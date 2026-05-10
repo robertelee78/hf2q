@@ -5452,6 +5452,56 @@ dequant cost (2.6 ms = 19% body) is the largest single optimization
 target on the default path.  Best-stack opt-in at 0.71× peer with
 no precision drift (Path E+G), 0.71× with F16 drift (Path E+F+G).
 
+### iter-194 — TQ-HB SDPA dequant loop: precise optimization plan
+
+Read `mlx-native/src/shaders/flash_attn_vec_tq_hb.metal` (670 lines)
+to identify concrete per-element optimization targets.
+
+**Current inner K-dequant loop** (D=256 path, lines 501-504):
+```metal
+for (short ii = 0; ii < DK4 / NL; ++ii) {
+    float4 k_val = dequant_hb_float4(k_base, (uint)(ii * NL) * 4u, k_sn, cbits);
+    partial += dot(k_val, float4(pq4[ii * NL]));
+}
+```
+
+`dequant_hb_float4` does 4 sequential `dequant_hb_single` calls.  Each
+call:
+1. Byte load: `uint idx = (uint)packed_pos[coord]` (1 byte at a time)
+2. Runtime branch on `cbits` (5/6/8) — codebook selector
+3. Codebook lookup: `CODEBOOK_HB_8BIT[idx]` (random access into 256-entry float array)
+4. Multiply by `scale_norm`
+
+**Two concrete optimization candidates** (preserves correctness):
+
+1. **Vectorize byte loads**: replace 4 sequential `packed_pos[coord+i]`
+   reads with 1 `uint k4 = *((device const uint*)(packed_pos + coord_base))`
+   + 4 bit-shift+mask extracts.  Apple Metal has efficient uint loads;
+   4-byte coalesced load > 4 separate 1-byte loads.  Expected: ~10-20%
+   K-load latency reduction.
+
+2. **Function-constant cbits specialization**: add `[[function_constant(N)]]`
+   for cbits, build 3 specialized variants (5/6/8).  Eliminates
+   per-element branch.  Branch predictor handles the runtime if-else
+   well at hot-path scale, but constant-folding lets compiler inline
+   the specific codebook + remove the mask op (`idx & 0x1F` etc).
+   Expected: 5-10% on inner loop.
+
+**Combined expected gain**: ~15-25% reduction in dequant cost.  TQ-HB
+SDPA total is 2.6 ms; 20% reduction = 0.5 ms saved = **+3.5%
+throughput on the default path**.
+
+**Risk**: high — kernel correctness gates on byte-identity vs
+existing kernel (5-fixture test in `tests/test_flash_attn_vec_f16_byte_identity.rs`).
+Multi-hour: implement + test parity + bench.  Cannot rush.
+
+**Strategic reminder**: this optimization is **only valuable while
+Path E+F is default-OFF**.  Path E+F (operator-flip) skips TQ-HB
+entirely → all optimization work here becomes moot.
+
+iter-195+ plan: implement and bench.  Or skip if operator approves
+Path E or E+F default-flip.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
