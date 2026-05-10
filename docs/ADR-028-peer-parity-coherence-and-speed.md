@@ -8377,6 +8377,84 @@ per operator directive, before DFlash:
 The path is engineering, not multi-month DFlash.  Find the real cost
 sites by direct measurement; close them one at a time.
 
+### iter-252 — actual peer dispatch count from source-walk corrects analysis
+
+Per iter-251 directive ("MEASURE peer dispatch count actually"),
+walked `/opt/llama.cpp/src/models/gemma4.cpp` lines 180-360 and
+counted actual ggml ops per layer that translate to Metal dispatches.
+
+**Actual per-layer count**:
+
+| Op | Count |
+|----|------:|
+| attn_norm fused (RMS+MUL) | 1 |
+| wq, wk, wv | 3 |
+| Q-norm, K-norm, V-norm | 3 |
+| Q-rope, K-rope | 2 |
+| KV write (set_rows) | 1 |
+| flash_attn_ext_vec [+ reduce when nwg>1] | 1-2 |
+| wo (O-proj) | 1 |
+| attn_post_norm fused | 1 |
+| ggml_add for attn_out | 1 |
+| ffn_norm_1 + ffn_norm_2 + tmp_norm | 3 |
+| shared MLP (gate / up / GLU / down) | 4 |
+| router scalar-mul + mat-mul + softmax + argsort | 4 |
+| gate_up_id + moe GLU + down_id + weighted_sum | 4 |
+| cur_mlp + cur_moe add | 1 |
+| ffn_post_norm fused | 1 |
+| **per-layer total** | **~28-30** |
+
+× 30 layers = **840-870 dispatches/token**, NOT 450 as iter-237
+dossier estimated.  The dossier's "14-16 dispatches/layer" was
+counting GRAPH NODES collapsed by GGML's automatic fusion — NOT
+actual GPU dispatches.
+
+**Revised gap analysis**:
+
+| Engine | Dispatches | µs/dispatch | Total ms | tok/s |
+|--------|-----------:|------------:|---------:|------:|
+| hf2q Path E+G | 930 | 14.7 | 13.65 | 73.3 |
+| llama.cpp peer | ~850 | ~11.4 | 9.69 | 103.2 |
+| **Δ** | **+80** | **+3.3** | **+3.96** | -29.9 |
+
+**Key correction**: only **~80 excess dispatches** (not 510).  At 3 µs
+overhead each = 0.24 ms savings = ~1.7%.  Sequential fusion ceiling
+revised down to ~+2% absolute, NOT +10%.
+
+**Real gap source**: **per-dispatch execution time delta**:
+- peer: 11.4 µs/dispatch
+- hf2q: 14.7 µs/dispatch
+- Δ: 3.3 µs slower per kernel × ~850 shared dispatches = **2.8 ms**
+
+This is **80% of the 4.0 ms gap**.  The lever is per-kernel
+optimization, not sequential fusion.
+
+**Why kernels run slower** (hypotheses to test in iter-253+):
+
+H1. **TQ-HB SDPA is slower than F16 SDPA at same shape** — codebook
+    gather + per-pos norm scaling + FWHT-undo per K element.
+    Falsifier: microbench TQ-HB vs F16 at gemma4 decode shape.
+    Expected delta: 2-3 µs/dispatch on SDPA only (not all 850).
+H2. **Rust binding layer adds CPU overhead per dispatch** —
+    encoder_session, KernelArg enum, contents_ptr lookups.
+    Falsifier: profile CPU cycles per dispatch in hf2q vs llama.cpp's
+    thin C-level binding.
+H3. **Buffer access patterns differ** — F32 intermediate buffers
+    where peer uses F16 (more bandwidth), or different tensor
+    layouts (CHW vs HWC equivalents).  Falsifier: memory bandwidth
+    counters per kernel.
+H4. **Mat-vec / mat-mul kernel implementations** are less efficient
+    than peer's at gemma4 shapes.  Falsifier: bench iter-180 mat-vec
+    against equivalent peer kernel at same shapes.
+
+**iter-253 plan**: write head-to-head microbench: hf2q's
+flash_attn_vec_tq_hb vs flash_attn_vec_f16kv at gemma4 decode shape
+(head_dim=256, kv_seq=1024, n_heads=16, n_kv_heads=8).  Measure GPU
+time for each.  Confirms or refutes H1.
+
+This is the operator's directed path: exhaust kernel optimization
+before DFlash.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
