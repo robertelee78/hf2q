@@ -14870,3 +14870,100 @@ processes its findings.
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
 
 No code changes (H1 re-falsified; Worker A research in flight).
+
+
+---
+
+## iter-341 — Worker A returned: 1.81× gap is STRUCTURALLY TQ-HB-vs-F16-K; one viable fusion identified
+
+Background Worker A (Explore subagent_type, spawned iter-340) returned
+with a deep peer-vs-ours SDPA kernel comparison report.  Key findings:
+
+### Why peer's per-dispatch wall is 2.07× lower (3 root causes)
+
+1. **Template-selected dequant** (peer ggml-metal.metal:5772-5799):
+   peer compiles 28+ kernel variants with dequant function pointer
+   (`deq_k`) baked in at template instantiation.  No runtime if-else.
+
+   Ours (flash_attn_vec_tq_hb.metal:457): runtime `codebook_bits`
+   selector (5/6/8 branch via if-else) in inner loop.  Adds
+   instruction-cache misses at scale.
+
+2. **Peer's F16 K allows direct simdgroup_load + matrix multiply**
+   (peer ggml-metal.metal:6045-6099): `device const k_t * pk = ...`
+   then simdgroup matmul.  Pipelined, no per-element scalar work.
+
+   Ours (flash_attn_vec_tq_hb.metal:529-559): MUST scalar-loop dequant
+   per K position because K is byte-packed codebook indices.  Breaks
+   simdgroup matrix-multiply pipelining.  **THIS IS THE 1.81× GAP.**
+
+3. **Block-sparsity pruning** (peer ggml-metal.metal:5985-6039):
+   `blk_cur` flag skips entire all-zero K-blocks.  We check
+   `simd_max(ss[tiisg]) <= -65504.0f` (line 493) but at 32-element
+   chunk granularity, not block.
+
+### TQ-HB binding constraint (operator RAM-mantra)
+
+Worker A's analysis confirms peer's F16-K simdgroup-matmul advantage
+**cannot be ported without destroying TQ-HB**.  Storing K as F16
+instead of byte-packed codebook indices = 3.94× memory regression =
+violates operator iter-326 RAM-mantra.
+
+Verified empirically THIS ITER: HF2Q_F16_KV=1 vs default has
+**identical dispatch buckets**:
+
+```
+A (default):  flash_attn_vec_tq_hb_dk256=2475  hadamard_quantize_kv_fast_d256=5850  73.2 tok/s
+B (F16_KV=1): flash_attn_vec_tq_hb_dk256=2475  hadamard_quantize_kv_fast_d256=5850  73.3 tok/s
+```
+
+The HF2Q_F16_KV flag does NOT route gemma4 to a peer-equivalent SDPA;
+TQ-HB SDPA still runs at the same rate.  iter-330's "0% speed" finding
+explained: F16_KV affects K/V STORAGE dtype but not the SDPA KERNEL
+selection on the TQ-HB path.
+
+### One viable Phase 7d implementation target identified
+
+Worker A's TOP-3 fusion candidates (with TQ-HB preservation):
+
+| Rank | Candidate | Predicted gain | Status |
+|---|---|---|---|
+| **1** | **Function-constant compile-time `codebook_bits` specialization** in `flash_attn_vec_tq_hb` (eliminates runtime if-else in `dequant_hb_float4`; mirrors peer's template-based dequant via Metal `[[function_constant(...)]]`, extending iter-196 pattern) | **+10-15% per-dispatch = +7-10% end-to-end** | **OPEN — iter-342 implementation target** |
+| 2 | Fuse FWHT sign-undo into final-write thread scatter | <1%, register pressure cost | NOT WORTH |
+| 3 | Already-fused norm-aware scale (no further gain) | 0% | DONE |
+
+NOT FEASIBLE without breaking TQ-HB:
+- Move hadamard-quantize into SDPA kernel (requires raw F32 K/V in
+  ring buffer = 3.94× memory regression = REJECTED per RAM mantra)
+- Lift NWG cap beyond 32 (multi-month reduce-kernel redesign)
+
+### Phase 7d sub-target tracker (updated)
+
+| Sub | Hypothesis | Status |
+|---|---|---|
+| H1 | HF2Q_TQ_FUSE_FWHT_PRE | FALSIFIED iter-340 |
+| H2 (was) | SDPA→reduce inline fusion | FALSIFIED — Worker A: nwg cap multi-month |
+| H3 (was) | fwht_sign_undo into SDPA output | FALSIFIED — Worker A: <1% gain, register pressure cost |
+| H4 (was) | dual K+V encode kernel | FALSIFIED — would force F32 ring buffer (TQ-HB violation) |
+| H5 (was) | per-kernel micro-opts (NSG, etc.) | DONE iter-127 already at peer parity |
+| **NEW H6** | **function-constant codebook_bits specialization** | **OPEN — iter-342 target** |
+
+### Honest gap forecast after H6
+
+If H6 lands at +7-10% end-to-end:
+- gemma4 default 200-tok decode: 73.5 → ~78-81 tok/s
+- × peer (103.16): 0.713× → ~0.76-0.78×
+- Still ~24-22% gap remaining
+
+The structural 1.81× per-dispatch gap is **fundamental to TQ-HB**
+(quantized K cannot use simdgroup matmul; F16 K can).  H6 is the
+only remaining lever WITHIN TQ-HB.  Operator-mantra binding RAM
+constraint precludes the F16-K → simdgroup-mm transition that
+would close the rest.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (Worker A research consolidated; H6 implementation
+target identified for iter-342).
