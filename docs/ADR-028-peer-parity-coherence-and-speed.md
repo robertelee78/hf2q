@@ -6729,6 +6729,39 @@ configuration.  Available as `HF2Q_FUSED_END_OF_LAYER=1` opt-in flag.
 over current default (vs +1.8% from all session-shipped optimizations
 combined excluding the default-path).
 
+### iter-222 — long-form coherence verification (fused kernel)
+
+100-token greedy decode output comparison:
+
+```
+=== Default ===
+### 1. The Physical Perspective (Intuition)
+The easiest way to understand $2 + 2$ is through **set theory**
+applied to physical objects. This is how we teach children to grasp
+the concept
+
+=== HF2Q_FUSED_END_OF_LAYER=1 ===
+### 1. The Physical Perspective (Intuition)
+The easiest way to understand $2 + 2$ is through **set theory**
+applied to physical objects. This is how we teach children to grasp
+the concept
+```
+
+**OUTPUT IDENTICAL.**  iter-218's parity test (rel_error < 1e-5)
+extrapolates to production: greedy decode produces equivalent token
+sequences.
+
+The HF2Q_FUSED_END_OF_LAYER kernel is **safe to ship as opt-in flag**.
+While its individual ROI is small (+0.3-0.4%), the kernel is correct,
+parity-validated, and stacks cleanly with other opt-in flags
+(Path E+F+G + FUSED = 73.6 tok/s = 0.717× peer).
+
+Available env-flag stack for operator (precision-exact): `HF2Q_USE_DENSE=1
+HF2Q_LMHEAD_Q6K=1` → ~72.4 tok/s.
+Available env-flag stack (F16 25 ppm drift): `HF2Q_USE_DENSE=1 HF2Q_F16_KV=1
+HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_UNSAFE_EXPERIMENTS=1`
+→ 73.6 tok/s.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
