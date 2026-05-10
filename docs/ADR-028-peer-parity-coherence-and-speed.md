@@ -4538,6 +4538,74 @@ approval.
    `5d6f18a63` (current HEAD). Re-bench needed to validate 3023/1884 t/s
    peer numbers still hold or have shifted under llama.cpp's own work.
 
+### iter-170: qwen3.6 MTP verifier(N) scaling bench LANDED
+
+`HF2Q_VERIFIER_NBENCH=1` (commit `1c1aa64`). Measured at qwen3.6-27b-mtp:
+```
+N=1  T_v=34.17ms  per-tok=34.17
+N=2  T_v=39.99ms  per-tok=20.00
+N=3  T_v=47.77ms  per-tok=15.92
+N=4  T_v=58.72ms  per-tok=14.68
+```
+
+Sub-linear T_v(N). Speedup at K = optimal accept × T_v(1) / (T_v(N+1) + T_d):
+- K=1 (verify N=2): 1.38× greedy
+- K=2 (verify N=3): 1.46× greedy ← optimal
+- K=3 (verify N=4): 1.38× greedy
+
+### iter-171: K=1 batched verify (gated default-OFF) LANDED — partial success
+
+`HF2Q_SPEC_DECODE_K1=1` (commit `43c728f`). Leviathan-style: 2-token
+verifier forward `[token_next, draft_1]` at `[next_pos, next_pos+1]`,
+ACCEPT emits 2 tokens (proposed + argmax(logits_row1)), REJECT emits 1
+(verified_at_n1).
+
+**Short-prompt success** ('What is 2 plus 2?', max-tok 64):
+
+| Path | tok/s | accept |
+|------|---:|---:|
+| K=0 legacy | 28.4 | 63.5% |
+| **K=1 batched** | **40.6** | **75.0%** |
+
+**+43% speedup** matches iter-160's 1.41× prediction. Output coherent.
+
+### iter-172: K=1 BUG bisected (commit `06b40ab`)
+
+On 'Write a haiku about autumn leaves':
+- K=0: 'The user wants a haiku... A haiku is a traditional Japanese
+  poetic form... Line 1: 5...' (coherent)
+- K=1: 'The user wants a haiku... </think> Crimson leaves Gold and
+  orange and gold and gold...' (BROKEN, 93.2% accept)
+
+`HF2Q_SPEC_DECODE_K1_NO_AMORT=1` (2-token verify, 1-token push only):
+SAME degenerate output. Bug is in 2-token verifier forward state, not
+speculative push. K1_TRACE confirms verify_hidden has correct
+2*hidden_size = 10240 elements.
+
+### iter-173: forward_gpu_impl path analysis
+
+forward_gpu_impl has many `seq_len > 1` branches at 2204+: prefill
+arenas (FaPrefillArena, FaProjectionsArena, DenseFfnArena, MoeFfnArena,
+DnPrefillArena, output rings, layer boundary arena, encoder session,
+chunk allocs arena). K=1's 2-token forward DOES use prefill machinery
+(seq_len=2 takes the > 1 branches).
+
+So the bug is NOT "decode path lacks barriers" — multi-token prefill
+machinery is invoked. Likely cause: **mid-stream prefill** (kv_cache
+already populated up to N-1) differs from initial prefill (kv_cache
+empty) in some state-handling path.
+
+### iter-174 plan — focused 2-call bisect
+
+Add `HF2Q_SPEC_DECODE_K1_TWO_CALLS=1`: TWO consecutive 1-token forward
+calls instead of one 2-token forward.
+- If output CORRECT: bug isolated to multi-token mid-stream forward
+  (need fix in forward_gpu_impl prefill-mid-stream path)
+- If output STILL BROKEN: bug is in spec_decode state machine
+  (hidden_t/logits_t propagation across iters)
+
+Per-iter cost: 72ms (slower than K=0 38ms) — correctness test only.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
