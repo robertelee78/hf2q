@@ -4774,6 +4774,68 @@ NOT defer; it surfaces the bisect data and waits for direction.
   Q5_K_M MoE 4B-active. M5 Max peak 546 GB/s.
 - hf2q current 63 tok/s = 189 GB/s = 35% of peak vs llama.cpp 57%.
 - 22pp efficiency gap = mat-mul/SDPA kernel efficiency, NOT structural.
+  ⚠ **iter-180 REFUTED this** — see below.
+
+### iter-180 — kernel-efficiency hypothesis REFUTED
+
+Built `mlx-native/benches/bench_decode_qmatmul_shapes.rs` (commit
+mlx-native `ffed3e0`). Measures `quantized_matmul_ggml` mat-vec at M=1
+across gemma4 26B-A4B APEX-Q5_K_M decode shapes, with **batched**
+(32-dispatch CB) timing to amortize per-CB sync overhead — the
+production-relevant number.
+
+**Batched results vs M5 Max peak 546 GB/s**:
+
+| Shape       | NxK         | qtype | per_call_us | GB/s | %peak |
+|-------------|-------------|-------|------------:|-----:|------:|
+| Q_sliding   | 4096x2816   | Q5_K  | 17.9        | 442  | 81.1% |
+| K_sliding   | 2048x2816   | Q5_K  | 11.0        | 360  | 66.0% |
+| V_sliding   | 2048x2816   | Q5_K  | 10.8        | 365  | 67.0% |
+| O_sliding   | 2816x4096   | Q5_K  | 16.0        | 495  | 90.8% |
+| Q_global    | 4096x2816   | Q5_K  | 16.8        | 471  | 86.3% |
+| O_global    | 2816x4096   | Q5_K  | 16.2        | 490  | 89.7% |
+| **Aggregate**| -          | -     | -           | **389** | **71%** |
+
+**VERDICT**: hypothesis FALSE. Q5_K mat-vec kernels run at **71% aggregate
+of M5 Max peak** — top-tier efficiency for memory-bound kernels on Apple
+GPUs. iter-179's "kernel inefficiency" framing was wrong.
+
+Per-token attention+router weight reads = 0.72 GB in 1.85 ms (batched) →
+**540 tok/s ceiling** from these kernels alone. Decode at 63 tok/s
+(16 ms/token) means **14.15 ms is in MoE/FFN/SDPA + dispatch
+density + per-CB bookkeeping**, NOT kernel implementation.
+
+**Sub-finding**: K/V at 66% lag Q/O at 81-90% — N=2048 doesn't tile
+cleanly. Possible micro-optimization but secondary.
+
+### iter-180b — operator data point, gemma4 architecture is the gap
+
+Operator delivered comparison at the same prompt/binary:
+- **gemma4 26B-A4B APEX-Q5_K_M**: 62.3 tok/s
+- **qwen3.6 35B-A3B APEX-Q5_K_M**: 123.0 tok/s ← hf2q on this model
+
+Active-param-scaling prediction (assuming kernel efficiency parity):
+- qwen3.6: ~2.06 GB/token at 123 tok/s = 254 GB/s effective
+- gemma4: ~2.75 GB/token expected ~92 tok/s at same efficiency
+- gemma4 actual 62 tok/s = **33% worse than scale prediction**
+
+The 33% gemma4-specific deficit must live in:
+1. **Architecture**: gemma4 has 30 full-FA layers; qwen3.6 ~75% DeltaNet
+   (LinearAttn) which is much cheaper per token. ~6× attention cost
+   ratio per layer.
+2. **Dual-FFN per layer** (gemma4 only): MoE layers run BOTH dense MLP
+   AND MoE expert routing summed (llama.cpp gemma4.cpp:307
+   `cur = ggml_add(cur_mlp, cur_moe)`). qwen3.6 has only one path.
+3. **TQ-HB SDPA dequant cost**: per-element Hadamard transform + scale.
+   Each FA layer pays this.
+
+**Implication for optimization**: hf2q kernel-impl is fine. gemma4 perf
+gap is structural to the model architecture (full-FA every layer + dual
+FFN summed), not amenable to single-kernel walks. The remaining levers
+are:
+- Path E+F default-flip (+14%, F16 KV, kernel-validated, operator gate)
+- FA dispatch fusion (multi-day work; QKV+norm+RoPE+KVcopy+SDPA→1 kernel)
+- TQ-HB → F16 KV switch on SDPA (already covered by Path E+F)
 
 ## Links
 
