@@ -7655,6 +7655,56 @@ is started without explicit operator green-light.
 
 This concludes the post-iter-216 peer-source phase of ADR-028.
 
+### iter-241 — long-context coherence regression gate (defensive)
+
+**Goal**: prevent silent regression of the iter-233 F16 KV finding +
+provide a runnable coherence gate for the four SAFE stacks.
+
+**Shipped**: `scripts/adr028_coherence_gate.sh` (113 LOC, executable).
+
+**Behavior**:
+- Runs hf2q generate at MAX_TOKENS=1000 across 5 stacks (4 SAFE + 1
+  deprecated)
+- Extracts model body from stdout (after `prefill: ` line; `--- mlx-native:`
+  is on STDERR per direct verification)
+- Checks body for known degradation signatures:
+  - `<pad>` / `<unk>` sentinel tokens
+  - body length < 50 chars (early-EOS / argmax-killed)
+  - >150-char same-byte repeat (rep-loop signature)
+  - non-zero exit (binary crash)
+- SAFE stack failures break the gate (exit 1)
+- Path E+F+G (deprecated F16 KV) is in EXPECTED-FAIL — failure there
+  is the *deprecation signal*, not a gate-break
+
+**End-to-end verified at HEAD**:
+```
+[SAFE] stacks (gate-break if any fails):
+  Default                        : OK  | "# The Eye of Aeons: The Chronicles of Aethelgard..."
+  Path E                         : OK  | "# The Eye of Aeons: The Chronicles of Aethelgard..."
+  Path E+G ★ safe flip           : OK  | "# The Eye of Aeons: The Chronicles of Aethelgard..."
+  Path E+G + FUSED               : OK  | "# The Eye of Aeons: The Chronicles of Aethelgard..."
+
+[EXPECTED-FAIL] stacks (deprecated; failure here is correctness signal):
+  Path E+F+G (deprecated F16 KV): FAIL[sentinel]  | "# The Eye of Aeons..."
+
+Summary:
+  SAFE stack failures:      0 (gate-break threshold = 0)
+  EXPECTED-FAIL confirmed:  1 (= 1 means iter-233 deprecation still load-bearing)
+  GATE: PASS
+```
+
+**Validates**:
+- All 4 SAFE stacks coherent at 1000-tok ✓
+- Path E+F+G fails as expected — iter-233 deprecation still load-bearing ✓
+- Same opening prefix `# The Eye of Aeons` across all stacks confirms
+  deterministic sampling at the start; F16 KV's `<pad>` appears
+  LATER in the 1000-tok body (matches iter-234 sweep finding that
+  failure is non-deterministic, not threshold-based)
+
+**Operator action**: integrate this gate into CI / pre-merge hooks
+to prevent silent regression of any SAFE stack as ADR-028 work
+continues.  Single-command operator runner: `bash scripts/adr028_coherence_gate.sh`.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
