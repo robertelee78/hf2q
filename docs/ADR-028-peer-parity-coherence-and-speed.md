@@ -10875,3 +10875,103 @@ ones aren't.
 
 No code changes this iter — Chesterton's fence prevented a wrong fix.
 
+
+---
+
+## iter-286 — STRUCTURAL gap identified: graph-level op fusion (peer-grounded)
+
+### Peer code analysis (Chesterton's fence on llama.cpp)
+
+**Read /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-common.cpp:375-432**:
+`ggml_graph_optimize()` walks the cgraph, fuses chains of ADD/NORM/RMS_NORM
+followed by ADD/MUL/NORM/RMS_NORM up to MAX_FUSE=16 ops, then reorders
+via `ggml_metal_graph_optimize_reorder` for concurrency.
+
+This is what generates llama.cpp's bucket entries like:
+- `kernel_bin_fuse_f32_f32_f32_4_op=0_nf=7_rb=1_cb=0` (30/tok)
+  → 7 element-wise ops fused into ONE dispatch
+- Total `kernel_bin_fuse_*` ≈ 180/tok, packing many small ops
+
+**Read /opt/llama.cpp/src/models/gemma4.cpp:240-329**:
+gemma4 architecture HAS dual FFN paths per MoE layer (shared expert
+pattern):
+- `cur_mlp` = build_norm + build_ffn (DENSE shared MLP) + build_norm
+- `cur_moe` = build_norm + custom logits + build_moe_ffn + build_norm
+- `cur = cur_mlp + cur_moe`
+
+hf2q's `forward_mlx.rs:4014-4135` has the EQUIVALENT dual-FFN structure
+(B11: dense down + gate_up_id concurrent).  Architecture is the same on
+both sides — gap isn't from extra hf2q work.
+
+### What llama.cpp does that hf2q doesn't
+
+llama.cpp builds an explicit cgraph (data-flow graph of ops), then the
+Metal backend OPTIMIZES it before dispatching:
+
+```
+ggml_op chain: norm(x) → mul(x, w) → add(x, b) → mul(x, scale) → ...
+              ↓ ggml_graph_optimize
+              kernel_bin_fuse_*_nf=N (one dispatch)
+```
+
+hf2q's gemma4 forward is **hand-written imperative dispatches** —
+each op is its own `dispatch_*` call.  No graph optimizer.
+
+### What's already built but UNWIRED in mlx-native
+
+**Critical finding** — search shows zero callers:
+
+```
+grep -rnE "\.fuse\(\)|\.fuse\(" /opt/hf2q/src /opt/mlx-native/src
+  → 0 callers (infrastructure built but unused)
+```
+
+`mlx_native::ComputeGraph::fuse()` (`/opt/mlx-native/src/graph.rs:349`)
+implements EXACTLY the equivalent of llama.cpp's ggml_graph_optimize:
+
+- Walks captured nodes
+- Maps `rms_norm_f32 → rms_norm_mul_f32` (line 467-468 fusion table)
+- Fuses adjacent norm+mul into the existing
+  `mlx_native::ops::rms_norm::dispatch_rms_norm_mul` kernel (also
+  unwired per iter-285 finding)
+- Replaces 2 dispatches with 1 fused dispatch in the captured graph
+
+Plus hf2q's gemma4 `forward_decode` (line 2328) **already uses**
+`GraphSession` / `GraphExecutor` — the entry point exists.
+
+### Hypothesis (TESTABLE)
+
+If we call `graph.fuse(registry, device)?` between graph capture and
+execute in `forward_decode`, the dispatch count should drop by some
+delta D, and tok/s should change by some delta T.  Three outcomes:
+
+| Outcome | Meaning |
+|---------|---------|
+| D > 0 ∧ T > 0  | Win — ship with env-gate first |
+| D > 0 ∧ T ≤ 0 | Confirms iter-186 lesson at this scale (concurrent fusion regresses) |
+| D ≤ 0          | Bug in fuse() — investigate |
+
+**No speculation in this iter — plan only.**  iter-287 wires the call
+under env flag `HF2Q_GRAPH_FUSE=1`, runs fresh `MLX_DISP_BUCKET=1`
+bench at gemma4 APEX, and lands the result in this ADR.
+
+### Why prior iters didn't try this
+
+iter-186 wired ONE specific fused-triple-norm kernel and measured
+regression.  That work's negative result governs **only its specific
+site** (B8 concurrent norms).  It does NOT bound graph-fuse() ROI
+because graph-fuse operates over the WHOLE captured graph and the
+sequential vs concurrent classification per-node was never tested.
+
+iter-219 wired sequential end-of-layer fusion and got +0.3%.  That
+narrow result also doesn't bound graph-fuse — the iter-219 fusion
+addressed only ONE site, while graph-fuse can fuse arbitrarily many
+patterns automatically.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`:
+  this section.
+
+No code changes this iter.  Next iter wires + measures.
+
