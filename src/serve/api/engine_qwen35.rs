@@ -49,6 +49,19 @@ use crate::serve::provenance::{self, Provenance};
 
 use super::engine::{LoadOptions, SamplingParams};
 
+/// Canonical Qwen3 chat-template stop tokens.
+///
+/// Used by `Qwen35LoadedModel::load` (ADR-028 iter-267) to scan
+/// `tokenizer.ggml.tokens` by name for the standard stop tokens —
+/// extended-vocab GGUFs (e.g. 27B-MTP-Q4_0 with vocab=248044) put
+/// `<|im_end|>` at a different ID than the standard 151645 and some
+/// omit `eos_token_id` metadata entirely (per iter-265).  Hoisted to
+/// module scope at iter-295 to satisfy the structural audit
+/// (`tests/structural_audit_serve_consts.rs`); previously was
+/// `fn`-local inside `load`, which is structurally untestable from a
+/// `mod tests` block (fn-local consts aren't `super::*`-visible).
+pub const QWEN35_EOS_STOP_NAMES: &[&str] = &["<|im_end|>", "<|endoftext|>"];
+
 /// All artifacts the SERVE worker needs to handle requests against a
 /// Qwen3.5 or Qwen3.6 GGUF.
 ///
@@ -309,10 +322,9 @@ impl Qwen35LoadedModel {
         // Scan tokens array for canonical qwen3 chat-template stops.
         if let Some(arr) = gguf.metadata("tokenizer.ggml.tokens") {
             if let mlx_native::gguf::MetadataValue::Array(elems) = arr {
-                const STOP_NAMES: &[&str] = &["<|im_end|>", "<|endoftext|>"];
                 for (i, el) in elems.iter().enumerate() {
                     if let mlx_native::gguf::MetadataValue::String(s) = el {
-                        if STOP_NAMES.contains(&s.as_str()) {
+                        if QWEN35_EOS_STOP_NAMES.contains(&s.as_str()) {
                             let id = i as u32;
                             if !eos_token_ids.contains(&id) {
                                 eos_token_ids.push(id);
