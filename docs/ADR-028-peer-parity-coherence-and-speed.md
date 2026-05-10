@@ -7339,6 +7339,145 @@ Q6_K direct lm_head, no precision tradeoff.
 | Path E+G+FUSED | ~73 | +6.7% | ✓ | UNSAFE_EXP gate |
 | Path E+F+G | ~73 | +6.7% | ✗ random `<pad>` | **DROP from defaults** |
 
+### iter-235 — deprecation banner for HF2Q_F16_KV (operator-visible)
+
+`investigation_env.rs:845-851` activation banner now emits:
+
+```
+UNSAFE (ack-required, activated):
+  HF2Q_F16_KV=1   DEPRECATED: gemma4-incoherent at random N
+                  (ADR-028 iter-234, random `<pad>` emission);
+                  qwen3.6 no-op (no perf gain). Path E+G recommended
+                  instead
+```
+
+Doc comment on `f16_kv` field expanded with iter-234 sweep table +
+cross-model check + Path E+G redirect.  Code unchanged otherwise —
+flag still functions for anyone who explicitly opts in.
+
+### iter-236 — peer-source: mlx-lm gemma3 reference
+
+Read `/opt/mlx-lm/mlx_lm/models/gemma3_text.py` (257 LOC, Apple's
+canonical Apple-Silicon Python reference for gemma3 dense decode).
+Operator no-thrash rule: peer-source over more bisects.
+
+**Finding 1 — clip_residual fp16-stability guard (hf2q lacks)**:
+`gemma3_text.py:125-132` defines:
+```python
+@partial(mx.compile, shapeless=True)
+def clip_residual(x, y):
+    if x.dtype != mx.float16: return x + y
+    bound = mx.finfo(mx.float16).max
+    return mx.clip(x.astype(mx.float32) + y.astype(mx.float32),
+                   -bound, bound).astype(mx.float16)
+```
+Applied at every residual add (lines 158, 160) when fp16.
+
+→ **peer-grounded explanation for iter-233 F16 KV `<pad>` at long
+context**: fp16 cache → fp16 SDPA out → unbounded fp16 residual
+accumulation → overflow → NaN → `<pad>` argmax.  hf2q grep shows
+`-65504` only as attention-mask sentinel, never as residual clip.
+
+Not actionable for current ship (HF2Q_F16_KV deprecated) but
+load-bearing if we ever revive fp16 inference.
+
+**Finding 2 — Per-layer RoPE base (hf2q matches ✓)**:
+`gemma3_text.py:55-70` uses `rope_local_base_freq=10_000` for
+sliding layers, `rope_theta=1_000_000` for global with
+`rope_scaling`. hf2q matches at `forward_mlx.rs:4905-4906` +
+`config.rs:109` default.  No drift, no action.
+
+**Finding 3 — Sliding-window cache (different but not perf)**:
+mlx-lm uses `RotatingKVCache` (sliding) + `KVCache` (global) with
+explicit `_temporal_order` re-ordering at wrap.  hf2q uses single
+`dense_kvs` Vec preallocated at sliding_window with implicit
+re-ordering through stride+offset arithmetic.  Both layouts valid;
+mlx-lm's first-stop reference if hf2q sliding-layer coherence
+ever drifts.
+
+Three testable hypotheses captured in `project_mlx_lm_gemma3_peer_source_findings_2026_05_09.md`:
+
+- H1: clip_residual gates on any future fp16 inference path
+- H2: count dispatches/layer hf2q vs mlx-lm to size launch-floor delta
+- H3: compare mlx-lm `mx.fast.rms_norm` to our rms_norm.metal at
+  decode shape
+
+### iter-237 — peer-source: llama.cpp gemma4 decode dossier (researcher agent)
+
+Researcher agent produced file:line evidence dossier on
+`/opt/llama.cpp` gemma4 (`src/models/gemma4.cpp`) and Metal SDPA.
+Key structural findings:
+
+**Peer architecture insights** (cite file:line):
+- gemma4 SWA pattern is **data-driven from GGUF**, not hardcoded —
+  `gemma4.cpp:5` reads `LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN` per
+  layer; queried via `hparams.is_swa(il)` (`llama-hparams.cpp:208`).
+- gemma4 has **shared-KV layers** — `gemma4.cpp:7-10` reads
+  `LLM_KV_ATTENTION_SHARED_KV_LAYERS`; layers past
+  `n_layer_kv_from_start` REUSE earlier layers' KV (`gemma4.cpp:234-238`,
+  passes `nullptr` for `Kcur, Vcur`).  For 30-layer 26B-A4B this can
+  make the tail of decode do **zero KV write/read traffic**.  → Need
+  to audit hf2q for this — if missing, it's free win.
+- llama.cpp's iswa cache is **dual-instance** (`llama-kv-cache-iswa.h:14-79`):
+  separate KV cache for full-attn layers vs sliding layers.  Each
+  layer is filtered into exactly one.  Structurally different from
+  hf2q's uniform `Vec<DenseKvBuffers>`.
+- KV cache type for Q5_K_M is **F16 by default**
+  (`llama-context.cpp:3203-3204`); peer's F16 path is stable
+  (no `<pad>` issue) — likely because peer dot-product is
+  `dot(float4 pk4, float4 sq4)` direct from F16 cache without our
+  TQ-HB codebook+norm+FWHT-undo overhead.
+
+**Three peer-grounded testable hypotheses** (full proof in dossier):
+
+**H1 — TQ-HB SDPA residual is structural (peer-grounded)**:
+peer `metal.metal:6837` does ONE mul-add per K element (f16→f32 cast).
+hf2q `flash_attn_vec_tq_hb.metal:330-380` does codebook gather + per-pos
+norm scaling + FWHT-undo BEFORE the dot — ~3× extra arithmetic.
+**Expected ROI**: ~1.0 ms/layer reclaim ≈ **~12% absolute decode** if
+F16 KV at decode-only is enabled (avoiding iter-233 prefill-path
+correctness issue).
+**Falsifier**: F16 KV gated to K=1 decode SDPA leg only (not prefill);
+measure SDPA dispatch GPU time. If ≤0.5 ms/layer, H1 confirmed.
+
+**H2 — Norm-mul-add fusion (peer fuses, hf2q likely doesn't fully)**:
+peer has `kernel_rms_norm_mul_add_f32`
+(`metal.metal:3055`, `metal-ops.cpp:3389-3424`) that fuses
+`RMSNORM → MUL(weight) → ADD(residual)` into ONE dispatch.  Gemma's
+chain appears 3× per layer (`gemma4.cpp:246, 269, 302, 323`) — collapses
+to 3 dispatches not 9.  hf2q's 1.09 ms across 3 norms/layer is
+consistent with separate dispatches.
+**Expected ROI**: ~0.7 ms/layer ≈ **~5.5% absolute decode**.
+**Falsifier**: count distinct dispatches between attn output and MoE
+input via Metal capture; if ≥6 where peer is 3, gap is fusion-shaped.
+
+**H3 — MoE merged gate+up reduces mul_mat_id count**:
+peer's `gate_up_exps` (`llama-graph.cpp:1517-1540`) merges gate and up
+projections to ONE `mul_mat_id` then `view_3d` slices.  Halves the
+expert-FFN dispatch count.
+**Expected ROI**: ~0.6-0.8 ms/layer ≈ **~5-6% absolute decode**.
+**Falsifier**: audit hf2q MoE forward-decode for separate gate_proj
+and up_proj weight tensors; if separate, build fused `gate_up_exps`
+at quantize-time + re-measure.
+
+**Aggregate ceiling if H1+H2+H3 land**: **~22.5% closed of the 28.7%
+gap** (closing to ~0.92× peer).  Remaining ~6% lives in KV layout
+(`kv-cache-iswa.h` dual-instance) + dispatch concurrency tuning
+(`metal-ops.cpp:147-225` peer's range-overlap concurrency analysis
+that emits `memory_barrier` only on actual range conflict — hf2q's
+unconditional barriers per dispatch may be over-conservative).
+
+**Next action priority** (peer-grounded):
+1. **Audit hf2q for shared-KV layers** (`gemma4.cpp:7-10` peer pattern).
+   Cheap win if missing.
+2. **Count hf2q dispatches/layer** (H2 falsifier) — Metal capture or
+   instrumented counter.  Determines whether norm fusion is the right
+   lever.
+3. **Audit hf2q MoE for gate/up separation** (H3 falsifier).
+   Determines whether merged gate_up_exps is achievable.
+4. **F16 KV decode-only** (H1) — narrowest scope, gates K=1 decode
+   SDPA only, avoids iter-233 prefill correctness issue.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
