@@ -5285,6 +5285,38 @@ Remaining 25pp gap to peer (97 tok/s) lives in:
 - Concrete next walks: bench V/K projection (66% peak in iter-180),
   optimize threadgroup tiling
 
+### iter-190 — SPLIT_TIMING confirms Path G is HEAD-only
+
+Validated Path G (HF2Q_LMHEAD_Q6K=1) only touches HEAD time, not BODY:
+
+| Path | BODY GPU avg | dispatches | barriers |
+|------|-------------:|-----------:|---------:|
+| Default | 13.6 ms | 956 | 459 |
+| Path G | 13.7 ms | 956 | 459 |
+
+Same dispatches, same barriers, same body GPU (within noise).
+Path G's +1.76% wall-clock comes entirely from HEAD bytes-read
+reduction (Q6_K 605 MB vs Q8_0 784 MB = 179 MB saved per token =
+0.33 ms predicted vs 0.34 ms observed = within forecast).
+
+This confirms the orthogonality model: Path E modifies BODY (skips
+TQ-HB encode dispatches per layer), Path G modifies HEAD (smaller
+lm_head matmul).  Stacks linearly because they hit different GPU
+phases.
+
+**HEAD time decomposition** (steady-state, Path G):
+- Final RMS norm: ~0.01 ms
+- lm_head Q6_K mat-vec: ~1.06 ms (iter-187 bench)
+- Softcap + argmax: ~0.05 ms
+- CB submission + GPU completion + CPU argmax read: ~0.6 ms (residual)
+
+**Total HEAD ≈ 1.7 ms** at Path G (vs ~2.0 ms at default).
+
+The remaining ~0.6 ms in HEAD is sync/CPU overhead — hard to reduce
+without restructuring the head pipeline (e.g. fold final-norm into
+lm_head input, async argmax-on-GPU, eliminate CPU readback for
+streaming).  These are multi-day items but each saves <0.5%.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
