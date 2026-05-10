@@ -11962,3 +11962,207 @@ Active scripts are all aligned to current APEX paths.
 No code changes — audit produced a clean verdict on production-relevant
 script set.
 
+
+
+---
+
+## iter-308 — peer-source kernel diff: **q6_K mat-vec at half row-per-TG** (root cause candidate #1)
+
+**Operator REFRAME (2026-05-10):** "rust is not slower than C... we
+need to find the gap of what we're doing wrong in the implementation...
+set up the right tests to know where our gap is. then fix the code for
+that gap.  don't guess.  don't make random changes."
+
+**Operator clarification (2026-05-10):** "We can experiment with d
+flash later but that's a cherry on top. That is not the source of our
+speed differential.  If they are faster than us then they are doing
+something smarter than we are.  We have access to their full source
+code."
+
+Prior thread synthesis labelled 21% gap as "non-TQ-HB fusion gaps"
+without naming the kernels.  This iter does the falsifier work the
+synthesis skipped: **paired peer-grounded dispatch tables + read the
+hot kernel source.**
+
+### A. Peer-grounded dispatch tables (gemma4 APEX-Q5_K_M, 50-tok decode)
+
+**hf2q (this HEAD, gemma4 APEX, 21-prompt + 17-decode, 73.3 tok/s):**
+
+```
+[MLX_DISP_BUCKET] Per-pipeline breakdown (36 unique pipelines, total=36150):
+[MLX_DISP_BUCKET]       6475  (17.91%)  kernel_mul_mv_q6_K_f32
+[MLX_DISP_BUCKET]       5587  (15.46%)  rms_norm_f32
+[MLX_DISP_BUCKET]       2220  ( 6.14%)  fused_head_norm_rope_f32
+[MLX_DISP_BUCKET]       2220  ( 6.14%)  fused_norm_add_f32
+[MLX_DISP_BUCKET]       1850  ( 5.12%)  hadamard_quantize_kv_fast_d256
+[MLX_DISP_BUCKET]       1260  ( 3.49%)  kv_cache_copy_batch_f32
+[MLX_DISP_BUCKET]       1147  ( 3.17%)  kernel_mul_mv_q8_0_f32
+[MLX_DISP_BUCKET]       1110  ( 3.07%)  hf2q_dense_mm_f32_f32_tensor
+[MLX_DISP_BUCKET]       1110  ( 3.07%)  fused_moe_routing_f32
+[MLX_DISP_BUCKET]       1110  ( 3.07%)  kernel_mul_mv_id_q6_K_f32
+[MLX_DISP_BUCKET]       1110  ( 3.07%)  moe_weighted_sum
+[MLX_DISP_BUCKET]       1110  ( 3.07%)  fused_gelu_mul
+[MLX_DISP_BUCKET]       1110  ( 3.07%)  rms_norm_no_scale_f32
+[MLX_DISP_BUCKET]       1110  ( 3.07%)  moe_swiglu_batch
+[MLX_DISP_BUCKET]       1110  ( 3.07%)  fused_norm_add_scalar_f32
+[MLX_DISP_BUCKET]       1050  ( 2.90%)  hadamard_quantize_kv_hb_d256
+[... TQ-HB d512 variants + smaller buckets ...]
+```
+
+**llama.cpp peer (same gemma4 APEX-Q5_K_M file, tg50 r=1, 102.13 tok/s):**
+
+```
+[LLAMA_DISP_COUNT] Total Metal dispatches: 70839
+[LLAMA_DISP_COUNT] Per-pipeline breakdown (32 unique pipelines):
+[LLAMA_DISP_COUNT]      10812  (15.26%)  kernel_rms_norm_mul_f32_4
+[LLAMA_DISP_COUNT]       8976  (12.67%)  kernel_mul_mv_q6_K_f32_nsg=2
+[LLAMA_DISP_COUNT]       3162  ( 4.46%)  kernel_get_rows_f32
+[LLAMA_DISP_COUNT]       3060  ( 4.32%)  kernel_soft_max_f32_4
+[LLAMA_DISP_COUNT]       3060  ( 4.32%)  kernel_rope_neox_f32_imrope=0
+[LLAMA_DISP_COUNT]       3060  ( 4.32%)  kernel_set_rows_f16_i64
+[LLAMA_DISP_COUNT]       3060  ( 4.32%)  kernel_geglu_f32
+[LLAMA_DISP_COUNT]       3060  ( 4.32%)  kernel_bin_fuse_f32_f32_f32_op=2_nf=1
+[LLAMA_DISP_COUNT]       3060  ( 4.32%)  kernel_rms_norm_f32_4
+[LLAMA_DISP_COUNT]       3009  ( 4.25%)  kernel_rms_norm_mul_add_f32_4
+[LLAMA_DISP_COUNT]       2805  ( 3.96%)  kernel_mul_mv_f16_f32_4_nsg=2
+[LLAMA_DISP_COUNT]       1581  ( 2.23%)  kernel_unary_f32_f32_4_op=10_cnt=1
+[LLAMA_DISP_COUNT]       1530  ( 2.16%)  kernel_bin_fuse_f32_f32_f32_4_op=0_nf=7
+[... 1530-ct family of fused binary ops ...]
+```
+
+### B. Falsifier-grade observations
+
+**B.1 — Dispatch count is NOT the gap.**
+- hf2q: 951 dispatches/tok (36150 / 38)
+- peer: 1417 dispatches/tok (70839 / 50)
+
+Peer dispatches **MORE** kernels per token but runs **FASTER**.  Prior
+synthesis claim of "72 extra mat-vecs/tok on our side" was wrong-signed.
+We have FEWER dispatches (~289 mat-vec vs ~381) but each is slower.
+
+**B.2 — Effective time-per-dispatch.**
+- peer: 9.8 ms/tok ÷ 1417 disp/tok = **7.1 µs/disp**
+- hf2q: 14.3 ms/tok ÷ 951 disp/tok = **15 µs/disp**
+
+We're **2.1× slower per dispatch**.  The gap is per-kernel efficiency,
+NOT count, NOT fusion architecture parity.
+
+**B.3 — `kernel_mul_mv_q6_K_f32` is the smoking gun.**
+
+Same kernel name, same model file, similar count (peer 180/tok, hf2q
+170/tok), wildly different speed contribution.  This kernel is the
+single biggest line item in BOTH dispatch tables.
+
+### C. Reading the kernel source
+
+**Peer** (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:7968`):
+
+```c
+const short NSG = FC_mul_mv_nsg;        // function-constant: 2
+const int first_row = (r0 * NSG + sgitg) * nr0;   // nr0 = N_R0_Q6_K = 2
+
+float sumf[nr0] = { 0.f };               // 2 row accumulators
+float yl[16];                            // CACHED Y-vector
+
+for (int i = ix; i < nb; i += 2) {
+    // Load Y ONCE per block (cache)
+    for (short l = 0; l < 4; ++l) {
+        yl[4*l + 0] = y[l +  0];  yl[4*l + 1] = y[l + 32];
+        yl[4*l + 2] = y[l + 64];  yl[4*l + 3] = y[l + 96];
+    }
+
+    // Apply to nr0 = 2 rows simultaneously (dequant amortized)
+    for (short row = 0; row < nr0; ++row) {
+        FOR_UNROLL (short l = 0; l < 4; ++l) {
+            sums[0] += yl[4*l + 0] * ...;   // reuse cached Y
+            ...
+        }
+    }
+}
+```
+
+NSG=2 simdgroups × nr0=2 rows = **4 rows per threadgroup**, with Y
+cached once per block and re-used across 2 rows.
+
+**hf2q** (`/opt/mlx-native/src/shaders/quantized_matmul_ggml.metal:473`):
+
+```c
+const int row = 2 * r0 + sgitg;     // single row per simdgroup
+// ... no yl[] cache ...
+for (int i = ix; i < nb; i += 2) {
+    device const float * y = yy + i * QK_K + y_offset;   // re-read y from device
+
+    float4 sums = {0.f, 0.f, 0.f, 0.f};
+    for (int l = 0; l < 4; ++l) {
+        sums[0] += y[l+ 0] * ...;     // direct device load (slow path)
+        sums[1] += y[l+32] * ...;
+        sums[2] += y[l+64] * ...;
+        sums[3] += y[l+96] * ...;
+    }
+    sumf += dall * (sums[0]*sc[0] + ...);     // single scalar accumulator
+}
+```
+
+NSG=2 × **1 row per simdgroup = 2 rows per threadgroup**.  No Y cache;
+y[l+0..96] read directly from device memory.  Single accumulator.
+
+The N_DST=4 comment at file top is a **lie inherited from Q4_0** — the
+q6_K body computes ONE row.
+
+### D. Hypothesis (testable, NOT yet flipped)
+
+**H1 (q6_K mat-vec efficiency):** Implementing peer's nr0=2 + yl[]
+cache pattern in our `kernel_mul_mv_q6_K_f32` will close at least half
+the per-dispatch gap on this kernel.
+
+**Falsifier:**
+1. Build a `kernel_mul_mv_q6_K_f32_nr2` variant matching peer's
+   structure (caching yl[16], computing nr0=2 rows per simdgroup).
+2. Bench in isolation (existing `tests/bench_q6k_mat_vec.rs` or
+   equivalent micro-bench framework).
+3. Production decode test on gemma4 APEX-Q5_K_M.
+4. Expected: ≥30% speedup on q6_K mat-vec at gemma4 shapes (3584,
+   3072), translating to ~5% end-to-end decode improvement (since q6_K
+   mat-vec is ~17.9% of dispatches and time per dispatch is ~2× peer).
+
+**Risk:** Other slow kernels (rms_norm_f32, kv_cache_copy_batch_f32,
+fused_norm_add) may share the same pattern of "single row / no Y
+cache / no nsg tuning."  Same-class fixes may compound.
+
+### E. Why this wasn't caught before
+
+iter-180 / iter-253 / iter-256 measured kernel ROOFLINE saturation — but
+"saturated" only means "running at the limit FOR THE CURRENT KERNEL
+DESIGN."  The peer's kernel design saturates at a different (higher)
+roofline because of nr0=2 amortization.
+
+**This is the lesson the operator's REFRAME was pointing at**:  prior
+iters measured the wrong saturation — local saturation under our
+current code path — rather than comparing against peer's saturation
+under their kernel design.
+
+### F. NO code changes in iter-308
+
+Per "no deferrals without operator approval" rule AND mantra "Measure
+3x, cut once," this iter ships:
+- Documented finding with falsifiable hypothesis
+- Paired dispatch tables (frozen at HEAD 77891d9, gemma4 APEX-Q5_K_M)
+- Kernel source diff (line-numbered)
+
+**Operator-decision-gated next moves:**
+
+| Lever | Expected | Cost | Risk |
+|---|---|---|---|
+| **H1: nr0=2 + yl[] cache for q6_K mat-vec** | **~5% end-to-end** | 1-2 days (build kernel + parity test + bench) | low (peer pattern, well-understood) |
+| H2: same for q8_0, q4_0, _id variants | ~3-5% more | 1 week | low |
+| H3: same for rms_norm + fused norm kernels | unknown until measured | 1 week | medium (these are smaller per-dispatch) |
+| H4: F16 KV cache (peer uses `set_rows_f16_i64`) | unknown | unknown | high (iter-233 found F16 KV broke gemma4 long-context coherence — need to understand why peer can use it) |
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes.  iter-308 is a measurement + hypothesis iter.  Next
+iter (309) recommended: spawn /cfa to build `kernel_mul_mv_q6_K_f32_nr2`
+on a branch, prove correctness via parity test against current kernel,
+then bench head-to-head.
