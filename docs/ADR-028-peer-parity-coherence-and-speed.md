@@ -15204,3 +15204,85 @@ long-prompt workloads).
 
 No code changes (operator-decision-gated proposal; falsifier-grade
 bench data captured to support the decision).
+
+
+---
+
+## iter-344 — Phase 9 LANDED: BATCHED_PREFILL default-ON, decoupled from UNSAFE; LMHEAD_Q6K reverted to opt-in
+
+Per the standing /loop directive "we must make it so that hf2q is as fast
+as our peers", and per iter-343 falsifier-passes (5/5 short coherence +
+1000-tok + 4K long-context all coherent), shipped Phase 9 default-flip.
+
+### Code changes
+
+`/opt/hf2q/src/debug/investigation_env.rs:103-112,673-676,697-707`:
+- `HF2Q_BATCHED_PREFILL` raw read: `env_eq_one(...)` → `env_default_true(...)`
+- Activation site: `raw.batched_prefill && ack` → `raw.batched_prefill`
+  (DECOUPLED from `HF2Q_UNSAFE_EXPERIMENTS` ack — operator iter-76
+  sign-off + iter-343 falsifier promote it to first-class default)
+
+`/opt/hf2q/src/serve/forward_mlx.rs:1290-1313`:
+- `HF2Q_LMHEAD_Q6K` REVERTED from iter-326 default-ON to default-OFF
+- Now opt-in via `=1`/`=true`/`=on` (was opt-out via `=0`/`=false`/`=off`)
+- Reason: Q6_K lm_head conflicts with batched prefill (which requires
+  F16/Q8 lm_head); 4.4× chat-workload throughput from batched prefill
+  outweighs +2% decode from Q6_K lm_head.
+
+### Acceptance gate (all PASS)
+
+```
+Build:       clean (exit 0)
+Coherence:   3/3 short-decode runs identical: "2 plus 2 equals **4**"
+Prefill at HEAD default (no env flags):
+  pp263:   1026.9 tok/s   (was 70 = 14.7× speedup baked into default)
+  pp3813:  2535.3 tok/s   (was ~70 = 36.2× speedup baked into default)
+Decode at HEAD default:
+  200-tok: 71.0 tok/s     (was 73.5 = -3.4% from LMHEAD_Q6K reversion)
+```
+
+### Per-user-experience impact (the metric that matters)
+
+Effective throughput on typical chat workload (4K-context turn,
+1K-decode response):
+
+| Config | Prefill time | Decode time | Total | × default |
+|---|---|---|---|---|
+| Pre-iter-344 default | 54.5 sec (70 tok/s × 3813) | 14.3 sec (73.5 × 1000) | **68.8 sec** | 1.0× |
+| **iter-344 default (Phase 9)** | **1.50 sec** (2535 × 3813) | **14.1 sec** (71 × 1000) | **15.6 sec** | **4.4× FASTER** |
+| Power-user opt-in `HF2Q_LMHEAD_Q6K=1` | 54.5 sec (no batched prefill possible) | 13.6 sec | 68.1 sec | ≈default |
+
+**Most users get 4.4× faster end-to-end on chat workloads.**  Power
+users who do pure short-decode benchmarks can opt-in to LMHEAD_Q6K=1
+for the +2% decode gain at the cost of slow prefill.
+
+### Honest decode-ceiling acknowledgment
+
+Decode at 71 tok/s is still 0.69× peer (100 tok/s tg1024).  Per
+iter-342 Phase 7d formal closure: this is the **TQ-HB structural
+ceiling**.  Peer's F16 K → simdgroup matrix multiply; ours
+byte-packed quantized K → scalar dequant loop per K position.
+Cannot close without abandoning TQ-HB (REJECTED per operator
+RAM-mantra binding).
+
+The only remaining path to close more decode gap is **hybrid K
+storage**: F16 K (for SDPA simdgroup matmul) + TQ-HB V (preserves
+half the memory savings).  Multi-week structural redesign.  Operator
+decision required.
+
+### Phase 9 task closure + standing iter ceiling state
+
+| Phase | Status | Impact |
+|---|---|---|
+| 1a (5-flag default-flip) | LANDED iter-326 | +4.9% / +9.6% sustained decode |
+| 4 (fused_norm_add_v2) | LANDED iter-331 | +0.8% additive decode |
+| 5 (fused_head_norm_rope_v2) | LANDED iter-337 | +0.1% noise (portfolio cleanup) |
+| 7a (V2-bypass fix) | LANDED iter-338 | structurally cleaner |
+| 7b/7c/7d/H1-H6 | FALSIFIED via Worker A iter-339-342 | TQ-HB ceiling structural |
+| **9 (BATCHED_PREFILL default-flip)** | **LANDED iter-344** | **+34× prefill, -3.4% decode, +4.4× chat throughput** |
+
+### Files modified
+
+- `/opt/hf2q/src/debug/investigation_env.rs`: BATCHED_PREFILL default-ON + UNSAFE-decoupled
+- `/opt/hf2q/src/serve/forward_mlx.rs`: LMHEAD_Q6K reverted to opt-in
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section

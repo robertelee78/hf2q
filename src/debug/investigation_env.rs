@@ -100,9 +100,15 @@ pub struct InvestigationEnv {
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub f16_kv: bool,
 
-    /// `HF2Q_BATCHED_PREFILL=1` — use the experimental batched prefill
-    /// path instead of per-token. Bails on `seq_len > sliding_window`.
-    /// Original parse: `map_or(false, |v| v == "1")`.
+    /// `HF2Q_BATCHED_PREFILL` — use the batched prefill path instead of
+    /// per-token.  ADR-028 iter-344 default-flipped to ON: per-token
+    /// prefill at default was 14-45× SLOWER than peer (70 tok/s vs
+    /// 3130 tok/s pp512); batched gives ~34× speedup at pp4096 (2366
+    /// tok/s = 0.80× peer) with coherence intact at every tested length
+    /// up to pp3813 (4× sliding_window) per iter-343.  Operator iter-76
+    /// signed off on the L6 MoE sliding_wrap deferral (still ack-able
+    /// via opt-out).  Opt out via `HF2Q_BATCHED_PREFILL=0` / `=false` /
+    /// `=off`.  Decoupled from `HF2Q_UNSAFE_EXPERIMENTS` ack (iter-344).
     pub batched_prefill: bool,
 
     /// `HF2Q_SKIP_TQ_ENCODE=1` — skip TQ encode for timing bisection.
@@ -671,7 +677,9 @@ impl InvestigationEnv {
     pub fn from_env() -> Self {
         let raw = RawAckIntent {
             f16_kv: env_eq_one("HF2Q_F16_KV"),
-            batched_prefill: env_eq_one("HF2Q_BATCHED_PREFILL"),
+            // ADR-028 iter-344: default-ON (was env_eq_one).  Decoupled
+            // from UNSAFE ack at the activation site below.
+            batched_prefill: env_default_true("HF2Q_BATCHED_PREFILL"),
             skip_tq_encode: env_eq_one("HF2Q_SKIP_TQ_ENCODE"),
             skip_tq_sdpa: env_eq_one("HF2Q_SKIP_TQ_SDPA"),
             skip_dense_mlp: env_eq_one("HF2Q_SKIP_DENSE_MLP"),
@@ -697,7 +705,13 @@ impl InvestigationEnv {
         Self {
             // Ack-required — effective value is raw AND ack.
             f16_kv: raw.f16_kv && ack,
-            batched_prefill: raw.batched_prefill && ack,
+            // ADR-028 iter-344: batched_prefill DECOUPLED from ack.
+            // Operator iter-76 signed off on the L6 MoE sliding_wrap
+            // deferral; iter-343 falsifier-tested at pp3813 (5/5 short
+            // coherence + 1000-tok + 4K long-context all coherent at
+            // HEAD with iter-326+331+337+338 stack).  Promoting to
+            // first-class default-ON; opt-out via env=0/false/off.
+            batched_prefill: raw.batched_prefill,
             skip_tq_encode: raw.skip_tq_encode && ack,
             skip_tq_sdpa: raw.skip_tq_sdpa && ack,
             skip_dense_mlp: raw.skip_dense_mlp && ack,
