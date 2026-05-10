@@ -5966,6 +5966,41 @@ iter-206+ plan: bisect more sequential candidates:
 
 Each likely ~0.3-0.5 ms.  Bisect-then-fuse for compound savings.
 
+### iter-206 — BISECT weighted_sum near-free (refines pattern)
+
+Shipped HF2Q_SKIP_WEIGHTED_SUM.  Skips B14 moe_weighted_sum dispatch.
+
+| Config | BODY GPU | dispatches |
+|--------|---------:|-----------:|
+| Default | 12.56 ms | 956 |
+| SKIP_WEIGHTED_SUM | 12.71 ms | 926 (-30) |
+| **Δ** | **~0 ms (within noise)** | -30 |
+
+weighted_sum = essentially FREE.  Sequential but tiny kernel
+(top_k=8 × hidden=2816 weighted accumulate; 5 µs/layer × 30 = 0.15 ms).
+
+**Refined pattern across 5 bisects**:
+
+| Op | Cost | Type | GPU work |
+|----|-----:|------|----------|
+| TQ-HB encode | ~0 ms | concurrent | medium |
+| swiglu | 0.14 ms | concurrent | medium |
+| head_norm_rope | 0.11 ms | concurrent | medium |
+| weighted_sum | ~0 ms | sequential | tiny |
+| **post-attn fused_norm_add** | **0.55 ms** | **sequential** | **substantial** |
+
+**Key insight**: Sequential ≠ always costly.  Cost depends on the
+KERNEL's actual GPU work.  post-attn fused_norm_add is unique among
+bisected ops in being:
+1. SEQUENTIAL on critical path (must wait for O-proj)
+2. SUBSTANTIAL work (reads attn_out + hidden, writes residual = ~33 KB
+   memory traffic per layer × 30 layers = ~1 MB at the threadgroup
+   level + RMS reduction compute)
+
+iter-207 plan: bisect post_feedforward_layernorm_2 (final residual
+update — combines hidden + cur_mlp + cur_moe at end-of-layer).
+Sequential, similar to post-attn-norm-add → expected ~0.5 ms.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
