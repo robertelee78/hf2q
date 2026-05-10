@@ -2865,6 +2865,34 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         println!("Decode tok/s: {:.1}", tok_per_sec);
     }
 
+    // ADR-028 iter-290: qwen35 generate path mirror of HF2Q_DUMP_COUNTERS dump
+    // from gemma4's cmd_generate (at /opt/hf2q/src/serve/mod.rs:1361).
+    // Enables cross-model per-pipeline comparison.
+    if std::env::var("HF2Q_DUMP_COUNTERS").ok().as_deref() == Some("1") {
+        let dispatches = mlx_native::dispatch_count();
+        let syncs = mlx_native::sync_count();
+        eprintln!(
+            "[MLX_COUNTERS] dispatches={} syncs={} prompt_tokens={} decode_tokens={}",
+            dispatches, syncs, prompt_len, generated,
+        );
+        let buckets = mlx_native::pipeline_dispatch_buckets();
+        if !buckets.is_empty() {
+            let total: u64 = buckets.iter().map(|(_, c)| *c).sum();
+            eprintln!(
+                "[MLX_DISP_BUCKET] Per-pipeline breakdown ({} unique pipelines, total={}):",
+                buckets.len(),
+                total,
+            );
+            for (label, count) in &buckets {
+                let pct = if total > 0 { 100.0 * (*count as f64) / (total as f64) } else { 0.0 };
+                eprintln!(
+                    "[MLX_DISP_BUCKET]   {:>8}  ({:5.2}%)  {}",
+                    count, pct, label,
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 

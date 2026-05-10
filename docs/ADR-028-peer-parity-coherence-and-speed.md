@@ -11256,3 +11256,118 @@ component.
 No code changes this iter — fresh dual-model measurement consolidates
 "engine OK, model-specific gap" framing.
 
+
+---
+
+## iter-290 — cross-model bucket comparison: structural source of qwen3.6 vs gemma4 disparity
+
+### Method
+
+iter-289 measured qwen3.6 APEX 1.34× peer vs gemma4 APEX 0.69× on the
+SAME engine — claimed proof "engine isn't slow".  This iter
+instruments qwen3.6 generate path with the same MLX_DISP_BUCKET dump
+(was missing — only gemma4 path had it) and runs a side-by-side
+bucket comparison.
+
+Mod added at `serve/mod.rs:cmd_generate_qwen35`:
+```rust
+if std::env::var("HF2Q_DUMP_COUNTERS").ok().as_deref() == Some("1") {
+    let dispatches = mlx_native::dispatch_count();
+    let buckets = mlx_native::pipeline_dispatch_buckets();
+    // ... emit MLX_COUNTERS + MLX_DISP_BUCKET lines (identical format
+    //    to gemma4 path so cross-model comparison is direct)
+}
+```
+
+### qwen3.6 APEX per-pipeline buckets at HEAD
+
+```
+Total: 277377 dispatches (256 decode + 23 prefill)
+Top kernels (% of total):
+  18.48%  kernel_mul_mv_q4_0_f32          ← Q4_0 dense matmul
+  18.39%  hf2q_dense_gemv_bf16_f32_4      ← BF16 dense matvec
+  9.22%   kernel_mul_mv_id_q5_K_f32       ← MoE Q5_K
+  7.38%   silu_mul_f32                    ← activation
+  5.63%   rms_norm_f32
+  5.54%   l2_norm_f32                     ← per-head norm
+  3.69%   moe_weighted_reduce_f32
+  3.69%   moe_softmax_topk_f32            ← MoE routing
+  3.69%   fused_residual_norm_f32
+  2.77%   ssm_conv_forward_f32            ← DeltaNet SSM
+  2.77%   gated_delta_net_decode_f32_4    ← DeltaNet decode
+  2.77%   ssm_conv_state_update_f32
+  2.77%   compute_g_beta_f32              ← DeltaNet γ/β compute
+  2.77%   ssm_norm_gate_f32               ← DeltaNet gating
+  ...
+```
+
+### Gemma4 APEX (from iter-284) for comparison
+
+```
+Top kernels (% of total):
+  18.18%  kernel_mul_mv_q6_K_f32          ← Q6_K dense matmul (HEAVIER than Q4_0)
+  15.68%  rms_norm_f32
+  6.23%   fused_head_norm_rope_f32
+  6.23%   fused_norm_add_f32
+  5.19%   hadamard_quantize_kv_fast_d256  ← TQ-HB only (qwen3.6 has NONE)
+  3.22%   kernel_mul_mv_q8_0_f32
+  3.12×8  fused_norm_add_scalar / kernel_mul_mv_id / fused_gelu_mul / ...
+  2.36×4  hadamard_quantize_kv_hb_dual / fwht_sign_premult / etc — TQ-HB only
+  ...
+```
+
+### Cross-model decomposition
+
+| Metric | qwen3.6 | gemma4 | Note |
+|--------|--------:|-------:|------|
+| tok/s | 126.5 | 69.4 | (1.34× / 0.69× peer) |
+| ms/tok | 7.91 | 14.41 | gap 6.50 ms |
+| disp/tok | ~1083 | ~960 | qwen3.6 has MORE dispatches |
+| µs/dispatch (avg) | **7.3** | **15.14** | gemma4 is **2× heavier** per dispatch |
+| TQ-HB dispatches | 0 | ~166 (~16%) | gemma4-only (qwen3.6 generate uses F32 KV per iter-131) |
+
+### KEY structural insight
+
+The qwen3.6 vs gemma4 disparity is NOT engine speed.  It's:
+
+1. **Different weight quant**: qwen3.6 uses Q4_0 for dense (smaller, faster
+   per dispatch); gemma4 uses Q6_K (larger, slower per dispatch).
+   Gemma4's average µs/dispatch is 2× higher because each kernel is
+   doing more work.
+
+2. **TQ-HB**: qwen3.6 generate CLI silently uses F32 KV (per iter-131
+   audit at `serve/mod.rs:2487-2493`).  Gemma4 uses TQ-HB → 16% of
+   dispatches are hadamard_quantize / fwht / flash_attn_vec_tq_hb.
+
+3. **Attention type**: qwen3.6 has DeltaNet linear-attention in most
+   layers (ssm_conv, gated_delta_net, compute_g_beta) — much cheaper
+   than gemma4's full+sliding attention with KV cache.
+
+### Caveat on iter-289 framing
+
+iter-289's "1.34× peer with TQ-HB intact" claim was wrong.  The qwen3.6
+generate CLI I measured runs with F32 KV cache, NOT TQ-HB.  Per
+iter-131 estimate of qwen3.6 with TQ-HB engaged: ~106 tok/s = ~1.12×
+peer at matched regime.
+
+**Mantra-aligned status**:
+- qwen3.6 with TQ-HB: ~1.12× peer ✓ ABOVE peer (mantra satisfied)
+- qwen3.6 without TQ-HB: 1.34× peer ✓ FURTHER above peer
+- gemma4 with TQ-HB: 0.69× peer ✗ below peer
+- gemma4 without TQ-HB (Path E+G+FUSED): 0.74× peer ✗ still below
+
+### Files modified
+
+- `/opt/hf2q/src/serve/mod.rs`: +28 lines (qwen35 generate path bucket dump)
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+### Strategic locked-in status (after iter-283..290 thread)
+
+| Lever | gemma4 ceiling | TQ-HB? | Cost |
+|-------|--------------:|:------:|------|
+| Status quo | 0.694× | YES | shipped |
+| G+FUSED default flip | ~0.70× | YES | flag flip |
+| E+G+FUSED default flip | 0.735× | NO | flag flip + memory loss |
+| Per-layer-type bisect → kernel work | ?  | ? | multi-week, ROI uncertain |
+| DFlash port | 1.4-2.8× | YES | multi-month, operator-decision-gated |
+
