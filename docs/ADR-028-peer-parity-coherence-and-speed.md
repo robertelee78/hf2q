@@ -5410,6 +5410,48 @@ iter-193+ candidates:
 - Investigate triple-buffer / 3-way CB split
 - HEAD pipeline restructure (async argmax-on-GPU)
 
+### iter-193 — peer baseline refined to 102 tok/s; gap = 28.7%
+
+Re-ran llama.cpp llama-bench with more samples (`-n 200` and pp+tg
+combined modes) to tighten the peer baseline std-dev:
+
+| llama.cpp test | tok/s |
+|----------------|------:|
+| tg128 (iter-183 short) | 97.16 ± 8.77 (high noise) |
+| tg128 (re-run) | 102.72 ± 0.10 (low noise) |
+| tg200 | 102.30 ± 0.44 |
+| pp512+tg200 | 327.31 ± 6.30 (mixed) |
+
+**Refined peer baseline: 102.7 tok/s** (low-noise single-token decode).
+
+hf2q Path E+F+G: 73.3 tok/s = **0.713× peer = 28.7% slower** (was
+0.75× / 25% with iter-183's noisier 97 number).
+
+Updated lever inventory + gap math:
+
+| Stack | tok/s | vs peer 102.7 | Δ |
+|-------|------:|--------------:|--:|
+| Default | 62.7 | 0.61× | -39.0% |
+| Path G alone | 63.6 | 0.62× | -38.1% |
+| Path E alone | 70.7 | 0.69× | -31.2% |
+| Path E+G | 72.2 | 0.70× | -29.7% |
+| Path E+F+G | 73.3 | **0.713×** | **-28.7%** |
+| llama.cpp peer | 102.7 | 1.00× | — |
+
+The 28.7pp gap is the honest steady-state delta against peer.
+
+**Prefill comparison** (separate concern from operator's decode signal):
+- llama.cpp pp512+tg200 = 327 tok/s combined
+- Implies pp throughput ~3000 tok/s (tg amortizes)
+- hf2q gemma4 prefill ~46 tok/s — large gap; not addressed this session
+
+Cumulative session work has produced one shipped lever (Path G,
++1.76%), confirmed orthogonality (E+F+G stacks linearly), bisected
+the per-component cost decomposition, and proven the TQ-HB SDPA
+dequant cost (2.6 ms = 19% body) is the largest single optimization
+target on the default path.  Best-stack opt-in at 0.71× peer with
+no precision drift (Path E+G), 0.71× with F16 drift (Path E+F+G).
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
