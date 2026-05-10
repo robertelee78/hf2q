@@ -3590,6 +3590,59 @@ Expected savings:
 This is THE walk-phase win. ~50-100 LOC change. Coherence trivially
 preserved (storage format change, not computation).
 
+### iter-157: Q4_0 shared_head_head LANDED — head time validated, but accept-rate cost
+
+#### Single-line code change
+
+`mtp_weights_load.rs:144`:
+```rust
+- let shared_head_head = upload_bf16_from_f32(&shared_head_head_f32, device)
++ let shared_head_head = upload_q4_0_from_f32(&shared_head_head_f32, device)
+```
+
+`apply_linear_projection_f32` already accepts Q4_0 U8-buffers (verified by
+verifier path at `forward_gpu.rs:856`), so no kernel-side changes needed.
+
+#### A/B results (qwen3.6-27b-mtp-q4_0, prompt "Hello, my name is")
+
+| Metric | Before iter-157 (BF16) | After iter-157 (Q4_0) | Change |
+|--------|---:|---:|---:|
+| forward_shared_head | 4.52 ms | 1.51 ms | -3.0 ms (-67%) |
+| forward_draft total | 6.86 ms | 3.82 ms | -3.0 ms (-44%) |
+| Spec tok/s (32 tok) | 26.2 | **28.9** | **+10%** |
+| Greedy tok/s | 32.4 | 32.9 | (drift) |
+| **Accept rate** | 80% | **67.7%** | **-12pp** |
+| Spec/greedy | 0.81× | 0.88× | +0.07 |
+
+Head time dropped EXACTLY as predicted by iter-156 hypothesis (4.52 → 1.51
+≈ verifier-equivalent). The BF16-vs-Q4_0 storage hypothesis is validated.
+
+#### But: Q4_0 draft loses 12pp accept rate
+
+Q4_0's 4-bit quantization with per-block scale produces logits that are
+slightly less aligned with the verifier's F32-computed logits. Fewer
+drafted tokens match the verifier's argmax → lower acceptance.
+
+Net spec/greedy improved 0.81× → 0.88× but is still **slower than
+greedy** (28.9 vs 32.9 tok/s). The 3ms saved per draft is partly offset
+by ~12pp lower acceptance.
+
+#### iter-158 walk-phase target: Q8_0 instead of Q4_0
+
+Q8_0 storage: 1.27 GB (vs BF16 2.54 GB or Q4_0 0.635 GB). At 587 GB/s:
+- BF16: 4.33 ms (was-baseline)
+- Q8_0: 2.16 ms (intermediate)
+- Q4_0: 1.08 ms (current iter-157 ≈ 1.51 ms)
+
+Q8_0 sacrifices ~half of the bandwidth saving but PRESERVES accept rate
+(8-bit per element keeps logit precision much closer to F32 than 4-bit).
+
+Predicted: forward_draft 3.82 → ~4.5 ms (from +0.65ms head time vs Q4_0)
++ accept rate ≥ 80% (back to BF16 level) → spec_iter ≈ 36ms; tok/s @ 80%
+accept = 1.8 / 0.036 = **50 tok/s = 1.51× greedy**.
+
+iter-158 swaps Q4_0 → Q8_0 in mtp_weights_load.rs + tests A/B.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)

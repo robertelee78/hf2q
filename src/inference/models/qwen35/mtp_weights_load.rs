@@ -4,7 +4,7 @@ use mlx_native::{MlxBuffer, MlxDevice};
 
 use super::ffn::DenseFfnWeights;
 use super::gpu_ffn::{DenseFfnWeightsGpu};
-use super::gpu_full_attn::{upload_bf16_from_f32, upload_f32_weight};
+use super::gpu_full_attn::{upload_bf16_from_f32, upload_f32_weight, upload_q4_0_from_f32};
 use super::mtp::{MtpFullAttnWeightsGpu, MtpWeights};
 use super::weight_loader::load_f32_tensor;
 use super::Qwen35Config;
@@ -141,8 +141,18 @@ pub fn load_mtp_weights_if_present(
         vocab_size,
         "qwen35 MTP loader: shared_head_head resolved"
     );
-    let shared_head_head = upload_bf16_from_f32(&shared_head_head_f32, device)
-        .context("MTP upload shared_head_head")?;
+    // ADR-028 iter-157: shared_head_head was stored as F32→BF16 (2.54 GB at
+    // qwen3.6 vocab=248320 × hidden=5120). At 587 GB/s peak bandwidth that
+    // pays 4.33 ms per draft step — matched iter-156 measurement (4.52 ms,
+    // 65% of forward_draft). Verifier already learned this lesson at
+    // forward_gpu.rs:416-422 ("Q4_0 matmul on Apple Silicon is faster than
+    // BF16 at BOTH M=1 and M>1, ~1.4 ms saved per step → +14 tok/s") and
+    // switched its lm_head from BF16 to Q4_0. Replicate that here for the
+    // MTP shared_head_head — same `apply_linear_projection_f32` call site
+    // works with the Q4_0 U8 buffer (verified by reading verifier path at
+    // forward_gpu.rs:856).
+    let shared_head_head = upload_q4_0_from_f32(&shared_head_head_f32, device)
+        .context("MTP upload shared_head_head Q4_0")?;
     let attn = load_mtp_attn(gguf, cfg, layer_index, device)?;
     let (ffn, intermediate_size) = load_mtp_ffn(gguf, cfg, layer_index, device)?;
 
