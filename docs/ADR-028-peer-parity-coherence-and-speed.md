@@ -6545,6 +6545,42 @@ without serializing previously-concurrent work.
 This is the FIRST fusion kernel build — others (O-proj+post-attn-norm,
 QKV 3-way) follow in subsequent multi-iter chains.
 
+### iter-218 — dispatch wrapper + parity test (PASS)
+
+mlx-native commit `45c7922`.
+
+**Shipped**:
+- Rust wrapper `dispatch_fused_post_ff_norm2_endlayer_f32` in
+  `mlx-native/src/ops/rms_norm.rs` (~120 lines validation + dispatch)
+- Parity unit test `tests/test_fused_post_ff_norm2_endlayer.rs`
+
+**Parity test result**: **PASSES at rel_error < 1e-5** (within f32
+FMA reordering noise).  Compared at gemma4 production decode shape
+(rows=1, dim=2816):
+- Sequential baseline: `fused_norm_add_f32` + `fused_norm_add_scalar_f32`
+- Fused: 1-dispatch `fused_post_ff_norm2_endlayer_f32`
+
+Both produce equivalent output as expected (same math operations).
+
+**iter-217's risk-aware design validated**: 2 sequential RMS reductions
+in 1 kernel produce equivalent output to 2 sequential dispatches.
+Different from iter-186 fused_triple_norm regression (which was
+concurrent → sequential).
+
+**Status**:
+- ✅ Shader written + registered (iter-217)
+- ✅ test_all_shaders_compile PASSES (iter-217)
+- ✅ Rust dispatch wrapper (iter-218)
+- ✅ Parity unit test PASSES (iter-218)
+- ❌ Production wire-up in `forward_mlx.rs` (iter-219)
+- ❌ 5-run statistical bench (iter-219)
+- ❌ Default-flip decision based on bench result (iter-220+)
+
+**iter-219 plan**: wire into `forward_mlx.rs` end-of-layer dispatch
+site under `HF2Q_FUSED_END_OF_LAYER=1` env flag (default-OFF).  Run
+5-run statistical bench.  If matches bisect prediction +2.7%, ship
+default-OFF for soak then plan default-flip operator-decision.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
