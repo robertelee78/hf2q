@@ -6507,6 +6507,44 @@ Compounding all 3: ~+6-8% additional default-path throughput.
 | Build 3 fusion kernels | ~73-75 | ~0.71-0.73× | multi-week |
 | Architectural rewrite | ~80+ | ~0.78×+ | multi-month |
 
+### iter-217 — BUILD: fused_post_ff_norm2_endlayer_f32 kernel (compile-only)
+
+mlx-native commit `877ddda`.
+
+Wrote new Metal kernel `fused_post_ff_norm2_endlayer_f32` that fuses
+the gemma4 layer-end pair into a single dispatch:
+- (a) mlp_down = attn_out + norm(moe_accum, w2)
+- (b) hidden   = (residual + norm(mlp_down, w3)) * layer_scalar
+
+**Bisect-confirmed lever** (iter-208): saves the (b) launch ≈ 0.34 ms
+= +2.7% throughput on gemma4 default path.
+
+**Structural template**: existing `fused_post_attn_triple_norm_f32`
+(also 2 RMS reductions in 1 kernel).  Adapted with scalar mul at the
+end (broadcast or per-channel via `scalar_is_vector` flag).
+
+**Risk-aware design**: iter-186's fused_post_attn_triple_norm
+REGRESSED on decode because it forced 3 CONCURRENT norms into 1
+SEQUENTIAL kernel.  This kernel fuses 2 SEQUENTIAL norms (different
+scenario): fusion eliminates the second dispatch's launch latency
+without serializing previously-concurrent work.
+
+**Status**: shader written (~95 lines), registered in
+`kernel_registry.rs`, **compiles cleanly via xcrun**
+(test_all_shaders_compile PASSES).  NOT YET:
+- Rust dispatch wrapper `dispatch_fused_post_ff_norm2_endlayer_f32`
+- Parity unit test (fused vs sequential 2-dispatch byte-identity)
+- Production wire-up in `forward_mlx.rs` end-of-layer site
+
+**iter-218 plan**:
+1. Write Rust dispatch wrapper
+2. Write parity unit test
+3. Wire into forward_mlx.rs end-of-layer under `HF2Q_FUSED_END_OF_LAYER` flag
+4. 5-run statistical bench; if no regression at default-OFF, plan default-flip
+
+This is the FIRST fusion kernel build — others (O-proj+post-attn-norm,
+QKV 3-way) follow in subsequent multi-iter chains.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
