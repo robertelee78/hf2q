@@ -11447,3 +11447,98 @@ the per-pipeline data.
 
 No code changes — observation locked in, source not yet localized.
 
+
+---
+
+## iter-292 — per-layer dispatch attribution: gap is UNIFORM, not layer-type-specific
+
+### Method
+
+Added env-gated per-layer dispatch counter to gemma4 forward_decode
+(`forward_mlx.rs`):
+- At each layer iteration start: snapshot `mlx_native::dispatch_count()`
+- At iteration end: snapshot again, store `(layer_idx, is_sliding, delta)`
+- After loop: dump per-layer log with sliding/full-attn split
+
+`HF2Q_PER_LAYER_DISP=1` env-gated, zero overhead when unset.
+
+### Measurement at HEAD (8-token decode, gemma4 APEX)
+
+```
+[PER_LAYER_DISP] sliding_layers=25 (avg 32 disp/layer, total 800)
+[PER_LAYER_DISP] full_layers=5    (avg 31 disp/layer, total 155)
+```
+
+Per-layer split:
+- L00..L04 SLID 32, L05 FULL 31, L06..L10 SLID 32, L11 FULL 31, ...
+- Pattern: every 6th layer is FULL (matches gemma4 architecture)
+- **Dispatch count per layer is UNIFORM: 32 sliding vs 31 full — only 1 dispatch difference**
+
+Total: 800 + 155 = 955 disp + 5 head ≈ 960 ✓ matches iter-283's 960/tok.
+
+### Hypothesis test result: REFUTED
+
+**Hypothesis (iter-289)**: gemma4 full-attn layers are disproportionately
+expensive in dispatch count vs sliding layers.
+
+**Result**: REFUTED.  Full-attn layers are slightly CHEAPER in dispatches
+(31 vs 32) — the head_dim=512 vs 256 difference doesn't add dispatches,
+just larger per-dispatch work.
+
+### Where the +9-disp-per-layer vs peer gap actually lives
+
+llama.cpp gemma4 = ~694.5 disp/tok / 30 layers ≈ 23 disp/layer.
+hf2q gemma4 = ~32 disp/layer.  Δ = +9 dispatches per layer × 30 = +270/tok.
+
+Decomposition (from iter-284 + iter-290 buckets):
+
+| Component | hf2q disp/layer | llama.cpp disp/layer | Δ |
+|-----------|----------------:|---------------------:|---:|
+| TQ-HB infrastructure | ~6 | 0 (F16 KV) | **+6** |
+| - hadamard_quantize_kv_fast | 2 | 0 | |
+| - hadamard_quantize_kv_hb_dual | 1 | 0 | |
+| - fwht_sign_premult/undo | 2 | 0 | |
+| - flash_attn_vec_tq_hb | 1 | 0 | |
+| Fusion gaps (norm/elem-wise) | ~3 | 0 | **+3** |
+| Total | 9 | 0 | **+9** |
+
+**~6 of 9 per-layer extras are operator-mandated TQ-HB.**  Remaining
+~3/layer × 30 layers × 3 µs overhead = **0.27 ms** = +1.9% lever
+realistically.
+
+### Strategic conclusion (locked-in via 4 measurement passes)
+
+The 4.5 ms gap between gemma4 hf2q (14.5 ms) and peer (10.0 ms) is:
+- ~1.5 ms TQ-HB compute + dispatch overhead (operator-mandated, retained)
+- ~0.27 ms non-TQ-HB fusion gaps (small, ROI-marginal per iter-186/219)
+- ~2.7 ms per-dispatch kernel-work delta (peer's bin_fuse_*_nf=7 kernels
+  do more work per dispatch with single-pass memory access)
+
+**The +9 per-layer dispatch delta is well-attributed: 67% TQ-HB-mandated,
+33% small-fusion ROI.  Per-layer optimization ROI ceiling is ~+2-3%.**
+
+**Combined with iter-288/iter-291 ceilings, gemma4 APEX with TQ-HB
+intact tops out at ~0.78× peer through dispatch-count optimization.**
+The remaining 22% gap to peer requires either (a) dropping TQ-HB
+(rejected by operator policy), (b) DFlash spec-decode (multi-month,
+operator-decision-gated), or (c) deep per-dispatch kernel-work
+optimization (multi-month).
+
+### Files modified
+
+- `/opt/hf2q/src/serve/forward_mlx.rs`: +27 lines per-layer dispatch
+  attribution (env-gated `HF2Q_PER_LAYER_DISP=1`, zero overhead unset).
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+### Operator-aligned outcome
+
+The "find the gap" mandate from iter-282 is now COMPLETED to the layer
+level.  Each of the 4.5 ms is attributed to a concrete component with
+ROI bound.  No more measurement work can advance without operator
+decision on:
+1. Flag flip stack (E+G+FUSED → 0.735× at TQ-HB cost)
+2. DFlash port (1.4-2.8× peer with TQ-HB intact, multi-month)
+3. Deep kernel rework (per-dispatch fused kernel re-engineering)
+4. Accept current state (gemma4 APEX at 0.694× peer with full memory
+   savings; qwen3.6 APEX at 1.34× peer ★ MANTRA SATISFIED)
+

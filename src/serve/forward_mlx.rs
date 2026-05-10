@@ -2605,7 +2605,16 @@ impl MlxModelWeights {
             let dump_sliding_l0: bool = INVESTIGATION_ENV.dump_sliding_layer_0;
             let dump_run_name: Option<&str> = INVESTIGATION_ENV.dump_run_name.as_deref();
 
+            // ADR-028 iter-292: per-layer dispatch attribution
+            // (HF2Q_PER_LAYER_DISP=1). Snapshot dispatch_count at layer start;
+            // diff at layer end gives dispatches-per-layer-type.  Localizes
+            // the iter-291 +72 mat-vec gap (sliding vs full-attn layers).
+            let per_layer_disp_enabled = std::env::var("HF2Q_PER_LAYER_DISP").as_deref() == Ok("1");
+            let mut per_layer_disp_log: Vec<(usize, bool, u64)> = Vec::new();
             for layer_idx in 0..num_layers {
+                let layer_disp_start = if per_layer_disp_enabled {
+                    mlx_native::dispatch_count()
+                } else { 0 };
                 let hd = self.layers[layer_idx].head_dim;
                 let nkv = self.layers[layer_idx].num_kv_heads;
                 let nh = self.num_attention_heads;
@@ -4228,6 +4237,16 @@ impl MlxModelWeights {
                     p.s1_dispatches[layer_idx] = total_dispatches;
                 }
 
+                // ADR-028 iter-292: per-layer dispatch attribution.
+                if per_layer_disp_enabled {
+                    let layer_disp_end = mlx_native::dispatch_count();
+                    per_layer_disp_log.push((
+                        layer_idx,
+                        is_sliding,
+                        layer_disp_end - layer_disp_start,
+                    ));
+                }
+
                 // ADR-009 Phase 3A: per-layer hidden state dump.
                 // Commits the session mid-forward to read hidden state, then re-starts.
                 // Only active when HF2Q_DUMP_LAYERS=<seq_pos> matches.
@@ -4260,6 +4279,26 @@ impl MlxModelWeights {
                         eprintln!("  [DUAL_BUFFER] split at layer {} — buf0: {} dispatches, {} barriers",
                             layer_idx + 1, total_dispatches, b0_barriers);
                     }
+                }
+            }
+
+            // ADR-028 iter-292: dump per-layer dispatch counts post-loop.
+            if per_layer_disp_enabled && !per_layer_disp_log.is_empty() {
+                let n_sliding = per_layer_disp_log.iter().filter(|(_, s, _)| *s).count();
+                let n_full = per_layer_disp_log.len() - n_sliding;
+                let total_sliding: u64 = per_layer_disp_log.iter()
+                    .filter(|(_, s, _)| *s).map(|(_, _, n)| *n).sum();
+                let total_full: u64 = per_layer_disp_log.iter()
+                    .filter(|(_, s, _)| !*s).map(|(_, _, n)| *n).sum();
+                let avg_sliding = if n_sliding > 0 { total_sliding / n_sliding as u64 } else { 0 };
+                let avg_full = if n_full > 0 { total_full / n_full as u64 } else { 0 };
+                eprintln!("[PER_LAYER_DISP] sliding_layers={} (avg {} disp/layer, total {})",
+                    n_sliding, avg_sliding, total_sliding);
+                eprintln!("[PER_LAYER_DISP] full_layers={} (avg {} disp/layer, total {})",
+                    n_full, avg_full, total_full);
+                for (idx, sliding, count) in &per_layer_disp_log {
+                    eprintln!("[PER_LAYER_DISP]   L{:02} {} {} disp",
+                        idx, if *sliding { "SLID" } else { "FULL" }, count);
                 }
             }
 
