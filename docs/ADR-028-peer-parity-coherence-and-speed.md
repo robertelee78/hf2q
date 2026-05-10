@@ -8932,6 +8932,53 @@ sustained, llama.cpp peer at 94.55 ± 2.56 sustained (tg1024 matched
 regime); the often-cited 102.7 burst figure is tg128 = different
 thermal regime than hf2q's 1000-token measurement."
 
+### iter-260 — FUSED stack noise resolved + reproducible +0.7% over E+G
+
+iter-258 reported FUSED σ ≈ 3.5 tok/s (71.6 / 64.7 / 68.1) and flagged
+it as suspicious.  Hypothesis: same system-load artifact as the
+peer-baseline drift (iter-258→iter-259 resolution).
+
+**5-run quiesced FUSED at HEAD**:
+
+```
+71.8, 71.6, 71.6, 71.6, 71.6
+median: 71.6   mean: 71.64   σ: 0.089
+```
+
+**Hypothesis CONFIRMED**: iter-258's σ ≈ 3.5 was system-load noise
+(40× smaller in this quiesced 5-run).  FUSED stack is as
+reproducible as Default and Path E+G (all σ < 0.1 quiesced).
+
+**Reproducible HEAD measurements** (post iter-258/iter-260 cleanup):
+
+| Stack | tok/s | σ | Δ vs Default | Δ vs E+G |
+|-------|------:|--:|-------------:|---------:|
+| Default       | 68.6 | 0.15 | — | — |
+| Path E        | 69.7 | 0.00 | +1.6% | — |
+| **Path E+G ★**| 71.1 | 0.06 | **+3.6%** | — |
+| **Path E+G + FUSED** | **71.6** | 0.09 | **+4.4%** | **+0.7%** |
+
+**iter-219 retroactive correction**: iter-219 measured FUSED at +0.3%
+on its measurement system.  Quiesced HEAD shows **+0.7% over Path E+G**
+= 2.3× larger but still sub-1%.  iter-220's strategic retirement of
+fusion as a *major* lever holds (each fusion sub-1%), but FUSED is
+**kernel-correct + reproducible at +0.7% over E+G = safe to enable**.
+
+**Operator-actionable lever ranking** (post iter-260):
+
+| Lever | Effort | ROI vs Default | Method |
+|-------|--------|---------------:|--------|
+| Path E+G default flip | 1 line | +3.6% | env_default_true on `HF2Q_USE_DENSE` and `HF2Q_LMHEAD_Q6K` |
+| FUSED on top of E+G | 1 line | +4.4% (cumul) | env_default_true on `HF2Q_FUSED_END_OF_LAYER` (UNSAFE_EXP gate stays — operator's choice if exposing) |
+| DFlash spec-decode | multi-month | +50-200% est | iter-227 skeleton |
+
+**iter-260 outcome**:
+- ✓ FUSED noise was system-load (iter-258 anomaly resolved)
+- ✓ FUSED reproducibly adds +0.7% over E+G at HEAD
+- ✓ iter-219's +0.3% measurement updated to +0.7% post-iter-258 cleanup
+- → Both Path E+G and FUSED are now **safe operator-flips** at HEAD
+  (kernel-correct, reproducible, sub-noise σ).
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
