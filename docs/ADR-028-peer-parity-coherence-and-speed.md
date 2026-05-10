@@ -3643,6 +3643,64 @@ accept = 1.8 / 0.036 = **50 tok/s = 1.51× greedy**.
 
 iter-158 swaps Q4_0 → Q8_0 in mtp_weights_load.rs + tests A/B.
 
+### iter-158: loop-overhead bisection — 26ms unaccounted per spec iter
+
+#### Sustained-run reading (64 tokens, prompt "Hello, my name is")
+
+```
+Spec    (Q4_0): 64 tokens / 2.23s = 28.7 tok/s @ 77.8% accept
+Greedy:         64 tokens / 1.97s = 32.5 tok/s
+```
+
+Accept rate at 64 tokens: 77.8% (was 67.7% at 32-token short run — the
+67% was a small-sample artifact; at sustained run it lands ≈ original
+80% baseline). Iter-157 BF16 → Q4_0 head-time saving holds.
+
+#### Per-iter cost breakdown
+
+```
+Iter time @ 28.7 tok/s × 1.778 (1 + accept) = 62 ms/iter
+Profile reports:
+  mtp_draft           = 4.14 ms
+  forward_gpu_with_hidden = 31.47 ms
+  Subtotal            = 35.6 ms
+  Unaccounted         = 26 ms (42%)
+```
+
+**26ms per iter is "loop overhead" outside the timed sub-paths.**
+
+#### Likely sources (by reading spec_decode.rs run_prompt loop)
+
+1. `last_logits(&verify_logits, vocab).to_vec()` — verifier returns
+   `Vec<f32>` of vocab=248320 = 1MB CPU readback, forcing GPU→CPU
+   sync per iter (~5-10ms wait after pipelined GPU)
+2. `argmax_logits_gpu` for draft — extra commit_and_wait sync
+3. `last_hidden_row` slice — zero-copy view but the underlying
+   forward_gpu_with_hidden may still readback hidden state
+4. `embed_token_on_device` — 1-row F32 upload (~20KB, fast)
+5. `verifier.with_gpu_cache_mut` — lock + cache lookup overhead
+
+#### iter-159 walk-phase target
+
+Replace the verifier path's CPU logits readback with GPU-side argmax:
+- Modify `forward_gpu_with_hidden` to optionally return a single u32
+  token (4 bytes) via internal `dispatch_argmax_f32`, instead of
+  returning the full `Vec<f32>` logits
+- Eliminate 1MB readback per iter → likely saves 10-15ms/iter
+- Spec iter 62 → ~50ms, tok/s @ 78% accept = 1.78/0.05 = **35.6 tok/s
+  = 1.10× greedy** (first time spec beats greedy)
+
+This is a deeper refactor (~200 LOC across spec_decode.rs +
+forward_gpu_with_hidden) — multi-iter scope.
+
+#### iter-158 recommendation
+
+Skip Q8_0 helper build for now (`upload_q8_0_from_f32` doesn't exist;
+multi-iter scope to add encode_q8_0_blocks). The Q4_0 head choice is
+empirically validated as not the dominant constraint — accept rate
+preserves at sustained run, and 26ms loop overhead is the next
+bigger fish.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
