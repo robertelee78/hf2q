@@ -13020,3 +13020,65 @@ optimization claims should be benched in BOTH:
 - `/opt/hf2q/scripts/adr028_full_stack_bench.sh`: added G+FUSED+V2+NR2
   + E+G+FUSED+V2+NR2 rows
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section
+
+
+---
+
+## iter-319 — stack sweep + 5-run lock-in for G+FUSED+V2+NR2
+
+iter-318's "stack orthogonality" finding tested against more
+historical flags on top of the new safe-flip baseline.
+
+### Sweep results (3 runs each, gemma4 APEX-Q5_K_M, 200 tok)
+
+```
+G+FUSED+V2+NR2 baseline:         72.7 tok/s median
++ HF2Q_TQ_FUSE_FWHT_PRE=1:       72.3 tok/s  (-0.5%)
++ HF2Q_FUSED_TRIPLE_NORM=1:      71.1 tok/s  (-2.2%)
++ BOTH:                          70.8 tok/s  (-2.6%)
+```
+
+Both historical FALSIFIED flags (iter-186 + iter-315) remain
+regressive even stacked.  iter-318's stack is the local optimum
+among TQ-HB-intact safe-flips.
+
+### 5-run lock-in (σ < 0.1)
+
+```
+baseline:           69.3, 69.2, 69.1, 69.2, 69.1   median 69.2 tok/s
+G+FUSED+V2+NR2:     72.5, 72.4, 72.5, 72.4, 72.3   median 72.4 tok/s
+Delta: +4.6% (within iter-318's +4.3% claim, σ <0.1 both)
+```
+
+Peer reference: 102 tok/s (tg128 burst) / 97 tok/s (tg1024 matched).
+Our G+FUSED+V2+NR2 stack: **0.711× peer** at 200-tok matched regime
+(up from default 0.679×).
+
+### Updated `scripts/adr028_full_stack_bench.sh` reference table
+
+Reflects iter-318 + iter-319 measurements with proper peer baseline
+(tg1024=97 matched regime, vs tg128=102 burst).  Operator decision
+tree updated.
+
+### Coherence + TQ-HB
+
+Same status as iter-318: byte-identical "2+2=4" output, TQ-HB scaffold
+intact (no FA-path touched), 3.94× memory savings preserved.
+
+### Status of operator-decision queue
+
+| Path | × peer | Cost | TQ-HB |
+|---|---|---|---|
+| Status quo | 0.679 | 0 | ✓ |
+| Flip G+FUSED (iter-293 candidate) | 0.700 | env-flag default | ✓ |
+| **Flip G+FUSED+V2+NR2 (iter-318 ★ new candidate)** | **0.711** | **env-flag default** | **✓** |
+| Path E+G+FUSED+V2+NR2 | 0.735 | breaks TQ-HB | ✗ |
+| DFlash port | 1.4-2.8 | multi-month | ✓ |
+| Apple Instruments profiling | unknown | manual GUI | ✓ |
+
+### Files modified
+
+- `/opt/hf2q/scripts/adr028_full_stack_bench.sh`: updated reference
+  table to reflect iter-318 + iter-319 measurements
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`:
+  this section
