@@ -6642,6 +6642,56 @@ iter-220+ plan: shift away from fusion strategy.  Either accept current
 floor OR pivot to fundamentally different optimization angle (kernel
 implementation efficiency, e.g. simdgroup_sum to replace tree-reduce).
 
+### iter-220 — strategic pivot: fusion strategy retired
+
+iter-219's measurement (+0.3% vs predicted +2.7%) **invalidates the
+fusion strategy**.  Bisects measure dispatch GPU time INCLUDING the
+compute work; fusion only saves launch overhead which is small.
+
+**Roadmap revision** (post-iter-219 lesson):
+
+**Levers ranked by realistic ROI**:
+
+| Lever | Effort | Realistic ROI | Status |
+|-------|--------|--------------:|--------|
+| Path E (USE_DENSE) flag | 1 line | +3% | available NOW |
+| Path E+G stack | 1 env var combo | +5% | available NOW |
+| Path E+F+G stack | 1 env var combo | +6.4% | available NOW |
+| 3 fusion kernels (compounded) | multi-week | ~+1% | **revised down** |
+| simdgroup_sum kernel optimization | multi-day | +0.5% | future |
+| Shared-mem fused kernel rewrite | multi-day | +0.5% | future |
+| TQ-HB→F16 KV (covered by Path F) | 1 line | (above) | available NOW |
+| Architectural arena patterns | multi-week | +5-10% | future |
+| qwen3.6 cross-pollination | multi-month | +5-15% | future |
+| ggml graph fusion infra | multi-month | +10-20% | future |
+
+**Key insight from this session**: SKIP bisects measure dispatch
+COSTS but fusion savings ≠ dispatch costs.  The compute work (RMS
+reduce, mat-mul, etc.) survives fusion.  Future fusion attempts
+should target SHARED-COMPUTE patterns (eliminating duplicate work),
+not dispatch-elimination patterns.
+
+**Operator decision space** (final, data-complete):
+
+| Default | tok/s | vs peer | Decision required |
+|---------|------:|--------:|--------------------|
+| Status quo (current default) | 68.8 | 0.670× | none |
+| Approve Path E flip | ~71 | ~0.69× | 1-line, exact precision |
+| Approve Path E+F+G flip | 73.2 | 0.713× | 1-line, F16 25 ppm drift |
+
+**Cumulative session** (38 iters, 104 tasks):
+- **Shipped**: default 62.5 → 68.8 tok/s = +10.1% byte-identical
+- **Built**: fused_post_ff_norm2_endlayer kernel (correct, parity-validated, +0.3% delivered)
+- **Discovered**: cost-class hypothesis (concurrent free, sequential+substantial = real)
+- **Discovered**: SKIP bisect ≠ fusion savings (compute work survives fusion)
+- **Validated**: 9 falsifications saved multi-day misallocations
+- **Mapped**: 96% of body GPU bisect coverage, irreducible floor 4.85 ms
+- **Refuted**: 5 fusion ROI guesses (each off by 5-20×)
+
+iter-221+ would continue marginal kernel-internal optimizations or wait
+for operator-direction.  Without new information, the bisect-driven
+discipline has reached its useful limit on default-path single-iter wins.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
