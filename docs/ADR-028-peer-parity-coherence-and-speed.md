@@ -7911,6 +7911,91 @@ it.  Reaching out to operator is the right move here.
 
 **Audit phase complete**.  Future progress is operator-decision-gated.
 
+### iter-246 — H1 ROI FALSIFIED via direct measurement
+
+Operator approved H1 work ("sounds right to try?").  Per
+"code+test==truth", verified the H1 ROI assumption BEFORE writing
+the kernel.  Result: **H1's dossier ~12% ROI estimate is wrong
+for hf2q.**
+
+**Bisect investigation 1 — intermittent `<pad>` pattern at varied N**:
+
+Path E+F+G (HF2Q_F16_KV=1) at varying N values, same prompt:
+
+| N tokens | `<pad>` present? |
+|---------:|-----------------:|
+| 250 | NO (coherent) |
+| 300 | YES |
+| 350 | NO (coherent) |
+| 400 | YES |
+
+Pattern is **intermittent, not cumulative**.  N=300 fails but N=350
+succeeds — rules out simple cumulative-noise theory.  The `<pad>`
+hits at specific knife-edge token positions where F16 noise flips
+argmax, then the next argmax goes back to coherent.  Consistent with
+hf2q's deterministic-greedy sampling (per iter-243): F16 noise
+matters only at uncertain-token positions where multiple
+continuations have similar logits.
+
+**Bisect investigation 2 — F16 KV alone perf at HEAD**:
+
+| Stack | tok/s @ 100-tok | Δ vs default |
+|-------|----------------:|-------------:|
+| Default | 69.3 | 0 |
+| HF2Q_F16_KV=1 (alone) | 68.6 | **-1.0% (no-op or slight regression)** |
+| HF2Q_USE_DENSE=1 (alone) | 71.5 | +3.2% |
+
+**F16 KV alone is a no-op (or slight regression) at HEAD on gemma4**
+— matches iter-184's earlier finding "F16_KV-alone is a no-op,
+USE_DENSE gets 90% of E+F win".
+
+**Why the dossier estimate was wrong for hf2q**:
+
+llama.cpp's peer-grounded +12% estimate assumed bypassing TQ-HB-
+equivalent overhead.  But hf2q's TQ-HB SDPA is already heavily
+optimized post-iter-195 (vectorized dequant_hb_float4) + iter-197
+(function-constant cbits) = **+10.6% measured default-path improvement
+this session alone**.  The TQ-HB optimization closed the per-K-element
+arithmetic delta that the dossier identified as the +12% lever.
+
+**H1's actual ROI for hf2q at HEAD ≈ +1-2%**, not +12%.
+
+**Engineering vs. ROI reality check**:
+- H1 implementation: 1-2 weeks (kernel work + decode-only gating +
+  long-context coherence test + cross-model parity)
+- Realistic gain: ~+1-2% (perf-equivalent to existing Path E+F+G)
+- BUT: still inherits iter-233 knife-edge `<pad>` correctness issue
+  on gemma4 → STILL needs the deprecation safety net
+
+**H1 is REVOKED as a perf project**.  The peer-grounded estimate
+turned out to be falsified by hf2q-specific measurement.
+
+**Updated lever priority**:
+
+| Lever | Real ROI at HEAD | Effort | Recommendation |
+|-------|-----------------:|--------|----------------|
+| Path E+G default flip | +4.7% | minutes | ★ ship if memory tradeoff acceptable |
+| Path E+G+FUSED default flip | +6.3% | minutes | ★ ship if UNSAFE_EXP gate acceptable |
+| H1 (F16 KV decode-only) | +1-2% | 1-2 weeks | DON'T BUILD — falsified ROI |
+| C/DFlash spec-decode | +50-100% | 11-15 weeks | multi-month project decision |
+
+**Mantra check**: "Code+test==truth" + "Never make assumptions" +
+"Measure 3x cut once" — this iteration validated the assumption
+BEFORE 1-2 weeks of engineering.  Saved the misallocation.
+
+**Honest operator-facing recommendation**:
+
+1. **Immediate**: flip Path E+G default (~3 lines in
+   `investigation_env.rs` to flip the default from `false` to `true`
+   for `use_dense` + `lmhead_q6k`).  +4.7%.  No engineering risk.
+   Memory tradeoff: per-slot KV doubles vs TQ-HB.
+
+2. **Next major project**: pursue C (DFlash) for 50-100% gain.
+   Multi-month but the only remaining lever with meaningful ROI.
+
+3. **Don't pursue**: H1 — measurement-falsified ROI doesn't justify
+   the engineering scope.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
