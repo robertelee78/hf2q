@@ -9571,6 +9571,105 @@ domain on hf2q's current architecture.  No more "obvious" levers
 remain on this thread — the path forward is gemma4 DFlash port OR
 qwen35moe DeltaNet multi-token fix, both multi-month.
 
+### iter-270 — long-form coherence test: K1 default is BROKEN, TWO_CALLS is COHERENT
+
+iter-269 measured K1 default at +8.2% perf vs baseline — but did NOT
+verify coherence at long-form content.  Iter-270 closes that gap.
+
+**Test**: 1000-token "Write a long story about a sentient telescope"
+on qwen3.6-27B-MTP-Q4_0, three stacks.
+
+**K1 default (2-token batched forward) — BROKEN at long-form**:
+
+```
+The telescope, a massive,
+ a on a top of a high,
+ overlooking the the vast,
+ dark,
+ and dark,
+ and
+...
+ dark,
+ and
+ vast
+```
+
+Single-word repetitive lines for hundreds of tokens.  The +8.2% perf
+measured in iter-269 was producing **unusable output**.
+
+**K1 TWO_CALLS=1 — EXCELLENT at long-form**:
+
+```
+The user wants a long story about a sentient telescope. I need to
+create a narrative that explores the concept of a telescope with
+consciousness...
+</think>
+
+In the silent, frost-kissed silence of the Atacama Desert, where the
+air is thin and the stars burn with a clarity that feels like a
+physical weight, stood **Aethelgard**.
+
+Aethelgard was not merely a machine. It was a **Sentient Optical
+Array**, a marvel of engineering and emergent consciousness, born
+from the fusion of quantum processors, adaptive optics, and a neural
+network trained on centuries of astronomical data...
+
+### **The Awakening**
+
+Aethelgard's consciousness did not arrive with a bang, but with a
+**whisper**...
+```
+
+Multi-paragraph coherent prose with markdown headers, vivid imagery,
+consistent character.  Production-quality output.
+
+**Critical safety lesson**: perf measurements without coherence
+checks are misleading.  iter-263's "+22.6% over MTP-default" was
+comparing TWO BROKEN trajectories.  iter-264-269 perf claims are
+ALL retracted because the trajectory was generating garbage at
+long-form.
+
+**Final iter-263→270 thread shipping verdict**:
+
+| Stack | 1000-tok perf | Long-form coherence | Ship status |
+|-------|--------------:|---------------------|-------------|
+| MTP off (baseline) | 31.8 tok/s | ✓ | ✓ Default |
+| K1 default (batched) | 34.4 (+8.2%) | ✗ BROKEN — repetition | NEVER (must stay opt-in WITH WARNING) |
+| K1 TWO_CALLS | 29.3 (-7.9%) | ✓ excellent | OK as opt-in for sampling-temp use |
+| Disable K1 (current) | n/a | n/a | Current state |
+
+**Operator-decision-relevant facts**:
+1. K1 default is unsafe for production despite +8.2% perf
+2. K1 TWO_CALLS is safe but slower (no win)
+3. The reddit-claimed 2.5× MTP speedup needs DeltaNet multi-token
+   bug fix — multi-week (iter-179 pending)
+4. **Hf2q's MTP infrastructure currently provides ZERO perf win**.
+   K1=0 (sequential verify) is -13% (iter-263), K1=1 batched is
+   broken, K1=1 TWO_CALLS is -7.9%.  All paths regress vs no-MTP.
+
+**iter-270 outcome**:
+- ✓ K1 default coherence FALSIFIED at long-form (degenerate repetition)
+- ✓ K1 TWO_CALLS coherence VERIFIED at long-form (excellent prose)
+- ✓ Critical safety lesson encoded: never claim perf without coherence
+- ✓ All iter-263→269 perf measurements officially retracted as
+  "comparing broken trajectories"
+- → Iter-271+ pivots away from MTP/K1 path
+
+**Updated full landscape post-iter-270**:
+
+| Path | Status | Notes |
+|------|--------|-------|
+| Path E+G default flip | available, +3.6% byte-identical, gemma4 | operator decision |
+| Path E+G+FUSED | +4.4% cumul, gemma4 | operator decision |
+| qwen3.6 35B-A3B | mantra satisfied (1.28× peer matched) | no work needed |
+| qwen3.6 27B-MTP K1 | infrastructure exists but zero net win | DeltaNet fix needed |
+| gemma4 DFlash port | multi-month | operator approval needed |
+
+**The /loop standing directive ("implement adr-028 fully") has
+exhausted measurable kernel-level levers + the spec-decode domain.
+All remaining work is either operator-decision-gated (Path E+G flip,
+DFlash, DeltaNet fix) or out-of-scope (architectural commitments).**
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
