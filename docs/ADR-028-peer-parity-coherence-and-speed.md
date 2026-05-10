@@ -3775,6 +3775,60 @@ Expected:
 Multi-iter scope (~150-300 LOC). Verifier 2-token forward shape
 already supported (prefill batching infra).
 
+### iter-160: scope batched-verify refactor — sizing K choice
+
+#### Why K=1 batched verify alone gives only ~1.1× speedup
+
+Standard spec-decode amortization analysis at K=1:
+```
+Greedy:        T_v per token (1 forward, 1 token out)
+Spec K=1 BV:   T_v(2) + T_d per iter (1 batched verify, 1 draft)
+                emits 1+a tokens (a = accept probability)
+Speedup:       1+a × T_v / (T_v(2) + T_d)
+```
+
+If T_v(2) ≈ 1.4 × T_v (decode is sublinear on N because KV-state dominates):
+- T_v = 31.5 ms, T_d = 4 ms, a = 0.78
+- Spec: 1.78 × 31.5 / (44.1 + 4) = 56 / 48 = **1.16× greedy**
+
+Modest. To get llama.cpp's 2.5×, need K=3:
+- 3 chained drafts: 12 ms
+- T_v(4) ≈ ~1.7 × T_v = 53 ms
+- 4 tokens at 78%-each accept ≈ 1 + 0.78 + 0.78² + 0.78³ = 2.62 tokens
+- Per iter: 12 + 53 = 65 ms → 40 tok/s
+- vs greedy 32.5 → **1.23× speedup**
+
+For 2.5× need very high accept (>90%) or chain longer. Reddit's
+2.5× claim assumes Q5_K_M model + temp=0.7 (not greedy) which
+typically yields higher accept than greedy.
+
+#### iter-161 walk-phase target — bench verifier(N) scaling FIRST
+
+Before refactor, measure T_v(N) for N=1..4 by:
+1. Modify `forward_gpu_with_hidden` test harness to time N-token forward
+2. Or: add HF2Q_VERIFIER_NBENCH env probe in spec_decode that runs
+   forward_gpu_with_hidden with synthetic 2-token, 3-token inputs
+3. Read times, pick K minimizing per-token cost
+
+Without this measurement, K=1 vs K=2 vs K=3 choice is a guess. Per
+operator mantra "test before change".
+
+#### Refactor scope (iter-162+ after K decision)
+
+For chosen K:
+1. spec_decode.rs: chain MTP forward_draft K times, building
+   draft_chain = [draft_1, ..., draft_K]
+2. Verifier call: forward_gpu_with_hidden(&[token_next, draft_1, ...],
+   positions [pos, pos+1, ..., pos+K])
+3. Accept-prefix:
+   for i in 0..K: if argmax(verify_logits[i]) == draft_chain[i]:
+     accepted += 1; else: break
+4. Emit accepted+1 tokens
+5. KV cache rollback for K-accepted positions (use
+   verifier::rollback_kv_state from Path A Phase 2 GPU scaffold)
+
+Total LOC: ~150-300. Multi-iter.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
