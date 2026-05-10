@@ -10133,6 +10133,54 @@ investigation thread**.  Rationale:
   deliverables (Path E+G flip prep, regression gate runs, ADR
   closing summary).
 
+### iter-277 — future-session continuity memory shipped
+
+Wrote `~/.claude/projects/-opt-hf2q/memory/project_adr028_iter263_276
+_k1_thread_closure_2026_05_10.md` capturing the iter-263→276 thread
+closure for future-session pickup.  MEMORY.md index updated with
+one-line entry.
+
+This prevents future sessions from re-investigating already-refuted
+hypotheses.  The memory entry documents:
+- 2 production code changes shipped (multi-EOS API + name-based EOS
+  resolver)
+- 3 permanent regression gates (DeltaNet seq=2 mid-stream + batched-
+  vs-sequential + FA resume kernel parity)
+- 5 hypothesis refutations with measured evidence
+- Strategic retract rationale (qwen3.6 production already 1.28× peer
+  matched; K1 ROI uncertain; multi-iter forward-instrumentation
+  required for full localization)
+- Cross-references to commit chain `2c4d188` `82522f7` `6325462`
+  `6e6a374`
+
+**Operator-actionable summary at HEAD (post iter-263→277)**:
+
+Per the ADR's iter-276 decision matrix — the production landscape:
+
+1. **gemma4 26B-A4B**: 0.726× peer matched.  Below mantra bar.
+   - Path E+G default flip: tested at +3.6% byte-identical (1 line)
+   - +FUSED on top: tested at +0.7% (cumul +4.4%, 1 line)
+   - DFlash port: multi-month, operator-decision-gated per iter-227
+2. **qwen3.6 35B-A3B-APEX**: 1.28× peer matched ★ MANTRA SATISFIED
+3. **qwen3.6 27B-MTP**: K1 spec-decode trajectory bug (orchestration-
+   level), opt-in only, ROI uncertain pending multi-iter fix
+
+**iter-277 outcome**:
+- ✓ Memory entry shipped (`project_adr028_iter263_276_k1_thread_closure_2026_05_10.md`)
+- ✓ MEMORY.md index updated
+- ✓ ADR closing summary at iter-276 + this iter-277 update
+- → All operator-decision-gated work flagged; no concrete buildable
+  steps remain without explicit operator approval
+
+**Standing summary for future sessions**:
+- Production qwen3.6 path satisfies operator mantra
+- gemma4 path requires either default-flip approval (immediate) or
+  DFlash commitment (multi-month)
+- All measurable kernel/layer optimization landscape is exhausted
+  with measured falsifications
+- 14-iter MTP/K1 thread closed with permanent test infrastructure as
+  the lasting value
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
