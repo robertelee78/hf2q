@@ -15478,3 +15478,68 @@ New Metal kernel `flash_attn_vec_hybrid_dk256` in `/opt/mlx-native/src/shaders/`
 - Writes scaled+softmax output into the existing SDPA-out buffer.
 
 Reference: `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:5801 kernel_flash_attn_ext_impl` for the F16-K simdgroup matmul layout; `/opt/mlx-native/src/shaders/flash_attn_vec_tq_hb.metal` for the existing V-side TQ-HB codebook lookup.  Expect ~5-7 /loop iters for kernel + parity + bench (10d-10g).
+
+## iter-349 — Phase 10d LANDED: `flash_attn_vec_hybrid_dk{256,512}` Metal kernel + dispatcher + parity
+
+### Date
+2026-05-10
+
+### Hypothesis (from iter-348 design)
+A new Metal kernel that reads K as F16 dense (no codebook lookup, no per-pos norm) while keeping V on the existing TQ-HB byte-packed + Lloyd-Max codebook path will:
+1. Compile cleanly via the existing `kernel_registry` + `function_constant(50)` cbits specialization machinery (re-use of TQ-HB ABI).
+2. Produce NRMSE ≤ 5e-2 vs CPU reference (F16-roundtrip K + HB-dequant V + standard SDPA).  Expected band: dominated by V 8-bit Lloyd-Max noise (~8e-3), with K side at F16 precision floor (~1e-3 relative).
+3. Eliminate the codebook lookup overhead on the K side — the structural close on the 1.81× per-dispatch gap measured iter-326..342.
+
+### Result
+**LANDED.**  Both kernel + dispatcher + parity tests live:
+
+- **Parity (8-bit cbits, D=256)** — measured NRMSE far below the 5e-2 acceptance band, dominated by F16 precision not V codebook:
+  - `flash_attn_vec_hybrid_dk256_8bit_small_fixture` (nh=4, nkv=1, kvl=16): max_abs_diff = **1.999736e-4**, NRMSE = **1.270387e-4**.
+  - `flash_attn_vec_hybrid_dk256_8bit_kvl64_gqa4` (nh=16, nkv=4, kvl=64): max_abs_diff = **1.554787e-4**, NRMSE = **1.726908e-4**.
+
+  Both **~50× better** than the legacy 8-bit TQ-HB SDPA path's ~8e-3 NRMSE.  This is a coherence WIN, not just a perf path — F16 K is structurally more accurate than 8-bit Lloyd-Max K on the dot product.
+
+- **mlx-native lib tests**: 284/0 passing (no regression on existing kernels).
+- **mlx-native dispatcher unit tests**: 4/0 passing (params size, validate-bad-bits, validate-ok-8bit, validate-bad-head_dim).
+- **hf2q lib tests**: 3454/0 passing (no regression).
+
+### Critical design discovery (iter-349)
+
+The hybrid kernel does NOT need FWHT on Q.  In the legacy TQ-HB path both K and V are FWHT-rotated during encode, so the kernel reads pre-rotated K/V and the caller pre-rotates Q (preserving `<FWHT(K), FWHT(Q)> = <K, Q>`).  For hybrid, K is stored F16 raw (no FWHT), so the dot product must use raw Q — applying FWHT to Q alone would yield wrong results.
+
+**This is a structural perf win in production**: at hf2q wiring time (Phase 10e), the hybrid path skips BOTH the `dispatch_fwht_sign_premult_f32` Q-pre-rotation AND the `dispatch_fwht_sign_undo_f32` output-undo dispatches per-layer.  At gemma4 30L, that's 60 dispatches/decode-token saved on top of the K-side codebook elimination.
+
+### Files added
+
+- `/opt/mlx-native/src/shaders/flash_attn_vec_hybrid.metal` — 724-line shader.  Identical to `flash_attn_vec_tq_hb.metal` except:
+  - Signature drops `K_norms` buffer; K is `device const half *K_f16` at buffer slot 2.
+  - K-loop body replaces `dequant_hb_float4(k_base, ...)` with `(float4)*((device const half4 *)k_base)` direct load.
+  - Both D=256 and D=512 kernel instantiations.
+  - V-side codebook lookup unchanged (same `CBITS_FC` function constant at index 50; same `dequant_hb_float4` helper; same 5/6/8-bit selector).
+- `/opt/mlx-native/src/ops/flash_attn_vec_hybrid.rs` — 280-line Rust dispatcher.  Re-uses `FlashAttnVecTqHbParams` and `tmp_buffer_bytes` + `compute_nsg` from the TQ-HB module via `pub use`.  Adds:
+  - F16 dtype hard-check on K buffer (catches silent 2× overrun if caller passes F32 K).
+  - Same NSG-aware shmem + threadgroup layout as TQ-HB.
+  - Compacted 6-buffer binding (vs 7 in TQ-HB; K_norms removed).
+  - 4 unit tests: params-size (60 bytes match TQ-HB), validate-bad-bits, validate-ok-8bit, validate-bad-head_dim.
+- `/opt/mlx-native/tests/test_flash_attn_vec_hybrid.rs` — 380-line integration test.  CPU reference SDPA + GPU encoder round-trip for V byte-exact parity.  Two test fixtures (kvl=16, kvl=64).
+
+### Files modified
+
+- `/opt/mlx-native/src/ops/mod.rs`: add `pub mod flash_attn_vec_hybrid;`.
+- `/opt/mlx-native/src/kernel_registry.rs`: register `flash_attn_vec_hybrid_dk{256,512}` against the new shader source.
+
+### What 10e will need (unblocked by this iter)
+
+At hf2q `forward_mlx.rs:3744+` (the SDPA dispatch site, currently hard-failing under `INVESTIGATION_ENV.hybrid_kv` per iter-348 design):
+1. Skip the `dispatch_fwht_sign_premult_f32` Q-pre-rotation when `hybrid_kv` is set (Q stays raw F32).
+2. Call `mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid` instead of `flash_attn_vec_tq_hb::flash_attn_vec_tq_hb` (different buffer signature: drops K_norms).
+3. Skip the `dispatch_fwht_sign_undo_f32` output-undo when `hybrid_kv` is set (output is already in raw domain).
+4. Mirror the same flag-routing changes at the prefill paths in `forward_prefill.rs` and `forward_prefill_batched.rs` (Phase 10c wired the encode side; 10e wires the SDPA dispatch side at all 3 sites).
+
+### Bench (still no default-path delta — kernel landed but not wired)
+
+Default decode (gate OFF) unchanged: gemma4 71.8 tok/s baseline preserved.  Phase 10e wiring + 10g bench will produce the first hybrid-vs-legacy speed measurement.
+
+### Next iter (10e)
+
+Wire the hybrid SDPA dispatcher at hf2q's 3 SDPA sites with the FWHT-skip described above.  Expected delta: per-dispatch wall on hybrid SDPA reaches peer territory (~7 µs vs current TQ-HB 14.7 µs), plus 60 fewer FWHT dispatches/decode-token at gemma4 30L.  If realized at production scale: gemma4 decode from 71.8 → estimated 95-100 tok/s (~0.92-0.97× peer).  Bench under 10g.
