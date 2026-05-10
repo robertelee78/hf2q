@@ -4307,14 +4307,24 @@ impl MlxModelWeights {
             // GPU section separately. Adds ~50μs sync overhead — measurement only.
             let body_dispatches = total_dispatches;
             let split_timing = INVESTIGATION_ENV.split_timing;
+            // ADR-028 iter-312 — group-stats dump for barrier audit.
+            let group_stats_enabled = std::env::var("HF2Q_GROUP_STATS")
+                .ok()
+                .as_deref()
+                .map_or(false, |v| v == "1");
             if split_timing {
                 let body_barriers = s.barrier_count();
+                if group_stats_enabled {
+                    s.dump_group_stats();
+                }
                 let (enc_ns, gpu_ns) = s.finish_with_timing(session_start)
                     .map_err(|e| anyhow::anyhow!("body finish: {e}"))?;
                 eprintln!("  [SPLIT] BODY: encode={:.2}ms gpu={:.2}ms dispatches={} barriers={}",
                     enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, body_dispatches, body_barriers);
                 // Start a new session for the head
                 s = exec.begin().map_err(|e| anyhow::anyhow!("head session: {e}"))?;
+            } else if group_stats_enabled {
+                s.dump_group_stats();
             }
 
             // --- 3. Final norm + lm_head + softcap + argmax (all GPU) ---

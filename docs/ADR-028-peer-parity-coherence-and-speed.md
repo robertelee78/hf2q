@@ -12493,3 +12493,74 @@ test after each (regression-gate via existing
   this section.
 
 No code changes in iter-311 — measurement + lever-sizing iter.
+
+
+---
+
+## iter-312 — barrier audit reveals OVER-CONSERVATIVE range tracking
+
+Wired group-stats dump to gemma4 decode path
+(`HF2Q_GROUP_STATS=1` + `HF2Q_SPLIT_TIMING=1`).  Live measurement on
+gemma4 APEX-Q5_K_M decode token:
+
+```
+[GROUP_STATS] dispatches=594 barriers=459 groups=459 ratio=1.29
+  size 1: 351 groups       ← 76% of groups have NO concurrency
+  size 2:  81 groups
+  size 3:  27 groups
+```
+
+(594 barrier-tracked dispatches of 956 total; the other 362 don't
+participate in `barrier_between` and run through different paths.)
+
+**76% of barrier-tracked dispatches run ALONE.**  Ratio
+(dispatches/groups) is **1.29** — barely above pure serial (1.0).
+
+For comparison: pure-concurrent would be 1 group of 594 dispatches;
+peer's `mem_ranges` design typically produces ratio ~5-10.
+
+### Hypothesis: false-positive range overlaps
+
+Our `ConflictTracker::conflicts_reason` uses `contents_ptr +
+byte_len` for each `MlxBuffer`.  When multiple writes go to
+DIFFERENT offsets in the SAME buffer (e.g. Q/K/V into a combined
+QKV buffer at offsets 0/2816/4096), the range check sees them as
+overlapping → false conflict → unnecessary barrier.
+
+Test case (typical gemma4 layer):
+- Q matvec: writes QKV buffer at offset 0..2816
+- K matvec: writes QKV buffer at offset 2816..4096
+- V matvec: writes QKV buffer at offset 4096..5376
+
+All three write the same buffer pointer + same total length per the
+tracker's view.  Our check sees overlap between Q and K writes →
+emits barrier even though they're disjoint.
+
+Three plausible Q/K/V matvecs that could run CONCURRENT are
+serialized into 3 groups instead of 1.
+
+### iter-313 plan: per-offset range tracking
+
+Audit a hot path (Q/K/V projections) and switch `MlxBuffer`-based
+read/write tracking to per-offset slices (start, end) where
+distinct sub-regions exist.
+
+Two paths to try:
+1. **Slice-level conflict tracking:** extend `MemRange` to include
+   byte offset+length within the buffer; check overlap at
+   sub-buffer granularity.
+2. **Disjoint-write annotation:** allow callers to say "this write
+   covers bytes [off, off+len) within buffer X" instead of "this
+   write covers all of X."
+
+Either path requires churn at every `barrier_between` call site
+(~36 in forward_mlx.rs).  iter-313 will start with the Q/K/V site
+specifically — that's 3 barriers/layer × 30 layers = 90/tok = ~20%
+of all barriers in one swoop.
+
+### Files modified
+
+- `/opt/hf2q/src/serve/forward_mlx.rs`: env-gated
+  `dump_group_stats()` call after BODY split.
+
+No production code change — measurement instrumentation only.
