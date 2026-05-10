@@ -808,7 +808,9 @@ impl InvestigationEnv {
             mlx_timing: env::var("HF2Q_MLX_TIMING").is_ok(),
             split_timing: env_eq_one("HF2Q_SPLIT_TIMING"),
             fused_triple_norm: env_eq_one("HF2Q_FUSED_TRIPLE_NORM"),
-            fused_end_of_layer: env_eq_one("HF2Q_FUSED_END_OF_LAYER"),
+            // ADR-028 iter-326: default-flipped to ON (operator REFRAME #2).
+            // Opt out with `HF2Q_FUSED_END_OF_LAYER=0` / `=false` / `=off`.
+            fused_end_of_layer: env_default_true("HF2Q_FUSED_END_OF_LAYER"),
             kv_dual_legacy: env_eq_one("HF2Q_KV_DUAL_LEGACY"),
             hb_dual_legacy: env_eq_one("HF2Q_HB_DUAL_LEGACY"),
             mlx_kernel_profile: env_eq_one("HF2Q_MLX_KERNEL_PROFILE"),

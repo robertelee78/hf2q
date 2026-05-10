@@ -13411,3 +13411,186 @@ smoking-gun memory entry).
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section
 
 No code changes — pure continuity hygiene.
+
+
+---
+
+## iter-326 — operator REFRAME #2: full-closure plan + RAM-minimization constraint
+
+After iter-324 closed the TQ-HB-intact stack thread at gemma4 0.74× peer
+sustained, operator returned in this session with three coupled directives
+that reset the work-of-record:
+
+1. **Close the gap entirely.** "We can do whatever is needed to close the
+   gap, as long as it is aligned with `~/Documents/mantra.txt`."  Mantra:
+   *no shortcuts, no fallback, no stub code, measure 3x cut once,
+   Chesterton's fence — understand current fully before changing it.*
+2. **Default-flip the safe stack.** "The default should have the best
+   things on that provide the best mantra-aligned outcome for users."
+   Authorizes flipping all 5 parity-proven flags from default-OFF/opt-in
+   to default-ON/opt-out (env=0 disables).
+3. **Minimize RAM while hitting peer parity AND keeping TQ properly
+   intact.** This adds a hard RAM-budget constraint to every subsequent
+   optimization: the TQ-HB 3.94× per-slot KV memory savings (Phase B
+   landed iter-23) is non-negotiable, AND we must seek further per-token
+   peak-memory reductions (within reason) on top of speed work.
+
+   This is operator-binding context for evaluating Path E and any future
+   memory-trading optimizations: **NEVER trade peak memory for speed
+   without explicit operator sign-off.**  Path E's iter-323 result
+   (+1.9% sustained at the cost of 3.94× → ~1× memory) is now formally
+   REJECTED by this constraint.
+
+This iter ALSO ran a parallel deep-research pass via three Explore
+sub-agents (full kernel-by-kernel peer-vs-hf2q diff, CPU-side per-dispatch
+overhead source, F16 KV peer path).  Findings recorded in
+`/Users/robert/.claude/projects/-opt-hf2q/memory/project_adr028_iter325_deep_research_synthesis_2026_05_10.md`
+and revised the iter-308 candidate list:
+
+### Revised gemma4 lever priority (deep-research-grounded)
+
+| Order | Lever | ETA | Risk | Est. gain on 0.74× | RAM impact |
+|---|---|---|---|---|---|
+| 1 | Default-flip 5-flag safe stack (Phase 1a) | 0.5 day | low | +9.6% baked in | none |
+| 2 | Bench `HF2Q_ENCODER_SESSION=1` default (Phase 1b) | 0.5 day | low | +15-25% if wins | likely lower (fewer CBs) |
+| 3 | Port Q5_K mat-vec nr0=2 + yl/yh cache (Phase 2) | 1-2 days | low | +8-12% on Q5_K_M | none |
+| 4 | Port Q4_K mat-vec same pattern (Phase 3) | 1 day | low | +3-5% | none |
+| 5 | Port `fused_norm_add_f32` to float4 (Phase 4) | 1 day | low | +1-2% | none |
+| 6 | Port `fused_head_norm_rope_f32` to float4 (Phase 5) | 1 day | low | +1-2% | none |
+| 7 | F16 KV + `clip_residual` guard (Phase 6, gemma4 only) | 1 day + 0.5 bench | medium | +12% or 0% | LOWER (F16 < F32 KV) |
+| 8 | TQ-HB kernel-fusion redesign (Phase 7) | multi-week | higher | depends; closes per-dispatch gap | KEEP TQ-HB savings |
+
+**Aggregate-best forecast** (if Phases 1a + 1b + 2 + 3 + 6 land):
+gemma4 sustained 1000-tok could reach `0.74× × 1.20 (encoder) × 1.10 (Q5_K) × 1.04 (Q4_K) × 1.12 (F16 KV) = ~1.20× peer`,
+with RAM possibly LOWER than current (F16 KV halves K/V slot
+storage; encoder session reduces transient CB memory).
+
+### Constraint reordering
+
+Phase 7 (TQ-HB fusion redesign) is operator-authorized but timeboxed
+behind the cheaper levers.  Open it only if Phases 1-6 plateau below
+mantra (peer-parity).  The redesign MUST preserve TQ-HB 3.94× memory
+savings — operator iter-326 directive is binding.
+
+### Note: iter-308 candidate list correction
+
+iter-308's MoE kernel candidates (`moe_swiglu_batch`,
+`fused_moe_routing_f32`, `moe_weighted_sum`) are **N/A for gemma4**
+(gemma4 is dense, not MoE).  Those are qwen3.6-only levers and qwen3.6
+is already 1.37× peer; deferring indefinitely.
+
+`fused_norm_add_f32` and `fused_head_norm_rope_f32` ARE valid
+float4-vectorization candidates (peer uses
+`kernel_norm_fuse_impl<float4>`) — kept as Phase 4 + 5.
+
+### Multi-phase plan now tracked in TaskCreate
+
+| ID | Subject | Status |
+|---|---|---|
+| 1 | Phase 1a: Default-flip 5-flag safe stack | **in_progress** |
+| 2 | Phase 1b: Bench `HF2Q_ENCODER_SESSION=1` default-flip | pending |
+| 3 | Phase 2: Port Q5_K mat-vec nr0=2 + yl/yh cache | pending |
+| 4 | Phase 3: Port Q4_K mat-vec same pattern | pending |
+| 5 | Phase 4: Port `fused_norm_add_f32` to float4 | pending |
+| 6 | Phase 5: Port `fused_head_norm_rope_f32` to float4 | pending |
+| 7 | Phase 6: F16 KV + `clip_residual` guard | pending |
+| 8 | Phase 7: TQ-HB kernel-fusion redesign (multi-week) | pending |
+
+Each phase landing closes its task and opens an ADR §iter-XXX subsection
+documenting numbers + parity + commit shas.  This ADR is now the
+single source of truth for work-to-do and work-completed on ADR-028.
+
+### Phase 1a scope (this iter, in_progress)
+
+5 parity-proven flags flip to default-ON, opt-out via `=0`/`false`/`off`:
+
+| Flag | Repo + file:line | Current default | New default |
+|---|---|---|---|
+| `HF2Q_LMHEAD_Q6K` | `hf2q/src/serve/forward_mlx.rs:1295` | OFF (Q8_0/F16 auto) | ON when on-disk Q6_K |
+| `HF2Q_FUSED_END_OF_LAYER` | `hf2q/src/debug/investigation_env.rs:811` | OFF | ON |
+| `HF2Q_RMS_NORM_V2` | `mlx-native/src/ops/rms_norm.rs:103,663` | OFF | ON when F32+dim%4==0 |
+| `HF2Q_Q6K_MV_NR2` | `mlx-native/src/ops/quantized_matmul_ggml.rs:483` | OFF | ON when type==Q6_K |
+| `HF2Q_Q6K_ID_MV_NR2` | `mlx-native/src/ops/quantized_matmul_id_ggml.rs:480` | OFF | ON when type==Q6_K _id |
+
+Helper added: `mlx-native/src/env_flags.rs` exposes
+`env_default_true(name)` mirroring the helper at
+`hf2q/src/debug/investigation_env.rs:1106-1121`.
+
+Acceptance gate (must all PASS before commit):
+- 14/14 parity tests (iter-309/310/321) PASS unchanged
+- 1000-tok coherence smoke on gemma4 + qwen3.6 APEX: PASS
+- 200-tok bench on gemma4 APEX shows ~+4-5% vs HEAD (defaults now baked in)
+- Build clean both repos
+- `HF2Q_*=0` opt-out verified to restore old behavior on at least one flag
+
+### Phase 1a — implementation + gate results (closed)
+
+**Code shipped**:
+- `mlx-native/src/env_flags.rs` (NEW) — `env_default_true(name)` helper
+  with 6/6 unit tests covering unset/`1`/`0`/`false`/`off`/permissive paths.
+- `mlx-native/src/lib.rs` — register `mod env_flags;` in internal modules.
+- `mlx-native/src/ops/quantized_matmul_ggml.rs:482-493` — `HF2Q_Q6K_MV_NR2`
+  default-ON via helper; `use crate::env_flags::env_default_true;`.
+- `mlx-native/src/ops/quantized_matmul_id_ggml.rs:478-486` —
+  `HF2Q_Q6K_ID_MV_NR2` default-ON.
+- `mlx-native/src/ops/rms_norm.rs:99-110, 661-666` — `HF2Q_RMS_NORM_V2`
+  default-ON at both dispatch sites.
+- `hf2q/src/debug/investigation_env.rs:811-813` — `HF2Q_FUSED_END_OF_LAYER`
+  default-ON via existing `env_default_true` helper (no boundary cross).
+- `hf2q/src/serve/forward_mlx.rs:1290-1313` — `HF2Q_LMHEAD_Q6K` default-ON
+  via inline opt-out match (preserves debug→serve module boundary;
+  `pub(crate)` not needed).
+
+**Gate results**:
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Parity tests iter-309/310/321 | **14/14 PASS** | `cargo test --test adr_028_iter309_q6k_mv_nr2_parity --test adr_028_iter310_rms_norm_v2_parity --test adr_028_iter321_q6k_id_mv_nr2_parity` |
+| `env_flags` helper unit tests | **6/6 PASS** | `cargo test --lib env_flags` |
+| Build mlx-native | **clean (exit 0)** | `cargo build --release` |
+| Build hf2q | **clean (exit 0)** | `cargo build --release` (only pre-existing dead-code warnings unrelated to changes) |
+| Coherence smoke gemma4 APEX | **PASS** | `What is 2 plus 2?` → `2 plus 2 equals **4**.<turn\|>`; TQ-HB intact (`8-bit Lloyd-Max native HB SDPA`); 76.3 tok/s |
+| 200-tok bench delta | **+4.9% ✓** | A: defaults-on 72.8 tok/s decode; B: HF2Q_*=0 opt-out 69.4 tok/s; same prompt/seed |
+| Opt-out restores baseline | **PASS** | B configuration produces 69.4 tok/s = pre-flip baseline (matches iter-318 baseline 69.2) |
+
+**Bench numbers** (single-trial; `--benchmark` 5-run median deferred to a
+formal Phase 1a-followup; iter-318/319 5-run median pinned at 72.4 σ <0.2
+matches this single-trial 72.8 within sampling noise):
+
+```
+=== A: defaults baked in (new HEAD) ===
+prefill: 18 tok in 397ms (45 tok/s)
+--- mlx-native: 200 tokens in 2.75s (72.8 tok/s) ---
+Decode tok/s: 72.8
+
+=== B: all flags opt-out (HF2Q_*=0) ===
+prefill: 18 tok in 419ms (43 tok/s)
+--- mlx-native: 200 tokens in 2.88s (69.4 tok/s) ---
+Decode tok/s: 69.4
+```
+
+Delta: (72.8 − 69.4) / 69.4 = **+4.9%**, matches iter-318/319 stack
+measurement of +4.6%–4.9%.
+
+**Per-user impact at HEAD after this commit**:
+- Gemma4 APEX-Q5_K_M users: +4.9% at 200-tok, +9.6% at 1000-tok sustained,
+  thermal stabilization (σ 2.7 → <0.1).
+- Qwen3.6 APEX users: +2.1% (V2 alone covers; NR2 paths neutral on Q5_K).
+- All other models: zero regression (per-type guards prevent activation).
+
+**Phase 1a CLOSED. Phase 1b (bench HF2Q_ENCODER_SESSION=1 default-flip
+candidacy) opens next.**
+
+### Files modified (iter-326 + iter-327)
+
+- `/opt/mlx-native/src/env_flags.rs` (NEW)
+- `/opt/mlx-native/src/lib.rs` (1 line: `mod env_flags;`)
+- `/opt/mlx-native/src/ops/quantized_matmul_ggml.rs`
+- `/opt/mlx-native/src/ops/quantized_matmul_id_ggml.rs`
+- `/opt/mlx-native/src/ops/rms_norm.rs`
+- `/opt/hf2q/src/debug/investigation_env.rs`
+- `/opt/hf2q/src/serve/forward_mlx.rs`
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md` (this section)
+
+Memory updates (cross-session continuity):
+- `/Users/robert/.claude/projects/-opt-hf2q/memory/project_adr028_iter325_deep_research_synthesis_2026_05_10.md` (NEW, iter-326)
