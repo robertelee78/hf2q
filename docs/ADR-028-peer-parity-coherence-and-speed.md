@@ -7102,6 +7102,60 @@ DFlash spec-decode integration on gemma4.
 **Decision blocker**: this is an architectural commitment.  Operator
 approval needed before iter-228+ begins multi-month chain.
 
+### iter-228 — omlx reference: production-validated DFlash+MTP on Apple Silicon
+
+Skimmed `/opt/omlx` (Apple Silicon LLM inference engine, Python +
+mlx-lm runtime).
+
+**Key findings**:
+
+1. **omlx integrates DFlash** for spec-decode (README links
+   `bstnxbt/dflash-mlx`).  Production-validated on Apple Silicon.
+
+2. **omlx has `mlx_lm_mtp` patch** (`/opt/omlx/omlx/patches/mlx_lm_mtp/`)
+   that adds MTP to mlx-lm without forking the upstream package.
+
+3. **omlx scheduler** uses `_specprefill_draft_model` API
+   (`/opt/omlx/omlx/scheduler.py:505-2838`) — an attention-based
+   sparse-prefill draft pattern.  Different from token-prediction MTP
+   but in the same family.
+
+4. **omlx has tiered KV caching** with SSD offloading for boundary
+   snapshots — orthogonal lever to spec-decode (different perf domain).
+
+**Cumulative reference landscape**:
+
+| Engine | Runtime | SD support | Apple Silicon? |
+|--------|---------|------------|----------------|
+| llama.cpp | C++ + Metal | qwen3.6-27B built-in MTP | ✅ |
+| ds4 | C + Metal | DeepSeek V4 built-in MTP | ✅ (pure native) |
+| omlx | Python + mlx-lm | DFlash + mlx_lm_mtp + specprefill | ✅ (Python wrap) |
+| **DFlash standalone** | **Python + MLX** | **gemma4, qwen3.6-35B-A3B** | **✅ (target lib)** |
+| **hf2q (us)** | **Rust + MLX-native** | **none yet** | **✅ target** |
+
+**hf2q is the ONLY pure-Rust + MLX-native runtime in this list.**
+That's both our differentiator AND our integration challenge — every
+other engine that supports DFlash uses Python/mlx-lm.
+
+**Implications for iter-227 skeleton**:
+- Reference patterns ABUNDANT (4 engines validate the approach)
+- Apple Silicon viability CONFIRMED at production scale
+- hf2q's Rust reimpl of DFlash draft is novel work — no pure-Rust
+  reference exists yet
+- Total integration cost stands: 11-15 weeks
+
+**Pure-Rust SD precedent check**:
+- Atlas (reddit-atlas.txt) is pure Rust + CUDA SD on GB10 — closest
+  Rust+SD reference.  But CUDA-specific kernels not transferable to
+  MLX-native Metal.
+- No published Rust + Apple Metal + SD engine exists.
+
+hf2q's DFlash integration would be the **first pure-Rust SD engine on
+Apple Silicon**.  Significant industry value beyond just our gap-close.
+
+iter-229+: continue baseline iterations or wait for operator green-light
+on multi-month chain start.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
