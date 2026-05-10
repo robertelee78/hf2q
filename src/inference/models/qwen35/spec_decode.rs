@@ -178,6 +178,9 @@ impl<'a> SpecDecode<'a> {
             let kv_cache_ref = &mut self.kv_cache;
             let hidden_ref = &hidden_t;
             let token_embd = &self.verifier.token_embd;
+            // ADR-028 iter-154: per-step MTP profile gated on HF2Q_MTP_PROFILE=1.
+            let mtp_profile = std::env::var("HF2Q_MTP_PROFILE").as_deref() == Ok("1");
+            let mtp_t0 = if mtp_profile { Some(Instant::now()) } else { None };
             let proposed = self.verifier.with_gpu_cache_mut(|device, registry| {
                 let embed_next = embed_token_on_device(token_embd, token_next, cfg.hidden_size, device)?;
                 let draft_logits = mtp
@@ -193,13 +196,20 @@ impl<'a> SpecDecode<'a> {
                     .context("SpecDecode MTP forward_draft")?;
                 argmax_logits_gpu(device, registry, &draft_logits, mtp_vocab)
             })?;
+            let mtp_ms = mtp_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
             self.stats.proposed += 1;
 
             let verify_positions = vec![next_pos; 4];
+            let verify_t0 = if mtp_profile { Some(Instant::now()) } else { None };
             let (verify_logits, verify_hidden) = self
                 .verifier
                 .forward_gpu_with_hidden(&[token_next], &verify_positions, &mut self.kv_cache)
                 .with_context(|| format!("SpecDecode verifier step pos {next_pos}"))?;
+            if mtp_profile {
+                let v_ms = verify_t0.unwrap().elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[MTP_PROFILE] iter {}: mtp_draft={:.2}ms verifier={:.2}ms",
+                    self.stats.proposed, mtp_ms.unwrap_or(0.0), v_ms);
+            }
             let verified = greedy_argmax_last_token(&verify_logits, vocab);
 
             // Verifier step is a single-token decode (seq_len=1); slice is

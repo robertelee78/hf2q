@@ -3422,6 +3422,69 @@ required for path E (USE_DENSE default-flip) or wait on run-phase
 spec-decode (which could also help gemma4 once MTP analog or n-gram
 draft is available).
 
+### iter-154: MTP profile reveals 6-buffer architecture (root cause)
+
+#### Per-iter timing under HF2Q_MTP_PROFILE=1 (qwen3.6-mtp-q4_0)
+
+```
+[MTP_PROFILE] iter 1:  mtp_draft=22.51ms verifier=32.42ms  (warmup)
+[MTP_PROFILE] iter 2:  mtp_draft= 6.43ms verifier=31.67ms  (steady)
+[MTP_PROFILE] iter 3:  mtp_draft= 6.38ms verifier=31.83ms
+...
+[MTP_PROFILE] iter 15: mtp_draft= 6.52ms verifier=31.75ms
+```
+
+Steady-state per iter:
+- MTP forward_draft: 6.4 ms (12× a single verifier layer at 0.5ms)
+- Verifier forward_gpu_with_hidden: 31.8 ms (matches greedy)
+- Subtotal: 38.2 ms
+- Per-iter total in real run: ~67 ms (via 16 tok / 0.6s / 1.8 tok/iter)
+- **Unaccounted: ~30 ms/iter loop overhead**
+
+#### Hypothesis tree update
+
+- **H1 (forward_draft runs 64 layers)**: FALSIFIED — 6.4ms is too cheap
+- **H2 (1 layer but slow kernels)**: PARTIALLY CONFIRMED — 12× a regular
+  layer's GPU time
+- **H3 (loop overhead)**: CONFIRMED — 30ms unaccounted per iter
+
+#### Root cause for H2 — multiple command buffers in MTP forward_draft
+
+```bash
+$ grep -n 'let mut enc = device\|enc.commit' src/inference/models/qwen35/mtp.rs
+139:    let mut enc = device.command_encoder().context("MTP enc eh_proj")?;
+196:    enc.commit();
+215:    let mut enc = device.command_encoder().context("MTP enc attn qkv")?;
+292:    enc.commit();
+316:    let mut enc = device.command_encoder().context("MTP enc attn output")?;
+339:    enc.commit();
+358:    let mut enc = device.command_encoder().context("MTP enc residual norm")?;
+373:    enc.commit();
+398:    let mut enc = device.command_encoder().context("MTP enc head norm")?;
+409:    enc.commit();
+413:    let mut enc = device.command_encoder().context("MTP enc shared head")?;
+425:    enc.commit_and_wait().context("MTP commit logits")?;
+```
+
+**6 separate command buffers** per MTP draft step. Verifier uses
+single-CB per ADR-015 lockdown. Each extra buffer pays per-buffer
+overhead at decode shape (~1ms/buffer measured here, consistent with
+6 × 1 ≈ 6ms forward_draft time vs ~0.5ms theoretical for 1 layer).
+
+#### iter-155 walk-phase target
+
+Consolidate MTP forward_draft 6→1 command buffer matching ADR-015
+verifier pattern. Expected:
+
+  Current:    forward_draft = 6.4 ms, spec=27 vs greedy=34 → 0.79×
+  iter-155:   forward_draft ≈ 1-2 ms (4× faster)
+              spec_iter ≈ 31.8 + 1.5 = 33.3 ms
+              tok/s @ 80% accept = 1.8 / 0.0333 = 54 tok/s
+  Speedup:    54 / 34 = 1.59× over greedy on qwen3.6
+  Peer:       54 / 102 (gemma4 llama peer) = depends on qwen3.6 peer
+
+Plus iter-156 reduces loop overhead (logits readback, embed upload).
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
