@@ -3899,10 +3899,13 @@ impl MlxModelWeights {
                         &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
                     total_dispatches += 1;
                 }
-                dispatch_qmatmul(&mut s, reg, dev, &self.activations.router_norm_out,
-                    &self.layers[layer_idx].moe.router_proj,
-                    &mut self.activations.moe_router_logits, 1)?;
-                total_dispatches += 1;
+                // ADR-028 iter-213: SKIP_ROUTING bisect — skip router_proj qmatmul.
+                if !INVESTIGATION_ENV.skip_routing {
+                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.router_norm_out,
+                        &self.layers[layer_idx].moe.router_proj,
+                        &mut self.activations.moe_router_logits, 1)?;
+                    total_dispatches += 1;
+                }
 
                 // -- B10: fused_gelu_mul + fused_moe_routing [2 CONCURRENT] --
                 // gelu_mul reads mlp_gate+mlp_up (from B9 gate/up), writes mlp_fused.
@@ -3932,15 +3935,17 @@ impl MlxModelWeights {
                     );
                     total_dispatches += 1;
                 }
-                mlx_native::ops::fused_norm_add::dispatch_fused_moe_routing_f32(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.moe_router_logits,
-                    &self.activations.moe_expert_ids,
-                    &self.activations.moe_routing_weights_gpu,
-                    &self.layers[layer_idx].moe.per_expert_scale,
-                    num_experts as u32, top_k as u32,
-                ).map_err(|e| anyhow::anyhow!("fused MoE routing L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
+                if !INVESTIGATION_ENV.skip_routing {
+                    mlx_native::ops::fused_norm_add::dispatch_fused_moe_routing_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.moe_router_logits,
+                        &self.activations.moe_expert_ids,
+                        &self.activations.moe_routing_weights_gpu,
+                        &self.layers[layer_idx].moe.per_expert_scale,
+                        num_experts as u32, top_k as u32,
+                    ).map_err(|e| anyhow::anyhow!("fused MoE routing L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+                }
 
                 // ============================================================
                 // MoE expert dispatches (was S4, now in same session)

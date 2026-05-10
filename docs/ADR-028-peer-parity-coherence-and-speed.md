@@ -6274,6 +6274,67 @@ iter-213+ options:
 - (c) Pivot to qwen3.6 cross-pollination (already-fast path, learn what makes it work)
 - (d) Bisect remaining "Other" 4.35 ms bucket more
 
+### iter-213 — INVALID BISECT: SKIP_ROUTING confounded by MoE cache effects
+
+Shipped HF2Q_SKIP_ROUTING.  Skips B9 router_proj + B10 fused_moe_routing.
+
+| Config | BODY GPU | dispatches |
+|--------|---------:|-----------:|
+| Default | 12.48 ms | 956 |
+| SKIP_ROUTING | 8.24 ms | 896 (-60) |
+| **Δ** | **4.24 ms (CONFOUNDED!)** | -60 |
+
+**THE BISECT IS INVALID**:
+
+Skipping `fused_moe_routing` leaves `moe_expert_ids` and
+`moe_routing_weights_gpu` STALE (old values).  Downstream MoE expert
+dispatches (gate_up_id, swiglu, down_id) STILL RUN but read STALE ids.
+
+If stale ids contain a single repeated value (e.g., all zeros), all
+top_k=8 expert slots route to the SAME expert → MoE matmul reads the
+SAME 1.4 MB Q6_K weight 8 times → **cache-resident** → much faster.
+
+So the 4.24 ms "savings" is mostly:
+- Routing dispatches: ~0.5-1 ms (real)
+- MoE matmul cache-hit speedup: ~3 ms (artifact of stale ids)
+
+**Bisect failed its own validity check**.  This is a USEFUL falsification
+of the bisect methodology: SKIP_* flags only measure correctly when
+downstream consumers don't depend on the skipped kernel's output (or
+when the stale buffer doesn't change downstream perf characteristics).
+
+**Lesson**: SKIP bisects measure the dispatch's WALL TIME only when:
+1. Skipped kernel produces buffers that downstream OUT/READ but doesn't
+   semantically affect downstream timing (e.g., garbage activation
+   that's just consumed)
+2. Skipped kernel produces buffers that downstream ONLY READ from
+   cache (so stale buffer is irrelevant)
+
+When skipped kernel produces ROUTING/CONTROL signals (expert IDs,
+attention masks, etc.), the SKIP confounds downstream timing.
+
+**Revised bisect coverage**:
+- iter-191/199 SKIP_TQ_SDPA: timing-valid (downstream uses sdpa_out
+  passively, no control signal)
+- iter-200 SKIP_DENSE_MLP: valid (mlp_down semantically irrelevant
+  downstream when skipped at decode)
+- iter-201 SKIP_MOE_EXPERTS: valid (moe_down_id_out passively consumed)
+- iter-202 SKIP_MOE_SWIGLU: valid
+- iter-204 SKIP_HEAD_NORM_ROPE: valid
+- iter-205 SKIP_POST_ATTN_NORM: valid
+- iter-206 SKIP_WEIGHTED_SUM: valid
+- iter-207 SKIP_END_OF_LAYER: valid
+- iter-208 SKIP_END_OF_LAYER_FINAL: valid
+- iter-210 SKIP_ATTN_QKV: valid (attn_q/k/v passively consumed by SDPA)
+- iter-211 SKIP_O_PROJ: valid (attn_out passively consumed)
+- **iter-213 SKIP_ROUTING: INVALID** — control signals affect MoE matmul cache pattern
+
+True routing cost: probably ~0.5-1 ms (real router_proj + fused_moe_routing
+launch).  Cannot directly bisect without writing valid stub IDs.
+
+iter-214 plan: write SKIP_ROUTING_WITH_VALID_IDS that fills expert_ids
+with a spread valid pattern (e.g., 0..top_k) before skipping kernel.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)

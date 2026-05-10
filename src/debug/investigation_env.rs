@@ -167,6 +167,12 @@ pub struct InvestigationEnv {
     /// Produces garbage attn_out.
     pub skip_o_proj: bool,
 
+    /// `HF2Q_SKIP_ROUTING=1` — skip B9 router_proj qmatmul +
+    /// B10 fused_moe_routing dispatches per layer (2 dispatches/layer).
+    /// ADR-028 iter-213 — bisect routing scaffold cost.  Produces
+    /// garbage MoE expert routing.
+    pub skip_routing: bool,
+
     // ========================================================================
     // Category 4 — warn-only (ineffective but safe). No gate; raw intent.
     // ========================================================================
@@ -620,6 +626,7 @@ struct RawAckIntent {
     skip_end_of_layer_final: bool,
     skip_attn_qkv: bool,
     skip_o_proj: bool,
+    skip_routing: bool,
     lmhead_rerank_disabled: bool,
     chunk_scan_prefill: bool,
 }
@@ -644,6 +651,7 @@ impl InvestigationEnv {
             skip_end_of_layer_final: env_eq_one("HF2Q_SKIP_END_OF_LAYER_FINAL"),
             skip_attn_qkv: env_eq_one("HF2Q_SKIP_ATTN_QKV"),
             skip_o_proj: env_eq_one("HF2Q_SKIP_O_PROJ"),
+            skip_routing: env_eq_one("HF2Q_SKIP_ROUTING"),
             lmhead_rerank_disabled: matches!(
                 env::var("HF2Q_LMHEAD_RERANK").as_deref(),
                 Ok("0")
@@ -668,6 +676,7 @@ impl InvestigationEnv {
             skip_end_of_layer_final: raw.skip_end_of_layer_final && ack,
             skip_attn_qkv: raw.skip_attn_qkv && ack,
             skip_o_proj: raw.skip_o_proj && ack,
+            skip_routing: raw.skip_routing && ack,
             lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
             chunk_scan_prefill: raw.chunk_scan_prefill && ack,
 
