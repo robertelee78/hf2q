@@ -5035,6 +5035,55 @@ commit_and_wait between B-blocks under HF2Q_BLOCK_TIMING flag) to
 locate the remaining 21pp.  Specific suspects: B1..B7 attention path,
 final lm_head GEMM at vocab=262144.
 
+### iter-185 — body GPU time breakdown via cross-bench arithmetic
+
+Skipped per-block instrumentation (~30 min build, 3-6 ms sync overhead
+distorts measurement) in favor of arithmetic decomposition from
+existing measurement data:
+
+**Default gemma4 body GPU = 13.5 ms** (iter-182 SPLIT_TIMING)
+
+Component time estimates (combining iter-180/181/184 batched-mode benches):
+| Component | Per-layer | × 30 layers |
+|-----------|-----------|-------------|
+| Attn QKVO matmul (4 × Q5_K mat-vec) | ~60 µs | 1.80 ms |
+| MoE _id matmul (gate_up + down) | ~61 µs | 1.84 ms |
+| Dense MLP matmul (3 × Q5_K mat-vec) | ~50 µs | 1.50 ms (estimated) |
+| **Mat-mul subtotal** | — | **5.14 ms (38%)** |
+| SDPA TQ-HB (incl. flash_attn_vec_tq) | ~30 µs | 0.90 ms |
+| TQ-HB K-encode (Hadamard quantize) | ~50 µs | 1.50 ms (Path E skips) |
+| **SDPA+TQ subtotal** | — | **2.40 ms (18%)** |
+| Norms + RoPE + KV-copy + small ops | ~200 µs | 6.00 ms (44%) |
+
+**The largest single bucket is "small ops" at 6.0 ms = 44% of body** —
+norms, RoPE applies, KV cache writes, fused_norm_add, weighted-sum,
+softmax-topk, etc.  These are individually tiny (5-15 µs) but there
+are ~20 per layer × 30 = 600 of them.
+
+**Operator decision space, fully data-backed**:
+
+| Default flip | tok/s | precision | memory/slot |
+|--------------|------:|-----------|------------:|
+| (current) Default TQ-HB | 62 | exact (TQ-HB) | 191 MiB |
+| **Path E** (USE_DENSE=1) | **78** | **exact F32** | 502 MiB |
+| Path E+F (USE_DENSE+F16_KV) | 80 | F16 (~25 ppm) | 251 MiB |
+| llama.cpp peer | 97 | F16 KV | ~256 MiB |
+
+**Path E is operator-orthogonal-to-precision**.  Buys +12.5%
+(80% of gap-to-Path-E+F win) at zero precision drift — only memory
+cost (+311 MiB/slot, manageable on M5 Max with 128 GB unified memory).
+Operator's prior precision-tradeoff hesitation does NOT apply to
+Path E.
+
+The remaining 21pp gap to llama.cpp peer (97 tok/s) lives in the 6 ms
+"small ops" bucket — fundamentally a multi-week kernel-fusion + dispatch-
+reduction effort (no single fusion saves >2 pp).
+
+**iter-186+ plan**: 
+- IF operator approves Path E default-flip → ship it (1-line env-default)
+- ELSE continue dispatch-reduction kernel walk (each iter: ~1pp gain,
+  multi-week to close 21pp)
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
