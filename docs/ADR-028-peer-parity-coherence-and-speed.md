@@ -6820,6 +6820,72 @@ gemma4 forward path.  Multi-iter chain to:
 4. Production wire-up + coherence + bench
 5. Default-OFF flag → soak → operator default-flip decision
 
+### iter-224 — DFlash deep-read: integration is MULTI-MONTH not multi-week
+
+Read `/opt/dflash/dflash/model_mlx.py` (582 LOC) thoroughly.
+
+**DFlash architecture**:
+- `DFlashDraftModel` extends mlx-lm with `bind(target_model)` to share
+  the target's `embed_tokens` + `lm_head`
+- Forward signature: `draft(inputs, target_hidden, cache)` — requires
+  `target_hidden` from intermediate layers of target model
+- `_patch_model` injects hooks into target to capture
+  `hidden_states[target_layer_ids]` per layer
+- `stream_generate` orchestrates: target forward → capture hidden → draft
+  proposes block → target verifies → accept/rollback → loop
+
+**Integration barriers** (HIGHER than initial iter-223 estimate):
+
+1. **Runtime mismatch**: DFlash uses Python/mlx-lm; hf2q uses
+   Rust/MLX-native Metal kernels.  Cannot directly load/run DFlash
+   draft in hf2q.
+
+2. **Hidden state capture**: DFlash requires `hidden_states` from
+   specific `target_layer_ids` of target model.  hf2q's
+   `MlxModelWeights::forward_decode` doesn't currently expose
+   intermediate states; adding capture hooks is non-trivial.
+
+3. **KV cache management**: DFlash needs trim/rollback support for
+   target cache when verification rejects candidates.  hf2q's KV
+   cache is heavily optimized for in-place writes, not rollback.
+
+4. **Bridging options** (all multi-month):
+   - **(a) Pure Rust reimpl**: rewrite DFlashDraftModel in MLX-native
+     Rust kernels.  Multi-month, but preserves hf2q performance.
+   - **(b) PyO3 bridge**: keep DFlash draft in Python, expose
+     hidden-state output from hf2q via Rust→Python.  Complex IPC,
+     per-step overhead would eat most SD gains.
+   - **(c) Abandon hf2q runtime**: run gemma4 target via mlx-lm
+     directly; integrate DFlash standalone.  Loses our session-shipped
+     +10.1% byte-identical default-path improvement.
+
+**Honest revised assessment**:
+- iter-223's "multi-week, +50-300%" was over-optimistic
+- Realistic effort: **3-6 months** for option (a) properly engineered
+- Realistic ROI: 2-4× on gemma4 if integrated properly
+- Net: 68.8 × 2.5× = ~170 tok/s = above peer (102.7)
+
+**DFlash remains the largest lever, but the integration cost is
+significantly higher than initial estimate.**
+
+**Operator decision space (revised)**:
+
+| Lever | Speedup | Effort | Ship date est |
+|-------|--------:|--------|---------------|
+| Path E+F+G default-flip | +6.4% | 1 line | this week |
+| Compounded fusion kernels | ~+1% | multi-week | 1-2 months |
+| **DFlash speculative decode (option a)** | **+150-300%** | **3-6 months** | next quarter |
+| qwen3.6 cross-pollination | +5-15% | multi-month | next quarter |
+
+**iter-225+ plan**: pivot from "kernel optimization" to "DFlash
+integration architecture design".  Decide between options (a)/(b)/(c)
+based on operator priorities — this is now an architectural choice,
+not a kernel-tuning exercise.
+
+Per "no fallback, no stub" mantra: documenting the integration cost
+honestly so future sessions don't underestimate.  This isn't a defer;
+it's an accurate scope assessment from peer-code reading.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
