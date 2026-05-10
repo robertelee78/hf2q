@@ -3869,12 +3869,16 @@ impl MlxModelWeights {
                     &[&self.activations.mlp_gate, &self.activations.mlp_up,
                       &self.activations.moe_router_logits],
                 );
-                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                    &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
-                total_dispatches += 1;
-                dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                    &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
-                total_dispatches += 1;
+                // ADR-028 iter-200: SKIP_DENSE_MLP bisect — skip mlp_gate +
+                // mlp_up dispatches.  Router proj must run (MoE depends on it).
+                if !INVESTIGATION_ENV.skip_dense_mlp {
+                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                        &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
+                    total_dispatches += 1;
+                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
+                        &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
+                    total_dispatches += 1;
+                }
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.router_norm_out,
                     &self.layers[layer_idx].moe.router_proj,
                     &mut self.activations.moe_router_logits, 1)?;
@@ -3890,7 +3894,7 @@ impl MlxModelWeights {
                     &[&self.activations.mlp_fused,
                       &self.activations.moe_expert_ids, &self.activations.moe_routing_weights_gpu],
                 );
-                {
+                if !INVESTIGATION_ENV.skip_dense_mlp {
                     use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
                     let n_elements_bytes = (self.intermediate_size as u32).to_ne_bytes();
                     let pipeline = reg.get_pipeline("fused_gelu_mul", metal_dev)?;
@@ -3906,8 +3910,8 @@ impl MlxModelWeights {
                         mlx_native::MTLSize::new(
                             std::cmp::min(256, self.intermediate_size as u64), 1, 1),
                     );
+                    total_dispatches += 1;
                 }
-                total_dispatches += 1;
                 mlx_native::ops::fused_norm_add::dispatch_fused_moe_routing_f32(
                     s.encoder_mut(), reg, metal_dev,
                     &self.activations.moe_router_logits,
@@ -3932,13 +3936,15 @@ impl MlxModelWeights {
                     // -- B11: dense down + gate_up_id [2 concurrent] --
                     // dense_down reads mlp_fused (from B10), gate_up_id reads moe_norm_out
                     // (from B8) + moe_expert_ids (from B10). Disjoint writes.
-                    s.barrier_between(
-                        &[&self.activations.mlp_fused, &self.layers[layer_idx].mlp.down_proj.buffer],
-                        &[&self.activations.mlp_down],
-                    );
-                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
-                        &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
-                    total_dispatches += 1;
+                    if !INVESTIGATION_ENV.skip_dense_mlp {
+                        s.barrier_between(
+                            &[&self.activations.mlp_fused, &self.layers[layer_idx].mlp.down_proj.buffer],
+                            &[&self.activations.mlp_down],
+                        );
+                        dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
+                            &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
+                        total_dispatches += 1;
+                    }
 
                     let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
                     s.barrier_between(

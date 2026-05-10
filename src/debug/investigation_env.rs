@@ -102,6 +102,12 @@ pub struct InvestigationEnv {
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub skip_tq_sdpa: bool,
 
+    /// `HF2Q_SKIP_DENSE_MLP=1` — skip dense MLP dispatches (gate, up,
+    /// fused_gelu_mul, down) per layer for timing bisection.  ADR-028
+    /// iter-200 — measure dense MLP cost as candidate for further
+    /// optimization.  Produces garbage output (mlp_down stale buffer).
+    pub skip_dense_mlp: bool,
+
     // ========================================================================
     // Category 4 — warn-only (ineffective but safe). No gate; raw intent.
     // ========================================================================
@@ -545,6 +551,7 @@ struct RawAckIntent {
     batched_prefill: bool,
     skip_tq_encode: bool,
     skip_tq_sdpa: bool,
+    skip_dense_mlp: bool,
     lmhead_rerank_disabled: bool,
     chunk_scan_prefill: bool,
 }
@@ -559,6 +566,7 @@ impl InvestigationEnv {
             batched_prefill: env_eq_one("HF2Q_BATCHED_PREFILL"),
             skip_tq_encode: env_eq_one("HF2Q_SKIP_TQ_ENCODE"),
             skip_tq_sdpa: env_eq_one("HF2Q_SKIP_TQ_SDPA"),
+            skip_dense_mlp: env_eq_one("HF2Q_SKIP_DENSE_MLP"),
             lmhead_rerank_disabled: matches!(
                 env::var("HF2Q_LMHEAD_RERANK").as_deref(),
                 Ok("0")
@@ -573,6 +581,7 @@ impl InvestigationEnv {
             batched_prefill: raw.batched_prefill && ack,
             skip_tq_encode: raw.skip_tq_encode && ack,
             skip_tq_sdpa: raw.skip_tq_sdpa && ack,
+            skip_dense_mlp: raw.skip_dense_mlp && ack,
             lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
             chunk_scan_prefill: raw.chunk_scan_prefill && ack,
 
