@@ -6001,6 +6001,62 @@ iter-207 plan: bisect post_feedforward_layernorm_2 (final residual
 update — combines hidden + cur_mlp + cur_moe at end-of-layer).
 Sequential, similar to post-attn-norm-add → expected ~0.5 ms.
 
+### iter-207 — BISECT end-of-layer norm chain = 0.54 ms; REAL FUSION LEVER
+
+Shipped HF2Q_SKIP_END_OF_LAYER.  Skips 2 sequential fused_norm_add
+dispatches at end-of-layer:
+- post-FF norm 2 + combine MLP+MoE
+- end-of-layer post_feedforward_layernorm + residual + scalar mul
+
+| Config | BODY GPU | dispatches |
+|--------|---------:|-----------:|
+| Default | 12.61 ms | 956 |
+| SKIP_END_OF_LAYER | 12.07 ms | 896 (-60) |
+| **Δ** | **0.54 ms = 4.3% body** | -60 |
+
+**Cumulative fused_norm_add cost** (iter-205 + iter-207):
+
+| Op | Per layer | Total | % body |
+|----|----------:|------:|-------:|
+| post-attn fused_norm_add | 1 dispatch | 0.55 ms | 4.4% |
+| end-of-layer chain | 2 dispatches | 0.54 ms | 4.3% |
+| **TOTAL** | **3 dispatches** | **1.09 ms** | **8.7%** |
+
+3 fused_norm_add per layer × 30 layers = 90 dispatches.
+Per-dispatch cost: ~9-18 µs.
+
+**Bandwidth math says 0.1 µs is compute**:
+- 2 reads × 11.25 KB + 1 write × 11.25 KB = 45 KB at hidden=2816 F32
+- At 71% peak (390 GB/s) = 0.115 µs bandwidth-bound
+- Measured 9-18 µs = **80-90× launch overhead per dispatch**
+
+**REAL FUSION LEVER FOUND.**  3 SEQUENTIAL fused_norm_add per layer
+can be merged into 1 kernel that does:
+- 3 RMS reductions
+- 3 weight multiplications
+- 2 residual adds
+- 1 scalar mul
+all in a single launch.  Eliminates ~60 launches/token.
+
+**KEY DIFFERENCE FROM iter-186 FAILURE**:
+iter-186 fused 3 CONCURRENT norms (already free) → REGRESSED -1.0%.
+This fuses 3 SEQUENTIAL norms (each costs real launch overhead) →
+expected +6-7% throughput.  Concurrent kernels were already overlapping
+on GPU so fusion lost parallelism; sequential kernels gain by avoiding
+launch latency.
+
+iter-208 plan: design and ship `fused_layer_combined_f32` kernel that
+subsumes all 3 fused_norm_add per layer.  Multi-day work but
+bisect-confirmed +6-7% target.
+
+Cumulative cost map (12.5 ms body):
+- MoE experts: 2.60 ms (21%)
+- Mat-mul attention: 1.85 ms (15%)
+- TQ-HB SDPA residual: 1.50 ms (12%)
+- Dense MLP: 1.14 ms (9%)
+- **fused_norm_add chain (3/layer): 1.09 ms (8.7%)** ← attackable
+- Other (concurrent norms, RoPE, KV-copy, routing): ~4.32 ms (35%)
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
