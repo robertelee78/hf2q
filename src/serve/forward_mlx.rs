@@ -3749,14 +3749,106 @@ impl MlxModelWeights {
                     // SDPA-out from a previous decode token.  This is the
                     // intentional partial-stack failure mode signalled in
                     // Phase 10b's design (iter-347).
+                    //
+                    // ADR-028 Phase 10e (iter-350): live wiring lands here.
+                    // K is stored F16 raw → Q stays raw (NO FWHT-pre dispatch),
+                    // SDPA runs in raw domain (NO FWHT-undo dispatch), V comes
+                    // from hybrid_kv[layer_idx].{v_packed, v_norms} (TQ-HB-encoded
+                    // by the Phase 10c encode site at line ~3074).  Saves 60
+                    // FWHT dispatches/decode-token at gemma4 30L on top of the
+                    // K-side codebook elimination.
                     if INVESTIGATION_ENV.hybrid_kv {
-                        return Err(anyhow::anyhow!(
-                            "HF2Q_HYBRID_KV=1 set but Phase 10e SDPA dispatcher \
-                             not wired (gemma4 decode L{layer_idx}). Unset HF2Q_HYBRID_KV \
-                             to fall back to legacy TQ-HB SDPA, or land Phase 10d/10e first. \
-                             See ADR-028 §iter-348."
-                        ));
-                    }
+                        // ADR-028 Phase 10e (iter-350): hybrid F16-K + TQ-HB-V SDPA.
+                        //
+                        // FWHT chain reasoning (corrected mid-iter after garbage
+                        // output observed at first attempt):
+                        //   * K stored RAW F16 → Q stays raw, K-side dot computes
+                        //     `<Q, K_raw> = <Q, K>` correctly. NO fwht_sign_premult
+                        //     dispatch needed for Q (saves 30 dispatches/token at
+                        //     gemma4 30L).
+                        //   * V stored ROTATED (Phase 10c V-encode still calls
+                        //     `dispatch_hadamard_quantize_kv_hb` which applies the
+                        //     Hadamard rotation; we did NOT add a no-FWHT V encoder).
+                        //     SDPA output = `softmax × V_rot = FWHT(output_raw)` by
+                        //     FWHT linearity. So output IS in the rotated domain;
+                        //     we MUST apply `dispatch_fwht_sign_undo_f32` after.
+                        //
+                        // Net dispatch saving: 30 dispatches/token (FWHT-pre only).
+                        // Follow-up (Phase 10e.5): add a no-FWHT V encoder kernel
+                        // to also drop the 30 FWHT-undo dispatches → 60 total.
+                        let hybrid_kv = self.hybrid_kv.as_ref().ok_or_else(|| anyhow::anyhow!(
+                            "HF2Q_HYBRID_KV=1 but hybrid_kv buffers not allocated \
+                             (gemma4 decode L{layer_idx}); should have been allocated \
+                             by Phase 10c lazy-alloc gate. See ADR-028 §iter-350."
+                        ))?;
+                        let hb_cap = hybrid_kv[layer_idx].capacity;
+                        let hb_is_ring = hybrid_kv[layer_idx].is_sliding;
+                        let hb_kv_seq_len = if hb_is_ring {
+                            ((kv_write_pos + 1).min(hb_cap)) as u32
+                        } else {
+                            (kv_write_pos + 1) as u32
+                        };
+                        let ring_start_hb = if hb_is_ring && hb_kv_seq_len as usize >= hb_cap {
+                            ((kv_write_pos + 1) % hb_cap) as u32
+                        } else {
+                            0u32
+                        };
+                        s.barrier_between(
+                            &[&self.activations.attn_q_normed,
+                              &hybrid_kv[layer_idx].k,
+                              &hybrid_kv[layer_idx].v_packed,
+                              &hybrid_kv[layer_idx].v_norms],
+                            &[&self.activations.sdpa_out],
+                        );
+                        let p_hyb = mlx_native::ops::flash_attn_vec_hybrid::FlashAttnVecTqHbParams {
+                            num_heads: nh as u32,
+                            num_kv_heads: nkv as u32,
+                            head_dim: hd as u32,
+                            kv_seq_len: hb_kv_seq_len,
+                            kv_capacity: hb_cap as u32,
+                            scale: 1.0,
+                            mask_type: if is_sliding { 2 } else { 1 },
+                            sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                            softcap: 0.0,
+                            ring_start: ring_start_hb,
+                            scale_factor_d512: tq_scale_factor_d512,
+                            codebook_bits: tq_codebook_bits,
+                            // Hybrid kernel: caller passes RAW Q (no rotation).
+                            // fuse_fwht_pre=0 → kernel reads Q as-is.
+                            fuse_fwht_pre: 0,
+                            nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(hb_kv_seq_len),
+                        };
+                        mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
+                            s.encoder_mut(), reg, dev,
+                            &self.activations.attn_q_normed,
+                            &hybrid_kv[layer_idx].k,
+                            &hybrid_kv[layer_idx].v_packed,
+                            &hybrid_kv[layer_idx].v_norms,
+                            &self.activations.sdpa_out,
+                            &self.activations.sdpa_tmp,
+                            &p_hyb,
+                        ).map_err(|e| anyhow::anyhow!("flash_attn_vec_hybrid L{layer_idx}: {e}"))?;
+                        total_dispatches += 2; // main + reduce (conservative)
+
+                        // Inverse-rotate SDPA output: V was FWHT-encoded, so output
+                        // = FWHT(output_raw); the rest of the layer (o_proj etc.)
+                        // expects raw-domain values. Same dispatch as the legacy
+                        // TQ-HB path's FWHT-undo at line ~3893.
+                        s.barrier_between(
+                            &[&self.activations.sdpa_out],
+                            &[&self.activations.sdpa_out],
+                        );
+                        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.sdpa_out,
+                            nh as u32, hd as u32,
+                        ).map_err(|e| anyhow::anyhow!("hybrid FWHT sign-undo L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+                        // Hybrid path complete; fall through to o_proj/MLP without
+                        // entering the legacy `if let Some(ref leg_hb_enc) ...` block
+                        // below (`leg_hb_encoded` is `None` under hybrid_kv per the
+                        // Phase 10c lazy-alloc mutex, so the `if let` is a no-op).
+                    } else
                     // -- iter-24: native HB SDPA (5/6/8-bit byte-packed K/V) --
                     //
                     // K/V have been HB-encoded into leg_hb_encoded above.

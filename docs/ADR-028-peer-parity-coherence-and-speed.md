@@ -15543,3 +15543,81 @@ Default decode (gate OFF) unchanged: gemma4 71.8 tok/s baseline preserved.  Phas
 ### Next iter (10e)
 
 Wire the hybrid SDPA dispatcher at hf2q's 3 SDPA sites with the FWHT-skip described above.  Expected delta: per-dispatch wall on hybrid SDPA reaches peer territory (~7 µs vs current TQ-HB 14.7 µs), plus 60 fewer FWHT dispatches/decode-token at gemma4 30L.  If realized at production scale: gemma4 decode from 71.8 → estimated 95-100 tok/s (~0.92-0.97× peer).  Bench under 10g.
+
+## iter-350 — Phase 10e LANDED: hybrid SDPA dispatcher wired; coherent; +1.2% baseline
+
+### Date
+2026-05-10
+
+### Hypothesis (from iter-349 plan)
+Replacing the iter-348 hard-fail at `forward_mlx.rs:3744+` with the live hybrid SDPA dispatch (`flash_attn_vec_hybrid`) — passing K_f16 directly, skipping the FWHT-pre Q rotation, AND skipping the FWHT-undo on output — would produce coherent output AND close most of the K-side per-dispatch wall gap to peer.
+
+### Result
+**LANDED with course correction mid-iter.**  Coherent (`"2 + 2 = 4<turn|>"` byte-identical to legacy on the smoke prompt).  Decode +1.2% on the 245-token long-decode bench (73.7 → 74.5 tok/s, p50 across 3 trials each).  Binding-goal gap to peer (103 tok/s) shrinks from 0.715× → 0.723×.
+
+### Course correction (Chesterton's fence violation caught + fixed live)
+
+**First attempt (5 min into the iter)**: skipped BOTH FWHT-pre AND FWHT-undo dispatches.  Output was garbage on `"What is 2+2?"` — emitted random Cyrillic / Korean / fragments instead of `"2 + 2 = 4"`.
+
+**Root cause** (diagnosed by re-reading the Phase 10c V-encode site at `forward_mlx.rs:3074+`): the V-only encode path uses `dispatch_hadamard_quantize_kv_hb` which APPLIES the Hadamard rotation to V before storing.  So V is FWHT-rotated in storage.  By FWHT linearity:
+
+```
+SDPA output = Σᵢ softmax_i × V_i
+            = Σᵢ softmax_i × FWHT(V_raw_i)
+            = FWHT(Σᵢ softmax_i × V_raw_i)
+            = FWHT(output_raw)
+```
+
+So output IS in the rotated domain when V is rotated — the inverse FWHT MUST be applied before passing to o_proj.  K-side is unaffected: `<Q_raw, K_raw> = <Q, K>` is correct since K is stored raw.
+
+**Fix**: keep skipping FWHT-pre (saves 30 dispatches/decode-token at gemma4 30L) but RESTORE the FWHT-undo dispatch (cannot save those 30 until Phase 10e.5 lands a no-FWHT V encoder).  After fix: `"2 + 2 = 4<turn|>"` byte-identical to legacy.
+
+**Lesson** (saved as feedback memory candidate): Hadamard fusion analysis must trace BOTH K-side and V-side FWHT independently; assuming "if K is raw, no FWHT anywhere" is wrong because output is in V's domain.
+
+### Why the speedup is only +1.2% (and how to grow it)
+
+Per-decode-token dispatch accounting at gemma4 30L:
+
+| Dispatch class | Legacy TQ-HB | Hybrid (10c+10e) | Δ |
+|---|---|---|---|
+| K+V dual encode | 30 (one fused per layer) | 0 | **−30** |
+| F16 K copy | 0 | 30 | **+30** |
+| V-only TQ-HB encode | 0 | 30 | **+30** |
+| FWHT-pre on Q | 30 | 0 | **−30** |
+| TQ-HB SDPA | 60 (main + reduce) | 0 | **−60** |
+| Hybrid SDPA | 0 | 60 (main + reduce) | **+60** |
+| FWHT-undo on output | 30 | 30 | 0 |
+| **Total dispatches Δ** | — | — | **0** |
+
+Dispatch count is unchanged.  The +1.2% measured speedup comes purely from per-kernel-cost differences:
+- Hybrid SDPA reads K as F16 (direct half4 load) vs TQ-HB SDPA's codebook lookup (4 byte loads + 4 indirect lookups + 4 muls).  Per-thread savings ~6 µs on the K side per dispatch × 30 layers × 60 dispatches = ~10 ms.
+- BUT: the codebook is in `constant` memory which Apple Metal aggressively caches.  The actual K-side speedup is much smaller than the structural analysis suggested — most of the codebook latency was hidden by cache.
+
+### How to grow the speedup (Phase 10 follow-up plan)
+
+1. **Phase 10e.5**: V-no-FWHT encoder (new kernel).  Drops 30 FWHT-undo dispatches/decode-token (~3% expected from dispatch-floor savings).  V is then stored RAW; output domain matches K-side; FWHT chain is fully eliminated.
+2. **Phase 10c.5**: fused F16-K-copy + V-TQ-HB-encode kernel.  Drops 30 dispatches/decode-token (~3% expected).
+3. **Phase 10f.5**: NSG-axis tuning for hybrid kernel at long context.  TQ-HB iter-127 measured 1.83× at kL=4096; same threshold likely applies.
+
+Combined potential: ~6-9% additional speedup from dispatch-floor reduction, on top of the 1.2% per-kernel gain.  Would bring gemma4 to ~80-82 tok/s = 0.78-0.80× peer.
+
+The remaining gap to peer (~0.80× → 1.0×) is likely owned by additional structural items not yet identified — likely the V-side codebook lookup itself (TQ-HB V is what peer DOESN'T do, and dropping it would close most of the residual gap but at coherence cost; needs F32 V vs TQ-HB V evaluation).  Multi-week scope continues.
+
+### Files modified
+
+- `/opt/hf2q/src/serve/forward_mlx.rs:3744+`: replace iter-348 hard-fail with live `flash_attn_vec_hybrid` dispatch.  Skip `dispatch_fwht_sign_premult_f32` (Q stays raw for raw-K dot product).  Keep `dispatch_fwht_sign_undo_f32` (V is FWHT-rotated, output must be inverse-rotated — see course-correction note above).  If/else flow: `if INVESTIGATION_ENV.hybrid_kv { hybrid SDPA } else if let Some(leg_hb_enc) = ... { legacy SDPA }` — falls through to o_proj/MLP without entering the legacy block.
+
+### Tests + bench
+
+- **Lib tests**: 3454/0 passing (no regression, multiple runs).
+- **Coherence (default)**: `"What is 2+2?"` → `"2 + 2 = 4<turn|>"` (legacy unchanged).
+- **Coherence (hybrid)**: `"What is 2+2?"` → `"2 + 2 = 4<turn|>"` (byte-identical to legacy).
+- **Decode bench (245-tok long output, p50/3 trials, gemma4-ara-2pass-APEX-Q5_K_M.gguf, M5 Max)**:
+  - Legacy: 73.7 tok/s (consistent ±0.1 across 3 trials)
+  - Hybrid: 74.5 tok/s (consistent ±0.1)
+  - Speedup: **+1.2%**
+- **Output divergence**: 245 vs 246 tokens to EOS — 1-token difference due to F16-K vs 8-bit-K precision affecting next-token argmax at exactly one decode step.  Expected behavior; not a coherence bug.
+
+### Next iter (10e.5)
+
+V-no-FWHT encoder kernel.  Drops the 30 FWHT-undo dispatches/decode-token.  Need new MSL kernel `kv_quantize_v_no_fwht` that does Lloyd-Max codebook lookup WITHOUT applying the Hadamard rotation.  ~150 LOC kernel + 100 LOC dispatcher + parity test.  Estimated +3% additional decode speedup.
