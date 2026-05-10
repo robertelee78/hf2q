@@ -2300,11 +2300,9 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // The legacy `eos_token_id` single value is kept for the SpecDecode path
     // below which still takes `Option<u32>` (TODO: extend SpecDecode to take
     // a slice; tracked in a follow-up to avoid scope creep here).
-    let eos_token_id: u32 = loaded
-        .eos_token_ids
-        .first()
-        .copied()
-        .unwrap_or(151_645);
+    // ADR-028 iter-266: SpecDecode now takes the full eos set via
+    // run_with_eos_set; the legacy single-id was retired (was the
+    // root cause of MTP K1 running past <|im_end|> per iter-263..265).
     let eos_token_ids: Vec<u32> = if loaded.eos_token_ids.is_empty() {
         vec![151_645]
     } else {
@@ -2392,14 +2390,19 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         model
             .ensure_gpu_cache_primed()
             .context("Qwen35Model::ensure_gpu_cache_primed (P19 H12 spec-decode warmup)")?;
-        let result = SpecDecode::run_with_eos(
+        // ADR-028 iter-266: pass the full eos_token_ids set (not just
+        // first()) so the SpecDecode runner can match BOTH
+        // `<|endoftext|>` AND `<|im_end|>` (qwen3 chat-template stop).
+        // Previously single-eos let `<|im_end|>` slip past, causing
+        // MTP K1 path to run to max_tokens (ADR-028 iter-263..265).
+        let result = SpecDecode::run_with_eos_set(
             &model,
             &prompt_tokens,
             args.max_tokens,
-            Some(eos_token_id),
+            eos_token_ids.clone(),
             max_seq as u32,
         )
-        .context("qwen35 SpecDecode::run_with_eos")?;
+        .context("qwen35 SpecDecode::run_with_eos_set")?;
 
         let prefill_tok_s = if result.stats.prefill_elapsed.as_secs_f64() > 0.0 {
             prompt_len as f64 / result.stats.prefill_elapsed.as_secs_f64()

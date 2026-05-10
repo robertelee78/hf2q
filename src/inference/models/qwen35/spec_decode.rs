@@ -109,7 +109,14 @@ pub struct SpecDecodeResult {
 pub struct SpecDecode<'a> {
     verifier: &'a Qwen35Model,
     kv_cache: HybridKvCache,
-    eos_token_id: Option<u32>,
+    /// Set of token IDs that terminate generation.  Multi-token to
+    /// support qwen3.5/3.6 GGUFs whose chat template uses `<|im_end|>`
+    /// (not in `tokenizer.ggml.eos_token_id` for some converted GGUFs)
+    /// alongside or instead of the canonical `<|endoftext|>`.
+    /// ADR-028 iter-266: was `Option<u32>` — caused MTP K1 to ignore
+    /// `<|im_end|>` when GGUF metadata only listed `<|endoftext|>`
+    /// (or omitted the key entirely).
+    eos_token_ids: Vec<u32>,
     stats: SpecDecodeStats,
 }
 
@@ -118,6 +125,18 @@ impl<'a> SpecDecode<'a> {
         verifier: &'a Qwen35Model,
         max_seq_len: u32,
         eos_token_id: Option<u32>,
+    ) -> Result<Self> {
+        let eos_token_ids = eos_token_id.into_iter().collect();
+        Self::new_with_eos_set(verifier, max_seq_len, eos_token_ids)
+    }
+
+    /// ADR-028 iter-266: multi-EOS variant.  Use this when the caller
+    /// has the full set (e.g., qwen3 has both `<|endoftext|>` 151643
+    /// and `<|im_end|>` 151645 / 248046).
+    pub fn new_with_eos_set(
+        verifier: &'a Qwen35Model,
+        max_seq_len: u32,
+        eos_token_ids: Vec<u32>,
     ) -> Result<Self> {
         ensure!(verifier.mtp.is_some(), "SpecDecode requires MTP weights");
         // Prime the verifier's GPU_CACHE so HybridKvCache and MTP
@@ -138,7 +157,7 @@ impl<'a> SpecDecode<'a> {
         Ok(Self {
             verifier,
             kv_cache,
-            eos_token_id,
+            eos_token_ids,
             stats: SpecDecodeStats::default(),
         })
     }
@@ -157,6 +176,24 @@ impl<'a> SpecDecode<'a> {
         max_seq_len: u32,
     ) -> Result<SpecDecodeResult> {
         let mut runner = Self::new(verifier, max_seq_len, eos_token_id)?;
+        runner.run_prompt(prompt, max_new)
+    }
+
+    /// ADR-028 iter-266: multi-EOS variant of [`run_with_eos`].
+    ///
+    /// Pass the full set of stop-token IDs (e.g., both `<|endoftext|>`
+    /// and `<|im_end|>` for qwen3 chat templates).  Generation
+    /// terminates when the next token matches ANY id in the set.
+    /// Fixes MTP K1 path running past `<|im_end|>` when GGUF only
+    /// lists `<|endoftext|>` (or neither — see ADR-028 iter-265).
+    pub fn run_with_eos_set(
+        verifier: &'a Qwen35Model,
+        prompt: &[u32],
+        max_new: usize,
+        eos_token_ids: Vec<u32>,
+        max_seq_len: u32,
+    ) -> Result<SpecDecodeResult> {
+        let mut runner = Self::new_with_eos_set(verifier, max_seq_len, eos_token_ids)?;
         runner.run_prompt(prompt, max_new)
     }
 
@@ -600,7 +637,7 @@ impl<'a> SpecDecode<'a> {
     }
 
     fn is_eos(&self, token: u32) -> bool {
-        self.eos_token_id == Some(token)
+        self.eos_token_ids.contains(&token)
     }
 }
 
