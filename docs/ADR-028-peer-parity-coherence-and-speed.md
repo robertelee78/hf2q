@@ -4707,6 +4707,74 @@ calls instead of one 2-token forward.
 
 Per-iter cost: 72ms (slower than K=0 38ms) — correctness test only.
 
+### iter-179 — gemma4 bandwidth bisect via llama.cpp peer-code study
+
+**Trigger**: operator's most recent signal: `--- mlx-native: 853 tokens in
+13.69s (62.3 tok/s) --- -- still` for `gemma4-ara-2pass-APEX-Q5_K_M.gguf`.
+qwen3.6 K=1 work (iter-170..178) does not transfer (different arch, no MTP).
+
+**3-way reconfirm at small-prompt regime** (8 tokens, '2+2'):
+| Path | tok/s |
+|---|---:|
+| Default (TQ-HB) | 72.5 |
+| Path E (USE_DENSE F32) | 71.4 (long-form) |
+| Path E+F (USE_DENSE+F16_KV) | 81.4 |
+
+Long-form (32-tok): default 63 tok/s, E+F 72 tok/s. Stable across all
+prior iters (95, 150, 162, 163, 165, 167-169) — single-kernel walks
+within TQ-HB regime structurally exhausted.
+
+**Code-first peer study** (operator standing rule "read code from peers
+when stuck"):
+- `/opt/llama.cpp/src/models/gemma4.cpp:139-389` traced line-by-line.
+  - Dense MLP: `LLM_FFN_PAR` (par gate/up/down — same as us).
+  - MoE: `build_moe_ffn` with `model.layers[il].ffn_gate_up_exps` —
+    fused gate+up matmul, splits after. **hf2q has matching fusion**
+    (`stacked_gate_up` + `quantized_matmul_id_ggml`, forward_mlx.rs:3879).
+  - Custom router: norm on `attn_out` (not `cur_moe`) → scale → mul →
+    matmul. **hf2q matches this** (forward_mlx.rs:6957 family).
+  - No structural divergence found at the IR level.
+
+**Kernel-level fusion gap** (forward_mlx.rs MoE call sites 3870-3927):
+- B11: gate_up_id matmul (1 dispatch, fused via `quantized_matmul_id_ggml`)
+- B12: swiglu (1 dispatch via `moe_swiglu_batch_encode`)
+- B13: down_id matmul (1 dispatch)
+= 3 MoE dispatches/layer × 30 layers = 90 dispatches/token.
+
+`kernel_mul_mv_id_q4_0_f32_swiglu` exists (mlx-native shaders/quantized_matmul_id_ggml.metal:354)
+— fuses B12 silu + ×up inline before the dot product, saving 1 dispatch.
+But: **only Q4_0**. gemma4 APEX is Q5_K. Adding Q5_K _swiglu would save
+30 dispatches/token. **Q4_0 _swiglu was tested in qwen35 dwq46 — REGRESSED
+-1.5%** (Task #18 already-falsified per session memory). Transfer
+probability to gemma4 Q5_K is unverified but low-priority given regression.
+
+**Profile-mode bisect attempted**: HF2Q_MLX_KERNEL_PROFILE=1 ran with 242
+sessions/token (per-kernel) — overhead-inflated. Total 48469 µs/token
+shows MoE 294 µs/layer (worst absolute) but ranks dominated by per-session
+overhead (~50µs × 242 sessions = ~12000 µs of overhead). Not useful for
+production differential analysis without recalibration.
+
+**Verdict**: gemma4 walk-phase converged. Three options remain:
+1. **Path E+F default-flip** (1-line in forward_mlx.rs): +14% wall, F16
+   precision, kernel-validated by iter-168/169 5-fixture byte-identity
+   test (5/5 PASS at 1.00× amplification, refuting ADR-009 "19× drift").
+2. **Build Q5_K _swiglu** (multi-day): saves 30 dispatches/token, expected
+   gain <1% per Q4_0 regression evidence.
+3. **Continue walk** (multi-week): per-iter gain <100µs/token (~0.4%).
+
+Operator-decision required: precision tradeoff (#1) vs slow walk (#2/#3).
+Per `feedback_no_deferrals_without_explicit_approval.md`, this iter does
+NOT defer; it surfaces the bisect data and waits for direction.
+
+**Memorialize lever data** (so future iters don't re-walk):
+- Path E (F32 dense KV, sliding+global): +12.8% wall, 502 MiB/slot.
+- Path E+F (F16 KV): +14.4% wall, 251 MiB/slot, ~25 ppm rel_rms drift.
+- Default (TQ-HB): 191 MiB/slot, 0 ppm drift.
+- llama.cpp peer (CPU-instr unknown): 103 tok/s = 309 GB/s effective at
+  Q5_K_M MoE 4B-active. M5 Max peak 546 GB/s.
+- hf2q current 63 tok/s = 189 GB/s = 35% of peak vs llama.cpp 57%.
+- 22pp efficiency gap = mat-mul/SDPA kernel efficiency, NOT structural.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
