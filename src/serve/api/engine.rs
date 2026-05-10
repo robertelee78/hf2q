@@ -9205,13 +9205,16 @@ assistant:
     /// Phase B contract: when the GGUF lacks
     /// `tokenizer.ggml.eos_token_id`, `Qwen35LoadedModel::load`
     /// synthesizes the HF Qwen3.5 default (151645) per
-    /// `cmd_generate_qwen35:1066-1069`.  We can't drive
-    /// `Qwen35LoadedModel::load` end-to-end without a real GGUF, but
-    /// we can pin the contract by hand-constructing the synthetic
-    /// fixture the same way the constructor does and asserting the
-    /// resulting EOS list is exactly `[151645]`.  Wedge-3 will replace
-    /// this with an end-to-end synthetic-GGUF round-trip when the
-    /// forward path lands.
+    /// `cmd_generate_qwen35:1066-1069`.
+    ///
+    /// ADR-028 iter-267: extended to multi-EOS API.  The fallback path
+    /// shape changed from `.unwrap_or(151645)` to an explicit
+    /// `eos_token_ids.push(151_645)` after the multi-source scan
+    /// (`tokenizer.ggml.eos_token_id` + `eot_token_id` + name-based
+    /// scan of `tokenizer.ggml.tokens` for `<|im_end|>` /
+    /// `<|endoftext|>`).  The behavior contract is preserved
+    /// (151645 is still the final fallback when no source produced an
+    /// EOS); the test pattern updates to match the iter-267 syntax.
     #[test]
     fn qwen35_loaded_model_load_synthesizes_eos_default_when_metadata_absent() {
         // The constant the constructor uses when the GGUF is silent.
@@ -9219,20 +9222,22 @@ assistant:
         // fallback drifts, this test fails until both are aligned.
         let expected_default: u32 = 151645;
 
-        // Read the constructor source: the literal must appear in
-        // `engine_qwen35.rs` in a `.unwrap_or(...)` over
-        // `tokenizer.ggml.eos_token_id`.  This is the operator-facing
-        // contract the iter-215 acceptance criteria call out.
         let src = include_str!("engine_qwen35.rs");
         assert!(
             src.contains("tokenizer.ggml.eos_token_id"),
             "Qwen35LoadedModel::load must read tokenizer.ggml.eos_token_id"
         );
+        // Post-iter-267 contract: literal must appear inside an
+        // empty-fallback push (the final fallback after multi-source
+        // scan returns empty).  Allow either underscore-formatted or
+        // plain literal.
         assert!(
-            src.contains(&format!(".unwrap_or({expected_default})")),
+            src.contains(&format!("push({expected_default})"))
+                || src.contains(&format!("push({}_{})", expected_default / 1000, expected_default % 1000))
+                || src.contains(&format!("push(151_645)")),
             "Qwen35LoadedModel::load must default EOS to {expected_default} \
              (HF Qwen3.5 default per cmd_generate_qwen35) when the GGUF metadata \
-             key is absent"
+             key is absent + name-scan finds no <|im_end|>/<|endoftext|>"
         );
     }
 
