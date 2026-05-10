@@ -5140,6 +5140,57 @@ The remaining 21pp gap to llama.cpp peer must be addressed via:
   (e.g. norm+matmul where the norm output feeds matmul input —
   these are SEQUENTIAL, not concurrent, so fusion saves real time).
 
+### iter-187 — lm_head Q8_0 vs Q6_K direct: ~2% lever (multi-day)
+
+gemma4 has tied embeddings: `token_embd.weight` Q6_K [2816, 262144] is
+loaded as F32 (2.95 GB) and re-quantized at load to Q8_0 (784 MB) for
+the lm_head matmul.  Peer (llama.cpp) uses Q6_K storage directly for
+both embedding lookup AND lm_head — saving 179 MB read per token.
+
+**Bench at lm_head shape** (n=262144, k=2816, mlx-native d6a6f83):
+
+| qtype | per_call | bytes | GB/s | %peak |
+|-------|----------:|------:|-----:|------:|
+| Q6_K  | 1059.6 µs | 605.6 MB | 571.5 | 104.7% |
+| Q8_0  | 1390.4 µs | 784.3 MB | 564.1 | 103.3% |
+
+Both kernels saturate at ~570 GB/s (cache-mixed at this size).
+Per-byte rate is **qtype-independent** at this scale; only total
+bytes-read differ.
+
+**Q6_K-direct lever sized: 0.33 ms saved/token = ~2% throughput**.
+
+Cross-checked vs end-to-end production:
+- Default Q8_0 lm_head: bench-predicted 1.39 ms; production observed
+  ~2.0 ms head total (incl. final-norm + softcap + argmax + non-GPU
+  overhead).  Bench reflects pure kernel time; production has the
+  full HEAD path.
+- F16 lm_head end-to-end at HF2Q_LMHEAD_Q8=0: 58.5 tok/s (vs Q8_0
+  62.5) = 1.09 ms slower from doubling lm_head bytes (784 → 1476 MB).
+  Implies actual lm_head wall-time delta ≈ 1.09 ms — matches bench
+  prediction (1.39 - F16_predicted) to within noise.
+
+**Verdict**: Q6_K-direct lm_head is a real but small lever (~2%) that
+costs multi-day rework (load Q6_K natively + refactor embedding lookup
+to Q6_K-aware kernel).  ROI poor vs Path E default-flip (+12.5%).
+
+**Cumulative gemma4 lever inventory** (iter-179..187):
+
+| Lever | Gain | Effort | Precision | Status |
+|-------|-----:|--------|-----------|--------|
+| Path E (USE_DENSE) | +12.5% | 1-line env-default | exact F32 | operator-gate |
+| Path F (F16 KV on top of E) | +1.5% | 1-line env-default | F16 ~25 ppm | operator-gate |
+| Q6_K direct lm_head | +2.0% | multi-day | exact | iter-188+ candidate |
+| Fused triple norm | -1.0% | shipped default-OFF | exact | FALSIFIED |
+| TQ-HB → F16 KV (covered by E+F) | +14% | (above) | (above) | (above) |
+| FA-vec dispatch fusion | speculative | multi-week | TBD | future |
+
+**Operator decision space (data-complete)**:
+- Approve Path E flip (1 line) → 78 tok/s = 0.80× peer, no precision drift
+- Approve Path E+F flip (1 line) → 80 tok/s = 0.82× peer, F16 ~25 ppm drift
+- Continue walks → +2% per multi-day iter, ~10 iters to close 21pp gap
+- Status quo → 62 tok/s = 0.64× peer
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
