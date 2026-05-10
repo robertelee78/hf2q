@@ -5897,6 +5897,35 @@ tried (iter-186 fused-triple-norm regressed, but other patterns may
 work).  Or pivot to a completely different bisect angle (CPU-side
 work, head pipeline, dispatch encoding cost).
 
+### iter-204 — BISECT head_norm_rope = 0.11 ms (free, concurrent)
+
+Shipped HF2Q_SKIP_HEAD_NORM_ROPE.  Bisect skips the 2
+fused_head_norm_rope dispatches per layer (Q-norm-rope + K-norm-rope).
+
+| Config | BODY GPU | dispatches |
+|--------|---------:|-----------:|
+| Default | 12.58 ms | 956 |
+| SKIP_HEAD_NORM_ROPE | 12.47 ms | 896 (-60) |
+| **Δ** | **0.11 ms** | **0.9% body** |
+
+head_norm_rope = essentially FREE.  Already concurrent on GPU.
+
+**Pattern across iter-202+204 (small concurrent dispatches)**:
+- swiglu: 0.14 ms (1.1% body)
+- head_norm_rope: 0.11 ms (0.9% body)
+- TQ-HB encode (iter-191): ~0 ms (fully overlapped)
+
+These small concurrent dispatches together account for ~0.25 ms of
+the 5.65 ms scaffolding bucket.  The remaining ~5.4 ms must be in:
+- QKVO production qmatmul (~1.85 ms estimated, possibly higher in production)
+- Transition norms via fused_norm_add (post-attn-norm+add per layer)
+- Routing scaffold (router_proj + fused_moe_routing + weighted_sum + accumulator)
+- Other ops not yet bisected (KV cache copy, V-norm, B14 weighted_sum)
+
+iter-205+ plan: bisect QKVO production directly OR bisect routing
+scaffold (router_proj + softmax_topk + gather + weighted_sum) to
+localize the remaining ~5.4 ms.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
