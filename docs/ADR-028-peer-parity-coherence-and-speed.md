@@ -9670,6 +9670,76 @@ exhausted measurable kernel-level levers + the spec-decode domain.
 All remaining work is either operator-decision-gated (Path E+G flip,
 DFlash, DeltaNet fix) or out-of-scope (architectural commitments).**
 
+### iter-271 — DeltaNet K1 fix scope LOCALIZED to routing condition
+
+Read `gpu_delta_net.rs:1986`:
+
+```rust
+let output = if seq == 1 {
+    // DECODE PATH — uses dispatch_gated_delta_net_decode
+} else {
+    // PREFILL PATH — CPU de-interleave + two encoders
+};
+```
+
+**K1's seq_len=2 routes to the PREFILL path**, not the decode kernel.
+
+**Critical insight**: the decode kernel `gated_delta_net_decode_f32_*`
+ALREADY supports n_tokens > 1 (per `gated_delta_net_decode.metal:145`:
+`for (uint t = 0; t < n_tokens; ++t)` with sequential state
+threading).  The MATH for n_tokens=2 in the decode kernel is the
+same math as 2× sequential n_tokens=1 calls — the kernel was built
+to handle this.
+
+**The bug is a ROUTING DECISION**, not missing kernel infrastructure.
+The condition `if seq == 1` blocks K1's seq_len=2 case from using
+the existing decode kernel.
+
+**Hypothesis (testable)** for iter-272:
+- Extend routing condition: `if seq <= MAX_K_DECODE` (e.g., 4 or 8)
+- Decode kernel already handles n_tokens up to whatever the state
+  buffers can hold
+- May require state buffer size adjustment (currently sized for
+  n_tokens=1 single-pass per iter)
+
+**Falsifier**: change line 1986 from `if seq == 1` to `if seq <= 4`,
+rebuild, run K1 batched at seq=2, compare to TWO_CALLS trajectory.
+If matches → routing was the only bug.  If still diverges →
+state-init or buffer-sizing issue requires deeper fix.
+
+**Iter-178/179 reframe**: iter-178 documented "DeltaNet multi-token
+mid-stream cur_len bug remains".  iter-179 was "bisect" pending.
+Today's localization shows the bug is specifically in the **prefill
+path engaging when it shouldn't** — not in any kernel-level math
+issue.  Fix scope drops from "multi-week" (rewrite multi-token
+support) to "1-2 iter" (route seq=2..K through decode path).
+
+**Actionable iter-272 plan**:
+1. Read prefill path's n_tokens handling to understand why it differs
+   from decode at seq=2
+2. Read decode kernel's n_tokens loop more carefully (state buffer
+   size constraints)
+3. Try the trivial fix: change routing condition
+4. Rebuild + run K1 batched coherence test
+5. If coherent: ship as default-flip-eligible; if not: identify
+   secondary bug
+
+**Iter-271 outcome**:
+- ✓ Localized iter-179's "bisect" pending task to a specific code
+  routing condition
+- ✓ Reframed scope from "multi-week DeltaNet rewrite" to "small
+  routing fix" (pending verification)
+- ✓ Found existing kernel infrastructure (decode_f32 with n_tokens
+  loop) that can be leveraged
+- → iter-272 attempts the trivial routing fix as falsification test
+  before any deeper code changes
+
+**This MAY unlock the K1 perf win** (~+8% measured) WITH coherent
+output — IF the routing fix is sufficient.  Operator's "≥ peer ...
+while implementing proper TQ" mantra would extend to qwen3.6 27B-MTP
+in addition to the already-satisfied 35B-A3B.  Worth one iter to
+test.
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
