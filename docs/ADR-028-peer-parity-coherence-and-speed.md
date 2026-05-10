@@ -7996,6 +7996,93 @@ BEFORE 1-2 weeks of engineering.  Saved the misallocation.
 3. **Don't pursue**: H1 — measurement-falsified ROI doesn't justify
    the engineering scope.
 
+### iter-247 — methodology gap recommendations (research synthesis)
+
+Operator-invoked synthesis question: "what can we do better to
+understand our speed gap?"  Honest meta-critique of investigation
+methods used so far.
+
+**What we've done well**:
+- SKIP_* bisects (15 flags) for per-component cost attribution
+- Peer-source dossiers with file:line evidence (iter-237)
+- Cross-model coherence gates (iter-242)
+- Measured-before-built discipline (iter-246 saved 1-2 weeks)
+
+**What we haven't measured (gaps blocking confident decisions)**:
+
+1. **Metal Capture / Xcode GPU debugger never run**.  We've assumed
+   concurrency from `barrier_between` calls but never visualized the
+   actual GPU timeline.  iter-237 dossier noted llama.cpp uses
+   range-overlap concurrency analysis to skip barriers when ranges
+   don't conflict; we don't know if hf2q's barriers are over-
+   conservative without measurement.
+2. **MTL hardware counters unsampled**.  Apple Silicon GPUs expose
+   memory bandwidth, ALU utilization, cache hit rates, occupancy via
+   `MTLCounterSampleBuffer`.  Never collected.  The "iter-215
+   irreducible 4.85 ms floor" could be GPU compute floor OR CPU
+   dispatch overhead OR memory-bandwidth floor — we cannot
+   distinguish.
+3. **Roofline analysis missing**.  M5 Max has ~400 GB/s memory
+   bandwidth.  TQ-HB SDPA reads ~230 MB/token; 400 GB/s peak gives
+   0.58 ms theoretical floor.  Measured 12.5 ms body suggests we're
+   either at ~5% bandwidth utilization OR compute-bound.  **We don't
+   know which** → we don't know whether kernel-level or memory-layout
+   optimization is the right lever.
+4. **omlx (Python+mlx-lm) same-machine baseline never run**.  iter-228
+   noted omlx is "production DFlash+MTP on Apple Silicon".  We've
+   benched llama.cpp (C++) but never mlx-lm (Apple's optimized MLX
+   Python).  Without omlx, we can't tell if 0.71× peer ceiling is
+   C++/MLX-specific or Apple-Silicon fundamental.
+5. **In-flight per-component GPU timing not active**.  iter-185 added
+   the infrastructure but recent benches (iter-243/245) report only
+   aggregate tok/s.  Cost map relies on SKIP-bisect deltas, which
+   iter-213 found can be confounded by cache effects.
+6. **TQ-HB SDPA structural cost assumed, not measured**.  iter-237
+   dossier hypothesized "~3× extra arithmetic per K element" for
+   codebook-gather + per-pos norm + FWHT-undo vs peer's direct dot.
+   Never measured the actual arithmetic cycles or memory-bandwidth
+   ratio between hf2q's TQ-HB SDPA and a hypothetical bare-F16-dot
+   SDPA at the same shape.
+
+**Recommendations** (ordered by ROI per investigation hour):
+
+| # | Action | Cost | Falsifier / what it answers |
+|---|--------|------|------------------------------|
+| 1 | Bench omlx (mlx-lm) on same gemma4 GGUF | ~1 hr | Independent peer baseline; if omlx > llama.cpp, gap is impl-specific not Apple-Silicon-fundamental |
+| 2 | Run Metal Capture on single decode step | ~2 hr | Visualizes actual barrier/concurrency timeline; falsifies "peer skips barriers via range-overlap" hypothesis for hf2q |
+| 3 | Re-activate iter-185 per-block GPU timing for prod benches | minutes | Whether cost-map component attributions are stable across runs (iter-213 confound check) |
+| 4 | Sample MTL bandwidth + ALU counters | ~4 hr | Memory-bound vs compute-bound on roofline → determines optimization direction |
+| 5 | Microbench TQ-HB SDPA vs bare-F16-dot at same shape | ~6 hr | Confirms or refutes that ~12% TQ-HB cost is structural |
+| 6 | Build full roofline-analysis script | ~3 hr | Combines #3+#4 into single artifact: GB/s used vs avail, GFLOPs used vs avail |
+
+**Top-1**: Bench omlx on the same gemma4 GGUF (#1, ~1 hour).
+Independent peer baseline; if omlx outperforms llama.cpp on the same
+hardware + same model file, the structural-vs-engineering split
+shifts.
+
+**Top-2**: Combined Metal Capture + MTL counter sampling on a single
+decode step (#2 + #4, ~6 hours).  Two unknowns —
+compute-vs-memory-bound + barrier-overhead — block confident
+next-step decisions.  Both are answerable via Apple's profiling
+tools that we have not yet used.
+
+**Methodology contradictions surfaced**:
+- iter-237 dossier H1 ~12% ROI vs iter-246 measured ~+1-2% ROI:
+  resolved — dossier estimate based on llama.cpp's pre-optimization
+  starting cost; iter-195/197 closed the gap.  **Lesson**: dossier
+  ROI estimates should be re-grounded against post-optimization hf2q
+  cost map before becoming engineering plans.
+- iter-215 "irreducible 4.85 ms floor" vs absence of bandwidth
+  measurement: unresolved.  Need MTL counters to attribute floor to
+  compute / dispatch / sync.
+
+**Sources NOT yet read** (potential future deep-dives):
+- omlx Python serving layer at gemma4 inference time
+- /opt/dflash kernel-level details (only architecture overview)
+- /opt/candle (mentioned, never read)
+- Apple Metal Performance Shaders documentation
+- Xcode Metal Frame Capture output for any hf2q decode step
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
