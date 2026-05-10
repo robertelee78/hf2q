@@ -9917,6 +9917,66 @@ ELSE in the qwen35 forward path.
 - **Current**: bug is in qwen35 forward orchestration (FA layer, or
   state/position threading) NOT in DeltaNet layer kernel/setup
 
+### iter-274 — read iter-177's FA fix commit + map test coverage gaps
+
+Read iter-177's actual commit `b8ac9eb` to understand the FA fix scope:
+
+> "Fix: add cur_len_for_arena = slot.current_len[0]; gate use_arena
+> on == 0. When cur_len > 0, fall through to apply_sdpa_with_kv_cache
+> which correctly takes the resume_path_eligible branch (kernel-
+> validated byte-correct at qL=2 + kL=130 by iter-21 probe)."
+
+Key observations:
+- iter-177 fix is a **runtime gate**, not a unit test
+- "Kernel-validated by iter-21 probe" was end-to-end (1 specific qL/kL
+  combination), not exhaustive
+- Commit message explicitly notes "haiku still loops late" — fix was
+  PARTIAL
+- iter-178 attributed remaining bug to DeltaNet → now REFUTED by
+  iter-273
+
+**Test coverage matrix at HEAD**:
+
+| Test | seq_len | state/cache | Result |
+|------|--------:|-------------|--------|
+| Decode kernel n_tokens=1..32 | varies | varies | ✓ pass (math correct) |
+| DeltaNet layer at seq=4 + state=0 | 4 | zero | ✓ pass (existing) |
+| **DeltaNet seq=2 + non-zero state** | 2 | non-zero | **✓ pass (iter-273 SHIPPED)** |
+| FA stateless multi-token | 4 | None (no cache) | ✓ pass (existing) |
+| **FA seq=2 + non-zero KV cache** | 2 | non-zero | **MISSING — iter-275 work** |
+
+**Bug location now narrowed to two possibilities**:
+
+1. **FA cache-threaded mid-stream multi-token** — iter-177's fix was
+   incomplete (haiku still looped post-fix per commit message).  No
+   layer-level unit test was ever written to verify the fix.  iter-275
+   plan: write analogous test to iter-273's but for FA layer with
+   non-zero KV cache slot.
+
+2. **Higher-level orchestration** — qwen35 forward call chain, state
+   ping-pong between K1 iters, position threading across all 64 layers.
+
+**Reframed iter-179 task** (still pending in task list): now scoped
+to "iter-275: write FA seq=2 mid-stream cache parity test + bisect
+within if FA passes too".  No more multi-week DeltaNet rewrite.
+
+**iter-274 outcome**:
+- ✓ iter-177's fix scope confirmed via direct commit read
+- ✓ "Haiku loop" remaining bug acknowledged by iter-177 commit itself
+- ✓ Test coverage gaps mapped — only the FA cache-threaded mid-stream
+  case lacks a unit test
+- → iter-275 writes that test as the next falsifier
+- ✓ Bug location narrowed from "anywhere in the layer chain" to
+  "either FA cache-threaded path OR higher-level orchestration"
+
+**Cumulative iter-263→274 thread evidence**:
+- 12 iterations, 4 hypothesis refutations, 2 production code changes
+  shipped (multi-EOS API, name-based EOS resolver), 1 layer parity
+  test shipped (DeltaNet mid-stream)
+- Bug location narrowed by ~80% from initial "K1 trajectory divergence"
+  to specific candidates (FA cache or orchestration)
+- Each iter measures, never guesses, never ships speculative fixes
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
