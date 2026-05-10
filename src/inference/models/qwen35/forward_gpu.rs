@@ -136,19 +136,48 @@ fn print_and_reset_cb_profile(label: &str) {
     mlx_native::kernel_profile::reset();
 }
 
-/// Write the last-token row of `hidden` [seq, H] as f32 bytes to `path`.
+/// Write `hidden` [seq, H] as f32 bytes to `path`.
+///
+/// By default writes only the last-token row (matches pre-iter-279
+/// behavior — the embed-decode use case).
+///
+/// **ADR-028 iter-279**: when `HF2Q_DUMP_LAYER_ALL=1` AND seq_len > 1,
+/// writes ALL `seq_len` rows.  Used by the K1 spec-decode trajectory
+/// divergence bisect: compare K1's hidden[layer L][position 0] to
+/// MTP-off's hidden[layer L][token 0] — they should be IDENTICAL if
+/// the qwen35 forward correctly handles batched-vs-sequential.  See
+/// `delta_net_layer_seq1_plus_seq1_eq_seq2_at_same_initial_state`
+/// (iter-276) — proven at the LAYER level; this dump tests the FULL
+/// forward chain across all 64 layers.
 fn dump_layer_bin(path: &str, buf: &MlxBuffer, seq_len: u32, hidden_size: u32) {
+    let dump_all = std::env::var("HF2Q_DUMP_LAYER_ALL").as_deref() == Ok("1");
     match download_f32(buf) {
         Ok(data) => {
             let h = hidden_size as usize;
-            let last_start = ((seq_len as usize).saturating_sub(1)) * h;
-            let row = &data[last_start..last_start + h.min(data.len().saturating_sub(last_start))];
+            let row = if dump_all && seq_len > 1 {
+                // Write all seq_len rows for K1 trajectory bisect.
+                let total = (seq_len as usize) * h;
+                &data[..total.min(data.len())]
+            } else {
+                let last_start = ((seq_len as usize).saturating_sub(1)) * h;
+                &data[last_start..last_start + h.min(data.len().saturating_sub(last_start))]
+            };
             let bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 4) };
             if let Err(e) = std::fs::write(path, bytes) {
                 eprintln!("[DUMP_LAYER] write {path} failed: {e}");
             } else {
-                eprintln!("[DUMP_LAYER] wrote {} f32 → {path}", row.len());
+                let rows_written = if dump_all && seq_len > 1 {
+                    seq_len as usize
+                } else {
+                    1
+                };
+                eprintln!(
+                    "[DUMP_LAYER] wrote {} f32 ({} row{}) → {path}",
+                    row.len(),
+                    rows_written,
+                    if rows_written == 1 { "" } else { "s" }
+                );
             }
         }
         Err(e) => eprintln!("[DUMP_LAYER] download failed for {path}: {e}"),
