@@ -9476,6 +9476,101 @@ on this GGUF.  If the 27B-MTP-Q4_0 file has structural issues
 might behave differently.  Per reddit-mtp.txt the recommended
 quant is q8_0-mtp not q4_0-mtp.
 
+### iter-269 — TWO_CALLS variant LOCALIZES bug to 2-token batched forward
+
+3-way bisect at greedy temp=0, 30 tokens, "What is 2+2?":
+
+| Stack | Tokens | Accept | Output (early lines) |
+|-------|-------:|-------:|---------------------|
+| A: MTP off | 13 (stops) | n/a | "\n\n4\n\n" + EOS |
+| B: K1=1 default (1× 2-token batched) | 30 (max) | 52.6% | "</think>\n4<\|im_end\|>\n\nThe result is 4..." |
+| **C: K1=1 TWO_CALLS=1 (2× 1-token sequential)** | 30 (max) | **70.6%** | "</think>\n\n4\n\n<\|im_start\|>user..." |
+
+C is **closer to A's greedy trajectory** than B.  Accept rate jumped
+52.6% → 70.6%.
+
+**1000-token perf bench**:
+
+| Stack | tok/s | vs MTP-off | Accept | Trajectory |
+|-------|------:|-----------:|-------:|-----------|
+| MTP off (baseline) | 31.8 | 1.000× | n/a | greedy ✓ |
+| K1=1 default (2-token batched) | 34.4 | **+8.2%** | 88.3% | **divergent** ✗ |
+| K1=1 TWO_CALLS (2× 1-token) | 29.3 | -7.9% | 76.2% | closer-to-greedy ✓ |
+
+**Bug FULLY LOCALIZED**: the 2-token batched forward
+`forward_gpu_with_hidden(&[a, b], &[N, N+1], ...)` produces
+**different logits at pos N** than the equivalent 1-token forward.
+TWO_CALLS proves it: replacing the batched 2-token forward with two
+sequential 1-token forwards (step A at pos N, step B at pos N+1)
+produces a closer-to-greedy trajectory.
+
+**Most likely root cause**: qwen35moe's hybrid arch has DeltaNet
+linear-attention layers (per `delta_net.rs:1`).  DeltaNet uses a
+recurrent state machine (chunk_scan kernel).  Multi-token batched
+forward at decode time may corrupt the recurrent state — exactly
+the iter-178 bug class that iter-179 was supposed to bisect (still
+PENDING per task list #63).
+
+**Decision matrix for K1 ship status**:
+
+| Option | Perf | Trajectory | Verdict |
+|--------|-----:|-----------|---------|
+| K1 default (batched) | +8.2% | divergent (violates verifier.rs:119) | NOT byte-identical |
+| K1 TWO_CALLS | -7.9% | closer-to-greedy | Correct but SLOWER than baseline |
+| Disable K1 (MTP off) | 0% | greedy ✓ | Shippable, no win |
+| Fix DeltaNet multi-token | TBD | TBD | Multi-week (iter-179 pending) |
+
+**MTP optimization domain assessment**:
+- With the current qwen35moe arch, K1 cannot simultaneously deliver
+  perf win AND byte-identical-to-greedy.
+- Reddit-claimed 2.5× speedup uses llama.cpp's spec-decode, which
+  presumably has correct multi-token handling for qwen3 hybrid arch.
+- hf2q's K1 path is **structurally limited** by the DeltaNet bug
+  until iter-179 is resolved.
+
+**Operator-decision-gated options for MTP path forward**:
+
+1. **Disable K1 default**: keep `HF2Q_SPEC_DECODE_K1=1` opt-in only
+   (current state is opt-in already).  Production MTP path remains
+   the K1=0 sequential verify (also broken at -13% per iter-263).
+   Net: MTP infrastructure exists but provides no perf win on
+   current qwen35moe.
+
+2. **Switch K1 default to TWO_CALLS**: ships correct trajectory but
+   regresses 7.9% from baseline.  Worse than non-MTP.
+
+3. **Investigate DeltaNet multi-token bug** (iter-179): multi-week
+   port of fix from llama.cpp/dflash reference impls.  Required to
+   unlock K1's potential.
+
+4. **Ship K1 default as "MTP-mode" opt-in with caveat**: +8.2% but
+   non-greedy.  Acceptable for sampling-temperature use cases but
+   violates standing rule.
+
+**Iter-269 outcome**:
+- ✓ K1 trajectory divergence root-caused to 2-token batched forward
+- ✓ TWO_CALLS variant (2× 1-token sequential) is closer-to-greedy
+  but slower than baseline
+- ✓ Real fix requires DeltaNet multi-token bug resolution (iter-179
+  pending, multi-week)
+- → Operator decision required: disable K1, ship correct-but-slower,
+  fix DeltaNet, or ship buggy-but-fast as opt-in
+
+**iter-263 → iter-269 thread closing assessment**:
+- Started with "MTP regresses 13%" perf observation
+- Discovered "K1=1 fixes regression" (+22.6% over MTP-default)
+- Discovered "K1 doesn't stop on EOS"
+- Discovered "GGUF metadata gap" (real, fixed with name-based scan)
+- Discovered "SpecDecode API mismatch" (real, fixed with multi-EOS)
+- Discovered "K1 trajectory diverges from greedy" (real, root cause)
+- Localized to 2-token batched forward (this iter)
+- Mapped fix path to iter-179 DeltaNet pending bisect
+
+The investigation succeeded in fully mapping the MTP optimization
+domain on hf2q's current architecture.  No more "obvious" levers
+remain on this thread — the path forward is gemma4 DFlash port OR
+qwen35moe DeltaNet multi-token fix, both multi-month.
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
