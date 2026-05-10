@@ -4837,6 +4837,63 @@ are:
 - FA dispatch fusion (multi-day work; QKV+norm+RoPE+KVcopy+SDPA→1 kernel)
 - TQ-HB → F16 KV switch on SDPA (already covered by Path E+F)
 
+### iter-181 — MoE _id matmul saturated; bottleneck is dispatch density
+
+Built `mlx-native/benches/bench_decode_moe_id_shapes.rs` (commit
+mlx-native `dfd327c`).  Read real GGUF qtypes via gguf-py (file label
+"APEX-Q5_K_M" is misleading — actual stored qtypes are mixed).
+
+**Real qtypes per the GGUF**:
+- gemma4 `ffn_gate_up_exps` **Q6_K** [2816, 1408, 128]
+- gemma4 `ffn_down_exps`    **Q8_0** [704, 2816, 128]
+- qwen3.6 `ffn_gate_exps`   **Q5_K** [2048, 512, 256] (separate, NOT fused with up)
+- qwen3.6 `ffn_up_exps`     **Q5_K** [2048, 512, 256]
+- qwen3.6 `ffn_down_exps`   **Q6_K** [512, 2048, 256]
+- qwen3.6 also has shared experts: `*_shexp` Q5_K/Q5_K/Q6_K (1 per layer)
+
+**Batched results** (M5 Max peak 546 GB/s):
+
+| Shape         | Q     | per_call | GB/s | %peak |
+|---------------|-------|---------:|-----:|------:|
+| g4_gate_up    | Q6_K  | 38.6µs   | 674  | 123% (cache) |
+| g4_down       | Q8_0  | 22.9µs   | 737  | 135% (cache) |
+| q36_gate      | Q5_K  | 14.1µs   | 409  | 75%  |
+| q36_up        | Q5_K  | 14.5µs   | 397  | 73%  |
+| q36_down      | Q6_K  | 20.6µs   | 335  | 61%  |
+
+Gemma4's 128-expert stack (26 MB / call read footprint) fits in M5 Max
+L3 → cache-resident, >100% nominal peak.  Qwen3.6's 256-expert stack
+(180 MB total) overflows → ~70% sustained.  Both are well above the
+"kernel-bottleneck" threshold.
+
+**Per-token MoE matmul aggregate**:
+- gemma4 (60 _id calls): **1.84 ms** at 697 GB/s aggregate
+- qwen3.6 (80 _id calls): **1.97 ms** at 374 GB/s aggregate
+
+Kernel profiler reported gemma4 MoE total = 294 µs/layer × 30 = **8.82 ms**.
+Subtracting the 1.84 ms matmul time → **~7 ms is in routing + swiglu +
+post-FF norm dispatches** (~300 small-kernel dispatches per token at
+~25 µs each).
+
+**VERDICT**: MoE matmul kernels are bandwidth-saturated.  The gemma4
+decode-time gap is **dispatch density in the MoE routing pipeline**
+(norm + scale + mul + router-matvec + softmax_topk + gather + mul +
+add + swiglu + post-FF norm = ~10 dispatches per MoE layer × 30 = 300
+small dispatches per token), NOT matmul kernel impl.
+
+**iter-182+ optimization lever**: fuse routing dispatches.  Specific
+candidates:
+1. **Fused router-norm+scale+mul** (3 dispatches → 1).  Currently
+   norm + scale + mul live as 3 sequential kernels — routine 1-token
+   reductions.  Fusing → eliminates 2 × 30 = 60 dispatches/token.
+2. **Fused softmax_topk + gather**: combine top-k selection with
+   expert-id gather.
+3. **Fused weighted-sum + accumulator**: merge B14 + accumulate.
+4. **mm_id at higher top_k**: route gate_up + down to mm_id (instead
+   of mv_id) to amortize launch overhead — but this would require
+   batching multiple decode steps, conflicting with single-token
+   serving latency.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
