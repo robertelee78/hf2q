@@ -128,6 +128,12 @@ pub struct InvestigationEnv {
     /// (attn_q_normed/attn_k_normed stale).
     pub skip_head_norm_rope: bool,
 
+    /// `HF2Q_SKIP_POST_ATTN_NORM=1` — skip the post-attention
+    /// fused_norm_add dispatch per layer (sequential between O-proj and
+    /// B8).  ADR-028 iter-205 — bisect a sequential-critical-path op.
+    /// Produces garbage residual stream.
+    pub skip_post_attn_norm: bool,
+
     // ========================================================================
     // Category 4 — warn-only (ineffective but safe). No gate; raw intent.
     // ========================================================================
@@ -575,6 +581,7 @@ struct RawAckIntent {
     skip_moe_experts: bool,
     skip_moe_swiglu: bool,
     skip_head_norm_rope: bool,
+    skip_post_attn_norm: bool,
     lmhead_rerank_disabled: bool,
     chunk_scan_prefill: bool,
 }
@@ -593,6 +600,7 @@ impl InvestigationEnv {
             skip_moe_experts: env_eq_one("HF2Q_SKIP_MOE_EXPERTS"),
             skip_moe_swiglu: env_eq_one("HF2Q_SKIP_MOE_SWIGLU"),
             skip_head_norm_rope: env_eq_one("HF2Q_SKIP_HEAD_NORM_ROPE"),
+            skip_post_attn_norm: env_eq_one("HF2Q_SKIP_POST_ATTN_NORM"),
             lmhead_rerank_disabled: matches!(
                 env::var("HF2Q_LMHEAD_RERANK").as_deref(),
                 Ok("0")
@@ -611,6 +619,7 @@ impl InvestigationEnv {
             skip_moe_experts: raw.skip_moe_experts && ack,
             skip_moe_swiglu: raw.skip_moe_swiglu && ack,
             skip_head_norm_rope: raw.skip_head_norm_rope && ack,
+            skip_post_attn_norm: raw.skip_post_attn_norm && ack,
             lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
             chunk_scan_prefill: raw.chunk_scan_prefill && ack,
 

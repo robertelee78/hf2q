@@ -3795,18 +3795,23 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 } else {
                     // -- Fused post-attention norm + residual add --
-                    s.barrier_between(
-                        &[&self.activations.hidden, &self.activations.attn_out],
-                        &[&self.activations.residual],
-                    );
-                    mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.hidden,
-                        &self.activations.attn_out,
-                        &self.layers[layer_idx].norms.post_attention_layernorm,
-                        &self.activations.residual,
-                        hs as u32, 1, eps,
-                    ).map_err(|e| anyhow::anyhow!("fused post-attn norm+add L{layer_idx}: {e}"))?;
+                    // ADR-028 iter-205: SKIP_POST_ATTN_NORM bisect — skip
+                    // the fused_norm_add dispatch.  Sequential, 1 per layer.
+                    // Produces garbage residual stream.
+                    if !INVESTIGATION_ENV.skip_post_attn_norm {
+                        s.barrier_between(
+                            &[&self.activations.hidden, &self.activations.attn_out],
+                            &[&self.activations.residual],
+                        );
+                        mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.hidden,
+                            &self.activations.attn_out,
+                            &self.layers[layer_idx].norms.post_attention_layernorm,
+                            &self.activations.residual,
+                            hs as u32, 1, eps,
+                        ).map_err(|e| anyhow::anyhow!("fused post-attn norm+add L{layer_idx}: {e}"))?;
+                    }
 
                     if dump_after_post_attn {
                         s.finish()
