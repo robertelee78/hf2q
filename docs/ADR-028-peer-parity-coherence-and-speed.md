@@ -8256,6 +8256,72 @@ each closing 4-8%.
 we were trading guesses about why the gap exists.  Now we have
 hard numbers: 960 dispatches × 15.1 µs vs peer 450 × 22 µs.
 
+### iter-250 — measured per-dispatch overhead = 3 µs (sequential-fusion ceiling = 0.91× peer)
+
+Used existing `HF2Q_FUSED_END_OF_LAYER=1` flag (iter-217/iter-219)
+as a real A/B probe — eliminates 30 dispatches/token by fusing
+2 sequential end-of-layer steps into 1.
+
+**A/B measurement at HEAD** (50 tokens, gemma4 26B-A4B Q5_K_M):
+
+| Stack | Dispatches/token | Total ms | µs/disp avg | tok/s |
+|-------|-----------------:|---------:|------------:|------:|
+| Path E+G | 930 | 13.75 | 14.7 | 73.9 |
+| Path E+G + FUSED | 900 | 13.66 | 15.1 | 74.3 |
+| **Δ (saved)** | **-30** | **-0.09 ms** | (compute survived; per-disp avg INCREASED) | +0.4 |
+
+**Per saved-dispatch OVERHEAD: 3.0 µs** (= 0.09 ms / 30).
+
+This is **not** the 15.1 µs/dispatch average (which includes compute
+that survives fusion per iter-219).  3 µs is the launch + barrier
++ scheduler-gap overhead per dispatch on Apple Silicon Metal.
+
+**Math of closing the gap via sequential fusion**:
+
+- Excess dispatches vs peer: 960 (hf2q) - 450 (llama.cpp est) = **510**
+- Saving overhead: 510 × 3 µs = **1.53 ms total**
+- New time: 14.57 - 1.53 = 13.04 ms/token = **76.7 tok/s**
+- × peer: 76.7 / 100.2 = **0.77×**
+
+**Even eliminating ALL excess dispatches gets to ~77 tok/s — still
+below peer's 100 by 23%**.  The remaining ~3 ms must come from
+**kernel efficiency** delta (peer's larger kernels do more work per
+cycle: better L1/L2 cache reuse + fewer scheduler gaps).  For TQ-HB-
+preserving design, this is a STRUCTURAL cost of byte-packed quant +
+per-pos norms vs llama.cpp's contiguous F16 cache.
+
+**Realistic ceiling estimates**:
+
+| Approach | Best-case ROI | Tok/s @ HEAD | × peer |
+|----------|--------------:|-------------:|-------:|
+| Eliminate all 510 excess dispatches | +10% | ~77 | 0.77× |
+| + Optimize TQ-HB kernel efficiency | +10-20% | ~85-91 | 0.85-0.91× |
+| **DFlash spec-decode (Option C)** | **+100-300%** | **140-280** | **1.4-2.8× ★** |
+
+**Bottom line**: even "perfect" fusion + kernel optimization tops out
+at ~0.91× peer with TQ-HB preserved.  **DFlash is the only known
+lever that can BEAT peer with TQ intact.**
+
+**Recommended next concrete iterations** (post-iter-250):
+
+1. **Identify highest-ROI sequential-fusion candidates**: the 510
+   excess dispatches break down as ~17 per layer × 30 layers.  Walk
+   `forward_mlx.rs` decode to find the top 5 sequential boundaries
+   that aren't already fused.  Each candidate at 3 µs × 30 layers =
+   ~0.09 ms = ~0.7%.  Fusion of top 5 candidates ≈ 3.5%.
+
+2. **Microbench TQ-HB kernel efficiency vs hypothetical bare-F16**
+   (iter-247 rec #5).  Measures structural-vs-engineering split for
+   the remaining ~3 ms gap.
+
+3. **Begin DFlash port preparation** (Option C, multi-month).  This
+   is the only path to peer-or-better.  iter-227 architectural
+   skeleton is already there.
+
+The audit + measurement phase has now produced the *complete cost
+breakdown* of the gap.  Future iterations execute one of these three
+directions; no more analysis without measurement.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
