@@ -9214,6 +9214,79 @@ fires only on the first slot.
 - Default-flip ships +7.5% on qwen MTP path
 - Unlocks all qwen3.5/3.6 MTP GGUFs (including the 27B-MTP file)
 
+### iter-265 — ROOT CAUSE LOCALIZED: 27B-MTP GGUF missing eos_token_id
+
+Direct GGUF metadata read of `qwen3.6-27b-mtp-q4_0.gguf` reveals only
+32 metadata entries:
+
+```
+GGUF v3, 866 tensors, 32 metadata entries
+  tokenizer.ggml.model = <str:4>           (= "gpt2")
+  tokenizer.ggml.tokens = <arr:8x248044>
+  tokenizer.ggml.scores = <arr:6x248044>
+  tokenizer.ggml.token_type = <arr:5x248044>
+  tokenizer.ggml.merges = <arr:8x247587>
+  tokenizer.ggml.add_bos_token = 1
+  tokenizer.ggml.add_space_prefix = 0
+  tokenizer.ggml.pre = <str:6>
+  tokenizer.chat_template = <str:7764>
+```
+
+**No `tokenizer.ggml.eos_token_id`, `bos_token_id`, or
+`padding_token_id`** in the metadata.
+
+**Causal chain**:
+1. `tokenizer.rs:290-302` reads these metadata keys (line 292:
+   `tokenizer.ggml.eos_token_id`).  All three return `None` for this
+   GGUF → no special-token entries in `specials`.
+2. `spec_decode.rs:112-141` constructs `eos_token_id: Option<u32>`
+   from this — set to `None` when key absent.
+3. `spec_decode.rs:602-603`:
+   ```rust
+   fn is_eos(&self, token: u32) -> bool {
+       self.eos_token_id == Some(token)
+   }
+   ```
+   Returns `false` for ALL token IDs because `None == Some(_)` is
+   always `false`.
+4. K1 path uses `is_eos` exclusively (lines 209, 327-328, 345, 444-445,
+   469).  All checks evaluate to false → break never fires → loop
+   runs to `max_tokens`.
+5. MTP-off path (test in iter-264) stops at 13 tokens — implies a
+   separate stop check at the cmd_generate_qwen35 / serve level that
+   K1 path bypasses.
+
+**Why MTP-off stops but K1 doesn't**: the non-spec generate code path
+likely uses an additional/parallel stop mechanism (e.g., direct
+chat-template-aware stop check or runtime-level stop sequence
+matching) that the spec_decode runner doesn't share.
+
+**Fix scope (iter-266+)**:
+1. **Robust eos_token_id resolution**: when GGUF metadata lacks
+   `eos_token_id`, fall back to scanning `token_type` array for
+   tokens of type 3 (CONTROL) and matching by name (`<|im_end|>`,
+   `<|endoftext|>`, `<|im_start|>` etc.) per the qwen3 chat template
+   convention.  Apply at `tokenizer.rs` GGUF loader level so BOTH
+   spec-decode and non-spec paths benefit.
+2. Or: parse `chat_template` metadata to extract the stop sequence
+   (qwen template uses `<|im_end|>`).
+3. Or: hardcode known qwen3 stop token name → ID lookup as a fallback.
+
+**iter-265 outcome**:
+- ✓ Root cause localized to GGUF metadata gap, NOT a K1-specific bug
+- ✓ Same eos_token_id=None affects ALL paths but only K1 path's broken
+  behavior is visible because MTP-off has parallel stop logic
+- ✓ Fix is at tokenizer.rs / GGUF loader, not spec_decode.rs
+- → iter-266 implements the fallback eos_token_id resolution
+- → After fix: K1 stops correctly, default-flip becomes safe, +7.5%
+  ships on qwen MTP path
+
+**Standing lesson encoded**: GGUF metadata coverage varies — never
+assume `tokenizer.ggml.eos_token_id` is present.  Robust loaders
+need name-based fallback for control tokens.  This bug was hiding
+because the non-spec path had a workaround that masked the missing
+metadata.
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
