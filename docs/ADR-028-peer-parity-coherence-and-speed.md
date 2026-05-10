@@ -5775,6 +5775,47 @@ across many small ops.  iter-201 will bisect MoE routing pipeline
 (B9 router proj + B10 routing + B14 weighted_sum) which is part of
 "other".
 
+### iter-201 — BISECT MoE experts = 2.6 ms / 20.7% body (largest component)
+
+Shipped HF2Q_SKIP_MOE_EXPERTS env flag (UNSAFE_EXPERIMENTS-gated).
+Skips B11 gate_up_id + B12 swiglu + B13 down_id (3 dispatches/layer).
+
+| Config | BODY GPU | dispatches |
+|--------|---------:|-----------:|
+| Default | 12.55 ms | 956 |
+| SKIP_MOE_EXPERTS | 9.96 ms | 866 (-90) |
+| **Δ MoE experts cost** | **2.60 ms** | -3/layer × 30 |
+
+**MoE experts = 2.60 ms = 20.7% of body GPU — biggest single component.**
+
+Per-layer 87 µs across 3 dispatches.  Decomposition vs iter-181 batched:
+- gate_up_id + down_id matmul: ~1.84 ms (peak-saturated, hard to attack)
+- swiglu batch: ~0.76 ms (1 dispatch/layer)
+
+**Updated cost map** (12.55 ms body):
+
+| Component | ms | % body |
+|-----------|---:|-------:|
+| **MoE experts** | **2.60** | **21%** ← largest |
+| Mat-mul attention | 1.85 | 15% |
+| TQ-HB SDPA residual | 1.50 | 12% |
+| Dense MLP | 1.14 | 9% |
+| Other (norms/RoPE/KV/routing scaffold) | 5.46 | 43% |
+
+**Optimization candidate**: build `kernel_mul_mv_id_q6_K_f32_swiglu`
+(analog of existing Q4_0 _swiglu kernel) to fuse gate_up_id + swiglu
+into one dispatch.  Potential savings: swiglu dispatch (~0.76 ms total)
++ extra `moe_gate_up_id_out` write/read = potentially +6% throughput.
+
+**Risk**: per session memory, Q4_0 _swiglu was tested in qwen35 dwq46
+and REGRESSED -1.5% (likely because fused kernel is 2-pass sequential
+vs 2 concurrent kernels at decode-time M=1).  Same risk applies to Q6_K.
+
+**iter-202 plan**: BISECT BEFORE BUILDING (operator's standing rule).
+Add HF2Q_SKIP_MOE_SWIGLU env flag — skip just the swiglu dispatch (keep
+matmuls) to measure swiglu's exact cost.  If <0.5 ms, fusion ROI poor.
+If >0.5 ms, then build the Q6_K _swiglu kernel and bench parity.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
