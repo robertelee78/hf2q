@@ -10477,3 +10477,140 @@ Cumulative cost map (12.5 ms body):
 - `project_gemma_prefill_bitrot_2026_05_09.md` (memory file) — cross-session continuity
 - hf2q commits: `133722d` (iter-64 fix), `6db074d` (iter-65 gate), `8df6afc..ce19e8f` (iter-67..86 chain)
 - mlx-native commits: `b6b8e79` (iter-68 1-char fix), `91f174b` (iter-73 shader gate)
+
+---
+
+## iter-283 — Test 1 EXECUTED: hf2q dispatches 38% MORE per token than llama.cpp
+
+**Operator's REFRAME (iter-282) demanded measurement before code changes.
+This iter delivers the first concrete number: the dispatch-count gap.**
+
+### Method
+
+**llama.cpp instrumentation** — added env-gated atomic counter at the
+single Metal dispatch site `ggml-metal-device.m:509`
+(`ggml_metal_encoder_dispatch_threadgroups`):
+
+```c
+// at file head
+static _Atomic uint64_t g_llama_disp_count = 0;
+static int g_llama_disp_count_enabled = 0;
+static pthread_once_t g_llama_disp_count_once = PTHREAD_ONCE_INIT;
+
+static void llama_disp_count_atexit(void) {
+    fprintf(stderr, "[LLAMA_DISP_COUNT] Total Metal dispatches: %llu\n",
+        (unsigned long long) atomic_load_explicit(&g_llama_disp_count, memory_order_relaxed));
+}
+static void llama_disp_count_init(void) {
+    const char * env = getenv("LLAMA_DISP_COUNT");
+    g_llama_disp_count_enabled = (env && env[0] && env[0] != '0') ? 1 : 0;
+    if (g_llama_disp_count_enabled) atexit(llama_disp_count_atexit);
+}
+
+// at the dispatchThreadgroups call
+pthread_once(&g_llama_disp_count_once, llama_disp_count_init);
+if (g_llama_disp_count_enabled) {
+    atomic_fetch_add_explicit(&g_llama_disp_count, 1, memory_order_relaxed);
+}
+```
+
+Single dispatch site (verified by `grep dispatchThreadgroups`) — every
+Metal compute kernel in llama.cpp goes through this function, so the
+counter captures 100% of the Metal dispatch traffic.
+
+**hf2q instrumentation** — already exists.  `HF2Q_DUMP_COUNTERS=1` env
+flag prints `[MLX_COUNTERS]` line via `mlx_native::dispatch_count()`
+(serve/mod.rs:1361, also used in qwen35 forward_gpu.rs).
+
+**Measurement protocol** — difference method to eliminate
+per-process startup dispatch overhead (Metal pipeline compilation,
+model load, warmup).  Same prompt for both -n values; subtract.
+
+### llama.cpp gemma4 APEX-Q5_K_M tg numbers
+
+```
+LLAMA_DISP_COUNT=1 llama-bench -m gemma4-ara-2pass-APEX-Q5_K_M.gguf -p 0 -n 64   -r 1
+  → tg64    = 102.90 tok/s,  total dispatches = 90285
+LLAMA_DISP_COUNT=1 llama-bench -m gemma4-ara-2pass-APEX-Q5_K_M.gguf -p 0 -n 1024 -r 1
+  → tg1024  = 99.95 tok/s,   total dispatches = 1423725
+```
+
+Difference: `1423725 - 90285 = 1333440` dispatches over `(1024-64)*2 = 1920`
+extra tokens (1 warmup run + 1 measured run, both at -n).
+
+**llama.cpp = 694.5 dispatches per decode token at gemma4 APEX tg1024.**
+
+### hf2q gemma4 APEX-Q5_K_M generate numbers
+
+```
+HF2Q_DUMP_COUNTERS=1 hf2q generate --max-tokens 64   --benchmark
+  → 69.8 tok/s, 26 prompt tokens, 64 decode tokens, dispatches = 86220
+HF2Q_DUMP_COUNTERS=1 hf2q generate --max-tokens 1024 --benchmark
+  → 68.8 tok/s, 26 prompt tokens, 1024 decode tokens, dispatches = 1007820
+```
+
+Difference: `1007820 - 86220 = 921600` dispatches over `1024-64 = 960`
+extra decode tokens.
+
+**hf2q = 960.0 dispatches per decode token at gemma4 APEX tg.**
+(numerically *exact* — no noise; deterministic per-token kernel pattern)
+
+### Decomposition of the 4.53 ms / token gap
+
+| | llama.cpp | hf2q | delta |
+|---|---|---|---|
+| ms / token | 10.005 | 14.535 | +4.530 ms |
+| dispatches / token | 694.5 | 960.0 | +265.5 (+38.2%) |
+| µs / dispatch (avg) | 14.40 | 15.14 | +0.74 (+5.1%) |
+
+If we keep hf2q's per-dispatch time but cut to 694.5 dispatches/token:
+  694.5 × 15.14 µs = 10.515 ms/tok = **95.1 tok/s = 0.951× peer**
+
+If we additionally match llama.cpp's per-dispatch time:
+  694.5 × 14.40 µs = 10.001 ms/tok = **99.99 tok/s = 1.00× peer**
+
+**Of the 4.53 ms gap:**
+- **89% (4.02 ms)** is from extra dispatches (hf2q does 38% more)
+- **11% (0.51 ms)** is from per-dispatch slowdown (hf2q is 5% slower per dispatch)
+
+### Strategic implications
+
+This **directly refutes** my iter-254 framing that "CPU encode = 0.36 µs
+per dispatch is constant" implied dispatch count was not the lever.
+The 0.36 µs CPU figure ignored the GPU launch+barrier per-dispatch cost
+(~3 µs measured iter-250).  In aggregate, dispatch *count* is **the
+dominant lever**.
+
+**Concrete next step (Test 2)** — find WHICH dispatches hf2q has that
+llama.cpp does not.  Approach:
+
+1. Per-op breakdown of llama.cpp's 694.5 disp/token: enable per-pipeline
+   counters keyed by `pipeline_with_params.label` at the same site
+   (already instrumented; just split by pipeline name).
+2. Per-op breakdown of hf2q's 960 disp/token: hf2q already labels via
+   `kernel_profile.rs` (lines 18, 69) — extract dispatch counts per
+   pipeline label.
+3. Diff: identify dispatches hf2q makes that llama.cpp doesn't, OR
+   dispatches llama.cpp fuses that hf2q splits.
+
+This is the iter-284 work.
+
+### Operator-aligned methodology check
+
+- **"Don't guess"** ✓ — measurement, not estimation.
+- **"Set up the right tests"** ✓ — Test 1 of the 3-test framework.
+- **"Fix the code at the gap"** — prerequisite is knowing WHICH
+  dispatches differ.  Iter-284 isolates that.
+- **"Same HW, same math, Rust ≠ slower"** ✓ — proven measurable.
+  The gap is concrete and decomposable into "more dispatches" +
+  "slower per dispatch", neither of which is structural.
+
+### Files modified
+
+- `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m`:
+  +24 lines counter infra, +4 lines at dispatch site.
+  **Stays in /opt/llama.cpp working tree** (not committed to that repo
+  — instrumentation only).
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`:
+  this section.
+
