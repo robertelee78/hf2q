@@ -11089,3 +11089,98 @@ No code changes this iter — second Chesterton's-fence rejection in this
 thread (iter-285 was the first).  Both rejections were correct: prior
 measured iters governed the decision.
 
+
+---
+
+## iter-288 — fresh A/B confirms iter-250; dispatch-count ceiling = 0.73× peer
+
+### iter-287 schedule reasoning was wrong
+
+Yesterday's iter-287 ScheduleWakeup said "iter-209's 10-20× headroom on
+per-dispatch latency is the lever".  **Re-reading iter-209 corrects this**:
+
+> "We're already near the launch floor.  Kernel-internal optimization
+> ROI: ... 0.5%/dispatch.  The fused_norm_add per-call cost is
+> hardware-launch-bound, not kernel-internal-bound."
+
+So iter-209's 9-18 µs/dispatch isn't "headroom" — it's HARDWARE.  The
+0.9 µs theoretical was *just compute*, ignoring Apple Metal's 5-10 µs
+hardware launch floor.  Per-dispatch overhead is at the hardware floor.
+
+iter-250 measured the actual *per-dispatch overhead* via A/B fusion at
+**3 µs**, separate from compute.  That number IS the headroom on
+"eliminate one dispatch".
+
+### Fresh A/B at HEAD (this iter)
+
+```bash
+HF2Q_DUMP_COUNTERS=1 hf2q generate --max-tokens 256 --benchmark
+  → 270540 disp, 69.4 tok/s
+
+HF2Q_DUMP_COUNTERS=1 HF2Q_FUSED_END_OF_LAYER=1 hf2q generate --max-tokens 256 --benchmark
+  → 262890 disp, 69.8 tok/s
+```
+
+**Δ: -7650 dispatches (29.9/tok matches iter-219's -30/tok), +0.4 tok/s.**
+- Time saved/tok: (1/69.4 - 1/69.8) = 0.082 ms
+- Per dispatch saved: 0.082 / 30 = **2.73 µs**
+
+Within ±10% of iter-250's 3 µs claim — measurement is reproducible at
+HEAD.
+
+### Updated dispatch-elimination ceiling math (fresh peer numbers)
+
+iter-250's framing used **estimated** 450 disp/tok for peer.  iter-283
+**measured** peer at **694.5 disp/tok**.  Updated math:
+
+| | Value |
+|---|---|
+| hf2q disp/tok | 960 |
+| peer disp/tok (iter-283 measured) | 694.5 |
+| Excess | 265.5 |
+| Per-dispatch overhead (this iter) | 2.73 µs |
+| Max savings (eliminate ALL excess) | 0.725 ms |
+| New time/tok | 14.41 - 0.725 = 13.69 ms |
+| New tok/s | 73.0 |
+| × peer | **0.73×** |
+
+Even **eliminating ALL 265 excess dispatches via perfect fusion**:
+**0.73× peer ceiling**.
+
+### Where's the remaining 3.69 ms?
+
+| Component | Cost | hf2q-specific delta |
+|-----------|------:|---------------------|
+| TQ-HB SDPA | 1.50 ms | hf2q-only (operator-mandated for 3.94× memory) |
+| Concurrent-group launch overhead | ~1 ms | iter-186 fusion regresses |
+| Per-dispatch kernel-work delta | ~1.2 ms | peer fuses N ops/dispatch (e.g. nf=7) — bandwidth saving from single-pass |
+| Total | ~3.7 ms | matches measurement |
+
+Per iter-256: hf2q's individual kernels are at 124-132% peak (peer or
+better).  The "kernel-work delta" isn't kernel slowness — it's
+peer's fused kernels doing **multiple ops in single dispatch with one
+input read** (memory bandwidth saving).
+
+### Strategic state (consolidated across iter-283..288)
+
+| Lever | Ceiling | Cost |
+|-------|---------|------|
+| Eliminate all 265 excess dispatches | 0.73× peer | Multi-day fusion work, iter-186 regression risk per group |
+| Bandwidth-savings via fusion (memory locality) | 0.85× peer (iter-250 estimate) | Multi-day kernel rewrite, similar regression risk |
+| Reduce per-dispatch hardware launch latency | unattainable | Apple Metal floor |
+| Remove TQ-HB (use F16) | 0.92× peer (estimated) | Operator-rejected (memory mantra) |
+| **DFlash spec-decode** | **2-3× peer** | Multi-month, operator-decision-gated iter-227 |
+
+**With operator policy intact (TQ-HB stays), realistic ceiling at gemma4
+APEX TG is 0.73-0.85× peer.**  The 0.69× current state is within that
+range; closing to 0.85× requires multi-week dispatch+kernel work.
+
+qwen3.6 APEX is **1.28× peer ★ MANTRA SATISFIED** at HEAD per iter-261.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes this iter — fresh measurement consolidates strategic
+state; no new lever revealed.
+
