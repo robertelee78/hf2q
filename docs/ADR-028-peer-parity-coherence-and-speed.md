@@ -14795,3 +14795,78 @@ For the next /loop iteration, the actionable next step is one of:
 
 No code changes (both sub-targets falsified by code reading before
 implementation effort committed).
+
+
+---
+
+## iter-340 — Phase 7d KICKED OFF: H1 RE-FALSIFIED at HEAD; Worker A spawned for peer SDPA deep read
+
+Operator: "let's do it" — spawn /cfa for Phase 7d (TQ-HB SDPA fusion redesign).
+
+### Environment-driven /cfa degradation
+
+The /cfa skill's full design assumes:
+1. MCP `claude-flow` tools available (hive-mind_*, memory_*, swarm_init) — **NOT available in this environment**
+2. Codex CLI for parallel competitive impl — Codex sandbox can't access Metal (per /cfa fallback rule for "hardware-bound tasks")
+3. Git worktrees for parallel impls — viable but moot without Codex
+
+Per /cfa's own fallback section:
+> "MCP entirely unavailable → mirror state to .claude/swarm/<slug>/*.json"
+> "Hardware-bound tasks under codex --full-auto sandbox → mode forces to review-only"
+
+Net: /cfa runs in **degraded solo mode** (queen=this session, workers=Agent Task spawns, file-based coordination, no Codex).  Mantra-aligned: "no shortcuts" — adapt to environment honestly rather than fake the substrate.
+
+### H1 (HF2Q_TQ_FUSE_FWHT_PRE re-test) — RE-FALSIFIED at HEAD
+
+iter-315/319 originally measured -1% / -0.5% on this lever.  Re-test
+at HEAD with full iter-326+331+337+338 stack ON to verify if the
+verdict changed (per /loop directive "Code + test == truth, never
+trust comments over code").
+
+Run command + result (3-run thermal baseline):
+```
+A: HF2Q_TQ_FUSE_FWHT_PRE unset (current default): 200 tok in 2.72s = 73.6 tok/s
+B: HF2Q_TQ_FUSE_FWHT_PRE=1 (peer-fused Q-FWHT inside SDPA): 200 tok in 2.73s = 73.4 tok/s
+C: re-confirm A baseline:                                    200 tok in 2.73s = 73.2 tok/s
+```
+
+3-run variance: 73.6/73.4/73.2 = ~0.5% thermal drift.  B vs A = -0.3%
+within noise.  **iter-315/319 verdict STANDS.**
+
+Why no win: fusion eliminates one dispatch + one barrier (~10-15µs)
+but the SDPA kernel becomes larger (more shared-mem pressure, more
+register pressure, longer kernel exec) which washes out the savings
+on M5 Max.  This matches the iter-336 "more smaller dispatches beats
+fewer larger dispatches per-dispatch wall on M5 Max" finding.
+
+### Worker A spawned (background) — peer flash_attn_ext_impl deep read
+
+Spawned an Explore subagent_type Agent in background to:
+1. Read peer's kernel_flash_attn_ext_impl in deep detail
+   (/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:5801)
+2. Compare to our flash_attn_vec_tq_hb chain
+3. Produce structured table: peer vs ours at SDPA-call level
+4. Identify TOP-3 candidate fusions hf2q could do WITHOUT breaking
+   TQ-HB 3.94× memory savings (operator RAM-mantra binding)
+5. Critically separate "peer does X because peer doesn't have TQ-HB"
+   from "peer does X and we should too"
+
+Worker A will return via task-completion notification.  iter-341+
+processes its findings.
+
+### Phase 7d sub-target tracker (tasks)
+
+| Sub | Hypothesis | Status |
+|---|---|---|
+| **H1** | HF2Q_TQ_FUSE_FWHT_PRE default-flip | **FALSIFIED iter-340** (re-test confirms iter-315/319) |
+| H2 | SDPA→reduce inline fusion | pending — needs Worker A finding |
+| H3 | fwht_sign_undo into SDPA output write | pending — needs Worker A finding |
+| H4 | dual K+V encode kernel (combine hadamard_quantize + hadamard_quantize_kv_hb_dual) | pending |
+| H5 | flash_attn_vec_tq_hb micro-opts (function-constant nsg, etc.) | pending — needs Worker A finding |
+| Worker A | Peer SDPA deep read (background) | in_progress |
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (H1 re-falsified; Worker A research in flight).
