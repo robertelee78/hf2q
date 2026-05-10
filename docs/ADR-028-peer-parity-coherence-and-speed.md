@@ -6942,6 +6942,77 @@ iter-226+ plan options:
       Path E+F+G 1-line)
 - (c) Document architectural skeleton for future session pickup
 
+### iter-226 — ds4 reference: MTP infrastructure already exists in C/Metal
+
+Read `/opt/ds4/ds4.c` (16,775 LOC — pure C+Metal narrow inference
+engine for DeepSeek V4 Flash).  **ds4 has full MTP speculative decode
+implemented end-to-end** in C/Metal — closest architectural reference
+to hf2q's Rust/Metal target.
+
+**ds4 MTP implementation patterns**:
+
+1. **Public API** `ds4_session_eval_speculative_argmax(session,
+   first_token, max_tokens, eos_token, accepted[], cap)`:
+   - Returns count of accepted tokens (1..cap)
+   - Single call evaluates target + drafts + verifies + accepts
+
+2. **First-token-free optimization** (line 16227-16236):
+   - Target model's normal forward already produces logits at the
+     committed prefix → first proposed draft token is "verified for
+     free" by argmax check on those logits
+
+3. **MTP cache rollback via counter** (lines 16246-16250):
+   ```
+   #define DS4_MTP_KEEP_ACCEPTED(n_) do { \
+       uint32_t keep_ = mtp_base_raw + (uint32_t)(n_); \
+       s->graph.mtp_n_raw = keep_; \
+   } while (0)
+   ```
+   No cache copy needed — counter delimits visible region.  Future
+   drafts overwrite stale slots.
+
+4. **Recursive drafting with ping-pong state** (line 16253):
+   - `mtp_state_hc` / `mtp_next_hc` alternated each draft step
+   - Enables iterative draft generation without allocation
+
+5. **Configurable verifier**:
+   - `--mtp-draft N`: max draft length per step
+   - `--mtp-margin F`: confidence threshold for fast N=2 verifier
+   - `DS4_MTP_STRICT` env: quality-vs-speed mode toggle
+
+6. **Diagnostic hooks**: `DS4_MTP_TIMING`, `DS4_MTP_CONF_LOG`,
+   `DS4_MTP_SPEC_LOG` (matches hf2q's HF2Q_*_TRACE pattern).
+
+**Critical difference from gemma4**:
+- ds4 works because **DeepSeek V4 has built-in MTP layers**:
+  `mtp.0.hc_head_fn.weight`, `mtp.0.hc_attn_fn.weight`, etc.
+- **gemma4 has NO built-in MTP layers** → cannot use ds4's pattern
+  directly
+- Must use **external draft model** (DFlash's approach) for gemma4
+
+**What transfers from ds4 to hf2q gemma4 SD work**:
+- ✅ KV state rollback via counter (saves cache-copy cost)
+- ✅ Recursive drafting with ping-pong state buffers
+- ✅ First-token-free verification optimization
+- ✅ Configurable strictness / verifier modes
+- ✅ Diagnostic env-flag pattern
+- ❌ Built-in MTP layer model assumption (gemma4 doesn't have)
+
+**Refined integration estimate** (post-ds4 study):
+
+The infrastructure runtime is well-modeled by ds4.  The novel work
+is purely the **draft model implementation** (which DFlash provides
+the architecture for).  Combined estimate:
+
+- ds4's MTP runtime infrastructure → applies to hf2q gemma4 path
+  (~1-2 months of porting C-pattern to Rust)
+- DFlash draft model in Rust + MLX-native kernels (~2-4 months)
+- Total: **3-6 months still holds** but with clearer milestones
+
+iter-227+ plan: write architectural skeleton document combining ds4's
+runtime patterns + DFlash's draft model design.  Ship as
+`docs/ADR-029-spec-decode-architecture.md` for future-session pickup.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
