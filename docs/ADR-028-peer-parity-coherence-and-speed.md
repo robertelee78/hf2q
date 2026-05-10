@@ -6386,6 +6386,55 @@ that aren't individually attackable.  Options:
 - (B) Pivot to qwen3.6 cross-pollination (multi-week refactor)
 - (C) Accept current floor, ship Path E+F+G operator-flip path
 
+### iter-215 — MAXIMAL-STACK BISECT: irreducible floor = 4.85 ms
+
+Stacked all 7 valid SKIP_* flags simultaneously:
+
+| Config | BODY GPU | dispatches | barriers |
+|--------|---------:|-----------:|---------:|
+| Default | 12.50 ms | 956 | 459 |
+| **ALL 7 SKIPs** | **4.85 ms** | 451 (-505) | 190 (-269) |
+| **Δ saved** | **7.65 ms** | -505 | -269 |
+
+Sum of individuals: 1.50 + 1.14 + 2.60 + 0.55 + 0.54 + 0.70 + 1.12 =
+**8.15 ms expected**.  Actual saved: 7.65 ms = **94% additivity**
+(sub-additivity 0.5 ms = GPU-side overlap when concurrent ops absorb
+each other's slots).
+
+**Irreducible body GPU floor = 4.85 ms** = 451 dispatches at 10.7 µs/dispatch
+avg.  Includes:
+- Routing scaffold (~0.5-1 ms)
+- KV cache copy
+- All concurrent norms collectively (head_norm_rope, V-norm, B8 norms)
+- Per-dispatch hardware overhead
+
+**Final strategic position** (29 iterations of bisects):
+
+| Body GPU breakdown | ms | Status |
+|--------------------|---:|--------|
+| MoE experts | 2.60 | bandwidth-saturated (iter-181) |
+| TQ-HB SDPA (residual after iter-197) | 1.50 | optimized; remainder hardware-bound |
+| Dense MLP | 1.14 | bandwidth-saturated |
+| Attn QKV (3 concurrent) | 1.12 | concurrent-already |
+| fused_norm_add chain (3 dispatches) | 1.09 | **fusable** (+2.5-2.7% potential) |
+| O-proj | 0.70 | **fusable** with post-attn-norm |
+| **Irreducible floor** | **4.85** | hardware/dispatch-bound |
+| **TOTAL** | **12.50** | |
+
+**Peer gap analysis**:
+- hf2q current: 12.5 ms body + 1.95 ms head = 14.45 ms (69.2 tok/s)
+- llama.cpp peer: ~8 ms body + 1.2 ms head = 9.74 ms (102.7 tok/s)
+- Gap: 4.7 ms (3.5 ms body + 1.2 ms head/sync overhead)
+
+**Cumulative session shipped wins**: +10.7% default-path (iter-195+197).
+**Available opt-in stack**: Path E+F+G = +16.7% over starting point.
+**Multi-week future levers**: 3 fusion kernels = ~+6-8% total.
+
+iter-216+ plan: shift mode from BISECT → BUILD.  Either tackle the
+3 fusion kernels (multi-day each, parallel-buildable via /cfa swarm)
+or pivot to broader architectural work.  Bisect-driven cost map is
+complete and validated.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
