@@ -3485,6 +3485,54 @@ verifier pattern. Expected:
 
 Plus iter-156 reduces loop overhead (logits readback, embed upload).
 
+### iter-155: Merge A LANDED — but CB-overhead hypothesis FALSIFIED
+
+#### Test result: per-buffer overhead ≈ 0
+
+Consolidated `forward_shared_head` from 2 CBs (head_norm + lm_head)
+into 1 CB with memory_barrier between RAW dependents. Re-run
+HF2Q_MTP_PROFILE=1:
+
+```
+Before iter-155 (6 CBs): mtp_draft = 6.4 ms steady
+After iter-155 (5 CBs):  mtp_draft = 6.5 ms steady
+Delta: ~0 ms (within noise)
+```
+
+Apple Metal pipelines `enc.commit()` non-blocking. CB count is NOT
+the bottleneck. The iter-154 hypothesis (~1ms/buffer) was wrong.
+
+#### Revised hypothesis tree
+
+The 6.4 ms forward_draft is **structural compute work**, not
+dispatch overhead:
+- 1 transformer layer: ~0.5 ms (5120 hidden × 64 layers / 31.8ms verifier)
+- eh_proj (10240 → 5120 Q4_0): ~0.2 ms
+- shared_head_norm + lm_head Q4_0: ~1.5 ms (635 MB / 587 GB/s)
+- **Subtotal theoretical: ~2.2 ms**
+- **Measured: 6.4 ms**
+- **Overhead: 3× theoretical = ~4 ms unaccounted**
+
+Merge A confirmed CB count isn't the cause. iter-156 must instrument
+INSIDE forward_draft to identify which sub-step pays the 4ms.
+
+#### iter-155 outcome (LANDED)
+
+Merge A is byte-identical, architecturally cleaner (1 fewer buffer,
+matches ADR-015 single-CB pattern at the head), but performance-
+neutral. Kept as a small clarity win.
+
+#### iter-156 walk-phase target
+
+Add finer-grained timing inside MtpWeights::forward_draft:
+- `project_embedding_and_hidden` (eh_proj)
+- `forward_full_attention` (pre-SDPA + SDPA + post-SDPA)
+- `forward_ffn_residual` (residual_norm + FFN)
+- `forward_shared_head` (now-merged)
+
+Identify the dominant sub-step within 6.4 ms. Then optimize that
+specific code path — CB-count optimization is exhausted.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)

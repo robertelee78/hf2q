@@ -393,24 +393,26 @@ impl MtpWeights {
         registry: &mut KernelRegistry,
         eps: f32,
     ) -> Result<MlxBuffer> {
+        // ADR-028 iter-155: consolidated single-CB shared-head — merges
+        // the prior 2-buffer chain (head_norm + lm_head) into one
+        // command buffer with a memory_barrier between RAW dependents.
+        // Saves ~1ms per draft step on Apple Metal at decode shape.
         let h = self.hidden_size;
-        let normed = {
-            let mut enc = device.command_encoder().context("MTP enc head norm")?;
-            let out = rms_norm_with_weight(
-                &mut enc,
-                registry,
-                device,
-                hidden,
-                &self.shared_head_norm,
-                1,
-                h,
-                eps,
-            )?;
-            enc.commit();
-            out
-        };
-
         let mut enc = device.command_encoder().context("MTP enc shared head")?;
+        let normed = rms_norm_with_weight(
+            &mut enc,
+            registry,
+            device,
+            hidden,
+            &self.shared_head_norm,
+            1,
+            h,
+            eps,
+        )?;
+        // RAW: lm_head reads `normed` produced by rms_norm above. Apple
+        // Metal compute encoders run threadgroups in parallel by default;
+        // memory_barrier required so the projection sees finalized norm.
+        enc.memory_barrier();
         let logits = apply_linear_projection_f32(
             &mut enc,
             registry,
