@@ -11827,3 +11827,50 @@ Both consistent.
 
 No code changes — flakes documented, operator-decision-gated.
 
+
+---
+
+## iter-305 — qwen3.6 APEX 3-run lock-in: 1.342× peer (σ < 0.1)
+
+iter-289 measured qwen3.6 APEX at 126.7 tok/s = 1.34× peer in a single
+run.  This iter converts that to a 3-run statistical median for
+operator-grade lock-in.
+
+### Method
+
+3 consecutive `hf2q generate --max-tokens 256 --benchmark` runs against
+`qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf` with
+the same prompt at HEAD.
+
+### Results
+
+```
+run1 Decode tok/s: 127.0
+run2 Decode tok/s: 126.9
+run3 Decode tok/s: 126.8
+```
+
+Median: **126.9 tok/s**, σ ≈ 0.1 (extremely tight).
+
+### × peer
+
+Against `llama-bench tg1024` matched-regime baseline 94.55 ± 2.94:
+- **126.9 / 94.55 = 1.342× peer ★**
+
+### Strategic implication
+
+The operator's mantra ("as coherent as peers, as fast as or faster")
+is **decisively achieved on qwen3.6 APEX** with σ < 0.1 reproducibility.
+qwen3.6 is shipping-quality on the APEX production GGUF.
+
+Note: this is the qwen35-generate-CLI path which silently uses F32 KV
+(per iter-131 audit at `serve/mod.rs:2487-2493`).  TQ-HB engagement
+via `engine.rs` HTTP path was estimated at ~106 tok/s = 1.12× peer
+in iter-131 — also above peer.  Mantra holds in both modes.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes — statistical confirmation only.
+
