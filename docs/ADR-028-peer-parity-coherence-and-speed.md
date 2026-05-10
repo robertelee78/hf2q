@@ -12947,3 +12947,76 @@ TQ-HB intact).  Closing it requires operator decision on one of:
   this section.
 
 No code changes.
+
+
+---
+
+## iter-318 — STACKED safe-flip: G+FUSED+V2+NR2 (+4.3% TQ-HB intact)
+
+**MISSED IN ITER-314: stacking the iter-309/310 v2 kernels with
+G+FUSED uncovers real production gain.**  In isolation against pure
+baseline, v2/nr2 looked noise-level (iter-309/310 marginal results).
+Today's iter-318 benched the FULL STACK and found measurable
+additivity — same orthogonality principle as iter-189 (E+G+F).
+
+### Production bench (gemma4 APEX-Q5_K_M, 3 runs each, 200 tok)
+
+```
+baseline:                  69.5, 69.5, 69.4  median 69.5 tok/s (0.682× peer)
+G+FUSED:                   71.3, 71.2, 71.3  median 71.3 tok/s (0.700× peer, +2.6%)
+G+FUSED+V2+NR2 (★ SAFE):   72.5, 72.4, 72.5  median 72.5 tok/s (0.711× peer, +4.3%)
+E+G+FUSED+V2+NR2 (Path E): 75.0, 74.8, 74.9  median 74.9 tok/s (0.735× peer, +7.8%, breaks TQ-HB)
+```
+
+### What changed since iter-314
+
+iter-309 + iter-310 already shipped the V2 + NR2 kernels env-gated
+default-OFF.  Both pass parity (4/4 + 6/6).  When benched alone vs
+pure baseline, the gain was noise-level (≤2%).
+
+iter-318 stacks them against ALL flags together for the first time.
+The +1.7% increment on top of G+FUSED (72.5 vs 71.3) is consistent
+across 3 runs with σ <0.1, well above noise.
+
+### Coherence + TQ-HB
+
+- "What is 2+2?" → "2 + 2 = 4<turn|>" byte-identical
+- TQ-HB scaffolding intact (Path G+FUSED+V2+NR2 doesn't touch FA path)
+- 3.94× memory savings preserved (no F16 KV in this stack)
+
+### Operator-decision-gated recommendation
+
+**G+FUSED+V2+NR2 (TQ-HB intact) is the new operator-actionable
+safe-flip candidate**, superseding iter-293's G+FUSED-only
+recommendation.  Same TQ-HB mantra preservation, +1.7% more.
+
+Flag combo:
+```
+HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_RMS_NORM_V2=1 HF2Q_Q6K_MV_NR2=1
+```
+
+**NOT silently flipped** — per "no deferrals without explicit operator
+approval" standing rule.  Stays env-gated until operator approves
+default flip.
+
+### Updated full-stack bench script
+
+`/opt/hf2q/scripts/adr028_full_stack_bench.sh` now includes the
+G+FUSED+V2+NR2 and E+G+FUSED+V2+NR2 stack rows for regression-pinning.
+
+### Lesson re-affirmed
+
+iter-189's "stack orthogonality" lesson — that small individually-
+marginal optimizations can compound when stacked against the full
+state — was overlooked across iter-309/iter-310/iter-314.  All future
+optimization claims should be benched in BOTH:
+1. Isolation vs pure baseline (proves correctness + identifies if
+   kernel is a no-op)
+2. **STACK with all other shippable safe-flip flags** (catches
+   compound additivity)
+
+### Files modified
+
+- `/opt/hf2q/scripts/adr028_full_stack_bench.sh`: added G+FUSED+V2+NR2
+  + E+G+FUSED+V2+NR2 rows
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section

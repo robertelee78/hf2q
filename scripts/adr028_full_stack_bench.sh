@@ -65,9 +65,16 @@ run_stack "Default (current)" ""
 # safe flip — both flags precision-exact (iter-188 + iter-219), TQ-HB memory
 # savings preserved (3.94x per-slot), measured +2.6% (3-run σ < 0.1).
 run_stack "G+FUSED (TQ-HB intact) ★ iter-293 safe flip" "HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1"
+# ADR-028 iter-318: STACKED G+FUSED+V2+NR2 — adds iter-310 rms_norm_v2
+# (float4+simd_sum) and iter-309 q6_K nr0=2 on top. TQ-HB intact, parity-
+# proven, +4.3% measured (3-run σ < 0.1).
+run_stack "G+FUSED+V2+NR2 (TQ-HB intact) ★ iter-318 stacked safe flip" "HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_RMS_NORM_V2=1 HF2Q_Q6K_MV_NR2=1"
 run_stack "Path E (USE_DENSE)" "HF2Q_USE_DENSE=1"
 run_stack "Path E+G (+LMHEAD_Q6K)" "HF2Q_USE_DENSE=1 HF2Q_LMHEAD_Q6K=1"
 run_stack "Path E+G + FUSED_END_OF_LAYER" "HF2Q_USE_DENSE=1 HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_UNSAFE_EXPERIMENTS=1"
+# ADR-028 iter-318: E+G+FUSED+V2+NR2 — breaks TQ-HB memory mantra (Path E)
+# but provides reference of full stack ceiling.
+run_stack "Path E+G+FUSED+V2+NR2 (breaks TQ-HB)" "HF2Q_USE_DENSE=1 HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_RMS_NORM_V2=1 HF2Q_Q6K_MV_NR2=1 HF2Q_UNSAFE_EXPERIMENTS=1"
 # iter-233: Path E+F+G (HF2Q_F16_KV=1) produces "<pad>" at 1000-tok output —
 # DO NOT recommend as default. Kept here for regression-tracking only.
 run_stack "Path E+F+G (F16 KV — DEGRADED >200 tok ✗)" "HF2Q_USE_DENSE=1 HF2Q_F16_KV=1 HF2Q_LMHEAD_Q6K=1 HF2Q_UNSAFE_EXPERIMENTS=1"
