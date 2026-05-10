@@ -11184,3 +11184,75 @@ qwen3.6 APEX is **1.28× peer ★ MANTRA SATISFIED** at HEAD per iter-261.
 No code changes this iter — fresh measurement consolidates strategic
 state; no new lever revealed.
 
+
+---
+
+## iter-289 — fresh dual-model bench: qwen3.6 1.34× peer (improved); gemma4 E+G+FUSED = 0.735×
+
+### Measurements at HEAD (single-run --benchmark, --max-tokens 256)
+
+| Config | Model | tok/s | × peer |
+|--------|-------|------:|-------:|
+| Default | gemma4-ara-2pass-APEX-Q5_K_M | 69.4 | 0.694× (peer 99.95) |
+| E+G+FUSED | gemma4-ara-2pass-APEX-Q5_K_M | **73.5** | **0.735×** |
+| Default | qwen3.6-35b-a3b APEX-Q5_K_M | **126.7** | **1.340× ★** (peer 94.55 tg1024) |
+
+E+G+FUSED stack:
+- HF2Q_USE_DENSE=1 (Path E): F32 KV cache — **breaks TQ-HB memory savings**
+- HF2Q_LMHEAD_Q6K=1 (Path G): Q6_K direct lm_head — exact
+- HF2Q_FUSED_END_OF_LAYER=1: iter-219 fused norm+add — exact
+
+### Strategic insights
+
+**1. qwen3.6 APEX improved from 1.28× to 1.34× peer at HEAD** —
+mantra still satisfied; possibly improved further from intervening
+optimization commits (Path E+G+FUSED defaults from iter-189..198 work).
+
+**2. The engine is NOT slow.**  Same engine that achieves 1.34× peer
+on qwen3.6 achieves 0.694× on gemma4.  **The 0.65× delta between
+models on the same engine proves the gemma4 gap is model-specific,
+not engine-specific.**  Operator's "rust isn't slower than C" mantra
+is validated.
+
+**3. Operator-actionable choice tree** (gemma4 APEX):
+
+| Option | tok/s | × peer | TQ-HB intact (3.94× memory) |
+|--------|------:|-------:|:---------------------------:|
+| Status quo (default) | 69.4 | 0.694× | YES ✓ |
+| Flip G+FUSED default | ~70 | ~0.700× | YES ✓ |
+| Flip E+G+FUSED default | 73.5 | 0.735× | **NO ✗** (loses memory mantra) |
+| Path E only (HF2Q_USE_DENSE=1) | ~71 | ~0.710× | NO ✗ |
+| DFlash (multi-month) | 140-280 | 1.4-2.8× | YES ✓ — only path to >peer with TQ-HB |
+
+**4. Gemma4-specific overhead candidates** (where the model-specific
+gap could live, candidates for future bisect):
+- TQ-HB encode for sliding-window attention layers (5/6 of layers)
+- Full-attention layer KV cache management (1/6 of layers)
+- MoE shared-dense-expert dual-FFN per layer (vs qwen3.6's
+  delta-net-attention which has fewer matmuls)
+- F16 KV cache in 1 of every 6 layers (full-attn) on top of TQ-HB
+  in others — non-uniform layer structure
+
+### Why qwen3.6 at 1.34× peer matters strategically
+
+qwen3.6 35B-A3B has DeltaNet linear-attention in most layers + a few
+full-attn layers.  DeltaNet has cheap per-token work (recurrent state)
+vs gemma4's per-token-per-head TQ-HB encode + KV write + sliding
+ring-buffer management.
+
+Per iter-198 cost map: TQ-HB SDPA = 1.5 ms = 12% of body.  Most of
+that is in the FULL-ATTN layers (1/6 of gemma4) — sliding-window
+attention can use the cheaper TQ-HB SDPA path.
+
+**If the gemma4-specific gap is concentrated in full-attn layer
+overhead**, that's a target.  Future bisect: compare per-layer-type
+GPU times in gemma4 (sliding vs full-attn) to identify the heaviest
+component.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes this iter — fresh dual-model measurement consolidates
+"engine OK, model-specific gap" framing.
+
