@@ -4595,6 +4595,54 @@ machinery is invoked. Likely cause: **mid-stream prefill** (kv_cache
 already populated up to N-1) differs from initial prefill (kv_cache
 empty) in some state-handling path.
 
+### iter-176: bug LOCALIZED — qL ∈ [2,15] gate at gpu_full_attn.rs:2435
+
+Read `apply_sdpa_with_kv_cache` (gpu_full_attn.rs ~2200-2615):
+
+```
+if seq == 1 && head_dim % 32 == 0 {           // single-token decode FAST
+    ...
+} else {                                       // prefill path
+    write_kv_with_optional_tq_encode(...);     // writes slot.k[cur_len..]
+    if new_path_eligible {                     // qL >= 16, cur_len == 0
+        flash_attn_prefill_seq_major(...)
+    } else if resume_path_eligible {           // cur_len > 0, kv_seq_len >= 16
+        flash_attn_prefill_seq_major_resume(...)
+    } else {
+        // FALLBACK: legacy SDPA. Comment explicitly says:
+        //   "qL ∈ [2, 15] remains broken — workaround is the user
+        //    padding their prompt up to qL >= 16."
+    }
+}
+```
+
+For K=1 verify (seq_len=2, cur_len=35+, kv_seq_len=37+):
+- new_path_eligible: cur_len≠0 ✗ FAIL
+- resume_path_eligible: cur_len>0 ✓, kv_seq_len>=16 ✓ → SHOULD PASS
+
+The kernel `flash_attn_prefill_bf16_d256_resume_small_ql_multi_kl_probe`
+documented at line 2491 confirms: "Kernel produces byte-correct output
+at small qL (∈{2,8,15}) when kL >= 16 (kL=130 tested)."
+
+So the resume kernel itself is CORRECT for K=1's geometry. Yet K=1
+output is broken. Two remaining hypotheses:
+
+1. The branch eligibility check is FALSE for some unexpected reason
+   (maybe slot.k.is_none() because TQ-only mode forces a different
+   path; or some other gate I haven't found)
+2. The K/V write or downstream op6-7 has a different qL=2 bug
+
+### iter-177 plan — instrument path engagement
+
+Add eprintln in apply_sdpa_with_kv_cache to print:
+- seq_len, cur_len, kv_seq_len, max_seq_len
+- new_path_eligible, resume_path_eligible booleans
+- which branch actually engages
+
+Run K=1 mode + observe traces. If resume path engages but output is
+broken, hypothesis 2 (downstream bug). If resume path does NOT engage,
+find the intercepting condition.
+
 ### iter-174 plan — focused 2-call bisect
 
 Add `HF2Q_SPEC_DECODE_K1_TWO_CALLS=1`: TWO consecutive 1-token forward
