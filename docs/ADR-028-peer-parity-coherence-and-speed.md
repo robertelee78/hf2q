@@ -13594,3 +13594,162 @@ candidacy) opens next.**
 
 Memory updates (cross-session continuity):
 - `/Users/robert/.claude/projects/-opt-hf2q/memory/project_adr028_iter325_deep_research_synthesis_2026_05_10.md` (NEW, iter-326)
+
+
+---
+
+## iter-328 — Phase 1b CLOSED with negative finding: EncoderSession is qwen35-only
+
+Phase 1b scope was "Bench `HF2Q_ENCODER_SESSION=1` default-flip
+candidacy" with deep-research-forecast +15-25% end-to-end on gemma4 if
+the flag works.  Result: **zero delta on gemma4 (+0.1%, within noise).**
+
+```
+A: HF2Q_ENCODER_SESSION unset (current default): 200 tok in 2.76s = 72.5 tok/s
+B: HF2Q_ENCODER_SESSION=1 (candidate default):    200 tok in 2.75s = 72.6 tok/s
+```
+
+Coherence intact in both (identical 200-token output text).
+
+### Root cause
+
+The HF2Q_ENCODER_SESSION wiring is **qwen35-specific**.  Every
+`EncoderSession::*` call site lives under
+`/opt/hf2q/src/inference/models/qwen35/` (encoder_stage.rs +
+forward_gpu.rs + dump_bisect.rs).  Zero call sites in `serve/forward_mlx.rs`
+(the gemma4 forward path) or `inference/models/gemma4/`.
+
+The deep-research synthesis (iter-326 §A) correctly identified the
+~100-CB/token vs peer ~2-3-CB/token asymmetry but conflated "flag
+exists in mlx-native" with "wired into all model paths".  The flag is
+a *capability* in the mlx-native crate; the *consumer wiring* into
+gemma4's forward loop is missing.
+
+For gemma4 to benefit from the CB-count reduction lever, `forward_mlx.rs`
+needs a structural refactor mirroring qwen35/encoder_stage.rs's
+session-borrowed pattern.  Multi-day scope, higher risk than a
+per-kernel port, and would touch the hot path that just got the iter-326
+default-flip — sequencing matters.
+
+### Repurposed as new Phase 1c (low priority)
+
+| Phase | Subject | Status | Notes |
+|---|---|---|---|
+| 1b | Bench `HF2Q_ENCODER_SESSION=1` default-flip | **CLOSED — negative** | Flag has no effect on gemma4 (qwen35-only wiring). |
+| 1c | Wire `EncoderSession` into gemma4 `forward_mlx` (NEW) | pending | Mirror qwen35/encoder_stage.rs pattern; multi-day; defer until Phases 2-6 complete to avoid hot-path collision with iter-326 default-flip. |
+
+### Lesson (for the standing record)
+
+When the deep-research agent says "flag X exists, expected impact Y",
+**verify the wiring at the consumer site** (the model-specific forward
+path) before forecasting impact.  iter-326's revised priority table
+listed Phase 1b as "0.5 day, no code, just bench" — that was correct
+*about the bench* but incorrect about the next step on a positive
+result.  On positive result, default-flip is appropriate; on
+negative result, the actionable work is wiring (multi-day).
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (negative bench → no edit; instead adds Phase 1c task to
+backlog).  Phase 2 (Q5_K mat-vec nr0=2 + yl/yh cache port) opens next
+as the highest-confidence remaining lever.
+
+
+---
+
+## iter-329 — Phases 2 + 3 CLOSED with falsified findings; gemma4 tensor-distribution ground truth
+
+### Phase 2 (Q5_K port) — FALSIFIED by peer source
+
+Read peer's `kernel_mul_mv_q5_K_f32_impl` at
+`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:7837-7952` and
+peer constants at `ggml-metal-impl.h:54-55`:
+
+- `N_R0_Q5_K = 1`  (NOT 2 as deep-research claimed)
+- `N_SG_Q5_K = 2`
+- = **2 rows/TG** (same as ours)
+- yl[16] + yh[16] cache present (same as ours)
+- float4 acc1+acc2 + simd_sum (same as ours)
+
+Our `kernel_mul_mv_q5_K_f32` (`/opt/mlx-native/src/shaders/quantized_matmul_ggml.metal:777-880`)
+is structurally equivalent to peer's at the row-geometry + Y-cache level.
+A nr0=2 port would diverge from peer's design and is unsupported by their
+source.  **Phase 2 N/A.**
+
+### Phase 3 (Q4_K port) — N/A for gemma4 by tensor inspection
+
+Peer's `kernel_mul_mv_q4_K_f32_impl` at `ggml-metal.metal:7716-7821` IS
+nr0=2 (`N_R0_Q4_K=2 × N_SG_Q4_K=2 = 4 rows/TG`) with yl/yh cache and
+`for (short row = 0; row < nr0; row++)` row-amortization.  Our equivalent
+at `quantized_matmul_ggml.metal:665-767` is nr0=1 (2 rows/TG) — real
+geometry gap.
+
+HOWEVER, GGUF metadata scan of
+`/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf`
+(via Python parsing of the n_kv + n_tensors block):
+
+| Type | Tensors | M elem | % weights |
+|---|---|---|---|
+| **Q6_K** | 206 | 17,430 | **69.08%** |
+| Q8_0 | 40 | 2,716 | 10.76% |
+| Q5_1 | 10 | 2,538 | 10.06% |
+| IQ4_NL | 10 | 2,538 | 10.06% |
+| F32 | 392 | 12 | 0.05% |
+| **Q4_K** | **0** | **0** | **0%** |
+| **Q5_K** | **0** | **0** | **0%** |
+
+The "_M" suffix in the filename does NOT mean Q5_K-mixed; gemma4 APEX
+uses Q6_K-dominant mix with Q8_0/Q5_1/IQ4_NL accent types.  **Phase 3
+N/A on gemma4.**  (Phase 3 work would still benefit any future
+Q4_K-mixed model port; deferred indefinitely until such a model
+arrives.)
+
+### Deep-research scorecard (lessons learned)
+
+The iter-326 deep-research spawn produced 3 top-impact lever claims for
+gemma4.  Empirical scoring after Phase 1b/2/3 closure:
+
+| Claim | Outcome |
+|---|---|
+| Lever A.1 — Q5_K port +8-12% | FALSIFIED (peer N_R0_Q5_K=1, ours matches) |
+| Lever A.2 — Q4_K port +3-5% | N/A on gemma4 (zero Q4_K weights in APEX file) |
+| Lever B   — `HF2Q_ENCODER_SESSION` default-flip +15-25% | FALSIFIED (qwen35-only wiring) |
+| Lever C   — F16 KV + clip_residual +12% | UNVERIFIED (Phase 6 — opens next) |
+| Lever D   — fused_norm_add float4 +1-2% | UNVERIFIED (Phase 4 — peer source confirms pattern) |
+
+**3/5 claims wrong before code touched.**  Lessons:
+1. Verify peer N_R0/N_SG defines (not just kernel filenames) before
+   forecasting.
+2. Verify the model's actual tensor type distribution (not assume from
+   filename suffix) before forecasting hot-path impact.
+3. Verify env-flag wiring at the consumer site (model-specific forward
+   path) before forecasting.
+
+These three checks now form the **iter-329 lever-validation gate**:
+no future port is approved without (a) peer N_R0/N_SG read, (b) gemma4
+tensor distribution check, (c) consumer-wiring grep.
+
+### Revised lever priority (post-iter-329 ground truth)
+
+| Order | Lever | Hot-path | Verified | Estimated | RAM impact |
+|---|---|---|---|---|---|
+| 1 | Phase 6: F16 KV + clip_residual (gemma4) | yes | peer source ✓ | +12% | **HALVES K/V bytes** ✓ mantra |
+| 2 | Phase 4: fused_norm_add_f32 → float4 | yes | peer source ✓ | +1-3% | none |
+| 3 | Phase 5: fused_head_norm_rope_f32 → float4 | yes | peer source ✓ | +1-2% | none |
+| 4 | Phase 2': Verify Q8_0 (10.76%) | medium | unverified | TBD | none |
+| 5 | Phase 3': Verify Q5_1 (10.06%) | medium | unverified | TBD | none |
+| 6 | Phase 4': Verify IQ4_NL (10.06%) | medium | unverified | TBD | none |
+| 7 | Phase 1c: Wire EncoderSession into gemma4 | unknown | structural | +15-25% if CB theory holds | likely lower |
+| 8 | Phase 7: TQ-HB kernel-fusion redesign | yes | structural | unknown, multi-week | KEEPS TQ-HB savings |
+
+Phase 6 promoted to top of queue: it directly addresses operator's
+RAM-minimization directive AND has the highest single-lever speed
+estimate that survived iter-329's lever-validation gate.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (read-only verification + plan correction).
