@@ -5233,6 +5233,58 @@ Paths E and E+F.
 iter-189+ plan: validate the E+G stack measurement (orthogonality
 hypothesis).  If confirmed, default-OFF flag set is operator-ready.
 
+### iter-189 — stack orthogonality confirmed; long-form steady-state corrections
+
+3-run statistical median, 200-tok long-form (matches operator's 853-tok
+regime; iter-184's 8-tok numbers had decode-floor inflation):
+
+| Path | Median tok/s | Δ default | vs peer 97 |
+|------|------:|---------:|----------:|
+| Default | 62.7 | — | 0.65× |
+| Path E (USE_DENSE) | 70.7 | +12.8% | 0.73× |
+| Path G (LMHEAD_Q6K) | 63.6 | +1.76% | 0.66× |
+| **Path E+G** | **72.2** | **+15.2%** | **0.74×** |
+| **Path E+F+G** | **73.2** | **+16.7%** | **0.75×** |
+
+**Orthogonality CONFIRMED**: E (+12.8%) ⊕ G (+1.76%) predicts +14.8%
+multiplicative; observed +15.2% — within 0.4 pp noise.  Levers don't
+interfere.  F adds +1.4% on top of E+G (small but real).
+
+**Corrected long-form lever inventory** (replacing iter-184's 8-tok
+short-fixture numbers):
+
+| Lever stack | Long-form tok/s | vs peer | precision | operator-gate |
+|-------------|----------------:|--------:|-----------|---------------|
+| Default | 62.7 | 0.65× | exact (TQ-HB) | — |
+| Path G alone (default-OFF flag) | 63.6 | 0.66× | exact | available NOW |
+| Path E (default-OFF flag) | 70.7 | 0.73× | exact F32 | available NOW |
+| Path E+G | 72.2 | 0.74× | exact | available NOW |
+| Path E+F | ~71 (estimate) | 0.73× | F16 ~25 ppm | available NOW |
+| **Path E+F+G** | **73.2** | **0.75×** | **F16 ~25 ppm** | **available NOW** |
+| llama.cpp peer | 97 | 1.00× | F16 KV | — |
+
+**Operator can opt into the best stack today** without any
+default-flip:
+
+```
+# Best precision-exact (no drift):
+HF2Q_USE_DENSE=1 HF2Q_LMHEAD_Q6K=1 hf2q ...
+# → 72.2 tok/s = 0.74× peer (+15.2% vs default)
+
+# Best raw throughput (F16 KV ~25 ppm drift):
+HF2Q_USE_DENSE=1 HF2Q_F16_KV=1 HF2Q_LMHEAD_Q6K=1 \
+  HF2Q_UNSAFE_EXPERIMENTS=1 hf2q ...
+# → 73.2 tok/s = 0.75× peer (+16.7% vs default)
+```
+
+Remaining 25pp gap to peer (97 tok/s) lives in:
+- The 6 ms small-ops bucket (norms/RoPE/KV-copy/etc.) — multi-week
+- SDPA TQ-HB residual cost (only TQ-HB encode skipped by Path E;
+  the SDPA path itself still runs the dequant; could be additional
+  lever)
+- Concrete next walks: bench V/K projection (66% peak in iter-180),
+  optimize threadgroup tiling
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
