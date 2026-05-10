@@ -10775,3 +10775,103 @@ robust at both ends.
 llama.cpp instrumentation stays uncommitted in /opt/llama.cpp working
 tree (peer repo, instrumentation only — ADR documents the diff exactly).
 
+
+---
+
+## iter-285 — rms_norm fusion REJECTED (Chesterton's fence); MoE infrastructure is real lever
+
+**Hypothesis from iter-284**: "rms_norm fusion is the dominant addressable
+lever — wire dispatch_rms_norm_mul to cut 15.68% of dispatches".
+
+**REJECTED via Chesterton's fence** — read the call sites + prior iters
+before changing code.
+
+### What the call sites actually do
+
+`/opt/hf2q/src/serve/forward_mlx.rs:3900-3933` (gemma4 MoE forward,
+B8 group) — the 3 rms_norm calls there are explicitly labeled:
+
+```rust
+// -- B8: pre-FF norm1 + pre-FF norm2 + router norm [3 CONCURRENT] --
+s.barrier_between(...)  // ONE barrier
+s.rms_norm(reg, dev, residual, pre_ff_norm,    norm_out,        ...)?;  // dispatch 1
+s.rms_norm(reg, dev, residual, pre_ff_norm_2,  moe_norm_out,    ...)?;  // dispatch 2
+s.rms_norm(reg, dev, residual, router_norm,    router_norm_out, ...)?;  // dispatch 3
+```
+
+These 3 dispatches read the SAME residual buffer and write DISJOINT
+outputs — they run CONCURRENTLY on the GPU.  hf2q's design pays
+launch overhead in PARALLEL for these 3, not sequential.
+
+### Why fusion FAILS here (iter-186 measurement, not speculation)
+
+iter-186 wired `dispatch_fused_post_attn_triple_norm_f32` in this exact
+pattern.  Result: **REGRESSED -1.0% on decode**.  Reason: GPU was
+already overlapping the 3 concurrent dispatches; fusion serialized the
+work into one kernel and LOST parallelism.
+
+### Why iter-284's "265.5 extra dispatches × 15.14 µs = 4.02 ms" math is wrong
+
+The 15.14 µs/dispatch average **assumes serial cost**.  In hf2q's
+design, concurrent dispatches in groups B8/B9/B10/B11 don't add
+15.14 µs each — they cost ~max(cluster_compute, launch_overhead).
+Eliminating one of N concurrent dispatches saves ~5 µs (incremental,
+not 15 µs).
+
+iter-186 + iter-208 + iter-219 lessons confirmed:
+- iter-186: triple norm fusion (concurrent) → -1.0% (REGRESSED)
+- iter-208: end-of-layer fusion (sequential) → +2.7% expected
+- iter-219: actual end-of-layer fusion → **+0.3% measured**
+
+ROI of fusion across all sites is bounded: ~+3% if all sequential
+fusions stack additively (rare), realistically ~+1-2%.  Not the path
+to 0.69× → 1.0× peer.
+
+### Where the gap ACTUALLY lives — MoE infrastructure
+
+Per iter-284 buckets (gemma4 APEX, hf2q normalized to per-tok):
+
+| Component | hf2q/tok | llama.cpp/tok | hf2q multiplier |
+|-----------|---------:|--------------:|----------------:|
+| MoE matmuls (q6_K, q5_1, iq4_nl, q8_0 _id) | ~66 | ~30 | 2.20× |
+| MoE activations (swiglu_batch / geglu) | 33 | 30 | 1.10× |
+| moe_weighted_sum | 33 | 0 | hf2q-only |
+| fused_moe_routing | 33 | 0 | hf2q-only |
+| **Total MoE-related** | **~165** | **~60** | **2.75×** |
+
+**hf2q does 2.75× more MoE-related dispatches per token than llama.cpp
+on the SAME gemma4 APEX file.**  llama.cpp consolidates the routing +
+weighted-sum + activation work into the main matmul or a single
+`geglu` step.  hf2q has separate dispatches for each.
+
+iter-201 measured MoE experts = 2.60 ms = 20.7% of body GPU.  This is
+the BIGGEST single component and the most likely place where the
+"same math, slower implementation" gap lives.
+
+### Levers not yet bisected (iter-286 candidates)
+
+| Lever | Method |
+|-------|--------|
+| `moe_weighted_sum` cost | HF2Q_SKIP_MOE_WEIGHTED_SUM env flag |
+| `fused_moe_routing` cost | HF2Q_SKIP_MOE_ROUTING env flag |
+| Per-expert vs batched-experts dispatch | Read llama.cpp's MoE forward for batching pattern |
+| MoE matmul count (66 vs 30) | Why does hf2q dispatch per Q-type? |
+
+### Methodology lock-in
+
+When my framing says "X is the lever", PRIOR ITERATIONS that already
+measured X are the truth.  Re-measure if conditions changed; otherwise
+the prior measurement governs.  iter-186 + iter-219 already measured
+fusion ROI on similar sites — those results bound the upper limit.
+
+The 38% dispatch count gap from iter-284 is REAL but its time-impact
+must be measured PER OPERATION TYPE, not multiplied by an average
+per-dispatch cost.  Concurrent dispatches are nearly free; sequential
+ones aren't.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes this iter — Chesterton's fence prevented a wrong fix.
+
