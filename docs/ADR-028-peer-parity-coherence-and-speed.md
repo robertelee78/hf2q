@@ -11874,3 +11874,49 @@ in iter-131 — also above peer.  Mantra holds in both modes.
 
 No code changes — statistical confirmation only.
 
+
+---
+
+## iter-306 — gemma4 default 3-run lock-in: 0.694× peer (σ < 0.1)
+
+iter-289 measured gemma4 APEX default at 69.4 tok/s = 0.694× peer in
+single run.  Now converted to 3-run statistical median.
+
+### Method
+
+3 consecutive `hf2q generate --max-tokens 256 --benchmark` against
+`gemma4-ara-2pass-APEX-Q5_K_M.gguf` at HEAD.
+
+### Results
+
+```
+run1 Decode tok/s: 69.4
+run2 Decode tok/s: 69.3
+run3 Decode tok/s: 69.4
+```
+
+Median: **69.4 tok/s**, σ ≈ 0.05.
+
+### × peer
+
+vs `llama-bench tg1024` 99.95: **0.694× peer** (σ < 0.1).
+
+### Consolidated 3-run stats matrix (operator decision-grade)
+
+| Stack | tok/s | σ | × peer | Source |
+|-------|------:|---:|-------:|--------|
+| qwen3.6 APEX default (F32 KV) | 126.9 | 0.1 | **1.342×** ★ | iter-305 |
+| gemma4 APEX default | **69.4** | **0.05** | **0.694×** | iter-306 |
+| gemma4 APEX G+FUSED (TQ-HB intact) | 71.2 | 0.1 | **0.712×** ★ flip | iter-293 |
+| gemma4 APEX E+G+FUSED (no TQ-HB) | 73.5 | tbd | 0.735× | iter-289 (1-run) |
+
+All 3-run measurements have σ < 0.1 — operator can rely on these
+decision-grade numbers.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes — statistical confirmation completing the iter-289
+single-run measurements.
+
