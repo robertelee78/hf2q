@@ -155,6 +155,13 @@ pub struct InvestigationEnv {
     /// to isolate the final residual update cost vs the post-FF norm 2.
     pub skip_end_of_layer_final: bool,
 
+    /// `HF2Q_SKIP_ATTN_QKV=1` — skip the 3 attention QKV qmatmul
+    /// dispatches per layer (Q proj + K proj + V proj, all concurrent).
+    /// ADR-028 iter-210 — measure production cost of attention QKV
+    /// (vs iter-180 batched-bench estimate).  Produces garbage
+    /// downstream attention.
+    pub skip_attn_qkv: bool,
+
     // ========================================================================
     // Category 4 — warn-only (ineffective but safe). No gate; raw intent.
     // ========================================================================
@@ -606,6 +613,7 @@ struct RawAckIntent {
     skip_weighted_sum: bool,
     skip_end_of_layer: bool,
     skip_end_of_layer_final: bool,
+    skip_attn_qkv: bool,
     lmhead_rerank_disabled: bool,
     chunk_scan_prefill: bool,
 }
@@ -628,6 +636,7 @@ impl InvestigationEnv {
             skip_weighted_sum: env_eq_one("HF2Q_SKIP_WEIGHTED_SUM"),
             skip_end_of_layer: env_eq_one("HF2Q_SKIP_END_OF_LAYER"),
             skip_end_of_layer_final: env_eq_one("HF2Q_SKIP_END_OF_LAYER_FINAL"),
+            skip_attn_qkv: env_eq_one("HF2Q_SKIP_ATTN_QKV"),
             lmhead_rerank_disabled: matches!(
                 env::var("HF2Q_LMHEAD_RERANK").as_deref(),
                 Ok("0")
@@ -650,6 +659,7 @@ impl InvestigationEnv {
             skip_weighted_sum: raw.skip_weighted_sum && ack,
             skip_end_of_layer: raw.skip_end_of_layer && ack,
             skip_end_of_layer_final: raw.skip_end_of_layer_final && ack,
+            skip_attn_qkv: raw.skip_attn_qkv && ack,
             lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
             chunk_scan_prefill: raw.chunk_scan_prefill && ack,
 
