@@ -7013,6 +7013,95 @@ iter-227+ plan: write architectural skeleton document combining ds4's
 runtime patterns + DFlash's draft model design.  Ship as
 `docs/ADR-029-spec-decode-architecture.md` for future-session pickup.
 
+### iter-227 — architectural skeleton for hf2q gemma4 spec-decode
+
+(Per CLAUDE.md "NEVER proactively create documentation files unless
+explicitly requested" — appending here instead of new ADR-029 file.)
+
+**Skeleton: hf2q gemma4 speculative decode (DFlash external draft +
+ds4-style runtime infrastructure)**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ hf2q::serve::generate_speculative()                         │
+│   ├── target = MlxModelWeights (gemma4, current)            │
+│   ├── draft  = DFlashDraftModel (Rust reimpl from MLX py)   │
+│   └── sd_state = SpeculativeDecodeState {                   │
+│         block_size: usize, // from draft config             │
+│         mtp_n_raw_counter: u32, // ds4 pattern              │
+│         draft_state_hc, draft_next_hc, // ping-pong         │
+│         accepted: Vec<u32>, // ds4 pattern                  │
+│         hidden_capture: Vec<MlxBuffer>, // target_layer_ids │
+│       }                                                     │
+└─────────────────────────────────────────────────────────────┘
+
+Per-step loop:
+1. target.forward(prompt) → emit logits + capture hidden_states
+   from target_layer_ids (NEW: requires hooks in forward_decode)
+2. accepted[0] = argmax(logits[-1])  // ds4 first-token-free
+3. while n < max_tokens:
+     a. block = [accepted[-1], MASK, MASK, ..., MASK]  // bs entries
+     b. draft.forward(block, hidden, draft_cache) → draft_logits
+     c. candidates = argmax(draft_logits) for each masked pos
+     d. target.verify(candidates) → re-forward target on candidates
+     e. accept first contiguous match prefix
+     f. rollback non-accepted via counter (ds4 pattern)
+     g. n += accepted_count
+```
+
+**hf2q-specific work items**:
+
+A. **Target hidden state capture** (forward_decode.rs):
+   - Add `Vec<MlxBuffer>` for hidden states at `target_layer_ids`
+   - HF2Q_SPEC_DECODE=1 flag gates capture path
+   - Estimated: 1 week
+
+B. **DFlash draft model port** (mlx-native + hf2q):
+   - 32-layer transformer in MLX-native Rust (similar to current
+     gemma4 layer impl but smaller, no MoE, tied embeds with target)
+   - Estimated: 4-8 weeks
+
+C. **Speculative decode state machine** (hf2q):
+   - SpeculativeDecodeState struct + ping-pong buffers
+   - Counter-based rollback (no cache copy)
+   - Block draft + verify orchestration
+   - Estimated: 2-3 weeks (after A+B complete)
+
+D. **KV cache rollback support** (hf2q):
+   - `MlxKvCache::trim(n_back)` method
+   - `MlxKvCache::counter_visible_len` for ds4-style counter
+   - Estimated: 1 week
+
+E. **Coherence + correctness gates**:
+   - 5-fixture parity test (greedy decode produces SAME tokens
+     as non-spec greedy)
+   - Acceptance rate measurement at varied temps
+   - Estimated: 1 week
+
+F. **Bench infrastructure**:
+   - Tok/s bench at varied block_size (1, 2, 4, 8)
+   - Per-token-type acceptance histogram
+   - Estimated: 1 week
+
+**Total**: 11-15 weeks (~3-4 months) for properly-engineered hf2q
+DFlash spec-decode integration on gemma4.
+
+**Order of operations**:
+1. iter-228+: WAIT for operator priority on this multi-month effort
+2. If approved → start with item D (KV cache rollback infrastructure
+   — smallest, least risky, useful even outside SD)
+3. Then items A, B in parallel (different agents via /cfa swarm)
+4. Items C, E, F sequentially after A+B land
+
+**Risk register**:
+- DFlash draft model size: 1-2B params? Need to verify HF model card
+- Acceptance rate at draft<target temp: typically 40-70% per literature
+- Effective speedup: 1.5-3× depending on acceptance rate × block_size
+- Memory overhead: draft model adds ~2-4 GB on M5 Max (acceptable)
+
+**Decision blocker**: this is an architectural commitment.  Operator
+approval needed before iter-228+ begins multi-month chain.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
