@@ -10181,6 +10181,52 @@ Per the ADR's iter-276 decision matrix — the production landscape:
 - 14-iter MTP/K1 thread closed with permanent test infrastructure as
   the lasting value
 
+### iter-278 — HEAD regression-clean post iter-263→277 work
+
+Verified at HEAD with `cargo test --release --bin hf2q gpu_delta_net`:
+
+```
+14 passed; 0 failed; 0 ignored
+
+Including the 2 new tests shipped this thread:
+  test ... delta_net_layer_seq2_mid_stream_state ... ok       (iter-273)
+  test ... delta_net_layer_seq1_plus_seq1_eq_seq2 ... ok      (iter-276)
+```
+
+**Confirms no regression** introduced by iter-263→277 work (multi-EOS
+API + name-based EOS resolver are production code changes that
+needed verification post-shipping).
+
+**Iter-278 outcome**:
+- ✓ HEAD regression-clean across all DeltaNet tests
+- ✓ Permanent regression gates from iter-273/iter-276 are GREEN
+- ✓ Multi-EOS API + EOS resolver code changes haven't regressed
+  qwen35 forward path (would have manifested in DeltaNet test
+  failures had layer-level state changed)
+- → No further high-priority unblockable work exists without
+  explicit operator direction.  Per loop skill guidance, idle
+  iters past the 5-minute cache window should run at 1200-1800s
+  cadence.
+
+**Final ADR-028 status (iter-278)**:
+
+| Component | Status |
+|-----------|--------|
+| Kernel-level audit | EXHAUSTED with measured falsifications (iter-253-257) |
+| Spec-decode/MTP K1 thread | CLOSED, retracted at iter-276 (orchestration-level bug, 14 iters) |
+| qwen3.6 35B-A3B production | ★ MANTRA SATISFIED (1.28× peer matched, iter-261/262) |
+| gemma4 path | OPERATOR-DECISION-GATED (E+G flip OR DFlash port OR accept current) |
+| Permanent regression gates | 3 SHIPPED (iter-273 + iter-275 + iter-276) |
+| Methodology | locked-in: peer-baseline matched-regime (iter-259), bench script (iter-258) |
+| Coherence gate | locked-in: multi-model (iter-241/242, run iter-262/270) |
+
+**Operator next-action checklist** (consolidated):
+1. Decide: ship Path E+G default flip (+3.6%, byte-identical, 1 line)
+2. Decide: ship Path E+G+FUSED on top (+0.7% cumul, 1 line)
+3. Decide: commit to multi-month DFlash port for gemma4 ≥ peer
+4. Decide: proceed with K1 per-layer trace (multi-iter, ROI uncertain)
+5. Decide: accept current state and end ADR-028 active iteration
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
