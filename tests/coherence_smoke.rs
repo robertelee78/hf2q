@@ -115,6 +115,48 @@ const CELLS: &[Cell] = &[
         prompt_slug: "what-is-22",
         model_path: "/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf",
     },
+    // ADR-028 iter-296: APEX-Q5_K_M production fixtures.  Goldens
+    // captured 2026-05-10 against the actual on-disk APEX files
+    // (operator-focus per APEX-focus memory) using llama-completion at
+    // -n 16 --temp 0.0 -no-cnv (qwen35 with --override-kv add_bos_token
+    // =false; gemma4 default).  Activates the coherence gate for the
+    // models actually shipped in production.
+    Cell {
+        fixture: "apex-q5km",
+        prompt: "Hello, my name is",
+        prompt_slug: "hello-my-name-is",
+        model_path: "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf",
+    },
+    Cell {
+        fixture: "apex-q5km",
+        prompt: "The quick brown fox",
+        prompt_slug: "the-quick-brown-fox",
+        model_path: "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf",
+    },
+    Cell {
+        fixture: "apex-q5km",
+        prompt: "What is 2+2?",
+        prompt_slug: "what-is-22",
+        model_path: "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf",
+    },
+    Cell {
+        fixture: "gemma4-apex-q5km",
+        prompt: "Hello, my name is",
+        prompt_slug: "hello-my-name-is",
+        model_path: "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf",
+    },
+    Cell {
+        fixture: "gemma4-apex-q5km",
+        prompt: "The quick brown fox",
+        prompt_slug: "the-quick-brown-fox",
+        model_path: "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf",
+    },
+    Cell {
+        fixture: "gemma4-apex-q5km",
+        prompt: "What is 2+2?",
+        prompt_slug: "what-is-22",
+        model_path: "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf",
+    },
 ];
 
 /// (fixture, prompt-slug) pairs whose llama-completion peer reference is
@@ -124,6 +166,15 @@ const CELLS: &[Cell] = &[
 const KNOWN_DEGENERATE_PEER: &[(&str, &str)] = &[
     ("gemma", "the-quick-brown-fox"),
     ("gemma", "what-is-22"),
+    // ADR-028 iter-296: gemma4 APEX-Q5_K_M peer goldens are also
+    // degenerate at temp 0 with bare prompts — same class as the
+    // original gemma fixture (model needs chat template wrapping
+    // for non-degenerate output, see iter-40 chat-template-and-EOS
+    // memory).  hf2q's coherence parity contract is "match peer
+    // even when peer is degenerate".
+    ("gemma4-apex-q5km", "the-quick-brown-fox"),
+    ("gemma4-apex-q5km", "what-is-22"),
+    ("gemma4-apex-q5km", "hello-my-name-is"),
 ];
 
 /// Markers from iter40 bisect: literal substrings that, when present in
