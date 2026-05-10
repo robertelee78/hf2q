@@ -118,6 +118,47 @@ const CELLS: &[Cell] = &[
         prompt_slug: "what-is-22",
         model_path: "/opt/hf2q/models/gemma-4-26B-A4B-it-ara-abliterated-dwq/gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf",
     },
+    // ADR-028 iter-298: APEX-Q5_K_M production fixtures (mirrors
+    // coherence_smoke.rs iter-296 addition).  Goldens captured 2026-05-10
+    // against actual on-disk files.  This is the heavyweight matrix
+    // variant — `#[ignore]`-gated; runs only via
+    //   cargo test --release --test coherence_matrix -- --ignored
+    Cell {
+        fixture: "apex-q5km",
+        prompt: "Hello, my name is",
+        prompt_slug: "hello-my-name-is",
+        model_path: "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf",
+    },
+    Cell {
+        fixture: "apex-q5km",
+        prompt: "The quick brown fox",
+        prompt_slug: "the-quick-brown-fox",
+        model_path: "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf",
+    },
+    Cell {
+        fixture: "apex-q5km",
+        prompt: "What is 2+2?",
+        prompt_slug: "what-is-22",
+        model_path: "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf",
+    },
+    Cell {
+        fixture: "gemma4-apex-q5km",
+        prompt: "Hello, my name is",
+        prompt_slug: "hello-my-name-is",
+        model_path: "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf",
+    },
+    Cell {
+        fixture: "gemma4-apex-q5km",
+        prompt: "The quick brown fox",
+        prompt_slug: "the-quick-brown-fox",
+        model_path: "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf",
+    },
+    Cell {
+        fixture: "gemma4-apex-q5km",
+        prompt: "What is 2+2?",
+        prompt_slug: "what-is-22",
+        model_path: "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf",
+    },
 ];
 
 const GIBBERISH_MARKERS: &[&str] = &[
@@ -146,9 +187,17 @@ enum Verdict {
 /// Mirrors `KNOWN_DEGENERATE_PEER` in `tests/coherence_smoke.rs`. ADR-015
 /// iter42: gemma's TQB pang and 2+2 degenerate at temp 0 are the peer's
 /// behavior, not a hf2q regression.
+// ADR-028 iter-298: gemma4-apex-q5km goldens are degenerate at temp 0
+// with bare prompts (same class as original gemma fixture per iter-40
+// chat-template-EOS memory).  Mirrors the iter-296 addition to
+// coherence_smoke.rs.
 const KNOWN_DEGENERATE_PEER: &[(&str, &str)] = &[
     ("gemma", "the-quick-brown-fox"),
     ("gemma", "what-is-22"),
+    // iter-298 additions — gemma4-apex-q5km mirrors gemma fixture
+    ("gemma4-apex-q5km", "the-quick-brown-fox"),
+    ("gemma4-apex-q5km", "what-is-22"),
+    ("gemma4-apex-q5km", "hello-my-name-is"),
 ];
 
 fn classify(actual: &str, golden: &str) -> Verdict {
@@ -386,6 +435,20 @@ fn coherence_matrix_all_cells() {
     let mut skipped: Vec<String> = Vec::new();
 
     for cell in CELLS {
+        // ADR-028 iter-298: mirror coherence_smoke iter-295 fix —
+        // check model existence BEFORE attempting golden read.  Missing
+        // model + missing golden together = dormant cell (e.g. the
+        // dynamic-quant-46 fixture renamed at iter-12a never regenerated
+        // its goldens and the model is also off-disk).
+        if !std::path::Path::new(cell.model_path).exists() {
+            eprintln!(
+                "SKIP {}/{}: MODEL_MISSING: {}",
+                cell.fixture, cell.prompt_slug, cell.model_path
+            );
+            skipped.push(format!("{}/{}", cell.fixture, cell.prompt_slug));
+            continue;
+        }
+
         let golden = match read_golden(cell) {
             Ok(g) => g,
             Err(e) => {
