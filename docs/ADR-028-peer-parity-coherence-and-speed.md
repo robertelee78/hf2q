@@ -7561,6 +7561,100 @@ gap likely structural (TQ-HB SDPA codebook + iter-215's irreducible
    leg only, with clip_residual guard from mlx-lm peer; iter-233's
    prefill-path issue avoided by separate prefill code path.
 
+### iter-239 — H2 falsifier (peer-grounded rule-out)
+
+Counted hf2q per-layer dispatches at decode by source-walk
+(`forward_mlx.rs:3807-4222` default path, no opt-in flags).
+
+**Fused RMS+MUL+ADD chains** (peer pattern):
+
+| hf2q dispatch | Lines | Type | Matches peer? |
+|---------------|-------|------|---------------|
+| post-attn fused_norm_add | 3869-3876 | RMS+MUL+ADD | ✓ matches peer's `kernel_rms_norm_mul_add_f32` |
+| end-of-layer fused_norm_add | 4193-4200 | RMS+MUL+ADD | ✓ matches peer |
+| end-of-layer-final fused_norm_add_scalar | 4211-4220 | RMS+MUL+SCALAR_MUL+ADD | ✓ extends peer (extra scalar mul) |
+
+= **3 fused norm+add dispatches per layer** — exactly matches peer's
+"3 fused chains" claim from iter-237 dossier.
+
+**Other per-layer norms**:
+- B8 (lines 3906-3934): 3 plain `rms_norm` dispatches CONCURRENT —
+  NOT fused with ADD because outputs feed 3 disjoint downstream ops
+  (gate, up, router_logits).  Peer would have similar topology.
+- post-FF norm1 (line 4110-4118): 1 plain rms_norm CONCURRENT with
+  down_id at B13.
+
+**iter-217's fused_post_ff_norm2_endlayer_f32** (shipped, opt-in via
+`HF2Q_FUSED_END_OF_LAYER=1`) collapses the 2 fused_norm_add
+end-of-layer dispatches into 1 — **beyond** peer pattern.  iter-219
+proved this only delivers +0.3% (compute survives fusion).
+
+**H2 falsifier verdict**: **hf2q is already on or beyond peer's
+norm-fusion pattern**.  Dossier's ~5.5% ROI estimate was based on
+counting unfused norm-mul-add chains; hf2q already fuses them.
+**H2 ROI ≈ 0%**.
+
+**Final peer-grounded audit summary** (after iter-238 + iter-239):
+
+| Lever | Dossier ROI | Audit verdict |
+|-------|------------:|---------------|
+| H1 free-win shared-KV | (n/a) | ✗ ruled out — gemma4 GGUF has `shared_kv_layers=0` |
+| H1 F16 KV decode-only | ~12% | ★ **REMAINING LEVER** — needs clip_residual + careful gating |
+| H2 norm-mul-add fusion | ~5.5% | ✗ ruled out — hf2q already fuses 3× chains; iter-217 goes beyond |
+| H3 routed-experts merge | ~5-6% | ✓ already shipped via `stacked_gate_up` |
+| H3 shared-MLP merge | (residual) | ✗ <2% per iter-219 + already-concurrent |
+
+**Net updated peer-grounded ceiling**: only **H1 F16 KV decode-only
+~12%** remains as a peer-grounded structural lever.
+
+The remaining 16.7% of the 28.7% gap is **structural to TQ-HB
+quantization** (per dossier H1 source: peer's `dot(float4, float4)`
+direct from F16 cache vs hf2q's codebook-gather + per-pos norm
+scaling + FWHT-undo).  This is the precision-vs-perf cost of TQ-HB,
+which exists for memory savings (5/6/8-bit packed K/V vs F16).
+Operator's standing instruction: "TQ for all models we support,
+as well or better than peers" — accepts TQ-HB cost as the value-add.
+
+### iter-240 — strategic conclusion (post-audit-trio)
+
+After iter-237/238/239 peer-grounded audits, the gemma4 decode gap
+breaks down as:
+
+| Component | % of gap | Status |
+|-----------|---------:|--------|
+| H1 F16 KV decode-only | ~12% (theoretical) | engineering work, needs clip_residual |
+| TQ-HB structural (codebook+norm+FWHT) | ~12% | accepted cost of TQ memory savings |
+| Iter-215 irreducible floor (4.85 ms) | ~5% | hardware/launch-overhead floor |
+| Total | ~28.7% | matches measured gap |
+
+**Three strategic options for operator decision**:
+
+**Option A — Ship Path E+G default flip (1-line, +3.7% safe)**:
+- Already validated coherent at 1000-tok (iter-233)
+- Closes ~3.7% of the 28.7% gap
+- Net 65% peer (vs current 67% peer)
+- **Effort: minutes**
+
+**Option B — Implement clip_residual + F16 KV decode-only (~12%)**:
+- New `clip_residual_f16` Metal kernel (mirror mlx-lm pattern from
+  `gemma3_text.py:125-132`)
+- New decode-only F16 KV path (avoid iter-233 prefill regression)
+- Long-context coherence test gate
+- Net ~76% peer if delivered fully
+- **Effort: 1-2 weeks engineering + validation**
+
+**Option C — Multi-month DFlash speculative decode (~70-100% perf)**:
+- Iter-223/224/227 scoped at 4-8 weeks DFlash port + 2-3 weeks
+  state-machine + 1 week coherence gates
+- Net ~1.5-2.0× current decode if delivered fully
+- **Effort: 11-15 weeks**
+
+Option A is the immediate ship.  Options B and C are operator-gated
+multi-week projects.  Per the no-fallback / no-stub mantra, NEITHER
+is started without explicit operator green-light.
+
+This concludes the post-iter-216 peer-source phase of ADR-028.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
