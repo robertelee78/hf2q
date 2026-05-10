@@ -40,6 +40,42 @@ fn last_hidden_row(hidden: &MlxBuffer, hidden_size: u32) -> Result<MlxBuffer> {
     Ok(hidden.slice_view(byte_offset, h))
 }
 
+/// ADR-028 iter-171: slice the Nth row out of a `[seq_len, hidden_size]`
+/// residual buffer. `row=0` → first token's hidden state, `row=seq_len-1`
+/// → last (== `last_hidden_row`). Used by K=1 batched-verify to extract
+/// the token-position-specific hidden state for next iter's MTP draft.
+fn nth_hidden_row(hidden: &MlxBuffer, hidden_size: u32, row: u64) -> Result<MlxBuffer> {
+    let h = hidden_size as usize;
+    let total = hidden.element_count();
+    ensure!(
+        total % h == 0 && total >= h,
+        "nth_hidden_row: hidden buffer element_count {} not a positive multiple of hidden_size {}",
+        total, h
+    );
+    let seq_len = (total / h) as u64;
+    ensure!(
+        row < seq_len,
+        "nth_hidden_row: row {} out of range (seq_len {})",
+        row, seq_len
+    );
+    let byte_offset = row * (h as u64) * 4; // F32 = 4 bytes
+    Ok(hidden.slice_view(byte_offset, h))
+}
+
+/// Argmax over a vocab-length logits slice. Used by K=1 batched-verify
+/// to extract per-position predicted tokens from a multi-row logits
+/// buffer (caller slices `logits[row*vocab..(row+1)*vocab]`).
+fn greedy_argmax_slice(logits_row: &[f32]) -> u32 {
+    debug_assert!(!logits_row.is_empty());
+    logits_row
+        .iter()
+        .enumerate()
+        .fold((0u32, f32::NEG_INFINITY), |(best_i, best_v), (i, &v)| {
+            if v > best_v { (i as u32, v) } else { (best_i, best_v) }
+        })
+        .0
+}
+
 use super::gpu_full_attn::upload_f32;
 use super::io_heads::greedy_argmax_last_token;
 use super::kv_cache::HybridKvCache;
@@ -203,54 +239,161 @@ impl<'a> SpecDecode<'a> {
             let mtp_ms = mtp_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
             self.stats.proposed += 1;
 
-            let verify_positions = vec![next_pos; 4];
+            // ADR-028 iter-171: K=1 batched verify path.
+            //
+            // HF2Q_SPEC_DECODE_K1=1 enables Leviathan-style batched verify:
+            // 2-token forward [token_next, proposed] at positions
+            // [next_pos, next_pos+1]. Per iter-170 bench: T_v(2)=40ms vs
+            // T_v(1)=34ms = +18% verifier cost for +78% accepted token
+            // throughput → 1.37× greedy speedup at 78% accept.
+            //
+            // Reject path: position next_pos+1's KV is stale (computed
+            // with the wrong draft_1 token). The next iter's verifier
+            // call writes pos next_pos+1 with the corrected token,
+            // OVERWRITING the stale K/V. No explicit GPU rollback —
+            // hidden_pos = next_pos (not next_pos+1) ensures only
+            // [0..=next_pos] is read in the meantime.
+            let k1_batched =
+                std::env::var("HF2Q_SPEC_DECODE_K1").as_deref() == Ok("1");
+
             let verify_t0 = if mtp_profile { Some(Instant::now()) } else { None };
-            let (verify_logits, verify_hidden) = self
-                .verifier
-                .forward_gpu_with_hidden(&[token_next], &verify_positions, &mut self.kv_cache)
-                .with_context(|| format!("SpecDecode verifier step pos {next_pos}"))?;
-            let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+            let hidden_size_u32 = self.verifier.cfg.hidden_size;
+            let vsz = vocab as usize;
 
-            // ADR-028 iter-159: granular post-verify timing.
-            let post_t0 = if mtp_profile { Some(Instant::now()) } else { None };
-            let verified = greedy_argmax_last_token(&verify_logits, vocab);
-            let argmax_ms = post_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+            if k1_batched {
+                let verify_positions_2 = positions_for_range(next_pos, 2);
+                let (verify_logits, verify_hidden) = self
+                    .verifier
+                    .forward_gpu_with_hidden(
+                        &[token_next, proposed],
+                        &verify_positions_2,
+                        &mut self.kv_cache,
+                    )
+                    .with_context(|| {
+                        format!("SpecDecode K1 verifier step pos {next_pos}")
+                    })?;
+                let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
-            let slice_t0 = if mtp_profile { Some(Instant::now()) } else { None };
-            // Verifier step is a single-token decode (seq_len=1); slice is
-            // an identity-shaped view but makes the [1, H] contract explicit.
-            hidden_t = last_hidden_row(&verify_hidden, self.verifier.cfg.hidden_size)
-                .with_context(|| format!("SpecDecode verify last_hidden_row slice pos {next_pos}"))?;
-            let slice_ms = slice_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
-
-            let copy_t0 = if mtp_profile { Some(Instant::now()) } else { None };
-            logits_t = last_logits(&verify_logits, vocab)?.to_vec();
-            let copy_ms = copy_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
-            hidden_pos = next_pos;
-
-            if mtp_profile {
-                let iter_ms = iter_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
-                let summed = mtp_ms.unwrap_or(0.0) + v_ms.unwrap_or(0.0)
-                    + argmax_ms.unwrap_or(0.0) + slice_ms.unwrap_or(0.0)
-                    + copy_ms.unwrap_or(0.0);
-                eprintln!(
-                    "[MTP_PROFILE] iter {}: mtp={:.2} ver={:.2} arg={:.2} sl={:.2} cp={:.2} summed={:.2} ITER={:.2} delta={:.2}",
-                    self.stats.proposed,
-                    mtp_ms.unwrap_or(0.0), v_ms.unwrap_or(0.0),
-                    argmax_ms.unwrap_or(0.0), slice_ms.unwrap_or(0.0), copy_ms.unwrap_or(0.0),
-                    summed, iter_ms, iter_ms - summed,
+                ensure!(
+                    verify_logits.len() == 2 * vsz,
+                    "SpecDecode K1: expected 2*vocab={} logits, got {}",
+                    2 * vsz, verify_logits.len()
                 );
-            }
+                let logits_row0 = &verify_logits[0..vsz];
+                let logits_row1 = &verify_logits[vsz..2 * vsz];
+                let verified_at_n1 = greedy_argmax_slice(logits_row0);
 
-            if proposed == verified && generated.len() < max_new {
-                generated.push(verified);
-                preemitted_argmax = true;
-                self.stats.accepted += 1;
-                if self.is_eos(verified) {
-                    break;
+                if verified_at_n1 == proposed {
+                    // ACCEPT: draft_1 was correct.
+                    // Emit BOTH proposed (=token at N+1, draft confirmed)
+                    // AND argmax(logits_row1) (=token at N+2, "free" since
+                    // verifier processed pos N+1 with the correct token).
+                    // This is the Leviathan amortization: per-iter output =
+                    // 1 (verifier's own next prediction) + 1 (draft accepted).
+                    let next_iter_token_next = greedy_argmax_slice(logits_row1);
+                    generated.push(proposed);
+                    if generated.len() < max_new && !self.is_eos(proposed) {
+                        generated.push(next_iter_token_next);
+                    }
+                    preemitted_argmax = true;
+                    self.stats.accepted += 1;
+                    if self.is_eos(proposed) || self.is_eos(next_iter_token_next) {
+                        break;
+                    }
+                    if generated.len() >= max_new {
+                        break;
+                    }
+                    hidden_pos = next_pos + 1;
+                    hidden_t = nth_hidden_row(
+                        &verify_hidden, hidden_size_u32, 1,
+                    )
+                    .with_context(|| format!("K1 ACCEPT row=1 pos {next_pos}"))?;
+                    logits_t = logits_row1.to_vec();
+                } else {
+                    // REJECT: emit the corrected token at N+1. KV at pos
+                    // N+1 is stale (draft_1's contribution); next iter
+                    // overwrites it via verifier.forward at pos N+1 with
+                    // verified_at_n1. hidden_pos = next_pos (not +1)
+                    // ensures attention-read range covers only [0..=N].
+                    generated.push(verified_at_n1);
+                    preemitted_argmax = true;
+                    self.stats.rejected += 1;
+                    if self.is_eos(verified_at_n1) {
+                        break;
+                    }
+                    hidden_pos = next_pos;
+                    hidden_t = nth_hidden_row(
+                        &verify_hidden, hidden_size_u32, 0,
+                    )
+                    .with_context(|| format!("K1 REJECT row=0 pos {next_pos}"))?;
+                    logits_t = logits_row0.to_vec();
+                }
+
+                if mtp_profile {
+                    let iter_ms = iter_t0
+                        .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                    eprintln!(
+                        "[MTP_PROFILE_K1] iter {}: mtp={:.2} ver={:.2} ITER={:.2}",
+                        self.stats.proposed,
+                        mtp_ms.unwrap_or(0.0),
+                        v_ms.unwrap_or(0.0),
+                        iter_ms,
+                    );
                 }
             } else {
-                self.stats.rejected += 1;
+                // Legacy K=0 path: 1-token verify at next_pos.
+                let verify_positions = vec![next_pos; 4];
+                let (verify_logits, verify_hidden) = self
+                    .verifier
+                    .forward_gpu_with_hidden(
+                        &[token_next], &verify_positions, &mut self.kv_cache,
+                    )
+                    .with_context(|| format!("SpecDecode verifier step pos {next_pos}"))?;
+                let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+
+                let post_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+                let verified = greedy_argmax_last_token(&verify_logits, vocab);
+                let argmax_ms = post_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+
+                let slice_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+                hidden_t = last_hidden_row(&verify_hidden, hidden_size_u32)
+                    .with_context(|| {
+                        format!("SpecDecode verify last_hidden_row slice pos {next_pos}")
+                    })?;
+                let slice_ms = slice_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+
+                let copy_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+                logits_t = last_logits(&verify_logits, vocab)?.to_vec();
+                let copy_ms = copy_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+                hidden_pos = next_pos;
+
+                if mtp_profile {
+                    let iter_ms = iter_t0
+                        .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                    let summed = mtp_ms.unwrap_or(0.0) + v_ms.unwrap_or(0.0)
+                        + argmax_ms.unwrap_or(0.0) + slice_ms.unwrap_or(0.0)
+                        + copy_ms.unwrap_or(0.0);
+                    eprintln!(
+                        "[MTP_PROFILE] iter {}: mtp={:.2} ver={:.2} arg={:.2} sl={:.2} cp={:.2} summed={:.2} ITER={:.2} delta={:.2}",
+                        self.stats.proposed,
+                        mtp_ms.unwrap_or(0.0), v_ms.unwrap_or(0.0),
+                        argmax_ms.unwrap_or(0.0), slice_ms.unwrap_or(0.0), copy_ms.unwrap_or(0.0),
+                        summed, iter_ms, iter_ms - summed,
+                    );
+                }
+
+                if proposed == verified && generated.len() < max_new {
+                    generated.push(verified);
+                    preemitted_argmax = true;
+                    self.stats.accepted += 1;
+                    if self.is_eos(verified) {
+                        break;
+                    }
+                } else {
+                    self.stats.rejected += 1;
+                }
             }
         }
         self.stats.decode_elapsed = decode_start.elapsed();
