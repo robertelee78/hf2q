@@ -4945,6 +4945,53 @@ dual MLP+MoE per layer (vs qwen3.6's MoE-only).  No single-kernel walk
 closes this — only Path E+F (precision tradeoff, +14%) or fundamental
 architecture-spec optimization closes meaningful percentage points.
 
+### iter-183 — peer-class baseline at SAME model file
+
+Operator course-correction: compare hf2q to actual peer engines on the
+same model files, not internal hf2q-vs-hf2q.  Ran `llama-bench` on
+M5 Max with both target models:
+
+**Decode (tg128)** at the same `.gguf` file:
+
+| Model | hf2q | llama.cpp | hf2q/peer |
+|-------|-----:|----------:|----------:|
+| gemma4 26B-A4B APEX-Q5_K_M | 62 | **97.16 ± 8.77** | **0.64×** (35% slower) |
+| qwen3.6 35B-A3B APEX-Q5_K_M | 132 | 97.41 ± 2.71 | **1.36×** (36% faster) |
+
+**Prefill (pp128)** llama.cpp gemma4 = **3253.40 ± 10.51 tok/s**.
+hf2q gemma4 prefill ~46 tok/s at 20 tokens (likely includes JIT compile
+in 1st measurement; long-prompt prefill needs separate bench).
+
+**Reframed verdict** (correcting iter-180b's "architectural" framing):
+
+The gemma4 gap is **NOT purely architectural**.  llama.cpp runs the
+same Apple Metal GPU, same `.gguf` file, same Q5_K/Q6_K/Q8_0 quants —
+yet gets 1.57× more decode throughput than hf2q.  hf2q's gemma4 path
+has engineering inefficiency that doesn't exist for qwen35moe.
+
+Path E+F (+14%) closes ~14 of the 35 pp gap → 0.74× ratio.
+Remaining 21 pp gap: gemma4-specific code path inefficiencies in
+hf2q's `MlxModelWeights::forward_decode`.  Candidates:
+1. **TQ-HB SDPA dequant cost** (8-bit Lloyd-Max codebook + Hadamard
+   transform per K element) — llama.cpp uses F16 KV directly.
+2. **Per-layer dispatch density** (956 in gemma4 vs whatever
+   llama.cpp's gemma4 path encodes — need to count).
+3. **lm_head GEMM** for vocab=262144 (massive output matrix) —
+   hf2q goes through a generic dense_matmul; peer may have a
+   specialized large-vocab kernel.
+4. **KV cache copy + layout** — hf2q has F32→F16/TQ-HB conversion;
+   peer reads/writes F16 directly.
+
+The **qwen3.6 1.36× hf2q-vs-peer beat** validates that hf2q's core
+backend (Q5_K mat-vec at 71% peak, MoE _id saturated, DeltaNet
+recurrent state) is genuinely peer-class.  The gemma4-specific
+underperformance is engineering, not fundamental.
+
+iter-184+ plan: bisect the gemma4 forward path by selectively
+disabling/swapping each candidate component and measuring tok/s
+delta.  Likely big winner: TQ-HB→F16 KV switch (already validated
+as Path E+F).
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
