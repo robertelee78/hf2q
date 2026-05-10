@@ -11542,3 +11542,62 @@ decision on:
 4. Accept current state (gemma4 APEX at 0.694× peer with full memory
    savings; qwen3.6 APEX at 1.34× peer ★ MANTRA SATISFIED)
 
+
+---
+
+## iter-293 — clean G+FUSED measurement (TQ-HB-intact +2.6% default-flip candidate)
+
+### Method
+
+3-run statistical median, gemma4-ara-2pass-APEX-Q5_K_M.gguf at HEAD,
+--max-tokens 256, --benchmark.
+
+### Results
+
+```
+HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 hf2q generate ...
+  run1 Decode tok/s: 71.2
+  run2 Decode tok/s: 71.1
+  run3 Decode tok/s: 71.2
+```
+
+3-run median: **71.2 tok/s** (σ < 0.1)
+
+### Comparison table
+
+| Stack | tok/s | × peer (99.95) | TQ-HB? | Precision |
+|-------|------:|---------------:|:------:|-----------|
+| Default | 69.4 | 0.694× | ✓ | exact |
+| **G+FUSED** | **71.2** | **0.712×** | ✓ | **exact** |
+| E+G+FUSED (iter-289) | 73.5 | 0.735× | ✗ | F32 KV |
+
+### Strategic implication
+
+**G+FUSED is the operator-actionable safe default flip:**
+- +2.6% improvement vs default
+- Precision-exact (both flags byte-identical at the math level per
+  iter-188 LMHEAD_Q6K + iter-219 FUSED_END_OF_LAYER)
+- TQ-HB intact → 3.94× per-slot KV memory savings retained
+- No downsides — already wired, already tested, just env-flag-gated
+
+Path E (HF2Q_USE_DENSE=1) gives an additional +3.3% but **breaks
+TQ-HB** (switches to F32 KV cache → 3.94× more memory per slot).
+That's a memory-mantra trade-off, NOT a precision trade-off, so it's
+operator-decision-gated separately.
+
+### Recommendation for operator
+
+Default-flip `HF2Q_LMHEAD_Q6K=1` + `HF2Q_FUSED_END_OF_LAYER=1`
+permanently in default config (or default-on env reading).  +2.6% to
+gemma4 APEX with zero precision/memory cost.
+
+This is consistent with iter-198's prior measurement that "Default
+users get nearly all the benefit automatically (within 5% of best
+precision-exact stack)" — taking that benefit by flipping the flags.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes — operator-decision-gated default-flip recommendation.
+
