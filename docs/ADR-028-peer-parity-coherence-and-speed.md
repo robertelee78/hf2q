@@ -8530,6 +8530,93 @@ separate categories.  Also: directly compare hf2q's Rust-Metal
 binding overhead vs llama.cpp's C-Metal binding for the SAME kernel
 dispatch (per H2).
 
+### iter-254 — H2 FALSIFIED: CPU encode = 0.36 µs/dispatch (negligible); gap is GPU-side
+
+Built `mlx-native/benches/bench_dispatch_overhead.rs` to directly
+measure per-dispatch CPU encoding overhead, isolated from GPU work.
+Method: time a 200-dispatch encode loop into a single command buffer
+WITHOUT committing (CPU-only), then `commit_and_wait` (total).  Per-
+dispatch CPU cost = encode_time / 200; per-dispatch GPU+sync amortized
+= (total - encode) / 200.
+
+**Three shapes contrasting same binding count (8 slots) but vastly
+different GPU work** (M=1 decode, gemma4 production shapes):
+
+| Shape | CPU/disp p50 | CPU [p10..p90] | total/disp | GPU+sync amort | CPU% |
+|-------|-------------:|----------------|-----------:|---------------:|-----:|
+| Router (128×2816 Q5_K)    | **0.36 µs** | [0.24, 0.41] |   3.84 µs |    3.48 µs |  9.4% |
+| Q_sliding (4096×2816 Q5_K)| **0.36 µs** | [0.23, 0.47] |  13.07 µs |   12.70 µs |  2.8% |
+| lmhead_Q6_K (262144×2816) | **0.36 µs** | [0.25, 0.42] | 1039.91 µs| 1039.55 µs |  0.0% |
+
+**H2 verdict: FALSIFIED.**
+
+The Rust→Metal binding cost is **constant at 0.36 µs/dispatch** across
+all three shapes — the binding count is the same (8 slots) so the
+FFI cost is the same.  Narrow p10-p90 band (0.23-0.47 µs) confirms
+the measurement is robust.
+
+**At 850 dispatches/token × 0.36 µs = 0.30 ms/token total CPU encode
+cost** = ~2% of decode time (14.5 ms).  Even reducing this to ZERO
+saves 1.5 tok/s.  Not the bottleneck.
+
+**The Router shape unmasks a more important number**: total
+3.48 µs/dispatch when GPU work is tiny.  Subtracting CPU 0.36 µs
+leaves **3.1 µs/dispatch as the GPU launch + barrier + scheduler
+floor on M5 Max**.  This is the same hardware floor llama.cpp peer
+sees (Apple Silicon GPU dispatch cost is identical across drivers).
+
+**Reframed gap math**:
+
+| Component | hf2q | peer | Δ |
+|-----------|-----:|-----:|--:|
+| Dispatches/token | 850 | 850 (iter-252) | 0 |
+| CPU encode/disp | 0.36 µs | similar (C-Metal FFI) | ~0 |
+| GPU launch+barrier floor/disp | ~3.1 µs | ~3.1 µs (same HW) | 0 |
+| GPU compute/disp average | ~11.2 µs | ~7.9 µs | **3.3 µs** |
+| Total/disp | 14.7 µs | 11.4 µs | 3.3 µs |
+| Total/token | 12.5 ms | 9.7 ms | **2.8 ms** |
+
+**Conclusion**: the 2.8 ms gap (32 tok/s) is **per-kernel GPU compute
+speed** — the actual bandwidth + arithmetic-throughput delta within
+each kernel.  iter-253 already mapped where the work goes:
+- mat-vec is 91-106% peak on most shapes (saturated; no lever)
+- Q_sliding is 47.8% peak (~2% lever — iter-255)
+- TQ-HB SDPA at 1.5 ms/token (peer uses contiguous F16 — structural
+  cost of byte-packed quant + per-pos norms)
+- MoE experts at 2.6 ms/token (iter-201; bandwidth-saturated)
+- 4.85 ms iter-215 floor = ~451 dispatches × 10.7 µs/disp average
+  (small concurrent norms, RoPE, KV-copy, routing scaffold)
+
+**iter-250 retroactive interpretation**: the "3 µs per saved
+dispatch" measured via FUSED end-of-layer was **GPU launch+barrier
+floor savings, not CPU encoding savings**.  Fusing 2 sequential
+dispatches into 1 saves the 3.1 µs GPU scheduler gap between them
+on the GPU itself, not the 0.36 µs CPU overhead.  iter-250's number
+is correct; the *attribution* in iter-250's analysis to "launch +
+barrier + scheduler-gap overhead" was right; my recent re-reading
+that called it "Rust binding overhead" was wrong.  Correction landed.
+
+**Updated ROI for sequential fusion** (iter-250's math, now verified
+mechanism):
+- Each fused pair saves 3.1 µs GPU floor (NOT CPU)
+- 510 excess dispatches × 3.1 µs = 1.58 ms saved
+- New per-token: 12.5 - 1.58 = 10.92 ms = 91.6 tok/s = **0.89× peer**
+- Still < peer's 102.7, since 1.7 ms remains in per-kernel compute
+
+**Iter-255+ plan** revised:
+1. **Top sequential-fusion candidates**: walk forward_mlx.rs decode
+   and rank pairs by `is_sequential && shared_op_kind`.  Each fused
+   pair = 3.1 µs × 30 layers = 93 µs/token.  Top 5 = ~0.5 ms = ~3.5%.
+2. **Q_sliding mat-vec optimization**: 47.8% → 80% target = 2-3%.
+3. **TQ-HB SDPA microbench at decode shape** (head_dim=256, kv_seq=
+   1024, n_heads=16, n_kv_heads=8) vs hypothetical contiguous-F16 to
+   size the structural floor of TQ-HB vs peer.
+4. **MoE expert sub-bisect**: 2.6 ms is biggest single kernel; needs
+   stride/threadgroup-size sweep at production shape.
+
+**Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
+(falsifier for any future "binding overhead" claim).
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
