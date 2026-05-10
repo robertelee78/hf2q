@@ -6187,6 +6187,52 @@ iter-211+ candidate levers ranked:
 3. Bisect "Other" 5.05 ms bucket via more SKIP_* flags
 4. Pivot to qwen3.6 cross-pollination (its kernel patterns)
 
+### iter-211 — BISECT O-proj = 0.70 ms (sequential)
+
+Shipped HF2Q_SKIP_O_PROJ.  Skips the sequential single qmatmul after
+SDPA (sdpa_out → attn_out).
+
+| Config | BODY GPU | dispatches |
+|--------|---------:|-----------:|
+| Default | 12.55 ms | 956 |
+| SKIP_O_PROJ | 11.85 ms | 926 (-30) |
+| **Δ** | **0.70 ms = 5.6% body** | -30 |
+
+Per-dispatch: **23 µs**, 2× QKV's per-qmatmul cost (12 µs effective
+when concurrent) because O-proj is sequential and pays full launch
+overhead.
+
+**Combined attention matmul total**: 1.12 ms (QKV concurrent) +
+0.70 ms (O sequential) = **1.82 ms** — matches iter-180 batched-bench
+estimate of 1.85 ms ✓
+
+**Updated cost map** (12.5 ms body):
+
+| Component | ms | % body |
+|-----------|---:|-------:|
+| MoE experts | 2.60 | 21% |
+| TQ-HB SDPA | 1.50 | 12% |
+| Dense MLP | 1.14 | 9% |
+| Attn QKV (3 conc) | 1.12 | 9% |
+| fused_norm_add chain (3) | 1.09 | 9% |
+| **O-proj (sequential)** | **0.70** | **5.6%** |
+| Other | ~4.35 | 35% |
+
+Bisect coverage now ~65% of body GPU.
+
+**Fusion lever for O-proj**: combine with downstream post-attn-norm-add
+into a Q5_K mat-vec-with-residual-and-norm kernel.  Eliminates the
+0.55 ms post-attn-norm-add launch.  Combined ROI: O-proj would still
+run (does the matmul) but absorbs the norm+add work.  Effective save
+≈ 0.55 ms = +4.4% throughput.
+
+This is the **highest-ROI tractable fusion lever** found across all
+bisects.  Multi-day kernel work but the bandwidth math says it should
+work: same input read, output is the residual write.
+
+iter-212+ plan: design fused_q5_k_matvec_with_residual_norm kernel.
+Or pivot to qwen3.6 cross-pollination.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
