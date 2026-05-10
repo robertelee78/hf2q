@@ -54,8 +54,36 @@ pub struct InvestigationEnv {
     // set an ack-required toggle without the ack, the field is `false`
     // and `activate()` prints a REFUSED line.
     // ========================================================================
-    /// `HF2Q_F16_KV=1` — allocate dense KV cache as F16. Known-worse
-    /// output vs the F32 default; documented in ADR-009.
+    /// `HF2Q_F16_KV=1` — allocate dense KV cache as F16. Halves KV
+    /// read bandwidth at attention.
+    ///
+    /// Historical: ADR-009 (2026-04-16) classified this as "known-
+    /// worse output" based on a measured 19× cache_k drift + 45×
+    /// sdpa_out drift vs llama.cpp. **REFUTED at HEAD** by ADR-028
+    /// iter-168 byte-identity test (`mlx-native` commit `a325827`,
+    /// `tests/test_flash_attn_vec_f16_byte_identity.rs`):
+    ///
+    ///   F32 baseline ↔ F32-with-F16-rounded-inputs:  rel_rms 2.57e-5
+    ///   F32 baseline ↔ F16-kernel:                   rel_rms 2.57e-5
+    ///   F32-with-F16-inputs ↔ F16-kernel:            rel_rms 0.0
+    ///   amplification:                                1.00×
+    ///
+    /// The F16 kernel is byte-identical to the F32 kernel fed
+    /// F16-rounded inputs — **F16 storage precision is the only
+    /// source of difference**. ADR-009's reported amplification
+    /// has been fixed somewhere in the iter-101..149 FA-vec work
+    /// (NSG axis + FWHT-pre fusion, ADR-028).
+    ///
+    /// Production effect at gemma4 26B-A4B (sliding=1024):
+    ///   - +15.7% wall-clock when combined with `HF2Q_USE_DENSE=1`
+    ///     (62.5 → 72.3 tok/s = 0.701× llama.cpp peer)
+    ///   - 251 MiB/slot KV memory (vs 502 F32-dense, 191 TQ-HB)
+    ///   - 25 ppm rel_rms output drift (F16 precision tradeoff only)
+    ///
+    /// Stays ack-required pending operator decision on default-flip;
+    /// the precision tradeoff is real but no longer a correctness
+    /// regression.
+    ///
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub f16_kv: bool,
 
