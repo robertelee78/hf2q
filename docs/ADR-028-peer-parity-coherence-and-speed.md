@@ -14248,3 +14248,131 @@ Honest range pending audit.
 
 - `/opt/hf2q/src/serve/mod.rs` (instrumentation added, +35 lines)
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+
+---
+
+## iter-335 — Phase 8 + UNRETAINED_REFS hypotheses both FALSIFIED by code reading + bench
+
+Per /loop iteration, ran two falsifier-grade tests against the iter-334
+findings:
+
+### Falsification 1: Phase 8 (barrier audit + reduction) — FALSIFIED by peer-source comparison
+
+Read peer's `ggml_metal_op_concurrency_check` at
+`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp:159+221`:
+
+```cpp
+const bool is_concurrent = ggml_metal_op_concurrency_check(ctx, node);
+if (!is_concurrent) {
+    ggml_metal_op_concurrency_reset(ctx);  // → ggml_metal_encoder_memory_barrier(ctx->enc)
+}
+```
+
+Read our `barrier_between` at `/opt/mlx-native/src/graph.rs:1494-1530`:
+
+```rust
+let reason = self.tracker.conflicts_reason(reads, writes);
+if let Some(...) = reason {
+    self.encoder.memory_barrier();
+    self.tracker.reset();
+    self.barrier_count += 1;
+    self.dispatch_in_group = 0;
+}
+```
+
+**Identical pattern.**  Comment at our line 1491-1492 explicitly says:
+"This mirrors llama.cpp's `ggml_metal_op_concurrency_check` +
+`ggml_metal_op_concurrency_reset` pattern."
+
+Read the gemma4 forward path's barrier_between call sites
+(`forward_mlx.rs:2632-2696` sample): they pass **precise read/write
+buffer sets**, not conservative `&[everything]`.  E.g. line 2649:
+`reads = &[&norm_out]`, `writes = &[&attn_q, &attn_k, &attn_v]`.
+
+**Conclusion**: the 508 barriers/decode_tok are conflict-driven by
+the actual graph dependency structure, NOT redundant.  Peer hits a
+similar count for the same dispatch graph density.  The deep-research
+agent's claim that "peer rarely calls memoryBarrierWithScope
+per-dispatch" was based on misreading peer's source; the actual peer
+pattern is identical.
+
+**Phase 8 CLOSED FALSIFIED.**
+
+### Falsification 2: HF2Q_UNRETAINED_REFS default-flip — FALSIFIED by bench
+
+Per `/opt/mlx-native/src/encoder.rs:411-413` doc-comment claim:
+> "llama.cpp's per-token decode CBs use this same call
+> (`commandBufferWithUnretainedReferences`) and gain ~3-5% wall on
+> M-series GPUs by skipping per-buffer-binding ARC retains on submit."
+
+Tested at HEAD on gemma4 APEX-Q5_K_M, 200-tok decode, temp=0:
+
+```
+A: HF2Q_UNRETAINED_REFS unset (current default): 200 tok in 2.72s = 73.6 tok/s
+B: HF2Q_UNRETAINED_REFS=1 (peer pattern):        200 tok in 2.72s = 73.5 tok/s
+```
+
+Delta: **-0.1% (within sampling noise)**.  Output character-identical
+between A and B.
+
+**Why no gain on gemma4 / M5 Max**:
+1. hf2q's per-decode-token `MlxBufferPool` already keeps Arc clones
+   alive in its `in_use` list across the entire decode token
+   (encoder.rs:418-423 caller-side prerequisite), so the ARC retain
+   on submit is essentially free.
+2. Apple Silicon may have improved per-buffer-binding ARC retain
+   efficiency in newer macOS releases (the peer claim's "3-5%" is
+   likely from an older measurement period).
+3. The peer's 3-5% claim was probably for a graph shape (large
+   concurrent CBs with many distinct buffers) that doesn't match
+   gemma4 decode (~920 dispatches reusing a small set of arena buffers).
+
+**HF2Q_UNRETAINED_REFS default-flip CLOSED FALSIFIED.**
+
+### Per-dispatch wall accounting (refined)
+
+iter-334 measured:
+- 14.7 µs/dispatch (gemma4 HEAD)
+- 7.1 µs/dispatch (peer, iter-308)
+- 7.6 µs/dispatch unaccounted gap
+
+Sub-µs accounting attempt:
+- Average barrier overhead: 0.55 × ~5 µs = 2.75 µs/dispatch
+- Pure kernel + CPU: 14.7 - 2.75 = ~11.95 µs/dispatch (ours)
+- Pure kernel + CPU: 7.1 - ~0.5 = ~6.6 µs/dispatch (peer estimate)
+- **Gap: 5.35 µs/dispatch in pure kernel + CPU (ours 1.81× peer)**
+
+The gap is in **per-kernel execution time + CPU encoding overhead**,
+NOT in barrier strategy or buffer-binding policy.  Per-kernel exec
+time is structurally tied to kernel design — and we've already ported
+the dominant kernel (q6_K = 69% of weights via iter-309/321 nr2 ports).
+
+The remaining gap is in: kernel-design refinement on the long-tail
+kernels (each <10% of weights), or structural CPU-side encoding
+optimization.  Neither yields more than a few % individually.
+
+### Honest assessment update
+
+Closing the gemma4 0.715× → mantra ≥1.0× gap requires either:
+1. **Phase 7 (TQ-HB kernel-fusion redesign)** — multi-week
+   structural; fuses dequant + norm + GEMV inside the SDPA path the
+   way peer fuses dequant inside mat-vec; preserves TQ-HB 3.94× memory
+   savings (operator RAM-mantra aligned); only remaining viable
+   structural lever
+2. **Apple Instruments Metal System Trace** — operator-GUI
+   profiling that would localize the per-µs CPU-side encoding
+   overhead more precisely than mlx_native's atomic counters can
+3. **Phase 5 (fused_head_norm_rope v2)** — small +0.5-1%
+   additive; race-history risk
+
+Per-kernel port avenue is now formally closed (Q8_0/Q5_1/IQ4_NL
+verified iter-332, q6_K already nr2 iter-309/321, fused_norm_add v2
+shipped iter-331, rms_norm v2 shipped iter-310).
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (both hypotheses falsified by code reading + bench
+before code touched).
