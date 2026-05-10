@@ -12764,3 +12764,81 @@ savings intact (no kernel removal).
 
 No code changes.  iter-314 closes the iter-308 thread pending operator
 decision on the three escalated paths above.
+
+
+---
+
+## iter-315 — H4: HF2Q_TQ_FUSE_FWHT_PRE — historical "+9%" claim FALSIFIED at HEAD
+
+iter-314 escalated, then the /loop fired again.  Per mantra "DO NOT BE
+LAZY," challenged my own "exhausted" claim and audited the
+`HF2Q_TQ_FUSE_FWHT_PRE` env flag (existing infrastructure from
+iter-106-108, default OFF).
+
+### What it does
+
+When set, the `flash_attn_vec_tq_hb` kernel applies the Q-side FWHT
+sign-premult + normalization INTERNALLY (using simdgroup shuffles)
+before the K-loop, eliminating the standalone
+`fwht_sign_premult_f32` dispatch and its forced barrier per layer.
+
+`/opt/mlx-native/src/shaders/flash_attn_vec_tq_hb.metal:386` — the
+`params.fuse_fwht_pre != 0u` branch.
+
+Iter-107 confirmed byte-parity (max_abs_diff=0).  The comment at
+`/opt/hf2q/src/serve/forward_mlx.rs:3576` claims:
+
+> "Saves 1 dispatch + 1 barrier per layer × 30 = ~9% decode."
+
+### Production bench (this iter, gemma4 APEX-Q5_K_M, 3 runs each)
+
+```
+Baseline:           69.2, 69.1, 69.2 tok/s   median 69.2
+HF2Q_TQ_FUSE_FWHT_PRE=1: 69.0, 68.3, 68.5 tok/s   median 68.5
+Delta: -1.0%
+```
+
+Bucket dump confirms the flag IS active — total dispatches dropped
+from 36150 → 33570 (-7.1% dispatch reduction) for fwht_sign_premult
+calls eliminated.
+
+### Why the claimed "+9%" doesn't show
+
+Removing the FWHT-pre dispatch saves ~13 µs × 30 layers = 390 µs/tok
+of dispatch overhead.  BUT the fused-into-FA kernel now does an
+additional FWHT (32-element simd-shuffle butterfly × 8 EPT) per
+threadgroup at the start of the FA kernel.  That extra work appears
+to outweigh the dispatch savings on this hardware/shape.
+
+Hypothesis (not yet falsified): the FA kernel was already compute-
+heavy at gemma4 head_dim=256 with 8 simdgroups/threadgroup.  Adding
+FWHT-pre at the start pushes occupancy or register pressure across a
+threshold, slowing the kernel by more than the savings.
+
+### Decision
+
+**Default OFF stays.**  Add this finding to the ADR so future iters
+don't re-investigate the claim.
+
+Lesson: **historical "saves X%" comments must be re-benched at HEAD**
+on the production APEX-Q5_K_M model whenever invoking them as
+hypothesis.  iter-106 was likely measured on different model / pre-
+iter-127a NSG axis / pre-iter-197 cbits — none of those conditions
+match HEAD.
+
+### Stack of falsified historical claims (this thread)
+
+iter-308→315 falsified:
+- iter-106 "FUSE_FWHT_PRE saves 9% decode" → -1% at HEAD (this iter)
+- iter-186 "FUSED_TRIPLE_NORM" → -1.0% (prior, in task list)
+- iter-249 "72 extra mat-vecs/tok our side" → wrong sign (iter-308)
+
+Pattern: claims based on dispatch-count math without end-to-end
+production bench are unreliable.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`:
+  this section.
+
+No code changes.
