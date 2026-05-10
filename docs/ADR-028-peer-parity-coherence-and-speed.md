@@ -6886,6 +6886,62 @@ Per "no fallback, no stub" mantra: documenting the integration cost
 honestly so future sessions don't underestimate.  This isn't a defer;
 it's an accurate scope assessment from peer-code reading.
 
+### iter-225 — synthesis of operator-pinned reddit docs
+
+Read all 3 operator-mentioned reddit docs to understand the broader
+SD/MTP landscape:
+
+**reddit-mtp.txt** (3268 lines — qwen3.6-27B MTP via llama.cpp PR):
+- Built-in MTP layer in qwen3.6-27B model (NOT in our 35B-A3B target)
+- llama.cpp PR 22673: `--spec-type mtp --spec-draft-n-max 3`
+- Mac M2 Max 96 GB: 28 tok/s = 2.5× speedup
+- froggeric/Qwen3.6-27B-MTP-GGUF on HF — drop-in replacement
+- Shows MTP works on Apple Silicon + llama.cpp Metal backend
+
+**reddit-atlas.txt** (Atlas inference engine, GB10 hardware):
+- Pure Rust + CUDA, no PyTorch, no Python runtime (aligns with hf2q
+  philosophy)
+- Qwen3.6-35B-A3B 130 tok/s peak with MTP K=2 + NVFP4 on GB10
+- 3.0-3.3× vLLM at testing time
+- Hand-tuned CUDA kernels for Blackwell SM120/121
+- Validates: pure-Rust SD inference engine IS achievable
+
+**reddit-heretic.txt** (Heretic 1.3 — censorship removal):
+- Tangentially related (model post-processing, not inference perf)
+- 20K GitHub stars, 13M downloads — ecosystem reach
+- Not directly applicable to gemma4 perf gap
+
+**Synthesized landscape**:
+
+| Path | Architecture | SD support | hf2q applicability |
+|------|--------------|------------|---------------------|
+| llama.cpp MTP | C++ + Metal | qwen3.6-27B built-in | qwen3.6-27B via fresh GGUF |
+| Atlas | Rust + CUDA | qwen3.6-35B 130 tok/s | reference for hf2q SD architecture |
+| **DFlash** | **Python + MLX** | **gemma-4-26B-A4B + qwen3.6-35B-A3B** | **draft model fits hf2q's targets** |
+
+**Strategic takeaway**:
+- DFlash is the ONLY path that explicitly supports BOTH operator-focus
+  models (gemma4 + qwen3.6-35B-A3B)
+- llama.cpp's MTP is qwen3.6-27B-only — different target than our
+  benchmark
+- Atlas validates the architectural pattern (Rust + GPU SD = 3× peer)
+  but is GB10-CUDA, not Apple Metal
+
+For hf2q on M5 Max, **DFlash with pure-Rust draft reimpl (option (a)
+from iter-224) is the canonical path** to peer parity + beyond.
+
+ADR-027 §11 already tagged "post-LANDED extension plan — MTP / DFlash
+speculative decoding" as future work.  This session has discovered
+the entry-point: `/opt/dflash/dflash/model_mlx.py` as a reference for
+the draft architecture.
+
+iter-226+ plan options:
+- (a) Begin Rust-reimpl DFlash draft model — multi-iter chain spanning
+      months
+- (b) Wait for operator priority direction (DFlash multi-month vs
+      Path E+F+G 1-line)
+- (c) Document architectural skeleton for future session pickup
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
