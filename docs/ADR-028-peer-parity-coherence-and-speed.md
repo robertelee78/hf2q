@@ -10227,6 +10227,48 @@ needed verification post-shipping).
 4. Decide: proceed with K1 per-layer trace (multi-iter, ROI uncertain)
 5. Decide: accept current state and end ADR-028 active iteration
 
+### iter-280 — Operator clarification: APEX FOCUS (MTP thread retracted)
+
+Operator at iter-280: *"explain the mtp stuff — I told you my focus is
+speed parity on the apex"*.
+
+**Major correction**: the 17-iter MTP K1 thread (iter-263→279) was
+on `qwen3.6-27b-mtp-q4_0.gguf` — a DEV artifact, NOT either APEX
+production GGUF.  That entire investigation does not move APEX speed-
+parity needle.
+
+**APEX-only status (post iter-280)**:
+
+| APEX model | hf2q | × peer matched | Status |
+|------------|-----:|---------------:|--------|
+| qwen3.6 35B-A3B-APEX-Q5_K_M | 126.3 | **1.28×** | ★ MANTRA SATISFIED |
+| gemma4 26B-A4B-APEX-Q5_K_M | 68.6 | **0.726×** | gap |
+| gemma4 + Path E+G | 71.1 | 0.752× | still gap |
+| gemma4 + E+G+FUSED | 71.6 | 0.757× | still gap |
+
+**Only gemma4 APEX needs work.**  All measurable kernel-level levers
+exhausted (iter-253-257).  The only known path to gemma4-APEX speed
+parity is DFlash spec-decode (multi-month, operator-decision-gated
+per iter-227).  Path E+G+FUSED is incremental but doesn't reach
+parity.
+
+**iter-281 outcome**:
+- ✓ Operator-focus correction encoded in memory
+  (`~/.claude/projects/-opt-hf2q/memory/feedback_apex_focus_not_dev_ggufs_2026_05_10.md`)
+- ✓ MEMORY.md index updated with focus rule + thread-tagged retraction
+- ✓ ADR-028 explicit APEX-only status table at HEAD
+- → No further APEX-actionable work without operator decision on
+  DFlash port.  Idle at 1200-1800s cadence per loop skill.
+
+**MTP thread artifacts (preserved as side-effects, NOT APEX-relevant)**:
+- `SpecDecode::run_with_eos_set` multi-EOS API (commit `2c4d188`)
+- Name-based EOS resolver (commit `82522f7`)
+- 3 layer parity tests (iter-273, iter-275, iter-276)
+- HF2Q_DUMP_LAYER_ALL trace extension (commit `b422667`)
+
+These ship as long-term test infrastructure but don't move either
+APEX model's perf.
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
