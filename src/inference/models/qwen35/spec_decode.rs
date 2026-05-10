@@ -260,31 +260,47 @@ impl<'a> SpecDecode<'a> {
             let hidden_size_u32 = self.verifier.cfg.hidden_size;
             let vsz = vocab as usize;
 
-            if k1_batched {
-                // ADR-028 iter-174 bisect: HF2Q_SPEC_DECODE_K1_TWO_CALLS=1
-                // uses TWO consecutive 1-token forward calls instead of one
-                // 2-token forward. Correctness probe — if 2-call mode
-                // produces coherent output but the original 2-token call
-                // does not, the bug is in multi-token mid-stream forward.
-                // If 2-call mode is also broken, the bug is in spec_decode
-                // state machine bookkeeping.
-                let two_calls = std::env::var("HF2Q_SPEC_DECODE_K1_TWO_CALLS")
+            // ADR-028 iter-175: TWO_CALLS_PROPER bisect interleaves the
+            // accept/reject decision BETWEEN forward A and forward B, so
+            // forward B only writes K[N+1] when accept is confirmed (with
+            // the correct token = proposed = verified_at_n1). On reject,
+            // forward B is skipped — next iter's verifier writes K[N+1]
+            // with the corrected token.
+            let two_calls = k1_batched
+                && std::env::var("HF2Q_SPEC_DECODE_K1_TWO_CALLS")
                     .as_deref() == Ok("1");
-                // hidden_row_0 / hidden_row_1: pre-extracted hidden rows.
-                // Built by either path so the unified ACCEPT/REJECT branch
-                // can pull from them without buffer-shape ambiguity.
-                let mut hidden_row_0: Option<MlxBuffer> = None;
-                let mut hidden_row_1: Option<MlxBuffer> = None;
-                let (verify_logits, verify_hidden) = if two_calls {
-                    let pos_a = vec![next_pos; 4];
-                    let (logits_a, hidden_a) = self
-                        .verifier
-                        .forward_gpu_with_hidden(
-                            &[token_next], &pos_a, &mut self.kv_cache,
-                        )
-                        .with_context(|| {
-                            format!("K1 TWO_CALLS step A pos {next_pos}")
-                        })?;
+
+            if two_calls {
+                // --- Step A: forward [token_next] at next_pos ---
+                let pos_a = vec![next_pos; 4];
+                let (logits_a, hidden_a) = self
+                    .verifier
+                    .forward_gpu_with_hidden(
+                        &[token_next], &pos_a, &mut self.kv_cache,
+                    )
+                    .with_context(|| {
+                        format!("K1 TWO_CALLS_PROPER A pos {next_pos}")
+                    })?;
+                let last_a = last_logits(&logits_a, vocab)?.to_vec();
+                let verified_at_n1 = greedy_argmax_slice(&last_a);
+
+                if std::env::var("HF2Q_SPEC_DECODE_K1_TRACE").as_deref()
+                    == Ok("1")
+                {
+                    eprintln!(
+                        "[K1_TRACE_TC] iter={} pos={} tn={} prop={} v_at_n1={} match={}",
+                        self.stats.proposed,
+                        next_pos,
+                        token_next,
+                        proposed,
+                        verified_at_n1,
+                        verified_at_n1 == proposed,
+                    );
+                }
+                let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+
+                if verified_at_n1 == proposed {
+                    // --- Step B (ACCEPT only): forward [proposed] at N+1 ---
                     let pos_b = vec![next_pos + 1; 4];
                     let (logits_b, hidden_b) = self
                         .verifier
@@ -292,30 +308,70 @@ impl<'a> SpecDecode<'a> {
                             &[proposed], &pos_b, &mut self.kv_cache,
                         )
                         .with_context(|| {
-                            format!("K1 TWO_CALLS step B pos {}", next_pos + 1)
+                            format!("K1 TWO_CALLS_PROPER B pos {}", next_pos + 1)
                         })?;
-                    // Each forward returns its own hidden buffer.
-                    // last_hidden_row works on each (single-token forward).
-                    hidden_row_0 = Some(
-                        last_hidden_row(&hidden_a, hidden_size_u32)
-                            .context("K1 TWO_CALLS hidden_a last_row")?,
-                    );
-                    hidden_row_1 = Some(
-                        last_hidden_row(&hidden_b, hidden_size_u32)
-                            .context("K1 TWO_CALLS hidden_b last_row")?,
-                    );
-                    // Concat logits only (used by the row0/row1 slice logic).
-                    let last_a = last_logits(&logits_a, vocab)?.to_vec();
                     let last_b = last_logits(&logits_b, vocab)?.to_vec();
-                    let mut logits_concat = Vec::with_capacity(2 * vsz);
-                    logits_concat.extend_from_slice(&last_a);
-                    logits_concat.extend_from_slice(&last_b);
-                    // verify_hidden unused in two_calls path — but we still
-                    // need to bind something. Reuse hidden_b (caller won't
-                    // index nth_hidden_row on it because hidden_row_*
-                    // are pre-set).
-                    (logits_concat, hidden_b)
+                    let next_iter_token_next = greedy_argmax_slice(&last_b);
+
+                    let no_amort = std::env::var("HF2Q_SPEC_DECODE_K1_NO_AMORT")
+                        .as_deref() == Ok("1");
+                    generated.push(proposed);
+                    if !no_amort
+                        && generated.len() < max_new
+                        && !self.is_eos(proposed)
+                    {
+                        generated.push(next_iter_token_next);
+                    }
+                    preemitted_argmax = !no_amort;
+                    self.stats.accepted += 1;
+                    if self.is_eos(proposed)
+                        || (!no_amort && self.is_eos(next_iter_token_next))
+                    {
+                        break;
+                    }
+                    if generated.len() >= max_new {
+                        break;
+                    }
+                    hidden_pos = next_pos + 1;
+                    hidden_t = last_hidden_row(&hidden_b, hidden_size_u32)
+                        .context("K1 TWO_CALLS_PROPER ACCEPT hidden_b last_row")?;
+                    logits_t = last_b;
                 } else {
+                    // REJECT: skip step B. K[N+1] not written this iter;
+                    // next iter writes K[N+1] with verified_at_n1.
+                    generated.push(verified_at_n1);
+                    preemitted_argmax = true;
+                    self.stats.rejected += 1;
+                    if self.is_eos(verified_at_n1) {
+                        break;
+                    }
+                    hidden_pos = next_pos;
+                    hidden_t = last_hidden_row(&hidden_a, hidden_size_u32)
+                        .context("K1 TWO_CALLS_PROPER REJECT hidden_a last_row")?;
+                    logits_t = last_a;
+                }
+
+                if mtp_profile {
+                    let iter_ms = iter_t0
+                        .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                    eprintln!(
+                        "[MTP_PROFILE_K1_TC] iter {}: mtp={:.2} ver={:.2} ITER={:.2}",
+                        self.stats.proposed,
+                        mtp_ms.unwrap_or(0.0),
+                        v_ms.unwrap_or(0.0),
+                        iter_ms,
+                    );
+                }
+                // Skip the rest of the K=1 (2-token forward) branch.
+                continue;
+            }
+
+            if k1_batched {
+                // hidden_row_0 / hidden_row_1: pre-extracted hidden rows.
+                let mut hidden_row_0: Option<MlxBuffer> = None;
+                let mut hidden_row_1: Option<MlxBuffer> = None;
+                let (verify_logits, verify_hidden) = {
                     let verify_positions_2 = positions_for_range(next_pos, 2);
                     self
                         .verifier
