@@ -7750,6 +7750,45 @@ Summary:
 Both production paths now have coherence guarantees against silent
 regression.
 
+### iter-243 — 3-run statistical baseline (mantra: "measure 3x")
+
+Per operator mantra ("Measure 3x, cut once"), ran the iter-242
+multi-model gate 3 consecutive times to verify stability before
+declaring the gate production-ready.
+
+**Result**: ALL 3 RUNS BYTE-IDENTICAL across all 7 stack outputs.
+
+| Stack | Run 1 | Run 2 | Run 3 |
+|-------|-------|-------|-------|
+| gemma4 Default | OK "# The Eye of Aeons..." | OK same | OK same |
+| gemma4 Path E | OK same | OK same | OK same |
+| gemma4 Path E+G | OK same | OK same | OK same |
+| gemma4 Path E+G+FUSED | OK same | OK same | OK same |
+| gemma4 Path E+F+G | FAIL[sentinel] | FAIL[sentinel] | FAIL[sentinel] |
+| qwen3.6 Default | OK "Here's a thinking thinking sequence..." | OK same | OK same |
+| qwen3.6 Default+F16KV | OK same | OK same | OK same |
+
+**Interpretation**:
+- **Deterministic sampling**: hf2q's default sampler is byte-identical
+  across runs at fixed prompt + N (greedy/temp=0 mode).  iter-234's
+  non-deterministic finding was across DIFFERENT N values
+  (200/400/600/800/1000), not run-to-run variance at fixed N.
+  This narrows the F16 KV regression understanding: the failure is
+  **token-position-dependent**, not random-per-run.
+- **Gate stability**: 3 runs identical → no flakiness at HEAD.  Gate
+  ready for CI integration as-is (single-run sufficient under
+  deterministic sampling).
+- **Wall clock**: ~3 min per full multi-model run × 3 = ~9 min
+  total.  Single-run gate (~80s) is the production cadence.
+
+**Operator action remains**: integrate `bash scripts/adr028_coherence_gate.sh`
+into `.github/workflows/ci.yml` (currently NOT wired) or pre-merge
+hook.  CI will need a self-hosted Apple Silicon runner since the
+gate requires Metal + the production GGUF files.
+
+**Audit/defensive phase formally concluded**.  Strategic options A/B/C
+from iter-240 remain operator-decision-gated.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
