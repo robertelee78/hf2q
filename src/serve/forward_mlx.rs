@@ -654,6 +654,56 @@ pub struct MlxKvCache {
     pub seq_len: usize,
 }
 
+impl MlxKvCache {
+    /// ADR-028 iter-229 / ADR-028 §iter-227 work item D: ds4-style counter
+    /// rollback for speculative decode infrastructure.
+    ///
+    /// Logically discards the most-recent `n_back` positions from the cache.
+    /// Following ds4's pattern (`DS4_MTP_KEEP_ACCEPTED` macro, ds4.c:16246),
+    /// no actual cache bytes are cleared — `seq_len` is decremented to make
+    /// the trailing positions invisible to subsequent SDPA reads.  Future
+    /// writes (via `write_pos`) will overwrite those slots naturally.
+    ///
+    /// Returns the new `seq_len` for caller assertion.
+    ///
+    /// # Semantics
+    /// - **Linear cache** (`is_sliding=false`): `write_pos == seq_len`, both
+    ///   decrement by `n_back`.  Subsequent writes resume at the new
+    ///   `write_pos`.
+    /// - **Sliding cache** (`is_sliding=true`): more complex — `write_pos`
+    ///   wraps modulo `capacity`.  Implemented for the linear case here;
+    ///   sliding-aware rollback requires position-tracking metadata and is
+    ///   deferred until iter-227 work item C (SD state machine).
+    ///
+    /// # Errors
+    /// Returns `Err` if `n_back > seq_len` or sliding cache (not yet supported).
+    pub fn trim(&mut self, n_back: usize) -> Result<usize, &'static str> {
+        if self.is_sliding {
+            // Sliding cache rollback requires logical-position tracking
+            // (the slot index ≠ logical position when wrapped).  For ds4-style
+            // SD on gemma4, sliding layers may need a counter parallel to
+            // `write_pos` that tracks logical end-position separately.
+            // Deferred to iter-227 work item C.
+            return Err("trim() not yet supported on sliding cache");
+        }
+        if n_back > self.seq_len {
+            return Err("trim n_back exceeds seq_len");
+        }
+        // Linear cache: write_pos == seq_len. Both decrement.
+        self.seq_len -= n_back;
+        self.write_pos = self.seq_len;
+        Ok(self.seq_len)
+    }
+
+    /// Returns the count of valid (visible) positions.  Equivalent to
+    /// `seq_len` post-iter-229 but exposed as named API for the SD
+    /// state machine (matches ds4's `s->graph.mtp_n_raw` semantic).
+    #[inline]
+    pub fn visible_len(&self) -> usize {
+        self.seq_len
+    }
+}
+
 /// Reusable activation buffers for one forward pass.
 pub struct MlxActivationBuffers {
     /// Hidden state `[1, hidden_size]` F32.
