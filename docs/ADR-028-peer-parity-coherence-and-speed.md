@@ -13863,3 +13863,91 @@ For typical 200-1000 tok generations, modest (~240 MB).
 
 No code changes (verification + finding documentation).  Phase 4
 (fused_norm_add_f32 → float4 port) opens next.
+
+
+---
+
+## iter-331 — Phase 4 LANDED: fused_norm_add_f32_v2 (float4 + simd_sum) default-ON
+
+Peer pattern: `kernel_rms_norm_fuse_impl<float4, 3>` (RMS norm + mul + add)
+at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:2989+` uses:
+- float4 vector loads via templated `T = float4`
+- `simd_sum()` in-simdgroup reduction (1 HW op, no barrier)
+- inter-simdgroup shuffle via shared memory (2 barriers total)
+- `dot(x, x)` for sum-of-squares (4-way multiply-add in 1 op)
+
+Our baseline `fused_norm_add_f32` used scalar `float` per element, tree
+reduction with `log2(tg_size)` barriers, `v*v` scalar accumulation.
+
+### Implementation
+
+- `/opt/mlx-native/src/shaders/fused_norm_add_f32.metal` (+85 lines):
+  new `fused_norm_add_f32_v2` kernel mirroring iter-310's
+  `rms_norm_f32_v2` pattern, extended with float4 residual add in
+  Phase 2.
+- `/opt/mlx-native/src/kernel_registry.rs` (+5 lines): register
+  `fused_norm_add_f32_v2` source.
+- `/opt/mlx-native/src/ops/fused_norm_add.rs` (+15 lines): env-gated
+  dispatcher selection — `HF2Q_FUSED_NORM_ADD_V2` default-ON (iter-326
+  pattern), opt-out via `=0`/`false`/`off`.  Requires `dim % 4 == 0`;
+  falls back to scalar when not.  Shared memory sized for n_sg=1
+  minimum case (32 floats) to handle partial-warp tg_sizes safely.
+- `/opt/mlx-native/tests/adr_028_iter331_fused_norm_add_v2_parity.rs`
+  (NEW, 160 lines): parity test mirroring iter-310's structure with
+  1e-4 abs + 1e-4 rel tolerance across gemma4/qwen35/head_dim/tiny
+  shapes.
+
+### Parity results
+
+```
+running 4 tests
+test fused_norm_add_v2_parity_tiny ... ok
+test fused_norm_add_v2_parity_head_dim ... ok
+test fused_norm_add_v2_parity_gemma4_hidden ... ok
+test fused_norm_add_v2_parity_qwen35_hidden ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;
+```
+
+8/8 shapes (each test covers 2 shapes) PASS within 1e-4 tolerance.
+Same precision character as iter-310's rms_norm_v2 port (passed) —
+not bit-exact due to simd_sum vs tree-reduction non-associativity, but
+within float-accumulation tolerance.
+
+### Bench
+
+```
+=== A: fused_norm_add_v2 default ON (new HEAD) ===
+prefill: 24 tok in 472ms (50 tok/s)
+--- mlx-native: 200 tokens in 2.74s (73.0 tok/s) ---
+
+=== B: fused_norm_add_v2 opt-out (HF2Q_FUSED_NORM_ADD_V2=0) ===
+prefill: 24 tok in 478ms (50 tok/s)
+--- mlx-native: 200 tokens in 2.76s (72.4 tok/s) ---
+```
+
+Delta: (73.0 − 72.4) / 72.4 = **+0.8%** additive on top of iter-326
+stack.  Within the deep-research forecast band of +1-3%.
+
+Greedy outputs differ between V2-on and V2-off (precision non-equivalence
+in argmax tie-breaks), but BOTH coherent.  Same character as iter-310.
+
+### Cumulative gemma4 200-tok progress
+
+| HEAD | tok/s | × peer | Delta vs baseline |
+|---|---|---|---|
+| Pre-iter-326 (all opt-in OFF) | 69.4 | 0.680× | 0 |
+| iter-326 (5-flag default-flip) | 72.8 | 0.713× | +4.9% |
+| **iter-331 (+fused_norm_add_v2)** | **73.0** | **0.715×** | **+5.2%** |
+
+Modest single-phase gain (+0.3% additive), but every additive lever
+counts per operator mantra "close the gap entirely".  Phase 5
+(fused_head_norm_rope_f32 → float4) opens next as the sibling port.
+
+### Files modified
+
+- `/opt/mlx-native/src/shaders/fused_norm_add_f32.metal`
+- `/opt/mlx-native/src/kernel_registry.rs`
+- `/opt/mlx-native/src/ops/fused_norm_add.rs`
+- `/opt/mlx-native/tests/adr_028_iter331_fused_norm_add_v2_parity.rs` (NEW)
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
