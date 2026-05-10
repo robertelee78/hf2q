@@ -12674,3 +12674,93 @@ scope of CPU-side instrumentation we've been using.
   this section.
 
 No code changes in iter-313 — analysis + decision-frame iter.
+
+
+---
+
+## iter-314 — thread closure + strategic decision point
+
+After 7 iters (308→314), the gemma4 APEX speed-parity investigation has
+exhausted the levers reachable from CPU-side measurement + peer-pattern
+kernel ports.  Summary:
+
+### What's been measured + shipped
+
+| Iter | Hypothesis | Result | Production gain |
+|---|---|---|---|
+| 308 | Peer dispatches kernels smarter | TRUE (peer 7.1 µs/disp vs us 15.7 µs) | doc only |
+| 309 | q6_K mat-vec nr0=2 + yl[] cache | parity ✓, falsifies kernel-internals | -0.9% (noise) |
+| 310 | rms_norm float4 + simd_sum | parity ✓, falsifies kernel-internals | +0.8-1.6% (noise) |
+| 311 | Barrier density blocks concurrency | Serial vs concurrent = +7%, near-tapped | doc only |
+| 312 | False-positive range tracking | Falsified — QKV uses separate buffers | doc only |
+| 313 | Concurrency-ceiling math | Theoretical ratio ~1.5; currently 1.29 | doc only |
+| 314 | (this iter) — thread closure | — | doc only |
+
+### Total wins shipped in this thread
+
+iter-309 kernel + iter-310 kernel ship as env-gated opt-in (default
+OFF, parity-clean).  No production wins above noise.  Coherence intact,
+TQ-HB intact.
+
+### Where the remaining ~1.5× per-dispatch cost lives
+
+After eliminating: kernel internals (309/310), concurrency tracking
+(311/312/313), graph topology (313 — gemma4 IS inherently sequential
+at our granularity), the remaining cost is OPAQUE to CPU-side
+measurement.
+
+Plausible homes (in order of cost):
+1. **TQ-HB scaffolding** (operator-mandated retain): ~150 dispatches/tok
+   of hadamard_quantize + fwht_sign + flash_attn_tq.  Structural cost
+   ~1.5 ms/tok = 10% of decode budget.  **Fusing them would require
+   multi-week kernel design work.**
+2. **GPU-side per-dispatch launch latency**: not measurable via CPU
+   timing.  Apple Instruments Metal System Trace can show this but
+   requires manual GUI workflow.
+3. **Argument-encoding latency** (set_pipeline + set_buffer × N +
+   set_bytes per dispatch): iter-254 measured 0.36 µs/disp on CPU,
+   but GPU-side argument-binding may add latency we don't profile.
+
+### Realistic ceiling math with TQ-HB intact
+
+```
+Current:          14.9 ms/tok = 67 tok/s  (0.66× peer @ 102)
+- TQ-HB fused:   -1.5 ms/tok → 13.4 ms = 75 tok/s  (0.74×)
+- Concurrency:   -0.5 ms/tok → 12.9 ms = 78 tok/s  (0.76×)
+- Per-disp opaque: -???       
+```
+
+Without identifying and closing the opaque per-dispatch cost,
+**realistic ceiling with TQ-HB intact is ~0.75-0.80× peer**.
+
+### Operator-decision points (escalated)
+
+To break past ~0.80× peer ceiling, one of:
+
+1. **Approve TQ-HB kernel-fusion redesign** — multi-week structural
+   work to merge the 6+ TQ-HB dispatches per attention into 1-2
+   combined kernels.  Preserves 3.94× memory savings.
+2. **Apple Instruments Metal System Trace** — Outside scripted
+   tooling.  Required to localize the opaque per-dispatch cost (GPU
+   launch latency / argument binding).  One-time profiling effort.
+3. **Accept current 0.66× ratio** — coherence + TQ-HB mantras
+   satisfied; absolute speed gap deferred.
+
+### What I am NOT shipping
+
+- DFlash port (operator-marked as "cherry on top, not the gap")
+- Further kernel-internals ports (309/310 falsified the class)
+- Concurrency-aggressive annotations (313 showed ceiling is near)
+
+### Cross-thread health checks (run this iter)
+
+Re-confirmed: parity tests for iter-309 + iter-310 still pass.
+Coherence unchanged (default decode path unaffected).  TQ-HB cache
+savings intact (no kernel removal).
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes.  iter-314 closes the iter-308 thread pending operator
+decision on the three escalated paths above.
