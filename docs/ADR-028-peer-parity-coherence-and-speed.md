@@ -5502,6 +5502,46 @@ entirely → all optimization work here becomes moot.
 iter-195+ plan: implement and bench.  Or skip if operator approves
 Path E or E+F default-flip.
 
+### iter-195 — vectorized dequant_hb_float4 LANDED (+2.08% default-path)
+
+Implemented option (1) from iter-194 plan: vectorized 4-byte uint32
+load in `dequant_hb_float4` (mlx-native shaders/flash_attn_vec_tq_hb.metal).
+Branch on cbits hoisted out of per-element to per-float4.  Alignment
+preserved (all call sites verified).
+
+mlx-native commit `2225d9c`.
+
+**Parity gate**: 15/15 byte-parity tests PASS in
+`test_tq_hb_encoder_byte_parity` — including
+`sdpa_kernel_vs_oracle_d256_production_shape_gemma4_26b` and the NSG
+equivalence suite.  Output is byte-identical to the oracle.
+
+**5-run statistical bench** (gemma4 default path):
+
+| Config | tok/s |
+|--------|------:|
+| Prior default | 62.5 |
+| New default | **63.8** (+2.08%) |
+
+Coherence: "2 + 2 = 4" identical to prior.
+
+**Updated session lever inventory**:
+
+| Stack | tok/s | vs peer 102.7 | precision |
+|-------|------:|--------------:|-----------|
+| **New default** | **63.8** | **0.62×** | **exact** |
+| Path G | 64.7 (+1.4 estimated) | 0.63× | exact |
+| Path E | 70.7 | 0.69× | exact |
+| Path E+G | 72.2 | 0.70× | exact |
+| Path E+F+G | 73.7 | 0.72× | F16 ~25 ppm |
+
+The default-path improvement is automatic (no env flag) and
+**byte-identical** to prior — no operator approval needed for this
+incremental shipped win.
+
+iter-196+ plan: option (2) from iter-194 — function-constant cbits
+specialization for additional ~5-10% on TQ-HB SDPA inner loop.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
