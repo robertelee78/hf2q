@@ -11371,3 +11371,79 @@ peer at matched regime.
 | Per-layer-type bisect → kernel work | ?  | ? | multi-week, ROI uncertain |
 | DFlash port | 1.4-2.8× | YES | multi-month, operator-decision-gated |
 
+
+---
+
+## iter-291 — mat-vec dispatch delta is real but source-of-extra not yet localized
+
+### Per-pipeline mat-vec count comparison (from iter-284 + iter-290 buckets)
+
+| Mat-vec kernels | llama.cpp/tok | hf2q/tok | Δ |
+|-----------------|--------------:|---------:|---:|
+| q6_K dense matvec | 88 | 192 | +104 |
+| q8_0 dense matvec | 15 | 31 | +16 |
+| f16 / f32 dense matvec | 30 / 15 | 30 (hf2q_dense_mm_f32_f32_tensor) | -15 |
+| MoE matvec_id (all types) | 30 | 60 | +30 |
+| TOTAL mat-vec | ~178 | ~250 | **+72** |
+
+If each extra mat-vec costs ~10-15 µs (heavy compute), that's 0.7-1.1 ms
+of the 4.5 ms gap.  Bigger lever than per-dispatch overhead alone.
+
+### Source-localization attempt (Chesterton's fence)
+
+Read `/opt/hf2q/src/serve/forward_mlx.rs:3947-3953` (gemma4 B9):
+```rust
+dispatch_qmatmul(&mut s, reg, dev, &norm_out,
+    &layer.mlp.gate_proj, &mut mlp_gate, 1)?;       // dispatch 1
+dispatch_qmatmul(&mut s, reg, dev, &norm_out,
+    &layer.mlp.up_proj,   &mut mlp_up, 1)?;         // dispatch 2
+```
+
+hf2q dispatches dense MLP gate + up as 2 separate matmuls.  But:
+
+Read `/opt/llama.cpp/src/models/gemma4.cpp:113`:
+```cpp
+layer.ffn_gate_up_exps = create_tensor(... LLM_TENSOR_FFN_GATE_UP_EXPS,
+    {n_embd, n_ff_exp * 2, n_expert}, 0);  // MoE EXPERTS — stacked
+```
+
+llama.cpp's stacked tensor is for **MoE experts only**, passed to
+`build_moe_ffn(... gate_up_exps ...)` at line 298.  For **dense MLP**
+(line 263-268 `build_ffn(ffn_up, ffn_gate, ffn_down, ...)`), peer also
+dispatches 2 separate matmuls.
+
+So the dense MLP gate+up split is NOT the dispatch-count gap source —
+both implementations have it.
+
+### What I don't yet know
+
+The 72 extra hf2q matmul dispatches/tok must come from:
+- Per-layer-type asymmetry hf2q has but peer doesn't, OR
+- A redundant matmul hf2q makes that peer skips, OR
+- Different lm_head / rope / per-head matmul wiring
+
+Localizing the actual sites requires per-layer dispatch instrumentation
+(attribute each dispatch to a layer index + role).  That's a multi-iter
+instrumentation project, not a single-iter find.
+
+### Strategic note
+
+Per the operator's "don't guess, set up the right tests" directive, I
+will NOT speculate on which sites contribute the 72 extra matmuls.
+Future iter (operator-decision-gated) can build the per-layer dispatch
+attribution if the ROI is worth the multi-iter investment.
+
+If the 72 extra matmuls average 13 µs (sequential equivalent), the ROI
+ceiling is ~0.94 ms saved = +6.5% to gemma4 = 0.694 → 0.74× peer.
+
+**Combined with iter-288's 0.73× ceiling from generic dispatch
+elimination, the realistic improved ceiling without DFlash is ~0.78-0.80×
+peer.**  Same conclusion as iter-220 strategic pivot, sharpened by
+the per-pipeline data.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes — observation locked in, source not yet localized.
+
