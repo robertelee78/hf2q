@@ -287,10 +287,51 @@ impl Qwen35LoadedModel {
         // Qwen3.5/3.6: `tokenizer.ggml.eos_token_id` is typically 151645
         // (`<|im_end|>`) per `cmd_generate_qwen35:1066-1069`.  When the
         // GGUF metadata is absent we fall back to the HF Qwen3.5 default.
-        let eos_token: u32 = gguf
-            .metadata_u32("tokenizer.ggml.eos_token_id")
-            .unwrap_or(151645);
-        let eos_token_ids: Vec<u32> = vec![eos_token];
+        //
+        // ADR-028 iter-267: extended-vocab qwen3 GGUFs (e.g. 27B-MTP-Q4_0
+        // with vocab=248044) put `<|im_end|>` at a different ID than the
+        // standard 151645 — and some GGUFs omit `eos_token_id` metadata
+        // entirely (per iter-265 the 27B-MTP file has 32 metadata keys
+        // none of which are eos_token_id).  Robust fallback: scan
+        // `tokenizer.ggml.tokens` array by NAME for the canonical qwen3
+        // chat-template stop tokens (`<|im_end|>`, `<|endoftext|>`) and
+        // include EVERY match.  is_eos.contains() then catches whatever
+        // the model actually emits.
+        let mut eos_token_ids: Vec<u32> = Vec::with_capacity(2);
+        if let Some(id) = gguf.metadata_u32("tokenizer.ggml.eos_token_id") {
+            eos_token_ids.push(id);
+        }
+        if let Some(id) = gguf.metadata_u32("tokenizer.ggml.eot_token_id") {
+            if !eos_token_ids.contains(&id) {
+                eos_token_ids.push(id);
+            }
+        }
+        // Scan tokens array for canonical qwen3 chat-template stops.
+        if let Some(arr) = gguf.metadata("tokenizer.ggml.tokens") {
+            if let mlx_native::gguf::MetadataValue::Array(elems) = arr {
+                const STOP_NAMES: &[&str] = &["<|im_end|>", "<|endoftext|>"];
+                for (i, el) in elems.iter().enumerate() {
+                    if let mlx_native::gguf::MetadataValue::String(s) = el {
+                        if STOP_NAMES.contains(&s.as_str()) {
+                            let id = i as u32;
+                            if !eos_token_ids.contains(&id) {
+                                eos_token_ids.push(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if eos_token_ids.is_empty() {
+            // Final fallback to legacy default.
+            eos_token_ids.push(151_645);
+        }
+        let _eos_token: u32 = eos_token_ids[0];
+        tracing::info!(
+            count = eos_token_ids.len(),
+            ids = ?eos_token_ids,
+            "Qwen35 EOS token set resolved (iter-267 multi-source)"
+        );
 
         // ---- Load tokenizer ----
         //
