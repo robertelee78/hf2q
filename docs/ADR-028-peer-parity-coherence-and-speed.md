@@ -9097,6 +9097,64 @@ gemma4 satisfies coherence + TQ but not speed.  Speed gap = ~24%.
 **No regression introduced by iter-253-261 work** (docs + benches
 only; production engine path unchanged).  Gate confirms.
 
+### iter-263 — HIDDEN BUG: hf2q MTP path regresses 13% despite 78% accept
+
+Following the operator-pinned `docs/reddit/reddit-mtp.txt`, investigated
+hf2q's qwen3.5/3.6 spec-decode infrastructure (`src/inference/spec_decode/`,
+`src/inference/models/qwen35/spec_decode.rs`, `cli.rs:767-768`,
+`HF2Q_SPEC_DECODE` env flag).
+
+**Loaded the 27B-MTP-Q4_0 GGUF that fails in current llama.cpp build but
+loads in hf2q** — banner reads "qwen35 spec" indicating MTP active.
+
+**A/B at HEAD on qwen3.6-27b-mtp-q4_0.gguf** (1000-tok prompt):
+
+| Config | tok/s | Accept |
+|--------|------:|-------:|
+| HF2Q_SPEC_DECODE=0 (MTP off) | **31.8** | n/a |
+| Default (MTP on, GGUF NextN tensors live) | **27.7** | 77.9% |
+| **Δ** | **-13%** | — |
+
+**Hidden perf bug**: hf2q's MTP path is **slower** than no-MTP, despite
+high acceptance rate.  Reddit reports peer (llama.cpp) at 2.5× speedup
+with MTP (28 → 70 tok/s on M2 Max 96GB).  hf2q goes the OTHER way.
+
+**Why the previous iter-261 mantra-claim still holds**:
+- qwen3.6 35B-A3B-APEX-Q5_K_M (production model) has **no NextN tensors**
+  — confirmed by `HF2Q_SPEC_DECODE=0` and default both giving 126 tok/s
+  identical (MTP path is no-op when tensors absent).
+- The 1.28× peer advantage for production qwen3.6 is genuine and
+  unaffected by this bug.
+- The 27B-MTP file is a separate dev/test artifact in our models/ dir,
+  not a production-served model.
+
+**Mechanism hypothesis** (iter-264 work):
+- High accept rate (78%) confirms MTP logic finds correct draft tokens
+- Per-cycle MTP overhead (draft forward + verify forward) exceeds savings
+- Possible causes:
+  1. Verify forward not batched (sequential per-draft-token)
+  2. K1 Leviathan-style batched verify (HF2Q_SPEC_DECODE_K1=1) not on
+     by default — observe references in `qwen35/spec_decode.rs:244,257`
+  3. Per-cycle KV cache rollback overhead exceeds savings on small
+     prompts
+  4. Draft-model-quality vs target-model-quality mismatch (Q4_0 draft
+     of Q4_0 target = no quality gain, only overhead)
+
+**iter-263 outcome**:
+- ✓ Discovered hf2q MTP infrastructure exists and runs (cli.rs:767-768,
+  src/inference/spec_decode/, src/inference/models/qwen35/spec_decode.rs)
+- ✓ MTP is functionally correct (78% accept rate)
+- ✗ MTP perf is *negative* — hf2q goes from 31.8 → 27.7 tok/s with MTP
+- → Iter-264 investigates whether HF2Q_SPEC_DECODE_K1 (batched verify)
+  reverses the regression.  If yes: a default-flip lever.  If no: deeper
+  spec-decode profiling needed.
+
+**Important reframing**: kernel-level audit (iter-253-257) was complete
+for the **non-spec-decode path**.  The spec-decode path is a SEPARATE
+hot path that has not been audited.  This is a new optimization
+domain, qwen-specific, with peer-claimed 2.5× upside.  ROI per the
+reddit data is significantly larger than any remaining gemma4 lever.
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
