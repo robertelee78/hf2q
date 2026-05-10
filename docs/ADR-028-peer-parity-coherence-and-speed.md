@@ -5698,6 +5698,52 @@ add HF2Q_BLOCK_TIMING=1 (3-6 ms diagnostic overhead acceptable for
 one-shot measurement).  Goal: identify next +5%+ bisect target with
 hardcode-and-measure approach (no speculation).
 
+### iter-199 — re-bisect TQ-HB SDPA cost post-iter-197 + HEAD timing
+
+**TQ-HB SDPA residual cost** (re-bench HF2Q_SKIP_TQ_SDPA post-iter-197):
+
+| Config | BODY GPU |
+|--------|---------:|
+| Default (post-iter-197) | 12.5 ms |
+| SKIP_TQ_SDPA | 11.0 ms |
+| **Δ saved by skipping** | **1.5 ms** |
+
+vs pre-iter-197 the same delta was 2.6 ms.  iter-197 closed
+**1.1 ms / 42%** of the original TQ-HB SDPA cost.  Remaining 1.5 ms
+= 12% of body — still a target but harder to attack:
+- Vectorized byte load (iter-195) ✓
+- Function-constant cbits (iter-197) ✓
+- Codebook in shared memory: bank conflicts at 32-wide simdgroup
+- Codebook in registers: 256 × 4 B × 32 lanes = 32 KB too large
+
+**HEAD timing** (HF2Q_SPLIT_TIMING=1 + HF2Q_MLX_TIMING=1):
+
+| Phase | encode | GPU |
+|-------|-------:|----:|
+| BODY | 0.4 ms | 12.5 ms (956 dispatches) |
+| HEAD | "13 ms" | 1.6 ms (4 dispatches) |
+
+The "13 ms HEAD encode" is misleading — `finish_with_timing` returns
+`(enc_ns, gpu_ns)` where `enc_ns` is `commit_time - session_start`.
+With SPLIT_TIMING the head session starts AFTER body completes, so
+HEAD encode includes the CPU wait for body GPU plus actual encoding.
+True HEAD CPU encode is <0.1 ms (4 dispatches).
+
+**Real per-token breakdown** (production):
+- Body GPU: 12.5 ms
+- Head GPU: 1.6 ms
+- Total: 14.1 ms = 70.9 tok/s (matches measured 69.2 within
+  SPLIT_TIMING ~50us overhead noise)
+
+**Gap to peer** (102.7 tok/s = 9.74 ms total):
+- ~4.4 ms gap; ~4.0 ms in body (peer body ~8.5 ms vs ours 12.5)
+- Body gap candidates: dense MLP, MoE routing, remaining TQ-HB SDPA
+- Head gap: 0.4 ms (small, peer head ~1.2 ms estimated)
+
+iter-200+ plan: bisect dense MLP cost via SKIP_DENSE_MLP env flag
+(produces garbage but reveals time).  Or bisect MoE pipeline.
+Hardcode-and-measure — operator's standing rule.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
