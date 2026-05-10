@@ -3967,6 +3967,64 @@ current TQ-HB + Q5_K_M regime. Single-kernel walks are exhausted.
 Mark Task #18 as completed (ALREADY-FALSIFIED). Surface operator
 decision request: Path E flip vs continue multi-kernel walk.
 
+#### Peer re-bench at HEAD (iter-163, this iter)
+
+```
+$ /opt/llama.cpp/build/bin/llama-bench \
+    -m gemma4-ara-2pass-APEX-Q5_K_M.gguf -p 0 -n 256 -r 2
+| gemma4 26B.A4B Q6_K | 19.15 GiB | 25.23 B | MTL,BLAS | tg256 |
+  103.13 ± 0.27 |
+build: 5d6f18a63 (9078)
+```
+
+vs hf2q on same file/fixture (256 tok, "Hello, my name is",
+greedy):
+
+| | tok/s | × peer |
+|---|---:|---:|
+| llama.cpp (HEAD 9078) | **103.13** | 1.000× |
+| hf2q USE_DENSE=1 | 70.9 | 0.687× |
+| hf2q DEFAULT (TQ-HB) | 62.5 | **0.606×** |
+
+**Real gap: -39.4% at default, -31.3% at USE_DENSE=1.** The
+iter-146 reported 0.679× ratio was inflated by the non-reproducible
+hf2q reading; the true ratio at default has been ~0.61× the whole
+time. Peer slightly improved (102→103) since iter-146.
+
+#### Path E sizing — operator decision data point
+
+Flipping default to USE_DENSE=1 ships the +13.4% wall-clock gain
+(62.5→70.9 = closes ~31% of the 39% peer gap) at the cost of
+token divergence on long contexts (precision tradeoff).
+
+Quality cost — measured at iter-146 for same prompt:
+- Default output token ID stream different from USE_DENSE=1
+- Both produce coherent text; semantic content equivalent
+- KV cache stores F32 (no TQ-HB encode) so re-roll-able
+- ADR-027 Phase B 3.94× memory savings DOES NOT APPLY at
+  USE_DENSE=1 (KV is F32, not TQ-HB) — operator-acceptable since
+  Path E is ONLY for gemma4 default; qwen35/36 retain TQ-HB
+
+The **memory cost** at USE_DENSE=1 for gemma4 26B-A4B at
+sliding=1024:
+- 30 layers × 8 kv_heads × 256 head_dim × 1024 cap × 4 bytes (F32)
+  × 2 (K+V) = 502 MiB extra over TQ-HB packed
+- vs TQ-HB packed: 30 × 8 × 256 × 1024 × (1 byte 8bit codebook
+  + 4 bytes F32 norm/head/token) = 191 MiB
+- Net: USE_DENSE adds ~311 MiB per slot — 2.6× more KV memory
+  for gemma4
+
+For single-user serve workloads (or 1-2 concurrent), 311 MiB
+extra is trivial. For high-fan-out serve (8+ slots), it matters.
+
+Operator pick:
+- **(a) Path E flip default-on** — ship 0.606×→0.687× (+13.4% wall)
+  at gemma4 with quality A/B test before flip
+- **(b) Continue multi-kernel walk** — multi-week, sub-100µs/iter
+- **(c) Add `HF2Q_USE_DENSE=auto`** that flips on for short prompts
+  (no precision impact below sliding cap), off for long — adds
+  decision cost per request
+
 #### Standing decision — Three closure paths still apply
 
 Independent of regression: gemma4's structural gap to llama.cpp
