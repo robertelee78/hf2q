@@ -8162,6 +8162,100 @@ Next iteration: continue executing iter-247 methodology
 recommendations.  iter-248 done #1 (omlx/mlx-lm bench).  Next: #2
 Metal Capture + #3 re-activate iter-185 per-block timing.
 
+### iter-249 — re-activated profile reveals dispatch-fragmentation gap to peer
+
+Executed iter-247 rec #3: re-activated `HF2Q_MLX_PROFILE=1` per-token
+profiling.  Captured per-token dispatch count + timing breakdown.
+
+**Default-path profile** (gemma4 26B-A4B Q5_K_M, 50 tokens, 2 warmup):
+
+```
+S1 (QKV+attn+MLP):   14.45 ms total
+Total:               14.57 ms / token (= 70 tok/s)
+GPU sessions:        14.45 ms (99.2%)  ← entirely GPU-bound
+CPU ops:              0.0  ms ( 0.0%)
+Total dispatches:    960 / token  (9.1× candle baseline of 105)
+Avg per dispatch:    15.1 µs
+```
+
+**Path E+G profile** (same settings):
+
+```
+S1 total:            13.53 ms
+Total:               13.65 ms / token (= 73.3 tok/s)
+GPU sessions:        13.53 ms (99.1%)
+Dispatches/token:    930 (-30 vs default)
+Avg per dispatch:    14.6 µs (-0.5 µs vs default)
+```
+
+Path E+G saves 30 dispatches AND reduces avg dispatch time by 0.5 µs
+= 14.57 - 13.65 = **0.92 ms/token gain (6.3%)**.
+
+**Critical comparison vs llama.cpp peer**:
+
+iter-237 dossier estimated peer at ~14-16 dispatches/layer × 30 layers
+= **~450 dispatches/token**.  At 100 tok/s = 10 ms/token, peer runs at
+**~22 µs per dispatch on average**.
+
+| Engine | Dispatches/token | µs/dispatch | Total ms/token |
+|--------|------------------:|------------:|---------------:|
+| hf2q default | 960 | 15.1 | 14.57 |
+| hf2q Path E+G | 930 | 14.6 | 13.65 |
+| llama.cpp (estimated) | ~450 | ~22 | 10.0 |
+
+**Telling**: hf2q has **2× MORE dispatches**, each **SMALLER** in
+average duration.  llama.cpp fuses more work per kernel — fewer,
+bigger kernels = less inter-dispatch scheduling overhead.
+
+**Diagnosis**: at 99.2% GPU time, we're NOT launch-overhead-bound
+(would be CPU-bound).  But the extra scheduling gaps between 960
+dispatches vs peer's 450 likely accumulate real time.  The cost
+isn't the dispatch CALL itself; it's the GPU scheduler's per-dispatch
+synchronization overhead and barriers between them.
+
+**Lever identified**: **fusion of SEQUENTIAL (not concurrent) sub-
+dispatches** is the right direction.  iter-219's "compute survives
+fusion" lesson applies to CONCURRENT dispatches (fusing serializes
+them).  For SEQUENTIAL dispatches that already have launch+barrier
+gaps between them, fusion CAN save the gaps.
+
+**iter-185 instrumentation limitation**: profile reports session-
+level timing (S1/S2/S3/S4) — current single-session mode collapses
+all 30 layers into S1.  Per-layer or per-block timing within S1
+requires either (a) re-introducing session boundaries or (b) Metal
+counter sampling between dispatches (iter-247 rec #4).
+
+**Next concrete actions** (in priority order):
+
+1. **Identify sequential dispatch chains** in `forward_mlx.rs` where
+   inter-dispatch barriers serialize work.  iter-238 enumerated:
+   - Post-attn → B8 norms: barrier between
+   - B8 → B9 (gate/up/router_logits): barrier between
+   - B9 → B10 (gelu_mul + moe_routing): barrier between
+   - ... etc.
+
+   Of these, which run sequentially (not in CONCURRENT[…] groups)?
+   Each sequential boundary is a fusion candidate.
+
+2. **Microbench the per-barrier cost**: insert/remove an extra
+   barrier in a known location, measure delta.  Establishes the
+   per-barrier baseline cost.
+
+3. **Build sequential-fusion kernel for the highest-cost chain**:
+   fuse the dispatches around a ~hot~ barrier into one kernel.
+   iter-219's `fused_post_ff_norm2_endlayer_f32` (already shipped,
+   opt-in) is one example — but only got +0.3% because the work
+   was already concurrent-friendly.  Sequential fusion targets
+   should yield more.
+
+This is the path to closing 38-46% to peer.  Not a single 12% lever
+— a series of 3-5 fusion-of-sequential-chains optimizations,
+each closing 4-8%.
+
+**Saved by measurement**: without iter-247 rec #3 re-activation,
+we were trading guesses about why the gap exists.  Now we have
+hard numbers: 960 dispatches × 15.1 µs vs peer 450 × 22 µs.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
