@@ -3181,6 +3181,83 @@ Recommend operator pick:
   switch to run-phase Path A (the largest lever)
 - If user-facing perf is urgent → Path E USE_DENSE default-flip
 
+### iter-151: NE=4 hypothesis FALSIFIED — peer also uses NE=1 at DK=256
+
+#### Reading peer template instantiations
+
+Read `kernel_flash_attn_ext_vec` template instantiations at
+`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:7117..7195`.
+The last template parameter is **NE** (cache positions per simdgroup).
+
+| Shape | NE | reason |
+|-------|---:|--------|
+| dk32_dv32 | 4 | small heads, fits NE=4 in shmem |
+| dk64_dv64 | 2 | medium heads |
+| dk96_dv96 | 4 | medium heads |
+| **dk128_dv128** | **1** | NL=32 per pos beats NL=8×NE=4 |
+| dk192_dv192 | 2 | larger heads |
+| **dk256_dv256** | **1** | gemma4 shape — NE=1 is peer choice |
+
+**Falsification**: At gemma4 head_dim=256, llama.cpp uses NE=1 — the
+SAME pattern hf2q's flash_attn_vec_tq_hb uses. NE=4 would actually
+DEVIATE from peer-tuned shape. Each lane would handle 8× more float4
+elements per cache position with NL=8 lanes — high register pressure,
+likely slower not faster.
+
+iter-150 architectural-gap conclusion was wrong. There is **no NE-axis
+gap** at DK=256.
+
+#### Where the FA-vec-tq-hb gap really lives
+
+USE_DENSE measurement (iter-147) said FA-vec saves 1.4ms vs
+FA-vec-tq-hb at gemma4 sliding=1024 (= ~47µs/call vs 60µs/call =
+~22% kernel time). This 22% gap is NOT NE-axis but **TQ-HB structural
+overhead**:
+1. Per-element codebook lookup (8-bit byte-packed → F32 dequant)
+2. FWHT pre-rotation on Q (kernel-internal when fuse_fwht_pre=1)
+3. FWHT post-rotation undo on output (separate dispatch — ~5µs)
+4. Per-token-per-head F32 norms read
+
+Structural cost of TQ-HB ≈ 30µs/layer × 30 layers = 0.9 ms/token =
+6% of decode. **This is the price of 3.94× KV memory savings**, an
+operator design choice.
+
+#### Walk-phase verdict
+
+Single-kernel optimization at gemma4 production decode is genuinely
+exhausted within current TQ-HB regime:
+- NE=4 port: peer doesn't even do this at DK=256 — no win available
+- FWHT-pre fusion: already landed iter-107
+- FWHT-post fusion: would save ~5µs/layer × 30 = 0.15ms/token (~1%)
+
+The 4.65 ms peer gap at gemma4 is structural — distributed across
+many kernels (FA-vec-tq-hb owns ~10%, the rest is in projs/MLP/
+LM head/norms each ~30% slower than peer). Each kernel saves <0.5ms
+even with maximal optimization. Closing the full gap requires either:
+
+- **Multi-kernel parallel attack**: ~10-20+ iters of incremental
+  shader work, each saving 100-300 µs. Walk-phase exhausted on
+  individual kernels.
+- **Path A spec-decode** (run-phase): 1.6-3.0× lever in one
+  architectural addition (~180 LOC).
+- **Path E USE_DENSE default-flip**: 17.6% in one toggle but
+  loses 3.94× KV memory savings.
+
+#### Walk-phase closure recommendation
+
+Per "no shortcuts" mantra: declare walk-phase **CLOSED for gemma4
+default decode**. Remaining single-kernel optimization opportunities
+are <1% of decode each. Operator pick required to proceed:
+
+1. **Run-phase open**: begin Path A Phase 2 GPU spec-decode body
+   (iter-134..140 scaffold preserved, ready to compose).
+2. **Operator pick on USE_DENSE default**: 17.6% throughput vs
+   precision tradeoff.
+3. **Multi-kernel walk-phase work** at <1%/kernel ROI is below the
+   "test-test-test before changing code" bar.
+
+iter-152+ continues only if operator engages on (1) or (2).
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
