@@ -8596,23 +8596,79 @@ is correct; the *attribution* in iter-250's analysis to "launch +
 barrier + scheduler-gap overhead" was right; my recent re-reading
 that called it "Rust binding overhead" was wrong.  Correction landed.
 
-**Updated ROI for sequential fusion** (iter-250's math, now verified
-mechanism):
-- Each fused pair saves 3.1 µs GPU floor (NOT CPU)
-- 510 excess dispatches × 3.1 µs = 1.58 ms saved
-- New per-token: 12.5 - 1.58 = 10.92 ms = 91.6 tok/s = **0.89× peer**
-- Still < peer's 102.7, since 1.7 ms remains in per-kernel compute
+**Updated ROI for sequential fusion** — iter-219 ALREADY MEASURED at
++0.3% / 30 fusions = **1.5 µs saved per fused pair** (not 3.1 µs).
 
-**Iter-255+ plan** revised:
-1. **Top sequential-fusion candidates**: walk forward_mlx.rs decode
-   and rank pairs by `is_sequential && shared_op_kind`.  Each fused
-   pair = 3.1 µs × 30 layers = 93 µs/token.  Top 5 = ~0.5 ms = ~3.5%.
-2. **Q_sliding mat-vec optimization**: 47.8% → 80% target = 2-3%.
-3. **TQ-HB SDPA microbench at decode shape** (head_dim=256, kv_seq=
-   1024, n_heads=16, n_kv_heads=8) vs hypothetical contiguous-F16 to
-   size the structural floor of TQ-HB vs peer.
-4. **MoE expert sub-bisect**: 2.6 ms is biggest single kernel; needs
-   stride/threadgroup-size sweep at production shape.
+The 3.1 µs/dispatch floor splits into ~1.6 µs launch + ~1.5 µs barrier.
+Fusion eliminates the BARRIER between two ops; the merged kernel
+still has to launch.  iter-220 retired the fusion strategy on this
+basis.
+
+| | Predicted (iter-254 first pass) | Measured (iter-219) |
+|---|---:|---:|
+| Per-pair savings | 3.1 µs | **1.5 µs** |
+| 510 excess dispatches as 255 pairs | 1.58 ms | **0.38 ms** |
+| New decode time | 10.92 ms (91.6 tok/s) | 12.12 ms (82.5 tok/s) |
+| × peer | 0.89× | **0.80×** |
+
+So even *complete* fusion of all 510 excess dispatches caps at 0.80×
+peer — still below peer.  This is consistent with iter-220's
+strategic pivot retiring fusion.
+
+**Iter-255+ plan** revised by iter-219 ROI lesson:
+1. ~~Sequential-fusion ranking~~ — RETIRED.  iter-219 measured 1.5 µs/
+   pair = 0.3%/fusion.  Even complete fusion caps at 0.80× peer.
+2. ~~Q_sliding mat-vec optimization~~ — RETRACTED in iter-255.
+   iter-253's "47.8% peak" was a mismeasurement; fresh sweep shows
+   Q_sliding at 82-86% peak.  Not a lever.
+3. **TQ-HB SDPA microbench at decode shape** vs hypothetical
+   contiguous-F16 — sizes the structural floor of TQ-HB vs peer.
+4. **MoE expert sub-bisect** — 2.6 ms biggest single kernel; needs
+   stride/threadgroup-size sweep at production shape.  **Now primary.**
+
+### iter-255 — RETRACTION: Q_sliding is at 82-86% peak (not 47.8%)
+
+Parameterized n,k sweep around Q_sliding (extended `bench_decode_qmatmul_shapes.rs`)
+falsifies iter-253's 47.8% peak claim.
+
+**Fresh measurement at HEAD** (gemma4 26B-A4B Q5_K_M shapes, BATCH=32):
+
+| Shape | n | k | µs | GB/s | %peak |
+|-------|--:|--:|---:|-----:|------:|
+| Q_sliding         | 4096 | 2816 | 17.6 | 451.8 | **82.7%** |
+| O_sliding         | 2816 | 4096 | 16.1 | 491.3 | 90.0% |
+| sweep_n2816       | 2816 | 2816 | 13.7 | 397.8 | 72.9% |
+| sweep_n3072       | 3072 | 2816 | 14.3 | 416.8 | 76.3% |
+| sweep_n3584       | 3584 | 2816 | 16.0 | 433.8 | 79.5% |
+| **sweep_n4096**   | 4096 | 2816 | 17.3 | 458.5 | **84.0%** |
+| sweep_n4608       | 4608 | 2816 | 19.7 | 452.3 | 82.8% |
+| sweep_n5120       | 5120 | 2816 | 21.4 | 462.8 | 84.8% |
+| sweep_k2048       | 4096 | 2048 | 14.0 | 410.8 | 75.2% |
+| sweep_k2816       | 4096 | 2816 | 16.8 | 473.2 | 86.7% |
+| sweep_k4096       | 4096 | 4096 | 21.3 | 542.2 | 99.3% |
+| sweep_k5120       | 4096 | 5120 | 25.1 | 574.6 | 105.2% |
+
+**Pattern**: efficiency varies along the **k axis** (75% at k=2048 →
+105% at k=5120), with mild dependence on n.  Larger k = more inner
+iterations per TG = better amortization of TG launch overhead.
+
+Q_sliding (k=2816) sits in the modest-k regime at 83-87% peak.
+This is **kernel-internal hardware efficiency**, not a software bug.
+
+**iter-253's 47.8% / 30.4 µs claim is RETRACTED**.  The fresh run
+shows 17.6 µs / 82.7%, ~1.7× faster.  iter-253 likely captured a
+single_sync measurement column (cold per-call with full CB sync
+overhead) rather than batched_per_call (the production-relevant
+amortized number).  ADR-028 §iter-253 retains the row but the
+finding is corrected here.
+
+**Mat-vec is not the lever**.  Average across attention+router shapes
+is **86.7% peak**, near the kernel-internal hardware ceiling.
+
+**Iter-256+ pivot**: focus on MoE experts (2.60 ms / 18% body — iter-
+201).  Run sub-bisect with parameterized expert-count and stride
+sweep using `bench_moe_q_qwen36_shape` infrastructure adapted to
+gemma4 shapes (n=2112 intermediate, expert top-k=8 per token).
 
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
