@@ -906,6 +906,20 @@ pub struct MlxModelWeights {
     /// Layout: `[nkv_heads, capacity, head_dim]` U8 (1 byte per element).
     /// Norms: same layout as 4-bit caches (D=256: 1 norm/pos, D=512: 2/pos).
     pub leg_hb_encoded: Option<Vec<HbKvBuffers>>,
+    /// ADR-028 Phase 10 (iter-347): hybrid K storage, F16 K + TQ-HB-packed V.
+    ///
+    /// Mutually exclusive with `leg_hb_encoded` at allocation time — exactly
+    /// one of the two is `Some(…)` for any given model instance, governed by
+    /// the `HF2Q_HYBRID_KV` env-gate (parsed in `investigation_env.rs`,
+    /// default OFF until Phase 10f parity + 10g coherence gates pass).
+    ///
+    /// Why an `Option` field rather than a wrapping enum: the existing
+    /// SDPA-dispatch site (`forward_decode`, ~line 3567) keys on the variant
+    /// of `leg_hb_encoded` today; making the hybrid path additive (a sibling
+    /// `Option` checked first) keeps the legacy TQ-HB path bit-identical when
+    /// the gate is OFF (regression-safety mantra).
+    #[allow(dead_code)] // Read in Phase 10c K-encode skip + 10e SDPA dispatcher (next iters).
+    pub hybrid_kv: Option<Vec<HybridKvBuffers>>,
     /// Per-instance decode-step counter for the Gate H stderr emit lines.
     ///
     /// Increments on every successful `forward_decode`.  The audit-binary
@@ -1060,6 +1074,64 @@ impl crate::serve::kv_persist::lcp_registry::ByteSized for DenseKvBuffers {
     /// and 5158+. No estimation.
     fn byte_len(&self) -> u64 {
         (self.k.byte_len() + self.v.byte_len()) as u64
+    }
+}
+
+/// ADR-028 Phase 10 (iter-347): hybrid K storage — F16 K alongside TQ-HB-packed V.
+///
+/// Motivation (ADR-028 §iter-346 audit):
+///   * Pure TQ-HB (today's default): 504 MB raw F32 → 128 MB packed (3.94× saving).
+///   * Pure F16 K + F16 V (peer): 504 MB → 252 MB (2× saving).
+///   * Hybrid (F16 K + TQ-HB V): 504 MB → 158 MB (3.19× saving — 81% of TQ-HB).
+///
+/// The structural decode-side gap vs llama.cpp peer (1.81× per-dispatch wall on
+/// our TQ-HB SDPA, formally measured iter-326..342) is owned by the K-side
+/// scalar dequant loop inside `flash_attn_vec_tq_hb`: peer's K is F16 and consumed
+/// by `simdgroup_matrix` matmul, ours is byte-packed and consumed by per-thread
+/// scalar lookup against the codebook. Storing K as F16 (this struct) and using a
+/// new `flash_attn_vec_hybrid_dk256` SDPA kernel (Phase 10d) brings the K-side
+/// throughput up to peer-equivalent simdgroup math while the V-side stays in
+/// 1-byte-per-element TQ-HB packing.
+///
+/// Field layout mirrors the union of `DenseKvBuffers` (K) and `HbKvBuffers` (V) so
+/// existing snapshot / restore / KV-persist code that walks the K and V buffers
+/// can pattern-match by field name without learning a new shape.
+///
+/// Allocation gate: env `HF2Q_HYBRID_KV` (parsed in `investigation_env.rs`).
+/// Default OFF until parity + bench gates pass (Phase 10f/g). When ON, the
+/// per-layer alloc site at `forward_decode` (currently building `HbKvBuffers`)
+/// instead builds `HybridKvBuffers`, the K-encode dispatch is skipped, and the
+/// SDPA dispatcher routes to the hybrid kernel.
+pub struct HybridKvBuffers {
+    /// Dense F16 K cache `[nkv_heads, capacity, head_dim]`. dtype is always
+    /// `mlx_native::DType::F16` for this struct (the whole point — F16 K → peer
+    /// SDPA-equivalent simdgroup matmul). No F32 variant: F32 K would erase the
+    /// memory advantage of the hybrid design (158 MB → 284 MB at gemma4 32K
+    /// context, defeating the purpose of mixing in TQ-HB on V at all).
+    pub k: MlxBuffer,
+    /// Byte-packed V indices `[nkv_heads, capacity, head_dim]` U8 — same layout
+    /// and codec as `HbKvBuffers::v_packed`. The V-encode dispatch
+    /// (`hadamard_quantize_kv_*`) writes here unchanged.
+    pub v_packed: MlxBuffer,
+    /// V per-position norms — same layout as `HbKvBuffers::v_norms`.
+    /// (D=256 → 1/pos, D=512 → 2/pos.)
+    pub v_norms: MlxBuffer,
+    /// Cache capacity in positions (matches `DenseKvBuffers::capacity` and
+    /// `HbKvBuffers::capacity` — populated identically at alloc site).
+    pub capacity: usize,
+    /// True if ring-buffer (sliding) semantics — same as the sibling structs.
+    pub is_sliding: bool,
+    /// Norms per position (1 for D=256, 2 for D=512). Mirrors
+    /// `HbKvBuffers::norms_per_pos`.
+    #[allow(dead_code)]
+    pub norms_per_pos: usize,
+}
+
+impl crate::serve::kv_persist::lcp_registry::ByteSized for HybridKvBuffers {
+    /// Exact byte count: F16 K + U8 V + F32 V-norms. Used by the LcpRegistry
+    /// byte budget the same way `DenseKvBuffers::byte_len` is.
+    fn byte_len(&self) -> u64 {
+        (self.k.byte_len() + self.v_packed.byte_len() + self.v_norms.byte_len()) as u64
     }
 }
 
@@ -1788,6 +1860,10 @@ impl MlxModelWeights {
             // iter-222 (2026-05-01): leg_f_kvs / leg_f_sdpa_tmp shadow-cache
             // fields deleted along with iter-34 dense-on-shadow Leg F branch.
             leg_hb_encoded: None,
+            // ADR-028 Phase 10 (iter-347): hybrid F16-K + TQ-HB-V — Option
+            // sibling, default `None` until lazy-allocated by the env-gated
+            // path in `forward_decode` (Phase 10c).
+            hybrid_kv: None,
             // ADR-007 Gate H release-check counter — increments per
             // forward_decode call, used by the `[HF2Q_NLL]` / `[HF2Q_DECODE_EMIT]`
             // stderr lines (W12 iter-108a blocker #1).

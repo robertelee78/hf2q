@@ -15373,3 +15373,63 @@ The hybrid trade: keep 81% of TQ-HB memory savings + unlock peer-equivalent SDPA
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
 
 No code changes (10a is audit-only).  10b implementation opens iter-347.
+
+## iter-347 — Phase 10b LANDED: `HybridKvBuffers` struct + env-gate scaffold
+
+### Date
+2026-05-10
+
+### Hypothesis (from iter-346 design)
+Adding a sibling `HybridKvBuffers` struct (alongside the existing `DenseKvBuffers` and `HbKvBuffers`) and a corresponding `Option<Vec<HybridKvBuffers>>` field on `MlxModelWeights` is purely additive — the legacy TQ-HB path stays bit-identical when the new `HF2Q_HYBRID_KV` env-gate is off (default).  No regression on coherence or speed; full unit-test suite still passes.
+
+### Result
+**LANDED.**  `cargo test --lib` 3454/0 passing (4 new env-gate tests + 3450 pre-existing).  Build clean (no new warnings beyond the expected dead_code on the field that 10c-e will read).
+
+### Files modified
+
+- `/opt/hf2q/src/serve/forward_mlx.rs`: add `pub struct HybridKvBuffers { pub k: MlxBuffer, pub v_packed: MlxBuffer, pub v_norms: MlxBuffer, pub capacity: usize, pub is_sliding: bool, pub norms_per_pos: usize }` after `DenseKvBuffers`; add `impl ByteSized for HybridKvBuffers`; add `pub hybrid_kv: Option<Vec<HybridKvBuffers>>` field on `MlxModelWeights` (with `#[allow(dead_code)]` until 10c-e wire reads); initialize to `None` in the `MlxModelWeights` constructor at line 1862.
+- `/opt/hf2q/src/debug/investigation_env.rs`: add `pub hybrid_kv: bool` field on `InvestigationEnv`; parse from `HF2Q_HYBRID_KV` via `env_eq_one` (default OFF, opt-in by `=1`); not ack-required (memory-layout selector, not a math skip); add 4 unit tests mirroring the `qwen36_autoreg` pattern (default-OFF, =1-on, other-values-off, no-ack-needed).
+- `/opt/hf2q/Cargo.toml`: bump `mlx-native` dep from `"0.7"` to `"0.8"` (mlx-native released 0.8.0 at commit 2d420f8 prior to this iter; transitive bump required for the build to find the path-dep).
+
+### Why this design (Chesterton's fence)
+
+Two earlier hybrid-K designs were rejected before code:
+
+1. **Wrap into `DenseKvBuffers` with `dtype: F16` + skip V dense-alloc** — would force every existing `DenseKvBuffers` consumer to learn a "V might be missing" invariant.  ~30 call sites (snapshot, restore, KV-persist, LCP registry, decode dispatch).  Rejected on regression-surface grounds.
+
+2. **Enum `KvLayout { TqHb(HbKvBuffers), Hybrid(HybridKvBuffers), Dense(DenseKvBuffers) }`** — would force the SDPA dispatch site at `forward_mlx.rs:3567` to learn a 3-arm match instead of the current 2-arm `Option<HbKvBuffers>` check.  Cleaner long-term but bigger blast radius.  Rejected for now in favor of additive Option-sibling; can revisit when 10c-e are stable.
+
+The chosen design — sibling `Option` field — keeps the legacy path bit-identical when the gate is off, mirrors the existing `dense_kvs` / `dense_kvs_snapshot_for_lcp` pattern (already two `Option<Vec<...>>` siblings on the same struct), and minimizes diff per /loop iter.
+
+### Tests added
+
+- `hybrid_kv_default_when_unset` — unset env → `false`.
+- `hybrid_kv_enabled_by_one` — `=1` → `true`.
+- `hybrid_kv_not_enabled_by_other_values` — `=0`, `=true`, `=yes`, `=hybrid`, `=""` → `false`.
+- `hybrid_kv_does_not_require_unsafe_ack` — `=1` alone (no `HF2Q_UNSAFE_EXPERIMENTS`) → `true`; `unsafe_experiments_acked` stays `false`.
+
+### What 10c will need (unblocked by this iter)
+
+- **K-encode skip path**: at `forward_mlx.rs:2901+`, when `hybrid_kv` is set, the K-encode dispatch (currently `dispatch_hadamard_quantize_kv` with K target) is skipped; instead, the F16 K is written into `hybrid_kv[layer].k` directly via the existing dense KV-write site (`forward_mlx.rs:3370+`).
+- **Lazy alloc**: at `forward_mlx.rs:2421+` (the existing `leg_hb_encoded` lazy-alloc gate), when `INVESTIGATION_ENV.hybrid_kv` is true, allocate `HybridKvBuffers` (F16 K size = `nkv * cap * hd * 2`, V identical to legacy) and stash into `self.hybrid_kv` instead of `leg_hb_encoded`.
+
+### What 10d will need (unblocked but non-trivial)
+
+A new Metal kernel `flash_attn_vec_hybrid_dk256` that:
+- Reads K as `device const half *` (F16) → consumed by `simdgroup_matrix<float, 8, 8>` matmul (peer-equivalent path; ~6.6 µs/dispatch budget).
+- Reads V as `device const uchar *` (TQ-HB packed) + per-position F32 norms → consumed by per-thread codebook lookup (existing TQ-HB path; ~5.3 µs/dispatch on V).
+- Writes scaled+softmax output into the existing SDPA-out buffer.
+
+This is the actual structural work that closes the 1.81× per-dispatch K-side gap.  ~5 /loop iters estimated for kernel + parity + bench.
+
+### Bench
+
+No bench delta this iter — Phase 10b is struct-only.  `HF2Q_HYBRID_KV=1` set without 10c-e wired will fall through to the legacy TQ-HB path (allocation succeeds but is unused; SDPA still reads `leg_hb_encoded`).
+
+Decode at HEAD (legacy default, `HF2Q_HYBRID_KV` unset) unchanged from iter-346 baseline:
+- decode 200-tok: 71.8 tok/s
+- prefill pp3813: 2540 tok/s = 0.85× peer
+
+### Next iter (10c)
+
+Wire the F16-K skip path: when `INVESTIGATION_ENV.hybrid_kv == true`, allocate `HybridKvBuffers` instead of `HbKvBuffers` at the `forward_mlx.rs:2421+` lazy-alloc site, and route the K write at `forward_mlx.rs:3370+` to the F16 K buffer instead of through the TQ-HB encode dispatch.  V stays on its existing TQ-HB encode path.  Allocation + write parity test first, then SDPA dispatcher in 10e.

@@ -329,6 +329,23 @@ pub struct InvestigationEnv {
     ///   `match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() { Ok("4")=>0, Ok("5")=>5, ... _ => 8 }`.
     pub tq_codebook_bits: u32,
 
+    /// `HF2Q_HYBRID_KV` — ADR-028 Phase 10 (iter-347): swap pure TQ-HB K
+    /// for hybrid F16-K + TQ-HB-V at allocation time.
+    ///
+    /// When `1` / `true` / `on`: at lazy KV alloc in `forward_decode`,
+    /// build `HybridKvBuffers` instead of `HbKvBuffers`. The K side stays
+    /// dense F16 (peer-equivalent simdgroup-matmul K throughput); V stays
+    /// 1-byte-per-element TQ-HB packed. Memory cost: 158 MB at gemma4 32K
+    /// vs 128 MB pure TQ-HB (3.19× saving vs 3.94×, preserving 81% of the
+    /// TQ-HB advantage). Requires the Phase 10d `flash_attn_vec_hybrid_dk256`
+    /// kernel, the Phase 10c K-encode skip, and the Phase 10e SDPA dispatcher
+    /// to be wired before producing coherent output.
+    ///
+    /// Default OFF until parity (10f) + coherence (10g) gates pass.
+    /// Opt-out: unset / `=0` / `=false` / `=off` (legacy TQ-HB path).
+    #[allow(dead_code)] // Read by Phase 10c K-encode skip + 10e SDPA dispatcher (next iters).
+    pub hybrid_kv: bool,
+
     // ========================================================================
     // Category 4 — iter-18 S2C sliding-layer-0 first-divergence dump.
     // Gate + run-name for diagnostic decode dumps at layer 0 (hd=256,
@@ -762,6 +779,13 @@ impl InvestigationEnv {
                 Ok("8") | Err(_) => 8u32,
                 Ok(_other) => 8u32,
             },
+
+            // ADR-028 Phase 10 (iter-347): hybrid F16-K + TQ-HB-V gate.
+            // Default OFF — flips on after Phase 10f parity + 10g coherence
+            // pass. Not ack-required: when ON without the kernel/dispatcher
+            // wiring (Phase 10c-e), allocation succeeds but SDPA dispatch
+            // will hard-fail at the first decode token (loud, not silent).
+            hybrid_kv: env_eq_one("HF2Q_HYBRID_KV"),
 
             // iter-18 S2C sliding-layer-0 dump gate + run name.
             dump_sliding_layer_0: matches!(
@@ -1442,6 +1466,56 @@ mod tests {
         // Note: HF2Q_UNSAFE_EXPERIMENTS deliberately not set.
         let env = InvestigationEnv::from_env();
         assert!(env.qwen36_autoreg);
+        assert!(!env.unsafe_experiments_acked);
+    }
+
+    // ── hybrid_kv (ADR-028 Phase 10 / iter-347) ──────────────────────
+
+    #[test]
+    fn hybrid_kv_default_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["HF2Q_HYBRID_KV"]);
+        assert!(
+            !InvestigationEnv::from_env().hybrid_kv,
+            "unset => default false (legacy TQ-HB path until Phase 10f/g pass)"
+        );
+    }
+
+    #[test]
+    fn hybrid_kv_enabled_by_one() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_HYBRID_KV"]);
+        guard.set("HF2Q_HYBRID_KV", "1");
+        assert!(InvestigationEnv::from_env().hybrid_kv);
+    }
+
+    #[test]
+    fn hybrid_kv_not_enabled_by_other_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_HYBRID_KV"]);
+        for bad in &["0", "true", "yes", "hybrid", ""] {
+            guard.set("HF2Q_HYBRID_KV", bad);
+            assert!(
+                !InvestigationEnv::from_env().hybrid_kv,
+                "value {:?} must not enable hybrid_kv",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_kv_does_not_require_unsafe_ack() {
+        // ADR-028 Phase 10: this is a memory-layout selector, not a math
+        // skip. Setting `HF2Q_HYBRID_KV=1` alone MUST take effect — the
+        // SDPA dispatcher (10e) will hard-fail loud-not-silent if the
+        // kernel wiring (10c-d) hasn't landed yet, which is the desired
+        // signal for partial-stack misuse.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_HYBRID_KV", "HF2Q_UNSAFE_EXPERIMENTS"]);
+        guard.set("HF2Q_HYBRID_KV", "1");
+        // Note: HF2Q_UNSAFE_EXPERIMENTS deliberately not set.
+        let env = InvestigationEnv::from_env();
+        assert!(env.hybrid_kv);
         assert!(!env.unsafe_experiments_acked);
     }
 
