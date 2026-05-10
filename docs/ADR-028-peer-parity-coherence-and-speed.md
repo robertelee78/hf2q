@@ -6581,6 +6581,67 @@ site under `HF2Q_FUSED_END_OF_LAYER=1` env flag (default-OFF).  Run
 5-run statistical bench.  If matches bisect prediction +2.7%, ship
 default-OFF for soak then plan default-flip operator-decision.
 
+### iter-219 — fused kernel WIRED & SHIPPED, but +0.3% (not +2.7%)
+
+hf2q commit `f907739`.  HF2Q_FUSED_END_OF_LAYER=1 env flag wired
+end-to-end.  5-run statistical bench:
+
+| Config | Median tok/s |
+|--------|-------------:|
+| Default | 68.8 |
+| HF2Q_FUSED_END_OF_LAYER=1 | **69.0** |
+| **Δ** | **+0.3%** |
+
+Coherence: "2 + 2 = 4" output identical.
+Parity test (iter-218): PASSES at rel_error < 1e-5.
+Dispatches: -30 (1 saved per layer × 30).
+
+**🚨 CRITICAL LESSON: bisect prediction was +2.7%; actual +0.3%.**
+
+**Why bisect ≠ fusion savings**:
+- SKIP bisect measures the dispatch's FULL GPU time (kernel work +
+  launch overhead).  iter-208 measured 0.34 ms saved by skipping the
+  end-of-layer FINAL dispatch.
+- FUSION only eliminates the **launch overhead** (~5-10 µs/dispatch).
+  The kernel **work** still runs:
+  - Phase 1: `sum_sq(moe_accum)` reduce (was inside dispatch a)
+  - Phase 2: `mlp_down = attn_out + norm(moe_accum, w2)` (was dispatch a)
+  - Phase 3: `hidden = (residual + norm(mlp_down, w3)) * scalar` (was dispatch b)
+  - All 3 phases run regardless of fusion.
+- Net savings = launch overhead only = ~0.03-0.05 ms per fusion.
+
+**This invalidates ALL fusion ROI predictions**:
+
+| Fusion candidate | Bisect (skip) | Fusion ROI (actual or predicted) |
+|------------------|--------------:|--------------------------------:|
+| swiglu (iter-202) | 0.14 ms | ~0.03 ms (+0.2%) |
+| post-attn (iter-205) | 0.55 ms | ~0.03 ms (+0.2%) |
+| **end-of-layer (iter-208/219)** | **0.34 ms** | **0.04 ms = +0.3% MEASURED** |
+| O-proj+post-attn (iter-211) | 0.70 ms | ~0.05 ms (+0.4%) |
+| QKV 3-way (iter-210) | 1.12 ms | ~0.05 ms (+0.4%) |
+
+**Realistic compounded fusion total**: ~+1% (not +6-8% as iter-212 estimated).
+Multi-day kernel work for ~+1% = **poor ROI**.
+
+**Lesson permanently encoded**: SKIP bisect ≠ fusion savings.  SKIP
+measures total kernel cost; fusion only saves the *launch overhead*
+component.  The compute work survives regardless.
+
+**Updated decision space**:
+- Fusion levers: each ~+0.3-0.5%, total ~+1%.  Multi-week for marginal gain.
+- Per-dispatch hardware launch optimization: bounded by Apple Metal
+  floor of 5-10 µs (per iter-209 analysis).
+- **Path E+F+G operator-flip remains the highest-ROI single move
+  available** (+6.4% over current default in 1 line).
+
+**Code shipped**: HF2Q_FUSED_END_OF_LAYER=1 opt-in flag, kernel-correct,
+parity-validated.  Available for future re-evaluation if hardware/kernel
+landscape changes.
+
+iter-220+ plan: shift away from fusion strategy.  Either accept current
+floor OR pivot to fundamentally different optimization angle (kernel
+implementation efficiency, e.g. simdgroup_sum to replace tree-reduce).
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
