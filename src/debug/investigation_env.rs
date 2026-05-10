@@ -140,6 +140,15 @@ pub struct InvestigationEnv {
     /// (moe_accum stale).
     pub skip_weighted_sum: bool,
 
+    /// `HF2Q_SKIP_END_OF_LAYER=1` — skip the 2 fused_norm_add
+    /// dispatches at end-of-layer:
+    ///   (a) post-FF norm 2 + combine MLP+MoE (writes mlp_down)
+    ///   (b) end-of-layer residual + scalar mul (writes hidden)
+    /// Both sequential, both use fused_norm_add (same kernel as the
+    /// 0.55 ms post-attn-norm-add measured in iter-205).
+    /// ADR-028 iter-207.  Produces garbage (hidden stale).
+    pub skip_end_of_layer: bool,
+
     // ========================================================================
     // Category 4 — warn-only (ineffective but safe). No gate; raw intent.
     // ========================================================================
@@ -589,6 +598,7 @@ struct RawAckIntent {
     skip_head_norm_rope: bool,
     skip_post_attn_norm: bool,
     skip_weighted_sum: bool,
+    skip_end_of_layer: bool,
     lmhead_rerank_disabled: bool,
     chunk_scan_prefill: bool,
 }
@@ -609,6 +619,7 @@ impl InvestigationEnv {
             skip_head_norm_rope: env_eq_one("HF2Q_SKIP_HEAD_NORM_ROPE"),
             skip_post_attn_norm: env_eq_one("HF2Q_SKIP_POST_ATTN_NORM"),
             skip_weighted_sum: env_eq_one("HF2Q_SKIP_WEIGHTED_SUM"),
+            skip_end_of_layer: env_eq_one("HF2Q_SKIP_END_OF_LAYER"),
             lmhead_rerank_disabled: matches!(
                 env::var("HF2Q_LMHEAD_RERANK").as_deref(),
                 Ok("0")
@@ -629,6 +640,7 @@ impl InvestigationEnv {
             skip_head_norm_rope: raw.skip_head_norm_rope && ack,
             skip_post_attn_norm: raw.skip_post_attn_norm && ack,
             skip_weighted_sum: raw.skip_weighted_sum && ack,
+            skip_end_of_layer: raw.skip_end_of_layer && ack,
             lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
             chunk_scan_prefill: raw.chunk_scan_prefill && ack,
 
