@@ -13380,3 +13380,34 @@ existing coherence or correctness invariant.
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
 
 No code changes — cross-model verification + housekeeping iter.
+
+
+---
+
+## iter-325 — future-session continuity memory shipped
+
+Wrote
+`/Users/robert/.claude/projects/-opt-hf2q/memory/project_adr028_iter308_324_thread_synthesis_2026_05_10.md`
+following the iter-277 pattern.  Future sessions can pick up the
+iter-308→324 thread without re-discovering:
+
+- Locked-in speed numbers (gemma4 0.679→0.740× peer, qwen3.6 1.342→1.373×)
+- 5-flag TQ-HB-intact safe-flip stack
+- Three falsified historical claims (FUSE_FWHT_PRE, FUSED_TRIPLE_NORM, "72 extra mat-vecs")
+- The STACKING orthogonality lesson (iter-318 breakthrough)
+- The sustained-regime amplification finding (iter-322 +9.6%)
+- The Path E ROI shrinks at production regime (iter-323 +1.9% only)
+- Cross-model qwen3.6 V2 finding (iter-320)
+
+Also updated
+`/Users/robert/.claude/projects/-opt-hf2q/memory/MEMORY.md` index to
+point at the new synthesis (replacing the now-superseded iter-308
+smoking-gun memory entry).
+
+### Files modified
+
+- `/Users/robert/.claude/projects/-opt-hf2q/memory/project_adr028_iter308_324_thread_synthesis_2026_05_10.md` (NEW)
+- `/Users/robert/.claude/projects/-opt-hf2q/memory/MEMORY.md` (index updated)
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section
+
+No code changes — pure continuity hygiene.
