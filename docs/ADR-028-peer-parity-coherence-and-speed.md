@@ -6335,6 +6335,57 @@ launch).  Cannot directly bisect without writing valid stub IDs.
 iter-214 plan: write SKIP_ROUTING_WITH_VALID_IDS that fills expert_ids
 with a spread valid pattern (e.g., 0..top_k) before skipping kernel.
 
+### iter-214 — BISECT V-norm = ~0 ms (cost-class hypothesis fully validated)
+
+Shipped HF2Q_SKIP_V_NORM.  Skips the per-head V-norm dispatch per layer.
+
+| Config | BODY GPU | dispatches |
+|--------|---------:|-----------:|
+| Default | 12.29 ms | 956 |
+| SKIP_V_NORM | 12.39 ms | 926 (-30) |
+| **Δ** | **~0 ms (within noise)** | -30 |
+
+V-norm = concurrent free dispatch.  Apple Metal schedules it in
+parallel with attention prep work.
+
+**Cost-class hypothesis FULLY VALIDATED across 6 bisects**:
+
+| Op | Type | Cost |
+|----|------|-----:|
+| swiglu (iter-202) | concurrent | 0.14 ms |
+| head_norm_rope (iter-204) | concurrent | 0.11 ms |
+| weighted_sum (iter-206) | sequential-tiny | ~0 |
+| **V-norm (iter-214)** | **concurrent** | **~0** |
+| post-attn fused_norm_add (iter-205) | sequential-substantial | 0.55 ms |
+| end-of-layer FINAL (iter-208) | sequential-substantial | 0.34 ms |
+
+**3-rule classification**:
+- CONCURRENT (parallel scheduling) → free
+- SEQUENTIAL + TINY work → free
+- SEQUENTIAL + SUBSTANTIAL work → real cost
+
+**Final body cost map** (12.5 ms, ~96% bisect coverage):
+
+| Component | ms | % body | Type |
+|-----------|---:|-------:|------|
+| MoE experts | 2.60 | 21% | seq+substantial |
+| TQ-HB SDPA | 1.50 | 12% | seq+substantial |
+| Dense MLP | 1.14 | 9% | seq+substantial |
+| Attn QKV (3 concurrent) | 1.12 | 9% | seq (3-way) |
+| fused_norm_add chain (3) | 1.09 | 9% | seq+substantial |
+| O-proj | 0.70 | 5.6% | seq+substantial |
+| Other (mostly concurrent) | ~4.35 | 35% | mixed |
+
+Sum of seq+substantial: ~8.15 ms = 65% of body.  Theoretical lower
+bound if perfect fusion: ~7.5 ms (per iter-203 stacked-skip floor).
+
+**iter-215+ plan**: bisect coverage exhausted for sequential ops.
+Remaining "Other" 4.35 ms is long tail of small concurrent dispatches
+that aren't individually attackable.  Options:
+- (A) Build fusion kernels (multi-day each, 3 candidates at +2.5%)
+- (B) Pivot to qwen3.6 cross-pollination (multi-week refactor)
+- (C) Accept current floor, ship Path E+F+G operator-flip path
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
