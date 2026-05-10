@@ -1733,7 +1733,20 @@ impl MlxModelWeights {
                     &self.activations.norm_params, 1, hs as u32,
                 ).map_err(|e| anyhow::anyhow!("prefill final norm T{tok_i}: {e}"))?;
 
-                if let Some(ref q8) = self.lm_head_q8 {
+                // ADR-028 iter-188: prefer Q6_K-native lm_head (HF2Q_LMHEAD_Q6K=1).
+                if let Some(ref q6k) = self.lm_head_q6k {
+                    s.barrier_between(
+                        &[&self.activations.norm_out, &q6k.buffer],
+                        &[&self.activations.logits],
+                    );
+                    super::forward_mlx::dispatch_qmatmul(
+                        &mut s, reg, dev,
+                        &self.activations.norm_out,
+                        q6k,
+                        &mut self.activations.logits,
+                        1,
+                    ).map_err(|e| anyhow::anyhow!("prefill lm_head Q6_K T{tok_i}: {e}"))?;
+                } else if let Some(ref q8) = self.lm_head_q8 {
                     s.barrier_between(
                         &[&self.activations.norm_out, &q8.buffer],
                         &[&self.activations.logits],

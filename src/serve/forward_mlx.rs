@@ -747,6 +747,14 @@ pub struct MlxModelWeights {
     /// When present and the env var is still set at decode time, used instead
     /// of lm_head_f16 via dispatch_qmatmul. Halves weight memory traffic vs F16.
     pub lm_head_q8: Option<MlxQWeight>,
+    /// Optional Q6_K-native lm_head (gated on HF2Q_LMHEAD_Q6K=1 at load).
+    /// ADR-028 iter-188: gemma4 ships token_embd.weight as Q6_K [2816, 262144]
+    /// = 605 MB; current Q8_0 re-quant path stores 784 MB.  Loading the
+    /// on-disk Q6_K storage directly saves ~0.33 ms/token in lm_head
+    /// (= ~2% gemma4 throughput).  Embedding lookup at input still uses
+    /// the F32 `embed_weight`, so this is purely additive at load.
+    /// Preferred over `lm_head_q8` when both are present.
+    pub lm_head_q6k: Option<MlxQWeight>,
     pub hidden_size: usize,
     pub vocab_size: usize,
     pub num_attention_heads: usize,
@@ -1228,20 +1236,41 @@ impl MlxModelWeights {
         // it is part of the supported user-facing product surface.
         let q8_env = std::env::var("HF2Q_LMHEAD_Q8").ok();
         let compare_mode = INVESTIGATION_ENV.lmhead_compare;
-        let use_q8 = match q8_env.as_deref() {
-            Some("1") => true,
-            Some("0") => false,
-            _ => {
-                // Auto: Q8 when F16 weight would exceed 256 MB and the
-                // shape is Q8-compatible.
-                lm_head_f16_bytes > 256 * 1024 * 1024 && cfg.hidden_size % 32 == 0
+
+        // ADR-028 iter-188: HF2Q_LMHEAD_Q6K=1 — load token_embd.weight as
+        // native on-disk Q6_K (no F32→Q8 re-quant).  Saves 0.33 ms/token
+        // in lm_head dispatch on gemma4 (~2% throughput).  When set,
+        // disables the Q8_0 path.  Auto-detected only when explicitly
+        // requested — not in auto-mode (Q8_0 path stays default).
+        let q6k_env = std::env::var("HF2Q_LMHEAD_Q6K").ok();
+        let use_q6k = matches!(q6k_env.as_deref(), Some("1"))
+            && {
+                // Verify the on-disk tensor is actually Q6_K (gemma4 is;
+                // qwen3.6 stores it as Q5_K).  If qtype mismatch, skip
+                // gracefully and fall through to Q8_0 / F16 auto-pick.
+                gguf.tensor_info("token_embd.weight")
+                    .map(|t| t.ggml_type == mlx_native::GgmlType::Q6_K)
+                    .unwrap_or(false)
+            };
+
+        let use_q8 = if use_q6k {
+            false
+        } else {
+            match q8_env.as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => {
+                    // Auto: Q8 when F16 weight would exceed 256 MB and the
+                    // shape is Q8-compatible.
+                    lm_head_f16_bytes > 256 * 1024 * 1024 && cfg.hidden_size % 32 == 0
+                }
             }
         };
 
         // Decide which buffers to allocate. Compare mode always keeps F16
         // (needed as the oracle for A/B), and Q8 if requested.
         let need_q8 = use_q8;
-        let need_f16 = !use_q8 || compare_mode;
+        let need_f16 = !use_q8 && !use_q6k || compare_mode;
         if use_q8 && cfg.hidden_size % 32 != 0 {
             anyhow::bail!(
                 "HF2Q_LMHEAD_Q8=1 requires hidden_size % 32 == 0 (got {})",
@@ -1338,6 +1367,21 @@ impl MlxModelWeights {
                 },
                 affine: None,
             })
+        } else {
+            None
+        };
+
+        // ADR-028 iter-188 — load token_embd.weight as Q6_K natively (no
+        // F32→Q8_0 re-quant).  Same source tensor as `embed_weight` but
+        // loaded directly from the GGUF Q6_K storage.  Used for lm_head
+        // dispatch via dispatch_qmatmul (Q6_K mat-vec kernel).
+        let lm_head_q6k: Option<MlxQWeight> = if use_q6k {
+            tracing::info!(
+                "Loading lm_head Q6_K natively (HF2Q_LMHEAD_Q6K=1, save \
+                 ~179 MB vs Q8_0)"
+            );
+            Some(load_gguf_qweight(gguf, "token_embd.weight", mlx_device)
+                .map_err(|e| anyhow::anyhow!("lm_head_q6k native load: {e}"))?)
         } else {
             None
         };
@@ -1668,6 +1712,7 @@ impl MlxModelWeights {
             final_norm,
             lm_head_f16,
             lm_head_q8,
+            lm_head_q6k,
             hidden_size: cfg.hidden_size,
             vocab_size: cfg.vocab_size,
             num_attention_heads: cfg.num_attention_heads,
@@ -4126,9 +4171,23 @@ impl MlxModelWeights {
                 s = exec.begin().map_err(|e| anyhow::anyhow!("dump boundary re-begin: {e}"))?;
             }
 
-            // GPU lm_head: whichever weight buffer was chosen at load time
-            // (Q8_0 auto-enabled for large vocab × hidden models, F16 otherwise).
-            if let Some(ref q8) = self.lm_head_q8 {
+            // GPU lm_head: prefer Q6_K-native (HF2Q_LMHEAD_Q6K=1, ADR-028
+            // iter-188), then Q8_0 (HF2Q_LMHEAD_Q8 auto for large vocab),
+            // then F16 dense.
+            if let Some(ref q6k) = self.lm_head_q6k {
+                s.barrier_between(
+                    &[&self.activations.norm_out, &q6k.buffer],
+                    &[&self.activations.logits],
+                );
+                dispatch_qmatmul(
+                    &mut s, reg, dev,
+                    &self.activations.norm_out,
+                    q6k,
+                    &mut self.activations.logits,
+                    1,
+                )?;
+                total_dispatches += 1;
+            } else if let Some(ref q8) = self.lm_head_q8 {
                 s.barrier_between(
                     &[&self.activations.norm_out, &q8.buffer],
                     &[&self.activations.logits],
@@ -4268,7 +4327,10 @@ impl MlxModelWeights {
         //
         // Rerank is skipped when lm_head is already F16 (no coarse noise to
         // correct) or when HF2Q_LMHEAD_RERANK=0.
-        let rerank_active = self.lm_head_q8.is_some()
+        // ADR-028 iter-188: Q6_K-direct lm_head also has quantization noise
+        // and benefits from rerank against the F16 oracle (when in compare
+        // mode).  Rerank fires for any quantized lm_head path.
+        let rerank_active = (self.lm_head_q8.is_some() || self.lm_head_q6k.is_some())
             && !INVESTIGATION_ENV.lmhead_rerank_disabled;
         let token_id: u32 = if rerank_active {
             // CPU candidate selection via threshold scan over the full Q8
