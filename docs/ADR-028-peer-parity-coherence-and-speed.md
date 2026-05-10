@@ -4100,6 +4100,94 @@ Path E + F sequence vs continued multi-kernel walk.
 
 This is multi-iter (~3-5 iters). Iter-165 starts the kernel skeleton.
 
+### iter-165: Path F is ALREADY-IMPLEMENTED — measured gains LIVE
+
+#### Discovery
+
+Re-reading `mlx-native/src/shaders/flash_attn_vec.metal:333+`:
+
+```
+template [[host_name("flash_attn_vec_f16kv_dk256")]]
+kernel flash_attn_vec_f16kv_t flash_attn_vec_impl<256, 256, half>;
+
+template [[host_name("flash_attn_vec_f16kv_dk512")]]
+kernel flash_attn_vec_f16kv_t flash_attn_vec_impl<512, 512, half>;
+```
+
+Plus `kv_cache_copy_batch_f32_to_f16_kv_dual` shader, dispatcher,
+and registry registration ALL exist (Wave P4.11 / Phase 4a). And
+hf2q has full plumbing:
+- `DenseKvBuffers.dtype: mlx_native::DType` field
+  (`forward_mlx.rs:994`)
+- `INVESTIGATION_ENV.f16_kv` (ack-required, classified
+  "known-worse output" per ADR-009 in `investigation_env.rs:57`)
+- Decode write-side dispatch path: `if kv_is_f16` branch at
+  `forward_mlx.rs:3239+` calling `_to_f16_kv_dual`
+- Read-side: F16 FA-vec kernel selected when `dtype == F16`
+
+**Path F is fully wired.** Just env-gated behind
+`HF2Q_F16_KV=1 HF2Q_UNSAFE_EXPERIMENTS=1`.
+
+#### Measured live (this iter, fresh bench)
+
+| Path | tok/s | vs default | vs peer (103.13) |
+|------|---:|---:|---:|
+| Default (TQ-HB) | 62.5 | 1.000× | 0.606× |
+| USE_DENSE=1 | 70.9 | 1.134× | 0.687× |
+| **USE_DENSE=1 + F16_KV=1** | **72.3** | **1.157×** | **0.701×** |
+| llama.cpp peer | 103.13 | 1.650× | 1.000× |
+
+**+15.7% over default, +2.0% over USE_DENSE alone.** F16 KV adds
+incremental win on top of USE_DENSE.
+
+#### Coherence A/B (this iter)
+
+Prompt: "What is the capital of France? Answer in one word."
+- Default → `Paris<turn|>`
+- USE_DENSE+F16_KV → `Paris<turn|>` ✓ identical
+
+Prompt: "Hello, my name is" / max-tok 256
+- Both produce coherent multi-paragraph responses with same general
+  structure (essay-style intro + section headers + lists). Token
+  IDs diverge by ~50% on long generations (precision tradeoff).
+
+**ADR-009 "known-worse output" claim warrants re-read** — the
+flag is ack-required because it's been classified as risky, but
+short-answer semantic preservation looks fine on this bench.
+
+#### Memory at gemma4 26B-A4B sliding=1024
+
+| Mode | per-slot KV |
+|------|---:|
+| TQ-HB (default) | 191 MiB |
+| F32 dense (USE_DENSE) | 502 MiB |
+| **F16 dense (USE_DENSE+F16_KV)** | **251 MiB** |
+
+USE_DENSE+F16_KV is mid-tier: 1.31× TQ-HB memory, but +15.7% speed.
+
+#### Operator decision restated
+
+Three viable production paths (was three; now four):
+
+(a) Path E only — default-flip USE_DENSE=1
+   - 70.9 tok/s, 0.687× peer, 502 MiB/slot
+
+(b) **Path E+F** — default-flip USE_DENSE=1 + F16_KV=1
+   - 72.3 tok/s, 0.701× peer, 251 MiB/slot
+   - Mid-memory between TQ-HB and F32-dense
+   - F16 precision tradeoff vs F32 (measured short-answer
+     preservation; long-context drift to be A/B'd)
+
+(c) Continue multi-kernel walk
+   - 10-20 iters, sub-100µs/iter, multi-week
+
+(d) Spec-decode for qwen36 (orthogonal lever, doesn't help gemma4)
+
+iter-166 walk-phase target: re-read ADR-009 §F16-KV section to
+understand what "known-worse output" specifically means; if the
+referenced regression was measured at long context with strict
+byte-comparison, surface to operator with quality A/B.
+
 #### Standing decision — Three closure paths still apply
 
 Independent of regression: gemma4's structural gap to llama.cpp
