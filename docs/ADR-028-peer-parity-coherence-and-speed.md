@@ -6435,6 +6435,78 @@ iter-216+ plan: shift mode from BISECT → BUILD.  Either tackle the
 or pivot to broader architectural work.  Bisect-driven cost map is
 complete and validated.
 
+### iter-216 — Final 5-run statistical verification + session summary
+
+**Final 5-run statistical median** (gemma4, 200-tok long-form):
+
+| Stack | tok/s | std-dev | vs peer 102.7 |
+|-------|------:|--------:|--------------:|
+| Pre-session default (iter-179) | 62.5 | — | 0.609× |
+| **Current default** (iter-197 shipped) | **68.8** | 0.2 | **0.670×** |
+| Path G alone | 70.1 | — | 0.683× |
+| Path E alone | 71.0 | — | 0.691× |
+| Path E+G | 72.4 | — | 0.705× |
+| **Path E+F+G** (best opt-in) | **73.2** | 0.2 | **0.713×** |
+| llama.cpp peer | 102.7 | 0.1 | 1.000× |
+
+**Default-path session improvement**: +6.3 tok/s = **+10.1%
+byte-identical**, no env flag, no precision change.
+
+**Best opt-in (Path E+F+G)**: +10.7 tok/s over pre-session = **+17.1%**.
+
+## Session shipped optimizations (iter-179..215, 37 iterations)
+
+**Default-path** (always-on):
+- iter-195 mlx-native `2225d9c`: vectorize dequant_hb_float4 (+2.08%)
+- iter-197 mlx-native `7c6f58f`: function-constant cbits (+8.5%)
+- Cumulative: **+10.1% byte-identical** (5-run statistical)
+
+**Opt-in flags** (operator-controlled):
+- iter-188 hf2q `11238b0`: `HF2Q_LMHEAD_Q6K=1` (+1.76%, no precision change)
+- Pre-existing: Path E (`HF2Q_USE_DENSE=1`), Path F (`HF2Q_F16_KV=1`)
+
+**Diagnostic flags** (15 SKIP_* shipped, 14 valid + 1 invalidated):
+- HF2Q_SKIP_TQ_ENCODE / HF2Q_SKIP_TQ_SDPA (pre-existing)
+- HF2Q_SKIP_DENSE_MLP / HF2Q_SKIP_MOE_EXPERTS / HF2Q_SKIP_MOE_SWIGLU
+- HF2Q_SKIP_HEAD_NORM_ROPE / HF2Q_SKIP_POST_ATTN_NORM
+- HF2Q_SKIP_END_OF_LAYER / HF2Q_SKIP_END_OF_LAYER_FINAL
+- HF2Q_SKIP_WEIGHTED_SUM / HF2Q_SKIP_ATTN_QKV / HF2Q_SKIP_O_PROJ
+- HF2Q_SKIP_V_NORM
+- HF2Q_SKIP_ROUTING (invalidated, kept for reference)
+- HF2Q_FUSED_TRIPLE_NORM (iter-186, kernel-correct, decode-regression)
+
+**Bisect-driven discoveries**:
+- TQ-HB SDPA dequant = 19% body (smoking gun, iter-191)
+- cbits branch = 8.5% (was guessed 0.5-1%, iter-196 BISECT)
+- Cost-class hypothesis: concurrent ops free, sequential+substantial costs
+- 8 falsifications saved multi-day misallocations
+- Final body GPU floor decomposed to 96% coverage
+
+## Remaining path forward
+
+**Single-iter levers**: exhausted.  All concurrent ops free (validated
+across 6 bisects).
+
+**Multi-day kernel work** (3 fusion candidates, each ~+2.5%):
+1. O-proj + post-attn-norm-add fusion (Q5_K matvec-with-residual-norm)
+2. Post-FF norm 2 + end-of-layer FINAL fusion (nested fused_norm_add)
+3. Q+K+V 3-way mat-vec fusion
+
+Compounding all 3: ~+6-8% additional default-path throughput.
+
+**Multi-week architectural work**:
+- qwen3.6 cross-pollination (arena patterns, LayerEncoder)
+- ggml-style graph fusion infrastructure
+- Architecture-aware kernel pipeline reordering
+
+**Operator decision space (data-complete)**:
+| Path | tok/s | vs peer | Effort |
+|------|------:|--------:|--------|
+| Status quo (current default) | 68.8 | 0.670× | none |
+| Approve Path E+F+G default-flip | 73.2 | 0.713× | 1 line |
+| Build 3 fusion kernels | ~73-75 | ~0.71-0.73× | multi-week |
+| Architectural rewrite | ~80+ | ~0.78×+ | multi-month |
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
