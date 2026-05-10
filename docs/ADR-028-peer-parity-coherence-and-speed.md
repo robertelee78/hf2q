@@ -10975,3 +10975,117 @@ patterns automatically.
 
 No code changes this iter.  Next iter wires + measures.
 
+
+---
+
+## iter-287 — fuse() wire-up REJECTED (Chesterton's fence #2 this thread)
+
+### Hypothesis-test on iter-286 plan
+
+**iter-286 hypothesis**: wire `ComputeGraph::fuse()` between graph capture
+and execute in `forward_decode`, measure dispatch-count + tok/s deltas.
+
+**Result before any code change**: hypothesis is INVALID at the API
+boundary level.
+
+### Read fuse() impl carefully (mlx-native/src/graph.rs:329-518)
+
+`fuse()` operates on `self.nodes: Vec<CapturedNode>` populated by
+`encoder.start_capture()` mode (encoder.rs:775-789).  In capture mode,
+every `encode*` call appends a `CapturedNode::Dispatch { ... }` instead
+of submitting to Metal directly.  fuse() then walks the nodes,
+identifies adjacent (RmsNorm → Barrier → ElemMul) sequences with
+matching buffer pointers, replaces them with one fused dispatch, and
+the final replay encodes the optimized list.
+
+### Read production decode flow (forward_mlx.rs:2467+)
+
+hf2q's `forward_decode` for gemma4 uses `GraphSession::begin()` /
+`finish()` (lines 2562, 2786, 2869, 3006, 3033, 3046, 3081, 3090) —
+**direct-dispatch mode**, NOT capture mode.  Each `s.rms_norm(...)`,
+`dispatch_qmatmul`, `s.barrier_between(...)` submits to Metal
+immediately.
+
+Wiring fuse() requires:
+1. Switch GraphSession.begin() to capture mode
+2. After all dispatches recorded, `take_capture()` → ComputeGraph
+3. Run `fuse()` on the captured graph
+4. Replay via `encode_sequential()` or equivalent
+5. Then commit_and_wait
+
+This is a multi-day production-path rearchitecture, not a simple
+wire-up.
+
+### Why this isn't worth the rearchitecture (per prior measurements)
+
+The 3-norm B8 group in gemma4 forward (forward_mlx.rs:3906-3934) is
+explicitly labeled `[3 CONCURRENT]`.  iter-186 fused exactly that
+group: `dispatch_fused_post_attn_triple_norm_f32` was wired and
+measured **REGRESSED -1.0% on decode**.
+
+iter-219 measured the only confirmed sequential fusion site
+(end-of-layer norm + add) at +0.3% wired.
+
+iter-220 strategic pivot: "fusion retired, session conclusion".
+
+`fuse()` automated would just re-litigate iter-186 across more sites
+that are MORE likely to regress (the concurrent ones).  Even if all
+sequential fusions stacked optimally, the iter-219 +0.3% × ~5 sites
+ceiling is ~+1.5% — not the path to 0.69× → 1.0× peer.
+
+### Why iter-284's "38% dispatch count gap" doesn't fall to fusion
+
+iter-285 already addressed the math: per-dispatch average µs assumes
+SERIAL cost.  Concurrent dispatches in hf2q's B8/B9/B10/B11 groups
+pay launch overhead in PARALLEL — eliminating one of N concurrent
+dispatches saves 0-5 µs incremental, not 15 µs.
+
+llama.cpp ALSO can't fuse the concurrent ops without losing
+parallelism.  Its `kernel_bin_fuse_*_nf=7` style fuses *sequential*
+chains where the data dependencies allow.  Per the gemma4.cpp dual-FFN
+pattern, these chains exist — but most of hf2q's equivalent work is
+already in fused kernels (`fused_norm_add_*`, `fused_head_norm_rope`,
+`fused_moe_routing`, `fused_gelu_mul`, etc.).
+
+### What the actual remaining gap is (per prior bisects)
+
+| Component | iter | Measured cost | Status |
+|-----------|------|--------------:|--------|
+| MoE experts | 201 | 2.60 ms | peak-saturated kernels (iter-256) |
+| Attn QKV | 210 | 1.12 ms | optimized (iter-197 cbits) |
+| TQ-HB SDPA | 191 | 2.60 ms | operator-mandated, not removable |
+| O-proj | 211 | 0.70 ms | sequential single qmatmul |
+| Dense MLP | 200 | 1.14 ms | small lever |
+| Norms (all) | 205-208 | ~1.09 ms total | partially fused, +0.3-2.7% remaining |
+| Irreducible floor | 215 | 4.85 ms | fully optimized phase |
+
+**Total bisect-explained: ~14 ms ≈ measured.**  The cost map is
+*complete*.  No "hidden gap" that fusion or graph optimization will
+reveal.
+
+### Updated path forward
+
+Per the bisect-complete picture:
+- TQ-HB SDPA: operator policy locked (3.94× memory savings)
+- Per-kernel work: peak-saturated (iter-256 measurements)
+- Fusion: ROI ~+1-2% across all remaining sites
+- Per-dispatch launch floor: 9-18 µs measured vs 0.9 µs theoretical
+  (iter-209) — **this is the 10-20× headroom region**
+
+The launch-floor problem is the only un-attacked lever with significant
+headroom.  But it's a deep Metal-encoder-engine optimization, not a
+fusion gimmick.
+
+**Operator-aligned conclusion**: the gemma4 APEX 0.69× peer is at the
+reachable floor of the current architecture without (a) DFlash spec-decode
+or (b) per-dispatch launch overhead optimization.  Both are operator-
+decision-gated multi-week work per iter-227 prior conclusion.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes this iter — second Chesterton's-fence rejection in this
+thread (iter-285 was the first).  Both rejections were correct: prior
+measured iters governed the decision.
+
