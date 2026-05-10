@@ -5854,6 +5854,49 @@ different optimization targets.  The +6% guessed lever was actually
 iter-203 plan: bisect KV cache copy or attention norms (next biggest
 candidates in the 5.46 ms "other" bucket).
 
+### iter-203 — additivity bisect: residual scaffolding floor = 7.5 ms
+
+Stacked all 3 SKIP_* flags simultaneously to test additivity of
+component costs (operator's "code+test==truth"):
+
+| Config | BODY GPU | dispatches | Δ vs default |
+|--------|---------:|-----------:|-------------:|
+| Default | 12.45 ms | 956 | — |
+| +SKIP TQ_SDPA | 10.90 ms | 836 | 1.55 |
+| +SKIP_DENSE_MLP | 9.83 ms | 716 | 2.62 |
+| **+SKIP_MOE_EXPERTS (all 3)** | **7.50 ms** | 626 | **4.95** |
+
+Sum of individual savings: 1.50 + 1.14 + 2.60 = 5.24 ms expected if
+additive.  Actual: 4.95 ms.  **Slight under-additivity = 0.29 ms.**
+The 0.29 ms gap is GPU-side overlap (when one component runs, others
+partly run in parallel; skipping one doesn't fully recover its cost
+because the others were already happening concurrently).
+
+**Big finding**: with the 3 LARGEST components SKIPPED, body still
+runs **7.50 ms** of work.  That's the "scaffolding floor" of the
+gemma4 decode kernel pipeline.
+
+**Decomposition of 7.50 ms scaffolding**:
+- Attention QKVO matmul (Q5_K mat-vec × 4): ~1.85 ms (iter-180 batched)
+- Norms + RoPE + KV-copy + routing scaffold: **~5.65 ms** (188 µs/layer
+  × 30 layers)
+
+The 5.65 ms is **~330 dispatches** of small kernels (~15-20 µs each
+amortized).  No single kernel dominates; no obvious fusion target.
+
+**Strategic implication**: gemma4 has hit a "death by a thousand cuts"
+floor.  Further default-path gain requires either:
+- Major architectural fusion (multi-week, e.g. fold post-attn-norm+add
+  into next layer's attention QKV)
+- llama.cpp-style "ggml graph fuse" pass that combines many small ops
+- Path E+F+G operator-flip (already +6.4% available today)
+
+iter-204+ plan: examine the dispatch density per B-block to see if
+ANY individual block has a clear fusion candidate that wasn't already
+tried (iter-186 fused-triple-norm regressed, but other patterns may
+work).  Or pivot to a completely different bisect angle (CPU-side
+work, head pipeline, dispatch encoding cost).
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
