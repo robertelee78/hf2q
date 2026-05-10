@@ -14055,3 +14055,102 @@ already-ported/deferred set.
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
 
 No code changes (verification + plan refinement).
+
+
+---
+
+## iter-333 — Phase 1c CLOSED FALSIFIED (Chesterton's fence): gemma4 is already at optimal CB count
+
+Operator-leaned-recommendation Phase 1c was "Wire EncoderSession into
+gemma4 forward_mlx" with deep-research-forecast +15-25% if the
+CB-count theory holds.  Per mantra "Chesterton's fence — always
+understand current fully before changing it", investigated WHY qwen35
+has EncoderSession but gemma4 doesn't BEFORE refactoring.
+
+### Authoritative answer from ADR-019
+
+`/opt/hf2q/docs/ADR-019-mlx-native-encoder-architecture.md` lines 245
+and 1201-1203 (the document that introduced EncoderSession):
+
+> "gemma already does this correctly in mlx-native (forward_mlx.rs:1488
+> = 1 CB / decode default; 2 CBs under HF2Q_DUAL_BUFFER). The question
+> for ADR-019 is whether to retarget qwen35's chunk-engaged path to
+> the gemma-shape, and how aggressively."
+
+> "D3 is qwen35-specific. gemma is already at the D1 end-state
+> (post-Phase-6 future). ADR-019 explicitly does not touch
+> forward_mlx.rs (the gemma forward path).  The encoder.rs / device.rs
+> changes (Phase 0 EncoderSession) are mlx-native-side and benefit
+> gemma indirectly (e.g. EncoderSession can host gemma's
+> HF2Q_DUAL_BUFFER mode), but no behavior change to gemma's production
+> path."
+
+### Empirical CB count comparison
+
+```
+gemma4 forward_mlx.rs:        6 commit-call sites
+qwen35 forward_gpu.rs:       93 commit-call sites
+```
+
+Gemma4's hot path is **already at the canonical 1 CB/decode shape**
+that EncoderSession was designed to bring qwen35 toward.  The
+deep-research +15-25% lever was based on measuring qwen35's prefill
+CB count and incorrectly generalizing to gemma4 decode.
+
+### Deep-research scorecard (final session score)
+
+5 lever claims surveyed across iter-326+iter-329 deep-research:
+
+| # | Lever | Outcome | Evidence |
+|---|---|---|---|
+| 1 | A.1 — Q5_K port +8-12% | FALSIFIED iter-329 | peer N_R0_Q5_K=1 = ours 1 |
+| 2 | A.2 — Q4_K port +3-5% | N/A iter-329 | gemma4 has zero Q4_K weights |
+| 3 | B  — HF2Q_ENCODER_SESSION default-flip +15-25% | DOUBLY FALSIFIED iter-328+333 | wiring qwen35-only AND gemma4 doesn't need it |
+| 4 | C  — F16 KV + clip_residual +12% | FALSIFIED iter-330 | 0% speed; RAM win only |
+| 5 | D  — fused_norm_add float4 +1-2% | VERIFIED iter-331 | +0.8% additive shipped |
+
+**Final score: 1/5 deep-research lever forecasts validated.**  Only
+the smallest lever was real.  Lessons:
+- Always read peer N_R0/N_SG defines (not infer from kernel filenames).
+- Always check actual model tensor type distribution (not infer from
+  filename suffix).
+- Always check consumer-side wiring (not just the existence of an
+  `mlx-native` capability) AND check whether the consumer NEEDS that
+  capability at all.
+- Always check ADR documentation for prior decisions before
+  refactoring (Chesterton's fence).
+
+### Revised strategic picture
+
+After this iter, gemma4 APEX-Q5_K_M state at HEAD:
+- 73.0 tok/s decode @ 200-tok = 0.715× peer
+- 71.8 tok/s decode @ 1000-tok sustained (+9.6% from iter-326 stack
+  alone; +0.x% additional from iter-331 V2 not yet measured at 1000-tok)
+- Per-kernel port avenue: EXHAUSTED (Q5_K matches; Q4_K N/A; Q8_0
+  matches; Q5_1 matches; IQ4_NL deferred-no-ROI; fused_norm_add
+  shipped; rms_norm_v2 shipped; q6_K_nr2/_id_nr2 shipped iter-309/321)
+- CB-count reduction: NOT NEEDED (gemma4 already at 1-2 CB/decode)
+- F16 KV: safe at HEAD but 0% speed (RAM-only opt-in)
+- TQ-HB intact, parity intact, coherence intact
+
+Remaining levers to close 0.715× → mantra ≥1.0×:
+
+| Lever | Type | Effort | Risk | Mantra-aligned? |
+|---|---|---|---|---|
+| Phase 5 (fused_head_norm_rope_v2) | per-kernel | 1 day | medium (race-history) | ~+0.5-1%, marginal |
+| Phase 7 (TQ-HB kernel-fusion redesign) | structural | multi-week | high | ★ KEEPS TQ-HB; closes the gap |
+| Apple Instruments Metal System Trace | profiling | 0.5 day operator GUI | none | unlocks unknowns; iter-308 standing item #4 |
+| Accept current 0.715× ceiling | n/a | 0 | none | violates mantra ("close the gap entirely") |
+
+The HONEST answer: **per-kernel port lever is exhausted.**  To close
+the remaining ~28% gap requires either Phase 7 (structural multi-week)
+OR fresh empirical insight from Apple Instruments Metal System Trace
+(localizes the opaque per-dispatch overhead that current CPU
+instrumentation cannot attribute).
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (Chesterton's fence found Phase 1c invalid before code
+touched — the right outcome per mantra "measure 3x cut once").
