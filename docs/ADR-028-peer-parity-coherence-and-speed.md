@@ -3258,6 +3258,93 @@ are <1% of decode each. Operator pick required to proceed:
 
 iter-152+ continues only if operator engages on (1) or (2).
 
+### iter-152: MTP head audit + Path A run-phase opens for qwen3.6
+
+#### Re-read of operator-pointed reddit-mtp.txt
+
+`docs/reddit/reddit-mtp.txt` (operator-flagged): MTP (Multi-Token
+Prediction) is the **2.5× speedup lever for Qwen 3.6 27B** in
+llama.cpp via PR 22673:
+
+```
+llama-server -m Qwen3.6-27B-Q5_K_M-mtp.gguf \
+  --spec-type mtp --spec-draft-n-max 3 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  -np 1 -c 262144 --temp 0.7 --top-k 20 -ngl 99 --port 8081
+```
+
+This is NOT the same as DFlash (operator-rejected as "cheating") nor
+generic n-gram. MTP uses **tensor heads BUILT INTO THE MODEL** —
+the draft source is a single in-model layer that predicts the next
+token from (last embed, last hidden). Quality preservation by design.
+
+#### Audit of qwen3.6-27b-mtp-q4_0.gguf (task #22 — closed this iter)
+
+```
+gguf-dump --no-tensors qwen3.6-27b-mtp-q4_0.gguf | grep nextn
+qwen35.nextn_predict_layers = 1
+blk.64.nextn.eh_proj.weight    [10240 × 5120] Q4_0  (embed+hidden → next-hidden)
+blk.64.nextn.enorm.weight      [5120]         F32   (embedding norm)
+blk.64.nextn.hnorm.weight      [5120]         F32   (hidden norm)
+blk.64.nextn.shared_head_norm  [5120]         F32   (pre-shared-LM-head norm)
+```
+
+`block_count = 65` (64 main + 1 MTP head at layer index 64). Standard
+qwen MTP design. eh_proj fuses concat(embed, hidden) → next-hidden via
+2× hidden_size column dimension.
+
+#### MTP draft-step flow
+
+Per layer 64 forward pass:
+```
+embed_t      = embedding(last_predicted_token)
+hidden_t     = output of main 64-layer stack at last position
+n_e          = enorm(embed_t)                          // 5120 F32
+n_h          = hnorm(hidden_t)                         // 5120 F32
+concat       = [n_e ; n_h]                             // 10240 F32
+next_hidden  = eh_proj(concat)                         // 5120 F32 ← MTP body
+n_h2         = shared_head_norm(next_hidden)           // 5120 F32
+draft_logits = lm_head(n_h2)                           // 248320 F32
+draft_token  = argmax(draft_logits)
+```
+
+Drafted N tokens via N successive applications, then main model
+verifies in batched forward (Phase 2 GPU body of Path A spec-decode).
+
+#### iter-153+ scope
+
+The Path A Phase 2 GPU scaffold (iter-134..140 LANDED; preserved per
+iter-141 walk-phase pivot) already has:
+- `forward_decode_verify_serial` for correctness gate (Shape S)
+- `forward_decode_verify_batched` callable via Shape S delegation
+- `start_pos` parameter threaded through batched prefill
+- `ArgmaxCapture` enum for per-position argmax extraction
+
+**Adding MTP draft source is the missing piece.** Concrete walk-phase
+work:
+
+1. **iter-153**: load layer 64 nextn.* tensors at qwen3.6-mtp gguf load
+2. **iter-154**: wire `MtpDraftStep::propose(embed_t, hidden_t)` →
+   draft_token using GPU dispatch chain (5 dispatches: enorm + hnorm
+   + concat + eh_proj_qmatmul + shared_head_norm + lm_head)
+3. **iter-155**: chain N=3 draft steps for `--spec-draft-n-max 3`
+   equivalent
+4. **iter-156**: integrate into existing Path A Phase 2 GPU body
+   (`forward_decode_verify_batched` → accept-prefix loop)
+5. **iter-157**: A/B production decode: hf2q+MTP vs hf2q-default
+
+Expected outcome: **qwen3.6 production decode 1.27× → 1.27× × 2.5 ≈
+3.2× peer** (assuming acceptance ratio matches reddit's 60-80%).
+
+#### Walk-phase status update
+
+**Gemma4 path** (no MTP heads in model): walk-phase exhausted per
+iter-151. Operator pick required to proceed.
+
+**Qwen3.6 path** (MTP heads present): walk-phase OPENS at iter-153
+via MTP draft-step port. This is THE concrete walk-phase work
+remaining for hf2q at the qwen3.6 fixture.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
