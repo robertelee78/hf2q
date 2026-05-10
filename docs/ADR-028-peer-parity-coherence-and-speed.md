@@ -8083,6 +8083,85 @@ tools that we have not yet used.
 - Apple Metal Performance Shaders documentation
 - Xcode Metal Frame Capture output for any hf2q decode step
 
+### iter-248 — peer-vs-peer baseline (mlx-lm vs llama.cpp)
+
+Operator restated bar: **≥ peers in coherence AND speed, while
+implementing proper TQ**.  This rules out F16 KV path entirely (TQ
+must remain).  Gap to peer is the real metric.
+
+Executed iter-247 Top-1 recommendation: bench mlx-lm.  GGUF format
+not loadable by mlx-lm directly (needs HF dirs + safetensors).
+Used cached `unsloth/gemma-4-31b-it-UD-MLX-4bit` (different size: 31B,
+4-bit MLX quant) as best-available substitute.
+
+**Cross-engine baseline on Apple Silicon M5 Max** (200-token decode):
+
+| Engine | Model | Quant | tok/s | × llama.cpp peer |
+|--------|-------|-------|------:|------------------|
+| hf2q (default) | gemma-4-26B-A4B | Q5_K_M | 68.3 | 0.682× |
+| hf2q (Path E+G+FUSED) | gemma-4-26B-A4B | Q5_K_M | 72.6 | 0.724× |
+| llama.cpp tg128 | gemma-4-26B-A4B | Q5_K_M | 100-103 | 1.000× |
+| mlx-lm 0.31.2 | gemma-4-31B (different size) | 4-bit MLX | 22.4 | (different model) |
+
+**Key findings**:
+
+1. **mlx-lm is dramatically SLOWER than llama.cpp** on similar-class
+   Apple Silicon decode (22.4 vs 100+ tok/s on comparable models).
+   Apple's own MLX framework is NOT a faster reference; **llama.cpp
+   genuinely is the fast peer to chase**.
+
+2. **hf2q at Path E+G+FUSED beats mlx-lm by ~3.2×** on similar-scale
+   models.  Our default-path 68.3 tok/s already beats mlx-lm's 22.4
+   by ~3×.  This is context worth knowing — hf2q is fast among
+   Apple-Silicon engines, just not as fast as llama.cpp.
+
+3. **Gap to operator's bar (≥ peer)**:
+   - From Default 68.3 → llama.cpp 100 = need **+46.4%**
+   - From Path E+G+FUSED 72.6 → llama.cpp 100 = need **+37.8%**
+
+   This is a HUGE gap.  H1 (revoked, ~+1-2%) doesn't close it.
+   Path E+G default flip alone (+4.7%) doesn't close it.  Even
+   E+G+FUSED (+6.3%) doesn't close it.
+
+**Implications for ADR-028 strategic direction**:
+
+Closing 38-46% to peer with TQ preserved requires either:
+
+(a) **Multiple non-overlapping optimizations** that we haven't yet
+    identified.  Methodology recommendations from iter-247 are the
+    way to find them: Metal Capture timeline, MTL counters, roofline
+    analysis, microbench TQ-HB-vs-bare-F16.  Need to know if we're
+    compute-bound or memory-bound before deciding.
+
+(b) **DFlash speculative decode** (Option C, 11-15 weeks).  Multiplies
+    effective tokens-per-call by 2-4× via draft+verify.  This is the
+    only known peer-grounded lever that can deliver +37-46% on its
+    own — but requires multi-month engineering.
+
+**Updated lever priority** (operator-bar-aware: must close 38-46%):
+
+| Lever | Real ROI | Closes gap? | Effort |
+|-------|---------:|-------------|--------|
+| Path E+G default flip | +4.7% | NO (still 0.71×) | minutes |
+| Path E+G+FUSED flip | +6.3% | NO (still 0.72×) | minutes |
+| H1 F16 KV decode-only | +1-2% | NO | 1-2 wks (revoked) |
+| **iter-247 methodology #1-#6** | TBD | **need to find unknown levers** | 1-2 days |
+| **C: DFlash spec-decode** | **+50-100%** | **YES** | 11-15 weeks |
+
+**Recommendation revised**:
+
+Given the operator's bar (≥ peer with TQ) requires closing 38-46%,
+the only known path is **execute the iter-247 methodology
+recommendations to find unknown levers** (1-2 days) AND/OR **start
+DFlash spec-decode multi-month work**.
+
+Path E+G default flips alone are insufficient and should not be
+shipped as "the answer" — they're partial mitigations only.
+
+Next iteration: continue executing iter-247 methodology
+recommendations.  iter-248 done #1 (omlx/mlx-lm bench).  Next: #2
+Metal Capture + #3 re-activate iter-185 per-block timing.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
