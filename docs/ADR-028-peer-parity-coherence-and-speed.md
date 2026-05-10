@@ -6762,6 +6762,64 @@ Available env-flag stack (F16 25 ppm drift): `HF2Q_USE_DENSE=1 HF2Q_F16_KV=1
 HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_UNSAFE_EXPERIMENTS=1`
 → 73.6 tok/s.
 
+### iter-223 — MAJOR LEVER FOUND: DFlash speculative decode for gemma4
+
+Per operator's standing instruction "/opt/dflash exists for reference",
+read `/opt/dflash/dflash/model_mlx.py` (582 LOC) + README.
+
+**Discovery**: DFlash is a published **block-diffusion speculative
+decode** project (z-lab, arxiv 2602.06036) that **explicitly supports
+gemma-4-26B-A4B-it** via the released draft model
+`z-lab/gemma-4-26B-A4B-it-DFlash`.
+
+**Architecture**:
+- Small `DFlashDraftModel` trained alongside target (block_size tokens
+  per parallel draft step)
+- Target model verifies drafted block; accepted tokens advance
+  multiple positions per forward pass
+- MLX implementation already exists at `/opt/dflash/dflash/model_mlx.py`
+
+**Per-arch supported draft models** (relevant to operator's two
+focus models):
+- `z-lab/gemma-4-26B-A4B-it-DFlash` ← gemma4 target model
+- `z-lab/Qwen3.6-35B-A3B-DFlash` ← qwen3.6 target model
+
+**Estimated speedup** (per SD literature, 2-4×):
+- gemma4 current 68.8 tok/s × 2-4× = 140-280 tok/s
+- That **EXCEEDS llama.cpp peer** 102.7 tok/s
+- Even at conservative 1.5×, would reach 103 tok/s = peer parity
+
+**This is the LARGEST single lever discovered this session.**
+
+**Effort**: multi-week integration:
+1. Load DFlash draft model alongside target (currently target-only)
+2. Wire draft→target verification pipeline
+3. Implement block-acceptance logic (with rollback on rejection)
+4. Coherence + speedup validation
+
+**Comparison to other future levers**:
+
+| Lever | Est. speedup | Effort | Architecture-impact |
+|-------|------------:|--------|---------------------|
+| Path E+F+G default-flip | +6.4% | 1 line | minimal |
+| Compounded fusion kernels | ~+1% | multi-week | local |
+| Architectural arena patterns | +5-10% | multi-week | medium |
+| qwen3.6 cross-pollination | +5-15% | multi-month | broad |
+| **DFlash speculative decode** | **+50-300%** | **multi-week** | **major** |
+
+DFlash is **the path to peer-parity (and beyond)** for gemma4 decode.
+Per the operator's mantra "no fallback, no stub", documenting this
+as iter-223+ work.
+
+**iter-224+ plan**: study `/opt/dflash/dflash/model_mlx.py` and
+`/opt/dflash/dflash/model.py` deeply.  Plan integration with hf2q's
+gemma4 forward path.  Multi-iter chain to:
+1. Load DFlash draft alongside target
+2. Implement parallel block draft + verify
+3. Acceptance loop + KV-cache management
+4. Production wire-up + coherence + bench
+5. Default-OFF flag → soak → operator default-flip decision
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
