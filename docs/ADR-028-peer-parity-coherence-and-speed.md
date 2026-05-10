@@ -5191,6 +5191,48 @@ to Q6_K-aware kernel).  ROI poor vs Path E default-flip (+12.5%).
 - Continue walks → +2% per multi-day iter, ~10 iters to close 21pp gap
 - Status quo → 62 tok/s = 0.64× peer
 
+### iter-188 — HF2Q_LMHEAD_Q6K=1 default-OFF, +1.76% LANDED
+
+Implemented Q6_K-direct lm_head wire-up (commit hf2q `11238b0`):
+- New env flag `HF2Q_LMHEAD_Q6K=1` (default-OFF)
+- Auto-detects: only engages when `token_embd.weight` is on-disk Q6_K
+  (gemma4 yes; qwen3.6 stores Q5_K → falls through gracefully)
+- Loads native Q6_K storage via `load_gguf_qweight` (no F32 dequant)
+- Wired into 3 dispatch sites: `forward_decode`, `forward_prefill`,
+  `rerank_active` gate
+
+**3-run statistical bench** (200 tokens long-form, gemma4):
+
+| Path | Run 1 | Run 2 | Run 3 | Median |
+|------|-------|-------|-------|--------|
+| Default Q8_0 | 62.6 | 62.3 | 62.5 | 62.5 |
+| **Q6K direct** | **63.7** | **63.6** | **63.6** | **63.6 (+1.76%)** |
+
+Coherence: "2 + 2 = 4" output identical to default.
+Memory: -179 MB (Q8_0 784 MB → Q6_K 605 MB).
+Matches iter-187 prediction (+2%).
+
+**Updated cumulative gemma4 lever inventory**:
+
+| Lever | Gain | Effort | Precision | Status |
+|-------|-----:|--------|-----------|--------|
+| Path E (USE_DENSE) | +12.5% | 1-line | exact F32 | operator-gate |
+| Path F (F16 KV on E) | +1.5% | 1-line | F16 ~25 ppm | operator-gate |
+| **Path G (LMHEAD_Q6K)** | **+1.76%** | **shipped default-OFF** | **exact** | **iter-188** |
+| Fused triple norm | -1.0% | shipped default-OFF | exact | FALSIFIED |
+| FA-vec dispatch fusion | speculative | multi-week | TBD | future |
+
+Path G is **operator-orthogonal-to-precision** (like Path E) — exact
+output, just smaller bytes-read-per-token.  Stacks additively with
+Paths E and E+F.
+
+**Combined hypothetical bests** (all flags additive, untested combo):
+- E + G: ~80 tok/s = 0.82× peer (no precision drift)
+- E + F + G: ~82 tok/s = 0.85× peer (F16 ~25 ppm)
+
+iter-189+ plan: validate the E+G stack measurement (orthogonality
+hypothesis).  If confirmed, default-OFF flag set is operator-ready.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
