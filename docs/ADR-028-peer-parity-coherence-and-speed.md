@@ -12892,3 +12892,58 @@ historical claim; iter-316 is sanity-only).
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
 
 No code changes.  All prior parity + coherence gates green.
+
+
+---
+
+## iter-317 — DUAL_BUFFER tuning + full coherence-gate green
+
+### DUAL_BUFFER split-point sweep (gemma4 APEX-Q5_K_M, 3 runs each, 200 tok)
+
+```
+default (split=3):        69.5, 69.5, 69.4   median 69.5 tok/s
+HF2Q_DUAL_BUFFER=10:      68.7, 68.7, 68.7   median 68.7 tok/s  (-1.1%)
+HF2Q_DUAL_BUFFER=15:      68.1, 68.2, 68.1   median 68.1 tok/s  (-2.0%)
+```
+
+iter-192's default split=3 IS optimal.  Higher splits monotonically
+decrease throughput (CPU encode finishes faster than buf0 GPU
+execution, so longer buf1 means GPU idles waiting for the commit).
+
+### Full coherence gate (scripts/adr028_coherence_gate.sh) — GREEN
+
+Long-context (1000 tok) coherence test across both production APEX
+models + all SAFE stack combinations:
+
+**gemma4 (gemma4-ara-2pass-APEX-Q5_K_M.gguf):**
+- Default                       : OK
+- Path E (USE_DENSE)            : OK
+- Path E+G (★ safe-flip iter-293): OK
+- Path E+G + FUSED              : OK
+- Path E+F+G (F16 KV deprecated): FAIL[sentinel] ← EXPECTED, iter-233 deprecation load-bearing
+
+**qwen3.6 (APEX-Q5_K_M.gguf):**
+- Default                       : OK
+- Default + F16 KV              : OK
+
+**GATE: PASS** (0 SAFE-stack failures, 1 EXPECTED-FAIL confirmed).
+
+### Bottom line confirmed
+
+The operator's bar of "as coherent as peer, while keeping helpful TQ
+implementation" is **satisfied** across both APEX models at the
+1000-tok long-context regime under ALL safe stack combinations.
+TQ-HB intact (3.94× memory savings retained).
+
+The remaining gap is purely SPEED on gemma4 (0.66-0.68× peer with
+TQ-HB intact).  Closing it requires operator decision on one of:
+1. Approve multi-week TQ-HB kernel-fusion redesign
+2. Approve Apple Instruments profiling sweep
+3. Accept current ratio
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`:
+  this section.
+
+No code changes.
