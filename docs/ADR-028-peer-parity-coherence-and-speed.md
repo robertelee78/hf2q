@@ -13198,3 +13198,71 @@ Total stacking gain (default 69.2 → 72.6): **+4.9% TQ-HB intact**.
 - `/opt/mlx-native/src/ops/quantized_matmul_id_ggml.rs`
 - `/opt/mlx-native/tests/adr_028_iter321_q6k_id_mv_nr2_parity.rs` (NEW)
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section
+
+
+---
+
+## iter-322 — full stack gains GROW at sustained 1000-tok regime
+
+iter-318/319/320/321 measured at 200-tok decode (matched llama-bench
+tg200).  iter-322 tests the full stack at 1000-tok sustained — the
+production-relevant long-context regime, matched against peer's
+tg1024 = 97 tok/s baseline.
+
+### Bench at 1000-tok (3 runs each, gemma4 APEX-Q5_K_M)
+
+```
+Full stack (G+FUSED+V2+NR2+ID_NR2):  71.8, 71.8, 71.9 tok/s   median 71.8  σ <0.1
+Baseline (default):                  68.5, 65.5, 63.2 tok/s   median 65.5  σ 2.7
+```
+
+Delta: **+9.6%** at sustained 1000-tok regime.
+
+Peer reference: tg1024 = 97 tok/s.
+- baseline 1000-tok:    65.5 / 97 = **0.675× peer**
+- full stack 1000-tok:  71.8 / 97 = **0.740× peer**
+
+The gap is BIGGER than at 200-tok and the stack's win is BIGGER too.
+
+### Why thermal stability matters
+
+Baseline shows 65.5 → 63.2 monotonic decrease across 3 sequential
+1000-tok runs (σ=2.7).  Full stack stays 71.8-71.9 (σ <0.1).
+
+Interpretation: the stack reduces total work per token enough that
+the thermal envelope no longer throttles, while baseline's higher
+work-per-token hits sustained thermal cap.  iter-316 measured
+similar effect (-2.3% drift over 50→500 tok); at 1000-tok it's
+more severe (-7.7% baseline drift run-to-run).
+
+### DUAL_BUFFER tuning on new stack (re-check)
+
+```
+DUAL_BUFFER=1: 72.1-72.3
+DUAL_BUFFER=2: 72.4-72.9 (3-run looked better, 5-run merged with =3)
+DUAL_BUFFER=3 (default): 72.4-72.7
+DUAL_BUFFER=4: 72.4-72.5
+DUAL_BUFFER=5: 72.4-72.5
+```
+
+5-run lock-in: DUAL_BUFFER=2 vs =3 differ by <0.1 tok/s (within noise).
+**Default 3 stays** — no shift needed despite the new stack.
+
+### Updated cross-regime peer ratio table
+
+| Regime | Default | Full stack | Peer | Δ |
+|---|---|---|---|---|
+| 200-tok | 69.2 (0.679×) | 72.6 (0.713×) | 102 | +4.9% |
+| 1000-tok sustained | 65.5 (0.675×) | 71.8 (0.740×) | 97 | **+9.6%** |
+
+### Coherence + TQ-HB
+
+Same status as iter-318→321: byte-identical decode, TQ-HB intact
+(no FA-path touched, 3.94× memory savings preserved).
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes — measurement iter that surfaced an even bigger
+production-regime win for the iter-318→321 stack.
