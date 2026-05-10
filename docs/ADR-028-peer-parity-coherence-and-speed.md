@@ -13319,3 +13319,64 @@ delta likely smaller in absolute terms]
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
 
 No code changes — bench script + doc update.
+
+
+---
+
+## iter-324 — qwen3.6 1000-tok cross-model + regression-gate sanity
+
+iter-322 found gemma4's stack helps MORE at 1000-tok sustained.
+iter-324 tests qwen3.6 at the same sustained regime.
+
+### qwen3.6 APEX-Q5_K_M at 1000-tok (3 runs each)
+
+```
+baseline:    126.1, 126.1, 126.1 tok/s   median 126.1  σ <0.1
++ V2:        128.7, 128.8, 128.8 tok/s   median 128.8  σ <0.1
+Delta: +2.1% reliable
+```
+
+Peer reference: qwen3.6 tg1024 = 94.55 tok/s.
+- baseline 1000-tok:  126.1 / 94.55 = **1.334× peer**
+- + V2 1000-tok:      128.8 / 94.55 = **1.362× peer**
+
+Mantra still EXCEEDS by wide margin.
+
+### qwen3.6 thermal vs gemma4 thermal
+
+qwen3.6 baseline at 1000-tok shows σ <0.1 (NO thermal drift), unlike
+gemma4 baseline (σ 2.7).  Likely because qwen3.6 active params = 3B
+vs gemma4 active = 4B — less work per token, less heat.
+
+This means qwen3.6's stack delta is roughly stable across 200-tok
+and 1000-tok regimes (+2.3% / +2.1%), while gemma4's stack delta
+GROWS at 1000-tok due to thermal stabilization (+4.9% / +9.6%).
+
+### Cross-model summary at sustained 1000-tok regime
+
+| Model | Default | + V2/stack | × peer | Mantra |
+|---|---|---|---|---|
+| gemma4 APEX | 65.5 (0.675× σ 2.7) | 71.8 (0.740× σ <0.1) | <1.0 | ✗ |
+| qwen3.6 APEX | 126.1 (1.334× σ <0.1) | 128.8 (1.362× σ <0.1) | >1.0 | ★ ✓ |
+
+### Regression-gate sanity (post iter-321)
+
+`scripts/adr028_coherence_gate.sh` (1000-tok long-context):
+- gemma4 SAFE stacks: 4/4 OK (Default, Path E, Path E+G, E+G+FUSED)
+- gemma4 F16 KV: FAIL[sentinel] ← EXPECTED, iter-233 deprecation
+- qwen3.6 SAFE stacks: 2/2 OK
+- **GATE: PASS**
+
+Parity test suites:
+- iter-309 q6_K mv nr2: 4/4 PASS
+- iter-310 rms_norm_v2: 6/6 PASS
+- iter-321 q6_K _id mv nr2: 4/4 PASS
+
+All gates green.  iter-321's new MoE kernel does not regress any
+existing coherence or correctness invariant.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes — cross-model verification + housekeeping iter.
