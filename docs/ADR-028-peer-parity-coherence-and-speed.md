@@ -9336,6 +9336,82 @@ metadata coverage or vocab size.
   values are wrong for extended-vocab qwen3 GGUFs
 - → iter-267 fixes the fallback resolver
 
+### iter-267 — name-based EOS resolver shipped, exposes K1 TRAJECTORY DIVERGENCE
+
+Implemented robust EOS resolver in `Qwen35LoadedModel::load`
+(`engine_qwen35.rs:286-335`):
+
+1. Read `tokenizer.ggml.eos_token_id` metadata
+2. Read `tokenizer.ggml.eot_token_id` metadata (added — covers some
+   GGUF variants)
+3. **Scan `tokenizer.ggml.tokens` array by NAME** for `<|im_end|>`
+   and `<|endoftext|>` (catches extended-vocab variants where IDs
+   differ from canonical 151_645)
+4. Final fallback: legacy 151_645
+
+Tracing logs the resolved set (`Qwen35 EOS token set resolved
+count=N ids=[...]`) for operator visibility.
+
+**Verified on 27B-MTP-Q4_0** (commit `82522f7`):
+
+```
+INFO Qwen35 EOS token set resolved count=1 ids=[151645]
+```
+
+Only 151645 found because the GGUF's `tokens` array is truncated to
+248044 entries (per qwen3 extended-vocab convention) — the special
+`<|im_end|>` at id 248046 is OUTSIDE the array.  151645 is the
+in-range token whose decode produces `<|im_end|>` text.
+
+**HOWEVER — K1 STILL doesn't stop on 151645 despite proper
+resolution**:
+
+| Test | Tokens generated | Stops? |
+|------|-----------------:|-------:|
+| MTP-off greedy "What is 2+2?" | **13 tokens** (correct) | ✓ |
+| MTP-K1=1 greedy same prompt | 50 tokens (max) | ✗ |
+| MTP-K1=1 1000-tok perf | 1000 tok @ 88% accept | (perf still good) |
+
+**Root cause shift**: the bug is NOT EOS coverage.  iter-267's fix
+is correct defensive code, but the issue is that **K1's trajectory
+diverges from non-spec greedy**.  K1 is emitting different tokens
+than MTP-off would emit at the same positions.
+
+**Standing rule violated**: per `inference/spec_decode/verifier.rs:119`:
+
+> "At temperature=0 (greedy), spec-decode is byte-identical to
+> default."
+
+K1 violates this.  Either:
+- The "free token" amortization (line 432-437 emits both `proposed`
+  AND `next_iter_token_next` per accept) introduces tokens the
+  verifier never actually saw at the right context
+- The reject path's KV state handling (line 460-480, "K[N+1] not
+  written this iter; next iter overwrites it via verifier.forward")
+  has a subtle bug where the next iter's verifier sees stale state
+
+**iter-268 plan**: bisect K1 trajectory divergence
+1. Capture MTP-off greedy 50 tokens (ground truth)
+2. Run K1=1 with `HF2Q_SPEC_DECODE_K1_NO_AMORT=1` — should match
+   greedy if ONLY the amortization is buggy
+3. If NO_AMORT matches greedy: free-token push at line 437 is the bug
+4. If NO_AMORT also diverges: 2-token verifier or reject path is the
+   bug — bisect via `HF2Q_SPEC_DECODE_K1_TRACE=1`
+
+**iter-267 outcome**:
+- ✓ Robust name-based EOS resolver shipped (defensive against any
+  GGUF metadata variant)
+- ✓ Tracing for operator visibility added
+- ✗ K1 still doesn't stop because TRAJECTORY DIVERGES from greedy
+- → iter-268 bisects K1 trajectory bug
+
+**Important reframe**: iter-263→267 turned out to be a longer thread
+than expected.  The MTP perf regression (iter-263) was downstream of
+a K1 correctness bug (iter-264-267).  Path forward: fix the
+trajectory divergence first, THEN re-measure perf — the +7.5%
+measured in iter-264 may need re-evaluation since the trajectory
+isn't byte-identical to greedy.
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
