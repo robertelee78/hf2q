@@ -7197,6 +7197,37 @@ will already need a test crate refactor for the larger SD test surface.
 
 iter-231+: continue cron iterations or wait for operator direction.
 
+### iter-232 — full-stack regression baseline post-iter-229 (stable)
+
+Ran iter-231's `scripts/adr028_full_stack_bench.sh` with 3-run config
+to verify iter-229's MlxKvCache::trim() / visible_len() additions
+introduced no regression.
+
+| Stack | Median (3-run) | iter-216 ref | Match |
+|-------|---------------:|-------------:|-------|
+| Default | 68.6 | 68.8 | ✓ |
+| Path E | 71.1 | ~71 | ✓ |
+| Path E+G | 72.3 | 72.4 | ✓ |
+| **Path E+F+G** | **73.3** | **73.3** | **✓ exact** |
+| +FUSED_END_OF_LAYER | 73.6 | 73.6 | ✓ exact |
+| llama.cpp peer | 96.23 ± 2.76 | 102.7 ± 8.77 | within sd-dev |
+
+**Zero perf regression** from iter-229 trim() infrastructure
+(methods are dead-code-flagged until SD state machine lands).
+Numbers reproduce iter-216 exactly within ±0.3 noise.
+
+llama.cpp peer drift (96 vs 102.7) within their reported 8.77 std-dev
+— hardware/sampling variability, not regression.
+
+iter-231's bench-runner script proven useful: produces clean
+side-by-side comparison + automatic peer baseline + reference table
+for daily regression detection.
+
+iter-233+ plan options unchanged:
+- Continue marginal/foundation prerequisites (e.g., iter-227 work
+  item E coherence-gates skeleton)
+- Wait for operator green-light on multi-week SD chain
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
