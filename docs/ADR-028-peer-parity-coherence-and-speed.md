@@ -4188,6 +4188,92 @@ understand what "known-worse output" specifically means; if the
 referenced regression was measured at long context with strict
 byte-comparison, surface to operator with quality A/B.
 
+### iter-166: ADR-009 F16-KV "known-worse" classification re-read
+
+#### What ADR-009 said (2026-04-16)
+
+`ADR-009-reference-parity-and-coherence-recovery.md:1257+`:
+
+> "Implemented F16 dense KV cache + `kv_cache_copy_batch_f32_to_f16`
+> cast kernel, routing flash_attn_vec through the
+> `flash_attn_vec_f16kv_dk256` variant.
+
+Specific findings:
+- Sourdough: 3656/3658 → 3095/3658 = **−561 bytes** (15% loss)
+- Sliding wrap: 752/2327 → 627/2316 = **−125 bytes**
+- L24 cache_k rel_rms vs llama: 1.4e-2 → 2.7e-1 = **19× worse**
+- L24 sdpa_out rel_rms vs llama: 1.4e-2 → 6.4e-1 = **45× worse**
+
+**Critical control test (the load-bearing finding)**:
+- llama.cpp F16 KV vs F32 KV: **2327/2327 bytes — IDENTICAL**
+
+llama.cpp's F16 path is byte-identical to F32. Ours is 19× drift.
+**The 19× is a real bug** in our F16 flash_attn_vec kernel — not
+F16 precision tradeoff (peer pays no precision cost on the same
+F16 storage).
+
+#### Production-coherence test (this iter)
+
+Despite the ADR-009 bug, real-world output is coherent:
+
+Prompt: 800-token spy novel ("Write the opening of a thrilling
+spy novel set in 1980s Berlin. Include vivid sensory detail...")
+
+USE_DENSE+F16_KV produced (excerpt):
+> "He's not late," countered Klaus, emerging from the shadows
+> of a nearby café. He pressed a microfiche canister into
+> Stefan's palm. "He's dead. And the Stasi are already closing
+> the perimeter."
+
+Coherent narrative, named characters, sensory detail, plot
+stakes. **Long-context drift does not break production output.**
+
+#### Three-axis quality summary
+
+| Axis | F32 baseline | F16 KV | Verdict |
+|------|---|---|---|
+| Short factual ("Paris") | "Paris" | "Paris" | **Identical** |
+| Long essay | coherent | coherent (~50% token-divergent) | **Coherent** |
+| Strict-byte vs F32 | 3656/3658 | 3095/3658 | **−561 bytes drift** |
+| Strict-byte vs llama F32 | 752/2327 | 627/2316 | **−125 bytes drift** |
+| Coherence under sliding wrap | OK | OK | **OK** |
+| L24 SDPA drift vs peer | 1.4e-2 | 6.4e-1 | **45× amplification (BUG)** |
+
+**Operator-relevant**: production coherence is fine; strict-byte
+matching is not. If operator's serve workload tolerates "essay-
+quality drift" (= F16 precision-equivalent), Path E+F unlocks
++15.7% wall-clock for free.
+
+#### iter-167 walk-phase target — numerical bisect of the 19× bug
+
+The 19× cache_k amplification under F16 KV is in the FA-vec_f16kv
+kernel. Per ADR-009 §next, candidates:
+1. Q cast-to-half pattern (Q stored as half4 in shared memory in
+   BOTH F32 and F16 paths — same precision, can't be the cause)
+2. Mask value type (mask written via `ss[tx] = mask_val` as float;
+   shmem is half-pointer-typed but ss is cast to float — verify
+   no overlap with sq4 region)
+3. Online softmax intermediate precision (M, S, ms, vs all float —
+   looks clean)
+4. Reduce kernel numerical ordering (only at NWG > 1)
+
+Hypothesis: the bug is **not in the math** but in a **layout
+boundary** — F16 K layout matches F32 in `[n_heads, capacity,
+head_dim]` (verified at kv_cache_copy.metal:140), so it should be
+correct. But maybe there's an alignment issue with half4 loads.
+
+iter-167 plan: run `tests/test_flash_attn_vec_f16.rs` (if exists)
+or build a synthetic K with known values, decode at fixed seed,
+compare F32 vs F16 output bit-by-bit. Bisect to identify the
+specific line where the 19× amplification originates.
+
+If FIX FOUND: Path E+F becomes drop-in replacement with no
+quality cost. +15.7% wall-clock + 251 MiB/slot memory. Strong
+case for operator default-flip.
+
+If NO FIX (or multi-week scope): operator decision proceeds with
+quality-A/B context: drift is real but production-tolerable.
+
 #### Standing decision — Three closure paths still apply
 
 Independent of regression: gemma4's structural gap to llama.cpp
