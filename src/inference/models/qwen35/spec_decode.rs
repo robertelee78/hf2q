@@ -261,17 +261,73 @@ impl<'a> SpecDecode<'a> {
             let vsz = vocab as usize;
 
             if k1_batched {
-                let verify_positions_2 = positions_for_range(next_pos, 2);
-                let (verify_logits, verify_hidden) = self
-                    .verifier
-                    .forward_gpu_with_hidden(
-                        &[token_next, proposed],
-                        &verify_positions_2,
-                        &mut self.kv_cache,
-                    )
-                    .with_context(|| {
-                        format!("SpecDecode K1 verifier step pos {next_pos}")
-                    })?;
+                // ADR-028 iter-174 bisect: HF2Q_SPEC_DECODE_K1_TWO_CALLS=1
+                // uses TWO consecutive 1-token forward calls instead of one
+                // 2-token forward. Correctness probe — if 2-call mode
+                // produces coherent output but the original 2-token call
+                // does not, the bug is in multi-token mid-stream forward.
+                // If 2-call mode is also broken, the bug is in spec_decode
+                // state machine bookkeeping.
+                let two_calls = std::env::var("HF2Q_SPEC_DECODE_K1_TWO_CALLS")
+                    .as_deref() == Ok("1");
+                // hidden_row_0 / hidden_row_1: pre-extracted hidden rows.
+                // Built by either path so the unified ACCEPT/REJECT branch
+                // can pull from them without buffer-shape ambiguity.
+                let mut hidden_row_0: Option<MlxBuffer> = None;
+                let mut hidden_row_1: Option<MlxBuffer> = None;
+                let (verify_logits, verify_hidden) = if two_calls {
+                    let pos_a = vec![next_pos; 4];
+                    let (logits_a, hidden_a) = self
+                        .verifier
+                        .forward_gpu_with_hidden(
+                            &[token_next], &pos_a, &mut self.kv_cache,
+                        )
+                        .with_context(|| {
+                            format!("K1 TWO_CALLS step A pos {next_pos}")
+                        })?;
+                    let pos_b = vec![next_pos + 1; 4];
+                    let (logits_b, hidden_b) = self
+                        .verifier
+                        .forward_gpu_with_hidden(
+                            &[proposed], &pos_b, &mut self.kv_cache,
+                        )
+                        .with_context(|| {
+                            format!("K1 TWO_CALLS step B pos {}", next_pos + 1)
+                        })?;
+                    // Each forward returns its own hidden buffer.
+                    // last_hidden_row works on each (single-token forward).
+                    hidden_row_0 = Some(
+                        last_hidden_row(&hidden_a, hidden_size_u32)
+                            .context("K1 TWO_CALLS hidden_a last_row")?,
+                    );
+                    hidden_row_1 = Some(
+                        last_hidden_row(&hidden_b, hidden_size_u32)
+                            .context("K1 TWO_CALLS hidden_b last_row")?,
+                    );
+                    // Concat logits only (used by the row0/row1 slice logic).
+                    let last_a = last_logits(&logits_a, vocab)?.to_vec();
+                    let last_b = last_logits(&logits_b, vocab)?.to_vec();
+                    let mut logits_concat = Vec::with_capacity(2 * vsz);
+                    logits_concat.extend_from_slice(&last_a);
+                    logits_concat.extend_from_slice(&last_b);
+                    // verify_hidden unused in two_calls path — but we still
+                    // need to bind something. Reuse hidden_b (caller won't
+                    // index nth_hidden_row on it because hidden_row_*
+                    // are pre-set).
+                    (logits_concat, hidden_b)
+                } else {
+                    let verify_positions_2 = positions_for_range(next_pos, 2);
+                    self
+                        .verifier
+                        .forward_gpu_with_hidden(
+                            &[token_next, proposed],
+                            &verify_positions_2,
+                            &mut self.kv_cache,
+                        )
+                        .with_context(|| {
+                            format!("SpecDecode K1 verifier step pos {next_pos}")
+                        })?
+                };
                 let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
                 ensure!(
@@ -338,10 +394,12 @@ impl<'a> SpecDecode<'a> {
                         break;
                     }
                     hidden_pos = next_pos + 1;
-                    hidden_t = nth_hidden_row(
-                        &verify_hidden, hidden_size_u32, 1,
-                    )
-                    .with_context(|| format!("K1 ACCEPT row=1 pos {next_pos}"))?;
+                    hidden_t = if let Some(h1) = hidden_row_1.take() {
+                        h1
+                    } else {
+                        nth_hidden_row(&verify_hidden, hidden_size_u32, 1)
+                            .with_context(|| format!("K1 ACCEPT row=1 pos {next_pos}"))?
+                    };
                     logits_t = logits_row1.to_vec();
                 } else {
                     // REJECT: emit the corrected token at N+1. KV at pos
@@ -356,10 +414,12 @@ impl<'a> SpecDecode<'a> {
                         break;
                     }
                     hidden_pos = next_pos;
-                    hidden_t = nth_hidden_row(
-                        &verify_hidden, hidden_size_u32, 0,
-                    )
-                    .with_context(|| format!("K1 REJECT row=0 pos {next_pos}"))?;
+                    hidden_t = if let Some(h0) = hidden_row_0.take() {
+                        h0
+                    } else {
+                        nth_hidden_row(&verify_hidden, hidden_size_u32, 0)
+                            .with_context(|| format!("K1 REJECT row=0 pos {next_pos}"))?
+                    };
                     logits_t = logits_row0.to_vec();
                 }
 
