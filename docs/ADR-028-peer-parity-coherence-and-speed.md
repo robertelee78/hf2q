@@ -3873,15 +3873,36 @@ Other code that landed since iter-146:
   but still pays GGUF-parse path delta)
 - iter-156 `HF2Q_MTP_PROFILE` env reads (gated, no decode hot path)
 
-#### iter-162 walk-phase target — bisect the 9-13% regression
+#### iter-162 — PHANTOM REGRESSION (no code change required)
 
-Use git worktree at `iter-146` commit (`4acdd1a`), build, bench,
-compare. If iter-146 worktree reproduces 81.5 USE_DENSE → roll
-forward by halves to find the offending commit.
+Built hf2q at `4acdd1a` worktree against mlx-native at `a4e8b0f`
+(iter-145 era). Re-bench:
 
-If regression source recovers ~7-10 tok/s → 67-72 tok/s default,
-~76-82 USE_DENSE = closes ~25% of the remaining peer gap with no
-quality cost.
+| Path | iter-146 binary | HEAD binary | iter-146 docs |
+|------|---:|---:|---:|
+| Default | **61.4** | 62.5 | ~~69.3~~ |
+| USE_DENSE=1 | **71.1** | 70.9 | ~~81.5~~ |
+
+**Conclusion**: iter-146 binary itself reproduces the same numbers
+as HEAD (within 1-2 tok/s noise). The 69.3/81.5 documented in
+iter-146 was an outlier measurement — likely cooler thermal state,
+different background load, or transient OS scheduling. **No code
+regression occurred** between iter-146 and HEAD. Current 62.5/70.9
+IS the steady-state ceiling on M5 Max + this fixture.
+
+Standing iter-150 verdict re-confirmed: gemma4 0.62× peer is
+structural within current TQ-HB regime. Distribution across 6+
+kernel families. No single-kernel fix recovers the gap.
+
+#### iter-163 walk-phase target — implement Task #18
+
+Q6_K + Q5_K fused-swiglu-down mv_id (3% decode gain target,
+pending since item enumeration). Peer (llama.cpp) has the fused
+silu-mul-down kernel; hf2q does separate dispatches. Concrete
+multi-day work item — non-trivial but bounded.
+
+Or: Path E operator decision (USE_DENSE default-flip, +12-13%
+with token divergence on long contexts). Awaiting operator pick.
 
 #### Standing decision — Three closure paths still apply
 
