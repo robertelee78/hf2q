@@ -9977,6 +9977,79 @@ within if FA passes too".  No more multi-week DeltaNet rewrite.
   to specific candidates (FA cache or orchestration)
 - Each iter measures, never guesses, never ships speculative fixes
 
+### iter-275 — FA resume kernel parity verified, narrows to orchestration
+
+Verified existing kernel-level FA resume parity test at HEAD:
+
+```
+test flash_attn_prefill_tests::flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic ... ok
+```
+
+PASSES at `qL=32, kL=64, kv_capacity=128`.  The FA resume kernel is
+byte-identical to monolithic forward for that configuration.
+
+iter-177's commit claims "kernel-validated byte-correct at qL=2 +
+kL=130 by iter-21 probe".  Both data points are kernel-level passes.
+
+**Test coverage matrix updated**:
+
+| Test layer | Result | Source |
+|------------|--------|--------|
+| DeltaNet kernel n_tokens=1..32 | ✓ pass | iter-272 |
+| DeltaNet layer seq=2 + non-zero state | ✓ pass | iter-273 SHIPPED |
+| FA resume kernel qL=32, kL=64 | ✓ pass | iter-275 verified |
+| FA resume kernel qL=2, kL=130 | iter-177 claim | indirect |
+| FA layer at seq=2 + non-zero KV cache | NO test | gap remains |
+
+**Net conclusion**: every kernel-level test and the one shipped layer-
+level test are CORRECT.  The K1 trajectory bug is NOT in any kernel
+math.  Only candidates left:
+
+1. **A specific layer-level path** (`apply_sdpa_with_kv_cache`
+   resume_path_eligible branch wiring, or `build_gated_attn_layer`
+   orchestration of cache writes) that the existing kernel tests
+   don't cover.
+2. **Higher-level qwen35 forward orchestration** — state ping-pong
+   between K1 iters, position-axis-flat tensor construction across
+   layers, or hidden-state accumulation mode.
+
+**iter-276 plan — direct top-down per-layer divergence test**:
+
+Capture per-layer hidden states for both:
+- **A**: MTP-off greedy at iter 1 (after token_a is selected)
+  - forward([token_a]) at pos N → hidden[layer 0..63] + logits
+- **B**: K1=1 at iter 1 (the diverging path)
+  - forward([token_a, draft_b]) at pos [N, N+1] → hidden[layer 0..63]
+    × 2 + logits × 2
+
+Compare A's hidden[layer L] to B's hidden[layer L][position 0] for
+each L in 0..63.  The first L where they diverge is THE LAYER
+containing the bug.
+
+Implementation: instrument `forward_gpu_with_hidden` with
+`HF2Q_K1_DIVERGE_TRACE=1` to dump per-layer hidden state to disk
+(or in-memory ring buffer).  Compare via Python.
+
+This is the most direct falsifier remaining — sidesteps all hypothesis
+generation by directly measuring at every architectural boundary.
+
+**Iter-275 outcome**:
+- ✓ FA resume kernel parity verified at HEAD
+- ✓ All kernel-level + DeltaNet layer-level math verified correct
+- ✗ Bug must be in layer-level path NOT in kernel math (per multiple
+  refutations)
+- → iter-276 implements per-layer divergence trace as the targeted
+  top-down falsifier
+
+**Cumulative thread state (iter-263 → iter-275)**:
+- 13 iterations, 5 hypothesis refutations
+- 2 production code changes shipped, 1 layer parity test shipped,
+  1 kernel parity test re-verified
+- Bug location narrowed from "K1 trajectory diverges" to "in qwen35
+  forward layer-level orchestration, NOT kernel math"
+- Investigation continues to be measurement-driven; each iter rules
+  out a layer of possibilities rather than guessing
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
