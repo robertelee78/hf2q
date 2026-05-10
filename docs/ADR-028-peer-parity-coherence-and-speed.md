@@ -15286,3 +15286,90 @@ decision required.
 - `/opt/hf2q/src/debug/investigation_env.rs`: BATCHED_PREFILL default-ON + UNSAFE-decoupled
 - `/opt/hf2q/src/serve/forward_mlx.rs`: LMHEAD_Q6K reverted to opt-in
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section
+
+
+---
+
+## iter-345 — LMHEAD_Q6K + BATCHED_PREFILL coexist (Phase 9.1)
+
+The iter-344 LMHEAD_Q6K reversion was unnecessary.  forward_prefill_batched.rs:2032
+had a 2-arm dispatcher (Q8 / F16) but no Q6_K arm.  Added the Q6_K arm
+that dispatches via `dispatch_qmatmul` (which routes to
+`kernel_mul_mv_q6_K_f32_nr2` since iter-309 + iter-326 default).
+Re-restored `HF2Q_LMHEAD_Q6K=1` default-ON.
+
+### Bench at iter-345 default
+
+```
+prefill pp263:  1073 tok/s
+prefill pp3813: 2540 tok/s = 0.85× peer
+decode 200-tok: 71.8 tok/s  (vs iter-344 71.0 = +1.1% recovery)
+```
+
+Coherence 3/3 PASS.
+
+### Files modified
+
+- `/opt/hf2q/src/serve/forward_prefill_batched.rs:2032+` — Q6_K arm
+- `/opt/hf2q/src/serve/forward_mlx.rs:1290-1313` — LMHEAD_Q6K restored
+  to default-ON (opt-out via `HF2Q_LMHEAD_Q6K=0`)
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section
+
+
+---
+
+## iter-346 — Phase 10 OPENS: Hybrid K storage design
+
+Goal: F16 K + TQ-HB V → enable peer-equivalent SDPA simdgroup matmul on K
+while preserving half the TQ-HB memory savings on V.  Multi-week scope.
+
+### Phase 10 sub-tasks (audited iter-346)
+
+| Sub | Scope | Files | Est effort |
+|---|---|---|---|
+| 10a | Audit current K storage allocation | forward_mlx.rs:1028 (DenseKvBuffers), :2425+ (leg_hb_encoded), :3370+ (KV write path) | 1 iter (this iter) |
+| 10b | New `HybridKvBuffers` struct (F16 K + TQ-HB V) | forward_mlx.rs new struct | 1 iter |
+| 10c | F16 K encode path (skip Hadamard for K) | forward_mlx.rs:2901+ (existing TQ-HB encode) | 2 iter |
+| 10d | New SDPA kernel `flash_attn_vec_hybrid_dk256` (F16-K simdgroup matmul + TQ-HB V dequant) | mlx-native/src/shaders/ NEW | 5+ iter |
+| 10e | Dispatcher routing (HF2Q_HYBRID_KV env-gate) | forward_mlx.rs:3497+ (SDPA dispatch site) | 1 iter |
+| 10f | Parity tests (1e-4 tolerance vs current TQ-HB SDPA) | mlx-native/tests/ NEW | 1 iter |
+| 10g | Coherence + bench gates (1000-tok 10-run + 4K + 8K) | scripts/ | 1 iter |
+
+Total: ~12 /loop iterations.
+
+### iter-346: 10a audit findings
+
+Current K storage path:
+- **Allocation**: `forward_mlx.rs:1029-1054` — `pub struct DenseKvBuffers
+  { pub k: MlxBuffer, pub v: MlxBuffer, ..., pub dtype: mlx_native::DType }`
+  K and V symmetric.
+- **TQ-HB encode lazy alloc**: `forward_mlx.rs:2425-2469` — `leg_hb_encoded:
+  Option<Vec<HbKvBuffers>>` allocated on first decode, holds K+V byte-packed
+  + norms.  Per-layer.
+- **Per-token TQ-HB encode dispatch**: `forward_mlx.rs:2901-2912` for K,
+  :2950-2977 for V (or :2977 dual K+V).
+- **KV write path**: `forward_mlx.rs:3370-3398` writes either F16 K/V
+  (when `kv_is_f16`) or F32 K/V (when not).  TQ-HB encoded buffers are
+  written separately by the encode kernels above.
+- **SDPA dispatch**: `forward_mlx.rs:3565-3640` selects between
+  `flash_attn_vec_tq_hb` (cb_bits>=5) and `flash_attn_vec_tq` (cb_bits=4).
+  Both consume TQ-HB byte-packed K/V from `leg_hb_encoded`.
+
+Hybrid K means: K stored as F16 (no FWHT, no TQ encoding); V stored as
+TQ-HB (FWHT + 8-bit codebook).  SDPA reads K as F16 directly (peer-style
+simdgroup matmul) and V via TQ-HB dequant (existing path).
+
+Memory math at gemma4 defaults (sliding_window=1024, 8 KV heads × 256
+head_dim, 30 layers):
+- F32 K/V (raw): 30 × 8 × 256 × 1024 × 4 × 2 = 504 MB
+- TQ-HB K/V (current): 504 / 3.94 = ~128 MB  (3.94× savings)
+- F16 K + TQ-HB V (hybrid): K = 252/2 = 126 MB; V = 126/3.94 = 32 MB; total = 158 MB
+  → savings ratio = 504/158 = **3.19× vs raw F32** (was 3.94× = 81% of full TQ-HB savings preserved)
+
+The hybrid trade: keep 81% of TQ-HB memory savings + unlock peer-equivalent SDPA on K (1.81× per-dispatch wall improvement on the K path, which is half of SDPA work).
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (10a is audit-only).  10b implementation opens iter-347.

@@ -2029,11 +2029,28 @@ impl MlxModelWeights {
                 bucket_finish!(s, exec, t0, &PROFILE_B_FINAL_NORM_NS, &PROFILE_B_FINAL_NORM_COUNT, 1, "final_norm");
             }
 
-            // lm_head: whichever weight was loaded (Q8 for large vocab×hs, F16 otherwise).
+            // lm_head: whichever weight was loaded.  ADR-028 iter-345
+            // adds Q6_K arm so HF2Q_LMHEAD_Q6K=1 (iter-188 lever, +2%
+            // decode) coexists with HF2Q_BATCHED_PREFILL=1 (iter-344
+            // default, 34× prefill).  Q6_K dispatched via the same
+            // dispatch_qmatmul as Q8/Q4_0 (kernel_mul_mv_q6_K_f32_nr2
+            // since iter-309 + iter-326 default).
             let t0_lm_head = if profile_buckets_on {
                 Some(std::time::Instant::now())
             } else { None };
-            if let Some(ref q8) = self.lm_head_q8 {
+            if let Some(ref q6k) = self.lm_head_q6k {
+                s.barrier_between(
+                    &[&self.activations.norm_out, &q6k.buffer],
+                    &[&self.activations.logits],
+                );
+                super::forward_mlx::dispatch_qmatmul(
+                    &mut s, reg, dev,
+                    &self.activations.norm_out,
+                    q6k,
+                    &mut self.activations.logits,
+                    1,
+                ).map_err(|e| anyhow::anyhow!("batched lm_head Q6_K: {e}"))?;
+            } else if let Some(ref q8) = self.lm_head_q8 {
                 s.barrier_between(
                     &[&self.activations.norm_out, &q8.buffer],
                     &[&self.activations.logits],
@@ -2058,7 +2075,7 @@ impl MlxModelWeights {
                     &DenseGemmF16Params { m: 1, n: vocab_size as u32, k: hs as u32 },
                 ).map_err(|e| anyhow::anyhow!("batched lm_head: {e}"))?;
             } else {
-                anyhow::bail!("batched prefill requires GPU lm_head (F16 or Q8 weight)");
+                anyhow::bail!("batched prefill requires GPU lm_head (Q6_K, F16, or Q8 weight)");
             }
             if let Some(t0) = t0_lm_head {
                 bucket_finish!(s, exec, t0, &PROFILE_B_LM_HEAD_NS, &PROFILE_B_LM_HEAD_COUNT, 1, "lm_head");

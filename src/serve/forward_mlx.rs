@@ -1288,26 +1288,22 @@ impl MlxModelWeights {
         let compare_mode = INVESTIGATION_ENV.lmhead_compare;
 
         // ADR-028 iter-188: HF2Q_LMHEAD_Q6K — load token_embd.weight as
-        // native on-disk Q6_K (no F32→Q8 re-quant).  Saves 0.33 ms/token
-        // in lm_head dispatch on gemma4 (~2% throughput).  When active,
-        // disables the Q8_0 path AND blocks batched prefill (which
-        // requires F16 or Q8 lm_head).
+        // native on-disk Q6_K (no F32→Q8 re-quant). Saves 0.33 ms/token
+        // (~2% decode).
         //
-        // ADR-028 iter-326 default-flipped to ON.
-        // ADR-028 iter-344 REVERTED to default-OFF (opt-in via env=1)
-        // because Q6_K lm_head conflicts with HF2Q_BATCHED_PREFILL=1
-        // (now also default-ON per iter-344) and batched prefill
-        // delivers 14-45× the prefill speedup (4.4× effective
-        // chat-workload throughput).  Power users who want the +2%
-        // pure-decode gain can opt back in via `HF2Q_LMHEAD_Q6K=1`
-        // (and accept the prefill slowdown).
-        let q6k_env_on = matches!(
+        // iter-326 default-flipped to ON; iter-344 reverted because of
+        // batched-prefill conflict; iter-345 RESTORED to default-ON
+        // because forward_prefill_batched.rs now has a Q6_K arm
+        // dispatching via dispatch_qmatmul + kernel_mul_mv_q6_K_f32_nr2.
+        // Q6_K lm_head + batched prefill COEXIST.  Opt-out via
+        // HF2Q_LMHEAD_Q6K=0/false/off.
+        let q6k_env_off = matches!(
             std::env::var("HF2Q_LMHEAD_Q6K").ok().as_deref(),
-            Some(v) if v.eq_ignore_ascii_case("1")
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("on")
+            Some(v) if v.eq_ignore_ascii_case("0")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
         );
-        let use_q6k = q6k_env_on
+        let use_q6k = !q6k_env_off
             && {
                 gguf.tensor_info("token_embd.weight")
                     .map(|t| t.ggml_type == mlx_native::GgmlType::Q6_K)
