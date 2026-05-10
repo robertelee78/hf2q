@@ -9155,6 +9155,65 @@ hot path that has not been audited.  This is a new optimization
 domain, qwen-specific, with peer-claimed 2.5× upside.  ROI per the
 reddit data is significantly larger than any remaining gemma4 lever.
 
+### iter-264 — K1 batched-verify FIXES regression + REVEALS EOS BUG
+
+Tested HF2Q_SPEC_DECODE_K1=1 (Leviathan-style batched verify per
+`qwen35/spec_decode.rs:242-248`) on qwen3.6-27B-MTP-Q4_0:
+
+| Config | tok/s | Accept | vs MTP-off |
+|--------|------:|-------:|-----------:|
+| MTP off (baseline) | 31.8 | n/a | 1.000× |
+| MTP default (K1=0, sequential verify) | 27.9 | 77.9% | 0.876× ✗ |
+| **MTP + K1=1 (batched verify)** | **34.2** | **88.0%** | **1.075×** ★ |
+
+**Three findings**:
+1. **K1=1 reverses the iter-263 regression** (+22.6% vs default, +7.5%
+   vs MTP-off baseline = real win).
+2. **K1=1 raises acceptance rate 78%→88%** (+10pp).  Better verifier
+   signal: the batched 2-token forward gives the model a "look-ahead"
+   that catches more accepts.
+3. iter-170/171 bench predicted "1.37× greedy speedup at 78% accept";
+   measured at HEAD = 1.075× over MTP-off baseline, 1.226× over
+   MTP-default.  Real-world less than predicted but DEFINITELY a win.
+
+**HOWEVER — K1=1 has an EOS-detection bug at greedy**:
+
+Test prompt: "What is 2+2?", `--temperature 0 --max-tokens 50`:
+- MTP-off:    13 tokens, stops cleanly on `<|im_end|>` ✓
+- MTP-K1=1:   50 tokens (max), generates "</think>\n4<|im_end|>\n\nThe
+              result is 4\n\nThe correct answer is: 4\n\nThe user
+              result: 4" — fails to stop at first `<|im_end|>` ✗
+
+EOS handling EXISTS in K1 path (`spec_decode.rs:327-328, 345, 444-445,
+469`) — the issue is a logic bug in WHEN the EOS check fires, not a
+missing check.  Likely: the batched-verify path emits 2 tokens before
+checking, and `<|im_end|>` lands in the second slot but the check
+fires only on the first slot.
+
+**iter-264 outcome**:
+- ✓ K1=1 path is the right perf direction (+7.5% over no-MTP)
+- ✓ Accept rate improvement confirms K1 logic is sound
+- ✗ EOS-detection bug **blocks default-flip** of HF2Q_SPEC_DECODE_K1
+- → Iter-265+ to localize the EOS check bug at the 2-token boundary
+  in `qwen35/spec_decode.rs`.  Once fixed, K1 becomes the default
+  spec-decode path = +7.5% lever for any qwen3.5/3.6 GGUF with NextN
+  tensors (incl. the 27B-MTP file currently broken in llama.cpp).
+
+**Updated landscape**:
+
+| Optimization | Status | ROI |
+|--------------|--------|----:|
+| Path E+G (gemma4 default flip) | operator-decision-pending | +3.6% |
+| +FUSED on top (gemma4) | operator-decision-pending | +0.7% |
+| K1 batched verify (qwen MTP) | EOS bug to fix | +7.5% over baseline |
+| DFlash port (gemma4) | operator-decision multi-month | +50-200% est |
+
+**The K1 EOS fix is the smallest-scope concrete gain available**:
+- 1-2 iter to localize the bug
+- 1 iter to fix
+- Default-flip ships +7.5% on qwen MTP path
+- Unlocks all qwen3.5/3.6 MTP GGUFs (including the 27B-MTP file)
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
