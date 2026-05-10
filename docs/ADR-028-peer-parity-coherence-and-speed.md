@@ -5317,6 +5317,61 @@ without restructuring the head pipeline (e.g. fold final-norm into
 lm_head input, async argmax-on-GPU, eliminate CPU readback for
 streaming).  These are multi-day items but each saves <0.5%.
 
+### iter-191 — SMOKING GUN: TQ-HB SDPA dequant = 19% of body GPU
+
+Bisected the TQ-HB pipeline by toggling `HF2Q_SKIP_TQ_ENCODE` and
+`HF2Q_SKIP_TQ_SDPA` independently (both produce garbage output but
+preserve dispatch shape — for timing only):
+
+| Config | dispatches | barriers | BODY GPU avg |
+|--------|-----------:|---------:|-------------:|
+| Default (TQ-HB encode + TQ SDPA) | 956 | 459 | 13.6 ms |
+| SKIP_TQ_ENCODE only | 866 (-90) | 459 | 13.5 ms (~free) |
+| **SKIP_TQ_SDPA only** | **836** (-120) | 378 (-81) | **11.0 ms (-2.6 ms!)** |
+| Path E (USE_DENSE F32 KV) | 926 (-30) | 432 (-27) | 12.0 ms (-1.6 ms) |
+| Path E+F (F16 KV) | 926 | 432 | 11.8 ms |
+
+**KEY FINDING**: TQ-HB encode dispatches are FREE on body GPU
+(concurrent / overlapped) — confirming iter-186's lesson that "many
+small dispatches" isn't the cost.  But **TQ-HB SDPA dequant per element
+costs 2.6 ms = 19% of body** — the largest single optimization target
+in the default decode path.
+
+**TQ-HB SDPA cost decomposition** (in flash_attn_vec_tq kernel):
+- Per-element Hadamard inverse on K and V values
+- Per-element 8-bit Lloyd-Max codebook lookup → F32
+- Per-token-per-head F32 scale apply
+- Standard FA softmax + reduction
+
+The 2.6 ms is dequant work *inside* the FA-vec-tq kernel, not the
+encode (which is fully overlapped).
+
+**Path E vs F bandwidth math**:
+- TQ-HB: ~0.5 B/elem (8-bit codebook + small scale)
+- F16:   2 B/elem (4× more bytes)
+- F32:   4 B/elem (8× more bytes)
+
+Path E (F32) saves only 1.6 ms (vs 2.6 ms TQ SDPA cost) because F32
+reads 8× more bytes — dequant cost gone but bandwidth cost partially
+restores.  Path E+F (F16) saves 1.8 ms — closer to full 2.6 ms because
+F16's 4× bytes is more manageable.
+
+**Implication for 25pp peer gap**:
+
+llama.cpp uses F16 KV directly (no TQ-HB).  Path E+F at 73.2 tok/s =
+0.75× peer 97 still has 24pp gap.  This isn't TQ-HB related — Path E+F
+doesn't use TQ-HB.  The 24pp lives elsewhere:
+- Per-layer fixed overhead (norms, RoPE, KV-copy, dispatch chain)
+- SDPA F16 kernel impl differences vs llama.cpp's
+  `kernel_flash_attn_ext_vec`
+
+**TQ-HB SDPA optimization** (if pursued): only valuable while Path E+F
+is default-OFF.  If Path E+F becomes default, TQ-HB code path becomes
+inactive — its 2.6 ms cost vanishes by switching, not by optimizing.
+This makes the operator decision space cleaner:
+- Don't flip → TQ-HB SDPA optimization could buy +19% (~2 ms saved)
+- Flip Path E+F → +14% immediately, no TQ-HB work needed
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
