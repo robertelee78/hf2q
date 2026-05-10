@@ -9740,6 +9740,97 @@ while implementing proper TQ" mantra would extend to qwen3.6 27B-MTP
 in addition to the already-satisfied 35B-A3B.  Worth one iter to
 test.
 
+### iter-272 — REFUTES iter-271's routing-fix hypothesis (Chesterton's fence)
+
+Verified existing test coverage at HEAD before changing the routing
+condition:
+
+**Decode kernel parity** (`mlx-native/tests/test_gated_delta_net_decode.rs`):
+
+```
+test multi_token_nsg_n_tokens_1  ... ok
+test multi_token_nsg_n_tokens_2  ... ok
+test multi_token_nsg_n_tokens_4  ... ok
+test multi_token_nsg_n_tokens_8  ... ok
+test multi_token_nsg_n_tokens_16 ... ok
+test multi_token_nsg_n_tokens_32 ... ok
+```
+
+All 6 PASS within 1e-4 of CPU reference.  Decode kernel math is
+correct at n_tokens up to 32.
+
+**Full DeltaNet layer parity**
+(`gpu_delta_net::tests::full_delta_net_layer_gpu_matches_cpu_ref`):
+
+```
+test inference::models::qwen35::gpu_delta_net::tests::full_delta_net_layer_gpu_matches_cpu_ref ... ok
+```
+
+PASSES at `seq_len=4` with `state_in = vec![0.0f32; state_size]`
+(zero state).  Layer math is correct for **fresh-context** prefill.
+
+**Critical gap**: NO test exercises **seq_len > 1 with non-zero
+state_in** (the mid-stream case K1 actually hits at decode time).
+
+**iter-271's routing-fix hypothesis REFUTED**: simply changing
+`if seq == 1` to `if seq <= 4` won't help because the kernel was
+never the bug.  The bug is in the **layer-level setup code** that
+prepares Q/K/V/state for the kernel when seq>1 AND state is mid-
+stream non-zero.
+
+**iter-178's "cur_len bug" reframed**: "cur_len" suggests the bug is
+in **current-length offset tracking** — specifically, the conv_state
+position offset or recurrent_state read offset when seq_len > 1
+mid-stream.  The prefill path was designed for fresh-context (offset
+0) but K1 uses it mid-stream (offset > 0).
+
+**Updated iter-273 plan** — write the missing test:
+
+```rust
+// Test fixture: synthetic state_in with non-zero values
+//   (simulates accumulated state from N prior decode steps)
+let state_in = synthetic_state(...);
+// 2-token batched forward
+let gpu_out_batched = build_delta_net_layer(seq_len=2, state_in, ...);
+// 2× sequential 1-token forwards (same math, ground truth)
+let mid_state = build_delta_net_layer(seq_len=1, state_in, ...);
+let gpu_out_seq = build_delta_net_layer(seq_len=1, mid_state, ...);
+// Compare
+assert_close(gpu_out_batched, gpu_out_seq, 1e-4);
+```
+
+If this test FAILS → confirms mid-stream + multi-token integration
+bug.  Then bisect within the prefill path's setup steps (op1 norm,
+op2 qkv proj, op3 ssm_conv, op4-6 norms, op7 GDN).
+
+If this test PASSES → bug is higher up (e.g., in qwen35 forward
+calling layer with wrong state_in or position offset).
+
+**Iter-272 outcome**:
+- ✓ Decode kernel math VERIFIED correct at n_tokens=1..32
+- ✓ Layer math VERIFIED correct at seq_len=4 with fresh state
+- ✗ No test exists for seq_len>1 with non-zero state_in (the K1 case)
+- ✗ iter-271's "1-line routing fix" hypothesis REFUTED — bug isn't
+  in routing
+- → iter-273 writes the targeted mid-stream test as the missing
+  falsifier
+
+**Reframed scope estimate**:
+- iter-271: claimed "1-2 iter routing fix" — REFUTED
+- iter-272: scope now "write missing test + bisect within prefill
+  setup" → 2-4 iter targeted localization
+- Still vastly less than original "multi-week DeltaNet rewrite"
+
+**Standing lesson encoded**: when localizing a bug, verify all
+intermediate test layers — kernel parity, layer parity at fresh
+context, integration tests — before assuming "the bug is here".
+iter-271's routing-fix guess would have been a wasted code change.
+
+**Chesterton's fence applied successfully**: iter-271 hypothesized a
+1-line fix, iter-272 verified existing test coverage and refuted it,
+iter-273 will run the targeted falsifier.  No production code
+changes made yet — saved a wasted commit.
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
