@@ -3752,13 +3752,17 @@ impl MlxModelWeights {
                 }
 
                 // -- O-proj --
-                s.barrier_between(
-                    &[&self.activations.sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
-                    &[&self.activations.attn_out],
-                );
-                dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
-                    &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
-                total_dispatches += 1;
+                // ADR-028 iter-211: SKIP_O_PROJ bisect.  Sequential
+                // single qmatmul on critical path after SDPA.
+                if !INVESTIGATION_ENV.skip_o_proj {
+                    s.barrier_between(
+                        &[&self.activations.sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
+                        &[&self.activations.attn_out],
+                    );
+                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
+                        &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
+                    total_dispatches += 1;
+                }
 
                 let num_experts = self.num_experts;
                 let top_k = self.layers[layer_idx].moe.top_k;
