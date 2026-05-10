@@ -115,6 +115,13 @@ pub struct InvestigationEnv {
     /// Produces garbage output (moe_down_id_out stale).
     pub skip_moe_experts: bool,
 
+    /// `HF2Q_SKIP_MOE_SWIGLU=1` — skip just the moe_swiglu_batch_encode
+    /// dispatch per layer (keep gate_up_id and down_id).  ADR-028 iter-202
+    /// — bisect swiglu's exact cost before deciding whether to build a
+    /// fused Q6_K _swiglu kernel.  Produces garbage (down_id reads stale
+    /// moe_swiglu_id_out).
+    pub skip_moe_swiglu: bool,
+
     // ========================================================================
     // Category 4 — warn-only (ineffective but safe). No gate; raw intent.
     // ========================================================================
@@ -560,6 +567,7 @@ struct RawAckIntent {
     skip_tq_sdpa: bool,
     skip_dense_mlp: bool,
     skip_moe_experts: bool,
+    skip_moe_swiglu: bool,
     lmhead_rerank_disabled: bool,
     chunk_scan_prefill: bool,
 }
@@ -576,6 +584,7 @@ impl InvestigationEnv {
             skip_tq_sdpa: env_eq_one("HF2Q_SKIP_TQ_SDPA"),
             skip_dense_mlp: env_eq_one("HF2Q_SKIP_DENSE_MLP"),
             skip_moe_experts: env_eq_one("HF2Q_SKIP_MOE_EXPERTS"),
+            skip_moe_swiglu: env_eq_one("HF2Q_SKIP_MOE_SWIGLU"),
             lmhead_rerank_disabled: matches!(
                 env::var("HF2Q_LMHEAD_RERANK").as_deref(),
                 Ok("0")
@@ -592,6 +601,7 @@ impl InvestigationEnv {
             skip_tq_sdpa: raw.skip_tq_sdpa && ack,
             skip_dense_mlp: raw.skip_dense_mlp && ack,
             skip_moe_experts: raw.skip_moe_experts && ack,
+            skip_moe_swiglu: raw.skip_moe_swiglu && ack,
             lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
             chunk_scan_prefill: raw.chunk_scan_prefill && ack,
 

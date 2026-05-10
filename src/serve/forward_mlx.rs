@@ -3976,17 +3976,22 @@ impl MlxModelWeights {
                         total_dispatches += 1;
 
                         // -- B12: swiglu (singleton) --
-                        s.barrier_between(
-                            &[&self.activations.moe_gate_up_id_out],
-                            &[&self.activations.moe_swiglu_id_out],
-                        );
-                        mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
-                            s.encoder_mut(), reg, metal_dev,
-                            &self.activations.moe_gate_up_id_out,
-                            &self.activations.moe_swiglu_id_out,
-                            moe_int, top_k,
-                        ).map_err(|e| anyhow::anyhow!("swiglu batch L{layer_idx}: {e}"))?;
-                        total_dispatches += 1;
+                        // ADR-028 iter-202: SKIP_MOE_SWIGLU isolates swiglu
+                        // cost.  Skipping leaves moe_swiglu_id_out stale →
+                        // down_id reads garbage.  Timing-only bisect.
+                        if !INVESTIGATION_ENV.skip_moe_swiglu {
+                            s.barrier_between(
+                                &[&self.activations.moe_gate_up_id_out],
+                                &[&self.activations.moe_swiglu_id_out],
+                            );
+                            mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.moe_gate_up_id_out,
+                                &self.activations.moe_swiglu_id_out,
+                                moe_int, top_k,
+                            ).map_err(|e| anyhow::anyhow!("swiglu batch L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+                        }
                     }
 
                     // -- B13: down_id + post-FF norm1 [2 concurrent] --
