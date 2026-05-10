@@ -255,6 +255,51 @@ impl<'a> SpecDecode<'a> {
         }
         self.stats.decode_elapsed = decode_start.elapsed();
 
+        // ADR-028 iter-170: verifier(N) scaling bench (HF2Q_VERIFIER_NBENCH=1).
+        //
+        // Empirical T_v(N) for N=1..4. Used to pick K for the iter-162+
+        // batched-verify refactor. Runs N forward calls back-to-back with
+        // synthetic tokens at sequential positions after the main loop —
+        // doesn't affect generated output, just adds bench latency.
+        //
+        // Speedup formula at K=N-1:
+        //   spec speedup = (1 + a × ... × a^(N-1)) × T_v(1) / (T_v(N) + T_d)
+        // where a = chained accept rate (~0.78 measured), T_d = MTP draft
+        // time (~4ms). Pick K maximizing the ratio.
+        if std::env::var("HF2Q_VERIFIER_NBENCH").as_deref() == Ok("1") {
+            let bench_start_pos = hidden_pos + 1;
+            eprintln!(
+                "[VERIFIER_NBENCH] starting bench at pos {bench_start_pos}"
+            );
+            let mut cumulative_pos = bench_start_pos;
+            for n in 1..=4usize {
+                let synth_tokens: Vec<u32> =
+                    (0..n).map(|i| (i as u32) % 100).collect();
+                let synth_positions =
+                    positions_for_range(cumulative_pos, n);
+                let t0 = Instant::now();
+                let _ = self
+                    .verifier
+                    .forward_gpu_with_hidden(
+                        &synth_tokens,
+                        &synth_positions,
+                        &mut self.kv_cache,
+                    )
+                    .with_context(|| {
+                        format!("VerifierN bench N={n}")
+                    })?;
+                let elapsed_ms =
+                    t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[VERIFIER_NBENCH] N={} T_v={:.2}ms per-tok={:.2}ms",
+                    n,
+                    elapsed_ms,
+                    elapsed_ms / n as f64
+                );
+                cumulative_pos += n as i32;
+            }
+        }
+
         Ok(SpecDecodeResult {
             tokens: generated,
             stats: self.stats.clone(),
