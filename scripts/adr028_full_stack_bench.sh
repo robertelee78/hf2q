@@ -61,8 +61,12 @@ echo "  Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo
 
 run_stack "Default (current)" ""
+# ADR-028 iter-293/297/299: G+FUSED (TQ-HB-intact) is the operator-actionable
+# safe flip — both flags precision-exact (iter-188 + iter-219), TQ-HB memory
+# savings preserved (3.94x per-slot), measured +2.6% (3-run σ < 0.1).
+run_stack "G+FUSED (TQ-HB intact) ★ iter-293 safe flip" "HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1"
 run_stack "Path E (USE_DENSE)" "HF2Q_USE_DENSE=1"
-run_stack "Path E+G (+LMHEAD_Q6K) ★ safe flip" "HF2Q_USE_DENSE=1 HF2Q_LMHEAD_Q6K=1"
+run_stack "Path E+G (+LMHEAD_Q6K)" "HF2Q_USE_DENSE=1 HF2Q_LMHEAD_Q6K=1"
 run_stack "Path E+G + FUSED_END_OF_LAYER" "HF2Q_USE_DENSE=1 HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_UNSAFE_EXPERIMENTS=1"
 # iter-233: Path E+F+G (HF2Q_F16_KV=1) produces "<pad>" at 1000-tok output —
 # DO NOT recommend as default. Kept here for regression-tracking only.
@@ -82,12 +86,19 @@ else
 fi
 
 echo
-echo "Reference (iter-258/259 — long-form 1000-tok HEAD measurements):"
-echo "  Default:       68.6 tok/s   (0.726x peer matched, was 0.663x burst)"
-echo "  Path E:        69.7 tok/s   (0.737x peer matched)"
-echo "  Path E+G:      71.1 tok/s   (0.752x peer matched)  ★ SAFE FLIP"
-echo "  Path E+G+FUS:  noisy 5% σ   (within-noise; iter-258 retired)"
+echo "Reference HEAD measurements (gemma4 APEX-Q5_K_M):"
+echo "  Default:       69.4 tok/s   (0.694x peer 99.95) — TQ-HB intact (iter-293)"
+echo "  G+FUSED:       71.2 tok/s   (0.712x peer; +2.6%) ★ iter-293 SAFE FLIP — TQ-HB intact"
+echo "  Path E:        ~71.0 tok/s  (0.710x peer)        — F32 KV (no TQ-HB)"
+echo "  Path E+G:      ~72.4 tok/s  (0.725x peer)"
+echo "  Path E+G+FUS:  73.5 tok/s   (0.735x peer)        — breaks TQ-HB memory mantra"
 echo "  Path E+F+G:    --           (F16 KV DEGRADES at 1000 tok ✗ iter-233)"
-echo "  llama.cpp tg128:   ~103 tok/s  (burst regime — historical, mismatched)"
-echo "  llama.cpp tg1024:  ~94.5 tok/s (matched regime — apples-to-apples)"
+echo "  llama.cpp tg128:   ~103 tok/s   (burst — historical, mismatched)"
+echo "  llama.cpp tg1024:  ~94.5 tok/s  (matched regime — apples-to-apples)"
 echo "  Apple Silicon thermal throttle: 8.7% from burst → sustained (iter-259)"
+echo
+echo "Operator decision tree:"
+echo "  - Status quo (default):       0.694x peer  TQ-HB ✓"
+echo "  - Flip G+FUSED default:       0.712x peer  TQ-HB ✓ (recommended iter-293)"
+echo "  - Flip E+G+FUSED default:     0.735x peer  TQ-HB ✗ (memory cost)"
+echo "  - DFlash port (multi-month):  1.4-2.8x peer TQ-HB ✓"
