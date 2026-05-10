@@ -68,13 +68,18 @@ run_stack "G+FUSED (TQ-HB intact) ★ iter-293 safe flip" "HF2Q_LMHEAD_Q6K=1 HF2
 # ADR-028 iter-318: STACKED G+FUSED+V2+NR2 — adds iter-310 rms_norm_v2
 # (float4+simd_sum) and iter-309 q6_K nr0=2 on top. TQ-HB intact, parity-
 # proven, +4.3% measured (3-run σ < 0.1).
-run_stack "G+FUSED+V2+NR2 (TQ-HB intact) ★ iter-318 stacked safe flip" "HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_RMS_NORM_V2=1 HF2Q_Q6K_MV_NR2=1"
+run_stack "G+FUSED+V2+NR2 (TQ-HB intact) iter-318 stacked safe flip" "HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_RMS_NORM_V2=1 HF2Q_Q6K_MV_NR2=1"
+# ADR-028 iter-321: adds iter-321 _id_nr2 for MoE Q6_K kernel. +0.3% additive
+# on top of iter-318 stack at 200-tok; full stack delivers +9.6% at 1000-tok
+# (iter-322 sustained regime where baseline thermal-throttles).
+run_stack "G+FUSED+V2+NR2+ID_NR2 (TQ-HB intact) ★ iter-321/322 FULL STACK safe flip" "HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_RMS_NORM_V2=1 HF2Q_Q6K_MV_NR2=1 HF2Q_Q6K_ID_MV_NR2=1"
 run_stack "Path E (USE_DENSE)" "HF2Q_USE_DENSE=1"
 run_stack "Path E+G (+LMHEAD_Q6K)" "HF2Q_USE_DENSE=1 HF2Q_LMHEAD_Q6K=1"
 run_stack "Path E+G + FUSED_END_OF_LAYER" "HF2Q_USE_DENSE=1 HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_UNSAFE_EXPERIMENTS=1"
 # ADR-028 iter-318: E+G+FUSED+V2+NR2 — breaks TQ-HB memory mantra (Path E)
 # but provides reference of full stack ceiling.
 run_stack "Path E+G+FUSED+V2+NR2 (breaks TQ-HB)" "HF2Q_USE_DENSE=1 HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_RMS_NORM_V2=1 HF2Q_Q6K_MV_NR2=1 HF2Q_UNSAFE_EXPERIMENTS=1"
+run_stack "Path E+G+FUSED+V2+NR2+ID_NR2 (breaks TQ-HB, max stack)" "HF2Q_USE_DENSE=1 HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 HF2Q_RMS_NORM_V2=1 HF2Q_Q6K_MV_NR2=1 HF2Q_Q6K_ID_MV_NR2=1 HF2Q_UNSAFE_EXPERIMENTS=1"
 # iter-233: Path E+F+G (HF2Q_F16_KV=1) produces "<pad>" at 1000-tok output —
 # DO NOT recommend as default. Kept here for regression-tracking only.
 run_stack "Path E+F+G (F16 KV — DEGRADED >200 tok ✗)" "HF2Q_USE_DENSE=1 HF2Q_F16_KV=1 HF2Q_LMHEAD_Q6K=1 HF2Q_UNSAFE_EXPERIMENTS=1"
@@ -93,21 +98,22 @@ else
 fi
 
 echo
-echo "Reference HEAD measurements (gemma4 APEX-Q5_K_M, 5-run median 200-tok, σ <0.1):"
-echo "  Default:           69.2 tok/s   (0.679x peer 102) — TQ-HB intact"
-echo "  G+FUSED:           71.3 tok/s   (0.700x peer; +2.6%) iter-293"
-echo "  G+FUSED+V2+NR2:    72.4 tok/s   (0.711x peer; +4.6%) ★ iter-318 STACKED SAFE FLIP — TQ-HB intact"
-echo "  Path E:            ~71.0 tok/s  (0.696x peer)        — F32 KV (no TQ-HB)"
-echo "  Path E+G:          ~72.4 tok/s  (0.710x peer)"
-echo "  Path E+G+FUS:      73.5 tok/s   (0.721x peer)        — breaks TQ-HB memory mantra"
-echo "  Path E+G+FUS+V2+NR2: 74.9 tok/s (0.735x peer; +7.8%) — breaks TQ-HB"
-echo "  Path E+F+G:        --           (F16 KV DEGRADES at 1000 tok ✗ iter-233)"
-echo "  llama.cpp tg128:   ~103 tok/s   (burst)"
-echo "  llama.cpp tg1024:  ~97 tok/s    (matched regime)"
+echo "Reference HEAD measurements (gemma4 APEX-Q5_K_M, σ <0.1):"
+echo "  200-tok matched-regime (5-run median):"
+echo "    Default:                  69.2 tok/s   (0.679x peer 102) — TQ-HB intact"
+echo "    G+FUSED:                  71.3 tok/s   (0.700x peer; +2.6%) iter-293"
+echo "    G+FUSED+V2+NR2:           72.4 tok/s   (0.711x peer; +4.6%) iter-318"
+echo "    G+FUSED+V2+NR2+ID_NR2:    72.6 tok/s   (0.713x peer; +4.9%) ★ iter-321 FULL STACK — TQ-HB intact"
+echo "    Path E+G+FUSED+V2+NR2:    74.9 tok/s   (0.735x peer; +7.8%) — breaks TQ-HB"
+echo "  1000-tok sustained-regime (3-run median, iter-322):"
+echo "    Default:                  65.5 tok/s   (0.675x peer 97)  — thermal-drifts (σ 2.7)"
+echo "    Full stack (5 flags):     71.8 tok/s   (0.740x peer; +9.6%) ★ stable σ <0.1"
+echo "  llama.cpp peer:  tg128 ~103 (burst), tg1024 ~97 (matched)"
 echo
 echo "Operator decision tree (TQ-HB intact options):"
-echo "  - Status quo (default):              0.679x peer  TQ-HB ✓"
-echo "  - Flip G+FUSED:                      0.700x peer  TQ-HB ✓  (iter-293 candidate)"
-echo "  - Flip G+FUSED+V2+NR2:               0.711x peer  TQ-HB ✓  ★ iter-318 candidate (+1.7% more)"
-echo "  - Flip Path E+G+FUSED+V2+NR2:        0.735x peer  TQ-HB ✗  (breaks 3.94x memory)"
-echo "  - DFlash port (multi-month):         1.4-2.8x peer TQ-HB ✓"
+echo "  - Status quo (default):              0.675-0.679x peer  TQ-HB ✓"
+echo "  - Flip G+FUSED only:                 0.700x peer        TQ-HB ✓  (iter-293 candidate)"
+echo "  - Flip G+FUSED+V2+NR2:               0.711x peer        TQ-HB ✓  (iter-318 candidate)"
+echo "  - Flip G+FUSED+V2+NR2+ID_NR2:        0.713-0.740x peer  TQ-HB ✓  ★ iter-321/322 FULL STACK"
+echo "  - Flip E+G+FUSED+V2+NR2+ID_NR2:      ~0.74-0.78x peer   TQ-HB ✗  (breaks 3.94x memory)"
+echo "  - DFlash port (multi-month):         1.4-2.8x peer      TQ-HB ✓"

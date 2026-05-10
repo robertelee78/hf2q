@@ -13266,3 +13266,56 @@ Same status as iter-318→321: byte-identical decode, TQ-HB intact
 
 No code changes — measurement iter that surfaced an even bigger
 production-regime win for the iter-318→321 stack.
+
+
+---
+
+## iter-323 — bench script update + E-path ROI at sustained regime
+
+Locked iter-321/322 findings into `scripts/adr028_full_stack_bench.sh`
+and tested the E+max-stack at 1000-tok for pure ceiling reference.
+
+### Bench script updates
+
+Added 2 new stack rows + updated reference table to show BOTH 200-tok
+matched-regime AND 1000-tok sustained-regime (iter-322 finding):
+
+```
+200-tok matched-regime (5-run median, σ <0.1):
+  Default:                  69.2 tok/s   (0.679x peer 102)
+  G+FUSED:                  71.3 tok/s   (0.700x; +2.6%)  iter-293
+  G+FUSED+V2+NR2:           72.4 tok/s   (0.711x; +4.6%)  iter-318
+  G+FUSED+V2+NR2+ID_NR2:    72.6 tok/s   (0.713x; +4.9%)  ★ iter-321 FULL STACK
+  Path E+G+FUSED+V2+NR2:    74.9 tok/s   (0.735x; +7.8%)  breaks TQ-HB
+
+1000-tok sustained-regime (3-run median, σ <0.1 stack / σ 2.7 baseline):
+  Default:                  65.5 tok/s   (0.675x peer 97) — thermal-drifts
+  Full stack (5 flags):     71.8 tok/s   (0.740x; +9.6%) ★ stable
+  E + max-stack (6 flags):  73.2 tok/s   (0.755x; +11.8%)  breaks TQ-HB
+```
+
+### Path E ROI at sustained regime SHRINKS
+
+At 200-tok: E+max-stack vs TQ-HB-intact full stack:
+  - 74.9 vs 72.6 = +3.2% (significant ROI for breaking TQ-HB memory)
+
+At 1000-tok: E+max-stack vs TQ-HB-intact full stack:
+  - 73.2 vs 71.8 = **+1.9% (marginal ROI; thermal stability erodes Path E's lead)**
+
+**Implication:** At production-relevant sustained workloads, the
+TQ-HB-intact stack closes most of the gap that Path E offers.  The
+operator-actionable G+FUSED+V2+NR2+ID_NR2 safe-flip is increasingly
+the right tradeoff at sustained regime.
+
+### qwen3.6 cross-check at 1000-tok (3 runs)
+
+[deferred to iter-324 — qwen3.6 already at 1.37× peer per iter-320, so
+delta likely smaller in absolute terms]
+
+### Files modified
+
+- `/opt/hf2q/scripts/adr028_full_stack_bench.sh`: added iter-321 + iter-322
+  rows, updated reference table to show 200-tok + 1000-tok regimes.
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes — bench script + doc update.
