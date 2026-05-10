@@ -7287,6 +7287,58 @@ iter-234+ plan: also long-context-test qwen3.6 to verify it doesn't
 have similar issues.  Update bench script to default to 1000-token
 runs to make this kind of regression visible.
 
+### iter-234 — F16 KV: gemma4-broken AND qwen3.6-no-op
+
+**Cross-model long-context check** of `HF2Q_F16_KV=1`:
+
+**qwen3.6 35B-A3B APEX-Q5_K_M, 1000-tok**:
+
+| Stack | Output (first words) | tok/s |
+|-------|----------------------|------:|
+| Default | "Astraeus finds a signal. Not human." | 126.2 |
+| Path E+F+G | "Astraeus finds a signal. Not human." | 125.7 |
+
+→ **qwen3.6 with F16 KV is COHERENT at 1000-tok** AND **F16 KV is
+a no-op on qwen3.6** (perf identical, no measurable speedup).
+qwen3.6 MoE-A3B sparse activation makes KV bandwidth not the
+bottleneck.
+
+**gemma4 26B APEX-Q5_K_M, threshold sweep at Path E+F+G**:
+
+| N tokens | Output (first words) | Coherent? |
+|---------:|----------------------|-----------|
+| 200 | "Aethelgard was more than the sum..." | ✓ |
+| 400 | `<pad>` | ✗ |
+| 600 | "melancholic scholar..." | ✓ |
+| 800 | "year 2142..." | ✓ |
+| 1000 (iter-233 retry) | `<pad>` | ✗ |
+
+→ **Failure is non-deterministic, not threshold-based**.  hf2q's
+default sampler (non-greedy) means F16 KV's logit-noise occasionally
+pushes `<pad>` to argmax-rank early, killing generation.  Random
+fail at any N ≥ 200.
+
+**Conclusion**: `HF2Q_F16_KV` flag is **gemma4-broken AND
+qwen3.6-no-op** → the flag has **no remaining safe use case**:
+
+- gemma4: incoherent at random output lengths → unsafe at any N
+- qwen3.6: coherent but no perf benefit → no reason to enable
+- iter-189's "+8.5%" win was sampling luck at 200-tok benches
+
+iter-235+ plan: deprecate `HF2Q_F16_KV` flag entirely (warn-on-set
++ document as broken in ADR-028); all gemma4 perf gains live in
+**Path E+G** (USE_DENSE + LMHEAD_Q6K) which is precision-exact F32 +
+Q6_K direct lm_head, no precision tradeoff.
+
+**Final operator decision space** (after iter-233 + iter-234):
+
+| Flip | tok/s @ 1000-tok | Δ vs default | Coherence | Recommend? |
+|------|----------------:|-------------:|-----------|------------|
+| (none, default) | 68.4 | 0 | ✓ | baseline |
+| **Path E+G** | **70.9** | **+3.7%** | **✓ at 1000-tok** | **★ SAFE 1-line flip** |
+| Path E+G+FUSED | ~73 | +6.7% | ✓ | UNSAFE_EXP gate |
+| Path E+F+G | ~73 | +6.7% | ✗ random `<pad>` | **DROP from defaults** |
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
