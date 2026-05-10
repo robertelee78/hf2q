@@ -5084,6 +5084,62 @@ reduction effort (no single fusion saves >2 pp).
 - ELSE continue dispatch-reduction kernel walk (each iter: ~1pp gain,
   multi-week to close 21pp)
 
+### iter-186 — fused_post_attn_triple_norm wired in: REGRESSED -1.0% on decode
+
+Discovered `mlx_native::ops::rms_norm::dispatch_fused_post_attn_triple_norm_f32`
+already existed (used by `forward_prefill_batched.rs` via batched-prefill
+path) but was NOT engaged in gemma4 decode (`forward_mlx.rs::forward_decode`).
+Hypothesis: wiring it in saves 3 dispatches/layer × 30 = 90 dispatches/token
+on gemma4 decode → expected ~5% gain.
+
+**Wire-up**: added `HF2Q_FUSED_TRIPLE_NORM=1` env flag (default-OFF) that
+replaces the per-layer pair `dispatch_fused_norm_add_f32` + 3×
+`s.rms_norm` with a single `dispatch_fused_post_attn_triple_norm_f32`
+call (forward_mlx.rs:3707-3784).  Coherence verified: identical "+ 2 = 4"
+output on '2+2' fixture vs default.
+
+**3-run statistical bench** (long-form 200-token generation):
+
+| Config | Run 1 | Run 2 | Run 3 | Median |
+|--------|-------|-------|-------|--------|
+| Default | 62.6 | 62.5 | 62.5 | 62.5 |
+| `HF2Q_FUSED_TRIPLE_NORM=1` | 61.9 | 61.9 | 61.8 | **61.9 (-1.0%)** |
+
+**HYPOTHESIS FALSIFIED**.  Dispatch reduction (956 → 866) gave a
+**REGRESSION on decode**, not a win.
+
+**Root cause** (analyzed post-bench):
+1. B8's three rms_norms were already concurrent on GPU under one barrier.
+   Apple Metal scheduled them in parallel with abundant TG capacity at
+   M=1; effective per-layer cost ≈ max(t1, t2, t3) ≈ ~10 µs total.
+2. The fused kernel is **2-pass sequential within one kernel**: phase 1
+   computes residual+RMS-of-attn, phase 2 writes residual, phase 3
+   re-reads residual + writes 3 outputs with their own RMS computed in
+   between.  No internal parallelism beyond intra-threadgroup.
+3. Bandwidth: extra `residual` write+read pair (~11 KB/layer at hidden=2816)
+   that the unfused path avoided (each unfused norm reads input from L2
+   if cached).
+4. **Net**: fewer dispatches but more sequential work → net slower at
+   single-token decode.  Designed for prefill (M=2455+) where bandwidth
+   savings of "input read once" dominate.
+
+**Lesson learned**: dispatch-count reduction is NOT a universal win.
+Single-token decode is GPU-cycle-rich, not dispatch-bound.  The
+"956 dispatches × 14 µs = 13.5 ms" framing from iter-182 was misleading
+— concurrent dispatches don't multiply linearly.
+
+**Code shipped** default-OFF (opt-in flag) — kernel-correct + tested,
+useful for any future code path that needs the prefill-style fusion or
+where dispatch overhead becomes more limiting (e.g. small batches).
+
+**iter-187+ plan**: dispatch-density walking is invalidated as a strategy.
+The remaining 21pp gap to llama.cpp peer must be addressed via:
+- (a) lower-level kernel impl (specific SDPA/lm_head optimization),
+- (b) Path E default-flip (operator-gate, +12.5%, no precision change),
+- (c) different fusion targets that DON'T already overlap on GPU
+  (e.g. norm+matmul where the norm output feeds matmul input —
+  these are SEQUENTIAL, not concurrent, so fusion saves real time).
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there

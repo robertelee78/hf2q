@@ -473,6 +473,16 @@ pub struct InvestigationEnv {
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub split_timing: bool,
 
+    /// `HF2Q_FUSED_TRIPLE_NORM=1` — replace the per-layer pair
+    /// `fused_norm_add(hidden, attn_out, post_attn_w → residual)` +
+    /// 3× `rms_norm(residual, w_a/b/c → out_a/b/c)` with the single
+    /// `fused_post_attn_triple_norm_f32` kernel.  Saves 3
+    /// dispatches/layer × 30 layers = 90 dispatches/token on gemma4
+    /// decode.  Kernel already exists in mlx-native (used by batched
+    /// prefill) and is byte-identical with the unfused path on prefill
+    /// fixtures.  Default-OFF until decode-path correctness validated.
+    pub fused_triple_norm: bool,
+
     /// `HF2Q_KV_DUAL_LEGACY=1` — force the legacy 2-dispatch K+V cache
     /// copy path (one for K, one for V) instead of the iter-145 fused
     /// single-dispatch dual kernel. ADR-028 forensic A/B switch; both
@@ -658,6 +668,7 @@ impl InvestigationEnv {
             // Profiling / timing.
             mlx_timing: env::var("HF2Q_MLX_TIMING").is_ok(),
             split_timing: env_eq_one("HF2Q_SPLIT_TIMING"),
+            fused_triple_norm: env_eq_one("HF2Q_FUSED_TRIPLE_NORM"),
             kv_dual_legacy: env_eq_one("HF2Q_KV_DUAL_LEGACY"),
             hb_dual_legacy: env_eq_one("HF2Q_HB_DUAL_LEGACY"),
             mlx_kernel_profile: env_eq_one("HF2Q_MLX_KERNEL_PROFILE"),

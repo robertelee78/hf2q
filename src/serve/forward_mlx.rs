@@ -3704,83 +3704,117 @@ impl MlxModelWeights {
                     &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
                 total_dispatches += 1;
 
-                // -- Fused post-attention norm + residual add --
-                s.barrier_between(
-                    &[&self.activations.hidden, &self.activations.attn_out],
-                    &[&self.activations.residual],
-                );
-                mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.hidden,
-                    &self.activations.attn_out,
-                    &self.layers[layer_idx].norms.post_attention_layernorm,
-                    &self.activations.residual,
-                    hs as u32, 1, eps,
-                ).map_err(|e| anyhow::anyhow!("fused post-attn norm+add L{layer_idx}: {e}"))?;
-
-                // (dump_detail_layer already declared above for sdpa_out dump)
-                if dump_layers && dump_detail_layer == Some(layer_idx) {
-                    s.finish()
-                        .map_err(|e| anyhow::anyhow!("dump post-attn finish L{layer_idx}: {e}"))?;
-                    // Post-attention residual (= attn_out after norm+add).
-                    dumps::dump_f32(&self.activations.residual, hs,
-                        "attn_out", Some(layer_idx), seq_pos)?;
-                    s = exec.begin()
-                        .map_err(|e| anyhow::anyhow!("dump post-attn re-begin L{layer_idx}: {e}"))?;
-                }
-                total_dispatches += 1;
-
-                // ============================================================
-                // Dense MLP + MoE routing INTERLEAVED dispatch
-                // (ADR-006 Phase 4e: matches llama.cpp's graph reorder pattern)
-                //
-                // Group B8:  pre-FF norm1 + pre-FF norm2 + router norm  [3 concurrent]
-                // Group B9:  dense gate + dense up + router logits      [3 concurrent]
-                // Group B10: fused_gelu_mul + fused_moe_routing          [2 concurrent]
-                // Group B11: dense down + gate_up_id                     [2 concurrent]
-                //   ... then sequential MoE chain + post-processing
-                // ============================================================
-
                 let num_experts = self.num_experts;
                 let top_k = self.layers[layer_idx].moe.top_k;
 
-                // -- B8: pre-FF norm1 + pre-FF norm2 + router norm [3 CONCURRENT] --
-                // All three read `residual` (written by post-attn norm+add), write disjoint buffers.
-                // ONE barrier, then all three dispatch without barriers between them.
-                s.barrier_between(
-                    &[&self.activations.residual],
-                    &[&self.activations.norm_out, &self.activations.moe_norm_out,
-                      &self.activations.router_norm_out],
-                );
-                s.rms_norm(
-                    reg, metal_dev,
-                    &self.activations.residual,
-                    &self.layers[layer_idx].norms.pre_feedforward_layernorm,
-                    &self.activations.norm_out,
-                    &self.activations.norm_params,
-                    1, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("pre-FF norm L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
+                let dump_after_post_attn = dump_layers && dump_detail_layer == Some(layer_idx);
 
-                s.rms_norm(
-                    reg, metal_dev,
-                    &self.activations.residual,
-                    &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
-                    &self.activations.moe_norm_out,
-                    &self.activations.norm_params,
-                    1, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("pre-FF norm 2 L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
+                // ADR-028 iter-186 — opt-in fused 4→1 kernel that combines:
+                //   (a) post-attn norm+add (hidden + norm(attn_out, post_attn_w) → residual)
+                //   (b) B8's three concurrent rms_norms over `residual` with weights
+                //       {pre_feedforward_layernorm, pre_feedforward_layernorm_2,
+                //        router_combined_weight} → {norm_out, moe_norm_out, router_norm_out}
+                // Saves 3 dispatches/layer × 30 layers = 90 dispatches/token on gemma4.
+                // Kernel `fused_post_attn_triple_norm_f32` already exists in mlx-native
+                // (used by batched prefill).  Default-OFF until decode coherence proven.
+                //
+                // Disabled when dump_layers requires reading `residual` between
+                // (a) and (b) — would need a CB split that defeats the fusion.
+                if INVESTIGATION_ENV.fused_triple_norm && !dump_after_post_attn {
+                    s.barrier_between(
+                        &[&self.activations.hidden, &self.activations.attn_out],
+                        &[&self.activations.residual,
+                          &self.activations.norm_out,
+                          &self.activations.moe_norm_out,
+                          &self.activations.router_norm_out],
+                    );
+                    mlx_native::ops::rms_norm::dispatch_fused_post_attn_triple_norm_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.hidden,
+                        &self.activations.attn_out,
+                        &self.layers[layer_idx].norms.post_attention_layernorm,
+                        &self.layers[layer_idx].norms.pre_feedforward_layernorm,
+                        &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
+                        &self.layers[layer_idx].moe.router_combined_weight,
+                        &self.activations.residual,
+                        &self.activations.norm_out,
+                        &self.activations.moe_norm_out,
+                        &self.activations.router_norm_out,
+                        eps, 1, hs as u32,
+                    ).map_err(|e| anyhow::anyhow!("fused post-attn+triple-norm L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+                } else {
+                    // -- Fused post-attention norm + residual add --
+                    s.barrier_between(
+                        &[&self.activations.hidden, &self.activations.attn_out],
+                        &[&self.activations.residual],
+                    );
+                    mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.hidden,
+                        &self.activations.attn_out,
+                        &self.layers[layer_idx].norms.post_attention_layernorm,
+                        &self.activations.residual,
+                        hs as u32, 1, eps,
+                    ).map_err(|e| anyhow::anyhow!("fused post-attn norm+add L{layer_idx}: {e}"))?;
 
-                s.rms_norm(
-                    reg, metal_dev,
-                    &self.activations.residual,
-                    &self.layers[layer_idx].moe.router_combined_weight,
-                    &self.activations.router_norm_out,
-                    &self.activations.norm_params,
-                    1, hs as u32,
-                ).map_err(|e| anyhow::anyhow!("router norm L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
+                    if dump_after_post_attn {
+                        s.finish()
+                            .map_err(|e| anyhow::anyhow!("dump post-attn finish L{layer_idx}: {e}"))?;
+                        dumps::dump_f32(&self.activations.residual, hs,
+                            "attn_out", Some(layer_idx), seq_pos)?;
+                        s = exec.begin()
+                            .map_err(|e| anyhow::anyhow!("dump post-attn re-begin L{layer_idx}: {e}"))?;
+                    }
+                    total_dispatches += 1;
+
+                    // ============================================================
+                    // Dense MLP + MoE routing INTERLEAVED dispatch
+                    // (ADR-006 Phase 4e: matches llama.cpp's graph reorder pattern)
+                    //
+                    // Group B8:  pre-FF norm1 + pre-FF norm2 + router norm  [3 concurrent]
+                    // Group B9:  dense gate + dense up + router logits      [3 concurrent]
+                    // Group B10: fused_gelu_mul + fused_moe_routing          [2 concurrent]
+                    // Group B11: dense down + gate_up_id                     [2 concurrent]
+                    //   ... then sequential MoE chain + post-processing
+                    // ============================================================
+
+                    // -- B8: pre-FF norm1 + pre-FF norm2 + router norm [3 CONCURRENT] --
+                    s.barrier_between(
+                        &[&self.activations.residual],
+                        &[&self.activations.norm_out, &self.activations.moe_norm_out,
+                          &self.activations.router_norm_out],
+                    );
+                    s.rms_norm(
+                        reg, metal_dev,
+                        &self.activations.residual,
+                        &self.layers[layer_idx].norms.pre_feedforward_layernorm,
+                        &self.activations.norm_out,
+                        &self.activations.norm_params,
+                        1, hs as u32,
+                    ).map_err(|e| anyhow::anyhow!("pre-FF norm L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+
+                    s.rms_norm(
+                        reg, metal_dev,
+                        &self.activations.residual,
+                        &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
+                        &self.activations.moe_norm_out,
+                        &self.activations.norm_params,
+                        1, hs as u32,
+                    ).map_err(|e| anyhow::anyhow!("pre-FF norm 2 L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+
+                    s.rms_norm(
+                        reg, metal_dev,
+                        &self.activations.residual,
+                        &self.layers[layer_idx].moe.router_combined_weight,
+                        &self.activations.router_norm_out,
+                        &self.activations.norm_params,
+                        1, hs as u32,
+                    ).map_err(|e| anyhow::anyhow!("router norm L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+                }
 
                 // -- B9: dense gate + dense up + router logits [3 CONCURRENT] --
                 // gate/up read norm_out (from B8 norm1); router reads router_norm_out (from B8 router norm).
