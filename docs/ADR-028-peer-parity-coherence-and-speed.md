@@ -5656,6 +5656,48 @@ to confirm orthogonality math.  Then look for next bisect target —
 likely norm fusion (B8/B9 sequential chains) with a similar
 hardcode-and-measure approach.
 
+### iter-198 — full re-bench post-iter-197; Path E delta shrunk to +2.5%
+
+3-run statistical median, gemma4 200-tok long-form:
+
+| Stack | tok/s | vs peer 102.7 | Δ vs new default |
+|-------|------:|--------------:|-----------------:|
+| **New default (iter-197)** | **69.3** | **0.675×** | — |
+| Path G | 70.1 | 0.683× | +1.2% |
+| Path E | 71.0 | 0.691× | +2.5% |
+| Path E+G | 72.4 | 0.705× | +4.5% |
+| Path E+F+G | 73.7 | 0.718× | +6.4% |
+
+**Big strategic finding**: Path E delta shrunk from +12.8% (pre-iter-197)
+to **+2.5%** (post-iter-197).  iter-197's TQ-HB SDPA optimization
+RECLAIMED most of the win that Path E was filling — Path E skips TQ-HB
+entirely, so making TQ-HB faster reduces the relative advantage of
+Path E.
+
+**Operator-flip ROI re-evaluation**:
+- Default → Path E: was +12.5% lever, now +2.5% lever (mostly closed)
+- Default → Path E+F+G: was +16.7% lever, now +6.4% lever
+- The "should we flip default?" question is now MUCH less impactful
+- Default users get nearly all the benefit automatically (within 5%
+  of best precision-exact stack)
+
+**Body GPU split-timing post-iter-197**:
+- Body GPU avg: **12.5 ms** (was 13.5 ms pre-iter-197 = saved 1.0 ms)
+- Dispatches/barriers unchanged: 956/459 (function-constant doesn't
+  change shape, just kernel runtime)
+- Total token time: 14.45 ms → head ≈ 1.95 ms (consistent with
+  pre-iter-197 head ~2.0 ms)
+
+**Per-layer body cost**: 12.5/30 = **417 µs/layer** (was 450 µs
+pre-iter-197).  qwen3.6 still at ~150 µs/layer (3× cheaper due to
+DeltaNet majority).
+
+iter-199+ plan: per-block GPU timing instrumentation in production CB
+to localize where the remaining 12.5 ms body GPU time lives.  Will
+add HF2Q_BLOCK_TIMING=1 (3-6 ms diagnostic overhead acceptable for
+one-shot measurement).  Goal: identify next +5%+ bisect target with
+hardcode-and-measure approach (no speculation).
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
