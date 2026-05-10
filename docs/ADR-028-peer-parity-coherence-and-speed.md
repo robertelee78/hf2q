@@ -8455,6 +8455,81 @@ time for each.  Confirms or refutes H1.
 This is the operator's directed path: exhaust kernel optimization
 before DFlash.
 
+### iter-253 — fresh mat-vec bench at HEAD: Q_sliding 47.8% peak, but kernels NOT the bottleneck
+
+Re-ran existing iter-180 bench (`benches/bench_decode_qmatmul_shapes.rs`)
+at HEAD for fresh per-shape mat-vec efficiency.  Apple M5 Max peak
+546 GB/s, sustained ~400 GB/s.
+
+**Per-shape results** (BATCHED median, M=1 decode):
+
+| Shape | bytes | µs | GB/s | %peak | %sustained |
+|-------|------:|---:|-----:|------:|-----------:|
+| Q_sliding (4096×2816 Q5_K) | 7.9 MB | 30.4 | 261 | **47.8%** | 65.3% |
+| K_sliding (2048×2816 Q5_K) | 4.0 MB | 11.0 | 360 | 66.0% | 90.0% |
+| V_sliding (2048×2816 Q5_K) | 4.0 MB | 10.8 | 366 | 67.1% | 91.6% |
+| **O_sliding (2816×4096 Q5_K)** | 7.9 MB | 15.9 | **500** | **91.6%** | **125.0%** |
+| Q_global (4096×2816 Q5_K) | 7.9 MB | 16.7 | 475 | 87.0% | 118.7% |
+| K_global (2048×2816 Q5_K) | 4.0 MB | 11.0 | 362 | 66.3% | 90.5% |
+| V_global (2048×2816 Q5_K) | 4.0 MB | 10.9 | 363 | 66.5% | 90.7% |
+| **O_global (2816×4096 Q5_K)** | 7.9 MB | 16.0 | **497** | **91.0%** | **124.2%** |
+| Router (128×2816 Q5_K) | 0.2 MB | 5.8 | 43 | 7.9% | 10.8% |
+| **lmhead_Q6_K (262144×2816)** | 605.6 MB | 1045 | **579** | **106.1%** | **144.8%** |
+| lmhead_Q8_0 | 784.3 MB | 1368 | 573 | 105.0% | 143.3% |
+
+**Findings**:
+
+1. **lm_head Q6_K is at 579 GB/s = 106% of nominal peak**.  Kernel is
+   **bandwidth-saturated, optimal**.  Cannot improve further.
+
+2. **O-proj at 91% peak** for both sliding and global — also near
+   optimal.
+
+3. **Q_sliding suboptimal (47.8% peak)** — same bytes as O_sliding
+   but 2× lower bandwidth (261 vs 500 GB/s).  The mat-vec kernel
+   handles N>K (Q_sliding: 4096×2816) less well than N<K
+   (O_sliding: 2816×4096).  Optimization target: **bring Q_sliding
+   up to ~80% peak → +12 µs/layer × 24 sliding layers = 0.29 ms/token
+   ≈ 2% gain**.
+
+4. **K/V at 66% peak** — could potentially improve but smaller
+   absolute savings.
+
+5. **Per-token attention+router reads: 2.11 GB / 4.55 ms = 464 GB/s
+   aggregate**.  Implies **219.9 tok/s ceiling from these kernels
+   alone** — far above peer's 103 tok/s and our 70.
+
+**Critical conclusion**: **mat-vec kernels are NOT the bottleneck**.
+Their aggregate ceiling is 220 tok/s; we're at 70.  The 14.5 ms decode
+breakdown:
+
+| Component | ms | % |
+|-----------|---:|--:|
+| Attn+router mat-vec (this bench) | 4.55 | 31% |
+| MoE experts (iter-201) | 2.60 | 18% |
+| TQ-HB SDPA (iter-191) | 1.50 | 10% |
+| 3× fused_norm_add (iter-205+207+208) | 1.09 | 8% |
+| Other (RoPE, KV-copy, head-norm, dispatch overhead) | **4.76** | **33%** |
+| **Total** | **14.50** | **100%** |
+
+**The "Other" 4.76 ms is the largest component**.  It includes:
+- ~2.88 ms dispatch overhead (3 µs × 960 dispatches)
+- ~1.88 ms residual (KV cache update, RoPE, embed gather, head ops)
+
+**Per-kernel efficiency is mostly fine; the gap lives in**:
+- **Dispatch count + per-dispatch overhead** (need to find the 80
+  excess vs peer + investigate if 3 µs is fundamental on M5 Max or
+  hf2q-specific Rust binding overhead)
+- **Q_sliding mat-vec optimization** (~2% available)
+- **MoE expert optimization** (largest single component at 2.6 ms;
+  iter-201 already bisected; needs sub-component analysis)
+
+**Iter-254 plan**: investigate the 4.76 ms "Other" residual.
+Specifically: profile RoPE, KV-copy, head-norm, embed gather as
+separate categories.  Also: directly compare hf2q's Rust-Metal
+binding overhead vs llama.cpp's C-Metal binding for the SAME kernel
+dispatch (per H2).
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
