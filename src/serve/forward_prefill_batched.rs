@@ -327,35 +327,52 @@ impl MlxModelWeights {
             _ => 1.0_f32,  // bare (iter-16 default)
         };
         if tq_codebook_bits_prefill >= 5 {
-            eprintln!("[iter-21 Track B] Allocating leg_hb_encoded ({}-bit, {} layers) [batched]",
-                      tq_codebook_bits_prefill, num_layers);
-            let mut leg_hb_vec: Vec<HbKvBuffers> = Vec::with_capacity(num_layers);
-            for (layer_idx, layer) in self.layers.iter().enumerate() {
-                let nkv_l = layer.num_kv_heads;
-                let hd_l = layer.head_dim;
-                let layer_is_ring = layer.layer_type == LayerType::Sliding;
-                let capacity = if layer_is_ring { sw } else { linear_capacity };
-                let norms_per_pos = (hd_l / 256).max(1);
-                let norms_n = nkv_l * capacity * norms_per_pos;
-                let k_packed = dev.alloc_buffer(nkv_l * capacity * hd_l, mlx_native::DType::U8,
-                    vec![nkv_l, capacity, hd_l])
-                    .map_err(|e| anyhow::anyhow!("leg_hb batched K packed L{layer_idx}: {e}"))?;
-                let k_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
-                    if norms_per_pos == 1 { vec![nkv_l, capacity] } else { vec![nkv_l, capacity, norms_per_pos] })
-                    .map_err(|e| anyhow::anyhow!("leg_hb batched K norms L{layer_idx}: {e}"))?;
-                let v_packed = dev.alloc_buffer(nkv_l * capacity * hd_l, mlx_native::DType::U8,
-                    vec![nkv_l, capacity, hd_l])
-                    .map_err(|e| anyhow::anyhow!("leg_hb batched V packed L{layer_idx}: {e}"))?;
-                let v_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
-                    if norms_per_pos == 1 { vec![nkv_l, capacity] } else { vec![nkv_l, capacity, norms_per_pos] })
-                    .map_err(|e| anyhow::anyhow!("leg_hb batched V norms L{layer_idx}: {e}"))?;
-                leg_hb_vec.push(HbKvBuffers {
-                    k_packed, k_norms, v_packed, v_norms,
-                    capacity, is_sliding: layer_is_ring, norms_per_pos,
-                });
+            // ADR-028 Phase 10c (iter-348): hybrid F16-K + TQ-HB-V routing,
+            // mirrors forward_mlx.rs decode lazy-alloc + forward_prefill.rs.
+            if INVESTIGATION_ENV.hybrid_kv {
+                eprintln!("[ADR-028 Phase 10c] Allocating hybrid_kv ({} layers, F16 K + TQ-HB V {}-bit) [batched]",
+                    num_layers, tq_codebook_bits_prefill);
+                let mut hybrid_vec: Vec<crate::serve::forward_mlx::HybridKvBuffers> = Vec::with_capacity(num_layers);
+                for (layer_idx, layer) in self.layers.iter().enumerate() {
+                    let nkv_l = layer.num_kv_heads;
+                    let hd_l = layer.head_dim;
+                    let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                    let capacity = if layer_is_ring { sw } else { linear_capacity };
+                    hybrid_vec.push(crate::serve::forward_mlx::alloc_hybrid_kv_for_layer(
+                        dev, layer_idx, nkv_l, hd_l, capacity, layer_is_ring)?);
+                }
+                self.hybrid_kv = Some(hybrid_vec);
+            } else {
+                eprintln!("[iter-21 Track B] Allocating leg_hb_encoded ({}-bit, {} layers) [batched]",
+                          tq_codebook_bits_prefill, num_layers);
+                let mut leg_hb_vec: Vec<HbKvBuffers> = Vec::with_capacity(num_layers);
+                for (layer_idx, layer) in self.layers.iter().enumerate() {
+                    let nkv_l = layer.num_kv_heads;
+                    let hd_l = layer.head_dim;
+                    let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                    let capacity = if layer_is_ring { sw } else { linear_capacity };
+                    let norms_per_pos = (hd_l / 256).max(1);
+                    let norms_n = nkv_l * capacity * norms_per_pos;
+                    let k_packed = dev.alloc_buffer(nkv_l * capacity * hd_l, mlx_native::DType::U8,
+                        vec![nkv_l, capacity, hd_l])
+                        .map_err(|e| anyhow::anyhow!("leg_hb batched K packed L{layer_idx}: {e}"))?;
+                    let k_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
+                        if norms_per_pos == 1 { vec![nkv_l, capacity] } else { vec![nkv_l, capacity, norms_per_pos] })
+                        .map_err(|e| anyhow::anyhow!("leg_hb batched K norms L{layer_idx}: {e}"))?;
+                    let v_packed = dev.alloc_buffer(nkv_l * capacity * hd_l, mlx_native::DType::U8,
+                        vec![nkv_l, capacity, hd_l])
+                        .map_err(|e| anyhow::anyhow!("leg_hb batched V packed L{layer_idx}: {e}"))?;
+                    let v_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
+                        if norms_per_pos == 1 { vec![nkv_l, capacity] } else { vec![nkv_l, capacity, norms_per_pos] })
+                        .map_err(|e| anyhow::anyhow!("leg_hb batched V norms L{layer_idx}: {e}"))?;
+                    leg_hb_vec.push(HbKvBuffers {
+                        k_packed, k_norms, v_packed, v_norms,
+                        capacity, is_sliding: layer_is_ring, norms_per_pos,
+                    });
+                }
+                self.leg_hb_encoded = Some(leg_hb_vec);
+                eprintln!("[iter-21 Track B] leg_hb_encoded ready ({} layers) [batched]", num_layers);
             }
-            self.leg_hb_encoded = Some(leg_hb_vec);
-            eprintln!("[iter-21 Track B] leg_hb_encoded ready ({} layers) [batched]", num_layers);
         }
 
         // -------------------------------------------------------------------
@@ -1400,7 +1417,36 @@ impl MlxModelWeights {
                 // n_copy / src_tok_offset) so dense and HB caches stay in
                 // lockstep on sliding-window ring positions.
                 if tq_codebook_bits_prefill >= 5 && !INVESTIGATION_ENV.skip_tq_encode {
-                    if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
+                    if INVESTIGATION_ENV.hybrid_kv {
+                        // ADR-028 Phase 10c (iter-348): hybrid F16-K + TQ-HB-V
+                        // batched-prefill encode path. F32 K → F16 K (sequence
+                        // copy) + V-only TQ-HB sequence encode.
+                        if let Some(ref hybrid_kv) = self.hybrid_kv {
+                            let hb_cap = hybrid_kv[layer_idx].capacity as u32;
+                            let hb_is_ring = hybrid_kv[layer_idx].is_sliding;
+                            s.barrier_between(
+                                &[&pf_k_normed, &pf_v_normed],
+                                &[&hybrid_kv[layer_idx].k,
+                                  &hybrid_kv[layer_idx].v_packed, &hybrid_kv[layer_idx].v_norms],
+                            );
+                            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                                s.encoder_mut(), reg, metal_dev,
+                                &pf_k_normed,
+                                &hybrid_kv[layer_idx].k,
+                                nkv as u32, hd as u32,
+                                hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
+                            ).map_err(|e| anyhow::anyhow!("batched hybrid F16 K L{layer_idx}: {e}"))?;
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
+                                s.encoder_mut(), reg, metal_dev,
+                                &pf_v_normed,
+                                &hybrid_kv[layer_idx].v_packed,
+                                &hybrid_kv[layer_idx].v_norms,
+                                nkv as u32, hd as u32,
+                                hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
+                                hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
+                            ).map_err(|e| anyhow::anyhow!("batched hybrid V TQ-HB L{layer_idx}: {e}"))?;
+                        }
+                    } else if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
                         let hb_cap = leg_hb_enc[layer_idx].capacity as u32;
                         let hb_is_ring = leg_hb_enc[layer_idx].is_sliding;
                         s.barrier_between(

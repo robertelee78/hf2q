@@ -15433,3 +15433,48 @@ Decode at HEAD (legacy default, `HF2Q_HYBRID_KV` unset) unchanged from iter-346 
 ### Next iter (10c)
 
 Wire the F16-K skip path: when `INVESTIGATION_ENV.hybrid_kv == true`, allocate `HybridKvBuffers` instead of `HbKvBuffers` at the `forward_mlx.rs:2421+` lazy-alloc site, and route the K write at `forward_mlx.rs:3370+` to the F16 K buffer instead of through the TQ-HB encode dispatch.  V stays on its existing TQ-HB encode path.  Allocation + write parity test first, then SDPA dispatcher in 10e.
+
+## iter-348 — Phase 10c LANDED: F16-K skip + V-only TQ-HB encode wired at all 3 sites
+
+### Date
+2026-05-10
+
+### Hypothesis (from iter-347 plan)
+Wiring the `HF2Q_HYBRID_KV` env-gate at the 3 lazy-alloc sites (decode lazy-alloc in `forward_mlx.rs:2509+`, per-token prefill in `forward_prefill.rs:802+`, batched prefill in `forward_prefill_batched.rs:312+`) and at the 3 corresponding encode sites (decode at `forward_mlx.rs:3060+`, per-token prefill at `forward_prefill.rs:1243+`, batched prefill at `forward_prefill_batched.rs:1411+`) — using the existing single-buffer dispatchers (`dispatch_kv_cache_copy_batch_f32_to_f16` / `dispatch_kv_cache_copy_seq_f32_to_f16` for F16 K + `dispatch_hadamard_quantize_kv_hb` / `dispatch_hadamard_quantize_kv_hb_seq` for V-only TQ-HB) — should keep the legacy TQ-HB path bit-identical when the gate is OFF and produce a clear hard-fail when the gate is ON without Phase 10d/10e wired.
+
+### Result
+**LANDED.**  Both branches verified live on `gemma4-ara-2pass-APEX-Q5_K_M.gguf`:
+
+- **Default (gate OFF)**: `prompt="What is 2+2?", max_tokens=30, temp=0` → `2 + 2 = 4<turn|>` (bit-identical to HEAD).  Decode 81 tok/s (matches iter-347 baseline noise).
+- **Gate ON (`HF2Q_HYBRID_KV=1`)**: lazy-alloc emits `[ADR-028 Phase 10c] Allocating hybrid_kv (30 layers, F16 K + TQ-HB V 8-bit) [batched]`; encode dispatches succeed; SDPA dispatcher hard-fails with `HF2Q_HYBRID_KV=1 set but Phase 10e SDPA dispatcher not wired (gemma4 decode L0). Unset HF2Q_HYBRID_KV to fall back to legacy TQ-HB SDPA, or land Phase 10d/10e first. See ADR-028 §iter-348.`  Loud-not-silent partial-stack failure mode confirmed; `leg_hb_encoded` is NOT allocated under the hybrid path (verified via the `[iter-21 Track B] Allocated leg_hb_encoded ...` line being absent from stderr).
+
+`cargo test --bin hf2q --lib` 3454/0 passing (no regression on the 4 hybrid_kv env-gate tests + 3450 pre-existing).
+
+### Files modified
+
+- `/opt/hf2q/src/serve/forward_mlx.rs`:
+  - Add `pub(super) fn alloc_hybrid_kv_for_layer(...)` helper — single-source-of-truth for the F16-K + TQ-HB-V buffer shape (called from 3 sites).
+  - Decode lazy-alloc gate (line 2509+): route to `alloc_hybrid_kv_for_layer` + `self.hybrid_kv` when `INVESTIGATION_ENV.hybrid_kv && self.hybrid_kv.is_none()`; else if `!INVESTIGATION_ENV.hybrid_kv` fall through to existing legacy alloc (mutex).
+  - Decode encode site (line 3060+): when `INVESTIGATION_ENV.hybrid_kv && self.hybrid_kv.is_some()`, dispatch F32→F16 K copy + V-only TQ-HB encode (2 dispatches); else fall through to existing legacy dual-encode.
+  - Decode SDPA site (line 3744+): when `INVESTIGATION_ENV.hybrid_kv` is set, return loud `anyhow::Error` with clear "Phase 10e not wired" message before any TQ-HB SDPA dispatch.
+- `/opt/hf2q/src/serve/forward_prefill.rs`: per-token prefill lazy-alloc + encode sites mirrored from forward_mlx.rs (calls into the shared `alloc_hybrid_kv_for_layer` helper).
+- `/opt/hf2q/src/serve/forward_prefill_batched.rs`: batched-prefill lazy-alloc + encode sites mirrored, using `dispatch_kv_cache_copy_seq_f32_to_f16` for the F16 K SEQUENCE copy (vs the single-position variant in the per-token path).
+
+### Trade-off documented
+
+The hybrid encode adds 30 dispatches/decode-token at gemma4 30L (1 dual-encode → 1 F16-K-copy + 1 V-only-encode = 2 per layer).  Each ~14 µs Apple kernel-launch floor → ~420 µs/decode-token added by encode side.  The expected K-side SDPA throughput gain (Phase 10d) is ~5 µs/dispatch × 30 layers = 150 µs/decode-token saved.
+
+Net at 10c+10d if no further work: encode +420 µs vs SDPA -150 µs = **net +270 µs/decode-token regression** on hybrid path.  This means 10c+10d alone is NOT enough — a follow-up (10d.5) is required to fuse F16-K-copy + V-only-encode into a single dispatch (a `kv_copy_f16_quantize_v_dual` kernel).  Documented now so the operator decision after 10g bench is informed: ship hybrid only when the fused encode kernel also lands.
+
+This is NOT premature optimization deferral — Phase 10c.5 / 10d.5 is a known-required iteration BEFORE shipping hybrid as default (per mantra: no fallback, no stub).
+
+### Bench
+No bench delta this iter (legacy path bit-identical when gate OFF).  Decode 81 tok/s on gemma4 short prompt unchanged from iter-347.
+
+### Next iter (10d)
+New Metal kernel `flash_attn_vec_hybrid_dk256` in `/opt/mlx-native/src/shaders/`:
+- Reads K as `device const half *` (F16) → consumed by `simdgroup_matrix<float, 8, 8>` matmul (peer-equivalent path; ~6.6 µs/dispatch budget).
+- Reads V as `device const uchar *` (TQ-HB packed) + per-position F32 norms → consumed by per-thread codebook lookup (existing TQ-HB path; ~5.3 µs/dispatch on V).
+- Writes scaled+softmax output into the existing SDPA-out buffer.
+
+Reference: `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:5801 kernel_flash_attn_ext_impl` for the F16-K simdgroup matmul layout; `/opt/mlx-native/src/shaders/flash_attn_vec_tq_hb.metal` for the existing V-side TQ-HB codebook lookup.  Expect ~5-7 /loop iters for kernel + parity + bench (10d-10g).

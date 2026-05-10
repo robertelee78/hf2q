@@ -1135,6 +1135,38 @@ impl crate::serve::kv_persist::lcp_registry::ByteSized for HybridKvBuffers {
     }
 }
 
+/// ADR-028 Phase 10c (iter-348): per-layer F16-K + TQ-HB-V buffer allocator.
+///
+/// Single-source-of-truth for the hybrid allocation shape — called from
+/// 3 sites (decode lazy-alloc, per-token prefill alloc, batched-prefill
+/// alloc) so all three stay in lockstep.
+///
+/// F16 K: 2 bytes/elem, shape `[nkv, cap, hd]`.
+/// V layout identical to legacy `HbKvBuffers` V-side (1 byte/elem packed +
+/// per-pos F32 norms with `norms_per_pos = max(1, hd / 256)`).
+pub(super) fn alloc_hybrid_kv_for_layer(
+    dev: &mlx_native::MlxDevice,
+    layer_idx: usize,
+    nkv: usize,
+    hd: usize,
+    cap: usize,
+    is_ring: bool,
+) -> anyhow::Result<HybridKvBuffers> {
+    let norms_per_pos = (hd / 256).max(1);
+    let norms_n = nkv * cap * norms_per_pos;
+    // F16 K: byte_count = elements * 2.
+    let k = dev.alloc_buffer(nkv * cap * hd * 2, mlx_native::DType::F16,
+        vec![nkv, cap, hd])
+        .map_err(|e| anyhow::anyhow!("hybrid F16 K L{layer_idx}: {e}"))?;
+    let v_packed = dev.alloc_buffer(nkv * cap * hd, mlx_native::DType::U8,
+        vec![nkv, cap, hd])
+        .map_err(|e| anyhow::anyhow!("hybrid V packed L{layer_idx}: {e}"))?;
+    let v_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
+        if norms_per_pos == 1 { vec![nkv, cap] } else { vec![nkv, cap, norms_per_pos] })
+        .map_err(|e| anyhow::anyhow!("hybrid V norms L{layer_idx}: {e}"))?;
+    Ok(HybridKvBuffers { k, v_packed, v_norms, capacity: cap, is_sliding: is_ring, norms_per_pos })
+}
+
 /// Per-call decode regime override for ADR-007 Gate H two-regime-one-process
 /// runs (W12 iter-108a blocker #3).
 ///
@@ -2506,7 +2538,26 @@ impl MlxModelWeights {
             // ADR-005 wave-1 T1.2: read from INVESTIGATION_ENV LazyLock (parsed once at
             // process start) instead of calling std::env::var per forward_decode call.
             let cb_bits: u32 = INVESTIGATION_ENV.tq_codebook_bits;
-            if cb_bits >= 5 && self.leg_hb_encoded.is_none() {
+            // ADR-028 Phase 10c (iter-348): if hybrid_kv gate is on, route to
+            // HybridKvBuffers (F16 K + TQ-HB V) instead of legacy HbKvBuffers
+            // (TQ-HB K + TQ-HB V). Mutually exclusive at alloc time per the
+            // Phase 10b struct comment; only one of `hybrid_kv` /
+            // `leg_hb_encoded` is `Some(_)` for a given model instance.
+            if cb_bits >= 5 && INVESTIGATION_ENV.hybrid_kv && self.hybrid_kv.is_none() {
+                let (exec, _reg) = gpu.split();
+                let dev = exec.device();
+                let mut hybrid_vec: Vec<HybridKvBuffers> = Vec::with_capacity(num_layers);
+                for layer_idx in 0..num_layers {
+                    let nkv = self.layers[layer_idx].num_kv_heads;
+                    let hd = self.layers[layer_idx].head_dim;
+                    let is_ring = self.kv_caches[layer_idx].is_sliding;
+                    let cap = self.kv_caches[layer_idx].capacity;
+                    hybrid_vec.push(alloc_hybrid_kv_for_layer(dev, layer_idx, nkv, hd, cap, is_ring)?);
+                }
+                eprintln!("[ADR-028 Phase 10c] Allocated hybrid_kv ({} layers, F16 K + TQ-HB V {}-bit)",
+                    num_layers, cb_bits);
+                self.hybrid_kv = Some(hybrid_vec);
+            } else if cb_bits >= 5 && !INVESTIGATION_ENV.hybrid_kv && self.leg_hb_encoded.is_none() {
                 let (exec, _reg) = gpu.split();
                 let dev = exec.device();
                 // Use kv_caches[0] write_pos - 1 to infer linear capacity. In practice
@@ -3007,7 +3058,57 @@ impl MlxModelWeights {
                 // that suppressed this block under iter-34's dense-on-shadow
                 // default was deleted along with the iter-34 Leg F branch.
                 if use_native_hb_sdpa && !INVESTIGATION_ENV.skip_tq_encode {
-                    if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
+                    // ADR-028 Phase 10c (iter-348): hybrid F16-K + TQ-HB-V
+                    // encode path. K is written F32→F16 via the existing
+                    // `kv_cache_copy_batch_f32_to_f16` (no Hadamard, no
+                    // codebook lookup); V is encoded via the existing
+                    // single-buffer `dispatch_hadamard_quantize_kv_hb` path
+                    // (legacy 2-dispatch arm reused).
+                    //
+                    // 2 dispatches/layer/token vs 1 in the dual legacy path
+                    // (+30 dispatches/decode-token at gemma4 30L).  Trade-off
+                    // documented in ADR-028 §iter-348: the K-side SDPA
+                    // throughput gain (Phase 10d) outweighs the encode
+                    // overhead; if not, follow-up adds a fused
+                    // `kv_copy_f16_quantize_v_dual` kernel.
+                    if INVESTIGATION_ENV.hybrid_kv {
+                        if let Some(ref hybrid_kv) = self.hybrid_kv {
+                            let cache_pos_val = if kv_is_sliding {
+                                (kv_write_pos % kv_capacity) as u32
+                            } else {
+                                kv_write_pos as u32
+                            };
+                            s.barrier_between(
+                                &[&self.activations.attn_k_normed, v_src],
+                                &[&hybrid_kv[layer_idx].k,
+                                  &hybrid_kv[layer_idx].v_packed, &hybrid_kv[layer_idx].v_norms],
+                            );
+                            // F32 K → F16 K cache (peer-equivalent K layout).
+                            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.attn_k_normed,
+                                &hybrid_kv[layer_idx].k,
+                                nkv as u32, hd as u32,
+                                hybrid_kv[layer_idx].capacity as u32,
+                                cache_pos_val,
+                            ).map_err(|e| anyhow::anyhow!("hybrid F16 K copy L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+                            // V-only TQ-HB encode (existing single-buffer dispatcher).
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                                s.encoder_mut(), reg, metal_dev,
+                                v_src,
+                                &hybrid_kv[layer_idx].v_packed,
+                                &hybrid_kv[layer_idx].v_norms,
+                                nkv as u32, hd as u32,
+                                hybrid_kv[layer_idx].capacity as u32,
+                                cache_pos_val,
+                                hybrid_kv[layer_idx].is_sliding,
+                                tq_scale_factor_d512,
+                                tq_codebook_bits,
+                            ).map_err(|e| anyhow::anyhow!("hybrid V TQ-HB encode L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+                        }
+                    } else if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
                         let cache_pos_val = if kv_is_sliding {
                             (kv_write_pos % kv_capacity) as u32
                         } else {
@@ -3641,6 +3742,21 @@ impl MlxModelWeights {
                 // inline-fused `flash_attn_vec_tq_hb` (cb_bits>=5, default 8)
                 // or `flash_attn_vec_tq` (cb_bits=4 legacy) branches below.
                 } else if !INVESTIGATION_ENV.skip_tq_sdpa && use_native_hb_sdpa {
+                    // ADR-028 Phase 10c (iter-348): hybrid path SDPA dispatcher
+                    // not yet wired (Phase 10e).  When the user enables
+                    // `HF2Q_HYBRID_KV=1` without 10e+10d (kernel) landed,
+                    // hard-fail loud-not-silent rather than read stale F32
+                    // SDPA-out from a previous decode token.  This is the
+                    // intentional partial-stack failure mode signalled in
+                    // Phase 10b's design (iter-347).
+                    if INVESTIGATION_ENV.hybrid_kv {
+                        return Err(anyhow::anyhow!(
+                            "HF2Q_HYBRID_KV=1 set but Phase 10e SDPA dispatcher \
+                             not wired (gemma4 decode L{layer_idx}). Unset HF2Q_HYBRID_KV \
+                             to fall back to legacy TQ-HB SDPA, or land Phase 10d/10e first. \
+                             See ADR-028 §iter-348."
+                        ));
+                    }
                     // -- iter-24: native HB SDPA (5/6/8-bit byte-packed K/V) --
                     //
                     // K/V have been HB-encoded into leg_hb_encoded above.
