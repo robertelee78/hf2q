@@ -15086,3 +15086,121 @@ acceptable.
 
 No code changes (H6 already shipped iter-197; verified before writing
 redundant code).
+
+
+---
+
+## iter-343 — MASSIVE prefill gap discovered: 14-45× SLOWER than peer at default; batched prefill exists, gated behind UNSAFE flag
+
+After iter-342 closed Phase 7d, completed the empirical picture by
+benching PREFILL vs peer (we had only benched decode all session).
+Result: HUGE gap.
+
+### Peer prefill on M5 Max (llama-bench HEAD)
+
+```
+$ llama-bench -m gemma4-ara-2pass-APEX-Q5_K_M.gguf -p 512,4096 -n 0
+| model      | size     | params | backend  | threads | test    |     t/s |
+| gemma4 26B | 19.15GiB | 25.23B | BLAS,MTL |       1 | pp512   | 3129.63 ± 15.01 |
+| gemma4 26B | 19.15GiB | 25.23B | BLAS,MTL |       1 | pp4096  | 2971.76 ± 44.17 |
+```
+
+### Ours prefill at HEAD default config
+
+```
+prefill: 263 tok in 3779ms = 70 tok/s = 0.022× peer
+prefill: 913 tok would take ~13 sec at default
+prefill: 3813 tok would take ~54 sec at default
+```
+
+**Default config prefill is 14-45× SLOWER than peer.**  This violates
+operator directive "as fast as peers" by orders of magnitude on
+prefill specifically.
+
+### Batched prefill EXISTS but is opt-in behind UNSAFE flags
+
+Per memory `project_gemma_prefill_bitrot_2026_05_09.md`:
+> "Gemma prefill 35× speedup LANDED + lock-in chain... default flag
+> still HF2Q_BATCHED_PREFILL=1 + UNSAFE=1 (operator-signed L6 MoE
+> deferral on long sliding_wrap fixtures)."
+
+Tested at HEAD with `HF2Q_LMHEAD_Q6K=0 HF2Q_BATCHED_PREFILL=1
+HF2Q_UNSAFE_EXPERIMENTS=1` (Q6_K lm_head must be opted out because
+batched prefill requires F16/Q8 lm_head):
+
+| pp length | Default | Batched | Speedup | Peer | × peer |
+|---|---|---|---|---|---|
+| 263 | 70 tok/s (3779ms) | 979 tok/s (269ms) | **14×** | n/a | 0.31× |
+| 673 | (not measured) | 1629 tok/s (413ms) | est 23× | n/a | 0.52× |
+| 913 | (not measured) | 1829 tok/s (499ms) | est 26× | 3130 (pp512) | 0.58× |
+| 1813 | (not measured) | 2207 tok/s (822ms) | est 31× | ~3050 | 0.72× |
+| **3813** | **~54 sec at default** | **2366 tok/s (1611ms)** | **34×** | 2972 (pp4096) | **0.80× peer** |
+
+Coherence at pp2048: "tell a story of this magnitude, one must not
+merely speak; one must build a world of salt, iron, and solitude"
+— fully coherent generation.  No errors at any tested length up to
+pp3813 (4× sliding_window).
+
+### The trade-off
+
+Batched prefill REQUIRES F16 or Q8 lm_head (returns
+"batched prefill requires GPU lm_head (F16 or Q8 weight)" error
+when Q6_K is loaded).  Conflicts with iter-326's
+`HF2Q_LMHEAD_Q6K=1` default which gives +2% decode throughput.
+
+Trade-off if defaults flipped:
+- LOSE: 2% decode (Q6_K lm_head) → 73.5 → ~72.0 tok/s decode
+- GAIN: 14-45× prefill (70 → 2400 tok/s at long prompts)
+
+For typical chat workloads (long system prompt + history), prefill
+happens ONCE per turn while decode runs many times.  At 70 vs 2400
+tok/s, prefill of a 4K-context turn takes 54 sec (default) vs 1.6
+sec (batched).  **The default is unusable for production workloads
+> a few hundred tokens.**
+
+### iter-343 OPERATOR DECISION proposal
+
+Per operator iter-326 directive: "default should have the best things
+on that provide the best mantra-aligned outcome for users."
+
+Recommend default-flip stack:
+- `HF2Q_BATCHED_PREFILL=1` (default-on; opt-out via =0)
+- `HF2Q_UNSAFE_EXPERIMENTS=1` (default-on; risk: L6 MoE sliding_wrap
+  edge case operator-signed-deferred per iter-76 memory)
+- `HF2Q_LMHEAD_Q6K=0` (default-OFF; reverses iter-326 default-flip
+  for this flag — prefill prerequisite)
+
+Net per-user impact:
+- Prefill: 70 → 2400 tok/s (~34× speedup)
+- Decode: 73.5 → ~72.0 tok/s (-2%)
+- Effective throughput on chat workloads (4K prefill + 1K decode):
+  - Default today: 54 sec prefill + 13.6 sec decode = **67.6 sec/turn**
+  - Proposed: 1.6 sec prefill + 13.9 sec decode = **15.5 sec/turn**
+  - **4.4× faster end-to-end on typical chat workload**
+
+Risk: UNSAFE flag's L6 MoE sliding_wrap edge case.  Operator
+already signed off on the deferral at iter-76 (per memory).  Default-
+flipping requires extending that risk acceptance to all users.
+
+Falsifier tests for default-flip approval:
+- 1000-tok 10-run coherence sweep at default sampling: PASS expected
+- Long-context (8K, 16K) coherence: untested at HEAD
+- Memory baseline: measure RSS delta (should be similar)
+
+### Phase 9 opens (NEW, operator-decision-gated)
+
+| Phase | Lever | Estimated impact | Status |
+|---|---|---|---|
+| 9 | Default-flip BATCHED_PREFILL + UNSAFE + un-flip LMHEAD_Q6K | +34× prefill, -2% decode, **+4.4× chat-workload throughput** | **OPERATOR DECISION** |
+
+This is by far the largest mantra-aligned default-flip opportunity
+discovered this session.  All Phase 7d work was for ~7-10% gain on
+decode; Phase 9 delivers 34× gain on prefill (the dominant cost on
+long-prompt workloads).
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (operator-decision-gated proposal; falsifier-grade
+bench data captured to support the decision).
