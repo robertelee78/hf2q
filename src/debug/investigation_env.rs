@@ -169,9 +169,19 @@ pub struct InvestigationEnv {
 
     /// `HF2Q_SKIP_ROUTING=1` — skip B9 router_proj qmatmul +
     /// B10 fused_moe_routing dispatches per layer (2 dispatches/layer).
-    /// ADR-028 iter-213 — bisect routing scaffold cost.  Produces
-    /// garbage MoE expert routing.
+    /// ADR-028 iter-213 — bisect routing scaffold cost.
+    /// ⚠ INVALID BISECT (iter-213 lesson): produces garbage expert IDs
+    /// which collapse MoE matmul to single-expert reads (cache hit
+    /// artifact).  Real cost is ~0.5-1 ms; SKIP measures 4.24 ms
+    /// (3 ms is cache-hit artifact).  Kept for future SKIP_ROUTING_WITH_VALID_IDS work.
     pub skip_routing: bool,
+
+    /// `HF2Q_SKIP_V_NORM=1` — skip the per-head V-norm RMS norm
+    /// dispatch (sequential after V proj, before KV cache copy).
+    /// ADR-028 iter-214.  Produces garbage V cache (SDPA reads bad V).
+    /// VALID bisect: V-norm output is consumed by KV-copy + SDPA as
+    /// data, not control signals — no cache-pattern confound.
+    pub skip_v_norm: bool,
 
     // ========================================================================
     // Category 4 — warn-only (ineffective but safe). No gate; raw intent.
@@ -627,6 +637,7 @@ struct RawAckIntent {
     skip_attn_qkv: bool,
     skip_o_proj: bool,
     skip_routing: bool,
+    skip_v_norm: bool,
     lmhead_rerank_disabled: bool,
     chunk_scan_prefill: bool,
 }
@@ -652,6 +663,7 @@ impl InvestigationEnv {
             skip_attn_qkv: env_eq_one("HF2Q_SKIP_ATTN_QKV"),
             skip_o_proj: env_eq_one("HF2Q_SKIP_O_PROJ"),
             skip_routing: env_eq_one("HF2Q_SKIP_ROUTING"),
+            skip_v_norm: env_eq_one("HF2Q_SKIP_V_NORM"),
             lmhead_rerank_disabled: matches!(
                 env::var("HF2Q_LMHEAD_RERANK").as_deref(),
                 Ok("0")
@@ -677,6 +689,7 @@ impl InvestigationEnv {
             skip_attn_qkv: raw.skip_attn_qkv && ack,
             skip_o_proj: raw.skip_o_proj && ack,
             skip_routing: raw.skip_routing && ack,
+            skip_v_norm: raw.skip_v_norm && ack,
             lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
             chunk_scan_prefill: raw.chunk_scan_prefill && ack,
 

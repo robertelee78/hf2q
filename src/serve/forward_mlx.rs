@@ -2663,7 +2663,10 @@ impl MlxModelWeights {
                 } else {
                     &self.activations.norm_params_global_hd
                 };
-                if v_is_k {
+                // ADR-028 iter-214: SKIP_V_NORM bisect.  V-norm output
+                // is consumed passively by KV-copy + SDPA — no control
+                // signal confound.
+                if v_is_k && !INVESTIGATION_ENV.skip_v_norm {
                     s.barrier_between(
                         &[&self.activations.attn_k],
                         &[&self.activations.attn_v],
@@ -2679,7 +2682,7 @@ impl MlxModelWeights {
                         },
                     )?;
                     total_dispatches += 1;
-                } else {
+                } else if !v_is_k && !INVESTIGATION_ENV.skip_v_norm {
                     s.barrier_between(
                         &[&self.activations.attn_v],
                         &[&self.activations.moe_expert_out],
