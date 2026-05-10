@@ -76,13 +76,26 @@ pub struct InvestigationEnv {
     ///
     /// Production effect at gemma4 26B-A4B (sliding=1024):
     ///   - +15.7% wall-clock when combined with `HF2Q_USE_DENSE=1`
-    ///     (62.5 → 72.3 tok/s = 0.701× llama.cpp peer)
+    ///     at 200-token benches (62.5 → 72.3 tok/s)
     ///   - 251 MiB/slot KV memory (vs 502 F32-dense, 191 TQ-HB)
-    ///   - 25 ppm rel_rms output drift (F16 precision tradeoff only)
+    ///   - 25 ppm rel_rms output drift (F16 precision tradeoff)
     ///
-    /// Stays ack-required pending operator decision on default-flip;
-    /// the precision tradeoff is real but no longer a correctness
-    /// regression.
+    /// **DEPRECATED at ADR-028 iter-234 (2026-05-09)**: long-context
+    /// stress testing (1000 tok) revealed gemma4 produces random
+    /// `<pad>` emission at non-deterministic output lengths (sweep:
+    /// N=200 ✓, N=400 ✗, N=600 ✓, N=800 ✓, N=1000 ✗).  hf2q's
+    /// non-greedy default sampler means F16 logit-noise occasionally
+    /// pushes `<pad>` to argmax-rank early, killing generation.
+    /// The iter-189 "+8.5%" win was sampling luck at 200-tok.
+    ///
+    /// Cross-model check at qwen3.6 35B-A3B APEX-Q5_K_M, 1000-tok:
+    /// coherent BUT zero perf gain (126.2 vs 125.7 tok/s — MoE
+    /// sparse activation makes KV bandwidth not the bottleneck).
+    ///
+    /// → **No remaining safe use case**.  Use Path E+G (USE_DENSE +
+    /// LMHEAD_Q6K) for gemma4 perf instead — F32 KV preserved,
+    /// +3.7% over default at 1000-tok, coherent at long context.
+    /// Activation banner now warns DEPRECATED.
     ///
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub f16_kv: bool,
@@ -845,7 +858,9 @@ impl InvestigationEnv {
         if self.f16_kv {
             active_unsafe.push((
                 "HF2Q_F16_KV=1",
-                "known-worse KV cache representation (ADR-009)",
+                "DEPRECATED: gemma4-incoherent at random N (ADR-028 iter-234, \
+                 random `<pad>` emission); qwen3.6 no-op (no perf gain). \
+                 Path E+G recommended instead",
             ));
         }
         if self.batched_prefill {
