@@ -4992,6 +4992,49 @@ disabling/swapping each candidate component and measuring tok/s
 delta.  Likely big winner: TQ-HB→F16 KV switch (already validated
 as Path E+F).
 
+### iter-184 — 4-path bisect: TQ-HB encode is the dispatch-density lever
+
+Ran `HF2Q_SPLIT_TIMING=1` in 4 configurations on the same gemma4 prompt:
+
+| Path | Env | dispatches | BODY ms | tok/s | vs peer 97 |
+|------|-----|-----------:|--------:|------:|-----------:|
+| Default | (none) | 956 | 13.5 | 68 | 0.70× |
+| F16_KV-alone | `HF2Q_F16_KV=1 HF2Q_UNSAFE=1` | 956 | 13.5 | 71 | 0.73× |
+| Path E | `HF2Q_USE_DENSE=1` | 926 | 12.0 | 78 | 0.80× |
+| Path E+F | `HF2Q_USE_DENSE=1 HF2Q_F16_KV=1 HF2Q_UNSAFE=1` | 926 | 11.8 | 80 | 0.82× |
+
+**Key bisect findings**:
+
+1. **F16_KV alone is a no-op** when USE_DENSE=0 (TQ-HB regime).  956
+   dispatches and 13.5 ms BODY identical to default.  The flag only
+   takes effect on the F32-dense KV allocation path.
+
+2. **USE_DENSE alone (Path E) closes 90% of Path E+F's win**:
+   - Drops 30 dispatches per token (TQ-HB encode skipped, 1 per layer × 30)
+   - 1.5 ms BODY savings
+   - +12.5% throughput (68 → 78 tok/s)
+   - Vs Path E+F's +14% (68 → 80) — F16 storage adds only 2pp on top.
+
+3. **The TQ-HB encode dispatch is the dominant gemma4-default cost**.
+   Each layer pays ~50 µs to Hadamard-encode K vectors before SDPA.
+   With F32 dense KV (Path E), this work is skipped entirely.
+
+**Updated breakdown of 35pp gap to llama.cpp peer**:
+- TQ-HB encode dispatches: ~12.5pp (USE_DENSE skips them) → covered by Path E
+- F16 KV bandwidth halving: ~2pp → covered by Path F (on top of E)
+- **Remaining 21pp**: SDPA kernel impl + lm_head + per-layer fusion gap
+
+**Path E (no precision drift, +12.5%) is operator-orthogonal to E+F** —
+F32 dense KV is exact-replica precision (no Hadamard, no codebook,
+no F16 rounding).  Operator gating concern was the F16 drift; Path E
+removes that concern entirely.  Memory cost: 502 MiB/slot vs default
+191 MiB/slot — but memory was not previously raised as a constraint.
+
+iter-185 plan: per-block GPU timing in production CB (insert
+commit_and_wait between B-blocks under HF2Q_BLOCK_TIMING flag) to
+locate the remaining 21pp.  Specific suspects: B1..B7 attention path,
+final lm_head GEMM at vocab=262144.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
