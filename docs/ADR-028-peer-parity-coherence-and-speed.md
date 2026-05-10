@@ -5744,6 +5744,37 @@ iter-200+ plan: bisect dense MLP cost via SKIP_DENSE_MLP env flag
 (produces garbage but reveals time).  Or bisect MoE pipeline.
 Hardcode-and-measure — operator's standing rule.
 
+### iter-200 — BISECT dense MLP cost = 1.14 ms / 9.1% body
+
+Shipped HF2Q_SKIP_DENSE_MLP env flag (UNSAFE_EXPERIMENTS-gated).
+Bisect via SPLIT_TIMING:
+
+| Config | BODY GPU | dispatches |
+|--------|---------:|-----------:|
+| Default | 12.50 ms | 956 |
+| SKIP_DENSE_MLP | 11.36 ms | 836 (-120) |
+| **Δ Dense MLP cost** | **1.14 ms** | -4/layer × 30 |
+
+Dense MLP = 1.14 ms = 9.1% of body GPU.
+Per-layer: 38 µs across 4 dispatches (gate, up, gelu_mul, down).
+
+**ROI**: kernels already 71-90% peak (iter-180/181 bench).  Fusing
+into a single Q5_K-Q8_0 dense-MLP kernel could save ~0.5 ms launch +
+1 input read = +3% throughput, multi-day work.  **NOT the next
+highest-leverage target.**
+
+**Updated cost decomposition** (12.5 ms body post-iter-197):
+- Mat-mul attention: ~1.85 ms (15%)
+- MoE _id matmul: ~1.84 ms (15%)
+- TQ-HB SDPA residual: ~1.5 ms (12%)
+- Dense MLP: ~1.14 ms (9%)
+- **Other (norms, RoPE, KV-copy, routing)**: **~6.17 ms (49%)**
+
+The "other" bucket is the largest remaining lever — but it's spread
+across many small ops.  iter-201 will bisect MoE routing pipeline
+(B9 router proj + B10 routing + B14 weighted_sum) which is part of
+"other".
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
