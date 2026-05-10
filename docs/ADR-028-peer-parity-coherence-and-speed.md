@@ -6141,6 +6141,52 @@ Cumulative session totals (29 iters):
 - All single-iter tractable levers exhausted; next +2-3% requires
   multi-day kernel work
 
+### iter-210 — BISECT attn QKV = 1.12 ms (production-measured)
+
+Shipped HF2Q_SKIP_ATTN_QKV.  Skips 3 concurrent QKV qmatmul dispatches
+per layer.
+
+| Config | BODY GPU | dispatches |
+|--------|---------:|-----------:|
+| Default | 12.51 ms | 956 |
+| SKIP_ATTN_QKV | 11.39 ms | 871 |
+| **Δ** | **1.12 ms = 8.9% body** | -85 |
+
+(-85 dispatches: expected 90 = 3/layer × 30, off by 5 because some
+gemma4 layers have `v_is_k = true` so V proj reuses K's output.)
+
+**Comparison with iter-180 batched-bench estimate**:
+- Batched bench: Q+K+V sequential = 17+11+11 = 39 µs/layer = 1.17 ms
+- Production with concurrency: 37 µs/layer = 1.12 ms
+- Concurrency saves only ~5% (NOT 40-50% theoretical max)
+
+**Insight**: Concurrent QKV dispatches DO overlap on GPU but don't
+fully parallelize.  Apple Metal threadgroups are already saturated by
+each individual matmul; adding more concurrent dispatches mostly
+queues them.  iter-180's batched-bench was within 5% of production —
+not the 1.85 ms "all sequential" approximation.
+
+**Updated production cost map** (12.5 ms body):
+
+| Component | ms | % body |
+|-----------|---:|-------:|
+| MoE experts | 2.60 | 21% |
+| TQ-HB SDPA | 1.50 | 12% |
+| Dense MLP | 1.14 | 9% |
+| **Attn QKV (3 concurrent)** | **1.12** | **9%** |
+| fused_norm_add chain | 1.09 | 9% |
+| Other | ~5.05 | 40% |
+
+QKV fusion lever (3-way Q5_K mat-vec kernel that emits Q+K+V from
+single norm_out read): +2.4-4.7% potential.  Comparable magnitude to
+post-attn fusion (iter-208 +2.7%).
+
+iter-211+ candidate levers ranked:
+1. Q+K+V 3-way mat-vec fusion: +2.4-4.7% (multi-day, novel kernel)
+2. Post-FF norm 2 + end-of-layer FINAL fusion: +2.7% (multi-day, fusion risk)
+3. Bisect "Other" 5.05 ms bucket via more SKIP_* flags
+4. Pivot to qwen3.6 cross-pollination (its kernel patterns)
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
