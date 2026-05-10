@@ -134,6 +134,12 @@ pub struct InvestigationEnv {
     /// Produces garbage residual stream.
     pub skip_post_attn_norm: bool,
 
+    /// `HF2Q_SKIP_WEIGHTED_SUM=1` — skip B14 moe_weighted_sum_encode
+    /// dispatch per layer (sequential after down_id, combines top_k
+    /// expert outputs).  ADR-028 iter-206 — bisect.  Produces garbage
+    /// (moe_accum stale).
+    pub skip_weighted_sum: bool,
+
     // ========================================================================
     // Category 4 — warn-only (ineffective but safe). No gate; raw intent.
     // ========================================================================
@@ -582,6 +588,7 @@ struct RawAckIntent {
     skip_moe_swiglu: bool,
     skip_head_norm_rope: bool,
     skip_post_attn_norm: bool,
+    skip_weighted_sum: bool,
     lmhead_rerank_disabled: bool,
     chunk_scan_prefill: bool,
 }
@@ -601,6 +608,7 @@ impl InvestigationEnv {
             skip_moe_swiglu: env_eq_one("HF2Q_SKIP_MOE_SWIGLU"),
             skip_head_norm_rope: env_eq_one("HF2Q_SKIP_HEAD_NORM_ROPE"),
             skip_post_attn_norm: env_eq_one("HF2Q_SKIP_POST_ATTN_NORM"),
+            skip_weighted_sum: env_eq_one("HF2Q_SKIP_WEIGHTED_SUM"),
             lmhead_rerank_disabled: matches!(
                 env::var("HF2Q_LMHEAD_RERANK").as_deref(),
                 Ok("0")
@@ -620,6 +628,7 @@ impl InvestigationEnv {
             skip_moe_swiglu: raw.skip_moe_swiglu && ack,
             skip_head_norm_rope: raw.skip_head_norm_rope && ack,
             skip_post_attn_norm: raw.skip_post_attn_norm && ack,
+            skip_weighted_sum: raw.skip_weighted_sum && ack,
             lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
             chunk_scan_prefill: raw.chunk_scan_prefill && ack,
 

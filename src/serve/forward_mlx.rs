@@ -4050,18 +4050,21 @@ impl MlxModelWeights {
                     total_dispatches += 1;
 
                     // -- B14: weighted_sum (singleton) --
-                    s.barrier_between(
-                        &[&self.activations.moe_down_id_out, &self.activations.moe_routing_weights_gpu],
-                        &[&self.activations.moe_accum],
-                    );
-                    mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_down_id_out,
-                        &self.activations.moe_routing_weights_gpu,
-                        &self.activations.moe_accum,
-                        hs, top_k,
-                    ).map_err(|e| anyhow::anyhow!("weighted_sum L{layer_idx}: {e}"))?;
-                    total_dispatches += 1;
+                    // ADR-028 iter-206: SKIP_WEIGHTED_SUM bisect.
+                    if !INVESTIGATION_ENV.skip_weighted_sum {
+                        s.barrier_between(
+                            &[&self.activations.moe_down_id_out, &self.activations.moe_routing_weights_gpu],
+                            &[&self.activations.moe_accum],
+                        );
+                        mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.moe_down_id_out,
+                            &self.activations.moe_routing_weights_gpu,
+                            &self.activations.moe_accum,
+                            hs, top_k,
+                        ).map_err(|e| anyhow::anyhow!("weighted_sum L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+                    }
                 } else {
                     // Fallback: per-expert loop (all in same session)
                     mlx_native::ops::moe_dispatch::moe_zero_buffer_encode(
