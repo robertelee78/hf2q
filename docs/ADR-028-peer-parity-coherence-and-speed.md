@@ -14154,3 +14154,97 @@ instrumentation cannot attribute).
 
 No code changes (Chesterton's fence found Phase 1c invalid before code
 touched — the right outcome per mantra "measure 3x cut once").
+
+
+---
+
+## iter-334 — empirical CB-count probe + NEW lever discovered (barrier overhead)
+
+Per /loop iteration directive: "Code + test == truth. Comments in code
+or ADR can be starting points, but never trust them over code."  iter-333
+relied on ADR-019:245's "1 CB / decode" claim from 2026-04-XX.  This
+iter EMPIRICALLY tests it at HEAD via `mlx_native::cmd_buf_count()`
+counter.
+
+### Instrumentation
+
+Extended `serve/mod.rs:1257-1264` (decode-loop entry) to call
+`reset_counters()` when `HF2Q_DUMP_COUNTERS=1`, AND extended the
+existing dump block at `serve/mod.rs:1361-1395` to emit `cmd_bufs`
+and `barriers` alongside `dispatches` and `syncs`, all expressed as
+per-decode-token rates.  Counters are now decode-only (was
+prefill+decode aggregate).
+
+### Measurement
+
+Run: `HF2Q_DUMP_COUNTERS=1 hf2q generate --model gemma4-APEX-Q5_K_M.gguf
+--prompt "Tell me a story." --max-tokens 100 --temperature 0`
+
+```
+[MLX_COUNTERS] dispatches=92070 syncs=0 cmd_bufs=198 barriers=50787
+prompt_tokens=18 decode_tokens=100
+dispatches/decode_tok=920.70
+syncs/decode_tok=0.00
+cmd_bufs/decode_tok=1.9800       ← ADR-019:245 CONFIRMED (~2 CB/decode)
+barriers/decode_tok=507.87       ← NEW: 55% of dispatches have barriers
+```
+
+Decode wall: 100 tok in 1.35s = 73.9 tok/s.
+
+### Hypothesis 1 (iter-333) RE-VERIFIED
+
+ADR-019:245 was correct AT HEAD: gemma4 = 1.98 CB/decode token, the
+canonical optimal CB shape.  Phase 1c (EncoderSession wiring) remains
+falsified.
+
+### Hypothesis 2 NEW (iter-334)
+
+The 507.87 barriers/decode_tok is **suspiciously high** — 55% of all
+dispatches have an explicit `enc.memory_barrier()` preceding them.
+
+Per the iter-326 deep-research finding (CPU-side overhead source #1):
+> "hf2q emits enc.encoder().memory_barrier() between EVERY RAW-dependent
+> dispatch pair... llama.cpp relies on Metal's implicit hazard tracking
+> and rarely calls memoryBarrierWithScope per-dispatch (only when
+> explicit dependencies cross kernel boundaries in fusion paths)."
+
+Per-dispatch math (iter-308 measurement, this iter re-verified):
+- 14.7 µs/dispatch (1.35s / 100tok / 920disp = 14.7 µs)
+- vs peer's 7.1 µs/dispatch (iter-308)
+- gap = 7.6 µs/dispatch unaccounted
+
+If barriers contribute, say, 5 µs each (Apple Silicon barrier overhead),
+508 barriers × 5 µs = 2540 µs/tok of barrier overhead alone, which
+would account for ~19% of decode wall time (2.54ms / 13.5ms per token).
+
+### Testable falsifier
+
+Audit the 50,787 barrier sites in gemma4 decode (508/tok × 100 tok):
+- Classify each call site as "structurally required for correctness"
+  or "potentially redundant given Metal implicit hazard tracking"
+- Test by removing a SINGLE redundant barrier:
+  - PASS condition: coherence intact (1000-tok identical output) +
+    parity tests still pass + bench shows positive Δ
+  - FAIL condition: coherence broken OR parity test fails
+- If PASS: barrier was redundant → re-classify class → audit more
+
+Reference: `feedback_metal_raw_barrier_per_dispatch.md` (operator
+standing rule that warns against removing barriers without rigorous
+testing — RAW races are non-deterministic and hard to detect at small
+sequence lengths).
+
+### Next phase
+
+**Open Phase 8: Barrier audit + reduction** (replaces the now-falsified
+Phase 1c slot in priority order).  Higher-confidence than Phase 5
+(documented gap, peer-source-grounded), lower-effort than Phase 7
+(per-call-site work, not multi-week structural).
+
+Estimated impact ceiling: if half the barriers are removable,
+~10% end-to-end speedup.  If only 10% are removable, ~2% speedup.
+Honest range pending audit.
+
+### Files modified
+
+- `/opt/hf2q/src/serve/mod.rs` (instrumentation added, +35 lines)
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.

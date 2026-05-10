@@ -1254,6 +1254,12 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     print!("{}", printed_text);
     std::io::stdout().flush()?;
 
+    // ADR-028 iter-334 — reset mlx-native counters at decode-loop entry so
+    // HF2Q_DUMP_COUNTERS=1 reports decode-only dispatch/CB/barrier rates
+    // (was previously prefill+decode aggregate, ambiguous per-token attribution).
+    if std::env::var("HF2Q_DUMP_COUNTERS").ok().as_deref() == Some("1") {
+        mlx_native::reset_counters();
+    }
     let decode_start = std::time::Instant::now();
     let mut generated = 1usize;
     let mut kernel_profiles: Vec<forward_mlx::KernelTypeProfile> = Vec::new();
@@ -1358,12 +1364,16 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // them. The counters are atomic globals in mlx-native (not per-
     // invocation); for fresh numbers, run hf2q in a fresh process.
     if std::env::var("HF2Q_DUMP_COUNTERS").ok().as_deref() == Some("1") {
+        // Counters were reset at decode-loop entry (iter-334) so all values
+        // below are decode-only.
         let dispatches = mlx_native::dispatch_count();
         let syncs = mlx_native::sync_count();
+        let cmd_bufs = mlx_native::cmd_buf_count();
+        let barriers = mlx_native::barrier_count();
         let prompt_n = prompt_tokens.len() as u64;
         let decode_n = generated as u64;
-        let dispatches_per_prompt_tok = if prompt_n > 0 {
-            dispatches as f64 / prompt_n as f64
+        let dispatches_per_decode_tok = if decode_n > 0 {
+            dispatches as f64 / decode_n as f64
         } else {
             0.0
         };
@@ -1372,10 +1382,25 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         } else {
             0.0
         };
+        let cb_per_decode_tok = if decode_n > 0 {
+            cmd_bufs as f64 / decode_n as f64
+        } else {
+            0.0
+        };
+        let barriers_per_decode_tok = if decode_n > 0 {
+            barriers as f64 / decode_n as f64
+        } else {
+            0.0
+        };
         eprintln!(
-            "[MLX_COUNTERS] dispatches={} syncs={} prompt_tokens={} decode_tokens={} \
-             dispatches_per_prompt_tok={:.2} syncs_per_decode_tok={:.2}",
-            dispatches, syncs, prompt_n, decode_n, dispatches_per_prompt_tok, syncs_per_decode_tok,
+            "[MLX_COUNTERS] dispatches={} syncs={} cmd_bufs={} barriers={} \
+             prompt_tokens={} decode_tokens={} \
+             dispatches/decode_tok={:.2} syncs/decode_tok={:.2} \
+             cmd_bufs/decode_tok={:.4} barriers/decode_tok={:.2}",
+            dispatches, syncs, cmd_bufs, barriers,
+            prompt_n, decode_n,
+            dispatches_per_decode_tok, syncs_per_decode_tok,
+            cb_per_decode_tok, barriers_per_decode_tok,
         );
         // ADR-028 iter-284: dump per-pipeline dispatch buckets if MLX_DISP_BUCKET=1.
         // Mirrors llama.cpp's LLAMA_DISP_COUNT atexit dump for direct compare.
