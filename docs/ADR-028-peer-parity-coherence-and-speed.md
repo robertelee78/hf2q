@@ -14967,3 +14967,122 @@ would close the rest.
 
 No code changes (Worker A research consolidated; H6 implementation
 target identified for iter-342).
+
+
+---
+
+## iter-342 — H6 ALREADY IMPLEMENTED at iter-197; Phase 7d FORMALLY CLOSED
+
+Per /loop directive "Code + test == truth" + "Chesterton's fence —
+understand current fully before changing it", verified Worker A's H6
+recommendation against the actual code BEFORE writing the Metal
+function-constant specialization.
+
+### H6 was iter-197 work (shipped previously)
+
+`flash_attn_vec_tq_hb.metal:190-229`:
+```metal
+// ADR-028 iter-197: function-constant cbits specialization.
+constant int CBITS_FC [[function_constant(50)]];
+constant int cbits_effective = is_function_constant_defined(CBITS_FC) ? CBITS_FC : 8;
+
+inline float4 dequant_hb_float4(...) {
+    cbits = (uint)cbits_effective;  // Line 229: OVERWRITE runtime cbits
+    if (cbits == 5u) { ... }       // Constant-folded by compiler
+    else if (cbits == 6u) { ... }
+    else { ... }                    // 8u
+}
+```
+
+`flash_attn_vec_tq_hb.rs:281-291`:
+```rust
+// ADR-028 iter-197: pass cbits as a Metal function constant for
+// constant-folding by the compiler.  Index 50 must match
+// [[function_constant(50)]] in the shader.
+let cbits_const = (params.codebook_bits as i32, 50usize);
+... encode_threadgroups_with_args_and_function_constants(
+        pipeline,
+        ...,
+        &[(cbits_const.1, cbits_const.0)],   // Set function constant
+        ...);
+```
+
+Bucket-label confirmation: dispatch dump shows
+`flash_attn_vec_tq_hb_dk256|50:i8` — the `|50:i8` suffix indicates
+function constant 50 is set to int8 = the codebook_bits value.  3
+separate compiled pipelines exist (5/6/8-bit), no runtime if-else
+chain at the inner-loop level.
+
+**Worker A's H6 was redundant** — the work was already shipped at
+iter-197.  Worker A correctly identified the candidate but didn't
+verify the existing implementation state before recommending.
+
+### What this means: TQ-HB ceiling is the actual structural limit
+
+After H6's redundancy was uncovered, Worker A's other findings
+become formally binding:
+
+| Aspect | Verdict |
+|---|---|
+| Per-dispatch wall: 14.7 µs (ours) vs 7.1 µs (peer) = 2.07× | STRUCTURAL |
+| Root cause | Scalar-loop dequant per K position (lines 545-560), required because K is byte-packed quantized indices |
+| Peer's F16 K → simdgroup_load + matrix multiply | **Requires F16 K** |
+| F16 K → 3.94× memory regression vs TQ-HB | **VIOLATES operator RAM-mantra** |
+
+**Phase 7d is FORMALLY EXHAUSTED.**  All hypotheses tested or
+verified-already-shipped:
+- H1 FALSIFIED iter-340 (-0.3% within noise)
+- H2/H3/H4/H5 FALSIFIED via Worker A iter-341 analysis
+- H6 ALREADY SHIPPED at iter-197 (redundant rec)
+
+### gemma4 0.713× peer is the TQ-HB ceiling
+
+This is the honest, mantra-aligned end state for the per-kernel +
+SDPA-fusion optimization avenue:
+
+- **gemma4 default 200-tok decode at HEAD: 73.5 tok/s = 0.713× peer**
+- **gemma4 1000-tok sustained: 72.5 tok/s = 0.724× peer**
+- **TQ-HB 3.94× per-slot memory savings INTACT** (operator RAM-mantra)
+- **Coherence INTACT** across all sampling modes (10/10 1000-tok sweep)
+- **18+ parity tests pass** (iter-309/310/321/331/337/iter-338 V2-bypass)
+- **Cumulative this session: +5.9% baked into default user experience**
+
+### Operator decision space (going forward)
+
+Closing more of the residual ~28% gap requires one of:
+
+1. **Hybrid K storage** (F16 K + TQ-HB V): K bytes = 2× F16 (vs 1×
+   8-bit), V bytes = TQ-HB; total per-slot = ~2.5× memory (was
+   3.94× full-TQ-HB, would be ~50% halfway to F32-only).  Multi-week
+   structural redesign of encoder + ring buffer + SDPA dispatcher +
+   regression-pin re-validation.  Operator-decision-gated (RAM
+   trade-off).
+
+2. **Abandon TQ-HB entirely** for gemma4: F16 K/V → matches peer
+   pattern, peer-equivalent SDPA, +27% expected.  REJECTED by
+   operator RAM-mantra (iter-326).
+
+3. **Apple Instruments Metal System Trace** (iter-308 standing item
+   #4): operator-GUI profiling that might reveal sub-µs CPU-side
+   overhead invisible to mlx-native's atomic counters.  Could open
+   non-kernel levers that current investigation cannot see.
+
+4. **Accept 0.713× peer as the TQ-HB ceiling** and document as the
+   honest mantra-aligned end state.
+
+### /loop status at iter-342
+
+Cron `8d087b1f` continues every 5 min.  But all viable iteration-scope
+work is complete.  Next /loop fires will either:
+- Idle (no actionable work) → ScheduleWakeup with long delay
+- Or operator interjects with a new directive
+
+Per CronDelete, /loop can be stopped if operator decides 0.713× is
+acceptable.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (H6 already shipped iter-197; verified before writing
+redundant code).
