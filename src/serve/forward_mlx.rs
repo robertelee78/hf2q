@@ -3961,28 +3961,33 @@ impl MlxModelWeights {
                         expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
                         ggml_type: ggml_type_gu,
                     };
-                    s.quantized_matmul_id_ggml(
-                        reg, dev,
-                        &self.activations.moe_norm_out,
-                        self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                        &self.activations.moe_expert_ids,
-                        &mut self.activations.moe_gate_up_id_out,
-                        &gu_params,
-                    ).map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
-                    total_dispatches += 1;
+                    // ADR-028 iter-201: SKIP_MOE_EXPERTS bisect — skip
+                    // gate_up_id + swiglu + down_id dispatches.  Produces
+                    // garbage moe_down_id_out (stale buffer).
+                    if !INVESTIGATION_ENV.skip_moe_experts {
+                        s.quantized_matmul_id_ggml(
+                            reg, dev,
+                            &self.activations.moe_norm_out,
+                            self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                            &self.activations.moe_expert_ids,
+                            &mut self.activations.moe_gate_up_id_out,
+                            &gu_params,
+                        ).map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
 
-                    // -- B12: swiglu (singleton) --
-                    s.barrier_between(
-                        &[&self.activations.moe_gate_up_id_out],
-                        &[&self.activations.moe_swiglu_id_out],
-                    );
-                    mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_gate_up_id_out,
-                        &self.activations.moe_swiglu_id_out,
-                        moe_int, top_k,
-                    ).map_err(|e| anyhow::anyhow!("swiglu batch L{layer_idx}: {e}"))?;
-                    total_dispatches += 1;
+                        // -- B12: swiglu (singleton) --
+                        s.barrier_between(
+                            &[&self.activations.moe_gate_up_id_out],
+                            &[&self.activations.moe_swiglu_id_out],
+                        );
+                        mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.moe_gate_up_id_out,
+                            &self.activations.moe_swiglu_id_out,
+                            moe_int, top_k,
+                        ).map_err(|e| anyhow::anyhow!("swiglu batch L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+                    }
 
                     // -- B13: down_id + post-FF norm1 [2 concurrent] --
                     // down_id reads moe_swiglu_id_out (from B12). post-FF norm1 reads
@@ -4002,15 +4007,17 @@ impl MlxModelWeights {
                         expert_stride: self.layers[layer_idx].moe.down_expert_stride,
                         ggml_type: ggml_type_dn,
                     };
-                    s.quantized_matmul_id_ggml(
-                        reg, dev,
-                        &self.activations.moe_swiglu_id_out,
-                        self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                        &self.activations.moe_expert_ids,
-                        &mut self.activations.moe_down_id_out,
-                        &dn_params,
-                    ).map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
-                    total_dispatches += 1;
+                    if !INVESTIGATION_ENV.skip_moe_experts {
+                        s.quantized_matmul_id_ggml(
+                            reg, dev,
+                            &self.activations.moe_swiglu_id_out,
+                            self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                            &self.activations.moe_expert_ids,
+                            &mut self.activations.moe_down_id_out,
+                            &dn_params,
+                        ).map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+                    }
 
                     // post-FF norm1: mlp_down → attn_out (concurrent with down_id)
                     s.barrier_between(
