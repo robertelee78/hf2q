@@ -3345,6 +3345,83 @@ iter-151. Operator pick required to proceed.
 via MTP draft-step port. This is THE concrete walk-phase work
 remaining for hf2q at the qwen3.6 fixture.
 
+### iter-153: MAJOR Chesterton's-fence finding — MTP pipeline exists but underperforms
+
+#### Discovered: full MTP+spec-decode pipeline already built
+
+Per "Chesterton's fence — always understand current fully before changing it":
+the entire MTP+spec-decode infrastructure for qwen3.5/3.6 is ALREADY
+implemented in hf2q HEAD:
+
+```
+src/inference/models/qwen35/
+├── mtp.rs                      # MtpWeights struct + forward_draft impl
+├── mtp_weights_load.rs         # load_mtp_weights_if_present (gguf load)
+├── mtp_tests.rs                # unit tests for MTP weight load
+└── spec_decode.rs              # SpecDecode::run_prompt with verify+accept loop
+```
+
+CLI auto-enables when MTP weights present (`serve/mod.rs:2362`):
+```rust
+let mut use_spec_decode = match spec_env.as_deref() {
+    Some("0" | "false" | "off") => false,
+    Some(_) => true,
+    _ => !sample_logits && (args.speculative || model.mtp.is_some()),
+};
+```
+
+`HF2Q_SPEC_DECODE=0` overrides for forensic A/B.
+
+#### Smoke test on qwen3.6-27b-mtp-q4_0.gguf
+
+| Mode | tok/s | accept rate | per-token | result |
+|------|------:|---:|---:|---|
+| MTP spec-decode (auto-on) | **27.0** | 80% | 37.0 ms | -20% slower than greedy |
+| Greedy (SPEC_DECODE=0) | **33.9** | — | 29.5 ms | baseline |
+
+**Spec-decode regresses 20%** on qwen3.6-mtp despite excellent 80%
+accept rate. This is a SOLVED-INFRA / UNSOLVED-PERF problem.
+
+#### Why spec-decode underperforms
+
+Per-iteration cost for the spec-decode loop:
+1. MTP `forward_draft` (1 transformer-block-ish forward of layer 64)
+2. Verifier `forward_decode` (1 main-stack forward = 64 layers + lm_head)
+3. Argmax + accept/reject
+
+If MTP forward_draft ≈ verifier forward_decode in cost, the loop is
+~2× verifier cost per iter, yielding (1 + accept)/2 = 0.9 effective
+tokens per iter at 80% accept. That matches the observed 27/34 = 0.80×.
+
+For the lever to PAY: MTP forward_draft must be MUCH cheaper than
+verifier forward_decode. Reddit reports llama.cpp achieves 2.5× with
+`--spec-draft-n-max 3` (3 drafts per verify). hf2q does N=1 drafts
+(single MTP block, single propose) and forward_draft cost equals
+verifier — neither lever applied.
+
+#### iter-154 walk-phase target
+
+Profile MTP `forward_draft` vs verifier `forward_decode`:
+1. Add `HF2Q_MTP_PROFILE=1` mode → per-stage timing in MTP block
+2. Measure: how does MTP forward_draft (1 attn block + 1 FFN + 1
+   lm_head) scale relative to verifier (64 layers + lm_head)?
+3. If MTP block is paying full verifier-stack cost: bug, fix to
+   only-1-layer
+4. If MTP block IS only-1-layer but slow: kernel-level opt
+5. If both fast individually but loop overhead high: batching /
+   draft-n-max 3 implementation
+
+#### Walk-phase status update
+
+**Qwen3.6 path**: SPEC-DECODE ENGAGES but UNDERPERFORMS. iter-154+
+profile-then-fix the MTP forward_draft cost. THE concrete walk-phase
+work for qwen3.6 closure to peer ratio.
+
+**Gemma4 path**: walk-phase exhausted per iter-151. Operator pick
+required for path E (USE_DENSE default-flip) or wait on run-phase
+spec-decode (which could also help gemma4 once MTP analog or n-gram
+draft is available).
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
