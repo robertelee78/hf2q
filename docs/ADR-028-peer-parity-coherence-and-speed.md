@@ -12403,3 +12403,93 @@ iter-309 + iter-310 both showed kernels with peer's pattern give
 3. **CPU-side encode overhead:** profile dispatch_qmatmul +
    set_pipeline + set_bytes calls.  Even 1µs × 1000 disp/tok =
    1ms/tok = 7% gap if reducible.
+
+
+---
+
+## iter-311 — H3 (barrier density) MEASURED + lever sized
+
+iter-309/iter-310 falsified per-kernel-internals as dominant gap.
+iter-311 measures GPU scheduling.
+
+### Barrier instrumentation
+
+`HF2Q_SPLIT_TIMING=1` exposes per-token BODY stats.  Live measurement
+on gemma4 APEX-Q5_K_M, 5-tok decode:
+
+```
+[SPLIT] BODY: encode=2.35ms gpu=11.67ms dispatches=956 barriers=459
+[SPLIT] BODY: encode=0.50ms gpu=12.25ms dispatches=956 barriers=459
+[SPLIT] BODY: encode=0.53ms gpu=12.26ms dispatches=956 barriers=459
+```
+
+**459 barriers / 956 dispatches = 48% of dispatches followed by a
+GPU memory barrier.**  Each barrier serializes the pipeline.
+
+### Serial-vs-concurrent A/B (3 runs each, 200-tok)
+
+```
+HF2Q_FORCE_SERIAL_DISPATCH=0 (default, concurrent):   69.6, 67.5, 67.6  median 67.6 tok/s
+HF2Q_FORCE_SERIAL_DISPATCH=1 (serial):                63.2, 63.2, 61.9  median 63.2 tok/s
+Delta: +7.0%
+```
+
+Current barrier density already gives +7% over fully-serial.  Each
+"barrier-bounded group" is ~2 dispatches on average (956/459 = 2.08).
+
+### Peer comparison (llama.cpp ggml-metal-ops.cpp)
+
+```c
+// ggml_metal_op_encode_impl, lines 220-225:
+const bool is_concurrent = ggml_metal_op_concurrency_check(ctx, node);
+if (!is_concurrent) {
+    ggml_metal_op_concurrency_reset(ctx);  // emits memory_barrier
+}
+```
+
+Peer maintains `mem_ranges` of all pending dispatches and only inserts
+a barrier when a new dispatch's read/write ranges OVERLAP with a
+prior dispatch's range.  This means peer's barriers ≈ count of actual
+data hazards, not "after each kernel."
+
+If peer has 100 barriers/tok (~10% of dispatches), barrier-bounded
+groups are ~10 dispatches each.  Conservative estimate: 5× wider
+concurrency than ours.
+
+### Quantitative upper bound
+
+Sub-linear ceiling: even infinite concurrency wouldn't make decode
+faster than the longest critical-path kernel.  But on the
+serial→concurrent path our measured gain was +7% from 2× wider
+groups; 5× wider groups should yield another +10-15% upper bound.
+
+Combined with iter-309/iter-310 marginal +1-2% structural wins, the
+plausible total reachable headroom is +15-20%.
+
+That would take gemma4 APEX from 67-69 tok/s → ~80 tok/s vs peer's
+102.  Still short of parity but materially closer.
+
+### iter-312 plan: barrier audit on hot path
+
+Specifically audit:
+- `/opt/mlx-native/src/ops/moe_dispatch.rs`: 4 barriers per MoE call
+  × 30 layers = 120 barriers/tok (26% of total).
+- `/opt/mlx-native/src/ops/flash_attn_vec_tq.rs`: 1 barrier per FA
+  call × ~30 layers = 30 barriers/tok.
+- `/opt/mlx-native/src/graph.rs`: scaffolding barriers, multiple sites.
+
+For each: identify dispatches with NO RAW dependency on prior
+work-set; replace `encoder.memory_barrier()` with
+`encoder.dispatch_tracked(reads, writes)` to enable per-range
+auto-barrier logic.
+
+This is multi-iter work — proceed one barrier site at a time, parity
+test after each (regression-gate via existing
+`scripts/adr028_coherence_gate.sh`).
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`:
+  this section.
+
+No code changes in iter-311 — measurement + lever-sizing iter.
