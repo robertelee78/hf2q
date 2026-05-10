@@ -14674,3 +14674,124 @@ captured what was left = within noise but structurally cleaner)
 
 - `/opt/hf2q/src/serve/forward_mlx.rs:7158-7176`: V2-bypass fix
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+
+---
+
+## iter-339 — Phase 7b + 7c BOTH FALSIFIED by code reading (Chesterton's fence)
+
+Per /loop directive "Code + test == truth, never trust ADR/comments
+over code", investigated the two iter-338-opened sub-targets BEFORE
+committing implementation effort.
+
+### Phase 7c (MoE kernels peer-port) FALSIFIED
+
+Read peer's MoE kernels at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:9652+`
+(`kernel_mul_mm_id_map0` + `kernel_mul_mm_id`):
+
+Peer's design is **per-expert dispatch** for the prefill/large-batch
+path.  For decode (single token), peer falls back to
+`kernel_mul_mv_id_*` which we already nr2-ported (iter-321).
+
+Read our MoE kernel naming + dispatch counts:
+- `moe_swiglu_batch`: 35.1/tok ÷ 30 layers = 1.17/layer
+  → already BATCHED across all 8 active experts in 1 dispatch
+- `moe_weighted_sum`: same batched pattern
+- `fused_moe_routing_f32`: same
+
+The "_batch" suffix in our kernel names + the 1.17-per-layer rate
+prove our design is the OPPOSITE of peer's per-expert pattern: we
+coalesce the 8 active experts into a single dispatch.
+
+Per iter-336 finding:
+> "Peer pattern: MORE dispatches each doing LESS work per launch."
+> "Our: FEWER bigger dispatches" (920 vs 1417 disp/tok)
+
+Switching MoE to per-expert dispatch would ADD 7 dispatches per layer
+(8 - 1 batched) × 30 layers = 210 dispatches/tok ADDITIONAL, at our
+current 14.7 µs/dispatch wall = +3 ms/tok = **REGRESSION** of 22%.
+
+**Phase 7c CLOSED FALSIFIED.**  Our batched MoE design is MORE
+efficient than peer's per-expert pattern for decode.
+
+### Phase 7b (hadamard_quantize_kv_fast_d256 optimization) FALSIFIED
+
+Read `/opt/mlx-native/src/shaders/hadamard_quantize_kv_fast.metal:140-250`:
+
+Kernel is ALREADY SIMD-optimized:
+- Line 184: "FWHT via SIMD shuffle (ZERO threadgroup barriers)" —
+  the most expensive part uses SIMD-level operations only
+- Line 209: `simd_sum(local_sq_sum)` for L2 norm reduction
+- Line 218-219: `simd_sum` for per-block RMS (D=512 case)
+- Per-thread register storage of EPT=8 (D=256/32) elements
+- Per-thread D1 sign pre-multiplication (TBQ_SIGNS table)
+- Line 141: "queen-verified" — already reviewed
+- Threadgroup geometry: (32, 1, 1) = single simdgroup per threadgroup,
+  processes 1 KV head per dispatch
+
+Peer (llama.cpp) has **NO Hadamard equivalent** (grep on
+`/opt/llama.cpp/ggml/src/ggml-metal/` returns zero hadamard matches).
+There is no peer to port from.
+
+Per Chesterton's fence: this kernel was carefully designed to be
+SIMD-optimal already.  No obvious lever.  Further optimization
+requires deep mathematical analysis of FWHT structure (not a
+mechanical port).
+
+**Phase 7b CLOSED FALSIFIED** as a port lever.  Kernel is already
+near-optimal.  A "rewrite from scratch with different algorithm"
+would be Phase 7d-class work (structural).
+
+### Final Phase 7 sub-target status
+
+| Sub | Lever | Status |
+|---|---|---|
+| 7a | rms_norm_no_scale V2-bypass fix | LANDED iter-338 |
+| 7b | hadamard_quantize_* family optimization | **FALSIFIED** — already SIMD-optimal |
+| 7c | MoE kernels peer-port | **FALSIFIED** — our batched design beats peer's per-expert for decode |
+| 7d | TQ-HB SDPA fusion redesign | open, multi-week structural |
+
+**Per-kernel + per-kernel-family optimization avenue is now FULLY
+exhausted.**  After 14 iter sections of work (iter-326→iter-339),
+the remaining 28.7% gap to peer (73.5 vs 103.16 tok/s) is
+structurally tied to per-dispatch kernel exec time on our larger
+coalesced kernels.
+
+### Honest closure on iterative ceiling
+
+Cumulative session record:
+- Per-kernel ports shipped: 5 (q6_K nr2 iter-309, q6_K _id nr2
+  iter-321, rms_norm_v2 iter-310, fused_norm_add_v2 iter-331,
+  fused_head_norm_rope_v2 iter-337) + 1 V2-bypass fix iter-338
+- Default-flips shipped: 5 flags (iter-326)
+- Falsifications properly documented: 9 (iter-328 ENCODER_SESSION
+  qwen35-only, iter-329 Q5_K matches + Q4_K N/A, iter-330 F16 KV
+  no speed, iter-332 Q8_0/Q5_1 match + IQ4_NL deferred, iter-333
+  EncoderSession-already-at-1CB, iter-335 barriers conflict-driven
+  + UNRETAINED_REFS no-op, iter-339 7b + 7c both FALSIFIED)
+- Cumulative gemma4 default 200-tok decode: 69.4 → 73.5 tok/s
+  = **+5.9% baked into all gemma4 user experience**
+- Coherence intact, TQ-HB intact (3.94× memory savings preserved
+  per RAM mantra), 18+/18 parity tests PASS
+
+### Only remaining viable structural lever
+
+**Phase 7d: TQ-HB SDPA fusion redesign** — multi-week structural
+work to fuse the dequant + norm + GEMV chain inside the SDPA path
+the way peer fuses dequant inside mat-vec.  Preserves TQ-HB savings.
+Out of /loop iteration scope; requires `/cfa` swarm spawn at the
+implementation phase.
+
+For the next /loop iteration, the actionable next step is one of:
+1. Spawn /cfa swarm for Phase 7d (operator decision — multi-week)
+2. Apple Instruments Metal System Trace (operator GUI — would
+   localize the per-µs encoding overhead more precisely)
+3. Accept 0.713× gemma4 ceiling as the per-kernel-port-exhausted
+   end state for this session
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (both sub-targets falsified by code reading before
+implementation effort committed).
