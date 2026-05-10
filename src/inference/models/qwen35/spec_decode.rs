@@ -161,6 +161,10 @@ impl<'a> SpecDecode<'a> {
 
         let decode_start = Instant::now();
         while generated.len() < max_new {
+            // ADR-028 iter-159: whole-iter timer to find loop overhead.
+            let mtp_profile_iter = std::env::var("HF2Q_MTP_PROFILE").as_deref() == Ok("1");
+            let iter_t0 = if mtp_profile_iter { Some(Instant::now()) } else { None };
+
             let token_next = greedy_argmax_last_token(&logits_t, vocab);
             if !preemitted_argmax {
                 generated.push(token_next);
@@ -205,19 +209,38 @@ impl<'a> SpecDecode<'a> {
                 .verifier
                 .forward_gpu_with_hidden(&[token_next], &verify_positions, &mut self.kv_cache)
                 .with_context(|| format!("SpecDecode verifier step pos {next_pos}"))?;
-            if mtp_profile {
-                let v_ms = verify_t0.unwrap().elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[MTP_PROFILE] iter {}: mtp_draft={:.2}ms verifier={:.2}ms",
-                    self.stats.proposed, mtp_ms.unwrap_or(0.0), v_ms);
-            }
-            let verified = greedy_argmax_last_token(&verify_logits, vocab);
+            let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
+            // ADR-028 iter-159: granular post-verify timing.
+            let post_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+            let verified = greedy_argmax_last_token(&verify_logits, vocab);
+            let argmax_ms = post_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+
+            let slice_t0 = if mtp_profile { Some(Instant::now()) } else { None };
             // Verifier step is a single-token decode (seq_len=1); slice is
             // an identity-shaped view but makes the [1, H] contract explicit.
             hidden_t = last_hidden_row(&verify_hidden, self.verifier.cfg.hidden_size)
                 .with_context(|| format!("SpecDecode verify last_hidden_row slice pos {next_pos}"))?;
+            let slice_ms = slice_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+
+            let copy_t0 = if mtp_profile { Some(Instant::now()) } else { None };
             logits_t = last_logits(&verify_logits, vocab)?.to_vec();
+            let copy_ms = copy_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
             hidden_pos = next_pos;
+
+            if mtp_profile {
+                let iter_ms = iter_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+                let summed = mtp_ms.unwrap_or(0.0) + v_ms.unwrap_or(0.0)
+                    + argmax_ms.unwrap_or(0.0) + slice_ms.unwrap_or(0.0)
+                    + copy_ms.unwrap_or(0.0);
+                eprintln!(
+                    "[MTP_PROFILE] iter {}: mtp={:.2} ver={:.2} arg={:.2} sl={:.2} cp={:.2} summed={:.2} ITER={:.2} delta={:.2}",
+                    self.stats.proposed,
+                    mtp_ms.unwrap_or(0.0), v_ms.unwrap_or(0.0),
+                    argmax_ms.unwrap_or(0.0), slice_ms.unwrap_or(0.0), copy_ms.unwrap_or(0.0),
+                    summed, iter_ms, iter_ms - summed,
+                );
+            }
 
             if proposed == verified && generated.len() < max_new {
                 generated.push(verified);

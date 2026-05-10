@@ -3701,6 +3701,80 @@ empirically validated as not the dominant constraint — accept rate
 preserves at sustained run, and 26ms loop overhead is the next
 bigger fish.
 
+### iter-159: CRITICAL — current spec_decode is degenerate at K=1
+
+#### Finer-grained loop profile (per-step)
+
+Added per-step timers around argmax + slice + copy. Steady-state:
+
+```
+[MTP_PROFILE] mtp=4.10 ver=31.65 arg=0.13 sl=0.00 cp=0.01 summed=35.89 ITER=36.0 delta=0.11
+```
+
+The post-verify CPU work (argmax + last_hidden_row + last_logits.to_vec)
+is **only 0.13 ms** — 1MB readback hypothesis from iter-158 FALSIFIED.
+
+#### Math reconciliation
+
+Recompute iter time correctly:
+- 12 tokens at 72.7% accept reported, but **each iter contributes
+  exactly 1 token** to `generated[]` regardless of accept/reject
+  (re-traced run_prompt loop carefully)
+- → 12 iters for 12 tokens
+- Iter body = 36 ms
+- Total decode = 12 × 36 = 432 ms (close to reported 410 ms)
+
+Per-iter cost: 36 ms (spec) vs ~30 ms (greedy). **Spec is 1.2×
+SLOWER per iter, with 1 token/iter both ways.** No amortization.
+
+#### Why current spec_decode is degenerate
+
+Re-reading run_prompt loop:
+1. `argmax(logits_t)` → token_next
+2. push token_next (if !preemitted)
+3. forward_draft → proposed
+4. verifier `forward_gpu_with_hidden(&[token_next], ...)` — verifies
+   only `token_next` at next_pos (1 token)
+5. argmax(verify_logits) → verified
+6. if proposed == verified: push verified, set preemitted
+
+**The verifier processes only 1 token per iter.** Accept/reject only
+controls WHICH iter pushes verified-at-end vs token-at-start. No
+verifier amortization across multiple positions.
+
+For real spec-decode speedup at K=1, the verifier should:
+- Process `[token_next, proposed]` in ONE batched forward at
+  positions `[next_pos, next_pos+1]`
+- Yield logits at BOTH positions
+- Check accept: argmax(logits[0]) == proposed?
+- Accept: emit `[token_next, proposed]` AND keep KV cache for both
+- Reject: emit `[token_next]` only, roll back KV cache pos+1
+
+This is standard speculative decoding (Leviathan et al. 2023). hf2q's
+current loop is degenerate — spec-decode CANNOT be a speedup at K=1
+without batched verify.
+
+#### iter-160+ walk-phase target — REAL spec-decode
+
+Refactor `spec_decode.rs::run_prompt` to do batched verify:
+- Concat `[token_next, proposed]` into input
+- Generate positions `[next_pos, next_pos+1]`
+- Call verifier with 2-token input
+- Read logits at position 0 (check accept) AND position 1 (next
+  iter's token_next)
+- KV cache rollback on reject (Path A Phase 2 GPU scaffold from
+  iter-134..140 has the rollback_kv_state utility)
+
+Expected:
+- accept iter: 36 ms verifier(2 tok) + 4 ms MTP = 40 ms; emits 2 tok
+  → 50 tok/s effective
+- reject iter: 36 ms + 4 ms = 40 ms; emits 1 tok → 25 tok/s
+- At 78% accept: weighted = 0.78×50 + 0.22×25 = 44.5 tok/s
+- vs greedy 32.5 → **1.37× speedup**
+
+Multi-iter scope (~150-300 LOC). Verifier 2-token forward shape
+already supported (prefill batching infra).
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
