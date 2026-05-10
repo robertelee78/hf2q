@@ -6692,6 +6692,43 @@ iter-221+ would continue marginal kernel-internal optimizations or wait
 for operator-direction.  Without new information, the bisect-driven
 discipline has reached its useful limit on default-path single-iter wins.
 
+### iter-221 — stability re-verify + stack independence check
+
+**Stability** (no regression from iter-217-220 fusion work):
+- gemma4 default: 68.7 ± 0.1 tok/s (matches iter-216 exactly)
+- qwen3.6 default: 130.4 tok/s (matches operator's earlier 132 within noise)
+
+**Stack independence** test — does iter-217's fused kernel stack with
+Path E+F+G?
+
+| Stack | Median tok/s |
+|-------|-------------:|
+| Path E+F+G alone | 73.3 |
+| Path E+F+G + HF2Q_FUSED_END_OF_LAYER=1 | **73.6** |
+| **Δ** | **+0.4%** |
+
+**iter-219 lesson confirmed across baselines**: fusion ROI is
+~+0.3-0.4% regardless of which baseline (default or Path E+F+G).
+Same launch-overhead-limited magnitude.
+
+**Final operator decision space** (post-stack-independence verified):
+
+| Path | tok/s | vs peer | precision |
+|------|------:|--------:|-----------|
+| Status quo (current default) | 68.8 | 0.670× | exact (TQ-HB) |
+| Path E flip (1-line) | ~71 | ~0.69× | exact (F32 KV) |
+| Path E+G | 72.4 | 0.705× | exact |
+| Path E+F+G | 73.3 | 0.713× | F16 ~25 ppm |
+| **Path E+F+G + FUSED** | **73.6** | **0.717×** | F16 ~25 ppm |
+| llama.cpp peer | 102.7 | 1.000× | F16 |
+
+The iter-217 fused kernel adds a marginal +0.4% on top of any base
+configuration.  Available as `HF2Q_FUSED_END_OF_LAYER=1` opt-in flag.
+
+**Highest-ROI single move remaining**: Path E+F+G default-flip = +6.4%
+over current default (vs +1.8% from all session-shipped optimizations
+combined excluding the default-path).
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
