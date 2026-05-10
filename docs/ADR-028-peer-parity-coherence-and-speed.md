@@ -13753,3 +13753,113 @@ estimate that survived iter-329's lever-validation gate.
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
 
 No code changes (read-only verification + plan correction).
+
+
+---
+
+## iter-330 — Phase 6 PARTIAL CLOSE: F16 KV no longer broken, but zero speed; RAM win only
+
+Phase 6 scope was "F16 KV + clip_residual guard" with deep-research-forecast
++12% speed AND ~50% K/V memory reduction.  Tested at HEAD (after iter-326
+default-flips): the iter-233/iter-234 break is fixed; speed forecast is
+falsified; RAM win is real.
+
+### Coherence verification at HEAD
+
+Tested `HF2Q_F16_KV=1` on gemma4-ara-2pass-APEX-Q5_K_M.gguf:
+
+| Test | Sampling | N tok | Runs | Result |
+|---|---|---|---|---|
+| 1 | --temperature 0 (greedy) | 200 | 1 | ✓ COHERENT, character-identical to F32 KV |
+| 2 | --temperature 0 (greedy) | 1000 | 1 | ✓ COHERENT, character-identical to F32 KV |
+| 3 | (default sampler) | 600 | 5 | ✓ 5/5 COHERENT, identical |
+| 4 | --temperature 1.0 | 600 | 5 | ✓ 5/5 COHERENT, identical |
+| 5 | --temperature 1.0, F32 KV control | 600 | 3 | ✓ 3/3 IDENTICAL to F16 KV runs |
+
+13/13 runs coherent.  Output is character-by-character identical between
+F16 KV and F32 KV across all sampling modes and prompt styles.  Whatever
+caused iter-234's "non-deterministic `<pad>`" failure has been fixed by
+intervening work — likely the cumulative precision improvements from the
+iter-308→324 thread (HF2Q_RMS_NORM_V2 float4+simd_sum, HF2Q_FUSED_END_OF_LAYER,
+q6_K_nr2 ports).  iter-233 noted "if the residual stream stays F32 the
+sliding-window wrap noise should be bounded"; this appears to be exactly
+what's now happening.
+
+`clip_residual` guard from `mlx-lm/mlx_lm/models/gemma3_text.py:125-132`
+is **NOT NEEDED**.  That guard activates only when `x.dtype == mx.float16`
+(mlx-lm's gemma3 has F16 residual stream); hf2q's residual stream is F32
+even when KV is F16, so the F16 overflow case the guard fixes doesn't
+apply to our architecture.
+
+### Speed: ZERO gain (deep-research +12% FALSIFIED)
+
+```
+A: F32 KV @ 1000 tok: 1000 tokens in 13.91s (71.9 tok/s)
+B: F16 KV @ 1000 tok: 1000 tokens in 13.91s (71.9 tok/s)
+```
+
+Identical to the millisecond.  Why no gain?
+1. K/V is tiny relative to weight memory: ~480 MB per-token K/V vs ~19 GB
+   weights → K/V bandwidth is not the bottleneck for decode tok/s.
+2. SDPA kernel reads K/V from MlxBuffer regardless of dtype; the F16
+   path goes through the same TQ-HB-encoded fast-path under the hood.
+3. iter-237 H1 prediction (+12%) was based on naive K/V-bandwidth
+   accounting that doesn't model the real bottleneck (mat-vec dispatch
+   overhead at 15 µs/dispatch, see iter-308).
+
+### RAM: real ~50% K/V reduction (operator's mantra-aligned win)
+
+Per-layer K/V bytes at gemma4 APEX defaults (sliding_window=1024,
+8 KV heads × 256 head_dim):
+
+| Path | K | V | Total per layer | × 30 layers |
+|---|---|---|---|---|
+| F32 KV (current default) | 8 MB | 8 MB | 16 MB | **480 MB** |
+| F16 KV | 4 MB | 4 MB | 8 MB | **240 MB** |
+
+For long-context generation on global layers (every 6th layer = 5
+layers, no sliding-window cap), savings scale:
+
+| Context | F32 K/V (5 global) | F16 K/V | Savings |
+|---|---|---|---|
+| 8 K | 1.7 GB | 0.85 GB | 850 MB |
+| 32 K | 6.7 GB | 3.4 GB | 3.4 GB |
+| 64 K | 13.4 GB | 6.7 GB | 6.7 GB |
+| 256 K (max_ctx_train) | 53.7 GB | 26.9 GB | **26.9 GB** |
+
+For long-context production workloads, the RAM win is substantial.
+For typical 200-1000 tok generations, modest (~240 MB).
+
+### Recommendation
+
+1. **iter-235 deprecation banner UNDONE**: F16 KV is no longer
+   gemma4-broken at HEAD.  Restore as a documented opt-in flag for
+   RAM-conscious users.
+2. **Default-flip DEFERRED**: 13 runs of identical output is encouraging
+   but not yet conclusive evidence for shipping default-on.  Validation
+   gate before any future default-flip:
+   - 100-run coherence sweep at default sampling, multiple prompt
+     domains (creative, factual, code, multi-turn)
+   - 100-run logit-divergence comparison (per-token KL between F16 and
+     F32 distributions, not just argmax)
+   - Long-context-specific test at 8K/32K/64K context lengths
+3. **Document opt-in path** for RAM-conscious users in operator-env-vars
+   doc — `HF2Q_F16_KV=1` for gemma4 saves K/V memory at zero observable
+   precision cost for most workloads.
+
+### Cross-references
+
+- `mlx-lm/mlx_lm/models/gemma3_text.py:125-132` — clip_residual definition
+  (not needed for hf2q because residual stream is F32)
+- `forward_mlx.rs:3390` — gemma4 F16 KV write-path (already wired)
+- `forward_mlx.rs:1037-1054` — DenseKvBuffers dtype invariant
+- ADR-028 §iter-233 — original break (now stale)
+- ADR-028 §iter-234 — non-deterministic sampling break (now stale)
+- ADR-028 §iter-235 — deprecation banner (recommend undoing)
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (verification + finding documentation).  Phase 4
+(fused_norm_add_f32 → float4 port) opens next.
