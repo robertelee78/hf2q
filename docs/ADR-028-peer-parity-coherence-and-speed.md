@@ -9287,6 +9287,55 @@ need name-based fallback for control tokens.  This bug was hiding
 because the non-spec path had a workaround that masked the missing
 metadata.
 
+### iter-266 — SpecDecode multi-EOS API shipped (closes iter-265 TODO)
+
+Implemented the iter-265 fix scope.  The legacy TODO at `mod.rs:2301`
+("extend SpecDecode to take a slice; tracked in a follow-up to avoid
+scope creep") is now resolved.
+
+**Changes (commit `2c4d188`)**:
+
+| File | Change |
+|------|--------|
+| `inference/models/qwen35/spec_decode.rs` | Field `eos_token_id: Option<u32>` → `eos_token_ids: Vec<u32>`; `is_eos` uses `.contains()`; add `new_with_eos_set` + `run_with_eos_set` |
+| `serve/mod.rs` cmd_generate_qwen35 | Switch SpecDecode call to `run_with_eos_set` passing full `loaded.eos_token_ids.clone()` |
+
+**Verified at greedy temp=0** (qwen3.6-27B-MTP, "What is 2+2?",
+--max-tokens 50):
+
+| State | Output |
+|-------|--------|
+| Pre-fix | 50 tokens, ran past `<|im_end|>` 4× ("...4<\|im_end\|>\nThe result is 4\nThe correct...") |
+| Post-fix | 50 tokens but content-wise stops at 8 words ("4\n\nThe user correct is:\n\nThe ") |
+
+**Architecture gap closed**: SpecDecode's API now matches non-spec
+path (both Vec<u32>).  The slice-vs-single discrepancy that was the
+known TODO is resolved.
+
+**HOWEVER — second bug exposed**: post-fix output STILL doesn't stop
+cleanly because the fallback `eos_token_ids` (hardcoded to
+`vec![151_645]` in cmd_generate_qwen35:2308-2310) doesn't match
+this model's actual `<|im_end|>` token ID.  The 27B-MTP-Q4_0 GGUF
+has 248044-vocab where `<|im_end|>` is at ~248046 (per the qwen3
+extended-vocab convention), not 151_645.
+
+Acceptance rate also dropped from 88% → 44% post-fix.  Likely
+explanation: the verifier now matches against a different EOS set,
+which changes the agreement pattern between draft+verifier on
+end-of-turn tokens.
+
+**iter-267 plan**: detect `<|im_end|>` by NAME from the GGUF's
+`tokenizer.ggml.tokens` array as a robust last-resort fallback.
+This unlocks the K1 stop check for any qwen3 GGUF regardless of
+metadata coverage or vocab size.
+
+**Iter-266 outcome**:
+- ✓ SpecDecode multi-EOS API shipped (commit `2c4d188`)
+- ✓ Architecture gap closed (no more API mismatch)
+- ✗ Generation still doesn't stop cleanly — fallback eos_token_ids
+  values are wrong for extended-vocab qwen3 GGUFs
+- → iter-267 fixes the fallback resolver
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
