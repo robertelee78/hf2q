@@ -14551,3 +14551,126 @@ Next /loop iter starts Phase 7 design work in earnest.
 - `/opt/mlx-native/src/kernel_registry.rs`
 - `/opt/mlx-native/src/ops/fused_head_norm_rope.rs`
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+
+---
+
+## iter-338 — Per-pipeline dispatch breakdown + 3 NEW findings (gemma4 IS MoE!)
+
+Per /loop directive "Code + test == truth", before committing weeks
+to Phase 7, captured empirical per-pipeline dispatch breakdown via
+`HF2Q_DUMP_COUNTERS=1 MLX_DISP_BUCKET=1` on gemma4 APEX 100-tok decode.
+
+### Empirical breakdown (37 unique pipelines, 109,890 dispatches/100-tok)
+
+Top-15 by share:
+
+| Rank | Dispatches | Share | Pipeline | Notes |
+|---|---|---|---|---|
+| 1 | 20592 | 18.74% | kernel_mul_mv_q6_K_f32_nr2 | iter-309 ported ✓ |
+| 2 | 17667 | 16.08% | rms_norm_f32_v2 | iter-310 ported ✓ |
+| 3 | 7020 | 6.39% | fused_head_norm_rope_f32_v2 | iter-337 ported ✓ |
+| 4 | 5850 | 5.32% | **hadamard_quantize_kv_fast_d256** | hf2q-unique TQ-encode |
+| 5 | 4050 | 3.69% | fused_norm_add_f32_v2 | iter-331 ported ✓ |
+| 6 | 3510 | 3.19% | **fused_moe_routing_f32** | MoE — gemma4 ACTIVE |
+| 7 | 3510 | 3.19% | kernel_mul_mv_q8_0_f32 | matches peer ✓ |
+| 8 | 3510 | 3.19% | **moe_weighted_sum** | MoE — gemma4 ACTIVE |
+| 9 | 3510 | 3.19% | hf2q_dense_mm_f32_f32_tensor | F32 dense mm tensor |
+| 10 | 3510 | 3.19% | kernel_mul_mv_id_q6_K_f32_nr2 | iter-321 ported ✓ |
+| 11 | 3510 | 3.19% | rms_norm_no_scale_f32 → **rms_norm_no_scale_f32_v2** | **V2-bypass FIXED this iter** |
+| 12 | 3510 | 3.19% | **moe_swiglu_batch** | MoE — gemma4 ACTIVE |
+| 13 | 3510 | 3.19% | fused_gelu_mul | gemma4 FFN |
+| 14 | 2970 | 2.70% | fused_post_ff_norm2_endlayer_f32 | iter-219 ✓ |
+| 15 | 2925 | 2.66% | flash_attn_vec_reduce_dk256 | SDPA reduce phase |
+
+### Finding 1: gemma4 IS MoE (deep-research falsified again)
+
+iter-329 closed Phase 3' (MoE kernel verification) with: "MoE kernels
+N/A for gemma4 — gemma4 isn't MoE."  This was WRONG.
+
+Confirmed via load banner:
+```
+features = sliding_window=1024, full_attn_every=6, moe=128 experts/8 active
+DEBUG GGUF layer N/30: MoE experts loaded (stacked, 416.3 MB + ...)
+```
+
+The gemma4-ara-2pass-APEX-Q5_K_M file is a MoE model (128 experts,
+8 active per token).  The "26B-A4B" naming = 26B total params,
+4B active per token (MoE structure).
+
+Active MoE kernels on gemma4 (per dispatch breakdown):
+- fused_moe_routing_f32:    3510/100-tok = 3.19%
+- moe_weighted_sum:         3510/100-tok = 3.19%
+- moe_swiglu_batch:         3510/100-tok = 3.19%
+- kernel_mul_mv_id_q6_K_f32_nr2 (MoE expert mat-vec): 3510 = 3.19% (already nr2)
+- **MoE kernel total: ~12.76% of dispatches on gemma4 decode**
+
+This is a real lever. Peer-port comparison opens a new sub-phase.
+
+### Finding 2: rms_norm_no_scale_f32 V2-bypass site FIXED
+
+`forward_mlx.rs:7158-7176` (`dispatch_rms_norm_unit_perhead`) was
+authored before the iter-310 V2 dispatcher existed, so it directly
+got the v1 pipeline by name (`rms_norm_no_scale_f32`).  At HEAD with
+iter-326 default-flips, this bypassed the V2-aware path.
+
+**Fix**: inline V2 env-gate matching `mlx-native/src/ops/rms_norm.rs:662-683`
+pattern.  When `dim%4==0` and `HF2Q_RMS_NORM_V2` not opt-out, switch
+to `rms_norm_no_scale_f32_v2` pipeline + adjust shared mem to V2's
+`(tg_size/32) * 4` byte budget.
+
+Verification:
+- Pre-fix dispatch dump: `rms_norm_no_scale_f32` 3510 = 3.19%
+- Post-fix dispatch dump: `rms_norm_no_scale_f32_v2` 3510 = 3.19% ✓
+
+Bench: 73.4 tok/s (within noise of 73.5 baseline) — V2 had already
+captured most of its lever via the larger `rms_norm_f32_v2` site
+that DOES use the dispatcher; this fix completes the V2 deployment
+across all rms_norm call sites.  Per "no fallback, no stub" mantra,
+this is the right closure.
+
+### Finding 3: hadamard_quantize_kv_fast_d256 is hf2q-unique
+
+5.32% of dispatches (5850/100-tok = 58.5/tok) is TQ-HB encoding
+(`hadamard_quantize_kv_fast_d256`).  Peer (llama.cpp) has NO equivalent
+— grep on `/opt/llama.cpp/ggml/src/ggml-metal/` returns zero matches
+for `hadamard_quantize`.  This is the cost of having TQ-HB.
+
+Per operator RAM-mantra binding (iter-326), TQ-HB savings (3.94×
+per-slot K/V memory) MUST be preserved.  This kernel cannot be
+removed.  But it CAN be optimized — it's the second-largest
+unported kernel after the iter-309/310/331/337 work.
+
+Phase 7 sub-target 7b: optimize `hadamard_quantize_kv_fast_d256` +
+the related `hadamard_quantize_kv_hb_*` family (combined ~7-10% of
+dispatches with the SDPA path).
+
+### Refined Phase 7 sub-targets (tracked separately)
+
+| Sub | Lever | Est. share | Difficulty |
+|---|---|---|---|
+| 7a | rms_norm_no_scale V2-bypass fix | 3.19% × ~30% saved | LANDED THIS ITER |
+| 7b | hadamard_quantize_kv_fast_* family optimization | ~7-10% combined | medium |
+| 7c | MoE kernels peer-port (moe_swiglu_batch, fused_moe_routing, moe_weighted_sum) | ~9.6% combined | medium |
+| 7d | TQ-HB SDPA fusion (flash_attn_vec_tq_hb + reduce + dequant chain) | ~6% combined | hard, multi-week |
+
+Sub-target 7c is the next concrete piece — peer-compare the 3 MoE
+kernels (which deep-research originally listed but iter-329 falsely
+ruled out as "qwen35-only").
+
+### Bench at iter-338 HEAD
+
+```
+prefill: 18 tok in 406ms (44 tok/s)
+--- mlx-native: 100 tokens in 1.35s (73.9 tok/s) ---
+[MLX_COUNTERS] dispatches=92070 cmd_bufs=198 barriers=50787
+  dispatches/decode_tok=920.70 cmd_bufs/decode_tok=1.9800
+
+200-tok decode: 73.4 tok/s (V2-on baseline 73.5; V2-bypass fix
+captured what was left = within noise but structurally cleaner)
+```
+
+### Files modified
+
+- `/opt/hf2q/src/serve/forward_mlx.rs:7158-7176`: V2-bypass fix
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.

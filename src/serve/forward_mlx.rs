@@ -7155,16 +7155,46 @@ pub struct RmsNormPerHeadArgs<'a> {
 ///
 /// Same as `dispatch_rms_norm_perhead` but uses `rms_norm_no_scale_f32`
 /// (no weight buffer — just unit normalization).
+///
+/// ADR-028 iter-338 — env-gated V2 (float4 + simd_sum) variant when
+/// `dim % 4 == 0`, mirroring mlx-native ops/rms_norm.rs:662-683 pattern
+/// that the iter-310 V2 dispatcher uses.  This was a V2-bypass site:
+/// the function was authored before the V2 dispatcher existed and
+/// directly gets the v1 pipeline by name.  Default-ON via
+/// `HF2Q_RMS_NORM_V2`; opt-out via `=0`/`false`/`off`.
 pub fn dispatch_rms_norm_unit_perhead(
     encoder: &mut mlx_native::CommandEncoder,
     registry: &mut mlx_native::KernelRegistry,
     device: &mlx_native::metal::DeviceRef,
     args: &RmsNormPerHeadArgs<'_>,
 ) -> Result<()> {
-    let pipeline = registry.get_pipeline("rms_norm_no_scale_f32", device)
-        .map_err(|e| anyhow::anyhow!("rms_norm_no_scale_f32 pipeline: {e}"))?;
-    let tg_size = std::cmp::min(256, args.dim.next_power_of_two()) as u64;
-    let shared_mem_bytes = tg_size * 4;
+    // Inline V2 env-gate (mirrors iter-326 inline pattern; preserves
+    // debug→serve module boundary).
+    let v2_env_off = matches!(
+        std::env::var("HF2Q_RMS_NORM_V2").ok().as_deref(),
+        Some(v) if v.eq_ignore_ascii_case("0")
+            || v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("off")
+    );
+    let use_v2 = (args.dim % 4 == 0) && !v2_env_off;
+    let kernel_name = if use_v2 {
+        "rms_norm_no_scale_f32_v2"
+    } else {
+        "rms_norm_no_scale_f32"
+    };
+    let pipeline = registry.get_pipeline(kernel_name, device)
+        .map_err(|e| anyhow::anyhow!("{kernel_name} pipeline: {e}"))?;
+    let mut tg_size = std::cmp::min(256, args.dim.next_power_of_two()) as u64;
+    if use_v2 && tg_size < 32 {
+        tg_size = 32;
+    }
+    let shared_mem_bytes = if use_v2 {
+        // V2 only needs n_sg = tg_size/32 floats; allocate at least 32
+        // so partial-warp tg_sizes are safe (matches rms_norm.rs:679-681).
+        (tg_size / 32).max(1) * 4
+    } else {
+        tg_size * 4
+    };
     encoder.encode_threadgroups_with_shared(
         pipeline,
         &[(0, args.input), (1, args.output), (2, args.params_buf)],
