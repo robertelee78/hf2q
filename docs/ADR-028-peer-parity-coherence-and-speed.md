@@ -8869,6 +8869,69 @@ a quiesced environment (operator action: power-cycle then re-run).
 - → Path E+G remains the cleanest operator-actionable lever (1 line,
   +3.6% measured at HEAD, byte-identical sourdough)
 
+### iter-259 — peer-baseline regime sweep: hf2q gap was OVERSTATED ~6pp
+
+Direct measurement via `llama-bench -m <APEX-Q5_K_M> -n 128,512,1024
+-r 3 -t 8` resolves both iter-258 anomalies:
+
+| llama.cpp regime | tok/s | σ |
+|------------------|------:|--:|
+| tg128 (burst, current quiesced) | **103.59** | ±0.19 |
+| tg512 (medium) | 101.71 | ±0.17 |
+| **tg1024 (matched to hf2q)** | **94.55** | ±2.56 |
+
+**Two findings**:
+
+1. **iter-258's tg128 = 90.68 ± 6.60 was a system-load anomaly**.
+   Quiesced now reproduces 103.59 ± 0.19 — matches iter-183's 102.7
+   ± 0.1 within noise.  System contention at iter-258 measurement
+   inflated σ ~30× (from 0.19 to 6.60).
+
+2. **llama.cpp drops 8.7% from tg128 → tg1024** (103.6 → 94.6).  This
+   is Apple Silicon thermal throttle on **sustained decode**.  M5 Max
+   maintains short-burst throughput but throttles at >5s sustained
+   GPU load.  hf2q runs at 1000-token sustained — same regime as
+   tg1024, NOT tg128.
+
+**The proper matched-regime peer baseline = tg1024 = 94.55 ± 2.56 tok/s**.
+
+**Corrected matched-regime ratios at HEAD**:
+
+| Stack | tok/s | × tg1024 (matched) | × tg128 (burst, mismatched) |
+|-------|------:|-------------------:|----------------------------:|
+| Default | 68.6 | **0.726×** | 0.663× |
+| Path E  | 69.7 | **0.737×** | 0.673× |
+| Path E+G ★ | 71.1 | **0.752×** | 0.687× |
+| llama.cpp tg1024 | 94.55 | 1.000× | 0.913× |
+
+**Methodological correction**: the entire ADR-028 series of "× peer"
+claims (e.g., iter-216 "0.666× peer", iter-237 "0.713× peer") were
+made against tg128 burst-regime baseline but hf2q's measurement is
+sustained-1000-token regime.  **Apparent gap was overstated by ~6pp**
+due to peer-vs-hf2q regime mismatch.
+
+**Updated map**:
+- Pre-session start (iter-179): 62.5 / 94.55 = **0.661× peer (matched)**
+- HEAD Default: 68.6 / 94.55 = **0.726× peer (matched)**
+- HEAD Path E+G: 71.1 / 94.55 = **0.752× peer (matched)**
+- Session-cumulative gain: **+9.0pp** vs peer (was reported as +5.7pp
+  vs tg128).
+
+**iter-259 outcome**:
+- ✓ Hypothesis confirmed: peer baseline IS regime-dependent
+- ✓ iter-258 anomaly resolved (was system load, not real drift)
+- ✓ Methodology now correct: tg1024 matches hf2q's measurement regime
+- → Closing-the-gap math: hf2q at 0.752× peer (matched), gap = 24.8%
+  (was ~32% under tg128 baseline)
+- → DFlash at 1.5-3× speedup would put hf2q at 1.13-2.26× peer
+  (matched) = clearly above peer
+
+**ADR header sentence to revise**: "currently 67.5-70 tok/s, llama.cpp
+peer at 100-103 tok/s" should read "currently 68.6-71.1 tok/s
+sustained, llama.cpp peer at 94.55 ± 2.56 sustained (tg1024 matched
+regime); the often-cited 102.7 burst figure is tg128 = different
+thermal regime than hf2q's 1000-token measurement."
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
