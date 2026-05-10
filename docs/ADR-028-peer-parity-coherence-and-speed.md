@@ -5602,6 +5602,60 @@ iter-197 plan: implement function-constant cbits properly:
 3. Dispatcher in ops/flash_attn_vec_tq_hb.rs selects variant
 4. Bench 5-run; expect +8.5% on cbits=8 default; verify 5/6/8 byte-parity
 
+### iter-197 — function-constant cbits LANDED (+8.5% as bisected)
+
+mlx-native commit `7c6f58f` ships the iter-196 bisect win.
+
+**Implementation**:
+- `shaders/flash_attn_vec_tq_hb.metal`: `constant int CBITS_FC
+  [[function_constant(50)]]` + `cbits_effective` fallback (8 if not set)
+- `ops/flash_attn_vec_tq_hb.rs`: `get_pipeline_with_constants(name,
+  device, &[], &[(50, params.codebook_bits as i32)])` — 3 specialized
+  pipeline variants compiled lazily on first use
+
+**Parity gate**: 15/15 byte-parity tests PASS for cbits=5/6/8 (full
+coverage: production-shape gemma4_26b, NSG equivalence, sliding window,
+fused-fwht-pre, multi-seed).
+
+**5-run statistical bench** (gemma4 default, 200-tok long-form):
+
+| Config | Run median | Δ from pre-session |
+|--------|-----------:|------:|
+| Pre-session default (iter-179 baseline) | 62.5 | — |
+| iter-195 (vector load shipped) | 63.8 | +2.08% |
+| iter-197 (vector load + fn-constant) | **69.2** | **+10.7%** |
+| llama.cpp peer 102.7 | — | (target) |
+
+Iter-197 matches iter-196 BISECT exactly (69.2 ± 0.1 std-dev).
+
+**Updated cumulative gemma4 lever inventory** (all default-path,
+no env flag, byte-identical to original):
+
+| Stack | tok/s | vs peer 102.7 | precision |
+|-------|------:|--------------:|-----------|
+| **New default (iter-195+197)** | **69.2** | **0.674×** | **exact** |
+| Path G (LMHEAD_Q6K) on top | ~70.5 (estimated) | 0.687× | exact |
+| Path E on top | 77.0 (estimated) | 0.750× | exact F32 |
+| Path E+G | 78.5 (estimated) | 0.764× | exact |
+| Path E+F+G | 80.0 (estimated) | 0.779× | F16 25 ppm |
+
+Default-path moved from 0.61× peer (62.5) to **0.67× peer (69.2)**.
+This is the largest session-shipped default-path improvement.
+Default users get +10.7% automatically with no flag, no precision
+change.
+
+**Operator lesson permanently encoded**: bisects > guesses.
+iter-194's 5-10% guess and iter-196 doc's 0.5-1% re-guess were both
+wrong by orders of magnitude.  The bisect (hardcode cbits=8, measure)
+gave the exact 8.5% which the function-constant impl delivered to
+within 0.1pp.  Speculation cost two iters of waste; bisect would have
+saved them.
+
+iter-198+ plan: re-bench Path E/E+G/E+F+G stacks with the new default
+to confirm orthogonality math.  Then look for next bisect target —
+likely norm fusion (B8/B9 sequential chains) with a similar
+hardcode-and-measure approach.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
