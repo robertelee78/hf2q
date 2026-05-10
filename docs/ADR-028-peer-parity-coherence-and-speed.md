@@ -4632,7 +4632,60 @@ output is broken. Two remaining hypotheses:
    path; or some other gate I haven't found)
 2. The K/V write or downstream op6-7 has a different qL=2 bug
 
-### iter-177 plan — instrument path engagement
+### iter-177 LANDED — partial fix via use_arena cur_len gate
+
+Added `HF2Q_FA_TRACE=1` instrumentation in `apply_sdpa_with_kv_cache`.
+Found via tracing: `build_gated_attn_layer`'s `use_arena` fast path
+(line 2729) bypasses `apply_sdpa_with_kv_cache` entirely and calls
+`apply_flash_attn_prefill_seq_major_into` directly — a fresh-prefill-
+only kernel.
+
+Fix: gate `use_arena` on `cur_len_for_arena == 0`:
+```rust
+let cur_len_for_arena = kv_cache_slot
+    .as_deref()
+    .map(|s| s.current_len[0])
+    .unwrap_or(0);
+let use_arena = fa_arena.is_some()
+    && seq_len > 1
+    && head_dim == 256
+    && cur_len_for_arena == 0;
+```
+
+Bench K=1 with fix:
+| Prompt | K=0 | K=1 broken | K=1 fixed | Output |
+|--------|---:|---:|---:|--------|
+| 2+2 | 28.4 | 40.6 | **36.2** | COHERENT |
+| haiku | 28.0 | broken | 35.2 | partial loop late |
+
+`HF2Q_FA_TRACE=1` post-fix confirms 16/16 FA layers/iter route to
+resume_path (= apply_flash_attn_prefill_seq_major_resume which is
+kernel-validated byte-correct at qL=2 + kL=130).
+
+### iter-178 finding — DeltaNet multi-token mid-stream is the remaining bug
+
+qwen3.6 layout: 64 layers, full_attn_every=4 → 16 FA + **48 DeltaNet
+(LinearAttn) layers**. After iter-177's FA fix, FA path is correct
+but haiku still loops "and gold and gold" — must be DeltaNet-specific.
+
+DeltaNet has its own state (conv_state + recurrent_state ping-pong)
+distinct from FA's K/V cache. `chunk_path_eligible` requires
+`seq_len > CHUNK_THRESHOLD=64`, so K=1 verify (seq_len=2) takes the
+**autoregressive** path. The autoregressive path SHOULD handle
+multi-token sequentially (process tokens 0..seq_len with state
+threading), but produces drift at K=1 mid-stream that compounds over
+many iters.
+
+Multi-iter scope. iter-179+ plan: bisect by:
+1. Run K=1 with TRACE on DeltaNet recurrent state convergence
+2. Compare seq_len=2 mid-stream vs two seq_len=1 calls
+3. Locate state-init bug (likely conv_state assumption or recurrent
+   state reset)
+
+Net status: K=1 batched verify produces +27% speedup over greedy on
+short prompts (2+2 fixture, coherent output). Long-form generation
+needs DeltaNet fix. Current production state (K=1 default-OFF) is
+unaffected.
 
 Add eprintln in apply_sdpa_with_kv_cache to print:
 - seq_len, cur_len, kv_seq_len, max_seq_len
