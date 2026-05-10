@@ -4105,22 +4105,26 @@ impl MlxModelWeights {
                     total_dispatches += 1;
 
                     // -- Fused end-of-layer: post-FF norm + residual add + scalar mul --
-                    let scalar_is_vector = self.layers[layer_idx].layer_scalar.element_count() > 1;
-                    s.barrier_between(
-                        &[&self.activations.residual, &self.activations.mlp_down],
-                        &[&self.activations.hidden],
-                    );
-                    mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_scalar_f32(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.residual,
-                        &self.activations.mlp_down,
-                        &self.layers[layer_idx].norms.post_feedforward_layernorm,
-                        &self.activations.hidden,
-                        &self.layers[layer_idx].layer_scalar,
-                        1, hs as u32, eps,
-                        scalar_is_vector,
-                    ).map_err(|e| anyhow::anyhow!("fused end-of-layer L{layer_idx}: {e}"))?;
-                    total_dispatches += 1;
+                    // ADR-028 iter-208 sub-bisect: SKIP_END_OF_LAYER_FINAL
+                    // skips only this final dispatch (keeps post-FF norm 2).
+                    if !INVESTIGATION_ENV.skip_end_of_layer_final {
+                        let scalar_is_vector = self.layers[layer_idx].layer_scalar.element_count() > 1;
+                        s.barrier_between(
+                            &[&self.activations.residual, &self.activations.mlp_down],
+                            &[&self.activations.hidden],
+                        );
+                        mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_scalar_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.residual,
+                            &self.activations.mlp_down,
+                            &self.layers[layer_idx].norms.post_feedforward_layernorm,
+                            &self.activations.hidden,
+                            &self.layers[layer_idx].layer_scalar,
+                            1, hs as u32, eps,
+                            scalar_is_vector,
+                        ).map_err(|e| anyhow::anyhow!("fused end-of-layer L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+                    }
                 }
 
                 if let Some(ref mut p) = profile {
