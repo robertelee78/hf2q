@@ -8813,6 +8813,62 @@ Available alternatives (smaller scope):
 
 Code committed: mlx-native bench (iter-257), ADR-028 §iter-256/257.
 
+### iter-258 — fresh full-stack regression at HEAD + peer-baseline drift
+
+Ran `scripts/adr028_full_stack_bench.sh` at HEAD post-iter-257 to
+verify no regression from iter-253-257 (which only added docs +
+benches; production engine path unchanged).
+
+| Stack | Run 1 | Run 2 | Run 3 | Median | vs iter-216 ref |
+|-------|------:|------:|------:|-------:|----------------:|
+| Default       | 68.8 | 68.6 | 68.5 | **68.6** | ≈ 68.4 (stable) |
+| Path E        | 69.7 | 69.7 | 69.7 | **69.7** | +0.5 (stable) |
+| **Path E+G ★**| 71.0 | 71.1 | 71.1 | **71.1** | ≈ 70.9 (stable) |
+| E+G+FUSED     | 71.6 | 64.7 | 68.1 | **68.1** | NOISY σ≈3.5 |
+| E+F+G (F16 KV)| 69.4 | 69.6 | 72.8 | **69.6** | broken anyway |
+| llama.cpp peer | --  | --   | --   | **90.68 ± 6.60** | was 102.7 ± 0.1 |
+
+**Three findings**:
+
+1. **Stable HEAD baseline**: Default / E / E+G reproduce within 0.3%
+   tok/s of iter-216 reference.  iter-253-257 work (docs + new
+   benches only) caused **no regression**.  Audit conclusion stands.
+
+2. **FUSED stack has σ ≈ 3.5 tok/s run-to-run variance** (~5% noise
+   floor at long-form 1000-token decode).  iter-219's "+0.3%"
+   measurement falls *inside* the run-to-run noise.  **Confirms
+   iter-220's retirement of the fusion strategy** — there's no
+   measurable signal above noise even at the best-case end-of-layer
+   pair.  Default-flip of HF2Q_FUSED_END_OF_LAYER=1 NOT recommended.
+
+3. **llama.cpp peer dropped from 102.7 ± 0.1 to 90.68 ± 6.60 tok/s**
+   on the SAME model file.  Two-sigma confidence interval is now
+   [77, 104], a 27 tok/s spread.  Causes (likely):
+   - Thermal contention from concurrent system load
+   - llama-bench tg128 (128 tokens) vs hf2q 1000-token measurement —
+     different sustained-thermal regimes
+   - llama.cpp version drift since iter-183
+   **All "vs peer" claims in this ADR should henceforth be reported
+   with ±13% confidence, not as point estimates.**  Previous peer
+   ratios (e.g., "0.666× peer", "0.713× peer") were based on a
+   single point measurement.
+
+**Updated ratio at HEAD with proper confidence interval**:
+- Default 68.6 / peer 90.68 = **0.756×** [+12% vs iter-216's 0.666×]
+- Path E+G 71.1 / peer 90.68 = **0.784×** [+10% vs iter-216's 0.690×]
+
+Either the **gap shrunk by ~12pp**, OR the peer baseline is just
+noisier today.  Cannot distinguish without a controlled re-bench in
+a quiesced environment (operator action: power-cycle then re-run).
+
+**Net iter-258 outcome**:
+- ✓ HEAD baseline confirmed stable across iter-253-257
+- ✓ FUSED retirement empirically reaffirmed (within-noise)
+- ⚠ Peer baseline measurement methodology needs tightening before any
+  further "× peer" ratio claims are load-bearing
+- → Path E+G remains the cleanest operator-actionable lever (1 line,
+  +3.6% measured at HEAD, byte-identical sourdough)
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
