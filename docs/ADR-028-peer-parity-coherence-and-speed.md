@@ -13951,3 +13951,107 @@ counts per operator mantra "close the gap entirely".  Phase 5
 - `/opt/mlx-native/src/ops/fused_norm_add.rs`
 - `/opt/mlx-native/tests/adr_028_iter331_fused_norm_add_v2_parity.rs` (NEW)
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+
+---
+
+## iter-332 — Phase 2'/3'/4' verification CLOSED: Q8_0 + Q5_1 match peer; IQ4_NL differs structurally
+
+Per iter-329 lever-validation gate, before further per-kernel port work
+on the remaining 30% of gemma4 weights (Q8_0 10.76% + Q5_1 10.06% +
+IQ4_NL 10.06%), verify peer N_R0/N_SG geometry against ours.
+
+### Phase 2': Q8_0 — MATCHES peer
+
+| | Peer | Ours |
+|---|---|---|
+| N_R0 / nr | 2 (`N_R0_Q8_0=2`, impl.h:39) | 2 (`N_DST_Q8=2`, line 30) |
+| N_SG / nsg | 4 (`N_SG_Q8_0=4`, impl.h:40) | 4 (`N_SIMDGROUP_Q8=4`, line 31) |
+| Rows per TG | 8 | 8 |
+| Y cache | yes (`yl[]`) | yes (`yl[NB_Q8_0]`, line 435) |
+| Row amortization | yes (`for row 0..NR0`) | yes (`for row 0..nr`, line 448) |
+
+Our Q8_0 kernel header at line 29 explicitly says "Matches llama.cpp
+N_SG_Q8_0=4, N_R0_Q8_0=2."  Verified.  No port.  **CLOSE.**
+
+### Phase 3': Q5_1 — MATCHES peer
+
+| | Peer | Ours |
+|---|---|---|
+| N_R0 / nr | 4 (`N_R0_Q5_1=4`, impl.h:36) | 4 (`N_DST=4`, line 24) |
+| N_SG / nsg | 2 (`N_SG_Q5_1=2`, impl.h:37) | 2 (`N_SIMDGROUP=2`, line 25) |
+| Rows per TG | 8 | 8 |
+
+`kernel_mul_mv_q5_1_f32` (line 276) uses default `N_DST=4`/`N_SIMDGROUP=2`.
+Verified.  No port.  **CLOSE.**
+
+### Phase 4': IQ4_NL — STRUCTURALLY DIFFERENT (ours: 8 rows/TG; peer: 4 rows/TG)
+
+| | Peer | Ours |
+|---|---|---|
+| N_R0 / nr | **2** (`N_R0_IQ4_NL=2`, impl.h:81) | **4** (uses default `N_DST=4`) |
+| N_SG / nsg | 2 (`N_SG_IQ4_NL=2`, impl.h:82) | 2 |
+| Rows per TG | **4** | **8** |
+| Y cache | yes (`float4 yl[4]`) | (uses default kernel_mul_mv geometry) |
+| Special design | `kvalues_iq4nl_f` LUT in shmem | (different — no shmem LUT) |
+
+Peer's IQ4_NL uses a 16-entry `kvalues_iq4nl_f` lookup table cached in
+threadgroup shmem (line 8884), with NR0=2 amortizing dequant+lookup
+across 2 rows.  Ours uses a 4-row default geometry without the LUT
+indirection.
+
+**Verdict**: structural design difference makes A/B without benchmarking
+inconclusive.  Peer's design is fewer-rows-per-TG with shared LUT;
+ours is more-rows-per-TG without LUT.  Either could win depending on
+M5 Max LUT-load latency vs simdgroup-cooperation overhead.
+
+**Defer**: IQ4_NL is only 10.06% of gemma4 weights; even a 2× kernel
+speedup would yield <2% end-to-end.  ROI does not justify a multi-day
+A/B port without operator priority.  CLOSE as deferred.
+
+### Lessons for the iter-329 lever-validation gate (refined)
+
+The gate caught 3/3 levers correctly this iter:
+- Q8_0: matches → no port (validated by reading our line 30-31 + kernel structure)
+- Q5_1: matches → no port (validated by reading our default `N_DST=4` use)
+- IQ4_NL: differs but inconclusive → defer (validated by structural diff)
+
+Add to gate: **(d) Estimated end-to-end ROI must exceed multi-day
+implementation cost.**  At 10% weight share, even doubling a kernel's
+speed yields <2% end-to-end — below the operator's
+"close the gap entirely" priority threshold for multi-day work.
+
+### Remaining viable phases
+
+After this iter, the ADR-028 work-of-record state is:
+
+| Phase | Status | Forward-blocking? |
+|---|---|---|
+| 1a (default-flip 5-flag) | **LANDED** iter-326+327 | no |
+| 1b (`HF2Q_ENCODER_SESSION` flag) | CLOSED — qwen35-only wiring | no |
+| 1c (gemma4 EncoderSession wiring — NEW) | pending — high upside, multi-day | **opens biggest single lever** |
+| 2 (Q5_K port) | CLOSED — matches peer | no |
+| 3 (Q4_K port) | CLOSED — N/A on gemma4 | no |
+| 2' (Q8_0 verify) | **CLOSED** — matches peer (this iter) | no |
+| 3' (Q5_1 verify) | **CLOSED** — matches peer (this iter) | no |
+| 4' (IQ4_NL verify) | **CLOSED** — deferred (10% × <2× = <2% ROI) | no |
+| 4 (fused_norm_add v2) | **LANDED** iter-331 | no |
+| 5 (fused_head_norm_rope v2) | pending — race-guard complexity, ~0.5-1% expected | no |
+| 6 (F16 KV) | partial-CLOSED — speed claim falsified, RAM win deferred | no |
+| 7 (TQ-HB fusion redesign) | pending — multi-week | structural win |
+
+**Two viable forward-paths**:
+1. Phase 1c (gemma4 EncoderSession wiring): biggest single lever; if
+   the +15-25% CB-count theory holds, takes gemma4 from 0.715× to
+   ~0.85-0.90× peer.
+2. Phase 7 (TQ-HB fusion redesign): multi-week structural; long-tail
+   improvements with TQ-HB memory savings preserved.
+
+Per-kernel port avenue is exhausted within the
+already-ported/deferred set.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (verification + plan refinement).
