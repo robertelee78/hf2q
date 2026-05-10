@@ -122,6 +122,12 @@ pub struct InvestigationEnv {
     /// moe_swiglu_id_out).
     pub skip_moe_swiglu: bool,
 
+    /// `HF2Q_SKIP_HEAD_NORM_ROPE=1` — skip the 2 fused_head_norm_rope
+    /// dispatches per layer (Q-norm-rope + K-norm-rope).  ADR-028 iter-204
+    /// — bisect attention head-prep cost.  Produces garbage SDPA
+    /// (attn_q_normed/attn_k_normed stale).
+    pub skip_head_norm_rope: bool,
+
     // ========================================================================
     // Category 4 — warn-only (ineffective but safe). No gate; raw intent.
     // ========================================================================
@@ -568,6 +574,7 @@ struct RawAckIntent {
     skip_dense_mlp: bool,
     skip_moe_experts: bool,
     skip_moe_swiglu: bool,
+    skip_head_norm_rope: bool,
     lmhead_rerank_disabled: bool,
     chunk_scan_prefill: bool,
 }
@@ -585,6 +592,7 @@ impl InvestigationEnv {
             skip_dense_mlp: env_eq_one("HF2Q_SKIP_DENSE_MLP"),
             skip_moe_experts: env_eq_one("HF2Q_SKIP_MOE_EXPERTS"),
             skip_moe_swiglu: env_eq_one("HF2Q_SKIP_MOE_SWIGLU"),
+            skip_head_norm_rope: env_eq_one("HF2Q_SKIP_HEAD_NORM_ROPE"),
             lmhead_rerank_disabled: matches!(
                 env::var("HF2Q_LMHEAD_RERANK").as_deref(),
                 Ok("0")
@@ -602,6 +610,7 @@ impl InvestigationEnv {
             skip_dense_mlp: raw.skip_dense_mlp && ack,
             skip_moe_experts: raw.skip_moe_experts && ack,
             skip_moe_swiglu: raw.skip_moe_swiglu && ack,
+            skip_head_norm_rope: raw.skip_head_norm_rope && ack,
             lmhead_rerank_disabled: raw.lmhead_rerank_disabled && ack,
             chunk_scan_prefill: raw.chunk_scan_prefill && ack,
 

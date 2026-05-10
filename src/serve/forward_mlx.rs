@@ -2623,28 +2623,33 @@ impl MlxModelWeights {
                     &[&self.activations.attn_q, &self.activations.attn_k],
                     &[&self.activations.attn_q_normed, &self.activations.attn_k_normed],
                 );
-                mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.attn_q,
-                    &self.activations.attn_q_normed,
-                    Some(&self.layers[layer_idx].attn.q_norm_weight),
-                    &self.activations.position,
-                    ff_gpu,
-                    nh as u32, hd as u32, half_rope,
-                    eps, theta,
-                ).map_err(|e| anyhow::anyhow!("fused Q norm+RoPE L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
-                mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32(
-                    s.encoder_mut(), reg, metal_dev,
-                    &self.activations.attn_k,
-                    &self.activations.attn_k_normed,
-                    Some(&self.layers[layer_idx].attn.k_norm_weight),
-                    &self.activations.position,
-                    ff_gpu,
-                    nkv as u32, hd as u32, half_rope,
-                    eps, theta,
-                ).map_err(|e| anyhow::anyhow!("fused K norm+RoPE L{layer_idx}: {e}"))?;
-                total_dispatches += 1;
+                // ADR-028 iter-204: SKIP_HEAD_NORM_ROPE bisect — skip
+                // both Q-norm-rope and K-norm-rope dispatches.  Produces
+                // garbage SDPA (attn_q_normed/attn_k_normed stale).
+                if !INVESTIGATION_ENV.skip_head_norm_rope {
+                    mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.attn_q,
+                        &self.activations.attn_q_normed,
+                        Some(&self.layers[layer_idx].attn.q_norm_weight),
+                        &self.activations.position,
+                        ff_gpu,
+                        nh as u32, hd as u32, half_rope,
+                        eps, theta,
+                    ).map_err(|e| anyhow::anyhow!("fused Q norm+RoPE L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+                    mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32(
+                        s.encoder_mut(), reg, metal_dev,
+                        &self.activations.attn_k,
+                        &self.activations.attn_k_normed,
+                        Some(&self.layers[layer_idx].attn.k_norm_weight),
+                        &self.activations.position,
+                        ff_gpu,
+                        nkv as u32, hd as u32, half_rope,
+                        eps, theta,
+                    ).map_err(|e| anyhow::anyhow!("fused K norm+RoPE L{layer_idx}: {e}"))?;
+                    total_dispatches += 1;
+                }
 
                 // GPU V norm
                 let hd_norm_params = if is_sliding {
