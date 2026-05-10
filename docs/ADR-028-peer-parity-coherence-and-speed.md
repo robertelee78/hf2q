@@ -7478,6 +7478,89 @@ unconditional barriers per dispatch may be over-conservative).
 4. **F16 KV decode-only** (H1) — narrowest scope, gates K=1 decode
    SDPA only, avoids iter-233 prefill correctness issue.
 
+### iter-238 — peer-pattern audits (data-driven rule-outs)
+
+Executed priority-1 + priority-3 audits from iter-237.  Operator
+mantra: "Code + test == truth" — checked GGUF metadata + hf2q runtime
+condition, not estimated.
+
+**Audit 1: shared-KV layers in our model** —
+`gguf-dump --no-tensors gemma4-ara-2pass-APEX-Q5_K_M.gguf` shows:
+```
+gemma4.attention.shared_kv_layers = 0
+```
+→ **H1's "free-win" via skipping KV writes does NOT apply to our
+gemma4 26B-A4B-it APEX-Q5_K_M.gguf**.  All 30 layers compute their
+own KV.  Peer's `LLM_KV_ATTENTION_SHARED_KV_LAYERS` mechanism
+(`gemma4.cpp:7-10`, `:234-238`) is supported by some gemma4 variants
+but not this one.  Ruled out by data, not by guessing.
+
+Bonus architectural observations from same dump (peer-grounded):
+- `head_count_kv = [8,8,8,8,8,2,...]`: sliding layers have 8 KV
+  heads, global layers have 2.  Per-layer asymmetry hf2q must
+  honor.
+- `key_length = 512`, `key_length_swa = 256`: global layers have
+  head_dim=512, sliding layers have head_dim=256.  Asymmetric on
+  TWO axes.
+- `sliding_window_pattern = [True,True,True,True,True,False,...]`:
+  pattern of 6 (5 sliding + 1 global), matches mlx-lm peer.
+
+**Audit 2: hf2q routed-experts fusion** —
+Same `gguf-dump` shows our gemma4 GGUF has both:
+- `blk.{i}.ffn_gate_up_exps.weight` (Q6_K, [2816, 1408, 128])
+  → **fused** routed-experts gate+up (128 experts)
+- `blk.{i}.ffn_gate.weight` + `blk.{i}.ffn_up.weight`
+  (Q6_K, [2816, 2112])
+  → **separate** shared-MLP gate + up (2 tensors)
+
+`forward_mlx.rs:4007-4054` shows `use_fused_id` engages when both
+`stacked_gate_up.is_some()` AND `stacked_down.is_some()`.  Our model
+has the fused tensor → **routed experts already on fused path**.
+hf2q matches peer's `gate_up_exps` pattern (`llama-graph.cpp:1517-1540`).
+**H3's 5-6% peer ROI estimate was for routed-experts merge —
+already done in hf2q**.
+
+**Audit 3: shared-MLP gate+up fusion residual** —
+`forward_mlx.rs:3949+3951` shows shared-MLP gate + up are SEPARATE
+qmatmul dispatches.  However, the comment block at `:3940-3944`
+shows they're already CONCURRENT with router_proj at B9 stage:
+```
+s.barrier_between(
+    &[&norm_out, &router_norm_out],
+    &[&mlp_gate, &mlp_up, &moe_router_logits],
+);
+```
+3 dispatches launch back-to-back without intermediate barriers.
+
+Per iter-219's "compute work survives fusion" lesson, fusing
+concurrent dispatches saves only launch overhead, not compute time.
+Expected ROI **<2% absolute decode** (vs H3's headline ~5-6%).
+
+**Audits ruled out — final peer-grounded lever priority**:
+
+| Lever | Peer ROI | After audit | Verdict |
+|-------|---------:|-------------|---------|
+| H1 free-win shared-KV | (not in dossier) | n/a — model has shared_kv_layers=0 | ✗ ruled out by data |
+| H1 F16 KV decode-only | ~12% | not yet investigated; needs careful gating | ★ remaining lever |
+| H2 norm-mul-add fusion | ~5.5% | not yet investigated; needs dispatch count | ★ remaining lever |
+| H3 routed-experts merge | ~5-6% | already done via stacked_gate_up | ✓ already shipped |
+| H3 shared-MLP merge | (residual) | <2% per iter-219 lesson | weak lever |
+
+**Net updated ceiling**: H1 + H2 = ~17.5% closeable (vs dossier's
+22.5%).  H3 was already in the cost-map baseline.  Remaining ~11.2%
+gap likely structural (TQ-HB SDPA codebook + iter-215's irreducible
+4.85 ms/layer floor).
+
+**Next iteration priority** (peer-grounded, data-driven):
+1. **H2 falsifier** (next-cheapest audit): count distinct dispatches
+   between hf2q's attn_out and MoE input.  Compare to peer's 3
+   dispatches (3× fused RMS+MUL+ADD).  Falsifier passes if hf2q has
+   ≥6.  Cheap to instrument via `total_dispatches` counter (already
+   exists at `forward_mlx.rs:4000` etc).
+2. **H1 narrow scope** (after H2): F16 K/V cache for K=1 decode SDPA
+   leg only, with clip_residual guard from mlx-lm peer; iter-233's
+   prefill-path issue avoided by separate prefill code path.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
