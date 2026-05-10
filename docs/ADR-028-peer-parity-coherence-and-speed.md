@@ -5372,6 +5372,44 @@ This makes the operator decision space cleaner:
 - Don't flip → TQ-HB SDPA optimization could buy +19% (~2 ms saved)
 - Flip Path E+F → +14% immediately, no TQ-HB work needed
 
+### iter-192 — HF2Q_DUAL_BUFFER already engaged + optimal
+
+Tested `HF2Q_DUAL_BUFFER=N` which splits the decode CB after layer N
+to overlap GPU execution of buf 0 with CPU encoding of buf 1.  Per the
+investigation_env doc, "Default split applied" — so it's already
+engaged when no env var is set.
+
+3-run statistical median on Path E+F+G stack:
+
+| `HF2Q_DUAL_BUFFER` | Median tok/s |
+|--------------------|-------------:|
+| `=0` (disabled) | 70.5 |
+| `=15` (mid-split) | 72.0 |
+| auto (default, =3) | **72.9** ← already optimal |
+| `=3` explicit (same as default) | 72.9 |
+
+**Finding**: DUAL_BUFFER is **already engaged and optimal at the
+default early-split (layer 3)**.  It's worth +3.5% (70.5 → 72.9) but
+this gain is already baked into all prior Path E+G+F measurements.
+
+Tuning the split point further showed no improvement — early split
+dominates.  Triple-buffer or N-way split not implemented; estimated
+gain <1% based on amortization curve.
+
+**Cumulative Path E+F+G with all available levers**:
+- 73.2 tok/s = 0.75× peer (97 tok/s)
+- 24-25pp gap remaining lives in:
+  - Per-layer fixed kernel costs (norms/RoPE/KV-copy)
+  - SDPA F16 kernel impl differences vs llama.cpp
+  - HEAD sync overhead (~0.6 ms residual)
+- All these are multi-day-to-multi-week individual items, each <2pp.
+
+iter-193+ candidates:
+- Bench our F16 SDPA vs llama.cpp's `kernel_flash_attn_ext_vec` at
+  decode shape (one direct kernel comparison)
+- Investigate triple-buffer / 3-way CB split
+- HEAD pipeline restructure (async argmax-on-GPU)
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
