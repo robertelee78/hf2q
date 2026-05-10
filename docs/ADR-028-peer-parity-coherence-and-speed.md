@@ -7228,6 +7228,65 @@ iter-233+ plan options unchanged:
   item E coherence-gates skeleton)
 - Wait for operator green-light on multi-week SD chain
 
+### iter-233 — 🚨 LONG-CONTEXT BISECT: Path E+F (F16 KV) BREAKS
+
+Ran 1000-token stress bench across all opt-in stacks.  Output
+coherence comparison:
+
+| Stack | 1000-tok output (first words) | Coherent? |
+|-------|-------------------------------|-----------|
+| Default | "We are seeing the end..." | ✓ |
+| Path E (USE_DENSE F32) | "He watched the stars burn" | ✓ |
+| Path E+G (+LMHEAD_Q6K) | "He watched the stars burn" | ✓ |
+| **Path E+F (HF2Q_F16_KV)** | **"<pad>"** | **✗ DEGRADED** |
+| Path E+F+G | **"<pad>"** | **✗ DEGRADED** |
+| FUSED alone | "Humanity's survival..." | ✓ |
+| Path E+G+FUSED | "Aethelgard realized" | ✓ |
+
+**🚨 CRITICAL FINDING**: `HF2Q_F16_KV=1` produces **degraded output
+at long context** (1000 tokens).  F16 dynamic range exhaustion likely
+causes accumulated KV-cache errors → model emits padding tokens.
+
+Earlier 200-token benches (iter-189 through iter-232) reported Path
+E+F+G as the "best opt-in stack" at 73.3-73.6 tok/s with implicit
+coherence assumption.  **At long context (1000+ tokens), Path E+F is
+NOT safe to recommend**.
+
+**Root cause hypothesis**: F16 has ~1024 dynamic range vs F32's full
+exponent.  Sliding-window KV cache wrap-around at long context could
+amplify quantization noise.  Per session memory file
+`feedback_v01_readme_cache_layer_honesty`, F16 KV's drift at long
+context was prior-known but assumed manageable; this iter shows the
+breakdown is sharper than expected.
+
+**Updated operator decision space** (post-iter-233 long-context check):
+
+| Stack | tok/s @ 200-tok | tok/s @ 1000-tok | Coherence | Recommend? |
+|-------|----------------:|------------------:|-----------|------------|
+| Default | 68.8 | 68.4 | ✓ | safe baseline |
+| **Path E** | **~71** | **69.2** | **✓** | **SAFE FLIP** |
+| **Path E+G** | **72.4** | **70.9** | **✓** | **SAFE FLIP** |
+| Path E+F+G | 73.3 | (degraded) | ✗ | **DO NOT FLIP** |
+| Path E+G+FUSED | 73.6 | (52.8 thermal) | ✓ | safe but throttle-tested |
+
+**Path E+G is now the highest-ROI safe operator-flip recommendation**:
+- +5.2% over default (70.9 vs 68.4 at 1000-tok)
+- Coherent at long context (verified)
+- No precision tradeoff (F32 KV)
+- 1-line env-default change
+
+iter-189's "+15.2%" claim for Path E+G at 200-tok shrinks to ~+3.7%
+at 1000-tok (perf scales differently with context length).
+
+**Bisect saves another misallocation**: without iter-233's long-context
+test, operator might have flipped to Path E+F+G expecting 73.3 tok/s
+and hit production regressions at long-form generation.  Test caught
+this BEFORE shipping default.
+
+iter-234+ plan: also long-context-test qwen3.6 to verify it doesn't
+have similar issues.  Update bench script to default to 1000-token
+runs to make this kind of regression visible.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
