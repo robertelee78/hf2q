@@ -121,11 +121,51 @@ impl MtpWeights {
             h
         );
 
+        // ADR-028 iter-156: per-sub-step GPU-timing harness. Sets
+        // commit_and_wait barriers between sub-steps when HF2Q_MTP_PROFILE=1
+        // is set. Measurement-only — adds ~1-2ms total per draft. Default
+        // path commits each sub-step's CB without sync (Apple Metal pipelines
+        // them across the boundary).
+        let mtp_substep_profile = std::env::var("HF2Q_MTP_PROFILE").as_deref() == Ok("1");
         let pos_buf = upload_i32(position_ids, device).context("MTP upload positions")?;
+
+        let t0 = std::time::Instant::now();
         let projected = self.project_embedding_and_hidden(embed_t, prev_hidden, device, registry)?;
+        if mtp_substep_profile {
+            // Force GPU sync to measure sub-step time accurately.
+            let mut enc = device.command_encoder().context("MTP profile sync 1")?;
+            enc.commit_and_wait().ok();
+        }
+        let t_proj = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = std::time::Instant::now();
         let attn_out = self.forward_full_attention(&projected, &pos_buf, kv_cache, device, registry, cfg)?;
+        if mtp_substep_profile {
+            let mut enc = device.command_encoder().context("MTP profile sync 2")?;
+            enc.commit_and_wait().ok();
+        }
+        let t_attn = t1.elapsed().as_secs_f64() * 1000.0;
+
+        let t2 = std::time::Instant::now();
         let hidden = self.forward_ffn_residual(&projected, &attn_out, device, registry, cfg)?;
-        self.forward_shared_head(&hidden, device, registry, cfg.rms_norm_eps)
+        if mtp_substep_profile {
+            let mut enc = device.command_encoder().context("MTP profile sync 3")?;
+            enc.commit_and_wait().ok();
+        }
+        let t_ffn = t2.elapsed().as_secs_f64() * 1000.0;
+
+        let t3 = std::time::Instant::now();
+        let logits = self.forward_shared_head(&hidden, device, registry, cfg.rms_norm_eps)?;
+        let t_head = t3.elapsed().as_secs_f64() * 1000.0;
+
+        if mtp_substep_profile {
+            eprintln!(
+                "[MTP_SUBSTEP] proj={:.2}ms attn={:.2}ms ffn={:.2}ms head={:.2}ms total={:.2}ms",
+                t_proj, t_attn, t_ffn, t_head,
+                t_proj + t_attn + t_ffn + t_head,
+            );
+        }
+        Ok(logits)
     }
 
     fn project_embedding_and_hidden(

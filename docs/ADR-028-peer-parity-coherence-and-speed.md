@@ -3533,6 +3533,63 @@ Add finer-grained timing inside MtpWeights::forward_draft:
 Identify the dominant sub-step within 6.4 ms. Then optimize that
 specific code path — CB-count optimization is exhausted.
 
+### iter-156: Sub-step profile — SMOKING GUN at shared_head_head BF16 storage
+
+#### Per-sub-step timing under HF2Q_MTP_PROFILE=1 (commit_and_wait barriers)
+
+Steady-state on qwen3.6-27b-mtp-q4_0:
+
+```
+[MTP_SUBSTEP] proj=0.45ms attn=0.69ms ffn=1.20ms head=4.52ms total=6.86ms
+```
+
+| Sub-step | Time | % of 6.86ms |
+|----------|---:|---:|
+| project_embedding_and_hidden | 0.45 ms | 7% |
+| forward_full_attention | 0.69 ms | 10% |
+| forward_ffn_residual | 1.20 ms | 18% |
+| **forward_shared_head** | **4.52 ms** | **65%** |
+
+**`forward_shared_head` owns 65% of MTP draft time.**
+
+#### Root cause: BF16 storage instead of Q4_0
+
+Read `src/inference/models/qwen35/mtp_weights_load.rs:144`:
+
+```rust
+let shared_head_head = upload_bf16_from_f32(&shared_head_head_f32, device)
+    .context("MTP upload shared_head_head")?;
+```
+
+The `shared_head_head` weight is loaded as F32 → **BF16** at upload.
+For qwen3.6 vocab=248320, hidden=5120:
+
+| Storage | Size | Theoretical @ 587 GB/s | Measured |
+|---------|---:|---:|---:|
+| BF16 (current) | 2.54 GB | 4.33 ms | **4.52 ms ✓** |
+| Q4_0 (target) | 0.635 GB | 1.08 ms | — |
+
+BF16 storage is **4× Q4_0 bandwidth** — perfectly explains the 4×
+overhead vs theoretical Q4_0 expectation.
+
+#### iter-157 walk-phase target
+
+Modify `mtp_weights_load.rs::load_mtp_weights_if_present` to keep
+shared_head_head in its native quantized format (Q4_0 or Q8_0 per
+the gguf source) and use `dispatch_qmatmul` in `forward_shared_head`
+instead of `apply_linear_projection_f32` (which expects F32/BF16).
+
+Expected savings:
+- forward_shared_head: 4.52 ms → ~1.5 ms (3.0 ms saved)
+- forward_draft: 6.86 ms → ~3.86 ms (44% faster)
+- spec iter: 38.2 ms → 35.2 ms
+- Spec tok/s @ 80% accept: 1.8 / 0.0352 = **51.1 tok/s**
+- Greedy: 33.9 tok/s
+- **Speedup: 51.1 / 33.9 = 1.51× greedy on qwen3.6**
+
+This is THE walk-phase win. ~50-100 LOC change. Coherence trivially
+preserved (storage format change, not computation).
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
