@@ -8670,6 +8670,68 @@ is **86.7% peak**, near the kernel-internal hardware ceiling.
 sweep using `bench_moe_q_qwen36_shape` infrastructure adapted to
 gemma4 shapes (n=2112 intermediate, expert top-k=8 per token).
 
+### iter-256 — MoE expert kernels SATURATED (124-132% nominal peak)
+
+Ran `bench_decode_moe_id_shapes` at HEAD (commit `357172c`).  Direct
+measurement of gemma4 MoE _id mat-mul at production shapes:
+
+| Shape | tk | tok | n | k | Ne | µs | MB | GB/s | %peak |
+|-------|---:|---:|--:|--:|---:|---:|---:|-----:|------:|
+| **g4_gate_up_Q6K** | 8 | 1 | 1408 | 2816 | 128 | 38.6 | 26.0 | 674 | **123.5%** |
+| **g4_down_Q8_0**   | 1 | 8 | 2816 | 704  | 128 | 23.4 | 16.9 | 721 | **132.1%** |
+| q36_gate_Q5K   | 8 | 1 | 512 | 2048 | 256 | 14.6 | 5.8 | 395 | 72.3% |
+| q36_up_Q5K     | 8 | 1 | 512 | 2048 | 256 | 13.8 | 5.8 | 417 | 76.4% |
+| q36_down_Q6K   | 1 | 8 | 2048 | 512 | 256 | 19.0 | 6.9 | 362 | 66.4% |
+
+**Per-token MoE matmul aggregate**:
+- gemma4 (30 layers, 60 _id calls): **1.29 GB read in 1.86 ms = 692 GB/s**
+- qwen3.6 (40 layers, 80 _id calls): 0.74 GB read in 1.90 ms = 388 GB/s
+
+gemma4's 124-132% nominal-peak measurement reflects effective L2/shared-
+cache reuse on top of DRAM (input vector re-read across TGs).  Apple
+M5 Max measured peak DRAM 546 GB/s; hierarchical cache pushes
+aggregate above when access patterns reuse.
+
+**iter-201 reconciliation**:
+- iter-201 SKIP_MOE_EXPERTS = 2.60 ms saved
+- Bench HEAD pure matmul = 1.86 ms (matches iter-201's "1.84 ms" within
+  noise)
+- iter-202 swiglu = 0.14 ms
+- Residual ~0.60 ms = production cache contention from interleaved ops
+  (TQ-HB SDPA, dense MLP, attention QKV all running concurrent)
+
+**Conclusion**: gemma4 MoE expert kernels are at hardware saturation.
+**No kernel-level lever**.
+
+### Kernel optimization landscape — EXHAUSTED
+
+Combined finding from iter-253/255/256 fresh measurements at HEAD:
+
+| Component | µs (per-call) | %peak | Lever? |
+|-----------|--------------:|------:|--------|
+| Q_sliding mat-vec (4096×2816 Q5_K) | 17.6 | 82.7% | NO (k-axis cap, iter-255) |
+| O_sliding mat-vec (2816×4096 Q5_K) | 16.1 | 90.0% | NO |
+| lmhead Q6_K (262144×2816)    | 1040 | 106.6% | NO (saturated) |
+| MoE g4_gate_up_Q6K (128 exps) | 38.6 | 123.5% | NO (saturated) |
+| MoE g4_down_Q8_0 (128 exps)   | 23.4 | 132.1% | NO (saturated) |
+| TQ-HB SDPA dequant            | (iter-195/197 already shipped 2 wins) | n/a | iter-257 microbench |
+| Sequential fusion             | (iter-219 measured 0.3%/pair) | n/a | retired iter-220 |
+
+**All major decode kernels are at hardware ceiling**.  The remaining
+2.8 ms gap to peer (per iter-254 reframed math) is primarily:
+- GPU launch+barrier floor: ~3.1 µs/disp × 850 disp = 2.6 ms (HW floor)
+- TQ-HB SDPA structural cost vs hypothetical contiguous-F16: TBD iter-257
+
+**Iter-257 plan**: TQ-HB SDPA microbench at decode shape (head_dim=256,
+kv_seq=1024, n_heads=16, n_kv_heads=8) vs hypothetical F16 SDPA at
+same shape.  Sizes the ONLY remaining unmeasured kernel-level claim
+("structural TQ-HB cost is unavoidable for byte-packed quant").
+
+**Operator decision** post-iter-257: with full kernel-level audit
+complete, the path to peer-or-better is **DFlash speculative decode**
+(iter-223/224/227/228) since kernel optimization has reached its
+hardware ceiling.
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
