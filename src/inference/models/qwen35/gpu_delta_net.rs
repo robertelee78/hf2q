@@ -3626,6 +3626,153 @@ mod tests {
         );
     }
 
+    /// ADR-028 iter-273: mid-stream multi-token falsifier.
+    ///
+    /// The existing `full_delta_net_layer_gpu_matches_cpu_ref` test runs at
+    /// seq_len=4 with `state_in = [0.0; state_size]` (fresh-context).  This
+    /// test runs at **seq_len=2 with synthetic NON-ZERO state_in** — the
+    /// configuration K1 spec-decode actually hits at decode time.
+    ///
+    /// Per ADR-028 iter-269..272 thread:
+    /// - Decode kernel is correct at n_tokens up to 32 (parity-tested).
+    /// - Layer is correct at seq_len=4 + state_in=ZERO (parity-tested).
+    /// - K1 produces divergent output → bug is in mid-stream + multi-token.
+    ///
+    /// **If this test FAILS**: bug is inside `build_delta_net_layer`'s
+    /// prefill path setup (op1-op3 norm/proj/ssm_conv, op5+ chain), and
+    /// bisection within the layer is the next step.
+    /// **If this test PASSES**: bug is HIGHER (qwen35 forward calling
+    /// build_delta_net_layer with wrong state_in or wrong position).
+    #[test]
+    fn delta_net_layer_seq2_mid_stream_state() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+
+        let shape = small_shape();
+        let weights_cpu = synthetic_weights(shape, 0x9ABC);
+        let seq_len = 2u32; // K1's case
+        let h = shape.hidden_size as usize;
+        let seq = seq_len as usize;
+        let km1 = (shape.conv_kernel - 1) as usize;
+        let qkv_channels = shape.qkv_channels() as usize;
+        let state_size = (shape.d_k * shape.d_v * shape.n_v_heads) as usize;
+
+        // Deterministic input — 2 tokens (the K1 case).
+        let x_cpu: Vec<f32> = (0..seq * h).map(|i| 0.02 * (i as f32) - 0.7).collect();
+
+        // SYNTHETIC NON-ZERO state — simulates state accumulated from prior
+        // decode iters in K1 spec-decode flow.  Magnitudes ~1e-2 (similar
+        // scale to weights) to test math beyond the trivial zero-state case.
+        let state_in: Vec<f32> = (0..state_size)
+            .map(|i| 0.013 * ((i as f32) * 0.7).sin() - 0.005)
+            .collect();
+        let conv_state: Vec<f32> = (0..km1 * qkv_channels)
+            .map(|i| 0.011 * ((i as f32) * 0.5).cos())
+            .collect();
+
+        // CPU reference (authoritative).
+        let (cpu_out, _, _) = delta_net_layer_cpu_ref(
+            &x_cpu,
+            &weights_cpu,
+            shape,
+            &state_in,
+            &conv_state,
+        );
+        assert!(cpu_out.iter().all(|v| v.is_finite()), "CPU ref non-finite");
+        assert_eq!(cpu_out.len(), seq * h);
+
+        // GPU path.
+        let gpu_weights = DeltaNetWeightsGpu::from_cpu_f32(
+            &weights_cpu,
+            &device,
+            shape.conv_kernel as usize,
+            qkv_channels,
+        )
+        .expect("from_cpu_f32");
+
+        let x_gpu = upload_f32(&x_cpu, &device).expect("upload x");
+        let state_in_gpu = upload_f32(&state_in, &device).expect("upload state_in");
+        let state_out_gpu = upload_f32(&state_in, &device).expect("upload state_out scratch");
+        let conv_state_in_gpu = upload_f32(&conv_state, &device).expect("upload conv_state_in");
+        let conv_state_out_gpu = upload_f32(&conv_state, &device).expect("alloc conv_state_out");
+        let gpu_out_buf = build_delta_net_layer(
+            &device,
+            &mut registry,
+            &x_gpu,
+            &gpu_weights,
+            &conv_state_in_gpu,
+            &conv_state_out_gpu,
+            &state_in_gpu,
+            &state_out_gpu,
+            seq_len,
+            shape.hidden_size,
+            shape.n_k_heads,
+            shape.n_v_heads,
+            shape.d_k,
+            shape.d_v,
+            shape.conv_kernel,
+            shape.rms_norm_eps,
+        )
+        .expect("build_delta_net_layer");
+
+        device
+            .command_encoder()
+            .expect("sync enc")
+            .commit_and_wait()
+            .expect("sync wait");
+        let gpu_out = download_f32(&gpu_out_buf).expect("download gpu_out");
+        assert_eq!(gpu_out.len(), cpu_out.len(), "output length mismatch");
+        assert!(
+            gpu_out.iter().any(|&v| v != 0.0),
+            "delta_net_layer_seq2_mid_stream_state: GPU output all-zero — \
+             dispatch chain likely failed silently. cpu_first_8={:?}",
+            &cpu_out[..8.min(cpu_out.len())]
+        );
+
+        // Tolerance: same Q4_0 budget as the fresh-context test.
+        const Q4_0_PARITY_TOLERANCE: f32 = 5e-2;
+
+        let mut n_fail = 0usize;
+        for (i, (&g, &c)) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
+            if (g - c).abs() >= Q4_0_PARITY_TOLERANCE {
+                if n_fail < 5 {
+                    eprintln!(
+                        "  [seq2_mid_stream] mismatch[{i}]: gpu={g:.6}, cpu={c:.6}, err={:.2e}",
+                        (g - c).abs()
+                    );
+                }
+                n_fail += 1;
+            }
+        }
+
+        let max_err = gpu_out
+            .iter()
+            .zip(cpu_out.iter())
+            .map(|(&g, &c)| (g - c).abs())
+            .fold(0.0f32, f32::max);
+
+        eprintln!(
+            "delta_net_layer_seq2_mid_stream_state: max_abs_err={:.2e} \
+             (< {:.2e} Q4_0 budget? {}), n_fail={}/{}, seq={seq_len}",
+            max_err,
+            Q4_0_PARITY_TOLERANCE,
+            max_err < Q4_0_PARITY_TOLERANCE,
+            n_fail,
+            gpu_out.len()
+        );
+
+        assert!(
+            max_err < Q4_0_PARITY_TOLERANCE,
+            "DeltaNet seq2 mid-stream non-zero-state PARITY FAIL: \
+             max_abs_err={:.2e} (> {:.2e}), n_fail={}/{}.  \
+             This is the iter-178 'cur_len bug' — bug is inside \
+             build_delta_net_layer's prefill path setup at seq_len>1 + \
+             non-zero state_in.  Per iter-273 test plan, bisect within \
+             op1 (norm), op2 (qkv proj), op3 (ssm_conv), op5+ chain.",
+            max_err, Q4_0_PARITY_TOLERANCE, n_fail, gpu_out.len()
+        );
+    }
+
     /// Verify the ssm_conv kernel_w transpose is self-inverse.
     #[test]
     fn kernel_w_transpose_roundtrip() {

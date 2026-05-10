@@ -9831,6 +9831,92 @@ iter-271's routing-fix guess would have been a wasted code change.
 iter-273 will run the targeted falsifier.  No production code
 changes made yet — saved a wasted commit.
 
+### iter-273 — mid-stream falsifier test PASSES → DeltaNet layer is NOT the bug
+
+Wrote and shipped `delta_net_layer_seq2_mid_stream_state` test
+(commit pending below).  Same setup as the existing fresh-context
+parity test, but with:
+- `seq_len = 2` (K1's actual case)
+- `state_in` = synthetic NON-ZERO values (simulates accumulated
+  recurrent state from prior K1 iters)
+- `conv_state` = synthetic NON-ZERO values
+
+**Test runs against `delta_net_layer_cpu_ref` as ground truth.
+PASSES** within Q4_0 parity budget (5e-2).
+
+**This refutes iter-178/179's framing**: the DeltaNet layer
+**correctly** handles seq_len=2 + non-zero state_in.  The K1
+trajectory bug is NOT in `build_delta_net_layer`.
+
+**The bug must be at a HIGHER layer in the qwen35 forward path**.
+Candidates (iter-274+):
+
+1. **Full Attention (FA) layers** — qwen35 has 16 FA + 48 DeltaNet
+   layers (full_attention_interval=4).  iter-177 was supposed to
+   fix FA multi-token mid-stream but may not have covered the K1
+   case fully.  Test analogous to iter-273 needed for FA layer.
+
+2. **RoPE position offsets** — K1's 2-token batch applies RoPE at
+   positions [N, N+1].  MTP-off's two 1-token forwards apply RoPE
+   at [N] then [N+1].  These should match IF positions are passed
+   correctly.  Likely correct but worth verifying.
+
+3. **State ping-pong between K1 iters** — the state_in/state_out
+   buffer swap in K1's spec_decode loop may have an off-by-one or
+   incorrect handling on REJECT path (where state_out from current
+   iter shouldn't propagate to next).
+
+4. **MoE routing** — top-k=8 expert selection at K1's 2-token batch.
+   Each token's hidden_state may select different experts;
+   verifier's batched processing may mishandle per-token expert
+   routing.
+
+5. **Embedding / soft-token layer** — input embedding for 2 tokens
+   in batch may differ from sequential 1-token embeds (unlikely but
+   worth ruling out).
+
+**iter-274 plan**:
+- Analogous mid-stream test for FA layer (similar pattern to
+  iter-273 but for `build_full_attn_layer` or equivalent).
+- If FA test PASSES too → bug is in higher-level forward
+  orchestration (state ping-pong, position threading, MoE routing
+  setup).  Bisect via per-layer hidden-state comparison K1 vs
+  MTP-off at iter 1.
+
+**Iter-273 outcome**:
+- ✓ New test `delta_net_layer_seq2_mid_stream_state` shipped (per
+  the operator's "no fallback / no stub" rule, the test is full
+  coverage including assert_close, mismatch logging, all-zero
+  short-circuit detection)
+- ✓ Test PASSES at HEAD — DeltaNet correctly handles mid-stream
+  multi-token with non-zero state
+- ✓ iter-178/179's framing of the K1 trajectory bug as "DeltaNet
+  multi-token mid-stream cur_len bug" REFUTED
+- → iter-274 expands the falsifier search to FA layer + qwen35
+  forward orchestration
+- ✓ test serves as permanent regression gate against future
+  introduction of mid-stream DeltaNet bugs
+
+**Reframed iter-178/iter-179 task**: the original task description
+("DeltaNet multi-token mid-stream cur_len bug") was based on
+indirect reasoning from K1 symptoms (output divergence).  Direct
+test refutes it.  iter-179 (still pending in task list) should be
+RECLOSED with this finding.  The K1 trajectory bug is somewhere
+ELSE in the qwen35 forward path.
+
+**Cumulative thread state (iter-263 → iter-273)**:
+- Started: MTP regresses 13% perf (broken trajectory)
+- Localized: 2-token batched verifier produces different logits
+  than 1-token (verified iter-269 via TWO_CALLS bisect)
+- Hypothesis 1: GGUF metadata gap → REFUTED via direct read
+- Hypothesis 2: SpecDecode API mismatch → real, fixed (iter-266)
+- Hypothesis 3: DeltaNet kernel multi-token bug → REFUTED via
+  parity tests (iter-272 + iter-273)
+- Hypothesis 4: routing condition fix → REFUTED via Chesterton's
+  fence (iter-272)
+- **Current**: bug is in qwen35 forward orchestration (FA layer, or
+  state/position threading) NOT in DeltaNet layer kernel/setup
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
