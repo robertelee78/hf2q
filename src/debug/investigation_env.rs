@@ -554,6 +554,15 @@ pub struct InvestigationEnv {
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub split_timing: bool,
 
+    /// `HF2Q_FUSED_END_OF_LAYER=1` — replace the 2 sequential
+    /// fused_norm_add dispatches at end-of-layer (post-FF norm 2 +
+    /// end-of-layer FINAL) with the iter-217 fused single-dispatch
+    /// kernel `fused_post_ff_norm2_endlayer_f32`.  Bisect-confirmed
+    /// (iter-208) +2.7% throughput target.  Parity test PASS at
+    /// rel_error < 1e-5 (iter-218).  Default-OFF until production
+    /// bench validates.
+    pub fused_end_of_layer: bool,
+
     /// `HF2Q_FUSED_TRIPLE_NORM=1` — replace the per-layer pair
     /// `fused_norm_add(hidden, attn_out, post_attn_w → residual)` +
     /// 3× `rms_norm(residual, w_a/b/c → out_a/b/c)` with the single
@@ -786,6 +795,7 @@ impl InvestigationEnv {
             mlx_timing: env::var("HF2Q_MLX_TIMING").is_ok(),
             split_timing: env_eq_one("HF2Q_SPLIT_TIMING"),
             fused_triple_norm: env_eq_one("HF2Q_FUSED_TRIPLE_NORM"),
+            fused_end_of_layer: env_eq_one("HF2Q_FUSED_END_OF_LAYER"),
             kv_dual_legacy: env_eq_one("HF2Q_KV_DUAL_LEGACY"),
             hb_dual_legacy: env_eq_one("HF2Q_HB_DUAL_LEGACY"),
             mlx_kernel_profile: env_eq_one("HF2Q_MLX_KERNEL_PROFILE"),

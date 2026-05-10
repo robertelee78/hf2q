@@ -4107,41 +4107,69 @@ impl MlxModelWeights {
                 // ADR-028 iter-207: SKIP_END_OF_LAYER bisect — skip the
                 // 2 sequential fused_norm_add dispatches at end-of-layer.
                 if !INVESTIGATION_ENV.skip_end_of_layer {
-                    // -- Fused post-FF norm 2 + combine MLP+MoE --
-                    s.barrier_between(
-                        &[&self.activations.attn_out, &self.activations.moe_accum],
-                        &[&self.activations.mlp_down],
-                    );
-                    mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.attn_out,
-                        &self.activations.moe_accum,
-                        &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
-                        &self.activations.mlp_down,
-                        hs as u32, 1, eps,
-                    ).map_err(|e| anyhow::anyhow!("fused post-FF norm2+combine L{layer_idx}: {e}"))?;
-                    total_dispatches += 1;
+                    let scalar_is_vector = self.layers[layer_idx].layer_scalar.element_count() > 1;
 
-                    // -- Fused end-of-layer: post-FF norm + residual add + scalar mul --
-                    // ADR-028 iter-208 sub-bisect: SKIP_END_OF_LAYER_FINAL
-                    // skips only this final dispatch (keeps post-FF norm 2).
-                    if !INVESTIGATION_ENV.skip_end_of_layer_final {
-                        let scalar_is_vector = self.layers[layer_idx].layer_scalar.element_count() > 1;
+                    // ADR-028 iter-219: HF2Q_FUSED_END_OF_LAYER replaces
+                    // the 2 sequential fused_norm_add dispatches with the
+                    // single fused_post_ff_norm2_endlayer_f32 kernel.
+                    // Bisect-confirmed +2.7% target (iter-208).  Parity test
+                    // PASS (iter-218).  Default-OFF until production bench.
+                    if INVESTIGATION_ENV.fused_end_of_layer {
                         s.barrier_between(
-                            &[&self.activations.residual, &self.activations.mlp_down],
-                            &[&self.activations.hidden],
+                            &[&self.activations.attn_out, &self.activations.moe_accum,
+                              &self.activations.residual, &self.layers[layer_idx].layer_scalar],
+                            &[&self.activations.mlp_down, &self.activations.hidden],
                         );
-                        mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_scalar_f32(
+                        mlx_native::ops::rms_norm::dispatch_fused_post_ff_norm2_endlayer_f32(
                             s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_out,
+                            &self.activations.moe_accum,
                             &self.activations.residual,
-                            &self.activations.mlp_down,
+                            &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
                             &self.layers[layer_idx].norms.post_feedforward_layernorm,
-                            &self.activations.hidden,
                             &self.layers[layer_idx].layer_scalar,
-                            1, hs as u32, eps,
+                            &self.activations.mlp_down,
+                            &self.activations.hidden,
+                            eps, 1, hs as u32,
                             scalar_is_vector,
                         ).map_err(|e| anyhow::anyhow!("fused end-of-layer L{layer_idx}: {e}"))?;
                         total_dispatches += 1;
+                    } else {
+                        // -- Fused post-FF norm 2 + combine MLP+MoE --
+                        s.barrier_between(
+                            &[&self.activations.attn_out, &self.activations.moe_accum],
+                            &[&self.activations.mlp_down],
+                        );
+                        mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_out,
+                            &self.activations.moe_accum,
+                            &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
+                            &self.activations.mlp_down,
+                            hs as u32, 1, eps,
+                        ).map_err(|e| anyhow::anyhow!("fused post-FF norm2+combine L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+
+                        // -- Fused end-of-layer: post-FF norm + residual add + scalar mul --
+                        // ADR-028 iter-208 sub-bisect: SKIP_END_OF_LAYER_FINAL
+                        // skips only this final dispatch (keeps post-FF norm 2).
+                        if !INVESTIGATION_ENV.skip_end_of_layer_final {
+                            s.barrier_between(
+                                &[&self.activations.residual, &self.activations.mlp_down],
+                                &[&self.activations.hidden],
+                            );
+                            mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_scalar_f32(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.residual,
+                                &self.activations.mlp_down,
+                                &self.layers[layer_idx].norms.post_feedforward_layernorm,
+                                &self.activations.hidden,
+                                &self.layers[layer_idx].layer_scalar,
+                                1, hs as u32, eps,
+                                scalar_is_vector,
+                            ).map_err(|e| anyhow::anyhow!("fused end-of-layer L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+                        }
                     }
                 }
 
