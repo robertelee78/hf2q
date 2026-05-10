@@ -11659,3 +11659,63 @@ when operator approves.
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
 
 No code changes — this iter empirically validated existing claims.
+
+---
+
+## iter-302 — mlx-native test audit: Q4_0 id-vs-norid bit-exact assertion stale
+
+### Method
+
+Ran full mlx-native integration test suite at HEAD (was previously
+verified at lib level only in iter-295).
+
+### Findings
+
+**1. Flaky test** (`per_dispatch_sampling_records_nonzero_ns`):
+- Passes in isolation
+- Fails ~30% of full-suite runs due to global `kernel_profile` state
+  pollution from parallel test execution
+- Not a regression — known test-isolation issue with profile globals
+
+**2. Deterministic regression** (`test_q4_0_id_vs_norid` family):
+- 3 tests in `tests/test_quantized_matmul_id_ggml.rs`:
+  `test_q4_0_id_vs_norid` (47 mismatches, max_err=1e-6)
+  `test_q4_0_id_vs_norid_4tok` (161 mismatches, max_err=1e-6)
+  `test_q4_0_production_shape` (168 mismatches, max_err=4e-6)
+- Reproducible identically across 3 runs in isolation.
+- Tolerance is hardcoded `0.0` ("Should be bit-exact"; line 513 etc).
+
+### Analysis (Chesterton's fence)
+
+Q8_0 tests use the SAME 0.0 tolerance and presumably pass (Q8_0 path
+holds bit-exact).  Q4_0 path produces F32 ordering noise — same kernel
+computes both id and norid but different reduction orderings introduce
+sub-ULP rounding (max_err 1e-6 ≪ F32 ULP at decode-output magnitude).
+
+Likely origin: the iter-22 ADR-022 phase work that touched Q4_0 kernels
+introduced a new reduction ordering.  The Q4_0 "bit-exact" claim was
+either always optimistic or correct under a prior kernel arrangement.
+
+### Decision
+
+**NOT fixing this iter** — tolerance relaxation is a test strictness
+policy change.  Per "no deferrals without operator approval" rule.
+
+When operator approves: tolerance should change from `0.0` to `1e-5`
+(50× the observed sub-ULP errors, still strict enough to catch any
+real correctness regression).  Q8_0 0.0 should remain unchanged
+(genuinely bit-exact path).
+
+### Verified clean
+
+- mlx-native lib: 274/274 ✓
+- mlx-native integration: all suites pass except the 3 Q4_0 stale-
+  tolerance tests above.
+- hf2q lib: 3449/3449 ✓
+- hf2q integration: all pass ✓
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes — finding documented, decision deferred to operator.
