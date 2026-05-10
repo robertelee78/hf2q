@@ -4415,6 +4415,59 @@ If operator still silent and code-change-only iter desired:
 do (2) — update comment + cross-ref. Concrete, low-risk, makes the
 ADR record reflect current truth.
 
+### iter-169: F16 byte-identity extended to 5 fixtures — ALL PASS
+
+#### Test matrix (mlx-native commit `7fa1e6a`)
+
+| Fixture | F32↔F16-inputs rel_rms | F16↔F32-inputs | Amplification |
+|---|---:|---:|---:|
+| dk256 sliding kv=240 | 2.57e-5 | 0.0 | **1.00×** |
+| dk256 sliding kv=1024 saturated | 1.54e-5 | 0.0 | **1.00×** |
+| dk256 causal kv=512 | 1.72e-5 | 0.0 | **1.00×** |
+| dk256 causal kv=2048 | 1.34e-5 | 0.0 | **1.00×** |
+| dk512 causal kv=512 | 2.45e-5 | 0.0 | **1.00×** |
+
+Coverage:
+- 2 mask types (sliding window, causal)
+- 4 kv_seq_len values (240, 512, 1024, 2048)
+- 2 head dims (256 = gemma4 / 512 = qwen35/36)
+
+**All 5 fixtures show byte-identical F16 kernel output** (rel_rms 0.0)
+to F32 kernel fed F16-rounded inputs. F16 storage precision is the
+only source of difference vs F32 (~13-26 ppm rel_rms across fixtures).
+
+#### Production-code update (hf2q commit `35c8e34`)
+
+`investigation_env.rs:57` comment updated to reflect:
+- ADR-009 19× amplification has been REFUTED at HEAD
+- F16 KV is byte-identical kernel-wise; difference is F16 storage only
+- Production effect: +15.7% wall, 251 MiB/slot, 25 ppm output drift
+- Stays ack-required pending operator decision (precision tradeoff
+  remains real)
+
+#### Walk-phase status
+
+Convergent verdict (iter-150 + iter-95 + iter-162-165 + iter-167-169):
+
+1. Default TQ-HB path: 62.5 tok/s, 0.606× peer = **structural ceiling**
+2. Path E (USE_DENSE flip): +13.4% wall, F32 KV precision
+3. Path E+F (USE_DENSE+F16_KV flip): +15.7% wall, F16 KV (kernel-correct)
+4. Multi-kernel walk (~10-20 iters @ 100-300µs): exhausted on
+   single-kernel level
+
+**Path E+F is now the data-supported best gemma4 win.** Operator
+default-flip decision is the limiting factor, not technical work.
+
+#### iter-170 walk-phase target
+
+If operator pivots to Path E+F flip: implement default-on with
+operator gate (reverse the env logic so flag DEFAULT is ON, opt-out
+via `HF2Q_F16_KV=0`).
+
+If operator silent: pivot away from gemma4 (exhausted), back to
+qwen36 batched-verify spec_decode (iter-160 scope, has documented
+1.16-1.23× speedup target with no quality cost).
+
 #### Standing decision — Three closure paths still apply
 
 Independent of regression: gemma4's structural gap to llama.cpp
