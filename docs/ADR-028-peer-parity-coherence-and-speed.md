@@ -9048,6 +9048,55 @@ not per-kernel optimization.
 - ✓ Operator's mantra partially satisfied (1 of 2 production models)
 - → ADR-028 ↑ "speed gap" framing should narrow to gemma4-specific.
 
+### iter-262 — multi-model coherence gate PASS, qwen3.6 mantra FULLY satisfied
+
+Ran `scripts/adr028_coherence_gate.sh` at HEAD (1000-token long-form
+prompt across 4 gemma4 stacks + 2 qwen3.6 stacks):
+
+| Stack | Model | Result |
+|-------|-------|--------|
+| Default        | gemma4 | ✓ OK ("# The Eye of Aeons: The Chronicles of Aethelgard…") |
+| Path E         | gemma4 | ✓ OK (identical narrative) |
+| Path E+G ★     | gemma4 | ✓ OK |
+| Path E+G+FUSED | gemma4 | ✓ OK |
+| **Default**    | **qwen3.6** | **✓ OK** ("Here's a thinking sequence…") |
+| Default + F16 KV (no-op) | qwen3.6 | ✓ OK |
+| Path E+F+G (deprecated F16 KV) | gemma4 | FAIL[sentinel] (expected — iter-233/234 deprecation load-bearing) |
+
+**Gate: PASS** — 0 SAFE-stack failures, 1 expected fail confirms the
+F16 KV deprecation is still load-bearing.
+
+**qwen3.6 production status — FULLY MEETS OPERATOR MANTRA**:
+
+| Axis | Measurement | Bar |
+|------|-------------|-----|
+| Coherence (1000-tok long-context) | ✓ PASS (iter-262) | "≥ peer" |
+| Speed (sustained 1000-tok decode)  | 126.3 tok/s = **1.277× peer** (iter-261) | "≥ peer" |
+| Proper TQ (TQ-HB byte-packed)      | ✓ live in production (iter-181/256) | "implementing proper TQ" |
+
+**All three mantra clauses simultaneously satisfied for qwen3.6.**
+
+**gemma4 production status**:
+
+| Axis | Measurement | Bar |
+|------|-------------|-----|
+| Coherence | ✓ PASS all SAFE stacks (iter-262) | "≥ peer" |
+| Speed (Default)  | 0.726× peer (matched, iter-259) | below bar |
+| Speed (Path E+G+FUSED) | 0.757× peer | below bar |
+| Proper TQ | ✓ live | "implementing proper TQ" |
+
+gemma4 satisfies coherence + TQ but not speed.  Speed gap = ~24%.
+
+**Net session position (iter-262)**:
+- Half the production matrix (qwen3.6) ★ FULLY meets operator mantra
+- gemma4 ≥ peer requires DFlash spec-decode (multi-month, operator-
+  approval-gated per iter-227 §"Decision blocker")
+- Two safe operator-flippable levers exist for gemma4 default
+  (Path E+G = +3.6%; +FUSED = +4.4% cumul)
+
+**No regression introduced by iter-253-261 work** (docs + benches
+only; production engine path unchanged).  Gate confirms.
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 
