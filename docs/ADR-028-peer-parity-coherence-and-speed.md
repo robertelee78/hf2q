@@ -6233,6 +6233,47 @@ work: same input read, output is the residual write.
 iter-212+ plan: design fused_q5_k_matvec_with_residual_norm kernel.
 Or pivot to qwen3.6 cross-pollination.
 
+### iter-212 — STACKED additivity bisect: fusion ROI revised down to +2.5%
+
+Stacked HF2Q_SKIP_O_PROJ + HF2Q_SKIP_POST_ATTN_NORM to validate the
+iter-211 fusion ROI claim of +4.4%.
+
+| Config | BODY GPU | dispatches |
+|--------|---------:|-----------:|
+| Default | 12.52 ms | 956 |
+| SKIP_O_PROJ + SKIP_POST_ATTN_NORM | 11.51 ms | 926 |
+| **Δ** | **1.01 ms** | -30 |
+
+vs sum of individuals: 0.70 + 0.55 = **1.25 ms expected** (full add).
+Actual: 1.01 ms.  **Sub-additivity = 0.24 ms** (80% stack; 20% overlap).
+
+**The 0.24 ms overlap means**: O-proj and post-attn-norm-add already
+partially overlap on GPU.  When fused, we eliminate the launch
+overhead of one but the GPU work that overlapped becomes serialized
+inside the fused kernel.  Net savings reduced.
+
+**Realistic fusion ROI revised** (per the bisect):
+- iter-211 claim: +4.4% (assumed full additivity)
+- iter-212 measurement: ~+2.5% (sub-additive)
+
+iter-211's +4.4% was a guess; iter-212's +2.5% is bisect-measured.
+
+**Pattern reinforced** (THIRD time bisect saved misallocation):
+- iter-201 guess "MoE swiglu fusion = +6%" → iter-202 BISECT = +1% → DON'T BUILD
+- iter-207 guess "end-of-layer fusion = +6-7%" → iter-208 BISECT = +2.7%
+- iter-211 guess "O-proj fusion = +4.4%" → iter-212 BISECT = +2.5%
+
+**Multi-day kernel work for +2.5% is borderline ROI.**  Same pattern
+across all 3 fusion candidates (each ~+2-3% real).  Compounding 3
+fusions could give ~+7-8% total but each is multi-day risky kernel
+work.
+
+iter-213+ options:
+- (a) Build all 3 fusion kernels in parallel (multi-week, +6-8%)
+- (b) Build single fusion as proof-of-concept (multi-day, +2.5%)
+- (c) Pivot to qwen3.6 cross-pollination (already-fast path, learn what makes it work)
+- (d) Bisect remaining "Other" 4.35 ms bucket more
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
