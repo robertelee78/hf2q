@@ -11920,3 +11920,45 @@ decision-grade numbers.
 No code changes — statistical confirmation completing the iter-289
 single-run measurements.
 
+
+---
+
+## iter-307 — script-path audit: actively-used scripts all correct
+
+After iter-296 found coherence_smoke had stale model paths (post
+iter-12a rename), this iter audits ALL `scripts/*.sh` for similar
+issues.
+
+### Findings
+
+**Actively-used scripts (correct APEX paths):**
+- `scripts/adr028_full_stack_bench.sh` — gemma4 APEX-Q5_K_M ✓
+- `scripts/adr028_coherence_gate.sh` — gemma4 + qwen3.6 APEX ✓
+- `scripts/bench_lcp_long_prompt.sh` — qwen3.6 APEX ✓
+- `scripts/lcp_resume_mini_soak.sh` — qwen3.6 APEX ✓
+- `scripts/adr027-long-context-sweep.sh` — qwen3.6 APEX ✓
+- `scripts/adr020_ac8_validate.sh` — qwen3.6 + gemma4 APEX ✓
+- `scripts/adr010_iter64_iter68_full_lock.sh` — qwen3.6 APEX ✓
+
+**Historical one-shot scripts (stale paths, expected):**
+- `sunset-w5b20-*`, `bench-w5b{7,10,19,22,24,27}-*` — past iter
+  artifacts; reference paths that were correct at script-creation time.
+- `iter37-parity-matrix.sh`, `iter44-*`, `iter91-*`, `profile-iter9-*` —
+  iteration-specific tooling; not part of operator's regression
+  workflow.
+
+### Decision
+
+**No fix needed.**  Per Chesterton's fence rule, historical scripts
+should NOT be retroactively updated — they're snapshots of past
+investigations.  Modifying them risks breaking provenance trail.
+
+Active scripts are all aligned to current APEX paths.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes — audit produced a clean verdict on production-relevant
+script set.
+
