@@ -69,17 +69,25 @@ run_stack "Path E+G + FUSED_END_OF_LAYER" "HF2Q_USE_DENSE=1 HF2Q_LMHEAD_Q6K=1 HF
 run_stack "Path E+F+G (F16 KV — DEGRADED >200 tok ✗)" "HF2Q_USE_DENSE=1 HF2Q_F16_KV=1 HF2Q_LMHEAD_Q6K=1 HF2Q_UNSAFE_EXPERIMENTS=1"
 
 if [[ -x "$LLAMA_BENCH" ]]; then
-    echo "=== llama.cpp peer (tg128) ==="
-    "$LLAMA_BENCH" -m "$MODEL" -p 0 -n 128 -t 8 2>&1 | grep -E "tg128 *\|" | tail -1
+    # iter-259: hf2q runs sustained 1000-token decode (~14s); tg128 measures
+    # burst (~1.4s) which doesn't hit Apple Silicon's thermal throttle.
+    # Use tg1024 for proper apples-to-apples regime match (matches hf2q's
+    # measurement window). tg128 reported alongside for backwards
+    # compatibility with iter-183/iter-216 historical numbers.
+    echo "=== llama.cpp peer (tg128 burst + tg1024 matched-regime) ==="
+    "$LLAMA_BENCH" -m "$MODEL" -p 0 -n 128,1024 -r 3 -t 8 2>&1 \
+        | grep -E "(tg128|tg1024) *\|" | tail -2
 else
     echo "[skip] llama.cpp peer bench: $LLAMA_BENCH not found"
 fi
 
 echo
-echo "Reference (iter-216/iter-233 — long-form 1000-tok measurements):"
-echo "  Default:       68.4 tok/s   (0.666x peer)   ✓ coherent"
-echo "  Path E:        69.2 tok/s   (0.674x peer)   ✓ coherent"
-echo "  Path E+G:      70.9 tok/s   (0.690x peer)   ✓ coherent ★ SAFE FLIP"
-echo "  Path E+G+FUS:  ~73 tok/s    (0.71x peer)    ✓ coherent (UNSAFE_EXP)"
-echo "  Path E+F+G:    ~73 tok/s    -- F16 KV DEGRADES at 1000 tok ✗"
-echo "  llama.cpp:    102.7 tok/s   (1.000x peer baseline)"
+echo "Reference (iter-258/259 — long-form 1000-tok HEAD measurements):"
+echo "  Default:       68.6 tok/s   (0.726x peer matched, was 0.663x burst)"
+echo "  Path E:        69.7 tok/s   (0.737x peer matched)"
+echo "  Path E+G:      71.1 tok/s   (0.752x peer matched)  ★ SAFE FLIP"
+echo "  Path E+G+FUS:  noisy 5% σ   (within-noise; iter-258 retired)"
+echo "  Path E+F+G:    --           (F16 KV DEGRADES at 1000 tok ✗ iter-233)"
+echo "  llama.cpp tg128:   ~103 tok/s  (burst regime — historical, mismatched)"
+echo "  llama.cpp tg1024:  ~94.5 tok/s (matched regime — apples-to-apples)"
+echo "  Apple Silicon thermal throttle: 8.7% from burst → sustained (iter-259)"
