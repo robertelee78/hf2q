@@ -5816,6 +5816,44 @@ Add HF2Q_SKIP_MOE_SWIGLU env flag — skip just the swiglu dispatch (keep
 matmuls) to measure swiglu's exact cost.  If <0.5 ms, fusion ROI poor.
 If >0.5 ms, then build the Q6_K _swiglu kernel and bench parity.
 
+### iter-202 — BISECT swiglu = 0.14 ms; Q6_K _swiglu fusion DO NOT BUILD
+
+Shipped HF2Q_SKIP_MOE_SWIGLU env flag.  Bisect skips just the
+moe_swiglu_batch_encode dispatch per layer.
+
+| Config | BODY GPU | dispatches |
+|--------|---------:|-----------:|
+| Default | 12.50 ms | 956 |
+| SKIP_MOE_SWIGLU | 12.36 ms | 926 (-30) |
+| **Δ swiglu cost** | **0.14 ms** | -30 |
+
+Swiglu = **0.14 ms = 1.1% of body**.
+
+**iter-201's estimate was 0.76 ms.  Bisect proves real cost is 0.14 ms.**
+
+Updated MoE expert decomposition (2.6 ms total):
+- gate_up_id + down_id matmul: **2.46 ms** (peak-saturated, not 1.84
+  as the batched bench measured — production has ~0.62 ms additional
+  per-dispatch overhead)
+- swiglu batch: **0.14 ms** (near-free, likely concurrent overlap)
+
+**Q6_K _swiglu fusion ROI**:
+- Eliminates 1 dispatch/layer (~5 µs launch × 30 = 150 µs)
+- Plus tiny bandwidth (eliminate moe_gate_up_id_out re-read = ~3 µs)
+- Total potential: **~+1% throughput** (NOT +6%)
+- Multi-day kernel work
+- Q4_0 _swiglu (existing analog) regressed -1.5% in qwen35 dwq46
+- **VERDICT: DO NOT BUILD**
+
+**Lesson reinforced**: bisects > guesses.  iter-201 guessed swiglu
+cost from arithmetic (1.84 + 0.76 = 2.6).  Bisect at iter-202 showed
+the breakdown is 2.46 + 0.14, not 1.84 + 0.76.  Same total but very
+different optimization targets.  The +6% guessed lever was actually
++1%; building it would have wasted multi-days.
+
+iter-203 plan: bisect KV cache copy or attention norms (next biggest
+candidates in the 5.46 ms "other" bucket).
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
