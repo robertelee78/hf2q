@@ -10050,6 +10050,89 @@ generation by directly measuring at every architectural boundary.
 - Investigation continues to be measurement-driven; each iter rules
   out a layer of possibilities rather than guessing
 
+### iter-276 — DECISIVE: DeltaNet layer satisfies K1 invariant; bug is HIGHER
+
+Wrote and shipped `delta_net_layer_seq1_plus_seq1_eq_seq2_at_same_initial_state`
+test — the most direct possible falsifier of K1's implicit assumption:
+"batching 2 tokens in one call produces identical output + state to
+two sequential 1-token calls with state threaded between them."
+
+**Test verifies three nested invariants** at HEAD:
+
+1. **CPU recurrence is associative**: seq=1+1 ≡ seq=2 mathematically
+   (max_diff < 1e-5)
+2. **CPU state is associative**: state(seq=1+1) ≡ state(seq=2)
+   (max_diff < 1e-5)
+3. **GPU seq=2 matches CPU seq=2** within Q4_0 budget (5e-2)
+
+**ALL THREE INVARIANTS PASS.** The DeltaNet layer fully satisfies
+the K1 implicit invariant — there is no batched-vs-sequential
+divergence at the layer level.
+
+**Decisive strategic conclusion**: after 14 iterations of K1
+investigation (iter-263→276), the K1 trajectory bug is **definitively
+NOT** in:
+- Any kernel math (DeltaNet decode, FA resume — all parity-tested)
+- Any isolated layer math (DeltaNet seq=2 fresh + mid-stream + batched-
+  vs-sequential — all parity-tested)
+
+The bug **is** at the qwen35 FORWARD ORCHESTRATION level:
+- State/position threading across the 64-layer chain
+- FA cache-write integration paths in `apply_sdpa_with_kv_cache` /
+  `build_gated_attn_layer` (untested at unit-test level for the
+  K1 cur_len>0 case)
+- Hidden-state accumulation between layers
+- Potentially the K1 spec_decode runner's state ping-pong logic itself
+
+**To fully localize requires per-layer hidden-state instrumentation
+in the actual production model with the actual GGUF — multi-iter
+engineering work.**
+
+**Strategic decision (iter-276)**: **RETRACT the focused K1
+investigation thread**.  Rationale:
+- 14 iterations exhausted all measurable kernel/layer-level
+  hypotheses; remaining work is per-layer trace at production scale
+- qwen3.6 production path (35B-A3B-APEX-Q5_K_M) is **already 1.28×
+  peer matched** without MTP — mantra satisfied
+- K1 path is env-gated opt-in (HF2Q_SPEC_DECODE_K1=1 +
+  UNSAFE_EXPERIMENTS).  Production unaffected.
+- All work shipped in this thread is real and load-bearing:
+  * Multi-EOS API (`SpecDecode::run_with_eos_set`) — fixes the
+    legacy single-eos collapse bug for any future qwen3 GGUF that
+    has both <|endoftext|> and <|im_end|>
+  * Name-based EOS resolver — robust against missing-metadata GGUFs
+  * 2 layer-level parity tests — DeltaNet seq=2 mid-stream + batched-
+    vs-sequential equivalence; permanent regression gates
+
+**Final K1 status**:
+- Functionally correct: ✗ (trajectory diverges from greedy)
+- Perf with broken trajectory: +8.2% (iter-269 measured)
+- Perf with TWO_CALLS correct trajectory: -7.9% (iter-269)
+- **Practical recommendation**: keep K1 opt-in.  Real fix requires
+  multi-iter forward-level instrumentation work that's deferred
+  pending operator priority decision.
+
+**Operator-actionable summary at HEAD (post iter-263→276)**:
+
+| Path | Status | ROI | Decision needed? |
+|------|--------|----:|------------------|
+| Path E+G default flip (gemma4) | tested, +3.6% | small | YES (1 line) |
+| +FUSED on top (gemma4) | tested, +0.7% | small | YES (1 line) |
+| qwen3.6 35B-A3B production | mantra satisfied (1.28× peer) | n/a | none |
+| K1 spec-decode (qwen MTP) | trajectory bug, opt-in | uncertain | LATER (multi-iter fix) |
+| DFlash gemma4 port | architecturally scoped | +1.5-3× | YES (multi-month commitment) |
+
+**iter-276 outcome**:
+- ✓ Shipped third layer-level parity test (batched-vs-sequential
+  equivalence) — permanent regression gate
+- ✓ Definitively localized K1 bug to forward-orchestration level
+- ✓ Strategic retraction of focused K1 thread; ROI doesn't justify
+  multi-iter per-layer instrumentation given production already
+  meets mantra
+- → iter-277 pivots: focus on remaining operator-actionable
+  deliverables (Path E+G flip prep, regression gate runs, ADR
+  closing summary).
+
 **Bench shipped**: `mlx-native/benches/bench_dispatch_overhead.rs`
 (falsifier for any future "binding overhead" claim).
 

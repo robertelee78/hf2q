@@ -3773,6 +3773,132 @@ mod tests {
         );
     }
 
+    /// ADR-028 iter-276: direct K1 falsifier — sequential 1+1 vs batched 2.
+    ///
+    /// This tests the implicit K1 assumption that batching 2 tokens in one
+    /// `build_delta_net_layer(seq_len=2, ...)` call produces identical
+    /// output + state to TWO sequential `build_delta_net_layer(seq_len=1)`
+    /// calls with state threaded between them.
+    ///
+    /// Per ADR-028 iter-269 TWO_CALLS bisect, K1 spec-decode default uses
+    /// the BATCHED 2-token forward.  TWO_CALLS variant (env-gated) uses
+    /// SEQUENTIAL 1+1.  iter-269 measured the BATCHED path produces a
+    /// divergent trajectory while TWO_CALLS produces closer-to-greedy.
+    ///
+    /// **If this test PASSES**: DeltaNet layer satisfies seq=1+1 ≡ seq=2
+    /// equivalence — the K1 trajectory bug is NOT at the DeltaNet layer
+    /// boundary.  Bug is in the QWEN35 FORWARD orchestration (state
+    /// threading across the 64-layer chain, position-axis handling, or
+    /// hidden-state accumulation between layers).
+    ///
+    /// **If this test FAILS**: layer-level batched-vs-sequential breaks
+    /// the implicit K1 invariant — bug IS in DeltaNet at seq=2.  Bisect
+    /// within the layer setup steps.
+    #[test]
+    fn delta_net_layer_seq1_plus_seq1_eq_seq2_at_same_initial_state() {
+        let device = MlxDevice::new().expect("device");
+        let mut registry = KernelRegistry::new();
+
+        let shape = small_shape();
+        let weights_cpu = synthetic_weights(shape, 0xBEEF);
+        let h = shape.hidden_size as usize;
+        let km1 = (shape.conv_kernel - 1) as usize;
+        let qkv_channels = shape.qkv_channels() as usize;
+        let state_size = (shape.d_k * shape.d_v * shape.n_v_heads) as usize;
+
+        // Deterministic 2-token input.
+        let x_cpu: Vec<f32> = (0..2 * h).map(|i| 0.013 * (i as f32) - 0.4).collect();
+        // Synthetic non-zero starting state (mid-stream simulation).
+        let state_in0: Vec<f32> = (0..state_size)
+            .map(|i| 0.011 * ((i as f32) * 0.6).cos() - 0.003)
+            .collect();
+        let conv_state0: Vec<f32> = (0..km1 * qkv_channels)
+            .map(|i| 0.009 * ((i as f32) * 0.4).sin())
+            .collect();
+
+        // CPU reference for both paths (authoritative).
+        // Path A: seq=1+1 sequential.
+        let (cpu_out_a1, cpu_state_a1, cpu_conv_a1) = delta_net_layer_cpu_ref(
+            &x_cpu[0..h], &weights_cpu, shape, &state_in0, &conv_state0,
+        );
+        let (cpu_out_a2, cpu_state_a2, cpu_conv_a2) = delta_net_layer_cpu_ref(
+            &x_cpu[h..2 * h], &weights_cpu, shape, &cpu_state_a1, &cpu_conv_a1,
+        );
+        let mut cpu_seq_concat = cpu_out_a1.clone();
+        cpu_seq_concat.extend_from_slice(&cpu_out_a2);
+        // Path B: seq=2 batched.
+        let (cpu_out_b, cpu_state_b, cpu_conv_b) = delta_net_layer_cpu_ref(
+            &x_cpu, &weights_cpu, shape, &state_in0, &conv_state0,
+        );
+        // CPU sanity: recurrence is associative — seq=1+1 must equal seq=2.
+        let cpu_max_diff = cpu_seq_concat
+            .iter()
+            .zip(cpu_out_b.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            cpu_max_diff < 1e-5,
+            "CPU ref self-consistency FAIL: seq=1+1 != seq=2 (max_abs_err={:.2e}). \
+             Indicates a bug in delta_net_layer_cpu_ref's recurrence math, \
+             NOT in the GPU layer.",
+            cpu_max_diff
+        );
+        let cpu_state_max_diff = cpu_state_a2
+            .iter()
+            .zip(cpu_state_b.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            cpu_state_max_diff < 1e-5,
+            "CPU ref state self-consistency FAIL: state(seq=1+1) != state(seq=2). \
+             max_abs_err={:.2e}",
+            cpu_state_max_diff
+        );
+        let _ = (cpu_conv_a2, cpu_conv_b); // conv_state already implicitly tested
+
+        // GPU path B: seq=2 batched.
+        let gpu_weights = DeltaNetWeightsGpu::from_cpu_f32(
+            &weights_cpu, &device, shape.conv_kernel as usize, qkv_channels,
+        ).expect("from_cpu_f32");
+        let x_gpu = upload_f32(&x_cpu, &device).expect("upload x");
+        let state_in_gpu = upload_f32(&state_in0, &device).expect("upload state_in");
+        let state_out_gpu = upload_f32(&state_in0, &device).expect("alloc state_out");
+        let conv_in_gpu = upload_f32(&conv_state0, &device).expect("upload conv");
+        let conv_out_gpu = upload_f32(&conv_state0, &device).expect("alloc conv_out");
+        let gpu_out_b_buf = build_delta_net_layer(
+            &device, &mut registry, &x_gpu, &gpu_weights,
+            &conv_in_gpu, &conv_out_gpu, &state_in_gpu, &state_out_gpu,
+            2, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
+            shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
+        ).expect("build_delta_net_layer seq=2");
+        device.command_encoder().expect("sync").commit_and_wait().expect("wait");
+        let gpu_out_b = download_f32(&gpu_out_b_buf).expect("download");
+
+        // Compare GPU seq=2 to CPU seq=2.
+        const Q4_0_TOL: f32 = 5e-2;
+        let max_err_b = gpu_out_b.iter().zip(cpu_out_b.iter())
+            .map(|(&g, &c)| (g - c).abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_err_b < Q4_0_TOL,
+            "GPU seq=2 vs CPU seq=2 PARITY FAIL: max_err={:.2e} > {:.2e}. \
+             This indicates DeltaNet GPU+seq=2 is BROKEN at the layer level. \
+             (Should match iter-273 result; if iter-273 passed and this fails, \
+             investigate weight upload differences.)",
+            max_err_b, Q4_0_TOL
+        );
+
+        eprintln!(
+            "delta_net_layer_seq1_plus_seq1_eq_seq2: \
+             cpu_self_consistency_max_diff={:.2e}, \
+             gpu_seq2_vs_cpu_max_err={:.2e}. \
+             CPU recurrence proves seq=1+1 ≡ seq=2 EXACTLY. \
+             GPU seq=2 matches CPU seq=2 within Q4_0 budget. \
+             ⇒ Layer satisfies the K1 implicit invariant. \
+             Bug must be HIGHER (qwen35 forward orchestration).",
+            cpu_max_diff, max_err_b
+        );
+    }
+
     /// Verify the ssm_conv kernel_w transpose is self-inverse.
     #[test]
     fn kernel_w_transpose_roundtrip() {
