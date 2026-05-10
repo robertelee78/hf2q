@@ -5542,6 +5542,66 @@ incremental shipped win.
 iter-196+ plan: option (2) from iter-194 — function-constant cbits
 specialization for additional ~5-10% on TQ-HB SDPA inner loop.
 
+### iter-196 — BISECT: cbits branch cost MEASURED at +8.5% (was guessed 0.5-1%)
+
+Operator pushback at iter-196: "we need more bisects I think — guessing
+is wrong without it."  Direct hit on my speculation that the cbits
+branch was already amortized by iter-195's per-float4 hoisting.
+Replaced speculation with a measurement.
+
+**BISECT method**: temporarily hardcoded `cbits=8` in `dequant_hb_float4`
+(skipped the `if (cbits == 5u) ... else if (cbits == 6u) ... else { 8-bit }`
+chain entirely).  Verified the `sdpa_kernel_vs_oracle_d256_8bit_no_mask`
+parity test still passes (cbits=8 is the correct path for the
+production HF2Q_TQ_CODEBOOK_BITS=8 default).  Reverted to the branched
+form after measurement.
+
+**5-run statistical bench** (gemma4 default path, 200-tok long-form):
+
+| Config | tok/s |
+|--------|------:|
+| iter-195 vectorized + branched | 63.8 |
+| iter-196 BISECT hardcoded cbits=8 | **69.2** |
+| **Δ from removing cbits branch** | **+5.4 tok/s = +8.5%** |
+
+(Excluded 1st run 65.6 tok/s = pipeline JIT compile.)
+
+**HYPOTHESIS RESIZE**: my iter-196 speculation of "0.5-1%" was
+**~10× too low**.  The Metal compiler did NOT hoist the cbits branch
+out of the inner K-loop after `dequant_hb_float4` inlining despite
+loop-invariance.  Real cost = 5.4 tok/s (8.5% of throughput, ~1 ms
+of decode time on the 30-layer × kv_seq=1024 path).
+
+V-side `dequant_hb_float4` calls (lines 583, 589, 598) share the same
+inline — same +8.5% gain expected from K + V combined.
+
+**Updated iter-194 plan ROI**:
+- Option (1) Vector load: SHIPPED (+2.08% iter-195)
+- **Option (2) cbits function-constant: ~+8.5%** (measured!)
+- Cumulative TQ-HB SDPA optimization potential: **~+10.6%** if both
+  ship (multiplicative on top of iter-195's already-shipped +2%).
+
+**Strategic implication**: TQ-HB SDPA optimization is the single
+HIGHEST-ROI default-path lever remaining (matches iter-191's smoking
+gun "TQ-HB SDPA = 19% body").  +8.5% from a 1-day kernel work
+investment is the most impactful single-component speedup since
+iter-188's Path G (+1.76%).
+
+**Reverted hardcoded version**: shipping a cbits=8-only kernel would
+break 5-bit and 6-bit users (HF2Q_TQ_CODEBOOK_BITS=5|6).  Proper
+function-constant impl is iter-197+ work: 3 specialized pipeline
+variants, dispatcher selects based on `params.codebook_bits` at
+runtime.
+
+**Lesson reinforced**: NEVER GUESS performance numbers.  Always bisect.
+My "well-optimized kernel" claim was wrong by an order of magnitude.
+
+iter-197 plan: implement function-constant cbits properly:
+1. Add `[[function_constant(N)]] uint cbits_fc` to flash_attn_vec_tq_hb.metal
+2. Compile 3 specialized variants in kernel_registry
+3. Dispatcher in ops/flash_attn_vec_tq_hb.rs selects variant
+4. Bench 5-run; expect +8.5% on cbits=8 default; verify 5/6/8 byte-parity
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
