@@ -10614,3 +10614,164 @@ This is the iter-284 work.
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`:
   this section.
 
+
+---
+
+## iter-284 — Test 2 EXECUTED: per-pipeline dispatch breakdown locates the gap
+
+**Per-pipeline buckets shipped on both sides.  Direct comparison of which
+kernels each implementation dispatches reveals the concrete gap.**
+
+### What shipped (instrumentation)
+
+**llama.cpp** (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m`):
+- Parallel pipeline-pointer → name table populated at compile (since
+  `MTLComputePipelineState.label` is read-only post-creation)
+- Per-name buckets (linear-scan hash; ≤512 unique kernels)
+- atexit dump under `LLAMA_DISP_COUNT=1`
+- Stays in /opt/llama.cpp working tree (instrumentation, not committed
+  to peer)
+
+**hf2q + mlx-native** (committed):
+- `mlx_native::pipeline_dispatch_buckets()` — public API returning
+  `Vec<(label, count)>` sorted desc
+- `mlx_native::reset_pipeline_dispatch_buckets()` — for prefill-vs-decode
+  separation (future iters)
+- `bucket_dispatch(pipeline)` helper called at all 6 `encode*` sites in
+  `mlx-native/src/encoder.rs`
+- `MLX_DISP_BUCKET=1` env-flag (cached AtomicI8, single load on hot path)
+- `serve/mod.rs` dump alongside `HF2Q_DUMP_COUNTERS=1`
+- Pipeline labels already set via `descriptor.set_label(name)` at
+  pipeline compile time — no kernel_registry change needed
+
+### Measurements (gemma4-ara-2pass-APEX-Q5_K_M.gguf at -n 256, -n 1024)
+
+**llama.cpp tg1024** (1,423,725 dispatches over ~2050 token batches):
+
+| Rank | %     | Kernel | Per-tok est |
+|------|-------|--------|------|
+| 1    | 15.26 | kernel_rms_norm_mul_f32_4 (FUSED) | 106.0 |
+| 2    | 12.67 | kernel_mul_mv_q6_K_f32_nsg=2 | 88.0 |
+| 3    | 4.46  | kernel_get_rows_f32 | 31.0 |
+| 4    | 4.32  | kernel_soft_max_f32_4 | 30.0 |
+| 5    | 4.32  | kernel_rope_neox_f32_imrope=0 | 30.0 |
+| 6    | 4.32  | kernel_set_rows_f16_i64 | 30.0 |
+| 7    | 4.32  | kernel_geglu_f32 | 30.0 |
+| 8    | 4.32  | kernel_bin_fuse_f32_f32_f32_op=2_nf=1_rb=0_cb=1 | 30.0 |
+| 9    | 4.32  | kernel_rms_norm_f32_4 | 30.0 |
+| 10   | 4.25  | kernel_rms_norm_mul_add_f32_4 (FUSED 3 ops) | 29.5 |
+
+… 32 unique pipelines total.  Top 10 sum ≈ 62.5%.
+
+**hf2q gemma4 APEX -n 256** (270,540 dispatches over 26 prefill + 256 decode):
+
+| Rank | %     | Kernel | Note |
+|------|-------|--------|------|
+| 1    | 18.18 | kernel_mul_mv_q6_K_f32 | matches llama.cpp #2 |
+| 2    | 15.68 | rms_norm_f32 (NOT fused) | vs llama.cpp's fused #1 |
+| 3    | 6.23  | fused_head_norm_rope_f32 | hf2q-only fusion |
+| 4    | 6.23  | fused_norm_add_f32 | hf2q-only fusion |
+| 5    | 5.19  | hadamard_quantize_kv_fast_d256 | TQ-HB only |
+| 6    | 3.22  | kernel_mul_mv_q8_0_f32 | (Path G lm_head) |
+| 7    | 3.12  | fused_norm_add_scalar_f32 |  |
+| 8    | 3.12  | kernel_mul_mv_id_q6_K_f32 | MoE matvec |
+| 9    | 3.12  | fused_gelu_mul |  |
+| 10   | 3.12  | moe_weighted_sum |  |
+| 11   | 3.12  | moe_swiglu_batch |  |
+| 12   | 3.12  | rms_norm_no_scale_f32 |  |
+| 13   | 3.12  | hf2q_dense_mm_f32_f32_tensor |  |
+| 14   | 3.12  | fused_moe_routing_f32 |  |
+| 15   | 2.60  | flash_attn_vec_reduce_dk256 | 2-stage SDPA |
+| 16   | 2.36  | flash_attn_vec_tq_hb_dk256 | TQ-HB SDPA |
+| 17   | 2.36  | fwht_sign_premult_f32_d256 | TQ-HB only |
+| 18   | 2.36  | fwht_sign_undo_f32_d256 | TQ-HB only |
+| 19   | 2.36  | hadamard_quantize_kv_hb_dual_d256 | TQ-HB only |
+
+… 36 unique pipelines total.
+
+### Concrete gap decomposition
+
+**1. TQ-HB-specific dispatches (~16% of hf2q's budget = ~169 disp/tok)**
+
+These exist purely because hf2q runs TQ-HB SDPA for the 3.94× per-slot
+KV memory savings shipped in ADR-027.  llama.cpp uses F16 KV → no
+hadamard_quantize / fwht / flash_attn_vec_tq_hb dispatches needed.
+
+| TQ-HB kernel | hf2q % |
+|---|---|
+| hadamard_quantize_kv_fast_d256 | 5.19 |
+| flash_attn_vec_tq_hb_dk256 | 2.36 |
+| fwht_sign_premult_f32_d256 | 2.36 |
+| fwht_sign_undo_f32_d256 | 2.36 |
+| hadamard_quantize_kv_hb_dual_d256 | 2.36 |
+| hadamard_quantize_kv_fast_d512 | 1.04 |
+| (4 × d512 variants) | ~2.5 |
+| Total | ~18% |
+
+**Operator policy**: TQ-HB stays.  Memory-savings mantra is non-negotiable.
+This is the cost of the design choice, not a bug.
+
+**2. Missing rms+mul fusion (~10% potentially recoverable)**
+
+llama.cpp ships `kernel_rms_norm_mul_f32_4` (15.26% of dispatches) — a
+fused RMSNorm + element-wise multiply kernel.  hf2q ships standalone
+`rms_norm_f32` (15.68%) that emits one dispatch, then a separate mul
+follows in its own dispatch.
+
+**Note on apparent matching frequency**: 15.68% (hf2q) ≈ 15.26%
+(llama.cpp).  Same call rate — but llama.cpp's kernel does TWO ops per
+dispatch (rms+mul).  hf2q would need 2× dispatches to match the same
+work.  We avoid this only because some sites use `fused_norm_add_f32`
+(6.23%) etc.  But many norm-then-mul patterns are still split.
+
+**Concrete next step** (iter-285): grep all `rms_norm_f32` call sites in
+hf2q forward paths.  Identify which are followed by a same-token mul
+(e.g. residual + scale).  Fuse those.
+
+**3. 2-stage SDPA reduction (~2.6%)**
+
+hf2q's `flash_attn_vec_reduce_dk256` (2.60%) is a separate dispatch
+after `flash_attn_vec_dk256` (0.24% — much fewer because most go
+through TQ-HB path).  llama.cpp's softmax is one-shot (4.32%) — no
+separate reduce.
+
+**4. llama.cpp also has fused triple op** (`kernel_rms_norm_mul_add_f32_4`,
+4.25%) — three ops in one dispatch.  hf2q has `fused_norm_add_*` for
+some sites but not all.
+
+### Next iters
+
+| iter | Target | Mechanism |
+|------|--------|-----------|
+| 285  | Audit rms_norm + mul patterns in hf2q forward path | grep + reading |
+| 286  | Build a fused rms_norm_mul_f32 kernel (test parity) | mlx-native |
+| 287  | Wire fused kernel at top-N call sites | hf2q forward |
+| 288  | Re-run Test 1 + Test 2; quantify dispatch savings | bench |
+| 289+ | If savings <expected, profile flash_attn_vec_reduce | mlx-native |
+
+### Methodology notes
+
+The buckets are CUMULATIVE from process start, including:
+- Model load + kernel pipeline compile (small contribution)
+- 26-token prefill batched forward (~24,780 dispatches one-time)
+- N decode tokens × ~960 dispatches/tok
+
+For perfect per-decode-token attribution, call
+`mlx_native::reset_pipeline_dispatch_buckets()` at decode start.
+Currently the prefill+load contamination is ~24,780/270,540 ≈ 9% at -n
+256, and ~24,780/1,007,820 ≈ 2.5% at -n 1024.  Top-rank ordering is
+robust at both ends.
+
+### Files modified (committed)
+
+- `/opt/mlx-native/src/encoder.rs`: bucket infra + 6 dispatch sites
+  (+72 lines)
+- `/opt/mlx-native/src/lib.rs`: re-export pipeline_dispatch_buckets +
+  reset_pipeline_dispatch_buckets (+1 line)
+- `/opt/hf2q/src/serve/mod.rs`: dump under HF2Q_DUMP_COUNTERS+MLX_DISP_BUCKET
+  (+19 lines)
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+llama.cpp instrumentation stays uncommitted in /opt/llama.cpp working
+tree (peer repo, instrumentation only — ADR documents the diff exactly).
+

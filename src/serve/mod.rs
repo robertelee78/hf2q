@@ -1377,6 +1377,24 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
              dispatches_per_prompt_tok={:.2} syncs_per_decode_tok={:.2}",
             dispatches, syncs, prompt_n, decode_n, dispatches_per_prompt_tok, syncs_per_decode_tok,
         );
+        // ADR-028 iter-284: dump per-pipeline dispatch buckets if MLX_DISP_BUCKET=1.
+        // Mirrors llama.cpp's LLAMA_DISP_COUNT atexit dump for direct compare.
+        let buckets = mlx_native::pipeline_dispatch_buckets();
+        if !buckets.is_empty() {
+            let total: u64 = buckets.iter().map(|(_, c)| *c).sum();
+            eprintln!(
+                "[MLX_DISP_BUCKET] Per-pipeline breakdown ({} unique pipelines, total={}):",
+                buckets.len(),
+                total,
+            );
+            for (label, count) in &buckets {
+                let pct = if total > 0 { 100.0 * (*count as f64) / (total as f64) } else { 0.0 };
+                eprintln!(
+                    "[MLX_DISP_BUCKET]   {:>8}  ({:5.2}%)  {}",
+                    count, pct, label,
+                );
+            }
+        }
     }
 
     Ok(())
