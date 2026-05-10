@@ -5926,6 +5926,46 @@ iter-205+ plan: bisect QKVO production directly OR bisect routing
 scaffold (router_proj + softmax_topk + gather + weighted_sum) to
 localize the remaining ~5.4 ms.
 
+### iter-205 — BISECT post-attn fused_norm_add = 0.55 ms (sequential!)
+
+Shipped HF2Q_SKIP_POST_ATTN_NORM.  Skips the single fused_norm_add
+dispatch per layer (post-attn norm + residual add).
+
+| Config | BODY GPU | barriers |
+|--------|---------:|---------:|
+| Default | 12.61 ms | 459 |
+| SKIP_POST_ATTN_NORM | 12.06 ms | 405 (-54) |
+| **Δ** | **0.55 ms** | -54 |
+
+**post-attn fused_norm_add = 0.55 ms = 4.4% body.**
+
+**FIRST clearly non-free sequential op found in scaffolding.**
+
+**Concurrent vs sequential pattern confirmed**:
+
+| Op (3 iters of bisect) | Cost | Type |
+|------------------------|-----:|------|
+| swiglu (iter-202) | 0.14 ms | concurrent → free |
+| head_norm_rope (iter-204) | 0.11 ms | concurrent → free |
+| TQ-HB encode (iter-191) | ~0 ms | concurrent → free |
+| **post-attn fused_norm_add (iter-205)** | **0.55 ms** | **SEQUENTIAL → real cost** |
+
+The critical-path math: 18 µs per dispatch × 30 layers = 0.55 ms.
+
+**Optimization candidates** (high risk):
+- Fuse O-proj + post-attn-norm-add into a custom matmul-with-residual
+  kernel.  Multi-day.  Risk: prior fusion attempts (iter-186
+  fused_triple_norm) REGRESSED on decode.  Same risk applies here.
+- Or wait for ggml-style graph fusion infrastructure (multi-week).
+
+iter-206+ plan: bisect more sequential candidates:
+- B14 weighted_sum (sequential after down_id)
+- B10 fused_moe_routing (sequential after router_proj)
+- B7 post-FF norm 1 (post_feedforward_layernorm_1)
+- Final hidden update (post_feedforward_layernorm_2 + residual add)
+
+Each likely ~0.3-0.5 ms.  Bisect-then-fuse for compound savings.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
