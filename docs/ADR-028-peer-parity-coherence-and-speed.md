@@ -14376,3 +14376,82 @@ shipped iter-331, rms_norm v2 shipped iter-310).
 
 No code changes (both hypotheses falsified by code reading + bench
 before code touched).
+
+
+---
+
+## iter-336 — True peer-parity gap measured on this M5 Max (NOT stale iter-308 number)
+
+Per /loop directive "Code + test == truth", before committing weeks
+to Phase 7 (TQ-HB kernel-fusion redesign), re-measured the actual gap
+at HEAD using current llama.cpp binary on this hardware with the SAME
+gemma4 APEX file.
+
+### Bench (llama.cpp build d05fe1d7d, 9010, M5 Max, gemma4-ara-2pass-APEX-Q5_K_M.gguf)
+
+```
+$ llama-bench -m gemma4-ara-2pass-APEX-Q5_K_M.gguf -p 0 -n 128
+| model      | size     | params | backend  | threads | test  |     t/s |
+| gemma4 26B | 19.15GiB | 25.23B | BLAS,MTL |       1 | tg128 | 103.16 ± 0.39 |
+
+$ llama-bench -m gemma4-ara-2pass-APEX-Q5_K_M.gguf -p 0 -n 1024 -r 2
+| ...                                                          | tg1024 | 100.08 ± 0.10 |
+```
+
+vs hf2q HEAD on the same model:
+- 200-tok decode (iter-335 measured): 73.6 tok/s
+- 1024-tok decode (iter-336 measured): 72.5 tok/s
+
+| Test | Peer | Ours | Ratio |
+|---|---|---|---|
+| tg128 | 103.16 ± 0.39 | 73.6 | **0.713×** |
+| tg1024 | 100.08 ± 0.10 | 72.5 | **0.724×** |
+
+Gap is sustained across decode lengths.  Cited iter-308 number of
+"102 tok/s" was accurate (within +1% of current peer).
+
+### Per-dispatch math (verified)
+
+- Ours: 920 disp/tok × 14.7 µs = 13.5 ms/tok = 74 tok/s ✓
+- Peer: 1417 disp/tok × 7.1 µs = 10.1 ms/tok = 99 tok/s ✓
+
+**Peer pattern: MORE dispatches each doing LESS work per launch.**
+Their per-dispatch wall is 2.07× faster.  We've already coalesced
+into fewer-but-bigger dispatches via per-kernel ports (q6_K nr2, etc.)
+— that lever is exhausted.
+
+To match peer at our current 920 disp/tok, per-dispatch wall must
+drop from 14.7 → ~11 µs (25% reduction).  No single per-kernel port
+delivers that on this scale.
+
+### Phase 7 is now formally the only viable structural close-the-gap path
+
+After 5 iters of Chesterton's-fence-applied falsification (iter-328
+EncoderSession qwen35-only, iter-329 Q5_K matches peer + Q4_K N/A,
+iter-330 F16 KV +0% speed, iter-332 Q8_0/Q5_1 match peer + IQ4_NL
+deferred, iter-333+334 EncoderSession+gemma4-already-at-1CB,
+iter-335 barriers conflict-driven not redundant + UNRETAINED_REFS
++0%), the per-kernel + CPU-side optimization avenue is formally
+exhausted on gemma4.
+
+The remaining 0.71-0.72× → 1.0× gap (~28%) is in:
+1. Per-dispatch kernel execution time (1.81× vs peer)
+2. Possibly: graph-level scheduling / dispatch coalescing decisions
+
+Phase 7 (TQ-HB kernel-fusion redesign) addresses #1 by fusing the
+TQ-HB dequant + norm + GEMV path into single kernels the way peer
+fuses dequant inside its mat-vec kernels.  Multi-week scope.
+
+### Phase 7 design opens next iter
+
+Next /loop iter will produce a Phase 7 design doc:
+- Identify candidate fusion targets (which dequant-norm-GEMV chains)
+- Assess TQ-HB invariants that must be preserved (3.94× memory savings)
+- Propose first prototype kernel
+- Spawn /cfa swarm if appropriate (multi-week scope)
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes (peer-bench measurement only; honest gap re-confirmation).
