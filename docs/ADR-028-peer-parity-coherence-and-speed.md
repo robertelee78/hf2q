@@ -4894,6 +4894,57 @@ candidates:
    batching multiple decode steps, conflicting with single-token
    serving latency.
 
+### iter-182 — production split-timing ground truth + per-layer cost decomposition
+
+Ran `HF2Q_SPLIT_TIMING=1` (in-band production-mode timing, no per-kernel
+sync inflation):
+
+**gemma4 default**:
+- 956 dispatches/token, 459 barriers, **13.5 ms BODY GPU time**
+- Encode (CPU-side): 0.4 ms steady-state (1st token 7.6 ms = JIT compile)
+- Per layer: 956/30 = 31.9 dispatches; 13.5/30 = **450 µs/layer**
+
+**gemma4 Path E+F (USE_DENSE+F16_KV)**:
+- 926 dispatches/token (-30: TQ-HB skips 1 HB-encode/layer), 432 barriers
+- 11.8 ms BODY GPU time (-1.7 ms = +14% throughput)
+- Confirms iter-179 lever: F16-KV path drops a full per-layer kernel
+
+**qwen3.6 35B-A3B** (different code path qwen35/forward_gpu.rs, no SPLIT_TIMING):
+- 132 tok/s = 7.58 ms/token total
+- Estimated body ≈ 6 ms / 40 layers = **150 µs/layer**
+
+**Per-layer ratio**: gemma4 450 µs/layer / qwen3.6 150 µs/layer = **3×**.
+Architecture difference (full-FA + dual-FFN every layer in gemma4 vs
+75% cheap DeltaNet in qwen3.6) explains the per-token deficit.
+
+**Critical-path math**: 459 barriers = 459 sequential GPU phases × avg
+29 µs/phase = 13.5 ms.  To go faster:
+- Reduce barrier count (fuse adjacent dependent stages).
+- Reduce per-phase max kernel time (kernel-impl, already saturated).
+- Reduce dispatch count (saves ~5 µs GPU launch + tiny CPU encode).
+
+**Fusion candidate analysis** (lowest hanging):
+- **B8** has 3 RMS-norms reading same `residual`, writing different
+  outputs.  Already concurrent on GPU.  Fusing into `rms_norm_3way_f32`
+  saves: 2 launches/layer (×30 = 60 dispatches), 2 redundant input
+  reads (60 × 11 KB = 660 KB).  Estimated gain: **~2% throughput**.
+- **B9** has 3 qmatmuls (gate, up, router_proj) reading same `norm_out`.
+  Already concurrent.  Fusing into 3-way-mat-vec saves: 2 input reads
+  + 2 launches.  Different weight tensors → complex fusion.
+  Estimated gain: **~3% throughput** but multi-day kernel work.
+- **B11** dense_down + gate_up_id: already concurrent, max-bound.
+  No fusion benefit.
+
+The largest concrete sub-2-day lever: **build `rms_norm_3way_f32` for B8**,
+expected +2% on gemma4. Not enough to close the 33% gap, but a clean
+incremental win and reusable pattern for future MoE arches.
+
+The 33% gemma4-vs-qwen3.6 deficit is fundamentally **architectural** —
+gemma4 runs FA on every layer (vs qwen3.6's 25% FA + 75% DeltaNet) and
+dual MLP+MoE per layer (vs qwen3.6's MoE-only).  No single-kernel walk
+closes this — only Path E+F (precision tradeoff, +14%) or fundamental
+architecture-spec optimization closes meaningful percentage points.
+
 ## Links
 
 - `ADR-010-exact-batched-kernel-parity.md` — original parity ADR; iter-59..86 entries also live in §Status Log there
