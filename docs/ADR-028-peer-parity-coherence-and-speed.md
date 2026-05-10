@@ -13144,3 +13144,57 @@ Both env-gated, awaiting operator approval for default flips.
 
 No code changes.  V2 kernel already shipped iter-310; iter-320 is
 discovery + lock-in of cross-model benefit.
+
+
+---
+
+## iter-321 — q6_K _id mv nr0=2 (MoE variant), small additive gain
+
+Following iter-309/318 lesson "stacking lever can find marginal
+incremental wins," ported the nr0=2 + cached `yl[16]` pattern to the
+MoE `_id` variant.
+
+### What landed
+
+mlx-native commit 72fd377:
+- `kernel_mul_mv_id_q6_K_f32_nr2` (Metal, ~100 LOC)
+- Env-gated via `HF2Q_Q6K_ID_MV_NR2=1` in `dispatch_id_mv`
+- Parity test (4/4 PASS at 1e-4 across small/large/multi-token/
+  boundary cases)
+
+### Production bench on gemma4 APEX-Q5_K_M (5-run, σ <0.1)
+
+```
+STACK (G+FUSED+V2+NR2):           72.4 tok/s median  (0.711× peer)
+STACK + HF2Q_Q6K_ID_MV_NR2:       72.6 tok/s median  (0.713× peer)
+Delta: +0.3% additive (marginal at edge of significance)
+```
+
+### Coherence
+
+`"What is 2+2?"` → `"2 + 2 = 4<turn|>"` byte-identical.  TQ-HB
+scaffolding intact (kernel only changes how Q6_K _id mat-vec
+computes per-row).
+
+### Updated full-stack recommendation
+
+For maximum TQ-HB-intact gemma4 throughput, the safe-flip stack now
+includes 5 flags:
+
+```
+HF2Q_LMHEAD_Q6K=1
+HF2Q_FUSED_END_OF_LAYER=1
+HF2Q_RMS_NORM_V2=1
+HF2Q_Q6K_MV_NR2=1
+HF2Q_Q6K_ID_MV_NR2=1
+```
+
+Total stacking gain (default 69.2 → 72.6): **+4.9% TQ-HB intact**.
+
+### Files modified
+
+- `/opt/mlx-native/src/shaders/quantized_matmul_id_ggml.metal`
+- `/opt/mlx-native/src/kernel_registry.rs`
+- `/opt/mlx-native/src/ops/quantized_matmul_id_ggml.rs`
+- `/opt/mlx-native/tests/adr_028_iter321_q6k_id_mv_nr2_parity.rs` (NEW)
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section
