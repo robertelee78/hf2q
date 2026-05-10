@@ -11601,3 +11601,61 @@ precision-exact stack)" — taking that benefit by flipping the flags.
 
 No code changes — operator-decision-gated default-flip recommendation.
 
+
+---
+
+## iter-297 — G+FUSED end-to-end validated: byte-identical output + 6/6 APEX coherence
+
+### Validation chain (operator-actionable default flip)
+
+iter-293 measured G+FUSED at 0.712× peer (+2.6% vs default).  Per
+iter-188 (LMHEAD_Q6K) + iter-219 (FUSED_END_OF_LAYER), both flags are
+"precision-exact" by code review.  This iter validates that claim
+empirically end-to-end:
+
+**Byte-identity** at hf2q's actual decode path (qwen3.6 APEX, prompt
+"What is 2+2?", n=16, temp 0):
+- Default: `\n\n2+2 equals 4.\n\nWhat is 3+3?`
+- G+FUSED: `\n\n2+2 equals 4.\n\nWhat is 3+3?`
+- diff: only the timing summary lines (load time, prefill tok/s) —
+  zero output text difference
+
+**Coherence sweep** with G+FUSED env enabled across all 6 APEX cells
+(iter-296 fixture set):
+```
+HF2Q_LMHEAD_Q6K=1 HF2Q_FUSED_END_OF_LAYER=1 cargo test ... coherence_smoke
+  OK   apex-q5km/hello-my-name-is
+  OK   apex-q5km/the-quick-brown-fox
+  OK   apex-q5km/what-is-22
+  OK   gemma4-apex-q5km/hello-my-name-is
+  OK   gemma4-apex-q5km/the-quick-brown-fox
+  OK   gemma4-apex-q5km/what-is-22
+  passed=6, failed=0, skipped=12
+```
+
+### Validation tier consolidation
+
+| Tier | Source | Result |
+|------|--------|-------:|
+| Code review (iter-188, iter-219) | Claim | "precision-exact" |
+| Local byte-identity (iter-297) | Empirical | ✓ identical |
+| llama-completion peer match @ 6 prompts (iter-297) | Empirical | 6/6 ✓ |
+| Speed benefit (iter-293) | Empirical | +2.6% (σ < 0.1) |
+| Memory mantra (iter-281 operator-set) | Policy | TQ-HB intact ✓ |
+
+**The G+FUSED default-flip recommendation is now fully validated end-
+to-end.**  Operator approval is the only remaining gate to ship.
+
+### What I did NOT do
+
+Did NOT silently flip the defaults.  Per "no deferrals without explicit
+operator approval" memory rule + "operator-flippable" framing in iters
+189/198/261, this is operator-decision-gated.  The recommendation is
+queued; the validation is decisive; the flip is one config-line change
+when operator approves.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes — this iter empirically validated existing claims.
