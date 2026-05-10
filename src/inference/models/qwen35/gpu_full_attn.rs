@@ -2433,6 +2433,18 @@ pub fn apply_sdpa_with_kv_cache(
         // qL ∈ [2, 15] remains broken — workaround is the user
         // padding their prompt up to qL >= 16.
         let new_path_eligible = head_dim == 256 && cur_len == 0 && seq_len >= 16;
+        // ADR-028 iter-177: trace branch eligibility for K=1 batched-verify
+        // bug bisect. HF2Q_FA_TRACE=1 prints all booleans + actual branch.
+        let fa_trace =
+            std::env::var("HF2Q_FA_TRACE").as_deref() == Ok("1");
+        if fa_trace {
+            eprintln!(
+                "[FA_TRACE] seq_len={} cur_len={} kv_seq_len={} head_dim={} new_eligible={} slot.k={} slot.v={} slot.tq={}",
+                seq_len, cur_len, (cur_len as u32).saturating_add(seq_len), head_dim,
+                new_path_eligible,
+                slot.k.is_some(), slot.v.is_some(), slot.tq.is_some(),
+            );
+        }
         if new_path_eligible {
             // Dispatch flash_attn_prefill on the chunk seq-major Q/K/V
             // directly. Output is seq-major F32, matching the legacy
@@ -2495,6 +2507,12 @@ pub fn apply_sdpa_with_kv_cache(
         let resume_path_eligible = head_dim == 256
             && cur_len > 0
             && kv_seq_len >= 16;
+        if fa_trace {
+            eprintln!(
+                "[FA_TRACE] resume_eligible={} (will engage if true; else fallback)",
+                resume_path_eligible
+            );
+        }
         if resume_path_eligible {
             let _w5b10_kernel_resume = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FaSdpaKernel,
@@ -2708,7 +2726,26 @@ pub fn build_gated_attn_layer(
     // new_path_eligible check in apply_sdpa_with_kv_cache. cur_len == 0 is
     // guaranteed by prefill-from-zero (the arena is only allocated in
     // forward_gpu_impl when seq_len > 1, and fresh-slot cur_len is always 0).
-    let use_arena = fa_arena.is_some() && seq_len > 1 && head_dim == 256;
+    // ADR-028 iter-177: gate the fused arena fast path on cur_len == 0.
+    // The fast path calls apply_flash_attn_prefill_seq_major_into which
+    // is fresh-prefill-only (assumes cur_len==0). For K=1 batched-verify
+    // mid-stream (seq_len=2, cur_len>0), the fast path silently ignores
+    // prior KV cache contents and emits attention over only the new
+    // tokens — produces coherent-looking but contextually-wrong output
+    // (the 'and gold' loop bug from iter-171/172/175).
+    //
+    // When cur_len > 0, fall through to apply_sdpa_with_kv_cache which
+    // correctly takes the resume_path_eligible branch
+    // (apply_flash_attn_prefill_seq_major_resume), kernel-validated at
+    // qL=2 + kL=130 byte-correct.
+    let cur_len_for_arena = kv_cache_slot
+        .as_deref()
+        .map(|s| s.current_len[0])
+        .unwrap_or(0);
+    let use_arena = fa_arena.is_some()
+        && seq_len > 1
+        && head_dim == 256
+        && cur_len_for_arena == 0;
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;
 
