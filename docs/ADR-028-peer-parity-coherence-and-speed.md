@@ -3829,6 +3829,71 @@ For chosen K:
 
 Total LOC: ~150-300. Multi-iter.
 
+### iter-161: operator pivot back to gemma4 — regression detected
+
+Operator pinged: `gemma4: --- mlx-native: 853 tokens in 13.67s
+(62.4 tok/s) --- -- still` — confirming gemma4 gap to peer
+(llama.cpp 102 tok/s) is "still" present. Pivoting walk-phase
+from qwen36/MTP/spec-decode back to gemma4 for next iter
+sequence.
+
+#### Re-bench at HEAD vs iter-146 fixture (`"Hello, my name is"`)
+
+| Path | iter-146 | now (HEAD) | Δ |
+|------|---:|---:|---:|
+| **Default** (TQ-HB + FA-vec-tq-hb) | 69.3 | **62.5** | -9.8% |
+| **HF2Q_USE_DENSE=1** | 81.5 | **70.9** | -13.0% |
+| llama.cpp peer (HEAD build 9010) | 102.05 | (cached) | — |
+
+Current gap to peer: 0.613× (default), 0.695× (USE_DENSE=1).
+
+#### Bisect ladder (this iter)
+
+| Test | result | conclusion |
+|------|---|---|
+| `HF2Q_HB_DUAL_LEGACY=1` (default-path, revert iter-149 fused HB) | 63.3 ≈ 62.5 | iter-149 fused HB **NOT** the regression source |
+| `HF2Q_USE_DENSE=1 + HF2Q_KV_DUAL_LEGACY=1` (revert iter-145/146 fused KV) | 70.7 ≈ 70.9 | iter-145/146 fused KV **NOT** the regression source |
+
+Both A/B switches identical to default → regression is upstream of
+both wire-ups. **Both paths (default + USE_DENSE) regressed by
+similar magnitude** (-9.8% and -13.0%). Common cause must be in
+shared decode hot path: matmul-vec kernels, norms, LM head, or
+load-time setup.
+
+#### Commits since iter-146 in inference path
+
+Only `ce896f9` (iter-149 fused HB wire-up) touched
+`src/serve/forward_mlx.rs`; iter-149 byte-identical at `HF2Q_HB_DUAL_LEGACY=1`
+(measured this iter, see ladder above). mlx-native added
+`635c8f5` (iter-148 HB encoder) + `a4e8b0f` (iter-145 KV fusion).
+None of these explain USE_DENSE regression.
+
+Other code that landed since iter-146:
+- iter-153..158 qwen36 MTP loading (gemma4 doesn't load MTP heads
+  but still pays GGUF-parse path delta)
+- iter-156 `HF2Q_MTP_PROFILE` env reads (gated, no decode hot path)
+
+#### iter-162 walk-phase target — bisect the 9-13% regression
+
+Use git worktree at `iter-146` commit (`4acdd1a`), build, bench,
+compare. If iter-146 worktree reproduces 81.5 USE_DENSE → roll
+forward by halves to find the offending commit.
+
+If regression source recovers ~7-10 tok/s → 67-72 tok/s default,
+~76-82 USE_DENSE = closes ~25% of the remaining peer gap with no
+quality cost.
+
+#### Standing decision — Three closure paths still apply
+
+Independent of regression: gemma4's structural gap to llama.cpp
+(measured at iter-150 as TQ-HB structural overhead 0.9 ms/tok =
+6%, distributed across 6+ kernel families) requires:
+- **Path E** (USE_DENSE default-flip, +12-18% with token divergence)
+- **Multi-kernel attack** (10-20+ iters at 100-300µs each)
+- Spec-decode (qwen36-only, doesn't apply to gemma4 — no MTP head)
+
+Operator decision still pending on Path E.
+
 ### Three closure paths to the decode mantra-violation
 
 The 4.72 ms decode peer gap (15.83 ms hf2q vs 11.11 ms llama.cpp HEAD)
