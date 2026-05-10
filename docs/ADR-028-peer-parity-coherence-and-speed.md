@@ -7705,6 +7705,51 @@ Summary:
 to prevent silent regression of any SAFE stack as ADR-028 work
 continues.  Single-command operator runner: `bash scripts/adr028_coherence_gate.sh`.
 
+### iter-242 — multi-model coherence gate (gemma4 + qwen3.6)
+
+Extended iter-241 gate to cover **both production models**.  Per
+iter-234 cross-model asymmetry, stack semantics differ by model:
+- gemma4: F16 KV is BROKEN at long context → EXPECTED-FAIL on this model
+- qwen3.6: F16 KV is COHERENT but no-op (MoE not KV-bandwidth-bound)
+
+Refactored signature:
+- `run_stack_with_check $MODEL "$LABEL" $ENV_VARS` (model now a parameter)
+- Per-model existence checks (skip section if model missing, don't fail
+  whole gate)
+- Override env vars: `HF2Q_GEMMA4_MODEL`, `HF2Q_QWEN36_MODEL`
+
+Coverage matrix:
+
+| Model | Stacks tested | Expected outcome |
+|-------|---------------|------------------|
+| gemma4 26B-A4B-it APEX-Q5_K_M | Default, Path E, Path E+G, Path E+G+FUSED | all SAFE → OK |
+| gemma4 26B-A4B-it APEX-Q5_K_M | Path E+F+G (F16 KV) | EXPECTED-FAIL (deprecation signal) |
+| qwen3.6 35B-A3B APEX-Q5_K_M | Default | SAFE → OK |
+| qwen3.6 35B-A3B APEX-Q5_K_M | Default + F16 KV | SAFE on qwen3.6 → OK (per iter-234) |
+
+**End-to-end run at HEAD** (6 stack runs, ~80s total):
+
+```
+Model 1: gemma4 — gemma4-ara-2pass-APEX-Q5_K_M.gguf
+  Default                        : OK  | "# The Eye of Aeons..."
+  Path E                         : OK  | "# The Eye of Aeons..."
+  Path E+G ★ safe flip           : OK  | "# The Eye of Aeons..."
+  Path E+G + FUSED               : OK  | "# The Eye of Aeons..."
+  Path E+F+G (deprecated F16 KV) : FAIL[sentinel]  ← deprecation signal
+
+Model 2: qwen3.6 — APEX-Q5_K_M.gguf
+  Default                        : OK  | "Here's a thinking thinking sequence..."
+  Default + F16 KV (no-op)       : OK  | "Here's a thinking thinking sequence..."
+
+Summary:
+  SAFE stack failures (across all models): 0 (gate-break threshold = 0)
+  EXPECTED-FAIL confirmed (gemma4 F16 KV): 1
+  GATE: PASS (exit 0)
+```
+
+Both production paths now have coherence guarantees against silent
+regression.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
