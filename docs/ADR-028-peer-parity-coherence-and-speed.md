@@ -8322,6 +8322,61 @@ The audit + measurement phase has now produced the *complete cost
 breakdown* of the gap.  Future iterations execute one of these three
 directions; no more analysis without measurement.
 
+### iter-251 — operator pushback + retraction of "0.91× ceiling" claim
+
+Operator objected to base premise:
+> "we're borrowing logic from peers and running on same hardware
+> and rust is as fast as python or c — why the fuck are we slower?"
+
+**The objection lands.**  Reviewing iter-250's claim of "0.91× ceiling
+with TQ preserved" — it was inferred-by-exclusion, not measured:
+
+| iter-250 claim | Actual evidence |
+|----------------|-----------------|
+| "Peer has ~450 dispatches/token" | iter-237 dossier ESTIMATE from reading llama.cpp source.  **Never measured via Metal Capture or counter sampling.** |
+| "Remaining 3 ms is structural TQ-HB cost" | Inferred: 510 excess × 3 µs = 1.53 ms; remaining 3 ms attributed to "kernel efficiency / TQ-HB structural" by exclusion.  **Never directly measured TQ-HB SDPA vs F16 SDPA at same shape.** |
+| "0.91× peer ceiling" | Stacked from above two assumptions.  Falsifiable. |
+
+**The mantra check fails**: "Code+test==truth" + "Never make
+assumptions" — I assumed structural cost without microbench evidence.
+
+**Operator's reasoning is sound**:
+- Same hardware (M5 Max)
+- Same model (gemma4 26B-A4B Q5_K_M)
+- Borrowed logic from peers (per ADR-022 kernel parity work)
+- Rust ≅ C performance for compute kernels
+- → No fundamental reason hf2q should be ≥30% slower
+
+**Real possibilities** (not yet measured):
+1. Our TQ-HB SDPA kernel may be SLOWER than F16 SDPA at the same
+   shape due to specific implementation (codebook gather pattern,
+   per-pos norm scaling order, FWHT-undo loop) — fixable engineering
+2. Per-dispatch CPU overhead in our Rust wrapping layer might be
+   higher than llama.cpp's thin C-level binding — fixable engineering
+3. Dispatch count gap may be smaller than estimated — re-measurement
+   needed
+4. Some buffers we use F32 where peer uses F16 — fixable engineering
+
+**Retraction**: iter-250's "0.91× ceiling" is NOT a measured fact.
+Drop it.  The gap is engineering until proven structural.
+
+**Iter-252+ plan** — exhaust sequential-fusion + kernel optimization
+per operator directive, before DFlash:
+
+1. **MEASURE peer dispatch count actually** — read llama.cpp gemma4
+   dispatches in `/opt/llama.cpp/src/models/gemma4.cpp` line by line,
+   count exact dispatches per layer, multiply by 30.
+2. **MEASURE TQ-HB SDPA vs F16 SDPA at same shape** — write a
+   microbench that runs both kernels at gemma4 decode shape
+   (head_dim=256, kv_seq=1024) and compares GPU time directly.
+3. **MEASURE per-dispatch CPU overhead in hf2q's Rust binding**
+   vs the GPU-only equivalent — find any wrapping-layer overhead.
+4. **Read peer kernels at SAME operations** (RMS norm, mat-vec, etc.)
+   and compare implementations line-by-line.
+
+The path is engineering, not multi-month DFlash.  Find the real cost
+sites by direct measurement; close them one at a time.
+
 Cumulative cost map (12.5 ms body):
 - MoE experts: 2.60 ms (21%)
 - Mat-mul attention: 1.85 ms (15%)
