@@ -17689,3 +17689,76 @@ already knows the multiple constraint.  The hint provides no new information.
 
 ### Investigation count this thread
 33 total: 32 from iter-375 + this iter (parity ✓ infrastructure ✓ no perf win).
+
+## iter-377 — cumulative LANDED state verification (no code change)
+
+### Date
+2026-05-10
+
+### Verification 1: split=2 holds at sustained 1000-tok regime
+
+iter-373's split=2 default flip was bench-validated at 200-tok decode.  Verify
+the same advantage holds at sustained 1000-tok (which exposes thermal
+throttling not seen in 200-tok bursts).
+
+| Cycle | split=2 (default) | split=3 (was) |
+|---|---|---|
+| 1 | 74.3 | 74.1 |
+| 2 | 74.1 | 74.0 |
+| **mean** | **74.20** | **74.05** |
+
+Δ = **+0.20%** sustained (matches +0.18% burst from iter-373).  Win HOLDS
+at sustained throughput.
+
+### Verification 2: cumulative LANDED stack at zero-flag default
+
+Tested 200-tok decode with NO env vars vs explicit iter-321 stack:
+
+| Config | Trial 1 | Trial 2 | Trial 3 | Mean |
+|---|---|---|---|---|
+| ZERO-FLAG (no env vars) | 74.8 | 74.8 | 74.9 | **74.83** |
+| Explicit iter-321 stack | 74.9 | 74.8 | 74.8 | **74.83** |
+
+**Δ = 0.0%** — explicit env vars match default behavior.  All iter-321 stack
+flags are now baked into defaults (HF2Q_LMHEAD_Q6K via iter-326,
+HF2Q_FUSED_END_OF_LAYER via env_default_true, HF2Q_RMS_NORM_V2 via iter-310,
+HF2Q_Q6K_MV_NR2 via iter-326, HF2Q_Q6K_ID_MV_NR2 via iter-321).  No operator
+opt-in required.
+
+### Verification 3: hybrid path at HEAD delivers iter-364 claimed +2.4%
+
+5-pair interleaved A/B with HF2Q_HYBRID_KV=1 (operator opt-in):
+
+| Trial | Legacy default | Hybrid (HF2Q_HYBRID_KV=1) |
+|---|---|---|
+| 1 | 74.9 | 76.8 |
+| 2 | 74.8 | 76.9 |
+| 3 | 74.7 | 76.6 |
+| 4 | 74.8 | 76.9 |
+| 5 | 74.9 | 76.8 |
+| **mean** | **74.82** | **76.80** |
+
+Δ = **+2.65%** (slightly above iter-364's +2.4% claim due to iter-373
+split=2 win compounding).  Matches expectations.
+
+### Cumulative state at HEAD (post-iter-376)
+
+| Path | Default | Pre-thread baseline | Cumulative gain | vs peer 103 |
+|---|---|---|---|---|
+| Legacy decode | 74.82 tok/s | 73.7 (iter-308) | **+1.5%** | 0.726× |
+| Hybrid decode (opt-in) | 76.80 tok/s | 73.7 (iter-308) | **+4.2%** | 0.746× |
+
+5 LANDED phases collectively delivering measurable improvements at default
+(legacy) + operator opt-in (hybrid).  All parity-tested + coherence-verified.
+
+### Falsification count this thread
+34 total: 33 from iter-376 + this iter (verification only, no code change).
+
+### Conclusion (operator-decision-gated path forward unchanged)
+
+Per-iter-tractable optimization avenue formally exhausted.  Remaining
+~25-26% peer gap requires multi-day engineering or operator decision:
+1. Multi-thread encoding port (peer's `n_cb=2`) — multi-day work
+2. Apple Instruments Metal trace — operator GUI required
+3. Pivot to qwen35 / prefill / additional models
+4. Accept current asymptote (0.726× peer legacy / 0.746× peer hybrid)
