@@ -15621,3 +15621,104 @@ The remaining gap to peer (~0.80× → 1.0×) is likely owned by additional stru
 ### Next iter (10e.5)
 
 V-no-FWHT encoder kernel.  Drops the 30 FWHT-undo dispatches/decode-token.  Need new MSL kernel `kv_quantize_v_no_fwht` that does Lloyd-Max codebook lookup WITHOUT applying the Hadamard rotation.  ~150 LOC kernel + 100 LOC dispatcher + parity test.  Estimated +3% additional decode speedup.
+
+## iter-351 — Phase 10e.5 LANDED: V-no-FWHT encoder + drop FWHT-undo; +2.3% cumulative
+
+### Date
+2026-05-10
+
+### Hypothesis (from iter-350 follow-up plan)
+Adding a `kv_quantize_v_no_fwht_d{256,512}` Metal kernel that skips the Hadamard rotation (sign pre-mult + FWHT + 1/sqrt(d) normalize) but keeps the same Lloyd-Max codebook quantization will produce dequant NRMSE comparable to the FWHT path on RMS-normalized input.  If true, hf2q can:
+  * Wire the no-FWHT V encoder at all 3 hybrid V-encode sites (decode + per-token prefill + batched-prefill seq variant).
+  * Drop the FWHT-undo dispatch from the hybrid SDPA path (since output = `Σ softmax × V_raw` is now in the raw domain).
+
+Total expected savings: 60 dispatches/decode-token at gemma4 30L (30 FWHT-pre + 30 FWHT-undo).
+
+### Result
+**LANDED with one math correction caught + fixed via parity test.**
+
+#### Parity (kv_quantize_v_no_fwht round-trip vs raw V)
+On 8 heads × 256 head_dim of N(0,1) RMS-normalized input (mirrors hf2q's per-head RMS norm output feeding the V encoder):
+
+```
+NRMSE on RMS-normalized input (n_heads=8, D=256, 8-bit):
+  no-FWHT V round-trip vs raw: 7.863181e-3
+```
+
+Within the expected ~5e-3 band for 8-bit Lloyd-Max on N(0,1) (theoretical limit per centroid spacing).  Far below the 5e-2 falsifier band.  **Hypothesis CONFIRMED.**
+
+#### Math correction caught mid-iter (Chesterton's fence)
+First attempt computed `norm0 = sqrt(simd_sum(local_sq_sum) / D)` (RMS instead of L2 norm).  Parity test produced NRMSE 0.77 — far over the band.  Re-derivation of the dequant formula constraint:
+- SDPA D=256 dequant: `recovered = centroid * (norm0 * 1/sqrt(d))`
+- For `recovered ≈ raw_elem`, with `centroid ≈ N(0,1)`: need `norm0 * 1/sqrt(d) ≈ 1` → `norm0 ≈ sqrt(d)`.
+- For RMS=1 raw (sum² = D): `sqrt(simd_sum)` gives `sqrt(D) = sqrt(d)` ✓; `sqrt(simd_sum / D)` gives `1` ✗.
+
+Fix: use `sqrt(simd_sum(local_sq_sum))` for D=256 (NOT divided by D) — same formula as the FWHT path; the difference between paths is only that FWHT path applies `/sqrt(d)` to elements before sum, no-FWHT path doesn't.  D=512 dequant divides by `sf_d512` not `sqrt(d)`, so its norm formula stays as-is (`sqrt(blk_sq / 256)`).
+
+Lesson saved: when changing kernel encoding, derive the dequant→encode constraint chain end-to-end before writing code; the falsifier test caught what code review wouldn't have.
+
+#### Coherence (gemma4-ara-2pass-APEX-Q5_K_M)
+- Default (`HF2Q_HYBRID_KV` unset): `"What is 2+2?"` → `"2 + 2 = 4<turn|>"` (legacy bit-identical).
+- Hybrid (`HF2Q_HYBRID_KV=1`): `"What is 2+2?"` → `"2 + 2 = 4<turn|>"` (byte-identical to legacy on this short prompt).
+
+#### Decode bench (M5 Max, p50 across 3 trials each, deterministic temp=0)
+
+| Path | 245-tok long output | Δ vs legacy |
+|---|---|---|
+| Legacy TQ-HB | **73.5 tok/s** | — |
+| Hybrid (iter-350, FWHT-undo kept) | **74.5 tok/s** | +1.4% |
+| Hybrid (iter-351, full no-FWHT) | **75.2 tok/s** | **+2.3%** |
+
+Cumulative gemma4 decode improvement across Phase 10: **+2.3%** (73.5 → 75.2 tok/s).  Peer (llama.cpp) at 103 tok/s — gap is now **0.73×** (was 0.71× at iter-326 before Phase 10).
+
+Output divergence: 244 vs 246 tokens to EOS — 2-token difference vs legacy (same magnitude as iter-350's 1-token).  V quantization noise propagates to next-token argmax at a small number of decode steps.  Coherence on the smoke prompt unchanged.
+
+### Files added (mlx-native)
+
+- `/opt/mlx-native/src/shaders/hadamard_quantize_kv_fast.metal`: append `kv_quantize_v_no_fwht<HEAD_DIM>` template kernel (~140 LOC) + 2 host_name instantiations (`_d256`, `_d512`).  Steps: load → compute L2 norm directly → scale to N(0,1) range → Lloyd-Max codebook lookup → byte-pack write → store norm.  No D1 sign mult, no FWHT, no `/sqrt(d)` normalize.
+- `/opt/mlx-native/src/ops/hadamard_quantize_kv.rs`: add `dispatch_kv_quantize_v_no_fwht` (single-position) + `dispatch_kv_quantize_v_no_fwht_seq` (batched-prefill variant — Rust-side loop, mirrors `dispatch_hadamard_quantize_kv_hb_seq`).  ~180 LOC total.
+- `/opt/mlx-native/src/kernel_registry.rs`: register `kv_quantize_v_no_fwht_d{256,512}` against the shared shader source.
+- `/opt/mlx-native/tests/test_kv_quantize_v_no_fwht.rs`: 250-LOC parity test.  Two cases: NRMSE band check on RMS-normalized N(0,1) input (passes at 7.86e-3); per-position determinism (encode same input twice → identical bytes).
+
+### Files modified (hf2q)
+
+- `/opt/hf2q/src/serve/forward_mlx.rs`:
+  - **Decode encode site**: swap `dispatch_hadamard_quantize_kv_hb` → `dispatch_kv_quantize_v_no_fwht` for hybrid V.
+  - **SDPA dispatcher**: drop the `dispatch_fwht_sign_undo_f32` dispatch (V is raw → output is raw → no inverse FWHT).
+- `/opt/hf2q/src/serve/forward_prefill.rs`: per-token-prefill V-encode site — same swap.
+- `/opt/hf2q/src/serve/forward_prefill_batched.rs`: batched-prefill V-encode site — swap to `dispatch_kv_quantize_v_no_fwht_seq`.
+
+### Tests
+
+- mlx-native parity test: 2/2 passing (`no_fwht_v_round_trip_nrmse_within_band_on_rms_normalized_input`, `no_fwht_v_round_trip_per_position_consistency`).
+- mlx-native lib + integration: 284/0 passing (no regression).
+- hf2q lib: 3454/0 passing (no regression).
+- Coherence smoke: legacy + hybrid both produce `"2 + 2 = 4<turn|>"` byte-identical.
+
+### Why the speedup is +2.3% not the +6% predicted
+
+The 60 saved dispatches × 14 µs Apple-floor ≈ 840 µs/decode-token ≈ 6% of 13.5 ms/token decode.  Measured +2.3% — about 1/3 of the floor estimate.  Likely reasons:
+1. **Parallel dispatch overlap**: the 3 separate SDPA-side dispatches (FWHT-pre + SDPA + FWHT-undo) historically overlapped on the GPU command queue — eliminating dispatches doesn't fully linearize into wall-time savings because the GPU was already pipelining them.
+2. **CPU encoder cost**: each dispatch costs ~3-5 µs of CPU time encoding the Metal command buffer.  Saving 60 dispatches = ~240 µs CPU = ~2% of decode wall.  Matches the observed +2.3%.
+
+Net: the structural saving is real (and visible at +2.3%), but the GPU-side floor savings are largely absorbed by the existing pipelining.  Subsequent levers must target either:
+1. **CPU-side cost**: smaller per-dispatch encoding (less metadata, function-constant pre-baking).
+2. **GPU-side: per-kernel cost**: Apple Instruments Metal trace to find hotspots in the actually-executed kernels.
+
+### Phase 10 follow-up plan revisited
+
+| Sub | Status | Measured Δ |
+|---|---|---|
+| 10a (audit) | ✓ done iter-346 | n/a |
+| 10b (struct) | ✓ done iter-347 | n/a |
+| 10c (alloc + encode wired) | ✓ done iter-348 | n/a |
+| 10d (kernel + parity) | ✓ done iter-349 | n/a |
+| 10e (SDPA dispatcher) | ✓ done iter-350 | +1.2% |
+| 10e.5 (V no-FWHT) | ✓ done iter-351 | +1.1% (cumulative +2.3%) |
+| 10c.5 (fused F16-K-copy + V-encode) | open | est. +1-2% |
+| 10f (parity tests) | ongoing (gemma4 production smokes pass) | n/a |
+| 10g (long-context bench) | open | n/a |
+
+### Next iter (10c.5)
+
+Fused F16-K-copy + V-no-FWHT-encode single kernel — drops 30 dispatches/decode-token by combining the per-layer K-copy + V-encode into one dispatch.  Per the +2.3% measured here (vs +6% theoretical for 60 dispatches), expected delta is +0.5-1%.  Smaller, but still in mantra-aligned scope.

@@ -3093,8 +3093,12 @@ impl MlxModelWeights {
                                 cache_pos_val,
                             ).map_err(|e| anyhow::anyhow!("hybrid F16 K copy L{layer_idx}: {e}"))?;
                             total_dispatches += 1;
-                            // V-only TQ-HB encode (existing single-buffer dispatcher).
-                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                            // ADR-028 Phase 10e.5 (iter-351): V-only no-FWHT
+                            // encode.  Stores raw V (Lloyd-Max quantized but
+                            // NOT Hadamard-rotated).  Combined with hybrid F16
+                            // K and the FWHT-undo skip below at SDPA dispatch,
+                            // eliminates the entire FWHT chain in attention.
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_kv_quantize_v_no_fwht(
                                 s.encoder_mut(), reg, metal_dev,
                                 v_src,
                                 &hybrid_kv[layer_idx].v_packed,
@@ -3105,7 +3109,7 @@ impl MlxModelWeights {
                                 hybrid_kv[layer_idx].is_sliding,
                                 tq_scale_factor_d512,
                                 tq_codebook_bits,
-                            ).map_err(|e| anyhow::anyhow!("hybrid V TQ-HB encode L{layer_idx}: {e}"))?;
+                            ).map_err(|e| anyhow::anyhow!("hybrid V no-FWHT encode L{layer_idx}: {e}"))?;
                             total_dispatches += 1;
                         }
                     } else if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
@@ -3760,22 +3764,17 @@ impl MlxModelWeights {
                     if INVESTIGATION_ENV.hybrid_kv {
                         // ADR-028 Phase 10e (iter-350): hybrid F16-K + TQ-HB-V SDPA.
                         //
-                        // FWHT chain reasoning (corrected mid-iter after garbage
-                        // output observed at first attempt):
-                        //   * K stored RAW F16 → Q stays raw, K-side dot computes
-                        //     `<Q, K_raw> = <Q, K>` correctly. NO fwht_sign_premult
-                        //     dispatch needed for Q (saves 30 dispatches/token at
-                        //     gemma4 30L).
-                        //   * V stored ROTATED (Phase 10c V-encode still calls
-                        //     `dispatch_hadamard_quantize_kv_hb` which applies the
-                        //     Hadamard rotation; we did NOT add a no-FWHT V encoder).
-                        //     SDPA output = `softmax × V_rot = FWHT(output_raw)` by
-                        //     FWHT linearity. So output IS in the rotated domain;
-                        //     we MUST apply `dispatch_fwht_sign_undo_f32` after.
+                        // FWHT chain reasoning (Phase 10e initial wiring iter-350
+                        // kept FWHT-undo because V was FWHT-rotated; Phase 10e.5
+                        // iter-351 swapped V-encode to `kv_quantize_v_no_fwht`,
+                        // which stores raw V — so output is now in raw domain):
+                        //   * K stored RAW F16 → Q stays raw, NO fwht_sign_premult.
+                        //   * V stored RAW (Phase 10e.5 V-encode dispatcher) → SDPA
+                        //     output = softmax × V_raw → output IS raw → NO
+                        //     fwht_sign_undo dispatch needed.
                         //
-                        // Net dispatch saving: 30 dispatches/token (FWHT-pre only).
-                        // Follow-up (Phase 10e.5): add a no-FWHT V encoder kernel
-                        // to also drop the 30 FWHT-undo dispatches → 60 total.
+                        // Net dispatch saving: 60 dispatches/decode-token at gemma4
+                        // 30L (the entire FWHT chain in attention is eliminated).
                         let hybrid_kv = self.hybrid_kv.as_ref().ok_or_else(|| anyhow::anyhow!(
                             "HF2Q_HYBRID_KV=1 but hybrid_kv buffers not allocated \
                              (gemma4 decode L{layer_idx}); should have been allocated \
@@ -3829,21 +3828,10 @@ impl MlxModelWeights {
                             &p_hyb,
                         ).map_err(|e| anyhow::anyhow!("flash_attn_vec_hybrid L{layer_idx}: {e}"))?;
                         total_dispatches += 2; // main + reduce (conservative)
-
-                        // Inverse-rotate SDPA output: V was FWHT-encoded, so output
-                        // = FWHT(output_raw); the rest of the layer (o_proj etc.)
-                        // expects raw-domain values. Same dispatch as the legacy
-                        // TQ-HB path's FWHT-undo at line ~3893.
-                        s.barrier_between(
-                            &[&self.activations.sdpa_out],
-                            &[&self.activations.sdpa_out],
-                        );
-                        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
-                            s.encoder_mut(), reg, metal_dev,
-                            &self.activations.sdpa_out,
-                            nh as u32, hd as u32,
-                        ).map_err(|e| anyhow::anyhow!("hybrid FWHT sign-undo L{layer_idx}: {e}"))?;
-                        total_dispatches += 1;
+                        // ADR-028 Phase 10e.5 (iter-351): NO fwht_sign_undo on output.
+                        // V is raw (Lloyd-Max quantized but not FWHT-rotated), so
+                        // SDPA output is already in the raw domain — feed directly
+                        // to o_proj.
                         // Hybrid path complete; fall through to o_proj/MLP without
                         // entering the legacy `if let Some(ref leg_hb_enc) ...` block
                         // below (`leg_hb_encoded` is `None` under hybrid_kv per the

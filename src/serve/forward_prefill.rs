@@ -1272,15 +1272,15 @@ impl MlxModelWeights {
                                 &hybrid_kv[layer_idx].k,
                                 nkv as u32, hd as u32, hb_cap as u32, hb_write_slot,
                             ).map_err(|e| anyhow::anyhow!("prefill hybrid F16 K L{layer_idx} T{tok_i}: {e}"))?;
-                            // V-only TQ-HB encode.
-                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                            // ADR-028 Phase 10e.5 (iter-351): V-only no-FWHT encode.
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_kv_quantize_v_no_fwht(
                                 s.encoder_mut(), reg, metal_dev,
                                 v_src,
                                 &hybrid_kv[layer_idx].v_packed,
                                 &hybrid_kv[layer_idx].v_norms,
                                 nkv as u32, hd as u32, hb_cap as u32, hb_write_slot,
                                 hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
-                            ).map_err(|e| anyhow::anyhow!("prefill hybrid V TQ-HB L{layer_idx} T{tok_i}: {e}"))?;
+                            ).map_err(|e| anyhow::anyhow!("prefill hybrid V no-FWHT L{layer_idx} T{tok_i}: {e}"))?;
                         }
                     } else if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
                         let hb_cap = leg_hb_enc[layer_idx].capacity;

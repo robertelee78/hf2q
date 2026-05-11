@@ -1436,7 +1436,8 @@ impl MlxModelWeights {
                                 nkv as u32, hd as u32,
                                 hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
                             ).map_err(|e| anyhow::anyhow!("batched hybrid F16 K L{layer_idx}: {e}"))?;
-                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
+                            // ADR-028 Phase 10e.5 (iter-351): batched-prefill V no-FWHT.
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_kv_quantize_v_no_fwht_seq(
                                 s.encoder_mut(), reg, metal_dev,
                                 &pf_v_normed,
                                 &hybrid_kv[layer_idx].v_packed,
@@ -1444,7 +1445,7 @@ impl MlxModelWeights {
                                 nkv as u32, hd as u32,
                                 hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
                                 hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
-                            ).map_err(|e| anyhow::anyhow!("batched hybrid V TQ-HB L{layer_idx}: {e}"))?;
+                            ).map_err(|e| anyhow::anyhow!("batched hybrid V no-FWHT L{layer_idx}: {e}"))?;
                         }
                     } else if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
                         let hb_cap = leg_hb_enc[layer_idx].capacity as u32;
