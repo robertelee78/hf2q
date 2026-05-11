@@ -5831,10 +5831,28 @@ impl MlxModelWeights {
                 1, hs as u32,
             ).map_err(|e| anyhow::anyhow!("final norm: {e}"))?;
 
-            // iter-144: kernel-profile lm_head — match production path at 4051+:
-            // prefer Q8_0 (auto-picked for big-vocab models like gemma4 262144),
-            // fall back to F16 if no Q8_0 weight present.
-            if let Some(ref q8) = self.lm_head_q8 {
+            // ADR-029 §Decision item 3: kernel-profile lm_head — mirror
+            // production single-session path at ~4818: prefer Q6_K-native
+            // (HF2Q_LMHEAD_Q6K=1, ADR-028 iter-188/345, default-on when
+            // token_embd.weight is Q6_K on-disk), then Q8_0 (auto for
+            // big-vocab models like gemma4 262144), then F16 dense.
+            //
+            // Pre-ADR-029 this path only checked Q8_0/F16 and hard-failed
+            // on gemma4-APEX-Q5_K_M (Q6_K token_embd) — blocking all
+            // per-kernel-type buckets needed for MoE-1/-2/-3 audits.
+            if let Some(ref q6k) = self.lm_head_q6k {
+                s.barrier_between(
+                    &[&self.activations.norm_out, &q6k.buffer],
+                    &[&self.activations.logits],
+                );
+                dispatch_qmatmul(
+                    &mut s, reg, dev,
+                    &self.activations.norm_out,
+                    q6k,
+                    &self.activations.logits,
+                    1,
+                )?;
+            } else if let Some(ref q8) = self.lm_head_q8 {
                 s.barrier_between(
                     &[&self.activations.norm_out, &q8.buffer],
                     &[&self.activations.logits],
@@ -5868,7 +5886,9 @@ impl MlxModelWeights {
                     vocab_size, CastDirection::F16ToF32,
                 ).map_err(|e| anyhow::anyhow!("cast F16->F32: {e}"))?;
             } else {
-                anyhow::bail!("Kernel profile requires GPU lm_head (Q8_0 or F16 weight)");
+                anyhow::bail!(
+                    "Kernel profile requires GPU lm_head (Q6_K, Q8_0, or F16 weight)"
+                );
             }
 
             // Softcap (params pre-initialized at model load time)
