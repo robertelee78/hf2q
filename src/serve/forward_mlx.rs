@@ -4235,6 +4235,21 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
+                // ADR-029 iter-9 — phase split at attn/ffn boundary.
+                // HF2Q_PER_LAYER_PHASE_GPU_TIME=1 commits the attn portion
+                // and reports its GPU time, then begins a new session for ffn.
+                if std::env::var("HF2Q_PER_LAYER_PHASE_GPU_TIME").as_deref() == Ok("1") {
+                    let gpu_ns: u64 = s.finish_with_gpu_time()
+                        .map_err(|e| anyhow::anyhow!("phase-attn finish L{layer_idx}: {e}"))?;
+                    eprintln!("    [PHASE_ATTN L{:02} {}] gpu={:>6.1}µs",
+                        layer_idx,
+                        if is_sliding { "S" } else { "G" },
+                        gpu_ns as f64 / 1000.0);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("phase-attn begin L{layer_idx}: {e}"))?;
+                    s.track_dispatch(&[],
+                        &[&self.activations.hidden, &self.activations.attn_out]);
+                }
+
                 let num_experts = self.num_experts;
                 let top_k = self.layers[layer_idx].moe.top_k;
 
@@ -4700,6 +4715,26 @@ impl MlxModelWeights {
                         is_sliding,
                         layer_disp_end - layer_disp_start,
                     ));
+                }
+
+                // ADR-029 iter-9 — per-layer GPU TIME ground truth.
+                // HF2Q_PER_LAYER_GPU_TIME=1 commits the session per-layer
+                // and records GPU wall-clock via finish_with_gpu_time.
+                // HF2Q_PER_LAYER_PHASE_GPU_TIME=1 also commits at the
+                // attn/ffn boundary, so this commit at end-of-layer
+                // reports just the FFN+EOL phase.
+                let phase_split = std::env::var("HF2Q_PER_LAYER_PHASE_GPU_TIME").as_deref() == Ok("1");
+                let per_layer = std::env::var("HF2Q_PER_LAYER_GPU_TIME").as_deref() == Ok("1");
+                if per_layer || phase_split {
+                    let gpu_ns: u64 = s.finish_with_gpu_time()
+                        .map_err(|e| anyhow::anyhow!("per-layer finish L{layer_idx}: {e}"))?;
+                    let label = if phase_split { "PHASE_FFN" } else { "PER_LAYER_GPU" };
+                    eprintln!("    [{label} L{:02} {}] gpu={:>6.1}µs",
+                        layer_idx,
+                        if is_sliding { "S" } else { "G" },
+                        gpu_ns as f64 / 1000.0);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("per-layer-gpu-time begin L{layer_idx}: {e}"))?;
+                    s.track_dispatch(&[], &[&self.activations.hidden]);
                 }
 
                 // ADR-009 Phase 3A: per-layer hidden state dump.
