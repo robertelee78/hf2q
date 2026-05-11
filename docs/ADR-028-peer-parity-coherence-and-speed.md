@@ -24004,3 +24004,49 @@ Future default-flip path (operator decision):
 
 The tokenizer opt-in is the **first concrete startup lever shipped**
 in this thread.  Remaining (mmap) is architectural multi-iter work.
+
+## iter-467 — Phase 15 + tokenizer opt-in combo stability check
+
+### Hypothesis
+iter-466 shipped HF2Q_TOKENIZER_GGUF_EMBEDDED opt-in.  Verify it
+composes cleanly with Phase 15 default-on across varied request types.
+
+### Method
+hf2q serve with both `HF2Q_TOKENIZER_GGUF_EMBEDDED=1` + Phase 15
+default-on.  Three test classes:
+1. 10 varied short prompts (max=30)
+2. 4 sequential quick prompts (max=15)
+3. 1 long-gen streaming (max=200)
+
+### Results
+
+| Test | Outcome |
+|---|---|
+| 10 varied short prompts | **10/10 success** |
+| 4 sequential quick | 4/4 finish_reason=length (correct) |
+| Long-gen 200 max | 48 tok in 788 ms = 61 tok/s |
+
+All requests produce valid JSON responses with proper finish_reason.
+No coherence regressions; no error responses.
+
+### Stability verified for combo
+- Phase 15 default-on (serve batched prefill)
+- HF2Q_TOKENIZER_GGUF_EMBEDDED=1 (faster startup)
+- Default Q6_K lm_head
+- Default TQ-HB KV cache (3.94× memory savings)
+
+All compose cleanly on gemma4-ara-2pass-APEX-Q5_K_M.gguf.
+
+### Investigation count this thread
+124 total: 123 from iter-466 + this iter (combo stability).
+
+### Cumulative production state at HEAD
+- Startup: **3.29 sec default** / **3.09 sec with TOKENIZER opt-in**
+- Prefill: 0.94× peer (Phase 15)
+- Decode: 0.69× pure peer / 0.92× e2e
+- Coherence: TIED with peer on tested prompts
+- All concurrent/sequential/long-gen paths stable
+
+Two operator-actionable flags shipped this thread:
+1. **HF2Q_SERVE_BATCHED_PREFILL** (iter-421 default-on): 35-43× prefill
+2. **HF2Q_TOKENIZER_GGUF_EMBEDDED** (iter-466 opt-in): -200 ms startup
