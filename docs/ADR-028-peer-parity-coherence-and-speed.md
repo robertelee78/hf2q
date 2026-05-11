@@ -21579,3 +21579,71 @@ or formally exhausted (per-kernel optimization).
 ### No new lever
 Confirms the operator decision matrix.  Phase 15 is the dominant
 production speedup; remaining e2e gap is the structural decode floor.
+
+## iter-429 — Apple Metal4 tensor_ops::matmul2d peer parity confirmed
+
+### Hypothesis
+Peer's startup log says "has tensor = true" + uses
+`mpp::tensor_ops::matmul2d` (Apple Metal4 cooperative tensor /
+AMX hardware).  If hf2q misses this, it's a structural decode lever.
+
+### Method
+1. Search /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal for
+   tensor_ops usage
+2. Search /opt/mlx-native/src/shaders/ for same
+3. Verify production tensor probe via MLX_LOG_TENSOR_PROBE=1
+
+### Findings
+
+**Peer**: uses `mpp::tensor_ops::matmul2d` at lines 9363-9806 of
+ggml-metal.metal.  Metal4 cooperative tensor.
+
+**hf2q**:
+- `dense_mm_bf16_tensor.metal` — line 142: `using namespace
+  mpp::tensor_ops` + `matmul2d` invocation
+- `dense_mm_f16_tensor.metal` — same
+- `dense_mm_f32_f32.metal` — same
+- `quantized_matmul_id_mm_tensor.metal` — tensor MoE _id
+- `qmm_affine_t_packed_simd4_b4.metal` — quantized affine via tensor
+
+Tensor variants exist for: Q4_0, Q4_K, Q5_K, Q5_1, Q6_K, Q8_0,
+IQ4_NL × {mm, mm_id, mm_tensor, mm_id_tensor}.
+
+**Production verification** (MLX_LOG_TENSOR_PROBE=1):
+```
+[mlx-native] tensor_mm probe: OK (using tensor variant)
+[mlx-native] tensor_mm_id probe: OK (using tensor variant for MoE)
+```
+
+Both dense and MoE _id paths engage Apple Metal4 tensor_ops at
+runtime on M5 Max.
+
+### Significance
+hf2q is at PEER-PARITY for Apple Metal4 tensor cores.  All major
+matmul kernels (QKV_MM, O_MM, MLP_GUR_MM, MLP_DN_MM, MOE_GATE_UP,
+MOE_DOWN) use AMX hardware via `mpp::tensor_ops::matmul2d`.
+
+This is not a missing optimization — it's already shipped.
+
+### Implication for decode gap
+The decode 0.726× peer gap is not from missing tensor cores.  Both
+hf2q and peer use AMX-equivalent acceleration.  The gap must come
+from:
+- Per-dispatch CPU launch latency (iter-397 GPU 93% bound)
+- Different shared-memory layouts (already-tuned per iter-426 Q-tile
+  parity)
+- Subtle pipeline scheduling differences
+
+All are within hardware floor / multi-iter engineering scope.
+
+### Investigation count this thread
+86 total: 85 from iter-428 + this iter (tensor_ops parity confirmed).
+
+### No new lever
+Yet another peer-pattern confirmation.  hf2q is structurally at
+peer-equivalent kernel-level optimization across:
+- blk skip (FA) ✓
+- tensor_ops matmul (AMX) ✓
+- BF16 K storage ✓
+- Q-tile size / NSG ✓
+- Dispatch-latency floor ✓
