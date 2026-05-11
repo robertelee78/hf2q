@@ -16686,3 +16686,70 @@ V2-port pattern formally exhausted in gemma4 decode hot path.  21 falsifications
 - All V2 parity tests: 27/0 passing (25 rms_norm + 2 V2 fused_post_ff_norm2 + 2 V2 fused_moe_routing).
 - hf2q lib: 3454/0 passing.
 - No code change shipped this iter (audit + falsification only).
+
+## iter-365 — float4-vectorize moe_weighted_sum FALSIFIED (-0.04%, 22nd falsification)
+
+### Date
+2026-05-10
+
+### Hypothesis
+Iter-364's audit dismissed embarrassingly-parallel kernels because V2 (reduction
+optimization) doesn't apply — but float4 vectorization is an *orthogonal* lever.
+`moe_weighted_sum` is the largest unexamined memory-bound kernel in the decode
+hot path (3.41% of dispatches): 8 strided loads + 8 broadcast weight loads + 1
+fmadd per element, no reduction.  Predicted +0.1-0.3% from float4 packing
+reducing the launch grid by 4× and issuing one 16-byte load per thread instead
+of 4 separate 4-byte loads.
+
+### Implementation (prototyped, parity-validated, then reverted)
+
+Added `moe_weighted_sum_f32_v2` in `moe_dispatch.metal` with float4 reads of
+expert_outputs and float4 stores of output.  Each lane has its own k-loop
+accumulator (independent reductions).  Dispatcher path default-ON via
+`HF2Q_MOE_WEIGHTED_SUM_V2` env flag with `hidden_size % 4 == 0` gate.
+
+### Parity (byte-identical)
+```
+v2_parity_gemma4_moe_weighted_sum_top8_h3584: max_abs=0.0e0 max_rel=0.0e0
+v2_parity_qwen35_moe_weighted_sum_top8_h5120: max_abs=0.0e0 max_rel=0.0e0
+```
+2/2 tests pass with max_abs = 0.0 at both gemma4 (hidden=3584, top_k=8) and
+qwen35 (hidden=5120, top_k=8) production shapes.
+
+### Bench (gemma4-ara-2pass-APEX-Q5_K_M, 200-tok decode, 3 runs)
+
+| Config | Run 1 | Run 2 | Run 3 | Mean |
+|---|---|---|---|---|
+| V1 (HF2Q_MOE_WEIGHTED_SUM_V2=0) | 74.8 | 74.8 | 74.6 | **74.73** |
+| V2 (HF2Q_MOE_WEIGHTED_SUM_V2=1) | 74.7 | 74.7 | 74.7 | **74.70** |
+
+Δ = **-0.04%** — within run-to-run noise.  FALSIFIED.
+
+### Root cause analysis
+
+Apple Metal's compiler aggressively auto-coalesces consecutive scalar loads in
+adjacent SIMD lanes into the same 16-byte cache line.  For `expert_outputs[k *
+hidden + tid]` with 32 threads of a SIMD group accessing tid = base..base+31,
+the hardware already issues a single 128-byte cache-line read serving all 32
+threads.  Manual float4 packing produces the same hardware access pattern.
+
+Iter-364's audit was correct: V2 + float4 cannot improve `moe_weighted_sum`
+because the kernel is already optimal for Apple Metal's coalesced-load
+hardware.  The "orthogonal lever" hypothesis was wrong — vectorization and
+coalescing produce the SAME hardware behavior on Apple GPU; only reductions
+benefit from V2.
+
+### Action
+
+Reverted in full per "no unused code" rule.  Kernel + dispatcher V2 path +
+parity test file all removed.  Falsification documented in ADR (this iter) and
+in a code comment at the `moe_weighted_sum` kernel site.
+
+### Falsification count this thread
+
+22 total: 21 from iter-364 + this iter.
+
+### Tests + bench
+- mlx-native lib: 284/0 passing (no test count change — V2 test removed alongside kernel).
+- hf2q lib: 3454/0 passing.
+- Coherence unchanged: gemma4 "What is 2+2?" → "2 + 2 = 4<turn|>".
