@@ -16753,3 +16753,84 @@ in a code comment at the `moe_weighted_sum` kernel site.
 - mlx-native lib: 284/0 passing (no test count change — V2 test removed alongside kernel).
 - hf2q lib: 3454/0 passing.
 - Coherence unchanged: gemma4 "What is 2+2?" → "2 + 2 = 4<turn|>".
+
+## iter-366 — wiring dead-code fused_moe_wsum_norm_add FALSIFIED (-4.8%, 23rd falsification)
+
+### Date
+2026-05-10
+
+### Discovery
+While auditing for fusion opportunities, found `dispatch_fused_moe_wsum_norm_add_f32`
+in mlx-native (commit 99b2f8f, Apr 19 2026) — a kernel built for prefill
+"Wave P4.13" that fuses `moe_weighted_sum + fused_norm_add` into one dispatch.
+**Zero call sites in either repo.**  The kernel is dead code awaiting wiring.
+
+### Hypothesis
+Wire it into gemma4 decode Path B (HF2Q_FUSED_END_OF_LAYER=0) replacing the
+2-dispatch chain.  Predicted savings: 1 dispatch/layer (~14.7 µs CPU × 30 = 441
+µs/token = 3.3% of 13.5 ms wall) + 1 GPU memory round-trip on `moe_accum`.
+
+### Parity (passed)
+```
+parity_gemma4_decode_dim3584_top8: max_abs=0.0e0  max_rel=0.0e0  ★ byte-identical
+parity_qwen35_decode_dim5120_top8: max_abs=9.5367e-7  max_rel=8.9582e-5
+```
+At gemma4 production shape (dim=3584, top_k=8) byte-identical with the chain.
+At qwen35 (dim=5120) max_rel = 8.96e-5 (within ADR-028's standing 1e-4 budget;
+arises from V2 simd_sum reduction order in the chain vs scalar tree-reduce in
+the fused kernel).
+
+Required `enc.memory_barrier()` between `moe_weighted_sum_encode` and
+`dispatch_fused_norm_add_f32` in the chain test — they have RAW dependency
+on the moe_accum buffer.  Initial test without barrier produced garbage
+(catalogued in `feedback_metal_raw_barrier_per_dispatch.md`).
+
+### Bench (gemma4-ara-2pass-APEX-Q5_K_M, 200-tok decode, 3 runs each, HF2Q_FUSED_END_OF_LAYER=0)
+
+| Config | Run 1 | Run 2 | Run 3 | Mean |
+|---|---|---|---|---|
+| Path B baseline (chain) | 73.9 | 73.9 | 73.7 | **73.83** |
+| Path B + iter-366 fused | 70.3 | 70.5 | 70.1 | **70.30** |
+
+Δ = **-4.8%** (NEGATIVE).  Fusion is SLOWER.  FALSIFIED.
+
+### Root cause
+Per-dispatch GPU compute time matters more than per-token dispatch count when
+the kernels involved have different reduction patterns:
+- Chain dispatches: scalar `moe_weighted_sum` (1 thread/element, no reduction) +
+  `fused_norm_add_f32_v2` (simd_sum + per-SG staging, 4 barriers/dispatch).
+  Total: 4 barriers + 1 cheap kernel.
+- Fused dispatch: scalar tree-reduce (16 barriers/dispatch at tg=256).
+  Total: 16 barriers, all in one kernel.
+
+The 12 extra barriers in the fused kernel cost more than the 14.7 µs CPU saved
+by eliminating one dispatch.  Same lesson as iter-310/331/337/362's V2 ports:
+on Apple Metal, simd_sum reduction beats scalar tree-reduce for any kernel
+big enough to need barriers — and that wins outweigh dispatch-count savings.
+
+### Action
+
+Wiring reverted in full from `forward_decode`.  Kernel left in mlx-native
+(public API, unused) with iter-366 falsification doc-comment added at
+`dispatch_fused_moe_wsum_norm_add_f32` (lines 327-336).  Parity test removed
+per "no unused code" rule.
+
+### Path forward (not committed; iter-367+ scope decision)
+
+To make this fusion productive at gemma4 decode would require a V2-port:
+`fused_moe_wsum_norm_add_f32_v2` using simd_sum + per-SG staging matching the
+chain's V2 reduction.  Potential ~1-3% if the V2 port lands and beats the
+chain.  Could be paired with the bigger structural change of ALSO fusing the
+moe_weighted_sum into `fused_post_ff_norm2_endlayer_f32_v2` (the Path A,
+default-on, end-of-layer kernel) — a more ambitious fusion that would help
+the production decode default.
+
+### Falsification count this thread
+
+23 total: 22 from iter-365 + this iter.
+
+### Tests + bench
+- mlx-native lib: 284/0 passing.
+- hf2q lib: 3454/0 passing.
+- Coherence verified: gemma4 "What is 2+2?" → "2 + 2 = 4<turn|>" intact under both
+  Path B baseline and fusion-attempt (parity-equivalent output before bench-revert).
