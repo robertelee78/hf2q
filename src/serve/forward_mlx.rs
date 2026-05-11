@@ -3083,24 +3083,18 @@ impl MlxModelWeights {
                                 &[&hybrid_kv[layer_idx].k,
                                   &hybrid_kv[layer_idx].v_packed, &hybrid_kv[layer_idx].v_norms],
                             );
-                            // F32 K → F16 K cache (peer-equivalent K layout).
-                            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
+                            // ADR-028 Phase 10c.5 (iter-354): fused F16-K-copy +
+                            // V-no-FWHT-encode in a single dispatch (Z-dim splits
+                            // K and V streams).  Byte-identical to the prior
+                            // 2-dispatch sequence at identical params (verified
+                            // via test_kv_copy_kf16_quantize_v_no_fwht_parity).
+                            // Saves 30 KV-write dispatches/decode-token at gemma4
+                            // 30L.
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_kv_copy_kf16_quantize_v_no_fwht(
                                 s.encoder_mut(), reg, metal_dev,
                                 &self.activations.attn_k_normed,
-                                &hybrid_kv[layer_idx].k,
-                                nkv as u32, hd as u32,
-                                hybrid_kv[layer_idx].capacity as u32,
-                                cache_pos_val,
-                            ).map_err(|e| anyhow::anyhow!("hybrid F16 K copy L{layer_idx}: {e}"))?;
-                            total_dispatches += 1;
-                            // ADR-028 Phase 10e.5 (iter-351): V-only no-FWHT
-                            // encode.  Stores raw V (Lloyd-Max quantized but
-                            // NOT Hadamard-rotated).  Combined with hybrid F16
-                            // K and the FWHT-undo skip below at SDPA dispatch,
-                            // eliminates the entire FWHT chain in attention.
-                            mlx_native::ops::hadamard_quantize_kv::dispatch_kv_quantize_v_no_fwht(
-                                s.encoder_mut(), reg, metal_dev,
                                 v_src,
+                                &hybrid_kv[layer_idx].k,
                                 &hybrid_kv[layer_idx].v_packed,
                                 &hybrid_kv[layer_idx].v_norms,
                                 nkv as u32, hd as u32,
@@ -3109,7 +3103,7 @@ impl MlxModelWeights {
                                 hybrid_kv[layer_idx].is_sliding,
                                 tq_scale_factor_d512,
                                 tq_codebook_bits,
-                            ).map_err(|e| anyhow::anyhow!("hybrid V no-FWHT encode L{layer_idx}: {e}"))?;
+                            ).map_err(|e| anyhow::anyhow!("hybrid fused KV write L{layer_idx}: {e}"))?;
                             total_dispatches += 1;
                         }
                     } else if let Some(ref leg_hb_enc) = self.leg_hb_encoded {

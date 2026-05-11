@@ -15914,3 +15914,92 @@ The +2.3% from Phase 10 is real; the path to 100%+ peer parity requires changes 
 
 - All 3454/0 hf2q lib tests + 284/0 mlx-native lib tests still passing.
 - HEAD bench unchanged from iter-352 baseline (73.6 legacy / 75.0 hybrid).
+
+## iter-354 — Phase 10c.5 LANDED: fused F16-K + V-no-FWHT-encode kernel; +2.4% cumulative
+
+### Date
+2026-05-10
+
+### Hypothesis (from iter-353 plan)
+Combining the hybrid path's two stand-alone KV-write dispatches (`dispatch_kv_cache_copy_batch_f32_to_f16` for K and `dispatch_kv_quantize_v_no_fwht` for V) into a single fused dispatch via grid Z-dim should:
+1. Drop 30 dispatches/decode-token at gemma4 30L (saving ~0.4 ms theoretical → ~+1% per iter-351 measured-vs-theoretical ratio).
+2. Preserve byte-identical output (same math per stream as the stand-alone counterparts).
+
+### Result
+**LANDED.**  Coherent.  +0.3 tok/s vs iter-351 baseline (75.2 → 75.5).  Cumulative Phase 10 = **+2.4%** vs legacy TQ-HB (73.7 baseline).
+
+#### Bench (gemma4-ara-2pass-APEX-Q5_K_M, M5 Max, p50 across 3 trials, deterministic temp=0)
+
+| Path | tok/s | Δ vs legacy | Δ vs prior iter |
+|---|---|---|---|
+| Legacy TQ-HB (baseline) | 73.7 | — | — |
+| Hybrid post-10e (iter-350) | 74.5 | +1.1% | +1.1% |
+| Hybrid post-10e.5 (iter-351) | 75.2 | +2.0% | +0.9% |
+| **Hybrid post-10c.5 (iter-354)** | **75.5** | **+2.4%** | **+0.4%** |
+
+Peer (llama.cpp): 103.33 tok/s.  Gap: 0.728× → **0.731× peer** (closes ~0.3pp on the 27.2pp gap).
+
+#### Dispatch reduction confirmed
+
+```
+HF2Q_HYBRID_KV=1, 100-tok decode at HEAD:
+  dispatches/decode_tok = 861.30  (was 905.0 at iter-352, -44/tok)
+  cmd_bufs/decode_tok   = 1.9800   (unchanged — dual_buffer split-3 still optimum)
+  barriers/decode_tok   = 478.17   (was 507.87 at iter-352, -30/tok)
+```
+
+The 30-dispatch saving from per-layer fusion materialized as a measurable -44 dispatches and -30 barriers per token (the extra 14 dispatch reduction comes from secondary effects — eg. the fused dispatch eliminates one `barrier_between` call too).
+
+#### Coherence
+- Default (`HF2Q_HYBRID_KV` unset): `"What is 2+2?"` → `"2 + 2 = 4<turn|>"` (legacy bit-identical).
+- Hybrid (`HF2Q_HYBRID_KV=1`): `"What is 2+2?"` → `"2 + 2 = 4<turn|>"` (byte-identical to legacy on smoke prompt).
+
+### Files added (mlx-native)
+
+- `/opt/mlx-native/src/shaders/hadamard_quantize_kv_fast.metal`: append `kv_copy_kf16_quantize_v_no_fwht<HEAD_DIM>` template kernel + 2 host_name instantiations (`_d256`, `_d512`).  Z=0 stream does F32→F16 K cast write; Z=1 stream does V Lloyd-Max codebook + L2 norm.  Math per stream is byte-identical to its stand-alone counterpart (`kv_cache_copy_batch_f32_to_f16` and `kv_quantize_v_no_fwht` respectively).
+- `/opt/mlx-native/src/ops/hadamard_quantize_kv.rs`: `dispatch_kv_copy_kf16_quantize_v_no_fwht` Rust dispatcher.  6-buffer binding (params + src_k, src_v, cache_k, packed_v, norms_v).  Hard-checks K dtype = F16.
+- `/opt/mlx-native/src/kernel_registry.rs`: register both kernel names against the shared shader source.
+- `/opt/mlx-native/tests/test_kv_copy_kf16_quantize_v_no_fwht_parity.rs`: 2 tests:
+  - `fused_kf16_v_quantize_byte_identical_to_two_dispatches_d256_8bit`: Path A (two stand-alone dispatches) vs Path B (fused) — byte-compare K cache, V packed, V norms.  Asserts strict byte equality.
+  - `fused_kf16_v_quantize_runs_with_sliding_ring_position`: smoke test at write_pos=100, capacity=64, sliding=true (wraps to slot 36).  Validates ring math.
+
+### Files modified (hf2q)
+
+- `/opt/hf2q/src/serve/forward_mlx.rs`: at the hybrid V-encode site (Phase 10c, ~line 3074), replace the 2-dispatch sequence with the single fused dispatch.  Same buffer order, same params, byte-identical output per the parity test.
+
+### Why the win is +0.4% not the ~+1% predicted
+
+The ~+1% theoretical assumed each saved dispatch costs the full ~14 µs Apple-floor.  In practice GPU pipelining absorbs much of the floor — only the CPU encoder cost (~3-5 µs/dispatch) materializes as wall time.  At 30 dispatches × 4 µs = 120 µs/token = 0.9% of decode wall.  Measured +0.4% is in the lower half of that estimate.
+
+This pattern matches iter-351's measurement (60 dispatches eliminated → +1.1% measured, ~3% theoretical).  The takeaway from iter-352 + iter-353 + iter-354: dispatch-elimination wins are **CPU-encoder bound** because GPU pipelines, and CPU encoder is already small (~0.45 ms/token total per iter-353).  Future dispatch-elimination has diminishing returns — at most ~3% remaining headroom.
+
+### Tests + bench summary
+
+- mlx-native lib: 284/0 passing.
+- New parity tests: 2/0 passing.
+- hf2q lib: 3454/0 passing.
+- Coherence: legacy + hybrid both produce `"2 + 2 = 4<turn|>"` byte-identical.
+- Decode bench: hybrid 75.5 tok/s (was 75.2 at iter-351; +0.3 absolute).
+
+### Phase 10 status
+
+| Sub | Status | Δ |
+|---|---|---|
+| 10a (audit) | ✓ done iter-346 | n/a |
+| 10b (struct) | ✓ done iter-347 | n/a |
+| 10c (alloc + encode wired) | ✓ done iter-348 | n/a |
+| 10d (kernel + parity) | ✓ done iter-349 | n/a (NRMSE 1.7e-4) |
+| 10e (SDPA dispatcher) | ✓ done iter-350 | +1.1% |
+| 10e.5 (V no-FWHT) | ✓ done iter-351 | +0.9% |
+| 10c.5 (fused KV write) | ✓ done iter-354 | +0.4% |
+| **Phase 10 cumulative** | **CLOSED** | **+2.4%** |
+
+### Next iter — open levers (per iter-353 + this iter's analysis)
+
+Dispatch-elimination has hit the CPU-encoder wall.  Remaining levers:
+
+1. **MoE expert weight-cache audit** — gemma4 MoE _id matmuls run at 746 GB/s (137% of M5 Max nominal peak) per `bench_decode_moe_id_shapes`.  Combined attention+router (493 GB/s) + MoE (746 GB/s) accounts for 6 ms/token of matmul.  Our actual 13 ms/token leaves ~7 ms for non-matmul (TQ-HB encode, SDPA, norms, KV writes).  Peer non-matmul ≈ 3.7 ms.  Source of the gap is per-kernel cost on non-matmul, not dispatch count.  Per-kernel analysis = next direction (requires Apple Instruments trace ideally).
+
+2. **Indirect command buffers** (Apple Metal 4 feature) — pre-bake parameter buffers; saves CPU encoder cost.  At 0.45 ms/token current encoder cost, max win = 3.5%.  3-5 iters effort.
+
+3. **F32 V vs TQ-HB V evaluation** (NOT operator-approved) — peer stores F16 V; we store TQ-HB V.  Dropping TQ-HB on V would close most of the residual gap but breaks the operator-binding RAM-mantra (iter-326).  REJECTED.
