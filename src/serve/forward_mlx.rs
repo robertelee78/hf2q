@@ -2050,22 +2050,31 @@ impl MlxModelWeights {
                 p[0] = w.vocab_size as u32;
             }
 
-            // ADR-029 iter-28 H29 — F16 shadow population pass.
+            // ADR-029 iter-28 H29 / iter-31 — F16 shadow population pass.
             //
             // Materializes an F16 pre-dequantized buffer for every attn
             // and dense-MLP quantized weight in every layer, so that the
             // runtime dispatch_qmatmul fast-paths through the F16-input
-            // matmul kernel (peer's gemma4 strategy).  Default OFF; opt-in
-            // via HF2Q_F16_SHADOW=1.  ~1 GB extra resident on gemma4-26B
-            // when active.
+            // matmul kernel (peer's gemma4 strategy).
+            //
+            // iter-31 default-flip: HF2Q_F16_SHADOW now default-true
+            // (opt-out via =0/false/off).  Multi-regime bench (4 ctxs ×
+            // 3 trials each, gemma4-APEX-Q5_K_M):
+            //   2K prefill: +16.0%
+            //   4K prefill: +7.3%
+            //   8K prefill: +1.9%
+            //   decode m=1: unaffected (V2 path gated on m > 8, H29 too)
+            // Byte-identical first decode tokens at every context.
+            // ~1 GB extra resident on gemma4-26B; 128 GB M5 Max budget
+            // accommodates without pressure.  0.4s load-time pass.
             //
             // Doing this in a second pass (after weight load) avoids
             // borrow-checker conflicts between `gpu.device()` (read) and
             // `gpu.registry` (write) during the per-layer load loop.
             let f16_shadow_enabled = std::env::var("HF2Q_F16_SHADOW")
                 .ok()
-                .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
-                .unwrap_or(false);
+                .map(|v| !matches!(v.as_str(), "0" | "false" | "off"))
+                .unwrap_or(true);
             if f16_shadow_enabled {
                 let dev = gpu.executor.device();
                 let n_layers = w.layers.len();
@@ -7821,11 +7830,11 @@ fn populate_f16_shadow_if_enabled(
     registry: &mut mlx_native::KernelRegistry,
     tensor_name: &str,
 ) -> Result<()> {
-    // Env gate (default OFF until coherence + multi-regime bench parity).
+    // iter-31 default-flip: H29 default-true; opt-out via =0/false/off.
     let enabled = std::env::var("HF2Q_F16_SHADOW")
         .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
-        .unwrap_or(false);
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "off"))
+        .unwrap_or(true);
     if !enabled {
         return Ok(());
     }
