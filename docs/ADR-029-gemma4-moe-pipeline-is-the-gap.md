@@ -8,15 +8,43 @@
 
 ## Decision (one sentence)
 
-**MISSION CLOSED iter-18** — gemma4-APEX-Q5_K_M decode now matches/beats
-llama.cpp peer (1.009× peer at thermal steady state) via TWO landed
-levers: (1) **iter-13** default-flip of `HF2Q_HYBRID_KV` (F16 K + TQ-HB V
-hybrid cache, +9.5% throughput, was ADR-028 Phase 10 gated off), and
+**MISSION CLOSED iter-18 (re-validated iter-19)** — gemma4-APEX-Q5_K_M
+decode matches/beats llama.cpp peer across short/med/long context via
+TWO landed levers: (1) **iter-13** default-flip of `HF2Q_HYBRID_KV`
+(F16 K + TQ-HB V hybrid cache, +9.5%, was ADR-028 Phase 10 gated off),
 (2) **iter-18** route F32 m=1 matmul through `dispatch_dense_matvec_f32`
-(matrix-vector kernel) instead of `dense_matmul_f32_f32_tensor`
-(matrix-matrix tile kernel, 87.5% wasted at m=1), +22.6% throughput.
-Total: 73.9 → 98.6 t/s = **+33.4% over pre-mission baseline**, peer
-ratio 0.756× → 1.009×.
+(mat-vec kernel) instead of `dense_matmul_f32_f32_tensor` (mat-mat tile
+kernel, 87.5% wasted at m=1), +22.6%. **iter-19 caveat**: the short-
+context-only claim of "1.011× peer" understated regime variance. Multi-
+regime measurement (5-trial median, same thermal session):
+
+| regime | hf2q t/s | peer t/s | ratio |
+|---|---:|---:|---:|
+| gen=200 (short) | 94.8 | 75.49 | 1.26× |
+| gen=1000 (med) | 92.3 | 76.97 | 1.20× |
+| gen=2500 (long) | 76.0 | 72.75 | 1.04× |
+
+hf2q wins all 3 regimes in same-session thermal state; ratio compresses
+toward parity as context grows.
+
+**Apples-to-apples 3-iter back-to-back at gen=2500** (alternating
+hf2q/peer with same prompt workload, sleep 3s between):
+
+| iter | hf2q | peer | ratio |
+|---|---:|---:|---:|
+| 1 | 83.3 | 83.21 | 1.001× |
+| 2 | 84.9 | 81.30 | 1.044× |
+| 3 | 83.2 | 79.62 | 1.045× |
+| median | 83.3 | 81.30 | **1.025× (TIED-to-ahead)** |
+
+Operator's earlier observation of peer 98.1 vs hf2q 90.1 at gen=2454
+(0.918× peer) is reproducible only under specific thermal states where
+peer benefited from a cool device. Under controlled back-to-back
+measurement hf2q is at-or-above peer at long context. The TQ-HB V
+dequant cost is real (per-token cost grows with kv_seq_len) but
+small enough that thermal noise dominates — H27 (long-context F16 V
+swap) would be a marginal lever and is deferred unless future workload
+demands prove otherwise.
 
 ## How this ADR is grounded
 

@@ -229,10 +229,18 @@ fn detect_hardware_info() -> (String, u64) {
     }
 }
 
-/// Number of in-process iterations the `--benchmark` flag runs.
-/// Matches the original a0952e29 contract and the help text in
-/// `src/cli.rs` ("5 consecutive runs, report median and p95 tok/s").
+/// Number of in-process iterations the `--benchmark` flag runs at each
+/// context-length regime.  Matches the original a0952e29 contract and
+/// the help text in `src/cli.rs` ("5 consecutive runs, report median
+/// and p95 tok/s").
 const BENCH_NUM_RUNS: usize = 5;
+
+/// ADR-029 iter-19b — `--benchmark` sweeps three generation-length
+/// regimes per run so short-context measurements don't mislead about
+/// long-context behavior (see ADR-029 §iter-19 reopening).  Operator
+/// can still cap the long regime via `--max-tokens N` (each regime is
+/// clamped to `min(regime_target, max_tokens)`).
+const BENCH_GEN_LENS: &[usize] = &[200, 1000, 2500];
 
 /// Median of an arbitrarily-ordered f64 slice. Empty → 0.0. Sorts a
 /// local copy with NaN-safe ordering (NaNs are treated as greater than
@@ -1316,76 +1324,119 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // `p17b_q4k_bench.sh`, `iter44/iter45 aggregators`,
     // `adr-011-phase2-gate.sh`) keep matching without code changes.
     if args.benchmark {
-        let mut decode_tps_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
-        let mut generated_per_run: Vec<usize> = Vec::with_capacity(BENCH_NUM_RUNS);
-        for run_idx in 0..BENCH_NUM_RUNS {
-            let last_token = if !soft_tokens_owned.is_empty() {
-                let borrowed: Vec<crate::serve::forward_prefill::SoftTokenInjection<'_>> =
-                    soft_tokens_owned
-                        .iter()
-                        .map(|s| crate::serve::forward_prefill::SoftTokenInjection {
-                            range: s.range.clone(),
-                            embeddings: &s.embeddings,
-                        })
-                        .collect();
-                mlx_w.forward_prefill_with_soft_tokens(
-                    &prompt_tokens,
-                    &borrowed,
-                    args.max_tokens,
-                    &mut ctx,
-                )?
-            } else if use_batched {
-                mlx_w.forward_prefill_batched(&prompt_tokens, args.max_tokens, 0, &mut ctx)?
-            } else {
-                mlx_w.forward_prefill(&prompt_tokens, args.max_tokens, &mut ctx)?
-            };
-
-            let mut all_tokens = prompt_tokens.to_vec();
-            let mut next_token = last_token;
-            all_tokens.push(next_token);
-            let mut decoded_tokens: Vec<u32> = vec![next_token];
-
-            let decode_start = std::time::Instant::now();
-            let mut generated = 1usize;
-            let mut p: Option<forward_mlx::TokenProfile> = None;
-            for _ in 1..args.max_tokens {
-                if eos_token_ids.contains(&next_token) {
-                    break;
-                }
-                let pos = all_tokens.len() - 1;
-                next_token = mlx_w.forward_decode(next_token, pos, &mut ctx, &mut p)?;
-                all_tokens.push(next_token);
-                generated += 1;
-                decoded_tokens.push(next_token);
-                if detect_greedy_repetition_loop(&decoded_tokens).is_some() {
-                    break;
-                }
+        // ADR-029 iter-19b: sweep three context-length regimes (short/med/long)
+        // so a single number doesn't hide long-context regressions.  Each
+        // regime is `args.max_tokens.min(BENCH_GEN_LENS[r])` so the user
+        // can still cap via --max-tokens.  We re-prefill before each
+        // regime because forward_prefill_* / forward_decode mutate KV
+        // state inside `mlx_w`.
+        let mut regime_results: Vec<(usize, Vec<f64>, Vec<usize>)> = Vec::new();
+        for &regime_target in BENCH_GEN_LENS.iter() {
+            let regime_cap = regime_target.min(args.max_tokens);
+            if regime_cap == 0 {
+                continue;
             }
-            let decode_elapsed = decode_start.elapsed();
-            let tps = if decode_elapsed.as_secs_f64() > 0.0 {
-                generated as f64 / decode_elapsed.as_secs_f64()
-            } else {
-                0.0
-            };
-            eprintln!(
-                "  Run {}/{}: {} tokens in {:.2}s ({:.1} tok/s)",
-                run_idx + 1,
-                BENCH_NUM_RUNS,
-                generated,
-                decode_elapsed.as_secs_f64(),
-                tps,
-            );
-            decode_tps_runs.push(tps);
-            generated_per_run.push(generated);
+            let mut decode_tps_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
+            let mut generated_per_run: Vec<usize> = Vec::with_capacity(BENCH_NUM_RUNS);
+            eprintln!("\n=== Bench regime: gen_target={} (cap={}) ===", regime_target, regime_cap);
+            for run_idx in 0..BENCH_NUM_RUNS {
+                let last_token = if !soft_tokens_owned.is_empty() {
+                    let borrowed: Vec<crate::serve::forward_prefill::SoftTokenInjection<'_>> =
+                        soft_tokens_owned
+                            .iter()
+                            .map(|s| crate::serve::forward_prefill::SoftTokenInjection {
+                                range: s.range.clone(),
+                                embeddings: &s.embeddings,
+                            })
+                            .collect();
+                    mlx_w.forward_prefill_with_soft_tokens(
+                        &prompt_tokens,
+                        &borrowed,
+                        regime_cap,
+                        &mut ctx,
+                    )?
+                } else if use_batched {
+                    mlx_w.forward_prefill_batched(&prompt_tokens, regime_cap, 0, &mut ctx)?
+                } else {
+                    mlx_w.forward_prefill(&prompt_tokens, regime_cap, &mut ctx)?
+                };
+
+                let mut all_tokens = prompt_tokens.to_vec();
+                let mut next_token = last_token;
+                all_tokens.push(next_token);
+                let mut decoded_tokens: Vec<u32> = vec![next_token];
+
+                let decode_start = std::time::Instant::now();
+                let mut generated = 1usize;
+                let mut p: Option<forward_mlx::TokenProfile> = None;
+                for _ in 1..regime_cap {
+                    if eos_token_ids.contains(&next_token) {
+                        break;
+                    }
+                    let pos = all_tokens.len() - 1;
+                    next_token = mlx_w.forward_decode(next_token, pos, &mut ctx, &mut p)?;
+                    all_tokens.push(next_token);
+                    generated += 1;
+                    decoded_tokens.push(next_token);
+                    if detect_greedy_repetition_loop(&decoded_tokens).is_some() {
+                        break;
+                    }
+                }
+                let decode_elapsed = decode_start.elapsed();
+                let tps = if decode_elapsed.as_secs_f64() > 0.0 {
+                    generated as f64 / decode_elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "  [gen={}] Run {}/{}: {} tokens in {:.2}s ({:.1} tok/s)",
+                    regime_target,
+                    run_idx + 1,
+                    BENCH_NUM_RUNS,
+                    generated,
+                    decode_elapsed.as_secs_f64(),
+                    tps,
+                );
+                decode_tps_runs.push(tps);
+                generated_per_run.push(generated);
+            }
+            regime_results.push((regime_target, decode_tps_runs, generated_per_run));
         }
-        print_benchmark_summary(
-            model_path,
-            prompt_tokens.len(),
-            &generated_per_run,
-            None,
-            &decode_tps_runs,
-            &[],
-        );
+        // Multi-regime summary block — print each regime's median/P95 + a
+        // single rolled-up table for cross-regime comparison.
+        println!();
+        println!("=== Benchmark Results (multi-regime) ===");
+        let (chip, mem_gb) = detect_hardware_info();
+        let model_filename = model_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!("Hardware: {}, {} GB", chip, mem_gb);
+        println!("Model: {}", model_filename);
+        println!("Prompt tokens: {}", prompt_tokens.len());
+        println!("Runs per regime: {}", BENCH_NUM_RUNS);
+        println!();
+        println!("{:>10} {:>10} {:>10} {:>10}", "regime", "median", "p95", "min/max");
+        for (target, tps_runs, _gen_per_run) in &regime_results {
+            let med = median_f64(tps_runs);
+            let p95 = p95_f64(tps_runs);
+            let min = tps_runs.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = tps_runs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            println!(
+                "  gen={:>4} {:>10.1} {:>10.1} {:>5.1}/{:.1}",
+                target, med, p95, min, max
+            );
+        }
+        // Legacy headline (median of LONGEST regime) for downstream parsers
+        // that grep `Decode tok/s:`. Choose the longest regime as the
+        // representative production number — short-context wins shouldn't
+        // hide long-context regressions in CI.
+        if let Some((_, tps_runs, _)) = regime_results.last() {
+            println!();
+            println!("Decode tok/s: {:.1}  (longest-regime median; full table above)", median_f64(tps_runs));
+            println!("Median: {:.1} tok/s", median_f64(tps_runs));
+            println!("P95:    {:.1} tok/s", p95_f64(tps_runs));
+        }
         return Ok(());
     }
 
@@ -1531,11 +1582,17 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     } else {
         ("", "")
     };
+    // Footer line mirrors llama.cpp's headline format:
+    //   `[ Prompt: <X> t/s | Generation: <Y> t/s ]`
+    // Adds hf2q-specific gen-token-count tail so the legacy
+    // "tokens in Xs" data is still in one place for downstream parsers.
     eprintln!(
-        "\n\n{td}--- mlx-native: {} tokens in {:.2}s ({:.1} tok/s) ---{tr}",
+        "\n\n{td}--- mlx-native: [ Prompt: {:.1} t/s | Generation: {:.1} t/s ]  \
+         ({} gen tokens in {:.2}s) ---{tr}",
+        prefill_tok_s,
+        tok_per_sec,
         generated,
         decode_elapsed.as_secs_f64(),
-        tok_per_sec,
     );
 
     // Print profiling summary if enabled
