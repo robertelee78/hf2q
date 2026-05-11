@@ -24436,3 +24436,58 @@ weaker (~half the speed benefit at the same memory cost).
 Note: HYBRID_KV (+2.0%) and Multi-thread (+2.2%) are now within noise
 of each other.  Multi-thread has 0 memory cost vs HYBRID's 33%.  If
 operator prioritizes RAM mantra, multi-thread becomes more attractive.
+
+## iter-475 — Phase 15 + HYBRID_KV stacked: compose cleanly (no interaction)
+
+### Hypothesis
+Both flags (Phase 15 default-on + HF2Q_HYBRID_KV opt-in) should
+compose without negative interaction.  Verify stacked behavior +
+coherence.
+
+### Method
+Single server run with HF2Q_HYBRID_KV=1 (Phase 15 always default-on
+at HEAD).  Measure prefill at 3 sizes + decode 3 reps + coherence.
+
+### Results
+
+**Prefill** (Phase 15 batched):
+| Size | Internal tok/s | HTTP wall |
+|---|---|---|
+| pp~527 | 2570 ± 12 | 247-250 ms |
+| pp~4028 | 2770 ± 1 | 1572 ms |
+
+Matches iter-415's Phase 15 numbers (2525/2758).  **HYBRID does NOT
+affect prefill** — confirms iter-419's earlier finding (prefill uses
+F32 K regardless of HYBRID).
+
+**Decode** (3 reps × max=128):
+- 68.68 / 69.29 / 67.65 = **68.54 ± 0.83 tok/s**
+- vs iter-474 default 66.61 = **+2.9%**
+
+**Coherence**: "What is 2+2?" → "2 + 2 = 4" ✓
+
+### Compose cleanly, no interaction
+Phase 15 + HYBRID_KV are orthogonal:
+- Phase 15 acts on prefill code path (forward_prefill_batched)
+- HYBRID acts on decode code path (flash_attn_vec_hybrid kernel)
+- No shared state or contention
+
+### Aggregate state at HEAD with HYBRID opt-in
+- Startup: 3.07 sec (Phase 15 + tokenizer default-on)
+- Prefill: 0.94× peer (Phase 15)
+- Decode: **0.74× peer** (66.61 → 68.54 = 0.737× peer 92.88)
+- Coherence: TIED
+- Memory: 33% cost vs default (3.94× → 2.65×)
+
+### Investigation count this thread
+132 total: 131 from iter-474 + this iter (stack compose verified).
+
+### Operator path: minimum-friction HYBRID rollout
+If operator decides to ship HYBRID default-on:
+1. Flip env_eq_one → env_default_true at investigation_env.rs
+2. Run 5-day soak with broader prompt set
+3. Document the 33% memory cost in shipping-contract.md
+4. Communicate the +2.9% decode benefit to users
+
+Single-line change once approved.  iter-475 confirms the stack works
+cleanly when both opt-in to maximum.
