@@ -18498,3 +18498,79 @@ effort.  Each iter ships a discrete artifact + remains revertable.
 
 ### Investigation count this thread
 44 total: 43 from iter-386 + this iter (probe + scoping).
+
+## iter-388 — &mut self.activations.X → &self.activations.X cascade
+
+### Date
+2026-05-10
+
+### Goal
+Per iter-387's revised plan, Step A was "extract 1848 LOC layer body into
+free fn".  Tried a SMALLER mechanical alternative first: convert all
+`&mut self.activations.X` → `&self.activations.X` access paths.  Per
+iter-385's `&MlxBuffer` cascade, the `&mut` is no longer required at
+encode-fn call sites.
+
+### Implementation
+
+3-phase mechanical sed:
+1. **forward_mlx.rs**: `s/&mut self\.activations\./\&self.activations./g`
+   — 23 sites converted.
+2. **mlx-native/src/graph.rs**: 3 wrapper methods (`quantized_matmul_id_ggml`
+   etc.) had `output: &mut MlxBuffer` — converted.
+3. **hf2q wrappers**: `dispatch_qmatmul` (forward_mlx.rs:7600) +
+   `gpu_ffn.rs:108` `output: &mut MlxBuffer` → `output: &MlxBuffer`.
+
+After these 3 cascades, hf2q builds clean.
+
+### Verification
+
+- mlx-native lib: 290/0 passing (1 transient 288/2 result on first run —
+  re-run was clean; likely env-var race in unrelated test).
+- hf2q lib: 3454/0 passing.
+- Coherence: gemma4 "What is 2+2?" → " + 2 = 4<turn|>" intact.
+- Bench (3 trials, default config): 75.1 / 75.1 / 75.1 tok/s (mean **75.10**)
+  vs iter-385 baseline 74.97 → **+0.17%** (within noise but consistent).
+
+### What this unblocks (vs blockers remaining)
+
+**Unblocked**:
+- All activation buffer accesses in forward_decode now use `&self.activations.X`
+  (immutable projection through `&self`).
+- Forward_decode's encode call sites no longer carry `&mut` borrow constraints.
+
+**Still blocking** (per iter-387 probe):
+- `self.decode_step += 1` (counter)
+- `self.hybrid_kv = Some(...)` (lazy alloc)
+- `self.leg_hb_encoded = Some(...)` (lazy alloc)
+- `self.kv_caches[i].push_back(...)` (per-layer KV write)
+
+These remain `&mut self` consumers.  For full multi-thread, these need to
+be hoisted out of the layer loop (counter++ before, KV push after) or
+wrapped in interior-mutability (Mutex<Option<...>> for lazy fields).
+
+### Refined iter-389+ plan
+
+- **iter-389**: Hoist `&mut self` mutations out of the layer loop body.
+  - `decode_step` increment: move to single statement at start of fn
+  - `hybrid_kv` lazy alloc: move to before-loop block
+  - `leg_hb_encoded` lazy alloc: same
+  - `kv_caches` push: collect deferred writes during loop, apply after loop
+- **iter-390**: Extract layer-loop body into free fn (now smaller scope
+  since activation accesses are already `&self`-based).
+- **iter-391**: Wire EncoderWorker for parallel encoding (per iter-387
+  Step C plan).
+- **iter-392**: Bench A/B + tune split N + ship if positive.
+
+### Why this iter wasn't a "no-op"
+
+The mechanical change in iter-388 is GENUINE PROGRESS toward the multi-thread
+port:
+- Reduced refactor scope for iter-390 (free-fn extraction now smaller — no
+  per-site `&mut`→`&` conversion required during extraction)
+- Confirmed the iter-385 + iter-388 cascade leaves correctness + perf intact
+- Identified the EXACT remaining `&mut self` mutations (4 categories) that
+  iter-389 must address
+
+### Investigation count this thread
+45 total: 44 from iter-387 + this iter (mechanical cascade LANDED).

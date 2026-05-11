@@ -105,7 +105,7 @@ fn dispatch_moe_id_routed(
     legacy_weight: &MlxBuffer,
     affine: Option<&MlxAffineMoeStack>,
     ids: &MlxBuffer,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     legacy_params: &GgmlQuantizedMatmulIdParams,
     pool_slot: super::decode_pool::MmIdSlot,
     pool_n_experts: u32,

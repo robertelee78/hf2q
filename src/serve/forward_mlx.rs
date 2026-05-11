@@ -2788,13 +2788,13 @@ impl MlxModelWeights {
                 // attention output downstream.
                 if !INVESTIGATION_ENV.skip_attn_qkv {
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                        &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1)?;
+                        &self.layers[layer_idx].attn.q_proj, &self.activations.attn_q, 1)?;
                     total_dispatches += 1;
                     // Per-dispatch range annotation for the reorder pass. The
                     // single barrier_between above only annotates the first
                     // dispatch; concurrent K and V need their own ranges.
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                        &self.layers[layer_idx].attn.k_proj, &mut self.activations.attn_k, 1)?;
+                        &self.layers[layer_idx].attn.k_proj, &self.activations.attn_k, 1)?;
                     s.track_dispatch(&[&self.activations.norm_out], &[&self.activations.attn_k]);
                     total_dispatches += 1;
                 }
@@ -2802,7 +2802,7 @@ impl MlxModelWeights {
                 if !v_is_k && !INVESTIGATION_ENV.skip_attn_qkv {
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                         self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
-                        &mut self.activations.attn_v, 1)?;
+                        &self.activations.attn_v, 1)?;
                     s.track_dispatch(&[&self.activations.norm_out], &[&self.activations.attn_v]);
                     total_dispatches += 1;
                 }
@@ -4099,7 +4099,7 @@ impl MlxModelWeights {
                         &[&self.activations.attn_out],
                     );
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
-                        &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
+                        &self.layers[layer_idx].attn.o_proj, &self.activations.attn_out, 1)?;
                     total_dispatches += 1;
                 }
 
@@ -4232,17 +4232,17 @@ impl MlxModelWeights {
                 // mlp_up dispatches.  Router proj must run (MoE depends on it).
                 if !INVESTIGATION_ENV.skip_dense_mlp {
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                        &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
+                        &self.layers[layer_idx].mlp.gate_proj, &self.activations.mlp_gate, 1)?;
                     total_dispatches += 1;
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                        &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
+                        &self.layers[layer_idx].mlp.up_proj, &self.activations.mlp_up, 1)?;
                     total_dispatches += 1;
                 }
                 // ADR-028 iter-213: SKIP_ROUTING bisect — skip router_proj qmatmul.
                 if !INVESTIGATION_ENV.skip_routing {
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.router_norm_out,
                         &self.layers[layer_idx].moe.router_proj,
-                        &mut self.activations.moe_router_logits, 1)?;
+                        &self.activations.moe_router_logits, 1)?;
                     total_dispatches += 1;
                 }
 
@@ -4306,7 +4306,7 @@ impl MlxModelWeights {
                             &[&self.activations.mlp_down],
                         );
                         dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
-                            &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
+                            &self.layers[layer_idx].mlp.down_proj, &self.activations.mlp_down, 1)?;
                         total_dispatches += 1;
                     }
 
@@ -4334,7 +4334,7 @@ impl MlxModelWeights {
                             &self.activations.moe_norm_out,
                             self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
                             &self.activations.moe_expert_ids,
-                            &mut self.activations.moe_gate_up_id_out,
+                            &self.activations.moe_gate_up_id_out,
                             &gu_params,
                         ).map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
                         total_dispatches += 1;
@@ -4382,7 +4382,7 @@ impl MlxModelWeights {
                             &self.activations.moe_swiglu_id_out,
                             self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
                             &self.activations.moe_expert_ids,
-                            &mut self.activations.moe_down_id_out,
+                            &self.activations.moe_down_id_out,
                             &dn_params,
                         ).map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
                         total_dispatches += 1;
@@ -4692,7 +4692,7 @@ impl MlxModelWeights {
                     &mut s, reg, dev,
                     &self.activations.norm_out,
                     q6k,
-                    &mut self.activations.logits,
+                    &self.activations.logits,
                     1,
                 )?;
                 total_dispatches += 1;
@@ -4705,7 +4705,7 @@ impl MlxModelWeights {
                     &mut s, reg, dev,
                     &self.activations.norm_out,
                     q8,
-                    &mut self.activations.logits,
+                    &self.activations.logits,
                     1,
                 )?;
                 total_dispatches += 1;
@@ -5250,15 +5250,15 @@ impl MlxModelWeights {
 
                 // Q proj
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                    &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1)?;
+                    &self.layers[layer_idx].attn.q_proj, &self.activations.attn_q, 1)?;
                 // K proj
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                    &self.layers[layer_idx].attn.k_proj, &mut self.activations.attn_k, 1)?;
+                    &self.layers[layer_idx].attn.k_proj, &self.activations.attn_k, 1)?;
                 // V proj (if not k_eq_v)
                 if !v_is_k {
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                         self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
-                        &mut self.activations.attn_v, 1)?;
+                        &self.activations.attn_v, 1)?;
                 }
 
                 let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
@@ -5438,7 +5438,7 @@ impl MlxModelWeights {
                 let mut s = exec.begin().map_err(|e| anyhow::anyhow!("oproj begin L{layer_idx}: {e}"))?;
 
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
-                    &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
+                    &self.layers[layer_idx].attn.o_proj, &self.activations.attn_out, 1)?;
 
                 let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
                     .map_err(|e| anyhow::anyhow!("oproj finish L{layer_idx}: {e}"))?;
@@ -5476,10 +5476,10 @@ impl MlxModelWeights {
 
                 // gate
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                    &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
+                    &self.layers[layer_idx].mlp.gate_proj, &self.activations.mlp_gate, 1)?;
                 // up
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                    &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
+                    &self.layers[layer_idx].mlp.up_proj, &self.activations.mlp_up, 1)?;
                 // fused gelu_mul
                 {
                     use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
@@ -5500,7 +5500,7 @@ impl MlxModelWeights {
                 }
                 // down
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
-                    &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
+                    &self.layers[layer_idx].mlp.down_proj, &self.activations.mlp_down, 1)?;
 
                 let (_enc_ns, gpu_ns) = s.finish_with_timing(t0)
                     .map_err(|e| anyhow::anyhow!("mlp finish L{layer_idx}: {e}"))?;
@@ -5550,7 +5550,7 @@ impl MlxModelWeights {
                 // Router proj
                 dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                     &self.layers[layer_idx].moe.router_proj,
-                    &mut self.activations.moe_router_logits, 1)?;
+                    &self.activations.moe_router_logits, 1)?;
 
                 // Fused MoE routing
                 let num_experts = self.num_experts;
@@ -5590,7 +5590,7 @@ impl MlxModelWeights {
                     &self.activations.moe_norm_out,
                     self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
                     &self.activations.moe_expert_ids,
-                    &mut self.activations.moe_gate_up_id_out,
+                    &self.activations.moe_gate_up_id_out,
                     &gu_params,
                 ).map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
 
@@ -5617,7 +5617,7 @@ impl MlxModelWeights {
                     &self.activations.moe_swiglu_id_out,
                     self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
                     &self.activations.moe_expert_ids,
-                    &mut self.activations.moe_down_id_out,
+                    &self.activations.moe_down_id_out,
                     &dn_params,
                 ).map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
 
@@ -5699,7 +5699,7 @@ impl MlxModelWeights {
                     &mut s, reg, dev,
                     &self.activations.norm_out,
                     q8,
-                    &mut self.activations.logits,
+                    &self.activations.logits,
                     1,
                 )?;
             } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
@@ -7603,7 +7603,7 @@ pub fn dispatch_qmatmul(
     device: &MlxDevice,
     input: &MlxBuffer,
     weight: &MlxQWeight,
-    output: &mut MlxBuffer,
+    output: &MlxBuffer,
     m: u32,
 ) -> Result<()> {
     // ADR-020 AC#5 Iter C — affine route MUST be checked first (before
