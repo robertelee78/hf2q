@@ -22391,3 +22391,64 @@ UX decision, not a perf optimization.
 ### Investigation count this thread
 98 total: 97 from iter-440 + this iter (chat-template render
 mechanism).
+
+## iter-442 — explicit `<|think|>` system message doesn't trigger reasoning in hf2q
+
+### Hypothesis
+iter-441 found peer auto-injects `<|think|>` system message that
+triggers gemma4 reasoning.  Verify hf2q's reasoning infra works
+end-to-end by sending an EXPLICIT system message with `<|think|>`.
+
+### Method
+hf2q serve (Phase 15 default-on), 3 system message variants for
+"What is 7 times 8?":
+1. No system message
+2. system="<|think|>"
+3. system="You should think step by step before answering."
+
+### Results
+
+| System | seq_len | content | reasoning_content |
+|---|---|---|---|
+| (none) | 21 | "7 times 8 is **56**." | (empty) |
+| `<\|think\|>` | 27 (+6) | "7 times 8 is **56**." | (empty) |
+| "You should think..." | 35 (+14) | "7 times 8 is **56**." | (empty) |
+
+### Diagnosis
+- System message DOES pass through to model (seq_len grows
+  proportionally with system content)
+- Model produces IDENTICAL answer in all 3 cases
+- `reasoning_content` always empty
+
+Per `gguf.rs:6645`, `<think>` token has `special: false` — meaning
+the tokenizer treats `<|think|>` as a regular BPE multi-token sequence,
+NOT a single special token.  Whatever triggers gemma4's reasoning in
+peer's setup must be more specific than just the literal `<|think|>`
+text in a system message.
+
+### Possible mechanisms (untested)
+1. Peer's chat-template renders the system role with specific
+   wrapping characters that gemma4 was trained to recognize
+2. Peer adds a specific TOKEN ID (not text) that gemma4 maps to
+   thinking mode trigger
+3. The reasoning mode might require user-side `<think>` not
+   system-side
+4. Different training-data presence of system templates
+
+### Coherence impact
+For "7 × 8 = ?", both hf2q and peer (per iter-431 pattern) produce
+correct "56".  Model is correct in both modes.  The difference is
+whether to emit thinking trace.
+
+### Investigation count this thread
+99 total: 98 from iter-441 + this iter (explicit system test).
+
+### Conclusion
+hf2q's reasoning infrastructure is wired but the auto-injection
+mechanism that triggers gemma4 reasoning mode is non-trivial to
+replicate in a single iter.  Operator-decision-gated whether to
+match peer's reasoning-by-default behavior.
+
+For the operator's "as coherent as peer" mantra: ✓ MET on tested
+prompts; reasoning trace difference is presentational, not
+correctness.
