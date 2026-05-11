@@ -1194,13 +1194,19 @@ impl HybridKvCache {
         Ok(cache)
     }
 
-    /// Internal helper used by `new()` to zero every owned GPU buffer at
-    /// construction time.  Distinct from the public `reset()` which only
-    /// zeros the linear-attention SSM state — full-attention K/V is
-    /// covered here for correctness against any future kernel that reads
-    /// past `current_len` (today's SDPA/flash-attn paths mask, but the
-    /// cost of belt-and-braces zeroing at construction is one memset).
-    fn reset_all_buffers(&mut self) {
+    /// Construction-time zero-init of every owned GPU buffer.
+    /// Distinct from the public `reset()` which only zeros the
+    /// linear-attention SSM state — full-attention K/V is covered here
+    /// for correctness against any future kernel that reads past
+    /// `current_len` (today's SDPA/flash-attn paths mask, but the cost
+    /// of belt-and-braces zeroing at construction is one memset).
+    ///
+    /// `pub(crate)` because the qwen35 `--benchmark` 5-iter loop in
+    /// `src/serve/mod.rs::cmd_generate_qwen35` calls this between
+    /// iterations to re-establish the exact byte-state a freshly
+    /// constructed cache would have, without paying the allocator cost
+    /// of full reallocation each iter.
+    pub(crate) fn reset_all_buffers(&mut self) {
         // Cursor reset (matches `reset()`).
         for slot in self.full_attn.iter_mut() {
             for c in slot.current_len.iter_mut() {

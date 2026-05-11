@@ -229,6 +229,107 @@ fn detect_hardware_info() -> (String, u64) {
     }
 }
 
+/// Number of in-process iterations the `--benchmark` flag runs.
+/// Matches the original a0952e29 contract and the help text in
+/// `src/cli.rs` ("5 consecutive runs, report median and p95 tok/s").
+const BENCH_NUM_RUNS: usize = 5;
+
+/// Median of an arbitrarily-ordered f64 slice. Empty → 0.0. Sorts a
+/// local copy with NaN-safe ordering (NaNs are treated as greater than
+/// everything, which never matters for tok/s values).
+fn median_f64(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
+}
+
+/// P95 of an arbitrarily-ordered f64 slice via nearest-rank. Empty → 0.0.
+/// Matches the original a0952e29 helper byte-for-byte (clamped to last
+/// index for small samples — at N=5 returns sorted[4]).
+fn p95_f64(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let rank = ((0.95 * n as f64).ceil() as usize)
+        .saturating_sub(1)
+        .min(n - 1);
+    sorted[rank]
+}
+
+/// Print the unified benchmark summary block. `prefill_tps` is `None`
+/// for the Gemma path (which historically reports decode only) and
+/// `Some(...)` for the Qwen35 paths. The `Decode tok/s:` line is the
+/// MEDIAN — this preserves the regex contract of all downstream parser
+/// scripts (`scripts/bench-baseline.sh`, `qwen35_bench.sh`,
+/// `p17b_q4k_bench.sh`, `iter44/iter45 aggregators`,
+/// `adr-011-phase2-gate.sh`) which match `Decode tok/s: <X>` and would
+/// silently break if the line vanished or was renamed.
+///
+/// `extras` lets the qwen35-spec path tack on its acceptance-rate
+/// summary without inventing a new printer.
+fn print_benchmark_summary(
+    model_path: &Path,
+    prompt_tokens: usize,
+    generated_per_run: &[usize],
+    prefill_tps: Option<&[f64]>,
+    decode_tps: &[f64],
+    extras: &[(String, String)],
+) {
+    let (chip, mem_gb) = detect_hardware_info();
+    let model_filename = model_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let generated_str = if generated_per_run.iter().all(|&g| Some(g) == generated_per_run.first().copied()) {
+        format!("{}", generated_per_run.first().copied().unwrap_or(0))
+    } else {
+        let parts: Vec<String> = generated_per_run.iter().map(|g| g.to_string()).collect();
+        parts.join(",")
+    };
+
+    println!();
+    println!("=== Benchmark Results ===");
+    println!("Hardware: {}, {} GB", chip, mem_gb);
+    println!("Model: {}", model_filename);
+    println!("Prompt tokens: {}", prompt_tokens);
+    println!("Generated tokens: {}", generated_str);
+    println!("Runs: {}", decode_tps.len());
+    if let Some(pp) = prefill_tps {
+        for (i, (&pp_tps, &dec_tps)) in pp.iter().zip(decode_tps.iter()).enumerate() {
+            println!("Run {}: prefill {:.1} tok/s, decode {:.1} tok/s", i + 1, pp_tps, dec_tps);
+        }
+    } else {
+        for (i, &dec_tps) in decode_tps.iter().enumerate() {
+            println!("Run {}: decode {:.1} tok/s", i + 1, dec_tps);
+        }
+    }
+    // Load-bearing lines for downstream parser scripts: emit the
+    // MEDIAN under the legacy single-value labels so existing regexes
+    // continue to find a sensible value. Order matters: Prefill first
+    // (qwen35 historic order), Decode last (matches gemma).
+    if let Some(pp) = prefill_tps {
+        println!("Prefill tok/s: {:.1}", median_f64(pp));
+    }
+    println!("Decode tok/s: {:.1}", median_f64(decode_tps));
+    println!("Median: {:.1} tok/s", median_f64(decode_tps));
+    println!("P95:    {:.1} tok/s", p95_f64(decode_tps));
+    for (label, value) in extras {
+        println!("{}: {}", label, value);
+    }
+}
+
 /// Hardcoded fallback chat template used ONLY when no GGUF-embedded template
 /// exists and the user has not passed `--chat-template` / `--chat-template-file`.
 ///
@@ -1188,6 +1289,106 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // prompts is operator-gated; the unsafe-ack remains required across
     // all prompt sizes to preserve a single uniform decision boundary.
     let use_batched = INVESTIGATION_ENV.batched_prefill;
+
+    // ADR-005 1bNEW.0 — `--benchmark` runs `BENCH_NUM_RUNS` in-process
+    // iterations and reports median + P95 decode tok/s. The help text in
+    // `src/cli.rs` ("5 consecutive runs, report median and p95 tok/s")
+    // is the binding contract; the original 5-run loop landed in
+    // a0952e29 and was incidentally collapsed to a single run in the
+    // 9e23b7d8 ADR-008 candle divorce (47k lines deleted). This branch
+    // restores the contract.
+    //
+    // Each iter calls `forward_prefill[_batched]` with `start_pos=0`,
+    // which internally resets `cache.write_pos = 0` and reallocates the
+    // per-layer `dense_kvs` buffers (see
+    // `src/serve/forward_prefill.rs:386` docstring and
+    // `forward_prefill_batched.rs:281` allocator). No external KV
+    // reset call is needed.
+    //
+    // Streaming, profiler, kernel-profile, and `HF2Q_DUMP_COUNTERS` are
+    // intentionally suppressed in benchmark mode: it's a perf
+    // measurement, not an interactive run. Use a non-`--benchmark`
+    // invocation when you want any of those.
+    //
+    // The summary block emits the **median** decode tok/s under the
+    // legacy `Decode tok/s: <X>` label so downstream parser scripts
+    // (`scripts/bench-baseline.sh`, `qwen35_bench.sh`,
+    // `p17b_q4k_bench.sh`, `iter44/iter45 aggregators`,
+    // `adr-011-phase2-gate.sh`) keep matching without code changes.
+    if args.benchmark {
+        let mut decode_tps_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
+        let mut generated_per_run: Vec<usize> = Vec::with_capacity(BENCH_NUM_RUNS);
+        for run_idx in 0..BENCH_NUM_RUNS {
+            let last_token = if !soft_tokens_owned.is_empty() {
+                let borrowed: Vec<crate::serve::forward_prefill::SoftTokenInjection<'_>> =
+                    soft_tokens_owned
+                        .iter()
+                        .map(|s| crate::serve::forward_prefill::SoftTokenInjection {
+                            range: s.range.clone(),
+                            embeddings: &s.embeddings,
+                        })
+                        .collect();
+                mlx_w.forward_prefill_with_soft_tokens(
+                    &prompt_tokens,
+                    &borrowed,
+                    args.max_tokens,
+                    &mut ctx,
+                )?
+            } else if use_batched {
+                mlx_w.forward_prefill_batched(&prompt_tokens, args.max_tokens, 0, &mut ctx)?
+            } else {
+                mlx_w.forward_prefill(&prompt_tokens, args.max_tokens, &mut ctx)?
+            };
+
+            let mut all_tokens = prompt_tokens.to_vec();
+            let mut next_token = last_token;
+            all_tokens.push(next_token);
+            let mut decoded_tokens: Vec<u32> = vec![next_token];
+
+            let decode_start = std::time::Instant::now();
+            let mut generated = 1usize;
+            let mut p: Option<forward_mlx::TokenProfile> = None;
+            for _ in 1..args.max_tokens {
+                if eos_token_ids.contains(&next_token) {
+                    break;
+                }
+                let pos = all_tokens.len() - 1;
+                next_token = mlx_w.forward_decode(next_token, pos, &mut ctx, &mut p)?;
+                all_tokens.push(next_token);
+                generated += 1;
+                decoded_tokens.push(next_token);
+                if detect_greedy_repetition_loop(&decoded_tokens).is_some() {
+                    break;
+                }
+            }
+            let decode_elapsed = decode_start.elapsed();
+            let tps = if decode_elapsed.as_secs_f64() > 0.0 {
+                generated as f64 / decode_elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  Run {}/{}: {} tokens in {:.2}s ({:.1} tok/s)",
+                run_idx + 1,
+                BENCH_NUM_RUNS,
+                generated,
+                decode_elapsed.as_secs_f64(),
+                tps,
+            );
+            decode_tps_runs.push(tps);
+            generated_per_run.push(generated);
+        }
+        print_benchmark_summary(
+            model_path,
+            prompt_tokens.len(),
+            &generated_per_run,
+            None,
+            &decode_tps_runs,
+            &[],
+        );
+        return Ok(());
+    }
+
     let prefill_start = std::time::Instant::now();
     let last_token = if !soft_tokens_owned.is_empty() {
         // Image-augmented prefill — borrow the owned soft-token buffers
@@ -1345,20 +1546,11 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         forward_mlx::MlxModelWeights::print_kernel_profile_report(&kernel_profiles);
     }
 
-    if args.benchmark {
-        let (chip, mem_gb) = detect_hardware_info();
-        let model_filename = model_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        println!();
-        println!("=== Benchmark Results ===");
-        println!("Hardware: {}, {} GB", chip, mem_gb);
-        println!("Model: {}", model_filename);
-        println!("Prompt tokens: {}", prompt_tokens.len());
-        println!("Generated tokens: {}", generated);
-        println!("Decode tok/s: {:.1}", tok_per_sec);
-    }
+    // `--benchmark` is handled by the 5-run loop earlier in this
+    // function (which `return Ok(())`s before reaching here); the
+    // single-run summary block that lived here pre-restoration is
+    // unreachable when `args.benchmark` is true. See
+    // `if args.benchmark { ... }` above.
 
     // ADR-005 Gate G: mlx-native dispatch + sync counter emission.
     // Gated by HF2Q_DUMP_COUNTERS=1. Emits totals, per-prompt-token, and
@@ -2435,6 +2627,67 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         model
             .ensure_gpu_cache_primed()
             .context("Qwen35Model::ensure_gpu_cache_primed (P19 H12 spec-decode warmup)")?;
+
+        // ADR-005 1bNEW.0 — `--benchmark` 5-iter loop, median + P95.
+        // SpecDecode allocates and owns its own KV cache per call, so
+        // each iter is a fresh cold prefill+decode by construction.
+        // Streaming output and prefill-header printing are suppressed
+        // in benchmark mode (see gemma path for the design rationale).
+        if args.benchmark {
+            let mut prefill_tps_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
+            let mut decode_tps_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
+            let mut generated_per_run: Vec<usize> = Vec::with_capacity(BENCH_NUM_RUNS);
+            let mut accept_pct_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
+            for run_idx in 0..BENCH_NUM_RUNS {
+                let result = SpecDecode::run_with_eos_set(
+                    &model,
+                    &prompt_tokens,
+                    args.max_tokens,
+                    eos_token_ids.clone(),
+                    max_seq as u32,
+                )
+                .context("qwen35 SpecDecode::run_with_eos_set (benchmark)")?;
+                let prefill_tps = if result.stats.prefill_elapsed.as_secs_f64() > 0.0 {
+                    prompt_len as f64 / result.stats.prefill_elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let gen = result.tokens.len();
+                let decode_tps = if result.stats.decode_elapsed.as_secs_f64() > 0.0 {
+                    gen as f64 / result.stats.decode_elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                let accept_pct = result.stats.acceptance_rate_pct();
+                eprintln!(
+                    "  Run {}/{}: prefill {} tok in {:.2}s ({:.1} tok/s); decode {} tok in {:.2}s ({:.1} tok/s; accept {:.1}%)",
+                    run_idx + 1,
+                    BENCH_NUM_RUNS,
+                    prompt_len,
+                    result.stats.prefill_elapsed.as_secs_f64(),
+                    prefill_tps,
+                    gen,
+                    result.stats.decode_elapsed.as_secs_f64(),
+                    decode_tps,
+                    accept_pct,
+                );
+                prefill_tps_runs.push(prefill_tps);
+                decode_tps_runs.push(decode_tps);
+                generated_per_run.push(gen);
+                accept_pct_runs.push(accept_pct);
+            }
+            let median_accept = median_f64(&accept_pct_runs);
+            print_benchmark_summary(
+                model_path,
+                prompt_len,
+                &generated_per_run,
+                Some(&prefill_tps_runs),
+                &decode_tps_runs,
+                &[("Spec accept %".to_string(), format!("{:.1}", median_accept))],
+            );
+            return Ok(());
+        }
+
         // ADR-028 iter-266: pass the full eos_token_ids set (not just
         // first()) so the SpecDecode runner can match BOTH
         // `<|endoftext|>` AND `<|im_end|>` (qwen3 chat-template stop).
@@ -2488,22 +2741,6 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             result.stats.acceptance_rate_pct(),
         );
 
-        if args.benchmark {
-            let (chip, mem_gb) = detect_hardware_info();
-            let model_filename = model_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            println!();
-            println!("=== Benchmark Results ===");
-            println!("Hardware: {}, {} GB", chip, mem_gb);
-            println!("Model: {}", model_filename);
-            println!("Prompt tokens: {}", prompt_len);
-            println!("Generated tokens: {}", generated);
-            println!("Prefill tok/s: {:.1}", prefill_tok_s);
-            println!("Decode tok/s: {:.1}", tok_per_sec);
-            println!("Spec accept %: {:.1}", result.stats.acceptance_rate_pct());
-        }
         return Ok(());
     }
 
@@ -2555,6 +2792,118 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         "Qwen3.5 GPU warmup (P19 H12): {:.2}s",
         warmup_start.elapsed().as_secs_f64()
     );
+
+    // ADR-005 1bNEW.0 — `--benchmark` 5-iter loop, median + P95.
+    // Each iter resets the HybridKvCache (zero cursors + zero K/V buffers
+    // via `reset_all_buffers`) then re-runs prefill + decode. Warmup
+    // already ran above (outside the per-iter timer — preserves the
+    // ADR-013 P19 H12 timing semantics across all 5 iterations).
+    //
+    // Streaming output is suppressed: the `on_event` callback is a
+    // no-op and the cumulative-text accumulator is unused (decode_text
+    // closure returns "" so the special-token-leak detector never
+    // fires). EOS / max-tokens / max-seq stops still work; the
+    // n-gram repetition guard inside `run_decode_loop` is also active.
+    if args.benchmark {
+        let mut prefill_tps_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
+        let mut decode_tps_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
+        let mut generated_per_run: Vec<usize> = Vec::with_capacity(BENCH_NUM_RUNS);
+        for run_idx in 0..BENCH_NUM_RUNS {
+            kv_cache.reset_all_buffers();
+
+            let prefill_start = std::time::Instant::now();
+            let prefill_logits = model
+                .forward_gpu_last_logits(&prompt_tokens, &prefill_positions, &mut kv_cache)
+                .context("Qwen35Model::forward_gpu_last_logits (benchmark prefill)")?;
+            let prefill_elapsed = prefill_start.elapsed();
+            let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
+                prompt_len as f64 / prefill_elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+
+            let next_token = if sample_logits {
+                let mut logits = prefill_logits.to_vec();
+                sample_qwen35_logits_for_generate(&mut logits, &args, &[])
+            } else {
+                greedy_argmax_last_token(&prefill_logits, model.cfg.vocab_size)
+            };
+
+            let decode_start = std::time::Instant::now();
+            let outcome = if sample_logits {
+                run_decode_loop(
+                    next_token,
+                    prompt_len,
+                    max_seq,
+                    args.max_tokens,
+                    &eos_token_ids,
+                    |prev_token, pos, generated_tokens| -> Result<u32> {
+                        let decode_positions = vec![pos; 4];
+                        let mut logits = model
+                            .forward_gpu_last_logits(&[prev_token], &decode_positions, &mut kv_cache)
+                            .with_context(|| {
+                                format!("forward_gpu_last_logits decode at pos {pos} (benchmark)")
+                            })?;
+                        Ok(sample_qwen35_logits_for_generate(
+                            &mut logits,
+                            &args,
+                            generated_tokens,
+                        ))
+                    },
+                    |_toks| String::new(),
+                    |_event| {},
+                )?
+            } else {
+                run_decode_loop(
+                    next_token,
+                    prompt_len,
+                    max_seq,
+                    args.max_tokens,
+                    &eos_token_ids,
+                    |prev_token, pos, _generated_tokens| -> Result<u32> {
+                        let decode_positions = vec![pos; 4];
+                        model
+                            .forward_gpu_greedy(&[prev_token], &decode_positions, &mut kv_cache)
+                            .with_context(|| {
+                                format!("forward_gpu_greedy decode at pos {pos} (benchmark)")
+                            })
+                    },
+                    |_toks| String::new(),
+                    |_event| {},
+                )?
+            };
+            let decode_elapsed = decode_start.elapsed();
+            let gen = outcome.generated;
+            let decode_tps = if decode_elapsed.as_secs_f64() > 0.0 {
+                gen as f64 / decode_elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  Run {}/{}: prefill {} tok in {:.2}s ({:.1} tok/s); decode {} tok in {:.2}s ({:.1} tok/s)",
+                run_idx + 1,
+                BENCH_NUM_RUNS,
+                prompt_len,
+                prefill_elapsed.as_secs_f64(),
+                prefill_tps,
+                gen,
+                decode_elapsed.as_secs_f64(),
+                decode_tps,
+            );
+            prefill_tps_runs.push(prefill_tps);
+            decode_tps_runs.push(decode_tps);
+            generated_per_run.push(gen);
+        }
+        print_benchmark_summary(
+            model_path,
+            prompt_len,
+            &generated_per_run,
+            Some(&prefill_tps_runs),
+            &decode_tps_runs,
+            &[],
+        );
+        return Ok(());
+    }
 
     tracing::info!("Qwen3.5 prefill: seq_len={}", prompt_len);
     // ADR-013 P19 H9 (2026-05-01): empirical CB-sync attribution.  Reset
@@ -2876,21 +3225,11 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         tok_per_sec,
     );
 
-    if args.benchmark {
-        let (chip, mem_gb) = detect_hardware_info();
-        let model_filename = model_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        println!();
-        println!("=== Benchmark Results ===");
-        println!("Hardware: {}, {} GB", chip, mem_gb);
-        println!("Model: {}", model_filename);
-        println!("Prompt tokens: {}", prompt_len);
-        println!("Generated tokens: {}", generated);
-        println!("Prefill tok/s: {:.1}", prefill_tok_s);
-        println!("Decode tok/s: {:.1}", tok_per_sec);
-    }
+    // `--benchmark` is handled by the 5-run loop earlier in this
+    // function (which `return Ok(())`s before reaching here); the
+    // single-run summary block that lived here pre-restoration is
+    // unreachable when `args.benchmark` is true. See
+    // `if args.benchmark { ... }` above (qwen35 normal-decode branch).
 
     // ADR-028 iter-290: qwen35 generate path mirror of HF2Q_DUMP_COUNTERS dump
     // from gemma4's cmd_generate (at /opt/hf2q/src/serve/mod.rs:1361).
