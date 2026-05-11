@@ -16134,3 +16134,72 @@ No code shipped — diagnostic only.  Falsification logged so future iters skip 
 - All 3454/0 hf2q lib tests + 286/0 mlx-native lib tests still passing.
 - Bench unchanged from iter-354: legacy 73.7, hybrid 75.5 (75.7 with this iter's noise variance).
 - Coherence preserved on all configs tested.
+
+## iter-357 — Prefill is ALSO 1.6× slower; tensor cores firing; gap is code-quality
+
+### Date
+2026-05-10
+
+### New finding (this iter)
+
+Prior iters focused on decode (75 vs 103 = 0.73× peer).  This iter measured **prefill** for the first time at the same shape:
+
+```
+Peer (llama-bench pp512):           3160.58 ± 32.19 tok/s
+Ours (gemma4-ara-2pass-APEX-Q5_K_M, hybrid, ~913-tok actual prompt):
+  Batched prefill: 913 tokens in 425.5 ms = 2145.8 tok/s
+  prefill (with tokenize):  913 tok in 464ms = 1969 tok/s
+```
+
+**Prefill = 0.62-0.68× peer** (depending on whether you count tokenize CPU time).  Bigger gap than decode (0.73× peer).
+
+### Implication
+
+The peer-parity gap is **NOT decode-specific**.  It affects both prefill (mm kernels) AND decode (mv kernels).  Per the data:
+- Prefill uses `kernel_mul_mm_q6_K_f32_tensor_f32` (verified: tensor cores firing, MLX_LOG_TENSOR_PROBE=1 → "OK (using tensor variant)").
+- Decode uses `kernel_mul_mv_q6_K_f32_nr2` (NSG=2/nr0=2, matches peer's `N_R0_Q6_K=2 + N_SG_Q6_K=2`).
+- Peer also uses tensor cores for prefill (visible in their device-init log: "GPU family: MTLGPUFamilyMetal4 (5002)" + "has tensor = true").
+
+Both paths match peer's choice of compute primitives.  Gap is structural in HOW THE KERNELS ARE WRITTEN, not WHICH PRIMITIVES THEY USE.
+
+### Confirmed not-a-lever (this iter)
+
+- `simdgroup_matrix` MMA: peer's flash_attn_ext (prefill batched) uses it; peer's flash_attn_ext_vec (decode) does NOT (uses scalar dot like us).  No port lever for decode.
+- Tensor cores: already firing for prefill mm + MoE mm.
+- Metal 4 features: device init shows we have access (Apple M5 Max = `MTLGPUFamilyApple10` = Metal 4 capable) but no specific opt-in API call would change kernel performance.
+
+### Where the gap actually is
+
+After iter-326..356 (15 falsified peer-pattern micro-levers + 5 successful Phase 10 sub-iters yielding +2.4% cumulative), the inescapable conclusion:
+
+> The 22-38% peer gap on gemma4-ara-2pass-APEX-Q5_K_M.gguf is **per-kernel GPU code-quality on EXISTING dispatches**, NOT in dispatch count, scheduling, sync overhead, KV format, kernel choice, or compute primitive selection.  It can only be localized via Apple Instruments Metal System Trace.
+
+### Diagnostic snapshot for a future Instruments trace session
+
+When the operator captures an Instruments trace, focus on:
+
+| Symbol | Dispatches/decode_tok | % of dispatches | Suggested probe |
+|---|---|---|---|
+| `kernel_mul_mv_q6_K_f32_nr2` | 175 | 19.36% | per-call GPU active time vs peer (peer also has this kernel, identical parameters) |
+| `rms_norm_f32_v2` | 150 | 16.62% | per-call latency vs `kernel_rms_norm_mul_f32` (peer equivalent) |
+| `fused_head_norm_rope_f32_v2` | 60 | 6.60% | hf2q-unique fusion; check vs peer's separate norm + rope dispatches |
+| `hadamard_quantize_kv_fast_d256` | 50 | 5.50% | hf2q-unique; baseline cost — peer has no equivalent |
+| `flash_attn_vec_hybrid_dk256` | 25 | 2.75% | per-call vs peer's `kernel_flash_attn_ext_vec_f16_dk256_dv256` |
+
+For prefill traces, focus on:
+- `kernel_mul_mm_q6_K_f32_tensor_f32` (our prefill matmul; uses tensor cores)
+- `flash_attn_prefill_with_*` (our prefill SDPA)
+
+### Tests + bench
+
+- All 3454/0 hf2q lib tests + 286/0 mlx-native lib tests still passing.
+- HEAD bench unchanged from iter-354: hybrid 75.5-76.0 tok/s, legacy 73.7 tok/s.
+- New: prefill measurement at ~913 tok prompt: hybrid 1969-2145 tok/s = 0.62-0.68× peer.
+
+### Next iter
+
+Without Apple Instruments data, /loop iters from here are limited to:
+1. **Indirect command buffers** (caps at +3.5%, 3-5 iter, structural)
+2. **Pivoting** to a different work area (operator-decision)
+
+The iter-355 + iter-356 lever budget remains accurate: best-case future ceiling = 78.4 tok/s = 0.76× peer from in-scope /loop work.
