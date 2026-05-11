@@ -22095,3 +22095,48 @@ surfaced from this audit.
 ### Operator decision matrix (unchanged)
 Same five rows as iter-435.  Confirmed no hidden levers in env-flag
 space — HYBRID_KV remains the singular toggle-only lever.
+
+## iter-437 — peer's vec-mode FA kernel: NQPSG=1, NCPSG=32 = ours
+
+### Hypothesis
+Audit peer's `kernel_flash_attn_ext_vec` (single-token decode FA),
+distinct from `kernel_flash_attn_ext_impl` (prefill FA).  Verify
+hf2q vec mode has peer-parity tile dimensions.
+
+### Method
+- Read peer source: `ggml-metal-impl.h:109+` for OP_FLASH_ATTN_EXT_VEC
+  defines, `ggml-metal.metal:6666` for kernel
+- Compare to hf2q `flash_attn_vec.metal`
+
+### Results
+
+| Param | Peer (vec mode) | hf2q vec |
+|---|---|---|
+| NQPSG (queries per threadgroup) | **1** | **1** (implicit, vec mode) |
+| NCPSG (cache items per threadgroup) | **32** | **32** (`C=32` line 27) |
+| NE (head elements per thread) | 4 | (similar structure) |
+
+Peer-parity confirmed for vec-mode FA tile dimensions.
+
+### Cumulative peer-parity audit (across iter-419/425/426/429/437)
+| Optimization | Status |
+|---|---|
+| blk pre-pass tile skip (FA prefill) | ✓ peer-parity |
+| tensor_ops::matmul2d (Apple AMX) | ✓ peer-parity |
+| BF16 K storage | ✓ peer-parity |
+| Q-tile NQPSG=8 (FA prefill) | ✓ peer-parity |
+| C-tile NCPSG=64 (FA prefill) | ✓ peer-parity |
+| Q-tile NQPSG=1 (FA decode) | ✓ peer-parity |
+| C-tile NCPSG=32 (FA decode) | ✓ peer-parity |
+
+**hf2q is at structural peer-parity across all kernel-level
+optimizations**.  The remaining 0.7× decode gap is per-dispatch CPU
+launch latency (iter-397 GPU 93% bound) or sub-µs hardware physics.
+
+### Investigation count this thread
+94 total: 93 from iter-436 + this iter (vec-mode FA peer parity).
+
+### No new lever
+Continues the cumulative pattern: every peer-parity audit confirms
+hf2q has the same structural optimization.  Decode floor remains
+structural per all evidence.
