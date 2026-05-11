@@ -23229,3 +23229,60 @@ operator's prior bench).
 HYBRID_KV remains the singular operator-actionable speed lever.
 The "tile-K-into-shared" alternative was already tested and falsified
 by the operator before this thread began.
+
+## iter-456 — FA dominates decode at 56% of wall (cross-validation)
+
+### Hypothesis
+Cross-validate iter-435's HYBRID +3.3% measurement against
+iter-455's micro-bench numbers (v1 TQ-HB 277μs, F16 K 214μs at
+sliding kv=1024).
+
+### Method
+Compute FA share of decode wall using iter-455's per-kernel μs
+× per-layer counts × kv_seq_len assumption.
+
+### Results
+
+**FA composition per decode token** (using iter-455 micro-bench at
+kv=1024):
+| Component | Per token | Layers |
+|---|---|---|
+| FA_SW (D=256) | 25 × 277μs = 6.92 ms | 25 sliding |
+| FA_GL (D=512) | 5 × 289μs = 1.45 ms | 5 global |
+| **FA total** | **8.37 ms** | 30 layers |
+
+**Production decode wall** at 67 tok/s = **14.93 ms/tok**
+
+**FA share of decode wall**: **56%**
+
+### Hybrid lever theory vs measurement
+- F16 K savings: sliding 277→214 = 63μs/layer; global 289→252 = 37μs/layer
+- Assuming K-side is half of FA (matches V cost): savings × 0.5
+- Theory: 0.79 ms/tok savings = **5.3% of decode wall**
+- Measured (iter-435): **+3.3%**
+- Realization rate: 3.3 / 5.3 = **62% of theoretical**
+
+The 38% gap between theory and measured is consistent with
+per-dispatch CPU launch latency (iter-397 GPU 93% bound) — the
+kernel-level savings are partially absorbed by dispatch overhead.
+
+### Implications
+1. **FA dominates decode** (56% of wall) → all big levers must
+   target FA
+2. **HYBRID K-side is the only viable FA lever** at peer-parity
+   architecture (per iter-455 closure)
+3. **Other 44% of wall** is fragmented across MOE_GATE_UP, MOE_DOWN,
+   QKV_MM, O_MM, etc. — too small individually to be high-leverage
+4. **Multi-thread integration** (operator-gated) would parallelize
+   CPU encoding of these ~30 dispatches/layer — could provide
+   small additional gain
+
+### Investigation count this thread
+113 total: 112 from iter-455 + this iter (FA share cross-validation).
+
+### Cross-validation summary
+iter-435 measured +3.3% HYBRID; iter-455 micro-bench predicted
+~5-6% theoretical; production realization is 56-62% of theory.
+The model is internally consistent.
+
+No new lever.
