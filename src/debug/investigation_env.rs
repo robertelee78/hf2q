@@ -604,12 +604,18 @@ pub struct InvestigationEnv {
     /// 1 dispatch + moe_accum round-trip per layer (30 dispatches/decode-token
     /// on gemma4).  Requires `HF2Q_FUSED_END_OF_LAYER=1` AND `dim % 4 == 0`.
     /// Parity byte-identical at gemma4 prod shape (dim=2816, top_k=8) — see
-    /// test_fused_moe_wsum_endlayer_v2_parity.rs.  Bench +0.4% interleaved
-    /// 5-pair A/B (74.64 → 74.94, σ 0.10) at minimal config.
-    /// **Default-OFF (ADR-028 iter-367)**: coherence regresses under the
-    /// iter-321 stack (any of LMHEAD_Q6K / RMS_NORM_V2 / Q6K_MV_NR2 /
-    /// Q6K_ID_MV_NR2) — root cause not yet identified.  Opt-in only via
-    /// `HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1`.  Pending iter-368+ debug.
+    /// test_fused_moe_wsum_endlayer_v2_parity.rs.
+    /// **Default-OFF**: ADR-029 iter-3 re-test on adr-029 HEAD with full
+    /// default-flag stack (LMHEAD_Q6K + Q6K_MV_NR2 + Q6K_ID_MV_NR2 all on)
+    /// produces byte-identical 50-tok haiku output on gemma4-APEX-Q5_K_M
+    /// — coherence regresses are no longer reproducible at HEAD (the iter-367
+    /// claim is stale).  Throughput at HEAD: 74.4 t/s median (σ-pct 0.11%)
+    /// vs 75.0 baseline → **-0.8% throughput regression**, mirroring the
+    /// iter-2 H6 fused-triple-norm pattern (fewer-larger Metal kernels
+    /// regress over more-smaller at gemma4 decode shape on M5 Max).
+    /// Standing: leave default-off; mantra "code + test == truth" — the
+    /// kernel is functionally correct but loses on launch-overhead-vs-
+    /// per-call-cost balance at this shape.
     pub fused_moe_wsum_end_layer_v2: bool,
 
     /// `HF2Q_FUSED_TRIPLE_NORM=1` — replace the per-layer pair
@@ -619,7 +625,16 @@ pub struct InvestigationEnv {
     /// dispatches/layer × 30 layers = 90 dispatches/token on gemma4
     /// decode.  Kernel already exists in mlx-native (used by batched
     /// prefill) and is byte-identical with the unfused path on prefill
-    /// fixtures.  Default-OFF until decode-path correctness validated.
+    /// fixtures.
+    /// **Default-OFF**: ADR-029 iter-1 H6 test on gemma4-APEX-Q5_K_M
+    /// at HEAD with default-flag stack: coherence byte-identical
+    /// (50-tok haiku), throughput **72.9 t/s** median (σ-pct 0.05%, n=5)
+    /// vs 75.0 baseline = **-2.8% regression**.  The fused single-dispatch
+    /// kernel is correct but its per-call cost exceeds the savings from
+    /// dropping 4 unfused launches at gemma4's decode shape on M5 Max.
+    /// Sibling falsification: HF2Q_FUSED_MOE_WSUM_END_LAYER_V2 above.
+    /// Standing decision: leave default-off; the dispatch-fusion lever
+    /// class appears to lose on Apple Metal at hidden_size=2816, top_k=8.
     pub fused_triple_norm: bool,
 
     /// `HF2Q_KV_DUAL_LEGACY=1` — force the legacy 2-dispatch K+V cache

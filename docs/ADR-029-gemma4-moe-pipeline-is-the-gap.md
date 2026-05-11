@@ -332,6 +332,82 @@ re-open. **Refuse to consume any σ-pct ≥ 5% claim without re-measuring.**
    "redundant barrier" pattern is protected by infrastructure invariants
    the surface comments don't surface.
 
+### iter-3 (2026-05-11, branch `adr-029`) — H7 falsified + stale-claim cleanup + regression gate
+
+#### iter-3 ship list
+
+8. **H7 — fused-MoE-wsum-end-layer-v2 FALSIFIED** at HEAD.
+   The pre-existing `investigation_env.rs:609` comment claimed
+   "coherence regresses under iter-321 stack — root cause not yet identified".
+   Iter-3 test on adr-029 HEAD with full default-flag stack
+   (LMHEAD_Q6K + Q6K_MV_NR2 + Q6K_ID_MV_NR2 all on) re-runs the 50-tok haiku
+   fixture: **coherence byte-identical** to baseline. The iter-367 coherence
+   claim is **stale at HEAD**. Throughput bench n=5:
+   `HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1` → **74.4 t/s** (σ-pct 0.11%) vs 75.0
+   baseline = **-0.8% regression**. Coherence is fine; throughput is the
+   blocker. Same falsification class as H6 (TRIPLE_NORM):
+   dispatch-count saved (30/tok) but per-call cost > launch savings on
+   gemma4's decode shape.
+
+9. **Doc-debt cleanup**. Updated `investigation_env.rs:602-618` (FUSED_MOE_WSUM)
+   and `investigation_env.rs:621-638` (FUSED_TRIPLE_NORM) to replace the
+   stale "coherence regresses" / "default-off until validated" claims with
+   the iter-1/iter-3 measurement-grounded verdicts. Code + test == truth
+   superseding comments.
+
+10. **Regression gate**: full `cargo test --release --lib` on adr-029 HEAD
+    = **51 passed, 0 failed, 0 ignored**. No regression from the iter-1
+    kernel-profile gating fix (1cd6540f).
+
+#### iter-3 cumulative dispatch-fusion lever census (on gemma4-APEX-Q5_K_M)
+
+| flag | saves (disp/tok) | coherence | throughput | verdict |
+|---|---:|:---:|---:|:---:|
+| `HF2Q_FUSED_END_OF_LAYER` (default-on) | 30 | ✓ | baseline-included | LANDED prior |
+| `HF2Q_FUSED_TRIPLE_NORM` (H6) | 90 | ✓ | -2.8% | FALSIFIED |
+| `HF2Q_FUSED_MOE_WSUM_END_LAYER_V2` (H7) | 30 | ✓ | -0.8% | FALSIFIED |
+
+**The dispatch-fusion lever class is exhausted on gemma4-APEX-Q5_K_M at
+Apple M5 Max.** Every fewer-larger-kernel alternative loses or ties on
+throughput despite saving 30-90 dispatches/tok. Apple Metal's per-dispatch
+launch overhead at hidden_size=2816 is small enough that the fused kernel's
+per-call cost exceeds it. Future gemma4-decode optimization must work at the
+**per-kernel cost level** (kernel internals — threadgroup shape, shared
+memory, register pressure) or at **structural levels above dispatch fusion**
+(ggml-metal-style graph compilation, op-reordering for cross-CB concurrency,
+expert-batching that re-uses bandwidth across top-k slots).
+
+#### iter-3 standing direction
+
+The 27% gemma4 gap is **structurally unresolvable within ADR-029's
+flag-flip-iteration scope**. Closing it requires one of:
+
+A. **ADR-030 graph-fusion infrastructure** (multi-week): port the
+   ggml-metal scheduler's op-fusion pass. hf2q emits ~25-30 dispatches/layer;
+   peer emits ~3-4 effectively because ggml-metal compiles N ggml ops into
+   M < N Metal dispatches. The 8.4× dispatch gap is the structural delta.
+   Scope: read `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp`,
+   identify which gemma4 ops fuse, port the fusion pass into mlx-native's
+   graph.rs recording mode. ROI estimate: 1.5-2× speedup if fully ported;
+   uncertain time bound; appropriate scope for /cfa dual-mode swarm.
+
+B. **Per-kernel cost tuning** (single-iter feasible, smaller ROI): the
+   kernel-profile shows MoE bucket at 294 µs/layer in profile mode. The
+   non-trivial Q6_K mul_mv_id NR2 kernel may have residual headroom in
+   threadgroup-shape / shared-memory layout for the top-8 fan-out case
+   that's distinct from the non-_id case ADR-028 already tuned.
+
+C. **Architectural delta acceptance**: gemma4-APEX is a gemma4-26B-A4B
+   MoE without TQ-KV; qwen3.6-APEX runs the same code at **1.270× peer**.
+   The gap is gemma4-specific. Operator may accept gemma4 at 0.72× peer
+   if mantra "as fast as peer for all models we support" is interpreted
+   per-model rather than universally.
+
+This ADR's original §Decision items 1-5 are **all closed**. Branch
+`adr-029` is ready to merge to `main` (no behavior change from the
+gating-fix landing commit; documentation captures the negative findings
+that block future re-trials).
+
 ### iter-1 standing direction (revised)
 
 Decode-time dispatch-fusion (TRIPLE_NORM, MOE_WSUM_END_LAYER_V2) appears to be
