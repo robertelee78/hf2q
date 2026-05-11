@@ -19032,3 +19032,85 @@ through iter-393's reference-refresh.
 3. Pivot to qwen35 (already 1.34× peer per memory)
 4. Apple Instruments trace (operator GUI required)
 5. Accept current 0.730× / 0.749× peer asymptote
+
+## iter-395 — cross-peer audit beyond llama.cpp
+
+### Date
+2026-05-10
+
+### Goal
+Per "DO NOT BE LAZY" + /loop charter "continue until complete", survey
+peer repos beyond llama.cpp for optimizations applicable to gemma4 decode.
+
+### Repos surveyed
+
+#### `/opt/mlx-lm` (Apple's official MLX inference)
+
+Recent commits (past 2 months):
+- 2 Gemma4 fixes for KV-shared layers — NOT APPLICABLE (our model has
+  shared_kv_layers=0 per iter-378)
+- `f79dba7 perf: use max instead of argsort in apply_min_p sampling` —
+  we use greedy argmax, not min_p; NOT APPLICABLE
+- `7e67225 Faster DSV32 generation` — DeepSeek-V3.2-specific; NOT APPLICABLE
+
+#### `/opt/omlx` (Apple-native MLX engine)
+
+- `6bda678 fix(scheduler): periodic mx.clear_cache during long decodes` —
+  fixes IOGPUMetalResidencySet hitting 4096 live entries at 50k+ context.
+  Our decode at 200/1000 tok doesn't hit this limit; NOT APPLICABLE for
+  operator's bench but documented for very-long-context stability.
+- We don't use `mx.random.categorical` / `mx.compile` so root cause doesn't
+  apply.
+
+#### `/opt/candle` (Rust ML framework)
+
+- `e0e33e91 [Metal] Use StorageModePrivate for intermediate compute buffers`
+  — **POTENTIAL LEVER**.  Candle commit msg: "Remove a small CPU-GPU
+  coherency overhead from intermediate buffers."
+- iter-375 H4 dismissed this assuming Apple Silicon unified memory makes
+  Shared/Private equivalent.  Candle disagrees — there IS small overhead
+  on Shared from CPU-GPU coherency tracking.
+- Predicted gain: ~10-100 ns saved per buffer access × ~4600 accesses/token
+  ≈ 46 µs/token (~0.3%) — small but real.
+- **Blocker**: our forward_decode CPU-reads the final logits/next-token
+  buffer.  Switching activations to Private requires either:
+  - Staging-buffer pattern for the final logits readback
+  - OR splitting Shared (for CPU-readable buffers) and Private (for pure
+    intermediates).  Most of our 30+ activation fields are pure
+    intermediates that could be Private.
+- Implementation: ~1-2 days of work touching MlxBuffer alloc + maybe ~30+
+  call sites in alloc_activation_buffers + ensuring no CPU as_slice on
+  Private buffers in the hot path.
+
+#### `/opt/dflash` (multi-month port mentioned in operator decision tree)
+
+- `91c26e8 update interleaved SWA draft model` — speculative decoding with
+  draft model.  Multi-month port per operator decision tree estimate.  Not
+  iter-tractable.
+
+### Conclusion
+
+ONE potential lever discovered: candle's StorageModePrivate for
+intermediate buffers.  Predicted ~0.3% decode gain.  Implementation
+requires 1-2 days of careful work to split Shared/Private buffer pools.
+
+This is the smallest remaining concrete lever found in cross-peer audit.
+
+### Operator decision matrix (updated)
+
+| Option | Predicted gain | Cost | Risk |
+|---|---|---|---|
+| 1. Multi-thread port (iter-380-392 prep complete) | +5-7% | 5-8 iters or focus session | Medium |
+| 2. **StorageModePrivate refactor (new)** | **+0.3%** | **1-2 days** | **Low-Medium** |
+| 3. Prefill optimization (peer d1649047a tensor API) | unknown | multi-day | Medium |
+| 4. Pivot to qwen35 (already 1.34× peer) | improve user-facing claim | varies | Low |
+| 5. Apple Instruments trace | identify remaining hotspots | operator GUI | Low |
+| 6. Accept current 0.730× / 0.749× peer | — | — | — |
+
+### Cumulative state (unchanged from iter-394)
+- 5 LANDED phases + 12 multi-thread infra iters + 33 falsified/audit
+- Default: 0.730× peer 103; Hybrid: 0.749× peer 103
+- 52 total investigations
+
+### Investigation count this thread
+52 total: 51 from iter-394 + this iter (cross-peer audit).
