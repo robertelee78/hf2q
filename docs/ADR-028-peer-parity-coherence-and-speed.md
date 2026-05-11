@@ -23595,3 +23595,84 @@ phases localized).
 | HYBRID_KV | OPERATOR-GATED (+3.3% decode) |
 | Multi-thread | OPERATOR-GATED (+2.2% decode) |
 | FA_GL F8 K | OPERATOR-GATED |
+
+## iter-462 — MoE expert load is THE bottleneck (2071ms = 81% of mlx_weights_load)
+
+### Hypothesis (continued action over deferral)
+iter-461 localized startup to mlx_weights_load (2552 ms = 88%) and
+tokenizer_init (302 ms = 10%).  Per "DO NOT BE LAZY", drill into
+mlx_weights_load with cumulative per-bucket timers in the layer loop.
+
+### Method
+Added 4 cumulative `Instant` accumulators (attn / mlp / moe / misc)
+in `MlxModelWeights::load_from_gguf` layer loop (forward_mlx.rs:1593),
+opt-in via existing `HF2Q_LOAD_TIMING=1`.
+
+### Patch
+```rust
+let mut cum_attn_ns = 0u128;
+let mut cum_mlp_ns = 0u128;
+let mut cum_moe_ns = 0u128;
+// ... per-layer:
+let t_attn = Instant::now();
+// ... attn loads ...
+cum_attn_ns += t_attn.elapsed().as_nanos();
+// ... etc per bucket ...
+// post-loop:
+if load_timing {
+    tracing::info!("[LOAD_TIMING] layer_loop_buckets attn={}ms mlp={}ms moe={}ms misc={}ms",
+        cum_attn_ns/1e6, cum_mlp_ns/1e6, cum_moe_ns/1e6, cum_misc_ns/1e6);
+}
+```
+
+### Results
+
+| Bucket | Time | % of mlx_weights_load (2553 ms) |
+|---|---|---|
+| attn (q/k/v/o + norms) | 90 ms | 3.5% |
+| mlp (gate/up/down) | 50 ms | 2.0% |
+| **moe (stacked experts)** | **2071 ms** | **81%** |
+| misc (norms + push) | 0 ms | <0.1% |
+| Layer loop sum | **2211 ms** | 87% |
+| Pre-loop (embed + final_norm + lm_head) | ~342 ms | 13% |
+
+### MoE per-layer
+2071 ms / 30 layers = **69 ms per MoE layer** for expert loading.
+
+Each MoE layer loads:
+- `blk.{i}.ffn_gate_up_exps.weight` (3D tensor: 128 experts × 2*moe_int × hidden_size)
+- `blk.{i}.ffn_down_exps.weight` (3D tensor: 128 experts × hidden_size × moe_int)
+- Per-expert stride + dtype computation
+- Optionally affine bias setup
+
+### Significance
+**MoE expert load = 63% of total startup gap (1.6 sec)**:
+- Total startup: 3.29 sec
+- load_wall_clock: 2.91 sec
+- mlx_weights_load: 2.55 sec
+- **moe in layer loop: 2.07 sec** (63% of 3.29)
+
+This is THE actionable lever for startup optimization.
+
+### Lever options (operator decisions)
+1. **Lazy MoE load** (defer until first use): saves 2 sec startup,
+   adds first-request latency.  Operator UX decision.
+2. **Parallel layer load** (rayon/thread-pool MoE loads in parallel):
+   could theoretically saturate disk bandwidth, save ~1 sec.
+   Multi-iter implementation.
+3. **mmap-only mode** (skip eager registration of expert buffers,
+   register on first kernel dispatch): saves time without latency
+   penalty.  Multi-iter, likely affects iter-21 leg_hb_encoded path.
+
+### Investigation count this thread
+119 total: 118 from iter-461 + this iter (MoE load smoking gun).
+
+### Operator decision matrix (refined startup levers)
+| Lever | Effect |
+|---|---|
+| **Lazy MoE load** | **-2.0 sec startup**, +first-request latency |
+| **Parallel MoE load** | -1.0 sec startup, multi-iter |
+| **GGUF-embedded tokenizer default** | -300 ms startup |
+| Phase 15 default-on | ✓ shipped |
+| HYBRID_KV | OPERATOR-GATED |
+| Multi-thread decode | OPERATOR-GATED |

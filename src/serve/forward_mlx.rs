@@ -1590,10 +1590,20 @@ impl MlxModelWeights {
         let mut layers = Vec::with_capacity(num_layers);
         let mut kv_caches = Vec::with_capacity(num_layers);
 
+        // ADR-028 iter-462: bucket timing inside layer loop, opt-in via
+        // HF2Q_LOAD_TIMING=1.  Bisects mlx_weights_load (88% of startup
+        // per iter-461) into attn/mlp/moe/misc.
+        let load_timing = std::env::var("HF2Q_LOAD_TIMING").as_deref() == Ok("1");
+        let mut cum_attn_ns = 0u128;
+        let mut cum_mlp_ns = 0u128;
+        let mut cum_moe_ns = 0u128;
+        let mut cum_misc_ns = 0u128;
+
         for i in 0..num_layers {
             tracing::debug!("GGUF layer {}/{}: loading weights", i + 1, num_layers);
 
             // -- Attention quantized weights --
+            let t_attn = std::time::Instant::now();
             let q_proj = load_gguf_qweight(gguf, &format!("blk.{i}.attn_q.weight"), mlx_device)?;
             let k_proj = load_gguf_qweight(gguf, &format!("blk.{i}.attn_k.weight"), mlx_device)?;
             let v_proj = if cfg.is_full_attention(i) && cfg.attention_k_eq_v {
@@ -1610,6 +1620,7 @@ impl MlxModelWeights {
             let k_norm_weight = gguf.load_tensor_f32(
                 &format!("blk.{i}.attn_k_norm.weight"), mlx_device,
             ).map_err(|e| anyhow::anyhow!("layer {i} k_norm: {e}"))?;
+            cum_attn_ns += t_attn.elapsed().as_nanos();
 
             let attn = MlxAttentionWeights {
                 q_proj,
@@ -1621,6 +1632,7 @@ impl MlxModelWeights {
             };
 
             // -- Dense MLP (quantized) --
+            let t_mlp = std::time::Instant::now();
             let gate_proj = load_gguf_qweight(gguf, &format!("blk.{i}.ffn_gate.weight"), mlx_device)?;
             let up_proj = load_gguf_qweight(gguf, &format!("blk.{i}.ffn_up.weight"), mlx_device)?;
             let down_proj = load_gguf_qweight(gguf, &format!("blk.{i}.ffn_down.weight"), mlx_device)?;
@@ -1630,6 +1642,7 @@ impl MlxModelWeights {
                 up_proj,
                 down_proj,
             };
+            cum_mlp_ns += t_mlp.elapsed().as_nanos();
 
             // -- MoE expert weights (3D tensors, already stacked in GGUF) --
             //
@@ -1665,6 +1678,7 @@ impl MlxModelWeights {
             let dn_info_opt = gguf.tensor_info(&dn_name);
             let layer_has_moe_experts = gu_info_opt.is_some() && dn_info_opt.is_some();
 
+            let t_moe = std::time::Instant::now();
             let moe = if layer_has_moe_experts {
                 // MoE layer — preserve pre-iter-227 load behavior byte-
                 // identically. The two-clone of `gguf.tensor_info` is
@@ -1838,6 +1852,8 @@ impl MlxModelWeights {
                 seq_len: 0,
             });
 
+            cum_moe_ns += t_moe.elapsed().as_nanos();
+            let t_misc = std::time::Instant::now();
             layers.push(MlxDecoderLayerWeights {
                 attn,
                 mlp,
@@ -1849,8 +1865,19 @@ impl MlxModelWeights {
                 layer_type,
             });
             progress.on_layer(i + 1);
+            cum_misc_ns += t_misc.elapsed().as_nanos();
         }
         progress.finish();
+        if load_timing {
+            tracing::info!(
+                "[LOAD_TIMING] layer_loop_buckets attn={:.0}ms mlp={:.0}ms moe={:.0}ms misc(norms+push+progress)={:.0}ms n_layers={}",
+                cum_attn_ns as f64 / 1e6,
+                cum_mlp_ns as f64 / 1e6,
+                cum_moe_ns as f64 / 1e6,
+                cum_misc_ns as f64 / 1e6,
+                num_layers,
+            );
+        }
         tracing::info!(
             "Loaded {}/{} mlx-native layer weights from GGUF (including MoE)",
             num_layers, num_layers
