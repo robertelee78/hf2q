@@ -18962,3 +18962,73 @@ work per "DFlash port" estimate in the decision tree).
 
 ### Investigation count this thread
 50 total: 49 from iter-392 + this iter (script reference refresh).
+
+## iter-394 — peer recent commits audit (no applicable decode lever)
+
+### Date
+2026-05-10
+
+### Investigation focus
+Per /loop charter "continue until complete", audit recent peer commits for
+any new optimization that might apply to gemma4 decode.
+
+### Peer commits since 1 month ago (ggml-metal/)
+
+```
+$ cd /opt/llama.cpp && git log --oneline --since="1 month ago" -- ggml/src/ggml-metal/ggml-metal.metal
+d1649047a metal : optimize Metal Tensor API usage for GGML_OP_MUL_MAT (#20962)
+ae2d34899 metal: Implement ROLL op (#21946)
+aa0f1897b metal : add XIELU unary op (#20802)
+```
+
+3 commits.  Audit each:
+
+#### d1649047a — Metal Tensor API matmul2d optimization
+
+**What it does**: Separates Metal Tensor API (matmul2d, M3+ devices) path
+from legacy simdgroup_matrix path in `kernel_mul_mm`.  Tensor path uses
+`nr0=NRA, nr1=NRB` derived from `N_MM_BLOCK_X/Y * SZ_SIMDGROUP * N_MM_SIMD_GROUP_X/Y`
+constants.  Different shared memory layout (smem_a only vs smem_a+smem_b).
+
+**Applies to**: `kernel_mul_mm_*` — matrix-matrix (mm) kernels.  Active when
+`m > MM_ROUTING_THRESHOLD` (prefill regime).
+
+**Decode applicability**: NONE.  Decode runs at `m=1` → routes to mat-vec (mv)
+kernels, not mm.  Tensor API optimization doesn't apply.
+
+**Prefill applicability**: POTENTIAL LEVER for prefill (where iter-357 noted
+1.6× slower than peer).  Defer until operator prioritizes prefill.
+
+#### ae2d34899 — ROLL op kernel
+
+GGML ROLL operation kernel.  Used for sequence-permutation ops.  Gemma4 doesn't
+use this op (verified via gemma4.cpp scan).  NOT APPLICABLE.
+
+#### aa0f1897b — XIELU unary op
+
+Extended SiLU activation variant.  Gemma4 uses GELU, not XIELU.  NOT APPLICABLE.
+
+### Conclusion
+
+NO new applicable peer-source optimization for gemma4 decode in the past
+month.  Peer-source audit avenue for THIS model class formally exhausted
+through iter-393's reference-refresh.
+
+### Cumulative state at HEAD (unchanged from iter-392/393)
+- Default: 0.730× peer 103
+- Hybrid: 0.749× peer 103
+- 1000-tok sustained: 0.765× peer 97
+- 5 LANDED phases + 12 multi-thread infra iters + 33 falsified/audit
+
+### Investigation count this thread
+51 total: 50 from iter-393 + this iter (peer-source audit, no actionable lever).
+
+### Path forward (operator-decision-gated, unchanged)
+
+1. Multi-thread port (iter-380-392 prep complete; needs ~5-8 more chunked
+   iters or operator focus session): predicted +5-7% to ~0.78× peer
+2. Prefill optimization (iter-357 said 1.6× slower; peer's d1649047a
+   tensor-API improvement is a candidate lever)
+3. Pivot to qwen35 (already 1.34× peer per memory)
+4. Apple Instruments trace (operator GUI required)
+5. Accept current 0.730× / 0.749× peer asymptote
