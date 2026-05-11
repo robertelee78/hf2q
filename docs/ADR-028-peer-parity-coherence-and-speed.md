@@ -19712,3 +19712,52 @@ within noise σ ~0.10).
 
 ### Investigation count this thread
 61 total: 60 from iter-403 + this iter (verification).
+
+## iter-405 — fix pre-existing Q4_0 ID test tolerance (3 false-negatives)
+
+### Date
+2026-05-10
+
+### Goal
+Per iter-404 finding, 3 Q4_0 ID tests were failing with `max_err 1e-6`
+(essentially zero error) but strict assertion `0.0` tolerance.  Real bug
+in test code, not in kernel.  Fix.
+
+### Implementation
+
+3 tests in `tests/test_quantized_matmul_id_ggml.rs` — tolerance changed
+`0.0` → `1.0e-5`:
+- `test_q4_0_id_vs_norid` (line 507)
+- `test_q4_0_id_vs_norid_4tok` (line 529)
+- `test_q4_0_production_shape` (line 565)
+
+Added comment explaining: Q4_0 ID vs non-ID variants have FMA-fusion
+differences in f32 reduction order producing ~1e-6 mismatches on
+otherwise-identical math.  Q8_0 tests pass at 0.0 because its kernel
+fuses identically.
+
+### Verification
+
+```
+test test_q4_0_id_vs_norid ... ok
+test test_q4_0_id_vs_norid_4tok ... ok
+test test_q4_0_production_shape ... ok
+test result: ok. 9 passed; 0 failed
+```
+
+All 9 Q4_0/Q8_0/Q5_K ID tests now pass.
+
+### Wider verification
+
+- mlx-native lib: 290/0 passing
+- Integration tests: all PASS (no failures across the suite)
+- 1e-5 tolerance is still very strict (1 ULP at f32 magnitude ~10);
+  real correctness preserved
+
+### Tests + bench
+- mlx-native lib: 290/0 + integration tests all PASS.
+- hf2q lib: 3454+2 passing.
+- No production code change → no bench impact.
+
+### Investigation count this thread
+62 total: 61 from iter-404 + this iter (test-tolerance fix).
