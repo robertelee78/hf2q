@@ -22815,3 +22815,72 @@ Per RAM-mantra "preserve TQ-HB 3.94× per-slot savings", the HYBRID
 opt-in costs 33% more memory than default — not 19% as iter-435/auto-
 memory had documented.  Operator decision more constrained than
 previously thought.
+
+## iter-449 — gemma4 config from GGUF metadata; per-slot ratios nkv-independent
+
+### Hypothesis
+iter-447 used nkv=16 in per-slot calc; iter-346 used nkv=8.  Verify
+the actual gemma4 nkv value from GGUF metadata, and confirm the
+3.94× / 2.65× ratios are correct regardless.
+
+### Method
+Extract gemma4 config via gguf-py:
+```python
+from gguf import GGUFReader
+r = GGUFReader('gemma4-ara-2pass-APEX-Q5_K_M.gguf')
+```
+
+### gemma4 config (verified)
+
+| Param | Value |
+|---|---|
+| block_count (n_layer) | 30 |
+| attention.head_count (Q heads) | 16 |
+| **attention.head_count_kv (KV heads, GQA)** | **8** |
+| attention.key_length (D global) | 512 |
+| attention.value_length (D global) | 512 |
+| attention.sliding_window | 1024 |
+| attention.key_length_swa (D sliding) | 256 |
+| attention.value_length_swa (D sliding) | 256 |
+| context_length (max) | 262144 |
+
+So **nkv=8** (per iter-346); iter-447 erroneously assumed nkv=16.
+
+### Per-slot ratio verification (with corrected nkv=8)
+
+| Mode | K bytes | V bytes (incl norm) | Total | Savings |
+|---|---|---|---|---|
+| F32 baseline | 8,192 | 8,192 | **16,384** | 1.00× |
+| TQ-HB | 2,080 | 2,080 | **4,160** | **3.94×** ✓ |
+| Hybrid F16-K + TQ-HB-V | 4,096 | 2,080 | **6,176** | **2.65×** |
+
+**Per-slot ratios are nkv-independent** — same 3.94× / 2.65× answer
+regardless of nkv. iter-447 conclusion is CORRECT (just different
+absolute byte counts).
+
+### iter-447 byte numbers corrected
+| Mode | Per-slot bytes (corrected, nkv=8) |
+|---|---|
+| F32 | 16,384 (was 32,768 with nkv=16) |
+| TQ-HB | 4,160 (was 8,320) |
+| Hybrid | 6,176 (was 12,352) |
+
+The RATIOS (3.94×, 2.65×) and conclusions remain the same.
+
+### Implication for total memory at gemma4 defaults
+At sw=1024, all 30 layers sliding (D=256, nkv=8):
+- F32: 30 × 8 × 1024 × 256 × 4 × 2 = 503 MB ✓ (matches iter-346)
+- TQ-HB: 503 / 3.94 = 128 MB
+- Hybrid: 503 / 2.65 = 190 MB
+
+iter-346's "504 MB / 128 MB" matches.  iter-346's "158 MB" hybrid
+total is wrong; correct is **190 MB**.
+
+### Investigation count this thread
+106 total: 105 from iter-448 + this iter (nkv verification +
+ratio independence proof).
+
+### No further code/doc change
+The iter-448 fix already used the right ratios (3.94×, 2.65×).
+This iter just confirms iter-447's nkv assumption was off by 2× but
+the conclusion (ratios) is correct and nkv-independent.
