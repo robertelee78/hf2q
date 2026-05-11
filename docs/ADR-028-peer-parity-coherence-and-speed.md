@@ -20222,3 +20222,91 @@ holds 2400+ at 16K.  Possible causes:
 high-leverage lane.  Multi-thread infra is already in place
 (iter-380-396), and small-prompt regime is exactly where CPU
 encoding amortization helps most.
+
+## iter-413 — prefill curve fit: ~141 ms fixed overhead per prefill (smoking gun)
+
+### Hypothesis
+iter-412 showed prefill ratio is size-dependent (0.509× at pp413,
+0.900× at pp8013).  Classic shape of fixed-cost amortization.  Fit
+linear model `T(N) = T_overhead + N × T_per_tok` to extract the
+fixed cost; if non-trivial, this is a lever distinct from per-kernel
+optimization.
+
+### Method
+hf2q `generate --max-tokens 1` at 8 small prompt sizes (63, 113, 263,
+513, 1013, 2013, 4013, 8013 tokens), 3 reps each, parsed wall time
+from "Batched prefill complete".
+
+### Raw timing (3-rep mean, in ms)
+
+| N tokens | T (ms) | tok/s |
+|---|---|---|
+| 63 | 180.1 | 350 |
+| 113 | 196.6 | 575 |
+| 263 | 244.6 | 1075 |
+| 513 | 324.5 | 1581 |
+| 1013 | 484.0 | 2093 |
+| 2013 | 825.8 | 2438 |
+| 4013 | 1573.5 | 2550 |
+| 8013 | 3316.5 | 2416 |
+
+### Linear fit (513-tok and 4013-tok anchors)
+- Slope: `(1573.5 - 324.5) / (4013 - 513) = 0.357 ms/tok`
+- Intercept: `324.5 - 513 × 0.357 = 141.5 ms`
+- **Model: T(N) ≈ 141.5 + 0.357 × N (ms)**
+- Predicted at N=1013: 503 ms vs measured 484 ms (≈4% off — fit is good)
+
+### Comparison to peer
+- Peer pp4013 = 2950 tok/s → T_per_tok = 0.339 ms (close to ours 0.357)
+- Peer pp413 = 2848 tok/s → T = 145 ms total
+- Peer fixed overhead: `145 - 413 × 0.34 = 145 - 140 = ~5 ms`
+- **hf2q fixed overhead: ~141 ms vs peer ~5 ms** — 28× more
+
+### Why this matters
+At pp413, fixed overhead = `141 / 145 = 97%` of peer's total wall.
+Per-token compute is roughly competitive (0.357 ms vs 0.339 ms, only
+5% slower).  **Almost the entire 0.509× peer ratio at pp413 is the
+overhead, not the kernel work.**
+
+If overhead were eliminated:
+- hf2q pp413 wall: `413 × 0.357 = 147 ms` → 2810 tok/s = **0.987× peer**
+- hf2q pp1013 wall: `1013 × 0.357 = 362 ms` → 2799 tok/s = **0.892× peer**
+
+The "small-prompt" gap is dominated by overhead.  Long-prompt gap
+(~10% at pp8013) is genuine compute slope.
+
+### Candidate causes of the 141 ms overhead
+Per Chesterton's fence — investigate before changing.  Candidates:
+1. **Pipeline JIT compile / Metal kernel cache warm** — first-prefill-only setup
+2. **Buffer allocation / Metal device residency-set warmup**
+3. **TQ-HB FWHT init or Hadamard sign vector setup** (per-prefill)
+4. **Tokenizer / chat-template processing** (CPU)
+5. **KV cache slot allocation** (if growing per-prefill)
+6. **Some debug/probe emission** (env-var checks, stat init)
+
+The 141 ms is VERY close to "~1 model layer worth of GPU work" — could
+also be a synchronization stall waiting for a previous frame's GPU
+ops to drain before prefill starts.
+
+### Action
+Next iter (iter-414): instrument `forward_prefill_batched` startup
+with wall-clock timestamps to localize the 141 ms.  Add
+HF2Q_PREFILL_TIMING env-gated probe (mirrors HF2Q_MLX_TIMING for
+decode).  No code change yet — measurement first.
+
+### Investigation count this thread
+70 total: 69 from iter-412 + this iter (overhead extraction).
+
+### Operator decision matrix (REFINED — overhead localized)
+
+| Lever | Predicted | Empirical | Cost |
+|---|---|---|---|
+| **Eliminate 141 ms prefill overhead** | 0.51× → 0.99× peer at pp413 | 28× more than peer | iter-414 instrument first |
+| Prefill compute slope (0.357 vs 0.339) | small lever, ~5% gap | ~10% at pp8013 | per-kernel work (already exhausted) |
+| 16K prefill regression | ~44% slower per-tok | confirmed | sliding-window TBI |
+| Multi-thread port | +2.2% decode | direct hit on overhead | 5-8 iters |
+| Decode 0.726× | exhausted | confirmed | — |
+
+**Top lever**: localize and remove the 141 ms prefill overhead.
+This is the largest CONCRETE actionable gap discovered in 70
+investigations.
