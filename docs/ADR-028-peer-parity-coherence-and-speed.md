@@ -22567,3 +22567,52 @@ hypotheses.  At this point the operator decision matrix is complete:
 - Decode floor: structural, exhausted at kernel level
 - Multi-thread: ready but operator-decision-gated
 - HYBRID_KV: available but operator-decision-gated (memory tradeoff)
+
+## iter-445 — StorageModeShared peer-parity confirmed (7th audit)
+
+### Hypothesis
+Peer log: "use shared buffers = true".  Verify hf2q uses Metal
+StorageModeShared (CPU/GPU coherent) for buffer allocations.
+
+### Method
+Grep `/opt/mlx-native/src/buffer*.rs` and `device.rs` for storage
+mode declarations.
+
+### Findings
+hf2q uses `MTLResourceOptions::StorageModeShared` exclusively:
+- `device.rs:153`: `new_buffer(byte_len, StorageModeShared)`
+- `buffer_pool.rs:158`: bucket allocator uses StorageModeShared
+- `buffer.rs:3`: file comment "Buffers are allocated with
+  StorageModeShared so that CPU and GPU share..."
+
+**Peer-parity confirmed.**
+
+### Cumulative peer-parity audits (7 across iter-419/425/426/429/437/444/445)
+| Optimization | Status |
+|---|---|
+| blk pre-pass tile skip (FA) | ✓ |
+| tensor_ops::matmul2d (Apple AMX) | ✓ |
+| BF16 K storage | ✓ |
+| Q-tile NQPSG=8/1 (FA prefill/vec) | ✓ |
+| C-tile NCPSG=64/32 (FA prefill/vec) | ✓ |
+| MTLResidencySet | ✓ |
+| **StorageModeShared (CPU/GPU shared)** | **✓** |
+
+### Note on StorageModePrivate possibility
+Per iter-396 synthetic bench: StorageModePrivate (GPU-only, no CPU
+coherency) could give 0.07-0.68% production speedup by removing
+CPU-side write-coherency tracking.  But:
+- Requires explicit blit copies for any CPU read (e.g., logits
+  readback, sample, argmax)
+- Multi-iter refactoring scope (every CPU read site needs blit)
+- Tradeoff: small gain vs significant architectural change
+
+Not a single-iter probe; operator-decision-gated work.
+
+### Investigation count this thread
+102 total: 101 from iter-444 + this iter (StorageModeShared parity).
+
+### No new lever
+hf2q is at peer-parity for memory-management infrastructure.  The
+0.7× pure decode floor is genuinely structural; remaining work is
+all multi-iter operator-decision-gated.
