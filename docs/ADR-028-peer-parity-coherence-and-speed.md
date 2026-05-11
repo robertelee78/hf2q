@@ -23102,3 +23102,66 @@ of stack, with iter-415-421 below.
 - 8 peer-parity audits done
 - 2 doc bugs fixed (3.19→2.65 hybrid math, nkv=8 FA_GL)
 - Operator decision matrix: 3 multi-iter levers remaining (HYBRID_KV, multi-thread, FA_GL F8 K)
+
+## iter-454 — F16_KV (F16 K + F16 V) bench: marginal speed at heavy memory cost
+
+### Hypothesis
+hf2q has `flash_attn_vec_f16kv_dk{256,512}` kernel variant (F16 for
+both K and V).  Bench it via `HF2Q_F16_KV=1` (with UNSAFE ack) to
+characterize the third KV-storage option alongside default TQ-HB and
+HYBRID.
+
+### Method
+hf2q serve with `HF2Q_F16_KV=1 HF2Q_UNSAFE_EXPERIMENTS=1`, max_tokens=
+128, T=0, 3 unique prompts via streaming SSE.
+
+### Results
+
+| Mode | tok/s (3 reps) | mean | Memory savings |
+|---|---|---|---|
+| **default TQ-HB-K+V** | 66.85 / 66.90 / 66.98 (iter-451) | **66.91 ± 0.05** | **3.94×** |
+| **HYBRID F16-K + TQ-HB-V** | 69.12 / 69.51 / 68.12 (iter-435) | 68.92 ± 0.71 | 2.65× |
+| **F16-K + F16-V** (this iter) | 67.36 / 67.07 / 67.11 | **67.18 ± 0.16** | **2.00×** |
+
+Coherence: "What is 2+2?" → "2 + 2 = 4" ✓
+
+### Three-way tradeoff comparison
+
+| Mode | Speed Δ | Memory savings |
+|---|---|---|
+| TQ-HB (default) | baseline | 3.94× |
+| F16 K+V | +0.4% (noise) | 2.00× (loses 49%) |
+| HYBRID K-F16 + V-TQ-HB | +3.3% real | 2.65× (loses 33%) |
+
+### Diagnosis
+F16 K+V mode provides essentially NO speed benefit (+0.4% within
+noise) despite halving K bandwidth.  HYBRID (which uses F16 K +
+TQ-HB V) provides +3.3% — meaning the speed gain comes from K-side
+specifically, not V-side.
+
+The `flash_attn_vec_f16kv` kernel may not have the recent
+optimizations that flash_attn_vec_hybrid has (function-constant
+specialization, recent peer-pattern alignment).  Or V-side TQ-HB
+overhead is so small that converting V to F16 doesn't help speed.
+
+### Lever assessment
+F16 K+V is **strictly worse than HYBRID** at HEAD:
+- Less speed (+0.4 vs +3.3%)
+- More memory cost (49% loss vs 33% loss)
+- No reason to use it
+
+HYBRID remains the only operator-actionable lever.  F16 K+V can be
+removed from the operator decision matrix.
+
+### Investigation count this thread
+111 total: 110 from iter-453 + this iter (F16_KV bench).
+
+### Operator decision matrix (F16_KV row eliminated)
+| Lever | Status | Speed | Memory cost |
+|---|---|---|---|
+| Phase 15 default-on | ✓ shipped | prefill 35-43× | 0 |
+| MTLResidencySet | ✓ default-on | +0.7% decode | 0 |
+| HYBRID_KV | OPERATOR-GATED | **+3.3% decode** | **33%** |
+| ~~F16_KV~~ | DOMINATED by HYBRID | ~~+0.4%~~ | ~~49%~~ |
+| Multi-thread | OPERATOR-GATED | +2.2% | 0 (CPU only) |
+| FA_GL F8 K | OPERATOR-GATED | ~50% pp16K | small |
