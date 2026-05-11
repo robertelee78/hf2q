@@ -21344,3 +21344,90 @@ assessment).
 | FA_GL kernel locality | +20% pp16K | unmeasured | research |
 | Multi-thread port | +2.2% decode | unmeasured | 5-8 iters |
 | Decode 0.726× | exhausted | confirmed | — |
+
+## iter-426 — FA_GL Q-tile peer parity verified + pp16K direct peer comparison
+
+### Hypothesis
+iter-425 cited "F32 K = 525 MB/layer" but `pf_k_perm = alloc_bf16` →
+already 16-bit.  Re-derive bandwidth model with correct dtype.  Also
+verify peer's Q-tile size matches ours, and measure peer pp16K rate
+directly for the canonical comparison.
+
+### Method
+1. Read `forward_prefill_batched.rs:438` to confirm `pf_k_perm` dtype
+2. Read `flash_attn_prefill_d512.metal:272` for our Q-tile size
+3. Read `llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h:106` for
+   peer NQPSG
+4. `llama-bench -p 16021 -n 0 -r 2` for peer canonical pp16K
+
+### Findings
+
+**Dtype correction**:
+- `pf_k_perm = alloc_bf16(...)` (line 438) — already 16-bit, NOT F32
+- Per-layer K bytes: 16021 × 512 × 16 × 2 (BF16) = **262 MB** (was
+  iter-425's 525 MB)
+- 5 layers × 262 MB = 1.31 GB total K storage
+
+**Q-tile size**: peer-parity confirmed
+| Param | hf2q | peer |
+|---|---|---|
+| NQPSG (queries per threadgroup) | **8** | **8** |
+| NCPSG (cache items per threadgroup) | **64** | **64** |
+| Shared-mem budget per Q-tile | 24,576 B | 24,576 B |
+
+**Peer pp16K direct measurement**:
+| Stack | pp16021 | Ratio |
+|---|---|---|
+| **Peer** llama.cpp 9010 | 2461.84 ± 56.74 tok/s | 1.000× |
+| **hf2q** HEAD (Phase 15 default-on) | 1929.7 tok/s | **0.784× peer** |
+
+### Gap at long context (refined)
+| pp | hf2q | peer | Ratio | Δ from pp4K |
+|---|---|---|---|---|
+| pp4013 | 2550 | 2950 | 0.864× | baseline |
+| pp8013 | 2416 | 2684 | 0.900× | +0.036 |
+| pp16021 | 1930 | **2462** | **0.784×** | **-0.080** |
+
+**The pp16K ratio is WORSE than pp4K's** — 8% wider gap.  Both
+hf2q and peer slow down at 16K (peer ~17% slower at 16K vs 4K, hf2q
+~24% slower).  Our FA_GL O(N²) growth is more aggressive than peer's.
+
+### Per-call FA_GL ms (hf2q vs peer-derived)
+hf2q has 5 FA_GL calls per prefill.  Per call:
+- pp4K: 31.9 ms
+- pp16K: 561.9 ms
+- Per-call ratio (4K→16K): 17.6× for 4× tokens (super-quadratic)
+
+Peer's underlying compute is similar (NQPSG=8 etc.), but their total
+pp16K wall is ~6500 ms vs ours 8302 ms.  Peer's lower per-call FA_GL
+overhead suggests:
+- Better K-cache locality (Apple SLC management)
+- Different dispatch chain layout reduces re-serialization between
+  kernels
+
+### Lever assessment refined
+**Confirmed exhausted at peer-parity tuning level**:
+- Q-tile size = peer ✓
+- C-tile size = peer ✓
+- blk skip pre-pass = peer ✓
+- BF16 K (already half of original F32) ✓
+
+**Remaining levers (multi-iter)**:
+- F8 K storage for global layers (would need new kernel variant)
+- Cross-layer K cache reuse (architectural)
+- Sparse global attention (research-level)
+
+The gap at pp16K is a real ~22% wall-time gap (8302 vs 6500 ms);
+fixing requires F8 K kernel variant or fundamental redesign.
+
+### Investigation count this thread
+83 total: 82 from iter-425 + this iter (Q-tile parity verification +
+peer pp16K direct + gap quantification).
+
+### Operator decision matrix (refined)
+| Lever | Predicted | Empirical | Cost |
+|---|---|---|---|
+| Phase 15 default-on | 35-43× prefill | 0.022→0.94× peer | ✓ shipped |
+| Pp16K gap closure (F8 K) | 0.78→~0.95× peer | ~22% wall improvement | multi-iter kernel |
+| Multi-thread port | +2.2% decode | unmeasured | 5-8 iters |
+| Decode 0.726× | exhausted | confirmed | — |
