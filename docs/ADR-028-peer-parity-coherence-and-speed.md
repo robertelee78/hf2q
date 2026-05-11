@@ -22140,3 +22140,55 @@ launch latency (iter-397 GPU 93% bound) or sub-µs hardware physics.
 Continues the cumulative pattern: every peer-parity audit confirms
 hf2q has the same structural optimization.  Decode floor remains
 structural per all evidence.
+
+## iter-438 — HF2Q_PIPELINE_TG_MULT_HINT bench: null (within noise)
+
+### Hypothesis
+mlx-native iter-376 added `HF2Q_PIPELINE_TG_MULT_HINT=1` env-flag
+that calls `set_thread_group_size_is_multiple_of_thread_execution_width(true)`
+on every Metal pipeline, claimed to enable more aggressive Metal
+compiler codegen.  Bench at HEAD with default vs flag-on.
+
+### Method
+hf2q serve, max_tokens=128, T=0, 3 unique prompts via streaming SSE,
+both modes.
+
+### Results
+
+| Mode | tok/s (3 reps) | mean ± std |
+|---|---|---|
+| Default (no env) | 67.24 / 67.09 / 67.31 | **67.21 ± 0.11** |
+| `HF2Q_PIPELINE_TG_MULT_HINT=1` | 66.94 / 66.58 / 67.34 | **66.95 ± 0.39** |
+| **Δ** | | **-0.4% (within noise)** |
+
+### Findings
+The Metal compiler hint provides no measurable production decode
+speedup at HEAD on M5 Max with this gemma4 model.  Default-OFF is
+correct.
+
+Possible reasons:
+- Apple Metal compiler may already infer this property from kernel
+  attributes (constant tg_size in our kernels)
+- The compiler optimization saved by the hint may be redundant with
+  other M5 Max codegen
+- Or the hint affects compile-time only, not runtime perf
+
+### Investigation count this thread
+95 total: 94 from iter-437 + this iter (TG_MULT_HINT bench).
+
+### Audit cumulative tally for default-OFF perf flags
+| Flag | Status (HEAD) |
+|---|---|
+| `HF2Q_GRAPH_OPT=1` (iter-436) | +0.2% noise |
+| `HF2Q_FUSED_TRIPLE_NORM=1` (iter-436) | -2.5% regression |
+| `HF2Q_PIPELINE_TG_MULT_HINT=1` (this iter) | -0.4% noise |
+| `HF2Q_HYBRID_KV=1` (iter-435) | **+3.3% real** (operator-gated, 19% memory cost) |
+| `HF2Q_SERVE_BATCHED_PREFILL=0` (legacy mode) | -29-43× regression |
+
+**HYBRID_KV is the SOLE remaining default-OFF flag with measurable
+positive impact**.  All other perf-related flags either have no
+benefit or regress at HEAD.
+
+### Operator decision matrix (unchanged)
+Same five rows as iter-435.  Continued elimination of false leads
+clarifies the picture: HYBRID_KV is the only single-flip lever.
