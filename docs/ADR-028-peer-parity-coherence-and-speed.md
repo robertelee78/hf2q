@@ -17518,3 +17518,103 @@ Adding more splits doesn't help:
 ### Investigation count this thread
 31 total: 30 from iter-373 + this iter (parity ✓ infrastructure ✓ but no
 perf win — like iter-365/368/370).
+
+## iter-375 — Metal compile options + threadgroup hint audit (no code change)
+
+### Date
+2026-05-10
+
+### Investigation focus
+
+After iter-374's multi-split falsification, audit other low-level Metal API
+levers that could close per-dispatch CPU/GPU overhead vs peer.
+
+### H1: MTLCompileOptions parity with peer
+
+Verified peer source `ggml-metal-device.m:228-241`: peer creates
+`MTLCompileOptions` with default values + `preprocessorMacros` only.
+`setFastMathEnabled:false` is COMMENTED OUT (line 231) — peer uses
+default fast-math (true).
+
+Our `kernel_registry.rs:944` uses `metal::CompileOptions::new()` (metal-rs
+defaults).  Per metal-rs source: defaults match Apple Metal's defaults.
+**Match peer.**
+
+### H2: HazardTrackingMode
+
+Verified neither peer nor we use `MTLHazardTrackingModeUntracked`.  Both
+rely on Apple's default hardware-managed dependency tracking.  We additionally
+manage barriers via our own `ConflictTracker` (graph.rs).  **Match peer.**
+
+### H3: threadGroupSizeIsMultipleOfThreadExecutionWidth pipeline hint
+
+This Apple Metal pipeline-descriptor flag tells the compiler that threadgroup
+size is always a multiple of SIMD width (32), allowing more aggressive
+codegen.  Most of our hot kernels use tg_size = 256 (multiple of 32) so this
+hint would apply.
+
+**Blocker**: `metal-0.33.0` (our pinned metal-rs version) does NOT expose this
+API.  Adding it requires either:
+- Direct objc `msg_send!` invocation (~10 LOC + safety wrapper)
+- Upstream metal-rs PR (out of /loop scope)
+
+Potential gain: typically <1% on Apple GPU per Apple's profiling docs.  Below
+threshold for /loop budget.
+
+### H4: Buffer storage mode (StorageModeShared vs Private)
+
+Peer uses `MTLResourceStorageModeShared` for activations + `Private` for
+some allocation paths (line 1470).  We use `StorageModeShared` exclusively
+(simpler, allows CPU readback for debug).  Apple Silicon unified memory
+makes Shared and Private equivalent in most cases.  **No actionable lever.**
+
+### Investigation outcome
+
+NO new optimization lever found within /loop iter budget.  Per-iter-tractable
+optimization avenue is formally exhausted across:
+- per-kernel V2 ports (iter-310/331/337/362/363) — done
+- per-kernel float4 vectorization (iter-365) — falsified for memory-bound
+- kernel fusions (iter-366/367/370) — parity ✓ but bench flat or worse
+- peer-port matmul kernels (iter-368) — parity ✓ flat at gemma4 shapes
+- dispatch architecture (iter-369) — already efficient (1-2 cmd_bufs/token)
+- dual_buffer_split tuning (iter-373) — LANDED +0.18%
+- multi-split (iter-374) — falsified
+- Metal compile options (iter-375 this) — match peer
+
+### Cumulative thread state (post-iter-375)
+
+| | Status |
+|---|---|
+| LANDED phases | 5 (Phase 9 + 10 + 13 + 13.2 + 14) |
+| Falsified investigations | 27 |
+| Total investigations | 32 |
+| Decode legacy gain @ default | +1.3% (73.7 → ~74.7-74.8) |
+| Decode hybrid gain @ default | +4.1% (73.7 → ~76.6) |
+| vs peer (legacy) | 0.726× peer (74.8 / 103) |
+| vs peer (hybrid) | 0.744× peer (76.6 / 103) |
+
+### Path forward (operator-decision-gated, unchanged from iter-369/372)
+
+The remaining ~25% peer gap requires multi-day engineering:
+
+1. **Multi-thread encoding port** (peer's `n_cb=2` GCD `dispatch_apply`):
+   - Real ~3-5% gain potential
+   - Requires thread-safe encoder, per-thread cmd_bufs, conflict tracker
+     coordination across threads
+   - Multi-day implementation
+
+2. **threadGroupSizeIsMultiple hint**: <1% gain, ~10 LOC of objc raw msg_send
+   if operator wants the lever
+
+3. **Apple Instruments Metal trace**: requires operator GUI session to
+   identify remaining hotspot ratios
+
+4. **Pivot work area**: qwen35 perf, prefill optimization, additional models
+
+5. **Accept current asymptote**: 0.726× peer legacy / 0.744× peer hybrid
+
+### Tests + bench
+No code change shipped this iter.
+
+### Investigation count this thread
+32 total: 31 from iter-374 + this iter (audit-only).
