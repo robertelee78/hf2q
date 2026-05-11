@@ -249,7 +249,90 @@ If any of these fail to reproduce within σ-pct < 5%, suspect (a) thermal thrott
 | **H6** fused-triple-norm decode | +3-5% (90 disp/tok save) | -2.8% (-2.1 t/s) | **FALSIFIED — kernel per-call cost > launch savings at decode shape** |
 | MoE-2 NR2 port (§Decision 2b) | +3-7% if peer NR2 hf2q NR1 | both on NR2 (Q6_K) / NR1 (Q5_K/Q8_0) — no gap | **FALSIFIED — already on parity paths** |
 
-#### iter-1 standing direction (revised)
+#### iter-2 (2026-05-11, branch `adr-029`) — §Decision items 4 & 5 CLOSED
+
+#### iter-2 ship list
+
+5. **§Decision item 4 — qwen3.6 σ-pct re-test CONFIRMED 1.27× peer**, not a
+   thermal artifact. Same machine (Apple M5 Max, 128 GB), same thermal session,
+   same homebrew llama.cpp `d05fe1d7d (9010)`, same fresh-bench discipline as
+   gemma4.
+   | source | tool | n | result | σ-pct |
+   |---|---|---:|---:|---:|
+   | hf2q | `hf2q generate ... --max-tokens 200 --benchmark` | 5 | **129.7 t/s** | 0.14% |
+   | peer | `llama-bench -m … -p 0 -n 200 -r 10` | 10 | **102.17 ± 0.22 t/s** | 0.22% |
+   Ratio: 129.7 / 102.17 = **1.270× peer**. Both σ-pct well below 5% gate.
+   Interpretation: qwen3.6's iter-487 claim survives. **Important contrast vs
+   gemma4** — hf2q is 27% slower on gemma4 (0.724× peer) but 27% **faster** on
+   qwen3.6 (1.270× peer). The decode gap is **model-architecture-specific to
+   gemma4**, not a hf2q-wide regression. Likely driver: qwen3.6 runs the
+   TQ-KV path by default (ADR-027 Phase B, 3.94× KV memory savings) while
+   gemma4 does not (`tq_kv = inactive` at load banner per ADR-029 §Links).
+   Architectural delta between the two MoE models, not just MoE-pipeline
+   inefficiency.
+
+6. **§Decision item 5 — σ-pct standing rule** explicitly codified below as a
+   normative part of this ADR's §Validation gate. All future "X× peer" claims
+   in commit messages, ADRs, memories, or comments must report σ-as-pct-of-mean
+   alongside the ratio. Claims with σ-pct > 5% are thermal-artifact-suspect
+   and **MUST** be re-measured in a thermally-stable session before being
+   acted upon.
+
+### Standing rule — σ-pct gate on peer-parity claims
+
+Every "X× peer" or "X tok/s" claim in this repo (ADRs, commit messages,
+memories, code comments, doc strings) carries **two numbers**:
+
+1. **mean (or median)** — what was measured
+2. **σ-pct** = (standard deviation) / (mean) × 100
+
+A claim is **defensible** when σ-pct < 5% and the comparison is apples-to-apples
+(same machine, same GGUF, same thermal session, same prompt shape, same
+sampling, both engines fresh-loaded).
+
+A claim with σ-pct ≥ 5% is **thermal-artifact-suspect** and MUST be either:
+(a) re-measured in a cooler thermal session and re-stated with the new
+    σ-pct, OR
+(b) caveated as "exploratory, not load-bearing" — and never acted upon as a
+    closure verdict.
+
+This rule is enforced retroactively: ADR-028 §iter-486's "tied at 77 ± 15 t/s"
+(σ-pct = 20%) is the canonical violation; it triggered an 18-iter mission
+re-open. **Refuse to consume any σ-pct ≥ 5% claim without re-measuring.**
+
+7. **§Decision item 2c — MoE-3 barrier audit FALSIFIED via Chesterton's-fence
+   code-read.** Hypothesis: redundant `barrier_between(reads, writes)` calls
+   in the B8-B14 MoE chain emit unnecessary Apple Metal `memory_barrier()`
+   instructions, inflating the 487 measured barriers/tok.
+   Verdict: `mlx_native/src/graph.rs:1494-1530` `barrier_between` already
+   **deduplicates via a conflict tracker**. The flow is:
+   ```rust
+   let reason = self.tracker.conflicts_reason(reads, writes);
+   if let Some(_) = reason {
+       self.encoder.memory_barrier();   // ← only here, on real conflict
+       self.tracker.reset();
+       self.barrier_count += 1;
+   }
+   self.tracker.add(reads, writes);
+   ```
+   Calls to `barrier_between` with no real RAW/WAR conflict are zero-cost
+   bookkeeping — no Metal barrier is emitted; `barrier_count` is not
+   incremented. The 487 barriers/tok counter measures **actual emitted
+   `enc.memory_barrier()` instructions**, i.e. provably-needed barriers
+   given the current dispatch ORDER. Hand-merging `barrier_between(...)`
+   call-sites would not reduce this count. The standing pattern
+   `B11: dense_down + gate_up_id [2 concurrent]` (forward_mlx.rs:4432-4471)
+   already runs concurrent under Metal — the two adjacent `barrier_between`
+   calls produce a single emitted Metal barrier when the second call's
+   reads/writes don't conflict with the first dispatch's outputs.
+   Implication: reducing the 487 barriers/tok requires **reducing the
+   dispatch count** itself (kernel fusion), which H6 already falsified
+   for the largest available fusion (-2.8% at triple-norm).
+   This is the canonical Chesterton's-fence outcome: the apparent
+   "redundant barrier" pattern is protected by infrastructure invariants
+   the surface comments don't surface.
+
+### iter-1 standing direction (revised)
 
 Decode-time dispatch-fusion (TRIPLE_NORM, MOE_WSUM_END_LAYER_V2) appears to be
 a dead-end class on M5 Max — Apple Metal's per-dispatch overhead at the shapes
