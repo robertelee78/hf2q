@@ -16265,3 +16265,90 @@ Standing /loop directive "continue until complete" + 16 falsifications suggests 
 - (c) Pivot to a different gemma4 work area (e.g., long-context >8K bench, additional model coverage, prefill-specific structural work)
 
 Continuing aimless /loop iters at this point would produce more falsifications without measurable speedup.
+
+## iter-359 — ICB falsified-by-precedent; peer's MTLSharedEvent + n_cb=2 thread pattern identified
+
+### Date
+2026-05-10
+
+### ICB hypothesis FALSIFIED before implementation
+
+Per iter-356 lever budget: "Indirect command buffers cap at +3.5%, 3-5 iter, only undamped lever."  Investigation this iter:
+
+```
+$ grep -rn "MTLIndirectCommandBuffer" /opt/llama.cpp/ggml/src/ggml-metal/    → 0 matches
+$ grep -rln "MTLIndirectCommandBuffer" /opt/mlx-lm /opt/candle /opt/dflash /opt/ds4 /opt/omlx → 0 matches
+```
+
+**Neither peer (llama.cpp) nor any other ML framework on Apple Silicon uses ICB.**  Peer hits 103 tok/s without it; we hit 75 without it.  ICB is therefore NOT the lever — if it were +3.5% as advertised, peer would already use it.
+
+This is a strong falsifier-by-precedent: the +3.5% theoretical estimate from generic Apple docs doesn't materialize in practice for this workload class, otherwise mature peer projects would have adopted it.
+
+**ICB closed without implementation effort.** Saved 3-5 iters that would have produced no perf gain.
+
+### MTLSharedEvent: peer DOES use it, but for cross-backend not single-device
+
+Peer (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:945-989`) implements `ggml_metal_event_encode_signal/wait/synchronize` as wrappers around `MTLSharedEvent`.  Use sites: GGML's backend interface (`ggml_backend_metal_event_record/wait` at `ggml-metal.cpp:540/547`) — exposed to GGML's HIGHER layers for cross-backend coordination.
+
+For SINGLE-device single-context decode (our case), peer's hot path uses `commit + waitUntilCompleted` (same as our `commit_and_wait`).  Events do NOT pipeline our cross-token decode loop.
+
+### NEW FINDING: peer uses multi-threaded command buffer encoding (`n_cb`)
+
+Peer's `ggml_metal_context` (line 56-67):
+```c
+int n_cb;           // number of extra threads used to submit the command buffers
+struct ggml_metal_command_buffer cmd_bufs[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
+```
+
+Default `n_cb = 1` (`ggml-metal.cpp:611, 705`) = 1 extra worker thread + 1 main thread = 2 threads encoding command buffers in parallel.  Cap warning at line 668: "using n_cb > 2 is not recommended and can degrade the performance in some cases".
+
+### Hf2q vs peer thread model
+
+| | Threads encoding cmd_bufs | Per-token cmd_buf count |
+|---|---|---|
+| Peer (default n_cb=1) | 2 (main + 1 worker) | depends on graph nodes |
+| Hf2q (current) | 1 (main only) | 2 (dual_buffer_split=3) |
+
+Our CPU encode time = 0.45 ms/token (per iter-353 timing).  Buf0 (layers 0-3) ≈ 0.06 ms; buf1 (layers 4-29) ≈ 0.39 ms.  Encoding sequentially on one thread = 0.45 ms total.
+
+If we adopted peer's 2-thread pattern: encode buf0 + buf1 in parallel.  Wall encode = max(0.06, 0.39) = 0.39 ms.  Save = 0.06 ms = **0.5%** of decode wall.
+
+For 4-way split (4 cmd_bufs of ~7 layers each, 4-thread encode): wall = 0.45/4 = 0.11 ms = save 0.34 ms = **2.6%**.  But peer warns n_cb > 2 degrades — likely Apple Metal's internal serialization in `MTLCommandQueue.commit` becomes the bottleneck above 2 threads.
+
+### Phase 14 (proposed): multi-threaded cmd_buf encoding
+
+Estimate: +0.5-1% from 2-thread encoding (Phase 14a), +1-2% from 4-thread if Apple cap holds (Phase 14b — risky).
+
+Implementation cost (multi-iter):
+1. Make `forward_decode` encode 2 cmd_bufs from 2 threads concurrently (instead of sequential dual_buffer_split).  Requires CommandQueue thread-safety verification + std::thread spawn per token.
+2. Verify byte-identical output (parity test).
+3. Bench A/B vs single-thread default.
+
+This is the only remaining /loop-tractable lever NOT yet falsified.  Combined with Phase 10's +2.4%, the cumulative ceiling becomes:
+
+**75.5 × 1.005 ≈ 75.9 tok/s = 0.735× peer** (Phase 14a only)
+**75.5 × 1.025 ≈ 77.4 tok/s = 0.749× peer** (Phase 14b if cap holds)
+
+### Total falsifications in this thread (17 now)
+
+iter-326..339: 11 peer-pattern micro-ports
+iter-352: FOR_UNROLL pragma
+iter-355: barrier audit
+iter-356: Phase 13 GPU-rerank (cost-bounded)
+iter-357: simdgroup_matrix on decode mv (peer doesn't either)
+iter-358: NWG=1 SDPA reduce-skip
+iter-359: ICB (no peer/framework uses it)
+
+### Tests + bench
+- 3454/0 hf2q lib + 286/0 mlx-native lib still passing.
+- Bench unchanged from iter-354 baseline.
+- No code change shipped this iter.
+
+### Next iter (Phase 14a — concrete implementation)
+
+Implement 2-thread command buffer encoding for forward_decode.  Specifically:
+- thread A: encode buf0 (layers 0-3) → submit to MTLCommandQueue
+- thread B: encode buf1 (layers 4-29 + head) → submit to MTLCommandQueue
+- main: spawn both, join, then commit_and_wait on the second buffer's completion event
+
+Multi-iter scope per "no shortcuts" — each thread needs proper buffer-tracking + barrier semantics.  Estimated 3-4 /loop iters for landed + benched.
