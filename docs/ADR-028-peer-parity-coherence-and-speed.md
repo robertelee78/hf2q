@@ -16834,3 +16834,126 @@ the production decode default.
 - hf2q lib: 3454/0 passing.
 - Coherence verified: gemma4 "What is 2+2?" → "2 + 2 = 4<turn|>" intact under both
   Path B baseline and fusion-attempt (parity-equivalent output before bench-revert).
+
+## iter-367 — V2 fusion of moe_wsum INTO Path A end-of-layer: parity ✓, bench ✓ at minimal config, coherence-regression with iter-321 stack (24th investigation)
+
+### Date
+2026-05-10
+
+### Hypothesis (from iter-366 path-forward)
+Build a NEW V2 kernel `fused_moe_wsum_post_ff_norm2_endlayer_f32_v2` that
+fuses `moe_weighted_sum` INTO the production-default Path A end-of-layer
+kernel.  V2 (float4 + simd_sum + per-SG staging) — eliminates iter-366's
+V1-vs-V2 reduction-pattern penalty.  Predicted +1-3% on Path A by
+eliminating 1 dispatch + 1 moe_accum global memory round-trip per layer.
+
+### Implementation
+
+NEW kernel `fused_moe_wsum_post_ff_norm2_endlayer_f32_v2` (~125 LOC, mlx-native
+`src/shaders/rms_norm.metal`).  Uses V2 reduction throughout:
+- Phase 1: float4 weighted_sum from experts × routing_weights, stash in
+  threadgroup `sum_buf`, accumulate dot(v,v); simd_sum + per-SG staging →
+  `rms_inv_moe`.
+- Phase 2: read `sum_buf` (instead of `moe_accum`), write `mlp_down`,
+  accumulate mlp²; simd_sum + per-SG staging → `rms_inv_mlp`.
+- Phase 3: hidden = (residual + mlp_down × rms_inv_mlp × w3) × scalar.
+
+NEW dispatcher `dispatch_fused_moe_wsum_post_ff_norm2_endlayer_f32_v2`
+(`src/ops/rms_norm.rs`).  Threadgroup memory: max(32, n_sg) + dim floats =
+~14.5 KB at gemma4 dim=2816 (under 32 KB Apple budget).
+
+Wired into hf2q `forward_decode` Path A at the `fused_end_of_layer` site
+behind `INVESTIGATION_ENV.fused_moe_wsum_end_layer_v2`.  Skips both the
+`moe_weighted_sum_encode` AND the `dispatch_fused_post_ff_norm2_endlayer_f32`
+dispatches when active.
+
+### Parity (PASSED — 6/6 byte-identical)
+
+```
+parity_gemma4_dim2816_top8_actual_prod_shape  mlp_down max_abs=0.0e0  hidden max_abs=0.0e0
+parity_gemma4_dim3584_top8_scalar_broadcast   mlp_down max_abs=0.0e0  hidden max_abs=0.0e0
+parity_gemma4_dim3584_top8_scalar_vector      mlp_down max_abs=0.0e0  hidden max_abs=0.0e0
+```
+
+All 3 shapes × 2 outputs = 6/6 byte-identical (max_abs = max_rel = 0.0).
+
+Required `enc.memory_barrier()` between `moe_weighted_sum_encode` and the
+endlayer dispatch in the parity test (RAW dependency on moe_accum buffer,
+not auto-inserted within a single encoder).
+
+### Bench (gemma4-ara-2pass-APEX-Q5_K_M, 200-tok decode)
+
+**At minimal config (HF2Q_FUSED_END_OF_LAYER=1 only):**
+
+| Trial | Baseline (chain) | iter-367 (fused) |
+|---|---|---|
+| 1 | 74.7 | 74.9 |
+| 2 | 74.5 | 75.0 |
+| 3 | 74.6 | 75.0 |
+| 4 | 74.7 | 74.8 |
+| 5 | 74.7 | 75.0 |
+| **mean** | **74.64** | **74.94** |
+
+Δ = **+0.4%** (interleaved A/B, every pair F > B, σ 0.10 → 3σ from noise).
+
+**At iter-321 FULL STACK config (HF2Q_LMHEAD_Q6K=1 + RMS_NORM_V2=1 +
+Q6K_MV_NR2=1 + Q6K_ID_MV_NR2=1 + FUSED_END_OF_LAYER=1):**
+
+Default-OFF (chain): 74.5–74.6 tok/s ✓ coherent ("2 + 2 = 4")
+iter-367 ON:        ~75 tok/s (+0.5%) ✗ **incoherent gibberish**
+
+### Coherence regression: bisected to ALL iter-321 stack flags
+
+Per-flag bisect with iter-367 ON:
+
+| Stack flag | Coherence |
+|---|---|
+| (none) | ✓ "2 + 2 = 4" |
+| HF2Q_LMHEAD_Q6K=1 | ✗ "*  로  (결" |
+| HF2Q_RMS_NORM_V2=1 | ✗ "*  [결" |
+| HF2Q_Q6K_MV_NR2=1 | ✗ "*  [결" |
+| HF2Q_Q6K_ID_MV_NR2=1 | ✗ "*  [결" |
+
+EVERY iter-321 stack flag breaks coherence with iter-367.  But each works
+fine WITHOUT iter-367.  The fusion is mathematically correct (parity-byte-
+identical at kernel level) but interacts badly with these other optimizations
+in production.  Root cause not yet identified within this iter's debug
+budget.
+
+### Action
+
+**Default-OFF** (`env_eq_one` instead of `env_default_true` in
+investigation_env.rs).  All infrastructure preserved:
+- Kernel + dispatcher + 3 parity tests (byte-identical) live in mlx-native
+- Wiring in hf2q forward_decode Path A is in place
+- Operator can opt-in via `HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1` for further
+  investigation
+
+Production default unchanged: chain (`moe_weighted_sum + fused_post_ff_norm2_endlayer_v2`).
+
+### Hypotheses for iter-368+ debug
+
+1. **Buffer aliasing under iter-321 stack**: maybe `moe_down_id_out` is
+   aliased to a buffer that LMHEAD_Q6K / RMS_NORM_V2 / Q6K_NR2 modifies,
+   making my fusion read corrupted data.  Chain reads it earlier (in
+   moe_weighted_sum) before any potential aliasing issue.
+2. **Subtle Metal RAW barrier issue**: iter-321 stack changes the dispatch
+   order, and `barrier_between` may not detect a conflict for one of the
+   inputs to my fused kernel (perhaps `routing_weights_gpu` after
+   `dispatch_fused_moe_routing_f32_v2` from iter-363).
+3. **Numerical edge case**: production with iter-321 may produce input
+   values (e.g., very small or very specific patterns) that exercise a
+   kernel bug not surfaced by gaussian-random parity test.
+4. **Threadgroup memory layout**: my kernel uses ~14.5 KB shmem at
+   dim=2816 vs the existing endlayer's ~128 bytes.  Might force fewer
+   concurrent threadgroups or trigger a register-spill that interacts
+   with iter-321's kernels.
+
+### Tests + bench
+- mlx-native lib: 287/0 passing (3 new V2 fusion parity tests).
+- hf2q lib: 3454/0 passing.
+- Coherence verified: production default unchanged after default-OFF flip.
+
+### Falsification count this thread
+24 total: 23 from iter-366 + this iter (default-OFF deferral counts as a
+"shipped infrastructure but not landed" partial; full landing pending).

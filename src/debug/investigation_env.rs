@@ -599,6 +599,19 @@ pub struct InvestigationEnv {
     /// bench validates.
     pub fused_end_of_layer: bool,
 
+    /// `HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1` — fuse `moe_weighted_sum` INTO
+    /// `fused_post_ff_norm2_endlayer_v2` (Path A end-of-layer), eliminating
+    /// 1 dispatch + moe_accum round-trip per layer (30 dispatches/decode-token
+    /// on gemma4).  Requires `HF2Q_FUSED_END_OF_LAYER=1` AND `dim % 4 == 0`.
+    /// Parity byte-identical at gemma4 prod shape (dim=2816, top_k=8) — see
+    /// test_fused_moe_wsum_endlayer_v2_parity.rs.  Bench +0.4% interleaved
+    /// 5-pair A/B (74.64 → 74.94, σ 0.10) at minimal config.
+    /// **Default-OFF (ADR-028 iter-367)**: coherence regresses under the
+    /// iter-321 stack (any of LMHEAD_Q6K / RMS_NORM_V2 / Q6K_MV_NR2 /
+    /// Q6K_ID_MV_NR2) — root cause not yet identified.  Opt-in only via
+    /// `HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1`.  Pending iter-368+ debug.
+    pub fused_moe_wsum_end_layer_v2: bool,
+
     /// `HF2Q_FUSED_TRIPLE_NORM=1` — replace the per-layer pair
     /// `fused_norm_add(hidden, attn_out, post_attn_w → residual)` +
     /// 3× `rms_norm(residual, w_a/b/c → out_a/b/c)` with the single
@@ -849,6 +862,8 @@ impl InvestigationEnv {
             // ADR-028 iter-326: default-flipped to ON (operator REFRAME #2).
             // Opt out with `HF2Q_FUSED_END_OF_LAYER=0` / `=false` / `=off`.
             fused_end_of_layer: env_default_true("HF2Q_FUSED_END_OF_LAYER"),
+            // ADR-028 iter-367: default-OFF until coherence-with-stack debug.
+            fused_moe_wsum_end_layer_v2: env_eq_one("HF2Q_FUSED_MOE_WSUM_END_LAYER_V2"),
             kv_dual_legacy: env_eq_one("HF2Q_KV_DUAL_LEGACY"),
             hb_dual_legacy: env_eq_one("HF2Q_HB_DUAL_LEGACY"),
             mlx_kernel_profile: env_eq_one("HF2Q_MLX_KERNEL_PROFILE"),

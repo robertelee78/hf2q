@@ -4401,7 +4401,13 @@ impl MlxModelWeights {
 
                     // -- B14: weighted_sum (singleton) --
                     // ADR-028 iter-206: SKIP_WEIGHTED_SUM bisect.
-                    if !INVESTIGATION_ENV.skip_weighted_sum {
+                    // ADR-028 iter-367: fold moe_weighted_sum into the fused
+                    // end-of-layer kernel (Path A only).  Default-ON.
+                    let use_iter367_fusion = INVESTIGATION_ENV.fused_end_of_layer
+                        && !INVESTIGATION_ENV.skip_end_of_layer
+                        && INVESTIGATION_ENV.fused_moe_wsum_end_layer_v2
+                        && (hs as u32) % 4 == 0;
+                    if !INVESTIGATION_ENV.skip_weighted_sum && !use_iter367_fusion {
                         s.barrier_between(
                             &[&self.activations.moe_down_id_out, &self.activations.moe_routing_weights_gpu],
                             &[&self.activations.moe_accum],
@@ -4447,6 +4453,38 @@ impl MlxModelWeights {
                     // Bisect-confirmed +2.7% target (iter-208).  Parity test
                     // PASS (iter-218).  Default-OFF until production bench.
                     if INVESTIGATION_ENV.fused_end_of_layer {
+                        // ADR-028 iter-367: HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1 fuses
+                        // moe_weighted_sum INTO this end-of-layer kernel, eliminating
+                        // 1 dispatch + moe_accum round-trip from gemma4 decode default.
+                        let use_iter367_fusion = std::env::var("HF2Q_FUSED_MOE_WSUM_END_LAYER_V2")
+                            .ok().as_deref() == Some("1")
+                            && (hs as u32) % 4 == 0
+                            && !INVESTIGATION_ENV.skip_weighted_sum;
+                        if use_iter367_fusion {
+                            s.barrier_between(
+                                &[&self.activations.moe_down_id_out,
+                                  &self.activations.moe_routing_weights_gpu,
+                                  &self.activations.attn_out,
+                                  &self.activations.residual,
+                                  &self.layers[layer_idx].layer_scalar],
+                                &[&self.activations.mlp_down, &self.activations.hidden],
+                            );
+                            mlx_native::ops::rms_norm::dispatch_fused_moe_wsum_post_ff_norm2_endlayer_f32_v2(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.moe_down_id_out,
+                                &self.activations.moe_routing_weights_gpu,
+                                &self.activations.attn_out,
+                                &self.activations.residual,
+                                &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
+                                &self.layers[layer_idx].norms.post_feedforward_layernorm,
+                                &self.layers[layer_idx].layer_scalar,
+                                &self.activations.mlp_down,
+                                &self.activations.hidden,
+                                eps, 1, hs as u32, top_k as u32,
+                                scalar_is_vector,
+                            ).map_err(|e| anyhow::anyhow!("iter-367 fused wsum+endlayer L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+                        } else {
                         s.barrier_between(
                             &[&self.activations.attn_out, &self.activations.moe_accum,
                               &self.activations.residual, &self.layers[layer_idx].layer_scalar],
@@ -4466,6 +4504,7 @@ impl MlxModelWeights {
                             scalar_is_vector,
                         ).map_err(|e| anyhow::anyhow!("fused end-of-layer L{layer_idx}: {e}"))?;
                         total_dispatches += 1;
+                        }
                     } else {
                         // -- Fused post-FF norm 2 + combine MLP+MoE --
                         s.barrier_between(
