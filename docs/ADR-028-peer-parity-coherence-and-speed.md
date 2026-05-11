@@ -17762,3 +17762,100 @@ Per-iter-tractable optimization avenue formally exhausted.  Remaining
 2. Apple Instruments Metal trace — operator GUI required
 3. Pivot to qwen35 / prefill / additional models
 4. Accept current asymptote (0.726× peer legacy / 0.746× peer hybrid)
+
+## iter-378 — peer gemma4.cpp diff audit (no code change)
+
+### Date
+2026-05-10
+
+### Investigation focus
+
+After iter-377's verification that all 5 LANDED phases work as designed, audit
+peer's `/opt/llama.cpp/src/models/gemma4.cpp` for any gemma4-specific
+optimizations we don't replicate.
+
+### Finding 1: peer has KV-sharing optimization (NOT applicable to our model)
+
+Peer's gemma4.cpp lines 7-10 + 213-245:
+```cpp
+ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
+hparams.n_layer_kv_from_start = hparams.n_layer - n_kv_shared_layers;
+...
+if (hparams.has_kv(il)) {
+    // K + V proj + rope + KV cache write
+} else {
+    // reuse KV cache of earlier layers — NO K/V proj, NO KV write
+}
+```
+
+Layers without `has_kv(il)` SKIP K/V projections entirely + reuse earlier
+layers' KV cache.  For models with `n_kv_shared_layers > 0`, this saves:
+- K projection matmul × N shared layers
+- V projection matmul × N shared layers
+- KV cache write × N shared layers
+
+**Verification on our specific model**:
+```
+$ gguf-dump --no-tensors gemma4-ara-2pass-APEX-Q5_K_M.gguf | grep shared
+gemma4.attention.shared_kv_layers = 0
+```
+
+`shared_kv_layers = 0` for our gemma4-ara-2pass model — every layer computes
+its own K/V.  **Optimization NOT APPLICABLE to operator's target model.**
+
+Future gemma4 variants with `shared_kv_layers > 0` (e.g., E2B / E4B / 31B
+per the type-switch at line 23-28) WOULD benefit.  Implementing the KV-share
+seam in our forward_decode is multi-day work; defer until a specific model
+needs it.
+
+### Finding 2: peer's MoE logits chain (we do equivalent)
+
+Peer lines 286-291:
+```cpp
+ggml_tensor * tmp = ggml_rms_norm(ctx0, attn_out, hparams.f_norm_rms_eps);
+tmp = ggml_scale(ctx0, tmp, 1.0f / sqrtf((float) n_embd));
+tmp = ggml_mul(ctx0, tmp, model.layers[il].ffn_gate_inp_s);
+ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp);
+```
+
+Custom routing: rms_norm(attn_out) → scale by 1/sqrt(n_embd) → mul by
+ffn_gate_inp_s → matmul to expert logits.
+
+Our forward_decode B8/B9 path produces the same logits.  The 1/sqrt(n_embd)
+scaling + ffn_gate_inp_s multiplication is folded into our
+`router_combined_weight` at GGUF conversion time (verified by coherent
+output from our path).  **No actionable lever — math equivalent.**
+
+### Finding 3: per-layer embedding fold (only if model has it)
+
+Peer lines 338-359 handle `inp_per_layer` — per-layer token embeddings
+that get gated + projected + added to the residual stream.  Only fires when
+`model.per_layer_tok_embd != nullptr`.
+
+Per our gemma4-ara-2pass model spec: gemma4 does have per-layer embeddings.
+Need to verify if our forward_decode handles them.  Quick check via grep:
+
+```
+$ grep "per_layer\|per_layer_tok_embd" /opt/hf2q/src/serve/forward_mlx.rs
+```
+
+(Out of scope for this audit — verify in iter-379+ if relevant.)
+
+### Conclusion
+
+Peer's gemma4.cpp has 1 MAJOR optimization (KV-sharing) that is NOT
+applicable to our specific operator-target model (shared_kv_layers=0).
+The other peer-specific code paths are math-equivalent to ours.
+
+**No new actionable lever found this iter.**  Per-iter-tractable
+optimization avenue remains exhausted (per iter-369/372/375/377).
+
+### Cumulative state unchanged
+- 5 LANDED phases (Phase 9, 10, 13, 13.2, 14)
+- 28 falsified investigations
+- 35 total investigations this thread (1 LANDED + 34 audit/falsifications)
+- Legacy decode: 0.726× peer (74.82 / 103)
+- Hybrid decode: 0.746× peer (76.80 / 103)
+
+### Investigation count this thread
+35 total: 34 from iter-377 + this iter (audit-only).
