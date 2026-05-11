@@ -16003,3 +16003,67 @@ Dispatch-elimination has hit the CPU-encoder wall.  Remaining levers:
 2. **Indirect command buffers** (Apple Metal 4 feature) — pre-bake parameter buffers; saves CPU encoder cost.  At 0.45 ms/token current encoder cost, max win = 3.5%.  3-5 iters effort.
 
 3. **F32 V vs TQ-HB V evaluation** (NOT operator-approved) — peer stores F16 V; we store TQ-HB V.  Dropping TQ-HB on V would close most of the residual gap but breaks the operator-binding RAM-mantra (iter-326).  REJECTED.
+
+## iter-355 — Phase 12 barrier-audit hypothesis FALSIFIED before code change
+
+### Date
+2026-05-10
+
+### Hypothesis tested
+"478 barriers/decode_tok is high; if half are spurious, removing them gains +5-10%."  Per the iter-353/354 synthesis report, this was the second-highest-priority candidate after Apple Instruments trace.
+
+### Falsification evidence (read code, not assumptions)
+
+1. **`barrier_between` already conflict-checks** — `/opt/mlx-native/src/graph.rs:1494` reads:
+   ```
+   let reason = self.tracker.conflicts_reason(reads, writes);
+   if let Some(...) = reason {
+       self.encoder.memory_barrier();
+       self.barrier_count += 1;
+   }
+   ```
+   The byte-range conflict tracker (`ConflictTracker::conflicts_reason`) only emits a real GPU `memory_barrier()` when there's a verified RAW/WAR/WAW between the new dispatch and the current concurrent group.  Spurious `barrier_between` calls at hf2q sites are no-ops at the GPU level.
+
+2. **Peer has MORE dispatches per token (not fewer)** — Per iter-308 measurement: peer 1417 disp/decode_tok vs ours 920.  More dispatches → more inter-dispatch dependencies → more barriers.  Our `barrier_count = 478` is consistent with our LOWER dispatch count, not over-firing.
+
+3. **Math check: 478 barriers / 30 layers = 15.93 barriers/layer** — matches the natural per-layer dependency chain (norm → QKV → SDPA → o_proj → residual+norm → MoE-routing → MoE-experts → SwiGLU → down → weighted-sum → residual+norm = ~16 sync points).  Algorithm-driven, not code-quality.
+
+4. **Peer's gemma4.cpp uses the SAME fusion pattern** — `/opt/llama.cpp/src/models/gemma4.cpp:175-275` reads:
+   - Line 187: pre-attn norm (separate dispatch)
+   - Line 200/215/218: Q/K/V proj (3 separate matmuls — same as us)
+   - Line 205/226/227: Q-norm/K-norm/V-norm (3 separate dispatches)
+   - Line 208/232: Q/K rope (separate dispatches)
+   - Line 252: attn_post_norm (separate dispatch)
+   - Line 257: residual add (separate dispatch — peer does NOT fuse residual+norm!)
+   - Line 264: FFN-norm (separate dispatch)
+
+   Peer issues SEPARATE residual-add and FFN-norm dispatches.  We FUSE them via `fused_norm_add_f32_v2` — we are ahead of peer on this lever.  No barrier savings available by porting peer's structure (it's worse).
+
+5. **Peer kernel `kernel_rms_norm_fuse_impl<F>` already matches us** — peer's fused rms_norm + mul (F=2) is exactly our `rms_norm_f32_v2` (verified iter-310 port).  No additional fusion lever to port.
+
+### Result
+
+**FALSIFIED.**  No code change.  Documented falsification so future iters don't re-attempt.
+
+This is the **13th** falsified peer-pattern lever in the post-Phase-7 thread (after iter-326..339's 11 + iter-352's FOR_UNROLL).  The pattern remains the same as `feedback_metal_compiler_auto_optimizes_static_levers`: per-dispatch optimizations have already been ported, and the residual gap is in per-kernel GPU compute time on dispatches we already do equivalently.
+
+### Remaining lever budget (post-13-falsification)
+
+After Phase 10 (+2.4%) + Phase 12-falsified, the only meaningful candidates for further `/loop` work are:
+
+1. **GPU-side argmax + speculative pre-encoding** (Phase 13) — eliminate 1 GPU sync per decode token.  Per iter-353 sync overhead = 310 µs/tok (2.4% of decode); pipelining could recover ~half.  Est +1-1.5%, multi-iter.
+2. **Indirect command buffers** (Apple Metal 4 feature) — pre-bake parameter buffers, drop CPU encode time from 0.45 ms/tok toward 0.  Caps at +3.5%, 3-5 iter effort.
+3. **Multi-query SDPA** (operator-decision-gated) — Q for current token + K/V for current+prior tokens fused into single SDPA call.  Currently we do 1 SDPA call per decode token reading only the CURRENT-token Q vs all-time K/V.  Peer pattern, but minor change for decode (already 1 query token).
+
+After these 3, all in-scope levers are exhausted.  The remaining ~22% gap to peer requires either:
+- **Apple Instruments Metal trace** (operator-GUI required) to find non-obvious per-kernel hotspots, OR
+- Accept the current 75 tok/s = 0.73× peer as the asymptote of "/loop-tractable" optimization.
+
+### What this iter did NOT change
+
+No code changes shipped.  Diagnostic-only iter — read peer source, traced our own conflict-tracker logic, math-checked the per-layer barrier count.  All findings are in this section.
+
+### Tests + bench
+
+- All 3454/0 hf2q lib tests + 286/0 mlx-native lib tests still passing.
+- HEAD bench unchanged from iter-354 baseline: hybrid 75.5 tok/s, legacy 73.7 tok/s.
