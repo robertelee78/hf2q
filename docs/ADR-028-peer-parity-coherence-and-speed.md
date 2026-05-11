@@ -17,18 +17,34 @@ GGUF, same prompt, same sampler. Speed = tok/s on the same hardware
 
 ## Executive summary (iter-303 consolidated state)
 
-This ADR has grown to ~11K lines across iter-59..303.  This summary
+> **🚨 iter-486 REFRAME (2026-05-11) — READ FIRST**.  The "× peer" column
+> below was computed with **mixed methodology** (peer divisor from llama-server
+> streaming SSE with prefill amortized into per-token rate, hf2q numerator from
+> pure decode).  At apples-to-apples measurement (llama-bench tg both sides on
+> the same M5 Max, same GGUF), the gemma4 ratio at HEAD is **0.96–1.04×
+> (statistically tied with peer; possibly slightly ahead)** — NOT the 0.694×
+> shown below.  See §iter-486 for the fresh measurements and the new standing
+> rule: any "× peer" claim must pair identical methodology both sides.  The
+> qwen3.6 1.34× number has not been re-validated under llama-bench
+> methodology this thread — direction (hf2q faster) is consistent with all
+> prior runs, but the exact multiplier should be re-measured before being
+> cited authoritatively.
+
+This ADR has grown to ~25K lines across iter-59..486.  This summary
 captures the current strategic state for fast catch-up.
 
 ### Mantra status by production model
 
-| Model | tok/s @ HEAD | × peer | Mantra |
+> *Table below preserves historical (apples-to-oranges) numbers as recorded
+> in iter-303.  See iter-486 for the apples-to-apples reframe.*
+
+| Model | tok/s @ HEAD | × peer (legacy, mixed methodology) | Mantra (iter-486 apples-to-apples) |
 |-------|------------:|-------:|--------|
-| qwen3.6 35B-A3B-APEX-Q5_K_M | 126.5 | **1.34×** ★ | ✓ EXCEEDS |
-| qwen3.6 (with TQ-HB engaged via engine.rs) | ~106 (iter-131 est) | ~1.12× | ✓ EXCEEDS |
-| gemma4-ara-2pass-APEX-Q5_K_M (default) | 69.4 | 0.694× | ✗ below |
-| gemma4 + G+FUSED (precision-exact, TQ-HB intact) | 71.2 | 0.712× | ✗ below |
-| gemma4 + Path E+G+FUSED (breaks TQ-HB) | 73.5 | 0.735× | ✗ below |
+| qwen3.6 35B-A3B-APEX-Q5_K_M | 126.5 | **1.34×** ★ | ✓ EXCEEDS (direction confirmed; ratio not re-measured) |
+| qwen3.6 (with TQ-HB engaged via engine.rs) | ~106 (iter-131 est) | ~1.12× | ✓ EXCEEDS (likely; not re-measured) |
+| gemma4-ara-2pass-APEX-Q5_K_M (default) | 69.4 → 74.10 ± 11.62 (iter-485 Worker B) | 0.694× legacy / **0.96–1.04× apples-to-apples** | ✓ MET at HEAD (tied/slightly ahead) |
+| gemma4 + G+FUSED (precision-exact, TQ-HB intact) | 71.2 | 0.712× legacy | ✓ MET at HEAD (subsumed by above) |
+| gemma4 + Path E+G+FUSED (breaks TQ-HB) | 73.5 | 0.735× legacy | ✓ MET at HEAD; Path E REJECTED for memory cost |
 
 ### Coherence status (iter-296..298)
 
