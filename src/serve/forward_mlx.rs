@@ -4395,15 +4395,24 @@ impl MlxModelWeights {
                     &[&self.activations.mlp_gate, &self.activations.mlp_up,
                       &self.activations.moe_router_logits],
                 );
+                // ADR-029 iter-15 (H17 probe): HF2Q_B9_FORCE_SEQUENTIAL=1
+                // inserts memory_barrier()s between B9's 3 concurrent qmatmuls
+                // to test the "peer's more smaller serial dispatches" lever
+                // class. M5 Max scheduler may favor sequential issue at this
+                // shape (Q5_K 2816→5760 × 2 + 2816→128). Tracks no math
+                // change — barriers ONLY affect timing/scheduling.
+                let b9_sequential = std::env::var("HF2Q_B9_FORCE_SEQUENTIAL").as_deref() == Ok("1");
                 // ADR-028 iter-200: SKIP_DENSE_MLP bisect — skip mlp_gate +
                 // mlp_up dispatches.  Router proj must run (MoE depends on it).
                 if !INVESTIGATION_ENV.skip_dense_mlp {
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                         &self.layers[layer_idx].mlp.gate_proj, &self.activations.mlp_gate, 1)?;
                     total_dispatches += 1;
+                    if b9_sequential { s.encoder_mut().memory_barrier(); }
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                         &self.layers[layer_idx].mlp.up_proj, &self.activations.mlp_up, 1)?;
                     total_dispatches += 1;
+                    if b9_sequential { s.encoder_mut().memory_barrier(); }
                 }
                 // ADR-028 iter-213: SKIP_ROUTING bisect — skip router_proj qmatmul.
                 if !INVESTIGATION_ENV.skip_routing {
