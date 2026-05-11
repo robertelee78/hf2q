@@ -23860,3 +23860,84 @@ fix is multi-iter operator-decision-gated work in mlx-native.
 | Phase 15 default-on | ✓ shipped | done |
 | HYBRID_KV | OPERATOR-GATED | (decode lever) |
 | Multi-thread decode | OPERATOR-GATED | (decode lever) |
+
+## iter-465 — Peer mmap + zero-copy MTLBuffer architecture verified; all ingredients exist in mlx-native
+
+### Hypothesis (verification)
+iter-464 inferred peer uses mmap-backed Metal buffers.  Verify by
+reading peer source.  Also check mlx-native for any existing zero-copy
+infrastructure to estimate the lift.
+
+### Method
+Read:
+- `/opt/llama.cpp/src/llama-mmap.cpp:440-490` (peer mmap impl)
+- `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:1525-1565`
+  (peer Metal buffer wrapping)
+- `/opt/mlx-native/src/weight.rs:442-471` (mlx-native safetensors path)
+- `/opt/mlx-native/src/gguf/mod.rs:1100-1192` (mlx-native gguf load_tensor)
+- `metal-0.33.0/src/device.rs:1941` (metal-rs binding)
+
+### Findings
+
+**Peer (llama.cpp) uses POSIX mmap + `newBufferWithBytesNoCopy`**:
+```cpp
+// llama-mmap.cpp:456 — mmap with MAP_SHARED + PROT_READ + MAP_POPULATE prefetch
+addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
+posix_madvise(addr, ..., POSIX_MADV_WILLNEED);
+
+// ggml-metal-device.m:1534 — wrap mmap region in MTLBuffer (zero-copy)
+res->buffers[res->n_buffers].metal = [device newBufferWithBytesNoCopy:ptr
+    length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
+```
+
+**mlx-native has NO existing zero-copy path**:
+- `weight.rs:455-471` (safetensors): also COPIES via
+  `std::ptr::copy_nonoverlapping(data, metal_buf.contents(), byte_len)`
+- `gguf/mod.rs:1144-1190` (gguf load_tensor): COPIES via
+  `slice.copy_from_slice(&data)`
+
+**But all the pieces exist**:
+- `memmap2::Mmap` is already a mlx-native dependency (used by
+  weight.rs SafetensorsFile)
+- metal-rs 0.33 has `new_buffer_with_bytes_no_copy` binding at
+  device.rs:1941:
+  ```rust
+  pub fn new_buffer_with_bytes_no_copy(
+      &self, bytes: *const c_void, length: NSUInteger,
+      options: MTLResourceOptions, deallocator: ...
+  ) -> Buffer
+  ```
+
+### The architectural lift (well-defined)
+1. **mlx-native: add `MlxBuffer::from_mmap_no_copy(...)`** that calls
+   `device.new_buffer_with_bytes_no_copy` instead of allocating new
+   buffer + memcpy.  Lifetime owner: caller-supplied (or Arc<Mmap>)
+2. **mlx-native: add mmap-backed reader to gguf::GgufFile** —
+   replace `BufReader<File>` with `Mmap` (similar to weight.rs:514)
+3. **mlx-native: update `gguf::load_tensor`** for raw byte tensors
+   to construct via no-copy path
+4. **Operator-coordinated rollout** because of lifetime semantics
+   (Arc<Mmap> required to keep mmap alive while buffers exist)
+5. **Coherence verification** + bench
+
+Multi-iter scope but well-bounded.  Estimated gain: **-1.5 to -2.0 sec
+startup** (62% reduction of current load_wall_clock).
+
+### Investigation count this thread
+122 total: 121 from iter-464 + this iter (verification of
+architecture + ingredients audit).
+
+### Operator decision matrix (refined)
+| Lever | Effect | Cost |
+|---|---|---|
+| **mmap-backed gguf zero-copy** | **-1.5-2 sec startup** | multi-iter mlx-native architectural; all APIs ready |
+| GGUF-embedded tokenizer default | -300 ms startup | 1-2 iters |
+| Phase 15 default-on | ✓ shipped | done |
+| HYBRID_KV | OPERATOR-GATED (decode lever) | env flip |
+| Multi-thread decode | OPERATOR-GATED (decode lever) | 5-8 iters |
+
+### Cumulative iter-458→465 chain
+From "1.6s startup gap" (iter-458) to "concrete API path identified
+with all dependencies in place" (iter-465).  8 iters of root-cause
+investigation; concrete ready-to-ship architectural plan documented
+for operator review.
