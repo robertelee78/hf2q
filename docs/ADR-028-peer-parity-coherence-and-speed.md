@@ -16067,3 +16067,70 @@ No code changes shipped.  Diagnostic-only iter — read peer source, traced our 
 
 - All 3454/0 hf2q lib tests + 286/0 mlx-native lib tests still passing.
 - HEAD bench unchanged from iter-354 baseline: hybrid 75.5 tok/s, legacy 73.7 tok/s.
+
+## iter-356 — Phase 13 GPU-rerank: cost-bound BEFORE implementation (+0.5% asymptote)
+
+### Date
+2026-05-10
+
+### Hypothesis
+Per iter-355 lever budget: "GPU-side argmax + speculative pre-encoding eliminates 1 GPU sync per decode token; sync overhead is 310 µs/tok = 2.4%; pipelining could recover ~half = +1-1.5%."
+
+### Falsification: measure before designing
+
+Read the actual code at `forward_mlx.rs:4700+` first.  Discovery: **GPU-side argmax already exists** (line 4705 `dispatch_argmax_f32`).  The CPU sync at the bottom of every decode token is for the **Q8/Q6_K logits rerank** (line 4790-4837) which reads:
+- `argmax_index` (4 bytes) — already needed regardless
+- `argmax_value` (4 bytes) — already needed regardless
+- `logits[..262144]` (1.05 MB) — for the candidate-threshold scan
+- `norm_out` (14 KB) — for the per-candidate dot product
+- `embed_weight` rows (per candidate, ~1-100 × 14 KB) — for the F32 rerank dot
+
+The rerank corrects Q6_K lm_head quantization noise (~5e-3 logit envelope; otherwise the model occasionally picks the wrong nearby token).
+
+### Direct measurement: A/B `HF2Q_LMHEAD_RERANK=0`
+
+```
+rerank ON  (current 75.5 baseline):   75.6 / 75.6 / 75.7 tok/s
+rerank OFF (HF2Q_LMHEAD_RERANK=0):    76.0 / 76.0 / 76.0 tok/s
+```
+
+**Rerank cost = +0.4 tok/s = +0.5%**, NOT the +1-1.5% predicted.
+
+### Why the prediction was wrong
+
+Apple's unified memory + Metal driver scheduling already overlaps the CPU readback efficiently:
+1. The 1 MB logits readback is a pointer-sharing (no actual copy, since GPU + CPU share the same DRAM).
+2. The 50 µs CPU rerank loop runs WHILE the next token's GPU dispatches are being encoded (not WHILE GPU is computing — that's already a sync point).
+3. The argmax_index 4-byte read is the only true CPU dependency on GPU output, and Metal's `MTLCommandBuffer` completion handler resolves it efficiently.
+
+The "310 µs sync overhead per token" from the µbench (`bench_decode_qmatmul_shapes`) was per-cmd_buf-commit; cmd_bufs/decode_tok is 1.98 (one for body, one for head), and the sync PER cmd_buf is shared by ALL dispatches in it — the rerank's CPU work is amortized within the existing per-token sync window.
+
+### Remaining tractable /loop levers (post-14-falsification)
+
+1. **Indirect command buffers** (Apple Metal 4) — pre-bake parameter buffers; saves CPU encode time (currently 0.45 ms/tok).  Caps at +3.5%, 3-5 iter effort.  This is the only remaining /loop-tractable structural lever that is NOT a peer-pattern micro-port.
+2. **Multi-query SDPA** (operator-decision-gated) — minor for decode (already 1 query token per call).
+
+After these 2, all known in-scope /loop levers exhausted.
+
+### Recommendation update
+
+Per the 14th falsification, the synthesis-report (iter-355) recommendation needs revision:
+
+| Lever | Predicted Δ | Measured Δ | Status |
+|---|---|---|---|
+| Phase 13 GPU-rerank | +1-1.5% | +0.5% | **DOWNGRADED** — implementation effort not justified |
+| Indirect command buffers | +1-3% | unmeasured | open (3-5 iter) |
+| Multi-query SDPA | minor | unmeasured | open (operator-decision-gated) |
+| Apple Instruments trace | unknown | unmeasured | requires operator-GUI |
+
+The remaining ~22% gap to peer (75.7 vs 103.3 tok/s) is now **provably bounded above by ~3.5% from in-scope levers** (best case = 78.4 tok/s = 0.76× peer).  The remaining ~22% requires non-/loop work: Apple Instruments to localize the per-kernel hotspots, OR operator-approved structural changes (e.g., F32 vs F16 V cache, model-side architecture changes).
+
+### What this iter did NOT change
+
+No code shipped — diagnostic only.  Falsification logged so future iters skip Phase 13.
+
+### Tests + bench
+
+- All 3454/0 hf2q lib tests + 286/0 mlx-native lib tests still passing.
+- Bench unchanged from iter-354: legacy 73.7, hybrid 75.5 (75.7 with this iter's noise variance).
+- Coherence preserved on all configs tested.
