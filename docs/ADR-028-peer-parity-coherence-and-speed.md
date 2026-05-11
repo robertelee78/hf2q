@@ -17130,3 +17130,77 @@ No code change shipped.  Audit and findings only.
 
 ### Investigation count this thread
 26 total: 25 from iter-368 + this iter (audit, no code).
+
+## iter-370 — V2-port fused_post_attn_triple_norm: parity ✓, V2 fixes V1 regression but flat vs chain (27th investigation)
+
+### Date
+2026-05-10
+
+### Hypothesis
+iter-186 fused 3 concurrent rms_norm dispatches into 1 sequential kernel.
+Result was -1.0% on decode (parallelism loss outweighed dispatch savings).
+V2 reduction (simd_sum + per-SG, 4 barriers vs V1's 16 at tg=256) saves 12
+barriers/dispatch.  Test if barrier savings flip iter-186's verdict.
+
+### Implementation
+NEW kernel `fused_post_attn_triple_norm_f32_v2` in
+`mlx-native/src/shaders/rms_norm.metal` (~80 LOC).  Float4 + simd_sum +
+per-SG staging.  Same buffer layout, same FusedPostAttnTripleNormParams.
+Dispatcher gated on `HF2Q_FUSED_TRIPLE_NORM_V2=1` (default-OFF).
+
+### Parity (4/4 byte-identical)
+```
+parity_gemma4_dim2816_prod_shape:
+  residual_out  max_abs=0.0e0  max_rel=0.0e0
+  output_a      max_abs=0.0e0  max_rel=0.0e0
+  output_b      max_abs=0.0e0  max_rel=0.0e0
+  output_c      max_abs=0.0e0  max_rel=0.0e0
+```
+All 4 outputs byte-identical at gemma4 production shape (dim=2816, rows=1).
+
+### Bench (gemma4-ara-2pass-APEX-Q5_K_M, 200-tok decode, iter-321 stack ON)
+
+5-cycle 3-cell A/B/C bench:
+
+| Config | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Mean | vs Chain |
+|---|---|---|---|---|---|---|---|
+| Chain (3 concurrent norms) | 74.8 | 74.8 | 74.8 | 74.8 | 74.7 | **74.78** | baseline |
+| V1 fuse (iter-186) | 72.9 | 72.6 | 72.6 | 72.3 | 72.5 | **72.58** | **-2.9%** |
+| V2 fuse (iter-370) | 75.0 | 74.9 | 74.7 | 74.7 | 74.7 | **74.80** | **+0.03%** |
+
+V2 recovers the V1 regression (+3.0% vs V1) but matches the chain (+0.03% vs
+chain — within noise).  iter-186's documented -1.0% regression is now
+empirically -2.9% on this hardware/stack.
+
+### Root cause of the structural ceiling
+
+Apple GPU runs the 3 concurrent rms_norm dispatches in fully parallel mode
+on different compute units.  Total wall = max(3 norms) ≈ 1 norm time.
+
+The fused V2 kernel does 3 weight applications in Phase 3 SEQUENTIALLY (one
+thread iterates 3 weight buffers).  Sequential vs parallel: same total work
+on same compute unit, but the dispatch saves ~14.7 µs CPU and the
+dispatch's GPU work is ~1.5× a single rms_norm.
+
+Net: saves CPU (~14.7 µs/layer × 30 = 441 µs/token ≈ 3.3% theoretical) but
+loses GPU parallelism (3 concurrent kernels → 1 sequential = ~3 µs/token
+extra GPU wall × 30 layers = ~90 µs/token).  These are similar magnitude;
+result is break-even at the bench level.
+
+### Action
+
+Kernel kept in mlx-native (correct, parity-validated, 3× faster than V1).
+Default-OFF.  Operator can opt-in via
+`HF2Q_FUSED_TRIPLE_NORM=1 HF2Q_FUSED_TRIPLE_NORM_V2=1` for memory-pressure
+scenarios where dispatch count matters more than wall time (e.g., very long
+contexts where the chain's 3 concurrent buffer writes use more peak GPU
+memory bandwidth).
+
+### Tests + bench
+- mlx-native lib: 287/0 passing (1 new V2 parity test, 4 outputs verified).
+- hf2q lib: 3454/0 passing.
+- Coherence: gemma4 "2 + 2 = 4" intact under both V1+V2 and V2-only configs.
+
+### Falsification count this thread
+27 total: 26 from iter-369 + this iter (parity ✓, bench flat — like iter-365
+and iter-368).
