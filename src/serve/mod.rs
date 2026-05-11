@@ -8,6 +8,7 @@ pub mod auto_pipeline;
 #[allow(dead_code)]
 pub mod cache;
 pub mod config;
+pub mod encoder_worker_singleton;
 pub mod forward_mlx;
 pub mod forward_prefill;
 pub mod forward_prefill_batched;

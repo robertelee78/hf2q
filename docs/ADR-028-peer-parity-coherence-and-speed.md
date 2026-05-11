@@ -18055,3 +18055,62 @@ Validates:
 ### Investigation count this thread
 38 total: 37 from iter-380 + this iter (Metal integration tests, no
 production change).
+
+## iter-382 — process-level EncoderWorker singleton in hf2q
+
+### Date
+2026-05-10
+
+### Goal
+Per iter-380/381 plan step 2: add hf2q-side wrapper around mlx-native's
+`EncoderWorker` so `forward_decode` can submit work to a persistent worker
+without paying per-token spawn cost.
+
+### Implementation
+
+NEW module `hf2q/src/serve/encoder_worker_singleton.rs` (~110 LOC):
+- `static GLOBAL_ENCODER_WORKER: LazyLock<Mutex<EncoderWorker>>` — lazy init
+  on first access; spawned ONCE per process.
+- `pub fn submit_to_global_worker<F>(f)` — non-blocking submit; caller
+  arranges own completion signaling.
+- Wrapped in `Mutex` because `EncoderWorker::shutdown` requires `&mut`,
+  even though `submit` itself doesn't (channel send is `&self`).
+
+### Tests (2/2 PASS)
+```
+test serve::encoder_worker_singleton::tests::singleton_can_run_closure ... ok
+test serve::encoder_worker_singleton::tests::singleton_persists_across_calls ... ok
+```
+
+`singleton_persists_across_calls` validates that 3 sequential submits all
+run on the SAME worker thread (singleton, not per-call spawn).
+
+### NOT in this iter
+
+- Production wiring to `forward_decode` (deferred to iter-383+).
+- Bench (no production effect yet).
+
+### Why no production wiring this iter
+
+The challenge: `forward_decode` uses `&mut self` extensively, with
+`self.activations` and `self.layers[i]` in nearly every dispatch.  To
+parallelize layer encoding, we'd need either:
+
+1. **Refactor `MlxModelWeights.activations` to `Arc<MlxBuffer>`** — multi-day
+   change touching ~50+ call sites.  Each thread would clone Arc handles
+   for the buffer references it needs.
+2. **Mutex-serialize cross-thread access** — defeats the parallelism goal.
+
+iter-383 will design + scope this refactor.  iter-384+ will execute.
+
+### Path forward (revised)
+
+- **iter-383**: Design the `Arc<MlxBuffer>` activation refactor.  Identify
+  minimum set of buffers that need Arc-wrapping (most can stay `&self.act`
+  for the main thread; only buffers crossing thread boundaries need Arc).
+  Document the refactor scope.
+- **iter-384+**: Execute the refactor + wire `forward_decode` to use the
+  worker for the second-half layer encoding.  Bench A/B.
+
+### Investigation count this thread
+39 total: 38 from iter-381 + this iter (singleton scaffolding).
