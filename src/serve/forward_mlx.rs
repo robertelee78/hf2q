@@ -1598,6 +1598,11 @@ impl MlxModelWeights {
         let mut cum_mlp_ns = 0u128;
         let mut cum_moe_ns = 0u128;
         let mut cum_misc_ns = 0u128;
+        // ADR-028 iter-463: MoE sub-buckets
+        let mut cum_moe_gate_up_ns = 0u128;
+        let mut cum_moe_down_ns = 0u128;
+        let mut cum_moe_router_cpu_ns = 0u128;
+        let mut cum_moe_other_ns = 0u128;
 
         for i in 0..num_layers {
             tracing::debug!("GGUF layer {}/{}: loading weights", i + 1, num_layers);
@@ -1683,17 +1688,21 @@ impl MlxModelWeights {
                 // MoE layer — preserve pre-iter-227 load behavior byte-
                 // identically. The two-clone of `gguf.tensor_info` is
                 // safe; we already established both are Some above.
+                let t_gu = std::time::Instant::now();
                 let gu_info = gu_info_opt.unwrap();
                 let stacked_gate_up_buf = gguf.load_tensor(&gu_name, mlx_device)
                     .map_err(|e| anyhow::anyhow!("load {gu_name}: {e}"))?;
                 let gate_up_expert_stride = stacked_gate_up_buf.byte_len() / cfg.num_experts;
                 let gate_up_ggml_dtype = gu_info.ggml_type;
+                cum_moe_gate_up_ns += t_gu.elapsed().as_nanos();
 
+                let t_dn = std::time::Instant::now();
                 let dn_info = dn_info_opt.unwrap();
                 let stacked_down_buf = gguf.load_tensor(&dn_name, mlx_device)
                     .map_err(|e| anyhow::anyhow!("load {dn_name}: {e}"))?;
                 let down_expert_stride = stacked_down_buf.byte_len() / cfg.num_experts;
                 let down_ggml_dtype = dn_info.ggml_type;
+                cum_moe_down_ns += t_dn.elapsed().as_nanos();
 
                 if (i + 1) % 5 == 0 || i == 0 {
                     tracing::debug!("GGUF layer {}/{}: MoE experts loaded (stacked, {:.1} MB + {:.1} MB)",
@@ -1715,6 +1724,7 @@ impl MlxModelWeights {
 
                 // Pre-compute router combined weight:
                 //   router_combined_weight[j] = router_scale[j] * (hidden_size ^ -0.5)
+                let t_rcw = std::time::Instant::now();
                 let router_combined_weight = {
                     let scale_factor = (cfg.hidden_size as f32).powf(-0.5);
                     let rs: &[f32] = router_scale.as_slice()
@@ -1731,6 +1741,7 @@ impl MlxModelWeights {
                     }
                     combined
                 };
+                cum_moe_router_cpu_ns += t_rcw.elapsed().as_nanos();
 
                 MlxMoeWeights {
                     stacked_gate_up: Some(stacked_gate_up_buf),
@@ -1876,6 +1887,17 @@ impl MlxModelWeights {
                 cum_moe_ns as f64 / 1e6,
                 cum_misc_ns as f64 / 1e6,
                 num_layers,
+            );
+            // ADR-028 iter-463: MoE sub-buckets
+            cum_moe_other_ns = cum_moe_ns.saturating_sub(
+                cum_moe_gate_up_ns + cum_moe_down_ns + cum_moe_router_cpu_ns
+            );
+            tracing::info!(
+                "[LOAD_TIMING] moe_sub_buckets gate_up={:.0}ms down={:.0}ms router_cpu={:.0}ms other(router_proj+scales+placeholder)={:.0}ms",
+                cum_moe_gate_up_ns as f64 / 1e6,
+                cum_moe_down_ns as f64 / 1e6,
+                cum_moe_router_cpu_ns as f64 / 1e6,
+                cum_moe_other_ns as f64 / 1e6,
             );
         }
         tracing::info!(

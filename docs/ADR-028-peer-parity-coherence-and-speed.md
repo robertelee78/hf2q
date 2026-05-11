@@ -23676,3 +23676,79 @@ This is THE actionable lever for startup optimization.
 | Phase 15 default-on | ✓ shipped |
 | HYBRID_KV | OPERATOR-GATED |
 | Multi-thread decode | OPERATOR-GATED |
+
+## iter-463 — MoE bottleneck = `gguf.load_tensor()` for stacked_gate_up + stacked_down
+
+### Hypothesis
+iter-462 found MoE = 81% of mlx_weights_load.  Drill into MoE
+sub-phases to identify if it's the tensor load or downstream
+processing (router setup, scale computations).
+
+### Method
+Added 4 cumulative sub-buckets in MoE branch:
+- `gate_up`: gguf.load_tensor(ffn_gate_up_exps.weight) + stride compute
+- `down`: gguf.load_tensor(ffn_down_exps.weight) + stride compute
+- `router_cpu`: router_combined_weight CPU multiply loop
+- `other`: router_proj + router_scale + per_expert_scale loads
+
+### Results
+
+| MoE sub-bucket | Time | % of moe | Per layer |
+|---|---|---|---|
+| **gate_up** (stacked tensor load) | **1356 ms** | **65%** | 45 ms/layer |
+| **down** (stacked tensor load) | **667 ms** | **32%** | 22 ms/layer |
+| router_cpu (CPU multiply loop) | 0 ms | <0.1% | — |
+| other (router_proj + scales) | 66 ms | 3% | 2 ms/layer |
+| **MoE total** | **2089 ms** | **100%** | 70 ms/layer |
+
+### Diagnosis
+**The entire MoE bottleneck is TWO `gguf.load_tensor()` calls per
+layer**: one for `ffn_gate_up_exps.weight` and one for
+`ffn_down_exps.weight`.  Together they account for 97% of MoE work.
+
+The 2:1 time ratio (45 ms vs 22 ms per layer) matches the tensor
+size relationship (gate_up = 2 × moe_int = 2× down's size).  Both
+tensors are stacked across 128 experts.
+
+### Peer comparison hypothesis
+Per `resident_weight_bytes=None`, hf2q weights are mmap'd (no disk
+I/O).  But `gguf.load_tensor()` still takes 22-45 ms per call —
+that's setup overhead, NOT disk reads.  Possible causes:
+- `MlxBuffer` allocation + registration with residency_set
+- Per-tensor metadata validation
+- `MTLBuffer` creation from raw pointer
+- Potential bytewise copy into a new MtlBuffer (not zero-copy mmap)
+
+Peer reaches startup ready in 1.65 sec total = ~1 sec for ALL weight
+loading.  Either peer:
+- Uses zero-copy mmap-pointer references (no MtlBuffer alloc)
+- Lazy-loads tensors on first kernel dispatch
+- Has lower per-tensor setup overhead
+
+### Lever assessment
+The 2 sec MoE lever can be addressed via:
+1. **Zero-copy MlxBuffer for mmap'd tensors** (architectural change
+   in mlx-native gguf::load_tensor)
+2. **Parallel MoE tensor load** (rayon thread pool over the 30 layers,
+   2 tensors each = 60 parallel load_tensor calls)
+3. **Lazy MoE load** (defer until first request)
+
+Option 2 (parallel) is the most likely single-iter win without
+architectural changes.
+
+### Investigation count this thread
+120 total: 119 from iter-462 + this iter (MoE pinpointed to two
+load_tensor calls per layer).
+
+### Cumulative startup gap chain (iter-458→463)
+| Step | Finding |
+|---|---|
+| iter-458 | Gap = 1.64 sec (3.29s vs 1.65s peer) |
+| iter-459 | load_wall_clock = 88% of total (2.91s) |
+| iter-461 | mlx_weights_load = 88% of load (2.55s) |
+| iter-462 | MoE = 81% of weights load (2.07s) |
+| **iter-463** | **gate_up + down `load_tensor` = 97% of MoE (2.02s)** |
+
+The startup gap is now **fully traced from 3.29s → 2.02s of two
+`gguf.load_tensor()` calls per MoE layer × 30 layers**.  ~62% of the
+total startup is in this single mechanism.
