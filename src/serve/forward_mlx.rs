@@ -8068,16 +8068,15 @@ pub fn dispatch_qmatmul(
         .map_err(|e| anyhow::anyhow!("qmm_affine_t_packed_simd4_b4 failed: {e}"));
     }
 
-    // ADR-029 iter-28 H29 — F16 pre-dequant fast path.
+    // ADR-029 iter-28 H29 / iter-30 H29-speed — F16 pre-dequant fast path.
     //
     // When a quantized weight has been pre-dequantized to F16 at load
     // (via populate_f16_shadow_if_enabled under HF2Q_F16_SHADOW=1),
-    // route m > MM_ROUTING_THRESHOLD (= 8, prefill) through the
-    // F16-weight × F32-input mat-mat tile kernel
-    // (`hf2q_dense_mm_f16_f32_tensor`).  This mirrors peer's gemma4
-    // pattern: dequant once at load, then run fast F16-input matmul for
-    // every dense dispatch instead of paying the per-call dequant cost
-    // inside `kernel_mul_mm_<qtype>_tensor_f32`.
+    // route m > MM_ROUTING_THRESHOLD (= 8, prefill) through the V2-tile
+    // F16-weight × F32-input mat-mat kernel (`hf2q_mul_mm_tensor_v2_f16`).
+    // This is the F16-input analog of the V2 quantized kernel — same
+    // 64×128 tile + direct-device B-read — without the per-call dequant
+    // work inside the matmul.  Peer's gemma4 strategy.
     //
     // Decode m=1 still routes through the quantized branch below (the
     // dequant cost is amortized over fewer dispatches, and the m=1 mv
@@ -8086,23 +8085,18 @@ pub fn dispatch_qmatmul(
         if let Some(ref f16w) = weight.f16_shadow {
             let n = weight.info.rows as u32;
             let k = weight.info.cols as u32;
-            let params = mlx_native::ops::dense_mm_f16::DenseMmF16F32Params {
-                m,
-                n,
-                k,
-                src0_batch: 1,
-                src1_batch: 1,
-            };
-            return mlx_native::ops::dense_mm_f16::dense_matmul_f16_f32_tensor(
+            return mlx_native::ops::quantized_matmul_ggml::dispatch_mm_v2_f16(
                 session.encoder_mut(),
                 registry,
                 device,
                 f16w,
                 input,
                 output,
-                &params,
+                m,
+                n,
+                k,
             )
-            .map_err(|e| anyhow::anyhow!("dispatch_qmatmul F16-shadow path failed: {e}"));
+            .map_err(|e| anyhow::anyhow!("dispatch_qmatmul F16-shadow V2 path failed: {e}"));
         }
     }
 
