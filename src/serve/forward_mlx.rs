@@ -4367,6 +4367,26 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
+                // ADR-029 iter-14 — FFN sub-phase split (HF2Q_FFN_SPLIT=1).
+                // Boundary 1: end of "FFN_NORMS" sub-phase (post-attn norm +
+                // B8 3 pre-FF norms or the fused_triple_norm equivalent).
+                // Commits the CB so the next session's GPU time reports just
+                // the FFN body (B9-B13) under the FFN_BODY label.
+                if std::env::var("HF2Q_FFN_SPLIT").as_deref() == Ok("1") {
+                    let gpu_ns: u64 = s.finish_with_gpu_time()
+                        .map_err(|e| anyhow::anyhow!("ffn-norms finish L{layer_idx}: {e}"))?;
+                    eprintln!("    [FFN_NORMS L{:02} {}] gpu={:>6.1}µs",
+                        layer_idx,
+                        if is_sliding { "S" } else { "G" },
+                        gpu_ns as f64 / 1000.0);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("ffn-norms begin L{layer_idx}: {e}"))?;
+                    s.track_dispatch(&[],
+                        &[&self.activations.residual,
+                          &self.activations.norm_out,
+                          &self.activations.moe_norm_out,
+                          &self.activations.router_norm_out]);
+                }
+
                 // -- B9: dense gate + dense up + router logits [3 CONCURRENT] --
                 // gate/up read norm_out (from B8 norm1); router reads router_norm_out (from B8 router norm).
                 // All write disjoint buffers. ONE barrier after B8, then 3 dispatches without barriers.
@@ -4589,6 +4609,24 @@ impl MlxModelWeights {
                     );
                 }
 
+                // ADR-029 iter-14 — FFN sub-phase split (HF2Q_FFN_SPLIT=1).
+                // Boundary 2: end of "FFN_BODY" sub-phase (B9-B13: dense MLP +
+                // MoE experts + interleaved post-FF norm 1).  Commits the CB
+                // so the next session's GPU time reports just the end-of-layer
+                // norm + add + scalar under the FFN_EOL label.
+                if std::env::var("HF2Q_FFN_SPLIT").as_deref() == Ok("1") {
+                    let gpu_ns: u64 = s.finish_with_gpu_time()
+                        .map_err(|e| anyhow::anyhow!("ffn-body finish L{layer_idx}: {e}"))?;
+                    eprintln!("    [FFN_BODY  L{:02} {}] gpu={:>6.1}µs",
+                        layer_idx,
+                        if is_sliding { "S" } else { "G" },
+                        gpu_ns as f64 / 1000.0);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("ffn-body begin L{layer_idx}: {e}"))?;
+                    s.track_dispatch(&[],
+                        &[&self.activations.mlp_down, &self.activations.moe_accum,
+                          &self.activations.attn_out, &self.activations.residual]);
+                }
+
                 // ============================================================
                 // GPU post-MoE: norm, combine MLP+MoE, final norm, residual, scalar
                 // ============================================================
@@ -4725,10 +4763,13 @@ impl MlxModelWeights {
                 // reports just the FFN+EOL phase.
                 let phase_split = std::env::var("HF2Q_PER_LAYER_PHASE_GPU_TIME").as_deref() == Ok("1");
                 let per_layer = std::env::var("HF2Q_PER_LAYER_GPU_TIME").as_deref() == Ok("1");
-                if per_layer || phase_split {
+                let ffn_split = std::env::var("HF2Q_FFN_SPLIT").as_deref() == Ok("1");
+                if per_layer || phase_split || ffn_split {
                     let gpu_ns: u64 = s.finish_with_gpu_time()
                         .map_err(|e| anyhow::anyhow!("per-layer finish L{layer_idx}: {e}"))?;
-                    let label = if phase_split { "PHASE_FFN" } else { "PER_LAYER_GPU" };
+                    let label = if ffn_split { "FFN_EOL  " }
+                                else if phase_split { "PHASE_FFN" }
+                                else { "PER_LAYER_GPU" };
                     eprintln!("    [{label} L{:02} {}] gpu={:>6.1}µs",
                         layer_idx,
                         if is_sliding { "S" } else { "G" },

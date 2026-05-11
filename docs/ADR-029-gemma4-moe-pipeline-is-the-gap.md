@@ -146,6 +146,9 @@ overhead between them.
 | **H12** | **F16 KV cache (HF2Q_HYBRID_KV — pre-existing ADR-028 Phase 10) closes part of the ATTN gap on gemma4** | **iter-9 model + iter-11 first run** | **iter-11 first run: -17% (61.4 vs 73.9 t/s) — RETRACTED in iter-12 as cold-start artifact. iter-12 3-trial fresh: +9.7% median (78.5 vs 71.6 t/s, σ-pct < 0.5%). Coherence ✓. Per-layer GPU savings replicate (-22 µs sliding, -39 µs full).** | **✅ H12 CONFIRMED** |
 | H13 | FFN sub-phase has a single dominant slow op | iter-9 split needed | un-localized | **STANDING — needs sub-split** |
 | ~~H14~~ | ~~Per-layer GPU savings don't translate to wall-clock under HYBRID~~ | ~~iter-11 single-shot~~ | **iter-12: artifact RETRACTED. Wall-clock IS faster under HYBRID at all properly-measured thermally-stable trials.** | **❌ H14 RETRACTED** |
+| **H15** | **FFN gap is concentrated in FFN_BODY (B9-B13 dense MLP + MoE experts) at 264 µs/layer × 30 = 7.92 ms/tok** | **iter-14 sub-phase split** | **FFN_BODY = 264 µs (94.4% of FFN); FFN_NORMS = 6.7 µs (2.4%); FFN_EOL = 5.6 µs (2.0%). Peer FFN ~206 µs would imply peer FFN_BODY ~196 µs (gap = 68 µs/layer = 2.04 ms/tok).** | **✅ H15 CONFIRMED — gap is in FFN_BODY** |
+| **H16** | **FFN_BODY 264 µs is dispatch-pipeline-bound, not compute-bound. Removing any single sub-component (dense MLP / routing / MoE experts) does not change wall time.** | **iter-14 skip-flag bisect** | **SKIP_DENSE_MLP 265 µs; SKIP_ROUTING 265 µs; SKIP_MOE_EXPERTS 268 µs (within noise). All identical to baseline 264 µs.** | **✅ H16 CONFIRMED — explains H6/H7/H8 fusion regressions** |
+| **H17** | **The lever class that could move FFN_BODY is dispatch-PATTERN reorganization (not fusion, not kernel-replacement). Match peer's "more, smaller, more-concurrent" pattern that has 1389 vs hf2q 883 dispatches/tok.** | **iter-14 inference from H15+H16** | **not yet tested** | **STANDING — concrete next test (iter-15)** |
 
 ## Decision
 
@@ -360,7 +363,9 @@ disposition** — Action items A and B should be tried first.
 | 9 | c50da032 | ADR-029 rewritten to reflect measured ground truth (iter-stack collapse) |
 | 10 | a99a5b10 | Fresh re-measure at HEAD: hf2q 73.9 / peer 97.73 = 0.756× (σ-pct ≤ 1.2%, apples-to-apples confirmed). Per-phase parity-checks against iter-9 numbers: identical within noise. |
 | 11 | a99a5b10 | **HF2Q_HYBRID_KV=1 first run: -17% (61.4 t/s) — RETRACTED in iter-12 as cold-start artifact. ADR-amend committed prematurely.** |
-| 12 | this commit | **HF2Q_HYBRID_KV=1 3-trial fresh independent processes: +9.5% median (78.5 vs 71.6 t/s). H12 CONFIRMED — F16 K closes ~4.9pp of the gemma4-peer gap. H14 RETRACTED (artifact). New ratio: 0.805× peer. Coherence ✓. Default-flip queued as iter-13.** |
+| 12 | 0808e4e9 | **HF2Q_HYBRID_KV=1 3-trial fresh independent processes: +9.5% median (78.5 vs 71.6 t/s). H12 CONFIRMED — F16 K closes ~4.9pp of the gemma4-peer gap. H14 RETRACTED (artifact). New ratio: 0.805× peer. Coherence ✓.** |
+| 13 | 7e2239ad | **DEFAULT-FLIP: `HF2Q_HYBRID_KV` flipped from off to on via `env_default_true`. 3-trial steady-state bench DEFAULT 80.4 t/s vs OPT-OUT 78.1 t/s = +2.9% median, σ-pct < 1%, fluent haikus both modes, peer ratio 0.823×. Opt-out via `HF2Q_HYBRID_KV=0`. All 5 env tests + 16 qwen35 hybrid_kv_cache tests green.** |
+| 14 | this commit | **FFN sub-phase split (`HF2Q_FFN_SPLIT=1`) — added boundaries at end of B8 (norms) and end of B13 (body). Decomposition: FFN_NORMS = 6.7 µs (fused 1 dispatch), FFN_BODY = 264 µs (B9-B13 dense MLP + MoE), FFN_EOL = 5.6 µs (fused 1 dispatch). Skip-flag bisect: removing SKIP_DENSE_MLP / SKIP_ROUTING / SKIP_MOE_EXPERTS = identical 265 µs FFN_BODY ⇒ FFN_BODY is dispatch-pipeline-bound, not compute-bound. The 58 µs/layer FFN gap is in **dispatch scheduling**, not in any one kernel. Confirms why H6/H7/H8 (fusion) regressed on M5 Max — fusion compresses already-overlapped work.** |
 
 ## Links
 
