@@ -2083,11 +2083,23 @@ impl GemmaLoadedModel {
         // metadata. Both produce byte-identical token streams for Gemma4
         // per the parity test in
         // `tests/adr_022_phase1_p11_gemma4_tokenizer_parity.rs`.
-        let mut tokenizer = match tokenizer_path_opt.as_ref() {
-            Some(p) => Tokenizer::from_file(p)
-                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {}: {e}", p.display()))?,
-            None => crate::inference::models::gemma4::tokenizer::build_tokenizer_from_gguf(&gguf)
-                .context("Failed to build Gemma4 tokenizer from GGUF metadata")?,
+        //
+        // ADR-028 iter-466: opt-in `HF2Q_TOKENIZER_GGUF_EMBEDDED=1` forces
+        // the GGUF-embedded path even when an on-disk tokenizer.json is
+        // present.  Saves ~300 ms startup time per iter-461 (10% of total
+        // load_wall_clock).  Default-OFF for backward-compat HF-checkout
+        // ergonomics; operator can flip default later after broader soak.
+        let force_gguf_tokenizer = std::env::var("HF2Q_TOKENIZER_GGUF_EMBEDDED").as_deref() == Ok("1");
+        let mut tokenizer = if force_gguf_tokenizer {
+            crate::inference::models::gemma4::tokenizer::build_tokenizer_from_gguf(&gguf)
+                .context("Failed to build Gemma4 tokenizer from GGUF metadata (HF2Q_TOKENIZER_GGUF_EMBEDDED=1)")?
+        } else {
+            match tokenizer_path_opt.as_ref() {
+                Some(p) => Tokenizer::from_file(p)
+                    .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {}: {e}", p.display()))?,
+                None => crate::inference::models::gemma4::tokenizer::build_tokenizer_from_gguf(&gguf)
+                    .context("Failed to build Gemma4 tokenizer from GGUF metadata")?,
+            }
         };
         if load_timing {
             tracing::info!("[LOAD_TIMING] tokenizer_init={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);

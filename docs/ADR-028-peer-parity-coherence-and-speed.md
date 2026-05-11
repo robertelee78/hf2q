@@ -23941,3 +23941,66 @@ From "1.6s startup gap" (iter-458) to "concrete API path identified
 with all dependencies in place" (iter-465).  8 iters of root-cause
 investigation; concrete ready-to-ship architectural plan documented
 for operator review.
+
+## iter-466 — `HF2Q_TOKENIZER_GGUF_EMBEDDED=1` opt-in: -200 ms startup, coherent
+
+### Hypothesis (action over deferral)
+Per iter-461 candidate: switching to GGUF-embedded tokenizer saves
+~300 ms.  Per ADR-022 P1.11 + parity test, both paths produce
+byte-identical tokens for gemma4.  Add an opt-in flag and bench.
+
+### Method
+1. Added `HF2Q_TOKENIZER_GGUF_EMBEDDED=1` env-flag at engine.rs:2086
+2. When set, forces `build_tokenizer_from_gguf` even if on-disk
+   tokenizer.json is present
+3. Default-OFF for backward-compat (HF-checkout ergonomics)
+4. A/B test startup + coherence
+
+### Patch
+```rust
+let force_gguf_tokenizer = std::env::var("HF2Q_TOKENIZER_GGUF_EMBEDDED").as_deref() == Ok("1");
+let mut tokenizer = if force_gguf_tokenizer {
+    crate::inference::models::gemma4::tokenizer::build_tokenizer_from_gguf(&gguf)?
+} else {
+    /* original on-disk-preferred logic */
+};
+```
+
+### Results
+
+| Mode | Startup time | tokenizer_init | Δ |
+|---|---|---|---|
+| Default (on-disk tokenizer.json) | 3.29-3.93 sec | 289 ms | baseline |
+| **HF2Q_TOKENIZER_GGUF_EMBEDDED=1** | **3.08-3.09 sec** | **124 ms** | **-165 ms tokenizer, ~-200 ms startup** |
+
+**Coherence verified**: "What is 2+2?" → "2 + 2 = 4" ✓
+
+### Action — opt-in shipped, default-OFF
+The 200 ms startup saving is real and verified.  Default-OFF until
+operator approves (HF-checkout users who supply explicit
+`--tokenizer <path>` still want on-disk preference).
+
+Future default-flip path (operator decision):
+- Verify parity test still passes on a wider set of GGUFs
+- Verify edge cases (corrupt tokenizer.json, missing GGUF metadata)
+- Flip env_eq_one → env_default_true at line 2086
+
+### Investigation count this thread
+123 total: 122 from iter-465 + this iter (tokenizer flag landed).
+
+### Startup gap reduction at HEAD (with new opt-in)
+- **Default startup**: 3.29 sec (unchanged)
+- **With HF2Q_TOKENIZER_GGUF_EMBEDDED=1**: 3.09 sec (-6% startup)
+- vs peer 1.65 sec: gap reduced from 1.64 → 1.44 sec (12% closed)
+
+### Operator decision matrix (refined)
+| Lever | Status | Effect |
+|---|---|---|
+| Phase 15 default-on | ✓ shipped | prefill 0.94× peer |
+| **HF2Q_TOKENIZER_GGUF_EMBEDDED** | **OPT-IN shipped** | **-200 ms startup** |
+| mmap-backed gguf zero-copy | OPERATOR-GATED | -1.5-2 sec startup |
+| HYBRID_KV | OPERATOR-GATED | +3.3% decode (33% memory) |
+| Multi-thread decode | OPERATOR-GATED | +2.2% (5-8 iters) |
+
+The tokenizer opt-in is the **first concrete startup lever shipped**
+in this thread.  Remaining (mmap) is architectural multi-iter work.
