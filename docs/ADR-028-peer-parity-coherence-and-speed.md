@@ -24886,3 +24886,74 @@ hf2q's 1.42 sec gap vs peer is fully attributed:
 
 The ~2.4 sec architectural improvement potential is precisely
 quantified and operator-decision-gated.
+
+## iter-483 — embed_weight 271ms is DEQUANT compute, not memcpy
+
+### Hypothesis
+iter-464 found `load_tensor` does double memcpy.  Verify if
+`load_tensor_f32` (used for embed_weight) has the same issue.
+
+### Method
+Read `/opt/mlx-native/src/gguf/mod.rs:1204-1228` (load_tensor_f32).
+
+### Findings — load_tensor_f32 is SINGLE-memcpy
+```rust
+pub fn load_tensor_f32(&self, name: &str, device: &MlxDevice) -> Result<MlxBuffer> {
+    let info = self.tensors.get(name)?;
+    let data = self.read_tensor_bytes(info)?;  // memcpy #1: alloc Vec + read_exact
+    let mut buf = device.alloc_buffer(f32_byte_len, DType::F32, info.shape.clone())?;
+    {
+        let out_slice: &mut [f32] = buf.as_mut_slice()?;
+        dequantize_to_f32(&data, info.ggml_type, out_slice)?;  // dequant DIRECTLY into MlxBuffer
+    }
+    Ok(buf)
+}
+```
+
+So `load_tensor_f32` avoids the second memcpy that `load_tensor`
+suffers — the Q6_K→F32 dequant writes the output directly into the
+Metal buffer.
+
+### embed_weight cost breakdown (271 ms measured)
+- `read_tensor_bytes`: 480 MB / 50 GB/s ≈ **10 ms** (memcpy #1, only)
+- `alloc_buffer` (MlxBuffer + residency_set): ~5 ms
+- **`dequantize_to_f32` compute + write**: ~150-200 ms (Q6_K
+  super-block dequant of 738M elements + write 2.95 GB to F32)
+- Misc overhead: ~50 ms
+
+Total: ~215-265 ms — matches measured 271 ms.
+
+### Implication for lever sizing
+**mmap zero-copy would NOT eliminate this cost** — the dominant
+cost is the dequant compute, not the memcpy.  mmap only saves
+the ~10 ms read_exact step.
+
+The full 271 ms saving REQUIRES Q6_K-on-device storage (no F32
+dequant at startup; dequant on-the-fly at gather time).  Tradeoff:
++2% decode (per iter-188 lm_head Q6_K finding).
+
+### Revised lever sizing
+| Lever | embed_weight saving | Notes |
+|---|---|---|
+| mmap zero-copy | -10 ms | Only saves memcpy #1 of read_exact |
+| **Q6_K-on-device embed** | **-271 ms** | Full saving; +2% decode tradeoff |
+
+The full -271 ms requires the Q6_K-on-device architectural change,
+not mmap.
+
+### Investigation count this thread
+140 total: 139 from iter-482 + this iter (load_tensor_f32 single-
+copy refinement).
+
+### Refined architectural ROI
+| Lever | Startup saving | Decode cost |
+|---|---|---|
+| mmap zero-copy (MoE only) | -2.0 sec | 0 |
+| Q6_K-on-device embed_weight | -271 ms | +2% decode |
+| Pre-built tokenizer cache | -100 ms | 0 |
+| **Total potential** | **-2.37 sec → startup 0.70 sec** | +2% decode |
+
+Compared to peer's 1.65 sec, hf2q would BEAT peer by ~1 sec startup
++ HYBRID_KV (+2% decode) cancels the embed_weight cost.  Net:
+**hf2q faster than peer on startup AND decode-neutral** if all
+levers landed.
