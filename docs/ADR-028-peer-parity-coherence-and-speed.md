@@ -24491,3 +24491,45 @@ If operator decides to ship HYBRID default-on:
 
 Single-line change once approved.  iter-475 confirms the stack works
 cleanly when both opt-in to maximum.
+
+## iter-476 — 20-request soak stability at HEAD
+
+### Hypothesis
+After 132 iters of work, verify production state is stable under
+varied request load.
+
+### Method
+hf2q serve at HEAD (Phase 15 + tokenizer default-on, HYBRID off).
+20 unique prompts × varied max_tokens (3-30).  Measure
+success rate + total wall + server RSS.
+
+### Results
+
+| Metric | Value |
+|---|---|
+| Success rate | **20/20 (100%)** |
+| Total wall | 7.28 sec |
+| Avg per request | 364 ms |
+| Final RSS | 24.7 GB (stable, no leak) |
+| Final CPU usage | 12.2% (mostly idle) |
+
+All 20 requests succeed with varied prompts (math, list, geography,
+abstract) and varied max_tokens (3-30).  No errors, no hangs, no
+memory leaks.
+
+### Investigation count this thread
+133 total: 132 from iter-475 + this iter (soak verification).
+
+### Cumulative thread state (final)
+- 133 investigations across iter-409→476
+- 4 auto-memory entries covering the work-of-record
+- 2 default-on flags shipped (Phase 15 iter-421, tokenizer iter-469)
+- 1 optional flag verified (HYBRID +2.0% / 33% memory)
+- 8 peer-parity audits all confirmed
+- 2 doc bugs fixed
+- Test suite 3456/3467 + 51 lib, no regressions
+- Production state:
+  - Startup: 3.07 sec (was 3.29)
+  - Prefill: 0.94× peer (was 0.022×)
+  - Decode: 0.72× peer canonical
+  - Coherence: TIED with peer
