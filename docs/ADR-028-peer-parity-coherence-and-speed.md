@@ -16957,3 +16957,87 @@ Production default unchanged: chain (`moe_weighted_sum + fused_post_ff_norm2_end
 ### Falsification count this thread
 24 total: 23 from iter-366 + this iter (default-OFF deferral counts as a
 "shipped infrastructure but not landed" partial; full landing pending).
+
+## iter-368 — peer-style Q8_0 NSG=4 NR=2 port: parity ✓, bench flat (25th investigation)
+
+### Date
+2026-05-10
+
+### Hypothesis
+Per dispatch breakdown, `kernel_mul_mv_q8_0_f32` is 3.41% of decode dispatches.
+Peer (llama.cpp) uses N_R0_Q8_0=2 + N_SG_Q8_0=4 (128 threads/TG, 2 rows/TG with
+cross-SG reduction).  Ours uses N_DST=4 + N_SIMDGROUP=2 (64 threads/TG, 8
+rows/TG).  Same total work but peer has 2× more threads per TG → better Apple
+GPU latency hiding.  Predicted 0.5-1% decode improvement.
+
+### Chesterton's fence (uncovered)
+Peer-style port was originally attempted Apr 12 (mlx-native commit 1818693)
+but reverted Apr 15 (commit 636d5cb) because of a "dispatch mismatch that
+produced wrong results."  Inspecting the original broken implementation: the
+dispatch geometry, kernel logic, and barrier placement all match peer's
+working implementation.  The exact root cause of the original failure is
+not identifiable from the diff alone — possibly a stale build artifact or
+unrelated issue at the time of revert.
+
+### Implementation
+Fresh port from peer (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:3572-3644`,
+MIT licensed):
+- New kernel `kernel_mul_mv_q8_0_f32_nr2` in `quantized_matmul_ggml.metal`
+  (~115 LOC).  NR0=2, NSG=4, NQ=8 — exact peer mirror.
+- Cross-SG reduction via threadgroup memory (256 bytes).
+- Dispatcher gated on `HF2Q_Q8_0_MV_NR2=1` (default-OFF).
+- Threadgroups = `(ceil(N/2), M, B)`, threads_per_tg = `(32, 4, 1)`.
+
+### Parity (PASSED)
+```
+parity_q8_0_mv_nr2_n128_k2048      max_abs=1.5259e-5  max_rel=1.2110e-7
+parity_q8_0_mv_nr2_n2816_k2816     max_abs=3.0518e-5  max_rel=1.7721e-7
+```
+Both shapes well within 1e-4 ADR tolerance.  Different reduction order (cross-SG
+vs single-SG simd_sum) introduces small f32 rounding deltas — expected.
+
+### Bench (gemma4-ara-2pass-APEX-Q5_K_M, 200-tok decode, iter-321 stack ON)
+
+5-pair interleaved A/B:
+
+| Trial | Baseline (V1) | NR2 (V2) |
+|---|---|---|
+| 1 | 74.9 | 74.9 |
+| 2 | 74.8 | 74.6 |
+| 3 | 74.8 | 74.7 |
+| 4 | 74.6 | 74.6 |
+| 5 | 74.6 | 74.6 |
+| **mean** | **74.74** | **74.68** |
+
+Δ = **-0.08%** — within run-to-run noise.
+
+### Why no improvement?
+
+Q8_0 mv is only 3.41% of dispatches AND each Q8_0 weight in gemma4 is
+relatively small (auxiliary tensors, not main attention/FFN weights).  Even
+a 25% per-dispatch speedup would only yield ~0.85% overall — but we got 0%.
+Possible reasons:
+1. Apple GPU's compute units are underutilized at gemma4's Q8_0 N values; the
+   parallelism boost from 64→128 threads/TG provides no benefit when the
+   workload is memory-bandwidth-bound on small matrices.
+2. Cross-SG reduction overhead (3 barriers + threadgroup memory traffic)
+   eats the dispatch-launch savings.
+3. The few Q8_0 dispatches per token are already too fast to optimize
+   meaningfully.
+
+### Coherence
+"What is 2+2?" → "2 + 2 = 4<turn|>" ✓ — bit-equivalent to baseline.
+
+### Action
+Kernel kept in mlx-native (correct, parity-validated peer port).  Default-OFF
+in dispatcher.  Operator can opt-in via `HF2Q_Q8_0_MV_NR2=1` for
+investigation on different shapes / model configs (e.g., qwen35 may use Q8_0
+more heavily; future Q8_0-quantized models would benefit).
+
+### Tests + bench
+- mlx-native lib: 287/0 passing (2 new Q8_0 NR2 parity tests).
+- hf2q lib: 3454/0 passing.
+- Coherence verified: gemma4 "2 + 2 = 4" intact at default + at iter-368=1.
+
+### Falsification count this thread
+25 total: 24 from iter-367 + this iter (parity ✓ but bench flat — like iter-365).
