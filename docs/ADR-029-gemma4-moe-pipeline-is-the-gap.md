@@ -66,6 +66,34 @@
 > with atomic `hf2q_peer_dispatch_count` + per-pipeline histogram, env-gated
 > via `HF2Q_PEER_COUNT_PRINT=1` and `HF2Q_PEER_PIPELINE_HIST=1`.
 >
+> **iter-6 first test of the new direction — falsified for throughput.**
+> Ported `kernel_mul_mv_id_q8_0_f32_nr2` to mlx-native (commit `7acd4d4`,
+> matches peer's `N_R0_Q8_0=2 + N_SG_Q8_0=4`). Gemma4 MoE `ffn_down_exps`
+> is Q8_0 (30 dispatches/decode-tok on this path). Coherence: BYTE-IDENTICAL
+> 30-tok haiku. Throughput: **74.3 → 73.3 t/s = -1.3% regression**
+> (σ-pct 0.14% / 0.30%). Same pattern as iter-1..3 falsifications: the new
+> kernel is functionally correct but Apple Metal's scheduler doesn't favor
+> the larger threadgroup (128 threads vs 64) for this workload shape.
+> Kernel kept (env-flag `HF2Q_Q8_0_ID_MV_NR2=1`, default-off) for future
+> workloads.
+>
+> **The 2.14× per-dispatch gap is REAL but NOT explained by SG count.**
+> Both engines use `MTLDispatchTypeConcurrent`. Both use residency sets +
+> shared buffers. The remaining suspects:
+> - Apple Metal kernel launch overhead is fundamentally lower for peer's
+>   kernels (compiled differently? smaller pipeline state?)
+> - hf2q has command-encoder bookkeeping (mlx-native's tracker + barrier
+>   bookkeeping in graph.rs:barrier_between) adding 1-2 µs CPU per call
+> - Peer's larger total dispatch count (1389 vs 883) better hides Metal
+>   bubble overhead — the Apple GPU scheduler may be optimized for a
+>   "many small kernels" stream pattern
+>
+> Next direction: add per-pipeline timing instrumentation to mlx-native
+> (mirror the peer-side patch), capture per-kernel µs distribution to
+> identify hf2q outliers (kernels > 2× the global avg of 15 µs). Most
+> promising candidates remain `flash_attn_vec_tq_hb` (monolithic
+> attention) and `lm_head` (single dispatch over 262144 vocab).
+>
 > --- (prior MISSION REOPENED note retained below for chronology) ---
 
 > **⚠ MISSION REOPENED 2026-05-11 (post iter-4 merge)**
