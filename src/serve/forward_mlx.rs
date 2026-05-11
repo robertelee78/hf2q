@@ -4235,6 +4235,21 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
+                // ADR-029 iter-9 — phase split at attn/ffn boundary.
+                // HF2Q_PER_LAYER_PHASE_GPU_TIME=1 commits the attn portion
+                // and reports its GPU time, then begins a new session for ffn.
+                if std::env::var("HF2Q_PER_LAYER_PHASE_GPU_TIME").as_deref() == Ok("1") {
+                    let gpu_ns: u64 = s.finish_with_gpu_time()
+                        .map_err(|e| anyhow::anyhow!("phase-attn finish L{layer_idx}: {e}"))?;
+                    eprintln!("    [PHASE_ATTN L{:02} {}] gpu={:>6.1}µs",
+                        layer_idx,
+                        if is_sliding { "S" } else { "G" },
+                        gpu_ns as f64 / 1000.0);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("phase-attn begin L{layer_idx}: {e}"))?;
+                    s.track_dispatch(&[],
+                        &[&self.activations.hidden, &self.activations.attn_out]);
+                }
+
                 let num_experts = self.num_experts;
                 let top_k = self.layers[layer_idx].moe.top_k;
 
@@ -4352,6 +4367,26 @@ impl MlxModelWeights {
                     total_dispatches += 1;
                 }
 
+                // ADR-029 iter-14 — FFN sub-phase split (HF2Q_FFN_SPLIT=1).
+                // Boundary 1: end of "FFN_NORMS" sub-phase (post-attn norm +
+                // B8 3 pre-FF norms or the fused_triple_norm equivalent).
+                // Commits the CB so the next session's GPU time reports just
+                // the FFN body (B9-B13) under the FFN_BODY label.
+                if std::env::var("HF2Q_FFN_SPLIT").as_deref() == Ok("1") {
+                    let gpu_ns: u64 = s.finish_with_gpu_time()
+                        .map_err(|e| anyhow::anyhow!("ffn-norms finish L{layer_idx}: {e}"))?;
+                    eprintln!("    [FFN_NORMS L{:02} {}] gpu={:>6.1}µs",
+                        layer_idx,
+                        if is_sliding { "S" } else { "G" },
+                        gpu_ns as f64 / 1000.0);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("ffn-norms begin L{layer_idx}: {e}"))?;
+                    s.track_dispatch(&[],
+                        &[&self.activations.residual,
+                          &self.activations.norm_out,
+                          &self.activations.moe_norm_out,
+                          &self.activations.router_norm_out]);
+                }
+
                 // -- B9: dense gate + dense up + router logits [3 CONCURRENT] --
                 // gate/up read norm_out (from B8 norm1); router reads router_norm_out (from B8 router norm).
                 // All write disjoint buffers. ONE barrier after B8, then 3 dispatches without barriers.
@@ -4360,15 +4395,24 @@ impl MlxModelWeights {
                     &[&self.activations.mlp_gate, &self.activations.mlp_up,
                       &self.activations.moe_router_logits],
                 );
+                // ADR-029 iter-15 (H17 probe): HF2Q_B9_FORCE_SEQUENTIAL=1
+                // inserts memory_barrier()s between B9's 3 concurrent qmatmuls
+                // to test the "peer's more smaller serial dispatches" lever
+                // class. M5 Max scheduler may favor sequential issue at this
+                // shape (Q5_K 2816→5760 × 2 + 2816→128). Tracks no math
+                // change — barriers ONLY affect timing/scheduling.
+                let b9_sequential = std::env::var("HF2Q_B9_FORCE_SEQUENTIAL").as_deref() == Ok("1");
                 // ADR-028 iter-200: SKIP_DENSE_MLP bisect — skip mlp_gate +
                 // mlp_up dispatches.  Router proj must run (MoE depends on it).
                 if !INVESTIGATION_ENV.skip_dense_mlp {
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                         &self.layers[layer_idx].mlp.gate_proj, &self.activations.mlp_gate, 1)?;
                     total_dispatches += 1;
+                    if b9_sequential { s.encoder_mut().memory_barrier(); }
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                         &self.layers[layer_idx].mlp.up_proj, &self.activations.mlp_up, 1)?;
                     total_dispatches += 1;
+                    if b9_sequential { s.encoder_mut().memory_barrier(); }
                 }
                 // ADR-028 iter-213: SKIP_ROUTING bisect — skip router_proj qmatmul.
                 if !INVESTIGATION_ENV.skip_routing {
@@ -4574,6 +4618,24 @@ impl MlxModelWeights {
                     );
                 }
 
+                // ADR-029 iter-14 — FFN sub-phase split (HF2Q_FFN_SPLIT=1).
+                // Boundary 2: end of "FFN_BODY" sub-phase (B9-B13: dense MLP +
+                // MoE experts + interleaved post-FF norm 1).  Commits the CB
+                // so the next session's GPU time reports just the end-of-layer
+                // norm + add + scalar under the FFN_EOL label.
+                if std::env::var("HF2Q_FFN_SPLIT").as_deref() == Ok("1") {
+                    let gpu_ns: u64 = s.finish_with_gpu_time()
+                        .map_err(|e| anyhow::anyhow!("ffn-body finish L{layer_idx}: {e}"))?;
+                    eprintln!("    [FFN_BODY  L{:02} {}] gpu={:>6.1}µs",
+                        layer_idx,
+                        if is_sliding { "S" } else { "G" },
+                        gpu_ns as f64 / 1000.0);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("ffn-body begin L{layer_idx}: {e}"))?;
+                    s.track_dispatch(&[],
+                        &[&self.activations.mlp_down, &self.activations.moe_accum,
+                          &self.activations.attn_out, &self.activations.residual]);
+                }
+
                 // ============================================================
                 // GPU post-MoE: norm, combine MLP+MoE, final norm, residual, scalar
                 // ============================================================
@@ -4700,6 +4762,29 @@ impl MlxModelWeights {
                         is_sliding,
                         layer_disp_end - layer_disp_start,
                     ));
+                }
+
+                // ADR-029 iter-9 — per-layer GPU TIME ground truth.
+                // HF2Q_PER_LAYER_GPU_TIME=1 commits the session per-layer
+                // and records GPU wall-clock via finish_with_gpu_time.
+                // HF2Q_PER_LAYER_PHASE_GPU_TIME=1 also commits at the
+                // attn/ffn boundary, so this commit at end-of-layer
+                // reports just the FFN+EOL phase.
+                let phase_split = std::env::var("HF2Q_PER_LAYER_PHASE_GPU_TIME").as_deref() == Ok("1");
+                let per_layer = std::env::var("HF2Q_PER_LAYER_GPU_TIME").as_deref() == Ok("1");
+                let ffn_split = std::env::var("HF2Q_FFN_SPLIT").as_deref() == Ok("1");
+                if per_layer || phase_split || ffn_split {
+                    let gpu_ns: u64 = s.finish_with_gpu_time()
+                        .map_err(|e| anyhow::anyhow!("per-layer finish L{layer_idx}: {e}"))?;
+                    let label = if ffn_split { "FFN_EOL  " }
+                                else if phase_split { "PHASE_FFN" }
+                                else { "PER_LAYER_GPU" };
+                    eprintln!("    [{label} L{:02} {}] gpu={:>6.1}µs",
+                        layer_idx,
+                        if is_sliding { "S" } else { "G" },
+                        gpu_ns as f64 / 1000.0);
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("per-layer-gpu-time begin L{layer_idx}: {e}"))?;
+                    s.track_dispatch(&[], &[&self.activations.hidden]);
                 }
 
                 // ADR-009 Phase 3A: per-layer hidden state dump.
@@ -7812,15 +7897,45 @@ pub fn dispatch_qmatmul(
     }
 
     if weight.info.ggml_dtype == mlx_native::GgmlType::F32 {
-        // F32 dense path. Weight buffer holds [n_rows, k_cols] f32 row-major.
-        // dense_matmul_f32_f32_tensor expects:
-        //   src0 = weight  [src0_batch, n, k] f32 → [1, rows, cols]
-        //   src1 = input   [src1_batch, m, k] f32 → [1, m, cols]
-        //   dst  = output  [src1_batch, m, n] f32 → [1, m, rows]
+        // F32 dense path.  Weight buffer holds [n_rows, k_cols] f32 row-major.
+        //
+        // ADR-029 iter-18 (H26): for m=1 (decode), the matrix-MATRIX tile
+        // kernel `dense_matmul_f32_f32_tensor` wastes 87.5% of its 8x8 SIMD-
+        // group-matrix tile (uses 1 row of input out of 8 loaded).  Route
+        // m=1 dispatches through `dispatch_dense_matvec_f32` (mat-VECTOR
+        // kernel, MTLSize threads=32x2, 4 rows/dst x 2 SGs) which matches
+        // peer's `kernel_mul_mv_f32_f32` pattern.  Gemma4 router_proj
+        // (ffn_gate_inp F32 [2816,128]) measured ~73 µs/layer via the
+        // mat-mat kernel under HF2Q_FFN_SPLIT bisect; the mat-vec kernel
+        // is bandwidth-bound at ~7-10 µs/layer = ~63 µs/layer x 30 layers
+        // = ~1.9 ms/tok savings if H26 holds.  Opt-out via
+        // HF2Q_F32_MATVEC=0 (legacy mat-mat path); default ON for m=1.
+        let n = weight.info.rows as u32;
+        let k = weight.info.cols as u32;
+        let f32_matvec_default = std::env::var("HF2Q_F32_MATVEC")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
+        if m == 1 && f32_matvec_default {
+            let params = mlx_native::ops::dense_gemm::DenseGemmF16Params {
+                m, n, k,
+            };
+            return mlx_native::ops::dense_gemm::dispatch_dense_matvec_f32(
+                session.encoder_mut(),
+                registry,
+                device.metal_device(),
+                input,
+                &weight.buffer,
+                output,
+                &params,
+            )
+            .map_err(|e| anyhow::anyhow!("dispatch_dense_matvec_f32 failed: {e}"));
+        }
+        // m>=2 (prefill) or opt-out: fall back to mat-mat tile kernel.
         let params = mlx_native::DenseMmF32F32Params {
             m,
-            n: weight.info.rows as u32,
-            k: weight.info.cols as u32,
+            n,
+            k,
             src0_batch: 1,
             src1_batch: 1,
         };
