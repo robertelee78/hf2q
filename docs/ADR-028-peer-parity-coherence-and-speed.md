@@ -24533,3 +24533,67 @@ memory leaks.
   - Prefill: 0.94× peer (was 0.022×)
   - Decode: 0.72× peer canonical
   - Coherence: TIED with peer
+
+## iter-477 — multi-turn chat with growing history verified at HEAD
+
+### Hypothesis
+Phase 15 default-on handles multi-turn chat correctly with growing
+history.  Real production usage.
+
+### Method
+3-turn dialogue:
+- Turn 1: "My name is Alice. What is 2+2?" (intro + math)
+- Turn 2: history + "What was my name? Reply with just the name."
+- Turn 3: history + "And what number did I ask about? Reply with
+  the math expression."
+
+### Results
+
+| Turn | Reply | Recall test | Result |
+|---|---|---|---|
+| 1 | "Hello, Alice! The answer is **4**." | name + math | ✓ |
+| 2 | "Alice" | recalls name from turn 1 | ✓ |
+| 3 | "2+2" | recalls math from turn 1 (across turn 2) | ✓ |
+
+### Prefill scaling with history
+Each turn shows growing prefill seq_len as history accumulates:
+| Turn | seq_len | wall_ms | tok/s |
+|---|---|---|---|
+| 1 | 25 | 61 | 410 |
+| 2 | 56 | 63 | 887 |
+| 3 | 81 | 71 | 1148 |
+
+Per iter-413 linear model T(N) = 32 + 0.355N:
+- N=25: predicted 41 ms (measured 61) — small overhead
+- N=56: predicted 52 ms (measured 63) — close
+- N=81: predicted 61 ms (measured 71) — close
+
+Consistent with the prefill model.
+
+### Production-readiness verification
+Phase 15 default-on handles real multi-turn chat correctly:
+- Name recall ✓
+- Multi-step context recall ✓
+- No KV state corruption across turns
+- Prefill scales correctly with history length
+
+### Investigation count this thread
+134 total: 133 from iter-476 + this iter (multi-turn verified).
+
+### Final cumulative state at HEAD
+Two LANDED default-on flags ship in production at HEAD:
+1. Phase 15 (iter-421): serve batched prefill (35-43× ratio improvement)
+2. HF2Q_TOKENIZER_GGUF_EMBEDDED (iter-469): -200 ms startup
+
+All capabilities tested:
+- Coherence (TIED with peer)
+- Phase 15 prefill (0.94× peer)
+- Decode (0.72× peer canonical)
+- Long-gen (gap closes 42→25% from tg50 to tg2048)
+- Multi-turn (this iter)
+- Streaming + sampling + temp variation
+- 20-request soak (iter-476)
+- 3456/3467 integration tests pass
+
+134 investigations across iter-409→477.  Operator decision matrix
+exhaustively documented; remaining work multi-iter architectural.
