@@ -18807,3 +18807,90 @@ But this iter formally surfaces that the path forward is incremental
 
 ### Investigation count this thread
 48 total: 47 from iter-390 + this iter (stub method).
+
+## iter-392 — HEAD comprehensive bench refresh + handoff state
+
+### Date
+2026-05-10
+
+### Refreshed bench measurements at HEAD
+
+Tested after iter-388's `&mut self.activations` cascade + iter-385's
+`&MlxBuffer` cascade (which together may have given the Rust compiler
+more optimization headroom).
+
+| Config | Mean | vs original 73.7 baseline | vs peer 103/97 |
+|---|---|---|---|
+| **Default (200-tok)** | 75.17 (3 trials, σ 0.05) | **+2.0%** | **0.730× peer** |
+| **Hybrid (HF2Q_HYBRID_KV=1)** | 77.07 (3 trials, σ 0.06) | **+4.6%** | **0.749× peer** |
+| **1000-tok sustained (default)** | 74.20 (2 trials) | **+13.3%** | **0.765× peer 97** |
+
+Compared to iter-377's bench:
+- Legacy +0.35 tok/s improvement at 200-tok (75.17 vs 74.82)
+- Hybrid +0.27 tok/s improvement (77.07 vs 76.80)
+
+Hypothesized cause: iter-385 + iter-388 cascade gave Rust compiler less
+borrow-checker work + cleaner aliasing analysis → marginally better
+codegen on hot path.
+
+### Multi-thread port status (HONEST)
+
+**Completed (iter-380-391)**:
+- ✓ Full infrastructure prep (12 iters)
+- ✓ Signature cascades (mlx-native + hf2q)
+- ✓ Synthetic bench POSITIVE (+5.8% min, +11.7% mean)
+- ✓ EncoderWorker + singleton + Metal integration tested
+- ✓ LayerCtx struct skeleton
+- ✓ encode_one_layer stub method
+
+**Remaining**:
+- iter-392+: Move 1848 LOC of layer body into encode_one_layer
+- Wire EncoderWorker for parallel encoding
+- Bench A/B + ship if positive
+
+The 1848-LOC move is genuinely BEYOND single-/loop-iter budget without
+breakage risk (per iter-391 scope acknowledgment).  It needs:
+- ~5-8 chunked iters (Path A, /loop default), OR
+- Operator-scheduled multi-hour focus session (Path B)
+
+### Recommendation for operator decision
+
+The infrastructure for multi-thread encoding is COMPLETE.  The remaining
+work is a mechanical 1848-LOC code relocation + worker wiring.
+
+**Predicted final gain after full multi-thread port**: +3-7% on top of
+current HEAD = **~0.78× peer legacy / ~0.80× peer hybrid**.
+
+**Cost**: 5-8 more /loop iters of chunked work, OR a few hours of
+concentrated focus.
+
+**Alternative path forward**:
+- **Pivot to qwen35**: already 1.34× peer per memory entries — work
+  there may have higher ROI for user-facing perf claims
+- **Prefill optimization**: per iter-357, prefill is 1.6× slower than
+  peer — significant headroom
+- **Accept current state**: 5 LANDED phases delivering +2.0% legacy /
+  +4.6% hybrid; operator opts in via env flags
+
+### Cumulative thread state at HEAD (iter-392)
+
+| Phase | Δ at default |
+|---|---|
+| 9: BATCHED_PREFILL | +4.4× chat throughput |
+| 10: hybrid F16-K + TQ-HB-V | +4.6% decode (operator opt-in) |
+| 13: fused_post_ff_norm2 V2 | +0.7% decode |
+| 13.2: fused_moe_routing V2 | +0.3% decode |
+| 14: dual_buffer_split=2 | +0.18% decode |
+| **Cumulative default** | **+2.0% legacy / +4.6% hybrid** |
+
+48 falsified investigations.  Per-iter-tractable optimization formally
+exhausted (per iter-369/372/375).  Multi-thread is the next concrete
+lever but requires the unblocking work documented above.
+
+### Tests + bench
+- mlx-native lib: 290/0 passing.
+- hf2q lib: 3454+2 passing (LayerCtx + EncoderWorker singleton tests).
+- Coherence: gemma4 "2 + 2 = 4" intact.
+
+### Investigation count this thread
+49 total: 48 from iter-391 + this iter (HEAD bench + handoff state).
