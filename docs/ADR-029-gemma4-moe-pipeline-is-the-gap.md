@@ -178,6 +178,104 @@ HF2Q_UNSAFE_EXPERIMENTS=1 HF2Q_SKIP_ROUTING=1 HF2Q_SKIP_MOE_EXPERTS=1 \
 
 If any of these fail to reproduce within σ-pct < 5%, suspect (a) thermal throttle (let chip cool, retry), (b) HEAD divergence from `cfbdc469`, or (c) GGUF substitution (the APEX file mtime should be May 6 2026).
 
+## Implementation log (post-acceptance)
+
+### iter-1 (2026-05-11, branch `adr-029`)
+
+**Status**: §Decision item 3 LANDED; items 2a/2b audits CLOSED with falsifications; item 2c surfaced 1 dispatch-fusion regression (H6).
+
+#### iter-1 ship list
+
+1. **§Decision item 3 — kernel-profile gating fix LANDED** (commit `1cd6540f`).
+   `forward_decode_kernel_profile` (src/serve/forward_mlx.rs:5837+) gained a
+   `lm_head_q6k` branch that mirrors the production single-session decode path
+   at ~4818. Pre-fix gemma4-APEX-Q5_K_M hard-failed `Kernel profile requires
+   GPU lm_head (Q8_0 or F16 weight)` because `HF2Q_LMHEAD_Q6K` defaults on
+   (ADR-028 iter-345) and the GGUF's `token_embd.weight` is Q6_K → only
+   `lm_head_q6k` is `Some(...)`. `HF2Q_MLX_KERNEL_PROFILE=1` now runs end-to-end
+   on this GGUF; verified per-bucket table emitted (MoE 294 µs/layer × 30 =
+   8.82 ms/tok in profile mode; KV-cache-copy / O-proj / SDPA have higher
+   per-kernel-time **ratios** but lower absolute).
+
+2. **§Decision item 2b — MoE-2 NR2 hypothesis FALSIFIED** (no port available).
+   Inspecting `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h:51-57`:
+   `N_R0_Q4_K=2`, **`N_R0_Q5_K=1`**, `N_R0_Q6_K=2`. Inspecting
+   `/opt/mlx-native/src/ops/quantized_matmul_id_ggml.rs:483-489`: `use_q6k_id_nr2
+   = matches!(params.ggml_type, GgmlType::Q6_K) && env_default_true("HF2Q_Q6K_ID_MV_NR2")`
+   → Q6_K mul_mv_id **default-routes to `kernel_mul_mv_id_q6_K_f32_nr2` already**.
+   Confirmed gemma4-APEX-Q5_K_M expert quant types via `gguf-dump`:
+   `ffn_gate_up_exps.weight = Q6_K` (NR2 active) + `ffn_down_exps.weight = Q8_0`
+   (no NR variant; peer also NR1). Both engines already on parity paths for
+   gemma4 MoE experts. The iter-308 "peer N_R0=2 vs hf2q N_R0=1" Q6_K claim
+   that ADR-029 §Correction 3 already retracted is doubly confirmed: peer
+   `_id` Q6_K is also NR2; hf2q ditto. No optimization gap here.
+
+3. **§Decision item 2c (adjacent) — H6 fused-triple-norm decode FALSIFIED.**
+   Hypothesis: `HF2Q_FUSED_TRIPLE_NORM=1` (kernel
+   `dispatch_fused_post_attn_triple_norm_f32` at mlx-native, wired into decode
+   at forward_mlx.rs:4254) replaces 4 dispatches/layer (post-attn norm+add +
+   3 pre-FF norms) with 1 dispatch — saves 90 dispatches/tok (10% of measured
+   883 dispatches/tok decode count). The kernel is byte-identical to the
+   unfused path on prefill fixtures.
+   Test: gemma4-APEX-Q5_K_M, 50-tok "haiku about quantum entanglement",
+   --benchmark mode, n=5 each, sequential same thermal session.
+   | mode | tok/s | σ-pct | coherent |
+   |---|---:|---:|:---:|
+   | `HF2Q_FUSED_TRIPLE_NORM=0` (default) | 75.0 | 0.08% | ✓ |
+   | `HF2Q_FUSED_TRIPLE_NORM=1` | 72.9 | 0.05% | **✓** (byte-identical haiku) |
+   Result: **-2.1 t/s = -2.8% regression**. Coherence preserved; the fused
+   kernel saves 90 launches but costs more per-call than 4 unfused launches.
+   Interpretation: at hidden_size=2816 with 3 weight tensors + 4 output buffers
+   resident, register pressure / memory-access-pattern overhead exceeds the
+   ~3-4 µs/dispatch launch savings the fusion intends. **Do NOT default-on.**
+   Standing decision: leave flag OFF; mark it FALSIFIED in
+   `investigation_env.rs:600` doc-comment in a follow-up.
+
+4. **Ground-truth counters captured on adr-029 HEAD** (production decode mode):
+   `HF2Q_DUMP_COUNTERS=1 hf2q generate --max-tokens 20`
+   → **dispatches/decode_tok = 883.5**, **barriers/decode_tok = 487.35**,
+   syncs/decode_tok = 0, cmd_bufs/decode_tok = 1.9. Matches ADR-029's
+   pre-iter-1 "925 / 510" estimates within decode-warmup noise.
+   Peer (ADR-029 dispatch-arithmetic table) = 105 dispatches/tok ⇒ hf2q is
+   **8.4× more dispatches**. The structural difference is **llama.cpp's
+   ggml-metal scheduler fuses N ggml ops into M < N Metal dispatches at
+   graph-compile time**; hf2q dispatches each op manually. Closing the
+   dispatch gap is multi-kernel structural work, not a flag flip.
+
+#### iter-1 hypotheses verdicts (additive to §Hypothesis verdicts table)
+
+| hypothesis | predicted | measured | verdict |
+|---|---|---|---|
+| **H6** fused-triple-norm decode | +3-5% (90 disp/tok save) | -2.8% (-2.1 t/s) | **FALSIFIED — kernel per-call cost > launch savings at decode shape** |
+| MoE-2 NR2 port (§Decision 2b) | +3-7% if peer NR2 hf2q NR1 | both on NR2 (Q6_K) / NR1 (Q5_K/Q8_0) — no gap | **FALSIFIED — already on parity paths** |
+
+#### iter-1 standing direction (revised)
+
+Decode-time dispatch-fusion (TRIPLE_NORM, MOE_WSUM_END_LAYER_V2) appears to be
+a dead-end class on M5 Max — Apple Metal's per-dispatch overhead at the shapes
+gemma4 produces is small enough that fewer-larger-kernels lose to
+more-smaller-kernels. The remaining MoE levers are:
+1. **MoE-pipeline barrier audit** (§Decision item 2c, MoE-3): identify
+   redundant barriers in the B8-B14 sequence and the post-MoE chain. Each
+   redundant barrier removed costs 0 lines of new kernel code.
+2. **Structural dispatch-graph audit** (out of §Decision 2 scope but
+   surfaced here): compare hf2q's per-layer dispatch sequence to ggml-metal's
+   graph-compiled output for the same gemma4 layer. If peer schedules N ops
+   into M < N dispatches at scheduler time, there may be op-pair fusions
+   hf2q hasn't tried yet.
+3. **Per-kernel cost optimization** (out of §Decision 2 scope): the 2.3×
+   MoE per-kernel-time ratio in kernel-profile mode suggests there may be
+   tuning headroom in `kernel_mul_mv_id_q6_K_f32_nr2` (threadgroup shape,
+   shared-memory layout) — but this is the work ADR-028 already exhausted
+   for the non-_id Q6_K variant, so ROI is likely small.
+
+The §Decision item 2 work remains "MoE-pipeline focused investigation" but the
+ROI surface is smaller than the ADR-029 acceptance text implied:
+H6 falsification narrows the per-layer fusion lever from "10% saved" to "−2.8%
+cost". §Decision item 1 (halt TQ work) stands; §Decision item 3 (kernel-profile
+fix) is LANDED; §Decision items 4-5 (re-test qwen3.6, σ-pct standing rule)
+remain open.
+
 ## Links
 
 - `~/.claude/projects/-opt-hf2q/memory/project_adr028_synthesis_moe_pipeline_2026_05_11.md` (this finding, memory-form)
