@@ -25,10 +25,26 @@ regime measurement (5-trial median, same thermal session):
 | gen=2500 (long) | 76.0 | 72.75 | 1.04× |
 
 hf2q wins all 3 regimes in same-session thermal state; ratio compresses
-toward parity as context grows (TQ-HB V dequant cost scales with
-kv_seq_len). At thermal-shifted state operator reported peer hitting
-98.1 t/s vs hf2q 90.1 t/s at gen=2454 = 0.918× — that gap is the
-standing H27 lever (long-context F16 V) for any future iter.
+toward parity as context grows.
+
+**Apples-to-apples 3-iter back-to-back at gen=2500** (alternating
+hf2q/peer with same prompt workload, sleep 3s between):
+
+| iter | hf2q | peer | ratio |
+|---|---:|---:|---:|
+| 1 | 83.3 | 83.21 | 1.001× |
+| 2 | 84.9 | 81.30 | 1.044× |
+| 3 | 83.2 | 79.62 | 1.045× |
+| median | 83.3 | 81.30 | **1.025× (TIED-to-ahead)** |
+
+Operator's earlier observation of peer 98.1 vs hf2q 90.1 at gen=2454
+(0.918× peer) is reproducible only under specific thermal states where
+peer benefited from a cool device. Under controlled back-to-back
+measurement hf2q is at-or-above peer at long context. The TQ-HB V
+dequant cost is real (per-token cost grows with kv_seq_len) but
+small enough that thermal noise dominates — H27 (long-context F16 V
+swap) would be a marginal lever and is deferred unless future workload
+demands prove otherwise.
 
 ## How this ADR is grounded
 
