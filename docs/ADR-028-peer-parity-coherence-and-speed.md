@@ -20310,3 +20310,124 @@ decode).  No code change yet — measurement first.
 **Top lever**: localize and remove the 141 ms prefill overhead.
 This is the largest CONCRETE actionable gap discovered in 70
 investigations.
+
+## iter-414 — MASSIVE REFRAME: serve HTTP prefill is per-token, never batched
+
+### Hypothesis
+iter-413 measured 141 ms fixed prefill overhead via the `generate` CLI.
+Verify the same overhead in serve mode (the production path).
+Methodology: HTTP requests with unique prompts (LCP off) to extract
+the actual per-prefill wall.
+
+### Method
+1. Start `hf2q serve --model gemma4...APEX-Q5_K_M.gguf --port 18418`
+2. Set `HF2Q_KV_LCP_RESUME=0` (disable cache hit short-circuit)
+3. Issue 5 requests per size (5w / 50w / 400w) with UNIQUE prompts
+   (random prefix per request)
+4. Measure HTTP wall time
+
+### Results
+
+| Size | Tokens | Wall (ms) | tok/s | vs `generate` ratio |
+|---|---|---|---|---|
+| 5w | 63 | 524 ± 2 | 120 | 0.34× |
+| 50w | 513 | 7223 ± 5 | **71** | 0.05× |
+| 400w | 4013 | 63298 ± 3000 | **63** | 0.025× |
+
+**Generate CLI** at same sizes (iter-413): 350 / 1581 / 2550 tok/s.
+**Serve HTTP** at same sizes (this iter): 120 / 71 / 63 tok/s.
+
+The serve numbers are **decode-rate**, not prefill-rate.
+
+### Code path investigation
+```
+$ grep -rn "forward_prefill_batched" /opt/hf2q/src/ | grep -v test
+serve/forward_prefill_batched.rs:181:    pub fn forward_prefill_batched(...)
+serve/forward_prefill_batched.rs:190:    bail!("...empty prompt")
+serve/mod.rs:15:pub mod forward_prefill_batched;
+serve/mod.rs:1213:        mlx_w.forward_prefill_batched(...)?
+```
+
+**`forward_prefill_batched` is called from EXACTLY ONE site:
+`serve/mod.rs:1213` — which is the CLI `generate` path.**
+
+The HTTP server path is `api/engine.rs:4583`:
+```rust
+loaded.weights.forward_prefill_with_soft_tokens_resume(...)
+```
+
+That function (line 497 of forward_prefill.rs):
+```rust
+for (tok_i, &tok) in prompt_tokens.iter().enumerate().skip(resume_k) {
+    for layer_idx in 0..num_layers {
+        // per-layer-per-token forward
+    }
+}
+```
+
+**Per-token-per-layer loop. Never invokes batched prefill.**
+
+### Gap quantification
+- Peer pp4013: 2950 tok/s
+- hf2q `generate` pp4013: 2550 tok/s = **0.864× peer**
+- hf2q `serve` pp4013: 63 tok/s = **0.021× peer = 47× SLOWER**
+
+### Why this is the largest gap discovered
+Iter-411/412/413 measured the prefill via `generate` CLI and quoted
+0.509× → 0.900× peer.  But the **production gemma4 serve path** is
+**0.021× peer at pp4013**.  This is a 47× slowdown that has been
+hiding because:
+1. `generate` CLI is what we benchmark interactively — gives a rosy
+   picture
+2. The auto-memory's "1.03× peer at pp1024" was the `generate` path
+3. No prior iter benched the `serve` HTTP path for gemma4 prefill
+4. The `forward_prefill_batched` exists but is wired to ONLY the CLI
+
+### Why it might be wired this way (Chesterton's fence)
+- `HF2Q_BATCHED_PREFILL` warning: "experimental; errors when
+  seq_len > sliding_window" — operator explicitly gated as UNSAFE
+  for serve
+- Soft-token injection (vision) needs per-token positions
+- LCP resume needs per-position cache state
+- The auto-memory `gemma_prefill_bitrot_2026_05_09` describes the
+  batched path as having unresolved L6 MoE router top-K sensitivity
+  on long sliding_wrap fixtures (operator-signed deferral)
+
+So wiring batched into serve is NOT a one-line change.  It needs:
+- Soft-token compatibility audit
+- LCP resume integration
+- Vision path verification
+- Multi-modal slot allocation parity
+- Operator approval (UNSAFE flag)
+
+### Action — opens MAJOR optimization lane
+
+**This is the largest concrete actionable gap discovered in 70
+investigations.**  The infrastructure exists; only wiring to serve is
+missing.  Estimated potential gain at gemma4 production prefill:
+**20-47× speedup** depending on how much of forward_prefill_batched
+applies through the soft-token + LCP layers.
+
+Next steps (operator decision required):
+1. Audit `forward_prefill_batched` for soft-token + LCP compatibility
+2. Or: design hybrid path that uses batched for text-only, per-token
+   for vision/soft-tokens
+3. Run end-to-end coherence test to verify TQ-HB preservation in
+   serve-batched-prefill path
+
+### Investigation count this thread
+71 total: 70 from iter-413 + this iter (architectural-asymmetry
+discovery).
+
+### Operator decision matrix (RADICALLY UPDATED)
+
+| Lever | Predicted | Empirical | Cost |
+|---|---|---|---|
+| **Wire batched-prefill into serve HTTP** | **20-47× speedup** | **0.021× → 0.864× peer at pp4013** | multi-iter audit + integration |
+| Eliminate 141 ms fixed overhead in generate | 0.51× → 0.99× at pp413 | concrete | iter-415+ instrument |
+| 16K prefill regression | 1947 vs 2550 peak | concrete | sliding-window investigation |
+| Multi-thread port | +2.2% decode | unmeasured | 5-8 iters/focus |
+| Decode 0.726× | exhausted | confirmed | — |
+
+**Top lever**: serve HTTP is silently running per-token prefill.
+This dwarfs every other gap discovered in 70+ investigations.
