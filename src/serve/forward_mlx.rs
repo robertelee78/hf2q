@@ -4461,6 +4461,13 @@ impl MlxModelWeights {
                             && (hs as u32) % 4 == 0
                             && !INVESTIGATION_ENV.skip_weighted_sum;
                         if use_iter367_fusion {
+                            // ADR-028 iter-371 (PROBE): explicit memory_barrier()
+                            // forces a global Metal barrier even if the tracker
+                            // doesn't detect a conflict.  Tests if iter-367's
+                            // coherence regression under the iter-321 stack is
+                            // caused by a missed barrier (tracker reset between
+                            // distant write + read).
+                            s.encoder_mut().memory_barrier();
                             s.barrier_between(
                                 &[&self.activations.moe_down_id_out,
                                   &self.activations.moe_routing_weights_gpu,

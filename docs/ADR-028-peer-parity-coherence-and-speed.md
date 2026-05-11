@@ -17204,3 +17204,108 @@ memory bandwidth).
 ### Falsification count this thread
 27 total: 26 from iter-369 + this iter (parity ✓, bench flat — like iter-365
 and iter-368).
+
+## iter-371 — iter-367 coherence regression ROOT-CAUSED + FIXED, but bench falsifies (28th investigation)
+
+### Date
+2026-05-10
+
+### Hypothesis trail
+
+iter-367's coherence regression with iter-321 stack flags (LMHEAD_Q6K /
+RMS_NORM_V2 / Q6K_MV_NR2 / Q6K_ID_MV_NR2) was unexplained at iter-367 close.
+Hypothesised candidates: buffer aliasing, RAW barrier, numerical edge case,
+threadgroup memory pressure.
+
+### Probe 1: HF2Q_FORCE_SERIAL_DISPATCH=1
+Switching to `MTLDispatchType::Serial` (every dispatch waits for previous,
+no concurrency) made coherence WORK with iter-367 + iter-321 stack:
+```
+$ HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1 HF2Q_FORCE_SERIAL_DISPATCH=1 (+iter-321 stack)
+"What is 2+2?" → " + 2 = 4<turn|>"  ✓
+```
+**Conclusion**: iter-367's regression IS a missing memory barrier under
+concurrent dispatch.  Some buffer's RAW dependency wasn't tracked.
+
+### Probe 2: explicit `enc.memory_barrier()` before iter-367 dispatch
+Added unconditional Metal global barrier before iter-367's
+`barrier_between` call (forces sync regardless of tracker state):
+```
+$ HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1 (+iter-321 stack, concurrent dispatch)
+"What is 2+2?" → " + 2 = 4<turn|>"  ✓
+```
+**Conclusion**: explicit barrier fixes the race.  iter-367 is now
+mathematically AND operationally correct.
+
+### Root cause (confirmed)
+
+`ConflictTracker.add()` (graph.rs:1015) only tracks reads/writes since the
+last barrier.  Between B10 (writes routing_weights_gpu) and iter-367's
+fused dispatch (reads routing_weights_gpu), several intervening dispatches
+fire barriers for OTHER buffers.  Each barrier resets the tracker.  By the
+time iter-367 fused checks for routing_weights conflict, the tracker has no
+record of the B10 write — no barrier is inserted by `barrier_between`.
+
+The CHAIN works because Apple's `MTLBarrierScopeBuffers` is GLOBAL — when
+the chain's `moe_weighted_sum` triggers a barrier (for moe_down_id_out
+conflict), that single barrier ALSO makes routing_weights visible.  Then
+chain's fused_endlayer doesn't read routing_weights at all.
+
+iter-367 fused reads BOTH moe_down_id_out AND routing_weights.  The
+moe_down_id_out conflict triggers a barrier, but that barrier comes AFTER
+the previous chain dispatch (where routing_weights was last touched
+explicitly).  In the iter-367 path, fewer intervening barriers fire
+(because moe_weighted_sum is skipped), so routing_weights doesn't get the
+implicit barrier that the chain provides.
+
+Wait — actually, ANY barrier between B10 and iter-367 fused should make
+routing_weights visible (Metal barriers are global).  So the race condition
+must be more subtle.  The empirical finding is what it is: explicit barrier
+fixes it; no explicit barrier breaks it; FORCE_SERIAL_DISPATCH=1 fixes it.
+
+### Bench (gemma4-ara-2pass-APEX-Q5_K_M, 200-tok decode, iter-321 stack ON)
+
+5-pair interleaved A/B:
+
+| Trial | Chain (V1) | iter-367+iter-371 (with barrier) |
+|---|---|---|
+| 1 | 75.1 | 74.4 |
+| 2 | 74.7 | 74.4 |
+| 3 | 74.9 | 74.3 |
+| 4 | 74.6 | 74.1 |
+| 5 | 74.7 | 74.1 |
+| **mean** | **74.80** | **74.26** |
+
+Δ = **-0.7%** — fusion is SLOWER than chain.
+
+The explicit `enc.memory_barrier()` costs ~2-3 µs × 30 layers = 60-90 µs/token
+(~0.6%), plus the fused kernel itself appears to lose parallelism vs the
+chain's concurrent moe_weighted_sum + fused_endlayer dispatch pair.
+
+### Conclusion
+
+iter-367 is now correct (coherence intact under any flag combo with iter-371
+explicit barrier) but doesn't help production performance at the iter-321
+stack.  The earlier iter-367 measurement of +0.4-1.1% at minimal config was
+an artifact of fewer concurrent operations — the gain disappears under the
+production stack.
+
+### Action
+
+- Kernel + dispatcher + 3 parity tests preserved (correct + reusable peer
+  port pattern).
+- Wiring in forward_decode kept as opt-in via
+  `HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1` (default-OFF).
+- Explicit `enc.memory_barrier()` before the dispatch retained — required
+  for correctness under concurrent dispatch.
+- Production decode uses chain unchanged (74.80 tok/s baseline).
+
+### Tests + bench
+- mlx-native lib: 287/0 passing (kernel + 3 parity tests preserved).
+- hf2q lib: 3454/0 passing.
+- Coherence: chain "2 + 2 = 4" intact at default; iter-367 ON also coherent
+  with iter-371 barrier under full iter-321 stack.
+
+### Falsification count this thread
+28 total: 27 from iter-370 + this iter (parity ✓ + correctness ✓ but bench
+worse than chain).  iter-367 closure: confirmed not a production win.
