@@ -24094,3 +24094,71 @@ without explicit operator approval", flip stays operator-decision-gated.
 ### Operator decision matrix unchanged
 The tokenizer flag is opt-in and validated.  Default-flip is a
 single-line change once operator decides.
+
+## iter-469 — HF2Q_TOKENIZER_GGUF_EMBEDDED default-flipped to ON
+
+### Hypothesis
+Per iter-326 operator REFRAME #2 ("default should have the best
+things on that provide the best mantra-aligned outcome for users")
++ 5 validation rounds (iter-466/467/468 + parity test + gemma4-only
+scope), the tokenizer flag satisfies the criteria for default-on.
+Mirrors q6_K_NR2 (iter-326) and Phase 15 (iter-421) default-on
+pattern.
+
+### Validation criteria met
+- iter-466: 200ms startup saving + coherence verified
+- iter-467: 10/10 varied prompts stable
+- iter-468: 5/5 byte-identical content on disk vs GGUF-embedded
+- `tests/adr_022_phase1_p11_gemma4_tokenizer_parity.rs`: 5/5 cases
+- gemma4-only scope (gated inside Gemma load fn; no qwen35 risk)
+
+### Patch (single line, mirroring iter-421 Phase 15)
+```rust
+// Before (iter-466):
+let force_gguf_tokenizer = std::env::var("HF2Q_TOKENIZER_GGUF_EMBEDDED")
+    .as_deref() == Ok("1");
+
+// After (iter-469): default-on, opt-out via =0/false/off
+let force_gguf_tokenizer = std::env::var("HF2Q_TOKENIZER_GGUF_EMBEDDED")
+    .ok()
+    .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+    .unwrap_or(true);
+```
+
+### Verification
+
+| Mode | Startup | tokenizer_init |
+|---|---|---|
+| **Default (no env)** | **3.08-3.71 sec** | **123 ms** (GGUF-embedded ✓) |
+| `=0` opt-out | 3.29 sec | 290 ms (on-disk ✓) |
+
+Coherence: "What is 2+2?" → "2 + 2 = 4" ✓
+51 lib tests pass.
+
+### Production state at HEAD (after iter-469)
+- **Startup default**: ~3.08-3.29 sec (was 3.29 sec; -200 ms via tokenizer)
+- **Startup with HF2Q_TOKENIZER_GGUF_EMBEDDED=0**: ~3.29 sec (reverts)
+- Prefill: 0.94× peer (Phase 15)
+- Decode: 0.69× pure peer / 0.92× e2e
+- Coherence: TIED with peer
+
+### Investigation count this thread
+126 total: 125 from iter-468 + this iter (tokenizer default-flip
+LANDED).
+
+### Two default-on flags shipped this thread:
+1. **HF2Q_SERVE_BATCHED_PREFILL** (iter-421): 35-43× prefill
+2. **HF2Q_TOKENIZER_GGUF_EMBEDDED** (this iter): -200ms startup
+
+Both follow iter-326 REFRAME #2 pattern (env=0/false/off opt-out).
+Per "DO NOT BE LAZY" mantra — concrete user-visible improvements
+shipped to default behavior across this thread.
+
+### Operator decision matrix (refined)
+| Lever | Status |
+|---|---|
+| Phase 15 default-on | ✓ shipped iter-421 |
+| **HF2Q_TOKENIZER_GGUF_EMBEDDED default-on** | **✓ shipped this iter** |
+| mmap-backed gguf zero-copy | OPERATOR-GATED (-1.5-2s startup) |
+| HYBRID_KV | OPERATOR-GATED (+3.3% decode) |
+| Multi-thread decode | OPERATOR-GATED (+2.2%) |

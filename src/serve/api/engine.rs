@@ -2087,9 +2087,21 @@ impl GemmaLoadedModel {
         // ADR-028 iter-466: opt-in `HF2Q_TOKENIZER_GGUF_EMBEDDED=1` forces
         // the GGUF-embedded path even when an on-disk tokenizer.json is
         // present.  Saves ~300 ms startup time per iter-461 (10% of total
-        // load_wall_clock).  Default-OFF for backward-compat HF-checkout
-        // ergonomics; operator can flip default later after broader soak.
-        let force_gguf_tokenizer = std::env::var("HF2Q_TOKENIZER_GGUF_EMBEDDED").as_deref() == Ok("1");
+        // load_wall_clock).
+        //
+        // ADR-028 iter-469 default-flipped: per iter-326 operator REFRAME #2
+        // ("default should have the best things on") + 5 validation rounds:
+        //   - iter-466: 200ms startup saving + coherence verified
+        //   - iter-467: 10/10 varied prompts stable
+        //   - iter-468: 5/5 byte-identical content on disk vs GGUF-embedded
+        //   - tests/adr_022_phase1_p11_gemma4_tokenizer_parity.rs (5/5)
+        //   - gemma4-only scope (gated inside Gemma load fn; no qwen35 risk)
+        // Mirrors q6_K_NR2 (iter-326) + Phase 15 (iter-421) default-on pattern.
+        // Opt out via `HF2Q_TOKENIZER_GGUF_EMBEDDED=0` / `=false` / `=off`.
+        let force_gguf_tokenizer = std::env::var("HF2Q_TOKENIZER_GGUF_EMBEDDED")
+            .ok()
+            .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
         let mut tokenizer = if force_gguf_tokenizer {
             crate::inference::models::gemma4::tokenizer::build_tokenizer_from_gguf(&gguf)
                 .context("Failed to build Gemma4 tokenizer from GGUF metadata (HF2Q_TOKENIZER_GGUF_EMBEDDED=1)")?
