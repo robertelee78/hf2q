@@ -20716,3 +20716,114 @@ batched-serve path).
 
 Phase 15 remains the dominant win.  Next-tier lever: 32 ms
 batched-serve overhead elimination.
+
+## iter-418 — bucket profiler reveals dispatch-latency-bound regime at small N
+
+### Hypothesis (from iter-417)
+The 32 ms fixed overhead in batched-serve prefill is a localizable
+startup cost (mask build, blk pre-pass, buffer alloc, etc.).
+Instrument with HF2Q_PROFILE_BUCKETS=1 (existing infrastructure)
+to identify the dominant component.
+
+### Method
+Run hf2q serve with `HF2Q_PROFILE_BUCKETS=1
+HF2Q_SERVE_BATCHED_PREFILL=1`.  Issue 4 prefill probes at
+N ∈ {42, 114, 518, 4018} tokens via HTTP.  Parse the per-category
+bucket dumps (already emitted by forward_prefill_batched.rs:2280+).
+
+### Results — bucket totals (CPU wall-clock + GPU wait)
+
+| Category | pp42 (183 ms) | pp114 (191 ms) | pp518 (308 ms) | pp4018 (1570 ms) |
+|---|---|---|---|---|
+| STARTUP total | 5.5 (3.0%) | 5.9 (3.1%) | 9.8 (3.2%) | 19.0 (1.2%) |
+| ┗ mask_sliding | 4.9 | 4.9 | 7.9 | **14.5** |
+| MOE_GATE_UP | 42 (23%) | 40 (21%) | 62 (20%) | **307 (20%)** |
+| MOE_DOWN | 21 (11%) | 23 (12%) | 48 (15%) | **283 (18%)** |
+| QKV_MM | 13 (7%) | 17 (9%) | 34 (11%) | 194 (12%) |
+| O_MM | 11 (6%) | 11 (6%) | 22 (7%) | 104 (7%) |
+| FA_SW (D=256) | 5.4 (3%) | 6.5 (3%) | 15 (5%) | 156 (10%) |
+| FA_GL (D=512) | 1.0 (1%) | 1.7 (1%) | 4.6 (2%) | 159 (10%) |
+| HEAD total | 2.2 (1%) | 2.0 (1%) | 1.8 (1%) | 1.8 (0.1%) |
+
+### Critical observation — per-dispatch latency floor
+
+**pp42 (183 ms) vs pp114 (191 ms): only 4% time difference for 2.7×
+more tokens.**
+
+This proves: at N≤120, the limiting factor is per-dispatch GPU launch
+latency × ~900 dispatches (30 layers × ~30+ dispatches/layer), NOT
+per-token compute.  At pp42 the per-token math is essentially free;
+the cost is just 30 layers worth of per-dispatch overhead.
+
+### Per-layer cost vs N (extracted)
+
+| N | Per-layer mean (ms) | Notes |
+|---|---|---|
+| 42 | 5.6 | dispatch-latency-floor regime |
+| 114 | 5.9 | still floor-limited |
+| 518 | 9.6 | mixed compute + latency |
+| 4018 | 51.0 | compute-dominated |
+
+Per-layer cost barely changes from N=42 → N=114.  Then grows ~9× as N
+grows ~35×.  Curve = max(dispatch_floor, per_tok_compute).
+
+### Why iter-417's linear fit was misleading
+iter-417 fit (272, 129) and (4021, 1460) → T(N) = 32 + 0.355N.  But
+the small-N regime (N=42 → T=183 ms) shows that fit underpredicts by
+4× at small N.  Real curve has TWO regimes:
+- N < ~120: T ≈ 180 ms (dispatch-latency floor: 30 layers × ~6 ms)
+- N > ~500: T ≈ 32 + 0.355N (compute-dominated)
+- Transition at ~150-200 tokens where per-token compute exceeds
+  per-dispatch floor
+
+### Lever assessment
+The 32 ms "fixed overhead" is actually per-dispatch latency
+distributed across 900+ dispatches per prefill.  This is the SAME
+GPU-bound regime that decode is in (iter-397: GPU 93% bound).
+
+**Reductions in lever value:**
+- Mask build: 4.9 → 14.5 ms across all N (1% of pp4K) — too small
+- MOE_GATE_UP/DOWN: dominate at all sizes but per-dispatch
+  optimization already exhausted (iter-263→276 + iter-308→324 +
+  iter-380→398)
+- Per-dispatch latency floor: hardware physics on Apple Metal
+- Multi-thread / dispatch concurrency: already explored
+  (iter-380-396 ROI revised down to +2.2%)
+
+**Surviving levers:**
+- Reduce dispatch count via further fusion (very low remaining ROI;
+  most fusion already done)
+- Apple `MTLDispatchType::Concurrent` for per-layer independent ops
+  (operator-decision-gated)
+- Accept current 0.80-0.94× peer asymptote across small-large prompts
+
+### Conclusion
+The 32 ms "fixed" overhead is not a single localizable startup
+cost — it's per-dispatch latency × ~900 dispatches that amortizes
+into per-prefill noise as N grows.  No new high-leverage probe
+remains for this regime.
+
+The Phase 15 LANDED win (29-43× speedup) is the dominant story;
+remaining 6.4× gap to peer's ~5 ms overhead is structural per-
+dispatch latency that requires architectural changes (multi-thread,
+dispatch concurrency, kernel mega-fusion) — all already-explored
+or operator-decision-gated.
+
+### Investigation count this thread
+75 total: 74 from iter-417 + this iter (bucket-profiler diagnostic).
+
+### Operator decision matrix (refined per dispatch-latency finding)
+
+| Lever | Predicted | Empirical | Cost |
+|---|---|---|---|
+| Phase 15 LANDED | 20-47× | 29-43× | ✓ shipped opt-in |
+| Default-on Phase 15 | trajectory CHANGE | OPERATOR | trivial flip |
+| **32 ms overhead** | localizable startup | **per-dispatch floor (NOT localizable)** | ARCHITECTURAL |
+| Mask build optimization | 4.9-14.5 ms | <1% of pp4K | NOT WORTH |
+| Multi-thread port | +2.2% decode | unmeasured | 5-8 iters |
+| MTLDispatchType::Concurrent | small-N gain | unmeasured | operator-decision |
+| Decode 0.726× | exhausted | confirmed | — |
+
+The "32 ms overhead" lever from iter-417 is REVISED to "structural
+dispatch-latency floor" by iter-418's bucket evidence.  Removed from
+high-leverage list.
