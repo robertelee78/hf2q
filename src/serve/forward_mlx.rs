@@ -3102,6 +3102,12 @@ impl MlxModelWeights {
 
                 // -- GPU KV cache update: Hadamard-quantize into TQ packed cache (ADR-007) --
                 // HF2Q_SKIP_TQ_ENCODE=1: skip for timing bisection (output garbage).
+                //
+                // ADR-028 iter-485 (Phase 7d / H4): when HF2Q_TQ_FAST_FUSED_KV=1
+                // collapse the two consecutive dispatches into one via the
+                // Z-dim-split `dispatch_hadamard_quantize_kv_fast_dual`.
+                // Byte-identical to the 2-dispatch reference; HF2Q_DEBUG_TQ_RMS
+                // path forces the legacy split (probe is single-stream only).
                 if !INVESTIGATION_ENV.skip_tq_encode {
                     let cache_pos_val = if kv_is_sliding {
                         (kv_write_pos % kv_capacity) as u32
@@ -3113,28 +3119,44 @@ impl MlxModelWeights {
                         &[&self.kv_caches[layer_idx].k_packed, &self.kv_caches[layer_idx].k_norms,
                           &self.kv_caches[layer_idx].v_packed, &self.kv_caches[layer_idx].v_norms],
                     );
-                    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.attn_k_normed,
-                        &self.kv_caches[layer_idx].k_packed,
-                        &self.kv_caches[layer_idx].k_norms,
-                        nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
-                        kv_is_sliding,
-                        Some(tq_scale_factor_d512),
-                        None, // rms_scratch: handled below by HF2Q_DEBUG_TQ_RMS path
-                    ).map_err(|e| anyhow::anyhow!("hadamard_quantize K L{layer_idx}: {e}"))?;
-                    total_dispatches += 1;
-                    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
-                        s.encoder_mut(), reg, metal_dev,
-                        v_src,
-                        &self.kv_caches[layer_idx].v_packed,
-                        &self.kv_caches[layer_idx].v_norms,
-                        nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
-                        kv_is_sliding,
-                        Some(tq_scale_factor_d512),
-                        None, // rms_scratch: probe not wired here
-                    ).map_err(|e| anyhow::anyhow!("hadamard_quantize V L{layer_idx}: {e}"))?;
-                    total_dispatches += 1;
+                    if INVESTIGATION_ENV.tq_fast_fused_kv && !INVESTIGATION_ENV.debug_tq_rms {
+                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_fast_dual(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            v_src,
+                            &self.kv_caches[layer_idx].k_packed,
+                            &self.kv_caches[layer_idx].v_packed,
+                            &self.kv_caches[layer_idx].k_norms,
+                            &self.kv_caches[layer_idx].v_norms,
+                            nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
+                            kv_is_sliding,
+                            Some(tq_scale_factor_d512),
+                        ).map_err(|e| anyhow::anyhow!("hadamard_quantize KV dual L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+                    } else {
+                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.attn_k_normed,
+                            &self.kv_caches[layer_idx].k_packed,
+                            &self.kv_caches[layer_idx].k_norms,
+                            nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
+                            kv_is_sliding,
+                            Some(tq_scale_factor_d512),
+                            None, // rms_scratch: handled below by HF2Q_DEBUG_TQ_RMS path
+                        ).map_err(|e| anyhow::anyhow!("hadamard_quantize K L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+                        mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv(
+                            s.encoder_mut(), reg, metal_dev,
+                            v_src,
+                            &self.kv_caches[layer_idx].v_packed,
+                            &self.kv_caches[layer_idx].v_norms,
+                            nkv as u32, hd as u32, kv_capacity as u32, cache_pos_val,
+                            kv_is_sliding,
+                            Some(tq_scale_factor_d512),
+                            None, // rms_scratch: probe not wired here
+                        ).map_err(|e| anyhow::anyhow!("hadamard_quantize V L{layer_idx}: {e}"))?;
+                        total_dispatches += 1;
+                    }
                 }
 
                 // iter-24: higher-bit (5/6/8-bit) KV encode into leg_hb_encoded.
@@ -3987,30 +4009,57 @@ impl MlxModelWeights {
                             // lifts based on kL once kernel logic supports NSG > 1.
                             nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(hb_kv_seq_len),
                         };
-                        mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
-                            s.encoder_mut(), reg, dev,
-                            &self.activations.attn_q_normed,
-                            &leg_hb_enc[layer_idx].k_packed,
-                            &leg_hb_enc[layer_idx].k_norms,
-                            &leg_hb_enc[layer_idx].v_packed,
-                            &leg_hb_enc[layer_idx].v_norms,
-                            &self.activations.sdpa_out,
-                            &self.activations.sdpa_tmp,
-                            &p_hb,
-                        ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq_hb L{layer_idx}: {e}"))?;
-                        total_dispatches += 2; // main + reduce (conservative)
+                        // ADR-028 §iter-485 (Phase 7d H3): env-gated fused
+                        // reduce + FWHT-sign-undo path. Saves 1 dispatch + 1
+                        // forced memory_barrier per layer per decode-token
+                        // (~30 of each at gemma4 30 layers). Parity test
+                        // `reduce_tq_hb_undo_fused_vs_unfused_parity` confirmed
+                        // byte-identical output (max_abs_diff=0, max_rel=0).
+                        let tq_hb_out_fused = std::env::var("HF2Q_TQ_HB_OUT_FUSED")
+                            .map(|v| v == "1").unwrap_or(false);
 
-                        // Inverse-rotate SDPA output.
-                        s.barrier_between(
-                            &[&self.activations.sdpa_out],
-                            &[&self.activations.sdpa_out],
-                        );
-                        mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
-                            s.encoder_mut(), reg, metal_dev,
-                            &self.activations.sdpa_out,
-                            nh as u32, hd as u32,
-                        ).map_err(|e| anyhow::anyhow!("HB FWHT sign-undo L{layer_idx}: {e}"))?;
-                        total_dispatches += 1;
+                        if tq_hb_out_fused {
+                            mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_with_fused_undo(
+                                s.encoder_mut(), reg, dev,
+                                &self.activations.attn_q_normed,
+                                &leg_hb_enc[layer_idx].k_packed,
+                                &leg_hb_enc[layer_idx].k_norms,
+                                &leg_hb_enc[layer_idx].v_packed,
+                                &leg_hb_enc[layer_idx].v_norms,
+                                &self.activations.sdpa_out,
+                                &self.activations.sdpa_tmp,
+                                &p_hb,
+                            ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq_hb_with_fused_undo L{layer_idx}: {e}"))?;
+                            total_dispatches += 2; // main + fused-reduce-undo
+                            // Caller contract: no trailing fwht_sign_undo
+                            // dispatch — the fused reduce already inverse-
+                            // rotated the output.
+                        } else {
+                            mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb(
+                                s.encoder_mut(), reg, dev,
+                                &self.activations.attn_q_normed,
+                                &leg_hb_enc[layer_idx].k_packed,
+                                &leg_hb_enc[layer_idx].k_norms,
+                                &leg_hb_enc[layer_idx].v_packed,
+                                &leg_hb_enc[layer_idx].v_norms,
+                                &self.activations.sdpa_out,
+                                &self.activations.sdpa_tmp,
+                                &p_hb,
+                            ).map_err(|e| anyhow::anyhow!("flash_attn_vec_tq_hb L{layer_idx}: {e}"))?;
+                            total_dispatches += 2; // main + reduce (conservative)
+
+                            // Inverse-rotate SDPA output.
+                            s.barrier_between(
+                                &[&self.activations.sdpa_out],
+                                &[&self.activations.sdpa_out],
+                            );
+                            mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.sdpa_out,
+                                nh as u32, hd as u32,
+                            ).map_err(|e| anyhow::anyhow!("HB FWHT sign-undo L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+                        }
                     }
                 } else if !INVESTIGATION_ENV.skip_tq_sdpa {
                     // -- TQ-packed SDPA (original path) --

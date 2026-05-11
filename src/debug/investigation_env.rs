@@ -638,6 +638,16 @@ pub struct InvestigationEnv {
     /// (`test_hadamard_quantize_kv_hb_dual_byte_identity_d256`).
     pub hb_dual_legacy: bool,
 
+    /// `HF2Q_TQ_FAST_FUSED_KV=1` — enable the ADR-028 iter-485 (Phase 7d
+    /// / H4) fused 4-bit K+V single-position TQ encoder. When set, the
+    /// gemma4 decode path at `forward_mlx::run_decode_step_layer` swaps
+    /// the two consecutive `dispatch_hadamard_quantize_kv` calls (K then
+    /// V) for a single `dispatch_hadamard_quantize_kv_fast_dual` launch.
+    /// Default OFF (opt-in until decode-bench ≥+3% gate clears); both
+    /// paths byte-identical by mlx-native unit test
+    /// (`test_hadamard_quantize_kv_fast_dual_byte_identity_d256`).
+    pub tq_fast_fused_kv: bool,
+
     /// `HF2Q_MLX_KERNEL_PROFILE=1` — per-kernel profile mode.
     /// Original parse: `map_or(false, |v| v == "1")`.
     pub mlx_kernel_profile: bool,
@@ -866,6 +876,8 @@ impl InvestigationEnv {
             fused_moe_wsum_end_layer_v2: env_eq_one("HF2Q_FUSED_MOE_WSUM_END_LAYER_V2"),
             kv_dual_legacy: env_eq_one("HF2Q_KV_DUAL_LEGACY"),
             hb_dual_legacy: env_eq_one("HF2Q_HB_DUAL_LEGACY"),
+            // ADR-028 iter-485 (Phase 7d / H4): default-OFF opt-in.
+            tq_fast_fused_kv: env_eq_one("HF2Q_TQ_FAST_FUSED_KV"),
             mlx_kernel_profile: env_eq_one("HF2Q_MLX_KERNEL_PROFILE"),
             mlx_profile: env_eq_one("HF2Q_MLX_PROFILE"),
 

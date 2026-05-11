@@ -25209,3 +25209,125 @@ as llama-server-vs-decode-only, not as pure-decode-vs-pure-decode.
 - `/tmp/peer_baseline_iter_486.log`: raw bench outputs (volatile; not committed).
 
 No code changes.  Workers C and D still running.
+
+## iter-485 H4 — fused 4-bit K+V TQ encoder FALSIFIED, parity-clean kernel landed dormant
+
+Worker D delivered the H4 prototype.  Verdict: byte-identity parity passes
+at D=256 + D=512, coherence intact, **decode bench regression of −3.8%
+to −18% across two 5-rep runs** at gemma4 APEX-Q5_K_M, 200 tokens.  Falls
+the +3% ship gate.  Code is committed as a dormant opt-in
+(`HF2Q_TQ_FAST_FUSED_KV=1`, default OFF) so the parity tests stay green
+and future investigators can re-bench without rewriting the kernel.
+
+### What was built
+
+- **mlx-native kernel**: `hadamard_quantize_kv_fast_dual<HEAD_DIM>` —
+  Z-dim-split fused 4-bit nibble-packed K+V encoder.  Mirrors the existing
+  `hadamard_quantize_kv_hb_dual` Z-dim split pattern but writes 4-bit
+  nibbles (head_dim/2 bytes/pos) and reads the original
+  `HadamardQuantizeParams` struct (no `codebook_bits` field).  Grid
+  `(num_kv_heads, 1, 2)`, threadgroup `(32, 1, 1)`.  `tgpig.z = 0/1`
+  selects K vs V stream.  Templated d256 + d512 instantiations.  ~140 LOC.
+  Location: `/opt/mlx-native/src/shaders/hadamard_quantize_kv_fast.metal`.
+- **mlx-native dispatcher**: `dispatch_hadamard_quantize_kv_fast_dual` —
+  full size validation for src_k/src_v/packed_k/packed_v/norms_k/norms_v;
+  D=256 / D=512 only; rejects probe-mode (no RMS scratch slot in fused
+  variant — single-stream path remains the only RMS-probe-capable arm).
+  ~120 LOC.  Location: `/opt/mlx-native/src/ops/hadamard_quantize_kv.rs`.
+- **mlx-native parity tests** (both PASS):
+  - `test_hadamard_quantize_kv_fast_dual_byte_identity_d256` —
+    8 KV-heads × 256 head_dim × cap=1024 × sliding-window, byte-identity
+    across fused vs 2-dispatch reference for both packed-nibble and F32
+    norms.
+  - `test_hadamard_quantize_kv_fast_dual_byte_identity_d512` —
+    8 KV-heads × 512 head_dim × cap=1024 × global cache, same byte-identity
+    guarantee (per-block d=512 norms × 2 also bit-identical).
+- **hf2q wiring**: env-gated branch at `forward_mlx::run_decode_step` (~line
+  3116-3138) — when `HF2Q_TQ_FAST_FUSED_KV=1` AND `HF2Q_DEBUG_TQ_RMS=0` the
+  two consecutive `dispatch_hadamard_quantize_kv` calls collapse into one
+  `dispatch_hadamard_quantize_kv_fast_dual` launch.  RMS-probe path
+  intentionally forces the legacy split (the fused variant rejects the
+  scratch buffer).  New flag exposed via
+  `InvestigationEnv::tq_fast_fused_kv`.
+- **Bench script**: `/opt/hf2q/scripts/adr028_iter485_h4_bench.sh` —
+  A/B runner, 5 reps each, default 200 tokens at the telescope prompt.
+
+### Measured numbers (gemma4 APEX-Q5_K_M, 200-tok decode, 5 reps)
+
+| Run | OFF (HEAD baseline) tok/s | ON (HF2Q_TQ_FAST_FUSED_KV=1) tok/s | Δ median |
+|-----|---------------------------|------------------------------------|----------|
+|  1  | 62.0 / 63.8 / **66.2** / 67.5 / 63.6 (median 63.8) | 59.2 / 58.5 / **61.4** / 65.8 / 65.5 (median 61.4) | **−3.8%** |
+|  2  | 75.2 / 73.1 / 65.2 / **69.6** / 69.5 (median 69.6) | 65.5 / 56.6 / 56.1 / **56.7** / 57.9 (median 56.7) | **−18.5%** |
+
+Both runs show a regression.  Run 2's wider gap is consistent with thermal
+state (longer-running fused dispatches throttle faster than the legacy pair
+that the GPU scheduler already pipelines).
+
+Coherence intact: `What is 2+2?` at temp=0 emits `2 + 2 = 4<turn|>` —
+**character-identical** between OFF and ON.
+
+### Why the structural argument failed
+
+The +3% theoretical was: "30 fewer Apple-Metal-launch floors × ~14 µs =
+~0.4 ms/tok ≈ ~3% of decode at 73-75 tok/s".  Measured negative delta says
+the launch-floor model is wrong here for three concrete reasons.
+
+1.  **GPU occupancy is already the floor.**  Both legacy and fused use
+    1 simdgroup (32 threads) per head.  At gemma4's 8 KV heads that is
+    256 threads/dispatch — far below Apple SM saturation.  Adding a second
+    Z-dim slot doubles the launch's logical thread count but doesn't
+    actually improve hardware utilization: the SM was idle in legacy and
+    is still idle in fused.  No latency hidden, no parallelism gained.
+2.  **Apple's command queue already pipelines same-pipeline dispatches.**
+    Two consecutive `hadamard_quantize_kv_fast_d256` launches share the
+    same pipeline state object and run back-to-back on the GPU command
+    queue with sub-launch-floor gaps.  The "~14 µs per launch" overhead is
+    a serial-CPU-encode cost; once committed, the GPU executes both with
+    near-zero idle.  Collapsing two launches into one saves CPU-encode
+    time, not GPU time — and decode is GPU-bound (97% GPU per iter-397).
+3.  **Z-dim divergence adds per-thread branch cost.**  Every thread in
+    the fused kernel evaluates `(kv_sel == 0u) ? K : V` three times (src,
+    packed, norms pointer select) before the FWHT runs.  Cheap per-thread,
+    but at 8 heads × 32 threads × 2 streams × 30 layers = 15 360 extra
+    branches per token; with the tight inner FWHT loop, even small ALU
+    pressure costs ~1-2% in practice.
+
+The same Z-dim pattern works for `hadamard_quantize_kv_hb_dual` because
+the HB path's byte-packed output (1 byte/elem vs ½ byte/elem for 4-bit)
+roughly doubles the per-thread write-bandwidth opportunity — there the
+GPU IS bandwidth-bound and the dispatch-collapse exposes more
+work-per-launch.  At 4-bit nibble-pack the writes are too small for the
+collapse to matter.
+
+### Files committed
+
+- `/opt/mlx-native/src/shaders/hadamard_quantize_kv_fast.metal` — added
+  `hadamard_quantize_kv_fast_dual` template + d256/d512 instantiations
+  (~140 LOC).
+- `/opt/mlx-native/src/ops/hadamard_quantize_kv.rs` — added
+  `dispatch_hadamard_quantize_kv_fast_dual` (~120 LOC).
+- `/opt/mlx-native/src/kernel_registry.rs` — registered d256 + d512.
+- `/opt/mlx-native/tests/test_hadamard_quantize_kv.rs` — added
+  `test_hadamard_quantize_kv_fast_dual_byte_identity_d256` and
+  `..._d512` (~220 LOC; both PASS).
+- `/opt/hf2q/src/debug/investigation_env.rs` — added `tq_fast_fused_kv`
+  field + `HF2Q_TQ_FAST_FUSED_KV` env reader (default OFF).
+- `/opt/hf2q/src/serve/forward_mlx.rs` — env-gated branch around lines
+  3116-3138 swapping the 2-dispatch pair for the fused dispatch (also
+  forces legacy when `HF2Q_DEBUG_TQ_RMS=1`).
+- `/opt/hf2q/scripts/adr028_iter485_h4_bench.sh` — A/B bench runner.
+
+### Default policy
+
+`HF2Q_TQ_FAST_FUSED_KV=0` (OFF).  Operator-controlled; no recommendation
+to flip.  Falsifier rerun anytime via `bash scripts/adr028_iter485_h4_bench.sh`.
+
+### Standing lesson
+
+Apple-Metal "fewer dispatches = faster" is contingent on whether the
+collapsed work changes the GPU's bottleneck.  When the original pair was
+already CPU-encode-pipelined and GPU-occupancy-idle (1 simdgroup/head, no
+shared memory), the launch-floor savings show up as CPU idle time, not
+GPU throughput.  Always measure before defaulting on a dispatch-collapse;
+the math-equivalent kernel and the actually-faster kernel are not the
+same thing.
