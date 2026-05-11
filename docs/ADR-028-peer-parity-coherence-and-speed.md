@@ -17,6 +17,20 @@ GGUF, same prompt, same sampler. Speed = tok/s on the same hardware
 
 ## Executive summary (iter-303 consolidated state)
 
+> **🚨🚨 ADR-029 CORRECTION (2026-05-11) — READ FIRST; SUPERSEDES iter-486 + iter-487 BELOW**.
+> The iter-486 "0.96–1.04× tied" reframe AND the iter-487 "mission CLOSED at +4.5%"
+> verdict are **BOTH WRONG**. iter-486 measured peer at 77.18 ± 15.36 t/s — σ=20%
+> was the thermal-throttle smoking gun and was not flagged. Fresh same-machine
+> same-GGUF same-build measurement in a thermally-stable session yielded peer =
+> 103.66 ± 0.30 t/s (σ-pct 0.29%); hf2q 75.10 ± 0.17 t/s → ratio **0.7245× peer
+> (27% slower)**. Mission re-opened iter-488. Root cause localized to **hf2q's
+> MoE pipeline** (routing 38% of wall-clock, experts 19% = 49% combined), NOT TQ
+> (TQ is at most 7% of the gap). The iter-308 "peer Q5_K is N_R0=2 vs ours N_R0=1
+> smoking gun" claim is also wrong — peer Q5_K is `N_R0=1`. See
+> `docs/ADR-029-gemma4-moe-pipeline-is-the-gap.md` for the full re-investigation,
+> the three other prior-claim corrections, and the next-iter MoE-1/-2/-3 direction.
+> The iter-486 reframe block immediately below is preserved for historical context.
+
 > **🚨 iter-486 REFRAME (2026-05-11) — READ FIRST**.  The "× peer" column
 > below was computed with **mixed methodology** (peer divisor from llama-server
 > streaming SSE with prefill amortized into per-token rate, hf2q numerator from
