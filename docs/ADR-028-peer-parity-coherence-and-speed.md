@@ -21002,3 +21002,93 @@ iter-420 LOWERS the perceived risk of Phase 15 default-on:
 verified byte-identity at pp3.4K is ABOVE typical chat prompt
 sizes; coherence at pp15K (chat template limit) is intrinsic-model
 behavior reproducing under both modes.
+
+## iter-421 — Phase 15 default-flipped to ON (per iter-326 REFRAME)
+
+### Hypothesis
+Phase 15 has been validated 4× across 4 angles:
+- iter-415: 3 short prompts byte-identical
+- iter-416: 5 multi-turn unrelated requests coherent + cache reset OK
+- iter-420: pp3.4K byte-identical, pp15K coherent (model-intrinsic limit)
+- iter-421 (this iter): long-decode (300 tok), temperature=0.7 sampling,
+  streaming responses — all robust
+
+Per iter-326 operator REFRAME #2 ("default should have the best things
+on that provide the best mantra-aligned outcome for users"), Phase 15
+satisfies the criteria for default-on.
+
+### Method
+3 robustness probes via batched-serve mode:
+1. Long decode (max_tokens=300): "Count from 1 to 30 in English words"
+2. Temperature sampling (T=0.7, seed=42): "Write a haiku about programming"
+3. Streaming response: "What is 7 plus 8?" with `stream:true`
+
+### Robustness probe results
+
+**Probe 1 — Long decode (300 tok max)**
+- finish_reason: "stop" (correctly terminated)
+- 246 chars output, 39 number words detected
+- Counted 1→30 in order, one per line, no truncation, no garbage
+- Decode KV state from batched prefill is sound for long generations
+
+**Probe 2 — Temperature sampling**
+- Coherent haiku produced: "Logic flows in lines, / Bugs hide in the
+  silent code, / Compile and succeed."
+- 5-7-5 syllable pattern preserved
+- Sampling at T=0.7 works correctly through batched-prefill path
+
+**Probe 3 — Streaming**
+- Chunks emit cleanly via SSE
+- Final chunk has finish_reason="stop"
+- [DONE] sentinel emitted
+- Content: "7 plus 8 is **15**." (correct math, intact markdown)
+
+### Patch — default flip
+```rust
+// iter-415: opt-in via env=1
+let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL")
+    .as_deref() == Ok("1");
+
+// iter-421: default-on; opt-out via env=0/false/off
+let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL")
+    .ok()
+    .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+    .unwrap_or(true);
+```
+
+Mirrors the iter-326 q6_K_NR2 default-on pattern.  Operator can opt out
+via `HF2Q_SERVE_BATCHED_PREFILL=0` for any reason (e.g., to compare
+trajectories).
+
+### Verification — both modes work
+| Config | HTTP wall (~63 tok) | Mode confirmed |
+|---|---|---|
+| **default (no env)** | **165 ms** | "Batched prefill complete" ✓ |
+| `=0` opt-out | **639 ms** | per-token (no batched line) ✓ |
+
+51 lib tests pass.
+
+### Production impact (default behavior change)
+**Before iter-421**: serve gemma4 prefill = ~75 tok/s (per-token,
+0.022× peer)
+**After iter-421**: serve gemma4 prefill = **2500-2800 tok/s**
+(batched, **0.80-0.94× peer**)
+
+For typical chat (≤4K context), output is byte-identical to legacy.
+For longer responses (>50 tokens), trajectory may differ from legacy
+due to numerical noise — both equally coherent per iter-416 evidence.
+
+### Investigation count this thread
+78 total: 77 from iter-420 + this iter (Phase 15 default flip).
+
+### Operator decision matrix (UPDATED — Phase 15 now default-on)
+
+| Lever | Status | Notes |
+|---|---|---|
+| **Phase 15 default-on (this iter)** | **✓ LANDED** | Operator can opt out via env=0 |
+| FA_GL D=512 long-context | identified iter-419 | only relevant when pp>8K production |
+| Multi-thread port | +2.2% decode | unmeasured, 5-8 iters |
+| Decode 0.726× | exhausted | confirmed |
+
+The mantra "as fast as peer" advanced from 0.022× to 0.80-0.94× peer
+on prefill — single largest production speedup in this thread.

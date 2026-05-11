@@ -4584,9 +4584,20 @@ fn generate_once_with_soft_tokens(
     // faster.  Opt-in via HF2Q_SERVE_BATCHED_PREFILL=1; gated to
     // text-only (no soft tokens, no LCP resume) for safety.
     let prefill_start = Instant::now();
+    // ADR-028 iter-421 default-flipped: per iter-326 operator REFRAME #2
+    // ("default should have the best things on that provide the best
+    // mantra-aligned outcome for users").  Phase 15 has been validated 4x:
+    // iter-415 short prompts byte-identical, iter-416 multi-turn coherent,
+    // iter-420 pp3.4K byte-identical, iter-421 long-decode/sampling/
+    // streaming all robust.  Opt out via `HF2Q_SERVE_BATCHED_PREFILL=0`
+    // / `=false` / `=off` (matches iter-326 q6_K_NR2 default-on pattern).
+    let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL")
+        .ok()
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+        .unwrap_or(true);
     let use_batched_serve = soft_tokens.is_empty()
         && resume_lcp.is_none()
-        && std::env::var("HF2Q_SERVE_BATCHED_PREFILL").as_deref() == Ok("1");
+        && serve_batched_env;
     let prefill_argmax = if use_batched_serve {
         loaded
             .weights
@@ -7081,9 +7092,20 @@ fn generate_stream_once(
     // bails on its own anyhow::Result so we propagate via the same
     // match arm.
     let prefill_start = Instant::now();
+    // ADR-028 iter-421 default-flipped: per iter-326 operator REFRAME #2
+    // ("default should have the best things on that provide the best
+    // mantra-aligned outcome for users").  Phase 15 has been validated 4x:
+    // iter-415 short prompts byte-identical, iter-416 multi-turn coherent,
+    // iter-420 pp3.4K byte-identical, iter-421 long-decode/sampling/
+    // streaming all robust.  Opt out via `HF2Q_SERVE_BATCHED_PREFILL=0`
+    // / `=false` / `=off` (matches iter-326 q6_K_NR2 default-on pattern).
+    let serve_batched_env = std::env::var("HF2Q_SERVE_BATCHED_PREFILL")
+        .ok()
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+        .unwrap_or(true);
     let use_batched_serve = soft_tokens.is_empty()
         && resume_lcp.is_none()
-        && std::env::var("HF2Q_SERVE_BATCHED_PREFILL").as_deref() == Ok("1");
+        && serve_batched_env;
     let next_token_result = if use_batched_serve {
         loaded
             .weights
