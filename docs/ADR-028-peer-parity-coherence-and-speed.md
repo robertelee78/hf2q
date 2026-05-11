@@ -16203,3 +16203,65 @@ Without Apple Instruments data, /loop iters from here are limited to:
 2. **Pivoting** to a different work area (operator-decision)
 
 The iter-355 + iter-356 lever budget remains accurate: best-case future ceiling = 78.4 tok/s = 0.76× peer from in-scope /loop work.
+
+## iter-358 — NWG sweep on hybrid SDPA: NWG=16 default firmly optimum (16th falsification)
+
+### Date
+2026-05-10
+
+### Hypothesis
+"For short kv_seq_len (decode hot path), HF2Q_HYBRID_NWG=1 might beat NWG=16 by avoiding the per-token reduce kernel dispatch (24.87 dispatches/decode_tok at 14 µs each = ~350 µs/tok ≈ 2.6% theoretical)."
+
+### Result FALSIFIED
+```
+NWG=16 (default):  74.2 / 74.1 tok/s
+NWG=1  (no reduce): 63.1 / 63.1 tok/s   = -15% (massive regression)
+NWG=8:             72.9 / 72.4 tok/s   = -1.7% (less parallel, slightly worse)
+```
+
+NWG=1 also produced 228 tokens vs 244 for other configs — numerical instability (different reduction order) shifts EOS point.  Coherence intact but trajectory diverges.
+
+### Why FALSIFIED
+NWG controls parallelism across workgroups.  At gemma4 decode shapes (kv_seq_len typically ~30-1024), NWG=16 lets the SDPA work split across 16 SM groups concurrently.  NWG=1 serializes onto one workgroup → 1/16th the parallelism → 15% slower despite skipping the reduce dispatch.  Reduce overhead (~350 µs/tok) is dwarfed by the lost parallelism (~2 ms/tok).
+
+This matches `feedback_metal_compiler_auto_optimizes_static_levers` pattern: structural defaults already chosen well; explicit overrides regress.
+
+### Cumulative falsifications this thread (16 total)
+
+iter-326..339: 11 peer-pattern micro-ports that yielded no win or regression
+iter-352: FOR_UNROLL pragma (12th)
+iter-355: barrier audit hypothesis (13th)
+iter-356: Phase 13 GPU-rerank pipelining cost-bounded at +0.5%, not +1-1.5% (14th)
+iter-357: simdgroup_matrix on decode mv (peer doesn't either; 15th)
+iter-358: NWG=1 SDPA reduce-skip (16th)
+
+Phase 10 cumulative LANDED: +2.4% across 5 sub-iters (10c, 10d, 10e, 10e.5, 10c.5).
+
+### Provable bound on remaining /loop levers
+
+After 16 falsifications + Phase 10's +2.4%, the in-scope lever budget is:
+
+| Lever | Δ ceiling | Status |
+|---|---|---|
+| Indirect command buffers (Apple Metal 4) | +3.5% | Open, 3-5 iter, no falsification yet |
+| Multi-query SDPA | minor | Open, operator-decision-gated |
+| Phase 13 GPU-rerank | +0.5% | DOWNGRADED iter-356 |
+| Apple Instruments trace | unknown | Requires operator-GUI |
+
+Best-case future ceiling = 75.5 × 1.035 = **78.2 tok/s = 0.76× peer** from indirect command buffers alone (the only undamped /loop lever left).
+
+The remaining ~22% peer gap is in per-kernel GPU code-quality on EXISTING dispatches that cannot be localized further without Apple Instruments Metal System Trace (operator-GUI session required; per-dispatch sampling NOT supported on M-series Apple Silicon, only stage-boundary which is incompatible with our persistent-encoder pattern — see `mlx-native/src/encoder.rs:1712`).
+
+### Tests + bench
+- 3454/0 hf2q lib + 286/0 mlx-native lib still passing.
+- HEAD bench unchanged from iter-354: hybrid 75.5 tok/s baseline; +0.5% with rerank off (iter-356 measurement).
+- No code change shipped this iter.
+
+### Pivot decision (operator-decision-gated)
+
+Standing /loop directive "continue until complete" + 16 falsifications suggests `complete` is approaching the asymptote.  Recommended pivots from the iter-356/357 chain:
+- (a) Implement indirect command buffers (3-5 iter, +3.5% cap, only undamped lever)
+- (b) Pause for Instruments trace session (highest-leverage, requires operator-GUI)
+- (c) Pivot to a different gemma4 work area (e.g., long-context >8K bench, additional model coverage, prefill-specific structural work)
+
+Continuing aimless /loop iters at this point would produce more falsifications without measurable speedup.
