@@ -19501,3 +19501,60 @@ change (instrumentation only fires under MLX_PROFILE_BARRIERS=1).
 
 ### Investigation count this thread
 57 total: 56 from iter-399 + this iter (empirical barrier measurement).
+
+## iter-401 — short indexing in q6_K_nr2 kernel (matches peer pattern)
+
+### Date
+2026-05-10
+
+### Goal
+Per /loop "continue until complete", side-by-side diff of our q6_K_nr2 vs
+peer's q6_K_impl revealed peer uses `short` (16-bit) for indexing
+(`tid`, `ix`, `ip`, `il`, `l0`, `is`); we use `int` (32-bit).  Apple Metal
+compiler may emit more compact 16-bit ALU ops.  Test if matching peer's
+pattern yields measurable gain.
+
+### Implementation
+Changed 6 const decls in `kernel_mul_mv_q6_K_f32_nr2` from `int` → `short`
+to match peer's ggml-metal.metal:8005-8014.
+
+### Tests
+4/4 q6_K NR2 parity tests PASS byte-identical:
+```
+q6k_mv_nr2_parity_n8_k512 ... ok
+q6k_mv_nr2_parity_n_odd_boundary ... ok
+q6k_mv_nr2_parity_n4_k256 ... ok
+q6k_mv_nr2_parity_gemma4_lm_head_shape ... ok
+```
+
+### Bench (gemma4 200-tok decode, default config, 5 trials)
+
+```
+75.0 / 75.1 / 75.0 / 74.9 / 75.0 → mean **75.00** tok/s
+```
+
+vs iter-392 baseline 75.17 (3 trials).  Δ = -0.17 tok/s = -0.23% within
+typical run-to-run noise (σ ~0.10-0.15).
+
+### Conclusion
+
+**Code-quality improvement, perf-neutral**.  Parity preserved (byte-
+identical).  Matches peer's idiomatic pattern for the q6_K mv kernel.
+Apple Metal compiler appears to optimize int and short equivalently for
+this access pattern (consistent with iter-376's TG_MULT_HINT finding —
+Apple compiler is smart about static patterns).
+
+### Why ship anyway
+
+- Aligns our kernel with peer's reference implementation
+- Reduces cognitive overhead when comparing kernels in future audits
+- Zero perf regression
+- Parity proven byte-identical
+
+### Tests + bench
+- mlx-native lib: 290/0 + 4 q6_K NR2 parity tests PASS.
+- hf2q lib: 3454+2 passing.
+- Coherence intact.
+
+### Investigation count this thread
+58 total: 57 from iter-400 + this iter (peer-pattern alignment).
