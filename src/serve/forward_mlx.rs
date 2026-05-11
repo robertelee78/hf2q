@@ -7897,15 +7897,45 @@ pub fn dispatch_qmatmul(
     }
 
     if weight.info.ggml_dtype == mlx_native::GgmlType::F32 {
-        // F32 dense path. Weight buffer holds [n_rows, k_cols] f32 row-major.
-        // dense_matmul_f32_f32_tensor expects:
-        //   src0 = weight  [src0_batch, n, k] f32 → [1, rows, cols]
-        //   src1 = input   [src1_batch, m, k] f32 → [1, m, cols]
-        //   dst  = output  [src1_batch, m, n] f32 → [1, m, rows]
+        // F32 dense path.  Weight buffer holds [n_rows, k_cols] f32 row-major.
+        //
+        // ADR-029 iter-18 (H26): for m=1 (decode), the matrix-MATRIX tile
+        // kernel `dense_matmul_f32_f32_tensor` wastes 87.5% of its 8x8 SIMD-
+        // group-matrix tile (uses 1 row of input out of 8 loaded).  Route
+        // m=1 dispatches through `dispatch_dense_matvec_f32` (mat-VECTOR
+        // kernel, MTLSize threads=32x2, 4 rows/dst x 2 SGs) which matches
+        // peer's `kernel_mul_mv_f32_f32` pattern.  Gemma4 router_proj
+        // (ffn_gate_inp F32 [2816,128]) measured ~73 µs/layer via the
+        // mat-mat kernel under HF2Q_FFN_SPLIT bisect; the mat-vec kernel
+        // is bandwidth-bound at ~7-10 µs/layer = ~63 µs/layer x 30 layers
+        // = ~1.9 ms/tok savings if H26 holds.  Opt-out via
+        // HF2Q_F32_MATVEC=0 (legacy mat-mat path); default ON for m=1.
+        let n = weight.info.rows as u32;
+        let k = weight.info.cols as u32;
+        let f32_matvec_default = std::env::var("HF2Q_F32_MATVEC")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
+        if m == 1 && f32_matvec_default {
+            let params = mlx_native::ops::dense_gemm::DenseGemmF16Params {
+                m, n, k,
+            };
+            return mlx_native::ops::dense_gemm::dispatch_dense_matvec_f32(
+                session.encoder_mut(),
+                registry,
+                device.metal_device(),
+                input,
+                &weight.buffer,
+                output,
+                &params,
+            )
+            .map_err(|e| anyhow::anyhow!("dispatch_dense_matvec_f32 failed: {e}"));
+        }
+        // m>=2 (prefill) or opt-out: fall back to mat-mat tile kernel.
         let params = mlx_native::DenseMmF32F32Params {
             m,
-            n: weight.info.rows as u32,
-            k: weight.info.cols as u32,
+            n,
+            k,
             src0_batch: 1,
             src1_batch: 1,
         };
