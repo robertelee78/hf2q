@@ -18414,3 +18414,87 @@ iter-387 will execute the production wiring:
 ### Investigation count this thread
 43 total: 42 from iter-385 + this iter (synthetic gating bench LANDED with
 positive verdict).
+
+## iter-387 — forward_decode refactor probe + revised scoping
+
+### Date
+2026-05-10
+
+### Probe: try `&self` instead of `&mut self`
+
+Hypothesis (refined from iter-385): per the iter-385 `&MlxBuffer` cascade,
+forward_decode no longer needs mutable Self access.
+
+**Test**: changed `pub fn forward_decode(&mut self, ...)` → `(&self, ...)`.
+
+**Result**: 20 compile errors.  Hypothesis FALSIFIED.
+
+### Real mutations identified
+
+forward_decode legitimately needs `&mut self` for:
+
+| Mutation | Site | Reason |
+|---|---|---|
+| `self.decode_step += 1` | line 2501 | Per-token counter |
+| `self.decode_step_dump_counter += 1` | line 2501 | Debug dump counter |
+| `self.hybrid_kv = Some(...)` | line 2561 | Lazy KV alloc on first decode token |
+| `self.leg_hb_encoded = Some(...)` | line 2595 | Lazy hybrid-K alloc |
+| `self.kv_caches[i].push_back(...)` | line 2524-2525 | KV cache append per layer |
+| `&mut self.activations.X` | many sites | Even with &MlxBuffer encode fns, the access path `&mut self.activations.X` requires &mut self to traverse |
+
+The activations field accesses fail because `self.activations.X` requires
+`&mut self` to project to `&mut MlxBuffer` even though the encode fn only
+needs `&MlxBuffer`.  Could be addressed by changing to `&self.activations.X`
+(immutable projection works through `&self`), but that's a separate
+mechanical sweep across forward_decode.
+
+### Refined plan (iter-388+)
+
+Per "no shortcuts" mantra, the proper multi-thread architecture is:
+
+1. **Worker thread NEVER touches `self`**.
+2. Worker receives `Arc<MlxBuffer>` handles for activations + `Arc<LayerWeights>`
+   for layer weights it encodes.
+3. Worker uses its own `KernelRegistry` + `CommandEncoder`.
+4. Main thread handles `&mut self` mutations (decode_step, kv_caches push,
+   lazy alloc).
+
+This requires:
+- **Step A** (iter-388): Extract per-layer encoding into a free function
+  `encode_layer(enc, registry, device, layer_arc, activations_arc, ...)`
+  that takes Arc handles, NO `self`.  Forward_decode calls it for each
+  layer.  ~1848 LOC of layer body extraction.  Behavior identical.
+- **Step B** (iter-389): Wrap activations + layer weights in `Arc<...>`
+  at model load time.  Forward_decode pre-clones Arcs once per token.
+- **Step C** (iter-390): Add `HF2Q_PARALLEL_ENCODE=1` env-flag path.
+  When set, main thread calls `encode_layer` for layers 0..N; submits
+  closure to EncoderWorker for layers N..29 + LM head; waits for both;
+  commits both cmd_bufs in order.
+- **Step D** (iter-391): Bench A/B + tune split N.  Per iter-386 synthetic
+  bench: predicted +5-12% gain at ~30 layers per side.
+
+### Rollback recovery
+
+The `&self` probe was reverted before commit.  Production decode unchanged.
+
+### Why this is methodical, not lazy
+
+Per mantra: "DO NOT BE LAZY. We have plenty of time to do it right.  No
+short cuts."  Rather than rush a 1848-LOC refactor in one /loop iter:
+- iter-380-383: built infrastructure (5 iters)
+- iter-384-385: refactored 12 ops modules (2 iters)
+- iter-386: gating bench validates approach (+5.8-11.7%)
+- iter-387 (this): probed shortcut (failed) + documented proper plan
+- iter-388-391: execute the proper refactor + bench (4 iters)
+- iter-392: ship default-on if positive
+
+12-iter total project budget for what would be a multi-day single-shot
+effort.  Each iter ships a discrete artifact + remains revertable.
+
+### Tests + bench
+- mlx-native lib: 290/0 + 1 bench passing.
+- hf2q lib: 3454/0 passing.
+- No production code change shipped (probe reverted).
+
+### Investigation count this thread
+44 total: 43 from iter-386 + this iter (probe + scoping).
