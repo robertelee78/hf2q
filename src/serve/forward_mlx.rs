@@ -2049,6 +2049,56 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("argmax_params init: {e}"))?;
                 p[0] = w.vocab_size as u32;
             }
+
+            // ADR-029 iter-28 H29 — F16 shadow population pass.
+            //
+            // Materializes an F16 pre-dequantized buffer for every attn
+            // and dense-MLP quantized weight in every layer, so that the
+            // runtime dispatch_qmatmul fast-paths through the F16-input
+            // matmul kernel (peer's gemma4 strategy).  Default OFF; opt-in
+            // via HF2Q_F16_SHADOW=1.  ~1 GB extra resident on gemma4-26B
+            // when active.
+            //
+            // Doing this in a second pass (after weight load) avoids
+            // borrow-checker conflicts between `gpu.device()` (read) and
+            // `gpu.registry` (write) during the per-layer load loop.
+            let f16_shadow_enabled = std::env::var("HF2Q_F16_SHADOW")
+                .ok()
+                .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
+                .unwrap_or(false);
+            if f16_shadow_enabled {
+                let dev = gpu.executor.device();
+                let n_layers = w.layers.len();
+                eprintln!("[ADR-029 H29] Materializing F16 shadows for {} layers' attn + dense MLP weights...", n_layers);
+                let t0 = std::time::Instant::now();
+                for li in 0..n_layers {
+                    populate_f16_shadow_if_enabled(
+                        &mut w.layers[li].attn.q_proj, dev, &mut gpu.registry,
+                        &format!("blk.{li}.attn_q"))?;
+                    populate_f16_shadow_if_enabled(
+                        &mut w.layers[li].attn.k_proj, dev, &mut gpu.registry,
+                        &format!("blk.{li}.attn_k"))?;
+                    if let Some(ref mut v) = w.layers[li].attn.v_proj {
+                        populate_f16_shadow_if_enabled(
+                            v, dev, &mut gpu.registry,
+                            &format!("blk.{li}.attn_v"))?;
+                    }
+                    populate_f16_shadow_if_enabled(
+                        &mut w.layers[li].attn.o_proj, dev, &mut gpu.registry,
+                        &format!("blk.{li}.attn_output"))?;
+                    populate_f16_shadow_if_enabled(
+                        &mut w.layers[li].mlp.gate_proj, dev, &mut gpu.registry,
+                        &format!("blk.{li}.ffn_gate"))?;
+                    populate_f16_shadow_if_enabled(
+                        &mut w.layers[li].mlp.up_proj, dev, &mut gpu.registry,
+                        &format!("blk.{li}.ffn_up"))?;
+                    populate_f16_shadow_if_enabled(
+                        &mut w.layers[li].mlp.down_proj, dev, &mut gpu.registry,
+                        &format!("blk.{li}.ffn_down"))?;
+                }
+                let elapsed = t0.elapsed();
+                eprintln!("[ADR-029 H29] F16 shadow population done in {:.2}s", elapsed.as_secs_f64());
+            }
         }
 
         result
@@ -7748,6 +7798,72 @@ fn load_gguf_qweight(
         affine: None,
         f16_shadow: None,
     })
+}
+
+/// ADR-029 iter-28 H29 — populate the F16 pre-dequantized shadow for a
+/// quantized weight.  Returns Ok(()) silently if:
+///   * HF2Q_F16_SHADOW is unset / falsy (default), OR
+///   * the weight is not a quantized type that dequant_to_f16 supports
+///     (F32 / F16 / I16 / affine).
+///
+/// When ENABLED and the weight type is supported, dispatches the dequant
+/// kernel at load time, allocates a 2-bytes/elem F16 buffer, and stores
+/// it as the `f16_shadow` field.  Subsequent `dispatch_qmatmul` at m > 8
+/// will fast-path through the F16-input matmul kernel (kernel_mul_mm_f16
+/// _f32_tensor) which avoids per-call dequant overhead.
+///
+/// Memory cost: ~1 GB extra resident for gemma4-26B attn weights when
+/// applied to attn_q/k/v/output + ffn_gate/up.  On the M5 Max target
+/// (128 GB unified), this is well within budget; matches peer's strategy.
+fn populate_f16_shadow_if_enabled(
+    qweight: &mut MlxQWeight,
+    device: &MlxDevice,
+    registry: &mut mlx_native::KernelRegistry,
+    tensor_name: &str,
+) -> Result<()> {
+    // Env gate (default OFF until coherence + multi-regime bench parity).
+    let enabled = std::env::var("HF2Q_F16_SHADOW")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(());
+    }
+
+    // Skip when affine — that path doesn't go through dispatch_qmatmul's
+    // quantized branch.
+    if qweight.affine.is_some() {
+        return Ok(());
+    }
+
+    // Skip types the dequant kernel doesn't handle.
+    use mlx_native::GgmlType;
+    match qweight.info.ggml_dtype {
+        GgmlType::Q4_0
+        | GgmlType::Q8_0
+        | GgmlType::Q5_1
+        | GgmlType::IQ4_NL
+        | GgmlType::Q4_K
+        | GgmlType::Q5_K
+        | GgmlType::Q6_K => {}
+        _ => return Ok(()),
+    }
+
+    let n_rows = qweight.info.rows as u32;
+    let n_cols = qweight.info.cols as u32;
+
+    let f16 = mlx_native::ops::dequant_to_f16::materialize_f16_shadow(
+        device,
+        registry,
+        &qweight.buffer,
+        n_rows,
+        n_cols,
+        qweight.info.ggml_dtype,
+    )
+    .map_err(|e| anyhow::anyhow!("F16 shadow materialize for '{}': {e}", tensor_name))?;
+
+    qweight.f16_shadow = Some(f16);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
