@@ -22508,3 +22508,62 @@ generations (decode floor).
 ### Investigation count this thread
 100 total: 99 from iter-442 + this iter (chat-template token-count
 correction).
+
+## iter-444 — MTLResidencySet peer-parity confirmed (active at runtime)
+
+### Hypothesis
+Peer log shows "use residency sets = true".  Apple MTLResidencySet
+provides explicit GPU memory residency hints — improves working-set
+predictability, avoids surprise paging.  Verify hf2q uses it.
+
+### Method
+- Grep `/opt/mlx-native/src/` for ResidencySet usage
+- Run hf2q serve with `MLX_NATIVE_LOG_INIT=1` to log residency state
+
+### Findings
+
+**hf2q infrastructure**:
+- `device.rs:62`: `let set = ResidencySet::new(&device)?` — created
+  on device init when macOS >= 15.0 and not disabled by env
+- `buffer_pool.rs:340/415`: every buffer allocation registers with
+  the residency set
+- `encoder.rs:618+/745`: encoder session passes residency_set
+  through to dispatches
+- `device.rs:69`: `set.register_with_queue(&queue)` — bound to
+  command queue at init
+
+**Runtime verification**:
+```
+$ MLX_NATIVE_LOG_INIT=1 hf2q serve ...
+[mlx-native] residency sets = true
+```
+
+hf2q uses MTLResidencySet at runtime on M5 Max (macOS >= 15).
+**Peer-parity confirmed.**
+
+### Cumulative peer-parity confirmations (across iter-419/425/426/429/437/444)
+| Optimization | Status |
+|---|---|
+| blk pre-pass tile skip (FA) | ✓ peer-parity |
+| tensor_ops::matmul2d (Apple AMX) | ✓ peer-parity |
+| BF16 K storage | ✓ peer-parity |
+| Q-tile NQPSG=8/1 (FA prefill/vec) | ✓ peer-parity |
+| C-tile NCPSG=64/32 (FA prefill/vec) | ✓ peer-parity |
+| **MTLResidencySet** (working-set residency) | **✓ peer-parity** |
+
+**6 peer-parity audits all confirm**: hf2q is at structural peer-
+parity across every kernel-level + memory-management optimization
+peer uses.  The 0.7× pure decode floor is genuinely structural per-
+dispatch CPU launch latency (iter-397 GPU 93% bound finding).
+
+### Investigation count this thread
+101 total: 100 from iter-443 + this iter (residency set peer parity).
+
+### No new lever
+Continued elimination of "what could peer have that we don't"
+hypotheses.  At this point the operator decision matrix is complete:
+- Phase 15 prefill: SHIPPED ✓
+- Coherence: TIED ✓
+- Decode floor: structural, exhausted at kernel level
+- Multi-thread: ready but operator-decision-gated
+- HYBRID_KV: available but operator-decision-gated (memory tradeoff)
