@@ -118,6 +118,52 @@
 > a /cfa swarm with explicit operator approval — Codex in review-only
 > mode for peer-source audit while Claude implements + benches.
 >
+> **iter-7 — ADR-029's MoE attribution was DOUBLY WRONG**:
+> `/opt/mlx-native/benches/bench_decode_moe_id_shapes.rs` (ADR-028 iter-181,
+> already in-repo) measures hf2q's actual MoE per-token GPU time at the
+> exact gemma4 APEX-Q5_K_M shapes:
+> | shape | batched µs/call | calls/tok | total µs/tok | GB/s |
+> |---|---:|---:|---:|---:|
+> | g4_gate_up_Q6K (n=1408 k=2816 tk=8) | 34.8 | 30 | 1044 | 748 |
+> | g4_down_Q8_0 (n=2816 k=704 tk=1, ntok=8) | 21.1 | 30 | 633 | 799 |
+> | **gemma4 MoE total per decode tok** | | **60** | **1677 µs** | **767 (agg)** |
+>
+> **gemma4 MoE = 1.68 ms/decode-token = 12.6% of the 13.33 ms wall-clock**,
+> NOT 49% as ADR-029's H5B-routing-skip "5.02 ms" probe claimed. H5B was an
+> **upper bound from incoherent skip behavior** (skipping routing leaves
+> garbage expert_ids → MoE expert dispatches still run but on a
+> degenerate access pattern that may load the same expert 8× with cache
+> hits — making the skipped baseline FASTER than coherent execution
+> would be).
+>
+> hf2q's MoE is already at **747 GB/s = 137% of the "peak" 546 GB/s
+> sustained estimate**, i.e. near memory-bandwidth saturation. There's
+> no meaningful MoE optimization headroom on gemma4 APEX-Q5_K_M.
+>
+> **The 3.6 ms/tok gap is OUTSIDE the MoE pipeline.** Where? Per-layer
+> remaining budget = (443 − 56 µs MoE − 35 µs lmhead amortized) = ~352
+> µs/layer for attention + dense MLP + norms + KV cache + RoPE. The
+> peer-side total for these same ops must therefore be ~220 µs/layer
+> for the gap math to add up (3.6 ms / 30 layers = 120 µs/layer
+> attention-path savings).
+>
+> The largest remaining hf2q candidates by time:
+> - `flash_attn_vec_tq_hb` (monolithic Q@K + softmax + @V), peer
+>   replaces with 3 separate kernels — hypothesis (un-tested) it
+>   accumulates ~50-80 µs/layer overhead vs peer
+> - dense MLP (Q6_K up/gate/down via 3 separate `dispatch_qmatmul`
+>   calls), peer fuses via `pipeline_norm_fuse_norm_mul_add` and tighter
+>   ggml-graph scheduling — also un-tested
+> - Q-norm + K-norm + RoPE per-head pair (`s.rms_norm` × 2 +
+>   `dispatch_rope_*`), peer combines via `kernel_rope_neox_*` fused
+>   pre-RoPE-norm
+>
+> Note that ADR-029's "MoE pipeline is the gap" framing is now
+> retracted twice over: first by iter-5 (peer issues MORE dispatches,
+> not fewer) and now by iter-7 (MoE is only 12.6% of wall-clock, not
+> 49%). The actual gap structure remains unidentified at the bucket
+> level after 7 iters.
+>
 > --- (prior MISSION REOPENED note retained below for chronology) ---
 
 > **⚠ MISSION REOPENED 2026-05-11 (post iter-4 merge)**
