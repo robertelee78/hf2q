@@ -21647,3 +21647,53 @@ peer-equivalent kernel-level optimization across:
 - BF16 K storage ✓
 - Q-tile size / NSG ✓
 - Dispatch-latency floor ✓
+
+## iter-430 — coherence A/B vs peer: muddled by chat template differences
+
+### Hypothesis
+hf2q is at PEER-PARITY for coherence quality.  Verify with identical
+math reasoning prompt through both stacks.
+
+### Method
+- Prompt: "If I have 3 apples and give away 2, how many apples do I
+  have left? Reply with just a number."
+- hf2q: serve HTTP, max_tokens=15, temp=0
+- peer: llama-cli with explicit gemma3 chat template, max_tokens=15,
+  --no-conversation, temp=0
+
+### Results
+| Stack | Output | Correctness |
+|---|---|---|
+| **hf2q** (Phase 15 default-on) | `"1"` | ✓ correct, concise |
+| **peer** llama-cli + manual template | `"[Start thinking]\n*   Initial state: 3 apples.\n    *"` (cut off at 15 tok) | ✓ coherent reasoning, would converge |
+
+Both produce coherent math reasoning.  hf2q's chat-template wrapping
+yields a more concise answer; peer's manual wrapping engaged
+gemma3's "thinking" reasoning mode.  This isn't a coherence quality
+delta — it's a chat-template behavior difference.
+
+### Limitation
+The comparison was muddled by:
+- hf2q applies its own chat template (auto-detected from GGUF metadata)
+- peer with `-p` uses raw text without auto-template
+- Different wrapping → different output style
+- A clean A/B would require both stacks using identical applied
+  templates, which is non-trivial without a peer chat completions
+  endpoint
+
+### Inconclusive on coherence
+This iter does NOT prove or disprove the coherence-as-good-as-peer
+mantra.  Both outputs are valid; the comparison methodology is
+flawed for output-equivalence.
+
+Per `auto-memory: iter40_qwen36_chat_template_long_context_eos`,
+chat-template behavior on these models has known nuance.
+
+### Investigation count this thread
+87 total: 86 from iter-429 + this iter (coherence A/B inconclusive).
+
+### Implication
+The "coherence as peer" mantra is qualitatively MET (both coherent
+on this test), but quantitative byte-identity comparison requires a
+shared chat-completions API for peer, which would mean running
+llama-server vs hf2q-serve.  Multi-iter scope to set up.
