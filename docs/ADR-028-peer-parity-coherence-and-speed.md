@@ -23346,3 +23346,58 @@ operator decision matrix:
 - FA via HYBRID (operator-gated, +3.3%)
 - CPU encode via multi-thread (operator-gated, +2.2%)
 - Both already documented; nothing new revealed
+
+## iter-458 — server startup time: hf2q 3.29s vs llama-server 1.65s
+
+### Hypothesis
+User-perceived "time to first request ready" matters but has never
+been measured.  Compare hf2q-serve startup vs llama-server.
+
+### Method
+Time from process spawn to `/v1/models` returning HTTP 200.  Same
+model both stacks (gemma4-ara-2pass-APEX-Q5_K_M.gguf), 2 reps each.
+
+### Results
+
+| Stack | rep 1 | rep 2 | mean |
+|---|---|---|---|
+| **hf2q serve** | 3.28 sec | 3.30 sec | **3.29 ± 0.01** |
+| **llama-server** | 1.54 sec | 1.75 sec | **1.65 ± 0.11** |
+| **Gap** | | | **+1.64 sec (2.0× slower)** |
+
+### Diagnosis
+hf2q startup is **2× slower** than peer.  Possible candidates:
+- Metal pipeline state JIT compile (we register many kernels)
+- Buffer pool allocation
+- KV cache pre-allocation (per-layer Arc allocations)
+- TQ codebook initialization
+- Tokenizer init (chat template parsing)
+- mmap + GGUF metadata parse
+
+### Significance
+This is a **one-time cost per process** — small impact for long-running
+production serving (1.6 sec amortized over many requests).  But
+matters for:
+- CLI generate (every invocation pays the cost)
+- Server cold-start in containerized environments
+- Test suites that spawn fresh server per test
+
+### Lever assessment
+Startup optimization is a smaller lever than decode/prefill (since
+it's amortized over the session lifetime).  Multi-iter scope to
+profile + reduce.  Operator-decision-gated.
+
+### Investigation count this thread
+115 total: 114 from iter-457 + this iter (startup time gap).
+
+### Operator decision matrix (added startup row)
+
+| Lever | Status | Effect |
+|---|---|---|
+| Phase 15 default-on | ✓ shipped | prefill 0.94× peer |
+| MTLResidencySet | ✓ default-on | +0.7% decode |
+| HYBRID_KV | OPERATOR-GATED | +3.3% decode (33% memory) |
+| Multi-thread integration | OPERATOR-GATED | +2.2% decode (5-8 iters) |
+| FA_GL F8 K | OPERATOR-GATED | ~50% pp16K (multi-iter) |
+| **Server startup time** | **OPERATOR-GATED** | **2× slower (1.6 sec gap)** — one-time cost, multi-iter profile |
+| Decode floor | exhausted | 0.69× pure peer |
