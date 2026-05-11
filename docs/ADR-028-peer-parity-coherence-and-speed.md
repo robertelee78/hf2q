@@ -22051,3 +22051,47 @@ default-on is operator-decision-gated.
 
 The Phase 10d HYBRID_KV row is now an **operator-actionable single-
 decision lever** (toggle default-on vs preserve 3.94× memory).
+
+## iter-436 — env-flag audit: graph_opt + fused_triple_norm both NOT levers
+
+### Hypothesis
+After iter-435 found Phase 10d HYBRID_KV is wired-but-default-OFF
+with +3.3% gain, audit OTHER default-OFF env flags
+(HF2Q_GRAPH_OPT, HF2Q_FUSED_TRIPLE_NORM, HF2Q_CHUNK_SCAN_PREFILL)
+to see if any provides measurable production decode speedup.
+
+### Method
+hf2q serve, max_tokens=128, T=0, 3 unique prompts via streaming SSE
+each.
+
+### Results
+
+| Flag | tok/s mean (3 reps) | Δ vs default |
+|---|---|---|
+| **default** (no env) | 66.80 ± 0.30 | baseline |
+| **HF2Q_GRAPH_OPT=1** | 66.95 ± 0.03 | +0.2% (noise) |
+| **HF2Q_FUSED_TRIPLE_NORM=1** | 65.10 ± 0.25 | **-2.5% REGRESSION** |
+
+`HF2Q_CHUNK_SCAN_PREFILL` not benched (requires UNSAFE ack flag).
+
+### Findings
+- `graph_opt`: no measurable benefit — within noise band
+- `fused_triple_norm`: REGRESSION (-2.5%).  Per `auto-memory:
+  iter-380→398 thread synthesis`, the V2 variant `fused_triple_norm_v2`
+  was tested and showed parity but caused coherence regression with
+  iter-321 stack.  The V1 path enabled by HF2Q_FUSED_TRIPLE_NORM=1
+  appears to lose performance vs unfused at HEAD.
+- `chunk_scan_prefill`: UNSAFE-acked path; not relevant unless operator
+  enables UNSAFE_EXPERIMENTS=1
+
+### Confirmation of current defaults
+The current default-OFF state for these flags is CORRECT per
+empirical benchmarks at HEAD.  No new operator-actionable lever
+surfaced from this audit.
+
+### Investigation count this thread
+93 total: 92 from iter-435 + this iter (env-flag audit).
+
+### Operator decision matrix (unchanged)
+Same five rows as iter-435.  Confirmed no hidden levers in env-flag
+space — HYBRID_KV remains the singular toggle-only lever.
