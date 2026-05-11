@@ -20007,3 +20007,56 @@ confirmed OFF — non-finding, not falsification).
 
 ### Operator decision matrix (unchanged)
 Same six rows as iter-408.  No new lever identified.
+
+## iter-410 — peer + hf2q baseline refresh (canonical numbers at HEAD)
+
+### Hypothesis
+Long-running thread quoted "0.730× / 0.749× peer" repeatedly, but the
+last full re-measurement was iter-393.  Verify peer + hf2q HEAD numbers
+are still current; refresh the canonical reference.
+
+### Method
+Same M5 Max, same model
+(`gemma4-ara-2pass-APEX-Q5_K_M.gguf`), `llama-bench` (peer) vs
+`hf2q generate` for hf2q.  5 reps each.  Default decode + hybrid
+(`HF2Q_HYBRID_KV=1`) for hf2q.  All apples-to-apples at HEAD on
+`2026-05-10`.
+
+### Results
+
+| Stack | tok/s (5 reps) | Ratio vs peer |
+|---|---|---|
+| **llama.cpp** d05fe1d7d (build 9010) | 103.68 ± 0.65 | 1.000× |
+| **hf2q default** | 75.24 ± 0.05 | **0.726×** |
+| **hf2q hybrid** (HF2Q_HYBRID_KV=1) | 77.08 ± 0.10 | **0.743×** |
+| Hybrid uplift over default | — | +2.45% |
+
+### Reconciliation with memory
+Memory tracked "0.730× / 0.749×" — slightly higher than today's
+empirical 0.726× / 0.743×.  Δ = -0.4 to -0.6 percentage points (within
+rep-to-rep variance over the long thread, but the trend is correct:
+peer slightly improved or our build picked up minor regression).  Use
+**0.726× / 0.743×** as the canonical reference going forward.
+
+### What this confirms
+- Peer at HEAD effectively unchanged (103.68 vs prior 103-103.16
+  across multiple measurements throughout this thread).
+- hf2q gemma4 decode at HEAD is genuinely flat — the 19-iter
+  multi-thread infra prep + 33+ falsifications have NOT moved the
+  ratio meaningfully (consistent with iter-397's "GPU 93% bound"
+  finding).
+- The 5 LANDED phases (Phase 9, 10, 13, 13.2, 14) account for the
+  cumulative gain from the original 73.7 baseline → 75.24 default
+  / 77.08 hybrid (+2.1% / +4.6% relative).
+
+### Investigation count this thread
+67 total: 66 from iter-409 + this iter (canonical-baseline refresh).
+
+### Operator decision matrix (canonical numbers refreshed)
+Same six rows as iter-408/iter-409.  Updated reference numbers:
+- Default ratio: 0.726× peer (was 0.730×)
+- Hybrid ratio:  0.743× peer (was 0.749×)
+
+The two-decimal-place revision does not change any operator decision
+about which lever to pursue; the per-iter avenue remains formally
+exhausted.
