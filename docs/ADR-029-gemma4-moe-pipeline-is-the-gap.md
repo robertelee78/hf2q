@@ -1,5 +1,73 @@
 # ADR-029: gemma4-APEX-Q5_K_M Decode Gap is in the MoE Pipeline, Not TQ
 
+> **🎯 ITER-5 SMOKING GUN 2026-05-11 — ADR-029 GOT THE GAP STRUCTURE WRONG**
+>
+> Measured peer's actual gemma4-APEX-Q5_K_M dispatch counts by patching
+> llama.cpp's ggml-metal-device.m with atomic dispatch+barrier counters
+> and a per-pipeline histogram. Slope analysis across tg10/50/100/200 r=1
+> at peer = 99-102 t/s converges to:
+>
+> | metric | peer | hf2q | ratio |
+> |---|---:|---:|:---:|
+> | dispatches/decode-tok | **1389** | 883 | **peer 1.57× MORE** |
+> | barriers/decode-tok | **905** | 487 | peer 1.86× MORE |
+> | µs/dispatch (avg) | **7.05** | **15.10** | **hf2q is 2.14× SLOWER per dispatch** |
+>
+> **ADR-029's "peer issues 105 dispatches/tok" claim was hf2q's old candle
+> Phase 0 reference baseline, NOT peer's actual count.** Peer dispatches
+> ~57% MORE kernels than hf2q. The gap is entirely **per-dispatch cost**,
+> not dispatch count. Every dispatch-fusion lever falsified in iter-1..4
+> (H6 triple-norm, H7 wsum-end-layer) made hf2q's KERNELS LARGER —
+> exactly the WRONG direction.
+>
+> Peer's pipeline histogram (per decode-token forward pass) shows it
+> fragments work into more, smaller kernels:
+> - 212 `rms_norm_mul_f32_4` (norm+weight, ~7/layer × 30)
+> - 176 `mul_mv_q6_K_f32_nsg=2` (Q6_K mat-vec, dense path)
+> - 60 `rope_neox_f32_imrope=0` (Q+K RoPE, 2/layer)
+> - 60 `set_rows_f16_i64` (KV cache write, 2/layer)
+> - 60 `soft_max_f32_4` (attention + routing softmax)
+> - 59 `rms_norm_mul_add_f32_4` (3-op fusion: norm+mul+add)
+> - 55 `mul_mv_f16_f32_4_nsg=2` (F16 attention kernels — peer does NOT
+>   use a single flash_attn_ext kernel for gemma4 decode!)
+> - 30 `bin_fuse_f32_f32_f32_4_op=0_nf=7` (peer chains 7 ADDs in 1 kernel)
+> - 30 each of `cpy_f32_f32`, `mul_mv_id_q6_K_f32_nsg=2`,
+>   `mul_mv_q8_0_f32_nsg=4`, `argsort_f32_i32_desc`, `sum_rows_f32_f32_4`
+> - 30 `mul_mv_f32_f32_4_nsg=4` (F32 mat-vec, probably router_proj)
+>
+> Notable peer ABSENCES vs hf2q:
+> - **NO single flash_attn_ext** — peer computes attention as
+>   `mul_mv_f16(Q@K^T) → soft_max → mul_mv_f16(score@V)` per layer.
+>   hf2q has a monolithic `flash_attn_vec` kernel which may be 2-3× longer
+>   per call than peer's 3 separate dispatches summed.
+> - hf2q's largest single dispatch is `lm_head` (Q6_K mat-vec at
+>   vocab 262144 × hidden 2816 = 736M ops, ~343 µs/dispatch in production).
+>   Peer likely shards this across multiple smaller `mul_mv_q6_K` calls.
+>
+> **The new optimization direction**: SHARD hf2q's largest kernels into
+> smaller per-call work. Specifically:
+> 1. **Replace flash_attn_vec with peer's 3-dispatch attention** (Q@K^T,
+>    softmax, score@V). Could save ~30-50 µs/layer × 30 = ~1 ms/tok.
+> 2. **Shard lm_head** Q6_K mat-vec across multiple dispatches (peer
+>    splits vocab dim 262144 into chunks → multiple mul_mv_q6_K calls).
+> 3. **Tune kernel threadgroup geometry** to match peer's `nsg=2/nsg=4`
+>    pattern for the Q6_K/Q8_0 dispatchers.
+> 4. **Profile per-kernel timing** with HF2Q_DUMP_COUNTERS extended to
+>    capture per-pipeline µs, identify which hf2q dispatches are > 30 µs
+>    (i.e., > 2× hf2q's average), and target those for sharding.
+>
+> This direction is the inverse of ADR-029 §Decision 2 (dispatch fusion).
+> The §Decision items 1-5 are still closed (audits + qwen3.6 σ-pct stand);
+> the §Decision item 2 *direction* was a wild-goose chase. ADR-030 should
+> be opened to formalize the per-dispatch-cost direction with the
+> instrumented peer data captured here.
+>
+> Instrumentation patch: `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m`
+> with atomic `hf2q_peer_dispatch_count` + per-pipeline histogram, env-gated
+> via `HF2Q_PEER_COUNT_PRINT=1` and `HF2Q_PEER_PIPELINE_HIST=1`.
+>
+> --- (prior MISSION REOPENED note retained below for chronology) ---
+
 > **⚠ MISSION REOPENED 2026-05-11 (post iter-4 merge)**
 >
 > The iter-4 closure framing "all §Decision items closed = mission complete"
