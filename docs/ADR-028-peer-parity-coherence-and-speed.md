@@ -18337,3 +18337,80 @@ without borrow-checker conflict.  The fundamental blocker is removed.
 
 ### Investigation count this thread
 42 total: 41 from iter-384 + this iter (refactor cascade complete).
+
+## iter-386 — synthetic bench: multi-thread encoding WINS (+5.8% min, +11.7% mean)
+
+### Date
+2026-05-10
+
+### Goal
+Per "Measure 3x cut once" mantra: BEFORE committing to the multi-day
+forward_decode refactor (iter-387+), gate the investment with a synthetic
+bench that empirically proves multi-thread encoding wins.
+
+### Implementation
+NEW test `mlx-native/tests/test_iter386_parallel_encoding_bench.rs`:
+- Workload: 60 independent Q6_K qmatmul ops at gemma4 shape (m=1, n=2816,
+  k=2816 — typical Q/K/V/O projection).
+- Serial baseline: main thread encodes all 60 + commit_and_wait.
+- Parallel variant: main encodes 30 into buf0; worker encodes 30 into
+  buf1 concurrently; both commit + wait.
+- 5 trials each, report min + mean.
+
+### Results
+
+```
+Serial   : min 2665 µs  mean 2858 µs  trials [2665, 2882, 2959, 2801, 2983]
+Parallel : min 2520 µs  mean 2559 µs  trials [2520, 2584, 2532, 2584, 2577]
+```
+
+| Metric | Serial | Parallel | Speedup |
+|---|---|---|---|
+| **Min wall time** | 2665 µs | 2520 µs | **1.058× (+5.8%)** |
+| **Mean wall time** | 2858 µs | 2559 µs | **1.117× (+11.7%)** |
+
+### Verdict: ✓ PROCEED iter-387+
+
+Synthetic bench shows positive speedup (+5.8% min, +11.7% mean).  Above
+the +5% threshold.  Multi-thread encoding is empirically validated on
+gemma4-realistic shapes.
+
+### Why mean speedup > min speedup
+The mean reflects parallel's TIGHTER variance (σ ~30 µs vs serial's σ
+~120 µs).  Worker thread provides not just speedup but also jitter
+reduction (less interference between encode + GPU wait phases).
+
+### Source of the gain
+
+Per the iter-369 audit:
+- Per-dispatch CPU encoding overhead: ~10 µs
+- 60 ops × 10 µs = 600 µs sequential encoding
+- Parallel encoding (30 + 30 in parallel): ~300 µs
+- Saved: ~300 µs
+
+Measured saving: 2665 - 2520 = 145 µs (min) or 2858 - 2559 = 299 µs (mean).
+The mean saving matches the predicted ~300 µs.  The min is smaller likely
+because thread sync overhead consumed some of the headroom on the min
+trial.
+
+### Path forward (iter-387+)
+
+iter-387 will execute the production wiring:
+1. Refactor `forward_decode` to enable per-layer encoding to be invoked
+   from either main or worker thread (using `Arc<MlxBuffer>` activation
+   refs unblocked by iter-385).
+2. Split layer encoding: main thread encodes layers 0..N, worker
+   encodes layers N..29 + LM head.
+3. Add env-flag `HF2Q_PARALLEL_ENCODE=1` (default-OFF for first bench).
+4. Bench A/B + tune split N.
+5. iter-388: ship default-on if positive on production decode.
+
+### Tests + bench
+- mlx-native lib: 290/0 passing.
+- New synthetic bench test: 1/0 passing (PARALLEL WINS verdict).
+- hf2q lib: 3454/0 passing.
+- No production wiring yet.
+
+### Investigation count this thread
+43 total: 42 from iter-385 + this iter (synthetic gating bench LANDED with
+positive verdict).
