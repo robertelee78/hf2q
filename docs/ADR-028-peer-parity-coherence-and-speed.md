@@ -16608,3 +16608,81 @@ The "audit kernels missed by earlier V2 sweeps" pattern is yielding real wins.  
 - New V2 fused_post_ff_norm2 parity (iter-362): 2/0 passing.
 - hf2q lib: 3454/0 passing.
 - Coherence verified: hybrid produces "2 + 2 = 4<turn|>" bit-identical.
+
+## iter-364 — V2 candidate audit complete; FUSE_FWHT_PRE re-falsified at HEAD
+
+### Date
+2026-05-10
+
+### Audit: V2-able kernels in gemma4 decode hot path
+
+Reviewed every kernel in iter-352 dispatch breakdown (now refreshed at HEAD post-iter-363) for missed V2 (float4 + simd_sum) opportunities:
+
+| Kernel | % dispatches | Status |
+|---|---|---|
+| kernel_mul_mv_q6_K_f32_nr2 | 20.02% | Peer-matched (NSG=2/nr0=2); FOR_UNROLL falsified iter-352 |
+| rms_norm_f32_v2 | 17.19% | V2 ✓ iter-310; cap raise + right-size both falsified iter-360/361 |
+| fused_head_norm_rope_f32_v2 | 6.82% | V2 ✓ iter-337 |
+| hadamard_quantize_kv_fast_d256 | 5.69% | SIMD-optimal iter-339 |
+| fused_norm_add_f32_v2 | 3.43% | V2 ✓ iter-331 |
+| hf2q_dense_mm_f32_f32_tensor | 3.43% | Tensor cores firing |
+| **fused_gelu_mul** | 3.43% | Embarrassingly parallel — float4 wouldn't help (Apple coalesces scalars) |
+| fused_moe_routing_f32_v2 | 3.41% | V2 ✓ iter-363 |
+| kernel_mul_mv_id_q6_K_f32_nr2 | 3.41% | Peer-matched |
+| rms_norm_no_scale_f32_v2 | 3.41% | V2 ✓ iter-310 |
+| **moe_weighted_sum** | 3.41% | Embarrassingly parallel |
+| **moe_swiglu_batch** | 3.41% | Embarrassingly parallel |
+| fused_post_ff_norm2_endlayer_f32_v2 | 3.41% | V2 ✓ iter-362 |
+| kernel_mul_mv_q8_0_f32 | 3.41% | Peer-matched |
+| flash_attn_vec_reduce_dk256 | 2.84% | Already simd_sum (iter-103 design) |
+| kv_copy_kf16_quantize_v_no_fwht_d256 | 2.84% | iter-354 fused; V-stream uses simd_sum |
+| flash_attn_vec_hybrid_dk256 | 2.84% | iter-349 hf2q-unique; F16 K + TQ-HB V |
+
+**ALL V2-able kernels in gemma4 decode hot path are now V2.**  Embarrassingly-parallel kernels (fused_gelu_mul, moe_swiglu_batch, moe_weighted_sum) cannot benefit from V2 (no reduction to optimize) and float4 vectorization wouldn't help because Apple Metal coalesces scalar loads to the same 32-byte aligned chunks (SIMD ALU is per-FP32-cycle, not per-vec-cycle, on M-series).
+
+### FUSE_FWHT_PRE re-tested at HEAD (21st falsification)
+
+Per iter-340/iter-352 the `HF2Q_TQ_FUSE_FWHT_PRE=1` flag was last tested before iter-362+363's V2 ports landed.  Re-test at HEAD:
+
+```
+Legacy baseline:                 74.5 / 74.5 / 74.6 tok/s (mean 74.5)
+Legacy + HF2Q_TQ_FUSE_FWHT_PRE=1: 74.2 / 74.1 / 74.1 tok/s (mean 74.1) → -0.5%
+```
+
+Re-confirmed FALSIFIED.  21st falsification this thread.  The dispatch profile change from V2 ports (lower CPU cost per layer) didn't shift the verdict — FWHT-pre fusion still loses to the standalone dispatch on the Metal compiler's kernel scheduler.
+
+### Updated baseline at HEAD (post-iter-362+363 V2 ports)
+
+| Path | Pre-iter-362 | Post-iter-363 | Δ vs original 73.7 baseline |
+|---|---|---|---|
+| Legacy TQ-HB | 73.7 | **74.5** | **+1.1%** |
+| Hybrid F16-K | 75.5 | **76.6-76.8** (mean 76.6) | **+3.9% vs original 73.7** / +1.5% vs Phase-10-only |
+
+Hybrid 76.6 = **0.742× peer** (was 0.731× at iter-354).  Closes ~1.1pp on the 26.9pp gap.
+
+### Cumulative thread improvements (4 LANDED phases)
+
+| Phase | Δ at default |
+|---|---|
+| Phase 9 (BATCHED_PREFILL) | +4.4× chat throughput |
+| Phase 10 (hybrid F16-K + TQ-HB-V) | +2.4% decode (hybrid path) |
+| Phase 13 (fused_post_ff_norm2 V2) | +0.7% decode (both paths) |
+| Phase 13.2 (fused_moe_routing V2) | +0.3% decode |
+| **Cumulative decode (legacy)** | **+1.1%** (73.7 → 74.5) |
+| **Cumulative decode (hybrid)** | **+3.9%** (73.7 → 76.6) |
+
+### Honest status (post-iter-364)
+
+V2-port pattern formally exhausted in gemma4 decode hot path.  21 falsifications + 4 successful phases this thread.  The remaining ~26% peer gap is per-kernel GPU compute time on EXISTING dispatches (matmul, SDPA, KV-encode, embarrassingly-parallel kernels) that the Metal compiler has already optimized as much as it will without operator-supplied Apple Instruments trace data.
+
+**Path forward** (operator-decision-gated):
+- **Apple Instruments Metal trace** — requires operator-GUI; would identify remaining per-kernel hotspots
+- **Operator-approved structural change** (F32 V instead of TQ-HB V; breaks iter-326 RAM-mantra)
+- **Pivot to a different work area** (long-context bench, additional model coverage)
+- **Accept current 0.742× peer asymptote on gemma4 decode**
+
+### Tests + bench
+- mlx-native lib: 284/0 passing.
+- All V2 parity tests: 27/0 passing (25 rms_norm + 2 V2 fused_post_ff_norm2 + 2 V2 fused_moe_routing).
+- hf2q lib: 3454/0 passing.
+- No code change shipped this iter (audit + falsification only).
