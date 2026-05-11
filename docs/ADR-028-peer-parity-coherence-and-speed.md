@@ -21150,3 +21150,61 @@ memory housekeeping).
 1. FA_GL D=512 long-context kernel (only when pp>8K production)
 2. Multi-thread port (+2.2% decode)
 3. Decode 0.726× exhausted
+
+## iter-423 — decode rate vs KV cache size: ~7% degradation pp5 → pp4K
+
+### Hypothesis
+After Phase 15 LANDED (iter-415) + decode-neutral confirmed (iter-422),
+characterize how decode rate varies with prior KV cache size.  If
+decode degrades meaningfully at large prefix, that's a separate lever
+from per-iter optimization.
+
+### Method
+hf2q serve (Phase 15 default-on), 4 prompt sizes (5/50/200/800
+words), 2 reps each, 100-token decode via streaming.  Extract
+prefill_ms from "Batched prefill complete" log line; subtract from
+HTTP wall to isolate decode time.  Compute decode tok/s from token
+count emitted via SSE.
+
+### Results
+
+| pp size | Decode tok/s | vs pp5 |
+|---|---|---|
+| pp5 (~30 tok) | 71.4 ± 0.2 | baseline |
+| pp50 (~272 tok) | 71.1 (rep1) / 65.2 (rep2 early-stop) | -0.4% |
+| pp200 (~1066 tok) | 70.3 ± 0.1 | -1.4% |
+| pp800 (~4200 tok) | 66.6 ± 0.2 | **-6.6%** |
+
+### Interpretation
+Decode degrades modestly with prior KV cache size.  Decode reads grow
+linearly with prefix size (per-token attention reads K[0..pos] and
+V[0..pos] from KV cache).  At pp4K, KV cache K+V global = 4200 × 512
+× 2 × 5 × 4B ≈ 86 MB; sliding K+V = bounded at sliding_window=1024.
+86 MB fits in L2 cache (M5 Max has ~24-48 MB L2 + huge L3) but
+imposes some bandwidth pressure.
+
+The 7% degradation matches roughly what would be expected from KV
+read bandwidth growing linearly while compute per-token is fixed.
+
+### vs peer
+Peer's decode also degrades with KV size (not measured here; would
+need a custom probe since llama-bench separates pp + tg).  Both
+suffer similar physics.  The key finding is that hf2q's degradation
+is bounded — not catastrophic.
+
+### Lever assessment
+~7% degradation across the realistic chat range (pp ≤ 4K) is not
+a high-leverage probe.  TQ-HB (3.94× memory savings) would help
+this if global K wasn't already bounded — but global is the layer
+type that DOES use F32 cache, while sliding uses TQ-HB.  Sliding
+is bounded by sliding_window=1024 so degradation only comes from
+global layers' KV growth.
+
+### Investigation count this thread
+80 total: 79 from iter-422 + this iter (decode-vs-KV-size
+characterization).
+
+### No new lever identified
+Same six rows in operator decision matrix; no actionable change.
+This is a characterization measurement that confirms decode is
+not catastrophically affected by long context.
