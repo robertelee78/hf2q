@@ -16473,3 +16473,75 @@ The 27% peer gap on gemma4 decode requires Apple Instruments Metal trace to loca
 - All rms_norm parity: 25/0 passing.
 - hf2q lib: 3454/0 passing.
 - Bench restored to baseline: hybrid 74.9-75.5 tok/s (within noise of 75.5 iter-354 baseline).
+
+## iter-362 — Phase 13 LANDED: fused_post_ff_norm2_endlayer V2 default-on (+0.7%)
+
+### Date
+2026-05-10
+
+### Hypothesis
+Per iter-352 dispatch breakdown, `fused_post_ff_norm2_endlayer_f32` is 3.41% of decode dispatches but had NEVER received the V2 (float4 + simd_sum) treatment that iter-310 applied to the basic rms_norm.  Reading the kernel revealed it does TWO tree reductions per dispatch with `log2(tg_size)=8` barriers each (16 barriers per dispatch at tg=256 vs V2's 4).  At 30 dispatches/decode-token: 480 unnecessary barriers.
+
+V2 rewrite: float4 loads + simd_sum + per-simdgroup partial-sum staging (mirrors `rms_norm_f32_v2` structural pattern from iter-310).  Same math; reductions only differ by accumulation order.
+
+### Result LANDED
+
+#### Parity (byte-identical)
+```
+test_fused_post_ff_norm2_endlayer_v2_parity:
+  scalar broadcast: mlp max_abs=0.0e0 max_rel=0.0e0 | hidden max_abs=0.0e0 max_rel=0.0e0
+  scalar vector:    mlp max_abs=0.0e0 max_rel=0.0e0 | hidden max_abs=0.0e0 max_rel=0.0e0
+```
+**MAX-ABS = 0.0** on both fixtures at gemma4 hidden_dim=3584.  Bit-identical math even with different reduction order.
+
+#### Bench (gemma4-ara-2pass-APEX-Q5_K_M, M5 Max, p50 across 3 trials, deterministic temp=0)
+
+| Path | Pre-iter-362 | Post-iter-362 (V2 default-on) | Δ |
+|---|---|---|---|
+| Legacy TQ-HB | 73.7 tok/s | **74.3-74.6** (mean 74.2) | **+0.7%** |
+| Hybrid F16-K | 75.5 tok/s | **75.9-76.3** (mean 76.0) | **+0.7%** |
+
+#### Coherence (preserved)
+- Legacy `"What is 2+2?"` → `"2 + 2 = 4<turn|>"` — bit-identical to pre-V2.
+- Hybrid `"What is 2+2?"` → `"2 + 2 = 4<turn|>"` — bit-identical.
+
+### Files added (mlx-native)
+- `/opt/mlx-native/src/shaders/rms_norm.metal`: append `fused_post_ff_norm2_endlayer_f32_v2` kernel (~120 LOC).  Same buffer layout + same `FusedPostFFNorm2EndlayerParams` struct as V1; only the reductions change (simd_sum + per-SG staging).  Phase 3 (final write) optimized into vectorized float4 path with branch on `scalar_is_vec`.
+- `/opt/mlx-native/src/kernel_registry.rs`: register the new kernel.
+- `/opt/mlx-native/tests/test_fused_post_ff_norm2_endlayer_v2_parity.rs`: 2 parity tests (scalar broadcast + per-channel scalar vector) at gemma4 hidden=3584.
+
+### Files modified
+- `/opt/mlx-native/src/ops/rms_norm.rs`: V2 dispatcher path, default-ON via `env_default_true("HF2Q_FUSED_POST_FF_NORM2_V2")`.  Opt-out via `=0` / `=false` / `=off`.  Shared-memory budget reduced from `tg_size * 4` (V1 tree reduction) to `(tg_size / 32) * 4` (V2 per-SG only).
+
+### Phase 13 status
+
+Iter-359 originally proposed Phase 13 as "GPU-side argmax + speculative pre-encoding" but iter-356 falsified that at +0.5%.  This iter REPURPOSES Phase 13 as the V2-norm fusion port — directly analogous to Phase 7's V2-norm work (iter-310/331/337/338) but on a kernel iter-217 had introduced AFTER those V2 ports landed (it was missed in the V2 sweep).
+
+### Cumulative thread improvements
+
+| Phase | Iters | Δ at default | Status |
+|---|---|---|---|
+| Phase 9 (BATCHED_PREFILL default-on) | iter-344 | +4.4× chat throughput | LANDED |
+| Phase 10 (hybrid F16-K + TQ-HB-V) | iter-346..354 | +2.4% decode (hybrid path) | LANDED |
+| Phase 13 (fused_post_ff_norm2 V2) | iter-362 (this) | +0.7% decode (both paths) | LANDED |
+| **Cumulative** | — | **+3.1% decode + 4.4× chat** | — |
+
+### Tests + bench
+- mlx-native lib: 284/0 passing.
+- New parity tests: 2/0 passing (byte-identical).
+- mlx-native rms_norm parity tests: 25/0 passing.
+- hf2q lib: 3454/0 passing.
+- Coherence verified on smoke prompts.
+
+### Next iter direction
+
+Iter-362's success — finding a kernel iter-310's V2 sweep MISSED — suggests one more concrete audit may be productive: scan ALL dispatchers in `mlx-native/src/ops/` for `tree-reduction + tg_size shared mem` pattern and check which ones haven't received the V2 treatment.  Each candidate that exists is a +0.5-1.5% win like this one.
+
+Possible candidates from the iter-352 dispatch breakdown:
+- `fused_norm_add_f32_v2` — already V2 (iter-331)
+- `fused_head_norm_rope_f32_v2` — already V2 (iter-337)
+- `rms_norm_f32_v2` + `rms_norm_no_scale_f32_v2` — already V2 (iter-310)
+- `fused_post_ff_norm2_endlayer_f32_v2` — **THIS ITER** (iter-362)
+- Other fused-norm variants (e.g., `fused_post_attn_triple_norm_f32` if present, `rms_norm_f32_triple` if present) — TBD audit
+
+If 2-3 more candidates exist, cumulative could climb to +5-6% decode.  Real path forward.
