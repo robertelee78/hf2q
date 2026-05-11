@@ -19605,3 +19605,48 @@ pattern.
 
 ### Investigation count this thread
 59 total: 58 from iter-401 + this iter (consistency improvement).
+
+## iter-403 — short indexing in Q5_K mv kernel
+
+### Date
+2026-05-10
+
+### Goal
+Apply iter-401/402's int→short indexing pattern to Q5_K mv kernel.  Per peer
+source (ggml-metal.metal:7873-7880), peer uses `short` for tid/ix/iq/ir/l0/q_offset/y_offset.
+Our Q5_K mv used `int`.
+
+### Implementation
+
+`kernel_mul_mv_q5_K_f32` (line 903-1010):
+- 6 const decls changed `int` → `short` (matching peer)
+- Inlined `n = 8` constant: 2 loops `for (l = 0; l < n; ++l)` updated to
+  `for (l = 0; l < 8; ++l)` (compile error from removed `n` decl)
+
+### Verification
+
+- Build clean (after fixing 2 loops referencing removed `n`).
+- mlx-native lib + quantized_matmul tests: 9/9 PASS.
+- Coherence: gemma4 "What is 2+2?" → " + 2 = 4<turn|>" intact.
+- Bench (5-trial mean): **74.90 tok/s** (matches iter-402, within noise).
+
+### Conclusion
+Same as iter-401/402 — code-quality consistency, perf-neutral.  All 3 main
+mv kernels (Q6_K NR2, Q6_K_ID NR2, Q5_K) now use peer's idiomatic short
+indexing pattern.
+
+### Lesson learned
+
+When removing a const decl (`n = 8`), grep for ALL references in the file
+before commit — kernel-internal loops `for (l = 0; l < n; ++l)` would fail
+at runtime (Metal shader compile error) but BUILD-time appears clean.
+The bench output's stray text was the runtime kernel-compile error
+bubbling up.
+
+### Tests + bench
+- mlx-native lib: 290/0 + quantized_matmul 9/9 PASS.
+- hf2q lib: 3454+2 passing.
+- Coherence intact.
+
+### Investigation count this thread
+60 total: 59 from iter-402 + this iter (Q5_K alignment).
