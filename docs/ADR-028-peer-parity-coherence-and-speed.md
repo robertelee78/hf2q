@@ -20060,3 +20060,92 @@ Same six rows as iter-408/iter-409.  Updated reference numbers:
 The two-decimal-place revision does not change any operator decision
 about which lever to pursue; the per-iter avenue remains formally
 exhausted.
+
+## iter-411 — prefill gap re-measured: 2.0× peer slower (was tracked 1.6×)
+
+### Hypothesis
+Memory + iter-357 quoted "prefill 1.6× slower than peer" but we have
+not re-measured prefill at HEAD throughout the iter-300+ thread.
+Decode optimization is formally exhausted; verify the prefill gap is
+still 1.6× or has moved.
+
+### Method
+Apples-to-apples on M5 Max,
+`gemma4-ara-2pass-APEX-Q5_K_M.gguf`:
+- `llama-bench -p N -n 0 -r {3,5}` for peer (build 9010, d05fe1d7d)
+- `hf2q generate --prompt <N-tok prompt> --max-tokens 1` for hf2q
+  (parses "Batched prefill complete" line)
+- Constructed N=413 prompt via repeated phrase, 3 reps each side
+
+### Results
+
+| Stack | pp size | tok/s | Ratio vs peer |
+|---|---|---|---|
+| **Peer** llama.cpp 9010 | pp512 | 3154.17 ± 39.50 | 1.000× |
+| **Peer** llama.cpp 9010 | pp1024 | 3147.02 ± 12.22 | 1.000× |
+| **Peer** llama.cpp 9010 | **pp413** | **2848.43 ± 25.51** | 1.000× |
+| **hf2q** HEAD | **413 tok** | **1449.5 ± 8.6** | **0.509×** |
+
+Apples-to-apples gap: **0.509× peer = 1.96× slower** (≈2.0×).
+
+### Reconciliation with memory
+Memory + iter-357 tracked "1.6× slower".  Today's empirical: **2.0×
+slower** (gap is 0.4× LARGER than tracked).  The discrepancy is
+likely:
+- iter-357's measurement was at a different prompt size or different
+  batched-prefill code path
+- Multiple iter-300+ work landed on decode but not prefill, possibly
+  drifting the prefill gap unintentionally
+- Or iter-357 was an estimate from a thinner measurement
+
+### Significance
+**This is the largest remaining gap vs peer for gemma4.**
+- Decode gap: 0.726× peer (1.38× slower) — formally exhausted
+- Prefill gap: 0.509× peer (1.96× slower) — UNINVESTIGATED at
+  iter-300+ HEAD
+
+Per operator mantra ("as fast as or faster than our peers" — does NOT
+restrict to decode), prefill is the logical next focus.  Per "no
+excuses tolerated", we cannot leave a 2× gap without investigation.
+
+### Why this is a fresh lane
+Decode hit GPU 93%-bound (iter-397) — kernel + family + barrier work
+exhausted.  Prefill executes through a DIFFERENT path:
+- Decode dispatches `flash_attn_vec_tq_hb` per token with seq_len=1
+- Prefill dispatches `flash_attn_prefill` (different kernel) over full
+  prompt + uses mm kernels (matrix-matrix) instead of mv (matrix-vec)
+- Path: `forward_prefill_batched.rs` (vs decode in `forward_mlx.rs`)
+
+Per `auto-memory: gemma_prefill_bitrot_2026_05_09`, the BATCHED_PREFILL
+path was a 35× improvement over the per-token default and currently
+ships at 1.03× peer at pp1024 specifically for gemma4 — but the
+re-measurement above shows we're at 0.51× peer at pp413, so either:
+1. The 1.03× was at pp1024+ scale only, with sub-1× at smaller scales
+2. Drift since 2026-05-09 due to other landings
+3. My measurement methodology vs llama-bench differs in a load-bearing
+   way (need to verify next iter)
+
+### Action
+Open prefill investigation lane.  Next iter: (a) verify hf2q ALSO at
+pp1024 to check the auto-memory's 1.03× claim, (b) read peer's
+prefill mm kernel dispatch path for comparison, (c) bucket-dump
+prefill dispatches (need to add MLX_DISP_BUCKET dump to generate
+path, currently only in serve).
+
+### Investigation count this thread
+68 total: 67 from iter-410 + this iter (prefill gap re-measure,
+opens new lane).
+
+### Operator decision matrix (UPDATED — prefill promoted)
+
+| Lever | Predicted | Empirical | Cost |
+|---|---|---|---|
+| **Prefill optimization** | UNINVESTIGATED | **0.509× peer** | TBD |
+| Multi-thread port | +2.2% (iter-397) | unmeasured | 5-8 iters/focus |
+| StorageModePrivate | 0.07-0.68% (iter-396) | unmeasured | 1-2 days |
+| Apple Instruments trace | identify hotspots | unmeasured | operator GUI |
+| Pivot to qwen35 | UX claim | 1.34× peer | varies |
+| Accept current decode 0.726× | — | confirmed | — |
+
+**Prefill jumps to top of decision matrix as the largest gap +
+freshest unworked lane.**
