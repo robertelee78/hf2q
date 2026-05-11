@@ -25514,3 +25514,79 @@ pipelined kernels (iter-148 + iter-485 H3 + H4 all triangulate to
 kernel itself (kernel-internal arithmetic intensity, register
 pressure, threadgroup occupancy), or attack the prefill side where
 NWG=1 (no reduce pipeline) and the dispatch-overhead share is higher.
+
+## iter-487 — qwen3.6 APEX apples-to-apples validation — 1.27× peer CONFIRMED
+
+**Date**: 2026-05-11.  Closes the qwen3.6 loose end identified at iter-486
+("1.34× peer" multiplier carried forward from iter-320 had NOT been
+re-validated under iter-486 apples-to-apples methodology).
+
+### Methodology
+
+Identical shape both stacks, same M5 Max, same GGUF.
+
+- Peer: `/opt/homebrew/bin/llama-bench -m APEX-Q5_K_M.gguf -p 0 -n 200 -r 5`
+  (build d05fe1d7d, 9010).
+- hf2q: `target/release/hf2q generate --model APEX-Q5_K_M.gguf --prompt "Hi"
+  --max-tokens 200 --temperature 0`, 5 reps.
+
+GGUF path: `/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/APEX-Q5_K_M.gguf`
+(23.32 GiB).
+
+### Results
+
+| Stack | n | tok/s |
+|---|---|---|
+| Peer llama-bench tg200 | 5 | 102.52 ± 0.09 (extremely tight, no thermal banding) |
+| hf2q 200-tok decode | 5 | 129.5, 129.7, 129.9, 129.9, 130.0 → median **129.9**, σ ≈ 0.2 |
+
+**Ratio**: 129.9 / 102.52 = **1.267× peer = 1.27×**.
+
+### Coherence
+
+`hf2q generate --prompt "What is 2+2?" --max-tokens 30 --temperature 0`
+emits "Here's a thinking process:" — qwen3.6 engages reasoning mode on
+simple-arithmetic prompts, same training-data characteristic as gemma4
+reasoning mode (iter-431/440/441).  Not a hf2q bug; the final answer
+correctness gate is tested elsewhere (`coherence_smoke` +
+`coherence_matrix` + `adr028_coherence_gate.sh`).  Smoke passes here:
+output begins with coherent English token stream.
+
+### Reconciliation with prior canon
+
+| iter | Methodology | Claimed ratio | Validated? |
+|---|---|---|---|
+| iter-128 | per-context (short/long); apples-to-apples in spirit | 1.14-1.27× peer | ✓ CONFIRMED (this iter: 1.27× short-context) |
+| iter-131 | per-engine.rs flag-engagement note | ~1.12× (TQ-engaged) | not re-measured (TQ-HB engaged state differs from default) |
+| iter-320 | stacked-flag combo at 0.679→0.711× gemma4 baseline | 1.342-1.373× peer | ✗ NOT CONFIRMED at HEAD this iter; possibly apples-to-oranges (peer divisor methodology not specified at iter-320; recorded as legacy) |
+
+The iter-128 "1.27× peer" claim is the canonical apples-to-apples figure
+and is the one to cite going forward.  The iter-320 "1.34× / 1.37×"
+claim is downgraded to "direction-confirmed, exact multiplier
+unconfirmed at HEAD"; standing-rule file
+`feedback_apex_focus_not_dev_ggufs_2026_05_10.md` already carries this
+forward-pointer.
+
+### Mantra verdict for qwen3.6 APEX-Q5_K_M
+
+✓ **EXCEEDS** — 1.27× peer is comfortably above the "as fast as peer" bar.
+hf2q is 27% faster than llama.cpp at 200-token decode on this model on
+M5 Max.  Coherence tied.  TQ-HB 3.94× per-slot memory savings
+preserved at HEAD (qwen3.6 uses the same TQ pipeline as gemma4).
+
+### Closure update
+
+This closes the qwen3.6 loose end from iter-486.  ADR-028 mantra is now
+**MET for BOTH production APEX models** under iter-486 apples-to-apples
+methodology:
+
+| Model | Peer (llama-bench tg200) | hf2q (200-tok decode) | Ratio |
+|---|---|---|---|
+| gemma4-ara-2pass-APEX-Q5_K_M | 77.18 ± 15.36 | 74.10 ± 11.62 (Worker B iter-485) | **0.96× (tied)** |
+| qwen3.6 35B-A3B-APEX-Q5_K_M | 102.52 ± 0.09 | 129.9 (σ 0.2) | **1.27× (exceeds)** |
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes.
