@@ -19886,3 +19886,75 @@ No code change shipped.  Audit only.
 Per /loop "continue until complete" mantra, kernel-level peer-pattern
 alignment is now COMPLETE for the gemma4 hot path.  All small-index
 matmul kernels use `short`, all V2 reductions use `uint` (matching peer).
+
+## iter-408 — MLX_UNRETAINED_REFS=1 perf lever FALSIFIED at HEAD
+
+### Date
+2026-05-10
+
+### Goal
+Per encoder.rs:725 docstring claim ("saves ~3-5% on M-series GPUs"),
+test if `MLX_UNRETAINED_REFS=1` (peer's `commandBufferWithUnretainedReferences`
+pattern) yields measurable production gain at HEAD.
+
+### Caller contract verification
+Per docstring: "Every Metal buffer bound to a dispatch in this CB MUST
+outlive the CB's GPU completion."  Required pre-flip work: lifting all
+transient scratch from `device.alloc_buffer` to `pooled_alloc_buffer`.
+
+**Empirical**: enabled `MLX_UNRETAINED_REFS=1`; coherence intact:
+```
+$ MLX_UNRETAINED_REFS=1 hf2q generate --prompt "What is 2+2?"
+2 + 2 = 4<turn|>  ✓
+```
+
+No CB crash → caller contract is satisfied at HEAD (transients have been
+hoisted to pool over time).
+
+### Bench (gemma4 200-tok decode, 5-pair interleaved)
+
+| Trial | B (default, retained) | U (MLX_UNRETAINED_REFS=1) |
+|---|---|---|
+| 1 | 75.0 | 75.0 |
+| 2 | 75.0 | 75.0 |
+| 3 | 75.1 | 74.9 |
+| 4 | 74.9 | 74.9 |
+| 5 | 74.9 | 74.7 |
+| **mean** | **74.98** | **74.90** |
+
+Δ = **-0.11%** (within run-to-run noise σ ~0.10).
+
+### Conclusion: docstring's "3-5%" claim FALSIFIED at HEAD
+
+Possible reasons:
+- Claim was measured before iter-321 stack default-on (different baseline)
+- Apple's Metal driver may have closed the gap on retained-ref overhead
+- metal-rs binding may have evolved
+- Other optimizations (residency-set batching, etc.) may have already
+  captured similar wins
+
+### Action
+
+Default unchanged (`MLX_UNRETAINED_REFS` opt-in only).  Caller contract
+preserved.  Operator can opt in for niche scenarios but no measurable
+production gain expected.
+
+### Tests + bench
+No code change (env-flag probe only).  Coherence + bench verified.
+
+### Investigation count this thread
+65 total: 64 from iter-407 + this iter (unretained-refs falsification).
+
+### Operator decision matrix (refreshed)
+
+| Lever | Predicted | Empirical | Cost |
+|---|---|---|---|
+| Multi-thread port | +2.2% (iter-397) | unmeasured | 5-8 iters/focus |
+| Barrier reduction | +0.5% max (iter-400) | none found | multi-day |
+| StorageModePrivate | 0.07-0.68% (iter-396) | unmeasured | 1-2 days |
+| **MLX_UNRETAINED_REFS** | 3-5% (docstring) | **-0.11% (this iter)** | **FALSIFIED** |
+| Apple Instruments trace | identify hotspots | unmeasured | operator GUI |
+| Pivot to qwen35 | UX claim | already 1.34× peer | varies |
+| Accept current 0.730× peer | — | — | — |
+
+The MLX_UNRETAINED_REFS row joins 33 other falsified investigations.
