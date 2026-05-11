@@ -94,6 +94,30 @@
 > promising candidates remain `flash_attn_vec_tq_hb` (monolithic
 > attention) and `lm_head` (single dispatch over 262144 vocab).
 >
+> **iter-6 closing — FFI/encode-overhead hypothesis FALSIFIED via existing
+> bench**. `/opt/mlx-native/benches/bench_dispatch_overhead.rs` (ADR-028
+> iter-254) already tested this in March-2026; ran fresh today:
+> | shape | CPU-only/disp | GPU+sync/disp | CPU% |
+> |---|---:|---:|---:|
+> | Router_Q5K (n=128) | 0.19 µs | 4.82 µs | 3.8% |
+> | Q_sliding_Q5K (n=4096) | 0.19 µs | 12.81 µs | 1.5% |
+> | lmhead_Q6_K (n=262144) | 0.33 µs | 1059 µs | 0.0% |
+> hf2q's per-dispatch CPU encode is **0.19-0.33 µs** — negligible.
+> The 15 µs/dispatch avg (from production decode) is almost entirely
+> GPU + driver sync time, not Rust→Metal binding overhead.
+> Note: lm_head alone is **1.06 ms per call** = 8% of decode wall-clock;
+> peer faces the same shape and same GPU, so this is parity not gap.
+> The 3.6 ms/tok gap to peer must therefore be spread across the OTHER
+> ~882 dispatches at ~4 µs/dispatch differential each — concentrated in
+> specific kernel types that hf2q implements differently from peer.
+>
+> The investigation has reached the limit of what can be productively
+> done in 5-min /loop iterations. The remaining structural work
+> (per-pipeline µs histogram + flash_attn_vec_tq_hb decomposition into
+> 3-dispatch peer-style attention) is multi-iter scope appropriate for
+> a /cfa swarm with explicit operator approval — Codex in review-only
+> mode for peer-source audit while Claude implements + benches.
+>
 > --- (prior MISSION REOPENED note retained below for chronology) ---
 
 > **⚠ MISSION REOPENED 2026-05-11 (post iter-4 merge)**
