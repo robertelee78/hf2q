@@ -22254,3 +22254,66 @@ Production HEAD measurements match expected:
 ### No code change
 Verification only.  Confirms all LANDED phases still active.
 HYBRID_KV remains the singular toggle-only operator decision.
+
+## iter-440 — reasoning_content support audit: infra present, chat template doesn't engage
+
+### Hypothesis
+iter-431's A/B showed peer returned `reasoning_content` field with
+"* Initial state: 3 apples..." while hf2q returned `content: "1"`
+with no reasoning_content.  Investigate whether hf2q lacks the
+infrastructure or just doesn't engage it.
+
+### Method
+Grep `reasoning_content` across hf2q source, check gemma4 registry
+markers, verify SSE output split.
+
+### Findings
+
+**Infrastructure present**:
+- `engine.rs:418-433`: `reasoning_text: Option<String>` and
+  `reasoning_tokens: Option<usize>` fields on completion result
+- `sse.rs:53+`: `ChunkDelta` has `reasoning_content` slot, splitter
+  routes tokens into content vs reasoning via "Decision #21"
+- `registry.rs:2087-2096`: GEMMA4.has_reasoning() = true,
+  reasoning_open = `<|channel>`, reasoning_close = `<channel|>`
+- `chat_templates/qwen3-chatml.jinja:90-101`: input messages can
+  carry reasoning_content
+
+**Why peer emitted reasoning but hf2q didn't**:
+hf2q's gemma4 chat template (auto-applied) doesn't trigger the
+`<|channel>` reasoning emission for the iter-431 math prompt.
+Per `auto-memory: iter40_qwen36_chat_template_long_context_eos`,
+chat template behavior on these models has known nuance.
+
+Peer's llama-server applied a different default template that
+DOES trigger reasoning mode → model emitted "* Initial state...
+3 - 2 = 1." then `"1"` final answer.
+
+### Coherence quality implication
+On simple tasks (3-2=?), reasoning mode is verbose but reaches the
+same correct answer.  Both peer (with reasoning) and hf2q (without)
+returned `"1"` final answer.
+
+On HARDER problems (multi-step math, code reasoning), the absence
+of reasoning emission MIGHT degrade hf2q's accuracy.  Not measured
+in this thread.
+
+### Action — research lane (not a perf lever)
+hf2q's registration markers exist but the chat-template trigger
+doesn't fire.  Could be:
+1. Chat-template behavior (the user's prompt format determines if
+   the model thinks or answers directly)
+2. System prompt absent in hf2q (peer might inject one that triggers
+   thinking)
+3. GGUF chat-template metadata uses different defaults
+
+Not a single-iter probe to fix.  Operator-decision-gated whether
+reasoning-mode-by-default is desired (longer responses + higher
+latency vs more accurate answers on hard problems).
+
+### Investigation count this thread
+97 total: 96 from iter-439 + this iter (reasoning_content audit).
+
+### No code change
+Verification only.  Reasoning infra is present; chat-template
+engagement is per-prompt and operator-decision-gated.
