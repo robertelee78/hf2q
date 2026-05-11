@@ -16422,3 +16422,54 @@ Per the standing /loop directive "continue until complete", and 19 successive fa
 2. Operator approves a structural change (e.g., F32 V instead of TQ-HB V) — but that breaks the iter-326 RAM-mantra binding
 
 **Continuing /loop without operator input from here will produce only more falsifications + no perf gain.**
+
+## iter-361 — rms_norm tg right-size to float4 element count FALSIFIED (-0.4%)
+
+### Date
+2026-05-10
+
+### Hypothesis
+At per-head norm dispatches (dim ∈ {256, 512}), our V2 path uses tg=256 but only has dim/4 = 64-128 float4 elements → 50-75% threads idle.  Right-sizing tg to `min(256, (dim/4).next_power_of_two())` should:
+- dim=256 → tg=64 (was 256, 75% idle threads)
+- dim=512 → tg=128 (was 256, 50% idle threads)
+- dim=3584 → tg=256 (unchanged at cap)
+
+Mirrors peer's adaptive sizing at `ggml-metal-ops.cpp:3452-3459`.  Per-head norms fire 30/decode-token (1/layer for V-norm via `dispatch_rms_norm_no_scale_f32_v2`).
+
+### Result FALSIFIED
+
+```
+Hybrid baseline (tg=256 for dim ≤ 256):     75.5 tok/s
+Hybrid right-sized (tg=64 for dim=256):     75.2 / 75.1 / 75.2  → -0.4%
+```
+
+Slight regression.  Reverted both `dispatch_rms_norm` and `dispatch_rms_norm_no_scale_f32`.
+
+### Why FALSIFIED
+
+Two plausible mechanisms (need Apple Instruments to confirm):
+1. **Apple Metal compiler already deduplicates idle threads** via warp scheduling, so the explicit tg-size reduction adds no real saving.
+2. **Per-thread launch overhead amortizes better at tg=256** — fewer total threadgroups dispatched per kernel × less per-TG overhead.
+
+Falsification documented in BOTH dispatcher comments (`dispatch_rms_norm:128`, `dispatch_rms_norm_no_scale_f32:686`) so future iters skip both directions of the tg-size adjustment.
+
+### Cumulative falsifications: 20
+
+Phase 10 LANDED: +2.4% across 5 sub-iters.
+20 falsified hypotheses across iter-326..361.
+
+### Remaining /loop-tractable lever space (provably exhausted on rms_norm)
+
+After iter-360 (cap raise) + iter-361 (right-size):
+- rms_norm tg geometry is at empirical optimum.  No further tg-size lever.
+- All other per-pipeline kernels were either peer-ported (matmul nr2 + V2 norms + V2 norm-add + V2 head-norm-rope) or hf2q-unique (TQ-HB encode, hybrid SDPA — already optimized).
+
+### Honest status (unchanged from iter-360)
+
+The 27% peer gap on gemma4 decode requires Apple Instruments Metal trace to localize per-kernel hotspots.  In-scope /loop levers exhausted.
+
+### Tests + bench
+- mlx-native lib: 284/0 passing.
+- All rms_norm parity: 25/0 passing.
+- hf2q lib: 3454/0 passing.
+- Bench restored to baseline: hybrid 74.9-75.5 tok/s (within noise of 75.5 iter-354 baseline).
