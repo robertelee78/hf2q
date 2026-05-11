@@ -19172,3 +19172,104 @@ Private as available-when-multi-thread-port-completes.
 
 ### Investigation count this thread
 53 total: 52 from iter-395 + this iter (Shared overhead bench).
+
+## iter-397 — CRITICAL FINDING: GPU is the bottleneck, not CPU encoding
+
+### Date
+2026-05-10
+
+### Discovery via HF2Q_GROUP_STATS=1 + HF2Q_MLX_TIMING=1
+
+```
+[DUAL_BUFFER] split at layer 2 — buf0: 63 dispatches, 32 barriers
+[GROUP_STATS] dispatches=588 barriers=448 groups=448 ratio=1.31
+[TIMING] encode=0.55ms gpu_wait=12.54ms dispatches=930 barriers=452
+```
+
+Per-token breakdown at HEAD:
+- **CPU encoding wall**: 0.55-0.62 ms (4.1-4.6%)
+- **GPU wait wall**: 12.54-12.66 ms (93.0-93.8%)
+- Total: ~13.2 ms (matches 75 tok/s)
+- 930 dispatches/token (matches iter-308 940 estimate)
+- 452 Metal barriers/token (1 per ~2 dispatches)
+
+### Implication for multi-thread port
+
+The iter-386 synthetic bench predicted +5.8-11.7% gain.  But that bench
+used `commit_and_wait` per thread independently — INCLUDING GPU concurrency
+across thread workloads.
+
+**Production CANNOT get GPU concurrency from the multi-thread port** because:
+- buf0 (layers 0-N) and buf1 (layers N..29) commit in ORDER
+- GPU executes them serially due to commit ordering
+- Only CPU ENCODING can overlap
+
+Realistic production gain from multi-thread port:
+- CPU encoding currently: 0.6 ms/token (4.5% of wall)
+- Parallel split (50/50): ~0.3 ms/token
+- Saved: 0.3 ms = **2.2% absolute gain** (not 5-7%)
+
+### Operator decision matrix (REVISED)
+
+| Option | OLD predicted gain | NEW predicted gain | Cost |
+|---|---|---|---|
+| 1. Multi-thread port | +5-7% | **~+2.2%** | 5-8 iters or focus session |
+| 2. StorageModePrivate | 0.07-0.68% | 0.07-0.68% (unchanged) | 1-2 days |
+| 3. Prefill optimization | unknown | unknown | multi-day |
+| 4. Pivot to qwen35 | UX claim | UX claim | varies |
+| 5. Apple Instruments trace | identify hotspots | identify hotspots | operator GUI |
+| 6. Accept current 0.730×/0.749× peer | — | — | — |
+
+The multi-thread port's expected ROI is now significantly LOWER than
+previously estimated.
+
+### What ACTUALLY makes us slower than peer
+
+If GPU is 93% of token wall, and we're 0.730× peer, then the per-kernel
+GPU compute time is the dominant gap.  Per iter-369:
+- Ours: 14.7 µs/dispatch wall
+- Peer: 7.1 µs/dispatch wall
+
+Per iter-397 measurements: ours 13.7 µs/dispatch is GPU + 0.65 µs CPU.
+Peer's 7.1 µs/dispatch breakdown unknown (needs Apple Instruments).
+
+If peer's GPU per-dispatch is similar to ours (Apple hardware constant),
+then peer's 7.1 µs reflects faster CPU encoding via n_cb=2 multi-threaded
+encoding.  But our CPU encoding is ALREADY only 0.65 µs/dispatch — there's
+not much to save.
+
+So peer's advantage must be GPU-side: either faster kernels, fewer barriers,
+or better GPU utilization. iter-372 audit already confirmed our kernels
+match peer's. Per-dispatch GPU time difference is therefore in:
+- Apple GPU launch latency (per-dispatch fixed cost)
+- Memory access patterns
+- Or measurement methodology differences
+
+### Barrier count analysis
+
+452 barriers/token × ~0.5-1 µs each = 226-452 µs/token = 1.7-3.3% of wall.
+**Reducing barrier count is a real lever.** Each removed barrier saves
+0.5-1 µs.
+
+Hypothesis for iter-398+: audit `barrier_between` call sites for over-listed
+buffers (defensive) that cause spurious barrier triggers.
+
+### Tests + bench
+No code change this iter (instrumentation-only investigation).
+
+### Investigation count this thread
+54 total: 53 from iter-396 + this iter (CRITICAL bottleneck finding).
+
+### Recommendation revision
+
+Per "Measure 3x cut once" mantra, this finding refutes a key assumption
+of iter-380-396's multi-thread investment.  The realistic gain is ~2.2%
+not the 5-7% I'd been quoting.
+
+**Revised priority order for operator**:
+1. **Barrier count reduction** (NEW, iter-398): predicted 1-3% if
+   over-listed barriers found; small iter scope
+2. Apple Instruments trace: identify per-kernel hotspot ratio
+3. Multi-thread port: now ~+2.2% expected (lower than thought)
+4. StorageModePrivate: still 0.07-0.68%
+5. Accept current asymptote
