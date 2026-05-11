@@ -15722,3 +15722,90 @@ Net: the structural saving is real (and visible at +2.3%), but the GPU-side floo
 ### Next iter (10c.5)
 
 Fused F16-K-copy + V-no-FWHT-encode single kernel — drops 30 dispatches/decode-token by combining the per-layer K-copy + V-encode into one dispatch.  Per the +2.3% measured here (vs +6% theoretical for 60 dispatches), expected delta is +0.5-1%.  Smaller, but still in mantra-aligned scope.
+
+## iter-352 — Phase 11: FOR_UNROLL micro-port FALSIFIED + peer ground-truth re-confirmed
+
+### Date
+2026-05-10
+
+### Context
+Phase 10c-e.5 closed with +2.3% cumulative gemma4 decode (73.5 → 75.2 tok/s).  Per the iter-308 deep-research, the structural gap is per-dispatch wall (2.07× peer despite our dispatch count being 1.54× lower).  Dispatch-elimination work has hit diminishing returns.  This iter pivots to per-kernel-cost: pick the highest-volume kernel and look for any peer micro-optimization we missed.
+
+### Per-pipeline data refresh at HEAD with hybrid path active
+
+```
+[MLX_DISP_BUCKET] Per-pipeline breakdown (52 unique pipelines, total=180934):
+  35025  (19.36%)  kernel_mul_mv_q6_K_f32_nr2          ← top opportunity
+  30080  (16.62%)  rms_norm_f32_v2                     ← V2-ported iter-310
+  11940  ( 6.60%)  fused_head_norm_rope_f32_v2         ← V2-ported iter-337
+   9950  ( 5.50%)  hadamard_quantize_kv_fast_d256      ← SIMD-optimal iter-339
+   6000  ( 3.32%)  hf2q_dense_mm_f32_f32_tensor
+   6000  ( 3.32%)  fused_gelu_mul
+   6000  ( 3.32%)  fused_norm_add_f32_v2               ← V2-ported iter-331
+   5970  ( 3.30%)  kernel_mul_mv_q8_0_f32              ← matches peer
+   5970  ( 3.30%)  kv_cache_copy_batch_f32_to_f16      ← NEW under hybrid (Phase 10e)
+   5970  ( 3.30%)  kernel_mul_mv_id_q6_K_f32_nr2       ← already nr2-ported iter-321
+   5970  ( 3.30%)  fused_post_ff_norm2_endlayer_f32
+   5970  ( 3.30%)  moe_swiglu_batch
+   5970  ( 3.30%)  moe_weighted_sum
+   5970  ( 3.30%)  rms_norm_no_scale_f32_v2
+   5970  ( 3.30%)  fused_moe_routing_f32
+   5850  ( 3.23%)  kv_quantize_v_no_fwht_d256          ← NEW from iter-351 Phase 10e.5
+   4975  ( 2.75%)  flash_attn_vec_reduce_dk256
+   4975  ( 2.75%)  flash_attn_vec_hybrid_dk256|50:i8   ← NEW from iter-349 Phase 10d
+   1990  ( 1.10%)  hadamard_quantize_kv_fast_d512
+   ...
+```
+
+Total: 180934 dispatches / 200 decode tokens = **905 dispatches/tok** at HEAD with hybrid (was 920 before Phase 10).  Net Phase 10 dispatch reduction = **15/tok**, not the 60 I predicted at iter-351.  Math correction: legacy = 5 dispatches/layer (FWHT-pre + SDPA + reduce + FWHT-undo + dual encode); hybrid = 4 dispatches/layer (F16-K-copy + V-no-FWHT-encode + SDPA + reduce).  Saved 1/layer × 30 layers = 30/tok, but reduce kernel still fires; effective measured saving = 15/tok.
+
+### Peer ground-truth re-confirmed
+
+```
+$ llama-bench -m gemma4-ara-2pass-APEX-Q5_K_M.gguf -p 0 -n 200 -r 2
+| model               | size      | params | backend  | threads | test  | t/s            |
+| gemma4 26B.A4B Q6_K | 19.15 GiB | 25.23B | BLAS,MTL | 6       | tg200 | 103.33 ± 0.42  |
+```
+
+Peer = **103.33 tok/s**.  Our HEAD (hybrid) = 75.0 tok/s = **0.726× peer**.  Gap = 28.3 tok/s = 27%.  Note: peer ALSO recognizes this as "Q6_K dominant" not Q5_K (matches our load banner).  No measurement bias — same model, same hardware (M5 Max).
+
+### Hypothesis tested + FALSIFIED
+
+**H1**: Add `_Pragma("clang loop unroll(full)")` to the inner `for (l = 0..4)` loops in `kernel_mul_mv_q6_K_f32_nr2` and the `_id` variant, mirroring peer's `FOR_UNROLL` macro at llama.cpp ggml-metal.metal:8035.  Expected delta: +1-3% if Apple Metal's auto-unroll wasn't already optimal.
+
+**Result**: -0.2 to -0.4 tok/s (legacy 73.5 → 73.1; hybrid 75.2 → 75.0).  **FALSIFIED.**
+
+Reverted both edits.  Updated kernel comments to record the falsification so future iters don't re-attempt.
+
+### Why it didn't help
+
+Apple Metal's compiler (clang-derivative) auto-unrolls small fixed-count loops as a default optimization.  The explicit `_Pragma("clang loop unroll(full)")` adds an extra hint but, in our case, appears to have hurt register allocation slightly — likely because the auto-unroller had already balanced register pressure against unroll-depth, and the forced full-unroll over-spilled live values.
+
+This adds another data point to the **`feedback_metal_compiler_auto_optimizes_static_levers`** memory: 11 prior peer-pattern levers also FALSIFIED at iter-100/118; FOR_UNROLL is now lever #12.  The pattern: "if the change is mechanical/syntactic, the Metal compiler probably did it already, AND may regress when forced".
+
+### Open levers (not yet tried this thread)
+
+After 12 falsifications, the remaining levers all look more structural:
+
+1. **simdgroup_matrix on quantized matmul** — peer's mul_mm path uses `simdgroup_half8x8` matrix instructions for prefill; decode uses scalar mul_mv.  Could simdgroup_matrix work for nr0=8 mul_mv?  Needs deep peer-impl read.
+2. **MoE routing fusion** — peer dispatches per-expert; we batch.  Per iter-339 our batched is FASTER for decode.  No lever.
+3. **F16 V (drop TQ-HB on V)** — would close most of the residual gap but at coherence cost.  Operator iter-326 RAM-mantra binding rejects this.
+4. **Apple Instruments Metal trace** — operator-GUI; can identify per-kernel hotspots.  Out of /loop scope.
+
+### Files modified
+
+- `/opt/mlx-native/src/shaders/quantized_matmul_ggml.metal`: added FOR_UNROLL, then reverted; comment captures the test+result.
+- `/opt/mlx-native/src/shaders/quantized_matmul_id_ggml.metal`: same.
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+### Tests + bench
+
+- mlx-native lib: 284/0 passing (no regression).
+- q6_K mv parity tests: 4/0 + 4/0 passing (revert clean).
+- gemma4 decode bench unchanged from iter-351 baseline:
+  - Legacy 73.1 tok/s (within noise of 73.5)
+  - Hybrid 75.0 tok/s (within noise of 75.2)
+
+### Next iter
+
+Either attempt structural lever #1 (simdgroup_matrix mul_mv exploration — multi-week scope), or capture Apple Instruments trace to localize per-kernel hotspots (requires operator GUI).  Phase 10c.5 (fused F16-K-copy + V-encode) remains open as a smaller iteration; per iter-351 measured ~0.7 µs/dispatch saving × 30 = ~0.2-0.5% — not the highest-value next move.
