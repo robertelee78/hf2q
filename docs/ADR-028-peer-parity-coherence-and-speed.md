@@ -24382,3 +24382,57 @@ The long-gen pattern confirms iter-433's observation and shows the
 trend continues at very long N.  No new code lever identified.
 Both stacks operate within memory-bandwidth physics; the asymptotic
 convergence is fundamental.
+
+## iter-474 — HYBRID_KV re-bench at HEAD: +2.0% (refined from iter-435's +3.3%)
+
+### Hypothesis
+iter-435 measured HYBRID_KV at +3.3% with 3-rep sample.  Re-bench
+with 5-rep tight at HEAD (post-iter-466/469 tokenizer default-on)
+to refine the canonical gain.
+
+### Method
+hf2q serve, max_tokens=128, T=0, 5 unique prompts each mode via
+streaming SSE.
+
+### Results
+
+| Mode | tok/s (5 reps) | mean ± std |
+|---|---|---|
+| **default** TQ-HB-K+V | 67.35 / 66.78 / 66.03 / 66.78 / 66.13 | **66.61 ± 0.46** |
+| **HF2Q_HYBRID_KV=1** | 69.01 / 67.49 / 67.70 / 67.65 / 67.98 | **67.97 ± 0.55** |
+| **Δ** | | **+2.0%** |
+
+### Reconciliation with iter-435's +3.3%
+iter-435 used 3-rep sample; iter-474 uses 5-rep tight.
+- iter-435 default mean: 66.74 ± 0.12 (small sample, low variance)
+- iter-435 HYBRID mean: 68.92 ± 0.71 (rep 1 outlier 69.12)
+- iter-474 5-rep means correct the +3.3% to **+2.0%**
+
+The 1.3 percentage-point difference is sample-size variance.  iter-474
+is the more reliable canonical number.
+
+### Refined operator tradeoff for HYBRID
+- Speed: **+2.0%** decode (refined from +3.3%)
+- Memory cost: 33% (3.94× → 2.65× per iter-447/448)
+- ROI: 2% / 33% = 0.06× — less attractive than previously documented
+
+The operator decision matrix should reflect the smaller speed gain.
+Default-on remains operator-decision-gated, but the case is now
+weaker (~half the speed benefit at the same memory cost).
+
+### Investigation count this thread
+131 total: 130 from iter-473 + this iter (HYBRID re-bench).
+
+### Operator decision matrix (refined HYBRID)
+| Lever | Effect | Cost |
+|---|---|---|
+| Phase 15 default-on | ✓ shipped | 0 |
+| HF2Q_TOKENIZER_GGUF_EMBEDDED default-on | ✓ shipped (iter-469) | 0 |
+| **HYBRID_KV** | **+2.0% decode (refined)** | **33% memory** |
+| mmap zero-copy startup | -1.5-2s startup | multi-iter mlx-native |
+| Multi-thread decode | +2.2% (similar to HYBRID) | 5-8 iters |
+| FA_GL F8 K | ~50% pp16K | multi-iter |
+
+Note: HYBRID_KV (+2.0%) and Multi-thread (+2.2%) are now within noise
+of each other.  Multi-thread has 0 memory cost vs HYBRID's 33%.  If
+operator prioritizes RAM mantra, multi-thread becomes more attractive.
