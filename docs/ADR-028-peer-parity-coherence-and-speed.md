@@ -22616,3 +22616,55 @@ Not a single-iter probe; operator-decision-gated work.
 hf2q is at peer-parity for memory-management infrastructure.  The
 0.7× pure decode floor is genuinely structural; remaining work is
 all multi-iter operator-decision-gated.
+
+## iter-446 — simd_sum peer-parity (8th audit) + Phase 15 stability re-verified
+
+### Hypothesis
+Peer log: "simdgroup reduction = true".  Verify hf2q uses simd_sum
+in hot kernels.  Also re-verify Phase 15 default-on still works at
+HEAD (regression check).
+
+### Method
+- Grep simd_sum usage across hf2q shaders
+- Quick HTTP probe on Phase 15 default-on path
+
+### Findings
+
+**simd_sum usage**: 160 occurrences across hf2q shaders, including
+all major hot paths:
+- flash_attn_vec.metal, flash_attn_vec_hybrid.metal,
+  flash_attn_vec_tq_hb.metal, flash_attn_vec_tq.metal,
+  flash_attn_vec_tq_v2.metal
+- flash_attn_prefill_d512.metal
+- quantized_matmul.metal, quantized_matmul_ggml.metal,
+  quantized_matmul_id_ggml.metal
+
+**Peer-parity confirmed.**
+
+**Phase 15 stability re-verified at HEAD**:
+- HTTP wall (522-tok prompt + max=1 decode): 247.1 ms
+- Internal "Batched prefill complete": 519 tok in 205.3 ms = 2527 tok/s
+- Matches iter-415's original 2525 tok/s (within 0.1%)
+- Phase 15 default-on still correctly engaged
+
+### Cumulative peer-parity audits (8 across iter-419/425/426/429/437/444/445/446)
+| Optimization | Status |
+|---|---|
+| blk pre-pass tile skip (FA) | ✓ |
+| tensor_ops::matmul2d (Apple AMX) | ✓ |
+| BF16 K storage | ✓ |
+| Q-tile NQPSG=8/1 | ✓ |
+| C-tile NCPSG=64/32 | ✓ |
+| MTLResidencySet | ✓ |
+| StorageModeShared | ✓ |
+| **simd_sum / simdgroup_reduction** | **✓** |
+
+### Investigation count this thread
+103 total: 102 from iter-445 + this iter (simd_sum parity + Phase
+15 stability).
+
+### Production stability snapshot at HEAD
+- Phase 15 default-on: 2527 tok/s prefill at pp~520 (0.80× peer)
+- Coherence: TIED (iter-431 verified)
+- 0 LANDED phase regressions across 7 iters of audits
+- All operator-decision-gated levers documented
