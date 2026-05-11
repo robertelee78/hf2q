@@ -2727,8 +2727,12 @@ impl MlxModelWeights {
             // (94.3→98.7) with zero correctness impact (sourdough gate PASS).
             //
             // Override: HF2Q_DUAL_BUFFER=N (split after layer N, 0=disabled).
+            // ADR-028 iter-374: comma-separated list supported (e.g. "2,10,20").
             let dual_buffer_split: Option<usize> =
                 INVESTIGATION_ENV.dual_buffer_split(num_layers);
+            let dual_buffer_splits: Vec<usize> =
+                INVESTIGATION_ENV.dual_buffer_splits(num_layers);
+            let _ = dual_buffer_split;
 
             // --- 2. Transformer layers ---
             // Phase 3A: sub-layer detail dump (which specific layer to break down)
@@ -4589,9 +4593,11 @@ impl MlxModelWeights {
                 // - Threaded wait DURING encode:   -43 tok/s (thread spawn + Metal
                 //   cross-thread synchronization overhead on command queue)
                 // The async overlap without any wait is the correct approach.
-                if dual_buffer_split == Some(layer_idx + 1) {
+                // ADR-028 iter-374: multi-split — commit at any of the
+                // configured split points, not just the first.
+                if dual_buffer_splits.contains(&(layer_idx + 1)) {
                     let b0_barriers = s.barrier_count();
-                    let _b0_encoder = s.commit(); // commit buf0 → GPU starts async
+                    let _b0_encoder = s.commit(); // commit current buf → GPU starts async
                     s = exec.begin().map_err(|e| anyhow::anyhow!("dual-buffer begin: {e}"))?;
                     s.track_dispatch(&[], &[&self.activations.hidden]);
                     if INVESTIGATION_ENV.mlx_timing {

@@ -17455,3 +17455,66 @@ start unnecessarily.
 ### Investigation count this thread
 30 total: 29 from iter-372 + this iter (+0.18% landed + 8.3% concurrent
 dispatch quantification).
+
+## iter-374 — multi-split dual_buffer FALSIFIED vs single split=2 (31st investigation)
+
+### Date
+2026-05-10
+
+### Hypothesis
+iter-373 landed dual_buffer_split=2 (+0.18%).  Multiple split points (e.g.,
+"2,10,20" → 4 cmd_bufs) might increase CPU/GPU overlap further: each split
+commits the current cmd_buf, GPU starts processing while CPU continues
+encoding the next buf.
+
+### Implementation
+
+Extended `dual_buffer_split(num_layers) -> Option<usize>` with a new
+`dual_buffer_splits(num_layers) -> Vec<usize>` method that parses
+comma-separated env values like `HF2Q_DUAL_BUFFER=2,10,20`.  Updated
+forward_decode to commit at any of the configured split points.
+
+### Bench (gemma4-ara-2pass-APEX-Q5_K_M, 200-tok decode, iter-321 stack ON)
+
+4-cycle interleaved A/B/C bench:
+
+| Config | Run 1 | Run 2 | Run 3 | Run 4 | Mean | vs split=2 |
+|---|---|---|---|---|---|---|
+| split=2 (current default) | 74.9 | 74.8 | 74.7 | 74.8 | **74.80** | baseline |
+| split=2,10,20 | 74.8 | 74.7 | 74.7 | 74.8 | **74.75** | -0.07% |
+| split=2,15 | 74.9 | 74.7 | 74.8 | 74.8 | **74.80** | 0.00% |
+
+Single trials with more configurations:
+- "2,10": 74.9
+- "2,20": 74.9
+- "2,5,15,25": 74.9
+- "5,15,25": 74.5 (no early split — worse)
+
+### Root cause: extra commits add cost without buying overlap
+
+At split=2, GPU starts processing the first 2 layers' work (~13 ms / 30
+layers × 2 = ~0.9 ms of GPU work).  Meanwhile CPU encodes the remaining 28
+layers (~12 ms of CPU encoding work — GPU finishes buf0 before CPU finishes).
+Once GPU is processing buf0, CPU encoding has full overlap budget.
+
+Adding more splits doesn't help:
+- GPU is already saturated with buf0 by time CPU starts buf1
+- Each additional commit costs ~10-50 µs (Metal commit + new cmd_buf alloc)
+- The remaining 28 layers don't need further chunking — GPU absorbs them
+  serially after buf0 finishes
+
+### Action
+
+- Multi-split infrastructure KEPT (`dual_buffer_splits()` returns `Vec<usize>`,
+  forward_decode uses `.contains(...)`).  Operator can opt-in to multi-split
+  via `HF2Q_DUAL_BUFFER=2,10,20` for niche experimentation.
+- Default remains single split=2 (iter-373 LANDED).
+
+### Tests + bench
+- mlx-native lib: 287/0 passing.
+- hf2q lib: 3454/0 passing.
+- Coherence verified at multi-split configs ("2,15" → "2 + 2 = 4" intact).
+
+### Investigation count this thread
+31 total: 30 from iter-373 + this iter (parity ✓ infrastructure ✓ but no
+perf win — like iter-365/368/370).

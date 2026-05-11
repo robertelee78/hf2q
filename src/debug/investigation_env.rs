@@ -888,13 +888,39 @@ impl InvestigationEnv {
     /// the sweet spot — buf0 has 2 layers' worth of GPU work to overlap
     /// with CPU encoding the remaining 28 layers.  split=1 has too little
     /// work in buf0; split=5+ delays GPU start unnecessarily.
+    ///
+    /// ADR-028 iter-374 NOTE: this method returns the FIRST split point
+    /// for backward compatibility.  For multi-split support (3+ buffers),
+    /// use [`Self::dual_buffer_splits`] which returns `Vec<usize>` parsed
+    /// from comma-separated env values like `HF2Q_DUAL_BUFFER=2,10,20`.
     pub fn dual_buffer_split(&self, num_layers: usize) -> Option<usize> {
+        self.dual_buffer_splits(num_layers).first().copied()
+    }
+
+    /// Resolve all dual-buffer split points (sorted, unique, in-range).
+    ///
+    /// ADR-028 iter-374: multi-split support.  Each split point causes a
+    /// `commit()` and re-`begin()` of the encoder mid-forward.  Returns
+    /// empty Vec when fully disabled.
+    ///
+    /// Env parsing:
+    /// - Env unset → `vec![2]` (single default split, matches iter-373).
+    /// - Env set to a single int "N" → `vec![N]` if `0 < N < num_layers`.
+    /// - Env set to comma-separated "N1,N2,..." → sorted unique in-range.
+    /// - Env set to "0" or invalid → empty Vec (disabled).
+    pub fn dual_buffer_splits(&self, num_layers: usize) -> Vec<usize> {
         match self.dual_buffer_raw.as_deref() {
-            None => Some(2),
-            Some(v) => v
-                .parse::<usize>()
-                .ok()
-                .filter(|&n| n > 0 && n < num_layers),
+            None => vec![2],
+            Some(v) => {
+                let mut splits: Vec<usize> = v
+                    .split(',')
+                    .filter_map(|tok| tok.trim().parse::<usize>().ok())
+                    .filter(|&n| n > 0 && n < num_layers)
+                    .collect();
+                splits.sort_unstable();
+                splits.dedup();
+                splits
+            }
         }
     }
 
