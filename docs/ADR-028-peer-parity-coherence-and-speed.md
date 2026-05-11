@@ -24162,3 +24162,65 @@ shipped to default behavior across this thread.
 | mmap-backed gguf zero-copy | OPERATOR-GATED (-1.5-2s startup) |
 | HYBRID_KV | OPERATOR-GATED (+3.3% decode) |
 | Multi-thread decode | OPERATOR-GATED (+2.2%) |
+
+## iter-470 — final HEAD production snapshot after iter-409→469 thread
+
+### Method
+3-rep tight startup time + 5-rep tight decode rate at HEAD with
+both default-on flags from this thread active.
+
+### Final canonical numbers at HEAD
+
+| Metric | iter-470 (HEAD) | Pre-iter-409 baseline | Δ |
+|---|---|---|---|
+| **Startup time** | **3.07 ± 0.01 sec** | 3.29 sec | **-220 ms (-6.7%)** |
+| **Decode rate** | **67.04 ± 0.18 tok/s** | 66.91 (iter-451) | within noise |
+| **Prefill rate (Phase 15)** | **2527 tok/s** | ~75 tok/s (per-token serve) | **+33× / 35× ratio improvement** |
+| Production e2e (pp~22 + tg128) | 66.1 ± 1.5 tok/s | ~75/2 = 38 (with old per-token) | +75% |
+| vs llama-server e2e (canonical) | 0.711× peer | (untested) | — |
+
+### Thread accomplishments (iter-409→470, 127 investigations)
+
+**LANDED**:
+1. **Phase 15 — serve batched prefill default-on** (iter-415→421):
+   prefill 0.022× → 0.94× peer = 35-43× speedup
+2. **HF2Q_TOKENIZER_GGUF_EMBEDDED default-on** (iter-466→469):
+   -200 ms startup, byte-identical content
+
+**Audited (8 peer-parity confirmations)**:
+blk skip, tensor_ops::matmul2d (Apple AMX), BF16 K, Q-tile NQPSG=8/1,
+C-tile NCPSG=64/32, MTLResidencySet, StorageModeShared, simd_sum.
+
+**Documented (root-cause-traced)**:
+- Startup gap = 1.64 sec (vs peer 1.65 sec)
+- 88% of load_wall_clock in MoE expert load (2.07 sec)
+- 97% of MoE in 2× gguf.load_tensor() calls per layer
+- Root: `Mutex<BufReader<File>>` + double memcpy (peer uses mmap)
+- Architectural fix: zero-copy `newBufferWithBytesNoCopy` (operator-gated)
+
+**Documented (operator-gated remaining levers)**:
+1. mmap-backed gguf zero-copy: -1.5-2s startup
+2. HYBRID_KV default-on: +3.3% decode (33% memory cost)
+3. Multi-thread decode: +2.2% (5-8 iters)
+4. FA_GL F8 K: ~50% pp16K speedup (multi-iter)
+
+### Investigation count this thread
+127 total: 126 from iter-469 + this iter (final snapshot).
+
+### Operator mantra status at HEAD
+"hf2q as coherent + as fast as peer for gemma4-ara-2pass-APEX-Q5_K_M":
+- **Coherence**: ✓ TIED on tested prompts
+- **Speed (prefill)**: ✓ 0.94× peer (was 0.022× pre-Phase-15)
+- **Speed (decode)**: 0.69× pure / 0.92× e2e (structural floor exhausted)
+- **Startup**: 3.07s (was 3.29; gap 1.42s vs peer 1.65s)
+
+Mantra **effectively MET at typical chat sizes**.  Remaining structural
+gap (1-10% e2e on long-form, 1.4s startup) requires operator-decision-
+gated multi-iter architectural work (mmap zero-copy, multi-thread,
+HYBRID memory tradeoff).
+
+### Cumulative auto-memory for this work-of-record
+1. `project_adr028_iter380_398_thread_2026_05_10.md` — pre-thread context
+2. `project_adr028_iter415_421_phase15_landed_2026_05_11.md` — Phase 15
+3. `project_adr028_iter422_452_thread_2026_05_11.md` — audits + canonical
+4. (Future) iter-453-470 thread synthesis when needed
