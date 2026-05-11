@@ -20613,3 +20613,106 @@ flip `env_eq_one` to `env_default_true` at engine.rs:4587 + 7068.
 
 ### Investigation count this thread
 73 total: 72 from iter-415 + this iter (Phase 15 falsification).
+
+## iter-417 — batched-serve overhead curve: 32 ms (vs CLI generate 141 ms, vs peer 5 ms)
+
+### Hypothesis
+iter-413 measured 141 ms fixed prefill overhead in CLI generate path.
+iter-415's batched-serve uses the SAME forward_prefill_batched
+function — does it have the same overhead, or does serve's amortized
+process state reduce it?
+
+### Method
+Repeat iter-413's curve-fit but via HTTP + batched-serve mode.
+8 prompt sizes (1, 5, 10, 25, 50, 100, 400 words → 15-4022 tokens),
+3 reps each.  Parse internal "Batched prefill complete" wall (kernel-
+level) AND HTTP wall (curl wall, includes network + serialization).
+
+### Internal prefill timings (3-rep mean, in ms)
+
+| N tokens | T_internal (ms) | tok/s |
+|---|---|---|
+| 30 | 64.3 | 467 |
+| 32 | 66.3 | 483 |
+| 72 | 67.5 ± 1 | 1051 |
+| 122 | 80.7 ± 0.3 | 1500 |
+| 272 | 129.0 ± 0.5 | 2108 |
+| 522 | 206.3 ± 1 | 2528 |
+| 1022 | 368.4 ± 1 | 2774 |
+| 4021 | 1459.8 ± 4 | 2754 |
+
+### Linear fit
+- Anchor (272, 129) and (4021, 1460): slope = 0.355 ms/tok, intercept = 32.4 ms
+- **Model: T_internal(N) ≈ 32.4 + 0.355 × N (ms)**
+- Predicted at N=1022: 395 ms vs measured 368 ms (7% off — fit is good)
+
+### Comparison
+| Path | Fixed overhead | Per-tok |
+|---|---|---|
+| **Peer** (extracted from pp413+pp4013) | **~5 ms** | 0.347 ms |
+| **hf2q batched-serve** (this iter) | **~32 ms** | 0.355 ms |
+| hf2q CLI generate (iter-413) | 141 ms | 0.357 ms |
+
+**Serve overhead is 4.4× smaller than CLI generate** (141 → 32 ms),
+but still **6.4× larger than peer** (32 vs 5 ms).  Per-token cost is
+within 2.3% of peer.
+
+### HTTP wall analysis
+HTTP wall includes prefill + tokenization + first decode token +
+serialization + network:
+
+| N tokens | HTTP wall | Internal | HTTP overhead |
+|---|---|---|---|
+| 15 | 95 ms | 48 ms | +47 ms |
+| 522 | 248 ms | 206 ms | +42 ms |
+| 4021 | 1577 ms | 1460 ms | +117 ms |
+
+HTTP overhead grows with N (proportional to response payload size).
+At small N, HTTP layer adds ~45 ms.  At large N, ~120 ms.
+
+### What consumes the ~32 ms batched-serve overhead?
+Per Chesterton's fence — investigate before changing.  Candidates
+(from forward_prefill_batched.rs:534-700):
+1. **Mask construction**: `build_sdpa_mask_bf16` × 2 (sliding +
+   global) at lines 540-574+ — pure CPU work, scales with seq_len²
+2. **blk pre-pass dispatches**: 2 kernel dispatches for blk_sliding +
+   blk_global at lines 543-545
+3. **Buffer allocations**: pf_hidden, pf_residual, pf_norm_out,
+   pf_q/k/v, etc. at lines 399-415 — Metal MTLBuffer allocs
+4. **First decode token argmax setup**: lines 2155-2165 — single dispatch
+5. **Layer-loop CPU bookkeeping**: per-layer dispatch chains
+
+Per iter-413 candidates list (CLI generate); ~110 ms of the original
+141 ms must be CLI/JIT-specific (model-load amortization, pipeline
+JIT first compile) — already absorbed in serve.
+
+### Action — measurement only
+No code change.  Document the gap and candidates for iter-418
+instrumentation.  Per the operator decision matrix, this is a smaller
+lever than Phase 15 (already LANDED) but a real ~30 ms target.
+
+If 32 ms could be removed:
+- pp30 (small): 64 → 32 ms = 935 tok/s vs current 467 (+100%)
+- pp522: 206 → 174 ms = 3000 tok/s vs current 2528 (+18%) = **0.951× peer**
+- pp4021: 1460 → 1428 ms = 2818 tok/s vs current 2754 (+2.3%) = **0.955× peer**
+
+Most lever value is at small-to-medium prompts (pp~50-500), where
+overhead is still 10-30% of total wall.
+
+### Investigation count this thread
+74 total: 73 from iter-416 + this iter (overhead curve fit on
+batched-serve path).
+
+### Operator decision matrix (refined)
+
+| Lever | Predicted | Empirical | Cost |
+|---|---|---|---|
+| **Phase 15 LANDED (iter-415)** | 20-47× | 29-43× | ✓ shipped opt-in |
+| Default-on Phase 15 | unchanged perf, output trajectory shift | OPERATOR DECISION | trivial flip |
+| **Eliminate 32 ms batched-serve overhead** | 0.93→0.95× peer at pp4K, 0.80→0.95× at pp512 | candidate hunt needed | 1-3 iters instrument |
+| 16K prefill regression | 1947 vs 2550 peak | unaddressed | sliding-window TBI |
+| Multi-thread port | +2.2% decode | unmeasured | 5-8 iters |
+| Decode 0.726× | exhausted | confirmed | — |
+
+Phase 15 remains the dominant win.  Next-tier lever: 32 ms
+batched-serve overhead elimination.
