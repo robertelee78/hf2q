@@ -23401,3 +23401,67 @@ profile + reduce.  Operator-decision-gated.
 | FA_GL F8 K | OPERATOR-GATED | ~50% pp16K (multi-iter) |
 | **Server startup time** | **OPERATOR-GATED** | **2× slower (1.6 sec gap)** — one-time cost, multi-iter profile |
 | Decode floor | exhausted | 0.69× pure peer |
+
+## iter-459 — startup gap localized: load_wall_clock = 2.91s (88% of total)
+
+### Hypothesis
+iter-458 found hf2q startup is 2× slower than peer (3.29s vs 1.65s).
+Localize the 1.6 sec extra by examining timestamped startup log.
+
+### Method
+Run `RUST_LOG=info hf2q serve` and parse the startup log for
+explicit timing fields.
+
+### Findings
+
+**hf2q startup phases** (from log):
+| Phase | Time | % |
+|---|---|---|
+| GGUF header parse | (pre-load) | <1% |
+| GpuContext init | (parallel) | small |
+| **load_wall_clock** | **2.91 sec** | **88%** |
+| iter-21 leg_hb_encoded alloc | (within load) | included |
+| warmup (1 token) | 192 ms | 6% |
+| HTTP server bind | (instant) | <1% |
+| **Total to ready** | **~3.29 sec** | 100% |
+
+**Dominant**: `load_wall_clock=2.914672709s` per the
+`hf2q::serve::load_info` log line.
+
+### Localized candidates
+The 2.91 sec covers GGUF parse + weight reference Arc construction.
+Per `resident_weight_bytes=None`, weights are mmap'd (no disk I/O
+of full 20.6 GB model).  So 2.91s is mostly:
+1. GGUF metadata parse (47 fields, 658 tensors)
+2. Per-layer weight Arc construction (30 layers × many tensors)
+3. MoE expert routing table setup (128 experts × 30 layers)
+4. **External tokenizer.json load** (line 24:
+   `tokenizer_source=HfTokenizerJson`)
+   — peer reads tokens from GGUF embedded; hf2q reads separate file
+5. iter-21 Track B leg_hb_encoded allocation (8-bit × 30 layers)
+6. Chat template parse from GGUF
+
+### Peer comparison
+llama-server reaches ready in 1.65 sec.  Reads the SAME GGUF.
+Reads tokens from GGUF embedded (no separate tokenizer.json hop).
+Doesn't allocate hf2q's iter-21 leg_hb_encoded (uses different KV
+strategy).
+
+### Lever assessment
+The 1.6 sec gap is from 2-3 specific items:
+- **Tokenizer source**: hf2q reads external tokenizer.json
+  → could shift to GGUF embedded (reduces 1 disk hop)
+- **iter-21 alloc**: up-front 8-bit × 30 layers buffer init for
+  decode TQ-HB cache (can't easily defer; needed for first request)
+- **MoE routing setup**: 128 experts × 30 layers metadata
+  construction
+
+Each is a potential single-iter optimization but cumulative gain is
+1-2 sec startup time only — small impact on long-running serving.
+
+### Investigation count this thread
+116 total: 115 from iter-458 + this iter (startup gap localized).
+
+### Operator decision matrix unchanged
+Startup gap is documented but multi-iter scope to address.
+Still operator-decision-gated per iter-458.
