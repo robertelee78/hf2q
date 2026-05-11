@@ -10,6 +10,7 @@ pub mod cache;
 pub mod config;
 pub mod encoder_worker_singleton;
 pub mod forward_mlx;
+pub mod layer_ctx;
 pub mod forward_prefill;
 pub mod forward_prefill_batched;
 pub mod gpu;

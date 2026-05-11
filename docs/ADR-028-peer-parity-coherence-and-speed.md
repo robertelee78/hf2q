@@ -18649,3 +18649,76 @@ No code change this iter (verification only).
 
 ### Investigation count this thread
 46 total: 45 from iter-388 + this iter (verification only).
+
+## iter-390 — LayerCtx struct skeleton (multi-thread infra)
+
+### Date
+2026-05-10
+
+### Goal
+Per iter-389 plan, define the `LayerCtx` struct that bundles forward_decode's
+59 pre-loop `let` bindings used by the layer body.  This is iter-391's
+prerequisite for extracting the layer body into `encode_one_layer(&self,
+layer_idx, ctx, session, gpu)`.
+
+### Implementation
+
+NEW module `hf2q/src/serve/layer_ctx.rs` (~95 LOC).  Defines `LayerCtx<'a>`
+struct with documented field categories:
+
+1. **Token state**: seq_pos, input_token (passed to forward_decode)
+2. **Model constants**: num_layers, hidden_size, num_attention_heads, eps
+   (cached from self at fn entry)
+3. **KV-cache state**: `kv_info: &'a [(bool, u32, u32, u32)]` (per-layer
+   tuple computed in pre-loop)
+4. **Debug/dump flags**: dump_layers, dump_detail_layer, dump_sliding_l0,
+   dump_run_name (INVESTIGATION_ENV-derived, evaluated once)
+5. **Buffer-split config**: `dual_buffer_splits: &'a [usize]` (per iter-374
+   multi-split support)
+6. **Per-layer dispatch profiling**: per_layer_disp_enabled
+
+### Tests
+
+```
+test serve::layer_ctx::tests::layer_ctx_struct_compiles ... ok
+```
+
+Stub test confirms struct compiles + is constructible with realistic field
+values (30-layer kv_info, dual_buffer_splits=[2]).
+
+### NOT in this iter
+
+- `LayerCtx` is `#[allow(dead_code)]` — present in source tree but not yet
+  populated/used.
+- iter-391 will:
+  1. Add fields here as discovered during the actual layer-body extraction.
+  2. Build the struct in forward_decode's pre-loop section.
+  3. Replace each layer-body local-var reference with `ctx.X`.
+  4. Call `self.encode_one_layer(layer_idx, &ctx, &mut session, gpu)`.
+
+### Why this iter shipped a stub instead of full extraction
+
+Per "DO NOT BE LAZY ... measure 3x cut once" mantra: the 1848-LOC layer-body
+extraction is too big for a single 5-min /loop iter without high regression
+risk (e.g., iter-367 coherence regression took multiple iters to root-cause
++ fix).  Splitting into:
+
+- iter-390 (this): struct skeleton + field design — testable in isolation
+- iter-391: bundle 59 locals into ctx; move layer body verbatim into
+  encode_one_layer; preserve serial loop; verify coherence + bench
+- iter-392: split loop range across main + worker threads; bench A/B
+- iter-393: ship default-on if positive
+
+Each iter ships a discrete artifact + remains easily revertable.
+
+### Files added (hf2q)
+- `src/serve/layer_ctx.rs` (~95 LOC, struct + 1 stub test)
+- `src/serve/mod.rs` (+1 line: `pub mod layer_ctx`)
+
+### Tests + bench
+- mlx-native lib: 290/0 passing (no changes).
+- hf2q lib: 3454+1 passing (1 new struct compile-test).
+- hf2q production: unchanged (LayerCtx not yet wired).
+
+### Investigation count this thread
+47 total: 46 from iter-389 + this iter (struct skeleton).
