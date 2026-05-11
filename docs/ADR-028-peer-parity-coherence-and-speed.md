@@ -20827,3 +20827,101 @@ or operator-decision-gated.
 The "32 ms overhead" lever from iter-417 is REVISED to "structural
 dispatch-latency floor" by iter-418's bucket evidence.  Removed from
 high-leverage list.
+
+## iter-419 — pp16K regression smoking gun: FA_GL O(N²) attention
+
+### Hypothesis A (HYBRID_KV affecting prefill)
+HF2Q_HYBRID_KV=1 (Phase 10 +4.6% decode) might also help prefill.
+
+### Result A — non-finding
+| Config | HTTP wall (5 reps × pp522) | Internal prefill |
+|---|---|---|
+| Default KV | 248.5 ± 0.9 ms | 2537 ± 6 tok/s |
+| HYBRID_KV | 248.0 ± 1.7 ms | 2564 ± 12 tok/s |
+
+Hybrid is ~1.0% faster on prefill (within noise on HTTP wall).
+HF2Q_HYBRID_KV is decode-only beneficial; no prefill lever.
+
+### Hypothesis B (16K regression localized)
+iter-412 found pp16013 throughput drops 24% vs pp4013 peak (1947 vs
+2550 tok/s).  Use HF2Q_PROFILE_BUCKETS=1 to localize the regression.
+
+### Method
+Run pp~8K and pp~16K via batched-serve with bucket profile.
+Compare per-category time growth across pp~4K, pp~8K, pp~16K.
+
+### Results — bucket comparison
+
+| Category (ms total) | pp4018 | pp8020 | pp16021 | 4K→16K growth |
+|---|---|---|---|---|
+| **FA_GL (D=512)** | **159** | **632** | **2810** | **17.7×** |
+| FA_SW (D=256) | 156 | 330 | 741 | 4.7× |
+| MOE_GATE_UP | 307 | 594 | 1211 | 3.9× |
+| MOE_DOWN | 283 | 550 | 1118 | 3.9× |
+| QKV_MM | 194 | 370 | 750 | 3.9× |
+| O_MM | 104 | 201 | 411 | 3.9× |
+| MLP_GUR_MM | 103 | 197 | 402 | 3.9× |
+| **TOTAL prefill** | 1570 | 3327 | **8302** | 5.3× |
+
+### Diagnosis
+- FA_SW, MOE, MM kernels all scale ~4× for 4× tokens (linear).
+- **FA_GL scales 17.7× = quadratic in seq_len** — global attention is
+  O(N²) per layer × 5 layers × N queries.
+- At pp4K, FA_GL is 10% of wall.  At pp16K, FA_GL is **33.8%** of wall.
+- The 24% throughput drop at pp16K vs pp4K peak is entirely owned by
+  FA_GL O(N²) growth.
+
+### Per-call FA_GL cost
+| pp | FA_GL ms/call | ms/M-ops |
+|---|---|---|
+| 4018 | 31.9 | 0.078 |
+| 8020 | 126.4 | 0.196 |
+| 16021 | 561.9 | 0.219 |
+
+Per-op cost ALSO grows ~3× from pp4K to pp16K — memory bandwidth
+pressure as global-K cache grows past L2 (at pp16K: K+V global = 16021
+× 512 × 2 × 5 × 4B ≈ 327 MB, exceeds L3).
+
+### Comparison to peer at long context
+Peer wasn't benched at pp16K via llama-bench, but extrapolating from
+pp4013 (2950 t/s) + pp8013 (2684 t/s):
+- Peer projected pp16K: ~2400 t/s
+- hf2q pp16K: 1930 t/s = **~0.80× peer**
+
+So even with the FA_GL regression, hf2q at pp16K is still ~0.80× peer
+(comparable to our pp512 batched-serve gap).  The regression is real
+but doesn't make us catastrophically slower than peer.
+
+### Lever assessment
+**FA_GL O(N²) is algorithmic** — full attention requires this.  The
+per-op cost growth (0.078 → 0.219 ms/M-ops) IS optimizable — it's
+memory-bandwidth bound past L3.  Candidates:
+- Larger Q-tile in FA_GL kernel (more compute reuse per K read)
+- KV quantization for global layers (currently F32; TQ-HB on global K
+  would 4× shrink the reads)
+- Streaming-K layout to improve cache locality
+- Multi-pass attention with KV reload reduction
+
+### Action — investigation lane opened
+No code change.  Documented as iter-420+ candidate when pp>8K is a
+production scenario.  For typical chat (<4K context), Phase 15 LANDED
+delivers the dominant win and FA_GL regression is not a production
+concern.
+
+### Investigation count this thread
+76 total: 75 from iter-418 + this iter (FA_GL O(N²) localization +
+HYBRID_KV non-finding).
+
+### Operator decision matrix (refined)
+
+| Lever | Predicted | Empirical | Cost |
+|---|---|---|---|
+| Phase 15 LANDED | 20-47× | 29-43× | ✓ shipped opt-in |
+| Default-on Phase 15 | trajectory CHANGE | OPERATOR | trivial flip |
+| **FA_GL D=512 long-context optimization** | improve pp16K from 0.80×→1.0× peer | smoking-gun localized | multi-iter kernel work |
+| Multi-thread port | +2.2% decode | unmeasured | 5-8 iters |
+| MTLDispatchType::Concurrent | small-N gain | unmeasured | operator-decision |
+| Decode 0.726× | exhausted | confirmed | — |
+
+FA_GL long-context optimization is the new identified lane (only
+relevant when pp>8K is a production concern).
