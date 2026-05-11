@@ -1,20 +1,22 @@
 # ADR-029: gemma4-APEX-Q5_K_M Decode Gap — Measurement-Driven Root Cause
 
-- **Status**: amended (2026-05-11); original framing RETRACTED, iter-9 rewrite + iter-10/11 amendment (H12 FALSIFIED)
-- **Date**: 2026-05-11 (original) → 2026-05-11 (rewrite iter-9) → 2026-05-11 (amendment iter-10/11)
+- **Status**: 🎯 **CLOSED 2026-05-11 iter-18** — gemma4-APEX-Q5_K_M now at **1.009× peer** (98.6 vs 97.73 t/s, +22.6% over iter-13 HYBRID-default-on, +33.4% over pre-mission baseline)
+- **Date**: 2026-05-11 (original) → iter-9 rewrite → iter-10..16 thread → **iter-18 H26 mission close**
 - **Supersedes**: itself (the original "MoE pipeline IS the gap" framing was wrong; this rewrite replaces it)
-- **Decision-grade evidence**: per-layer GPU timestamps from `MTLCommandBuffer.GPUStartTime/GPUEndTime` in real production decode
-- **Tags**: performance, root-cause, gemma4, measurement-discipline, baseline-correction
+- **Decision-grade evidence**: per-layer GPU timestamps from `MTLCommandBuffer.GPUStartTime/GPUEndTime` in real production decode + 3-trial fresh-process benchmark at thermal steady state
+- **Tags**: performance, root-cause, gemma4, measurement-discipline, baseline-correction, peer-parity-achieved
 
 ## Decision (one sentence)
 
-The 25–32% decode-throughput gap between hf2q and llama.cpp on
-`gemma4-ara-2pass-APEX-Q5_K_M.gguf` (Apple M5 Max) is **distributed
-roughly evenly between attention (~51 µs/layer) and FFN (~58 µs/layer)
-on the per-layer GPU-time axis** — NOT concentrated in any single
-bucket. The dispatch-fusion lever class is exhausted; the actionable
-direction is **F16 KV cache for gemma4** (largest single known lever)
-followed by FFN sub-phase localization.
+**MISSION CLOSED iter-18** — gemma4-APEX-Q5_K_M decode now matches/beats
+llama.cpp peer (1.009× peer at thermal steady state) via TWO landed
+levers: (1) **iter-13** default-flip of `HF2Q_HYBRID_KV` (F16 K + TQ-HB V
+hybrid cache, +9.5% throughput, was ADR-028 Phase 10 gated off), and
+(2) **iter-18** route F32 m=1 matmul through `dispatch_dense_matvec_f32`
+(matrix-vector kernel) instead of `dense_matmul_f32_f32_tensor`
+(matrix-matrix tile kernel, 87.5% wasted at m=1), +22.6% throughput.
+Total: 73.9 → 98.6 t/s = **+33.4% over pre-mission baseline**, peer
+ratio 0.756× → 1.009×.
 
 ## How this ADR is grounded
 
@@ -156,6 +158,7 @@ overhead between them.
 | ~~H21~~ | ~~152 µs/layer fixed overhead is encoder-close/reopen cost~~ | ~~iter-17 deep-researcher H21~~ | **iter-17: HF2Q_DUAL_BUFFER sweep flat at ~80.5 t/s across single/multi-split configurations (=2 default, =5,10,15,20,25,29 sweep + multi-split 2,15 / 2,10,20 / 2,8,16,24 / 2,6,12,18,24 / 1,4,8,12,16,20,24,28). Default `vec![2]` is already optimal.** | **❌ H21 FALSIFIED — CB granularity exhausted** |
 | ~~H23~~ | ~~152 µs fixed overhead has 10-30 µs from routing dispatches~~ | ~~iter-17 deep-researcher H23~~ | **iter-17: HF2Q_SKIP_ROUTING=1 alone drops FFN_BODY by 176 µs (268 → 92 µs) — far more than 2 dispatches' worth of work. Mechanism: zero-init moe_expert_ids causes MoE kernels (still-emitted under SKIP_ROUTING) to read invalid expert slices = OOB or zero-read = fast-exit. Measurement INVALID — corrupts MoE input data.** | **🚨 H23 INVALID — dependency-corrupting skip-flag combo** |
 | ~~H25~~ | ~~Per-layer encoder commit forces GPU drain at each layer boundary~~ | ~~iter-17 deep-researcher H25~~ | **iter-17: HF2Q_DUAL_BUFFER=0 (single-CB, all 30 layers): 76.7 t/s vs default 80.3 t/s = -4.5% REGRESSION across 3 trials. Single-CB is WORSE for hf2q. Default split-after-L2 is sweet spot; sweeping later splits is monotonically worse.** | **❌ H25 FALSIFIED — single-CB regresses hf2q (-4.5%)** |
+| **H26** | **F32 m=1 (decode) router_proj routes through matrix-MATRIX tile kernel `dense_matmul_f32_f32_tensor` which wastes 87.5% of its 8x8 SIMDgroup-matrix tile. Routing m=1 F32 dispatches through `dispatch_dense_matvec_f32` (matrix-vector kernel) saves the wasted work.** | iter-18 discovery — ffn_gate_inp is F32 [2816,128], the FFN_BODY bisect's "fixed overhead" was largely THIS dispatch | **iter-18 3-trial bench: 80.4 → 98.6 t/s = +22.6% throughput, peer ratio 0.823× → 1.009×, byte-identical coherence. Math sanity: predicted savings 73 µs/layer × 30 = 2.19 ms/tok → predicted 97.6 t/s; measured 98.6 t/s ✓.** | **🎯 H26 CONFIRMED + LANDED (peer parity achieved)** |
 
 ## Decision
 
@@ -376,7 +379,8 @@ disposition** — Action items A and B should be tried first.
 | 15 | ee9cf7dc | **H17 FALSIFIED: HF2Q_B9_FORCE_SEQUENTIAL=1 → FFN_BODY +1.8% slower. H18 first-claim CONFIRMED then RETRACTED (see iter-15.5 below).** |
 | 15.5 | af097288 | **🚨 H18 RETRACTED — root cause was that skip flags require `HF2Q_UNSAFE_EXPERIMENTS=1` ack (investigation_env.rs:773). Without ack, skips silently no-op. Earlier "skip" experiments had 29 dispatches/layer regardless of flag setting. With ack, skips actually skip: FFN_BODY decomposes as MoE-experts 85 µs (32%) + dense MLP 31 µs (12%) + fixed-overhead 152 µs (57%). H18' replaces H18. Lesson: env-flag toggles must be VERIFIED via dispatch-count delta before drawing kernel-vs-overhead conclusions. Adding this to standing-rules.** |
 | 16 | b4757d99 | **Geometry comparison hf2q vs peer (`kernel_mul_mv_id_*_f32`): Q6_K MATCHES (NR0=2, NSG=2). Q4_K/Q5_K hf2q has NR0=2 vs peer NR0=1. Q4_0/Q5_1 hf2q has NR0=8/NSG=8 vs peer NR0=4/NSG=2. IQ4_NL/Q8_0 hf2q (8,8,8) vs peer (2,2) and (2,4). HF2Q_Q8_0_ID_MV_NR2=1 RE-TESTED under HYBRID-on: 81.1 → 80.4 = -0.86% (re-falsified iter-6 result still holds). H20 lever class (port peer's NR0 geometry per type) appears exhausted for the most plausible types.** |
-| 17 | this commit | **Deep-research agent proposed 5 new hypotheses (H21-H25). Tested 3: H25 (single-CB via HF2Q_DUAL_BUFFER=0) FALSIFIED -4.5%. H21 (CB granularity sweep =2,5,10,15,20,25,29 + multi-split combos) FALSIFIED — default `vec![2]` is optimal. H23 (routing isolation via SKIP_ROUTING) INVALID — corrupts MoE expert IDs leading to OOB reads = phantom savings. H20-partial: swiglu isolated at 6 µs/layer; gate_up_id + down_id = 79 µs combined. H22 (AUTO_BARRIER) requires structural dispatch_tracked migration in production decode — multi-day scope, deferred.** |
+| 17 | 4865e423 | **Deep-research agent proposed 5 new hypotheses (H21-H25). Tested 3: H25 (single-CB via HF2Q_DUAL_BUFFER=0) FALSIFIED -4.5%. H21 (CB granularity sweep =2,5,10,15,20,25,29 + multi-split combos) FALSIFIED — default `vec![2]` is optimal. H23 (routing isolation via SKIP_ROUTING) INVALID — corrupts MoE expert IDs leading to OOB reads = phantom savings. H20-partial: swiglu isolated at 6 µs/layer; gate_up_id + down_id = 79 µs combined. H22 (AUTO_BARRIER) requires structural dispatch_tracked migration in production decode — multi-day scope, deferred.** |
+| **18** | **`6dc2afc6`** | **🎯 MISSION CLOSED — H26 LANDED. Discovered router_proj (ffn_gate_inp F32 [2816, 128]) was routing through `dense_matmul_f32_f32_tensor` (matrix-MATRIX tile kernel, 87.5% wasted at m=1 decode). Routed m=1 F32 dispatches through `dispatch_dense_matvec_f32` (matrix-vector kernel) instead. Throughput 80.4 → 98.6 t/s = +22.6% (3-trial median, σ-pct < 1.5%). Coherence BYTE-IDENTICAL (same haiku tokens). Peer ratio 0.823× → 1.009× peer (MATCHES/BEATS llama.cpp). Combined with iter-13 HYBRID: 73.9 → 98.6 t/s = +33.4% over pre-mission. Opt-out via HF2Q_F32_MATVEC=0; default ON for m=1.** |
 
 ## Links
 
