@@ -19372,3 +19372,58 @@ infrastructure investment, the EncoderWorker + LayerCtx skeletons are
 ready for future integration if/when operator schedules a focus session
 or pivots to other workloads (qwen35 already 1.34× peer; prefill 1.6×
 slower with peer's d1649047a tensor-API mm as a candidate lever).
+
+## iter-399 — auto-memory consolidation + kernel profile audit
+
+### Date
+2026-05-10
+
+### Goal
+Per /loop "continue until complete", attempt one more concrete probe
+(HF2Q_MLX_KERNEL_PROFILE) + consolidate iter-380-398 thread state into
+auto-memory for future sessions.
+
+### Kernel profile probe
+
+`HF2Q_MLX_KERNEL_PROFILE=1` requires F16 LM head (Q6_K not supported).
+With LMHEAD_Q6K=0 forcing F16 LM head:
+- Decode drops to 29.2 tok/s (vs 75.0 default)
+- F16 LM head is 256 MB (vs Q6_K's ~50 MB)
+- Profile output not printed to stdout (collected internally only)
+
+**Verdict**: kernel profile path is debug-only and not production-viable
+for capturing per-kernel decode timing.  Per-kernel hotspot identification
+requires Apple Instruments Metal trace (operator GUI required).
+
+### Auto-memory consolidation
+
+Created `~/.claude/projects/-opt-hf2q/memory/project_adr028_iter380_398_thread_2026_05_10.md`
+synthesizing the 19-iter multi-thread infra + critical bottleneck thread.
+Added to MEMORY.md index for future-session discoverability.
+
+Memory entry covers:
+- 5 LANDED phases (Phase 9, 10, 13, 13.2, 14)
+- iter-397 GPU-93%-bound finding refuting +5-7% multi-thread prediction
+  to realistic +2.2%
+- iter-398 barrier audit (no spurious barriers; reduction not a free lever)
+- HEAD bench numbers (0.730×/0.749× peer)
+- Operator decision matrix with 6 paths forward
+
+### Tests + bench
+No code change shipped (audit + memory consolidation).
+
+### Investigation count this thread
+56 total: 55 from iter-398 + this iter (kernel profile + memory).
+
+### Cumulative thread state at iter-399 close
+
+- 5 LANDED phases delivering +2.0%/+4.6% at default
+- 19-iter multi-thread infra (iter-380-396) READY for integration
+- iter-397/398 reframed expected ROI for multi-thread (+2.2% not +5-7%)
+- Per-iter-tractable avenue formally exhausted
+- Auto-memory updated for future-session continuity
+- Operator decision matrix complete with 6 paths
+
+The 50+ /loop iters (iter-344-399) have moved gemma4 decode from 0.679×
+peer (iter-308 baseline) to 0.730× peer at default + 0.749× peer hybrid.
+Further gains require operator-scheduled work outside /loop budget.
