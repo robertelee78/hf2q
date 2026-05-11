@@ -22668,3 +22668,75 @@ all major hot paths:
 - Coherence: TIED (iter-431 verified)
 - 0 LANDED phase regressions across 7 iters of audits
 - All operator-decision-gated levers documented
+
+## iter-447 — RAM-mantra 3.94× verified; hybrid 3.19× claim has math discrepancy
+
+### Hypothesis
+The operator's standing rule (iter-326) is "preserve TQ-HB 3.94×
+per-slot K/V memory savings".  Verify this still holds at HEAD by
+computing per-slot byte counts.  Also verify Phase 10d hybrid's
+claimed "3.19× memory savings (81% preserved)" from
+`flash_attn_vec_hybrid.metal:7`.
+
+### Method
+Compute per-slot K+V bytes for gemma4 (nkv=16, hd_sliding=256,
+hd_global=512) under three modes:
+1. F32 baseline (K + V both F32)
+2. TQ-HB (K + V both 1 byte/elem + per-pos F32 norm)
+3. Hybrid (K F16 dense + V 1 byte/elem + per-pos norm)
+
+### Results — per-slot bytes (sliding, hd=256, nkv=16)
+
+| Mode | K bytes | V bytes (incl norms) | Total | Savings |
+|---|---|---|---|---|
+| F32 baseline | 16,384 | 16,384 | **32,768** | 1.00× |
+| TQ-HB | 4,096 + 64 | 4,096 + 64 | **8,320** | **3.94×** ✓ |
+| Hybrid F16-K + TQ-HB-V | 8,192 | 4,096 + 64 | **12,352** | **2.65×** |
+
+**Operator RAM-mantra verified**: 3.94× per-slot savings holds at
+HEAD with default TQ-HB-K+V configuration.
+
+### Documentation discrepancy
+Per `flash_attn_vec_hybrid.metal:7`: "preserving 81% of TQ-HB's 3.94×
+memory savings (3.19× total vs raw F32)"
+
+Per my per-slot calc: hybrid is **2.65×**, NOT 3.19×.
+
+The "81% preserved" interpretation:
+- TQ-HB saves 75% of F32 (8 → 2 units)
+- Hybrid saves 62.5% of F32 (8 → 3 units)
+- Hybrid preserves 5/6 = 83% of TQ-HB's savings ✓
+
+But "3.19× total vs raw F32" is wrong per the per-slot math.  Likely
+sources of the discrepancy:
+- `iter-346 memory math` (referenced) might use a different scope
+  (e.g., total process RSS including activation buffers, not just
+  per-slot KV)
+- May include other memory categories (FWHT sign buffers, codebook
+  tables) that hybrid mode also eliminates
+
+iter-435 quoted "3.19× memory savings" from auto-memory; this iter
+flags that the per-slot ratio is actually 2.65×.
+
+### Implication for iter-435 finding
+The HYBRID_KV "+3.3% decode at 19% memory cost" framing assumed
+3.19× hybrid savings.  Actual hybrid per-slot savings = 2.65× =
+**33% memory cost vs 3.94× TQ-HB** (more expensive than auto-memory
+suggested).
+
+### Investigation count this thread
+104 total: 103 from iter-446 + this iter (RAM-mantra verification +
+hybrid math correction).
+
+### Operator decision matrix (refined hybrid memory cost)
+
+| Lever | Status | Notes |
+|---|---|---|
+| Phase 15 default-on | ✓ shipped | prefill 0.94× peer |
+| **Phase 10d HYBRID_KV** | OPERATOR-GATED | +3.3% decode, **33% memory cost** (revised from 19%) |
+| Multi-thread integration | OPERATOR-GATED | +2.2%, 5-8 iters |
+| FA_GL F8 K | OPERATOR-GATED | multi-iter |
+
+The HYBRID_KV memory tradeoff is HARDER than previously documented
+(33% memory cost, not 19%).  Operator decision is more constrained
+by RAM-mantra.
