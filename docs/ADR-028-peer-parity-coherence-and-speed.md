@@ -24336,3 +24336,49 @@ production e2e ratio** for the Mars prompt.
 Per operator mantra: same qualitative status (gap closed substantially
 on prefill, structural floor on decode, identified architectural
 levers for further work).
+
+## iter-473 — extreme long-gen: gap continues to close (tg2048 = 0.754× peer)
+
+### Hypothesis
+Per iter-433 pattern (gap 42% at tg50 → 31% at tg500), extend
+measurement to tg1024 and tg2048 to characterize the asymptote.
+
+### Method
+- Peer: llama-bench `-n 1024,2048 -r 2`
+- hf2q: HTTP streaming, 2 unique prompts × max=1024 and max=2048
+- Note: hf2q may emit EOS before reaching max; peer always generates N
+
+### Results
+
+| Generation | hf2q tok/s | peer tok/s | Ratio |
+|---|---|---|---|
+| tg50 (iter-433) | 62.0 | 104.6 | 0.593× (gap 42%) |
+| tg128 (iter-433) | 64.6 | 104.5 | 0.618× (gap 38%) |
+| tg250 (iter-433) | 67.1 | 103.5 | 0.648× (gap 35%) |
+| tg500 (iter-433) | 68.2 | 99.5 | 0.685× (gap 31%) |
+| **tg1024** | **68.7 ± 0.3** | **99.9 ± 1.6** | **0.688× (gap 31%)** |
+| **tg2048** | **69.7 ± 0.3** | **92.4 ± 1.9** | **0.754× (gap 25%)** |
+
+### Diagnosis
+**Gap closes monotonically with generation length**:
+- Peer degrades faster at very long gen (7% drop tg1024→tg2048
+  from KV cache bandwidth growth)
+- hf2q stays nearly flat (+1.4% tg1024→tg2048 from prefill
+  amortization)
+- Cross-over (hf2q ≥ peer) likely at tg ~ 16K+ but model usually
+  emits EOS before then
+
+### Practical implication
+For typical chat (tg ≤ 500), hf2q runs at ~0.69× peer.  For
+extremely long-form generation (tg ≥ 2K), gap narrows to ~0.75×.
+Cross-over is theoretically possible but practically unreachable
+due to model EOS behavior + chat-template length budgets.
+
+### Investigation count this thread
+130 total: 129 from iter-472 + this iter (extreme long-gen pattern).
+
+### Operator decision matrix unchanged
+The long-gen pattern confirms iter-433's observation and shows the
+trend continues at very long N.  No new code lever identified.
+Both stacks operate within memory-bandwidth physics; the asymptotic
+convergence is fundamental.
