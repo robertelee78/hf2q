@@ -1306,24 +1306,46 @@ impl MlxModelWeights {
                         &self.layers[layer_idx].attn.o_proj,
                         &mut pf_attn_out, seq_len as u32)?;
                 } else {
-                    s.barrier_between(
-                        &[&pf_sdpa_out_perm, &self.layers[layer_idx].attn.o_proj.buffer],
-                        &[&pf_attn_out],
-                    );
                     let o_info = &self.layers[layer_idx].attn.o_proj.info;
-                    mlx_native::quantized_matmul_mm_tensor_perm021(
-                        s.encoder_mut(), reg, dev,
-                        &pf_sdpa_out_perm,
-                        &self.layers[layer_idx].attn.o_proj.buffer,
-                        &mut pf_attn_out,
-                        &mlx_native::GgmlQuantizedMatmulPerm021Params {
-                            m: seq_len as u32,
-                            n: o_info.rows as u32,
-                            k: o_info.cols as u32,
-                            head_dim: hd as u32,
-                            ggml_type: o_info.ggml_dtype,
-                        },
-                    ).map_err(|e| anyhow::anyhow!("batched O-proj perm021 L{layer_idx}: {e}"))?;
+                    let perm021_params = mlx_native::GgmlQuantizedMatmulPerm021Params {
+                        m: seq_len as u32,
+                        n: o_info.rows as u32,
+                        k: o_info.cols as u32,
+                        head_dim: hd as u32,
+                        ggml_type: o_info.ggml_dtype,
+                    };
+                    // ADR-029 iter-36 H28-D — route O-proj through F16-weight
+                    // perm021 variant when MlxQWeight.f16_shadow was populated
+                    // at load (HF2Q_F16_SHADOW=1 by default per iter-31).
+                    // The F16 kernel reads the half weight directly, bypassing
+                    // the per-call quantized dequant.  Falls back to the
+                    // quantized perm021 kernel when no shadow exists (env
+                    // opt-out or no F16 buffer for this layer).
+                    if let Some(f16_w) = self.layers[layer_idx].attn.o_proj.f16_shadow.as_ref() {
+                        s.barrier_between(
+                            &[&pf_sdpa_out_perm, f16_w],
+                            &[&pf_attn_out],
+                        );
+                        mlx_native::quantized_matmul_mm_tensor_perm021_f16(
+                            s.encoder_mut(), reg, dev,
+                            &pf_sdpa_out_perm,
+                            f16_w,
+                            &mut pf_attn_out,
+                            &perm021_params,
+                        ).map_err(|e| anyhow::anyhow!("batched O-proj perm021_f16 L{layer_idx}: {e}"))?;
+                    } else {
+                        s.barrier_between(
+                            &[&pf_sdpa_out_perm, &self.layers[layer_idx].attn.o_proj.buffer],
+                            &[&pf_attn_out],
+                        );
+                        mlx_native::quantized_matmul_mm_tensor_perm021(
+                            s.encoder_mut(), reg, dev,
+                            &pf_sdpa_out_perm,
+                            &self.layers[layer_idx].attn.o_proj.buffer,
+                            &mut pf_attn_out,
+                            &perm021_params,
+                        ).map_err(|e| anyhow::anyhow!("batched O-proj perm021 L{layer_idx}: {e}"))?;
+                    }
                 }
                 if let Some(t0) = o_t0 {
                     bucket_finish!(s, exec, t0, &PROFILE_O_MM_NS, &PROFILE_O_MM_COUNT, 1, "O_mm");
