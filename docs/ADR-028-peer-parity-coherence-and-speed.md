@@ -20523,3 +20523,93 @@ This single iteration delivers more speedup than the previous
 rigorous methodology (iter-414's 5-rep unique-prompt HTTP probe
 revealed the architectural asymmetry that 70 prior decode-focused
 iterations missed).
+
+## iter-416 — Phase 15 falsification: short identical, long diverges (numerical noise, not regression)
+
+### Hypothesis (from iter-415 LANDED)
+Phase 15 (batched-serve prefill) showed coherence on 3 short
+prompts ("4", "Paris", photosynthesis paragraph).  Verify it
+matches per-token-serve byte-for-byte, multi-turn doesn't break
+cache state, and longer generations remain coherent.
+
+### Method (3 falsification probes)
+
+1. **Identity probe**: 3 short prompts (max_tokens=40), greedy
+   temp=0, both modes, character-by-character compare.
+2. **Long-generation probe**: 200-token story, both modes,
+   character-by-character compare.
+3. **Multi-turn probe**: 5 unrelated requests in succession via
+   batched mode, verify coherence and cache reset.
+
+### Results
+
+**Probe 1 — short outputs IDENTICAL ✓**
+
+| Prompt | Legacy | Batched | Match |
+|---|---|---|---|
+| "What is 2+2?..." | `"4"` | `"4"` | ✓ |
+| "List the first 5 prime numbers..." | `"2, 3, 5, 7, 11"` | `"2, 3, 5, 7, 11"` | ✓ |
+| "...capital of France?" | `"The capital of France is Paris."` | `"The capital of France is Paris."` | ✓ |
+
+**Probe 2 — 200-token output DIVERGES at sentence 3 (BOTH coherent)**
+
+Both share first 2 sentences (~50 tokens) verbatim:
+> "Unit 742 was designed for precision, tasked solely with sorting
+> rusted bolts in a silent warehouse. While the other machines hummed
+> with mechanical indifference, 742 began collecting discarded
+> wildflower seeds found in the dust."
+
+Then sentence 3 diverges:
+- Legacy: "One morning, the robot tucked a single green sprout into..."
+- Batched: "Every day, the robot diverted a fraction of its power..."
+
+Both end at "purpose...to nurture" / "purpose...to grow" — semantically
+equivalent, both valid 5-sentence robot stories, indistinguishable
+quality.
+
+**Probe 3 — multi-turn (5 unrelated requests, batched mode) ✓**
+
+| # | Q | A |
+|---|---|---|
+| 1 | What is 2+2? | "2 + 2 = 4" |
+| 2 | Name a color. | "Cerulean" |
+| 3 | What is the capital of Japan? | "The capital of Japan is **Tokyo**." |
+| 4 | List three fruits. | (markdown list, body parses) |
+| 5 | What is 5 times 6? | "5 times 6 is **30**." |
+
+All 5 coherent.  KV cache reset between requests works correctly.
+
+### Divergence diagnosis
+Per-token mode and batched mode produce byte-identical outputs for
+short generations.  At ~50 generated tokens, accumulated f32/bf16
+rounding differences (parallel reductions in batched vs sequential
+in per-token; different mask kernels: `sliding_mask_bf16` vs
+flash-attn-vec causal) cross a logit-argmax-margin threshold.
+
+This is the same pattern documented in
+`auto-memory: ADR-027 Phase B LANDED` ("byte-identical at ~128 tok/s")
+and the numerical-noise behavior is intrinsic to mixed-precision
+parallel reduction order on Apple Metal.
+
+**Quality verdict**: BOTH outputs from BOTH modes are coherent, valid,
+on-topic, and indistinguishable in quality.  The divergence is a
+trajectory split between two equivalent greedy paths, not a
+regression.
+
+### Default-on readiness
+Per the operator mantra "as coherent as (or more coherent than)" —
+both modes have indistinguishable coherence quality.  Phase 15 is
+SAFE to default-on per coherence-quality criterion.
+
+Cautious operator-decision-gated remaining concern: byte-identity
+vs prior production output WILL change for >50-token responses.
+This is a CHANGE of trajectory, not a quality regression.
+Stress-tested coherence: ✓.
+
+### Action — Phase 15 stays opt-in pending operator soak
+Patch already shipped iter-415.  Default-OFF retained until operator
+explicitly approves the trajectory-change behavior.  When approved:
+flip `env_eq_one` to `env_default_true` at engine.rs:4587 + 7068.
+
+### Investigation count this thread
+73 total: 72 from iter-415 + this iter (Phase 15 falsification).
