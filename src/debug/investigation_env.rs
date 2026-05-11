@@ -329,21 +329,22 @@ pub struct InvestigationEnv {
     ///   `match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() { Ok("4")=>0, Ok("5")=>5, ... _ => 8 }`.
     pub tq_codebook_bits: u32,
 
-    /// `HF2Q_HYBRID_KV` — ADR-028 Phase 10 (iter-347): swap pure TQ-HB K
-    /// for hybrid F16-K + TQ-HB-V at allocation time.
+    /// `HF2Q_HYBRID_KV` — ADR-028 Phase 10 (iter-347) / ADR-029 iter-13 default-flip.
     ///
-    /// When `1` / `true` / `on`: at lazy KV alloc in `forward_decode`,
-    /// build `HybridKvBuffers` instead of `HbKvBuffers`. The K side stays
-    /// dense F16 (peer-equivalent simdgroup-matmul K throughput); V stays
-    /// 1-byte-per-element TQ-HB packed. Memory cost: 158 MB at gemma4 32K
-    /// vs 128 MB pure TQ-HB (3.19× saving vs 3.94×, preserving 81% of the
-    /// TQ-HB advantage). Requires the Phase 10d `flash_attn_vec_hybrid_dk256`
-    /// kernel, the Phase 10c K-encode skip, and the Phase 10e SDPA dispatcher
-    /// to be wired before producing coherent output.
+    /// At lazy KV alloc in `forward_decode`, build `HybridKvBuffers` instead
+    /// of `HbKvBuffers`: F16 K + TQ-HB-packed V. The K side stays dense F16
+    /// (peer-equivalent simdgroup-matmul K throughput); V stays 1-byte-per-
+    /// element TQ-HB packed. Memory cost: 158 MB at gemma4 32K vs 128 MB
+    /// pure TQ-HB (3.19× saving vs 3.94×, preserving 81% of the TQ-HB
+    /// memory advantage). Routes attention through `flash_attn_vec_hybrid`
+    /// (mlx-native Phase 10d) and `dispatch_kv_copy_kf16_quantize_v_no_fwht`
+    /// (Phase 10c.5 fused write).
     ///
-    /// Default OFF until parity (10f) + coherence (10g) gates pass.
-    /// Opt-out: unset / `=0` / `=false` / `=off` (legacy TQ-HB path).
-    #[allow(dead_code)] // Read by Phase 10c K-encode skip + 10e SDPA dispatcher (next iters).
+    /// **Default ON** since ADR-029 iter-13 (2026-05-11). H12 confirmed in
+    /// iter-12 via 3-trial fresh-process bench at HEAD `0808e4e9`: median
+    /// +9.5% gemma4 throughput (78.5 vs 71.6 t/s) with byte-class-coherent
+    /// output. Brings gemma4-APEX-Q5_K_M peer ratio from 0.756× → 0.805×
+    /// (+4.9 pp). Opt-out via `=0` / `=false` / `=off` (legacy TQ-HB path).
     pub hybrid_kv: bool,
 
     // ========================================================================
@@ -818,12 +819,12 @@ impl InvestigationEnv {
                 Ok(_other) => 8u32,
             },
 
-            // ADR-028 Phase 10 (iter-347): hybrid F16-K + TQ-HB-V gate.
-            // Default OFF — flips on after Phase 10f parity + 10g coherence
-            // pass. Not ack-required: when ON without the kernel/dispatcher
-            // wiring (Phase 10c-e), allocation succeeds but SDPA dispatch
-            // will hard-fail at the first decode token (loud, not silent).
-            hybrid_kv: env_eq_one("HF2Q_HYBRID_KV"),
+            // ADR-028 Phase 10 (iter-347) / ADR-029 iter-13: hybrid F16-K + TQ-HB-V.
+            // **Default ON** after ADR-029 iter-12 confirmation (3-trial fresh
+            // bench: +9.5% gemma4 throughput, byte-class-coherent output,
+            // 0.756× → 0.805× peer ratio). Opt-out via =0 / =false / =off
+            // (returns legacy TQ-HB path); coherence parity preserved either way.
+            hybrid_kv: env_default_true("HF2Q_HYBRID_KV"),
 
             // iter-18 S2C sliding-layer-0 dump gate + run name.
             dump_sliding_layer_0: matches!(
@@ -1548,11 +1549,12 @@ mod tests {
 
     #[test]
     fn hybrid_kv_default_when_unset() {
+        // ADR-029 iter-13 default-flip: unset => ON (was OFF pre-iter-13).
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::new(&["HF2Q_HYBRID_KV"]);
         assert!(
-            !InvestigationEnv::from_env().hybrid_kv,
-            "unset => default false (legacy TQ-HB path until Phase 10f/g pass)"
+            InvestigationEnv::from_env().hybrid_kv,
+            "unset => default true after ADR-029 iter-13 default-flip"
         );
     }
 
@@ -1565,15 +1567,33 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_kv_not_enabled_by_other_values() {
+    fn hybrid_kv_disabled_by_zero_false_off() {
+        // ADR-029 iter-13: env_default_true semantics. Explicit falsy values
+        // turn HYBRID off (legacy TQ-HB path); other values keep it on.
         let _lock = ENV_LOCK.lock().unwrap();
         let guard = EnvGuard::new(&["HF2Q_HYBRID_KV"]);
-        for bad in &["0", "true", "yes", "hybrid", ""] {
-            guard.set("HF2Q_HYBRID_KV", bad);
+        for falsy in &["0", "false", "off", "FALSE", "Off"] {
+            guard.set("HF2Q_HYBRID_KV", falsy);
             assert!(
                 !InvestigationEnv::from_env().hybrid_kv,
-                "value {:?} must not enable hybrid_kv",
-                bad
+                "value {:?} must disable hybrid_kv (env_default_true falsy)",
+                falsy
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_kv_permissive_truthy() {
+        // ADR-029 iter-13: env_default_true semantics. "1"/"true"/"on" and
+        // unrecognized non-empty values all leave HYBRID on.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_HYBRID_KV"]);
+        for truthy in &["1", "true", "on", "yes", "hybrid", ""] {
+            guard.set("HF2Q_HYBRID_KV", truthy);
+            assert!(
+                InvestigationEnv::from_env().hybrid_kv,
+                "value {:?} keeps hybrid_kv on (permissive default-true)",
+                truthy
             );
         }
     }
@@ -1581,10 +1601,10 @@ mod tests {
     #[test]
     fn hybrid_kv_does_not_require_unsafe_ack() {
         // ADR-028 Phase 10: this is a memory-layout selector, not a math
-        // skip. Setting `HF2Q_HYBRID_KV=1` alone MUST take effect — the
-        // SDPA dispatcher (10e) will hard-fail loud-not-silent if the
-        // kernel wiring (10c-d) hasn't landed yet, which is the desired
-        // signal for partial-stack misuse.
+        // skip. Setting `HF2Q_HYBRID_KV=1` (or leaving unset under ADR-029
+        // iter-13 default-true) takes effect — the SDPA dispatcher routes
+        // to the wired `flash_attn_vec_hybrid` kernel without needing the
+        // UNSAFE experiment ack.
         let _lock = ENV_LOCK.lock().unwrap();
         let guard = EnvGuard::new(&["HF2Q_HYBRID_KV", "HF2Q_UNSAFE_EXPERIMENTS"]);
         guard.set("HF2Q_HYBRID_KV", "1");
