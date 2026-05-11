@@ -21992,3 +21992,62 @@ The multi-thread lane is the next-largest concrete-actionable work,
 but per operator standing rule "no deferrals without explicit operator
 approval" — this iter ESCALATES the deferral status to documented
 honest state.
+
+## iter-435 — Phase 10d hybrid F16-K decode kernel re-verified (+3.3%)
+
+### Hypothesis
+Discovered Phase 10d kernel `flash_attn_vec_hybrid` (iter-349/350)
+designed to close the K-side decode gap.  File comment claims
+"~1.05× peer at hybrid" with 81% TQ-HB memory savings preserved
+(3.19× vs 3.94×).  Re-verify the production decode delta at HEAD.
+
+### Method
+hf2q serve, both modes (default vs HF2Q_HYBRID_KV=1), max_tokens=128,
+temp=0, 3 unique prompts each via streaming SSE, count chunks /
+wall.
+
+### Results
+
+| Mode | rep 1 | rep 2 | rep 3 | Mean tok/s |
+|---|---|---|---|---|
+| Default | 66.62 | 66.74 | 66.86 | **66.74 ± 0.12** |
+| **HYBRID_KV=1** | 69.12 | 69.51 | 68.12 | **68.92 ± 0.71** |
+| **Δ** | | | | **+3.3%** |
+
+### Reconciliation with memory
+Auto-memory `iter-380→398 thread synthesis` claimed Phase 10
+HYBRID_KV = +4.6% decode.  Today's HTTP-streaming measurement = +3.3%.
+The auto-memory was likely measured in `generate` CLI mode (less
+overhead), while this iter measures HTTP serve (closer to production
+user experience).
+
+### Memory-vs-speed tradeoff (per operator RAM-mantra)
+- Default: TQ-HB-K + TQ-HB-V = **3.94× memory savings** (iter-326
+  operator hard rule)
+- HYBRID: F16-K + TQ-HB-V = **3.19× memory savings** (81% preserved)
+- Tradeoff: give up 19% memory savings for +3.3% decode
+
+### Operator-decision-gated for default-on
+Per iter-326 RAM-mantra: "We must preserve TQ-HB 3.94× per-slot KV
+memory savings" — going to 3.19× is a HARD VIOLATION of the rule
+unless operator explicitly approves the tradeoff.
+
+Phase 10d EXISTS, is wired correctly (forward_mlx.rs:3784+ via
+iter-350), and measurably improves decode by ~3%.  Whether to
+default-on is operator-decision-gated.
+
+### Investigation count this thread
+92 total: 91 from iter-434 + this iter (Phase 10d re-verification).
+
+### Operator decision matrix (refreshed)
+
+| Lever | Status | Notes |
+|---|---|---|
+| Phase 15 default-on | ✓ shipped iter-421 | prefill 0.022→0.94× peer |
+| **Phase 10d HYBRID_KV** | **WIRED, verified +3.3% decode** | OPERATOR (19% memory cost) |
+| Multi-thread integration | READY but UNUSED | OPERATOR (5-8 iters, +2.2%) |
+| FA_GL F8 K | identified | OPERATOR (multi-iter kernel work) |
+| Decode floor | structural | exhausted at kernel level |
+
+The Phase 10d HYBRID_KV row is now an **operator-actionable single-
+decision lever** (toggle default-on vs preserve 3.94× memory).
