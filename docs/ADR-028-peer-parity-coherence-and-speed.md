@@ -18114,3 +18114,99 @@ iter-383 will design + scope this refactor.  iter-384+ will execute.
 
 ### Investigation count this thread
 39 total: 38 from iter-381 + this iter (singleton scaffolding).
+
+## iter-383 — parallel-encoding refactor: design + scope (no code change)
+
+### Date
+2026-05-10
+
+### Investigation: where's the actual borrow-checker blocker?
+
+Verified by reading `mlx-native/src/ops/quantized_matmul_ggml.rs` + `buffer.rs`:
+
+- Encode functions (e.g., `pub fn quantized_matmul_ggml(... output: &mut MlxBuffer ...)`)
+  take `&mut MlxBuffer` for output buffers.
+- The Metal API ONLY uses `output.metal_buffer()` (returns `&MetalBuffer`)
+  and `output.contents_ptr()` (returns `*mut c_void`) — both `&self` methods.
+- `as_mut_slice()` requires `&mut MlxBuffer` for CPU-side mutation (read/write
+  Rust slice).  But encoders never call `as_mut_slice` — only the host-side
+  setup code does.
+
+**Conclusion**: `&mut MlxBuffer` in encode signatures is purely Rust
+borrow-checker convention.  The Metal API would work identically with
+`&MlxBuffer`.
+
+### 4 design options to enable multi-thread encoding
+
+#### Option 1: Change all encode signatures `&mut MlxBuffer` → `&MlxBuffer`
+- **Scope**: ~50+ encode fns across ~30 ops modules; mechanical change
+- **Risk**: low — Rust safety preserved (no MlxBuffer mutation in encoders)
+- **Multi-thread enable**: worker can hold `Arc<MlxBuffer>` clones
+- **Effort estimate**: 2-3 hours of mechanical work + test re-validation
+
+#### Option 2: Introduce parallel `encode_*_arc(...)` API alongside existing
+- **Scope**: New API surface (~30 fns); existing API unchanged
+- **Risk**: API duplication; worker uses Arc API, main thread uses old API
+- **Multi-thread enable**: worker uses `Arc<MlxBuffer>`
+- **Effort**: 4-6 hours; long-term tech debt from API duplication
+
+#### Option 3: `unsafe` cast `&MlxBuffer` → `&mut MlxBuffer` in worker thread
+- **Scope**: Single helper function with `unsafe` block
+- **Risk**: HIGH — undefined behavior if multiple threads mutate same buffer
+  simultaneously (not protected by Rust's borrow checker anymore)
+- **Multi-thread enable**: yes, but unsafe
+- **Effort**: 30 min; high audit/maintenance burden
+
+#### Option 4: `Arc<Mutex<MlxBuffer>>` for activations
+- **Scope**: Wrap all activation fields in Arc<Mutex>; each dispatch locks
+- **Risk**: Mutex serializes encoding → defeats parallelism goal
+- **Multi-thread enable**: technically yes, but no actual concurrency
+- **Effort**: 2-3 hours; performance regression likely
+
+### Recommendation: Option 1 (mechanical signature change)
+
+- Lowest risk (preserves Rust safety guarantees)
+- Smallest scope (2-3 hours of mechanical work)
+- No API duplication or unsafe code
+- Enables true multi-thread encoding via Arc<MlxBuffer>
+
+### iter-384+ execution plan
+
+1. **iter-384**: Mechanical change — convert all `output: &mut MlxBuffer` →
+   `output: &MlxBuffer` in mlx-native/src/ops/*.rs.  Build + run full test
+   suite (mlx-native 293/0 + hf2q 3454/0).  No semantic change; pure
+   borrow-checker relaxation.
+2. **iter-385**: Wire `forward_decode` second-half to use EncoderWorker.
+   Main thread encodes layers 0..N; worker encodes layers N..29 + LM head.
+   Both commit in order; main waits for both GPU completions.
+3. **iter-386**: Bench A/B (single-thread vs multi-thread).  Tune split N
+   for max parallelism.  Coherence + parity verification.
+4. **iter-387+**: Ship default-on if positive (~3-5% predicted gain per
+   iter-369 H3 estimate).  If negative or marginal, document falsification.
+
+### Why I'm doing this incrementally
+
+Per the operator mantra ("DO NOT BE LAZY. We have plenty of time to do it
+right.  No short cuts."), I'm taking the methodical path:
+1. iter-380: mlx-native scaffolding (4 unit tests)
+2. iter-381: mlx-native Metal integration (2 tests; cross-thread proof)
+3. iter-382: hf2q singleton (2 tests; per-process worker)
+4. **iter-383: design + scope (this)** — confirms blocker, picks Option 1
+5. iter-384: execute mechanical refactor
+6. iter-385: wire forward_decode
+7. iter-386: bench + tune
+8. iter-387+: ship or falsify
+
+### Risk assessment
+
+- **iter-384 mechanical refactor**: low risk per Option 1 analysis
+- **iter-385 wiring**: medium risk (touches forward_decode hot path); use
+  env-flag to gate
+- **iter-386 bench**: outcome-dependent; could be negative (extra context
+  switch overhead) or positive (~3-5%)
+
+If iter-386 falsifies, iter-384's signature changes still stand as a
+quality improvement (less misleading Rust borrow-checker noise).
+
+### Investigation count this thread
+40 total: 39 from iter-382 + this iter (design only).
