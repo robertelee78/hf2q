@@ -23465,3 +23465,58 @@ Each is a potential single-iter optimization but cumulative gain is
 ### Operator decision matrix unchanged
 Startup gap is documented but multi-iter scope to address.
 Still operator-decision-gated per iter-458.
+
+## iter-460 — load_wall_clock is monolithic; sub-phase bisect requires instrumentation
+
+### Hypothesis
+iter-459 found 88% of startup is `load_wall_clock=2.91s`.  Try to
+break into sub-phases via existing log instrumentation.
+
+### Method
+Read `/opt/hf2q/src/serve/api/engine.rs:1905+` (LoadedModel::load fn)
+and audit existing timing.
+
+### Findings
+The `load_start = Instant::now()` at engine.rs:1906 begins a
+monolithic timer that wraps:
+1. tokenizer_path resolution
+2. GgufFile::open (header + metadata)
+3. Gemma4Config::from_gguf
+4. Provenance detect
+5. Quant label infer (dominant tensor type scan)
+6. Chat template parse
+7. (Many more steps including weight Arc construction + KV setup)
+
+There are NO sub-phase Instant::now() markers between these steps —
+only the final `load_wall_clock = load_start.elapsed()`.
+
+### To bisect further
+Would need to add instrumentation:
+```rust
+let t_open = Instant::now();
+let gguf = mlx_native::gguf::GgufFile::open(model_path)?;
+let dt_open = t_open.elapsed();
+tracing::info!(open_ms = dt_open.as_millis());
+
+let t_config = Instant::now();
+let config = Gemma4Config::from_gguf(&gguf)?;
+let dt_config = t_config.elapsed();
+tracing::info!(config_ms = dt_config.as_millis());
+
+// ... etc for each major phase
+```
+
+### Single-iter scope assessment
+Adding instrumentation requires:
+- ~20 timing markers across the load fn
+- Building + verifying log output
+- Wouldn't change perf, just diagnostic
+- Multi-iter scope per "no defective probes; verify each timing
+  marker is at the right point"
+
+### Investigation count this thread
+117 total: 116 from iter-459 + this iter (load monolithic finding).
+
+### Operator decision matrix unchanged
+Startup gap remains 1.6s, dominated by 2.91s monolithic load.
+Bisecting requires multi-iter instrumentation work; operator-gated.
