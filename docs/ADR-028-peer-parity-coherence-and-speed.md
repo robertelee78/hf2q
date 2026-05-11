@@ -18210,3 +18210,61 @@ quality improvement (less misleading Rust borrow-checker noise).
 
 ### Investigation count this thread
 40 total: 39 from iter-382 + this iter (design only).
+
+## iter-384 — Option 1 mechanical refactor: proof on quantized_matmul_ggml
+
+### Date
+2026-05-10
+
+### Goal
+Per iter-383's chosen Option 1: change all encode fn signatures from
+`output: &mut MlxBuffer` to `output: &MlxBuffer`.  This eliminates the
+Rust borrow-checker constraint that currently prevents Arc<MlxBuffer>
+sharing across threads.
+
+### Discovery: Rust auto-coercion handles call sites
+
+Initial hypothesis (per iter-383 design): Rust's `&mut T → &T` coercion
+should handle existing call sites without modification.
+
+**Verified**:
+- Changed `quantized_matmul_ggml` + internal `dispatch_mv` + `dispatch_mm`
+  signatures from `output: &mut MlxBuffer` → `output: &MlxBuffer`
+- Cascading required because the public fn passes output to internal helpers
+- mlx-native builds clean, hf2q (47 call sites) builds clean WITHOUT changes
+- mlx-native lib: 290/0 tests pass
+- gemma4 coherence: "What is 2+2?" → " + 2 = 4<turn|>" intact
+
+The auto-coercion works.  Existing call sites that pass `&mut self.act.X`
+to a fn now expecting `&MlxBuffer` are auto-coerced.  No call-site changes
+needed!
+
+### Scope estimate (refined)
+
+Original iter-383 estimate: ~45 fn signatures across ~30 modules.
+
+After iter-384 proof: each ops module needs:
+- Public encode fn signature: `output: &mut MlxBuffer` → `&MlxBuffer`
+- Cascade to any internal helpers it calls
+- No call-site changes (auto-coercion)
+- No test changes (signatures still accept &mut via coercion)
+
+Mechanical work: ~45 × 1-line edits = ~45 minutes.
+
+### Path forward (revised)
+
+- **iter-385**: Execute remaining ~44 fn signature changes across all
+  mlx-native ops modules.  Build + run full test suite.
+- **iter-386**: Wire EncoderWorker into forward_decode for parallel layer
+  encoding.  Use Arc<MlxBuffer> handles in worker thread.
+- **iter-387**: Bench A/B + tune split layer N.
+- **iter-388+**: Ship default-on if positive (~3-5% predicted gain).
+
+### Tests + bench
+- mlx-native lib: 290/0 passing.
+- hf2q lib: 3454/0 passing.
+- Coherence: gemma4 "2 + 2 = 4" intact.
+- No production wiring yet → no bench impact.
+
+### Investigation count this thread
+41 total: 40 from iter-383 + this iter (signature change proof).
