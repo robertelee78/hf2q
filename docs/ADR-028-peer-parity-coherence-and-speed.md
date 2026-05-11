@@ -22317,3 +22317,77 @@ latency vs more accurate answers on hard problems).
 ### No code change
 Verification only.  Reasoning infra is present; chat-template
 engagement is per-prompt and operator-decision-gated.
+
+## iter-441 — chat-template render mechanism: peer auto-injects `<|think|>` system
+
+### Hypothesis
+iter-440 found hf2q HAS reasoning infrastructure but doesn't engage
+gemma4 reasoning mode.  Identify the exact mechanism by comparing
+peer's resolved chat template vs hf2q's for the same input.
+
+### Method
+- llama-server `/apply-template` endpoint: returns peer's resolved
+  prompt before tokenization
+- hf2q seq_len logging via "Batched prefill complete: ... seq_len=N"
+
+### Findings
+
+**Peer's resolved template** (for `[{role:user, content:"What is 2+2?"}]`):
+```
+<|turn>system
+<|think|><turn|>
+<|turn>user
+What is 2+2?<turn|>
+<|turn>model
+
+```
+= ~14 tokens approximately
+
+**hf2q's resolved template** (same input):
+seq_len=20 tokens (6 more than peer)
+
+### Mechanism
+Both stacks read the SAME chat template from the GGUF metadata
+(verified via `strings $MODEL`):
+- chat_template macros use `<|channel>` and `<channel|>` for
+  reasoning span markers
+- The template includes a `system` block
+
+**Key difference**: peer's llama-server **auto-injects** a system
+message containing `<|think|>` token when no system prompt is
+provided.  hf2q does not auto-inject the `<|think|>` system marker.
+
+### Why this matters
+- The `<|think|>` token in the system prompt tells gemma4 to engage
+  reasoning mode → emits `<|channel>` ... `<channel|>` thinking
+  trace before the final answer
+- Without `<|think|>` in system, gemma4 produces direct answer (no
+  thinking trace)
+- Both are valid model behaviors; chat-template wrapping selects
+  which one fires
+
+### Coherence implication (revisited from iter-440)
+- Simple tasks (3-2=?, capital of France): both produce same correct
+  answer
+- Hard reasoning tasks (multi-step math, code analysis): reasoning
+  mode COULD improve accuracy
+- Latency: reasoning mode 4-7× longer per response
+
+### Operator-decision-gated
+Two options:
+1. Match peer behavior (auto-inject `<|think|>` system) — gives
+   reasoning trace by default, slower for short tasks
+2. Keep current behavior (no auto-injection) — faster for simple
+   prompts, no reasoning trace by default
+
+Both stacks support reasoning when explicitly invoked; this is just
+the default-behavior question.
+
+### Action — chat-template behavior research
+No code change.  Documented the exact chat-template render
+discrepancy.  Whether to match peer's auto-injection is an operator
+UX decision, not a perf optimization.
+
+### Investigation count this thread
+98 total: 97 from iter-440 + this iter (chat-template render
+mechanism).
