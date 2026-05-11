@@ -17859,3 +17859,61 @@ optimization avenue remains exhausted (per iter-369/372/375/377).
 
 ### Investigation count this thread
 35 total: 34 from iter-377 + this iter (audit-only).
+
+## iter-379 — peer per-layer-embedding finding (NOT applicable to our model)
+
+### Date
+2026-05-10
+
+### Investigation focus
+iter-378 finding 3 left as TODO: verify if our forward_decode handles per-layer
+embeddings (peer's gemma4.cpp lines 338-359 conditional block).
+
+### Verification
+
+Our model's GGUF metadata:
+```
+gemma4.embedding_length_per_layer_input = 0
+```
+
+`n_embd_per_layer = 0` → in peer, `model.per_layer_tok_embd = nullptr` →
+`inp_per_layer = nullptr` → peer's per-layer-embedding code block IS SKIPPED.
+
+Our `forward_decode` source check:
+```
+$ grep "per_layer\|per_layer_tok_embd\|n_embd_per_layer" forward_mlx.rs
+(0 matches except per_layer_disp = HF2Q_PER_LAYER_DISP debug counter — unrelated)
+```
+
+Our code has NO per-layer embedding logic.  Correct for this model — and
+correct for any future model with `n_embd_per_layer = 0`.
+
+### Conclusion
+
+ALL peer gemma4-specific optimizations evaluated:
+1. KV-sharing → N/A (shared_kv_layers=0)
+2. MoE logits scaling chain → Math-equivalent (already done)
+3. Per-layer embeddings → N/A (n_embd_per_layer=0)
+
+**Peer-specific optimization avenue formally exhausted for the operator's
+target model (gemma4-ara-2pass-APEX-Q5_K_M.gguf).**
+
+### Path forward (operator-decision-gated, unchanged)
+
+1. **Multi-thread encoding port** (peer's `n_cb=2`): multi-day, ~3-5% potential
+2. **Apple Instruments Metal trace**: operator GUI required
+3. **Pivot to qwen35 / prefill / additional models**: opens new optimization
+   surface (qwen35 already at 1.34× peer per memory entries)
+4. **Accept current 0.726× peer asymptote**: legacy default; or 0.746× hybrid
+   (operator opt-in via HF2Q_HYBRID_KV=1)
+
+### Cumulative state unchanged
+- 5 LANDED phases (Phase 9, 10, 13, 13.2, 14)
+- 28 falsified investigations
+- 7 audit/verification investigations
+- 36 total this thread
+- Legacy decode: 0.726× peer (74.82 / 103)
+- Hybrid decode: 0.746× peer (76.80 / 103) [operator opt-in]
+
+### Investigation count this thread
+36 total: 35 from iter-378 + this iter (audit-only).
