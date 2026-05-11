@@ -19958,3 +19958,52 @@ No code change (env-flag probe only).  Coherence + bench verified.
 | Accept current 0.730× peer | — | — | — |
 
 The MLX_UNRETAINED_REFS row joins 33 other falsified investigations.
+
+## iter-409 — baseline q6_K + q6_K_ID mv dispatcher branches confirmed OFF at HEAD
+
+### Hypothesis
+iter-352 dispatch breakdown showed `kernel_mul_mv_q6_K_f32` (baseline,
+non-NR2) at 3.41% of dispatches — a residual call site that escaped
+the NR2 fast path.  If reproducible at HEAD, that's a remaining lever.
+
+### Method
+Read the dispatcher at HEAD (no bench needed; logic is binary):
+- `quantized_matmul_ggml.rs:490-491`: `use_q6k_nr2 = matches!(Q6_K) && env_default_true("HF2Q_Q6K_MV_NR2")`
+- `quantized_matmul_id_ggml.rs:483-484`: `use_q6k_id_nr2 = matches!(Q6_K) && env_default_true("HF2Q_Q6K_ID_MV_NR2")`
+
+`env_default_true(...)` returns `true` unless explicitly set to
+`0|false|off`.  iter-326 default-flipped both (per ADR sections in this
+doc).
+
+### Finding
+At HEAD with no env override:
+- `use_q6k_nr2 = true` → all dense Q6_K mv routes to
+  `kernel_mul_mv_q6_K_f32_nr2`
+- `use_q6k_id_nr2 = true` → all MoE Q6_K _id mv routes to
+  `kernel_mul_mv_id_q6_K_f32_nr2`
+- Baseline `kernel_mul_mv_q6_K_f32` and `kernel_mul_mv_id_q6_K_f32`
+  fire **only** under explicit opt-out
+
+iter-352's 3.41% baseline observation was captured **before**
+iter-326's default-flip.  At HEAD that line item is 0% in production
+gemma4 decode.
+
+### Chesterton's fence
+Both baseline kernels remain registered (`kernel_registry.rs:81` +
+`:233`) because they still serve the documented opt-out path.  Removing
+the registration would break the `=0/false/off` env contract.  Leave
+in place.
+
+### Action
+None.  This is a confirmation that the NR2 default-on flip from
+iter-326 is fully effective at HEAD; no residual baseline leak exists.
+
+### Tests + bench
+No code change (analytic verification of dispatcher branches only).
+
+### Investigation count this thread
+66 total: 65 from iter-408 + this iter (q6_K baseline branch
+confirmed OFF — non-finding, not falsification).
+
+### Operator decision matrix (unchanged)
+Same six rows as iter-408.  No new lever identified.
