@@ -18268,3 +18268,72 @@ Mechanical work: ~45 × 1-line edits = ~45 minutes.
 
 ### Investigation count this thread
 41 total: 40 from iter-383 + this iter (signature change proof).
+
+## iter-385 — Option 1 cascade complete: 42 encode-fn signatures changed
+
+### Date
+2026-05-10
+
+### Goal
+Per iter-384 plan: cascade the `&mut MlxBuffer` → `&MlxBuffer` change
+across all 42 remaining encode-fn signatures in mlx-native/src/ops/.
+
+### Implementation
+Single global sed replace across the 12 affected files:
+```
+$ for f in $(grep -rl ": &mut MlxBuffer" src/ops/); do
+    sed -i '' 's/: &mut MlxBuffer/: \&MlxBuffer/g' "$f"
+  done
+```
+
+Result: 42 signatures changed across 12 ops modules in a single pass.
+
+### Cascade fix: test helpers needed restore
+The sed was too aggressive — it also caught test-only helper fns like
+`fn fill_f32(buf: &mut MlxBuffer, vals: &[f32])` which call `as_mut_slice`
+INSIDE (test setup code, not encode code).  These needed restoration to
+`&mut MlxBuffer`:
+- `moe_dispatch.rs:1400, 1717` — `fill_f32` test helper
+- `slice_concat_2d.rs:181` — `write_params_u32` test helper
+
+After restoration, all 290 mlx-native lib tests pass.
+
+### Verification
+- mlx-native lib: 290/0 passing.
+- hf2q build: clean (auto-coercion handles call sites).
+- gemma4 coherence: "What is 2+2?" → " + 2 = 4<turn|>" intact.
+- gemma4 bench (3 trials): 75.0 / 74.9 / 75.0 tok/s — mean **74.97**
+  (vs iter-377 baseline 74.83, within run-to-run noise σ ~0.1).
+
+### Status: Arc<MlxBuffer> sharing now unblocked
+
+With encode fns accepting `&MlxBuffer`, worker threads can hold
+`Arc<MlxBuffer>` clones and pass `&*arc` (which derefs to `&MlxBuffer`)
+without borrow-checker conflict.  The fundamental blocker is removed.
+
+### Path forward (iter-386+)
+
+- **iter-386**: Wire EncoderWorker into `forward_decode` for parallel layer
+  encoding.  Main thread encodes layers 0..N; worker encodes layers
+  N..29 + LM head + softmax + argmax.  Both commit cmd_bufs in order.
+- **iter-387**: Bench A/B + tune split point N.
+- **iter-388+**: Ship default-on if positive; falsify + revert if not.
+
+### Files changed (mlx-native)
+- src/ops/quantized_matmul_ggml.rs
+- src/ops/mul_mv_ext.rs
+- src/ops/moe_dispatch.rs (with test helper restoration)
+- src/ops/flash_attn_prefill.rs
+- src/ops/dense_gemv_bf16.rs
+- src/ops/dense_mm_f32_f32.rs
+- src/ops/quantized_matmul_id_ggml.rs
+- src/ops/flash_attn_train.rs
+- src/ops/dense_mm_f16.rs
+- src/ops/dense_mm_bf16.rs
+- src/ops/slice_concat_2d.rs (with test helper restoration)
+- src/ops/flash_attn_prefill_d512.rs
+
+12 files, 42 sig changes net.
+
+### Investigation count this thread
+42 total: 41 from iter-384 + this iter (refactor cascade complete).
