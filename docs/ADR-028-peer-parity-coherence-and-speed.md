@@ -17618,3 +17618,74 @@ No code change shipped this iter.
 
 ### Investigation count this thread
 32 total: 31 from iter-374 + this iter (audit-only).
+
+## iter-376 — pipeline threadGroupSizeIsMultiple hint FALSIFIED (-0.03%, 33rd investigation)
+
+### Date
+2026-05-10
+
+### Discovery + correction of iter-375
+
+iter-375 H3 dismissed `threadGroupSizeIsMultipleOfThreadExecutionWidth` because
+"metal-0.33.0 doesn't expose this API."  **That was incorrect.**  Re-checked
+metal-0.33.0/src/pipeline/compute.rs:130-141: the API IS exposed via
+`set_thread_group_size_is_multiple_of_thread_execution_width(bool)`.  Single
+safe Rust call.
+
+### Implementation
+
+Added `HF2Q_PIPELINE_TG_MULT_HINT=1` env-gated call to BOTH pipeline creation
+paths in `kernel_registry.rs` (primary at line 968+ and function-constant at
+line 1099+).  When set, all created pipelines have the hint enabled.
+
+### Coherence verification
+```
+$ HF2Q_PIPELINE_TG_MULT_HINT=1 (+ iter-321 stack)
+"What is 2+2?" → " + 2 = 4<turn|>"  ✓
+```
+
+All hot kernels use tg_size ∈ {32, 64, 256, 1024} — all multiples of 32.
+No undefined behavior triggered.
+
+### Bench (gemma4-ara-2pass-APEX-Q5_K_M, 200-tok decode, iter-321 stack ON)
+
+5-pair interleaved A/B:
+
+| Trial | OFF (default) | ON (HF2Q_PIPELINE_TG_MULT_HINT=1) |
+|---|---|---|
+| 1 | 74.9 | 74.9 |
+| 2 | 75.0 | 75.0 |
+| 3 | 74.8 | 74.8 |
+| 4 | 74.9 | 74.8 |
+| 5 | 74.8 | 74.8 |
+| **mean** | **74.88** | **74.86** |
+
+Δ = **-0.03%** — within run-to-run noise.
+
+### Why no improvement?
+
+Apple's Metal compiler already optimizes for our static, known-at-dispatch-site
+threadgroup sizes.  The hint helps when the compiler CAN'T prove the multiple
+constraint (e.g., dynamic dispatch sizes from scalar params).  Our dispatchers
+either:
+1. Hard-code tg_size at compile time (matmul kernels: `MTLSize::new(8, 8, 1)`)
+2. Compute tg_size via `min(256, dim.next_power_of_two())` — always multiple
+   of 32 once dim ≥ 32
+
+In both cases, the compiler's existing constant-folding + range analysis
+already knows the multiple constraint.  The hint provides no new information.
+
+### Action
+
+- Code KEPT (~6 LOC across both pipeline-creation paths).  Env-gated default-OFF.
+- Operator can opt-in via `HF2Q_PIPELINE_TG_MULT_HINT=1` for niche dynamic-tg
+  scenarios where it might matter.
+- Production decode unchanged.
+
+### Tests + bench
+- mlx-native lib: 287/0 passing.
+- hf2q lib: 3454/0 passing.
+- Coherence verified at HINT=1 + iter-321 stack.
+
+### Investigation count this thread
+33 total: 32 from iter-375 + this iter (parity ✓ infrastructure ✓ no perf win).
