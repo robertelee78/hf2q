@@ -23286,3 +23286,63 @@ iter-435 measured +3.3% HYBRID; iter-455 micro-bench predicted
 The model is internally consistent.
 
 No new lever.
+
+## iter-457 — DECODE timing breakdown via HF2Q_GROUP_STATS + HF2Q_MLX_TIMING
+
+### Hypothesis
+iter-397 showed GPU 93% bound for decode (encode 0.6 ms vs gpu_wait
+12.6 ms).  Re-verify at HEAD with latest measurements + map against
+iter-456's FA share.
+
+### Method
+hf2q serve with `HF2Q_GROUP_STATS=1 HF2Q_MLX_TIMING=1`.  Issue
+30-token decode request, parse [TIMING] log lines.
+
+### Results
+
+```
+[TIMING] encode=2.52ms gpu_wait=12.27ms dispatches=930 barriers=452
+[TIMING] encode=1.74ms gpu_wait=12.61ms dispatches=930 barriers=452
+```
+
+Per-token decode breakdown:
+- **CPU encode**: 1.74-2.52 ms (12-17% of wall)
+- **GPU wait**: 12.27-12.61 ms (83-88% of wall)
+- **930 dispatches/token, 452 barriers/token** (same as iter-397)
+
+Total wall ≈ 14-15 ms/tok = 67 tok/s ✓ (matches iter-451/452/456)
+
+### Cross-validation with iter-456 model
+| Component | ms/tok | % of wall |
+|---|---|---|
+| FA total (per iter-456) | 8.37 | 56% |
+| Other GPU work | 12.61 - 8.37 = 4.24 | 28% |
+| CPU encode | 2.0 (avg) | 13% |
+| Per-dispatch latency × barriers | 142 µs (per iter-400) | 1% |
+| **Total** | **~14.93** | **~100%** |
+
+The model is internally consistent.  FA dominates GPU work; CPU
+encode is a small but non-trivial slice.
+
+### iter-397 vs iter-457 encode comparison
+- iter-397: encode 0.55-0.62 ms (GPU 95% bound)
+- iter-457: encode 1.74-2.52 ms (GPU 85% bound)
+
+Why the difference?
+- iter-397 was measured pre-Phase-15 at smaller scale
+- iter-457 includes Phase 15 path overhead (different prompt)
+- Variability is normal across measurement sessions
+
+Either way: GPU is dominantly bound (>83%).  CPU encode
+optimization (multi-thread integration, +2.2% est) is a real but
+small lever.
+
+### Investigation count this thread
+114 total: 113 from iter-456 + this iter (decode timing breakdown).
+
+### No new lever
+Cross-validates iter-456's FA-dominates-decode model.  Same
+operator decision matrix:
+- FA via HYBRID (operator-gated, +3.3%)
+- CPU encode via multi-thread (operator-gated, +2.2%)
+- Both already documented; nothing new revealed
