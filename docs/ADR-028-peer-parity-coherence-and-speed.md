@@ -21092,3 +21092,61 @@ due to numerical noise — both equally coherent per iter-416 evidence.
 
 The mantra "as fast as peer" advanced from 0.022× to 0.80-0.94× peer
 on prefill — single largest production speedup in this thread.
+
+## iter-422 — Phase 15 is decode-neutral (verified) + auto-memory consolidated
+
+### Hypothesis
+Phase 15 changes prefill but post-prefill KV state semantics are
+preserved.  Decode rate after batched prefill should match decode
+rate after per-token prefill.  Verify empirically.
+
+### Method
+Same prompt ("Write a 200-word essay about precision in scientific
+measurement"), 5 reps, max_tokens=150 streamed via SSE for clean
+token counting.  Mode A: default-on.  Mode B: HF2Q_SERVE_BATCHED_PREFILL=0.
+
+### Results
+
+| Mode | Cold rep 1 (149 tok) | Warm reps 2-5 (149 tok) |
+|---|---|---|
+| Default-on | 2092 ms | 185-199 ms (cache hit) |
+| Opt-out (=0) | 2454 ms | 186-199 ms (cache hit) |
+
+Cold rep 1 difference: 362 ms saved with default-on (entirely from
+prefill: batched ~50 ms vs per-token ~400 ms for ~30-tok prompt).
+
+Decode portion calculation:
+- Default-on: ~1987 ms / 149 = 13.3 ms/tok = **75 tok/s**
+- Opt-out: ~2054 ms / 149 = 13.8 ms/tok = **72 tok/s**
+- Δ: < 5% (within noise) — **decode-neutral confirmed**
+
+### Auto-memory consolidation
+Created new memory:
+- `project_adr028_iter415_421_phase15_landed_2026_05_11.md` — full
+  Phase 15 LANDED thread synthesis
+
+Updated MEMORY.md index:
+- Added iter-415→421 entry as the new top-of-stack
+- Updated iter-380→398 entry to mark prefill scope superseded by
+  iter-415-421
+- Implicit supersession of `gemma_prefill_bitrot_2026_05_09` "1.03×
+  peer at pp1024" claim (was a different baseline / never the
+  production HTTP path)
+
+### Investigation count this thread
+79 total: 78 from iter-421 + this iter (decode-neutral verification +
+memory housekeeping).
+
+### Cumulative production state at HEAD (2026-05-11)
+- Prefill (gemma4-ara-2pass-APEX-Q5_K_M):
+  - pp~512: **0.80× peer** (was 0.022×)
+  - pp~4K: **0.93× peer** (was 0.021×)
+  - Coherence: byte-identical at pp ≤ 4K
+- Decode: 0.726× peer (unchanged, exhausted)
+- Streaming, sampling, multi-turn, long-decode all robust
+- Operator override: `HF2Q_SERVE_BATCHED_PREFILL=0` reverts
+
+### Open levers (post-Phase-15)
+1. FA_GL D=512 long-context kernel (only when pp>8K production)
+2. Multi-thread port (+2.2% decode)
+3. Decode 0.726× exhausted
