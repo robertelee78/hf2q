@@ -20149,3 +20149,76 @@ opens new lane).
 
 **Prefill jumps to top of decision matrix as the largest gap +
 freshest unworked lane.**
+
+## iter-412 — prefill scaling: gap CLOSES from 0.509× → 0.900× peer at pp8013
+
+### Hypothesis
+iter-411 measured prefill at pp413 only and reported 2.0× slower than
+peer.  The auto-memory's "1.03× peer at pp1024" claim is irreconcilable
+with that — must be size-dependent.  Verify hf2q prefill across a
+range of prompt sizes vs peer at matching sizes.
+
+### Method
+hf2q `generate --max-tokens 1` at 5 prompt sizes (1013, 2013, 4013,
+8013, 16013 tokens), 3 reps each, parsed from "Batched prefill
+complete" line.  Peer `llama-bench -p N -n 0 -r 3` at matching N.
+
+### Results
+
+| Tokens | hf2q (tok/s, 3 reps) | Peer (tok/s, 3 reps) | Ratio |
+|---|---|---|---|
+| 413 | 1449.5 ± 8.6 | 2848.4 ± 25.5 | **0.509×** |
+| 1013 | 2099.4 ± 16.7 | 3139.2 ± 22.0 | **0.669×** |
+| 2013 | 2437.7 ± 6.8 | 3080.8 ± 8.2 | **0.791×** |
+| 4013 | 2550.4 ± 7.0 | 2949.8 ± 42.0 | **0.864×** |
+| 8013 | 2416.1 ± 4.0 | 2683.8 ± 46.3 | **0.900×** |
+| 16013 | 1947.5 ± 41.4 | — (not benched) | — |
+
+**Critical finding**: gap closes from **2.0× slower at pp413** to
+**1.11× slower at pp8013**.  iter-411's "2.0× slower" was measured at
+the worst point of the scaling curve (small-prompt overhead-dominated
+regime).
+
+### Reconciliation with auto-memory
+- `gemma_prefill_bitrot_2026_05_09` claimed "hf2q BEATS llama.cpp at
+  pp1024 (1.03× peer)" — today's measurement: 0.669× peer at pp1013,
+  not 1.03×.  Likely the 2026-05-09 number was on a different model or
+  used a different baseline.  The structural shape (prefill scales
+  better than decode) is consistent with that older work.
+- Today is the canonical re-measurement at HEAD.
+
+### Two distinct levers identified
+
+**Lever A — small-prompt CPU overhead (pp413: 0.509× peer)**
+At small prompt sizes, fixed CPU encoding cost dominates and we lose
+2× to peer.  Same root cause as decode's CPU encoding finding
+(iter-397 GPU 93% bound) but the GAP is bigger because prefill is
+shorter-running per-token.  Multi-thread infra (iter-380-396) would
+help here proportionally more than at decode.
+
+**Lever B — 16K regression (pp16013: 1947 vs ramp-up suggests
+~2300+ if linear)**
+At 16013 tokens, throughput drops 24% vs the pp4013 peak (2550 →
+1947).  Peer not benched at 16K but their pp8013 is 2684 — likely
+holds 2400+ at 16K.  Possible causes:
+- Sliding-window inefficiency in our SDPA at long sequences
+- Memory bandwidth pressure as KV cache grows past L1/L2
+- TQ-HB encoding cost growing super-linearly
+
+### Investigation count this thread
+69 total: 68 from iter-411 + this iter (prefill scaling curve).
+
+### Operator decision matrix (REFINED — prefill story corrected)
+
+| Lever | Predicted | Empirical | Cost |
+|---|---|---|---|
+| **Prefill at small prompt sizes** | 0.509× peer at pp413 | confirmed 2.0× slower | fix CPU overhead → multi-thread direct hit |
+| **Prefill at 16K** | regression vs peak | 1947 vs 2550 (24% drop) | sliding-window or BW investigation |
+| Prefill at pp4-8K | "1.03× peer" auto-memory | actually 0.86-0.90× peer | gap is real but small |
+| Multi-thread port | +2.2% decode (iter-397) | likely larger at small-prefill | 5-8 iters/focus session |
+| Decode 0.726× peer | exhausted | confirmed | — |
+
+**Actionable**: small-prompt prefill overhead is the freshest
+high-leverage lane.  Multi-thread infra is already in place
+(iter-380-396), and small-prompt regime is exactly where CPU
+encoding amortization helps most.
