@@ -18574,3 +18574,78 @@ port:
 
 ### Investigation count this thread
 45 total: 44 from iter-387 + this iter (mechanical cascade LANDED).
+
+## iter-389 — verify layer loop body is &self-only after iter-388
+
+### Date
+2026-05-10
+
+### Goal
+Per iter-388, the activation cascade converted 23 `&mut self.activations.X`
+→ `&self.activations.X`.  iter-389 verifies no remaining `&mut self`
+mutations exist inside the layer loop body (lines 2748-4595, 1848 LOC).
+
+### Verification
+
+```
+$ awk 'NR>=2748 && NR<=4595' forward_mlx.rs | \
+    grep -nE "&mut self|self\.[a-z_]+ ?\+= ?|self\.[a-z_]+ ?\-= ?"
+(0 matches — completely clean)
+```
+
+Plus a deeper scan for any patterns I might have missed: 0 hits on
+`&mut self`, `self.X +=`, `self.X -=`.
+
+For reference, **52 LOCAL mutations** (`let mut X`, `total_dispatches +=`)
+exist in the loop body, but these are caller-owned state (no `&mut self`
+needed).
+
+### Where the remaining `&mut self` mutations live (PRE-LOOP)
+
+iter-387's probe identified:
+- `self.decode_step += 1` — line 2496 area (pre-loop counter)
+- `self.decode_step_dump_counter += 1` — line 2499 (pre-loop)
+- `self.kv_caches[layer_idx].write_pos += 1` — line 2522 (pre-loop kv_info
+  setup, NOT inside layer encoding loop)
+- `self.kv_caches[layer_idx].seq_len += 1` — line 2523 (pre-loop kv_info)
+- `self.hybrid_kv = Some(...)` — line 2559 (pre-loop lazy alloc)
+- `self.leg_hb_encoded = Some(...)` — line 2593 (pre-loop lazy alloc)
+
+**ALL `&mut self` mutations are PRE-LOOP.**  The layer-encoding loop itself
+is read-only on `self`.
+
+### Implication for iter-390+ extraction
+
+Extracting the layer-loop body into a free fn or `&self` method is now
+mechanical:
+
+1. The fn signature: `fn encode_one_layer(&self, layer_idx: usize,
+   session: &mut GraphSession, gpu: &mut GpuContext, ctx: &LayerCtx)
+   -> Result<()>`
+2. `LayerCtx` is a struct holding the cross-layer constants from
+   forward_decode's pre-loop setup (eps, dump flags, dual_buffer_splits,
+   kv_info, etc.).
+3. forward_decode's pre-loop section computes the mutations + builds
+   `LayerCtx`, then calls `encode_one_layer` in a loop.
+4. For parallelization (iter-391+): split the loop range across threads,
+   each thread calls `encode_one_layer(&self_arc, ...)` for its layers.
+
+### Why this is a productive iter (not a no-op)
+
+iter-388 mechanical cascade + iter-389 verification together prove:
+- The 1848-LOC layer body, post-cascade, requires NO further refactoring
+  for `&mut self` removal.
+- The extraction in iter-390 is now a STRAIGHTFORWARD bundle-params-
+  into-a-struct operation.
+- The risk of iter-390 is LOW: each line of the loop body relocates
+  verbatim into the new fn (just gains a self-prefix on local vars
+  promoted to ctx).
+
+This converts iter-390's risk profile from "1848-LOC refactor with
+unknown borrow-checker issues" to "1848-LOC mechanical relocation".
+
+### Tests + bench
+No code change this iter (verification only).
+
+### Investigation count this thread
+46 total: 45 from iter-388 + this iter (verification only).
