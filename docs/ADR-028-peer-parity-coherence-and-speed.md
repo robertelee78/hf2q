@@ -19823,3 +19823,66 @@ These could be aligned in future iters if desired (perf-neutral, code-quality).
 
 ### Investigation count this thread
 63 total: 62 from iter-405 + this iter (4/4 main mv alignment + l2_norm audit).
+
+## iter-407 — rms_norm_v2 + fused_norm_v2 peer-pattern audit (already equivalent)
+
+### Date
+2026-05-10
+
+### Goal
+Per /loop "continue until complete" + iter-401-406 alignment momentum,
+audit the V2 reduction kernels (rms_norm_f32_v2 — 17.19% of dispatches,
+fused_norm_add_f32_v2, fused_post_ff_norm2_endlayer_f32_v2,
+fused_moe_routing_f32_v2) for peer-pattern alignment opportunities.
+
+### Findings
+
+Reading peer's `kernel_rms_norm_fuse_impl` (ggml-metal.metal:2990) vs our
+`rms_norm_f32_v2`:
+
+| Pattern | Peer | Ours |
+|---|---|---|
+| 3D dispatch indices (i01/i02/i03 vs row_idx) | `int` | `uint` |
+| Loop counter (i00 vs i) | `int` | `uint` |
+| Thread positions (tpitg/sgitg/tiisg) | `ushort` | `ushort` |
+| Sum of squares | `dot(x[i00], x[i00])` | `dot(v, v)` |
+| Reduction | simd_sum + cross-SG broadcast | simd_sum + per-SG staging |
+| Weight application | `x*scale*f0[i00]` | `(input * rms_inv) * weight[i]` |
+
+**Our pattern is already peer-equivalent**.  Both `uint` and `int` are
+32-bit on Apple GPU; differences below compiler-significance threshold.
+Vectorization (float4) + simd_sum reduction match peer.
+
+### Why this matters
+
+iter-401-406 found `short` indexing wins on q-K matmul kernels because
+those use SMALL indices (tid 0..31, tiisg 0..31).  RMS norm uses LARGER
+indices (row_idx up to thousands of rows in batched prefill, dim4 up to
+hundreds).  `short` would overflow.  `uint` matches peer's `int` for
+this scale.
+
+### No new alignment ships this iter
+
+NO peer-pattern alignment opportunity in V2 reduction kernels.  iter-401-406
+captured all the small-index `short` wins.
+
+### Tests + bench
+No code change shipped.  Audit only.
+
+### Investigation count this thread
+64 total: 63 from iter-406 + this iter (V2 reduction audit, no change).
+
+### Cumulative state at iter-407 (post 64 investigations)
+
+- 5 LANDED phases (default-on)
+- 4 peer-pattern alignments (Q4_K + Q5_K + Q6_K NR2 + Q6_K_ID NR2 mv kernels)
+- 19-iter multi-thread infra (ready for integration)
+- 1 test-tolerance fix (Q4_0 ID iter-405)
+- 33 falsified investigations
+- 5+ measurement iters
+- Default decode: 0.730× peer 103
+- Hybrid decode: 0.749× peer 103
+
+Per /loop "continue until complete" mantra, kernel-level peer-pattern
+alignment is now COMPLETE for the gemma4 hot path.  All small-index
+matmul kernels use `short`, all V2 reductions use `uint` (matching peer).
