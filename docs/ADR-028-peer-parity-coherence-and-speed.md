@@ -23000,3 +23000,71 @@ Per iter-444 + iter-451:
 - HF2Q_NO_RESIDENCY=1 escape hatch works correctly
 
 No code change needed.  This is a confirmation of correct defaults.
+
+## iter-452 — canonical production A/B at HEAD (5-rep tight)
+
+### Hypothesis
+Across iter-410/432/433/435/451, hf2q decode measurements ranged
+66-77 tok/s and peer 93-111 tok/s.  Establish a definitive
+canonical reference at HEAD with tight 5-rep sampling on identical
+prompt structure both stacks.
+
+### Method
+- llama-server (peer) + hf2q-serve (default-on Phase 15) running
+  simultaneously
+- 5 unique "Tell me about Mars in 100 words" + random-salt prompts
+- max_tokens=128, T=0, streaming SSE
+- Token count = sum of `delta.content` + `delta.reasoning_content`
+  chunks (peer's reasoning_content counts for fairness)
+- e2e tok/s = total tokens / HTTP wall
+
+### Canonical results
+
+| Stack | tok/s (5 reps) | mean ± std |
+|---|---|---|
+| **Peer** llama.cpp 9010 | 93.63 / 92.86 / 92.45 / 93.14 / 93.07 | **93.0 ± 0.4** |
+| **hf2q** Phase 15 default-on | 63.16 / 66.78 / 66.98 / 66.66 / 66.94 | **66.1 ± 1.5** |
+| **Ratio** | | **0.711× peer e2e** |
+
+### Reconciliation with prior measurements
+
+| Iter | hf2q | peer | Notes |
+|---|---|---|---|
+| 410 | 75 | 103.68 | llama-bench tg128 (different methodology) |
+| 432 | 76.5 | 110.7 | HTTP streaming, max=150 |
+| 433 | 64-68 | 104.5 | history-of-computing prompt (varies per output) |
+| 435 | 66.9 | — | hf2q only |
+| 451 | 66.9 | — | hf2q only |
+| **452** | **66.1** | **93.0** | **canonical 5-rep tight at HEAD** |
+
+The variance reflects per-prompt content effects on token generation
+patterns (different model outputs → different effective tok/s).
+**iter-452 is the canonical reference going forward** — same
+methodology both stacks, 5-rep tight sampling, identical prompt
+structure.
+
+### Refined operator mantra status
+
+Per "as fast as peer for gemma4-ara-2pass-APEX-Q5_K_M.gguf":
+- **Production e2e (HTTP serve)**: 0.711× peer (29% slower)
+- **Prefill (Phase 15)**: 0.94× peer (6% slower)
+- **Decode floor (pure)**: 0.69× peer (per iter-432/435/451)
+
+The 29% e2e gap on long-form generation is the structural decode
+floor + residual prefill gap.  Phase 15 closed the prefill 47×
+gap to 6%; remaining work is operator-decision-gated.
+
+### Investigation count this thread
+109 total: 108 from iter-451 + this iter (canonical 5-rep tight A/B).
+
+### Operator decision matrix (refreshed canonical numbers)
+| Lever | Status | Production e2e impact |
+|---|---|---|
+| Phase 15 default-on | ✓ shipped | prefill 35-43× ratio improvement |
+| HYBRID_KV | OPERATOR-GATED | ~+3.3% (33% memory cost) |
+| Multi-thread | OPERATOR-GATED | ~+2.2%, 5-8 iters |
+| FA_GL F8 K | OPERATOR-GATED | multi-iter |
+| Decode floor | exhausted | 0.69× peer pure |
+| MTLResidencySet | ✓ default-on | +0.7% (iter-451) |
+
+Canonical ratio: **0.711× peer e2e production**.
