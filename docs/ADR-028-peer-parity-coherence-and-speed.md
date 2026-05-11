@@ -23068,3 +23068,37 @@ gap to 6%; remaining work is operator-decision-gated.
 | MTLResidencySet | ✓ default-on | +0.7% (iter-451) |
 
 Canonical ratio: **0.711× peer e2e production**.
+
+## iter-453 — auto-memory thread synthesis (iter-422-452 consolidated)
+
+### Action
+Created new auto-memory:
+`project_adr028_iter422_452_thread_2026_05_11.md`
+
+Captures 31-iter post-Phase-15 thread:
+- 8 peer-parity audits (all confirming structural parity)
+- 2 doc bug fixes shipped (hybrid memory math, FA_GL nkv)
+- Default-OFF perf-flag exhaustive audit (4 flags)
+- Coherence verdict (TIED on tested prompts)
+- Multi-thread infra audit (READY but UNUSED)
+- LANDED phase inventory (9 default-active, 0 regressions)
+- Canonical production reference (0.711× peer e2e)
+
+Updated MEMORY.md index to surface the new thread synthesis at top
+of stack, with iter-415-421 below.
+
+### Cumulative auto-memory entries for this work-of-record
+1. `project_adr028_iter380_398_thread_2026_05_10` — multi-thread infra prep
+2. `project_adr028_iter415_421_phase15_landed_2026_05_11` — Phase 15 LANDED
+3. **`project_adr028_iter422_452_thread_2026_05_11`** (this iter) — audit + canonical
+
+### Investigation count this thread
+110 total: 109 from iter-452 + this iter (memory consolidation).
+
+### State summary at HEAD
+- 109+ investigations across iter-409→452
+- Phase 15 LANDED + default-on
+- Production: prefill 0.94× peer / decode 0.69× peer pure / e2e 0.711× peer
+- 8 peer-parity audits done
+- 2 doc bugs fixed (3.19→2.65 hybrid math, nkv=8 FA_GL)
+- Operator decision matrix: 3 multi-iter levers remaining (HYBRID_KV, multi-thread, FA_GL F8 K)
