@@ -24050,3 +24050,47 @@ All compose cleanly on gemma4-ara-2pass-APEX-Q5_K_M.gguf.
 Two operator-actionable flags shipped this thread:
 1. **HF2Q_SERVE_BATCHED_PREFILL** (iter-421 default-on): 35-43× prefill
 2. **HF2Q_TOKENIZER_GGUF_EMBEDDED** (iter-466 opt-in): -200 ms startup
+
+## iter-468 — tokenizer A/B: 5/5 byte-identical outputs (parity claim verified)
+
+### Hypothesis
+iter-466 shipped HF2Q_TOKENIZER_GGUF_EMBEDDED opt-in based on
+ADR-022 P1.11's parity claim ("byte-identical token streams").
+Verify the claim empirically at HEAD by side-by-side content
+comparison.
+
+### Method
+Run both server modes simultaneously (A: on-disk tokenizer.json,
+B: HF2Q_TOKENIZER_GGUF_EMBEDDED=1).  Send 5 identical prompts to
+both, compare response content byte-by-byte.
+
+### Results
+
+| Prompt | A (on-disk) | B (GGUF-embedded) | Identical |
+|---|---|---|---|
+| "What is 2+2? Reply only with the number." | `"4"` | `"4"` | ✓ |
+| "Name a color. Reply with one word." | `"Azure"` | `"Azure"` | ✓ |
+| "Capital of Japan? Reply with one word." | `"Tokyo"` | `"Tokyo"` | ✓ |
+| "5 times 6? Reply with the number only." | `"30"` | `"30"` | ✓ |
+| "Speed of light in m/s?" | `"The approximate speed of light is **299,792,458 m/s**..."` | same | ✓ |
+
+**5/5 BYTE-IDENTICAL.**  Parity claim confirmed at HEAD.
+
+### Default-flip readiness assessment
+- ✓ Parity test passes
+- ✓ 5/5 content byte-identical (this iter)
+- ✓ 10/10 stable on varied prompts (iter-467)
+- ✓ Streaming + sampling + multi-turn all work (iter-466 coherence)
+- ✓ 200 ms startup saving verified
+- ✓ build_tokenizer_from_gguf is gated to gemma4 load path (no qwen35 risk)
+
+**Remaining gate**: operator explicit approval to flip env_eq_one →
+env_default_true at engine.rs:2086.  Per standing rule "no deferrals
+without explicit operator approval", flip stays operator-decision-gated.
+
+### Investigation count this thread
+125 total: 124 from iter-467 + this iter (parity empirically verified).
+
+### Operator decision matrix unchanged
+The tokenizer flag is opt-in and validated.  Default-flip is a
+single-line change once operator decides.
