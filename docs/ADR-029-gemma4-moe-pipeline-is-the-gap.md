@@ -1,7 +1,7 @@
 # ADR-029: gemma4-APEX-Q5_K_M Decode Gap — Measurement-Driven Root Cause
 
-- **Status**: amended (2026-05-11); original framing RETRACTED, new framing measurement-grounded
-- **Date**: 2026-05-11 (original) → 2026-05-11 (rewrite iter-9)
+- **Status**: amended (2026-05-11); original framing RETRACTED, iter-9 rewrite + iter-10/11 amendment (H12 FALSIFIED)
+- **Date**: 2026-05-11 (original) → 2026-05-11 (rewrite iter-9) → 2026-05-11 (amendment iter-10/11)
 - **Supersedes**: itself (the original "MoE pipeline IS the gap" framing was wrong; this rewrite replaces it)
 - **Decision-grade evidence**: per-layer GPU timestamps from `MTLCommandBuffer.GPUStartTime/GPUEndTime` in real production decode
 - **Tags**: performance, root-cause, gemma4, measurement-discipline, baseline-correction
@@ -143,8 +143,9 @@ overhead between them.
 | H9 | Q6_K mul_mv_id already on NR2 (matches peer) | iter-1 verification | confirmed parity | **STANDING** (no work needed) |
 | H10 | MoE-3 barriers are redundant (487 emitted/tok) | iter-2 audit | tracker already dedupes via `conflicts_reason`; 487 is provably minimum | **FALSIFIED** |
 | H11 | hf2q's per-dispatch is slower because launch-overhead-bound | iter-5/6 model | CPU encode 0.19 µs negligible; gap is GPU-side | **FALSIFIED** |
-| **H12** | **F16 KV cache for gemma4 would close ~450 µs/tok of the ATTN gap** | **iter-9 model based on F32/F16/TQ-HB SDPA bench + per-layer phase data** | **not yet tested in production** | **STANDING — concrete next test** |
+| ~~H12~~ | ~~F16 KV cache for gemma4 would close ~450 µs/tok of the ATTN gap~~ | ~~iter-9 model~~ | **iter-11 LIVE TEST: HF2Q_HYBRID_KV=1 (ADR-028 Phase 10 — F16 K + TQ-HB V): coherent ✅ but throughput 61.4 t/s vs 73.9 baseline = -17% REGRESSION at σ-pct < 3%** | **🚨 H12 FALSIFIED** |
 | H13 | FFN sub-phase has a single dominant slow op | iter-9 split needed | un-localized | **STANDING — needs sub-split** |
+| **H14** | **Per-layer GPU drops 8 µs/layer under HYBRID (sliding 113→104 µs ATTN) AND 60 dispatches/tok eliminated, yet wall-clock loses 2.75 ms/tok. Therefore 3.5 ms/tok of CPU-or-cmd-buffer overhead is added by the HYBRID encode/SDPA path OUTSIDE the per-layer phase.** | **iter-11 measurement** | **not yet localized** | **STANDING — concrete next test (iter-12: find the 3.5 ms/tok)** |
 
 ## Decision
 
@@ -171,28 +172,66 @@ overhead between them.
 
 ## Action items (what's actually left to do)
 
-### A. F16 KV cache for gemma4 (priority 1; estimated ~3-4% throughput)
+### A. ~~F16 KV cache for gemma4~~ — REPLACED by iter-12 (localize the HYBRID 3.5 ms/tok overhead)
 
-**Current state**: hf2q gemma4 supports F32 KV (USE_DENSE) and TQ-HB
-KV (default). No F16 KV path.
+**iter-11 finding (2026-05-11 HEAD c50da032, fresh re-measure)**:
+F16 K-cache infrastructure already exists as ADR-028 Phase 10:
+- `HybridKvBuffers` (forward_mlx.rs:1105 — F16 K + TQ-HB V)
+- `flash_attn_vec_hybrid` SDPA kernel (mlx-native, Phase 10d)
+- `dispatch_kv_copy_kf16_quantize_v_no_fwht` fused write (Phase 10c.5)
+- `HF2Q_HYBRID_KV` env gate (investigation_env.rs:826)
+- Phase 10e wired SDPA dispatch + 10e.5 skipped FWHT-undo (V is raw)
 
-**Why F16**: peer's `kernel_set_rows_f16_i64` writes F16 K/V and
-peer's attention `mul_mv_f16_f32_4` reads F16. Bench shows F16 SDPA at
-21 µs/call vs F32 at 36.5 µs/call (1.74× speedup, bandwidth-bound).
+**Live measurement at HEAD c50da032** on gemma4-ara-2pass-APEX-Q5_K_M.gguf:
+| metric | HEAD (no HYBRID) | HF2Q_HYBRID_KV=1 | Δ |
+|---|---:|---:|---:|
+| decode t/s --benchmark n=5 | 73.9 (σ 0.07%) | **61.4 (σ 2.7%)** | **−17%** |
+| dispatches/layer (sliding) | 31 | 29 | −2/layer (−60/tok) ✓ |
+| per-layer GPU total (sliding) | 399 µs | 377 µs | −22 µs ✓ |
+| per-layer GPU total (full) | 451 µs | 412 µs | −39 µs ✓ |
+| ATTN-only (PHASE) sliding | 113 µs | 104 µs | −9 µs ✓ |
+| FFN-only (PHASE) sliding | 285 µs | 280 µs | −5 µs ✓ |
+| FWHT-pre+undo dispatches | present | eliminated | ✓ |
+| coherence (haiku 50-tok) | reference | "Neon lights aglow,…" — fluent ✓ | parity ✓ |
 
-**Work required**:
-1. Add `HF2Q_KV_DTYPE=F16` env path in `src/serve/forward_mlx.rs`
-   alongside the existing F32/TQ-HB branches.
-2. Allocate `kv_caches[i].k` / `.v` as F16 Metal buffers when active.
-3. Route attention through `flash_attn_vec` with F16 K/V dtype
-   (existing kernel; check if Metal-side already supports F16 K read).
-4. Coherence gate: 50-tok haiku byte-identical vs F32 baseline.
-5. Bench gate: ≥+2% throughput at σ-pct < 0.5%.
-6. Default-off pending operator approval (TQ-KV is the standing default).
+**Decomposition of the 2.75 ms/tok wall-clock regression**:
+- Per-layer GPU ↓ 240 µs/tok (savings, predicted +1.7%)
+- Per-token wall ↑ 2750 µs/tok (regression, measured −17%)
+- **Δ = +2.99 ms/tok overhead OUTSIDE the per-layer phase under HYBRID**
 
-**Falsification budget**: if F16 produces no measurable improvement
-over F32 at decode shape, H12 is falsified and the ATTN gap explanation
-needs revision.
+This is the new question. H14 (above) is the standing hypothesis.
+
+### A'. iter-12: localize the HYBRID +3 ms/tok wall-clock overhead
+
+**Candidate sources** (to test in iter-12+):
+1. Per-token CB-commit cost: HYBRID may commit fewer/larger CBs vs the
+   chunked legacy path → bigger latency tail per token if scheduler stalls.
+2. `flash_attn_vec_hybrid` kernel internal throughput at gemma4 head_dim=256
+   shapes is lower per-µs-of-CB than TQ-HB equivalent (despite measured
+   per-layer GPU being lower; some scheduling overhead may not show up in
+   `MTLCommandBuffer.GPUEndTime − GPUStartTime`).
+3. Cross-CB barrier scheduling: HYBRID's per-token CB graph (1 fused KV-write
+   + 1 SDPA-main + 1 SDPA-reduce + 0 FWHT-pre + 0 FWHT-undo) may serialize
+   differently than legacy (2 FWHT + 1 fused KV-write + 1 SDPA + 0 FWHT-undo).
+4. CPU encode work per HYBRID dispatch may be heavier (more args / arg
+   buffer construction) — testable via dispatch_count vs wall ratio.
+5. Phase 10c.5 fused KV-write may stall the GPU pipe in a way that
+   `kv_copy + 2× hadamard_quantize_kv` (legacy) does not.
+
+**Localization plan (iter-12)**:
+- (a) Add `HF2Q_DECODE_WALL_BREAKDOWN=1` that measures: token-pre-layer wall
+  + per-layer wall + token-post-layer wall + sampling wall. Each segment via
+  `Instant::now()` between CB commits.
+- (b) Run the same 5-trial bench under HYBRID with this instrumentation;
+  compute average µs/token across the 4 segments.
+- (c) Identify which segment carries the +3 ms/tok regression.
+
+**Falsification criterion**: if the segment-by-segment wall sums to ≈ measured
+wall (within 5%), the localization is correct. If a "missing time" gap remains,
+the regression is in CB scheduling or barrier hold-time and a different
+instrumentation (xctrace System Trace) is required.
+
+### B'. iter-13: FFN sub-phase split — UNCHANGED from iter-9 plan, deferred until iter-12 root-cause is closed
 
 ### B. FFN sub-phase split (priority 1, prerequisite to optimization)
 
@@ -330,7 +369,9 @@ disposition** — Action items A and B should be tried first.
 | 7 | c6a3e707 | MoE attribution retracted (real 12.6%, was 49%) |
 | 8 | — | Sub-bucket arithmetic continued to not add up; operator called out the pattern |
 | 9 | bc6ffd88 | **Per-layer + per-phase GPU instrumentation landed; TRUE root cause measured** |
-| 9 | this rewrite | ADR-029 rewritten to reflect measured ground truth |
+| 9 | c50da032 | ADR-029 rewritten to reflect measured ground truth (iter-stack collapse) |
+| 10 | this commit | Fresh re-measure at HEAD: hf2q 73.9 / peer 97.73 = 0.756× (σ-pct ≤ 1.2%, apples-to-apples confirmed). Per-phase parity-checks against iter-9 numbers: identical within noise. |
+| 11 | this commit | **HF2Q_HYBRID_KV=1 (ADR-028 Phase 10 F16-K+TQ-HB-V) LIVE TEST: COHERENT but −17% throughput regression. H12 FALSIFIED at wall-clock. Per-layer GPU savings (-22 µs sliding, -39 µs full) are real but +3 ms/tok overhead emerges OUTSIDE the per-layer phase. New H14 standing: localize the 3 ms/tok via iter-12 wall-breakdown instrumentation.** |
 
 ## Links
 
