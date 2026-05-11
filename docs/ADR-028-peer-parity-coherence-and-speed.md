@@ -17391,3 +17391,67 @@ iter-369 H3) — a multi-day engineering project not /loop-iter-tractable.
 - Pivot to qwen35 / prefill / additional models
 - Accept current ~0.723× peer asymptote on gemma4 decode default
 - Hybrid path 0.742× peer (iter-364) is the operator-recommended config
+
+## iter-373 — concurrent dispatch +8.3% quantified + dual_buffer_split default flipped 3→2 (LANDED +0.18%)
+
+### Date
+2026-05-10
+
+### Finding 1: Concurrent dispatch parallelism quantified
+
+Tested production (chain, iter-321 stack) with default `MTLDispatchType::Concurrent`
+vs `HF2Q_FORCE_SERIAL_DISPATCH=1` (forces every dispatch to wait for previous):
+
+| Config | Run 1 | Run 2 | Run 3 | Run 4 | Mean |
+|---|---|---|---|---|---|
+| Concurrent (default) | 75.2 | 75.1 | 74.9 | 74.8 | **75.00** |
+| Serial | 68.8 | 68.8 | 68.7 | 68.7 | **68.75** |
+
+Δ = **-8.3%** from forcing serial.  **Apple's `MTLDispatchTypeConcurrent` IS
+providing real GPU overlap on gemma4 decode** — independent dispatches in the
+same group (B8 3-norm, B9 3-matmul, B10 2-fused, B11 2-matmul) run in parallel
+on different compute units.
+
+### Finding 2: dual_buffer_split sweep — default flipped 3 → 2
+
+Production decode commits buf0 mid-forward (after layer N) so GPU starts work
+early while CPU continues encoding buf1.  Previous default = split after
+layer 3.  Sweep:
+
+| split | Trial 1 | Trial 2 | Trial 3 | Mean | vs split=3 |
+|---|---|---|---|---|---|
+| 1 | 73.9 | 73.8 | 73.9 | **73.87** | -1.1% |
+| **2** | 74.7 | 74.9 | 74.9 | **74.83** | **+0.18%** ✓ |
+| 3 (was default) | 74.6 | 74.7 | 74.8 | **74.70** | baseline |
+| 5 | 74.5 | 74.5 | 74.4 | **74.47** | -0.31% |
+
+Pattern: split=1 is too small (buf0 has only 1 layer of GPU work — not enough
+to overlap with CPU encoding the remaining 29 layers).  split=2 is the sweet
+spot (2 layers of GPU work covers CPU encoding budget).  split=5+ delays GPU
+start unnecessarily.
+
+### Action LANDED
+- `investigation_env.rs:dual_buffer_split` default flipped `Some(3)` → `Some(2)`.
+- Docstring updated with bench data + iter-373 reference.
+- Coherence verified: gemma4 "What is 2+2?" → "2 + 2 = 4<turn|>" intact.
+
+### Cumulative thread improvements (5 LANDED phases)
+
+| Phase | Iters | Δ at default | Status |
+|---|---|---|---|
+| Phase 9 (BATCHED_PREFILL) | iter-344 | +4.4× chat throughput | LANDED |
+| Phase 10 (hybrid F16-K + TQ-HB-V) | iter-346..354 | +2.4% decode (hybrid) | LANDED |
+| Phase 13 (fused_post_ff_norm2 V2) | iter-362 | +0.7% decode | LANDED |
+| Phase 13.2 (fused_moe_routing V2) | iter-363 | +0.3% decode | LANDED |
+| Phase 14 (dual_buffer_split=2) | iter-373 (this) | +0.18% decode | LANDED |
+| **Cumulative** | — | **+1.3% (legacy) / +4.1% (hybrid)** | — |
+
+### Tests + bench
+- mlx-native lib: 287/0 passing (no kernel changes).
+- hf2q lib: 3454/0 passing.
+- Coherence verified at new default + at explicit split=3 (both produce
+  identical "2 + 2 = 4" output).
+
+### Investigation count this thread
+30 total: 29 from iter-372 + this iter (+0.18% landed + 8.3% concurrent
+dispatch quantification).

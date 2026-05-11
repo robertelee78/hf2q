@@ -877,13 +877,20 @@ impl InvestigationEnv {
     /// Resolve the dual-buffer split point against the current model's
     /// layer count. Preserves the original inline behavior exactly:
     ///
-    /// - Env unset → default to `Some(3)` (split after layer 3).
+    /// - Env unset → default to `Some(2)` (split after layer 2).
     /// - Env set to a parsable `usize` → `Some(n)` only if
     ///   `n > 0 && n < num_layers`, else `None`.
     /// - Env set but not a `usize` → `None`.
+    ///
+    /// ADR-028 iter-373: default flipped 3 → 2.  3-cycle sweep on gemma4
+    /// at iter-321 stack: split=1 73.87 (-1.1%), split=2 74.83 (+0.18%),
+    /// split=3 74.70 (baseline), split=5 74.47 (-0.31%).  split=2 hits
+    /// the sweet spot — buf0 has 2 layers' worth of GPU work to overlap
+    /// with CPU encoding the remaining 28 layers.  split=1 has too little
+    /// work in buf0; split=5+ delays GPU start unnecessarily.
     pub fn dual_buffer_split(&self, num_layers: usize) -> Option<usize> {
         match self.dual_buffer_raw.as_deref() {
-            None => Some(3),
+            None => Some(2),
             Some(v) => v
                 .parse::<usize>()
                 .ok()
