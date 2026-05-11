@@ -24273,3 +24273,66 @@ Per operator mantra "as coherent + as fast as peer for gemma4":
 
 **Thread effectively complete.** Remaining work requires operator
 decisions on multi-iter architectural projects.
+
+## iter-472 — peer baseline re-verification: 92.77 ± 0.16 confirms iter-452
+
+### Hypothesis
+iter-432 measured peer at 110.7 tok/s while iter-452 measured 93.0
+on the same Mars-100w prompt.  Re-verify which is canonical.
+
+### Method
+5-rep tight measurement of peer (llama-server) with iter-452's exact
+prompt pattern ("iter472 r$r $RANDOM. Tell me about Mars in 100
+words.") via streaming SSE, counting both `delta.content` and
+`delta.reasoning_content` chunks.
+
+### Results
+
+| Rep | Tokens | Wall (ms) | tok/s |
+|---|---|---|---|
+| 1 | 125 | 1346 | 92.86 |
+| 2 | 125 | 1349 | 92.66 |
+| 3 | 125 | 1344 | 93.00 |
+| 4 | 125 | 1349 | 92.66 |
+| 5 | 125 | 1349 | 92.66 |
+| **Mean** | **125** | **1347** | **92.77 ± 0.16** |
+
+Very stable across 5 reps.  **Confirms iter-452's 93.0 ± 0.4 as the
+canonical peer Mars-prompt decode rate.**
+
+### Reconciliation with iter-432's 110.7
+iter-432 measured 147 chunks in 1325 ms = 110.9 tok/s for the same
+Mars prompt.  Today's iter-472: 125 chunks in 1347 ms.
+
+The difference is **chunk count** (147 vs 125 = +18%).  Possible
+causes:
+- iter-432's streaming may have produced more chunks due to
+  reasoning-content emission patterns
+- iter-432 might have triggered gemma4 reasoning mode (peer's auto-
+  inject `<|think|>` per iter-441) which boosted total token count
+- Different randomness across measurement sessions
+
+The CANONICAL number for peer Mars-prompt decode (iter-452 + iter-472
+agree): **~93 tok/s**.
+
+### Refined canonical ratio
+- hf2q at HEAD (iter-470): 67.04 tok/s
+- Peer canonical (iter-452 + iter-472): 92.88 tok/s
+- **Ratio: 0.722× peer**
+
+iter-432's 0.691× and iter-452's 0.711× cited slightly different
+baselines.  Today's tight re-bench gives **0.72× as the canonical
+production e2e ratio** for the Mars prompt.
+
+### Investigation count this thread
+129 total: 128 from iter-471 + this iter (peer baseline re-verified).
+
+### State at HEAD (production reality with canonical peer)
+- Prefill: 0.94× peer (Phase 15)
+- Decode/e2e: **0.72× peer canonical** (refined from 0.71×)
+- Coherence: TIED on tested prompts
+- Startup: 3.07 sec (gap 1.42s vs peer 1.65s)
+
+Per operator mantra: same qualitative status (gap closed substantially
+on prefill, structural floor on decode, identified architectural
+levers for further work).
