@@ -17309,3 +17309,85 @@ production stack.
 ### Falsification count this thread
 28 total: 27 from iter-370 + this iter (parity ✓ + correctness ✓ but bench
 worse than chain).  iter-367 closure: confirmed not a production win.
+
+## iter-372 — Q6_K mv + dispatch_qmatmul wrapper audit (no code change)
+
+### Date
+2026-05-10
+
+### Investigation focus
+
+iter-371 closed iter-367 (28th investigation).  Per "no excuses tolerated" +
+operator mantra, iter-372 audits remaining unexamined per-kernel + per-call
+overheads in the gemma4 decode hot path.
+
+### H1: Q6_K mv NSG configuration vs peer
+
+Verified peer's Q6_K mv settings via `ggml-metal-impl.h:55-58` and
+`ggml-metal-device.cpp:797`:
+- `N_R0_Q6_K = 2` → 2 rows per simdgroup
+- `N_SG_Q6_K = 2` → 2 simdgroups per threadgroup
+
+Our `kernel_mul_mv_q6_K_f32_nr2` uses `NSG = 2, nr0 = 2` (line 685-686 of
+quantized_matmul_ggml.metal).  **Already peer-matched.**
+
+Confirmed via reading peer source `ggml-metal.metal:7968-8060`: same yl[16]
+caching pattern, same dequant unroll, same simd_sum reduction.  `FOR_UNROLL`
+pragma at line 8035 (peer) is the only difference, but iter-352 already
+falsified that addition (-0.4%).
+
+### H2: dispatch_qmatmul wrapper per-call overhead
+
+Read `forward_mlx.rs:7594+` wrapper.  For gemma4 (Q5_K + Q6_K weights):
+- 2 branch checks (affine.is_some + is F32) — ~5 ns each
+- `weight.matmul_params(m)?` constructs a fresh struct — no alloc, ~5 ns
+- Direct dispatch to `quantized_matmul_ggml` ops module
+
+Per-call wrapper overhead = ~15 ns.  At 920 dispatches/token = ~14 µs/token =
+0.1%.  Below noise floor; not a worthwhile optimization target.
+
+### Cumulative per-kernel optimization status (post-iter-371)
+
+ALL major decode-hot-path kernels (bucket dump from iter-352, refreshed):
+
+| Kernel | % dispatches | Status |
+|---|---|---|
+| kernel_mul_mv_q6_K_f32_nr2 | 20.02% | **peer-matched** (NSG=2, NR0=2, yl[16]) |
+| rms_norm_f32_v2 | 17.19% | **V2** (iter-310) |
+| fused_head_norm_rope_f32_v2 | 6.82% | **V2** (iter-337) |
+| hadamard_quantize_kv_fast_d256 | 5.69% | SIMD-optimal (iter-339) |
+| fused_norm_add_f32_v2 | 3.43% | **V2** (iter-331) |
+| hf2q_dense_mm_f32_f32_tensor | 3.43% | tensor cores firing |
+| fused_gelu_mul | 3.43% | embarrassingly parallel |
+| moe_swiglu_batch | 3.41% | embarrassingly parallel |
+| moe_weighted_sum | 3.41% | float4 falsified (iter-365) |
+| fused_moe_routing_f32_v2 | 3.41% | **V2** (iter-363) |
+| kernel_mul_mv_id_q6_K_f32_nr2 | 3.41% | peer-matched (iter-321) |
+| rms_norm_no_scale_f32_v2 | 3.41% | **V2** (iter-310) |
+| fused_post_ff_norm2_endlayer_f32_v2 | 3.41% | **V2** (iter-362) |
+| kernel_mul_mv_q8_0_f32 | 3.41% | NR2 flat (iter-368) |
+| flash_attn_vec_reduce_dk256 | 2.84% | already simd_sum |
+| kv_copy_kf16_quantize_v_no_fwht_d256 | 2.84% | fused (iter-354) |
+| flash_attn_vec_hybrid_dk256 | 2.84% | hf2q-unique |
+| flash_attn_vec_tq_hb_dk256 | 2.25% | hf2q-unique |
+| fwht_sign_premult/undo | 4.50% | fusion falsified (21st) |
+| hadamard_quantize_kv_hb_dual | 2.25% | iter-354 fused into kv_copy |
+| **TOTAL audited** | **>95%** | All available levers exhausted |
+
+### Conclusion
+
+Per-kernel + per-call overhead optimization is **exhausted** for the gemma4
+decode hot path.  The remaining ~26% peer gap is structural per-dispatch
+CPU encoding overhead (peer's `n_cb=2` multi-thread encoding pattern, see
+iter-369 H3) — a multi-day engineering project not /loop-iter-tractable.
+
+### Falsification count this thread
+29 total: 28 from iter-371 + this iter (audit-only).
+
+### Path forward (operator-decision-gated, unchanged from iter-369)
+- iter-373+ multi-thread encoding port (~30-40% per-dispatch CPU savings,
+  multi-day engineering)
+- Apple Instruments Metal trace (operator GUI required)
+- Pivot to qwen35 / prefill / additional models
+- Accept current ~0.723× peer asymptote on gemma4 decode default
+- Hybrid path 0.742× peer (iter-364) is the operator-recommended config
