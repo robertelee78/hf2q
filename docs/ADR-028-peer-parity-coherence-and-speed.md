@@ -23165,3 +23165,67 @@ removed from the operator decision matrix.
 | ~~F16_KV~~ | DOMINATED by HYBRID | ~~+0.4%~~ | ~~49%~~ |
 | Multi-thread | OPERATOR-GATED | +2.2% | 0 (CPU only) |
 | FA_GL F8 K | OPERATOR-GATED | ~50% pp16K | small |
+
+## iter-455 — flash_attn_vec_tq_v2 hypothesis: already falsified by operator (Apr 14, 2026)
+
+### Hypothesis
+Per iter-454, V-side TQ-HB codebook lookup is essentially free; K-side
+is the speed cost.  What if K stayed byte-packed (TQ-HB memory) but
+used a different dequant pattern (tile-into-shared first, then
+attend)?  Could give HYBRID's speed without HYBRID's memory cost.
+
+### Method
+Search /opt/mlx-native shaders for any tile-dequant variant.
+
+### Discovery
+**`flash_attn_vec_tq_v2.metal`** EXISTS (12.7 KB shader, April 15 2026):
+- "Tiled shared-memory dequant variant"
+- "Dequants a tile of K positions into shared memory as half4, then
+  runs QK dot products from shared memory (same access pattern as
+  F16 SDPA)"
+- Designed to do exactly what hypothesis suggested
+
+But: NOT registered in kernel_registry, NOT wired in any dispatcher,
+NOT called from anywhere.  Looked abandoned.
+
+### Git log finding (operator already tested it)
+Commit `f1b3f1d` (April 14 2026, by Robert E. Lee):
+> "bench: v2 tiled dequant prototype — NEGATIVE result, v1 wins"
+
+**Operator's empirical results**:
+
+| Config | v1 fused | v2 tiled | F16 (no quant) |
+|---|---|---|---|
+| Sliding kv=1024 (hd=256) | 277μs | **502μs** | 214μs |
+| Global kv=1024 (hd=512) | 289μs | **679μs** | 252μs |
+
+**v2 is 1.5-2.5× SLOWER than v1**.
+
+Operator's commit message:
+> "The extra threadgroup barriers between dequant and dot product
+> phases cost more than the register pressure reduction saves. The
+> fused kernel (v1) is the better architecture — the compiler handles
+> register allocation well when dequant is interleaved with the dot
+> product. Keeping both the v2 shader and bench as documentation of
+> what was tried."
+
+### Implication for the architectural alternatives space
+| Approach | Speed (sliding kv=1024) | Memory |
+|---|---|---|
+| v1 TQ-HB fused (default) | 277μs | 3.94× savings |
+| v2 tiled dequant | 502μs (1.81× slower) | 3.94× savings |
+| F16 K (HYBRID/F16-K+TQ-HB-V) | 214μs (1.30× faster) | 2.65× savings |
+
+The architectural exploration is COMPLETE per operator's prior bench:
+- Tiled-dequant approach is dead (extra barriers cost more)
+- F16 K (HYBRID) is the only viable speed lever
+- TQ-HB memory savings can't be preserved while matching F16 K speed
+
+### Investigation count this thread
+112 total: 111 from iter-454 + this iter (tiled-dequant null per
+operator's prior bench).
+
+### No new lever — architectural alternatives space CLOSED
+HYBRID_KV remains the singular operator-actionable speed lever.
+The "tile-K-into-shared" alternative was already tested and falsified
+by the operator before this thread began.
