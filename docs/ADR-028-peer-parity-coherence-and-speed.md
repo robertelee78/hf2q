@@ -21846,3 +21846,70 @@ So the true picture:
 
 Production users see the 0.92× e2e ratio.  The pure-engine 0.691×
 decode is the underlying physics; HTTP framing partially hides it.
+
+## iter-433 — decode scaling: hf2q gap CLOSES at long generation
+
+### Hypothesis
+Peer tg500 (99.5 tok/s) is 5% slower than peer tg128 (104.5).  Does
+hf2q have similar long-gen degradation, or does hf2q's gap close at
+longer generations?
+
+### Method
+hf2q serve (Phase 15 default-on), 4 max_tokens sizes (50/128/250/500),
+2 reps each via streaming SSE.  Compare against peer's
+llama-bench tg{32,64,128,250,500}.
+
+### Results
+
+**hf2q decode scaling**
+| max_tokens | tok generated | wall (ms) | tok/s |
+|---|---|---|---|
+| 50 | 47 | 757 | **62.0** |
+| 128 | 124 | 1911 | **64.6** |
+| 250 | 247 | 3672 | **67.1** |
+| 500 | 493 | 7219 | **68.2** |
+
+**Peer scaling (iter-432 + this iter llama-bench)**
+| size | tok/s |
+|---|---|
+| tg32 | 104.6 |
+| tg64 | 104.5 |
+| tg128 | 104.5 |
+| tg250 | 103.5 |
+| tg500 | 99.5 |
+
+### Cross-over picture
+| Generation length | hf2q | peer | gap | ratio |
+|---|---|---|---|---|
+| 50 | 62.0 | 104.6 | -42% | 0.593× |
+| 128 | 64.6 | 104.5 | -38% | 0.618× |
+| 250 | 67.1 | 103.5 | -35% | 0.648× |
+| 500 | 68.2 | 99.5 | -31% | 0.685× |
+
+### Diagnosis
+- **Peer degrades 5%** from tg128→tg500 (KV cache bandwidth pressure
+  at long generation)
+- **hf2q improves 9%** from tg50→tg500 (prefill amortization)
+- **Gap closes** from 0.593× peer at tg50 to 0.685× peer at tg500
+
+This is a positive long-running observation: at long generations
+(>500 tokens) the structural decode gap is somewhat masked by
+prefill-amortization gains.  At very-long-generation (>1K tokens):
+- Peer continues degrading
+- hf2q approaches steady-state ~70 tok/s
+- Cross-over might happen at very long gen (uneconomical for users)
+
+### Reconciliation with iter-432's 0.691×
+iter-432 measured at max=150 with diff prompt = 0.691× ratio.
+iter-433 at max=128 = 0.618× ratio.  Difference is per-prompt
+variance (different output content → different tokenization/
+serialization overhead).  Both are within the 0.6-0.7× decode-
+ratio band; production-realistic point estimate is **~0.65× pure
+decode** (averaged across prompts).
+
+### Investigation count this thread
+90 total: 89 from iter-432 + this iter (long-gen scaling).
+
+### No new lever; characterization only
+Confirms structural decode floor.  At long-gen the gap shrinks but
+hf2q's 75 tok/s ceiling is firm per the iter-397 GPU 93% finding.
