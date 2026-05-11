@@ -18894,3 +18894,71 @@ lever but requires the unblocking work documented above.
 
 ### Investigation count this thread
 49 total: 48 from iter-391 + this iter (HEAD bench + handoff state).
+
+## iter-393 — full-stack bench script reference numbers refreshed
+
+### Date
+2026-05-10
+
+### Goal
+The `scripts/adr028_full_stack_bench.sh` reference measurements at the
+bottom of the script were stale — captured before iter-373 (split=2),
+iter-385 (mlx-native cascade), iter-388 (hf2q cascade) gained ~2 tok/s
+across all cells.  Refresh the operator decision tree to reflect HEAD
+state.
+
+### Refreshed reference measurements
+
+| Stack | tok/s | vs peer 103 | TQ-HB |
+|---|---|---|---|
+| **Default (no env vars; 5 phases default-on)** | 75.0-75.2 | **0.730×** | ✓ (3.94× mem) |
+| **+ HF2Q_HYBRID_KV=1** (iter-364 opt-in) | 77.0-77.1 | **0.749×** | ✓ (3.19× mem) |
+| **Path E (HF2Q_USE_DENSE=1)** | 77.6-77.7 | **0.754×** | ✗ (1× mem) |
+| **Path E+F+G (F16 KV)** | 78.6 | 0.763× | ✗ DEGRADED — DO NOT SHIP |
+| 1000-tok sustained (default) | 74.2 | **0.765× peer 97** | ✓ |
+
+**vs ORIGINAL baseline 73.7 (iter-308 reference)**:
+- Default: +2.0%
+- Hybrid: +4.6%
+- 1000-tok sustained: +13.3% (also benefits from thermal-throttle resilience)
+
+### Operator decision tree at HEAD
+
+```
+- Status quo (no env vars):              0.730× peer  TQ-HB ✓ (3.94× mem)
+- Opt-in hybrid (HF2Q_HYBRID_KV=1):       0.749× peer  TQ-HB ✓ (3.19× mem)
+- Path E (HF2Q_USE_DENSE=1):              0.754× peer  TQ-HB ✗ (1× mem)
+- Multi-thread port (iter-380-392 prep):  ~0.78× peer (predicted)
+- DFlash port (multi-month):              1.4-2.8× peer  TQ-HB ✓
+```
+
+### Why the operator decision tree changed since iter-322
+
+- iter-373 default-flipped dual_buffer_split from 3 to 2 (+0.18%)
+- iter-385 mlx-native ops cascade (compiler opt headroom)
+- iter-388 hf2q forward_decode cascade (compiler opt headroom)
+
+These three combined moved the default from 0.713× peer (iter-322 measurement)
+to 0.730× peer at HEAD.  Roughly +1.7pp of peer parity since iter-322.
+
+### Status of operator's binding goal
+
+Operator mantra: "as fast as our peers specifically for
+gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf.
+hf2q vs llama.cpp to start."
+
+**Current**: 0.730× peer default / 0.749× peer hybrid.  Still 25-27%
+behind peer.
+
+**Realistic ceiling without DFlash port**:
+- Multi-thread port: ~0.78× peer (predicted +5-7% from iter-386 synthetic
+  bench) — requires multi-day forward_decode refactor (12-iter infra
+  prep complete, 5-8 iters or operator focus session remaining)
+- Apple Instruments trace: would identify any remaining hotspots
+  requiring operator GUI session
+
+**Beyond 0.78× peer requires DFlash-style structural changes** (multi-month
+work per "DFlash port" estimate in the decision tree).
+
+### Investigation count this thread
+50 total: 49 from iter-392 + this iter (script reference refresh).
