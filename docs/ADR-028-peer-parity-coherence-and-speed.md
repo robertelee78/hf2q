@@ -21507,3 +21507,75 @@ characterization, refined production overhead).
 This is a measurement-methodology finding.  Refines interpretation
 of prior iters' bucket data; reduces the apparent "fixed overhead"
 gap to peer.
+
+## iter-428 — end-to-end characterization: decode dominates the e2e gap
+
+### Hypothesis
+Users see end-to-end (prefill + decode + serialization) latency, not
+component-wise.  Characterize hf2q vs peer at the e2e level to know
+where the user-perceived gap actually lives.
+
+### Method
+hf2q (Phase 15 default-on, streaming): pp522 + max_tokens ∈ {1, 50,
+100, 250, 500}, 2 reps each via SSE.  Peer (llama-bench `-pg`):
+pp522+tg{50,100,250}, 3 reps.  Compare e2e tok/s (gen / wall_time).
+
+### Results
+
+**hf2q e2e (Phase 15 default-on)**
+
+| max_tokens | actual tok | wall (ms) | e2e tok/s |
+|---|---|---|---|
+| 1 (TTFT) | 1 | 202 | 5.0 |
+| 50 | 44 | 848 | 51.9 |
+| 100 | 94 | 1513 | 62.1 |
+| 250 | 244 | 3485 | 69.9 |
+| 500 | ~273 (EOS) | 3913 | 69.7 |
+
+**Peer e2e (llama-bench)**
+
+| Setup | rate | wall derived |
+|---|---|---|
+| pp522 alone | 3158 tok/s | 165 ms |
+| tg128 alone | 104.5 tok/s | 1224 ms |
+| pp522+tg50 | 806 tok/s (572/806) | 710 ms |
+| pp522+tg100 | 507 tok/s (622/507) | 1227 ms |
+| pp522+tg250 | 277 tok/s (772/277) | 2787 ms |
+
+**Direct e2e comparison**
+
+| Setup | hf2q e2e | peer e2e | hf2q/peer | hf2q wall | peer wall |
+|---|---|---|---|---|---|
+| pp522+tg50 | 51.9 | 70.4 | **0.74×** | 848 | 710 |
+| pp522+tg100 | 62.1 | 81.3 | **0.76×** | 1513 | 1227 |
+| pp522+tg250 | 69.9 | 89.6 | **0.78×** | 3485 | 2787 |
+
+### Component decomposition (pp522+tg250)
+| Component | hf2q | peer | gap (ms) |
+|---|---|---|---|
+| Prefill | 206 ms | 165 ms | **+41 ms** (+25%) |
+| Decode (244-250 tok) | ~3250 ms | ~2622 ms | **+628 ms** (+24%) |
+| TOTAL | 3485 | 2787 | **+698 ms (+25%)** |
+
+**Decode dominates the e2e gap** — its 3250 ms is 16× longer than
+prefill's 206 ms, and per-token decode is 24% slower.  At this prompt
+size the prefill gap contributes only 6% of the total e2e delta.
+
+### Key insight
+Phase 15 (iter-415-421) already MAXED OUT the prefill lever.  At
+typical chat sizes (pp ≤ 1K + tg ≤ 250):
+- Prefill: 0.80-0.94× peer (close)
+- Decode: ~0.75× peer (exhausted per iter-397 GPU 93% bound)
+- E2E user-perceived: ~0.74-0.78× peer
+
+The remaining gap to peer is OWNED by decode.  Any further e2e
+improvement requires the decode optimization avenues that are
+already either operator-decision-gated (multi-thread port, F8 KV)
+or formally exhausted (per-kernel optimization).
+
+### Investigation count this thread
+85 total: 84 from iter-427 + this iter (e2e characterization).
+
+### No new lever
+Confirms the operator decision matrix.  Phase 15 is the dominant
+production speedup; remaining e2e gap is the structural decode floor.
