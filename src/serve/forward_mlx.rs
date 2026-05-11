@@ -4800,12 +4800,24 @@ impl MlxModelWeights {
                         enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, total_dispatches, barrier_count);
                     eprintln!("  [GRAPH_OPT] fusions={} reordered={} barriers={}+{}",
                         fusions, reordered, b0, b1);
+                    // ADR-028 iter-400: per-barrier wall measurement.
+                    let bns = mlx_native::barrier_total_ns();
+                    if bns > 0 && barrier_count > 0 {
+                        eprintln!("  [BARRIER_PROFILE] total_ns={} per_barrier_ns={}",
+                            bns, bns / barrier_count as u64);
+                    }
                 }
             } else {
                 let head_barriers = barrier_count; // snapshot before finish consumes s
                 let (enc_ns, gpu_ns) = s.finish_with_timing(session_start)
                     .map_err(|e| anyhow::anyhow!("single session finish: {e}"))?;
                 if INVESTIGATION_ENV.mlx_timing {
+                    // ADR-028 iter-400: per-barrier wall measurement.
+                    let bns = mlx_native::barrier_total_ns();
+                    if bns > 0 && barrier_count > 0 {
+                        eprintln!("  [BARRIER_PROFILE] total_ns={} per_barrier_ns={}",
+                            bns, bns / barrier_count as u64);
+                    }
                     if split_timing {
                         eprintln!("  [SPLIT] HEAD: encode={:.2}ms gpu={:.2}ms dispatches={} barriers={}",
                             enc_ns as f64 / 1e6, gpu_ns as f64 / 1e6, head_dispatches, head_barriers);

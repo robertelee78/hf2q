@@ -19427,3 +19427,77 @@ No code change shipped (audit + memory consolidation).
 The 50+ /loop iters (iter-344-399) have moved gemma4 decode from 0.679×
 peer (iter-308 baseline) to 0.730× peer at default + 0.749× peer hybrid.
 Further gains require operator-scheduled work outside /loop budget.
+
+## iter-400 — empirical barrier wall measurement (~310 ns, not 0.5-1 µs)
+
+### Date
+2026-05-10
+
+### Goal
+Per iter-397/398's pivot to barrier audit, measure the ACTUAL per-barrier
+wall time on M5 Max via `MLX_PROFILE_BARRIERS=1` instrumentation.  Validates
+or refutes iter-397's 0.5-1 µs/barrier estimate.
+
+### Implementation
+Added `[BARRIER_PROFILE]` print to forward_decode TIMING block (2 sites)
+that emits `mlx_native::barrier_total_ns()` + per-barrier ns.
+
+### Empirical results (8 sequential decode tokens at iter-321 stack default)
+
+```
+[BARRIER_PROFILE] total_ns=1015369 per_barrier_ns=2246  (cumulative t1)
+[BARRIER_PROFILE] total_ns=1153235 per_barrier_ns=2551  (cumulative t2)
+[BARRIER_PROFILE] total_ns=1289648 per_barrier_ns=2853  (cumulative t3)
+[BARRIER_PROFILE] total_ns=1438546 per_barrier_ns=3182  (cumulative t4)
+[BARRIER_PROFILE] total_ns=1583888 per_barrier_ns=3504  (cumulative t5)
+```
+
+Note: `barrier_total_ns()` and `barrier_count()` are CUMULATIVE atomics —
+the `per_barrier_ns` column is cumulative.  **Per-token differential**:
+
+| Token | Δ total_ns | Δ barriers | per-barrier wall |
+|---|---|---|---|
+| t1→t2 | 137,866 ns | 452 | **305 ns** |
+| t2→t3 | 136,413 ns | 452 | **302 ns** |
+| t3→t4 | 148,898 ns | 452 | **329 ns** |
+| t4→t5 | 145,342 ns | 452 | **322 ns** |
+
+**Mean per-barrier wall**: ~**315 ns** on Apple M5 Max.
+
+### Implication for barrier reduction lever
+
+Per iter-397's revised estimate: `452 barriers × 0.5-1 µs = 226-452 µs`
+(1.7-3.3% of wall).  EMPIRICAL: `452 barriers × 315 ns = **142 µs/token =
+1.05%** of 13.5 ms`.
+
+**Barrier reduction potential is roughly half what iter-397 estimated.**
+Even reducing 50% of barriers would save 0.5% — small.
+
+### Updated decision matrix (post-iter-400)
+
+| Lever | Predicted gain | Cost | ROI |
+|---|---|---|---|
+| Multi-thread port | +2.2% (iter-397) | 5-8 iters or focus | medium |
+| Barrier reduction | +0.5% max (50% reduction) | multi-day | LOW |
+| Apple Instruments trace | identify hotspots | operator GUI | UNKNOWN |
+| StorageModePrivate | 0.07-0.68% | 1-2 days | LOW |
+| Pivot to qwen35 | UX claim | varies | high (vs goal) |
+| Accept 0.730×/0.749× peer | — | — | — |
+
+The iter-397/398/400 measurements collectively show that the gemma4 decode
+optimization avenue at /loop iter scale is genuinely tapped out:
+- GPU 93% bound, only 4.5% CPU encoding
+- Multi-thread can recover some CPU encoding (max +2.2%)
+- Barrier reduction can recover some GPU barrier wall (max +0.5%)
+- Total realistic /loop-iter-tractable ceiling: **+2.7%** on top of current
+  0.730× peer = **0.750× peer max**
+
+To exceed 0.750× peer requires Apple Instruments-guided structural
+changes or pivot to other workloads.
+
+### Tests + bench
+hf2q lib: 3454+2 passing.  Coherence intact.  No production behavior
+change (instrumentation only fires under MLX_PROFILE_BARRIERS=1).
+
+### Investigation count this thread
+57 total: 56 from iter-399 + this iter (empirical barrier measurement).
