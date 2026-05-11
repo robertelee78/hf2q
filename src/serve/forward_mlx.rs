@@ -328,6 +328,19 @@ pub struct MlxQWeight {
     /// path.  Routing in `dispatch_qmatmul` checks `affine.is_some()`
     /// FIRST and skips both the F32 and GGML branches when set.
     pub affine: Option<MlxAffineExtra>,
+    /// ADR-029 iter-28 H29 — F16 pre-dequantized shadow.  When `Some`,
+    /// `dispatch_qmatmul` at m > MM_ROUTING_THRESHOLD routes through
+    /// `kernel_mul_mm_f16_f32_*` (peer's gemma4 pattern) instead of
+    /// per-call dequant inside `kernel_mul_mm_<qtype>_tensor_f32`.
+    ///
+    /// Materialized at load via `dispatch_dequant_to_f16` when the
+    /// `HF2Q_F16_SHADOW=1` env gate is set and the weight is a quantized
+    /// type the dequant kernel supports (Q4_0/Q8_0/Q5_1/IQ4_NL/Q4_K/
+    /// Q5_K/Q6_K).  ~1 GB extra resident on gemma4-26B; M5 Max's 128 GB
+    /// unified memory accommodates this without pressure.
+    ///
+    /// Default OFF until coherence + multi-regime bench parity proven.
+    pub f16_shadow: Option<MlxBuffer>,
 }
 
 impl MlxQWeight {
@@ -442,6 +455,7 @@ impl MlxQWeight {
                 bits: linear.bits,
                 group_size: linear.group_size as u32,
             }),
+            f16_shadow: None,
         })
     }
 }
@@ -590,6 +604,7 @@ impl MlxMoeWeights {
                     cols: 1,
                 },
                 affine: None,
+                f16_shadow: None,
             },
             per_expert_scale: alloc_one_f32_placeholder(mlx_device, "per_expert_scale")?,
             gate_up_ggml_dtype: mlx_native::GgmlType::F32,
@@ -1558,6 +1573,7 @@ impl MlxModelWeights {
                     cols,
                 },
                 affine: None,
+                f16_shadow: None,
             })
         } else {
             None
@@ -7079,6 +7095,7 @@ mod dispatch_qmatmul_f32_router_test {
                 cols: k,
             },
             affine: None,
+            f16_shadow: None,
         };
 
         // Run through GraphSession (mirrors production dispatch path).
@@ -7729,6 +7746,7 @@ fn load_gguf_qweight(
             cols,
         },
         affine: None,
+        f16_shadow: None,
     })
 }
 
