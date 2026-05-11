@@ -23520,3 +23520,78 @@ Adding instrumentation requires:
 ### Operator decision matrix unchanged
 Startup gap remains 1.6s, dominated by 2.91s monolithic load.
 Bisecting requires multi-iter instrumentation work; operator-gated.
+
+## iter-461 — startup gap localized: mlx_weights_load 88%, tokenizer_init 10%
+
+### Hypothesis (action over deferral)
+iter-460 punted on instrumentation as "multi-iter scope".  Per
+mantra "DO NOT BE LAZY" — added 7 minimal `Instant::now() +
+tracing::info!` markers to bisect the 2.91s `load_wall_clock`
+in this iter.
+
+### Method
+- Added env-gated `HF2Q_LOAD_TIMING=1` flag at engine.rs:1908
+- Inserted 6 phase markers after each major load step:
+  gguf_open, config_parse, meta_misc, gpu_ctx_new, mlx_weights_load,
+  tokenizer_init
+- Built + ran with `RUST_LOG=info HF2Q_LOAD_TIMING=1`
+
+### Patch
+```rust
+let load_timing = std::env::var("HF2Q_LOAD_TIMING").as_deref() == Ok("1");
+let mut t_phase = Instant::now();
+// ... GGUF open ...
+if load_timing { tracing::info!("[LOAD_TIMING] gguf_open={}ms", t_phase.elapsed().as_millis()); t_phase = Instant::now(); }
+// ... etc
+```
+
+### Results
+
+| Phase | Time | % of load_wall_clock (2910 ms) |
+|---|---|---|
+| gguf_open | 23 ms | 0.8% |
+| config_parse | 0 ms | <0.1% |
+| meta_misc (provenance+quant+chat_template) | 0 ms | <0.1% |
+| gpu_ctx_new | 33 ms | 1.1% |
+| **mlx_weights_load** | **2552 ms** | **88%** |
+| **tokenizer_init** | **302 ms** | **10%** |
+| **Sum** | **2910 ms** | **100%** |
+
+### Localization complete
+Two phases account for **98%** of the load_wall_clock:
+1. **`MlxModelWeights::load_from_gguf`** (2552 ms = 88%):
+   - Per-layer weight Arc construction (30 layers × ~22 tensors/layer
+     for dense + MoE gate/up/down per expert × 128 experts)
+   - mlx-native buffer registration + residency set add
+   - iter-21 leg_hb_encoded allocation visible in this phase
+2. **Tokenizer init** (302 ms = 10%):
+   - `Tokenizer::from_file(tokenizer.json)` from `/opt/hf2q/models/.../tokenizer.json`
+   - Per iter-459 candidate #4: peer reads from GGUF embedded;
+     could be reduced by switching to `build_tokenizer_from_gguf`
+     by default (already a code path in our load fn)
+
+### Lever assessment
+**Tokenizer 302 ms is the easiest single-iter win**:
+- Switch default to GGUF-embedded tokenizer (already implemented at
+  engine.rs:2065+, currently triggered only when no tokenizer.json
+  found alongside GGUF)
+- Could shave 200-300 ms off startup (10% reduction)
+- Operator decision needed: HF-checkout ergonomics vs faster startup
+
+**mlx_weights_load 2552 ms** would need deeper instrumentation in
+`MlxModelWeights::load_from_gguf` to bisect further.  Multi-iter
+scope.
+
+### Investigation count this thread
+118 total: 117 from iter-460 + this iter (instrumentation shipped +
+phases localized).
+
+### Operator decision matrix (added concrete startup levers)
+| Lever | Effect |
+|---|---|
+| **Switch tokenizer to GGUF-embedded by default** | **-300 ms startup** (10% gain) |
+| **Bisect mlx_weights_load further** | unknown sub-phase distribution |
+| Phase 15 default-on | ✓ shipped |
+| HYBRID_KV | OPERATOR-GATED (+3.3% decode) |
+| Multi-thread | OPERATOR-GATED (+2.2% decode) |
+| FA_GL F8 K | OPERATOR-GATED |

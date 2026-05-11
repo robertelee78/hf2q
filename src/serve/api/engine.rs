@@ -1904,6 +1904,10 @@ impl GemmaLoadedModel {
     /// than duplicated here — maintainers: if you touch one, touch both.
     pub fn load(opts: &LoadOptions) -> Result<Self> {
         let load_start = Instant::now();
+        // ADR-028 iter-461: opt-in sub-phase timing via HF2Q_LOAD_TIMING=1.
+        // Surfaces where the 2.91 sec load_wall_clock is spent (per iter-460).
+        let load_timing = std::env::var("HF2Q_LOAD_TIMING").as_deref() == Ok("1");
+        let mut t_phase = Instant::now();
 
         let model_path = &opts.model_path;
         anyhow::ensure!(
@@ -1937,9 +1941,17 @@ impl GemmaLoadedModel {
         // Open GGUF (header + metadata only).
         let gguf = mlx_native::gguf::GgufFile::open(model_path)
             .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+        if load_timing {
+            tracing::info!("[LOAD_TIMING] gguf_open={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);
+            t_phase = Instant::now();
+        }
 
         let config = Gemma4Config::from_gguf(&gguf)
             .context("Failed to derive Gemma4Config from GGUF metadata")?;
+        if load_timing {
+            tracing::info!("[LOAD_TIMING] config_parse={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);
+            t_phase = Instant::now();
+        }
 
         // ADR-017 §F4 + ADR-005 iter-211: detect hf2q-origin provenance
         // (producer_version + source_sha256 + optional mmproj_sha256) at
@@ -2016,8 +2028,16 @@ impl GemmaLoadedModel {
         //     verbosity. Either way: server output is clean.
         //   - Test contexts that capture stderr: stderr is rarely a
         //     TTY → reporter silent.
+        if load_timing {
+            tracing::info!("[LOAD_TIMING] meta_misc(provenance+quant+template)={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);
+            t_phase = Instant::now();
+        }
         let mut ctx = GpuContext::new()
             .map_err(|e| anyhow::anyhow!("mlx-native init failed: {e}"))?;
+        if load_timing {
+            tracing::info!("[LOAD_TIMING] gpu_ctx_new={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);
+            t_phase = Instant::now();
+        }
 
         let n_layers = config.num_hidden_layers;
         let stderr_is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
@@ -2033,6 +2053,10 @@ impl GemmaLoadedModel {
             &mut ctx,
             &mut load_progress,
         )?;
+        if load_timing {
+            tracing::info!("[LOAD_TIMING] mlx_weights_load={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);
+            t_phase = Instant::now();
+        }
 
         // ADR-020 AC#5 Iter D — DWQ overlay (mlx-affine packed-U32
         // safetensors) applied after the GGUF load.  Replaces each
@@ -2065,6 +2089,10 @@ impl GemmaLoadedModel {
             None => crate::inference::models::gemma4::tokenizer::build_tokenizer_from_gguf(&gguf)
                 .context("Failed to build Gemma4 tokenizer from GGUF metadata")?,
         };
+        if load_timing {
+            tracing::info!("[LOAD_TIMING] tokenizer_init={:.0}ms", t_phase.elapsed().as_secs_f64()*1000.0);
+        }
+        let _ = t_phase; // last phase consumes the timer; suppress unused warning
         let tokenizer_path = tokenizer_path_opt.unwrap_or_else(|| {
             // Synthetic sentinel for the load_info banner — communicates
             // "GGUF-embedded" in the path slot without misrepresenting an
