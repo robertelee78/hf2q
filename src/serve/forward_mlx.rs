@@ -1354,15 +1354,27 @@ impl MlxModelWeights {
         let mlx_device = gpu.device();
         tracing::debug!("Loading mlx-native weights directly from GGUF...");
 
+        // ADR-028 iter-482: time pre-loop loads (embed_weight + final_norm)
+        // separately to verify iter-481's embed_weight ~200ms estimate.
+        let load_timing = std::env::var("HF2Q_LOAD_TIMING").as_deref() == Ok("1");
+        let t_pre = std::time::Instant::now();
+
         // --- Embedding weight (F32) ---
         tracing::debug!("Loading embed_weight");
         let embed_weight = gguf.load_tensor_f32("token_embd.weight", mlx_device)
             .map_err(|e| anyhow::anyhow!("embed: {e}"))?;
+        if load_timing {
+            tracing::info!("[LOAD_TIMING] embed_weight_load={:.0}ms", t_pre.elapsed().as_secs_f64()*1000.0);
+        }
+        let t_fn = std::time::Instant::now();
 
         // --- Final norm (F32) ---
         tracing::debug!("Loading final_norm");
         let final_norm = gguf.load_tensor_f32("output_norm.weight", mlx_device)
             .map_err(|e| anyhow::anyhow!("final_norm: {e}"))?;
+        if load_timing {
+            tracing::info!("[LOAD_TIMING] final_norm_load={:.0}ms", t_fn.elapsed().as_secs_f64()*1000.0);
+        }
 
         // --- lm_head: auto-pick Q8_0 vs F16 based on model size ---
         //

@@ -24830,3 +24830,59 @@ identified as the dominant pre-loop cost).
 | HYBRID_KV | +2% decode (33% memory) | operator-gated |
 | Multi-thread decode | +2.2% | 5-8 iters |
 | FA_GL F8 K | ~50% pp16K | multi-iter |
+
+## iter-482 — embed_weight load empirically verified at 271 ms
+
+### Hypothesis (verification)
+iter-481 estimated embed_weight Q6_K→F32 dequant at 200-280 ms.
+Add timing marker and verify empirically.
+
+### Method
+Added `embed_weight_load` + `final_norm_load` markers to
+forward_mlx.rs:1357+, opt-in via HF2Q_LOAD_TIMING=1.
+
+### Results — full breakdown of mlx_weights_load (2479 ms)
+
+| Phase | Time | % | Source |
+|---|---|---|---|
+| **embed_weight** (Q6_K→F32) | **271 ms** | **10.9%** | iter-482 ✓ matches iter-481 |
+| final_norm (F32, hidden×4 bytes) | 0 ms | <0.1% | iter-482 |
+| Layer loop attn | 89 ms | 3.6% | iter-462 |
+| Layer loop mlp | 50 ms | 2.0% | iter-462 |
+| Layer loop moe | 1999 ms | 80.6% | iter-462 |
+| ┗ gate_up | 1298 ms | 52.4% | iter-463 |
+| ┗ down | 638 ms | 25.7% | iter-463 |
+| ┗ other (router + scales) | 63 ms | 2.5% | iter-463 |
+| **Residual** (lm_head + activations) | **70 ms** | **2.8%** | derived |
+| **Sum** | **2479 ms** | **100%** | full accounting ✓ |
+
+### Total startup breakdown at HEAD (3.07 sec)
+| Phase | Time | % of total startup |
+|---|---|---|
+| gguf_open | 23 ms | 0.7% |
+| config_parse + meta_misc | 0 ms | <0.1% |
+| gpu_ctx_new | 31 ms | 1.0% |
+| **mlx_weights_load** | **2479 ms** | **80.7%** |
+| tokenizer_init | 118 ms | 3.8% |
+| warmup + HTTP bind | ~440 ms | 14.3% |
+
+### Architectural lever sizing (cumulative startup reduction)
+If all 3 multi-iter levers landed:
+1. mmap zero-copy: -2.0 sec (MoE gate_up + down + embed_weight memcpy)
+2. embed_weight Q6_K-on-device: -271 ms (with +2% decode tradeoff)
+3. Pre-built tokenizer cache: -100 ms
+- **Total: -2.4 sec startup → 0.67 sec**
+- **Would beat peer's 1.65 sec by ~1 sec**
+
+### Investigation count this thread
+139 total: 138 from iter-481 + this iter (full mlx_weights_load
+accounting).
+
+### State at HEAD with full startup breakdown
+hf2q's 1.42 sec gap vs peer is fully attributed:
+- 86% (1.22 sec) in MoE expert load (mmap fix addresses)
+- 10% (140 ms) in embed_weight + lm_head (Q6_K-on-device addresses)
+- 4% in residual
+
+The ~2.4 sec architectural improvement potential is precisely
+quantified and operator-decision-gated.
