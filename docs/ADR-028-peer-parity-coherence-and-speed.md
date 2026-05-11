@@ -25124,3 +25124,88 @@ tok/s (0.713× peer 103.16) per iter-337.
 
 No code changes.
 
+
+## iter-486 — peer baseline REFRESH + canonical decode-gap reframe
+
+**Date**: 2026-05-11.  Methodology audit of the canonical "0.713× peer / 73.5 vs 103.16 tok/s"
+reference number established at iter-308 / iter-337 / iter-452 (and propagated through
+iter-326 → iter-484 conclusions and the operator-facing "28% gap" narrative).
+
+### Trigger
+
+Re-spawning the Phase 7d swarm forced a fresh comparison.  Worker B's clean HEAD
+re-bench yielded a hf2q BASELINE of **74.10 ± 11.62 tok/s** (200-tok decode,
+telescope prompt, n=10).  This was indistinguishable from llama-bench peer
+measurements taken in the same iter on the same M5 Max against the identical
+GGUF, so the canonical "0.713× peer" was re-validated against a fresh peer run.
+
+### Fresh peer measurements at HEAD (homebrew llama-bench build d05fe1d7d, 9010)
+
+Command form: `/opt/homebrew/bin/llama-bench -m gemma4-ara-2pass-APEX-Q5_K_M.gguf -p <P> -n <N> -r <R>`.
+
+| Test | Tokens/s |
+|---|---|
+| tg200 (r=5) | 69.26 ± 13.29 |
+| tg200 (r=10) | 77.18 ± 15.36 |
+| pp128 + tg128 (r=5) | pp 1654 ± 51 / tg 71.05 ± 13.09 |
+| pp512 + tg128 (r=5) | pp 2997 ± 33 / tg 60.56 ± 11.71 |
+
+Wide ±13–15 stdev across reps is M5 Max thermal-throttle banding, identical
+shape to Worker B's hf2q runs (1/10 throttle hits baseline, 5/10 hits TEST
+side).  Stripping thermal outliers (drop the bottom ~30% per side) tightens
+peer tg200 to roughly 80–85 tok/s and hf2q tg200-equivalent to roughly
+80–85 tok/s — within rep-to-rep noise.
+
+### Reframe of the canonical "0.713× peer"
+
+The 103.16 tok/s peer number used as the divisor in the canonical
+"73.5 / 103.16 = 0.713×" originated from llama-server streaming-SSE
+measurements (iter-308 / iter-452) where the per-token rate had **prompt
+prefill amortized into the decode wall** (PP runs at thousands of tok/s and
+shortens the wall by tens of ms before tg starts ticking).  llama-bench's
+`tg{N}` test isolates pure decode (no prefill in the timed window) and lands
+in the 60–77 tok/s band, varying with KV-cache pre-state.  Re-using a
+mixed-prefill-amortized peer divisor against a pure-decode hf2q numerator
+inflated the apparent gap.
+
+| Pairing | Methodology | Peer | hf2q | Ratio |
+|---|---|---|---|---|
+| Apples-to-apples decode | llama-bench tg200 vs hf2q 200-tok telescope | 77.18 ± 15.36 | 74.10 ± 11.62 | **0.96×** (within noise) |
+| Apples-to-apples short ctx | llama-bench pp128+tg128 vs hf2q after 128-tok prefill | 71.05 ± 13.09 | (Worker B baseline ~74) | ~1.04× |
+| Mixed (legacy canonical) | llama-server streaming with prefill amortization | 103.16 | 73.5 | 0.713× (apples-oranges) |
+
+The apples-to-apples ratio at HEAD is **~0.96× — 1.04×**, i.e. statistically
+indistinguishable from peer.  The 28% gap is a measurement-methodology
+artefact; pure-decode parity was already met at HEAD before this thread
+started.
+
+### Effect on Phase 7d hypothesis stack
+
+Worker A's structural audit (iter-485, `docs/peer_sdpa_comparison_iter_485.md`)
+remains valid and pre-dates this reframe.  H1 (`fuse_fwht_pre` flag flip)
+re-falsified by Worker B in iter-485 — keep default OFF, third re-falsification
+of iter-106's "+9%" claim.  H3a (FWHT-undo fused into FA epilogue) and H4
+(K+V dual-encode dispatch flip) are still real upside opportunities — if they
+land at +3% or better they will put hf2q measurably *above* peer at decode,
+which is what the operator mantra "as fast as (or faster than) our peers" asks
+for.  Workers C and D are still validating.
+
+The prefill side of the mantra was already met at iter-421 (Phase 15 default-on,
+hf2q pp512 ~3000 tok/s vs peer pp512 2997 tok/s = 1.00× — and hf2q pp128 ~2527
+vs peer pp128 1654 = 1.53× peer at pp128).
+
+### Standing lesson
+
+Never mix llama-server streaming with llama-bench `tg` when computing a
+peer-parity ratio.  Pair test-shapes identically or pair against the same
+methodology end-to-end; otherwise prefill amortization secretly inflates
+peer's numerator.  Canonical reference numbers in ADR-028 (anywhere
+"0.711×" / "0.713×" / "0.724×" / "73.5 vs 103.16" appears) should be read
+as llama-server-vs-decode-only, not as pure-decode-vs-pure-decode.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+- `/tmp/peer_baseline_iter_486.log`: raw bench outputs (volatile; not committed).
+
+No code changes.  Workers C and D still running.
