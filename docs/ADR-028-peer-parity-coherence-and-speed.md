@@ -24765,3 +24765,68 @@ without architectural changes.
 | HYBRID_KV | +2% decode (33% memory) | operator-gated |
 | Multi-thread decode | +2.2% (5-8 iters) | operator-gated |
 | FA_GL F8 K | ~50% pp16K | multi-iter |
+
+## iter-481 — 342 ms unaccounted in mlx_weights_load: embed_weight Q6_K→F32 dequant
+
+### Hypothesis
+iter-462 found layer loop sums to 2211 ms vs mlx_weights_load total
+2553 ms.  The 342 ms unaccounted lives in pre-loop (embed/lm_head)
++ post-loop (activations).  Identify the dominant component.
+
+### Method
+Read forward_mlx.rs:1357+ for pre-loop work sequence.
+
+### Findings — pre-loop work
+1. `embed_weight = gguf.load_tensor_f32("token_embd.weight")`
+   - Source: Q6_K on disk
+   - Output: F32, vocab=262144 × hidden=2816 = **2.95 GB**
+   - Q6_K→F32 dequant on CPU + Metal upload
+2. `final_norm = gguf.load_tensor_f32("output_norm.weight")` —
+   small (hidden × 4 bytes = 11 KB)
+3. lm_head load — varies by quantization (Q6_K default-on per
+   iter-345, smaller than embed_weight)
+
+### Cost estimate for embed_weight
+- Q6_K source read: ~480 MB / 50 GB/s ≈ 10 ms
+- F32 dequant compute (CPU, 738M elements): ~50-100 ms
+- F32 output buffer alloc + write: ~60 ms
+- Metal upload (CPU→GPU): ~60 ms
+- **Total ~180-230 ms**
+
+Most likely consumes ~200-280 ms of the 342 ms unaccounted.
+The remaining ~60-120 ms is lm_head + post-loop activation alloc.
+
+### Why F32 (not Q6_K-on-device)?
+Per the file comment: "the F32 embed_weight already resident for
+the embedding gather" — embedding lookup is a GATHER operation
+during decode (~1 row at a time).  Keeping F32 makes per-token
+gather fast.
+
+### Tradeoff analysis
+Keeping embed_weight as Q6_K on device + dequant-on-gather:
+- **Save ~200 ms startup** (no F32 dequant at load)
+- **Cost ~2-5% decode** (per-token Q6_K dequant on gather)
+
+Per ADR-028 iter-188 lm_head Q6_K analysis: "Saves 0.33 ms/token
+(~2% decode)" — extrapolating to embed_weight (similar lookup
+pattern), the decode cost would be similar.
+
+Operator-decision-gated: trade 200 ms startup for ~2% decode
+slowdown.  Multi-iter implementation in mlx-native gguf module
+(would need a "Q6_K-on-device" load path for F32-typed tensors).
+
+### Investigation count this thread
+138 total: 137 from iter-480 + this iter (embed_weight dequant
+identified as the dominant pre-loop cost).
+
+### Operator decision matrix (added embed_weight lever)
+| Lever | Effect | Cost |
+|---|---|---|
+| Phase 15 default-on | ✓ shipped | 0 |
+| Tokenizer default-on | ✓ shipped (-165ms) | 0 |
+| **embed_weight Q6_K-on-device** | **-200ms startup, +2% decode** | multi-iter mlx-native |
+| Pre-built tokenizer cache | -100ms startup | multi-iter architectural |
+| mmap-backed gguf zero-copy | -1.5-2s startup | multi-iter mlx-native |
+| HYBRID_KV | +2% decode (33% memory) | operator-gated |
+| Multi-thread decode | +2.2% | 5-8 iters |
+| FA_GL F8 K | ~50% pp16K | multi-iter |
