@@ -15809,3 +15809,108 @@ After 12 falsifications, the remaining levers all look more structural:
 ### Next iter
 
 Either attempt structural lever #1 (simdgroup_matrix mul_mv exploration — multi-week scope), or capture Apple Instruments trace to localize per-kernel hotspots (requires operator GUI).  Phase 10c.5 (fused F16-K-copy + V-encode) remains open as a smaller iteration; per iter-351 measured ~0.7 µs/dispatch saving × 30 = ~0.2-0.5% — not the highest-value next move.
+
+## iter-353 — Diagnostic deep-dive: GPU-compute-bound, NOT dispatch-bound
+
+### Date
+2026-05-10
+
+### Context
+After 12 falsified peer-pattern micro-levers + Phase 10's structural +2.3% gain, the gap to peer (28 tok/s, 27%) is not closing.  This iter PIVOTED from "try another peer-pattern port" to "instrument what's actually slow" before committing to the next lever direction.
+
+### Data captured
+
+#### 1. cmd_buf accounting
+
+`HF2Q_DUMP_COUNTERS=1` at HEAD (default flags, gemma4-ara-2pass-APEX-Q5_K_M.gguf, 100-tok decode):
+```
+[MLX_COUNTERS] dispatches=92070 cmd_bufs=198 cmd_bufs/decode_tok=1.9800
+```
+
+**Found**: `dual_buffer_split = Some(3)` (default in `investigation_env.rs:869`) commits buf0 mid-decode (after layer 3) so CPU can encode buf1 (layers 4-29) while GPU executes buf0.  Async overlap = 2 cmd_bufs/decode_tok.
+
+#### 2. Dual-buffer split sweep
+
+```
+split=1 → 72.7   split=10 → 72.7
+split=2 → 73.5   split=15 → 72.2
+split=3 → 73.6   ← OPTIMUM
+split=5 → 73.1   split=20 → 71.6
+split=8 → 72.7   no-split → 70.6 (-4.1%)
+```
+
+**The default split=3 is firmly optimal** (range 70.6 to 73.6 across configs, +4.1% vs no-split).  Async overlap is a real ~4% lever that's already in place.  No tuning room.
+
+#### 3. Per-token CPU encode vs GPU wait timing
+
+`HF2Q_MLX_TIMING=1`:
+```
+[TIMING] encode=0.45ms gpu_wait=13.05ms dispatches=930 barriers=436
+[TIMING] encode=0.43ms gpu_wait=13.16ms dispatches=930 barriers=436
+[TIMING] encode=0.42ms gpu_wait=12.99ms dispatches=930 barriers=436
+... (steady-state across 30 tokens)
+```
+
+**GPU wait = 96.7% of decode wall time.  CPU encode = 3.3%.**  We are GPU-COMPUTE-BOUND.  CPU-side optimizations (indirect command buffers, parameter pre-baking, fused kernels to drop dispatch count) can save AT MOST 0.45 ms/token = 3.5% of decode — and that's the impossible upper bound (cutting CPU encode to zero).
+
+#### 4. Per-token sync overhead
+
+From `bench_decode_qmatmul_shapes`:
+- single-sync per call: 173-180 µs (~155 µs sync overhead per cmd_buf)
+- batched per call: 14-23 µs
+
+At 2 cmd_bufs/decode_tok × 155 µs = **310 µs of sync per token = 2.4% of decode**.  Eliminating ALL sync overhead caps gain at 2.4%.
+
+#### 5. Kernel bandwidth ceiling
+
+From the same bench:
+```
+Per-token attention+router weight reads: 2.11 GB in 4.28 ms (493 GB/s aggregate)
+Implies decode throughput ceiling from these kernels alone: 233.6 tok/s
+```
+
+Our matmul kernels themselves can theoretically support **233 tok/s** at the measured 493 GB/s aggregate bandwidth.  Peer is at 103 tok/s, we're at 75 — both well below the kernel ceiling.
+
+### Conclusion
+
+We are **NOT** dispatch-bound, sync-bound, or kernel-throughput-bound.  We are bound by **per-token GPU compute** somewhere between the matmul kernels' theoretical ceiling (233 tok/s) and our measured 75 tok/s.  Difference = ~9 ms/token of "missing" GPU work.
+
+### Hypotheses for the missing 9 ms
+
+1. **Memory-bandwidth utilization gap** — peer may achieve closer to peak ~600 GB/s on M5 Max (we measured 493 aggregate); gap = ~20% bandwidth = ~20% latency ⇒ ~3 ms savings if closed.
+2. **MoE expert matmul cost** — bench note: "this bench EXCLUDES the MoE expert matmuls".  gemma4 has 8 active experts × 3 matmuls (gate/up/down) per layer × 30 layers = 720 dispatches/token of MoE work.  Per-pipeline shows `mul_mv_id_q6_K_f32_nr2` at 5970 dispatches / 200 tok = 29.85/tok ≠ 720 — suggests our batched MoE collapses these efficiently, OR the MoE expert weights dominate bandwidth in ways the bench misses.
+3. **TQ-HB encoding overhead** — `hadamard_quantize_kv_fast_d256` is 5.50% + `kv_quantize_v_no_fwht_d256` is 3.23% = 8.73% of dispatches purely for K/V cache writes.  Peer doesn't have this cost (peer stores F16 K + V directly).  Operator iter-326 RAM-mantra binding rejects dropping TQ-HB.
+
+### Open levers (per-iter scoping)
+
+| Lever | Est. Δ | Effort | Risk |
+|---|---|---|---|
+| MoE bench micro-trace + per-expert weight-cache audit | +1-3% | 1 iter | low |
+| Indirect command buffers (drop CPU encode) | +1-3% | 2-3 iter | medium (Apple API) |
+| async pipelined argmax → eliminate 1 sync per token | +1-2% | 1 iter | medium |
+| Apple Instruments Metal trace (operator-GUI) | unknown | requires user | low |
+| Fused F16-K-copy + V-encode (Phase 10c.5) | +0.5-1% | 1 iter | low |
+| Multi-split dual-buffer (3 + 15 + 25) | unknown, prob -1-2% | 1 iter | low |
+
+### What this iter did NOT change
+
+No code changes shipped this iter — diagnostic-only.  All findings are in this section + the bench output.  Hypothesis-driven path forward documented for future iters.
+
+### Next iter (operator-decision-gated)
+
+Given the binding goal "as fast as or faster than peer" + multi-week scope OK + the 27% gap requires structural work:
+
+1. **Recommend**: try Phase 10c.5 (fused F16-K + V-encode) as a quick +0.5-1% to bank.  Then move to MoE micro-trace (+1-3% candidate).
+2. **Long-horizon**: indirect command buffers + async argmax — the only paths that change the per-dispatch wall structure.  3-5 iters each.
+3. **Out-of-scope-without-operator-input**: Apple Instruments Metal trace requires GUI session.
+
+The +2.3% from Phase 10 is real; the path to 100%+ peer parity requires changes deeper than per-kernel ports (12 falsified) or dispatch fusion (saves at most 3.5%).
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section (no code changes).
+
+### Tests + bench
+
+- All 3454/0 hf2q lib tests + 284/0 mlx-native lib tests still passing.
+- HEAD bench unchanged from iter-352 baseline (73.6 legacy / 75.0 hybrid).
