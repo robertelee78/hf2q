@@ -21431,3 +21431,79 @@ peer pp16K direct + gap quantification).
 | Pp16K gap closure (F8 K) | 0.78→~0.95× peer | ~22% wall improvement | multi-iter kernel |
 | Multi-thread port | +2.2% decode | unmeasured | 5-8 iters |
 | Decode 0.726× | exhausted | confirmed | — |
+
+## iter-427 — GPU_TS vs CPU-wall: small-kernel bucket measurements inflated
+
+### Hypothesis
+Existing iter-417/418/419 measurements use HF2Q_PROFILE_BUCKETS=1
+which serializes via per-bucket `commit_and_wait`.  This may inflate
+small-kernel measurements relative to actual GPU compute time.
+Probe with HF2Q_PROFILE_GPU_TS=1 (uses MTLCommandBuffer.GPU{Start,
+End}Time) to see GPU-only timings.
+
+### Method
+Same prompt (~4017 tokens) on both bucket modes:
+- HF2Q_PROFILE_BUCKETS=1 (CPU wall, includes commit-wait)
+- HF2Q_PROFILE_BUCKETS=1 + HF2Q_PROFILE_GPU_TS=1 (GPU timestamps)
+
+### Results
+
+| Category | GPU-TS (ms) | CPU-wall (ms) | Bucket artifact |
+|---|---|---|---|
+| **mask_sliding** | **0.148** | **14.708** | **99× over** |
+| mask_global | 0.146 | 2.737 | 19× |
+| PRE_ATTN_NORM | 4.597 | 9.847 | +5.3 ms |
+| KV_COPY | 1.841 | 7.370 | +5.5 ms |
+| TRIPLE_RMS_NORM | 24.490 | 30.137 | +5.6 ms |
+| END_LAYER_NORM_ADD_SCALAR | 7.046 | 12.989 | +5.9 ms |
+| MOE_SWIGLU | 14.625 | 20.737 | +6.1 ms |
+| **QKV_MM** (large) | **188.5** | **193.7** | **+5.2 ms ✓** |
+| **FA_SW (D=256)** (large) | **151.5** | **156.4** | **+4.9 ms ✓** |
+| **FA_GL (D=512)** (large) | **158.5** | **159.5** | **+1.0 ms ✓** |
+| **MOE_GATE_UP** (large) | **301.2** | **307.0** | **+5.8 ms ✓** |
+| **MOE_DOWN** (large) | **276.6** | **282.7** | **+6.1 ms ✓** |
+| **O_MM** (large) | **99.4** | **104.8** | **+5.4 ms ✓** |
+| **MLP_GUR_MM** (large) | **97.2** | **102.5** | **+5.3 ms ✓** |
+
+Total bucket sums:
+- GPU-TS: 1437.86 ms (91.5% of total)
+- CPU-wall: 1547.57 ms (98.6% of total)
+- Δ: ~110 ms accumulated commit-wait overhead
+
+### Interpretation
+**Big kernels** (FA_*, MOE_*, MM, O_MM): measurements stable ±5%
+between modes.  Real GPU compute time is what we've been quoting.
+
+**Small kernels** (mask, KV_COPY, norms): CPU-wall is INFLATED by
+~5-15 ms per category.  Each bucket call adds commit_and_wait
+overhead (~50-200 µs documented in `forward_prefill_batched.rs:574-
+576`).  At 30+ buckets per layer, this accumulates.
+
+### Implications for prior iters
+- **iter-418 conclusion stands**: per-dispatch latency floor is real
+  (pp42 vs pp114 only 4% slower) — that's not bucket artifact since
+  pp comparison is at constant bucket count.
+- **iter-419 FA_GL O(N²) finding stands**: FA_GL is a big kernel,
+  CPU-wall ≈ GPU-TS within 1%.
+- **iter-417's "32 ms fixed overhead"**: largely bucket artifact.
+  Real GPU-side fixed overhead is ~10-15 ms (mask + blk + small
+  prefill setup).  Production (no profile) doesn't pay this.
+
+### Production reality
+Production runs WITHOUT bucket profiling = single fused command
+buffer = no per-bucket commit_and_wait.  The "32 ms overhead"
+measured under bucketing OVERSTATES production overhead by ~3×.
+Real production overhead: ~10 ms.
+
+### Lever assessment
+The remaining 5-15 ms per small-kernel category in CPU-wall mode is
+NOT a production lever — it disappears when bucketing is off.
+
+### Investigation count this thread
+84 total: 83 from iter-426 + this iter (GPU_TS vs CPU-wall
+characterization, refined production overhead).
+
+### No code change
+This is a measurement-methodology finding.  Refines interpretation
+of prior iters' bucket data; reduces the apparent "fixed overhead"
+gap to peer.
