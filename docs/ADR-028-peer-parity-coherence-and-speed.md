@@ -25022,3 +25022,105 @@ Remaining work is operator-decision-gated multi-iter architectural:
 6. FA_GL F8 K (~50% pp16K, multi-iter)
 
 141 investigations across iter-409→484.  Thread complete.
+
+
+---
+
+## iter-485 — H1 (HF2Q_TQ_FUSE_FWHT_PRE) re-test at HEAD post-stack — FALSIFIED AGAIN
+
+**Hypothesis**: After the iter-326 (+5 flag default-flip) + iter-331
+(fused_norm_add_v2) + iter-337 (fused_head_norm_rope_v2) stack landed,
+re-test `HF2Q_TQ_FUSE_FWHT_PRE=1` to check whether the previous
+falsifications (iter-315 at -1.0%, iter-319 at -0.5%) inverted under
+the new HEAD where the FA-vec-tq-hb kernel runs in a different
+dispatch envelope.
+
+**Reasoning to retest**: iter-315's "extra in-kernel FWHT work outweighs
+dispatch savings" hypothesis is dependent on absolute FA-tq-hb runtime.
+The post-iter-337 HEAD shaves ~5.9% off other dispatches, so the
+relative cost balance might have shifted.
+
+### Bench setup
+
+- Repo HEAD: `00f01009` (iter-484, clean tree, no flag/kernel changes)
+- Model: `models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf`
+- Prompt: "Write a long story about a sentient telescope" (21 tokens)
+- max-tokens: 200
+- Reps: 10 per side (variance > 5% on first 5 forced extension)
+- Binary: `target/release/hf2q` rebuilt clean at HEAD
+
+### Raw results (decode tok/s, 200 tokens)
+
+**BASELINE** (env unset, n=10):
+```
+74.6, 74.4, 74.0, 74.6, 74.2, 74.6, 37.2, 73.1, 72.8, 72.6
+sorted: 37.2, 72.6, 72.8, 73.1, 74.0, 74.2, 74.4, 74.6, 74.6, 74.6
+median 74.10  mean 70.21  stdev 11.62  (1 thermal outlier at 37.2)
+```
+
+**TEST** (`HF2Q_TQ_FUSE_FWHT_PRE=1`, n=10):
+```
+43.8, 42.7, 74.3, 74.2, 74.2, 40.4, 41.9, 67.7, 73.0, 41.2
+sorted: 40.4, 41.2, 41.9, 42.7, 43.8, 67.7, 73.0, 74.2, 74.2, 74.3
+median 55.75  mean 57.34  stdev 16.30  (5 thermal outliers in 40-44 range)
+```
+
+### Deltas
+
+| Slice | BASELINE | TEST | Delta |
+|---|---|---|---|
+| Full median (n=10) | 74.10 | 55.75 | **-24.8%** |
+| Best-5 median | 74.60 | 74.20 | **-0.54%** |
+| No-throttle median | 74.20 (n=9) | 74.20 (n=5) | **0.0%** |
+
+### Verdict: **FALSIFIED**
+
+Two complementary findings:
+
+1. **Best-case parity**: when neither side thermal-throttles, TEST
+   matches BASELINE within noise (-0.5%, same magnitude as iter-319).
+   The in-kernel FWHT-pre work still costs roughly what the eliminated
+   standalone dispatch + barrier saved.  Net = ~0%.
+
+2. **NEW finding: thermal sensitivity is 5× higher with the flag ON**.
+   BASELINE hit the ~40 tok/s throttled mode in 1/10 reps; TEST hit it
+   in 5/10.  Hypothesis: the in-kernel FWHT-pre uses simdgroup-shuffle
+   butterflies that increase peak register pressure or SLM bank
+   pressure in `flash_attn_vec_tq_hb`, raising the kernel's energy
+   footprint per dispatch and tripping the M5 Max thermal governor
+   sooner under repeated bench runs.  Not falsifying — observational —
+   but is a strong second reason to keep default OFF.
+
+### Decision
+
+**Default OFF stays.**  Flag exists at `forward_mlx.rs:3937` for
+operator override; comment at line 3936 ("Saves 1 dispatch + 1 barrier
+per layer × 30 = ~9% decode") is now triple-falsified (iter-315 -1.0%
++ iter-319 -0.5% + iter-485 -0.5% best-case / -24.8% real-world).
+
+### Coherence
+
+Both sides emit coherent "2 + 2 = 4<turn|>" on the smoke prompt; long
+story prompt runs to completion (200 tokens, no gibberish, no NaN).
+
+### Stack of falsified historical claims (updated, this thread)
+
+- iter-106 "FUSE_FWHT_PRE saves 9% decode" → -1.0% iter-315, -0.5%
+  iter-319, **-0.5% iter-485 (3rd re-falsification, +5× thermal cost)**
+- iter-186 "FUSED_TRIPLE_NORM" → -1.0% (iter-187)
+- iter-249 "72 extra mat-vecs/tok our side" → wrong sign (iter-308)
+
+Pattern reaffirmed: dispatch-count-math claims unreliable; bench at HEAD
+on production fixture every time.
+
+### Cumulative gemma4 default decode (session record, post-iter-485)
+
+No change from iter-484 — H1 NOT default-flipped.  HEAD remains 73.5
+tok/s (0.713× peer 103.16) per iter-337.
+
+### Files modified
+
+- `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
+
+No code changes.
+
