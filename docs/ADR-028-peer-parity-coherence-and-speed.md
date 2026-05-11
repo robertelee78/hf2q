@@ -20431,3 +20431,95 @@ discovery).
 
 **Top lever**: serve HTTP is silently running per-token prefill.
 This dwarfs every other gap discovered in 70+ investigations.
+
+## iter-415 LANDED — wire forward_prefill_batched into serve HTTP (opt-in)
+
+### Hypothesis (from iter-414 reframe)
+forward_prefill_batched exists, is iter-344 default-on, and was
+falsifier-tested coherent at pp3813 on this exact GGUF
+(gemma4-ara-2pass-APEX-Q5_K_M).  But serve HTTP routes through
+forward_prefill_with_soft_tokens_resume (per-token-per-layer).
+Wiring batched into serve for text-only requests should deliver
+~30-45× speedup with no coherence regression.
+
+### Method (TDD)
+1. Read both functions; verify KV state semantics match
+   (`write_pos = seq_len`, `seq_len = min(write_pos, capacity)`).  ✓
+2. Verify gemma4 sliding_window=1024 (config.rs:429); iter-343
+   verified envelope to pp3813 (4K tokens).
+3. Apply minimal patch at engine.rs:4581 (non-streaming) +
+   engine.rs:7064 (streaming): conditional batched routing gated on:
+   - `soft_tokens.is_empty()` (no vision)
+   - `resume_lcp.is_none()` (no LCP cache hit)
+   - `HF2Q_SERVE_BATCHED_PREFILL=1` (operator opt-in)
+4. Build, smoke test, measure, verify coherence.
+
+### Patch
+```rust
+let use_batched_serve = soft_tokens.is_empty()
+    && resume_lcp.is_none()
+    && std::env::var("HF2Q_SERVE_BATCHED_PREFILL").as_deref() == Ok("1");
+let prefill_argmax = if use_batched_serve {
+    loaded.weights.forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut loaded.ctx)?
+} else {
+    loaded.weights.forward_prefill_with_soft_tokens_resume(...)?
+};
+```
+Mirrored at both call sites (non-streaming line 4581, streaming line 7064).
+
+### Coherence verification
+| Prompt | Output | Status |
+|---|---|---|
+| "What is 2+2? Reply only with the number." | `"4"` | ✓ correct |
+| "Tell me about photosynthesis in 2 sentences." | coherent 2-sentence biology answer (228 chars) | ✓ correct |
+| "What is 2+2?" (max_tokens=30) | `"2 + 2 = 4"` | ✓ correct |
+
+### Performance results (5-rep means)
+
+| Size | Per-token serve (iter-414) | **Batched serve (iter-415)** | Speedup |
+|---|---|---|---|
+| 50w (522 tok) HTTP wall | 7223 ms | **249 ms** | **29×** |
+| 50w (522 tok) prefill rate | 71 tok/s | **2525 tok/s** | **35.6×** |
+| 400w (4022 tok) HTTP wall | 63298 ms | **1573 ms** | **40×** |
+| 400w (4022 tok) prefill rate | 63 tok/s | **2758 tok/s** | **43.4×** |
+
+### Ratio vs peer (llama.cpp d05fe1d7d, build 9010)
+
+| Size | Peer | Per-token serve | **Batched serve** |
+|---|---|---|---|
+| pp~512 | 3154 tok/s | 71 = 0.022× | **2525 = 0.801× peer** |
+| pp~4K | 2950 tok/s | 63 = 0.021× | **2758 = 0.935× peer** |
+
+**At pp4K, hf2q serve is now 0.935× peer — within 7% of llama.cpp.**
+
+### Action — LANDED
+Patch shipped at `engine.rs:4581+` (non-streaming) + `engine.rs:7064+`
+(streaming).  Default-OFF behind `HF2Q_SERVE_BATCHED_PREFILL=1` for
+operator validation phase.  No regression to legacy path (the env-off
+case is byte-identical to pre-patch).  Future iter (with operator
+sign-off): default-ON.
+
+### Investigation count this thread
+72 total: 71 from iter-414 + this iter (LANDED Phase 15).
+
+### Operator decision matrix (RADICALLY UPDATED — biggest LANDED win)
+
+| Lever | Predicted | **Empirical** | Cost |
+|---|---|---|---|
+| **Phase 15 — batched serve prefill (LANDED)** | 20-47× speedup | **29-43.4× speedup** | ✓ shipped, opt-in |
+| Default-on Phase 15 | 0.8-0.94× peer prefill | pending operator soak | trivial flip |
+| 16K prefill regression | 1947 vs 2550 peak | unaddressed | sliding-window TBI |
+| Eliminate 141 ms generate overhead | 0.51 → 0.99× at pp413 | unaddressed | iter-415 OBSOLETED for serve |
+| Multi-thread port | +2.2% decode | unmeasured | 5-8 iters |
+| Decode 0.726× | exhausted | confirmed | — |
+
+**Phase 15 is the biggest LANDED win in 72 investigations.**  Cumulative
+gains for serve gemma4 at HEAD with `HF2Q_SERVE_BATCHED_PREFILL=1`:
+- Decode: 0.726× peer (unchanged, exhausted)
+- Prefill: **0.021× → 0.935× peer at pp4K** (44.5× ratio improvement)
+
+This single iteration delivers more speedup than the previous
+65-iter combined.  Vindicates the "DO NOT BE LAZY" mantra:
+rigorous methodology (iter-414's 5-rep unique-prompt HTTP probe
+revealed the architectural asymmetry that 70 prior decode-focused
+iterations missed).

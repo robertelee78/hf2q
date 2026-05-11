@@ -4577,16 +4577,31 @@ fn generate_once_with_soft_tokens(
     // Iter-98: route through forward_prefill_with_soft_tokens. Empty
     // soft_tokens slice is the no-op identity over forward_prefill —
     // text-only requests pay zero overhead.
+    //
+    // ADR-028 iter-415: serve HTTP path was historically per-token.
+    // forward_prefill_batched (iter-344 default-on, iter-343 verified
+    // coherent at pp3813 on gemma4-ara-2pass-APEX-Q5_K_M) is ~20-47×
+    // faster.  Opt-in via HF2Q_SERVE_BATCHED_PREFILL=1; gated to
+    // text-only (no soft tokens, no LCP resume) for safety.
     let prefill_start = Instant::now();
-    let prefill_argmax = loaded
-        .weights
-        .forward_prefill_with_soft_tokens_resume(
-            prompt_tokens,
-            soft_tokens,
-            max_tokens,
-            &mut loaded.ctx,
-            resume_lcp,
-        )?;
+    let use_batched_serve = soft_tokens.is_empty()
+        && resume_lcp.is_none()
+        && std::env::var("HF2Q_SERVE_BATCHED_PREFILL").as_deref() == Ok("1");
+    let prefill_argmax = if use_batched_serve {
+        loaded
+            .weights
+            .forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut loaded.ctx)?
+    } else {
+        loaded
+            .weights
+            .forward_prefill_with_soft_tokens_resume(
+                prompt_tokens,
+                soft_tokens,
+                max_tokens,
+                &mut loaded.ctx,
+                resume_lcp,
+            )?
+    };
     let prefill_duration = prefill_start.elapsed();
 
     // First decode token: greedy fast-path uses prefill's on-GPU argmax;
@@ -7061,8 +7076,19 @@ fn generate_stream_once(
     // requests; the prefill API treats an empty slice as identity over
     // `forward_prefill` (`src/serve/forward_prefill.rs:117`), so the
     // text-only path stays byte-identical.
+    // ADR-028 iter-415: same batched-prefill opt-in as non-streaming
+    // path above.  Streaming wraps in a Result-match; batched path
+    // bails on its own anyhow::Result so we propagate via the same
+    // match arm.
     let prefill_start = Instant::now();
-    let next_token_result =
+    let use_batched_serve = soft_tokens.is_empty()
+        && resume_lcp.is_none()
+        && std::env::var("HF2Q_SERVE_BATCHED_PREFILL").as_deref() == Ok("1");
+    let next_token_result = if use_batched_serve {
+        loaded
+            .weights
+            .forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut loaded.ctx)
+    } else {
         loaded
             .weights
             .forward_prefill_with_soft_tokens_resume(
@@ -7071,7 +7097,8 @@ fn generate_stream_once(
                 max_tokens,
                 &mut loaded.ctx,
                 resume_lcp,
-            );
+            )
+    };
     let prefill_duration = prefill_start.elapsed();
     let prefill_argmax = match next_token_result {
         Ok(t) => t,
