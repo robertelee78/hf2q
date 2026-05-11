@@ -408,6 +408,51 @@ This ADR's original §Decision items 1-5 are **all closed**. Branch
 gating-fix landing commit; documentation captures the negative findings
 that block future re-trials).
 
+### iter-4 (2026-05-11, branch `adr-029`) — closure validation + merge
+
+#### iter-4 ship list
+
+11. **Full validation pass on adr-029 HEAD before merge to `main`**:
+
+   | gate | expected (per ADR-029 §Validation) | iter-4 measured | verdict |
+   |---|---|---:|:---:|
+   | `cargo test --release --lib` | clean | **51 pass / 0 fail** | ✓ |
+   | gemma4 baseline `hf2q --benchmark` n=5 | ~75 t/s, σ < 0.5 | **75.1 t/s, σ-pct 0.07%** | ✓ |
+   | `HF2Q_USE_DENSE=1` probe | ~77 t/s, coherent | **77.7 t/s, σ-pct 0.10%, coherent** | ✓ |
+   | qwen3.6 σ-pct (iter-2) | n/a (new gate this ADR) | **1.270× peer, σ-pct 0.14%** | ✓ |
+   | coherence stability | byte-identical haiku | **byte-identical 50-tok output** | ✓ |
+
+   All gates pass. The iter-1 kernel-profile gating fix (`1cd6540f`) does not
+   regress anything; the iter-2/-3 doc updates have no runtime impact.
+
+12. **Cumulative iter-1→4 status of original §Decision items**:
+
+   | # | item | status | landed-as |
+   |---:|---|:---:|---|
+   | 1 | Halt TQ/FWHT/SDPA/qmatmul-fusion work on gemma4 | ✓ STANDING | discipline (nothing touched in 4 iters) |
+   | 2a | MoE-1 dispatch audit | ✓ DONE | iter-1 mapping; 883 disp/tok ground truth |
+   | 2b | MoE-2 NR2 port verification | ✓ FALSIFIED | already on parity paths (mlx-native:484) |
+   | 2c | MoE-3 barrier audit | ✓ FALSIFIED | tracker dedupes (graph.rs:1494-1530) |
+   | 3 | kernel-profile Q6_K lm_head gating | ✓ LANDED | commit `1cd6540f` |
+   | 4 | qwen3.6 σ-pct re-test | ✓ CONFIRMED | 1.270× peer, both σ-pct < 0.25% |
+   | 5 | σ-pct standing rule | ✓ CODIFIED | §Validation gate in this ADR |
+
+   Adjacent falsifications (H6, H7) recorded for future iter-blocking.
+
+13. **Closing direction for the unresolved 27% gemma4 gap** (NOT in
+   §Decision item scope; for the next ADR or a /cfa swarm to pursue):
+
+   The 27% gap is structural — `~825` extra dispatches/tok between hf2q
+   and llama.cpp graph-compile output for the same gemma4 layer. Every
+   in-scope dispatch-fusion lever falsified. Path A (ADR-030 graph-fusion
+   infra port from `ggml-metal-ops.cpp`) is the canonical next-step;
+   estimated multi-week effort. Path C (accept architectural delta) is
+   defensible — qwen3.6 on the same codebase runs at 1.270× peer, so the
+   parity gap is gemma4-specific, not a hf2q-wide regression.
+
+   No more code change appropriate on this branch. **Branch `adr-029`
+   merges to `main` at iter-4**.
+
 ### iter-1 standing direction (revised)
 
 Decode-time dispatch-fusion (TRIPLE_NORM, MOE_WSUM_END_LAYER_V2) appears to be
