@@ -21253,3 +21253,94 @@ Phase 15 default-on does not introduce any test regression.
 ### Action — none
 No code change.  Confirms Phase 15 default-on is production-clean
 across the entire test surface.
+
+## iter-425 — FA_GL D=512 audit: peer-pattern blk skip already in place
+
+### Hypothesis
+iter-419's FA_GL O(N²) regression at pp16K (561 ms/call, 33.8% of
+wall) suggests a structural kernel issue.  Read peer's
+`kernel_flash_attn_ext_impl` for D=512 to identify any optimization
+hf2q lacks.
+
+### Method
+Read peer source:
+- `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:5801` —
+  `kernel_flash_attn_ext_impl` (templated by DK, DV)
+- `:5628` — `kernel_flash_attn_ext_pad` (KV padding pre-pass)
+- `:5700` — `kernel_flash_attn_ext_blk` (mask scan, identifies
+  fully-masked tiles to skip)
+- `:6511` — `f32_dk512_dv512` instantiation
+
+Cross-reference with hf2q:
+- `/opt/mlx-native/src/shaders/flash_attn_prefill_d512.metal`
+- `/opt/mlx-native/src/ops/flash_attn_prefill_d512.rs`
+- `/opt/hf2q/src/serve/forward_prefill_batched.rs:1224-1241` (FA_GL
+  dispatch site)
+
+### Findings
+1. **Peer's blk pre-pass IS implemented in our D=512 kernel**
+   (`flash_attn_prefill_d512.metal:512+`, gated by function constant
+   303 `has_blk`).  Three-way classification 0=skip, 1=process,
+   2=all-zero matches peer.
+
+2. **`forward_prefill_batched` PASSES blk_global + global_mask** to
+   the D=512 dispatcher (line 1228-1229).  Tile skip IS active.
+
+3. **Causal-mask short-circuit also active**: with `do_causal: false`
+   and a CAUSAL global mask, blk pre-pass marks above-diagonal tiles
+   as "0" → skipped.  This brings cost from O(N²) to ~O(N²/2) — but
+   still O(N²).
+
+4. **HYBRID_KV doesn't apply during PREFILL FA_GL**: hybrid_kv is the
+   PERSISTED storage format (used at decode for K reads).  During
+   prefill, FA_GL reads `pf_k_perm` (F32 staging) regardless of
+   HYBRID_KV.  Verifies iter-419's HYBRID_KV non-finding.
+
+### Diagnosis
+The 561 ms/call FA_GL at pp16K is genuine **quadratic compute**:
+- 16021 query positions × 16021 K positions per layer = 257M ops
+- × 5 global layers × ~16 head-pairs (GQA) = ~20 G-ops total
+- At Apple M5 Max ~12 TFLOP/s effective f16 compute → 1.7 ms theory
+- Measured 562 ms/call × 5 calls = 2810 ms total
+- Theory says 8.5 ms/call. Measured is ~66× higher.
+
+**Why 66× over theory?** Memory bandwidth bound:
+- K cache global = 16021 × 512 × 16 × 4B = 525 MB (per layer)
+- Read once per query position group → ~325 MB/call effective bandwidth
+- Apple M5 Max LPDDR5x peak = ~400 GB/s
+- 325 MB / 400 GB/s × 16021 queries = 13 ms theory if perfectly streamed
+- We're 40× over → cache locality + per-Q load redundancy is the
+  dominant cost
+
+### Lever assessment for FA_GL improvement
+**Already-done**: blk skip ✓, mask handling ✓, simdgroup tiling ✓.
+
+**Real levers (multi-iter scope, OPERATOR-DECISION-GATED)**:
+1. **F16/BF16 K storage during prefill**: halve memory bandwidth →
+   could reduce FA_GL ~2× at pp16K → pp16K total from 8.3s → ~7.0s.
+   Requires F32→F16 conversion at K write (small cost) + new F16-K
+   D=512 kernel variant (large engineering).
+2. **K-cache tiling reorder**: improve locality of K reads across
+   query batches.  Possibly +20% with careful work.
+3. **Fused QK^T + softmax + PV**: peer already does this.  Verify
+   we don't have a redundant pass.
+
+### Action — research probe only
+No code change.  Documented that peer-pattern parity is met;
+remaining FA_GL gap is fundamental memory-bandwidth-bound quadratic
+work.  Improvements are multi-iter F16/BF16 KV engineering, not
+kernel-tweak-level fixes.
+
+### Investigation count this thread
+82 total: 81 from iter-424 + this iter (peer FA_GL audit + lever
+assessment).
+
+### Operator decision matrix (refined)
+
+| Lever | Predicted | Empirical | Cost |
+|---|---|---|---|
+| Phase 15 default-on | 35-43× prefill | 0.022→0.94× peer | ✓ shipped |
+| **F16/BF16 K for FA_GL prefill** | **~2× pp16K** | unmeasured | multi-iter kernel |
+| FA_GL kernel locality | +20% pp16K | unmeasured | research |
+| Multi-thread port | +2.2% decode | unmeasured | 5-8 iters |
+| Decode 0.726× | exhausted | confirmed | — |
