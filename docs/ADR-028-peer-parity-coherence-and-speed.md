@@ -17041,3 +17041,92 @@ more heavily; future Q8_0-quantized models would benefit).
 
 ### Falsification count this thread
 25 total: 24 from iter-367 + this iter (parity ✓ but bench flat — like iter-365).
+
+## iter-369 — dispatch-overhead architecture audit (no code change)
+
+### Date
+2026-05-10
+
+### Question
+After iter-365/366/367/368's per-kernel optimization attempts hit asymptote,
+audit the dispatch architecture itself for unaddressed structural overhead.
+
+### Hypotheses tested (read-only investigation)
+
+#### H1: Per-group sync-wait at every group boundary
+**Hypothesis**: `finish_with_timing` calls `commit() + wait_until_completed()`
+synchronously.  With 8 groups/layer × 30 layers = 240 sync points/token, this
+could be a major per-token overhead.
+
+**Verified (read code)**: production decode (`forward_decode` line 2443) uses
+ONE session per token, NOT one per group.  `s.finish()` only fires in debug
+paths (`dump_layers`).  Per-layer "GROUPs" are LOGICAL groupings separated
+by `barrier_between` (no commit/wait).
+
+The `dual_buffer_split` optimization at line 4587 does an async `s.commit()`
+mid-forward for CPU/GPU overlap — proven valuable in earlier iters.
+
+**Verdict**: production already efficient.  1-2 cmd_bufs/token, not 240.
+NO HYPOTHESIS LEVER.
+
+#### H2: Per-dispatch CPU overhead from missing pipeline caching
+**Hypothesis**: `set_compute_pipeline_state(pipeline)` is called every dispatch.
+If the same pipeline is used N consecutive times, N-1 calls are wasted.
+
+**Verified (read peer source `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:493`)**:
+peer ALSO calls `setComputePipelineState` every dispatch.  No caching.  Same
+pattern as us.
+
+**Verdict**: not a differentiator.  NO HYPOTHESIS LEVER.
+
+#### H3: Multi-threaded command-buffer encoding (peer's `n_cb=2`)
+**Confirmed via peer source `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:438+550`**:
+peer uses GCD `dispatch_apply(n_cb, queue, encode_async)` to encode dispatches
+in PARALLEL across `n_cb` worker threads, each filling its own command buffer.
+The peer comment: "tests on M1 Pro and M2 Ultra using LLaMA models, show that
+optimal values for n_cb are 1 or 2".
+
+We encode SINGLE-THREADED (main thread only).  This is the largest unaddressed
+per-dispatch CPU overhead lever — peer encodes ~half the dispatches in
+parallel with a worker thread, halving wall-clock encoding time.
+
+**Implementation cost**: multi-day engineering project:
+- Thread-safe encoder split (currently `&mut self` on a single-thread session)
+- Per-thread cmd_bufs with proper Metal queue ordering
+- Tracker/barrier coordination across threads
+- Conflict detection across split sessions
+
+Not /loop iter-tractable.  Documented as iter-370+ scope decision item.
+
+#### H4: Per-call binding overhead vs peer
+**Verified**: same number of API calls per dispatch as peer (~4 setBuffer + 1
+setBytes + 1 setPipelineState + 1 dispatchThreadgroups).  Difference must be
+in Rust→metal-rs→objc→Metal call stack depth vs peer's direct ObjC.  ~1-2 µs
+extra per call from the metal-rs wrapper layer.  Not addressable without
+bypassing metal-rs (multi-day).
+
+### Findings summary
+
+| Source of per-dispatch wall (~14.7 µs ours vs ~7.1 µs peer = 7.6 µs gap) | Status |
+|---|---|
+| Per-group sync-wait | NOT THE ISSUE (1-2 commits/token, not 240) |
+| Pipeline state caching | NOT THE ISSUE (peer doesn't cache either) |
+| Single-threaded encoding (peer uses n_cb=2) | **REAL LEVER** but multi-day port |
+| metal-rs wrapper layer overhead | **REAL LEVER** but requires bypass / metal-3 ObjC port |
+
+### Path forward (operator-decision-gated)
+
+- **iter-370+ multi-thread encoding port** (peer's n_cb=2): potential 30-40%
+  per-dispatch CPU savings, multi-day engineering
+- **Apple Instruments Metal trace** (operator GUI): would identify exact
+  per-dispatch hotspot ratios
+- **Continue per-kernel exhaustion** (less productive — diminishing returns
+  per iter-365 onwards)
+- **Pivot to other work** (qwen35 perf, prefill, additional models)
+- **Accept current 0.723× peer asymptote**
+
+### Tests + bench
+No code change shipped.  Audit and findings only.
+
+### Investigation count this thread
+26 total: 25 from iter-368 + this iter (audit, no code).
