@@ -1,6 +1,35 @@
 # ADR-029: gemma4-APEX-Q5_K_M Decode Gap is in the MoE Pipeline, Not TQ
 
-- **Status**: accepted (2026-05-11)
+> **⚠ MISSION REOPENED 2026-05-11 (post iter-4 merge)**
+>
+> The iter-4 closure framing "all §Decision items closed = mission complete"
+> was a misread of operator intent. The §Decision items 1-5 are valid sub-goals
+> (and remain closed) but the REAL mission target is **close the gemma4 decode
+> gap from ~75 t/s to ≥98 t/s** (operator-measured peer parity on
+> `gemma4-ara-2pass-APEX-Q5_K_M.gguf`). That target is **NOT achieved**. The
+> iter-1..4 work shipped:
+> - 1 functional fix (kernel-profile Q6_K lm_head gating) — useful but
+>   doesn't move t/s
+> - 6 falsified hypotheses (TQ-removed +7% only; H6 triple-norm regresses
+>   -2.8%; H7 wsum-end-layer regresses -0.8%; MoE-2 NR2 already on parity;
+>   MoE-3 barriers already minimum)
+> - confirmation that qwen3.6 is 1.27× peer on the same codebase (so the
+>   gap is gemma4-specific)
+>
+> What's still required: actual per-kernel and/or per-graph optimization
+> work that lands a coherent throughput win on gemma4 decode. The
+> dispatch-fusion lever class is exhausted on this chip+shape; remaining
+> levers are (a) per-kernel tuning of MoE mat-vec, (b) ggml-metal-style
+> graph-fusion port, (c) per-layer-embedding path (gemma4.cpp:338-359
+> shows peer has a `inp_per_layer` add-on that hf2q may or may not match —
+> needs verification), (d) routing kernel optimization (router_proj F32
+> mat-vec + softmax/top-k path).
+>
+> Mission is **OPEN**. /loop cron `7e171c2b` restarted to continue the
+> optimization work. The iter-1..4 audit data below is correct and
+> load-bearing for any future attempt; it should NOT be re-litigated.
+
+- **Status**: accepted (2026-05-11; OPTIMIZATION REOPENED iter-5+)
 - **Date**: 2026-05-11
 - **Supersedes**: nothing structurally; corrects ADR-028 §iter-486 + §iter-487 closure verdict and the iter-308 "Q5_K nr0=2" smoking-gun claim
 - **Deciders**: Robert (operator), Claude (cfa-adr028-gap-20260511 swarm: queen-phase1 / claude-impl perf-engineer / codex-impl structural-reviewer)
