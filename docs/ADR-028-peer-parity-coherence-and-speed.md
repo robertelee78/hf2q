@@ -19761,3 +19761,65 @@ All 9 Q4_0/Q8_0/Q5_K ID tests now pass.
 
 ### Investigation count this thread
 62 total: 61 from iter-404 + this iter (test-tolerance fix).
+
+## iter-406 — Q4_K mv short indexing (4/4 main mv kernels aligned)
+
+### Date
+2026-05-10
+
+### Goal
+Apply iter-401-403's int→short indexing pattern to Q4_K mv kernel for
+completeness.  Plus audit the l2_norm WIP that got bundled into iter-405's
+mlx-native commit.
+
+### Q4_K mv changes
+
+`kernel_mul_mv_q4_K_f32` (line 791+):
+- 6 const decls changed `int` → `short`
+- Inlined `n = 8` constant (1 loop body update)
+
+### l2_norm WIP audit (sidebar from iter-405)
+
+The l2_norm files bundled into mlx-native commit `5ca5f5e` are a
+**Qwen3.5/3.6 DeltaNet fused L2-norm + scalar-multiply kernel** (per
+ADR-015 iter59a comment in the diff).  This is **off-mission per
+operator's gemma4 binding directive** but additive-only (no harm to
+gemma4 path).
+
+Kept in repo as it represents real WIP from a parallel session/effort.
+
+### Verification
+
+- mlx-native lib: 290/0 passing
+- quantized_matmul tests: 9/9 PASS
+- Coherence: gemma4 "2 + 2 = 4" intact
+- Bench (5-trial mean): **74.96** tok/s (matches iter-403 74.90, within noise)
+
+### Status: 4/4 main mv kernels aligned
+
+| Kernel | iter | Status |
+|---|---|---|
+| Q6_K NR2 | iter-401 | ✓ short indexing |
+| Q6_K_ID NR2 | iter-402 | ✓ short indexing |
+| Q5_K | iter-403 | ✓ short indexing |
+| **Q4_K** | **iter-406 (this)** | ✓ **short indexing** |
+
+All 4 main MV kernels now consistent with peer's idiomatic pattern.
+
+### Remaining mv kernels NOT aligned (lower priority)
+
+- Q6_K baseline (line 591) — only fires if NR2 disabled (default-on, so unused)
+- Q4_0 (line 205) — auxiliary type, low usage in gemma4
+- Q8_0 (line 407) — iter-368 found NR2 flat; baseline still int
+- Q5_1 (line 276) — APEX MoE expert tensors, minor usage
+- IQ4_NL (line 342) — APEX-specific, minor usage
+
+These could be aligned in future iters if desired (perf-neutral, code-quality).
+
+### Tests + bench
+- mlx-native lib: 290/0 + quantized_matmul 9/9.
+- hf2q lib: 3454+2 passing.
+- Coherence intact.
+
+### Investigation count this thread
+63 total: 62 from iter-405 + this iter (4/4 main mv alignment + l2_norm audit).
