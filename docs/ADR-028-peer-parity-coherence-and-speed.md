@@ -17989,3 +17989,69 @@ iter-381+ work plan:
 
 ### Investigation count this thread
 37 total: 36 from iter-379 + this iter (scaffolding only).
+
+## iter-381 — EncoderWorker Metal-dispatch integration tests
+
+### Date
+2026-05-10
+
+### Goal
+Per iter-380's plan step 1: validate that `EncoderWorker` can actually drive
+real Metal compute dispatches end-to-end from a worker thread, not just
+execute Rust closures.
+
+### Implementation
+
+Added 2 `#[cfg(target_vendor = "apple")]` integration tests to
+`mlx-native/src/encoder_worker.rs`:
+
+#### Test 1: `worker_can_create_metal_encoder_and_commit`
+Validates the foundational invariant:
+- `MlxDevice` can be wrapped in `Arc` and sent to worker thread
+- Worker thread can call `device.command_encoder()` to create a fresh encoder
+- Worker thread can call `enc.commit_and_wait()` and return success
+- Main thread receives completion signal via channel
+
+This proves the Metal command queue is genuinely thread-safe in practice
+(matches the static_assertions_send_sync claim at device.rs:39).
+
+#### Test 2: `worker_can_dispatch_real_kernel_zero_buffer`
+End-to-end Metal compute dispatch from worker thread:
+1. Main thread allocates `MlxBuffer` with 1024 × f32, initialized to 1.0
+2. Buffer wrapped in `Arc<Mutex>` for cross-thread mutation access
+3. Worker submitted: creates KernelRegistry, dispatches `moe_zero_buffer`
+   kernel, commits + waits
+4. Main thread: after worker completion, locks buffer + verifies all 1024
+   elements are now 0.0
+
+Validates:
+- Worker thread can register + dispatch real Metal kernels
+- Buffer GPU mutations are visible to main thread after commit_and_wait
+  (Apple unified memory model)
+- No data races or undefined behavior in the cross-thread Metal access path
+
+### Tests + bench
+- mlx-native lib: 291/0 → 293/0 (2 new Metal integration tests).
+- All 6 EncoderWorker tests pass:
+  ```
+  test encoder_worker::tests::submit_runs_closure ... ok
+  test encoder_worker::tests::submissions_run_in_order ... ok
+  test encoder_worker::tests::shutdown_waits_for_in_flight_work ... ok
+  test encoder_worker::tests::submit_after_shutdown_errors ... ok
+  test encoder_worker::tests::worker_can_create_metal_encoder_and_commit ... ok
+  test encoder_worker::tests::worker_can_dispatch_real_kernel_zero_buffer ... ok
+  ```
+- hf2q lib: 3454/0 unchanged.
+- No bench impact (no production wiring yet).
+
+### Path forward (unchanged from iter-380)
+
+- **iter-382**: Wire EncoderWorker into hf2q `forward_decode` — split layer
+  encoding between main thread (layers 0-N) and worker (layers N+1-29).
+  Main thread commits buf0 first; worker commits buf1 after.
+- **iter-383**: Bench A/B (single-thread vs multi-thread encoding).
+- **iter-384+**: Ship default-on if positive (~3-5% potential gain).
+
+### Investigation count this thread
+38 total: 37 from iter-380 + this iter (Metal integration tests, no
+production change).
