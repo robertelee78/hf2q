@@ -16545,3 +16545,66 @@ Possible candidates from the iter-352 dispatch breakdown:
 - Other fused-norm variants (e.g., `fused_post_attn_triple_norm_f32` if present, `rms_norm_f32_triple` if present) — TBD audit
 
 If 2-3 more candidates exist, cumulative could climb to +5-6% decode.  Real path forward.
+
+## iter-363 — Phase 13.2 LANDED: fused_moe_routing_f32 V2 default-on (+0.3%)
+
+### Date
+2026-05-10
+
+### Hypothesis (from iter-362's audit pattern)
+Apply iter-362's discovery — kernels written from scratch for hf2q that missed iter-310's V2 sweep — to `fused_moe_routing_f32`.  Per the iter-352 dispatch breakdown: 1 dispatch/layer × 30 layers = 30/decode-token = 3.41% of dispatches.  V1 uses two scalar tree reductions (max + sum) with 7 barriers each = 14 barriers per dispatch.  V2 simd_max + simd_sum should reduce to 4 barriers per dispatch, saving ~300 barriers/decode-token.
+
+### Result LANDED
+
+#### Parity (byte-identical)
+```
+v2_parity_gemma4_moe_routing_128_experts_top_8: max_abs=0.0e0  max_rel=0.0e0
+v2_parity_with_per_expert_scale:                max_abs=0.0e0  max_rel=0.0e0
+```
+**Top-K expert IDs match exactly** + **routing weights bit-identical** at 128 experts × 8 top_k (gemma4 production shape).  Same math as V1.
+
+#### Bench (gemma4-ara-2pass-APEX-Q5_K_M, M5 Max, p50 across 3 trials)
+
+| Path | Pre-iter-363 | Post-iter-363 default-on | Δ |
+|---|---|---|---|
+| Hybrid F16-K (default) | 76.0 (iter-362) | **76.3** | **+0.3%** |
+
+Smaller than barrier-count math predicted (~+1% expected from 300 barrier saving), but consistent across 3 trials.  Likely because barrier cost on Apple GPU is smaller than my 5 µs/barrier estimate.  Real and measurable; ships as default per parity-proven Phase 10/13 pattern.
+
+#### Coherence (preserved)
+- Hybrid `"What is 2+2?"` → `"2 + 2 = 4<turn|>"` — bit-identical.
+
+### Files added (mlx-native)
+- `/opt/mlx-native/src/shaders/fused_norm_add_f32.metal`: append `fused_moe_routing_f32_v2` kernel (~115 LOC).  Same buffer layout + same `FusedMoeRoutingParams` struct as V1.  V2 uses simd_max + simd_sum + per-SG staging; top-K phase identical (single-thread serial selection).  Shared memory layout extended slightly to fit n_sg per-SG sum scratch at offset `[2 * num_experts]`.
+- `/opt/mlx-native/src/kernel_registry.rs`: register the new kernel.
+- `/opt/mlx-native/tests/test_fused_moe_routing_v2_parity.rs`: 2 parity tests at gemma4 shape (128 experts × top_k=8) — both with unit per-expert scale and per-channel scale.
+
+### Files modified
+- `/opt/mlx-native/src/ops/fused_norm_add.rs`: V2 dispatcher path, default-ON via inline opt-out check.  Shared-memory budget computed conditionally (V1 uses tree-reduction scratch; V2 uses smaller per-SG scratch).
+
+### Cumulative thread improvements (now 4 successful phases)
+
+| Phase | Iters | Δ at default | Status |
+|---|---|---|---|
+| Phase 9 (BATCHED_PREFILL default-on) | iter-344 | +4.4× chat throughput | LANDED |
+| Phase 10 (hybrid F16-K + TQ-HB-V) | iter-346..354 | +2.4% decode (hybrid) | LANDED |
+| Phase 13 (fused_post_ff_norm2 V2) | iter-362 | +0.7% decode | LANDED |
+| Phase 13.2 (fused_moe_routing V2) | iter-363 (this) | +0.3% decode | LANDED |
+| **Cumulative decode improvement** | — | **+3.4%** | **at default** |
+
+### Pattern continues to work
+
+The "audit kernels missed by earlier V2 sweeps" pattern is yielding real wins.  Phase 14 candidate audit:
+- All `*_f32_v2` already done: rms_norm, rms_norm_no_scale, fused_head_norm_rope, fused_norm_add, fused_post_ff_norm2_endlayer (this iter family), fused_moe_routing
+- Remaining tree-reduction kernels in hot path (per dispatch breakdown):
+  - `moe_swiglu_batch` (3.41%) — likely uses tree reduction internally (or per-token writes)
+  - `moe_weighted_sum` (3.41%) — likely scalar tree-reduce across active experts
+- These two are the largest unaudited candidates.  Iter-364 will audit + V2 if applicable.
+
+### Tests + bench
+- mlx-native lib: 284/0 passing.
+- New parity tests: 2/0 passing (byte-identical).
+- All rms_norm parity tests: 25/0 passing.
+- New V2 fused_post_ff_norm2 parity (iter-362): 2/0 passing.
+- hf2q lib: 3454/0 passing.
+- Coherence verified: hybrid produces "2 + 2 = 4<turn|>" bit-identical.
