@@ -17917,3 +17917,75 @@ target model (gemma4-ara-2pass-APEX-Q5_K_M.gguf).**
 
 ### Investigation count this thread
 36 total: 35 from iter-378 + this iter (audit-only).
+
+## iter-380 — EncoderWorker scaffolding for multi-thread cmd-buf encoding
+
+### Date
+2026-05-10
+
+### Goal
+Per iter-369/377/378/379 audits, the largest remaining gemma4-decode peer-gap
+lever is multi-thread command-buffer encoding (peer's `n_cb=2` GCD
+`dispatch_apply` pattern, `ggml-metal-context.m:438+550`).  The previous
+attempt at threading was falsified at -43 tok/s due to per-token
+`std::thread::spawn` overhead (per `forward_decode` comment line 4592-4595).
+
+iter-380 is the FIRST step of the multi-day port: persistent worker thread
+infrastructure with one-time spawn cost, channel-based work submission.
+
+### Implementation
+
+NEW module `mlx-native/src/encoder_worker.rs` (~165 LOC):
+- `EncoderWorker` struct with persistent `std::thread` + `mpsc::Sender<Task>`.
+- `spawn()` creates the thread once; thread blocks on `rx.recv()` with zero
+  CPU when idle.
+- `submit<F: FnOnce + Send + 'static>(&self, f)` enqueues work without
+  blocking caller.
+- `shutdown()` drops the sender (closing the channel, ending the worker's
+  run-loop) then `join`s.
+- `Drop` impl auto-shuts-down.
+
+Closures execute SEQUENTIALLY on the worker thread (FIFO order).  For
+parallelism with the main thread, the typical pattern is:
+1. Spawn one `EncoderWorker` at process start.
+2. Per token: submit half the encoding work to worker; encode other half
+   on main thread; wait for both.
+
+### Tests (4/4 PASS)
+
+```
+test encoder_worker::tests::submit_runs_closure ... ok
+test encoder_worker::tests::submissions_run_in_order ... ok
+test encoder_worker::tests::shutdown_waits_for_in_flight_work ... ok
+test encoder_worker::tests::submit_after_shutdown_errors ... ok
+```
+
+Tests verify: closure execution, FIFO ordering, in-flight task completion
+on shutdown, error on post-shutdown submit.
+
+### NOT in this iter
+
+- Metal-dispatch integration test (deferred to iter-381+ once wired to
+  forward_decode).
+- Production wiring in hf2q forward_decode (deferred).
+- Bench (deferred — no production effect yet).
+
+### Path forward
+
+iter-381+ work plan:
+1. **iter-381**: Add a Metal-dispatch integration test (worker encodes a
+   small dispatch into its own cmd_buf, commits, validates output).
+2. **iter-382**: Wire into hf2q `forward_decode` — split layer encoding
+   between main thread (layers 0-N) and worker (layers N+1-29).  Main
+   commits buf0 first; worker commits buf1 after.
+3. **iter-383**: Bench A/B (single-thread vs multi-thread encoding).
+4. **iter-384+**: If positive, ship default-on; tune split point;
+   investigate scaling to 2+ workers.
+
+### Tests + bench
+- mlx-native lib: 287/0 → 291/0 (4 new EncoderWorker tests).
+- hf2q lib: 3454/0 passing (no hf2q changes).
+- No bench impact (no production wiring yet).
+
+### Investigation count this thread
+37 total: 36 from iter-379 + this iter (scaffolding only).
