@@ -18722,3 +18722,88 @@ Each iter ships a discrete artifact + remains easily revertable.
 
 ### Investigation count this thread
 47 total: 46 from iter-389 + this iter (struct skeleton).
+
+## iter-391 — encode_one_layer stub method + scope reality check
+
+### Date
+2026-05-10
+
+### Goal
+Per iter-390 plan, populate the encode_one_layer method.  Approached
+realistically given /loop iter budget.
+
+### Implementation
+
+Added stub method to `MlxModelWeights` impl (forward_mlx.rs ~line 2443):
+
+```rust
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn encode_one_layer(
+    &self,
+    _layer_idx: usize,
+    _ctx: &super::layer_ctx::LayerCtx<'_>,
+    _session: &mut mlx_native::graph::GraphSession<'_>,
+    _gpu: &mut GpuContext,
+    _profile: &mut Option<TokenProfile>,
+    _total_dispatches: &mut u64,
+) -> Result<()> {
+    // STUB — iter-392+ will move layer body here.
+    Ok(())
+}
+```
+
+Method signature compiles.  Production unchanged (method unused).
+
+### Scope reality check (honest)
+
+After 12 iters of multi-thread infrastructure (iter-380 through iter-391),
+I have:
+- ✓ Worker thread infrastructure (mlx-native EncoderWorker, hf2q singleton)
+- ✓ Metal-dispatch validated cross-thread
+- ✓ All `&mut MlxBuffer` → `&MlxBuffer` (49 sites)
+- ✓ All `&mut self.activations.X` → `&self.activations.X` (23 sites)
+- ✓ Layer body is `&self`-only (verified)
+- ✓ LayerCtx struct skeleton
+- ✓ Synthetic bench: +5.8% min / +11.7% mean
+- ✓ encode_one_layer stub method
+
+Remaining work:
+- iter-392: Move 1848 LOC of layer body into encode_one_layer + populate
+  LayerCtx with the 59 cross-loop locals.
+- iter-393: Wire EncoderWorker — split layer range across main + worker.
+- iter-394: Bench A/B + tune split N.
+- iter-395+: Ship default-on if positive.
+
+### Honest acknowledgment
+
+**The 1848-LOC layer-body move (iter-392) cannot be done safely in a
+single 5-min /loop iter.**  Each block of the layer body has subtle borrow
+patterns + interactions with `s` (GraphSession) + `gpu` (GpuContext) that
+need careful handling to avoid coherence regressions like iter-367 had.
+
+The iter-380-391 incremental approach was correct for INFRASTRUCTURE prep,
+but the actual code move is "concentrated multi-hour focus" work — not
+something that benefits from being chunked across many /loop iters.
+
+### Two paths forward
+
+**Path A**: Continue chunking — iter-392 moves first sub-block (e.g., the
+QKV projection block ~150 LOC), iter-393 moves next, etc.  Maybe 5-8
+iters to complete the move.
+
+**Path B**: Operator decision — schedule a focused multi-hour session for
+iter-392 that does the full move + bench, sidestepping the /loop iter
+chunk constraint.
+
+Per /loop charter "continue until complete", Path A is the default.
+But this iter formally surfaces that the path forward is incremental
++ slow vs. concentrated + fast.
+
+### Tests + bench
+- mlx-native lib: 290/0 passing (no changes).
+- hf2q lib: 3454+1 passing (LayerCtx test from iter-390 still passes).
+- Coherence: gemma4 "2 + 2 = 4" intact.
+- No bench impact (encode_one_layer unused in production).
+
+### Investigation count this thread
+48 total: 47 from iter-390 + this iter (stub method).

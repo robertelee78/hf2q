@@ -2439,6 +2439,28 @@ impl MlxModelWeights {
     ///   - gpu: the GpuContext holding the executor and registry
     ///   - profile: optional per-token profile accumulator
     ///
+    /// ADR-028 iter-391: stub method for the upcoming layer-body extraction.
+    /// Currently UNUSED (forward_decode keeps inline layer loop).  iter-392+
+    /// will incrementally populate this method with code from the existing
+    /// layer loop body, then switch forward_decode to call it instead.
+    ///
+    /// When complete, this method will be the unit of work that the
+    /// EncoderWorker thread runs in parallel with the main thread for the
+    /// second-half of layer encoding.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn encode_one_layer(
+        &self,
+        _layer_idx: usize,
+        _ctx: &super::layer_ctx::LayerCtx<'_>,
+        _session: &mut mlx_native::graph::GraphSession<'_>,
+        _gpu: &mut GpuContext,
+        _profile: &mut Option<TokenProfile>,
+        _total_dispatches: &mut u64,
+    ) -> Result<()> {
+        // STUB — iter-392+ will move layer body here.
+        Ok(())
+    }
+
     /// Returns: the next token ID (greedy decode)
     pub fn forward_decode(
         &mut self,
