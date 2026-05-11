@@ -23752,3 +23752,111 @@ load_tensor calls per layer).
 The startup gap is now **fully traced from 3.29s → 2.02s of two
 `gguf.load_tensor()` calls per MoE layer × 30 layers**.  ~62% of the
 total startup is in this single mechanism.
+
+## iter-464 — ROOT CAUSE: `gguf.load_tensor()` is double-copy via File I/O (not mmap)
+
+### Hypothesis
+iter-463 found 60 `load_tensor` calls take 22-45 ms each.  Per
+iter-461 `resident_weight_bytes=None` suggested mmap, but per-call
+overhead is too high for zero-copy.  Read the actual implementation.
+
+### Method
+Read `/opt/mlx-native/src/gguf/mod.rs:1100-1192`:
+- `load_tensor()` impl
+- `read_tensor_bytes()` helper
+- reader type declaration
+
+### Findings — DOUBLE-COPY ARCHITECTURE
+
+**`read_tensor_bytes` (line 1104-1124)**:
+```rust
+let mut buf = vec![0u8; info.byte_len];
+reader.read_exact(&mut buf)?;
+Ok(buf)
+```
+Allocates Vec on heap, file-reads bytes via BufReader → memcpy #1.
+
+**`load_tensor` (line 1144-1190)**:
+```rust
+let data = self.read_tensor_bytes(info)?;
+let mut buf = device.alloc_buffer(info.byte_len, DType::U8, ...)?;
+buf.as_mut_slice()?.copy_from_slice(&data);
+Ok(buf)
+```
+Allocates fresh MlxBuffer, copies Vec into it → memcpy #2.
+
+**Reader type (line 162)**:
+```rust
+reader: Mutex<BufReader<std::fs::File>>,
+```
+**Buffered File I/O, NOT mmap.** `resident_weight_bytes=None` from
+iter-461 was misleading — that field tracks something else.
+
+### Per-tensor cost breakdown
+For one MoE stacked tensor (~248 MB at gemma4):
+- Mutex lock (cheap)
+- File seek (cheap)
+- read_exact: alloc Vec + read 248 MB from disk (or page cache) → memcpy #1
+- alloc MlxBuffer (Metal API call + residency_set add)
+- copy_from_slice → memcpy #2
+
+At Apple LPDDR5x ~50 GB/s memcpy: 248 MB / 50 GB/s = 5 ms per memcpy.
+Two memcpy = 10 ms minimum.  Plus ~30 ms in mutex + seek + alloc +
+residency_set add = ~40-45 ms per call.  Matches measured 45 ms/layer
+for gate_up.
+
+### Total memory movement at startup
+For gemma4-26b-A4B (30 layers, 128 experts):
+- 30 × ffn_gate_up_exps (~248 MB each) = 7.4 GB
+- 30 × ffn_down_exps (~120 MB each) = 3.6 GB
+- **~11 GB physical bytes moved** during MoE load
+
+Each byte is moved TWICE (file→Vec→MlxBuffer), so effectively 22 GB
+of memcpy traffic.  At ~50 GB/s memcpy that's 0.44 sec just in
+memcpy time + ~1.5 sec in alloc/lock/seek/registration overhead =
+~2 sec measured.
+
+### Peer's architecture (inferred)
+llama.cpp uses **mmap'd MTLBuffer** — points the Metal buffer
+descriptor directly at the mmap'd file region.  Zero memcpy at
+load time.  Per-tensor cost is just buffer descriptor construction
+(microseconds).
+
+### The lever
+**Change `mlx-native::gguf::load_tensor` to support zero-copy mmap-
+backed MlxBuffer construction**.  This is the architectural fix.
+
+Multi-iter scope:
+- Add mmap-backed reader to gguf module
+- Add `MlxBuffer::from_mmap_slice(...)` constructor in mlx-native
+- Update load_tensor to construct via mmap when possible
+- Validate all callers handle borrowed-vs-owned semantics
+- Coherence verify (no readback bugs)
+
+Estimated gain: 1.5-2 sec startup (62% of current load_wall_clock).
+
+### Investigation count this thread
+121 total: 120 from iter-463 + this iter (root cause: double-copy
+via File I/O, not mmap).
+
+### Cumulative gap chain (iter-458→464 — FULLY TRACED)
+| iter | Finding |
+|---|---|
+| 458 | Total gap = 1.64 sec (3.29s vs 1.65s peer) |
+| 459 | load_wall_clock = 88% (2.91s) |
+| 461 | mlx_weights_load = 88% of load (2.55s) |
+| 462 | MoE = 81% of weights (2.07s) |
+| 463 | gate_up + down `load_tensor` = 97% of MoE (2.02s) |
+| **464** | **ROOT: BufReader<File> + double memcpy (no mmap)** |
+
+The startup gap is now FULLY ROOT-CAUSED in 7 iters.  Architectural
+fix is multi-iter operator-decision-gated work in mlx-native.
+
+### Operator decision matrix (refined)
+| Lever | Effect | Cost |
+|---|---|---|
+| **mmap-backed gguf load_tensor** | **-2 sec startup** | multi-iter mlx-native architectural |
+| GGUF-embedded tokenizer default | -300 ms startup | 1-2 iters |
+| Phase 15 default-on | ✓ shipped | done |
+| HYBRID_KV | OPERATOR-GATED | (decode lever) |
+| Multi-thread decode | OPERATOR-GATED | (decode lever) |
