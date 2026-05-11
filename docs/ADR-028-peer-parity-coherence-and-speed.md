@@ -15361,10 +15361,15 @@ simdgroup matmul) and V via TQ-HB dequant (existing path).
 
 Memory math at gemma4 defaults (sliding_window=1024, 8 KV heads × 256
 head_dim, 30 layers):
-- F32 K/V (raw): 30 × 8 × 256 × 1024 × 4 × 2 = 504 MB
-- TQ-HB K/V (current): 504 / 3.94 = ~128 MB  (3.94× savings)
-- F16 K + TQ-HB V (hybrid): K = 252/2 = 126 MB; V = 126/3.94 = 32 MB; total = 158 MB
-  → savings ratio = 504/158 = **3.19× vs raw F32** (was 3.94× = 81% of full TQ-HB savings preserved)
+- F32 K/V (raw): 30 × 8 × 256 × 1024 × 4 × 2 = 504 MB (252 MB K + 252 MB V)
+- TQ-HB K/V (current): 504 / 3.94 = ~128 MB  (3.94× savings; 64 MB K + 64 MB V)
+- F16 K + TQ-HB V (hybrid): K = 252/2 = 126 MB; V = 252/3.94 = ~64 MB (SAME TQ-HB-V as all-TQ-HB case); total = 190 MB
+  → savings ratio = 504/190 = **2.65× vs raw F32**
+  → iter-346 ORIGINAL claim of 3.19× was a math error: used `V = 126/3.94 = 32 MB`
+    (using F16 K size as V's baseline) instead of `V = 252/3.94 = 64 MB` (using
+    F32 V baseline).  CORRECTED iter-447: hybrid is 2.65× memory savings.
+  → Hybrid preserves ~83% of TQ-HB's PER-BYTE savings ratio (the "81% preserved"
+    framing remains correct for that interpretation).  Absolute ratio is 2.65×.
 
 The hybrid trade: keep 81% of TQ-HB memory savings + unlock peer-equivalent SDPA on K (1.81× per-dispatch wall improvement on the K path, which is half of SDPA work).
 
@@ -22740,3 +22745,73 @@ hybrid math correction).
 The HYBRID_KV memory tradeoff is HARDER than previously documented
 (33% memory cost, not 19%).  Operator decision is more constrained
 by RAM-mantra.
+
+## iter-448 — fix iter-346 hybrid memory math: 3.19× → 2.65× corrected
+
+### Hypothesis
+iter-447 found hybrid per-slot calc gives 2.65× savings, not 3.19×
+as iter-346 claimed.  Investigate iter-346's actual math + fix the
+documentation error.
+
+### Method
+Re-read ADR-028 §iter-346 derivation; trace the math step-by-step.
+
+### iter-346's original math (from ADR-028 line 15364-15367)
+```
+F32 K/V (raw): 30 × 8 × 256 × 1024 × 4 × 2 = 504 MB
+TQ-HB K/V (current): 504 / 3.94 = ~128 MB  (3.94× savings)
+F16 K + TQ-HB V (hybrid):
+  K = 252/2 = 126 MB
+  V = 126/3.94 = 32 MB    ← BUG: should be 252/3.94 = 64 MB
+  total = 158 MB
+savings ratio = 504/158 = 3.19×
+```
+
+### The bug
+iter-346 computed `V_hybrid = 126/3.94 = 32 MB` using F16_K_size
+(126 MB) as V's baseline.  But V's F32 baseline is 252 MB (half of
+the 504 MB total F32 K+V), and TQ-HB-V is the SAME encoding whether
+K is also TQ-HB or F16.
+
+**Correct hybrid math**:
+- K F16 = 126 MB
+- V TQ-HB = 252/3.94 = **64 MB** (NOT 32 MB)
+- Total = 190 MB
+- Savings = 504/190 = **2.65×** vs raw F32
+
+Per-slot derivation (independent verification):
+- F32: 32,768 B
+- TQ-HB: 8,320 B → 3.94×
+- Hybrid: 12,352 B → 2.65×
+
+### Fix shipped
+1. **`/opt/mlx-native/src/shaders/flash_attn_vec_hybrid.metal:7`**
+   updated to cite "2.65× total vs raw F32" with explicit note that
+   iter-346's "3.19× savings (81% preserved)" was a math error.
+2. **ADR-028 §iter-346 memory math block** corrected with annotated
+   step-by-step showing the bug and the right answer.
+
+The "81% preserved" framing is RETAINED but reinterpreted: hybrid
+preserves ~83% of TQ-HB's PER-BYTE savings ratio (5/6 saved units
+out of 6).  But the ABSOLUTE ratio is 2.65×, not 3.19×.
+
+### Build verification
+hf2q rebuilt cleanly after metal comment edit.  No code change in
+the kernel itself; only doc strings updated.
+
+### Investigation count this thread
+105 total: 104 from iter-447 + this iter (math fix shipped).
+
+### Operator decision matrix (refined hybrid memory cost)
+
+| Lever | Status | Memory tradeoff |
+|---|---|---|
+| Phase 15 default-on | ✓ shipped | 0 |
+| **HYBRID_KV** | OPERATOR-GATED | **3.94× → 2.65× = 33% extra memory** |
+| Multi-thread | OPERATOR-GATED | 0 |
+| FA_GL F8 K | OPERATOR-GATED | 0 |
+
+Per RAM-mantra "preserve TQ-HB 3.94× per-slot savings", the HYBRID
+opt-in costs 33% more memory than default — not 19% as iter-435/auto-
+memory had documented.  Operator decision more constrained than
+previously thought.
