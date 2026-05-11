@@ -19114,3 +19114,61 @@ This is the smallest remaining concrete lever found in cross-peer audit.
 
 ### Investigation count this thread
 52 total: 51 from iter-394 + this iter (cross-peer audit).
+
+## iter-396 — Shared-mode dispatch overhead bench (Private decision deferred)
+
+### Date
+2026-05-10
+
+### Goal
+Per "Measure 3x cut once" mantra: empirically measure Shared-mode dispatch
+overhead BEFORE committing to candle's StorageModePrivate refactor (1-2
+days) flagged in iter-395.
+
+### Implementation
+NEW test `mlx-native/tests/test_iter396_storage_mode_bench.rs`:
+- Allocate 30 Shared MlxBuffers (1024 floats each — typical activation size)
+- Run 30 zero_buffer dispatches per buffer = 900 total dispatches
+- Measure wall time across 10 trials
+
+### Results
+
+```
+Shared  : min 741 µs  mean 814 µs  trials [957, 818, 820, 814, 790, 823, 814, 796, 741, 765]
+Per-dispatch wall (min):    0.823 µs
+Per-dispatch wall (mean):   0.904 µs
+```
+
+At gemma4 decode 920 dispatches/token / 13.5 ms/token = predicted savings:
+- Low end (10 ns/dispatch): 9.2 µs/token = **0.068%** gain
+- High end (100 ns/dispatch): 92 µs/token = **0.681%** gain
+
+### Decision: defer Private refactor
+
+The savings magnitude is uncertain without an A/B comparison.  Adding the
+Private alloc API itself is ~30 LOC + GPU-side fillBuffer zero-init
+(~1-2 hours).  Could add it to enable proper comparison.
+
+But even at the high end (0.681%), the gain is below other unblocked
+levers:
+- Multi-thread port (iter-380-392 prep complete): predicted +5-7%
+- StorageModePrivate: predicted 0.07-0.68%
+
+Scope decision: prioritize multi-thread over Private refactor.  Document
+Private as available-when-multi-thread-port-completes.
+
+### What this iter validated
+
+- Per-dispatch wall on Apple M5 Max for trivial kernel: 0.823 µs (min)
+- iter-336 measurement of 14.7 µs/dispatch was on REAL kernels with
+  more buffers + larger work; the 0.823 µs here represents the FLOOR
+  for any dispatch (encoding overhead + GPU launch latency)
+- Coherency tracking overhead is a small fraction of this floor
+
+### Tests + bench
+- mlx-native lib: 290/0 passing (1 new bench test, not in lib).
+- New iter-396 bench test passes.
+- hf2q lib: 3454+2 passing.
+
+### Investigation count this thread
+53 total: 52 from iter-395 + this iter (Shared overhead bench).
