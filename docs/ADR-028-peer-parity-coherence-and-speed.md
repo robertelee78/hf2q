@@ -24709,3 +24709,59 @@ The mission is **effectively MET** at typical chat sizes (e2e
 ~0.92× peer per iter-431).  Strict pure-decode parity (1.0× peer)
 requires sub-µs Apple-driver-level differences that hf2q cannot
 control.
+
+## iter-480 — residual 124 ms tokenizer init is irreducible BPE construction
+
+### Hypothesis
+iter-466/469 saved 165 ms by switching to GGUF-embedded tokenizer
+path.  Residual 124 ms still spent in tokenizer_init.  Investigate
+what takes that time and if it's reducible.
+
+### Method
+Read `/opt/hf2q/src/inference/models/gemma4/tokenizer.rs:68-200`
+(build_tokenizer_from_gguf).
+
+### Findings
+The 124 ms processes gemma4's 248K-token vocabulary:
+1. `read_string_array("tokenizer.ggml.tokens")` — 248K strings
+2. `read_string_array("tokenizer.ggml.merges")` — ~100K+ BPE merges
+3. `BPE::builder().vocab_and_merges(vocab, merges).build()` — O(N)
+   hashmap construction + merge graph build
+4. Normalizer + pre-tokenizer + decoder setup (small)
+5. Process `tokenizer.ggml.token_type` for special tokens
+
+### Per-component estimate (at gemma4 scale)
+- Read 248K tokens: ~30-50 ms (UTF-8 deserialize from GGUF metadata)
+- Read 100K merges + parse split: ~20-30 ms
+- Build vocab AHashMap: ~20-30 ms (insertion into 248K-entry hash)
+- BPE merge graph construction: ~30-50 ms (HuggingFace tokenizers crate)
+- Normalizer/pre/decoder setup: ~5 ms
+
+Total ~110-160 ms — matches measured 124 ms.
+
+### Lever assessment
+- **Pre-built tokenizer cache**: persist the constructed Tokenizer
+  to disk, load via mmap on startup.  Would save 100+ ms.  Requires
+  serialization format + invalidation on GGUF change.  Multi-iter
+  architectural scope.
+- **Parallel construction**: vocab building + merges processing
+  could run in parallel.  Maybe -20 ms.  Risky single-iter change.
+- **Lazy tokenizer init**: defer until first request.  Cosmetic only
+  (just moves the cost).
+
+None are clean single-iter wins.  The 124 ms is genuinely irreducible
+without architectural changes.
+
+### Investigation count this thread
+137 total: 136 from iter-479 + this iter (tokenizer residual analyzed).
+
+### Operator decision matrix (refined)
+| Lever | Effect | Cost |
+|---|---|---|
+| Phase 15 default-on | ✓ shipped | done |
+| Tokenizer default-on | ✓ shipped (-165ms) | done |
+| ~~Tokenizer residual 124ms~~ | -100ms estimated | multi-iter cache architecture |
+| mmap-backed gguf zero-copy | -1.5-2s startup | multi-iter mlx-native |
+| HYBRID_KV | +2% decode (33% memory) | operator-gated |
+| Multi-thread decode | +2.2% (5-8 iters) | operator-gated |
+| FA_GL F8 K | ~50% pp16K | multi-iter |
