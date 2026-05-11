@@ -22192,3 +22192,65 @@ benefit or regress at HEAD.
 ### Operator decision matrix (unchanged)
 Same five rows as iter-435.  Continued elimination of false leads
 clarifies the picture: HYBRID_KV is the only single-flip lever.
+
+## iter-439 — LANDED phase inventory verification at HEAD
+
+### Hypothesis
+With many phases LANDED across iter-300+ (Phase 4/5/9/10*/13/13.2/
+14/15) and several env-flag flips, verify that ALL claimed "default-on"
+phases are still actually default-on at HEAD (no regression by
+subsequent work).
+
+### Method
+- Search `investigation_env.rs` for env_default_true vs env_eq_one
+  state of each flag
+- Cross-reference with each Phase X LANDED claim in this ADR
+
+### Inventory at HEAD
+
+| Phase | Title | Default state | Verified |
+|---|---|---|---|
+| 4 (iter-331) | fused_norm_add_f32_v2 | hard-coded V2 path | ✓ |
+| 5 (iter-337) | fused_head_norm_rope_f32_v2 | hard-coded V2 path | ✓ |
+| 9 (iter-344) | BATCHED_PREFILL | `env_default_true` | ✓ |
+| 10b (iter-347) | HybridKvBuffers struct | scaffold | always present |
+| 10c (iter-348) | F16-K skip + V-only TQ-HB | env-gated `HYBRID_KV` | OPT-IN |
+| 10d (iter-349) | flash_attn_vec_hybrid kernel | env-gated `HYBRID_KV` | OPT-IN |
+| 10e (iter-350) | hybrid SDPA dispatcher | env-gated `HYBRID_KV` | OPT-IN |
+| 10e.5 (iter-351) | V-no-FWHT encoder | env-gated `HYBRID_KV` | OPT-IN |
+| 10c.5 (iter-354) | fused F16-K + V-no-FWHT | env-gated `HYBRID_KV` | OPT-IN |
+| 13 (iter-362) | fused_post_ff_norm2_endlayer V2 | hard-coded V2 path | ✓ |
+| 13.2 (iter-363) | fused_moe_routing_f32 V2 | hard-coded V2 path | ✓ |
+| 14 (iter-373) | dual_buffer_split=2 | default `vec![2]` | ✓ |
+| 15 (iter-415→421) | serve batched-prefill | `env_default_true` | ✓ (iter-421) |
+
+### State summary
+- **9 LANDED phases default-active at HEAD**: 4/5/9/13/13.2/14/15
+  + scaffold 10b
+- **5 LANDED Phase 10 variants are HYBRID-grouped under HF2Q_HYBRID_KV**:
+  collectively contribute +3.3% decode (iter-435 verified) but
+  operator-gated due to 19% memory cost
+- **0 LANDED phases regressed** by subsequent work
+- **Env opt-out** for Phase 9, 14, 15 still works (operator can disable
+  any LANDED phase via env=0)
+
+### Cumulative gain at production (default-active phases)
+From original 73.7 tok/s baseline (iter-300 era):
+- Phase 4 (norm_add V2): +1.3%
+- Phase 5 (head_norm_rope V2): +0.1% noise
+- Phase 9 (BATCHED_PREFILL CLI): +4.4× chat throughput
+- Phase 13 (post_ff_norm2 V2): +0.7%
+- Phase 13.2 (moe_routing V2): +0.3%
+- Phase 14 (dual_buffer=2): +0.18%
+- **Phase 15 (serve batched): production prefill 0.022→0.94× peer (35-43×)**
+
+Production HEAD measurements match expected:
+- Decode: ~67-77 tok/s (varies by methodology)
+- Prefill (batched-serve): 2500-2800 tok/s
+
+### Investigation count this thread
+96 total: 95 from iter-438 + this iter (LANDED inventory).
+
+### No code change
+Verification only.  Confirms all LANDED phases still active.
+HYBRID_KV remains the singular toggle-only operator decision.
