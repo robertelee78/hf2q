@@ -25347,3 +25347,170 @@ shared memory), the launch-floor savings show up as CPU idle time, not
 GPU throughput.  Always measure before defaulting on a dispatch-collapse;
 the math-equivalent kernel and the actually-faster kernel are not the
 same thing.
+
+## iter-485 H3 — fused TQ-HB reduce + FWHT-sign-undo FALSIFIED, parity-clean kernel landed dormant
+
+**Status:** FALSIFIED (delta < +3% ship gate).  Implemented, parity-passes,
+coherence-intact, but the measured production decode improvement is below
+the ship threshold.  Kernel remains in tree, env-gated OFF by default.
+
+### Hypothesis
+
+Per-decode-token at gemma4 30L, the TQ-HB SDPA chain runs:
+1. `fwht_sign_premult_f32` on Q (1 dispatch + barrier per layer)
+2. `flash_attn_vec_tq_hb_dk256` (1 dispatch + barrier)
+3. `flash_attn_vec_reduce_dk256` (1 dispatch + barrier)
+4. `fwht_sign_undo_f32_d256` on output (1 dispatch + barrier)
+
+H3 hypothesizes fusing 3+4 into a single kernel
+`flash_attn_vec_reduce_tq_hb_undo_dk{256,512}` that does the cross-WG
+online-softmax reduce AND the FWHT-sign-undo on the final output row,
+saving 1 dispatch + 1 forced memory_barrier per layer per decode token.
+Expected delta: +3-7% decode (mirroring iter-108's fwht_sign_premult
+fusion gain).
+
+### Implementation
+
+- **mlx-native kernel**: `flash_attn_vec_reduce_tq_hb_undo<DV>` —
+  `/opt/mlx-native/src/shaders/flash_attn_vec_reduce_tq_hb_undo.metal`
+  (~165 LOC).  One threadgroup per output row.  First simdgroup does
+  the standard `flash_attn_vec_reduce` work (per-WG S/M load, simd_max
+  for M_global, simd_sum for S_total, per-D4 chunk rescale-and-sum
+  with `inv_S` division), staging the result in threadgroup memory.
+  Then sgitg==0's 32 threads run a simd-butterfly FWHT (EPT=8 for
+  D=256, EPT=16 for D=512) + 1/sqrt(d) normalize + sign-mask flip,
+  identical to `fwht_sign_undo_fast`, and write the inverse-rotated
+  output to global memory.
+- **mlx-native dispatcher**:
+  `dispatch_flash_attn_vec_reduce_tq_hb_undo` in
+  `/opt/mlx-native/src/ops/flash_attn_vec_reduce_tq_hb_undo.rs` (~115 LOC).
+- **mlx-native combined dispatcher**:
+  `flash_attn_vec_tq_hb_with_fused_undo` in
+  `/opt/mlx-native/src/ops/flash_attn_vec_tq_hb.rs` (~125 LOC) — same
+  SDPA call as `flash_attn_vec_tq_hb` but swaps the reduce step for
+  the fused-undo variant.
+- **Shader source registration**: added two `sources.insert(...)`
+  entries in `/opt/mlx-native/src/kernel_registry.rs`.
+- **Parity test**:
+  `reduce_tq_hb_undo_fused_vs_unfused_parity` in
+  `/opt/mlx-native/tests/test_flash_attn_vec_reduce_tq_hb_undo_parity.rs`
+  — exercises the production gemma4 shape (nh=16, nkv=4, hd=256,
+  kvl=128, cbits=8, fuse_fwht_pre=1) and asserts both fused-undo and
+  unfused (reduce → fwht_sign_undo) produce identical output.  PASS
+  with `max_abs=0.0, max_rel=0.0, nrmse=0.0` — byte-identical.
+- **hf2q wiring**: env-gated branch in
+  `/opt/hf2q/src/serve/forward_mlx.rs` around lines 4012-4078.
+  `HF2Q_TQ_HB_OUT_FUSED=1` selects `flash_attn_vec_tq_hb_with_fused_undo`
+  (no trailing `fwht_sign_undo` dispatch).  Default OFF — preserves
+  the legacy 3-step (SDPA → reduce → fwht_sign_undo) chain.
+
+### Bench result (gemma4 ara APEX-Q5_K_M, 200-tok decode, warm, 8 reps interleaved)
+
+Decode tok/s, paired A/B (each pair is one (baseline, fused) round-trip):
+
+| rep | baseline | fused | delta |
+|-----|---------:|------:|------:|
+| 1   |   74.8   |  74.8 |  +0.0% |
+| 2   |   73.9   |  75.0 |  +1.5% |
+| 3   |   74.8   |  75.1 |  +0.4% |
+| 4   |   74.2   |  74.5 |  +0.4% |
+| 5   |   74.8   |  75.2 |  +0.5% |
+| 6   |   74.6   |  74.8 |  +0.3% |
+| 7   |   74.6   |  75.2 |  +0.8% |
+| 8   |   74.5   |  74.1 |  -0.5% |
+
+- **Baseline median:** 74.65 tok/s   **fused median:** 74.9 tok/s
+  → delta on medians **+0.33%**.
+- **Baseline mean:** 74.53 tok/s     **fused mean:** 74.84 tok/s
+  → delta on means **+0.42%**.
+- **Pairwise mean delta:** **+0.43%**, median pair **+0.4%**.
+- **+3% ship gate: FAIL** (delta is +0.4%, an order of magnitude below
+  the threshold).
+
+Coherence: byte-identical output text on `"What is 2+2?"` and a 30-token
+"importance of curiosity" prompt; only diff between baseline and fused
+runs is the `prefill: NN tok in NNms` line timing.
+
+### Why the gain is so small
+
+The standalone `fwht_sign_undo_f32_d256` dispatch is one simdgroup (32
+threads) per head, no shared memory, no codebook lookups, no quantized
+dequant — by far the cheapest dispatch in the TQ-HB chain.  At gemma4
+nh=16, it's 16 threadgroups × 32 threads × ~few-µs GPU time, plus the
+14-µs CPU encode floor and ~10-µs forced memory_barrier.  Saving 30
+of those per token (one per layer) saves ~720 µs/token at most.
+
+At 75 tok/s the decode budget is ~13.3 ms/token; 720 µs is ~5.4%
+upper-bound — but most of those 720 µs is CPU-encode time that the
+encoder thread amortizes against GPU work elsewhere (the
+`encoder_worker` does double-buffering of encode-vs-execute).  The
+remaining GPU-time savings are <100 µs/token = <1% of the budget.
+
+This matches the iter-485 H4 lesson: dispatch-collapse fusions on
+already-CPU-encode-pipelined paths show up as CPU idle time, not GPU
+throughput.  Decode is GPU-bound (iter-397: 97% GPU); saving CPU
+encode time below the saturation threshold does not move decode tok/s.
+
+### Decision: H3 path NOT a viable lever for >3% decode improvement
+
+- Kernel left in tree, env-gated `HF2Q_TQ_HB_OUT_FUSED=0` (default OFF).
+- No regression vs HEAD: legacy path unchanged.  Operator-controlled.
+- Reproducible falsifier: `HF2Q_TQ_HB_OUT_FUSED=1 ./target/release/hf2q
+  generate --model models/.../gemma4-ara-2pass-APEX-Q5_K_M.gguf
+  --prompt "..." --max-tokens 200 --temperature 0` warm reps × 8.
+- Parity test runs in 0.5 s and confirms byte-identical output, so the
+  kernel is correct for any future fusion that bundles more work into
+  the reduce stage (e.g. + LayerNorm + o_proj fusion).
+
+### H2 (inline reduce-in-SDPA) NOT IMPLEMENTED — structurally infeasible
+
+H2 (fuse the reduce INTO the SDPA kernel) would require cross-workgroup
+communication via threadgroup memory.  Apple Metal compute encoders
+schedule workgroups independently; only threads within the same
+threadgroup share threadgroup memory.  At gemma4 decode shape NWG=16
+or NWG=32 (per `compute_nwg`), each WG is a separate threadgroup —
+they CANNOT share scratch via shmem.  In-kernel cross-WG reduce would
+require either a persistent-kernel rewrite (one threadgroup spans all
+WG-equivalent work units, defeating the parallelism the split-K
+reduce was designed to expose) or global-memory atomics with a fixup
+pass (slower than the current 2-dispatch reduce on M5 Max).  Worker C
+chose H3 over H2 on this analysis; H2 falsified by design without
+spending implementation time.
+
+### Files committed
+
+- `/opt/mlx-native/src/shaders/flash_attn_vec_reduce_tq_hb_undo.metal`
+  — new H3 fused-reduce kernel (~165 LOC).
+- `/opt/mlx-native/src/ops/flash_attn_vec_reduce_tq_hb_undo.rs` —
+  new dispatcher module (~120 LOC).
+- `/opt/mlx-native/src/ops/flash_attn_vec_tq_hb.rs` — added
+  `flash_attn_vec_tq_hb_with_fused_undo` combined dispatcher (~125 LOC).
+- `/opt/mlx-native/src/ops/mod.rs` — registered the new module.
+- `/opt/mlx-native/src/kernel_registry.rs` — registered two new
+  shader-source entries (dk256 + dk512).
+- `/opt/mlx-native/tests/test_flash_attn_vec_reduce_tq_hb_undo_parity.rs`
+  — new parity test (~265 LOC, PASS byte-identical).
+- `/opt/hf2q/src/serve/forward_mlx.rs` — env-gated branch
+  (`HF2Q_TQ_HB_OUT_FUSED=1`, default OFF) around the TQ-HB SDPA dispatch.
+
+### Default policy
+
+`HF2Q_TQ_HB_OUT_FUSED=0` (OFF).  Operator-controlled; no recommendation
+to flip.  No regression vs HEAD with env unset.  Parity test pins
+correctness for future fusion expansions on top of the H3 kernel.
+
+### Standing lesson
+
+Reinforces the iter-485 H4 lesson at a different layer of the SDPA
+chain: dispatch-collapse on the OUTPUT side of a CPU-encode-pipelined,
+GPU-bound decode loop yields CPU idle time, not GPU throughput.  The
++3% ship gate is the right gate to enforce here — kernels that pass
+parity but fail this gate would otherwise consume the maintenance
+budget of fused paths without delivering the measured win that
+justifies the complexity.  Direction-of-attack for future Phase 7d
+work: STOP looking at per-layer dispatch-count reductions on already-
+pipelined kernels (iter-148 + iter-485 H3 + H4 all triangulate to
+≤0.5% gain).  Instead, target the per-dispatch GPU TIME of the SDPA
+kernel itself (kernel-internal arithmetic intensity, register
+pressure, threadgroup occupancy), or attack the prefill side where
+NWG=1 (no reduce pipeline) and the dispatch-overhead share is higher.
