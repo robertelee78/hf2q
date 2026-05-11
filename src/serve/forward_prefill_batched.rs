@@ -1436,16 +1436,30 @@ impl MlxModelWeights {
                                 nkv as u32, hd as u32,
                                 hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
                             ).map_err(|e| anyhow::anyhow!("batched hybrid F16 K L{layer_idx}: {e}"))?;
-                            // ADR-028 Phase 10e.5 (iter-351): batched-prefill V no-FWHT.
-                            mlx_native::ops::hadamard_quantize_kv::dispatch_kv_quantize_v_no_fwht_seq(
-                                s.encoder_mut(), reg, metal_dev,
-                                &pf_v_normed,
-                                &hybrid_kv[layer_idx].v_packed,
-                                &hybrid_kv[layer_idx].v_norms,
-                                nkv as u32, hd as u32,
-                                hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
-                                hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
-                            ).map_err(|e| anyhow::anyhow!("batched hybrid V no-FWHT L{layer_idx}: {e}"))?;
+                            // ADR-029 iter-20 H27: if V buffer is F16-typed
+                            // (HF2Q_FULL_F16_KV=1) → plain F32→F16 cast (no
+                            // TQ-HB quantize).  Otherwise legacy V-only TQ-HB
+                            // no-FWHT (Phase 10e.5).
+                            if hybrid_kv[layer_idx].v_packed.dtype() == mlx_native::DType::F16 {
+                                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                                    s.encoder_mut(), reg, metal_dev,
+                                    &pf_v_normed,
+                                    &hybrid_kv[layer_idx].v_packed,
+                                    nkv as u32, hd as u32,
+                                    hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
+                                ).map_err(|e| anyhow::anyhow!("batched hybrid F16 V L{layer_idx}: {e}"))?;
+                            } else {
+                                // ADR-028 Phase 10e.5 (iter-351): batched-prefill V no-FWHT.
+                                mlx_native::ops::hadamard_quantize_kv::dispatch_kv_quantize_v_no_fwht_seq(
+                                    s.encoder_mut(), reg, metal_dev,
+                                    &pf_v_normed,
+                                    &hybrid_kv[layer_idx].v_packed,
+                                    &hybrid_kv[layer_idx].v_norms,
+                                    nkv as u32, hd as u32,
+                                    hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
+                                    hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
+                                ).map_err(|e| anyhow::anyhow!("batched hybrid V no-FWHT L{layer_idx}: {e}"))?;
+                            }
                         }
                     } else if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
                         let hb_cap = leg_hb_enc[layer_idx].capacity as u32;

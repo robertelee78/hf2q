@@ -1158,12 +1158,31 @@ pub(super) fn alloc_hybrid_kv_for_layer(
     let k = dev.alloc_buffer(nkv * cap * hd * 2, mlx_native::DType::F16,
         vec![nkv, cap, hd])
         .map_err(|e| anyhow::anyhow!("hybrid F16 K L{layer_idx}: {e}"))?;
-    let v_packed = dev.alloc_buffer(nkv * cap * hd, mlx_native::DType::U8,
-        vec![nkv, cap, hd])
-        .map_err(|e| anyhow::anyhow!("hybrid V packed L{layer_idx}: {e}"))?;
-    let v_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
-        if norms_per_pos == 1 { vec![nkv, cap] } else { vec![nkv, cap, norms_per_pos] })
-        .map_err(|e| anyhow::anyhow!("hybrid V norms L{layer_idx}: {e}"))?;
+    // ADR-029 iter-20 H27: when HF2Q_FULL_F16_KV is set, V is F16 (2 bytes/elem)
+    // and v_norms is a small dummy buffer (kernel ignores it when v_is_f16=1).
+    // Otherwise: legacy TQ-HB packed V (1 byte/elem) + per-position F32 norms.
+    let full_f16_v = std::env::var("HF2Q_FULL_F16_KV")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
+        .unwrap_or(false);
+    let (v_packed, v_norms) = if full_f16_v {
+        let v_f16 = dev.alloc_buffer(nkv * cap * hd * 2, mlx_native::DType::F16,
+            vec![nkv, cap, hd])
+            .map_err(|e| anyhow::anyhow!("hybrid F16 V L{layer_idx}: {e}"))?;
+        // Dummy norms buffer (unused but kept for ABI compat with hybrid SDPA
+        // signature; kernel's v_is_f16 FC=1 skips the read).
+        let v_norms_dummy = dev.alloc_buffer(4, mlx_native::DType::F32, vec![1])
+            .map_err(|e| anyhow::anyhow!("hybrid V norms (dummy) L{layer_idx}: {e}"))?;
+        (v_f16, v_norms_dummy)
+    } else {
+        let v_p = dev.alloc_buffer(nkv * cap * hd, mlx_native::DType::U8,
+            vec![nkv, cap, hd])
+            .map_err(|e| anyhow::anyhow!("hybrid V packed L{layer_idx}: {e}"))?;
+        let v_n = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
+            if norms_per_pos == 1 { vec![nkv, cap] } else { vec![nkv, cap, norms_per_pos] })
+            .map_err(|e| anyhow::anyhow!("hybrid V norms L{layer_idx}: {e}"))?;
+        (v_p, v_n)
+    };
     Ok(HybridKvBuffers { k, v_packed, v_norms, capacity: cap, is_sliding: is_ring, norms_per_pos })
 }
 
@@ -3192,6 +3211,24 @@ impl MlxModelWeights {
                                 &[&hybrid_kv[layer_idx].k,
                                   &hybrid_kv[layer_idx].v_packed, &hybrid_kv[layer_idx].v_norms],
                             );
+                            // ADR-029 iter-20 H27: when V is allocated as F16
+                            // (HF2Q_FULL_F16_KV=1), write both K and V via a
+                            // plain F32→F16 cast — no TQ-HB quantize, no FWHT.
+                            // Detect via v_packed dtype (single source of truth
+                            // matching the alloc-time selection).
+                            if hybrid_kv[layer_idx].v_packed.dtype() == mlx_native::DType::F16 {
+                                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16_kv_dual(
+                                    s.encoder_mut(), reg, metal_dev,
+                                    &self.activations.attn_k_normed,
+                                    v_src,
+                                    &hybrid_kv[layer_idx].k,
+                                    &hybrid_kv[layer_idx].v_packed,
+                                    nkv as u32, hd as u32,
+                                    hybrid_kv[layer_idx].capacity as u32,
+                                    cache_pos_val,
+                                ).map_err(|e| anyhow::anyhow!("full F16 KV write L{layer_idx}: {e}"))?;
+                                total_dispatches += 1;
+                            } else {
                             // ADR-028 Phase 10c.5 (iter-354): fused F16-K-copy +
                             // V-no-FWHT-encode in a single dispatch (Z-dim splits
                             // K and V streams).  Byte-identical to the prior
@@ -3214,6 +3251,7 @@ impl MlxModelWeights {
                                 tq_codebook_bits,
                             ).map_err(|e| anyhow::anyhow!("hybrid fused KV write L{layer_idx}: {e}"))?;
                             total_dispatches += 1;
+                            } // closes else-block (legacy TQ-HB V path under hybrid)
                         }
                     } else if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
                         let cache_pos_val = if kv_is_sliding {
