@@ -24224,3 +24224,52 @@ HYBRID memory tradeoff).
 2. `project_adr028_iter415_421_phase15_landed_2026_05_11.md` — Phase 15
 3. `project_adr028_iter422_452_thread_2026_05_11.md` — audits + canonical
 4. (Future) iter-453-470 thread synthesis when needed
+
+## iter-471 — test verification + auto-memory consolidation
+
+### Test suite verification at HEAD
+After iter-469 default-flip:
+- Lib: **51/51** pass
+- Main integration: **3456/3467** (11 ignored, 0 failed — iter-424's
+  flake passed today)
+- Other suites (serve_ux, structural_audit, etc.): all 0 failures
+- **No regressions** from default-flip
+
+### Auto-memory consolidation
+Created new auto-memory entry:
+`project_adr028_iter453_470_thread_2026_05_11.md`
+
+Captures 18-iter startup-focus thread:
+- Final perf-flag audits (iter-454-457)
+- Startup root-cause investigation (iter-458-464)
+- mmap architectural verification (iter-465)
+- Tokenizer flag opt-in → default-on shipped (iter-466-469)
+- Final snapshot (iter-470)
+
+Updated MEMORY.md index to surface this thread at top of stack.
+
+### Cumulative auto-memory chain for the 127-iter work-of-record:
+1. `project_adr028_iter380_398_thread_2026_05_10.md` — pre-thread context
+2. `project_adr028_iter415_421_phase15_landed_2026_05_11.md` — Phase 15 LANDED
+3. `project_adr028_iter422_452_thread_2026_05_11.md` — audits + canonical
+4. **`project_adr028_iter453_470_thread_2026_05_11.md`** (this iter) — startup + tokenizer default-on
+
+### Investigation count this thread
+128 total: 127 from iter-470 + this iter (test verification + memory).
+
+### State at HEAD (final)
+- 9 LANDED phases default-active at HEAD
+- 2 default-on flags shipped THIS thread (iter-421 Phase 15, iter-469 tokenizer)
+- 8 peer-parity audits all confirm structural parity
+- 2 documentation bugs fixed (hybrid math 3.19→2.65, FA_GL nkv=8)
+- Test suite 3456/3467 + 51 lib, 0 regressions
+- 4 operator-gated levers documented (mmap, HYBRID, multi-thread, F8 K)
+
+Per operator mantra "as coherent + as fast as peer for gemma4":
+- Coherence: ✓ TIED
+- Prefill: ✓ 0.94× peer (was 0.022×)
+- Decode: 0.92× e2e (structural floor)
+- Startup: 3.07s (gap 1.42s; mmap fix would close ~75%)
+
+**Thread effectively complete.** Remaining work requires operator
+decisions on multi-iter architectural projects.
