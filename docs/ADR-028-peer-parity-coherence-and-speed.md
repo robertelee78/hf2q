@@ -19558,3 +19558,50 @@ Apple compiler is smart about static patterns).
 
 ### Investigation count this thread
 58 total: 57 from iter-400 + this iter (peer-pattern alignment).
+
+## iter-402 — short indexing in q6_K_ID_NR2 (matches iter-401 pattern)
+
+### Date
+2026-05-10
+
+### Goal
+Apply iter-401's int→short indexing to the ID variant of q6_K NR2 kernel
+(`kernel_mul_mv_id_q6_K_f32_nr2`).  Both kernels use identical inner-loop
+patterns; consistency improvement.
+
+### Implementation
+6 const decls in `kernel_mul_mv_id_q6_K_f32_nr2` (line 935-945) changed
+from `int` → `short` to mirror iter-401's change to the non-_id variant.
+
+### Tests
+4/4 q6_K ID NR2 parity tests PASS byte-identical:
+```
+q6k_id_mv_nr2_parity_n8_k512_e4 ... ok
+q6k_id_mv_nr2_parity_n4_k256_e2 ... ok
+q6k_id_mv_nr2_parity_multi_token ... ok
+q6k_id_mv_nr2_parity_n_odd_boundary ... ok
+```
+
+### Bench (gemma4 200-tok decode, default config, 5 trials)
+
+```
+74.9 / 75.0 / 74.9 / 74.9 / 74.8 → mean **74.90** tok/s
+```
+
+vs iter-401 baseline 75.00.  Δ -0.10 within noise.
+
+Coherence: "What is 2+2?" → "2 + 2 = 4<turn|>" intact.
+
+### Conclusion
+
+Same as iter-401: **code-quality improvement, perf-neutral**.  Ensures
+both NR2 kernels (non-_id and _id) consistently follow peer's idiomatic
+pattern.
+
+### Tests + bench
+- mlx-native lib: 290/0 + 4 q6_K ID NR2 parity PASS.
+- hf2q lib: 3454+2 passing.
+- Coherence intact.
+
+### Investigation count this thread
+59 total: 58 from iter-401 + this iter (consistency improvement).
