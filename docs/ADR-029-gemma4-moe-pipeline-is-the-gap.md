@@ -536,9 +536,57 @@ This **also falsifies the iter-109 prediction** of "5-10% wall gain from paralle
 | 14 | 103→104→108 | host-encoding overhead hypothesis | reversed by measurement |
 | 15 | 110 | HF2Q_DECODE_SPLIT_CB_AT_LAYER=15 (CPU-encoding overlap) | -0.07% NEUTRAL |
 
-### Conclusion (iter-100..110)
+## Iter-111 (2026-05-12) — Multi-regime gate: ratio is CONSTANT 0.92× (gap is DIFFUSED not concentrated)
 
-The 91.0 ± 0.3 t/s baseline = **0.924× peer-FA at tg2000** is the empirical structural ceiling for gemma4-APEX-Q5_K_M on M5 Max in the current hf2q codebase architecture. Tested attack surface includes:
+Per `feedback_no_premature_mission_close_2026_05_11` multi-regime requirement, mapped the hf2q-vs-peer ratio across three decode regimes (thermally cool start each, single rep):
+
+| regime | avg kv depth | hf2q t/s | peer t/s | ratio |
+|---|---:|---:|---:|---:|
+| tg100 | ~50 | 92.7 | 100.85 | **0.919×** |
+| tg2000 | ~1000 | 91 (prior alt-pair) | 98.6 | **0.924×** |
+| tg5000 | ~2500 | 86.0 | 93.27 | **0.922×** |
+
+**Critical finding**: ratio is **CONSTANT 0.92× across all regimes**. The gap is NOT depth-dependent — it does NOT grow with kv depth.
+
+### Implication: gap is DIFFUSED across many sub-ops
+
+If the gap is constant across regimes, it's NOT in:
+- Attention BW (which grows linearly with kv)
+- KV cache reading (grows with kv)
+- FA kernel internals at long kv
+
+Per-token delta is ~0.85 ms (constant). With 30 layers, that's ~30 µs/layer of fixed cost we incur that peer doesn't. Distributed across ~29 dispatches/layer, that's ~1 µs/dispatch — below the noise floor of any single-site optimization.
+
+This **explains why no single per-iter lever moves the needle (15 falsifications iter-100..110)**: there's no concentration point to attack. The gap is spread across ALL small per-layer dispatches.
+
+### Updated mental model
+
+| previous hypothesis (falsified) | actual reality |
+|---|---|
+| Gap concentrates at long-kv attention | Gap is CONSTANT across kv depths |
+| Smaller dispatches faster on Apple Metal | Single-site de-fusion is neutral; CPU-encoding overlap is neutral |
+| Host-encoding overhead (1.8 ms/token) | Peer has MORE dispatches than us (1339 vs 865); overhead per dispatch ≠ the gap |
+
+### What this tells us about Option E
+
+A "comprehensive port of peer's per-layer dispatch sequence" (Option E) only closes the gap IF the per-layer fixed-cost difference is specifically in the dispatch SEQUENCE structure (which exact kernels fire in what order with what barriers). The 15-falsification ledger shows changing the dispatch composition at norm/add/scalar/FA granularity DOESN'T help.
+
+This suggests Option E may ALSO not close the gap. The actual ~1 µs/dispatch fixed cost may be in:
+- **Apple Metal compiler output differences** for our kernels vs peer's (PSO-level efficiency)
+- **Threadgroup geometry per-kernel** (peer's specific NL/NSG choices per shape)
+- **Resource binding state per-kernel** (peer's argument layout)
+
+These are deep-implementation details accessible only via per-kernel rewrites, not dispatch-sequence reorganization.
+
+### Mission status (iter-111)
+
+Per `feedback_no_premature_mission_close_2026_05_11` multi-regime gate: **NOT MET** at any of 3 measured regimes (tg100: 0.919×, tg2000: 0.924×, tg5000: 0.922×). Mission stays OPEN.
+
+Per operator mantra "as fast or faster than peer": the **constant 0.92× ratio** represents a structural cost we incur per layer. Closing it requires per-kernel rewrites (kernel-by-kernel comparison vs peer's compiled outputs), not just dispatch reorganization.
+
+### Conclusion (iter-100..111)
+
+The 91 t/s baseline = **0.924× peer-FA at tg2000 (and 0.92× consistently across all measured regimes)** is the empirical structural ceiling for gemma4-APEX-Q5_K_M on M5 Max in the current hf2q codebase architecture. Tested attack surface includes:
 - KV cache dtype (FULL_F16_KV)
 - FA kernel internals (H72 unroll, NSG/NWG tuning)
 - Single-site fusion (FUSED_END_OF_LAYER, MOE_WSUM_V2)
