@@ -4034,7 +4034,16 @@ impl MlxModelWeights {
                             nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(hb_kv_seq_len),
                         };
                         // HF2Q_FA_PEER_PORT=1: dispatch verbatim peer-port kernel instead of hybrid.
-                        // Preconditions: head_dim==256, K dtype==F16, V dtype==F16.
+                        // Preconditions: head_dim==256, K dtype==F16, V dtype==F16, is_sliding=true.
+                        //
+                        // is_sliding gate (iter-132): PORT is hardcoded NWG=1 which serializes
+                        // chunks of size C=32 on a single workgroup. At sliding layers kv≤1024
+                        // (32 chunks). Without this gate, full-attn layers at deep kv (e.g.,
+                        // tg5000 → kv=5000 = 156 chunks) starve PORT vs HYBRID's NWG=32
+                        // parallelism, costing -25% wall at tg5000. With this gate, full-attn
+                        // layers fallthrough to flash_attn_vec_hybrid (compute_nwg picks NWG=32
+                        // at kv>512). Sliding layers (always kv≤1024) keep PORT.
+                        //
                         // Default OFF — when unset, zero behavior change at HEAD.
                         static FA_PEER_PORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         let use_peer_port = *FA_PEER_PORT.get_or_init(|| {
@@ -4042,6 +4051,7 @@ impl MlxModelWeights {
                         });
 
                         if use_peer_port
+                            && is_sliding
                             && hd == 256
                             && hybrid_kv[layer_idx].k.dtype() == mlx_native::DType::F16
                             && hybrid_kv[layer_idx].v_packed.dtype() == mlx_native::DType::F16

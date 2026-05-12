@@ -1210,6 +1210,78 @@ Per `feedback_no_premature_mission_close_2026_05_11`: multi-regime gate now **VA
 
 `/tmp/cfa-20260512-fa-peer-port/true_tg5000_bench.sh` + `true_tg5000_results.txt`
 
+## Iter-132 (2026-05-12) — AC5 at TRUE tg5000: PORT regresses -25% — NWG=1 hardcoding is the problem
+
+Re-ran iter-127's AC5 (PORT vs HYBRID) at true tg5000 using `--ignore-eos` per iter-130 follow-up. iter-127's NEUTRAL was tg2000-only.
+
+3-cycle alt-pair, same apples-to-apples protocol, both arms HF2Q_FULL_F16_KV=1:
+
+| Arm | C1 | C2 | C3 | Mean | σ | σ_pct |
+|---|---|---|---|---|---|---|
+| PORT (HF2Q_FA_PEER_PORT=1) | 67.3 | 67.4 | 67.4 | **67.37** | 0.06 | 0.09% ✓ |
+| HYBRID (env unset) | 89.6 | 89.3 | 89.5 | **89.47** | 0.15 | 0.17% ✓ |
+
+**Ratio PORT/HYBRID = 0.753× = -24.7% PORT regression at tg5000**. Both σ_pct < 0.2%, extremely stable. The regression is DEFINITIVE, not noise.
+
+### Tried mitigation: gate PORT on is_sliding (only sliding-attn layers)
+
+Hypothesis: full-attn layers (5 of 30, kv up to 5000) on PORT@NWG=1 starve while HYBRID uses NWG=32. Gate PORT on `is_sliding=true` to keep PORT only on the 25 sliding layers (kv≤1024 always); let full-attn fall through to HYBRID.
+
+Result of mitigated bench (PORT_C1 = 67.5): **still ~67 t/s. Mitigation did NOT help**.
+
+This falsifies the "full-attn-only explanation" — sliding layers ALSO suffer from PORT@NWG=1 vs HYBRID@NWG=32 even at kv=1024 (1024/32=32 chunks: HYBRID does 32 chunks × 1-WG-each in parallel, PORT does 32 chunks serial on 1 WG).
+
+## Iter-133 (2026-05-12) — Root cause: peer's NWG=32 is the default; spec ported peer's UNUSED dead code path
+
+Read peer source at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp:2944-2956`:
+
+```cpp
+int32_t nwg = 1;
+if (false) {                       // dead code: peer explicitly DISABLED
+    nwg = 1; nsg = 4;
+} else {
+    nwg = 32;                      // peer's actual runtime default
+    nsg = 1;
+    while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) { nsg *= 2; }
+}
+```
+
+The `if (false)` branch is **explicitly disabled** with comment: *"for small KV caches, we could launch a single workgroup and write the results directly to dst, however, this does not lead to significant improvement, so disabled"*.
+
+**Peer ALWAYS dispatches flash-attn-vec at NWG=32 + a separate reduce kernel call**. Our CFA spec (queen Phase 1, iter-125) assumed "gemma4 sliding-decode is single-WG (NWG=1, NSG=1)" — that assumption was **wrong**. We ported peer's UNUSED NWG=1 dead code path.
+
+### Implications
+
+1. **The verbatim-port hypothesis was tested against a config peer doesn't use**. iter-127's tg2000 NEUTRAL is partly because HYBRID itself uses NWG=32 (matching peer's actual config), and tg2000's kv=1024 sliding layers were near NWG=1's break-even point. iter-132's tg5000 -25% reflects the full parallelism gap manifesting at deep kv.
+2. **The CFA team workflow caught the LANGUAGE/SOURCE-pattern hypothesis correctly** (rule-1 verbatim was satisfied). But neither queen nor codex flagged the CONFIGURATION mismatch — both worked off the spec's assumption without checking peer's runtime defaults. This is exactly the rule from `feedback_peer_runtime_vs_literal_template_2026_05_11.md`: *"Templates in peer source ≠ all hot paths. Read peer's runtime defaults before proposing peer-grounded changes."* The spec violated this rule; future CFA spec phases should explicitly call out "verify peer's runtime dispatch path picks THIS instantiation".
+3. **The peer-port artifact stays in main as opt-in with `is_sliding` gate added** (commit pending). It's documented as a falsified hypothesis test; the real next step is porting peer's NWG=32 + reduce-kernel path.
+
+### Proper next-iteration scope: NWG=32 + reduce kernel port
+
+The actual peer-equivalent port would require:
+1. New shader: `flash_attn_vec_peer_port_f16_nwg32.metal` with NWG=32 in the FC bake
+2. Each workgroup writes partial results to a temp buffer (peer: `bid_tmp`)
+3. New shader: reduce kernel `flash_attn_vec_peer_port_f16_reduce.metal` matching peer's `kernel_flash_attn_ext_vec_reduce` (peer ggml-metal.metal line ~7100)
+4. Dispatcher: dynamic NWG selection per kv depth + temp buffer alloc + reduce kernel dispatch
+5. Equivalent of peer's `ggml_metal_op_concurrency_reset(ctx)` between vec and reduce
+
+Estimated scope: 200-500 LOC of metal + 100-200 LOC of dispatcher Rust. Multi-day. The existing PORT@NWG=1 artifact provides the verbatim-kernel-body baseline; the NWG=32 work is structurally different but reuses the same kernel body inside the per-WG loop.
+
+### Mission state
+
+Production HEAD (env unset) unchanged: 0.949× peer-FA at tg2000, 0.916× peer-FA at tg5000. Mission stays OPEN.
+
+The peer-port-at-NWG=1 hypothesis is now FALSIFIED at all valid regimes (tg2000 NEUTRAL, tg5000 -25%). The next attempted closure is the NWG=32 port + reduce kernel — operator-decision-gated multi-day work.
+
+### Standing rule added
+
+Future verbatim-port specs MUST verify peer's runtime dispatch matches the spec's hardcoded FC values. Per `feedback_peer_runtime_vs_literal_template_2026_05_11`: peer's source templates ≠ peer's runtime hot paths. The CFA spec at iter-125 missed this; future iterations should grep peer's `*.cpp` dispatcher for the FC values BEFORE freezing the spec.
+
+### Bench artifacts
+
+`/tmp/cfa-20260512-fa-peer-port/ac5_tg5000_bench.sh` + `ac5_tg5000_results.txt` (PORT vs HYBRID regression)
+`/tmp/cfa-20260512-fa-peer-port/ac5_tg5000_mitigated.sh` + `ac5_tg5000_mitigated_results.txt` (is_sliding gate failed)
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
