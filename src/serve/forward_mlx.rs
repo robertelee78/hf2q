@@ -4033,17 +4033,52 @@ impl MlxModelWeights {
                             fuse_fwht_pre: 0,
                             nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(hb_kv_seq_len),
                         };
-                        mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
-                            s.encoder_mut(), reg, dev,
-                            &self.activations.attn_q_normed,
-                            &hybrid_kv[layer_idx].k,
-                            &hybrid_kv[layer_idx].v_packed,
-                            &hybrid_kv[layer_idx].v_norms,
-                            &self.activations.sdpa_out,
-                            &self.activations.sdpa_tmp,
-                            &p_hyb,
-                        ).map_err(|e| anyhow::anyhow!("flash_attn_vec_hybrid L{layer_idx}: {e}"))?;
-                        total_dispatches += 2; // main + reduce (conservative)
+                        // HF2Q_FA_PEER_PORT=1: dispatch verbatim peer-port kernel instead of hybrid.
+                        // Preconditions: head_dim==256, K dtype==F16, V dtype==F16.
+                        // Default OFF — when unset, zero behavior change at HEAD.
+                        static FA_PEER_PORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        let use_peer_port = *FA_PEER_PORT.get_or_init(|| {
+                            std::env::var("HF2Q_FA_PEER_PORT").map(|v| v == "1").unwrap_or(false)
+                        });
+
+                        if use_peer_port
+                            && hd == 256
+                            && hybrid_kv[layer_idx].k.dtype() == mlx_native::DType::F16
+                            && hybrid_kv[layer_idx].v_packed.dtype() == mlx_native::DType::F16
+                        {
+                            let p_peer = mlx_native::ops::flash_attn_vec_peer_port_f16::FlashAttnVecPeerPortParams {
+                                num_heads: nh as u32,
+                                num_kv_heads: nkv as u32,
+                                head_dim: hd as u32,
+                                kv_seq_len: hb_kv_seq_len,
+                                kv_capacity: hb_cap as u32,
+                                scale: 1.0,
+                                mask_type: if is_sliding { 2 } else { 1 },
+                                sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                                ring_start: ring_start_hb,
+                            };
+                            mlx_native::ops::flash_attn_vec_peer_port_f16::flash_attn_vec_peer_port_f16(
+                                s.encoder_mut(), reg, dev,
+                                &self.activations.attn_q_normed,
+                                &hybrid_kv[layer_idx].k,
+                                &hybrid_kv[layer_idx].v_packed,
+                                &self.activations.sdpa_out,
+                                &p_peer,
+                            ).map_err(|e| anyhow::anyhow!("flash_attn_vec_peer_port_f16 L{layer_idx}: {e}"))?;
+                            total_dispatches += 1; // NWG=1: no reduce kernel
+                        } else {
+                            mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
+                                s.encoder_mut(), reg, dev,
+                                &self.activations.attn_q_normed,
+                                &hybrid_kv[layer_idx].k,
+                                &hybrid_kv[layer_idx].v_packed,
+                                &hybrid_kv[layer_idx].v_norms,
+                                &self.activations.sdpa_out,
+                                &self.activations.sdpa_tmp,
+                                &p_hyb,
+                            ).map_err(|e| anyhow::anyhow!("flash_attn_vec_hybrid L{layer_idx}: {e}"))?;
+                            total_dispatches += 2; // main + reduce (conservative)
+                        }
                         // ADR-028 Phase 10e.5 (iter-351): NO fwht_sign_undo on output.
                         // V is raw (Lloyd-Max quantized but not FWHT-rotated), so
                         // SDPA output is already in the raw domain — feed directly
