@@ -757,6 +757,40 @@ Per operator mantra "as fast or faster than peer":
 
 Closing the f16-V regime to peer parity requires multi-week per-kernel deep-toolchain work. Per `feedback_no_deferrals_without_explicit_approval`: operator iter-107 approved multi-week work, but it does not fit /loop 5m granularity.
 
+## Iter-118 (2026-05-12) — H82 V-loop unroll REGRESSION; 19 levers, 0 wins
+
+Per iter-115 GPU-95% finding + iter-116 H81 conclusion that compiler emits identical IR for accumulator pattern variations, attempted H82: unroll ONLY the V-loop cc (not the K-loop which has mqk[32] register-spill concerns).
+
+Hypothesis: V-loop per-thread state is small (lo[DV4/NL=2] float4 = 8 fp32, well below register budget). Matching peer's FOR_UNROLL pattern at ggml-metal.metal:6945-6952 for the V-loop should give clean instruction pipelining without register pressure.
+
+Coherence: PASS.
+
+Alt-pair thermal-fair bench (3 cycles, separate baseline + H82 binaries saved to /tmp):
+
+| cycle | baseline | H82 |
+|---:|---:|---:|
+| 1 | 91.5 | 90.0 |
+| 2 | 91.3 | 90.3 |
+| 3 | 91.0 | 90.1 |
+
+Means: baseline **91.27 ± 0.21** vs H82 **90.13 ± 0.13** = **-1.24% REGRESSION**.
+
+REVERTED. Hypothesis FALSIFIED.
+
+### Why V-loop unroll regresses
+
+Despite low per-thread register state, the unroll causes overhead:
+- 32 unrolled iterations × ~10 instructions each = ~320 inline instructions per V-phase
+- Conditional `continue` (when kv_pos >= kv_seq_len) inside unrolled body forces per-iter branches
+- Increases instruction cache pressure for the FA kernel
+- Apple Metal compiler may not optimize the unrolled+branched code as efficiently as the structured loop
+
+### 19 levers tested iter-100..118, 0 wins.
+
+The combined record across compiler optimization (H72, H79, H81), threadgroup geometry (NSG/NWG tuning), fusion (3 variants), de-fusion (3+stacked), encoder primitives (UNRETAINED_REFS, SPLIT_CB, B9_SEQUENTIAL), and now V-loop micro-optimization (H82) — every reasonable per-iter lever exhausted.
+
+The structural ceiling holds at 91 t/s = 0.922× peer-FA at tg2000.
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
