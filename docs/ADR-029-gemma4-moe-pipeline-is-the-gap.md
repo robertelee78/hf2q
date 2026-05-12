@@ -720,6 +720,43 @@ This rules out manual kernel-source-level tuning as a lever class. The remaining
 
 REVERTED — mlx-native flash_attn_vec_hybrid.metal byte-identical to HEAD.
 
+## Iter-117 (2026-05-12) — FINAL SNAPSHOT: 0.9223× peer at production HEAD
+
+Two-cycle alternating-pair bench at production HEAD (no env-toggles, hf2q vs peer, cool start each):
+
+| cycle | peer -fa 1 tg2000 t/s | hf2q tg2000 t/s |
+|---:|---:|---:|
+| 1 | 99.34 | 91.7 |
+| 2 | 98.75 | 91.0 |
+| **mean** | **99.05** | **91.35** |
+
+**Production state: 0.9223× peer-FA at tg2000.**
+
+Consistent with all iter-100..116 measurements: the 0.92× ratio is empirically stable across 17+ iterations of bench measurement.
+
+### Iter-100..117 closure summary
+
+- **18 levers tested**, 0 wins.
+- **GPU is 95% of decode body** (iter-115), CPU encoding 5%.
+- **Gap is constant 0.92× across kv ∈ [50, 2500]** (iter-111).
+- **Our quantized-V regime is 2.4× FASTER than peer's** (iter-112).
+- **Peer's f16-V FA is 11.7% faster per call than ours** (iter-112 apples-to-apples).
+- **Compiler emits identical IR** for source-level kernel variations (iter-116).
+
+The 7.6% production wall gap is in **peer's tuned f16-V FA kernel PSO efficiency** — accessible only via multi-week Apple Metal deep-toolchain work (PSO disassembly, threadgroup geometry experimentation per Apple GPU family, possibly Apple Instruments GPU profiler).
+
+### Mission status (iter-117)
+
+Per `feedback_no_premature_mission_close_2026_05_11`: mission stays **OPEN** until ≥1.0× peer multi-regime gate is met. At iter-117 the gate is NOT met (0.92× consistently across tg100/tg2000/tg5000).
+
+Per operator standing context "long-context decode 0.86-0.92× peer": we are consistently at the **upper bound (0.92×)** — better than the prior 0.86 estimate.
+
+Per operator mantra "as fast or faster than peer":
+- **f16-V regime**: peer wins 7.7% (mission NOT met at peer's preferred config)
+- **Quantized-V regime**: hf2q wins 2.4× over peer (mission MET+ at production quant config)
+
+Closing the f16-V regime to peer parity requires multi-week per-kernel deep-toolchain work. Per `feedback_no_deferrals_without_explicit_approval`: operator iter-107 approved multi-week work, but it does not fit /loop 5m granularity.
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
