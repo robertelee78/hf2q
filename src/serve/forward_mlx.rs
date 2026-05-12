@@ -4033,24 +4033,60 @@ impl MlxModelWeights {
                             fuse_fwht_pre: 0,
                             nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(hb_kv_seq_len),
                         };
-                        // HF2Q_FA_PEER_PORT=1: dispatch verbatim peer-port kernel instead of hybrid.
-                        // Preconditions: head_dim==256, K dtype==F16, V dtype==F16, is_sliding=true.
+                        // HF2Q_FA_PEER_PORT*: dispatch peer-port kernel variant instead of hybrid.
+                        // Preconditions: head_dim==256, K dtype==F16, V dtype==F16.
                         //
-                        // is_sliding gate (iter-132): PORT is hardcoded NWG=1 which serializes
-                        // chunks of size C=32 on a single workgroup. At sliding layers kv≤1024
-                        // (32 chunks). Without this gate, full-attn layers at deep kv (e.g.,
-                        // tg5000 → kv=5000 = 156 chunks) starve PORT vs HYBRID's NWG=32
-                        // parallelism, costing -25% wall at tg5000. With this gate, full-attn
-                        // layers fallthrough to flash_attn_vec_hybrid (compute_nwg picks NWG=32
-                        // at kv>512). Sliding layers (always kv≤1024) keep PORT.
+                        // iter-137 — two variants:
+                        //   HF2Q_FA_PEER_PORT       = NWG=1 verbatim port (iter-126).
+                        //                             Falsified at tg5000 (-25%) because peer's
+                        //                             actual runtime uses NWG=32 (iter-133 root
+                        //                             cause). Kept for A/B + documentation;
+                        //                             additionally gated on is_sliding so
+                        //                             full-attn fallthrough to HYBRID.
+                        //   HF2Q_FA_PEER_PORT_NWG32 = NWG=32 + reduce-kernel port (iters 134-137).
+                        //                             Matches peer's actual runtime dispatch.
+                        //                             Tests the refined hypothesis that peer's
+                        //                             PSO advantage comes from NWG=32 parallelism.
+                        //                             Reuses existing sdpa_tmp buffer (identical
+                        //                             size formula nrows*32*(dv+2)*4).
                         //
-                        // Default OFF — when unset, zero behavior change at HEAD.
+                        // Default OFF for both. When neither env is set, zero behavior change at HEAD.
                         static FA_PEER_PORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         let use_peer_port = *FA_PEER_PORT.get_or_init(|| {
                             std::env::var("HF2Q_FA_PEER_PORT").map(|v| v == "1").unwrap_or(false)
                         });
+                        static FA_PEER_PORT_NWG32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        let use_peer_port_nwg32 = *FA_PEER_PORT_NWG32.get_or_init(|| {
+                            std::env::var("HF2Q_FA_PEER_PORT_NWG32").map(|v| v == "1").unwrap_or(false)
+                        });
 
-                        if use_peer_port
+                        if use_peer_port_nwg32
+                            && hd == 256
+                            && hybrid_kv[layer_idx].k.dtype() == mlx_native::DType::F16
+                            && hybrid_kv[layer_idx].v_packed.dtype() == mlx_native::DType::F16
+                        {
+                            let p_peer = mlx_native::ops::flash_attn_vec_peer_port_f16::FlashAttnVecPeerPortParams {
+                                num_heads: nh as u32,
+                                num_kv_heads: nkv as u32,
+                                head_dim: hd as u32,
+                                kv_seq_len: hb_kv_seq_len,
+                                kv_capacity: hb_cap as u32,
+                                scale: 1.0,
+                                mask_type: if is_sliding { 2 } else { 1 },
+                                sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                                ring_start: ring_start_hb,
+                            };
+                            mlx_native::ops::flash_attn_vec_peer_port_f16::flash_attn_vec_peer_port_f16_nwg32(
+                                s.encoder_mut(), reg, dev,
+                                &self.activations.attn_q_normed,
+                                &hybrid_kv[layer_idx].k,
+                                &hybrid_kv[layer_idx].v_packed,
+                                &self.activations.sdpa_tmp,
+                                &self.activations.sdpa_out,
+                                &p_peer,
+                            ).map_err(|e| anyhow::anyhow!("flash_attn_vec_peer_port_f16_nwg32 L{layer_idx}: {e}"))?;
+                            total_dispatches += 2; // vec + reduce
+                        } else if use_peer_port
                             && is_sliding
                             && hd == 256
                             && hybrid_kv[layer_idx].k.dtype() == mlx_native::DType::F16
