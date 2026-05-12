@@ -885,6 +885,43 @@ Compiler-hint family fully tested:
 
 The Apple Metal compiler at -O3 is doing all the heavy lifting. Source-level hints/refactors at this granularity produce identical or worse IR. Per-iter optimization space is comprehensively exhausted across all explored compiler-interaction patterns.
 
+## Iter-121 (2026-05-12) — H84 hot-vs-cold-path split NEUTRAL: compiler already does this
+
+Per iter-120's emerging picture (Apple Metal compiler at -O3 is sophisticated), tested H84: explicit split of V-loop into:
+1. Full-chunk fast path: unrolled, no per-cc branch (when `ic + C <= kv_seq_len`)
+2. Partial-chunk fallback: structured loop with `continue`
+
+Hypothesis: in tg2000 generation, ~31/32 chunks are full (no invalid positions). The full-chunk fast path runs 99% of the time. With explicit branch hoisting + unroll on the fast path, the compiler should emit cleaner code than the structured loop with conditional `continue`.
+
+Coherence: PASS (first_decode_token=236778 byte-identical to baseline).
+
+Alt-pair thermal-fair (3 cycles):
+
+| cycle | baseline | H84 |
+|---:|---:|---:|
+| 1 | 91.5 | 91.3 |
+| 2 | 91.5 | 91.4 |
+| 3 | 91.3 | 91.3 |
+
+Means: baseline **91.43 ± 0.10** vs H84 **91.33 ± 0.05** = **-0.11% NEUTRAL** (within noise).
+
+### Conclusion
+
+Apple Metal compiler at -O3 ALREADY splits hot vs cold paths internally. Manual source-level splitting produces redundant code that the compiler folds back into the same IR as the structured loop.
+
+REVERTED. mlx-native byte-identical to HEAD.
+
+### 22 levers tested iter-100..121, 0 wins.
+
+The compiler-sophistication catalog grows:
+- Apple Metal at -O3 hoists invariant computations (H79)
+- ... already infers branch probability (H83)
+- ... optimizes accumulator patterns to identical IR (H81)
+- ... dead-code-eliminates conditional bodies (H82v2)
+- ... splits hot vs cold paths internally (H84)
+
+The 11.7% per-call gap to peer is at compiler-VERSION-specific PSO output differences, NOT at source-level patterns the compiler can re-derive. Closure requires per-PSO instruction-level inspection + rewrite, which is multi-week.
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
