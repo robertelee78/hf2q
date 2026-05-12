@@ -433,6 +433,51 @@ Code changes landed this session: H76 + H77 + H78 env-gates (default OFF; opt-in
 - **Per-iter Class A + B optimization spaces**: FULLY EXHAUSTED (13 levers tested, 0 wins).
 - **Path forward**: Option E (multi-week comprehensive port) is the only remaining lever class.
 
+## Iter-109 (2026-05-12) — Deep-research into peer's per-dispatch efficiency, MLX_UNRETAINED_REFS FALSIFIED
+
+Per operator standing instruction "Always use /ruflo-goals:deep-research when stuck" — invoked deep-research after 13 falsifications.
+
+### Peer techniques identified via source read
+
+Read /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m + ggml-metal-device.m + ggml-metal-ops.cpp. Three structural techniques peer uses:
+
+1. **`commandBufferWithUnretainedReferences`** (device.m:512): peer skips ARC-retain on bound resources per command buffer. Claimed +3-5% on M-series. **Already implemented in hf2q behind `MLX_UNRETAINED_REFS=1` env-gate (mlx-native/src/encoder.rs:747-751).** Tested below.
+
+2. **Parallel CPU encoding via `dispatch_apply` on concurrent GCD queue** (context.m:550): peer encodes multiple command buffers IN PARALLEL across n_cb worker threads while GPU executes the first CB. CPU encoding overlaps with GPU execution, hiding ~1 ms encoding latency per token. **Not implemented in hf2q decode path** — we encode 1 CB sequentially per token and commit_and_wait. Hf2q has `EncoderWorker` infrastructure at mlx-native/src/encoder_worker.rs (ADR-028 iter-380) but it's NOT wired into forward_decode (encode_one_layer is a STUB at forward_mlx.rs:2606). Implementing requires multi-day refactor.
+
+3. **Standard `setBuffer`+`setBytes` per dispatch** (device.m:512-517, ops.cpp:2148-2150). Peer uses 7 encoder API calls per mat-vec dispatch (set_pipeline + set_bytes + 3× set_buffer + set_threadgroup_memory + dispatch_threadgroups). hf2q `dispatch_qmatmul` does similar. **No argument buffer or indirect command optimization used by peer.** Same as us.
+
+### Tested: MLX_UNRETAINED_REFS=1 (alt-pair thermal-fair, 3 cycles)
+
+| cycle | baseline t/s | MLX_UNRETAINED_REFS=1 t/s |
+|---:|---:|---:|
+| 1 | 89.7 | 89.8 |
+| 2 (contention) | 88.7 | 88.0 |
+| 3 | 89.5 | 89.4 |
+
+Means: baseline 89.30 ± 0.43; UNRETAINED 89.07 ± 0.81. **Δ = -0.26% NEUTRAL** (clean cycles 1+3: exactly 89.60 both). Coherence PASS.
+
+**14 levers tested iter-100..109, 0 wins.**
+
+### Remaining structural lever (multi-day)
+
+Parallel CPU encoding via `dispatch_apply` is the ONLY un-tested peer technique with a credible mechanism for our 1 ms/token CPU encoding overhead. Implementing requires:
+
+1. Split forward_decode's single-token graph into N command buffers (one per layer-chunk).
+2. Wire EncoderWorker thread pool (already built ADR-028 iter-380) to encode CBs[1..N] in parallel.
+3. Main thread submits CB[0] to GPU immediately, encoding overlaps.
+
+Estimated scope: 200-400 LOC across `forward_mlx.rs::forward_decode` + `encoder_worker_singleton.rs`. Multi-day work but bounded.
+
+Predicted gain: up to ~10% wall if peer's overlap mechanism transfers cleanly. Closes the 7.5% gap with margin.
+
+Risk: at ~865 dispatches/token, the encoding work is small (~1 ms); parallelism saves ~0.5-1 ms depending on n_cb. Even ideal gain might be 5-6%, not 10%.
+
+### Iter-109 conclusion
+
+Per `feedback_no_premature_mission_close`, mission stays OPEN. Per operator's iter-107 "best mantra-aligned outcome" instruction, parallel-CPU-encoding refactor is the operator-approved direction. Out of scope for single-loop-iter; requires sustained multi-day session.
+
+
 
 
 ## Iter-106 (2026-05-12) — Lever A invalid (RAW deps); env-only exhausted
