@@ -830,9 +830,32 @@ impl MlxModelWeights {
             // SESSION A: norm → QKV → head_norm+RoPE → permute → SDPA →
             //            permute_back → O-proj → post-attn norm+residual
             // ================================================================
+            //
+            // ADR-029 iter-39 H40 — `HF2Q_GRAPH_OPT_PREFILL=1` opts the
+            // per-layer session into capture/record mode so the end-of-layer
+            // commit can run the fusion pass over the captured graph before
+            // emitting the command buffer.  Fusion replaces RMS_NORM→MUL
+            // patterns with a single dispatch (see graph.rs `ComputeGraph::fuse`),
+            // matching peer's `ggml_graph_optimize` pass.  Default off until
+            // measured.  Incompatible with HF2Q_PROFILE_BUCKETS / HF2Q_PROFILE_MM
+            // (those introduce mid-session finish/begin pairs that defeat the
+            // per-layer capture); when both are set, the recording flag is
+            // forced off for correctness.
+            let graph_opt_prefill = std::env::var("HF2Q_GRAPH_OPT_PREFILL")
+                .ok()
+                .as_deref() == Some("1")
+                && !profile_buckets_on
+                && std::env::var("HF2Q_PROFILE_MM").is_err()
+                && std::env::var("HF2Q_PROFILE_FA").is_err()
+                && std::env::var("HF2Q_PROFILE_MOE").is_err();
             {
-                let mut s = exec.begin()
-                    .map_err(|e| anyhow::anyhow!("batched attn session L{layer_idx}: {e}"))?;
+                let mut s = if graph_opt_prefill {
+                    exec.begin_recorded()
+                        .map_err(|e| anyhow::anyhow!("batched attn session (recorded) L{layer_idx}: {e}"))?
+                } else {
+                    exec.begin()
+                        .map_err(|e| anyhow::anyhow!("batched attn session L{layer_idx}: {e}"))?
+                };
 
                 // 1. Pre-attention norm over [seq_len, hs]
                 let t0_pre_attn_norm = if profile_buckets_on {
@@ -1894,13 +1917,30 @@ impl MlxModelWeights {
                     || std::env::var("HF2Q_SYNC_PER_LAYER").is_ok()
                     || profile_buckets_on;
                 if sync_per_layer {
-                    s.finish()
-                        .map_err(|e| anyhow::anyhow!("batched mlp finish L{layer_idx}: {e}"))?;
+                    if graph_opt_prefill {
+                        // ADR-029 iter-39 H40 — sync-mode with fusion.  Mirrors
+                        // commit_with_fusion's fuse+replay path, but commits-
+                        // and-waits so HF2Q_PROFILE_LAYERS gets the same per-
+                        // layer GPU-wall measurement it used pre-graph_opt.
+                        let _f = s.finish_with_fusion(reg, dev.metal_device())
+                            .map_err(|e| anyhow::anyhow!("batched mlp finish_with_fusion L{layer_idx}: {e}"))?;
+                    } else {
+                        s.finish()
+                            .map_err(|e| anyhow::anyhow!("batched mlp finish L{layer_idx}: {e}"))?;
+                    }
                     if std::env::var("HF2Q_PROFILE_LAYERS").is_ok() {
                         let kind = if is_sliding { "SW" } else { "GL" };
                         eprintln!("[LAYER_TIME] L{:02} {} {}us", layer_idx, kind,
                             layer_start.elapsed().as_micros());
                     }
+                } else if graph_opt_prefill {
+                    // ADR-029 iter-39 H40 — fusion + async commit.  The
+                    // captured per-layer graph is fused (rms_norm→mul collapsed
+                    // into single dispatch) then committed without waiting so
+                    // the GPU pipelines with the next layer's CPU encode.
+                    let (_committed, _fusions) = s.commit_with_fusion(reg, dev.metal_device())
+                        .map_err(|e| anyhow::anyhow!("batched mlp commit_with_fusion L{layer_idx}: {e}"))?;
+                    drop(_committed);
                 } else {
                     // Fire-and-forget commit — GPU continues executing
                     // while CPU moves on.  The returned CommandEncoder is
