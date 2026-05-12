@@ -4408,18 +4408,58 @@ impl MlxModelWeights {
                     // the fused_norm_add dispatch.  Sequential, 1 per layer.
                     // Produces garbage residual stream.
                     if !INVESTIGATION_ENV.skip_post_attn_norm {
-                        s.barrier_between(
-                            &[&self.activations.hidden, &self.activations.attn_out],
-                            &[&self.activations.residual],
-                        );
-                        mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
-                            s.encoder_mut(), reg, metal_dev,
-                            &self.activations.hidden,
-                            &self.activations.attn_out,
-                            &self.layers[layer_idx].norms.post_attention_layernorm,
-                            &self.activations.residual,
-                            hs as u32, 1, eps,
-                        ).map_err(|e| anyhow::anyhow!("fused post-attn norm+add L{layer_idx}: {e}"))?;
+                        // ADR-029 iter-107 H76 — env-gated SPLIT of the
+                        // fused norm+add into 2 separate dispatches
+                        // (rms_norm → norm_out; elementwise_add hidden+norm_out
+                        // → residual). Tests the counter-fusion hypothesis
+                        // (iter-105 confirmed: on Apple Metal scheduler, more
+                        // smaller dispatches outperform fewer larger fused
+                        // dispatches at decode shape).
+                        let split_postattn = std::env::var("HF2Q_SPLIT_POSTATTN_NORM").as_deref() == Ok("1");
+                        if split_postattn {
+                            // Step 1: norm_out = rms_norm(attn_out, post_attn_weight)
+                            s.barrier_between(
+                                &[&self.activations.attn_out,
+                                  &self.layers[layer_idx].norms.post_attention_layernorm],
+                                &[&self.activations.norm_out],
+                            );
+                            s.rms_norm(
+                                reg, metal_dev,
+                                &self.activations.attn_out,
+                                &self.layers[layer_idx].norms.post_attention_layernorm,
+                                &self.activations.norm_out,
+                                &self.activations.norm_params,
+                                1, hs as u32,
+                            ).map_err(|e| anyhow::anyhow!("split post-attn norm L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+
+                            // Step 2: residual = hidden + norm_out
+                            s.barrier_between(
+                                &[&self.activations.hidden, &self.activations.norm_out],
+                                &[&self.activations.residual],
+                            );
+                            mlx_native::ops::elementwise::elementwise_add(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.hidden,
+                                &self.activations.norm_out,
+                                &self.activations.residual,
+                                hs,
+                                mlx_native::DType::F32,
+                            ).map_err(|e| anyhow::anyhow!("split post-attn add L{layer_idx}: {e}"))?;
+                        } else {
+                            s.barrier_between(
+                                &[&self.activations.hidden, &self.activations.attn_out],
+                                &[&self.activations.residual],
+                            );
+                            mlx_native::ops::fused_norm_add::dispatch_fused_norm_add_f32(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.hidden,
+                                &self.activations.attn_out,
+                                &self.layers[layer_idx].norms.post_attention_layernorm,
+                                &self.activations.residual,
+                                hs as u32, 1, eps,
+                            ).map_err(|e| anyhow::anyhow!("fused post-attn norm+add L{layer_idx}: {e}"))?;
+                        }
                     }
 
                     if dump_after_post_attn {

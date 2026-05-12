@@ -226,6 +226,103 @@ If over-fusion is the gap, the WIN direction is **DE-fusion**:
 3. Test H77 (de-fuse endlayer triple op). If +2-4%, default-flip.
 4. If A+H76+H77 all win and sum to ~5-8%, mission achievable per-iter.
 
+## Iter-107 (2026-05-12) — H76 single-site de-fusion NEUTRAL; operator approves Option E
+
+Operator approval: "yeah, fucking do it" — explicit go-ahead for multi-day structural work. Operator clarified: "let's do the option that produces the best possible mantra aligned outcome" — Option E (port peer's dispatch sequence to peer-parity).
+
+### H76 test (matched-thermal pair-bench)
+
+Added env-gated `HF2Q_SPLIT_POSTATTN_NORM=1` at `forward_mlx.rs:4406-4471`. Splits `dispatch_fused_norm_add_f32` into:
+1. `s.rms_norm(attn_out, post_attn_weight) → norm_out`
+2. `mlx_native::ops::elementwise::elementwise_add(hidden, norm_out, residual)`
+
+Adds 1 extra dispatch + 1 extra barrier per layer × 30 = 30 + 30 = 60 extra ops/token.
+
+Coherence: PASS. "2 plus 2 is **4**." byte-identical.
+
+| variant | trial 1 | trial 2 | trial 3 | mean | σ |
+|---|---:|---:|---:|---:|---:|
+| baseline (matched thermal) | 90.9 | 90.7 | 90.5 | **90.70** | 0.16 |
+| HF2Q_SPLIT_POSTATTN_NORM=1 | 90.8 | 90.6 | 90.6 | **90.67** | 0.10 |
+
+Δ = 0.03 t/s = **0.03% NEUTRAL** (within noise floor).
+
+### What this tells us
+
+Single-site de-fusion at the per-layer norm+add granularity has NO measurable effect on wall. This is consistent with iter-101's HF2Q_FUSED_END_OF_LAYER finding (1 vs 2 dispatches at end-of-layer = neutral).
+
+Implications:
+- The "Apple Metal favors smaller dispatches" hypothesis from iter-104 isn't strong enough at the per-norm scale to manifest as a measurable wall gain.
+- Per-site de-fusion likely won't compound to the +7-8% needed.
+- The structural gap requires a FULLER port of peer's per-layer pattern, not just splitting fused ops.
+
+### Per-iter Class B (single-site de-fusion) also empirically exhausted
+
+Combined with iter-100..106 falsifications:
+- 10 env/code single-site levers: 0 wins (iter-100..106)
+- H76 single-site de-fusion: NEUTRAL (iter-107)
+- HF2Q_FUSED_END_OF_LAYER (1 vs 2 dispatches): NEUTRAL (iter-101)
+
+The per-iter, single-touchpoint optimization space is FULLY EXHAUSTED.
+
+### Iter-108+ plan — full peer-dispatch-sequence port (Option E)
+
+Per operator's mantra-aligned-outcome instruction, the path forward is comprehensive: port peer's exact per-layer dispatch composition for gemma4. Each Transformer layer in peer's `ggml_metal_op_*` chain:
+
+```
+peer per-layer (gemma4):
+  RMS norm + bias                            (1 dispatch)
+  Q proj + K proj + V proj                   (3 dispatches concurrent)
+  Q head-rms-norm  + RoPE Q                  (2 dispatches)
+  K head-rms-norm  + RoPE K                  (2 dispatches)
+  V rms-norm                                 (1 dispatch)
+  KV-cache store (f16 K, f16 V — no quant)  (0 dispatches — write through view)
+  flash_attn_ext_vec_f16                     (1 dispatch + reduce)
+  O proj                                     (1 dispatch)
+  ADD residual (chained — fuses up to 8)     (1 dispatch)
+  Post-attn norm                             (1 dispatch)
+  Pre-FF norm                                (1 dispatch)
+  Gate proj + Up proj                        (2 dispatches concurrent)
+  SiLU + mul                                 (1 dispatch — fused)
+  Down proj                                  (1 dispatch)
+  Router norm + Router proj                  (2 dispatches)
+  Top-k softmax + expert select              (1 dispatch)
+  MoE gate_up_id mat_mul_id                  (1 dispatch)
+  SiLU + mul (expert chain)                  (1 dispatch)
+  MoE down_id mat_mul_id                     (1 dispatch)
+  Weighted sum                               (1 dispatch)
+  Post-FF norm                               (1 dispatch)
+  ADD residual                               (1 dispatch chained)
+
+  Approx 28-30 dispatches/layer × 30 layers ≈ 840-900 dispatches/token (= our 865)
+```
+
+**Realization**: peer's per-layer dispatch composition COUNT is similar to ours (~28-30/layer). Their 1339/token total includes MULTIPLE encoder operations per dispatch (state changes, parameter binding, etc.) that our wrapper accounts as 1 unit per high-level op.
+
+So the iter-104 "865 vs 1339" comparison may have been comparing different counting units. Need to confirm what peer's count instrumentation actually measures.
+
+### Hypothesis revision
+
+Peer's "1339 dispatches/token" reported by `HF2Q_PEER_COUNT_PRINT` may include encoder-level operations (e.g., `setComputePipelineState`, `setBuffer`, `dispatchThreadgroups`) rather than logical kernel invocations. Our `HF2Q_PER_LAYER_DISP` counts logical dispatches.
+
+If true, peer and we both fire ~865 logical kernels/token at gemma4 — same total. The gap is in KERNEL EXECUTION TIME, not count.
+
+Going back to iter-103 micro-bench: our kernels are 72-137% of peak BW per call. So at micro-bench level we're peer-class. But aggregated across 30 layers in real decode, we accumulate 7.5% extra wall.
+
+The aggregate gap may be in:
+- Buffer/state binding overhead per dispatch (could be 0.5-1 µs each × 865 = ~0.6 ms wall)
+- Apple Metal scheduler pipelining differences (orthogonal to kernel times)
+- Real-decode resource contention (residency, register pressure, cache thrash)
+
+### Iter-108 ACTION
+
+Cleanly bench-instrument BOTH sides with WALL TIME PER DISPATCH (not aggregate count) to localize where the 5 µs/dispatch wall gap actually concentrates. If wall localizes to specific kernels, target those. If wall is distributed evenly across all kernel types, the gap is in scheduling/pipelining (host-side encoder behavior).
+
+This requires `MTLCounterSampleBuffer.AtDispatchBoundary` — per iter-95 memory hardware-blocked on Apple M-series. Alternative: use `addCompletedHandler` per-CB with single-CB-per-dispatch to manually time each (slow but possible).
+
+Given the per-iter optimization space is fully exhausted AND the gap may be in non-attackable structural pipelining differences, this is also a candidate operator-decision-point.
+
+
 ## Iter-106 (2026-05-12) — Lever A invalid (RAW deps); env-only exhausted
 
 ### Lever A audit
