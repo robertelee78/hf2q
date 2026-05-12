@@ -957,6 +957,38 @@ Per `feedback_no_premature_mission_close_2026_05_11.md`: mission stays OPEN. Per
 
 **CFA workflow validation**: the multi-agent review pipeline caught a subtle spec-misread that single-agent would have missed (claude-impl's self-report said "kernel body VERBATIM from peer ... with only the 4 allowed surface adaptations" — accurate per her interpretation, wrong per spec intent). Codex's independent static review + opus queen's spec-grounded judgment combined to flag all 8 deviations with line numbers + spec citations. This is exactly the value-add of the CFA review-only mode for hardware-bound work.
 
+## Iter-126 (2026-05-12) — CFA redo APPROVED + merged to main: literal peer-kernel port is LIVE opt-in
+
+Claude-impl-2 applied queen's 10-item redo_guidance from iter-125. Concrete delta vs iter-125:
+- File-header `#define NWG 1`, `NSG 1`, `nl_k 1`, `nl_v 1`, `FC_flash_attn_ext_vec_has_mask 1` ... `_has_kvpad 0` macros (queen wanted constexpr but MSL rejects program-scope constexpr short — #define is the standard mechanism and is spec-equivalent).
+- No-op `deq_k_t4`/`deq_v_t4` template stubs at file header so peer's dequant call sites in dead else-branches remain lexically valid; compiler DCEs them via `is_same<kd4_t,k4_t>::value` fold to true at f16.
+- All 5 critical iter-125 violations restored to peer's symbolic pattern: main loop init `for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG)`, K/V dequant else branches with `deq_k_t4(pk + i/nl_k, i%nl_k, mk)` / `deq_v_t4(pv4 + i/nl_v, i%nl_v, mv)`, NSG parallel-reduce block physically DELETED (peer 7039-7066 absent), rescale ternary `NWG == 1 ? (ss[0] == 0.0f ? 0.0f : 1.0f/ss[0]) : 1.0f`, store formula verbatim `dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[i]*S` (the only line spec called out by name), S/M store guard `if (NWG > 1)` symbolic.
+- Score block predicate symbolic with FC macros `if (FC_flash_attn_ext_vec_has_mask && !FC_flash_attn_ext_vec_has_scap && !FC_flash_attn_ext_vec_has_bias)`.
+- Operator-directed post-codex cleanup commit (47d8584): `#define NS10 DK` + `#define NS20 DV` at file header, K/V stride expressions in body now use `NS10`/`NS20` matching peer's exact token shape; our-added "// Peer: ...", "// Dead else-branch (...)", "// verbatim peer lines XXX-YYY" annotations removed from kernel body; peer-originated comments retained.
+
+Codex re-review (Phase 2b-redo): verdict = **approve_with_concerns**. All 10 queen items applied. No new deviations. `args.logit_softcap` placeholder confirmed inside DCE'd dead branch (not live). Two non-blocking concerns: (a) some comments inside body, (b) NS10/NS20 lexical parity — both addressed by operator-directed cleanup commit.
+
+Queen Phase 3-redo: verdict = **APPROVE**, merge_recommendation = `merge_after_AC3_AC4_pass`. Dismissed codex's two concerns as cosmetic (Apple Metal lexer tokenizes comments to whitespace; hypothesis is structural not lexical). Spot-checked all 8 named sites at HEAD against peer source — verbatim verified.
+
+**Phase 4 gates (launcher-run with Metal access)**:
+- AC3 (env unset, HF2Q_HYBRID_KV=1 HF2Q_FULL_F16_KV=1): first decode token = **236778** ✓ baseline
+- AC4 (HF2Q_FA_PEER_PORT=1 HF2Q_HYBRID_KV=1 HF2Q_FULL_F16_KV=1): first decode token = **236778** ✓ byte-identical to baseline
+
+**MERGED TO MAIN** on both repos:
+- mlx-native: `f8d3c51` Merge cfa/fa-peer-port-claude (5 files, 710 insertions: new shader + new dispatcher + registry + mod.rs + 230 LOC test); pushed to origin
+- hf2q: `bdd61072` Merge cfa/fa-peer-port-claude (forward_mlx.rs +46/-11 env-gate); pushed to origin
+
+Production HEAD with env unset is **byte-identical to pre-port HEAD** (AC3 pass). The kernel is opt-in via `HF2Q_FA_PEER_PORT=1` with preconditions head_dim==256 + k.dtype==F16 + v.dtype==F16 (requires `HF2Q_HYBRID_KV=1 HF2Q_FULL_F16_KV=1` to reach the f16-V path). Fallthrough to existing hybrid kernel when precondition fails.
+
+**AC5 OPERATOR-FOLLOWUP REQUIRED**: thermal-fair alt-pair bench per `feedback_metal_bench_protocol_2026_05_12`. Single non-thermal-fair smoke run during AC4 showed 109.3 t/s vs 92.0 t/s baseline (+18.8%, above peer-FA 98.6) but this is NOT a valid AC5 measurement — could be cold-cache artifact in either direction. Run `scripts/iter121_alt_pair_v_f16_thermal_fair.sh` or equivalent with 60-90s cool-downs and σ<1% precondition. Interpretation:
+- WIN ≥0.98× peer-FA → hypothesis CONFIRMED (peer-source-pattern fidelity IS the load-bearing variable; 22-lever ledger gap closes; mission can advance toward CLOSURE per multi-regime gate)
+- LOSS ≤0.93× peer-FA → hypothesis FALSIFIED (Apple compiler is NOT pattern-sensitive at this layer; per-PSO instruction-level rewrite forced, multi-week)
+- MIDDLE 0.94×-0.97× → may need MTLCounterSampleBuffer instrumentation to attribute
+
+Per `feedback_no_premature_mission_close_2026_05_11`: ADR-029 mission stays **OPEN** until AC5 ratio is verified σ<1% at multi-regime gates (tg100/tg2000/tg5000 + d=0/2K/4K/8K).
+
+**CFA workflow value-add at iter-125→126**: independent codex review caught 8 RULE-1 deviations claude-impl-1 didn't realize were violations. Queen's spec-grounded judgment + 10-item concrete redo_guidance produced a faithful port on the second try. Operator override after codex's second-pass concerns drove the NS10/NS20 cleanup. Total: 4 commits on cfa branch (c8e8636 + 9e05df3 + 130d707 + 47d8584), 2 codex reviews, 2 queen judgments, full review-only workflow exercised. Standing rule added to memory: `feedback_fc_bake_via_symbolic_constexpr_not_literal_2026_05_12.md`.
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
