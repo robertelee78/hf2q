@@ -848,6 +848,43 @@ This is a non-obvious insight that explains why both H82 variants fail: the comp
 
 Structural ceiling holds at 91 t/s.
 
+## Iter-120 (2026-05-12) — H83 [[unlikely]] attribute hint NEUTRAL; 21 levers, 0 wins
+
+Per iter-119 insight (`continue` is load-bearing for compiler), tested H83: add C++17 `[[unlikely]]` attribute to give the Apple Metal compiler an explicit branch probability hint on the kv_pos-out-of-range path.
+
+Hypothesis: explicit `[[unlikely]]` may help the compiler optimize register layout / instruction scheduling for the body path (since the body path is hot, the branch is cold in 31/32 chunks).
+
+Coherence: PASS (first_decode_token=236778 = baseline; output byte-identical).
+
+Alt-pair thermal-fair (3 cycles, separate binaries saved):
+
+| cycle | baseline | H83 |
+|---:|---:|---:|
+| 1 | 91.6 | 91.4 |
+| 2 | 91.1 | 91.3 |
+| 3 | 91.2 | 91.2 |
+
+Means: baseline **91.30 ± 0.27** vs H83 **91.30 ± 0.10** = **0.00% EXACTLY NEUTRAL**.
+
+### Conclusion
+
+Apple Metal compiler is already inferring branch probability correctly without the explicit hint. `[[unlikely]]` adds no measurable benefit.
+
+This is consistent with the compiler's sophisticated handling identified in iter-119 — the compiler doesn't need source-level hints for branch probability; its static analysis at -O3 already optimizes correctly.
+
+REVERTED. mlx-native flash_attn_vec_hybrid.metal byte-identical to HEAD.
+
+### 21 levers tested iter-100..120, 0 wins.
+
+Compiler-hint family fully tested:
+- Source-level hoist (H79): identical IR
+- Loop unroll on cc (H72, H81): regression
+- V-loop unroll only (H82): regression
+- V-loop unroll + remove continue (H82v2): worse regression
+- Explicit [[unlikely]] hint (H83): neutral
+
+The Apple Metal compiler at -O3 is doing all the heavy lifting. Source-level hints/refactors at this granularity produce identical or worse IR. Per-iter optimization space is comprehensively exhausted across all explored compiler-interaction patterns.
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
