@@ -721,6 +721,11 @@ pub struct GenerateArgs {
     #[arg(long, default_value = "256")]
     pub max_tokens: usize,
 
+    /// Ignore end-of-sequence token; generate the full max_tokens regardless of EOS.
+    /// Used for benchmarks that need a fixed-length generation (e.g., true tg5000 vs peer).
+    #[arg(long)]
+    pub ignore_eos: bool,
+
     /// Path to a multimodal projector GGUF (mmproj). When supplied,
     /// `hf2q generate` validates the GGUF + parses `MmprojConfig` +
     /// loads the projector weights onto the Metal device, and surfaces

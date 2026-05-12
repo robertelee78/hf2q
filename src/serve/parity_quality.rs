@@ -477,6 +477,7 @@ fn run_two_regime_decode(
             kv_bits: None,
             enable_thinking: false,
             no_thinking: false,
+            ignore_eos: false,
         },
         Some(&tokenizer),
         prompt_text,

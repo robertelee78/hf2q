@@ -1370,7 +1370,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
                 let mut generated = 1usize;
                 let mut p: Option<forward_mlx::TokenProfile> = None;
                 for _ in 1..regime_cap {
-                    if eos_token_ids.contains(&next_token) {
+                    if !args.ignore_eos && eos_token_ids.contains(&next_token) {
                         break;
                     }
                     let pos = all_tokens.len() - 1;
@@ -1520,7 +1520,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     let kernel_profile_warmup = 2usize;
     let kernel_profile_measure = 3usize;
     for _ in 1..params.max_tokens {
-        if eos_token_ids.contains(&next_token) {
+        if !args.ignore_eos && eos_token_ids.contains(&next_token) {
             break;
         }
         let pos = all_tokens.len() - 1;
@@ -1557,22 +1557,25 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         }
 
         // N-gram repetition guard — same shared detector as the qwen35 path.
-        if let Some((ngram, repeats)) = detect_greedy_repetition_loop(&decoded_tokens) {
-            tracing::info!(
-                "Gemma decode: greedy n-gram repetition detected (last {} tokens \
-                 repeated {} times); stopping. Sampling \
-                 (temperature/top_k/top_p/repetition_penalty) is wired in \
-                 forward_decode but the CLI does not pass them through; \
-                 use the chat-completion API for non-deterministic decoding.",
-                ngram, repeats
-            );
-            eprintln!(
-                "\n[hf2q] Gemma greedy decode entered a {}-token repetition loop \
-                 — stopping. Use the chat-completion API for non-deterministic \
-                 decoding.",
-                ngram
-            );
-            break;
+        // Skipped under --ignore-eos (bench mode wants raw N-token generation).
+        if !args.ignore_eos {
+            if let Some((ngram, repeats)) = detect_greedy_repetition_loop(&decoded_tokens) {
+                tracing::info!(
+                    "Gemma decode: greedy n-gram repetition detected (last {} tokens \
+                     repeated {} times); stopping. Sampling \
+                     (temperature/top_k/top_p/repetition_penalty) is wired in \
+                     forward_decode but the CLI does not pass them through; \
+                     use the chat-completion API for non-deterministic decoding.",
+                    ngram, repeats
+                );
+                eprintln!(
+                    "\n[hf2q] Gemma greedy decode entered a {}-token repetition loop \
+                     — stopping. Use the chat-completion API for non-deterministic \
+                     decoding.",
+                    ngram
+                );
+                break;
+            }
         }
     }
     let decode_elapsed = decode_start.elapsed();
@@ -5169,6 +5172,7 @@ fn cmd_parity_check(
             kv_bits: None,
             enable_thinking: false,
             no_thinking: false,
+            ignore_eos: false,
         },
         Some(&tokenizer),
         &prompt_text,
@@ -5357,6 +5361,7 @@ fn cmd_parity_capture(
                 kv_bits: None,
                 enable_thinking: false,
                 no_thinking: false,
+                ignore_eos: false,
             },
             Some(&tokenizer),
             &prompt_text,
@@ -6265,6 +6270,7 @@ mod tests {
             kv_bits: None,
             enable_thinking: false,
             no_thinking: false,
+            ignore_eos: false,
         }
     }
 
