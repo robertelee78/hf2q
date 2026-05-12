@@ -1086,6 +1086,61 @@ Both peer and hf2q absolute t/s increased ~4-5% from iter-117 to iter-128. **The
 
 Production HEAD = **0.9485× peer-FA today** = -5.15% gap. Both arms within tight σ. The structural gap is real, persistent, machine-state-independent at the relative scale. Closing requires the iter-117/127 multi-week paths (per-PSO AIR/PTX inspection, MTLCounterSampleBuffer instrumentation, or cross-call kernel-fusion work). Per `feedback_no_premature_mission_close_2026_05_11` mission stays **OPEN**; today's bench locks the apples-to-apples ratio and removes the cross-session confound from future analysis.
 
+## Iter-129 (2026-05-12) — Multi-regime gate: tg100 + tg2000 confirm constant 0.93-0.95× peer-FA; tg5000 blocked on hf2q EOS-stop
+
+Per `feedback_no_premature_mission_close_2026_05_11`: multi-regime gate required before any closing claim. Ran tg100 + tg5000 fresh A2A in same session as iter-128's tg2000 (machine state continuous).
+
+### Results
+
+| Regime | HF2Q mean | HF2Q σ_pct | PEER mean | PEER σ_pct | Ratio | Valid? |
+|---|---|---|---|---|---|---|
+| tg100  | 94.40 (94.1, 94.4, 94.7) | 0.32% ✓ | 100.99 (100.01, 101.44, 101.51) | 0.84% ✓ | **0.935×** peer-FA | yes |
+| tg2000 (iter-128) | 95.70 (96.1, 96.1, 94.9) | 0.72% ✓ | 100.90 (100.63, 101.23, 100.85) | 0.30% ✓ | **0.949×** peer-FA | yes |
+| tg5000 | 92.27 (93.3, 93.4, 90.1) | 2.02% ✗ | 95.44 (95.87, 94.81, 95.65) | 0.58% ✓ | 0.967× peer-FA | **NO — see caveat** |
+
+### tg5000 caveat — INVALID for A2A comparison
+
+Hf2q's generate stops at EOS token; on the bench prompt `"Q."` with `--temperature 0` the greedy decode hits `<|im_end|>` at ~750 tokens (8-9s wall) instead of running the full 5000. Peer's `llama-bench -p 0 -n 5000` always runs 5000 generation steps regardless of EOS.
+
+Concretely at tg5000:
+- HF2Q averages over generation tokens 0..750 (effective ≈ tg750)
+- PEER averages over generation tokens 0..5000 (true tg5000)
+- Apparent ratio 0.967× is artificially favorable — hf2q is being measured at lower kv depth than peer.
+
+The hf2q `generate` subcommand has no `--ignore-eos` flag (only `--max-tokens`, `--temperature`). To validate a true tg5000 comparison would require either:
+- Add `--ignore-eos` flag to hf2q (~10-30 LOC, future iter)
+- Use a longer prompt that yields >5000 generation tokens before EOS (hard to construct deterministically)
+- Add a `bench` subcommand to hf2q that mirrors `llama-bench` (multi-iter scope)
+
+For now, **tg5000 ratio = MEASUREMENT INVALID** and the σ_pct=2.02% (above 1% bar) hints at instability that likely reflects the asymmetric stopping conditions.
+
+### Multi-regime gate verdict (tg100 + tg2000 only)
+
+VALID data points span 50× kv depth (0..100 vs 0..2000) for hf2q's average decode. Both σ<1%, both apples-to-apples:
+- tg100 ratio: 0.935× peer-FA
+- tg2000 ratio: 0.949× peer-FA
+- Δ between regimes: 1.4pp (modest; both fall in 0.93-0.95× cluster)
+
+**iter-111's "constant ratio across regimes" claim CONFIRMED at today's machine state for valid regimes.** Gap is fundamentally constant ~5-7% across tg depth. Iter-127's NEUTRAL falsification of the peer-port hypothesis at tg2000 generalizes to tg100 as well — port doesn't help, hybrid baseline IS the ratio.
+
+### Notable observation
+
+Peer-FA tg100 = 100.99 vs tg5000 = 95.44 = **peer is 5.5% slower at tg5000** vs tg100 (true peer scaling). HF2Q at "tg5000" (effective ~tg750) = 92.27 vs tg100 = 94.40 = hf2q only 2.3% slower (smaller effective depth range). If hf2q ran true tg5000, we'd expect it to drop by ~3-5% as well, putting it at ~89-90 t/s with peer at 95.4 = ratio ~0.94×. So TRUE tg5000 ratio likely stays in the 0.93-0.95× cluster, consistent with iter-111's constancy claim.
+
+### Implications for next steps
+
+Standing gap = **5-7% structural across all valid regimes**. With 23 micro-pattern levers + 1 verbatim-port lever all falsified, the only remaining paths are:
+1. **MTLCounterSampleBuffer instrumentation** (multi-day mlx-native work; per iter-108 H67)
+2. **Per-PSO AIR/PTX inspection** (operator-bound on `xcodebuild -downloadComponent MetalToolchain`)
+3. **Cross-call kernel fusion / dispatch graph reshape** (multi-week refactor; per iter-117 conclusion)
+4. **Add `--ignore-eos` to hf2q** for true multi-regime tg5000 validation (small follow-up; ~10-30 LOC)
+
+Mission stays **OPEN** per `feedback_no_premature_mission_close`. Multi-regime gate PARTIAL (tg100 + tg2000 valid; tg5000 blocked on tooling).
+
+### Bench artifacts
+
+`/tmp/cfa-20260512-fa-peer-port/multi_regime_bench.sh` + `multi_regime_results.txt`
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
