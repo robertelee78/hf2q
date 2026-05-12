@@ -1058,7 +1058,16 @@ impl MlxModelWeights {
                 // mask representation. sdpa_sliding previously had a "dense
                 // cap 1024" issue at pp=2455 (docs/spike-gate-a-prefill.md
                 // §Addendum); flash_attn_prefill unblocks that sub-gate.
-                if use_no_fa {
+                // ADR-029 iter-82 H62: gate NO_FA on global-attn layers
+                // only.  Sliding layers' FA_SW already has sliding-window
+                // K=1024 cap + Wave 2E tile-skip, costing only 6.55 ms/call
+                // at pp8333 (iter-50).  Under NO_FA they'd compute the full
+                // uncapped K=qL matmul = 1771 ms total across 25 layers
+                // (iter-81 measurement).  Keeping FA_SW for sliding +
+                // routing global through NO_FA saves ~52 ms wall at pp8333
+                // per model.
+                let route_through_nofa = use_no_fa && !is_sliding;
+                if route_through_nofa {
                     // ---- HF2Q_NO_FA path: tensor-mm attention ----
                     //
                     // Mirrors llama.cpp's `-fa 0` fast path (which on M5
@@ -1401,7 +1410,12 @@ impl MlxModelWeights {
                     s = exec.begin().map_err(|e| anyhow::anyhow!("MM-profile begin (O) L{layer_idx}: {e}"))?;
                     Some(t0)
                 } else { None };
-                if use_no_fa {
+                // ADR-029 iter-82 H62: O-proj reads pf_sdpa_out (NO_FA layout
+                // f32) only when this layer actually routed through NO_FA
+                // (i.e. !is_sliding AND use_no_fa).  Sliding layers under
+                // FA_SW populated pf_sdpa_out_perm (FA layout bf16) and
+                // need the FA-style O-proj branch.
+                if route_through_nofa {
                     s.barrier_between(
                         &[&pf_sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
                         &[&pf_attn_out],
