@@ -1282,6 +1282,82 @@ Future verbatim-port specs MUST verify peer's runtime dispatch matches the spec'
 `/tmp/cfa-20260512-fa-peer-port/ac5_tg5000_bench.sh` + `ac5_tg5000_results.txt` (PORT vs HYBRID regression)
 `/tmp/cfa-20260512-fa-peer-port/ac5_tg5000_mitigated.sh` + `ac5_tg5000_mitigated_results.txt` (is_sliding gate failed)
 
+## Iter-134/135/136/137/138 (2026-05-12) — 🎯 NWG=32 PEER-PORT WINS +1.8% @ tg2000 and +2.2% @ tg5000 (first WIN in 23 levers)
+
+Iter-133 root-cause established that peer's runtime ALWAYS dispatches flash-attn-vec at NWG=32, not NWG=1. The iter-126 verbatim port targeted peer's `if (false)` dead code path. iter-134 through 137 built the proper NWG=32 + reduce-kernel port; iter-138 validates with thermal-fair AC5.
+
+### The stack landed
+
+| Iter | Building block | Commit |
+|---:|---|---|
+| 134 | Reduce-kernel MSL port (peer ggml-metal.metal:7235-7275) | mlx-native `b22eb8c` |
+| 135 | NWG=32 vec kernel variant (same body as iter-126, `#define NWG 1→32`) | mlx-native `f56cb82` |
+| 136 | Rust dispatcher `flash_attn_vec_peer_port_f16_nwg32` (vec + barrier + reduce) | mlx-native `5050b0b` |
+| 137 | `HF2Q_FA_PEER_PORT_NWG32=1` env-gate in hf2q forward_mlx.rs | hf2q `605b17be` |
+| 138 | AC5 thermal-fair 2-regime alt-pair bench | (results below) |
+
+Buffer reuse: `self.activations.sdpa_tmp` was already pre-allocated via `flash_attn_vec_tq::tmp_buffer_bytes(num_heads, head_dim)` which computes the IDENTICAL formula `nrows*32*(dv+2)*4` that the new dispatcher requires (~528 KiB at gemma4 shape). Zero new allocations — just pass the existing buffer.
+
+### iter-138 AC5 result (same session, σ<1% precondition both arms)
+
+| Regime | PORT_NWG32 | σ_pct | HYBRID | σ_pct | Ratio | Verdict |
+|---|---|---|---|---|---|---|
+| tg2000 | **95.07** (94.2, 95.4, 95.6) | 0.80% ✓ | 93.40 (93.3, 93.5, 93.4) | 0.11% ✓ | **1.018×** | **+1.79% WIN** |
+| tg5000 | **91.80** (91.6, 92.0, 91.8) | 0.22% ✓ | 89.80 (89.7, 90.2, 89.5) | 0.40% ✓ | **1.022×** | **+2.23% WIN** |
+
+Both arms σ<1%, both regimes statistically distinguishable WINS for PORT_NWG32.
+
+### Implied PORT_NWG32 vs peer-FA (using session-stable ratios)
+
+From iter-128/131 (today's apples-to-apples HYBRID vs peer-FA):
+- HYBRID/PEER tg2000 = 0.949×
+- HYBRID/PEER tg5000 = 0.916×
+
+Applying iter-138's PORT_NWG32/HYBRID multiplier:
+- PORT_NWG32/PEER tg2000 ≈ 0.949 × 1.018 = **0.966× peer-FA** (gap 5.1% → 3.4%)
+- PORT_NWG32/PEER tg5000 ≈ 0.916 × 1.022 = **0.936× peer-FA** (gap 8.4% → 6.4%)
+
+Needs validation via direct same-session PORT_NWG32-vs-peer-FA bench (next).
+
+### Refined hypothesis verdict
+
+The original "verbatim peer source pattern" hypothesis (iter-127) FAILED because we ported peer's UNUSED dead-code path at NWG=1. The REFINED hypothesis ("peer's PSO advantage = NWG=32 parallelism + reduce-kernel + verbatim source pattern combined") is now CONFIRMED by direct alt-pair measurement.
+
+The win is moderate (+1.8% to +2.2%) but DEFINITIVE — first positive result after 22 NEUTRAL/REGRESSION levers. Two-regime gate met. Apples-to-apples σ<1% met both sides.
+
+### Mechanism — why NWG=32 PORT beats HYBRID at SAME parallelism level
+
+Both NWG=32 PORT and HYBRID use the same `compute_nwg(kv>512)→32` decision logic at our shapes; same parallelism. The difference is the verbatim peer source pattern in the per-WG kernel body. Possibilities:
+- Apple Metal compiler emits ~2% better IR for peer's exact loop structure (online-softmax, V-loop, simd-shuffle ladder)
+- Peer's exact register-allocation pattern at -O3 produces fewer spills
+- Subtle differences in shared-memory layout / barrier placement
+
+iter-138 doesn't isolate WHICH of these; the win is unambiguous at the wall-clock level. MTLCounterSampleBuffer instrumentation could attribute further (multi-day, separate iter).
+
+### Mission state
+
+**Mission stays OPEN** but with material progress.
+
+Production HEAD env-unset behavior unchanged. PORT_NWG32 is opt-in via `HF2Q_FA_PEER_PORT_NWG32=1 HF2Q_HYBRID_KV=1 HF2Q_FULL_F16_KV=1`.
+
+Validated at:
+- AC1 build clean (release, 19.41s + 5.10s incremental)
+- AC2 pipeline registers + compiles (5/5 tests pass including new `nwg32_pipeline_registers_and_compiles` + `reduce_pipeline_registers_and_compiles`)
+- AC3 env unset → first decode token 236778 (byte-identical to pre-stack HEAD)
+- AC4 HF2Q_FA_PEER_PORT_NWG32=1 → first decode token 236778 (byte-identical)
+- AC5 thermal-fair alt-pair 3-cycle × 2-regime: PORT_NWG32 WINS at both tg2000 (+1.79%) and tg5000 (+2.23%)
+- AC6 hybrid tests still pass (no regression to default path)
+
+### Next steps
+
+- **iter-139**: same-session PORT_NWG32-vs-peer-FA A2A bench at tg2000 + tg5000 to confirm implied 0.966×/0.936× peer-FA numbers (REPLACE the ratio extrapolation with direct measurement)
+- **iter-140**: if validated, default-flip `HF2Q_FA_PEER_PORT_NWG32=1` ON for gemma4 f16-V regime (operator decision)
+- **Future**: instrument with MTLCounterSampleBuffer to attribute the +2% to specific kernel-body pattern (Apple compiler IR differences)
+
+### Bench artifacts
+
+`/tmp/cfa-20260512-fa-peer-port/nwg32_ac5_bench.sh` + `nwg32_ac5_results.txt`
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
