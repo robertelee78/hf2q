@@ -1,10 +1,45 @@
 # ADR-029: gemma4-APEX-Q5_K_M Decode Gap — Measurement-Driven Root Cause
 
-- **Status**: 🎯 **MERGED TO MAIN iter-95** (2026-05-12). Decode CLOSED at thermal-fair multi-regime gate (4/4 regimes ≥ 1.0× peer); prefill FA-vs-FA TIED at multi-regime (3/3 regimes ≥ 1.0× peer-FA). Peer-BEST prefill gap (8-14%) is documented as structural (peer's split-attn choice at gemma4 head_dim=512+gqa=4) and Apple-M-hardware-blocked for definitive per-pipeline attribution. hf2q main `4e6b0ee3`, mlx-native main `5133971`.
-- **Date**: 2026-05-11 (original) → iter-9 rewrite → iter-18 short-ctx close → iter-19c long-ctx reopen → iter-21..73 prefill levers → **iter-74 thermal-fair multi-regime re-measurement**
-- **Supersedes**: itself (the original "MoE pipeline IS the gap" framing was wrong; this rewrite replaces it)
-- **Decision-grade evidence**: per-layer GPU timestamps from `MTLCommandBuffer.GPUStartTime/GPUEndTime` in real production decode + 3-trial fresh-process benchmark at thermal steady state
-- **Tags**: performance, root-cause, gemma4, thermal-fair, decode-closed, prefill-open
+- **Status**: 🚨 **iter-100 (2026-05-12) — DECODE GAP REOPENED.** Iter-95's "MERGED TO MAIN, DECODE CLOSED" verdict was based on point-measurements at specific kv depths (d=0/2K/4K/8K, n=100 fresh tokens at each depth). At peer's standard **averaged-over-2000-tokens** workload (`llama-bench -p 0 -n 2000`), thermally-fair single-rep × 5 with 90s cool-downs: **hf2q 91.17 ± 0.15 t/s vs peer-FA 98.64 ± 0.18 t/s = 0.924× peer-FA (-7.6%, 7.5 t/s gap)**. The operator's standing-rule `feedback_no_premature_mission_close_2026_05_11` multi-regime gate did NOT include this averaged-decode regime; iter-95 closure missed it. Per `feedback_targets_must_be_apples_to_apples_2026_05_11`, peer's tg2000 IS the workload most users hit; we are NOT at parity there.
+- **Date**: 2026-05-11 (original) → iter-9 rewrite → iter-18 short-ctx close → iter-19c long-ctx reopen → iter-21..73 prefill levers → iter-74 thermal-fair multi-regime re-measurement → iter-95 (merged-to-main) → **iter-100 (regime miss — averaged decode reopens gap)**
+- **Supersedes**: itself (the original "MoE pipeline IS the gap" framing was wrong; this rewrite replaces it). Also supersedes iter-95 closure for the averaged-decode regime.
+- **Decision-grade evidence**: per-layer GPU timestamps from `MTLCommandBuffer.GPUStartTime/GPUEndTime` in real production decode + 3-trial fresh-process benchmark at thermal steady state + iter-100 averaged-tg2000 thermal-fair 5-trial cool-down bench
+- **Tags**: performance, root-cause, gemma4, thermal-fair, decode-reopened-iter-100, prefill-tied
+
+## Iter-100 (2026-05-12) — Averaged-decode regime reopens the gap
+
+**Trigger**: operator measurement `hf2q 90.6 vs llama.cpp 98.1 t/s, ~8 t/s gap` at a 1958-token greedy generation (operator clarification: "the 1st number, 90.6 was hf2q ... the second the 98.1 was llama.cpp"). This was the WORKLOAD a real user hits: short prompt + long generation, decoder running across kv depths 0→2000.
+
+**Methodology** (iter-100, all thermally fair):
+
+- hf2q: 3 trials × `hf2q generate --prompt-file <149-word prompt> --max-tokens 2000 --temperature 0` with 30s cool-downs between trials and 60s preamble (model EOSes at ≥2000 toks reliably with the 5000-word-essay request prompt).
+- peer: 5 trials × `llama-bench -p 0 -n 2000 -r 1 -fa {0,1}` with 90s cool-downs between trials (llama-bench's internal -r N back-to-back **thermally throttles** within the bench itself — earlier σ=4.01 was thermal artifact, not sampling variance).
+
+| workload (avg kv depth) | hf2q t/s | peer -fa 1 t/s | peer -fa 0 t/s | ratio (vs peer-FA) | status |
+|---|---:|---:|---:|---:|---|
+| gen=200 from short prompt (avg kv ~100) | 99.6-101.9 | 101.69 ± 0.04 | — | ~0.98× | TIED (short) |
+| gen=500 from long prompt (avg kv ~250) | 93.5 ± 0.21 | — | — | — | — |
+| **gen=2000 (avg kv ~1000)** | **91.17 ± 0.15** | **98.64 ± 0.18** | 94.32 ± 0.13 | **0.924×** | **✗ GAP** |
+
+(Peer cool-down trials: -fa 1 → 98.67/98.78/98.86/98.45/98.44; -fa 0 → 94.29/?/94.16/94.46/94.45.)
+
+**Coincident control**: HF2Q_FULL_F16_KV=1 (F16-K + F16-V, no TQ-HB) thermal-fair 3 trials at gen=2000 = **88.23 ± 0.06 t/s** — **3.3% SLOWER than HYBRID_KV default**. The pre-compact +2.2 t/s claim for FULL_F16_KV was a thermal-bias artifact (single-trial, not cool-down). **F16-V is NOT a default-flip lever; the TQ-HB V is helping us.** (Marginal H27 status retained at iter-20.)
+
+**Why iter-95 missed this**: the iter-74 multi-regime gate measured *point* throughput — prefill to kv depth d, then 100 new tokens at depth d. At each point we were 1.027-1.054× peer because peer-at-that-point also has identical depth-degradation. The averaged-over-N workload is **dominated by the deep portion** of the kv growth where our per-token cost grows faster than peer's. The iter-95 conclusion held for "rate at a given kv depth"; it didn't hold for "rate averaged across kv ∈ [0,2000]."
+
+**Standing-rule violation acknowledgement**: `feedback_no_premature_mission_close_2026_05_11` requires the multi-regime gate. The iter-74 4-regime gate was thorough on the depth axis but missed the **integration axis** (averaging over the full kv trajectory of a real generation). Adding tg2000 as a required regime going forward.
+
+**What this changes**: peer's tg2000 IS the realistic workload most users will hit. We are 7.5 t/s (7.6%) behind there. Iter-100 reopens decode work targeting this regime.
+
+**Initial hypothesis (testable, not assumed)**:
+
+- **H72**: hf2q's per-token cost grows faster with kv depth than peer's. Differential: at gen=200 we're ~0.98× peer; at gen=2000 we're 0.924× peer. **Test**: bench hf2q at gen=1000 with same long-prompt methodology; expect ~93-95 t/s if growth is linear in depth.
+- **H73**: the gap concentrates in our FA_VEC_HYBRID kernel at deep kv (kv≥500). **Test**: per-layer GPU time at decode-step kv=1500 vs kv=100; gap should localize to attention layers, not FFN/MoE.
+- **H74**: peer's flash_attn_ext_vec_f16 at single-token-Q dominates at deep kv because it reads K/V as half precision (matches Apple Metal simdgroup_half throughput). We read F16 K but **dequant TQ-HB V inline** (per-token-per-head norm * codebook[index]) — the inline dequant adds per-thread ALU work that pure-f16 peer avoids. **Test**: measure FA_VEC_HYBRID at deep kv vs flash_attn_vec_d256_full_f16 reference (hypothetical f16-V variant); if f16-V is faster at deep kv but slower at shallow kv, the lever is depth-conditional V dtype.
+
+Action: keep TQ-HB V as default (verified iter-100 it's the cheaper option at this regime), and look for kernel-internal opportunities in FA_VEC_HYBRID (e.g., codebook in shared memory, vectorized dequant, NSG axis lift).
+
+
 
 ## Iter-74 (2026-05-11) — Decode CLOSED, Prefill OPEN
 
