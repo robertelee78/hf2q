@@ -98,6 +98,20 @@ static PROFILE_B_POST_ATTN_NORM_ADD_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_B_POST_ATTN_NORM_ADD_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROFILE_B_KV_COPY_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_B_KV_COPY_COUNT: AtomicU64 = AtomicU64::new(0);
+// ADR-029 iter-81 H61: per-dispatch profiling of HF2Q_NO_FA's 5 dispatches
+// per global-attn layer.  Used to localize where the NO_FA-vs-FA wall delta
+// (1610 ms at 8K) actually goes: Q@K^T mm, scale-mask-softmax, V transpose,
+// scores@V mm, or output permute_021.  All gated by HF2Q_PROFILE_BUCKETS=1.
+static PROFILE_B_NOFA_QK_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_NOFA_QK_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_NOFA_SMS_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_NOFA_SMS_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_NOFA_VTRANS_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_NOFA_VTRANS_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_NOFA_SV_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_NOFA_SV_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_NOFA_PERM_NS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_B_NOFA_PERM_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROFILE_B_TRIPLE_NORM_NS: AtomicU64 = AtomicU64::new(0);
 static PROFILE_B_TRIPLE_NORM_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROFILE_B_GELU_MUL_ROUTING_NS: AtomicU64 = AtomicU64::new(0);
@@ -1080,6 +1094,14 @@ impl MlxModelWeights {
                     // src0 = K [nkv, seq, hd] bf16, src1 = Q [nh, seq, hd] f32.
                     // Output kq[h, q, k] = sum_d K[h/r2, k, d] * Q[h, q, d].
                     // r2 = nh / nkv for GQA head broadcast.
+                    // ADR-029 iter-81 H61: bracket with finish/begin under
+                    // profile_buckets_on to measure per-dispatch GPU+CPU wall.
+                    let nofa_qk_t0 = if profile_buckets_on {
+                        s.finish().map_err(|e| anyhow::anyhow!("noFA QK pre-finish L{layer_idx}: {e}"))?;
+                        let t0 = std::time::Instant::now();
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("noFA QK begin L{layer_idx}: {e}"))?;
+                        Some(t0)
+                    } else { None };
                     s.barrier_between(
                         &[&pf_k_perm, pf_q_perm_f32_ref],
                         &[pf_kq_ref],
@@ -1096,10 +1118,23 @@ impl MlxModelWeights {
                             src1_batch: nh as u32,
                         },
                     ).map_err(|e| anyhow::anyhow!("non-FA Q@K^T L{layer_idx}: {e}"))?;
+                    if let Some(t0) = nofa_qk_t0 {
+                        s.finish().map_err(|e| anyhow::anyhow!("noFA QK post-finish L{layer_idx}: {e}"))?;
+                        let dt_ns = t0.elapsed().as_nanos() as u64;
+                        PROFILE_B_NOFA_QK_NS.fetch_add(dt_ns, Ordering::Relaxed);
+                        PROFILE_B_NOFA_QK_COUNT.fetch_add(1, Ordering::Relaxed);
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("noFA QK reopen L{layer_idx}: {e}"))?;
+                    }
 
                     // Step 3: scale + mask + softmax fused.  scale = 1.0
                     // because Q's norm-weight pre-scales by 1/sqrt(hd)
                     // (matches FA path's scale=1.0).
+                    let nofa_sms_t0 = if profile_buckets_on {
+                        s.finish().map_err(|e| anyhow::anyhow!("noFA SMS pre-finish L{layer_idx}: {e}"))?;
+                        let t0 = std::time::Instant::now();
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("noFA SMS begin L{layer_idx}: {e}"))?;
+                        Some(t0)
+                    } else { None };
                     let mask_ref = if is_sliding { &sliding_mask } else { &global_mask };
                     s.barrier_between(
                         &[pf_kq_ref, mask_ref],
@@ -1115,10 +1150,23 @@ impl MlxModelWeights {
                             scale: 1.0,
                         },
                     ).map_err(|e| anyhow::anyhow!("non-FA scale_mask_softmax L{layer_idx}: {e}"))?;
+                    if let Some(t0) = nofa_sms_t0 {
+                        s.finish().map_err(|e| anyhow::anyhow!("noFA SMS post-finish L{layer_idx}: {e}"))?;
+                        let dt_ns = t0.elapsed().as_nanos() as u64;
+                        PROFILE_B_NOFA_SMS_NS.fetch_add(dt_ns, Ordering::Relaxed);
+                        PROFILE_B_NOFA_SMS_COUNT.fetch_add(1, Ordering::Relaxed);
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("noFA SMS reopen L{layer_idx}: {e}"))?;
+                    }
 
                     // Step 4: transpose V [nkv, seq, hd] -> [nkv, hd, seq]
                     // so the scores@V matmul contracts on seq_kv (K-dim
                     // = inner-most dim of src0 per our kernel contract).
+                    let nofa_vtrans_t0 = if profile_buckets_on {
+                        s.finish().map_err(|e| anyhow::anyhow!("noFA Vtrans pre-finish L{layer_idx}: {e}"))?;
+                        let t0 = std::time::Instant::now();
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("noFA Vtrans begin L{layer_idx}: {e}"))?;
+                        Some(t0)
+                    } else { None };
                     s.barrier_between(
                         &[&pf_v_perm],
                         &[pf_v_perm_t_ref],
@@ -1128,11 +1176,24 @@ impl MlxModelWeights {
                         &pf_v_perm, pf_v_perm_t_ref,
                         nkv, seq_len, hd,
                     ).map_err(|e| anyhow::anyhow!("non-FA V transpose L{layer_idx}: {e}"))?;
+                    if let Some(t0) = nofa_vtrans_t0 {
+                        s.finish().map_err(|e| anyhow::anyhow!("noFA Vtrans post-finish L{layer_idx}: {e}"))?;
+                        let dt_ns = t0.elapsed().as_nanos() as u64;
+                        PROFILE_B_NOFA_VTRANS_NS.fetch_add(dt_ns, Ordering::Relaxed);
+                        PROFILE_B_NOFA_VTRANS_COUNT.fetch_add(1, Ordering::Relaxed);
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("noFA Vtrans reopen L{layer_idx}: {e}"))?;
+                    }
 
                     // Step 5: scores @ V_t via dense bf16×f32→f32 tensor-mm.
                     // src0 = V_t [nkv, hd, seq_kv] bf16, src1 = kq [nh, seq_q, seq_kv] f32.
                     // Output attn[h, q, d] = sum_k V_t[h/r2, d, k] * kq[h, q, k]
                     //                       = sum_k V[h/r2, k, d] * probs[h, q, k].
+                    let nofa_sv_t0 = if profile_buckets_on {
+                        s.finish().map_err(|e| anyhow::anyhow!("noFA SV pre-finish L{layer_idx}: {e}"))?;
+                        let t0 = std::time::Instant::now();
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("noFA SV begin L{layer_idx}: {e}"))?;
+                        Some(t0)
+                    } else { None };
                     s.barrier_between(
                         &[pf_v_perm_t_ref, pf_kq_ref],
                         &[pf_attn_f32_ref],
@@ -1149,9 +1210,22 @@ impl MlxModelWeights {
                             src1_batch: nh as u32,
                         },
                     ).map_err(|e| anyhow::anyhow!("non-FA scores@V L{layer_idx}: {e}"))?;
+                    if let Some(t0) = nofa_sv_t0 {
+                        s.finish().map_err(|e| anyhow::anyhow!("noFA SV post-finish L{layer_idx}: {e}"))?;
+                        let dt_ns = t0.elapsed().as_nanos() as u64;
+                        PROFILE_B_NOFA_SV_NS.fetch_add(dt_ns, Ordering::Relaxed);
+                        PROFILE_B_NOFA_SV_COUNT.fetch_add(1, Ordering::Relaxed);
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("noFA SV reopen L{layer_idx}: {e}"))?;
+                    }
 
                     // Step 6: permute attn [nh, seq, hd] f32 -> pf_sdpa_out
                     // [seq, nh, hd] f32 to match the O-proj input layout.
+                    let nofa_perm_t0 = if profile_buckets_on {
+                        s.finish().map_err(|e| anyhow::anyhow!("noFA perm pre-finish L{layer_idx}: {e}"))?;
+                        let t0 = std::time::Instant::now();
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("noFA perm begin L{layer_idx}: {e}"))?;
+                        Some(t0)
+                    } else { None };
                     s.barrier_between(
                         &[pf_attn_f32_ref],
                         &[&pf_sdpa_out],
@@ -1161,6 +1235,13 @@ impl MlxModelWeights {
                         pf_attn_f32_ref, &pf_sdpa_out,
                         nh, seq_len, hd,
                     ).map_err(|e| anyhow::anyhow!("non-FA attn permute L{layer_idx}: {e}"))?;
+                    if let Some(t0) = nofa_perm_t0 {
+                        s.finish().map_err(|e| anyhow::anyhow!("noFA perm post-finish L{layer_idx}: {e}"))?;
+                        let dt_ns = t0.elapsed().as_nanos() as u64;
+                        PROFILE_B_NOFA_PERM_NS.fetch_add(dt_ns, Ordering::Relaxed);
+                        PROFILE_B_NOFA_PERM_COUNT.fetch_add(1, Ordering::Relaxed);
+                        s = exec.begin().map_err(|e| anyhow::anyhow!("noFA perm reopen L{layer_idx}: {e}"))?;
+                    }
                 } else {
                 s.barrier_between(
                     &[&pf_q_perm, &pf_k_perm, &pf_v_perm],
@@ -2379,6 +2460,13 @@ impl MlxModelWeights {
             let (o_ms, o_n)               = fetch(&PROFILE_O_MM_NS, &PROFILE_O_MM_COUNT);
             let (post_attn_na_ms, post_attn_na_n) = fetch(&PROFILE_B_POST_ATTN_NORM_ADD_NS, &PROFILE_B_POST_ATTN_NORM_ADD_COUNT);
             let (kv_copy_ms, kv_copy_n)   = fetch(&PROFILE_B_KV_COPY_NS, &PROFILE_B_KV_COPY_COUNT);
+            // ADR-029 iter-81 H61: NO_FA per-dispatch buckets (only populated when use_no_fa is on).
+            let (nofa_qk_ms, nofa_qk_n)         = fetch(&PROFILE_B_NOFA_QK_NS,     &PROFILE_B_NOFA_QK_COUNT);
+            let (nofa_sms_ms, nofa_sms_n)       = fetch(&PROFILE_B_NOFA_SMS_NS,    &PROFILE_B_NOFA_SMS_COUNT);
+            let (nofa_vtrans_ms, nofa_vtrans_n) = fetch(&PROFILE_B_NOFA_VTRANS_NS, &PROFILE_B_NOFA_VTRANS_COUNT);
+            let (nofa_sv_ms, nofa_sv_n)         = fetch(&PROFILE_B_NOFA_SV_NS,     &PROFILE_B_NOFA_SV_COUNT);
+            let (nofa_perm_ms, nofa_perm_n)     = fetch(&PROFILE_B_NOFA_PERM_NS,   &PROFILE_B_NOFA_PERM_COUNT);
+            let nofa_total_ms = nofa_qk_ms + nofa_sms_ms + nofa_vtrans_ms + nofa_sv_ms + nofa_perm_ms;
             let (triple_ms, triple_n)     = fetch(&PROFILE_B_TRIPLE_NORM_NS, &PROFILE_B_TRIPLE_NORM_COUNT);
             let (gur_ms, gur_n)           = fetch(&PROFILE_MLP_GUR_MM_NS, &PROFILE_MLP_GUR_MM_COUNT);
             let (gelu_mul_r_ms, gelu_mul_r_n) = fetch(&PROFILE_B_GELU_MUL_ROUTING_NS, &PROFILE_B_GELU_MUL_ROUTING_COUNT);
@@ -2401,7 +2489,8 @@ impl MlxModelWeights {
                 + post_fa_perm_ms + o_ms + post_attn_na_ms + kv_copy_ms
                 + triple_ms + gur_ms + gelu_mul_r_ms + mlp_dn_ms
                 + moe_gu_ms + moe_sw_ms + moe_dn_ms + moe_ws_ms + end_layer_ms
-                + head_ms;
+                + head_ms
+                + nofa_total_ms;
             let residual_ms = prefill_ms - sum_ms;
 
             let sep = "------------------------------------------------------------------";
@@ -2437,6 +2526,12 @@ impl MlxModelWeights {
             row5("FA_SW (D=256)",             fa_sw_ms,        fa_sw_n);
             row5("FA_GL (D=512)",             fa_gl_ms,        fa_gl_n);
             row5("POST_FA_PERMUTE",           post_fa_perm_ms, post_fa_perm_n);
+            // ADR-029 iter-81 H61: NO_FA per-dispatch buckets (zero when use_no_fa=0).
+            row5("NOFA_QK (Q@K^T)",           nofa_qk_ms,      nofa_qk_n);
+            row5("NOFA_SMS (scale_mask_sm)",  nofa_sms_ms,     nofa_sms_n);
+            row5("NOFA_VTRANS (V transpose)", nofa_vtrans_ms,  nofa_vtrans_n);
+            row5("NOFA_SV (scores@V)",        nofa_sv_ms,      nofa_sv_n);
+            row5("NOFA_PERM (perm021)",       nofa_perm_ms,    nofa_perm_n);
             row5("O_MM",                      o_ms,            o_n);
             row5("POST_ATTN_NORM_ADD",        post_attn_na_ms, post_attn_na_n);
             row5("KV_COPY",                   kv_copy_ms,      kv_copy_n);
