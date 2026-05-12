@@ -600,6 +600,39 @@ REVERTED. mlx-native flash_attn_vec_hybrid.metal byte-identical to HEAD.
 
 **16 levers tested iter-100..113, 0 wins.**
 
+## Iter-114 (2026-05-12) — HF2Q_TQ_NSG=1 (peer's policy match) NEUTRAL/regression — peer's NSG policy is wrong for our kernel
+
+Per iter-113 finding, dug into peer source for FA NSG policy. Peer at ggml-metal-ops.cpp:2940-2954:
+```c
+int64_t nsg = 1;
+int32_t nwg = 32;
+while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) { nsg *= 2; }
+```
+
+At kv=2048: 2*32*1*32 = 2048 < 2048 is FALSE → NSG=1. Peer uses NSG=1 up to kv=2048.
+
+Our `compute_nsg` switches at kv>1024 → NSG=4. We're more aggressive in the 1024-2048 range.
+
+### Test: HF2Q_TQ_NSG=1 forced (matches peer policy at tg2000 avg kv=1000)
+
+Alt-pair thermal-fair (3 cycles, cool start each):
+
+| cycle | baseline | NSG=1 forced |
+|---:|---:|---:|
+| 1 | 89.3 | 89.2 |
+| 2 | 89.5 | 89.3 |
+| 3 | 90.0 | 89.4 |
+
+Means: baseline **89.6 ± 0.3** vs NSG=1 **89.3 ± 0.08** = **-0.33% slight regression**.
+
+### Conclusion
+
+Peer's NSG=1 policy is WRONG for our kernel at tg2000 regime. Our compute_nsg(kv>1024 → NSG=4) was empirically validated by mlx-native bench_fa_vec_tq_hb_gemma_decode (per iter-127d ledger): NSG=4 at kv=1024+ wins for OUR kernel.
+
+Different kernels have different optimal threadgroup geometries. Per-PSO tuning is required.
+
+**17 levers tested iter-100..114, 0 wins.**
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
