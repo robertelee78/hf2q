@@ -584,6 +584,22 @@ Per `feedback_no_premature_mission_close_2026_05_11` multi-regime gate: **NOT ME
 
 Per operator mantra "as fast or faster than peer": the **constant 0.92× ratio** represents a structural cost we incur per layer. Closing it requires per-kernel rewrites (kernel-by-kernel comparison vs peer's compiled outputs), not just dispatch reorganization.
 
+## Iter-113 (2026-05-12) — H79 K-base hoist NEUTRAL: compiler already does the hoist
+
+Per iter-112 finding (gap is in peer's tuned f16-V FA kernel) — tested explicit hoist of K base address outside the cc loop in `flash_attn_vec_hybrid.metal`, matching peer's `pk4 += ty*NS10/4 + tx` pattern at ggml-metal.metal:6824-6826.
+
+Code change: added `k_base_const = K_f16 + (kv_head * kv_capacity + ic) * DK + (is_d512 ? 0 : tx * 4u)` outside the cc loop. Inside the loop: `k_base = k_base_const + cc * DK`.
+
+Coherence: PASS.
+
+Wall: 89.8 / 89.0 = mean **89.4 t/s**, matches baseline. **NEUTRAL.**
+
+Conclusion: Apple Metal compiler ALREADY hoists `K_f16 + kv_head * kv_capacity * DK` outside the cc loop. Explicit source-level hoisting produces identical IR. The per-call gap to peer is NOT at compiler-hoisting level; it's at deeper instruction-scheduling / threadgroup-geometry / per-PSO level.
+
+REVERTED. mlx-native flash_attn_vec_hybrid.metal byte-identical to HEAD.
+
+**16 levers tested iter-100..113, 0 wins.**
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
