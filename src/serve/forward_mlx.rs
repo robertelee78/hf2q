@@ -8036,6 +8036,35 @@ pub fn dispatch_qmatmul(
     output: &MlxBuffer,
     m: u32,
 ) -> Result<()> {
+    // ADR-029 iter-40 H40 — annotate the next-captured dispatch with this
+    // call's exact reads/writes so the graph_opt reorder pass (graph.rs
+    // `ComputeGraph::reorder`) can detect non-conflicts between adjacent
+    // dispatches (e.g. Q/K/V which write to disjoint outputs from the
+    // same input).  Without per-dispatch annotation, the prior
+    // `barrier_between` carries the union of write targets and the reorder
+    // pass treats the dispatches as conflicting.  The annotation only
+    // takes effect in `begin_recorded` mode (HF2Q_GRAPH_OPT_PREFILL=1);
+    // in direct-dispatch mode it's a no-op zero-cost ranges stash.
+    //
+    // Weights are read-only (never mutated post-load), so we annotate
+    // reads=[input] only — weight RANGES would force conservative
+    // RAW-conflict checks against the load-time dequant pass that ran
+    // hours ago (already complete, no live dependency).
+    {
+        let input_range = {
+            let start = input.contents_ptr() as usize;
+            (start, start + input.byte_len())
+        };
+        let output_range = {
+            let start = output.contents_ptr() as usize;
+            (start, start + output.byte_len())
+        };
+        session.encoder_mut().set_pending_buffer_ranges(
+            vec![input_range],
+            vec![output_range],
+        );
+    }
+
     // ADR-020 AC#5 Iter C — affine route MUST be checked first (before
     // F32/GGML).  When `weight.affine` is `Some`, the buffer holds
     // packed-U32 mlx-affine codes and `info.ggml_dtype` is a sentinel.
