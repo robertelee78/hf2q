@@ -682,6 +682,44 @@ Multi-week scope. NOT accessible at /loop 5m granularity.
 
 The cumulative falsification + measurement record (iter-100..115) consistently localizes the gap to a kernel-PSO-level inefficiency in our f16-V FA path. Mission stays OPEN per `feedback_no_premature_mission_close`. Closing requires multi-week deep Apple Metal toolchain work.
 
+## Iter-116 (2026-05-12) — H81: peer-pattern accumulator + full unroll NEUTRAL (compiler emits identical IR)
+
+Per iter-115 GPU-95%-of-body finding, attempted to match peer's kernel pattern directly:
+
+1. Eliminate intermediate `partial` accumulator — peer's pattern accumulates directly into `mqk[cc] +=`
+2. Apply `_Pragma("clang loop unroll(full)")` to BOTH cc loop (C=32 iter) and inner ii loop (DK4/NL=2 iter)
+3. Initialize mqk[] outside cc loop so `continue` (which inhibits unroll) becomes a no-op flag
+
+Hypothesis: H72 (just unroll) regressed due to `partial` register interaction. H81 should avoid that by following peer's exact pattern.
+
+Coherence: PASS.
+
+Alt-pair thermal-fair (3 cycles, baseline-binary vs H81-binary saved separately to /tmp):
+
+| cycle | baseline | H81 |
+|---:|---:|---:|
+| 1 | 91.0 | 91.2 |
+| 2 | 91.3 | 91.2 |
+| 3 | 91.4 | 91.4 |
+
+Means: baseline **91.23 ± 0.21** vs H81 **91.27 ± 0.12** = **+0.04% NEUTRAL** (within noise).
+
+### Conclusion
+
+Apple Metal compiler emits IDENTICAL IR for our `float partial = 0; ...; mqk[cc] = simd_sum(partial)` vs peer's `mqk[cc] += ...; mqk[cc] = simd_sum(mqk[cc])`. Both forms reduce to the same machine code at -O3.
+
+The earlier single-arm test showing +1.77% was thermal drift artifact; alt-pair conclusively shows neutral.
+
+**18 levers tested iter-100..116, 0 wins.**
+
+### Updated mental model
+
+The H72 regression (iter-101) was likely thermal artifact too, not register spill. Or the register-spill threshold lies BETWEEN our `partial`-accumulator version and the unrolled version. Either way, manual unroll/accumulator-pattern changes produce IDENTICAL output to Apple Metal compiler's automatic optimizations.
+
+This rules out manual kernel-source-level tuning as a lever class. The remaining attack surface for the f16-V FA SDPA gap is at deeper Metal toolchain levels (PSO disassembly, instruction-level rewrite, threadgroup geometry experimentation per Apple GPU family). Multi-week scope.
+
+REVERTED — mlx-native flash_attn_vec_hybrid.metal byte-identical to HEAD.
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
