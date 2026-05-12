@@ -989,6 +989,47 @@ Per `feedback_no_premature_mission_close_2026_05_11`: ADR-029 mission stays **OP
 
 **CFA workflow value-add at iter-125→126**: independent codex review caught 8 RULE-1 deviations claude-impl-1 didn't realize were violations. Queen's spec-grounded judgment + 10-item concrete redo_guidance produced a faithful port on the second try. Operator override after codex's second-pass concerns drove the NS10/NS20 cleanup. Total: 4 commits on cfa branch (c8e8636 + 9e05df3 + 130d707 + 47d8584), 2 codex reviews, 2 queen judgments, full review-only workflow exercised. Standing rule added to memory: `feedback_fc_bake_via_symbolic_constexpr_not_literal_2026_05_12.md`.
 
+## Iter-127 (2026-05-12) — AC5 thermal-fair PORT vs HYBRID: NEUTRAL (-0.63%) → hypothesis FALSIFIED
+
+Ran 3-cycle alt-pair thermal-fair bench per `feedback_metal_bench_protocol_2026_05_12.md`: single-rep × N with 90s cool-downs both sides, one-instance-at-a-time, σ<1% precondition. Apples-to-apples: both arms at `HF2Q_HYBRID_KV=1 HF2Q_FULL_F16_KV=1`; only kernel differs (PORT=peer-port, HYBRID=existing flash_attn_vec_hybrid with V_IS_F16_FC=1). tg=2000 on gemma4-APEX-Q5_K_M.
+
+**Results**:
+
+| Arm | C1 | C2 | C3 | Mean | σ | σ_pct | vs peer-FA 98.6 |
+|---|---|---|---|---|---|---|---|
+| PORT (HF2Q_FA_PEER_PORT=1) | 94.4 | 95.9 | 95.5 | **95.27** | 0.78 | 0.82% ✓ | 0.966× |
+| HYBRID (env unset) | 95.9 | 95.8 | 95.9 | **95.87** | 0.06 | 0.06% ✓ | 0.972× |
+
+- **PORT/HYBRID ratio = 0.9937 (-0.63%)** — within pooled noise; statistically distinguishable (~1σ separation) but practically negligible.
+- Both arms within σ<1% precondition. HYBRID extraordinarily stable (σ_pct 0.06%), PORT slightly noisier (0.82%) but still passes the bar.
+
+**Verdict against queen's thresholds**:
+- WIN ≥0.98× peer-FA → NOT MET (PORT is 0.966×, HYBRID is 0.972×; both fail this gate)
+- LOSS ≤0.93× peer-FA → NOT TRIGGERED (PORT is well above)
+- **MIDDLE ZONE** (0.94×-0.97×) — both arms land here
+
+**Hypothesis FALSIFIED as the closure mechanism**: "Apple Metal compiler PSO quality is sensitive to peer's exact source pattern" does NOT hold at the level that closes the 7-8% gap to peer-FA. Our verbatim-source-pattern kernel produces ~the same wall-clock as our existing structured-different kernel. The Apple Metal compiler at -O3 normalizes both forms to equivalent IR for this kernel shape — same as iter-116/118/119/120/121 found for individual micro-patterns (FOR_UNROLL/[[unlikely]]/hot-cold split/etc.).
+
+Confirms iter-117's read: **"The 11.7% per-call gap to peer is at compiler-VERSION-specific PSO output differences, NOT at source-level patterns the compiler can re-derive."**
+
+**This is the 23rd lever in the falsification ledger**, all 23 NEUTRAL or REGRESS:
+1. `feedback_class_AB_lever_falsification_ledger_2026_05_12.md` updated with lever #23: HF2Q_FA_PEER_PORT=1 verbatim kernel port → -0.63% neutral.
+
+**The peer-FA 98.6 t/s baseline itself is suspicious**: today's HYBRID baseline is 95.87 ± 0.06 vs iter-117's 91.3 baseline. Difference: 4.57 t/s = 5.0%. Possible causes: (a) thermal state difference between session days, (b) the merge of cfa/fa-peer-port-claude touched forward_mlx.rs even with env unset (the env check adds branch prediction effects), (c) iter-117's baseline included extra perf instrumentation. NEEDS REVISIT in a separate iter to compare today's HYBRID against `b81ddaa6` (pre-merge HEAD) with all the same flags.
+
+**What this tells us about closure**:
+- Per-kernel-source-pattern rewrite is NOT the lever (this iter falsifies)
+- Per-PSO-AIR/PTX-level rewrite is the only remaining mechanism (queen iter-117 noted "multi-week")
+- Alternative: instrumentation via MTLCounterSampleBuffer (queen redo_guidance + H67 from iter-108) to attribute the gap to specific GPU pipeline stalls
+
+**Production HEAD state**: peer-port is LIVE on main as opt-in, default OFF (zero behavior change at HEAD with env unset, AC3 byte-identical pre-iter-127 confirmed). Operator can:
+- Leave as documentation reference / future-investigation seed
+- Eventually delete if no further use (but it's documented in ADR-029, low cost to keep)
+
+Per `feedback_no_premature_mission_close_2026_05_11`: mission stays OPEN. Single-regime AC5 falsification at tg2000 is one data point; multi-regime (tg100/tg5000 + various kv depths) would solidify the verdict. ADR-029 stays at production HEAD = 0.972× peer-FA (today's measurement) / 0.922× peer-FA (iter-117 baseline). Mission objective unmet.
+
+**Bench artifacts**: `/tmp/cfa-20260512-fa-peer-port/ac5_results.txt` + `ac5_alt_pair_bench.sh`.
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
