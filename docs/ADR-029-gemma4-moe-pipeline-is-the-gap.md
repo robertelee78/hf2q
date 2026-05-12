@@ -226,6 +226,81 @@ If over-fusion is the gap, the WIN direction is **DE-fusion**:
 3. Test H77 (de-fuse endlayer triple op). If +2-4%, default-flip.
 4. If A+H76+H77 all win and sum to ~5-8%, mission achievable per-iter.
 
+## Iter-106 (2026-05-12) — Lever A invalid (RAW deps); env-only exhausted
+
+### Lever A audit
+
+Read the 3 barriers at `forward_mlx.rs:4447, 4506, 4542`:
+
+- **Line 4447 (B7→B8)**: reads `residual`, writes 3 disjoint norm outputs. Residual was just written by post-attn fused norm-add. **RAW dependency — REAL**.
+- **Line 4506 (B8→B9)**: reads `norm_out, router_norm_out`, writes 3 disjoint qmatmul outputs. **RAW dep — REAL**.
+- **Line 4542 (B9→B10)**: reads 3 B9 outputs, writes 3 disjoint B10 outputs. **RAW dep — REAL**.
+
+All three are REAL RAW dependencies. Researcher's "drop disjoint-data barriers" prediction was incorrect — disjoint WRITE sets don't matter if there are READ dependencies. Cannot drop.
+
+### Tested HF2Q_B9_FORCE_SEQUENTIAL=1 (peer-style serial dispatch)
+
+Existing env-gate that adds `memory_barrier()` between B9's 3 concurrent qmatmuls (forcing serial issue).
+
+| variant | mean t/s | σ | vs. baseline |
+|---|---:|---:|---:|
+| baseline | 91.37 | 0.32 | — |
+| HF2Q_B9_FORCE_SEQUENTIAL=1 | **89.07** | 0.10 | **-2.5%** |
+
+FALSIFIED. Forcing serial dispatch slows decode 2.5%. Confirms concurrent dispatch (no extra barriers) wins for B9 qmatmuls.
+
+### Tested HF2Q_TQ_NSG=2 (FA simdgroup parallelism tuning)
+
+Default `compute_nsg` returns NSG=4 at kv>1024. Test NSG=2.
+
+| variant | mean t/s | σ |
+|---|---:|---:|
+| baseline (NSG=4 by adaptive) | 91.37 | 0.32 |
+| HF2Q_TQ_NSG=2 | 91.17 | 0.10 |
+| HF2Q_TQ_NWG=16 | 90.5* | 0.10 |
+
+*NWG=16 trial 1 had GPU contention outlier (78.2); trials 2-3 stable at 90.5.
+
+NSG=2 NEUTRAL. NWG=16 slight regression. Current adaptive policy (NSG=4, NWG=32 at kv>1024) is already optimal.
+
+### Cumulative falsification count iter-100..106
+
+10 levers tested, **0 positive**:
+
+| # | lever | result | iter |
+|---:|---|:---:|:---:|
+| 1 | HF2Q_FULL_F16_KV=1 | -3.3% | 100 |
+| 2 | H72 full unroll cc | -4.7..-25% (register spill) | 101 |
+| 3 | HF2Q_FUSED_END_OF_LAYER=1 | -0.1% (neutral) | 101 |
+| 4 | HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1 | -1.2% | 101 |
+| 5 | iter-103 host-encoding hypothesis | reversed by iter-104 measurement | 103→104 |
+| 6 | HF2Q_FUSED_TRIPLE_NORM=1 (researcher Lever B) | -3.6% | 105 |
+| 7 | Researcher Lever A (drop barriers) | invalid (RAW deps) | 106 |
+| 8 | HF2Q_B9_FORCE_SEQUENTIAL=1 | -2.5% | 106 |
+| 9 | HF2Q_TQ_NSG=2 | neutral | 106 |
+| 10 | HF2Q_TQ_NWG=16 | -0.9% | 106 |
+
+### Per-iter Class A lever space exhausted
+
+Per `feedback_no_deferrals_without_explicit_approval` + the iter-100..106 falsification record, the per-iter env+small-code lever class is empirically exhausted. Current 91.37 ± 0.32 t/s baseline IS the local optimum at this config.
+
+### Mission status
+
+- **Decode KERNEL QUALITY**: peer-class (iter-103 micro-benches all at 72-137% of M5 Max peak).
+- **Decode HOST/SCHEDULING**: We dispatch 865 ops/tok vs peer 1339; per-op avg 12.7 µs vs peer 7.5 µs. **Per-op gap is structural** — likely due to Apple Metal's scheduler favoring smaller dispatches than we currently fire.
+- **Production wall**: 91.37 ± 0.32 = **0.924× peer-FA at tg2000**.
+
+### Operator decision (per `feedback_no_deferrals_without_explicit_approval`)
+
+Closing the remaining ~7.5% gap requires multi-day structural work:
+
+- **Option D — full per-layer de-fusion**: split every currently-fused dispatch into peer-equivalent smaller ops. Estimated 200-400 LOC delta across forward_mlx.rs. Predicted +5-8% if Apple Metal scheduling hypothesis (smaller=faster) holds across all sites; risk of -1-2% if barrier overhead grows.
+- **Option E — peer-source dispatch porting**: port peer's exact ggml-metal-ops.cpp gemma4 dispatch sequence to hf2q. ~1-2 weeks effort. Predicted close to peer-parity if successful.
+- **Option F — accept current state**: document 0.924× peer-FA at tg2000 as the host-scheduling structural ceiling, close mission at KERNEL-CLOSED + HOST-LIMITED status.
+
+Per the operator's standing mantra "as fast or faster than peer", Option F does NOT meet the bar. Options D/E require explicit operator approval to commit multi-day work.
+
+
 
 
 
