@@ -633,6 +633,55 @@ Different kernels have different optimal threadgroup geometries. Per-PSO tuning 
 
 **17 levers tested iter-100..114, 0 wins.**
 
+## Iter-115 (2026-05-12) — Empirical body-decode timing: GPU is 95%, CPU encoding 5%, barrier ratio 0.49
+
+Per HF2Q_SPLIT_TIMING=1 instrumentation (forward_mlx.rs:5132-5152), got clean per-token GPU vs CPU decomposition for the layer body (30 layers, excluding lm_head):
+
+```
+[SPLIT] BODY: encode=0.45ms gpu=8.7ms dispatches=866 barriers=420  (mean of stable post-warmup tokens)
+```
+
+Per-token body composition:
+- **CPU encoding: 0.45 ms (5%)**
+- **GPU execution: 8.7 ms (95%)**
+- 866 logical kernel dispatches (matches iter-104's 865 measurement; off-by-one within noise)
+- 420 barriers
+- **barrier/dispatch ratio: 0.49**
+
+Compare to peer (iter-104 instrumentation): 1339 dispatches / 844 barriers per decode token = **barrier/dispatch ratio 0.63**.
+
+### Implications
+
+**Peer has MORE barriers per dispatch than us** (0.63 vs 0.49). Opposite of what'd be expected if barriers were our bottleneck.
+
+**GPU is 95% of decode body time**. CPU encoding (0.45 ms) is below the lever threshold for any per-iter optimization. This makes iter-110's SPLIT_CB NEUTRAL result mathematically necessary: even fully hiding 0.45 ms of CPU encoding behind GPU saves ≤4% wall — and Apple Metal already implicitly pipelines, so the captured savings are smaller.
+
+**Reinforces iter-111 + iter-112 conclusion**: the 7.6% gap is in per-call GPU kernel efficiency (peer's tuned f16-V FA kernel), not in barriers, sync, encoding overhead, or dispatch sequence.
+
+### Updated mental model
+
+| previous hypothesis | actual reality |
+|---|---|
+| Gap is in dispatch sequence | Gap is in PER-KERNEL GPU efficiency (not sequence) |
+| Gap is in barriers/sync | Peer has MORE barriers, faster anyway |
+| Gap is in CPU encoding | CPU encoding is 5% of decode; overlap can save ≤4% |
+| Gap is in kv-depth scaling | Constant 0.92× across kv ∈ [50, 2500] (iter-111) |
+| **Gap is in peer's f16-V FA kernel per-call efficiency** | **CONFIRMED via iter-112 isolation** |
+
+### Closing path remains: per-kernel Metal PSO-level work
+
+The 30 µs/layer gap (constant per iter-111) lives inside our kernels' compiled PSO efficiency vs peer's. To match peer's f16-V FA per-call cost, we need:
+1. Apple Metal Instruments / Xcode GPU profile of peer's kernel
+2. Disassemble peer's PSO via `metal-objdump` or similar
+3. Identify instruction-level differences vs our PSO
+4. Rewrite our kernel to match peer's instruction schedule
+
+Multi-week scope. NOT accessible at /loop 5m granularity.
+
+### 17 levers + iter-115 measurement confirms structural ceiling
+
+The cumulative falsification + measurement record (iter-100..115) consistently localizes the gap to a kernel-PSO-level inefficiency in our f16-V FA path. Mission stays OPEN per `feedback_no_premature_mission_close`. Closing requires multi-week deep Apple Metal toolchain work.
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
