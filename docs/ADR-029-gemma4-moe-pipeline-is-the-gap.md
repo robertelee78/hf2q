@@ -791,6 +791,63 @@ The combined record across compiler optimization (H72, H79, H81), threadgroup ge
 
 The structural ceiling holds at 91 t/s = 0.922× peer-FA at tg2000.
 
+## Iter-119 (2026-05-12) — H82v2 (remove continue + unroll) REGRESSES MORE; 20 levers, 0 wins
+
+Per iter-118 ledger re-test trigger ("V-loop refactor — remove continue, init lo[] differently"), tested H82v2: removed the `if (kv_pos >= kv_seq_len) continue;` from V-loop, relying on ss[cc]=0 (from softmax masking -INF score → exp=0) to zero invalid V contributions.
+
+Hypothesis: removing the conditional `continue` allows clean full unroll without per-iter branches. V buffer reads stay in-bounds since `kv_capacity > kv_seq_len`. Eliminates dead branch in unrolled body.
+
+### Coherence: PASS (byte-identical)
+
+Both binaries produce identical output:
+- baseline: `first_decode_token=236778; "2 plus 2 is **4**.<turn|>"`
+- H82v2:    `first_decode_token=236778; "2 plus 2 is **4**.<turn|>"`
+
+This confirms the `continue`-removal is mathematically sound (ss[cc]=0 properly zeros invalid V contributions).
+
+### Wall: WORSE than H82 with continue
+
+Alt-pair thermal-fair (3 cycles, separate binaries):
+
+| cycle | baseline | H82v2 |
+|---:|---:|---:|
+| 1 | 91.3 | 88.7 |
+| 2 | 91.4 | 88.7 |
+| 3 | 91.4 | 88.5 |
+
+Means: baseline **91.37 ± 0.06** vs H82v2 **88.63 ± 0.12** = **-3.00% REGRESSION** (worse than H82's -1.24%).
+
+### Why removing continue makes it WORSE
+
+Counter-intuitive: the `continue` was doing useful work for the compiler. With `continue`, the compiler can:
+- Speculate that the body is conditionally executed
+- Optimize register usage for the conditional path
+- Avoid scheduling V-read instructions for likely-invalid iters
+
+Without `continue` + unroll:
+- All 32 iters do V buffer reads (16 wasted reads per token at last chunk × 30 layers = 480 wasted reads/token)
+- lo[] accumulator participates in 32 unrolled additions instead of conditional fewer
+- Register pressure increases without dead-code-elimination benefit
+- Net result: more work, slower wall
+
+REVERTED. mlx-native flash_attn_vec_hybrid.metal byte-identical to HEAD.
+
+### 20 levers tested iter-100..119, 0 wins.
+
+Adding H82v2 to the ledger:
+- H82 (V-loop unroll WITH continue): -1.24%
+- H82v2 (V-loop unroll WITHOUT continue): -3.00%
+
+Both branched and unbranched unroll strategies for V-loop FAIL. The structured loop with `continue` is the optimal pattern at this scale.
+
+### Key learning
+
+The conditional `continue` is NOT just a branch — it's a DEAD-CODE-ELIMINATION hint to the Apple Metal compiler. Removing it forces the compiler to generate code for ALL iterations, even the invalid ones, which dominates over branch-elimination savings.
+
+This is a non-obvious insight that explains why both H82 variants fail: the compiler is doing more sophisticated work than just "executing the body".
+
+Structural ceiling holds at 91 t/s.
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
