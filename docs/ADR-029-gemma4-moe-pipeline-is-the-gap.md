@@ -94,13 +94,31 @@ From iter-49 (`HF2Q_PROFILE_BUCKETS=1`, post-H44+H46 HEAD, wall 1549 ms):
 
 ### Testable hypotheses for closing prefill gap (open, not yet tested)
 
-**H56 (Class A — V-layout direct-load)**: peer's `kernel_flash_attn_ext_*`
-reads V with stride directly (no transpose dispatch). hf2q's `HF2Q_NO_FA`
-path required a separate transpose dispatch (`[nkv, seq, hd] → [nkv,
-hd, seq]`) at `forward_prefill_batched.rs:235-249`. Test: add a
-V-stride variant to the FA_GL kernel that consumes V in the natural
-layout, skipping the transpose. Predicted gain: 100-200 ms at 8K
-prefill = 3-6% wall.
+**H59 (Class A — half-typed O accumulator, peer-grounded)** ★ *primary*:
+peer routes gemma4 (bf16 KV) to `kernel_flash_attn_ext_bf16_dk512_dv512`
+which instantiates with `FA_TYPES_BF` (o_t = **half**, see
+`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:6478-6485`).
+Our `flash_attn_prefill_d512.metal:898` uses
+`simdgroup_matrix<float, 8, 8> lo[NO]` (o_t = **float**). For
+DV=512, NSG=8 → NO=8, so lo[] = 8 simdgroup matrices = 512 elements
+per simdgroup. With s_t=float the register pressure is 2× peer's;
+H41 (full-unroll falsified +6.7%) is direct evidence we exceed
+register budget where peer doesn't. Test: switch `lo[]` (and the
+`so` shared-memory backing) from float to half; promote to float
+only at the final divide-by-S step. Predicted gain: 4-8% wall
+improvement at 8K based on register-pressure-relief allowing
+fuller unroll + better occupancy. Coherence: per peer's choice for
+its own bf16 path; small numeric drift vs current float-O is
+acceptable as a class-equivalence (peer's bf16 path is the ground
+truth, not float-O hf2q).
+
+**H56 (Class A — V-layout direct-load)** RETRACTED 2026-05-11 iter-75:
+read-through of our kernel `flash_attn_prefill_d512.metal:909-953`
+shows V is ALREADY read direct from device memory via
+`simdgroup_load(mv, pv + ..., NS20, 0, false)` — same idiom as peer
+`ggml-metal.metal:6266-6269`. The transpose dispatch only exists in
+the HF2Q_NO_FA (split-attn) path which is opt-out, not production.
+H56 as originally framed targets a non-existing problem.
 
 **H58 (Class A — peer FA_GL per-call instrumentation)**: instrument
 peer's `kernel_flash_attn_ext_*` at
