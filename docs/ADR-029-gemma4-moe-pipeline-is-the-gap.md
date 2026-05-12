@@ -39,6 +39,49 @@
 
 Action: keep TQ-HB V as default (verified iter-100 it's the cheaper option at this regime), and look for kernel-internal opportunities in FA_VEC_HYBRID (e.g., codebook in shared memory, vectorized dequant, NSG axis lift).
 
+## Iter-101 (2026-05-12) — Three candidate levers FALSIFIED, methodology correction
+
+Tested three candidate levers for the 7.5 t/s averaged-decode gap. All thermal-fair gen=2000 with cool-downs.
+
+### H72 (code change): full unroll cc loops in flash_attn_vec_hybrid.metal
+
+Applied `_Pragma("clang loop unroll(full)")` to the K-phase and V-phase C=32 cc loops (matching peer's `FOR_UNROLL` pattern at ggml-metal.metal:6834). Coherence preserved.
+
+Wall results: trial 1 = 86.9 t/s, trial 2 = 83.7 t/s, trial 3 = 68.3 t/s — clear regression with degradation across trials, indicative of **register spill** (mqk[32] live across all 32 unrolled iterations + lo[8] + Q/K/V loads exceeds Apple GPU per-thread register file). Apple GPU has ~32 fp32 registers/lane practical; full unroll forces spill to threadgroup memory.
+
+**FALSIFIED.** Reverted (mlx-native flash_attn_vec_hybrid.metal byte-identical to HEAD).
+
+Lesson: peer's `qk_t mqk[C/NE]` with NE-axis partitioning at NE=4 (NL=8) for some shapes keeps mqk smaller (C/NE = 8) — that smaller working set may be why peer's FOR_UNROLL doesn't spill. At our NE=1 (NL=32) configuration, unrolling 32 cc iterations IS the problem.
+
+### Two env toggles (no code change)
+
+| variant | trial 1 | trial 2 | trial 3 | mean | σ | vs. baseline |
+|---|---:|---:|---:|---:|---:|---:|
+| A. baseline (HEAD, no env) | (polluted)* | 88.6 | 88.9 | 88.75 | 0.21 | reference |
+| B. HF2Q_FUSED_END_OF_LAYER=1 | 88.5 | 88.9 | 88.5 | 88.63 | 0.23 | **-0.1% (neutral)** |
+| C. + HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1 | 87.7 | 87.5 | 87.9 | 87.70 | 0.20 | **-1.2% (slight regression)** |
+
+*A trial 1 polluted by GPU contention with peer's tg1000 trial 4 — see methodology note below.
+
+The +2.7% claim in source comments for HF2Q_FUSED_END_OF_LAYER (from iter-208 bisect) does NOT replicate at this thermal/workload regime. **Both FALSIFIED.**
+
+### Methodology note: baseline thermal drift
+
+Baseline drifted from **91.17 t/s** (iter-100 thermally-cool start) to **88.75 t/s** (iter-101 after sustained bench activity). Same code, same kernel binary. Cause: extended back-to-back peer + hf2q benchmarking left M5 Max in a sustained-warm state that 30-90s cool-downs don't fully reset.
+
+**Consequence**: peer's 98.64 ± 0.18 t/s (measured at thermally-COOL state) vs hf2q's 88.75 t/s (warm) is NOT a fair comparison.
+
+**Required for iter-102**: pair-alternating bench protocol — single hf2q trial → 90s cool → single peer trial → 90s cool → repeat. Both sides start from the SAME thermal state each cycle. Per iter-74's original methodology that this iter accidentally deviated from.
+
+### iter-102 plan
+
+1. Pair-alternating thermal-fair bench (hf2q tg2000-equivalent vs peer tg2000), 3 cycles. Settle the actual gap at matched thermal state.
+2. Per-layer phase GPU time at deep kv (kv=1500) via HF2Q_PER_LAYER_PHASE_GPU_TIME=1 — localize which layer/phase grows with kv depth differently from peer.
+3. Code-grounded peer-source read of `kernel_flash_attn_ext_vec_f16_dk256_dv256` (NE/NL split, shared memory layout, threadgroup config) vs our `flash_attn_vec_hybrid_impl<256,256>` — find structural deltas peer has that we don't.
+
+iter-101 commit + push pending; no production code change (H72 reverted).
+
+
 
 
 ## Iter-74 (2026-05-11) — Decode CLOSED, Prefill OPEN
