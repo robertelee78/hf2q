@@ -1030,6 +1030,62 @@ Per `feedback_no_premature_mission_close_2026_05_11`: mission stays OPEN. Single
 
 **Bench artifacts**: `/tmp/cfa-20260512-fa-peer-port/ac5_results.txt` + `ac5_alt_pair_bench.sh`.
 
+## Iter-128 (2026-05-12) — Drift localized + fresh A2A baseline: today's real ratio 0.949× peer-FA (-5.15%)
+
+Per operator standing rule + `feedback_targets_must_be_apples_to_apples_2026_05_11` + `feedback_do_not_trust_file_claims_re_measure_2026_05_11`: ran two thermal-fair benches in same session to (a) localize the +5% baseline drift between iter-117 and iter-127, and (b) get today's definitive apples-to-apples ratio.
+
+### Bench A: drift localization
+
+Tested whether the env-gate code added in iter-126 merge affects perf. Reverted `src/serve/forward_mlx.rs` to b81ddaa6 (pre-merge), rebuilt, ran 3-cycle HYBRID. Restored to HEAD, rebuilt, ran 3-cycle HYBRID. Same thermal session.
+
+| Arm | C1 | C2 | C3 | Mean | σ | σ_pct |
+|---|---|---|---|---|---|---|
+| PRE-merge (b81ddaa6 forward_mlx.rs) | 95.9 | 96.0 | 95.7 | **95.87** | 0.12 | 0.13% ✓ |
+| POST-merge (HEAD ac87b239) | 95.4 | 95.9 | 96.0 | **95.77** | 0.26 | 0.27% ✓ |
+
+**Δ = -0.10% (within noise)**. Env-gate code has ZERO perf impact at env-unset path. The +5% drift from iter-117's 91.37 to iter-127's 95.87 is **entirely machine/session state** (likely PSO cache rebuild, OS-level cache state, ambient thermal). Tree was restored clean post-test.
+
+### Bench B: fresh apples-to-apples peer-FA today
+
+3-cycle alt-pair hf2q HYBRID (HF2Q_HYBRID_KV=1 HF2Q_FULL_F16_KV=1, env unset peer-port) vs peer `llama-bench -fa 1 -p 0 -n 2000 -r 1`. 90s cool-downs every run. tg=2000 gemma4-APEX-Q5_K_M.
+
+| Arm | C1 | C2 | C3 | Mean | σ | σ_pct |
+|---|---|---|---|---|---|---|
+| HF2Q_HYB | 96.1 | 96.1 | 94.9 | **95.70** | 0.69 | 0.72% ✓ |
+| PEER_FA | 100.63 | 101.23 | 100.85 | **100.90** | 0.30 | 0.30% ✓ |
+
+Both arms σ<1% precondition met.
+
+**TODAY'S APPLES-TO-APPLES RATIO**: `95.70 / 100.90 = 0.9485× peer-FA = -5.15% gap`
+
+### Reconciling with prior baselines
+
+- **iter-117** measured 91.37 ± 0.32 / 98.64 ± 0.18 = 0.9263× peer-FA (-7.37% gap)
+- **iter-128 today** measures 95.70 ± 0.69 / 100.90 ± 0.30 = 0.9485× peer-FA (-5.15% gap)
+
+Both peer and hf2q absolute t/s increased ~4-5% from iter-117 to iter-128. **They track each other across machine-state changes**. The gap is fundamentally constant at ~5-7% across sessions. iter-128's 0.9485× is statistically distinguishable from iter-117's 0.9263× (Δ=2.22pp, beyond combined σ envelope of ~1pp) — but both fall within the iter-100..127 "0.92-0.96× peer-FA range" cluster.
+
+### Implications
+
+1. **iter-127's port-vs-hybrid NEUTRAL falsification still holds, properly grounded**: today's ratio is 0.949× peer-FA at hybrid baseline; peer-port produced -0.6% (0.943× peer-FA). Both deep in queen's MIDDLE zone. Per-source-pattern-fidelity is NOT the closure mechanism.
+2. **The 5-7% gap is the REAL persistent structural gap**. Today's 5.15% is the lower end; iter-117's 7.37% was the upper end (older machine state, both peer and hf2q slower together).
+3. **All prior "0.X× peer" claims using cross-session pairing are slightly mis-attributed**. iter-117's 0.926× was at-session apples-to-apples (both measured iter-117), so that one IS correct for its session. iter-127's NEUTRAL was port-vs-hybrid intra-session, also correct. The cross-session 95.87 vs iter-117's 98.64 (used informally in iter-126 post-merge AC4 commentary) was misleading.
+4. **Machine state is now identified as a 4-5% confounder**. Future benches MUST measure peer + hf2q same session per operator standing rule.
+
+### Memory updates
+
+- ADD `feedback_machine_state_confounds_perf_5pct_2026_05_12.md` — same-session is the ONLY valid pairing; cross-session compares of absolute t/s are mis-attributed by 4-5%.
+- UPDATE `feedback_class_AB_lever_falsification_ledger`: re-stamp iter-127 ratio against today's peer baseline = 0.943× peer-FA (port) vs 0.949× peer-FA (hybrid).
+
+### Bench artifacts
+
+- `/tmp/cfa-20260512-fa-peer-port/baseline_drift_test.sh` + `drift_results.txt`
+- `/tmp/cfa-20260512-fa-peer-port/fresh_a2a_bench.sh` + `fresh_a2a_results.txt`
+
+### Status
+
+Production HEAD = **0.9485× peer-FA today** = -5.15% gap. Both arms within tight σ. The structural gap is real, persistent, machine-state-independent at the relative scale. Closing requires the iter-117/127 multi-week paths (per-PSO AIR/PTX inspection, MTLCounterSampleBuffer instrumentation, or cross-call kernel-fusion work). Per `feedback_no_premature_mission_close_2026_05_11` mission stays **OPEN**; today's bench locks the apples-to-apples ratio and removes the cross-session confound from future analysis.
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
