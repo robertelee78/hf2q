@@ -180,6 +180,53 @@ If H75 confirms (splitting INCREASES wall), then peer's finer-grained pattern is
 
 Per `feedback_no_guessing` — H75 is testable; per `feedback_no_deferrals_without_explicit_approval` — confirm with operator before deeper structural changes.
 
+## Iter-105 (2026-05-12) — Researcher-identified Lever B FALSIFIED; H75 (over-fusion) PARTIALLY CONFIRMED
+
+Spawned `researcher` agent to study peer's per-layer dispatch sequence vs ours (per operator instruction "Spawn Swarm team where appropriate"). Researcher delivered 3 ranked levers:
+
+- **Lever A**: drop 3 redundant `barrier_between` at B8→B9, B9→B10, B10→B11 (`forward_mlx.rs:4447, 4506, 4542`). Predicted +0.7-1.0%.
+- **Lever B (highest)**: fuse 3 separate `s.rms_norm` at B8 (`forward_mlx.rs:4452-4480`) into one `dispatch_fused_post_attn_triple_norm_f32`. Already implemented behind `HF2Q_FUSED_TRIPLE_NORM=1`. Predicted +7-8%.
+- **Lever C**: fold scalar-add into endlayer norm-add (`forward_mlx.rs:4832, 4850`). Predicted +3-4%.
+
+### Lever B tested (HF2Q_FUSED_TRIPLE_NORM=1) — FALSIFIED
+
+| variant | trial 1 | trial 2 | trial 3 | mean | σ |
+|---|---:|---:|---:|---:|---:|
+| baseline (no env) | 91.5 | 91.6 | 91.0 | **91.37** | 0.32 |
+| HF2Q_FUSED_TRIPLE_NORM=1 | 88.1 | 88.0 | 88.2 | **88.10** | 0.10 |
+
+**-3.6% regression. OPPOSITE of researcher's +7-8% prediction.**
+
+Coherence: PASS at both. "What is 2 plus 2?" → "2 plus 2 is **4**." byte-identical.
+
+### Why Lever B falsified (analysis)
+
+Fusing 3 RMS norms into 1 dispatch:
+- SAVES: 2 dispatch boundaries (3 → 1 dispatches per layer × 30 = 60 fewer dispatches/token).
+- LOSES: per-dispatch GPU parallelism. A single fused-triple-norm thread does 3× the work of one rms_norm thread; threadgroup occupancy + shared memory reduce parallelism. Apple Metal scheduler pipelines 3 separate small dispatches MORE EFFICIENTLY than 1 monolithic fused dispatch.
+
+This **CONFIRMS H75 in the over-fusion direction**: our gap is from doing too much per dispatch, not too little. Peer's "more small dispatches" pattern wins on Apple Metal.
+
+### What this implies for Levers A, C, and beyond
+
+- **Lever C** (fold scalar-add into endlayer norm-add): adds MORE fusion → predicted regression by H75 logic. **Stop unless tested**.
+- **Lever A** (drop barriers): different lever class. Reduces SYNC overhead, doesn't fuse work. May still help.
+
+### Counter-fusion direction (new hypothesis class)
+
+If over-fusion is the gap, the WIN direction is **DE-fusion**:
+- **H76**: split `dispatch_fused_norm_add_f32` (post-attn norm + residual add) into 2 separate dispatches. Predicted +1-2%.
+- **H77**: split `dispatch_fused_post_ff_norm2_endlayer_f32` into its 3 component ops. Predicted +2-4%.
+- **H78**: REMOVE `HF2Q_FUSED_END_OF_LAYER` (de-fuse the 2 sequential fused_norm_add → 4 separate ops). Note: iter-101 measured HF2Q_FUSED_END_OF_LAYER=1 as NEUTRAL, not regression. The DEFAULT path is the unfused (4 ops) which is what we want.
+
+### Iter-106 plan
+
+1. Test Lever A (barrier removal). Cheap test, may save 0.7-1%.
+2. Test H76 (de-fuse post-attn norm + residual add). If +1-2%, default-flip.
+3. Test H77 (de-fuse endlayer triple op). If +2-4%, default-flip.
+4. If A+H76+H77 all win and sum to ~5-8%, mission achievable per-iter.
+
+
 
 
 
