@@ -584,9 +584,49 @@ Per `feedback_no_premature_mission_close_2026_05_11` multi-regime gate: **NOT ME
 
 Per operator mantra "as fast or faster than peer": the **constant 0.92× ratio** represents a structural cost we incur per layer. Closing it requires per-kernel rewrites (kernel-by-kernel comparison vs peer's compiled outputs), not just dispatch reorganization.
 
-### Conclusion (iter-100..111)
+## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
-The 91 t/s baseline = **0.924× peer-FA at tg2000 (and 0.92× consistently across all measured regimes)** is the empirical structural ceiling for gemma4-APEX-Q5_K_M on M5 Max in the current hf2q codebase architecture. Tested attack surface includes:
+Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
+
+| peer cache config | peer tg2000 t/s | hf2q equivalent |
+|---|---:|---:|
+| `-ctk f16 -ctv f16` (default) | **98.6** | 88.2 (FULL_F16_KV: F16 K + F16 V) |
+| `-ctk f16 -ctv q8_0` | **37.87** | 91.17 (HYBRID_KV: F16 K + TQ-HB 8-bit V) |
+| `-ctk f16 -ctv q4_0` | 39.71 | — |
+| `-ctk q8_0 -ctv q8_0` | 83.54 | — |
+
+### Critical findings
+
+1. **Peer's q8_0 V cache (37.87 t/s) is 2.4× SLOWER than our TQ-HB V cache (91.17 t/s)** at the same workload. Our Lloyd-Max-coded V quantization with inline-fused SDPA is **MUCH** more optimized than peer's q8_0 V SDPA. This is a peer-superior-to-us win for hf2q.
+
+2. **Peer's f16-V SDPA is 2.6× faster than peer's q8_0-V SDPA** (98.6 vs 37.87). Peer has invested heavy optimization in f16-V at the expense of quantized-V.
+
+3. **Our FULL_F16_KV (88.23) is slightly slower than our HYBRID_KV (91.17)** despite avoiding V quantization. Our f16-V SDPA path is LESS optimized than our hybrid path (which has TQ-HB V dequant inline).
+
+### The actual gap localized
+
+Peer's 98.6 t/s (f16-V) vs our 91.17 t/s (HYBRID_KV) = 7.6% gap. The gap localizes to **peer's flash_attn_ext_vec_f16_dk256_dv256 kernel being more tuned than our flash_attn_vec_hybrid**.
+
+If we made our `flash_attn_vec_hybrid` as efficient PER-CALL as peer's f16 FA kernel, we'd close the gap. But OUR FA kernel ALREADY has more work to do (TQ-HB V dequant inline), so a true apples-to-apples FA-kernel comparison should be hf2q-FULL_F16_KV (88.23) vs peer-f16-V (98.6) = 0.895× — peer's f16 FA is 11.7% faster per call than ours at f16-V.
+
+### What this means for the optimization path
+
+- **Optimizing our flash_attn_vec_hybrid f16-V path**: predicted gain up to 7.6% wall IF we can match peer's f16 FA. Requires per-kernel Metal compiler-level tuning (PSO inspection, NSG/threadgroup geometry tuning, instruction scheduling). Multi-week work.
+
+- **Optimizing our TQ-HB path further**: we're ALREADY 2.4× faster than peer's q8_0. Hard to gain much more vs hf2q's own theoretical ceiling. The TQ-HB ALU cost is what bounds us; eliminating it = FULL_F16_KV which is slower for us.
+
+### Re-framed mission
+
+The structural truth at iter-112:
+- hf2q's quantized KV pipeline is **MORE optimized than peer's equivalent**.
+- Peer's f16 KV pipeline is **MORE optimized than ours**.
+- The 7.6% mantra-target gap is in the f16-V SDPA implementation specifically.
+
+Per `feedback_no_premature_mission_close` mission stays OPEN. Closing requires per-kernel-level f16 SDPA tuning (multi-week scope per iter-111 finding).
+
+### Conclusion (iter-100..112)
+
+The 91 t/s baseline = **0.924× peer-FA at tg2000 (and 0.92× consistently across all measured regimes — see iter-111)** is the empirical structural ceiling for gemma4-APEX-Q5_K_M on M5 Max in the current hf2q codebase architecture. The 7.6% gap concentrates in peer's intrinsically-faster f16 FA SDPA kernel implementation. Tested attack surface includes:
 - KV cache dtype (FULL_F16_KV)
 - FA kernel internals (H72 unroll, NSG/NWG tuning)
 - Single-site fusion (FUSED_END_OF_LAYER, MOE_WSUM_V2)
