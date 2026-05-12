@@ -922,6 +922,41 @@ The compiler-sophistication catalog grows:
 
 The 11.7% per-call gap to peer is at compiler-VERSION-specific PSO output differences, NOT at source-level patterns the compiler can re-derive. Closure requires per-PSO instruction-level inspection + rewrite, which is multi-week.
 
+## Iter-125 (2026-05-12) — CFA team fires literal peer-kernel port; codex+queen REJECT for RULE-1 violations
+
+Operator-approved iter-107 path: literal port of llama.cpp `kernel_flash_attn_ext_vec` body (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal:6666-7115`) into mlx-native as `flash_attn_vec_peer_port_f16.metal`, instantiated for f16-V dk256/dv256 single-WG case targeting gemma4 sliding decode. Hypothesis: Apple Metal compiler PSO quality is sensitive to peer's exact source pattern; verbatim port closes 11.7% per-call gap (88.23 → 98.6 t/s, baseline 91.3 → target ≥97 t/s).
+
+CFA session `cfa-20260512-fa-peer-port` ran review-only (hardware-bound, codex-sandbox blocks Metal). Phase 1 Queen wrote `spec.json` with 5 subtasks, 13 invariants, 8 adaptation rules, 6 ACs. Phase 2a Claude-impl shipped:
+- `/opt/mlx-native/src/shaders/flash_attn_vec_peer_port_f16.metal` (~220 LOC)
+- `/opt/mlx-native/src/ops/flash_attn_vec_peer_port_f16.rs` (~230 LOC + 3 unit tests)
+- `kernel_registry.rs` + `ops/mod.rs` registration (+6 LOC)
+- `/opt/hf2q/src/serve/forward_mlx.rs` env-gate `HF2Q_FA_PEER_PORT=1` at hybrid call site (+46/-11 LOC)
+- Branches: `mlx-native@9e05df3` + `hf2q@f226ffed` on `cfa/fa-peer-port-claude`.
+
+AC1-AC4 + AC6 PASSED: build clean both repos, pipeline_registers_and_compiles ok, env unset → first token 236778 byte-identical to HEAD, env=1 → first token 236778 byte-identical (kernel arithmetic correct), no hybrid regressions. AC5 deferred (operator-bound thermal-fair alt-pair bench).
+
+Phase 2b Codex static review: **REJECT — 8 deviations, 3 critical**. Phase 3 Queen (opus, foreground) cross-checked codex's findings against spec + actual artifact: **verdict = REJECT_REDO, merge_recommendation = do_not_merge**. Five critical RULE-1 violations:
+
+| # | Line | Spec invariant | Claude-impl wrote | Required |
+|--:|--:|---|---|---|
+| 1 | L474 | invariant 9, store_lines: "DO NOT simplify ... NWG=1 makes it trivially `dst4[rid*DV4 + i]`" | `dst4[rid*DV4*1 + 1*i + 0]` | `dst4[rid*DV4*NWG + NWG*i + iwg]` with `constexpr short NWG=1, iwg=0` at file header |
+| 2 | L427 | invariant 9, notes 1: "DELETE the block entirely (not `if (NSG>1)`-gate, but physically remove)" | dead `for (short r = 1/2; r > 0; r >>= 1)` loop | physically removed (kernel goes directly to store block) |
+| 3 | L251 | notes 3: "KEEP the source structurally identical (don't manually remove the dead else branch) — the compiler removes it" | `(void)mk; (void)pk; ...` stubs, `mk` uninitialized | `deq_k_t4(pk + i/nl_k, i%nl_k, mk)` with no-op `deq_k_t4` helper at file header |
+| 4 | L351 | (mirror of L251 for V loop) | `(void)mv; (void)pv4; ...` stubs | `deq_v_t4(pv4 + i/nl_v, i%nl_v, mv)` with no-op helper |
+| 5 | L470 | store_lines verbatim | `1 == 1 ? ... : 1.0f` | `NWG == 1 ? ... : 1.0f` with NWG constexpr |
+
+Plus 3 minor literal-substitution violations at L199 (main loop init), L293 (score block predicate), L478 (S/M store guard).
+
+**Root cause of misread**: Claude-impl interpreted spec RULE-1(c) "hardcode FC flags ... by physically deleting unreachable branches" as license to literal-substitute ALL FC symbols in the live code. The spec actually requires: (a) physically delete unreachable BRANCHES (`if (FC_*_has_*)` blocks whose predicate is statically false) AND (b) preserve symbolic FC constants (NWG, NSG, NE, FC_*_has_mask, etc.) in expressions that remain live, via file-header `constexpr` declarations or `#define` macros. Two of the five critical deviations (#1 and #5) are in the protected store block which the spec called out by name with "DO NOT simplify" — direct contradiction of Claude-impl's choice.
+
+**Hypothesis-falsification-risk**: HIGH. The experiment's whole point is "compiler IS or IS NOT sensitive to peer's exact source pattern." Running AC5 on the rejected artifact yields ambiguous attribution: a perf win could be from kernel-arithmetic correctness with same-IR-anyway, or from one of the 5 deviations accidentally helping; a perf loss could be from any of the deviations or the hypothesis being wrong. RULE-8 ("falsification IS the result") requires a faithful port to test against.
+
+**Phase 4 action**: do NOT merge. Branches `cfa/fa-peer-port-claude` parked at mlx-native@9e05df3 + hf2q@f226ffed for next-iter redo. Spec.json reused unchanged (spec is fine; impl misread). Redo guidance: 10 concrete fixes in `~/.claude/teams/cfa-20260512-fa-peer-port/shared/judgment.json:redo_guidance_if_reject` — restore symbolic constants via file-header `constexpr short NWG=1, NSG=1, NE=1, iwg=0, sgitg=0;` + `#define FC_flash_attn_ext_vec_has_mask 1` etc., physically delete only the parallel-reduce block, provide no-op `deq_k_t4`/`deq_v_t4` template stubs.
+
+Per `feedback_no_premature_mission_close_2026_05_11.md`: mission stays OPEN. Per `feedback_class_AB_lever_falsification_ledger_2026_05_12.md`: this attempt is NOT entered as lever #23 because the artifact is not test-worthy. Production HEAD on main unchanged at `b81ddaa6` (decode 91.3 t/s = 0.922× peer-FA on gemma4 tg2000).
+
+**CFA workflow validation**: the multi-agent review pipeline caught a subtle spec-misread that single-agent would have missed (claude-impl's self-report said "kernel body VERBATIM from peer ... with only the 4 allowed surface adaptations" — accurate per her interpretation, wrong per spec intent). Codex's independent static review + opus queen's spec-grounded judgment combined to flag all 8 deviations with line numbers + spec citations. This is exactly the value-add of the CFA review-only mode for hardware-bound work.
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
