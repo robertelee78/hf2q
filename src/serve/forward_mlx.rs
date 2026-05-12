@@ -5001,6 +5001,44 @@ impl MlxModelWeights {
                     p.s1_dispatches[layer_idx] = total_dispatches;
                 }
 
+                // ADR-029 iter-110 — CPU-encoding/GPU-execution overlap via
+                // split CB. When HF2Q_DECODE_SPLIT_CB_AT_LAYER=N is set,
+                // commit (non-blocking) the current session at end of layer
+                // N-1 and start a new session for the remaining layers.
+                // Mirrors peer's dispatch_apply overlap pattern at
+                // /opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:550
+                // — peer encodes multi-CB in parallel during GPU execution.
+                // We achieve the same overlap WITHOUT worker threads by
+                // splitting into 2 CBs (non-blocking commit on CB1, encode
+                // CB2 while GPU runs CB1, commit_and_wait CB2 at end).
+                //
+                // GraphSession::commit() returns the CommandEncoder which
+                // we drop — Metal retains the committed CB and runs it to
+                // completion. Cross-CB buffer dependencies (residual,
+                // hidden) resolve via MTLCommandQueue's in-order execution.
+                let split_at_layer: Option<usize> = {
+                    static SPLIT_AT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+                    *SPLIT_AT.get_or_init(|| {
+                        std::env::var("HF2Q_DECODE_SPLIT_CB_AT_LAYER")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                    })
+                };
+                if let Some(n) = split_at_layer {
+                    if layer_idx + 1 == n {
+                        // End current session via commit (non-blocking).
+                        // The returned encoder drops; Metal owns the
+                        // committed CB and runs it to completion.
+                        let prev_session = std::mem::replace(
+                            &mut s,
+                            exec.begin().map_err(|e| anyhow::anyhow!("split CB begin: {e}"))?,
+                        );
+                        let _committed_enc = prev_session.commit();
+                        // GPU begins executing CB1 immediately; CPU now
+                        // proceeds to encode CB2 (layers n..num_layers + head).
+                    }
+                }
+
                 // ADR-028 iter-292: per-layer dispatch attribution.
                 if per_layer_disp_enabled {
                     let layer_disp_end = mlx_native::dispatch_count();

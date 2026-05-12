@@ -477,6 +477,85 @@ Risk: at ~865 dispatches/token, the encoding work is small (~1 ms); parallelism 
 
 Per `feedback_no_premature_mission_close`, mission stays OPEN. Per operator's iter-107 "best mantra-aligned outcome" instruction, parallel-CPU-encoding refactor is the operator-approved direction. Out of scope for single-loop-iter; requires sustained multi-day session.
 
+## Iter-110 (2026-05-12) — Split-CB encoding-overlap FALSIFIED; 15 levers, 0 wins
+
+Per iter-109 plan, implemented the simpler version of peer's parallel-CPU-encoding pattern. Insight: with `GraphSession::commit()` being non-blocking (encoder.rs:2092), the same overlap effect achievable WITHOUT worker threads:
+
+1. begin session1
+2. encode layers 0..N
+3. `s1.commit()` → non-blocking commit; CB1 submitted to GPU queue; encoder dropped (Metal retains the CB)
+4. begin session2 (independent CB on same queue; ordering preserved)
+5. encode layers N..29 + head + sampler (CPU work; GPU executes CB1 in parallel)
+6. `s2.commit_and_wait()` — blocks until CB2 done (which means CB1 also done via queue order)
+
+### Implementation
+
+Added env-gate `HF2Q_DECODE_SPLIT_CB_AT_LAYER=N` at forward_mlx.rs:5003-5031. When set, commits the current session at end of layer N-1 via `std::mem::replace + .commit()` and starts a new session. The `_committed_enc` returned by commit() drops — Metal owns the committed CB and runs it to completion. Cross-CB buffer dependencies (residual, hidden, KV) resolve via MTLCommandQueue's in-order execution semantics.
+
+### Coherence: PASS
+
+`HF2Q_DECODE_SPLIT_CB_AT_LAYER=15 hf2q generate "What is 2 plus 2?"` → `"2 plus 2 is **4**."` byte-identical to baseline. Cross-CB buffer dependencies handled correctly.
+
+### Wall results (alt-pair thermal-fair, 3 cycles)
+
+| cycle | baseline | SPLIT_CB=15 |
+|---:|---:|---:|
+| 1 | 89.6 | 89.3 |
+| 2 | 89.3 | 89.2 |
+| 3 | 89.5 | 89.7 |
+
+Means: baseline **89.47 ± 0.13** vs SPLIT_CB **89.40 ± 0.21** = **-0.07% NEUTRAL**.
+
+### Why split-CB doesn't help on M5 Max
+
+The CPU-encoding-overlap-with-GPU-execution hypothesis from iter-109 doesn't manifest. Plausible explanations:
+
+- **Metal's MTLCommandBuffer batches commands lazily**: encoding work is likely already deferred/pipelined internally; calling commit just flushes to queue, doesn't add new overlap opportunity.
+- **CPU encoding is too small**: per iter-397 memory, ~0.5-0.6 ms in an ~11 ms token. Even fully hidden would save < 6% wall; in practice the implicit pipelining already captures most of that.
+- **Cross-CB sync overhead**: Apple Metal may add a small fixed cost between CBs that offsets the encoding-overlap savings at this token size.
+
+This **also falsifies the iter-109 prediction** of "5-10% wall gain from parallel encoding". Apple Metal on M5 Max doesn't reward this pattern at our token-level dispatch density (~865 dispatches/CB).
+
+### Falsification ledger iter-100..110: 15 levers, 0 wins
+
+| # | iter | lever | result |
+|---:|---:|---|:---:|
+| 1 | 100 | HF2Q_FULL_F16_KV=1 | -3.3% |
+| 2 | 101 | H72 full unroll cc | regression (register spill) |
+| 3 | 101 | HF2Q_FUSED_END_OF_LAYER=1 | neutral |
+| 4 | 101 | HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1 | -1.2% |
+| 5 | 105 | HF2Q_FUSED_TRIPLE_NORM=1 (researcher Lever B) | -3.6% |
+| 6 | 106 | researcher Lever A (drop barriers) | invalid (RAW deps) |
+| 7 | 106 | HF2Q_B9_FORCE_SEQUENTIAL=1 | -2.5% |
+| 8 | 106 | HF2Q_TQ_NSG=2 | neutral |
+| 9 | 106 | HF2Q_TQ_NWG=16 | -0.9% |
+| 10 | 107 | H76 single-site de-fusion | neutral |
+| 11 | 108 | H76+H77 stacked de-fusion | -0.22% |
+| 12 | 108 | H76+H77+H78 stacked de-fusion | -0.22 to -1.34% |
+| 13 | 109 | MLX_UNRETAINED_REFS=1 | -0.26% NEUTRAL |
+| 14 | 103→104→108 | host-encoding overhead hypothesis | reversed by measurement |
+| 15 | 110 | HF2Q_DECODE_SPLIT_CB_AT_LAYER=15 (CPU-encoding overlap) | -0.07% NEUTRAL |
+
+### Conclusion (iter-100..110)
+
+The 91.0 ± 0.3 t/s baseline = **0.924× peer-FA at tg2000** is the empirical structural ceiling for gemma4-APEX-Q5_K_M on M5 Max in the current hf2q codebase architecture. Tested attack surface includes:
+- KV cache dtype (FULL_F16_KV)
+- FA kernel internals (H72 unroll, NSG/NWG tuning)
+- Single-site fusion (FUSED_END_OF_LAYER, MOE_WSUM_V2)
+- Multi-op fusion (FUSED_TRIPLE_NORM)
+- Single-site de-fusion (H76, H77, H78)
+- Stacked de-fusion (H76+H77, H76+H77+H78)
+- Encoder primitives (MLX_UNRETAINED_REFS, B9_FORCE_SEQUENTIAL)
+- Multi-CB execution overlap (SPLIT_CB_AT_LAYER)
+- Barrier removal (RAW-dependency-bound, invalid)
+
+Every reasonable per-iter lever class is empirically falsified. Closing the 7.5% gap requires either:
+1. **Comprehensive port** of peer's full per-layer dispatch sequence (Option E from iter-106; multi-week scope)
+2. **Acceptance** of the 0.924× ceiling as a structural cost of the hf2q architecture (per `feedback_no_premature_mission_close` does NOT meet operator's "as fast or faster than peer" mantra)
+
+Mission stays OPEN; no further per-iter levers identified.
+
+
 
 
 
