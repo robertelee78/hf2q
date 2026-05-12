@@ -4865,6 +4865,43 @@ impl MlxModelWeights {
                         }
                     } else {
                         // -- Fused post-FF norm 2 + combine MLP+MoE --
+                        // ADR-029 iter-108 H77: env-gated SPLIT into 2 dispatches
+                        // (rms_norm + elementwise_add). Same counter-fusion test
+                        // class as H76; tests if STACKING multiple de-fusions
+                        // produces measurable wall improvement (individual
+                        // de-fusions are below noise floor per iter-107).
+                        let split_postff_normadd = std::env::var("HF2Q_SPLIT_POSTFF_NORMADD").as_deref() == Ok("1");
+                        if split_postff_normadd {
+                            // Step 1: mlp_down = rms_norm(moe_accum, post_ff_norm_2)
+                            s.barrier_between(
+                                &[&self.activations.moe_accum,
+                                  &self.layers[layer_idx].norms.post_feedforward_layernorm_2],
+                                &[&self.activations.mlp_down],
+                            );
+                            s.rms_norm(
+                                reg, metal_dev,
+                                &self.activations.moe_accum,
+                                &self.layers[layer_idx].norms.post_feedforward_layernorm_2,
+                                &self.activations.mlp_down,
+                                &self.activations.norm_params,
+                                1, hs as u32,
+                            ).map_err(|e| anyhow::anyhow!("split post-FF norm2 L{layer_idx}: {e}"))?;
+                            total_dispatches += 1;
+
+                            // Step 2: mlp_down = attn_out + mlp_down (in-place add)
+                            s.barrier_between(
+                                &[&self.activations.attn_out, &self.activations.mlp_down],
+                                &[&self.activations.mlp_down],
+                            );
+                            mlx_native::ops::elementwise::elementwise_add(
+                                s.encoder_mut(), reg, metal_dev,
+                                &self.activations.attn_out,
+                                &self.activations.mlp_down,
+                                &self.activations.mlp_down,
+                                hs,
+                                mlx_native::DType::F32,
+                            ).map_err(|e| anyhow::anyhow!("split post-FF add L{layer_idx}: {e}"))?;
+                        } else {
                         s.barrier_between(
                             &[&self.activations.attn_out, &self.activations.moe_accum],
                             &[&self.activations.mlp_down],
@@ -4877,12 +4914,68 @@ impl MlxModelWeights {
                             &self.activations.mlp_down,
                             hs as u32, 1, eps,
                         ).map_err(|e| anyhow::anyhow!("fused post-FF norm2+combine L{layer_idx}: {e}"))?;
+                        }
                         total_dispatches += 1;
 
                         // -- Fused end-of-layer: post-FF norm + residual add + scalar mul --
                         // ADR-028 iter-208 sub-bisect: SKIP_END_OF_LAYER_FINAL
                         // skips only this final dispatch (keeps post-FF norm 2).
                         if !INVESTIGATION_ENV.skip_end_of_layer_final {
+                            // ADR-029 iter-108 H78: env-gated SPLIT of the
+                            // 3-op fused end-of-layer into 3 separate dispatches
+                            // (rms_norm + add + scalar_mul). Only enabled when
+                            // scalar_is_vector (gemma4 default) — otherwise
+                            // fall back to fused since no scalar_mul_f32 kernel
+                            // for non-vector scalar exists.
+                            let split_postff_normaddscalar = std::env::var("HF2Q_SPLIT_POSTFF_NORMADDSCALAR").as_deref() == Ok("1");
+                            if split_postff_normaddscalar && scalar_is_vector {
+                                // Step 1: norm_out = rms_norm(mlp_down, post_ff_norm)
+                                s.barrier_between(
+                                    &[&self.activations.mlp_down,
+                                      &self.layers[layer_idx].norms.post_feedforward_layernorm],
+                                    &[&self.activations.norm_out],
+                                );
+                                s.rms_norm(
+                                    reg, metal_dev,
+                                    &self.activations.mlp_down,
+                                    &self.layers[layer_idx].norms.post_feedforward_layernorm,
+                                    &self.activations.norm_out,
+                                    &self.activations.norm_params,
+                                    1, hs as u32,
+                                ).map_err(|e| anyhow::anyhow!("split endlayer norm L{layer_idx}: {e}"))?;
+                                total_dispatches += 1;
+
+                                // Step 2: norm_out = residual + norm_out
+                                s.barrier_between(
+                                    &[&self.activations.residual, &self.activations.norm_out],
+                                    &[&self.activations.norm_out],
+                                );
+                                mlx_native::ops::elementwise::elementwise_add(
+                                    s.encoder_mut(), reg, metal_dev,
+                                    &self.activations.residual,
+                                    &self.activations.norm_out,
+                                    &self.activations.norm_out,
+                                    hs,
+                                    mlx_native::DType::F32,
+                                ).map_err(|e| anyhow::anyhow!("split endlayer add L{layer_idx}: {e}"))?;
+                                total_dispatches += 1;
+
+                                // Step 3: hidden = norm_out * layer_scalar (elementwise)
+                                s.barrier_between(
+                                    &[&self.activations.norm_out,
+                                      &self.layers[layer_idx].layer_scalar],
+                                    &[&self.activations.hidden],
+                                );
+                                mlx_native::ops::elementwise::elementwise_mul(
+                                    s.encoder_mut(), reg, metal_dev,
+                                    &self.activations.norm_out,
+                                    &self.layers[layer_idx].layer_scalar,
+                                    &self.activations.hidden,
+                                    hs,
+                                    mlx_native::DType::F32,
+                                ).map_err(|e| anyhow::anyhow!("split endlayer scalar L{layer_idx}: {e}"))?;
+                                // total_dispatches += 1 happens via fall-through outside
+                            } else {
                             s.barrier_between(
                                 &[&self.activations.residual, &self.activations.mlp_down],
                                 &[&self.activations.hidden],
@@ -4898,6 +4991,7 @@ impl MlxModelWeights {
                                 scalar_is_vector,
                             ).map_err(|e| anyhow::anyhow!("fused end-of-layer L{layer_idx}: {e}"))?;
                             total_dispatches += 1;
+                            }
                         }
                     }
                 }

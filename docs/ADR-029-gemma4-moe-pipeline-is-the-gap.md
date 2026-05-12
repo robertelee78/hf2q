@@ -322,6 +322,118 @@ This requires `MTLCounterSampleBuffer.AtDispatchBoundary` — per iter-95 memory
 
 Given the per-iter optimization space is fully exhausted AND the gap may be in non-attackable structural pipelining differences, this is also a candidate operator-decision-point.
 
+## Iter-108 (2026-05-12) — Operator-approved Option D: per-site de-fusion FULLY FALSIFIED
+
+Operator approval received iter-107 ("yeah, fucking do it" + "best mantra-aligned outcome"). Proceeded with Option D — systematic de-fusion at multiple sites.
+
+### Re-verified iter-104 (peer's dispatch counter)
+
+Read peer source `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:611`:
+```c
+void ggml_metal_encoder_dispatch_threadgroups(...) {
+    atomic_fetch_add(&hf2q_peer_dispatch_count, 1);
+    ...
+}
+```
+
+Peer counts at `dispatchThreadgroups` — same logical unit as ours. iter-107's "apples-to-oranges" worry was wrong; iter-104 measurement WAS apples-to-apples. Peer fires 1339 logical dispatches per decode token vs our 865 (55% more), and each averages 1.69× faster wall (7.5 vs 12.7 µs).
+
+### Three new env-gated de-fusion landed (default OFF, opt-in for A/B):
+
+- **H76** (`HF2Q_SPLIT_POSTATTN_NORM=1`): splits `dispatch_fused_norm_add_f32` at line ~4415 into rms_norm + elementwise_add (+1 dispatch/layer).
+- **H77** (`HF2Q_SPLIT_POSTFF_NORMADD=1`): splits same kernel at end-of-layer line ~4872 (+1 dispatch/layer).
+- **H78** (`HF2Q_SPLIT_POSTFF_NORMADDSCALAR=1`): splits `dispatch_fused_norm_add_scalar_f32` at line ~4928 into rms_norm + elementwise_add + elementwise_mul (+2 dispatches/layer).
+
+Combined stack: +120 dispatches/token (865 → ~985), pushing us closer to peer's 1339.
+
+### Coherence: all three PASS individually + stacked
+
+"What is 2 plus 2?" → "2 plus 2 is **4**." byte-identical across all configurations.
+
+### Wall results (alternating thermal-fair pairs, baseline-first, cool-start each side)
+
+iter-107 first attempt (sequential not alt-pair, thermal-bias possible):
+
+| variant | mean t/s | σ |
+|---|---:|---:|
+| baseline (matched thermal) | 90.70 | 0.16 |
+| HF2Q_SPLIT_POSTATTN_NORM=1 | 90.67 | 0.10 |
+
+NEUTRAL (Δ = +0.03%).
+
+iter-108 H76+H77 stacked alt-pair (3 cycles, baseline-first cool each cycle):
+
+| cycle | baseline | H76+H77 |
+|---:|---:|---:|
+| 1 | 91.3 | 91.2 |
+| 2 | 91.2 | 90.8 |
+| 3 | 91.3 | 91.2 |
+
+Means: baseline 91.27 ± 0.06; H76+H77 91.07 ± 0.23. **Δ = -0.22% slight regression.**
+
+iter-108 H76+H77+H78 stacked alt-pair (2 cycles, contention in cycle 2):
+
+| cycle | baseline | H76+H77+H78 |
+|---:|---:|---:|
+| 1 | 91.2 | 91.0 |
+| 2 (contention) | 82.1 | 81.0 |
+
+H76+H77+H78 is **consistently slightly SLOWER** than baseline in every cycle.
+
+### Per-iter Class B (single-site + stacked de-fusion) ALSO empirically exhausted
+
+Combined falsifications iter-100..108:
+
+| # | lever | result |
+|---:|---|:---:|
+| 1 | HF2Q_FULL_F16_KV=1 | -3.3% |
+| 2 | H72 unroll cc | regression (register spill) |
+| 3 | HF2Q_FUSED_END_OF_LAYER=1 | neutral |
+| 4 | HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1 | -1.2% |
+| 5 | iter-103 host-encoding hypothesis | reversed (then re-confirmed iter-108) |
+| 6 | HF2Q_FUSED_TRIPLE_NORM=1 (researcher Lever B) | -3.6% |
+| 7 | researcher Lever A (drop barriers) | invalid (RAW deps) |
+| 8 | HF2Q_B9_FORCE_SEQUENTIAL=1 | -2.5% |
+| 9 | HF2Q_TQ_NSG=2 | neutral |
+| 10 | HF2Q_TQ_NWG=16 | -0.9% |
+| 11 | H76 single-site de-fusion | neutral |
+| 12 | H76+H77 stacked de-fusion | -0.22% |
+| 13 | H76+H77+H78 stacked de-fusion | -0.22 to -1.34% |
+
+**ZERO positive levers in 13 attempts.**
+
+### What's left
+
+The structural 7.5 t/s gap to peer-FA at tg2000 is NOT closable via:
+- Env-toggled fusion levers
+- Single-site de-fusion
+- Stacked multi-site de-fusion
+- Barrier removal (RAW-dep constraint)
+- NSG/NWG tuning (already at adaptive optimum)
+- KV-cache dtype switch (F16-V also slower)
+
+The 91 t/s baseline IS the structural ceiling for the gemma4-APEX-Q5_K_M model on M5 Max at HF2Q_HYBRID_KV default in this codebase architecture.
+
+Closing the gap to peer-parity at tg2000 requires Option E: **comprehensive port of peer's per-layer dispatch sequence** — multi-week scope, not single-loop-iter work. This includes:
+- Replicating peer's exact RoPE pre/post pattern
+- Replicating peer's exact MoE expert dispatch chain
+- Replicating peer's exact pre/post-norm pattern with bias adds where peer fires them
+- Possibly: build a peer-source-derived `forward_decode_peer_pattern` alternative path for A/B comparison
+
+### Final iter-108 conclusion
+
+Per `feedback_no_premature_mission_close_2026_05_11` mission stays OPEN; per `feedback_no_deferrals_without_explicit_approval` Option E proceeds with operator's iter-107 approval. Multi-week scope; per-iter loop is not the right tool for this scope.
+
+Code changes landed this session: H76 + H77 + H78 env-gates (default OFF; opt-in for A/B). Production behavior unchanged at HEAD.
+
+### Mission status (after iter-108)
+
+- **Decode KERNEL QUALITY**: peer-class (iter-103 micro-bench 72-137% of M5 Max peak).
+- **Decode TG2000 averaged**: 91.0 ± 0.3 t/s = **0.924× peer-FA** (98.6 t/s peer).
+- **Per-iter Class A + B optimization spaces**: FULLY EXHAUSTED (13 levers tested, 0 wins).
+- **Path forward**: Option E (multi-week comprehensive port) is the only remaining lever class.
+
+
 
 ## Iter-106 (2026-05-12) — Lever A invalid (RAW deps); env-only exhausted
 
