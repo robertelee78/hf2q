@@ -150,6 +150,37 @@ If the gap is host-side dispatch encoding overhead, the only realistic levers ar
 2. **Look at fused-norm opportunities**: hf2q already has fused_post_ff_norm2_endlayer + fused_norm_add_scalar. What's NOT fused that peer fuses? Read peer's per-layer dispatch sequence for gemma4 from ggml-metal-ops.cpp.
 3. **Operator decision point**: this regime gap is small (~7.6%) and structural (host-side, not kernel). Closing it requires either multi-day orchestration refactor or operator approval to accept current state. Per `feedback_no_deferrals_without_explicit_approval`, neither path proceeds without operator input.
 
+## Iter-104 (2026-05-12) — Dispatch-count hypothesis REVERSED by measurement
+
+Measured both sides:
+
+| metric | hf2q (HF2Q_PER_LAYER_DISP=1 at decode) | peer (HF2Q_PEER_COUNT_PRINT=1 at tg100) | ratio |
+|---|---:|---:|---:|
+| dispatches per decode token | **865** (725 sliding + 140 full) | **1339** (133926/100 tokens) | 0.65× |
+| barriers per decode token | (not instrumented) | 844 | — |
+| avg µs/dispatch | **12.7** (= 11ms / 865) | **7.5** (= 10ms / 1339) | 1.69× |
+
+**REVERSED**: peer has MORE dispatches (1.55×), but each averages 1.7× LESS time. We have FEWER dispatches but each one is slower on average.
+
+iter-103's "host-encoding overhead from extra dispatches" hypothesis is FALSIFIED. Reality is the OPPOSITE — peer dispatches more frequently but each kernel finishes faster.
+
+### What this means for the lever class
+
+- iter-103's micro-benches showed our hot kernels (FA, mat-vec, MoE) are AT-OR-ABOVE peer bandwidth. Those individual kernels are NOT the gap class.
+- iter-104 dispatch count shows peer has 474 MORE dispatches/token than us → peer **does finer-grained work** per dispatch (rmsnorms unfused, RoPE separate, etc.).
+- Our SLOWER per-dispatch average suggests our 30+ NON-MAT-VEC dispatches per layer (rmsnorms, residuals, RoPE, KV-write, barrier-bounded ops) are individually slower than peer's equivalents.
+
+### Iter-105 plan
+
+1. **Per-pipeline GPU time** for OUR side. Without per-dispatch GPU times (H67 Apple-hardware-blocked), use the existing HF2Q_PER_LAYER_PHASE_GPU_TIME=1 to get phase-level GPU times. Localize: are our NORM/RESIDUAL/ROPE/V-ENCODE dispatches slower per-call than peer's equivalents?
+2. **Read peer's per-layer dispatch sequence for gemma4** at ggml-metal-ops.cpp. Count which kernels peer fires per layer. Compare to our 29 dispatches/sliding-layer composition.
+3. **Test hypothesis H75**: peer fires more SMALLER ops (e.g., separate rmsnorm + residual instead of our fused) because Apple Metal's scheduler overlaps small ops better. Test: split our `dispatch_fused_post_ff_norm2_endlayer_f32` into 2 separate dispatches; bench wall.
+
+If H75 confirms (splitting INCREASES wall), then peer's finer-grained pattern is also slower per-call but they have other compensations. If H75 falsifies (splitting DECREASES wall), then we've been over-fusing.
+
+Per `feedback_no_guessing` — H75 is testable; per `feedback_no_deferrals_without_explicit_approval` — confirm with operator before deeper structural changes.
+
+
 
 
 
