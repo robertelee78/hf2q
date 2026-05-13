@@ -1438,6 +1438,71 @@ Mission stays OPEN — the 5.7-6.3% structural gap remains. But the NWG-parallel
 
 `/tmp/cfa-20260512-fa-peer-port/nwg32_vs_peer_bench.sh` + `nwg32_vs_peer_results.txt`
 
+## Iter-140 (2026-05-12) — Multi-regime gate MET: PORT_NWG32 WINS at tg100/tg2000/tg5000
+
+Completed the 3-regime gate per `feedback_no_premature_mission_close_2026_05_11`.
+Added tg100 to iter-138/139's tg2000+tg5000 data with same protocol.
+
+### Full 3-regime PORT_NWG32 vs HYBRID
+
+| Regime | PORT_NWG32 mean | σ_pct | HYBRID mean | σ_pct | Ratio | Δ pp |
+|---|---|---|---|---|---|---|
+| tg100  | 100.03 (100.4, 100.2, 99.5) | 0.46% ✓ | 97.00 (97.2, 96.5, 97.3) | 0.45% ✓ | **1.031×** | +3.12% |
+| tg2000 | 95.07 (94.2, 95.4, 95.6) | 0.80% ✓ | 93.40 (93.3, 93.5, 93.4) | 0.11% ✓ | **1.018×** | +1.79% |
+| tg5000 | 91.80 (91.6, 92.0, 91.8) | 0.22% ✓ | 89.80 (89.7, 90.2, 89.5) | 0.40% ✓ | **1.022×** | +2.23% |
+
+**Multi-regime gate MET**: 3/3 regimes WIN PORT_NWG32 vs HYBRID, σ<1% all 6 arms.
+
+### Pattern: win is largest at short context
+
+At tg100 the +3.1pp gain is ~1.5× the tg2000/tg5000 gains. Mechanism hypothesis:
+the reduce-kernel call has a fixed-overhead component (dispatch + barrier);
+amortized across more decode tokens (longer regime) the FIXED win shows up but
+the per-token kernel-quality advantage may be partially offset by the additional
+reduce dispatch overhead at deep kv. At tg100 the kernel-quality advantage
+dominates because each kv chunk has more headroom.
+
+### Implied PORT_NWG32 vs peer-FA at tg100
+
+Today's PEER_FA tg100 wasn't measured this session; using iter-128/129 same-machine
+session ratio (HYBRID/PEER at tg100 ≈ 0.935×):
+- Today's HYBRID tg100 = 97.00
+- Implied PEER tg100 ≈ 97.00 / 0.935 = 103.7 (slightly higher than iter-129's 100.99 — session drift)
+- PORT_NWG32/PEER tg100 ≈ 100.03 / 103.7 ≈ 0.965× peer-FA
+
+Alternative direct compare (cross-session): PORT_NWG32 tg100 = 100.03 vs iter-129's
+PEER tg100 = 100.99 → ratio 0.9905× — near parity. But cross-session, so subject to
+the 4-5% machine-state confound (`feedback_machine_state_confounds_perf_5pct`).
+A same-session PORT_NWG32 vs peer-FA at tg100 would lock this down (iter-141 candidate).
+
+### Updated production ratios (PORT_NWG32 opt-in, all regimes)
+
+| Regime | PORT_NWG32/PEER (today's direct measurement or extrapolation) |
+|---|---|
+| tg100  | ~0.965× peer-FA (extrapolated; needs direct A2A) |
+| tg2000 | 0.943× peer-FA (direct, iter-139) |
+| tg5000 | 0.937× peer-FA (direct, iter-139) |
+
+All three above the operator's standing-context band "0.86-0.92× peer-FA (H27 marginal at long ctx)".
+
+### Mission state
+
+Mission stays OPEN. Multi-regime gate MET. The +1.8-3.1pp closure to HYBRID is
+significant and consistent. The remaining 3.5-6.3% structural gap to peer-FA is
+the compiler-PSO-version-specific delta per iter-117 hypothesis.
+
+### Next candidates
+
+- **iter-141**: same-session PORT_NWG32 vs peer-FA at tg100 to lock the ~0.965×
+  extrapolation with direct measurement.
+- **iter-142**: operator-decision-gated default-flip of `HF2Q_FA_PEER_PORT_NWG32=1`
+  ON for gemma4 f16-V regime.
+- **iter-143+**: MTLCounterSampleBuffer instrumentation to attribute remaining gap.
+
+### Bench artifacts
+
+`/tmp/cfa-20260512-fa-peer-port/nwg32_tg100_bench.sh` + `nwg32_tg100_results.txt`
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
