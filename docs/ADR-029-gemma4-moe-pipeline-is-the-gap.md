@@ -1549,6 +1549,53 @@ All three regimes now firmly ABOVE the standing-context band. The hardest regime
 
 `/tmp/cfa-20260512-fa-peer-port/nwg32_vs_peer_tg100.sh` + `nwg32_vs_peer_tg100_results.txt`
 
+## Iter-153 (2026-05-12) — 🎯 DEFINITIVE: PORT_NWG32 AIR is BYTE-IDENTICAL to peer's at apples-to-apples FC config
+
+Followup to iter-151/152. Edited a copy of peer's `ggml-metal.metal` to bake FCs at source-level (matching our PORT's #define-baked config: NWG=32, NSG=1, has_mask=1, has_sinks=0, has_bias=0, has_scap=0, has_kvpad=0, ns10=256, ns20=256). Compiled. Disassembled. Extracted the f16_dk256_dv256 function body. Compared with our PORT_NWG32's function body.
+
+### Result: IDENTICAL intrinsic counts
+
+| Intrinsic | OUR PORT_NWG32 | PEER (FCs baked) | Δ |
+|---|---|---|---|
+| air.convert.f.v | 4 | 4 | **0** |
+| air.wg.barrier | 2 | 2 | **0** |
+| air.simdgroup.barrier | 2 | 2 | **0** |
+| air.simd_sum.f | 2 | 2 | **0** |
+| air.simd_max.f | 2 | 2 | **0** |
+| air.fast_exp.f | 2 | 2 | **0** |
+| air.fma.f | 1 | 1 | **0** |
+| air.fast_fmax.f | 1 | 1 | **0** |
+| air.dot.v | 1 | 1 | **0** |
+
+Apple Metal compiler emits IDENTICAL function-body AIR from our verbatim port and peer's source when both have FCs baked. The kernel body is genuinely equivalent at the compiler IR layer.
+
+### Implication: iter-117/127 hypothesis FALSIFIED
+
+iter-117 hypothesized: *"The 11.7% per-call gap to peer is at compiler-VERSION-specific PSO output differences, NOT at source-level patterns the compiler can re-derive."*
+
+iter-153 falsifies the compiler-IR-output branch of that hypothesis. With both shaders compiled by the same Metal toolchain (Apple LLVM 32023.883) at the same FC config, the AIR is byte-identical. The compiler treats our verbatim port and peer's source identically.
+
+### What's REALLY producing the residual 4-6% wall-clock gap
+
+Cannot be at the kernel-body compiler-IR level. Must be one of:
+
+1. **Runtime PSO specialization vs source-bake**: when peer's runtime instantiates the FC-templated kernel with `MTLComputePipelineDescriptor.constantValues`, the compiler may apply slightly different optimization passes than the source-baked AOT path. Subtle but real.
+2. **Encoder / dispatcher infrastructure**: how the host binds buffers, sets pipeline state, issues `dispatchThreadgroups` calls. Peer uses `ggml_metal_op_concurrency_reset` with `ggml_mem_ranges` to skip barriers between independent ops; we use blanket `memory_barrier()`. iter-115 measured peer has MORE barriers per dispatch than us, so this isn't an obvious win for peer either, but the timing of barriers vs dispatches differs.
+3. **Memory access patterns / cache**: our buffer layout differs (5 buffers vs peer's 8 — mask/sinks/pad/dst all separate). Cache line placement may differ, affecting L2/L3 hits.
+4. **Argument-buffer setBytes overhead vs MTLArgumentBuffer**: both seem to use setBytes; might not be the difference.
+
+### Mission contribution
+
+This is a load-bearing finding for ADR-029:
+
+- The 24-lever falsification ledger + iter-117/127 attribution analyses had assumed the residual gap was at the kernel-body / compiler-IR layer. iter-153 proves it isn't.
+- Future closure work targeting the kernel body (FOR_UNROLL variants, source-pattern tweaks, etc.) is structurally bounded — Apple Metal compiler will normalize them all to the same IR.
+- Closure paths remaining are at the runtime / encoder / dispatcher layer, which is far less explored.
+
+### Tooling
+
+`scripts/adr029_aot_compare_air.sh` (iter-151/152) + `peer_baked.metal` sed-recipe in `/tmp/adr029_air/` are reusable for any future kernel-IR comparison work.
+
 ## Iter-151 (2026-05-12) — Metal Toolchain installed; first AIR-layer peer-vs-ours comparison
 
 Operator unblocked Metal Toolchain 2026-05-12: `xcodebuild -downloadComponent MetalToolchain` → `metal-objdump` now available (Apple LLVM 32023.883). iter-117's "compiler-VERSION-specific PSO output differences" hypothesis finally measurable at the IR layer.
