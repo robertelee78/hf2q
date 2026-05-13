@@ -2895,3 +2895,29 @@ The residual 5.7-6.3% gap (apples-to-apples F16 V: PORT_NWG32 0.949× peer-FA) m
 
 **Decision**: branch retained for ledger reference; NOT merged to main (neutral delta + per-pair noise = no shipping value). Ledger updated to lever #26.
 
+## Iter-158 (2026-05-13) — Fresh canonical ground-truth re-measure at HEAD
+
+**Why**: standing rule `feedback_do_not_trust_file_claims_re_measure_2026_05_11` — performance claims in memory/ADR MUST be re-measured fresh before being acted upon. iter-156 documented 0.934× peer-FA; iter-158 verifies at fresh thermal state in the same session as iter-157 H87 bench.
+
+**Method**: 5-cycle alt-pair hf2q-main vs peer-FA, 90s cool-downs both sides, both with `--ignore-eos` / `-n 2000 -r 1` equivalents (`feedback_always_ignore_eos_for_benchmarks_2026_05_12`), gemma4-ara-2pass-APEX-Q5_K_M.gguf, M5 Max.
+
+**Builds**: hf2q HEAD `dacdaa54` (post-iter-157 doc cherry-pick to main), mlx-native HEAD `5050b0b`. Binary md5 `0f913fdc858156959f3b217a88343bf9`. No H87 shader; default config (HYBRID_KV with TQ-HB V active).
+
+| cycle | hf2q t/s | peer-FA t/s | ratio |
+|---:|---:|---:|---:|
+| 1 | 92.5 | 99.11 | 0.933 |
+| 2 | 92.7 | 99.11 | 0.935 |
+| 3 | 92.4 | 99.05 | 0.933 |
+| 4 | 92.7 | 99.46 | 0.932 |
+| 5 | 92.7 | 99.09 | 0.935 |
+| **mean** | **92.60 ± 0.126 (σ 0.14%)** | **99.164 ± 0.150 (σ 0.15%)** | **0.934×** |
+
+**Verdict**: iter-156 reframe confirmed at fresh-session thermal state. Production HEAD remains at 0.934× peer-FA in default config (TQ-HB V active). This is the **canonical baseline** for any subsequent /loop iteration claiming "we improved decode."
+
+**Mission direction**: per iter-156, the residual 6.6% gap is structurally attributable to TQ-HB V dequant work (5 ops/V-element peer doesn't pay; see `feedback_decode_gap_is_TQ_dequant_not_kernel_quality_2026_05_12`). Three available framings:
+- **Match peer F16 with TQ-active**: structurally impossible (TQ adds work peer doesn't pay)
+- **Match peer F16 with TQ-off**: already 0.949× via PORT_NWG32 at F16-V regime (iter-128/139)
+- **Best for TQ users**: already 2.4× FASTER than peer's TQ-equivalent (`-ctv q8_0`, iter-112)
+
+26-lever falsification ledger holds (1 win: PORT_NWG32 in F16-V regime, where it is the production default; 25 falsifications spanning K-side, V-side, softmax, fusion, NWG/NSG policy, kernel-port-fidelity, FWHT-prelude DCE). All measurable single-kernel levers exhausted; closure of the residual TQ-vs-F16 gap requires reducing TQ-decode op count (multi-day kernel work) or operator regime-goal clarification.
+
