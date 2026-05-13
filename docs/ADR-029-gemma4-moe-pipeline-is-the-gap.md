@@ -1580,9 +1580,11 @@ The remaining 4-6% therefore lives in:
 ### Implications
 
 **Closure requires multi-day to multi-week unattacked paths**:
-1. **MTLCounterSampleBuffer instrumentation** (peer ggml-metal-context.m doesn't use this; we'd build it from scratch via Apple's `MTLDevice.makeCounterSet` API). Attributes the 4-6% to specific GPU pipeline stalls — measurement, not directly a fix, but informs WHERE to look.
-2. **Per-PSO AIR/PTX inspection** (operator-bound on `xcodebuild -downloadComponent MetalToolchain`; `metal-objdump` not currently installed). Would let us compare peer's PSO IR vs ours and find specific instruction differences.
-3. **Compile flag matching by peer-toolchain-version emulation** — extreme; identify exactly which Apple Metal compiler version peer's binary was built with and bisect.
+1. **MTLCounterSampleBuffer instrumentation** — ❌ **FUNDAMENTALLY BLOCKED on Apple Silicon** (iter-143). MTLCounterSampleBuffer infra already exists in mlx-native/encoder.rs (lines 489-1730) gated by `MLX_PROFILE_DISPATCH=1`, but running it on Apple M5 Max produces: *"MLX_PROFILE_DISPATCH=1 ignored: device 'Apple M5 Max' does NOT support MTLCounterSamplingPointAtDispatchBoundary (Apple Silicon limitation; only AtStageBoundary is supported, which is incompatible with the persistent compute-encoder pattern)."* Apple Silicon does NOT expose per-dispatch timestamp sampling at the hardware level. The per-CB granularity via `MLX_PROFILE_CB=1` works but cannot attribute per-kernel.
+2. **Per-PSO AIR/PTX inspection** (operator-bound on `xcodebuild -downloadComponent MetalToolchain`; `metal-objdump` not currently installed). Would let us compare peer's PSO IR vs ours and find specific instruction differences. **The only programmatic path remaining**.
+3. **Per-CB timing via `MLX_PROFILE_CB=1`** — works on Apple Silicon. Provides command-buffer-level GPU timing. Coarser than per-dispatch but could bound which CB the gap lives in (decode encodes ~7 CBs per token on the hybrid path).
+4. **xctrace / Instruments GUI profiler** — Apple's developer-tool path; manual not CLI-automatable. Could provide per-kernel timing via "Metal System Trace" template. Requires operator hands-on session.
+5. **Compile flag matching by peer-toolchain-version emulation** — extreme; identify exactly which Apple Metal compiler version peer's binary was built with and bisect.
 
 ### Mission state
 
