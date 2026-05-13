@@ -3017,3 +3017,33 @@ Per `project_adr028_iter308_q6k_smoking_gun_2026_05_10`, q5_K/q6_K matvec is the
 
 **Companion peer commits to investigate**: only `da4495332` since iter-138 baseline. No FA-vec changes upstream. Confirms iter-156 reframe holds for FA but suggests matvec is the actually-reachable optimization surface for the residual decode gap.
 
+## Iter-162 (2026-05-13) — H93 WIN: matvec FC-promotion closes +1.08pp at tg2000
+
+**Implementation** (`adr-029-iter162-h93-matvec-fc-promotion` branch):
+
+1. **Shader** (`quantized_matmul_ggml.metal`): 3 new function constants at FC slots 700/701/702 (`FC_qmatmul_ne12`, `FC_qmatmul_r2`, `FC_qmatmul_r3`) + helper macros `QMM_NE12(p) / QMM_R2(p) / QMM_R3(p)` that fall back to runtime `p.ne12 / p.r2 / p.r3` if FC unset. Replaced all 31 sites of `p.ne12 / p.r2 / p.r3` in kernel bodies with the macros (sed-mechanical).
+2. **Dispatcher** (`quantized_matmul_ggml.rs`): all 5 `get_pipeline(...)` calls converted to `get_pipeline_with_constants(..., &[], &[(700, 1), (701, 1), (702, 1)])`. Hardcoded =1 matches current mlx-native usage (always single-batch matmul). PSO cache key includes FC values for correctness across future non-1 callers.
+
+**Coherence** ✓: `What is 2 plus 2?` → "2 plus 2 is **4**." identical to baseline.
+
+**Bench** (4-pair alt-pair, 90s cooldowns, gemma4-APEX-Q5_K_M tg2000, --ignore-eos):
+
+| pair | main t/s | h93 t/s | Δ |
+|---:|---:|---:|---:|
+| 1 | 92.6 | 93.6 | +1.08% |
+| 2 | 92.6 | 93.7 | +1.19% |
+| 3 | 92.6 | 93.6 | +1.08% |
+| 4 | 92.7 | 93.6 | +0.97% |
+| **mean** | **92.625 ± 0.043 (σ 0.05%)** | **93.625 ± 0.043 (σ 0.05%)** | **+1.08%** |
+
+**Verdict**: WIN. All 4 cycles same positive direction, σ < 0.1% both arms (well within `feedback_metal_bench_protocol` σ_pct < 1% precondition). Lever #27 in the falsification ledger; **second WIN after PORT_NWG32 (iter-138)**.
+
+**vs peer-FA (iter-158 baseline 99.164 t/s)**:
+- main (baseline): 92.625 / 99.164 = 0.9340×
+- h93: 93.625 / 99.164 = **0.9442×**
+- **+1.0pp closure of the decode gap**
+
+**Why it works**: With FCs 700=701=702=1 baked at PSO time, the compiler folds `im % 1 → 0` and `(i12 / 1) → i12` across all matvec/matmul kernels. Saves ~3 integer divisions per thread per dispatch (each ~10-15 cycles on Apple Silicon). With ~210 matvec dispatches/decode-token and 32 threads/SG, the cumulative cycle savings hit the wall-clock at +1.08%.
+
+Multi-regime gate in flight (tg100 + tg5000 × 3) to verify the win holds across regimes per `feedback_no_premature_mission_close`. If multi-regime confirms, merge to main.
+
