@@ -3190,3 +3190,23 @@ The 0.7 ms/token wall gap matches the observed 6% peer-FA gap.
 
 **Decision for current scope**: H93 captured the practical kernel-side closure. Further closure requires the multi-day overlap refactor. Multi-regime gate is MET at the current HEAD per `feedback_no_premature_mission_close_2026_05_11`.
 
+## Iter-167 (2026-05-13) — Multi-split CB FALSIFIED — encoder-overlap path is structurally not a lever in current impl
+
+**Hypothesis**: iter-110 tested HF2Q_DECODE_SPLIT_CB_AT_LAYER=15 (1 split) and found NEUTRAL. The forward_mlx.rs:5188-5194 comment claims commit-then-continue-encoding gives implicit async GPU overlap. iter-167 tests FINE-GRAINED multi-split (5 splits at layers 5/10/15/20/25) — predicting that more frequent commits give finer encoder/GPU hide amortization.
+
+**Bench** (3-pair alt-pair, gemma4-APEX-Q5_K_M tg2000, 90s cool-downs):
+
+| pair | main t/s | msplit t/s | Δ |
+|---:|---:|---:|---:|
+| 1 | 93.0 | 93.1 | +0.11% |
+| 2 | 90.8 | 90.2 | -0.66% |
+| 3 | 90.1 | 90.1 | 0.00% |
+
+σ exceeded 1% on both arms (thermal drift cross-pairs); per-pair direction split (+/-/0) shows no consistent signal. Net mean delta ≈ -0.19%.
+
+**Verdict**: NEUTRAL. Lever #29 falsified.
+
+**What this confirms**: iter-110's NEUTRAL result wasn't a granularity issue. The async commit "implicit overlap" claim at forward_mlx.rs:5188-5194 does NOT deliver measurable wall savings regardless of split count. The Metal driver likely doesn't start GPU execution until the encoder is fully finalized + committed, even though the API allows async commit.
+
+**Implication for the multi-day overlap refactor**: the structural pattern peer uses (`n_cb=2` `dispatch_apply` on a Concurrent queue) requires actually-parallel ENCODING on different threads, not just multi-CB commits on the same thread. The hf2q `EncoderWorker` infrastructure exists for this but `forward_decode` doesn't use it (encode_one_layer stub at forward_mlx.rs:2606). Multi-day refactor remains the only path; multi-split CB without parallel encoding is confirmed insufficient.
+
