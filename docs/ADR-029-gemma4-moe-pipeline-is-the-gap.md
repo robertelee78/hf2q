@@ -3268,3 +3268,39 @@ For full overlap (encode-N hidden behind GPU-N-1): potentially 0.46 ms saved = ~
 
 **Decision**: this is the next concrete work item per the operator's "continue until complete" mandate. Will start incrementally — first iter: extract `encode_one_layer` stub into a working method that forward_decode CAN call (still serial); subsequent iters: switch forward_decode to use it; final iter: wire EncoderWorker. Each iter ships measurable progress per `feedback_loop_iteration_cadence_180s`.
 
+## Iter-169 (2026-05-13) — Per-token CPU overhead is the BIGGER lever, not encoder
+
+**Goal**: validate the iter-168 plan with actual per-token timing breakdown.
+
+**Measurement** (HF2Q_SPLIT_TIMING=1 at HEAD post-H93):
+
+- BODY encode: 0.58 ms (CPU)
+- BODY GPU: 8.78 ms
+- **BODY total: 9.36 ms**
+- Token wall (1/93.65 t/s): 10.68 ms
+- **Inter-token overhead: 1.32 ms** (head + sample/EOS/yield not in BODY split)
+
+**Comparison with peer**:
+
+| metric | hf2q | peer (est) | delta |
+|---|---:|---:|---:|
+| Body GPU | 8.78 ms | 10.04 ms | hf2q 1.26ms LESS |
+| Body encode | 0.58 ms | (parallel-hidden) | hf2q 0.58 visible |
+| Inter-token overhead | 1.32 ms | ~0.06 ms | **hf2q 1.26 MORE** |
+| **Token wall** | **10.68 ms** | **10.10 ms** | hf2q 0.58 ms slower |
+
+**Key insight**: the 5.4% wall gap = +0.58 ms/token, of which:
+- ~0.58 ms is encode-visible (parallel-encode max gain: ~0.30 ms saved = 2.7%)
+- ~1.26 ms is inter-token CPU overhead (head + sample + EOS + yield)
+- ~1.26 ms less GPU work (hf2q WINS here due to H93 + fewer dispatches)
+
+The encoder-visibility 0.58 ms is what parallel-encode CAN close. But the **bigger absolute overhead is the 1.26 ms inter-token CPU work** — head decoding + softmax + argmax + EOS check + yield + sample.
+
+**ROI re-analysis** of next-step options:
+1. **Parallel-encode refactor** (430-630 LOC): closes max ~0.30 ms (3%). Multi-iter. Falsification risk.
+2. **Inter-token overhead reduction** (target 1.26 ms): could close more if optimizable. Each ms saved = ~9% wall. Lower-risk.
+
+**Next direction**: investigate the inter-token CPU path. What's the head + sample work that takes 1.32 ms? Code locations: forward_mlx.rs:5407+ (post-body work), serve EOS/yield path.
+
+Per the operator's "continue until complete" mandate, the next iter should profile and optimize this 1.26 ms inter-token overhead, NOT immediately commit to the parallel-encode refactor.
+
