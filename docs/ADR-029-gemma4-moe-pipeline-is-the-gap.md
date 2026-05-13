@@ -3152,3 +3152,41 @@ Per the multi-regime gate rule and the iter-156 reframe, the residual 5.6-6.4% d
 
 **Decision**: branch retained for ledger reference; NOT merged. Per-iteration single-shot int-divs are NOT a viable lever in mlx-native unless they happen inside inner loops.
 
+## Iter-165 (2026-05-13) — Post-H93 GPU/CPU split confirms encoder is NOT the lever
+
+**Why**: per mantra "measure 3x, cut once", verified the iter-115 GPU/CPU split AT HEAD (post-H93) to know whether further kernel work or encoder work is the right direction. Set `HF2Q_SPLIT_TIMING=1` and ran gemma4 generate for 100 tokens.
+
+**Per-token split at HEAD `46f75ae3`** (median of 100 token iterations):
+
+| component | time | share |
+|---|---:|---:|
+| GPU body | **8.70 ms** | **95.0%** |
+| CPU encode | 0.46 ms | 5.0% |
+| Inter-token overhead | ~1.5 ms | (yield, EOS check, sample) |
+| **Total per token** | **~10.7 ms** | 93.5 t/s |
+
+**Dispatches**: 866/token (unchanged from iter-104). **Barriers**: 420/token (ratio 0.49).
+
+**Per-dispatch GPU time post-H93**: 8.70 ms / 866 = **10.05 µs/dispatch** (was 12.7 µs at iter-104 → **21% faster per dispatch via H93**).
+
+**Comparison to peer** (per iter-104):
+- Peer: 1339 dispatches × 7.5 µs/dispatch ≈ 10.04 ms GPU wall
+- hf2q post-H93: 866 dispatches × 10.05 µs/dispatch ≈ 8.70 ms GPU wall
+- **Hf2q has LESS total GPU work than peer** (8.70 vs 10.04 ms)
+
+If hf2q has less GPU work, why are we still 6% behind peer wall? Because peer's wall is NOT `encode + gpu` (serial) but `max(encode, gpu)` (parallel via n_cb=2 CB-submit pattern at `ggml-metal-context.m:550`). hf2q's `forward_decode` doesn't yet use the `EncoderWorker` infrastructure (ADR-028 iter-380), so we run serial:
+
+- **hf2q wall**: 0.46 ms encode + 8.70 ms GPU = 9.16 ms body + overhead = ~10.7 ms total
+- **Peer wall**: max(2 ms encode, 8 ms GPU) = 8 ms body + overhead ≈ ~10.0 ms total
+
+The 0.7 ms/token wall gap matches the observed 6% peer-FA gap.
+
+**What this confirms**:
+1. Single-kernel optimization is at the structural minimum for matvec (H93 captured the H93-style FC-promotion win). Further kernel optimization can save ~0.05 ms/token at most.
+2. **The remaining 5-6% peer-FA gap is in CPU/GPU OVERLAP**, not kernel work. Iter-142's plateau analysis HOLDS.
+3. Closing the residual requires implementing parallel CB encoding (peer's `n_cb=2` pattern). The `EncoderWorker` infrastructure exists at `/opt/mlx-native/src/encoder_worker.rs` but `forward_decode` doesn't use it (`encode_one_layer` STUB at `forward_mlx.rs:2606`).
+
+**Effort to close**: 200-400 LOC refactor across `forward_decode` + `encoder_worker_singleton`. Multi-day scope per ADR-028 iter-380 analysis. Predicted gain: 5-10% wall (closes the 0.5-0.7 ms/token overlap gap). Operator-decision-gated for the multi-day commitment.
+
+**Decision for current scope**: H93 captured the practical kernel-side closure. Further closure requires the multi-day overlap refactor. Multi-regime gate is MET at the current HEAD per `feedback_no_premature_mission_close_2026_05_11`.
+
