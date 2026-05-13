@@ -3075,3 +3075,48 @@ All 3 regimes positive, all σ < 0.3% (≪ 1% protocol precondition). Per-cycle 
 
 **27-lever falsification ledger status**: 2 wins (PORT_NWG32 iter-138, H93 iter-162), 25 falsifications. H93 is the FIRST decode WIN in the default-config TQ-active production path (PORT_NWG32 only helps F16-V regime).
 
+## Iter-163 (2026-05-13) — Peer-port search exhausted (researcher H94/H95/H96 all FALSIFIED or already applied)
+
+After iter-162 H93 ship, ran a researcher agent (deep-research-style) tasked with finding more peer-port opportunities like H93 by scanning llama.cpp commits since 2026-02-01. Researcher returned 3 candidates:
+
+**H94 (researcher #1): Q5_K mul_mv `N_R0: 2 → 1` per peer commit `b54124110` (2026-03-11)**
+
+Researcher claimed mlx-native still has N_R0=2 for Q5_K mat-vec, leaving a register-spill penalty on Apple GPUs. Verification:
+
+- Peer ggml-metal-impl.h:54 — `#define N_R0_Q5_K 1` (post-fix)
+- mlx-native `kernel_mul_mv_q5_K_f32` at `quantized_matmul_ggml.metal:955` — `const int row = 2 * (int)r0 + (int)sgitg;`
+- Decode: `r0 = TG_x`, `sgitg ∈ {0, 1}`, so 1 row per simdgroup × 2 simdgroups = 2 rows/TG. This matches peer's CURRENT (post-fix) state, not the pre-fix state.
+
+**Verdict**: H94 invalid — mlx-native ALREADY at peer's fixed state. Not a new lever. Falsified before implementing.
+
+**H95 (researcher #2): `flash_attn_ext_blk` mask-prepass for FA-vec decode**
+
+Peer's `kernel_flash_attn_ext_blk` scans the KV mask once before main FA-vec, classifying each block as `{0=masked, 1=mixed, 2=all-zero}`. Main kernel skips block load for `0` or just the mask-add for `2`.
+
+mlx-native already has `flash_attn_prefill_blk.metal` for prefill but no FA-VEC variant. Implementing requires:
+- New prepass kernel `flash_attn_vec_blk_prepass.metal` (~80-120 LOC)
+- Plumb prepass dispatch + buffer into PORT_NWG32 main loop
+- Multi-regime gate
+
+Estimated speedup: only material at sliding-window sparse masks (gemma4 sliding layers). Per iter-159, tg5000 gap is 5.7% — partial close possible if mask sparsity dominates. Multi-iter scope (3-5 cycles).
+
+**Deferred** for future iter; not implemented this cycle.
+
+**H96 (researcher #3): mul_mv_ext small-batch routing for MoE expert dispatch**
+
+mlx-native has `kernel_mul_mv_ext_q5_K_f32_r1_{2..5}` kernels already (`mul_mv_ext.metal:627-645`) but `quantized_matmul_ggml.rs:136-151` doesn't route to them — always returns single-row `kernel_mul_mv_q5_K_f32` for `m ≤ MM_ROUTING_THRESHOLD`.
+
+For decode m=1, doesn't help. For MoE routing where individual experts see batched tokens (TOPK distribution), this could win.
+
+But: the MoE expert dispatch goes through `quantized_matmul_id_ggml.metal` (different file), not `quantized_matmul_ggml.metal`. The `mul_mv_ext` activation would only help if a non-MoE call site has batched-decode m∈[2,5], which is rare in production.
+
+**Verdict**: marginal value for current production workloads. Not implemented this cycle.
+
+**Conclusion for iter-163**: H93 captured the available peer-port lever; H94 was a false positive (already applied); H95/H96 are deferred work. The 27-lever ledger now has 2 wins + 25 falsifications + 3 deferred candidates. Mission state at HEAD:
+
+- **Prefill** pp1800/pp3700: 1.072×/1.087× peer-FA (AHEAD)
+- **Decode** tg100/tg2000/tg5000: 0.9362×/0.9441×/0.9434× peer-FA (closed +0.76-1.26pp via H93)
+- **KV memory**: 3.94× more savings via TQ-HB-V
+
+Per the multi-regime gate rule and the iter-156 reframe, the residual 5.6-6.4% decode gap is structurally TQ-HB-V dequant overhead plus per-dispatch fixed cost. Single-kernel levers exhausted within current investigation depth.
+
