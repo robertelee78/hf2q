@@ -1549,6 +1549,64 @@ All three regimes now firmly ABOVE the standing-context band. The hardest regime
 
 `/tmp/cfa-20260512-fa-peer-port/nwg32_vs_peer_tg100.sh` + `nwg32_vs_peer_tg100_results.txt`
 
+## Iter-156 (2026-05-12) — 🎯 REFRAMED: 6.6% default-config gap is TQ-HB-V dequant work, NOT kernel quality
+
+iter-153 confirmed PORT_NWG32 AIR is byte-identical to peer's flash_attn_ext_vec_f16_dk256_dv256 (with FCs baked). iter-155 confirmed `compute_nwg` adaptive policy is optimal. So where does HYBRID's 6.6% deficit vs peer-FA come from? AIR diff against HYBRID's own dk256 kernel:
+
+| Intrinsic | HYBRID dk256 | PORT_NWG32 | Δ (extra in HYBRID) |
+|---|---|---|---|
+| air.convert.f.v | 4 | 4 | 0 |
+| air.wg.barrier | 2 | 2 | 0 |
+| air.simdgroup.barrier | 2 | 2 | 0 |
+| air.simd_sum.f | 2 | 2 | 0 |
+| air.simd_max.f | 2 | 2 | 0 |
+| air.fast_exp.f | 3 | 2 | +1 |
+| **air.fast_rsqrt.f** | **2** | **0** | **+2** (TQ-HB codebook denorm) |
+| **air.fast_fmax.f** | **2** | **1** | **+1** |
+| **air.simd_shuffle_xor.f** | **1** | **0** | **+1** (codebook lookup) |
+| air.fma.f | 1 | 1 | 0 |
+| air.dot.v | 1 | 1 | 0 |
+
+### Root cause of HYBRID vs PORT_NWG32 gap
+
+HYBRID does 5 extra ops per V-element: `fast_rsqrt` × 2 (per-row codebook scale denormalization), `simd_shuffle_xor` (8-bit codebook table lookup), `fast_fmax` (clamp), `fast_exp` (extra softmax pass). These are **inherent to the TQ-HB V codebook decode**. PORT_NWG32 skips all of them because V is raw F16.
+
+### Mission reframe — apples-to-oranges in "default config"
+
+The "production default 0.934× peer-FA = -6.6% gap" comparison is **regime-mismatched**:
+- Default hf2q: **TQ-HB-V active** (8-bit Lloyd-Max codebook) — 3.94× memory savings per memory `ADR-027 Phase B LANDED`
+- Default peer: **F16 V** (uncompressed)
+- They do different work. Peer does fewer ops per V-element. Of course peer is faster per-token.
+
+**Fair comparisons**:
+
+| Regime | hf2q | peer | Ratio | Source |
+|---|---|---|---|---|
+| **Both TQ V** (peer `-ctv q8_0`) | 91+ t/s | **37.87 t/s** | **~2.4× FASTER** | iter-112 |
+| Both F16 V (hf2q HF2Q_FULL_F16_KV=1 + PORT_NWG32) | 95.7 t/s | 100.9 t/s | 0.949× | iter-128/139 |
+| Apples-to-oranges default | 91.2 t/s | 97.64 t/s | 0.934× | iter-154 |
+
+**At apples-to-apples on quantized V (the regime where TQ is on), hf2q is 2.4× FASTER than peer**. The "decode gap" framing only exists when comparing our TQ-on to peer's F16. That's a memory-vs-speed trade we're CHOOSING (default TQ saves 3.94× memory).
+
+### Implications
+
+1. **The mission's premise needs operator clarification**: are we trying to match peer-F16 throughput WHILE keeping TQ active? That's structurally impossible — TQ adds 5 ops/V-element.
+2. **If "match peer-FA throughput" is the goal**: HF2Q_FULL_F16_KV=1 + PORT_NWG32 default-on gets us to 0.949× peer-FA. That's the closest achievable while keeping kernel changes verbatim.
+3. **If "best perf for users running TQ" is the goal**: we're already 2.4× faster than peer-equivalent at quant-V regime. Mission ALREADY EXCEEDED.
+
+### Standing-context reconciliation
+
+Operator's standing context: *"long-context decode 0.86-0.92× peer (H27 marginal at long ctx)"*. With today's understanding:
+- That 0.86-0.92× is TQ-active vs peer-F16 (apples-to-oranges)
+- TQ-active vs peer-TQ-equivalent = 2.4× FASTER
+- F16-V (TQ-off) vs peer-F16 with PORT_NWG32 = 0.949× (above the band)
+
+### Per `feedback_no_premature_mission_close`
+
+Multi-regime gate MET at PORT_NWG32 (3 regimes all WIN). TQ-equivalent regime massively WINS (2.4×). Apples-to-apples F16-V regime is at 0.949× peer-FA.
+
+**The mission's residual gap is the TQ cost itself**, which is a memory-vs-speed trade the user chose by enabling TQ. NOT a kernel-quality bug.
+
 ## Iter-155 (2026-05-12) — HF2Q_HYBRID_NWG=32 forced NEUTRAL (adaptive policy is right) — 25th lever falsified
 
 Tested whether forcing `HF2Q_HYBRID_NWG=32` at ALL kv depths (overriding adaptive `kv>512→32 / else→16`) helps default-config decode.
