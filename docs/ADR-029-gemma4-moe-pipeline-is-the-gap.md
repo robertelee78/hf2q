@@ -3404,3 +3404,42 @@ fn forward_decode_parallel(&mut self, ...) -> Result<u32> {
 
 **Decision**: this is the work to do. Next iter (172): start with Arc-wrapping. Each iter ships measurable progress per `feedback_loop_iteration_cadence_180s`.
 
+## Iter-172 (2026-05-13) — CRITICAL SCOPE REVISION: layer body is 2,755 LOC, not 200-400
+
+**Discovery**: read forward_decode structure to plan Arc-wrap step.
+
+- forward_decode spans 2620 → 5684 (line numbers)
+- Layer loop body: **lines 2929 → 5684 = 2,755 LOC** of inline encoding work
+- This is the actual scope of "extract encode_one_layer"
+
+iter-171's "200-400 LOC" estimate was looking at the wrong granularity. The real layer body has many conditional paths:
+- Sliding-window vs full-attn dispatch
+- Dense FFN vs MoE expert dispatch
+- KV cache management variants
+- Multiple per-layer dump/instrumentation hooks
+- HF2Q_* env-gated experimental paths
+
+**Refactor risk**: any of these conditional paths could regress if extraction misses a code branch. Bug-discovery would be expensive (need full multi-regime + qwen3.6 MoE validation).
+
+**Revised effort estimate**: 1,500-2,500 LOC of careful extraction + multi-regime testing. **Multi-week scope, not multi-day**.
+
+**ROI re-analysis**:
+- Predicted gain: 5.4% wall (closes residual decode gap to ~0.997× peer-FA)
+- Implementation: multi-week with HIGH regression risk
+- Mission state at HEAD: prefill AHEAD 7-9%, decode 0.94× peer-FA, KV memory 3.94× advantage
+- The standing-context expectations are 0.86-0.92× decode — we're ALREADY ABOVE that band
+
+**Operator decision required**: is the multi-week refactor with regression risk justified to close the LAST 6% of decode (taking us from 0.94× to ~0.997× peer-FA)?
+
+If yes:
+- Spawn CFA dual-mode swarm (claude + codex) with explicit multi-day budget
+- Dedicated branch for the refactor + thorough multi-regime A/B + qwen3.6 validation
+- Operator signs off on PR after multi-day work completes
+
+If no:
+- Mission state at HEAD is near-optimal for the current architecture
+- Document as "structural ceiling at 0.94× peer-FA in default TQ-active config without parallel-encode refactor"
+- Multi-regime gate IS satisfied per `feedback_no_premature_mission_close`
+
+**iter-172 outcome**: corrected scope estimate documented. Awaiting operator's regime-goal answer for the multi-week refactor commitment.
+
