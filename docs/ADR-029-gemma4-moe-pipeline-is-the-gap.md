@@ -2861,3 +2861,37 @@ Second stacking re-test (after iter-147's #3b). 3-cycle alt-pair, σ<1% both arm
 
 Two re-tests now confirm the 23 prior falsifications hold at the new PORT_NWG32 baseline. PORT_NWG32 remains the unique WIN among 24 levers tested.
 
+## Iter-157 (2026-05-13) — H87 FALSIFIED: FWHT-prelude DCE via function constant is NEUTRAL
+
+**Hypothesis (testable)**: HYBRID's `if (params.fuse_fwht_pre != 0u)` at line 414 of `flash_attn_vec_hybrid.metal` is a RUNTIME branch on a buffer load. The hf2q caller hardcodes `fuse_fwht_pre: 0` (forward_mlx.rs:4033), so the FWHT prelude (~150 lines: sign-premult loop + `fwht_simd_fa<EPT>` butterfly with `simd_shuffle_xor` + `rsqrt(float(DK))`) is dead at runtime but live in the compiled PSO. Converting to a Metal function constant (FC 52, default=false) should DCE the prelude at PSO instantiation time, shrinking the kernel.
+
+**Code change** (`adr-029-iter157-h87-fuse-fwht-pre-fc` branch):
+- Added `constant int FUSE_FWHT_PRE_FC [[function_constant(52)]];` + `constant bool fuse_fwht_pre_effective = is_function_constant_defined(FUSE_FWHT_PRE_FC) ? (FUSE_FWHT_PRE_FC != 0) : false;`
+- Replaced `if (params.fuse_fwht_pre != 0u)` with `if (fuse_fwht_pre_effective)` (1-line)
+- Struct layout PRESERVED (params.fuse_fwht_pre field stays for ABI safety); dispatcher does NOT set FC 52 (default-false path)
+
+**Coherence check** ✓: `What is 2 plus 2?` → "2 plus 2 is **4**.<turn|>", first_decode_token = 236778 (byte-identical to baseline)
+
+**Bench** (4-pair alt-pair, 90s cooldowns, gemma4-ara-2pass-APEX-Q5_K_M.gguf, prompt "Q.", max-tokens 2000 + --ignore-eos):
+
+| pair | baseline | H87 | Δ |
+|---:|---:|---:|---:|
+| 1 | 92.3 | 92.4 | +0.11% |
+| 2 | 92.1 | 92.5 | +0.43% |
+| 3 | 92.3 | 92.6 | +0.33% |
+| 4 | 92.6 | 92.2 | **-0.43%** |
+| **mean** | **92.325 ± 0.18 (σ 0.19%)** | **92.425 ± 0.15 (σ 0.16%)** | **+0.11%** |
+
+**Verdict**: NEUTRAL. The +0.11% mean delta is well below the σ noise floor (0.19% baseline). Per-pair direction split 3/1 — the 4th pair flipped sign, confirming we're at the noise floor not a real signal. σ_pct < 1% precondition met on both arms.
+
+**What this falsifies**: the FWHT-prelude presence is NOT a material factor for HYBRID kernel performance. Either (a) Apple's Metal compiler ALREADY DCEs the runtime branch effectively at PSO time (the `if (param == 0)` is profile-folded), or (b) the FWHT-prelude cost is sub-noise-floor (sign-premult loop + butterfly are cheap; 150 lines of code != 150 cycles of work).
+
+**Search-space narrowing**: combined with the 25 prior falsifications, this rules out:
+- Kernel-source-fidelity per iter-127 (lever #23 PORT verbatim port at single-WG)
+- NWG policy per iter-155 (lever #25)
+- FWHT-prelude DCE per iter-157 (lever #26, this iter)
+
+The residual 5.7-6.3% gap (apples-to-apples F16 V: PORT_NWG32 0.949× peer-FA) must therefore live in the **V-side dequant loop body** (per-V-element codebook lookup + scale), the **K-side dot product** (which is identical-shape to peer), the **softmax** (1 extra `fast_exp` + 1 extra `fast_fmax` per kernel vs PORT, per iter-156 AIR diff), or the **reduce kernel** (NWG=32 cross-WG online-softmax reconciliation). Per-V-element dequant work is structural (codebook load + mul cannot become free); reduce kernel is iter-138 verbatim peer port. Next candidate lever: the extra `fast_exp`/`fast_fmax` in HYBRID's softmax — investigate whether `m_old/M` tracking emits one extra exp pair vs PORT's tighter single-pass online softmax.
+
+**Decision**: branch retained for ledger reference; NOT merged to main (neutral delta + per-pair noise = no shipping value). Ledger updated to lever #26.
+
