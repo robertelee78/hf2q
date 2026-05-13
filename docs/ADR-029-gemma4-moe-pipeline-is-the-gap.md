@@ -2612,3 +2612,13 @@ disposition** — Action items A and B should be tried first.
 - mlx-native bench infra: `/opt/mlx-native/benches/bench_{decode_qmatmul_shapes, decode_moe_id_shapes, sdpa_kv_dtype_compare, dispatch_overhead}.rs`
 - Peer instrumentation patch: `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m` (atomic counters + per-pipeline histogram, env `HF2Q_PEER_COUNT_PRINT=1` + `HF2Q_PEER_PIPELINE_HIST=1`)
 - hf2q production timing hooks (landed iter-9): `src/serve/forward_mlx.rs` (env `HF2Q_PER_LAYER_GPU_TIME` + `HF2Q_PER_LAYER_PHASE_GPU_TIME`)
+
+## Iter-148 (2026-05-12) — Lever #15b: HF2Q_DECODE_SPLIT_CB_AT_LAYER also NEUTRAL stacked with PORT_NWG32
+
+Second stacking re-test (after iter-147's #3b). 3-cycle alt-pair, σ<1% both arms:
+  PORT_only:       95.8, 95.6, 95.4 → 95.60 ± 0.20 (σ_pct 0.21%)
+  PORT+SPLIT_CB:   95.8, 95.5, 95.3 → 95.53 ± 0.25 (σ_pct 0.26%)
+  Δ = -0.07% within noise. FALSIFIED.
+
+Two re-tests now confirm the 23 prior falsifications hold at the new PORT_NWG32 baseline. PORT_NWG32 remains the unique WIN among 24 levers tested.
+
