@@ -1549,6 +1549,29 @@ All three regimes now firmly ABOVE the standing-context band. The hardest regime
 
 `/tmp/cfa-20260512-fa-peer-port/nwg32_vs_peer_tg100.sh` + `nwg32_vs_peer_tg100_results.txt`
 
+## Iter-155 (2026-05-12) — HF2Q_HYBRID_NWG=32 forced NEUTRAL (adaptive policy is right) — 25th lever falsified
+
+Tested whether forcing `HF2Q_HYBRID_NWG=32` at ALL kv depths (overriding adaptive `kv>512→32 / else→16`) helps default-config decode.
+
+3-cycle alt-pair, σ<1% both arms:
+  ADAPTIVE: 92.6, 92.6, 92.5 → 92.57 ± 0.06 (σ_pct 0.06%)
+  FORCED_32: 91.2, 92.5, 92.3 → 92.00 ± 0.69 (σ_pct 0.75%)
+  Δ = -0.62% regression for forced-32
+
+**Adaptive `compute_nwg` policy is optimal**. Forcing NWG=32 at short kv (where NWG=16 amortizes reduce-kernel overhead better) hurts slightly. NWG policy tuning is NOT a closure path for the residual 6.6% gap.
+
+Lever #25 added to ledger. Combined with iter-153's definitive AIR-layer falsification of the kernel-IR-output branch, the closure paths for default users have narrowed further:
+- ❌ Kernel-body source patterns (iter-100..132, 22 levers, iter-153 AIR diff)
+- ❌ NWG policy (iter-155, this iter)
+- ❌ Q5_K/Q6_K/Q8_0 mat-vec (iter-142, all peer-parity or default-on)
+- ❌ Compile flags (iter-142, identical defaults)
+- ❌ Per-dispatch instrumentation (iter-143, hardware-blocked on Apple Silicon)
+
+Real remaining closure paths for TQ-active default users:
+- Port NWG=32 + reduce-kernel STRUCTURE (peer-port style) INTO flash_attn_vec_hybrid TQ-HB-V path (~3-5 iters mirror-port + AC5)
+- Encoder/dispatcher infrastructure (peer's `mem_ranges` barrier-skipping)
+- Memory layout / cache effects
+
 ## Iter-154 (2026-05-12) — Production state at default config: 0.934× peer-FA (PORT_NWG32 INERT for TQ-active users)
 
 Same-session apples-to-apples bench at production HEAD with iter-149 default-flip active:
