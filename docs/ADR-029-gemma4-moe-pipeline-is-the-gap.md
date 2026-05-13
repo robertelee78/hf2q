@@ -3304,3 +3304,36 @@ The encoder-visibility 0.58 ms is what parallel-encode CAN close. But the **bigg
 
 Per the operator's "continue until complete" mandate, the next iter should profile and optimize this 1.26 ms inter-token overhead, NOT immediately commit to the parallel-encode refactor.
 
+## Iter-170 (2026-05-13) — Iter-169 RETRACTED — parallel-encode IS the closure path
+
+**Retraction**: iter-169 misinterpreted split-mode HEAD timing. The HEAD `encode=9.22ms` reading uses the ORIGINAL session_start (token-start) for delta calculation, so it includes BODY encode + BODY GPU wait + HEAD encode. The actual HEAD encode is ≈0 ms (4 dispatches only).
+
+**Re-analysis with HF2Q_MLX_TIMING=1 + HF2Q_SPLIT_TIMING=1**:
+
+| component | hf2q ms/token | peer ms/token (est) |
+|---|---:|---:|
+| BODY encode | 0.58 | (parallel-hidden) |
+| BODY GPU | 8.78 | ~8.78 (similar) |
+| HEAD encode | ~0 | ~0 |
+| HEAD GPU | 1.30 | ~1.30 |
+| Inter-token (sample/EOS/yield) | ~0.04 | ~0.04 |
+| **Total serial** | **10.70 ms** | n/a |
+| **Total with encode-overlap** | n/a | **10.12 ms** |
+| **Gap** | n/a | **0.58 ms = 5.4%** |
+
+**Math**: peer's wall (10.10 ms measured, iter-158) ≈ max(BODY encode, BODY GPU) + HEAD GPU + inter-token = 8.78 + 1.30 + 0.04 = 10.12 ms (predicted). hf2q's wall (10.68 ms measured) = BODY encode + BODY GPU + HEAD GPU + inter-token = 0.58 + 8.78 + 1.30 + 0.04 = 10.70 ms (predicted). Matches.
+
+**The full 5.4% peer-FA gap = BODY encode visibility**.
+
+**Iter-168 plan is RECONFIRMED as the correct closure path**. The predicted gain is 5.4% wall — closing the full residual decode gap. Multi-day refactor scope is justified.
+
+Closure target: hide the 0.58 ms BODY encode behind the 8.78 ms BODY GPU. Even partial hiding (50%) saves 0.29 ms = 2.7%, taking us to ~0.969× peer-FA. Full hiding saves 0.58 ms = 5.4%, taking us to ~0.997× peer-FA — effectively TIED.
+
+This is the work for the next session. Multi-iter refactor:
+1. Extract `encode_one_layer` (single iter)
+2. Wire EncoderWorker for layer-half submission (single iter)
+3. Multi-regime validation (single iter)
+4. Default-flip merge (single iter)
+
+Per `feedback_no_premature_mission_close`, the multi-regime gate must validate the refactor across tg100/tg2000/tg5000.
+
