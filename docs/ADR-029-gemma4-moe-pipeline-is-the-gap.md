@@ -1549,6 +1549,37 @@ All three regimes now firmly ABOVE the standing-context band. The hardest regime
 
 `/tmp/cfa-20260512-fa-peer-port/nwg32_vs_peer_tg100.sh` + `nwg32_vs_peer_tg100_results.txt`
 
+## Iter-150 (2026-05-12) — Prefill ratio is REGIME-DEPENDENT: short -35%, long +5% (iter-77 finding holds)
+
+Operator reported fresh A2A: hf2q 246.9 pp / 90.3 gen vs peer 503.6 pp / 98.0 gen.
+The 0.49× prompt ratio was at VERY short prompt (`Q.` ≈ 12 tokens). Same-session re-bench:
+
+| Regime | hf2q t/s | peer-FA t/s | Ratio | Verdict |
+|---|---|---|---|---|
+| pp512  (short) | 2103.7 | 3227.06 | **0.652×** | -35% gap |
+| pp4096 (long) | 2951.5 | 2809.90 | **1.050×** | **hf2q WINS by 5%** |
+
+**hf2q is FASTER than peer at long prefill**. Confirms iter-77's "FA-vs-FA TIED at
+pp4173/pp8333" finding still holds. The operator's -51% gap reflects regime where
+fixed per-invocation overhead dominates per-token rate.
+
+Likely short-prefill overhead sources:
+- Batched prefill setup (HF2Q_BATCHED_PREFILL=1 default-on per iter-415)
+- KV-cache lazy allocation per session
+- Engine initialization per generate call
+- F16 shadow materialization (one-time per process per layer)
+
+At long prefill (pp ≥ 4096), these costs amortize and hf2q's kernel quality wins.
+
+The standing-context's `prefill 0.50× peer (H28, multi-day refactor)` interprets as
+the SHORT-prompt regime. Long-prompt prefill is already at peer parity / above.
+Short-prompt fixed overhead is a separate axis from kernel-perf and would need
+profile-mode investigation of per-token vs per-invocation costs.
+
+Iter-149 default-flip status: `HF2Q_FA_PEER_PORT_NWG32` default-ON (`3196643e`).
+TQ-active users see zero change (gate falls through to HYBRID); F16-V opt-in users
+get +1.8-3.1pp closure automatically.
+
 ## Iter-147 (2026-05-12) — HF2Q_FUSED_END_OF_LAYER does NOT stack with PORT_NWG32 (re-confirmed neutral at new baseline)
 
 Re-tested ledger lever #3 at the new PORT_NWG32 baseline. Was NEUTRAL alone with HYBRID
