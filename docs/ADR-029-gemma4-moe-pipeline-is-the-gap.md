@@ -1549,6 +1549,58 @@ All three regimes now firmly ABOVE the standing-context band. The hardest regime
 
 `/tmp/cfa-20260512-fa-peer-port/nwg32_vs_peer_tg100.sh` + `nwg32_vs_peer_tg100_results.txt`
 
+## Iter-151 (2026-05-12) — Metal Toolchain installed; first AIR-layer peer-vs-ours comparison
+
+Operator unblocked Metal Toolchain 2026-05-12: `xcodebuild -downloadComponent MetalToolchain` → `metal-objdump` now available (Apple LLVM 32023.883). iter-117's "compiler-VERSION-specific PSO output differences" hypothesis finally measurable at the IR layer.
+
+`scripts/adr029_aot_compare_air.sh` lands as reusable tooling:
+  1. xcrun -sdk macosx metal -c → AIR for our PORT_NWG32 shader (8144 bytes)
+  2. Same for peer's full ggml-metal.metal library with include paths (2.4 MiB)
+  3. xcrun metal-objdump -d → LLVM IR disassembly both
+  4. Print intrinsic-count summary
+
+### Initial finding (template-level, NOT FC-resolved)
+
+| Intrinsic | OUR PORT_NWG32 | PEER (template thunk) |
+|---|---|---|
+| air.fast_exp.f | 4 | 6 |
+| air.simd_max.f | 6 | 3 |
+| air.simd_sum.f | 4 | 3 |
+| air.wg.barrier | 4 | 3 |
+| air.simdgroup.barrier | 4 | 2 |
+| air.fast_fmax.f | 0 | 3 |
+| air.tanh.f | 0 | 1 |
+| air.fast_pow.f | 0 | 1 |
+
+### Caveats
+
+- Peer template includes ALL function-constant paths (has_scap → tanh, has_bias → fast_pow). At runtime FC instantiation those DCE.
+- Peer's true implementation is at mangled symbol `_Z26kernel_flash_attn_ext_vec_impl...`; the unmangled `kernel_flash_attn_ext_vec_f16_dk256_dv256` is a thunk. My awk extracted the thunk body; for accurate comparison need mangled extraction.
+- For real apples-to-apples need peer compiled with FCs matching our baked config (NWG=32, NSG=1, has_mask=1, has_sinks=0, has_bias=0, has_scap=0, has_kvpad=0). xcrun metal doesn't AOT-bake FCs — they're runtime concept; would need MTLBinaryArchive infra to capture true PSO IR.
+
+### Source-level barrier comparison (more direct than AIR)
+
+Counting `simdgroup_barrier` / `threadgroup_barrier` calls in source lines 6666-7096 (peer's kernel body):
+
+- Peer source: **5 barriers** (3 wg + 2 sg)
+- Our PORT source: **4 barriers** (2 wg + 2 sg)
+- Δ: peer has 1 extra wg.barrier at line 400 — inside the NSG parallel-reduce block we DELETED per iter-126 spec.
+
+So peer has 1 more SOURCE barrier than us. But peer's AIR has FEWER barriers than ours. **Apple Metal compiler is eliminating peer's source barriers but NOT ours** — a real signal.
+
+Why might that be? Possibilities:
+- Different source structure lets compiler prove no race condition
+- Different optimization context
+- Cause iter-117 hypothesized — and now MEASURABLE
+
+### Next-iter scope
+
+Within operator's "B sounds right" greenlight (multi-day scope):
+- Extract peer's mangled `_Z26kernel_flash_attn_ext_vec_impl...` for f16/f16 dk256/dv256
+- Set up MTLBinaryArchive to capture peer's actual runtime PSO with FCs baked
+- Diff with our PORT_NWG32's PSO at the IR layer
+- Identify specific instruction-pattern differences
+
 ## Iter-150 (2026-05-12) — Prefill ratio is REGIME-DEPENDENT: short -35%, long +5% (iter-77 finding holds)
 
 Operator reported fresh A2A: hf2q 246.9 pp / 90.3 gen vs peer 503.6 pp / 98.0 gen.
