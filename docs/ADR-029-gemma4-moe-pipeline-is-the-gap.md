@@ -1549,6 +1549,34 @@ All three regimes now firmly ABOVE the standing-context band. The hardest regime
 
 `/tmp/cfa-20260512-fa-peer-port/nwg32_vs_peer_tg100.sh` + `nwg32_vs_peer_tg100_results.txt`
 
+## Iter-154 (2026-05-12) — Production state at default config: 0.934× peer-FA (PORT_NWG32 INERT for TQ-active users)
+
+Same-session apples-to-apples bench at production HEAD with iter-149 default-flip active:
+
+  hf2q DEFAULT (no env vars, --ignore-eos): 91.2 t/s (2000 tokens)
+  peer llama-bench tg2000 -fa 1:             97.64 t/s
+  Ratio:                                     **0.934× peer-FA = -6.60% gap**
+
+### Default config = TQ-HB-V active = PORT_NWG32 falls through
+
+The iter-149 default-flip of `HF2Q_FA_PEER_PORT_NWG32` is INERT for default users because TQ-HB-V is also default — the gate precondition `v_packed.dtype()==F16` fails, fallthrough to `flash_attn_vec_hybrid`. The +1.8pp PORT_NWG32 win only materializes when users opt-into F16-V regime via `HF2Q_FULL_F16_KV=1` (which turns OFF TQ — contrary to operator's "TQ still enabled" constraint).
+
+So today's DEFAULT-USER experience is the HYBRID kernel at 0.934× peer-FA, NOT the PORT_NWG32 closure.
+
+### To benefit TQ-active default users
+
+Would require porting the NWG=32 + reduce-kernel structure into `flash_attn_vec_hybrid` (the TQ-HB-V kernel). That's NEW multi-iter work:
+- Modify flash_attn_vec_hybrid.metal to support NWG=32 + write-to-tmp at TQ-HB-V dispatch path
+- Either create a new variant or function-constant-bake NWG
+- Add reduce kernel companion (already exists for PORT but is TQ-unaware)
+- Wire dispatch in forward_mlx.rs hybrid call site
+
+Estimated: 3-5 iters of port work + AC5 thermal-fair validation, mirroring iter-134→138 stack.
+
+### Standing rule added
+
+`feedback_always_ignore_eos_for_benchmarks_2026_05_12.md` — per operator iter-154: every `hf2q generate` in a bench context must pass `--ignore-eos`. Without it, hf2q stops at EOS (~500 tok for `Q.` prompt), biasing measurements toward shallow kv-depth. Peer's `llama-bench -n N` always runs full N steps. Mismatched stopping = invalid A/B.
+
 ## Iter-153 (2026-05-12) — 🎯 DEFINITIVE: PORT_NWG32 AIR is BYTE-IDENTICAL to peer's at apples-to-apples FC config
 
 Followup to iter-151/152. Edited a copy of peer's `ggml-metal.metal` to bake FCs at source-level (matching our PORT's #define-baked config: NWG=32, NSG=1, has_mask=1, has_sinks=0, has_bias=0, has_scap=0, has_kvpad=0, ns10=256, ns20=256). Compiled. Disassembled. Extracted the f16_dk256_dv256 function body. Compared with our PORT_NWG32's function body.
