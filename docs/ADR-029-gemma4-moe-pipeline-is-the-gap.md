@@ -3210,3 +3210,61 @@ The 0.7 ms/token wall gap matches the observed 6% peer-FA gap.
 
 **Implication for the multi-day overlap refactor**: the structural pattern peer uses (`n_cb=2` `dispatch_apply` on a Concurrent queue) requires actually-parallel ENCODING on different threads, not just multi-CB commits on the same thread. The hf2q `EncoderWorker` infrastructure exists for this but `forward_decode` doesn't use it (encode_one_layer stub at forward_mlx.rs:2606). Multi-day refactor remains the only path; multi-split CB without parallel encoding is confirmed insufficient.
 
+## Iter-168 (2026-05-13) — Peer source READ: confirmed the closure path is parallel encoding, not multi-CB-commit
+
+Read peer's `ggml_metal_graph_compute` at `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-context.m:530-604` to definitively identify the closure pattern.
+
+**Peer's actual mechanism**:
+
+```c
+// Line 530-550: ENCODE all N CBs IN PARALLEL on the concurrent queue
+for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+    // setup cmd_buf[cb_idx] WITHOUT encoding
+}
+dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+// At this point, all CBs are ENCODED + COMMITTED by their respective threads
+// (encode_async commits its CB at the end of encoding)
+
+// Line 574-604: main thread waits + conditionally commits any
+// CB that the worker didn't commit (rare race-condition edge)
+for (int i = 0; i < n_cb; ++i) {
+    [cmd_buf waitUntilCompleted];
+    // ... if next_buffer is NotEnqueued, commit it (conditional)
+}
+```
+
+**The critical detail**: `encode_async` (a closure invoked by GCD on parallel threads) does:
+1. Encode dispatches into ITS OWN CB
+2. Commit that CB
+
+So each CB is encoded ON ITS OWN THREAD and committed FROM THAT THREAD. The N CBs are encoded simultaneously. Then the main thread sequentially waits for each.
+
+**What mlx-native currently does** (forward_mlx.rs:5198-5208):
+1. Main thread encodes CB0 (layers 0-14)
+2. Main thread commits CB0
+3. Main thread encodes CB1 (layers 15-29)
+4. Main thread commits CB1
+5. Main thread waits
+
+This is SERIAL ENCODING with multi-CB commits. The 0.23 ms encode-CB1 happens AFTER 0.23 ms encode-CB0 + commit. Total CPU-side: ~0.46 ms serial.
+
+**Peer's pattern saves**: max(encode-time-per-CB) instead of sum. For n_cb=2 with 0.23 ms per half: peer pays 0.23 ms, we pay 0.46 ms. Saves 0.23 ms = ~2.5% wall.
+
+For full overlap (encode-N hidden behind GPU-N-1): potentially 0.46 ms saved = ~5% wall (matches the observed gap).
+
+**Refactor scope to implement**:
+
+1. **EncoderWorker pool**: spawn N-1 workers at process start (currently have 1 `EncoderWorker` infrastructure ready). [LOC: 50]
+2. **Extract `encode_one_layer`**: move layer body out of `forward_decode` (currently inline). [LOC: 200-400 — half-day to multi-day]
+3. **Add `forward_decode_parallel_encode`**: new forward path that splits layers across worker threads via channels, awaits all, commits in order. [LOC: 150]
+4. **Wire feature flag**: `HF2Q_DECODE_PARALLEL_ENCODE=1` to opt in. [LOC: 30]
+5. **Multi-regime gate**: tg100/tg2000/tg5000 + qwen3.6 to verify no regression on MoE path. [No LOC; bench cycles]
+
+**Total**: ~430-630 LOC + correctness validation + multi-regime A/B. Multi-iter scope (3-5 cycles autonomous, or single CFA swarm session).
+
+**Predicted gain**: +2.5% to +5% wall (closes the 0.5-0.7 ms/token overlap gap measured iter-165).
+
+**Risk**: Apple Silicon Metal driver behavior for multi-threaded encoding may have hidden serialization (e.g., command queue thread-safety). The previous attempt (forward_mlx.rs:5193 comment "-43 tok/s") used naive `std::thread::spawn` per token; the persistent `EncoderWorker` should avoid that cost basis but hasn't been measured for decode yet.
+
+**Decision**: this is the next concrete work item per the operator's "continue until complete" mandate. Will start incrementally — first iter: extract `encode_one_layer` stub into a working method that forward_decode CAN call (still serial); subsequent iters: switch forward_decode to use it; final iter: wire EncoderWorker. Each iter ships measurable progress per `feedback_loop_iteration_cadence_180s`.
+
