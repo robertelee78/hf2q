@@ -1549,6 +1549,20 @@ All three regimes now firmly ABOVE the standing-context band. The hardest regime
 
 `/tmp/cfa-20260512-fa-peer-port/nwg32_vs_peer_tg100.sh` + `nwg32_vs_peer_tg100_results.txt`
 
+## Iter-147 (2026-05-12) — HF2Q_FUSED_END_OF_LAYER does NOT stack with PORT_NWG32 (re-confirmed neutral at new baseline)
+
+Re-tested ledger lever #3 at the new PORT_NWG32 baseline. Was NEUTRAL alone with HYBRID
+(iter-101); hypothesis was that PORT's new end-of-layer dispatch landscape (added reduce
+kernel) might interact differently.
+
+3-cycle alt-pair, σ<1% both arms:
+  PORT_only:       95.6, 95.8, 95.6 → 95.67 ± 0.12 (σ_pct 0.12%)
+  PORT+FUSED_EOL:  95.8, 95.6, 95.9 → 95.77 ± 0.15 (σ_pct 0.16%)
+  Δ = +0.10% within noise — stacking falsified.
+
+The end-of-layer fusion is genuinely independent of the FA kernel choice. Confirms
+the 22-NEUTRAL/REGRESS-prior-levers ledger doesn't change after the PORT_NWG32 win.
+
 ## Iter-146 (2026-05-12) — xctrace-based per-CB GPU attribution infrastructure landed; PORT_NWG32 win confirmed at the trace layer
 
 Built on iter-145's xctrace finding: tested `metal-application-command-buffer-submissions` schema. The schema's `duration` column = submission-to-completion time per CB. Extractable programmatically via `xcrun xctrace export --xpath`.
