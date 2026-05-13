@@ -3112,11 +3112,43 @@ But: the MoE expert dispatch goes through `quantized_matmul_id_ggml.metal` (diff
 
 **Verdict**: marginal value for current production workloads. Not implemented this cycle.
 
-**Conclusion for iter-163**: H93 captured the available peer-port lever; H94 was a false positive (already applied); H95/H96 are deferred work. The 27-lever ledger now has 2 wins + 25 falsifications + 3 deferred candidates. Mission state at HEAD:
+**Conclusion for iter-163**: H93 captured the available peer-port lever; H94 was a false positive (already applied); H95/H96 are deferred work. The 27-lever ledger now has 2 wins + 25 falsifications + 3 deferred candidates.
+
+(Note: H94 was renumbered after iter-164 retested a different idea under the same name — see iter-164 below for the actual H94 attempt.)
+
+Mission state at HEAD:
 
 - **Prefill** pp1800/pp3700: 1.072×/1.087× peer-FA (AHEAD)
 - **Decode** tg100/tg2000/tg5000: 0.9362×/0.9441×/0.9434× peer-FA (closed +0.76-1.26pp via H93)
 - **KV memory**: 3.94× more savings via TQ-HB-V
 
 Per the multi-regime gate rule and the iter-156 reframe, the residual 5.6-6.4% decode gap is structurally TQ-HB-V dequant overhead plus per-dispatch fixed cost. Single-kernel levers exhausted within current investigation depth.
+
+## Iter-164 (2026-05-13) — H94 FALSIFIED: top_k FC-promotion in MoE _id kernel is NEUTRAL
+
+**Hypothesis (testable)**: same shape as H93 — promote `p.top_k` from runtime arg to Metal function constant (FC 703) in `quantized_matmul_id_ggml.metal`. The kernel has 9 sites of `token_idx = output_row / p.top_k`. With top_k=8 baked at PSO time, compiler folds `/ 8 → >> 3`. Predicted: similar +1pp closure to H93.
+
+**Implementation** (`adr-029-iter164-h94-id-topk-fc` branch):
+- Shader (`quantized_matmul_id_ggml.metal`): added FC 703 + `QMM_ID_TOP_K(p)` macro with sentinel-0 runtime fallback. 9 sites replaced sed-mechanically.
+- Dispatcher (`quantized_matmul_id_ggml.rs`): 2 hot get_pipeline sites updated to `get_pipeline_with_constants(..., &[(703, params.top_k as i32)])`. Map0/MM sites left at runtime (kernels don't use the macro).
+
+**Coherence** ✓: gemma4 "2+2=4" identical output.
+
+**Bench** (4-pair alt-pair vs post-H93 baseline, 90s cooldowns, gemma4-APEX-Q5_K_M tg2000):
+
+| pair | main_h93 t/s | h94 t/s | Δ |
+|---:|---:|---:|---:|
+| 1 | 93.7 | 93.7 | 0.00% |
+| 2 | 93.7 | 93.7 | 0.00% |
+| 3 | 93.6 | 93.5 | -0.11% |
+| 4 | 93.6 | 93.7 | +0.11% |
+| **mean** | **93.65 ± 0.05 (σ 0.05%)** | **93.65 ± 0.08 (σ 0.09%)** | **0.00%** |
+
+**Verdict**: NEUTRAL. Per-pair split symmetric (2/0/1/1). σ both arms < 0.1%. The mean delta is mathematically zero. Lever #28 in the falsification ledger.
+
+**Why H94 failed where H93 won**: in H93, the int-div happens in `offset0` arithmetic that's computed PER MATVEC site (and the dispatcher invokes ~210 matvecs/decode-token). In H94, the int-div `token_idx = output_row / p.top_k` is computed ONCE PER THREAD at kernel start (line 295 et al.), then `token_idx` is reused for the rest of the matvec body. The amortized cost is too small to show in wall-clock.
+
+**Lesson**: not all H93-style FC-promotions win. The mechanism only helps when the int-div is on the per-iteration inner-loop critical path, not when it's hoisted out once per kernel start.
+
+**Decision**: branch retained for ledger reference; NOT merged. Per-iteration single-shot int-divs are NOT a viable lever in mlx-native unless they happen inside inner loops.
 
