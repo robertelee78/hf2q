@@ -41,12 +41,18 @@ echo "Peer .ll size:"
 wc -l peer_full.ll
 
 echo ""
-echo "[iter-151] instruction-count summary:"
-echo "OUR kernel air intrinsics:"
+echo "[iter-151/152] instruction-count summary:"
+echo "OUR kernel air intrinsics (FCs BAKED at source):"
 grep -oE "air\.[a-z_.]+" our_port_nwg32.ll | sort | uniq -c | sort -rn | head -15
 echo ""
-echo "PEER flash_attn intrinsics (in flash_attn_ext_vec section):"
-awk '/^define.*kernel_flash_attn_ext_vec_f16_dk256_dv256/,/^}/' peer_full.ll | grep -oE "air\.[a-z_.]+" | sort | uniq -c | sort -rn | head -15
+echo "PEER kernel_flash_attn_ext_vec_f16_dk256_dv256 IR intrinsics (FCs as RUNTIME LOADS, NOT specialized):"
+# Extract from the actual define onwards, until first '^}'
+awk '/^define weak_odr.*kernel_flash_attn_ext_vec_f16_dk256_dv256/{p=1} p; p && /^}/{exit}' peer_full.ll \
+    | grep -oE "air\.[a-z_.]+" | sort | uniq -c | sort -rn | head -15
+echo ""
+echo "PEER intrinsic count NOT directly comparable to ours — peer's AOT has FCs as"
+echo "runtime loads (@_ZL25FC_flash_attn_ext_vec_nwg etc), while ours has them baked."
+echo "True apples-to-apples needs MTLBinaryArchive PSO capture OR FC-baked peer source edit."
 
 echo ""
 echo "Artifacts:"
