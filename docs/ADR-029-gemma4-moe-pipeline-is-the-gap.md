@@ -2921,3 +2921,30 @@ The residual 5.7-6.3% gap (apples-to-apples F16 V: PORT_NWG32 0.949× peer-FA) m
 
 26-lever falsification ledger holds (1 win: PORT_NWG32 in F16-V regime, where it is the production default; 25 falsifications spanning K-side, V-side, softmax, fusion, NWG/NSG policy, kernel-port-fidelity, FWHT-prelude DCE). All measurable single-kernel levers exhausted; closure of the residual TQ-vs-F16 gap requires reducing TQ-decode op count (multi-day kernel work) or operator regime-goal clarification.
 
+## Iter-159 (2026-05-13) — Multi-regime gate at HEAD: standing context "0.86-0.92×" SUPERSEDED
+
+**Why**: per `feedback_no_premature_mission_close_2026_05_11` the multi-regime gate is required before any closing claim. iter-158 measured ONLY tg2000. iter-159 extends to tg100 + tg5000 for the full gate.
+
+**Method**: 3-cycle alt-pair per regime, 90s cool-downs both sides, `--ignore-eos` / `-n N -r 1` parity. Same session as iter-157+iter-158 (same thermal context).
+
+| regime | hf2q t/s | peer-FA t/s | ratio | σ_hf2q | σ_peer |
+|---:|---:|---:|---:|---:|---:|
+| **tg100**  | **95.467** ± 0.047 | **103.037** ± 0.148 | **0.9265×** | 0.05% | 0.14% |
+| **tg2000** | **92.60**  ± 0.126 | **99.164** ± 0.150 | **0.9338×** | 0.14% | 0.15% |
+| **tg5000** | **90.333** ± 0.047 | **96.527** ± 0.105 | **0.9358×** | 0.05% | 0.11% |
+
+All σ < 1% protocol met. Multi-regime gate satisfied.
+
+**Headline finding**: gap **NARROWS** at long context (0.9265× at tg100 → 0.9358× at tg5000). This is the OPPOSITE direction the operator's standing context implies ("long-context decode 0.86-0.92×"). Fresh re-measurement at HEAD `382e9227` shows production decode is ABOVE 0.92× at ALL three tested regimes.
+
+**Why the gap narrows at depth**: at longer kv the FIXED per-dispatch overhead (peer's ~5 µs/dispatch advantage at the encoder/queue layer, per iter-103/104 micro-bench) becomes a smaller fraction of the per-token wall (which grows linearly with kv depth). The kernel-body work itself scales identically on both sides — the gap is mostly per-dispatch fixed cost which depth amortizes.
+
+**Standing-context correction**: the operator's prompt phrasing "long-context decode 0.86-0.92×" reflects pre-iter-149 state (before PORT_NWG32 default-on for F16-V regime + before the cumulative HYBRID kernel improvements iter-127a/c through iter-149). At HEAD, the multi-regime gate is:
+- **tg100  0.927×** (7.4% gap)
+- **tg2000 0.934×** (6.6% gap)
+- **tg5000 0.936×** (6.4% gap)
+
+The "0.86-0.92×" range no longer reflects HEAD. Mission state requires recharacterization based on iter-159 fresh data.
+
+**Per the `feedback_no_premature_mission_close` rule**: the mission CANNOT be closed solely on these numbers without operator regime-goal clarification (per iter-156 there are 3 framings; iter-158 measured tg2000 only; iter-159 now covers tg100/tg2000/tg5000). The structural finding remains: residual ~6-7% gap is TQ-HB-V dequant + per-dispatch overhead, NOT closable via single-kernel levers (26-lever ledger).
+
