@@ -1503,6 +1503,52 @@ the compiler-PSO-version-specific delta per iter-117 hypothesis.
 
 `/tmp/cfa-20260512-fa-peer-port/nwg32_tg100_bench.sh` + `nwg32_tg100_results.txt`
 
+## Iter-141 (2026-05-12) — Direct PORT_NWG32 vs peer-FA at tg100 locks the third regime
+
+Followup to iter-140 multi-regime gate. tg100 direct A2A replaces the extrapolated
+0.965× with measurement.
+
+### Final tg100 data (same session, σ<1% precondition both arms)
+
+| Arm | C1 | C2 | C3 | Mean | σ_pct |
+|---|---|---|---|---|---|
+| PORT_NWG32 | 100.6 | 100.5 | 100.3 | **100.47** ± 0.13 | 0.13% ✓ |
+| PEER_FA | 104.93 | 104.93 | 104.94 | **104.93** ± 0.005 | 0.005% ✓ |
+
+**Ratio: 0.9575× peer-FA at tg100 = -4.25% gap**
+
+PEER_FA at tg100 = 104.93 today vs iter-129's 100.99 — peer's machine state
+shifted up ~4%. Per `feedback_machine_state_confounds_perf_5pct_2026_05_12`,
+absolute cross-session compares are invalid; same-session ratio at 0.9575× is
+the authoritative tg100 measurement.
+
+### Final 3-regime direct A2A ratios (all same-session validated)
+
+| Regime | PORT_NWG32 mean | PEER_FA mean | Ratio | Gap |
+|---|---|---|---|---|
+| tg100  | 100.47 | 104.93 | **0.9575×** | -4.25% |
+| tg2000 | 94.70 | 100.48 | **0.9425×** | -5.75% |
+| tg5000 | 91.07 | 97.17 | **0.937×** | -6.27% |
+
+Gap widens monotonically with depth — consistent with iter-131's pre-port finding
+that hf2q's per-layer SDPA scales slightly worse with kv than peer's. At tg100 the
+short context minimizes the scaling delta; at tg5000 it accumulates.
+
+### Updated mission state (vs operator's standing-context band 0.86-0.92×)
+
+| Regime | Pre-port (HYBRID) ratio | Post-port (PORT_NWG32) ratio | Closure | Within band? |
+|---|---|---|---|---|
+| tg100  | ~0.93× | **0.958×** | +2.8pp | NO (above band) |
+| tg2000 | ~0.93× | **0.943×** | +1.3pp | NO (above band) |
+| tg5000 | ~0.92× | **0.937×** | +1.7pp | NO (above band) |
+
+All three regimes now firmly ABOVE the standing-context band. The hardest regime
+(tg5000) was 0.92× at HEAD pre-PORT_NWG32, now 0.937× with PORT_NWG32 opt-in.
+
+### Bench artifacts
+
+`/tmp/cfa-20260512-fa-peer-port/nwg32_vs_peer_tg100.sh` + `nwg32_vs_peer_tg100_results.txt`
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
