@@ -1549,6 +1549,45 @@ All three regimes now firmly ABOVE the standing-context band. The hardest regime
 
 `/tmp/cfa-20260512-fa-peer-port/nwg32_vs_peer_tg100.sh` + `nwg32_vs_peer_tg100_results.txt`
 
+## Iter-146 (2026-05-12) — xctrace-based per-CB GPU attribution infrastructure landed; PORT_NWG32 win confirmed at the trace layer
+
+Built on iter-145's xctrace finding: tested `metal-application-command-buffer-submissions` schema. The schema's `duration` column = submission-to-completion time per CB. Extractable programmatically via `xcrun xctrace export --xpath`.
+
+`scripts/adr029_xctrace_per_cb_gpu_time.sh` (commit `558cdac6`) captures + exports + analyzes per-CB GPU wall time. Apple-Silicon-native attribution path that's CLI-automatable **without** the multi-day commit_labeled refactor (iter-144) or custom .tracetemplate (iter-145).
+
+### Same-session intra-hf2q comparison (200 decode tokens)
+
+| Arm | CBs | Sum | Mean | Median | P95 | Max |
+|---|---|---|---|---|---|---|
+| PORT_NWG32 | 609 | **196.11ms** | 322.0µs | 92.3µs | 831.8µs | 3.79ms |
+| HYBRID | 602 | **199.18ms** | 330.9µs | 94.0µs | 866.0µs | 3.82ms |
+| Δ | +7 (reduce kernel) | **-1.54%** | -2.7% | -1.8% | -3.9% | (same) |
+
+**PORT_NWG32 saves 3.07ms GPU wall in 200-token decode = -1.54%**. Matches iter-138's bench result (+1.79% throughput) — the attribution infrastructure independently confirms the throughput win at the trace layer.
+
+The win is **distributed across the CB distribution** (median, P95 all favor PORT_NWG32 by similar small percentages) — not concentrated in any single hot CB.
+
+### Caveat: peer comparison via xctrace is NOT apples-to-apples
+
+Initial attempt to trace peer (`llama-bench -fa 1 -p 0 -n 200`) showed peer CBs at 3.2× longer total duration than our PORT_NWG32. This is **misleading** because:
+- `llama-bench` has internal warmup runs + multiple bench passes; trace captures all of them
+- xctrace's `duration` = GPU execution + host overhead, not pure GPU time
+- Different bench harnesses have different process lifecycle profiles
+
+xctrace per-CB attribution is **valid for our intra-hf2q comparisons** (PORT_NWG32 vs HYBRID with same `generate` harness) but **invalid for raw peer-vs-hf2q absolute compare**.
+
+### Next-iter potential closure path via this infrastructure
+
+The script can now drive precise A/B kernel-level investigations. Future iters could:
+1. Capture decode-only trace by filtering trace time window to post-load-phase
+2. Compare per-CB distribution shapes between PORT_NWG32 and any new kernel variant
+3. Find the top-K CBs contributing to the residual gap → target those for kernel work
+4. With future commit_labeled wiring (iter-144), also get per-decode-phase attribution
+
+### Bench artifacts
+
+`/tmp/adr029_xctrace/{port_nwg32,hybrid,peer}.trace` + `.xml` files; `scripts/adr029_xctrace_per_cb_gpu_time.sh`.
+
 ## Iter-142 (2026-05-12) — Plateau analysis: residual 4-6% gap attributable to compiler-PSO-version delta
 
 After PORT_NWG32 closure (iter-134→141), gap stands at 4.25-6.27% across tg100/tg2000/tg5000. This iter investigated several remaining angles to identify if any single-kernel lever could close further. Result: **all single-kernel matmul levers exhausted at peer parity or better**.
