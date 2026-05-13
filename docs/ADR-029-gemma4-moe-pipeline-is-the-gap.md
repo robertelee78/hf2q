@@ -2948,3 +2948,37 @@ The "0.86-0.92×" range no longer reflects HEAD. Mission state requires recharac
 
 **Per the `feedback_no_premature_mission_close` rule**: the mission CANNOT be closed solely on these numbers without operator regime-goal clarification (per iter-156 there are 3 framings; iter-158 measured tg2000 only; iter-159 now covers tg100/tg2000/tg5000). The structural finding remains: residual ~6-7% gap is TQ-HB-V dequant + per-dispatch overhead, NOT closable via single-kernel levers (26-lever ledger).
 
+## Iter-160 (2026-05-13) — Prefill multi-regime gate: standing context "0.50× peer" SUPERSEDED
+
+**Why**: per `feedback_do_not_trust_file_claims_re_measure_2026_05_11`, performance claims must be verified before being acted upon. iter-159 showed the operator's decode standing context was stale; this iter verifies the prefill claim ("0.50× peer (H28, multi-day refactor)").
+
+**Method**: 3-cycle alt-pair per regime, 90s cool-downs both sides. hf2q via `generate --prompt-file <N-word file> --max-tokens 1 --ignore-eos` (reading the "Batched prefill complete: X tok/s" report); peer via `llama-bench -p N -n 0 -r 1 -fa 1`. Prompts: 1800 and 3700 words pre-generated, deterministic seed.
+
+| regime | hf2q t/s | peer-FA t/s | ratio | σ_hf2q | σ_peer |
+|---:|---:|---:|---:|---:|---:|
+| **pp1800** | **3058.83** ± 2.28 | **2853.66** ± 6.88 | **1.072×** | 0.075% | 0.24% |
+| **pp3700** | **2986.60** ± 1.36 | **2746.42** ± 1.75 | **1.087×** | 0.05% | 0.06% |
+
+All σ < 1% protocol met. Multi-regime prefill gate satisfied.
+
+**Headline finding**: hf2q is **7-9% FASTER than peer-FA** at prefill across BOTH tested regimes. Confirms iter-77's TIED finding (1.005×/1.012× at pp4173/pp8333) has been further IMPROVED by cumulative kernel work since iter-77. ADR-028 Phase 15 (`project_adr028_iter415_421_phase15_landed_2026_05_11`) was the major step that wired batched prefill into serve.
+
+**Standing-context correction (second)**: the operator's prompt phrasing `"prefill 0.50× peer (H28, multi-day refactor)"` is off by a factor of ~2×. At HEAD `382e9227+`, prefill is 1.07-1.09× peer-FA. The H28 "multi-day refactor" was apparently completed in prior iters (likely Phase 15 in ADR-028).
+
+**Combined HEAD state (iter-158/159/160)**:
+
+| metric | regime | hf2q vs peer-FA |
+|---|---|---|
+| **Prefill** | pp1800 | **1.072×** (AHEAD) |
+| **Prefill** | pp3700 | **1.087×** (AHEAD) |
+| Decode | tg100 | 0.9265× |
+| Decode | tg2000 | 0.9338× |
+| Decode | tg5000 | 0.9358× |
+
+**Mission characterization at HEAD**:
+- Prefill: **hf2q WINS** by 7-9% across measured regimes
+- Decode: hf2q is 6.4-7.4% behind peer-FA at default config, structurally bound by TQ-HB-V dequant (iter-156)
+- Memory: hf2q has **3.94× more KV memory savings** via TQ-HB-V (project_adr027_phase_b_LANDED_2026_05_08)
+
+This is the actual production state. The standing-context framing is two iterations behind reality on BOTH axes.
+
