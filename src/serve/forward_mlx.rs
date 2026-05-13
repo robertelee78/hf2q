@@ -4045,19 +4045,36 @@ impl MlxModelWeights {
                         //                             full-attn fallthrough to HYBRID.
                         //   HF2Q_FA_PEER_PORT_NWG32 = NWG=32 + reduce-kernel port (iters 134-137).
                         //                             Matches peer's actual runtime dispatch.
-                        //                             Tests the refined hypothesis that peer's
-                        //                             PSO advantage comes from NWG=32 parallelism.
+                        //                             Validated WIN +1.8-3.1pp at tg100/tg2000/tg5000
+                        //                             vs HYBRID at PORT's f16-V regime (iter-138/140).
+                        //                             Default-flipped ON iter-149 per operator
+                        //                             approval: "best possible outcome for users —
+                        //                             if coherent + TQ still enabled + marginally
+                        //                             faster, of course default."
                         //                             Reuses existing sdpa_tmp buffer (identical
                         //                             size formula nrows*32*(dv+2)*4).
                         //
-                        // Default OFF for both. When neither env is set, zero behavior change at HEAD.
+                        // PORT_NWG32 default ON; opt out via HF2Q_FA_PEER_PORT_NWG32=0.
+                        // PORT (NWG=1, falsified) default OFF — explicit HF2Q_FA_PEER_PORT=1 only.
+                        // The precondition `v_packed.dtype()==F16` means PORT_NWG32 ONLY fires when
+                        // TQ-HB-V is bypassed (HF2Q_FULL_F16_KV=1 or otherwise F16-V regime).
+                        // With default TQ-HB-V active, PORT_NWG32 gate falls through to hybrid —
+                        // zero behavior change. With explicit F16-V request, PORT_NWG32 wins +2pp.
                         static FA_PEER_PORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         let use_peer_port = *FA_PEER_PORT.get_or_init(|| {
                             std::env::var("HF2Q_FA_PEER_PORT").map(|v| v == "1").unwrap_or(false)
                         });
                         static FA_PEER_PORT_NWG32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         let use_peer_port_nwg32 = *FA_PEER_PORT_NWG32.get_or_init(|| {
-                            std::env::var("HF2Q_FA_PEER_PORT_NWG32").map(|v| v == "1").unwrap_or(false)
+                            // env_default_true pattern (mirrors HF2Q_Q6K_MV_NR2 iter-326):
+                            // unset → ON; "0"/"false"/"off" → OFF; "1"/"true"/"on" → ON.
+                            match std::env::var("HF2Q_FA_PEER_PORT_NWG32").ok().as_deref() {
+                                None => true,
+                                Some(v) if v.eq_ignore_ascii_case("0")
+                                    || v.eq_ignore_ascii_case("false")
+                                    || v.eq_ignore_ascii_case("off") => false,
+                                Some(_) => true,
+                            }
                         });
 
                         if use_peer_port_nwg32
