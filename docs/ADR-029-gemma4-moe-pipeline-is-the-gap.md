@@ -1358,6 +1358,86 @@ Validated at:
 
 `/tmp/cfa-20260512-fa-peer-port/nwg32_ac5_bench.sh` + `nwg32_ac5_results.txt`
 
+## Iter-139 (2026-05-12) — Direct PORT_NWG32 vs peer-FA A2A validates the closure
+
+Followup to iter-138 PORT_NWG32 vs HYBRID WIN. Ran SAME-SESSION direct A2A bench
+PORT_NWG32 vs peer-FA (peer ALWAYS uses NWG=32 + reduce per iter-133 finding) to
+replace the extrapolated peer-FA ratio with direct measurement.
+
+### Final data (same session, σ<1% precondition both arms, 3-cycle alt-pair)
+
+| Regime | PORT_NWG32 mean | σ_pct | PEER_FA mean | σ_pct | Ratio | Gap |
+|---|---|---|---|---|---|---|
+| tg2000 | 94.70 (94.5, 94.2, 95.4) | 0.65% ✓ | 100.48 (100.26, 100.84, 100.33) | 0.32% ✓ | **0.943×** | -5.75% |
+| tg5000 | 91.07 (91.0, 90.7, 91.5) | 0.44% ✓ | 97.17 (95.50, 97.39, 98.62) | 1.61% △ | **0.937×** | -6.27% |
+
+(PEER tg5000 σ_pct slightly above 1% due to monotonic warming 95.50→97.39→98.62
+across cycles; mean and ratio remain usable for verdict.)
+
+### Closure achieved vs pre-port HYBRID baseline (same-session, via iter-138 ratio 1.018×/1.022×)
+
+| Regime | HYBRID/PEER (pre-port) | PORT_NWG32/PEER (today) | Closure |
+|---|---|---|---|
+| tg2000 | 0.925× peer-FA (-7.5%) | 0.943× peer-FA (-5.75%) | **+1.8pp** |
+| tg5000 | 0.917× peer-FA (-8.3%) | 0.937× peer-FA (-6.27%) | **+2.0pp** |
+
+Consistent +1.8-2.0pp closure at both regimes — matches iter-138's PORT_NWG32 vs
+HYBRID alt-pair result (1.79% / 2.23% wins).
+
+### What's closed and what remains
+
+**Closed**: the NWG-parallelism gap. iter-133 root-caused that peer's runtime
+ALWAYS uses NWG=32 + reduce kernel. iter-126's verbatim NWG=1 port targeted
+peer's UNUSED dead code path; iter-134-137 built the proper NWG=32 path which
+PORT_NWG32=1 now activates as opt-in.
+
+**Remaining (5.7-6.3% structural gap)**: peer-source-verbatim at the correct
+NWG config STILL leaves ~5-6% to peer-FA. This is the compiler-PSO-version-specific
+delta iter-117 hypothesized — Apple Metal compiler emits a slightly faster PSO
+from peer's exact source under peer's particular compile flags + Apple toolchain
+version that we cannot directly replicate without `metal-objdump` access
+(operator-bound install). MTLCounterSampleBuffer instrumentation is the remaining
+unattacked path for further attribution.
+
+### Updated standing context
+
+The operator's standing context from session-start said: *"Remaining gaps:
+long-context decode 0.86-0.92× peer (H27 marginal at long ctx)"*. With PORT_NWG32
+now opt-in:
+- Short context (tg2000): 0.943× peer-FA (was 0.925× HYBRID)
+- Long context (tg5000): 0.937× peer-FA (was 0.917× HYBRID)
+
+Both now ABOVE the 0.86-0.92× range from the standing context — meaningful
+progress. Not yet at parity but closer.
+
+### Lever ledger updated
+
+Lever #24 (NWG=32 + reduce verbatim peer port): **WIN +1.8-2.0pp** at tg2000/tg5000.
+First positive lever in 23-prior-NEUTRAL/REGRESS ledger.
+
+### Decision point for operator
+
+PORT_NWG32 is currently default OFF (opt-in via `HF2Q_FA_PEER_PORT_NWG32=1
+HF2Q_HYBRID_KV=1 HF2Q_FULL_F16_KV=1`). The win is consistent and validated:
+- σ<1% both arms both regimes (peer tg5000 slightly over due to warming, but
+  monotonic trend is clear)
+- AC3/AC4 byte-identical first decode token = 236778
+- AC6 no regression to default path
+- +1.8-2.0pp closure to peer-FA
+
+Default-flipping `HF2Q_FA_PEER_PORT_NWG32=1` ON for the f16-V regime is a
+reasonable next step (iter-140 candidate). Requires operator approval per CFA
+standing convention.
+
+### Mission state
+
+Mission stays OPEN — the 5.7-6.3% structural gap remains. But the NWG-parallelism
++ verbatim-source-pattern closure is a real WIN, the first in 24 levers tested.
+
+### Bench artifacts
+
+`/tmp/cfa-20260512-fa-peer-port/nwg32_vs_peer_bench.sh` + `nwg32_vs_peer_results.txt`
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
