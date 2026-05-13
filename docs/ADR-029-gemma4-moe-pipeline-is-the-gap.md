@@ -3337,3 +3337,70 @@ This is the work for the next session. Multi-iter refactor:
 
 Per `feedback_no_premature_mission_close`, the multi-regime gate must validate the refactor across tg100/tg2000/tg5000.
 
+## Iter-171 (2026-05-13) — Integration constraint analysis: GraphSession lifetime ties refactor scope
+
+**Goal**: identify the minimum architectural change required to wire `encoder_worker_singleton` into `forward_decode`.
+
+**Findings**:
+
+1. **Infrastructure ready**:
+   - `mlx-native/src/encoder_worker.rs`: `EncoderWorker::spawn()` + `submit(closure)` + tested.
+   - `hf2q/src/serve/encoder_worker_singleton.rs`: `submit_to_global_worker(closure)` lazy singleton + tests (singleton_can_run_closure, singleton_persists_across_calls).
+
+2. **Blocking constraint**: `GraphSession<'a>` holds `device: &'a MlxDevice` — a borrowed reference. The `'a` lifetime is tied to the parent function. Cannot directly move a GraphSession to a worker closure (which requires `'static + Send`).
+
+3. **Refactor scope to unblock**:
+   - **Option A** — `Arc<MlxDevice>`: change GraphSession to hold `Arc<MlxDevice>` instead of `&MlxDevice`. All call sites need update. ~200 LOC across mlx-native + hf2q.
+   - **Option B** — `'static MlxDevice`: have a process-level static MlxDevice (similar to the encoder_worker_singleton pattern). Risky because Metal devices are tied to lifetimes elsewhere.
+   - **Option C** — Per-worker GraphSession: create a NEW GraphSession on the worker thread; pass only data (not lifetimes). Worker has Arc<MlxBuffer> for inputs/outputs. Main has its own session. They merge results via buffer dependencies. ~150 LOC + careful sync.
+
+**Option C is the cleanest** because:
+- No invasive lifetime change to existing GraphSession
+- Worker creates its own session on its own thread
+- Buffers are already Arc-shareable (`Arc<MlxBuffer>`)
+- Main + worker each commit their own CB → GPU executes both in order via shared command queue
+
+**Implementation outline (Option C)**:
+
+```rust
+// Pseudocode for iter-172:
+fn forward_decode_parallel(&mut self, ...) -> Result<u32> {
+    // Snapshot Arc handles needed by worker
+    let device_arc = self.device.clone();  // requires Arc<MlxDevice>
+    let weights_arc = self.weights_arc.clone();  // already Arc
+    let acts_arc = self.activations_arc.clone();
+    let split_layer = 15;
+
+    // Main thread encodes layers 0..split into its own session
+    let mut s_main = exec.begin()?;
+    for l in 0..split_layer { encode_layer(&mut s_main, l, ...); }
+    let main_cb = s_main.commit();  // GPU starts on this CB
+
+    // Worker thread encodes layers split..num_layers in PARALLEL with main's GPU
+    let (tx, rx) = mpsc::channel();
+    let worker_inputs = (device_arc, weights_arc, acts_arc, split_layer, num_layers);
+    submit_to_global_worker(move || {
+        let mut s_worker = exec_from(&device_arc).begin()?;
+        for l in split_layer..num_layers { encode_layer(&mut s_worker, l, ...); }
+        let _worker_cb = s_worker.commit();
+        tx.send(()).ok();
+    })?;
+
+    rx.recv()?;  // worker done encoding+committing
+    // Both CBs in queue. wait_until_completed on the LAST one for sync.
+    last_cb.wait_until_completed();
+    // ... head + sample ...
+}
+```
+
+**Remaining LOC estimate after Option C**:
+- Arc-wrap device + activation buffers: 50-80 LOC
+- `encode_layer(&mut session, l, ...)` extraction: 200-300 LOC
+- `forward_decode_parallel` new variant: 100 LOC
+- HF2Q_DECODE_PARALLEL_ENCODE feature flag + dispatcher: 30 LOC
+- Multi-regime gate: 0 LOC (just bench)
+
+**Total**: ~380-510 LOC. Multi-iter scope. Per the previous iter's -43 tok/s falsification, the persistent worker pattern (not naive per-token spawn) is the proven cost basis.
+
+**Decision**: this is the work to do. Next iter (172): start with Arc-wrapping. Each iter ships measurable progress per `feedback_loop_iteration_cadence_180s`.
+
