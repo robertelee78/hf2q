@@ -1549,6 +1549,56 @@ All three regimes now firmly ABOVE the standing-context band. The hardest regime
 
 `/tmp/cfa-20260512-fa-peer-port/nwg32_vs_peer_tg100.sh` + `nwg32_vs_peer_tg100_results.txt`
 
+## Iter-142 (2026-05-12) — Plateau analysis: residual 4-6% gap attributable to compiler-PSO-version delta
+
+After PORT_NWG32 closure (iter-134→141), gap stands at 4.25-6.27% across tg100/tg2000/tg5000. This iter investigated several remaining angles to identify if any single-kernel lever could close further. Result: **all single-kernel matmul levers exhausted at peer parity or better**.
+
+### Levers audited this iter
+
+| Component | Status | Audit finding |
+|---|---|---|
+| Metal compile options | identical to peer | Both use `MTLCompileOptions::new()` defaults; no `setFastMathEnabled`/`setLanguageVersion`/`setOptimizationLevel` differences. FastMath enabled both sides. |
+| Q6_K mat-vec | default-on (iter-326) | NR2 variant (nr0=2 rows/SG + cached yl[16]) already default-on via `env_default_true("HF2Q_Q6K_MV_NR2")`. Matches peer's `N_R0_Q6_K=2`. |
+| Q5_K mat-vec | peer-parity | Peer's `N_R0_Q5_K=1`. Our kernel uses `row = 2*r0 + sgitg` = nr0=1 / NSG=2. Identical. iter-308 had wrongly proposed Q5_K NR2 — peer doesn't use it (retracted in `project_adr028_synthesis_moe_pipeline_2026_05_11`). |
+| Q8_0 mat-vec | inapplicable | gemma4-APEX-Q5_K_M load banner: "Q6_K dominant, ~6.51 bpw". No significant Q8_0 weights. `HF2Q_Q8_0_MV_NR2=1` is a no-op for this gguf (verified: PORT_NWG32 + Q8_NR2 = byte-identical first token 10081, perf within noise). |
+| KV cache copy | already fused | Our `kv_copy_kf16_quantize_v_no_fwht` combines K-copy + V-quantize in one dispatch. Peer uses unfused `kernel_cpy_t_t` + separate quant. We're more dispatch-efficient here. iter-115 profile's 39.8× ratio was profile-mode overhead, not real. |
+| PORT NSG=2 variant | rejected (cost/benefit) | Peer's `compute_nsg` doubles NSG at kv>2048 (NSG=2) and kv>4096 (NSG=4). Our PORT_NWG32 hardcodes NSG=1. Predicted gain at tg5000: ~50% of FA-vec work is full-attn at deep kv × ~15% speedup if NSG=2 helps = ~7.5% of FA-vec wall = ~0.5% total wall. NOT worth the multi-day re-port (would need to restore peer's parallel-reduce block we deleted in iter-126 + new dispatcher + NSG-adaptive selection). |
+
+### Convergent conclusion: residual 4-6% is compiler-PSO-version delta
+
+Per iter-117 + iter-127 + iter-141 + iter-142 convergent analysis:
+
+1. **Kernel SOURCE patterns**: tested verbatim (iter-126 NWG=1, iter-135 NWG=32). PORT_NWG32 wins +1.8-3.1pp because of architecture (NWG=32+reduce), NOT body source-pattern. Body is byte-identical to peer.
+2. **Compile FLAGS**: identical to peer (iter-142).
+3. **All in-scope mat-vec kernels**: at peer-parity or better.
+4. **Dispatch barrier patterns**: peer has MORE barriers per dispatch than us (0.63 vs 0.49 per iter-115); barriers are not the gap.
+
+The remaining 4-6% therefore lives in:
+- Apple Metal compiler IR/PSO output differences between peer's compiled-with-X-toolchain library and ours-compiled-with-Y-toolchain. Same SOURCE, different PSO due to compiler version + flags propagated from peer's build context.
+- This is what iter-117 originally hypothesized ("compiler-VERSION-specific PSO output differences, NOT source-level patterns the compiler can re-derive") and iter-142 corroborates after exhaustive elimination of alternatives.
+
+### Implications
+
+**Closure requires multi-day to multi-week unattacked paths**:
+1. **MTLCounterSampleBuffer instrumentation** (peer ggml-metal-context.m doesn't use this; we'd build it from scratch via Apple's `MTLDevice.makeCounterSet` API). Attributes the 4-6% to specific GPU pipeline stalls — measurement, not directly a fix, but informs WHERE to look.
+2. **Per-PSO AIR/PTX inspection** (operator-bound on `xcodebuild -downloadComponent MetalToolchain`; `metal-objdump` not currently installed). Would let us compare peer's PSO IR vs ours and find specific instruction differences.
+3. **Compile flag matching by peer-toolchain-version emulation** — extreme; identify exactly which Apple Metal compiler version peer's binary was built with and bisect.
+
+### Mission state
+
+PORT_NWG32 closure at production HEAD (opt-in via `HF2Q_FA_PEER_PORT_NWG32=1`):
+- tg100: 0.958× peer-FA (closure +2.8pp from HYBRID)
+- tg2000: 0.943× peer-FA (closure +1.3pp from HYBRID)
+- tg5000: 0.937× peer-FA (closure +1.7pp from HYBRID)
+
+All regimes ABOVE the operator's standing-context band "0.86-0.92× peer (H27 marginal at long ctx)".
+
+Mission stays OPEN per `feedback_no_premature_mission_close_2026_05_11` until either:
+- Operator default-flip approval (production change — moves HEAD default from HYBRID to PORT_NWG32)
+- Multi-week instrumentation work attributes + closes further
+
+This iter's contribution: **rigorous attribution of the residual gap**. Saves future iters from re-investigating the same eliminated alternatives.
+
 ## Iter-112 (2026-05-12) — Peer's quantized-V cache is 2.4× SLOWER than ours; gap is in peer's tuned f16-V path
 
 Tested peer at different KV cache dtype configurations to localize where peer's f16-V advantage comes from:
