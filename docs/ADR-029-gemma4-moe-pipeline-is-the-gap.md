@@ -2982,3 +2982,38 @@ All σ < 1% protocol met. Multi-regime prefill gate satisfied.
 
 This is the actual production state. The standing-context framing is two iterations behind reality on BOTH axes.
 
+## Iter-161 (2026-05-13) — H93 lever DISCOVERED: peer just ported FC-promotion for mul_mv int-divisors
+
+**Trigger**: per mantra "Never guess. Read peer code", checked llama.cpp/origin/master for upstream changes since iter-138 baseline. Found commit `da4495332` (2026-05-12, day before yesterday): *"metal : promote mul_mv/mul_mm batch divisors to function constants (#22711)"*.
+
+**What peer changed**: in `kernel_mul_mv_q*_f32_impl` (the matvec kernels we dispatch heavily during decode), peer promoted three runtime args to function constants:
+- `args.ne12` → `FC_mul_mv_ne12` (FC_MUL_MV + 2)
+- `args.r2`   → `FC_mul_mv_r2`   (FC_MUL_MV + 3)
+- `args.r3`   → `FC_mul_mv_r3`   (FC_MUL_MV + 4)
+
+The diff replaces `im % args.ne12`, `i12 / args.r2`, `i13 / args.r3` with `im % FC_mul_mv_ne12`, etc. **Integer divisions** on Apple Silicon are expensive (~10-15 cycles, can't be pipelined). When the divisor is a function constant, the compiler **specializes magic-number multiplication** at PSO compile time → ~1-2 cycles per operation.
+
+**Why mlx-native is exposed to this**: grep confirms mlx-native's `quantized_matmul_ggml.metal` (Q5_K matvec hot path for gemma4 decode) has the EXACT SAME pattern across 16+ kernels:
+
+```metal
+const uint i12 = im % p.ne12;
+const uint i13 = im / p.ne12;
+const uint offset0 = first_row * nb + (i12/p.r2)*(nb*p.ne01) + (i13/p.r3)*(nb*p.ne01*p.ne02);
+```
+
+Per `project_adr028_iter308_q6k_smoking_gun_2026_05_10`, q5_K/q6_K matvec is the dispatch hot path (peer 1339 dispatches/decode-token). Each dispatch currently does 3-4 integer divisions per thread.
+
+**H93 hypothesis (testable)**: porting peer's da4495332 — adding `FC_qmatmul_ne12`, `FC_qmatmul_r2`, `FC_qmatmul_r3` function constants to `quantized_matmul_ggml.metal` and setting them at PSO instantiation — will close some of the residual 6-7% decode gap by replacing per-thread integer div with magic-multiply at PSO compile.
+
+**Predicted gain**: At ~30 layers × 7 mat ops/layer = ~210 matvec dispatches/decode-token, each with 3 div-by-FC operations × thread-count, the savings compound. Order-of-magnitude estimate: 1-3% wall, possibly higher if div latency was hidden behind cache misses.
+
+**Effort**:
+- Shader: add 3 FC decls + replace ~30 `p.ne12/p.r2/p.r3` usages with FC equivalents across 16+ kernels in `quantized_matmul_ggml.metal`
+- Dispatcher: extend `quantized_matmul_ggml` to set the 3 FCs at PSO instantiation (per-shape cache key)
+- Build, coherence test, alt-pair bench multi-regime
+- Risk: 16 kernels touched; PSO cache key expansion (3 new dims); coherence must be verified across all gemma4 shapes
+
+**Scope**: scheduled for iter-162 implementation (multi-cycle work; safer to dedicate a fresh iter than rush iter-161). The first NEW lever in 23 iterations since PORT_NWG32 (iter-138). Worth doing properly.
+
+**Companion peer commits to investigate**: only `da4495332` since iter-138 baseline. No FA-vec changes upstream. Confirms iter-156 reframe holds for FA but suggests matvec is the actually-reachable optimization surface for the residual decode gap.
+
