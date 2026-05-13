@@ -3047,3 +3047,31 @@ Per `project_adr028_iter308_q6k_smoking_gun_2026_05_10`, q5_K/q6_K matvec is the
 
 Multi-regime gate in flight (tg100 + tg5000 × 3) to verify the win holds across regimes per `feedback_no_premature_mission_close`. If multi-regime confirms, merge to main.
 
+### Iter-162 — Multi-regime gate MET, MERGED TO MAIN
+
+3-cycle alt-pair at tg100 + tg5000:
+
+| regime | main t/s | h93 t/s | Δ% | ratio vs peer-FA |
+|---:|---:|---:|---:|---:|
+| **tg100**  | 95.267 ± 0.047 (σ 0.05%) | 96.467 ± 0.124 (σ 0.13%) | **+1.26%** | 0.9265 → **0.9362** |
+| **tg2000** | 92.625 ± 0.043 (σ 0.05%) | 93.625 ± 0.043 (σ 0.05%) | **+1.08%** | 0.9338 → **0.9441** |
+| **tg5000** | 90.267 ± 0.247 (σ 0.27%) | 91.067 ± 0.047 (σ 0.05%) | **+0.89%** | 0.9358 → **0.9434** |
+
+All 3 regimes positive, all σ < 0.3% (≪ 1% protocol precondition). Per-cycle direction split 0/3 (all H93). Multi-regime gate satisfied per `feedback_no_premature_mission_close_2026_05_11`.
+
+**Merged to main** (mlx-native `a21e504`, hf2q `e97f7927`). Production HEAD now ships H93 by default.
+
+**Pattern observation**: gain is largest at tg100 (+1.26%) and smallest at tg5000 (+0.89%). Consistent with the mechanism: matvec FC-promotion saves cycles in the per-dispatch matvec; at long ctx, FA dispatch wall grows faster than matvec wall, so the relative saving shrinks. Still positive at all 3 regimes.
+
+**Combined HEAD state at iter-162**:
+
+| axis | regime | hf2q vs peer-FA | direction |
+|---|---|---|---|
+| **Prefill** | pp1800 | **1.072×** | hf2q AHEAD |
+| **Prefill** | pp3700 | **1.087×** | hf2q AHEAD |
+| Decode | tg100 | 0.9362× | gap +1.26pp closed |
+| Decode | tg2000 | 0.9441× | gap +1.03pp closed |
+| Decode | tg5000 | 0.9434× | gap +0.76pp closed |
+
+**27-lever falsification ledger status**: 2 wins (PORT_NWG32 iter-138, H93 iter-162), 25 falsifications. H93 is the FIRST decode WIN in the default-config TQ-active production path (PORT_NWG32 only helps F16-V regime).
+
