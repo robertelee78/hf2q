@@ -1957,6 +1957,34 @@ impl MlxModelWeights {
                                     hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
                                 ).map_err(|e| anyhow::anyhow!("batched hybrid V no-FWHT L{layer_idx}: {e}"))?;
                             }
+                            // ADR-030 iter-98 — populate BF16 xlen cache from
+                            // pf_k_perm/pf_v_perm BF16 head-major (single
+                            // F32→BF16 rounding at fused_head_norm_rope's
+                            // output).  Bit-identical to what Option C's
+                            // SDPA reads.  Kernel byte-identity verified at
+                            // iter-97 (mlx-native commit bf1befd).
+                            // Write-only this iteration — no SDPA reads yet
+                            // (iter-99+ will swap xlen branch to use cache).
+                            if let (Some(ref bf16_k), Some(ref bf16_v)) =
+                                (&hybrid_kv[layer_idx].bf16_xlen_k,
+                                 &hybrid_kv[layer_idx].bf16_xlen_v) {
+                                s.barrier_between(&[&pf_k_perm], &[bf16_k]);
+                                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major(
+                                    s.encoder_mut(), reg, metal_dev,
+                                    &pf_k_perm, bf16_k,
+                                    nkv as u32, hd as u32,
+                                    hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
+                                    seq_len as u32,
+                                ).map_err(|e| anyhow::anyhow!("post-SDPA bf16 xlen K L{layer_idx}: {e}"))?;
+                                s.barrier_between(&[&pf_v_perm], &[bf16_v]);
+                                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major(
+                                    s.encoder_mut(), reg, metal_dev,
+                                    &pf_v_perm, bf16_v,
+                                    nkv as u32, hd as u32,
+                                    hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
+                                    seq_len as u32,
+                                ).map_err(|e| anyhow::anyhow!("post-SDPA bf16 xlen V L{layer_idx}: {e}"))?;
+                            }
                         }
                     } else if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
                         let hb_cap = leg_hb_enc[layer_idx].capacity as u32;
