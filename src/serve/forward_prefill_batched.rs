@@ -1390,6 +1390,42 @@ impl MlxModelWeights {
                             q_f32, q_f16, q_n_elems,
                             mlx_native::ops::elementwise::CastDirection::F32ToF16,
                         ).map_err(|e| anyhow::anyhow!("xlen Q F32->F16 L{layer_idx}: {e}"))?;
+                        // ADR-030 iter-82 — runtime cast-chain diagnostic
+                        // (HF2Q_DFLASH_XLEN_DEBUG=1).  Commits the session,
+                        // reads Q/K/V/out at L0 + final layer only, prints
+                        // first 8 values each.  Lets us bisect between cast
+                        // corruption (Q wrong), K/V data integrity (K/V
+                        // wrong), kernel misconfig (Q/K/V fine, out wrong),
+                        // AND downstream corruption (L0 fine, final wrong).
+                        let xlen_debug = std::env::var("HF2Q_DFLASH_XLEN_DEBUG").as_deref() == Ok("1");
+                        if xlen_debug {
+                            s.finish().map_err(|e| anyhow::anyhow!("xlen debug pre-SDPA finish: {e}"))?;
+                            let q_slice = q_f16.as_slice::<half::f16>()
+                                .map_err(|e| anyhow::anyhow!("xlen debug Q slice: {e}"))?;
+                            let k_slice = layer_kv.k.as_slice::<half::f16>()
+                                .map_err(|e| anyhow::anyhow!("xlen debug K slice: {e}"))?;
+                            let v_slice = layer_kv.v_packed.as_slice::<half::f16>()
+                                .map_err(|e| anyhow::anyhow!("xlen debug V slice: {e}"))?;
+                            let qstart = 0usize; // [h=0, t=0, d=0..8]
+                            let kstart_0 = 0usize; // [h=0, p=0, d=0..8]
+                            let kstart_sp = (start_pos as usize) * (hd as usize); // [h=0, p=start_pos, d=0..8]
+                            eprintln!(
+                                "[XLEN_DEBUG sliding L{} verify start_pos={} seq_len={}]\n  \
+                                 Q[h=0,t=0,d=0..8] = {:?}\n  \
+                                 K[h=0,p=0,d=0..8] = {:?}\n  \
+                                 K[h=0,p={},d=0..8] = {:?}\n  \
+                                 V[h=0,p=0,d=0..8] = {:?}\n  \
+                                 V[h=0,p={},d=0..8] = {:?}",
+                                layer_idx, start_pos, seq_len,
+                                &q_slice[qstart..qstart + 8],
+                                &k_slice[kstart_0..kstart_0 + 8],
+                                start_pos, &k_slice[kstart_sp..kstart_sp + 8],
+                                &v_slice[kstart_0..kstart_0 + 8],
+                                start_pos, &v_slice[kstart_sp..kstart_sp + 8],
+                            );
+                            s = exec.begin().map_err(|e| anyhow::anyhow!("xlen debug post-dump reopen: {e}"))?;
+                        }
+
                         s.barrier_between(&[q_f16, &layer_kv.k, &layer_kv.v_packed], &[out_f16]);
                         mlx_native::ops::flash_attn_prefill::
                             dispatch_flash_attn_prefill_f16_d256_resume(
@@ -1409,6 +1445,16 @@ impl MlxModelWeights {
                                 kv_capacity: layer_kv.capacity as u32,
                             },
                         ).map_err(|e| anyhow::anyhow!("xlen sliding SDPA L{layer_idx}: {e}"))?;
+                        if xlen_debug {
+                            s.finish().map_err(|e| anyhow::anyhow!("xlen debug post-SDPA finish: {e}"))?;
+                            let out_slice = out_f16.as_slice::<half::f16>()
+                                .map_err(|e| anyhow::anyhow!("xlen debug out slice: {e}"))?;
+                            eprintln!(
+                                "  OUT[h=0,t=0,d=0..8] = {:?}",
+                                &out_slice[0..8],
+                            );
+                            s = exec.begin().map_err(|e| anyhow::anyhow!("xlen debug post-out reopen: {e}"))?;
+                        }
                         s.barrier_between(&[out_f16], &[out_f32]);
                         mlx_native::ops::elementwise::cast(
                             s.encoder_mut(), reg, metal_dev,
@@ -1484,7 +1530,14 @@ impl MlxModelWeights {
                     //   /opt/hf2q/docs/ADR-011-phase2-wave2c-d512-bug-fix.md
                     // for the per-line trace, the math, and the per-test
                     // tolerance numbers.
-                    if xlen_sdpa_mode {
+                    // ADR-030 iter-82 — env-gated D=512 xlen bypass for bisection.
+                    // HF2Q_DFLASH_XLEN_D512_OFF=1 routes the full-attn (D=512)
+                    // layers through the STANDARD non-xlen path while keeping
+                    // sliding (D=256) layers on the xlen path.  Lets us
+                    // bisect whether the iter-78 NaN is in our D=512 xlen
+                    // wiring or elsewhere.
+                    let xlen_d512_disabled = std::env::var("HF2Q_DFLASH_XLEN_D512_OFF").as_deref() == Ok("1");
+                    if xlen_sdpa_mode && !xlen_d512_disabled {
                         // ADR-030 iter-78 — pre-SDPA hybrid_kv write (D=512).
                         let hybrid_kv_vec = self.hybrid_kv.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("xlen SDPA L{layer_idx}: hybrid_kv not allocated — HF2Q_FULL_F16_KV=1 required"))?;
@@ -1535,6 +1588,33 @@ impl MlxModelWeights {
                             q_f32, q_f16, q_n_elems,
                             mlx_native::ops::elementwise::CastDirection::F32ToF16,
                         ).map_err(|e| anyhow::anyhow!("xlen Q F32->F16 L{layer_idx}: {e}"))?;
+                        // ADR-030 iter-82 — D=512 xlen debug (same as D=256 above).
+                        let xlen_debug_d512 = std::env::var("HF2Q_DFLASH_XLEN_DEBUG").as_deref() == Ok("1");
+                        if xlen_debug_d512 {
+                            s.finish().map_err(|e| anyhow::anyhow!("xlen debug D512 pre-SDPA finish: {e}"))?;
+                            let q_slice = q_f16.as_slice::<half::f16>()
+                                .map_err(|e| anyhow::anyhow!("xlen debug D512 Q slice: {e}"))?;
+                            let k_slice = layer_kv.k.as_slice::<half::f16>()
+                                .map_err(|e| anyhow::anyhow!("xlen debug D512 K slice: {e}"))?;
+                            let v_slice = layer_kv.v_packed.as_slice::<half::f16>()
+                                .map_err(|e| anyhow::anyhow!("xlen debug D512 V slice: {e}"))?;
+                            let kstart_sp = (start_pos as usize) * (hd as usize);
+                            eprintln!(
+                                "[XLEN_DEBUG global L{} verify start_pos={} seq_len={} hd={}]\n  \
+                                 Q[h=0,t=0,d=0..8] = {:?}\n  \
+                                 K[h=0,p=0,d=0..8] = {:?}\n  \
+                                 K[h=0,p={},d=0..8] = {:?}\n  \
+                                 V[h=0,p=0,d=0..8] = {:?}\n  \
+                                 V[h=0,p={},d=0..8] = {:?}",
+                                layer_idx, start_pos, seq_len, hd,
+                                &q_slice[0..8],
+                                &k_slice[0..8],
+                                start_pos, &k_slice[kstart_sp..kstart_sp + 8],
+                                &v_slice[0..8],
+                                start_pos, &v_slice[kstart_sp..kstart_sp + 8],
+                            );
+                            s = exec.begin().map_err(|e| anyhow::anyhow!("xlen debug D512 reopen: {e}"))?;
+                        }
                         s.barrier_between(&[q_f16, &layer_kv.k, &layer_kv.v_packed], &[out_f16]);
                         mlx_native::ops::flash_attn_prefill_d512::
                             dispatch_flash_attn_prefill_f16_d512_resume(
@@ -1554,6 +1634,21 @@ impl MlxModelWeights {
                                 kv_capacity: layer_kv.capacity as u32,
                             },
                         ).map_err(|e| anyhow::anyhow!("xlen global SDPA L{layer_idx}: {e}"))?;
+                        if xlen_debug_d512 {
+                            s.finish().map_err(|e| anyhow::anyhow!("xlen debug D512 post-SDPA finish: {e}"))?;
+                            let out_slice = out_f16.as_slice::<half::f16>()
+                                .map_err(|e| anyhow::anyhow!("xlen debug D512 out slice: {e}"))?;
+                            let n_used = (nh * seq_len * hd) as usize;
+                            let nan_count = out_slice[..n_used].iter().filter(|x| x.is_nan()).count();
+                            let inf_count = out_slice[..n_used].iter().filter(|x| x.is_infinite()).count();
+                            let max_abs = out_slice[..n_used].iter()
+                                .filter(|x| x.is_finite())
+                                .map(|x| x.to_f32().abs())
+                                .fold(0.0f32, f32::max);
+                            eprintln!("  OUT[h=0,t=0,d=0..8]={:?} nan={} inf={} max_abs={:.4e}",
+                                &out_slice[0..8], nan_count, inf_count, max_abs);
+                            s = exec.begin().map_err(|e| anyhow::anyhow!("xlen debug D512 post-out reopen: {e}"))?;
+                        }
                         s.barrier_between(&[out_f16], &[out_f32]);
                         mlx_native::ops::elementwise::cast(
                             s.encoder_mut(), reg, metal_dev,
@@ -2466,6 +2561,26 @@ impl MlxModelWeights {
                     let pf_data: &[f32] = pf_hidden.as_slice()
                         .map_err(|e| anyhow::anyhow!("dflash capture pf_hidden L{layer_idx}: {e}"))?;
                     let needed = seq_len * hs;
+                    // ADR-030 iter-82 — dump pf_hidden[t=0, d=0..8] at L0/Lfinal
+                    // (env-gated) to bisect SDPA-correct vs hidden-state-wrong.
+                    if std::env::var("HF2Q_DFLASH_XLEN_DEBUG").as_deref() == Ok("1")
+                        && start_pos > 0
+                    {
+                        let n = 4.min(hs);
+                        // Detect NaN/Inf and report magnitude summary.
+                        let nan_count = pf_data[..needed].iter().filter(|x| x.is_nan()).count();
+                        let inf_count = pf_data[..needed].iter().filter(|x| x.is_infinite()).count();
+                        let max_abs = pf_data[..needed].iter()
+                            .filter(|x| x.is_finite())
+                            .map(|x| x.abs())
+                            .fold(0.0f32, f32::max);
+                        eprintln!(
+                            "[XLEN_DEBUG capture L{} verify start_pos={} seq_len={} hs={}] \
+                             pf_hidden[t=0,d=0..{}]={:?} nan={} inf={} max_abs={:.4e}",
+                            layer_idx, start_pos, seq_len, hs, n,
+                            &pf_data[..n], nan_count, inf_count, max_abs,
+                        );
+                    }
                     if pf_data.len() >= needed {
                         Some(pf_data[..needed].to_vec())
                     } else {
