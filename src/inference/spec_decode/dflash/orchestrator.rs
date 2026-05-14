@@ -647,6 +647,14 @@ pub fn dispatch_dflash_generate(
         output.extend(round.committed_tokens.iter().copied());
         seq_pos += n_committed;
         last_token = *round.committed_tokens.last().unwrap();
+
+        // 10. Trim captured to only the target-accepted positions before
+        //     handing to next round's drafter (mirrors Python model_mlx.py:567
+        //     `hidden = hidden[:, :accepted + 1, :]`). Without this, drafter
+        //     would see all K+1 verify positions as ctx, including rejected
+        //     ones — breaks Phase 4 coherence.
+        let mut next_captured = next_captured;
+        super::hidden_capture::trim_capture_to(&mut next_captured, n_committed);
         captured = next_captured;
 
         if round.hit_eos {

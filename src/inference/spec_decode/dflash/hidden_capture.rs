@@ -59,6 +59,45 @@ pub struct PrefillCapture<'a> {
     pub per_position_argmaxes: Option<&'a mut [u32]>,
 }
 
+/// Trim a `DFlashCaptureSession`'s hidden_output down to the first
+/// `new_seq_len` positions per captured layer.
+///
+/// Used by the multi-round orchestrator after `step_round_from_argmaxes`
+/// reports `accept_count + 1` accepted tokens. Per Python
+/// `model_mlx.py:567` `hidden = hidden[:, :accepted + 1, :]`, the
+/// drafter's ctx K/V for the next round must reflect ONLY the
+/// target-accepted positions. Without this trim, the drafter would
+/// see all K+1 verify positions as ctx, including rejected ones —
+/// breaks Phase 4 coherence.
+///
+/// This is an in-place buffer rewrite (allocates a smaller Vec,
+/// copies slabs, swaps). Cost is proportional to
+/// `target_layer_ids.len() * new_seq_len * hidden_size` floats.
+pub fn trim_capture_to(
+    session: &mut super::hidden_capture::DFlashCaptureSession,
+    new_seq_len: usize,
+) {
+    if new_seq_len >= session.seq_len {
+        return;
+    }
+    let n_layers = session.target_layer_ids.len();
+    let hs = session.hidden_size;
+    let old_seq_len = session.seq_len;
+    let mut new_buf = vec![0.0f32; n_layers * new_seq_len * hs];
+    for l in 0..n_layers {
+        for t in 0..new_seq_len {
+            let src = (l * old_seq_len + t) * hs;
+            let dst = (l * new_seq_len + t) * hs;
+            new_buf[dst..dst + hs].copy_from_slice(&session.hidden_output[src..src + hs]);
+        }
+    }
+    session.hidden_output = new_buf;
+    session.seq_len = new_seq_len;
+    if let Some(pa) = session.per_position_argmaxes.as_mut() {
+        pa.truncate(new_seq_len);
+    }
+}
+
 impl<'a> PrefillCapture<'a> {
     /// Validate that the buffer sizes match the declared seq_len +
     /// hidden_size + num_capture_layers. Cheap check at call boundary
@@ -423,6 +462,54 @@ mod tests {
         for v in slab.iter() {
             assert_eq!(*v, 9.0);
         }
+    }
+
+    #[test]
+    fn trim_capture_to_compacts_buffer_and_keeps_first_positions() {
+        // 3 layers × 5 positions × 4 dim. Trim to 2 positions.
+        let mut sess = DFlashCaptureSession::new(vec![1, 6, 11], 5, 4, true);
+        // Fill: hidden[(l * 5 + t) * 4 + d] = l * 100 + t * 10 + d
+        for l in 0..3 {
+            for t in 0..5 {
+                for d in 0..4 {
+                    sess.hidden_output[(l * 5 + t) * 4 + d] = (l * 100 + t * 10 + d) as f32;
+                }
+            }
+        }
+        if let Some(pa) = sess.per_position_argmaxes.as_mut() {
+            for (i, v) in pa.iter_mut().enumerate() {
+                *v = i as u32;
+            }
+        }
+        trim_capture_to(&mut sess, 2);
+        assert_eq!(sess.seq_len, 2);
+        assert_eq!(sess.hidden_output.len(), 3 * 2 * 4);
+        // Verify positions 0 + 1 preserved per layer
+        for l in 0..3 {
+            for t in 0..2 {
+                for d in 0..4 {
+                    let expected = (l * 100 + t * 10 + d) as f32;
+                    let actual = sess.hidden_output[(l * 2 + t) * 4 + d];
+                    assert_eq!(actual, expected, "l={l} t={t} d={d}");
+                }
+            }
+        }
+        // argmaxes truncated
+        assert_eq!(
+            sess.per_position_argmaxes.as_ref().map(|v| v.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn trim_capture_to_no_op_when_new_geq_old() {
+        let mut sess = DFlashCaptureSession::new(vec![1, 6], 3, 4, false);
+        let orig_len = sess.hidden_output.len();
+        for v in sess.hidden_output.iter_mut() { *v = 7.0; }
+        trim_capture_to(&mut sess, 5); // 5 > 3, no-op
+        assert_eq!(sess.seq_len, 3);
+        assert_eq!(sess.hidden_output.len(), orig_len);
+        assert!(sess.hidden_output.iter().all(|&v| v == 7.0));
     }
 
     #[test]
