@@ -2278,3 +2278,46 @@ as an opt-in experimental path (HF2Q_DFLASH_XLEN_SDPA=1) that works
 on prompts where precision drift doesn't accumulate past argmax-flip
 threshold.
 
+
+### iter-95 — BF16 cache foundation shipped (mlx-native side)
+
+Building on iter-93's root cause (F16 hybrid_kv + cast chain ≠ Option C's pure BF16 from head_norm_rope), iter-95 ships the foundational kernel + dispatcher in mlx-native:
+
+**Added (mlx-native commit 83cb002):**
+- `kv_cache_copy_seq_bf16_to_bf16_head_major` Metal kernel
+  (`src/shaders/kv_cache_copy.metal:351`)
+- `dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major` Rust wrapper
+  (`src/ops/kv_cache_copy.rs:806`)
+- Kernel registry entry (`src/kernel_registry.rs:389`)
+- 298/298 lib tests pass
+
+**Semantics:** bit-exact BF16 → BF16 strided copy from pf_k_perm/pf_v_perm
+(head-major BF16 `[n_heads, src_seq_len, head_dim]`) into a persistent
+BF16 cache (head-major `[n_heads, capacity, head_dim]`).  No
+intermediate F32 rounding.  Ring-wrap supported via `dst_pos % capacity`
+for sliding-window layers.
+
+**Why this matters**: When propagated through every layer, the cache
+will contain BF16 K/V at positions [0..start_pos) BIT-IDENTICAL to
+what Option C's pf_k_perm contains at those positions (both come from
+the same head_norm_rope BF16 output via single F32→BF16 rounding).
+With Option A xlen reading this cache instead of hybrid_kv F16, the
+precision drift root-caused at iter-92/93 disappears.
+
+**Next iterations (iter-96+):**
+1. Extend `HybridKvBuffers` with optional BF16 xlen K/V buffers
+   (or add new field on `MlxModelWeights` to avoid breaking change).
+2. Lazy-allocate the BF16 xlen cache on first forward call with
+   xlen env flag set.
+3. Standard non-xlen post-SDPA write hook: ALSO call the new
+   dispatcher to populate BF16 cache from pf_k_perm/pf_v_perm.
+4. Update D=256 + D=512 xlen branches to source K/V from the
+   BF16 cache + use BF16 resume kernels (mirroring iter-84 D=512
+   pattern).
+5. Validate coherence on all 5 prompts from iter-92.
+
+Memory cost estimate: gemma-4 sliding cap=1024 × 256 dim × 4 nkv ×
+2 bytes = 2MB per sliding layer × 25 layers = 50MB.  Plus global
+layers (small).  Total ~55MB additional persistent storage when
+xlen mode is active.
+
