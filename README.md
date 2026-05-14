@@ -10,7 +10,7 @@ Apple Silicon.
 | **Rust** | 1.81+ |
 | **Inference backend** | [`mlx-native`](https://crates.io/crates/mlx-native) (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (`llama.cpp` consumers), mlx-lm safetensors |
-| **Status** | Production usage on M-series Macs; structural performance parity with `llama.cpp` peer at HEAD |
+| **Status** | Pre-release on M-series Macs. Some paths are fast and well-tested (batched prefill, TQ KV cache, Qwen 3.5 / 3.6 convert + serve); others are incomplete or actively under investigation (Gemma-4 decode gap, spec-decode wire-up, multi-arch coverage). See the ADR ledger for per-feature status. |
 
 ```bash
 # Convert a HuggingFace model to a Q4_K_M GGUF
