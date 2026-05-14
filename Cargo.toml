@@ -55,6 +55,9 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
 ahash = "0.8"
+# ADR-030 Phase 6 — Leviathan rejection sampling for temp > 0 spec-decode.
+# rand 0.8 is already in the dep tree transitively; promote to direct.
+rand = "0.8"
 
 # Async runtime + HTTP server (for `serve` subcommand)
 tokio = { version = "1", features = ["full"] }
