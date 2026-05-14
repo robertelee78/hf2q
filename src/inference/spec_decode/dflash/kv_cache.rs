@@ -165,6 +165,68 @@ impl DFlashLayerKvCache {
     pub fn rollback(&mut self, n: u32) {
         self.seq_len = self.seq_len.saturating_sub(n);
     }
+
+    /// Write seq-major prop K/V into the cache's SLACK space (positions
+    /// `[seq_len..seq_len+n]`) without advancing `seq_len`.
+    ///
+    /// Used per DFlash spec-decode step for the in-flight prop K/V
+    /// (mirrors `mx.concatenate([cached, prop], axis=2)` in the Python
+    /// — but we materialize the concat in-place in the cache slack
+    /// rather than allocating a fresh buffer). The next call's
+    /// `append_seq_major_kv` overwrites whatever was written here.
+    ///
+    /// After this call, the cache's `[seq_len..seq_len+n]` positions
+    /// hold prop K/V. The SDPA call should use `kv_seq_len = seq_len
+    /// + n` and `kv_capacity = capacity` — the kernel reads `kv_seq_len`
+    /// positions starting at offset 0 per head.
+    ///
+    /// Errors if `seq_len + n > capacity`.
+    pub fn write_slack_kv(
+        &mut self,
+        k_seq_major: &[f32],
+        v_seq_major: &[f32],
+        n: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> anyhow::Result<()> {
+        if self.seq_len.saturating_add(n) > self.capacity {
+            return Err(anyhow::anyhow!(
+                "dflash write_slack_kv layer {} would exceed capacity: seq_len={}, n={}, capacity={}",
+                self.layer_idx, self.seq_len, n, self.capacity
+            ));
+        }
+        let n_h = num_kv_heads as usize;
+        let d = head_dim as usize;
+        let cap = self.capacity as usize;
+        let n_usize = n as usize;
+        let start = self.seq_len as usize;
+
+        let expected = n_usize * n_h * d;
+        if k_seq_major.len() != expected || v_seq_major.len() != expected {
+            return Err(anyhow::anyhow!(
+                "dflash write_slack_kv: lens K={} V={} != n({}) * H({}) * D({}) = {}",
+                k_seq_major.len(), v_seq_major.len(), n, num_kv_heads, head_dim, expected
+            ));
+        }
+
+        let k_dst = self.keys.as_mut_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("write_slack k_dst slice: {e}"))?;
+        let v_dst = self.values.as_mut_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("write_slack v_dst slice: {e}"))?;
+
+        for h in 0..n_h {
+            for t in 0..n_usize {
+                let src_row = (t * n_h + h) * d;
+                let dst_row = (h * cap + start + t) * d;
+                k_dst[dst_row..dst_row + d]
+                    .copy_from_slice(&k_seq_major[src_row..src_row + d]);
+                v_dst[dst_row..dst_row + d]
+                    .copy_from_slice(&v_seq_major[src_row..src_row + d]);
+            }
+        }
+        // Intentionally NOT advancing seq_len — caller's responsibility.
+        Ok(())
+    }
 }
 
 /// Full drafter KV cache: one [`DFlashLayerKvCache`] per draft layer.
@@ -379,6 +441,89 @@ mod tests {
         assert_eq!(layer.seq_len, 2);
         layer.rollback(99);
         assert_eq!(layer.seq_len, 0, "saturating rollback");
+    }
+
+    /// Verify write_slack_kv writes to the correct slack positions
+    /// WITHOUT advancing seq_len. Sequence: append 3, slack-write 5
+    /// → seq_len should remain 3; positions 3..8 in cache must contain
+    /// the slack data; positions 0..3 must be unchanged.
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn write_slack_kv_does_not_advance_seq_len() {
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let mut cache = DFlashKvCache::new(&device, &cfg, 32).expect("cache");
+        let layer = &mut cache.layers[4]; // full-attention
+        let h = cfg.num_key_value_heads as u32;
+        let d = cfg.head_dim as u32;
+        let n_h = h as usize;
+        let dim = d as usize;
+
+        // Phase 1: append 3 positions with marker 1.x
+        let n_ctx = 3u32;
+        let mut k_ctx = vec![0.0f32; (n_ctx as usize) * n_h * dim];
+        let mut v_ctx = vec![0.0f32; (n_ctx as usize) * n_h * dim];
+        // Markers must stay in [1.0, 2.0) range so the "is this ctx?"
+        // check distinguishes them from slack markers in [2.0, 3.0).
+        // Use modulo to keep within range regardless of buffer length.
+        for (i, v) in k_ctx.iter_mut().enumerate() {
+            *v = 1.0 + ((i % 100) as f32) / 1000.0;
+        }
+        for (i, v) in v_ctx.iter_mut().enumerate() {
+            *v = 1.5 + ((i % 100) as f32) / 1000.0;
+        }
+        layer.append_seq_major_kv(&k_ctx, &v_ctx, n_ctx, h, d).expect("append ctx");
+        assert_eq!(layer.seq_len, n_ctx);
+
+        // Phase 2: slack-write 5 positions with marker 2.x
+        let n_slack = 5u32;
+        let mut k_slack = vec![0.0f32; (n_slack as usize) * n_h * dim];
+        let mut v_slack = vec![0.0f32; (n_slack as usize) * n_h * dim];
+        for (i, v) in k_slack.iter_mut().enumerate() {
+            *v = 2.0 + ((i % 100) as f32) / 1000.0;
+        }
+        for (i, v) in v_slack.iter_mut().enumerate() {
+            *v = 2.5 + ((i % 100) as f32) / 1000.0;
+        }
+        layer.write_slack_kv(&k_slack, &v_slack, n_slack, h, d).expect("write slack");
+        assert_eq!(layer.seq_len, n_ctx, "slack write must NOT advance seq_len");
+
+        // Phase 3: verify positions 0..3 still have ctx (1.x) markers
+        // and positions 3..8 have slack (2.x) markers, per head-major layout.
+        let cap = layer.capacity as usize;
+        let k_storage = layer.keys.as_slice::<f32>().expect("k_storage");
+        for t in 0..(n_ctx as usize) {
+            for head in 0..n_h {
+                let dst = (head * cap + t) * dim;
+                assert!(k_storage[dst] >= 1.0 && k_storage[dst] < 2.0,
+                    "ctx position t={t} head={head}: expected 1.x marker, got {}",
+                    k_storage[dst]);
+            }
+        }
+        for t in 0..(n_slack as usize) {
+            for head in 0..n_h {
+                let dst = (head * cap + (n_ctx as usize) + t) * dim;
+                assert!(k_storage[dst] >= 2.0 && k_storage[dst] < 3.0,
+                    "slack position t={t} head={head}: expected 2.x marker, got {}",
+                    k_storage[dst]);
+            }
+        }
+
+        // Phase 4: confirm a subsequent append_seq_major_kv overwrites
+        // the slack region.
+        let mut k_new = vec![0.0f32; (2 as usize) * n_h * dim];
+        let mut v_new = vec![0.0f32; (2 as usize) * n_h * dim];
+        for v in k_new.iter_mut() { *v = 9.0; }
+        for v in v_new.iter_mut() { *v = 9.5; }
+        layer.append_seq_major_kv(&k_new, &v_new, 2, h, d).expect("append after slack");
+        assert_eq!(layer.seq_len, n_ctx + 2);
+        let k_storage = layer.keys.as_slice::<f32>().expect("k_storage 2");
+        for head in 0..n_h {
+            for t in (n_ctx as usize)..((n_ctx as usize) + 2) {
+                let dst = (head * cap + t) * dim;
+                assert_eq!(k_storage[dst], 9.0, "post-append at t={t} head={head}");
+            }
+        }
     }
 
     #[test]
