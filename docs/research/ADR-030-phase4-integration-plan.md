@@ -104,20 +104,69 @@ for (layer_idx, layer) in self.layers.iter().enumerate() {
 }
 ```
 
-### 3. Per-position argmax emission
+### 3. Per-position argmax emission — REFINED iter-45
 
-Currently the tail of `forward_prefill_batched` (lines 1981-2034 per
-the existing iter-116 design refinement comment) computes only the
-LAST-row argmax. For Phase 4 we need argmax at every position.
+**Current tail** (forward_prefill_batched.rs:2245-2382):
+1. Copy last row of pf_hidden → activations.hidden
+2. final_norm: activations.hidden → activations.norm_out
+3. lm_head matmul (Q6K/Q8/F16 path): norm_out × lm_head → activations.logits
+4. softcap on activations.logits in-place
+5. argmax: activations.logits → activations.argmax_index, argmax_value
+6. s.finish() commits the Metal session
+7. first_token = argmax_index[0]
 
-Approach: replace the single argmax dispatch with a per-position loop
-(metadata-only — pf_hidden already holds all `seq_len` rows). Run
-final_norm + lm_head + argmax for every row, store into the
-`per_position_argmaxes` buffer.
+**Phase 4 modification** (~80 LOC):
 
-Cost: O(seq_len) argmaxes instead of O(1). For verify (seq_len = K+1 ≈ 8),
-this is ~8× overhead at the LM head stage only. The full forward is
-unchanged — only the tail is affected.
+After the legacy `first_token` computation (existing path preserved
+byte-identical), check if `self.dflash_capture` requires per-position
+argmaxes. If yes, loop pos = 0..(seq_len-1):
+
+```rust
+if let Some(cap) = self.dflash_capture.as_ref() {
+    if cap.per_position_argmaxes.is_some() {
+        // Pre-compute all argmaxes into a local Vec to avoid
+        // borrow-checker conflicts with self.activations + self.dflash_capture
+        let mut local_argmaxes: Vec<u32> = vec![0; seq_len];
+        local_argmaxes[seq_len - 1] = first_token; // already done
+
+        for pos in 0..(seq_len - 1) {
+            let mut s = exec.begin()?;
+            // 1. copy row `pos` of pf_hidden to activations.hidden
+            mlx_native::ops::copy::dispatch_copy_f32(
+                s.encoder_mut(), reg, metal_dev,
+                &pf_hidden, &self.activations.hidden,
+                pos * hs, 0, hs,
+            )?;
+            // 2-5. final_norm + lm_head + softcap + argmax (same as
+            //      the legacy block above; refactor into helper to
+            //      avoid duplication)
+            s.finish()?;
+            let argmax_val: u32 = self.activations.argmax_index.as_slice()?[0];
+            local_argmaxes[pos] = argmax_val;
+        }
+
+        // Now write back to capture (single mut borrow on dflash_capture)
+        if let Some(cap) = self.dflash_capture.as_mut() {
+            if let Some(pa) = cap.per_position_argmaxes.as_mut() {
+                pa.copy_from_slice(&local_argmaxes);
+            }
+        }
+    }
+}
+```
+
+**Cost**: seq_len × (1 copy + 1 norm + 1 matmul + 1 softcap + 1
+argmax) Metal dispatches. For seq_len=8, ~40 dispatches in 8 sessions
+= ~5× the existing tail cost. Total forward is unchanged.
+
+**Borrow-checker pattern**: use a local Vec to buffer argmaxes,
+write back after the loop with a single mut borrow on dflash_capture.
+Inside the loop we only need an immutable .is_some() check.
+
+**Helper extraction recommended** (~30 LOC refactor of existing
+tail): factor lines 2245-2375 into `fn argmax_for_row(&mut self,
+exec, reg, metal_dev, pf_hidden, pos, hs) -> Result<u32>`. Call it
+once at pos=seq_len-1 for legacy, then in the loop for capture.
 
 ### 4. Embed + lm_head wrappers
 
