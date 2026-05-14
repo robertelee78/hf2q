@@ -2522,3 +2522,12 @@ gives Option C's `pf_k_perm` baseline via the existing capture path.
 Difference at L0 position 5 (= last 6-tok prompt K) localises the
 divergence point definitively.
 
+**Extended to D=512 path (same commit)**: the D=512 global-layer
+debug block now ALSO dumps `F16_K` (from `layer_kv.k`, the cache the
+F16-cast SDPA reads) AND `BF16_K` (from `bf16_xlen_k`, populated
+directly from `pf_k_perm`).  Two parallel readbacks at p=0,
+p=start_pos-1, p=start_pos.  This lets the operator quantify the
+F16→F32→BF16 cast drift at every D=512 layer for any prompt — the
+direct test of iter-93's root-cause hypothesis applied to global
+layers.
+

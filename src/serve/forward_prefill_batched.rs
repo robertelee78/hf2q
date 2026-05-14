@@ -1748,6 +1748,45 @@ impl MlxModelWeights {
                                 "[XLEN_DEBUG global L{} verify start_pos={} seq_len={} hd={} F16-cast path]",
                                 layer_idx, start_pos, seq_len, hd,
                             );
+                            // ADR-030 iter-102 — D=512 BF16 cache readback.
+                            // For global layers the SDPA reads from `bf16_k`
+                            // (local scratch, F16→F32→BF16 cast).  Dumping the
+                            // persistent `bf16_xlen_k` (populated post-SDPA from
+                            // pf_k_perm at iter-98+) lets the operator compare
+                            // F16-cast-K vs BF16-direct-K bits at the same
+                            // positions — localising whether the 6-tok failure
+                            // is driven by the D=512 cast chain.
+                            s.finish().map_err(|e| anyhow::anyhow!("xlen debug D512 pre-read finish: {e}"))?;
+                            let f16_k_slice = layer_kv.k.as_slice::<half::f16>()
+                                .map_err(|e| anyhow::anyhow!("xlen debug D512 F16 K slice: {e}"))?;
+                            let cap_g = layer_kv.capacity;
+                            let slot_p0    = 0usize;
+                            let slot_sp_m1 = if start_pos > 0 { (start_pos as usize - 1) % cap_g } else { 0 };
+                            let slot_sp    = (start_pos as usize) % cap_g;
+                            let fk_p0    = slot_p0    * hd as usize;
+                            let fk_sp_m1 = slot_sp_m1 * hd as usize;
+                            let fk_sp    = slot_sp    * hd as usize;
+                            eprintln!(
+                                "  F16_K[h=0,p=0,d=0..8]    = {:?}\n  \
+                                 F16_K[h=0,p={},d=0..8]    = {:?}\n  \
+                                 F16_K[h=0,p={},d=0..8]    = {:?}",
+                                &f16_k_slice[fk_p0..fk_p0 + 8],
+                                start_pos - 1, &f16_k_slice[fk_sp_m1..fk_sp_m1 + 8],
+                                start_pos,     &f16_k_slice[fk_sp..fk_sp + 8],
+                            );
+                            if let Some(ref bf16_kc) = layer_kv.bf16_xlen_k {
+                                let bk_slice = bf16_kc.as_slice::<half::bf16>()
+                                    .map_err(|e| anyhow::anyhow!("xlen debug D512 bf16 K slice: {e}"))?;
+                                eprintln!(
+                                    "  BF16_K[h=0,p=0,d=0..8]   = {:?}\n  \
+                                     BF16_K[h=0,p={},d=0..8]   = {:?}\n  \
+                                     BF16_K[h=0,p={},d=0..8]   = {:?}",
+                                    &bk_slice[fk_p0..fk_p0 + 8],
+                                    start_pos - 1, &bk_slice[fk_sp_m1..fk_sp_m1 + 8],
+                                    start_pos,     &bk_slice[fk_sp..fk_sp + 8],
+                                );
+                            }
+                            s = exec.begin().map_err(|e| anyhow::anyhow!("xlen debug D512 post-K-dump reopen: {e}"))?;
                         }
                         s.barrier_between(&[&pf_q_perm, &bf16_k, &bf16_v], &[&pf_sdpa_out_perm]);
                         mlx_native::ops::flash_attn_prefill_d512::
