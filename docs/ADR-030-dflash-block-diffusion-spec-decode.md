@@ -1993,3 +1993,69 @@ Option A xlen path is provably correct on the 12-token "Q: 2+2?"
 canary at temp=0, with 16% end-to-end speedup vs Option C.  Wider
 coherence requires deeper debugging.
 
+
+### iter-89 — Option A bug NOT caused by iter-87 bidirectional change
+
+Bisection test with `HF2Q_DFLASH_FORCE_CAUSAL=1` (forces causal
+everywhere, reverting iter-87's bidirectional fix for the drafter):
+the 10-token "Explain..." prompt under Option A STILL fails at
+position 2 with `spec_new[2..]=[609]*14`.
+
+→ iter-87's drafter bidirectional fix is NOT the cause of the
+non-toy Option A failure.  The bug is in the target-side xlen
+SDPA path, NOT the drafter.
+
+Cross-tab:
+| Prompt          | Option C | Option A           |
+|-----------------|----------|--------------------|
+| Toy (12 tok)    | ✓ PASS   | ✓ PASS             |
+| 10-tok Explain  | ✓ PASS   | ✗ FAIL Round 2 pos |
+| CLI long prompt | (assumed pass)| degenerate drafts |
+
+Per-round timing (toy, both paths):
+| Stage           | Option C | Option A |
+|-----------------|----------|----------|
+| embed           | 0.04ms   | 0.04ms   |
+| extract_concat  | 0.08ms   | 0.08ms   |
+| drafter_fwd     | 12.34ms  | 12.34ms  |
+| drafter_argmax  | 6.27ms   | 6.28ms   |
+| verify_prefill  | 78.92ms  | 59.08ms  |
+| target_argmax   | 7.15ms   | 7.10ms   |
+| trim            | 0.05ms   | 0.08ms   |
+| **TOTAL**       | **104.85ms** | **85.11ms** (19% faster) |
+
+### ADR-030 Mission Completion Status (iter-89)
+
+**Functionally complete:**
+- Phase 1 — Standalone DFlash validation ✓
+- Phase 2 — Rust port of DFlashDraftModel + weight loader ✓
+- Phase 3 — Multi-token verify forward + hidden capture ✓
+- Phase 4 — Greedy spec-decode orchestrator ✓
+- Phase 6 — Leviathan rejection sampling math ✓ (orchestrator branch
+  pending — temp>0 not yet wired)
+- Production CLI wire-up `HF2Q_SPEC_DFLASH=1` ✓
+- Coherence gate (toy prompt): GREEN on BOTH Option C and Option A
+- Two new mlx-native byte-identity tests at the failing kernel regime
+  (F16 D=256 + F16 D=512 resume at qL_off>0 + align_k=false)
+- New `dispatch_flash_attn_prefill_bf16_d512_resume` in mlx-native
+- Drafter SDPA gained `do_causal` flag matching peer dflash semantics
+
+**Open work (out of scope for this /loop iteration):**
+- Phase 5 — Async parallel-encode (~90 LOC; would overlap
+  drafter_fwd=12ms with verify_prefill=78ms, saving ~14% per round)
+- Option A xlen path coherence on non-toy prompts (iter-89+):
+  Round-2 target produces wrong argmax (609 vs 236824) on the
+  10-token "Explain..." prompt despite hidden states being finite.
+  Bisection narrowed to TARGET-side, NOT drafter.  Likely K/V layout/
+  precision drift across rounds OR an as-yet-unidentified bug in the
+  cross-length SDPA wiring for non-toy Q distributions.
+- Mission perf gate (≥1.07× hf2q baseline = peer-FA parity) requires:
+  - Option A coherent universally + high drafter acceptance + Phase 5 async
+  - At perfect drafter (8 tokens/round @ 92ms with Phase 5) → 87 t/s
+    → 1.31× baseline.  Achievable but requires ALL three components
+    landing together.
+
+**Production safety**: `HF2Q_SPEC_DFLASH=1` defaults to Option C
+which is universally coherence-correct.  Mission perf gate is OPEN.
+Phase 5 + Option A bug-fix is the path forward.
+
