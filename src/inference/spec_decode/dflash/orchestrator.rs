@@ -301,6 +301,132 @@ pub fn dispatch_dflash_one_round(
     Ok(round)
 }
 
+/// Multi-round end-to-end DFlash spec-decode generation.
+///
+/// Wraps `dispatch_dflash_one_round` in the outer loop that:
+/// 1. Runs the initial prompt forward on the TARGET with capture
+///    installed at the drafter's `target_layer_ids` (and final layer)
+/// 2. Permutes the initial capture into `target_hidden_concat`
+/// 3. Loops `dispatch_dflash_one_round` until max_new_tokens or
+///    hit_eos. After each round, re-captures target hidden from the
+///    verify forward (now done internally by forward_decode_verify_batched)
+///    to feed the next round's drafter input.
+///
+/// Returns the generated token vector `[prompt_tokens..., generated...]`
+/// truncated at `max_new_tokens` generated or EOS.
+///
+/// # Initial-prompt capture
+///
+/// The first round needs `target_hidden_concat` from BEFORE any
+/// spec-decode steps. We get this by installing a capture session
+/// targeting `cfg.target_layer_ids` (drafter's = [1, 6, 11, 17, 22, 27])
+/// and running `forward_prefill_batched` on the prompt. The capture
+/// session's `hidden_output` is then permuted to `target_hidden_concat`.
+///
+/// # Per-round re-capture
+///
+/// Inside `dispatch_dflash_one_round`, `forward_decode_verify_batched`
+/// installs its OWN capture session (final layer only) for the
+/// per-position argmax. That session is consumed and dropped. For the
+/// NEXT round, we need a fresh target_hidden_concat capturing the
+/// drafter's target_layer_ids at the accepted positions.
+///
+/// **First cut (this iter)**: handles the first round only using
+/// the initial-prompt capture. Multi-round re-capture is iter-53+
+/// (requires modifying forward_decode_verify_batched to support
+/// the full target_layer_ids list, OR calling forward_prefill_batched
+/// directly with the orchestrator's capture session). For now this
+/// function runs ONE round and returns; the iter-53+ caller will
+/// loop until exhaustion.
+pub fn dispatch_dflash_generate_one_round_with_initial_capture(
+    target: &mut crate::serve::forward_mlx::MlxModelWeights,
+    drafter_tensors: &super::tensors::DFlashModelTensors,
+    drafter_cache: &mut super::kv_cache::DFlashKvCache,
+    drafter_cfg: &super::config::DFlashConfig,
+    prompt_tokens: &[u32],
+    block_size: u32,
+    eos_token_ids: &[u32],
+    gpu: &mut crate::serve::gpu::GpuContext,
+) -> anyhow::Result<RoundResult> {
+    use super::hidden_capture::{DFlashCaptureSession, PrefillCapture};
+
+    let hs = target.hidden_size;
+    let num_target_layers = target.layers.len();
+
+    // -------- Step 1: install capture session for drafter's target_layer_ids --------
+    let mut capture_layer_ids: Vec<usize> = drafter_cfg.target_layer_ids.clone();
+    capture_layer_ids.sort_unstable();
+    capture_layer_ids.dedup();
+    for &i in &capture_layer_ids {
+        if i >= num_target_layers {
+            anyhow::bail!(
+                "generate_one_round: target_layer_id {} >= num_target_layers {}",
+                i, num_target_layers
+            );
+        }
+    }
+
+    let session = DFlashCaptureSession::new(
+        capture_layer_ids.clone(),
+        prompt_tokens.len(),
+        hs,
+        false, // no per-position argmaxes needed for the ctx capture
+    );
+    target.install_dflash_capture(session);
+
+    // -------- Step 2: run initial prompt forward → captures pf_hidden --------
+    let last_committed_token = target
+        .forward_prefill_batched(prompt_tokens, 0, 0, gpu)
+        .map_err(|e| anyhow::anyhow!("generate: initial prompt forward: {e}"))?;
+
+    let captured = target
+        .take_dflash_capture()
+        .ok_or_else(|| anyhow::anyhow!("generate: capture session vanished after prompt forward"))?;
+
+    // -------- Step 3: permute capture to target_hidden_concat --------
+    let concat_vec: Vec<f32> = {
+        let view = PrefillCapture {
+            target_layer_ids: &captured.target_layer_ids,
+            hidden_output: &mut captured.hidden_output.clone(),
+            per_position_argmaxes: None,
+        };
+        view.permute_to_concat(prompt_tokens.len(), hs)
+    };
+    let target_hidden_concat = {
+        let (exec, _reg) = gpu.split();
+        let dev = exec.device();
+        let mut buf = dev
+            .alloc_buffer(
+                concat_vec.len() * 4,
+                mlx_native::DType::F32,
+                vec![prompt_tokens.len(), capture_layer_ids.len() * hs],
+            )
+            .map_err(|e| anyhow::anyhow!("generate: alloc target_hidden_concat: {e}"))?;
+        buf.as_mut_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("generate: target_hidden_concat slice: {e}"))?
+            .copy_from_slice(&concat_vec);
+        buf
+    };
+
+    // -------- Step 4: dispatch one spec-decode round --------
+    let current_seq_pos = prompt_tokens.len();
+    let round = dispatch_dflash_one_round(
+        target,
+        drafter_tensors,
+        drafter_cache,
+        drafter_cfg,
+        last_committed_token,
+        &target_hidden_concat,
+        prompt_tokens.len() as u32,
+        current_seq_pos,
+        block_size,
+        eos_token_ids,
+        gpu,
+    )?;
+
+    Ok(round)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
