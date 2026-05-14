@@ -569,6 +569,21 @@ pub fn dispatch_dflash_generate(
 
     let mut last_token = first_token;
 
+    // iter-70: per-stage timing (gated on HF2Q_DFLASH_PROFILE=1).  Each
+    // stage accumulates total wall-clock across all rounds; printed at
+    // function exit.  Production default (env unset) is bit-identical
+    // since the closures wrapping each timed region don't allocate any
+    // Instants when profile_on is false.
+    let profile_on = std::env::var("HF2Q_DFLASH_PROFILE").as_deref() == Ok("1");
+    let mut t_embed_ms = 0.0f64;
+    let mut t_extract_concat_ms = 0.0f64;
+    let mut t_drafter_fwd_ms = 0.0f64;
+    let mut t_drafter_argmax_ms = 0.0f64;
+    let mut t_verify_prefill_ms = 0.0f64;
+    let mut t_target_argmax_ms = 0.0f64;
+    let mut t_trim_ms = 0.0f64;
+    let mut rounds_count = 0usize;
+
     // -------- Multi-round loop (Option C + iter-69 single-prefill) --------
     //
     // Architecture:
@@ -584,6 +599,8 @@ pub fn dispatch_dflash_generate(
     // Drafter cache is reset each round and re-fed the full prior ctx
     // — its work is bounded but the K/V cache lifetime is per-round.
     while output.len() - prompt_tokens.len() < max_new_tokens {
+        rounds_count += 1;
+        let t0_embed = if profile_on { Some(std::time::Instant::now()) } else { None };
         // 1. Build the drafter's input block: [last_token, mask × K]
         let mut block: Vec<u32> = Vec::with_capacity(block_size as usize);
         block.push(last_token);
@@ -594,6 +611,7 @@ pub fn dispatch_dflash_generate(
         let h = target
             .embed_tokens(&block, gpu)
             .map_err(|e| anyhow::anyhow!("generate: embed_tokens: {e}"))?;
+        if let Some(t) = t0_embed { t_embed_ms += t.elapsed().as_secs_f64() * 1000.0; }
 
         // 2. Drafter's context = prior_captured (= prompt capture in
         //    round 1, OR trimmed verify capture from prior round).
@@ -609,6 +627,7 @@ pub fn dispatch_dflash_generate(
         // 3. Extract drafter_concat from the prior capture and upload
         //    to GPU.  drafter cache is reset so it appends the FULL
         //    prior ctx as fresh K/V each round.
+        let t0_extract = if profile_on { Some(std::time::Instant::now()) } else { None };
         let drafter_concat_vec = extract_drafter_concat(
             &prior_captured.hidden_output,
             &combined_capture_ids,
@@ -632,8 +651,10 @@ pub fn dispatch_dflash_generate(
             buf
         };
         drafter_cache.reset();
+        if let Some(t) = t0_extract { t_extract_concat_ms += t.elapsed().as_secs_f64() * 1000.0; }
 
         // 4. Drafter forward → h_final shape [block_size, hidden]
+        let t0_drafter = if profile_on { Some(std::time::Instant::now()) } else { None };
         let h_final = {
             let (exec, reg) = gpu.split();
             let device = exec.device();
@@ -650,10 +671,12 @@ pub fn dispatch_dflash_generate(
             )
             .context("generate: drafter forward")?
         };
+        if let Some(t) = t0_drafter { t_drafter_fwd_ms += t.elapsed().as_secs_f64() * 1000.0; }
 
         // 5. lm_head per position on drafter's h_final → K drafts
         //    (index 0 is for last_token's position which we already
         //    know; we want predictions at positions 1..block_size).
+        let t0_drafter_argmax = if profile_on { Some(std::time::Instant::now()) } else { None };
         let drafts: Vec<u32> = {
             let h_final_slice: &[f32] = h_final
                 .as_slice::<f32>()
@@ -664,6 +687,7 @@ pub fn dispatch_dflash_generate(
                 .map_err(|e| anyhow::anyhow!("generate: drafter argmax: {e}"))?;
             all_argmaxes[1..].to_vec()
         };
+        if let Some(t) = t0_drafter_argmax { t_drafter_argmax_ms += t.elapsed().as_secs_f64() * 1000.0; }
 
         // 6. Verify: re-prefill `output + drafts` from start_pos=0,
         //    capture all positions, compute argmaxes at the last
@@ -678,16 +702,24 @@ pub fn dispatch_dflash_generate(
             false,
         );
         target.install_dflash_capture(verify_session);
+        let t0_verify = if profile_on { Some(std::time::Instant::now()) } else { None };
         let _verify_last_argmax = target
             .forward_prefill_batched(&verify_prefix, max_decode_for_alloc, 0, gpu)
             .map_err(|e| anyhow::anyhow!("generate: verify forward: {e}"))?;
         let verify_captured = target
             .take_dflash_capture()
             .ok_or_else(|| anyhow::anyhow!("generate: verify capture vanished"))?;
+        if let Some(t) = t0_verify { t_verify_prefill_ms += t.elapsed().as_secs_f64() * 1000.0; }
 
-        // 7. Extract final-layer slab + per-position argmaxes at ALL
-        //    positions, then take the last `block_size` argmaxes as
-        //    target_argmaxes for accept-prefix.
+        // 7. Extract final-layer slab + per-position argmaxes ONLY at
+        //    verify positions = the last `block_size` rows of the slab.
+        //    iter-70: previously called per_position_argmax_from_hidden
+        //    over ALL verify_prefix_len positions and then discarded all
+        //    but the last block_size — wasting ~75% of the rms_norm +
+        //    lm_head + softcap + argmax work per round.  Now we slice
+        //    the slab to just the K+1 verify rows before invoking the
+        //    per-position pipeline.
+        let t0_target_argmax = if profile_on { Some(std::time::Instant::now()) } else { None };
         let final_slab = extract_final_layer_slab(
             &verify_captured.hidden_output,
             &combined_capture_ids,
@@ -695,22 +727,22 @@ pub fn dispatch_dflash_generate(
             verify_prefix_len,
             hs,
         )?;
-        let all_argmaxes = target
-            .per_position_argmax_from_hidden_opt(
-                &final_slab,
-                verify_prefix_len as u32,
-                true,
-                gpu,
-            )
-            .map_err(|e| anyhow::anyhow!("generate: target argmax: {e}"))?;
         // Verify positions are [output.len() - 1 .. output.len() - 1 +
         // block_size] of the prefill.  argmax_at_verify_start =
         // pred-after-last_token = compare to draft_1; etc.
         let verify_start = output.len() - 1;
         let verify_end = verify_start + block_size as usize;
         debug_assert_eq!(verify_end, verify_prefix_len);
-        let target_argmaxes: Vec<u32> =
-            all_argmaxes[verify_start..verify_end].to_vec();
+        let verify_slab_tail: &[f32] = &final_slab[verify_start * hs..verify_end * hs];
+        let target_argmaxes = target
+            .per_position_argmax_from_hidden_opt(
+                verify_slab_tail,
+                block_size,
+                true,
+                gpu,
+            )
+            .map_err(|e| anyhow::anyhow!("generate: target argmax: {e}"))?;
+        if let Some(t) = t0_target_argmax { t_target_argmax_ms += t.elapsed().as_secs_f64() * 1000.0; }
 
         // 8. Accept-prefix
         let round = step_round_from_argmaxes(&drafts, &target_argmaxes, eos_token_ids);
@@ -738,12 +770,31 @@ pub fn dispatch_dflash_generate(
         //     tokens [0..n) — independent of any draft tokens at
         //     positions ≥ verify_start.  So this trimmed slab is the
         //     correct prior_captured for the next round's drafter.
+        let t0_trim = if profile_on { Some(std::time::Instant::now()) } else { None };
         let mut next_captured = verify_captured;
         let next_prior_ctx_len = output.len() - 1;
         debug_assert!(next_prior_ctx_len <= next_captured.seq_len,
             "trim target {} > current {}", next_prior_ctx_len, next_captured.seq_len);
         super::hidden_capture::trim_capture_to(&mut next_captured, next_prior_ctx_len);
         prior_captured = next_captured;
+        if let Some(t) = t0_trim { t_trim_ms += t.elapsed().as_secs_f64() * 1000.0; }
+    }
+
+    if profile_on && rounds_count > 0 {
+        let n = rounds_count as f64;
+        eprintln!(
+            "[HF2Q_DFLASH_PROFILE] rounds={} per-round-ms: embed={:.2} extract={:.2} drafter_fwd={:.2} drafter_argmax={:.2} verify_prefill={:.2} target_argmax={:.2} trim={:.2} TOTAL={:.2}",
+            rounds_count,
+            t_embed_ms / n,
+            t_extract_concat_ms / n,
+            t_drafter_fwd_ms / n,
+            t_drafter_argmax_ms / n,
+            t_verify_prefill_ms / n,
+            t_target_argmax_ms / n,
+            t_trim_ms / n,
+            (t_embed_ms + t_extract_concat_ms + t_drafter_fwd_ms + t_drafter_argmax_ms
+                + t_verify_prefill_ms + t_target_argmax_ms + t_trim_ms) / n,
+        );
     }
 
     // Truncate to max_new_tokens if we overshot in the last round

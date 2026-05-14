@@ -1115,3 +1115,77 @@ to parity with one round-level refactor.
   round by trimming verify_captured to next round's prior_ctx_len).
 - `docs/research/adr030_iter68_bench/results_iter69.tsv` —
   side-by-side comparison data.
+
+### iter-70 (2026-05-14) — Per-stage profiling + 75% target_argmax reduction
+
+**Profiling instrumentation**: gated on `HF2Q_DFLASH_PROFILE=1` env
+var, accumulates per-round wall-clock for each orchestrator stage and
+prints a summary at function exit.  Production default unchanged.
+
+**Profile at N=16 (pre-optimization)**:
+```
+embed=0.03ms  extract=0.21ms  drafter_fwd=13.56ms  drafter_argmax=10.47ms
+verify_prefill=78.82ms  target_argmax=51.91ms  trim=0.07ms  TOTAL=155.08ms
+```
+
+verify_prefill (51%) + target_argmax (34%) dominate.
+
+**Optimization**: target_argmax was running per-position over ALL
+`verify_prefix_len` positions (e.g. 31 for N=15) but the orchestrator
+only USED the last `block_size`=8 argmaxes for accept-prefix.  ~75%
+of the rms_norm + lm_head + softcap + argmax work per round was
+wasted.
+
+Sliced the captured slab to just the verify-window rows BEFORE
+invoking per_position_argmax_from_hidden_opt:
+
+```rust
+let verify_slab_tail = &final_slab[verify_start * hs..verify_end * hs];
+let target_argmaxes = target.per_position_argmax_from_hidden_opt(
+    verify_slab_tail, block_size, true, gpu)?;
+```
+
+**Per-stage delta**:
+```
+target_argmax: 51.91ms → 11.21ms  (-40.7ms, -78%)
+TOTAL:        155.08ms →  114.12ms (-41ms, -26%)
+```
+
+**Bench results** (same harness, 2 trials, 20s cool-downs):
+
+| N | baseline t/s | spec t/s | spec/baseline | vs iter-69 | vs iter-68 |
+|---|---|---|---|---|---|
+|  8 | 103.6 | 9.00 | 0.087× (11.5× slower) | +29% (7.0→9.0)  | +94% (4.65→9.0)  |
+| 16 |  99.1 | 8.75 | 0.088× (11.3× slower) | +27% (6.9→8.75) | +99% (4.4→8.75)  |
+| 32 |  97.2 | 8.50 | 0.087× (11.4× slower) | +42% (6.0→8.5)  | +110% (4.05→8.5) |
+
+Mission gap progression:
+- iter-68 measured: 22.2× slower
+- iter-69 (single prefill): 14.9× slower
+- iter-70 (sliced argmax): **11.4× slower**
+
+Still 11× off the ≥1.07× mission gate.  Verify_prefill remains the
+dominant cost (~78 ms/round, 68% of remaining wall-clock); requires
+Option A (cross-length SDPA) to address.
+
+**Also shipped (opt-in, off by default)**: a batched
+`per_position_argmax_from_hidden_batched_impl` variant gated on
+`HF2Q_DFLASH_BATCH_ARGMAX=1` that processes all positions in ONE
+command buffer with bulk hidden upload + per-position output views.
+Modest gain (~8% over un-batched at N=16: 10.47 → 8.83 ms/round)
+because per_position GPU work dominates over per-iter sync cost.
+Slice optimization (above) gives much larger win and is enabled by
+default.
+
+**Coherence preserved**: e2e_dispatch_dflash_generate_gemma4_26b
+still GREEN at N=16 byte-identity vs single-token decode.
+
+**Code artifacts (iter-70)**:
+- `src/inference/spec_decode/dflash/orchestrator.rs` — per-stage
+  HF2Q_DFLASH_PROFILE timing instrumentation + sliced final-layer
+  slab to block_size rows before per_position_argmax.
+- `src/serve/forward_mlx.rs` —
+  `per_position_argmax_from_hidden_batched_impl` (opt-in via
+  HF2Q_DFLASH_BATCH_ARGMAX=1).
+- `docs/research/adr030_iter68_bench/results_iter70.tsv` —
+  comparison data showing 27-42% gain over iter-69 across N.

@@ -1524,6 +1524,18 @@ impl MlxModelWeights {
                 hidden.len(), seq_len, hs, expected
             );
         }
+        // ADR-030 iter-70: HF2Q_DFLASH_BATCH_ARGMAX=1 (opt-in) routes to
+        // the batched implementation that:
+        // 1. CPU-uploads ALL hidden rows in one shot (no per-iter CPU writes)
+        // 2. Runs all seq_len iterations in ONE command buffer (one finish())
+        // 3. Reads all argmaxes from a seq_len-sized output buffer at end
+        // Saves ~K * sync_overhead per call.  Profile data at N=16 shows
+        // target_argmax = 51 ms/round → expected ~10 ms/round after batching.
+        if std::env::var("HF2Q_DFLASH_BATCH_ARGMAX").as_deref() == Ok("1") {
+            return self.per_position_argmax_from_hidden_batched_impl(
+                hidden, seq_len, apply_final_norm, gpu,
+            );
+        }
         let mut argmaxes = Vec::with_capacity(seq_len as usize);
 
         let (exec, reg) = gpu.split();
@@ -1685,6 +1697,232 @@ impl MlxModelWeights {
             argmaxes.push(argmax_val);
         }
 
+        Ok(argmaxes)
+    }
+
+    /// ADR-030 iter-70 — batched per-position argmax.
+    ///
+    /// Equivalent semantically to [`per_position_argmax_from_hidden_opt`]
+    /// but:
+    /// 1. Uploads ALL hidden rows once (one bulk CPU→GPU copy).
+    /// 2. Allocates seq_len-element argmax_index/value output buffers.
+    /// 3. Runs all `seq_len` chains (copy → norm → lm_head → softcap →
+    ///    argmax) inside ONE command buffer.  Shared scratch
+    ///    (activations.hidden / norm_out / logits) is reused per
+    ///    iteration with `barrier_between` ensuring iter i's reads of
+    ///    a shared buffer complete before iter i+1's writes.
+    /// 4. Single `finish()` at end → reads all argmaxes from the
+    ///    per-position output buffer view.
+    ///
+    /// Eliminates `seq_len - 1` `commit_and_wait` syncs.  Profile data
+    /// shows ~5-7 ms per sync, so for seq_len=8 we expect ~35-50 ms
+    /// savings per call (validated by iter-71 bench).
+    fn per_position_argmax_from_hidden_batched_impl(
+        &mut self,
+        hidden: &[f32],
+        seq_len: u32,
+        apply_final_norm: bool,
+        gpu: &mut crate::serve::gpu::GpuContext,
+    ) -> anyhow::Result<Vec<u32>> {
+        let hs = self.hidden_size;
+        let vocab_size = self.vocab_size;
+        let n = seq_len as usize;
+        let expected = n * hs;
+        if hidden.len() != expected {
+            anyhow::bail!(
+                "per_position_argmax_batched: hidden len {} != seq_len({}) * hs({}) = {}",
+                hidden.len(), seq_len, hs, expected
+            );
+        }
+        let (exec, reg) = gpu.split();
+        let dev = exec.device();
+        let metal_dev = dev.metal_device();
+
+        // (1) Bulk upload hidden → GPU.
+        let mut gpu_hidden_all = dev
+            .alloc_buffer(n * hs * 4, mlx_native::DType::F32, vec![n, hs])
+            .map_err(|e| anyhow::anyhow!("alloc gpu_hidden_all: {e}"))?;
+        gpu_hidden_all
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("gpu_hidden_all slice: {e}"))?
+            .copy_from_slice(hidden);
+
+        // (2) Per-position argmax output buffers.
+        let argmax_index_all = dev
+            .alloc_buffer(n * 4, mlx_native::DType::U32, vec![n])
+            .map_err(|e| anyhow::anyhow!("alloc argmax_index_all: {e}"))?;
+        let argmax_value_all = dev
+            .alloc_buffer(n * 4, mlx_native::DType::F32, vec![n])
+            .map_err(|e| anyhow::anyhow!("alloc argmax_value_all: {e}"))?;
+
+        // (3) Single session.
+        let mut s = exec
+            .begin()
+            .map_err(|e| anyhow::anyhow!("batched argmax session begin: {e}"))?;
+
+        for pos in 0..n {
+            // Copy this position's hidden row into the shared scratch
+            // `activations.hidden`.  Use a slice_view of gpu_hidden_all
+            // (no CPU touch — GPU-only data flow within the session).
+            let hidden_view = gpu_hidden_all.slice_view((pos * hs * 4) as u64, hs);
+            // Barrier: ensure iter i-1's downstream reads of
+            // activations.hidden are done before we overwrite.
+            s.barrier_between(
+                &[&self.activations.hidden, &self.activations.norm_out,
+                  &self.activations.logits],
+                &[&self.activations.hidden],
+            );
+            mlx_native::ops::copy::dispatch_copy_f32(
+                s.encoder_mut(),
+                reg,
+                metal_dev,
+                &hidden_view,
+                &self.activations.hidden,
+                0,
+                0,
+                hs,
+            )
+            .map_err(|e| anyhow::anyhow!("batched arg copy L{pos}: {e}"))?;
+
+            if apply_final_norm {
+                s.barrier_between(
+                    &[&self.activations.hidden, &self.final_norm],
+                    &[&self.activations.norm_out],
+                );
+                s.rms_norm(
+                    reg,
+                    metal_dev,
+                    &self.activations.hidden,
+                    &self.final_norm,
+                    &self.activations.norm_out,
+                    &self.activations.norm_params,
+                    1,
+                    hs as u32,
+                )
+                .map_err(|e| anyhow::anyhow!("batched arg norm L{pos}: {e}"))?;
+            } else {
+                s.barrier_between(
+                    &[&self.activations.hidden],
+                    &[&self.activations.norm_out],
+                );
+                mlx_native::ops::copy::dispatch_copy_f32(
+                    s.encoder_mut(),
+                    reg,
+                    metal_dev,
+                    &self.activations.hidden,
+                    &self.activations.norm_out,
+                    0,
+                    0,
+                    hs,
+                )
+                .map_err(|e| anyhow::anyhow!("batched arg pre-norm copy L{pos}: {e}"))?;
+            }
+
+            // lm_head: prefer Q6_K, then Q8, then F16 (matches single-pos path).
+            if let Some(ref q6k) = self.lm_head_q6k {
+                s.barrier_between(
+                    &[&self.activations.norm_out, &q6k.buffer],
+                    &[&self.activations.logits],
+                );
+                super::forward_mlx::dispatch_qmatmul(
+                    &mut s,
+                    reg,
+                    dev,
+                    &self.activations.norm_out,
+                    q6k,
+                    &mut self.activations.logits,
+                    1,
+                )
+                .map_err(|e| anyhow::anyhow!("batched arg lm_head Q6_K L{pos}: {e}"))?;
+            } else if let Some(ref q8) = self.lm_head_q8 {
+                s.barrier_between(
+                    &[&self.activations.norm_out, &q8.buffer],
+                    &[&self.activations.logits],
+                );
+                super::forward_mlx::dispatch_qmatmul(
+                    &mut s,
+                    reg,
+                    dev,
+                    &self.activations.norm_out,
+                    q8,
+                    &mut self.activations.logits,
+                    1,
+                )
+                .map_err(|e| anyhow::anyhow!("batched arg lm_head Q8 L{pos}: {e}"))?;
+            } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
+                s.barrier_between(
+                    &[&self.activations.norm_out, lm_head_f16],
+                    &[&self.activations.logits],
+                );
+                mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
+                    s.encoder_mut(),
+                    reg,
+                    metal_dev,
+                    &self.activations.norm_out,
+                    lm_head_f16,
+                    &self.activations.logits,
+                    &mlx_native::ops::dense_gemm::DenseGemmF16Params {
+                        m: 1,
+                        n: vocab_size as u32,
+                        k: hs as u32,
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("batched arg lm_head F16 L{pos}: {e}"))?;
+            } else {
+                anyhow::bail!(
+                    "per_position_argmax_batched requires lm_head_q6k / q8 / f16"
+                );
+            }
+
+            if let Some(cap) = self.final_logit_softcapping {
+                s.barrier_between(
+                    &[&self.activations.logits],
+                    &[&self.activations.logits],
+                );
+                mlx_native::ops::softcap::dispatch_softcap(
+                    s.encoder_mut(),
+                    reg,
+                    metal_dev,
+                    &self.activations.logits,
+                    &self.activations.logits,
+                    &self.activations.softcap_params,
+                    cap,
+                )
+                .map_err(|e| anyhow::anyhow!("batched arg softcap L{pos}: {e}"))?;
+            }
+
+            // Per-position output views into the seq_len-sized output buffers.
+            let argmax_idx_view = argmax_index_all.slice_view((pos * 4) as u64, 1);
+            let argmax_val_view = argmax_value_all.slice_view((pos * 4) as u64, 1);
+            s.barrier_between(
+                &[&self.activations.logits],
+                &[&argmax_idx_view, &argmax_val_view],
+            );
+            mlx_native::ops::argmax::dispatch_argmax_f32(
+                s.encoder_mut(),
+                reg,
+                metal_dev,
+                &self.activations.logits,
+                &argmax_idx_view,
+                &argmax_val_view,
+                &self.activations.argmax_params,
+                vocab_size as u32,
+            )
+            .map_err(|e| anyhow::anyhow!("batched arg argmax L{pos}: {e}"))?;
+        }
+
+        // (4) Single commit + wait for ALL iterations.
+        s.finish()
+            .map_err(|e| anyhow::anyhow!("batched argmax session finish: {e}"))?;
+
+        // (5) Read all argmaxes in one shot.
+        let argmaxes: Vec<u32> = argmax_index_all
+            .as_slice::<u32>()
+            .map_err(|e| anyhow::anyhow!("batched argmax read: {e}"))?
+            .iter()
+            .take(n)
+            .copied()
+            .collect();
         Ok(argmaxes)
     }
 
