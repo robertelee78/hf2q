@@ -1413,24 +1413,47 @@ impl MlxModelWeights {
     /// ADR-030 Phase 4 — compute per-position argmaxes from a
     /// post-last-layer hidden state buffer.
     ///
+    /// Convenience wrapper around `per_position_argmax_from_hidden_opt`
+    /// with `apply_final_norm = true` (matches the target's tail).
+    ///
     /// Takes `hidden` of shape `[seq_len, hidden_size]` F32 (the
     /// `pf_hidden` content after all decoder layers ran, captured via
     /// the DFlash capture hook with the FINAL layer index included
     /// in `target_layer_ids`). For each row, runs final_norm +
     /// lm_head + softcap + argmax. Returns `[seq_len]` u32.
     ///
-    /// Uses the same model state (final_norm, lm_head_q6k/q8/f16,
-    /// softcap params, activations.{hidden,norm_out,logits,argmax_*})
-    /// as the existing last-row tail in `forward_prefill_batched`.
-    /// Bit-exact same dispatch ordering — guarantees the LAST-position
-    /// argmax this function returns matches `forward_prefill_batched`'s
-    /// own first_token return value when fed the same hidden buffer.
+    /// Uses the same model state as the existing last-row tail in
+    /// `forward_prefill_batched`. Bit-exact same dispatch ordering —
+    /// guarantees the LAST-position argmax matches first_token.
     ///
     /// **Not on the production hot path.** Spec-decode verify only.
     pub fn per_position_argmax_from_hidden(
         &mut self,
         hidden: &[f32],
         seq_len: u32,
+        gpu: &mut crate::serve::gpu::GpuContext,
+    ) -> anyhow::Result<Vec<u32>> {
+        self.per_position_argmax_from_hidden_opt(hidden, seq_len, true, gpu)
+    }
+
+    /// ADR-030 Phase 4 — per-position argmax with optional final_norm.
+    ///
+    /// `apply_final_norm = true` mirrors target's tail (used for
+    /// `forward_decode_verify_batched`).
+    ///
+    /// `apply_final_norm = false` is the drafter-side path: the drafter
+    /// applies its own `norm` (drafter's final_norm) inside
+    /// `dispatch_dflash_model_forward`; the orchestrator then takes
+    /// the drafter's h_final and runs target's lm_head + softcap +
+    /// argmax via THIS method with apply_final_norm=false. Mirrors
+    /// Python `model_mlx.py:194` — `logits = self.lm_head(self.norm(h))`
+    /// where `self.norm` is the drafter's, `self.lm_head` is target's
+    /// (shared via `bind()`).
+    pub fn per_position_argmax_from_hidden_opt(
+        &mut self,
+        hidden: &[f32],
+        seq_len: u32,
+        apply_final_norm: bool,
         gpu: &mut crate::serve::gpu::GpuContext,
     ) -> anyhow::Result<Vec<u32>> {
         let hs = self.hidden_size;
@@ -1464,21 +1487,44 @@ impl MlxModelWeights {
                 .begin()
                 .map_err(|e| anyhow::anyhow!("per_pos session begin: {e}"))?;
 
-            s.barrier_between(
-                &[&self.activations.hidden, &self.final_norm],
-                &[&self.activations.norm_out],
-            );
-            s.rms_norm(
-                reg,
-                metal_dev,
-                &self.activations.hidden,
-                &self.final_norm,
-                &self.activations.norm_out,
-                &self.activations.norm_params,
-                1,
-                hs as u32,
-            )
-            .map_err(|e| anyhow::anyhow!("per_pos final_norm: {e}"))?;
+            // norm_out source: either final_norm(hidden) when caller
+            // requests target's final_norm, OR a direct copy of hidden
+            // when caller has already applied the drafter's final_norm
+            // externally.
+            if apply_final_norm {
+                s.barrier_between(
+                    &[&self.activations.hidden, &self.final_norm],
+                    &[&self.activations.norm_out],
+                );
+                s.rms_norm(
+                    reg,
+                    metal_dev,
+                    &self.activations.hidden,
+                    &self.final_norm,
+                    &self.activations.norm_out,
+                    &self.activations.norm_params,
+                    1,
+                    hs as u32,
+                )
+                .map_err(|e| anyhow::anyhow!("per_pos final_norm: {e}"))?;
+            } else {
+                // Copy hidden → norm_out (already pre-normed by drafter)
+                s.barrier_between(
+                    &[&self.activations.hidden],
+                    &[&self.activations.norm_out],
+                );
+                mlx_native::ops::copy::dispatch_copy_f32(
+                    s.encoder_mut(),
+                    reg,
+                    metal_dev,
+                    &self.activations.hidden,
+                    &self.activations.norm_out,
+                    0,
+                    0,
+                    hs,
+                )
+                .map_err(|e| anyhow::anyhow!("per_pos pre-normed copy: {e}"))?;
+            }
 
             if let Some(ref q6k) = self.lm_head_q6k {
                 s.barrier_between(
