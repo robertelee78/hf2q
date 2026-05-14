@@ -2220,3 +2220,61 @@ Phase 5 async overlap + high drafter acceptance.
 - Phase 5 async parallel-encode
 - Mission perf gate closure
 
+
+### iter-93 — Hidden state divergence ROOT-CAUSED + BF16 D=256 fix REJECTED
+
+**Major instrumentation breakthrough**: added `HF2Q_DFLASH_HIDDEN_DEBUG=1`
+env to dump pf_hidden at final layer for the position used in
+target_argmax[0] computation, across BOTH Option A and Option C paths.
+
+Result on failing 10-token prompt:
+
+| Round | Path | hidden_final[d=0..8] |
+|-------|------|----------------------|
+| 1 | OptA | [0.134, 0.391, -0.0508, -0.097, -0.038, -0.066, -0.333, 0.0507] |
+| 1 | OptC | [0.133, 0.393, -0.0510, -0.097, -0.036, -0.071, -0.332, 0.0471] |
+| 2 | OptA | [0.726, 0.438, **0.0196**, 0.067, -0.578, -0.263, 0.097, -0.222] |
+| 2 | OptC | [0.712, **0.509**, **0.0572**, 0.064, -0.553, -0.269, 0.094, -0.266] |
+
+Round 1 hidden states are NEARLY IDENTICAL (~0.1-0.5% relative drift).
+Round 2 hidden states DIVERGE by up to 3× (d=2: 0.0196 vs 0.0572).
+After Round 2 the argmax flips: OptA picks 609, OptC picks 236824.
+
+**Root cause**: precision drift in Option A's xlen branch's cast chain
+(F16 hybrid_kv ↔ F32 ↔ BF16 cumulative rounding) vs Option C's pure
+BF16 path through pf_k_perm directly from head_norm_rope.  This drift
+COMPOUNDS across 30 layers + cross-round and eventually flips argmax.
+
+**Attempted fix (REJECTED)**: route D=256 xlen through BF16 resume
++ cast hybrid_kv K/V F16→F32→BF16 (mirror of iter-84 D=512 fix).
+Coherence results:
+- Toy 12-tok: ✓ PASS (unchanged)
+- "Hi" 1-tok: ✓ PASS (unchanged)  
+- 16-tok: ✓ PASS (unchanged)
+- **6-tok: ✗ FAIL pos 2 (WORSE — was pos 4)**
+- **10-tok: ✗ FAIL pos 1 (WORSE — was pos 2)**
+
+The BF16 D=256 path FAILS EARLIER on the previously-failing prompts.
+The F16→F32→BF16 cast doesn't bit-match Option C's pure-BF16 path
+(which originates from BF16 head_norm_rope output, NOT through
+hybrid_kv F16).
+
+**Reverted**.  F16 D=256 xlen path stays.  The precision drift is
+INHERENT to using hybrid_kv F16 as the K/V source for cross-length
+attention while Option C uses fresh BF16 from head_norm_rope.
+
+### Mission state at iter-93
+
+The precision-drift root cause is now KNOWN.  Fixing requires one of:
+1. Change hybrid_kv to BF16 storage (large-scope refactor; affects
+   decode + many other paths).
+2. Keep BF16 pf_k_perm / pf_v_perm across calls (recompute them
+   for prior positions; defeats the perf point of Option A).
+3. Use F32 throughout xlen path (significant memory + bandwidth cost).
+
+None of these are tractable as a 1-iteration fix.  Option C remains
+production-safe and universally coherent.  Option A xlen is shipped
+as an opt-in experimental path (HF2Q_DFLASH_XLEN_SDPA=1) that works
+on prompts where precision drift doesn't accumulate past argmax-flip
+threshold.
+

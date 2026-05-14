@@ -860,6 +860,35 @@ pub fn dispatch_dflash_generate(
             );
         }
 
+        // ADR-030 iter-93 — dump final-layer hidden state used for
+        // target_argmax[0] computation.  This is the SAME logical position
+        // in BOTH Option A and Option C (position output.len()-1 = last_token's
+        // pos in the model).  Comparing across paths localizes the Option A
+        // bug to the hidden state computation.
+        if std::env::var("HF2Q_DFLASH_HIDDEN_DEBUG").as_deref() == Ok("1") {
+            let final_combined_idx = combined_capture_ids
+                .iter()
+                .position(|&c| c == final_layer_idx)
+                .expect("final layer in combined capture set");
+            let path = if xlen_sdpa { "OptA" } else { "OptC" };
+            let logical_pos = output.len() - 1; // = start_pos in Option A
+            // Position-in-capture for the target_argmax[0] row:
+            // - OptA: row 0 of verify_captured (= first verify position)
+            // - OptC: row (output.len() - 1) of verify_captured (= position of last_token in re-prefilled prefix)
+            let capture_row = if xlen_sdpa { 0 } else { logical_pos };
+            let capture_seq_len = verify_captured.seq_len;
+            let layer_base = final_combined_idx * capture_seq_len * hs;
+            let row_base = layer_base + capture_row * hs;
+            let row_slice = &verify_captured.hidden_output[row_base..row_base + 8.min(hs)];
+            let max_abs = verify_captured.hidden_output[layer_base..layer_base + capture_seq_len * hs]
+                .iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            eprintln!(
+                "[HIDDEN_DEBUG path={} round={} logical_pos={} capture_row={} \
+                 hidden_final_layer[d=0..8]={:?} max_abs={:.4e}",
+                path, rounds_count, logical_pos, capture_row, row_slice, max_abs,
+            );
+        }
+
         // 9. Target rollback (Option A only — Option C re-prefills at
         //    start_pos=0 so no rollback needed).
         if xlen_sdpa {
