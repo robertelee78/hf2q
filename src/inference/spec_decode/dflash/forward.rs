@@ -195,6 +195,66 @@ pub fn dispatch_dflash_k_proj(
 /// - `input`: `[L_or_S, hidden_size]` F32 input
 /// - `layer`: uses `v_proj` BF16 weight `[num_kv_heads * head_dim, hidden_size]`
 /// - Returns: `[L_or_S, num_kv_heads * head_dim]` F32
+/// Apply per-head RMSNorm to a `[L, num_heads, head_dim]` projection
+/// output. Used for both `q_norm` (on Q) and `k_norm` (on K).
+///
+/// Mirrors `model_mlx.py:DFlashAttention.__call__` lines 97-100:
+/// `q_norm(queries.reshape(B, L, n_heads, -1))`.
+///
+/// The reshape `[L, n_heads * head_dim] → [L, n_heads, head_dim]` is
+/// metadata-only in our flat row-major layout. With `rows = L * n_heads`
+/// and `dim = head_dim`, mlx-native's `dispatch_rms_norm` normalizes
+/// each head independently — exactly what qwen3-style per-head norm
+/// requires.
+///
+/// The transpose to `[n_heads, L, head_dim]` for SDPA is NOT done here
+/// (deferred to a separate dispatcher / SDPA layout-conversion).
+///
+/// # Arguments
+///
+/// - `proj`: `[L, num_heads * head_dim]` F32 (output of Q or K proj)
+/// - `norm_weight`: `[head_dim]` F32 (q_norm or k_norm)
+/// - Returns: `[L, num_heads * head_dim]` F32 (same shape, normalized)
+pub fn dispatch_dflash_head_norm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    proj: &MlxBuffer,
+    norm_weight: &MlxBuffer,
+    cfg: &DFlashConfig,
+    seq_len: u32,
+    num_heads: u32,
+) -> Result<MlxBuffer> {
+    let head_dim = cfg.head_dim as u32;
+    let rows = seq_len * num_heads;
+    let expected_elem = (rows as usize) * (head_dim as usize);
+    if proj.element_count() != expected_elem {
+        return Err(anyhow!(
+            "dflash head_norm: proj element count {} != rows({}) * head_dim({})",
+            proj.element_count(),
+            rows,
+            head_dim
+        ));
+    }
+    let normed = device
+        .alloc_buffer(expected_elem * 4, DType::F32, vec![seq_len as usize, num_heads as usize, head_dim as usize])
+        .map_err(|e| anyhow!("alloc head_norm output: {e}"))?;
+    let params = alloc_rms_norm_params(device, cfg.rms_norm_eps, head_dim)?;
+    dispatch_rms_norm(
+        encoder,
+        registry,
+        device.metal_device(),
+        proj,
+        norm_weight,
+        &normed,
+        &params,
+        rows,
+        head_dim,
+    )
+    .context("dispatch_rms_norm head_norm")?;
+    Ok(normed)
+}
+
 pub fn dispatch_dflash_v_proj(
     encoder: &mut CommandEncoder,
     registry: &mut KernelRegistry,
@@ -296,6 +356,19 @@ mod tests {
             &mut encoder, &mut registry, &device, &normed, layer, &cfg, block_size,
         )
         .expect("v_proj dispatch");
+        encoder.memory_barrier(); // RAW: head_norm reads Q/K just written
+
+        // Per-head RMSNorm on Q and K (no v_norm by qwen3 convention)
+        let q_normed = dispatch_dflash_head_norm(
+            &mut encoder, &mut registry, &device, &q, &layer.q_norm, &cfg,
+            block_size, cfg.num_attention_heads as u32,
+        )
+        .expect("q_norm dispatch");
+        let k_normed = dispatch_dflash_head_norm(
+            &mut encoder, &mut registry, &device, &k, &layer.k_norm, &cfg,
+            block_size, cfg.num_key_value_heads as u32,
+        )
+        .expect("k_norm dispatch");
         encoder.commit_and_wait().expect("commit");
 
         // Validate shapes
@@ -305,9 +378,17 @@ mod tests {
         assert_eq!(q.element_count(), l * q_dim);
         assert_eq!(k.element_count(), l * kv_dim);
         assert_eq!(v.element_count(), l * kv_dim);
+        assert_eq!(q_normed.element_count(), l * q_dim);
+        assert_eq!(k_normed.element_count(), l * kv_dim);
 
-        // Validate all three are finite + non-trivially non-zero.
-        for (name, buf, dim) in [("Q", &q, q_dim), ("K", &k, kv_dim), ("V", &v, kv_dim)] {
+        // Validate all five are finite + non-trivially non-zero.
+        for (name, buf, dim) in [
+            ("Q", &q, q_dim),
+            ("K", &k, kv_dim),
+            ("V", &v, kv_dim),
+            ("Q_normed", &q_normed, q_dim),
+            ("K_normed", &k_normed, kv_dim),
+        ] {
             let host: &[f32] = buf.as_slice::<f32>().expect("host slice");
             assert_eq!(host.len(), l * dim, "{name} length");
             let n_finite = host.iter().filter(|v| v.is_finite()).count();

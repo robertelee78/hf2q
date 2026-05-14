@@ -36,33 +36,50 @@ pub enum TensorsError {
     MissingEntry(String),
 }
 
-/// Per-layer GPU-resident BF16 weights for one DFlash decoder layer.
+/// Per-layer GPU-resident weights for one DFlash decoder layer.
 ///
 /// Mirrors the Python `DFlashDecoderLayer` constituents
 /// (`model_mlx.py:119-129`): one [`DFlashAttention`] + one `nn.MLP`
 /// (qwen3-style SwiGLU) + two RMSNorms.
+///
+/// ## DType policy
+///
+/// Most weights stay BF16 (the safetensors-on-disk dtype) for memory
+/// efficiency — they are consumed by `dispatch_dense_mm_bf16`-class
+/// matmul kernels that operate on BF16 weights + F32 activations.
+///
+/// Two exceptions are stored as F32: `q_norm` and `k_norm`. These are
+/// per-head RMSNorm weights (only `head_dim = 128` floats each) and
+/// mlx-native's `dispatch_rms_norm` kernel selects by INPUT dtype, so
+/// when we apply per-head norm to the F32 Q/K projection output the
+/// weight must also be F32. Matching qwen35's `norm_w: MlxBuffer`
+/// convention (`forward_gpu.rs:440` uploaded via `upload_f32_weight`).
+/// The cost is negligible: 5 layers × 2 norms × 128 elements × 2 bytes
+/// = 2.5 KB of memory expansion.
 pub struct DFlashLayerTensors {
-    /// `[hidden_size]` — applied before attention.
+    /// `[hidden_size]` BF16 — applied before attention.
     pub input_layernorm: MlxBuffer,
-    /// `[hidden_size]` — applied between attention residual and MLP.
+    /// `[hidden_size]` BF16 — applied between attention residual and MLP.
     pub post_attention_layernorm: MlxBuffer,
-    /// `[num_q_heads * head_dim, hidden_size]` — Q projection.
+    /// `[num_q_heads * head_dim, hidden_size]` BF16 — Q projection.
     pub q_proj: MlxBuffer,
-    /// `[num_kv_heads * head_dim, hidden_size]` — K projection.
+    /// `[num_kv_heads * head_dim, hidden_size]` BF16 — K projection.
     pub k_proj: MlxBuffer,
-    /// `[num_kv_heads * head_dim, hidden_size]` — V projection.
+    /// `[num_kv_heads * head_dim, hidden_size]` BF16 — V projection.
     pub v_proj: MlxBuffer,
-    /// `[hidden_size, num_q_heads * head_dim]` — O projection.
+    /// `[hidden_size, num_q_heads * head_dim]` BF16 — O projection.
     pub o_proj: MlxBuffer,
-    /// `[head_dim]` — per-head RMSNorm on Q (qwen3-style).
+    /// `[head_dim]` **F32** — per-head RMSNorm on Q (qwen3-style).
+    /// Cast from BF16 at upload time for mlx-native rms_norm-f32 path.
     pub q_norm: MlxBuffer,
-    /// `[head_dim]` — per-head RMSNorm on K (qwen3-style).
+    /// `[head_dim]` **F32** — per-head RMSNorm on K (qwen3-style).
+    /// Cast from BF16 at upload time.
     pub k_norm: MlxBuffer,
-    /// `[intermediate_size, hidden_size]` — SwiGLU gate projection.
+    /// `[intermediate_size, hidden_size]` BF16 — SwiGLU gate projection.
     pub mlp_gate: MlxBuffer,
-    /// `[intermediate_size, hidden_size]` — SwiGLU up projection.
+    /// `[intermediate_size, hidden_size]` BF16 — SwiGLU up projection.
     pub mlp_up: MlxBuffer,
-    /// `[hidden_size, intermediate_size]` — SwiGLU down projection.
+    /// `[hidden_size, intermediate_size]` BF16 — SwiGLU down projection.
     pub mlp_down: MlxBuffer,
 }
 
@@ -92,6 +109,36 @@ fn upload_bf16(device: &MlxDevice, view: &TensorView<'_>) -> Result<MlxBuffer, T
         .map_err(|e| TensorsError::Mlx(MlxError::InvalidArgument(format!("buffer slice: {e}"))))?;
     debug_assert_eq!(dst.len(), byte_len);
     dst.copy_from_slice(view.data());
+    Ok(buf)
+}
+
+/// Convert a BF16 [`TensorView`] to F32 and upload to a fresh GPU
+/// [`MlxBuffer`]. Used for q_norm/k_norm where mlx-native's rms_norm
+/// kernel requires weight dtype to match the F32 input.
+fn upload_bf16_as_f32(device: &MlxDevice, view: &TensorView<'_>) -> Result<MlxBuffer, TensorsError> {
+    let bf16_bytes = view.data();
+    let n_elem = bf16_bytes.len() / 2;
+    if bf16_bytes.len() != n_elem * 2 {
+        return Err(TensorsError::Mlx(MlxError::InvalidArgument(format!(
+            "upload_bf16_as_f32: data len {} not even (not BF16-aligned)",
+            bf16_bytes.len()
+        ))));
+    }
+    let shape: Vec<usize> = view.shape().to_vec();
+    let mut buf = device.alloc_buffer(n_elem * 4, DType::F32, shape)?;
+    let dst: &mut [f32] = buf
+        .as_mut_slice::<f32>()
+        .map_err(|e| TensorsError::Mlx(MlxError::InvalidArgument(format!("f32 slice: {e}"))))?;
+    debug_assert_eq!(dst.len(), n_elem);
+    // BF16 = 16 MSBs of an F32. Reconstruct F32 by left-shifting BF16
+    // bits into the top half of the F32 bits.
+    for i in 0..n_elem {
+        let lo = bf16_bytes[i * 2] as u32;
+        let hi = bf16_bytes[i * 2 + 1] as u32;
+        let bf16_bits = lo | (hi << 8);
+        let f32_bits = bf16_bits << 16;
+        dst[i] = f32::from_bits(f32_bits);
+    }
     Ok(buf)
 }
 
@@ -141,11 +188,11 @@ impl DFlashModelTensors {
                     device,
                     fetch(weights, &format!("{p}.self_attn.o_proj.weight"))?,
                 )?,
-                q_norm: upload_bf16(
+                q_norm: upload_bf16_as_f32(
                     device,
                     fetch(weights, &format!("{p}.self_attn.q_norm.weight"))?,
                 )?,
-                k_norm: upload_bf16(
+                k_norm: upload_bf16_as_f32(
                     device,
                     fetch(weights, &format!("{p}.self_attn.k_norm.weight"))?,
                 )?,
