@@ -3236,3 +3236,107 @@ Companion ADR-029 already has the ngram proposer landed
 (`src/inference/spec_decode/ngram_proposer.rs`, 323 LOC); pivoting
 there would be a separate decision.
 
+
+
+### iter-216 — Plan B: wired `dispatch_ngram_generate` (ADR-029 ngram_proposer as alternative drafter)
+
+**Context**: iter-212 showed DFlash structurally cannot beat baseline
+on this drafter/target pair (0% acceptance from distribution mismatch).
+Plan B per the iter-211/212 operator-decision matrix was to wire the
+existing `src/inference/spec_decode/ngram_proposer.rs` (323 LOC, ADR-029
+Phase 1, never wired) as an alternative drafter — pure-CPU KMP-style
+suffix-matching, no model, no GPU, perfectly distribution-agnostic.
+
+**What landed (this commit)**:
+
+1. New module `src/inference/spec_decode/ngram_orchestrator.rs`
+   (~300 LOC) — `dispatch_ngram_generate` mirrors `dispatch_dflash_generate`'s
+   verify-loop shape (forward_prefill_batched at K+1 → per-position
+   argmax → accept_prefix_argmax → rollback_kv), MINUS all the drafter
+   plumbing.  Drafts come from `ngram_proposer::propose` instead.  When
+   propose returns empty (no n-gram match in suffix), falls through to
+   `forward_decode` for a single token — graceful degradation to
+   baseline cost vs DFlash's ~10× slowdown at 0% accept.
+
+2. `HF2Q_SPEC_NGRAM=1` env flag (parallel to `HF2Q_SPEC_DFLASH=1`)
+   in `src/serve/spec_decode_cli.rs`.  Knobs: `HF2Q_SPEC_NGRAM_K`
+   (default 3), `HF2Q_SPEC_NGRAM_MIN` (default 1), `HF2Q_SPEC_NGRAM_MAX`
+   (default 3), `HF2Q_SPEC_NGRAM_PROFILE=1` for per-round profile dump.
+
+3. Wired into `src/serve/mod.rs` `cmd_generate` immediately after the
+   DFlash dispatcher.  Default OFF; if both flags set, DFlash wins
+   (called first).
+
+**GPU measurements at HEAD** (target gemma4-ara-2pass-APEX-Q5_K_M.gguf,
+M5 Max, temp=0):
+
+| Workload                     | K | Mode  | Acceptance | Tok/s | vs baseline |
+|------------------------------|---|-------|-----------|-------|-------------|
+| Baseline (no spec-decode)    | — | —     | —         | 98–100| 1.00×       |
+| **DFlash** (iter-212)        | 7 | Opt-A | 0.00      | 11.8  | 0.12×       |
+| Ngram, prose poem            | 3 | Opt-C | 0.11      | 37.3  | 0.38×       |
+| Ngram, Python code echo      | 3 | Opt-C | 0.44      | 25.9  | 0.26×       |
+| Ngram, Python code echo      | 3 | Opt-A | 0.64      | 60.8  | 0.62×       |
+| Ngram, Python code echo      | 7 | Opt-A | 0.44      | 63.6  | 0.64×       |
+| **Ngram, pure repetition**   | 7 | Opt-A | **0.77**  | **81.0**| **0.81×** |
+
+Ngram **strictly dominates DFlash** on every workload tested (DFlash 0%
+accept everywhere; ngram 11–77% depending on workload).  On the best
+workload tested (pure paragraph repetition), ngram reaches 81 tok/s —
+still 0.81× baseline.
+
+**Why ngram doesn't beat baseline even at 77% accept**: per-round
+profile at the 0.81× run:
+```
+rounds=21 empty_propose=1 drafts_proposed=129 drafts_accepted=99
+cumulative_ms: propose=0.03 verify_prefill=1223.76 argmax=137.78 total=1374.91
+```
+20 proposing rounds × 1.91 mean drafts accepted/proposing-round + 1 empty
+× 0 = 99 + 1 + 20 fallback = 120 committed tokens.  Verify rounds cost
+~65 ms each (K=7); to break baseline at the 100 tok/s reference, we'd
+need mean accept per proposing round ≥ 5.5 (out of 7) with empty rate
+< 5%.  Real-world acceptance peaks at ~5/7 on pure repetition; common
+prose/code falls to 1–3/7.
+
+**Coherence — important caveat**:
+
+At temp=0 with greedy `accept_prefix_argmax`, the orchestrator only
+ever commits the target's own argmax at each position.  But the
+verify forward (forward_prefill_batched on K+1 tokens batched) and
+the baseline decode forward (forward_decode N times sequentially)
+follow different kernel paths with different floating-point reduction
+orders.  Empirically:
+
+- Baseline poem:  "A velvet hush dissolves in light, / As silver spills across the deep, / To chase the lingering ghosts of night / And wake the tides from sapphire sleep."
+- Ngram poem:     "A velvet hush dissolves in light, / As stars surrender to the tide, / The bruised horizon, soft and bright, / Where gold and indigo collide."
+- DFlash poem:    "A silver line breaks through the gray, / To herald in the coming day. / The tide exhales a rhythmic sigh, / Beneath a pale and waking"
+
+All three are coherent gemma-4 ocean-dawn poems at temp=0; they share
+the first line and diverge after, with float-order-sensitive argmax
+ties at high-entropy positions.  Iter-66's "byte-identity gate" passed
+for a specific short prompt; it does NOT hold universally and the
+ngram path inherits the same property.
+
+This is a fundamental limit of batched-verify spec-decode, NOT a bug.
+Default OFF stays correct — production decode remains byte-stable
+when spec-decode is not opted in.
+
+**Mission accounting**:
+
+- iter-212 verdict: ADR-030's DFlash-specific mission gate ≥1.07× is
+  structurally infeasible on this drafter/target pair.
+- iter-216 result: ngram path lands as a *graceful fallback strategy*
+  for spec-decode — strictly better than DFlash on every workload, and
+  comes within 19% of baseline on best-case repetition workloads.  Not
+  a speedup over baseline yet; falls back to baseline cost on prose
+  (where ngram returns empty).
+
+Future work (operator-gated):
+1. Tighter verify path (reduce 60 ms/round verify_prefill via Option A
+   variants or a dedicated K+1 batched-decode kernel) — would lift the
+   ceiling above baseline.
+2. Composite proposer: ngram for repetition, fallback to a target-
+   matched drafter for prose.  ADR-029's verifier trait already
+   abstracts the proposer; building a composite is a few hundred LOC.
+3. Drafter retraining against the ara-abliterated APEX target (multi-
+   day, payoff still capped by verify_prefill ceiling).

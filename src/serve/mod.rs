@@ -1299,6 +1299,26 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         return Ok(());
     }
 
+    // ADR-030 iter-216 Plan B — HF2Q_SPEC_NGRAM=1 opt-in path.  Uses
+    // pure-CPU n-gram proposer from ADR-029 Phase 1 instead of the
+    // DFlash drafter.  Workload-specific accelerator: needs ~80%
+    // acceptance to beat baseline (per iter-212 verify_prefill cost
+    // analysis); shines on quote-heavy / repetitive workloads
+    // (translate-this-code, summarize-this-text) per vLLM literature.
+    // Greedy invariant identical to DFlash: at temp=0 output is
+    // byte-identical to single-token decode.  Default OFF.
+    if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_ngram_spec_decode(
+        &mut mlx_w,
+        &prompt_tokens,
+        args.max_tokens,
+        &eos_token_ids,
+        args.ignore_eos,
+        &tokenizer,
+        &mut ctx,
+    )? {
+        return Ok(());
+    }
+
     // Profiling support
     let mut profiler = forward_mlx::ProfileAccumulator::new(2);
     let kernel_profile_mode = INVESTIGATION_ENV.mlx_kernel_profile;

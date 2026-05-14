@@ -183,3 +183,110 @@ pub fn try_dispatch_dflash_spec_decode(
 
     Ok(Some(()))
 }
+
+/// Resolve `K` for the n-gram proposer.  Default = 3 per
+/// ADR-029 Phase 1 / vLLM literature (`k=3, max_ngram=3, min_ngram=1`).
+fn resolve_ngram_k() -> Result<u32> {
+    match std::env::var("HF2Q_SPEC_NGRAM_K") {
+        Err(_) => Ok(3),
+        Ok(s) => {
+            let n: u32 = s
+                .parse()
+                .with_context(|| format!("HF2Q_SPEC_NGRAM_K must be integer; got {s:?}"))?;
+            anyhow::ensure!(n >= 1, "HF2Q_SPEC_NGRAM_K must be ≥ 1; got {n}");
+            Ok(n)
+        }
+    }
+}
+
+fn resolve_ngram_min() -> Result<u32> {
+    match std::env::var("HF2Q_SPEC_NGRAM_MIN") {
+        Err(_) => Ok(1),
+        Ok(s) => Ok(s.parse().with_context(|| {
+            format!("HF2Q_SPEC_NGRAM_MIN must be integer; got {s:?}")
+        })?),
+    }
+}
+
+fn resolve_ngram_max() -> Result<u32> {
+    match std::env::var("HF2Q_SPEC_NGRAM_MAX") {
+        Err(_) => Ok(3),
+        Ok(s) => Ok(s.parse().with_context(|| {
+            format!("HF2Q_SPEC_NGRAM_MAX must be integer; got {s:?}")
+        })?),
+    }
+}
+
+/// Dispatch n-gram spec-decode when `HF2Q_SPEC_NGRAM=1` is set
+/// (ADR-030 iter-216 Plan B — pure-CPU proposer alternative to the
+/// DFlash drafter, which had 0% acceptance against the ara-abliterated
+/// APEX-Q5_K_M target per iter-212 measurement).
+///
+/// - Returns `Ok(None)` when the env flag is unset; caller continues
+///   with the standard prefill + per-token decode path (or DFlash if
+///   THAT flag is set instead).
+/// - Returns `Ok(Some(()))` when ngram spec-decode ran to completion.
+/// - Returns `Err(_)` if `dispatch_ngram_generate` fails.
+///
+/// Env knobs:
+/// - `HF2Q_SPEC_NGRAM` (= "1") — opt in.
+/// - `HF2Q_SPEC_NGRAM_K` (default 3) — draft length per round.
+/// - `HF2Q_SPEC_NGRAM_MIN` (default 1) — min n-gram size to match.
+/// - `HF2Q_SPEC_NGRAM_MAX` (default 3) — max n-gram size to match.
+/// - `HF2Q_SPEC_NGRAM_PROFILE` (= "1") — print per-round timing on exit.
+/// - `HF2Q_DFLASH_XLEN_SDPA` (= "1") — engage Option A cross-length
+///   SDPA verify path (requires `HF2Q_FULL_F16_KV=1`).  Shared flag
+///   with DFlash since both orchestrators use the same target verify
+///   pipeline.
+pub fn try_dispatch_ngram_spec_decode(
+    target: &mut crate::serve::forward_mlx::MlxModelWeights,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    eos_token_ids: &[u32],
+    ignore_eos: bool,
+    tokenizer: &tokenizers::Tokenizer,
+    gpu: &mut crate::serve::gpu::GpuContext,
+) -> Result<Option<()>> {
+    if std::env::var("HF2Q_SPEC_NGRAM").as_deref() != Ok("1") {
+        return Ok(None);
+    }
+
+    let k = resolve_ngram_k()?;
+    let min_ngram = resolve_ngram_min()?;
+    let max_ngram = resolve_ngram_max()?;
+    eprintln!(
+        "[HF2Q_SPEC_NGRAM=1] enabled — pure-CPU ngram proposer K={k} \
+         min_ngram={min_ngram} max_ngram={max_ngram} \
+         (workload-specific; ~80% accept needed to beat baseline)"
+    );
+
+    let effective_eos: &[u32] = if ignore_eos { &[] } else { eos_token_ids };
+
+    let t_gen = std::time::Instant::now();
+    let output_tokens = crate::inference::spec_decode::ngram_orchestrator::dispatch_ngram_generate(
+        target,
+        prompt_tokens,
+        max_new_tokens,
+        k,
+        min_ngram,
+        max_ngram,
+        effective_eos,
+        gpu,
+    )
+    .context("dispatch_ngram_generate")?;
+    let gen_elapsed = t_gen.elapsed();
+
+    let new_tokens = &output_tokens[prompt_tokens.len()..];
+    let decoded = tokenizer
+        .decode(new_tokens, /*skip_special=*/ false)
+        .unwrap_or_else(|e| format!("<decode failed: {e}>"));
+    println!("{decoded}");
+    eprintln!(
+        "[HF2Q_SPEC_NGRAM] {} new tokens in {:.2}s ({:.1} tok/s)",
+        new_tokens.len(),
+        gen_elapsed.as_secs_f64(),
+        new_tokens.len() as f64 / gen_elapsed.as_secs_f64().max(1e-6),
+    );
+
+    Ok(Some(()))
+}
