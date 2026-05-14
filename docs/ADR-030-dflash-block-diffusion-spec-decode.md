@@ -1407,3 +1407,54 @@ that's the inherited bug).
 **Code artifacts (iter-74)**:
 - `/opt/mlx-native/src/ops/flash_attn_prefill.rs` —
   `dispatch_flash_attn_prefill_f16_d256_resume` added.
+
+### iter-75 (2026-05-14) — F16 D=512 resume dispatcher (mlx-native)
+
+Completes the pure-causal cross-length kernel surface for gemma-4:
+
+- iter-74: F16 D=256 resume (sliding layers, 25/30 of gemma-4)
+- iter-75: F16 D=512 resume (full-attn layers, 5/30 of gemma-4)
+
+Now hf2q can call cross-length SDPA against the F16 hybrid_kv slot
+for BOTH gemma-4 layer types with no F16↔BF16 cast step.
+
+**Implementation**: `dispatch_flash_attn_prefill_f16_d512_resume`
+added at `/opt/mlx-native/src/ops/flash_attn_prefill_d512.rs:753+`.
+Mirrors `dispatch_flash_attn_prefill_bf16_d256_resume` semantics:
+exposes `q_offset_in_k` (= kernel `qL_off`) and `kv_capacity` (slot
+stride for K/V head dimension).  Pure causal — function constants
+`has_mask=false`, `has_blk=false` dead-code-eliminate mask + blk
+accesses; in-kernel causal masking via `do_causal=true` uses
+`qL_off + iq1 + j` as absolute query position
+(flash_attn_prefill_d512.metal:528, 801).
+
+The D=512 metal kernel ALREADY supported `qL_off` since the original
+llama.cpp-derived port (kernel source line 206); the existing Rust
+dispatcher just hardcoded `qL_off=0`.  The new dispatcher exposes it.
+
+Reuses `FlashAttnPrefillResumeParams` struct from the D=256 module
+(re-exported at top of d512.rs).  Made `validate_buffer_size`
+`pub(crate)` to share with d512.rs.
+
+**Still missing for full Option A on long-context spec-decode**:
+- Sliding-window-with-mask resume dispatcher (for output_len > 1024)
+
+**Mission state at iter-75 end** (kernel surface complete for
+short-context Option A; orchestrator integration still pending):
+- Coherence: GREEN on untemplated N=16 ✓
+- Production wire-up: ✓ (HF2Q_SPEC_DFLASH=1)
+- Perf: 0.096× baseline = **10.5× slower** (no perf change this iter;
+  shipped building blocks)
+- Kernel surface for pure-causal short-context: COMPLETE (D=256 F16 +
+  D=512 F16 resume dispatchers exist + are byte-identity verified
+  via the BF16 parity test pattern)
+- iter-76+ work: wire both resume dispatchers into
+  `forward_prefill_batched` (Phase 1 swap + Phase 2 orchestrator
+  shrink verify_input to K+1) for the predicted ~50% throughput gain
+
+**Code artifacts (iter-75)**:
+- `/opt/mlx-native/src/ops/flash_attn_prefill_d512.rs` —
+  `dispatch_flash_attn_prefill_f16_d512_resume` (~150 LOC).
+  Reuses `FlashAttnPrefillResumeParams` from D=256 module.
+- `/opt/mlx-native/src/ops/flash_attn_prefill.rs` —
+  `validate_buffer_size` made `pub(crate)`.
