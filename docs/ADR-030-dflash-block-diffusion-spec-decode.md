@@ -958,3 +958,75 @@ forward_decode) to isolate.
 - `src/serve/mod.rs` (cmd_generate insertion, ~15 LOC) — gates the
   spec-decode helper after prompt-tokens finalization, returns
   immediately if the helper handles the request.
+
+### iter-67 (2026-05-14) — Three-axis coherence: orchestrator VINDICATED, batched_prefill is the deeper bug
+
+**Investigation of iter-66 finding** (CLI divergence on chat-templated prompts).
+
+Authored `e2e_coherence_gemma4_chat_templated_prompt` — a controlled
+reproducer using the hardcoded 24-token Gemma-chat-templated prompt
+(captured via `HF2Q_DUMP_PROMPT_TOKENS` from cmd_generate):
+
+```text
+[2, 105, 2364, 107, 236935, 236787, 2900, 563, 236743, 236778,
+ 236862, 236778, 105470, 169631, 236787, 106, 107, 105, 4368, 107,
+ 100, 45518, 107, 101]
+```
+
+(BOS=2, `<|turn>`=105, `<turn|>`=106, `<|channel>`=100, `<channel|>`=101.)
+
+**Three coherence axes** measured:
+
+| Axis | Direction | Result |
+|---|---|---|
+| 1 | spec-decode vs `forward_decode` baseline | ✗ FAILS at pos 3 |
+| 2 | `forward_prefill_batched` vs `forward_decode` (DIAG)  | ✗ FAILS at L=27, 28, 29 |
+| 3 | spec-decode vs `forward_prefill_batched` (SELF DIAG) | ✓ PASSES all 8 positions |
+
+Concrete evidence:
+
+```text
+DIAG L=27 argmax=2717 baseline_new[3]=106 ✗
+SELF L=27 argmax=2717 spec_new[3]=2717 ✓
+```
+
+**The orchestrator is FAITHFUL to batched-prefill.**
+`spec_new[i]` exactly matches what `forward_prefill_batched` produces
+at every position when called on `[prompt + spec_new[..i]]`.  This is
+the orchestrator's actual correctness guarantee.
+
+**The CLI divergence reported in iter-66 is a `forward_prefill_batched`
+vs `forward_decode` bug** (axis 2), not a spec-decode bug.  It would
+have manifested in the existing `forward_decode_verify_batched` API
+too (iter-47 added that for KV-prefill verify) if it were exercised
+at non-zero `start_seq_pos` with chat-templated content.  It is
+consistent with the pre-existing `coherence_smoke_all_cells` failure
+on gemma4-apex prompts.
+
+**Untemplated 12-token prompt coherence**: still PASSES byte-identity
+at N=16 (was N=8 in iter-65; bumped to N=16 in iter-67 as additional
+evidence).  The bug is content-sensitive.
+
+**Iter-68+ work**:
+- Investigate axis 2 (`forward_prefill_batched` vs `forward_decode`
+  coherence) on chat-templated prompts.  Hypothesis: special-token
+  handling inside the batched-prefill path is inconsistent with the
+  per-token decode path.  Bisect by comparing pf_hidden between
+  per-token and batched paths at specific layers/positions.
+- This is a hf2q-internal bug NOT introduced by ADR-030; spec-decode
+  inherits it transitively.  Fix is out of ADR-030's scope but
+  required to unblock the spec-decode CLI's full coherence story.
+
+**Code artifacts (iter-67)**:
+- `src/inference/spec_decode/dflash/orchestrator.rs` — new test
+  `e2e_coherence_gemma4_chat_templated_prompt` with three-axis
+  diagnostic (DIAG + SELF) + axis-3 self-consistency assertion that
+  PASSES, axis-1 baseline assertion that intentionally fails until
+  axis-2 is fixed separately.
+- `src/serve/mod.rs` — `HF2Q_DUMP_PROMPT_TOKENS` now also logs the
+  full `prompt_tokens` slice (was first10/last10 only) for clean
+  template-extraction in tests.
+- `src/inference/spec_decode/dflash/orchestrator.rs` —
+  `e2e_dispatch_dflash_generate_gemma4_26b` bumped from N=8 to N=16,
+  confirming untemplated coherence remains byte-identical at longer
+  generations.

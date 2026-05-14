@@ -1258,6 +1258,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             &prompt_tokens[prompt_tokens.len().saturating_sub(10)..],
             prompt_tokens.len()
         );
+        eprintln!("HF2Q_DUMP_PROMPT_TOKENS: full={:?}", prompt_tokens);
     }
 
     let params = sampler_pure::SamplingParams {

@@ -1053,7 +1053,7 @@ mod tests {
         );
 
         let prompt_len = prompt_tokens.len();
-        let max_new_tokens = 8usize; // N total new tokens to compare
+        let max_new_tokens = 16usize; // N total new tokens to compare
         let block_size = 8u32; // K=7, Phase 1.5 optimal on M5 Max
 
         // -----------------------------------------------------------------
@@ -1197,5 +1197,235 @@ mod tests {
             .unwrap_or_else(|e| format!("<decode failed: {e}>"));
         eprintln!("[e2e] COHERENCE PASS: spec_new == baseline_new for all {n_compare} tokens");
         eprintln!("[e2e] decoded = {decoded:?}");
+    }
+
+    /// Iter-67 dual-axis coherence diagnostic on Gemma chat-templated prompt.
+    ///
+    /// Hardcoded 24-token sequence captured from cmd_generate via
+    /// HF2Q_DUMP_PROMPT_TOKENS — Gemma's gguf-embedded chat template applied
+    /// to the canonical "Q: What is 2+2?\nA:" prompt.  Contains BOS=2,
+    /// `<|turn>`=105, `<turn|>`=106, `\n`=107, `<|channel>`=100,
+    /// `<channel|>`=101 — Gemma's chat-template special-token set.
+    ///
+    /// ## Finding (iter-67)
+    ///
+    /// On THIS prompt, two orthogonal coherence axes diverge:
+    ///
+    /// 1. **spec-decode vs single-token forward_decode** — FAILS at pos 3+.
+    /// 2. **`forward_prefill_batched` vs `forward_decode`** — ALSO FAILS at
+    ///    the same positions (L=27,28,29).  See the DIAG output: running
+    ///    forward_prefill_batched on `[prompt + baseline_new[..i]]` and
+    ///    taking the last-position argmax DIVERGES from
+    ///    `forward_decode(baseline_new[i-1], prompt_len + i - 1)`.
+    /// 3. **spec-decode vs forward_prefill_batched** — PASSES (orchestrator
+    ///    is internally consistent with batched-prefill).
+    ///
+    /// Conclusion: the spec-decode orchestrator FAITHFULLY reproduces what
+    /// `forward_prefill_batched` computes.  The "incoherence" surfaced by the
+    /// HF2Q_SPEC_DFLASH=1 CLI on chat-templated prompts is rooted in
+    /// `forward_prefill_batched`'s coherence with `forward_decode`, not in
+    /// the orchestrator.  This is consistent with the pre-existing
+    /// `coherence_smoke_all_cells` failure on gemma4-apex prompts.
+    ///
+    /// **Test is intentionally RED**: it documents the chain
+    /// (batched_prefill bug → spec-decode inherits) so a future
+    /// `forward_prefill_batched` fix is detected as turning this green.
+    #[test]
+    #[ignore = "iter-67 dual-axis diagnostic; requires gemma-4-26b GGUF + DFlash drafter"]
+    fn e2e_coherence_gemma4_chat_templated_prompt() {
+        use crate::inference::spec_decode::dflash::{
+            kv_cache::DFlashKvCache,
+            tensors::DFlashModelTensors,
+            weights::{DFlashWeights, DFlashWeightsFile},
+        };
+        use crate::serve::{
+            config::Gemma4Config,
+            forward_mlx::MlxModelWeights,
+            gpu::GpuContext,
+            header::LoadProgress,
+        };
+        use std::path::PathBuf;
+
+        let target_gguf = PathBuf::from(
+            "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/\
+             gemma4-ara-2pass-APEX-Q5_K_M.gguf",
+        );
+        let home = std::env::var("HOME").expect("HOME env set");
+        let drafter_dir = format!(
+            "{home}/.cache/huggingface/hub/\
+             models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/\
+             77d4202772dfe50b2396ec7bac9cfffc7b9e7057"
+        );
+        let drafter_cfg_path = format!("{drafter_dir}/config.json");
+        let drafter_safetensors_path = format!("{drafter_dir}/model.safetensors");
+        for p in [
+            target_gguf.to_string_lossy().to_string(),
+            drafter_cfg_path.clone(),
+            drafter_safetensors_path.clone(),
+        ] {
+            if !std::path::Path::new(&p).exists() {
+                panic!("required artifact missing: {p}");
+            }
+        }
+
+        let mut gpu = GpuContext::new().expect("Metal device");
+        let gguf = mlx_native::gguf::GgufFile::open(&target_gguf).expect("open gguf");
+        let target_cfg = Gemma4Config::from_gguf(&gguf).expect("gemma4 cfg");
+        let mut progress = LoadProgress::new(false, 0, 0);
+        let mut target = MlxModelWeights::load_from_gguf(&gguf, &target_cfg, &mut gpu, &mut progress)
+            .expect("load target");
+
+        let drafter_cfg = DFlashConfig::from_json_path(&drafter_cfg_path).expect("drafter cfg");
+        let drafter_file = DFlashWeightsFile::open(&drafter_safetensors_path).expect("drafter file");
+        let drafter_weights = DFlashWeights::load(drafter_file.bytes(), &drafter_cfg).expect("drafter weights");
+        let drafter_tensors = {
+            let (exec, _reg) = gpu.split();
+            DFlashModelTensors::upload(exec.device(), &drafter_cfg, &drafter_weights)
+                .expect("drafter upload")
+        };
+        let drafter_cache_cap: u32 = 4096;
+        let mut drafter_cache = {
+            let (exec, _reg) = gpu.split();
+            DFlashKvCache::new(exec.device(), &drafter_cfg, drafter_cache_cap)
+                .expect("drafter cache")
+        };
+
+        // The exact 24-token sequence cmd_generate produces for the
+        // canonical "Q: What is 2+2?\nA:" prompt via render_chat_template.
+        let prompt_tokens: Vec<u32> = vec![
+            2, 105, 2364, 107, 236935, 236787, 2900, 563, 236743, 236778,
+            236862, 236778, 105470, 169631, 236787, 106, 107, 105, 4368,
+            107, 100, 45518, 107, 101,
+        ];
+        let prompt_len = prompt_tokens.len();
+        let max_new_tokens = 8usize;
+        let block_size = 8u32;
+        eprintln!("[e2e-tmpl] prompt_tokens.len()={prompt_len}");
+
+        // BASELINE single-token decode for N tokens.
+        let max_decode_for_alloc = max_new_tokens + block_size as usize - 1;
+        let first_token_baseline = target
+            .forward_prefill_batched(&prompt_tokens, max_decode_for_alloc, 0, &mut gpu)
+            .expect("baseline prefill");
+        let mut baseline_new: Vec<u32> = vec![first_token_baseline];
+        let mut last_tok = first_token_baseline;
+        for step in 0..(max_new_tokens - 1) {
+            let mut prof: Option<crate::serve::forward_mlx::TokenProfile> = None;
+            let next = target
+                .forward_decode(last_tok, prompt_len + step, &mut gpu, &mut prof)
+                .expect("baseline forward_decode");
+            baseline_new.push(next);
+            last_tok = next;
+        }
+        eprintln!("[e2e-tmpl] BASELINE = {baseline_new:?}");
+
+        // Reset target for diagnostic runs.
+        target.rollback_kv(prompt_len + max_new_tokens - 1);
+
+        // DIAGNOSTIC: forward_prefill_batched at start_pos=0 on
+        // incremental prefixes.  At each prefix length L =
+        // prompt_len + i, the LAST-POSITION argmax (returned as
+        // first_token) should equal baseline_new[i] — proving
+        // forward_prefill_batched's self-attention pipeline is
+        // coherent for the chat-templated prompt content at every
+        // incremental length.  If this diverges, the bug is in the
+        // prefill+self-attention path, not the orchestrator.
+        eprintln!("[e2e-tmpl] DIAG: forward_prefill_batched at incremental prefix lengths");
+        for i in 0..max_new_tokens {
+            let mut prefix: Vec<u32> = prompt_tokens.clone();
+            prefix.extend(&baseline_new[..i]);
+            let argmax = target
+                .forward_prefill_batched(&prefix, max_decode_for_alloc, 0, &mut gpu)
+                .expect("diag forward_prefill_batched");
+            let mark = if argmax == baseline_new[i] { "✓" } else { "✗" };
+            eprintln!(
+                "[e2e-tmpl]   DIAG L={} argmax={} baseline_new[{}]={} {}",
+                prefix.len(), argmax, i, baseline_new[i], mark,
+            );
+            target.rollback_kv(prefix.len());
+        }
+
+        // SPEC: dispatch_dflash_generate.
+        let eos_token_ids: Vec<u32> = vec![]; // mirror --ignore-eos to avoid early-stop
+        let spec_output = dispatch_dflash_generate(
+            &mut target,
+            &drafter_tensors,
+            &mut drafter_cache,
+            &drafter_cfg,
+            &prompt_tokens,
+            max_new_tokens,
+            block_size,
+            &eos_token_ids,
+            &mut gpu,
+        )
+        .expect("dispatch_dflash_generate");
+        let spec_new = &spec_output[prompt_len..];
+        eprintln!("[e2e-tmpl] SPEC     = {spec_new:?}");
+
+        let n_compare = baseline_new.len().min(spec_new.len());
+        for i in 0..n_compare {
+            let mark = if baseline_new[i] == spec_new[i] { "✓" } else { "✗" };
+            eprintln!(
+                "[e2e-tmpl]   pos {i}: baseline={} spec={} {mark}",
+                baseline_new[i], spec_new[i]
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // ORCHESTRATOR INTERNAL-CONSISTENCY DIAGNOSTIC
+        //
+        // Now verify the third coherence axis: spec_new should match what
+        // forward_prefill_batched produces when called on the SPEC's own
+        // chain — i.e. spec-decode is faithful to batched-prefill.  This
+        // SHOULD pass even when the batched_prefill vs forward_decode
+        // axis fails.
+        // -----------------------------------------------------------------
+        eprintln!("[e2e-tmpl] DIAG: forward_prefill_batched on SPEC's own chain");
+        let mut spec_self_consistent = true;
+        target.rollback_kv(prompt_len + max_new_tokens - 1);
+        for i in 0..max_new_tokens {
+            let mut prefix: Vec<u32> = prompt_tokens.clone();
+            prefix.extend(&spec_new[..i]);
+            let argmax = target
+                .forward_prefill_batched(&prefix, max_decode_for_alloc, 0, &mut gpu)
+                .expect("self-consistency prefill");
+            let mark = if argmax == spec_new[i] { "✓" } else { "✗" };
+            if argmax != spec_new[i] {
+                spec_self_consistent = false;
+            }
+            eprintln!(
+                "[e2e-tmpl]   SELF L={} argmax={} spec_new[{}]={} {}",
+                prefix.len(), argmax, i, spec_new[i], mark,
+            );
+            target.rollback_kv(prefix.len());
+        }
+
+        // Spec-decode MUST be internally consistent with batched_prefill —
+        // this is the orchestrator's REAL coherence guarantee.  Even if
+        // baseline forward_decode disagrees with batched_prefill (axis 2),
+        // the orchestrator must faithfully reproduce batched_prefill's
+        // chain (axis 3).
+        assert!(
+            spec_self_consistent,
+            "ORCHESTRATOR self-consistency FAILED: spec_new should match \
+             forward_prefill_batched(prompt + spec_new[..i]).first_token at \
+             every i (see SELF rows above for first mismatch).",
+        );
+        eprintln!(
+            "[e2e-tmpl] ORCHESTRATOR self-consistency PASS (spec-decode faithful to batched_prefill)"
+        );
+
+        // The "spec vs forward_decode baseline" axis — currently fails due
+        // to an underlying forward_prefill_batched vs forward_decode
+        // divergence (see DIAG rows above).  Test is intentionally RED on
+        // this axis until the batched_prefill bug is fixed separately.
+        assert_eq!(spec_new.len(), baseline_new.len(), "length mismatch");
+        for (i, (b, s)) in baseline_new.iter().zip(spec_new.iter()).enumerate() {
+            assert_eq!(b, s,
+                "coherence gate FAILED on chat-templated prompt at new-token position {i}: \
+                 baseline={b} spec={s} — root cause is forward_prefill_batched coherence \
+                 (see DIAG output for axis-2 failures).");
+        }
+        eprintln!("[e2e-tmpl] FULL COHERENCE PASS for chat-templated prompt");
     }
 }
