@@ -233,13 +233,13 @@ impl DFlashConfig {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Verbatim JSON from `~/.cache/huggingface/hub/models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/.../config.json`
     /// (confirmed iter-2 of ADR-030 mission). This is the actual production
     /// drafter config that hf2q must consume.
-    const GEMMA4_26B_A4B_DFLASH_CONFIG: &str = r#"{
+    pub(crate) const GEMMA4_26B_A4B_DFLASH_CONFIG: &str = r#"{
         "architectures": ["DFlashDraftModel"],
         "attention_bias": false,
         "attention_dropout": 0.0,
