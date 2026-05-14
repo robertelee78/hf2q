@@ -1308,3 +1308,49 @@ initial measured baseline.
 - Remaining: ~10.5× to ≥1.07× mission gate.  Verify_prefill still
   dominates (78 ms = 75% of remaining round wall-clock); requires
   Option A (cross-length SDPA) — multi-day kernel/dispatch work.
+
+### iter-73 (2026-05-14) — Consolidation + Option A scope planning
+
+No code changes this iter.  Consolidated the iter-68 → iter-72 perf
+trajectory and scoped the Option A architectural lever precisely.
+
+Probed two env-var optimizations against the iter-72 baseline:
+- `HF2Q_GRAPH_OPT_PREFILL=1` — no measurable gain
+- `HF2Q_FULL_F16_KV=1` — no measurable gain on verify_prefill alone
+
+→ Verify_prefill cost is dominated by the kernel work itself
+(per-token cost × ~32 tokens per round), not by dispatch reordering
+or KV dtype.  Reducing it requires the architectural change to
+cross-length SDPA where the kernel processes only K+1 queries against
+the prior cache.
+
+**Detailed planning artifact**:
+[docs/research/ADR-030-iter73-perf-trajectory-and-option-A-plan.md](research/ADR-030-iter73-perf-trajectory-and-option-A-plan.md)
+
+Contents:
+1. Unified perf trajectory iter-68 → iter-72 (numbers, methodology)
+2. Mathematical mission gate analysis — Option A alone gets us to
+   ~0.71× baseline at 50% accept rate.  Mission gate ≥1.07× requires
+   BOTH Option A and ≥75% acceptance (the latter is blocked by the
+   axis-2 batched_prefill bug from iter-67).
+3. Kernel surface inventory — mlx-native's
+   `flash_attn_prefill_*_d{256,512}` already supports cross-length
+   attention natively via `qL`, `kL`, `qL_off` params (kernel source
+   line 1330+).  The DFlash drafter itself uses cross-length SDPA via
+   `dispatch_dflash_sdpa_cross_length` — proof the building blocks
+   work in hf2q.
+4. Implementation outline — branch in forward_prefill_batched's SDPA
+   dispatch when `start_pos > 0 && dflash_capture.is_some()`, use
+   hybrid_kv.k/v_packed directly with `kL = start_pos + seq_len`,
+   require `HF2Q_FULL_F16_KV=1` for the simple F16 V path.
+5. Estimated impact — verify_prefill 79 ms → 25-35 ms; throughput
+   9.5 → ~17.8 t/s at 0% accept; ~71 t/s at 50% accept.
+6. iter-74+ sequence: mask builder → BF16→F16 Q cast → wired SDPA
+   branch → e2e test → bench → production integration.
+
+**Mission state at iter-73 end** (unchanged from iter-72; this iter
+ships planning):
+- Coherence: GREEN on untemplated N=16 ✓
+- Production wire-up: ✓ (HF2Q_SPEC_DFLASH=1)
+- Perf: 0.096× baseline = **10.5× slower**
+- Plan ready for iter-74+ Option A implementation.
