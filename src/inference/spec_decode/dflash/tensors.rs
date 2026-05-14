@@ -122,33 +122,56 @@ fn upload_bf16(device: &MlxDevice, view: &TensorView<'_>) -> Result<MlxBuffer, T
     Ok(buf)
 }
 
-/// Convert a BF16 [`TensorView`] to F32 and upload to a fresh GPU
-/// [`MlxBuffer`]. Used for q_norm/k_norm where mlx-native's rms_norm
-/// kernel requires weight dtype to match the F32 input.
-fn upload_bf16_as_f32(device: &MlxDevice, view: &TensorView<'_>) -> Result<MlxBuffer, TensorsError> {
-    let bf16_bytes = view.data();
-    let n_elem = bf16_bytes.len() / 2;
-    if bf16_bytes.len() != n_elem * 2 {
+/// Decode little-endian BF16 bytes into F32 values via bit-shift
+/// reconstruction.
+///
+/// BF16 = top 16 bits of an F32 (matching exponent range, truncated
+/// mantissa).  Reconstruction is `f32_bits = (bf16_bits as u32) << 16`
+/// (the dropped low 16 mantissa bits become zero).
+///
+/// Factored out of [`upload_bf16_as_f32`] so the bit math is unit-
+/// testable without a Metal device (ADR-030 iter-108).  Catches future
+/// regressions in the iter-106 cast path.
+///
+/// Returns an error if `bytes.len()` is odd (not BF16-aligned).
+pub(super) fn decode_bf16_bytes_to_f32(bytes: &[u8]) -> Result<Vec<f32>, TensorsError> {
+    let n_elem = bytes.len() / 2;
+    if bytes.len() != n_elem * 2 {
         return Err(TensorsError::Mlx(MlxError::InvalidArgument(format!(
-            "upload_bf16_as_f32: data len {} not even (not BF16-aligned)",
-            bf16_bytes.len()
+            "decode_bf16_bytes_to_f32: data len {} not even (not BF16-aligned)",
+            bytes.len()
         ))));
     }
+    let mut out = Vec::with_capacity(n_elem);
+    for i in 0..n_elem {
+        let lo = bytes[i * 2] as u32;
+        let hi = bytes[i * 2 + 1] as u32;
+        let bf16_bits = lo | (hi << 8);
+        let f32_bits = bf16_bits << 16;
+        out.push(f32::from_bits(f32_bits));
+    }
+    Ok(out)
+}
+
+/// Convert a BF16 [`TensorView`] to F32 and upload to a fresh GPU
+/// [`MlxBuffer`]. Used for the RMSNorm weights (q_norm, k_norm,
+/// input_layernorm, post_attention_layernorm, hidden_norm, final_norm
+/// — see ADR-030 iter-106) where mlx-native's `rms_norm_f32` kernel
+/// declares `device const float*` for the weight buffer and requires
+/// the weight dtype to match the F32 input.
+///
+/// Bit decoding factored into [`decode_bf16_bytes_to_f32`] for
+/// device-free unit testability (ADR-030 iter-108).
+fn upload_bf16_as_f32(device: &MlxDevice, view: &TensorView<'_>) -> Result<MlxBuffer, TensorsError> {
+    let f32_values = decode_bf16_bytes_to_f32(view.data())?;
+    let n_elem = f32_values.len();
     let shape: Vec<usize> = view.shape().to_vec();
     let mut buf = device.alloc_buffer(n_elem * 4, DType::F32, shape)?;
     let dst: &mut [f32] = buf
         .as_mut_slice::<f32>()
         .map_err(|e| TensorsError::Mlx(MlxError::InvalidArgument(format!("f32 slice: {e}"))))?;
     debug_assert_eq!(dst.len(), n_elem);
-    // BF16 = 16 MSBs of an F32. Reconstruct F32 by left-shifting BF16
-    // bits into the top half of the F32 bits.
-    for i in 0..n_elem {
-        let lo = bf16_bytes[i * 2] as u32;
-        let hi = bf16_bytes[i * 2 + 1] as u32;
-        let bf16_bits = lo | (hi << 8);
-        let f32_bits = bf16_bits << 16;
-        dst[i] = f32::from_bits(f32_bits);
-    }
+    dst.copy_from_slice(&f32_values);
     Ok(buf)
 }
 
@@ -307,6 +330,83 @@ mod tests {
             super::super::config::tests::GEMMA4_26B_A4B_DFLASH_CONFIG,
         )
         .expect("test fixture must parse")
+    }
+
+    /// Build a BF16 byte buffer (little-endian) from a F32 value by
+    /// truncating the F32 to its top 16 bits.  Round-trip helper for
+    /// the tests below.
+    fn bf16_bytes_from_f32(values: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 2);
+        for v in values {
+            let bits = v.to_bits();
+            // BF16 = top 16 bits.  Round-to-nearest-even would add half
+            // a low-bit of the BF16 mantissa range, but for canonical
+            // test values (1.0, -1.0, 0.0, finite powers of two) the
+            // truncated form IS the round-to-nearest representative
+            // because the low 16 bits are already zero.
+            let bf16_bits = (bits >> 16) as u16;
+            out.push((bf16_bits & 0xff) as u8);
+            out.push(((bf16_bits >> 8) & 0xff) as u8);
+        }
+        out
+    }
+
+    /// ADR-030 iter-108 — locks down the bit-decode path that the iter-106
+    /// fix relies on.  Constructs synthetic BF16 byte buffers with known
+    /// canonical values and asserts the F32 round-trip via
+    /// `decode_bf16_bytes_to_f32` produces the originating F32 values
+    /// bit-exactly.
+    #[test]
+    fn decode_bf16_bytes_round_trips_canonical_values() {
+        // Values whose F32 form has all-zero low 16 bits: these survive
+        // BF16 truncation losslessly.
+        let canonical = [0.0f32, 1.0, -1.0, 2.0, 0.5, -0.5, 256.0, -256.0];
+        let bytes = bf16_bytes_from_f32(&canonical);
+        let decoded = decode_bf16_bytes_to_f32(&bytes).expect("decode");
+        assert_eq!(decoded.len(), canonical.len());
+        for (i, (got, want)) in decoded.iter().zip(canonical.iter()).enumerate() {
+            assert_eq!(got.to_bits(), want.to_bits(),
+                "canonical[{i}] = {want} round-trip got {got}");
+        }
+    }
+
+    /// Verify the OOB / corruption signature that iter-106 fixed.
+    /// Reading F32 over BF16 bytes (the pre-fix bug) would read 8 BF16
+    /// elements as 4 F32 elements with mangled bits.  This test
+    /// constructs a small BF16 buffer + reads the FIRST 4 F32 words from
+    /// it; the result should NOT equal the BF16 values themselves.
+    #[test]
+    fn bf16_over_f32_misinterpret_signature() {
+        let canonical = [1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let bf16_bytes = bf16_bytes_from_f32(&canonical);
+        assert_eq!(bf16_bytes.len(), canonical.len() * 2);
+        // BF16 1.0 bytes are [0x80, 0x3f] little-endian.
+        assert_eq!(&bf16_bytes[0..2], &[0x80, 0x3f]);
+
+        // The PRE-FIX bug: rms_norm_f32 kernel reads F32 over this BF16
+        // buffer.  Simulate by reinterpreting 4 bytes at a time as F32.
+        let mut misread = Vec::with_capacity(canonical.len() / 2);
+        for chunk in bf16_bytes.chunks_exact(4) {
+            let bits = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            misread.push(f32::from_bits(bits));
+        }
+        // Two BF16 1.0 bytes [0x80 0x3f 0x80 0x3f] reinterpret as
+        // F32 bits 0x3f803f80 — a value close to 1.0 but NOT equal
+        // (mantissa contains the second BF16's bits).
+        assert_eq!(misread.len(), 4);
+        let bug_value = f32::from_bits(0x3f803f80);
+        assert_eq!(misread[0].to_bits(), bug_value.to_bits(),
+            "pre-iter-106 bug: reads BF16 1.0 + 1.0 as F32 ≈ {} (NOT 1.0)",
+            bug_value);
+        assert_ne!(misread[0], 1.0,
+            "this is the silent-corruption signature iter-106 fixed");
+    }
+
+    #[test]
+    fn decode_bf16_bytes_rejects_odd_length() {
+        let bytes = vec![0x80, 0x3f, 0x00]; // 3 bytes — odd
+        let err = decode_bf16_bytes_to_f32(&bytes).unwrap_err();
+        assert!(format!("{err}").contains("not even"));
     }
 
     /// Integration test: upload all 58 drafter tensors to GPU and
