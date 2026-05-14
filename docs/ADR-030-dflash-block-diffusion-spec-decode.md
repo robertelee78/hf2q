@@ -2608,3 +2608,66 @@ Interpretation in next operator session:
 
 `cargo check --release` clean, 51/51 lib tests still GREEN.
 
+
+### iter-104 — Suspect audit + NaN/Inf detector in DRAFTER_DUMP
+
+Walked each of the three iter-103 narrowed suspects line-by-line
+against the actual mlx-native shader sources:
+
+**Suspect 1 (RoPE axis routing for plain NeoX)** — `apply_imrope`
+with `sections=[head_dim/2, 0, 0, 0]` and `mode=Imrope` resolves via
+`pick_axis()` (`rope_multi.metal:103-120`):
+  - pair `p%3==0`, sector `p < 3*s0` (always true for s0=64) → axis 0
+  - pair `p%3==1`, sector `< 3*s1 = 0` → fall through to axis 3
+  - pair `p%3==2`, sector `< 3*s2 = 0` → fall through to axis 3
+Since `build_dflash_pos_buf` writes IDENTICAL `[base, base+1, …,
+base+L-1]` into all four axis slots of the position buffer, axes 0
+and 3 produce the same `pos` for any pair.  Result is bit-equivalent
+to plain 1D NeoX RoPE.  Kernel reads `seq_idx = row_idx / n_heads`
+which matches our `[L, n_heads, head_dim]` flat row-major layout
+(`forward.rs:250-251` doc).  **Audit verdict: CORRECT**.
+
+**Suspect 2 (`dispatch_dflash_input_layernorm`)** — calls
+`dispatch_rms_norm` with `rows=seq_len, dim=hidden`.  RMS norm
+operates per row, no cross-row reduction.  **Audit verdict:
+CORRECT** (no per-position collapse).
+
+**Suspect 3 (`do_causal=false` SDPA wiring)** — `sdpa.metal:101-104`:
+```
+const uint abs_pos = kv_seq_len - seq_len + q_pos;
+const uint max_k = params->do_causal != 0
+    ? min(abs_pos + 1, kv_seq_len)
+    : kv_seq_len;
+```
+`do_causal=0` correctly sets `max_k = kv_seq_len` (bidirectional);
+`abs_pos` differentiates queries.  `SdpaParams` plumbs `do_causal`
+as `u32` (`sdpa.rs:72`).  **Audit verdict: CORRECT**.
+
+**All three iter-103 suspects ELIMINATED by code review.**
+
+This shifts the residual mystery to one of:
+- The iter-87 "all-pad `[0]*7`" pattern (a DIFFERENT signature from
+  iter-86's `[1595]*7`) consistent with `h_final` going degenerate
+  — vocab token id 0 wins when all logits collapse to a constant
+  (lm_head row-sum dominates argmax).
+- iter-86's `[1595]*7` may actually be the drafter being naturally
+  confident on a self-echoing toy prompt (not a bug).
+
+**Instrumentation extended (orchestrator.rs)**: the
+`HF2Q_DFLASH_DRAFTER_DUMP=1` block now also prints:
+```
+nan_count = N
+inf_count = N
+per_row_max_abs = [m_0, m_1, …, m_{bs-1}]
+```
+If `nan_count + inf_count > 0` OR `per_row_max_abs` ≈ 0 across all
+rows → drafter's per-layer pipeline is producing degenerate output
+(catches the iter-87 long-prompt all-pad failure mode).
+
+Per-row `max_abs` also lets the operator distinguish between
+"drafter produces uniform but non-degenerate logits at every
+position" (cluster, content-natural) vs "drafter output is sparse
+or vanishes" (numerical bug).
+
+`cargo check --release` clean, 51/51 lib tests still GREEN.
+

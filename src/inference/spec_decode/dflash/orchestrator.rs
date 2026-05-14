@@ -742,18 +742,38 @@ pub fn dispatch_dflash_generate(
                         .fold(0.0f32, f32::max);
                     max_pairwise_diff = max_pairwise_diff.max(diff);
                 }
+                // iter-104: NaN/Inf detector + per-row max-abs.  Catches
+                // the iter-87 "all-pad [0]*7" pattern (degenerate h_final
+                // → lm_head argmax falls to vocab token 0).  If
+                // nan_count + inf_count > 0 OR all row max_abs ≈ 0 →
+                // drafter forward is producing degenerate output rather
+                // than clustering in a content-natural way.
+                let nan_count = host_copy.iter().filter(|x| x.is_nan()).count();
+                let inf_count = host_copy.iter().filter(|x| x.is_infinite()).count();
+                let mut row_max_abs = Vec::with_capacity(bs);
+                for i in 0..bs {
+                    let row = &host_copy[i * hs..(i + 1) * hs];
+                    let m = row.iter().filter(|x| x.is_finite())
+                        .map(|x| x.abs())
+                        .fold(0.0f32, f32::max);
+                    row_max_abs.push(m);
+                }
                 eprintln!(
                     "[DRAFTER_DUMP round={} block_size={} hs={}]\n  \
                      h_final[pos=0,d=0..8] = {:?}\n  \
                      h_final[pos=1,d=0..8] = {:?}\n  \
                      h_final[pos={},d=0..8] = {:?}\n  \
-                     max_adj_pairwise_abs_diff(rows 1..{}) = {:.6e}",
+                     max_adj_pairwise_abs_diff(rows 1..{}) = {:.6e}\n  \
+                     nan_count = {} inf_count = {}\n  \
+                     per_row_max_abs = {:?}",
                     rounds_count, bs, hs,
                     &host_copy[0..8.min(hs)],
                     &host_copy[hs..hs + 8.min(hs)],
                     bs - 1, &host_copy[(bs - 1) * hs..(bs - 1) * hs + 8.min(hs)],
                     bs,
                     max_pairwise_diff,
+                    nan_count, inf_count,
+                    row_max_abs,
                 );
             }
             let all_argmaxes = target
