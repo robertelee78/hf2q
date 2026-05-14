@@ -930,6 +930,14 @@ pub fn apply_linear_projection_f32_into(
     in_features: u32,
     out_features: u32,
 ) -> Result<()> {
+    // ADR-030 iter-115 — defense-in-depth dtype check (mirrors
+    // apply_linear_projection_f32 in iter-114).  Caller-supplied dst must
+    // also be F32 since every kernel path below writes F32.
+    debug_assert_eq!(input.dtype(), DType::F32,
+        "apply_linear_projection_f32_into: input must be F32; got {}", input.dtype());
+    debug_assert_eq!(dst.dtype(), DType::F32,
+        "apply_linear_projection_f32_into: dst must be F32; got {}", dst.dtype());
+
     match weight.dtype() {
         DType::U8 => {
             let params = GgmlQuantizedMatmulParams {
