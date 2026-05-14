@@ -12,6 +12,7 @@
 
 pub mod config;
 pub mod forward;
+pub mod hidden_capture;
 pub mod kv_cache;
 pub mod orchestrator;
 pub mod tensors;
