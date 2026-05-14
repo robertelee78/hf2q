@@ -165,6 +165,102 @@ pub fn capture_buffer_len(cfg: &DFlashConfig, seq_len: usize) -> usize {
     cfg.target_layer_ids.len() * seq_len * cfg.hidden_size
 }
 
+/// Extract drafter's `target_layer_ids` slabs from a COMBINED capture
+/// buffer (which may include additional layers like the final layer for
+/// argmax purposes) and produce the drafter-input concat layout
+/// `[seq_len, drafter_n_layers * hidden_size]`.
+///
+/// ## When this is used
+///
+/// The multi-round orchestrator wrapper installs a SINGLE capture
+/// session per target forward call, with `target_layer_ids` = drafter's
+/// `[1, 6, 11, 17, 22, 27]` ∪ `[final_layer_idx]`. After the forward,
+/// it needs to produce TWO things from the same `hidden_output`:
+/// - drafter's input: `[seq_len, drafter_n_layers * hs]` (this helper)
+/// - target's argmax input: `[seq_len, hs]` (final layer slab only)
+///
+/// ## Layout
+///
+/// Input: `hidden_output` layout `[combined_capture_layer, seq_len, hs]`
+/// row-major where `combined_capture_layer_ids` is the merged set.
+///
+/// Output: `[seq_len, drafter_n_layers, hs]` flat row-major (= same as
+/// `[seq_len, drafter_n_layers * hs]` after final-axis merge), matching
+/// what `dispatch_dflash_fc` expects as `target_hidden_concat`.
+pub fn extract_drafter_concat(
+    hidden_output: &[f32],
+    combined_capture_layer_ids: &[usize],
+    drafter_target_layer_ids: &[usize],
+    seq_len: usize,
+    hidden_size: usize,
+) -> Result<Vec<f32>> {
+    let drafter_n = drafter_target_layer_ids.len();
+    let total_in = combined_capture_layer_ids.len() * seq_len * hidden_size;
+    if hidden_output.len() != total_in {
+        return Err(anyhow!(
+            "extract_drafter_concat: hidden_output len {} != combined_layers({}) * seq_len({}) * hs({}) = {}",
+            hidden_output.len(), combined_capture_layer_ids.len(), seq_len, hidden_size, total_in
+        ));
+    }
+
+    // Map each drafter layer id to its index in combined_capture_layer_ids
+    let mut drafter_to_combined: Vec<usize> = Vec::with_capacity(drafter_n);
+    for &dl in drafter_target_layer_ids {
+        match combined_capture_layer_ids.iter().position(|&c| c == dl) {
+            Some(idx) => drafter_to_combined.push(idx),
+            None => {
+                return Err(anyhow!(
+                    "extract_drafter_concat: drafter target_layer_id {} not in combined capture set {:?}",
+                    dl, combined_capture_layer_ids
+                ));
+            }
+        }
+    }
+
+    // Output layout: for each (t, drafter_l, d) put hidden_output at
+    // (combined_idx, t, d) into out at ((t * drafter_n + drafter_l), d).
+    let mut out = vec![0.0f32; seq_len * drafter_n * hidden_size];
+    for (drafter_l, &combined_idx) in drafter_to_combined.iter().enumerate() {
+        for t in 0..seq_len {
+            let src = (combined_idx * seq_len + t) * hidden_size;
+            let dst = (t * drafter_n + drafter_l) * hidden_size;
+            out[dst..dst + hidden_size]
+                .copy_from_slice(&hidden_output[src..src + hidden_size]);
+        }
+    }
+    Ok(out)
+}
+
+/// Extract the final-layer slab `[seq_len, hidden_size]` from a
+/// combined capture buffer. Used by the multi-round orchestrator's
+/// per-round argmax step.
+pub fn extract_final_layer_slab(
+    hidden_output: &[f32],
+    combined_capture_layer_ids: &[usize],
+    final_layer_idx: usize,
+    seq_len: usize,
+    hidden_size: usize,
+) -> Result<Vec<f32>> {
+    let final_combined_idx = combined_capture_layer_ids
+        .iter()
+        .position(|&c| c == final_layer_idx)
+        .ok_or_else(|| {
+            anyhow!(
+                "extract_final_layer_slab: final_layer_idx {} not in combined capture set {:?}",
+                final_layer_idx, combined_capture_layer_ids
+            )
+        })?;
+    let start = final_combined_idx * seq_len * hidden_size;
+    let end = start + seq_len * hidden_size;
+    if end > hidden_output.len() {
+        return Err(anyhow!(
+            "extract_final_layer_slab: end offset {} > buffer len {}",
+            end, hidden_output.len()
+        ));
+    }
+    Ok(hidden_output[start..end].to_vec())
+}
+
 /// Owned variant of `PrefillCapture` for installation as an
 /// `MlxModelWeights` field. Avoids the lifetime parameter (Vec-backed)
 /// so the capture session can live across the forward call without
@@ -269,6 +365,75 @@ mod tests {
             super::super::config::tests::GEMMA4_26B_A4B_DFLASH_CONFIG,
         )
         .expect("config parse")
+    }
+
+    #[test]
+    fn extract_drafter_concat_picks_right_slabs() {
+        // Combined capture has 7 layers: drafter's [1,6,11,17,22,27] + final 29
+        let combined = vec![1, 6, 11, 17, 22, 27, 29];
+        let drafter_ids = vec![1, 6, 11, 17, 22, 27];
+        let seq_len = 3usize;
+        let hs = 4usize;
+        // hidden_output layout: [combined_layer=7][t=3][dim=4]
+        // Fill with values = combined_layer_idx * 100 + t * 10 + dim
+        let mut hidden = vec![0.0f32; 7 * 3 * 4];
+        for cli in 0..7 {
+            for t in 0..3 {
+                for d in 0..4 {
+                    hidden[(cli * 3 + t) * 4 + d] = (cli * 100 + t * 10 + d) as f32;
+                }
+            }
+        }
+        let out = extract_drafter_concat(&hidden, &combined, &drafter_ids, seq_len, hs).unwrap();
+        // Expected layout: [t=3][drafter_l=6][dim=4]
+        // out[(t * 6 + drafter_l) * 4 + d] = hidden[(combined_idx * 3 + t) * 4 + d]
+        // For drafter_l=0 (id=1, combined_idx=0): values from cli=0
+        // For drafter_l=5 (id=27, combined_idx=5): values from cli=5
+        // Combined idx 6 (id=29) is the FINAL layer; should NOT appear in out.
+        for t in 0..seq_len {
+            for drafter_l in 0..drafter_ids.len() {
+                let combined_idx = drafter_l; // since drafter ids are first 6 of combined
+                for d in 0..hs {
+                    let expected = (combined_idx * 100 + t * 10 + d) as f32;
+                    let actual = out[(t * drafter_ids.len() + drafter_l) * hs + d];
+                    assert_eq!(actual, expected, "t={t} drafter_l={drafter_l} d={d}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extract_final_layer_slab_picks_correct_layer() {
+        // Combined: [1, 6, 11, 17, 22, 27, 29]
+        // Final layer = 29 → combined_idx = 6 (last)
+        let combined = vec![1, 6, 11, 17, 22, 27, 29];
+        let seq_len = 3usize;
+        let hs = 4usize;
+        let mut hidden = vec![0.0f32; 7 * 3 * 4];
+        // Make final-layer slab (combined_idx=6) all 9.0; rest all 1.0.
+        for cli in 0..7 {
+            for t in 0..3 {
+                for d in 0..4 {
+                    hidden[(cli * 3 + t) * 4 + d] = if cli == 6 { 9.0 } else { 1.0 };
+                }
+            }
+        }
+        let slab = extract_final_layer_slab(&hidden, &combined, 29, seq_len, hs).unwrap();
+        assert_eq!(slab.len(), seq_len * hs);
+        for v in slab.iter() {
+            assert_eq!(*v, 9.0);
+        }
+    }
+
+    #[test]
+    fn extract_drafter_concat_errors_on_missing_layer() {
+        // Drafter wants layer 100 which isn't in combined
+        let combined = vec![1, 6, 29];
+        let drafter_ids = vec![1, 100];
+        let mut hidden = vec![0.0f32; 3 * 3 * 4];
+        for v in hidden.iter_mut() { *v = 1.0; }
+        let err = extract_drafter_concat(&hidden, &combined, &drafter_ids, 3, 4).unwrap_err();
+        assert!(format!("{err}").contains("not in combined"));
     }
 
     #[test]
