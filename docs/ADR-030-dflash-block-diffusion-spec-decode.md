@@ -557,6 +557,42 @@ Synthesizing §3.2 + §3.5 into a single coherence contract:
 
 **The default flip to `HF2Q_SPEC_DFLASH=1` requires explicit operator approval** — this ADR commits to landing the feature behind a flag, NOT to default-flipping it. Default-flip is a separate post-Phase-6 operator decision based on field acceptance-rate distribution.
 
+### Operator commitment (2026-05-14, post-iter-117)
+
+After 14+ iterations of investigation that culminated in the iter-106
+RMSNorm dtype root-cause fix, the operator gave the standing directive:
+
+> "ok lets keep going but not a death march — let's honestly try
+>  fully — but no commitment to dflash unless it actually improves
+>  speed without harming coherence"
+>
+> "coherence > speed .. but speed is still wanted"
+
+**Encoded constraints**:
+1. **Coherence is non-negotiable.** Any default-on path MUST be
+   universally coherent across the iter-92 prompt-length fleet
+   (1, 6, 10, 12, 16 tokens) at temp=0.
+2. **Speed must be measured, not projected.** No commitment is
+   made based on Phase 1's 1.05× Python projection or the
+   1.30×/1.70× Rust-port math.  The 1.07× mission gate must be
+   demonstrated by alt-pair thermal-fair bench on real gemma-4-26b.
+3. **No death march.**  If post-iter-106 GPU measurement shows the
+   drafter still does not achieve meaningful acceptance + speedup,
+   DFlash stays opt-in via `HF2Q_SPEC_DFLASH=1` indefinitely.
+   Option C re-prefill remains the production-safe path.
+
+**Current production stance** (HEAD post-iter-117):
+- Default with `HF2Q_SPEC_DFLASH=0`: bit-identical to pre-ADR-030
+  HEAD on every prompt.
+- `HF2Q_SPEC_DFLASH=1` without `XLEN_SDPA`: Option C re-prefill,
+  universally coherent but slower than baseline (~0.15×) on
+  prompts where drafter has 0% acceptance.  Post-iter-106 the
+  drafter should produce meaningful drafts; whether that
+  translates to ≥1× baseline speedup is operator-gated.
+- `HF2Q_SPEC_DFLASH=1` + `HF2Q_DFLASH_XLEN_SDPA=1`: Option A
+  cross-length verify, 4/5 iter-92 prompts coherent post-iter-100,
+  6-tok still broken.  Not production-safe; gated for measurement.
+
 ### 3.7 Measurement protocol (mantra: "Measure 3×, cut once")
 
 Every perf gate uses the canonical hf2q protocol per `feedback_metal_bench_protocol_2026_05_12.md`:
