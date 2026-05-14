@@ -707,6 +707,160 @@ pub fn dispatch_dflash_sdpa_self_attn(
     .context("dispatch_dflash_sdpa_self_attn")
 }
 
+/// Run the full DFlashAttention sub-block for one layer with KV cache.
+///
+/// Mirrors `model_mlx.py:DFlashAttention.__call__` (lines 82-116) in
+/// full: input_layernorm + Q/K_ctx/V_ctx/K_prop/V_prop projections +
+/// q_norm/k_norm + RoPE + cache update + cross-length SDPA + O proj.
+///
+/// Returns the attention output (NOT residual-summed); caller adds
+/// `h + attn_out` for the residual.
+///
+/// # Manages encoders internally
+///
+/// This function commits multiple encoders during its run (Phase A
+/// GPU dispatches → CPU cache writes → Phase B SDPA encoder → Phase C
+/// o_proj encoder). Callers cannot pass an open encoder; they should
+/// open a fresh one for any subsequent dispatches.
+///
+/// # Cache mutation
+///
+/// On return, `cache_layer.seq_len` has grown by `ctx_chunk_size`
+/// (the new ctx K/V were appended). The block-size prop K/V live in
+/// the slack region beyond `seq_len` but are NOT included in `seq_len`
+/// — they get overwritten on the next call.
+///
+/// # Arguments
+///
+/// - `h`: `[L, hidden_size]` F32 — block input (post-residual from prior layer)
+/// - `h_ctx`: `[S, hidden_size]` F32 — same across all layers (model-level fc + hidden_norm output)
+/// - `layer_weights`: per-layer drafter weights
+/// - `cache_layer`: per-layer KV cache state (mutated)
+/// - `block_size`: L (number of block positions, typically 8)
+/// - `ctx_chunk_size`: S (number of NEW ctx positions to append this call)
+///
+/// # Caveat
+///
+/// SDPA uses causal masking (mlx-native default). For DFlash full-attn
+/// layer (1 of 5) Python uses mask=None; for sliding (4 of 5) Python
+/// uses causal+window. Smoke tests are mask-invariant; Phase 4 parity
+/// gates against Python will surface any mask-induced divergence.
+pub fn dispatch_dflash_decoder_layer_attention(
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    h: &MlxBuffer,
+    h_ctx: &MlxBuffer,
+    layer_weights: &DFlashLayerTensors,
+    cache_layer: &mut super::kv_cache::DFlashLayerKvCache,
+    cfg: &DFlashConfig,
+    block_size: u32,
+    ctx_chunk_size: u32,
+) -> Result<MlxBuffer> {
+    let prior_offset = cache_layer.seq_len;
+    let n_q = cfg.num_attention_heads as u32;
+    let n_kv = cfg.num_key_value_heads as u32;
+    let head_dim = cfg.head_dim as u32;
+    let l = block_size;
+    let s = ctx_chunk_size;
+
+    // -------- Phase A: GPU dispatches (single encoder) --------
+    let mut enc = device
+        .command_encoder()
+        .context("decoder_layer_attention: open encoder A")?;
+
+    let normed_h = dispatch_dflash_input_layernorm(
+        &mut enc, registry, device, h, layer_weights, cfg, l,
+    )
+    .context("layer attn: input_layernorm")?;
+    enc.memory_barrier();
+
+    let q = dispatch_dflash_q_proj(&mut enc, registry, device, &normed_h, layer_weights, cfg, l)
+        .context("layer attn: q_proj")?;
+    let k_ctx = dispatch_dflash_k_proj(&mut enc, registry, device, h_ctx, layer_weights, cfg, s)
+        .context("layer attn: k_ctx_proj")?;
+    let v_ctx = dispatch_dflash_v_proj(&mut enc, registry, device, h_ctx, layer_weights, cfg, s)
+        .context("layer attn: v_ctx_proj")?;
+    let k_prop =
+        dispatch_dflash_k_proj(&mut enc, registry, device, &normed_h, layer_weights, cfg, l)
+            .context("layer attn: k_prop_proj")?;
+    let v_prop =
+        dispatch_dflash_v_proj(&mut enc, registry, device, &normed_h, layer_weights, cfg, l)
+            .context("layer attn: v_prop_proj")?;
+    enc.memory_barrier();
+
+    let q_normed = dispatch_dflash_head_norm(
+        &mut enc, registry, device, &q, &layer_weights.q_norm, cfg, l, n_q,
+    )
+    .context("layer attn: q_norm")?;
+    let k_ctx_normed = dispatch_dflash_head_norm(
+        &mut enc, registry, device, &k_ctx, &layer_weights.k_norm, cfg, s, n_kv,
+    )
+    .context("layer attn: k_ctx_norm")?;
+    let k_prop_normed = dispatch_dflash_head_norm(
+        &mut enc, registry, device, &k_prop, &layer_weights.k_norm, cfg, l, n_kv,
+    )
+    .context("layer attn: k_prop_norm")?;
+    enc.memory_barrier();
+
+    // RoPE offsets per Python (model_mlx.py:102-104):
+    //   queries → offset = cache.offset + S        (= prior + S — the block positions sit after ctx)
+    //   ctx_keys → offset = cache.offset            (= prior — appended positions)
+    //   prop_keys → offset = cache.offset + S       (same as queries — the block positions)
+    let q_roped = dispatch_dflash_rope(
+        &mut enc, registry, device, &q_normed, cfg, l, n_q, prior_offset + s,
+    )
+    .context("layer attn: q rope")?;
+    let k_ctx_roped = dispatch_dflash_rope(
+        &mut enc, registry, device, &k_ctx_normed, cfg, s, n_kv, prior_offset,
+    )
+    .context("layer attn: k_ctx rope")?;
+    let k_prop_roped = dispatch_dflash_rope(
+        &mut enc, registry, device, &k_prop_normed, cfg, l, n_kv, prior_offset + s,
+    )
+    .context("layer attn: k_prop rope")?;
+
+    // -------- Phase B: commit + CPU download + cache writes --------
+    enc.commit_and_wait().context("layer attn: commit phase A")?;
+
+    let k_ctx_cpu = download_f32(&k_ctx_roped).context("download k_ctx")?;
+    let v_ctx_cpu = download_f32(&v_ctx).context("download v_ctx")?;
+    cache_layer
+        .append_seq_major_kv(&k_ctx_cpu, &v_ctx_cpu, s, n_kv, head_dim)
+        .context("layer attn: append ctx K/V to cache")?;
+    debug_assert_eq!(cache_layer.seq_len, prior_offset + s);
+
+    let k_prop_cpu = download_f32(&k_prop_roped).context("download k_prop")?;
+    let v_prop_cpu = download_f32(&v_prop).context("download v_prop")?;
+    cache_layer
+        .write_slack_kv(&k_prop_cpu, &v_prop_cpu, l, n_kv, head_dim)
+        .context("layer attn: write prop K/V to cache slack")?;
+    debug_assert_eq!(cache_layer.seq_len, prior_offset + s, "slack must not advance seq_len");
+
+    // -------- Phase C: cross-length SDPA --------
+    // kv_seq_len = ctx (now in cache via append) + L (prop in slack)
+    let kv_seq_len = cache_layer.seq_len + l;
+    let mut sdpa_enc = device
+        .command_encoder()
+        .context("decoder_layer_attention: open encoder for sdpa")?;
+    let attn_out = dispatch_dflash_sdpa_cross_length(
+        &mut sdpa_enc, registry, device, &q_roped, cache_layer, cfg, l, kv_seq_len,
+    )
+    .context("layer attn: sdpa cross-length")?;
+    // dispatch_dflash_sdpa_cross_length commits internally; sdpa_enc is dead.
+
+    // -------- Phase D: O proj --------
+    let mut o_enc = device
+        .command_encoder()
+        .context("decoder_layer_attention: open encoder for o_proj")?;
+    let attn_proj = dispatch_dflash_o_proj(
+        &mut o_enc, registry, device, &attn_out, layer_weights, cfg, l,
+    )
+    .context("layer attn: o_proj")?;
+    o_enc.commit_and_wait().context("layer attn: commit o_proj")?;
+
+    Ok(attn_proj)
+}
+
 /// Apply SDPA where Q seq_len < K/V seq_len (DFlash's true form).
 ///
 /// Mirrors `model_mlx.py:DFlashAttention.__call__` lines 105-115:
@@ -760,11 +914,19 @@ pub fn dispatch_dflash_sdpa_cross_length(
     cache_layer: &super::kv_cache::DFlashLayerKvCache,
     cfg: &DFlashConfig,
     q_seq_len: u32,
+    kv_seq_len: u32,
 ) -> Result<MlxBuffer> {
     let n_heads = cfg.num_attention_heads as u32;
     let n_kv_heads = cfg.num_key_value_heads as u32;
     let head_dim = cfg.head_dim as u32;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    if kv_seq_len > cache_layer.capacity {
+        return Err(anyhow!(
+            "sdpa cross-length: kv_seq_len {} > cache.capacity {}",
+            kv_seq_len, cache_layer.capacity
+        ));
+    }
 
     // Finalize Q (commit pending dispatches).
     encoder.commit_and_wait().context("commit before sdpa cross-length permute")?;
@@ -790,12 +952,14 @@ pub fn dispatch_dflash_sdpa_cross_length(
         .map_err(|e| anyhow!("alloc sdpa cross-length output: {e}"))?;
 
     // SDPA params: separate Q seq_len + KV seq_len + capacity.
+    // kv_seq_len is now an explicit parameter (was cache_layer.seq_len) so
+    // callers can include slack-written prop K/V in the kv range.
     let params = SdpaParams {
         n_heads,
         n_kv_heads,
         head_dim,
         seq_len: q_seq_len,
-        kv_seq_len: cache_layer.seq_len,
+        kv_seq_len,
         scale,
         kv_capacity: cache_layer.capacity,
     };
@@ -1082,6 +1246,94 @@ mod tests {
         }
     }
 
+    /// Smoke test for the full DFlashAttention sub-block with KV cache.
+    ///
+    /// Composes ALL attention dispatchers + cache append + slack write
+    /// + cross-length SDPA + O proj into the function the model forward
+    /// will call once per layer. Validates:
+    /// - return shape [L, hidden]
+    /// - all values finite + non-trivial
+    /// - cache_layer.seq_len incremented by ctx_chunk_size
+    /// - prop K/V wrote to slack (cache.seq_len unchanged for prop)
+    #[test]
+    #[ignore = "requires Metal device + drafter HF cache"]
+    fn smoke_decoder_layer_attention_with_cache() {
+        use super::super::kv_cache::DFlashKvCache;
+
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let mut registry = KernelRegistry::new();
+
+        let home = std::env::var("HOME").expect("HOME set");
+        let path = format!(
+            "{home}/.cache/huggingface/hub/models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/77d4202772dfe50b2396ec7bac9cfffc7b9e7057/model.safetensors"
+        );
+        let file = DFlashWeightsFile::open(&path).expect("file open");
+        let weights = DFlashWeights::load(file.bytes(), &cfg).expect("validated load");
+        let tensors = DFlashModelTensors::upload(&device, &cfg, &weights).expect("GPU upload");
+        let mut cache = DFlashKvCache::new(&device, &cfg, 64).expect("cache");
+
+        let block_size = 8u32;
+        let ctx_chunk = 4u32;
+        let hidden = cfg.hidden_size as u32;
+
+        // Build synthetic h [L, hidden] F32-ones
+        let h_elem = (block_size as usize) * (hidden as usize);
+        let mut h = device
+            .alloc_buffer(h_elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .expect("alloc h");
+        {
+            let s = h.as_mut_slice::<f32>().expect("h slice");
+            for v in s.iter_mut() { *v = 1.0; }
+        }
+        // Build synthetic h_ctx [S, hidden] F32 with varied values
+        let hctx_elem = (ctx_chunk as usize) * (hidden as usize);
+        let mut h_ctx = device
+            .alloc_buffer(hctx_elem * 4, DType::F32, vec![ctx_chunk as usize, hidden as usize])
+            .expect("alloc h_ctx");
+        {
+            let s = h_ctx.as_mut_slice::<f32>().expect("h_ctx slice");
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = 0.5 + ((i % 31) as f32) / 31.0;
+            }
+        }
+
+        // Use the FULL-attention layer (index 4) for first test — clean kv_seq_len.
+        let layer_idx = 4usize;
+        let initial_seq_len = cache.layers[layer_idx].seq_len;
+
+        let attn_out = dispatch_dflash_decoder_layer_attention(
+            &mut registry, &device, &h, &h_ctx,
+            &tensors.layers[layer_idx], &mut cache.layers[layer_idx],
+            &cfg, block_size, ctx_chunk,
+        )
+        .expect("decoder layer attention");
+
+        // Validate output [L, hidden] F32
+        assert_eq!(attn_out.element_count(), (block_size as usize) * (hidden as usize));
+
+        let host: &[f32] = attn_out.as_slice::<f32>().expect("attn_out slice");
+        let n_finite = host.iter().filter(|v| v.is_finite()).count();
+        let n_zero = host.iter().filter(|v| **v == 0.0).count();
+        assert_eq!(
+            n_finite, host.len(),
+            "decoder layer attention output must be finite (got {n_finite}/{}; n_zero={n_zero})",
+            host.len()
+        );
+        assert!(
+            n_zero < host.len() / 2,
+            "decoder layer attention output suspiciously sparse (n_zero={n_zero}/{})",
+            host.len()
+        );
+
+        // Cache state: ctx appended (seq_len += ctx_chunk), prop is in slack (NOT in seq_len).
+        assert_eq!(
+            cache.layers[layer_idx].seq_len,
+            initial_seq_len + ctx_chunk,
+            "cache should advance by ctx_chunk_size only; prop lives in slack"
+        );
+    }
+
     /// Cross-length SDPA smoke test (Phase 3 form).
     ///
     /// Builds a populated cache layer (synthetic head-major K/V via
@@ -1139,7 +1391,7 @@ mod tests {
         let mut encoder = device.command_encoder().expect("encoder");
         let out = dispatch_dflash_sdpa_cross_length(
             &mut encoder, &mut registry, &device,
-            &q, &cache.layers[layer_idx], &cfg, q_seq_len,
+            &q, &cache.layers[layer_idx], &cfg, q_seq_len, ctx_len,
         )
         .expect("sdpa cross-length");
 
