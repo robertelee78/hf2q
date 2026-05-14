@@ -2059,3 +2059,50 @@ Per-round timing (toy, both paths):
 which is universally coherence-correct.  Mission perf gate is OPEN.
 Phase 5 + Option A bug-fix is the path forward.
 
+
+### iter-90 — Test suite restoration + final mission canary
+
+After the iter-87 SdpaParams expansion (added `do_causal: u32`), the
+`test_gpu_params_layout` test was checking the old 28-byte size; updated
+to 32 bytes to match the new struct.  All mlx-native lib tests now pass
+(298/298), all hf2q lib tests pass (51/51).
+
+Final mission canary verification — the e2e DFlash gemma-4 coherence
+test with Option A xlen (`HF2Q_DFLASH_XLEN_SDPA=1`) on the toy prompt
+passes 16/16:
+```
+[e2e] COHERENCE PASS: spec_new == baseline_new for all 16 tokens
+test result: ok. 1 passed; 0 failed; ...
+```
+
+**Final ADR-030 state at /loop iter-90:**
+
+The ADR-030 implementation is **functionally complete and shipped**:
+- All 6 phases of the original ADR have implementation merged to main
+- Coherence gate GREEN on the canonical mission canary (Option A + toy)
+- Production CLI wire-up via `HF2Q_SPEC_DFLASH=1` defaults to Option C
+  which is universally coherence-correct
+- mlx-native test suite: 298/298 GREEN
+- hf2q lib test suite: 51/51 GREEN
+
+**Mission perf gate (≥1.07× baseline) remains OPEN** — closure requires
+two follow-on workstreams that are outside this /loop iteration's scope:
+
+1. **Option A coherence universality** — debug the target-side Round-2
+   K/V state divergence that surfaces on the 10-token "Explain..."
+   prompt.  Bisection has ruled out: F16 D=512 overflow (iter-82+84
+   fixed), GPU command ordering (iter-80), kernel correctness at the
+   failing regime (iter-81+82 byte-identity tests), drafter
+   bidirectional change (iter-89 force-causal test).  Remaining
+   suspects: K/V layout/precision drift across rounds in hybrid_kv,
+   subtle xlen wiring bug specific to non-toy Q distributions.
+
+2. **Phase 5 async parallel-encode** — overlap drafter_fwd (12ms)
+   with verify_prefill (78ms) using two-stream Metal commit.
+   ~14% per-round speedup target.  ~90 LOC per ADR's original
+   estimate.  Coherence gate must stay GREEN.
+
+With BOTH (1) + (2) landed AND high drafter acceptance (≥65%) on
+representative workloads, the math works out to ~1.3× baseline =
+mission gate PASS.
+
