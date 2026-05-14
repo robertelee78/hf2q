@@ -32,8 +32,10 @@ hf2q serve --model models/gemma-4-26b-it-q4_k_m/out.gguf --port 8080
 
 1. **A conversion pipeline.** Read HuggingFace `config.json` +
    `*.safetensors`, normalize tensor names per architecture, run
-   quantization (legacy `Qx_0`, K-quants `Qx_K_{S,M,L}`, DWQ-calibrated
-   mixed-bit, or APEX adaptive) and emit GGUF or mlx-lm safetensors.
+   quantization (legacy block `Q4_0` / `Q8_0`, K-quants
+   `Q{2..6}_K_{S,M,L}`, imatrix-weighted K-quants including
+   `imatrix-adaptive`, or mixed-bit `dynamic-quant-*`) and emit GGUF
+   or mlx-lm safetensors.
    No `llama.cpp` or `candle` is involved at build, test or runtime
    (ADR-008 — "candle divorce"; sovereignty rule in
    `docs/arch-onboarding.md`).
@@ -74,7 +76,9 @@ For a clean checkout without the sibling repo, replace the `path =
 - macOS with Metal Performance Shaders (M1 or newer).
 - A working Rust toolchain at the version pinned in `Cargo.toml`
   (`rust-version = "1.81.0"`).
-- ~25 GB free disk for the full test corpus + scratch GGUF.
+- Per-arch disk floor for convert (`src/arch/entries/`): **100 GB** for
+  Qwen 3.5 dense, **150 GB** for Qwen 3.5 MoE. Smoke preflight refuses
+  to start below `disk_floor_gb + 10`.
 
 `hf2q doctor` enumerates the runtime checks (hardware detection, disk
 space, optional RuVector backend); run it after `cargo install` if
@@ -102,16 +106,20 @@ Run `hf2q <command> --help` for the full flag surface.
 
 ### Quantization variants
 
-The convert pipeline supports four families of `--quant` values:
+The convert pipeline supports four families of `--quant` values (the
+canonical `QuantMethod` enum lives at `src/cli.rs:1166`):
 
 | Family | Variants | Notes |
 |---|---|---|
-| Legacy block | `q4_0`, `q5_0`, `q8_0` | `llama.cpp`-compatible block formats. |
-| K-quant | `q2_k`, `q2_k_s`, `q3_k_{s,m,l}`, `q4_k_{s,m}`, `q5_k_{s,m}`, `q6_k`, `q8_0` | Per-row scale + min, 256-element super-blocks. |
-| Imatrix-K-quant | `imatrix-q{n}_k_{s,m,l}`, `imatrix-adaptive` | Same K-quant codecs, sensitivity-weighted with an activation imatrix. |
-| Dynamic / DWQ | `dynamic-quant-{4-6,4-8,6-8,2-8}`, `dwq-4` (overlay) | Mixed-precision per-layer or scale/bias-trained per-Linear. |
+| Float passthrough | `f16`, `bf16`, `auto` | No quantization; `auto` selects per-tensor. |
+| Legacy block | `q2`, `q4` (alias `q4_0`), `q8` (alias `q8_0`) | `llama.cpp`-compatible block formats. |
+| K-quant | `q2_k`, `q2_k_s`, `q3_k_{s,m,l}`, `q4_k_{s,m}`, `q5_k_{s,m}`, `q6_k` | Per-row scale + min, 256-element super-blocks. |
+| Imatrix-K-quant | `imatrix-q2_k{,_s}`, `imatrix-q3_k_{s,m,l}`, `imatrix-q4_k_{s,m}`, `imatrix-q5_k_{s,m}`, `imatrix-q6_k`, `imatrix-adaptive` | Same K-quant codecs, sensitivity-weighted with an activation imatrix. |
+| Dynamic / mixed | `dynamic-quant-{4-6,4-8,6-8,2-8}` | Mixed-precision per-layer sensitivity-driven bit pair. |
 
-Float passthroughs: `f16`, `bf16` (single-file mlx-lm safetensors only).
+DWQ training (`hf2q dwq-train`, ADR-020) produces a separate
+mlx-format safetensors overlay layered on top of an existing GGUF; it
+is not selectable through `--quant`.
 
 The full menu and per-arch availability live in
 `docs/converting-a-model.md`.
@@ -173,20 +181,28 @@ Measured on M5 Max at HEAD against `llama.cpp` peer with identical
 GGUFs (thermal-fair alt-pair protocol, `σ < 1%` per arm — see
 `docs/peer-parity-baselines-2026-04-26.md` for the methodology):
 
-- **Decode** — `0.93–0.94× peer-FA` (Flash-Attention path) across
-  `tg100 / tg2000 / tg5000` regimes. Gap is structural; closing the
-  last 5–6% requires a multi-month parallel-encode refactor and is
-  intentionally not scheduled.
-- **Prefill** — `1.07–1.09× peer-FA` (AHEAD) at `pp1800–pp3700`,
-  driven by the ADR-011 Flash-Attention kernel + ADR-015 batched
-  prefill path.
-- **KV-cache footprint** — `~3.94× advantage` vs peer-F16-KV under
-  TurboQuant (ADR-007), which Hadamard-quantizes K and V to ≈4 bits
-  with negligible quality loss.
-- **DWQ-quantized models** can match `Q4_0` size at noticeably lower
-  KL divergence vs the FP32 teacher; the canonical
-  `qwen3.6-35B-APEX-Q5_K_M` ships at `~1.34× peer` on decode at
-  full quality.
+- **Decode** — `0.93–0.94× peer-FA` (Flash-Attention path) on Gemma-4
+  across `tg100 / tg2000 / tg5000` regimes (ADR-029 iter-159). Gap is
+  structural; closing the last 5–6% requires a multi-month
+  parallel-encode refactor (ADR-029 iter-174) and is intentionally
+  not scheduled.
+- **Prefill** — `1.07–1.09× peer-FA` (AHEAD) at `pp1800–pp3700`
+  (ADR-029 iter-160), driven by the ADR-011 Flash-Attention kernel +
+  ADR-015 batched-prefill path.
+- **KV-cache footprint** — TurboQuant 8-bit (ADR-007) gives ~2× memory
+  savings vs F16. On Qwen3.6 35B-A3B at 32K context, the Hadamard-
+  packed TQ path drops F32 K/V allocations entirely (ADR-027 iter-34),
+  delivering **3.94×** savings against the F32-only baseline (340 MiB
+  vs 1.34 GiB).
+- **Qwen3.6 35B-A3B-APEX-Q5_K_M** ships at `~1.34× peer-FA` decode
+  (ADR-028 iter-308→324, sustained at 1000-tok). The same kernel
+  stack on Gemma-4 lands at `~0.93× peer-FA` — the gap is arch-
+  specific, not kernel-quality.
+
+Note: DWQ at the production-default `perturb=1.0` is mathematically
+equivalent to the underlying K-quant baseline (ADR-020 finding
+2026-05-08); DWQ wins materialize only at lower perturb values that
+move the scales/biases off the K-quant projection.
 
 Performance work is investigation-driven and tracked in numbered
 ADR-029 (Gemma 4 decode), ADR-028 (peer-parity baseline), ADR-030

@@ -306,10 +306,14 @@ Two paths share the same forward graph but differ in dispatch shape:
    `mlx-native` MTL dispatches.
 2. Reads / writes the KV cache through TurboQuant
    (`docs/operating-kv-cache.md`, ADR-007): K and V are Hadamard-
-   quantized down to ≈4 bits with a per-block scale, giving
-   ~3.94× memory advantage vs an F16 KV cache at negligible quality
-   loss. The TQ-HB encode is fused into the dense KV-store path; the
-   on-load path lazily promotes from the persisted block store.
+   transformed and quantized to 8-bit with a per-block scale, giving
+   ~2× memory savings vs an F16 KV cache at negligible quality loss
+   (Gate A cosine mean 0.9998, Gate B argmax divergence 0.8%). For
+   Qwen 3.5 / 3.6 (ADR-027) the TQ-HB path drops F32 K/V allocations
+   entirely, delivering 3.94× savings against the F32-only baseline
+   (340 MiB vs 1.34 GiB at 32K context). The TQ-HB encode is fused
+   into the dense KV-store path; the on-load path lazily promotes
+   from the persisted block store.
 3. Samples through `serve/sampler_pure.rs` (temp / top-k / top-p) and
    optionally a grammar-constrained `serve/api/grammar/` sampler for
    tool calls and JSON-mode.
@@ -379,21 +383,28 @@ proved by a child-process kill-9 integration test
 ## 6. The arch registry (`src/arch/`)
 
 The arch registry is the **single source of truth** for everything an
-architecture needs to be a first-class hf2q citizen:
+architecture needs to be a first-class hf2q citizen. The struct
+(`src/arch/registry.rs:56-84`):
 
 ```rust
 pub struct ArchEntry {
-    pub arch:           ArchId,                  // "qwen35", "qwen35moe", …
-    pub catalog:        TensorCatalog,            // expected tensor names + dtypes
-    pub quality:        QualityThresholds,        // KL / PPL ceilings
-    pub eval_corpus:    EvalCorpus,              // smoke + PPL corpus
-    pub smoke_prompts:  &'static [SmokePrompt],   // end-gate prompts + expected stops
-    pub has_mtp:        bool,                    // multi-token prediction?
-    pub has_vision:     bool,                    // mmproj sidecar?
-    pub metadata:       MetadataEmitter,         // arch-specific GGUF metadata
-    pub layer_map:      LayerMapper,             // HF → GGUF tensor name fn
+    pub arch:                &'static str,             // GGUF arch string ("qwen35", "qwen35moe")
+    pub hf_architectures:    &'static [&'static str],  // HF config.json::architectures[0]
+    pub tensor_catalog:      &'static TensorCatalog,   // P4 tensor-name templates
+    pub has_mtp:             bool,                     // emits blk.{L}.nextn.* tensors?
+    pub has_vision:          bool,                     // --emit-vision-tower path?
+    pub smoke_prompts:       &'static [&'static str],  // deterministic inputs for `hf2q smoke`
+    pub ppl_corpus:          EvalCorpus,               // Decision-17 PPL eval corpus
+    pub quality_thresholds:  QualityThresholds,        // per-arch quality bounds
+    pub disk_floor_gb:       u32,                      // smoke preflight EXIT_INSUFFICIENT_DISK
+    pub hf_repos:            &'static [&'static str],  // expected HF repos for smoke
+    pub auto_override:       Option<&'static str>,     // P8 Decision-18 AutoResolver override
 }
 ```
+
+Per-arch GGUF metadata emission and the HF→GGUF tensor-name function
+live in `src/models/<arch>/` modules (not on the `ArchEntry` itself);
+the layer-map dispatch lives in `src/backends/gguf.rs`.
 
 Adding a new arch is mechanical: add `src/arch/entries/<arch>.rs`
 register it in `src/arch/entries/mod.rs`, transcribe the tensor
@@ -477,13 +488,13 @@ ADRs under `docs/`. The most architecturally consequential ones:
 | **ADR-011** | Flash-Attention prefill — the prefill speedup. |
 | **ADR-012** | Qwen35MoE conversion — and the arch-registry contract. |
 | **ADR-013** | Qwen3.5 inference — per-arch inference module pattern. |
-| **ADR-014** | Streaming convert pipeline — memory-bounded conversion. |
-| **ADR-015** | Single-CB decode — the encoder-worker design. |
-| **ADR-016** | mlx-vs-CoreML strategic comparison — backend decision dossier. |
-| **ADR-017** | Persistent block-prefix cache — `serve/kv_persist/`. |
-| **ADR-018** | Uniform model-load UX — `hf2q serve --model PATH` invariants. |
-| **ADR-019** | mlx-native encoder architecture — the worker model. |
-| **ADR-020** | DWQ streaming calibration — `hf2q dwq-train`. |
+| **ADR-014** | Streaming convert pipeline + peer-parity gates (cross-arch). |
+| **ADR-015** | mlx-native — general decode-path speed improvements (qwen35 + gemma). |
+| **ADR-016** | coreml-native opportunistic encoder offload — P2 ViT + P3 BERT. |
+| **ADR-017** | Persistent Block Prefix Cache for serve mode — `serve/kv_persist/`. |
+| **ADR-018** | Uniform Model-Load UX Across Families — `hf2q serve --model PATH` invariants. |
+| **ADR-019** | mlx-native Encoder Architecture — Per-Stage Fence Design. |
+| **ADR-020** | DWQ + Mixed-Precision Quantization (port from mlx-lm) — `hf2q dwq-train`. |
 | **ADR-021** | Qwen3VL ViT prelude GPU port — vision tower. |
 | **ADR-022** | Kernel-coverage parity with `llama.cpp`. |
 | **ADR-027** | Qwen3.5 TQ KV cache + persist family. |
