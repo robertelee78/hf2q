@@ -34,6 +34,7 @@ use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 use mlx_native::ops::elementwise::elementwise_add;
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
+use mlx_native::ops::softcap::dispatch_softcap;
 use crate::inference::models::qwen35::gpu_full_attn::{
     apply_imrope, apply_linear_projection_f32, apply_sdpa_causal_from_seq_major,
 };
@@ -449,6 +450,174 @@ pub fn dispatch_dflash_rope(
     .context("dispatch_dflash_rope")
 }
 
+/// Dispatch the fc projection: `fc @ target_hidden_concat`.
+///
+/// Mirrors `model_mlx.py:DFlashDraftModel.__call__` line 189:
+/// `h_ctx = self.hidden_norm(self.fc(target_hidden))`. This is the
+/// fc(.) half — projects the concatenated multi-layer target hidden
+/// state (one row per ctx position) into the drafter's hidden space.
+///
+/// # Arguments
+///
+/// - `target_hidden_concat`: `[ctx_seq_len, num_target_layers_used * hidden_size]`
+///   F32 — concat along the last axis of target hidden states at
+///   `target_layer_ids = [1, 6, 11, 17, 22, 27]` (6 × 2816 = 16896)
+/// - `model`: drafter model weights (uses `fc` BF16 `[hidden, fc_input_dim]`)
+/// - Returns: `[ctx_seq_len, hidden_size]` F32
+pub fn dispatch_dflash_fc(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    target_hidden_concat: &MlxBuffer,
+    model: &super::tensors::DFlashModelTensors,
+    cfg: &DFlashConfig,
+    ctx_seq_len: u32,
+) -> Result<MlxBuffer> {
+    let fc_in = cfg.fc_input_dim() as u32;
+    let hidden = cfg.hidden_size as u32;
+    apply_linear_projection_f32(
+        encoder, registry, device,
+        target_hidden_concat, &model.fc,
+        ctx_seq_len, fc_in, hidden,
+    )
+    .context("dispatch_dflash_fc")
+}
+
+/// Apply `hidden_norm` RMSNorm to the fc output → h_ctx.
+///
+/// Mirrors `model_mlx.py:DFlashDraftModel.__call__` line 189's `hidden_norm(.)`.
+/// Uses model-level (not per-layer) RMSNorm weight `[hidden_size]`.
+pub fn dispatch_dflash_hidden_norm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    fc_out: &MlxBuffer,
+    model: &super::tensors::DFlashModelTensors,
+    cfg: &DFlashConfig,
+    ctx_seq_len: u32,
+) -> Result<MlxBuffer> {
+    let hidden = cfg.hidden_size as u32;
+    let element_count = (ctx_seq_len as usize) * (hidden as usize);
+    if fc_out.element_count() != element_count {
+        return Err(anyhow!(
+            "dflash hidden_norm: fc_out element count {} != S({}) * hidden({})",
+            fc_out.element_count(),
+            ctx_seq_len,
+            hidden
+        ));
+    }
+    let normed = device
+        .alloc_buffer(
+            element_count * 4,
+            DType::F32,
+            vec![ctx_seq_len as usize, hidden as usize],
+        )
+        .map_err(|e| anyhow!("alloc hidden_norm output: {e}"))?;
+    let params = alloc_rms_norm_params(device, cfg.rms_norm_eps, hidden)?;
+    dispatch_rms_norm(
+        encoder, registry, device.metal_device(),
+        fc_out, &model.hidden_norm, &normed, &params,
+        ctx_seq_len, hidden,
+    )
+    .context("dispatch_rms_norm hidden_norm")?;
+    Ok(normed)
+}
+
+/// Apply `final_norm` (`norm.weight`) RMSNorm to the last layer's
+/// output, just before lm_head.
+///
+/// Mirrors `model_mlx.py:DFlashDraftModel.__call__` line 194:
+/// `logits = self.lm_head(self.norm(h))`. This is `self.norm(h)` —
+/// the final RMSNorm with model-level weight `norm.weight`.
+pub fn dispatch_dflash_final_norm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    h: &MlxBuffer,
+    model: &super::tensors::DFlashModelTensors,
+    cfg: &DFlashConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    let hidden = cfg.hidden_size as u32;
+    let element_count = (seq_len as usize) * (hidden as usize);
+    if h.element_count() != element_count {
+        return Err(anyhow!(
+            "dflash final_norm: h element count {} != L({}) * hidden({})",
+            h.element_count(),
+            seq_len,
+            hidden
+        ));
+    }
+    let normed = device
+        .alloc_buffer(
+            element_count * 4,
+            DType::F32,
+            vec![seq_len as usize, hidden as usize],
+        )
+        .map_err(|e| anyhow!("alloc final_norm output: {e}"))?;
+    let params = alloc_rms_norm_params(device, cfg.rms_norm_eps, hidden)?;
+    dispatch_rms_norm(
+        encoder, registry, device.metal_device(),
+        h, &model.final_norm, &normed, &params,
+        seq_len, hidden,
+    )
+    .context("dispatch_rms_norm final_norm")?;
+    Ok(normed)
+}
+
+/// Apply Gemma-style logit softcap: `out = tanh(logits / cap) * cap`.
+///
+/// Mirrors `model_mlx.py:DFlashDraftModel.__call__` lines 195-197:
+/// ```text
+///   if final_logit_softcapping is not None:
+///       cap = final_logit_softcapping
+///       logits = tanh(logits / cap) * cap
+/// ```
+/// For our drafter `cfg.final_logit_softcapping == Some(30.0)`. The
+/// op is element-wise on F32 logits in place — output buffer is
+/// allocated fresh here.
+///
+/// Returns the original buffer unchanged if `cfg.final_logit_softcapping`
+/// is `None` (no softcap configured).
+pub fn dispatch_dflash_softcap(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    logits: &MlxBuffer,
+    cfg: &DFlashConfig,
+) -> Result<Option<MlxBuffer>> {
+    let cap = match cfg.final_logit_softcapping {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let n = logits.element_count();
+    let shape: Vec<usize> = logits.shape().to_vec();
+    let mut out = device
+        .alloc_buffer(n * 4, DType::F32, shape)
+        .map_err(|e| anyhow!("alloc softcap output: {e}"))?;
+    // params_buf: [cap, n_elements_as_f32_bits]
+    let mut params = device
+        .alloc_buffer(8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("alloc softcap params: {e}"))?;
+    {
+        let s = params
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow!("softcap params slice: {e}"))?;
+        s[0] = cap;
+        s[1] = f32::from_bits(n as u32);
+    }
+    dispatch_softcap(
+        encoder, registry, device.metal_device(),
+        logits, &out, &params, cap,
+    )
+    .context("dispatch_softcap")?;
+    let _ = registry; // silence
+    Ok(Some({
+        let _ = &mut out; // ensure out is mutable in the binding above
+        out
+    }))
+}
+
 /// Element-wise F32 residual add: `out = a + b`.
 ///
 /// Mirrors the `+ attn(...)` / `+ mlp(...)` residual connections in
@@ -790,6 +959,129 @@ mod tests {
                 host.len()
             );
         }
+    }
+
+    /// Smoke test for the model-level globals: fc + hidden_norm +
+    /// final_norm + softcap.
+    ///
+    /// Validates that the four "outside-the-layer" dispatchers work
+    /// with the real drafter weights. Inputs are synthetic F32-ones:
+    /// - target_hidden_concat [S=4, fc_input_dim=16896] for fc/hidden_norm
+    /// - h [L=8, hidden=2816] for final_norm
+    /// - logits [L=8, vocab=262144] for softcap
+    #[test]
+    #[ignore = "requires Metal device + drafter HF cache"]
+    fn smoke_model_level_globals() {
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let mut registry = KernelRegistry::new();
+
+        let home = std::env::var("HOME").expect("HOME set");
+        let path = format!(
+            "{home}/.cache/huggingface/hub/models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/77d4202772dfe50b2396ec7bac9cfffc7b9e7057/model.safetensors"
+        );
+        let file = DFlashWeightsFile::open(&path).expect("file open");
+        let weights = DFlashWeights::load(file.bytes(), &cfg).expect("validated load");
+        let tensors = DFlashModelTensors::upload(&device, &cfg, &weights).expect("GPU upload");
+
+        // ===== fc + hidden_norm path =====
+        let ctx_seq_len = 4u32;
+        let fc_in = cfg.fc_input_dim() as u32;
+        let target_hidden_elem = (ctx_seq_len as usize) * (fc_in as usize);
+        let mut target_hidden = device
+            .alloc_buffer(
+                target_hidden_elem * 4,
+                DType::F32,
+                vec![ctx_seq_len as usize, fc_in as usize],
+            )
+            .expect("alloc target_hidden");
+        {
+            let s = target_hidden
+                .as_mut_slice::<f32>()
+                .expect("target_hidden slice");
+            for v in s.iter_mut() { *v = 1.0; }
+        }
+
+        let mut encoder = device.command_encoder().expect("encoder1");
+        let fc_out = dispatch_dflash_fc(
+            &mut encoder, &mut registry, &device, &target_hidden, &tensors, &cfg, ctx_seq_len,
+        )
+        .expect("fc dispatch");
+        encoder.memory_barrier();
+        let h_ctx = dispatch_dflash_hidden_norm(
+            &mut encoder, &mut registry, &device, &fc_out, &tensors, &cfg, ctx_seq_len,
+        )
+        .expect("hidden_norm dispatch");
+
+        // ===== final_norm path =====
+        let block_size = 8u32;
+        let hidden = cfg.hidden_size as u32;
+        let h_elem = (block_size as usize) * (hidden as usize);
+        let mut h = device
+            .alloc_buffer(h_elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .expect("alloc h");
+        {
+            let s = h.as_mut_slice::<f32>().expect("h slice");
+            for v in s.iter_mut() { *v = 1.0; }
+        }
+        let h_final = dispatch_dflash_final_norm(
+            &mut encoder, &mut registry, &device, &h, &tensors, &cfg, block_size,
+        )
+        .expect("final_norm dispatch");
+
+        // ===== softcap path (synthetic logits) =====
+        // Logits would normally come from lm_head; synthesize a small
+        // logit buffer to exercise softcap kernel.
+        let logits_n = (block_size as usize) * 256; // tiny vocab proxy
+        let mut logits = device
+            .alloc_buffer(logits_n * 4, DType::F32, vec![block_size as usize, 256])
+            .expect("alloc logits");
+        {
+            let s = logits.as_mut_slice::<f32>().expect("logits slice");
+            // Mix of values: most around 5.0, some over the cap (30.0)
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = if i % 17 == 0 { 100.0 } else { 5.0 };
+            }
+        }
+        let capped = dispatch_dflash_softcap(&mut encoder, &mut registry, &device, &logits, &cfg)
+            .expect("softcap dispatch")
+            .expect("softcap should be Some (cfg has final_logit_softcapping=30.0)");
+
+        encoder.commit_and_wait().expect("commit");
+
+        // ===== validations =====
+        let h_dim = cfg.hidden_size;
+        assert_eq!(fc_out.element_count(), (ctx_seq_len as usize) * h_dim);
+        assert_eq!(h_ctx.element_count(), (ctx_seq_len as usize) * h_dim);
+        assert_eq!(h_final.element_count(), (block_size as usize) * h_dim);
+        assert_eq!(capped.element_count(), logits_n);
+
+        for (name, buf) in [
+            ("fc_out", &fc_out),
+            ("h_ctx", &h_ctx),
+            ("h_final", &h_final),
+            ("softcap_out", &capped),
+        ] {
+            let host: &[f32] = buf.as_slice::<f32>().expect("host slice");
+            let n_finite = host.iter().filter(|v| v.is_finite()).count();
+            assert_eq!(
+                n_finite, host.len(),
+                "{name}: all values must be finite (got {n_finite}/{})",
+                host.len()
+            );
+        }
+
+        // Softcap-specific check: all values must satisfy |v| < cap.
+        let cap = cfg.final_logit_softcapping.unwrap();
+        let s_host: &[f32] = capped.as_slice::<f32>().expect("capped slice");
+        let max_abs = s_host.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(
+            max_abs < cap,
+            "softcap output |v|.max = {max_abs} >= cap {cap}; softcap kernel broken"
+        );
+        // And: the 100.0 inputs must be capped significantly down.
+        let near_cap = s_host.iter().filter(|v| **v > cap - 0.5).count();
+        assert!(near_cap > 0, "expected some outputs near cap; got max_abs={max_abs}");
     }
 
     /// Independent layer-forward smoke test (self-attn form).
