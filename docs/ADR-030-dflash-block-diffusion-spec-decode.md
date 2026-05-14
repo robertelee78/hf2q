@@ -2428,3 +2428,57 @@ iter-101 plan: investigate why 6-tok still fails.  Likely needs
 D=512 BF16 cache wire-up done correctly (iter-100 attempt regressed;
 needs careful re-implementation with runtime debug).
 
+
+### iter-101 — Honest assessment of remaining work (mantra check)
+
+Operator challenged "deferred work" terminology — mantra prohibits
+shortcuts and stubs.  Concrete list of what was being called "deferred":
+
+1. **6-token prompt "What is two plus two?" coherence failure.**
+   Round 2 target_argmax[0]=3004 vs baseline=4317.  Both produce
+   6-token cycles but in different orbits.  Differs because:
+   - `K[6]` (= `K(first_token=108)`) is computed via different kernels
+     in baseline (forward_decode) vs spec (forward_prefill_batched).
+   - F32→F16 vs F32→BF16 rounding produces different mantissa bits.
+   - Iter-100's BF16-cache path matches Option C, but baseline uses
+     F16 hybrid_kv (forward_decode). Their bits differ even with
+     identical logical K projections.
+   This iteration attempted D=512 BF16-cache wire-up.  Regression
+   confirmed: enabling `HF2Q_DFLASH_XLEN_BF16_D512=1` regresses 4/5
+   prompts to 1/5.  Reverted.
+
+2. **D=512 BF16 cache wire-up.**  Attempted iter-96, iter-100, iter-101.
+   All regress when active.  Possible root cause: F16 hybrid_kv K
+   bits (from F32→F16 cast in original write) → F32 → BF16 produces
+   DIFFERENT bits than `pf_k_perm` BF16 (from F32→BF16 direct rounding
+   in head_norm_rope).  For some prompts/positions, one bit pattern
+   matches baseline's argmax cone, the other doesn't.  Multi-day
+   investigation needed.
+
+3. **Mission perf gate ≥1.07× baseline.**  Currently spec-decode at
+   ~9.9 t/s vs baseline 66.7 t/s = 0.15× baseline.  Two blockers:
+   (a) verify_prefill is 78ms/round — fundamental cost of running
+   gemma-4 26B forward on 8 tokens.  (b) drafter acceptance 0% on
+   test prompts — drafter produces clusters of identical tokens.
+
+4. **Phase 5 async parallel-encode (~90 LOC per ADR-030).**  Never
+   started.  Estimated ~14% per-round speedup by overlapping drafter
+   forward (12ms) with target verify (78ms).
+
+5. **Drafter acceptance on real workloads.**  Untested.  Current
+   toy/synthetic prompts give 0% accept; characterization needed.
+
+**Acknowledgment**: per mantra, none of these should be permanently
+deferred.  They are work-in-progress.  iter-102+ should pick the
+highest-leverage one and dive deep:
+- 6-tok needs runtime K[6] byte comparison between baseline + spec
+- D=512 BF16 needs to figure out which bit pattern is "right"
+- Perf gate needs drafter quality improvement (separate workstream)
+- Phase 5 async is well-scoped but won't close the perf gap alone
+
+**Mission shipping state at iter-101:**
+- Coherence: 4/5 prompts pass with Option A xlen + BF16-cache fix
+- Production safety: Option C (re-prefill) universally coherent
+- Code: 8 commits this thread (iter-95→100), pushed to main
+- Test suite: mlx-native 298/298, hf2q 51/51, mission canary 1/1
+
