@@ -1380,6 +1380,36 @@ pub fn parse_dwq_moe_expert_role(role: &str) -> Option<(MoeBaseRole, usize)> {
 }
 
 impl MlxModelWeights {
+    /// ADR-030 Phase 4 — install a DFlash hidden-state capture session.
+    ///
+    /// While installed, `forward_prefill_batched` will populate the
+    /// session's `hidden_output` buffer with `pf_hidden` contents at
+    /// layer indices matching `session.target_layer_ids`. Reset the
+    /// session via `take_dflash_capture` after the forward returns.
+    ///
+    /// Default state (no install): byte-identical to legacy behavior.
+    pub fn install_dflash_capture(
+        &mut self,
+        session: crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession,
+    ) {
+        self.dflash_capture = Some(session);
+    }
+
+    /// Take back the installed DFlash capture session, returning its
+    /// populated buffers. Returns `None` if no session was installed.
+    /// After this call, subsequent `forward_prefill_batched` calls
+    /// revert to legacy non-capturing behavior.
+    pub fn take_dflash_capture(
+        &mut self,
+    ) -> Option<crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession> {
+        self.dflash_capture.take()
+    }
+
+    /// True if a DFlash capture session is currently installed.
+    pub fn has_dflash_capture(&self) -> bool {
+        self.dflash_capture.is_some()
+    }
+
     /// Load all model weights directly from a GGUF file into mlx-native
     /// MlxBuffers.
     ///
