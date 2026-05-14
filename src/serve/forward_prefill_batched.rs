@@ -1533,10 +1533,18 @@ impl MlxModelWeights {
                     // ADR-030 iter-82 — env-gated D=512 xlen bypass for bisection.
                     // HF2Q_DFLASH_XLEN_D512_OFF=1 routes the full-attn (D=512)
                     // layers through the STANDARD non-xlen path while keeping
-                    // sliding (D=256) layers on the xlen path.  Lets us
-                    // bisect whether the iter-78 NaN is in our D=512 xlen
-                    // wiring or elsewhere.
+                    // sliding (D=256) layers on the xlen path.  Used for
+                    // root-causing iter-82's L29 NaN; left in for safety
+                    // valve.
                     let xlen_d512_disabled = std::env::var("HF2Q_DFLASH_XLEN_D512_OFF").as_deref() == Ok("1");
+                    // ADR-030 iter-84 — F16 D=512 attention OVERFLOWS at the
+                    // final gemma-4 layer (L29) because Q magnitudes are
+                    // ~16× larger there and the F16 exponent caps at 2^15.
+                    // BF16 has the same exponent range as F32 so it's safe.
+                    // Cast hybrid_kv K, V from F16 to BF16 via F32, then
+                    // dispatch the new bf16 D=512 resume kernel.  pf_q_perm
+                    // is already BF16, so Q needs no cast.  Output goes
+                    // directly to pf_sdpa_out_perm (BF16).
                     if xlen_sdpa_mode && !xlen_d512_disabled {
                         // ADR-030 iter-78 — pre-SDPA hybrid_kv write (D=512).
                         let hybrid_kv_vec = self.hybrid_kv.as_ref()
@@ -1570,58 +1578,58 @@ impl MlxModelWeights {
                             );
                         }
 
-                        // ADR-030 iter-77 — D=512 cross-length verify path.
-                        let q_f32 = pf_q_f32_xlen.as_ref().expect("xlen Q f32 buf");
-                        let q_f16 = pf_q_f16_xlen.as_ref().expect("xlen Q f16 buf");
-                        let out_f16 = pf_out_f16_xlen.as_ref().expect("xlen out f16 buf");
-                        let out_f32 = pf_out_f32_xlen.as_ref().expect("xlen out f32 buf");
-                        let q_n_elems = nh * seq_len * hd;
-                        s.barrier_between(&[&pf_q_perm], &[q_f32]);
+                        // ADR-030 iter-84 — D=512 BF16 cross-length verify.
+                        // F16 overflows at L29 (iter-82 RC); BF16 has F32
+                        // exponent range so it doesn't overflow.  Cast
+                        // hybrid_kv K/V from F16 → F32 → BF16 (full slot,
+                        // small for global layers: ~70KB each at gemma-4
+                        // cap=35).  Q is already BF16 (pf_q_perm); output
+                        // goes directly to pf_sdpa_out_perm (BF16).
+                        let _q_n_elems = nh * seq_len * hd;
+                        let kv_full_elems = nkv * (layer_kv.capacity) * hd;
+                        let f32_kv_scratch = alloc_f32(kv_full_elems, "xlen_d512_kv_f32_scratch")?;
+                        let bf16_k = alloc_bf16(kv_full_elems, "xlen_d512_bf16_k")?;
+                        let bf16_v = alloc_bf16(kv_full_elems, "xlen_d512_bf16_v")?;
+                        // K cast: F16 → F32 → BF16.
+                        s.barrier_between(&[&layer_kv.k], &[&f32_kv_scratch]);
                         mlx_native::ops::elementwise::cast(
                             s.encoder_mut(), reg, metal_dev,
-                            &pf_q_perm, q_f32, q_n_elems,
-                            mlx_native::ops::elementwise::CastDirection::BF16ToF32,
-                        ).map_err(|e| anyhow::anyhow!("xlen Q BF16->F32 L{layer_idx}: {e}"))?;
-                        s.barrier_between(&[q_f32], &[q_f16]);
+                            &layer_kv.k, &f32_kv_scratch, kv_full_elems,
+                            mlx_native::ops::elementwise::CastDirection::F16ToF32,
+                        ).map_err(|e| anyhow::anyhow!("xlen D=512 K F16->F32 L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[&f32_kv_scratch], &[&bf16_k]);
                         mlx_native::ops::elementwise::cast(
                             s.encoder_mut(), reg, metal_dev,
-                            q_f32, q_f16, q_n_elems,
-                            mlx_native::ops::elementwise::CastDirection::F32ToF16,
-                        ).map_err(|e| anyhow::anyhow!("xlen Q F32->F16 L{layer_idx}: {e}"))?;
-                        // ADR-030 iter-82 — D=512 xlen debug (same as D=256 above).
+                            &f32_kv_scratch, &bf16_k, kv_full_elems,
+                            mlx_native::ops::elementwise::CastDirection::F32ToBF16,
+                        ).map_err(|e| anyhow::anyhow!("xlen D=512 K F32->BF16 L{layer_idx}: {e}"))?;
+                        // V cast: F16 → F32 → BF16 (reuse f32 scratch).
+                        s.barrier_between(&[&layer_kv.v_packed], &[&f32_kv_scratch]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            &layer_kv.v_packed, &f32_kv_scratch, kv_full_elems,
+                            mlx_native::ops::elementwise::CastDirection::F16ToF32,
+                        ).map_err(|e| anyhow::anyhow!("xlen D=512 V F16->F32 L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[&f32_kv_scratch], &[&bf16_v]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            &f32_kv_scratch, &bf16_v, kv_full_elems,
+                            mlx_native::ops::elementwise::CastDirection::F32ToBF16,
+                        ).map_err(|e| anyhow::anyhow!("xlen D=512 V F32->BF16 L{layer_idx}: {e}"))?;
                         let xlen_debug_d512 = std::env::var("HF2Q_DFLASH_XLEN_DEBUG").as_deref() == Ok("1");
                         if xlen_debug_d512 {
-                            s.finish().map_err(|e| anyhow::anyhow!("xlen debug D512 pre-SDPA finish: {e}"))?;
-                            let q_slice = q_f16.as_slice::<half::f16>()
-                                .map_err(|e| anyhow::anyhow!("xlen debug D512 Q slice: {e}"))?;
-                            let k_slice = layer_kv.k.as_slice::<half::f16>()
-                                .map_err(|e| anyhow::anyhow!("xlen debug D512 K slice: {e}"))?;
-                            let v_slice = layer_kv.v_packed.as_slice::<half::f16>()
-                                .map_err(|e| anyhow::anyhow!("xlen debug D512 V slice: {e}"))?;
-                            let kstart_sp = (start_pos as usize) * (hd as usize);
                             eprintln!(
-                                "[XLEN_DEBUG global L{} verify start_pos={} seq_len={} hd={}]\n  \
-                                 Q[h=0,t=0,d=0..8] = {:?}\n  \
-                                 K[h=0,p=0,d=0..8] = {:?}\n  \
-                                 K[h=0,p={},d=0..8] = {:?}\n  \
-                                 V[h=0,p=0,d=0..8] = {:?}\n  \
-                                 V[h=0,p={},d=0..8] = {:?}",
+                                "[XLEN_DEBUG global L{} verify start_pos={} seq_len={} hd={} BF16 path]",
                                 layer_idx, start_pos, seq_len, hd,
-                                &q_slice[0..8],
-                                &k_slice[0..8],
-                                start_pos, &k_slice[kstart_sp..kstart_sp + 8],
-                                &v_slice[0..8],
-                                start_pos, &v_slice[kstart_sp..kstart_sp + 8],
                             );
-                            s = exec.begin().map_err(|e| anyhow::anyhow!("xlen debug D512 reopen: {e}"))?;
                         }
-                        s.barrier_between(&[q_f16, &layer_kv.k, &layer_kv.v_packed], &[out_f16]);
+                        s.barrier_between(&[&pf_q_perm, &bf16_k, &bf16_v], &[&pf_sdpa_out_perm]);
                         mlx_native::ops::flash_attn_prefill_d512::
-                            dispatch_flash_attn_prefill_f16_d512_resume(
+                            dispatch_flash_attn_prefill_bf16_d512_resume(
                             s.encoder_mut(), dev, reg,
-                            q_f16, &layer_kv.k, &layer_kv.v_packed,
-                            out_f16,
-                            &mlx_native::ops::flash_attn_prefill_d512::FlashAttnPrefillResumeParams {
+                            &pf_q_perm, &bf16_k, &bf16_v,
+                            &pf_sdpa_out_perm,
+                            &mlx_native::ops::flash_attn_prefill::FlashAttnPrefillResumeParams {
                                 n_heads: nh as u32,
                                 n_kv_heads: nkv as u32,
                                 head_dim: hd as u32,
@@ -1633,34 +1641,24 @@ impl MlxModelWeights {
                                 q_offset_in_k: start_pos as u32,
                                 kv_capacity: layer_kv.capacity as u32,
                             },
-                        ).map_err(|e| anyhow::anyhow!("xlen global SDPA L{layer_idx}: {e}"))?;
+                        ).map_err(|e| anyhow::anyhow!("xlen global BF16 SDPA L{layer_idx}: {e}"))?;
                         if xlen_debug_d512 {
-                            s.finish().map_err(|e| anyhow::anyhow!("xlen debug D512 post-SDPA finish: {e}"))?;
-                            let out_slice = out_f16.as_slice::<half::f16>()
-                                .map_err(|e| anyhow::anyhow!("xlen debug D512 out slice: {e}"))?;
+                            s.finish().map_err(|e| anyhow::anyhow!("xlen debug D512 BF16 post-SDPA finish: {e}"))?;
+                            let out_slice = pf_sdpa_out_perm.as_slice::<half::bf16>()
+                                .map_err(|e| anyhow::anyhow!("xlen debug D512 BF16 out slice: {e}"))?;
                             let n_used = (nh * seq_len * hd) as usize;
                             let nan_count = out_slice[..n_used].iter().filter(|x| x.is_nan()).count();
-                            let inf_count = out_slice[..n_used].iter().filter(|x| x.is_infinite()).count();
                             let max_abs = out_slice[..n_used].iter()
                                 .filter(|x| x.is_finite())
                                 .map(|x| x.to_f32().abs())
                                 .fold(0.0f32, f32::max);
-                            eprintln!("  OUT[h=0,t=0,d=0..8]={:?} nan={} inf={} max_abs={:.4e}",
-                                &out_slice[0..8], nan_count, inf_count, max_abs);
-                            s = exec.begin().map_err(|e| anyhow::anyhow!("xlen debug D512 post-out reopen: {e}"))?;
+                            eprintln!("  BF16 OUT[h=0,t=0,d=0..8]={:?} nan={} max_abs={:.4e}",
+                                &out_slice[0..8], nan_count, max_abs);
+                            s = exec.begin().map_err(|e| anyhow::anyhow!("xlen debug D512 BF16 reopen: {e}"))?;
                         }
-                        s.barrier_between(&[out_f16], &[out_f32]);
-                        mlx_native::ops::elementwise::cast(
-                            s.encoder_mut(), reg, metal_dev,
-                            out_f16, out_f32, q_n_elems,
-                            mlx_native::ops::elementwise::CastDirection::F16ToF32,
-                        ).map_err(|e| anyhow::anyhow!("xlen O F16->F32 L{layer_idx}: {e}"))?;
-                        s.barrier_between(&[out_f32], &[&pf_sdpa_out_perm]);
-                        mlx_native::ops::elementwise::cast(
-                            s.encoder_mut(), reg, metal_dev,
-                            out_f32, &pf_sdpa_out_perm, q_n_elems,
-                            mlx_native::ops::elementwise::CastDirection::F32ToBF16,
-                        ).map_err(|e| anyhow::anyhow!("xlen O F32->BF16 L{layer_idx}: {e}"))?;
+                        // Bind unused buffers to silence unused-var warnings —
+                        // these are leftover from the F16 path we replaced.
+                        let _ = (&pf_q_f32_xlen, &pf_q_f16_xlen, &pf_out_f16_xlen, &pf_out_f32_xlen);
                     } else {
                     mlx_native::ops::flash_attn_prefill_d512::
                         dispatch_flash_attn_prefill_bf16_d512_with_blk(
