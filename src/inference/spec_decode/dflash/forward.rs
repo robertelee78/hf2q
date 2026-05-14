@@ -861,6 +861,93 @@ pub fn dispatch_dflash_decoder_layer_attention(
     Ok(attn_proj)
 }
 
+/// Run the full DFlashDraftModel forward through all `num_hidden_layers`
+/// decoder layers + model-level globals.
+///
+/// Mirrors `model_mlx.py:DFlashDraftModel.__call__` (lines 181-198):
+/// ```text
+///   h = embed_tokens(inputs) * embed_scale
+///   h_ctx = hidden_norm(fc(target_hidden))
+///   for layer, c in zip(layers, cache):
+///       h = layer(h, h_ctx, rope, c)
+///   h = norm(h)
+///   logits = lm_head(h)            ← caller's job (target's lm_head)
+///   if softcap: logits = tanh(logits / cap) * cap   ← caller's job
+///   return logits
+/// ```
+///
+/// Returns the post-final-norm hidden state `[L, hidden_size]`. The
+/// caller orchestrator (Phase 4+) does:
+/// 1. Embed tokens via target's embed_tokens (target.embed @ input_ids)
+///    + embed_scale → pass as `h`
+/// 2. Concat target hidden states at `cfg.target_layer_ids` (captured
+///    during the target's verify forward) → pass as `target_hidden_concat`
+/// 3. After this function returns h_final, run target's lm_head matmul
+///    on it → logits
+/// 4. Apply softcap via `dispatch_dflash_softcap` if cfg requires it
+///
+/// # Arguments
+///
+/// - `h`: `[L, hidden_size]` F32 — embedded block input (already scaled)
+/// - `target_hidden_concat`: `[S, fc_input_dim]` F32 — concat of target
+///   hidden states at the configured `target_layer_ids` (single tensor
+///   layout, not per-layer)
+/// - `model`: GPU drafter weights
+/// - `cache`: full KV cache (5 per-layer states)
+/// - `block_size`: L (block positions for the spec-decode round)
+/// - `ctx_chunk_size`: S (new ctx positions to append this call)
+///
+/// Returns the final-normed `h` after all layers, ready for lm_head.
+pub fn dispatch_dflash_model_forward(
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    h: &MlxBuffer,
+    target_hidden_concat: &MlxBuffer,
+    model: &super::tensors::DFlashModelTensors,
+    cache: &mut super::kv_cache::DFlashKvCache,
+    cfg: &DFlashConfig,
+    block_size: u32,
+    ctx_chunk_size: u32,
+) -> Result<MlxBuffer> {
+    // -------- Prelude: fc + hidden_norm to build h_ctx --------
+    let mut enc = device
+        .command_encoder()
+        .context("model_forward: open encoder for fc + hidden_norm")?;
+    let fc_out = dispatch_dflash_fc(&mut enc, registry, device, target_hidden_concat, model, cfg, ctx_chunk_size)
+        .context("model_forward: fc")?;
+    enc.memory_barrier();
+    let h_ctx = dispatch_dflash_hidden_norm(&mut enc, registry, device, &fc_out, model, cfg, ctx_chunk_size)
+        .context("model_forward: hidden_norm")?;
+    enc.commit_and_wait().context("model_forward: commit prelude")?;
+
+    // -------- Loop over decoder layers --------
+    let mut h_curr_owned: Option<MlxBuffer> = None;
+    for layer_idx in 0..cfg.num_hidden_layers {
+        let h_in: &MlxBuffer = match h_curr_owned.as_ref() {
+            Some(b) => b,
+            None => h,
+        };
+        let h_out = dispatch_dflash_decoder_layer(
+            registry, device, h_in, &h_ctx,
+            &model.layers[layer_idx], &mut cache.layers[layer_idx],
+            cfg, block_size, ctx_chunk_size,
+        )
+        .with_context(|| format!("model_forward: layer {layer_idx}"))?;
+        h_curr_owned = Some(h_out);
+    }
+    let h_after_layers = h_curr_owned.expect("at least 1 decoder layer in drafter");
+
+    // -------- Epilogue: final_norm --------
+    let mut enc = device
+        .command_encoder()
+        .context("model_forward: open encoder for final_norm")?;
+    let h_final = dispatch_dflash_final_norm(&mut enc, registry, device, &h_after_layers, model, cfg, block_size)
+        .context("model_forward: final_norm")?;
+    enc.commit_and_wait().context("model_forward: commit epilogue")?;
+
+    Ok(h_final)
+}
+
 /// Run the full DFlashDecoderLayer forward — attention sub-block +
 /// residual + post-norm + MLP + residual.
 ///
@@ -1303,6 +1390,97 @@ mod tests {
                 n_zero < host.len() / 2,
                 "{name} suspiciously sparse (n_zero={n_zero}/{})",
                 host.len()
+            );
+        }
+    }
+
+    /// Smoke test for the FULL DFlashDraftModel forward — all 5
+    /// decoder layers + fc + hidden_norm + final_norm.
+    ///
+    /// This is the Phase 3 integration milestone: the entire drafter
+    /// model forward end-to-end on M5 Max with real weights + KV cache.
+    /// The only missing pieces for a complete spec-decode loop are:
+    /// (1) input embedding via target's embed_tokens (orchestrator job)
+    /// (2) lm_head matmul via target's lm_head (orchestrator job)
+    /// (3) softcap on logits (dispatch_dflash_softcap)
+    /// — all of which are Phase 4+ orchestrator concerns.
+    #[test]
+    #[ignore = "requires Metal device + drafter HF cache"]
+    fn smoke_model_forward_with_cache() {
+        use super::super::kv_cache::DFlashKvCache;
+
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let mut registry = KernelRegistry::new();
+
+        let home = std::env::var("HOME").expect("HOME set");
+        let path = format!(
+            "{home}/.cache/huggingface/hub/models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/77d4202772dfe50b2396ec7bac9cfffc7b9e7057/model.safetensors"
+        );
+        let file = DFlashWeightsFile::open(&path).expect("file open");
+        let weights = DFlashWeights::load(file.bytes(), &cfg).expect("validated load");
+        let tensors = DFlashModelTensors::upload(&device, &cfg, &weights).expect("GPU upload");
+        // Full-attn layer caches: need capacity >= ctx_chunk + block_size.
+        // Sliding layers use sliding_window-1 = 2047 (plenty for 4+8=12).
+        let mut cache = DFlashKvCache::new(&device, &cfg, 128).expect("cache");
+
+        let block_size = 8u32;
+        let ctx_chunk = 4u32;
+        let hidden = cfg.hidden_size as u32;
+        let fc_in = cfg.fc_input_dim() as u32;
+
+        // Input h [L, hidden] F32-ones (stand-in for embed_tokens output)
+        let h_elem = (block_size as usize) * (hidden as usize);
+        let mut h = device
+            .alloc_buffer(h_elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .expect("alloc h");
+        {
+            let s = h.as_mut_slice::<f32>().expect("h slice");
+            for v in s.iter_mut() { *v = 1.0; }
+        }
+
+        // target_hidden_concat [S, fc_input_dim] F32 (synthetic)
+        let thc_elem = (ctx_chunk as usize) * (fc_in as usize);
+        let mut target_hidden = device
+            .alloc_buffer(thc_elem * 4, DType::F32, vec![ctx_chunk as usize, fc_in as usize])
+            .expect("alloc target_hidden");
+        {
+            let s = target_hidden.as_mut_slice::<f32>().expect("target_hidden slice");
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = 0.1 + ((i % 17) as f32) / 170.0;
+            }
+        }
+
+        let initial_seq_lens: Vec<u32> = cache.layers.iter().map(|l| l.seq_len).collect();
+
+        let h_final = dispatch_dflash_model_forward(
+            &mut registry, &device, &h, &target_hidden,
+            &tensors, &mut cache, &cfg, block_size, ctx_chunk,
+        )
+        .expect("model forward");
+
+        // Shape: [L, hidden]
+        assert_eq!(h_final.element_count(), (block_size as usize) * (hidden as usize));
+        let host: &[f32] = h_final.as_slice::<f32>().expect("h_final slice");
+        let n_finite = host.iter().filter(|v| v.is_finite()).count();
+        let n_zero = host.iter().filter(|v| **v == 0.0).count();
+        assert_eq!(
+            n_finite, host.len(),
+            "model forward output must be all finite (got {n_finite}/{}; n_zero={n_zero})",
+            host.len()
+        );
+        assert!(
+            n_zero < host.len() / 2,
+            "model forward output suspiciously sparse (n_zero={n_zero}/{})",
+            host.len()
+        );
+
+        // All 5 layer caches should have advanced by ctx_chunk.
+        for (i, l) in cache.layers.iter().enumerate() {
+            assert_eq!(
+                l.seq_len,
+                initial_seq_lens[i] + ctx_chunk,
+                "layer {i} cache should advance by ctx_chunk_size"
             );
         }
     }
