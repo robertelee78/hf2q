@@ -427,6 +427,245 @@ pub fn dispatch_dflash_generate_one_round_with_initial_capture(
     Ok(round)
 }
 
+/// Multi-round end-to-end DFlash spec-decode generation.
+///
+/// Composes ALL Phase 4 building blocks into a complete generation
+/// loop. Runs until `max_new_tokens` are emitted OR `hit_eos`.
+///
+/// Per-round, target's forward_prefill_batched is called ONCE with a
+/// combined capture session covering drafter's `target_layer_ids` ∪
+/// `[final_layer_idx]`. The combined buffer is split into:
+/// - drafter's input for NEXT round (via `extract_drafter_concat`)
+/// - per-position argmax input for THIS round (via `extract_final_layer_slab`)
+///
+/// This avoids double target-forward per round.
+///
+/// # Greedy byte-identity invariant
+///
+/// At temperature = 0, the output (after `prompt_tokens.len()`) is
+/// byte-identical to what single-token target decode would produce.
+/// Proven by composition: `step_round_from_argmaxes` only accepts
+/// drafts that match target's argmax; `target.rollback_kv` discards
+/// rejected positions; per-round capture is just additive
+/// instrumentation that doesn't change target's compute.
+///
+/// # Arguments
+///
+/// - `target`: MlxModelWeights for the production target
+/// - `drafter_tensors` / `drafter_cache` / `drafter_cfg`: drafter state
+/// - `prompt_tokens`: input prompt
+/// - `max_new_tokens`: cap on generated token count
+/// - `block_size`: K + 1 (drafts K + warmup slot); default 8 for K=7
+/// - `eos_token_ids`: stop conditions
+/// - `gpu`: shared MlxGpu context
+///
+/// # Returns
+///
+/// `Vec<u32>` = `[prompt_tokens..., generated...]`.
+pub fn dispatch_dflash_generate(
+    target: &mut crate::serve::forward_mlx::MlxModelWeights,
+    drafter_tensors: &super::tensors::DFlashModelTensors,
+    drafter_cache: &mut super::kv_cache::DFlashKvCache,
+    drafter_cfg: &super::config::DFlashConfig,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    block_size: u32,
+    eos_token_ids: &[u32],
+    gpu: &mut crate::serve::gpu::GpuContext,
+) -> anyhow::Result<Vec<u32>> {
+    use super::hidden_capture::{
+        extract_drafter_concat, extract_final_layer_slab, DFlashCaptureSession,
+    };
+
+    if prompt_tokens.is_empty() {
+        anyhow::bail!("dispatch_dflash_generate: empty prompt");
+    }
+    if block_size < 2 {
+        anyhow::bail!("dispatch_dflash_generate: block_size must be >= 2");
+    }
+
+    let hs = target.hidden_size;
+    let final_layer_idx = target.layers.len() - 1;
+
+    // Combined capture: drafter's target_layer_ids ∪ [final_layer_idx]
+    let mut combined_capture_ids: Vec<usize> = drafter_cfg.target_layer_ids.clone();
+    if !combined_capture_ids.contains(&final_layer_idx) {
+        combined_capture_ids.push(final_layer_idx);
+    }
+    combined_capture_ids.sort_unstable();
+    combined_capture_ids.dedup();
+
+    let mut output: Vec<u32> = prompt_tokens.to_vec();
+
+    // -------- Initial prompt forward with capture --------
+    let session = DFlashCaptureSession::new(
+        combined_capture_ids.clone(),
+        prompt_tokens.len(),
+        hs,
+        false,
+    );
+    target.install_dflash_capture(session);
+    let first_token = target
+        .forward_prefill_batched(prompt_tokens, 0, 0, gpu)
+        .map_err(|e| anyhow::anyhow!("generate: initial prompt forward: {e}"))?;
+    let mut captured = target
+        .take_dflash_capture()
+        .ok_or_else(|| anyhow::anyhow!("generate: initial capture vanished"))?;
+
+    // The first decode token comes from the prompt's last position's argmax.
+    // forward_prefill_batched wrote prompt_tokens into KV at positions
+    // [0..prompt_len); first_token is the predicted NEXT token, NOT yet in KV.
+    // It will be fed back via the next forward's verify_input[0].
+    output.push(first_token);
+    let mut seq_pos: usize = prompt_tokens.len();
+
+    if eos_token_ids.contains(&first_token) || max_new_tokens == 0 {
+        return Ok(output);
+    }
+
+    let mut last_token = first_token;
+
+    // -------- Multi-round loop --------
+    while output.len() - prompt_tokens.len() < max_new_tokens {
+        let captured_seq_len = captured.seq_len;
+
+        // 1. Extract drafter input from captured
+        let drafter_concat_vec = extract_drafter_concat(
+            &captured.hidden_output,
+            &combined_capture_ids,
+            &drafter_cfg.target_layer_ids,
+            captured_seq_len,
+            hs,
+        )?;
+        let target_hidden_concat = {
+            let (exec, _reg) = gpu.split();
+            let dev = exec.device();
+            let mut buf = dev
+                .alloc_buffer(
+                    drafter_concat_vec.len() * 4,
+                    mlx_native::DType::F32,
+                    vec![captured_seq_len, drafter_cfg.target_layer_ids.len() * hs],
+                )
+                .map_err(|e| anyhow::anyhow!("generate: alloc target_hidden_concat: {e}"))?;
+            buf.as_mut_slice::<f32>()
+                .map_err(|e| anyhow::anyhow!("generate: target_hidden_concat slice: {e}"))?
+                .copy_from_slice(&drafter_concat_vec);
+            buf
+        };
+
+        // 2. Build draft block + embed via target's embed_tokens
+        let mut block: Vec<u32> = Vec::with_capacity(block_size as usize);
+        block.push(last_token);
+        block.extend(
+            std::iter::repeat(drafter_cfg.mask_token_id)
+                .take((block_size - 1) as usize),
+        );
+        let h = target
+            .embed_tokens(&block, gpu)
+            .map_err(|e| anyhow::anyhow!("generate: embed_tokens: {e}"))?;
+
+        // 3. Drafter forward
+        let h_final = {
+            let (exec, reg) = gpu.split();
+            let device = exec.device();
+            super::forward::dispatch_dflash_model_forward(
+                reg,
+                device,
+                &h,
+                &target_hidden_concat,
+                drafter_tensors,
+                drafter_cache,
+                drafter_cfg,
+                block_size,
+                captured_seq_len as u32,
+            )
+            .map_err(|e| anyhow::anyhow!("generate: drafter forward: {e}"))?
+        };
+
+        // 4. lm_head per position on drafter's h_final → drafts
+        let drafts: Vec<u32> = {
+            let h_final_slice: &[f32] = h_final
+                .as_slice::<f32>()
+                .map_err(|e| anyhow::anyhow!("generate: h_final slice: {e}"))?;
+            let host_copy: Vec<f32> = h_final_slice.to_vec();
+            let all_argmaxes = target
+                .per_position_argmax_from_hidden_opt(&host_copy, block_size, false, gpu)
+                .map_err(|e| anyhow::anyhow!("generate: drafter argmax: {e}"))?;
+            all_argmaxes[1..].to_vec()
+        };
+
+        // 5. Target verify with capture (combined IDs) at seq_pos
+        let verify_input: Vec<u32> = std::iter::once(last_token)
+            .chain(drafts.iter().copied())
+            .collect();
+        let verify_seq_len = verify_input.len();
+        let verify_session = DFlashCaptureSession::new(
+            combined_capture_ids.clone(),
+            verify_seq_len,
+            hs,
+            false,
+        );
+        target.install_dflash_capture(verify_session);
+        let _verify_first_token = target
+            .forward_prefill_batched(&verify_input, 0, seq_pos, gpu)
+            .map_err(|e| anyhow::anyhow!("generate: verify forward: {e}"))?;
+        let next_captured = target
+            .take_dflash_capture()
+            .ok_or_else(|| anyhow::anyhow!("generate: verify capture vanished"))?;
+
+        // 6. Extract final-layer slab + per-position argmaxes
+        let final_slab = extract_final_layer_slab(
+            &next_captured.hidden_output,
+            &combined_capture_ids,
+            final_layer_idx,
+            verify_seq_len,
+            hs,
+        )?;
+        let target_argmaxes = target
+            .per_position_argmax_from_hidden_opt(
+                &final_slab,
+                verify_seq_len as u32,
+                true,
+                gpu,
+            )
+            .map_err(|e| anyhow::anyhow!("generate: target argmax: {e}"))?;
+
+        // 7. Accept-prefix
+        let round = step_round_from_argmaxes(&drafts, &target_argmaxes, eos_token_ids);
+
+        // 8. KV rollbacks
+        let rollback = drafts.len().saturating_sub(round.accept_count);
+        if rollback > 0 {
+            target.rollback_kv(rollback);
+            for layer in drafter_cache.layers.iter_mut() {
+                layer.rollback(rollback as u32);
+            }
+        }
+
+        // 9. Append committed tokens + advance state
+        let n_committed = round.committed_tokens.len();
+        output.extend(round.committed_tokens.iter().copied());
+        seq_pos += n_committed;
+        last_token = *round.committed_tokens.last().unwrap();
+        captured = next_captured;
+
+        if round.hit_eos {
+            break;
+        }
+        if output.len() - prompt_tokens.len() >= max_new_tokens {
+            break;
+        }
+    }
+
+    // Truncate to max_new_tokens if we overshot in the last round
+    let max_total = prompt_tokens.len() + max_new_tokens;
+    if output.len() > max_total {
+        output.truncate(max_total);
+    }
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
