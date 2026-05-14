@@ -2811,3 +2811,26 @@ prediction, drafter acceptance rate becomes testable for the
 first time, unblocking the perf-gate path (drafter quality ≥65%
 + Phase 5 async parallel-encode → mission gate PASS).
 
+
+### iter-110 — mlx-native dispatcher-level dtype guard (defense-in-depth)
+
+Promoted the iter-107 dtype invariant from the drafter call site into
+mlx-native's `dispatch_rms_norm` itself.  The dispatcher now validates
+`input.dtype() == weight.dtype() == output.dtype()` up front, returning
+`InvalidArgument` with an explicit reference to ADR-030 iter-106 if the
+caller violates the contract.  Mirrors the pre-existing dtype-coherence
+check in `dispatch_sigmoid_mul` and `dispatch_silu_mul`.
+
+**Audit result**: After adding the guard, 298/298 mlx-native lib tests
++ 3503/3503 hf2q bin tests pass GREEN.  This empirically confirms
+that **the iter-106 hf2q-side fix was the only rms_norm dtype mismatch
+in the entire codebase** — no other caller (qwen35 forward, MTP heads,
+gpu_delta_net, qwen35::gpu_full_attn) had a hidden mismatch.
+
+Repo shipped:
+- mlx-native `f865e34` (32 LOC, single dispatcher change).
+- hf2q HEAD unchanged (no caller needed adjustment).
+
+Future RMSNorm callers across mlx-native consumers will now get a
+clear early-error instead of corrupted hidden states downstream.
+
