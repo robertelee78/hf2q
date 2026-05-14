@@ -421,6 +421,13 @@ impl MlxModelWeights {
             dev.alloc_buffer(n * bf16_sz, DType::BF16, vec![n])
                 .map_err(|e| anyhow::anyhow!("batched alloc {name}: {e}"))
         };
+        // ADR-030 iter-77: F16 alloc helper for the cross-length verify
+        // SDPA path (Q/output cast targets).  F16 width is 2 bytes
+        // (matches BF16 in size; only mantissa/exponent split differs).
+        let alloc_f16 = |n: usize, name: &str| -> Result<MlxBuffer> {
+            dev.alloc_buffer(n * 2, DType::F16, vec![n])
+                .map_err(|e| anyhow::anyhow!("batched alloc {name}: {e}"))
+        };
         let alloc_u32 = |n: usize, name: &str| -> Result<MlxBuffer> {
             dev.alloc_buffer(n * u32_sz, DType::U32, vec![n])
                 .map_err(|e| anyhow::anyhow!("batched alloc {name}: {e}"))
@@ -469,6 +476,28 @@ impl MlxModelWeights {
         let pf_k_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_k_perm")?;
         let pf_v_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_v_perm")?;
         let mut pf_sdpa_out_perm = alloc_bf16(nh * seq_len * max_hd, "pf_sdpa_out_perm")?;
+
+        // ADR-030 iter-77 — cross-length-SDPA verify mode buffers.  Active
+        // only when env flag HF2Q_DFLASH_XLEN_SDPA=1 AND we are in a verify
+        // call (start_pos > 0 AND dflash_capture installed).  The cast
+        // chain is Q BF16→F32→F16 (call resume kernel) → F16→F32→BF16,
+        // staged via these scratch buffers.  At seq_len = K+1 = 8 these
+        // are very small (8 × 16 × 256 × 4 bytes ≈ 130 KB each).
+        let xlen_sdpa_mode = std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() == Ok("1")
+            && start_pos > 0
+            && self.dflash_capture.is_some();
+        let pf_q_f32_xlen: Option<MlxBuffer> = if xlen_sdpa_mode {
+            Some(alloc_f32(nh * seq_len * max_hd, "pf_q_f32_xlen")?)
+        } else { None };
+        let pf_q_f16_xlen: Option<MlxBuffer> = if xlen_sdpa_mode {
+            Some(alloc_f16(nh * seq_len * max_hd, "pf_q_f16_xlen")?)
+        } else { None };
+        let pf_out_f16_xlen: Option<MlxBuffer> = if xlen_sdpa_mode {
+            Some(alloc_f16(nh * seq_len * max_hd, "pf_out_f16_xlen")?)
+        } else { None };
+        let pf_out_f32_xlen: Option<MlxBuffer> = if xlen_sdpa_mode {
+            Some(alloc_f32(nh * seq_len * max_hd, "pf_out_f32_xlen")?)
+        } else { None };
 
         // HF2Q_NO_FA path buffers — only allocated when the env flag is
         // set.  pf_kq is the dominant footprint at seq_len=2455:
@@ -1290,6 +1319,64 @@ impl MlxModelWeights {
                     None
                 };
                 if is_sliding {
+                    if xlen_sdpa_mode {
+                        // ADR-030 iter-77 — cross-length SDPA verify path.
+                        // Cast pf_q_perm BF16 → F32 → F16, call
+                        // dispatch_flash_attn_prefill_f16_d256_resume with
+                        // K/V from hybrid_kv (already F16) at slot capacity,
+                        // cast output F16 → F32 → BF16 back to pf_sdpa_out_perm.
+                        let q_f32 = pf_q_f32_xlen.as_ref().expect("xlen Q f32 buf");
+                        let q_f16 = pf_q_f16_xlen.as_ref().expect("xlen Q f16 buf");
+                        let out_f16 = pf_out_f16_xlen.as_ref().expect("xlen out f16 buf");
+                        let out_f32 = pf_out_f32_xlen.as_ref().expect("xlen out f32 buf");
+                        let hybrid_kv_vec = self.hybrid_kv.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("xlen SDPA L{layer_idx}: hybrid_kv not allocated — HF2Q_FULL_F16_KV=1 required"))?;
+                        let layer_kv = &hybrid_kv_vec[layer_idx];
+                        let q_n_elems = nh * seq_len * hd;
+                        s.barrier_between(&[&pf_q_perm], &[q_f32]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            &pf_q_perm, q_f32, q_n_elems,
+                            mlx_native::ops::elementwise::CastDirection::BF16ToF32,
+                        ).map_err(|e| anyhow::anyhow!("xlen Q BF16->F32 L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[q_f32], &[q_f16]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            q_f32, q_f16, q_n_elems,
+                            mlx_native::ops::elementwise::CastDirection::F32ToF16,
+                        ).map_err(|e| anyhow::anyhow!("xlen Q F32->F16 L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[q_f16, &layer_kv.k, &layer_kv.v_packed], &[out_f16]);
+                        mlx_native::ops::flash_attn_prefill::
+                            dispatch_flash_attn_prefill_f16_d256_resume(
+                            s.encoder_mut(), dev, reg,
+                            q_f16, &layer_kv.k, &layer_kv.v_packed,
+                            out_f16,
+                            &mlx_native::ops::flash_attn_prefill::FlashAttnPrefillResumeParams {
+                                n_heads: nh as u32,
+                                n_kv_heads: nkv as u32,
+                                head_dim: hd as u32,
+                                seq_len_q: seq_len as u32,
+                                seq_len_k: (start_pos + seq_len) as u32,
+                                batch: 1,
+                                scale: 1.0,
+                                do_causal: true,
+                                q_offset_in_k: start_pos as u32,
+                                kv_capacity: layer_kv.capacity as u32,
+                            },
+                        ).map_err(|e| anyhow::anyhow!("xlen sliding SDPA L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[out_f16], &[out_f32]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            out_f16, out_f32, q_n_elems,
+                            mlx_native::ops::elementwise::CastDirection::F16ToF32,
+                        ).map_err(|e| anyhow::anyhow!("xlen O F16->F32 L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[out_f32], &[&pf_sdpa_out_perm]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            out_f32, &pf_sdpa_out_perm, q_n_elems,
+                            mlx_native::ops::elementwise::CastDirection::F32ToBF16,
+                        ).map_err(|e| anyhow::anyhow!("xlen O F32->BF16 L{layer_idx}: {e}"))?;
+                    } else {
                     // ADR-011 Phase 2 Wave 4 Stage 2: flash_attn_prefill D=256
                     // replaces sdpa_sliding. Inputs:
                     //   - Q/K/V/O: bf16 [n_heads/n_kv_heads, seq_len, hd=256],
@@ -1325,6 +1412,7 @@ impl MlxModelWeights {
                             do_causal: false,
                         },
                     ).map_err(|e| anyhow::anyhow!("batched sliding flash_attn_prefill L{layer_idx}: {e}"))?;
+                    } // end sliding else (existing non-xlen path)
                 } else {
                     // ADR-011 Phase 2 Wave 4 Stage 3: flash_attn_prefill D=512
                     // (NSG=8 llama.cpp-derived kernel) replaces s.sdpa for
@@ -1351,6 +1439,60 @@ impl MlxModelWeights {
                     //   /opt/hf2q/docs/ADR-011-phase2-wave2c-d512-bug-fix.md
                     // for the per-line trace, the math, and the per-test
                     // tolerance numbers.
+                    if xlen_sdpa_mode {
+                        // ADR-030 iter-77 — D=512 cross-length verify path.
+                        let q_f32 = pf_q_f32_xlen.as_ref().expect("xlen Q f32 buf");
+                        let q_f16 = pf_q_f16_xlen.as_ref().expect("xlen Q f16 buf");
+                        let out_f16 = pf_out_f16_xlen.as_ref().expect("xlen out f16 buf");
+                        let out_f32 = pf_out_f32_xlen.as_ref().expect("xlen out f32 buf");
+                        let hybrid_kv_vec = self.hybrid_kv.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("xlen SDPA L{layer_idx}: hybrid_kv not allocated — HF2Q_FULL_F16_KV=1 required"))?;
+                        let layer_kv = &hybrid_kv_vec[layer_idx];
+                        let q_n_elems = nh * seq_len * hd;
+                        s.barrier_between(&[&pf_q_perm], &[q_f32]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            &pf_q_perm, q_f32, q_n_elems,
+                            mlx_native::ops::elementwise::CastDirection::BF16ToF32,
+                        ).map_err(|e| anyhow::anyhow!("xlen Q BF16->F32 L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[q_f32], &[q_f16]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            q_f32, q_f16, q_n_elems,
+                            mlx_native::ops::elementwise::CastDirection::F32ToF16,
+                        ).map_err(|e| anyhow::anyhow!("xlen Q F32->F16 L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[q_f16, &layer_kv.k, &layer_kv.v_packed], &[out_f16]);
+                        mlx_native::ops::flash_attn_prefill_d512::
+                            dispatch_flash_attn_prefill_f16_d512_resume(
+                            s.encoder_mut(), dev, reg,
+                            q_f16, &layer_kv.k, &layer_kv.v_packed,
+                            out_f16,
+                            &mlx_native::ops::flash_attn_prefill_d512::FlashAttnPrefillResumeParams {
+                                n_heads: nh as u32,
+                                n_kv_heads: nkv as u32,
+                                head_dim: hd as u32,
+                                seq_len_q: seq_len as u32,
+                                seq_len_k: (start_pos + seq_len) as u32,
+                                batch: 1,
+                                scale: 1.0,
+                                do_causal: true,
+                                q_offset_in_k: start_pos as u32,
+                                kv_capacity: layer_kv.capacity as u32,
+                            },
+                        ).map_err(|e| anyhow::anyhow!("xlen global SDPA L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[out_f16], &[out_f32]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            out_f16, out_f32, q_n_elems,
+                            mlx_native::ops::elementwise::CastDirection::F16ToF32,
+                        ).map_err(|e| anyhow::anyhow!("xlen O F16->F32 L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[out_f32], &[&pf_sdpa_out_perm]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            out_f32, &pf_sdpa_out_perm, q_n_elems,
+                            mlx_native::ops::elementwise::CastDirection::F32ToBF16,
+                        ).map_err(|e| anyhow::anyhow!("xlen O F32->BF16 L{layer_idx}: {e}"))?;
+                    } else {
                     mlx_native::ops::flash_attn_prefill_d512::
                         dispatch_flash_attn_prefill_bf16_d512_with_blk(
                         s.encoder_mut(), dev, reg,
@@ -1369,6 +1511,7 @@ impl MlxModelWeights {
                             do_causal: false,
                         },
                     ).map_err(|e| anyhow::anyhow!("batched global flash_attn_prefill L{layer_idx}: {e}"))?;
+                    }
                 }
                 // Wave P4.0 — close the FA-only session and accumulate
                 // wall-clock time (commit_and_wait blocks until the GPU

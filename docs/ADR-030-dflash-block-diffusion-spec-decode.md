@@ -1518,3 +1518,70 @@ dflash_capture installed.  That delivers the Option A coherence.
   and output F16→F32→BF16.  K, V from hybrid_kv (F16) directly.  Once
   in place, flag ON should turn coherence gate GREEN and unlock the
   predicted ~50% throughput gain.
+
+### iter-77 (2026-05-14) — SDPA dispatch swap in forward_prefill_batched
+
+Wired the Phase 1 (SDPA swap) half of the Option A integration.
+forward_prefill_batched now has an inner branch at the SDPA dispatch
+site for both layer types (sliding D=256 + full-attn D=512):
+
+When `xlen_sdpa_mode = (HF2Q_DFLASH_XLEN_SDPA=1) && (start_pos > 0)
+&& (self.dflash_capture.is_some())`:
+
+1. Cast `pf_q_perm` BF16 → F32 → F16 (chain via
+   `mlx_native::ops::elementwise::cast` with `BF16ToF32` then
+   `F32ToF16`).  Staging buffers `pf_q_f32_xlen`, `pf_q_f16_xlen`
+   pre-allocated at top of `forward_prefill_batched` (gated).
+2. Call `dispatch_flash_attn_prefill_f16_d256_resume` (sliding) or
+   `dispatch_flash_attn_prefill_f16_d512_resume` (full-attn) with K, V
+   from `self.hybrid_kv[layer_idx].{k, v_packed}` directly (both F16
+   when `HF2Q_FULL_F16_KV=1` is set).
+3. Cast output `pf_out_f16_xlen` F16 → F32 → BF16 → `pf_sdpa_out_perm`
+   so downstream O-proj reads the existing BF16 contract.
+
+Resume params: `seq_len_q = seq_len` (= K+1=8 in our orchestrator),
+`seq_len_k = start_pos + seq_len`, `q_offset_in_k = start_pos`,
+`kv_capacity = hybrid_kv[layer].capacity`, `do_causal = true`.
+
+**Flag-OFF regression**: coherence GREEN at N=16 ✓ (verified before
+commit; the conditional branch is dead-code-eliminated at flag-OFF).
+
+**Flag-ON state (HF2Q_DFLASH_XLEN_SDPA=1 + HF2Q_FULL_F16_KV=1)**:
+- iter-76: single token repeated 16 times (SDPA self-attn over K+1
+  tokens only — Bug 5)
+- iter-77: mix of valid + zero tokens
+  (`spec_new = [236743, 0, 522, 0, 236743, 236778, 236743, 0, 0,
+  236743, 0, 236743, 236778, 236743, 0, 236743]`).  Progress — the
+  new dispatch IS exercising and producing SOMETHING; valid tokens
+  (236743, 236778) appear interspersed with zero argmaxes.  But not
+  yet byte-identical to baseline.
+
+Hypotheses for the remaining coherence gap (iter-78+):
+- Cast chain element count or layout mismatch (verified per-element
+  shape but not buffer striding edge cases)
+- hybrid_kv layout mismatch with kernel's expected strides at slot
+  capacity (kernel expects `[B, H_kv, kv_capacity, D]` head-major;
+  hybrid_kv stored as `[H_kv, capacity, D]`)
+- pf_q_perm staging issue (Q buffer contents may not be valid at the
+  exact point we cast; barrier_between may need different write
+  targets)
+- Initial prefill at start_pos=0 may have populated hybrid_kv K/V
+  differently than what the resume kernel expects
+
+**Code artifacts (iter-77)**:
+- `src/serve/forward_prefill_batched.rs` — `alloc_f16` helper, four
+  xlen-mode staging buffers (pf_q_f32_xlen, pf_q_f16_xlen,
+  pf_out_f16_xlen, pf_out_f32_xlen), SDPA dispatch swap at both
+  sliding and full-attn sites (~150 LOC of inner conditional
+  branches).
+
+**Mission state at iter-77 end**:
+- Coherence (flag OFF): GREEN ✓
+- Coherence (flag ON): RED at pos 1, but different failure mode than
+  iter-76 (was single-token-repeat; now mixed-valid-and-zero output —
+  the new dispatch IS running).  Debug-tractable.
+- iter-78+ debug task: bisect the cause of the remaining coherence
+  gap.  Most likely candidate is the strided K/V layout in hybrid_kv
+  vs what `_resume` dispatchers expect.  Use a unit test that
+  compares the resume kernel output against a CPU-reference cross-
+  length attention computation on small inputs.
