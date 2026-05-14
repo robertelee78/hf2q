@@ -309,19 +309,115 @@ Each phase ships **complete** code (no stubs) behind a phase-specific flag. The 
 - **Outcome**: Python @ K=7 achieves ~1.05× mean across 3 prompt types. Rust port projection on hf2q's cursor-mode KV: ~1.30× Python ≈ 1.21× peer-FA on TQ-HB target. **Mission gate cleared by margin → GO Phase 2.**
 - **Root-cause analysis (per Chesterton's fence)**: dflash MLX uses buffer-resize KV trim (model_mlx.py:_trim_recent_cache — structurally required by their "shape[2] = live data length" convention, not a bug). hf2q's cursor-mode `rollback_kv` (forward_mlx.rs:5733) structurally avoids this — that's where the projected 25-40% Rust port gain comes from.
 
-#### **Phase 2 — Draft model + weight loader** (~600 LOC; `HF2Q_SPEC_DFLASH_PHASE=2`)
-Lands: `config.rs`, `weights.rs`, `draft_model.rs`, `hidden_capture.rs`
-- `DFlashDraftModel` Rust port; runs in isolation (no target wiring yet)
-- Test gate: load `z-lab/gemma-4-26B-A4B-it-DFlash` + dummy hidden states → produce 15 token argmaxes; assert numerical match to `/opt/dflash` Python output within 1e-3 (allowed bf16 quantization noise) on 32 fixture inputs in `tests/fixtures/dflash_draft_parity/`
-- Coherence gate: N/A (draft runs in isolation)
-- Perf gate: N/A (draft only, not in the loop yet)
+#### **Phase 2 — Draft model + weight loader** ✅ COMPLETE iter-25 (2026-05-13)
+Landed: `config.rs`, `weights.rs`, `tensors.rs`, `forward.rs` (split from
+the originally-planned `draft_model.rs` for testability — each dispatcher
+ships independently with its own GPU smoke test).
 
-#### **Phase 3 — Verify forward + hidden capture** (~340 LOC; `HF2Q_SPEC_DFLASH_PHASE=3`)
-Lands: `gemma4_verify.rs`, modifications to `forward_prefill_batched.rs` tail (per iter-116 design refinement, ~50 LOC modification)
-- `forward_decode_verify(prompt_tokens, target_layer_ids) → (per_position_argmax, hidden_at_layers)`
-- The K=0 falsifier gate already-defined in `verifier.rs:36-41`: with empty drafts, verify-forward output must be byte-identical to single-token forward_decode
-- **Determinism gate**: run `scripts/coherence-harness/determinism_check.sh --spec-dflash-phase=3 --temp=0` on all 18 golden fixtures + 100 random prompts; require byte-identity
-- **Perf gate**: alt-pair thermal-fair single-token forward_decode vs forward_decode_verify(K=1) must show ≤ 5% verify-mode overhead (σ<1%, 5 cycles, 60-90s cool-downs)
+Deliverables (~1,953 LOC across 4 source files, 18+ tests all green):
+
+- **`config.rs`** (340 LOC, 6 tests): `DFlashConfig` struct + JSON loader
+  with full validation (layer_types length, sliding_window presence,
+  monotonic target_layer_ids, block_size ≥ 2). Loads the actual cached
+  `z-lab/gemma-4-26B-A4B-it-DFlash/config.json` verbatim.
+
+- **`weights.rs`** (308 LOC, 5+1 tests): strict safetensors manifest
+  loader. Validates every tensor name, dtype (BF16), shape against
+  config. Includes ignored integration test that loads the real 820MB
+  safetensors and confirms byte totals 1:1.
+
+- **`tensors.rs`** (290 LOC, 1 GPU integration test): GPU upload via
+  mlx-native MlxBuffer. q_norm/k_norm cast BF16 → F32 at upload (the
+  mlx-native rms_norm dispatcher requires weight dtype = input dtype,
+  and per-head norms apply to F32 Q/K projection output). 58 tensors
+  total. GPU test verifies every byte lands 1:1 on M5 Max.
+
+- **`forward.rs`** (1,015 LOC, 4 GPU smoke tests): all dispatch primitives
+  for one DFlashDecoderLayer forward. Each dispatcher is a thin wrapper
+  around mlx-native primitives or qwen35's existing helpers (Chesterton's
+  fence — reuse production-tested code):
+
+  | Dispatcher | Wraps |
+  |---|---|
+  | `dispatch_dflash_input_layernorm` | mlx-native `dispatch_rms_norm` |
+  | `dispatch_dflash_q_proj` / `k_proj` / `v_proj` / `o_proj` | qwen35 `apply_linear_projection_f32` |
+  | `dispatch_dflash_head_norm` (used for q_norm + k_norm) | mlx-native `dispatch_rms_norm` with `rows=L*n_heads` |
+  | `dispatch_dflash_rope` | qwen35 `apply_imrope` with `sections=[head_dim/2, 0, 0, 0]` (plain NeoX) |
+  | `dispatch_dflash_sdpa_self_attn` | qwen35 `apply_sdpa_causal_from_seq_major` (self-attn form — Phase 3 will replace with cross-length form once KV cache wired) |
+  | `dispatch_dflash_post_attention_layernorm` | mlx-native `dispatch_rms_norm` |
+  | `dispatch_dflash_mlp` | qwen35 `apply_linear_projection_f32` × 3 + mlx-native `dispatch_silu_mul` |
+  | `dispatch_dflash_residual_add` | mlx-native `elementwise_add` |
+
+  GPU integration tests: 4 end-to-end smoke tests on real drafter weights
+  on M5 Max — the last one (`smoke_decoder_layer_self_attn`) composes
+  ALL above dispatchers into a full decoder layer forward (11 dispatches
+  + 2 residual adds), validating shape + finiteness + non-triviality
+  in 0.24s release.
+
+**Key Phase 1.5 findings carried into Phase 2 defaults**:
+- `block_size = 8` is the production default per ADR §3.4 (revised from
+  16 — Python sweep showed K=7 wins monotonically on M5 Max)
+- Drafter is `model_type: qwen3` — vanilla dense, NO MoE, NO TQ-HB, NO
+  K=V tying. Substantially simpler to port than the gemma-4-26B-A4B-it
+  target. Phase 2 confirmed: 10 of 11 dispatchers are 1-line wrappers
+  around existing mlx-native or qwen35 helpers.
+
+**What Phase 2 does NOT include** (Phase 3 territory):
+- Cross-length SDPA (Q seq_len < K/V seq_len with ctx+prop K/V concat)
+- KV cache state management
+- Target hidden-state capture in `forward_mlx.rs`
+- 5-layer model forward composition + globals (fc, norms, softcap)
+- Wiring to target's embed_tokens + lm_head (the `bind()` analog)
+- `forward_decode_verify_batched` body replacement
+
+#### **Phase 3 — Verify forward + hidden capture** ⚙ IN PROGRESS iter-26+
+Sub-tasks landed so far (iter-26, commit `79265178`):
+
+- ✅ **Model-level globals** (4 dispatchers + smoke test in `forward.rs`):
+  `dispatch_dflash_fc` (fc projection of concat target hidden states),
+  `dispatch_dflash_hidden_norm` (RMSNorm on fc output → h_ctx),
+  `dispatch_dflash_final_norm` (RMSNorm before lm_head),
+  `dispatch_dflash_softcap` (Gemma-style tanh softcap, returns
+  `Option<MlxBuffer>` matching Python's conditional).
+  GPU smoke test `smoke_model_level_globals` validates all four on
+  M5 Max with synthetic inputs + correctness checks (softcap correctly
+  caps 100.0 inputs to <30.0).
+
+Sub-tasks remaining:
+
+- ⏳ **Cross-length SDPA** (kv_seq_len > q_seq_len) — replaces Phase 2's
+  self-attn-only `dispatch_dflash_sdpa_self_attn` with the form needed
+  for DFlash's ctx+prop K/V concat. Will use `sdpa(...)` directly (the
+  primitive under qwen35's `apply_sdpa_causal`) with `SdpaParams.kv_seq_len
+  != seq_len`.
+
+- ⏳ **DFlashKvCache state** (per-layer K/V buffer + offset + sliding-
+  window logic). Sliding-window cache for the 4 sliding layers, full
+  for the 1 full-attention layer.
+
+- ⏳ **5-layer DFlashDraftModel forward composition** — chains
+  embed → fc + hidden_norm → 5 × (layer forward with KV cache) →
+  final_norm → lm_head → softcap. The `bind()` analog uses target's
+  `embed_tokens` + `lm_head` MlxBuffers passed in by the orchestrator.
+
+- ⏳ **Target hidden-state capture** in `forward_mlx.rs` — emit hidden
+  states at `target_layer_ids: [1, 6, 11, 17, 22, 27]` during the target's
+  forward pass. Most invasive change.
+
+- ⏳ **`forward_decode_verify_batched` body replacement** at
+  `forward_prefill_batched.rs:2665` — currently a temporary delegation
+  to serial (per ADR-028 iter-139 comment). Replace with the actual
+  batched body that calls the drafter + target verify + accept_prefix.
+
+### Phase 3 gates (unchanged from original plan)
+
+- K=0 falsifier (`verifier.rs:36-41`): with empty drafts, verify-forward
+  must be byte-identical to single-token `forward_decode`
+- **Determinism gate**: `scripts/coherence-harness/determinism_check.sh
+  --spec-dflash-phase=3 --temp=0` on all 18 golden fixtures + 100 random
+  prompts; require byte-identity
+- **Perf gate**: alt-pair thermal-fair single-token forward_decode vs
+  forward_decode_verify(K=1) must show ≤ 5% verify-mode overhead
 
 #### **Phase 4 — Greedy spec-decode orchestrator** (~470 LOC; `HF2Q_SPEC_DFLASH_PHASE=4`)
 Lands: `kv_rollback.rs`, `orchestrator.rs` (greedy-only path; rejection sampler stubbed to `unreachable!()` for temp>0 — operator will only run temp=0 in this phase)
