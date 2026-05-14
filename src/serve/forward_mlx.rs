@@ -1755,154 +1755,154 @@ impl MlxModelWeights {
             .alloc_buffer(n * 4, mlx_native::DType::F32, vec![n])
             .map_err(|e| anyhow::anyhow!("alloc argmax_value_all: {e}"))?;
 
-        // (3) Single session.
+        // iter-72: truly batched processing.  One rms_norm with rows=n,
+        // one lm_head matmul with m=n, one softcap over n*vocab, then
+        // n argmax dispatches with logits views per row.  Replaces the
+        // iter-70 sequential loop on shared scratch.
+        let mut norm_out_batched = dev
+            .alloc_buffer(n * hs * 4, mlx_native::DType::F32, vec![n, hs])
+            .map_err(|e| anyhow::anyhow!("alloc norm_out_batched: {e}"))?;
+        let mut logits_batched = dev
+            .alloc_buffer(
+                n * (vocab_size as usize) * 4,
+                mlx_native::DType::F32,
+                vec![n, vocab_size as usize],
+            )
+            .map_err(|e| anyhow::anyhow!("alloc logits_batched: {e}"))?;
+
         let mut s = exec
             .begin()
             .map_err(|e| anyhow::anyhow!("batched argmax session begin: {e}"))?;
 
-        for pos in 0..n {
-            // Copy this position's hidden row into the shared scratch
-            // `activations.hidden`.  Use a slice_view of gpu_hidden_all
-            // (no CPU touch — GPU-only data flow within the session).
-            let hidden_view = gpu_hidden_all.slice_view((pos * hs * 4) as u64, hs);
-            // Barrier: ensure iter i-1's downstream reads of
-            // activations.hidden are done before we overwrite.
+        // (a) ONE rms_norm or copy with rows=n
+        if apply_final_norm {
             s.barrier_between(
-                &[&self.activations.hidden, &self.activations.norm_out,
-                  &self.activations.logits],
-                &[&self.activations.hidden],
+                &[&gpu_hidden_all, &self.final_norm],
+                &[&norm_out_batched],
+            );
+            s.rms_norm(
+                reg,
+                metal_dev,
+                &gpu_hidden_all,
+                &self.final_norm,
+                &norm_out_batched,
+                &self.activations.norm_params,
+                n as u32,
+                hs as u32,
+            )
+            .map_err(|e| anyhow::anyhow!("batched arg rms_norm: {e}"))?;
+        } else {
+            s.barrier_between(
+                &[&gpu_hidden_all],
+                &[&norm_out_batched],
             );
             mlx_native::ops::copy::dispatch_copy_f32(
                 s.encoder_mut(),
                 reg,
                 metal_dev,
-                &hidden_view,
-                &self.activations.hidden,
+                &gpu_hidden_all,
+                &norm_out_batched,
                 0,
                 0,
-                hs,
+                n * hs,
             )
-            .map_err(|e| anyhow::anyhow!("batched arg copy L{pos}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("batched arg pre-norm copy: {e}"))?;
+        }
 
-            if apply_final_norm {
-                s.barrier_between(
-                    &[&self.activations.hidden, &self.final_norm],
-                    &[&self.activations.norm_out],
-                );
-                s.rms_norm(
-                    reg,
-                    metal_dev,
-                    &self.activations.hidden,
-                    &self.final_norm,
-                    &self.activations.norm_out,
-                    &self.activations.norm_params,
-                    1,
-                    hs as u32,
-                )
-                .map_err(|e| anyhow::anyhow!("batched arg norm L{pos}: {e}"))?;
-            } else {
-                s.barrier_between(
-                    &[&self.activations.hidden],
-                    &[&self.activations.norm_out],
-                );
-                mlx_native::ops::copy::dispatch_copy_f32(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &self.activations.hidden,
-                    &self.activations.norm_out,
-                    0,
-                    0,
-                    hs,
-                )
-                .map_err(|e| anyhow::anyhow!("batched arg pre-norm copy L{pos}: {e}"))?;
-            }
+        // (b) ONE lm_head dispatch with m=n.  dispatch_qmatmul routes
+        //     m<=8 through mat-vec (multiple matvecs per dispatch) and
+        //     m>8 through mat-mat (simdgroup MMA, tile kernel).
+        if let Some(ref q6k) = self.lm_head_q6k {
+            s.barrier_between(
+                &[&norm_out_batched, &q6k.buffer],
+                &[&logits_batched],
+            );
+            super::forward_mlx::dispatch_qmatmul(
+                &mut s,
+                reg,
+                dev,
+                &norm_out_batched,
+                q6k,
+                &mut logits_batched,
+                n as u32,
+            )
+            .map_err(|e| anyhow::anyhow!("batched arg lm_head Q6_K: {e}"))?;
+        } else if let Some(ref q8) = self.lm_head_q8 {
+            s.barrier_between(
+                &[&norm_out_batched, &q8.buffer],
+                &[&logits_batched],
+            );
+            super::forward_mlx::dispatch_qmatmul(
+                &mut s,
+                reg,
+                dev,
+                &norm_out_batched,
+                q8,
+                &mut logits_batched,
+                n as u32,
+            )
+            .map_err(|e| anyhow::anyhow!("batched arg lm_head Q8: {e}"))?;
+        } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
+            s.barrier_between(
+                &[&norm_out_batched, lm_head_f16],
+                &[&logits_batched],
+            );
+            mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
+                s.encoder_mut(),
+                reg,
+                metal_dev,
+                &norm_out_batched,
+                lm_head_f16,
+                &logits_batched,
+                &mlx_native::ops::dense_gemm::DenseGemmF16Params {
+                    m: n as u32,
+                    n: vocab_size as u32,
+                    k: hs as u32,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("batched arg lm_head F16: {e}"))?;
+        } else {
+            anyhow::bail!(
+                "per_position_argmax_batched requires lm_head_q6k / q8 / f16"
+            );
+        }
 
-            // lm_head: prefer Q6_K, then Q8, then F16 (matches single-pos path).
-            if let Some(ref q6k) = self.lm_head_q6k {
-                s.barrier_between(
-                    &[&self.activations.norm_out, &q6k.buffer],
-                    &[&self.activations.logits],
-                );
-                super::forward_mlx::dispatch_qmatmul(
-                    &mut s,
-                    reg,
-                    dev,
-                    &self.activations.norm_out,
-                    q6k,
-                    &mut self.activations.logits,
-                    1,
-                )
-                .map_err(|e| anyhow::anyhow!("batched arg lm_head Q6_K L{pos}: {e}"))?;
-            } else if let Some(ref q8) = self.lm_head_q8 {
-                s.barrier_between(
-                    &[&self.activations.norm_out, &q8.buffer],
-                    &[&self.activations.logits],
-                );
-                super::forward_mlx::dispatch_qmatmul(
-                    &mut s,
-                    reg,
-                    dev,
-                    &self.activations.norm_out,
-                    q8,
-                    &mut self.activations.logits,
-                    1,
-                )
-                .map_err(|e| anyhow::anyhow!("batched arg lm_head Q8 L{pos}: {e}"))?;
-            } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
-                s.barrier_between(
-                    &[&self.activations.norm_out, lm_head_f16],
-                    &[&self.activations.logits],
-                );
-                mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &self.activations.norm_out,
-                    lm_head_f16,
-                    &self.activations.logits,
-                    &mlx_native::ops::dense_gemm::DenseGemmF16Params {
-                        m: 1,
-                        n: vocab_size as u32,
-                        k: hs as u32,
-                    },
-                )
-                .map_err(|e| anyhow::anyhow!("batched arg lm_head F16 L{pos}: {e}"))?;
-            } else {
-                anyhow::bail!(
-                    "per_position_argmax_batched requires lm_head_q6k / q8 / f16"
-                );
-            }
+        // (c) ONE softcap on the full n*vocab logits (element-wise).
+        //     dispatch_softcap is element-wise so it works on any size.
+        if let Some(cap) = self.final_logit_softcapping {
+            s.barrier_between(
+                &[&logits_batched],
+                &[&logits_batched],
+            );
+            mlx_native::ops::softcap::dispatch_softcap(
+                s.encoder_mut(),
+                reg,
+                metal_dev,
+                &logits_batched,
+                &logits_batched,
+                &self.activations.softcap_params,
+                cap,
+            )
+            .map_err(|e| anyhow::anyhow!("batched arg softcap: {e}"))?;
+        }
 
-            if let Some(cap) = self.final_logit_softcapping {
-                s.barrier_between(
-                    &[&self.activations.logits],
-                    &[&self.activations.logits],
-                );
-                mlx_native::ops::softcap::dispatch_softcap(
-                    s.encoder_mut(),
-                    reg,
-                    metal_dev,
-                    &self.activations.logits,
-                    &self.activations.logits,
-                    &self.activations.softcap_params,
-                    cap,
-                )
-                .map_err(|e| anyhow::anyhow!("batched arg softcap L{pos}: {e}"))?;
-            }
-
-            // Per-position output views into the seq_len-sized output buffers.
+        // (d) Per-row argmax (the kernel itself isn't batchable; this
+        //     stage is cheap compared to lm_head).  We dispatch within
+        //     the same session — n small dispatches, one finish().
+        for pos in 0..n {
+            let logits_row = logits_batched
+                .slice_view((pos * (vocab_size as usize) * 4) as u64, vocab_size as usize);
             let argmax_idx_view = argmax_index_all.slice_view((pos * 4) as u64, 1);
             let argmax_val_view = argmax_value_all.slice_view((pos * 4) as u64, 1);
             s.barrier_between(
-                &[&self.activations.logits],
+                &[&logits_batched],
                 &[&argmax_idx_view, &argmax_val_view],
             );
             mlx_native::ops::argmax::dispatch_argmax_f32(
                 s.encoder_mut(),
                 reg,
                 metal_dev,
-                &self.activations.logits,
+                &logits_row,
                 &argmax_idx_view,
                 &argmax_val_view,
                 &self.activations.argmax_params,

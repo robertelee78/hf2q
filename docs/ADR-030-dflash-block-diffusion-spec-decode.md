@@ -1247,3 +1247,64 @@ Cumulative iter-68 → iter-71 progression at N=16:
 - Remaining: ~11× to ≥1.07× mission gate → requires Option A
   (cross-length SDPA) to attack the dominant verify_prefill stage
   (78 ms = 72% of remaining wall-clock per round).
+
+### iter-72 (2026-05-14) — Truly batched per_position_argmax stages
+
+Refactored `per_position_argmax_from_hidden_batched_impl` from
+sequential loop on shared scratch (one row at a time) to TRULY
+batched processing:
+
+- ONE rms_norm with rows=n (instead of n sequential rms_norms)
+- ONE dispatch_qmatmul / dense_matvec_f16w_f32io with m=n (instead of
+  n m=1 matvec calls; n=block_size=8 hits the mat-vec path with
+  multiple matvecs in a single dispatch)
+- ONE softcap on the full [n, vocab] logits (element-wise, naturally
+  scales)
+- n separate argmax dispatches (argmax kernel is per-row; cheap)
+
+All within one command buffer, finished once at end.
+
+Scratch allocated per call: norm_out_batched [n, hs] + logits_batched
+[n, vocab].  For n=8, vocab=262144: ~8.4 MB.  Allocation cost
+amortized over the round.
+
+**Per-stage delta** at N=16:
+```
+                  iter-71  iter-72   delta
+drafter_argmax     8.83  →  6.22    (-30%)
+target_argmax      9.71  →  7.10    (-27%)
+TOTAL            111.91  → 105.52   (-6%)
+```
+
+**Bench results** (2 trials, 20s cool-downs):
+
+| N | baseline t/s | spec t/s | vs iter-71 |
+|---|---|---|---|
+|  8 | 103.9 | 9.55 | +4.4% (9.15→9.55) |
+| 16 |  99.3 | 9.45 | +4.4% (9.05→9.45) |
+| 32 |  97.0 | 9.20 | +4.5% (8.80→9.20) |
+
+Mission gap: 11.1× → **10.5× slower**.
+
+Cumulative iter-68 → iter-72 at N=16:
+4.40 → 9.45 t/s = **+115%** (2.15× spec-decode improvement) over the
+initial measured baseline.
+
+**Coherence preserved**: e2e gate at N=16 byte-identity ✓.
+
+**Code artifacts (iter-72)**:
+- `src/serve/forward_mlx.rs` —
+  `per_position_argmax_from_hidden_batched_impl` rewritten to truly
+  batched processing.  Allocates per-call scratch
+  `norm_out_batched [n, hs]` + `logits_batched [n, vocab]`.  Single
+  rms_norm, single lm_head matmul, single softcap, n argmaxes.
+- `docs/research/adr030_iter68_bench/results_iter72.tsv`.
+
+**Mission state at iter-72 end**:
+- Coherence: GREEN on untemplated N=16 ✓
+- Production wire-up: ✓ (HF2Q_SPEC_DFLASH=1)
+- Perf: 0.096× baseline (was 0.045× at iter-68 → **2.15×** spec-decode
+  improvement)
+- Remaining: ~10.5× to ≥1.07× mission gate.  Verify_prefill still
+  dominates (78 ms = 75% of remaining round wall-clock); requires
+  Option A (cross-length SDPA) — multi-day kernel/dispatch work.
