@@ -1585,3 +1585,63 @@ Hypotheses for the remaining coherence gap (iter-78+):
   vs what `_resume` dispatchers expect.  Use a unit test that
   compares the resume kernel output against a CPU-reference cross-
   length attention computation on small inputs.
+
+### iter-78 (2026-05-14) — Pre-SDPA hybrid_kv write (bug attribution)
+
+**Bug attribution**: iter-77's xlen SDPA read from `hybrid_kv` at slot
+capacity, but the standard K/V write to `hybrid_kv` at
+`forward_prefill_batched.rs:1572+` runs AFTER the SDPA dispatch in the
+layer ordering.  Result: xlen SDPA was reading STALE K/V at this
+round's positions `[start_pos..start_pos+seq_len)`.
+
+**Fix**: hoisted the F32→F16 K/V write to BEFORE the SDPA dispatch in
+the xlen branch.  Per layer in verify mode:
+
+1. `dispatch_kv_cache_copy_seq_f32_to_f16(pf_k_normed, hybrid_kv.k,
+   ..., start_pos, seq_len, ...)`
+2. Same for V (validates `v_packed.dtype() == F16` per
+   `HF2Q_FULL_F16_KV=1` requirement)
+3. Then the existing Q cast + resume SDPA + output cast.
+
+The post-SDPA copy at line 1572+ still runs and writes the SAME data
+idempotently (wasteful but correct).
+
+**Flag-ON output trajectory**:
+```
+iter-76 (orchestrator only):  [236743, 236825, 236825, 236825 ... × 15]  (single token repeated)
+iter-77 (SDPA swap):          [236743, 0, 522, 0, 236743, 236778, 236743, 0, 0, ...]
+                              (4 baseline tokens match in correct order)
+iter-78 (pre-SDPA write):     [236743, 0, 134722, 0, 236778, 236862, 236778, 0, 0,
+                               236743, 0, 236743, 236778, 236862, 0, 236743]
+                              (6+ baseline tokens match at spec[4..7] and other positions)
+```
+
+The pre-SDPA write is the right insight (more baseline tokens now
+appear in correct order) but there's still a remaining bug
+producing zeros at alternating positions.
+
+**Hypotheses for residual gap**:
+- BF16→F16 precision loss in Q cast (F16 narrower exponent range than
+  BF16; Gemma's Q is pre-scaled, may be sensitive to F16 underflow).
+- Multi-round target rollback / hybrid_kv state divergence.
+- Round-to-round persistent_captured slab indexing edge case in
+  `append_capture_positions`.
+
+**Flag-OFF regression**: GREEN at N=16 ✓ (the new pre-SDPA writes are
+dead-code-eliminated when xlen_sdpa_mode = false).
+
+**Code artifacts (iter-78)**:
+- `src/serve/forward_prefill_batched.rs` — added pre-SDPA F32→F16
+  K/V copies to hybrid_kv at start_pos+ range in xlen branches
+  (sliding D=256 + full-attn D=512).  ~50 LOC each branch.
+
+**Mission state at iter-78 end**:
+- Coherence (flag OFF, Option C): GREEN ✓
+- Coherence (flag ON, Option A): RED but each iter narrows the gap —
+  multiple baseline tokens now appear in correct relative positions.
+  Specific algorithmic flaw remaining (alternating zeros).
+- Production wire-up: ✓ (Option C default, Option A opt-in for debug)
+- iter-79+ debug: write a unit-level test that exercises
+  `dispatch_flash_attn_prefill_f16_d256_resume` directly with crafted
+  Q/K/V via hf2q's hybrid_kv layout pattern to isolate kernel-call
+  correctness from orchestrator-level state.

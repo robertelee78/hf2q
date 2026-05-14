@@ -1320,6 +1320,46 @@ impl MlxModelWeights {
                 };
                 if is_sliding {
                     if xlen_sdpa_mode {
+                        // ADR-030 iter-78 — pre-SDPA hybrid_kv write.
+                        // The standard K/V copy to hybrid_kv (line 1572+) happens
+                        // AFTER SDPA, but xlen SDPA needs hybrid_kv to be
+                        // populated at THIS round's positions
+                        // [start_pos..start_pos+seq_len) BEFORE reading.  Hoist
+                        // the F32→F16 K/V writes here.  The post-SDPA copy at
+                        // line 1572+ still runs and writes the SAME data
+                        // (idempotent), wasteful but correct.
+                        let hybrid_kv_vec = self.hybrid_kv.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("xlen SDPA L{layer_idx}: hybrid_kv not allocated — HF2Q_FULL_F16_KV=1 required"))?;
+                        let layer_kv = &hybrid_kv_vec[layer_idx];
+                        let xlen_dst_start = start_pos as u32;
+                        let xlen_n_copy = seq_len as u32;
+                        let xlen_src_off: u32 = 0;
+                        let xlen_hb_cap = layer_kv.capacity as u32;
+                        s.barrier_between(&[&pf_k_normed], &[&layer_kv.k]);
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                            s.encoder_mut(), reg, metal_dev,
+                            &pf_k_normed,
+                            &layer_kv.k,
+                            nkv as u32, hd as u32,
+                            xlen_hb_cap, xlen_dst_start, xlen_n_copy, xlen_src_off,
+                        ).map_err(|e| anyhow::anyhow!("xlen pre-SDPA K copy L{layer_idx}: {e}"))?;
+                        // V is F16 when HF2Q_FULL_F16_KV=1 (validated above).
+                        if layer_kv.v_packed.dtype() == mlx_native::DType::F16 {
+                            s.barrier_between(&[&pf_v_normed], &[&layer_kv.v_packed]);
+                            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                                s.encoder_mut(), reg, metal_dev,
+                                &pf_v_normed,
+                                &layer_kv.v_packed,
+                                nkv as u32, hd as u32,
+                                xlen_hb_cap, xlen_dst_start, xlen_n_copy, xlen_src_off,
+                            ).map_err(|e| anyhow::anyhow!("xlen pre-SDPA V copy L{layer_idx}: {e}"))?;
+                        } else {
+                            anyhow::bail!(
+                                "xlen SDPA L{layer_idx}: V is not F16 (got {:?}); HF2Q_FULL_F16_KV=1 required",
+                                layer_kv.v_packed.dtype()
+                            );
+                        }
+
                         // ADR-030 iter-77 — cross-length SDPA verify path.
                         // Cast pf_q_perm BF16 → F32 → F16, call
                         // dispatch_flash_attn_prefill_f16_d256_resume with
@@ -1329,9 +1369,6 @@ impl MlxModelWeights {
                         let q_f16 = pf_q_f16_xlen.as_ref().expect("xlen Q f16 buf");
                         let out_f16 = pf_out_f16_xlen.as_ref().expect("xlen out f16 buf");
                         let out_f32 = pf_out_f32_xlen.as_ref().expect("xlen out f32 buf");
-                        let hybrid_kv_vec = self.hybrid_kv.as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("xlen SDPA L{layer_idx}: hybrid_kv not allocated — HF2Q_FULL_F16_KV=1 required"))?;
-                        let layer_kv = &hybrid_kv_vec[layer_idx];
                         let q_n_elems = nh * seq_len * hd;
                         s.barrier_between(&[&pf_q_perm], &[q_f32]);
                         mlx_native::ops::elementwise::cast(
@@ -1440,14 +1477,43 @@ impl MlxModelWeights {
                     // for the per-line trace, the math, and the per-test
                     // tolerance numbers.
                     if xlen_sdpa_mode {
+                        // ADR-030 iter-78 — pre-SDPA hybrid_kv write (D=512).
+                        let hybrid_kv_vec = self.hybrid_kv.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("xlen SDPA L{layer_idx}: hybrid_kv not allocated — HF2Q_FULL_F16_KV=1 required"))?;
+                        let layer_kv = &hybrid_kv_vec[layer_idx];
+                        let xlen_dst_start = start_pos as u32;
+                        let xlen_n_copy = seq_len as u32;
+                        let xlen_src_off: u32 = 0;
+                        let xlen_hb_cap = layer_kv.capacity as u32;
+                        s.barrier_between(&[&pf_k_normed], &[&layer_kv.k]);
+                        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                            s.encoder_mut(), reg, metal_dev,
+                            &pf_k_normed,
+                            &layer_kv.k,
+                            nkv as u32, hd as u32,
+                            xlen_hb_cap, xlen_dst_start, xlen_n_copy, xlen_src_off,
+                        ).map_err(|e| anyhow::anyhow!("xlen pre-SDPA K copy L{layer_idx}: {e}"))?;
+                        if layer_kv.v_packed.dtype() == mlx_native::DType::F16 {
+                            s.barrier_between(&[&pf_v_normed], &[&layer_kv.v_packed]);
+                            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                                s.encoder_mut(), reg, metal_dev,
+                                &pf_v_normed,
+                                &layer_kv.v_packed,
+                                nkv as u32, hd as u32,
+                                xlen_hb_cap, xlen_dst_start, xlen_n_copy, xlen_src_off,
+                            ).map_err(|e| anyhow::anyhow!("xlen pre-SDPA V copy L{layer_idx}: {e}"))?;
+                        } else {
+                            anyhow::bail!(
+                                "xlen SDPA L{layer_idx}: V is not F16 (got {:?}); HF2Q_FULL_F16_KV=1 required",
+                                layer_kv.v_packed.dtype()
+                            );
+                        }
+
                         // ADR-030 iter-77 — D=512 cross-length verify path.
                         let q_f32 = pf_q_f32_xlen.as_ref().expect("xlen Q f32 buf");
                         let q_f16 = pf_q_f16_xlen.as_ref().expect("xlen Q f16 buf");
                         let out_f16 = pf_out_f16_xlen.as_ref().expect("xlen out f16 buf");
                         let out_f32 = pf_out_f32_xlen.as_ref().expect("xlen out f32 buf");
-                        let hybrid_kv_vec = self.hybrid_kv.as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("xlen SDPA L{layer_idx}: hybrid_kv not allocated — HF2Q_FULL_F16_KV=1 required"))?;
-                        let layer_kv = &hybrid_kv_vec[layer_idx];
                         let q_n_elems = nh * seq_len * hd;
                         s.barrier_between(&[&pf_q_perm], &[q_f32]);
                         mlx_native::ops::elementwise::cast(
