@@ -2192,6 +2192,39 @@ impl MlxModelWeights {
                 }
             }
 
+            // ADR-030 Phase 4 — DFlash hidden state capture hook.
+            // When installed, captures pf_hidden (= this layer's output)
+            // for layer indices matching dflash_capture.target_layer_ids.
+            // Default-None preserves byte-identical legacy behavior.
+            if self.dflash_capture.is_some() {
+                let layer_idx_for_capture = layer_idx;
+                let pf_data_opt: Option<Vec<f32>> = {
+                    // Borrow pf_hidden read-only; copy out the slab so we
+                    // don't hold a borrow into `self` when we then borrow
+                    // self.dflash_capture mutably.
+                    let pf_data: &[f32] = pf_hidden.as_slice()
+                        .map_err(|e| anyhow::anyhow!("dflash capture pf_hidden L{layer_idx}: {e}"))?;
+                    let needed = seq_len * hs;
+                    if pf_data.len() >= needed {
+                        Some(pf_data[..needed].to_vec())
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "dflash capture L{layer_idx}: pf_hidden len {} < seq_len*hs ({})",
+                            pf_data.len(), needed
+                        ));
+                    }
+                };
+                if let Some(slab) = pf_data_opt {
+                    let cap = self.dflash_capture.as_mut().unwrap();
+                    if let Some(capture_idx) = cap.capture_index_for(layer_idx_for_capture) {
+                        cap.write_layer_slab(capture_idx, &slab)
+                            .map_err(|e| anyhow::anyhow!(
+                                "dflash capture write_layer_slab L{layer_idx}: {e}"
+                            ))?;
+                    }
+                }
+            }
+
             // Metal-1 — stop capture once the target layer window closes
             // (before the final-norm + lm_head, so the .gputrace is
             // bounded to the per-layer scheduling we asked to inspect).

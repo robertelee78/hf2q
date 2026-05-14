@@ -1032,6 +1032,16 @@ pub struct MlxModelWeights {
     /// `reset_decode_step_dump_counter` for the rare caller that wants to
     /// reset without touching regime / replay state.
     pub decode_step_dump_counter: usize,
+
+    /// ADR-030 Phase 4 — optional DFlash spec-decode hidden-state
+    /// capture session. When `Some`, `forward_prefill_batched`
+    /// populates `dflash_capture.hidden_output` at indices matching
+    /// `dflash_capture.target_layer_ids` during the layer loop.
+    /// Default `None` preserves byte-identical legacy behavior — no
+    /// production-path caller installs this; only the spec-decode
+    /// orchestrator's `install_dflash_capture`/`take_dflash_capture`
+    /// pair touches it.
+    pub dflash_capture: Option<crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession>,
 }
 
 /// Per-layer byte-packed higher-bit (5/6-bit) KV buffers (iter-21 Track B).
@@ -2031,6 +2041,10 @@ impl MlxModelWeights {
             // the old process-static AtomicUsize so the SDPA dump gate's
             // [0, max_pos) window resets at the start of each Gate H pass.
             decode_step_dump_counter: 0,
+            // ADR-030 Phase 4 — capture session NOT installed by default.
+            // Spec-decode orchestrator installs via install_dflash_capture()
+            // before calling forward_prefill_batched.
+            dflash_capture: None,
         });
 
         // Pre-initialize constant param buffers so we never write them
