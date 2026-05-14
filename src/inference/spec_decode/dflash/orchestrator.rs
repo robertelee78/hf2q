@@ -532,8 +532,23 @@ pub fn dispatch_dflash_generate(
         false,
     );
     target.install_dflash_capture(session);
+    // Size full-attention KV cache via max_decode_tokens.  The
+    // worst-case write extent across all verify rounds is at the LAST
+    // round: seq_pos = prompt_len + max_new_tokens - 1 (writes through
+    // seq_pos + block_size - 1).  So we need
+    // `linear_capacity ≥ prompt_len + max_new_tokens + block_size - 1`
+    // = prompt_len + (max_new_tokens + block_size - 1).
+    //
+    // `linear_capacity` is computed by forward_prefill_batched as
+    // `seq_len + max_decode_tokens`, so passing
+    // `max_decode_tokens = max_new_tokens + block_size - 1` gives the
+    // right size.  Without this the verify rounds would overflow the
+    // dense cache at full-attention layers (iter-63 root-cause: the
+    // `kv_capacity (P) < kv_seq_len (P+1)` assertion that the coherence
+    // gate originally surfaced).
+    let max_decode_for_alloc = max_new_tokens + block_size as usize - 1;
     let first_token = target
-        .forward_prefill_batched(prompt_tokens, 0, 0, gpu)
+        .forward_prefill_batched(prompt_tokens, max_decode_for_alloc, 0, gpu)
         .map_err(|e| anyhow::anyhow!("generate: initial prompt forward: {e}"))?;
     let mut captured = target
         .take_dflash_capture()
@@ -871,18 +886,24 @@ mod tests {
         }
     }
 
-    /// End-to-end GPU integration test (ADR-030 iter-63).
+    /// End-to-end GPU coherence gate (ADR-030 iter-64).
     ///
     /// Loads the real target gemma-4-26b-a4b-it Q5_K_M GGUF + the
-    /// z-lab DFlash drafter safetensors, runs
-    /// [`dispatch_dflash_generate`] for a short prompt, and asserts the
-    /// pipeline produces a non-empty token sequence without panic.
+    /// z-lab DFlash drafter safetensors, runs a **single-token decode
+    /// baseline** for N tokens (forward_prefill_batched + N-1
+    /// forward_decode calls), fully resets the target's KV state via
+    /// [`MlxModelWeights::rollback_kv`], then runs
+    /// [`dispatch_dflash_generate`] for the same N tokens.
     ///
-    /// **Not a coherence gate.** Coherence (byte-identity vs single-token
-    /// decode at temp=0) is a separate test that requires comparison
-    /// against the existing per-token decode path; this test only
-    /// validates that the spec-decode pipeline runs end-to-end without
-    /// crashing and produces some output.
+    /// **The coherence assertion**: spec-decode output[prompt_len..]
+    /// must be byte-identical to the baseline at temp=0. This is the
+    /// fundamental greedy-spec-decode correctness guarantee — any
+    /// divergence is a bug.
+    ///
+    /// If this test fails: investigate by per-token diff between
+    /// baseline_new and spec_new. The first divergence position
+    /// localizes the issue (typically: K/V write position offset,
+    /// hidden capture layer mismatch, or accept-prefix math).
     ///
     /// Memory: loads ~20 GB target GGUF + ~820 MB drafter. Skipped by
     /// default (`#[ignore]`). Run with:
@@ -975,21 +996,18 @@ mod tests {
                 .expect("drafter cache alloc")
         };
 
-        // ---- Tokenize prompt with Gemma chat template ----
+        // ---- Tokenize prompt (plain — see note below) ----
         //
-        // Plain `"Q: What is 2+2?\nA:"` is out-of-distribution for
-        // gemma-4-it (chat-tuned) and yields incoherent argmaxes even
-        // under single-token decode (verified against cmd_generate on
-        // the same target; templated prompt produces "4", untemplated
-        // produces multilingual gibberish).
-        //
-        // For the coherence-validation gate we want a prompt the model
-        // is trained on. The Gemma chat template format is:
-        //   `<start_of_turn>user\n<USER>\n<end_of_turn>\n<start_of_turn>model\n`
-        // (tokenizer adds BOS automatically when configured).
+        // We deliberately use a PLAIN (non-chat-templated) prompt for the
+        // coherence gate.  Reason: the coherence assertion is
+        // `spec_output == baseline_output` at temp=0 — it does NOT
+        // require the model to be in-distribution, only that the
+        // spec-decode path produces the same argmax sequence as the
+        // single-token decode path.  Whether the model is confused by
+        // the prompt is orthogonal.
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .expect("load tokenizer.json");
-        let prompt_text = "<start_of_turn>user\nWhat is 2+2?\n<end_of_turn>\n<start_of_turn>model\n";
+        let prompt_text = "Q: What is 2+2?\nA:";
         let encoding = tokenizer.encode(prompt_text, false).expect("encode");
         let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
         assert!(!prompt_tokens.is_empty(), "prompt encoding empty");
@@ -998,15 +1016,69 @@ mod tests {
             prompt_tokens.len()
         );
 
-        // Gemma-4 end-of-turn id (per tokenizer + Gemma chat conventions).
-        // We also pass plain EOS=1 just in case.  Either one stops gen.
-        let eos_token_ids: Vec<u32> = vec![1, 106];
-
-        // ---- Run dispatch_dflash_generate ----
-        let max_new_tokens = 16usize;
+        let prompt_len = prompt_tokens.len();
+        let max_new_tokens = 8usize; // N total new tokens to compare
         let block_size = 8u32; // K=7, Phase 1.5 optimal on M5 Max
-        let t_gen = std::time::Instant::now();
-        let output_tokens = match dispatch_dflash_generate(
+
+        // -----------------------------------------------------------------
+        // STEP 1 — BASELINE: single-token decode (forward_prefill_batched
+        // + N-1 forward_decode calls).  This is the ground-truth greedy
+        // argmax sequence the spec-decode path must reproduce.
+        // -----------------------------------------------------------------
+        eprintln!("[e2e] BASELINE: single-token decode for N={max_new_tokens} tokens");
+        let t_baseline = std::time::Instant::now();
+        // Size full-attention KV cache to `prompt_len + max_new_tokens`
+        // by passing max_decode_tokens=max_new_tokens (see linear_capacity
+        // calculation at forward_prefill_batched.rs:295).  Otherwise
+        // forward_decode at position prompt_len + i fails the capacity
+        // check.
+        let first_token_baseline = target
+            .forward_prefill_batched(&prompt_tokens, max_new_tokens, 0, &mut gpu)
+            .expect("baseline initial prefill");
+        let mut baseline_new: Vec<u32> = vec![first_token_baseline];
+        let mut last_tok = first_token_baseline;
+        // We emit `max_new_tokens` new tokens total: first_token_baseline
+        // + (max_new_tokens - 1) forward_decode calls.  Each
+        // forward_decode writes KV at the supplied seq_pos and returns
+        // the next argmax.
+        for step in 0..(max_new_tokens - 1) {
+            let seq_pos = prompt_len + step;
+            let mut prof: Option<crate::serve::forward_mlx::TokenProfile> = None;
+            let next = target
+                .forward_decode(last_tok, seq_pos, &mut gpu, &mut prof)
+                .expect("baseline forward_decode");
+            baseline_new.push(next);
+            last_tok = next;
+        }
+        let baseline_elapsed = t_baseline.elapsed();
+        eprintln!(
+            "[e2e] BASELINE done: {:.2}s, tokens={baseline_new:?}",
+            baseline_elapsed.as_secs_f64(),
+        );
+
+        // -----------------------------------------------------------------
+        // STEP 2 — RESET target's KV cache fully back to seq_len=0.
+        //
+        // After baseline: kv_caches[].seq_len = prompt_len + (N-1).  Each
+        // forward_decode wrote 1 position; the final argmax (last_tok =
+        // baseline_new[N-1]) was the RETURNED prediction and is NOT yet
+        // in the cache.  So we need to roll back by `prompt_len + N - 1`
+        // to fully reset.  rollback_kv handles sliding and full-attn
+        // layers per the verifier::rollback_kv_state tests.
+        let rollback_count = prompt_len + max_new_tokens - 1;
+        target.rollback_kv(rollback_count);
+        eprintln!("[e2e] target.rollback_kv({rollback_count}) → seq_len=0");
+
+        // -----------------------------------------------------------------
+        // STEP 3 — SPEC: dispatch_dflash_generate on the same prompt for
+        // the same N new tokens.  Uses the SAME target instance (now
+        // logically reset).  hybrid_kv storage at positions [0..N) still
+        // has baseline data but that's invisible — forward kernels only
+        // read positions [0..seq_len) and writes overwrite at start_pos.
+        // -----------------------------------------------------------------
+        let eos_token_ids: Vec<u32> = vec![1, 106];
+        let t_spec = std::time::Instant::now();
+        let spec_output = match dispatch_dflash_generate(
             &mut target,
             &drafter_tensors,
             &mut drafter_cache,
@@ -1019,8 +1091,6 @@ mod tests {
         ) {
             Ok(toks) => toks,
             Err(e) => {
-                // Print the full anyhow context chain — default `{}`
-                // shows only the outermost wrap which loses the root.
                 eprintln!("[e2e] dispatch_dflash_generate FAILED chain:");
                 for (i, cause) in e.chain().enumerate() {
                     eprintln!("[e2e]   #{i}: {cause}");
@@ -1028,35 +1098,66 @@ mod tests {
                 panic!("dispatch_dflash_generate end-to-end (see chain above)");
             }
         };
-        let gen_elapsed = t_gen.elapsed();
+        let spec_elapsed = t_spec.elapsed();
         eprintln!(
-            "[e2e] dispatch_dflash_generate elapsed={:.2}s output.len()={} (prompt={}, new<={})",
-            gen_elapsed.as_secs_f64(),
-            output_tokens.len(),
-            prompt_tokens.len(),
-            max_new_tokens,
+            "[e2e] SPEC done: {:.2}s, output.len()={} (prompt={prompt_len}, new<={max_new_tokens})",
+            spec_elapsed.as_secs_f64(),
+            spec_output.len(),
         );
 
-        // Pipeline-runs assertions (NOT coherence — that's a later gate).
+        // Pipeline-runs assertions.
         assert!(
-            output_tokens.len() > prompt_tokens.len(),
-            "dispatch_dflash_generate must emit at least 1 new token; got prompt_len={} output_len={}",
-            prompt_tokens.len(),
-            output_tokens.len(),
+            spec_output.len() > prompt_len,
+            "spec output must emit ≥ 1 new token; got len={}",
+            spec_output.len()
         );
-        let new_tokens = &output_tokens[prompt_tokens.len()..];
+        let spec_new = &spec_output[prompt_len..];
         assert!(
-            new_tokens.len() <= max_new_tokens,
-            "dispatch_dflash_generate must not exceed max_new_tokens={}; got {}",
-            max_new_tokens,
-            new_tokens.len(),
+            spec_new.len() <= max_new_tokens,
+            "spec must not exceed max_new_tokens={max_new_tokens}; got {}",
+            spec_new.len()
         );
 
-        // Decode for visual inspection (does NOT participate in assertions).
+        // Diff print for debugging (before assertion so failures are
+        // diagnosable from the test output).
+        let n_compare = baseline_new.len().min(spec_new.len());
+        eprintln!("[e2e] baseline_new = {baseline_new:?}");
+        eprintln!("[e2e] spec_new     = {spec_new:?}");
+        for i in 0..n_compare {
+            let mark = if baseline_new[i] == spec_new[i] { "✓" } else { "✗" };
+            eprintln!(
+                "[e2e]   pos {i}: baseline={} spec={} {mark}",
+                baseline_new[i], spec_new[i]
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // COHERENCE GATE: spec must produce byte-identical output to
+        // baseline at temp=0.  This is the greedy-spec-decode
+        // correctness invariant: accept_prefix_argmax only accepts a
+        // draft when it matches target's argmax, so committed tokens
+        // are always identical to single-token decode.
+        // -----------------------------------------------------------------
+        assert_eq!(
+            spec_new.len(),
+            baseline_new.len(),
+            "spec emitted {} tokens, baseline emitted {} — length mismatch",
+            spec_new.len(),
+            baseline_new.len(),
+        );
+        for (i, (b, s)) in baseline_new.iter().zip(spec_new.iter()).enumerate() {
+            assert_eq!(
+                b, s,
+                "coherence gate FAILED at new-token position {i}: baseline={b} spec={s} \
+                 (first {i} tokens matched). Investigate orchestrator at this round.",
+            );
+        }
+
+        // Decode for visual inspection (only runs if assertions pass).
         let decoded = tokenizer
-            .decode(new_tokens, /*skip_special=*/ false)
+            .decode(spec_new, /*skip_special=*/ false)
             .unwrap_or_else(|e| format!("<decode failed: {e}>"));
-        eprintln!("[e2e] new_tokens={new_tokens:?}");
-        eprintln!("[e2e] decoded={decoded:?}");
+        eprintln!("[e2e] COHERENCE PASS: spec_new == baseline_new for all {n_compare} tokens");
+        eprintln!("[e2e] decoded = {decoded:?}");
     }
 }

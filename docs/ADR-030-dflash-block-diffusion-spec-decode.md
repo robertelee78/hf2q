@@ -748,3 +748,92 @@ diagnostic).
 - `src/inference/spec_decode/dflash/orchestrator.rs` —
   `e2e_dispatch_dflash_generate_gemma4_26b` test + anyhow chain
   preservation via `.context()` instead of `.map_err(anyhow!("…{e}"))`
+
+### iter-64 (2026-05-14) — Coherence gate authored; surfaces architectural SDPA limitation
+
+**Mission state at start**: iter-63 e2e test passes pipeline-runs
+assertions but produces multilingual gibberish. Hypothesis: orchestrator
+correct, prompt template wrong.
+
+**What ran**: Upgraded the e2e test into a real coherence gate.
+Single-token-decode baseline runs `forward_prefill_batched(prompt)` +
+N-1 `forward_decode` calls to produce ground-truth tokens. Target is
+then fully rolled back via `rollback_kv(prompt_len + N - 1)`.
+Then `dispatch_dflash_generate(prompt, N)` runs and the test asserts
+byte-identity on the new tokens.
+
+**Test verdict**: FAILS at new-token position 1. Position 0 matches
+(both paths use forward_prefill_batched for initial prefill; first_token
+agrees). Position 1+ diverges across every round (8/8 mismatch).
+**Hypothesis falsified**: orchestrator is not coherent, even after
+iter-63 fixes.
+
+**Bug 3 — FIXED**: K/V destination offset ignored `start_pos`.
+- Symptom in iter-64: `linear_capacity=8 < write target 20` at L5
+  full-attention layer; capacity check fired AFTER the iter-63 lazy-alloc
+  was correctly preserving hybrid_kv.
+- Root cause: `forward_prefill_batched.rs:1531` computed
+  `dst_seq_pos_start = src_tok_offset` (CHUNK-INTERNAL offset, always
+  0 for single-chunk prefill). The kv_cache_copy / kv_quantize
+  dispatchers wrote at position 0 even when `start_pos > 0`. iter-137
+  (Path A Phase 2) had threaded `start_pos` through `pf_positions[i]`
+  (RoPE) and `write_pos` (cache cursor) — but never into the K/V copy
+  destination.
+- Fix (this iter): `dst_seq_pos_start = (start_pos as u32) +
+  src_tok_offset`, with the capacity check also updated to
+  `(start_pos + seq_len) > layer_cap`. Bit-identical for production
+  callers (all pass `start_pos=0`).
+
+**Bug 4 — FIXED**: orchestrator under-sized cache via `max_decode_tokens=0`.
+- Symptom: dense KV capacity from initial prefill = `prompt_len + 0`,
+  but worst-case write extent across verify rounds is `prompt_len +
+  max_new_tokens + block_size - 1`.
+- Fix: orchestrator passes `max_decode_tokens = max_new_tokens +
+  block_size - 1` to the initial `forward_prefill_batched`.
+
+**Bug 5 — DISCOVERED, NOT YET FIXED (architectural)**: batched
+prefill's SDPA is self-attention over current chunk only.
+- After Bugs 3 + 4 are fixed, coherence gate still fails at the same
+  position 1.
+- Inspection of `forward_prefill_batched.rs:1310-1327` /
+  `forward_prefill_batched.rs:1329-…`: both the D=256 (sliding) and
+  D=512 (full) flash_attn_prefill dispatches set
+  `seq_len_q = seq_len_k = seq_len` — the kernel computes attention
+  ONLY over the current chunk's seq_len tokens with a causal/sliding
+  mask. **Prior cache content is invisible to the SDPA**, regardless
+  of write_pos / hybrid_kv contents.
+- Implication: the `forward_decode_verify_batched` API at
+  `forward_prefill_batched.rs:2698` (introduced iter-47) is broken at
+  any non-zero `start_seq_pos` — the K/V writes go to the right place
+  now after Bug 3, but the SDPA still attends only to the current K+1
+  verify tokens, ignoring the prompt + accepted tokens.
+- This is a fundamental architecture choice in the existing prefill
+  path. Spec-decode requires cross-length attention (seq_len_k >>
+  seq_len_q at non-zero start_pos), which the existing
+  `flash_attn_prefill` kernels don't support.
+
+**Options for iter-65 to make coherence gate pass**:
+- **A. Cross-length SDPA in batched prefill**: extend
+  `flash_attn_prefill_*` kernels (and dispatch layer) to take
+  separate Q/K lengths + read from prior hybrid_kv. Most performance-
+  preserving; multi-day Metal kernel work.
+- **B. Add capture support to forward_decode + use
+  forward_decode_verify_serial**: forward_decode already extends KV
+  correctly. Add the layer-loop capture hook to forward_decode (~50
+  LOC) and switch orchestrator's verify call. Loses batched verify
+  speedup but proves coherence; ~1 iter scope.
+- **C. Re-prefill full prefix each round (option C)**: every verify
+  round re-prefills `[prompt + accepted + last_token + drafts]` from
+  `start_pos=0`. SDPA self-attention works (it sees the whole
+  prefix). Drafter cache also reset each round. O(N²) cost. Largest
+  orchestrator rewrite; ~1 iter scope.
+
+**Code artifacts (iter-64)**:
+- `src/inference/spec_decode/dflash/orchestrator.rs` — coherence gate
+  upgraded to do baseline (forward_prefill + N-1 forward_decode) vs
+  spec-decode byte-identity comparison. Currently RED (fails at pos 1).
+- `src/serve/forward_prefill_batched.rs` —
+  `dst_seq_pos_start = (start_pos as u32) + src_tok_offset` fix +
+  capacity check accounts for `start_pos`.
+- `src/inference/spec_decode/dflash/orchestrator.rs` (dispatch_dflash_generate)
+  — `max_decode_tokens = max_new_tokens + block_size - 1` for cache sizing.

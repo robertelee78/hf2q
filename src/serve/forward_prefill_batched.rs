@@ -1520,15 +1520,26 @@ impl MlxModelWeights {
                 // source buffers.
                 // ------------------------------------------------------------
                 let layer_cap = dense_kvs_vec[layer_idx].capacity;
-                if !dense_kvs_vec[layer_idx].is_sliding && seq_len > layer_cap {
+                if !dense_kvs_vec[layer_idx].is_sliding && (start_pos + seq_len) > layer_cap {
                     anyhow::bail!(
-                        "batched prefill L{}: seq_len={} exceeds global dense cap={} — \
-                         increase linear_capacity allocation",
-                        layer_idx, seq_len, layer_cap);
+                        "batched prefill L{}: start_pos={} + seq_len={} = {} exceeds global dense cap={} — \
+                         increase linear_capacity allocation (max_decode_tokens param)",
+                        layer_idx, start_pos, seq_len, start_pos + seq_len, layer_cap);
                 }
                 let n_copy = seq_len.min(layer_cap);
                 let src_tok_offset = (seq_len - n_copy) as u32;
-                let dst_seq_pos_start = src_tok_offset;
+                // ADR-030 iter-64 (extend-mode write-position fix):
+                // include start_pos in the K/V cache destination offset.
+                // Before iter-64 `dst_seq_pos_start = src_tok_offset` which
+                // is the CHUNK-INTERNAL offset (0 for single-chunk
+                // prefill), causing all writes to go to position 0
+                // regardless of `start_pos`.  iter-137/138 had fixed
+                // pf_positions (RoPE) and write_pos (cache cursor) but
+                // missed the kv_cache_copy/quantize destination offset.
+                // For start_pos=0 (all production cmd_generate / parity /
+                // engine callers) the expression reduces to src_tok_offset
+                // — bit-identical behavior.
+                let dst_seq_pos_start = (start_pos as u32) + src_tok_offset;
                 let t0_kv_copy = if profile_buckets_on {
                     Some(std::time::Instant::now())
                 } else { None };
