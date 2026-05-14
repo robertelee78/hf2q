@@ -261,6 +261,113 @@ mod tests {
         }
     }
 
+    /// End-to-end integration: simulates the post-target-verify state
+    /// (capture buffer populated by hypothetical layer-loop hook) and
+    /// drives the drafter forward on the permuted concat. Validates
+    /// the Phase 4 data path from capture → permute → drafter forward
+    /// → finite output.
+    #[test]
+    #[ignore = "requires Metal device + drafter HF cache"]
+    fn smoke_capture_to_drafter_forward_pipeline() {
+        use crate::inference::spec_decode::dflash::{
+            forward::dispatch_dflash_model_forward,
+            kv_cache::DFlashKvCache,
+            tensors::DFlashModelTensors,
+            weights::{DFlashWeights, DFlashWeightsFile},
+        };
+        use mlx_native::{DType, KernelRegistry, MlxDevice};
+
+        let cfg = gemma4_cfg();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let mut registry = KernelRegistry::new();
+
+        // Load drafter
+        let home = std::env::var("HOME").expect("HOME set");
+        let path = format!(
+            "{home}/.cache/huggingface/hub/models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/77d4202772dfe50b2396ec7bac9cfffc7b9e7057/model.safetensors"
+        );
+        let file = DFlashWeightsFile::open(&path).expect("file open");
+        let weights = DFlashWeights::load(file.bytes(), &cfg).expect("validated load");
+        let tensors = DFlashModelTensors::upload(&device, &cfg, &weights).expect("GPU upload");
+        let mut cache = DFlashKvCache::new(&device, &cfg, 128).expect("cache");
+
+        // Allocate capture buffer + populate as if target forward had
+        // run and hooks had been written.
+        let ctx_chunk = 4usize;
+        let hidden = cfg.hidden_size;
+        let block_size = 8u32;
+
+        let mut hidden_buf = vec![0.0f32; capture_buffer_len(&cfg, ctx_chunk)];
+        let target_layer_ids: Vec<usize> = cfg.target_layer_ids.clone();
+
+        // Populate with synthetic values per (capture_layer_idx, token,
+        // dim) so we can verify permute placement
+        for cli in 0..target_layer_ids.len() {
+            for t in 0..ctx_chunk {
+                for d in 0..hidden {
+                    let off = (cli * ctx_chunk + t) * hidden + d;
+                    hidden_buf[off] = 0.1 + ((off % 31) as f32) / 310.0;
+                }
+            }
+        }
+
+        // Build PrefillCapture view + validate.
+        // per_position_argmaxes is for the VERIFY forward pass, not the
+        // ctx capture; we leave it None here since this test only
+        // exercises the ctx-capture → drafter-forward path.
+        let cap = PrefillCapture {
+            target_layer_ids: &target_layer_ids,
+            hidden_output: &mut hidden_buf,
+            per_position_argmaxes: None,
+        };
+        cap.validate(ctx_chunk, hidden).expect("validate");
+
+        // Permute capture buffer to drafter's expected concat layout
+        // [seq_len, num_capture_layers * hidden_size]
+        let concat = cap.permute_to_concat(ctx_chunk, hidden);
+        assert_eq!(concat.len(), ctx_chunk * target_layer_ids.len() * hidden);
+
+        // Upload concat to GPU as target_hidden_concat for the drafter
+        let mut target_hidden = device
+            .alloc_buffer(
+                concat.len() * 4,
+                DType::F32,
+                vec![ctx_chunk, target_layer_ids.len() * hidden],
+            )
+            .expect("alloc target_hidden");
+        target_hidden
+            .as_mut_slice::<f32>()
+            .expect("target_hidden slice")
+            .copy_from_slice(&concat);
+
+        // Allocate input h (simulated embed_tokens output)
+        let h_elem = (block_size as usize) * hidden;
+        let mut h = device
+            .alloc_buffer(h_elem * 4, DType::F32, vec![block_size as usize, hidden])
+            .expect("alloc h");
+        {
+            let s = h.as_mut_slice::<f32>().expect("h slice");
+            for v in s.iter_mut() { *v = 1.0; }
+        }
+
+        // Run drafter forward end-to-end on the permuted captured hidden
+        let h_final = dispatch_dflash_model_forward(
+            &mut registry, &device, &h, &target_hidden,
+            &tensors, &mut cache, &cfg,
+            block_size, ctx_chunk as u32,
+        )
+        .expect("drafter forward on permuted capture");
+
+        // Validate output [L, hidden] all finite
+        assert_eq!(h_final.element_count(), (block_size as usize) * hidden);
+        let host: &[f32] = h_final.as_slice::<f32>().expect("h_final slice");
+        let n_finite = host.iter().filter(|v| v.is_finite()).count();
+        assert_eq!(
+            n_finite, host.len(),
+            "drafter output on permuted capture must be all finite"
+        );
+    }
+
     #[test]
     fn permute_to_concat_round_trips_layout() {
         let target_layer_ids = vec![1, 6];
