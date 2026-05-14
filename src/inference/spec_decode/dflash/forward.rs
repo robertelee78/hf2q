@@ -33,7 +33,7 @@ use anyhow::{anyhow, Context, Result};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
-use crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32;
+use crate::inference::models::qwen35::gpu_full_attn::{apply_imrope, apply_linear_projection_f32};
 
 /// Build the `[eps, dim]` F32 params buffer required by [`dispatch_rms_norm`].
 ///
@@ -364,6 +364,88 @@ pub fn dispatch_dflash_mlp(
     .context("dispatch_dflash_mlp: down_proj")
 }
 
+/// Build the per-axis position buffer required by mlx-native's
+/// IMROPE kernel.
+///
+/// Format: `int32[4 * seq_len]` — four axis blocks each of length
+/// `seq_len`. For DFlash's plain NeoX RoPE (text-only) we replicate the
+/// same `[offset, offset+1, …, offset+seq_len-1]` block across all four
+/// axes; the sections=`[head_dim/2, 0, 0, 0]` config sends every pair
+/// to axis 0 so axes 1-3 are unused, but the kernel still expects a
+/// non-zero pos_buf of the right shape.
+fn build_dflash_pos_buf(
+    device: &MlxDevice,
+    seq_len: u32,
+    offset: u32,
+) -> Result<MlxBuffer> {
+    let n_pos = 4 * (seq_len as usize);
+    let mut buf = device
+        .alloc_buffer(n_pos * 4, DType::I32, vec![n_pos])
+        .map_err(|e| anyhow!("alloc rope pos_buf: {e}"))?;
+    let slice = buf
+        .as_mut_slice::<i32>()
+        .map_err(|e| anyhow!("rope pos_buf slice: {e}"))?;
+    let l = seq_len as usize;
+    let base = offset as i32;
+    for axis in 0..4 {
+        let dst = &mut slice[axis * l..(axis + 1) * l];
+        for (i, v) in dst.iter_mut().enumerate() {
+            *v = base + (i as i32);
+        }
+    }
+    Ok(buf)
+}
+
+/// Apply NeoX-style RoPE to a per-head-normalized Q or K buffer.
+///
+/// Mirrors `model_mlx.py:DFlashAttention.__call__` lines 102-104:
+/// `queries = rope(queries, offset=cache.offset + S)` and similar for
+/// `ctx_keys` / `prop_keys` with different offsets.
+///
+/// Reuses qwen35's `apply_imrope` (gpu_full_attn.rs:620) since drafter
+/// is qwen3-style. Drafter RoPE config: head_dim=128, rope_dim=128 (full
+/// rotation, traditional=False), freq_base=1_000_000, plain NeoX = all
+/// pairs in axis 0 via sections=`[head_dim/2, 0, 0, 0]`.
+///
+/// # Arguments
+///
+/// - `qk_in`: `[seq_len * num_heads, head_dim]` F32 (post per-head norm)
+/// - `seq_len`: number of token positions in the input
+/// - `num_heads`: number of heads (Q: num_q_heads; K: num_kv_heads)
+/// - `offset`: starting position in the sequence (the Python `offset` arg)
+/// - Returns: `[seq_len * num_heads, head_dim]` F32 rotated
+pub fn dispatch_dflash_rope(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    qk_in: &MlxBuffer,
+    cfg: &DFlashConfig,
+    seq_len: u32,
+    num_heads: u32,
+    offset: u32,
+) -> Result<MlxBuffer> {
+    let head_dim = cfg.head_dim as u32;
+    let rope_dim = head_dim; // DFlash drafter uses full rotation
+    let freq_base = cfg.rope_theta;
+    // Plain NeoX: all pairs go to axis 0. Sum must equal rope_dim / 2.
+    let sections = [head_dim / 2, 0, 0, 0];
+    let positions = build_dflash_pos_buf(device, seq_len, offset)?;
+    apply_imrope(
+        encoder,
+        registry,
+        device,
+        qk_in,
+        &positions,
+        seq_len,
+        num_heads,
+        head_dim,
+        rope_dim,
+        freq_base,
+        sections,
+    )
+    .context("dispatch_dflash_rope")
+}
+
 /// Dispatch the O projection: `o_proj @ attn_out`.
 ///
 /// Mirrors `model_mlx.py:DFlashAttention.__call__` line 116:
@@ -541,6 +623,18 @@ mod tests {
             block_size, cfg.num_key_value_heads as u32,
         )
         .expect("k_norm dispatch");
+        encoder.memory_barrier(); // RAW: RoPE reads q_normed / k_normed
+        // RoPE applied to Q and K (V passes through unrotated)
+        let q_roped = dispatch_dflash_rope(
+            &mut encoder, &mut registry, &device, &q_normed, &cfg,
+            block_size, cfg.num_attention_heads as u32, 0,
+        )
+        .expect("q rope dispatch");
+        let k_roped = dispatch_dflash_rope(
+            &mut encoder, &mut registry, &device, &k_normed, &cfg,
+            block_size, cfg.num_key_value_heads as u32, 0,
+        )
+        .expect("k rope dispatch");
         encoder.commit_and_wait().expect("commit");
 
         // Validate shapes
@@ -553,13 +647,19 @@ mod tests {
         assert_eq!(q_normed.element_count(), l * q_dim);
         assert_eq!(k_normed.element_count(), l * kv_dim);
 
-        // Validate all five are finite + non-trivially non-zero.
+        // Q_roped / K_roped shapes match their pre-RoPE shapes
+        assert_eq!(q_roped.element_count(), l * q_dim);
+        assert_eq!(k_roped.element_count(), l * kv_dim);
+
+        // Validate all seven outputs are finite + non-trivially non-zero.
         for (name, buf, dim) in [
             ("Q", &q, q_dim),
             ("K", &k, kv_dim),
             ("V", &v, kv_dim),
             ("Q_normed", &q_normed, q_dim),
             ("K_normed", &k_normed, kv_dim),
+            ("Q_roped", &q_roped, q_dim),
+            ("K_roped", &k_roped, kv_dim),
         ] {
             let host: &[f32] = buf.as_slice::<f32>().expect("host slice");
             assert_eq!(host.len(), l * dim, "{name} length");
