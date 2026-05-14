@@ -3068,3 +3068,26 @@ sections 3.6 and 3.8):
 - /opt/hf2q: 19+ commits across iter-102→115, all on `main`.
 - /opt/mlx-native: 5 commits (iter-110/111/112/113) on `main`.
 
+
+### iter-117 — Final dispatcher audit closure: transpose_2d (mlx-native 146ddce)
+
+One more dispatcher pattern was found: `transpose_2d` takes `dtype`
+as a CALLER-SUPPLIED parameter that selects the kernel pipeline
+(`transpose_2d_{f32,f16}`), but pre-iter-117 the function only
+validated `byte_len`.  A caller passing buffers of a different dtype
+than the `dtype` param would silently mis-stride.
+
+Added explicit `input.dtype() == dtype` and `output.dtype() == dtype`
+checks.
+
+This closes a third pattern variant for dispatch-by-buffer-dtype:
+- (a) kernel-by-input-dtype with multi-buffer dispatch
+  (iter-110/111/112: rms_norm family + sdpa + sdpa_sliding).
+- (b) dtype-named dispatchers with explicit buffer dtype validation
+  (iter-112: rms_norm_no_scale_{bf16,f32}).
+- (c) dtype-param selection with buffer dtype validation
+  (iter-117: transpose_2d).
+
+The audit pattern is now exhaustive.  298/298 mlx-native + 3503/3503
+hf2q tests pass GREEN with every guard landed.
+
