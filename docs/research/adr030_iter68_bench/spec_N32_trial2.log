@@ -21,139 +21,77 @@ hf2q load: provenance = external
 hf2q load: vision = mmproj-required (no mmproj loaded; pass --mmproj)
 hf2q load: kv_spill = inactive
 hf2q load: tq_kv = inactive
-hf2q load: ready in 2.85 s
+hf2q load: ready in 2.83 s
 [HF2Q_SPEC_DFLASH=1] loading DFlash drafter — coherent at temp=0, SLOWER than baseline (Option A pending for perf parity)
 [HF2Q_SPEC_DFLASH] drafter loaded in 0.09s (config=/Users/robert/.cache/huggingface/hub/models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/77d4202772dfe50b2396ec7bac9cfffc7b9e7057/config.json, cache_cap=2048)
 Batched prefill: KV=F32, seq_len=24, path=flash-attn
 [ADR-028 Phase 10c] Allocating hybrid_kv (30 layers, F16 K + TQ-HB V 8-bit) [batched]
-Batched prefill complete: 24 tokens in 83.5 ms (287.5 tok/s), first decode token = 236812
-Batched prefill: KV=F32, seq_len=24, path=flash-attn
-Batched prefill complete: 24 tokens in 60.0 ms (399.7 tok/s), first decode token = 236812
+Batched prefill complete: 24 tokens in 82.3 ms (291.5 tok/s), first decode token = 236812
 Batched prefill: KV=F32, seq_len=32, path=flash-attn
-Batched prefill complete: 32 tokens in 68.9 ms (464.7 tok/s), first decode token = 1595
-Batched prefill: KV=F32, seq_len=25, path=flash-attn
-Batched prefill complete: 25 tokens in 62.4 ms (400.5 tok/s), first decode token = 106
+Batched prefill complete: 32 tokens in 68.8 ms (464.8 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=33, path=flash-attn
-Batched prefill complete: 33 tokens in 59.2 ms (557.2 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=26, path=flash-attn
-Batched prefill complete: 26 tokens in 62.5 ms (415.7 tok/s), first decode token = 106
+Batched prefill complete: 33 tokens in 58.5 ms (563.7 tok/s), first decode token = 569
 Batched prefill: KV=F32, seq_len=34, path=flash-attn
-Batched prefill complete: 34 tokens in 59.3 ms (572.9 tok/s), first decode token = 1595
-Batched prefill: KV=F32, seq_len=27, path=flash-attn
-Batched prefill complete: 27 tokens in 64.4 ms (419.4 tok/s), first decode token = 2717
+Batched prefill complete: 34 tokens in 58.6 ms (580.4 tok/s), first decode token = 569
 Batched prefill: KV=F32, seq_len=35, path=flash-attn
-Batched prefill complete: 35 tokens in 59.8 ms (585.2 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=28, path=flash-attn
-Batched prefill complete: 28 tokens in 65.0 ms (430.6 tok/s), first decode token = 60865
+Batched prefill complete: 35 tokens in 59.0 ms (593.3 tok/s), first decode token = 191
 Batched prefill: KV=F32, seq_len=36, path=flash-attn
-Batched prefill complete: 36 tokens in 60.0 ms (600.0 tok/s), first decode token = 1595
-Batched prefill: KV=F32, seq_len=29, path=flash-attn
-Batched prefill complete: 29 tokens in 66.2 ms (437.9 tok/s), first decode token = 107
+Batched prefill complete: 36 tokens in 60.1 ms (598.7 tok/s), first decode token = 107
 Batched prefill: KV=F32, seq_len=37, path=flash-attn
-Batched prefill complete: 37 tokens in 60.7 ms (609.3 tok/s), first decode token = 1082
-Batched prefill: KV=F32, seq_len=30, path=flash-attn
-Batched prefill complete: 30 tokens in 67.0 ms (447.7 tok/s), first decode token = 236865
+Batched prefill complete: 37 tokens in 60.1 ms (615.6 tok/s), first decode token = 107
 Batched prefill: KV=F32, seq_len=38, path=flash-attn
-Batched prefill complete: 38 tokens in 60.4 ms (628.7 tok/s), first decode token = 573
-Batched prefill: KV=F32, seq_len=31, path=flash-attn
-Batched prefill complete: 31 tokens in 67.6 ms (458.7 tok/s), first decode token = 50698
+Batched prefill complete: 38 tokens in 59.8 ms (635.4 tok/s), first decode token = 569
 Batched prefill: KV=F32, seq_len=39, path=flash-attn
-Batched prefill complete: 39 tokens in 61.6 ms (632.9 tok/s), first decode token = 573
-Batched prefill: KV=F32, seq_len=32, path=flash-attn
-Batched prefill complete: 32 tokens in 69.1 ms (463.4 tok/s), first decode token = 15308
+Batched prefill complete: 39 tokens in 62.1 ms (628.2 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=40, path=flash-attn
-Batched prefill complete: 40 tokens in 63.1 ms (633.5 tok/s), first decode token = 568
-Batched prefill: KV=F32, seq_len=33, path=flash-attn
-Batched prefill complete: 33 tokens in 59.9 ms (550.8 tok/s), first decode token = 236787
+Batched prefill complete: 40 tokens in 62.0 ms (645.5 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=41, path=flash-attn
-Batched prefill complete: 41 tokens in 62.6 ms (655.1 tok/s), first decode token = 1595
-Batched prefill: KV=F32, seq_len=34, path=flash-attn
-Batched prefill complete: 34 tokens in 59.8 ms (568.5 tok/s), first decode token = 236743
+Batched prefill complete: 41 tokens in 61.9 ms (662.4 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=42, path=flash-attn
-Batched prefill complete: 42 tokens in 62.8 ms (669.0 tok/s), first decode token = 1595
-Batched prefill: KV=F32, seq_len=35, path=flash-attn
-Batched prefill complete: 35 tokens in 59.8 ms (585.4 tok/s), first decode token = 236778
+Batched prefill complete: 42 tokens in 62.0 ms (677.7 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=43, path=flash-attn
-Batched prefill complete: 43 tokens in 63.4 ms (678.4 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=36, path=flash-attn
-Batched prefill complete: 36 tokens in 61.1 ms (589.5 tok/s), first decode token = 236862
+Batched prefill complete: 43 tokens in 63.1 ms (681.7 tok/s), first decode token = 108
 Batched prefill: KV=F32, seq_len=44, path=flash-attn
-Batched prefill complete: 44 tokens in 63.1 ms (696.8 tok/s), first decode token = 1595
-Batched prefill: KV=F32, seq_len=37, path=flash-attn
-Batched prefill complete: 37 tokens in 61.3 ms (603.9 tok/s), first decode token = 236778
+Batched prefill complete: 44 tokens in 63.0 ms (698.8 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=45, path=flash-attn
-Batched prefill complete: 45 tokens in 63.8 ms (705.2 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=38, path=flash-attn
-Batched prefill complete: 38 tokens in 61.7 ms (615.8 tok/s), first decode token = 108
+Batched prefill complete: 45 tokens in 63.4 ms (709.7 tok/s), first decode token = 653
 Batched prefill: KV=F32, seq_len=46, path=flash-attn
-Batched prefill complete: 46 tokens in 63.9 ms (720.1 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=39, path=flash-attn
-Batched prefill complete: 39 tokens in 61.6 ms (632.9 tok/s), first decode token = 1408
+Batched prefill complete: 46 tokens in 63.3 ms (726.6 tok/s), first decode token = 573
 Batched prefill: KV=F32, seq_len=47, path=flash-attn
-Batched prefill complete: 47 tokens in 64.0 ms (734.2 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=40, path=flash-attn
-Batched prefill complete: 40 tokens in 61.3 ms (652.5 tok/s), first decode token = 236743
+Batched prefill complete: 47 tokens in 63.8 ms (736.9 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=48, path=flash-attn
-Batched prefill complete: 48 tokens in 64.7 ms (741.9 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=41, path=flash-attn
-Batched prefill complete: 41 tokens in 61.8 ms (663.9 tok/s), first decode token = 236770
+Batched prefill complete: 48 tokens in 64.1 ms (748.5 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=49, path=flash-attn
-Batched prefill complete: 49 tokens in 65.1 ms (752.3 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=42, path=flash-attn
-Batched prefill complete: 42 tokens in 62.7 ms (670.3 tok/s), first decode token = 236761
+Batched prefill complete: 49 tokens in 64.6 ms (758.2 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=50, path=flash-attn
-Batched prefill complete: 50 tokens in 65.2 ms (766.6 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=43, path=flash-attn
-Batched prefill complete: 43 tokens in 63.2 ms (680.2 tok/s), first decode token = 15044
+Batched prefill complete: 50 tokens in 64.7 ms (772.7 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=51, path=flash-attn
-Batched prefill complete: 51 tokens in 65.0 ms (784.5 tok/s), first decode token = 1595
-Batched prefill: KV=F32, seq_len=44, path=flash-attn
-Batched prefill complete: 44 tokens in 62.7 ms (701.7 tok/s), first decode token = 25252
+Batched prefill complete: 51 tokens in 65.4 ms (779.3 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=52, path=flash-attn
-Batched prefill complete: 52 tokens in 65.6 ms (792.1 tok/s), first decode token = 107
-Batched prefill: KV=F32, seq_len=45, path=flash-attn
-Batched prefill complete: 45 tokens in 63.1 ms (713.1 tok/s), first decode token = 107
+Batched prefill complete: 52 tokens in 66.0 ms (787.9 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=53, path=flash-attn
-Batched prefill complete: 53 tokens in 65.6 ms (808.4 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=46, path=flash-attn
-Batched prefill complete: 46 tokens in 64.0 ms (718.6 tok/s), first decode token = 818
+Batched prefill complete: 53 tokens in 66.3 ms (798.8 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=54, path=flash-attn
-Batched prefill complete: 54 tokens in 67.2 ms (803.7 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=47, path=flash-attn
-Batched prefill complete: 47 tokens in 64.8 ms (725.2 tok/s), first decode token = 12092
+Batched prefill complete: 54 tokens in 65.8 ms (820.8 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=55, path=flash-attn
-Batched prefill complete: 55 tokens in 67.6 ms (813.8 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=48, path=flash-attn
-Batched prefill complete: 48 tokens in 64.8 ms (740.7 tok/s), first decode token = 529
+Batched prefill complete: 55 tokens in 67.5 ms (815.4 tok/s), first decode token = 618
 Batched prefill: KV=F32, seq_len=56, path=flash-attn
-Batched prefill complete: 56 tokens in 68.2 ms (821.2 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=49, path=flash-attn
-Batched prefill complete: 49 tokens in 65.8 ms (744.5 tok/s), first decode token = 672
+Batched prefill complete: 56 tokens in 67.5 ms (829.3 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=57, path=flash-attn
-Batched prefill complete: 57 tokens in 68.6 ms (830.4 tok/s), first decode token = 1595
-Batched prefill: KV=F32, seq_len=50, path=flash-attn
-Batched prefill complete: 50 tokens in 66.3 ms (754.2 tok/s), first decode token = 8688
+Batched prefill complete: 57 tokens in 68.1 ms (836.6 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=58, path=flash-attn
-Batched prefill complete: 58 tokens in 68.7 ms (844.4 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=51, path=flash-attn
-Batched prefill complete: 51 tokens in 66.8 ms (763.3 tok/s), first decode token = 563
+Batched prefill complete: 58 tokens in 68.8 ms (842.4 tok/s), first decode token = 618
 Batched prefill: KV=F32, seq_len=59, path=flash-attn
-Batched prefill complete: 59 tokens in 69.7 ms (846.3 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=52, path=flash-attn
-Batched prefill complete: 52 tokens in 67.1 ms (774.4 tok/s), first decode token = 531
+Batched prefill complete: 59 tokens in 68.2 ms (864.7 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=60, path=flash-attn
-Batched prefill complete: 60 tokens in 69.3 ms (865.6 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=53, path=flash-attn
-Batched prefill complete: 53 tokens in 67.6 ms (784.3 tok/s), first decode token = 14245
+Batched prefill complete: 60 tokens in 69.2 ms (867.4 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=61, path=flash-attn
-Batched prefill complete: 61 tokens in 69.8 ms (874.4 tok/s), first decode token = 1902
-Batched prefill: KV=F32, seq_len=54, path=flash-attn
-Batched prefill complete: 54 tokens in 68.0 ms (794.0 tok/s), first decode token = 506
+Batched prefill complete: 61 tokens in 69.9 ms (872.1 tok/s), first decode token = 1082
 Batched prefill: KV=F32, seq_len=62, path=flash-attn
-Batched prefill complete: 62 tokens in 70.3 ms (882.0 tok/s), first decode token = 1595
+Batched prefill complete: 62 tokens in 69.9 ms (887.2 tok/s), first decode token = 618
 4<turn|><turn|>```markdown
 # Implementation Guide: 2+2
 
 ## 1. Executive Summary
 The objective of this implementation is to resolve the mathematical
-[HF2Q_SPEC_DFLASH] 32 new tokens in 7.90s (4.0 tok/s)
+[HF2Q_SPEC_DFLASH] 32 new tokens in 5.33s (6.0 tok/s)

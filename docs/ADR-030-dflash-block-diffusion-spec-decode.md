@@ -1075,3 +1075,43 @@ Two paths in analysis.md:
 - `docs/research/adr030_iter68_bench/results.tsv` — raw measurements.
 - `docs/research/adr030_iter68_bench/analysis.md` — full analysis,
   caveats, and recommended next steps.
+
+### iter-69 (2026-05-14) — Single-prefill-per-round → ~50% throughput gain
+
+**Optimization**: eliminated the redundant `prior_ctx` prefill at the
+start of each verify round.  The verify prefill's capture already
+covers positions `[0..output_len + K)` (= all committed tokens + all
+drafts).  With start_pos=0 + causal masking, the captured hidden at
+position i depends ONLY on tokens at `[0..=i]` — so trimming
+`verify_captured` to `output_next.len() - 1` yields a CORRECT
+prior_captured for next round's drafter input.
+
+Round structure changed from 2 prefills (prior_ctx + verify) per
+round to **1 prefill** (verify only), with the initial prompt
+prefill seeding round-1's `prior_captured`.
+
+**Bench results** (same harness as iter-68, 2 trials, 20s cool-downs):
+
+| N | baseline t/s | spec t/s | spec/baseline | vs iter-68 |
+|---|---|---|---|---|
+|  8 | 104.0 | 7.0 | 0.067× (14.9× slower) | **+50%** (4.65→7.0) |
+| 16 | 99.1  | 6.9 | 0.070× (14.4× slower) | **+57%** (4.40→6.9) |
+| 32 | 96.8  | 6.0 | 0.062× (16.1× slower) | **+48%** (4.05→6.0) |
+
+Mission gate gap shrank from 22× to ~15× — still requires
+Option A (cross-length SDPA) for the remaining gain, but ~50% closer
+to parity with one round-level refactor.
+
+**Coherence assertions preserved**:
+- Untemplated e2e gate at N=16: ✓ byte-identical to single-token decode
+- Chat-templated axis-3 self-consistency (orchestrator faithful to
+  batched_prefill): ✓ all 8 positions still match
+
+**Code artifacts (iter-69)**:
+- `src/inference/spec_decode/dflash/orchestrator.rs` —
+  `dispatch_dflash_generate` round loop: replaced explicit
+  prior_ctx prefill with `prior_captured` state preserved across
+  rounds (seeded from initial prompt prefill capture, updated each
+  round by trimming verify_captured to next round's prior_ctx_len).
+- `docs/research/adr030_iter68_bench/results_iter69.tsv` —
+  side-by-side comparison data.

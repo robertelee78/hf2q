@@ -550,14 +550,16 @@ pub fn dispatch_dflash_generate(
     let first_token = target
         .forward_prefill_batched(prompt_tokens, max_decode_for_alloc, 0, gpu)
         .map_err(|e| anyhow::anyhow!("generate: initial prompt forward: {e}"))?;
-    // The initial prefill installed a capture session for the prompt's
-    // hidden states.  Option C (iter-65) re-prefills the full prefix
-    // from start_pos=0 each round, so this initial capture is unused
-    // by the round-1 drafter; take it back to drop it cleanly without
-    // leaving stale state on the target.
-    let _ = target
+    // Keep the initial prompt prefill's capture as round-1's prior_ctx.
+    // iter-69: instead of running a SEPARATE prior_ctx prefill each
+    // round (which was ~50% of round wall-clock), we use the previous
+    // verify's capture (trimmed to the accepted-positions count) as
+    // the drafter's input next round.  The initial capture seeds
+    // round 1.
+    let mut prior_captured = target
         .take_dflash_capture()
         .ok_or_else(|| anyhow::anyhow!("generate: initial capture vanished"))?;
+    debug_assert_eq!(prior_captured.seq_len, prompt_tokens.len());
 
     output.push(first_token);
 
@@ -567,23 +569,20 @@ pub fn dispatch_dflash_generate(
 
     let mut last_token = first_token;
 
-    // -------- Multi-round loop (Option C: re-prefill each round) --------
+    // -------- Multi-round loop (Option C + iter-69 single-prefill) --------
     //
-    // Background: the underlying `flash_attn_prefill` kernels in
-    // forward_prefill_batched set `seq_len_q = seq_len_k = seq_len` —
-    // they do self-attention over the current chunk only and cannot
-    // attend to prior cache content.  This makes verify-at-non-zero-
-    // start_pos fundamentally incoherent (iter-64 Bug 5).
+    // Architecture:
+    // - Re-prefill `[output + drafts]` from start_pos=0 each round.
+    //   The SDPA self-attention spans the whole prefix → correct
+    //   cross-context attention (bypasses iter-64 Bug 5).
+    // - SINGLE prefill per round (iter-69): the verify prefill ALSO
+    //   captures all positions [0..output_len + K).  Hidden states for
+    //   positions [0..output_len - 1) form next round's prior_ctx;
+    //   target argmaxes at positions [output_len - 1 .. output_len - 1
+    //   + block_size) form this round's verify result.
     //
-    // Option C bypasses this by re-prefilling the ENTIRE prefix
-    // `[output..., drafts...]` from start_pos=0 each round.  The SDPA
-    // self-attention now spans the whole prefix → correct cross-context
-    // attention.  Cost: O(N * (P + K)) work per generation; we lose
-    // the spec-decode batched-verify speedup.  This is a CORRECTNESS-
-    // first temporary path until iter-66 lands cross-length SDPA in
-    // batched prefill (Option A from ADR-030 iter-64 status log).
-    //
-    // Drafter cache is reset each round and re-fed the full prior ctx.
+    // Drafter cache is reset each round and re-fed the full prior ctx
+    // — its work is bounded but the K/V cache lifetime is per-round.
     while output.len() - prompt_tokens.len() < max_new_tokens {
         // 1. Build the drafter's input block: [last_token, mask × K]
         let mut block: Vec<u32> = Vec::with_capacity(block_size as usize);
@@ -596,31 +595,20 @@ pub fn dispatch_dflash_generate(
             .embed_tokens(&block, gpu)
             .map_err(|e| anyhow::anyhow!("generate: embed_tokens: {e}"))?;
 
-        // 2. Build the drafter's context: target hidden at positions
-        //    [0..output.len()-1) — i.e. all committed tokens EXCEPT
-        //    last_token (last_token is the drafter's block[0] query).
-        //    We re-prefill once before the drafter forward to capture
-        //    the target's hidden states for those positions.
-        let prior_ctx_len = output.len() - 1;
-        debug_assert!(prior_ctx_len >= prompt_tokens.len() - 1);
-        let prior_ctx_tokens: &[u32] = &output[..prior_ctx_len];
-        let prior_session = DFlashCaptureSession::new(
-            combined_capture_ids.clone(),
-            prior_ctx_len,
-            hs,
-            false,
+        // 2. Drafter's context = prior_captured (= prompt capture in
+        //    round 1, OR trimmed verify capture from prior round).
+        //    seq_len matches output.len() - 1 (= all committed tokens
+        //    EXCEPT last_token, which is drafter's block[0] query).
+        let prior_ctx_len = prior_captured.seq_len;
+        debug_assert_eq!(
+            prior_ctx_len, output.len() - 1,
+            "prior_captured stale: seq_len={} but output.len()-1={}",
+            prior_ctx_len, output.len() - 1,
         );
-        target.install_dflash_capture(prior_session);
-        let _ = target
-            .forward_prefill_batched(prior_ctx_tokens, max_decode_for_alloc, 0, gpu)
-            .map_err(|e| anyhow::anyhow!("generate: prior-ctx prefill: {e}"))?;
-        let prior_captured = target
-            .take_dflash_capture()
-            .ok_or_else(|| anyhow::anyhow!("generate: prior-ctx capture vanished"))?;
 
-        // 3. Extract drafter_concat from the prior-ctx capture and
-        //    upload to GPU.  drafter cache is reset before the forward
-        //    so it appends the FULL prior ctx as fresh K/V.
+        // 3. Extract drafter_concat from the prior capture and upload
+        //    to GPU.  drafter cache is reset so it appends the FULL
+        //    prior ctx as fresh K/V each round.
         let drafter_concat_vec = extract_drafter_concat(
             &prior_captured.hidden_output,
             &combined_capture_ids,
@@ -740,6 +728,22 @@ pub fn dispatch_dflash_generate(
         if output.len() - prompt_tokens.len() >= max_new_tokens {
             break;
         }
+
+        // 11. iter-69: trim verify_captured for next round's drafter
+        //     ctx.  Next round's prior_ctx_len = output.len() - 1 =
+        //     (verify_start + n_committed).  trim_capture_to keeps
+        //     positions [0..new_seq_len) and updates seq_len.  Because
+        //     of causal masking in the verify prefill at start_pos=0,
+        //     positions [0..n) in the captured slab depend ONLY on
+        //     tokens [0..n) — independent of any draft tokens at
+        //     positions ≥ verify_start.  So this trimmed slab is the
+        //     correct prior_captured for the next round's drafter.
+        let mut next_captured = verify_captured;
+        let next_prior_ctx_len = output.len() - 1;
+        debug_assert!(next_prior_ctx_len <= next_captured.seq_len,
+            "trim target {} > current {}", next_prior_ctx_len, next_captured.seq_len);
+        super::hidden_capture::trim_capture_to(&mut next_captured, next_prior_ctx_len);
+        prior_captured = next_captured;
     }
 
     // Truncate to max_new_tokens if we overshot in the last round
