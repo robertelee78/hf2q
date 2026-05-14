@@ -165,6 +165,100 @@ pub fn capture_buffer_len(cfg: &DFlashConfig, seq_len: usize) -> usize {
     cfg.target_layer_ids.len() * seq_len * cfg.hidden_size
 }
 
+/// Owned variant of `PrefillCapture` for installation as an
+/// `MlxModelWeights` field. Avoids the lifetime parameter (Vec-backed)
+/// so the capture session can live across the forward call without
+/// borrow-checker gymnastics.
+///
+/// Set `seq_len` and `hidden_size` at install time so the layer-loop
+/// hook can compute offsets without re-deriving them. The
+/// `target_layer_ids` are checked once at install via `validate()`.
+#[derive(Debug, Default, Clone)]
+pub struct DFlashCaptureSession {
+    pub target_layer_ids: Vec<usize>,
+    pub hidden_output: Vec<f32>,
+    pub per_position_argmaxes: Option<Vec<u32>>,
+    /// Cached so the hook doesn't need to re-derive.
+    pub seq_len: usize,
+    pub hidden_size: usize,
+}
+
+impl DFlashCaptureSession {
+    /// Allocate a capture session with the given layout. Buffers are
+    /// pre-sized to `target_layer_ids.len() * seq_len * hidden_size`
+    /// (and `seq_len` for argmaxes if requested).
+    pub fn new(
+        target_layer_ids: Vec<usize>,
+        seq_len: usize,
+        hidden_size: usize,
+        with_argmaxes: bool,
+    ) -> Self {
+        let hidden_output = vec![0.0f32; target_layer_ids.len() * seq_len * hidden_size];
+        let per_position_argmaxes = if with_argmaxes {
+            Some(vec![0u32; seq_len])
+        } else {
+            None
+        };
+        Self {
+            target_layer_ids,
+            hidden_output,
+            per_position_argmaxes,
+            seq_len,
+            hidden_size,
+        }
+    }
+
+    /// Find the capture index (0..num_capture_layers) for a given
+    /// target layer index, or None if this layer is not captured.
+    pub fn capture_index_for(&self, target_layer_idx: usize) -> Option<usize> {
+        self.target_layer_ids
+            .iter()
+            .position(|&i| i == target_layer_idx)
+    }
+
+    /// Write one layer's full `[seq_len, hidden_size]` row-major slab
+    /// from a target hidden buffer into the capture. Used by the
+    /// layer-loop hook in `forward_prefill_batched`.
+    pub fn write_layer_slab(
+        &mut self,
+        capture_layer_idx: usize,
+        pf_hidden_data: &[f32],
+    ) -> Result<()> {
+        let slab_len = self.seq_len * self.hidden_size;
+        if pf_hidden_data.len() != slab_len {
+            return Err(anyhow!(
+                "DFlashCaptureSession::write_layer_slab: pf_hidden_data len {} != seq_len({}) * hidden_size({}) = {}",
+                pf_hidden_data.len(), self.seq_len, self.hidden_size, slab_len
+            ));
+        }
+        let start = PrefillCapture::offset_for(
+            capture_layer_idx,
+            0,
+            self.seq_len,
+            self.hidden_size,
+        );
+        let end = start + slab_len;
+        if end > self.hidden_output.len() {
+            return Err(anyhow!(
+                "DFlashCaptureSession::write_layer_slab: write out of bounds (start {}, end {}, buf {})",
+                start, end, self.hidden_output.len()
+            ));
+        }
+        self.hidden_output[start..end].copy_from_slice(pf_hidden_data);
+        Ok(())
+    }
+
+    /// Convenience: borrow as a `PrefillCapture` view for consumers
+    /// that need the borrowed-buffer API.
+    pub fn as_view(&mut self) -> PrefillCapture<'_> {
+        PrefillCapture {
+            target_layer_ids: &self.target_layer_ids,
+            hidden_output: &mut self.hidden_output,
+            per_position_argmaxes: self.per_position_argmaxes.as_deref_mut(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +353,63 @@ mod tests {
             let expected = if i >= layer2_start && i < layer2_end { 1.0 } else { 0.0 };
             assert_eq!(hidden[i], expected, "at index {i}");
         }
+    }
+
+    /// DFlashCaptureSession: new() pre-allocates correct buffer sizes.
+    #[test]
+    fn session_new_allocates_correct_sizes() {
+        let sess = DFlashCaptureSession::new(
+            vec![1, 6, 11, 17, 22, 27],
+            4,
+            2816,
+            true,
+        );
+        assert_eq!(sess.hidden_output.len(), 6 * 4 * 2816);
+        assert_eq!(sess.per_position_argmaxes.as_ref().map(|v| v.len()), Some(4));
+        assert_eq!(sess.seq_len, 4);
+        assert_eq!(sess.hidden_size, 2816);
+
+        // No-argmaxes path
+        let sess2 = DFlashCaptureSession::new(vec![1, 6], 8, 128, false);
+        assert_eq!(sess2.hidden_output.len(), 2 * 8 * 128);
+        assert!(sess2.per_position_argmaxes.is_none());
+    }
+
+    #[test]
+    fn session_capture_index_for_finds_target_layers() {
+        let sess = DFlashCaptureSession::new(vec![1, 6, 11, 17, 22, 27], 4, 2816, false);
+        assert_eq!(sess.capture_index_for(1), Some(0));
+        assert_eq!(sess.capture_index_for(11), Some(2));
+        assert_eq!(sess.capture_index_for(27), Some(5));
+        assert_eq!(sess.capture_index_for(0), None);
+        assert_eq!(sess.capture_index_for(5), None);
+        assert_eq!(sess.capture_index_for(28), None);
+    }
+
+    #[test]
+    fn session_write_layer_slab_places_data_at_correct_offset() {
+        let mut sess = DFlashCaptureSession::new(vec![1, 6, 11, 17, 22, 27], 3, 4, false);
+        // Layer-2 slab: capture_layer_idx=2; offset = 2 * 3 * 4 = 24
+        let slab = vec![5.0f32; 3 * 4];
+        sess.write_layer_slab(2, &slab).expect("write");
+        for i in 0..sess.hidden_output.len() {
+            let expected = if (24..36).contains(&i) { 5.0 } else { 0.0 };
+            assert_eq!(sess.hidden_output[i], expected, "i={i}");
+        }
+    }
+
+    #[test]
+    fn session_as_view_borrows_buffers_consistently() {
+        let mut sess = DFlashCaptureSession::new(vec![1, 6], 2, 4, true);
+        // Write something via session
+        let slab = vec![3.0f32; 2 * 4];
+        sess.write_layer_slab(0, &slab).expect("write");
+        // Borrow as view — should see the same data
+        let view = sess.as_view();
+        for i in 0..8 {
+            assert_eq!(view.hidden_output[i], 3.0);
+        }
+        assert!(view.per_position_argmaxes.is_some());
     }
 
     /// End-to-end integration: simulates the post-target-verify state
