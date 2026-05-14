@@ -97,6 +97,79 @@ pub fn step_round_from_argmaxes(
     }
 }
 
+/// One target-side spec-decode round: target verify on
+/// `[last_committed, d_1, ..., d_K]`, accept-prefix, KV rollback.
+///
+/// Composes:
+/// - `MlxModelWeights::forward_decode_verify_batched` (returns K+1
+///   per-position argmaxes)
+/// - `step_round_from_argmaxes` (greedy accept-prefix + EOS check)
+/// - `MlxModelWeights::rollback_kv` (clears the rejected K/V writes)
+///
+/// The DRAFTER side — generating the `drafts` slice — is the
+/// orchestrator caller's responsibility (they call the drafter via
+/// `dispatch_dflash_model_forward` + apply target's lm_head on the
+/// drafter's output + argmax per position). This function is the
+/// target-side composition.
+///
+/// # Arguments
+///
+/// - `target`: MlxModelWeights with NO dflash_capture installed
+///   (this function installs/takes its own internal session)
+/// - `last_committed_token`: the token most recently committed to the
+///   output sequence (becomes verify_input[0])
+/// - `drafts`: K candidate tokens proposed by the drafter
+/// - `current_seq_pos`: target's current KV write position; verify
+///   appends at this offset
+/// - `eos_token_ids`: stop conditions
+/// - `gpu`: GpuContext (mlx-native exec + registry)
+///
+/// # Returns
+///
+/// `RoundResult{ committed_tokens, accept_count, hit_eos }`. Committed
+/// tokens = `drafts[..accept_count] + [target_continuation]`. The
+/// caller appends these to the output sequence and advances seq_pos
+/// by `committed_tokens.len()`.
+///
+/// # Greedy byte-identity guarantee
+///
+/// At temperature=0 (greedy), this function emits tokens
+/// byte-identical to single-token target decode for the same prompt.
+/// Proof: `forward_decode_verify_batched` runs target's exact
+/// dispatchers on K+1 tokens; argmax at each position is what
+/// single-token decode would emit at that position; `accept_prefix_argmax`
+/// only accepts drafts that match those argmaxes, falling through to
+/// target's own argmax at the first mismatch.
+pub fn dispatch_dflash_spec_decode_round_target_side(
+    target: &mut crate::serve::forward_mlx::MlxModelWeights,
+    last_committed_token: u32,
+    drafts: &[u32],
+    current_seq_pos: usize,
+    eos_token_ids: &[u32],
+    gpu: &mut crate::serve::gpu::GpuContext,
+) -> anyhow::Result<RoundResult> {
+    // 1. Build verify input: [last_committed, d_1, …, d_K]
+    let mut verify_input = Vec::with_capacity(drafts.len() + 1);
+    verify_input.push(last_committed_token);
+    verify_input.extend_from_slice(drafts);
+
+    // 2. Target verify: returns per-position argmaxes
+    let argmaxes = target
+        .forward_decode_verify_batched(&verify_input, current_seq_pos, gpu)
+        .map_err(|e| anyhow::anyhow!("spec_decode_round: verify_batched: {e}"))?;
+
+    // 3. Accept-prefix + EOS
+    let round = step_round_from_argmaxes(drafts, &argmaxes, eos_token_ids);
+
+    // 4. KV rollback: reject K - accept_count positions
+    let rollback = drafts.len().saturating_sub(round.accept_count);
+    if rollback > 0 {
+        target.rollback_kv(rollback);
+    }
+
+    Ok(round)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
