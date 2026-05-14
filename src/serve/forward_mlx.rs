@@ -1717,7 +1717,7 @@ impl MlxModelWeights {
     /// Eliminates `seq_len - 1` `commit_and_wait` syncs.  Profile data
     /// shows ~5-7 ms per sync, so for seq_len=8 we expect ~35-50 ms
     /// savings per call (validated by iter-71 bench).
-    fn per_position_argmax_from_hidden_batched_impl(
+    pub(crate) fn per_position_argmax_from_hidden_batched_impl(
         &mut self,
         hidden: &[f32],
         seq_len: u32,

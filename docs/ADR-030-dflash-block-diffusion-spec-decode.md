@@ -1189,3 +1189,61 @@ still GREEN at N=16 byte-identity vs single-token decode.
   HF2Q_DFLASH_BATCH_ARGMAX=1).
 - `docs/research/adr030_iter68_bench/results_iter70.tsv` —
   comparison data showing 27-42% gain over iter-69 across N.
+
+### iter-71 (2026-05-14) — Incremental drafter cache + batched argmax (default)
+
+Two small contained perf-positive changes:
+
+(1) **Incremental drafter cache**: preserve drafter cache state across
+rounds (was: `drafter_cache.reset()` every round and re-feed the FULL
+prior ctx).  Now extracts only NEW positions from `prior_captured`
+(= `prior_ctx_len - drafter_cache.layers[0].seq_len`) per round.
+Drafter's RoPE offsets (`prior_offset = cache_layer.seq_len`) advance
+correctly across rounds — matches the ADR-030 spec's incremental design.
+Per-round drafter forward cost is dominated by per-call fixed
+overhead, not ctx_chunk size, so the perf win is small (~0.5 ms/round)
+but the change is architecturally correct.
+
+(2) **Always-on batched argmax** in the orchestrator: both drafter
+argmax (block_size positions) and target argmax (block_size verify
+positions) now call `per_position_argmax_from_hidden_batched_impl`
+directly.  Eliminates K = 7 commit-and-wait syncs per argmax call,
+saving ~1.5 ms per argmax site (~3 ms/round across both).
+
+**Per-stage delta** (N=16, single profiling run):
+```
+                  iter-70  iter-71  delta
+drafter_argmax    10.42   →  8.83   (-1.6 ms, -15%)
+target_argmax     11.21   →  9.71   (-1.5 ms, -13%)
+TOTAL            114.12   → 111.91  (-2.2 ms, -2%)
+```
+
+**Bench results** (2 trials, 20s cool-downs):
+
+| N | baseline t/s | spec t/s | vs iter-70 |
+|---|---|---|---|
+|  8 | 103.8 | 9.15 | +1.7% (9.00→9.15) |
+| 16 |  99.5 | 9.05 | +3.4% (8.75→9.05) |
+| 32 |  97.3 | 8.80 | +3.5% (8.50→8.80) |
+
+Mission gap: 11.4× → ~11.1× slower.
+
+Cumulative iter-68 → iter-71 progression at N=16:
+4.40 → 6.90 → 8.75 → 9.05 t/s = **+106%** over iter-68 baseline.
+
+**Coherence preserved**: e2e gate at N=16 byte-identity ✓.
+
+**Code artifacts (iter-71)**:
+- `src/inference/spec_decode/dflash/orchestrator.rs` — drafter cache
+  not reset between rounds; extract only NEW rows; route both argmax
+  calls through `per_position_argmax_from_hidden_batched_impl`.
+- `src/serve/forward_mlx.rs` — batched impl exposed as `pub(crate)`.
+- `docs/research/adr030_iter68_bench/results_iter71.tsv`.
+
+**Mission state at iter-71 end**:
+- Coherence: GREEN on untemplated N=16 ✓
+- Production wire-up: ✓ (HF2Q_SPEC_DFLASH=1)
+- Perf: 0.091× baseline (was 0.045× at iter-68 → **2.02× spec-decode improvement**)
+- Remaining: ~11× to ≥1.07× mission gate → requires Option A
+  (cross-length SDPA) to attack the dominant verify_prefill stage
+  (78 ms = 72% of remaining wall-clock per round).

@@ -624,33 +624,61 @@ pub fn dispatch_dflash_generate(
             prior_ctx_len, output.len() - 1,
         );
 
-        // 3. Extract drafter_concat from the prior capture and upload
-        //    to GPU.  drafter cache is reset so it appends the FULL
-        //    prior ctx as fresh K/V each round.
+        // 3. Extract NEW drafter_concat rows from the prior capture and
+        //    upload to GPU.
+        //
+        // iter-71: incremental drafter cache.  Instead of resetting the
+        // drafter cache each round and re-feeding the FULL prior ctx,
+        // we preserve cache state across rounds and append only NEW
+        // positions per round (= prior_ctx_len - cached_seq_len).  The
+        // drafter's RoPE offsets (prior_offset = cache_layer.seq_len)
+        // advance correctly across rounds (see
+        // forward.rs:798-849).  At 0% acceptance rate, new_rows=1 per
+        // round vs the previous ~P+r rows → ~5-10× faster drafter_fwd.
         let t0_extract = if profile_on { Some(std::time::Instant::now()) } else { None };
-        let drafter_concat_vec = extract_drafter_concat(
+        let drafter_cached_seq_len = drafter_cache.layers[0].seq_len as usize;
+        debug_assert!(
+            prior_ctx_len >= drafter_cached_seq_len,
+            "drafter cache state regressed: cached={} prior_ctx_len={}",
+            drafter_cached_seq_len, prior_ctx_len,
+        );
+        let drafter_new_rows = prior_ctx_len - drafter_cached_seq_len;
+        let n_target_layers = drafter_cfg.target_layer_ids.len();
+        let row_stride = n_target_layers * hs;
+        let drafter_concat_vec_full = extract_drafter_concat(
             &prior_captured.hidden_output,
             &combined_capture_ids,
             &drafter_cfg.target_layer_ids,
             prior_ctx_len,
             hs,
         )?;
+        // Take only the LAST drafter_new_rows rows (= positions
+        // [drafter_cached_seq_len..prior_ctx_len) in the prior_captured
+        // slab).  drafter_concat_vec_full is [prior_ctx_len, row_stride].
+        let new_rows_start = drafter_cached_seq_len * row_stride;
+        let drafter_concat_new: &[f32] = &drafter_concat_vec_full[new_rows_start..];
+        debug_assert_eq!(
+            drafter_concat_new.len(),
+            drafter_new_rows * row_stride,
+            "drafter_concat_new length mismatch",
+        );
         let target_hidden_concat = {
             let (exec, _reg) = gpu.split();
             let dev = exec.device();
             let mut buf = dev
                 .alloc_buffer(
-                    drafter_concat_vec.len() * 4,
+                    drafter_concat_new.len() * 4,
                     mlx_native::DType::F32,
-                    vec![prior_ctx_len, drafter_cfg.target_layer_ids.len() * hs],
+                    vec![drafter_new_rows.max(1), row_stride],
                 )
                 .map_err(|e| anyhow::anyhow!("generate: alloc target_hidden_concat: {e}"))?;
-            buf.as_mut_slice::<f32>()
-                .map_err(|e| anyhow::anyhow!("generate: target_hidden_concat slice: {e}"))?
-                .copy_from_slice(&drafter_concat_vec);
+            if drafter_new_rows > 0 {
+                buf.as_mut_slice::<f32>()
+                    .map_err(|e| anyhow::anyhow!("generate: target_hidden_concat slice: {e}"))?
+                    .copy_from_slice(drafter_concat_new);
+            }
             buf
         };
-        drafter_cache.reset();
         if let Some(t) = t0_extract { t_extract_concat_ms += t.elapsed().as_secs_f64() * 1000.0; }
 
         // 4. Drafter forward → h_final shape [block_size, hidden]
@@ -667,7 +695,7 @@ pub fn dispatch_dflash_generate(
                 drafter_cache,
                 drafter_cfg,
                 block_size,
-                prior_ctx_len as u32,
+                drafter_new_rows as u32,
             )
             .context("generate: drafter forward")?
         };
@@ -676,6 +704,10 @@ pub fn dispatch_dflash_generate(
         // 5. lm_head per position on drafter's h_final → K drafts
         //    (index 0 is for last_token's position which we already
         //    know; we want predictions at positions 1..block_size).
+        //    iter-71: route through batched argmax impl (one command
+        //    buffer for all block_size positions instead of K+1
+        //    separate commit-and-wait syncs).  Bit-identical to the
+        //    un-batched path at temp=0 (verified by the e2e gate).
         let t0_drafter_argmax = if profile_on { Some(std::time::Instant::now()) } else { None };
         let drafts: Vec<u32> = {
             let h_final_slice: &[f32] = h_final
@@ -683,7 +715,7 @@ pub fn dispatch_dflash_generate(
                 .map_err(|e| anyhow::anyhow!("generate: h_final slice: {e}"))?;
             let host_copy: Vec<f32> = h_final_slice.to_vec();
             let all_argmaxes = target
-                .per_position_argmax_from_hidden_opt(&host_copy, block_size, false, gpu)
+                .per_position_argmax_from_hidden_batched_impl(&host_copy, block_size, false, gpu)
                 .map_err(|e| anyhow::anyhow!("generate: drafter argmax: {e}"))?;
             all_argmaxes[1..].to_vec()
         };
@@ -735,7 +767,7 @@ pub fn dispatch_dflash_generate(
         debug_assert_eq!(verify_end, verify_prefix_len);
         let verify_slab_tail: &[f32] = &final_slab[verify_start * hs..verify_end * hs];
         let target_argmaxes = target
-            .per_position_argmax_from_hidden_opt(
+            .per_position_argmax_from_hidden_batched_impl(
                 verify_slab_tail,
                 block_size,
                 true,
