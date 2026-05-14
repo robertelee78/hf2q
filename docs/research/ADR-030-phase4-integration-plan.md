@@ -1,0 +1,198 @@
+# ADR-030 Phase 4 — Target integration plan
+
+**Date**: 2026-05-13 (iter-36)
+**Status**: planning artifact, no code change yet
+**Audience**: this is a planning doc to lock in the integration shape
+before modifying `forward_mlx.rs` / `forward_prefill_batched.rs`.
+
+## The remaining Phase 4 work
+
+To get end-to-end DFlash spec-decode running, we need:
+
+1. **Target hidden-state capture** at `target_layer_ids = [1, 6, 11, 17, 22, 27]`
+   during the target's verify forward pass. The captured hidden states are
+   the input to `dispatch_dflash_fc` (the drafter's `target_hidden_concat`
+   argument).
+
+2. **Per-position argmax emission** from the target's verify forward.
+   Currently `forward_prefill_batched` returns only the LAST-row argmax;
+   we need all `seq_len` positions for `accept_prefix_argmax`.
+
+3. **`forward_decode_verify_batched` body replacement** at
+   `forward_prefill_batched.rs:2665`. Currently a temporary delegation
+   to `forward_decode_verify_serial`. The replacement calls the modified
+   `forward_prefill_batched` (with capture + per-position argmax) +
+   returns both outputs.
+
+4. **Target KV rollback** after spec-decode round: existing
+   `MlxModelWeights::rollback_kv` (`forward_mlx.rs:5733`) handles this —
+   just needs to be called by the orchestrator with `K - accept_count`.
+
+5. **Embed lookup + lm_head matmul** wrappers callable from the orchestrator
+   without re-entering the full `forward_prefill_batched` body. The drafter
+   needs embedded tokens as input (`h` in `dispatch_dflash_model_forward`)
+   and target's lm_head applied to its output.
+
+## Proposed API shape
+
+### 1. Modify `forward_prefill_batched` signature
+
+```rust
+// Before (iter-138, current production):
+pub fn forward_prefill_batched(
+    &mut self,
+    prompt_tokens: &[u32],
+    max_decode_tokens: usize,
+    start_pos: usize,
+    gpu: &mut GpuContext,
+) -> Result<u32>;
+
+// After (Phase 4 iter-X):
+pub fn forward_prefill_batched(
+    &mut self,
+    prompt_tokens: &[u32],
+    max_decode_tokens: usize,
+    start_pos: usize,
+    gpu: &mut GpuContext,
+    capture: Option<&mut PrefillCapture>,
+) -> Result<PrefillResult>;
+
+pub struct PrefillCapture<'a> {
+    /// Layer indices at which to capture pf_hidden. Indices outside
+    /// this set are not captured.
+    pub target_layer_ids: &'a [usize],
+    /// Output buffer, layout [num_capture_layers, seq_len, hidden_size]
+    /// F32 row-major. Pre-allocated by caller.
+    pub hidden_output: &'a mut [f32],
+    /// Per-position argmax output. Length seq_len. Pre-allocated.
+    /// When None, function preserves legacy single-argmax-return behavior.
+    pub per_position_argmaxes: Option<&'a mut [u32]>,
+}
+
+pub struct PrefillResult {
+    /// Last-row argmax (= legacy return value). Always emitted.
+    pub last_argmax: u32,
+    /// True if capture was performed and per_position_argmaxes was
+    /// populated.
+    pub did_capture: bool,
+}
+```
+
+**Compatibility**: production callers pass `None` and read
+`PrefillResult.last_argmax`. Byte-identical to legacy behavior.
+
+### 2. Hook point for hidden capture
+
+End of layer loop iteration, after `pf_hidden` has been written with
+the layer's output. Approximate line: TBD after closer reading of the
+layer-loop body (line 765-end-of-iter). Pseudocode:
+
+```rust
+for (layer_idx, layer) in self.layers.iter().enumerate() {
+    // ... existing layer body (norms, QKV, attn, MLP, residuals) ...
+    // ... after pf_hidden is written with layer output ...
+
+    if let Some(cap) = capture.as_deref_mut() {
+        if let Some(target_idx) = cap.target_layer_ids.iter().position(|&i| i == layer_idx) {
+            let pf_data: &[f32] = pf_hidden.as_slice()
+                .map_err(|e| anyhow!("capture pf_hidden L{layer_idx}: {e}"))?;
+            let dst_start = target_idx * seq_len * hs;
+            let dst_end = dst_start + seq_len * hs;
+            cap.hidden_output[dst_start..dst_end].copy_from_slice(pf_data);
+        }
+    }
+}
+```
+
+### 3. Per-position argmax emission
+
+Currently the tail of `forward_prefill_batched` (lines 1981-2034 per
+the existing iter-116 design refinement comment) computes only the
+LAST-row argmax. For Phase 4 we need argmax at every position.
+
+Approach: replace the single argmax dispatch with a per-position loop
+(metadata-only — pf_hidden already holds all `seq_len` rows). Run
+final_norm + lm_head + argmax for every row, store into the
+`per_position_argmaxes` buffer.
+
+Cost: O(seq_len) argmaxes instead of O(1). For verify (seq_len = K+1 ≈ 8),
+this is ~8× overhead at the LM head stage only. The full forward is
+unchanged — only the tail is affected.
+
+### 4. Embed + lm_head wrappers
+
+These already exist as internal helpers. We just need to expose them
+as `pub fn` for orchestrator use:
+- `pub fn dispatch_embed_tokens(...)` — looks up embed_tokens[token_id]
+- `pub fn dispatch_target_lm_head(...)` — applies lm_head + softcap
+
+Both can be thin wrappers around the existing internal dispatches in
+forward_prefill_batched's tail.
+
+### 5. `forward_decode_verify_batched` replacement
+
+```rust
+pub fn forward_decode_verify_batched(
+    &mut self,
+    tokens: &[u32],
+    start_seq_pos: usize,
+    gpu: &mut GpuContext,
+    capture: Option<&mut PrefillCapture>,
+) -> Result<Vec<u32>> {
+    // No longer a delegation to serial. Real batched body:
+    let mut argmaxes = vec![0u32; tokens.len()];
+    let mut cap = capture.unwrap_or_else(...).extend_or_set_per_position(&mut argmaxes);
+    let _ = self.forward_prefill_batched(
+        tokens, 0 /* no further decode */, start_seq_pos, gpu, Some(&mut cap),
+    )?;
+    Ok(argmaxes)
+}
+```
+
+## Risk + mitigation
+
+| Concern | Risk | Mitigation |
+|---|---|---|
+| 4 production call sites need update | Low | Pass `None` for `capture`, read `PrefillResult.last_argmax`. Mechanical |
+| Per-position argmax breaks legacy callers | Low | Only runs when `capture.per_position_argmaxes` is Some |
+| Capture buffer layout mismatch with drafter | Medium | Strict shape check at orchestrator entry; assert pf_input_dim = num_capture_layers × hidden_size |
+| Captured hidden differs from Python `model._hidden_states` | High — coherence-blocking | Phase 4 parity test: capture from hf2q + Python, compare element-wise within bf16 tolerance |
+| `forward_decode_verify_batched` body change breaks ADR-028 iter-139 callers | Low (none in production yet) | Existing function is dead-code-flagged (no callers); behavior was "serial via fallback" anyway |
+
+## Phase 4 milestone gate
+
+After this integration, run:
+
+```bash
+HF2Q_SPEC_DFLASH=1 hf2q generate --temp 0 --model gemma-4-26b-a4b-it-ara-abliterated.gguf \
+  --prompt "How many positive whole-number divisors does 196 have?"
+```
+
+Compare output byte-for-byte against `HF2Q_SPEC_DFLASH=0` at temp=0.
+**Byte-identity required** — any divergence fails the coherence gate.
+
+Then run `scripts/coherence-harness/coherence_bench.sh` on all 18 golden
+fixtures + 100 random prompts.
+
+## Order of operations (proposed)
+
+1. (1 iter) Add `pub fn` wrappers for embed_tokens + lm_head in
+   `forward_mlx.rs`. No layer-body changes.
+2. (1-2 iters) Add `Option<PrefillCapture>` parameter + capture hook at
+   end-of-layer-iter in `forward_prefill_batched.rs`. Update 4 production
+   call sites to pass None. Test that build + existing test suite still
+   pass byte-for-byte.
+3. (1 iter) Add per-position argmax emission in the tail. Smoke test
+   verifies argmaxes match `forward_decode_verify_serial` byte-for-byte
+   at K=0.
+4. (1-2 iters) Replace `forward_decode_verify_batched` body.
+5. (1 iter) Wire orchestrator end-to-end: drafter forward + target
+   verify + accept_prefix + KV rollback. Smoke test on one prompt.
+6. (1-2 iters) Run coherence gate + golden harness. Debug any
+   divergences.
+7. (1 iter) Run perf gate vs hf2q baseline.
+
+Total: ~7-10 iters to complete Phase 4. Per the per-iter cadence
+established (~5 min wall, ~150-300 LOC per iter for non-monolith work,
+slower for monolith touches) this is 1-3 hours of remaining work for
+Phase 4.
