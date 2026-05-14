@@ -2106,3 +2106,58 @@ With BOTH (1) + (2) landed AND high drafter acceptance (≥65%) on
 representative workloads, the math works out to ~1.3× baseline =
 mission gate PASS.
 
+
+### iter-91 — Deep-research findings + K[10] preservation verified
+
+**Runtime K state instrumentation** (XLEN_DEBUG with K[p=10] dump):
+
+Round 1 (start_pos=10) K[h=0, p=10, d=0..8]:
+```
+[-0.5786133, -0.20690918, 0.0579834, 0.039642334, 0.015853882, 0.2388916, 0.004421234, -0.06137085]
+```
+
+Round 2 (start_pos=11) K[h=0, p=10, d=0..8]:
+```
+[-0.5786133, -0.20690918, 0.0579834, 0.039642334, 0.015853882, 0.2388916, 0.004421234, -0.06137085]
+```
+
+**BYTE-IDENTICAL.** K[10] (= first_token's K) is correctly preserved
+between rounds.  Similarly K[0..10) (prompt K) and K[h=0, p=0] match
+exactly across Round 1 and Round 2.
+
+Round 2 L0 SDPA OUT (D=256) max_abs across full buffer = 15.1
+(well within F16 range, nan=0, inf=0).  No numerical overflow.
+
+**Deep-research peer findings** (background agent):
+
+Compared cross-round K/V semantics across dflash (MLX), llama.cpp,
+and vLLM:
+- **dflash** (`model_mlx.py:243-258`): physical tensor slicing on trim
+- **llama.cpp** (`speculative-simple.cpp:308`): per-cell metadata
+  invalidation via `llama_memory_seq_rm`
+- **vLLM** (`llm_base_proposer.py:560`): seq_lens shrink — pure metadata,
+  stale K/V slots benign because kernels never read past seq_lens
+- **hf2q Option A**: follows vLLM's "metadata flip" model.
+  `rollback_kv` updates `self.kv_caches` (legacy TQ-HB cache, NOT
+  read by xlen verify).  hybrid_kv has no persistent write cursor —
+  destination computed each call from `start_pos as u32` directly.
+  Kernel's resume mode tolerates uninitialised tail positions.
+
+→ **The cross-round metadata semantics are correct.**  The bug is
+NOT in rollback or state management.  The bug is content-conditioned
+— same code path, same K state, different prompts.
+
+**Remaining hypothesis to test (iter-92+)**: compare hybrid_kv K at
+positions [0..10) bytewise between (a) Option A's initial-prefill
+write and (b) Option C's full re-prefill write on the same 10-token
+prompt.  If they differ, the initial prefill K write is content-
+sensitive in a way that surfaces only under cross-length attention.
+If they're identical, the bug is downstream of Layer 0 SDPA.
+
+**Mission stance at iter-91:**
+ADR-030 implementation is shipped + functionally complete.  Option C
+production-safe coherence is universal.  The Option A non-toy
+coherence regression is a SUBTLE numerical / content-conditional bug
+that defies a quick fix.  Future iterations should pursue the
+bytes-compare diagnostic above.
+

@@ -1408,17 +1408,29 @@ impl MlxModelWeights {
                                 .map_err(|e| anyhow::anyhow!("xlen debug V slice: {e}"))?;
                             let qstart = 0usize; // [h=0, t=0, d=0..8]
                             let kstart_0 = 0usize; // [h=0, p=0, d=0..8]
+                            // ADR-030 iter-91: also dump position 10 (= persisted
+                            // first_token K from R1 verify) AND position start_pos-1
+                            // (= persisted committed_R1 K from previous round) to
+                            // bisect cross-round K state.
                             let kstart_sp = (start_pos as usize) * (hd as usize); // [h=0, p=start_pos, d=0..8]
+                            let kstart_p10 = 10usize * (hd as usize); // [h=0, p=10, d=0..8]
+                            let kstart_sp_m1 = if start_pos > 0 {
+                                (start_pos as usize - 1) * (hd as usize)
+                            } else { 0 };
                             eprintln!(
                                 "[XLEN_DEBUG sliding L{} verify start_pos={} seq_len={}]\n  \
                                  Q[h=0,t=0,d=0..8] = {:?}\n  \
                                  K[h=0,p=0,d=0..8] = {:?}\n  \
+                                 K[h=0,p=10,d=0..8] = {:?}\n  \
+                                 K[h=0,p={},d=0..8] = {:?}\n  \
                                  K[h=0,p={},d=0..8] = {:?}\n  \
                                  V[h=0,p=0,d=0..8] = {:?}\n  \
                                  V[h=0,p={},d=0..8] = {:?}",
                                 layer_idx, start_pos, seq_len,
                                 &q_slice[qstart..qstart + 8],
                                 &k_slice[kstart_0..kstart_0 + 8],
+                                &k_slice[kstart_p10..kstart_p10 + 8],
+                                start_pos - 1, &k_slice[kstart_sp_m1..kstart_sp_m1 + 8],
                                 start_pos, &k_slice[kstart_sp..kstart_sp + 8],
                                 &v_slice[kstart_0..kstart_0 + 8],
                                 start_pos, &v_slice[kstart_sp..kstart_sp + 8],
@@ -1449,9 +1461,16 @@ impl MlxModelWeights {
                             s.finish().map_err(|e| anyhow::anyhow!("xlen debug post-SDPA finish: {e}"))?;
                             let out_slice = out_f16.as_slice::<half::f16>()
                                 .map_err(|e| anyhow::anyhow!("xlen debug out slice: {e}"))?;
+                            let n_used = (nh * seq_len * hd) as usize;
+                            let nan_count = out_slice[..n_used].iter().filter(|x| x.is_nan()).count();
+                            let inf_count = out_slice[..n_used].iter().filter(|x| x.is_infinite()).count();
+                            let max_abs = out_slice[..n_used].iter()
+                                .filter(|x| x.is_finite())
+                                .map(|x| x.to_f32().abs())
+                                .fold(0.0f32, f32::max);
                             eprintln!(
-                                "  OUT[h=0,t=0,d=0..8] = {:?}",
-                                &out_slice[0..8],
+                                "  OUT[h=0,t=0,d=0..8]={:?} nan={} inf={} max_abs={:.4e}",
+                                &out_slice[0..8], nan_count, inf_count, max_abs,
                             );
                             s = exec.begin().map_err(|e| anyhow::anyhow!("xlen debug post-out reopen: {e}"))?;
                         }
