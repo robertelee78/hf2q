@@ -792,9 +792,20 @@ pub fn dispatch_dflash_decoder_layer_attention(
     layer_weights: &DFlashLayerTensors,
     cache_layer: &mut super::kv_cache::DFlashLayerKvCache,
     cfg: &DFlashConfig,
+    layer_idx: usize,
     block_size: u32,
     ctx_chunk_size: u32,
 ) -> Result<MlxBuffer> {
+    // ADR-030 iter-87 — DFlash drafter uses CAUSAL attention for sliding
+    // layers and BIDIRECTIONAL (mask=None) for full_attention layers.
+    // Block-diffusion needs bidirectional within the block so each mask
+    // position produces a different prediction (without it, all mask
+    // positions collapse to the same next-token prediction).  Matches
+    // peer dflash/model_mlx.py:109-114.
+    let do_causal = matches!(
+        cfg.layer_types[layer_idx],
+        super::config::LayerType::SlidingAttention
+    );
     let prior_offset = cache_layer.seq_len;
     let n_q = cfg.num_attention_heads as u32;
     let n_kv = cfg.num_key_value_heads as u32;
@@ -887,7 +898,7 @@ pub fn dispatch_dflash_decoder_layer_attention(
         .command_encoder()
         .context("decoder_layer_attention: open encoder for sdpa")?;
     let attn_out = dispatch_dflash_sdpa_cross_length(
-        &mut sdpa_enc, registry, device, &q_roped, cache_layer, cfg, l, kv_seq_len,
+        &mut sdpa_enc, registry, device, &q_roped, cache_layer, cfg, l, kv_seq_len, do_causal,
     )
     .context("layer attn: sdpa cross-length")?;
     // dispatch_dflash_sdpa_cross_length commits internally; sdpa_enc is dead.
@@ -974,7 +985,7 @@ pub fn dispatch_dflash_model_forward(
         let h_out = dispatch_dflash_decoder_layer(
             registry, device, h_in, &h_ctx,
             &model.layers[layer_idx], &mut cache.layers[layer_idx],
-            cfg, block_size, ctx_chunk_size,
+            cfg, layer_idx, block_size, ctx_chunk_size,
         )
         .with_context(|| format!("model_forward: layer {layer_idx}"))?;
         h_curr_owned = Some(h_out);
@@ -1018,12 +1029,13 @@ pub fn dispatch_dflash_decoder_layer(
     layer_weights: &DFlashLayerTensors,
     cache_layer: &mut super::kv_cache::DFlashLayerKvCache,
     cfg: &DFlashConfig,
+    layer_idx: usize,
     block_size: u32,
     ctx_chunk_size: u32,
 ) -> Result<MlxBuffer> {
     // 1. Attention sub-block (internally commits + opens encoders).
     let attn_proj = dispatch_dflash_decoder_layer_attention(
-        registry, device, h, h_ctx, layer_weights, cache_layer, cfg, block_size, ctx_chunk_size,
+        registry, device, h, h_ctx, layer_weights, cache_layer, cfg, layer_idx, block_size, ctx_chunk_size,
     )
     .context("decoder_layer: attention sub-block")?;
 
@@ -1107,6 +1119,7 @@ pub fn dispatch_dflash_sdpa_cross_length(
     cfg: &DFlashConfig,
     q_seq_len: u32,
     kv_seq_len: u32,
+    do_causal: bool,
 ) -> Result<MlxBuffer> {
     let n_heads = cfg.num_attention_heads as u32;
     let n_kv_heads = cfg.num_key_value_heads as u32;
@@ -1156,6 +1169,7 @@ pub fn dispatch_dflash_sdpa_cross_length(
         kv_seq_len,
         scale,
         kv_capacity: cache_layer.capacity,
+        do_causal,
     };
 
     // Fresh encoder for SDPA dispatch.
@@ -1587,7 +1601,7 @@ mod tests {
         let h_out = dispatch_dflash_decoder_layer(
             &mut registry, &device, &h, &h_ctx,
             &tensors.layers[layer_idx], &mut cache.layers[layer_idx],
-            &cfg, block_size, ctx_chunk,
+            &cfg, layer_idx, block_size, ctx_chunk,
         )
         .expect("decoder layer forward");
 
@@ -1671,7 +1685,7 @@ mod tests {
         let attn_out = dispatch_dflash_decoder_layer_attention(
             &mut registry, &device, &h, &h_ctx,
             &tensors.layers[layer_idx], &mut cache.layers[layer_idx],
-            &cfg, block_size, ctx_chunk,
+            &cfg, layer_idx, block_size, ctx_chunk,
         )
         .expect("decoder layer attention");
 
@@ -1757,7 +1771,7 @@ mod tests {
         let mut encoder = device.command_encoder().expect("encoder");
         let out = dispatch_dflash_sdpa_cross_length(
             &mut encoder, &mut registry, &device,
-            &q, &cache.layers[layer_idx], &cfg, q_seq_len, ctx_len,
+            &q, &cache.layers[layer_idx], &cfg, q_seq_len, ctx_len, true,
         )
         .expect("sdpa cross-length");
 

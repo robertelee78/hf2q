@@ -1248,6 +1248,7 @@ pub fn apply_sdpa_causal(
         kv_seq_len: seq_len,
         scale: 1.0 / (head_dim as f32).sqrt(),
         kv_capacity: 0, // 0 = use kv_seq_len
+        do_causal: true,
     };
 
     sdpa(encoder, registry, device, q_head_major, k_head_major, v_head_major, &out, &params, 1)
@@ -2589,6 +2590,7 @@ pub fn apply_sdpa_with_kv_cache(
                 kv_seq_len,
                 scale: 1.0 / (d as f32).sqrt(),
                 kv_capacity: max_seq_len,
+                do_causal: true,
             };
             let mut enc = device.command_encoder().context("enc sdpa kv-cache prefill")?;
             // iter-29 (sub-sub-iter 23c-α): F32 head_dim-fallback prefill.
@@ -4973,6 +4975,7 @@ mod tests {
                 kv_seq_len: seq_full, // 64 — full slot
                 scale,
                 kv_capacity,
+                do_causal: true,
             };
             let mut enc = device.command_encoder().expect("enc sdpa C");
             sdpa(

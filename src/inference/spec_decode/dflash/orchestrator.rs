@@ -850,6 +850,16 @@ pub fn dispatch_dflash_generate(
         // 8. Accept-prefix
         let round = step_round_from_argmaxes(&drafts, &target_argmaxes, eos_token_ids);
 
+        // ADR-030 iter-86 — per-round accept_count log (env-gated).
+        if std::env::var("HF2Q_DFLASH_PROFILE").as_deref() == Ok("1") {
+            eprintln!(
+                "[HF2Q_DFLASH_ACCEPT] round={rounds_count} accept_count={}/{} \
+                 drafts={drafts:?} target_argmaxes={target_argmaxes:?} \
+                 committed={:?}",
+                round.accept_count, drafts.len(), round.committed_tokens,
+            );
+        }
+
         // 9. Target rollback (Option A only — Option C re-prefills at
         //    start_pos=0 so no rollback needed).
         if xlen_sdpa {
