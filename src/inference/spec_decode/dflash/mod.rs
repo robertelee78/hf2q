@@ -11,5 +11,6 @@
 //! capture and the verify forward.
 
 pub mod config;
+pub mod forward;
 pub mod tensors;
 pub mod weights;
