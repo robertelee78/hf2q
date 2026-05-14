@@ -1360,6 +1360,14 @@ impl MlxModelWeights {
                             );
                         }
 
+                        // ADR-030 iter-80 — hypothesis 2 (GPU ordering)
+                        // FALSIFIED: inserting s.finish() between pre-SDPA
+                        // K/V writes and SDPA dispatch yields IDENTICAL
+                        // output, so the alternating-zeros bug is NOT a
+                        // memory ordering race.  Determinism + identical
+                        // output → bug is in cast chain, kernel params, or
+                        // layout (hypothesis 1 or 3 from iter-79 plan).
+
                         // ADR-030 iter-77 — cross-length SDPA verify path.
                         // Cast pf_q_perm BF16 → F32 → F16, call
                         // dispatch_flash_attn_prefill_f16_d256_resume with
