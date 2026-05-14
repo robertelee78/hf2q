@@ -37,9 +37,48 @@ use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::ops::softcap::dispatch_softcap;
 use crate::inference::models::qwen35::gpu_full_attn::{
     apply_imrope, apply_linear_projection_f32, apply_sdpa_causal_from_seq_major,
-    download_f32, permute_seq_head_dim_to_head_seq_dim_cpu, upload_f32,
+    permute_seq_head_dim_to_head_seq_dim_cpu, upload_f32,
 };
 use mlx_native::ops::sdpa::{sdpa, SdpaParams};
+
+/// Logical-bounded F32 download for DFlash drafter CPU-read sites.
+///
+/// `MlxBuffer::as_slice` returns a view of the full storage, which can
+/// be bucket-rounded by `decode_pool::pooled_alloc_buffer` (used inside
+/// `apply_imrope`). Bucket-rounded storage is safe for GPU-only feeds
+/// (the qwen35 hot path's contract), but the DFlash drafter must
+/// CPU-read the K/V projections to populate the cursor-mode cache, and
+/// the trailing bucket padding must NOT be appended.
+///
+/// This helper truncates to `buf.element_count()` (the product of the
+/// buffer's logical shape) before copying to a `Vec<f32>`. When the
+/// allocator returned a non-pooled buffer (e.g. `apply_linear_projection_f32`)
+/// `element_count()` equals storage and the helper is a no-op vs
+/// `download_f32`.
+///
+/// See `src/inference/models/qwen35/gpu_full_attn.rs:649` (apply_imrope
+/// pool alloc + the `kv_cache_slot=Some` GPU-only safety note that we
+/// explicitly do not satisfy in the DFlash drafter).
+fn download_f32_logical(buf: &MlxBuffer) -> Result<Vec<f32>> {
+    if buf.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "download_f32_logical: buffer dtype {} != f32",
+            buf.dtype()
+        ));
+    }
+    let storage: &[f32] = buf.as_slice().map_err(|e| anyhow!("as_slice: {e}"))?;
+    let logical = buf.element_count();
+    if storage.len() < logical {
+        return Err(anyhow!(
+            "download_f32_logical: storage slice len {} < logical element_count {} \
+             (shape {:?})",
+            storage.len(),
+            logical,
+            buf.shape(),
+        ));
+    }
+    Ok(storage[..logical].to_vec())
+}
 
 /// Build the `[eps, dim]` F32 params buffer required by [`dispatch_rms_norm`].
 ///
@@ -822,15 +861,20 @@ pub fn dispatch_dflash_decoder_layer_attention(
     // -------- Phase B: commit + CPU download + cache writes --------
     enc.commit_and_wait().context("layer attn: commit phase A")?;
 
-    let k_ctx_cpu = download_f32(&k_ctx_roped).context("download k_ctx")?;
-    let v_ctx_cpu = download_f32(&v_ctx).context("download v_ctx")?;
+    // download_f32_logical: K buffers come from apply_imrope which uses
+    // `pooled_alloc_buffer` (qwen35/gpu_full_attn.rs:649) that can be
+    // bucket-rounded.  We must truncate to the logical element count
+    // before appending into the cursor-mode cache, otherwise stale
+    // trailing pool bytes appear as extra "ctx" positions (iter-63 bug).
+    let k_ctx_cpu = download_f32_logical(&k_ctx_roped).context("download k_ctx")?;
+    let v_ctx_cpu = download_f32_logical(&v_ctx).context("download v_ctx")?;
     cache_layer
         .append_seq_major_kv(&k_ctx_cpu, &v_ctx_cpu, s, n_kv, head_dim)
         .context("layer attn: append ctx K/V to cache")?;
     debug_assert_eq!(cache_layer.seq_len, prior_offset + s);
 
-    let k_prop_cpu = download_f32(&k_prop_roped).context("download k_prop")?;
-    let v_prop_cpu = download_f32(&v_prop).context("download v_prop")?;
+    let k_prop_cpu = download_f32_logical(&k_prop_roped).context("download k_prop")?;
+    let v_prop_cpu = download_f32_logical(&v_prop).context("download v_prop")?;
     cache_layer
         .write_slack_kv(&k_prop_cpu, &v_prop_cpu, l, n_kv, head_dim)
         .context("layer attn: write prop K/V to cache slack")?;
@@ -1080,7 +1124,9 @@ pub fn dispatch_dflash_sdpa_cross_length(
     encoder.commit_and_wait().context("commit before sdpa cross-length permute")?;
 
     // CPU permute Q seq-major [L, H_q, D] → head-major [1, H_q, L, D].
-    let q_cpu = download_f32(q_seq_major)?;
+    // q_seq_major can come from apply_imrope (pool-allocated, bucket-rounded
+    // storage); use logical element count to avoid permuting trailing junk.
+    let q_cpu = download_f32_logical(q_seq_major)?;
     let q_hm_cpu = permute_seq_head_dim_to_head_seq_dim_cpu(
         &q_cpu,
         q_seq_len as usize,
@@ -1122,8 +1168,11 @@ pub fn dispatch_dflash_sdpa_cross_length(
     .map_err(|e| anyhow!("sdpa cross-length: {e}"))?;
     enc2.commit_and_wait().context("commit sdpa cross-length")?;
 
-    // CPU permute output head-major → seq-major.
-    let out_hm_cpu = download_f32(&out_hm)?;
+    // CPU permute output head-major → seq-major. `out_hm` was created by
+    // `device.alloc_buffer` (not pooled), so its element_count already
+    // equals storage — `download_f32_logical` is defensive parity with
+    // the other dflash download sites.
+    let out_hm_cpu = download_f32_logical(&out_hm)?;
     let mut out_sm_cpu = vec![0.0f32; out_elem];
     let nh = n_heads as usize;
     let l = q_seq_len as usize;

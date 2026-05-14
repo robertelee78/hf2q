@@ -343,20 +343,37 @@ impl MlxModelWeights {
         if tq_codebook_bits_prefill >= 5 {
             // ADR-028 Phase 10c (iter-348): hybrid F16-K + TQ-HB-V routing,
             // mirrors forward_mlx.rs decode lazy-alloc + forward_prefill.rs.
+            //
+            // ADR-030 iter-63 (extend-mode KV preservation): allocate only
+            // if `self.hybrid_kv` / `self.leg_hb_encoded` is None.  This
+            // matches forward_decode's lazy-alloc pattern at
+            // forward_mlx.rs:3045 (`&& self.hybrid_kv.is_none()`) and is
+            // load-bearing for spec-decode verify rounds, where the
+            // orchestrator calls forward_prefill_batched repeatedly with
+            // non-zero `start_pos` to APPEND to the existing cache.
+            // Without this guard the second call zeroed prompt + accepted
+            // K/V data, producing incoherent rounds despite
+            // pf_positions / write_pos already being correctly offset by
+            // iter-137/138.  All production callers pass `start_pos=0` on a
+            // fresh MlxModelWeights instance (hybrid_kv == None), so this
+            // is bit-identical to pre-iter-63 for the cmd_generate /
+            // parity / engine flows.
             if INVESTIGATION_ENV.hybrid_kv {
-                eprintln!("[ADR-028 Phase 10c] Allocating hybrid_kv ({} layers, F16 K + TQ-HB V {}-bit) [batched]",
-                    num_layers, tq_codebook_bits_prefill);
-                let mut hybrid_vec: Vec<crate::serve::forward_mlx::HybridKvBuffers> = Vec::with_capacity(num_layers);
-                for (layer_idx, layer) in self.layers.iter().enumerate() {
-                    let nkv_l = layer.num_kv_heads;
-                    let hd_l = layer.head_dim;
-                    let layer_is_ring = layer.layer_type == LayerType::Sliding;
-                    let capacity = if layer_is_ring { sw } else { linear_capacity };
-                    hybrid_vec.push(crate::serve::forward_mlx::alloc_hybrid_kv_for_layer(
-                        dev, layer_idx, nkv_l, hd_l, capacity, layer_is_ring)?);
+                if self.hybrid_kv.is_none() {
+                    eprintln!("[ADR-028 Phase 10c] Allocating hybrid_kv ({} layers, F16 K + TQ-HB V {}-bit) [batched]",
+                        num_layers, tq_codebook_bits_prefill);
+                    let mut hybrid_vec: Vec<crate::serve::forward_mlx::HybridKvBuffers> = Vec::with_capacity(num_layers);
+                    for (layer_idx, layer) in self.layers.iter().enumerate() {
+                        let nkv_l = layer.num_kv_heads;
+                        let hd_l = layer.head_dim;
+                        let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                        let capacity = if layer_is_ring { sw } else { linear_capacity };
+                        hybrid_vec.push(crate::serve::forward_mlx::alloc_hybrid_kv_for_layer(
+                            dev, layer_idx, nkv_l, hd_l, capacity, layer_is_ring)?);
+                    }
+                    self.hybrid_kv = Some(hybrid_vec);
                 }
-                self.hybrid_kv = Some(hybrid_vec);
-            } else {
+            } else if self.leg_hb_encoded.is_none() {
                 eprintln!("[iter-21 Track B] Allocating leg_hb_encoded ({}-bit, {} layers) [batched]",
                           tq_codebook_bits_prefill, num_layers);
                 let mut leg_hb_vec: Vec<HbKvBuffers> = Vec::with_capacity(num_layers);

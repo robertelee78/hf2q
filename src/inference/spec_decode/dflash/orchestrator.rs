@@ -40,6 +40,7 @@
 //! Target forward integration + KV rollback wiring land in subsequent
 //! commits.
 
+use anyhow::Context;
 use crate::inference::spec_decode::verifier::accept_prefix_argmax;
 
 /// Output of one spec-decode round.
@@ -605,7 +606,7 @@ pub fn dispatch_dflash_generate(
                 block_size,
                 captured_seq_len as u32,
             )
-            .map_err(|e| anyhow::anyhow!("generate: drafter forward: {e}"))?
+            .context("generate: drafter forward")?
         };
 
         // 4. lm_head per position on drafter's h_final → drafts
@@ -868,5 +869,194 @@ mod tests {
                 "layer {i} cache should advance by ctx_chunk"
             );
         }
+    }
+
+    /// End-to-end GPU integration test (ADR-030 iter-63).
+    ///
+    /// Loads the real target gemma-4-26b-a4b-it Q5_K_M GGUF + the
+    /// z-lab DFlash drafter safetensors, runs
+    /// [`dispatch_dflash_generate`] for a short prompt, and asserts the
+    /// pipeline produces a non-empty token sequence without panic.
+    ///
+    /// **Not a coherence gate.** Coherence (byte-identity vs single-token
+    /// decode at temp=0) is a separate test that requires comparison
+    /// against the existing per-token decode path; this test only
+    /// validates that the spec-decode pipeline runs end-to-end without
+    /// crashing and produces some output.
+    ///
+    /// Memory: loads ~20 GB target GGUF + ~820 MB drafter. Skipped by
+    /// default (`#[ignore]`). Run with:
+    /// ```text
+    /// cargo test --release --no-default-features --features metal-shaders \
+    ///     --test-threads=1 -- --ignored \
+    ///     spec_decode::dflash::orchestrator::tests::e2e_dispatch_dflash_generate_gemma4_26b
+    /// ```
+    #[test]
+    #[ignore = "requires gemma-4-26b GGUF + DFlash drafter HF cache + ~22GB RAM"]
+    fn e2e_dispatch_dflash_generate_gemma4_26b() {
+        use crate::inference::spec_decode::dflash::{
+            kv_cache::DFlashKvCache,
+            tensors::DFlashModelTensors,
+            weights::{DFlashWeights, DFlashWeightsFile},
+        };
+        use crate::serve::{
+            config::Gemma4Config,
+            forward_mlx::MlxModelWeights,
+            gpu::GpuContext,
+            header::LoadProgress,
+        };
+        use std::path::PathBuf;
+
+        // ---- Resolve paths ----
+        let target_gguf = PathBuf::from(
+            "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/\
+             gemma4-ara-2pass-APEX-Q5_K_M.gguf",
+        );
+        let tokenizer_path = PathBuf::from(
+            "/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/tokenizer.json",
+        );
+        let home = std::env::var("HOME").expect("HOME env set");
+        let drafter_dir = format!(
+            "{home}/.cache/huggingface/hub/\
+             models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/\
+             77d4202772dfe50b2396ec7bac9cfffc7b9e7057"
+        );
+        let drafter_cfg_path = format!("{drafter_dir}/config.json");
+        let drafter_safetensors_path = format!("{drafter_dir}/model.safetensors");
+
+        for p in [
+            &target_gguf,
+            &tokenizer_path,
+            &PathBuf::from(&drafter_cfg_path),
+            &PathBuf::from(&drafter_safetensors_path),
+        ] {
+            if !p.exists() {
+                panic!(
+                    "required artifact missing: {} — see test #[ignore] note",
+                    p.display()
+                );
+            }
+        }
+
+        // ---- Init GPU + load target ----
+        let mut gpu = GpuContext::new().expect("Metal device available");
+        let gguf = mlx_native::gguf::GgufFile::open(&target_gguf)
+            .expect("open target GGUF");
+        let target_cfg = Gemma4Config::from_gguf(&gguf).expect("gemma4 cfg from gguf");
+        let mut progress = LoadProgress::new(false, 0, 0);
+        let mut target = MlxModelWeights::load_from_gguf(
+            &gguf,
+            &target_cfg,
+            &mut gpu,
+            &mut progress,
+        )
+        .expect("load target weights from GGUF");
+
+        // ---- Load drafter ----
+        let drafter_cfg = DFlashConfig::from_json_path(&drafter_cfg_path)
+            .expect("drafter config.json");
+        let drafter_file = DFlashWeightsFile::open(&drafter_safetensors_path)
+            .expect("drafter safetensors open");
+        let drafter_weights = DFlashWeights::load(drafter_file.bytes(), &drafter_cfg)
+            .expect("drafter validated load");
+        let drafter_tensors = {
+            let (exec, _reg) = gpu.split();
+            DFlashModelTensors::upload(exec.device(), &drafter_cfg, &drafter_weights)
+                .expect("drafter GPU upload")
+        };
+
+        // Allocate drafter KV cache.  The cache caps total ctx the drafter
+        // can absorb across rounds; for max_new_tokens=16 + ~10 prompt
+        // tokens we need very little capacity, but allocate generously.
+        let drafter_cache_cap: u32 = 4096;
+        let mut drafter_cache = {
+            let (exec, _reg) = gpu.split();
+            DFlashKvCache::new(exec.device(), &drafter_cfg, drafter_cache_cap)
+                .expect("drafter cache alloc")
+        };
+
+        // ---- Tokenize prompt with Gemma chat template ----
+        //
+        // Plain `"Q: What is 2+2?\nA:"` is out-of-distribution for
+        // gemma-4-it (chat-tuned) and yields incoherent argmaxes even
+        // under single-token decode (verified against cmd_generate on
+        // the same target; templated prompt produces "4", untemplated
+        // produces multilingual gibberish).
+        //
+        // For the coherence-validation gate we want a prompt the model
+        // is trained on. The Gemma chat template format is:
+        //   `<start_of_turn>user\n<USER>\n<end_of_turn>\n<start_of_turn>model\n`
+        // (tokenizer adds BOS automatically when configured).
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .expect("load tokenizer.json");
+        let prompt_text = "<start_of_turn>user\nWhat is 2+2?\n<end_of_turn>\n<start_of_turn>model\n";
+        let encoding = tokenizer.encode(prompt_text, false).expect("encode");
+        let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+        assert!(!prompt_tokens.is_empty(), "prompt encoding empty");
+        eprintln!(
+            "[e2e] prompt={prompt_text:?} prompt_tokens.len()={}",
+            prompt_tokens.len()
+        );
+
+        // Gemma-4 end-of-turn id (per tokenizer + Gemma chat conventions).
+        // We also pass plain EOS=1 just in case.  Either one stops gen.
+        let eos_token_ids: Vec<u32> = vec![1, 106];
+
+        // ---- Run dispatch_dflash_generate ----
+        let max_new_tokens = 16usize;
+        let block_size = 8u32; // K=7, Phase 1.5 optimal on M5 Max
+        let t_gen = std::time::Instant::now();
+        let output_tokens = match dispatch_dflash_generate(
+            &mut target,
+            &drafter_tensors,
+            &mut drafter_cache,
+            &drafter_cfg,
+            &prompt_tokens,
+            max_new_tokens,
+            block_size,
+            &eos_token_ids,
+            &mut gpu,
+        ) {
+            Ok(toks) => toks,
+            Err(e) => {
+                // Print the full anyhow context chain — default `{}`
+                // shows only the outermost wrap which loses the root.
+                eprintln!("[e2e] dispatch_dflash_generate FAILED chain:");
+                for (i, cause) in e.chain().enumerate() {
+                    eprintln!("[e2e]   #{i}: {cause}");
+                }
+                panic!("dispatch_dflash_generate end-to-end (see chain above)");
+            }
+        };
+        let gen_elapsed = t_gen.elapsed();
+        eprintln!(
+            "[e2e] dispatch_dflash_generate elapsed={:.2}s output.len()={} (prompt={}, new<={})",
+            gen_elapsed.as_secs_f64(),
+            output_tokens.len(),
+            prompt_tokens.len(),
+            max_new_tokens,
+        );
+
+        // Pipeline-runs assertions (NOT coherence — that's a later gate).
+        assert!(
+            output_tokens.len() > prompt_tokens.len(),
+            "dispatch_dflash_generate must emit at least 1 new token; got prompt_len={} output_len={}",
+            prompt_tokens.len(),
+            output_tokens.len(),
+        );
+        let new_tokens = &output_tokens[prompt_tokens.len()..];
+        assert!(
+            new_tokens.len() <= max_new_tokens,
+            "dispatch_dflash_generate must not exceed max_new_tokens={}; got {}",
+            max_new_tokens,
+            new_tokens.len(),
+        );
+
+        // Decode for visual inspection (does NOT participate in assertions).
+        let decoded = tokenizer
+            .decode(new_tokens, /*skip_special=*/ false)
+            .unwrap_or_else(|e| format!("<decode failed: {e}>"));
+        eprintln!("[e2e] new_tokens={new_tokens:?}");
+        eprintln!("[e2e] decoded={decoded:?}");
     }
 }

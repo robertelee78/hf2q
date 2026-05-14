@@ -675,3 +675,76 @@ These must be answered before Phase 1 begins. Each blocks the corresponding phas
 - `feedback_metal_bench_protocol_2026_05_12.md` — measurement protocol
 - `feedback_do_not_trust_file_claims_re_measure_2026_05_11.md` — re-measure rule
 - `feedback_no_guessing_read_peers_use_goalie.md` — peer-read discipline
+
+---
+
+## 8. Status Log
+
+### iter-63 (2026-05-14) — End-to-end GPU integration test + 2 bug fixes
+
+**Mission state at start**: `dispatch_dflash_generate` shipped but never run on real models.
+
+**What ran**: Authored
+`spec_decode::dflash::orchestrator::tests::e2e_dispatch_dflash_generate_gemma4_26b`
+— a real `#[ignore]`'d GPU integration test that loads the production
+gemma-4-26b-a4b-it Q5_K_M GGUF + the z-lab DFlash drafter safetensors,
+tokenizes a Gemma chat-templated prompt, and runs
+`dispatch_dflash_generate` for 16 new tokens at block_size=8 (K=7).
+
+**Bug 1 — FIXED**: Buffer bucket-rounding leak on CPU read.
+- Symptom: `dflash append_seq_major_kv: input lens K=16384 V=12288 !=
+  n_new(12) * num_kv_heads(8) * head_dim(128) = 12288`
+- Root cause: `apply_imrope` in `qwen35/gpu_full_attn.rs:649` uses
+  `pooled_alloc_buffer`, which rounds `byte_len` up to a power-of-2
+  bucket (16384 ≥ 12288). Its comment said this was safe "for GPU-only
+  feeds, not satisfied in DFlash drafter which CPU-reads K/V to write
+  the cursor-mode cache". `MlxBuffer::as_slice` returns
+  `byte_len/sizeof`, not `element_count` (the shape product), so
+  bucketed storage leaked 4096 trailing junk f32s into the CPU `Vec`.
+- Fix: Added `download_f32_logical(buf)` helper in `dflash::forward`
+  that truncates to `buf.element_count()` before copying. All 6 dflash
+  download sites switched.
+
+**Bug 2 — FIXED**: forward_prefill_batched re-allocated hybrid_kv on every call.
+- Symptom: `Allocating hybrid_kv (...) [batched]` printed on EVERY
+  verify round; output was incoherent because the prompt's KV state
+  was wiped at the first verify round.
+- Root cause: `forward_prefill_batched.rs:358` did
+  `self.hybrid_kv = Some(hybrid_vec)` unconditionally inside the
+  `INVESTIGATION_ENV.hybrid_kv` arm. The iter-137/138 work correctly
+  threaded `start_pos` through `pf_positions[i] = start_pos + i` and
+  `write_pos = start_pos + seq_len`, but the iter-348 hybrid_kv alloc
+  did not get the `is_none()` guard that the parallel decode path
+  (`forward_mlx.rs:3045`) has.
+- Fix: Gated both `hybrid_kv` and `leg_hb_encoded` allocations with
+  `is_none()` checks, mirroring the forward_decode lazy-alloc pattern.
+  All production callers pass `start_pos=0` on a fresh
+  `MlxModelWeights` instance (hybrid_kv == None on first call), so
+  this is bit-identical to pre-iter-63 for cmd_generate / parity /
+  engine flows.
+
+**Status after fixes**: Pipeline runs end-to-end without panic. Test
+asserts pass (non-empty output, length ≤ max_new_tokens). 16 verify
+rounds in ~1.41 s on M5 Max (~88 ms/round). Coherence NOT yet
+established — output is multilingual gibberish on a hand-rolled chat
+template; this matches the SAME behavior we got from cmd_generate when
+fed a non-templated prompt, so the suspect is either (a) the
+hand-rolled template differs from gguf-embedded one, or (b) verify K/V
+writes are not correctly offset by `start_pos` (need to add
+diagnostic).
+
+**Deferred to iter-64**: ground-truth coherence comparison. Two paths:
+1. Wire the test to use `render_chat_template` so the prompt matches
+   what cmd_generate produces (clean parity surface).
+2. Run a parallel `forward_decode_verify_serial` baseline inside the
+   test and assert byte-identity vs `dispatch_dflash_generate` output
+   at temp=0.
+
+**Code artifacts (this iter)**:
+- `src/inference/spec_decode/dflash/forward.rs` — `download_f32_logical`
+  helper (+ 6 download sites switched)
+- `src/serve/forward_prefill_batched.rs` — hybrid_kv / leg_hb_encoded
+  lazy-alloc gate
+- `src/inference/spec_decode/dflash/orchestrator.rs` —
+  `e2e_dispatch_dflash_generate_gemma4_26b` test + anyhow chain
+  preservation via `.context()` instead of `.map_err(anyhow!("…{e}"))`
