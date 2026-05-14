@@ -490,15 +490,55 @@ Lands: `async_dispatch.rs`, modifications to orchestrator
 - **Perf gate**: alt-pair thermal-fair; async path must show ≥ 1.3× additional speedup over Phase 4 (the synchronous baseline). Combined Phase 4+5 target: ≥ 2× single-token decode (conservative; oMLX measured 3×)
 - Falsifier: at `HF2Q_SPEC_DFLASH_ASYNC=0`, output and perf must match Phase 4
 
-#### **Phase 6 — Rejection sampling for temp>0** (~140 LOC; `HF2Q_SPEC_DFLASH_PHASE=6`)
-Lands: `rejection_sampler.rs`, accept_prefix_rejection_sample exported via verifier.rs
-- Leviathan 2023 distribution-preserving rejection sampling
-- **Distribution coherence gate**: §3.2.2's three statistical tests on a 256-sample run of each golden fixture at temp=0.5, 0.7, 1.0
-  - KL divergence ≤ 0.01
-  - Mean log-prob ratio in [0.98, 1.02]
-  - Top-50 5-gram Jaccard ≥ 0.95
-- **Perf gate**: rejection sampling adds ~5-15% verify-pass overhead per Leviathan §4; net speedup at temp=0.7 must still be ≥ 1.5× single-token decode
-- **Operator-visible**: with `HF2Q_SPEC_DFLASH_TEMP_REJECT=0`, naive sampled-compare runs (for operator A/B comparison only; not for production)
+#### **Phase 6 — Rejection sampling for temp>0** ✅ MATH SHIPPED iter-53 (2026-05-14)
+
+Landed: `src/inference/spec_decode/dflash/rejection_sampler.rs` (378 LOC).
+
+API:
+- `softmax_with_temp(logprobs: &[f32], temp: f32) -> Vec<f32>`
+- `leviathan_step(draft_token, target_probs, drafter_probs, rng)
+   -> SampleStep::{Accept | Reject{replacement_token}}`
+- `leviathan_accept_prefix(drafts, target_probs_per_pos,
+   drafter_probs_per_pos, rng) -> (accept_count, replacement_or_continuation)`
+
+Algorithm per Leviathan et al. 2023 §2.3 verified by 7 unit tests
+with statistical bounds:
+- `softmax_with_temp_normalizes` (sum=1, monotonic)
+- `softmax_temp_zero_panics_via_assert` (temp > 0 enforced)
+- `leviathan_step_accepts_when_target_dominates` (100/100 trials accept
+  when p >> q)
+- `leviathan_step_rejects_when_drafter_dominates` (~95% rejects in
+  [800,990]/1000 range when q >> p)
+- `leviathan_step_residual_replacement_is_correct_token` (zero-mass
+  tokens never sampled; remaining tokens at expected 0.43:0.57 ratio)
+- `leviathan_accept_prefix_full_accept_returns_continuation`
+- `leviathan_accept_prefix_partial_reject_truncates`
+
+Added `rand = "0.8"` direct dependency (already transitive via
+tokenizers / mlx-native).
+
+**Greedy degeneration at temp=0**: the rejection rule reduces to
+byte-identical behavior of existing `accept_prefix_argmax`:
+- argmax(p) == argmax(q) == draft → p/q=1 always accept
+- argmax(p) != argmax(q) → reject, residual sampling collapses to
+  argmax(p)
+
+So this module is the GENERALIZATION of the greedy path that handles
+temp > 0 correctly without breaking temp = 0.
+
+**Integration with verify path** ⏳ deferred:
+- Requires per-position full-logits emission (not just argmaxes) from
+  `forward_decode_verify_batched` — ~2MB/call for gemma-4 vocab 262144
+- New `dispatch_dflash_one_round_with_logits` orchestrator variant
+  that uses `leviathan_accept_prefix` instead of greedy
+  `step_round_from_argmaxes`
+- Production gating via `HF2Q_SPEC_DFLASH_TEMP_REJECT=1` env flag
+
+Gates (still required for default-flip at temp > 0):
+- KL divergence ≤ 0.01
+- Mean log-prob ratio in [0.98, 1.02]
+- Top-50 5-gram Jaccard ≥ 0.95
+- Perf gate: ≥ 1.5× single-token decode at temp=0.7
 
 ### 3.6 Coherence preservation (the explicit operator requirement)
 
