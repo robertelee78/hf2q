@@ -33,7 +33,9 @@ use anyhow::{anyhow, Context, Result};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
-use crate::inference::models::qwen35::gpu_full_attn::{apply_imrope, apply_linear_projection_f32};
+use crate::inference::models::qwen35::gpu_full_attn::{
+    apply_imrope, apply_linear_projection_f32, apply_sdpa_causal_from_seq_major,
+};
 
 /// Build the `[eps, dim]` F32 params buffer required by [`dispatch_rms_norm`].
 ///
@@ -446,6 +448,51 @@ pub fn dispatch_dflash_rope(
     .context("dispatch_dflash_rope")
 }
 
+/// Apply SDPA to seq-major Q (post-RoPE) + K (post-RoPE) + V (no RoPE).
+///
+/// This is the **self-attention** form: Q seq_len == K/V seq_len. In
+/// DFlash's full algorithm, K/V are the CONCAT of (ctx KV from cache +
+/// prop KV from current block), so K/V seq_len > Q seq_len. That cross-
+/// length form is handled by a separate dispatcher in Phase 3 (where
+/// the KV cache is wired in). This wrapper exists so Phase 2 can
+/// smoke-test the SDPA primitive on drafter shapes (head_dim=128).
+///
+/// Mirrors `model_mlx.py:DFlashAttention.__call__` line 115:
+/// `output = mx.fast.scaled_dot_product_attention(queries, keys, values,
+///                                                  scale=self.scale, mask=mask)`
+/// — minus mask (causal-only here; sliding-window adds in Phase 3) and
+/// minus the ctx/prop K/V concat.
+///
+/// Reuses qwen35's `apply_sdpa_causal_from_seq_major` (gpu_full_attn.rs:1270)
+/// — same seq-major layout the rest of our pipeline produces.
+///
+/// # Arguments
+///
+/// - `q_roped`: `[seq_len * num_q_heads, head_dim]` F32 (post-norm + RoPE)
+/// - `k_roped`: `[seq_len * num_kv_heads, head_dim]` F32 (post-norm + RoPE)
+/// - `v`:       `[seq_len * num_kv_heads, head_dim]` F32 (no V norm/RoPE)
+/// - Returns:   `[seq_len * num_q_heads, head_dim]` F32 (seq-major)
+pub fn dispatch_dflash_sdpa_self_attn(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q_roped: &MlxBuffer,
+    k_roped: &MlxBuffer,
+    v: &MlxBuffer,
+    cfg: &DFlashConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    let n_heads = cfg.num_attention_heads as u32;
+    let n_kv_heads = cfg.num_key_value_heads as u32;
+    let head_dim = cfg.head_dim as u32;
+    apply_sdpa_causal_from_seq_major(
+        encoder, registry, device,
+        q_roped, k_roped, v,
+        seq_len, n_heads, n_kv_heads, head_dim,
+    )
+    .context("dispatch_dflash_sdpa_self_attn")
+}
+
 /// Dispatch the O projection: `o_proj @ attn_out`.
 ///
 /// Mirrors `model_mlx.py:DFlashAttention.__call__` line 116:
@@ -635,7 +682,23 @@ mod tests {
             block_size, cfg.num_key_value_heads as u32, 0,
         )
         .expect("k rope dispatch");
-        encoder.commit_and_wait().expect("commit");
+        encoder.memory_barrier(); // RAW: SDPA reads Q_roped/K_roped/V
+        // SDPA: self-attention form (kv_seq_len = q_seq_len = block_size).
+        // The cross-length form (kv_seq_len > q_seq_len) for DFlash's
+        // ctx+prop concat is Phase 3 territory.
+        let attn_out = dispatch_dflash_sdpa_self_attn(
+            &mut encoder, &mut registry, &device,
+            &q_roped, &k_roped, &v, &cfg, block_size,
+        )
+        .expect("sdpa dispatch");
+        // apply_sdpa_causal_from_seq_major internally commits, so the
+        // next encoder is a fresh one — final O proj happens on it.
+        let mut encoder = device.command_encoder().expect("encoder2");
+        let h_out = dispatch_dflash_o_proj(
+            &mut encoder, &mut registry, &device, &attn_out, layer, &cfg, block_size,
+        )
+        .expect("o_proj dispatch");
+        encoder.commit_and_wait().expect("commit2");
 
         // Validate shapes
         let q_dim = (cfg.num_attention_heads * cfg.head_dim) as usize;
@@ -650,8 +713,13 @@ mod tests {
         // Q_roped / K_roped shapes match their pre-RoPE shapes
         assert_eq!(q_roped.element_count(), l * q_dim);
         assert_eq!(k_roped.element_count(), l * kv_dim);
+        // SDPA output: [L, n_q_heads * head_dim]
+        assert_eq!(attn_out.element_count(), l * q_dim);
+        // O proj output: [L, hidden_size]
+        let h_dim = cfg.hidden_size;
+        assert_eq!(h_out.element_count(), l * h_dim);
 
-        // Validate all seven outputs are finite + non-trivially non-zero.
+        // Validate all nine outputs are finite + non-trivially non-zero.
         for (name, buf, dim) in [
             ("Q", &q, q_dim),
             ("K", &k, kv_dim),
@@ -660,6 +728,8 @@ mod tests {
             ("K_normed", &k_normed, kv_dim),
             ("Q_roped", &q_roped, q_dim),
             ("K_roped", &k_roped, kv_dim),
+            ("Attn_out", &attn_out, q_dim),
+            ("H_out", &h_out, h_dim),
         ] {
             let host: &[f32] = buf.as_slice::<f32>().expect("host slice");
             assert_eq!(host.len(), l * dim, "{name} length");
