@@ -1933,3 +1933,63 @@ to iter-88+.
   acceptance; deferred until iter-88 long-prompt investigation
   resolves the all-pad drafter pathology under Option A.
 
+
+### iter-88 — Option A coherence regime characterization (BISECTION)
+
+Added `HF2Q_TEST_PROMPT` env override to `e2e_dispatch_dflash_generate_gemma4_26b`.
+Tested 3 prompts under Option A + bidirectional drafter SDPA:
+
+| Prompt | Length (tok) | Coherence | spec_new pattern |
+|--------|-------------:|-----------|------------------|
+| "Q: What is 2+2?\nA:" | 12 | ✓ PASS 16/16 | matches baseline |
+| "Explain how transformer self-attention works in detail." | 10 | ✗ FAIL pos=2 | collapses to repeated 609 |
+| CLI chat-templated long prompt | ~38 | unobserved coherence; drafts all `[0]*7` | degenerate |
+
+Trace from the failing 10-token prompt:
+```
+[ACCEPT round=1 accept=0/7 target_argmaxes=[236795, 226069, ...] committed=[236795]]  ← OK
+[ACCEPT round=2 accept=0/7 target_argmaxes=[609, 506, ...]      committed=[609]]      ← FAIL
+[ACCEPT round=3 accept=0/7 target_argmaxes=[609, 531, ...]      committed=[609]]      ← stuck
+```
+
+Round 2's TARGET argmax is wrong (609 instead of baseline_new[2]=236824).  This
+is a TARGET-side bug — drafter is innocent here.  iter-84's BF16 fix solved
+the F16 D=512 overflow at L29 for the toy prompt's specific Q magnitudes, but
+the 10-token "Explain..." prompt's Q distribution evidently exercises a
+different bug.
+
+### iter-88 — Mission state summary at the /loop iteration end
+
+The mission has DELIVERED multiple major coherence + perf wins:
+
+**Shipped (committed + pushed to main):**
+- iter-83 — `dispatch_flash_attn_prefill_bf16_d512_resume` in mlx-native
+- iter-84 — hf2q xlen D=512 branch routes through BF16 (fixes L29 NaN
+  for toy prompt) — COHERENCE PASS 16/16 on toy
+- iter-85 — Option A is 16% faster end-to-end vs Option C re-prefill
+- iter-87 — drafter SDPA gains `do_causal` flag; full_attention layer
+  flipped to bidirectional matching peer dflash semantics
+- mlx-native test `flash_attn_prefill_f16_d256_resume_qL_off_align_k_false_byte_identity`
+  + `flash_attn_prefill_f16_d512_resume_qL_off_align_k_false_byte_identity`
+  both PASS — kernels verified at the failing regime
+
+**Production safety:**
+- `HF2Q_SPEC_DFLASH=1` defaults to Option C (re-prefill) which is
+  coherent on ALL prompts tested.  Option A flag-flip blocked on
+  iter-89+ Round-2 target investigation.
+
+**Open (iter-89+ scope):**
+- Option A coherence on non-toy prompts — TARGET produces wrong tokens
+  at Round 2 on the 10-token "Explain..." prompt.  Suspected: K/V
+  state across rounds (hybrid_kv vs dense_kvs rollback asymmetry,
+  cast-chain precision drift, OR another F16/BF16 overflow surfacing
+  at different Q magnitudes).
+- Drafter all-pad outputs on long Option A prompts (CLI test).
+- Mission perf gate (≥1.07× baseline) requires Option A active +
+  drafter producing distinct diverse drafts AND high acceptance rate.
+
+**Defining the bound of what's been proven:**
+Option A xlen path is provably correct on the 12-token "Q: 2+2?"
+canary at temp=0, with 16% end-to-end speedup vs Option C.  Wider
+coherence requires deeper debugging.
+
