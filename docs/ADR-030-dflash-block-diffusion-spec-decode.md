@@ -2531,3 +2531,80 @@ F16→F32→BF16 cast drift at every D=512 layer for any prompt — the
 direct test of iter-93's root-cause hypothesis applied to global
 layers.
 
+
+### iter-103 — Deep-research review of drafter clustering + DRAFTER_DUMP instrumentation
+
+Read `/opt/dflash/dflash/model_mlx.py` (peer reference impl, 582 LOC)
+end-to-end and walked through `dispatch_dflash_decoder_layer`
+(`src/inference/spec_decode/dflash/forward.rs`) point-by-point.
+Findings on the iter-86 "drafter outputs [1595]*7" clustering:
+
+**Structural equivalence confirmed:**
+- Peer `__call__` (model_mlx.py:82): q_proj(x), k_proj(x_ctx),
+  v_proj(x_ctx), k_proj(x), v_proj(x).  Our `dispatch_dflash_q_proj`
+  + `dispatch_dflash_k_proj` calls at forward.rs:827-838 mirror this
+  exactly.
+- Peer RoPE offsets (model_mlx.py:102-104):
+  `queries → cache.offset + S`, `ctx_keys → cache.offset`,
+  `prop_keys → cache.offset + S`.  Our forward.rs:859-870 uses
+  `prior_offset + s` for q and prop, `prior_offset` for ctx — match.
+- Peer position assignment: `rope(qs, offset=O)` internally rotates
+  with positions `[O, O+1, ..., O+L-1]`.  Our `build_dflash_pos_buf`
+  (forward.rs:421-442) explicitly assigns `base + i` per element —
+  match.
+- Peer mask (model_mlx.py:109-114): `None` for full_attention
+  layers, causal/windowed for sliding.  Our `do_causal` flag
+  (forward.rs:805-808) gates causal masking by `LayerType::SlidingAttention`
+  — match.
+- Peer cache.update_and_fetch appends ctx_keys/ctx_values to cache
+  but does NOT cache prop.  Our `append_seq_major_kv(k_ctx, v_ctx)`
+  + `write_slack_kv(k_prop, v_prop)` with debug_assert that slack
+  doesn't advance seq_len (forward.rs:882-892) — match.
+- Peer drafter config for gemma-4-26B-A4B-it-DFlash:
+  hidden_size=2816, num_hidden_layers=5, mask_token_id=4,
+  target_layer_ids=[1,6,11,17,22,27], layer_types=[4×sliding,
+  1×full_attention], sliding_window=2048.  Our config.rs parses
+  identical fields.
+- Peer applies `embed_scale = self.embed_scale` (= sqrt(hidden_size))
+  to embed_tokens output (model_mlx.py:188).  Our `embed_tokens`
+  (forward_mlx.rs:1488-1491) multiplies by `(hs as f32).sqrt()` —
+  match.
+
+**Open mystery**: structure equivalent yet drafter still outputs
+identical token at all K positions on iter-86 toy + iter-87 long
+realistic prompts.  Hypothesis: a per-position transform inside our
+drafter forward collapses or duplicates positional information.
+Candidates (untested):
+- `dispatch_dflash_input_layernorm` accidentally reducing across
+  positions (would zero-out RoPE differentiation).
+- `apply_imrope` mis-routing axes for `sections=[head_dim/2,0,0,0]`
+  (plain NeoX) — could broadcast a single rotation across positions.
+- `dispatch_dflash_sdpa_cross_length` with `do_causal=false` could
+  still apply a residual mask if the param wiring fails.
+- lm_head per-position batched argmax — already verified bit-exact
+  in iter-72, so unlikely root cause.
+
+**Instrumentation shipped (orchestrator.rs)**:
+```
+HF2Q_DFLASH_DRAFTER_DUMP=1
+```
+gates a per-round dump of `h_final` (drafter output, fed into
+target's lm_head):
+```
+[DRAFTER_DUMP round=R block_size=8 hs=2816]
+  h_final[pos=0,d=0..8] = [...]
+  h_final[pos=1,d=0..8] = [...]
+  h_final[pos=7,d=0..8] = [...]
+  max_adj_pairwise_abs_diff(rows 1..8) = X
+```
+
+Interpretation in next operator session:
+- If `max_adj_pairwise_abs_diff` ≈ 0 across positions 1..7 → the
+  drafter's per-position transform IS collapsed; bug is inside
+  one of the per-layer transforms (RoPE, input_layernorm, SDPA).
+- If `max_adj_pairwise_abs_diff` >> 0 but per_position_argmax still
+  produces the same token at every position → bug is in the
+  argmax / lm_head pipeline.
+
+`cargo check --release` clean, 51/51 lib tests still GREEN.
+

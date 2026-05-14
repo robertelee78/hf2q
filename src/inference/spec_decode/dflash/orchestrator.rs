@@ -724,6 +724,38 @@ pub fn dispatch_dflash_generate(
                 .as_slice::<f32>()
                 .map_err(|e| anyhow::anyhow!("generate: h_final slice: {e}"))?;
             let host_copy: Vec<f32> = h_final_slice.to_vec();
+            // ADR-030 iter-103 — per-position h_final dump for drafter
+            // clustering bisection.  iter-86 observed drafts cluster as
+            // [1595]*7 (all identical).  If h_final rows 1..block_size
+            // are bit-equal → bug inside drafter forward (per-position
+            // transform collapsed).  If rows differ but argmax still
+            // clusters → bug in argmax/lm_head path.  Env-gated so
+            // production has zero overhead.
+            if std::env::var("HF2Q_DFLASH_DRAFTER_DUMP").as_deref() == Ok("1") {
+                let bs = block_size as usize;
+                let mut max_pairwise_diff = 0.0f32;
+                for i in 1..bs {
+                    let row_i = &host_copy[i * hs..(i + 1) * hs];
+                    let row_im1 = &host_copy[(i - 1) * hs..i * hs];
+                    let diff = row_i.iter().zip(row_im1.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    max_pairwise_diff = max_pairwise_diff.max(diff);
+                }
+                eprintln!(
+                    "[DRAFTER_DUMP round={} block_size={} hs={}]\n  \
+                     h_final[pos=0,d=0..8] = {:?}\n  \
+                     h_final[pos=1,d=0..8] = {:?}\n  \
+                     h_final[pos={},d=0..8] = {:?}\n  \
+                     max_adj_pairwise_abs_diff(rows 1..{}) = {:.6e}",
+                    rounds_count, bs, hs,
+                    &host_copy[0..8.min(hs)],
+                    &host_copy[hs..hs + 8.min(hs)],
+                    bs - 1, &host_copy[(bs - 1) * hs..(bs - 1) * hs + 8.min(hs)],
+                    bs,
+                    max_pairwise_diff,
+                );
+            }
             let all_argmaxes = target
                 .per_position_argmax_from_hidden_batched_impl(&host_copy, block_size, false, gpu)
                 .map_err(|e| anyhow::anyhow!("generate: drafter argmax: {e}"))?;
