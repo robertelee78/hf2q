@@ -843,6 +843,102 @@ mod tests {
         }
     }
 
+    /// ADR-030 iter-109 — covers the n_committed > 1 case (drafter
+    /// acceptance > 0).  iter-105 tested the 0%-accept worst case
+    /// (n_committed = 1).  This test exercises the multi-token-accept
+    /// path: n_committed = 4 (4 drafts accepted + 1 target bonus from
+    /// position 4).  All 5 new rows MUST come from verify_captured
+    /// positions [0..5) at each drafter target layer.
+    #[test]
+    fn option_a_round2_prior_captured_multi_accept_plumbing() {
+        let drafter_target_layer_ids: Vec<usize> = vec![1, 6, 11, 17, 22, 27];
+        let final_layer_idx = 29usize;
+        let mut combined_ids: Vec<usize> = drafter_target_layer_ids.clone();
+        combined_ids.push(final_layer_idx);
+        combined_ids.sort_unstable();
+        combined_ids.dedup();
+        let prompt_len = 8usize;
+        let block_size = 8usize;
+        let hs = 16usize;
+
+        let mut prior_captured = DFlashCaptureSession::new(
+            combined_ids.clone(),
+            prompt_len,
+            hs,
+            false,
+        );
+        for cli in 0..combined_ids.len() {
+            for t in 0..prompt_len {
+                for d in 0..hs {
+                    let off = (cli * prompt_len + t) * hs + d;
+                    prior_captured.hidden_output[off] =
+                        (cli * 1000 + t * 10 + d) as f32;
+                }
+            }
+        }
+
+        let mut verify_captured = DFlashCaptureSession::new(
+            combined_ids.clone(),
+            block_size,
+            hs,
+            false,
+        );
+        for cli in 0..combined_ids.len() {
+            for t in 0..block_size {
+                for d in 0..hs {
+                    let off = (cli * block_size + t) * hs + d;
+                    verify_captured.hidden_output[off] =
+                        100_000.0 + (cli * 1000 + t * 10 + d) as f32;
+                }
+            }
+        }
+
+        let n_committed = 5usize; // 4 accepts + 1 target bonus
+        let next_prior = append_capture_positions(
+            &prior_captured,
+            &verify_captured,
+            n_committed,
+        )
+        .expect("append");
+        assert_eq!(next_prior.seq_len, prompt_len + n_committed);
+
+        let drafter_concat = extract_drafter_concat(
+            &next_prior.hidden_output,
+            &combined_ids,
+            &drafter_target_layer_ids,
+            next_prior.seq_len,
+            hs,
+        )
+        .expect("extract");
+
+        let drafter_n = drafter_target_layer_ids.len();
+        let row_stride = drafter_n * hs;
+        let drafter_cached_seq_len = prompt_len;
+        let new_rows_start = drafter_cached_seq_len * row_stride;
+        let drafter_concat_new: &[f32] = &drafter_concat[new_rows_start..];
+        assert_eq!(drafter_concat_new.len(), n_committed * row_stride);
+
+        // For each of the 5 new rows, verify it matches
+        // verify_captured[combined_idx, t, :] for t in [0..5).
+        for t in 0..n_committed {
+            for (drafter_l, &dl_id) in drafter_target_layer_ids.iter().enumerate() {
+                let combined_idx = combined_ids.iter().position(|&c| c == dl_id)
+                    .expect("drafter layer in combined");
+                let verify_pos_t_base = (combined_idx * block_size + t) * hs;
+                let expected = &verify_captured.hidden_output
+                    [verify_pos_t_base..verify_pos_t_base + hs];
+                let actual_row_base = (t * drafter_n + drafter_l) * hs;
+                let actual = &drafter_concat_new
+                    [actual_row_base..actual_row_base + hs];
+                assert_eq!(
+                    actual, expected,
+                    "t={t} drafter_l={drafter_l} (target_layer_id={dl_id}, combined_idx={combined_idx}): \
+                     drafter_concat_new row {t} must equal verify_captured[combined={combined_idx}, pos={t}, :]",
+                );
+            }
+        }
+    }
+
     /// End-to-end integration: simulates the post-target-verify state
     /// (capture buffer populated by hypothetical layer-loop hook) and
     /// drives the drafter forward on the permuted concat. Validates
