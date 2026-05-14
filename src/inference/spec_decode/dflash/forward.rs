@@ -861,6 +861,67 @@ pub fn dispatch_dflash_decoder_layer_attention(
     Ok(attn_proj)
 }
 
+/// Run the full DFlashDecoderLayer forward — attention sub-block +
+/// residual + post-norm + MLP + residual.
+///
+/// Mirrors `model_mlx.py:DFlashDecoderLayer.__call__` (line 127):
+/// ```text
+///   h = x + self.self_attn(self.input_layernorm(x), x_ctx, rope, cache)
+///   return h + self.mlp(self.post_attention_layernorm(h))
+/// ```
+///
+/// Composes:
+/// - `dispatch_dflash_decoder_layer_attention` (the big attention block)
+/// - residual add: `h + attn_proj` → `h_after_attn`
+/// - post_attention_layernorm
+/// - MLP (gate + up + silu_mul + down)
+/// - residual add: `h_after_attn + mlp_out` → `h_out`
+///
+/// Like the attention sub-block, manages encoders internally
+/// (multi-commit needed for the attn function's CPU-cache writes).
+pub fn dispatch_dflash_decoder_layer(
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    h: &MlxBuffer,
+    h_ctx: &MlxBuffer,
+    layer_weights: &DFlashLayerTensors,
+    cache_layer: &mut super::kv_cache::DFlashLayerKvCache,
+    cfg: &DFlashConfig,
+    block_size: u32,
+    ctx_chunk_size: u32,
+) -> Result<MlxBuffer> {
+    // 1. Attention sub-block (internally commits + opens encoders).
+    let attn_proj = dispatch_dflash_decoder_layer_attention(
+        registry, device, h, h_ctx, layer_weights, cache_layer, cfg, block_size, ctx_chunk_size,
+    )
+    .context("decoder_layer: attention sub-block")?;
+
+    // 2. Residual + post_norm + MLP + residual on a fresh encoder.
+    let mut enc = device
+        .command_encoder()
+        .context("decoder_layer: open encoder for residual + MLP")?;
+
+    let h_after_attn = dispatch_dflash_residual_add(&mut enc, registry, device, h, &attn_proj)
+        .context("decoder_layer: residual 1")?;
+    enc.memory_barrier();
+
+    let post_normed = dispatch_dflash_post_attention_layernorm(
+        &mut enc, registry, device, &h_after_attn, layer_weights, cfg, block_size,
+    )
+    .context("decoder_layer: post_attention_layernorm")?;
+    enc.memory_barrier();
+
+    let mlp_out = dispatch_dflash_mlp(&mut enc, registry, device, &post_normed, layer_weights, cfg, block_size)
+        .context("decoder_layer: mlp")?;
+    enc.memory_barrier();
+
+    let h_out = dispatch_dflash_residual_add(&mut enc, registry, device, &h_after_attn, &mlp_out)
+        .context("decoder_layer: residual 2")?;
+    enc.commit_and_wait().context("decoder_layer: commit residual+MLP")?;
+
+    Ok(h_out)
+}
+
 /// Apply SDPA where Q seq_len < K/V seq_len (DFlash's true form).
 ///
 /// Mirrors `model_mlx.py:DFlashAttention.__call__` lines 105-115:
@@ -1244,6 +1305,84 @@ mod tests {
                 host.len()
             );
         }
+    }
+
+    /// Smoke test for the FULL DFlashDecoderLayer forward (attn + 2
+    /// residuals + post_norm + MLP).
+    ///
+    /// This is the integration check that one complete drafter layer
+    /// runs end-to-end on M5 Max with real weights + KV cache, mirroring
+    /// what the multi-layer model forward will do per layer.
+    #[test]
+    #[ignore = "requires Metal device + drafter HF cache"]
+    fn smoke_decoder_layer_full_with_cache() {
+        use super::super::kv_cache::DFlashKvCache;
+
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let mut registry = KernelRegistry::new();
+
+        let home = std::env::var("HOME").expect("HOME set");
+        let path = format!(
+            "{home}/.cache/huggingface/hub/models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/77d4202772dfe50b2396ec7bac9cfffc7b9e7057/model.safetensors"
+        );
+        let file = DFlashWeightsFile::open(&path).expect("file open");
+        let weights = DFlashWeights::load(file.bytes(), &cfg).expect("validated load");
+        let tensors = DFlashModelTensors::upload(&device, &cfg, &weights).expect("GPU upload");
+        let mut cache = DFlashKvCache::new(&device, &cfg, 64).expect("cache");
+
+        let block_size = 8u32;
+        let ctx_chunk = 4u32;
+        let hidden = cfg.hidden_size as u32;
+
+        let h_elem = (block_size as usize) * (hidden as usize);
+        let mut h = device
+            .alloc_buffer(h_elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .expect("alloc h");
+        {
+            let s = h.as_mut_slice::<f32>().expect("h slice");
+            for v in s.iter_mut() { *v = 1.0; }
+        }
+        let hctx_elem = (ctx_chunk as usize) * (hidden as usize);
+        let mut h_ctx = device
+            .alloc_buffer(hctx_elem * 4, DType::F32, vec![ctx_chunk as usize, hidden as usize])
+            .expect("alloc h_ctx");
+        {
+            let s = h_ctx.as_mut_slice::<f32>().expect("h_ctx slice");
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = 0.5 + ((i % 31) as f32) / 31.0;
+            }
+        }
+
+        let layer_idx = 4usize; // full-attention layer
+        let initial_seq_len = cache.layers[layer_idx].seq_len;
+
+        let h_out = dispatch_dflash_decoder_layer(
+            &mut registry, &device, &h, &h_ctx,
+            &tensors.layers[layer_idx], &mut cache.layers[layer_idx],
+            &cfg, block_size, ctx_chunk,
+        )
+        .expect("decoder layer forward");
+
+        assert_eq!(h_out.element_count(), (block_size as usize) * (hidden as usize));
+        let host: &[f32] = h_out.as_slice::<f32>().expect("h_out slice");
+        let n_finite = host.iter().filter(|v| v.is_finite()).count();
+        let n_zero = host.iter().filter(|v| **v == 0.0).count();
+        assert_eq!(
+            n_finite, host.len(),
+            "decoder layer forward output must be all finite (got {n_finite}/{}; n_zero={n_zero})",
+            host.len()
+        );
+        assert!(
+            n_zero < host.len() / 2,
+            "decoder layer forward output suspiciously sparse (n_zero={n_zero}/{})",
+            host.len()
+        );
+        assert_eq!(
+            cache.layers[layer_idx].seq_len,
+            initial_seq_len + ctx_chunk,
+            "cache should advance by ctx_chunk only after full layer forward"
+        );
     }
 
     /// Smoke test for the full DFlashAttention sub-block with KV cache.
