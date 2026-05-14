@@ -37,7 +37,9 @@ use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::ops::softcap::dispatch_softcap;
 use crate::inference::models::qwen35::gpu_full_attn::{
     apply_imrope, apply_linear_projection_f32, apply_sdpa_causal_from_seq_major,
+    download_f32, permute_seq_head_dim_to_head_seq_dim_cpu, upload_f32,
 };
+use mlx_native::ops::sdpa::{sdpa, SdpaParams};
 
 /// Build the `[eps, dim]` F32 params buffer required by [`dispatch_rms_norm`].
 ///
@@ -705,6 +707,125 @@ pub fn dispatch_dflash_sdpa_self_attn(
     .context("dispatch_dflash_sdpa_self_attn")
 }
 
+/// Apply SDPA where Q seq_len < K/V seq_len (DFlash's true form).
+///
+/// Mirrors `model_mlx.py:DFlashAttention.__call__` lines 105-115:
+/// ```text
+///   keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
+///   ctx_len = keys.shape[2]
+///   keys = mx.concatenate([keys, prop_keys], axis=2)
+///   values = mx.concatenate([values, prop_values], axis=2)
+///   output = scaled_dot_product_attention(queries, keys, values, scale, mask)
+/// ```
+///
+/// In our design, `cache_layer.keys / .values` already hold the full
+/// merged K/V (ctx + prop) — the caller appends both via
+/// `append_seq_major_kv` before calling here. `kv_seq_len =
+/// cache_layer.seq_len`, `kv_capacity = cache_layer.capacity`.
+///
+/// # Layout staging (Phase 3 first cut)
+///
+/// The SDPA kernel needs head-major Q `[1, n_heads, seq_len, head_dim]`
+/// and reads K/V from cache.keys/values which are ALREADY head-major
+/// `[n_kv_heads, capacity, head_dim]` (per `append_seq_major_kv`).
+///
+/// So only Q needs the permute (seq-major in our pipeline → head-major).
+/// We download Q to CPU, permute, re-upload — mirrors qwen35's
+/// `apply_sdpa_causal_from_seq_major` pattern. The drafter's per-call
+/// Q size is small (block_size=8 × num_q_heads=32 × head_dim=128 = 32KB)
+/// so the CPU round-trip cost is bounded.
+///
+/// # Arguments
+///
+/// - `q_seq_major`: `[q_seq_len * num_q_heads, head_dim]` F32
+/// - `cache_layer`: per-layer KV cache (already populated with full
+///   ctx + prop K/V for this step)
+/// - Returns: `[q_seq_len * num_q_heads, head_dim]` F32 seq-major
+///
+/// # Caveat (Phase 3 partial)
+///
+/// The current mlx-native `sdpa()` kernel applies CAUSAL masking. For
+/// DFlash full-attention layers (layer 4 in gemma-4-26B-A4B-it
+/// drafter), Python passes `mask=None` (bidirectional). For sliding
+/// layers (0-3), Python uses "causal" or windowed-causal. This first
+/// cut uses causal everywhere; correctness gates in Phase 4 will
+/// surface any mask-induced parity gap and we'll plumb through a mask
+/// configuration then. For the smoke test we just verify shape +
+/// finiteness, which is mask-invariant.
+pub fn dispatch_dflash_sdpa_cross_length(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q_seq_major: &MlxBuffer,
+    cache_layer: &super::kv_cache::DFlashLayerKvCache,
+    cfg: &DFlashConfig,
+    q_seq_len: u32,
+) -> Result<MlxBuffer> {
+    let n_heads = cfg.num_attention_heads as u32;
+    let n_kv_heads = cfg.num_key_value_heads as u32;
+    let head_dim = cfg.head_dim as u32;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    // Finalize Q (commit pending dispatches).
+    encoder.commit_and_wait().context("commit before sdpa cross-length permute")?;
+
+    // CPU permute Q seq-major [L, H_q, D] → head-major [1, H_q, L, D].
+    let q_cpu = download_f32(q_seq_major)?;
+    let q_hm_cpu = permute_seq_head_dim_to_head_seq_dim_cpu(
+        &q_cpu,
+        q_seq_len as usize,
+        n_heads as usize,
+        head_dim as usize,
+    );
+    let q_hm = upload_f32(&q_hm_cpu, device)?;
+
+    // Allocate output buffer head-major [1, H_q, L, D].
+    let out_elem = (n_heads as usize) * (q_seq_len as usize) * (head_dim as usize);
+    let out_hm = device
+        .alloc_buffer(
+            out_elem * 4,
+            DType::F32,
+            vec![1, n_heads as usize, q_seq_len as usize, head_dim as usize],
+        )
+        .map_err(|e| anyhow!("alloc sdpa cross-length output: {e}"))?;
+
+    // SDPA params: separate Q seq_len + KV seq_len + capacity.
+    let params = SdpaParams {
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        seq_len: q_seq_len,
+        kv_seq_len: cache_layer.seq_len,
+        scale,
+        kv_capacity: cache_layer.capacity,
+    };
+
+    // Fresh encoder for SDPA dispatch.
+    let mut enc2 = device.command_encoder().context("enc sdpa cross-length")?;
+    sdpa(
+        &mut enc2, registry, device,
+        &q_hm, &cache_layer.keys, &cache_layer.values,
+        &out_hm, &params, 1,
+    )
+    .map_err(|e| anyhow!("sdpa cross-length: {e}"))?;
+    enc2.commit_and_wait().context("commit sdpa cross-length")?;
+
+    // CPU permute output head-major → seq-major.
+    let out_hm_cpu = download_f32(&out_hm)?;
+    let mut out_sm_cpu = vec![0.0f32; out_elem];
+    let nh = n_heads as usize;
+    let l = q_seq_len as usize;
+    let d = head_dim as usize;
+    for h in 0..nh {
+        for t in 0..l {
+            let src = (h * l + t) * d;
+            let dst = (t * nh + h) * d;
+            out_sm_cpu[dst..dst + d].copy_from_slice(&out_hm_cpu[src..src + d]);
+        }
+    }
+    upload_f32(&out_sm_cpu, device).map_err(|e| anyhow!("upload sdpa cross-length output: {e}"))
+}
+
 /// Dispatch the O projection: `o_proj @ attn_out`.
 ///
 /// Mirrors `model_mlx.py:DFlashAttention.__call__` line 116:
@@ -959,6 +1080,79 @@ mod tests {
                 host.len()
             );
         }
+    }
+
+    /// Cross-length SDPA smoke test (Phase 3 form).
+    ///
+    /// Builds a populated cache layer (synthetic head-major K/V via
+    /// append_seq_major_kv with random-ish ones inputs), runs Q of
+    /// seq_len=8 against cache with seq_len=12 (kv_seq_len > q_seq_len),
+    /// validates output shape + finiteness. This validates the layout
+    /// permute + cross-length params end-to-end.
+    #[test]
+    #[ignore = "requires Metal device + drafter HF cache"]
+    fn smoke_sdpa_cross_length() {
+        use super::super::kv_cache::DFlashKvCache;
+
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let mut registry = KernelRegistry::new();
+
+        // Allocate cache + populate with 12 positions of synthetic K/V.
+        let mut cache = DFlashKvCache::new(&device, &cfg, 64).expect("cache");
+        let layer_idx = 4usize; // full-attention layer
+        let n_kv = cfg.num_key_value_heads as u32;
+        let d = cfg.head_dim as u32;
+        let ctx_len = 12u32;
+        let total = (ctx_len as usize) * (n_kv as usize) * (d as usize);
+        let mut k_input = vec![0.0f32; total];
+        let mut v_input = vec![0.0f32; total];
+        for (i, v) in k_input.iter_mut().enumerate() {
+            *v = (i % 17) as f32 / 17.0; // varied finite values
+        }
+        for (i, v) in v_input.iter_mut().enumerate() {
+            *v = (i % 23) as f32 / 23.0;
+        }
+        cache.layers[layer_idx]
+            .append_seq_major_kv(&k_input, &v_input, ctx_len, n_kv, d)
+            .expect("populate cache");
+        assert_eq!(cache.layers[layer_idx].seq_len, ctx_len);
+
+        // Build Q seq-major [L=8, n_q_heads, head_dim] F32 ones-ish.
+        let q_seq_len = 8u32;
+        let n_q = cfg.num_attention_heads as u32;
+        let q_elem = (q_seq_len as usize) * (n_q as usize) * (d as usize);
+        let mut q = device
+            .alloc_buffer(
+                q_elem * 4,
+                DType::F32,
+                vec![q_seq_len as usize, n_q as usize, d as usize],
+            )
+            .expect("alloc q");
+        {
+            let s = q.as_mut_slice::<f32>().expect("q slice");
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = ((i % 11) as f32) * 0.01;
+            }
+        }
+
+        let mut encoder = device.command_encoder().expect("encoder");
+        let out = dispatch_dflash_sdpa_cross_length(
+            &mut encoder, &mut registry, &device,
+            &q, &cache.layers[layer_idx], &cfg, q_seq_len,
+        )
+        .expect("sdpa cross-length");
+
+        // Shape: [L * n_q_heads * head_dim] F32 seq-major.
+        let expected_elem = (q_seq_len as usize) * (n_q as usize) * (d as usize);
+        assert_eq!(out.element_count(), expected_elem);
+        let host: &[f32] = out.as_slice::<f32>().expect("out slice");
+        let n_finite = host.iter().filter(|v| v.is_finite()).count();
+        assert_eq!(
+            n_finite, host.len(),
+            "cross-length SDPA output must be all finite (got {n_finite}/{})",
+            host.len()
+        );
     }
 
     /// Smoke test for the model-level globals: fc + hidden_norm +
