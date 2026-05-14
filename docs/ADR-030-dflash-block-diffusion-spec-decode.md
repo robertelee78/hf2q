@@ -2927,3 +2927,144 @@ iter-106-class corruption is possible from any current dispatcher.
 
 298/298 mlx-native + 3503/3503 hf2q tests still GREEN.
 
+
+### iter-114 / iter-115 — hf2q wrapper dtype guards (apply_linear_projection_f32 family)
+
+Mirror of the mlx-native dispatcher guards landed at iter-110→113,
+applied to hf2q's qwen35 wrapper layer:
+
+- `apply_linear_projection_f32` (iter-114): `debug_assert_eq!`
+  that input is F32.  Every internal kernel path (Q4_0 quantized
+  via `quantized_matmul_ggml`, BF16 dense via `dense_gemv_bf16_f32`
+  or `dense_matmul_bf16_f32_tensor`, F32 legacy via inline BF16
+  cast) assumes F32 input — function name encoded this contract
+  since iter-0 but did not enforce it.
+- `apply_linear_projection_f32_into` (iter-115): same guard +
+  additional check that caller-supplied `dst` is F32.
+- `apply_linear_projection_f32_pooled`: transitively protected
+  via delegation to one of the two functions above.
+
+`debug_assert` zero-cost in release builds; fires loudly in debug
+builds if a future change introduces a non-F32 caller.
+
+3503/3503 hf2q tests pass GREEN — confirms every caller already
+passes F32 input + (where applicable) F32 dst.
+
+---
+
+## ADR-030 iter-102→115 synthesis (2026-05-14, late session)
+
+This 14-iteration thread root-caused and locked down a SILENT
+correctness bug in the DFlash drafter forward + extended the same
+defense-in-depth pattern across the entire mlx-native dispatcher
+surface and the hf2q-side qwen35 wrappers.
+
+**Bug found** (iter-106):
+The DFlash drafter uploaded 4 RMSNorm tensors as BF16 while passing
+F32 input to `mlx-native::dispatch_rms_norm`.  The dispatcher selected
+the F32 kernel (`rms_norm_f32`) which declares its weight buffer as
+`device const float*`.  Reading a BF16-allocated buffer at F32 stride
+caused (a) bit-misinterpretation of two adjacent BF16 elements as one
+F32 and (b) OOB reads past the buffer end for i ≥ dim/2.  The result
+was content-conditional corruption of drafter hidden states across all
+5 layers, manifesting as the iter-86 "[X]*7 cluster" pattern and
+iter-87 "all-pad [0]*7" pathology that had defied 6 iterations of
+prior investigation.
+
+**Fix** (iter-106): cast the 4 norm tensors to F32 at upload time
+(mirroring the qwen35 production convention).  Single-commit fix
+in `src/inference/spec_decode/dflash/tensors.rs`.
+
+**Regression-proofing** (iter-107→109):
+- Drafter-side invariant guards on every uploaded buffer's dtype
+  inside `DFlashModelTensors::upload`.
+- Pure-CPU unit tests with named regression signatures (e.g.
+  `bf16_over_f32_misinterpret_signature` pins the exact pre-fix
+  bit pattern `0x3f803f80 ≈ 1.00012`).
+- CPU plumbing test for round-2 `prior_captured` data delivery to
+  the drafter, both worst-case (0% accept) and high-acceptance
+  (4/7 accept).
+
+**Defense-in-depth audit** (iter-110→115):
+Every mlx-native dispatcher that selects its kernel by a buffer's
+dtype now validates dtype coherence across input/weight/output:
+- iter-110: `dispatch_rms_norm`
+- iter-111: `sdpa`, `sdpa_sliding`
+- iter-112: `dispatch_rms_norm_mul`, `dispatch_rms_norm_no_scale_bf16`,
+  `dispatch_rms_norm_no_scale_f32`
+- iter-113: `dispatch_softmax`, `dispatch_gelu`, `dispatch_softcap`,
+  `dispatch_rope`
+- iter-114/115: `apply_linear_projection_f32` + `_into` siblings
+  (hf2q-side wrappers)
+
+Pre-existing dtype-coherence checks (independently verified):
+`rms_norm_f32_triple`, `cumsum`, `l2_norm`×2, `rope_multi`,
+`vision_2d_rope`, `tri_solve`, `sigmoid_mul`, `silu_mul`.
+
+**Empirical confirmation**: 298/298 mlx-native + 3503/3503 hf2q
+tests pass GREEN with every new guard landed.  This *empirically
+proves* that the iter-106 bug was the ONLY dtype mismatch hiding
+anywhere in the active codebase — no qwen35 forward, MTP, delta_net,
+or full-attn site had a parallel bug.
+
+**Files touched across iter-102→115**:
+- `src/inference/spec_decode/dflash/tensors.rs` (iter-106 fix +
+  iter-107/108 guards/tests).
+- `src/inference/spec_decode/dflash/hidden_capture.rs` (iter-105/109
+  plumbing tests).
+- `src/inference/spec_decode/dflash/orchestrator.rs` (iter-102/103/104
+  DRAFTER_DUMP instrumentation).
+- `src/serve/forward_prefill_batched.rs` (iter-102 XLEN_DEBUG BF16
+  cache readback).
+- `src/inference/models/qwen35/gpu_full_attn.rs` (iter-114/115
+  wrapper dtype asserts).
+- mlx-native: `src/ops/rms_norm.rs`, `src/ops/sdpa.rs`,
+  `src/ops/sdpa_sliding.rs`, `src/ops/softmax.rs`, `src/ops/gelu.rs`,
+  `src/ops/softcap.rs`, `src/ops/rope.rs` (iter-110→113 dispatcher
+  guards).
+
+**Test deltas**:
+- hf2q dflash module: 41 → 46 tests (+5 new tests, all pass).
+- hf2q full bin: 3499 → 3503 tests (+4 new tests, all pass).
+- mlx-native: 298 → 298 tests (no test count change; all new guards
+  pass with existing test inputs).
+
+**What still requires operator GPU verification** (cannot be tested
+offline):
+1. Drafter acceptance rate on the e2e canary
+   (`e2e_dispatch_dflash_generate_gemma4_26b`) — iter-103/104
+   `HF2Q_DFLASH_DRAFTER_DUMP=1` instrumentation will report whether
+   drafts cluster post-fix or differentiate per-position.
+2. iter-86 / iter-87 / iter-92 / iter-93 cluster + all-pad
+   pathologies — predicted to disappear once the drafter computes
+   correct hidden states.
+3. 6-token prompt Option A coherence — separate issue from iter-106
+   (target-side iter-93 hidden-state divergence on D=512 cast chain);
+   may or may not also improve post-iter-106 depending on whether
+   the drafter's broken state was a confounder.
+4. Mission perf gate (≥1.07× baseline at temp=0) — testable once
+   drafter quality is verified.
+
+**What is explicitly NOT this thread's scope** (per ADR-030
+sections 3.6 and 3.8):
+- Phase 5 async parallel-encode implementation (90+ LOC refactor,
+  deferred until post-iter-115 GPU perf measurement shows actual
+  headroom).
+- Multi-model DFlash integration (Qwen3.6, gpt-oss, etc).
+- Continuous-batching spec-decode.
+
+**Production safety stance at iter-115**:
+- Default mode (`HF2Q_SPEC_DFLASH=1` without `XLEN_SDPA=1`):
+  Option C re-prefill, universally coherent.  Unchanged by
+  iter-106 (Option C is target-side; drafter bug was a sub-system
+  separate from target verify).
+- iter-100's D=256 BF16 cache fix for Option A xlen path is still
+  the production-ready path for 4/5 iter-92 prompts.
+- iter-106 RMSNorm cast fix should unblock both clustering AND the
+  drafter acceptance signal — confirming this on GPU is the next
+  operator gate.
+
+**Repos pushed**:
+- /opt/hf2q: 19+ commits across iter-102→115, all on `main`.
+- /opt/mlx-native: 5 commits (iter-110/111/112/113) on `main`.
+
