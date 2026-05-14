@@ -142,6 +142,46 @@ These are the gate this ADR must clear (§5).
 
 Implement DFlash block-diffusion speculative decoding for hf2q gemma-4-26b as a **single complete, gated, coherence-tested feature** rolled out in six landed phases. No phase ships with stubs; every phase ships compiled and tested code behind a per-phase flag, and the next phase only begins after the prior phase clears all three gates (perf σ<1%, coherence golden, determinism).
 
+### 3.0 Drafter + target concrete shapes (locked iter-2 from downloaded configs)
+
+**Drafter** `z-lab/gemma-4-26B-A4B-it-DFlash` — 820 MB BF16 safetensors (425M params), `model_type: qwen3` (vanilla dense, NOT MoE, NOT TQ-HB):
+| Field | Value |
+|---|---|
+| num_hidden_layers | 5 (4 sliding + 1 full, last layer is full) |
+| hidden_size | 2816 |
+| head_dim | 128 |
+| num_attention_heads | 32 |
+| num_key_value_heads | 8 (GQA=4) |
+| intermediate_size | 5632 |
+| sliding_window | 2048 |
+| block_size | 16 |
+| mask_token_id | 4 |
+| target_layer_ids | [1, 6, 11, 17, 22, 27] (6 hidden states from target) |
+| num_target_layers | 30 |
+| final_logit_softcapping | 30.0 |
+| rope_theta | 1_000_000 |
+| vocab_size | 262144 |
+| dtype | bfloat16 |
+
+**Target** `mlx-community/gemma-4-26b-a4b-it-4bit` (also runs in hf2q production):
+| Field | Value | Match drafter? |
+|---|---|---|
+| hidden_size | 2816 | ✅ same |
+| num_hidden_layers | 30 | matches `num_target_layers` |
+| head_dim | 256 | ✗ different |
+| num_attention_heads | 16 | ✗ different |
+| num_key_value_heads | 8 | ✅ same |
+| intermediate_size | 2112 | ✗ different |
+| sliding_window | 1024 | ✗ different |
+| `enable_moe_block` | True | target is MoE; drafter is dense |
+| `attention_k_eq_v` | True | target K=V tied; drafter is not |
+| `num_kv_shared_layers` | (TBD) | target shares KV across some layers |
+| `use_double_wide_mlp` | True | target uses double-wide MLP variant |
+
+**FC projection**: input = `6 × 2816 = 16896`, output = `2816` → 47.6M params × 2 bytes = 95 MB (in BF16). Plus per-layer ~76.5M = 382M layer params + 95M fc + norms ≈ 425M, 820 MB BF16 — confirmed.
+
+**Implication for Phase 2**: drafter has its own QKV shapes (32×128) distinct from target's (16×256). The Rust port writes a *new* small attention block using mlx-native's vanilla `dispatch_dense_mm_bf16` primitives — NO TQ-HB dequant, NO MoE routing, NO K=V tying. Substantially simpler than porting any part of the target forward.
+
 ### 3.1 Algorithm specification (locked from `/opt/dflash/dflash/model_mlx.py:429-582`)
 
 The verbatim DFlash MLX algorithm at `block_size=16`:
