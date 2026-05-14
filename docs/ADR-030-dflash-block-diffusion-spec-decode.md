@@ -2898,3 +2898,32 @@ the two SDPA dispatchers (`sdpa`, `sdpa_sliding`).
 298/298 mlx-native + 3503/3503 hf2q tests still GREEN — no existing
 caller relies on mismatched dtype anywhere in the codebase.
 
+
+### iter-113 — Single-input dispatcher dtype-coherence audit (mlx-native 245d34c)
+
+Closed the audit on dispatchers that select kernel by input.dtype()
+and have a single output buffer.  Four dispatchers were missing the
+input↔output dtype check:
+
+- `dispatch_softmax`
+- `dispatch_gelu`
+- `dispatch_softcap`
+- `dispatch_rope`
+
+All four now reject mismatched output dtype up front.  Pattern matches
+iter-110 (`rms_norm`), iter-111 (sdpa/sdpa_sliding), and iter-112
+(`rms_norm_mul`, `rms_norm_no_scale_{bf16,f32}`).
+
+**Cumulative dispatchers protected**: 11 dispatchers with new guards
+across iter-110→113.  Plus 9 dispatchers (`rms_norm_f32_triple`,
+`cumsum`, `l2_norm`×2, `rope_multi`, `vision_2d_rope`, `tri_solve`,
+`sigmoid_mul`, `silu_mul`) had pre-existing dtype-coherence checks
+that predate iter-106.
+
+**Audit completeness**: every dispatcher in mlx-native that selects
+kernel by a buffer's dtype now validates dtype coherence — either via
+the new iter-110→113 guards OR via pre-existing checks.  No silent
+iter-106-class corruption is possible from any current dispatcher.
+
+298/298 mlx-native + 3503/3503 hf2q tests still GREEN.
+
