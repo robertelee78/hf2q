@@ -1229,8 +1229,9 @@ mod tests {
         // the prompt is orthogonal.
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .expect("load tokenizer.json");
-        let prompt_text = "Q: What is 2+2?\nA:";
-        let encoding = tokenizer.encode(prompt_text, false).expect("encode");
+        let prompt_text = std::env::var("HF2Q_TEST_PROMPT")
+            .unwrap_or_else(|_| "Q: What is 2+2?\nA:".to_string());
+        let encoding = tokenizer.encode(prompt_text.as_str(), false).expect("encode");
         let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
         assert!(!prompt_tokens.is_empty(), "prompt encoding empty");
         eprintln!(
