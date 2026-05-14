@@ -228,6 +228,33 @@ impl DFlashModelTensors {
             layers.push(lw);
         }
 
+        // ADR-030 iter-107 — defensive dtype-invariant guard.  The
+        // iter-106 bug (rms_norm_f32 reading F32 over BF16-allocated
+        // weight buffer → bit-misinterpretation + OOB reads) silently
+        // produced corrupted hidden states.  These asserts catch future
+        // regressions at upload time instead of letting them surface
+        // as opaque drafter-clustering symptoms downstream.
+        debug_assert_eq!(fc.dtype(), DType::BF16, "fc weight must stay BF16 for dense_matmul");
+        debug_assert_eq!(hidden_norm.dtype(), DType::F32, "hidden_norm weight must be F32 for rms_norm_f32 kernel");
+        debug_assert_eq!(final_norm.dtype(), DType::F32, "final_norm weight must be F32 for rms_norm_f32 kernel");
+        for (idx, l) in layers.iter().enumerate() {
+            debug_assert_eq!(l.input_layernorm.dtype(), DType::F32,
+                "layer {idx}: input_layernorm weight must be F32 for rms_norm_f32 kernel");
+            debug_assert_eq!(l.post_attention_layernorm.dtype(), DType::F32,
+                "layer {idx}: post_attention_layernorm weight must be F32 for rms_norm_f32 kernel");
+            debug_assert_eq!(l.q_norm.dtype(), DType::F32,
+                "layer {idx}: q_norm weight must be F32 for rms_norm_f32 head_norm kernel");
+            debug_assert_eq!(l.k_norm.dtype(), DType::F32,
+                "layer {idx}: k_norm weight must be F32 for rms_norm_f32 head_norm kernel");
+            debug_assert_eq!(l.q_proj.dtype(), DType::BF16, "layer {idx}: q_proj must stay BF16 for dense_matmul");
+            debug_assert_eq!(l.k_proj.dtype(), DType::BF16, "layer {idx}: k_proj must stay BF16 for dense_matmul");
+            debug_assert_eq!(l.v_proj.dtype(), DType::BF16, "layer {idx}: v_proj must stay BF16 for dense_matmul");
+            debug_assert_eq!(l.o_proj.dtype(), DType::BF16, "layer {idx}: o_proj must stay BF16 for dense_matmul");
+            debug_assert_eq!(l.mlp_gate.dtype(), DType::BF16, "layer {idx}: mlp_gate must stay BF16 for dense_matmul");
+            debug_assert_eq!(l.mlp_up.dtype(), DType::BF16, "layer {idx}: mlp_up must stay BF16 for dense_matmul");
+            debug_assert_eq!(l.mlp_down.dtype(), DType::BF16, "layer {idx}: mlp_down must stay BF16 for dense_matmul");
+        }
+
         Ok(DFlashModelTensors {
             fc,
             hidden_norm,
