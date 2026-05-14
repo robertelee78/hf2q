@@ -2383,3 +2383,48 @@ verifies positions outside written range stay zero.
 NOT in the kernel.  iter-98+ has confidence-building gate to re-attempt
 the wire-up with runtime debugging.
 
+
+### iter-98/99/100 — D=256 BF16 cache wire-up SHIPPED — 4/5 prompts PASS
+
+Step-by-step careful re-implementation of the BF16 cache wire-up
+that was attempted but reverted at iter-96:
+
+**iter-98** (commit d7c321b8): added post-SDPA hook that writes
+`bf16_xlen_k/v` from `pf_k_perm/pf_v_perm` BF16 head-major directly
+(no F16 round-trip).  Single F32→BF16 rounding identical to Option
+C's pf_k_perm.  Write-only this stage — toy coherence GREEN.
+
+**iter-99** (committed with iter-100): added pre-SDPA bf16 cache
+write at the xlen branch for verify positions [start_pos..).  Toy
+coherence still GREEN.
+
+**iter-100** (commit 14af9551): swapped D=256 xlen SDPA dispatch
+from F16 D=256 resume to BF16 D=256 resume, reading from
+`bf16_xlen_k/v` cache.  Env-gated `HF2Q_DFLASH_XLEN_BF16=0` for
+fallback.
+
+**D=512 swap attempted then REVERTED**: my D=512 path swap to
+`bf16_xlen_k/v` cache regressed toy + 10-tok.  Kept iter-84's
+F16→F32→BF16 cast path for D=512.  Foundation (struct + hooks) ready
+for future D=512 wire-up.
+
+**Final coherence gate results (iter-100):**
+
+| Prompt          | Tokens | iter-92 | iter-100 |
+|-----------------|-------:|---------|----------|
+| Toy "Q: 2+2?"   | 12     | ✓ PASS  | ✓ PASS   |
+| "Hi"            | 1      | ✓ PASS  | ✓ PASS   |
+| "Explain..."    | 10     | ✗ FAIL  | ✓ PASS   |
+| "What is 2+2?"  | 6      | ✗ FAIL  | ✗ FAIL   |
+| "Tell me..."    | 16     | ✓ PASS  | ✓ PASS   |
+
+**4/5 PASS (up from 3/5).**  iter-92's headline failing 10-token
+"Explain..." prompt — the one we've been hunting since iter-89 —
+NOW PASSES.  Mission canary (Option A + toy) ✓ GREEN, all other
+working prompts still GREEN, the failure-mode regression is
+isolated to the 6-token prompt which fails at pos 2 vs pos 4 before.
+
+iter-101 plan: investigate why 6-tok still fails.  Likely needs
+D=512 BF16 cache wire-up done correctly (iter-100 attempt regressed;
+needs careful re-implementation with runtime debug).
+
