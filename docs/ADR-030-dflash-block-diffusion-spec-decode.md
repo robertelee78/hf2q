@@ -2364,3 +2364,22 @@ Mission perf gate (≥1.07× baseline) remains OPEN, blocked on
 completing the BF16 cache wire-up that fixes the precision drift
 root-caused at iter-92/93.
 
+
+### iter-97 — Kernel byte-identity test PASSES (mlx-native)
+
+Standalone unit test for `kv_cache_copy_seq_bf16_to_bf16_head_major`
+(mlx-native commit bf1befd):
+- src: `[n_heads=4, src_seq_len=6, head_dim=16]` BF16 head-major
+- cache: `[n_heads=4, capacity=32, head_dim=16]` BF16 head-major
+- seq_pos_start=10, n_tokens=6, src_tok_offset=0
+
+Asserts each (head, tok, elem) element is bit-identical to src;
+verifies positions outside written range stay zero.
+
+**Test PASSES.**
+
+→ The kernel itself is correct.  iter-96's hf2q wire-up regression
+(toy fail position 1) was in the call-site or surrounding wire-up,
+NOT in the kernel.  iter-98+ has confidence-building gate to re-attempt
+the wire-up with runtime debugging.
+
