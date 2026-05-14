@@ -100,6 +100,14 @@ pub fn step_round_from_argmaxes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::spec_decode::dflash::{
+        config::DFlashConfig,
+        forward::dispatch_dflash_model_forward,
+        kv_cache::DFlashKvCache,
+        tensors::DFlashModelTensors,
+        weights::{DFlashWeights, DFlashWeightsFile},
+    };
+    use mlx_native::{DType, KernelRegistry, MlxDevice};
 
     #[test]
     fn k0_empty_drafts_degrades_to_single_token() {
@@ -172,5 +180,91 @@ mod tests {
         assert_eq!(result.committed_tokens, vec![10, 20, 1]);
         assert_eq!(result.accept_count, 2);
         assert!(result.hit_eos);
+    }
+
+    /// Integration smoke test for orchestrator + drafter: drafter runs
+    /// end-to-end producing h_final; then we SIMULATE what the target
+    /// verify would produce (synthetic argmaxes) and feed both into
+    /// step_round_from_argmaxes. Validates the orchestrator+drafter
+    /// API surface from the caller's perspective.
+    ///
+    /// This is the seam where Phase 4 target integration will plug in:
+    /// the synthetic argmaxes here are placeholders for what
+    /// `forward_decode_verify_batched` (modified per ADR-030 §3.5
+    /// Phase 4) will return.
+    #[test]
+    #[ignore = "requires Metal device + drafter HF cache"]
+    fn smoke_orchestrator_drafter_loop_with_simulated_target() {
+        let cfg = DFlashConfig::from_json_str(
+            crate::inference::spec_decode::dflash::config::tests::GEMMA4_26B_A4B_DFLASH_CONFIG,
+        )
+        .expect("config parse");
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let mut registry = KernelRegistry::new();
+
+        let home = std::env::var("HOME").expect("HOME set");
+        let path = format!(
+            "{home}/.cache/huggingface/hub/models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/77d4202772dfe50b2396ec7bac9cfffc7b9e7057/model.safetensors"
+        );
+        let file = DFlashWeightsFile::open(&path).expect("file open");
+        let weights = DFlashWeights::load(file.bytes(), &cfg).expect("validated load");
+        let tensors = DFlashModelTensors::upload(&device, &cfg, &weights).expect("GPU upload");
+        let mut cache = DFlashKvCache::new(&device, &cfg, 128).expect("cache");
+
+        let block_size = 8u32;
+        let ctx_chunk = 4u32;
+        let hidden = cfg.hidden_size as u32;
+        let fc_in = cfg.fc_input_dim() as u32;
+
+        // Build synthetic h + target_hidden_concat (caller would supply
+        // these from target's embed + hidden capture).
+        let h_elem = (block_size as usize) * (hidden as usize);
+        let mut h = device
+            .alloc_buffer(h_elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .expect("alloc h");
+        {
+            let s = h.as_mut_slice::<f32>().expect("h slice");
+            for v in s.iter_mut() { *v = 1.0; }
+        }
+        let thc_elem = (ctx_chunk as usize) * (fc_in as usize);
+        let mut target_hidden = device
+            .alloc_buffer(thc_elem * 4, DType::F32, vec![ctx_chunk as usize, fc_in as usize])
+            .expect("alloc target_hidden");
+        {
+            let s = target_hidden.as_mut_slice::<f32>().expect("target_hidden slice");
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = 0.1 + ((i % 17) as f32) / 170.0;
+            }
+        }
+
+        // Run drafter forward → h_final [L, hidden]
+        let h_final = dispatch_dflash_model_forward(
+            &mut registry, &device, &h, &target_hidden,
+            &tensors, &mut cache, &cfg, block_size, ctx_chunk,
+        )
+        .expect("drafter forward");
+        assert_eq!(h_final.element_count(), (block_size as usize) * (hidden as usize));
+
+        // Caller would now apply target's lm_head + softcap on h_final
+        // to get K draft tokens. For this test, we SIMULATE:
+        // drafts = [1, 2, 3, 4, 5, 6, 7] (K=7 placeholder tokens)
+        let drafts: Vec<u32> = (1..=7).collect();
+        // Simulate target verify returning argmaxes — 4 match, 1 mismatch, 3 free
+        let target_argmaxes = vec![1, 2, 3, 4, 99, 100, 101, 102];
+
+        // Apply round math
+        let round = step_round_from_argmaxes(&drafts, &target_argmaxes, &[]);
+        assert_eq!(round.accept_count, 4);
+        assert_eq!(round.committed_tokens, vec![1, 2, 3, 4, 99]);
+        assert!(!round.hit_eos);
+
+        // Cache should have advanced by ctx_chunk on all layers (drafter
+        // forward side-effect).
+        for (i, l) in cache.layers.iter().enumerate() {
+            assert_eq!(
+                l.seq_len, ctx_chunk,
+                "layer {i} cache should advance by ctx_chunk"
+            );
+        }
     }
 }
