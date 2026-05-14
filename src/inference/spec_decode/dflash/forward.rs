@@ -364,6 +364,46 @@ pub fn dispatch_dflash_mlp(
     .context("dispatch_dflash_mlp: down_proj")
 }
 
+/// Dispatch the O projection: `o_proj @ attn_out`.
+///
+/// Mirrors `model_mlx.py:DFlashAttention.__call__` line 116:
+/// `self.o_proj(output.transpose(0, 2, 1, 3).reshape(B, L, -1))`.
+///
+/// In our flat row-major layout, the transpose-reshape from the SDPA
+/// output is metadata-only IF the SDPA output is already in
+/// `[L, n_heads, head_dim]` flat order. If SDPA emits `[n_heads, L,
+/// head_dim]` order, an explicit transpose is required upstream (handled
+/// in the SDPA dispatcher, not here).
+///
+/// # Arguments
+///
+/// - `attn_out`: `[L, num_q_heads * head_dim]` F32 (SDPA output post-transpose)
+/// - `layer`: uses `o_proj` BF16 weight `[hidden_size, num_q_heads * head_dim]`
+/// - Returns: `[L, hidden_size]` F32
+pub fn dispatch_dflash_o_proj(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    attn_out: &MlxBuffer,
+    layer: &DFlashLayerTensors,
+    cfg: &DFlashConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    let hidden = cfg.hidden_size as u32;
+    let q_in_dim = (cfg.num_attention_heads * cfg.head_dim) as u32;
+    apply_linear_projection_f32(
+        encoder,
+        registry,
+        device,
+        attn_out,
+        &layer.o_proj,
+        seq_len,
+        q_in_dim,
+        hidden,
+    )
+    .context("dispatch_dflash_o_proj")
+}
+
 /// Dispatch post_attention_layernorm (`RMSNorm(h)`) — same shape as
 /// input_layernorm but applied between the attention residual and MLP.
 ///
@@ -537,6 +577,57 @@ mod tests {
                 host.len()
             );
         }
+    }
+
+    /// Independent O projection smoke test: validates that o_proj
+    /// dispatcher takes a `[L, num_q_heads * head_dim]` F32 input and
+    /// produces a `[L, hidden_size]` F32 output. Input is F32-ones (a
+    /// stand-in for SDPA output — the dispatcher cares about shape +
+    /// arithmetic, not the semantic meaning of the input).
+    #[test]
+    #[ignore = "requires Metal device + drafter HF cache"]
+    fn smoke_o_proj() {
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let mut registry = KernelRegistry::new();
+
+        let home = std::env::var("HOME").expect("HOME set");
+        let path = format!(
+            "{home}/.cache/huggingface/hub/models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/77d4202772dfe50b2396ec7bac9cfffc7b9e7057/model.safetensors"
+        );
+        let file = DFlashWeightsFile::open(&path).expect("file open");
+        let weights = DFlashWeights::load(file.bytes(), &cfg).expect("validated load");
+        let tensors = DFlashModelTensors::upload(&device, &cfg, &weights).expect("GPU upload");
+
+        let block_size = 8u32;
+        let q_dim = (cfg.num_attention_heads * cfg.head_dim) as u32; // 32 * 128 = 4096
+        let elem = (block_size as usize) * (q_dim as usize);
+        let mut attn_out = device
+            .alloc_buffer(elem * 4, DType::F32, vec![block_size as usize, q_dim as usize])
+            .expect("alloc attn_out");
+        {
+            let s = attn_out.as_mut_slice::<f32>().expect("attn_out slice");
+            for v in s.iter_mut() { *v = 1.0; }
+        }
+
+        let mut encoder = device.command_encoder().expect("encoder");
+        let layer = &tensors.layers[0];
+        let h_out = dispatch_dflash_o_proj(
+            &mut encoder, &mut registry, &device, &attn_out, layer, &cfg, block_size,
+        )
+        .expect("o_proj dispatch");
+        encoder.commit_and_wait().expect("commit");
+
+        // [L, hidden_size]
+        let h_dim = cfg.hidden_size;
+        assert_eq!(h_out.element_count(), (block_size as usize) * h_dim);
+        let host: &[f32] = h_out.as_slice::<f32>().expect("h_out slice");
+        let n_finite = host.iter().filter(|v| v.is_finite()).count();
+        let n_zero = host.iter().filter(|v| **v == 0.0).count();
+        assert_eq!(n_finite, host.len(),
+            "O projection output must be all finite (got {n_finite}/{}; n_zero={n_zero})", host.len());
+        assert!(n_zero < host.len() / 2,
+            "O projection output suspiciously sparse (n_zero={n_zero}/{})", host.len());
     }
 
     /// Independent MLP smoke test: load drafter, apply
