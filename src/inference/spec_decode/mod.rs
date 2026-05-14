@@ -9,5 +9,6 @@
 //! Status: NO production wire-up yet. The proposer module is publicly
 //! accessible but no caller exists in `cmd_generate*` until Phase 3.
 
+pub mod dflash;
 pub mod ngram_proposer;
 pub mod verifier;
