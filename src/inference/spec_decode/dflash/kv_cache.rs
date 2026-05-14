@@ -73,6 +73,98 @@ impl DFlashLayerKvCache {
             self.seq_len.saturating_add(n) > self.capacity
         }
     }
+
+    /// Append seq-major `[n_new, num_kv_heads, head_dim]` K and V to
+    /// the cache. Permutes to head-major on write (cache storage is
+    /// `[num_kv_heads, capacity, head_dim]`). Increments `seq_len` by
+    /// `n_new`.
+    ///
+    /// CPU-side copy via `as_mut_slice<f32>()` — fine for the drafter's
+    /// small per-step writes (L=8 for block_size + ctx_chunk_size per
+    /// call). The drafter is tiny; SDPA dominates anyway.
+    ///
+    /// Returns an error if appending would exceed capacity (full-attn
+    /// only; sliding caches MUST not overflow either for our scenarios
+    /// — see module-level note about no-wrap assumption).
+    pub fn append_seq_major_kv(
+        &mut self,
+        k_seq_major: &[f32],
+        v_seq_major: &[f32],
+        n_new: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> anyhow::Result<()> {
+        if self.would_overflow(n_new) {
+            return Err(anyhow::anyhow!(
+                "dflash KV cache layer {} would overflow: seq_len={}, n_new={}, capacity={}",
+                self.layer_idx, self.seq_len, n_new, self.capacity
+            ));
+        }
+        if self.is_sliding && self.seq_len.saturating_add(n_new) > self.capacity {
+            // Defensive: sliding overflow not yet implemented; ASSERT per module note.
+            return Err(anyhow::anyhow!(
+                "dflash KV cache layer {} (sliding) would wrap past capacity {} — \
+                 not supported in Phase 3 first cut (seq_len={}, n_new={})",
+                self.layer_idx, self.capacity, self.seq_len, n_new
+            ));
+        }
+
+        let n_h = num_kv_heads as usize;
+        let d = head_dim as usize;
+        let cap = self.capacity as usize;
+        let n = n_new as usize;
+        let start = self.seq_len as usize;
+
+        let expected_input_elems = n * n_h * d;
+        if k_seq_major.len() != expected_input_elems
+            || v_seq_major.len() != expected_input_elems
+        {
+            return Err(anyhow::anyhow!(
+                "dflash append_seq_major_kv: input lens K={} V={} != n_new({}) * num_kv_heads({}) * head_dim({}) = {}",
+                k_seq_major.len(), v_seq_major.len(), n_new, num_kv_heads, head_dim,
+                expected_input_elems
+            ));
+        }
+
+        // Layout permute: src [t, h, d] (seq-major) → dst [h, cap, d]
+        // (head-major with stride cap). For each head h, copy a
+        // contiguous run of n rows into dst[h * cap * d + start * d ..].
+        let k_dst = self
+            .keys
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("k_dst slice: {e}"))?;
+        let v_dst = self
+            .values
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("v_dst slice: {e}"))?;
+
+        for h in 0..n_h {
+            for t in 0..n {
+                let src_row = (t * n_h + h) * d;
+                let dst_row = (h * cap + start + t) * d;
+                k_dst[dst_row..dst_row + d]
+                    .copy_from_slice(&k_seq_major[src_row..src_row + d]);
+                v_dst[dst_row..dst_row + d]
+                    .copy_from_slice(&v_seq_major[src_row..src_row + d]);
+            }
+        }
+
+        self.seq_len += n_new;
+        Ok(())
+    }
+
+    /// Roll back the cache by `n` positions. Used after a spec-decode
+    /// verify step rejects `n` of the proposed positions — those K/V
+    /// writes must be undone so the next step starts from the correct
+    /// post-accept state.
+    ///
+    /// For our cache (no ring buffer wrap in supported scenarios),
+    /// rollback is just `seq_len -= n`. The underlying buffer bytes
+    /// at positions `seq_len..seq_len+n` are left as garbage; they
+    /// get overwritten on the next append.
+    pub fn rollback(&mut self, n: u32) {
+        self.seq_len = self.seq_len.saturating_sub(n);
+    }
 }
 
 /// Full drafter KV cache: one [`DFlashLayerKvCache`] per draft layer.
@@ -218,6 +310,75 @@ mod tests {
         for l in &cache.layers {
             assert_eq!(l.seq_len, 0, "reset() should zero seq_len");
         }
+    }
+
+    /// Verify that append_seq_major_kv correctly permutes seq-major
+    /// input to head-major storage. Constructs distinguishable values
+    /// per (t, h, d) position and checks placement.
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn append_seq_major_kv_permutes_to_head_major() {
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let max_full = 64u32;
+        let mut cache = DFlashKvCache::new(&device, &cfg, max_full).expect("cache alloc");
+        let layer = &mut cache.layers[4]; // full-attention layer
+        let h = cfg.num_key_value_heads as u32;
+        let d = cfg.head_dim as u32;
+
+        // Build seq-major input [n_new=3, h, d] with distinguishable values
+        // = t * 10000 + head * 100 + dim. Easy to spot misplacement.
+        let n_new = 3u32;
+        let n_h = h as usize;
+        let dim = d as usize;
+        let total = (n_new as usize) * n_h * dim;
+        let mut k_input = vec![0.0f32; total];
+        let mut v_input = vec![0.0f32; total];
+        for t in 0..(n_new as usize) {
+            for head in 0..n_h {
+                for dimi in 0..dim {
+                    let row = (t * n_h + head) * dim;
+                    k_input[row + dimi] = (t * 10000 + head * 100 + dimi) as f32;
+                    v_input[row + dimi] = (t * 10000 + head * 100 + dimi) as f32 + 0.5;
+                }
+            }
+        }
+        layer
+            .append_seq_major_kv(&k_input, &v_input, n_new, h, d)
+            .expect("append_seq_major_kv");
+
+        assert_eq!(layer.seq_len, n_new);
+        // Verify head-major placement: position t for head h must land
+        // at offset (head * capacity + t) * head_dim.
+        let cap = layer.capacity as usize;
+        let k_storage = layer.keys.as_slice::<f32>().expect("k_storage slice");
+        let v_storage = layer.values.as_slice::<f32>().expect("v_storage slice");
+        for t in 0..(n_new as usize) {
+            for head in 0..n_h {
+                let dst = (head * cap + t) * dim;
+                for dimi in 0..dim {
+                    let expected_k = (t * 10000 + head * 100 + dimi) as f32;
+                    let expected_v = expected_k + 0.5;
+                    assert_eq!(
+                        k_storage[dst + dimi], expected_k,
+                        "K mismatch t={t} head={head} dim={dimi}: got {} expected {expected_k}",
+                        k_storage[dst + dimi]
+                    );
+                    assert_eq!(
+                        v_storage[dst + dimi], expected_v,
+                        "V mismatch t={t} head={head} dim={dimi}"
+                    );
+                }
+            }
+        }
+
+        // Rollback by 1, verify seq_len drops, the underlying data is
+        // still there (we don't zero it) but seq_len-bounded reads
+        // ignore it.
+        layer.rollback(1);
+        assert_eq!(layer.seq_len, 2);
+        layer.rollback(99);
+        assert_eq!(layer.seq_len, 0, "saturating rollback");
     }
 
     #[test]
