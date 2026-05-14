@@ -1354,3 +1354,56 @@ ships planning):
 - Production wire-up: ✓ (HF2Q_SPEC_DFLASH=1)
 - Perf: 0.096× baseline = **10.5× slower**
 - Plan ready for iter-74+ Option A implementation.
+
+### iter-74 (2026-05-14) — mlx-native F16 D=256 resume dispatcher added
+
+Investigated mlx-native's existing cross-length kernel surface to scope
+Option A.  Found:
+
+- `dispatch_flash_attn_prefill_bf16_d256_resume` EXISTS at
+  `/opt/mlx-native/src/ops/flash_attn_prefill.rs:971` — supports
+  `qL_off > 0` and slot-capacity strides (= cross-length attention
+  against an existing K/V slot).  ADR-017 Phase E.a originally added
+  it for LCP partial-prefill resume.  Byte-identical to a fresh
+  monolithic prefill per the mlx-native parity test
+  `flash_attn_prefill_bf16_d256_resume_byte_identical_to_monolithic`.
+- F16 / D=512 / sliding-window-with-mask sibling dispatchers DO NOT yet
+  exist.  Each would be a ~80-200 LOC port of the BF16 pure-causal D=256
+  variant.
+
+Gemma-4 architecture has 25 sliding-window layers (D=256) + 5 full-attn
+layers (D=512).  For typical short-context spec-decode (output_len +
+drafts <= sliding_window=1024), the sliding-window constraint never
+trims attention, so a pure-causal resume kernel produces the SAME
+result as a sliding-window-aware one in that regime.
+
+**This iter**: ported the F16 D=256 variant to mlx-native:
+
+- New `pub fn dispatch_flash_attn_prefill_f16_d256_resume(...)` at
+  `/opt/mlx-native/src/ops/flash_attn_prefill.rs:1146-1294`
+  (~150 LOC).  Bit-identical port with dtype check `BF16 → F16` and
+  kernel name `K_BF16_D256 → K_F16_D256`.  Same strides, same params
+  layout, same causal `qL_off` semantics, same pipeline-cache key
+  shape.
+- mlx-native builds clean.  hf2q builds clean.  All 41 dflash unit
+  tests + 18 GPU-ignored pass.  e2e coherence gate GREEN.
+
+The new dispatcher lets iter-75+ use `hybrid_kv.k/v_packed` (F16 with
+`HF2Q_FULL_F16_KV=1`) DIRECTLY as K/V buffers without an F16→BF16
+cast step.
+
+**Still missing for full Option A on gemma-4**:
+- F16 D=512 resume (port to D=512 NSG=8 kernel; gemma-4 full-attn layers)
+- Sliding-window-with-mask resume (for output_len > 1024 long-context)
+
+**iter-75+ plan**: wire `dispatch_flash_attn_prefill_f16_d256_resume`
+into hf2q's `forward_prefill_batched` at the sliding-layer SDPA
+dispatch site, gated on `HF2Q_DFLASH_XLEN_SDPA=1` + `start_pos > 0` +
+`dflash_capture.is_some()` + `output_len + seq_len <= sliding_window`.
+Keep the existing self-attn dispatch for D=512 layers as a temporary
+fallback (broken on chat-templated per iter-67 axis-2 finding, but
+that's the inherited bug).
+
+**Code artifacts (iter-74)**:
+- `/opt/mlx-native/src/ops/flash_attn_prefill.rs` —
+  `dispatch_flash_attn_prefill_f16_d256_resume` added.
