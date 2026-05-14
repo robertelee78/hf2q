@@ -32,6 +32,7 @@ use super::tensors::DFlashLayerTensors;
 use anyhow::{anyhow, Context, Result};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
+use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32;
 
 /// Build the `[eps, dim]` F32 params buffer required by [`dispatch_rms_norm`].
@@ -279,6 +280,137 @@ pub fn dispatch_dflash_v_proj(
     .context("dispatch_dflash_v_proj")
 }
 
+/// Dispatch the SwiGLU MLP: `down(silu(gate(x)) * up(x))`.
+///
+/// Mirrors `mlx_lm.models.qwen3.MLP.__call__` (the qwen3 MLP that
+/// DFlashDecoderLayer uses per `model_mlx.py:123`):
+///
+/// ```text
+///   gate = gate_proj @ x        [L, intermediate_size]
+///   up   = up_proj   @ x        [L, intermediate_size]
+///   h    = silu(gate) * up      [L, intermediate_size]  (fused via dispatch_silu_mul)
+///   out  = down_proj @ h        [L, hidden_size]
+/// ```
+///
+/// Three matmuls + one fused element-wise op. The encoder is NOT
+/// committed; caller composes with residual add + next layer.
+///
+/// # Arguments
+///
+/// - `input`: `[L, hidden_size]` F32 (typically post-attention-norm output)
+/// - `layer`: uses `mlp_gate`, `mlp_up`, `mlp_down` BF16 weights
+/// - Returns: `[L, hidden_size]` F32
+pub fn dispatch_dflash_mlp(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    layer: &DFlashLayerTensors,
+    cfg: &DFlashConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    let hidden = cfg.hidden_size as u32;
+    let inter = cfg.intermediate_size as u32;
+
+    // 1. gate = mlp_gate @ input → [L, intermediate_size]
+    let gate = apply_linear_projection_f32(
+        encoder, registry, device, input, &layer.mlp_gate, seq_len, hidden, inter,
+    )
+    .context("dispatch_dflash_mlp: gate_proj")?;
+
+    // 2. up = mlp_up @ input → [L, intermediate_size]
+    let up = apply_linear_projection_f32(
+        encoder, registry, device, input, &layer.mlp_up, seq_len, hidden, inter,
+    )
+    .context("dispatch_dflash_mlp: up_proj")?;
+
+    // RAW barrier: silu_mul reads gate + up just written by the two matmuls.
+    encoder.memory_barrier();
+
+    // 3. silu(gate) * up → activated [L, intermediate_size]
+    let n_h = seq_len * inter;
+    let mut silu_params = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("alloc mlp silu_params: {e}"))?;
+    silu_params
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("silu_params slice: {e}"))?[0] = n_h;
+    let activated = device
+        .alloc_buffer(
+            (n_h as usize) * 4,
+            DType::F32,
+            vec![seq_len as usize, inter as usize],
+        )
+        .map_err(|e| anyhow!("alloc mlp activated: {e}"))?;
+    dispatch_silu_mul(
+        encoder,
+        registry,
+        device.metal_device(),
+        &gate,
+        &up,
+        &activated,
+        &silu_params,
+        n_h,
+    )
+    .context("dispatch_dflash_mlp: silu_mul")?;
+
+    // RAW barrier: down_proj reads activated.
+    encoder.memory_barrier();
+
+    // 4. mlp_down @ activated → [L, hidden_size]
+    apply_linear_projection_f32(
+        encoder, registry, device, &activated, &layer.mlp_down, seq_len, inter, hidden,
+    )
+    .context("dispatch_dflash_mlp: down_proj")
+}
+
+/// Dispatch post_attention_layernorm (`RMSNorm(h)`) — same shape as
+/// input_layernorm but applied between the attention residual and MLP.
+///
+/// Mirrors `model_mlx.py:DFlashDecoderLayer.__call__`:
+/// `h + self.mlp(self.post_attention_layernorm(h))` (the inner RMSNorm).
+pub fn dispatch_dflash_post_attention_layernorm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    h: &MlxBuffer,
+    layer: &DFlashLayerTensors,
+    cfg: &DFlashConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    let hidden = cfg.hidden_size as u32;
+    let element_count = (seq_len as usize) * (hidden as usize);
+    if h.element_count() != element_count {
+        return Err(anyhow!(
+            "dflash post_attention_layernorm: h element count {} != L({}) * hidden({})",
+            h.element_count(),
+            seq_len,
+            hidden
+        ));
+    }
+    let normed = device
+        .alloc_buffer(
+            element_count * 4,
+            DType::F32,
+            vec![seq_len as usize, hidden as usize],
+        )
+        .map_err(|e| anyhow!("alloc post_attention_layernorm output: {e}"))?;
+    let params = alloc_rms_norm_params(device, cfg.rms_norm_eps, hidden)?;
+    dispatch_rms_norm(
+        encoder,
+        registry,
+        device.metal_device(),
+        h,
+        &layer.post_attention_layernorm,
+        &normed,
+        &params,
+        seq_len,
+        hidden,
+    )
+    .context("dispatch_rms_norm post_attention_layernorm")?;
+    Ok(normed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +537,69 @@ mod tests {
                 host.len()
             );
         }
+    }
+
+    /// Independent MLP smoke test: load drafter, apply
+    /// post_attention_layernorm + SwiGLU MLP to F32-ones input,
+    /// verify output shape and finite values.
+    ///
+    /// At ones input → post_norm → ~weight (per-row), → 3 matmuls + silu_mul,
+    /// output is [L, hidden_size] F32 with non-trivial values.
+    #[test]
+    #[ignore = "requires Metal device + drafter HF cache"]
+    fn smoke_post_norm_and_mlp() {
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let mut registry = KernelRegistry::new();
+
+        let home = std::env::var("HOME").expect("HOME set");
+        let path = format!(
+            "{home}/.cache/huggingface/hub/models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/77d4202772dfe50b2396ec7bac9cfffc7b9e7057/model.safetensors"
+        );
+        let file = DFlashWeightsFile::open(&path).expect("file open");
+        let weights = DFlashWeights::load(file.bytes(), &cfg).expect("validated load");
+        let tensors = DFlashModelTensors::upload(&device, &cfg, &weights).expect("GPU upload");
+
+        // F32-ones input [L=8, hidden=2816]
+        let block_size = 8u32;
+        let hidden = cfg.hidden_size as u32;
+        let elem = (block_size as usize) * (hidden as usize);
+        let mut h = device
+            .alloc_buffer(elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .expect("alloc h");
+        {
+            let slice = h.as_mut_slice::<f32>().expect("h slice");
+            for v in slice.iter_mut() { *v = 1.0; }
+        }
+
+        // Encoder: post_norm → MLP
+        let mut encoder = device.command_encoder().expect("encoder");
+        let layer = &tensors.layers[0];
+        let post_normed = dispatch_dflash_post_attention_layernorm(
+            &mut encoder, &mut registry, &device, &h, layer, &cfg, block_size,
+        ).expect("post_norm");
+        encoder.memory_barrier();
+        let mlp_out = dispatch_dflash_mlp(
+            &mut encoder, &mut registry, &device, &post_normed, layer, &cfg, block_size,
+        ).expect("mlp");
+        encoder.commit_and_wait().expect("commit");
+
+        // Validate shape: [block_size, hidden_size]
+        let h_dim = cfg.hidden_size;
+        assert_eq!(mlp_out.element_count(), (block_size as usize) * h_dim);
+
+        let host: &[f32] = mlp_out.as_slice::<f32>().expect("mlp_out host slice");
+        let n_finite = host.iter().filter(|v| v.is_finite()).count();
+        let n_zero = host.iter().filter(|v| **v == 0.0).count();
+        assert_eq!(
+            n_finite, host.len(),
+            "MLP output must be all finite (got {n_finite}/{}; n_zero={n_zero})",
+            host.len()
+        );
+        assert!(
+            n_zero < host.len() / 2,
+            "MLP output suspiciously sparse (n_zero={n_zero}/{})",
+            host.len()
+        );
     }
 }
