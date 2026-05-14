@@ -1850,3 +1850,86 @@ architectural path that enables that win when acceptance>0.
 - Closure path: dependent on drafter acceptance rate on production
   workloads (gemma-4 with non-trivial prompts)
 
+
+### iter-86 — Drafter acceptance characterization
+
+Instrumented per-round `accept_count + drafts + target_argmaxes`
+(env-gated on `HF2Q_DFLASH_PROFILE=1`).  Findings on the iter-85
+toy-prompt test:
+
+```
+[HF2Q_DFLASH_ACCEPT] round=1 accept_count=0/7 drafts=[1595, 1595,
+   1595, 1595, 1595, 1595, 1595] target=[236778, 531, 1595, 1595,
+   236743, 236743, 236743, 1595] committed=[236778]
+[HF2Q_DFLASH_ACCEPT] round=2 accept_count=0/7 drafts=[1638, 1638,
+   1638, 1638, 1638, 1638, 1638] target=[236862, ...] ...
+```
+
+Drafter is outputting K *clustered* drafts per round — all 7 positions
+predict the same (or near-same) token.  This kills draft diversity and
+yields 0% acceptance.  Block-diffusion is supposed to produce K
+distinct predictions at the K mask positions.
+
+### iter-87 — Drafter SDPA now bidirectional for full_attention layer
+
+Smoking-gun comment in `forward.rs:1093` admitted: *"The current
+mlx-native sdpa() kernel applies CAUSAL masking. For DFlash
+full-attention layers (layer 4 in the drafter), Python passes
+`mask=None` (bidirectional). … This first cut uses causal
+everywhere."*
+
+Peer `dflash/model_mlx.py:109-114`:
+```python
+mask = None  # full_attention → bidirectional
+if self.is_sliding:
+    mask = "causal" if ctx_len + L <= self.sliding_window
+                    else create_causal_mask(L, offset=ctx_len, ...)
+```
+
+Block-diffusion REQUIRES bidirectional within the block — all mask
+positions must see each other to produce different next-K predictions.
+Causal masking forces all mask positions to attend only to prior
+positions, collapsing predictions.
+
+Fix:
+- mlx-native `SdpaParams` gains `do_causal: bool` field; kernel gates
+  `max_k` (causal: `min(abs_pos+1, kv_seq_len)`; bidirectional: `kv_seq_len`).
+- hf2q drafter forward plumbs `layer_idx` → `dispatch_dflash_sdpa_cross_length`
+  → `do_causal = (layer_types[layer_idx] == SlidingAttention)`.
+- Existing qwen35 + sliding dflash callers stay causal (=true).
+
+Coherence GREEN — 16/16 tokens still bit-identical to baseline.
+
+Per-round drafter behavior on the toy prompt is essentially unchanged
+(drafts still cluster as `[1638]*7` etc.).  The gemma-4 chat model is
+heavily echoing the toy "Q: 2+2?\nA:" prompt and the drafter mirrors
+that echo pattern — even bidirectional attention can't manufacture
+diversity when the model's distribution is dominated by prompt-
+repetition tokens.
+
+On a longer realistic prompt under CLI (`hf2q generate --prompt
+"Explain in detail how transformer self-attention works..." \
+--max-tokens 8`):
+- Option C re-prefill: drafts `[42000]*7` (clustered, non-zero)
+- Option A xlen verify: drafts `[0]*7` (all pad — degenerate)
+
+Option A on a long context with bidirectional SDPA produces all-pad
+drafts.  This is a SEPARATE bug from iter-82 (which was target-side
+F16 D=512 overflow at L29); the drafter's all-pad output suggests the
+drafter's hidden state pipeline has an issue when fed Option A's
+appended `prior_captured` from `append_capture_positions`.  Deferred
+to iter-88+.
+
+### Mission state at iter-87
+
+- Coherence (Option A, toy prompt): GREEN ✓ (16/16 bit-identical)
+- Coherence (Option C, toy prompt): GREEN ✓ (pre-existing)
+- Drafter SDPA: now matches peer DFlash semantics (causal for sliding,
+  bidirectional for full_attention)
+- Drafter acceptance: still 0% on toy prompt (model echoes prompt)
+- Production wire-up: HF2Q_SPEC_DFLASH=1 routes through Option C; need
+  Option A on realistic workloads
+- Mission perf gate (≥1.07× baseline): requires non-trivial drafter
+  acceptance; deferred until iter-88 long-prompt investigation
+  resolves the all-pad drafter pathology under Option A.
+
