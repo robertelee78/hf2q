@@ -1,0 +1,33 @@
+
+hf2q: investigation-only environment variables detected
+      (not part of the shipping contract — see docs/shipping-contract.md)
+
+  UNSAFE (ack-required, activated):
+    HF2Q_BATCHED_PREFILL=1          experimental; errors when seq_len > sliding_window
+
+[ADR-029 H29] Materializing F16 shadows for 30 layers' attn + dense MLP weights...
+[ADR-029 H29] F16 shadow population done in 0.32s
+[hf2q lcp] byte_budget=2765 MB (source=sysinfo available_memory=54 GB × 5%)
+hf2q load: backend = mlx-native (M5 Max)
+hf2q load: model = Gemma4 Ara 2pass Baseline (arch = gemma4, family = gemma4)
+hf2q load: source = /opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf (19.16 GiB on disk)
+hf2q load: layout = 30 layers, 16 heads (8 kv), head_dim=256, hidden=2816, vocab=262144
+hf2q load: features = sliding_window=1024, full_attn_every=6, moe=128 experts/8 active
+hf2q load: quant = Q6_K dominant, ~6.51 bpw, mlx-native resident none
+hf2q load: max_ctx_train = 262144, kv_budget = none
+hf2q load: tokenizer = hf-tokenizer-json (/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/tokenizer.json)
+hf2q load: chat_template = gguf-embedded
+hf2q load: provenance = external
+hf2q load: vision = mmproj-required (no mmproj loaded; pass --mmproj)
+hf2q load: kv_spill = inactive
+hf2q load: tq_kv = inactive
+hf2q load: ready in 2.85 s
+Batched prefill: KV=F32, seq_len=24, path=flash-attn
+[ADR-028 Phase 10c] Allocating hybrid_kv (30 layers, F16 K + TQ-HB V 8-bit) [batched]
+Batched prefill complete: 24 tokens in 68.0 ms (353.2 tok/s), first decode token = 236812
+prefill: 24 tok in 92ms (260 tok/s)
+
+4[HF2Q_TQ_CODEBOOK_BITS] 8-bit Lloyd-Max native HB SDPA (default)
+<turn|><turn|><turn|>**A: 4**<turn|><turn|>/**A: 
+
+--- mlx-native: [ Prompt: 260.3 t/s | Generation: 98.8 t/s ]  (16 gen tokens in 0.16s) ---

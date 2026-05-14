@@ -1030,3 +1030,48 @@ evidence).  The bug is content-sensitive.
   `e2e_dispatch_dflash_generate_gemma4_26b` bumped from N=8 to N=16,
   confirming untemplated coherence remains byte-identical at longer
   generations.
+
+### iter-68 (2026-05-14) — Perf gap measured: 22× slower at all N
+
+Benchmarked `HF2Q_SPEC_DFLASH=1` vs baseline at N ∈ {8, 16, 32}, 2
+trials each, 20s cool-downs.  See
+`docs/research/adr030_iter68_bench/{results.tsv, analysis.md}`.
+
+| N | baseline tok/s | spec tok/s | ratio |
+|---|---|---|---|
+|  8 | 103.15 | 4.65 | 0.045× (22.2× slower) |
+| 16 | 98.85  | 4.40 | 0.045× (22.5× slower) |
+| 32 | 96.55  | 4.05 | 0.042× (23.8× slower) |
+
+σ within each cell: <1%.  Ratio is approximately constant across N at
+these scales (24-token prompt P dominates over Option C's quadratic
+term).
+
+**0% drafter acceptance observed** — wall-clock implies each round
+commits exactly 1 token (the target free-continuation).  Consistent
+with iter-67's axis-2 finding: batched-prefill's hidden states (which
+feed the drafter) diverge from forward-decode's on chat-templated
+content → drafter proposes tokens target rejects 100%.
+
+**Mission gate**: ≥1.07× baseline.
+**Current**: 0.045× baseline.
+**Required gain**: ~24×.
+
+Cannot reach via micro-optimisation; requires architecture change.
+Two paths in analysis.md:
+- **Option A (preferred)**: cross-length SDPA in batched prefill,
+  mirroring peer dflash MLX path at `/opt/dflash/dflash/model_mlx.py:513`
+  (one `model(verify_input, target_cache)` call attends over prior
+  cache atomically).  hf2q has all building blocks: the existing
+  `mlx_native::ops::sdpa::sdpa` kernel supports cross-length attention
+  (used in `dispatch_dflash_sdpa_cross_length`).  Scope ~500 LOC.
+- **Option B**: capture hook on `forward_decode` + serial verify.
+  Throughput ceiling ~13 t/s (baseline ÷ K+1) — still 8× off mission
+  gate.  Scope ~150 LOC.
+
+**Code artifacts (iter-68)**:
+- `scripts/adr030/bench_spec_decode.sh` (new, 70 LOC) — reproducible
+  benchmark harness with thermal-aware cool-downs.
+- `docs/research/adr030_iter68_bench/results.tsv` — raw measurements.
+- `docs/research/adr030_iter68_bench/analysis.md` — full analysis,
+  caveats, and recommended next steps.

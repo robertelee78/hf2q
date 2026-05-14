@@ -1,0 +1,60 @@
+
+hf2q: investigation-only environment variables detected
+      (not part of the shipping contract — see docs/shipping-contract.md)
+
+  UNSAFE (ack-required, activated):
+    HF2Q_BATCHED_PREFILL=1          experimental; errors when seq_len > sliding_window
+
+[ADR-029 H29] Materializing F16 shadows for 30 layers' attn + dense MLP weights...
+[ADR-029 H29] F16 shadow population done in 0.34s
+[hf2q lcp] byte_budget=2759 MB (source=sysinfo available_memory=53 GB × 5%)
+hf2q load: backend = mlx-native (M5 Max)
+hf2q load: model = Gemma4 Ara 2pass Baseline (arch = gemma4, family = gemma4)
+hf2q load: source = /opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf (19.16 GiB on disk)
+hf2q load: layout = 30 layers, 16 heads (8 kv), head_dim=256, hidden=2816, vocab=262144
+hf2q load: features = sliding_window=1024, full_attn_every=6, moe=128 experts/8 active
+hf2q load: quant = Q6_K dominant, ~6.51 bpw, mlx-native resident none
+hf2q load: max_ctx_train = 262144, kv_budget = none
+hf2q load: tokenizer = hf-tokenizer-json (/opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/tokenizer.json)
+hf2q load: chat_template = gguf-embedded
+hf2q load: provenance = external
+hf2q load: vision = mmproj-required (no mmproj loaded; pass --mmproj)
+hf2q load: kv_spill = inactive
+hf2q load: tq_kv = inactive
+hf2q load: ready in 2.85 s
+[HF2Q_SPEC_DFLASH=1] loading DFlash drafter — coherent at temp=0, SLOWER than baseline (Option A pending for perf parity)
+[HF2Q_SPEC_DFLASH] drafter loaded in 0.09s (config=/Users/robert/.cache/huggingface/hub/models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/77d4202772dfe50b2396ec7bac9cfffc7b9e7057/config.json, cache_cap=2048)
+Batched prefill: KV=F32, seq_len=24, path=flash-attn
+[ADR-028 Phase 10c] Allocating hybrid_kv (30 layers, F16 K + TQ-HB V 8-bit) [batched]
+Batched prefill complete: 24 tokens in 83.9 ms (286.2 tok/s), first decode token = 236812
+Batched prefill: KV=F32, seq_len=24, path=flash-attn
+Batched prefill complete: 24 tokens in 59.9 ms (401.0 tok/s), first decode token = 236812
+Batched prefill: KV=F32, seq_len=32, path=flash-attn
+Batched prefill complete: 32 tokens in 68.4 ms (467.7 tok/s), first decode token = 42000
+Batched prefill: KV=F32, seq_len=25, path=flash-attn
+Batched prefill complete: 25 tokens in 62.3 ms (401.3 tok/s), first decode token = 106
+Batched prefill: KV=F32, seq_len=33, path=flash-attn
+Batched prefill complete: 33 tokens in 59.6 ms (553.4 tok/s), first decode token = 42000
+Batched prefill: KV=F32, seq_len=26, path=flash-attn
+Batched prefill complete: 26 tokens in 62.9 ms (413.4 tok/s), first decode token = 106
+Batched prefill: KV=F32, seq_len=34, path=flash-attn
+Batched prefill complete: 34 tokens in 58.3 ms (582.7 tok/s), first decode token = 236772
+Batched prefill: KV=F32, seq_len=27, path=flash-attn
+Batched prefill complete: 27 tokens in 63.6 ms (424.6 tok/s), first decode token = 2717
+Batched prefill: KV=F32, seq_len=35, path=flash-attn
+Batched prefill complete: 35 tokens in 60.4 ms (579.8 tok/s), first decode token = 46966
+Batched prefill: KV=F32, seq_len=28, path=flash-attn
+Batched prefill complete: 28 tokens in 65.0 ms (430.5 tok/s), first decode token = 60865
+Batched prefill: KV=F32, seq_len=36, path=flash-attn
+Batched prefill complete: 36 tokens in 61.0 ms (590.5 tok/s), first decode token = 42000
+Batched prefill: KV=F32, seq_len=29, path=flash-attn
+Batched prefill complete: 29 tokens in 65.9 ms (439.9 tok/s), first decode token = 107
+Batched prefill: KV=F32, seq_len=37, path=flash-attn
+Batched prefill complete: 37 tokens in 62.2 ms (594.7 tok/s), first decode token = 236743
+Batched prefill: KV=F32, seq_len=30, path=flash-attn
+Batched prefill complete: 30 tokens in 66.5 ms (450.9 tok/s), first decode token = 236865
+Batched prefill: KV=F32, seq_len=38, path=flash-attn
+Batched prefill complete: 38 tokens in 60.7 ms (626.4 tok/s), first decode token = 1082
+4<turn|><turn|>```markdown
+# Implementation
+[HF2Q_SPEC_DFLASH] 8 new tokens in 1.72s (4.6 tok/s)
