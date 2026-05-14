@@ -1,0 +1,383 @@
+{
+  "spec": "ADR-030 Phase 1 M5 Max baseline",
+  "target": "mlx-community/gemma-4-26b-a4b-it-4bit",
+  "draft": "z-lab/gemma-4-26B-A4B-it-DFlash",
+  "cycles": 5,
+  "cool_down_sec": 60,
+  "max_tokens": 256,
+  "block_size": 16,
+  "device": {
+    "device_name": "Apple M5 Max",
+    "max_recommended_working_set_size": 115448725504,
+    "memory_size": 137438953472,
+    "architecture": "applegpu_g17s",
+    "max_buffer_length": 86586540032,
+    "resource_limit": 499000
+  },
+  "prompts": [
+    "How many positive whole-number divisors does 196 have?",
+    "Explain in 3 short paragraphs how Flash Attention reduces memory in attention computation.",
+    "Write a Rust function that computes the nth Fibonacci number iteratively."
+  ],
+  "samples": [
+    {
+      "arm": "baseline",
+      "tps": 124.75139568648098,
+      "tokens": 256,
+      "elapsed_sec": 2.331255124998279,
+      "peak_mem_gb": 15.474435692,
+      "prompt_idx": 0,
+      "cycle": 0
+    },
+    {
+      "arm": "dflash",
+      "tps": 137.15539397865487,
+      "tokens": 256,
+      "elapsed_sec": 2.06741575000342,
+      "peak_mem_gb": 15.474435692,
+      "mean_accepted_per_step": 5.976744186046512,
+      "n_steps": 43,
+      "block_size": 16,
+      "prompt_idx": 0,
+      "cycle": 0
+    },
+    {
+      "arm": "baseline",
+      "tps": 126.34427925817454,
+      "tokens": 256,
+      "elapsed_sec": 2.2950821249978617,
+      "peak_mem_gb": 15.474435692,
+      "prompt_idx": 0,
+      "cycle": 1
+    },
+    {
+      "arm": "dflash",
+      "tps": 152.1109516315551,
+      "tokens": 256,
+      "elapsed_sec": 1.9027766670333222,
+      "peak_mem_gb": 15.474435692,
+      "mean_accepted_per_step": 5.976744186046512,
+      "n_steps": 43,
+      "block_size": 16,
+      "prompt_idx": 0,
+      "cycle": 1
+    },
+    {
+      "arm": "baseline",
+      "tps": 125.8753525038429,
+      "tokens": 256,
+      "elapsed_sec": 2.297299666912295,
+      "peak_mem_gb": 15.474435692,
+      "prompt_idx": 0,
+      "cycle": 2
+    },
+    {
+      "arm": "dflash",
+      "tps": 152.46612095581065,
+      "tokens": 256,
+      "elapsed_sec": 1.8785421669017524,
+      "peak_mem_gb": 15.474435692,
+      "mean_accepted_per_step": 5.976744186046512,
+      "n_steps": 43,
+      "block_size": 16,
+      "prompt_idx": 0,
+      "cycle": 2
+    },
+    {
+      "arm": "baseline",
+      "tps": 125.84651184113216,
+      "tokens": 256,
+      "elapsed_sec": 2.291183708002791,
+      "peak_mem_gb": 15.474435692,
+      "prompt_idx": 0,
+      "cycle": 3
+    },
+    {
+      "arm": "dflash",
+      "tps": 152.43322654845062,
+      "tokens": 256,
+      "elapsed_sec": 1.8796855410328135,
+      "peak_mem_gb": 15.474455266,
+      "mean_accepted_per_step": 5.976744186046512,
+      "n_steps": 43,
+      "block_size": 16,
+      "prompt_idx": 0,
+      "cycle": 3
+    },
+    {
+      "arm": "baseline",
+      "tps": 125.91367339198771,
+      "tokens": 256,
+      "elapsed_sec": 2.2941416669636965,
+      "peak_mem_gb": 15.474455266,
+      "prompt_idx": 0,
+      "cycle": 4
+    },
+    {
+      "arm": "dflash",
+      "tps": 152.31779263745062,
+      "tokens": 256,
+      "elapsed_sec": 1.8617039999226108,
+      "peak_mem_gb": 15.474455266,
+      "mean_accepted_per_step": 5.976744186046512,
+      "n_steps": 43,
+      "block_size": 16,
+      "prompt_idx": 0,
+      "cycle": 4
+    },
+    {
+      "arm": "baseline",
+      "tps": 126.42944863070998,
+      "tokens": 256,
+      "elapsed_sec": 2.2904256660258397,
+      "peak_mem_gb": 15.474455266,
+      "prompt_idx": 1,
+      "cycle": 0
+    },
+    {
+      "arm": "dflash",
+      "tps": 58.22047261780949,
+      "tokens": 250,
+      "elapsed_sec": 4.485043124994263,
+      "peak_mem_gb": 15.474455266,
+      "mean_accepted_per_step": 2.2818181818181817,
+      "n_steps": 110,
+      "block_size": 16,
+      "prompt_idx": 1,
+      "cycle": 0
+    },
+    {
+      "arm": "baseline",
+      "tps": 125.41707454359855,
+      "tokens": 256,
+      "elapsed_sec": 2.323959792032838,
+      "peak_mem_gb": 15.474455266,
+      "prompt_idx": 1,
+      "cycle": 1
+    },
+    {
+      "arm": "dflash",
+      "tps": 58.25921975195198,
+      "tokens": 250,
+      "elapsed_sec": 4.486761208041571,
+      "peak_mem_gb": 15.474455266,
+      "mean_accepted_per_step": 2.2818181818181817,
+      "n_steps": 110,
+      "block_size": 16,
+      "prompt_idx": 1,
+      "cycle": 1
+    },
+    {
+      "arm": "baseline",
+      "tps": 126.56040444641991,
+      "tokens": 256,
+      "elapsed_sec": 2.3396329170791432,
+      "peak_mem_gb": 15.474455266,
+      "prompt_idx": 1,
+      "cycle": 2
+    },
+    {
+      "arm": "dflash",
+      "tps": 58.25471156085118,
+      "tokens": 250,
+      "elapsed_sec": 4.481782708084211,
+      "peak_mem_gb": 15.474455266,
+      "mean_accepted_per_step": 2.2818181818181817,
+      "n_steps": 110,
+      "block_size": 16,
+      "prompt_idx": 1,
+      "cycle": 2
+    },
+    {
+      "arm": "baseline",
+      "tps": 126.54304143948433,
+      "tokens": 256,
+      "elapsed_sec": 2.329361667041667,
+      "peak_mem_gb": 15.474455266,
+      "prompt_idx": 1,
+      "cycle": 3
+    },
+    {
+      "arm": "dflash",
+      "tps": 58.02786890128621,
+      "tokens": 250,
+      "elapsed_sec": 4.504233791027218,
+      "peak_mem_gb": 15.474455266,
+      "mean_accepted_per_step": 2.2818181818181817,
+      "n_steps": 110,
+      "block_size": 16,
+      "prompt_idx": 1,
+      "cycle": 3
+    },
+    {
+      "arm": "baseline",
+      "tps": 126.51416495445301,
+      "tokens": 256,
+      "elapsed_sec": 2.326401708065532,
+      "peak_mem_gb": 15.474455266,
+      "prompt_idx": 1,
+      "cycle": 4
+    },
+    {
+      "arm": "dflash",
+      "tps": 58.25697405986288,
+      "tokens": 250,
+      "elapsed_sec": 4.488887500017881,
+      "peak_mem_gb": 15.474455266,
+      "mean_accepted_per_step": 2.2818181818181817,
+      "n_steps": 110,
+      "block_size": 16,
+      "prompt_idx": 1,
+      "cycle": 4
+    },
+    {
+      "arm": "baseline",
+      "tps": 126.71866577291794,
+      "tokens": 256,
+      "elapsed_sec": 2.325409666984342,
+      "peak_mem_gb": 15.474455266,
+      "prompt_idx": 2,
+      "cycle": 0
+    },
+    {
+      "arm": "dflash",
+      "tps": 126.24956293638594,
+      "tokens": 256,
+      "elapsed_sec": 2.238802583073266,
+      "peak_mem_gb": 15.474455266,
+      "mean_accepted_per_step": 5.019607843137255,
+      "n_steps": 51,
+      "block_size": 16,
+      "prompt_idx": 2,
+      "cycle": 0
+    },
+    {
+      "arm": "baseline",
+      "tps": 126.61048687513171,
+      "tokens": 256,
+      "elapsed_sec": 2.2804568340070546,
+      "peak_mem_gb": 15.474455266,
+      "prompt_idx": 2,
+      "cycle": 1
+    },
+    {
+      "arm": "dflash",
+      "tps": 129.03579178217927,
+      "tokens": 256,
+      "elapsed_sec": 2.18170079193078,
+      "peak_mem_gb": 15.474455266,
+      "mean_accepted_per_step": 5.019607843137255,
+      "n_steps": 51,
+      "block_size": 16,
+      "prompt_idx": 2,
+      "cycle": 1
+    },
+    {
+      "arm": "baseline",
+      "tps": 126.64240137178594,
+      "tokens": 256,
+      "elapsed_sec": 2.294847709010355,
+      "peak_mem_gb": 15.474455266,
+      "prompt_idx": 2,
+      "cycle": 2
+    },
+    {
+      "arm": "dflash",
+      "tps": 128.9316277032006,
+      "tokens": 256,
+      "elapsed_sec": 2.1731677500065416,
+      "peak_mem_gb": 15.474455266,
+      "mean_accepted_per_step": 5.019607843137255,
+      "n_steps": 51,
+      "block_size": 16,
+      "prompt_idx": 2,
+      "cycle": 2
+    },
+    {
+      "arm": "baseline",
+      "tps": 125.976210506072,
+      "tokens": 256,
+      "elapsed_sec": 2.2896930830320343,
+      "peak_mem_gb": 15.474455266,
+      "prompt_idx": 2,
+      "cycle": 3
+    },
+    {
+      "arm": "dflash",
+      "tps": 127.87932724269248,
+      "tokens": 256,
+      "elapsed_sec": 2.2060201660497114,
+      "peak_mem_gb": 15.474455266,
+      "mean_accepted_per_step": 5.019607843137255,
+      "n_steps": 51,
+      "block_size": 16,
+      "prompt_idx": 2,
+      "cycle": 3
+    },
+    {
+      "arm": "baseline",
+      "tps": 126.32427689106684,
+      "tokens": 256,
+      "elapsed_sec": 2.2792140420060605,
+      "peak_mem_gb": 15.474455266,
+      "prompt_idx": 2,
+      "cycle": 4
+    },
+    {
+      "arm": "dflash",
+      "tps": 129.15517733303213,
+      "tokens": 256,
+      "elapsed_sec": 2.176747666904703,
+      "peak_mem_gb": 15.474455266,
+      "mean_accepted_per_step": 5.019607843137255,
+      "n_steps": 51,
+      "block_size": 16,
+      "prompt_idx": 2,
+      "cycle": 4
+    }
+  ],
+  "summary": {
+    "per_prompt": [
+      {
+        "prompt_idx": 0,
+        "baseline_mean": 125.74624253632366,
+        "baseline_stdev": 0.5920567084224394,
+        "baseline_sigma_pct": 0.4708345128097287,
+        "dflash_mean": 149.29669715038438,
+        "dflash_stdev": 6.788618284635452,
+        "dflash_sigma_pct": 4.547065282895961,
+        "speedup_mean": 1.1872855533417455,
+        "mean_accepted_per_step": 5.976744186046512
+      },
+      {
+        "prompt_idx": 1,
+        "baseline_mean": 126.29282680293315,
+        "baseline_stdev": 0.49213902520307723,
+        "baseline_sigma_pct": 0.38968090085671225,
+        "dflash_mean": 58.203849378352345,
+        "dflash_stdev": 0.09965005276613859,
+        "dflash_sigma_pct": 0.17120869810236514,
+        "speedup_mean": 0.4608642537487375,
+        "mean_accepted_per_step": 2.2818181818181817
+      },
+      {
+        "prompt_idx": 2,
+        "baseline_mean": 126.45440828339488,
+        "baseline_stdev": 0.30624387436982936,
+        "baseline_sigma_pct": 0.242177302102044,
+        "dflash_mean": 128.2502973994981,
+        "dflash_stdev": 1.228879301559418,
+        "dflash_sigma_pct": 0.958188266598302,
+        "speedup_mean": 1.0142018703853999,
+        "mean_accepted_per_step": 5.019607843137255
+      }
+    ],
+    "overall": {
+      "baseline_mean": 126.1644925408839,
+      "dflash_mean": 111.91694797607828,
+      "speedup_mean": 0.8870716769998606,
+      "mean_accepted_per_step": 4.42605673700065,
+      "go_no_go_gate_1_6x": false
+    }
+  }
+}
