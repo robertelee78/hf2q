@@ -2482,3 +2482,43 @@ highest-leverage one and dive deep:
 - Code: 8 commits this thread (iter-95→100), pushed to main
 - Test suite: mlx-native 298/298, hf2q 51/51, mission canary 1/1
 
+
+### iter-102 — BF16 cache readback diagnostic added (XLEN_DEBUG extension)
+
+Extended existing `HF2Q_DFLASH_XLEN_DEBUG=1` block in
+`src/serve/forward_prefill_batched.rs` to ALSO dump the BF16 cache
+contents (`bf16_xlen_k`, `bf16_xlen_v`) at the same positions the F16
+hybrid_kv (`layer_kv.k`) is already dumped:
+- `BF16_K[h=0, p=0, d=0..8]` — first prompt token K
+- `BF16_K[h=0, p=10, d=0..8]` — sentinel "unwritten" baseline
+- `BF16_K[h=0, p=start_pos-1, d=0..8]` — previous-round committed K
+- `BF16_K[h=0, p=start_pos, d=0..8]` — current verify-window start K
+
+Indexing matches the head-major `[nkv, capacity, head_dim]` layout
+that `dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major` writes
+(`slot = dst_pos % capacity` for sliding-window ring).  Zero
+overhead when `HF2Q_DFLASH_XLEN_DEBUG` is not set.
+
+Compiles cleanly under `cargo check --release`.  Build state at
+HEAD: 4 warnings, 0 errors.
+
+**Why this matters for the 6-tok investigation**: at iter-100 the
+D=256 SDPA reads from `bf16_xlen_k` (not `layer_kv.k`).  Comparing
+the BF16 cache content across (a) the failing 6-tok prompt and
+(b) the passing 4-prompt fleet at the same positions localises
+whether the failure is BF16-cache divergence (write-side bug),
+F16→BF16 cast divergence on D=512 layers (still on F16 path),
+or downstream of SDPA (kernel-side numerical drift).
+
+**Next operator-machine step**:
+```
+HF2Q_TEST_PROMPT="What is two plus two?" \
+  HF2Q_DFLASH_XLEN_SDPA=1 HF2Q_DFLASH_XLEN_DEBUG=1 \
+  cargo test --release -- --ignored --test-threads=1 \
+    inference::spec_decode::dflash::orchestrator::tests::e2e_dispatch_dflash_generate_gemma4_26b
+```
+captures BF16-cache state.  Same prompt at `HF2Q_DFLASH_XLEN_SDPA=0`
+gives Option C's `pf_k_perm` baseline via the existing capture path.
+Difference at L0 position 5 (= last 6-tok prompt K) localises the
+divergence point definitively.
+

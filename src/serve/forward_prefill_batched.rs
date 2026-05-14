@@ -1461,6 +1461,54 @@ impl MlxModelWeights {
                                 &v_slice[kstart_0..kstart_0 + 8],
                                 start_pos, &v_slice[kstart_sp..kstart_sp + 8],
                             );
+                            // ADR-030 iter-102 — BF16 cache readback parallel
+                            // to F16 hybrid_kv readback above.  When iter-100's
+                            // D=256 BF16-cache path is active, the SDPA reads
+                            // from `bf16_xlen_k`, NOT `layer_kv.k`.  Comparing
+                            // F16 vs BF16 cache at the SAME positions localises
+                            // whether 6-tok failure is BF16-cache divergence or
+                            // downstream of SDPA.  Indexing matches the head-
+                            // major `[nkv, capacity, head_dim]` layout that
+                            // `dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major`
+                            // writes (`slot = dst_pos % capacity` for sliding).
+                            if let Some(ref bf16_k) = layer_kv.bf16_xlen_k {
+                                let bk_slice = bf16_k.as_slice::<half::bf16>()
+                                    .map_err(|e| anyhow::anyhow!("xlen debug bf16 K slice: {e}"))?;
+                                let cap = layer_kv.capacity;
+                                let slot_p0    = 0usize;
+                                let slot_p10   = 10 % cap;
+                                let slot_sp_m1 = if start_pos > 0 { (start_pos as usize - 1) % cap } else { 0 };
+                                let slot_sp    = (start_pos as usize) % cap;
+                                let bk_p0    = slot_p0    * hd as usize;
+                                let bk_p10   = slot_p10   * hd as usize;
+                                let bk_sp_m1 = slot_sp_m1 * hd as usize;
+                                let bk_sp    = slot_sp    * hd as usize;
+                                eprintln!(
+                                    "  BF16_K[h=0,p=0,d=0..8]   = {:?}\n  \
+                                     BF16_K[h=0,p=10,d=0..8]  = {:?}\n  \
+                                     BF16_K[h=0,p={},d=0..8]   = {:?}\n  \
+                                     BF16_K[h=0,p={},d=0..8]   = {:?}",
+                                    &bk_slice[bk_p0..bk_p0 + 8],
+                                    &bk_slice[bk_p10..bk_p10 + 8],
+                                    start_pos - 1, &bk_slice[bk_sp_m1..bk_sp_m1 + 8],
+                                    start_pos,     &bk_slice[bk_sp..bk_sp + 8],
+                                );
+                            }
+                            if let Some(ref bf16_v) = layer_kv.bf16_xlen_v {
+                                let bv_slice = bf16_v.as_slice::<half::bf16>()
+                                    .map_err(|e| anyhow::anyhow!("xlen debug bf16 V slice: {e}"))?;
+                                let cap = layer_kv.capacity;
+                                let slot_p0 = 0usize;
+                                let slot_sp = (start_pos as usize) % cap;
+                                let bv_p0 = slot_p0 * hd as usize;
+                                let bv_sp = slot_sp * hd as usize;
+                                eprintln!(
+                                    "  BF16_V[h=0,p=0,d=0..8]   = {:?}\n  \
+                                     BF16_V[h=0,p={},d=0..8]   = {:?}",
+                                    &bv_slice[bv_p0..bv_p0 + 8],
+                                    start_pos, &bv_slice[bv_sp..bv_sp + 8],
+                                );
+                            }
                             s = exec.begin().map_err(|e| anyhow::anyhow!("xlen debug post-dump reopen: {e}"))?;
                         }
 
