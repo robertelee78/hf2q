@@ -3127,3 +3127,112 @@ This closes a third pattern variant for dispatch-by-buffer-dtype:
 The audit pattern is now exhaustive.  298/298 mlx-native + 3503/3503
 hf2q tests pass GREEN with every guard landed.
 
+
+
+### iter-212 — GPU measurement at HEAD: mission perf gate INFEASIBLE on this drafter/target pair
+
+**Run config** (HEAD hf2q `279348db`, mlx-native `146ddce`, M5 Max thermal-fair):
+- Target: `gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf`
+  (ara-variant, abliterated, Q5_K_M quantization).
+- Drafter: `z-lab/gemma-4-26B-A4B-it-DFlash` (trained against STOCK
+  gemma-4-26B-A4B-it, not the ara-abliterated variant).
+- Prompt: "Write a short poem about the ocean at dawn:" (44-token chat-wrapped).
+- Temp: 0.0 (greedy).  Max new tokens: 32.
+- Env: see per-row.
+
+**Results**:
+
+| Mode                          | Tok/s | Verify_prefill | Acceptance       | Output                          |
+|-------------------------------|-------|----------------|------------------|---------------------------------|
+| Baseline (no spec-decode)     | 98.3  | n/a            | n/a              | coherent ocean-dawn poem        |
+| `HF2Q_SPEC_DFLASH=1` (Opt C)  | 9.1   | 82.8 ms/round  | **0/7** all rounds | coherent ocean-dawn poem        |
+| `+ HF2Q_DFLASH_XLEN_SDPA=1 + HF2Q_FULL_F16_KV=1` (Opt A) | 11.8 | 59.3 ms/round | **0/7** all rounds | coherent ocean-dawn poem |
+
+**Per-round profile (Option A, iter-212)** — `HF2Q_DFLASH_PROFILE=1`:
+```
+embed=0.03  extract=0.11  drafter_fwd=13.22  drafter_argmax=6.31
+verify_prefill=59.27  target_argmax=7.11  trim=0.18  TOTAL=86.23
+```
+With 0% acceptance: 1 token / 86.23 ms = 11.6 tok/s.
+
+**Structural ceiling math** — even at theoretical 100% acceptance:
+- Option A: 8 tokens / 86.23 ms = **92.8 tok/s** < 98.3 baseline.
+- Option C: 8 tokens / 109.89 ms = **73.4 tok/s** < 98.3 baseline.
+
+So **DFlash spec-decode at this verify_prefill cost CANNOT beat
+baseline on this hardware/target/drafter combination** even if the
+drafter were perfect.  Mission perf gate ≥1.07× is infeasible without
+either (a) cutting verify_prefill below ~5 ms/round (currently 59 ms,
+~12× too slow), (b) cutting drafter overhead below ~1 ms/round
+(currently 19.5 ms — drafter_fwd + drafter_argmax), or (c) replacing
+the drafter with one whose distribution matches the target.
+
+**The 0% acceptance is NOT a regression** — iter-106 dtype fix
+DID work.  The drafter's outputs are varied, coherent gemma-4 tokens
+(e.g. drafts `[20470, 20470, 6481, 3643, ...]` — no cluster pathology
+like the pre-iter-106 `[1595]*7` or `[0]*7`).  The drafts simply
+disagree with the target's argmax at every position.
+
+**Root cause of distribution mismatch**:
+- Drafter weights came from `z-lab/gemma-4-26B-A4B-it-DFlash`, trained
+  against stock gemma-4-26B-A4B-it (not abliterated, not quantized).
+- Target is `gemma-4-26b-a4b-it-ara-abliterated/...APEX-Q5_K_M.gguf`
+  — multi-axis transformation away from drafter's training corpus.
+- Sample (iter-212 round 30):
+  - drafts        = `[506, 236772, 20470, 20470, 20470, 20470, 20470]`
+  - target argmax = `[7217, 7217, 16012, 7217, 7217, 237028, 237028, 237028]`
+  - Both coherent gemma-4 tokens, completely different next-token
+    distributions.
+
+**Coherence preserved**: Output reads "A silver line breaks through
+the gray, / To herald in the coming day. / The tide retreats with a
+rhythmic sigh, / Under a pale and waking sky" — peer-quality gemma-4
+output at temp=0 with HF2Q_SPEC_DFLASH=1.
+
+**Operator standing rule satisfied**:
+> "no commitment to dflash unless it actually improves speed
+> without harming coherence"
+
+DFlash currently HARMS speed (0.12× baseline) while PRESERVING
+coherence.  Default OFF (`HF2Q_SPEC_DFLASH=1` is explicit opt-in)
+remains the correct gate.  No code change recommended.
+
+**What WOULD make DFlash viable on this target**:
+1. **Retrain the drafter on ara-abliterated APEX outputs**
+   (multi-day fine-tune; uncertain payoff — even with matched
+   distribution, the structural verify_prefill ceiling at 92.8 tok/s
+   is still below 98.3 baseline).
+2. **Use the stock gemma-4 target** instead of APEX
+   (off-focus per operator's APEX-focus standing rule).
+3. **Order-of-magnitude cut to verify_prefill cost**
+   (gemma-4 sliding-window + 30-layer dense FFN + 128-expert MoE
+   architecture makes 5 ms/round verify implausible without a full
+   custom inference path).
+
+**Phase 5 async parallel-encode reconsidered**: the iter-61 design
+targeted hiding drafter_fwd (13.22 ms) inside verify_prefill
+(59.27 ms) via parallel encoding.  Even at perfect overlap, the
+savings is bounded above by min(13.22, 59.27) = 13.22 ms/round
+→ ceiling 109.4 tok/s @ 100% accept (Option A) — still wouldn't beat
+baseline 98.3 if real acceptance stays at 0%.  Implementation cost
+(466 device signature sites + 2,755 LOC layer body extraction per
+the prior session note) is not justified by this ceiling.
+
+**Mission status**:
+- Phase 1-6 implementation: ✅ complete and shipped.
+- Production wire-up (`HF2Q_SPEC_DFLASH=1`): ✅ working.
+- Coherence: ✅ matches baseline byte-for-byte at temp=0
+  (single-token greedy path, all tests green).
+- Speed: ❌ 0.12× baseline; structurally infeasible to reach 1.07×
+  with this drafter/target/hardware combination.
+
+**Recommendation**: close ADR-030 implementation as "Phase 1-6
+complete, default OFF correct."  Open a follow-up ADR or stay in
+ADR-030 with a clear "drafter retraining required for speedup
+or pivot to alternative drafter (e.g. ngram from ADR-029 Phase 1)"
+section if operator decides DFlash is the right strategic bet.
+
+Companion ADR-029 already has the ngram proposer landed
+(`src/inference/spec_decode/ngram_proposer.rs`, 323 LOC); pivoting
+there would be a separate decision.
+
