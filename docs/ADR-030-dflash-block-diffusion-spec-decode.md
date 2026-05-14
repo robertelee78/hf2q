@@ -2712,3 +2712,102 @@ be falsified offline.
 **Tests**: 42/42 dflash tests pass (was 41); 3499/3499 full bin
 test suite GREEN.
 
+
+### iter-106 — ROOT CAUSE FOUND: drafter RMSNorm weight dtype mismatch
+
+After iter-104 eliminated three GPU-kernel suspects and iter-105
+falsified the CPU plumbing hypothesis, iter-106 audited the
+drafter weight UPLOAD path and found a concrete bug.
+
+**Bug**: `src/inference/spec_decode/dflash/tensors.rs` uploaded the
+following four RMSNorm tensors as **BF16**:
+- per-layer `input_layernorm.weight`
+- per-layer `post_attention_layernorm.weight`
+- model-level `hidden_norm.weight`
+- model-level `norm.weight` (= `final_norm`)
+
+But `mlx-native::dispatch_rms_norm` selects pipeline by **INPUT
+dtype** (`rms_norm.rs:105-123`).  Drafter input is F32, so the
+kernel `rms_norm_f32` (`shaders/rms_norm.metal:18`) is dispatched:
+```metal
+kernel void rms_norm_f32(
+    device const float *input     [[buffer(0)]],
+    device const float *weight    [[buffer(1)]],    // ← F32 stride!
+    device float       *output    [[buffer(2)]],
+    ...
+) {
+    ...
+    output[base + i] = input[base + i] * rms_inv * weight[i];
+}
+```
+
+The kernel reads `weight[i]` as F32 (4 bytes per element).  When
+the bound buffer is BF16-allocated (2 bytes per element):
+- For `i < dim/2`: F32 word combines two adjacent BF16 values'
+  bit patterns → bit-misinterpreted float (typically close to
+  but not equal to the trained value).
+- For `i ≥ dim/2`: reads past the buffer end (BF16 buffer is
+  `dim * 2` bytes; F32 kernel reads `dim * 4` bytes).  Apple
+  Metal does not crash on OOB reads but returns
+  driver/implementation-defined values.
+
+**Symptom alignment**:
+- iter-86 "[1595]*7 clustered drafts" — drafter forward produces
+  similar-but-not-quite-right hidden states across positions
+  because each layer's per-row norm scales by a corrupted weight
+  vector.  Per-position differentiation from RoPE + bidirectional
+  SDPA survives, but the magnitude is washed out → lm_head argmax
+  collapses to whichever vocab token has the highest residual
+  signal at that scale.
+- iter-87 "all-pad [0]*7" on long Option A prompts — when ctx
+  varies more (longer prompts), the OOB-read garbage interacts
+  with stronger numerical signals → h_final values dominated by
+  garbage scale → argmax falls to vocab token id 0 (typical
+  failure mode when logits are near-zero or constant).
+- iter-86 toy prompt clustering matches up: prompt-echo dominates
+  the corrupted-weights signal because target embedding magnitude
+  itself biases predictions toward prompt tokens.
+
+**Root cause** is well-precedented in our own code: qwen35 uploads
+identical norm tensors as F32 via `upload_f32_weight`
+(`gpu_full_attn.rs:332-333`).  The original drafter author flagged
+this dtype constraint in the `DFlashLayerTensors` docstring for
+`q_norm` and `k_norm` (head-dim norms) but missed extending it to
+`input_layernorm`, `post_attention_layernorm`, `hidden_norm`, and
+`final_norm` (hidden-dim norms).  The `upload_bf16_as_f32` helper
+already existed for q_norm/k_norm — the fix is a 4-line change
+plus doc + test update.
+
+**Fix** (`tensors.rs`):
+- Change `upload_bf16` → `upload_bf16_as_f32` for the 4 hidden-dim
+  RMSNorm tensors at upload time.
+- Update DFlashLayerTensors docstring + field comments.
+- Update `uploads_real_drafter_to_gpu` test assertion to account
+  for F32 cast expansion (BF16 → F32 = 2× bytes per element for
+  14 RMSNorm vectors at gemma-4-26B-A4B drafter: 5 layers ×
+  (2×hidden_size + 2×head_dim) + 2×hidden_size = 39424 elements
+  × 2 extra bytes = 78848 bytes resident expansion).
+
+**Verification path**:
+- `cargo check --release` clean.
+- `cargo test --release --bin hf2q -- inference::spec_decode::dflash`:
+  42/42 PASS (unchanged — the bug only surfaces in GPU runtime).
+- `cargo test --release --bin hf2q`: 3499/3499 PASS.
+
+**Open verification (operator GPU step)**: re-run
+`e2e_dispatch_dflash_generate_gemma4_26b` with
+`HF2Q_DFLASH_DRAFTER_DUMP=1` (added iter-103/104).  Predictions:
+- `max_adj_pairwise_abs_diff` should now show meaningful spread
+  across positions (drafter actually differentiates).
+- `nan_count` / `inf_count` should still be 0.
+- Per-round drafts should NO LONGER cluster as `[X]*7`.
+- 6-tok prompt coherence may also improve (Option A failure
+  pattern was content-conditional; corrupted norm weights are a
+  plausible contributor to the content sensitivity).
+
+This is the most concrete bug-fix candidate identified in 6
+iterations of offline investigation.  If GPU runtime confirms the
+prediction, drafter acceptance rate becomes testable for the
+first time, unblocking the perf-gate path (drafter quality ≥65%
++ Phase 5 async parallel-encode → mission gate PASS).
+

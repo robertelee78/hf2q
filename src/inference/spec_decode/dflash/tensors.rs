@@ -48,18 +48,26 @@ pub enum TensorsError {
 /// efficiency — they are consumed by `dispatch_dense_mm_bf16`-class
 /// matmul kernels that operate on BF16 weights + F32 activations.
 ///
-/// Two exceptions are stored as F32: `q_norm` and `k_norm`. These are
-/// per-head RMSNorm weights (only `head_dim = 128` floats each) and
-/// mlx-native's `dispatch_rms_norm` kernel selects by INPUT dtype, so
-/// when we apply per-head norm to the F32 Q/K projection output the
-/// weight must also be F32. Matching qwen35's `norm_w: MlxBuffer`
-/// convention (`forward_gpu.rs:440` uploaded via `upload_f32_weight`).
-/// The cost is negligible: 5 layers × 2 norms × 128 elements × 2 bytes
-/// = 2.5 KB of memory expansion.
+/// **All RMSNorm weights are stored as F32** (ADR-030 iter-106): `q_norm`,
+/// `k_norm`, `input_layernorm`, `post_attention_layernorm`, model-level
+/// `hidden_norm`, and final `norm`. mlx-native's `dispatch_rms_norm`
+/// kernel selects pipeline by INPUT dtype only; for F32 input it
+/// dispatches `rms_norm_f32` which declares `device const float*
+/// weight [[buffer(1)]]` (`shaders/rms_norm.metal:20`).  Passing a
+/// BF16-backed weight buffer to that kernel causes the kernel to
+/// read F32 words over the BF16 byte layout — values become bit-
+/// misinterpreted combinations of adjacent BF16 elements AND reads
+/// past the buffer end (BF16 buffer is dim*2 bytes; F32 kernel reads
+/// dim*4 bytes).  Matching qwen35's convention (`forward_gpu.rs:332`
+/// uploaded via `upload_f32_weight`).  Memory cost is small: all
+/// drafter norms total 5 × (2 head + 2 layer) + 2 model = 14 RMSNorm
+/// vectors, each at most `hidden_size = 2816` floats → ~158 KB.
 pub struct DFlashLayerTensors {
-    /// `[hidden_size]` BF16 — applied before attention.
+    /// `[hidden_size]` **F32** — applied before attention.
+    /// Cast from BF16 at upload time (ADR-030 iter-106).
     pub input_layernorm: MlxBuffer,
-    /// `[hidden_size]` BF16 — applied between attention residual and MLP.
+    /// `[hidden_size]` **F32** — applied between attention residual and MLP.
+    /// Cast from BF16 at upload time (ADR-030 iter-106).
     pub post_attention_layernorm: MlxBuffer,
     /// `[num_q_heads * head_dim, hidden_size]` BF16 — Q projection.
     pub q_proj: MlxBuffer,
@@ -88,9 +96,11 @@ pub struct DFlashModelTensors {
     /// `[hidden_size, num_target_layers_used * hidden_size]` — projects
     /// concatenated target hidden states into draft hidden space.
     pub fc: MlxBuffer,
-    /// `[hidden_size]` — RMSNorm applied to `fc` output (h_ctx).
+    /// `[hidden_size]` **F32** — RMSNorm applied to `fc` output (h_ctx).
+    /// Cast from BF16 at upload time (ADR-030 iter-106).
     pub hidden_norm: MlxBuffer,
-    /// `[hidden_size]` — final RMSNorm before lm_head.
+    /// `[hidden_size]` **F32** — final RMSNorm before lm_head.
+    /// Cast from BF16 at upload time (ADR-030 iter-106).
     pub final_norm: MlxBuffer,
     /// One per draft layer (5 for gemma-4-26B-A4B-it drafter).
     pub layers: Vec<DFlashLayerTensors>,
@@ -156,19 +166,25 @@ impl DFlashModelTensors {
     ) -> Result<Self, TensorsError> {
         // Globals
         let fc = upload_bf16(device, fetch(weights, "fc.weight")?)?;
-        let hidden_norm = upload_bf16(device, fetch(weights, "hidden_norm.weight")?)?;
-        let final_norm = upload_bf16(device, fetch(weights, "norm.weight")?)?;
+        // ADR-030 iter-106 — hidden_norm + final_norm uploaded as F32.
+        // dispatch_rms_norm selects pipeline by INPUT dtype (F32 here);
+        // rms_norm_f32 declares weight as `device const float*` so a BF16
+        // buffer would be bit-misinterpreted + out-of-bounds-read.
+        let hidden_norm = upload_bf16_as_f32(device, fetch(weights, "hidden_norm.weight")?)?;
+        let final_norm = upload_bf16_as_f32(device, fetch(weights, "norm.weight")?)?;
 
         // Per-layer
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let p = format!("layers.{i}");
             let lw = DFlashLayerTensors {
-                input_layernorm: upload_bf16(
+                // ADR-030 iter-106 — see DFlashLayerTensors docstring.
+                // F32 cast at upload mirrors qwen35 forward_gpu.rs:332.
+                input_layernorm: upload_bf16_as_f32(
                     device,
                     fetch(weights, &format!("{p}.input_layernorm.weight"))?,
                 )?,
-                post_attention_layernorm: upload_bf16(
+                post_attention_layernorm: upload_bf16_as_f32(
                     device,
                     fetch(weights, &format!("{p}.post_attention_layernorm.weight"))?,
                 )?,
@@ -268,7 +284,8 @@ mod tests {
 
     /// Integration test: upload all 58 drafter tensors to GPU and
     /// verify the resident byte total matches the safetensors data
-    /// total (within 0 bytes — every byte is copied 1:1).
+    /// total plus the F32 expansion for the cast RMSNorm tensors
+    /// (ADR-030 iter-106).
     ///
     /// Requires both a Metal device AND the cached drafter download.
     #[test]
@@ -287,9 +304,22 @@ mod tests {
         let tensors = DFlashModelTensors::upload(&device, &cfg, &weights).expect("GPU upload");
         let gpu_bytes = tensors.gpu_resident_bytes();
 
+        // ADR-030 iter-106: RMSNorm weights are BF16 on disk but uploaded
+        // as F32 (2× expansion).  Per-layer F32-cast norms: q_norm +
+        // k_norm (head_dim each) + input_layernorm + post_attention_layernorm
+        // (hidden_size each).  Model-level: hidden_norm + final_norm
+        // (hidden_size each).  Each cast adds `n_elem * 2` bytes vs
+        // straight BF16 copy.
+        let per_layer_cast_elems = 2 * cfg.head_dim + 2 * cfg.hidden_size;
+        let model_cast_elems = 2 * cfg.hidden_size;
+        let cast_expansion_bytes =
+            (cfg.num_hidden_layers * per_layer_cast_elems + model_cast_elems) * 2;
         assert_eq!(
-            gpu_bytes, safetensors_data_bytes,
-            "every byte from safetensors must land on the GPU 1:1"
+            gpu_bytes,
+            safetensors_data_bytes + cast_expansion_bytes,
+            "GPU resident bytes must equal safetensors data + F32 cast expansion \
+             (cfg.num_hidden_layers={}, head_dim={}, hidden_size={}, expansion={})",
+            cfg.num_hidden_layers, cfg.head_dim, cfg.hidden_size, cast_expansion_bytes,
         );
         assert_eq!(tensors.layers.len(), cfg.num_hidden_layers);
     }
