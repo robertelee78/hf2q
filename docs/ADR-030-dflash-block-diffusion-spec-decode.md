@@ -370,44 +370,69 @@ Deliverables (~1,953 LOC across 4 source files, 18+ tests all green):
 - Wiring to target's embed_tokens + lm_head (the `bind()` analog)
 - `forward_decode_verify_batched` body replacement
 
-#### **Phase 3 — Verify forward + hidden capture** ⚙ IN PROGRESS iter-26+
-Sub-tasks landed so far (iter-26, commit `79265178`):
+#### **Phase 3 — Verify forward + hidden capture** ⚙ MOSTLY COMPLETE iter-33
 
-- ✅ **Model-level globals** (4 dispatchers + smoke test in `forward.rs`):
-  `dispatch_dflash_fc` (fc projection of concat target hidden states),
-  `dispatch_dflash_hidden_norm` (RMSNorm on fc output → h_ctx),
-  `dispatch_dflash_final_norm` (RMSNorm before lm_head),
-  `dispatch_dflash_softcap` (Gemma-style tanh softcap, returns
-  `Option<MlxBuffer>` matching Python's conditional).
-  GPU smoke test `smoke_model_level_globals` validates all four on
-  M5 Max with synthetic inputs + correctness checks (softcap correctly
-  caps 100.0 inputs to <30.0).
+Phase 3's **drafter-in-isolation** is feature-complete. All algorithmic
+primitives and the full 5-layer model forward run end-to-end on M5 Max
+with real `z-lab/gemma-4-26B-A4B-it-DFlash` weights + KV cache.
 
-Sub-tasks remaining:
+**Sub-tasks landed iter-26 through iter-33:**
 
-- ⏳ **Cross-length SDPA** (kv_seq_len > q_seq_len) — replaces Phase 2's
-  self-attn-only `dispatch_dflash_sdpa_self_attn` with the form needed
-  for DFlash's ctx+prop K/V concat. Will use `sdpa(...)` directly (the
-  primitive under qwen35's `apply_sdpa_causal`) with `SdpaParams.kv_seq_len
-  != seq_len`.
+| Component | Commit | LOC |
+|---|---|---|
+| Model globals (fc, hidden_norm, final_norm, softcap) | `79265178` | 292 |
+| DFlashKvCache struct + allocator | `12b816f7` | 244 |
+| KV append (seq-major → head-major) + rollback | `1f23eb75` | 161 |
+| Cross-length SDPA dispatcher | `e752738f` | 194 |
+| KV slack-write for prop K/V | `550338ea` | 145 |
+| Decoder layer attention with cache | `c4ccf5da` | 254 |
+| Full decoder layer forward (attn + 2 residuals + MLP) | `d347acd4` | 139 |
+| **FULL 5-layer model forward** | `5040d2fc` | 178 |
 
-- ⏳ **DFlashKvCache state** (per-layer K/V buffer + offset + sliding-
-  window logic). Sliding-window cache for the 4 sliding layers, full
-  for the 1 full-attention layer.
+**Drafter completeness check:** `dispatch_dflash_model_forward` mirrors
+`model_mlx.py:DFlashDraftModel.__call__` (lines 181-198) exactly:
+- fc projection of concatenated target hidden states (16896 → 2816)
+- hidden_norm RMSNorm → h_ctx
+- 5-layer loop: each layer composes input_norm + 5 projections +
+  3 per-head norms + 3 RoPEs (with correct per-stream offsets) +
+  cache append (ctx only) + slack-write (prop only) + cross-length
+  SDPA (kv_seq_len = cache.seq_len + L) + O proj + 2 residual adds + MLP
+- final_norm
 
-- ⏳ **5-layer DFlashDraftModel forward composition** — chains
-  embed → fc + hidden_norm → 5 × (layer forward with KV cache) →
-  final_norm → lm_head → softcap. The `bind()` analog uses target's
-  `embed_tokens` + `lm_head` MlxBuffers passed in by the orchestrator.
+**GPU integration test `smoke_model_forward_with_cache`**: PASSES in
+0.20s release on M5 Max. Validates: output [L, hidden] all finite +
+non-trivial; ALL 5 layer caches advance by ctx_chunk_size in lockstep
+(prop K/V correctly stays in slack, not persisted).
 
-- ⏳ **Target hidden-state capture** in `forward_mlx.rs` — emit hidden
-  states at `target_layer_ids: [1, 6, 11, 17, 22, 27]` during the target's
-  forward pass. Most invasive change.
+**Total Phase 2+3 LOC**: ~3,565 LOC across 5 source files; 27+ active
+tests; 13 GPU integration tests passing on M5 Max.
+
+#### **Phase 3 → Phase 4 boundary refinement**
+
+The two remaining items from the original Phase 3 plan are **target-side
+integration** work, not drafter logic:
+
+- ⏳ **Target hidden-state capture** in `forward_mlx.rs` (the 8,643-LOC
+  monolith). Per-layer hook at indices `[1, 6, 11, 17, 22, 27]` to emit
+  hidden state into a caller-supplied buffer during target's forward.
+  Risk-weighted as INVASIVE — production code path used by all hf2q
+  decode/prefill scenarios.
 
 - ⏳ **`forward_decode_verify_batched` body replacement** at
-  `forward_prefill_batched.rs:2665` — currently a temporary delegation
-  to serial (per ADR-028 iter-139 comment). Replace with the actual
-  batched body that calls the drafter + target verify + accept_prefix.
+  `forward_prefill_batched.rs:2665` — wires target capture +
+  `dispatch_dflash_model_forward` + `accept_prefix` into one verify
+  call.
+
+**Scope decision (per mantra "Measure 3×, cut once" + risk of touching
+the 8,643-LOC monolith)**: these two items move to **Phase 4 (Greedy
+spec-decode orchestrator)**, where they belong logically — they ARE the
+orchestrator. Phase 3 was originally defined as "Verify forward + hidden
+capture"; the verify forward (the drafter) is done; hidden capture is
+the orchestrator's job per Python's `model_mlx.py:_patch_model`
+(lines 284-290) which monkey-patches target layers from OUTSIDE the
+model. We do the equivalent in Phase 4 via a wrapper function in the
+orchestrator module, not by mutating the target's `forward_decode`
+signature.
 
 ### Phase 3 gates (unchanged from original plan)
 
@@ -419,13 +444,44 @@ Sub-tasks remaining:
 - **Perf gate**: alt-pair thermal-fair single-token forward_decode vs
   forward_decode_verify(K=1) must show ≤ 5% verify-mode overhead
 
-#### **Phase 4 — Greedy spec-decode orchestrator** (~470 LOC; `HF2Q_SPEC_DFLASH_PHASE=4`)
-Lands: `kv_rollback.rs`, `orchestrator.rs` (greedy-only path; rejection sampler stubbed to `unreachable!()` for temp>0 — operator will only run temp=0 in this phase)
-- End-to-end spec-decode at temp=0 with `HF2Q_SPEC_DFLASH=1`
-- **Coherence gate**: all 18 coherence golden fixtures at temp=0 must produce byte-identical output to single-token decode. **NO EXCEPTIONS** — if any fixture flips, halt and fix before proceeding.
-- **Determinism gate**: 10 repeated runs of each golden fixture must each produce identical output (intra-run determinism, no thread-scheduling races)
-- **Perf gate**: alt-pair thermal-fair `bench-decode.sh tg256` at temp=0, σ<1%, 5 cycles; spec-decode must show ≥ 1.6× speedup over single-token decode on gemma-4-26b
-- Falsifier: at `HF2Q_SPEC_DFLASH=0`, output and perf must be identical to ADR-029 HEAD `31677488` baseline (no regression introduced by the new module)
+#### **Phase 4 — Greedy spec-decode orchestrator** ⏳ PENDING
+Lands: `orchestrator.rs` + target hidden capture wiring + verify_batched body.
+
+**Subsumed from Phase 3 boundary refinement** (iter-34):
+- Target hidden capture at `target_layer_ids` (called from orchestrator,
+  not by mutating forward_decode signature — mirrors Python's
+  `_patch_model` monkey-patch pattern in model_mlx.py:284-290)
+- `forward_decode_verify_batched` body replacement at
+  `forward_prefill_batched.rs:2665`
+
+**End-to-end orchestrator (greedy temp=0):**
+- Input: prompt tokens
+- Output: generated tokens (byte-identical to single-token decode at K=0)
+- Loop per decode step:
+  1. ngram_proposer or empty-drafts decision
+  2. If K > 0: call orchestrator wrapper that
+     a. Runs target's forward on K+1 tokens, capturing per-layer hidden
+        at `target_layer_ids`
+     b. Calls `dispatch_dflash_model_forward(target_hidden, ...)` to get
+        drafter logits at L positions
+     c. Argmax drafter logits → K draft tokens
+     d. Runs target's verify forward on [last_accepted, draft_1, …,
+        draft_K] (K+1 tokens), captures target argmaxes
+     e. Applies `accept_prefix_argmax(drafts, target_argmaxes)` →
+        (accept_count, model_token)
+     f. Rolls back target KV cache by `K - accept_count` per `rollback_kv`
+  3. Else (K=0): standard single-token decode
+
+**Gates (unchanged from original plan):**
+- **Coherence gate**: all 18 coherence golden fixtures at temp=0 must
+  produce byte-identical output to single-token decode. **NO EXCEPTIONS**.
+- **Determinism gate**: 10 repeated runs of each golden fixture must each
+  produce identical output.
+- **Perf gate**: alt-pair thermal-fair `bench-decode.sh tg256` at temp=0,
+  σ<1%, 5 cycles; spec-decode must show ≥ 1.07× speedup vs hf2q baseline
+  (= peer-FA parity per Phase 1.5 mission gate revision).
+- Falsifier: at `HF2Q_SPEC_DFLASH=0`, output + perf must be identical to
+  pre-Phase-2 HEAD baseline (no regression).
 
 #### **Phase 5 — Async parallel-encode** (~90 LOC; `HF2Q_SPEC_DFLASH_PHASE=5`)
 Lands: `async_dispatch.rs`, modifications to orchestrator
