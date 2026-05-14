@@ -13,5 +13,6 @@
 pub mod config;
 pub mod forward;
 pub mod kv_cache;
+pub mod orchestrator;
 pub mod tensors;
 pub mod weights;
