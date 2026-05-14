@@ -2671,3 +2671,44 @@ or vanishes" (numerical bug).
 
 `cargo check --release` clean, 51/51 lib tests still GREEN.
 
+
+### iter-105 — Option A round-2 prior_captured plumbing TESTED (passes)
+
+Continuing the iter-87 "all-pad [0]*7" investigation.  iter-104
+eliminated three GPU-kernel suspects.  iter-105 falsifies a CPU-side
+hypothesis with a pure-CPU unit test.
+
+**Hypothesis**: `append_capture_positions` (round-1 verify → round-2
+prior_captured) + `extract_drafter_concat` (round-2 prior_captured →
+drafter forward input) corrupt the new row's data, causing the
+drafter to see garbage at the position corresponding to the newly
+committed token, which propagates to NaN/all-zero h_final.
+
+**Test added** (`hidden_capture.rs::tests::option_a_round2_prior_captured_delivers_correct_new_row`):
+- Seed prior_captured with prompt_len=10 rows of synthetic distinct
+  values per (layer, position, dim).
+- Seed verify_captured with block_size=8 rows of separate distinct
+  values offset by +100_000.
+- `append_capture_positions(..., n_committed=1)` — mirrors round-1
+  with 0% acceptance.
+- `extract_drafter_concat(...)` — mirrors orchestrator's round-2
+  prep.
+- Slice `[drafter_cached_seq_len * row_stride..]` — exactly the
+  `drafter_concat_new` slice the drafter forward consumes.
+- Per-layer assertion: the extracted row 0 (the only "new" row)
+  MUST byte-equal `verify_captured[combined_idx_of(target_layer_ids[drafter_l]), pos=0, :]`
+  for each drafter layer.
+
+**Result: PASS**.  All 6 drafter layers receive the bit-correct
+hidden state for the newly committed token's position.
+
+**Verdict**: the CPU-side data plumbing for Option A round-2 is
+CORRECT.  Eliminates this as a suspect for the iter-87 all-pad
+pattern.  Residual hypothesis is now confined to the GPU drafter
+forward (input_layernorm fp32 stability, attention numerics,
+silu_mul overflow, or final_norm degeneracy) — none of which can
+be falsified offline.
+
+**Tests**: 42/42 dflash tests pass (was 41); 3499/3499 full bin
+test suite GREEN.
+

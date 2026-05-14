@@ -723,6 +723,126 @@ mod tests {
         assert!(view.per_position_argmaxes.is_some());
     }
 
+    /// ADR-030 iter-105 — CPU-only validation of the Option A round-2
+    /// drafter-input pipeline.  Targets the iter-87 "all-pad [0]*7"
+    /// hypothesis (degenerate h_final on long Option A prompts) by
+    /// asserting that the round-1 → round-2 data plumbing for
+    /// `prior_captured` correctly delivers the NEWLY committed token's
+    /// hidden state into round-2's `drafter_concat_new` slice.
+    ///
+    /// Scenario:
+    /// - Initial prefill capture seeds prior_captured with prompt_len rows
+    ///   (synthetic values: layer_idx * 1000 + pos * 10 + dim).
+    /// - Round-1 verify produces a separate capture with block_size rows
+    ///   (synthetic values: 100000 + layer_idx * 1000 + pos * 10 + dim).
+    /// - n_committed = 1 (worst-case 0% accept).
+    /// - append_capture_positions stacks them → prior_captured grows by 1.
+    /// - extract_drafter_concat permutes → round-2 takes the last 1 row.
+    /// - That row's contents at each drafter layer MUST equal the
+    ///   round-1 verify capture at position 0 for that layer
+    ///   (= the hidden state for `last_token` at the verify start_pos).
+    ///
+    /// If this assertion fails, the iter-87 all-pad pattern is plausibly
+    /// caused by data-plumbing corruption.  If it passes (expected),
+    /// the bug lies downstream in the GPU drafter forward.
+    #[test]
+    fn option_a_round2_prior_captured_delivers_correct_new_row() {
+        let drafter_target_layer_ids: Vec<usize> = vec![1, 6, 11, 17, 22, 27];
+        let final_layer_idx = 29usize;
+        let mut combined_ids: Vec<usize> = drafter_target_layer_ids.clone();
+        combined_ids.push(final_layer_idx);
+        combined_ids.sort_unstable();
+        combined_ids.dedup();
+        let prompt_len = 10usize;
+        let block_size = 8usize;
+        let hs = 16usize; // small for fast test
+
+        // Initial prefill capture (prompt only).
+        let mut prior_captured = DFlashCaptureSession::new(
+            combined_ids.clone(),
+            prompt_len,
+            hs,
+            false,
+        );
+        for (cli, &_clid) in combined_ids.iter().enumerate() {
+            for t in 0..prompt_len {
+                for d in 0..hs {
+                    let off = (cli * prompt_len + t) * hs + d;
+                    prior_captured.hidden_output[off] =
+                        (cli * 1000 + t * 10 + d) as f32;
+                }
+            }
+        }
+
+        // Round-1 verify capture (block_size rows at start_pos=prompt_len).
+        let mut verify_captured = DFlashCaptureSession::new(
+            combined_ids.clone(),
+            block_size,
+            hs,
+            false,
+        );
+        for (cli, &_clid) in combined_ids.iter().enumerate() {
+            for t in 0..block_size {
+                for d in 0..hs {
+                    let off = (cli * block_size + t) * hs + d;
+                    verify_captured.hidden_output[off] =
+                        100_000.0 + (cli * 1000 + t * 10 + d) as f32;
+                }
+            }
+        }
+
+        // Round-1 accept-prefix = 0 → n_committed = 1 (target's bonus token).
+        let n_committed = 1usize;
+        let next_prior = append_capture_positions(
+            &prior_captured,
+            &verify_captured,
+            n_committed,
+        )
+        .expect("append_capture_positions");
+        assert_eq!(next_prior.seq_len, prompt_len + n_committed);
+
+        // Round-2 drafter extraction.
+        let drafter_concat = extract_drafter_concat(
+            &next_prior.hidden_output,
+            &combined_ids,
+            &drafter_target_layer_ids,
+            next_prior.seq_len,
+            hs,
+        )
+        .expect("extract_drafter_concat");
+
+        // Round-2 takes the LAST n_committed = 1 row from the extraction
+        // (mirrors orchestrator.rs:668-669 `new_rows_start =
+        // drafter_cached_seq_len * row_stride`).
+        let drafter_n = drafter_target_layer_ids.len();
+        let row_stride = drafter_n * hs;
+        let drafter_cached_seq_len = prompt_len;
+        let new_rows_start = drafter_cached_seq_len * row_stride;
+        let drafter_concat_new: &[f32] = &drafter_concat[new_rows_start..];
+        assert_eq!(drafter_concat_new.len(), n_committed * row_stride);
+
+        // The single new row's layout (per extract_drafter_concat):
+        //   for drafter_l in 0..drafter_n:
+        //     drafter_concat_new[drafter_l * hs .. (drafter_l+1) * hs]
+        //     == verify_captured[combined_idx_of(target_layer_ids[drafter_l]), 0, :]
+        for (drafter_l, &dl_id) in drafter_target_layer_ids.iter().enumerate() {
+            let combined_idx = combined_ids.iter().position(|&c| c == dl_id)
+                .expect("drafter layer in combined");
+            let verify_layer_base = combined_idx * block_size * hs;
+            let verify_pos0_base = verify_layer_base; // pos 0 → +0
+            let expected = &verify_captured.hidden_output
+                [verify_pos0_base..verify_pos0_base + hs];
+            let actual = &drafter_concat_new
+                [drafter_l * hs..(drafter_l + 1) * hs];
+            assert_eq!(
+                actual, expected,
+                "drafter_l={} (target_layer_id={}, combined_idx={}): \
+                 drafter_concat_new row 0 must equal verify_captured[combined={}, pos=0, :]",
+                drafter_l, dl_id, combined_idx, combined_idx,
+            );
+        }
+    }
+
     /// End-to-end integration: simulates the post-target-verify state
     /// (capture buffer populated by hypothetical layer-loop hook) and
     /// drives the drafter forward on the permuted concat. Validates
