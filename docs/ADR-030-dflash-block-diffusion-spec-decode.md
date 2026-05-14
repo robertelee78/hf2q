@@ -1458,3 +1458,63 @@ short-context Option A; orchestrator integration still pending):
   Reuses `FlashAttnPrefillResumeParams` from D=256 module.
 - `/opt/mlx-native/src/ops/flash_attn_prefill.rs` —
   `validate_buffer_size` made `pub(crate)`.
+
+### iter-76 (2026-05-14) — Phase 2 orchestrator scaffold (HF2Q_DFLASH_XLEN_SDPA gate)
+
+Wired the Phase 2 (orchestrator) half of the Option A integration.
+Two paths now live in `dispatch_dflash_generate`, gated by env flag:
+
+- **Option C** (default, flag OFF) — iter-65..iter-72 path.  Re-prefill
+  full `[output + drafts]` from start_pos=0 each round.  No target
+  rollback (start_pos=0 next round overwrites).  `prior_captured =
+  trim(verify_captured, output.len()-1)` after accept-prefix.
+  Bit-identical to iter-72 (regression-verified: coherence GREEN at
+  N=16, profile TOTAL=104.5ms vs iter-72's 105.5ms, neutral).
+
+- **Option A** (HF2Q_DFLASH_XLEN_SDPA=1) — iter-76 scaffold.
+  verify_input = `[last_token, drafts]` (K+1 tokens) at
+  start_pos=output.len()-1.  Capture covers K+1 positions only.
+  target_argmaxes = ALL K+1 argmaxes (no slicing).
+  target.rollback_kv(K - accept_count) after accept-prefix.
+  `prior_captured = append_capture_positions(prior, verify,
+  n_committed)` — new helper in hidden_capture.rs that grows the
+  persistent slab by n_committed positions per round.
+
+**Bug fixed**: dense KV cache cap underflow in xlen path.  In Option A,
+forward_prefill_batched is called with verify_input.len() = K+1 (=8)
+at start_pos=output.len()-1.  The K/V writes go to positions
+[start_pos..start_pos+8), so the dense cap must be ≥ start_pos + 8.
+`linear_capacity = seq_len + max_decode_tokens` per
+`forward_prefill_batched.rs:295`; pass `max_decode_tokens = start_pos`
+to make cap = 8 + start_pos exactly.
+
+**Current state under flag ON**: orchestrator works structurally (no
+crashes, dimensions correct) but COHERENCE BREAKS — the existing
+SDPA dispatch at non-zero start_pos does self-attention over the K+1
+verify tokens only (iter-64 Bug 5).  Prior K/V context invisible →
+wrong attention → output is a single token repeated 16 times
+(`spec_new = [236743, 236825 × 15]`).
+
+iter-77 will add the SDPA swap in forward_prefill_batched to call
+`dispatch_flash_attn_prefill_f16_d{256,512}_resume` (added in
+iter-74/iter-75) when the env flag is set + start_pos > 0 +
+dflash_capture installed.  That delivers the Option A coherence.
+
+**Code artifacts (iter-76)**:
+- `src/inference/spec_decode/dflash/hidden_capture.rs` — new
+  `append_capture_positions` helper (~60 LOC).
+- `src/inference/spec_decode/dflash/orchestrator.rs` —
+  `dispatch_dflash_generate` verify section refactored into two paths
+  (Option C + Option A), gated on `HF2Q_DFLASH_XLEN_SDPA=1`.  Default
+  path bit-identical to iter-72.
+
+**Mission state at iter-76 end**:
+- Coherence (flag OFF, Option C): GREEN at N=16 ✓
+- Coherence (flag ON, Option A): RED (expected; awaits iter-77 SDPA swap)
+- Production wire-up: ✓ (HF2Q_SPEC_DFLASH=1, default Option C)
+- Perf (flag OFF): 0.096× baseline (unchanged from iter-72)
+- iter-77 plan: add SDPA dispatch swap in forward_prefill_batched
+  (sliding-layer + full-attn-layer paths).  Cast chain Q BF16→F32→F16
+  and output F16→F32→BF16.  K, V from hybrid_kv (F16) directly.  Once
+  in place, flag ON should turn coherence gate GREEN and unlock the
+  predicted ~50% throughput gain.

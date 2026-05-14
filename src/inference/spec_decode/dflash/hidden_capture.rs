@@ -394,6 +394,65 @@ impl DFlashCaptureSession {
     }
 }
 
+/// ADR-030 iter-76 — append `n_committed` accepted positions from
+/// `verify_captured` onto `prior_captured`, returning a fresh
+/// `DFlashCaptureSession` whose `seq_len = prior.seq_len + n_committed`.
+///
+/// Used by the Option A orchestrator path: each round's verify pass
+/// captures K+1 positions starting at `start_pos = output.len() - 1`.
+/// After accept-prefix, the first `n_committed` of those positions
+/// are accepted into the committed prefix and need to be merged into
+/// the persistent prior_captured slab for the next round's drafter
+/// input.
+///
+/// Layout: both sessions store `hidden_output` as flat
+/// `[num_target_layers, seq_len, hidden_size]` row-major.  The
+/// returned session's seq_len = prior.seq_len + n_committed; for each
+/// capture layer, positions `[0..prior.seq_len)` come from `prior`
+/// and positions `[prior.seq_len..prior.seq_len + n_committed)` come
+/// from `verify_captured`'s first `n_committed` rows.
+///
+/// Both sessions must have IDENTICAL `target_layer_ids` and
+/// `hidden_size`.  Panics in debug mode otherwise.
+pub fn append_capture_positions(
+    prior: &DFlashCaptureSession,
+    verify_captured: &DFlashCaptureSession,
+    n_committed: usize,
+) -> Result<DFlashCaptureSession> {
+    debug_assert_eq!(prior.target_layer_ids, verify_captured.target_layer_ids);
+    debug_assert_eq!(prior.hidden_size, verify_captured.hidden_size);
+    if n_committed > verify_captured.seq_len {
+        return Err(anyhow!(
+            "append_capture_positions: n_committed ({}) > verify_captured.seq_len ({})",
+            n_committed, verify_captured.seq_len
+        ));
+    }
+    let hs = prior.hidden_size;
+    let num_layers = prior.target_layer_ids.len();
+    let prior_seq = prior.seq_len;
+    let new_seq = prior_seq + n_committed;
+    let mut new_hidden = vec![0.0f32; num_layers * new_seq * hs];
+    for layer in 0..num_layers {
+        let new_layer_base = layer * new_seq * hs;
+        // (a) Copy prior's positions [0..prior_seq) for this layer.
+        let prior_layer_base = layer * prior_seq * hs;
+        new_hidden[new_layer_base..new_layer_base + prior_seq * hs]
+            .copy_from_slice(&prior.hidden_output[prior_layer_base..prior_layer_base + prior_seq * hs]);
+        // (b) Append verify_captured's positions [0..n_committed) for this layer.
+        let verify_layer_base = layer * verify_captured.seq_len * hs;
+        let new_extended = new_layer_base + prior_seq * hs;
+        new_hidden[new_extended..new_extended + n_committed * hs]
+            .copy_from_slice(&verify_captured.hidden_output[verify_layer_base..verify_layer_base + n_committed * hs]);
+    }
+    Ok(DFlashCaptureSession {
+        target_layer_ids: prior.target_layer_ids.clone(),
+        hidden_output: new_hidden,
+        per_position_argmaxes: None,
+        seq_len: new_seq,
+        hidden_size: hs,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

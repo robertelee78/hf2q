@@ -524,6 +524,16 @@ pub fn dispatch_dflash_generate(
 
     let mut output: Vec<u32> = prompt_tokens.to_vec();
 
+    // ADR-030 iter-76: opt-in cross-length SDPA verify path (Option A).
+    // When env flag HF2Q_DFLASH_XLEN_SDPA=1 is set, the orchestrator
+    // shrinks verify_input to K+1 tokens at start_pos=output.len()-1,
+    // rolls back target's KV cache by (K - accept_count) per round, and
+    // grows persistent_captured incrementally.  Coordinated with
+    // forward_prefill_batched's resume-SDPA branch (gated on same env).
+    // Default OFF for safety; when OFF, behavior is iter-72 path bit-
+    // identical.
+    let xlen_sdpa = std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() == Ok("1");
+
     // -------- Initial prompt forward with capture --------
     let session = DFlashCaptureSession::new(
         combined_capture_ids.clone(),
@@ -721,68 +731,136 @@ pub fn dispatch_dflash_generate(
         };
         if let Some(t) = t0_drafter_argmax { t_drafter_argmax_ms += t.elapsed().as_secs_f64() * 1000.0; }
 
-        // 6. Verify: re-prefill `output + drafts` from start_pos=0,
-        //    capture all positions, compute argmaxes at the last
-        //    `block_size` positions (= verify positions).
-        let mut verify_prefix: Vec<u32> = output.clone();
-        verify_prefix.extend(drafts.iter().copied());
-        let verify_prefix_len = verify_prefix.len();
-        let verify_session = DFlashCaptureSession::new(
-            combined_capture_ids.clone(),
-            verify_prefix_len,
-            hs,
-            false,
-        );
-        target.install_dflash_capture(verify_session);
-        let t0_verify = if profile_on { Some(std::time::Instant::now()) } else { None };
-        let _verify_last_argmax = target
-            .forward_prefill_batched(&verify_prefix, max_decode_for_alloc, 0, gpu)
-            .map_err(|e| anyhow::anyhow!("generate: verify forward: {e}"))?;
-        let verify_captured = target
-            .take_dflash_capture()
-            .ok_or_else(|| anyhow::anyhow!("generate: verify capture vanished"))?;
-        if let Some(t) = t0_verify { t_verify_prefill_ms += t.elapsed().as_secs_f64() * 1000.0; }
+        // 6. Verify forward — two paths gated on HF2Q_DFLASH_XLEN_SDPA.
+        //
+        // Option C (default, xlen_sdpa=false): re-prefill
+        //   [output + drafts] from start_pos=0.  Verify capture covers
+        //   all output_len + K positions; target_argmaxes are the last
+        //   block_size rows.  NO target.rollback_kv (start_pos=0 next
+        //   round overwrites).  prior_captured = trim(verify_captured,
+        //   output.len()-1).
+        //
+        // Option A (iter-76, xlen_sdpa=true): verify_input = K+1
+        //   tokens at start_pos=output.len()-1.  Verify capture covers
+        //   just K+1 positions; target_argmaxes = ALL K+1 argmaxes.
+        //   target.rollback_kv(K - accept_count) after accept-prefix.
+        //   prior_captured = append_capture_positions(prior, verify,
+        //   n_committed).  Requires forward_prefill_batched's resume-
+        //   SDPA branch (also gated on HF2Q_DFLASH_XLEN_SDPA).
+        let (verify_captured, target_argmaxes, verify_seq_len_for_path) = if xlen_sdpa {
+            // ── Option A: cross-length verify ───────────────────────
+            let verify_input: Vec<u32> = std::iter::once(last_token)
+                .chain(drafts.iter().copied())
+                .collect();
+            let verify_seq_len = verify_input.len(); // = block_size = K+1
+            let start_pos = output.len() - 1;
+            let verify_session = DFlashCaptureSession::new(
+                combined_capture_ids.clone(),
+                verify_seq_len,
+                hs,
+                false,
+            );
+            target.install_dflash_capture(verify_session);
+            let t0_verify = if profile_on { Some(std::time::Instant::now()) } else { None };
+            // dense_kvs_vec is fresh-allocated per forward_prefill_batched call
+            // with `linear_capacity = seq_len + max_decode_tokens`.  For the
+            // xlen verify call, K/V writes go to positions
+            // [start_pos..start_pos+seq_len) — so the cap needs to be ≥
+            // start_pos + seq_len.  Pass max_decode_tokens = start_pos so
+            // cap = seq_len + start_pos exactly.
+            let xlen_max_decode = start_pos;
+            let _verify_last_argmax = target
+                .forward_prefill_batched(&verify_input, xlen_max_decode, start_pos, gpu)
+                .map_err(|e| anyhow::anyhow!("generate: verify forward (xlen): {e}"))?;
+            let captured = target
+                .take_dflash_capture()
+                .ok_or_else(|| anyhow::anyhow!("generate: verify capture vanished (xlen)"))?;
+            if let Some(t) = t0_verify { t_verify_prefill_ms += t.elapsed().as_secs_f64() * 1000.0; }
 
-        // 7. Extract final-layer slab + per-position argmaxes ONLY at
-        //    verify positions = the last `block_size` rows of the slab.
-        //    iter-70: previously called per_position_argmax_from_hidden
-        //    over ALL verify_prefix_len positions and then discarded all
-        //    but the last block_size — wasting ~75% of the rms_norm +
-        //    lm_head + softcap + argmax work per round.  Now we slice
-        //    the slab to just the K+1 verify rows before invoking the
-        //    per-position pipeline.
-        let t0_target_argmax = if profile_on { Some(std::time::Instant::now()) } else { None };
-        let final_slab = extract_final_layer_slab(
-            &verify_captured.hidden_output,
-            &combined_capture_ids,
-            final_layer_idx,
-            verify_prefix_len,
-            hs,
-        )?;
-        // Verify positions are [output.len() - 1 .. output.len() - 1 +
-        // block_size] of the prefill.  argmax_at_verify_start =
-        // pred-after-last_token = compare to draft_1; etc.
-        let verify_start = output.len() - 1;
-        let verify_end = verify_start + block_size as usize;
-        debug_assert_eq!(verify_end, verify_prefix_len);
-        let verify_slab_tail: &[f32] = &final_slab[verify_start * hs..verify_end * hs];
-        let target_argmaxes = target
-            .per_position_argmax_from_hidden_batched_impl(
-                verify_slab_tail,
-                block_size,
-                true,
-                gpu,
-            )
-            .map_err(|e| anyhow::anyhow!("generate: target argmax: {e}"))?;
-        if let Some(t) = t0_target_argmax { t_target_argmax_ms += t.elapsed().as_secs_f64() * 1000.0; }
+            // target_argmaxes: ALL K+1 positions of the verify capture
+            // (verify_input[0] = last_token, so argmax at position 0 =
+            // pred-after-last_token; argmax at position i = pred-after-
+            // verify_input[i] = compare to draft[i+1] or accept as
+            // free-continuation when accept_count == K).
+            let t0_target_argmax = if profile_on { Some(std::time::Instant::now()) } else { None };
+            let final_slab = extract_final_layer_slab(
+                &captured.hidden_output,
+                &combined_capture_ids,
+                final_layer_idx,
+                verify_seq_len,
+                hs,
+            )?;
+            let argmaxes = target
+                .per_position_argmax_from_hidden_batched_impl(
+                    &final_slab,
+                    verify_seq_len as u32,
+                    true,
+                    gpu,
+                )
+                .map_err(|e| anyhow::anyhow!("generate: target argmax (xlen): {e}"))?;
+            if let Some(t) = t0_target_argmax { t_target_argmax_ms += t.elapsed().as_secs_f64() * 1000.0; }
+
+            (captured, argmaxes, verify_seq_len)
+        } else {
+            // ── Option C: full-prefix re-prefill (iter-65..iter-72) ──
+            let mut verify_prefix: Vec<u32> = output.clone();
+            verify_prefix.extend(drafts.iter().copied());
+            let verify_prefix_len = verify_prefix.len();
+            let verify_session = DFlashCaptureSession::new(
+                combined_capture_ids.clone(),
+                verify_prefix_len,
+                hs,
+                false,
+            );
+            target.install_dflash_capture(verify_session);
+            let t0_verify = if profile_on { Some(std::time::Instant::now()) } else { None };
+            let _verify_last_argmax = target
+                .forward_prefill_batched(&verify_prefix, max_decode_for_alloc, 0, gpu)
+                .map_err(|e| anyhow::anyhow!("generate: verify forward: {e}"))?;
+            let captured = target
+                .take_dflash_capture()
+                .ok_or_else(|| anyhow::anyhow!("generate: verify capture vanished"))?;
+            if let Some(t) = t0_verify { t_verify_prefill_ms += t.elapsed().as_secs_f64() * 1000.0; }
+
+            let t0_target_argmax = if profile_on { Some(std::time::Instant::now()) } else { None };
+            let final_slab = extract_final_layer_slab(
+                &captured.hidden_output,
+                &combined_capture_ids,
+                final_layer_idx,
+                verify_prefix_len,
+                hs,
+            )?;
+            let verify_start = output.len() - 1;
+            let verify_end = verify_start + block_size as usize;
+            debug_assert_eq!(verify_end, verify_prefix_len);
+            let verify_slab_tail: &[f32] = &final_slab[verify_start * hs..verify_end * hs];
+            let argmaxes = target
+                .per_position_argmax_from_hidden_batched_impl(
+                    verify_slab_tail,
+                    block_size,
+                    true,
+                    gpu,
+                )
+                .map_err(|e| anyhow::anyhow!("generate: target argmax: {e}"))?;
+            if let Some(t) = t0_target_argmax { t_target_argmax_ms += t.elapsed().as_secs_f64() * 1000.0; }
+
+            (captured, argmaxes, verify_prefix_len)
+        };
 
         // 8. Accept-prefix
         let round = step_round_from_argmaxes(&drafts, &target_argmaxes, eos_token_ids);
 
-        // 9. NO target rollback — next round's re-prefill from start_pos=0
-        //    overwrites all positions.  Cache state is naturally reset.
+        // 9. Target rollback (Option A only — Option C re-prefills at
+        //    start_pos=0 so no rollback needed).
+        if xlen_sdpa {
+            let rollback = drafts.len().saturating_sub(round.accept_count);
+            if rollback > 0 {
+                target.rollback_kv(rollback);
+            }
+        }
 
         // 10. Append committed tokens + advance state
+        let n_committed = round.committed_tokens.len();
         output.extend(round.committed_tokens.iter().copied());
         last_token = *round.committed_tokens.last().unwrap();
 
@@ -793,23 +871,34 @@ pub fn dispatch_dflash_generate(
             break;
         }
 
-        // 11. iter-69: trim verify_captured for next round's drafter
-        //     ctx.  Next round's prior_ctx_len = output.len() - 1 =
-        //     (verify_start + n_committed).  trim_capture_to keeps
-        //     positions [0..new_seq_len) and updates seq_len.  Because
-        //     of causal masking in the verify prefill at start_pos=0,
-        //     positions [0..n) in the captured slab depend ONLY on
-        //     tokens [0..n) — independent of any draft tokens at
-        //     positions ≥ verify_start.  So this trimmed slab is the
-        //     correct prior_captured for the next round's drafter.
+        // 11. Update prior_captured for next round.
         let t0_trim = if profile_on { Some(std::time::Instant::now()) } else { None };
-        let mut next_captured = verify_captured;
-        let next_prior_ctx_len = output.len() - 1;
-        debug_assert!(next_prior_ctx_len <= next_captured.seq_len,
-            "trim target {} > current {}", next_prior_ctx_len, next_captured.seq_len);
-        super::hidden_capture::trim_capture_to(&mut next_captured, next_prior_ctx_len);
-        prior_captured = next_captured;
+        if xlen_sdpa {
+            // Option A: persistent_captured grows by n_committed
+            // positions per round (the accepted positions from this
+            // round's verify capture).  The verify capture covers K+1
+            // verify positions; the first n_committed of those are
+            // accepted into output and need to be merged into the
+            // persistent prior_captured slab.
+            prior_captured = super::hidden_capture::append_capture_positions(
+                &prior_captured,
+                &verify_captured,
+                n_committed,
+            )?;
+        } else {
+            // Option C: trim verify_captured to the new output.len()-1
+            // (causal masking in the start_pos=0 prefill makes positions
+            // [0..N) depend ONLY on tokens [0..N) — independent of
+            // drafts at higher positions).
+            let mut next_captured = verify_captured;
+            let next_prior_ctx_len = output.len() - 1;
+            debug_assert!(next_prior_ctx_len <= next_captured.seq_len,
+                "trim target {} > current {}", next_prior_ctx_len, next_captured.seq_len);
+            super::hidden_capture::trim_capture_to(&mut next_captured, next_prior_ctx_len);
+            prior_captured = next_captured;
+        }
         if let Some(t) = t0_trim { t_trim_ms += t.elapsed().as_secs_f64() * 1000.0; }
+        let _ = verify_seq_len_for_path; // silence unused warning when not branched on
     }
 
     if profile_on && rounds_count > 0 {
