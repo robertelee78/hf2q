@@ -1729,3 +1729,124 @@ start_pos = prompt_len = 12).
 - Perf (flag OFF): 0.096× baseline (unchanged from iter-72/77/78)
 - Mission gap: 10.5× — closes only when Option A coherence is fixed
   and orchestrator path activates.
+
+
+### iter-80 — Hypothesis 2 (GPU ordering) FALSIFIED
+
+Inserted `s.finish()` between pre-SDPA hybrid_kv K/V writes and the
+xlen SDPA dispatch (forward_prefill_batched.rs:1322-1370).  Output:
+**identical** to iter-78 — same broken tokens
+`spec_new = [236743, 0, 134722, 0, 236778, 236862, 236778, 0, ...]`.
+Determinism + identical-output rules out command-buffer ordering as
+the bug.  `barrier_between` was already enforcing the correct
+write-before-read ordering.
+
+### iter-81 — F16 D=256 resume kernel byte-identity at qL_off>0 + align_k=false
+
+Wrote standalone unit test in
+`/opt/mlx-native/tests/test_flash_attn_prefill.rs:5043+`:
+`flash_attn_prefill_f16_d256_resume_qL_off_align_k_false_byte_identity`.
+
+Compared monolithic-equivalent (qL_off=0, kv_capacity=kL=20) vs
+slot-stride resume (qL_off=12, kv_capacity=64, qL=8, kL=20).  Result:
+**0 / 32768 F16 elements differ**.  Kernel is correct at the failing
+regime.  Hypothesis 3 (kernel edge case at align_k=false) FALSIFIED
+for the F16 D=256 kernel.
+
+### iter-82 — ROOT CAUSE: F16 D=512 SDPA overflow at L29
+
+Added runtime instrumentation (`HF2Q_DFLASH_XLEN_DEBUG=1`) that
+commits the session and dumps Q/K/V/OUT values at each layer's SDPA
+call + `pf_hidden` at the dflash capture point.  Findings:
+
+| Layer | Q[h=0,t=0] magnitude | SDPA OUT nan_count | pf_hidden status |
+|---|---|---|---|
+| L0 (sliding D=256) | ~3.30  | 0 | finite |
+| L5 (global D=512)  | ~0.66  | 0 | finite |
+| L11 (global D=512) | ~0.53  | 0 | finite |
+| L17 (global D=512) | ~0.27  | 0 | finite |
+| L23 (global D=512) | ~0.19  | 0 | finite |
+| **L29 (global D=512)** | **~3.25** | **1408** | **NaN (22528/22528)** |
+
+L29's Q values are ~16× larger than other globals.  F16 attention
+scores at L29 overflow the 5-bit exponent (max ≈ 65504), producing
+NaN in 1408 / 65536 SDPA output elements.  The 1408 NaN propagate
+through L29's MLP / MoE / residual into a fully-NaN final hidden
+state, which yields the `argmax = 0` (= `<pad>` token) we saw at
+verify position 0.
+
+Bisection control: `HF2Q_DFLASH_XLEN_D512_OFF=1` (routes D=512 layers
+through standard non-xlen BF16 with_blk path while keeping D=256 on
+xlen) → `pf_hidden` becomes finite at L29 and `spec_new[1] = 236778
+= baseline_new[1]` matches.  Confirms F16 dtype is the issue.
+
+The iter-81 byte-identity test PASSED with pseudo-random data because
+the random distribution doesn't exceed F16 dynamic range.  Production
+Q distribution at gemma-4 L29 specifically triggers the overflow.
+
+### iter-83 — Implement BF16 D=512 resume dispatcher in mlx-native
+
+`mlx-native/src/ops/flash_attn_prefill_d512.rs:967+`:
+`dispatch_flash_attn_prefill_bf16_d512_resume`.  Mirror of the F16
+sibling with BF16 dtype validation.  Reuses the existing
+`K_LLAMACPP_BF16_D512` metal kernel.  Also adds the F16 D=512
+byte-identity test (passes — confirms kernel correctness at the
+failing regime; production overflow is dtype-only).
+
+### iter-84 — Route hf2q D=512 xlen branch through BF16 resume
+
+`forward_prefill_batched.rs` D=512 xlen branch now:
+
+1. Casts `hybrid_kv` K from F16 → F32 → BF16 (full slot,
+   ~70KB per layer at gemma-4 cap=35).
+2. Casts `hybrid_kv` V from F16 → F32 → BF16 (~70KB).
+3. Q stays BF16 (uses `pf_q_perm` directly).
+4. Dispatches `dispatch_flash_attn_prefill_bf16_d512_resume`.
+5. Output goes directly to `pf_sdpa_out_perm` (BF16; no cast).
+
+Net: drops the 4 Q/output F16 casts from the previous F16 path,
+replaces with 4 K/V casts.  Dispatch-count-neutral.
+
+**RESULT — COHERENCE PASS** (operator-runnable):
+
+```
+HF2Q_DFLASH_XLEN_SDPA=1 HF2Q_FULL_F16_KV=1 cargo test --release \
+  --bin hf2q e2e_dispatch_dflash_generate_gemma4_26b -- --ignored --nocapture
+
+[e2e] baseline_new = [236743, 236778, 236862, 236778, 236881, 107,
+                     236776, 236787, 236743, 236778, 236862, 236778,
+                     236881, 107, 236776, 236787]
+[e2e] spec_new     = [236743, 236778, 236862, 236778, 236881, 107,
+                     236776, 236787, 236743, 236778, 236862, 236778,
+                     236881, 107, 236776, 236787]
+[e2e] COHERENCE PASS: spec_new == baseline_new for all 16 tokens
+```
+
+16/16 tokens bit-identical to baseline single-token decode.
+
+### iter-85 — Perf: Option A is 16% faster than Option C
+
+```
+Option C (re-prefill, default):       102.19 ms/round, total 1.60s
+Option A (xlen, iter-84 coherent):     85.11 ms/round, total 1.34s
+                                       —————————————————————————————
+                                       16% end-to-end speedup
+                                       (verify_prefill 76.72ms → 59.08ms, 23%)
+```
+
+At 0% drafter acceptance, spec-decode is still slower than baseline
+(11.94 t/s vs baseline 66.67 t/s ≈ 0.18×) because verify forward
+overhead dominates when drafts are wrong.  Mission perf gate requires
+high drafter acceptance on representative workloads — Option A is the
+architectural path that enables that win when acceptance>0.
+
+### Mission state at iter-85
+
+- Coherence (flag OFF, Option C): GREEN ✓
+- **Coherence (flag ON, Option A): GREEN ✓ (NEW)**
+- Production wire-up: HF2Q_SPEC_DFLASH=1 routes through Option C; flip
+  default to Option A pending real-workload perf validation
+- D=512 xlen kernel: BF16 resume (iter-83) replaces F16
+- Closure path: dependent on drafter acceptance rate on production
+  workloads (gemma-4 with non-trivial prompts)
+
