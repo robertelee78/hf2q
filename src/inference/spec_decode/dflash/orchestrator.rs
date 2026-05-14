@@ -550,16 +550,16 @@ pub fn dispatch_dflash_generate(
     let first_token = target
         .forward_prefill_batched(prompt_tokens, max_decode_for_alloc, 0, gpu)
         .map_err(|e| anyhow::anyhow!("generate: initial prompt forward: {e}"))?;
-    let mut captured = target
+    // The initial prefill installed a capture session for the prompt's
+    // hidden states.  Option C (iter-65) re-prefills the full prefix
+    // from start_pos=0 each round, so this initial capture is unused
+    // by the round-1 drafter; take it back to drop it cleanly without
+    // leaving stale state on the target.
+    let _ = target
         .take_dflash_capture()
         .ok_or_else(|| anyhow::anyhow!("generate: initial capture vanished"))?;
 
-    // The first decode token comes from the prompt's last position's argmax.
-    // forward_prefill_batched wrote prompt_tokens into KV at positions
-    // [0..prompt_len); first_token is the predicted NEXT token, NOT yet in KV.
-    // It will be fed back via the next forward's verify_input[0].
     output.push(first_token);
-    let mut seq_pos: usize = prompt_tokens.len();
 
     if eos_token_ids.contains(&first_token) || max_new_tokens == 0 {
         return Ok(output);
@@ -567,35 +567,25 @@ pub fn dispatch_dflash_generate(
 
     let mut last_token = first_token;
 
-    // -------- Multi-round loop --------
+    // -------- Multi-round loop (Option C: re-prefill each round) --------
+    //
+    // Background: the underlying `flash_attn_prefill` kernels in
+    // forward_prefill_batched set `seq_len_q = seq_len_k = seq_len` —
+    // they do self-attention over the current chunk only and cannot
+    // attend to prior cache content.  This makes verify-at-non-zero-
+    // start_pos fundamentally incoherent (iter-64 Bug 5).
+    //
+    // Option C bypasses this by re-prefilling the ENTIRE prefix
+    // `[output..., drafts...]` from start_pos=0 each round.  The SDPA
+    // self-attention now spans the whole prefix → correct cross-context
+    // attention.  Cost: O(N * (P + K)) work per generation; we lose
+    // the spec-decode batched-verify speedup.  This is a CORRECTNESS-
+    // first temporary path until iter-66 lands cross-length SDPA in
+    // batched prefill (Option A from ADR-030 iter-64 status log).
+    //
+    // Drafter cache is reset each round and re-fed the full prior ctx.
     while output.len() - prompt_tokens.len() < max_new_tokens {
-        let captured_seq_len = captured.seq_len;
-
-        // 1. Extract drafter input from captured
-        let drafter_concat_vec = extract_drafter_concat(
-            &captured.hidden_output,
-            &combined_capture_ids,
-            &drafter_cfg.target_layer_ids,
-            captured_seq_len,
-            hs,
-        )?;
-        let target_hidden_concat = {
-            let (exec, _reg) = gpu.split();
-            let dev = exec.device();
-            let mut buf = dev
-                .alloc_buffer(
-                    drafter_concat_vec.len() * 4,
-                    mlx_native::DType::F32,
-                    vec![captured_seq_len, drafter_cfg.target_layer_ids.len() * hs],
-                )
-                .map_err(|e| anyhow::anyhow!("generate: alloc target_hidden_concat: {e}"))?;
-            buf.as_mut_slice::<f32>()
-                .map_err(|e| anyhow::anyhow!("generate: target_hidden_concat slice: {e}"))?
-                .copy_from_slice(&drafter_concat_vec);
-            buf
-        };
-
-        // 2. Build draft block + embed via target's embed_tokens
+        // 1. Build the drafter's input block: [last_token, mask × K]
         let mut block: Vec<u32> = Vec::with_capacity(block_size as usize);
         block.push(last_token);
         block.extend(
@@ -606,7 +596,56 @@ pub fn dispatch_dflash_generate(
             .embed_tokens(&block, gpu)
             .map_err(|e| anyhow::anyhow!("generate: embed_tokens: {e}"))?;
 
-        // 3. Drafter forward
+        // 2. Build the drafter's context: target hidden at positions
+        //    [0..output.len()-1) — i.e. all committed tokens EXCEPT
+        //    last_token (last_token is the drafter's block[0] query).
+        //    We re-prefill once before the drafter forward to capture
+        //    the target's hidden states for those positions.
+        let prior_ctx_len = output.len() - 1;
+        debug_assert!(prior_ctx_len >= prompt_tokens.len() - 1);
+        let prior_ctx_tokens: &[u32] = &output[..prior_ctx_len];
+        let prior_session = DFlashCaptureSession::new(
+            combined_capture_ids.clone(),
+            prior_ctx_len,
+            hs,
+            false,
+        );
+        target.install_dflash_capture(prior_session);
+        let _ = target
+            .forward_prefill_batched(prior_ctx_tokens, max_decode_for_alloc, 0, gpu)
+            .map_err(|e| anyhow::anyhow!("generate: prior-ctx prefill: {e}"))?;
+        let prior_captured = target
+            .take_dflash_capture()
+            .ok_or_else(|| anyhow::anyhow!("generate: prior-ctx capture vanished"))?;
+
+        // 3. Extract drafter_concat from the prior-ctx capture and
+        //    upload to GPU.  drafter cache is reset before the forward
+        //    so it appends the FULL prior ctx as fresh K/V.
+        let drafter_concat_vec = extract_drafter_concat(
+            &prior_captured.hidden_output,
+            &combined_capture_ids,
+            &drafter_cfg.target_layer_ids,
+            prior_ctx_len,
+            hs,
+        )?;
+        let target_hidden_concat = {
+            let (exec, _reg) = gpu.split();
+            let dev = exec.device();
+            let mut buf = dev
+                .alloc_buffer(
+                    drafter_concat_vec.len() * 4,
+                    mlx_native::DType::F32,
+                    vec![prior_ctx_len, drafter_cfg.target_layer_ids.len() * hs],
+                )
+                .map_err(|e| anyhow::anyhow!("generate: alloc target_hidden_concat: {e}"))?;
+            buf.as_mut_slice::<f32>()
+                .map_err(|e| anyhow::anyhow!("generate: target_hidden_concat slice: {e}"))?
+                .copy_from_slice(&drafter_concat_vec);
+            buf
+        };
+        drafter_cache.reset();
+
+        // 4. Drafter forward → h_final shape [block_size, hidden]
         let h_final = {
             let (exec, reg) = gpu.split();
             let device = exec.device();
@@ -619,12 +658,14 @@ pub fn dispatch_dflash_generate(
                 drafter_cache,
                 drafter_cfg,
                 block_size,
-                captured_seq_len as u32,
+                prior_ctx_len as u32,
             )
             .context("generate: drafter forward")?
         };
 
-        // 4. lm_head per position on drafter's h_final → drafts
+        // 5. lm_head per position on drafter's h_final → K drafts
+        //    (index 0 is for last_token's position which we already
+        //    know; we want predictions at positions 1..block_size).
         let drafts: Vec<u32> = {
             let h_final_slice: &[f32] = h_final
                 .as_slice::<f32>()
@@ -636,67 +677,62 @@ pub fn dispatch_dflash_generate(
             all_argmaxes[1..].to_vec()
         };
 
-        // 5. Target verify with capture (combined IDs) at seq_pos
-        let verify_input: Vec<u32> = std::iter::once(last_token)
-            .chain(drafts.iter().copied())
-            .collect();
-        let verify_seq_len = verify_input.len();
+        // 6. Verify: re-prefill `output + drafts` from start_pos=0,
+        //    capture all positions, compute argmaxes at the last
+        //    `block_size` positions (= verify positions).
+        let mut verify_prefix: Vec<u32> = output.clone();
+        verify_prefix.extend(drafts.iter().copied());
+        let verify_prefix_len = verify_prefix.len();
         let verify_session = DFlashCaptureSession::new(
             combined_capture_ids.clone(),
-            verify_seq_len,
+            verify_prefix_len,
             hs,
             false,
         );
         target.install_dflash_capture(verify_session);
-        let _verify_first_token = target
-            .forward_prefill_batched(&verify_input, 0, seq_pos, gpu)
+        let _verify_last_argmax = target
+            .forward_prefill_batched(&verify_prefix, max_decode_for_alloc, 0, gpu)
             .map_err(|e| anyhow::anyhow!("generate: verify forward: {e}"))?;
-        let next_captured = target
+        let verify_captured = target
             .take_dflash_capture()
             .ok_or_else(|| anyhow::anyhow!("generate: verify capture vanished"))?;
 
-        // 6. Extract final-layer slab + per-position argmaxes
+        // 7. Extract final-layer slab + per-position argmaxes at ALL
+        //    positions, then take the last `block_size` argmaxes as
+        //    target_argmaxes for accept-prefix.
         let final_slab = extract_final_layer_slab(
-            &next_captured.hidden_output,
+            &verify_captured.hidden_output,
             &combined_capture_ids,
             final_layer_idx,
-            verify_seq_len,
+            verify_prefix_len,
             hs,
         )?;
-        let target_argmaxes = target
+        let all_argmaxes = target
             .per_position_argmax_from_hidden_opt(
                 &final_slab,
-                verify_seq_len as u32,
+                verify_prefix_len as u32,
                 true,
                 gpu,
             )
             .map_err(|e| anyhow::anyhow!("generate: target argmax: {e}"))?;
+        // Verify positions are [output.len() - 1 .. output.len() - 1 +
+        // block_size] of the prefill.  argmax_at_verify_start =
+        // pred-after-last_token = compare to draft_1; etc.
+        let verify_start = output.len() - 1;
+        let verify_end = verify_start + block_size as usize;
+        debug_assert_eq!(verify_end, verify_prefix_len);
+        let target_argmaxes: Vec<u32> =
+            all_argmaxes[verify_start..verify_end].to_vec();
 
-        // 7. Accept-prefix
+        // 8. Accept-prefix
         let round = step_round_from_argmaxes(&drafts, &target_argmaxes, eos_token_ids);
 
-        // 8. Target KV rollback (drafter cache does NOT roll back — its
-        //    seq_len only tracks ctx positions, which are trimmed to
-        //    accepted-only via trim_capture_to in step 10 BELOW).
-        let rollback = drafts.len().saturating_sub(round.accept_count);
-        if rollback > 0 {
-            target.rollback_kv(rollback);
-        }
+        // 9. NO target rollback — next round's re-prefill from start_pos=0
+        //    overwrites all positions.  Cache state is naturally reset.
 
-        // 9. Append committed tokens + advance state
-        let n_committed = round.committed_tokens.len();
+        // 10. Append committed tokens + advance state
         output.extend(round.committed_tokens.iter().copied());
-        seq_pos += n_committed;
         last_token = *round.committed_tokens.last().unwrap();
-
-        // 10. Trim captured to only the target-accepted positions before
-        //     handing to next round's drafter (mirrors Python model_mlx.py:567
-        //     `hidden = hidden[:, :accepted + 1, :]`). Without this, drafter
-        //     would see all K+1 verify positions as ctx, including rejected
-        //     ones — breaks Phase 4 coherence.
-        let mut next_captured = next_captured;
-        super::hidden_capture::trim_capture_to(&mut next_captured, n_committed);
-        captured = next_captured;
 
         if round.hit_eos {
             break;
@@ -1027,13 +1063,15 @@ mod tests {
         // -----------------------------------------------------------------
         eprintln!("[e2e] BASELINE: single-token decode for N={max_new_tokens} tokens");
         let t_baseline = std::time::Instant::now();
-        // Size full-attention KV cache to `prompt_len + max_new_tokens`
-        // by passing max_decode_tokens=max_new_tokens (see linear_capacity
-        // calculation at forward_prefill_batched.rs:295).  Otherwise
-        // forward_decode at position prompt_len + i fails the capacity
-        // check.
+        // Size full-attention KV cache to accommodate BOTH the baseline
+        // forward_decode loop AND the subsequent SPEC re-prefill (which
+        // grows to prompt_len + max_new_tokens + block_size - 1 in the
+        // worst-case round).  Use the larger of the two so hybrid_kv
+        // (lazy-alloc'd on first prefill, preserved by iter-63 fix) is
+        // big enough for both paths.
+        let max_decode_for_alloc = max_new_tokens + block_size as usize - 1;
         let first_token_baseline = target
-            .forward_prefill_batched(&prompt_tokens, max_new_tokens, 0, &mut gpu)
+            .forward_prefill_batched(&prompt_tokens, max_decode_for_alloc, 0, &mut gpu)
             .expect("baseline initial prefill");
         let mut baseline_new: Vec<u32> = vec![first_token_baseline];
         let mut last_tok = first_token_baseline;

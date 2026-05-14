@@ -837,3 +837,77 @@ prefill's SDPA is self-attention over current chunk only.
   capacity check accounts for `start_pos`.
 - `src/inference/spec_decode/dflash/orchestrator.rs` (dispatch_dflash_generate)
   — `max_decode_tokens = max_new_tokens + block_size - 1` for cache sizing.
+
+### iter-65 (2026-05-14) — COHERENCE GATE GREEN ✅
+
+**Mission state at start**: iter-64 surfaced Bug 5 (batched-prefill SDPA is
+self-attention only).  Decision: implement Option C (re-prefill full
+prefix from start_pos=0 each round) — orchestrator-only correctness path,
+defer Option A (cross-length SDPA) to perf iteration.
+
+**Option C implementation**: rewrote `dispatch_dflash_generate`'s
+multi-round loop.  Each round:
+1. Re-prefill the prior context `output[0..output.len()-1]` from
+   start_pos=0 with capture installed (gets target hidden states for
+   the drafter's input).
+2. Reset drafter cache via `DFlashKvCache::reset()`.
+3. Drafter forward over the FULL prior ctx (drafter cache rebuilt
+   each round).
+4. Build `verify_prefix = output + drafts`, re-prefill from start_pos=0
+   with capture installed.
+5. `per_position_argmax_from_hidden_opt` on the captured final-layer
+   slab; take argmaxes at `[output.len()-1 .. output.len()-1+block_size]`
+   = the verify positions.
+6. Accept-prefix, append committed tokens; NO target rollback (next
+   round re-prefills from 0 anyway).
+
+**Performance trade**: O(N²) cost vs spec-decode's intended O(N·K).
+For N=8, K=7 on M5 Max: ~1.5 s vs baseline 0.16 s ≈ 10× slowdown.
+Acceptable for the correctness gate; Option A (cross-length SDPA) is
+the perf path for iter-66+.
+
+**Bug 6 — FIXED**: capture hook read pf_hidden async, got stale data.
+- Symptom: even with Option C in place, the coherence gate STILL failed
+  at pos 1.  DIAG2 traced the issue: `forward_prefill_batched(13 tokens)`
+  returned first_token=236778 ✓ (= baseline), but capture+per_position
+  on the SAME prefill returned 191232 at position 12.
+- Root cause: the dflash capture hook at
+  `forward_prefill_batched.rs:2216` CPU-reads `pf_hidden` via
+  `as_slice()`.  Production uses fire-and-forget `s.commit()` between
+  layers (per the layer-boundary comment at line 2015-2034) — the GPU
+  may not have finished writing pf_hidden when the CPU read happens.
+  `as_slice` returned stale data (from the PRIOR layer or initial
+  zeros), so the captured slab was the wrong layer's output → wrong
+  argmaxes → wrong commits.
+- Fix: gate the `sync_per_layer` flag (which triggers `s.finish()`
+  commit-and-wait between layers) on `self.dflash_capture.is_some()`.
+  Bit-identical for production callers (none install dflash_capture);
+  adds ~30 sync points per token-position when spec-decode is running,
+  which is acceptable since each verify forward only runs once per
+  round.
+
+**Coherence gate verdict** (e2e_dispatch_dflash_generate_gemma4_26b):
+
+```
+baseline_new = [236743, 236778, 236862, 236778, 236881, 107, 236776, 236787]
+spec_new     = [236743, 236778, 236862, 236778, 236881, 107, 236776, 236787]
+COHERENCE PASS: spec_new == baseline_new for all 8 tokens
+```
+
+✅ All 8 new tokens byte-identical between single-token decode and
+DFlash spec-decode at temp=0.  Wall time: SPEC 1.51 s vs BASELINE
+0.16 s on M5 Max.
+
+**Code artifacts (iter-65)**:
+- `src/inference/spec_decode/dflash/orchestrator.rs` —
+  `dispatch_dflash_generate` rewritten to Option C (re-prefill each
+  round from start_pos=0, drafter cache reset, no target rollback).
+- `src/serve/forward_prefill_batched.rs` — `sync_per_layer` gates on
+  `self.dflash_capture.is_some()` so capture hook reads land
+  post-GPU-flush.
+
+**iter-66+ work** (deferred): Option A (cross-length SDPA in
+flash_attn_prefill) for perf parity.  Option C's O(N²) cost makes
+DFlash spec-decode currently SLOWER than baseline single-token decode,
+but correctness is proven.  Mission perf gate (≥1.07× hf2q baseline)
+requires Option A.

@@ -2035,10 +2035,26 @@ impl MlxModelWeights {
                 //     wall-clock print is only meaningful when we wait.
                 //   * HF2Q_SYNC_PER_LAYER is set — explicit debug knob
                 //     for bisecting cross-layer correctness issues.
+                // ADR-030 iter-65 (coherence-gate fix): when a DFlash
+                // capture session is installed, the layer-loop hook at
+                // line ~2216 CPU-reads `pf_hidden` via `as_slice()` to
+                // populate the session.  With async `s.commit()` (the
+                // fire-and-forget production default), the GPU has not
+                // necessarily finished writing pf_hidden when the CPU
+                // read happens — `as_slice` returns stale data from the
+                // PRIOR layer (or initial zeros) → captured slab is for
+                // the wrong layer → per_position_argmax produces wrong
+                // values → coherence gate fails at pos 1.  Force
+                // commit-and-wait at every layer when capture is active
+                // so each layer's pf_hidden is GPU-flushed before the
+                // hook reads.  Adds ~30 per-layer sync points (one per
+                // layer per token-position) only when spec-decode is
+                // running; production cmd_generate path is bit-identical.
                 let sync_per_layer = batched_dump.is_some()
                     || std::env::var("HF2Q_PROFILE_LAYERS").is_ok()
                     || std::env::var("HF2Q_SYNC_PER_LAYER").is_ok()
-                    || profile_buckets_on;
+                    || profile_buckets_on
+                    || self.dflash_capture.is_some();
                 if sync_per_layer {
                     if graph_opt_prefill {
                         // ADR-029 iter-39 H40 — sync-mode with fusion.  Mirrors
