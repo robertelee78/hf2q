@@ -427,6 +427,37 @@ pub fn dispatch_dflash_generate_one_round_with_initial_capture(
 /// Composes ALL Phase 4 building blocks into a complete generation
 /// loop. Runs until `max_new_tokens` are emitted OR `hit_eos`.
 ///
+/// # Multi-round invariants (surfaced during iter-58/iter-59 review)
+///
+/// 1. **Target KV ↔ output lag invariant**: at the start of round N,
+///    target's KV ends exactly at `seq_pos`, while `output[seq_pos..]`
+///    contains the last committed token (= verify_input[0] for next
+///    round, fed back via embed). seq_pos += `n_committed` per round;
+///    target's KV grows then truncates to the same end position via
+///    `rollback_kv(K - accept_count)`.
+///
+/// 2. **Drafter ctx trim invariant**: `captured.seq_len` must contain
+///    only TARGET-ACCEPTED positions before feeding to drafter's next
+///    round (else drafter sees rejected ctx). `trim_capture_to` in
+///    step 10 enforces this — mirrors Python `model_mlx.py:567`
+///    `hidden = hidden[:, :accepted + 1, :]`.
+///
+/// 3. **Drafter cache no-rollback invariant**: drafter's `cache.seq_len`
+///    only ever holds accepted ctx (consequence of #2). The K+1 prop
+///    K/V lives in slack via `write_slack_kv`, never advances seq_len,
+///    gets overwritten on next round. Rolling back drafter cache
+///    would erroneously truncate REAL accepted ctx state.
+///
+/// 4. **Captured-hidden permute invariant**: combined capture's
+///    `hidden_output` is row-major `[combined_layer, t, dim]`.
+///    `extract_drafter_concat` produces `[t, drafter_layer, dim]`
+///    flat = `[t, drafter_layer * dim]` 2D-row-major, matching what
+///    `dispatch_dflash_fc` expects.
+///
+/// All four invariants were verified by composition + careful
+/// re-reading; #1 and #4 hold by construction; #2 and #3 required
+/// explicit fixes (iter-58 + iter-59 commits).
+///
 /// Per-round, target's forward_prefill_batched is called ONCE with a
 /// combined capture session covering drafter's `target_layer_ids` ∪
 /// `[final_layer_idx]`. The combined buffer is split into:
