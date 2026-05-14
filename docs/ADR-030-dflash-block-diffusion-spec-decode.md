@@ -911,3 +911,50 @@ flash_attn_prefill) for perf parity.  Option C's O(N²) cost makes
 DFlash spec-decode currently SLOWER than baseline single-token decode,
 but correctness is proven.  Mission perf gate (≥1.07× hf2q baseline)
 requires Option A.
+
+### iter-66 (2026-05-14) — Production wire-up + chat-template coherence regression
+
+**Wire-up landed**: `HF2Q_SPEC_DFLASH=1` env flag now plumbs through
+`cmd_generate` via the new `src/serve/spec_decode_cli.rs` helper.
+Loads the z-lab DFlash drafter (HuggingFace cache path, override via
+`HF2Q_DFLASH_DRAFTER_PATH`), runs `dispatch_dflash_generate`, prints
+the decoded text.  Default-OFF; opt-in for correctness validation on
+user workloads (perf is iter-67+).
+
+Verified on real `gemma-4-26b-a4b-it-ara-abliterated` Q5_K_M:
+```
+$ HF2Q_SPEC_DFLASH=1 hf2q generate ... --prompt "Q: What is 2+2?\nA:" --max-tokens 16
+[HF2Q_SPEC_DFLASH] drafter loaded in 0.09s
+4<turn|><turn|>```markdown
+# Implementation Guide: 2+2
+##
+[HF2Q_SPEC_DFLASH] 16 new tokens in 3.77s (4.2 tok/s)
+```
+
+**New finding (iter-67 work)**: chat-templated CLI prompt produces
+DIFFERENT output between spec-decode and baseline forward_decode:
+
+```
+Baseline (24-tok chat-templated prompt, N=8): "4<turn|><turn|><turn|>**A: "
+SPEC     (24-tok chat-templated prompt, N=8): "4<turn|><turn|>```markdown\n# Implementation"
+```
+
+Diverge at new-token position 3.  But the e2e coherence gate (12-token
+UNTEMPLATED prompt, N=8) still PASSES byte-identity — so the bug is
+prompt-content-sensitive.  Hypotheses for iter-67:
+1. Drafter mis-handles chat-template special tokens (BOS, <start_of_turn>)
+2. Sliding-window attention at templated prompt boundary
+3. verify_prefix construction order bug for specific contents
+4. Capture-sync fix from iter-65 doesn't cover all execution paths
+
+Action: add a second e2e test that reproduces with chat-template
+prompt, then bisect (single forward_prefill + capture vs
+forward_decode) to isolate.
+
+**Code artifacts (iter-66)**:
+- `src/serve/spec_decode_cli.rs` (new, 175 LOC) — env flag parsing,
+  drafter loading, `dispatch_dflash_generate` orchestration, stdout
+  text emission.
+- `src/serve/mod.rs` (cmd_generate insertion, ~15 LOC) — gates the
+  spec-decode helper after prompt-tokens finalization, returns
+  immediately if the helper handles the request.

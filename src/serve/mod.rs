@@ -28,6 +28,7 @@ pub mod provenance;
 pub mod quant_select;
 #[allow(dead_code)]
 pub mod sampler_pure;
+pub mod spec_decode_cli;
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -1273,6 +1274,29 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
     tracing::info!("Running mlx-native forward pass");
     let eos_token_ids: Vec<u32> = vec![1, 106];
+
+    // ADR-030 iter-66 production wire-up — HF2Q_SPEC_DFLASH=1 opt-in
+    // path.  When unset (production default), returns Ok(None) and
+    // execution falls through to the standard prefill + per-token
+    // decode loop below.  When set, loads the z-lab DFlash drafter,
+    // runs dispatch_dflash_generate, prints the decoded text and
+    // returns Ok(Some(())) — caller exits cmd_generate immediately.
+    //
+    // Coherence (temp=0) is byte-identical to single-token decode per
+    // e2e_dispatch_dflash_generate_gemma4_26b.  Performance is slower
+    // than baseline (Option C re-prefill cost) until iter-66+ lands
+    // cross-length SDPA — this is why the flag is opt-in.
+    if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_dflash_spec_decode(
+        &mut mlx_w,
+        &prompt_tokens,
+        args.max_tokens,
+        &eos_token_ids,
+        args.ignore_eos,
+        &tokenizer,
+        &mut ctx,
+    )? {
+        return Ok(());
+    }
 
     // Profiling support
     let mut profiler = forward_mlx::ProfileAccumulator::new(2);
