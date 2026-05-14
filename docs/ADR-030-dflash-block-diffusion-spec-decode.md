@@ -2321,3 +2321,46 @@ Memory cost estimate: gemma-4 sliding cap=1024 × 256 dim × 4 nkv ×
 layers (small).  Total ~55MB additional persistent storage when
 xlen mode is active.
 
+
+### iter-96 — hf2q BF16 xlen cache wire-up (PARTIAL: foundation only)
+
+Extended `HybridKvBuffers` with optional BF16 K/V cache fields:
+- `bf16_xlen_k: Option<MlxBuffer>` (head-major `[nkv, cap, hd]` BF16)
+- `bf16_xlen_v: Option<MlxBuffer>` (same)
+
+`alloc_hybrid_kv_for_layer` lazy-allocates these buffers when env
+`HF2Q_DFLASH_XLEN_SDPA=1` is set.  Default OFF: zero memory overhead.
+
+**Attempted full wire-up of xlen branches** (D=256 + D=512) to read
+from BF16 cache + use BF16 resume kernels.  Result: REGRESSED toy
+prompt coherence (was passing, now fails at position 1 with spec=0).
+
+Most likely causes of regression:
+1. Layout mismatch — `pf_k_perm` stride doesn't match my BF16 cache
+   copy kernel's expectations (despite verifying in iter-82's code
+   review).
+2. Pre-SDPA write timing — the cache might be read before fully
+   populated, despite barrier_between.
+3. The new dispatcher / kernel itself has a layout bug not caught
+   by the simple straight-copy code.
+
+Reverted the xlen branch swaps.  Kept the foundation (HybridKvBuffers
+struct extension, lazy-alloc).  Toy prompt back to ✓ PASS.
+
+**iter-97+ plan**: more careful debug instrumentation of the new
+BF16 cache contents at runtime (dump K[h=0, p=0..N, d=0..8] from
+bf16_xlen_k AFTER post-SDPA hook).  If values match what
+`fused_head_norm_rope`'s direct pf_k_perm output should look like,
+the cache is correctly populated and the bug is in xlen reads.
+Otherwise, the kernel has a layout bug.
+
+### Mission state at iter-96
+
+The mlx-native kernel + dispatcher (iter-95) is shipped to main and
+ready to be plumbed in by iter-97+.  The hf2q-side foundation
+(`HybridKvBuffers.bf16_xlen_k/v` fields + lazy-alloc) is committed
+in this iteration.  Mission canary (Option A + toy) remains ✓ PASS.
+Mission perf gate (≥1.07× baseline) remains OPEN, blocked on
+completing the BF16 cache wire-up that fixes the precision drift
+root-caused at iter-92/93.
+

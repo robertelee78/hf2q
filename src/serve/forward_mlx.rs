@@ -1150,6 +1150,16 @@ pub struct HybridKvBuffers {
     /// `HbKvBuffers::norms_per_pos`.
     #[allow(dead_code)]
     pub norms_per_pos: usize,
+    /// ADR-030 iter-96: BF16 K cache for DFlash spec-decode xlen verify
+    /// path. Same layout `[nkv_heads, capacity, head_dim]` as `k` but BF16
+    /// dtype. Populated from `pf_k_perm` BF16 (head_norm_rope's bf16 output)
+    /// via `dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major`. Used by
+    /// xlen branch's SDPA to read BF16 K bit-identical to what Option C
+    /// reads from pf_k_perm — avoids the F16-roundtrip precision drift
+    /// root-caused at iter-92/93.  Lazy-alloc'd on first xlen-mode call.
+    pub bf16_xlen_k: Option<MlxBuffer>,
+    /// ADR-030 iter-96: BF16 V cache, same semantics as `bf16_xlen_k`.
+    pub bf16_xlen_v: Option<MlxBuffer>,
 }
 
 impl crate::serve::kv_persist::lcp_registry::ByteSized for HybridKvBuffers {
@@ -1208,7 +1218,21 @@ pub(super) fn alloc_hybrid_kv_for_layer(
             .map_err(|e| anyhow::anyhow!("hybrid V norms L{layer_idx}: {e}"))?;
         (v_p, v_n)
     };
-    Ok(HybridKvBuffers { k, v_packed, v_norms, capacity: cap, is_sliding: is_ring, norms_per_pos })
+    // ADR-030 iter-96: lazy-alloc the BF16 xlen cache only when env opted-in.
+    // Saves ~55MB at gemma-4 when xlen mode disabled.
+    let xlen_mode = std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() == Ok("1");
+    let (bf16_xlen_k, bf16_xlen_v) = if xlen_mode {
+        let bk = dev.alloc_buffer(nkv * cap * hd * 2, mlx_native::DType::BF16,
+            vec![nkv, cap, hd])
+            .map_err(|e| anyhow::anyhow!("bf16 xlen K L{layer_idx}: {e}"))?;
+        let bv = dev.alloc_buffer(nkv * cap * hd * 2, mlx_native::DType::BF16,
+            vec![nkv, cap, hd])
+            .map_err(|e| anyhow::anyhow!("bf16 xlen V L{layer_idx}: {e}"))?;
+        (Some(bk), Some(bv))
+    } else {
+        (None, None)
+    };
+    Ok(HybridKvBuffers { k, v_packed, v_norms, capacity: cap, is_sliding: is_ring, norms_per_pos, bf16_xlen_k, bf16_xlen_v })
 }
 
 /// Per-call decode regime override for ADR-007 Gate H two-regime-one-process
