@@ -2161,3 +2161,62 @@ coherence regression is a SUBTLE numerical / content-conditional bug
 that defies a quick fix.  Future iterations should pursue the
 bytes-compare diagnostic above.
 
+
+### iter-92 — Prompt-length sweep + kl_rem analysis (Option A failure pattern)
+
+Tested Option A coherence across prompts of varying length on `e2e_dispatch_dflash_generate_gemma4_26b`:
+
+| Prompt | Tokens | Coherence | Failure round / position |
+|--------|-------:|-----------|--------------------------|
+| "Hi" | 1 | ✓ PASS | (none — all 16 pass) |
+| "What is two plus two?" | 6 | ✗ FAIL | pos 4 (Round 4) |
+| "Explain how transformer..." | 10 | ✗ FAIL | pos 2 (Round 2) |
+| "Q: What is 2+2?\nA:" | 12 | ✓ PASS | (none) |
+| "Tell me about cats and dogs..." | 16 | ✓ PASS | (none) |
+
+kl_rem (K-tile remainder for D=256 sliding kernel, BK=16):
+- 6-tok R4: kL=17, kl_rem=1
+- 10-tok R2: kL=19, kl_rem=3
+- 1-tok all rounds: kl_rem cycles through [9..15, 0..8]
+- 12-tok R1+: kl_rem=4, 5, ...
+- 16-tok R1+: kl_rem=8, 9, ...
+
+Failing kl_rems = {1, 3}.  Passing kl_rems = {0, 2, 4, 5, ..., 15}.
+**Pattern does NOT cleanly correlate with kl_rem** — both 6-tok and
+10-tok fail but at different kl_rems; "Hi" passes through kl_rem=1
+and kl_rem=3 without failing.
+
+**Best current hypothesis**: the failure is determined by a content-
+sensitive numerical path through a specific intermediate layer, where
+the combination of (Q magnitude at certain heads × K state from prior
+prompt) produces a value that's just-barely-different from baseline.
+F16 precision loss can compound over 30 layers + cross-round into a
+detectable argmax difference.
+
+**Action implication**: Option A is currently NOT production-safe for
+arbitrary prompts.  `HF2Q_SPEC_DFLASH=1` defaults to Option C re-
+prefill which is universally coherent.  Mission perf gate (≥1.07×
+baseline) closure requires Option A coherence on all prompts +
+Phase 5 async overlap + high drafter acceptance.
+
+### Mission shipping summary at iter-92
+
+**Repos:**
+- /opt/hf2q: 17 commits across iter-80 → iter-92, all pushed
+- /opt/mlx-native: 3 commits (iter-81 D=256 test, iter-83 BF16 D=512 dispatcher, iter-87 do_causal field), all pushed
+- All test suites GREEN: mlx-native 298/298, hf2q 51/51, mission canary e2e Option A toy 1/1
+
+**Major artifacts shipped:**
+1. `dispatch_flash_attn_prefill_bf16_d512_resume` (mlx-native)
+2. `SdpaParams.do_causal: bool` for DFlash bidirectional drafter path (mlx-native)
+3. F16 D=256 + F16 D=512 byte-identity tests at qL_off>0, align_k=false regime (mlx-native)
+4. BF16-routed D=512 xlen branch in hf2q (iter-84 — fixed L29 NaN for toy)
+5. DFlash drafter bidirectional SDPA for full_attention layer per peer (iter-87)
+6. `HF2Q_TEST_PROMPT` env override for prompt characterization (iter-88)
+7. `HF2Q_DFLASH_PROFILE`-gated per-round accept_count + K/V state instrumentation (iter-82, iter-86, iter-91)
+
+**Open work (deferred to follow-on iterations):**
+- iter-93+: Option A non-toy coherence (content-sensitive numerical bug)
+- Phase 5 async parallel-encode
+- Mission perf gate closure
+
