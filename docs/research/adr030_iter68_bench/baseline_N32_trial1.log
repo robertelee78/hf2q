@@ -6,8 +6,8 @@ hf2q: investigation-only environment variables detected
     HF2Q_BATCHED_PREFILL=1          experimental; errors when seq_len > sliding_window
 
 [ADR-029 H29] Materializing F16 shadows for 30 layers' attn + dense MLP weights...
-[ADR-029 H29] F16 shadow population done in 0.33s
-[hf2q lcp] byte_budget=3085 MB (source=sysinfo available_memory=60 GB × 5%)
+[ADR-029 H29] F16 shadow population done in 0.32s
+[hf2q lcp] byte_budget=2660 MB (source=sysinfo available_memory=51 GB × 5%)
 hf2q load: backend = mlx-native (M5 Max)
 hf2q load: model = Gemma4 Ara 2pass Baseline (arch = gemma4, family = gemma4)
 hf2q load: source = /opt/hf2q/models/gemma-4-26b-a4b-it-ara-abliterated/gemma4-ara-2pass-APEX-Q5_K_M.gguf (19.16 GiB on disk)
@@ -21,11 +21,11 @@ hf2q load: provenance = external
 hf2q load: vision = mmproj-required (no mmproj loaded; pass --mmproj)
 hf2q load: kv_spill = inactive
 hf2q load: tq_kv = inactive
-hf2q load: ready in 2.85 s
+hf2q load: ready in 2.87 s
 Batched prefill: KV=F32, seq_len=24, path=flash-attn
 [ADR-028 Phase 10c] Allocating hybrid_kv (30 layers, F16 K + TQ-HB V 8-bit) [batched]
-Batched prefill complete: 24 tokens in 68.3 ms (351.2 tok/s), first decode token = 236812
-prefill: 24 tok in 93ms (259 tok/s)
+Batched prefill complete: 24 tokens in 68.7 ms (349.5 tok/s), first decode token = 236812
+prefill: 24 tok in 93ms (257 tok/s)
 
 4[HF2Q_TQ_CODEBOOK_BITS] 8-bit Lloyd-Max native HB SDPA (default)
 <turn|><turn|><turn|>**A: 4**<turn|><turn|>/**A: 4**<turn|>
@@ -34,4 +34,4 @@ prefill: 24 tok in 93ms (259 tok/s)
 
 **A: 4
 
---- mlx-native: [ Prompt: 258.5 t/s | Generation: 96.6 t/s ]  (32 gen tokens in 0.33s) ---
+--- mlx-native: [ Prompt: 257.1 t/s | Generation: 97.2 t/s ]  (32 gen tokens in 0.33s) ---

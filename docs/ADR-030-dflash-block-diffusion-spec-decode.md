@@ -1645,3 +1645,87 @@ dead-code-eliminated when xlen_sdpa_mode = false).
   `dispatch_flash_attn_prefill_f16_d256_resume` directly with crafted
   Q/K/V via hf2q's hybrid_kv layout pattern to isolate kernel-call
   correctness from orchestrator-level state.
+
+### iter-79 (2026-05-14) — Flag-OFF perf verification + iter-80 plan
+
+Goal: verify the iter-77+78 forward_prefill_batched additions did NOT
+regress default-path (flag OFF, Option C) performance.
+
+**Bench results** (2 trials, 20s cool-downs):
+
+| N | iter-72 spec t/s | iter-79 spec t/s | delta |
+|---|---|---|---|
+|  8 | 9.55 | 9.45 | −1% (noise) |
+| 16 | 9.45 | 9.45 | 0% |
+| 32 | 9.20 | 9.20 | 0% |
+
+Default path is bit-identical at the perf level: the iter-77+78
+conditional code paths add ~150 LOC each gated on
+`xlen_sdpa_mode = false` by default — these branches dead-code-
+eliminate at runtime when the flag is unset.  Coherence gate also
+re-confirmed GREEN at N=16.
+
+**Algorithmic bisection** of Option A failure mode:
+
+The iter-77 → iter-78 progression showed each fix increases baseline-
+match count.  Looking at iter-78 flag-ON output:
+```
+baseline = [236743, 236778, 236862, 236778, 236881, 107, 236776, 236787,
+            236743, 236778, 236862, 236778, 236881, 107, 236776, 236787]
+spec     = [236743, 0,    134722, 0, 236778, 236862, 236778, 0, 0,
+            236743, 0,    236743, 236778, 236862, 0, 236743]
+```
+
+spec_new[0] = 236743 ✓ (from initial prefill, no spec involved)
+spec_new[1] = 0 ✗ (should be 236778)
+
+The argmax = 0 at first verify position implies the model's logits are
+uniformly small (token 0 wins by tie).  After that, spec_new is
+INTERNALLY CONSISTENT with itself (each spec_new[i+1] = pred-after-
+spec_new[i]) but diverges from baseline.
+
+The fact that the first wrong token is 0 (not random) strongly
+suggests the verify forward returns a UNIFORM hidden state at
+position 0 of the K+1 verify input — i.e. attention isn't computing
+correctly at the FIRST verify position (= absolute position
+start_pos = prompt_len = 12).
+
+**Hypothesis ranking for iter-80**:
+1. **Q[0] reads stale/zero data**: cast chain BF16→F32→F16 may have
+   an off-by-one or layout issue at the first row.  Unit-test the
+   cast by dumping pf_q_perm[0..256] vs pf_q_f16_xlen[0..256] (after
+   chain) at Round 1.
+2. **K/V at position start_pos hasn't been written by the time
+   resume kernel reads it**: even with iter-78's pre-SDPA write,
+   command-buffer ordering might be subtly different than expected.
+   Insert `s.finish()` (commit-and-wait) between the pre-SDPA writes
+   and the SDPA call to enforce strict serialization.
+3. **In-kernel causal mask with qL_off=12 has an edge-case at
+   first Q position**: the kernel's causal logic for Q at absolute
+   position start_pos may need special handling at the tile
+   boundary.  The BF16 D=256 parity test passes (iter-74 finding)
+   but it uses Q at chunk-2 of a fresh KV cache, not at the SAME
+   absolute position as start_pos.
+
+**iter-80 plan**:
+- (a) Add `s.finish()` between pre-SDPA K/V writes and SDPA dispatch
+  to test hypothesis 2 (simplest first; ~5 LOC).
+- (b) If still RED, instrument: dump `pf_q_f16_xlen[0..16]` and
+  expected forward_decode Q at the same position; bisect cast vs
+  SDPA.
+- (c) Investigate whether `hybrid_kv` initial-prefill K/V writes
+  populate positions [0..prompt_len) in a different layout than what
+  resume kernel expects (post-SDPA write differs from pre-SDPA
+  write?).
+
+**Code artifacts (iter-79)**:
+- `docs/research/adr030_iter68_bench/results_iter79.tsv` — perf
+  regression-verification data.
+
+**Mission state at iter-79 end** (default path unchanged):
+- Coherence (flag OFF): GREEN ✓
+- Coherence (flag ON): RED, debugging
+- Production wire-up: ✓ (HF2Q_SPEC_DFLASH=1 routes through Option C)
+- Perf (flag OFF): 0.096× baseline (unchanged from iter-72/77/78)
+- Mission gap: 10.5× — closes only when Option A coherence is fixed
+  and orchestrator path activates.
