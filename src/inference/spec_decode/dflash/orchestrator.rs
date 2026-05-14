@@ -290,13 +290,8 @@ pub fn dispatch_dflash_one_round(
         gpu,
     )?;
 
-    // -------- Step 7: drafter KV rollback (mirror of target's) --------
-    let rollback = drafts.len().saturating_sub(round.accept_count) as u32;
-    if rollback > 0 {
-        for layer in drafter_cache.layers.iter_mut() {
-            layer.rollback(rollback);
-        }
-    }
+    // Step 7: drafter KV cache does NOT roll back (see correctness
+    // note in dispatch_dflash_spec_decode_round_target_side above).
 
     Ok(round)
 }
@@ -633,13 +628,12 @@ pub fn dispatch_dflash_generate(
         // 7. Accept-prefix
         let round = step_round_from_argmaxes(&drafts, &target_argmaxes, eos_token_ids);
 
-        // 8. KV rollbacks
+        // 8. Target KV rollback (drafter cache does NOT roll back — its
+        //    seq_len only tracks ctx positions, which are trimmed to
+        //    accepted-only via trim_capture_to in step 10 BELOW).
         let rollback = drafts.len().saturating_sub(round.accept_count);
         if rollback > 0 {
             target.rollback_kv(rollback);
-            for layer in drafter_cache.layers.iter_mut() {
-                layer.rollback(rollback as u32);
-            }
         }
 
         // 9. Append committed tokens + advance state
