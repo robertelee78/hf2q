@@ -826,6 +826,16 @@ pub fn apply_linear_projection_f32(
     // to fail.  Decode hot-path lm_head goes through `apply_output_head_gpu`
     // which uses the pre-allocated `logits_buf` from `DecodeBuffers` (not
     // this code path), so leaving this device-allocated has no decode cost.
+    // ADR-030 iter-114 — defense-in-depth dtype check.  Every kernel
+    // path below (quantized_matmul_ggml, dense_gemv_bf16_f32,
+    // dense_matmul_bf16_f32_tensor) assumes F32 input.  Passing BF16
+    // would silently mis-stride at the kernel (iter-106 class of bug,
+    // see ADR-030 iter-110/111/112/113 for the mlx-native dispatcher-
+    // level guards).
+    debug_assert_eq!(input.dtype(), DType::F32,
+        "apply_linear_projection_f32: input must be F32 (kernel paths assume F32); got {}",
+        input.dtype());
+
     let out_bytes = (seq_len * out_features) as usize * 4;
     let mut dst = device
         .alloc_buffer(out_bytes, DType::F32, vec![seq_len as usize, out_features as usize])
