@@ -1410,6 +1410,65 @@ impl MlxModelWeights {
         self.dflash_capture.is_some()
     }
 
+    /// ADR-030 Phase 4 — public embed_tokens lookup.
+    ///
+    /// Mirrors the gather+scale embedding inside `forward_prefill_batched`
+    /// (lines 618-641): for each token in `tokens`, copy
+    /// `embed_weight[token_id * hidden_size..]` into the output buffer,
+    /// then scale by `sqrt(hidden_size)` (gemma's embed_scale convention).
+    ///
+    /// Returns a fresh MlxBuffer of shape `[tokens.len(), hidden_size]`
+    /// F32, ready to feed into `dispatch_dflash_model_forward` as `h`.
+    ///
+    /// Used by the DFlash spec-decode orchestrator to embed the
+    /// "block" `[last_committed_token, mask, mask, ..., mask]` before
+    /// the drafter forward.
+    pub fn embed_tokens(
+        &self,
+        tokens: &[u32],
+        gpu: &mut crate::serve::gpu::GpuContext,
+    ) -> anyhow::Result<MlxBuffer> {
+        let hs = self.hidden_size;
+        let n_tokens = tokens.len();
+        if n_tokens == 0 {
+            anyhow::bail!("embed_tokens: empty tokens");
+        }
+        let scale = (hs as f32).sqrt();
+        let (exec, _reg) = gpu.split();
+        let dev = exec.device();
+        let mut out = dev
+            .alloc_buffer(n_tokens * hs * 4, mlx_native::DType::F32, vec![n_tokens, hs])
+            .map_err(|e| anyhow::anyhow!("alloc embed output: {e}"))?;
+        let embed_f32: &[f32] = self
+            .embed_weight
+            .as_slice()
+            .map_err(|e| anyhow::anyhow!("embed_weight slice: {e}"))?;
+        // Validate vocab bound
+        let vocab_in_buf = embed_f32.len() / hs;
+        for &tok in tokens.iter() {
+            if (tok as usize) >= vocab_in_buf {
+                anyhow::bail!(
+                    "embed_tokens: token id {} out of vocab range {}",
+                    tok, vocab_in_buf
+                );
+            }
+        }
+        {
+            let out_slice: &mut [f32] = out
+                .as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("embed output slice: {e}"))?;
+            for (i, &tok) in tokens.iter().enumerate() {
+                let src = (tok as usize) * hs;
+                let dst = i * hs;
+                out_slice[dst..dst + hs].copy_from_slice(&embed_f32[src..src + hs]);
+            }
+            for v in out_slice.iter_mut() {
+                *v *= scale;
+            }
+        }
+        Ok(out)
+    }
+
     /// ADR-030 Phase 4 — compute per-position argmaxes from a
     /// post-last-layer hidden state buffer.
     ///
