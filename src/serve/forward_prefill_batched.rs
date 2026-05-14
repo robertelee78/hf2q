@@ -2701,23 +2701,91 @@ impl MlxModelWeights {
         start_seq_pos: usize,
         gpu: &mut GpuContext,
     ) -> Result<Vec<u32>> {
-        // ADR-028 iter-139 — TEMPORARY DELEGATION to Shape S serial.
+        // ADR-030 Phase 4 (iter-47) — REAL BATCHED BODY.
         //
-        // The Shape B body (single-GraphSession batched matmul over k
-        // tokens, leveraging the iter-137 + iter-138 append-mode wiring
-        // in forward_prefill_batched) lands in iter-140+ once the LM
-        // head/argmax site is parameterized for per-position emission.
+        // Previously a serial delegation (iter-139 TEMPORARY); now
+        // implements the actual batched verify using:
+        //  1. DFlashCaptureSession installed on self
+        //  2. forward_prefill_batched with the layer-loop hook
+        //     capturing the FINAL layer's pf_hidden
+        //  3. per_position_argmax_from_hidden running final_norm +
+        //     lm_head + softcap + argmax for each of the K+1 positions
         //
-        // Until then, this API is functionally CORRECT (output matches
-        // serial forward_decode K+1 times via Shape S) but runs at
-        // Shape S serial speed (k × forward_decode latency) — no
-        // batched speedup yet. Downstream callers can wire to this API
-        // and the speedup materializes when the body is replaced.
+        // Byte-identity invariant: argmaxes[seq_len-1] MUST equal
+        // forward_prefill_batched's returned first_token (the existing
+        // last-row argmax). Both compute identical dispatches on the
+        // identical hidden buffer. Debug-asserted at the bottom.
         //
-        // At greedy temperature, this is byte-identical to calling
-        // forward_decode K+1 times serially — same numerics either way.
-        // The eventual Shape B body will be byte-identical too (just
-        // batched dispatch).
-        self.forward_decode_verify_serial(tokens, start_seq_pos, gpu)
+        // Performance: 1 forward_prefill_batched + K+1 per-position
+        // argmax sessions. The per-position argmax cost is ~5×K small
+        // dispatches (vs the K× forward_decode the serial path did).
+        // Total verify cost ≈ 1 batched forward + small constant.
+        let seq_len = tokens.len() as u32;
+        if seq_len == 0 {
+            anyhow::bail!("forward_decode_verify_batched: empty tokens");
+        }
+        let hs = self.hidden_size;
+        let num_layers = self.layers.len();
+        let final_layer_idx = num_layers - 1;
+
+        // Install a capture session targeting the FINAL layer only.
+        // The Phase 4 orchestrator's drafter-input target_layer_ids
+        // (= [1, 6, 11, 17, 22, 27] for gemma-4) is a separate concern
+        // captured in a different session — that orchestrator wraps
+        // this method and installs its own session in its own call.
+        let session = crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession::new(
+            vec![final_layer_idx],
+            seq_len as usize,
+            hs,
+            true, // with per_position_argmaxes (not used here, but allocated for API consistency)
+        );
+        self.install_dflash_capture(session);
+
+        // Run forward — the layer-loop hook captures pf_hidden into the
+        // installed session at layer_idx = final_layer_idx.
+        let first_token = self
+            .forward_prefill_batched(tokens, 0, start_seq_pos, gpu)
+            .map_err(|e| anyhow::anyhow!("forward_decode_verify_batched: forward: {e}"))?;
+
+        // Take back the populated session.
+        let session = self
+            .take_dflash_capture()
+            .ok_or_else(|| anyhow::anyhow!("forward_decode_verify_batched: session vanished"))?;
+
+        // Extract final layer's [seq_len, hs] slab. With only one
+        // target_layer_id, hidden_output is exactly [seq_len, hs] F32.
+        let final_hidden = session.hidden_output;
+        let expected_len = (seq_len as usize) * hs;
+        if final_hidden.len() != expected_len {
+            anyhow::bail!(
+                "forward_decode_verify_batched: hidden_output len {} != seq_len({}) * hs({}) = {}",
+                final_hidden.len(), seq_len, hs, expected_len
+            );
+        }
+
+        // Compute per-position argmaxes from the captured hidden.
+        let argmaxes = self.per_position_argmax_from_hidden(&final_hidden, seq_len, gpu)?;
+
+        // Byte-identity guarantee: last-position argmax must match
+        // forward_prefill_batched's first_token (same dispatchers,
+        // same hidden row).
+        debug_assert_eq!(
+            argmaxes[(seq_len - 1) as usize],
+            first_token,
+            "forward_decode_verify_batched byte-identity: argmaxes[last] != first_token"
+        );
+        // In release, log a warning rather than panic if invariant
+        // somehow violates — would indicate dispatch nondeterminism.
+        if argmaxes[(seq_len - 1) as usize] != first_token {
+            eprintln!(
+                "[ADR-030 Phase 4 WARNING] forward_decode_verify_batched byte-identity \
+                 violated: argmaxes[{}] = {} but first_token = {}. Coherence at risk.",
+                seq_len - 1,
+                argmaxes[(seq_len - 1) as usize],
+                first_token
+            );
+        }
+
+        Ok(argmaxes)
     }
 }
