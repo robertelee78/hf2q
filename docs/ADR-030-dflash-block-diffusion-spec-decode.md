@@ -2869,3 +2869,32 @@ So the iter-106 dispatch-by-input-dtype class of bug exists in EXACTLY
 THREE mlx-native dispatchers: `rms_norm`, `sdpa`, `sdpa_sliding`.  All
 three are now guarded.
 
+
+### iter-112 — Extended rms_norm family guards (mlx-native 0ea781a)
+
+Continued the iter-110/111 audit into the rms_norm family.  Three more
+dispatchers had silent-corruption risk and now reject mismatched buffer
+dtypes up front:
+
+- `dispatch_rms_norm_mul` (the fused norm + scalar-multiply variant)
+  — kernel selected by input.dtype(); now validates norm_weight, scale,
+  and output match.
+- `dispatch_rms_norm_no_scale_bf16` — hardcoded BF16 kernel; now rejects
+  F32 / F16 callers that would mis-stride.
+- `dispatch_rms_norm_no_scale_f32` — hardcoded F32 kernel; now rejects
+  BF16 / F16 callers.
+
+`dispatch_rms_norm_f32_triple` already had a pre-existing all-F32
+guard from before iter-106 (lines 268, 286).
+
+**Audit-clean total**: the iter-106 dispatch-by-input-dtype class of
+bug now has dispatcher-level guards in EVERY rms_norm dispatcher
+(`rms_norm`, `rms_norm_mul`, `rms_norm_no_scale_bf16`,
+`rms_norm_no_scale_f32`, plus pre-existing `rms_norm_f32_triple`) AND
+the two SDPA dispatchers (`sdpa`, `sdpa_sliding`).
+
+**Total dispatchers guarded across iter-110/111/112**: 7.
+
+298/298 mlx-native + 3503/3503 hf2q tests still GREEN — no existing
+caller relies on mismatched dtype anywhere in the codebase.
+
