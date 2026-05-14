@@ -170,6 +170,137 @@ pub fn dispatch_dflash_spec_decode_round_target_side(
     Ok(round)
 }
 
+/// THE Phase 4 end-to-end one-round orchestrator.
+///
+/// Composes all the proven building blocks into one spec-decode round:
+///
+/// ```text
+///   1. embed_tokens([last, mask*K])           → h [block_size, hs] F32
+///   2. dispatch_dflash_model_forward(
+///        h, target_hidden_concat, drafter ... ) → h_final [block_size, hs] F32
+///   3. per_position_argmax_from_hidden_opt(
+///        h_final, block_size, false, gpu)     → all_argmaxes [block_size]
+///   4. drafts = all_argmaxes[1..]              (Python logits_start=1 — skip pos 0)
+///   5. dispatch_dflash_spec_decode_round_target_side(
+///        target, last_token, drafts, ...)    → RoundResult (target verify + accept + KV rollback)
+///   6. Drafter KV rollback by K - accept_count
+/// ```
+///
+/// Returns the RoundResult; caller appends `committed_tokens` to the
+/// output sequence and advances `current_seq_pos` by
+/// `committed_tokens.len()`.
+///
+/// # Greedy byte-identity invariant (mantra-coherence)
+///
+/// At temperature=0 (no sampler — pure argmax), this function's
+/// committed_tokens is byte-identical to what single-token target
+/// decode would emit. Proof chain:
+/// - Drafter is consulted but its drafts only commit when they match
+///   target's argmax (per step_round_from_argmaxes)
+/// - target.forward_decode_verify_batched is bit-exact same dispatcher
+///   sequence as single-token tail
+/// - target.rollback_kv discards rejected positions
+///
+/// # Arguments
+///
+/// - `target`: target's MlxModelWeights, mutable for verify_batched +
+///   rollback_kv + capture install
+/// - `drafter_tensors`/`drafter_cache`/`drafter_cfg`: drafter state
+/// - `last_committed_token`: most recent token in the output sequence
+/// - `target_hidden_concat`: pre-computed by caller from a prior
+///   target verify's hidden capture (permuted via PrefillCapture)
+/// - `ctx_chunk_size`: number of new ctx positions this round (= 1
+///   per spec-decode step, or N for the initial prompt forward)
+/// - `current_seq_pos`: target's current KV write position
+/// - `block_size`: K+1 (drafts K + the warmup last_committed_token slot)
+/// - `eos_token_ids`: stop conditions
+/// - `gpu`: shared MlxGpu context
+pub fn dispatch_dflash_one_round(
+    target: &mut crate::serve::forward_mlx::MlxModelWeights,
+    drafter_tensors: &super::tensors::DFlashModelTensors,
+    drafter_cache: &mut super::kv_cache::DFlashKvCache,
+    drafter_cfg: &super::config::DFlashConfig,
+    last_committed_token: u32,
+    target_hidden_concat: &mlx_native::MlxBuffer,
+    ctx_chunk_size: u32,
+    current_seq_pos: usize,
+    block_size: u32,
+    eos_token_ids: &[u32],
+    gpu: &mut crate::serve::gpu::GpuContext,
+) -> anyhow::Result<RoundResult> {
+    if block_size < 2 {
+        anyhow::bail!(
+            "dispatch_dflash_one_round: block_size must be >= 2; got {block_size}"
+        );
+    }
+
+    // -------- Step 1: build the draft block --------
+    // [last_committed, mask, mask, ..., mask]
+    let mut block: Vec<u32> = Vec::with_capacity(block_size as usize);
+    block.push(last_committed_token);
+    block.extend(std::iter::repeat(drafter_cfg.mask_token_id).take((block_size - 1) as usize));
+
+    // -------- Step 2: embed via target's embed_tokens --------
+    let h = target
+        .embed_tokens(&block, gpu)
+        .map_err(|e| anyhow::anyhow!("one_round: embed_tokens: {e}"))?;
+
+    // -------- Step 3: drafter forward --------
+    let h_final = {
+        let (exec, reg) = gpu.split();
+        let device = exec.device();
+        super::forward::dispatch_dflash_model_forward(
+            reg,
+            device,
+            &h,
+            target_hidden_concat,
+            drafter_tensors,
+            drafter_cache,
+            drafter_cfg,
+            block_size,
+            ctx_chunk_size,
+        )
+        .map_err(|e| anyhow::anyhow!("one_round: drafter forward: {e}"))?
+    };
+
+    // -------- Step 4: per-position argmax via target's lm_head --------
+    // The drafter applied its own norm; pass apply_final_norm=false.
+    let all_argmaxes: Vec<u32> = {
+        let h_final_slice: &[f32] = h_final
+            .as_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("one_round: h_final slice: {e}"))?;
+        let host_copy: Vec<f32> = h_final_slice.to_vec();
+        target
+            .per_position_argmax_from_hidden_opt(&host_copy, block_size, false, gpu)
+            .map_err(|e| anyhow::anyhow!("one_round: per_position argmax: {e}"))?
+    };
+
+    // -------- Step 5: drafts = argmaxes at positions 1..block_size --------
+    // Position 0 is the embed(last_committed_token) → drafter prediction
+    // for position 0, which corresponds to Python's logits_start=1 skip.
+    let drafts: Vec<u32> = all_argmaxes[1..].to_vec();
+
+    // -------- Step 6: target-side verify + accept + KV rollback --------
+    let round = dispatch_dflash_spec_decode_round_target_side(
+        target,
+        last_committed_token,
+        &drafts,
+        current_seq_pos,
+        eos_token_ids,
+        gpu,
+    )?;
+
+    // -------- Step 7: drafter KV rollback (mirror of target's) --------
+    let rollback = drafts.len().saturating_sub(round.accept_count) as u32;
+    if rollback > 0 {
+        for layer in drafter_cache.layers.iter_mut() {
+            layer.rollback(rollback);
+        }
+    }
+
+    Ok(round)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
