@@ -1410,6 +1410,179 @@ impl MlxModelWeights {
         self.dflash_capture.is_some()
     }
 
+    /// ADR-030 Phase 4 — compute per-position argmaxes from a
+    /// post-last-layer hidden state buffer.
+    ///
+    /// Takes `hidden` of shape `[seq_len, hidden_size]` F32 (the
+    /// `pf_hidden` content after all decoder layers ran, captured via
+    /// the DFlash capture hook with the FINAL layer index included
+    /// in `target_layer_ids`). For each row, runs final_norm +
+    /// lm_head + softcap + argmax. Returns `[seq_len]` u32.
+    ///
+    /// Uses the same model state (final_norm, lm_head_q6k/q8/f16,
+    /// softcap params, activations.{hidden,norm_out,logits,argmax_*})
+    /// as the existing last-row tail in `forward_prefill_batched`.
+    /// Bit-exact same dispatch ordering — guarantees the LAST-position
+    /// argmax this function returns matches `forward_prefill_batched`'s
+    /// own first_token return value when fed the same hidden buffer.
+    ///
+    /// **Not on the production hot path.** Spec-decode verify only.
+    pub fn per_position_argmax_from_hidden(
+        &mut self,
+        hidden: &[f32],
+        seq_len: u32,
+        gpu: &mut crate::serve::gpu::GpuContext,
+    ) -> anyhow::Result<Vec<u32>> {
+        let hs = self.hidden_size;
+        let vocab_size = self.vocab_size;
+        let expected = (seq_len as usize) * hs;
+        if hidden.len() != expected {
+            anyhow::bail!(
+                "per_position_argmax_from_hidden: hidden len {} != seq_len({}) * hs({}) = {}",
+                hidden.len(), seq_len, hs, expected
+            );
+        }
+        let mut argmaxes = Vec::with_capacity(seq_len as usize);
+
+        let (exec, reg) = gpu.split();
+        let dev = exec.device();
+        let metal_dev = dev.metal_device();
+
+        for pos in 0..(seq_len as usize) {
+            // Copy hidden[pos] into activations.hidden via CPU→GPU upload.
+            {
+                let slice: &mut [f32] = self
+                    .activations
+                    .hidden
+                    .as_mut_slice::<f32>()
+                    .map_err(|e| anyhow::anyhow!("activations.hidden slice: {e}"))?;
+                slice[..hs].copy_from_slice(&hidden[pos * hs..(pos + 1) * hs]);
+            }
+
+            // Open session and run final_norm + lm_head + softcap + argmax.
+            let mut s = exec
+                .begin()
+                .map_err(|e| anyhow::anyhow!("per_pos session begin: {e}"))?;
+
+            s.barrier_between(
+                &[&self.activations.hidden, &self.final_norm],
+                &[&self.activations.norm_out],
+            );
+            s.rms_norm(
+                reg,
+                metal_dev,
+                &self.activations.hidden,
+                &self.final_norm,
+                &self.activations.norm_out,
+                &self.activations.norm_params,
+                1,
+                hs as u32,
+            )
+            .map_err(|e| anyhow::anyhow!("per_pos final_norm: {e}"))?;
+
+            if let Some(ref q6k) = self.lm_head_q6k {
+                s.barrier_between(
+                    &[&self.activations.norm_out, &q6k.buffer],
+                    &[&self.activations.logits],
+                );
+                super::forward_mlx::dispatch_qmatmul(
+                    &mut s,
+                    reg,
+                    dev,
+                    &self.activations.norm_out,
+                    q6k,
+                    &mut self.activations.logits,
+                    1,
+                )
+                .map_err(|e| anyhow::anyhow!("per_pos lm_head Q6_K: {e}"))?;
+            } else if let Some(ref q8) = self.lm_head_q8 {
+                s.barrier_between(
+                    &[&self.activations.norm_out, &q8.buffer],
+                    &[&self.activations.logits],
+                );
+                super::forward_mlx::dispatch_qmatmul(
+                    &mut s,
+                    reg,
+                    dev,
+                    &self.activations.norm_out,
+                    q8,
+                    &mut self.activations.logits,
+                    1,
+                )
+                .map_err(|e| anyhow::anyhow!("per_pos lm_head Q8: {e}"))?;
+            } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
+                s.barrier_between(
+                    &[&self.activations.norm_out, lm_head_f16],
+                    &[&self.activations.logits],
+                );
+                mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
+                    s.encoder_mut(),
+                    reg,
+                    metal_dev,
+                    &self.activations.norm_out,
+                    lm_head_f16,
+                    &self.activations.logits,
+                    &mlx_native::ops::dense_gemm::DenseGemmF16Params {
+                        m: 1,
+                        n: vocab_size as u32,
+                        k: hs as u32,
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("per_pos lm_head f16: {e}"))?;
+            } else {
+                anyhow::bail!("per_position_argmax_from_hidden requires lm_head_q6k / q8 / f16");
+            }
+
+            if let Some(cap) = self.final_logit_softcapping {
+                s.barrier_between(
+                    &[&self.activations.logits],
+                    &[&self.activations.logits],
+                );
+                mlx_native::ops::softcap::dispatch_softcap(
+                    s.encoder_mut(),
+                    reg,
+                    metal_dev,
+                    &self.activations.logits,
+                    &self.activations.logits,
+                    &self.activations.softcap_params,
+                    cap,
+                )
+                .map_err(|e| anyhow::anyhow!("per_pos softcap: {e}"))?;
+            }
+
+            s.barrier_between(
+                &[&self.activations.logits],
+                &[&self.activations.argmax_index, &self.activations.argmax_value],
+            );
+            mlx_native::ops::argmax::dispatch_argmax_f32(
+                s.encoder_mut(),
+                reg,
+                metal_dev,
+                &self.activations.logits,
+                &self.activations.argmax_index,
+                &self.activations.argmax_value,
+                &self.activations.argmax_params,
+                vocab_size as u32,
+            )
+            .map_err(|e| anyhow::anyhow!("per_pos argmax: {e}"))?;
+
+            s.finish()
+                .map_err(|e| anyhow::anyhow!("per_pos session finish: {e}"))?;
+
+            let argmax_val: u32 = {
+                let idx: &[u32] = self
+                    .activations
+                    .argmax_index
+                    .as_slice()
+                    .map_err(|e| anyhow::anyhow!("per_pos argmax read: {e}"))?;
+                idx[0]
+            };
+            argmaxes.push(argmax_val);
+        }
+
+        Ok(argmaxes)
+    }
+
     /// Load all model weights directly from a GGUF file into mlx-native
     /// MlxBuffers.
     ///
