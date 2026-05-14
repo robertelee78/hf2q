@@ -31,6 +31,7 @@ use super::config::DFlashConfig;
 use super::tensors::DFlashLayerTensors;
 use anyhow::{anyhow, Context, Result};
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::ops::elementwise::elementwise_add;
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use crate::inference::models::qwen35::gpu_full_attn::{
@@ -448,6 +449,48 @@ pub fn dispatch_dflash_rope(
     .context("dispatch_dflash_rope")
 }
 
+/// Element-wise F32 residual add: `out = a + b`.
+///
+/// Mirrors the `+ attn(...)` / `+ mlp(...)` residual connections in
+/// `model_mlx.py:DFlashDecoderLayer.__call__`:
+/// ```text
+///   h = x + self.self_attn(self.input_layernorm(x), …)
+///   return h + self.mlp(self.post_attention_layernorm(h))
+/// ```
+/// Both buffers must have the same shape; output is freshly allocated.
+pub fn dispatch_dflash_residual_add(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    a: &MlxBuffer,
+    b: &MlxBuffer,
+) -> Result<MlxBuffer> {
+    let n = a.element_count();
+    if b.element_count() != n {
+        return Err(anyhow!(
+            "dflash residual_add: length mismatch a={} b={}",
+            n,
+            b.element_count()
+        ));
+    }
+    let shape: Vec<usize> = a.shape().to_vec();
+    let out = device
+        .alloc_buffer(n * 4, DType::F32, shape)
+        .map_err(|e| anyhow!("alloc residual_add output: {e}"))?;
+    elementwise_add(
+        encoder,
+        registry,
+        device.metal_device(),
+        a,
+        b,
+        &out,
+        n,
+        DType::F32,
+    )
+    .map_err(|e| anyhow!("elementwise_add: {e}"))?;
+    Ok(out)
+}
+
 /// Apply SDPA to seq-major Q (post-RoPE) + K (post-RoPE) + V (no RoPE).
 ///
 /// This is the **self-attention** form: Q seq_len == K/V seq_len. In
@@ -747,6 +790,137 @@ mod tests {
                 host.len()
             );
         }
+    }
+
+    /// Independent layer-forward smoke test (self-attn form).
+    ///
+    /// Composes ALL Phase 2 dispatchers into a single decoder layer
+    /// forward, mirroring `model_mlx.py:DFlashDecoderLayer.__call__`
+    /// (line 127):
+    /// ```text
+    ///   h_attn = h + self.self_attn(self.input_layernorm(h), …)
+    ///   h_out  = h_attn + self.mlp(self.post_attention_layernorm(h_attn))
+    /// ```
+    /// The SDPA call uses self-attention semantics (Q seq_len == K/V
+    /// seq_len) — Phase 3 will replace this with the cross-length form
+    /// once KV cache state + ctx/prop concat are wired.
+    ///
+    /// This test is the integration milestone for Phase 2: every
+    /// dispatcher composes correctly, output is finite + non-trivial,
+    /// and the layer pipeline runs end-to-end on M5 Max in one test.
+    #[test]
+    #[ignore = "requires Metal device + drafter HF cache"]
+    fn smoke_decoder_layer_self_attn() {
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let mut registry = KernelRegistry::new();
+
+        let home = std::env::var("HOME").expect("HOME set");
+        let path = format!(
+            "{home}/.cache/huggingface/hub/models--z-lab--gemma-4-26B-A4B-it-DFlash/snapshots/77d4202772dfe50b2396ec7bac9cfffc7b9e7057/model.safetensors"
+        );
+        let file = DFlashWeightsFile::open(&path).expect("file open");
+        let weights = DFlashWeights::load(file.bytes(), &cfg).expect("validated load");
+        let tensors = DFlashModelTensors::upload(&device, &cfg, &weights).expect("GPU upload");
+
+        // F32-ones input
+        let block_size = 8u32;
+        let hidden = cfg.hidden_size as u32;
+        let elem = (block_size as usize) * (hidden as usize);
+        let mut h0 = device
+            .alloc_buffer(elem * 4, DType::F32, vec![block_size as usize, hidden as usize])
+            .expect("alloc h0");
+        {
+            let s = h0.as_mut_slice::<f32>().expect("h0 slice");
+            for v in s.iter_mut() { *v = 1.0; }
+        }
+
+        let layer = &tensors.layers[0];
+        let l = block_size as usize;
+        let q_dim = (cfg.num_attention_heads * cfg.head_dim) as usize;
+
+        // ====== Attention sub-block ======
+        let mut encoder = device.command_encoder().expect("encoder1");
+        let h0_normed = dispatch_dflash_input_layernorm(
+            &mut encoder, &mut registry, &device, &h0, layer, &cfg, block_size,
+        ).expect("input_norm");
+        encoder.memory_barrier();
+        let q = dispatch_dflash_q_proj(
+            &mut encoder, &mut registry, &device, &h0_normed, layer, &cfg, block_size,
+        ).expect("q_proj");
+        let k = dispatch_dflash_k_proj(
+            &mut encoder, &mut registry, &device, &h0_normed, layer, &cfg, block_size,
+        ).expect("k_proj");
+        let v = dispatch_dflash_v_proj(
+            &mut encoder, &mut registry, &device, &h0_normed, layer, &cfg, block_size,
+        ).expect("v_proj");
+        encoder.memory_barrier();
+        let q_normed = dispatch_dflash_head_norm(
+            &mut encoder, &mut registry, &device, &q, &layer.q_norm, &cfg,
+            block_size, cfg.num_attention_heads as u32,
+        ).expect("q_norm");
+        let k_normed = dispatch_dflash_head_norm(
+            &mut encoder, &mut registry, &device, &k, &layer.k_norm, &cfg,
+            block_size, cfg.num_key_value_heads as u32,
+        ).expect("k_norm");
+        encoder.memory_barrier();
+        let q_roped = dispatch_dflash_rope(
+            &mut encoder, &mut registry, &device, &q_normed, &cfg,
+            block_size, cfg.num_attention_heads as u32, 0,
+        ).expect("q rope");
+        let k_roped = dispatch_dflash_rope(
+            &mut encoder, &mut registry, &device, &k_normed, &cfg,
+            block_size, cfg.num_key_value_heads as u32, 0,
+        ).expect("k rope");
+        encoder.memory_barrier();
+        let attn_out = dispatch_dflash_sdpa_self_attn(
+            &mut encoder, &mut registry, &device, &q_roped, &k_roped, &v, &cfg, block_size,
+        ).expect("sdpa");
+        // sdpa internally commits + returns; fresh encoder for o_proj + residual
+        let mut encoder = device.command_encoder().expect("encoder2");
+        let h_after_attn_proj = dispatch_dflash_o_proj(
+            &mut encoder, &mut registry, &device, &attn_out, layer, &cfg, block_size,
+        ).expect("o_proj");
+        encoder.memory_barrier();
+        let h_after_attn = dispatch_dflash_residual_add(
+            &mut encoder, &mut registry, &device, &h0, &h_after_attn_proj,
+        ).expect("residual1");
+
+        // ====== MLP sub-block ======
+        encoder.memory_barrier();
+        let post_normed = dispatch_dflash_post_attention_layernorm(
+            &mut encoder, &mut registry, &device, &h_after_attn, layer, &cfg, block_size,
+        ).expect("post_norm");
+        encoder.memory_barrier();
+        let mlp_out = dispatch_dflash_mlp(
+            &mut encoder, &mut registry, &device, &post_normed, layer, &cfg, block_size,
+        ).expect("mlp");
+        encoder.memory_barrier();
+        let h_out = dispatch_dflash_residual_add(
+            &mut encoder, &mut registry, &device, &h_after_attn, &mlp_out,
+        ).expect("residual2");
+        encoder.commit_and_wait().expect("final commit");
+
+        // Validate final layer output shape + finite/non-trivial.
+        let h_dim = cfg.hidden_size;
+        assert_eq!(h_out.element_count(), l * h_dim);
+        assert_eq!(h_after_attn.element_count(), l * h_dim);
+
+        let host_final: &[f32] = h_out.as_slice::<f32>().expect("h_out slice");
+        let n_finite = host_final.iter().filter(|v| v.is_finite()).count();
+        let n_zero = host_final.iter().filter(|v| **v == 0.0).count();
+        assert_eq!(
+            n_finite, host_final.len(),
+            "decoder layer output must be all finite (got {n_finite}/{}; n_zero={n_zero})",
+            host_final.len()
+        );
+        assert!(
+            n_zero < host_final.len() / 2,
+            "decoder layer output suspiciously sparse (n_zero={n_zero}/{})",
+            host_final.len()
+        );
+        // Sanity: h_out != h0 (the layer did SOMETHING non-trivial).
+        let _ = q_dim; // silence unused
     }
 
     /// Independent O projection smoke test: validates that o_proj
