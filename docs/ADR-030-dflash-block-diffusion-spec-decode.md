@@ -2834,3 +2834,38 @@ Repo shipped:
 Future RMSNorm callers across mlx-native consumers will now get a
 clear early-error instead of corrupted hidden states downstream.
 
+
+### iter-111 — SDPA dispatcher dtype-coherence guard (mlx-native f13ec33)
+
+Extended the iter-110 audit to all mlx-native dispatchers that select
+their kernel pipeline by a single buffer's dtype.  Two more dispatchers
+matched the iter-106 risk pattern:
+
+- `sdpa()` (sdpa.rs:222) selects `sdpa_{bf16,f32}` from `q.dtype()`.
+- `sdpa_sliding()` (sdpa_sliding.rs:239) selects `sdpa_sliding_{bf16,f32}`
+  from `q.dtype()`.
+
+Both kernels read K, V and write output at the Q-dtype stride.  The
+pre-existing `validate_buffer` only checked each buffer's `byte_len`
+against its OWN declared dtype, allowing mismatched K/V/output dtypes
+to slip through.  Both now reject mismatched dtypes up front with
+clear `InvalidArgument` errors.
+
+Audit-clean by exhaustion: 298/298 mlx-native + 3503/3503 hf2q tests
+GREEN with both new guards landed.  No existing caller was relying on
+a mismatched-dtype SDPA dispatch.
+
+**Audit also confirmed**:
+- `flash_attn_prefill_{bf16,f16}_d{256,512}` use hard-coded dtype-named
+  kernel constants (`K_BF16_D256`, `K_F16_D256`, etc) — the caller picks
+  the right dispatcher, no dispatch-by-input-dtype risk.
+- `flash_attn_vec_hybrid` uses a function constant (`v_is_f16` slot 51)
+  for V dtype specialization — GPU-side branching, no caller-side
+  mismatch possible.
+- `dense_mm_{bf16,f16,f32}` dispatchers are dtype-named — caller picks
+  explicitly.
+
+So the iter-106 dispatch-by-input-dtype class of bug exists in EXACTLY
+THREE mlx-native dispatchers: `rms_norm`, `sdpa`, `sdpa_sliding`.  All
+three are now guarded.
+
