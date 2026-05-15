@@ -1,9 +1,70 @@
 # ADR-031: Parallel-encode the gemma4 decode forward path
 
-- **Status**: accepted (2026-05-14, Phase A start pending operator green-light)
+- **Status**: Phase A LANDED 2026-05-14 (merge `c7f98865`); Phase B/C pending separate CFA sessions
 - **Date**: 2026-05-14
 - **Deciders**: operator (max3@agidreams.us)
 - **Tags**: performance, decode, metal, gemma4, peer-parity
+
+## Phase A landing — 2026-05-14 (merge `c7f98865`)
+
+Mechanical layer-body extraction shipped via CFA review-only workflow (queen
+Phase 1 spec → claude-impl 5 substeps A1-A5 → codex review → queen Phase 3
+judgment 88/100 approve → operator gate green on tg100 alt-pair).
+
+**Commits merged** (preserved via `git merge --no-ff`):
+- A1 `38e6aa57` — `LayerCtx` +4 fields, `kv_info` usize type fix
+- A2 `818cea1d` — `encode_one_layer` stub signature fix + `LayerCtx` pre-loop construct
+- A3 `c748cd46` — parallel copy of 2,278 LOC body into `encode_one_layer`
+- A4 `f02495c8` — switch forward_decode loop to `self.encode_one_layer(...)`
+- A5 `526e6f70` — cleanup placeholder comments, drop 4 unused LayerCtx fields
+
+**Final diff**: 2 files (`src/serve/forward_mlx.rs`, `src/serve/layer_ctx.rs`),
++676 / -674 lines net via parallel-copy-then-strip strategy.
+
+**Scope correction** (vs the planning numbers above): the actual extracted
+body was lines 3513-5792 = **2,280 LOC**, not the "3279-6268 = 2,989 LOC"
+this ADR's Context section originally claimed.  Lines 3279-3288 are a
+separate KV bookkeeping loop and 3289-3512 are session-begin pre-work —
+both stayed in `forward_decode`.  Queen caught this during Phase 1
+planning and the spec scoped against the corrected range.
+
+**Gates** (M5 Max, alt-pair thermal-fair, σ<1% per arm, 75s cool-downs):
+
+| Gate | Result |
+|---|---|
+| `cargo build --release` | clean |
+| `coherence_smoke` | 2/2 PASS in 27.40s |
+| `sourdough_gate` × 3 | PASS 3/3 (2045 byte common prefix ≥ 179 floor) |
+| `clippy --release -D warnings` | no new lints vs `9d08bcd6` baseline |
+| Chesterton's fence | 0 `&mut self` references inside `encode_one_layer` body |
+| `tg100` Phase A warmed (4 runs) | 96.23 ± 0.15 t/s (σ 0.16%) |
+| `tg100` MAIN baseline (3 runs) | 96.10 ± 0.14 t/s (σ 0.15%) |
+| peer-FA tg100 (4 runs) | 104.77 ± 0.6 t/s |
+| Phase A / peer-FA ratio | **0.918×** vs MAIN 0.917× — refactor neutral |
+
+The refactor is byte-identical at decode output (sourdough) AND at perf
+(tg100 within ±0.15 t/s of MAIN; identical peer ratio).
+
+**Spec deviations accepted by queen** (final-report.json):
+1. `LayerCtx` ended at 13 fields instead of planned 17.  4 fields
+   (`input_token`, `num_layers`, `num_attention_heads`, `eps`) dropped in A5
+   because the body reads them via `&self.X` directly — iter-388 invariant
+   is `&mut self == 0`, not `&self == 0`.  Eliminated a clippy lint.
+2. `encode_one_layer(exec: &'sess GraphExecutor, reg: &mut KernelRegistry)`
+   instead of the spec's planned `gpu: &mut GpuContext`.  The outer block in
+   `forward_decode` already has `exec`/`reg` from `gpu.split()`; passing
+   pre-split refs avoids the R5 double-borrow risk the spec itself flagged.
+3. `std::mem::replace(session, exec.begin()?).{finish|finish_with_gpu_time|commit}()`
+   at 14 sites — reorders NEW_BEGIN before OLD_FINISH vs the original
+   `s.finish(); s = exec.begin()?` pattern.  Empirically validated as safe
+   by sourdough 3/3 byte-identity PASS at the only hot-path site (L5468
+   dual_buffer commit); 13 debug-only sites theoretically safe because
+   `exec.begin()` allocates a disjoint `MTLCommandBuffer` descriptor without
+   submitting GPU work.
+
+**Phase B is now unblocked** — `encode_one_layer` is a free-standing method
+that can be invoked from a worker thread via the existing
+`EncoderWorker`+`encoder_worker_singleton` infrastructure (iter-382).
 
 ## Context
 
