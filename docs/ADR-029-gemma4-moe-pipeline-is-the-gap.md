@@ -4357,4 +4357,58 @@ What's holding it back:
 
 Per `feedback_no_premature_mission_close`, gating on firm bench data.
 
+## Iter-175 Step 1s (2026-05-15) — HF2Q_PIPELINE_TG_MULT_HINT REFUTED via 3-cycle re-bench
+
+Per Step 1r plan, ran 3-cycle alt-pair tg100 with 65s cool-downs to firm up the +2.08% signal seen at iter 16.
+
+| Cycle | A (default) | B (HINT=1) |
+|---|---:|---:|
+| C1 | 94.3 | 94.3 |
+| C2 | 95.4 | 95.2 |
+| C3 | 95.2 | 95.0 |
+| **Mean** | **94.97** | **94.83** |
+| σ per arm | 0.59 | 0.45 |
+
+**Delta: −0.14% (within noise; both σ < 0.6).**
+
+### Iter 16's +2.08% finding is REFUTED
+
+The signal trajectory:
+- iter 16 (2-cycle, 60s cool): +2.08% (Arm A 93.80 → Arm B 95.75)
+- iter 18 (2-cycle post-ssm_conv-fix): +0.63%
+- **iter 19 (3-cycle, this Step 1s): −0.14%**
+
+The original iter 16 measurement was a single thermal/PSO-cache artifact. Per the mantra "Measure 3x, cut once" — measured 3x, the signal vanishes.
+
+### What stays valuable from the iter 16-1r chain
+
+1. **`assert_tg_size_multiple_of_32_if_hinted` safety check** (mlx-native `cddf39e`): durable defense against future similar bugs. Caught the qwen3.6 silent corruption that would have shipped under a naive default-flip.
+2. **`ssm_conv.rs` threadgroup-rounding fix** (mlx-native `e7a6b33`): correctness improvement. qwen3.6 path now uses proper multiple-of-32 threadgroup geometry (tg=(3,64,1)=192 instead of (3,85,1)=255). Coherence preserved 2/2 PASS.
+3. **Standing rule** (`feedback_levers_can_widen_opposing_regressions`): single 2-cycle benches can produce 2pp spurious signals. Default to 3+ cycles before drawing perf conclusions.
+
+### Decision
+
+**HF2Q_PIPELINE_TG_MULT_HINT remains DEFAULT-OFF**. The lever has no measurable benefit at gemma4-APEX-Q5_K_M decode tg100. Keep opt-in for future investigation under different shapes or hardware.
+
+### Updated iter-175 ledger after Step 1s
+
+| Step | Hypothesis | Status |
+|---|---|---|
+| 1-1j | various | (see prior steps) |
+| 1k | H-E precompile single-kernel test | CONFIRMED +5.89% |
+| 1l | H-E precompile infra LANDED | default-OFF initially |
+| 1m | H-E precompile validation | DEFAULT-FLIPPED ON (+3-5% prefill) |
+| 1n | gemma4 already smart-barriered | discovery (R2 saved multi-day) |
+| 1o | iter-1 H6 re-falsified | bigger regression at HEAD |
+| 1p | HF2Q_PIPELINE_TG_MULT_HINT (single 2-cycle) | apparent +2.08% |
+| 1q | Safety check caught silent corruption | qwen3.6 ssm_conv UB |
+| 1r | ssm_conv fix + label panic | unblocks universal HINT=1 |
+| **1s** | **3-cycle re-bench refutes 1p finding** | **HINT=1 ≈ neutral; stays default-OFF** |
+
+### Genuine wins from iter-175
+
+- **H-E precompile lever**: +3-5% prefill, default-ON
+- **Safety infrastructure**: assert + ssm_conv fix prevent silent corruption
+- **Comprehensive hypothesis space mapping**: which directions don't work and why
+
 
