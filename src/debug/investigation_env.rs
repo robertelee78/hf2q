@@ -671,6 +671,15 @@ pub struct InvestigationEnv {
     /// Sibling falsification: HF2Q_FUSED_MOE_WSUM_END_LAYER_V2 above.
     /// Standing decision: leave default-off; the dispatch-fusion lever
     /// class appears to lose on Apple Metal at hidden_size=2816, top_k=8.
+    ///
+    /// ADR-029 iter-175 Step 1o RE-BENCH at HEAD (post H-E precompile +
+    /// FC-promote + q6_K_nr2 + many other landed levers): 2-cycle alt-pair
+    /// tg100 with 60s cool-downs:
+    ///   A (default): 96.1, 96.1 → mean 96.10 t/s
+    ///   B (HF2Q_FUSED_TRIPLE_NORM=1): 89.6, 92.7 → mean 91.15 t/s
+    ///   Delta: -5.15% (BIGGER regression than original -2.8%)
+    /// The unfused path benefited more from the accumulated levers than
+    /// the fused path; the gap WIDENED.  Doubly-falsified at HEAD.
     pub fused_triple_norm: bool,
 
     /// `HF2Q_KV_DUAL_LEGACY=1` — force the legacy 2-dispatch K+V cache
