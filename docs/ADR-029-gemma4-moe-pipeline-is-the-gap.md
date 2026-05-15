@@ -3540,3 +3540,80 @@ The remaining 5.4% wall gap is **architecturally bounded** — only a codebase-w
 
 **iter-174 outcome**: The single-iter autonomous /loop investigation is exhausted. The mission is at its structural ceiling for autonomous work. Further closure requires operator-dedicated multi-month refactor commitment, which is outside /loop's autonomous scope.
 
+---
+
+## Iter-175 (2026-05-15) — CRITICAL CORRECTION: iter-174's "parallel-encode is the closure path" verdict EMPIRICALLY FALSIFIED by ADR-031
+
+iter-174 declared the residual 5.4% gap closure required parallel-encode (per iter-165's prediction: "Closing the residual requires implementing parallel CB encoding... Predicted gain: 5-10% wall").  ADR-031 was created to deliver that closure.  ADR-031 Phase B shipped a complete parallel-encode worker-thread implementation (`83c3ea6d`, 2026-05-15).  Then ADR-031 step C0 (`a6fdf252` + `9e88af76`) profiled the implementation under both PARALLEL=0 and PARALLEL=1 with HF2Q_SPLIT_TIMING + HF2Q_PARALLEL_PROFILE diagnostic instrumentation.
+
+**Empirical result invalidates iter-165 + iter-174 predictions**:
+
+| Metric | PARALLEL=0 | PARALLEL=1 |
+|---|---|---|
+| CPU body encode | 0.55 ± 0.06 ms | 0.53 ± 0.04 ms |
+| GPU body wait | 9.05 ± 0.18 ms | 9.05 ± 0.18 ms |
+| Dispatches | **866** | **866** |
+| Barriers | **420** | **420** |
+| tg100 wall t/s | 95.52 ± 1.11 | 95.58 ± 0.62 (Δ +0.06) |
+| tg2000 wall t/s | 92.93 ± 0.32 | 92.43 ± 0.47 (Δ −0.50, within σ) |
+
+**iter-165's math was wrong** because it modeled peer's hypothetical CPU encode as 2 ms (an assumption, not a measurement) and computed `max(2, 8) = 8 ms` for peer's body, comparing to hf2q's `0.46 + 8.70 = 9.16 ms`.  The 1.16 ms predicted savings was a fiction: hf2q's own CPU encode is only **0.46-0.55 ms** which by Amdahl's law caps any CPU-parallelism savings at that amount (~5% of 10.7 ms wall) — and Phase B's overhead eats most of that.
+
+**Why iter-165's header claim ("encoder is NOT the lever") was correct but its decision ("Closing requires parallel CB encoding") was wrong**: the header observed CPU/GPU split = 0.46 ms / 8.70 ms = 5% / 95% — correctly identifying CPU as ~5% of wall.  But then it conflated "we don't yet have parallel encoding" with "parallel encoding is the path."  By Amdahl's law, halving 5% only saves 2.5% — far short of the predicted 5-10% gain.
+
+**Where the gap actually lives** (re-confirmed at iter-175 from same-hardware comparison):
+
+| | hf2q | llama.cpp peer-FA |
+|---|---|---|
+| tg100 t/s | 95.86 | ~104.77 |
+| Dispatches/token | **866** | **1339** |
+| Barriers/token | **420** | **844** |
+| Implied per-dispatch GPU time | ~10.05 µs | **~7.3 µs** (back-computed) |
+
+hf2q has FEWER total dispatches AND FEWER barriers than peer — yet still loses by ~8% wall.  The remaining gap MUST be **per-dispatch GPU kernel execution speed**: peer's individual kernels execute ~2.7 µs faster on average than hf2q's.  Over 866 hf2q dispatches × ~1 µs delta (vs peer's average pace adjusted for dispatch-count difference) ≈ ~0.85 ms/token gap.  The gap is **diffused**, not concentrated in any single kernel — per iter-111's "constant ratio 0.92× across tg100/2000/5000" finding.
+
+### Standing-context corrections (use these going forward)
+
+| Stale standing context (pre-iter-175) | Corrected at iter-175 |
+|---|---|
+| "Closing requires parallel CB encoding... predicted gain 5-10% wall" (iter-165) | **Falsified**.  CPU is 5% of wall; halving caps gain at 2.5%; measured ≈ 0%. |
+| "Closure path is parallel encoding, not multi-CB-commit" (iter-168) | **Falsified for hf2q-on-M5-Max specifically**.  Parallel encoding is the closure path FOR PEER (which has 2 ms CPU encode of 1339 dispatches that benefits from overlap).  hf2q's 0.46 ms CPU encode of 866 dispatches doesn't.  Same code path, different gain because of different CPU/GPU ratio. |
+| "Multi-month refactor closes 5.4% via parallel-encode" (iter-174) | **Falsified**.  Multi-week parallel-encode refactor shipped in ADR-031 Phase B, closed 0% (within noise). |
+| "The /loop autonomous investigation is EXHAUSTED" (iter-174 final memo) | **Re-opened at iter-175 with new framing**: continue iterating on per-kernel GPU speed (the lever that ADR-029 H93 already demonstrated).  Not exhausted — just misdirected. |
+
+### New mission framing post-iter-175
+
+The closure path is **per-kernel GPU execution speed optimization** — continuing ADR-029's H93+ lever ledger.  H93 (iter-162 FC-promote port) closed +1.08-1.26pp via porting one llama.cpp kernel pattern.  The remaining ~5-6% gap has 866 dispatches × ~1 µs per-dispatch room to close.  No single kernel dominates (gap is diffused, per iter-111) but the lever is still per-kernel-by-per-kernel ports + tuning.
+
+### Iter-175 investigation plan
+
+The kernel investigation plan is documented at `/opt/hf2q/docs/research/ADR-029-resumed-per-kernel-investigation-2026-05-15.md`.  Summary:
+
+1. **Step 1**: Per-kernel GPU timing via `mlx_native::pipeline_dispatch_buckets()` + per-kernel cumulative time.  Identify top-5 hottest hf2q kernels by dispatch count × cumulative GPU time.
+2. **Step 2**: For each top-5 kernel, locate the corresponding llama.cpp kernel in `/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal` (single-file 250-300 KB of MSL).  Compare argument-buffer layout, threadgroup size, SIMD-width, memory access patterns, loop unrolling.
+3. **Step 3**: For each candidate slow kernel, port the llama.cpp pattern (preserving sourdough byte-identity + coherence_smoke + thermal-fair bench gates).  Add to the H94+ lever ledger.
+4. **Step 4**: Apple Instruments Metal trace side-investigation (operator-runnable).  Pinpoint specific slow kernels at the Metal driver level.
+5. **Step 5**: Close when hf2q tg100 within ±2% of peer-FA on multi-regime bench.
+
+### Tools available
+
+- `HF2Q_SPLIT_TIMING=1` — CPU/GPU body+head split (already validated, used at iter-115 and ADR-031 C0)
+- `HF2Q_PARALLEL_PROFILE=1` — per-phase µs inside encode_parallel_layers_chunked (added by ADR-031, useful for any parallel-encode investigation)
+- `mlx_native::pipeline_dispatch_buckets()` — per-kernel-name dispatch counts (existing API at `/opt/mlx-native/src/encoder.rs:342`)
+- `mlx_native::barrier_total_ns()` — cumulative barrier wait time (existing API at `/opt/mlx-native/src/encoder.rs:387`)
+- `MTLCaptureManager` — Metal Capture trace (set `MLX_METAL_CAPTURE=<path>` + `METAL_CAPTURE_ENABLED=1`)
+- Apple Instruments Metal System Trace (manual / GUI; operator-driven)
+
+### Iter-175 conclusion
+
+The autonomous /loop investigation is RE-OPENED with corrected framing.  iter-174's verdict was wrong because it inherited iter-165's wrong math.  The mission proceeds with:
+
+- ADR-031 closed (`e33859a0`): parallel-encode infrastructure landed as durable scaffolding (default-OFF, no benefit on current target), Phase A's encode_one_layer refactor kept as durable code-quality win
+- ADR-029 resumed (this iter-175 entry): per-kernel GPU speed work continues from H93 baseline
+- Investigation plan written at `docs/research/ADR-029-resumed-per-kernel-investigation-2026-05-15.md`
+
+The 5-6% gap remains structurally addressable via H94+ kernel ports.  No single dramatic lever closes it; each port adds ~0.5-1.5pp.  Multi-iter /loop work suits this well: pick a kernel, port, bench, ship-or-falsify, repeat.
+
+**ADR-031 spawned to chase a wrong-bottleneck premise.  Lessons applied; mission resumes correctly.**
+
+
