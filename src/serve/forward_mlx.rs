@@ -5228,8 +5228,10 @@ impl MlxModelWeights {
                         // ADR-028 iter-367: HF2Q_FUSED_MOE_WSUM_END_LAYER_V2=1 fuses
                         // moe_weighted_sum INTO this end-of-layer kernel, eliminating
                         // 1 dispatch + moe_accum round-trip from gemma4 decode default.
-                        let use_iter367_fusion = std::env::var("HF2Q_FUSED_MOE_WSUM_END_LAYER_V2")
-                            .ok().as_deref() == Some("1")
+                        // ADR-029 iter-175 Step 1au: cached INVESTIGATION_ENV field
+                        // (parsed once at process start) — was per-layer per-token
+                        // std::env::var call (~70 ns × 30 layers = 2.1 µs/tok savings).
+                        let use_iter367_fusion = INVESTIGATION_ENV.fused_moe_wsum_end_layer_v2
                             && (hs as u32) % 4 == 0
                             && !INVESTIGATION_ENV.skip_weighted_sum;
                         if use_iter367_fusion {
