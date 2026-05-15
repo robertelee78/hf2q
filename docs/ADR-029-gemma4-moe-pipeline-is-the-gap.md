@@ -3917,4 +3917,74 @@ This is the **next /loop-suitable investigation** — replaces the deferred H-E.
 
 Full bench data: `docs/research/ADR-029-iter-175-step-1h-per-kernel-bench-2026-05-15.md`.
 
+## Iter-175 Step 1i (2026-05-15) — per-layer-phase attribution: FFN non-matvec is 37% of wall
+
+Using existing `HF2Q_PER_LAYER_PHASE_GPU_TIME=1` + `HF2Q_FFN_SPLIT=1` instrumentation:
+
+### Per-layer-phase GPU time (sliding layer baseline)
+
+| Phase | µs/layer | Per-token (30 layers) |
+|---|---:|---:|
+| PHASE_ATTN (sliding) | ~98 | 2352 + 810 (global) = **3.17 ms/tok** |
+| PHASE_FFN (sliding) | ~191 | **5.73 ms/tok** |
+
+**FFN is 1.81× more expensive than attn per layer.**
+
+### FFN sub-phase split
+
+| Sub-phase | µs/layer | Per-tok |
+|---|---:|---:|
+| FFN_NORMS (post-attn norm + 3 pre-FF norms + router-norm) | ~104 | ~3.1 ms |
+| **FFN_BODY (MoE pipeline)** | **~182** | **~5.5 ms** |
+| FFN_EOL | ~5.6 | ~0.17 ms |
+
+### Key insight: FFN_NORMS is dispatch-overhead-bound
+
+~104 µs/layer / ~5 norm dispatches = **~20 µs per norm dispatch** (inflated). Real ~10-15 µs.
+
+Each rms_norm reads ~11.3 KB of activations. At 500 GB/s, memory access = ~23 ns. The remaining ~10 µs is **GPU launch overhead + pipeline-state setup + writeback** — matching iter-111's "~1 µs/dispatch" finding at scale (150+ norm dispatches/tok × ~10 µs each = ~1.5 ms launch overhead just for norms).
+
+### Refined wall-budget (Step 1h + Step 1i combined)
+
+| Component | Time | % wall |
+|---|---:|---:|
+| Attn matvec | ~1.86 ms | ~17% |
+| Attn non-matvec (FA + kv_copy + head_norm_rope) | ~1.1 ms | ~10% |
+| FFN matvec (MoE expert + router) | ~1.75 ms | ~16% |
+| **FFN non-matvec (norms + routing + swiglu + weighted_sum)** | **~4.0 ms** | **~37%** |
+| head (lm_head + softmax + argmax) | ~1.0 ms | ~9% |
+| sync + per-dispatch CPU encode | ~1.0 ms | ~9% |
+
+**The biggest chunk is FFN non-matvec at ~37% of wall.** This is where the gap lives.
+
+### Structural levers (in priority order)
+
+**A) FUSION**: combine adjacent norm + small-vector ops into single dispatches. Each saved dispatch ≈ ~10-15 µs × 30 layers = ~300-450 µs/tok = **~3-4% wall per fused site**. Existing `fused_head_norm_rope_f32_v2`, `fused_norm_add_f32_v2`, `fused_post_ff_norm2_endlayer_f32_v2` show hf2q already follows this pattern. Remaining FFN_NORMS sub-phase (4-5 separate norm dispatches per layer) is the candidate.
+
+**B) Reduce pipeline-state changes**: set_compute_pipeline_state is the most expensive per-dispatch ObjC call. Co-locate same-pipeline dispatches. Peer's mem_ranges + concurrent dispatch achieves this (the H-D 3.5pp ceiling).
+
+**C) (Already attempted, falsified at ADR-031)**: parallel-encode the CPU portion.
+
+### Testable next steps (H-G family)
+
+- **H-G1**: bench each FFN-non-matvec kernel in isolation. Identify which (if any) dominates the 4 ms/tok FFN-non-matvec budget. Cleanest /loop-suitable.
+- **H-G2**: scan FFN_NORMS sub-phase for fusion opportunities (4-5 separate norm dispatches per layer ≥ 2-3 fused dispatches).
+- **H-G3**: side-by-side peer comparison of FFN forward-path structure.
+
+### Updated cumulative iter-175 ledger
+
+| Step | Status |
+|---|---|
+| 1: dispatch baseline | DONE |
+| 1b: H-A/H-B | FALSIFIED |
+| 1d: H-D concurrency | CONFIRMED 3.5pp ceiling |
+| 1e: H-D2 enabling infra | LANDED default-OFF |
+| 1f: H-D2 single-site | FALSIFIED |
+| 1g: H-E precompile toolchain | CONFIRMED, test DEFERRED |
+| 1h: matvec near-peak | DONE |
+| **1i: per-layer-phase attribution** | **DONE — FFN non-matvec is 37% of wall** |
+| 1j (next): H-G1 kernel-isolation bench | OPEN |
+
+Full layer-phase attribution: `docs/research/ADR-029-iter-175-step-1i-layer-phase-attribution-2026-05-15.md`.
+
 
