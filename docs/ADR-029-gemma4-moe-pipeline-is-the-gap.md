@@ -3727,4 +3727,39 @@ Migrate the hottest dispatch site (`kernel_mul_mv_q6_K_f32_nr2`, 19.91% of dispa
 
 Full bench data and side-by-side strategy comparison: `docs/research/ADR-029-iter-175-step-1d-concurrency-lever-2026-05-15.md`.
 
+## Iter-175 Step 1e (2026-05-15) — H-D2: first dispatch site migrated to dispatch_tracked
+
+Migrated the quantized-matvec else-branch in `mlx-native/src/ops/quantized_matmul_ggml.rs` (covers `kernel_mul_mv_q6_K_f32_nr2` and all other non-NR2 quantized matvecs — 19.91% of decode dispatches at gemma4-APEX) from `encode_threadgroups_with_args` to `dispatch_tracked_threadgroups_with_args`.
+
+Also extended `mlx-native/src/encoder.rs::memory_barrier()` to reset the `MemRanges` tracker when `HF2Q_AUTO_BARRIER=1`. This is required for partial migration safety: without the reset, tracked dispatches downstream of a hand-placed barrier would false-conflict against stale ranges and emit spurious extra barriers. No-op under default `HF2Q_AUTO_BARRIER=0` (tracker is empty).
+
+mlx-native commit: `b32b81e`.
+
+### Gates (HEAD: hf2q `5f7d3e99` + mlx-native `b32b81e`)
+
+- `cargo build --release`: clean
+- mlx-native `cargo test --release --lib`: **298/298 PASS**
+- hf2q `cargo test --release --test coherence_smoke`: **2/2 PASS**
+- hf2q tg30 smoke (single-rep, no thermal-fair):
+  - default: 96.7 t/s
+  - `HF2Q_AUTO_BARRIER=1`: 97.4 t/s
+  - **byte-identical first decode token (10081) in both arms**
+  - directional +0.72% signal, within tg30 noise floor
+
+### Default-OFF preservation
+
+`HF2Q_AUTO_BARRIER=0` (default) makes this code path behaviorally identical to the prior `encode_threadgroups_with_args` call. Opt-in via `HF2Q_AUTO_BARRIER=1`. Production decode at HEAD is unchanged until/unless a full alt-pair bench validates flipping the default.
+
+### Next iteration (Step 1f)
+
+Proper thermal-fair alt-pair bench:
+- 3-cycle alt-pair × tg100 + tg2000 multi-regime
+- 60-90s cool-downs between arms
+- σ < 1% per arm precondition
+- Gate: ≥+0.5% on tg100 to consider extending migration to more sites; ≥+1% multi-regime to default-flip HF2Q_AUTO_BARRIER
+
+If positive: continue migration of next-hottest sites (rms_norm_f32_v2 #2 at 17.11%, fused_head_norm_rope_f32_v2 #3 at 6.79%). Each migration adds ~0.5pp potential per peer's 3.5pp total concurrency-benefit gap.
+
+If neutral/negative: H-D2 falsified for partial migration; full all-or-nothing migration becomes the only remaining path (multi-day to multi-week effort).
+
 
