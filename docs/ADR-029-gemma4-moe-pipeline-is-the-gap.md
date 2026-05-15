@@ -3987,4 +3987,53 @@ Each rms_norm reads ~11.3 KB of activations. At 500 GB/s, memory access = ~23 ns
 
 Full layer-phase attribution: `docs/research/ADR-029-iter-175-step-1i-layer-phase-attribution-2026-05-15.md`.
 
+## Iter-175 Step 1j (2026-05-15) — fusion lever FALSIFIED via Chesterton's fence; iter-175 reaches /loop ceiling
+
+**Critical re-check before code change**: Step 1i recommended "kernel fusion in FFN_NORMS" as the close-the-gap lever. Reading `src/debug/investigation_env.rs:657-674` reveals this was **already tested at ADR-029 iter-1 H6** on the existing `fused_post_attn_triple_norm_f32` kernel (4→1 fusion combining post-attn norm + residual_add + 3 pre-FF norms; saves 90 dispatches/tok).
+
+**iter-1 H6 result**: −2.8% regression at gemma4-APEX-Q5_K_M, byte-identical coherence. Standing decision: "the dispatch-fusion lever class appears to lose on Apple Metal at hidden_size=2816, top_k=8."
+
+Consistent with `forward_mlx.rs:4839-4841` (iter-105): "on Apple Metal scheduler, more smaller dispatches outperform fewer larger fused dispatches at decode shape."
+
+### Why fusion loses despite ~10 µs launch overhead per dispatch
+
+Apple GPU has FIXED-cost components per kernel (warp scheduling, register allocation, instruction-cache fill) that aren't amortizable across the larger work of a fused kernel. A single fused 4× larger kernel can't fit 4× the workload in the same time slot — it stalls on register pressure / warp limits. Net: fusion overhead from extra-large-kernel inefficiency > savings from 3 fewer launch overheads.
+
+Same explanation as iter-101's `FOR_UNROLL` regression on flash_attn (register spill).
+
+### iter-175 closure status
+
+**iter-175's /loop-autonomous investigation has reached its ceiling.** All hypotheses tractable within the 5-min /loop window have been either FALSIFIED, CONFIRMED-requiring-multi-day-eng, or DEFERRED to operator-runs Apple Instruments.
+
+Full hypothesis ledger:
+
+| Hypothesis | Status |
+|---|---|
+| H-A: per-dispatch encoder overhead | FALSIFIED |
+| H-B: runtime Metal compile options | PARTIALLY FALSIFIED |
+| H-D: concurrency dispatch strategy | CONFIRMED 3.5pp ceiling — requires multi-day global migration |
+| H-D2: single-site partial migration | FALSIFIED |
+| H-E: precompiled .metallib | TOOLCHAIN CONFIRMED, definitive test DEFERRED |
+| H-F: matvec kernel inefficiency | FALSIFIED — matvecs at 70-119% peak |
+| H-G: kernel fusion in FFN_NORMS | **FALSIFIED** at iter-1 H6 (this Step 1j check) |
+| H-C: cache/memory layout | OPEN, operator-runs Instruments |
+
+### Remaining levers (all outside /loop scope)
+
+1. **H-D global migration** (multi-day to multi-week): ~3.5pp target. Migration infrastructure already landed at mlx-native `b32b81e`.
+2. **H-E definitive test + port** (~2-3 hours test + multi-day port): unknown target.
+3. **H-C Apple Instruments investigation** (operator-runs): unknown target.
+4. **Accept current state**: hf2q at 0.92× peer-FA on M5 Max + gemma4-APEX-Q5_K_M may be the structural floor for current architecture + SDK + hardware.
+
+### Durable iter-175 deliverables
+
+- **mlx-native b32b81e**: `dispatch_tracked_*` migration infrastructure (default-OFF, safe, correctness-tested)
+- **9 research artifacts** at `docs/research/ADR-029-iter-175-*`
+- **ADR-029** fully updated with iter-175 entries for each step (1, 1b, 1d, 1e, 1f, 1g, 1h, 1i, 1j)
+- **2 memory entries** capturing non-obvious findings (top kernels already peer-ported; H-D concurrency lever CONFIRMED)
+
+Full closure rationale: `docs/research/ADR-029-iter-175-step-1j-closure-recommendation-2026-05-15.md`.
+
+**Per `feedback_no_premature_mission_close_2026_05_11` standing rule, this is NOT a unilateral closure of ADR-029. iter-175 has reached its /loop-autonomous ceiling; operator decides whether to commit to one of the multi-day engineering paths above or accept the current state.**
+
 
