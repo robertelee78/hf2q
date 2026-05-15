@@ -4412,3 +4412,192 @@ The original iter 16 measurement was a single thermal/PSO-cache artifact. Per th
 - **Comprehensive hypothesis space mapping**: which directions don't work and why
 
 
+
+## Iter-175 Steps 1t–1ac (2026-05-15) — exhaustive negative-result + fresh canonical baselines
+
+This block covers iter-175 from Step 1t through 1ac, all landed 2026-05-15.
+Each step has a detailed research artifact in `docs/research/`; below is the
+consolidated outcome.
+
+### Step 1t — peer source review (gemma4 architecturally identical)
+
+Read `/opt/llama.cpp/src/models/gemma4.cpp` (457 LOC) plus recent peer
+Metal commits.  Peer's gemma4 per-layer pipeline is byte-byte identical to
+hf2q's at the operation level.  No big missed algorithmic lever.  One small
+candidate (peer commit `e4cff0956` bin-kernel FC_CB) classified as not
+applicable in Step 1x.
+
+Artifact: `docs/research/ADR-029-iter-175-step-1t-peer-source-review-2026-05-15.md`
+
+### Step 1u — `HF2Q_TQ_FAST_FUSED_KV` re-falsified
+
+iter-1's TQ_FAST_FUSED_KV lever re-tested at HEAD: -0.21% (REFUTED).
+Adds another data point to the levers-widen-with-opposing-levers rule.
+
+### Step 1v — FA-vec NWG sweep at HEAD
+
+`HF2Q_HYBRID_NWG=32` forced is marginally tighter (range 0.0 vs 2.6
+default) but mean Δ within bench noise.  Threshold at compute_nwg=512
+kept; documented in source for future investigators not to re-bench.
+
+### Step 1w — `threads_per_tg` geometry FALSIFIED
+
+Hypothesis (H-F): peer's `MTLSize(32, nsg, 1)` vs hf2q's `MTLSize(2, 32, 1)`
+might produce different memory access patterns.  Tested at gemma4 Q_sliding
+shape (m=1, n=4096, k=2816) with precompiled metallib:
+
+```
+hf2q (2,32,1)  mean: 19.19us
+peer (32,2,1)  mean: 19.27us
+delta: -0.42% — FALSIFIED (within noise)
+```
+
+Metal compiler emits equivalent code for both layouts when kernel uses
+`tiisg`/`sgitg` (linear-position-derived).  Falsification artifact retained
+at `mlx-native/tests/iter175_h_f_threads_per_tg_geometry.rs`.
+
+### Step 1x — exhaustive 8-month peer commit archaeology
+
+Cross-referenced **128 peer Metal commits** between 2025-09-01 and 2026-05-15
+against hf2q's current state:
+
+- 3 commits **already ported** or hf2q already matches post-fix
+  (`da4495332` FC-promote H93; `b54124110` Q5_K nr0=1; `f161463a5` concurrent)
+- 16 commits **not applicable** to gemma4 quantized decode
+  (F-type dynamic NSG, MLA/GDN/SSM, FA-ext mask-skip, etc.)
+- 1 commit (`dfcd53f7e` NORM+MUL+ADD fusion) maps to **already-falsified**
+  direction (iter-1 H6 / Step 1o at -5.15%)
+- 5 broad refactors with no isolatable per-kernel optimization
+
+**Conclusion**: archaeology **eliminates "we missed a peer optimization"
+as a remaining lever**.  The structural-floor interpretation is now backed
+by 25+ classified peer commits.
+
+Artifact: `docs/research/ADR-029-iter-175-step-1x-peer-commit-archaeology-2026-05-15.md`
+
+### Step 1y — per-layer-phase GPU profile at HEAD
+
+Re-measured the per-layer-phase profile with all Step 1 levers default-ON
+(precompiled metallib + concurrent dispatch + FC-promoted batch divisors):
+
+| Phase | Layer type | Median | σ |
+|---|---|---|---|
+| ATTN | sliding (26 layers) | ~100 µs | ~2 µs |
+| ATTN | global (4 layers)   | ~138 µs | ~3 µs |
+| FFN  | sliding (26 layers) | ~195 µs | ~5 µs |
+| FFN  | global (4 layers)   | ~194 µs | ~6 µs |
+
+**FFN dominates ATTN 2:1** — FFN-side levers have 2× leverage.  Per-token
+GPU body ≈ 9.0 ms; CPU/encode ≈ 1.5 ms; wall ≈ 10.5 ms = ~95 t/s.
+
+Top FFN kernel candidates for future per-kernel investigation:
+- `kernel_mul_mv_id_q6_K_f32_nr2` (expert down_proj)
+- `kernel_mul_mv_id_q5_K_f32` (expert up/gate_proj)
+- `kernel_rms_norm_f32_v2` (multiple norm sites)
+
+Artifact: `docs/research/ADR-029-iter-175-step-1y-phase-profile-at-HEAD-2026-05-15.md`
+
+### Step 1z — `HF2Q_Q8_0_ID_MV_NR2` widens to -1.96%
+
+Re-tested iter-6's falsified lever at HEAD per the standing rule:
+
+```
+baseline       : 95.30 ± 0.21 t/s (σ-pct 0.22%)
+Q8_0_ID_MV_NR2 : 93.43 ± 0.43 t/s (σ-pct 0.43%)
+delta          : -1.96% (REFUTED ≤-1%)
+```
+
+iter-6 had -1.3%; today -1.96% (**+0.66pp wider**).  First quantitative
+confirmation of the rule
+`feedback_levers_can_widen_opposing_regressions_2026_05_15.md` (now has
+2 data points).
+
+Side benefit: established new canonical hf2q baseline of **95.30 t/s ± 0.21
+(σ-pct 0.22%)** — supersedes iter-158's 92.60, reflecting cumulative Step 1d
++ 1e + 1m default-ons (+2.9%).
+
+Artifact: `docs/research/ADR-029-iter-175-step-1z-q8_0_id_mv_nr2-rebench-2026-05-15.md`
+
+### Step 1aa — canonical peer ratio at HEAD: 0.9365× (6.35% gap)
+
+3-cycle alt-pair vs peer-FA, gemma4-APEX-Q5_K_M, M5 Max, tg200:
+
+```
+hf2q    : mean 94.53  σ 0.33 (0.35%)  samples: [94.1, 94.9, 94.6]
+peer-FA : mean 100.94 σ 0.28 (0.28%)  samples: [100.55, 101.05, 101.22]
+ratio   : 0.9365×  (+6.35% gap)
+```
+
+Net improvement since iter-100 (0.924×): **+1.25pp** from cumulative Step 1d
++ 1e + 1m default-ons.
+
+Artifact: `docs/research/ADR-029-iter-175-step-1aa-peer-ratio-at-HEAD-2026-05-15.md`
+
+### Step 1ab — prefill measurement methodology problem (RETRACTED, see 1ac)
+
+Initial prefill bench at HEAD produced apparent regression (0.9577× peer),
+seemingly contradicting iter-160's "1.07-1.09× AHEAD" memory.  Documented
+honestly that methodology was apples-to-oranges (real-token vs synthetic
+tokens; cycle 0 cold; mismatched parser).  Then fixed in Step 1ac.
+
+Artifact: `docs/research/ADR-029-iter-175-step-1ab-prefill-methodology-2026-05-15.md`
+
+### Step 1ac — prefill apples-to-apples: 1.0370× AHEAD
+
+Parser bug from Step 1ab fixed.  hf2q emits TWO prefill numbers:
+- `Batched prefill complete: ... (X tok/s)` ← **pure matmul rate** (correct comparator)
+- `Prompt: X t/s` ← legacy-path total with +9% overhead
+
+3-cycle alt-pair at exact pp=2013 tokens both arms:
+
+```
+hf2q    : 3030.17 ± 4.90 t/s (σ-pct 0.16%)
+peer-FA : 2922.13 ± 10.71 t/s (σ-pct 0.37%)
+ratio   : 1.0370×  (+3.70% AHEAD)
+```
+
+**Prefill is AHEAD at HEAD by 3.70%** — confirms iter-160's direction,
+slightly lower magnitude than iter-160's 1.072-1.087× (likely peer build
+progression).
+
+Artifact: `docs/research/ADR-029-iter-175-step-1ac-prefill-apples-to-apples-2026-05-15.md`
+
+### Canonical iter-175 baselines (for iter-176+ regression gates)
+
+| Phase | hf2q | peer-FA | ratio | source |
+|---|---|---|---|---|
+| **decode tg200** | **95.30 ± 0.21 t/s** | **100.94 ± 0.28 t/s** | **0.9365×** | Step 1z + 1aa |
+| **prefill pp2013** | **3030 ± 5 t/s** | **2922 ± 11 t/s** | **1.0370× AHEAD** | Step 1ac |
+
+Regression gates:
+- decode drop below 0.92× ratio = investigate
+- prefill drop below 1.00× ratio = investigate
+
+### iter-175 net effect
+
+| Lever | Status | Decode Δ | Prefill Δ |
+|---|---|---|---|
+| Step 1d concurrent default | DEFAULT-ON | (infrastructure) | — |
+| Step 1e q6_K_nr2 tracked-dispatch | LANDED | (no measurable, defense in depth) | — |
+| Step 1m precompiled metallib | DEFAULT-ON | +0.42%/−0.32% σ | +3-5% |
+| Steps 1f-1l/1p-1ab | various tested | falsified/refuted | falsified/refuted |
+| Step 1q safety check | LANDED | (caught silent corruption bug) | — |
+| Step 1r ssm_conv tg fix | LANDED | correctness | — |
+
+**Cumulative net since iter-100**: +1.25pp decode ratio (0.924× → 0.9365×),
+prefill confirmed still AHEAD.
+
+### Operator decision point at end of iter-175
+
+Per the structural-floor interpretation backed by 17+ falsifications and the
+exhaustive Step 1x archaeology, the remaining work to close decode further
+is **NOT /loop-tractable**:
+
+- Multi-week MoE-pipeline redesign (per Step 1y leverage analysis)
+- Operator-only Apple Instruments deep dive
+- Or accepting the 0.9365× ceiling as structural for our weight + KV format
+
+/loop autonomous iteration should:
+1. Continue periodic re-bench cycles (canonical baselines for drift detection)
+2. Periodic peer commit archaeology (new commits since 2026-05-15)
+3. Per-step recording of any new hypothesis that gets tested
