@@ -1044,6 +1044,18 @@ pub struct MlxModelWeights {
     pub dflash_capture: Option<crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession>,
 }
 
+// ADR-031 Phase B foundation — compile-time Send+Sync assertion.
+//
+// Phase B needs to share `&MlxModelWeights` across a main thread and a
+// worker thread during parallel-encode (HF2Q_PARALLEL_ENCODE=1).  That
+// requires Self: Sync.  This assertion fails the build at this site if a
+// future field violates the contract, surfacing the regression long
+// before runtime.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<MlxModelWeights>();
+};
+
 /// Per-layer byte-packed higher-bit (5/6-bit) KV buffers (iter-21 Track B).
 pub struct HbKvBuffers {
     /// Byte-packed K indices `[nkv_heads, capacity, head_dim]` U8.
