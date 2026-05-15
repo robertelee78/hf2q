@@ -48,6 +48,24 @@ pub fn forward_decode<'sess>(&self, ...) -> Result<...> {
 
 …the closure captured by `submit(move || ...)` cannot reference `&ctx`, `&self`, `&mut s`, `exec`, or `&mut reg`, because all of them are tied to `forward_decode`'s stack frame and the worker thread outlives any single call.
 
+## Serve-layer ownership pattern (verified at HEAD)
+
+`mlx_w: MlxModelWeights` is held by direct ownership (not Arc) at every call
+site touched:
+
+| Site | Pattern |
+|---|---|
+| `src/serve/mod.rs:1422` | `mlx_w.forward_decode(next_token, pos, &mut ctx, &mut p)?` — direct `&mut` |
+| `src/serve/mod.rs:1582, 5244, 5432` | same direct ownership |
+| `src/serve/api/engine.rs:4107, 4784, 7291` | `loaded.weights.forward_decode(...)` via LoadedModel container |
+| `src/serve/parity_quality.rs:649` | direct |
+| `src/inference/spec_decode/dflash/orchestrator.rs:1354, 1583` | direct |
+| `src/inference/spec_decode/ngram_orchestrator.rs:229` | direct |
+
+No Arc-wrap exists today.  Path A (Arc-everywhere) would touch ~6 call
+sites × 5+ methods = ~30 mechanical edits.  Not insurmountable but a
+large diff.
+
 ## Three paths forward
 
 ### Path A — Arc-wrap everything (recommended)
@@ -72,7 +90,71 @@ Pro: no Arc overhead.  Con: per-token allocation cost may eat the parallel speed
 
 Same as A but make it the only API — no fallback to `&self`-borrowing.  Cleanest long-term shape; biggest immediate diff.
 
-**Recommendation**: Path A.  Minimum surface change, preserves the &self call site for serial decode, opt-in Arc construction only when HF2Q_PARALLEL_ENCODE=1.
+**Recommendation revised after serve-layer audit**: Path A is still the
+*cleanest long-term shape*, but Path D below (Design Y) is the
+*pragmatic v1 choice* for Phase B.
+
+### Path D — Surgical unsafe lifetime-forge with manual wait
+
+The persistent worker's `'static` constraint can be bypassed by
+forging a `&'a T` into a `&'static T` AT THE SUBMIT BOUNDARY ONLY,
+under the strict precondition that the worker mpsc::recv() completes
+BEFORE forward_decode returns and the `'a` lifetime ends.  This is
+exactly what `crossbeam::thread::scope` does internally; we replicate
+the pattern manually around the persistent global worker.
+
+```rust
+// In forward_decode, when HF2Q_PARALLEL_ENCODE=1:
+let me: &MlxModelWeights = self;
+let ctx_ref: &LayerCtx<'_> = &ctx;
+let exec_ref: &mlx_native::GraphExecutor = exec;
+let reg_mutex: &Mutex<mlx_native::KernelRegistry> = &reg_mutex;
+
+// SAFETY: this transmute is sound IFF we wait on `done_rx.recv()`
+// BEFORE returning from forward_decode (which is enforced below).
+// All forged references outlive the worker's use of them.
+let me_static: &'static MlxModelWeights = unsafe { std::mem::transmute(me) };
+let ctx_static: &'static LayerCtx<'_> = unsafe { std::mem::transmute(ctx_ref) };
+// ... etc
+
+let (done_tx, done_rx) = std::sync::mpsc::channel();
+submit_to_global_worker(move || {
+    let mut session_a = exec_static.begin().expect("begin chunk A");
+    for layer_idx in CHUNK_A {
+        me_static.encode_one_layer(
+            layer_idx, ctx_static, &mut session_a,
+            exec_static, &reg_mutex_static, &mut profile_a,
+            &mut per_layer_disp_a, &mut total_disp_a,
+        ).expect("encode chunk A");
+    }
+    session_a.commit();
+    done_tx.send(()).ok();
+}).expect("submit");
+
+// Main thread encodes chunk B:
+for layer_idx in CHUNK_B {
+    self.encode_one_layer(layer_idx, &ctx, &mut s, exec, &mut reg, ...)?;
+}
+
+// MANDATORY: wait before returning, or UB.
+done_rx.recv().expect("worker mpsc died");
+
+// Now safe to fall out of forward_decode — the forged 'static refs
+// were only valid during the worker's execution, which is now done.
+```
+
+Trade-off:
+- ✓ Diff is ~50 LOC in forward_mlx.rs ONLY — no serve-layer refactor.
+- ✓ Per-token cost: zero Arc-clone overhead.
+- ✓ Encapsulates the unsafe block behind the HF2Q_PARALLEL_ENCODE=1 gate.
+- ✗ One block of unsafe code requires a clear safety comment + invariant
+  documentation.
+- ✗ Future maintainer who removes the `done_rx.recv()` introduces UB.
+  Mitigation: surround the worker spawn + wait in a private helper
+  function that makes the spawn-and-wait atomic at the API level.
+
+This is the recommended path for Phase B v1.  Path A remains the
+right shape for a future cleanup.
 
 ## KernelRegistry mutation analysis
 
@@ -144,21 +226,42 @@ rx.recv().expect("worker died");
 | dual_buffer_split=3 already commits first 3 layers — does Phase B interact safely? | MEDIUM | Layers 0-2 run serially BEFORE parallel split; layers 3+ are the parallel target |
 | Per-layer dispatch counters (`mlx_native::dispatch_count()`) are global, races under parallel encode | LOW | Spec already mentions gating off HF2Q_PER_LAYER_DISP; needs implementation |
 
+## KernelRegistry sharing strategy refinement
+
+Two viable approaches for the parallel encode:
+
+**Option A (recommended)**: separate `KernelRegistry` per worker thread.
+The cache state duplicates across threads (a few hundred kernels ×
+ComputePipelineState pointers = negligible memory).  Each thread owns
+its own `&mut KernelRegistry`.  Zero Mutex contention.  Pre-warming
+both registries at model load ensures no lazy-compile in decode hot
+path.  Adds ~5 ms one-time cost at startup; pays zero cost per token.
+
+**Option B**: `Arc<Mutex<KernelRegistry>>` shared.  Brief locks per
+dispatch.  At ~50 dispatches/layer × 30 layers × 95 t/s = ~143k locks/s
+across both threads.  Empirically: a stdlib Mutex acquisition is
+~25-50 ns uncontended.  Total: 143k × 50 ns = 7 ms/s = 0.7% overhead.
+Acceptable.
+
+**For Phase B v1**: use Option A (separate registries).  Simplest, no
+contention, opt-in cost paid once at startup behind the
+HF2Q_PARALLEL_ENCODE=1 gate.
+
 ## Recommended next steps
 
 1. ~~Verify `MlxBuffer` Send/Sync by reading buffer.rs.~~ DONE — confirmed Send + Sync via static_assertions at buffer.rs:80.
-2. **Verify model `Self` type** in serve module — confirm it's already `Arc`-shared at the HTTP layer (gemma4_decode_model or whatever the actual type is).
-3. **Wrap up this analysis as Phase B research artifact** (this file).
-4. **Spawn /cfa for Phase B implementation** with explicit Path A plan + Arc-wrap directive.
-5. **Phase B substep plan** (preliminary):
-   - B0: Verify Self thread-safety + add MlxBuffer Send/Sync if needed
-   - B1: Add `encode_one_layer_arc(Arc<Self>, ..., Arc<Mutex<KernelRegistry>>)` sibling method
-   - B2: Add layer-chunking helper + Arc-construction at forward_decode entry behind HF2Q_PARALLEL_ENCODE=1
-   - B3: Wire parallel split for layers 4..n-1 (or chosen range)
-   - B4: Per-token mpsc completion signaling
-   - B5: Per-layer profile interference handling (gate parallel mode OFF when HF2Q_PER_LAYER_DISP=1)
-   - B6: Build clean + coherence_smoke + sourdough + tg100 alt-pair gates (per Phase A protocol)
-   - B7: Default-OFF + opt-in env flag
+2. ~~Verify model `Self` type in serve module.~~ DONE — `MlxModelWeights` is held by direct ownership at every call site; not Arc'd today.  Refactoring to Arc would require ~30 mechanical site changes (Path A).  Path D (surgical unsafe lifetime-forge) avoids this.
+3. **Verify Send + Sync of `MlxKvCache` and `MlxActivationBuffers`** (the remaining big MlxModelWeights fields) — likely fine since they're built from MlxBuffer (Send+Sync), but unverified at HEAD.  TODO for next iteration.
+4. **Spawn /cfa for Phase B implementation** with Path D (surgical) + Option A (separate KernelRegistry per thread) directive.
+5. **Phase B substep plan** (revised):
+   - B0: Verify MlxKvCache + MlxActivationBuffers Send+Sync; add static_assertions to MlxModelWeights itself.
+   - B1: Pre-warm both `KernelRegistry`s (main + worker) at model-load time to eliminate lazy-compile in decode hot path.
+   - B2: Add private helper `encode_parallel_layers_chunked(&self, layer_range_a, layer_range_b, ...) -> Result<()>` to forward_mlx.rs that encapsulates the unsafe transmute + submit + main-thread encode + mpsc::recv() pattern as a single atomic API.  The unsafe block lives in this helper ONLY.
+   - B3: In forward_decode, after `dual_buffer_splits` commits layer 3, check `HF2Q_PARALLEL_ENCODE=1`; if set, call `encode_parallel_layers_chunked` for layers 4..n-1.  Otherwise fall through to serial loop (status quo).
+   - B4: Verify the worker thread holds its own `KernelRegistry` instance (not shared).
+   - B5: Gate parallel mode OFF when HF2Q_PER_LAYER_DISP=1 (global counter races) — env-check at forward_decode entry.
+   - B6: Build clean + coherence_smoke + sourdough + tg100 alt-pair gates (per Phase A protocol).
+   - B7: Default-OFF + opt-in env flag.  Phase C (Phase B perf tune + default-flip decision) is separate work.
 
 ## References
 
