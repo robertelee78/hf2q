@@ -3762,4 +3762,52 @@ If positive: continue migration of next-hottest sites (rms_norm_f32_v2 #2 at 17.
 
 If neutral/negative: H-D2 falsified for partial migration; full all-or-nothing migration becomes the only remaining path (multi-day to multi-week effort).
 
+## Iter-175 Step 1f (2026-05-15) — H-D2 FALSIFIED: single-site partial migration is NEUTRAL
+
+Thermal-fair alt-pair bench on the Step 1e migration:
+
+| Regime | Arm A (default) mean | Arm B (`AUTO_BARRIER=1`) mean | Delta |
+|---|---:|---:|---:|
+| tg100, 2-cycle, 60s cool-downs | 95.10 t/s | 94.75 t/s | **−0.37%** (within σ) |
+| tg2000, 1-cycle, 75s cool-down | 93.0 t/s | 92.7 t/s | **−0.32%** (within σ) |
+
+Both regimes neutral. The H-D 3.5pp ceiling is **NOT capturable via single-site partial migration**.
+
+### Why neutral
+
+The surrounding hand-placed barriers around the migrated site STILL FIRE. Step 1e's change to `memory_barrier()` makes them reset the mem_ranges tracker, so the tracker starts fresh after each hand-placed barrier. Within a sequence of matvecs, consecutive dispatches write to DIFFERENT output buffers → no conflicts → no auto-barriers emitted → no net change vs unmigrated state. The auto-tracker on a single site is a no-op + tiny overhead.
+
+### Decision: keep Step 1e as default-OFF infrastructure
+
+The migration code at `mlx-native b32b81e` is:
+- Small (19 LOC net)
+- Default-OFF (behaviorally identical to prior code under `HF2Q_AUTO_BARRIER=0`)
+- Correctness-tested (298/298 mlx-native unit tests, 2/2 coherence_smoke, byte-identical first token)
+- Bench-tested as neutral (no regression at default)
+
+Keeping it preserves the migration infrastructure for future global-migration work. Operator standing rule applied: "if we found benefit, why not enable? — answer: didn't find benefit, so it stays OFF" (same pattern as ADR-031 Phase B).
+
+### What it would take to capture H-D's 3.5pp
+
+GLOBAL migration: switch ALL ~400 hand-placed `enc.memory_barrier()` call sites to use `dispatch_tracked_*`, REMOVE the hand-placed barriers, verify byte-identity + coherence, bench to confirm auto-tracker's barrier-elision rate beats the hand-placed strategy.
+
+**Multi-day to multi-week effort. Comparable in size to ADR-031's parallel-encode refactor (which delivered 0% wall benefit despite similar effort).** Not /loop-suitable.
+
+### Updated iter-175 hypothesis ledger
+
+| Hypothesis | Status | Source |
+|---|---|---|
+| H-A: per-dispatch encoder overhead | **FALSIFIED** (Step 1b) | encoder.rs side-by-side; CPU <1% of wall |
+| H-B: Metal compile-options divergence | **PARTIALLY FALSIFIED** (Step 1b) | Both repos default MTLCompileOptions |
+| H-C: cache/memory layout | **DEFERRED** (operator-runs Instruments) | Not /loop-suitable |
+| H-D: concurrency dispatch strategy | **CONFIRMED but not partial-capturable** | 3.5pp ceiling (Step 1d); single-site neutral (Step 1f) |
+| H-D2: partial migration captures share of H-D | **FALSIFIED** (Step 1f) | tg100 −0.37%, tg2000 −0.32%, both within noise |
+| H-E: precompiled .metallib | **OPEN** | Single-shader test, 0.5-1 day, next-iter |
+
+### Next iteration
+
+**H-E investigation**: precompile `quantized_matmul_ggml.metal` via `xcrun metal -O3` + `xcrun metallib`, load via `device.new_library_with_url()` in a test path, bench. If positive → port to all shaders. If negative → strong evidence iter-175 closes at structural parity.
+
+Full bench details: `docs/research/ADR-029-iter-175-step-1f-thermal-fair-bench-2026-05-15.md`.
+
 
