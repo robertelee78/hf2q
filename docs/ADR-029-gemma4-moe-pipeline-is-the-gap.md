@@ -4173,4 +4173,57 @@ Per Step 1k iter-1k test, precompiled was +5.89% faster on `kernel_mul_mv_q6_K_f
 
 Per R2 from synthesis: start H-D global migration. Infrastructure is at `mlx-native b32b81e` (`dispatch_tracked_*` API + MemRanges tracker). Migrate batches of hand-placed barrier sites incrementally with byte-identity gates per batch.
 
+## Iter-175 Step 1n (2026-05-15) — CRITICAL: gemma4 production decode is ALREADY migrated to smart barriers
+
+**Chesterton's-fence audit before R2 work**: counted barrier API usage across hf2q.
+
+| File | `barrier_between` | `memory_barrier()` |
+|---|---:|---:|
+| **`forward_mlx.rs` (gemma4 decode/prefill)** | **62** | **3** (all debug-gated) |
+| `forward_prefill_batched.rs` | 55 | — |
+| `forward_prefill.rs` | 30 | — |
+| `vision/vit_gpu.rs` | 0 | 81 |
+| `qwen35/gpu_delta_net.rs` | 0 | 48 |
+| `qwen35/gpu_full_attn.rs` | 0 | 40 |
+| `bert/bert_gpu.rs` | 0 | 27 |
+| `qwen35/gpu_ffn.rs` | 0 | 24 |
+| `spec_decode/dflash/forward.rs` | 0 | 23 |
+| `nomic_bert/forward.rs` | 0 | 19 |
+| `qwen35/forward_gpu.rs` | 0 | 15 |
+| `calibrate/autograd_gpu_tape.rs` | 0 | 12 |
+| **Totals** | **147** | **362** |
+
+The 3 remaining `memory_barrier()` calls in `forward_mlx.rs` are all **debug-gated**: 2 at lines 4986/4990 behind `b9_sequential`, 1 at line 5242 behind `use_iter367_fusion` coherence-regression PROBE. **Production gemma4 decode uses 100% smart conditional barriers** via `session.barrier_between(reads, writes)` — same algorithm as peer's `ggml_metal_op_concurrency_check` + `_reset` at `ggml-metal-ops.cpp:147-225`.
+
+**Production gemma4 path is already H-D-migrated. The 3.5pp ceiling from Step 1d's 4-arm bench cannot be captured by further barrier migration on this path.**
+
+### Re-measured barrier ratios at HEAD
+
+`HF2Q_DUMP_COUNTERS=1` decode (50 tok at gemma4-APEX-Q5_K_M):
+- hf2q at HEAD: 852.6 disp/tok, 473.3 barriers/tok → **1.80 dispatches per concurrent group**
+- peer (iter-115): 1339 disp/tok, 844 barriers/tok → **1.59 dispatches per concurrent group**
+
+Peer's concurrent groups are SMALLER (more barriers per dispatch). Adding ~63 more barriers/tok to match would be ~315 ns/tok of extra Metal overhead — negligible. The 3.5pp gap must come from **dispatch structure** (peer's many smaller kernels schedule better on Apple GPU), NOT from barrier placement.
+
+### What this changes
+
+The synthesis R2 (H-D global migration) is **not applicable to gemma4**. Production gemma4 decode is already optimally migrated to smart barriers. The 3.5pp H-D ceiling identified at Step 1d reflects DISPATCH STRUCTURE difference (kernel granularity), not barrier-strategy difference.
+
+Dispatch-structure direction:
+- Fusion levers tested: iter-1 H6 (−2.8%), iter-107 H76 (negative), iter-101 FOR_UNROLL (negative). All regress.
+- Unfusion direction also explored at iter-105.
+- The kernel-set as currently shaped is the LOCAL OPTIMUM for hf2q on Apple Metal at gemma4 shapes.
+
+### Updated standing-context
+
+The residual 6-8% peer-FA gap on gemma4-APEX-Q5_K_M at M5 Max is the **STRUCTURAL FLOOR** for the current kernel-set + Apple SDK + M5 Max hardware. Closing it would require a kernel-set rewrite to match peer's dispatch granularity — multi-week to multi-month, no guarantee of success.
+
+### H-H family (new testable hypotheses, but lower-confidence)
+
+- **H-H1**: explicitly add `barrier_between` sites to FORCE smaller concurrent groups → match peer's 1.59 ratio. If Apple-GPU-scheduler-cache likes smaller groups independently of dispatch granularity, this is a free win. If not, falsifies the lever.
+- **H-H2**: selective unfusion of ONE specific kernel (e.g. `fused_head_norm_rope_v2` back to separate norm + RoPE). Tests dispatch-granularity axis on one site.
+- **H-H3**: Apple Instruments Metal System Trace (operator-runs) to pinpoint per-kernel-name GPU time outliers.
+
+Full audit + analysis: `docs/research/ADR-029-iter-175-step-1n-gemma4-already-migrated-2026-05-15.md`.
+
 
