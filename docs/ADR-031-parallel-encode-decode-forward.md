@@ -1,6 +1,41 @@
 # ADR-031: Parallel-encode the gemma4 decode forward path
 
-- **Status**: Phase A LANDED 2026-05-14 (merge `c7f98865`); **Phase B LANDED 2026-05-15 as INFRASTRUCTURE-ONLY (merge `83c3ea6d`, default-OFF; no measured speedup yet); Phase C pending separate CFA session**
+- **Status**: **CLOSED 2026-05-15** — Phase A landed (`c7f98865`, durable refactor); Phase B landed as INFRASTRUCTURE-ONLY (`83c3ea6d`, default-OFF, no measurable benefit on hf2q-on-M5-Max); **Phase C abandoned per C0 deep investigation (`9e88af76`) — parallel-encode hypothesis empirically disproven: CPU encode is ~5% of decode wall, GPU body is ~85%, so no CPU-side lever can move the gap by more than ~1%. Real gap-closing levers live in ADR-029 (per-kernel GPU optimization).**
+
+## Close-out 2026-05-15
+
+**ADR-031's premise was wrong.** The original hypothesis — that parallel-encoding the gemma4 decode forward path would close the ~6% gap to llama.cpp peer-FA — assumed CPU encoding was on the critical path.  C0 diagnostic profiling (`a6fdf252` HF2Q_PARALLEL_PROFILE instrumentation + `9e88af76` SPLIT_TIMING comparison) empirically disproved that assumption:
+
+- **CPU body encode**: ~0.55 ms/token = **~5% of decode wall**
+- **GPU body wait**: ~9.05 ms/token = **~85% of decode wall**
+- Halving CPU encode (theoretical maximum from CPU-parallelism) saves ≤ 2.5% of wall, at noise floor.
+- Phase B's 2-CB overhead eats most of that. Net measured: Δ +0.06 t/s tg100, Δ −0.50 t/s tg2000 — statistically indistinguishable from zero.
+
+**Where the gap actually lives**: per-kernel GPU execution speed.  Comparing hf2q vs llama.cpp on the SAME hardware shows llama.cpp has MORE dispatches (1339 vs our 866) and MORE barriers (844 vs 420) yet runs FASTER.  That means per-dispatch GPU time is ~1 µs slower in hf2q × 866 dispatches/token = ~866 µs/token = ~8% of wall = the observed gap.  The lever is per-kernel work (argument-buffer setup, threadgroup sizes, SIMD-width, PSO tuning, memory access patterns), not CPU work organization.
+
+### What remains durable from ADR-031
+
+- **Phase A** (commit `c7f98865`): `encode_one_layer` method extraction from inline forward_decode body.  Pure refactor; zero behavior change; sourdough byte-identical; tg100 neutral.  This is a code-quality win independent of parallel-encode — keeps the layer body as a maintainable unit.
+- **Phase B** (commit `83c3ea6d`): default-OFF opt-in `HF2Q_PARALLEL_ENCODE=1` scaffolding.  Worker registry, encode_parallel_layers_chunked private helper, RAII-via-IIFE registry restoration, INV-3..7 + R-B9 invariants.  Kept for future experimentation if a different workload (batch size, hardware) ever makes CPU-encode parallelism worthwhile.
+- **Diagnostic instrumentation** (commit `a6fdf252`): `HF2Q_PARALLEL_PROFILE=1` env that prints per-phase µs timings inside `encode_parallel_layers_chunked`.  Permanent diagnostic tool.
+- **Research artifacts** at `docs/research/ADR-031-*`: thread-safety analysis, iter-2 bench results, Phase C design + step-C0 + step-C0-deep findings.  Documented closure.
+
+### Lessons learned
+
+1. **Profile before architecting**.  ADR-031's premise was based on iter-174's verdict ("closure requires parallel-encode refactor").  C0 profiling would have shown CPU is 5% of wall in the first hour, saving the 2 days of CFA work that produced Phase B's correct-but-irrelevant infrastructure.
+2. **`HF2Q_SPLIT_TIMING=1` is the right tool to ask "is CPU or GPU the bottleneck?"** before deciding on any CPU-side optimization.  The data was already collected in `project_adr029_iter115_gpu95_body_decode_timing_2026_05_12` ("GPU 95% body decode timing") — but the implication ("don't optimize CPU; it's only 5% of wall") was misread by the iter-174 follow-up as "parallelize the CPU to overlap with GPU."
+3. **Halving the smaller fraction caps gain at that fraction × halving = (5% × 50%) = 2.5%.**  Even perfect parallelism can't beat that, and 2-CB overhead eats most of it.  This is generalizable: CPU/GPU split timings + Amdahl's law dictate the ceiling BEFORE any architectural work begins.
+
+### Pointer to the real lever
+
+Active mission shifts back to ADR-029 (per-kernel GPU optimization).  Documented baseline:
+- `project_adr029_iter174_FINAL_session_outcome_2026_05_13.md` — 31-lever ledger, decode 0.94× peer-FA at HEAD `31677488`
+- `project_adr029_iter162_h93_WIN_2026_05_13.md` — H93 FC-promote port from llama.cpp's quantized_matmul_ggml.metal: +1.26% multi-regime decode win
+- `project_adr029_iter111_constant_ratio_2026_05_12.md` — gap is ~1 µs/dispatch over 866 dispatches; diffused, not concentrated
+
+Next /loop iteration's focus: identify which specific Metal kernel(s) contribute the largest share of the ~866 µs/token gap, port the slow one(s) from llama.cpp.
+
+
 - **Date**: 2026-05-14
 - **Deciders**: operator (max3@agidreams.us)
 - **Tags**: performance, decode, metal, gemma4, peer-parity
