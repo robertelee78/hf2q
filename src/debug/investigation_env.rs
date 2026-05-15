@@ -454,6 +454,13 @@ pub struct InvestigationEnv {
     /// so both interaction-guard checks see the same value.
     pub per_layer_disp_raw: bool,
 
+    /// Minimum `seq_pos` at which the parallel-encode path engages.
+    /// Below this depth the serial path is used even when
+    /// `HF2Q_PARALLEL_ENCODE=1` (worker overhead > benefit at shallow KV
+    /// depth).  Default 512.  Override via
+    /// `HF2Q_PARALLEL_ENCODE_KV_THRESHOLD=N`.
+    pub parallel_encode_kv_threshold: usize,
+
     // ========================================================================
     // Category 4 — SDPA regime selector (HF2Q_USE_DENSE / HF2Q_LAYER_POLICY).
     // These two vars select per-layer dense vs TQ SDPA dispatch.
@@ -931,6 +938,10 @@ impl InvestigationEnv {
             // same values as the GpuContext::new() call site.
             parallel_encode_raw: env_eq_one("HF2Q_PARALLEL_ENCODE"),
             per_layer_disp_raw: env_eq_one("HF2Q_PER_LAYER_DISP"),
+            parallel_encode_kv_threshold: env::var("HF2Q_PARALLEL_ENCODE_KV_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(512),
 
             unsafe_experiments_acked: ack,
             raw,

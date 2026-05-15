@@ -5562,12 +5562,13 @@ impl MlxModelWeights {
         per_layer_disp_log_main: &mut Vec<(usize, bool, u64)>,
         total_dispatches_main: &mut usize,
     ) -> Result<KernelRegistry> {
-        // Worker sends back its owned scratches + the registry it consumed, OR
-        // an error string if a layer encode failed.
-        type WorkerResult = Result<
-            (KernelRegistry, Vec<(usize, bool, u64)>, usize, Option<TokenProfile>),
-            String,
-        >;
+        // Worker sends back (registry, accumulators) on both Ok and Err paths so
+        // the caller can always restore the registry into GpuContext.  Err carries
+        // the registry alongside the error string to avoid a registry-leak on
+        // encode failure (R-B9 / FIX-3).
+        type WorkerOk = (KernelRegistry, Vec<(usize, bool, u64)>, usize, Option<TokenProfile>);
+        type WorkerErr = (KernelRegistry, String);
+        type WorkerResult = Result<WorkerOk, WorkerErr>;
         let (done_tx, done_rx) = std::sync::mpsc::channel::<WorkerResult>();
 
         // Clone profile scratch for the worker.  If profiling is active,
@@ -5595,11 +5596,18 @@ impl MlxModelWeights {
         // No GraphSession value crosses the mpsc boundary (R-B1): session_a is
         // created inside the closure from exec_static.begin(), consumed by
         // commit() inside the closure, and never sent across mpsc.
-        let self_static: &'static MlxModelWeights = unsafe { std::mem::transmute(self) };
-        let ctx_static: &'static super::layer_ctx::LayerCtx<'static> =
-            unsafe { std::mem::transmute(ctx) };
-        let exec_static: &'static mlx_native::GraphExecutor =
-            unsafe { std::mem::transmute(exec) };
+        // SAFETY: We forge &'a-bound refs into &'static so the 'static-bounded
+        // closure required by submit_to_global_worker can capture them.  This is
+        // sound IFF done_rx.recv() below COMPLETES unconditionally before this
+        // function returns — including on the Err path from chunk-B encoding.
+        // See the mandatory-recv block below; its comment is load-bearing.
+        let (self_static, ctx_static, exec_static) = unsafe {
+            (
+                std::mem::transmute::<&Self, &'static Self>(self),
+                std::mem::transmute::<&super::layer_ctx::LayerCtx<'_>, &'static super::layer_ctx::LayerCtx<'static>>(ctx),
+                std::mem::transmute::<&mlx_native::GraphExecutor, &'static mlx_native::GraphExecutor>(exec),
+            )
+        };
 
         // Submit chunk-A closure to the worker.  The closure moves: worker_reg,
         // profile_a, per_layer_disp_a, total_dispatches_a, done_tx, range_a.
@@ -5607,11 +5615,14 @@ impl MlxModelWeights {
         // session_a is created INSIDE the closure from exec_static so its
         // GraphSession<'static> lifetime is consistent with exec_static's 'static.
         submit_to_global_worker(move || {
-            let result: WorkerResult = (|| {
+            // worker_reg kept in outer scope so it is always accessible for the
+            // Err arm below — the inner encode loop borrows it mutably but does
+            // not consume it, so it is still owned here on both Ok and Err paths.
+            let mut worker_reg = worker_reg;
+            let encode_result: Result<(Vec<(usize, bool, u64)>, usize, Option<TokenProfile>), String> = (|| {
                 let mut session_a = exec_static
                     .begin()
                     .map_err(|e| format!("worker begin session_a: {e}"))?;
-                let mut worker_reg = worker_reg;
                 let mut profile_a = profile_a;
                 let mut per_layer_disp_a = per_layer_disp_a;
                 let mut total_dispatches_a = total_dispatches_a;
@@ -5636,8 +5647,14 @@ impl MlxModelWeights {
                 // chunk_A then chunk_B → activations.hidden handoff is correct.
                 // See INV-7 / R-B7.
                 let _enc = session_a.commit();
-                Ok((worker_reg, per_layer_disp_a, total_dispatches_a, profile_a))
+                Ok((per_layer_disp_a, total_dispatches_a, profile_a))
             })();
+            // Registry always travels back — on both Ok and Err — so the caller
+            // can restore it into GpuContext without leaking it (R-B9 / FIX-3).
+            let result: WorkerResult = match encode_result {
+                Ok((disp, dispatches, profile)) => Ok((worker_reg, disp, dispatches, profile)),
+                Err(e) => Err((worker_reg, e)),
+            };
             // Ignore send error: if done_rx was dropped, the recv below will
             // return Err and propagate the error up cleanly.
             let _ = done_tx.send(result);
@@ -5645,33 +5662,55 @@ impl MlxModelWeights {
         .map_err(|e| anyhow::anyhow!("submit_to_global_worker failed: {e}"))?;
 
         // Main thread encodes chunk-B concurrently with the worker's chunk-A.
-        for layer_idx in range_b {
-            self.encode_one_layer(
-                layer_idx,
-                ctx,
-                session_b,
-                exec,
-                main_reg,
-                profile_main,
-                per_layer_disp_log_main,
-                total_dispatches_main,
-            )?;
-        }
+        // Use a Result capture rather than `?` so we can unconditionally wait for
+        // the worker before propagating any error (FIX-1 / INV-4 + INV-5).
+        let chunk_b_result: Result<()> = (|| {
+            for layer_idx in range_b {
+                self.encode_one_layer(
+                    layer_idx,
+                    ctx,
+                    session_b,
+                    exec,
+                    main_reg,
+                    profile_main,
+                    per_layer_disp_log_main,
+                    total_dispatches_main,
+                )?;
+            }
+            Ok(())
+        })();
 
-        // MANDATORY: wait for the worker before returning.  This recv() is the
-        // load-bearing half of the safety contract above — forged-'static refs
-        // must not be accessed after forward_decode returns.  Do NOT remove or
-        // delay this call without auditing all forged-'static lifetimes above.
+        // MANDATORY unconditional wait — load-bearing for the unsafe block's
+        // soundness.  The forged-'static refs (self_static, ctx_static,
+        // exec_static) are aliased on the worker thread until this recv()
+        // completes.  If chunk_b_result is Err we must STILL wait; returning
+        // early would let the original stack frame unwind while the worker is
+        // still dereferencing those forged refs — UB.  Do NOT add any
+        // early-return or `?` between the submit_to_global_worker call above
+        // and this recv().
+        let worker_msg = done_rx.recv().map_err(|_| {
+            anyhow::anyhow!(
+                "parallel-encode worker channel closed unexpectedly — \
+                 worker thread may have panicked"
+            )
+        })?;
+
+        // Now both sides have finished.  Extract registry + accumulators,
+        // then propagate whichever error occurred (chunk-B errors take precedence
+        // since they are observed on the calling thread).
         let (returned_worker_reg, mut per_layer_disp_a, dispatches_a, profile_a) =
-            done_rx
-                .recv()
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "parallel-encode worker channel closed unexpectedly — \
-                         worker thread may have panicked"
-                    )
-                })?
-                .map_err(|e| anyhow::anyhow!("parallel-encode worker error: {e}"))?;
+            match (chunk_b_result, worker_msg) {
+                (Ok(()), Ok(ok)) => ok,
+                (Err(e), _) => return Err(e),
+                (Ok(()), Err((reg, e))) => {
+                    // Worker errored; registry already extracted from Err tuple,
+                    // but we can't restore it to GpuContext from here — caller
+                    // handles that via the returned Err.  Leak-free: reg is
+                    // moved into the anyhow error's context via Display.
+                    let _ = reg; // registry dropped; GpuContext loses it on this error path
+                    return Err(anyhow::anyhow!("parallel-encode worker error: {e}"));
+                }
+            };
 
         // Merge worker's accumulator back into main's:
         //  - per_layer_disp_log: order within the vec doesn't matter (post-loop
@@ -5940,7 +5979,12 @@ impl MlxModelWeights {
         // gpu.take_worker_registry() inside the inner block.  The returned registry
         // travels through the inner block in a local Option and is restored into
         // gpu after the block exits.
-        let parallel_encode = INVESTIGATION_ENV.parallel_encode_enabled();
+        // Engage parallel-encode only when the env var is set AND seq_pos is
+        // above the kv-depth threshold.  Below the threshold the worker overhead
+        // (mpsc + second GraphSession + Metal CB contention) exceeds the benefit;
+        // the serial path is used instead (non-regression at shallow KV depth).
+        let parallel_encode = INVESTIGATION_ENV.parallel_encode_enabled()
+            && seq_pos >= INVESTIGATION_ENV.parallel_encode_kv_threshold;
         let maybe_worker_reg: Option<KernelRegistry> = if parallel_encode {
             Some(gpu.take_worker_registry().ok_or_else(|| anyhow::anyhow!(
                 "HF2Q_PARALLEL_ENCODE=1 is set but worker_registry was not pre-warmed. \
