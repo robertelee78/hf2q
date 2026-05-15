@@ -30,7 +30,7 @@
 
 use anyhow::Result;
 use mlx_native::{
-    GgmlQuantizedMatmulParams, GraphSession, MlxBuffer, MlxDevice,
+    GgmlQuantizedMatmulParams, GraphSession, KernelRegistry, MlxBuffer, MlxDevice,
 };
 use mlx_native::ops::flash_attn_vec_tq::FlashAttnVecTqParams;
 // CODEBOOK_4BIT is now embedded directly in the Metal shader as a constant array.
@@ -40,6 +40,7 @@ use mlx_native::ops::elementwise::CastDirection;
 use std::time::Instant;
 
 use crate::debug::{dumps, INVESTIGATION_ENV};
+use crate::serve::encoder_worker_singleton::submit_to_global_worker;
 use super::config::{Gemma4Config, LayerType};
 use super::gpu::{GpuContext, QuantWeightInfo};
 
@@ -109,6 +110,48 @@ pub struct TokenProfile {
     pub s3_dispatches: Vec<usize>,
     pub s4_dispatches: Vec<usize>,
     pub head_dispatches: usize,
+}
+
+/// Merge worker's `TokenProfile` into the main thread's profile (ADR-031 Phase B).
+///
+/// Per-layer Vec fields (layer_s1_us, s1_dispatches, …) are pre-allocated to
+/// num_layers at forward_decode entry.  The worker writes only the range_a
+/// indices (all others stay at 0.0/0); the main thread wrote the range_b
+/// indices.  After this merge, every index is populated exactly once.
+/// Scalar fields (head_session_us, head_cpu_us, total_us, head_dispatches) are
+/// written by main (post-loop) and are not touched here.
+// allow(dead_code) removed when B3 wires encode_parallel_layers_chunked.
+#[allow(dead_code)]
+fn merge_profiles(main: &mut Option<TokenProfile>, worker: Option<TokenProfile>) {
+    let (Some(m), Some(w)) = (main.as_mut(), worker) else {
+        return; // profiling is disabled; nothing to merge.
+    };
+    // Per-layer f64 Vecs: element-wise addition.
+    for (mv, wv) in [
+        (&mut m.layer_s1_us, &w.layer_s1_us),
+        (&mut m.layer_cpu1_us, &w.layer_cpu1_us),
+        (&mut m.layer_s2_us, &w.layer_s2_us),
+        (&mut m.layer_cpu2_us, &w.layer_cpu2_us),
+        (&mut m.layer_s3_us, &w.layer_s3_us),
+        (&mut m.layer_cpu3_us, &w.layer_cpu3_us),
+        (&mut m.layer_s4_us, &w.layer_s4_us),
+        (&mut m.layer_cpu4_us, &w.layer_cpu4_us),
+    ] {
+        for (mi, wi) in mv.iter_mut().zip(wv.iter()) {
+            *mi += *wi;
+        }
+    }
+    // Per-layer usize dispatch Vecs: element-wise addition.
+    for (mv, wv) in [
+        (&mut m.s1_dispatches, &w.s1_dispatches),
+        (&mut m.s2_dispatches, &w.s2_dispatches),
+        (&mut m.s3_dispatches, &w.s3_dispatches),
+        (&mut m.s4_dispatches, &w.s4_dispatches),
+    ] {
+        for (mi, wi) in mv.iter_mut().zip(wv.iter()) {
+            *mi += *wi;
+        }
+    }
 }
 
 /// Multi-token profiling accumulator.
@@ -5485,6 +5528,168 @@ impl MlxModelWeights {
                     }
                 }
         Ok(())
+    }
+
+    /// Encode two disjoint layer chunks in parallel using the global encoder
+    /// worker (ADR-031 Phase B, Path D).
+    ///
+    /// The worker creates a fresh `GraphSession` from `exec`, encodes `range_a`
+    /// layers on the encoder worker thread; the main thread concurrently encodes
+    /// `range_b` layers into `session_b`.  GPU execution order is guaranteed by
+    /// commit-order serialization (Pillar P3 / INV-7): the worker calls
+    /// `session_a.commit()` BEFORE sending on `done_tx`, and main commits
+    /// `session_b` only AFTER `done_rx.recv()` returns (main is blocked on recv
+    /// during chunk-B encoding) — Metal queue receives CB-A before CB-B.
+    ///
+    /// Returns the worker's `KernelRegistry` so the caller can store it back
+    /// into `GpuContext::put_worker_registry` for the next token.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if:
+    /// - `submit_to_global_worker` fails (worker dead — process exit in progress).
+    /// - The worker itself errors during encoding (layer encode error).
+    /// - The mpsc channel drops before a result is received (worker panicked).
+    // allow(dead_code) removed when B3 wires the call site in forward_decode.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    fn encode_parallel_layers_chunked<'sess>(
+        &self,
+        range_a: std::ops::Range<usize>,
+        range_b: std::ops::Range<usize>,
+        ctx: &super::layer_ctx::LayerCtx<'_>,
+        session_b: &mut mlx_native::graph::GraphSession<'sess>,
+        exec: &'sess mlx_native::GraphExecutor,
+        main_reg: &mut KernelRegistry,
+        worker_reg: KernelRegistry,
+        profile_main: &mut Option<TokenProfile>,
+        per_layer_disp_log_main: &mut Vec<(usize, bool, u64)>,
+        total_dispatches_main: &mut usize,
+    ) -> Result<KernelRegistry> {
+        // Worker sends back its owned scratches + the registry it consumed, OR
+        // an error string if a layer encode failed.
+        type WorkerResult = Result<
+            (KernelRegistry, Vec<(usize, bool, u64)>, usize, Option<TokenProfile>),
+            String,
+        >;
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<WorkerResult>();
+
+        // Clone profile scratch for the worker.  If profiling is active,
+        // profile_main already has per-layer Vecs pre-allocated to num_layers;
+        // the worker writes only its range_a indices, main writes range_b.
+        let profile_a: Option<TokenProfile> = profile_main.clone();
+        let per_layer_disp_a: Vec<(usize, bool, u64)> = Vec::new();
+        let total_dispatches_a: usize = 0;
+
+        // SAFETY: We forge &'a-bound references into &'static so the 'static-
+        // bounded closure required by submit_to_global_worker can capture them.
+        // This is sound IFF done_rx.recv() below COMPLETES before this function
+        // returns and before the enclosing forward_decode stack frame is unwound.
+        // All forged-'static refs are ONLY dereferenced during the worker's
+        // execution, which is bracketed by `submit_to_global_worker` (start) and
+        // `done_rx.recv()` (end).  Encapsulating both sides in this single helper
+        // makes the spawn-and-wait invariant atomic at the API level — a future
+        // maintainer who removes done_rx.recv() will see the unsafe block in the
+        // same file and the safety comment will flag the dependency immediately.
+        //
+        // This mirrors the crossbeam::thread::scope pattern but works against a
+        // persistent global worker (per-token thread spawn was empirically
+        // -43 tok/s; see forward_mlx.rs comment near line 5471-5474).
+        //
+        // No GraphSession value crosses the mpsc boundary (R-B1): session_a is
+        // created inside the closure from exec_static.begin(), consumed by
+        // commit() inside the closure, and never sent across mpsc.
+        let self_static: &'static MlxModelWeights = unsafe { std::mem::transmute(self) };
+        let ctx_static: &'static super::layer_ctx::LayerCtx<'static> =
+            unsafe { std::mem::transmute(ctx) };
+        let exec_static: &'static mlx_native::GraphExecutor =
+            unsafe { std::mem::transmute(exec) };
+
+        // Submit chunk-A closure to the worker.  The closure moves: worker_reg,
+        // profile_a, per_layer_disp_a, total_dispatches_a, done_tx, range_a.
+        // The closure uses forged-'static: self_static, ctx_static, exec_static.
+        // session_a is created INSIDE the closure from exec_static so its
+        // GraphSession<'static> lifetime is consistent with exec_static's 'static.
+        submit_to_global_worker(move || {
+            let result: WorkerResult = (|| {
+                let mut session_a = exec_static
+                    .begin()
+                    .map_err(|e| format!("worker begin session_a: {e}"))?;
+                let mut worker_reg = worker_reg;
+                let mut profile_a = profile_a;
+                let mut per_layer_disp_a = per_layer_disp_a;
+                let mut total_dispatches_a = total_dispatches_a;
+                for layer_idx in range_a {
+                    self_static
+                        .encode_one_layer(
+                            layer_idx,
+                            ctx_static,
+                            &mut session_a,
+                            exec_static,
+                            &mut worker_reg,
+                            &mut profile_a,
+                            &mut per_layer_disp_a,
+                            &mut total_dispatches_a,
+                        )
+                        .map_err(|e| format!("worker encode L{layer_idx}: {e}"))?;
+                }
+                // CRITICAL: commit chunk-A's CommandBuffer BEFORE signaling via
+                // done_tx.send.  This ensures CB-A enters the Metal queue BEFORE
+                // main thread commits CB-B (which happens after done_rx.recv()
+                // returns).  Metal executes CBs in commit order → GPU runs
+                // chunk_A then chunk_B → activations.hidden handoff is correct.
+                // See INV-7 / R-B7.
+                let _enc = session_a.commit();
+                Ok((worker_reg, per_layer_disp_a, total_dispatches_a, profile_a))
+            })();
+            // Ignore send error: if done_rx was dropped, the recv below will
+            // return Err and propagate the error up cleanly.
+            let _ = done_tx.send(result);
+        })
+        .map_err(|e| anyhow::anyhow!("submit_to_global_worker failed: {e}"))?;
+
+        // Main thread encodes chunk-B concurrently with the worker's chunk-A.
+        for layer_idx in range_b {
+            self.encode_one_layer(
+                layer_idx,
+                ctx,
+                session_b,
+                exec,
+                main_reg,
+                profile_main,
+                per_layer_disp_log_main,
+                total_dispatches_main,
+            )?;
+        }
+
+        // MANDATORY: wait for the worker before returning.  This recv() is the
+        // load-bearing half of the safety contract above — forged-'static refs
+        // must not be accessed after forward_decode returns.  Do NOT remove or
+        // delay this call without auditing all forged-'static lifetimes above.
+        let (returned_worker_reg, mut per_layer_disp_a, dispatches_a, profile_a) =
+            done_rx
+                .recv()
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "parallel-encode worker channel closed unexpectedly — \
+                         worker thread may have panicked"
+                    )
+                })?
+                .map_err(|e| anyhow::anyhow!("parallel-encode worker error: {e}"))?;
+
+        // Merge worker's accumulator back into main's:
+        //  - per_layer_disp_log: order within the vec doesn't matter (post-loop
+        //    dump iterates all entries); just append.
+        per_layer_disp_log_main.append(&mut per_layer_disp_a);
+        //  - total_dispatches: additive.
+        *total_dispatches_main += dispatches_a;
+        //  - profile: per-layer Vecs are indexed by layer_idx; range_a indices
+        //    were written by worker, range_b by main — merge by summing each
+        //    index (worker's range_b entries are all zero; main's range_a
+        //    entries are all zero before this merge).
+        merge_profiles(profile_main, profile_a);
+
+        Ok(returned_worker_reg)
     }
 
     /// Returns: the next token ID (greedy decode)
