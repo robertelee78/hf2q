@@ -3201,7 +3201,6 @@ impl MlxModelWeights {
         let dev = exec.device();
         let metal_dev = dev.metal_device();
         let hs = ctx.hidden_size;
-        let num_layers = ctx.num_layers;
         let seq_pos = ctx.seq_pos;
         let dump_layers = ctx.dump_layers;
         let dump_detail_layer = ctx.dump_detail_layer;
@@ -5788,11 +5787,7 @@ impl MlxModelWeights {
             let mut per_layer_disp_log: Vec<(usize, bool, u64)> = Vec::new();
             let ctx = super::layer_ctx::LayerCtx {
                 seq_pos,
-                input_token,
-                num_layers,
                 hidden_size: hs,
-                num_attention_heads: self.num_attention_heads,
-                eps: self.rms_norm_eps,
                 kv_info: &kv_info,
                 dump_layers,
                 dump_detail_layer,
