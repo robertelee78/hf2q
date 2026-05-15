@@ -37,6 +37,11 @@
 /// Per-token, cross-layer encoding context.  Built once in
 /// forward_decode's pre-loop section, then passed (`&LayerCtx`) to
 /// each invocation of `encode_one_layer`.
+///
+/// `Copy` is derived so ADR-031 Phase B can construct a child `parallel_ctx`
+/// with `dual_buffer_splits: &[]` via struct-update syntax (`..ctx`).  All
+/// 13 fields are `Copy` (usize, bool, Option<usize>, f32, u32, &[T], &str).
+#[derive(Clone, Copy)]
 pub(crate) struct LayerCtx<'a> {
     // --- Token state ---
     pub seq_pos: usize,

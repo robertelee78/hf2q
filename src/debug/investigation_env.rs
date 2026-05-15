@@ -427,6 +427,41 @@ pub struct InvestigationEnv {
     // ========================================================================
 
     // ========================================================================
+    // ADR-031 Phase B — parallel-encode gate + interaction guard.
+    //
+    // HF2Q_PARALLEL_ENCODE=1 opts in to encoding layer chunks concurrently
+    // on the global encoder worker + main thread.  Default OFF.
+    //
+    // Interaction guard: HF2Q_PER_LAYER_DISP=1 uses a global mlx-native
+    // dispatch counter; two CPU encode threads racing on it produce
+    // meaningless per-layer attribution.  When PER_LAYER_DISP is set,
+    // parallel_encode_enabled() returns false and emits a once-per-process
+    // warning via tracing::warn.
+    //
+    // parallel_encode_raw: raw intent (pre-guard); true when
+    //   HF2Q_PARALLEL_ENCODE=1 was set at process start.
+    // per_layer_disp_raw: true when HF2Q_PER_LAYER_DISP=1 was set at
+    //   process start.  Snapshotted here so both are read once from the
+    //   environment at LazyLock init time.
+    // ========================================================================
+
+    /// Raw (pre-guard) intent for `HF2Q_PARALLEL_ENCODE=1`.
+    /// Use `parallel_encode_enabled()` for the guarded effective value.
+    pub parallel_encode_raw: bool,
+
+    /// Raw snapshot of `HF2Q_PER_LAYER_DISP=1`.  Also used by forward_decode
+    /// to decide whether to print per-layer dispatch counts; snapshotted here
+    /// so both interaction-guard checks see the same value.
+    pub per_layer_disp_raw: bool,
+
+    /// Minimum `seq_pos` at which the parallel-encode path engages.
+    /// Below this depth the serial path is used even when
+    /// `HF2Q_PARALLEL_ENCODE=1` (worker overhead > benefit at shallow KV
+    /// depth).  Default 512.  Override via
+    /// `HF2Q_PARALLEL_ENCODE_KV_THRESHOLD=N`.
+    pub parallel_encode_kv_threshold: usize,
+
+    // ========================================================================
     // Category 4 — SDPA regime selector (HF2Q_USE_DENSE / HF2Q_LAYER_POLICY).
     // These two vars select per-layer dense vs TQ SDPA dispatch.
     // Read per-token per-layer in the decode loop when gate_h_inactive and
@@ -897,9 +932,49 @@ impl InvestigationEnv {
             mlx_kernel_profile: env_eq_one("HF2Q_MLX_KERNEL_PROFILE"),
             mlx_profile: env_eq_one("HF2Q_MLX_PROFILE"),
 
+            // ADR-031 Phase B: parallel-encode gate + interaction guard.
+            // Both vars are snapshotted once at LazyLock init so the
+            // parallel_encode_enabled() interaction guard always sees the
+            // same values as the GpuContext::new() call site.
+            parallel_encode_raw: env_eq_one("HF2Q_PARALLEL_ENCODE"),
+            per_layer_disp_raw: env_eq_one("HF2Q_PER_LAYER_DISP"),
+            parallel_encode_kv_threshold: env::var("HF2Q_PARALLEL_ENCODE_KV_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(512),
+
             unsafe_experiments_acked: ack,
             raw,
         }
+    }
+
+    /// Returns true when parallel-encode is active for this process:
+    ///   - `HF2Q_PARALLEL_ENCODE=1` was set at process start, AND
+    ///   - `HF2Q_PER_LAYER_DISP=1` was NOT set (interaction guard).
+    ///
+    /// When `HF2Q_PER_LAYER_DISP=1` overrides the parallel request,
+    /// a once-per-process `tracing::warn!` is emitted via a `Once` guard so
+    /// the operator immediately sees why PARALLEL=ON had no effect.
+    pub fn parallel_encode_enabled(&self) -> bool {
+        if !self.parallel_encode_raw {
+            return false;
+        }
+        if self.per_layer_disp_raw {
+            // Interaction guard: HF2Q_PER_LAYER_DISP=1 races on the global
+            // mlx_native::dispatch_count() counter with two CPU encode threads.
+            // Force parallel OFF and warn once.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "HF2Q_PARALLEL_ENCODE=1 is set but HF2Q_PER_LAYER_DISP=1 is also set — \
+                     parallel encode DISABLED (per-layer dispatch counter is process-global; \
+                     two encode threads would race on it). Unset HF2Q_PER_LAYER_DISP to enable \
+                     parallel encode."
+                );
+            });
+            return false;
+        }
+        true
     }
 
     /// Resolve the dual-buffer split point against the current model's
@@ -1862,5 +1937,52 @@ mod tests {
         // "0" → false.
         guard.set("HF2Q_KV_LCP_RESUME", "0");
         assert!(!is_kv_lcp_resume_explicitly_one(), r#""0" must return false"#);
+    }
+
+    // ── parallel_encode_enabled (ADR-031 Phase B) ────────────────────────────
+
+    /// a) Both env vars unset → enabled() returns false.
+    #[test]
+    fn parallel_encode_enabled_both_unset_returns_false() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::new(&["HF2Q_PARALLEL_ENCODE", "HF2Q_PER_LAYER_DISP"]);
+        let env = InvestigationEnv::from_env();
+        assert!(!env.parallel_encode_raw, "raw field should be false when unset");
+        assert!(!env.per_layer_disp_raw, "per_layer_disp_raw should be false when unset");
+        assert!(
+            !env.parallel_encode_enabled(),
+            "both unset => enabled() must return false (default OFF)"
+        );
+    }
+
+    /// b) PARALLEL=1, DISP unset → enabled() returns true.
+    #[test]
+    fn parallel_encode_enabled_parallel_one_disp_unset_returns_true() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_PARALLEL_ENCODE", "HF2Q_PER_LAYER_DISP"]);
+        guard.set("HF2Q_PARALLEL_ENCODE", "1");
+        let env = InvestigationEnv::from_env();
+        assert!(env.parallel_encode_raw, "raw field should be true with =1");
+        assert!(!env.per_layer_disp_raw, "per_layer_disp_raw should be false when unset");
+        assert!(
+            env.parallel_encode_enabled(),
+            "PARALLEL=1, DISP unset => enabled() must return true"
+        );
+    }
+
+    /// c) PARALLEL=1, DISP=1 → enabled() returns false (interaction guard).
+    #[test]
+    fn parallel_encode_enabled_interaction_guard_blocks_when_disp_set() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::new(&["HF2Q_PARALLEL_ENCODE", "HF2Q_PER_LAYER_DISP"]);
+        guard.set("HF2Q_PARALLEL_ENCODE", "1");
+        guard.set("HF2Q_PER_LAYER_DISP", "1");
+        let env = InvestigationEnv::from_env();
+        assert!(env.parallel_encode_raw, "raw field should be true");
+        assert!(env.per_layer_disp_raw, "per_layer_disp_raw should be true");
+        assert!(
+            !env.parallel_encode_enabled(),
+            "PARALLEL=1 + DISP=1 => enabled() must return false (interaction guard)"
+        );
     }
 }
