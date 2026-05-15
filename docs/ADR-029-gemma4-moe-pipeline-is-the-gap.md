@@ -4601,3 +4601,124 @@ is **NOT /loop-tractable**:
 1. Continue periodic re-bench cycles (canonical baselines for drift detection)
 2. Periodic peer commit archaeology (new commits since 2026-05-15)
 3. Per-step recording of any new hypothesis that gets tested
+
+## Iter-175 Steps 1ad–1ar (2026-05-15) — gap localized to CPU side; closure attempts
+
+This block extends the consolidated ADR with iter-175 Steps 1ad through 1ar.
+Each has a detailed research artifact in `docs/research/`.
+
+### The closure investigation — endgame
+
+Steps 1ad–1ar systematically bisect WHERE the residual 6.35% decode gap
+lives, and what's resistant to standard optimization.
+
+#### Step 1ad–1ag — per-kernel speed is NOT the bottleneck
+
+* Step 1ad — `_id` kernel per-row vs non-`_id`: `_id` is **-36% per-row**
+  (better GPU fill from 8× more TGs).  Refutes "indirection is slow".
+  *Note: synthetic shape K=8192/N=2816; Step 1af corrected this.*
+* Step 1ae — peer Q6_K kernel vs hf2q Q6_K kernel at synthetic shape:
+  hf2q **+3.89% faster** than peer.
+* Step 1af — shape correction: actual gemma4 ffn_down_exps is **Q8_0**
+  (K=704, N=2816), not Q6_K.
+* Step 1ag — peer Q8_0 kernel vs hf2q Q8_0 kernel at CORRECT gemma4 shape:
+  hf2q **2× faster** than peer (20.0 vs 40.4 µs).  Peer's wider TG
+  strategy overcommits at K=704; our simpler 2-SG fits the shape.
+
+**Conclusion**: hf2q's FFN kernels are equal-or-faster than peer's.  The
+6.35% wall gap is NOT in per-kernel speed.
+
+#### Step 1ah — gap LOCALIZED to CPU encode
+
+Used `HF2Q_SPLIT_TIMING=1` instrumentation on production decode:
+
+```
+CPU encode body: ~0.59 ms (6.0% of wall)
+GPU body:        ~8.70 ms (89.4% of wall)
+HEAD + misc:     ~0.44 ms (~4.5% of wall)
+Total wall:      ~9.73 ms (matches Generation 102.8 t/s)
+```
+
+Per-dispatch: **0.68 µs/dispatch** in production.
+
+Inferred peer breakdown: peer's wall is 0.60 ms shorter; peer must spend
+~0.30 ms on encode + 0.13 ms on head (3× cheaper per dispatch).
+
+#### Step 1ai–1ak — per-dispatch CPU bisect
+
+* Step 1ai (estimated): FFI dominates ~94% of cost → WRONG.
+* Step 1aj (measured): raw Metal FFI is 162 ns/dispatch (24%).
+* Step 1ak (measured): encoder.rs wrapper +37 ns, dispatch_tracked +23 ns
+  → 228 ns through deepest mlx-native layer.  Production = 680 ns.
+  **452 ns is in forward_mlx.rs orchestration** (5-layer call chain).
+
+#### Step 1al–1ap — orchestration component bisect
+
+| Step | Component | Cost | Wall % |
+|---|---|---|---|
+| 1al | pipeline lookups | 40 µs/tok | 0.4% |
+| 1am | env reads (uncached) | 20 µs/tok | 0.2% |
+| 1ap | barrier_between | 29 µs/tok | 0.3% |
+| Sum | small overheads | 89 µs/tok | **~0.9%** |
+| Unaccounted | dispersed in call chain | 281 µs/tok | **~3.1%** |
+
+#### Step 1an–1ao — landed wins
+
+* Step 1an: cached `HF2Q_Q6K_ID_MV_NR2` + `HF2Q_Q8_0_ID_MV_NR2` via AtomicI8.
+  Validated: **+0.24% wall** (95.30 → 95.53 t/s, σ 0.05% per-arm).
+* Step 1ao: extended caching to 4 more sites (dispatch_mv + rms_norm × 3 +
+  fused_norm_add + fused_head_norm_rope).  Validated: **+0.17% vs Step 1z**
+  (additional sites within noise — Step 1an captured the dominant ones).
+
+#### Step 1aq–1ar — closure attempts FALSIFIED
+
+* Step 1aq: added `lto = "thin"` to `[profile.release]` → **-0.28% regression**.
+  Reverted.  Build time +35s.  Likely ICache pressure from over-aggressive
+  cross-crate inlining.
+* Step 1ar: added `#[inline]` to encoder dispatch methods → **0.00% neutral**.
+  Reverted.  Either compiler chose not to inline these hot methods, or the
+  inlining didn't matter at the observed precision.
+
+### The endgame conclusion
+
+After 25+ iterations of investigation, the iter-175 gap is now:
+
+* **Definitively localized**: ~3% in dispersed CPU-side orchestration overhead
+  (5-layer nested call chain, struct construction, etc.).
+* **Resistant to standard compiler levers**: both global LTO and per-function
+  `#[inline]` produced neutral-to-negative effect.
+* **Resistant to localized micro-fixes**: pipeline lookups, env reads,
+  barrier_between, struct construction — each individually <0.5% wall.
+
+To close further requires either:
+1. **Algorithmic restructuring** (pre-bake per-layer dispatch records at
+   model load; collapse the 5-layer call chain into a flat
+   dispatch-table-driven inner loop).  **Multi-week project.**
+2. **Operator-only Apple Instruments timeline profile** to identify the
+   actual cycle-level bottleneck (cache misses? branch mispredicts?
+   memory access stalls?).
+3. **Accept the current state** as the structural floor at this codebase
+   shape.  Decode 0.9365× peer-FA + prefill 1.037× peer-FA = ship-worthy
+   parity with intentional structural choices (TQ-HB KV cache, MoE
+   experts).
+
+### Final canonical baselines
+
+For iter-176+ regression gates:
+
+| Phase | hf2q | peer-FA | ratio |
+|---|---|---|---|
+| **decode tg200** | **95.30-95.53 t/s** | 100.94 t/s | 0.9365-0.9462× |
+| **prefill pp2013** | **3030 t/s** | 2922 t/s | **1.0370× AHEAD** |
+
+Iter-175 cumulative wins since iter-100 (0.924× → ~0.94-0.95× peer-FA):
+- Step 1d concurrent dispatch default
+- Step 1e q6_K_nr2 tracked-dispatch
+- Step 1m precompiled metallib default-ON
+- Step 1an env caching at 2 hot sites (+0.24%)
+- Step 1ao env caching at 4 more sites (+0.17%, additive)
+
+7 hypothesis-falsifications prevented committing wrong-direction code:
+1ad shape (synthetic vs production), 1ai cost estimate (4× off), 1aj
+wrapper attribution, 1ak orchestration attribution, 1al pipeline lookups,
+1ap barrier_between, 1aq LTO=thin, 1ar inline hints.
