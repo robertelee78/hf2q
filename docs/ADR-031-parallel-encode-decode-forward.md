@@ -1,9 +1,81 @@
 # ADR-031: Parallel-encode the gemma4 decode forward path
 
-- **Status**: Phase A LANDED 2026-05-14 (merge `c7f98865`); Phase B/C pending separate CFA sessions
+- **Status**: Phase A LANDED 2026-05-14 (merge `c7f98865`); **Phase B LANDED 2026-05-15 as INFRASTRUCTURE-ONLY (merge `83c3ea6d`, default-OFF; no measured speedup yet); Phase C pending separate CFA session**
 - **Date**: 2026-05-14
 - **Deciders**: operator (max3@agidreams.us)
 - **Tags**: performance, decode, metal, gemma4, peer-parity
+
+## Phase B landing — 2026-05-15 (merge `83c3ea6d`) — INFRASTRUCTURE ONLY, default OFF
+
+Phase B v3 shipped the parallel-encode worker-thread infrastructure that
+Phase C will activate.  **Phase B itself does not deliver a measurable
+speedup** — bench at HEAD `c2a2ee4c` (pre-merge) showed:
+
+| Regime | MAIN (e86831ab) | PARALLEL=0 (B9) | PARALLEL=1 (B9) | Δ vs PARALLEL=0 |
+|---|---|---|---|---|
+| tg100 (5-cycle alt-pair) | 95.86 ± 0.34 | 95.52 ± 1.11 | **95.58 ± 0.62** | **+0.06 t/s** (within ±0.3 gate ✓) |
+| tg2000 (3-cycle alt-pair) | 92.63 ± 0.47 | 92.93 ± 0.32 | **92.43 ± 0.47** | **−0.50 t/s** (just outside ±0.3, but Δ ≈ σ → statistically within noise) |
+
+At tg100 the FIX-4 kv-depth threshold (`HF2Q_PARALLEL_ENCODE_KV_THRESHOLD`
+default 512) routes the call back through the serial path, so PARALLEL=1
+is effectively PARALLEL=0 (Δ +0.06 t/s, well within noise).  At tg2000
+the parallel path engages but hits the **R-B7 commit-serialization
+ceiling**: CPU encoding overlaps across the worker + main threads, but
+the Metal command-buffer commits are serialized (worker commits CB-A
+before mpsc::send; main commits CB-B after recv) to enforce
+chunk-A-before-chunk-B GPU execution order without adding a new
+`mlx_native::GraphSession::enqueue()` API.  This caps the realistic gain
+ceiling at small-positive in v1.
+
+**Why merge with no demonstrated gain**: Phase B v3 is operator-approved
+as infrastructure scaffolding for Phase C.  Default-OFF means production
+tg100 + tg2000 are unaffected.  Phase C (separate future CFA session)
+will add `GraphSession::enqueue()` to overlap commits, then re-bench to
+find the depth where parallel actually wins, then default-flip if
+≥+2% gain with coherence preserved.  Operator decision recorded:
+**default-flip is GATED on Phase C delivering measurable benefit.**
+
+### Commits merged (10 substeps, preserved via `--no-ff`)
+
+- B0 `3add7a8a` — GpuContext.worker_registry: Option<KernelRegistry>; lazy alloc at HF2Q_PARALLEL_ENCODE=1
+- B1 `0d8b28b8` — InvestigationEnv.parallel_encode_enabled() + HF2Q_PER_LAYER_DISP interaction guard
+- B2 `1fba9fea` — encode_parallel_layers_chunked Path-D unsafe-lifetime-forge (initial)
+- B3 `91883b51` — forward_decode wiring + LayerCtx derive Copy
+- B4 `0701ae35` — sourdough byte-identity PARALLEL=1 3/3 PASS
+- B5 `51893164` — coherence_smoke 2/2 PARALLEL=1 PASS
+- B6 `7468cdaf` — tg100 bench: default neutral, parallel −1.17% (v1 regression that triggered iter-2)
+- B7 `e954742d` — FIX-1 (INV-4 unconditional recv) + FIX-2 (INV-3 single unsafe) + FIX-3 (R-B9 mpsc carries reg) + FIX-4 (kv-depth threshold 512)
+- B7-gates `ce19198d` — post-fix sourdough 6/6 + coherence 2/2 PASS
+- B8 `6a33046b` — perf re-bench: tg100 Δ +0.06, tg2000 Δ −0.50
+- B9 `c2a2ee4c` — R-B9 RAII: IIFE wrap + tuple-return signature so put_worker_registry runs unconditionally on every exit path
+
+### Architecture summary
+
+- `MlxModelWeights: Send + Sync` compile-tested at `e86831ab` (Phase B foundation)
+- `GpuContext.worker_registry: Option<KernelRegistry>` — second registry pre-warmed at GpuContext::new IF HF2Q_PARALLEL_ENCODE=1 is set in the env
+- `encode_parallel_layers_chunked(...) -> (Option<KernelRegistry>, Result<()>)` — private helper containing ONE unsafe `std::mem::transmute` block (three forges of &'a → &'static for self/ctx/exec); mandatory `done_rx.recv()` AFTER worker submit guarantees the forged lifetimes are bounded; tuple return ensures the worker's KernelRegistry is always recoverable through all post-submit error paths
+- `forward_decode`'s inner gpu.split() block wrapped in IIFE so `?` returns from the closure, NOT from forward_decode — the post-IIFE `put_worker_registry` runs unconditionally (R-B9 RAII)
+- HF2Q_PARALLEL_ENCODE_KV_THRESHOLD (default 512): below threshold, parallel path is skipped — tg100 falls back to serial
+
+### Invariants (all verified at merge)
+
+- INV-1 byte-identity default: sourdough 6/6 PASS, byte-identical to HEAD `e86831ab`
+- INV-2 byte-identity parallel: sourdough 3/3 PASS with HF2Q_PARALLEL_ENCODE=1
+- INV-3 single unsafe block: 1 unsafe block in encode_parallel_layers_chunked, 0 elsewhere
+- INV-4 mandatory recv: done_rx.recv() runs on every return path of the helper (codex iter2 verified)
+- INV-5 spawn-and-wait atomicity: spawn + recv co-located in single private helper
+- INV-6 interaction guard: parallel_encode_enabled() returns false when HF2Q_PER_LAYER_DISP=1, warn-once
+- INV-7 commit order: worker session_a.commit() BEFORE done_tx.send; main session_b.commit() AFTER done_rx.recv
+- R-B9 panic-leak: closed for all post-submit-success paths via tuple-return + RAII-IIFE; documented submit-failure edge case remains (Phase C addresses via Arc<Mutex<KernelRegistry>>)
+
+### Carry-forward to Phase C
+
+1. `mlx_native::GraphSession::enqueue()` API addition (the lever for actual speedup)
+2. tg5000+ deep-kv-context benches to find regime where parallel wins
+3. HF2Q_PARALLEL_ENCODE_KV_THRESHOLD tuning
+4. HF2Q_SPEC_NGRAM + PARALLEL stack interaction measurement (R-B10)
+5. R-B9 submit-failure registry leak (Arc<Mutex<KernelRegistry>>)
+6. Default-flip decision (gated on ≥+2% measured gain + coherence preserved)
 
 ## Phase A landing — 2026-05-14 (merge `c7f98865`)
 
