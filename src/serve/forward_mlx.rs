@@ -5567,6 +5567,14 @@ impl MlxModelWeights {
         per_layer_disp_log_main: &mut Vec<(usize, bool, u64)>,
         total_dispatches_main: &mut usize,
     ) -> (Option<KernelRegistry>, Result<()>) {
+        // ADR-031 Phase C — diagnostic profiling.  Gated on
+        // HF2Q_PARALLEL_PROFILE=1 env var (read once per token, branch
+        // predictor handles cheaply when unset).  Prints per-phase timings
+        // to stderr so the Phase C design choice (commit-overlap via
+        // GraphSession::enqueue() vs CPU overhead reduction) can be made
+        // based on measured data, not assumption.
+        let profile_enabled = std::env::var("HF2Q_PARALLEL_PROFILE").as_deref() == Ok("1");
+        let prof_t0 = if profile_enabled { Some(std::time::Instant::now()) } else { None };
         // Worker sends back (registry, accumulators) on both Ok and Err paths so
         // the caller can always restore the registry into GpuContext.  Err carries
         // the registry alongside the error string to avoid a registry-leak on
@@ -5574,7 +5582,9 @@ impl MlxModelWeights {
         type WorkerOk = (KernelRegistry, Vec<(usize, bool, u64)>, usize, Option<TokenProfile>);
         type WorkerErr = (KernelRegistry, String);
         type WorkerResult = Result<WorkerOk, WorkerErr>;
+        let prof_t_pre_channel = prof_t0.map(|_| std::time::Instant::now());
         let (done_tx, done_rx) = std::sync::mpsc::channel::<WorkerResult>();
+        let prof_channel_us = prof_t_pre_channel.map(|t| t.elapsed().as_micros());
 
         // Clone profile scratch for the worker.  If profiling is active,
         // profile_main already has per-layer Vecs pre-allocated to num_layers;
@@ -5619,15 +5629,20 @@ impl MlxModelWeights {
         // The closure uses forged-'static: self_static, ctx_static, exec_static.
         // session_a is created INSIDE the closure from exec_static so its
         // GraphSession<'static> lifetime is consistent with exec_static's 'static.
+        let prof_t_pre_submit = prof_t0.map(|_| std::time::Instant::now());
         if let Err(submit_err) = submit_to_global_worker(move || {
             // worker_reg kept in outer scope so it is always accessible for the
             // Err arm below — the inner encode loop borrows it mutably but does
             // not consume it, so it is still owned here on both Ok and Err paths.
             let mut worker_reg = worker_reg;
             let encode_result: Result<(Vec<(usize, bool, u64)>, usize, Option<TokenProfile>), String> = (|| {
+                // ADR-031 Phase C profile: worker-side phase timings.
+                let pw_begin = profile_enabled.then(std::time::Instant::now);
                 let mut session_a = exec_static
                     .begin()
                     .map_err(|e| format!("worker begin session_a: {e}"))?;
+                let pw_begin_us = pw_begin.map(|t| t.elapsed().as_micros());
+                let pw_encode = profile_enabled.then(std::time::Instant::now);
                 let mut profile_a = profile_a;
                 let mut per_layer_disp_a = per_layer_disp_a;
                 let mut total_dispatches_a = total_dispatches_a;
@@ -5645,6 +5660,8 @@ impl MlxModelWeights {
                         )
                         .map_err(|e| format!("worker encode L{layer_idx}: {e}"))?;
                 }
+                let pw_encode_us = pw_encode.map(|t| t.elapsed().as_micros());
+                let pw_commit = profile_enabled.then(std::time::Instant::now);
                 // CRITICAL: commit chunk-A's CommandBuffer BEFORE signaling via
                 // done_tx.send.  This ensures CB-A enters the Metal queue BEFORE
                 // main thread commits CB-B (which happens after done_rx.recv()
@@ -5652,6 +5669,15 @@ impl MlxModelWeights {
                 // chunk_A then chunk_B → activations.hidden handoff is correct.
                 // See INV-7 / R-B7.
                 let _enc = session_a.commit();
+                let pw_commit_us = pw_commit.map(|t| t.elapsed().as_micros());
+                if profile_enabled {
+                    eprintln!(
+                        "[PARALLEL_PROFILE worker] begin={}µs encode_a={}µs commit_a={}µs",
+                        pw_begin_us.unwrap_or(0),
+                        pw_encode_us.unwrap_or(0),
+                        pw_commit_us.unwrap_or(0),
+                    );
+                }
                 Ok((per_layer_disp_a, total_dispatches_a, profile_a))
             })();
             // Registry always travels back — on both Ok and Err — so the caller
@@ -5674,9 +5700,12 @@ impl MlxModelWeights {
             return (None, Err(anyhow::anyhow!("submit_to_global_worker failed: {submit_err}")));
         }
 
+        let prof_submit_us = prof_t_pre_submit.map(|t| t.elapsed().as_micros());
+
         // Main thread encodes chunk-B concurrently with the worker's chunk-A.
         // Use a Result capture rather than `?` so we can unconditionally wait for
         // the worker before propagating any error (FIX-1 / INV-4 + INV-5).
+        let prof_t_pre_encode_b = prof_t0.map(|_| std::time::Instant::now());
         let chunk_b_result: Result<()> = (|| {
             for layer_idx in range_b {
                 self.encode_one_layer(
@@ -5692,6 +5721,7 @@ impl MlxModelWeights {
             }
             Ok(())
         })();
+        let prof_encode_b_us = prof_t_pre_encode_b.map(|t| t.elapsed().as_micros());
 
         // MANDATORY unconditional wait — load-bearing for the unsafe block's
         // soundness.  The forged-'static refs (self_static, ctx_static,
@@ -5701,6 +5731,7 @@ impl MlxModelWeights {
         // still dereferencing those forged refs — UB.  Do NOT add any
         // early-return or `?` between the submit_to_global_worker call above
         // and this recv().
+        let prof_t_pre_recv = prof_t0.map(|_| std::time::Instant::now());
         let worker_msg = match done_rx.recv() {
             Ok(msg) => msg,
             Err(_) => {
@@ -5742,6 +5773,19 @@ impl MlxModelWeights {
                     )));
                 }
             };
+
+        let prof_recv_us = prof_t_pre_recv.map(|t| t.elapsed().as_micros());
+        if profile_enabled {
+            let total_us = prof_t0.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+            eprintln!(
+                "[PARALLEL_PROFILE main]  channel={}µs submit={}µs encode_b={}µs recv_blocked={}µs total_helper={}µs",
+                prof_channel_us.unwrap_or(0),
+                prof_submit_us.unwrap_or(0),
+                prof_encode_b_us.unwrap_or(0),
+                prof_recv_us.unwrap_or(0),
+                total_us,
+            );
+        }
 
         // Merge worker's accumulator back into main's:
         //  - per_layer_disp_log: order within the vec doesn't matter (post-loop
