@@ -3851,4 +3851,70 @@ All three require engineering investment beyond a 5-min /loop window. iter-175's
 
 Full step-by-step details: `docs/research/ADR-029-iter-175-step-1g-h-e-toolchain-2026-05-15.md`.
 
+## Iter-175 Step 1h (2026-05-15) — per-kernel bench REFRAMES where the gap lives
+
+Comprehensive per-kernel bench at HEAD using mlx-native's existing benches (`bench_decode_qmatmul_shapes`, `bench_decode_moe_id_shapes`, `bench_hadamard`):
+
+### Matvec kernels are NEAR-PEAK efficient
+
+| Kernel/shape | µs/call | GB/s | % M5 Max peak |
+|---|---:|---:|---:|
+| Q_sliding (Q6_K 4096×2816) | 24.6 | 384.1 | 70.3% |
+| K_sliding (Q6_K 2048×2816) | 11.8 | 402.1 | 73.7% |
+| V_sliding (Q6_K 2048×2816) | 10.6 | 444.5 | 81.4% |
+| O_sliding (Q6_K 2816×4096) | 15.0 | 630.2 | 115.4% (L2 amp) |
+| lmhead (Q6_K 262144×2816) | 1037.8 | 583.5 | 106.9% |
+| g4_gate_up MoE (Q6_K) | 35.7 | 728.4 | 133.4% |
+| g4_down MoE (Q8_0) | 22.7 | 743.8 | 136.2% |
+
+Average matvec efficiency: **~85% of peak** for memory-bound work. Matvecs are NOT the close-the-gap lever.
+
+### Wall-budget allocation per decoded token (10.7 ms/tok ≈ 93 t/s at HEAD)
+
+| Component | Time | % wall |
+|---|---:|---:|
+| Attention + router matvecs | 4.39 ms | **41.0%** |
+| MoE-id matvecs | 1.75 ms | **16.4%** |
+| Hadamard quantize | ~0.145 ms | ~1.4% |
+| **Sub-total matvec + hadamard** | **6.28 ms** | **58.7%** |
+| **NON-MATVEC residual** | **4.42 ms** | **41.3%** ← **gap concentrates here** |
+
+### The structural reframe
+
+Standing-context assumed "matvec kernels are where the lever lives." Step 1h **falsifies** this assumption: matvecs run at near-peak efficiency, and the ~6-8% peer-FA gap (~1.1 ms/tok) cannot live in already-efficient matvecs.
+
+The non-matvec 41.3% of wall = **4.42 ms/tok** spread across:
+- `flash_attn_vec_hybrid_dk256` (25/tok)
+- `flash_attn_vec_reduce_dk256` (25/tok)
+- `kv_copy_kf16_quantize_v_no_fwht_d256` (25/tok)
+- `fused_head_norm_rope_f32_v2` (60/tok)
+- `fused_moe_routing_f32_v2` (30/tok)
+- `moe_weighted_sum` (30/tok)
+- `moe_swiglu_batch` (30/tok)
+- `rms_norm_f32_v2` (150/tok — peer-equivalent, fast)
+
+### H-F (NEW): the residual gap concentrates in non-matvec kernels
+
+**Testable**: bench each non-matvec kernel in isolation, identify which (if any) accounts for a disproportionate share of the 4.42 ms/tok budget. Targets:
+- FA hybrid+reduce together >2 ms/tok = bigger lever (50 calls × ~40 µs)
+- MoE routing+swiglu+weighted_sum together >1.5 ms/tok = bigger lever
+- If no single kernel dominates → distributed gap; harder to close
+
+This is the **next /loop-suitable investigation** — replaces the deferred H-E.
+
+### Updated cumulative iter-175 status
+
+| Step | Hypothesis | Status |
+|---|---|---|
+| 1 | Dispatch baseline | DONE |
+| 1b | H-A encoder, H-B compile flags | FALSIFIED / PARTIALLY FALSIFIED |
+| 1d | H-D concurrency | CONFIRMED 3.5pp ceiling |
+| 1e | H-D2 enabling infra | LANDED default-OFF |
+| 1f | H-D2 single-site | FALSIFIED |
+| 1g | H-E precompile toolchain | CONFIRMED, test DEFERRED |
+| **1h** | **Per-kernel bench** | **DONE — matvecs near-peak; gap lives in non-matvec** |
+| **1i (next)** | **H-F non-matvec deep-dive** | **OPEN, /loop-suitable** |
+
+Full bench data: `docs/research/ADR-029-iter-175-step-1h-per-kernel-bench-2026-05-15.md`.
+
 
