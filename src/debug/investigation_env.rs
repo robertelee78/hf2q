@@ -706,6 +706,13 @@ pub struct InvestigationEnv {
     /// Default OFF (opt-in until decode-bench ≥+3% gate clears); both
     /// paths byte-identical by mlx-native unit test
     /// (`test_hadamard_quantize_kv_fast_dual_byte_identity_d256`).
+    ///
+    /// ADR-029 iter-175 Step 1u (2026-05-15) re-bench at HEAD:
+    /// 3-cycle alt-pair tg100, gemma4-APEX-Q5_K_M, M5 Max:
+    ///   A (default) C1/C2/C3: 95.5/96.0/95.5 → mean 95.67 t/s
+    ///   B (FUSED_KV=1)    : 89.8(cold)/95.6/95.5 → mean 95.55 (C2+C3)
+    ///   Delta: -0.21% (within noise; C1 outlier from cold PSO).
+    /// Does NOT clear the ≥+3% bar. Stays default-OFF.
     pub tq_fast_fused_kv: bool,
 
     /// `HF2Q_MLX_KERNEL_PROFILE=1` — per-kernel profile mode.
