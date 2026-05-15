@@ -3810,4 +3810,45 @@ GLOBAL migration: switch ALL ~400 hand-placed `enc.memory_barrier()` call sites 
 
 Full bench details: `docs/research/ADR-029-iter-175-step-1f-thermal-fair-bench-2026-05-15.md`.
 
+## Iter-175 Step 1g (2026-05-15) — H-E toolchain confirmed; empirical test deferred
+
+Confirmed `xcrun -sdk macosx metal -O3` produces clean `.air` (21984 B) + `metallib` (71542 B) from `quantized_matmul_ggml.metal`. AIR sizes vary by optimization level:
+- `-O0`: 31264 B (no optimization)
+- default: 22640 B
+- **`-O3`: 21984 B** (smallest)
+
+The 3% AIR-byte delta between default and -O3 confirms Apple's runtime `MTLLibraryOptimizationLevelDefault` is **not byte-identical** to `xcrun metal -O3` at the AIR level. Whether this translates to measurable kernel-execution speed difference requires empirical bench.
+
+### Why empirical test is deferred
+
+To get apples-to-apples kernel timing, one needs:
+1. Load a shader BOTH ways (`new_library_with_source` AND `new_library_with_file`)
+2. Construct realistic Q6_K matvec input buffers at decode shapes (K=2816, N=4096)
+3. Run N≥1000 dispatches each, measure GPU wall-clock with proper warmup
+4. Gate confounders (thermal, sample-buffer overhead, CB count)
+
+Required code: either modify `KernelRegistry` to accept precompiled `Library` (clean refactor, 1-2 hours) OR write a parallel test bypassing `KernelRegistry` entirely (2-3 hours, brittle). **Neither fits a /loop iteration window.**
+
+### Iter-175 cumulative status (after Step 1g)
+
+| Step | Hypothesis | Status |
+|---|---|---|
+| 1 | Dispatch-count baseline | DONE — top kernels already peer-ported |
+| 1b | H-A: encoder overhead | FALSIFIED |
+| 1b | H-B: runtime Metal compile options | PARTIALLY FALSIFIED |
+| 1d | H-D: concurrency strategy | CONFIRMED — 3.5pp ceiling |
+| 1e | H-D2 enabling code | LANDED — default-OFF infrastructure |
+| 1f | H-D2: single-site migration | FALSIFIED — neutral |
+| 1g | H-E: precompiled .metallib | TOOLCHAIN CONFIRMED, empirical test DEFERRED |
+
+### Open paths beyond /loop scope
+
+1. **H-D global migration** (multi-day to multi-week): migrate all ~400 hand-placed barriers to `dispatch_tracked_*`, remove redundant ones, validate byte-identity. Targets ~3.5pp.
+2. **H-E test + full migration** (~2-3 hours test + multi-day port): precompile all 30+ shaders, bundle `.metallib`, modify kernel_registry. Test first; target value unknown until measured.
+3. **H-C cache/memory layout** (operator-runs Apple Instruments + multi-day analysis): unknown target value.
+
+All three require engineering investment beyond a 5-min /loop window. iter-175's /loop-autonomous investigation has produced its full deliverable: structural parity confirmed at all /loop-tractable hypotheses (H-A FALSIFIED, H-B PARTIALLY FALSIFIED, H-D2 FALSIFIED). Remaining gap is structurally addressable but requires dedicated engineering sessions.
+
+Full step-by-step details: `docs/research/ADR-029-iter-175-step-1g-h-e-toolchain-2026-05-15.md`.
+
 
