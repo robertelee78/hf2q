@@ -3692,4 +3692,39 @@ H-E is the highest-information-density next experiment because if Apple's runtim
 
 Full encoder fast-path and CompileOptions side-by-side: `docs/research/ADR-029-iter-175-step-1b-encoder-and-compile-options-2026-05-15.md`.
 
+## Iter-175 Step 1d (2026-05-15) — H-D CONFIRMED: concurrency dispatch IS a lever; hf2q leaves ~3.5pp on the table
+
+**4-arm matrix bench** (same-session, M5 Max, gemma4-ara-2pass-APEX-Q5_K_M, tg100, 60-90s cool-downs):
+
+| Variant | tg100 t/s | Concurrency benefit |
+|---|---:|---:|
+| peer-FA concurrent (default) | **103.79** | +11.9% over serial |
+| peer-FA serial (`GGML_METAL_CONCURRENCY_DISABLE=1`) | 92.77 | baseline |
+| **hf2q HEAD** | **92.7** | +8.4% over serial |
+| hf2q `HF2Q_FORCE_SERIAL_DISPATCH=1` | 85.5 | baseline |
+
+**Peer extracts 11.9% from concurrency; hf2q extracts 8.4% — hf2q is leaving ~3.5pp of concurrency benefit on the table.**
+
+### Root cause
+
+Both repos use `MTLDispatchTypeConcurrent` by default. The difference is barrier-placement strategy:
+- **peer**: auto-tracks read/write ranges at every node via `mem_ranges` (`ggml-metal-ops.cpp:147-225`); inserts barrier only on conflict (844 barriers/1339 disp = 0.63 ratio)
+- **hf2q**: hand-placed `enc.memory_barrier()` at fixed points in `forward_decode` (420 barriers/866 disp = 0.49 ratio)
+
+Per iter-115 raw counts, peer is more aggressive with barriers AND more concurrent in throughput. hf2q's hand-placed strategy approximates ~70% of peer's auto-tracked efficiency.
+
+### Existing migration infrastructure (already built in ADR-015 iter37 — never wired into production)
+
+`mlx-native/src/encoder.rs:1268-1497` has the full peer-equivalent `dispatch_tracked_*` API family + `MemRanges` tracker at `mlx-native/src/mem_ranges.rs`. Gated on `HF2Q_AUTO_BARRIER=1`. **Zero production call sites today** (verified via grep) — the iter37 plan to migrate in "iter38+" never happened.
+
+### Testable next step (H-D2)
+
+Migrate the hottest dispatch site (`kernel_mul_mv_q6_K_f32_nr2`, 19.91% of dispatches at 174/tok) from `encode_threadgroups_with_args_and_shared` to `dispatch_tracked_threadgroups_with_args_and_shared`. Enable `HF2Q_AUTO_BARRIER=1`. Bench tg100 alt-pair. Expected: 0-1pp improvement at this site; cumulative effect requires migrating ~20 hot sites.
+
+### Verdict
+
+**H-D is CONFIRMED as a measurable lever** worth ~3.5pp on a fully-migrated path. This is the highest-confidence-signal hypothesis in the iter-175 ledger. The remaining ~7pp of the 10.7% gap-at-concurrent must come from H-C (cache) or H-E (precompile).
+
+Full bench data and side-by-side strategy comparison: `docs/research/ADR-029-iter-175-step-1d-concurrency-lever-2026-05-15.md`.
+
 
