@@ -66,7 +66,7 @@ pub(crate) struct LayerCtx<'a> {
     // --- KV-cache pre-loop snapshot ---
     /// Per-layer (is_sliding, write_pos, capacity, seq_len) at decode entry.
     /// Layer-encoding loop reads these via `ctx.kv_info[layer_idx]`.
-    pub kv_info: &'a [(bool, u32, u32, u32)],
+    pub kv_info: &'a [(bool, usize, usize, usize)],
 
     // --- Debug/dump flags (INVESTIGATION_ENV-derived, evaluated once) ---
     pub dump_layers: bool,
@@ -79,6 +79,14 @@ pub(crate) struct LayerCtx<'a> {
 
     // --- Per-layer dispatch profiling ---
     pub per_layer_disp_enabled: bool,
+
+    // --- TQ / HB-SDPA parameters (process-static, cached in forward_decode) ---
+    pub tq_scale_factor_d512: f32,
+    pub tq_codebook_bits: u32,
+    pub use_native_hb_sdpa: bool,
+
+    // --- Cache-efficiency dump flag ---
+    pub dump_all_cache_eff: bool,
 }
 
 #[cfg(test)]
@@ -90,7 +98,7 @@ mod tests {
     /// actually wires this struct into encode_one_layer.
     #[test]
     fn layer_ctx_struct_compiles() {
-        let kv_info = vec![(false, 0u32, 1024u32, 0u32); 30];
+        let kv_info = vec![(false, 0usize, 1024usize, 0usize); 30];
         let dual_buffer_splits = vec![2usize];
         let _ctx = LayerCtx {
             seq_pos: 0,
@@ -106,6 +114,10 @@ mod tests {
             dump_run_name: None,
             dual_buffer_splits: &dual_buffer_splits,
             per_layer_disp_enabled: false,
+            tq_scale_factor_d512: 1.0,
+            tq_codebook_bits: 8,
+            use_native_hb_sdpa: true,
+            dump_all_cache_eff: false,
         };
     }
 }
