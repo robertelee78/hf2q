@@ -4226,4 +4226,47 @@ The residual 6-8% peer-FA gap on gemma4-APEX-Q5_K_M at M5 Max is the **STRUCTURA
 
 Full audit + analysis: `docs/research/ADR-029-iter-175-step-1n-gemma4-already-migrated-2026-05-15.md`.
 
+## Iter-175 Step 1p (2026-05-15) — HF2Q_PIPELINE_TG_MULT_HINT: +2.08% tg100, neutral tg2000
+
+Re-tested ADR-028 iter-376's `HF2Q_PIPELINE_TG_MULT_HINT=1` flag at current HEAD (it was added opt-in default-OFF and never re-benched). The flag sets `threadGroupSizeIsMultipleOfThreadExecutionWidth(true)` on every pipeline descriptor, letting Metal compiler skip bounds checks + use more aggressive codegen.
+
+### Bench (2-cycle tg100 alt-pair, 60s cool-downs)
+
+| Cycle | A (default) | B (HINT=1) |
+|---|---:|---:|
+| C1 | 92.9 | 95.9 |
+| C2 | 94.7 | 95.6 |
+| Mean | **93.80** | **95.75** |
+
+**Delta: +2.08% decode at tg100.** Arm B tighter (range 0.3) vs Arm A (range 1.8 thermal-affected).
+
+### tg2000 (1-cycle alt-pair, 75s cool-down)
+
+| Arm | t/s |
+|---|---:|
+| A | 92.3 |
+| B (HINT=1) | 92.1 |
+
+**Delta: −0.2% (within noise)** — long-decode thermal masks the per-dispatch speedup.
+
+### Correctness
+
+- coherence_smoke under HF2Q_PIPELINE_TG_MULT_HINT=1: **2/2 PASS**
+
+### Why not default-flip universally
+
+Apple Metal spec: when this hint is set, every dispatched threadgroup MUST be a multiple of `threadExecutionWidth` (32 on Apple silicon); otherwise UB. Kernel-registry comment claims hot gemma4 kernels are all in `{32, 64, 256, 1024}`. Verified for gemma4 via coherence_smoke; NOT yet verified for qwen35/qwen3vl/bert/nomic_bert/dflash/calibration paths.
+
+Per `feedback_apex_focus`, qwen3.6 is a production APEX target — silently corrupting that path would violate the standing rule "coherence > speed".
+
+### Operator decision
+
+1. **Default-flip gemma4-only** (cheapest, captures +2% tg100 risk-free) — requires plumbing the flag through to per-model path
+2. **Add runtime safety check** in `CommandEncoder::dispatch_thread_groups` to panic on non-multiple-of-32 → then universal default-flip safely
+3. **Cross-model coherence validation** of HINT=1 across all paths → then universal flip
+
+Bench data is solid; gating question is risk tolerance vs ~2% tg100 decode reward.
+
+Full bench data + safety analysis: `docs/research/ADR-029-iter-175-step-1p-tg-mult-hint-bench-2026-05-15.md`.
+
 
