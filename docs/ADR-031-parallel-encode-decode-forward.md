@@ -1,8 +1,8 @@
 # ADR-031: Parallel-encode the gemma4 decode forward path
 
-- **Status**: proposed
+- **Status**: accepted (2026-05-14, Phase A start pending operator green-light)
 - **Date**: 2026-05-14
-- **Deciders**: <pending>
+- **Deciders**: operator (max3@agidreams.us)
 - **Tags**: performance, decode, metal, gemma4, peer-parity
 
 ## Context
