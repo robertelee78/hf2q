@@ -5539,15 +5539,20 @@ impl MlxModelWeights {
     /// `session_b` only AFTER `done_rx.recv()` returns (main is blocked on recv
     /// during chunk-B encoding) — Metal queue receives CB-A before CB-B.
     ///
-    /// Returns the worker's `KernelRegistry` so the caller can store it back
-    /// into `GpuContext::put_worker_registry` for the next token.
+    /// Returns the worker's `KernelRegistry` in BOTH the Ok and Err arms so
+    /// the caller can always restore it into `GpuContext::put_worker_registry`
+    /// without leaking it on encode failure (R-B9 / FIX-3 / iter-2 final).
     ///
-    /// # Errors
-    ///
-    /// Returns `Err` if:
-    /// - `submit_to_global_worker` fails (worker dead — process exit in progress).
-    /// - The worker itself errors during encoding (layer encode error).
-    /// - The mpsc channel drops before a result is received (worker panicked).
+    /// Return shape: `(Option<KernelRegistry>, Result<()>)`.
+    /// - `(Some(reg), Ok(()))` — both sides succeeded; reg is the worker's registry.
+    /// - `(Some(reg), Err(e))` — at least one side errored AFTER the worker
+    ///   thread accepted the closure; reg recovered through the mpsc payload.
+    /// - `(None, Err(e))` — failure BEFORE the worker thread took ownership
+    ///   (e.g. `submit_to_global_worker` lock-poisoned) OR the mpsc channel
+    ///   dropped (worker panicked).  In the rare submit-failure case the
+    ///   registry was already moved into the closure that never ran; the
+    ///   registry is permanently lost for this `GpuContext` (process restart
+    ///   recovers).  Phase C addresses this via Arc<Mutex<KernelRegistry>>.
     #[allow(clippy::too_many_arguments)]
     fn encode_parallel_layers_chunked<'sess>(
         &self,
@@ -5561,7 +5566,7 @@ impl MlxModelWeights {
         profile_main: &mut Option<TokenProfile>,
         per_layer_disp_log_main: &mut Vec<(usize, bool, u64)>,
         total_dispatches_main: &mut usize,
-    ) -> Result<KernelRegistry> {
+    ) -> (Option<KernelRegistry>, Result<()>) {
         // Worker sends back (registry, accumulators) on both Ok and Err paths so
         // the caller can always restore the registry into GpuContext.  Err carries
         // the registry alongside the error string to avoid a registry-leak on
@@ -5614,7 +5619,7 @@ impl MlxModelWeights {
         // The closure uses forged-'static: self_static, ctx_static, exec_static.
         // session_a is created INSIDE the closure from exec_static so its
         // GraphSession<'static> lifetime is consistent with exec_static's 'static.
-        submit_to_global_worker(move || {
+        if let Err(submit_err) = submit_to_global_worker(move || {
             // worker_reg kept in outer scope so it is always accessible for the
             // Err arm below — the inner encode loop borrows it mutably but does
             // not consume it, so it is still owned here on both Ok and Err paths.
@@ -5658,8 +5663,16 @@ impl MlxModelWeights {
             // Ignore send error: if done_rx was dropped, the recv below will
             // return Err and propagate the error up cleanly.
             let _ = done_tx.send(result);
-        })
-        .map_err(|e| anyhow::anyhow!("submit_to_global_worker failed: {e}"))?;
+        }) {
+            // submit_to_global_worker failed BEFORE the closure ran.  Per the
+            // signature contract, the registry is now lost (it was moved into
+            // the closure that never executed).  Return (None, Err) so the
+            // caller can propagate cleanly.  This is a rare path (only fires
+            // if GLOBAL_ENCODER_WORKER mutex is poisoned — i.e. worker thread
+            // already panicked).  Phase C: Arc<Mutex<KernelRegistry>> would
+            // let the registry survive even submit failures.
+            return (None, Err(anyhow::anyhow!("submit_to_global_worker failed: {submit_err}")));
+        }
 
         // Main thread encodes chunk-B concurrently with the worker's chunk-A.
         // Use a Result capture rather than `?` so we can unconditionally wait for
@@ -5688,27 +5701,45 @@ impl MlxModelWeights {
         // still dereferencing those forged refs — UB.  Do NOT add any
         // early-return or `?` between the submit_to_global_worker call above
         // and this recv().
-        let worker_msg = done_rx.recv().map_err(|_| {
-            anyhow::anyhow!(
-                "parallel-encode worker channel closed unexpectedly — \
-                 worker thread may have panicked"
-            )
-        })?;
+        let worker_msg = match done_rx.recv() {
+            Ok(msg) => msg,
+            Err(_) => {
+                // mpsc channel dropped — worker panicked.  Registry is gone
+                // with the worker thread; nothing for us to return.
+                return (None, Err(anyhow::anyhow!(
+                    "parallel-encode worker channel closed unexpectedly — \
+                     worker thread may have panicked"
+                )));
+            }
+        };
 
-        // Now both sides have finished.  Extract registry + accumulators,
-        // then propagate whichever error occurred (chunk-B errors take precedence
-        // since they are observed on the calling thread).
+        // Both sides have finished.  Extract registry + accumulators, then
+        // propagate whichever error occurred.  R-B9 fix: in EVERY arm we
+        // recover the worker's KernelRegistry (from the mpsc payload's Ok or
+        // Err tuple) so the caller can restore it into GpuContext, even on
+        // encode failure.  chunk-B errors take precedence over worker errors
+        // since chunk-B is the originating frame's outcome.
         let (returned_worker_reg, mut per_layer_disp_a, dispatches_a, profile_a) =
             match (chunk_b_result, worker_msg) {
                 (Ok(()), Ok(ok)) => ok,
-                (Err(e), _) => return Err(e),
-                (Ok(()), Err((reg, e))) => {
-                    // Worker errored; registry already extracted from Err tuple,
-                    // but we can't restore it to GpuContext from here — caller
-                    // handles that via the returned Err.  Leak-free: reg is
-                    // moved into the anyhow error's context via Display.
-                    let _ = reg; // registry dropped; GpuContext loses it on this error path
-                    return Err(anyhow::anyhow!("parallel-encode worker error: {e}"));
+                (Err(main_e), Ok((wreg, _disp, _dispatches, _profile))) => {
+                    // chunk-B errored; worker succeeded.  Recover worker reg
+                    // through the Ok tuple; discard worker's accumulator data
+                    // (output is unreliable since main errored).
+                    return (Some(wreg), Err(main_e));
+                }
+                (Ok(()), Err((wreg, worker_e))) => {
+                    // Worker errored; chunk-B succeeded.  Recover worker reg
+                    // through the Err tuple (FIX-3 already routed it there).
+                    return (Some(wreg), Err(anyhow::anyhow!(
+                        "parallel-encode worker error: {worker_e}"
+                    )));
+                }
+                (Err(main_e), Err((wreg, worker_e))) => {
+                    // Both errored.  Recover worker reg; chain errors.
+                    return (Some(wreg), Err(anyhow::anyhow!(
+                        "chunk-B encode error: {main_e}; worker also errored: {worker_e}"
+                    )));
                 }
             };
 
@@ -5724,7 +5755,7 @@ impl MlxModelWeights {
         //    entries are all zero before this merge).
         merge_profiles(profile_main, profile_a);
 
-        Ok(returned_worker_reg)
+        (Some(returned_worker_reg), Ok(()))
     }
 
     /// Returns: the next token ID (greedy decode)
@@ -5996,7 +6027,14 @@ impl MlxModelWeights {
         };
         let mut returned_worker_reg: Option<KernelRegistry> = None;
 
-        {
+        // R-B9 / iter-2 final: wrap the gpu.split() inner block in an IIFE so
+        // any `?`-propagated error inside it returns from the closure, NOT
+        // from forward_decode.  This ensures the post-IIFE
+        // put_worker_registry below runs UNCONDITIONALLY — restoring the
+        // registry into GpuContext on every exit path (success, encode error,
+        // or any internal `?` failure).  The final error propagation happens
+        // AFTER the put so the registry handle always rejoins GpuContext.
+        let parallel_block_result: Result<()> = (|| {
             let (exec, reg) = gpu.split();
             let dev = exec.device();
             let metal_dev = dev.metal_device();
@@ -6119,7 +6157,15 @@ impl MlxModelWeights {
                     // encode_parallel_layers_chunked encodes range_b into s (session_b)
                     // on the main thread, while the worker encodes range_a into a
                     // fresh session_a it creates internally.
-                    let returned_reg = self.encode_parallel_layers_chunked(
+                    //
+                    // R-B9 / iter-2 final: helper returns (Option<KernelRegistry>,
+                    // Result<()>) so the registry travels back on BOTH success
+                    // and encode-failure paths.  We store it into
+                    // returned_worker_reg BEFORE propagating any error so the
+                    // post-IIFE put_worker_registry always finds it.  Only the
+                    // rare submit-failure / mpsc-drop paths return None (worker
+                    // thread already destroyed the registry).
+                    let (maybe_returned_reg, helper_outcome) = self.encode_parallel_layers_chunked(
                         range_a,
                         range_b,
                         &parallel_ctx,
@@ -6130,8 +6176,11 @@ impl MlxModelWeights {
                         profile,
                         &mut per_layer_disp_log,
                         &mut total_dispatches,
-                    )?;
-                    returned_worker_reg = Some(returned_reg);
+                    );
+                    if let Some(reg) = maybe_returned_reg {
+                        returned_worker_reg = Some(reg);
+                    }
+                    helper_outcome?;
                 } else {
                     // Edge case: num_layers <= PARALLEL_SPLIT_START (all layers done serially).
                     returned_worker_reg = Some(worker_reg);
@@ -6344,12 +6393,22 @@ impl MlxModelWeights {
                     }
                 }
             }
-        }
+            Ok(())
+        })();
         // ADR-031 Phase B: restore worker_registry into gpu now that gpu.split()
         // borrow has been released (the inner block above has exited).
+        // R-B9 / iter-2 final: this put runs UNCONDITIONALLY regardless of
+        // whether the IIFE above succeeded or errored.  The registry handle
+        // always rejoins GpuContext, eliminating the prior leak on encode-Err
+        // paths.
         if let Some(wreg) = returned_worker_reg {
             gpu.put_worker_registry(wreg);
         }
+        // Propagate any error from the IIFE AFTER the registry has been
+        // safely restored.  See INV-4 / load-bearing recv comment in
+        // encode_parallel_layers_chunked for the parallel symmetry: there
+        // we wait unconditionally, here we restore unconditionally.
+        parallel_block_result?;
 
         let session_us = session_start.elapsed().as_secs_f64() * 1e6;
 
