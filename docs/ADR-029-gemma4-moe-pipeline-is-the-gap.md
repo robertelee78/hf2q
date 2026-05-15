@@ -3616,4 +3616,44 @@ The 5-6% gap remains structurally addressable via H94+ kernel ports.  No single 
 
 **ADR-031 spawned to chase a wrong-bottleneck premise.  Lessons applied; mission resumes correctly.**
 
+## Iter-175 Step 1 (2026-05-15) — per-kernel dispatch-count baseline at HEAD
+
+**HEAD**: `f3aa12ea` (post-synthesis). **Bench**: 100-tok decode, `MLX_DISP_BUCKET=1`, gemma4-ara-2pass-APEX-Q5_K_M, ignore-eos, T=0.
+
+**Throughput on this run**: 94.5 t/s (≈ 0.99× of 95.86 standing baseline; thermal-warm-up drag).
+
+**Per-token derived rates**: 861.3 dispatches/decode_tok, 478.2 barriers/decode_tok across **53 unique pipelines**. Distribution highly **concentrated**: top 2 = 37%, top 14 = 90%, long tail of ~36 kernels ≤1.1% each.
+
+| Rank | Count | % | Pipeline | Status |
+|---|---:|---:|---|---|
+| 1 | 17425 | 19.91 | `kernel_mul_mv_q6_K_f32_nr2` | iter-308/352/401 peer-ported (nr0=2, short indexing) |
+| 2 | 14980 | 17.11 | `rms_norm_f32_v2` | already peer-pattern (float4 + simd_sum + fused weight mul ≈ peer F=2) |
+| 3 | 5940 | 6.79 | `fused_head_norm_rope_f32_v2` | hf2q-specific fusion (no direct peer eq) |
+| 4 | 4950 | 5.65 | `hadamard_quantize_kv_fast_d256` | hf2q-specific (FA-hybrid V-quant) |
+| 5 | 3000 | 3.43 | `kernel_mul_mv_id_q6_K_f32_nr2` | MoE-id variant of #1 |
+| 6-14 | each 2970-3000 | each ~3.4 | various hf2q-specific fused kernels | |
+
+**Side-by-side diff (top 2 hf2q kernels vs llama.cpp equivalents)**: documented in `docs/research/ADR-029-iter-175-step-1-dispatch-distribution-2026-05-15.md`. Result: **both top kernels are already functionally peer-equivalent.** Differences are micro-optimizations (pointer-increment vs row-mul addressing) that the Metal compiler folds. iter-352's `FOR_UNROLL` experiment on #1 was already tested and FALSIFIED (caused register spill on Apple GPU).
+
+### What this rules in / rules out
+
+- ✗ **Single-site port of #1-#2 hottest kernels is NOT the lever** — both already match peer at the algorithm level. The "port peer pattern verbatim" template that worked at iter-162 (H93 FC-promote) and iter-308 (q6_K nr2) has been **exhausted on the dominant kernels**.
+- ✓ **The gap is still per-dispatch GPU speed** (per iter-111 constant-ratio 0.92× across tg100/2000/5000 — gap diffused as ~1 µs/dispatch).
+- ⚠ **Remaining hypothesis candidates** for the residual ~6-8% gap:
+  - **H-A (per-dispatch encoder/framework overhead)**: peer has 1339 dispatches/tok yet runs faster. Implied per-dispatch GPU time: hf2q ~10.05 µs vs peer ~7.3 µs. Lever: profile encoder fast-path (`mlx_native::CommandEncoder::encode*`) against peer's `ggml_metal_op_*`.
+  - **H-B (Metal compile-options divergence)**: we use default `MTLCompileOptions`; peer may use specific optimization flags. Lever: dump `MTLCompileOptions` at pipeline creation in both.
+  - **H-C (memory layout / cache miss diff)**: same algorithm + different KV/arg layout → different L1/L2 behavior. Lever: Apple Instruments Metal trace cache counters (operator-runnable).
+  - **H-D (stage-boundary serialization)**: M5 Max only supports `AtStageBoundary` (not `AtDispatchBoundary`) — HW-enforced serialization at stage boundaries. Lever: compare CB structure & dispatch grouping with peer.
+
+### Limitations of Step 1
+
+- Per-CB / per-dispatch **GPU TIME** not collected. `MLX_PROFILE_DISPATCH=1` is no-op'd on M5 Max (confirmed: "device 'Apple M5 Max' does NOT support MTLCounterSamplingPointAtDispatchBoundary"). `MLX_PROFILE_CB=1` requires `commit_and_wait_labeled` which is **not currently wired in the gemma4 decode path** (`src/serve/forward_mlx.rs` uses unlabeled `commit_and_wait`). So Step 1 has dispatch counts but not per-kernel GPU time.
+- Wiring CB labels into gemma4 path or running Apple Instruments are the two paths to obtain per-kernel time; both are next-iteration candidates.
+
+### Step 1 verdict
+
+**The "easy" peer-port lever (H93 template) is mostly tapped on the hottest hf2q kernels.** Next iteration's investigation pivots to H-A or H-B (read-only / data-collection, no code changes, suit a 5-min /loop iteration).
+
+Full data and side-by-side kernel diffs: `docs/research/ADR-029-iter-175-step-1-dispatch-distribution-2026-05-15.md`.
+
 
