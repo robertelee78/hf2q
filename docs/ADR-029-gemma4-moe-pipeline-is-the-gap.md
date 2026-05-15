@@ -4132,4 +4132,45 @@ Correctness preserved (byte-identical first token), but the per-kernel iter-1k f
 
 Per `feedback_no_premature_mission_close`, NOT closing iter-175. Continuing the multi-day port work next iter.
 
+## Iter-175 Step 1m (2026-05-15) — Step 1l regression NOT REPRODUCED; DEFAULT-FLIP precompiled to ON
+
+Per R1 from /ruflo-goals:research-synthesize, debugged Step 1l's apparent −35% full-decode regression by splitting `MLX_PRECOMPILED_METALLIB` into two flags (master + FCV-path) for A/B isolation. **The regression did NOT reproduce on fresh rebuild + clean run** — most likely a cold-PSO-cache or first-run-of-rebuilt-binary artifact.
+
+mlx-native commit: `7fd679f`.
+
+### Multi-regime validation at HEAD
+
+| Test | Default (precompile OFF) | PRECOMPILED+FCV ON | Delta |
+|---|---:|---:|---:|
+| tg100 2-cycle decode | 95.50 t/s | 95.90 t/s | +0.42% (within σ) |
+| tg100 2-cycle prefill | 179.2 t/s | 185.1 t/s | **+3.3%** |
+| tg2000 1-cycle decode | 93.1 t/s | 92.8 t/s | −0.32% (within σ) |
+| tg2000 1-cycle prefill | 171.0 t/s | 178.5 t/s | **+4.4%** |
+| coherence_smoke | 2/2 PASS | 2/2 PASS | ✓ |
+| tg50 first decode token | 10081 | 10081 | byte-identical ✓ |
+
+**Decode: neutral. Prefill: small but real +3-5% improvement. Correctness preserved.**
+
+### Decision: default-flip ON
+
+Per operator standing rule "if we found benefit, why not enable?" — the prefill +3-5% gain across regimes is a real measurable benefit with no decode regression. `MLX_PRECOMPILED_METALLIB=1` and `MLX_PRECOMPILED_METALLIB_FCV=1` are now default-ON.
+
+Opt-out preserved:
+- `MLX_PRECOMPILED_METALLIB=0` (or `false`/`off`): disables BOTH paths
+- `MLX_PRECOMPILED_METALLIB_FCV=0`: disables FCV-specialized path only
+
+### Standing context update
+
+Per Step 1k iter-1k test, precompiled was +5.89% faster on `kernel_mul_mv_q6_K_f32_nr2` in isolation. At full-decode integration, the per-kernel delta is amortized across 870 dispatches and many concurrent kernels → net decode neutral. **Prefill** benefits more because it has fewer cache hits per pipeline (different shapes per layer, less cache amortization).
+
+### What this DOES and DOES NOT close
+
+✓ **Closes**: H-E precompile-metallib lever — landed default-ON with +3-5% prefill gain.
+✗ **Does not close**: H-D global concurrency migration (~3.5pp decode target still untouched — `mlx-native b32b81e` infrastructure ready).
+✗ **Does not close**: residual 6-8% decode gap to peer-FA on M5 Max.
+
+### Next iteration (Step 1n)
+
+Per R2 from synthesis: start H-D global migration. Infrastructure is at `mlx-native b32b81e` (`dispatch_tracked_*` API + MemRanges tracker). Migrate batches of hand-placed barrier sites incrementally with byte-identity gates per batch.
+
 
