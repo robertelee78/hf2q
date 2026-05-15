@@ -4269,4 +4269,48 @@ Bench data is solid; gating question is risk tolerance vs ~2% tg100 decode rewar
 
 Full bench data + safety analysis: `docs/research/ADR-029-iter-175-step-1p-tg-mult-hint-bench-2026-05-15.md`.
 
+## Iter-175 Step 1q (2026-05-15) — Safety check catches silent corruption bug in qwen3.6 path
+
+Per Step 1p, `HF2Q_PIPELINE_TG_MULT_HINT=1` gave +2.08% tg100 on gemma4 but couldn't be default-flipped universally. iter 17 implemented option 2 from Step 1p (runtime safety check).
+
+mlx-native commit `cddf39e`:
+- New `pipeline_tg_mult_hint_enabled()` env-cached check
+- New `assert_tg_size_multiple_of_32_if_hinted(tg)` — panics if hint is ON but `tg.x*y*z % 32 != 0`
+- Inserted at all 8 dispatch sites in `encoder.rs`
+
+### Validation
+
+| Test | Default | HINT=1 |
+|---|---|---|
+| mlx-native cargo test --lib | — | **298/298 PASS** |
+| hf2q smoke tg30 (gemma4) | OK, fdtok=10081 | OK, fdtok=10081, +1.2 t/s |
+| hf2q coherence_smoke | 2/2 PASS | **1/2 PASS, 1/2 FAILED** |
+
+The failure panic message:
+```
+ADR-029 Step 1q safety: HF2Q_PIPELINE_TG_MULT_HINT=1 requires
+threadgroup_size.x * y * z to be a multiple of 32. Got tg=(3, 85, 1)
+→ total=255 → 255 mod 32 = 31.
+```
+
+The failing tests are `apex-q5km/the-quick-brown-fox` and `apex-q5km/what-is-22` — both target qwen3.6's APEX-Q5_K_M model, NOT gemma4. Some kernel in the qwen3.6 forward path uses threadgroup size 3×85×1=255 which is not a multiple of 32.
+
+**Without the safety check, default-flipping HF2Q_PIPELINE_TG_MULT_HINT=1 would have silently corrupted qwen3.6 production output** (qwen3.6 is a production APEX target per `feedback_apex_focus`).
+
+### Implications for Step 1p default-flip
+
+- **Gemma4 production path: SAFE under HINT=1** (validated, +2.08% tg100)
+- **Qwen3.6 production path: UNSAFE under HINT=1** (would corrupt)
+- **Universal default-flip BLOCKED** until the qwen3.6 offending dispatch is fixed (round up the threadgroup to a multiple of 32, or skip the hint per-pipeline for that kernel)
+
+### Durable safety infrastructure
+
+The safety check has zero overhead when the env-flag is unset (cached atomic load, immediate return). When set, it converts UB to a panic with full diagnostic info. This becomes durable infrastructure that catches future similar bugs.
+
+### Standing-rule for future work
+
+When adding any pipeline-level hint that imposes runtime constraints on dispatch geometry: ADD A RUNTIME ASSERTION at the dispatch site that validates the constraint. The iter-376 hint docstring claimed gemma4 hot kernels satisfied the multiple-of-32 constraint — TRUE for gemma4, FALSE for qwen3.6. Without the assertion, this would have been caught only by output-divergence on production users — far worse than a panic at dispatch time.
+
+Per the mantra "Comments in code or ADR can be starting points, but never trust them over code" — the iter-376 claim was a comment; running code-with-coherence-test revealed it was incomplete.
+
 
