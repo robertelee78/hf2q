@@ -71,5 +71,16 @@ fn main() -> anyhow::Result<()> {
         f16_tensors.iter().map(|i| i.byte_len as u64).sum::<u64>()
     );
 
+    // Optional: dump ALL tensors with shape+type when invoked with `--all`.
+    if std::env::args().any(|a| a == "--all") {
+        eprintln!("[dump] all tensors (sorted by name):");
+        let mut names: Vec<_> = gguf.tensor_names().iter().map(|s| s.to_string()).collect();
+        names.sort();
+        for n in &names {
+            let info = gguf.tensor_info(n).unwrap();
+            println!("{} type={:?} shape={:?}", n, info.ggml_type, info.shape);
+        }
+    }
+
     Ok(())
 }
