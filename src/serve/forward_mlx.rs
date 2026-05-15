@@ -3194,9 +3194,10 @@ impl MlxModelWeights {
         _session: &mut mlx_native::graph::GraphSession<'_>,
         _gpu: &mut GpuContext,
         _profile: &mut Option<TokenProfile>,
-        _total_dispatches: &mut u64,
+        _per_layer_disp_log: &mut Vec<(usize, bool, u64)>,
+        _total_dispatches: &mut usize,
     ) -> Result<()> {
-        // STUB — iter-392+ will move layer body here.
+        // STUB — A3+ will move layer body here.
         Ok(())
     }
 
@@ -3510,6 +3511,25 @@ impl MlxModelWeights {
             // the iter-291 +72 mat-vec gap (sliding vs full-attn layers).
             let per_layer_disp_enabled = std::env::var("HF2Q_PER_LAYER_DISP").as_deref() == Ok("1");
             let mut per_layer_disp_log: Vec<(usize, bool, u64)> = Vec::new();
+            let _ctx = super::layer_ctx::LayerCtx {
+                seq_pos,
+                input_token,
+                num_layers,
+                hidden_size: hs,
+                num_attention_heads: self.num_attention_heads,
+                eps: self.rms_norm_eps,
+                kv_info: &kv_info,
+                dump_layers,
+                dump_detail_layer,
+                dump_sliding_l0,
+                dump_run_name,
+                dual_buffer_splits: &dual_buffer_splits,
+                per_layer_disp_enabled,
+                tq_scale_factor_d512,
+                tq_codebook_bits,
+                use_native_hb_sdpa,
+                dump_all_cache_eff,
+            };
             for layer_idx in 0..num_layers {
                 let layer_disp_start = if per_layer_disp_enabled {
                     mlx_native::dispatch_count()
