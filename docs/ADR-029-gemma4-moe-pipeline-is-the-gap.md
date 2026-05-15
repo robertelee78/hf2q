@@ -4036,4 +4036,59 @@ Full closure rationale: `docs/research/ADR-029-iter-175-step-1j-closure-recommen
 
 **Per `feedback_no_premature_mission_close_2026_05_11` standing rule, this is NOT a unilateral closure of ADR-029. iter-175 has reached its /loop-autonomous ceiling; operator decides whether to commit to one of the multi-day engineering paths above or accept the current state.**
 
+## Iter-175 Step 1k (2026-05-15) — H-E CONFIRMED: precompiled metallib is +5.89% faster
+
+**Operator directive received**: commit to the multi-day work. iter 10 wrote the H-E test harness and ran it.
+
+Test: `mlx-native/tests/iter175_h_e_metallib_perf.rs` (commit `mlx-native 536210e`):
+- xcrun-compiles `quantized_matmul_ggml.metal` to `.metallib` at test runtime (xcrun metal -O3 + xcrun metallib)
+- Loads via `device.metal_device().new_library_with_file`
+- Builds pipeline both ways (runtime-source + precompiled) with same function constants (700:1, 701:1, 702:1)
+- Runs `kernel_mul_mv_q6_K_f32_nr2` at gemma4 Q_sliding decode shape (m=1, n=4096, k=2816), BATCH=32, MEASURE=50
+
+### Result on M5 Max
+
+| Variant | median µs | p10 | p90 |
+|---|---:|---:|---:|
+| RUNTIME-SOURCE | 19.49 | 18.18 | 70.11 |
+| PRECOMPILED -O3 | **18.35** | 17.80 | 19.54 |
+
+**Delta: +5.89% precompiled is faster.**
+
+The runtime-source p90 of 70 µs vs precompiled p90 of 19.5 shows runtime has occasional jitter outliers; precompiled is tightly distributed. Consistent with Apple's runtime compile chain doing less aggressive AIR optimization than xcrun -O3 (3% smaller AIR bytes per Step 1g toolchain verification).
+
+### Implications
+
+The 1.14 µs/call savings × 174 calls/tok for this single kernel = **~199 µs/tok = ~1.9% wall** improvement potential from ONE kernel alone.
+
+If the effect generalizes across mlx-native's 30+ `.metal` shader files, total decode-wall savings could be substantial. Need to test multi-kernel + full-decode bench to confirm.
+
+### Side-by-side peer dispatch comparison (also collected this iteration)
+
+Running peer (llama.cpp at `/opt/llama.cpp/build/bin/llama-bench`) with `HF2Q_PEER_PIPELINE_HIST=1`:
+- Peer t/s: **100.21** (similar to standing 103.79 baseline; thermal-warm drift)
+- Peer total: 133926 dispatches / 100 tokens = **1339/tok across 33 unique pipelines**
+- hf2q total (Step 1): **875/tok across 53 unique pipelines** — peer has 1.53× MORE dispatches with EQUAL throughput
+
+Per-kernel comparison reveals **peer uses F=3 fusion (kernel_rms_norm_mul_add_f32_4) in 60 calls/tok vs hf2q's fused_norm_add_f32_v2 at 30 calls/tok** — peer uses F=3 in 2× as many places.
+
+Also: peer DOESN'T fuse RoPE+norm (we do via fused_head_norm_rope_v2). Per iter-105/iter-1 H6 standing rule: "more smaller dispatches outperform fewer larger fused on Apple Metal" — but specific fusion (e.g. the F=3 norm+mul+add) DOES help when applied at the RIGHT sites.
+
+### Updated iter-175 cumulative ledger
+
+| Step | Hypothesis | Status |
+|---|---|---|
+| 1-1j | iter-175 ledger | various (FALSIFIED/CONFIRMED-multi-day/DEFERRED) |
+| **1k** | **H-E empirical test** | **CONFIRMED +5.89% precompiled faster** |
+
+### Next iteration (Step 1l)
+
+Start full-shader migration:
+1. Identify the simplest path to bundle precompiled `.metallib`(s) with mlx-native at build time
+2. Extend `KernelRegistry` to load from `.metallib` first, fall back to source-compile
+3. Validate byte-identity + coherence_smoke per shader
+4. Bench full decode to confirm cumulative wall gain
+
+Full test code + bench output: `mlx-native/tests/iter175_h_e_metallib_perf.rs`.
+
 
