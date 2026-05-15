@@ -4091,4 +4091,45 @@ Start full-shader migration:
 
 Full test code + bench output: `mlx-native/tests/iter175_h_e_metallib_perf.rs`.
 
+## Iter-175 Step 1l (2026-05-15) — Precompiled .metallib infrastructure LANDED (default-OFF; unexpected full-decode regression to investigate)
+
+mlx-native commit `3378f86`. Multi-iter migration phase 1.
+
+### What landed
+
+- **build.rs**: at mlx-native build time, `xcrun metal -O3 -c <f>` on every `src/shaders/*.metal` file (all 112 compile clean), linked into a single `default.metallib` in OUT_DIR (2.72 MB). Non-macOS / no-xcrun fallback: empty placeholder.
+- **kernel_registry.rs**:
+  - `const EMBEDDED_METALLIB = include_bytes!(...)` to embed the 2.72 MB
+  - `precompiled_lib: Option<metal::Library>` lazy field
+  - `precompiled_enabled()` cached env check for `MLX_PRECOMPILED_METALLIB=1`
+  - `try_precompiled_lib(device)` — lazy loader with fail-once semantics
+  - `get_pipeline()` and `get_pipeline_with_constants()`: probe precompiled first; fall back to source-compile on missing function
+
+Default-OFF preserves prod behavior: zero risk.
+
+### Unexpected full-decode regression at tg50
+
+| Variant | tg50 t/s | first-tok |
+|---|---:|---|
+| Default (`MLX_PRECOMPILED_METALLIB` unset) | **95.4** | 10081 |
+| `MLX_PRECOMPILED_METALLIB=1` | **62.1** (−35%) | 10081 (byte-identical ✓) |
+| Prefill default | 254.5 | — |
+| Prefill `MLX_PRECOMPILED_METALLIB=1` | 24.5 (−90%) | — |
+
+Correctness preserved (byte-identical first token), but the per-kernel iter-1k finding (+5.89%) **does NOT generalize** to full decode integration. The lever class is more subtle than the test-isolation experiment suggested.
+
+### Hypotheses to investigate (Step 1m, next iter)
+
+- **Function-constant specialization through metallib**: my `get_pipeline_with_constants` builds a separate FCV for the precompiled-probe path. If FCV is somehow not applied, the loaded function may use default-zero constants → slow/wrong kernel. **Most likely candidate.**
+- **Pipeline-creation from `new_library_with_data` may trigger different Apple GPU compile-state vs `new_library_with_source`** (need to test by tracing pipeline creation time).
+- **Lookups against the 2.72 MB metallib's function table may be expensive per get_function call** (would explain prefill blowup; less likely for steady-state decode).
+
+### Validation plan (Step 1m)
+
+1. Disable the `get_pipeline_with_constants` precompiled path, leave only `get_pipeline` (no-FCV) probing the precompiled lib. Re-bench. If regression disappears → FCV path is the bug.
+2. Add per-pipeline-creation timing instrumentation to confirm where the slow path lives.
+3. If FCV issue confirmed: investigate whether FCV must be set at metallib build time (i.e., bake specific FC values into separate pre-specialized functions in the metallib).
+
+Per `feedback_no_premature_mission_close`, NOT closing iter-175. Continuing the multi-day port work next iter.
+
 
