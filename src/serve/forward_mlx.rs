@@ -120,8 +120,6 @@ pub struct TokenProfile {
 /// indices.  After this merge, every index is populated exactly once.
 /// Scalar fields (head_session_us, head_cpu_us, total_us, head_dispatches) are
 /// written by main (post-loop) and are not touched here.
-// allow(dead_code) removed when B3 wires encode_parallel_layers_chunked.
-#[allow(dead_code)]
 fn merge_profiles(main: &mut Option<TokenProfile>, worker: Option<TokenProfile>) {
     let (Some(m), Some(w)) = (main.as_mut(), worker) else {
         return; // profiling is disabled; nothing to merge.
@@ -5550,8 +5548,6 @@ impl MlxModelWeights {
     /// - `submit_to_global_worker` fails (worker dead — process exit in progress).
     /// - The worker itself errors during encoding (layer encode error).
     /// - The mpsc channel drops before a result is received (worker panicked).
-    // allow(dead_code) removed when B3 wires the call site in forward_decode.
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     fn encode_parallel_layers_chunked<'sess>(
         &self,
@@ -5938,6 +5934,24 @@ impl MlxModelWeights {
 
         let session_start = Instant::now();
         let mut total_dispatches = 0usize;
+
+        // ADR-031 Phase B: take the worker registry from gpu BEFORE gpu.split()
+        // borrows gpu.  `gpu.split()` mutably borrows all of gpu; we cannot call
+        // gpu.take_worker_registry() inside the inner block.  The returned registry
+        // travels through the inner block in a local Option and is restored into
+        // gpu after the block exits.
+        let parallel_encode = INVESTIGATION_ENV.parallel_encode_enabled();
+        let maybe_worker_reg: Option<KernelRegistry> = if parallel_encode {
+            Some(gpu.take_worker_registry().ok_or_else(|| anyhow::anyhow!(
+                "HF2Q_PARALLEL_ENCODE=1 is set but worker_registry was not pre-warmed. \
+                 GpuContext::new() must be called AFTER HF2Q_PARALLEL_ENCODE=1 is set in \
+                 the environment (it is read once at model load)."
+            ))?)
+        } else {
+            None
+        };
+        let mut returned_worker_reg: Option<KernelRegistry> = None;
+
         {
             let (exec, reg) = gpu.split();
             let dev = exec.device();
@@ -6017,11 +6031,75 @@ impl MlxModelWeights {
                 use_native_hb_sdpa,
                 dump_all_cache_eff,
             };
-            for layer_idx in 0..num_layers {
-                self.encode_one_layer(
-                    layer_idx, &ctx, &mut s, exec, reg,
-                    profile, &mut per_layer_disp_log, &mut total_dispatches,
-                )?;
+            if let Some(worker_reg) = maybe_worker_reg {
+                // ADR-031 Phase B: parallel-encode path.
+                //
+                // Serial pre-split: encode layers 0..PARALLEL_SPLIT_START.
+                // This range includes the default dual_buffer_splits=[2] commit,
+                // which fires inside encode_one_layer when (layer_idx+1)==2, i.e.,
+                // after layer 1.  After the serial pre-split loop, `s` holds the
+                // work for layers 2..PARALLEL_SPLIT_START (layers 0+1 were already
+                // committed to buf0 inside the loop).
+                const PARALLEL_SPLIT_START: usize = 4;
+                for layer_idx in 0..PARALLEL_SPLIT_START.min(num_layers) {
+                    self.encode_one_layer(
+                        layer_idx, &ctx, &mut s, exec, reg,
+                        profile, &mut per_layer_disp_log, &mut total_dispatches,
+                    )?;
+                }
+
+                if PARALLEL_SPLIT_START < num_layers {
+                    // Commit the post-serial-pre-split session (contains layers
+                    // 2..PARALLEL_SPLIT_START work).  Its CB must be queued BEFORE
+                    // the worker's chunk-A CB — commit-order serialization (INV-7).
+                    let _enc = std::mem::replace(
+                        &mut s,
+                        exec.begin().map_err(|e| anyhow::anyhow!("parallel pre-commit begin: {e}"))?,
+                    ).commit();
+
+                    // Parallel chunk split: naive midpoint of PARALLEL_SPLIT_START..num_layers.
+                    let mid = PARALLEL_SPLIT_START
+                        + (num_layers - PARALLEL_SPLIT_START) / 2;
+                    let range_a = PARALLEL_SPLIT_START..mid;
+                    let range_b = mid..num_layers;
+
+                    // Build a parallel LayerCtx with empty dual_buffer_splits so
+                    // encode_one_layer's inline split-and-commit does NOT fire
+                    // mid-chunk (INV-11 / R-B5).
+                    let chunk_dual_buffer_splits: &[usize] = &[];
+                    let parallel_ctx = super::layer_ctx::LayerCtx {
+                        dual_buffer_splits: chunk_dual_buffer_splits,
+                        ..ctx
+                    };
+
+                    // encode_parallel_layers_chunked encodes range_b into s (session_b)
+                    // on the main thread, while the worker encodes range_a into a
+                    // fresh session_a it creates internally.
+                    let returned_reg = self.encode_parallel_layers_chunked(
+                        range_a,
+                        range_b,
+                        &parallel_ctx,
+                        &mut s,
+                        exec,
+                        reg,
+                        worker_reg,
+                        profile,
+                        &mut per_layer_disp_log,
+                        &mut total_dispatches,
+                    )?;
+                    returned_worker_reg = Some(returned_reg);
+                } else {
+                    // Edge case: num_layers <= PARALLEL_SPLIT_START (all layers done serially).
+                    returned_worker_reg = Some(worker_reg);
+                }
+            } else {
+                // Default serial path — zero behavior change vs HEAD e86831ab.
+                for layer_idx in 0..num_layers {
+                    self.encode_one_layer(
+                        layer_idx, &ctx, &mut s, exec, reg,
+                        profile, &mut per_layer_disp_log, &mut total_dispatches,
+                    )?;
+                }
             }
 
             // ADR-028 iter-292: dump per-layer dispatch counts post-loop.
@@ -6223,6 +6301,12 @@ impl MlxModelWeights {
                 }
             }
         }
+        // ADR-031 Phase B: restore worker_registry into gpu now that gpu.split()
+        // borrow has been released (the inner block above has exited).
+        if let Some(wreg) = returned_worker_reg {
+            gpu.put_worker_registry(wreg);
+        }
+
         let session_us = session_start.elapsed().as_secs_f64() * 1e6;
 
         // --- ADR-009 Phase 3A: dump post-lm_head logits at boundary position ---

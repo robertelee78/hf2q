@@ -447,15 +447,11 @@ pub struct InvestigationEnv {
 
     /// Raw (pre-guard) intent for `HF2Q_PARALLEL_ENCODE=1`.
     /// Use `parallel_encode_enabled()` for the guarded effective value.
-    // allow(dead_code) removed when B2/B3 wire the call sites.
-    #[allow(dead_code)]
     pub parallel_encode_raw: bool,
 
     /// Raw snapshot of `HF2Q_PER_LAYER_DISP=1`.  Also used by forward_decode
     /// to decide whether to print per-layer dispatch counts; snapshotted here
     /// so both interaction-guard checks see the same value.
-    // allow(dead_code) removed when B2/B3 wire the call sites.
-    #[allow(dead_code)]
     pub per_layer_disp_raw: bool,
 
     // ========================================================================
@@ -941,8 +937,6 @@ impl InvestigationEnv {
         }
     }
 
-    // allow(dead_code) removed when B3 wires the call site in forward_decode.
-    #[allow(dead_code)]
     /// Returns true when parallel-encode is active for this process:
     ///   - `HF2Q_PARALLEL_ENCODE=1` was set at process start, AND
     ///   - `HF2Q_PER_LAYER_DISP=1` was NOT set (interaction guard).
