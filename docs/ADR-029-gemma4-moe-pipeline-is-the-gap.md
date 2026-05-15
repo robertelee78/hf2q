@@ -3656,4 +3656,40 @@ The 5-6% gap remains structurally addressable via H94+ kernel ports.  No single 
 
 Full data and side-by-side kernel diffs: `docs/research/ADR-029-iter-175-step-1-dispatch-distribution-2026-05-15.md`.
 
+## Iter-175 Step 1b (2026-05-15) — H-A & H-B both FALSIFIED at the runtime level
+
+Read-only investigation: side-by-side compare of both repos' encoder fast-path and `MTLCompileOptions` usage.
+
+### H-A (per-dispatch encoder/framework overhead) — FALSIFIED
+
+hf2q's hot-path encode (`encode_threadgroups_with_args_and_shared` at `mlx-native/src/encoder.rs:1227`) per-dispatch CPU cost: ~50-100 ns (1 atomic + 2 vec swaps + ~7 ObjC msg_send for a typical 5-arg matvec). llama.cpp's equivalent (`ggml-metal-device.m:501-616`): ~50-100 ns (same atomic + similar ObjC msg_send count, plus unconditional `getenv` per dispatch).
+
+At 866 dispatches/decode_tok and ~10.7 ms wall budget per token: total CPU encode overhead is **<1% of wall**. The implied per-dispatch gap (~10.05 µs hf2q vs ~7.3 µs peer) is **almost entirely GPU-side time**.
+
+**Verdict**: encoder CPU fast-path is functionally equivalent to peer. The gap does not live in Rust or ObjC overhead.
+
+### H-B (Metal compile-options divergence) — PARTIALLY FALSIFIED
+
+Both repos use Apple's default `MTLCompileOptions` for runtime compile:
+- hf2q: `metal::CompileOptions::new()` at `mlx-native/src/kernel_registry.rs:1032,1138`
+- llama.cpp runtime-fallback path: `[MTLCompileOptions new]` at `ggml-metal-device.m:236,293`
+
+Both have fast-math YES (peer's `setFastMathEnabled:false` is commented out). Both leave `preserveInvariance = NO` and `languageVersion` at SDK default. llama.cpp adds 3 preprocessor macros (`GGML_METAL_HAS_BF16`, `_HAS_TENSOR`, `_EMBED_LIBRARY`) — these select shader code-paths, NOT optimization.
+
+**Where peer diverges (H-E candidate)**: llama.cpp's PRIMARY pipeline-load path at `ggml-metal-device.m:185` is `[device newLibraryWithURL:libURL]` — loads a `default.metallib` PRECOMPILED with `xcrun metal -O3` (per `CMakeLists.txt:78-79`). hf2q has no precompiled-metallib path; all shaders are runtime-compiled. Whether Apple's runtime compile produces equivalent AIR to `xcrun metal -O3` is unknown; Apple's `MTLLibraryOptimizationLevelDefault` is documented as "optimize for runtime performance" but there's no API to choose `-O0/-O1/-O2/-O3` at runtime.
+
+**Verdict for the runtime axis**: identical between repos; H-B falsified. **Build-time precompile divergence becomes H-E** (next experiment).
+
+### Updated remaining hypothesis-space
+
+After Step 1b, the candidate space narrows to:
+
+- **H-C**: memory layout / cache miss diffs — operator-runs Apple Instruments (NOT /loop-suitable)
+- **H-D**: stage-boundary serialization — compare CB structure / dispatch grouping (0.5-1 day, /loop-suitable read-only)
+- **H-E**: precompiled `.metallib` vs runtime source compile — single-shader micro-experiment (0.5-1 day, /loop-suitable)
+
+H-E is the highest-information-density next experiment because if Apple's runtime compile is materially different from `xcrun metal -O3`, this could explain a uniform per-dispatch slowdown across all kernels (which is exactly the iter-111 "constant 0.92× ratio across regimes" signature).
+
+Full encoder fast-path and CompileOptions side-by-side: `docs/research/ADR-029-iter-175-step-1b-encoder-and-compile-options-2026-05-15.md`.
+
 
