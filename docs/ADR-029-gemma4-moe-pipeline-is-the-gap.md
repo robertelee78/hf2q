@@ -4313,4 +4313,48 @@ When adding any pipeline-level hint that imposes runtime constraints on dispatch
 
 Per the mantra "Comments in code or ADR can be starting points, but never trust them over code" — the iter-376 claim was a comment; running code-with-coherence-test revealed it was incomplete.
 
+## Iter-175 Step 1r (2026-05-15) — unblock universal HINT=1: ssm_conv tg=255 fix + panic includes label
+
+mlx-native commit `e7a6b33`:
+
+### Enhanced panic message
+
+The Step 1q safety panic now includes the pipeline label, identifying the offending kernel directly. Without this, debugging required a stack trace. New panic format:
+
+```
+ADR-029 Step 1q safety: ... Got tg=(3, 85, 1) → total=255 → 255 mod 32 = 31.
+Pipeline label: "ssm_conv_state_update_f32". Either fix the dispatch site ...
+```
+
+### Identified + fixed offending dispatch
+
+`ssm_conv_state_update_f32` (qwen3.6's gated_delta_net SSM convolution) computed `state_tg = (k_width-1=3, min(channels, 256/3=85)=85, 1)` = 255 = NOT a multiple of 32.
+
+Fixed at `mlx-native/src/ops/ssm_conv.rs:225-260` using gcd-based rounding:
+- `step = 32 / gcd(su_tg_i, 32)`
+- `su_tg_c` rounds DOWN to a multiple of `step`
+- For k_width=4 (su_tg_i=3): step=32, su_tg_c rounds to 64 → tg=(3, 64, 1) = 192 (multiple of 32 ✓)
+- Math is general for any su_tg_i
+
+### Validation
+
+- `coherence_smoke` (default): **2/2 PASS**
+- `coherence_smoke` (HF2Q_PIPELINE_TG_MULT_HINT=1): **2/2 PASS** ← was 1/2 FAILED before
+- mlx-native cargo test --lib: 298/298 PASS
+- Gemma4 tg100 re-bench: +0.63% (noisier than iter-16's +2.08% — likely thermal/machine-state variance)
+
+### NOT default-flipping HINT=1 yet
+
+The gemma4 perf signal under HINT=1 is now noisier across re-benches (iter 16: +2.08%, iter 18: +0.63%). Default-flip needs firmer signal. Plan: re-bench with more cycles (3+ alt-pairs, σ-per-arm < 0.5%) in a future iter before flipping.
+
+What's now safe to flip universally:
+- Coherence: validated across gemma4 + qwen3.6 (both APEX-Q5_K_M paths)
+- The lever class is structurally sound
+
+What's holding it back:
+- Bench signal not yet conclusive (±2% range across runs)
+- Tight bench (σ < 0.5%) requires 5-10 cool-downs which spans multiple /loop iterations
+
+Per `feedback_no_premature_mission_close`, gating on firm bench data.
+
 
