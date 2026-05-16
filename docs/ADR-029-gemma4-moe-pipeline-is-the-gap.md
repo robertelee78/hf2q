@@ -5401,6 +5401,29 @@ the projected 18× speedup on the top-K phase × top-K's share of routing.
 **Commits**:
 - mlx-native `5119eee` (V3 kernel + dispatcher + default-flip)
 
+### Step 1j LANDED — batched prefill V3 (infrastructure, neutral prefill)
+
+Ported the Step 1i parallel SG-tournament top-K pattern to the
+batched prefill variant (`fused_moe_routing_batch_f32_v3`).  Same
+per-token routing kernel; just operates on a strided grid of
+tok_id × num_experts.
+
+**Bench** (4-run alt-pair, prompt ~66 tokens, gemma4-APEX-Q5_K_M):
+
+| | V3 ON (default) | V3 OFF (V2 fb) | Δ |
+|---|---:|---:|---:|
+| Prefill | 773.05 t/s | 780.80 t/s | -1.0% (NEUTRAL within noise) |
+| Gen | 108.25 t/s | 97.45 t/s | +11.1% (decode V3 win confirmed) |
+
+Prefill neutral: at 66-token prefill, routing is a smaller share of
+prefill wall (MoE matmul + gather_mm dominate).  Per-token TG savings
+are real but proportionally small.  Committed as infrastructure for
+consistency (same pattern at both routing paths) and forward-
+compatible for very-long-prefill regimes where routing share may grow.
+
+**Commits**:
+- mlx-native `720e763` (V3 batch kernel + dispatcher + default-flip)
+
 ### Concrete optimization candidates (multi-week scope)
 
 To close the 6% peer-FA gap, the highest-leverage targets are:
