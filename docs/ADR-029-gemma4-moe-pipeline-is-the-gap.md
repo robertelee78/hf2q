@@ -5018,16 +5018,24 @@ within bench noise.  Step 1j.2's tree-reduce trade-off doesn't measurably
 affect tg2000 wall — batched routing is a small share of the prefill +
 2000-token decode wall.
 
-**Final cross-regime + post-fix table**:
+**Final cross-regime + post-fix table** (ALL three regimes re-validated):
 
-| Regime | Pre-fix ratio | Post-fix ratio (this iter) | Status |
+| Regime | Pre-fix ratio | Post-fix ratio | Status |
 |---|---:|---:|---|
-| tg200 | 1.054× | 1.055× (10.96% gen δ) | ✓ holds |
-| tg2000 | 1.047× | **1.050× AHEAD** | ✓ holds |
-| tg5000 | 1.055× | (not re-bench'd; presumed within noise) | — |
+| tg200 | 1.054× | **1.055×** AHEAD (gen δ +10.96%) | ✓ holds |
+| tg2000 | 1.047× | **1.050× AHEAD** (post-fix re-bench) | ✓ holds |
+| tg5000 | 1.055× | **1.052× AHEAD** (post-fix re-bench) | ✓ holds |
+
+Mean post-fix lead: **~1.052× AHEAD across all 3 regimes**.
+
+tg5000 post-fix bench (this iteration):
+  hf2q V3 (post 1j.2): 100.60 t/s ± 0.0% (100.6, 100.6 — perfectly stable)
+  peer-FA tg5000:       95.675 t/s ± 0.07% (95.74, 95.61)
+  Ratio: 1.0515× AHEAD
 
 Net: Step 1j.2 fix is **truly free** at the wall-clock level for
-gemma4-APEX-Q5_K_M.  Byte-identity gained, speed retained.
+gemma4-APEX-Q5_K_M across the FULL decode regime spectrum (tg200 →
+tg2000 → tg5000).  Byte-identity gained, speed retained at all three.
 
 ### Step 1i V3 long-decode output divergence — honest disclosure (this iteration)
 
