@@ -5313,6 +5313,30 @@ data confirms the localization — **the MoE pipeline IS the gap** (despite
 the ADR title being a question, the 2026-05-15 skip-bisect data validates
 the original framing).
 
+## 🏆 MISSION OBJECTIVE ACHIEVED + VALIDATED at tg2000 averaged-decode
+
+Per iter-100 standing rule: the REAL workload is averaged-decode over
+n=2000 (or 5000) — that's what reopened the gap originally.  Two
+same-session apples-to-apples pairs confirm the Step 1i win persists
+at tg2000:
+
+| Session | hf2q V3 | peer-FA tg2000 | Ratio |
+|---|---:|---:|---:|
+| Session A C1 (warm, prior iter carryover) | 103.4 t/s | 98.72 t/s | **1.047× AHEAD** |
+| Session B C3 (thermal-degraded) | 85.1 t/s | 81.85 t/s | **1.040× AHEAD** |
+| **Combined** | | | **~1.043× AHEAD at tg2000** |
+
+The session-B numbers are 18% lower in absolute terms (machine state
+drift between iterations: PSO cache cold, OS noise, thermal headroom)
+— but BOTH engines drift together.  Per
+[[feedback_machine_state_confounds_perf_5pct_2026_05_12]] only
+same-session ratios are trustworthy, and **both same-session pairs
+show hf2q AHEAD**.
+
+Combined with tg200 (1.054×), the mission objective is empirically
+validated at **both** the warmup-pass tg200 regime AND the realistic
+averaged-decode tg2000 regime that originally opened iter-100.
+
 ## 🏆 MISSION OBJECTIVE ACHIEVED — iter-175 post-Step-1i
 
 **Decode: hf2q 107.17 t/s vs peer-FA 101.72 t/s = 1.054× AHEAD of peer**
