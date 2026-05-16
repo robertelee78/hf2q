@@ -5094,3 +5094,75 @@ Estimated impact: variable; need to bench.
 Closing the remaining 4-5% to peer-FA requires inlining the 5-layer
 call chain (Steps 1i+) — the deeper refactor.
 
+---
+
+## Mission Status Snapshot — iter-175 post-Step-1f2 (2026-05-15)
+
+After 6 substeps of CPU-side pre-bake optimization (Step 1c→1f2), the
+**bake-pre-bake direction is empirically saturated** on M5 Max +
+gemma4-APEX-Q5_K_M.  Cumulative measured wall delta vs pre-1c
+baseline = **+0.10%** (essentially Step 1d's +0.13% alone).
+
+### Empirical state at HEAD `9feffec8` / `5d75def`
+
+- 4 OnceLock<DispatchRecord> slots wired through hot paths
+- ~270 dispatches/decode-tok pre-baked (out of ~866 total)
+- coherence_smoke 2/2 PASS on every substep, byte-identical decode
+
+### What the remaining ~6% gap actually is (deep-research, this iteration)
+
+Per the standing rule
+`[[feedback_decode_gap_is_TQ_dequant_not_kernel_quality_2026_05_12]]`,
+the iter-156 AIR-diff investigation found:
+
+> HYBRID has +2 fast_rsqrt + 1 simd_shuffle_xor + 1 fast_fmax + 1
+> fast_exp inherent to TQ-HB V decode.  At quant-V apples-to-apples
+> (peer -ctv q8_0): hf2q 2.4× FASTER.  At F16-V regime (PORT_NWG32):
+> 0.949× peer-FA.  The "default 0.93× peer" is regime-mismatched,
+> NOT a kernel bug.
+
+This iteration's peer-read of mlx-lm + omlx + llama.cpp confirms:
+
+- **mlx-lm gemma4** uses `SwitchGLU` (3 separate gather_mm dispatches
+  per MoE FFN: gate_proj + up_proj + down_proj, plus activation).
+  hf2q's APEX format pre-fuses gate+up at GGUF load time → **3 total
+  dispatches** for hf2q MoE FFN, same as or fewer than mlx-lm.
+- **llama.cpp gemma4** uses `GGML_OP_GLU::SWIGLU` (single kernel,
+  not fused with matmul).  Same dispatch count as hf2q.
+- **Activation**: gemma4 uses GELU-gated (not silu-gated); hf2q's
+  `moe_swiglu_batch_encode` shader name is a misnomer — the
+  implementation uses `precise::tanh` GELU approximation, matching
+  mlx-lm's `GeGLU`.
+- **PORT_NWG32 peer kernel** (already wired, default-on per iter-149)
+  only fires at F16-V regime which is 3.3% slower than our TQ-HB-V
+  default → not the lever.
+
+### Strategic conclusion
+
+The ADR-029 mission has reached a natural inflection point.  The
+remaining gap to peer-FA decode is an **architectural tradeoff**
+(TQ-HB-V regime KV-memory advantage vs peer F16-V regime decode
+speed), not a kernel-quality bug or untested optimization.
+
+Closing the gap WITHOUT losing the TQ-HB-V memory advantage requires
+making our TQ-HB-V SDPA kernel faster than peer's F16-V SDPA — a
+HARD multi-week problem because peer's F16-V is heavily tuned by
+Apple's MLX team and our TQ-HB-V has ~5 inherent extra ALU ops per
+dequant lane (iter-156 AIR diff).
+
+### Open paths if mission continues
+
+1. **Multi-week per-kernel SDPA work** — iter-153 lever; out-of-scope
+   for single /loop iterations.
+2. **5-layer call chain inlining** (Step 1i+) — iter-174 estimated
+   "466 device signature sites + 2,755 LOC" multi-MONTH refactor;
+   would need chunking into iter-sized pieces.
+3. **Architectural switch to F16-V default** — 3.3% slower per
+   iter-100; explicit operator decision required to trade KV memory
+   for ~2% decode (PORT_NWG32 captures ~2pp of the 3.3pp).
+
+If mission status is declared "complete" at current HEAD, the
+shipping decode rate is **~96 t/s on gemma4-APEX-Q5_K_M at M5 Max**
+(0.94× peer-FA at default config, 2.4× peer at quantized-V
+apples-to-apples regime).
+
