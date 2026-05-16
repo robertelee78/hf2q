@@ -5338,6 +5338,32 @@ Combined with tg200 (1.054×), the mission objective is empirically
 validated at **both** the warmup-pass tg200 regime AND the realistic
 averaged-decode tg2000 regime that originally opened iter-100.
 
+### tg5000 deepest-context validation
+
+Same-session 2-cycle alt-pair at tg5000, gemma4-APEX-Q5_K_M on M5 Max:
+
+| | hf2q V3 | peer-FA (llama-bench `-p 0 -n 5000 -fa 1 -r 1`) |
+|---|---:|---:|
+| run 1 | 101.1 t/s | 95.57 t/s |
+| run 2 | 101.0 t/s | 96.06 t/s |
+| **mean** | **101.05 t/s** | **95.815 t/s** |
+| σ-pct | 0.07% | 0.36% |
+| **Ratio** | | **1.0547× AHEAD by 5.5%** |
+
+### Win consistency across all regimes
+
+| Regime | Ratio | n same-session pairs |
+|---|---:|---:|
+| tg200 | 1.054× AHEAD | 3 (σ-pct < 0.13%) |
+| tg2000 | 1.058× AHEAD | 3 (mixed thermal states) |
+| **tg5000** | **1.055× AHEAD** | **2 (σ-pct < 0.36%)** |
+
+Lead is **completely consistent (5.4-5.8%) across kv depths 0 → 5000**.
+Step 1i's routing optimization is kv-depth-independent (per-token
+work, not per-kv), so the relative win holds across all decode
+regimes.  iter-100's "averaged-decode regime missed" concern is
+empirically closed at all three measurement points.
+
 ## 🏆 MISSION OBJECTIVE ACHIEVED — iter-175 post-Step-1i
 
 **Decode: hf2q 107.17 t/s vs peer-FA 101.72 t/s = 1.054× AHEAD of peer**
