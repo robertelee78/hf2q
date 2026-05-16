@@ -1,60 +1,59 @@
-Making sourdough bread is a blend of science (fermentation) and art (handling dough). Because it relies on wild yeast rather than commercial yeast, the process is slower, but the result is a superior flavor and texture.
+Making sourdough bread is a journey of managing living organisms (wild yeast and bacteria). Unlike commercial yeast, sourdough requires patience, temperature control, and intuition.
 
-This guide covers the **"No-Knead" Method**, which is the most effective way for beginners to achieve a professional crust and airy interior.
-
----
-
-### Phase 1: The Essentials
-To succeed, you need the right tools and ingredients.
-
-**The Ingredients:**
-*   **Active Sourdough Starter:** 100g–200g (must be bubbly and active).
-*   **Bread Flour:** 500g (High protein is key for structure).
-*   **Water:** 350g–375g (Filtered water is best; chlorine can inhibit wild yeast).
-*   **Salt:** 10g (Fine sea salt).
-
-**The Tools:**
-*   A Dutch Oven (essential for steam).
-*   A digital scale (volume measurements like "cups" are too imprecise for bread).
-*   A proofing basket (Banneton) or a bowl lined with a heavy linen towel.
-*   A sharp razor blade (Lame) or a sharp knife.
+This guide is broken down into four phases: **The Starter**, **The Dough**, **The Fermentation**, and **The Bake**.
 
 ---
 
-### Phase 2: The Timeline (The 24-Hour Workflow)
+### Phase 1: The Starter (The Engine)
+Before you bake, you must have an active, bubbly sourdough starter. If your starter is "young" (less than 2 weeks old), it won't have enough strength. If it is mature, it should double in size within 4–6 hours of feeding and smell fruity/tangy, not like gym socks.
 
-#### 1. The Levain/Starter Activation (Morning - 8:00 AM)
-Before you bake, ensure your starter is "active." Feed your starter and wait until it has doubled in size and passes the "float test" (a small piece of starter floats in water).
-
-#### 2. The Autolyse (The Mix)
-*   **Combine:** Mix your flour and water in a large bowl until no dry flour remains. It will look shaggy.
-*   **Rest:** Cover and let sit for 30–60 minutes. This hydrates the flour and begins gluten development.
-
-#### 3. Adding Starter and Salt (The Incorporation)
-*   Add your active starter and salt to the dough. 
-*   **The Technique:** Use your hands to "squish" the dough together. Squeeze the dough through your fingers until it is fully incorporated. It will feel messy, but this is normal.
-
-####ま 4. Bulk Fermentation (The First Rise)
-This is the most critical stage. You are building structure through **"Stretch and Folds."**
-*   **The Process:** Instead of kneading, perform 4 sets of "Stretch and Folds" every 30 minutes. Wet your hand, grab the side of the dough, pull it up high, and fold it over the center. Repeat for the whole bowl.
-*   **The Goal:** After 4 sets, let the dough rest undisturbed. The dough should grow in volume and look "bubbly" or aerated.
-5.  **The Rule of Thumb:** If the dough doubles in size and feels jiggly like a marshmallow, it’s ready for the next step.
-
-#### 5. Shaping (The Tension)
-*   Turn the dough onto a floured surface. 
-*   **Pre-shape:** Gently fold the dough into a rough ball. Let it rest for 20 minutes (this is the "bench rest").
-*   **Final Shape:** Use the dough to create tension. Tighten the surface of the dough by pulling it toward you on a clean surface. The goal is a tight "skin" on the top of the loaf.
-*   **The Proof:** Place the dough in a floured proofing basket. Cover with a damp cloth or plastic.
-
-#### 6. The Cold Proof (The Flavor Builder)
-*   Place the basket in the fridge for 8–24 hours. 
-*   **Why?** Cold fermentation slows down the yeast but allows the bacteria to produce lactic acid, creating that "sour" flavor and making the bread easier to digest.
+**The Golden Rule:** Only bake when your starter is at its **peak** (maximum height and bubbly).
 
 ---
 
-### Phase 3: The Bake (The Heat)
+### Phase 2: The Ingredients & Tools
+*For a standard loaf:*
+*   **Active Starter:** 100g (fed and bubbly)
+*   **Warm Water:** 350g (filtered is best; chlorine can inhibit yeast)
+*   **Bread Flour:** 500g (High protein is essential for structure)
+*   **Fine Sea Salt:** 10g
 
-1.  **Preheat:** Place your Dutch Oven in the oven and heat to **450°F (230°C)** for at least 45 minutes.
-2.  **The Score:** Turn the cold dough out onto a piece of parchment paper. Use a razor (Lame) to slice a deep 1/2-inch cut through the top. This controls where the bread expands.
-3.  **The Bake (Stage 1 - Steam):** Lower the dough into the hot Dutch Oven. Cover with the lid. Bake for **25 minutes**. The lid traps the steam from the dough, which is vital for a "springy" rise and a crispy crust.
+**Essential Tools:**
+*   Digital kitchen scale (volume measurements like "cups" are too inaccurate for sourdough)
+*   Large mixing bowl
+*   Bench scraper
+*   Proofing basket (Banneton) or a bowl lined with a linen cloth
+*   Dutch Oven (essential for creating steam)
+*   Lame (or a very sharp razor blade)
 
+---
+
+### Phase 3: The Process (Step-by-Step)
+
+#### 1. The Autolyse (Mixing)
+Mix your water and starter in a bowl until dissolved. Add the flour and salt. Mix by hand until no dry flour remains. It will look shaggy and messy.
+*   **Rest:** Cover with a damp cloth and let rest for 30–60 minutes. This allows the flour to hydrate and begins gluten development.
+
+#### 2. Bulk Fermentation (The First Rise)
+This is where flavor and air are built. Instead of "kneading" like traditional bread, we use **"Stretch and Folds."**
+*   **Stretch & Fold:** Every 30 minutes, grab one side of the dough, pull it upward, and fold it over the center. Rotate the bowl and do this 4 times (North, South, East, West).
+*   **Repeat:** Do 4 sets of folds (total of 2 hours).
+*   **Rest:** Let the dough sit undisturbed for another 2–4 hours. 
+*   **Goal:** The dough should increase in volume by about 50–75%, look bubbly on the surface, and feel "jiggly" like a bowl of gelatin.
+
+#### 3. Shaping (Creating Tension)
+*   **Pre-shape:** Gently tip the dough onto a lightly floured surface. Fold the edges toward the center to create a loose ball. Let it rest for 20 minutes (Bench Rest).
+*   **Final Shape:** Flip the dough over. Pull the dough toward you across the counter to create surface tension. The skin of the dough should be taut. 
+*   **The Tension:** If the dough is floppy, you haven't created enough tension. A tight skin prevents the bread from spreading like a pancake in the oven.
+
+#### 4. Cold Proof (The Flavor Builder)
+Place your shaped dough upside down into a floured proofing basket (Banneton). Cover with plastic to prevent drying.
+*   **The Fridge:** Place in the refrigerator for 12–24 hours. This "cold retard" slows down the yeast but allows the bacteria to produce that signature sour flavor.
+
+#### 5. The Bake (The Transformation)
+*   **Preheat:** Place your Dutch Oven inside the oven and preheat to **450°F (230°C)** for at least 45 minutes.
+*   **Score:** Take the dough out of the fridge. Flip it onto parchment paper. Use a razor blade to make one deep slash (about 1/2 inch deep) across the top. This directs the expansion.
+*   **Steam:** Carefully lower the dough into the hot Dutch Oven. Cover with the lid. The lid traps the moisture escaping from the dough, creating steam—this is the secret to a crispy, shiny crust.
+*   **The Two-Stage Bake:**
+    1.  **Lid ON:** Bake for 20–25 minutes.
+    2.  **Lid OFF:** Bake for another 20–25 minutes until the crust is deep

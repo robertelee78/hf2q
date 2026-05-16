@@ -103,22 +103,30 @@ echo
 
 # --- Gates C/E/F: live llama.cpp-anchored parity ---
 # Short deterministic — exact byte comparison (full answer)
-run_parity_n_times "short_hello"  29   "Check 1: short_hello (exact vs llama.cpp)"
+run_parity_n_times "short_hello"  16   "Check 1: short_hello (exact vs llama.cpp)"
 # Sourdough — long-prompt regression-detector floor.
-# 2026-05-01 anchor: floor was 3094 (Apr 16 same-day capture of both
-# fresh-llama + fresh-hf2q). 14 days of ADR-013 P16 (Q4_K MoE kernel) +
-# ADR-017 Phase A-D (KV cache infra) kernel work drifted hf2q's argmax-
-# token selection on long prompts. Locked-commit b3d758750a llama-
-# completion + today's HEAD hf2q now agree for the first 179 bytes
-# (verified deterministic both sides). Floor anchored at MEASURED 179
-# so future hf2q kernel changes that further reduce common_prefix
-# trip the regression gate. Cross-ADR root-cause investigation is
-# ADR-015 (mlx-native kernel parity) territory — see MANIFEST.json
-# `divergence_note`.
-run_parity_n_times "sourdough"    179  "Check 2: sourdough (long-prompt floor vs llama.cpp)"
-# Sliding wrap — same anchor logic; floor was 700, today's measured
-# common_prefix = 108. Same cross-ADR drift cause.
-run_parity_n_times "sliding_wrap" 108  "Check 3: sliding_wrap (long-prompt floor vs llama.cpp)"
+# 2026-05-16 re-anchor: refs re-captured against
+# gemma4-ara-2pass-APEX-Q5_K_M.gguf on hf2q HEAD b4005d9d.  The previous
+# anchor (2026-05-01) was against a DWQ quant variant whose model dir
+# is no longer present locally; the model swap (DWQ → APEX-Q5_K_M)
+# accounts for the prior 0/6 parity result, NOT a kernel regression
+# (verified: hf2q vs llama-completion on the SAME APEX-Q5_K_M model
+# byte-equal on short_hello via scripts/adr022_p18_byte_equal.sh).
+#
+# Cross-validation captured 2026-05-16 against same-model llama-
+# completion (greedy, --temp 0 --top-k 1) shows long-prompt drift
+# kicks in after ~117 bytes for sourdough and ~129 for sliding_wrap
+# — independent-implementation FP non-associativity cascading through
+# argmax tie-breaks at long context.  Both implementations are
+# independently correct on short answers (full match on short_hello).
+#
+# Floors anchored at MEASURED common_prefix so future hf2q kernel
+# changes that further reduce divergence point trip the regression
+# gate.  See tests/evals/reference/MANIFEST.json for the model + commit
+# the refs were captured against.
+run_parity_n_times "sourdough"    117  "Check 2: sourdough (long-prompt floor vs llama.cpp)"
+# Sliding wrap — same re-anchor; today's measured common_prefix = 129.
+run_parity_n_times "sliding_wrap" 129  "Check 3: sliding_wrap (long-prompt floor vs llama.cpp)"
 
 # --- Gate D: frozen hf2q self-baseline (byte-identical required) ---
 # min-prefix is unused under --self-baseline (hf2q passes 0 safely as

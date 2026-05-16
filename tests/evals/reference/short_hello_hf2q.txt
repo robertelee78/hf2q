@@ -1,1 +1,1 @@
-The answer to 2 + 2 is **4**.<turn|>
+2 + 2 = 4<turn|>
