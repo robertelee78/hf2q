@@ -5166,3 +5166,45 @@ shipping decode rate is **~96 t/s on gemma4-APEX-Q5_K_M at M5 Max**
 (0.94× peer-FA at default config, 2.4× peer at quantized-V
 apples-to-apples regime).
 
+### Per-phase GPU time profile (iter-175 post-1f2, this iteration)
+
+Captured with `HF2Q_MLX_PROFILE=1 HF2Q_FFN_SPLIT=1
+HF2Q_PER_LAYER_PHASE_GPU_TIME=1` at decode, gemma4-APEX-Q5_K_M
+on M5 Max.
+
+**At deep kv (last 200 layer-tokens of tg1000)**:
+
+| Phase | Sliding layers (n=40) | Global layers (n=9) | Notes |
+|---|---:|---:|---|
+| PHASE_ATTN | **109.2 µs** (35.4%) | **147.3 µs** (42.6%) | Q/K/V proj + norms + RoPE + KV-write + SDPA + o_proj |
+| FFN_NORMS | 6.7 µs (2.2%) | 6.7 µs (1.9%) | pre-FF norms, dense gate_up |
+| **FFN_BODY** | **185.7 µs** (**60.2%**) | **186.8 µs** (54.1%) | **dense down + MoE gate_up + swiglu + MoE down + post-FF norm 1** |
+| FFN_EOL | 5.5 µs (1.8%) | 5.5 µs (1.6%) | end-of-layer fused norm+add+scalar |
+| **Total/layer** | **308.6 µs** | **346.3 µs** | per-token wall = layer-sum × 30 layers ≈ 9.4 ms |
+
+**Strategic implication**: FFN_BODY is the empirically dominant phase at
+~60% of layer GPU time (24× larger than FFN_NORMS or FFN_EOL).  The 6%
+decode-wall gap to peer-FA (~600 µs/tok absolute) represents ~3.3%
+relative reduction needed in FFN_BODY (or ~18% in PHASE_ATTN) to close.
+
+Within FFN_BODY (5 dispatches per layer):
+- Dense MLP down_proj (dispatch_qmatmul, Step 1d fast-pathed)
+- MoE gate_up_id (Q6_K_ID NR2 kernel, Step 1e fast-pathed)
+- moe_swiglu_batch (GELU-gated activation, single dispatch)
+- MoE down_id (Q8_0_ID regular kernel, Step 1e2 fast-pathed)
+- Post-FF norm 1 (Step 1f fast-pathed)
+
+All 5 dispatches' CPU encode paths are pre-baked.  Remaining gap is
+GPU-side per-kernel time — the multi-week SDPA / MoE kernel
+optimization track per iter-153.
+
+**Peer comparison**: peer's `kernel_mul_mv_id_q6_K_f32` is compile-time
+instantiated with `N_R0_Q6_K=2` (matches hf2q's NR2 default-on).
+Peer's `kernel_mul_mv_id_q8_0_f32` uses `N_R0_Q8_0=2, N_SG_Q8_0=4`
+(NR2 + NSG=4 variant); hf2q has the equivalent kernel
+(`kernel_mul_mv_id_q8_0_f32_nr2`) but it is **default-OFF** per
+[[feedback_levers_can_widen_opposing_regressions_2026_05_15]] which
+documented `HF2Q_Q8_0_ID_MV_NR2=-1.3% → -1.96%` regression at
+gemma4 shape (different best-choice geometry vs peer's compile-time
+commit).  Already-optimal kernel choice for hf2q's specific shape.
+
