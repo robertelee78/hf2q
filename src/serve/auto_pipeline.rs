@@ -1053,9 +1053,9 @@ mod tests {
         // Inject the shards by going through record_source_with_shards
         // (the canonical API).  We have to fabricate a corresponding
         // ShardIntegrity Vec because that's the public type.
-        let integ: Vec<crate::input::integrity::ShardIntegrity> = shards
+        let integ: Vec<crate::core::integrity::ShardIntegrity> = shards
             .iter()
-            .map(|s| crate::input::integrity::ShardIntegrity {
+            .map(|s| crate::core::integrity::ShardIntegrity {
                 filename: s.filename.clone(),
                 bytes: s.bytes,
                 sha256: s.sha256.clone(),

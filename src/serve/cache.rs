@@ -146,7 +146,7 @@ pub struct ModelEntry {
 }
 
 /// One per-shard integrity record (ADR-005 Phase 3 item 3/4).  Mirrors
-/// [`crate::input::integrity::ShardIntegrity`] in JSON shape so the two
+/// [`crate::core::integrity::ShardIntegrity`] in JSON shape so the two
 /// surfaces stay aligned and a `From` adapter is a memberwise copy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceShard {
@@ -167,7 +167,7 @@ pub struct SourceShard {
 impl SourceShard {
     /// Adapter from the integrity-side struct.  Stamps `verified_at_secs`
     /// at adapter time so the cache's clock is the canonical timestamp.
-    pub fn from_integrity(value: &crate::input::integrity::ShardIntegrity) -> Self {
+    pub fn from_integrity(value: &crate::core::integrity::ShardIntegrity) -> Self {
         Self {
             filename: value.filename.clone(),
             bytes: value.bytes,
@@ -593,7 +593,7 @@ impl ModelCache {
         repo_id: &str,
         revision: &str,
         source: SourcePointer,
-        shards: Vec<crate::input::integrity::ShardIntegrity>,
+        shards: Vec<crate::core::integrity::ShardIntegrity>,
     ) -> Result<()> {
         let _ = slug_repo_id(repo_id)?;
 
@@ -1941,8 +1941,8 @@ mod tests {
 
     // ── record_source_with_shards ───────────────────────────────────────
 
-    fn fake_shard(filename: &str, bytes: u64, sha256: Option<&str>) -> crate::input::integrity::ShardIntegrity {
-        crate::input::integrity::ShardIntegrity {
+    fn fake_shard(filename: &str, bytes: u64, sha256: Option<&str>) -> crate::core::integrity::ShardIntegrity {
+        crate::core::integrity::ShardIntegrity {
             filename: filename.to_string(),
             bytes,
             sha256: sha256.map(|s| s.to_string()),
@@ -2105,7 +2105,7 @@ mod tests {
 
     #[test]
     fn source_shard_adapter_copies_all_fields_and_stamps_timestamp() {
-        let integ = crate::input::integrity::ShardIntegrity {
+        let integ = crate::core::integrity::ShardIntegrity {
             filename: "model.safetensors".into(),
             bytes: 4096,
             sha256: Some("d".repeat(64)),

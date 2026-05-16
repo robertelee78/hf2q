@@ -47,5 +47,6 @@
 // helpers.  `SourceShard` + `compute_source_bundle_sha256` deferred to
 // B1.3 (alongside `integrity` migration — SourceShard's `from_integrity`
 // adapter depends on ShardIntegrity from `src/input/integrity`).
+pub mod integrity;
 pub mod provenance;
 pub mod sha256;

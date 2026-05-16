@@ -1641,7 +1641,7 @@ pub struct ConvertConfig {
     /// no source bundle binding is available, GGUF parses as External,
     /// auto-pipeline runs the W71 30 GB SHA-256 re-hash exactly as
     /// before.
-    pub source_shards: Option<Vec<crate::input::integrity::ShardIntegrity>>,
+    pub source_shards: Option<Vec<crate::core::integrity::ShardIntegrity>>,
 }
 
 /// Custom value parser for `--shard-size-gb` (ADR-014 P9 iter-1 §S5).
@@ -1713,7 +1713,7 @@ pub fn resolve_convert_config(args: &ConvertArgs) -> anyhow::Result<ConvertConfi
     // GGUF backend can stamp `hf2q.source_sha256` at write time.
     // `None` for the local-path / `--no-integrity` paths (no source
     // bundle binding is available; GGUF parses as External post-write).
-    let mut source_shards: Option<Vec<crate::input::integrity::ShardIntegrity>> = None;
+    let mut source_shards: Option<Vec<crate::core::integrity::ShardIntegrity>> = None;
     let input_dir = match (&args.input, &args.repo) {
         (Some(path), None) => {
             if !path.exists() {
