@@ -782,7 +782,7 @@ fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
     }
 }
 
-/// How to source the [`crate::inference::models::qwen35::activation_capture::ActivationCapture`]
+/// How to source the [`crate::core::traits::activation_capture::ActivationCapture`]
 /// for calibrators that need a forward pass.
 ///
 /// `None` is the explicit "no capture" state — used by uncalibrated
@@ -797,7 +797,7 @@ fn cmd_smoke(args: cli::SmokeArgs) -> Result<(), AppError> {
 enum CaptureSpec {
     None,
     #[allow(dead_code)] // exercised by test-only callers that inject a capture
-    Eager(Box<dyn crate::inference::models::qwen35::activation_capture::ActivationCapture + Send + Sync>),
+    Eager(Box<dyn crate::core::traits::activation_capture::ActivationCapture + Send + Sync>),
     Lazy { tokenizer: Box<tokenizers::Tokenizer> },
 }
 

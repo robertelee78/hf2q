@@ -42,7 +42,7 @@ use mlx_native::ops::elementwise::elementwise_add;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 use std::sync::OnceLock;
 
-use super::activation_capture::LayerActivations;
+use crate::core::traits::activation_capture::LayerActivations;
 use super::delta_net::DeltaNetLayerShape;
 use super::encoder_stage::LayerEncoder;
 use super::ffn::{DenseFfnShape, MoeFfnShape};

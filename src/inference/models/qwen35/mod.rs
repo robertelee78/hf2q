@@ -25,7 +25,6 @@
 use anyhow::{anyhow, bail, Result};
 use mlx_native::gguf::{GgufFile, MetadataValue};
 
-pub mod activation_capture;
 pub mod activation_capture_real;
 pub mod decode_pool;
 pub mod delta_net;

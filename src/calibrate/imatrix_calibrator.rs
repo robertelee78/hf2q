@@ -53,7 +53,7 @@ use super::calibrator::{
     corpus_sha, model_fingerprint, CalibrationCorpus, CalibrationData, CalibrationError, Calibrator,
 };
 use super::imatrix::ImatrixCollector;
-use crate::inference::models::qwen35::activation_capture::ActivationCapture;
+use crate::core::traits::activation_capture::ActivationCapture;
 use crate::ir::lazy::LazyTensorMap;
 use crate::ir::ModelMetadata;
 use crate::progress::ProgressReporter;
@@ -80,7 +80,7 @@ pub const IMATRIX_ALGORITHM_VERSION: &str = "imatrix-v1.0";
 /// importance via [`ImatrixCollector`]. Consumes any
 /// [`ActivationCapture`] impl, so the same calibrator works for
 /// qwen35 / qwen35moe (real capture) and for tests
-/// ([`crate::inference::models::qwen35::activation_capture::MockActivationCapture`]).
+/// ([`crate::core::traits::activation_capture::MockActivationCapture`]).
 ///
 /// `#[allow(dead_code)]` on the struct + impl block until P8 wires
 /// `--quant imatrix-q4_k_m` through `select_calibrator` → live
@@ -340,7 +340,7 @@ mod tests {
     use crate::calibrate::cache::SensitivityCacheKey;
     use crate::calibrate::calibrator::{corpus_sha, model_fingerprint};
     use crate::calibrate::imatrix::ImatrixCollector;
-    use crate::inference::models::qwen35::activation_capture::{
+    use crate::core::traits::activation_capture::{
         ActivationCapture, LayerActivations, MockActivationCapture,
     };
     use crate::ir::lazy::{LazyMeta, LazyTensor, LazyTensorMap};

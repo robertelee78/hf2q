@@ -51,3 +51,4 @@ pub mod hardware;
 pub mod integrity;
 pub mod provenance;
 pub mod sha256;
+pub mod traits;

@@ -36,7 +36,7 @@ use std::ops::RangeInclusive;
 
 use tracing::{debug, info};
 
-use crate::inference::models::qwen35::activation_capture::ActivationCapture;
+use crate::core::traits::activation_capture::ActivationCapture;
 use crate::ir::lazy::LazyTensorMap;
 use crate::ir::{ModelMetadata, QuantizedModel, TensorMap};
 use crate::progress::ProgressReporter;
@@ -424,7 +424,7 @@ fn indices_to_ranges(indices: &[usize]) -> Vec<RangeInclusive<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::models::qwen35::activation_capture::MockActivationCapture;
+    use crate::core::traits::activation_capture::MockActivationCapture;
     use crate::ir::{DType, TensorRef};
     use crate::calibrate::dwq::DwqArch;
 

@@ -684,7 +684,7 @@ mod tests {
     /// that the sensitivity scorer can consume.
     #[test]
     fn test_mock_activation_capture_feeds_scorer() {
-        use crate::inference::models::qwen35::activation_capture::{
+        use crate::core::traits::activation_capture::{
             ActivationCapture, MockActivationCapture,
         };
         use crate::calibrate::sensitivity::compute_layer_sensitivity;

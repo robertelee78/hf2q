@@ -47,7 +47,7 @@ use super::calibrator::{
 use super::dwq::{DwqArch, DwqConfig};
 use super::dwq_activation::capture_activations_to_sensitive_ranges_fd;
 use super::dynamic_quant::SENSITIVITY_ALGORITHM_VERSION_GRADIENT_ALIGNMENT;
-use crate::inference::models::qwen35::activation_capture::ActivationCapture;
+use crate::core::traits::activation_capture::ActivationCapture;
 use crate::ir::lazy::LazyTensorMap;
 use crate::ir::ModelMetadata;
 use crate::progress::ProgressReporter;
@@ -458,7 +458,7 @@ mod tests {
     };
     use crate::calibrate::dynamic_quant::SENSITIVITY_ALGORITHM_VERSION_GRADIENT_ALIGNMENT;
     use crate::calibrate::calibrator::{corpus_sha, model_fingerprint};
-    use crate::inference::models::qwen35::activation_capture::{
+    use crate::core::traits::activation_capture::{
         LayerActivations, MockActivationCapture,
     };
     use crate::ir::lazy::LazyTensorMap;

@@ -62,7 +62,7 @@ use mlx_native::MlxDevice;
 use thiserror::Error;
 use tokenizers::Tokenizer;
 
-use super::activation_capture::{ActivationCapture, LayerActivations};
+use crate::core::traits::activation_capture::{ActivationCapture, LayerActivations};
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
 use crate::ir::lazy::LazyTensorMap;
