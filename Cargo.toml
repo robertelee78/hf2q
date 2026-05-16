@@ -3,9 +3,15 @@ name = "hf2q"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.81.0"
-description = "Pure Rust CLI for converting HuggingFace models to hardware-optimized formats"
-license = "Apache-2.0"
+authors = ["Robert E. Lee <robert@agidreams.us>"]
+description = "Pure Rust CLI for converting HuggingFace models to hardware-optimized formats and serving them over an OpenAI-compatible API on Apple Silicon"
+license = "Apache-2.0 OR MIT"
 repository = "https://github.com/robertelee78/hf2q"
+homepage = "https://github.com/robertelee78/hf2q"
+documentation = "https://github.com/robertelee78/hf2q"
+readme = "README.md"
+keywords = ["llm", "gguf", "mlx", "quantization", "huggingface"]
+categories = ["command-line-utilities", "science"]
 
 [features]
 default = []
@@ -47,10 +53,7 @@ thiserror = "2"
 # development, override via a (gitignored) .cargo/config.toml:
 #   [patch.crates-io]
 #   mlx-native = { path = "/opt/mlx-native" }
-# ADR-015 iter56 — path-pin to local mlx-native (which now has the new
-# `gated_delta_net_decode` op merged at commit 641ab78). Revert to
-# `mlx-native = "0.6"` once mlx-native publishes a 0.7 with this kernel.
-mlx-native = { version = "0.8", path = "/opt/mlx-native" }
+mlx-native = "0.9"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 # Transitive via tokenizers but we consume it directly to construct
 # the WordPiece builder's AHashMap vocab (tokenizers 0.22 requires it).
@@ -190,6 +193,10 @@ harness = false
 
 # ADR-008: vendored candle patches removed (candle no longer used for inference).
 
-# (ADR-015 iter56 mlx-native path override is on the dependency line itself;
-# no `[patch.crates-io]` block needed — see comment near the dependency.)
+# Local mlx-native development: place this in a gitignored .cargo/config.toml
+# rather than this file, so fresh clones get the published crates.io version
+# by default.
+#
+#   [patch.crates-io]
+#   mlx-native = { path = "/opt/mlx-native" }
 
