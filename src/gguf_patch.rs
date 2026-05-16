@@ -146,7 +146,7 @@ pub fn patch_chat_template_from_arch(opts: GgufPatchOptions) -> Result<PatchOutc
         return Ok(PatchOutcome::MissingArch);
     };
 
-    let Some(template) = crate::backends::chat_templates::arch_default_chat_template(&arch) else {
+    let Some(template) = crate::core::chat_templates::arch_default_chat_template(&arch) else {
         warn!(
             arch = %arch,
             input = %opts.input.display(),
@@ -654,7 +654,7 @@ fn write_gguf_string<W: Write>(w: &mut W, s: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::chat_templates::QWEN3_CHATML;
+    use crate::core::chat_templates::QWEN3_CHATML;
 
     fn synthetic_gguf(path: &Path, arch: &str, chat_template: Option<&str>) -> Result<()> {
         let mut metadata = vec![

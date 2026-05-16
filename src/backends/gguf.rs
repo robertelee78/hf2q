@@ -3065,7 +3065,7 @@ fn load_tokenizer_metadata(
     // Chat template — priority chain (ADR-012 chat-template-auto-inject 2026-04-30):
     //   1. chat_template.jinja file alongside HF tokenizer
     //   2. tokenizer_config.json[chat_template]
-    //   3. arch-default from `super::chat_templates::arch_default_chat_template`
+    //   3. arch-default from `crate::core::chat_templates::arch_default_chat_template`
     //   4. graceful skip + WARN (operator-visible)
     //
     // Why arch-default exists: 4 of 5 Qwen3.6 GGUFs on disk (all
@@ -3090,7 +3090,7 @@ fn load_tokenizer_metadata(
         {
             (Some(s), "tokenizer_config.json[chat_template]")
         } else if let Some(default) =
-            crate::backends::chat_templates::arch_default_chat_template(arch)
+            crate::core::chat_templates::arch_default_chat_template(arch)
         {
             (Some(default.to_string()), "arch-default (auto-inject)")
         } else {
@@ -6430,10 +6430,10 @@ mod tests {
             .expect("arch-default MUST inject tokenizer.chat_template for qwen35moe");
         assert_eq!(
             injected.len(),
-            crate::backends::chat_templates::QWEN3_CHATML_LEN,
+            crate::core::chat_templates::QWEN3_CHATML_LEN,
             "injected template must be the verbatim 7764-byte Qwen3 ChatML"
         );
-        assert_eq!(injected, crate::backends::chat_templates::QWEN3_CHATML);
+        assert_eq!(injected, crate::core::chat_templates::QWEN3_CHATML);
     }
 
     #[test]
@@ -6460,7 +6460,7 @@ mod tests {
         assert_eq!(emitted, custom, "source MUST win over arch-default");
         assert_ne!(
             emitted,
-            crate::backends::chat_templates::QWEN3_CHATML,
+            crate::core::chat_templates::QWEN3_CHATML,
             "arch-default must NOT have replaced the vendor-shipped template"
         );
     }

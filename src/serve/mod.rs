@@ -5432,7 +5432,7 @@ mod tests {
         should_enable_kv_persist, DecodeStopReason,
         FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
-    use crate::backends::chat_templates::QWEN3_CHATML;
+    use crate::core::chat_templates::QWEN3_CHATML;
     use crate::cli;
     use crate::serve::load_info::{
         ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource,
