@@ -5313,6 +5313,43 @@ data confirms the localization — **the MoE pipeline IS the gap** (despite
 the ADR title being a question, the 2026-05-15 skip-bisect data validates
 the original framing).
 
+## 🏆 MISSION OBJECTIVE ACHIEVED — iter-175 post-Step-1i
+
+**Decode: hf2q 107.17 t/s vs peer-FA 101.72 t/s = 1.054× AHEAD of peer**
+
+Same-session 3-cycle alt-pair thermal-fair bench, cycle-alternated
+[hf2q,peer | peer,hf2q | hf2q,peer], gemma4-ara-2pass-APEX-Q5_K_M
+on M5 Max:
+
+| | hf2q V3 | peer-FA (llama-bench `-p 0 -n 200 -fa 1`) |
+|---|---:|---:|
+| run 1 | 107.1 | 101.85 |
+| run 2 | 107.3 | 101.73 |
+| run 3 | 107.1 | 101.59 |
+| **mean** | **107.17 t/s** | **101.72 t/s** |
+| σ-pct | 0.088% | 0.13% |
+| **Ratio** | | **hf2q / peer = 1.0536× = AHEAD** |
+
+**Trajectory**: iter-100 (2026-05-12) measured 0.924× peer-FA (-7.6%
+gap) and reopened decode work.  After 11 substeps (1c, 1d, 1e, 1e2,
+1f, 1f2, 1g classified, 1h hypothesis, **1i +11.5% WIN**), hf2q is
+**+5.4% AHEAD of peer-FA** at the same averaged-decode regime that
+iter-100 was failing.  **Net trajectory: 0.924× → 1.054× peer-FA =
++13pp swing.**
+
+Mission state at HEAD `92d85ae3` / `5119eee`:
+- Decode (averaged tg200): **1.054× peer-FA AHEAD**
+- Quant-V apples-to-apples regime (peer `-ctv q8_0`): **2.4× peer**
+- Prefill: 1.04-1.09× AHEAD of peer-FA (per iter-160 measurement)
+- KV memory: 3.94× advantage
+- coherence_smoke 2/2 PASS at HEAD
+
+The 2026-05-11 thesis "MoE pipeline IS the gap" was correct.  The
+gap was localized to the routing kernel's serial top-K phase
+(unchanged from V1 since the original implementation).  Replacing
+it with parallel SG-tournament reductions reclaimed the entire
+deficit + delivered structural lead.
+
 ### Step 1i LANDED — MoE routing V3 parallel top-K, +11.5% MEASURED WIN
 
 **Hypothesis** (from prior iteration's skip-bisect): the fused MoE
