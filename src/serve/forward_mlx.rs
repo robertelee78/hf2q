@@ -382,6 +382,23 @@ pub struct MlxQWeight {
     ///
     /// Default OFF until coherence + multi-regime bench parity proven.
     pub f16_shadow: Option<MlxBuffer>,
+    /// ADR-029 iter-175 Step 1d — pre-baked dispatch record for the
+    /// Q6_K NR2 decode-m=1 mat-vec hot path.  Lazy-init on the first
+    /// `dispatch_qmatmul` call (held in a `OnceLock` so the bake cost
+    /// is amortized across the model's lifetime).
+    ///
+    /// `OnceLock<Option<DispatchRecord>>` encodes three states:
+    ///   - `OnceLock` empty: not yet attempted (will try on first call)
+    ///   - `Some(None)`: bake attempted but not applicable (wrong dtype,
+    ///     env-flag off, etc.); caller falls back to the unbaked path
+    ///   - `Some(Some(rec))`: bake succeeded; caller uses the fast path
+    ///
+    /// Gated by [`mlx_native::ops::quantized_matmul_ggml::build_q6k_nr2_m1_record`]
+    /// — only Q6_K with `HF2Q_Q6K_MV_NR2` truthy is bakeable through
+    /// this slot.  Other weight types (Q8_0, Q5_K, Q4_K, F32, affine,
+    /// F16 shadow) keep using the legacy dispatch path until additional
+    /// bake helpers land in later substeps.
+    pub decode_record_q6k_m1: std::sync::OnceLock<Option<mlx_native::DispatchRecord>>,
 }
 
 impl MlxQWeight {
@@ -497,6 +514,7 @@ impl MlxQWeight {
                 group_size: linear.group_size as u32,
             }),
             f16_shadow: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
         })
     }
 }
@@ -646,6 +664,7 @@ impl MlxMoeWeights {
                 },
                 affine: None,
                 f16_shadow: None,
+                decode_record_q6k_m1: std::sync::OnceLock::new(),
             },
             per_expert_scale: alloc_one_f32_placeholder(mlx_device, "per_expert_scale")?,
             gate_up_ggml_dtype: mlx_native::GgmlType::F32,
@@ -2207,6 +2226,7 @@ impl MlxModelWeights {
                 },
                 affine: None,
                 f16_shadow: None,
+                decode_record_q6k_m1: std::sync::OnceLock::new(),
             })
         } else {
             None
@@ -8475,6 +8495,7 @@ mod dispatch_qmatmul_f32_router_test {
             },
             affine: None,
             f16_shadow: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
         };
 
         // Run through GraphSession (mirrors production dispatch path).
@@ -9126,6 +9147,7 @@ fn load_gguf_qweight(
         },
         affine: None,
         f16_shadow: None,
+        decode_record_q6k_m1: std::sync::OnceLock::new(),
     })
 }
 
@@ -9522,6 +9544,44 @@ pub fn dispatch_qmatmul(
             &params,
         )
         .map_err(|e| anyhow::anyhow!("dense_matmul_f32_f32_tensor failed: {e}"));
+    }
+
+    // ADR-029 iter-175 Step 1d — Q6_K NR2 decode-m=1 fast path via
+    // pre-baked DispatchRecord.  Eliminates per-call HashMap pipeline
+    // lookup, MTLSize::new, ggml_type match arms, and
+    // GgmlMatvecGpuParams struct construction.
+    //
+    // Falls through to the legacy path when:
+    //   - bake returns None (HF2Q_Q6K_MV_NR2 disabled)
+    //   - first call ever fails to compile the PSO
+    // The legacy path is what handles all other dtypes (Q8_0, Q4_K,
+    // Q5_K, etc.) — those gain fast paths in subsequent substeps.
+    //
+    // Pre-conditions established by earlier branches in this function:
+    //   - weight.affine.is_none() (would have returned at affine block)
+    //   - weight.f16_shadow not applicable at m=1 (only consulted at
+    //     m > MM_ROUTING_THRESHOLD)
+    //   - weight.info.ggml_dtype != F32 (would have returned at F32 block)
+    if m == 1 && weight.info.ggml_dtype == mlx_native::GgmlType::Q6_K {
+        let n = weight.info.rows as u32;
+        let k = weight.info.cols as u32;
+        let record_opt = weight.decode_record_q6k_m1.get_or_init(|| {
+            mlx_native::ops::quantized_matmul_ggml::build_q6k_nr2_m1_record(
+                registry,
+                device.metal_device(),
+                n,
+                k,
+            )
+            .ok()
+            .flatten()
+        });
+        if let Some(record) = record_opt {
+            session.encoder_mut().dispatch_record(
+                record,
+                &[&weight.buffer, input, output],
+            );
+            return Ok(());
+        }
     }
 
     let params = weight.matmul_params(m)?;
