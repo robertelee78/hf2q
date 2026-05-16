@@ -2332,22 +2332,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.len(), 2 * 2 * hidden);
+        // Local helper: index into the [patch][channel] layout.
+        let p = |patch: usize, ch: usize| patch * hidden + ch;
         // Patch (0,0) — top-left of each channel at (0,0).
-        assert_eq!(out[0 * hidden + 0], 0.0); // c=0 pixel (0,0) = 0
-        assert_eq!(out[0 * hidden + 1], 100.0); // c=1 pixel (0,0) = 100
-        assert_eq!(out[0 * hidden + 2], 200.0); // c=2 pixel (0,0) = 200
+        assert_eq!(out[p(0, 0)], 0.0); // c=0 pixel (0,0) = 0
+        assert_eq!(out[p(0, 1)], 100.0); // c=1 pixel (0,0) = 100
+        assert_eq!(out[p(0, 2)], 200.0); // c=2 pixel (0,0) = 200
         // Patch (0,1) — top-left at (0,4).
-        assert_eq!(out[1 * hidden + 0], 4.0); // c=0 pixel (0,4) = 4
-        assert_eq!(out[1 * hidden + 1], 104.0);
-        assert_eq!(out[1 * hidden + 2], 204.0);
+        assert_eq!(out[p(1, 0)], 4.0); // c=0 pixel (0,4) = 4
+        assert_eq!(out[p(1, 1)], 104.0);
+        assert_eq!(out[p(1, 2)], 204.0);
         // Patch (1,0) — top-left at (4,0).
-        assert_eq!(out[2 * hidden + 0], 40.0);
-        assert_eq!(out[2 * hidden + 1], 140.0);
-        assert_eq!(out[2 * hidden + 2], 240.0);
+        assert_eq!(out[p(2, 0)], 40.0);
+        assert_eq!(out[p(2, 1)], 140.0);
+        assert_eq!(out[p(2, 2)], 240.0);
         // Patch (1,1) — top-left at (4,4).
-        assert_eq!(out[3 * hidden + 0], 44.0);
-        assert_eq!(out[3 * hidden + 1], 144.0);
-        assert_eq!(out[3 * hidden + 2], 244.0);
+        assert_eq!(out[p(3, 0)], 44.0);
+        assert_eq!(out[p(3, 1)], 144.0);
+        assert_eq!(out[p(3, 2)], 244.0);
     }
 
     #[test]
@@ -2819,14 +2821,16 @@ mod tests {
         // Expected out[1,0] = avg(patches 8,9,12,13) = 10.5
         // Expected out[1,1] = avg(patches 10,11,14,15) = 12.5
         assert_eq!(out.len(), 2 * 2 * hidden);
-        assert!((out[0 * hidden + 0] - 2.5).abs() < 1e-6);
-        assert!((out[0 * hidden + 1] - 25.0).abs() < 1e-6);
-        assert!((out[1 * hidden + 0] - 4.5).abs() < 1e-6);
-        assert!((out[1 * hidden + 1] - 45.0).abs() < 1e-6);
-        assert!((out[2 * hidden + 0] - 10.5).abs() < 1e-6);
-        assert!((out[2 * hidden + 1] - 105.0).abs() < 1e-6);
-        assert!((out[3 * hidden + 0] - 12.5).abs() < 1e-6);
-        assert!((out[3 * hidden + 1] - 125.0).abs() < 1e-6);
+        // Local helper: index into the [patch][channel] layout.
+        let p = |patch: usize, ch: usize| patch * hidden + ch;
+        assert!((out[p(0, 0)] - 2.5).abs() < 1e-6);
+        assert!((out[p(0, 1)] - 25.0).abs() < 1e-6);
+        assert!((out[p(1, 0)] - 4.5).abs() < 1e-6);
+        assert!((out[p(1, 1)] - 45.0).abs() < 1e-6);
+        assert!((out[p(2, 0)] - 10.5).abs() < 1e-6);
+        assert!((out[p(2, 1)] - 105.0).abs() < 1e-6);
+        assert!((out[p(3, 0)] - 12.5).abs() < 1e-6);
+        assert!((out[p(3, 1)] - 125.0).abs() < 1e-6);
     }
 
     #[test]
@@ -3557,11 +3561,15 @@ mod tests {
         // token 0: head 0 = [1,2,3,4], head 1 = [10,20,30,40]
         // token 1: head 0 = [5,6,7,8], head 1 = [50,60,70,80]
         // token 2: head 0 = [9,10,11,12], head 1 = [90,100,110,120]
+        // Local helper: index into the [batch][head][dim] layout.  Used
+        // by both the `v` write loop and the per-head assertions below
+        // so the layout expression appears in exactly one place.
+        let idx = |b: usize, h: usize, d: usize| b * num_heads * head_dim + h * head_dim + d;
         let mut v = vec![0f32; n];
         for b in 0..batch {
             for h in 0..num_heads {
                 for d in 0..head_dim {
-                    v[b * num_heads * head_dim + h * head_dim + d] = if h == 0 {
+                    v[idx(b, h, d)] = if h == 0 {
                         (b * 4 + d + 1) as f32
                     } else {
                         ((b * 4 + d + 1) * 10) as f32
@@ -3580,8 +3588,8 @@ mod tests {
         let expected_h1 = [50.0f32, 60.0, 70.0, 80.0];
         for b in 0..batch {
             for d in 0..head_dim {
-                let got_h0 = out[b * num_heads * head_dim + 0 * head_dim + d];
-                let got_h1 = out[b * num_heads * head_dim + 1 * head_dim + d];
+                let got_h0 = out[idx(b, 0, d)];
+                let got_h1 = out[idx(b, 1, d)];
                 assert!(
                     (got_h0 - expected_h0[d]).abs() < 1e-4,
                     "h0 b{b} d{d}: {got_h0} vs {}",
@@ -3613,11 +3621,13 @@ mod tests {
         // That inverts the usual delta test — the point is ONE key
         // dominates softmax and we should read V[that-key].
         let mut k = vec![0f32; n];
-        k[0 * head_dim] = 100.0; // token 0's key points huge along dim 0
+        // Local helper: index into the [token][dim] K layout.
+        let kidx = |tok: usize, dim: usize| tok * head_dim + dim;
+        k[kidx(0, 0)] = 100.0; // token 0's key points huge along dim 0
         // Token 1: orthogonal
-        k[1 * head_dim + 1] = 100.0;
+        k[kidx(1, 1)] = 100.0;
         // Token 2: orthogonal
-        k[2 * head_dim + 2] = 100.0;
+        k[kidx(2, 2)] = 100.0;
         // V: each token has a unique signature
         let v = vec![
             7.0, 7.0, 7.0, 7.0, // token 0

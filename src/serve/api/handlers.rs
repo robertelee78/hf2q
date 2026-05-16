@@ -8442,14 +8442,16 @@ mod multimodal_tests {
 
         // Image 0 contributes rows 0..4 of chunks[0]: values 0, 10, 20, 30.
         // Image 1 contributes rows 4..7 of chunks[0]: values 100, 101, 102.
+        // Local helper: index into the [row][hidden] layout of chunks[0].
+        let row = |r: usize, h: usize| r * hidden + h;
         for h in 0..hidden {
-            assert_eq!(chunks[0][0 * hidden + h], 0.0);
-            assert_eq!(chunks[0][1 * hidden + h], 10.0);
-            assert_eq!(chunks[0][2 * hidden + h], 20.0);
-            assert_eq!(chunks[0][3 * hidden + h], 30.0);
-            assert_eq!(chunks[0][4 * hidden + h], 100.0);
-            assert_eq!(chunks[0][5 * hidden + h], 101.0);
-            assert_eq!(chunks[0][6 * hidden + h], 102.0);
+            assert_eq!(chunks[0][row(0, h)], 0.0);
+            assert_eq!(chunks[0][row(1, h)], 10.0);
+            assert_eq!(chunks[0][row(2, h)], 20.0);
+            assert_eq!(chunks[0][row(3, h)], 30.0);
+            assert_eq!(chunks[0][row(4, h)], 100.0);
+            assert_eq!(chunks[0][row(5, h)], 101.0);
+            assert_eq!(chunks[0][row(6, h)], 102.0);
         }
     }
 
@@ -8484,11 +8486,13 @@ mod multimodal_tests {
         // chunks[0] is concatenated [img0_rows; img1_rows].
         // Row 0 of chunks[0] = img0 row 0's slot 1 = 0.
         // Row 3 of chunks[0] = img1 row 0's slot 1 = 100.
+        // Local helper: index into the [row][hidden] layout of chunks[0].
+        let row = |r: usize, h: usize| r * hidden + h;
         for h in 0..hidden {
-            assert_eq!(chunks[0][0 * hidden + h], 0.0);
-            assert_eq!(chunks[0][3 * hidden + h], 100.0);
-            assert_eq!(chunks[0][4 * hidden + h], 101.0);
-            assert_eq!(chunks[0][5 * hidden + h], 102.0);
+            assert_eq!(chunks[0][row(0, h)], 0.0);
+            assert_eq!(chunks[0][row(3, h)], 100.0);
+            assert_eq!(chunks[0][row(4, h)], 101.0);
+            assert_eq!(chunks[0][row(5, h)], 102.0);
         }
     }
 }

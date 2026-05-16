@@ -255,37 +255,59 @@ pub fn build_qwen3vl_positions(
     }
 
     let mut flat = vec![0i32; 4 * prompt_len];
-    // Global temporal counter — advances by 1 for every text token, by
-    // `max(n_x, n_y)` for every image chunk.
-    let mut t_global: i32 = 0;
-    let mut img_idx: usize = 0;
-    let mut p: usize = 0;
-    while p < prompt_len {
-        if img_idx < image_grids.len() && p == image_grids[img_idx].1 as usize {
-            // Image chunk start.
-            let (grid, _seq_start) = image_grids[img_idx];
-            let n_x = grid.n_x as i32;
-            let n_tokens = grid.n_image_tokens() as usize;
-            let t_img = t_global;
-            for i in 0..n_tokens {
-                let q = p + i;
-                let i_i32 = i as i32;
-                flat[0 * prompt_len + q] = t_img;                 // t (constant)
-                flat[1 * prompt_len + q] = t_img + (i_i32 / n_x); // y
-                flat[2 * prompt_len + q] = t_img + (i_i32 % n_x); // x
-                flat[3 * prompt_len + q] = 0;                     // z
+    // `chunks_exact_mut(0)` panics, so the empty-prompt case (which the
+    // prior `flat[i * 0 + q] = …` indexing tolerated only because the
+    // write loop never executed for `prompt_len == 0`) must be handled
+    // before the slice split.  Callers that pass `prompt_len == 0` get
+    // back the empty `flat` vec they would have gotten from the
+    // original implementation.
+    if prompt_len == 0 {
+        return Ok(flat);
+    }
+    {
+        // Split the flat buffer into 4 named per-channel slices (t, y, x, z),
+        // each of length `prompt_len`.  Avoids the `i * prompt_len + q`
+        // arithmetic that previously masked out-of-bounds writes into the
+        // wrong channel — `t_chan[q]` now panics cleanly on bounds error
+        // instead of silently corrupting `y_chan`.
+        let mut channels = flat.chunks_exact_mut(prompt_len);
+        let t_chan = channels.next().expect("flat is 4*prompt_len so chunks(prompt_len) yields 4");
+        let y_chan = channels.next().expect("flat is 4*prompt_len so chunks(prompt_len) yields 4");
+        let x_chan = channels.next().expect("flat is 4*prompt_len so chunks(prompt_len) yields 4");
+        let z_chan = channels.next().expect("flat is 4*prompt_len so chunks(prompt_len) yields 4");
+
+        // Global temporal counter — advances by 1 for every text token, by
+        // `max(n_x, n_y)` for every image chunk.
+        let mut t_global: i32 = 0;
+        let mut img_idx: usize = 0;
+        let mut p: usize = 0;
+        while p < prompt_len {
+            if img_idx < image_grids.len() && p == image_grids[img_idx].1 as usize {
+                // Image chunk start.
+                let (grid, _seq_start) = image_grids[img_idx];
+                let n_x = grid.n_x as i32;
+                let n_tokens = grid.n_image_tokens() as usize;
+                let t_img = t_global;
+                for i in 0..n_tokens {
+                    let q = p + i;
+                    let i_i32 = i as i32;
+                    t_chan[q] = t_img;                  // t (constant)
+                    y_chan[q] = t_img + (i_i32 / n_x);  // y
+                    x_chan[q] = t_img + (i_i32 % n_x);  // x
+                    z_chan[q] = 0;                      // z
+                }
+                t_global += grid.temporal_advance() as i32;
+                p += n_tokens;
+                img_idx += 1;
+            } else {
+                // Text token — all 4 channels share the same value.
+                t_chan[p] = t_global;
+                y_chan[p] = t_global;
+                x_chan[p] = t_global;
+                z_chan[p] = t_global;
+                t_global += 1;
+                p += 1;
             }
-            t_global += grid.temporal_advance() as i32;
-            p += n_tokens;
-            img_idx += 1;
-        } else {
-            // Text token.
-            flat[0 * prompt_len + p] = t_global;
-            flat[1 * prompt_len + p] = t_global;
-            flat[2 * prompt_len + p] = t_global;
-            flat[3 * prompt_len + p] = t_global;
-            t_global += 1;
-            p += 1;
         }
     }
     Ok(flat)
@@ -2236,6 +2258,18 @@ mod qwen3vl_position_tests {
     /// Helper: extract one axis as a Vec<i32> for assertion.
     fn axis(flat: &[i32], axis: usize, prompt_len: usize) -> Vec<i32> {
         flat[axis * prompt_len..(axis + 1) * prompt_len].to_vec()
+    }
+
+    #[test]
+    fn build_qwen3vl_positions_empty_prompt_returns_empty_vec() {
+        // Regression gate for the chunks_exact_mut refactor: chunks_exact_mut(0)
+        // panics, so the prompt_len == 0 path takes an explicit early-return.
+        // This locks the prior behavior: empty prompt + no image regions
+        // yields Ok(empty vec) without panic.  (A non-empty image region
+        // with prompt_len == 0 still hits the pre-existing
+        // region-extends-past-prompt_len error path, validated elsewhere.)
+        let flat = build_qwen3vl_positions(0, &[]).expect("empty prompt accepted");
+        assert!(flat.is_empty(), "empty prompt → empty flat vec");
     }
 
     #[test]
