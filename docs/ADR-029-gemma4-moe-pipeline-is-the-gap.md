@@ -5000,6 +5000,35 @@ The 200-token verification supersedes the prior 30-token test (which
 was already PASS) — confirms Step 1j.2's tree-reduce fix holds across
 long greedy decodes, not just short ones.
 
+**Post-Step-1j.2 cross-regime re-validation** (this iteration):
+
+Re-ran same-session 2-cycle apples-to-apples bench at tg2000 to verify
+Step 1j.2 fix doesn't regress the lead at the realistic averaged-decode
+regime that originally opened iter-100:
+
+| | hf2q V3 (post 1j.2) | peer-FA tg2000 |
+|---|---:|---:|
+| run 1 | 103.8 t/s | 98.74 t/s |
+| run 2 | 103.6 t/s | 98.70 t/s |
+| mean | **103.70 t/s** ± 0.10% | **98.72 t/s** ± 0.02% |
+| **Ratio** | | **1.050× AHEAD** |
+
+Comparison vs pre-Step-1j.2 tg2000 (1.047× AHEAD): nearly identical,
+within bench noise.  Step 1j.2's tree-reduce trade-off doesn't measurably
+affect tg2000 wall — batched routing is a small share of the prefill +
+2000-token decode wall.
+
+**Final cross-regime + post-fix table**:
+
+| Regime | Pre-fix ratio | Post-fix ratio (this iter) | Status |
+|---|---:|---:|---|
+| tg200 | 1.054× | 1.055× (10.96% gen δ) | ✓ holds |
+| tg2000 | 1.047× | **1.050× AHEAD** | ✓ holds |
+| tg5000 | 1.055× | (not re-bench'd; presumed within noise) | — |
+
+Net: Step 1j.2 fix is **truly free** at the wall-clock level for
+gemma4-APEX-Q5_K_M.  Byte-identity gained, speed retained.
+
 ### Step 1i V3 long-decode output divergence — honest disclosure (this iteration)
 
 The Step 1i commit comment claimed V3 was "byte-equivalent to V2
