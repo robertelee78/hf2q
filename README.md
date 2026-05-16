@@ -181,11 +181,15 @@ Measured on M5 Max at HEAD against `llama.cpp` peer with identical
 GGUFs (thermal-fair alt-pair protocol, `σ < 1%` per arm — see
 `docs/peer-parity-baselines-2026-04-26.md` for the methodology):
 
-- **Decode** — `0.93–0.94× peer-FA` (Flash-Attention path) on Gemma-4
-  across `tg100 / tg2000 / tg5000` regimes (ADR-029 iter-159). Gap is
-  structural; closing the last 5–6% requires a multi-month
-  parallel-encode refactor (ADR-029 iter-174) and is intentionally
-  not scheduled.
+- **Decode** — `1.05× peer-FA` (AHEAD) on Gemma-4 across
+  `tg200 / tg2000 / tg5000` regimes (ADR-029 iter-175 post Step 1i/1j.2;
+  same-session apples-to-apples thermal-fair).  Step 1i (parallel
+  SG-tournament top-K in fused_moe_routing) closed the prior 0.93×
+  gap; Step 1j.2 (V3 batched softmax tree-reduce fix) restored
+  byte-identity with the V2 baseline — same model outputs at greedy
+  decode, +10.96% measured speed.  Regression-protected by 8 parity
+  tests (V2/V3 unbatched + V3 batched) + coherence_smoke + 200-token
+  byte-identity verification.
 - **Prefill** — `1.07–1.09× peer-FA` (AHEAD) at `pp1800–pp3700`
   (ADR-029 iter-160), driven by the ADR-011 Flash-Attention kernel +
   ADR-015 batched-prefill path.
@@ -195,9 +199,11 @@ GGUFs (thermal-fair alt-pair protocol, `σ < 1%` per arm — see
   delivering **3.94×** savings against the F32-only baseline (340 MiB
   vs 1.34 GiB).
 - **Qwen3.6 35B-A3B-APEX-Q5_K_M** ships at `~1.34× peer-FA` decode
-  (ADR-028 iter-308→324, sustained at 1000-tok). The same kernel
-  stack on Gemma-4 lands at `~0.93× peer-FA` — the gap is arch-
-  specific, not kernel-quality.
+  (ADR-028 iter-308→324, sustained at 1000-tok). Same kernel stack
+  + ADR-029 Step 1i/1j.2 lands Gemma-4 at `~1.05× peer-FA` AHEAD
+  across all decode regimes — the prior arch-specific gap was
+  diagnosed (MoE routing's serial top-K phase) and closed via
+  parallel SG-tournament + byte-identity restoration.
 
 Note: DWQ at the production-default `perturb=1.0` is mathematically
 equivalent to the underlying K-quant baseline (ADR-020 finding
