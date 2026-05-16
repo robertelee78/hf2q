@@ -5208,3 +5208,60 @@ documented `HF2Q_Q8_0_ID_MV_NR2=-1.3% → -1.96%` regression at
 gemma4 shape (different best-choice geometry vs peer's compile-time
 commit).  Already-optimal kernel choice for hf2q's specific shape.
 
+### Skip-bisect wall-time attribution (iter-175 post-1f2, this iteration)
+
+The per-phase profile data above is **partly misleading** — phase GPU
+time includes async CB-boundary carryover (when a CB's commit_and_wait
+waits for prior CBs' GPU work to complete, the wait gets attributed to
+the CURRENT CB's measured GPU time).  To get a true wall-time
+attribution, ran a skip-bisect:
+
+Required ack: `HF2Q_UNSAFE_EXPERIMENTS=1` (not the misnamed
+`HF2Q_INVESTIGATION_ACK` documented elsewhere).
+
+**3-cycle alt-pair tg200** baseline 96.0 t/s = 10.42 ms/tok:
+
+| Skip flag | t/s | wall ms/tok | wall saved | % of wall |
+|---|---:|---:|---:|---:|
+| **Baseline** | 96.0 | 10.42 | — | — |
+| `HF2Q_SKIP_MOE_EXPERTS=1` | 126.2 | 7.92 | 2.50 ms | **24.0%** |
+| `HF2Q_SKIP_TQ_SDPA=1` | 109.6 | 9.12 | 1.30 ms | **12.5%** |
+| `HF2Q_SKIP_DENSE_MLP=1` | 104.5 | 9.57 | 0.85 ms | 8.2% |
+| `HF2Q_SKIP_HEAD_NORM_ROPE=1` | 96.8 | 10.33 | 0.09 ms | 0.86% |
+
+Wall-budget reconciliation (per token):
+- MoE experts: 2.50 ms (24.0%) — gate_up Q6_K_ID + swiglu + down Q8_0_ID
+- TQ-HB-V SDPA: 1.30 ms (12.5%) — flash_attn_vec_tq_hb kernel
+- Dense MLP: 0.85 ms (8.2%) — dense down_proj + (gate+up fused in FFN_NORMS)
+- Head_norm_rope + other norms: ~0.09 ms (1%)
+- **Remaining ~55%**: Q/K/V proj, o_proj, RoPE-only, KV writes, residual ops, sampling, framework
+
+### Strategic implication — concrete target identified
+
+To close the 6% peer-FA gap (~0.6 ms/tok), we need:
+- **24% reduction in MoE expert matmul time**, OR
+- **46% reduction in TQ-HB-V SDPA time**, OR
+- **70% reduction in dense MLP time** (unlikely — already peer-ported), OR
+- A combination thereof
+
+**MoE experts are the largest single target.**  Within MoE expert
+matmuls, the kernels are already peer-ported (Q6_K_ID NR2 matches
+peer's N_R0=2 compile-time choice; Q8_0_ID regular matches gemma4's
+specific shape per `feedback_levers_can_widen_opposing_regressions`).
+The remaining gap likely lives in:
+
+1. **Per-call MoE matmul overhead** — even with NR2, each MoE expert
+   matmul has ~70 µs/call × 30 layers = 2.1 ms/tok.  If peer's
+   equivalent is ~55 µs/call, that's 0.45 ms/tok savings (= ~4.3%
+   wall = most of the 6% gap).
+2. **Dispatch encoder overhead** (per iter-141: "residual 4-6% in
+   dispatch/encoder layer") — affects ALL dispatches including MoE.
+
+Closing the gap likely requires a combination of:
+- **Per-kernel MoE matmul tuning** (multi-week kernel work)
+- **Command encoder lifecycle changes** (per iter-141 hypothesis)
+
+Neither is a /loop-iteration-sized substep.  The skip-bisect data
+above is the empirical foundation for any future operator-directed
+multi-week effort.
+
