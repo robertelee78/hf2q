@@ -56,6 +56,23 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+// clippy::zombie_processes guard — keeps spawned `hf2q serve` children
+// from leaking as zombies if a test panics before reaching its final
+// `child.kill()`.  See tests/common/child_guard.rs.
+//
+// We use `#[path]` rather than the codebase's standard `mod common;`
+// idiom because `mod common;` would pull in every sibling submodule
+// of `tests/common/` (env_lock, llama_cpp_runner, metrics,
+// mlx_lm_runner, serve_driver) — some of which currently carry
+// pre-existing clippy 1.94 findings being addressed in a separate
+// follow-up commit. This narrow include keeps the zombie_processes
+// fix self-contained per the per-commit isolation policy. Once the
+// rest of the clippy 1.94 sweep lands, future tests can switch this
+// site to `mod common; use common::child_guard::ChildGuard;`.
+#[path = "common/child_guard.rs"]
+mod child_guard;
+use child_guard::ChildGuard;
+
 const ENV_GATE: &str = "HF2Q_QWEN3VL_E2E";
 const ENV_GGUF: &str = "HF2Q_QWEN3VL_E2E_GGUF";
 const ENV_MMPROJ: &str = "HF2Q_QWEN3VL_E2E_MMPROJ";
@@ -230,20 +247,22 @@ fn qwen3vl_streaming_e2e_real() {
 
     let bin = env!("CARGO_BIN_EXE_hf2q");
     let port: u16 = 18761; // distinct from chat E2E (18760) so they can run in parallel
-    let mut child = std::process::Command::new(bin)
-        .args([
-            "serve",
-            "--model",
-            &gguf_path,
-            "--mmproj",
-            &mmproj_path,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-        ])
-        .spawn()
-        .expect("spawn hf2q serve");
+    let mut child = ChildGuard::new(
+        std::process::Command::new(bin)
+            .args([
+                "serve",
+                "--model",
+                &gguf_path,
+                "--mmproj",
+                &mmproj_path,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+            ])
+            .spawn()
+            .expect("spawn hf2q serve"),
+    );
 
     let server_url = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(180);
@@ -253,7 +272,7 @@ fn qwen3vl_streaming_e2e_real() {
         .expect("reqwest client");
     loop {
         if Instant::now() > deadline {
-            let _ = child.kill();
+            child.kill();
             panic!("hf2q serve /readyz did not flip to 200 within 180s");
         }
         match client.get(format!("{server_url}/readyz")).send() {
@@ -316,7 +335,7 @@ fn qwen3vl_streaming_e2e_real() {
 
     let mut assert_and_kill = |cond: bool, msg: String| {
         if !cond {
-            let _ = child.kill();
+            child.kill();
             panic!("{msg}\nresponse body: {body_text}");
         }
     };
@@ -374,16 +393,16 @@ fn qwen3vl_streaming_e2e_real() {
     );
 
     if let Err(reason) = coherence_check(&accumulated_content) {
-        let _ = child.kill();
+        child.kill();
         panic!("streaming coherence check failed: {reason}");
     }
 
     if let Err(reason) = reasoning_balance_check(&accumulated_reasoning) {
-        let _ = child.kill();
+        child.kill();
         panic!("streaming reasoning_content balance check failed: {reason}");
     }
 
-    let _ = child.kill();
+    child.kill();
 }
 
 /// Real E2E test (gated): streaming + tools[] + tool_choice=auto.
@@ -408,20 +427,22 @@ fn qwen3vl_streaming_e2e_real_with_tools() {
 
     let bin = env!("CARGO_BIN_EXE_hf2q");
     let port: u16 = 18762;
-    let mut child = std::process::Command::new(bin)
-        .args([
-            "serve",
-            "--model",
-            &gguf_path,
-            "--mmproj",
-            &mmproj_path,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-        ])
-        .spawn()
-        .expect("spawn hf2q serve");
+    let mut child = ChildGuard::new(
+        std::process::Command::new(bin)
+            .args([
+                "serve",
+                "--model",
+                &gguf_path,
+                "--mmproj",
+                &mmproj_path,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+            ])
+            .spawn()
+            .expect("spawn hf2q serve"),
+    );
 
     let server_url = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(180);
@@ -431,7 +452,7 @@ fn qwen3vl_streaming_e2e_real_with_tools() {
         .expect("reqwest client");
     loop {
         if Instant::now() > deadline {
-            let _ = child.kill();
+            child.kill();
             panic!("hf2q serve /readyz did not flip to 200 within 180s");
         }
         match client.get(format!("{server_url}/readyz")).send() {
@@ -503,7 +524,7 @@ fn qwen3vl_streaming_e2e_real_with_tools() {
 
     let mut assert_and_kill = |cond: bool, msg: String| {
         if !cond {
-            let _ = child.kill();
+            child.kill();
             panic!("{msg}\nresponse body: {body_text}");
         }
     };
@@ -577,7 +598,7 @@ fn qwen3vl_streaming_e2e_real_with_tools() {
         Ok(())
     })();
 
-    let _ = child.kill();
+    child.kill();
     if let Err(reason) = tool_check_result {
         panic!("Wedge-4e tools[] check failed: {reason}");
     }
@@ -612,20 +633,22 @@ fn qwen3vl_streaming_e2e_real_with_tools_forced_function() {
     let bin = env!("CARGO_BIN_EXE_hf2q");
     // Distinct port from the auto-tools test so they can run in parallel.
     let port: u16 = 18763;
-    let mut child = std::process::Command::new(bin)
-        .args([
-            "serve",
-            "--model",
-            &gguf_path,
-            "--mmproj",
-            &mmproj_path,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-        ])
-        .spawn()
-        .expect("spawn hf2q serve");
+    let mut child = ChildGuard::new(
+        std::process::Command::new(bin)
+            .args([
+                "serve",
+                "--model",
+                &gguf_path,
+                "--mmproj",
+                &mmproj_path,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+            ])
+            .spawn()
+            .expect("spawn hf2q serve"),
+    );
 
     let server_url = format!("http://127.0.0.1:{port}");
     let deadline = Instant::now() + Duration::from_secs(180);
@@ -635,7 +658,7 @@ fn qwen3vl_streaming_e2e_real_with_tools_forced_function() {
         .expect("reqwest client");
     loop {
         if Instant::now() > deadline {
-            let _ = child.kill();
+            child.kill();
             panic!("hf2q serve /readyz did not flip to 200 within 180s");
         }
         match client.get(format!("{server_url}/readyz")).send() {
@@ -713,7 +736,7 @@ fn qwen3vl_streaming_e2e_real_with_tools_forced_function() {
 
     let mut assert_and_kill = |cond: bool, msg: String| {
         if !cond {
-            let _ = child.kill();
+            child.kill();
             panic!("{msg}\nresponse body: {body_text}");
         }
     };
@@ -802,7 +825,7 @@ fn qwen3vl_streaming_e2e_real_with_tools_forced_function() {
         Ok(())
     })();
 
-    let _ = child.kill();
+    child.kill();
     if let Err(reason) = tool_check_result {
         panic!("FORCED-tool-call check failed: {reason}");
     }

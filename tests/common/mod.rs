@@ -4,6 +4,9 @@
 //! (`tests/safetensors_mlx_lm_round_trip.rs`).
 //!
 //! Sub-modules:
+//! - [`child_guard`] — RAII guard that reaps spawned child processes
+//!   on drop (kill + wait). Used by the qwen3-vl E2E tests that spawn
+//!   `hf2q serve` as a subprocess.
 //! - [`metrics`] — `RunMetrics` struct + `missing_binary` sentinel
 //!   constructor. Every subprocess wrapper returns this type.
 //! - [`llama_cpp_runner`] — wrappers around `llama-quantize`,
@@ -37,6 +40,7 @@
 
 #![allow(dead_code)]
 
+pub mod child_guard;
 pub mod env_lock;
 pub mod llama_cpp_runner;
 pub mod metrics;
