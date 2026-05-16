@@ -4564,7 +4564,7 @@ mod tests {
     /// *numerically-equivalent* output to the legacy
     /// [`apply_flash_attn_prefill_seq_major`] wrapper when given the same
     /// inputs and a fresh arena. Bar: cosine ≥ 0.9999, max_abs_diff ≤ 1e-4
-    /// — see [`crate::quality::kernel_parity`] for rationale.
+    /// — see [`crate::core::kernel_parity`] for rationale.
     ///
     /// **Renamed from `flash_attn_prefill_into_byte_exact_parity_with_wrapper`**.
     /// Original docstring claimed *"if even one F32 element differs between
@@ -4742,7 +4742,7 @@ mod tests {
                 shown += 1;
             }
         }
-        crate::quality::kernel_parity::assert_kernel_equivalence(
+        crate::core::kernel_parity::assert_kernel_equivalence(
             &out_wrap,
             &out_into,
             0.9999,
@@ -5218,7 +5218,7 @@ mod tests {
     /// output to the legacy path (`fa_proj_arena=None`) given the same
     /// input, weights, and positions. Demonstrates the arena lift is a
     /// behavior-preserving allocation-source change. Bar: cosine ≥ 0.9999,
-    /// max_abs_diff ≤ 1e-4 — see [`crate::quality::kernel_parity`] for
+    /// max_abs_diff ≤ 1e-4 — see [`crate::core::kernel_parity`] for
     /// rationale.
     ///
     /// Stateless path (`kv_cache_slot=None`) at seq_len=128 — exercises
@@ -5420,7 +5420,7 @@ mod tests {
                 shown += 1;
             }
         }
-        crate::quality::kernel_parity::assert_kernel_equivalence(
+        crate::core::kernel_parity::assert_kernel_equivalence(
             &out_legacy,
             &out_arena,
             0.9999,

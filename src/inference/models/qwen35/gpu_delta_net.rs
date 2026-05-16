@@ -4563,7 +4563,7 @@ mod tests {
     /// produces *numerically-equivalent* output to the per-call
     /// `device.alloc_buffer` path inside
     /// `dispatch_chunk_gated_delta_rule_fwd`. Bar: cosine ≥ 0.9999,
-    /// max_abs_diff ≤ 1e-4 — see [`crate::quality::kernel_parity`] for
+    /// max_abs_diff ≤ 1e-4 — see [`crate::core::kernel_parity`] for
     /// rationale.
     ///
     /// **Renamed from `chunk_internal_arena_byte_exact_parity_at_seq128`**.
@@ -4766,14 +4766,14 @@ mod tests {
                 shown += 1;
             }
         }
-        crate::quality::kernel_parity::assert_kernel_equivalence(
+        crate::core::kernel_parity::assert_kernel_equivalence(
             &out_na_cpu,
             &out_ia_cpu,
             0.9999,
             1e-4,
             "iter83 chunk_internal_arena (out)",
         );
-        crate::quality::kernel_parity::assert_kernel_equivalence(
+        crate::core::kernel_parity::assert_kernel_equivalence(
             &state_na_cpu,
             &state_ia_cpu,
             0.9999,

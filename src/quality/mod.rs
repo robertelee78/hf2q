@@ -5,7 +5,6 @@
 //! only when an external runner provides logit data.
 
 pub mod cosine_sim;
-pub mod kernel_parity;
 pub mod kl_divergence;
 pub mod perplexity;
 pub mod ppl_driver;
