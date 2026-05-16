@@ -4899,13 +4899,72 @@ through the dispatch_record method.
 - mlx-native `12d3259` (build_q8_0_id_decode_record builder)
 - hf2q       `e0f00463` (wire fast path into forward_decode down)
 
+### Step 1f — DispatchRecord (F32, 1, hs) rms_norm fast path
+
+**Strategy**: extend the pre-bake pattern to `dispatch_rms_norm`.
+Share ONE OnceLock<Option<DispatchRecord>> across all hidden-size F32
+norm dispatches in `encode_one_layer` since they all carry identical
+bake parameters `(F32, rows=1, dim=hs)`.
+
+**Implementation**:
+1. `pub fn build_rms_norm_decode_record(registry, device, dtype, rows,
+   dim) -> Result<Option<DispatchRecord>>` in `ops::rms_norm`.
+   Mirrors `dispatch_rms_norm`'s exact kernel-selection + geometry +
+   shared-memory logic — returns None for unsupported dtypes.
+2. Bakes:
+   - Pipeline = `rms_norm_f32_v2` (default-on F32 path) / regular
+     `rms_norm_{f32,f16,bf16}` per dtype
+   - tg_size = `min(256, dim.next_power_of_two())` (ADR-028 iter-360/361
+     falsifications preserved)
+   - shmem = `(tg_size/32).max(1)*4` for V2; `tg_size*4` for scalar
+   - 4 binding slots (input=0, weight=1, output=2, params_buf=3)
+   - op_kind = `CapturedOpKind::RmsNorm` (baked, so caller doesn't
+     need `set_op_kind` call)
+3. `MlxModelWeights.decode_record_rms_norm_f32_hs: OnceLock<Option<DispatchRecord>>`
+   — model-wide slot (not per-layer) since all 30 layers' hs-norms
+   share the same (F32, 1, hs) bake.
+4. Free function `rms_norm_f32_hs_cached(cache, session, reg, dev, ...)`
+   — first call bakes via `OnceLock::get_or_init`, subsequent calls
+   fire `dispatch_record`; fall through to `session.rms_norm` when
+   bake returns None.
+5. 4 default-path call sites converted in `encode_one_layer`:
+   pre-FF norm, pre-FF norm 2, router norm, post-FF norm 1 — each
+   × 30 layers/tok.  Total coverage: ~120 dispatches/decode-tok.
+
+**Validation**:
+- cargo build --release: clean
+- coherence_smoke: 2/2 PASS — byte-identical decode through all 4 fast paths
+- 3-cycle alt-pair tg200 thermal-fair (gemma4-ara-APEX-Q5_K_M,
+  cycle-alternated order [1f,1e2 | 1e2,1f | 1f,1e2]):
+  - MAIN (Step 1e2): 96.067 ± 0.12% (96.0, 96.0, 96.2)
+  - 1F:              96.067 ± 0.12% (96.0, 96.2, 96.0)
+  - **Δ: 0.000% NEUTRAL** (literally identical means)
+
+**Verdict**: COMMITTED as infrastructure.  Coverage (~120 dispatches/tok)
+matched Step 1d's class (~91), but the win didn't replicate.
+Hypothesis: the function-call boundary into `rms_norm_f32_hs_cached`
+negates the inlining benefit Step 1d enjoyed at the inline fast-path
+branch in `dispatch_qmatmul`.  Next iteration could try
+`#[inline(always)]` on the helper or inline the fast-path code at
+each call site instead.
+
+**Commits**:
+- mlx-native `5d75def` (build_rms_norm_decode_record builder)
+- hf2q       `6086a920` (wire helper + 4 call sites)
+
 ### Forward plan — concrete substeps
 
-**Step 1f (next)**: rms_norm + fused_head_norm_rope DispatchRecord
-extension.  Coverage: ~90 dispatches/token across pre-attn-norm,
-Q/K head_norm_rope (×2 per layer), V norm (×1), post-attn-norm,
-post-ff-norm.  Estimated impact: ~+0.13% wall additional — closer to
-Step 1d's coverage class, so possibly measurable.
+**Step 1f2 (next)**: re-inline the rms_norm fast path at each call site
+(no helper function call), OR add `#[inline(always)]` to
+`rms_norm_f32_hs_cached`.  Test hypothesis: function-call overhead is
+negating the bake savings.  If +0.05% or more measured, fast-path
+inlining is the lever.  If still neutral, the per-dispatch savings
+genuinely sit below σ floor and the multi-substep cumulative target
+needs revision.
+
+**Step 1g (after 1f2)**: hadamard_quantize_kv + kv_cache_copy
+DispatchRecord extension.  Coverage: ~60 dispatches/token.  Estimated
+impact: ~+0.09% wall.
 
 **Step 1g (after 1f)**: hadamard_quantize_kv + kv_cache_copy.
 Coverage: ~60 dispatches/token.  Estimated impact: ~+0.09% wall.
