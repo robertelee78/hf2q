@@ -1133,6 +1133,26 @@ pub struct MlxModelWeights {
     /// orchestrator's `install_dflash_capture`/`take_dflash_capture`
     /// pair touches it.
     pub dflash_capture: Option<crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession>,
+    /// ADR-029 iter-175 Step 1f — model-wide pre-baked `DispatchRecord`
+    /// for hidden-size F32 `rms_norm` dispatches.  Populated on first call
+    /// via `OnceLock::get_or_init` calling
+    /// `mlx_native::ops::rms_norm::build_rms_norm_decode_record(F32, 1, hs)`.
+    ///
+    /// Hot-path coverage on gemma4 APEX-Q5_K_M decode: ~120 dispatches/tok
+    /// (pre-FF norm + pre-FF norm 2 + router norm + post-FF norm 1) × 30
+    /// layers.  All call sites share the same `(F32, rows=1, dim=hs)` bake.
+    ///
+    /// Three states encode the bake outcome:
+    ///   - `OnceLock::new()` — not yet attempted; try to bake on first call.
+    ///   - `Some(record)` — bake succeeded; fast-path eligible.
+    ///   - `None` (inside the OnceLock) — bake skipped (unsupported dtype,
+    ///     `HF2Q_RMS_NORM_V2=off` with mismatched bake, etc.).  Permanently
+    ///     fall through to unbaked `dispatch_rms_norm`.
+    ///
+    /// Per-MODEL slot (not per-layer): all 30 layers' hs-norms share the
+    /// same record since the bake key is `(dtype, rows, dim)` which is
+    /// identical across them.  Total memory: 1 OnceLock × ~150 B.
+    pub decode_record_rms_norm_f32_hs: std::sync::OnceLock<Option<mlx_native::DispatchRecord>>,
 }
 
 // ADR-031 Phase B foundation — compile-time Send+Sync assertion.
@@ -2721,6 +2741,9 @@ impl MlxModelWeights {
             // Spec-decode orchestrator installs via install_dflash_capture()
             // before calling forward_prefill_batched.
             dflash_capture: None,
+            // ADR-029 iter-175 Step 1f — lazy-baked per-(F32, 1, hs) rms_norm
+            // record.  Shared across all hs-norm call sites in decode.
+            decode_record_rms_norm_f32_hs: std::sync::OnceLock::new(),
         });
 
         // Pre-initialize constant param buffers so we never write them
@@ -4965,33 +4988,41 @@ impl MlxModelWeights {
                         &[&self.activations.norm_out, &self.activations.moe_norm_out,
                           &self.activations.router_norm_out],
                     );
-                    session.rms_norm(
-                        reg, metal_dev,
+                    // ADR-029 iter-175 Step 1f — Q6_K_M rms_norm fast paths.
+                    // All three norms share the same (F32, rows=1, dim=hs)
+                    // bake; the shared `decode_record_rms_norm_f32_hs`
+                    // OnceLock on `MlxModelWeights` populates on the first
+                    // call and serves the remaining ~120 hs-norm dispatches/tok.
+                    rms_norm_f32_hs_cached(
+                        &self.decode_record_rms_norm_f32_hs,
+                        session, reg, metal_dev,
                         &self.activations.residual,
                         &self.layers[layer_idx].norms.pre_feedforward_layernorm,
                         &self.activations.norm_out,
                         &self.activations.norm_params,
-                        1, hs as u32,
+                        hs as u32,
                     ).map_err(|e| anyhow::anyhow!("pre-FF norm L{layer_idx}: {e}"))?;
                     *total_dispatches += 1;
 
-                    session.rms_norm(
-                        reg, metal_dev,
+                    rms_norm_f32_hs_cached(
+                        &self.decode_record_rms_norm_f32_hs,
+                        session, reg, metal_dev,
                         &self.activations.residual,
                         &self.layers[layer_idx].norms.pre_feedforward_layernorm_2,
                         &self.activations.moe_norm_out,
                         &self.activations.norm_params,
-                        1, hs as u32,
+                        hs as u32,
                     ).map_err(|e| anyhow::anyhow!("pre-FF norm 2 L{layer_idx}: {e}"))?;
                     *total_dispatches += 1;
 
-                    session.rms_norm(
-                        reg, metal_dev,
+                    rms_norm_f32_hs_cached(
+                        &self.decode_record_rms_norm_f32_hs,
+                        session, reg, metal_dev,
                         &self.activations.residual,
                         &self.layers[layer_idx].moe.router_combined_weight,
                         &self.activations.router_norm_out,
                         &self.activations.norm_params,
-                        1, hs as u32,
+                        hs as u32,
                     ).map_err(|e| anyhow::anyhow!("router norm L{layer_idx}: {e}"))?;
                     *total_dispatches += 1;
                 }
@@ -5267,13 +5298,15 @@ impl MlxModelWeights {
                         &[&self.activations.mlp_down],
                         &[&self.activations.attn_out],
                     );
-                    session.rms_norm(
-                        reg, metal_dev,
+                    // ADR-029 iter-175 Step 1f — fast path same shared bake.
+                    rms_norm_f32_hs_cached(
+                        &self.decode_record_rms_norm_f32_hs,
+                        session, reg, metal_dev,
                         &self.activations.mlp_down,
                         &self.layers[layer_idx].norms.post_feedforward_layernorm_1,
                         &self.activations.attn_out,
                         &self.activations.norm_params,
-                        1, hs as u32,
+                        hs as u32,
                     ).map_err(|e| anyhow::anyhow!("post-FF norm 1 L{layer_idx}: {e}"))?;
                     *total_dispatches += 1;
 
@@ -9464,6 +9497,49 @@ pub fn dispatch_rms_norm_unit_perhead_dual_perm(
 /// fallback chain. F32 → `dense_matmul_f32_f32_tensor` (peer of llama.cpp's
 /// `kernel_mul_mm_f32_f32`); Q* / IQ* → `quantized_matmul_ggml`.
 ///
+/// ADR-029 iter-175 Step 1f — cached fast-path wrapper for hidden-size
+/// F32 `rms_norm` decode dispatches.
+///
+/// On first call, lazily bakes a `DispatchRecord` via
+/// `build_rms_norm_decode_record(F32, 1, hs)` into the shared `cache`
+/// slot.  On subsequent calls (the steady state), the encoder fires
+/// `dispatch_record` directly — skipping the `KernelRegistry::get_pipeline`
+/// HashMap lookup, `MTLSize::new` × 2, `dim.next_power_of_two`, shmem
+/// calculation, and `set_op_kind` indirection (~50 ns total per call).
+///
+/// Caller contract: input/weight/output dtype must all be F32, rows=1,
+/// dim=hs.  These match the four production `rms_norm` call sites in
+/// `encode_one_layer` (pre-FF norm, pre-FF norm 2, router norm,
+/// post-FF norm 1) which hit ~120 dispatches/decode-tok on gemma4 APEX-Q5_K_M.
+///
+/// Falls through to unbaked `session.rms_norm` when the bake returns
+/// None (unsupported dtype, pipeline-lookup failure).
+fn rms_norm_f32_hs_cached(
+    cache: &std::sync::OnceLock<Option<mlx_native::DispatchRecord>>,
+    session: &mut mlx_native::graph::GraphSession<'_>,
+    reg: &mut mlx_native::KernelRegistry,
+    metal_dev: &mlx_native::metal::DeviceRef,
+    input: &mlx_native::MlxBuffer,
+    weight: &mlx_native::MlxBuffer,
+    output: &mlx_native::MlxBuffer,
+    params: &mlx_native::MlxBuffer,
+    hs: u32,
+) -> Result<()> {
+    let rec = cache.get_or_init(|| {
+        mlx_native::ops::rms_norm::build_rms_norm_decode_record(
+            reg, metal_dev, mlx_native::DType::F32, 1, hs,
+        )
+        .ok()
+        .flatten()
+    });
+    if let Some(r) = rec {
+        session.encoder_mut().dispatch_record(r, &[input, weight, output, params]);
+        return Ok(());
+    }
+    session.rms_norm(reg, metal_dev, input, weight, output, params, 1, hs)
+        .map_err(|e| anyhow::anyhow!("rms_norm cached fallback: {e}"))
+}
+
 /// ADR-022 P1.9 — APEX-format Gemma4 GGUFs preserve `ffn_gate_inp.weight`
 /// (router projection) as F32 for accuracy. mlx-native's
 /// `quantized_matmul_ggml` correctly refuses F32 because the GGML block
