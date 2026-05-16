@@ -639,6 +639,20 @@ pub struct MlxMoeWeights {
     /// ~30 calls per decode-token through this path (n_tokens=1; top_k
     /// rows folded into `threadgroups.y`).
     pub decode_record_q6k_id_m1_gateup: std::sync::OnceLock<Option<mlx_native::DispatchRecord>>,
+    /// ADR-029 iter-175 Step 1e2 — lazy-baked Q8_0_ID regular decode
+    /// dispatch record for the MoE down call.  Populated on first
+    /// dispatch via `OnceLock::get_or_init` calling
+    /// `mlx_native::ops::quantized_matmul_id_ggml::build_q8_0_id_decode_record`.
+    ///
+    /// Distinct from `decode_record_q6k_id_m1_gateup`:
+    ///   - Uses regular `kernel_mul_mv_id_q8_0_f32` (not NR2)
+    ///   - Different geometry: threads=(8, 8, 1), align=8, no shmem
+    ///   - Down call site passes `n_tokens=real_top_k, top_k=1` (vs gate_up
+    ///     which uses `n_tokens=1, top_k=real_top_k`) — distinct params bake
+    ///
+    /// Per-layer slot: ~30 dispatches/decode-tok through the
+    /// down path on gemma4 APEX-Q5_K_M (1 down × 30 layers).
+    pub decode_record_q8_0_id_m1_down: std::sync::OnceLock<Option<mlx_native::DispatchRecord>>,
 }
 
 impl MlxMoeWeights {
@@ -690,6 +704,7 @@ impl MlxMoeWeights {
             gate_up_affine: None,
             down_affine: None,
             decode_record_q6k_id_m1_gateup: std::sync::OnceLock::new(),
+            decode_record_q8_0_id_m1_down: std::sync::OnceLock::new(),
         })
     }
 }
@@ -2474,6 +2489,7 @@ impl MlxModelWeights {
                     gate_up_affine: None,
                     down_affine: None,
                     decode_record_q6k_id_m1_gateup: std::sync::OnceLock::new(),
+                    decode_record_q8_0_id_m1_down: std::sync::OnceLock::new(),
                 }
             } else {
                 // Dense layer — produce a placeholder MoE bundle so the
@@ -5200,15 +5216,49 @@ impl MlxModelWeights {
                         expert_stride: self.layers[layer_idx].moe.down_expert_stride,
                         ggml_type: ggml_type_dn,
                     };
+                    // ADR-029 iter-175 Step 1e2 — Q8_0_ID regular m=1 fast path.
+                    // The down dispatch on gemma4 APEX-Q5_K_M is Q8_0 → ~30
+                    // dispatches/decode-tok via kernel_mul_mv_id_q8_0_f32.
+                    // Bake at first call; subsequent calls fire dispatch_record
+                    // directly.  Returns None when ggml_type != Q8_0 or
+                    // HF2Q_Q8_0_ID_MV_NR2=1 → falls through to unbaked.
+                    let q8_0_id_record_opt = if matches!(dn_params.ggml_type, mlx_native::GgmlType::Q8_0) {
+                        self.layers[layer_idx].moe.decode_record_q8_0_id_m1_down.get_or_init(|| {
+                            mlx_native::ops::quantized_matmul_id_ggml::build_q8_0_id_decode_record(
+                                reg,
+                                dev.metal_device(),
+                                dn_params.n,
+                                dn_params.k,
+                                dn_params.n_tokens, // = real_top_k for the down dispatch
+                                dn_params.expert_stride,
+                            )
+                            .ok()
+                            .flatten()
+                        }).as_ref()
+                    } else {
+                        None
+                    };
                     if !INVESTIGATION_ENV.skip_moe_experts {
-                        session.quantized_matmul_id_ggml(
-                            reg, dev,
-                            &self.activations.moe_swiglu_id_out,
-                            self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                            &self.activations.moe_expert_ids,
-                            &self.activations.moe_down_id_out,
-                            &dn_params,
-                        ).map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
+                        if let Some(rec) = q8_0_id_record_opt {
+                            session.encoder_mut().dispatch_record(
+                                rec,
+                                &[
+                                    self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                                    &self.activations.moe_swiglu_id_out,
+                                    &self.activations.moe_down_id_out,
+                                    &self.activations.moe_expert_ids,
+                                ],
+                            );
+                        } else {
+                            session.quantized_matmul_id_ggml(
+                                reg, dev,
+                                &self.activations.moe_swiglu_id_out,
+                                self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                                &self.activations.moe_expert_ids,
+                                &self.activations.moe_down_id_out,
+                                &dn_params,
+                            ).map_err(|e| anyhow::anyhow!("down _id L{layer_idx}: {e}"))?;
+                        }
                         *total_dispatches += 1;
                     }
 
