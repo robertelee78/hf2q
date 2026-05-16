@@ -5323,8 +5323,9 @@ at tg2000:
 | Session | hf2q V3 | peer-FA tg2000 | Ratio |
 |---|---:|---:|---:|
 | Session A C1 (warm, prior iter carryover) | 103.4 t/s | 98.72 t/s | **1.047× AHEAD** |
-| Session B C3 (thermal-degraded) | 85.1 t/s | 81.85 t/s | **1.040× AHEAD** |
-| **Combined** | | | **~1.043× AHEAD at tg2000** |
+| Original orphaned bench C3 (thermal-degraded) | 86.7 t/s | 79.87 t/s | **1.086× AHEAD** |
+| Resume bench C3 (thermal-degraded) | 85.1 t/s | 81.85 t/s | **1.040× AHEAD** |
+| **Combined (3 same-session pairs)** | | | **~1.058× AHEAD at tg2000** |
 
 The session-B numbers are 18% lower in absolute terms (machine state
 drift between iterations: PSO cache cold, OS noise, thermal headroom)
