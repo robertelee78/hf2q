@@ -355,7 +355,6 @@ mod tests {
             vec![0.1, 0.8, 0.1],
             vec![0.025, 0.95, 0.025],
         ];
-        let mut rng = StdRng::seed_from_u64(1);
         // Trial multiple seeds to verify partial-reject is achievable
         let mut saw_partial = false;
         for seed in 0..100 {

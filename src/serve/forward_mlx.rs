@@ -1906,7 +1906,7 @@ impl MlxModelWeights {
         // one lm_head matmul with m=n, one softcap over n*vocab, then
         // n argmax dispatches with logits views per row.  Replaces the
         // iter-70 sequential loop on shared scratch.
-        let mut norm_out_batched = dev
+        let norm_out_batched = dev
             .alloc_buffer(n * hs * 4, mlx_native::DType::F32, vec![n, hs])
             .map_err(|e| anyhow::anyhow!("alloc norm_out_batched: {e}"))?;
         let mut logits_batched = dev
@@ -2349,11 +2349,12 @@ impl MlxModelWeights {
         let mut cum_mlp_ns = 0u128;
         let mut cum_moe_ns = 0u128;
         let mut cum_misc_ns = 0u128;
-        // ADR-028 iter-463: MoE sub-buckets
+        // ADR-028 iter-463: MoE sub-buckets.  `cum_moe_other_ns` is derived
+        // from the siblings at end-of-loop inside the `if load_timing` block
+        // below — it has no per-layer accumulation, so it lives there.
         let mut cum_moe_gate_up_ns = 0u128;
         let mut cum_moe_down_ns = 0u128;
         let mut cum_moe_router_cpu_ns = 0u128;
-        let mut cum_moe_other_ns = 0u128;
 
         for i in 0..num_layers {
             tracing::debug!("GGUF layer {}/{}: loading weights", i + 1, num_layers);
@@ -2642,7 +2643,7 @@ impl MlxModelWeights {
                 num_layers,
             );
             // ADR-028 iter-463: MoE sub-buckets
-            cum_moe_other_ns = cum_moe_ns.saturating_sub(
+            let cum_moe_other_ns = cum_moe_ns.saturating_sub(
                 cum_moe_gate_up_ns + cum_moe_down_ns + cum_moe_router_cpu_ns
             );
             tracing::info!(
