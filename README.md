@@ -1,16 +1,33 @@
 # hf2q
 
+[![CI](https://github.com/robertelee78/hf2q/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/robertelee78/hf2q/actions/workflows/ci.yml)
+[![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
+[![Rust 1.81+](https://img.shields.io/badge/rust-1.81%2B-orange.svg)](https://www.rust-lang.org)
+[![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-lightgrey.svg)](#install)
+[![Backend: mlx-native](https://img.shields.io/badge/backend-mlx--native%200.9-purple.svg)](https://crates.io/crates/mlx-native)
+
 Pure-Rust CLI for converting HuggingFace models to hardware-optimized
 formats — and serving them through an OpenAI-compatible HTTP API on
-Apple Silicon.
+Apple Silicon. **No C++ at build, test, or runtime** (ADR-008
+sovereignty rule); the inference path runs entirely on `mlx-native`
+Metal kernels we own end-to-end.
+
+> **Performance** — on M5 Max, Gemma-4 26B decode runs **1.05× peer-FA
+> AHEAD** of `llama.cpp` across `tg200 / tg2000 / tg5000` regimes
+> (same-session apples-to-apples, σ < 1%); Qwen 3.6 35B-A3B
+> APEX-Q5_K_M ships at **1.34× peer-FA**; batched-prefill
+> Flash-Attention is **1.07–1.09× AHEAD** at `pp1800–pp3700`;
+> TurboQuant 8-bit KV cache gives **3.94× memory savings** at 32K
+> context vs F32 baseline.  Methodology + per-regime numbers in
+> [`docs/peer-parity-baselines-2026-04-26.md`](docs/peer-parity-baselines-2026-04-26.md).
 
 | | |
 |---|---|
-| **License** | Apache-2.0 |
+| **License** | Apache-2.0 OR MIT (dual) |
 | **Rust** | 1.81+ |
-| **Inference backend** | [`mlx-native`](https://crates.io/crates/mlx-native) (Apple Metal) — ADR-008 |
+| **Inference backend** | [`mlx-native`](https://crates.io/crates/mlx-native) 0.9 (Apple Metal) — ADR-008 |
 | **Output formats** | GGUF (`llama.cpp` consumers), mlx-lm safetensors |
-| **Status** | Pre-release on M-series Macs. Some paths are fast and well-tested (batched prefill, TQ KV cache, Qwen 3.5 / 3.6 convert + serve); others are incomplete or actively under investigation (Gemma-4 decode gap, spec-decode wire-up, multi-arch coverage). See the ADR ledger for per-feature status. |
+| **Status** | Pre-release on M-series Macs. Some paths are fast and well-tested (batched prefill, TQ KV cache, Qwen 3.5 / 3.6 convert + serve); others are incomplete or actively under investigation (spec-decode wire-up, multi-arch coverage). See the ADR ledger for per-feature status. |
 
 ```bash
 # Convert a HuggingFace model to a Q4_K_M GGUF

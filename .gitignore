@@ -28,12 +28,15 @@ CLAUDE.md
 # Agentic-QE local SQLite memory (accidentally committed in 9602b06; reverted)
 .agentic-qe/
 
-# Logs and examples
+# Runtime logs (per-session, never committed).
 logs/
-examples/
-# Exception: vendored crate examples are permanent test assets (added 2026-04-11
-# for the 1bNEW.29 NSG sweep microbench harness — see docs/spike-1bNEW29-*.md)
+# Vendored crate examples are permanent test assets (added 2026-04-11
+# for the 1bNEW.29 NSG sweep microbench harness — see docs/spike-1bNEW29-*.md).
 !vendor/candle-metal-kernels/examples/
+# 2026-05-16: `examples/` at the repo root is now part of the public
+# release (5 self-contained scenarios + README index).  Was gitignored
+# during the iter-216 ngram diagnostic when this dir held one-off
+# bench scripts; that material moved to scripts/ long ago.
 
 # Runtime output from `hf2q generate --benchmark` (ADR-005 1bNEW.0 metrics
 # instrumentation). The committed baseline lives at
