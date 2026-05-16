@@ -438,12 +438,12 @@ fn run_two_regime_decode(
 
     // STEP 2 — load model.
     let tokenizer_path = super::find_tokenizer(model_path, None)?;
-    let config_path = super::find_config(model_path, None)?;
-    let cfg = Gemma4Config::from_config_json(&config_path)?;
     let mut ctx = gpu::GpuContext::new()
         .map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+    // ADR-022 P1.8 — prefer GGUF-self-sufficient config; see cmd_parity_check.
+    let cfg = Gemma4Config::from_gguf(&gguf)?;
     let mut progress = header::LoadProgress::new(false, 1, 0);
     let mut mlx_w =
         MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx, &mut progress)?;

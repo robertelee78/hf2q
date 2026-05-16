@@ -174,30 +174,6 @@ pub(crate) fn find_tokenizer(model_path: &Path, explicit: Option<&Path>) -> Resu
 }
 
 /// Resolve config.json path.
-fn find_config(model_path: &Path, explicit: Option<&Path>) -> Result<std::path::PathBuf> {
-    if let Some(p) = explicit {
-        return Ok(p.to_path_buf());
-    }
-    let dir = model_path.parent().unwrap_or(Path::new("."));
-    let candidate = dir.join("config.json");
-    if candidate.exists() {
-        return Ok(candidate);
-    }
-    let models_dir = Path::new("models");
-    if models_dir.is_dir() {
-        for entry in std::fs::read_dir(models_dir)? {
-            let entry = entry?;
-            if entry.path().is_dir() {
-                let cfg = entry.path().join("config.json");
-                if cfg.exists() {
-                    return Ok(cfg);
-                }
-            }
-        }
-    }
-    anyhow::bail!("Cannot find config.json. Use --config to specify the path explicitly.")
-}
-
 /// Resolve the prompt text from either `--prompt` or `--prompt-file`.
 fn resolve_prompt(args: &cli::GenerateArgs) -> Result<String> {
     match (&args.prompt, &args.prompt_file) {
@@ -5178,11 +5154,15 @@ fn cmd_parity_check(
     eprintln!();
 
     let tokenizer_path = find_tokenizer(model_path, None)?;
-    let config_path = find_config(model_path, None)?;
-    let cfg = config::Gemma4Config::from_config_json(&config_path)?;
     let mut ctx = gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+    // ADR-022 P1.8 (operator pushback "requiring the config seems dumb"):
+    // the GGUF carries every architectural parameter `Gemma4Config` needs;
+    // there is no reason for parity check to require a sibling HF config.json
+    // when the GGUF is the source of truth.  `from_gguf` matches the
+    // `from_config_json` defaults so configs are byte-identical.
+    let cfg = config::Gemma4Config::from_gguf(&gguf)?;
     // cmd_parity has its own output contract — no progress line.
     let mut parity_progress = header::LoadProgress::new(false, 1, 0);
     let mut mlx_w =
@@ -5339,11 +5319,11 @@ fn cmd_parity_capture(
 
     // Load model once
     let tokenizer_path = find_tokenizer(model_path, None)?;
-    let config_path = find_config(model_path, None)?;
-    let cfg = config::Gemma4Config::from_config_json(&config_path)?;
     let mut ctx = gpu::GpuContext::new().map_err(|e| anyhow::anyhow!("GPU init: {e}"))?;
     let gguf = mlx_native::gguf::GgufFile::open(model_path)
         .map_err(|e| anyhow::anyhow!("GGUF open: {e}"))?;
+    // ADR-022 P1.8 — prefer GGUF-self-sufficient config; see cmd_parity_check.
+    let cfg = config::Gemma4Config::from_gguf(&gguf)?;
     // Model loaded once here; individual prompts re-create weights below to reset KV state
     let _gguf_preload = &gguf; // keep gguf alive
     let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
