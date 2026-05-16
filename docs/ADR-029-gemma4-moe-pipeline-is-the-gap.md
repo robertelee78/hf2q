@@ -5313,6 +5313,57 @@ data confirms the localization — **the MoE pipeline IS the gap** (despite
 the ADR title being a question, the 2026-05-15 skip-bisect data validates
 the original framing).
 
+### Step 1i LANDED — MoE routing V3 parallel top-K, +11.5% MEASURED WIN
+
+**Hypothesis** (from prior iteration's skip-bisect): the fused MoE
+routing kernel's top-K phase is single-thread serial (V1 and V2 both)
+while softmax was parallelized in V2.  At gemma4 (num_experts=128,
+top_k=8), serial top-K = 8 × 128 = 1024 sequential ops by thread 0
+alone — while 63 other threads idle.
+
+**Implementation**: `fused_moe_routing_f32_v3` kernel mirrors V2 for
+softmax (simd_max + simd_sum) and replaces the K serial linear scans
+with K parallel SG-tournament reductions:
+- Each thread holds `(best_val, best_idx)` over its strided expert slice
+- `simd_shuffle_down` reduces within each SG (32 lanes → 1 in 5 steps)
+- `n_sg` partial winners staged in shmem; SG0 cross-SG-reduces to global best
+- Thread 0 writes K-th result, marks `shared[winner] = -1.0`, barrier, repeat
+
+Shared memory: `2*num_experts + 2*n_sg` floats (V2 was `2*num_experts + n_sg`).
+Idx scratch stored via `as_type<float>(uint)` bit-pun in shmem.
+
+**Bench** (3-cycle alt-pair tg200 thermal-fair, cycle-alternated
+[v3,v2 | v2,v3 | v3,v2], gemma4 APEX-Q5_K_M on M5 Max):
+
+| | V2 baseline | V3 | Δ |
+|---|---:|---:|---:|
+| run 1 | 95.9 | 106.9 | |
+| run 2 | 96.1 | 107.0 | |
+| run 3 | 96.1 | 107.2 | |
+| mean | **96.03 t/s** | **107.03 t/s** | **+11.5% MEASURED** |
+| σ-pct | 0.10% | 0.11% | both < 1% |
+
+**Verdict**: **BIGGEST WIN OF THE ENTIRE ADR-029 MISSION.**  The +11.5%
+closes the entire 6% peer-FA gap and puts hf2q ~5pp AHEAD of peer's
+default config (101.58 t/s baseline per prior iter-175 measurement).
+
+**Default-flipped ON** per operator iter-149 precedent ("if coherent +
+faster, of course default").  Opt-out: `HF2Q_FUSED_MOE_ROUTING_V3=0/false/off`.
+
+**Validation**:
+- cargo build --release clean
+- coherence_smoke 2/2 PASS with V3 default-on (byte-equivalent decode
+  output except tie-breaking semantics, which differ from V2 only on
+  exact f32-equal softmax probabilities — vanishingly rare over 128 experts)
+
+**Math sanity check**: V3 saves ~11 t/s of 96 t/s = 11.5% wall.  Skip-bisect
+attributed ROUTING at 24.9% of wall.  V3 reducing ROUTING to ~half its V2
+cost → 11.5% / 24.9% = 46% reduction in ROUTING category.  Consistent with
+the projected 18× speedup on the top-K phase × top-K's share of routing.
+
+**Commits**:
+- mlx-native `5119eee` (V3 kernel + dispatcher + default-flip)
+
 ### Concrete optimization candidates (multi-week scope)
 
 To close the 6% peer-FA gap, the highest-leverage targets are:
