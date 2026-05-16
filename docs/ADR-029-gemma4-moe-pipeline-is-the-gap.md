@@ -4857,21 +4857,55 @@ infrastructure now wired through `MlxMoeWeights`.
 - mlx-native `5d0a140` (build_q6k_id_nr2_m1_record builder)
 - hf2q       `21e931d0` (wire fast path into forward_decode MoE gate_up)
 
+### Step 1e2 — DispatchRecord Q8_0_ID regular decode fast path (MoE down)
+
+**Strategy**: extend Step 1e's MoE infrastructure to the second MoE
+dispatch site.  Gemma4 APEX-Q5_K_M's MoE down is Q8_0 → ~30
+dispatches/decode-tok via `kernel_mul_mv_id_q8_0_f32` (regular non-NR2).
+
+**Implementation**:
+1. `pub fn build_q8_0_id_decode_record(registry, device, n, k,
+   real_top_k, expert_stride)` in `ops::quantized_matmul_id_ggml`.
+   Returns None when `HF2Q_Q8_0_ID_MV_NR2=1` (opt-in NR2 variant
+   selected; bake-time geometry differs).
+2. Bakes:
+   - Pipeline = `kernel_mul_mv_id_q8_0_f32` (regular, no FCs)
+   - threadgroups = `(div_ceil(n, 8), real_top_k, 1)`
+   - threads_per_tg = `(8, 8, 1)` — N_DST=4 × N_SIMDGROUP=2 (64
+     threads = 2 SGs × 32, 8 rows/TG)
+   - 5 bindings: weight=0, input=1, output=2, ids=3, params=4 (no shmem)
+3. `MlxMoeWeights.decode_record_q8_0_id_m1_down: OnceLock<Option<DispatchRecord>>`
+   second per-layer slot.
+4. Fast-path at `forward_decode:~5219` (down call site): the down dispatch
+   uses `n_tokens=real_top_k, top_k=1` (different shape vs gate_up's
+   `n_tokens=1, top_k=real_top_k`) — both folded into the baked
+   `params.ne1 = real_top_k` and `threadgroups.y = real_top_k`.
+
+**Validation**:
+- cargo build --release: clean
+- coherence_smoke: 2/2 PASS — byte-identical decode via both fast paths
+- 3-cycle alt-pair tg200 thermal-fair (gemma4-ara-APEX-Q5_K_M),
+  cycle-alternated order [1e2,1e | 1e,1e2 | 1e2,1e]:
+  - MAIN (Step 1e): 96.067 ± 0.16% (95.9, 96.1, 96.2)
+  - 1E2:            96.033 ± 0.22% (95.8, 96.2, 96.1)
+  - **Δ: -0.035% NEUTRAL** (within σ; no thermal drift)
+
+**Verdict**: COMMITTED as infrastructure.  Same per-dispatch math as
+Step 1e: ~30 calls × 40 ns = 1.2 µs/tok = 0.012% wall, below σ=0.22%.
+Combined Step 1e + 1e2 = ~60 MoE _id dispatches/tok now fast-path
+through the dispatch_record method.
+
+**Commits**:
+- mlx-native `12d3259` (build_q8_0_id_decode_record builder)
+- hf2q       `e0f00463` (wire fast path into forward_decode down)
+
 ### Forward plan — concrete substeps
 
-**Step 1e2 (next)**: extend to MoE down Q8_0_ID path
-(`kernel_mul_mv_id_q8_0_f32`, regular non-NR2 by default).  Build
-`build_q8_0_id_m1_record` — different geometry (threads=(8,8,1), align=8,
-no shmem) for the down dispatch.  Add second OnceLock slot on
-`MlxMoeWeights` (`decode_record_q8_0_id_m1_down`).  Wire fast path at
-`forward_decode:~5217` (the down call site).  Coverage: ~30 additional
-dispatches/decode-tok.  Combined with Step 1e total = ~60 MoE _id
-dispatches covered.
-
-**Step 1f (after 1e2)**: rms_norm + fused_head_norm_rope DispatchRecord
+**Step 1f (next)**: rms_norm + fused_head_norm_rope DispatchRecord
 extension.  Coverage: ~90 dispatches/token across pre-attn-norm,
 Q/K head_norm_rope (×2 per layer), V norm (×1), post-attn-norm,
-post-ff-norm.  Estimated impact: ~+0.13% wall additional.
+post-ff-norm.  Estimated impact: ~+0.13% wall additional — closer to
+Step 1d's coverage class, so possibly measurable.
 
 **Step 1g (after 1f)**: hadamard_quantize_kv + kv_cache_copy.
 Coverage: ~60 dispatches/token.  Estimated impact: ~+0.09% wall.
