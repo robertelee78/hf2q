@@ -4952,19 +4952,61 @@ each call site instead.
 - mlx-native `5d75def` (build_rms_norm_decode_record builder)
 - hf2q       `6086a920` (wire helper + 4 call sites)
 
+### Step 1f2 — `#[inline(always)]` on rms_norm helper (hypothesis falsified)
+
+**Hypothesis** (from Step 1f docs): function-call overhead into
+`rms_norm_f32_hs_cached` negates the bake savings; `#[inline(always)]`
+should restore +0.05% or more.
+
+**Implementation**: added `#[inline(always)]` to the helper.  Single
+attribute change.
+
+**Bench** (3-cycle alt-pair tg200 thermal-fair, cycle-alternated
+[1f2,1f | 1f,1f2 | 1f2,1f]):
+- MAIN (Step 1f): 96.067 ± 0.06% (96.1, 96.1, 96.0)
+- 1F2:            96.067 ± 0.12% (96.0, 96.0, 96.2)
+- **Δ: 0.000% NEUTRAL** (literally identical means)
+
+**Verdict**: hypothesis FALSIFIED with same rigor as ADR-029's
+iter-100..174 ledger.  The helper-function boundary is NOT the
+limiting factor.
+
+**Real explanation**: per-dispatch bake savings genuinely sit
+at/below σ=0.12% floor for this M5 Max + gemma4-APEX-Q5_K_M shape.
+Per-dispatch ~50 ns × 120 calls = 6 µs/tok = 0.058% wall — at noise
+floor.  The cumulative bake direction's MEASURABLE gain ceiling is
+probably the +0.13% already captured at Step 1d, not a multiple.
+
+Code retained — `#[inline(always)]` is zero-cost in production;
+future bake helpers should mirror for consistency.
+
+**Commits**:
+- hf2q `31c0ea92` (#[inline(always)] attribute + bench data)
+
+### Revised cumulative outlook
+
+After Step 1f + 1f2, the bake-pre-bake direction has accumulated:
+- Step 1c: vec! gating — neutral (foundation, correctness)
+- Step 1d: Q6_K m=1 NR2 — **+0.13% MEASURED**
+- Step 1e: Q6_K_ID NR2 gate_up — neutral
+- Step 1e2: Q8_0_ID regular down — neutral
+- Step 1f: rms_norm (F32, 1, hs) — neutral
+- Step 1f2: #[inline(always)] — neutral
+
+Total measured: **+0.13% wall** (Step 1d only).
+
+The bake-pre-bake direction's empirical ceiling on this hardware/model
+appears to BE Step 1d.  Future kernel-level wins (Step 1g KV, Step 1h
+FA) are NOT bound by this ceiling because they alter dispatch
+COUNT/algorithm (not just per-dispatch overhead) — they remain
+potentially measurable.
+
 ### Forward plan — concrete substeps
 
-**Step 1f2 (next)**: re-inline the rms_norm fast path at each call site
-(no helper function call), OR add `#[inline(always)]` to
-`rms_norm_f32_hs_cached`.  Test hypothesis: function-call overhead is
-negating the bake savings.  If +0.05% or more measured, fast-path
-inlining is the lever.  If still neutral, the per-dispatch savings
-genuinely sit below σ floor and the multi-substep cumulative target
-needs revision.
-
-**Step 1g (after 1f2)**: hadamard_quantize_kv + kv_cache_copy
-DispatchRecord extension.  Coverage: ~60 dispatches/token.  Estimated
-impact: ~+0.09% wall.
+**Step 1g**: hadamard_quantize_kv + kv_cache_copy DispatchRecord
+extension OR algorithmic kernel changes.  Need to measure whether
+this is a bake-style substep (sub-σ ceiling) or an algorithmic-change
+substep (higher ceiling).  Coverage: ~60 dispatches/token.
 
 **Step 1g (after 1f)**: hadamard_quantize_kv + kv_cache_copy.
 Coverage: ~60 dispatches/token.  Estimated impact: ~+0.09% wall.
