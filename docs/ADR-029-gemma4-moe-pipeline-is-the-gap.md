@@ -6,6 +6,42 @@
 - **Decision-grade evidence**: per-layer GPU timestamps from `MTLCommandBuffer.GPUStartTime/GPUEndTime` in real production decode + 3-trial fresh-process benchmark at thermal steady state + iter-100 averaged-tg2000 thermal-fair 5-trial cool-down bench
 - **Tags**: performance, root-cause, gemma4, thermal-fair, decode-reopened-iter-100, prefill-tied
 
+## Methodology lessons (distilled from the full mission)
+
+### The Step 1i breakthrough was a methodology, not luck
+
+After 31 levers tested (iter-100→174) all neutral or regressing — class A (compile flags, encoder overhead, cache, sync), class B (single-site de-fusion, MUL_MAT IR, FA unrolls, NSG/NWG tuning), class C (graph reorder, FA peer-port NWG32) — the mission state framed as "structural gap, multi-week SDPA refactor or architectural tradeoff."
+
+Step 1i (+11.5% measured wall, the biggest single substep in this entire ADR) was found by **combining two independent signals**:
+
+1. **Attribution profiling** (skip-bisect via `HF2Q_UNSAFE_EXPERIMENTS=1` + `HF2Q_SKIP_*` env flags): nominated **ROUTING = 24.9% of decode wall** as the single largest category. Necessary but not sufficient — V2 had been through 12 prior optimization passes already.
+
+2. **Chesterton's-fence read of the category's source** (`fused_moe_routing_f32_v2`): found a self-admitted comment in V2's own kernel:
+
+   ```metal
+   // Step 4: top-K selection (single-thread serial, same as V1)
+   ```
+
+   At gemma4 dims (num_experts=128, top_k=8): 8 × 128 = **1024 sequential ops by thread 0** while 63 SIMD lanes sat idle. V2's author had parallelized softmax (iter-363) but never came back to top-K.
+
+**Where the two signals converged = the actionable substep.** Either alone was insufficient. Attribution told us *where* the time was; source-comment grep told us *what* in that category was sub-optimal.
+
+### The standing rule (for future perf missions)
+
+When a perf mission has 15+ falsified levers and the next direction is unclear:
+
+1. **Run attribution profiling** (skip-bisect / category bucket / dispatch histogram). Rank wall-time CATEGORIES, not files.
+2. **For the top-2 categories, grep that category's source** for self-admitted limitations: `serial`, `single-thread`, `same as V1`, `TODO`, `FIXME`, `naive`, `simple`, `baseline`, `placeholder`, `for now`, `should be`, `eventually`.
+3. **Where attribution rank + comment-density correlate** = the next substep candidate. Read the code (don't trust the comment alone — *code is truth*).
+4. **Write a parity test FIRST** that captures the algorithm's contract (top-K SET equality + weight rtol, byte-identity over N tokens, etc.). Step 1i shipped without a *batched* parity test → introduced a byte-divergence bug that took 4 false hypotheses + 1 confirmed (Step 1j.2 tree-reduce-softmax fix) to root-cause. The cost of one missed parity test was ~5 iterations.
+
+### Per-mission corollaries also worth keeping
+
+- **Skip-bisect attribution beats per-file profiling** when the category boundaries align with code modules. Bucket time by *what kind of work*, not *which file*.
+- **`HF2Q_BATCHED_PREFILL=0` as a diagnostic isolator**: forcing unbatched prefill split the V3 unbatched (byte-equal to V2) from V3 batched (byte-divergent). The toggle existed for other reasons; in-the-moment repurposing it as a bisect axis is what cracked the Step 1j divergence after 4 falsified hypotheses.
+- **Parity tests must cover both prefill code paths**: unbatched + batched kernels have different reduction orders and can produce ULP-scale differences that compound over decode tokens. One parity test per *code path*, not per *algorithm*.
+- **Levers can WIDEN over time** (separate standing rule, originally iter-1 H6): a falsified lever's regression magnitude grows as opposing levers land. Re-attempt with caution; re-bench at HEAD before drawing conclusions.
+
 ## Iter-100 (2026-05-12) — Averaged-decode regime reopens the gap
 
 **Trigger**: operator measurement `hf2q 90.6 vs llama.cpp 98.1 t/s, ~8 t/s gap` at a 1958-token greedy generation (operator clarification: "the 1st number, 90.6 was hf2q ... the second the 98.1 was llama.cpp"). This was the WORKLOAD a real user hits: short prompt + long generation, decoder running across kv depths 0→2000.
