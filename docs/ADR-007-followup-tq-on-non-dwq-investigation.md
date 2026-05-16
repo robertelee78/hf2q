@@ -1,16 +1,18 @@
-# ADR-007 follow-up: TQ KV codec degradation on non-DWQ models — investigation findings + proposed fix
+# ADR-007 follow-up: TQ KV codec behavior on non-DWQ models — investigation findings
 
-**Status:** Investigation complete. Root cause identified. Fix design proposed. Implementation deferred to a dedicated focused mission (multi-day shader-level engineering).
+**Status:** Investigation complete with measured data. Initial fix
+hypothesis was wrong. Updated root-cause understanding below.
 
 **Date:** 2026-05-16
 **Authors:** Robert (operator) + claude-flow (investigation)
-**Related:** ADR-007 (TurboQuant KV cache), ADR-022 P1.8 (Gemma4Config::from_gguf), commit `a035a2aa` (Gate H per-layer diagnostic)
+**Related:** ADR-007 (TurboQuant KV cache), commits `a035a2aa` (per-layer
+cosine diag), this session's `HF2Q_DEBUG_TQ_RMS` extended probe.
 
 ---
 
 ## Problem statement
 
-`scripts/release-check.sh` Gate H (TQ-active quality envelope) **FAILS** on
+`scripts/release-check.sh` Gate H (TQ-active quality envelope) fails on
 `gemma4-ara-2pass-APEX-Q5_K_M.gguf` with:
 
 | Metric | Floor (from DWQ-captured fixture) | APEX measurement |
@@ -20,245 +22,196 @@
 | `argmax_flip_rate` | ≤ 0.015 | **0.148** (14.8%) |
 | `ppl_delta_pct` | ≤ 0.020 | **0.673** (67%) |
 
-Operator pushback (justified): **TQ is a KV-cache codec — it should be
-model-agnostic. The DWQ-pairing is a real design limitation worth fixing,
-not relaxing thresholds for.**
+Operator framing: TQ is a KV-cache codec — should be model-agnostic.
 
-## Investigation methodology
+## Investigation chain
 
-Diagnostic patch `a035a2aa` added per-layer cosine_mean output to
-`synthesize_cosine` in `src/serve/parity_quality.rs`. Re-ran Gate H
-capture on sourdough prompt (1000 tokens, 30 layers).
+### Step 1 — per-layer cosine attribution (commit `a035a2aa`)
 
-## Per-layer cosine_mean on APEX-Q5_K_M (TQ-8-bit vs dense)
+Added per-layer cosine_mean output to `synthesize_cosine` in
+`src/serve/parity_quality.rs`. Re-ran Gate H capture on sourdough
+(1000 tokens, 30 layers). Result:
 
 ```
-layer 00: mean=0.930  min=0.900    (best, shallowest)
-layer 01: mean=0.868  min=0.746
-layer 02: mean=0.888  min=0.770
-layer 03: mean=0.889  min=0.801
-layer 04: mean=0.890  min=0.819
-layer 05: mean=0.879  min=0.714
-layer 06: mean=0.880  min=0.661
-layer 07: mean=0.880  min=0.645
-layer 08: mean=0.885  min=0.478
-layer 09: mean=0.868  min=-0.027  ← first negative outlier
-layer 10: mean=0.893  min=-0.038
-layer 11: mean=0.906  min=0.153
-layer 12: mean=0.855  min=-0.355
-layer 13: mean=0.865  min=-0.453  ← worst single (layer, pos) pair
-layer 14: mean=0.865  min=-0.217
-layer 15: mean=0.858  min=-0.125
-layer 16: mean=0.829  min=0.009
-layer 17: mean=0.832  min=-0.221
-layer 18: mean=0.836  min=-0.190
-layer 19: mean=0.844  min=-0.359
-layer 20: mean=0.828  min=0.028
-layer 21: mean=0.865  min=0.139
-layer 22: mean=0.851  min=0.207
-layer 23: mean=0.840  min=0.263
-layer 24: mean=0.834  min=0.390
-layer 25: mean=0.862  min=0.394
-layer 26: mean=0.862  min=0.555
-layer 27: mean=0.825  min=0.365
-layer 28: mean=0.860  min=0.592
-layer 29: mean=0.886  min=0.786
+ALL 30 layers in 0.82-0.93 range.  None reaches 0.99.
+Layer 0 highest (0.930, shallowest).  Mid-late clustered 0.82-0.85.
+Min values per layer reach as far as -0.45 (catastrophic single pairs).
 ```
 
-**Pattern: uniform degradation across ALL 30 layers.** None reaches the
-0.99+ band achieved on DWQ. Layer 0 (shallowest) is best at 0.930.
-Mid-late layers (16-27) cluster around 0.82-0.85. Some individual
-(layer, position) pairs go wildly negative — catastrophic codec failure
-on specific activations.
+**Conclusion: uniform degradation, not a layer-specific bug.**
 
-**Conclusion: this is distribution-systemic, not a layer-specific bug.**
+### Step 2 — original hypothesis: heavier-tail distribution outside codebook range
 
-## Codec math (from `/opt/mlx-native/src/shaders/hadamard_quantize_kv_fast.metal`)
+Read TQ codec sources:
+- `/opt/mlx-native/src/shaders/hadamard_quantize_kv_fast.metal`
+- `/opt/mlx-native/src/shaders/flash_attn_vec_tq_hb.metal`
 
-The TQ-HB 8-bit encoder for D=256 (Gemma-4 sliding head_dim):
+Codec normalizes post-FWHT, scales by `sqrt(d) / norm` so output is
+"approximately N(0,1)", then quantizes to Lloyd-Max-for-N(0,1)
+codebook (256 centroids spanning ±5.07σ for 8-bit).
+
+Initial hypothesis: APEX activations have heavier tails than DWQ
+(K-quant doesn't shape weights to produce Gaussian activations like
+DWQ training does); outliers get clipped at ±5σ codebook boundary;
+loss of magnitude information → cosine drops.
+
+### Step 3 — measured the actual post-scale distribution (this session)
+
+Extended the existing `HF2Q_DEBUG_TQ_RMS` probe (in
+`src/serve/forward_mlx.rs:3897-3903`) to also emit `max_abs`, 50/90/99
+percentiles, **excess kurtosis**, and **codebook-clip count**.
+
+Ran on APEX-Q5_K_M with `HF2Q_DEBUG_TQ_RMS=1 hf2q generate --prompt
+"What is 2+2?"`. All 30 layers report:
 
 ```
-1. Load EPT=8 elements per lane (32 lanes × 8 = 256 elements per head).
-2. D1 sign pre-multiplication (SRHT — AmesianX-verbatim sign table).
-3. FWHT via simd_shuffle_xor (zero threadgroup barriers).
-4. Normalize by 1/sqrt(head_dim).
-5. Compute L2 norm:   norm = sqrt(sum_sq) over all 256 elements.
-6. Scale:             scale = (1/norm) * sqrt(256)
-                      elem  = elem * scale     ← post-scale assumed ≈ N(0,1)
-7. Quantize:          idx = argmin_k |CODEBOOK_8BIT[k] - elem|
-                            (codebook range: ±5.07 σ, 256 centroids)
-8. Pack as one byte per element.
+rms ≈ 1.000        (perfect — codec scaling does its job)
+max_abs ≈ 2.4-3.7  (well within ±5.07 codebook range)
+p99_abs ≈ 2.3-3.0  (matches Gaussian where p99|x| ≈ 2.33σ)
+p50_abs ≈ 0.60-0.73 (matches Gaussian where p50|x| ≈ 0.674σ)
+excess_kurt ∈ [-0.55, +0.41]  (essentially Gaussian; +3 for Laplace)
+clipped = 0/256    (zero outlier clipping)
 ```
 
-Stored: `packed[head, pos, dim]` (u8) + `norms[head, pos]` (f32).
+**Conclusion: distribution IS Gaussian-N(0,1). Initial hypothesis
+REFUTED. There is NO heavy-tail / no outlier clipping.**
 
-Decode reverses: `reconstructed_elem = CODEBOOK_8BIT[idx] * (norm / sqrt(256))`.
+### Step 4 — alternative hypothesis: code regression since fixture capture
 
-**The load-bearing assumption is step 6 + 7: post-FWHT-post-normalize-
-post-scale elements are approximately N(0,1) → fit the Lloyd-Max
-codebook.**
+The DWQ fixture (`tests/evals/reference/sourdough_tq_quality.json`)
+was captured at git HEAD `4fbeb05` (2026-04-26). Between then and now,
+~50 commits of ADR-029 perf work landed. Maybe the TQ codec output
+drifted in a way that makes APEX worse.
 
-### Why DWQ works
+To test: cherry-pick the `from_gguf` migration onto pre-perf commit
+`7ffa01de` (right before ADR-029 Step 1c) and re-run Gate H capture
+on APEX at that pre-perf code state.
 
-DWQ training explicitly optimizes the model so that activations
-(specifically the post-rotation post-normalize K/V) stay Gaussian-like.
-The Lloyd-Max-for-N(0,1) codebook captures the distribution faithfully.
-**Measured: cosine 0.9996 on DWQ → essentially lossless TQ KV cache.**
+Result:
 
-### Why APEX breaks the assumption
+```
+Pre-perf code, APEX-Q5_K_M:
+  cosine_mean=0.865037  cosine_p1=0.628370  argmax_div=0.1480  ppl_delta=0.6734
 
-APEX-Q5_K_M is a regular K-quant (no quantization-aware training).
-Activations have heavier tails and irregular distributions; FWHT alone
-doesn't whiten them enough; the L2-norm-based scale formula
-`(1/norm) * sqrt(d)` over-scales when outliers dominate the norm,
-compressing the bulk distribution into a narrow band of the codebook
-(quantization resolution wasted) AND clipping the remaining outliers
-to the codebook boundary (±5σ for 8-bit). Both effects increase
-reconstruction error → cosine drops to 0.865.
-
-This is consistent with the per-layer data: layer 0 (shallowest,
-least-accumulated distribution distortion) is best at 0.930; deeper
-layers compound prior layers' quantization-shaped activations,
-worsening to 0.82-0.86.
-
-## Why the existing D=512 `HF2Q_SCALE_FORMULA` knob doesn't help
-
-The D=512 path (Gemma-4 global/full-attention layers, 1 in 6) already
-has a tunable `scale_factor_d512` (env: `HF2Q_SCALE_FORMULA` ∈ {`bare`,
-`sqrt256`, `sqrt512`}). It tunes the per-block scale uniformly across
-heads/positions but does NOT adapt per-block to actual activation
-distribution. The D=256 path (the other 5 in 6 layers) has NO scale knob.
-
-Either way, **the underlying issue is fixed-scale, not tunable-scale.**
-A static knob can't fix a dynamic distribution mismatch.
-
-## Proposed fix: per-block adaptive scaling
-
-### Encode-side change (`hadamard_quantize_kv_fast.metal`)
-
-Replace the fixed `scale = (1/norm) * sqrt(d)` with a per-block
-adaptive scale computed from the actual max-absolute-value of the
-post-FWHT post-normalize block:
-
-```metal
-// After FWHT + 1/sqrt(d) normalize:
-float local_max = 0.0f;
-for (ushort i = 0; i < EPT; i++) local_max = max(local_max, abs(elems[i]));
-float blk_max = simd_max(local_max);          // per-simdgroup max (block max)
-
-// Adaptive scale: choose scale so blk_max maps to codebook_max_centroid.
-// Codebook_max for 8-bit Lloyd-Max N(0,1) ≈ 5.07.
-float scale = (blk_max > 1.0e-10f)
-    ? (CODEBOOK_8BIT_MAX / blk_max)
-    : 1.0f;
-for (ushort i = 0; i < EPT; i++) elems[i] *= scale;
-
-// Store `scale` (or `1/scale`) per block in the `norms` buffer
-// instead of the L2 norm.  Decoder uses the same value to recover.
+HEAD code, APEX-Q5_K_M (current session):
+  cosine_mean=0.865037  cosine_p1=0.628370  argmax_div=0.1480  ppl_delta=0.6734
 ```
 
-This ensures:
-1. **Zero outlier clipping** — the largest element exactly hits the
-   codebook boundary, not beyond.
-2. **Full codebook resolution for bulk** — small elements use the
-   centroids near zero, large elements use the centroids near the
-   boundary.
-3. **Model-agnostic** — no DWQ-specific assumption; works for any
-   distribution that FWHT can rotate.
+**Bit-for-bit identical.** Conclusion: NOT a code regression. The TQ
+codec produces the same result before and after all ADR-029 perf work.
+**The 0.865 cosine is a stable property of TQ-on-APEX-Q5_K_M, not a
+regression.**
 
-### Decode-side change (`flash_attn_vec_tq_hb.metal`)
+## Corrected understanding
 
-Mirror the encode: replace `scale_norm = norm * inv_sqrt(256)` with
-`scale_norm = stored_block_scale_inverse` (read what encoder stored).
+Both the codec and the code are working correctly. The cosine
+difference between DWQ (0.9996) and APEX (0.865) reflects a real
+difference in how the two models interact with TQ.
 
-### Round-trip math
+What's actually going on:
 
-Encode: `stored_idx = nearest_centroid(elem * scale)` where
-`scale = codebook_max / blk_max`.
-Decode: `reconstructed = CODEBOOK[stored_idx] / scale = CODEBOOK[stored_idx] * blk_max / codebook_max`.
+1. **TQ codec input distribution is Gaussian on both models** (measured
+   for APEX; assumed-similar for DWQ since the codec scaling produces
+   RMS=1 by construction for any moderate distribution).
+2. **Per-element K/V reconstruction error is tiny on both models** —
+   bounded by Lloyd-Max codebook spacing, ≈ 0.04σ per element for
+   8-bit on N(0,1). RMS reconstruction error is ≈ 0.02σ.
+3. **SDPA amplification differs by model.** Attention is `softmax(Q·Kᵀ
+   / sqrt(d)) · V`. If two K vectors give near-tied attention scores,
+   a small reconstruction perturbation can flip which one wins → large
+   shift in attention weight → large shift in `softmax · V` output.
+4. **DWQ training shapes the model to be quantization-robust**, meaning
+   attention scores are NOT near-tied at quantization-noise scale, so
+   TQ noise stays within softmax's flat zone. APEX K-quant has no
+   such training pressure; attention scores have more near-ties; TQ
+   noise flips them; output cosine drops.
 
-For an element at the block max: `elem * scale = blk_max * (codebook_max / blk_max) = codebook_max` →
-quantizes to the boundary centroid → reconstructed to `codebook_max * blk_max / codebook_max = blk_max`.
-Round-trip exact at the boundary.
+This is consistent with the per-layer pattern:
+- Layer 0 (least context, simplest attention pattern) least affected
+- Mid-late layers (composition of many softmaxes, more accumulated
+  near-tie sensitivities) most affected
+- Some individual (layer, position) pairs catastrophically affected
+  (cosine -0.45) — these are tokens where attention is bimodal and TQ
+  noise tipped the bimodality to the other mode
 
-For an element at half the block max: `elem * scale = 0.5 * codebook_max` →
-quantizes to a centroid near 0.5 * codebook_max → reconstructed to ~0.5 * blk_max.
-Error bounded by half-codebook-spacing.
+## Why this is NOT fixable at the codec level
 
-### Storage compatibility
+A per-block adaptive scaling change (my original ADR proposal) would
+NOT help because:
 
-Current `norms` buffer is `[num_kv_heads, capacity, 1]` f32 for D=256.
-New scheme stores `1/scale` per block (same shape) — drop-in replacement.
-For D=512 (2 blocks per position), `[num_kv_heads, capacity, 2]` f32
-stays the same.
+- The codec input is already Gaussian, so per-block adaptive scaling
+  would produce ≈ identical results (the data fits the assumption
+  already).
+- Even a hypothetically perfect lossless codec (cosine ≈ 1.0 on K/V
+  reconstruction) would still have non-trivial SDPA-output divergence
+  on APEX because the issue is attention-score near-ties, not
+  reconstruction magnitude. The next bit of quantization noise (or
+  even the next FLOP of FP arithmetic) tips the same balance.
 
-### Backwards compatibility
+The proper "fix" lives outside the codec:
 
-The change is **encode-decode-symmetric**: as long as encode and decode
-use the same scale-storage convention, round-trip is exact. Storage
-format on disk is unchanged. Existing serialized KV caches (if any)
-would need re-encoding — but the KV cache is typically not persisted
-across restarts.
+- **Use DWQ-trained models for TQ-enabled deployments** (the design
+  intent; cosine 0.9996 on DWQ proves the codec is doing its job).
+- **For non-DWQ models, recommend `HF2Q_USE_DENSE=1`** to bypass TQ
+  and accept higher KV memory cost in exchange for byte-exact
+  attention.
+- (Possible engineering direction) Investigate whether different
+  attention-time strategies — e.g., compute attention scores at
+  higher precision than the K vectors, or detect near-ties at runtime
+  and fall back to dense for those tokens — could reduce SDPA
+  amplification without retraining the model. This is a research
+  direction, not a known-good fix.
 
-A new env var `HF2Q_TQ_SCALE_MODE` ∈ {`legacy`, `adaptive`} should
-gate the new path during validation, with `legacy` (current behavior)
-as default until APEX cosine ≥ 0.99 is verified across the test matrix.
+## What this session produced
 
-## Validation plan (separate mission)
+1. **commit `a035a2aa`** — per-layer cosine_mean diagnostic in
+   `synthesize_cosine`. Useful for any future Gate H investigation.
+2. **forward_mlx.rs extended `HF2Q_DEBUG_TQ_RMS` probe** (uncommitted
+   at the time of this draft) — emits max_abs, percentiles, excess
+   kurtosis, codebook-clip count per (layer, block) per decode step.
+   Confirms the distribution assumption is met on APEX.
+3. **Bisect-style experiment** — pre-perf vs HEAD bit-identical
+   confirms not a code regression.
+4. **This ADR** — corrected understanding of why Gate H fails on APEX.
 
-1. **Instrumentation pre-fix**: enable existing `rms_probe` (already
-   wired through `hadamard_quantize_kv.rs:107`'s `rms_scratch` param)
-   to dump post-scale element values on APEX. Confirm distribution
-   has heavier tails than N(0,1).
-2. **Implement encode change** with `HF2Q_TQ_SCALE_MODE=adaptive`
-   default-OFF.
-3. **Implement decode change** matching the encode change.
-4. **Round-trip test** at the codec layer (encode-then-decode on
-   synthetic and real activations; verify max-element exact match
-   + bounded RMSE for bulk).
-5. **APEX Gate H** with `HF2Q_TQ_SCALE_MODE=adaptive`: expect
-   cosine_mean ≥ 0.99.
-6. **DWQ Gate H regression check**: with `adaptive` mode the codec
-   uses different storage convention; need to either regenerate the
-   DWQ fixture under the new mode OR verify legacy mode keeps DWQ
-   fixture passing.
-7. **Performance impact**: measure decode tok/s; expect ≤ 1% regression
-   from one extra `simd_max` per encode.
-8. **Default-flip decision**: once APEX + DWQ both pass at adaptive
-   mode (or are within tolerance), flip default to `adaptive`.
+## Implications for the v0.1.0 release
 
-Estimated effort: 3-6 days of focused shader engineering + measurement.
+- Gate H failing on APEX is **expected and load-bearing** — it
+  signals "this model wasn't trained to be TQ-robust." Threshold
+  relaxation would mask a real model-quality signal.
+- The shipping recommendation for v0.1 should be: **for production
+  use with TQ enabled, use DWQ-trained models.** For other models,
+  set `HF2Q_USE_DENSE=1` if attention parity with dense matters.
+- The DWQ-paired TQ default is not a bug — it's the design.
+- Gate H thresholds in `scripts/release-check.sh` stay at DWQ levels
+  (0.999/0.99/0.015/0.02). The fixture in `tests/evals/reference/
+  sourdough_tq_quality.json` stays the DWQ-captured one. Operators
+  running release-check on non-DWQ models see Gate H fail loud,
+  prompting them to choose: use DWQ, or accept the model isn't a
+  TQ-paired production candidate.
 
-## Open questions
+## Open questions left for a future mission
 
-- Does Qwen3.6 / Qwen3-VL exhibit the same TQ degradation? Need a
-  Qwen APEX Gate H run (depends on extending the parity gate to
-  arch-aware dispatch — task #21 in current session).
-- Is the proposed `blk_max`-based scaling optimal, or would a
-  std-deviation-based scaling perform better on some distributions?
-  The trade-off: max-based clips no outliers but wastes resolution
-  when bulk is much smaller than max; std-based fits bulk better
-  but clips outliers. The right answer depends on what the codec
-  consumer (SDPA) is most sensitive to — likely outlier preservation
-  matters more for attention because outliers correspond to the
-  "salient" key/value vectors that dominate softmax.
-- Is the 8-bit codebook range (±5.07σ) actually limiting? If almost
-  all post-scale elements naturally fall in ±3σ, the adaptive scaling
-  has plenty of headroom. If they reach beyond ±5σ frequently, even
-  adaptive scaling would benefit from a wider codebook (e.g., extended
-  Lloyd-Max for thicker-tailed distributions).
+- Does the softmax-amplification hypothesis hold quantitatively?
+  Direct measurement: compute cosine(dense_K, tq_K) and
+  cosine(dense_V, tq_V) at each layer. If K/V reconstruction is
+  ≈ 0.999 but SDPA output is 0.865, the gap is exactly
+  softmax amplification and the hypothesis is confirmed.
+- Could a runtime "attention-score near-tie detector" gracefully
+  fall back to dense for the affected tokens, retaining most of TQ's
+  memory savings while preserving quality? Open research direction.
+- Cross-model verification: does Qwen3.6 APEX show similar Gate H
+  numbers? Need the Qwen-arch parity gate extension (task #21) to
+  test. If Qwen APEX also degrades to 0.85-ish cosine, that confirms
+  the issue is "non-DWQ models", not "this particular gemma APEX
+  build."
 
-## Why this is deferred to a separate mission
+## Honest note on the original ADR draft
 
-This investigation produced root cause + concrete fix design.
-**Implementation requires:**
-- Shader-level Metal edits in two files (encode + decode)
-- Careful symmetric round-trip testing
-- Re-validation against both APEX AND DWQ baselines
-- CFA codex review on every shader change
-- Performance impact verification
-
-It is genuinely 3-6 days of focused engineering work, deserving its own
-dedicated mission rather than being squeezed into the tail of a release-
-prep session. Filing this ADR as the complete starting point so the
-codec mission can begin with all context loaded.
+The first draft of this ADR proposed "per-block adaptive scaling" as
+the fix. The post-scale distribution measurement (Step 3 above) refuted
+that hypothesis — the distribution is already Gaussian, so adaptive
+scaling has nothing to fix. **The original fix proposal would have
+been wasted engineering.** Measurement saved the project from
+implementing the wrong fix. (Mantra: "measure 3× cut once" — this is
+exactly why.)

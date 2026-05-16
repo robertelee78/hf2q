@@ -3895,10 +3895,31 @@ impl MlxModelWeights {
                         // This is the spec band for bare scale_factor=1.0 which is the iter-16 control.
                         // Only bare is valid (iter-16 result); sqrt256/sqrt512 are FALSIFIED (iter-16/18).
                         let status = if rms >= RMS_BAND_LOW && rms <= RMS_BAND_HIGH { "PASS" } else { "FAIL" };
+                        // 2026-05-16 Gate-H investigation: RMS alone doesn't constrain
+                        // kurtosis / outliers / shape — both Gaussian-N(0,1) and bimodal
+                        // distributions can have RMS=1.0.  Add max-abs + percentile
+                        // breakdown so we can see how far the actual distribution sits
+                        // from N(0,1), where 8-bit codebook range is ±5.07σ.
+                        let max_abs: f32 = samples.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+                        let mut sorted: Vec<f32> = samples.iter().map(|v| v.abs()).collect();
+                        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let p50 = sorted[sorted.len() / 2];
+                        let p90 = sorted[(sorted.len() as f64 * 0.90) as usize];
+                        let p99 = sorted[(sorted.len() as f64 * 0.99) as usize];
+                        // Kurtosis estimator (excess kurtosis: 0 for Gaussian, +3 for Laplace,
+                        // higher for heavier-tail).  Uses sample fourth-moment / variance² − 3.
+                        let mu: f32 = samples.iter().copied().sum::<f32>() / samples.len() as f32;
+                        let m2: f64 = samples.iter().map(|&v| ((v - mu) as f64).powi(2)).sum::<f64>() / samples.len() as f64;
+                        let m4: f64 = samples.iter().map(|&v| ((v - mu) as f64).powi(4)).sum::<f64>() / samples.len() as f64;
+                        let excess_kurt = if m2 > 1e-12 { (m4 / (m2 * m2)) - 3.0 } else { 0.0 };
+                        // Count clipped samples (beyond codebook range ±5.07).
+                        let n_clipped: usize = samples.iter().filter(|&&v| v.abs() > 5.0652659).count();
                         eprintln!(
                             "[HF2Q_DEBUG_TQ_RMS] layer={layer_idx} kind={probe_kind} head=0 \
-                             blk={blk} rms={rms:.4} band=[{RMS_BAND_LOW:.3},{RMS_BAND_HIGH:.3}] \
-                             status={status} (divisor=256 samples)"
+                             blk={blk} rms={rms:.4} max_abs={max_abs:.3} \
+                             p50_abs={p50:.3} p90_abs={p90:.3} p99_abs={p99:.3} \
+                             ex_kurt={excess_kurt:.2} clipped={n_clipped}/256 \
+                             status={status} (band=[{RMS_BAND_LOW:.3},{RMS_BAND_HIGH:.3}])"
                         );
                     }
 
