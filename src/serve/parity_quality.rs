@@ -741,6 +741,9 @@ fn synthesize_cosine(
     mlx_w: &MlxModelWeights,
 ) -> Result<CosineStats> {
     let mut cosines: Vec<f32> = Vec::with_capacity(num_layers * tokens);
+    // Per-layer cosines bucketed for diagnostic stderr-only print (gate-h
+    // attribution).  Investigation-only output: not in the JSON envelope.
+    let mut cosines_per_layer: Vec<Vec<f32>> = vec![Vec::new(); num_layers];
 
     for layer_idx in 0..num_layers {
         let nh = mlx_w.num_attention_heads;
@@ -782,8 +785,26 @@ fn synthesize_cosine(
             let cs = cosine_pairwise_f32(&dense_vec, &tq_vec);
             if cs.is_finite() {
                 cosines.push(cs);
+                cosines_per_layer[layer_idx].push(cs);
             }
         }
+    }
+
+    // Diagnostic stderr print: per-layer cosine_mean to surface gate-h
+    // attribution (which layer(s) drag the overall mean down).
+    // Investigation-only — no JSON envelope change, no gate behavior change.
+    eprintln!("[GATE_H_DIAG] per-layer cosine_mean (sdpa_out dense vs TQ):");
+    for (layer_idx, cs) in cosines_per_layer.iter().enumerate() {
+        if cs.is_empty() {
+            eprintln!("  layer {:02}: (no pairs)", layer_idx);
+            continue;
+        }
+        let mean = cs.iter().copied().map(|x| x as f64).sum::<f64>() / cs.len() as f64;
+        let min = cs.iter().copied().fold(f32::INFINITY, f32::min);
+        eprintln!(
+            "  layer {:02}: mean={:.6}  min={:.6}  n={}",
+            layer_idx, mean, min, cs.len()
+        );
     }
 
     if cosines.is_empty() {
