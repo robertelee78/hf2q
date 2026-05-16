@@ -4813,18 +4813,62 @@ matches the observed +0.13% wall.
 - mlx-native `1f86fbd` (DispatchRecord type + Q6_K NR2 builder)
 - hf2q       `04eca089` (wire fast path into dispatch_qmatmul)
 
+### Step 1e — DispatchRecord Q6_K_ID NR2 m=1 fast path (MoE gate_up)
+
+**Strategy**: apply Step 1d's pre-bake pattern to the MoE `_id` path.
+Build `pub fn build_q6k_id_nr2_m1_record(registry, device, n, k, top_k,
+expert_stride)` in `ops::quantized_matmul_id_ggml` returning a
+`DispatchRecord` for `kernel_mul_mv_id_q6_K_f32_nr2`.  Per-layer slot
+`MlxMoeWeights.decode_record_q6k_id_m1_gateup: OnceLock<Option<DispatchRecord>>`,
+wired in `forward_decode` at the gate_up call site.
+
+**Implementation**:
+1. `build_q6k_id_nr2_m1_record` — same shape as Step 1d's helper plus
+   `top_k` and `expert_stride` (folded into the baked
+   `GgmlMatvecIdGpuParams.ne1 = top_k` for n_tokens=1).  Returns None
+   when `HF2Q_Q6K_ID_MV_NR2` is off — non-NR2 geometry would be wrong.
+2. Bakes:
+   - Pipeline = `kernel_mul_mv_id_q6_K_f32_nr2` (no function constants —
+     unlike the non-_id Q6_K NR2 which carries 700/701/702 for FC promotion)
+   - threadgroups = `(div_ceil(n, 4), top_k, 1)`
+   - threads_per_tg = `(2, 32, 1)` (NSG=2 × nr0=2 contract)
+   - 5 bindings: weight=0, input=1, output=2, ids=3, params=4 (no shmem)
+3. Fast-path branch in `forward_decode` MoE site (`forward_mlx.rs:~5117`):
+   `session.encoder_mut().dispatch_record(rec, &[weight, input, output, ids])`.
+   Falls through to `session.quantized_matmul_id_ggml` when slot returns None.
+
+**Validation**:
+- cargo build --release: clean
+- coherence_smoke: 2/2 PASS — byte-identical decode via the new path
+- 3-cycle alt-pair tg200 thermal-fair (gemma4-ara-APEX-Q5_K_M):
+  - MAIN (Step 1d): 96.10 ± 0.21% (96.1, 96.3, 95.9)
+  - 1E:             96.07 ± 0.12% (96.0, 96.0, 96.2)
+  - **Δ: -0.034% NEUTRAL** (within σ; no thermal drift across 6 runs)
+
+**Verdict**: COMMITTED as infrastructure.  Why neutral despite Step 1d's
++0.13% win: gate_up Q6_K_ID hits only ~30 dispatches/decode-tok (vs
+Step 1d's 91 on the non-_id Q6_K m=1 path) → expected savings ~1.2
+µs/tok = 0.012% wall — below the σ=0.12% bench resolution floor.  Step
+1e is the FOUNDATION for downstream MoE substeps (1e2 down Q8_0, 1f
+norms) that compound on the same `OnceLock<Option<DispatchRecord>>`
+infrastructure now wired through `MlxMoeWeights`.
+
+**Commits**:
+- mlx-native `5d0a140` (build_q6k_id_nr2_m1_record builder)
+- hf2q       `21e931d0` (wire fast path into forward_decode MoE gate_up)
+
 ### Forward plan — concrete substeps
 
-**Step 1e (next iteration)**: extend DispatchRecord to MoE experts.
-Build helpers `build_q6k_id_nr2_m1_record` (gate_up Q6_K) and
-`build_q8_0_id_nr2_m1_record` (down Q8_0) in
-`quantized_matmul_id_ggml.rs`.  Bake records on `MlxMoeWeights`
-(`stacked_gate_up`, `stacked_down`).  Wire fast path in `dispatch_id_mv`.
-Coverage: ~240 dispatches/token (8 top_k × 30 layers × ~1 gate_up + ~1 down).
-Estimated impact: ~+0.34% wall (240 × 40 ns / 10.4 ms/tok), tracking
-the +0.13% Q6_K NR2 ratio.
+**Step 1e2 (next)**: extend to MoE down Q8_0_ID path
+(`kernel_mul_mv_id_q8_0_f32`, regular non-NR2 by default).  Build
+`build_q8_0_id_m1_record` — different geometry (threads=(8,8,1), align=8,
+no shmem) for the down dispatch.  Add second OnceLock slot on
+`MlxMoeWeights` (`decode_record_q8_0_id_m1_down`).  Wire fast path at
+`forward_decode:~5217` (the down call site).  Coverage: ~30 additional
+dispatches/decode-tok.  Combined with Step 1e total = ~60 MoE _id
+dispatches covered.
 
-**Step 1f (after 1e)**: rms_norm + fused_head_norm_rope DispatchRecord
+**Step 1f (after 1e2)**: rms_norm + fused_head_norm_rope DispatchRecord
 extension.  Coverage: ~90 dispatches/token across pre-attn-norm,
 Q/K head_norm_rope (×2 per layer), V norm (×1), post-attn-norm,
 post-ff-norm.  Estimated impact: ~+0.13% wall additional.
