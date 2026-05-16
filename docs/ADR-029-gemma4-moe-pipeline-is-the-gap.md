@@ -4989,6 +4989,17 @@ of the speed win.  Net Step 1i+1j.2: **+10.96%** with full byte-identity.
 
 This is the TRUE, FINAL number — speed + byte-identity together.
 
+**Long-decode byte-identity confirmed at 200 tokens** (this iteration):
+greedy `--temperature 0 --max-tokens 200 --ignore-eos` with prompt
+"The capital of France is".  V3 and V2 produce IDENTICAL 200-token
+text output character-by-character.  Only timing metadata differs
+(V3 generation 106.6 t/s vs V2 96.1 t/s = +10.93% in this run,
+consistent with the 3-cycle alt-pair +10.96%).
+
+The 200-token verification supersedes the prior 30-token test (which
+was already PASS) — confirms Step 1j.2's tree-reduce fix holds across
+long greedy decodes, not just short ones.
+
 ### Step 1i V3 long-decode output divergence — honest disclosure (this iteration)
 
 The Step 1i commit comment claimed V3 was "byte-equivalent to V2
