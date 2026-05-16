@@ -1,0 +1,9 @@
+
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - User says: "Hello, what is 2+2?"
+   - This is a simple greeting followed by a basic arithmetic question.
+
+2
+

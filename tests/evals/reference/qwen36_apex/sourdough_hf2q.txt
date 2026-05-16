@@ -1,0 +1,92 @@
+
+Here's a thinking process:
+
+1.  **Understand User Request:**
+   - **Topic:** Sourdough bread making
+   - **Requirement:** Comprehensive instructions
+   - **Goal:** Provide a clear, step-by-step, thorough guide covering everything from starter maintenance to baking and troubleshooting.
+
+2.  **Identify Key Components of Sourdough Bread Making:**
+   - Sourdough starter creation/maintenance
+   - Ingredients & equipment
+   - Mixing & autolyse
+   - Bulk fermentation
+   - Folding techniques
+   - Shaping
+   - Proofing (bench rest & final proof)
+   - Scoring & baking (oven spring, steam, temperature)
+   - Cooling & storage
+   - Troubleshooting & tips
+   - Safety/hygiene notes
+
+3.  **Structure the Guide:**
+   I'll organize it logically:
+   - Introduction/Overview
+   - Phase 1: Preparing the Starter
+   - Phase 2: Mixing & Autolyse
+   - Phase 3: Bulk Fermentation & Folds
+   - Phase 4: Shaping & Proofing
+   - Phase 5: Baking
+   - Phase 6: Cooling & Storage
+   - Troubleshooting & Pro Tips
+   - Safety & Best Practices
+
+4.  **Draft - Section by Section (Mental Refinement):**
+
+   *Introduction:* Briefly explain what sourdough is, why it takes time, and set expectations (patience, temperature, consistency).
+
+   *Phase 1: Starter Preparation*
+   - Need an active, fed starter (100% hydration)
+   - Feed schedule: 12-24 hrs before baking
+   - Readiness test: float test, bubbles, rise/fall pattern
+   - Amount needed: ~100g for a standard loaf
+
+   *Phase 2: Mixing & Autolyse*
+   - Ingredients: Bread flour, water, salt, active starter
+   - Autolyse: Mix flour + water, rest 30-60 mins (develops gluten, improves extensibility)
+   - Add starter + salt, mix until combined
+   - Note: Salt inhibits yeast initially, so add after autolyse
+
+   *Phase 3: Bulk Fermentation & Folds*
+   - Bulk fermentation: 4-8 hours depending on temp
+   - Stretch & folds: 3-4 sets, 30-45 mins apart
+   - Purpose: strengthen gluten, distribute yeast, develop structure
+   - Signs of completion: dough doubles, jiggly, web-like structure, slight rise
+
+   *Phase 4: Shaping & Proofing*
+   - Pre-shape: gentle round, rest 20-30 mins (bench rest)
+   - Final shape: boule or batard, tension is key
+   - Proofing: banneton, fridge retard (optional but recommended) 8-16 hrs
+   - Temperature matters: 65-75°F ideal
+
+   *Phase 5: Baking*
+   - Preheat: Dutch oven or combo cooker, 500°F (260°C)
+   - Score: sharp lame, 1/4" deep, confident cuts
+   - Bake: covered 20 mins, uncovered 20-25 mins, total 40-45 mins
+   - Internal temp: 205-210°F (96-99°C)
+   - Crust color: deep golden brown
+
+   *Phase 6: Cooling & Storage*
+   - Cool completely on rack (2-4 hours) to finish crumb setting
+   - Store: paper bag, airtight container, or freeze slices
+   - Avoid cutting warm (gummy crumb)
+
+   *Troubleshooting:*
+   - Dense/heavy: underproofed, weak starter, low temp
+   - Gummy: underbaked, cut too early, high hydration without technique
+   - Flat/spread: overproofed, weak gluten, insufficient folds
+   - Sourness: longer fermentation, cooler temps, higher starter ratio
+
+   *Pro Tips:*
+   - Hydration adjustments
+   - Temperature control
+   - Scaling up/down
+   - Recipe flexibility
+
+   *Safety/Hygiene:*
+   - Clean tools, avoid metal contamination if possible, but note that modern stainless steel is fine
+   - Food safety: sourdough's acidity makes it safe, but watch for mold
+
+5.  **Check for Completeness & Accuracy:**
+   - Are measurements clear? (I'll use weight-based measurements for precision)
+   - Are times/temp ranges realistic? Yes, with ranges to
