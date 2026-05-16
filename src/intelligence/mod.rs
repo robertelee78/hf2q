@@ -8,7 +8,8 @@
 
 pub mod auto_quant;
 pub mod fingerprint;
-pub mod hardware;
+// B1.4 — hardware migrated to `crate::core::hardware`; all callers
+// updated in the same sweep so no re-export is needed here.
 pub mod heuristics;
 pub mod ruvector;
 
@@ -18,7 +19,7 @@ use tracing::{info, warn};
 
 use self::auto_quant::{AutoQuantConstraints, AutoQuantPlan};
 use self::fingerprint::ModelFingerprint;
-use self::hardware::HardwareProfile;
+use crate::core::hardware::HardwareProfile;
 #[allow(unused_imports)]
 use self::heuristics::HeuristicResult;
 
@@ -27,7 +28,7 @@ use self::heuristics::HeuristicResult;
 #[allow(dead_code)]
 pub enum IntelligenceError {
     #[error("Hardware profiling failed: {0}")]
-    Hardware(#[from] hardware::HardwareError),
+    Hardware(#[from] crate::core::hardware::HardwareError),
 
     #[error("Model fingerprinting failed: {0}")]
     Fingerprint(#[from] fingerprint::FingerprintError),

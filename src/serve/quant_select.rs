@@ -15,7 +15,7 @@
 //! | < 8 GiB                      | refuse     |
 //!
 //! Production callers populate [`GpuInfo`] from
-//! [`crate::intelligence::hardware::HardwareProfiler::detect`]
+//! [`crate::core::hardware::HardwareProfiler::detect`]
 //! (`src/intelligence/hardware.rs:185`), whose `total_memory_bytes`/
 //! `available_memory_bytes` fields are bytes-typed exactly as this module
 //! expects. Tests construct [`GpuInfo`] directly via [`GpuInfo::from_gib`].
@@ -99,7 +99,7 @@ impl std::fmt::Display for QuantType {
 ///
 /// Construction:
 /// - **Production**: [`GpuInfo::from_hardware_profile`] adapts
-///   [`crate::intelligence::hardware::HardwareProfile`] (Apple Silicon
+///   [`crate::core::hardware::HardwareProfile`] (Apple Silicon
 ///   unified memory is reported via `sysinfo::System::total_memory`,
 ///   `src/intelligence/hardware.rs:191`).
 /// - **Tests**: [`GpuInfo::from_gib`] for deterministic boundary fixtures.
@@ -132,7 +132,7 @@ impl GpuInfo {
     /// the model right now," not the machine's nameplate RAM. On a busy host
     /// these can differ by tens of GiB.
     pub fn from_hardware_profile(
-        profile: &crate::intelligence::hardware::HardwareProfile,
+        profile: &crate::core::hardware::HardwareProfile,
     ) -> Self {
         Self::from_bytes(profile.available_memory_bytes)
     }

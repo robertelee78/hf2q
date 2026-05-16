@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::fingerprint::ModelFingerprint;
-use super::hardware::HardwareProfile;
+use crate::core::hardware::HardwareProfile;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -963,7 +963,7 @@ mod tests {
             performance_cores: 14,
             efficiency_cores: 4,
             total_cores: 18,
-            memory_bandwidth_gbs: crate::intelligence::hardware::lookup_memory_bandwidth_gbs(chip),
+            memory_bandwidth_gbs: crate::core::hardware::lookup_memory_bandwidth_gbs(chip),
         }
     }
 

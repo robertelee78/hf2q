@@ -92,7 +92,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use crate::intelligence::hardware::HardwareProfile;
+use crate::core::hardware::HardwareProfile;
 
 /// Configuration consumed by [`crate::serve::load_engine`] (and by extension
 /// the [`ModelLoader`] trait that the [`HotSwapManager`] dispatches against).

@@ -1097,7 +1097,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
     use backends::safetensors_out::SafetensorsBackend;
     use backends::OutputBackend;
     use intelligence::fingerprint::ModelFingerprint;
-    use intelligence::hardware::HardwareProfiler;
+    use core::hardware::HardwareProfiler;
     use intelligence::ruvector::{QualityMetrics, RuVectorDb};
     use intelligence::AutoResolver;
     use progress::ProgressReporter;
@@ -3069,9 +3069,9 @@ fn cmd_validate(args: cli::ValidateArgs) -> Result<(), AppError> {
     // Update RuVector with quality metrics from validation
     if quality_report.has_metrics() {
         if let Ok(mut ruvector_db) = intelligence::ruvector::RuVectorDb::open_default() {
-            let hw = intelligence::hardware::HardwareProfiler::detect()
+            let hw = core::hardware::HardwareProfiler::detect()
                 .ok()
-                .unwrap_or_else(|| intelligence::hardware::HardwareProfile {
+                .unwrap_or_else(|| core::hardware::HardwareProfile {
                     chip_model: "unknown".to_string(),
                     total_memory_bytes: 0,
                     available_memory_bytes: 0,

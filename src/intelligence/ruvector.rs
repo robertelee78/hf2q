@@ -14,7 +14,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use super::fingerprint::ModelFingerprint;
-use super::hardware::HardwareProfile;
+use crate::core::hardware::HardwareProfile;
 use super::{ResolvedConfig, ResolvedSource};
 
 /// Errors from RuVector operations.

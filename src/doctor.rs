@@ -5,7 +5,7 @@
 
 use thiserror::Error;
 
-use crate::intelligence::hardware::HardwareProfiler;
+use crate::core::hardware::HardwareProfiler;
 use crate::intelligence::ruvector;
 use crate::progress::format_bytes;
 

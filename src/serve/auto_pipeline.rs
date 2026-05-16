@@ -47,7 +47,7 @@ use crate::core::provenance::{self, compute_source_bundle_sha256, Provenance};
 use crate::core::sha256::sha256_file;
 use super::quant_select::{select_quant, GpuInfo, QuantType};
 use crate::input::integrity::verify_repo;
-use crate::intelligence::hardware::HardwareProfile;
+use crate::core::hardware::HardwareProfile;
 
 /// Classify a `--model` argument into one of the two supported shapes.
 #[derive(Debug, Clone, PartialEq, Eq)]

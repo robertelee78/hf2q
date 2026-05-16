@@ -29,7 +29,7 @@ use crate::inference::models::bert::weights::LoadedBertWeights;
 use crate::inference::models::nomic_bert::{LoadedNomicBertWeights, NomicBertConfig};
 use crate::inference::vision::mmproj::{ArchProfile, MmprojConfig};
 use crate::inference::vision::mmproj_weights::LoadedMmprojWeights;
-use crate::intelligence::hardware::HardwareProfile;
+use crate::core::hardware::HardwareProfile;
 use crate::serve::cache::ModelCache;
 use crate::serve::multi_model::{
     DefaultModelLoader, HotSwapManager, LoadedPool, RestoreErrorKind, RestoreOutcome,
@@ -765,7 +765,7 @@ impl AppState {
         engine_queue_capacity: usize,
         default_model: Option<String>,
     ) -> anyhow::Result<Self> {
-        let hardware = crate::intelligence::hardware::HardwareProfiler::detect()
+        let hardware = crate::core::hardware::HardwareProfiler::detect()
             .map_err(|e| anyhow::anyhow!("hardware detection: {e}"))?;
         let cache = ModelCache::open()?;
         let pool = LoadedPool::from_hardware(&hardware);

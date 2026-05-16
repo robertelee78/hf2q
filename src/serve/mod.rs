@@ -194,7 +194,7 @@ fn resolve_prompt(args: &cli::GenerateArgs) -> Result<String> {
 
 /// Detect hardware info for benchmark reporting.
 fn detect_hardware_info() -> (String, u64) {
-    use crate::intelligence::hardware::HardwareProfiler;
+    use crate::core::hardware::HardwareProfiler;
 
     match HardwareProfiler::detect() {
         Ok(profile) => {

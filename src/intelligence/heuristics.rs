@@ -14,7 +14,7 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use super::fingerprint::ModelFingerprint;
-use super::hardware::HardwareProfile;
+use crate::core::hardware::HardwareProfile;
 
 /// Errors from heuristic resolution.
 #[derive(Error, Debug)]
