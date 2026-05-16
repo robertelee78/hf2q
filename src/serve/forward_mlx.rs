@@ -624,6 +624,21 @@ pub struct MlxMoeWeights {
     /// produced by hf2q dwq-train).
     pub gate_up_affine: Option<MlxAffineMoeStack>,
     pub down_affine: Option<MlxAffineMoeStack>,
+    /// ADR-029 iter-175 Step 1e — lazy-baked Q6_K_ID NR2 `m=1` decode
+    /// dispatch record for the gate_up MoE call.  Populated on the
+    /// first dispatch via `OnceLock::get_or_init` calling
+    /// `mlx_native::ops::quantized_matmul_id_ggml::build_q6k_id_nr2_m1_record`.
+    ///
+    /// Three states encode the bake outcome:
+    ///   - `OnceLock::new()` — not yet attempted.  Try to bake on first call.
+    ///   - `Some(record)` — bake succeeded; fast-path eligible.
+    ///   - `None` (inside the OnceLock) — bake skipped (`HF2Q_Q6K_ID_MV_NR2`
+    ///     off, or non-Q6_K dtype).  Permanently fall through to unbaked.
+    ///
+    /// Per-layer slot: gemma4 APEX-Q5_K_M has 5 MoE layers × 1 dispatch =
+    /// ~30 calls per decode-token through this path (n_tokens=1; top_k
+    /// rows folded into `threadgroups.y`).
+    pub decode_record_q6k_id_m1_gateup: std::sync::OnceLock<Option<mlx_native::DispatchRecord>>,
 }
 
 impl MlxMoeWeights {
@@ -674,6 +689,7 @@ impl MlxMoeWeights {
             router_combined_weight: alloc_one_f32_placeholder(mlx_device, "router_combined_weight")?,
             gate_up_affine: None,
             down_affine: None,
+            decode_record_q6k_id_m1_gateup: std::sync::OnceLock::new(),
         })
     }
 }
@@ -2457,6 +2473,7 @@ impl MlxModelWeights {
                     router_combined_weight,
                     gate_up_affine: None,
                     down_affine: None,
+                    decode_record_q6k_id_m1_gateup: std::sync::OnceLock::new(),
                 }
             } else {
                 // Dense layer — produce a placeholder MoE bundle so the
@@ -5096,18 +5113,54 @@ impl MlxModelWeights {
                         expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
                         ggml_type: ggml_type_gu,
                     };
+                    // ADR-029 iter-175 Step 1e — Q6_K_ID NR2 m=1 fast path.
+                    // On gemma4 APEX-Q5_K_M (Q6_K gate_up) this hits ~30
+                    // dispatches/decode-tok.  First call bakes the record
+                    // via OnceLock::get_or_init; subsequent calls fire
+                    // dispatch_record directly (saves HashMap lookup +
+                    // MTLSize::new + GgmlMatvecIdGpuParams construction).
+                    // Returns None when ggml_type != Q6_K or
+                    // HF2Q_Q6K_ID_MV_NR2 is off → falls through to unbaked.
+                    let q6k_id_record_opt = if matches!(gu_params.ggml_type, mlx_native::GgmlType::Q6_K) {
+                        self.layers[layer_idx].moe.decode_record_q6k_id_m1_gateup.get_or_init(|| {
+                            mlx_native::ops::quantized_matmul_id_ggml::build_q6k_id_nr2_m1_record(
+                                reg,
+                                dev.metal_device(),
+                                gu_params.n,
+                                gu_params.k,
+                                gu_params.top_k,
+                                gu_params.expert_stride,
+                            )
+                            .ok()
+                            .flatten()
+                        }).as_ref()
+                    } else {
+                        None
+                    };
                     // ADR-028 iter-201: SKIP_MOE_EXPERTS bisect — skip
                     // gate_up_id + swiglu + down_id dispatches.  Produces
                     // garbage moe_down_id_out (stale buffer).
                     if !INVESTIGATION_ENV.skip_moe_experts {
-                        session.quantized_matmul_id_ggml(
-                            reg, dev,
-                            &self.activations.moe_norm_out,
-                            self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                            &self.activations.moe_expert_ids,
-                            &self.activations.moe_gate_up_id_out,
-                            &gu_params,
-                        ).map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
+                        if let Some(rec) = q6k_id_record_opt {
+                            session.encoder_mut().dispatch_record(
+                                rec,
+                                &[
+                                    self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                                    &self.activations.moe_norm_out,
+                                    &self.activations.moe_gate_up_id_out,
+                                    &self.activations.moe_expert_ids,
+                                ],
+                            );
+                        } else {
+                            session.quantized_matmul_id_ggml(
+                                reg, dev,
+                                &self.activations.moe_norm_out,
+                                self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                                &self.activations.moe_expert_ids,
+                                &self.activations.moe_gate_up_id_out,
+                                &gu_params,
+                            ).map_err(|e| anyhow::anyhow!("gate_up _id L{layer_idx}: {e}"))?;
+                        }
                         *total_dispatches += 1;
 
                         // -- B12: swiglu (singleton) --
