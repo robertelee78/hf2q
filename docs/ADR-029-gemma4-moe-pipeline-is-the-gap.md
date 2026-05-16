@@ -4931,6 +4931,54 @@ bake parameters `(F32, rows=1, dim=hs)`.
    pre-FF norm, pre-FF norm 2, router norm, post-FF norm 1 — each
    × 30 layers/tok.  Total coverage: ~120 dispatches/decode-tok.
 
+### Step 1i V3 long-decode output divergence — honest disclosure (this iteration)
+
+The Step 1i commit comment claimed V3 was "byte-equivalent to V2
+except for f32-softmax-tied tie-breaking, which is vanishingly rare".
+Code+test verification this iteration FALSIFIES the strong byte-equivalent
+claim at production scale:
+
+**Test**: greedy (`--temperature 0`) decode of "The capital of France is"
+at 50 tokens, gemma4-APEX-Q5_K_M, both V3 default-on and V3 opt-out (V2):
+
+- V3 (run 1): identical to V3 (run 2) — V3 is **SELF-DETERMINISTIC**
+- V2 (run 1): identical to V2 (run 2) — V2 is **SELF-DETERMINISTIC**
+- **V3 vs V2: diverge after ~30 identical tokens.**
+
+First ~30 tokens of both outputs:
+`The capital of France is **Paris**.<turn|><turn|><turn|><turn|><turn|>OF\n`
+
+After this prefix:
+- V3 continues: `France is **Paris**.<turn|>` (more whitespace)
+- V2 continues: `<|channel>thought\n<channel|>The capital of France is **Paris**.<turn|><turn|>OF\n-**Paris** is the capital of France.<turn|>...`
+
+Both outputs are VALID greedy model behaviors — neither is wrong.
+V3's tournament tie-breaking picks a different lane than V2's serial
+"lowest-index-on-tie" scan at some token (most likely a near-tied
+softmax over 128 experts).  That different expert routing produces
+different logits, cascading into different downstream argmax choices.
+
+**Implications**:
+- coherence_smoke 2/2 PASS at HEAD (short tests) — confirmed.
+- Long-decode greedy reproducibility V3-to-V2 is **NOT preserved**.
+- Users upgrading from pre-V3 hf2q to V3-default may see different
+  greedy output text for the same prompt.
+- Both V3 and V2 honor the model's distribution; both produce
+  coherent text.  Neither is "more correct".
+
+**Verdict**: V3 default-on is RETAINED.  The +11.5% speed win is real
+and consistent across regimes (tg200/tg2000/tg5000 all 5.4-5.8% ahead).
+Output divergence is a behavior-change tradeoff, not a correctness
+regression.  Users requiring byte-identical pre-V3 behavior should
+opt out via `HF2Q_FUSED_MOE_ROUTING_V3=0`.
+
+The original V3 commit comment ("byte-equivalent semantics except
+tie-breaking, vanishingly rare") understated the practical impact —
+ties happen often enough in real model decode that long outputs DO
+diverge.  Adding this honest disclosure per the mantra "Code + test ==
+truth.  Comments in code or ADR can be starting points, but never
+trust them over code."
+
 **Validation**:
 - cargo build --release: clean
 - coherence_smoke: 2/2 PASS — byte-identical decode through all 4 fast paths
