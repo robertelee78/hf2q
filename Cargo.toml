@@ -13,6 +13,55 @@ readme = "README.md"
 keywords = ["llm", "gguf", "mlx", "quantization", "huggingface"]
 categories = ["command-line-utilities", "science"]
 
+# Drop heavy investigation logs + test fixtures + a reference PDF from
+# the published tarball.  Pre-exclude the package was 38.4 MiB / 698
+# files; the items below account for ~22 MiB and are all crate-internal
+# (consumers don't run our tests, don't read our iter-log ADRs, don't
+# need the TurboQuant paper to use the binary).  The smaller ADRs that
+# document architectural decisions (ADR-008 candle-divorce, ADR-009
+# parity, ADR-027 TQ-KV) stay in the published tarball so docs.rs / the
+# crates.io page can link them.
+exclude = [
+    # Test fixtures + harness directory (consumers don't run our tests).
+    "tests/",
+    # Reference paper PDF (TurboQuant arxiv 2504.19874).
+    "docs/2306.14048.pdf",
+    # Iter-log ADRs — internal investigation diaries, not user-facing
+    # architectural decisions.  Each is hundreds of KB to >1 MB.
+    "docs/ADR-005-inference-server.md",
+    "docs/ADR-011-phase*.md",
+    "docs/ADR-012-*.md",
+    "docs/ADR-013-*.md",
+    "docs/ADR-014-*.md",
+    "docs/ADR-015-*.md",
+    "docs/ADR-016-research-dossier-*.md",
+    "docs/ADR-017-persistent-block-prefix-cache.md",
+    "docs/ADR-017-phase-*.md",
+    "docs/ADR-017-tq-storage-delta.md",
+    "docs/ADR-019-*.md",
+    "docs/ADR-020-*.md",
+    "docs/ADR-021-*.md",
+    "docs/ADR-022-*.md",
+    "docs/ADR-028-*.md",
+    "docs/ADR-029-*.md",
+    "docs/ADR-030-*.md",
+    "docs/ADR-031-*.md",
+    # Investigation byproducts.
+    "docs/iter*.md",
+    "docs/spike-*.md",
+    "docs/tq-c*.md",
+    "docs/wave*.md",
+    "docs/peer_sdpa_comparison_iter_*.md",
+    "docs/perf-traces/",
+    "docs/phase0-*.json",
+    "docs/research/",
+    "docs/reddit/",
+    "docs/reference-lock.md",
+    "docs/adr007-pathC/",
+    # Per-runbook docs that ship at the URL via repository link.
+    "docs/operator-llama-refresh-runbook.md",
+]
+
 [features]
 default = []
 # Enable RuVector self-learning
@@ -162,14 +211,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # `futures` is a runtime dep but only re-exports a subset; `futures-util` is
 # the canonical home for `StreamExt::next`.
 futures-util = "0.3"
-
-[[bench]]
-name = "quantize_bench"
-harness = false
-
-[[bench]]
-name = "shard_read_bench"
-harness = false
 
 # ADR-008: vendored candle patches removed (candle no longer used for inference).
 
