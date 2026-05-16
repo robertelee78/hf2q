@@ -4972,6 +4972,23 @@ softmax-reduce choice.
 
 **Commit**: mlx-native `9496c22`
 
+**Post-fix speed verification** (3-cycle alt-pair thermal-fair tg200,
+cycle-alternated [v3,v2 | v2,v3 | v3,v2], gemma4-APEX-Q5_K_M):
+
+| | V3 (post 1j.2) | V2 (V3_env=0) | Δ |
+|---|---:|---:|---:|
+| run 1 | 106.8 | 96.3 | |
+| run 2 | 106.4 | 95.9 | |
+| run 3 | 106.6 | 96.0 | |
+| **mean** | **106.60 t/s** | **96.07 t/s** | **+10.96% MEASURED** |
+| σ-pct | 0.15% | 0.18% | both < 1% |
+
+Compared to pre-Step-1j.2 (Step 1i original): +11.5% MEASURED.
+The Step 1j.2 fix (tree-reduce softmax in V3 batched) cost ~0.5pp
+of the speed win.  Net Step 1i+1j.2: **+10.96%** with full byte-identity.
+
+This is the TRUE, FINAL number — speed + byte-identity together.
+
 ### Step 1i V3 long-decode output divergence — honest disclosure (this iteration)
 
 The Step 1i commit comment claimed V3 was "byte-equivalent to V2
