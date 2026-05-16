@@ -757,7 +757,7 @@ mod tests {
         assert_eq!(h_after, header);
 
         // body-verifying read MUST reject.
-        let err = read_envelope_body(&path).err().expect("must fail");
+        let err = read_envelope_body(&path).expect_err("must fail");
         assert!(
             err.to_string().contains("body sha256 mismatch"),
             "expected body sha256 mismatch error, got: {err}"

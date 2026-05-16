@@ -591,7 +591,7 @@ mod tests {
 
         // read_block on an unknown hash returns NotFound.
         let unknown = BlockHash([0xFF; 32]);
-        let err = store.read_block(&unknown).err().expect("unknown");
+        let err = store.read_block(&unknown).expect_err("unknown");
         assert_eq!(err.kind(), ErrorKind::NotFound);
 
         let _ = fs::remove_dir_all(&dir);
@@ -876,7 +876,7 @@ mod tests {
             codec_version: 1,
             n_tokens: BLOCK_TOKENS,
         };
-        let err = store.write_block_sync(&header, &body).err().expect("err");
+        let err = store.write_block_sync(&header, &body).expect_err("err");
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(
             err.to_string().contains("exceeds MAX_BLOCK_BYTES"),

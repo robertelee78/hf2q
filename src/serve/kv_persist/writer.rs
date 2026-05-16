@@ -526,8 +526,7 @@ mod tests {
                 body: body_b,
                 completion_tx: None,
             })
-            .err()
-            .expect("must fail");
+            .expect_err("must fail");
         match err {
             TrySendError::Full(_) => {}
             other => panic!("expected Full, got {other:?}"),
