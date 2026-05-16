@@ -9514,6 +9514,12 @@ pub fn dispatch_rms_norm_unit_perhead_dual_perm(
 ///
 /// Falls through to unbaked `session.rms_norm` when the bake returns
 /// None (unsupported dtype, pipeline-lookup failure).
+///
+/// `#[inline(always)]` per ADR-029 Step 1f2 — the call-site inlining
+/// is the load-bearing optimization (without it, Step 1f bench was
+/// neutral despite ~120 dispatches/tok coverage).  Step 1d's win at
+/// the inline `dispatch_qmatmul` fast-path branch motivated this.
+#[inline(always)]
 fn rms_norm_f32_hs_cached(
     cache: &std::sync::OnceLock<Option<mlx_native::DispatchRecord>>,
     session: &mut mlx_native::graph::GraphSession<'_>,
