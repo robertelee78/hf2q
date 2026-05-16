@@ -163,26 +163,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # the canonical home for `StreamExt::next`.
 futures-util = "0.3"
 
-[[bin]]
-name = "iter23_audit"
-path = "src/bin/iter23_audit.rs"
-
-[[bin]]
-name = "iter24_audit"
-path = "src/bin/iter24_audit.rs"
-
-[[bin]]
-name = "iter25_audit"
-path = "src/bin/iter25_audit.rs"
-
-[[bin]]
-name = "extract_dwq_sensitivity"
-path = "src/bin/extract_dwq_sensitivity.rs"
-
-[[bin]]
-name = "dump_gguf_types"
-path = "src/bin/dump_gguf_types.rs"
-
 [[bench]]
 name = "quantize_bench"
 harness = false
