@@ -12,6 +12,10 @@ pub mod arch;
 pub mod calibrate;
 pub mod backends;
 pub mod cli;
+// `core` is the in-place precursor to the planned `hf2q-core` crate
+// (workspace v0.1.0 split). See `src/core/mod.rs` for the boundary
+// rule and the planned submodule layout.
+pub mod core;
 mod debug;
 mod doctor;
 pub mod models;
