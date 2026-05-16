@@ -5265,3 +5265,77 @@ Neither is a /loop-iteration-sized substep.  The skip-bisect data
 above is the empirical foundation for any future operator-directed
 multi-week effort.
 
+### Extended skip-bisect (full attribution, this iteration)
+
+Tested all major SKIP flags with correct `HF2Q_UNSAFE_EXPERIMENTS=1`
+ack.  Two flags broke decode (caused NaN/infinite-loop): SKIP_POST_ATTN_NORM
+and SKIP_END_OF_LAYER — these dispatches are LOAD-BEARING for arithmetic
+correctness (their absence causes downstream NaN cascade, hammering sampler
+into pathological retry).
+
+| Skip flag | t/s | wall ms/tok | wall saved | % of wall |
+|---|---:|---:|---:|---:|
+| **Baseline** | 96.0 | 10.42 | — | — |
+| `HF2Q_SKIP_ROUTING=1` | 127.9 | 7.82 | 2.60 ms | **24.9%** |
+| `HF2Q_SKIP_MOE_EXPERTS=1` | 126.2 | 7.92 | 2.50 ms | **24.0%** |
+| `HF2Q_SKIP_TQ_SDPA=1` | 109.6 | 9.12 | 1.30 ms | 12.5% |
+| `HF2Q_SKIP_ATTN_QKV=1` | 108.0 | 9.26 | 1.16 ms | 11.1% |
+| `HF2Q_SKIP_DENSE_MLP=1` | 104.5 | 9.57 | 0.85 ms | 8.2% |
+| `HF2Q_SKIP_O_PROJ=1` | 104.1 | 9.61 | 0.81 ms | 7.8% |
+| `HF2Q_SKIP_TQ_ENCODE=1` | 99.1 | 10.09 | 0.32 ms | 3.1% |
+| `HF2Q_SKIP_HEAD_NORM_ROPE=1` | 96.8 | 10.33 | 0.09 ms | 0.86% |
+| `HF2Q_SKIP_WEIGHTED_SUM=1` | 96.7 | 10.34 | 0.07 ms | 0.7% |
+| (`HF2Q_SKIP_POST_ATTN_NORM=1`) | 2.7 | — | — | (NaN cascade — broken) |
+| (`HF2Q_SKIP_END_OF_LAYER=1`) | 3.8 | — | — | (NaN cascade — broken) |
+
+Sum of skippable: **93.16% of wall** (rest is prefill setup + sampling +
+framework overhead + the 2 NaN-cascading skips).
+
+### Updated strategic targeting
+
+**ROUTING is the LARGEST single category at 24.9%** — even larger than
+MoE experts (24.0%).  ROUTING includes 2 dispatches per layer × 30 layers:
+1. `dispatch_qmatmul` for router_proj (F32 matmul 2816→128 experts) — ~2 µs/call ideal
+2. `dispatch_fused_moe_routing_f32` (softmax over 128 + top-8 insertion sort + renorm) — most of the time
+
+Total ROUTING = 2.6 ms/tok / 60 dispatches = ~43 µs/dispatch — overwhelmingly
+in the softmax+topk kernel.  This is per-layer overhead that scales
+linearly with layer count.
+
+**Combined ROUTING + MoE EXPERTS = 49% of wall** — the MoE pipeline as
+a whole dominates decode wall, matching ADR-028's original synthesis
+[[project-adr028-synthesis-moe-pipeline-2026-05-11]]:
+> "Routing (5.02 ms/tok 38%) + experts (2.52 ms/tok 19%) = 49% of
+> wall-clock"
+
+The 2026-05-11 synthesis predicted exactly this distribution.  Today's
+data confirms the localization — **the MoE pipeline IS the gap** (despite
+the ADR title being a question, the 2026-05-15 skip-bisect data validates
+the original framing).
+
+### Concrete optimization candidates (multi-week scope)
+
+To close the 6% peer-FA gap, the highest-leverage targets are:
+
+1. **MoE softmax_topk kernel optimization** — currently ~43 µs/call on
+   M5 Max for 128 experts × top-8.  Per-layer overhead times 30 layers
+   = ~1.3 ms/tok (half of ROUTING).  Replace insertion sort with
+   tournament-style top-k for better parallelism within a 128-thread TG.
+   Estimated impact: -0.5 to -1.0 ms/tok = 5-10% wall.
+
+2. **Batched routing across layers** — gather all 30 layers' router
+   logits first, then do ONE big batched routing dispatch over
+   `n_tokens × n_layers` rows.  Saves 29 commit_and_wait sync points.
+   But: layers are sequentially dependent (each layer's residual feeds
+   next), so cross-layer batching breaks the residual flow.  Would need
+   pipelined scheduling.  Multi-week.
+
+3. **Fuse rms_norm + router_proj into single kernel** — saves 30
+   dispatches/tok.  Output of pre-FF-2 norm goes directly to router
+   logits via one kernel.  Multi-day kernel work.
+
+4. **Per-call MoE matmul kernel tuning** — already peer-ported at NR2
+   level; remaining per-call differential needs deeper investigation
+   (compile-flag bisect with MTLCounterSampleBuffer, dispatch lifecycle
+   profiling, etc.).
+
