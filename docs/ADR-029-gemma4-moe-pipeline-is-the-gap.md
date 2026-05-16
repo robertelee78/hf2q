@@ -5001,12 +5001,87 @@ FA) are NOT bound by this ceiling because they alter dispatch
 COUNT/algorithm (not just per-dispatch overhead) — they remain
 potentially measurable.
 
-### Forward plan — concrete substeps
+### Step 1g — Classification (deep-research, no implementation)
 
-**Step 1g**: hadamard_quantize_kv + kv_cache_copy DispatchRecord
-extension OR algorithmic kernel changes.  Need to measure whether
-this is a bake-style substep (sub-σ ceiling) or an algorithmic-change
-substep (higher ceiling).  Coverage: ~60 dispatches/token.
+Per Step 1f2's falsification + the iter-174 closure note's
+multi-month estimate for remaining 5.4%, Step 1g required upfront
+classification before committing implementation time.
+
+**Chesterton's-fence audit**: read every KV-write call site in
+`encode_one_layer` (lines 3611-3858).  Production path uses
+`dispatch_kv_copy_kf16_quantize_v_no_fwht` for hybrid_kv (F16-K +
+TQ-HB-V, gemma4 default) — ADR-028 Phase 10c.5 iter-354 already
+FUSED the K-copy + V-encode into a single dispatch (saves 30
+KV-write dispatches/decode-tok vs the legacy 2-dispatch path).
+Legacy TQ-HB-V path uses `dispatch_hadamard_quantize_kv_hb_dual`
+(ADR-028 iter-149 fusion).  Both algorithmic fusions ALREADY
+LANDED.
+
+**Classification: pure bake-style** — no further algorithmic lever
+remaining at the KV-write site.  ~30 dispatches/decode-tok (1
+fused dispatch per layer × 30 layers).  Per Step 1f2's falsified
+hypothesis, this would be sub-σ NEUTRAL.
+
+**Verdict**: Step 1g NOT IMPLEMENTED.  Bake substep would be 100
+lines of infrastructure for a sub-σ result.  Time better spent on
+algorithmic substeps that change WHAT runs on GPU.
+
+### Cumulative bake-direction validation (this iteration)
+
+To validate the falsification with a strong direct test, built a
+pre-Step-1c baseline binary (hf2q `7ffa01de`, mlx-native `dbf1a76`)
+and benched against current main (post Step 1f2 = hf2q `31c0ea92`):
+
+**Bench** (3-cycle alt-pair tg200 thermal-fair, cycle-alternated
+[cum,pre | pre,cum | cum,pre]):
+
+| | Pre-1c baseline | Cumulative (post 1f2) | Δ |
+|---|---|---|---|
+| run 1 | 95.9 | 96.0 | |
+| run 2 | 95.9 | 96.1 | |
+| run 3 | 95.9 | 95.9 | |
+| mean | 95.900 t/s | 96.000 t/s | **+0.10% MEASURED** |
+| σ-pct | 0.00% (sub-decimal stable) | 0.085% | both < 1% |
+
+The cumulative bake direction yielded **+0.10% wall** — essentially
+equal to Step 1d's +0.13% measured alone.  Substeps 1e/1e2/1f/1f2
+**added no measurable cumulative gain** beyond Step 1d.
+
+**Confirms**: the bake-pre-bake direction's measurable ceiling on
+M5 Max + gemma4-APEX-Q5_K_M is **Step 1d's +0.10-0.13% wall**.
+Continuing this direction with Step 1g/1h/etc. would be
+infrastructure-only work that compounds without delivering bench
+wins.
+
+### Strategic pivot at HEAD `31c0ea92` / `5d75def`
+
+The bake-pre-bake direction is **EMPIRICALLY SATURATED**.  Operator's
+"Option A: pre-bake per-layer dispatch records at model-load"
+yielded its measurable potential at Step 1d (+0.10-0.13% wall).
+Remaining gap to peer-FA (~5.9%) is in per-kernel GPU time, not
+CPU encode time.
+
+**Remaining /loop-iteration-sized levers worth investigating**:
+
+1. **Per-kernel GPU optimization** — port specific peer kernels we
+   can validate are faster on M5 Max.  Iter-153 noted "per-kernel
+   f16-V SDPA tuning" as the lever; needs single-kernel A/B testing
+   per substep.
+
+2. **F16-V cache switch** — peer uses F16 V at default; hf2q
+   defaults to TQ-HB-V.  hybrid_kv supports both via
+   `dispatch_kv_cache_copy_batch_f32_to_f16_kv_dual` (already
+   wired).  If F16-V SDPA is faster than TQ-HB-V SDPA on M5 Max,
+   default-flipping closes some of the 6% gap.  Needs same-session
+   A/B bench to classify.
+
+3. **Compile-flag bisect** — last attempted at iter-141 (NWG=32
+   PORT peer-port); compile flags were IDENTICAL between peer and
+   hf2q, residual 4-6% in dispatch/encoder layer.  Could re-attempt
+   with deeper profiling.
+
+These are open hypotheses — each needs deep-research + classification
+before commitment.
 
 **Step 1g (after 1f)**: hadamard_quantize_kv + kv_cache_copy.
 Coverage: ~60 dispatches/token.  Estimated impact: ~+0.09% wall.
