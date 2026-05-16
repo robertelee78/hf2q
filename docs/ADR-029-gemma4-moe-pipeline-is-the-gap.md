@@ -4931,6 +4931,47 @@ bake parameters `(F32, rows=1, dim=hs)`.
    pre-FF norm, pre-FF norm 2, router norm, post-FF norm 1 — each
    × 30 layers/tok.  Total coverage: ~120 dispatches/decode-tok.
 
+### 🏆 Step 1j.2 — V3-V2 divergence ROOT-CAUSED AND FIXED (BYTE-IDENTICAL)
+
+After Step 1i (V3 kernel), greedy long-decode produced different output
+from V2 after ~30 identical tokens.  4 prior debugging attempts
+(Step 1i.1 lex-on-tie, Step 1i.2 OOR-guard, Step 1i.3 expanded parity
+tests) all failed to close the divergence.
+
+**Diagnostic that cracked it**: ran V3 with `HF2Q_BATCHED_PREFILL=0`
+(forces unbatched prefill).  Result: V3-default ≡ V2-default
+BYTE-IDENTICAL output in that mode.  Divergence was isolated to the
+BATCHED prefill kernel.
+
+**Root cause**: V1 batched (default fallback when V3 off) uses
+TREE-REDUCE softmax (`shared[tid] = local; for s = tg_size/2; s > 0;
+s >>= 1`).  V3 batched used SIMD-REDUCE softmax (`simd_max + simd_sum +
+per-SG broadcast`).  Different f32 reduction order → softmax probs
+differ at ULP scale → top-K boundary swaps → different routing →
+cascading divergent decode.
+
+**Why parity tests passed**: they tested the V3 kernel in isolation
+against V2 unbatched (which ALSO uses simd-reduce — V3 unbatched ≡
+V2 unbatched by construction).  They didn't test V3 batched vs V1
+batched, which is where the reduction-order mismatch lives.
+
+**Fix**: switch V3 batched softmax (Steps 1-2) from simd-reduce to
+TREE-REDUCE, matching V1 batched exactly.  V3 batched's Step 4
+parallel-tournament top-K is unchanged — that's where the +11.5%
+speed win lives.  The +11.5% comes from parallel top-K, not from
+softmax-reduce choice.
+
+**Validation**:
+- mlx-native + hf2q cargo build --release clean
+- coherence_smoke 2/2 PASS
+- 4 V3 parity tests still PASS (decode path unchanged)
+- V3-default vs V2-default 30-token greedy decode: **BYTE-IDENTICAL**
+  output (only timing diff)
+- V3 speed advantage RETAINED: prefill 217 vs 211 t/s; gen 109.4 vs
+  99.2 t/s (+10.3% in this run, within prior +11.5% range)
+
+**Commit**: mlx-native `9496c22`
+
 ### Step 1i V3 long-decode output divergence — honest disclosure (this iteration)
 
 The Step 1i commit comment claimed V3 was "byte-equivalent to V2
