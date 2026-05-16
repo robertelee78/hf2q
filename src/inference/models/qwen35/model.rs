@@ -406,7 +406,7 @@ impl Qwen35Model {
         device: &mlx_native::MlxDevice,
         path: &std::path::Path,
     ) -> anyhow::Result<usize> {
-        use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+        use crate::core::mlx_safetensors_loader::MlxAffineLinear;
         use crate::serve::forward_mlx::{
             parse_dwq_moe_expert_role, parse_dwq_overlay_metadata, MlxAffineMoeStack, MoeBaseRole,
         };
@@ -864,7 +864,7 @@ enum DenseFfnRole {
 /// time, so the transposed layout matches what the GGML Q4_0 matmul
 /// kernel reads at serve.
 fn dwq_to_native_q4_0_f32(
-    linear: &crate::calibrate::mlx_safetensors_loader::MlxAffineLinear,
+    linear: &crate::core::mlx_safetensors_loader::MlxAffineLinear,
     role: DenseFfnRole,
     intermediate: usize,
     hidden: usize,
@@ -938,7 +938,7 @@ fn dwq_to_native_q4_0_f32(
 fn overwrite_dense_ffn_q4_0_linear(
     layer: &mut Qwen35LayerWeights,
     role: DenseFfnRole,
-    linear: &crate::calibrate::mlx_safetensors_loader::MlxAffineLinear,
+    linear: &crate::core::mlx_safetensors_loader::MlxAffineLinear,
     layer_idx: usize,
     stem: &str,
     device: &mlx_native::MlxDevice,
@@ -1014,7 +1014,7 @@ fn overwrite_dense_ffn_q4_0_linear(
 fn overwrite_full_attn_f32_linear(
     layer: &mut Qwen35LayerWeights,
     role: AttnRole,
-    linear: &crate::calibrate::mlx_safetensors_loader::MlxAffineLinear,
+    linear: &crate::core::mlx_safetensors_loader::MlxAffineLinear,
     layer_idx: usize,
     stem: &str,
 ) -> anyhow::Result<()> {
@@ -1140,7 +1140,7 @@ fn empty_ffn_for(cfg: &Qwen35Config) -> Qwen35FfnWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+    use crate::core::mlx_safetensors_loader::MlxAffineLinear;
     use crate::inference::models::qwen35::{
         default_layer_types, Qwen35LayerKind, Qwen35MoeConfig, Qwen35Variant,
     };
@@ -1566,7 +1566,7 @@ mod tests {
         bits: u32,
         group_size: usize,
     ) {
-        use crate::calibrate::mlx_safetensors_loader::MlxAffineLinearBytes;
+        use crate::core::mlx_safetensors_loader::MlxAffineLinearBytes;
         use safetensors::tensor::Dtype;
         // Owned per-Linear bytes must outlive the borrowed views.
         // F32 scales/biases for byte-identical round-trip in the test;

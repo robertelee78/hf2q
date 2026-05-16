@@ -58,7 +58,7 @@ mod tests {
         box_muller_gaussian, buffer_from_f32, init_affine_params_gpu,
     };
     use crate::calibrate::dynamic_quant_gpu::kl_div_loss_per_row;
-    use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+    use crate::core::mlx_safetensors_loader::MlxAffineLinear;
     use mlx_native::ops::qmm_affine::dispatch_qmm_affine_t_f32;
     use mlx_native::{DType, KernelRegistry, MlxDevice};
 
@@ -481,7 +481,7 @@ mod tests {
     fn iter_19c_single_linear_kl_parity_vs_bf16() {
         use std::path::PathBuf;
 
-        use crate::calibrate::mlx_safetensors_loader::{
+        use crate::core::mlx_safetensors_loader::{
             discover_shards, read_floats_to_f32,
         };
 

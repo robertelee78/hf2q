@@ -49,6 +49,7 @@
 // adapter depends on ShardIntegrity from `src/input/integrity`).
 pub mod hardware;
 pub mod integrity;
+pub mod mlx_safetensors_loader;
 pub mod provenance;
 pub mod sha256;
 pub mod traits;

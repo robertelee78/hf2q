@@ -424,7 +424,7 @@ impl MlxQWeight {
     /// before the F32 check).  `info.rows = N`, `info.cols = K`.
     pub fn from_mlx_affine_linear(
         device: &MlxDevice,
-        linear: &crate::calibrate::mlx_safetensors_loader::MlxAffineLinear,
+        linear: &crate::core::mlx_safetensors_loader::MlxAffineLinear,
     ) -> Result<Self> {
         if linear.bits != 4 {
             anyhow::bail!(
@@ -2884,7 +2884,7 @@ impl MlxModelWeights {
         device: &MlxDevice,
         path: &std::path::Path,
     ) -> Result<usize> {
-        use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+        use crate::core::mlx_safetensors_loader::MlxAffineLinear;
         use anyhow::Context;
 
         let bytes = std::fs::read(path)
@@ -8704,7 +8704,7 @@ mod dispatch_qmatmul_f32_router_test {
 #[cfg(test)]
 mod ac5_iter_b_affine_qweight_roundtrip {
     use super::*;
-    use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+    use crate::core::mlx_safetensors_loader::MlxAffineLinear;
     use mlx_native::ops::qmm_affine::dispatch_qmm_affine_t_packed_simd4_b4;
 
     #[test]
@@ -9170,7 +9170,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
     /// hold without MlxModelWeights involvement.
     #[test]
     fn dwq_safetensors_metadata_roundtrip() {
-        use crate::calibrate::mlx_safetensors_loader::{MlxAffineLinear, MlxAffineLinearBytes};
+        use crate::core::mlx_safetensors_loader::{MlxAffineLinear, MlxAffineLinearBytes};
         use safetensors::tensor::{serialize, Dtype};
         use std::collections::HashMap;
 

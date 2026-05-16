@@ -359,7 +359,7 @@ pub fn buffer_from_f32(device: &MlxDevice, data: &[f32]) -> Result<MlxBuffer> {
 #[derive(Debug, Clone)]
 pub struct DwqLinearTrainResult {
     /// Trained Linear ready for safetensors save (iter-16b).
-    pub linear: crate::calibrate::mlx_safetensors_loader::MlxAffineLinear,
+    pub linear: crate::core::mlx_safetensors_loader::MlxAffineLinear,
     /// KL loss on the FIRST training step (post-perturbation).
     pub kl_initial: f32,
     /// Minimum KL loss observed across all training steps.
@@ -3191,7 +3191,7 @@ pub fn train_all_linears_dwq<F>(
 where
     F: Fn(&str) -> bool,
 {
-    use crate::calibrate::mlx_safetensors_loader::{MlxAffineLinear, MlxAffineLinearBytes};
+    use crate::core::mlx_safetensors_loader::{MlxAffineLinear, MlxAffineLinearBytes};
     use mlx_native::gguf::GgufFile;
 
     let device = MlxDevice::new()
@@ -3607,7 +3607,7 @@ pub fn train_all_linears_full_model_dwq(
         backward, checkpoint, matmul, ones_like, qdq_affine, rms_norm, transpose, view,
         GpuTape, GpuTensor,
     };
-    use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+    use crate::core::mlx_safetensors_loader::MlxAffineLinear;
     use crate::calibrate::qwen35_moe::{
         decoder_layer_on_tape_real_gqa, make_pos_buf_for_real_gqa,
         DecoderLayerWeightsRealGqa, Qwen35RealGqaConfig,
@@ -4360,7 +4360,7 @@ pub fn train_all_linears_full_model_dwq(
     }
 
     // Stage D: serialize all trained tensors.
-    type LinBytes = crate::calibrate::mlx_safetensors_loader::MlxAffineLinearBytes;
+    type LinBytes = crate::core::mlx_safetensors_loader::MlxAffineLinearBytes;
 
     let mut all_linears: Vec<(String, DwqQuantPack, usize, usize)> = Vec::new();
     for lp in &layer_packs {
@@ -4474,7 +4474,7 @@ pub fn train_linear_dwq_synthetic_teacher(
         backward, matmul, qdq_affine, scalar_mul, transpose, view, GpuTape, GpuTensor,
     };
     use crate::calibrate::dynamic_quant_gpu::kl_div_loss_per_row;
-    use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+    use crate::core::mlx_safetensors_loader::MlxAffineLinear;
 
     // ---- Validation ----
     if w_real.len() != n * k {
@@ -10979,7 +10979,7 @@ mod tests {
     #[test]
     fn iter_12d2_train_all_linears_dwq_real_gguf() {
         use super::{train_all_linears_dwq, DwqTrainingConfig};
-        use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+        use crate::core::mlx_safetensors_loader::MlxAffineLinear;
         use safetensors::tensor::Dtype;
         use safetensors::SafeTensors;
 

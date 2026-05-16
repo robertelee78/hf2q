@@ -196,7 +196,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
 /// prints a per-Linear `RoundTripDrift` line.
 fn cmd_dwq_overlay_drift(args: cli::DwqOverlayDriftArgs) -> Result<(), AppError> {
     use anyhow::Context as _;
-    use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+    use crate::core::mlx_safetensors_loader::MlxAffineLinear;
     use crate::serve::forward_mlx::parse_dwq_overlay_metadata;
 
     if !args.overlay.exists() {

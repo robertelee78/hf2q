@@ -33,7 +33,7 @@ use mlx_native::ops::qmm_affine::dispatch_qmm_affine_t_f32;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use crate::calibrate::dwq_loop::box_muller_gaussian;
-use crate::calibrate::mlx_safetensors_loader::MlxAffineLinear;
+use crate::core::mlx_safetensors_loader::MlxAffineLinear;
 use crate::calibrate::qdq_gpu::qdq_q4_0_gpu;
 
 /// Per-Linear KL benchmark result.  `delta_kl_nats > 0` means the
