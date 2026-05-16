@@ -42,11 +42,8 @@ use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 
-use super::cache::{
-    cache_model_path, compute_source_bundle_sha256, ModelCache, QuantEntry,
-    SourcePointer,
-};
-use crate::core::provenance::{self, Provenance};
+use super::cache::{cache_model_path, ModelCache, QuantEntry, SourcePointer};
+use crate::core::provenance::{self, compute_source_bundle_sha256, Provenance};
 use crate::core::sha256::sha256_file;
 use super::quant_select::{select_quant, GpuInfo, QuantType};
 use crate::input::integrity::verify_repo;
@@ -941,7 +938,7 @@ mod tests {
     // Some(hit)) only when the GGUF's provenance claim matches the
     // cache's recorded source-bundle SHA.
 
-    use super::super::cache::{SourceShard, compute_source_bundle_sha256};
+    use crate::core::provenance::{compute_source_bundle_sha256, SourceShard};
 
     /// Append a string-typed metadata KV pair to a GGUF buffer mid-
     /// construction.  Wire format per the GGUF spec (gguf.md):

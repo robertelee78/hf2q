@@ -127,7 +127,7 @@ pub struct Hf2qProvenance {
     /// reader does no parsing beyond presence + non-empty.
     pub producer_version: String,
     /// Lowercase-hex SHA-256 of the canonical source-shard manifest
-    /// (output of [`crate::serve::cache::compute_source_bundle_sha256`]).
+    /// (output of [`crate::core::provenance::compute_source_bundle_sha256`]).
     pub source_sha256: String,
     /// Lowercase-hex SHA-256 of the paired mmproj GGUF, when known at
     /// main-GGUF write time.  See struct doc for the production
@@ -5689,7 +5689,7 @@ mod tests {
     // model is loaded; no network; no conversion subprocess.
     // ─────────────────────────────────────────────────────────────────────
 
-    use crate::serve::cache::{compute_source_bundle_sha256, SourceShard};
+    use crate::core::provenance::{compute_source_bundle_sha256, SourceShard};
     use crate::core::provenance::{
         self as serve_provenance, Provenance, KEY_MMPROJ_SHA256, KEY_PRODUCER_VERSION,
         KEY_SOURCE_SHA256,

@@ -2,12 +2,10 @@
 //! by hf2q itself, and classify by metadata key contents.
 //!
 //! Migrated 2026-05-16 from `src/serve/provenance.rs` as part of the
-//! v0.1.0 workspace split (B1.2).  The old path is a `#[deprecated]`
-//! re-export shim — see `src/serve/provenance.rs`.  Source-bundle
-//! sha256 computation (which lives next to `SourceShard`) stays in
-//! `src/serve/cache.rs` for now and migrates here at B1.3 once
-//! `ShardIntegrity` moves to `crate::core::integrity` (the adapter
-//! `SourceShard::from_integrity` needs ShardIntegrity).
+//! v0.1.0 workspace split (B1.2).  Source-bundle sha256 computation
+//! (lives next to `SourceShard` in the [`source_shard`] submodule)
+//! moved here at B1.3b once `ShardIntegrity` had migrated to
+//! [`crate::core::integrity`].
 //!
 //! ## Schema (three keys)
 //!
@@ -349,3 +347,6 @@ mod tests {
         assert_eq!(KEY_MMPROJ_SHA256, "hf2q.mmproj_sha256");
     }
 }
+
+pub mod source_shard;
+pub use source_shard::{compute_source_bundle_sha256, SourceShard};

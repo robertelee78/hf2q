@@ -1780,9 +1780,9 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
         n.contains("vision_tower") || n.contains("embed_vision")
     });
     let provenance = config.source_shards.as_ref().and_then(|shards| {
-        let cache_shards: Vec<serve::cache::SourceShard> =
-            shards.iter().map(serve::cache::SourceShard::from_integrity).collect();
-        serve::cache::compute_source_bundle_sha256(&cache_shards).map(|sha| {
+        let cache_shards: Vec<core::provenance::SourceShard> =
+            shards.iter().map(core::provenance::SourceShard::from_integrity).collect();
+        core::provenance::compute_source_bundle_sha256(&cache_shards).map(|sha| {
             backends::gguf::Hf2qProvenance {
                 producer_version: format!("hf2q {}", env!("CARGO_PKG_VERSION")),
                 source_sha256: sha,

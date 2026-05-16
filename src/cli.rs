@@ -1634,7 +1634,7 @@ pub struct ConvertConfig {
     /// by [`crate::input::integrity::verify_repo`] during the
     /// `--repo` resolution path.  When `Some`, `cmd_convert` derives a
     /// canonical source-bundle SHA via
-    /// [`crate::serve::cache::compute_source_bundle_sha256`] and the
+    /// [`crate::core::provenance::compute_source_bundle_sha256`] and the
     /// GGUF backend stamps it into `hf2q.source_sha256` so the
     /// auto-pipeline short-circuit can fire on the next cache hit.
     /// `None` for `--input` (local) runs and `--no-integrity` runs —
