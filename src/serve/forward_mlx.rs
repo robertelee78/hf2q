@@ -9363,26 +9363,37 @@ pub fn dispatch_qmatmul(
     // same input).  Without per-dispatch annotation, the prior
     // `barrier_between` carries the union of write targets and the reorder
     // pass treats the dispatches as conflicting.  The annotation only
-    // takes effect in `begin_recorded` mode (HF2Q_GRAPH_OPT_PREFILL=1);
-    // in direct-dispatch mode it's a no-op zero-cost ranges stash.
+    // takes effect in `begin_recorded` mode (HF2Q_GRAPH_OPT_PREFILL=1).
+    //
+    // ADR-029 iter-175 Step 1c — gate on `is_capturing()`.  Previously
+    // this block unconditionally heap-allocated two `Vec<MemRange>` per
+    // `dispatch_qmatmul` call (~91/token: QKV proj × 3 × 30 layers +
+    // lm_head). `CommandEncoder::set_pending_buffer_ranges` doc:
+    // "Only meaningful in capture mode — has no effect on direct-dispatch."
+    // In production decode (capture None), the allocated vectors were
+    // taken + dropped on the next encode call — ~182 heap allocs/token
+    // of pure waste. First substep of multi-week DispatchRecord refactor.
     //
     // Weights are read-only (never mutated post-load), so we annotate
     // reads=[input] only — weight RANGES would force conservative
     // RAW-conflict checks against the load-time dequant pass that ran
     // hours ago (already complete, no live dependency).
     {
-        let input_range = {
-            let start = input.contents_ptr() as usize;
-            (start, start + input.byte_len())
-        };
-        let output_range = {
-            let start = output.contents_ptr() as usize;
-            (start, start + output.byte_len())
-        };
-        session.encoder_mut().set_pending_buffer_ranges(
-            vec![input_range],
-            vec![output_range],
-        );
+        let encoder = session.encoder_mut();
+        if encoder.is_capturing() {
+            let input_range = {
+                let start = input.contents_ptr() as usize;
+                (start, start + input.byte_len())
+            };
+            let output_range = {
+                let start = output.contents_ptr() as usize;
+                (start, start + output.byte_len())
+            };
+            encoder.set_pending_buffer_ranges(
+                vec![input_range],
+                vec![output_range],
+            );
+        }
     }
 
     // ADR-020 AC#5 Iter C — affine route MUST be checked first (before
