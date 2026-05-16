@@ -4088,14 +4088,11 @@ pub fn patch_mmproj_sha256_in_gguf(
         .windows(pattern.len())
         .position(|w| w == pattern.as_slice())
         .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "hf2q.mmproj_sha256 placeholder pattern not found in first {} bytes of {}",
-                    n,
-                    path.display()
-                ),
-            )
+            std::io::Error::other(format!(
+                "hf2q.mmproj_sha256 placeholder pattern not found in first {} bytes of {}",
+                n,
+                path.display()
+            ))
         })?;
 
     let value_offset = pattern_offset + 8 + key.len() + 4 + 8;

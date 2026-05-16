@@ -192,14 +192,13 @@ fn http_get_status(port: u16, path: &str) -> std::io::Result<u16> {
     reader.read_line(&mut line)?;
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!("malformed status line: {line:?}"),
         ));
     }
     parts[1]
         .parse::<u16>()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 fn wait_for_readyz(server: &ServerGuard) {
