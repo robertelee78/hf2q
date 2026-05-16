@@ -7195,8 +7195,8 @@ fn enrich_model_object_from_load_info(
 /// and `"external"`. Adding a third variant to `Provenance` requires
 /// updating the match arm here AND the doc string on
 /// `ModelObject::provenance`.
-fn provenance_label(p: &crate::serve::provenance::Provenance) -> &'static str {
-    use crate::serve::provenance::Provenance;
+fn provenance_label(p: &crate::core::provenance::Provenance) -> &'static str {
+    use crate::core::provenance::Provenance;
     match p {
         Provenance::Hf2q { .. } => "hf2q",
         Provenance::External => "external",
@@ -7365,7 +7365,7 @@ mod tests {
         use crate::serve::load_info::{
             ArchFamily, ChatTemplateSource, LoadInfo, MoeShape, TokenizerSource,
         };
-        use crate::serve::provenance::Provenance;
+        use crate::core::provenance::Provenance;
         use std::path::PathBuf;
         use std::time::Duration;
 
@@ -7418,7 +7418,7 @@ mod tests {
         use crate::serve::load_info::{
             ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource,
         };
-        use crate::serve::provenance::Provenance;
+        use crate::core::provenance::Provenance;
         use std::path::PathBuf;
         use std::time::Duration;
 
@@ -7460,7 +7460,7 @@ mod tests {
 
     #[test]
     fn provenance_label_maps_external_and_hf2q() {
-        use crate::serve::provenance::Provenance;
+        use crate::core::provenance::Provenance;
         assert_eq!(provenance_label(&Provenance::External), "external");
         assert_eq!(
             provenance_label(&Provenance::Hf2q {

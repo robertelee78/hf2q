@@ -2797,7 +2797,7 @@ fn cmd_convert(args: cli::ConvertArgs) -> Result<(), AppError> {
 
         match (main_gguf_path, mmproj_path) {
             (Some(main_p), Some(mmproj_p)) => {
-                let mmproj_sha = serve::cache::compute_file_sha256(&mmproj_p)
+                let mmproj_sha = core::sha256::compute_file_sha256(&mmproj_p)
                     .with_context(|| {
                         format!(
                             "iter-211b: failed to compute SHA-256 of mmproj at {}",

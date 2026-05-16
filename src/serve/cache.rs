@@ -68,12 +68,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::quant_select::QuantType;
+// B1.2 — sha256 helpers moved to `crate::core::sha256`.  Re-imported
+// here under their original short names so the existing call sites
+// in this file (cache writes / quantize integrity checks) need no
+// rewriting.
+use crate::core::sha256::sha256_file;
 
 /// Schema version for [`CacheManifest`].  Bumped when on-disk JSON layout
 /// changes incompatibly.
@@ -1144,35 +1149,8 @@ fn dir_total_bytes(dir: &Path) -> u64 {
 /// "compute" surface the GGUF provenance writer (ADR-005 Phase 4
 /// iter-211) emits at quantize time.
 ///
-/// ADR-005 Phase 4 iter-211 — added as the canonical 1-MiB-streaming
-/// hasher; [`sha256_file`] now delegates here so all callers (cache,
-/// auto-pipeline, Phase 3 integrity) share one implementation.
-pub fn compute_file_sha256(path: &Path) -> std::io::Result<String> {
-    let mut f = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1024 * 1024];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-/// SHA-256 of a file as lowercase hex.  Used by [`QuantEntry`] writers.
-/// Public so iter-203 (integrity check) can reuse it without re-creating
-/// yet another sha256 helper.
-///
-/// Thin `anyhow::Result`-shaped wrapper around
-/// [`compute_file_sha256`] that adds the `open: <path>` context expected
-/// by every existing caller.  Kept for back-compat with iter-203 / iter-205
-/// callsites — new code should prefer [`compute_file_sha256`] when
-/// `io::Result` is sufficient.
-pub fn sha256_file(path: &Path) -> Result<String> {
-    compute_file_sha256(path).with_context(|| format!("open: {}", path.display()))
-}
+// B1.2 — `compute_file_sha256` + `sha256_file` migrated to
+// `crate::core::sha256`.  See the import at the top of this file.
 
 // ────────────────────────────────────────────────────────────────────
 // Tests
@@ -1181,6 +1159,10 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // B1.2 — sha256 helpers moved out of this file; the tests below
+    // (compute_file_sha256_known_vector + the >1 MiB streaming-path
+    // pinning tests) consume the new location directly.
+    use crate::core::sha256::compute_file_sha256;
     use std::sync::Mutex;
     use tempfile::TempDir;
 

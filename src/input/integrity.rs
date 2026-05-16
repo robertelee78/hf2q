@@ -163,7 +163,7 @@ impl ShardIntegrity {
 /// Streams 1 MiB at a time so even 10+ GiB shards verify with a bounded
 /// 1 MiB resident buffer.  Used by [`verify_shard`] and the cache-side
 /// [`crate::serve::cache::ModelCache::verify_quantized`] (via
-/// [`crate::serve::cache::sha256_file`]).
+/// [`crate::core::sha256::sha256_file`]).
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     use std::fs::File;
     use std::io::Read;

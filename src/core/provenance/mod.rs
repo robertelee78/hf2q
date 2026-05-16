@@ -1,22 +1,20 @@
-//! ADR-005 Phase 4 iter-207 — GGUF provenance reader.
+//! GGUF provenance reader — detect whether an opened GGUF was produced
+//! by hf2q itself, and classify by metadata key contents.
 //!
-//! Detects whether an opened GGUF was produced by hf2q itself by reading
-//! three optional metadata keys from the GGUF KV section.  When present,
-//! the auto-pipeline ([`crate::serve::auto_pipeline`]) cross-verifies the
-//! GGUF's claimed source-bundle SHA-256 against the cache manifest's
-//! recorded `source_shards` (via
-//! [`crate::serve::cache::compute_source_bundle_sha256`]) and short-
-//! circuits the per-load 30 GB SHA-256 integrity re-check.  External
-//! GGUFs (llama.cpp's official quants, anything we didn't emit) carry
-//! none of the keys and continue to run [`crate::serve::cache::ModelCache::verify_quantized`]
-//! exactly as W71 / iter-203 designed.
+//! Migrated 2026-05-16 from `src/serve/provenance.rs` as part of the
+//! v0.1.0 workspace split (B1.2).  The old path is a `#[deprecated]`
+//! re-export shim — see `src/serve/provenance.rs`.  Source-bundle
+//! sha256 computation (which lives next to `SourceShard`) stays in
+//! `src/serve/cache.rs` for now and migrates here at B1.3 once
+//! `ShardIntegrity` moves to `crate::core::integrity` (the adapter
+//! `SourceShard::from_integrity` needs ShardIntegrity).
 //!
-//! # Schema (three keys)
+//! ## Schema (three keys)
 //!
 //! ```text
 //! hf2q.producer_version  String  REQUIRED  e.g. "hf2q 0.1.0" — `env!("CARGO_PKG_VERSION")` prefixed.
 //! hf2q.source_sha256     String  REQUIRED  lowercase-hex SHA-256 of the canonical source-shard manifest
-//!                                          (algo: [`crate::serve::cache::compute_source_bundle_sha256`]).
+//!                                          (algo: `compute_source_bundle_sha256` in `src/serve/cache.rs`).
 //! hf2q.mmproj_sha256     String  OPTIONAL  lowercase-hex SHA-256 of the paired vision projector GGUF, if any.
 //! ```
 //!
@@ -26,17 +24,7 @@
 //! conservative — a half-stamped GGUF is treated like an external one,
 //! never short-circuiting based on incomplete provenance.
 //!
-//! # Writer side (DEFERRED — ADR-014 P7 fence)
-//!
-//! As of iter-207 no hf2q-emitted GGUF carries these keys (the writer
-//! lives in `src/backends/gguf.rs`, fenced by ADR-014 P7).  Reader-side
-//! ships clean today: `detect` returns `External` for every existing
-//! GGUF, the auto-pipeline runs `verify_quantized` exactly as before,
-//! no behaviour change.  Once ADR-014 P7 closes, a fast-follow writer
-//! iter (iter-208/9 or later) emits the keys at quantize time, and the
-//! short-circuit activates naturally on the next cache hit.
-//!
-//! # Hex normalization
+//! ## Hex normalization
 //!
 //! SHA-256 strings are accepted in either case and lowercased before
 //! comparison so a writer that emits uppercase hex (or mixed case) will
@@ -56,8 +44,8 @@ use mlx_native::gguf::GgufFile;
 pub const KEY_PRODUCER_VERSION: &str = "hf2q.producer_version";
 
 /// Canonical GGUF metadata key for the source-bundle SHA-256.  Value is
-/// the hex digest computed by
-/// [`crate::serve::cache::compute_source_bundle_sha256`].
+/// the hex digest computed by `compute_source_bundle_sha256` (currently
+/// in `src/serve/cache.rs`; moves to this module at B1.3).
 pub const KEY_SOURCE_SHA256: &str = "hf2q.source_sha256";
 
 /// Canonical GGUF metadata key for the paired mmproj SHA-256.  Optional;
@@ -69,8 +57,7 @@ pub const KEY_MMPROJ_SHA256: &str = "hf2q.mmproj_sha256";
 /// A GGUF is classified `Hf2q` only when both required keys are present
 /// and non-empty; everything else is `External`.  Down-stream short-
 /// circuit logic must additionally cross-verify
-/// [`Hf2q::source_sha256`] against the cache's
-/// [`crate::serve::cache::compute_source_bundle_sha256`] before
+/// [`Hf2q::source_sha256`] against the cache's source-bundle SHA before
 /// trusting the provenance — a hf2q-stamped GGUF whose claimed source
 /// SHA does NOT match the cache's recorded shards is treated as an
 /// integrity error, not a short-circuit.

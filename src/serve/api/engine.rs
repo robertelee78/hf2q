@@ -856,7 +856,7 @@ fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
         eos_token_ids: Vec::new(),
         bos_token_id: None,
         chat_template_source: ChatTemplateSource::None,
-        provenance: crate::serve::provenance::Provenance::External,
+        provenance: crate::core::provenance::Provenance::External,
         vision_projector: None,
         load_wall_clock: Duration::ZERO,
         resident_weight_bytes: None,
@@ -1164,13 +1164,13 @@ pub struct GemmaLoadedModel {
     pub kv_metrics_sink:
         Option<std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>>,
     /// ADR-017 §F4 — GGUF provenance captured at load time via
-    /// `crate::serve::provenance::detect(&gguf)`. Threaded into the
+    /// `crate::core::provenance::detect(&gguf)`. Threaded into the
     /// `KvSpillDescriptor` at `Engine::spawn` so the per-family hook
     /// (Phase B-dense.2) can build a strict `ModelFingerprint`
     /// namespace key for hf2q-quantized GGUFs and fall back to the
     /// legacy `(repo, quant)` key for foreign GGUFs (`Provenance::External`).
     /// Read once at spawn; not consulted afterwards.
-    pub provenance: crate::serve::provenance::Provenance,
+    pub provenance: crate::core::provenance::Provenance,
 }
 
 impl LoadedModel {
@@ -1233,10 +1233,10 @@ impl LoadedModel {
 
     /// ADR-017 §F4 — GGUF provenance for the loaded model.  Both
     /// variants capture provenance at GGUF-open time via
-    /// `crate::serve::provenance::detect(&gguf)`.  Gemma consumes it for
+    /// `crate::core::provenance::detect(&gguf)`.  Gemma consumes it for
     /// dense KV-spill namespacing today; Qwen35 stores the same fact even
     /// though its hybrid KV-spill descriptor is a later ADR-017 phase.
-    pub fn provenance(&self) -> crate::serve::provenance::Provenance {
+    pub fn provenance(&self) -> crate::core::provenance::Provenance {
         match self {
             LoadedModel::Gemma(g) => g.provenance.clone(),
             LoadedModel::Qwen35(q) => q.provenance.clone(),
@@ -1960,7 +1960,7 @@ impl GemmaLoadedModel {
         // a strict `ModelFingerprint`. External GGUFs (no provenance
         // keys) yield `Provenance::External` and the spiller falls back
         // to the legacy `(repo, quant)` namespace.
-        let provenance = crate::serve::provenance::detect(&gguf);
+        let provenance = crate::core::provenance::detect(&gguf);
 
         // Extract model id: prefer general.name, fall back to file stem.
         let model_id = gguf
@@ -2350,7 +2350,7 @@ impl Engine {
                     // spiller's family_model_fp falls back to the
                     // legacy `(repo, quant, "", "", "")` namespace.
                     let provenance = match &g.provenance {
-                        crate::serve::provenance::Provenance::Hf2q {
+                        crate::core::provenance::Provenance::Hf2q {
                             producer_version,
                             source_sha256,
                             ..
@@ -2362,7 +2362,7 @@ impl Engine {
                                     &g.chat_template,
                                 ),
                         },
-                        crate::serve::provenance::Provenance::External => {
+                        crate::core::provenance::Provenance::External => {
                             super::kv_spill_descriptor::KvSpillProvenance::default()
                         }
                     };
@@ -2392,7 +2392,7 @@ impl Engine {
                 match &loaded {
                     LoadedModel::Gemma(g) => {
                         let provenance_for_tq = match &g.provenance {
-                            crate::serve::provenance::Provenance::Hf2q {
+                            crate::core::provenance::Provenance::Hf2q {
                                 producer_version,
                                 source_sha256,
                                 ..
@@ -2404,7 +2404,7 @@ impl Engine {
                                         &g.chat_template,
                                     ),
                             },
-                            crate::serve::provenance::Provenance::External => {
+                            crate::core::provenance::Provenance::External => {
                                 super::kv_spill_descriptor::KvSpillProvenance::default()
                             }
                         };
@@ -4201,24 +4201,24 @@ fn build_lcp_key_for_request(
 ) -> crate::serve::kv_persist::lcp_registry::LcpKey {
     use crate::serve::kv_persist::format::compute_model_fingerprint;
     let (producer_version, source_sha256) = match &loaded.provenance {
-        crate::serve::provenance::Provenance::Hf2q {
+        crate::core::provenance::Provenance::Hf2q {
             producer_version,
             source_sha256,
             ..
         } => (producer_version.as_str(), source_sha256.as_str()),
-        crate::serve::provenance::Provenance::External => ("", ""),
+        crate::core::provenance::Provenance::External => ("", ""),
     };
     // External provenance ⇒ chat-template hash empty (legacy
     // fallback at gemma4_dense.rs:1318-1324: External is
     // `(repo, quant, "", "", "")` — preserves pre-iter-211 namespace
     // collisions across re-quants of the same model).
     let chat_template_hash = match &loaded.provenance {
-        crate::serve::provenance::Provenance::Hf2q { .. } => {
+        crate::core::provenance::Provenance::Hf2q { .. } => {
             super::kv_spill_descriptor::KvSpillProvenance::hash_chat_template(
                 &loaded.chat_template,
             )
         }
-        crate::serve::provenance::Provenance::External => String::new(),
+        crate::core::provenance::Provenance::External => String::new(),
     };
     let quant = loaded.quant_type.as_deref().unwrap_or("");
     let fp = compute_model_fingerprint(
@@ -8407,7 +8407,7 @@ assistant:
         assert_eq!(info.backend, "mlx-native");
         assert_eq!(info.tokenizer_source, TokenizerSource::GgufEmbedded);
         assert_eq!(info.chat_template_source, ChatTemplateSource::None);
-        assert_eq!(info.provenance, crate::serve::provenance::Provenance::External);
+        assert_eq!(info.provenance, crate::core::provenance::Provenance::External);
         assert_eq!(info.load_wall_clock, Duration::ZERO);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -9275,7 +9275,7 @@ assistant:
             context_length: Some(1024),
             quant_type: Some("Q4_0".to_string()),
             load_duration: Duration::from_millis(7),
-            provenance: crate::serve::provenance::Provenance::External,
+            provenance: crate::core::provenance::Provenance::External,
             prompt_cache: super::super::engine_qwen35::HybridPromptCache::new(),
             lcp_registry:
                 crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),

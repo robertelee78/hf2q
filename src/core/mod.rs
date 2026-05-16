@@ -42,3 +42,10 @@
 //! `src/backends/chat_templates.rs` does NOT move here; it lands in
 //! `src/serve/chat_templates.rs` (serve-only concern; only consumer is
 //! `src/serve/mod.rs`).
+
+// B1.2 landed: provenance keys + Provenance enum + detect + sha256 file
+// helpers.  `SourceShard` + `compute_source_bundle_sha256` deferred to
+// B1.3 (alongside `integrity` migration — SourceShard's `from_integrity`
+// adapter depends on ShardIntegrity from `src/input/integrity`).
+pub mod provenance;
+pub mod sha256;

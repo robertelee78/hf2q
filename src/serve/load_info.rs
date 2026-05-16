@@ -35,7 +35,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::serve::provenance::Provenance;
+use crate::core::provenance::Provenance;
 
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";

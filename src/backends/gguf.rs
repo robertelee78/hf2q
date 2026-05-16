@@ -72,15 +72,15 @@ const LARGE_MODEL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 // unit test fails — coordinated reader+writer migration becomes
 // mandatory rather than accidental.
 
-/// Mirrors [`crate::serve::provenance::KEY_PRODUCER_VERSION`].  Pinned
+/// Mirrors [`crate::core::provenance::KEY_PRODUCER_VERSION`].  Pinned
 /// here so the writer doesn't reach across into `serve::*` purely to
 /// read a string constant (the writer is otherwise free of `serve::*`
 /// dependencies — keeping it that way preserves the convert-only
 /// build path).
 pub const PROVENANCE_KEY_PRODUCER_VERSION: &str = "hf2q.producer_version";
-/// Mirrors [`crate::serve::provenance::KEY_SOURCE_SHA256`].
+/// Mirrors [`crate::core::provenance::KEY_SOURCE_SHA256`].
 pub const PROVENANCE_KEY_SOURCE_SHA256: &str = "hf2q.source_sha256";
-/// Mirrors [`crate::serve::provenance::KEY_MMPROJ_SHA256`].
+/// Mirrors [`crate::core::provenance::KEY_MMPROJ_SHA256`].
 pub const PROVENANCE_KEY_MMPROJ_SHA256: &str = "hf2q.mmproj_sha256";
 
 /// 64-char ASCII-zero placeholder for `hf2q.mmproj_sha256` (iter-211b).
@@ -5690,7 +5690,7 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
 
     use crate::serve::cache::{compute_source_bundle_sha256, SourceShard};
-    use crate::serve::provenance::{
+    use crate::core::provenance::{
         self as serve_provenance, Provenance, KEY_MMPROJ_SHA256, KEY_PRODUCER_VERSION,
         KEY_SOURCE_SHA256,
     };
@@ -6523,7 +6523,7 @@ mod tests {
         // SHA via the production helper, patch the main GGUF, and
         // verify the reader sees the SAME SHA the helper computed.
         // This is the production cmd_convert flow in miniature.
-        use crate::serve::cache::compute_file_sha256;
+        use crate::core::sha256::compute_file_sha256;
 
         let (tmp, main_path) = write_gguf_with_mmproj_placeholder();
         let mmproj_path = tmp.path().join("test-mmproj.gguf");

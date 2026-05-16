@@ -43,10 +43,11 @@ use std::process::Command;
 use anyhow::{anyhow, Context, Result};
 
 use super::cache::{
-    cache_model_path, compute_source_bundle_sha256, sha256_file, ModelCache, QuantEntry,
+    cache_model_path, compute_source_bundle_sha256, ModelCache, QuantEntry,
     SourcePointer,
 };
-use super::provenance::{self, Provenance};
+use crate::core::provenance::{self, Provenance};
+use crate::core::sha256::sha256_file;
 use super::quant_select::{select_quant, GpuInfo, QuantType};
 use crate::input::integrity::verify_repo;
 use crate::intelligence::hardware::HardwareProfile;

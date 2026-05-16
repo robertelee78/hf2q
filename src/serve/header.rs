@@ -139,7 +139,7 @@ mod tests {
         use crate::serve::load_info::{
             print_banner, ArchFamily, ChatTemplateSource, LoadInfo, MoeShape, TokenizerSource,
         };
-        use crate::serve::provenance::Provenance;
+        use crate::core::provenance::Provenance;
         use std::path::PathBuf;
         use std::time::Duration;
 

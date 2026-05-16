@@ -23,7 +23,6 @@ pub mod load_info;
 pub mod multi_model;
 pub mod parity_quality;
 #[allow(dead_code)]
-pub mod provenance;
 #[allow(dead_code)]
 pub mod quant_select;
 #[allow(dead_code)]
@@ -5438,7 +5437,7 @@ mod tests {
     use crate::serve::load_info::{
         ArchFamily, ChatTemplateSource, LoadInfo, TokenizerSource,
     };
-    use crate::serve::provenance::Provenance;
+    use crate::core::provenance::Provenance;
     use std::path::PathBuf;
     use std::time::Duration;
 

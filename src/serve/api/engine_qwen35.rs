@@ -45,7 +45,7 @@ use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape,
     TokenizerSource,
 };
-use crate::serve::provenance::{self, Provenance};
+use crate::core::provenance::{self, Provenance};
 
 use super::engine::{LoadOptions, SamplingParams};
 
@@ -102,7 +102,7 @@ pub struct Qwen35LoadedModel {
     /// Wall-clock from start to finish of `load`.
     pub load_duration: Duration,
     /// ADR-017 §F4 — GGUF provenance captured at load time via
-    /// `crate::serve::provenance::detect(&gguf)`. Stored for the common
+    /// `crate::core::provenance::detect(&gguf)`. Stored for the common
     /// `LoadedModel::provenance()` surface; Qwen35 KV-spill remains
     /// descriptor-pending because the cache is hybrid.
     pub provenance: Provenance,
@@ -1103,20 +1103,20 @@ fn build_lcp_key_for_qwen35(
 ) -> crate::serve::kv_persist::lcp_registry::LcpKey {
     use crate::serve::kv_persist::format::compute_model_fingerprint;
     let (producer_version, source_sha256) = match &qwen.provenance {
-        crate::serve::provenance::Provenance::Hf2q {
+        crate::core::provenance::Provenance::Hf2q {
             producer_version,
             source_sha256,
             ..
         } => (producer_version.as_str(), source_sha256.as_str()),
-        crate::serve::provenance::Provenance::External => ("", ""),
+        crate::core::provenance::Provenance::External => ("", ""),
     };
     let chat_template_hash = match &qwen.provenance {
-        crate::serve::provenance::Provenance::Hf2q { .. } => {
+        crate::core::provenance::Provenance::Hf2q { .. } => {
             super::kv_spill_descriptor::KvSpillProvenance::hash_chat_template(
                 &qwen.chat_template,
             )
         }
-        crate::serve::provenance::Provenance::External => String::new(),
+        crate::core::provenance::Provenance::External => String::new(),
     };
     let quant = qwen.quant_type.as_deref().unwrap_or("");
     let fp = compute_model_fingerprint(
@@ -4117,7 +4117,7 @@ mod tests {
             context_length: Some(1024),
             quant_type: Some("Q4_K".to_string()),
             load_duration: std::time::Duration::from_millis(1),
-            provenance: crate::serve::provenance::Provenance::External,
+            provenance: crate::core::provenance::Provenance::External,
             prompt_cache: HybridPromptCache::new(),
             lcp_registry:
                 crate::serve::kv_persist::lcp_registry::LcpRegistry::new(1),

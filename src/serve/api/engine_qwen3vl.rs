@@ -41,7 +41,7 @@ use crate::serve::forward_prefill::{DeepstackInjection, SoftTokenInjection};
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, TokenizerSource,
 };
-use crate::serve::provenance::{self, Provenance};
+use crate::core::provenance::{self, Provenance};
 use crate::serve::sampler_pure::{self, SamplingParams as SamplerPureParams};
 
 use super::engine::{GenerationResult, LoadOptions, SamplingParams};
