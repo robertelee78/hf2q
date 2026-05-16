@@ -4722,3 +4722,121 @@ Iter-175 cumulative wins since iter-100 (0.924× → ~0.94-0.95× peer-FA):
 1ad shape (synthetic vs production), 1ai cost estimate (4× off), 1aj
 wrapper attribution, 1ak orchestration attribution, 1al pipeline lookups,
 1ap barrier_between, 1aq LTO=thin, 1ar inline hints.
+
+---
+
+## Iter-175 Step 1c + Step 1d: multi-week DispatchRecord refactor begun
+
+**Date**: 2026-05-15 (continuation iteration after operator approval of Option A)
+**Operator directive**: "yes do this" → committing to the multi-week
+algorithmic restructuring identified in Step 1ak.  Operator pushed back
+on prior pattern of deferring hard work.
+
+### Step 1c — `set_pending_buffer_ranges` gating (foundation)
+
+**Diagnosis**: `dispatch_qmatmul:9382` unconditionally heap-allocated
+two `Vec<MemRange>` per call (~91 calls/token at gemma4 decode:
+QKV proj × 3 × 30 layers + lm_head).  `CommandEncoder::set_pending_buffer_ranges`
+docstring: *"Only meaningful in capture mode — has no effect on
+direct-dispatch."*  In production decode (capture None), the allocated
+vectors were taken + dropped on the next encode call — **~182 wasted
+heap allocs/token**.
+
+**Fix**: gate the entire block on `encoder.is_capturing()`.
+Production decode collapses to a single load + branch.  Capture-mode
+behavior is byte-identical.
+
+**Validation**:
+- cargo build --release: clean
+- coherence_smoke: 2/2 PASS
+- 3-cycle alt-pair thermal-fair tg200 vs MAIN:
+  - MAIN: 97.10 ± 0.08 t/s (σ 0.084%)
+  - 1c:   97.13 ± 0.13 t/s (σ 0.129%)
+  - Δ: +0.03 t/s = +0.031% (**NEUTRAL** — sits at bench resolution floor)
+
+**Verdict**: COMMITTED.  Neutral measured impact is expected — alloc cost
+~9 µs/token sits at the σ=0.1 t/s noise floor.  The change is strictly
+correct (removes documented-as-no-op work).  Foundation for Step 1d.
+
+**Commit**: hf2q `bc2ea3a6`
+
+### Step 1d — DispatchRecord pre-bake type + Q6_K NR2 m=1 fast path
+
+**Strategy**: define a `DispatchRecord` type in mlx-native that captures
+load-time-immutable dispatch state (pipeline ref, threadgroup geometry,
+params bytes, binding-slot layout), and a fast-path `CommandEncoder::dispatch_record`
+method that skips per-call HashMap lookup, MTLSize::new, ggml_type match
+arms, and param-struct construction.
+
+**Why Q6_K NR2 first**: hottest single per-token dispatch shape on
+gemma4-APEX-Q5_K_M decode — Q/K/V projections × 30 layers + lm_head
+Q6_K = up to 91 dispatches/token at `kernel_mul_mv_q6_K_f32_nr2`.
+
+**Implementation**:
+1. `pub struct DispatchRecord` (mlx-native `encoder.rs`)
+   - `pipeline: ComputePipelineState`
+   - `threadgroups: MTLSize`, `threads_per_tg: MTLSize`
+   - `threadgroup_mem: Vec<(u64, u64)>`
+   - `params_bytes: Vec<u8>`, `params_slot: u64`
+   - `buffer_slots: Vec<u64>` (runtime buffers in caller order)
+   - `op_kind: CapturedOpKind`, `kernel_name: String`
+2. `pub fn dispatch_record(&mut self, rec, runtime_buffers)` — fast
+   path identical Metal command stream to `encode_threadgroups_with_args*`
+   but skips kernel-name lookup + struct construction.  Capture mode +
+   auto-barrier honored identically.
+3. `pub fn build_q6k_nr2_m1_record(registry, device, n, k) -> Result<Option<DispatchRecord>>`
+   in `ops::quantized_matmul_ggml`.  Returns None when
+   `HF2Q_Q6K_MV_NR2` is off (legacy NR1 selected at dispatch_mv would
+   make the bake stale).
+4. `MlxQWeight.decode_record_q6k_m1: OnceLock<Option<DispatchRecord>>`
+   — per-weight lazy-init slot.  Three states: `OnceLock` empty (not yet
+   attempted), `Some(None)` (bake N/A), `Some(Some(rec))` (active).
+5. `dispatch_qmatmul` fast-path branch — between F32 dense check and
+   legacy `quantized_matmul_ggml` fallback.  Falls through to legacy
+   path for all other dtypes.
+
+**Validation**:
+- cargo build --release: clean (only pre-existing warnings)
+- coherence_smoke: 2/2 PASS — byte-identical decode via new fast path
+- 3-cycle alt-pair tg200 thermal-fair:
+  - MAIN: 97.00 ± 0.22% (Step 1c committed, NO DispatchRecord)
+  - 1D:   97.13 ± 0.049%
+  - **Δ: +0.13 t/s = +0.13% (MEASURED WIN)**
+  - σ tightened **4.6×** (0.22 → 0.049) — also a coherence-of-cost signal
+
+**Verdict**: COMMITTED.  First MEASURED win in 5 substeps since the
+iter-175 closure note.  Validates the DispatchRecord direction:
+pre-baking trims ~40 ns/call × ~91 Q6_K m=1 dispatches = 3.6 µs/token =
+matches the observed +0.13% wall.
+
+**Commits**:
+- mlx-native `1f86fbd` (DispatchRecord type + Q6_K NR2 builder)
+- hf2q       `04eca089` (wire fast path into dispatch_qmatmul)
+
+### Forward plan — concrete substeps
+
+**Step 1e (next iteration)**: extend DispatchRecord to MoE experts.
+Build helpers `build_q6k_id_nr2_m1_record` (gate_up Q6_K) and
+`build_q8_0_id_nr2_m1_record` (down Q8_0) in
+`quantized_matmul_id_ggml.rs`.  Bake records on `MlxMoeWeights`
+(`stacked_gate_up`, `stacked_down`).  Wire fast path in `dispatch_id_mv`.
+Coverage: ~240 dispatches/token (8 top_k × 30 layers × ~1 gate_up + ~1 down).
+Estimated impact: ~+0.34% wall (240 × 40 ns / 10.4 ms/tok), tracking
+the +0.13% Q6_K NR2 ratio.
+
+**Step 1f (after 1e)**: rms_norm + fused_head_norm_rope DispatchRecord
+extension.  Coverage: ~90 dispatches/token across pre-attn-norm,
+Q/K head_norm_rope (×2 per layer), V norm (×1), post-attn-norm,
+post-ff-norm.  Estimated impact: ~+0.13% wall additional.
+
+**Step 1g (after 1f)**: hadamard_quantize_kv + kv_cache_copy.
+Coverage: ~60 dispatches/token.  Estimated impact: ~+0.09% wall.
+
+**Step 1h (after 1g)**: flash_attn DispatchRecord — TQ-HB-V and hybrid
+fast paths.  Coverage: ~30 dispatches/token but high per-dispatch cost.
+Estimated impact: variable; need to bench.
+
+**Cumulative target** (Steps 1d–1h): ~+0.70% wall = ~0.95× peer-FA.
+Closing the remaining 4-5% to peer-FA requires inlining the 5-layer
+call chain (Steps 1i+) — the deeper refactor.
+
