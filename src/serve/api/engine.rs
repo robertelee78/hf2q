@@ -4115,10 +4115,18 @@ fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
     // the embedding-mode reset at forward_prefill.rs:2216-2218 (same root
     // cause: a small-budget prefill poisons capacity for subsequent
     // calls).
+    //
+    // Codex review of `dbbd6009` (2026-05-17) flagged `dense_kvs_snapshot_for_lcp`
+    // as ALSO needing clearing: with HF2Q_KV_LCP_RESUME=1 + HF2Q_USE_DENSE=1,
+    // forward_prefill_with_soft_tokens_resume populates this snapshot and
+    // the post-prefill store sites (engine.rs:5058, :7615) `take()` it
+    // under the real prompt's LCP key.  A leftover BOS-sized warmup
+    // snapshot would be installed against the FIRST real request's key.
     loaded.weights.dense_kvs = None;
     loaded.weights.dense_sdpa_tmp = None;
     loaded.weights.leg_hb_encoded = None;
     loaded.weights.hybrid_kv = None;
+    loaded.weights.dense_kvs_snapshot_for_lcp = None;
     tracing::info!(
         "hf2q-engine warmup complete in {:.0}ms",
         started.elapsed().as_secs_f64() * 1000.0
