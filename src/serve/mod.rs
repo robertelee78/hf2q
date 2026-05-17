@@ -1591,7 +1591,16 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         // greedy traps; a trip here under sampling is almost certainly a
         // legitimate repetition pattern that the user opted into.
         if !args.ignore_eos && !qwen35_generate_uses_sampling(&args) {
-            if let Some((ngram, repeats)) = detect_greedy_repetition_loop(&decoded_tokens) {
+            // Smart detector: structural punctuation-only cycles (markdown
+            // table separators etc.) need more reps before bailing than
+            // alphanumeric content loops (real model degeneracy).  Decode
+            // the candidate cycle via the tokenizer to classify.
+            let detect = detect_greedy_repetition_loop_with_text(&decoded_tokens, |cycle| {
+                tokenizer
+                    .decode(cycle, /*skip_special_tokens=*/ false)
+                    .unwrap_or_default()
+            });
+            if let Some((ngram, repeats)) = detect {
                 tracing::info!(
                     "Gemma decode: greedy n-gram repetition detected (last {} tokens \
                      repeated {} times); stopping. Pass --temperature 0.8 or \
@@ -2039,45 +2048,101 @@ fn maybe_run_qwen35_prefill_sweep(
 /// and the ones before that, and so on for `REPEAT_MIN_OCCURRENCES` total
 /// copies. If all match, report a true loop.
 fn detect_greedy_repetition_loop(decoded_tokens: &[u32]) -> Option<(usize, usize)> {
-    // 2026-05-16: bulletproofed per BUG-gemma-cli-ignores-sampling-flags
-    // findings.  The prior fixed set {8,12,16,20,24} × ≥4 reps silently
-    // missed any cycle length outside the set (e.g. 18 / 22 / 5).  User
-    // observed a 4-term cycle (Miticidal / Fungicidal / Herbicidal /
-    // Insecticidal Agent) that ran to --max-tokens producing garbage.
-    //
-    // Replacement contract: detect EVERY consecutive n-gram cycle for
-    // n ∈ [2, 64], firing after 3 occurrences (down from 4).  Cost per
-    // call is O(MAX_NGRAM² × MIN_OCCURRENCES) ≈ 12k integer compares —
-    // negligible vs decode-token GPU work.  The lowest-matching n wins,
-    // matching the prior contract's "smallest cycle" return semantics.
-    //
-    // Doesn't tolerate intra-cycle drift; an entropy-window detector is
-    // the natural next refinement if real-world drift cases surface.
+    detect_greedy_repetition_loop_with_text(decoded_tokens, |_| String::new())
+}
+
+/// Smart loop detector. Same cycle-discovery as the basic variant, but
+/// when a candidate cycle is found, the closure decodes it to text and
+/// the rep-threshold scales with the cycle's "content character ratio":
+/// punctuation/whitespace-dominant cycles (e.g. legitimate markdown
+/// table separator `| :--- | :--- | :--- |`) need MORE reps before
+/// bailing; alphanumeric-dominant cycles (real model loops like
+/// "Miticidal Agent, Fungicidal Agent, ...") fire at the lower threshold.
+///
+/// 2026-05-16 (BUG-coherence iter): the Phase C detector at MIN=3 fires
+/// on legitimate markdown table separators (3-column `| :--- | :--- |
+/// :--- |` cycles 3 times) — observed live on probe_long after the
+/// batched-prefill workaround restored coherence.  Raising the bar
+/// uniformly to 4+ misses real 18-token text loops; instead, raise it
+/// only when the cycle is structurally repetitive (low letter content).
+///
+/// Content threshold: `alpha_ratio < 0.30` → require 8 reps (vs default 3).
+/// Empirically this catches markdown separators (`|`, `:`, `-`, ` ` only
+/// → 0% letters) without breaking real-text loop detection (Miticidal
+/// Agent etc. is ≥ 70% letters).
+fn detect_greedy_repetition_loop_with_text<F>(
+    decoded_tokens: &[u32],
+    mut decode_cycle: F,
+) -> Option<(usize, usize)>
+where
+    F: FnMut(&[u32]) -> String,
+{
     const MIN_NGRAM: usize = 2;
     const MAX_NGRAM: usize = 64;
-    const MIN_OCCURRENCES: usize = 3;
+    const MIN_OCCURRENCES_CONTENT: usize = 3;
+    const MIN_OCCURRENCES_STRUCTURAL: usize = 8;
+    const STRUCTURAL_ALPHA_THRESHOLD: f32 = 0.30;
 
     let n = decoded_tokens.len();
     for ngram in MIN_NGRAM..=MAX_NGRAM {
-        let need = ngram * MIN_OCCURRENCES;
-        if n < need {
-            // Window not yet full enough for this n-gram size.
-            // Sizes larger than n/3 will also miss; safe to continue
-            // since the loop is bounded by MAX_NGRAM.
+        // First check whether the cycle repeats at all at the lower (content)
+        // threshold.  If yes, then decide threshold based on cycle content.
+        let need_content = ngram * MIN_OCCURRENCES_CONTENT;
+        if n < need_content {
             continue;
         }
-        let tail = &decoded_tokens[n - need..];
-        let key = &tail[need - ngram..];
+        let tail = &decoded_tokens[n - need_content..];
+        let key = &tail[need_content - ngram..];
         let mut all_match = true;
-        for i in 0..MIN_OCCURRENCES {
+        for i in 0..MIN_OCCURRENCES_CONTENT {
             let start = i * ngram;
             if &tail[start..start + ngram] != key {
                 all_match = false;
                 break;
             }
         }
-        if all_match {
-            return Some((ngram, MIN_OCCURRENCES));
+        if !all_match {
+            continue;
+        }
+
+        // Cycle confirmed at MIN_OCCURRENCES_CONTENT.  Classify content.
+        let cycle_text = decode_cycle(key);
+        let total_chars = cycle_text.chars().count() as f32;
+        // When no decoder is supplied (e.g. unit tests or callers without
+        // a tokenizer), default to content classification — fire at the
+        // lower threshold so we don't miss real loops.  Only treat as
+        // STRUCTURAL when we have actual decoded text AND its alphabetic
+        // content is below the threshold.
+        if total_chars == 0.0 {
+            return Some((ngram, MIN_OCCURRENCES_CONTENT));
+        }
+        let alpha = cycle_text.chars().filter(|c| c.is_alphabetic()).count() as f32;
+        let alpha_ratio = alpha / total_chars;
+
+        if alpha_ratio >= STRUCTURAL_ALPHA_THRESHOLD {
+            // Content-bearing cycle (real text loop) — fire at the
+            // lower threshold immediately.
+            return Some((ngram, MIN_OCCURRENCES_CONTENT));
+        }
+
+        // Structural / punctuation-dominant cycle (table separator, list
+        // bullets, dash runs, etc.).  Require MIN_OCCURRENCES_STRUCTURAL
+        // before bailing — these are usually legitimate output.
+        let need_structural = ngram * MIN_OCCURRENCES_STRUCTURAL;
+        if n < need_structural {
+            continue;
+        }
+        let tail2 = &decoded_tokens[n - need_structural..];
+        let mut all_match2 = true;
+        for i in 0..MIN_OCCURRENCES_STRUCTURAL {
+            let start = i * ngram;
+            if &tail2[start..start + ngram] != key {
+                all_match2 = false;
+                break;
+            }
+        }
+        if all_match2 {
+            return Some((ngram, MIN_OCCURRENCES_STRUCTURAL));
         }
     }
     None
@@ -2416,7 +2481,12 @@ where
         }
 
         // N-gram repetition guard.
-        if let Some((ngram, repeats)) = detect_greedy_repetition_loop(&decoded_tokens) {
+        // Use the text-aware variant so legitimate structural repetition
+        // (markdown table separators, list bullets, dash runs) requires
+        // more reps before bailing than alphanumeric-content loops.
+        if let Some((ngram, repeats)) =
+            detect_greedy_repetition_loop_with_text(&decoded_tokens, |cycle| decode_text(cycle))
+        {
             return Ok(DecodeLoopOutcome {
                 generated,
                 stop_reason: DecodeStopReason::RepetitionLoop { ngram, repeats },
@@ -5455,7 +5525,8 @@ fn cmd_parity_capture(
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_greedy_repetition_loop, find_special_token_stop, maybe_print_serve_banner,
+        detect_greedy_repetition_loop, detect_greedy_repetition_loop_with_text,
+        find_special_token_stop, maybe_print_serve_banner,
         llama_cpp_special_token_id_for_model, render_jinja_template,
         resolve_enable_thinking, run_decode_loop,
         should_enable_kv_persist, DecodeStopReason,
@@ -6089,6 +6160,68 @@ mod tests {
         }
         let result = detect_greedy_repetition_loop(&toks);
         assert!(result.is_some(), "16-token cycle should be detected");
+    }
+
+    #[test]
+    fn detect_repetition_smart_skips_structural_cycle_at_3_reps() {
+        // Markdown table separator: cycle decodes to "| :--- " (all
+        // punctuation/whitespace).  At MIN_OCCURRENCES_CONTENT=3 the
+        // basic detector would bail; the smart detector must NOT bail
+        // when alpha_ratio < 0.30 — it should require 8+ reps instead.
+        //
+        // Real-world failure mode observed on probe_long after the
+        // batched-prefill workaround restored coherence: model genuinely
+        // emits a 3-column markdown separator (3 reps) and was caught
+        // as a false positive by the basic detector.
+        let cycle: [u32; 4] = [101, 102, 103, 104];
+        let mut toks: Vec<u32> = (0..30).collect();
+        for _ in 0..3 {
+            toks.extend_from_slice(&cycle);
+        }
+        let result = detect_greedy_repetition_loop_with_text(&toks, |_cycle| {
+            // Simulate tokenizer.decode → "| :--- " (no letters).
+            "| :--- ".to_string()
+        });
+        assert!(
+            result.is_none(),
+            "structural cycle (alpha_ratio=0) at only 3 reps should NOT fire"
+        );
+
+        // 8+ reps should still fire — at that point even a structural
+        // cycle is suspicious.
+        let mut toks2: Vec<u32> = (0..30).collect();
+        for _ in 0..8 {
+            toks2.extend_from_slice(&cycle);
+        }
+        let result2 = detect_greedy_repetition_loop_with_text(&toks2, |_cycle| {
+            "| :--- ".to_string()
+        });
+        assert!(
+            result2.is_some(),
+            "structural cycle at 8 reps should fire (genuine pad-loop)"
+        );
+        let (_ng, reps) = result2.unwrap();
+        assert!(reps >= 8, "structural threshold should be ≥ 8 reps");
+    }
+
+    #[test]
+    fn detect_repetition_smart_fires_on_content_cycle_at_3_reps() {
+        // Real content cycle ("Miticidal Agent, Fungicidal Agent, ..."):
+        // alpha-rich, MUST fire at 3 reps.
+        let cycle: [u32; 5] = [201, 202, 203, 204, 205];
+        let mut toks: Vec<u32> = (0..30).collect();
+        for _ in 0..3 {
+            toks.extend_from_slice(&cycle);
+        }
+        let result = detect_greedy_repetition_loop_with_text(&toks, |_cycle| {
+            "Miticidal Agent, ".to_string()
+        });
+        assert!(
+            result.is_some(),
+            "alphanumeric content cycle at 3 reps MUST fire"
+        );
+        let (_ng, reps) = result.unwrap();
+        assert_eq!(reps, 3, "content threshold should be 3 reps");
     }
 
     #[test]
