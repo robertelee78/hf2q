@@ -12,14 +12,29 @@ Apple Silicon. **No C++ at build, test, or runtime** (ADR-008
 sovereignty rule); the inference path runs entirely on `mlx-native`
 Metal kernels we own end-to-end.
 
-> **Performance** — on M5 Max, Gemma-4 26B decode runs **1.05× peer-FA
-> AHEAD** of `llama.cpp` across `tg200 / tg2000 / tg5000` regimes
-> (same-session apples-to-apples, σ < 1%); Qwen 3.6 35B-A3B
-> APEX-Q5_K_M ships at **1.34× peer-FA**; batched-prefill
-> Flash-Attention is **1.07–1.09× AHEAD** at `pp1800–pp3700`;
-> TurboQuant 8-bit KV cache gives **3.94× memory savings** at 32K
-> context vs F32 baseline.  Methodology + per-regime numbers in
-> [`docs/peer-parity-baselines-2026-04-26.md`](docs/peer-parity-baselines-2026-04-26.md).
+> **Performance** — on M5 Max at HEAD (2026-05-17 re-bench, 3-run
+> median, default config including the HF2Q_NO_FA hybrid-attn fix from
+> commit `03328ee5`):
+> * **Gemma-4 26B-A4B Q6_K decode** — `tg200` 105.2 t/s vs llama.cpp
+>   `-fa 1` 104.32 t/s (**1.01× peer-FA AHEAD**); `tg2000` 93.5 t/s vs
+>   96.69 t/s (**0.97× peer-FA**).
+> * **Qwen 3.6 35B-A3B APEX-Q5_K_M decode** — `tg200` 130.6 t/s vs
+>   llama.cpp `-fa 1` 101.31 t/s (**1.29× peer-FA AHEAD**).
+> * **Gemma-4 prefill** — `pp1800` 2734 t/s vs llama.cpp 2837 t/s
+>   (**0.96× peer-FA**); `pp3700` 2703 t/s vs 2181 t/s (**1.24×
+>   peer-FA AHEAD**) — hf2q's prefill rate drops only ~1% from
+>   pp1800→pp3700 while llama's drops ~23%, so the cross-over is in
+>   the lower part of this range.
+> * **TurboQuant 8-bit KV cache** — Qwen 3.6 35B-A3B at 32K context:
+>   340 MiB vs 1.34 GiB F32 baseline = **3.94× memory savings**
+>   (ADR-027 iter-34, regression-pinned by
+>   `tests/qh35_no_f32_kv_alloc_with_tq_kv.rs`).
+>
+> Methodology references in
+> [`docs/peer-parity-baselines-2026-04-26.md`](docs/peer-parity-baselines-2026-04-26.md);
+> the historical 1.05× decode + 1.07-1.09× prefill claims (ADR-029
+> iter-175) were measured at a pre-HF2Q_NO_FA HEAD and do not hold
+> at current main per the re-bench above.
 
 | | |
 |---|---|
@@ -83,10 +98,11 @@ cargo build --release
 ./target/release/hf2q --help
 ```
 
-The build path-pins a local checkout of
-[`mlx-native`](https://crates.io/crates/mlx-native) (`Cargo.toml:53`).
-For a clean checkout without the sibling repo, replace the `path =
-"/opt/mlx-native"` override with `mlx-native = "0.8"` from crates.io.
+The default `mlx-native = "0.9"` declaration at `Cargo.toml:105` resolves
+from `crates.io`.  For local mlx-native development place a path
+override in a gitignored `.cargo/config.toml` (template at
+`Cargo.toml:217+`) — out-of-the-box `cargo build` does NOT path-pin
+to a sibling checkout.
 
 `cargo build` requires:
 
@@ -124,7 +140,7 @@ Run `hf2q <command> --help` for the full flag surface.
 ### Quantization variants
 
 The convert pipeline supports four families of `--quant` values (the
-canonical `QuantMethod` enum lives at `src/cli.rs:1166`):
+canonical `QuantMethod` enum lives at `src/cli.rs:1167`):
 
 | Family | Variants | Notes |
 |---|---|---|
@@ -194,33 +210,41 @@ HF │ input/       │ -> │ models/<arch>/   │ -> │ backends/    │
 
 ## Performance
 
-Measured on M5 Max at HEAD against `llama.cpp` peer with identical
-GGUFs (thermal-fair alt-pair protocol, `σ < 1%` per arm — see
-`docs/peer-parity-baselines-2026-04-26.md` for the methodology):
+Re-bench at HEAD 2026-05-17 on M5 Max against `llama.cpp` peer
+(build `389ff61d7`, `-fa 1`) with identical GGUFs.  3-run median;
+hf2q uses default config including the HF2Q_NO_FA hybrid-attn
+fix from commit `03328ee5`.  See
+[`docs/peer-parity-baselines-2026-04-26.md`](docs/peer-parity-baselines-2026-04-26.md)
+for the full thermal-fair alt-pair protocol used by ADR-029 baselines.
 
-- **Decode** — `1.05× peer-FA` (AHEAD) on Gemma-4 across
-  `tg200 / tg2000 / tg5000` regimes (ADR-029 iter-175 post Step 1i/1j.2;
-  same-session apples-to-apples thermal-fair).  Step 1i (parallel
-  SG-tournament top-K in fused_moe_routing) closed the prior 0.93×
-  gap; Step 1j.2 (V3 batched softmax tree-reduce fix) restored
-  byte-identity with the V2 baseline — same model outputs at greedy
-  decode, +10.96% measured speed.  Regression-protected by 8 parity
-  tests (V2/V3 unbatched + V3 batched) + coherence_smoke + 200-token
-  byte-identity verification.
-- **Prefill** — `1.07–1.09× peer-FA` (AHEAD) at `pp1800–pp3700`
-  (ADR-029 iter-160), driven by the ADR-011 Flash-Attention kernel +
-  ADR-015 batched-prefill path.
-- **KV-cache footprint** — TurboQuant 8-bit (ADR-007) gives ~2× memory
-  savings vs F16. On Qwen3.6 35B-A3B at 32K context, the Hadamard-
-  packed TQ path drops F32 K/V allocations entirely (ADR-027 iter-34),
-  delivering **3.94×** savings against the F32-only baseline (340 MiB
-  vs 1.34 GiB).
-- **Qwen3.6 35B-A3B-APEX-Q5_K_M** ships at `~1.34× peer-FA` decode
-  (ADR-028 iter-308→324, sustained at 1000-tok). Same kernel stack
-  + ADR-029 Step 1i/1j.2 lands Gemma-4 at `~1.05× peer-FA` AHEAD
-  across all decode regimes — the prior arch-specific gap was
-  diagnosed (MoE routing's serial top-K phase) and closed via
-  parallel SG-tournament + byte-identity restoration.
+- **Decode (Gemma-4 26B-A4B Q6_K)** — `tg200` **1.01× peer-FA AHEAD**
+  (hf2q 105.2 t/s vs llama-bench 104.32 t/s); `tg2000` **0.97× peer-FA**
+  (hf2q 93.5 t/s vs 96.69 t/s).  The historical ADR-029 iter-175
+  `~1.05× AHEAD across tg200/tg2000/tg5000` claim was measured at a
+  pre-HF2Q_NO_FA HEAD; re-bench at current main shows it holding at
+  tg200 only.
+- **Prefill (Gemma-4 26B)** — crossover regime: `pp1800` **0.96×
+  peer-FA** (hf2q 2734 t/s vs llama-bench 2837 t/s); `pp3700`
+  **1.24× peer-FA AHEAD** (hf2q 2703 t/s vs 2181 t/s).  hf2q's
+  prefill rate drops ~1% from pp1800→pp3700 while llama's drops
+  ~23% (FA tile-skip helps less at longer K), so the cross-over
+  sits early in this range.  The historical `1.07-1.09× AHEAD`
+  claim across the whole range no longer holds at current main.
+- **Decode (Qwen 3.6 35B-A3B APEX-Q5_K_M)** — `tg200` **1.29× peer-FA
+  AHEAD** (hf2q 130.6 t/s vs 101.31 t/s).  Historical ADR-028
+  `~1.34×` measurement is within ~4% of current re-bench (thermal /
+  build drift).
+- **KV-cache footprint** — TurboQuant 8-bit (ADR-007 + ADR-027 iter-34)
+  drops F32 K/V allocations entirely on Qwen 3.6 35B-A3B at 32K
+  context, **340 MiB vs 1.34 GiB F32-only baseline = 3.94× memory
+  savings**.  This is the only major performance claim with an
+  in-tree regression pin (`tests/qh35_no_f32_kv_alloc_with_tq_kv.rs`).
+
+Regression protection for the decode path: 8 parity tests
+(V2/V3 unbatched + V3 batched), `coherence_smoke` (2 cells),
+200-token byte-identity verification.  No automated bench-vs-peer
+gate is currently in CI — these numbers are operator-driven
+re-bench, not continuously verified.
 
 Note: DWQ at the production-default `perturb=1.0` is mathematically
 equivalent to the underlying K-quant baseline (ADR-020 finding
@@ -246,9 +270,9 @@ src/
 ├── quality/       cosine / KL / perplexity scorers
 ├── quantize/      Q-format codecs (legacy / K-quant / DWQ / mixed)
 └── serve/         OpenAI HTTP API, block-prefix KV cache, multi-model
-docs/              ADRs 004–030 + per-feature runbooks
+docs/              ADRs 004–031 + per-feature runbooks
 tests/             77 integration test files
-scripts/           104 bench / repro / runbook scripts
+scripts/           109 bench / repro / runbook scripts
 ```
 
 ## Development
@@ -272,9 +296,10 @@ catalog + smoke prompt before any forward-pass code lands.
 - `docs/converting-qwen35.md` — Qwen 3.5/3.6 specifics.
 - `docs/operating-kv-cache.md` — TurboQuant KV cache operator guide.
 - `docs/operator-env-vars.md` — every `HF2Q_*` env var, what it gates.
-- `docs/ADR-004…ADR-030` — every architectural decision, with rationale and verification status.
+- `docs/ADR-004…ADR-031` — every architectural decision, with rationale and verification status.
 
 ## License
 
-Apache-2.0. See `Cargo.toml` for crate metadata and
+Dual-licensed under Apache-2.0 OR MIT (`Cargo.toml` `license` field;
+`LICENSE-APACHE` and `LICENSE-MIT` files at repo root).  See
 `docs/ADR-008-candle-divorce.md` for the dependency philosophy.
