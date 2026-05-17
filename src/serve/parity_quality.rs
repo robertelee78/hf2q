@@ -744,6 +744,10 @@ fn synthesize_cosine(
     // Per-layer cosines bucketed for diagnostic stderr-only print (gate-h
     // attribution).  Investigation-only output: not in the JSON envelope.
     let mut cosines_per_layer: Vec<Vec<f32>> = vec![Vec::new(); num_layers];
+    // ADR-032 followup 2026-05-17: track (step, cosine) per layer to localize
+    // outliers.  Mean+min alone don't say WHICH position diverged.
+    let mut cosines_per_layer_with_step: Vec<Vec<(usize, f32)>> =
+        vec![Vec::new(); num_layers];
 
     for layer_idx in 0..num_layers {
         let nh = mlx_w.num_attention_heads;
@@ -786,6 +790,7 @@ fn synthesize_cosine(
             if cs.is_finite() {
                 cosines.push(cs);
                 cosines_per_layer[layer_idx].push(cs);
+                cosines_per_layer_with_step[layer_idx].push((step, cs));
             }
         }
     }
@@ -801,9 +806,16 @@ fn synthesize_cosine(
         }
         let mean = cs.iter().copied().map(|x| x as f64).sum::<f64>() / cs.len() as f64;
         let min = cs.iter().copied().fold(f32::INFINITY, f32::min);
+        // ADR-032 followup 2026-05-17: print step-of-min so outlier
+        // positions can be located without re-running with persistent dumps.
+        let (min_step, _) = cosines_per_layer_with_step[layer_idx]
+            .iter()
+            .copied()
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or((usize::MAX, f32::INFINITY));
         eprintln!(
-            "  layer {:02}: mean={:.6}  min={:.6}  n={}",
-            layer_idx, mean, min, cs.len()
+            "  layer {:02}: mean={:.6}  min={:.6}  min_step={}  n={}",
+            layer_idx, mean, min, min_step, cs.len()
         );
     }
 

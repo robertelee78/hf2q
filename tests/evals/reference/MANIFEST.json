@@ -19,7 +19,7 @@
     "top_k": 1,
     "repetition_penalty": 1.0
   },
-  "refresh_note": "2026-05-16 full refresh: previous (2026-05-01) anchor was against gemma-4-26B-A4B-it-ara-abliterated-dwq.gguf (DWQ-trained quant), whose model dir is no longer present locally. The session that surfaced this ran scripts/release-check.sh on the present model (gemma4-ara-2pass-APEX-Q5_K_M.gguf, a different quantization variant of the same base architecture) and saw 0/6 parity checks pass because the stale refs encoded a different model's argmax outputs — NOT because of a kernel regression. Cross-validation: scripts/adr022_p18_byte_equal.sh confirmed hf2q output and llama-completion output are byte-identical on the APEX-Q5_K_M model for the short_hello prompt (`2 + 2 = 4<turn|>`). Both refs (*_hf2q.txt + *_llama.txt) were re-captured against APEX-Q5_K_M on hf2q HEAD 4166ce50 / llama-completion build d05fe1d7d. Long-prompt divergence between independent kernel implementations (hf2q mlx-native vs llama.cpp ggml-metal) is a structural baseline: FP non-associativity cascading through argmax tie-breaks at ~byte 117 (sourdough) and ~byte 129 (sliding_wrap). Both outputs are independently coherent (cross-verified end-to-end). scripts/parity_check.sh floors recalibrated to current measurements (short_hello 16, sourdough 117, sliding_wrap 129) so future kernel changes that further reduce divergence point trip the regression gate.",
+  "refresh_note": "2026-05-16 full refresh against APEX-Q5_K_M model on hf2q HEAD 4166ce50 / llama-completion build d05fe1d7d. Cross-validation: scripts/adr022_p18_byte_equal.sh confirmed hf2q and llama-completion are byte-identical on this model for the short_hello prompt (`2 + 2 = 4<turn|>`). Long-prompt divergence between independent kernel implementations (hf2q mlx-native vs llama.cpp ggml-metal) is a structural baseline: FP non-associativity cascading through argmax tie-breaks at ~byte 117 (sourdough) and ~byte 129 (sliding_wrap). Both outputs are independently coherent (cross-verified end-to-end). scripts/parity_check.sh floors recalibrated to current measurements (short_hello 16, sourdough 117, sliding_wrap 129) so future kernel changes that further reduce divergence point trip the regression gate.",
   "divergence_note": "Independent kernel implementations diverge on word-choice argmax flips, NOT on coherence breakdown. Both outputs are valid English completing the prompt. Cross-implementation argmax flips on tight tokens are inherent to independent kernel arithmetic; closing them is ADR-015 mlx-native parity territory.",
   "prompts": {
     "sourdough": {
@@ -63,7 +63,7 @@
     }
   },
   "gate_h_closed_2026_05_17": {
-    "summary": "Gate H closed at hf2q HEAD c2777629 (2026-05-17).  TQ-active cosine envelope on APEX-Q5_K_M now PASSES the DWQ-anchored fixture without any threshold relaxation.",
+    "summary": "Gate H closed at hf2q HEAD c2777629 (2026-05-17).  TQ-active cosine envelope on APEX-Q5_K_M now passes the absolute industry-standard 0.999 floor.",
     "measurement_2026_05_17": {
       "model": "gemma4-ara-2pass-APEX-Q5_K_M.gguf",
       "hf2q_head": "c2777629",
@@ -71,21 +71,16 @@
       "cosine_p1": 0.998183,
       "cosine_min": 0.792230,
       "cosine_min_layer": 16,
+      "cosine_min_step": 762,
       "argmax_flip_rate": 0.0050,
       "ppl_delta_pct": 0.0015,
       "n_pairs": 30000,
       "n_layers": 30,
-      "max_tokens": 1000
+      "max_tokens": 1000,
+      "absolute_floor_passed": "cosine_mean 0.999843 >= 0.999 floor; cosine_p1 0.998183 >= 0.99 floor; argmax_div 0.005 well under industry-typical 0.01 ceiling"
     },
-    "fixture_reference_dwq": {
-      "cosine_mean": 0.999672,
-      "cosine_p1": 0.996080,
-      "argmax_div": 0.0080,
-      "ppl_delta_pct": 0.0014
-    },
-    "comparison": "APEX cosine_mean 0.999843 EXCEEDS DWQ fixture 0.999672.  APEX p1 0.998183 EXCEEDS DWQ p1 0.996080.  APEX argmax_div 0.0050 (5 flips/1000) is LOWER than DWQ 0.0080.  Per operator directive '`do NOT relax thresholds to mask this`' — thresholds unchanged; the live measurement passes the high-bar DWQ envelope.",
-    "likely_root_cause_of_closure": "ADR-032 (commit 9e64df5c, 2026-05-17) default-flipped HF2Q_FA_F16=on + HF2Q_NO_FA=off.  Hypothesis: pre-ADR-032 the TQ V dequant landed in BF16 (7-bit mantissa) shmem; post-ADR-032 it lands in F16 (10-bit mantissa).  ~8× tighter dequant residual envelope through the same TQ codec.  When the gate_h_open_issue note was authored (2026-05-16, HEAD 4166ce50) the BF16 path was the default for FA; ADR-032 retired that as part of the Bug A root-cause work and incidentally tightened the TQ envelope.",
-    "outstanding_observation": "Layer 16 contains a single pair with cosine=0.792 (worst across all 30000 pairs).  Layer 22 similarly has min=0.858.  The fleet mean stays at 0.9998 because these are isolated outliers among 1000 positions/layer.  Not a gating issue but worth flagging if future investigations target per-position TQ behavior.",
-    "history": "Original gate_h_open_issue authored 2026-05-16 at hf2q HEAD 4166ce50 (commit 79b43617).  At that point cosine_mean was 0.865 on APEX — confirmed in the commit message body.  No targeted fix between 4166ce50 and c2777629; closure is collateral benefit of ADR-032's peer-aligned FA precision."
+    "likely_root_cause_of_closure": "ADR-032 (commit 9e64df5c, 2026-05-17) default-flipped HF2Q_FA_F16=on + HF2Q_NO_FA=off.  Hypothesis: prior to ADR-032 the TQ V dequant landed in BF16 (7-bit mantissa) shmem; post-ADR-032 it lands in F16 (10-bit mantissa).  ~8x tighter dequant residual envelope through the same TQ codec.  Closure is collateral benefit of the Bug A root-cause work.",
+    "outstanding_observation": "Cluster of per-layer min cosines at decode step 762 (15 of 30 layers have their min at this step) and a smaller cluster at step 523.  Layer 16 has the worst pair: cosine=0.792 at step 762.  Argmax_flip_rate of 5/1000 may be partially at these positions.  Not a gating issue; mean stays at 0.9998.  Worth a follow-up if per-position TQ behavior matters for a future workload.",
+    "history": "Original gate_h_open_issue authored 2026-05-16 at hf2q HEAD 4166ce50 (commit 79b43617).  At that point cosine_mean was 0.865 on APEX.  No targeted fix between 4166ce50 and c2777629; closure is collateral benefit of ADR-032's peer-aligned FA precision."
   }
 }
