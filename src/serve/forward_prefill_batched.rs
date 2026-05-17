@@ -736,6 +736,11 @@ impl MlxModelWeights {
         // immediately after sliding_mask is constructed, reused across all
         // 25 sliding-attention layers' F16 FA dispatches.
         let sliding_mask_f16: Option<MlxBuffer>;
+        // F16 global mask for HF2Q_FA_F16=1.  Same shape and rationale as
+        // sliding_mask_f16; reused across all 5 global D=512 layers' F16
+        // FA dispatches.  Fixes Bug A (Hemoglobin loop) by bringing the
+        // D=512 path to F16's 10-bit mantissa from BF16's 7-bit.
+        let global_mask_f16: Option<MlxBuffer>;
         let blk_sliding: MlxBuffer;
         let blk_global: MlxBuffer;
         {
@@ -883,6 +888,23 @@ impl MlxModelWeights {
                     q_abs_offset: 0,
                 },
             ).map_err(|e| anyhow::anyhow!("build global_mask: {e}"))?;
+            // HF2Q_FA_F16=1: cast the BF16 global mask to F16 once, reused
+            // across all 5 global D=512 layers' F16 FA dispatches.
+            // Must be rank-2 [seq_len, seq_len] so the FA dispatcher's
+            // rank-2 broadcast detection (`mask.shape().len() == 2`) fires.
+            global_mask_f16 = if use_fa_f16 {
+                let mask_elems = (seq_len * seq_len) as usize;
+                let m_f16 = dev.alloc_buffer(
+                    mask_elems * 2, DType::F16, vec![seq_len, seq_len],
+                ).map_err(|e| anyhow::anyhow!("alloc global_mask_f16: {e}"))?;
+                s.barrier_between(&[&global_mask], &[&m_f16]);
+                mlx_native::ops::elementwise::cast(
+                    s.encoder_mut(), reg, metal_dev,
+                    &global_mask, &m_f16, mask_elems,
+                    mlx_native::ops::elementwise::CastDirection::BF16ToF16,
+                ).map_err(|e| anyhow::anyhow!("cast global_mask BF16→F16: {e}"))?;
+                Some(m_f16)
+            } else { None };
             if let Some(t0) = t0_mask_gl {
                 bucket_finish!(s, exec, t0, &PROFILE_B_MASK_GL_NS, &PROFILE_B_MASK_GL_COUNT, 1, "mask_gl");
             }
@@ -2063,6 +2085,81 @@ impl MlxModelWeights {
                         // Bind unused buffers to silence unused-var warnings —
                         // these are leftover from the F16 path we replaced.
                         let _ = (&pf_q_f32_xlen, &pf_q_f16_xlen, &pf_out_f16_xlen, &pf_out_f32_xlen);
+                    } else if use_fa_f16 {
+                        // Bug A fix (2026-05-17): F16 D=512 FA path — keeps Q
+                        // in F16 (10-bit mantissa) instead of BF16 (7-bit) for
+                        // the global D=512 attention layers.  Worst-case
+                        // accumulated relative error over the 512-element dot
+                        // product drops from ~18% (BF16) to ~2.2% (F16) —
+                        // below the empirical argmax-flip threshold that
+                        // produced the `Format: Hemoglobin` greedy loop at
+                        // decode-pos ~70 on 300-item enumeration probes.
+                        //
+                        // Source F16 Q/K/V from F32 *_normed buffers via
+                        // permute_021_f32_to_f16 (single rounding step;
+                        // bypasses the BF16 round-trip through pf_*_perm).
+                        let q_f16 = pf_q_perm_f16.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("FA_F16: pf_q_perm_f16 not allocated"))?;
+                        let k_f16 = pf_k_perm_f16.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("FA_F16: pf_k_perm_f16 not allocated"))?;
+                        let v_f16 = pf_v_perm_f16.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("FA_F16: pf_v_perm_f16 not allocated"))?;
+                        let out_f16 = pf_sdpa_out_perm_f16.as_mut()
+                            .ok_or_else(|| anyhow::anyhow!("FA_F16: pf_sdpa_out_perm_f16 not allocated"))?;
+                        let mask_f16 = global_mask_f16.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("FA_F16: global_mask_f16 not allocated"))?;
+
+                        let q_elems = (nh * seq_len * hd) as usize;
+
+                        s.barrier_between(&[&pf_q_normed], &[q_f16]);
+                        mlx_native::ops::transpose::permute_021_f32_to_f16(
+                            s.encoder_mut(), reg, metal_dev,
+                            &pf_q_normed, q_f16,
+                            seq_len, nh, hd,
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 global Q permute+cast L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[&pf_k_normed], &[k_f16]);
+                        mlx_native::ops::transpose::permute_021_f32_to_f16(
+                            s.encoder_mut(), reg, metal_dev,
+                            &pf_k_normed, k_f16,
+                            seq_len, nkv, hd,
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 global K permute+cast L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[&pf_v_normed], &[v_f16]);
+                        mlx_native::ops::transpose::permute_021_f32_to_f16(
+                            s.encoder_mut(), reg, metal_dev,
+                            &pf_v_normed, v_f16,
+                            seq_len, nkv, hd,
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 global V permute+cast L{layer_idx}: {e}"))?;
+
+                        s.barrier_between(
+                            &[q_f16, k_f16, v_f16, mask_f16, &blk_global],
+                            &[out_f16],
+                        );
+                        mlx_native::ops::flash_attn_prefill_d512::
+                            dispatch_flash_attn_prefill_f16_d512_with_blk(
+                            s.encoder_mut(), dev, reg,
+                            q_f16, k_f16, v_f16,
+                            Some(mask_f16),
+                            Some(&blk_global),
+                            out_f16,
+                            &mlx_native::ops::flash_attn_prefill_d512::FlashAttnPrefillParams {
+                                n_heads: nh as u32,
+                                n_kv_heads: nkv as u32,
+                                head_dim: hd as u32,
+                                seq_len_q: seq_len as u32,
+                                seq_len_k: seq_len as u32,
+                                batch: 1,
+                                scale: 1.0,
+                                do_causal: false,
+                            },
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 global D=512 L{layer_idx}: {e}"))?;
+
+                        // Cast F16 output back to BF16 for o_proj input compat.
+                        s.barrier_between(&[out_f16], &[&pf_sdpa_out_perm]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            out_f16, &pf_sdpa_out_perm, q_elems,
+                            mlx_native::ops::elementwise::CastDirection::F16ToBF16,
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 global O cast L{layer_idx}: {e}"))?;
                     } else {
                     mlx_native::ops::flash_attn_prefill_d512::
                         dispatch_flash_attn_prefill_bf16_d512_with_blk(
