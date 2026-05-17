@@ -1758,9 +1758,16 @@ impl MlxModelWeights {
                     //   - scale=1.0 (Gemma 4: Q is pre-scaled upstream in
                     //     qmatmul), do_causal=false (mask carries causal).
                     if use_fa_f16 {
-                        // HF2Q_FA_F16=1: F16 FA path (kernel migration step 3).
-                        // Cast BF16 perm buffers → F16, dispatch F16 FA kernel,
-                        // cast F16 output → BF16 for o_proj compatibility.
+                        // HF2Q_FA_F16=1: F16 FA path (kernel migration step 4).
+                        //
+                        // Source F16 Q/K/V from the F32 *_normed buffers
+                        // directly via permute_021_f32_to_f16 (mlx-native
+                        // step 4 kernel) — bypassing the BF16 pf_*_perm
+                        // round-trip that left the step-3 wiring with
+                        // BF16 precision.  F16 is sourced from F32 with
+                        // a single rounding step at the F16 store, giving
+                        // F16's full 10-bit-mantissa precision (~8× the
+                        // BF16 7-bit mantissa).
                         let q_f16 = pf_q_perm_f16.as_ref()
                             .ok_or_else(|| anyhow::anyhow!("FA_F16: pf_q_perm_f16 not allocated"))?;
                         let k_f16 = pf_k_perm_f16.as_ref()
@@ -1773,27 +1780,30 @@ impl MlxModelWeights {
                             .ok_or_else(|| anyhow::anyhow!("FA_F16: sliding_mask_f16 not allocated"))?;
 
                         let q_elems = (nh * seq_len * hd) as usize;
-                        let k_elems = (nkv * seq_len * hd) as usize;
-                        let v_elems = (nkv * seq_len * hd) as usize;
 
-                        s.barrier_between(&[&pf_q_perm], &[q_f16]);
-                        mlx_native::ops::elementwise::cast(
+                        // pf_q_normed / pf_k_normed / pf_v_normed are F32 in
+                        // natural [seq_len, n_heads, head_dim] layout.
+                        // permute_021_f32_to_f16 writes F16 in permuted
+                        // [n_heads, seq_len, head_dim] layout which is what
+                        // dispatch_flash_attn_prefill_f16_d256_with_blk expects.
+                        s.barrier_between(&[&pf_q_normed], &[q_f16]);
+                        mlx_native::ops::transpose::permute_021_f32_to_f16(
                             s.encoder_mut(), reg, metal_dev,
-                            &pf_q_perm, q_f16, q_elems,
-                            mlx_native::ops::elementwise::CastDirection::BF16ToF16,
-                        ).map_err(|e| anyhow::anyhow!("FA_F16 Q cast L{layer_idx}: {e}"))?;
-                        s.barrier_between(&[&pf_k_perm], &[k_f16]);
-                        mlx_native::ops::elementwise::cast(
+                            &pf_q_normed, q_f16,
+                            seq_len, nh, hd,
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 Q permute+cast L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[&pf_k_normed], &[k_f16]);
+                        mlx_native::ops::transpose::permute_021_f32_to_f16(
                             s.encoder_mut(), reg, metal_dev,
-                            &pf_k_perm, k_f16, k_elems,
-                            mlx_native::ops::elementwise::CastDirection::BF16ToF16,
-                        ).map_err(|e| anyhow::anyhow!("FA_F16 K cast L{layer_idx}: {e}"))?;
-                        s.barrier_between(&[&pf_v_perm], &[v_f16]);
-                        mlx_native::ops::elementwise::cast(
+                            &pf_k_normed, k_f16,
+                            seq_len, nkv, hd,
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 K permute+cast L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[&pf_v_normed], &[v_f16]);
+                        mlx_native::ops::transpose::permute_021_f32_to_f16(
                             s.encoder_mut(), reg, metal_dev,
-                            &pf_v_perm, v_f16, v_elems,
-                            mlx_native::ops::elementwise::CastDirection::BF16ToF16,
-                        ).map_err(|e| anyhow::anyhow!("FA_F16 V cast L{layer_idx}: {e}"))?;
+                            &pf_v_normed, v_f16,
+                            seq_len, nkv, hd,
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 V permute+cast L{layer_idx}: {e}"))?;
 
                         s.barrier_between(
                             &[q_f16, k_f16, v_f16, mask_f16, &blk_sliding],
