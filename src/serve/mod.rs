@@ -437,7 +437,48 @@ fn template_supports_enable_thinking(template_str: &str) -> bool {
 }
 
 fn rendered_prompt_opens_thinking(enabled: &str, disabled: &str) -> bool {
-    enabled.trim_end() != disabled.trim_end()
+    let e = enabled.trim_end();
+    let d = disabled.trim_end();
+    if e == d {
+        return false;
+    }
+    // Canonical signal (mirrors llama.cpp's `compare_thinking_enabled` end-state
+    // for `reasoning_mode::TAG_BASED`): the template TRULY OPENS thinking only
+    // when, under `enable_thinking=true`, the rendered prompt ends with at
+    // least one UNCLOSED open-marker that the `enable_thinking=false` render
+    // does not leave open.  Two falsifier patterns the prior pure-byte-diff
+    // implementation mis-classified:
+    //   * Qwen3 0.6B suppressor:
+    //       TRUE  → `<|im_start|>assistant\n`  (bare)
+    //       FALSE → `<|im_start|>assistant\n<think>\n\n</think>\n\n`
+    //     FALSE adds a PAIRED `<think></think>` suppressor; TRUE has no open
+    //     at the tail.  Bytewise different, but TRUE does not open thinking.
+    //   * Gemma 4 ara-abliterated (this fix's reproducer):
+    //       TRUE  → `<bos><|turn>system\n<|think|><turn|>\n…<|turn>model\n`
+    //       FALSE → `<bos><|turn>user\n…<|turn>model\n<|channel>thought\n<channel|>`
+    //     FALSE adds a paired `<|channel>thought\n<channel|>` suppressor; TRUE
+    //     is bare at the model-turn tail.  Default-on under the prior byte-diff
+    //     produced argmax drift into `서히-own-` repetition loops on
+    //     enumerative prompts (operator's chemistry-Format probe 2026-05-17).
+    //
+    // Counted markers are the two reasoning-tag conventions documented in
+    // llama.cpp's `chat-diff-analyzer.cpp` workaround list (lines 36-100):
+    // `<think></think>` and `<reasoning></reasoning>`.  Model-class-specific
+    // section markers (e.g. Gemma 4's `<|channel>...<channel|>`) are NOT
+    // open-markers — they're suppressor primers in the FALSE branch and
+    // self-contained system-message annotations in the TRUE branch, neither
+    // of which constitutes "opening thinking" for the model to continue
+    // from at decode time.
+    fn unclosed_thinking_count(s: &str) -> i32 {
+        let opens = s.matches("<think>").count() as i32
+            + s.matches("<reasoning>").count() as i32
+            + s.matches("<thinking>").count() as i32;
+        let closes = s.matches("</think>").count() as i32
+            + s.matches("</reasoning>").count() as i32
+            + s.matches("</thinking>").count() as i32;
+        opens - closes
+    }
+    unclosed_thinking_count(e) > unclosed_thinking_count(d)
 }
 
 /// Resolve the `enable_thinking` value to pass to the chat-template Jinja
@@ -6624,6 +6665,34 @@ mod tests {
         assert!(
             !template_supports_enable_thinking(template),
             "a disabled-only empty think suppressor must not auto-enable thinking"
+        );
+    }
+
+    #[test]
+    fn template_supports_enable_thinking_false_for_gemma4_ara_channel_suppressor() {
+        // 2026-05-17 regression — Gemma 4 ara-abliterated APEX-Q5_K_M ships
+        // a GGUF chat template whose `if not enable_thinking` branch appends
+        // `<|channel>thought\n<channel|>` as a suppressor primer for
+        // generation.  Pre-fix `rendered_prompt_opens_thinking` returned
+        // `true` here (pure byte-diff), defaulting to enable_thinking=true,
+        // which left the model bare at `<|turn>model\n` and produced
+        // argmax-drift `서히-own-` repetition loops on enumerative prompts
+        // (operator's chemistry-Format probe).  Pin: this section-marker
+        // suppressor is NOT a `<think>`-style open, so the detector must
+        // return FALSE.
+        let template = "{%- for m in messages -%}\
+                        <|turn>{{ m.role }}\n{{ m.content }}<turn|>\n\
+                        {%- endfor -%}\
+                        {%- if add_generation_prompt -%}\
+                        <|turn>model\n\
+                        {%- if not (enable_thinking | default(false)) -%}\
+                        <|channel>thought\n<channel|>\
+                        {%- endif -%}\
+                        {%- endif -%}";
+        assert!(
+            !template_supports_enable_thinking(template),
+            "gemma4-ara `<|channel>thought<channel|>` suppressor must not \
+             auto-enable thinking — section markers are not `<think>` opens"
         );
     }
 
