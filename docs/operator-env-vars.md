@@ -1,11 +1,17 @@
 # hf2q Operator Environment Variables
 
-Default behavior on a supported model class (e.g., Gemma-4 26B DWQ GGUF):
+Default behavior on a supported model class (e.g., Gemma-4 26B GGUF,
+Qwen 3.5/3.6 GGUF):
 
 - **Coherence:** matches the F16 lm_head reference on the locked gates
-  (sourdough byte-identical vs llama.cpp, sliding_wrap byte-identical
-  vs the F16-hf2q reference).
-- **Throughput:** ~98% of llama.cpp decode on the same model and prompt.
+  (Qwen sourdough byte-identical vs llama.cpp; Gemma 300-Format greedy
+  enumeration coherent through 94+ items; chemistry+thinking probe
+  first-token byte-identical vs llama.cpp `--reasoning on`).
+- **Throughput** (M5 Max, APEX-Q5_K_M, post-ADR-032):
+  - Gemma 4 26B-A4B-it: 1.51× AHEAD of llama.cpp `-fa 1` at tg2000,
+    1.67× AHEAD at tg200.
+  - Qwen 3.6 35B-A3B: 1.47× AHEAD of llama.cpp `-fa 1` at tg1500,
+    1.31× AHEAD at tg200 — TQ-V active by default.
 - No flags required — the defaults are the ones you want.
 
 The env vars below are escape hatches and experimental toggles. In
@@ -43,7 +49,7 @@ rerank logic.
 
 | Var | Default | Values | Effect |
 |---|---|---|---|
-| `HF2Q_BATCHED_PREFILL` | off | `1` | Use the experimental batched prefill (`forward_prefill_batched`) instead of per-token prefill. Retained for parity diagnostics; per-token is the production path. |
+| `HF2Q_BATCHED_PREFILL` | on | `0`/`false`/`off` | Batched prefill (`forward_prefill_batched`) — the production path since ADR-028 iter-344 (default-flipped from per-token, which was 14-45× slower than peer at pp512–pp4096).  Coherence intact at every tested length up to pp3813 (4× sliding_window). Opt-out via `0`/`false`/`off` reverts to per-token prefill for parity diagnostics only. |
 | `HF2Q_F16_KV` | off | `1` | Allocate the dense KV cache as F16 instead of F32. Experimental — the current F16 path has a separate bug worse than F32; per ADR-009 the default F32 path is preferred. |
 | `HF2Q_NO_FA` | off | `1`/`true`/`on` | Diagnostic A/B knob.  When set, routes the global D=512 attention path through F32 tensor-mm instead of flash-attention.  Forced off at `seq_len < 32` (the dense-matmul kernel requires K ≥ 32).  Per ADR-032 the FA path is the production default — peer-aligned with llama.cpp's `kernel_flash_attn_ext_*_dk512_dv512`.  This flag exists for bisection work against the tensor-mm reference, not for production use. |
 | `HF2Q_FA_F16` | on | `0`/`false`/`off` | F16 (`half`, 10-bit mantissa) Q/K/V in flash-attention shared memory.  Matches llama.cpp's default `FA_TYPES` template specialisation for F16 KV cache (the standard production path).  Per ADR-032 this is the peer-aligned default — Q-shmem precision is the binding constraint on argmax stability at D=512 global layers (BF16's 7-bit mantissa accumulates ~9% relative error over a 512-element dot product, flipping argmax on narrow-margin greedy decode).  Opt-out reverts to BF16 (`bfloat`, 7-bit mantissa) shmem — peer's `FA_TYPES_BF` specialisation, only used in llama.cpp when KV cache is explicitly BF16.  Provided for diagnostic A/B against the BF16 instantiation; not for production. |
@@ -92,6 +98,7 @@ pre-MoE kernel alignment (option 1 in the ADR). Not pursuing in the
 current phase.
 
 Speed line: `shipping`. Default decode matches llama.cpp's coherence
-on the locked gates at ~98% of its throughput. Q8+rerank is the
-production lm_head strategy; F16 remains available via
-`HF2Q_LMHEAD_Q8=0`.
+on the locked gates at 1.31–1.67× of its throughput across Gemma 4
+and Qwen 3.6 APEX-Q5_K_M (see "Default behavior" at top for per-regime
+numbers).  Q8+rerank is the production lm_head strategy; F16 remains
+available via `HF2Q_LMHEAD_Q8=0`.
