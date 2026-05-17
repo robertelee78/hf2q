@@ -2092,8 +2092,14 @@ impl MlxModelWeights {
                                     hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
                                 ).map_err(|e| anyhow::anyhow!("batched hybrid F16 V L{layer_idx}: {e}"))?;
                             } else {
-                                // ADR-028 Phase 10e.5 (iter-351): batched-prefill V no-FWHT.
-                                mlx_native::ops::hadamard_quantize_kv::dispatch_kv_quantize_v_no_fwht_seq(
+                                // BUG-coherence fix (supersedes Phase 10e.5 iter-351):
+                                // batched FWHT V quantize.  See forward_mlx.rs
+                                // ~L3724 for empirical justification.  SDPA-side
+                                // fwht_sign_undo at forward_mlx.rs's hybrid branch
+                                // recovers raw output during decode.  Prefill SDPA
+                                // operates on its own pf_k_normed/pf_v_normed (not
+                                // the cache) so prefill output is unaffected.
+                                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
                                     s.encoder_mut(), reg, metal_dev,
                                     &pf_v_normed,
                                     &hybrid_kv[layer_idx].v_packed,
@@ -2101,7 +2107,7 @@ impl MlxModelWeights {
                                     nkv as u32, hd as u32,
                                     hb_cap, dst_seq_pos_start, n_copy as u32, src_tok_offset,
                                     hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
-                                ).map_err(|e| anyhow::anyhow!("batched hybrid V no-FWHT L{layer_idx}: {e}"))?;
+                                ).map_err(|e| anyhow::anyhow!("batched hybrid V FWHT quant L{layer_idx}: {e}"))?;
                             }
                             // ADR-030 iter-98 — populate BF16 xlen cache from
                             // pf_k_perm/pf_v_perm BF16 head-major (single

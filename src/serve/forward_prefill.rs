@@ -1294,15 +1294,22 @@ impl MlxModelWeights {
                                 &hybrid_kv[layer_idx].k,
                                 nkv as u32, hd as u32, hb_cap as u32, hb_write_slot,
                             ).map_err(|e| anyhow::anyhow!("prefill hybrid F16 K L{layer_idx} T{tok_i}: {e}"))?;
-                            // ADR-028 Phase 10e.5 (iter-351): V-only no-FWHT encode.
-                            mlx_native::ops::hadamard_quantize_kv::dispatch_kv_quantize_v_no_fwht(
+                            // BUG-coherence fix (supersedes Phase 10e.5 iter-351):
+                            // FWHT V quantize.  See forward_mlx.rs ~L3724 for the
+                            // empirical justification — real gemma4 V has kurtosis
+                            // up to 72.88 and max|v| up to 14.63, far outside the
+                            // 8-bit Lloyd-Max codebook range (±5.07).  Hadamard
+                            // rotation distributes outliers across all 256 dims
+                            // before quantization.  SDPA-side fwht_sign_undo at
+                            // forward_mlx.rs's hybrid branch recovers raw output.
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
                                 s.encoder_mut(), reg, metal_dev,
                                 v_src,
                                 &hybrid_kv[layer_idx].v_packed,
                                 &hybrid_kv[layer_idx].v_norms,
                                 nkv as u32, hd as u32, hb_cap as u32, hb_write_slot,
                                 hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
-                            ).map_err(|e| anyhow::anyhow!("prefill hybrid V no-FWHT L{layer_idx} T{tok_i}: {e}"))?;
+                            ).map_err(|e| anyhow::anyhow!("prefill hybrid V FWHT quant L{layer_idx} T{tok_i}: {e}"))?;
                         }
                     } else if let Some(ref leg_hb_enc) = self.leg_hb_encoded {
                         let hb_cap = leg_hb_enc[layer_idx].capacity;

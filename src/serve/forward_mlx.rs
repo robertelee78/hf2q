@@ -3714,18 +3714,45 @@ impl MlxModelWeights {
                                 ).map_err(|e| anyhow::anyhow!("full F16 KV write L{layer_idx}: {e}"))?;
                                 *total_dispatches += 1;
                             } else {
-                            // ADR-028 Phase 10c.5 (iter-354): fused F16-K-copy +
-                            // V-no-FWHT-encode in a single dispatch (Z-dim splits
-                            // K and V streams).  Byte-identical to the prior
-                            // 2-dispatch sequence at identical params (verified
-                            // via test_kv_copy_kf16_quantize_v_no_fwht_parity).
-                            // Saves 30 KV-write dispatches/decode-token at gemma4
-                            // 30L.
-                            mlx_native::ops::hadamard_quantize_kv::dispatch_kv_copy_kf16_quantize_v_no_fwht(
+                            // BUG-coherence fix (supersedes ADR-028 Phase 10c.5 / 10e.5):
+                            //
+                            // Phase 10e.5 (iter-351) switched V quantize to a no-FWHT
+                            // variant on the parity hypothesis that V is "approximately
+                            // N(0,1) per head" after RMS-norm.  Empirical dump of real
+                            // gemma4-APEX-Q5_K_M V activations shows kurtosis up to
+                            // 72.88 with max|v| up to 14.63 (4x exceeding the 8-bit
+                            // Lloyd-Max codebook range of ±5.07).  20/24 sampled
+                            // positions clip — outlier-bearing V channels lose their
+                            // magnitude through quantization, attention output drifts,
+                            // and greedy decode lands in fixed-point loops on
+                            // enumeration prompts.
+                            //
+                            // Fix: restore Hadamard rotation on V.  FWHT spreads any
+                            // outlier across all 256 dims (each becomes ≈outlier/√D),
+                            // bringing the post-FWHT distribution well within codebook
+                            // range.  K stays F16 raw (Phase 10c speedup retained).
+                            // Dispatch shape changes:
+                            //   * The fused `kv_copy_kf16_quantize_v_no_fwht` is split
+                            //     into a separate F16-K copy + FWHT-V quantize (one
+                            //     extra dispatch per layer).
+                            //   * SDPA output is now in the FWHT domain → a single
+                            //     `fwht_sign_undo` dispatch is added after SDPA
+                            //     (also one per layer).
+                            // Net: +2 dispatches/layer vs broken Phase 10e.5 path
+                            // (~0.5% throughput at gemma4 30L); Phase 10c F16-K and
+                            // Q-stays-raw savings are preserved.
+                            mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
                                 session.encoder_mut(), reg, metal_dev,
                                 &self.activations.attn_k_normed,
-                                v_src,
                                 &hybrid_kv[layer_idx].k,
+                                nkv as u32, hd as u32,
+                                hybrid_kv[layer_idx].capacity as u32,
+                                cache_pos_val,
+                            ).map_err(|e| anyhow::anyhow!("hybrid F16 K write L{layer_idx}: {e}"))?;
+                            *total_dispatches += 1;
+                            mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                                session.encoder_mut(), reg, metal_dev,
+                                v_src,
                                 &hybrid_kv[layer_idx].v_packed,
                                 &hybrid_kv[layer_idx].v_norms,
                                 nkv as u32, hd as u32,
@@ -3734,7 +3761,7 @@ impl MlxModelWeights {
                                 hybrid_kv[layer_idx].is_sliding,
                                 ctx.tq_scale_factor_d512,
                                 ctx.tq_codebook_bits,
-                            ).map_err(|e| anyhow::anyhow!("hybrid fused KV write L{layer_idx}: {e}"))?;
+                            ).map_err(|e| anyhow::anyhow!("hybrid V FWHT quant L{layer_idx}: {e}"))?;
                             *total_dispatches += 1;
                             } // closes else-block (legacy TQ-HB V path under hybrid)
                         }
@@ -4569,10 +4596,32 @@ impl MlxModelWeights {
                             ).map_err(|e| anyhow::anyhow!("flash_attn_vec_hybrid L{layer_idx}: {e}"))?;
                             *total_dispatches += 2; // main + reduce (conservative)
                         }
-                        // ADR-028 Phase 10e.5 (iter-351): NO fwht_sign_undo on output.
-                        // V is raw (Lloyd-Max quantized but not FWHT-rotated), so
-                        // SDPA output is already in the raw domain — feed directly
-                        // to o_proj.
+                        // BUG-coherence fix (supersedes Phase 10e.5 iter-351):
+                        // V is now FWHT-rotated then quantized (see V-encode site
+                        // ~line 3724).  SDPA output is therefore in the FWHT domain
+                        // and must be inverse-rotated to recover raw values before
+                        // feeding o_proj.  Skipped when V is F16 (FULL_F16_KV or
+                        // peer-port path) since no FWHT was applied during write.
+                        //
+                        // Why fwht_sign_undo and not fwht_sign_premult: the V-encode
+                        // applies sign-premult + FWHT + /√d.  SDPA produces
+                        //   Σ softmax * FWHT(sign*V)/√d = FWHT(sign * Σ softmax*V)/√d.
+                        // fwht_sign_undo = (multiply by √d via output buffer scale,
+                        // apply FWHT which is self-inverse for normalized H, then
+                        // sign-undo) recovers `Σ softmax * V` exactly.  Mirrors the
+                        // legacy TQ-HB SDPA caller at L4694.
+                        if hybrid_kv[layer_idx].v_packed.dtype() != mlx_native::DType::F16 {
+                            session.barrier_between(
+                                &[&self.activations.sdpa_out],
+                                &[&self.activations.sdpa_out],
+                            );
+                            mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+                                session.encoder_mut(), reg, metal_dev,
+                                &self.activations.sdpa_out,
+                                nh as u32, hd as u32,
+                            ).map_err(|e| anyhow::anyhow!("hybrid FWHT sign-undo L{layer_idx}: {e}"))?;
+                            *total_dispatches += 1;
+                        }
                         // Hybrid path complete; fall through to o_proj/MLP without
                         // entering the legacy `if let Some(ref leg_hb_enc) ...` block
                         // below (`leg_hb_encoded` is `None` under hybrid_kv per the
