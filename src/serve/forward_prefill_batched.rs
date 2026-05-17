@@ -317,6 +317,49 @@ impl MlxModelWeights {
             None => seq_len >= 32,
         };
 
+        // BUG-coherence kernel migration step 3 (2026-05-16): F16 FA path.
+        //
+        // When HF2Q_FA_F16=1, the D=256 sliding-attention layers route
+        // through `dispatch_flash_attn_prefill_f16_d256_with_blk`
+        // (mlx-native commit 6562eda) instead of the BF16 variant.
+        // Inputs are cast BF16→F16 via `cast_bf16_to_f16` (mlx-native
+        // commit 64b5497) before the FA call and the F16 output is cast
+        // F16→BF16 back into `pf_sdpa_out_perm` for compatibility with
+        // o_proj's BF16 input.
+        //
+        // *** KNOWN LIMITATION (2026-05-16): this wiring does NOT fix the
+        // BUG-gemma4-coherence argmax-flip bug ***
+        //
+        // The source pf_q_perm/pf_k_perm/pf_v_perm buffers are written
+        // as BF16 by fused_head_norm_rope_batch_f32_with_bf16{,_f32_perm}
+        // — the F32→BF16 cast happens upstream of this branch.  Casting
+        // BF16→F16 here cannot recover the precision already lost in
+        // the upstream BF16 store; F16 just carries 7-bit mantissa
+        // values in a 10-bit envelope.  Empirically the F16 FA path
+        // produces the same buggy `"Format: \""` argmax as the BF16
+        // path at decode position ~35 on the chemistry-glossary probe.
+        //
+        // To actually restore coherence via the FA path, a future
+        // iteration must source the F16 perm buffers from the F32
+        // pf_q_normed/pf_k_normed/pf_v_normed buffers directly — either
+        // by adding a F32→F16-with-permute fused kernel, or by modifying
+        // fused_head_norm_rope_batch_f32 to take an F16 permuted output
+        // option alongside its existing BF16 one.  The dispatcher
+        // (mlx-native 6562eda) and cast kernels (mlx-native 64b5497)
+        // remain ready for that wiring; only the upstream precision
+        // routing needs more work.
+        //
+        // The NO_FA workaround (commit 03328ee5) remains the validated
+        // coherent default until that upstream work lands.
+        //
+        // This branch is kept (default-off) as testable scaffolding so
+        // future investigators can A/B the FA-vs-tensor-mm dispatch
+        // shape without rebuilding cast / dispatcher infrastructure.
+        let use_fa_f16 = matches!(
+            std::env::var("HF2Q_FA_F16").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        );
+
         // Wave P4.17 — super-flag: per-op isolation for bucket attribution.
         // When on, every dispatch is bracketed by s.finish()/s = exec.begin()
         // pairs so its wall-clock is measured; the individual bucket atomics
@@ -531,6 +574,29 @@ impl MlxModelWeights {
         let pf_v_perm = alloc_bf16(max_nkv * seq_len * max_hd, "pf_v_perm")?;
         let mut pf_sdpa_out_perm = alloc_bf16(nh * seq_len * max_hd, "pf_sdpa_out_perm")?;
 
+        // F16 staging buffers for the HF2Q_FA_F16=1 path (kernel migration
+        // step 3).  These mirror the BF16 perm buffers but in F16 dtype;
+        // we cast BF16→F16 into them before the FA call and cast back
+        // F16→BF16 from the output after.  Only allocated when the env
+        // flag is set so the default-path memory footprint is unchanged
+        // (matches HF2Q_NO_FA's allocation pattern).  Each buffer is the
+        // same byte size as its BF16 sibling (both 2 bytes/element), so
+        // the additional memory budget is 4× per-head F16 perm =
+        // `(nh + max_nkv*2 + nh) * seq_len * max_hd * 2` bytes.  At
+        // seq=246, max_hd=512 (D=512 layers): ~24 MB.  At seq=1359: ~134 MB.
+        let pf_q_perm_f16 = if use_fa_f16 {
+            Some(alloc_f16(nh * seq_len * max_hd, "pf_q_perm_f16")?)
+        } else { None };
+        let pf_k_perm_f16 = if use_fa_f16 {
+            Some(alloc_f16(max_nkv * seq_len * max_hd, "pf_k_perm_f16")?)
+        } else { None };
+        let pf_v_perm_f16 = if use_fa_f16 {
+            Some(alloc_f16(max_nkv * seq_len * max_hd, "pf_v_perm_f16")?)
+        } else { None };
+        let mut pf_sdpa_out_perm_f16 = if use_fa_f16 {
+            Some(alloc_f16(nh * seq_len * max_hd, "pf_sdpa_out_perm_f16")?)
+        } else { None };
+
         // ADR-030 iter-77 — cross-length-SDPA verify mode buffers.  Active
         // only when env flag HF2Q_DFLASH_XLEN_SDPA=1 AND we are in a verify
         // call (start_pos > 0 AND dflash_capture installed).  The cast
@@ -648,6 +714,10 @@ impl MlxModelWeights {
         let prefill_start = Instant::now();
         let sliding_mask: MlxBuffer;
         let global_mask: MlxBuffer;
+        // F16 sliding mask for HF2Q_FA_F16=1.  Built once via cast_bf16_to_f16
+        // immediately after sliding_mask is constructed, reused across all
+        // 25 sliding-attention layers' F16 FA dispatches.
+        let sliding_mask_f16: Option<MlxBuffer>;
         let blk_sliding: MlxBuffer;
         let blk_global: MlxBuffer;
         {
@@ -760,6 +830,23 @@ impl MlxModelWeights {
                     q_abs_offset: 0,
                 },
             ).map_err(|e| anyhow::anyhow!("build sliding_mask: {e}"))?;
+            // HF2Q_FA_F16=1: cast the BF16 sliding mask to F16 once, reused
+            // across all 25 sliding D=256 layers' F16 FA dispatches.
+            // Must be rank-2 [seq_len, seq_len] so the FA dispatcher's
+            // rank-2 broadcast detection (`mask.shape().len() == 2`) fires.
+            sliding_mask_f16 = if use_fa_f16 {
+                let mask_elems = (seq_len * seq_len) as usize;
+                let m_f16 = dev.alloc_buffer(
+                    mask_elems * 2, DType::F16, vec![seq_len, seq_len],
+                ).map_err(|e| anyhow::anyhow!("alloc sliding_mask_f16: {e}"))?;
+                s.barrier_between(&[&sliding_mask], &[&m_f16]);
+                mlx_native::ops::elementwise::cast(
+                    s.encoder_mut(), reg, metal_dev,
+                    &sliding_mask, &m_f16, mask_elems,
+                    mlx_native::ops::elementwise::CastDirection::BF16ToF16,
+                ).map_err(|e| anyhow::anyhow!("cast sliding_mask BF16→F16: {e}"))?;
+                Some(m_f16)
+            } else { None };
             if let Some(t0) = t0_mask_sw {
                 bucket_finish!(s, exec, t0, &PROFILE_B_MASK_SW_NS, &PROFILE_B_MASK_SW_COUNT, 1, "mask_sw");
             }
@@ -1670,6 +1757,75 @@ impl MlxModelWeights {
                     //     sliding window excludes most of the prefix.
                     //   - scale=1.0 (Gemma 4: Q is pre-scaled upstream in
                     //     qmatmul), do_causal=false (mask carries causal).
+                    if use_fa_f16 {
+                        // HF2Q_FA_F16=1: F16 FA path (kernel migration step 3).
+                        // Cast BF16 perm buffers → F16, dispatch F16 FA kernel,
+                        // cast F16 output → BF16 for o_proj compatibility.
+                        let q_f16 = pf_q_perm_f16.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("FA_F16: pf_q_perm_f16 not allocated"))?;
+                        let k_f16 = pf_k_perm_f16.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("FA_F16: pf_k_perm_f16 not allocated"))?;
+                        let v_f16 = pf_v_perm_f16.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("FA_F16: pf_v_perm_f16 not allocated"))?;
+                        let out_f16 = pf_sdpa_out_perm_f16.as_mut()
+                            .ok_or_else(|| anyhow::anyhow!("FA_F16: pf_sdpa_out_perm_f16 not allocated"))?;
+                        let mask_f16 = sliding_mask_f16.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("FA_F16: sliding_mask_f16 not allocated"))?;
+
+                        let q_elems = (nh * seq_len * hd) as usize;
+                        let k_elems = (nkv * seq_len * hd) as usize;
+                        let v_elems = (nkv * seq_len * hd) as usize;
+
+                        s.barrier_between(&[&pf_q_perm], &[q_f16]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            &pf_q_perm, q_f16, q_elems,
+                            mlx_native::ops::elementwise::CastDirection::BF16ToF16,
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 Q cast L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[&pf_k_perm], &[k_f16]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            &pf_k_perm, k_f16, k_elems,
+                            mlx_native::ops::elementwise::CastDirection::BF16ToF16,
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 K cast L{layer_idx}: {e}"))?;
+                        s.barrier_between(&[&pf_v_perm], &[v_f16]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            &pf_v_perm, v_f16, v_elems,
+                            mlx_native::ops::elementwise::CastDirection::BF16ToF16,
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 V cast L{layer_idx}: {e}"))?;
+
+                        s.barrier_between(
+                            &[q_f16, k_f16, v_f16, mask_f16, &blk_sliding],
+                            &[out_f16],
+                        );
+                        mlx_native::ops::flash_attn_prefill::
+                            dispatch_flash_attn_prefill_f16_d256_with_blk(
+                            s.encoder_mut(), dev, reg,
+                            q_f16, k_f16, v_f16,
+                            Some(mask_f16),
+                            Some(&blk_sliding),
+                            out_f16,
+                            &mlx_native::ops::flash_attn_prefill::FlashAttnPrefillParams {
+                                n_heads: nh as u32,
+                                n_kv_heads: nkv as u32,
+                                head_dim: hd as u32,
+                                seq_len_q: seq_len as u32,
+                                seq_len_k: seq_len as u32,
+                                batch: 1,
+                                scale: 1.0,
+                                do_causal: false,
+                            },
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 sliding L{layer_idx}: {e}"))?;
+
+                        // Cast F16 output back to BF16 for o_proj input compat.
+                        s.barrier_between(&[out_f16], &[&pf_sdpa_out_perm]);
+                        mlx_native::ops::elementwise::cast(
+                            s.encoder_mut(), reg, metal_dev,
+                            out_f16, &pf_sdpa_out_perm, q_elems,
+                            mlx_native::ops::elementwise::CastDirection::F16ToBF16,
+                        ).map_err(|e| anyhow::anyhow!("FA_F16 O cast L{layer_idx}: {e}"))?;
+                    } else {
                     mlx_native::ops::flash_attn_prefill::
                         dispatch_flash_attn_prefill_bf16_d256_with_blk(
                         s.encoder_mut(), dev, reg,
@@ -1688,6 +1844,7 @@ impl MlxModelWeights {
                             do_causal: false,
                         },
                     ).map_err(|e| anyhow::anyhow!("batched sliding flash_attn_prefill L{layer_idx}: {e}"))?;
+                    } // end FA_F16 vs BF16 branch
                     } // end sliding else (existing non-xlen path)
                 } else {
                     // ADR-011 Phase 2 Wave 4 Stage 3: flash_attn_prefill D=512
