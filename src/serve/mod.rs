@@ -1554,7 +1554,27 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
             kernel_profiles.len() >= kernel_profile_measure
         } else {
             let mut p = profiler.start_token();
-            next_token = mlx_w.forward_decode(next_token, pos, &mut ctx, &mut p)?;
+            // forward_decode populates the on-device logits buffer AND
+            // returns the GPU-argmax token id.  If sampling is requested
+            // (Phase A of BUG-gemma-cli — wire --temperature /
+            // --repetition-penalty / --top-k / --top-p through), pull
+            // the logits via logits_view() and override the argmax with
+            // a sampler_pure::sample_token result.  Mirrors the qwen35
+            // CLI pattern at sample_qwen35_logits_for_generate.  When
+            // sampling is NOT needed (greedy temp=0, rep_penalty=1.0,
+            // top_k=0, top_p=1.0), keep the GPU-argmax fast-path —
+            // no logits download, no host-side compute — preserves
+            // the parity gates + benchmarks at full speed.
+            let argmax_token = mlx_w.forward_decode(next_token, pos, &mut ctx, &mut p)?;
+            next_token = if qwen35_generate_uses_sampling(&args) {
+                let mut logits: Vec<f32> = mlx_w
+                    .logits_view()
+                    .context("Gemma sampling: logits_view")?
+                    .to_vec();
+                sample_qwen35_logits_for_generate(&mut logits, &args, &decoded_tokens)
+            } else {
+                argmax_token
+            };
             profiler.finish_token(p);
             false
         };
@@ -1578,20 +1598,22 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
         // N-gram repetition guard — same shared detector as the qwen35 path.
         // Skipped under --ignore-eos (bench mode wants raw N-token generation).
-        if !args.ignore_eos {
+        // Skipped when sampling is active too — sampling already escapes
+        // greedy traps; a trip here under sampling is almost certainly a
+        // legitimate repetition pattern that the user opted into.
+        if !args.ignore_eos && !qwen35_generate_uses_sampling(&args) {
             if let Some((ngram, repeats)) = detect_greedy_repetition_loop(&decoded_tokens) {
                 tracing::info!(
                     "Gemma decode: greedy n-gram repetition detected (last {} tokens \
-                     repeated {} times); stopping. Sampling \
-                     (temperature/top_k/top_p/repetition_penalty) is wired in \
-                     forward_decode but the CLI does not pass them through; \
-                     use the chat-completion API for non-deterministic decoding.",
+                     repeated {} times); stopping. Pass --temperature 0.8 or \
+                     --repetition-penalty 1.1 (or use the chat-completion API) to \
+                     opt into sampling.",
                     ngram, repeats
                 );
                 eprintln!(
                     "\n[hf2q] Gemma greedy decode entered a {}-token repetition loop \
-                     — stopping. Use the chat-completion API for non-deterministic \
-                     decoding.",
+                     — stopping.  Pass --temperature 0.8 or --repetition-penalty 1.1 \
+                     to escape via sampling.",
                     ngram
                 );
                 break;
