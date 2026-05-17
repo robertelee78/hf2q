@@ -2028,19 +2028,37 @@ fn maybe_run_qwen35_prefill_sweep(
 /// and the ones before that, and so on for `REPEAT_MIN_OCCURRENCES` total
 /// copies. If all match, report a true loop.
 fn detect_greedy_repetition_loop(decoded_tokens: &[u32]) -> Option<(usize, usize)> {
-    const REPEAT_NGRAM_SIZES: &[usize] = &[8, 12, 16, 20, 24];
-    const REPEAT_MIN_OCCURRENCES: usize = 4;
+    // 2026-05-16: bulletproofed per BUG-gemma-cli-ignores-sampling-flags
+    // findings.  The prior fixed set {8,12,16,20,24} × ≥4 reps silently
+    // missed any cycle length outside the set (e.g. 18 / 22 / 5).  User
+    // observed a 4-term cycle (Miticidal / Fungicidal / Herbicidal /
+    // Insecticidal Agent) that ran to --max-tokens producing garbage.
+    //
+    // Replacement contract: detect EVERY consecutive n-gram cycle for
+    // n ∈ [2, 64], firing after 3 occurrences (down from 4).  Cost per
+    // call is O(MAX_NGRAM² × MIN_OCCURRENCES) ≈ 12k integer compares —
+    // negligible vs decode-token GPU work.  The lowest-matching n wins,
+    // matching the prior contract's "smallest cycle" return semantics.
+    //
+    // Doesn't tolerate intra-cycle drift; an entropy-window detector is
+    // the natural next refinement if real-world drift cases surface.
+    const MIN_NGRAM: usize = 2;
+    const MAX_NGRAM: usize = 64;
+    const MIN_OCCURRENCES: usize = 3;
 
     let n = decoded_tokens.len();
-    for &ngram in REPEAT_NGRAM_SIZES {
-        let need = ngram * REPEAT_MIN_OCCURRENCES;
+    for ngram in MIN_NGRAM..=MAX_NGRAM {
+        let need = ngram * MIN_OCCURRENCES;
         if n < need {
+            // Window not yet full enough for this n-gram size.
+            // Sizes larger than n/3 will also miss; safe to continue
+            // since the loop is bounded by MAX_NGRAM.
             continue;
         }
         let tail = &decoded_tokens[n - need..];
         let key = &tail[need - ngram..];
         let mut all_match = true;
-        for i in 0..REPEAT_MIN_OCCURRENCES {
+        for i in 0..MIN_OCCURRENCES {
             let start = i * ngram;
             if &tail[start..start + ngram] != key {
                 all_match = false;
@@ -2048,7 +2066,7 @@ fn detect_greedy_repetition_loop(decoded_tokens: &[u32]) -> Option<(usize, usize
             }
         }
         if all_match {
-            return Some((ngram, REPEAT_MIN_OCCURRENCES));
+            return Some((ngram, MIN_OCCURRENCES));
         }
     }
     None
@@ -5941,11 +5959,109 @@ mod tests {
         let result = detect_greedy_repetition_loop(&toks);
         assert!(result.is_some(), "8-token cycle should be detected");
         let (ngram, occ) = result.unwrap();
+        // Detector now returns the SMALLEST matching n.  An 8-cycle of
+        // [101..108] has no smaller subcycle (no repeats within 8 unique
+        // tokens), so ngram=8 is the smallest match.  Required-occurrence
+        // floor relaxed from 4 to 3 (2026-05-16 bulletproof rewrite).
         assert_eq!(ngram, 8, "should detect at the smallest matching size");
         assert!(
-            occ >= 4,
-            "should report ≥4 occurrences in a saturated window, got {occ}"
+            occ >= 3,
+            "should report ≥3 occurrences in a saturated window, got {occ}"
         );
+    }
+
+    // ---- Bulletproof-rewrite coverage (2026-05-16) ----
+    //
+    // Each test below is a cycle size that the prior fixed-set detector
+    // (sizes {8,12,16,20,24}) SILENTLY MISSED.  Now they must all fire.
+
+    #[test]
+    fn detect_repetition_finds_2_token_cycle_single_token_loop() {
+        // "AAAAAA" — model stuck on one token (technically a 2-cycle of
+        // [A,A] but covers single-token degenerate loops in practice).
+        let mut toks: Vec<u32> = (0..30).collect();
+        for _ in 0..10 {
+            toks.push(777);
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(result.is_some(), "single-token loop should be detected (was missed by prior detector)");
+        let (ngram, _) = result.unwrap();
+        assert_eq!(ngram, 2, "should detect at the smallest matching size");
+    }
+
+    #[test]
+    fn detect_repetition_finds_7_token_cycle() {
+        // 7-token cycle — NOT in the prior fixed set {8,12,16,20,24}.
+        let cycle: [u32; 7] = [501, 502, 503, 504, 505, 506, 507];
+        let mut toks: Vec<u32> = (0..30).collect();
+        for _ in 0..10 {
+            toks.extend_from_slice(&cycle);
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(result.is_some(), "7-token cycle should be detected (was missed by prior detector)");
+        assert_eq!(result.unwrap().0, 7);
+    }
+
+    #[test]
+    fn detect_repetition_finds_11_token_cycle() {
+        // 11-token cycle — NOT in the prior fixed set.
+        let cycle: [u32; 11] = [601, 602, 603, 604, 605, 606, 607, 608, 609, 610, 611];
+        let mut toks: Vec<u32> = (0..30).collect();
+        for _ in 0..10 {
+            toks.extend_from_slice(&cycle);
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(result.is_some(), "11-token cycle should be detected (was missed by prior detector)");
+        assert_eq!(result.unwrap().0, 11);
+    }
+
+    #[test]
+    fn detect_repetition_finds_18_token_cycle() {
+        // 18-token cycle — between the prior fixed-set steps {16, 20}.
+        // Approximates the "Miticidal/Fungicidal/Herbicidal/Insecticidal
+        // Agent" failure mode from the 2026-05-16 user report (4 terms
+        // each ~4-5 BPE tokens plus delimiters → cycle ~18 tokens).
+        let cycle: [u32; 18] = [
+            701, 702, 703, 704, 705, 706, 707, 708, 709, 710,
+            711, 712, 713, 714, 715, 716, 717, 718,
+        ];
+        let mut toks: Vec<u32> = (0..30).collect();
+        for _ in 0..8 {
+            toks.extend_from_slice(&cycle);
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(result.is_some(), "18-token cycle should be detected (was missed by prior detector)");
+        assert_eq!(result.unwrap().0, 18);
+    }
+
+    #[test]
+    fn detect_repetition_finds_22_token_cycle() {
+        // 22-token cycle — between the prior fixed-set steps {20, 24}.
+        let cycle: [u32; 22] = [
+            801, 802, 803, 804, 805, 806, 807, 808, 809, 810,
+            811, 812, 813, 814, 815, 816, 817, 818, 819, 820,
+            821, 822,
+        ];
+        let mut toks: Vec<u32> = (0..30).collect();
+        for _ in 0..6 {
+            toks.extend_from_slice(&cycle);
+        }
+        let result = detect_greedy_repetition_loop(&toks);
+        assert!(result.is_some(), "22-token cycle should be detected (was missed by prior detector)");
+        assert_eq!(result.unwrap().0, 22);
+    }
+
+    #[test]
+    fn detect_repetition_no_false_positive_on_two_repeats() {
+        // Bigger threshold check: a pattern that REPEATS ONLY TWICE is
+        // not a loop (could be legitimate parallelism in prose).  The
+        // detector requires ≥3 consecutive occurrences before firing.
+        let cycle: [u32; 8] = [901, 902, 903, 904, 905, 906, 907, 908];
+        let mut toks: Vec<u32> = (0..30).collect();
+        for _ in 0..2 {
+            toks.extend_from_slice(&cycle);
+        }
+        assert_eq!(detect_greedy_repetition_loop(&toks), None);
     }
 
     #[test]
