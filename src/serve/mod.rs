@@ -437,18 +437,7 @@ fn template_supports_enable_thinking(template_str: &str) -> bool {
 }
 
 fn rendered_prompt_opens_thinking(enabled: &str, disabled: &str) -> bool {
-    let enabled_tail = enabled.trim_end();
-    let disabled_tail = disabled.trim_end();
-
-    if !enabled_tail.ends_with("<think>") {
-        return false;
-    }
-
-    if disabled_tail == enabled_tail {
-        return false;
-    }
-
-    disabled_tail.contains("</think>") || !disabled_tail.ends_with("<think>")
+    enabled.trim_end() != disabled.trim_end()
 }
 
 /// Resolve the `enable_thinking` value to pass to the chat-template Jinja
