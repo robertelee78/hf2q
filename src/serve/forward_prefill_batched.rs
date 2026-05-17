@@ -257,37 +257,55 @@ impl MlxModelWeights {
         //   5. scores @ V^T via hf2q_dense_mm_bf16_f32_tensor -> attn f32 [nh, seq, hd]
         //   6. permute_021_f32 -> pf_sdpa_out f32 [seq, nh, hd]
         //
-        // BUG-coherence fix (2026-05-16): default-flipped to TRUE.
+        // BUG-coherence fix (2026-05-16, refined 2026-05-17):
+        // default-flipped to TRUE.
         //
-        // The flash-attn prefill kernel (D=256 sliding layers, 25/30 of
-        // Gemma 4) stores Q in BF16 shared memory before Q·K^T, while the
-        // tensor-mm path uses F32 Q.  Each Q element rounded to BF16 carries
-        // 0.39% relative error per side of the matmul; over 256-element dot
-        // products and 30 layers this accumulates into ~argmax flips on
-        // greedy decode.  Empirical: with FA on Gemma 4 ara-abliterated at
-        // tg1200 chemistry-glossary probe, the model diverges from
-        // llama.cpp/sequential at decode position ~35 (`"Format: \""` vs
-        // `` `Format: \`` `` ``) and cascades into Sodium-Lauryl loops.
-        // Same prompt with NO_FA stays coherent — matches llama.cpp's `-fa 0`.
+        // ROOT CAUSE (refined): the FA prefill kernel stores Q in BF16
+        // shared memory.  BF16's 7-bit mantissa carries ~0.39% error per
+        // Q element, which on the 5 global D=512 attention layers (full-
+        // attn, head_dim=512) compounds across the seq-wide dot product
+        // and the 30-layer residual stream into argmax flips on greedy
+        // decode of enumeration-style prompts.  The 25 sliding D=256
+        // layers (head_dim=256, sliding-window tile-skip) tolerate BF16
+        // precision without measurable coherence loss — the bug is
+        // *specifically* in the global attention path.
         //
-        // D=512 (full-attn, 5/30 layers) was already fixed by applying scale
-        // post-matmul in F32 — see flash_attn_prefill_d512.metal §458-468
-        // and ADR-011-phase2-wave2c-d512-bug-fix.md.  D=256 retained the
-        // BF16 pre-scale and the BF16-Q-in-shmem dot product, which is the
-        // residual precision bug this default-flip works around.
+        // Empirical localisation (HF2Q_PROFILE_BUCKETS=1):
+        //   FA_SW (D=256 sliding):   25 layers  BF16 FA  — coherence OK
+        //   NOFA_* (D=512 global):    5 layers  F32 tensor-mm — required
         //
-        // Speed: 2% slower at typical prompt lengths (1686 vs 1723 t/s at
-        // seq=246, M5 Max).  Memory: O(seq²) for the dense `pf_kq` buffer
-        // [n_heads, seq, seq] F32 — ~555 MB at seq=2455; ~4 MB at seq=246.
-        // Long-context users can opt back to FA via HF2Q_NO_FA=0; that path
-        // remains correct for non-precision-sensitive workloads and
-        // becomes mandatory at extreme seq_len where the dense matmul
-        // outgrows memory.
+        // HF2Q_FA_F16 scaffolding (commits ab8580db, 5c6bb5b0) explored
+        // routing the sliding D=256 path through F16 FA with F32-sourced
+        // F16 buffers; that DID NOT fix coherence on the chemistry-
+        // glossary probe, falsifying the "sliding-layer FA bug"
+        // hypothesis and confirming the bug is global-only.
         //
-        // Future cleanup: rebuild the FA kernel with F32 Q in shared memory
-        // (or apply scale post-matmul as D=512 does) so this default-flip
-        // can be reverted.  Tracked separately; the NO_FA path is the
-        // coherent baseline until then.
+        // OPTIMAL HYBRID DESIGN: this default-flip is *not* a workaround;
+        // it is the correct production configuration.  The
+        // `route_through_nofa = use_no_fa && !is_sliding` gate at line
+        // ~1256 means HF2Q_NO_FA=1 routes ONLY the 5 global D=512 layers
+        // through tensor-mm.  Per the inline comment at :1248-1255 this
+        // saves ~52 ms wall at pp8333 vs FA on global (uncapped K means
+        // FA's tile-skip helps less), so global-via-tensor-mm is BOTH
+        // faster AND precision-correct.  Sliding stays on FA where its
+        // tile-skip is decisive (would be 1771 ms slower under uncapped
+        // tensor-mm).
+        //
+        // Speed: 0% measured cost at seq 351-1359 vs HF2Q_NO_FA=0;
+        // -1.3% at seq=246.  Memory: O(seq²) for the dense `pf_kq`
+        // buffer [n_heads, seq, seq] F32 used by global layers only —
+        // ~4 MB at seq=246; ~118 MB at seq=1359; ~555 MB at seq=2455.
+        // Long-context users can opt back to all-FA via HF2Q_NO_FA=0
+        // (accepts coherence regression on enumeration prompts but
+        // bounds memory at very long seq_len).
+        //
+        // D=512 (full-attn) was already comment-documented in
+        // flash_attn_prefill_d512.metal §458-468 as the originally-fixed
+        // version of this bug class (the "byte-1026 divergence from
+        // llama.cpp on sourdough_gate" of ADR-011-phase2-wave2c-d512-
+        // bug-fix.md applied scale post-matmul in F32 but kept Q in
+        // BF16 shmem — that left the residual Q-precision bug that this
+        // default-flip routes around for global layers).
         // Threshold: dense_matmul_bf16_f32_tensor (the tensor-mm Q@K^T kernel
         // that NO_FA dispatches to in the V-side scores@V^T leg) requires
         // K >= 32 because its tile reduction is 32-aligned.  At very short
