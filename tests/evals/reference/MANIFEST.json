@@ -62,9 +62,30 @@
       "self_baseline_status": "PASS — refreshed against HEAD 4166ce50"
     }
   },
-  "gate_h_open_issue": {
-    "summary": "Gate H (TQ-active quality envelope) fails on APEX-Q5_K_M with cosine_mean=0.865 vs floor 0.999. The frozen Gate H fixture (sourdough_tq_quality.json) was captured against the DWQ model and shows cosine_mean=0.9996 (TQ effectively matches dense on DWQ).",
-    "operator_question": "TQ KV cache is designed to be model-agnostic — cosine 0.865 on APEX is a real quality signal, not threshold tuning. Investigation needed: why does TQ on APEX-Q5_K_M deviate this much from dense when TQ on DWQ matches dense at 0.9996?",
-    "deferred_to": "Next mission — do NOT relax Gate H thresholds to mask this. Gate H fixture intentionally NOT refreshed so the 0.9996 envelope remains a high-bar reference for the investigation."
+  "gate_h_closed_2026_05_17": {
+    "summary": "Gate H closed at hf2q HEAD c2777629 (2026-05-17).  TQ-active cosine envelope on APEX-Q5_K_M now PASSES the DWQ-anchored fixture without any threshold relaxation.",
+    "measurement_2026_05_17": {
+      "model": "gemma4-ara-2pass-APEX-Q5_K_M.gguf",
+      "hf2q_head": "c2777629",
+      "cosine_mean": 0.999843,
+      "cosine_p1": 0.998183,
+      "cosine_min": 0.792230,
+      "cosine_min_layer": 16,
+      "argmax_flip_rate": 0.0050,
+      "ppl_delta_pct": 0.0015,
+      "n_pairs": 30000,
+      "n_layers": 30,
+      "max_tokens": 1000
+    },
+    "fixture_reference_dwq": {
+      "cosine_mean": 0.999672,
+      "cosine_p1": 0.996080,
+      "argmax_div": 0.0080,
+      "ppl_delta_pct": 0.0014
+    },
+    "comparison": "APEX cosine_mean 0.999843 EXCEEDS DWQ fixture 0.999672.  APEX p1 0.998183 EXCEEDS DWQ p1 0.996080.  APEX argmax_div 0.0050 (5 flips/1000) is LOWER than DWQ 0.0080.  Per operator directive '`do NOT relax thresholds to mask this`' — thresholds unchanged; the live measurement passes the high-bar DWQ envelope.",
+    "likely_root_cause_of_closure": "ADR-032 (commit 9e64df5c, 2026-05-17) default-flipped HF2Q_FA_F16=on + HF2Q_NO_FA=off.  Hypothesis: pre-ADR-032 the TQ V dequant landed in BF16 (7-bit mantissa) shmem; post-ADR-032 it lands in F16 (10-bit mantissa).  ~8× tighter dequant residual envelope through the same TQ codec.  When the gate_h_open_issue note was authored (2026-05-16, HEAD 4166ce50) the BF16 path was the default for FA; ADR-032 retired that as part of the Bug A root-cause work and incidentally tightened the TQ envelope.",
+    "outstanding_observation": "Layer 16 contains a single pair with cosine=0.792 (worst across all 30000 pairs).  Layer 22 similarly has min=0.858.  The fleet mean stays at 0.9998 because these are isolated outliers among 1000 positions/layer.  Not a gating issue but worth flagging if future investigations target per-position TQ behavior.",
+    "history": "Original gate_h_open_issue authored 2026-05-16 at hf2q HEAD 4166ce50 (commit 79b43617).  At that point cosine_mean was 0.865 on APEX — confirmed in the commit message body.  No targeted fix between 4166ce50 and c2777629; closure is collateral benefit of ADR-032's peer-aligned FA precision."
   }
 }
