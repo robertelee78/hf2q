@@ -45,6 +45,8 @@ rerank logic.
 |---|---|---|---|
 | `HF2Q_BATCHED_PREFILL` | off | `1` | Use the experimental batched prefill (`forward_prefill_batched`) instead of per-token prefill. Retained for parity diagnostics; per-token is the production path. |
 | `HF2Q_F16_KV` | off | `1` | Allocate the dense KV cache as F16 instead of F32. Experimental — the current F16 path has a separate bug worse than F32; per ADR-009 the default F32 path is preferred. |
+| `HF2Q_NO_FA` | shape-aware (on at `seq_len ≥ 32`) | `0`/`1`/`false`/`off`/`on` | Batched-prefill global D=512 attention path: `1`/default routes through F32 tensor-mm (NO_FA); `0` reverts to BF16 flash-attention. Default-flipped 2026-05-16 (commit `03328ee5`) to fix Gemma-4 ara-abliterated argmax drift on enumeration prompts at decode-pos ~35.  When `=0`, the FA-D=512 path can exhibit late-decode argmax loops on long greedy enumerations (Bug A); see `HF2Q_FA_F16` for the kernel-level fix. |
+| `HF2Q_FA_F16` | off | `1` | Switch flash-attention prefill from BF16 (7-bit mantissa) to F16 (10-bit mantissa) in shmem for both D=256 sliding and D=512 global layers.  **Required for coherence when `HF2Q_NO_FA=0`** on Gemma 4 D=512 global layers (Bug A fix, mlx-native `eb8119b` + hf2q `5dae1bc7`).  Adds ~2.4% decode latency at tg2000 due to extra F32→F16 cast dispatches; opt-in until wider exposure justifies a default-flip.  Memory cost: 4 F16 perm buffers + global F16 mask (~24–134 MB at typical seq lengths). |
 
 ## Dense KV / decode layout
 
