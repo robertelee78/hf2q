@@ -560,9 +560,17 @@ fn run_two_regime_decode(
         .len()
         .min(tq_capture.pre_replay_argmax.len());
     let mut flips = 0usize;
+    // ADR-032 followup 2026-05-17: track WHICH positions flipped so the
+    // outlier characterization can be done without re-running.
+    let mut flip_positions: Vec<(usize, u32, u32)> = Vec::new();
     for i in 0..n {
         if tq_capture.pre_replay_argmax[i] != dense_capture.final_tokens[i] {
             flips += 1;
+            flip_positions.push((
+                i,
+                dense_capture.final_tokens[i],
+                tq_capture.pre_replay_argmax[i],
+            ));
         }
     }
     let argmax_flip_rate = if n == 0 {
@@ -570,6 +578,12 @@ fn run_two_regime_decode(
     } else {
         flips as f32 / n as f32
     };
+    if !flip_positions.is_empty() {
+        eprintln!("[GATE_H_DIAG] argmax flip positions (step, dense_token, tq_token):");
+        for (step, d, t) in &flip_positions {
+            eprintln!("  step {}: dense={} tq={}", step, d, t);
+        }
+    }
 
     let envelope = GateHEnvelope {
         cosine,
