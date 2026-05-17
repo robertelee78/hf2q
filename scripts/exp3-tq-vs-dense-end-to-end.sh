@@ -61,7 +61,7 @@ capture_one() {
         env -u HF2Q_LAYER_POLICY -u HF2Q_TQ_CODEBOOK_BITS HF2Q_USE_DENSE=1 \
             "$HF2Q_BIN" parity capture \
                 --model "$MODEL" \
-                --output-dir "$out_dir" \
+                --output "$out_dir" \
                 --prompt all 2>"$out_dir/stderr.log" >"$out_dir/stdout.log"
     else
         # TQ default-on — explicitly unset every dense / policy override so we
@@ -69,7 +69,7 @@ capture_one() {
         env -u HF2Q_USE_DENSE -u HF2Q_LAYER_POLICY -u HF2Q_TQ_CODEBOOK_BITS \
             "$HF2Q_BIN" parity capture \
                 --model "$MODEL" \
-                --output-dir "$out_dir" \
+                --output "$out_dir" \
                 --prompt all 2>"$out_dir/stderr.log" >"$out_dir/stdout.log"
     fi
 }
