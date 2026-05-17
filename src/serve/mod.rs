@@ -624,27 +624,23 @@ fn render_jinja_template_with_specials(
         minijinja::Value::UNDEFINED
     });
 
-    // Python string method shims via `set_unknown_method_callback`.
-    // Handles: `.startswith(prefix)`, `.endswith(suffix)` called as attribute
-    // method invocations on string values (Qwen3.6 template line 72).
-    env.set_unknown_method_callback(|_state, value, method, args| {
-        let s = value.as_str().unwrap_or("");
-        match method {
-            "startswith" => {
-                let prefix = args.first().and_then(|v| v.as_str()).unwrap_or("");
-                Ok(minijinja::Value::from(s.starts_with(prefix)))
-            }
-            "endswith" => {
-                let suffix = args.first().and_then(|v| v.as_str()).unwrap_or("");
-                Ok(minijinja::Value::from(s.ends_with(suffix)))
-            }
-            other => Err(
-                minijinja::Error::from(minijinja::ErrorKind::UnknownMethod).with_source(
-                    std::io::Error::other(format!("string has no method named {other}")),
-                ),
-            ),
-        }
-    });
+    // Python method shims via `minijinja-contrib`'s pycompat callback.
+    // The official Google Gemma 4 chat template (and many others)
+    // authors call `.get('reasoning')` on message dicts (line 238 of
+    // the embedded Gemma 4 template) and `.startswith` / `.endswith`
+    // on strings.  The pycompat callback emulates the Python str/dict/
+    // list/tuple method set so these all work.
+    //
+    // Mirrors `src/serve/api/engine.rs:7861` (the API path).  Pre-this-
+    // patch the CLI/generate path used a hand-rolled callback that only
+    // supported `startswith`/`endswith` — calling `.get` on the bartowski
+    // GGUF's official Gemma 4 template produced
+    // `"unknown method: map has no method named get (in chat:238)"`.
+    //
+    // pycompat is purely additive: it is only consulted when minijinja's
+    // built-in method dispatch returns UnknownMethod, so it cannot break
+    // existing templates that resolved without it.
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
 
     env.add_template("chat", template_str)
         .context("Failed to parse chat template as Jinja2")?;
