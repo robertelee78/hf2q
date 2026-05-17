@@ -246,136 +246,78 @@ impl MlxModelWeights {
         let kv_dtype = if use_f16_kv { DType::F16 } else { DType::F32 };
         let kv_elem_bytes = if use_f16_kv { 2 } else { 4 };
 
-        // Option 3 (Phase D) — non-FA tensor-mm attention path mirroring
-        // llama.cpp's `-fa 0`:
-        //   1. cast Q bf16 -> f32 (src1 dtype for our bf16 tensor-mm)
-        //   2. Q @ K^T via hf2q_dense_mm_bf16_f32_tensor -> kq f32 [nh, seq, seq]
-        //   3. scale_mask_softmax_f32 (scale is pre-applied in Q's norm
-        //      weights; passes 1.0; reuses the existing bf16 sliding /
-        //      global masks from the flash-attn path)
-        //   4. transpose_last2_bf16 on V: [nkv, seq, hd] -> [nkv, hd, seq]
-        //   5. scores @ V^T via hf2q_dense_mm_bf16_f32_tensor -> attn f32 [nh, seq, hd]
-        //   6. permute_021_f32 -> pf_sdpa_out f32 [seq, nh, hd]
+        // ADR-032 (2026-05-17): HF2Q_NO_FA reduced to debug/diagnostic flag.
         //
-        // BUG-coherence fix (2026-05-16, refined 2026-05-17):
-        // default-flipped to TRUE.
+        // History: this was previously default-on at seq_len>=32 as a
+        // workaround for Bug A (FA-D=512 BF16-Q argmax drift, Hemoglobin
+        // loop at decode-pos ~70 on enumeration prompts).  ADR-032 Phase 1
+        // peer-kernel diff against llama.cpp's `kernel_flash_attn_ext`
+        // showed that bug was specifically an *instantiation* deviation:
+        // llama.cpp's default `kernel_flash_attn_ext_f16_dk512_dv512` uses
+        // `FA_TYPES` (Q/K/V all `half`/F16 in shmem), and only the explicit
+        // BF16-KV-cache instantiation (`FA_TYPES_BF`) uses `bfloat`.
+        // Gemma 4's default KV cache is F16 in llama.cpp, so peer's
+        // production path is F16-Q-in-shmem — NOT BF16.  Our prior NO_FA
+        // default routed around the FA path entirely; ADR-032 instead
+        // fixes the kernel-instantiation deviation (see `HF2Q_FA_F16`
+        // below) so the FA path matches peer's algorithm.
         //
-        // ROOT CAUSE (refined): the FA prefill kernel stores Q in BF16
-        // shared memory.  BF16's 7-bit mantissa carries ~0.39% error per
-        // Q element, which on the 5 global D=512 attention layers (full-
-        // attn, head_dim=512) compounds across the seq-wide dot product
-        // and the 30-layer residual stream into argmax flips on greedy
-        // decode of enumeration-style prompts.  The 25 sliding D=256
-        // layers (head_dim=256, sliding-window tile-skip) tolerate BF16
-        // precision without measurable coherence loss — the bug is
-        // *specifically* in the global attention path.
+        // Tensor-mm fallback retained as `HF2Q_NO_FA=1` for diagnostic A/B
+        // comparison only.  At seq_len<32 the dense matmul kernel
+        // (`dense_matmul_bf16_f32_tensor`) returns a hard error because
+        // its tile reduction is 32-aligned; we therefore force FA at
+        // short seq regardless of operator request.
         //
-        // Empirical localisation (HF2Q_PROFILE_BUCKETS=1):
-        //   FA_SW (D=256 sliding):   25 layers  BF16 FA  — coherence OK
-        //   NOFA_* (D=512 global):    5 layers  F32 tensor-mm — required
-        //
-        // HF2Q_FA_F16 scaffolding (commits ab8580db, 5c6bb5b0) explored
-        // routing the sliding D=256 path through F16 FA with F32-sourced
-        // F16 buffers; that DID NOT fix coherence on the chemistry-
-        // glossary probe, falsifying the "sliding-layer FA bug"
-        // hypothesis and confirming the bug is global-only.
-        //
-        // OPTIMAL HYBRID DESIGN: this default-flip is *not* a workaround;
-        // it is the correct production configuration.  The
-        // `route_through_nofa = use_no_fa && !is_sliding` gate at line
-        // ~1256 means HF2Q_NO_FA=1 routes ONLY the 5 global D=512 layers
-        // through tensor-mm.  Per the inline comment at :1248-1255 this
-        // saves ~52 ms wall at pp8333 vs FA on global (uncapped K means
-        // FA's tile-skip helps less), so global-via-tensor-mm is BOTH
-        // faster AND precision-correct.  Sliding stays on FA where its
-        // tile-skip is decisive (would be 1771 ms slower under uncapped
-        // tensor-mm).
-        //
-        // Speed: 0% measured cost at seq 351-1359 vs HF2Q_NO_FA=0;
-        // -1.3% at seq=246.  Memory: O(seq²) for the dense `pf_kq`
-        // buffer [n_heads, seq, seq] F32 used by global layers only —
-        // ~4 MB at seq=246; ~118 MB at seq=1359; ~555 MB at seq=2455.
-        // Long-context users can opt back to all-FA via HF2Q_NO_FA=0
-        // (accepts coherence regression on enumeration prompts but
-        // bounds memory at very long seq_len).
-        //
-        // D=512 (full-attn) was already comment-documented in
-        // flash_attn_prefill_d512.metal §458-468 as the originally-fixed
-        // version of this bug class (the "byte-1026 divergence from
-        // llama.cpp on sourdough_gate" of ADR-011-phase2-wave2c-d512-
-        // bug-fix.md applied scale post-matmul in F32 but kept Q in
-        // BF16 shmem — that left the residual Q-precision bug that this
-        // default-flip routes around for global layers).
-        // Threshold: dense_matmul_bf16_f32_tensor (the tensor-mm Q@K^T kernel
-        // that NO_FA dispatches to in the V-side scores@V^T leg) requires
-        // K >= 32 because its tile reduction is 32-aligned.  At very short
-        // prompts (seq_len < 32 — typical of unit-test fixtures like the
-        // "what-is-22" probe) the NO_FA path returns
-        // `dense_matmul_bf16_f32_tensor: K (N) must be >= 32`.  The
-        // coherence bug only manifests at long prompts (≥30+ decode tokens
-        // attending against ≥200+ prompt tokens), so we use FA at short
-        // seq_len with no coherence cost.  Threshold 32 is the kernel's
-        // hard requirement; the chemistry-glossary regression prompt is
-        // 246 tokens, well above this cliff.
+        // Memory: the NO_FA path allocates `pf_kq` [n_heads, seq, seq]
+        // F32 used by global D=512 layers only — ~4 MB at seq=246,
+        // ~118 MB at seq=1359, ~555 MB at seq=2455.  The FA path
+        // (default) scales O(seq) not O(seq²), so long-context workloads
+        // benefit from the new default in addition to the algorithmic
+        // alignment.
         let env_no_fa = match std::env::var("HF2Q_NO_FA").as_deref() {
             Ok("0") | Ok("false") | Ok("off") => Some(false),
             Ok("1") | Ok("true") | Ok("on") => Some(true),
             _ => None,
         };
         let use_no_fa = match env_no_fa {
-            // Explicit override always honored (operator may force either
-            // path for diagnostic purposes; FA at long prompts is the
-            // known-broken default we work around, NO_FA at K<32 returns
-            // a clear error message via the kernel guard).
-            Some(b) => b,
-            // Default: NO_FA when the dense matmul can handle the shape,
-            // FA otherwise.  Both paths are correctness-bounded at this
-            // seq_len — FA's BF16-Q precision drift is below the
-            // observable threshold for prompts shorter than ~30 tokens.
-            None => seq_len >= 32,
+            // Explicit override always honored.  Operator may force NO_FA
+            // for diagnostic A/B (e.g. validating a future FA kernel
+            // change against the tensor-mm reference).
+            Some(b) => b && seq_len >= 32, // force-FA at seq<32 (kernel guard)
+            // Default (ADR-032): use FA path.  F16-Q-in-shmem matches
+            // peer algorithm; precision is sufficient at both D=256 sliding
+            // and D=512 global layers.
+            None => false,
         };
 
-        // BUG-coherence kernel migration step 3 (2026-05-16): F16 FA path.
+        // ADR-032 (2026-05-17): F16 FA path — peer-aligned default.
         //
-        // When HF2Q_FA_F16=1, the D=256 sliding-attention layers route
-        // through `dispatch_flash_attn_prefill_f16_d256_with_blk`
-        // (mlx-native commit 6562eda) instead of the BF16 variant.
-        // Inputs are cast BF16→F16 via `cast_bf16_to_f16` (mlx-native
-        // commit 64b5497) before the FA call and the F16 output is cast
-        // F16→BF16 back into `pf_sdpa_out_perm` for compatibility with
-        // o_proj's BF16 input.
+        // Q/K/V are written F32 → F16 via `permute_021_f32_to_f16` (single
+        // rounding step, mantissa-faithful) and the FA prefill kernel
+        // instantiates with `T=half` (10-bit mantissa).  This matches
+        // llama.cpp's default `kernel_flash_attn_ext_f16_dk{256,512}_dv*`
+        // template `FA_TYPES` (see /opt/llama.cpp/ggml/src/ggml-metal/
+        // ggml-metal.metal:6472, `half, half4, simdgroup_half8x8` for Q
+        // shmem; F32 for accumulator, softmax, scale).
         //
-        // *** KNOWN LIMITATION (2026-05-16): this wiring does NOT fix the
-        // BUG-gemma4-coherence argmax-flip bug ***
+        // Mantissa budget over a 512-element Q·K dot product accumulator:
+        //   F16 × F16: sqrt(512) × 2^-11 ≈ 1.1% — below argmax-flip threshold
+        //   BF16 × BF16: sqrt(512) × 2^-8  ≈ 9%  — above threshold for
+        //     narrow-margin greedy decode (Bug A: Format: Hemoglobin loop)
         //
-        // The source pf_q_perm/pf_k_perm/pf_v_perm buffers are written
-        // as BF16 by fused_head_norm_rope_batch_f32_with_bf16{,_f32_perm}
-        // — the F32→BF16 cast happens upstream of this branch.  Casting
-        // BF16→F16 here cannot recover the precision already lost in
-        // the upstream BF16 store; F16 just carries 7-bit mantissa
-        // values in a 10-bit envelope.  Empirically the F16 FA path
-        // produces the same buggy `"Format: \""` argmax as the BF16
-        // path at decode position ~35 on the chemistry-glossary probe.
+        // Default-flipped to TRUE (ADR-032 Phase 6).  Sliding D=256 layers
+        // dispatch `dispatch_flash_attn_prefill_f16_d256_with_blk`; global
+        // D=512 layers dispatch `dispatch_flash_attn_prefill_f16_d512_with_blk`.
+        // F16 → BF16 cast on output preserves o_proj's BF16 input contract.
         //
-        // To actually restore coherence via the FA path, a future
-        // iteration must source the F16 perm buffers from the F32
-        // pf_q_normed/pf_k_normed/pf_v_normed buffers directly — either
-        // by adding a F32→F16-with-permute fused kernel, or by modifying
-        // fused_head_norm_rope_batch_f32 to take an F16 permuted output
-        // option alongside its existing BF16 one.  The dispatcher
-        // (mlx-native 6562eda) and cast kernels (mlx-native 64b5497)
-        // remain ready for that wiring; only the upstream precision
-        // routing needs more work.
-        //
-        // The NO_FA workaround (commit 03328ee5) remains the validated
-        // coherent default until that upstream work lands.
-        //
-        // This branch is kept (default-off) as testable scaffolding so
-        // future investigators can A/B the FA-vs-tensor-mm dispatch
-        // shape without rebuilding cast / dispatcher infrastructure.
-        let use_fa_f16 = matches!(
+        // Opt-out via `HF2Q_FA_F16=0|false|off` reverts to legacy BF16
+        // instantiation (peer's `FA_TYPES_BF` path) for diagnostic A/B
+        // comparison only.  BF16-Q is the known-buggy path on enumeration
+        // prompts at D=512; the opt-out exists for kernel-bisection work,
+        // not production use.
+        let use_fa_f16 = !matches!(
             std::env::var("HF2Q_FA_F16").as_deref(),
-            Ok("1") | Ok("true") | Ok("on")
+            Ok("0") | Ok("false") | Ok("off")
         );
 
         // Wave P4.17 — super-flag: per-op isolation for bucket attribution.
