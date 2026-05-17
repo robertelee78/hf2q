@@ -246,9 +246,8 @@ impl MlxModelWeights {
         let kv_dtype = if use_f16_kv { DType::F16 } else { DType::F32 };
         let kv_elem_bytes = if use_f16_kv { 2 } else { 4 };
 
-        // Option 3 (Phase D) — HF2Q_NO_FA=1 swaps the flash-attention
-        // prefill path for a tensor-mm attention path that mirrors
-        // llama.cpp's `-fa 0` fast path:
+        // Option 3 (Phase D) — non-FA tensor-mm attention path mirroring
+        // llama.cpp's `-fa 0`:
         //   1. cast Q bf16 -> f32 (src1 dtype for our bf16 tensor-mm)
         //   2. Q @ K^T via hf2q_dense_mm_bf16_f32_tensor -> kq f32 [nh, seq, seq]
         //   3. scale_mask_softmax_f32 (scale is pre-applied in Q's norm
@@ -257,11 +256,42 @@ impl MlxModelWeights {
         //   4. transpose_last2_bf16 on V: [nkv, seq, hd] -> [nkv, hd, seq]
         //   5. scores @ V^T via hf2q_dense_mm_bf16_f32_tensor -> attn f32 [nh, seq, hd]
         //   6. permute_021_f32 -> pf_sdpa_out f32 [seq, nh, hd]
-        // The FA path stays live; env flag swap lets us A/B without
-        // code churn.  The non-FA path requires ~555 MB of extra
-        // intermediate buffers at seq_len=2455; only allocate them if
-        // the flag is set so the default-path footprint is unchanged.
-        let use_no_fa = std::env::var("HF2Q_NO_FA").is_ok();
+        //
+        // BUG-coherence fix (2026-05-16): default-flipped to TRUE.
+        //
+        // The flash-attn prefill kernel (D=256 sliding layers, 25/30 of
+        // Gemma 4) stores Q in BF16 shared memory before Q·K^T, while the
+        // tensor-mm path uses F32 Q.  Each Q element rounded to BF16 carries
+        // 0.39% relative error per side of the matmul; over 256-element dot
+        // products and 30 layers this accumulates into ~argmax flips on
+        // greedy decode.  Empirical: with FA on Gemma 4 ara-abliterated at
+        // tg1200 chemistry-glossary probe, the model diverges from
+        // llama.cpp/sequential at decode position ~35 (`"Format: \""` vs
+        // `` `Format: \`` `` ``) and cascades into Sodium-Lauryl loops.
+        // Same prompt with NO_FA stays coherent — matches llama.cpp's `-fa 0`.
+        //
+        // D=512 (full-attn, 5/30 layers) was already fixed by applying scale
+        // post-matmul in F32 — see flash_attn_prefill_d512.metal §458-468
+        // and ADR-011-phase2-wave2c-d512-bug-fix.md.  D=256 retained the
+        // BF16 pre-scale and the BF16-Q-in-shmem dot product, which is the
+        // residual precision bug this default-flip works around.
+        //
+        // Speed: 2% slower at typical prompt lengths (1686 vs 1723 t/s at
+        // seq=246, M5 Max).  Memory: O(seq²) for the dense `pf_kq` buffer
+        // [n_heads, seq, seq] F32 — ~555 MB at seq=2455; ~4 MB at seq=246.
+        // Long-context users can opt back to FA via HF2Q_NO_FA=0; that path
+        // remains correct for non-precision-sensitive workloads and
+        // becomes mandatory at extreme seq_len where the dense matmul
+        // outgrows memory.
+        //
+        // Future cleanup: rebuild the FA kernel with F32 Q in shared memory
+        // (or apply scale post-matmul as D=512 does) so this default-flip
+        // can be reverted.  Tracked separately; the NO_FA path is the
+        // coherent baseline until then.
+        let use_no_fa = match std::env::var("HF2Q_NO_FA").as_deref() {
+            Ok("0") | Ok("false") | Ok("off") => false,
+            _ => true,
+        };
 
         // Wave P4.17 — super-flag: per-op isolation for bucket attribution.
         // When on, every dispatch is bracketed by s.finish()/s = exec.begin()
