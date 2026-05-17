@@ -4105,6 +4105,20 @@ fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
     let _ = loaded
         .weights
         .forward_decode(last_token, prompt.len(), &mut loaded.ctx, &mut profiler)?;
+    // Discard the warmup's per-prefill cache state.  warmup runs with
+    // `prompt_len=1, max_tokens=1` → `linear_capacity = 2` allocated for
+    // every per-layer KV buffer.  The `is_none()` re-alloc guards at
+    // forward_prefill.rs:841 and forward_prefill_batched.rs:419 (load-
+    // bearing for spec-decode multi-call cache reuse) would otherwise
+    // make the FIRST real chat completion fail with
+    // `cache_capacity(2)` inside the V-quantize / FA dispatch.  Mirrors
+    // the embedding-mode reset at forward_prefill.rs:2216-2218 (same root
+    // cause: a small-budget prefill poisons capacity for subsequent
+    // calls).
+    loaded.weights.dense_kvs = None;
+    loaded.weights.dense_sdpa_tmp = None;
+    loaded.weights.leg_hb_encoded = None;
+    loaded.weights.hybrid_kv = None;
     tracing::info!(
         "hf2q-engine warmup complete in {:.0}ms",
         started.elapsed().as_secs_f64() * 1000.0

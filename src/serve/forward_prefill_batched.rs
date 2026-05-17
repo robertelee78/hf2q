@@ -416,9 +416,26 @@ impl MlxModelWeights {
             // is bit-identical to pre-iter-63 for the cmd_generate /
             // parity / engine flows.
             if INVESTIGATION_ENV.hybrid_kv {
-                if self.hybrid_kv.is_none() {
-                    eprintln!("[ADR-028 Phase 10c] Allocating hybrid_kv ({} layers, F16 K + TQ-HB V {}-bit) [batched]",
-                        num_layers, tq_codebook_bits_prefill);
+                // Re-allocate when EITHER:
+                //   (a) cache is None (fresh instance / post-warmup cleanup)
+                //   (b) any non-sliding layer's existing capacity < this
+                //       request's linear_capacity (would otherwise fault
+                //       inside the V-quantize / FA dispatch with
+                //       `cache_capacity(N) < write_pos(N)`)
+                // BUT only when start_pos == 0.  Spec-decode appends with
+                // start_pos > 0 and the orchestrator owns capacity guarantees;
+                // re-allocating mid-conversation would discard accepted-token
+                // KV (the original is_none() guard's load-bearing case).
+                let needs_realloc = match &self.hybrid_kv {
+                    None => true,
+                    Some(hk) if start_pos == 0 => {
+                        hk.iter().any(|h| !h.is_sliding && h.capacity < linear_capacity)
+                    }
+                    _ => false,
+                };
+                if needs_realloc {
+                    eprintln!("[ADR-028 Phase 10c] Allocating hybrid_kv ({} layers, F16 K + TQ-HB V {}-bit, cap={}) [batched]",
+                        num_layers, tq_codebook_bits_prefill, linear_capacity);
                     let mut hybrid_vec: Vec<crate::serve::forward_mlx::HybridKvBuffers> = Vec::with_capacity(num_layers);
                     for (layer_idx, layer) in self.layers.iter().enumerate() {
                         let nkv_l = layer.num_kv_heads;
