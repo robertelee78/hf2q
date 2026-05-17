@@ -168,23 +168,40 @@ pub(crate) fn read_tq_codebook_bits_env() -> u32 {
 /// Pure parsing logic for `HF2Q_TQ_KV`: takes the env value (as
 /// `Option<&str>`) and returns whether TQ-active mode is enabled.
 /// Pure → unit-testable without env contention.
+///
+/// Semantics (matches `env_default_true` in `debug/investigation_env.rs`):
+///   - `None` (unset)            → `true`  (default-on)
+///   - `Some("0"|"false"|"off")` → `false` (operator-disabled)
+///   - `Some("1"|"true"|"on")`   → `true`  (explicit-on)
+///   - `Some(other-non-empty)`   → `true`  (permissive default-on)
+///   - `Some("")` / whitespace   → `true`  (treated as unset)
+///
+/// Default-on landed 2026-05-17 per operator directive (see auto-memory
+/// `feedback_tq_default_directive.md` and the 2026-05-17 verification
+/// pass: sourdough_qwen35.sh PASS + tg200 ahead of llama.cpp).
 pub fn parse_tq_active_mode(env: Option<&str>) -> bool {
     match env {
+        None => true,
         Some(v) => {
             let t = v.trim();
-            !t.is_empty() && t != "0"
+            if t.is_empty() {
+                return true;
+            }
+            !(t.eq_ignore_ascii_case("0")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("off"))
         }
-        None => false,
     }
 }
 
-/// Returns `true` iff the operator has enabled TQ-active KV mode via
-/// `HF2Q_TQ_KV=1`.  Engine spawn uses this to decide whether to emit a
-/// `TqPackedSpillDescriptor` alongside the dense `KvSpillDescriptor`.
+/// Returns `true` iff TQ-active KV mode is enabled.  Engine spawn uses
+/// this to decide whether to emit a `TqPackedSpillDescriptor` alongside
+/// the dense `KvSpillDescriptor`.
 ///
-/// Empty / `0` / unset → `false`.  Any non-`0` non-empty value → `true`.
-/// Matches the `kv-persist` startup-disable predicate's permissive
-/// truthiness convention.
+/// **Default ON** — operator directive: "TQ is the default path, not an
+/// env-gated opt-in" (2026-04-23).  Verified 2026-05-17 on Qwen3.6 APEX
+/// Q5_K_M: sourdough_qwen35.sh PASS + decode tg200 ahead of llama.cpp
+/// with TQ default-on.  Opt-out via `HF2Q_TQ_KV=0` (or `false` / `off`).
 pub fn is_tq_active_mode() -> bool {
     parse_tq_active_mode(std::env::var("HF2Q_TQ_KV").ok().as_deref())
 }
@@ -234,17 +251,23 @@ mod tests {
         }
     }
 
-    /// `parse_tq_active_mode` honors permissive truthiness — pure-fn
-    /// test, no env contention.
+    /// `parse_tq_active_mode` is default-on (matches `env_default_true`
+    /// semantics).  Pure-fn test, no env contention.  Operator directive
+    /// 2026-04-23: "TQ is the default path, not an env-gated opt-in".
     #[test]
-    fn parse_tq_active_mode_permissive_truthiness() {
-        // Unset / empty / 0 → false.
-        assert!(!parse_tq_active_mode(None));
-        for falsy in ["", "0", "  0  ", "  "] {
+    fn parse_tq_active_mode_default_on() {
+        // Unset → default ON.
+        assert!(parse_tq_active_mode(None));
+        // Whitespace / empty trimmed → treated as unset → ON.
+        for blank in ["", "   ", "\t", "\n"] {
+            assert!(parse_tq_active_mode(Some(blank)), "blank={:?}", blank);
+        }
+        // Explicit falsy values → OFF.
+        for falsy in ["0", "false", "off", "FALSE", "Off", "  0  "] {
             assert!(!parse_tq_active_mode(Some(falsy)), "falsy={:?}", falsy);
         }
-        // Any non-zero non-empty trimmed → true.
-        for truthy in ["1", "yes", "true", "on", "anything"] {
+        // Explicit truthy / unrecognized non-empty → ON (permissive default-on).
+        for truthy in ["1", "yes", "true", "on", "anything", "TRUE", "ON"] {
             assert!(parse_tq_active_mode(Some(truthy)), "truthy={:?}", truthy);
         }
     }

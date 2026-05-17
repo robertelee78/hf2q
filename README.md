@@ -18,8 +18,11 @@ Metal kernels we own end-to-end.
 > * **Gemma-4 26B-A4B Q6_K decode** — `tg200` 105.2 t/s vs llama.cpp
 >   `-fa 1` 104.32 t/s (**1.01× peer-FA AHEAD**); `tg2000` 93.5 t/s vs
 >   96.69 t/s (**0.97× peer-FA**).
-> * **Qwen 3.6 35B-A3B APEX-Q5_K_M decode** — `tg200` 130.6 t/s vs
->   llama.cpp `-fa 1` 101.31 t/s (**1.29× peer-FA AHEAD**).
+> * **Qwen 3.6 35B-A3B APEX-Q5_K_M decode (TQ-V default-on)** — `tg200`
+>   130.6 t/s vs llama.cpp `-fa 1` 100.97 t/s (**1.29× peer-FA AHEAD**);
+>   `tg1500` 129.1 t/s vs 89.25 t/s (**1.45× peer-FA AHEAD** — TQ-V's
+>   bandwidth advantage widens with depth).  Byte-identical to llama.cpp
+>   for the first 242 bytes of greedy output (sourdough_qwen35.sh gate).
 > * **Gemma-4 prefill** — `pp1800` 2734 t/s vs llama.cpp 2837 t/s
 >   (**0.96× peer-FA**); `pp3700` 2703 t/s vs 2181 t/s (**1.24×
 >   peer-FA AHEAD**) — hf2q's prefill rate drops only ~1% from
@@ -28,7 +31,8 @@ Metal kernels we own end-to-end.
 > * **TurboQuant 8-bit KV cache** — Qwen 3.6 35B-A3B at 32K context:
 >   340 MiB vs 1.34 GiB F32 baseline = **3.94× memory savings**
 >   (ADR-027 iter-34, regression-pinned by
->   `tests/qh35_no_f32_kv_alloc_with_tq_kv.rs`).
+>   `tests/qh35_no_f32_kv_alloc_with_tq_kv.rs`).  Default-on for Qwen
+>   3.5/3.6 as of 2026-05-17 — opt out with `HF2Q_TQ_KV=0`.
 >
 > Methodology references in
 > [`docs/peer-parity-baselines-2026-04-26.md`](docs/peer-parity-baselines-2026-04-26.md);
