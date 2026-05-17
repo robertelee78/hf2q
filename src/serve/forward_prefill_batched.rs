@@ -288,9 +288,33 @@ impl MlxModelWeights {
         // (or apply scale post-matmul as D=512 does) so this default-flip
         // can be reverted.  Tracked separately; the NO_FA path is the
         // coherent baseline until then.
-        let use_no_fa = match std::env::var("HF2Q_NO_FA").as_deref() {
-            Ok("0") | Ok("false") | Ok("off") => false,
-            _ => true,
+        // Threshold: dense_matmul_bf16_f32_tensor (the tensor-mm Q@K^T kernel
+        // that NO_FA dispatches to in the V-side scores@V^T leg) requires
+        // K >= 32 because its tile reduction is 32-aligned.  At very short
+        // prompts (seq_len < 32 — typical of unit-test fixtures like the
+        // "what-is-22" probe) the NO_FA path returns
+        // `dense_matmul_bf16_f32_tensor: K (N) must be >= 32`.  The
+        // coherence bug only manifests at long prompts (≥30+ decode tokens
+        // attending against ≥200+ prompt tokens), so we use FA at short
+        // seq_len with no coherence cost.  Threshold 32 is the kernel's
+        // hard requirement; the chemistry-glossary regression prompt is
+        // 246 tokens, well above this cliff.
+        let env_no_fa = match std::env::var("HF2Q_NO_FA").as_deref() {
+            Ok("0") | Ok("false") | Ok("off") => Some(false),
+            Ok("1") | Ok("true") | Ok("on") => Some(true),
+            _ => None,
+        };
+        let use_no_fa = match env_no_fa {
+            // Explicit override always honored (operator may force either
+            // path for diagnostic purposes; FA at long prompts is the
+            // known-broken default we work around, NO_FA at K<32 returns
+            // a clear error message via the kernel guard).
+            Some(b) => b,
+            // Default: NO_FA when the dense matmul can handle the shape,
+            // FA otherwise.  Both paths are correctness-bounded at this
+            // seq_len — FA's BF16-Q precision drift is below the
+            // observable threshold for prompts shorter than ~30 tokens.
+            None => seq_len >= 32,
         };
 
         // Wave P4.17 — super-flag: per-op isolation for bucket attribution.
