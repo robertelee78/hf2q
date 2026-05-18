@@ -9802,6 +9802,53 @@ pub fn dispatch_qmatmul(
         .map_err(|e| anyhow::anyhow!("dense_matmul_f32_f32_tensor failed: {e}"));
     }
 
+    // Native F16 weight tensor from GGUF (NOT the Q*→F16 shadow path above).
+    //
+    // Some convert pipelines, including hf2q's own (`should_emit_f16_for_kquant`
+    // in `src/quantize/layer_mix.rs`), emit raw F16 for tensors whose row length
+    // isn't a multiple of the K-quant super-block size (256) — e.g. Gemma 4
+    // 26B-A4B's `ffn_down.weight` (intermediate=2112) and `ffn_down_exps.weight`
+    // (moe_intermediate=704).  Community quants (bartowski, unsloth) instead
+    // fall back to 32-aligned legacy quants (Q5_1 / IQ4_NL / Q8_0); both
+    // patterns are valid per the GGUF spec and llama.cpp accepts either.
+    //
+    // `quantized_matmul_ggml` below only handles Q-family block types, so
+    // F16 weights would error there ("does not support F16").  Route them to
+    // the matching F16 kernels — F16 weight × F32 input → F32 output — at
+    // both prefill (m > 1, `dispatch_mm_v2_f16`) and decode (m = 1,
+    // `dispatch_dense_matvec_f16w_f32io`).  These are the same kernels used
+    // by the F16-shadow prefill path above, plus the decode-m=1 matvec
+    // already used by lm_head's F16 weight when present.
+    if weight.info.ggml_dtype == mlx_native::GgmlType::F16 {
+        let n = weight.info.rows as u32;
+        let k = weight.info.cols as u32;
+        if m == 1 {
+            let params = mlx_native::ops::dense_gemm::DenseGemmF16Params { m, n, k };
+            return mlx_native::ops::dense_gemm::dispatch_dense_matvec_f16w_f32io(
+                session.encoder_mut(),
+                registry,
+                device.metal_device(),
+                input,
+                &weight.buffer,
+                output,
+                &params,
+            )
+            .map_err(|e| anyhow::anyhow!("dispatch_dense_matvec_f16w_f32io (native F16) failed: {e}"));
+        }
+        return mlx_native::ops::quantized_matmul_ggml::dispatch_mm_v2_f16(
+            session.encoder_mut(),
+            registry,
+            device,
+            &weight.buffer,
+            input,
+            output,
+            m,
+            n,
+            k,
+        )
+        .map_err(|e| anyhow::anyhow!("dispatch_mm_v2_f16 (native F16) failed: {e}"));
+    }
+
     // ADR-029 iter-175 Step 1d — Q6_K NR2 decode-m=1 fast path via
     // pre-baked DispatchRecord.  Eliminates per-call HashMap pipeline
     // lookup, MTLSize::new, ggml_type match arms, and
@@ -9818,6 +9865,7 @@ pub fn dispatch_qmatmul(
     //   - weight.f16_shadow not applicable at m=1 (only consulted at
     //     m > MM_ROUTING_THRESHOLD)
     //   - weight.info.ggml_dtype != F32 (would have returned at F32 block)
+    //   - weight.info.ggml_dtype != F16 (would have returned at F16 block)
     if m == 1 && weight.info.ggml_dtype == mlx_native::GgmlType::Q6_K {
         let n = weight.info.rows as u32;
         let k = weight.info.cols as u32;
