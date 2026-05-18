@@ -226,39 +226,47 @@ impl Quantizer for VariantKQuantizer {
         // llama.cpp's `(WARNING: must use F16 due to unusual shape)`
         // branch.
         let target = if is_kquant_row_misaligned(row_len_for_skip) {
-            if let Some(fb) = kquant_misalignment_fallback(target) {
-                if row_len_for_skip % 32 == 0 {
-                    tracing::info!(
-                        tensor = %tensor.name,
-                        row_len = row_len_for_skip,
-                        variant = self.variant.name(),
-                        from = ?target,
-                        to = ?fb,
-                        "K-quant row not div 256 → legacy 32-aligned fallback"
-                    );
-                    fb
-                } else {
-                    tracing::warn!(
-                        tensor = %tensor.name,
-                        row_len = row_len_for_skip,
-                        variant = self.variant.name(),
-                        "K-quant + legacy fallback both unavailable (ncols not div 32) → F16 passthrough"
-                    );
-                    return f16_passthrough(tensor, &tensor.name);
-                }
-            } else {
-                // No fallback defined (target was already a legacy
-                // 32-aligned type — the misalignment is genuinely
-                // unfixable for this target).
-                tracing::warn!(
-                    tensor = %tensor.name,
-                    row_len = row_len_for_skip,
-                    variant = self.variant.name(),
-                    "no K-quant misalignment fallback for {:?} → F16 passthrough",
-                    target,
-                );
-                return f16_passthrough(tensor, &tensor.name);
+            let Some(fb) = kquant_misalignment_fallback(target) else {
+                // `target` is already a 32-aligned legacy type and the
+                // row is still misaligned to its block — the tensor is
+                // genuinely un-quantizable.  Surface a typed error
+                // rather than silently degrade to F16 (the no-fallback
+                // mantra: degraded output is worse than a loud failure).
+                return Err(QuantizeError::TensorQuantizeFailed {
+                    tensor: tensor.name.clone(),
+                    reason: format!(
+                        "variant-quantizer ({}): row_len={row_len_for_skip} not aligned to \
+                         any K-quant or legacy 32-aligned block, and target={target:?} \
+                         has no further downshift",
+                        self.variant.name()
+                    ),
+                });
+            };
+            if row_len_for_skip % 32 != 0 {
+                // Even the 32-aligned legacy fallback can't represent
+                // this row.  Production models (Gemma, Qwen, Llama)
+                // never hit this — every tensor's inner dim is div 32.
+                // If a future model breaks that, surface a typed error
+                // so the operator addresses it explicitly.
+                return Err(QuantizeError::TensorQuantizeFailed {
+                    tensor: tensor.name.clone(),
+                    reason: format!(
+                        "variant-quantizer ({}): row_len={row_len_for_skip} not div 32 — \
+                         no GGML block format can encode this tensor (Q-family blocks need \
+                         div 32, K-family need div 256).  Refusing to silently emit F16.",
+                        self.variant.name()
+                    ),
+                });
             }
+            tracing::info!(
+                tensor = %tensor.name,
+                row_len = row_len_for_skip,
+                variant = self.variant.name(),
+                from = ?target,
+                to = ?fb,
+                "K-quant row not div 256 — switching target to 32-aligned legacy"
+            );
+            fb
         } else {
             target
         };

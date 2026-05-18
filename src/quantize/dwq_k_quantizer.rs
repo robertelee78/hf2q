@@ -844,11 +844,12 @@ mod tests {
         assert_eq!(out.quant_info.ggml_type.as_deref(), Some("Q4_K"));
     }
 
-    /// **Iter D**: defensive non-256-multiple arm fires for a
-    /// synthetic non-vision name on the DWQ path (independent of the
-    /// vision substring match).
+    /// **Post-Bug-B / no-fallback (2026-05-17)**: row_len=1153 is
+    /// not div 32 and not div 256 — no GGML block format can encode
+    /// it.  DWQ delegates to the inner codec which surfaces a typed
+    /// error rather than silently emit F16.
     #[test]
-    fn dwq_p46_non_256_multiple_emits_f16() {
+    fn dwq_p46_non_32_multiple_returns_typed_error() {
         let row: Vec<f32> = (0..1153).map(|i| (i as f32) / 1153.0).collect();
         let data: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
         let tensor = TensorRef {
@@ -858,9 +859,14 @@ mod tests {
             data: std::sync::Arc::new(data),
         };
         let q = DwqKQuantizer::new(DwqKVariant::P46, &[], CalibrationData::None);
-        let out = q.quantize_tensor(&tensor, &default_layer_config()).unwrap();
-        assert_eq!(out.quant_info.method, "f16");
-        assert_eq!(out.data.len(), 1153 * 2);
+        let err = q
+            .quantize_tensor(&tensor, &default_layer_config())
+            .expect_err("row_len=1153 should surface typed error post no-fallback fix");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not div 32") && msg.contains("Refusing to silently emit F16"),
+            "expected un-quantizable typed error, got: {msg}"
+        );
     }
 
     #[test]

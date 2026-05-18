@@ -333,35 +333,41 @@ impl Quantizer for KQuantCodecQuantizer {
         // (ncols % 32 != 0), drop to F16 per llama.cpp's
         // `(WARNING: must use F16 due to unusual shape)` branch.
         let effective_target = if is_k_quant_target && is_kquant_row_misaligned(row_len_for_skip) {
-            if let Some(fb) = kquant_misalignment_fallback(self.target) {
-                if row_len_for_skip % 32 == 0 {
-                    tracing::info!(
-                        tensor = %tensor.name,
-                        row_len = row_len_for_skip,
-                        from = ?self.target,
-                        to = ?fb,
-                        "K-quant row not div 256 → legacy 32-aligned fallback"
-                    );
-                    fb
-                } else {
-                    tracing::warn!(
-                        tensor = %tensor.name,
-                        row_len = row_len_for_skip,
-                        target = ?self.target,
-                        "K-quant + legacy fallback both unavailable (ncols not div 32) → F16 passthrough"
-                    );
-                    return f16_passthrough(tensor, &tensor.name);
-                }
-            } else {
-                tracing::warn!(
-                    tensor = %tensor.name,
-                    row_len = row_len_for_skip,
-                    target = ?self.target,
-                    "no K-quant misalignment fallback for {:?} → F16 passthrough",
-                    self.target,
-                );
-                return f16_passthrough(tensor, &tensor.name);
+            let Some(fb) = kquant_misalignment_fallback(self.target) else {
+                // Target is already a 32-aligned legacy quant and row is
+                // still misaligned to its block — un-quantizable.  Loud
+                // typed error, no silent F16 (no-fallback mantra).
+                return Err(QuantizeError::TensorQuantizeFailed {
+                    tensor: tensor.name.clone(),
+                    reason: format!(
+                        "k-quant-codec: row_len={row_len_for_skip} not aligned to any \
+                         K-quant or legacy 32-aligned block, and target={:?} has no further \
+                         downshift",
+                        self.target
+                    ),
+                });
+            };
+            if row_len_for_skip % 32 != 0 {
+                // 32-aligned legacy can't fit either.  Production
+                // models never hit this (every tensor's inner dim is
+                // div 32).  Typed error if a future model does.
+                return Err(QuantizeError::TensorQuantizeFailed {
+                    tensor: tensor.name.clone(),
+                    reason: format!(
+                        "k-quant-codec: row_len={row_len_for_skip} not div 32 — no GGML block \
+                         format can encode this tensor (Q-family blocks need div 32, K-family \
+                         need div 256).  Refusing to silently emit F16."
+                    ),
+                });
             }
+            tracing::info!(
+                tensor = %tensor.name,
+                row_len = row_len_for_skip,
+                from = ?self.target,
+                to = ?fb,
+                "K-quant row not div 256 — switching target to 32-aligned legacy"
+            );
+            fb
         } else {
             self.target
         };
@@ -577,13 +583,18 @@ mod tests {
     /// `TensorQuantizeFailed` for misaligned rows. Iter D added the
     /// `should_emit_f16_for_kquant` predicate which fires before the
     /// codec dispatch, converting the rejection-error path into a
-    /// graceful F16 passthrough. The codec-level rejection (the actual
-    /// `KQuantCodecError::NotBlockAligned` typed error) is still
-    /// exercised at `src/quantize/k_quant_codec.rs::tests::rejects_…`
-    /// for callers that bypass this dispatcher.
+    /// graceful F16 passthrough.
+    ///
+    /// **Post-Bug-B / no-fallback (2026-05-17)**: row_len=200 is NOT
+    /// div 32, so neither the K-quant block (256) nor the canonical
+    /// 32-aligned legacy fallback (Q5_0/Q5_1/etc) can fit.  The
+    /// codec now refuses to silently emit F16 in that case and
+    /// surfaces a typed `TensorQuantizeFailed` so the operator
+    /// addresses the un-quantizable shape explicitly.  Production
+    /// models (Gemma, Qwen, Llama) never hit this path.
     #[test]
-    fn dispatcher_misaligned_row_routes_to_f16_passthrough() {
-        let row: Vec<f32> = vec![0.0_f32; 200]; // not a multiple of 256
+    fn dispatcher_misaligned_row_under_32_returns_typed_error() {
+        let row: Vec<f32> = vec![0.0_f32; 200]; // not div 32, not div 256
         let tensor = make_f32_tensor("blk.0.weird.weight", vec![200], &row);
         let cfg = LayerQuantConfig {
             bits: 0,
@@ -591,12 +602,14 @@ mod tests {
             preserve: false,
         };
         let q = KQuantCodecQuantizer::new("q4_k_m", KQuantTarget::Q4K, CalibrationData::None);
-        let out = q.quantize_tensor(&tensor, &cfg).unwrap();
-        assert_eq!(out.quant_info.method, "f16");
-        assert!(out.quant_info.preserved);
-        assert_eq!(out.quant_info.ggml_type.as_deref(), Some("F16"));
-        // F16 bytes: 2 per element × 200 elements.
-        assert_eq!(out.data.len(), 200 * 2);
+        let err = q
+            .quantize_tensor(&tensor, &cfg)
+            .expect_err("row_len=200 must surface typed error post no-fallback fix");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not div 32") && msg.contains("Refusing to silently emit F16"),
+            "expected un-quantizable typed error, got: {msg}"
+        );
     }
 
     /// **Iter D**: vision tensor with the LIVE blocker shape
@@ -672,11 +685,11 @@ mod tests {
         assert_eq!(out.data.len(), 1152 * 2);
     }
 
-    /// **Iter D**: defensive non-256-multiple arm fires on a synthetic
-    /// non-vision name (proves the predicate is independent of the
-    /// vision pattern).
+    /// **Post-Bug-B / no-fallback (2026-05-17)**: row_len=1153 is not
+    /// div 32 (1153 = 36×32 + 1) AND not div 256 — no GGML block
+    /// format encodes it.  Surface a typed error instead of silent F16.
     #[test]
-    fn non_256_multiple_non_vision_tensor_emits_f16() {
+    fn non_32_multiple_non_vision_tensor_returns_typed_error() {
         let row: Vec<f32> = (0..1153).map(|i| (i as f32) / 1153.0).collect();
         let tensor = make_f32_tensor("blk.0.attn_weird.weight", vec![1153], &row);
         let cfg = LayerQuantConfig {
@@ -685,9 +698,36 @@ mod tests {
             preserve: false,
         };
         let q = KQuantCodecQuantizer::new("q4_k_m", KQuantTarget::Q4K, CalibrationData::None);
+        let err = q
+            .quantize_tensor(&tensor, &cfg)
+            .expect_err("row_len=1153 must surface typed error post no-fallback fix");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not div 32") && msg.contains("Refusing to silently emit F16"),
+            "expected un-quantizable typed error, got: {msg}"
+        );
+    }
+
+    /// 32-aligned non-256-multiple tensor IS quantizable via the
+    /// legacy fallback (post Bug B fix).  Q4_K + row_len=2112 (Gemma 4
+    /// `intermediate_size`) downshifts to Q5_0 per
+    /// `kquant_misalignment_fallback`.
+    #[test]
+    fn kquant_misaligned_but_32_aligned_emits_legacy_fallback() {
+        let row: Vec<f32> = (0..2112).map(|i| (i as f32 - 1056.0) / 1056.0).collect();
+        let tensor = make_f32_tensor("blk.0.ffn_down.weight", vec![2112], &row);
+        let cfg = LayerQuantConfig {
+            bits: 0,
+            group_size: 0,
+            preserve: false,
+        };
+        let q = KQuantCodecQuantizer::new("q4_k_m", KQuantTarget::Q4K, CalibrationData::None);
         let out = q.quantize_tensor(&tensor, &cfg).unwrap();
-        assert_eq!(out.quant_info.method, "f16");
-        assert_eq!(out.data.len(), 1153 * 2);
+        // Q4_K → Q5_0 per llama.cpp's tensor_type_fallback table.
+        assert_eq!(out.quant_info.ggml_type.as_deref(), Some("Q5_0"));
+        // Q5_0 block = 22 bytes per 32 elements.
+        assert_eq!(out.data.len(), (2112 / 32) * 22);
+        assert_eq!(out.quant_info.method, METHOD_K_QUANT_CODEC_DIRECT);
     }
 
     /// **Iter D**: `f16_passthrough` direct unit test — verifies the
