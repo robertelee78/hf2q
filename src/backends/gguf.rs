@@ -220,19 +220,38 @@ impl OutputBackend for GgufBackend {
     fn validate(&self, model: &QuantizedModel) -> Result<Vec<FormatWarning>, BackendError> {
         let mut warnings = Vec::new();
 
-        // Check for unsupported bit widths
+        // Check for unsupported bit widths.
+        //
+        // ADR-014 P11-prereq Iter A introduced the codec-direct sentinel
+        // (`bits = 0` + `ggml_type = Some(<canonical>)`) — those tensors
+        // wrote correctly as their target GGML type, but THIS validate
+        // would emit a confusing "0-bit quantization … will fall back to
+        // F16" warning anyway.  Suppress the warning when a known
+        // `ggml_type` is present (truth: the writer at
+        // `quant_info_to_ggml_type` honours that field).  Only warn when
+        // both the bit width is non-canonical AND no explicit
+        // `ggml_type` is set — that's a genuine "we don't know how to
+        // write this" case.
         for (name, tensor) in &model.tensors {
             let bits = tensor.quant_info.bits;
-            if !tensor.quant_info.preserved && !matches!(bits, 2 | 4 | 6 | 8 | 16) {
-                warnings.push(FormatWarning {
-                    message: format!(
-                        "Tensor '{}' has {}-bit quantization which has no standard GGML type; \
-                         will fall back to F16",
-                        name, bits
-                    ),
-                    severity: WarningSeverity::Warning,
-                });
+            if tensor.quant_info.preserved || matches!(bits, 2 | 4 | 6 | 8 | 16) {
+                continue;
             }
+            if let Some(ref type_name) = tensor.quant_info.ggml_type {
+                if ggml_type_from_name(type_name).is_some() {
+                    // Codec-direct sentinel: bytes match the named GGML
+                    // type; not a real fallback-to-F16 situation.
+                    continue;
+                }
+            }
+            warnings.push(FormatWarning {
+                message: format!(
+                    "Tensor '{}' has {}-bit quantization which has no standard GGML type \
+                     and no ggml_type override — will fall back to F16",
+                    name, bits
+                ),
+                severity: WarningSeverity::Warning,
+            });
         }
 
         // Warn if the total data is very large for a single file
@@ -1320,6 +1339,14 @@ fn repack_to_ggml_blocks(
             GGML_TYPE_Q3_K => crate::quantize::k_quant::BLOCK_Q3_K_SIZE,
             GGML_TYPE_Q4_0 => BLOCK_Q4_0_BYTES,
             GGML_TYPE_Q8_0 => BLOCK_Q8_0_BYTES,
+            // 32-aligned legacy fallback targets emitted by the K-quant
+            // codec when `is_kquant_row_misaligned` triggers
+            // `kquant_misalignment_fallback` (mirrors llama.cpp's
+            // `tensor_type_fallback` at `llama-quant.cpp:362-408`).
+            // Block sizes from `crate::quantize::q_legacy`.
+            GGML_TYPE_Q4_1 => crate::quantize::q_legacy::BLOCK_Q4_1_SIZE,
+            GGML_TYPE_Q5_0 => crate::quantize::q_legacy::BLOCK_Q5_0_SIZE,
+            GGML_TYPE_Q5_1 => crate::quantize::q_legacy::BLOCK_Q5_1_SIZE,
             _ => {
                 return Err(BackendError::WriteFailed {
                     reason: format!(
