@@ -550,6 +550,46 @@ pub fn target_for_str(
     Ok(target_for(v, tensor_name, i_layer, n_layers))
 }
 
+/// Mirror of llama.cpp's `tensor_type_fallback`
+/// (`llama-quant.cpp:362-408`).  When a tensor's inner dimension
+/// (`ncols`) isn't a multiple of the K-quant super-block (256) but IS
+/// a multiple of 32, llama.cpp downshifts to the equivalent legacy
+/// 32-aligned quant rather than F16 passthrough.  Mirroring this
+/// policy keeps hf2q's converted GGUFs byte-compatible with the
+/// community quant convention (bartowski / unsloth) and avoids the
+/// large F16-bloat penalty (~5-9 GB on Gemma 4 26B-A4B's
+/// `ffn_down_exps` at `moe_intermediate=704`).
+///
+/// Returns `Some(legacy_target)` for K-quant targets that have a
+/// canonical 32-aligned fallback.  Returns `None` for targets that
+/// are already 32-aligned (no fallback needed) or have no defined
+/// mapping (`Q4Legacy` etc. already 32-aligned).
+///
+/// Per llama.cpp's policy:
+///   * Q2_K / Q3_K → Q4_0  (Q4Legacy)
+///   * Q4_K        → Q5_0  (Q5Legacy0)
+///   * Q5_K        → Q5_1  (Q5Legacy1)
+///   * Q6_K        → Q8_0  (Q8Legacy)
+///
+/// If the fallback target itself can't fit the tensor's `ncols` (i.e.
+/// `ncols % 32 != 0`), the caller should fall back further to F16 per
+/// llama.cpp's `(WARNING: must use F16 due to unusual shape)` path.
+#[inline]
+pub fn kquant_misalignment_fallback(target: KQuantTarget) -> Option<KQuantTarget> {
+    match target {
+        KQuantTarget::Q2K | KQuantTarget::Q3K => Some(KQuantTarget::Q4Legacy),
+        KQuantTarget::Q4K => Some(KQuantTarget::Q5Legacy0),
+        KQuantTarget::Q5K => Some(KQuantTarget::Q5Legacy1),
+        KQuantTarget::Q6K => Some(KQuantTarget::Q8Legacy),
+        // Legacy targets are already 32-aligned — no fallback needed.
+        KQuantTarget::Q4Legacy
+        | KQuantTarget::Q4Legacy1
+        | KQuantTarget::Q5Legacy0
+        | KQuantTarget::Q5Legacy1
+        | KQuantTarget::Q8Legacy => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,6 +1108,46 @@ mod tests {
             "language_model.visual.blocks.0.attn.proj.weight",
             256,
         ));
+    }
+
+    /// `kquant_misalignment_fallback` mirrors llama.cpp's
+    /// `tensor_type_fallback` (`llama-quant.cpp:362-408`).
+    ///
+    /// Reference table:
+    ///   * Q2_K → Q4_0
+    ///   * Q3_K → Q4_0
+    ///   * Q4_K → Q5_0
+    ///   * Q5_K → Q5_1
+    ///   * Q6_K → Q8_0
+    ///   * Legacy targets → None (already 32-aligned)
+    #[test]
+    fn kquant_misalignment_fallback_matches_llama_cpp_policy() {
+        assert_eq!(
+            kquant_misalignment_fallback(KQuantTarget::Q2K),
+            Some(KQuantTarget::Q4Legacy),
+        );
+        assert_eq!(
+            kquant_misalignment_fallback(KQuantTarget::Q3K),
+            Some(KQuantTarget::Q4Legacy),
+        );
+        assert_eq!(
+            kquant_misalignment_fallback(KQuantTarget::Q4K),
+            Some(KQuantTarget::Q5Legacy0),
+        );
+        assert_eq!(
+            kquant_misalignment_fallback(KQuantTarget::Q5K),
+            Some(KQuantTarget::Q5Legacy1),
+        );
+        assert_eq!(
+            kquant_misalignment_fallback(KQuantTarget::Q6K),
+            Some(KQuantTarget::Q8Legacy),
+        );
+        // Legacy targets are already 32-aligned; no fallback exists.
+        assert_eq!(kquant_misalignment_fallback(KQuantTarget::Q4Legacy), None);
+        assert_eq!(kquant_misalignment_fallback(KQuantTarget::Q4Legacy1), None);
+        assert_eq!(kquant_misalignment_fallback(KQuantTarget::Q5Legacy0), None);
+        assert_eq!(kquant_misalignment_fallback(KQuantTarget::Q5Legacy1), None);
+        assert_eq!(kquant_misalignment_fallback(KQuantTarget::Q8Legacy), None);
     }
 
     /// `output.weight` and `token_embd.weight` still match exactly —

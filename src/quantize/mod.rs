@@ -5025,22 +5025,30 @@ mod tests {
         );
 
         // ── Base layer (Q4_K routing) ──
-        // Q4_K is K-quant + row_len=96 is misaligned → F16 passthrough.
-        // This control proves the routing-aware fix discriminates: the
-        // K-quant alignment arm STILL fires for K-quant routing, just
-        // not for Q8_0 routing.
+        // Post-Bug-B fix (2026-05-17): Q4_K + row_len=96 (32-aligned,
+        // not 256-aligned) now uses llama.cpp's canonical 32-aligned
+        // fallback instead of F16 passthrough.  Per
+        // `tensor_type_fallback` (`llama-quant.cpp:362-408`):
+        // Q4_K → Q5_0 (block size 32 elements / 22 bytes).
+        //
+        // This control still discriminates Q4_K from Q8_0:
+        //   * Q4_K routing → Q5_0 fallback (legacy 32-aligned)
+        //   * Q8_0 routing → Q8_0 (already 32-aligned, no fallback needed)
+        // Both inference-compatible — neither lands at F16.
         let t_base = out.tensors.get(base_name).expect("base missing");
         assert_eq!(
             t_base.quant_info.ggml_type.as_deref(),
-            Some("F16"),
-            "base layer at row_len=96 (K-quant routing) emitted {:?} \
-             instead of F16 — the K-quant alignment arm has been over-fixed",
+            Some("Q5_0"),
+            "base layer at row_len=96 (Q4_K routing) emitted {:?} \
+             instead of Q5_0 — Bug B's K-quant misalignment fallback regressed; \
+             llama.cpp policy says Q4_K → Q5_0 when ncols not div 256",
             t_base.quant_info.ggml_type
         );
+        // Q5_0 block: 22 bytes per 32 elements.
         assert_eq!(
             t_base.data.len(),
-            ROW_LEN * 2,
-            "base layer F16 byte budget"
+            (ROW_LEN / 32) * 22,
+            "base layer Q5_0 byte budget (3 blocks × 22 = 66 bytes)"
         );
     }
 

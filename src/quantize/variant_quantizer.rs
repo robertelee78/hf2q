@@ -40,7 +40,10 @@ use crate::calibrate::calibrator::CalibrationData;
 use crate::ir::{DType, QuantizedTensor, TensorQuantInfo, TensorRef};
 use crate::quantize::k_quant_codec::{quantize_tensor_2d_to_bytes, KQuantTarget};
 use crate::quantize::k_quant_codec_quantizer::{f16_passthrough, METHOD_K_QUANT_CODEC_DIRECT};
-use crate::quantize::layer_mix::{should_emit_f16_for_kquant, target_for, KQuantVariant};
+use crate::quantize::layer_mix::{
+    is_kquant_row_misaligned, is_vision_tensor_pattern, kquant_misalignment_fallback, target_for,
+    KQuantVariant,
+};
 use crate::quantize::{LayerQuantConfig, Quantizer, QuantizeError};
 
 /// Variant-aware K-quant Quantizer. Each tensor gets the target the
@@ -189,19 +192,19 @@ impl Quantizer for VariantKQuantizer {
             });
         }
 
-        // ADR-014 P11-prereq Iter D (2026-04-27): vision-tensor +
-        // non-256-multiple skip → F16 passthrough. See
-        // `KQuantCodecQuantizer::quantize_tensor` for the full doc;
-        // the skip is plumbed identically into all three K-quant
-        // dispatch sites so production `--quant q4_k_m` (this file)
-        // and DWQ paths (`DwqKQuantizer`) share the predicate.
+        // Vision-tensor F16 passthrough is intentional policy (vision
+        // encoder weights ship as F16 in production GGUFs regardless
+        // of the surrounding quantization target — see
+        // `is_vision_tensor_pattern` doc).  This arm fires BEFORE the
+        // K-quant misalignment arm below so vision tensors land at F16
+        // even when their inner dim is 32-aligned.
         let row_len_for_skip = tensor.shape.last().copied().unwrap_or(0);
-        if should_emit_f16_for_kquant(&tensor.name, row_len_for_skip) {
+        if is_vision_tensor_pattern(&tensor.name) {
             tracing::info!(
                 tensor = %tensor.name,
                 row_len = row_len_for_skip,
                 variant = self.variant.name(),
-                "K-quant skip → F16 passthrough (vision or non-256-multiple)"
+                "vision tensor → F16 passthrough"
             );
             return f16_passthrough(tensor, &tensor.name);
         }
@@ -209,6 +212,56 @@ impl Quantizer for VariantKQuantizer {
         // Pick the per-tensor target via the policy.
         let i_layer = parse_block_index(&tensor.name).unwrap_or(0);
         let target = target_for(self.variant, &tensor.name, i_layer, self.n_layers);
+
+        // K-quant misalignment fallback (mirrors llama.cpp's
+        // `tensor_type_fallback` at `llama-quant.cpp:362-408`).
+        // When the tensor's inner dim isn't a multiple of 256 (the
+        // K-quant super-block size, `QK_K`), downshift to the
+        // canonical 32-aligned legacy quant rather than F16
+        // passthrough — keeps the output GGUF byte-compatible with
+        // bartowski / unsloth conventions AND keeps hf2q's runtime
+        // happy (its 3D MoE expert dispatcher `dispatch_id_mm_for_test`
+        // only accepts Q-family block types).  If the legacy fallback
+        // itself can't fit (ncols % 32 != 0), drop to F16 per
+        // llama.cpp's `(WARNING: must use F16 due to unusual shape)`
+        // branch.
+        let target = if is_kquant_row_misaligned(row_len_for_skip) {
+            if let Some(fb) = kquant_misalignment_fallback(target) {
+                if row_len_for_skip % 32 == 0 {
+                    tracing::info!(
+                        tensor = %tensor.name,
+                        row_len = row_len_for_skip,
+                        variant = self.variant.name(),
+                        from = ?target,
+                        to = ?fb,
+                        "K-quant row not div 256 → legacy 32-aligned fallback"
+                    );
+                    fb
+                } else {
+                    tracing::warn!(
+                        tensor = %tensor.name,
+                        row_len = row_len_for_skip,
+                        variant = self.variant.name(),
+                        "K-quant + legacy fallback both unavailable (ncols not div 32) → F16 passthrough"
+                    );
+                    return f16_passthrough(tensor, &tensor.name);
+                }
+            } else {
+                // No fallback defined (target was already a legacy
+                // 32-aligned type — the misalignment is genuinely
+                // unfixable for this target).
+                tracing::warn!(
+                    tensor = %tensor.name,
+                    row_len = row_len_for_skip,
+                    variant = self.variant.name(),
+                    "no K-quant misalignment fallback for {:?} → F16 passthrough",
+                    target,
+                );
+                return f16_passthrough(tensor, &tensor.name);
+            }
+        } else {
+            target
+        };
 
         // Convert to F32 for the codec.
         let f32_values = tensor_to_f32(tensor)?;

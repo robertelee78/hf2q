@@ -88,7 +88,7 @@ use crate::calibrate::calibrator::CalibrationData;
 use crate::ir::{QuantizedTensor, TensorRef};
 use crate::quantize::k_quant_codec::KQuantTarget;
 use crate::quantize::k_quant_codec_quantizer::{f16_passthrough, KQuantCodecQuantizer};
-use crate::quantize::layer_mix::{is_kquant_row_misaligned, is_vision_tensor_pattern};
+use crate::quantize::layer_mix::is_vision_tensor_pattern;
 use crate::quantize::{LayerQuantConfig, Quantizer, QuantizeError};
 
 /// DWQ-class K-quant variant.  Maps to a (base, sensitive) pair of
@@ -275,29 +275,30 @@ impl Quantizer for DwqKQuantizer {
         // `VariantKQuantizer::quantize_tensor`.
         let row_len = tensor.shape.last().copied().unwrap_or(0);
         let routing_target = self.target_for(&tensor.name);
-        if !config.preserve {
-            let is_kquant_routing = matches!(
-                routing_target,
-                Some(
-                    KQuantTarget::Q2K
-                        | KQuantTarget::Q3K
-                        | KQuantTarget::Q4K
-                        | KQuantTarget::Q5K
-                        | KQuantTarget::Q6K
-                )
+        // Vision-tensor F16 passthrough is intentional policy (vision
+        // encoder weights ship as F16 in production GGUFs regardless of
+        // the routed target — see `is_vision_tensor_pattern`).  This
+        // short-circuit happens here so the inner codec's quantize
+        // path is never invoked for vision tensors.
+        //
+        // The K-quant row-misalignment policy used to also live here
+        // (returning F16 passthrough), but it now lives in the inner
+        // codec (`KQuantCodecQuantizer::quantize_tensor`) which
+        // downshifts to llama.cpp's canonical 32-aligned legacy quant
+        // (Q5_K → Q5_1, Q4_K → Q5_0, Q6_K → Q8_0, Q2/3_K → Q4_0) per
+        // `tensor_type_fallback` in `llama-quant.cpp:362-408`.  Letting
+        // the codec own the misalignment policy keeps the three
+        // quantizers (`KQuantCodecQuantizer`, `VariantKQuantizer`,
+        // `DwqKQuantizer`) in lockstep on the legacy-fallback story.
+        if !config.preserve && is_vision_tensor_pattern(&tensor.name) {
+            tracing::info!(
+                tensor = %tensor.name,
+                row_len,
+                variant = self.variant.name(),
+                routing_target = ?routing_target,
+                "DWQ codec skip → F16 passthrough (vision-tensor policy)"
             );
-            let f16_required = is_vision_tensor_pattern(&tensor.name)
-                || (is_kquant_routing && is_kquant_row_misaligned(row_len));
-            if f16_required {
-                tracing::info!(
-                    tensor = %tensor.name,
-                    row_len,
-                    variant = self.variant.name(),
-                    routing_target = ?routing_target,
-                    "DWQ codec skip → F16 passthrough (vision policy or K-quant row misalignment)"
-                );
-                return f16_passthrough(tensor, &tensor.name);
-            }
+            return f16_passthrough(tensor, &tensor.name);
         }
 
         let target = match routing_target {

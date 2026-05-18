@@ -41,7 +41,9 @@
 use crate::calibrate::calibrator::CalibrationData;
 use crate::ir::{DType, QuantizedTensor, TensorQuantInfo, TensorRef};
 use crate::quantize::k_quant_codec::{quantize_tensor_2d_to_bytes, KQuantTarget};
-use crate::quantize::layer_mix::{is_kquant_row_misaligned, is_vision_tensor_pattern};
+use crate::quantize::layer_mix::{
+    is_kquant_row_misaligned, is_vision_tensor_pattern, kquant_misalignment_fallback,
+};
 use crate::quantize::{LayerQuantConfig, Quantizer, QuantizeError};
 
 /// Quantizer that produces final GGUF block bytes via [`k_quant_codec`].
@@ -305,17 +307,64 @@ impl Quantizer for KQuantCodecQuantizer {
                 | KQuantTarget::Q5K
                 | KQuantTarget::Q6K
         );
-        let f16_passthrough_required = is_vision_tensor_pattern(&tensor.name)
-            || (is_k_quant_target && is_kquant_row_misaligned(row_len_for_skip));
-        if f16_passthrough_required {
+
+        // Vision-tensor F16 passthrough is intentional policy regardless
+        // of target/alignment — vision encoder weights ship as F16 in
+        // production GGUFs (`is_vision_tensor_pattern` doc).
+        if is_vision_tensor_pattern(&tensor.name) {
             tracing::info!(
                 tensor = %tensor.name,
                 row_len = row_len_for_skip,
                 target = ?self.target,
-                "Codec skip → F16 passthrough (vision policy or K-quant row misalignment)"
+                "Codec skip → F16 passthrough (vision-tensor policy)"
             );
             return f16_passthrough(tensor, &tensor.name);
         }
+
+        // K-quant misalignment fallback (mirrors llama.cpp's
+        // `tensor_type_fallback` at `llama-quant.cpp:362-408`).
+        // When the tensor's inner dim isn't a 256-multiple (the K-quant
+        // super-block size `QK_K`), downshift to the canonical
+        // 32-aligned legacy quant rather than F16 passthrough.  Keeps
+        // hf2q-converted GGUFs byte-compatible with bartowski / unsloth
+        // conventions AND keeps hf2q's runtime happy (the 3D MoE expert
+        // dispatcher `dispatch_id_mm_for_test` only accepts Q-family
+        // block types).  If the legacy fallback itself can't fit
+        // (ncols % 32 != 0), drop to F16 per llama.cpp's
+        // `(WARNING: must use F16 due to unusual shape)` branch.
+        let effective_target = if is_k_quant_target && is_kquant_row_misaligned(row_len_for_skip) {
+            if let Some(fb) = kquant_misalignment_fallback(self.target) {
+                if row_len_for_skip % 32 == 0 {
+                    tracing::info!(
+                        tensor = %tensor.name,
+                        row_len = row_len_for_skip,
+                        from = ?self.target,
+                        to = ?fb,
+                        "K-quant row not div 256 → legacy 32-aligned fallback"
+                    );
+                    fb
+                } else {
+                    tracing::warn!(
+                        tensor = %tensor.name,
+                        row_len = row_len_for_skip,
+                        target = ?self.target,
+                        "K-quant + legacy fallback both unavailable (ncols not div 32) → F16 passthrough"
+                    );
+                    return f16_passthrough(tensor, &tensor.name);
+                }
+            } else {
+                tracing::warn!(
+                    tensor = %tensor.name,
+                    row_len = row_len_for_skip,
+                    target = ?self.target,
+                    "no K-quant misalignment fallback for {:?} → F16 passthrough",
+                    self.target,
+                );
+                return f16_passthrough(tensor, &tensor.name);
+            }
+        } else {
+            self.target
+        };
 
         // Convert to F32 for the codec.
         let f32_values = tensor_to_f32(tensor)?;
@@ -343,7 +392,7 @@ impl Quantizer for KQuantCodecQuantizer {
             &f32_values,
             n_rows,
             row_len,
-            self.target,
+            effective_target,
             &self.calibration,
             &tensor.name,
         )
@@ -365,7 +414,7 @@ impl Quantizer for KQuantCodecQuantizer {
                 preserved: false,
                 scales: None,
                 biases: None,
-                ggml_type: Some(target_to_ggml_name(self.target)),
+                ggml_type: Some(target_to_ggml_name(effective_target)),
             },
         })
     }
