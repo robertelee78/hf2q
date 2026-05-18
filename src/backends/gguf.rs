@@ -1904,6 +1904,16 @@ fn ggml_tensor_size(total_elements: usize, ggml_type: u32) -> usize {
     // K-quant tensor that mis-predicted as F16). Fix: route every K-quant
     // family member through `ceil_div(elements, QK_K) * BLOCK_*_SIZE`,
     // mirroring `quantize_tensor_2d_to_bytes`'s actual emitted byte count.
+    //
+    // 2026-05-17 (Bug B sequel): same class recurred for Q4_1 / Q5_0 / Q5_1.
+    // After the convert-side fix that emits legacy 32-aligned types as the
+    // K-quant misalignment downshift, these types started flowing through
+    // this size estimator and hit the `_ =>` F16 fallback — re-introducing
+    // pass-2 zero-padding (file stayed at 27 GB instead of dropping to
+    // ~18 GB) AND a misleading 27.7 GB WARN in the conversion summary.
+    // Added Q4_1 / Q5_0 / Q5_1 arms below; the `_ =>` fallback is now a
+    // typed panic per the no-fallback / no-stub mantra so a future
+    // unknown type surfaces loudly instead of silently inflating.
     const QK_K: usize = 256;
     match ggml_type {
         GGML_TYPE_F32 => total_elements * 4,
@@ -1911,6 +1921,18 @@ fn ggml_tensor_size(total_elements: usize, ggml_type: u32) -> usize {
         GGML_TYPE_Q4_0 => {
             let n_blocks = total_elements.div_ceil(QK4_0);
             n_blocks * BLOCK_Q4_0_BYTES
+        }
+        GGML_TYPE_Q4_1 => {
+            let n_blocks = total_elements.div_ceil(QK4_0);
+            n_blocks * crate::quantize::q_legacy::BLOCK_Q4_1_SIZE
+        }
+        GGML_TYPE_Q5_0 => {
+            let n_blocks = total_elements.div_ceil(QK4_0);
+            n_blocks * crate::quantize::q_legacy::BLOCK_Q5_0_SIZE
+        }
+        GGML_TYPE_Q5_1 => {
+            let n_blocks = total_elements.div_ceil(QK4_0);
+            n_blocks * crate::quantize::q_legacy::BLOCK_Q5_1_SIZE
         }
         GGML_TYPE_Q8_0 => {
             let n_blocks = total_elements.div_ceil(QK8_0);
@@ -1936,9 +1958,17 @@ fn ggml_tensor_size(total_elements: usize, ggml_type: u32) -> usize {
             let n_blocks = total_elements.div_ceil(QK_K);
             n_blocks * crate::quantize::k_quant::BLOCK_Q5_K_SIZE
         }
-        // For any other type, we cannot compute the size; caller should ensure
-        // we never reach here for types we don't support.
-        _ => total_elements * 2, // fallback to f16 sizing
+        // No-fallback contract: any unknown ggml_type here would cause
+        // pass-1 size mis-prediction → pass-2 zero-padding to the wrong
+        // size (the iter-99 / Bug-B-sequel bug pattern).  Surface
+        // loudly so the caller adds the missing match arm rather than
+        // shipping a silently-bloated GGUF.
+        unknown => panic!(
+            "ggml_tensor_size: unknown ggml_type {} — add a match arm \
+             with the correct block size; never fall back to F16 sizing \
+             (re: ADR-014 P11 iter-99 + Bug B sequel 2026-05-17)",
+            unknown
+        ),
     }
 }
 
