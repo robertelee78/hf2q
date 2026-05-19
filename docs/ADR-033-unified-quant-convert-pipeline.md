@@ -440,7 +440,7 @@ The chain `I-tier ≡ non-I-tier (§P4b items 2-4 covering every reachable arm o
 
 ### P6 — Delete superseded code
 
-**Status:** SHIPPED (verified 2026-05-19 — all delete-listed files are gone, `src/quantize/mod.rs` is now 20 lines exposing only `ggml_quants` + `imatrix`, the 3 retired env vars no longer appear in `parse_env`, and `METHOD_K_QUANT_CODEC_DIRECT` is removed from the codebase). The full test suite is green: 2773 passed, 1 pre-existing flaky (`serve::tests::run_decode_loop_stops_on_repetition`).
+**Status:** SHIPPED (verified 2026-05-19 by direct file-existence check — all 8 delete-listed files are gone: `quantize/k_quant_codec_quantizer.rs`, `quantize/variant_quantizer.rs`, `quantize/dwq_k_quantizer.rs`, `quantize/mixed.rs`, `quantize/static_quant.rs`, `calibrate/dwq.rs`, `calibrate/apex.rs`, `quantize/k_quant_codec.rs`. `src/quantize/mod.rs` is now 23 lines (3 doc-paragraphs + `pub mod ggml_quants; pub mod imatrix;`) — the originally-claimed "20 lines" was off by 3 paragraph-breaks. The 3 retired env vars (`HF2Q_STREAMING_PHASE3`, `HF2Q_STREAMING_PHASE3_MUT`, `HF2Q_USE_LEGACY_DWQ_Q4_0`) no longer appear anywhere under `src/`, and `METHOD_K_QUANT_CODEC_DIRECT` is removed from the codebase). The full test suite is green: 2804 passed (was 2773 at original §P6 ship; the +31 delta is the §P4b and §Pi acceptance gates added subsequently), 1 pre-existing flaky (`serve::tests::run_decode_loop_stops_on_repetition`).
 
 **Why:** The new policy + writer + IR shipped in P1–P4b makes the old subsystems redundant.
 
