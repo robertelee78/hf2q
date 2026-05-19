@@ -15,8 +15,13 @@
 //! q6_k, q8_0, iq4_nl. Per ADR-033 §P0 amendment A.
 
 pub mod iq4_nl;
+pub mod q2_k;
+pub mod q3_k;
 pub mod q4_0;
 pub mod q4_1;
+pub mod q4_k;
 pub mod q5_0;
 pub mod q5_1;
+pub mod q5_k;
+pub mod q6_k;
 pub mod q8_0;
