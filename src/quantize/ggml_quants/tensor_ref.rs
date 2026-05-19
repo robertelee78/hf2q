@@ -19,12 +19,24 @@ pub enum SourceDtype {
     Fp8E4M3,
 }
 
-/// Closed enum of architectures hf2q's convert pipeline supports.
-/// Per ADR Decision §"TensorRef" — adding an arch is an explicit code
-/// change, not silent runtime detection. v1 set per §P0 amendment
-/// covers the convert matrix.
+/// Closed enum of architectures recognized by `StandardPolicy::target_for`.
+///
+/// Two tiers:
+///
+/// 1. **v1 convert arches** (Gemma4/Qwen35Moe/Bert/NomicBert/Llama3/
+///    MiniMaxM2 and their multimodal siblings) — first-class for the
+///    convert pipeline.
+/// 2. **C-fidelity placeholders** — `Falcon` and the rest exist so
+///    `target_for` can express its arch-keyed branches verbatim against
+///    `llama-quant.cpp`. The convert pipeline doesn't yet support
+///    quantizing models of these architectures; they show up in
+///    `target_for` only because the C function branches on them.
+///
+/// Per [[feedback-no-backwards-compat-2026-05-18]]: there's no implicit
+/// detection / migration — adding an arch is an explicit code change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArchName {
+    // --- v1 production arches ---
     /// Google Gemma 4 (Gemma3-architecture compatible).
     Gemma4,
     /// Google Gemma 4 multimodal projector (mmproj sidecar).
@@ -41,6 +53,11 @@ pub enum ArchName {
     Llama3,
     /// MiniMax M2.7 (FP8 source).
     MiniMaxM2,
+
+    // --- C-fidelity placeholders for `target_for` (no convert support yet) ---
+    /// Falcon — explicitly checked in 6 places inside
+    /// `llama_tensor_get_type_impl` (L449, L580, L588, L591, L602, L614).
+    Falcon,
 }
 
 impl ArchName {
@@ -56,6 +73,7 @@ impl ArchName {
             ArchName::NomicBert => "nomic-bert",
             ArchName::Llama3 => "llama",
             ArchName::MiniMaxM2 => "minimax-m2",
+            ArchName::Falcon => "falcon",
         }
     }
 }

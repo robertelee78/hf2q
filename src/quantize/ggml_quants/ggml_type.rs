@@ -31,8 +31,26 @@ pub enum GgmlType {
     Q5_K = 13,
     Q6_K = 14,
     Q8_K = 15,
+    // 16..23 + 29: IQ-family. Placeholders for target_for return-values
+    // — `llama_tensor_get_type_impl` selects these for several
+    // ftype/category combinations (e.g. IQ3_S on attn_v at IQ3_XXS).
+    // The convert pipeline has no Quantizer impl for these in v1; if
+    // target_for returns one of these, the downstream `quantizer_for`
+    // call surfaces `QuantizeError::NoQuantizerForType` instead of
+    // silently demoting. Per [[feedback-no-loop-suppression-2026-05-17]].
+    IQ2_XXS = 16,
+    IQ2_XS = 17,
+    IQ3_XXS = 18,
+    IQ1_S = 19,
     IQ4_NL = 20,
+    IQ3_S = 21,
+    IQ2_S = 22,
+    IQ4_XS = 23,
+    IQ1_M = 29,
     BF16 = 30,
+    TQ1_0 = 34,
+    TQ2_0 = 35,
+    MXFP4 = 39,
 }
 
 impl GgmlType {
@@ -48,13 +66,24 @@ impl GgmlType {
             | GgmlType::Q5_1
             | GgmlType::Q8_0
             | GgmlType::Q8_1
-            | GgmlType::IQ4_NL => 32,
+            | GgmlType::IQ4_NL
+            | GgmlType::MXFP4 => 32,
             GgmlType::Q2_K
             | GgmlType::Q3_K
             | GgmlType::Q4_K
             | GgmlType::Q5_K
             | GgmlType::Q6_K
-            | GgmlType::Q8_K => 256,
+            | GgmlType::Q8_K
+            | GgmlType::IQ2_XXS
+            | GgmlType::IQ2_XS
+            | GgmlType::IQ3_XXS
+            | GgmlType::IQ1_S
+            | GgmlType::IQ3_S
+            | GgmlType::IQ2_S
+            | GgmlType::IQ4_XS
+            | GgmlType::IQ1_M
+            | GgmlType::TQ1_0
+            | GgmlType::TQ2_0 => 256,
         }
     }
 
@@ -80,6 +109,20 @@ impl GgmlType {
             GgmlType::Q5_K => 176,    // f16 d + f16 dmin + scales[12] + qh[32] + qs[128]
             GgmlType::Q6_K => 210,    // ql[128] + qh[64] + scales[16] (i8) + f16 d
             GgmlType::Q8_K => 292,    // f32 d + qs[256] + bsums[16] (only used internally by llama.cpp)
+            // Placeholder IQ/TQ/MXFP4 types — no Quantizer impl in v1.
+            // Sizes mirror llama.cpp's ggml-common.h for documentation
+            // value; v1 pipeline never emits these rows (NoQuantizerForType).
+            GgmlType::IQ2_XXS => 66,
+            GgmlType::IQ2_XS => 74,
+            GgmlType::IQ3_XXS => 98,
+            GgmlType::IQ1_S => 50,
+            GgmlType::IQ3_S => 110,
+            GgmlType::IQ2_S => 82,
+            GgmlType::IQ4_XS => 136,
+            GgmlType::IQ1_M => 56,
+            GgmlType::TQ1_0 => 54,
+            GgmlType::TQ2_0 => 66,
+            GgmlType::MXFP4 => 17, // u8 scale + 16 nibbles
         }
     }
 
@@ -118,6 +161,17 @@ impl GgmlType {
             GgmlType::Q5_K => "q5_k",
             GgmlType::Q6_K => "q6_k",
             GgmlType::Q8_K => "q8_k",
+            GgmlType::IQ2_XXS => "iq2_xxs",
+            GgmlType::IQ2_XS => "iq2_xs",
+            GgmlType::IQ3_XXS => "iq3_xxs",
+            GgmlType::IQ1_S => "iq1_s",
+            GgmlType::IQ3_S => "iq3_s",
+            GgmlType::IQ2_S => "iq2_s",
+            GgmlType::IQ4_XS => "iq4_xs",
+            GgmlType::IQ1_M => "iq1_m",
+            GgmlType::TQ1_0 => "tq1_0",
+            GgmlType::TQ2_0 => "tq2_0",
+            GgmlType::MXFP4 => "mxfp4",
         }
     }
 }
@@ -140,8 +194,19 @@ impl TryFrom<u32> for GgmlType {
             13 => GgmlType::Q5_K,
             14 => GgmlType::Q6_K,
             15 => GgmlType::Q8_K,
+            16 => GgmlType::IQ2_XXS,
+            17 => GgmlType::IQ2_XS,
+            18 => GgmlType::IQ3_XXS,
+            19 => GgmlType::IQ1_S,
             20 => GgmlType::IQ4_NL,
+            21 => GgmlType::IQ3_S,
+            22 => GgmlType::IQ2_S,
+            23 => GgmlType::IQ4_XS,
+            29 => GgmlType::IQ1_M,
             30 => GgmlType::BF16,
+            34 => GgmlType::TQ1_0,
+            35 => GgmlType::TQ2_0,
+            39 => GgmlType::MXFP4,
             other => return Err(QuantizeError::UnknownGgmlType(other)),
         })
     }

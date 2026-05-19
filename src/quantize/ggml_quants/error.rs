@@ -46,4 +46,10 @@ pub enum QuantizeError {
     /// Numeric `u32` value didn't decode to a known `LlamaFtype`.
     #[error("unknown llama_ftype value {0} (not in supported set)")]
     UnknownLlamaFtype(u32),
+
+    /// `StandardPolicy::target_for` couldn't parse `blk.<N>.` out of an
+    /// MoE expert tensor's name, or the parsed layer was out of range.
+    /// Port of the runtime_error at `llama-quant.cpp:427-432`.
+    #[error("bad/missing layer index for tensor {name} (n_layer = {n_layer})")]
+    BadLayerForTensor { name: String, n_layer: i32 },
 }
