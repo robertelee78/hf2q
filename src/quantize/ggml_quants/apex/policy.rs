@@ -656,6 +656,126 @@ mod tests {
         assert_eq!(p.target_for(&nm).unwrap(), GgmlType::F32);
     }
 
+    /// ADR-033 §P4b — closes the override-equivalence hole in the
+    /// transitive byte-cmp proof.
+    ///
+    /// The structural-invariant test
+    /// (`p4b_tier_rules_i_variant_equals_non_i_sibling` in
+    /// `acceptance.rs`) pins that `tier_rules(IQuality) ==
+    /// tier_rules(Quality)` (and analogously). That covers the
+    /// algorithmic path through `target_for`. The other branch of
+    /// `target_for` (lines 277-310 of this file) lifts queries
+    /// through `mudler_override` when one is attached; that branch
+    /// must ALSO be tier-independent for the §P4b transitive proof
+    /// to hold end-to-end.
+    ///
+    /// Mechanism (verified at policy.rs:277-310, current commit):
+    ///   - When the mudler override `contains_match`, it returns
+    ///     `mudler.target_for(name)` which reads only the mudler
+    ///     config map — never `self.tier`.
+    ///   - When the override misses, structural-tensor classification
+    ///     (TokenEmbd/Output/RouterGate/Norm) falls through to the
+    ///     algorithmic hardcodes that don't read `self.tier` either.
+    ///   - Enumerated-tensor miss surfaces `TensorNotInMudlerConfig`
+    ///     identically for both tier classes.
+    ///
+    /// This test pins those three facts. If a future commit adds a
+    /// `if self.tier.requires_imatrix() { ... }` arm inside the
+    /// override branch, the test fails and §P4b's transitive proof
+    /// stays sound.
+    #[test]
+    fn p4b_mudler_override_is_tier_independent_for_i_and_non_i_siblings() {
+        use super::super::fingerprint::vendor_config_content;
+        use super::super::mudler_config::MudlerConfig;
+
+        let content =
+            vendor_config_content("vendor/apex-quant/configs/gemma4_26b_balanced.txt")
+                .expect("vendored balanced config must be baked in");
+        let mudler: &'static MudlerConfig = Box::leak(Box::new(
+            MudlerConfig::parse(content, "test/gemma4_26b_balanced.txt:p4b")
+                .expect("vendored config must parse"),
+        ));
+
+        let non_i = ApexPolicy::new(ApexTier::Balanced, ArchName::Gemma4, 30, 128)
+            .expect("non-I policy must construct")
+            .with_mudler_override(mudler);
+        let i = ApexPolicy::new_with_imatrix(
+            ApexTier::IBalanced,
+            ArchName::Gemma4,
+            30,
+            128,
+        )
+        .expect("I-tier policy must construct on Gemma4")
+        .with_mudler_override(mudler);
+
+        // Walk every tensor enumerated in the mudler config + a
+        // representative structural-fall-through set. For each, the
+        // I and non-I policies must produce identical output.
+        let mut probed_enumerated: usize = 0;
+        for (name, _expected) in mudler.map.iter() {
+            let canonical_name = format!("{name}.weight");
+            let layer_index = canonical_name
+                .strip_prefix("blk.")
+                .and_then(|r| r.find('.').map(|i| (r, i)))
+                .and_then(|(r, dot)| r[..dot].parse::<usize>().ok());
+            let shape = [4096usize, 1];
+            let tref = TensorRef {
+                name: &canonical_name,
+                shape: &shape,
+                source_dtype: SourceDtype::BF16,
+                arch: ArchName::Gemma4,
+                layer_index,
+            };
+            let a = non_i.target_for(&tref).expect("non-I override path");
+            let b = i.target_for(&tref).expect("I override path");
+            assert_eq!(
+                a, b,
+                "§P4b override-equivalence: tensor `{canonical_name}` \
+                 produced non-I={a:?}, I={b:?} — the override path must \
+                 be tier-independent (see policy.rs:277-310). Update both \
+                 the override branch and this test at the same commit.",
+            );
+            probed_enumerated += 1;
+        }
+        assert!(
+            probed_enumerated >= 50,
+            "§P4b override-equivalence probed only {probed_enumerated} enumerated \
+             tensors; gemma4_26b_balanced.txt is expected to enumerate ≥50 (per-layer \
+             attn/exps/shexp). If the vendored file shrank intentionally, lower the \
+             floor; if it shrank unexpectedly, the upstream vendor sync regressed."
+        );
+
+        // Structural fall-through arms: must produce IDENTICAL output
+        // on I and non-I sibling policies. Hard-coded set covers
+        // every MoeTensorRole that escapes the `mudler.contains_match`
+        // gate at policy.rs:289-309.
+        for (name, layer) in [
+            ("token_embd.weight", None),
+            ("output.weight", None),
+            ("output_norm.weight", None),
+            ("blk.5.attn_norm.weight", Some(5)),
+            ("blk.5.ffn_norm.weight", Some(5)),
+            ("blk.5.ffn_gate_inp.weight", Some(5)),
+        ] {
+            let shape = [4096usize, 1];
+            let tref = TensorRef {
+                name,
+                shape: &shape,
+                source_dtype: SourceDtype::BF16,
+                arch: ArchName::Gemma4,
+                layer_index: layer,
+            };
+            let a = non_i.target_for(&tref).expect("non-I structural arm");
+            let b = i.target_for(&tref).expect("I structural arm");
+            assert_eq!(
+                a, b,
+                "§P4b override-equivalence: structural tensor `{name}` \
+                 produced non-I={a:?}, I={b:?} — fall-through arms in \
+                 policy.rs must stay tier-independent.",
+            );
+        }
+    }
+
     /// ADR-033 §Pi gate: `ApexPolicy::new` (no imatrix data threaded)
     /// MUST reject any `i-*` tier with `ImatrixRequiresInference`. The
     /// I-tier opt-in path is `new_with_imatrix`, which Phase A wires
