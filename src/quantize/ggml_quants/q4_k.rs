@@ -103,9 +103,14 @@ fn quantize_row_ref(x: &[f32], out: &mut Vec<u8>) {
         let mut max_min = 0.0f32;
         for j in 0..QK_K / 32 {
             let sub = &xb[32 * j..32 * (j + 1)];
+            // FMA: clang fuses `sum_x2 + v*v` into fmadd at -O3 -march=native;
+            // mirror Q5_K's _ref path (q5_k.rs:185) for consistency. The
+            // single-tensor byte-cmp on blk.0.attn_k passed without this
+            // because the av_x ULP delta didn't propagate to L[] selection
+            // for that tensor, but other distributions may exercise it.
             let mut sum_x2 = 0.0f32;
             for &v in sub {
-                sum_x2 += v * v;
+                sum_x2 = v.mul_add(v, sum_x2);
             }
             let av_x = (sum_x2 / 32.0).sqrt();
             for l in 0..32 {
@@ -232,7 +237,7 @@ fn quantize_row_impl(x: &[f32], quant_weights: &[f32], out: &mut Vec<u8>) {
 
         let mut sum_x2 = 0.0f32;
         for &v in xb {
-            sum_x2 += v * v;
+            sum_x2 = v.mul_add(v, sum_x2);
         }
         let sigma2 = 2.0 * sum_x2 / QK_K as f32;
         let _av_x = sigma2.sqrt();
@@ -395,5 +400,108 @@ mod tests {
         let got = quantize(&input, 512, Some(&imatrix));
         assert_eq!(got.len(), expected.len(), "Q4_K im length mismatch");
         assert_eq!(got, expected, "Q4_K im byte-cmp failed");
+    }
+
+    /// ADR-033 quality-matrix iter-23+ : real-model byte-cmp.
+    ///
+    /// Fast iteration path that bypasses full 10-minute model conversion.
+    /// Compares hf2q's Q4_K output against canonical llama.cpp's output
+    /// for blk.0.attn_k.weight (Gemma 4 26B-A4B-IT). Fixture is the
+    /// canonical F16 GGUF's F16→F32 dequantization (lossless).
+    ///
+    /// Fixture preparation (one-time, requires gguf-py + canonical GGUFs):
+    ///   python3 /tmp/single_tensor_test.py
+    ///
+    /// Expected: 0 differing bytes once FMA + SIMD reduction fixes are
+    /// complete. Until then, prints diff count + first-divergence location.
+    /// Gated on fixture file presence so CI without the fixture skips.
+    #[test]
+    fn real_model_byte_cmp_blk0_attn_k() {
+        let f32_path = "/tmp/blk0_attn_k_f32.bin";
+        let expected_path = "/tmp/blk0_attn_k_q4k_expected.bin";
+        if !std::path::Path::new(f32_path).exists()
+            || !std::path::Path::new(expected_path).exists()
+        {
+            eprintln!(
+                "[skip] real_model_byte_cmp_blk0_attn_k: fixture files missing. \
+                 Run: python3 /tmp/single_tensor_test.py"
+            );
+            return;
+        }
+        let f32_bytes = fs::read(f32_path).expect("read F32 fixture");
+        let n = f32_bytes.len() / 4;
+        let mut f32_in = Vec::with_capacity(n);
+        for i in 0..n {
+            let b = [
+                f32_bytes[i * 4],
+                f32_bytes[i * 4 + 1],
+                f32_bytes[i * 4 + 2],
+                f32_bytes[i * 4 + 3],
+            ];
+            f32_in.push(f32::from_le_bytes(b));
+        }
+        assert_eq!(f32_in.len(), 2816 * 2048);
+        // GGUF stores [2816, 2048] with ne[0]=2816 (row size). Each row is
+        // 2816 elements (matches `data.shape=(2048, 2816)` in gguf-py).
+        let actual = quantize(&f32_in, 2816, None);
+        let expected = fs::read(expected_path).expect("read expected");
+        assert_eq!(actual.len(), expected.len());
+
+        let mut diffs = 0usize;
+        let mut first_diff: Option<(usize, u8, u8)> = None;
+        for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+            if a != e {
+                diffs += 1;
+                if first_diff.is_none() {
+                    first_diff = Some((i, a, e));
+                }
+            }
+        }
+        let pct = 100.0 * diffs as f64 / expected.len() as f64;
+        eprintln!(
+            "Q4_K real-model byte-cmp blk.0.attn_k.weight:\n  \
+             diffs={} of {} ({:.4}%)",
+            diffs,
+            expected.len(),
+            pct
+        );
+        if let Some((idx, a, e)) = first_diff {
+            let block = idx / 144;
+            let intra = idx % 144;
+            let field = match intra {
+                0..=1 => "d".to_string(),
+                2..=3 => "dmin".to_string(),
+                4..=15 => format!("scales[{}]", intra - 4),
+                _ => format!("qs[{}]", intra - 16),
+            };
+            eprintln!(
+                "  first diff: byte {} = block {} field {}: canonical=0x{:02x}, hf2q=0x{:02x}",
+                idx, block, field, e, a
+            );
+        }
+        // Count differing blocks + categorize by which field
+        let mut blocks_diff = std::collections::HashSet::new();
+        let mut field_diffs = std::collections::HashMap::new();
+        for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+            if a != e {
+                let block = i / 144;
+                let intra = i % 144;
+                let field = match intra {
+                    0..=1 => "d",
+                    2..=3 => "dmin",
+                    4..=15 => "scales",
+                    _ => "qs",
+                };
+                blocks_diff.insert(block);
+                *field_diffs.entry(field).or_insert(0) += 1;
+            }
+        }
+        eprintln!("  blocks differing: {} of 22528 ({:.2}%)", blocks_diff.len(), 100.0 * blocks_diff.len() as f64 / 22528.0);
+        eprintln!("  diffs per field: d={}, dmin={}, scales={}, qs={}",
+            field_diffs.get("d").unwrap_or(&0),
+            field_diffs.get("dmin").unwrap_or(&0),
+            field_diffs.get("scales").unwrap_or(&0),
+            field_diffs.get("qs").unwrap_or(&0));
+        assert_eq!(diffs, 0, "byte-cmp FAILED — {} bytes differ", diffs);
     }
 }

@@ -535,7 +535,18 @@ impl<W: Write + Seek> StreamingWriter<W> {
             }
             _ => {
                 let quantizer = quantizer_for(p.ggml_type)?;
-                quantizer.quantize(data, p.n_per_row, None)?
+                // ADR-033 §P1 F16-round-trip: convert_hf_to_gguf.py stores
+                // weight tensors as F16 in the intermediate GGUF (see
+                // /opt/llama.cpp/conversion/base.py:875-876), and
+                // llama-quantize reads them back to F32 with F16-precision
+                // loss before quantizing. To byte-match canonical output we
+                // mirror that round-trip here — BF16/F32 source values
+                // below F16's normal range (~6.1e-5) get rounded to F16
+                // subnormals, propagating identical inputs into the K-quant
+                // kernel. Per-element scalar round-trip; matches numpy's
+                // ndarray.astype(float16).astype(float32) used by canonical.
+                let f16_rt: Vec<f32> = data.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
+                quantizer.quantize(&f16_rt, p.n_per_row, None)?
             }
         };
 

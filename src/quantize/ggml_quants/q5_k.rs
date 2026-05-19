@@ -182,7 +182,7 @@ fn quantize_row_q5_k_ref(x: &[f32], out: &mut Vec<u8>) {
             // weights[l] = av_x + |x[l]|; av_x = sqrt(sum_x2 / 32)
             let mut sum_x2 = 0.0f32;
             for l in 0..32 {
-                sum_x2 += xb[32 * j + l] * xb[32 * j + l];
+                sum_x2 = xb[32 * j + l].mul_add(xb[32 * j + l], sum_x2);
             }
             let av_x = (sum_x2 / 32.0).sqrt();
             for l in 0..32 {
@@ -259,7 +259,7 @@ fn quantize_row_q5_k_impl(x: &[f32], quant_weights: &[f32], out: &mut Vec<u8>) {
 
         let mut sum_x2 = 0.0f32;
         for l in 0..QK_K {
-            sum_x2 += xb[l] * xb[l];
+            sum_x2 = xb[l].mul_add(xb[l], sum_x2);
         }
         let sigma2 = 2.0 * sum_x2 / (QK_K as f32);
         // av_x = sqrt(sigma2); kept for parity even though unused when

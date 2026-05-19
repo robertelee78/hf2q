@@ -114,8 +114,11 @@ pub fn make_qx_quants(
         } else {
             x[i].abs().sqrt()
         };
-        sumlx += w * x[i] * (li as f32);
-        suml2 += w * (li as f32) * (li as f32);
+        // FMA: clang auto-fuses these into fmadd on -O3 -march=native (4 fmadd
+        // instructions verified in _make_qx_quants binary). Rust at --release
+        // doesn't auto-FMA (fp-contract=off default), so use explicit mul_add.
+        sumlx = (w * x[i]).mul_add(li as f32, sumlx);
+        suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
     }
     let mut scale = if suml2 != 0.0 { sumlx / suml2 } else { 0.0 };
     if return_early {
@@ -147,8 +150,8 @@ pub fn make_qx_quants(
             } else {
                 x[i].abs().sqrt()
             };
-            sumlx += w * x[i] * (li as f32);
-            suml2 += w * (li as f32) * (li as f32);
+            sumlx = (w * x[i]).mul_add(li as f32, sumlx);
+            suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
         }
         if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
             for i in 0..n {
@@ -181,6 +184,18 @@ pub fn make_qkx2_quants(
     nstep: i32,
     use_mad: bool,
 ) -> f32 {
+    // ADR-033 quality-matrix iter-22 fix: use `f32::mul_add` for the 12
+    // accumulator hot-spots that clang auto-fuses into `fmadd` at -O3
+    // -march=native (verified via otool -tv of libggml-base.0.dylib —
+    // canonical emits 12 fmadd insns; Rust at --release auto-emits 0
+    // because rustc defaults to fp-contract=off). FMA produces a single
+    // rounded result; separate mul+add produces two rounded results.
+    // The ULP-level difference propagates through this function's
+    // iterative refinement and crosses F16-precision boundaries when
+    // the result is later quantized to f16 `dmin` for K-quant storage,
+    // producing a 0.04-0.07% byte divergence on real-model weight
+    // distributions even though the byte-cmp fixture tests pass on
+    // synthetic mulberry32 inputs that don't straddle the boundary.
     let mut min = x[0];
     let mut max = x[0];
     let mut sum_w = weights[0];
@@ -194,7 +209,7 @@ pub fn make_qkx2_quants(
         }
         let w = weights[i];
         sum_w += w;
-        sum_x += w * x[i];
+        sum_x = w.mul_add(x[i], sum_x);
     }
     if min > 0.0 {
         min = 0.0;
@@ -214,9 +229,11 @@ pub fn make_qkx2_quants(
         let li = nearest_int(iscale * (x[i] - min));
         let li_c = li.max(0).min(nmax) as u8;
         l[i] = li_c;
-        let mut diff = scale * li_c as f32 + min - x[i];
+        // FMA: clang fuses `scale * li_c + min` into fmadd, then subtracts x[i].
+        // 2 rounding ops vs Rust's 3 (fmul + fadd + fsub).
+        let mut diff = scale.mul_add(li_c as f32, min) - x[i];
         diff = if use_mad { diff.abs() } else { diff * diff };
-        best_error += weights[i] * diff;
+        best_error = weights[i].mul_add(diff, best_error);
     }
     if nstep < 1 {
         *the_min = -min;
@@ -233,23 +250,26 @@ pub fn make_qkx2_quants(
             l_aux[i] = li;
             let w = weights[i];
             let li_f = li as f32;
-            sum_l += w * li_f;
-            sum_l2 += w * li_f * li_f;
-            sum_xl += w * li_f * x[i];
+            sum_l = w.mul_add(li_f, sum_l);
+            sum_l2 = (w * li_f).mul_add(li_f, sum_l2);
+            sum_xl = (w * li_f).mul_add(x[i], sum_xl);
         }
-        let d_det = sum_w * sum_l2 - sum_l * sum_l;
+        // FMA: clang fuses `a*b - c*d` into `fmul(-c, d)` + `fmadd(a, b, prev)`
+        // — 2 rounding ops vs Rust's default 3 (2 fmul + 1 fsub). Use
+        // explicit mul_add to match clang's rounding chain.
+        let d_det = sum_w.mul_add(sum_l2, -sum_l * sum_l);
         if d_det > 0.0 {
-            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d_det;
-            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d_det;
+            let mut this_scale = sum_w.mul_add(sum_xl, -sum_x * sum_l) / d_det;
+            let mut this_min = sum_l2.mul_add(sum_x, -sum_l * sum_xl) / d_det;
             if this_min > 0.0 {
                 this_min = 0.0;
                 this_scale = sum_xl / sum_l2;
             }
             let mut cur_error = 0.0f32;
             for i in 0..n {
-                let mut diff = this_scale * l_aux[i] as f32 + this_min - x[i];
+                let mut diff = this_scale.mul_add(l_aux[i] as f32, this_min) - x[i];
                 diff = if use_mad { diff.abs() } else { diff * diff };
-                cur_error += weights[i] * diff;
+                cur_error = weights[i].mul_add(diff, cur_error);
             }
             if cur_error < best_error {
                 for i in 0..n {
@@ -303,7 +323,7 @@ pub fn make_qkx3_quants(
             None => x[i] * x[i],
         };
         sum_w += w;
-        sum_x += w * x[i];
+        sum_x = w.mul_add(x[i], sum_x);
     }
     if min > 0.0 {
         min = 0.0;
@@ -322,13 +342,14 @@ pub fn make_qkx3_quants(
         let li = nearest_int(iscale * (x[i] - min));
         let li_c = li.max(0).min(nmax) as u8;
         l[i] = li_c;
-        let mut diff = scale * li_c as f32 + min - x[i];
+        // FMA: clang fuses `scale * li_c + min` to fmadd; mirror.
+        let mut diff = scale.mul_add(li_c as f32, min) - x[i];
         diff = if use_mad { diff.abs() } else { diff * diff };
         let w = match weights {
             Some(ws) => ws[i],
             None => x[i] * x[i],
         };
-        best_mad += w * diff;
+        best_mad = w.mul_add(diff, best_mad);
     }
     if nstep < 1 {
         *the_min = -min;
@@ -348,27 +369,29 @@ pub fn make_qkx3_quants(
                 None => x[i] * x[i],
             };
             let li_f = li as f32;
-            sum_l += w * li_f;
-            sum_l2 += w * li_f * li_f;
-            sum_xl += w * li_f * x[i];
+            sum_l = w.mul_add(li_f, sum_l);
+            sum_l2 = (w * li_f).mul_add(li_f, sum_l2);
+            sum_xl = (w * li_f).mul_add(x[i], sum_xl);
         }
-        let d_det = sum_w * sum_l2 - sum_l * sum_l;
+        // FMA: same a*b - c*d divergence as make_qkx2_quants. Use mul_add
+        // so clang's 2-rounding fmadd chain is matched on the imatrix path.
+        let d_det = sum_w.mul_add(sum_l2, -sum_l * sum_l);
         if d_det > 0.0 {
-            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d_det;
-            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d_det;
+            let mut this_scale = sum_w.mul_add(sum_xl, -sum_x * sum_l) / d_det;
+            let mut this_min = sum_l2.mul_add(sum_x, -sum_l * sum_xl) / d_det;
             if this_min > 0.0 {
                 this_min = 0.0;
                 this_scale = sum_xl / sum_l2;
             }
             let mut mad = 0.0f32;
             for i in 0..n {
-                let mut diff = this_scale * l_aux[i] as f32 + this_min - x[i];
+                let mut diff = this_scale.mul_add(l_aux[i] as f32, this_min) - x[i];
                 diff = if use_mad { diff.abs() } else { diff * diff };
                 let w = match weights {
                     Some(ws) => ws[i],
                     None => x[i] * x[i],
                 };
-                mad += w * diff;
+                mad = w.mul_add(diff, mad);
             }
             if mad < best_mad {
                 for i in 0..n {
@@ -417,9 +440,11 @@ pub fn make_qp_quants(
     let scale = 1.0 / iscale;
     let mut best_mse = 0.0f32;
     for i in 0..n {
-        let diff = x[i] - scale * l[i] as f32;
+        // FMA: clang fuses `x - scale*l` to fnmsub (fmsub negated).
+        let diff = scale.mul_add(-(l[i] as f32), x[i]);
         let w = quant_weights[i];
-        best_mse += w * diff * diff;
+        // FMA: clang fuses `w * diff * diff + best_mse` into (fmul + fmadd).
+        best_mse = (w * diff).mul_add(diff, best_mse);
     }
     for is in -4i32..=4i32 {
         if is == 0 {
@@ -433,9 +458,9 @@ pub fn make_qp_quants(
             if li > nmax {
                 li = nmax;
             }
-            let diff = x[i] - scale_is * li as f32;
+            let diff = scale_is.mul_add(-(li as f32), x[i]);
             let w = quant_weights[i];
-            mse += w * diff * diff;
+            mse = (w * diff).mul_add(diff, mse);
         }
         if mse < best_mse {
             best_mse = mse;
@@ -451,24 +476,27 @@ pub fn make_qp_quants(
         }
         l[i] = li as u8;
         let w = quant_weights[i];
-        sumlx += w * x[i] * li as f32;
-        suml2 += w * (li as f32) * (li as f32);
+        // FMA: same pattern as make_qx_quants accumulators.
+        sumlx = (w * x[i]).mul_add(li as f32, sumlx);
+        suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
     }
     for _itry in 0..5 {
         let mut n_changed = 0;
         for i in 0..n {
             let w = quant_weights[i];
             let cur_l = l[i] as f32;
-            let mut slx = sumlx - w * x[i] * cur_l;
-            let mut sl2 = suml2 - w * cur_l * cur_l;
+            // FMA-subtract: clang fuses these as `fmsub slx, w*x[i], cur_l, sumlx`.
+            // Rust equivalent: (a*b).mul_add(-c, d) = a*b*(-c)+d = d - a*b*c.
+            let mut slx = (w * x[i]).mul_add(-cur_l, sumlx);
+            let mut sl2 = (w * cur_l).mul_add(-cur_l, suml2);
             if slx > 0.0 && sl2 > 0.0 {
                 let mut new_l = nearest_int(x[i] * sl2 / slx);
                 if new_l > nmax {
                     new_l = nmax;
                 }
                 if new_l as u8 != l[i] {
-                    slx += w * x[i] * new_l as f32;
-                    sl2 += w * (new_l as f32) * (new_l as f32);
+                    slx = (w * x[i]).mul_add(new_l as f32, slx);
+                    sl2 = (w * (new_l as f32)).mul_add(new_l as f32, sl2);
                     if slx * slx * suml2 > sumlx * sumlx * sl2 {
                         l[i] = new_l as u8;
                         sumlx = slx;
