@@ -255,6 +255,46 @@ impl ConvertOrchestrator {
         }
 
         // -----------------------------------------------------------------
+        // Compute a canonical visit-order permutation for the policy walk
+        // (does NOT reorder `entries` itself — the caller's `stream_tensor`
+        // protocol uses input-order indices and we preserve that).
+        //
+        // Canonical (`llama-quant.cpp`) visits tensors in GGUF storage order
+        // which `convert_hf_to_gguf.py` emits as: globals → blk.0.* → blk.1.*
+        // → ... → blk.<n_layer-1>.* (numeric layer, name-sorted within each).
+        // hf2q's HfModelSource iterates HF safetensors v0.3 in **lexical name
+        // order**: blk.0, blk.1, blk.10, blk.11, ..., blk.19, blk.2, ...
+        //
+        // The mismatch is benign for the WRITE side (llama.cpp loads by name),
+        // but `target_for` advances `qs.i_attention_wv` per visit and the
+        // Q5_K_M attn_v branch at `standard_policy.rs:556` uses that counter
+        // DIRECTLY (no `layer_info` parsing, see `llama-quant.cpp:533-534`).
+        // So a lexical visit order makes `use_more_bits(visit_count, n_layer)`
+        // fire on the wrong layer indices — measured as 12 attn_v Q5_K↔Q6_K
+        // swaps vs canonical on Gemma 4 26B Q5_K_M (docs §10.2).
+        //
+        // Fix: compute the canonical-order permutation, run the policy walk
+        // in that order so qs counters advance canonically, then un-permute
+        // `self.planned` back to input order. Result: `planned[i]` still
+        // matches `entries[i]` (stream protocol intact), but the ggml_type
+        // assignments byte-match canonical for every tensor.
+        // -----------------------------------------------------------------
+        fn canonical_sort_key(name: &str) -> (u32, u32, &str) {
+            if let Some(rest) = name.strip_prefix("blk.") {
+                if let Some(dot) = rest.find('.') {
+                    if let Ok(n) = rest[..dot].parse::<u32>() {
+                        return (1, n, name);
+                    }
+                }
+            }
+            (0, 0, name)
+        }
+        let mut canonical_order: Vec<usize> = (0..entries.len()).collect();
+        canonical_order.sort_by(|&a, &b| {
+            canonical_sort_key(&entries[a].name).cmp(&canonical_sort_key(&entries[b].name))
+        });
+
+        // -----------------------------------------------------------------
         // Pre-pass: count attn_v tensors and hardcode n_ffn_{down,gate,up}
         // to hparams.n_layer.
         //
@@ -295,8 +335,14 @@ impl ConvertOrchestrator {
 
         // Per-tensor: pick ggml_type. Payload size is also recorded for
         // stream-time validation. No payload bytes consumed here.
-        let mut planned: Vec<PlannedTensor> = Vec::with_capacity(entries.len());
-        for e in &entries {
+        //
+        // Policy walk runs in CANONICAL order (so qs counters advance to
+        // match llama.cpp), but results are stored in `planned[]` indexed
+        // by the input position so `stream_tensor(i, data)` semantics are
+        // unchanged. See top-of-function note about `canonical_order`.
+        let mut planned: Vec<Option<PlannedTensor>> = (0..entries.len()).map(|_| None).collect();
+        for &orig_idx in &canonical_order {
+            let e = &entries[orig_idx];
             let dims_gguf: Vec<u64> = e.shape.iter().map(|&d| d as u64).collect();
             let expected_numel: usize = e.shape.iter().product();
             let n_per_row = e.shape[0];
@@ -337,7 +383,7 @@ impl ConvertOrchestrator {
                 }
             };
 
-            planned.push(PlannedTensor {
+            planned[orig_idx] = Some(PlannedTensor {
                 name: e.name.clone(),
                 dims_gguf,
                 ggml_type,
@@ -346,7 +392,9 @@ impl ConvertOrchestrator {
             });
         }
 
-        self.planned = planned;
+        // Every orig_idx in 0..entries.len() appears in canonical_order
+        // exactly once (it's a permutation), so every slot is Some.
+        self.planned = planned.into_iter().map(|p| p.expect("permutation covers all indices")).collect();
         Ok(())
     }
 
@@ -1123,6 +1171,86 @@ mod tests {
             "ffn_down Q6_K promotion must match canonical use_more_bits(i, n_layer=30); \
              pre-fix bug had n_ffn_down=90 and would produce 17 layers including {{3,4,6,7,9,10,13,16,19,22,25}}."
         );
+    }
+
+    /// Regression test for bug #2 (docs §10.2): attn_v use_more_bits counter
+    /// advances on visit order, but hf2q's HfModelSource iterates safetensors
+    /// in lexical name order (blk.0, blk.1, blk.10, blk.11, ..., blk.2, ...).
+    /// Canonical visits in numeric layer order. Result: 12 attn_v Q5_K↔Q6_K
+    /// swaps vs canonical on a 30-layer MoE pre-fix.
+    ///
+    /// Fix: orchestrator sorts entries by canonical (group, layer, name)
+    /// before the policy walk. This test simulates the buggy input order
+    /// (lexical) and asserts the result matches canonical's numeric-order
+    /// promotion set {0, 1, 2, 9, 12, 15, 18, 21, 24, 26, 27, 28, 29} for
+    /// 30-layer use_more_bits over attn_v. (Note: this is the use_more_bits
+    /// canonical TRUE-set with n_attention_wv=30; differs from ffn_down's
+    /// {0,1,2,5,8,11,14,17,20,23,26,27,28,29} because the boundary computes
+    /// differently for incremented-vs-parsed indices.)
+    #[test]
+    fn attn_v_visit_order_sorts_to_canonical_numeric_layer_order() {
+        const N_LAYER: u32 = 30;
+        let hparams = HParams {
+            n_expert: 128,
+            n_head: 8,
+            n_head_kv: 1,
+            n_layer: N_LAYER,
+        };
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ5_K_M,
+            ArchName::Gemma4,
+            hparams,
+        );
+        orch.add_metadata(
+            "general.architecture".to_string(),
+            MetaValue::String("gemma4".into()),
+        );
+
+        // n_per_row=256 so Q5_K and Q6_K are block-aligned (no fallback)
+        let n_per_row = 256usize;
+        let shape = vec![n_per_row, 64];
+
+        // Build entries in LEXICAL order — the bug input pattern from
+        // HfModelSource on real Gemma 4 safetensors.
+        let layers_lex: Vec<u32> = {
+            let mut v: Vec<u32> = (0..N_LAYER).collect();
+            v.sort_by_key(|n| format!("{n}"));
+            v
+        };
+        let mut entries: Vec<PlanEntry> = Vec::new();
+        for li in layers_lex {
+            entries.push(PlanEntry {
+                name: format!("blk.{li}.attn_v.weight"),
+                shape: shape.clone(),
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(li as usize),
+            });
+        }
+        orch.plan_tensors(entries).expect("plan");
+
+        // Walk planned tensors. For each blk.<N>.attn_v.weight assert the
+        // type matches use_more_bits(N, 30) → Q6_K, else Q5_K.
+        fn use_more_bits(i: u32, n: u32) -> bool {
+            i < n / 8 || i >= 7 * n / 8 || (i.saturating_sub(n / 8)) % 3 == 2
+        }
+        for pt in orch.planned.iter() {
+            let layer: u32 = pt.name
+                .strip_prefix("blk.")
+                .and_then(|s| s.split('.').next())
+                .and_then(|s| s.parse().ok())
+                .expect("layer parse");
+            let expected = if use_more_bits(layer, N_LAYER) {
+                crate::quantize::ggml_quants::GgmlType::Q6_K
+            } else {
+                crate::quantize::ggml_quants::GgmlType::Q5_K
+            };
+            assert_eq!(
+                pt.ggml_type, expected,
+                "blk.{layer}.attn_v.weight: visit-order-sorted plan must produce \
+                 the canonical use_more_bits(layer, 30) type. Pre-fix bug would \
+                 produce Q5_K↔Q6_K swaps due to lexical iteration order."
+            );
+        }
     }
 
     #[test]
