@@ -111,6 +111,16 @@ fn dispatch_moe_id_routed(
     pool_n_experts: u32,
     pool_rows: u32,
     label: &str,
+    // ADR-033 §Pi Phase B Stage 3b.2 — imatrix intercept hint
+    // (Layered{tag,layer} for GGML-quant MoE expert tensors, or None
+    // to skip the intercept for paths where MoE imatrix collection
+    // isn't applicable). The affine-stack branch below is NOT
+    // intercepted yet — affine MoE GGUFs are a separate format and
+    // their imatrix wiring lands in Stage 3b.3 when an operator
+    // ships imatrix-aware DWQ. Per [[feedback-no-stub-2026-05-19]]
+    // we accept the gap as documented scope, not as a silent
+    // fallback.
+    imatrix_hint: crate::quantize::imatrix::ImatrixHint<'_>,
 ) -> anyhow::Result<()> {
     if let Some(stack) = affine {
         // Affine path: kernel writes into `output` directly.  M/N/K
@@ -149,6 +159,29 @@ fn dispatch_moe_id_routed(
         )
         .map_err(|e| anyhow!("{label} qmatmul_id_into (affine): {e}"))
     } else {
+        // ADR-033 §Pi Phase B Stage 3b.2 — imatrix intercept BEFORE
+        // the GGML-quant MoE-id dispatch. Captures the per-token
+        // shared input + per-token routed expert IDs and fires
+        // `record_moe` for each (token, expert) pair. No-op when no
+        // collector installed (production decode/serve path).
+        crate::quantize::imatrix::intercept_qmatmul_id_with_hint(
+            imatrix_hint,
+            legacy_params.n_tokens as usize,
+            legacy_params.top_k as usize,
+            legacy_params.k as usize,
+            || {
+                if let Err(e) = enc.commit_and_wait() {
+                    eprintln!(
+                        "[hf2q imatrix moe intercept ({label})] commit_and_wait failed: {e}"
+                    );
+                    return None;
+                }
+                input.as_slice::<f32>().ok().map(|sl| sl.to_vec())
+            },
+            || ids.as_slice::<u32>().ok().map(|sl| sl.to_vec()),
+        )
+        .map_err(|e| anyhow!("imatrix moe intercept ({label}): {e}"))?;
+
         // Legacy path: pooled scratch + GGML kernel.  Same body as
         // pre-Iter C2.4 #4 (preserved for byte-identity on non-overlay
         // serves).
@@ -2221,6 +2254,13 @@ pub fn build_moe_ffn_layer_gpu_q(
         weights,
         shape,
         add_residual,
+        // Legacy wrapper has no caller-supplied layer context (only
+        // reachable from the test at gpu_ffn.rs:~4004; production
+        // qwen35 prefill/decode goes through forward_gpu.rs which
+        // does carry layer_idx). Pass 0 — the imatrix intercept
+        // tag will be "blk.0.ffn_*_exps.weight" but the test
+        // doesn't install a collector so it never fires.
+        0,
     )?;
     let seq_len = (x.element_count() / shape.hidden_size as usize) as u32;
     if seq_len == 1 {
@@ -2278,6 +2318,12 @@ pub fn build_moe_ffn_layer_gpu_q_into(
     weights: &MoeFfnWeightsGpuQ,
     shape: MoeFfnShape,
     add_residual: Option<&MlxBuffer>,
+    // ADR-033 §Pi Phase B Stage 3b.2 — layer index needed to format
+    // the canonical GGUF tensor name (`blk.<layer_idx>.ffn_*_exps.weight`)
+    // for imatrix intercept hints. Callers MUST supply the actual
+    // 0-based layer index; the legacy wrapper at gpu_ffn.rs that has
+    // no layer context (test-only path) passes 0.
+    layer_idx: usize,
 ) -> Result<MlxBuffer> {
     let h = shape.hidden_size as usize;
     let _ne = shape.num_experts as usize;
@@ -2588,6 +2634,10 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 ne32,
                 seq_len * shape.num_experts_per_tok,
                 "gate_all",
+                crate::quantize::imatrix::ImatrixHint::Layered {
+                    tag: "ffn_gate_exps",
+                    layer: layer_idx,
+                },
             )?;
             dispatch_moe_id_routed(
                 enc,
@@ -2603,6 +2653,10 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 ne32,
                 seq_len * shape.num_experts_per_tok,
                 "up_all",
+                crate::quantize::imatrix::ImatrixHint::Layered {
+                    tag: "ffn_up_exps",
+                    layer: layer_idx,
+                },
             )?;
             // ADR-015 iter7b — pooled (q_into path; y_s_buf flows into
             // dispatch_moe_weighted_reduce, no CPU download).
@@ -2700,6 +2754,10 @@ pub fn build_moe_ffn_layer_gpu_q_into(
                 ne32,
                 total_rows as u32,
                 "y_all_decode",
+                crate::quantize::imatrix::ImatrixHint::Layered {
+                    tag: "ffn_down_exps",
+                    layer: layer_idx,
+                },
             )?;
         }
 
@@ -2773,6 +2831,10 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
     add_residual: Option<&MlxBuffer>,
     arena: &mut super::MoeFfnArena,
     out_slot: &mut MlxBuffer,
+    // ADR-033 §Pi Phase B Stage 3b.2 — layer index for imatrix
+    // intercept hint formatting. See sibling
+    // `build_moe_ffn_layer_gpu_q_into` for full rationale.
+    layer_idx: usize,
 ) -> Result<MlxBuffer> {
     let h = shape.hidden_size as usize;
     let _ne = shape.num_experts as usize;
@@ -2974,6 +3036,10 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 ne32,
                 seq_len * shape.num_experts_per_tok,
                 "gate_all_pf",
+                crate::quantize::imatrix::ImatrixHint::Layered {
+                    tag: "ffn_gate_exps",
+                    layer: layer_idx,
+                },
             )?;
             dispatch_moe_id_routed(
                 enc,
@@ -2989,6 +3055,10 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 ne32,
                 seq_len * shape.num_experts_per_tok,
                 "up_all_pf",
+                crate::quantize::imatrix::ImatrixHint::Layered {
+                    tag: "ffn_up_exps",
+                    layer: layer_idx,
+                },
             )?;
             proj_pooled(
                 enc,
@@ -3064,6 +3134,10 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
                 ne32,
                 total_rows as u32,
                 "y_all_pf",
+                crate::quantize::imatrix::ImatrixHint::Layered {
+                    tag: "ffn_down_exps",
+                    layer: layer_idx,
+                },
             )?;
         }
 

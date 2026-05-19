@@ -3599,6 +3599,7 @@ impl Qwen35Model {
                                 Some(&ffn_residual),
                                 arena,
                                 out_slot,
+                                layer_idx,
                             )
                             .with_context(|| {
                                 format!("moe_ffn_q_into_with_arena fused layer {layer_idx}")
@@ -3612,6 +3613,7 @@ impl Qwen35Model {
                             w_gpu,
                             shape,
                             Some(&ffn_residual),
+                            layer_idx,
                         )
                         .with_context(|| {
                             format!("moe_ffn_q_into fused layer {layer_idx}")
@@ -4779,6 +4781,7 @@ impl Qwen35Model {
                             w_gpu,
                             shape,
                             Some(ffn_residual_buf_ref),
+                            layer_idx,
                         )
                         .with_context(|| format!("moe_ffn_q_into single-cb layer {layer_idx}"))?;
                         out
@@ -5080,6 +5083,7 @@ impl Qwen35Model {
                             w_gpu,
                             shape,
                             Some(ffn_residual_buf_ref),
+                            layer_idx,
                         )
                         .with_context(|| {
                             format!("moe_ffn_q_into fused legacy greedy layer {layer_idx}")
