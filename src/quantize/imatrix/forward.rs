@@ -431,10 +431,12 @@ pub struct ComputeImatrixParams {
 ///
 /// Cost note: a single chunk of `forward_prefill` on a 26B-A4B Gemma
 /// model takes several seconds; a full cdv3 corpus (~50k tokens at
-/// n_ctx=512 ⇒ ~100 chunks) is operator-time, not CI-time. The
-/// driver intentionally has no per-test fixture — operators invoke
-/// it via `hf2q convert <hf-dir> --quant apex-i-balanced
-/// --imatrix-corpus cdv3` once Stage 3c.2 wires the CLI surface.
+/// the default `n_ctx=512` ⇒ ~100 chunks) is operator-time, not
+/// CI-time. The driver intentionally has no per-test fixture —
+/// operators invoke it via `hf2q convert <hf-dir> --quant
+/// apex-i-balanced --imatrix-corpus cdv3` (Stage 3c.2 CLI wiring
+/// SHIPPED 2026-05-19; `--imatrix-n-ctx <N>` flag SHIPPED at
+/// commit `71abbed5` overrides the 512 default).
 pub fn compute_imatrix(
     params: &ComputeImatrixParams,
 ) -> Result<super::ImatrixData, ImatrixError> {
