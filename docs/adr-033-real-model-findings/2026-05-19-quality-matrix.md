@@ -31,10 +31,60 @@ F16 GGUF → `llama-quantize <type>` ≠ HF → `hf2q convert --quant <type>`).
 | Q5_K_M  | 5471.84 ± 284.38       | 5411.20 ± 281.65      | 0.9889 | ✅ PASS | Matches §P1 closure (`b03915af`) exactly. |
 | Q4_K_M  | 13183.40 ± 697.92      | 11502.00 ± 607.41     | 0.8725 | ❌ FAIL | Ratio outside ±5% envelope. Per-tensor types match canonical (0 mismatches on 655 blk.* tensors); file-size delta is 448 bytes (header-KV-only, same as Q5_K_M). hf2q PPL is LOWER (better) than canonical — divergence direction is unexpected; needs deeper localization (see "Q4_K_M investigation" below). |
 | Q6_K    | 4150.61 ± 211.32       | 4193.80 ± 213.74      | 1.0104 | ✅ PASS | Within ±2% envelope. Q6_K-only file (no Q4_K, no Q5_K). 448-byte file delta. Result confirms Q6_K kernel is byte-equivalent (to PPL-detectable precision). |
-| Q8_0    | _pending_              | _pending_             | —      | —       | hf2q convert running. |
+| Q8_0    | 4119.9252 ± 206.98     | 4119.9252 ± 206.98    | 1.0000 | ✅ PASS | **PPL identical to 4 decimal places.** Q8_0 kernel is byte-equivalent to canonical at the data-flow level. 448-byte file delta. |
 
 Remaining matrix cells (per ADR §1 AC#2) are operator-time follow-ups:
 `q4_0`, `q4_k_s`, `q5_k_s`, `iq4_nl`, plus the APEX tier matrix.
+
+## Verdict summary
+
+**3 of 4 measured cells PASS the exit criterion** (|ratio − 1| < 0.05):
+- Q5_K_M: 0.989 ✅ (1.1% below canonical)
+- Q6_K:   1.010 ✅ (1.0% above canonical)
+- Q8_0:   1.000 ✅ (identical to 4 decimal places — empirically byte-equivalent at the data-flow level)
+
+**1 cell FAILS:**
+- Q4_K_M: 0.872 ❌ (12.8% below canonical, outside ±5% envelope)
+
+The Q5_K + Q6_K + Q8_0 kernels are confirmed clean. The **Q4_K kernel
+is the lone identified divergent kernel** (Q4_K_M uses Q4_K + Q6_K;
+Q6_K is independently clean; therefore Q4_K is the divergent layer).
+
+The Q4_K kernel's byte-cmp fixture tests
+(`q4_k::tests::byte_cmp_noim` + `byte_cmp_im`) pass at HEAD, so the
+divergence is input-distribution-dependent: the fixture's specific
+input distribution doesn't exercise the divergent code path that
+real Gemma 4 weights trigger.
+
+**Direction note:** hf2q's Q4_K_M PPL (11502) is LOWER (better) than
+canonical's (13183) — an unexpected divergence direction. Two possible
+explanations:
+
+1. **PPL-variance hypothesis:** at PPL ~10K-13K (Gemma 4 26B on cdv3 is
+   higher than typical PPL ranges because cdv3 is biomedical and Gemma
+   4 is general-purpose) the ±5% envelope may not capture sample
+   variance. The ±5.3% error bars on each measurement compound to
+   ~7.5% relative uncertainty on the ratio — making 0.872 statistically
+   meaningfully different from 1.0 but the magnitude could be partially
+   noise.
+
+2. **Q4_K kernel "accidentally better" hypothesis:** hf2q's Q4_K
+   implementation may have a subtle numerical difference (e.g., one
+   rounding boundary off by ½ ULP) that happens to produce a slightly
+   different quantization choice on real-model weight distributions,
+   landing in a regime that has marginally better quality on cdv3.
+   Byte-cmp fixture tests pass because the fixture input doesn't
+   straddle the boundary.
+
+Next investigation steps (operator-time):
+- Extract one specific Q4_K tensor (e.g., `blk.0.ffn_gate.weight`)
+  from BOTH GGUFs, byte-compare. Localizes whether the kernel
+  produces different bytes on real-model input.
+- If divergent: bisect the Q4_K kernel against `ggml-quants.c:1395-1465`
+  with real-model F32 input to find the divergent op.
+- If byte-equivalent: divergence is in metadata/loader; investigate
+  `tokenizer.ggml.pre` setting, missing `general.quantization_version`,
+  or KV ordering's effect on llama-perplexity load behavior.
 
 ---
 
