@@ -24,14 +24,31 @@ F16 GGUF → `llama-quantize <type>` ≠ HF → `hf2q convert --quant <type>`).
 
 ---
 
-## Matrix
+## Matrix — UPDATED 2026-05-19 POST-CLOSURE (commit `50fd89c2`)
+
+| Quant   | Canonical PPL          | hf2q PPL              | Ratio  | Tensors | Verdict |
+|---------|------------------------|-----------------------|--------|---------|---------|
+| Q4_K_M  | 13183.4003 ± 697.92    | 13183.4003 ± 697.92   | 1.0000 | **658/658 byte-identical** | 🏆 EXACT |
+| Q5_K_M  | 5458.7019 ± 283.97     | 5458.7019 ± 283.97    | 1.0000 | **658/658 byte-identical** | 🏆 EXACT |
+| Q6_K    | 4150.6105 ± 211.32     | 4150.6105 ± 211.32    | 1.0000 | **658/658 byte-identical** | 🏆 EXACT |
+| Q8_0    | 4119.9252 ± 206.98     | 4119.9252 ± 206.98    | 1.0000 | **658/658 byte-identical** | 🏆 EXACT |
+
+All four cells: per-tensor byte-cmp via `scripts/byte_cmp_gguf.py` reports zero diffs across every F32/Q4_K/Q5_K/Q5_0/Q5_1/Q6_K/Q8_0 tensor; PPL is bit-for-bit identical between canonical `convert_hf_to_gguf.py --outtype f16 | llama-quantize <type>` and `hf2q convert --quant <type>`. File-size delta remains 448 bytes (header-KV ordering only — not a tensor-data difference).
+
+Two root causes closed the historical gaps:
+
+1. **FMA non-associativity** between clang (`-O3 -march=native` + `-ffp-contract=on` default fuses `a*b+c` into single-rounded `fmadd`) and rustc (`--release` defaults `fp-contract=off`, no auto-FMA). Fix: explicit `f32::mul_add` at every accumulator hotspot, `a*b - c*d` determinant pattern (encoded as `a.mul_add(b, -c*d)`), and `scale*l + min - x` error-evaluation pattern (encoded as `scale.mul_add(l, min) - x`). Applied across `make_qx_quants`, `make_qkx2_quants`, `make_qkx3_quants`, `make_qp_quants` in `src/quantize/ggml_quants/common.rs`.
+
+2. **F16 intermediate round-trip**. Canonical pipeline stores BF16/F32 weight tensors as F16 in the intermediate GGUF (`/opt/llama.cpp/conversion/base.py:875-876`) before `llama-quantize` reads them back to F32; this round-trip is lossy below F16's normal range (~6.1e-5). hf2q's previous direct `BF16 → F32 → Q4_K` path produced ~779/5.77M element divergence on `blk.0.attn_k.weight` alone. Fix: `src/convert/orchestrator.rs::stream_tensor` applies `F32 → F16 → F32` to the input vector at the quantizer branch, mirroring canonical's behavior.
+
+### Earlier (pre-closure) measurements — historical
 
 | Quant   | Canonical PPL          | hf2q PPL              | Ratio  | Verdict | Notes |
 |---------|------------------------|-----------------------|--------|---------|-------|
-| Q5_K_M  | 5471.84 ± 284.38       | 5411.20 ± 281.65      | 0.9889 | ✅ PASS | Matches §P1 closure (`b03915af`) exactly. |
-| Q4_K_M  | 13183.40 ± 697.92      | 11502.00 ± 607.41     | 0.8725 | ❌ FAIL | Ratio outside ±5% envelope. Per-tensor types match canonical (0 mismatches on 655 blk.* tensors); file-size delta is 448 bytes (header-KV-only, same as Q5_K_M). hf2q PPL is LOWER (better) than canonical — divergence direction is unexpected; needs deeper localization (see "Q4_K_M investigation" below). |
-| Q6_K    | 4150.61 ± 211.32       | 4193.80 ± 213.74      | 1.0104 | ✅ PASS | Within ±2% envelope. Q6_K-only file (no Q4_K, no Q5_K). 448-byte file delta. Result confirms Q6_K kernel is byte-equivalent (to PPL-detectable precision). |
-| Q8_0    | 4119.9252 ± 206.98     | 4119.9252 ± 206.98    | 1.0000 | ✅ PASS | **PPL identical to 4 decimal places.** Q8_0 kernel is byte-equivalent to canonical at the data-flow level. 448-byte file delta. |
+| Q5_K_M  | 5471.84 ± 284.38       | 5411.20 ± 281.65      | 0.9889 | ✅ PASS | Pre-FMA-fix; was the §P1 byte-mix-equivalent measurement at `b03915af`. Closed exactly post-`50fd89c2`. |
+| Q4_K_M  | 13183.40 ± 697.92      | 11502.00 ± 607.41     | 0.8725 | ❌ FAIL | Pre-FMA-fix; 12.8% delta from FMA + F16-roundtrip artifacts. Closed exactly post-`50fd89c2`. |
+| Q6_K    | 4150.61 ± 211.32       | 4193.80 ± 213.74      | 1.0104 | ✅ PASS | Pre-FMA-fix; closed exactly post-`50fd89c2`. |
+| Q8_0    | 4119.9252 ± 206.98     | 4119.9252 ± 206.98    | 1.0000 | ✅ PASS | Q8_0 was unaffected by either bug (single-byte scalar quant, no iterative scale search). |
 
 Remaining matrix cells (per ADR §1 AC#2) are operator-time follow-ups:
 `q4_0`, `q4_k_s`, `q5_k_s`, `iq4_nl`, plus the APEX tier matrix.
@@ -228,13 +245,7 @@ and compares against the `-O3 -ffp-contract=on` build. Operator-time.
 
 ## What this matrix does NOT cover (and why)
 
-1. **Per-tensor byte-cmp** between canonical and hf2q output. ADR §1 AC#2
-   originally specified `cmp 0` byte-equality, but the §P1 closure
-   established that real-model byte-equivalence is not achievable due to
-   FP accumulation order between the per-row F32 buffer formation paths.
-   The §P1 closure replaced the strict byte-cmp with "byte-mix-equivalent"
-   (same per-tensor GgmlType assignments + PPL ratio close to 1.0). This
-   matrix extends that closure to additional quants.
+1. ~~**Per-tensor byte-cmp** between canonical and hf2q output~~ — **NOW COVERED**. Commit `50fd89c2` achieved strict per-tensor byte-equivalence (`cmp 0` semantics) via `scripts/byte_cmp_gguf.py`. The earlier "byte-mix-equivalent" framing assumed FP-accumulation-order divergence was structural; the d_det `a*b - c*d` FMA pattern + F16 intermediate round-trip turned out to be the actual sources. Strict byte-cmp now holds for Q4_K_M, Q5_K_M, Q6_K, Q8_0 on Gemma 4 26B-A4B-IT.
 
 2. **Cross-arch coverage.** Only Gemma 4 26B is exercised today. The
    source-level transitive proof (§Pa for non-I APEX, §P4b for I-tier
