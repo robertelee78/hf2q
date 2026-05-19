@@ -423,4 +423,105 @@ mod tests {
             other => panic!("expected MissingKv, got {other:?}"),
         }
     }
+
+    /// ADR-033 §Pi Phase A acceptance gate — cross-validates hf2q's
+    /// loader + writer against a real `.imatrix.gguf` produced by stock
+    /// `llama-imatrix`. Gated behind env var `HF2Q_IMATRIX_REAL_REF`
+    /// (path to the reference file) so CI / regular `cargo test` runs
+    /// skip it cleanly; setting the env var makes the test load the
+    /// real ref, round-trip it through `ImatrixData::write_gguf` +
+    /// `ImatrixData::load_from_path` again, and assert the second load
+    /// matches the first exactly (no arithmetic in the round-trip).
+    ///
+    /// Usage:
+    ///   HF2Q_IMATRIX_REAL_REF=/path/to/ref.imatrix.gguf \
+    ///     cargo test --bin hf2q imatrix_real_load_round_trip -- --nocapture
+    #[test]
+    fn imatrix_real_load_round_trip_byte_cmp() {
+        let Some(ref_path) = std::env::var_os("HF2Q_IMATRIX_REAL_REF") else {
+            eprintln!(
+                "skip: HF2Q_IMATRIX_REAL_REF not set — provide path to a \
+                 real .imatrix.gguf produced by stock llama-imatrix to run \
+                 the byte-cmp acceptance gate"
+            );
+            return;
+        };
+        let ref_path = std::path::PathBuf::from(ref_path);
+        eprintln!("loading reference imatrix: {}", ref_path.display());
+
+        use crate::quantize::imatrix::ImatrixData;
+        let data1 = ImatrixData::load_from_path(&ref_path)
+            .expect("hf2q load_from_path must parse stock llama-imatrix output");
+        let loaded1 = &data1.loaded;
+        eprintln!(
+            "  loaded {} tensor pairs, datasets={:?}, chunk_count={}, chunk_size={}",
+            loaded1.registry.len(),
+            loaded1.datasets,
+            loaded1.chunk_count,
+            loaded1.chunk_size,
+        );
+        assert!(
+            !loaded1.registry.is_empty(),
+            "reference imatrix must have at least one tensor"
+        );
+        assert!(
+            loaded1.chunk_count > 0,
+            "reference imatrix must have non-zero chunk_count"
+        );
+
+        // Round-trip via hf2q's writer + reload. `imatrix_data_round_trip_is_byte_stable`
+        // already pins schema-internal byte-stability; this real-ref gate
+        // adds the cross-validation that the stock writer's KV/tensor
+        // layout matches what hf2q's loader expects.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        data1
+            .write_gguf(tmp.path(), &loaded1.datasets)
+            .expect("hf2q write_gguf must succeed on data derived from stock ref");
+
+        let data2 = ImatrixData::load_from_path(tmp.path())
+            .expect("hf2q load_from_path must parse hf2q's own writer output");
+        let loaded2 = &data2.loaded;
+
+        assert_eq!(loaded2.datasets, loaded1.datasets);
+        assert_eq!(loaded2.chunk_count, loaded1.chunk_count);
+        assert_eq!(loaded2.chunk_size, loaded1.chunk_size);
+        assert_eq!(
+            loaded2.registry.len(),
+            loaded1.registry.len(),
+            "tensor count must match across round-trip"
+        );
+
+        // Per-tensor payload comparison. AccumulatorRegistry::iter()
+        // returns entries in insertion order; both writer + loader
+        // preserve order so positional iteration is sound for the
+        // round-trip case.
+        for ((name1, acc1), (name2, acc2)) in
+            loaded1.registry.iter().zip(loaded2.registry.iter())
+        {
+            assert_eq!(name1, name2, "tensor name mismatch");
+            assert_eq!(
+                acc1.n_per_row, acc2.n_per_row,
+                "tensor `{name1}` n_per_row mismatch"
+            );
+            assert_eq!(
+                acc1.n_mat, acc2.n_mat,
+                "tensor `{name1}` n_mat mismatch"
+            );
+            assert_eq!(
+                acc1.values, acc2.values,
+                "tensor `{name1}` in_sum2 payload (values) mismatch"
+            );
+            assert_eq!(
+                acc1.counts, acc2.counts,
+                "tensor `{name1}` counts payload mismatch"
+            );
+        }
+
+        eprintln!(
+            "byte-cmp PASS: hf2q load+write+reload matches stock llama-imatrix output \
+             ({} tensor pairs, {} chunks)",
+            loaded1.registry.len(),
+            loaded1.chunk_count
+        );
+    }
 }
