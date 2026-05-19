@@ -317,7 +317,7 @@ pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
 /// `None` if the field is missing or non-positive — surfaces as
 /// [`ConvertV2Error::ApexMissingLayerCount`] at the caller.
 fn config_n_layers(config: &serde_json::Value) -> Option<u32> {
-    config
+    effective_config(config)
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
         .filter(|&x| x > 0)
@@ -419,11 +419,34 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertV2Error> {
 // HParams
 // ============================================================================
 
+/// Multimodal-config flatten: when the top-level config is a multimodal
+/// wrapper (Gemma 4 mmproj-bundle, Qwen3-VL omni, etc.) the text-decoder
+/// hparams live in `config["text_config"]`, not at the top level. This
+/// helper returns the inner text-config when present, else the outer
+/// config unchanged.
+///
+/// Real-world bug surfaced 2026-05-18 by `hf2q convert-v2
+/// /opt/hf2q/models/google-gemma-4-26b-a4b-it --quant q5_k_m`: the
+/// outer config has only the multimodal scaffolding
+/// (architectures / model_type / vision_config / text_config), and
+/// `build_hparams` was reading `num_attention_heads` from the outer
+/// config → MissingHparam error.
+pub fn effective_config(config: &serde_json::Value) -> &serde_json::Value {
+    // Gemma 4 / Qwen3-VL-omni pattern: `text_config` is the text decoder.
+    if let Some(text) = config.get("text_config") {
+        return text;
+    }
+    // Future multimodal wrappers may use other key names; keep this
+    // single-source so per-arch mappers don't each have to handle it.
+    config
+}
+
 /// Extract the [`HParams`] block the orchestrator needs for
 /// `target_for`'s GQA + counter-walk branches. Mirrors the convention
 /// in the per-arch `build_metadata` mappers (default `n_head_kv` to
 /// `n_head`, `n_expert` to zero when absent).
 fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertV2Error> {
+    let config = effective_config(config);
     let n_head = config
         .get("num_attention_heads")
         .and_then(|v| v.as_u64())
@@ -469,6 +492,12 @@ fn build_metadata_for_arch(
     config: &serde_json::Value,
     ftype: u32,
 ) -> Vec<(String, MetaValue)> {
+    // Multimodal-wrapper flatten: text-decoder hparams live in
+    // config["text_config"] for Gemma 4 / Qwen3-VL omni-shape configs.
+    // Per-arch mappers don't each have to handle this; we resolve at the
+    // driver boundary. Surfaced 2026-05-18 by the operator's
+    // google-gemma-4-26b-a4b-it real-model convert smoke test.
+    let config = effective_config(config);
     match arch {
         ArchName::Llama3 => llama3::build_metadata(config, ftype),
         ArchName::Gemma4 => gemma4::build_metadata(config, ftype),
