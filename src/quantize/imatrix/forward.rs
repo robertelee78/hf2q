@@ -471,6 +471,11 @@ pub fn compute_imatrix(
         imatrix: None,
         imatrix_corpus: None,
         imatrix_out: None,
+        // The inner F16 convert never collects an imatrix (it's the
+        // F16 build that the imatrix driver itself feeds forward
+        // passes through). `imatrix_n_ctx` is consulted ONLY when
+        // `imatrix_corpus` is set, so None here is structurally safe.
+        imatrix_n_ctx: None,
     };
     crate::convert::cli_driver::run_convert(convert_args).map_err(|e| {
         ImatrixError::ConvertFailed {

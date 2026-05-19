@@ -216,6 +216,21 @@ pub struct ConvertCliArgs {
     /// matches stock `llama-imatrix --output-format gguf`.
     #[arg(long)]
     pub imatrix_out: Option<PathBuf>,
+
+    /// Context length for in-tree imatrix collection (ADR-033 §Pi
+    /// Stage 3c). Only consulted when `--imatrix-corpus` is set;
+    /// ignored on the `--imatrix <file>` load path (the loaded file's
+    /// `imatrix.chunk_size` KV is authoritative there). Defaults to
+    /// 512 to match stock `llama-imatrix -c 512`. Must be > 0; the
+    /// corpus must tokenize to at least this many tokens or the
+    /// driver surfaces `ImatrixError::CorpusTooShort`.
+    ///
+    /// Larger `n_ctx` means fewer, longer chunks per forward-pass
+    /// loop — useful for matching imatrices produced by stock
+    /// llama-imatrix with non-default `-c` values, but at the cost
+    /// of more memory per forward pass.
+    #[arg(long)]
+    pub imatrix_n_ctx: Option<u32>,
 }
 
 #[derive(clap::Args, Debug)]

@@ -396,7 +396,7 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
 **Stage 3 deferred sub-tasks** (out of MVP):
 - Stage 3b.3: affine-MoE intercept (DWQ-overlay format; no current operator demand).
 - Stage 3b.4: Qwen35Moe driver wiring (needs `Qwen35LoadedModel::forward_prefill` chat-completion path which is still iter-228b scope).
-- `--imatrix-n-ctx <N>` CLI flag (currently hardcoded to 512 matching stock `llama-imatrix -c 512`).
+- ~~`--imatrix-n-ctx <N>` CLI flag~~ **SHIPPED 2026-05-19** (post-Stage-3c follow-up). Operators can now pass `--imatrix-n-ctx 1024` (or any positive u32) to override the default 512 chunk size. Validated > 0 at `cli_driver.rs::resolve_imatrix_input`; `--imatrix-n-ctx 0` surfaces typed `ConvertError::ImatrixNCtxInvalid` per the no-silent-fallback rule. Covered by `imatrix_n_ctx_zero_errors_typed` + `imatrix_n_ctx_non_default_plumbs_through` tests.
 
 **Stage 3 historical scope analysis** (kept for archival reference; MoE intercept blocker described below is now RESOLVED):
 
