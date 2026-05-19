@@ -81,9 +81,11 @@ pub struct ConvertArgs {
     /// the writer in `src/quantize/imatrix/gguf_loader.rs`.
     pub imatrix: Option<PathBuf>,
     /// ADR-033 §Pi: in-tree imatrix generation via named calibration
-    /// corpus. Phase A returns a typed `InTreeGenerationNotYetShipped`
-    /// error pointing at the `--imatrix` workaround; Phase B will
-    /// wire this to the forward-pass driver.
+    /// corpus. Phase B Stage 3c SHIPPED 2026-05-19 — runs the
+    /// `compute_imatrix` driver (HF dir → tempfile F16 GGUF → load
+    /// → tokenize → chunk × `forward_prefill` → ImatrixData). Stage
+    /// 3.0 wires Gemma 4 only; other arches surface
+    /// `UnsupportedArchForDriver`.
     pub imatrix_corpus: Option<String>,
     /// ADR-033 §Pi: optional side-effect — write the imatrix used by
     /// this run to the given path. Useful for caching in-tree
@@ -381,10 +383,15 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
                 .ok_or(ConvertError::ApexMissingLayerCount)?;
             let n_expert = hparams.n_expert;
 
-            // ADR-033 §Pi: resolve the imatrix surface. Phase A accepts a
-            // pre-computed `.imatrix.gguf` via `--imatrix <path>`; in-tree
-            // generation via `--imatrix-corpus` is deferred and returns the
-            // typed `InTreeGenerationNotYetShipped` error.
+            // ADR-033 §Pi: resolve the imatrix surface. Two paths:
+            //   - `--imatrix <path>`: loads a pre-computed
+            //     `.imatrix.gguf` (Phase A; useful when the target
+            //     arch isn't yet wired for in-tree generation, or
+            //     when re-using a stock `llama-imatrix` output).
+            //   - `--imatrix-corpus <name>`: drives Stage 3c's
+            //     in-tree `compute_imatrix` (Gemma 4 only at
+            //     Stage 3.0; other arches surface
+            //     `UnsupportedArchForDriver`).
             //
             // The policy constructor choice depends on whether imatrix data
             // is present:
@@ -1734,9 +1741,10 @@ mod tests {
     // ADR-033 §Pi imatrix-resolution tests
     // ============================================================================
     //
-    // Cover the four routes through `resolve_imatrix_input`:
+    // Cover the routes through `resolve_imatrix_input`:
     //   1. `--imatrix <missing-path>`            → Imatrix(ImatrixError::Io)
-    //   2. `--imatrix-corpus cdv3`              → InTreeGenerationNotYetShipped
+    //   2. `--imatrix-corpus cdv3` + bogus hf_dir → ConvertFailed (driver fired)
+    //   3. `--imatrix-corpus cdv3` + Qwen35Moe  → UnsupportedArchForDriver (Stage 3.0)
     //   3. I-tier without imatrix data          → ImatrixRequiredForITier
     //   4. Non-I tier without imatrix data      → Ok(None)
     //

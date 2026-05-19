@@ -154,9 +154,16 @@ pub struct ConvertCliArgs {
     /// APEX variants (`apex-i-quality`, `apex-i-balanced`, `apex-i-compact`)
     /// per ADR-033 §Pi. Mutually exclusive with `--imatrix-corpus`.
     ///
-    /// Phase A workaround for in-tree generation: run stock
-    /// `llama-imatrix -m <gguf> -f data/calibration/cdv3.txt -o <out>.imatrix.gguf`
-    /// and pass `<out>.imatrix.gguf` here.
+    /// Two ways to produce an imatrix:
+    ///   1. **In-tree** (recommended for supported arches): use
+    ///      `--imatrix-corpus cdv3` instead. Drives hf2q's own
+    ///      forward-pass-based generator (ADR-033 §Pi Phase B,
+    ///      Stage 3.0 supports Gemma 4 only).
+    ///   2. **External** (works for any arch, useful when the
+    ///      target arch isn't yet wired for in-tree generation):
+    ///      run `llama-imatrix -m <gguf> -f
+    ///      data/calibration/cdv3.txt -o <out>.imatrix.gguf` from
+    ///      stock llama.cpp and pass `<out>.imatrix.gguf` here.
     #[arg(long, conflicts_with = "imatrix_corpus")]
     pub imatrix: Option<PathBuf>,
 

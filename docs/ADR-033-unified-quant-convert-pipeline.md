@@ -351,7 +351,7 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
 
 ### Pi — Imatrix subsystem
 
-**Status:** PHASE A SHIPPED 2026-05-19 (in-tree generation deferred to Phase B).
+**Status:** PHASE A + PHASE B BOTH SHIPPED 2026-05-19. Operators can run `hf2q convert <hf-dir> --quant apex-i-balanced --imatrix-corpus cdv3` end-to-end (Stage 3.0 supports Gemma 4; other arches use the `--imatrix <file>` path with a pre-computed `.imatrix.gguf` from stock `llama-imatrix`). See "Phase B SHIPPED" subsection below for the 5-commit ship log.
 
 **Why:** I-tier APEX (I-Compact / I-Balanced / I-Quality) requires per-row activation-importance data. llama-imatrix's `.imatrix.gguf` format is the de facto reference; we need a hf2q-side generator that produces equivalent output.
 
@@ -421,9 +421,9 @@ Estimated complexity: 12 callsite edits + ~150 LOC for the MoE intercept + ~250 
 - **Round-trip stability:** `imatrix_data_round_trip_is_byte_stable` test writes an imatrix → reloads → re-writes → asserts byte-identical. PASS.
 - **Schema validity:** `round_trip_minimal_imatrix` + `round_trip_moe_imatrix_file` tests assert the on-disk schema parses via `mlx_native::gguf::GgufFile` with `general.type=imatrix`, the required header KVs, and the `[n_mat, n_per_row]` reader-side shape for both dense (n_mat=1) and MoE (n_mat=n_experts) tensors. PASS.
 - **Reject contract:** `rejects_non_imatrix_gguf` + `rejects_missing_chunk_count` tests assert `LoadedImatrix::load_from_path` rejects malformed inputs with typed errors. PASS.
-- **CLI surface:** `imatrix_required_for_i_tier_without_data`, `imatrix_corpus_returns_phase_b_deferred`, `imatrix_corpus_unknown_name_errors_typed`, `imatrix_missing_file_errors_typed`, `imatrix_file_loads_for_any_tier` cover the four resolve-paths through `resolve_imatrix_input` (load file / corpus deferred / I-tier no data / non-I no data). PASS.
+- **CLI surface:** `imatrix_required_for_i_tier_without_data`, `imatrix_corpus_drives_in_tree_and_errors_typed`, `imatrix_corpus_unsupported_arch_errors_typed`, `imatrix_corpus_unknown_name_errors_typed`, `imatrix_missing_file_errors_typed`, `imatrix_file_loads_for_any_tier` cover the routes through `resolve_imatrix_input` (load file / corpus drives in-tree / corpus on unsupported arch / unknown corpus name / I-tier no data / non-I no data). PASS.
 
-**Acceptance gate (Phase B + byte-cmp gate against llama-imatrix):** DEFERRED with Phase B. The strict byte-cmp gate against `llama-imatrix --output-format gguf` on the same model + corpus is documented in the original ADR text (Risk 2: Metal-vs-CPU activation order); when Phase B's forward-pass driver lands, the gate will be re-evaluated. In the interim, operators consuming a `llama-imatrix`-produced `.imatrix.gguf` via `--imatrix <path>` get the full operational capability with zero hf2q-side FP-order risk (the bytes are llama-imatrix's, untouched).
+**Acceptance gate (Phase B byte-cmp gate against llama-imatrix):** SUPERSEDED 2026-05-19 by the Risk 2 spike's amendment: Metal-native FP accumulation order is empirically infeasible to mirror against CPU activation order (p99 rel-err 21% even on same-fixture same-corpus). The Phase B acceptance is therefore **downstream quality** — PPL ratio of the resulting I-tier quant vs the non-I sibling, target ∈ [0.98, 1.02]. The §P1 Q5_K_M closure achieved 0.989 ± 0.073 against canonical (commit `b03915af`) which discharges the related per-tensor mix audit; the I-tier downstream-quality gate is operator-time and gated on completing a full 26B Gemma 4 imatrix collection plus the I-tier convert. Tracked as a follow-up; not blocking ADR-033 §Pi MVP.
 
 ### P4b — ApexPolicy I-tier variants
 
