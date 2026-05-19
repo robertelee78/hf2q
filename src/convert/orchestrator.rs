@@ -40,6 +40,12 @@ pub enum OrchestratorError {
     /// etc.). Propagated unmodified per the no-fallback rule.
     Quantize(QuantizeError),
 
+    /// `ApexPolicy::target_for` rejected a tensor (unsupported arch,
+    /// dense model, missing layer index, etc.). Per
+    /// [[feedback-no-loop-suppression-2026-05-17]]: surfaced as a typed
+    /// error, never silently demoted to F16 or a dense-policy fallback.
+    Apex(ApexError),
+
     /// Underlying `GgufWriter` failure (I/O, payload-size mismatch,
     /// duplicate / missing tensor payload). Propagated unmodified.
     Writer(WriterError),
@@ -49,6 +55,7 @@ impl std::fmt::Display for OrchestratorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OrchestratorError::Quantize(e) => write!(f, "convert/quantize: {e}"),
+            OrchestratorError::Apex(e) => write!(f, "convert/apex: {e}"),
             OrchestratorError::Writer(e) => write!(f, "convert/writer: {e}"),
         }
     }
@@ -58,6 +65,7 @@ impl std::error::Error for OrchestratorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             OrchestratorError::Quantize(e) => Some(e),
+            OrchestratorError::Apex(e) => Some(e),
             OrchestratorError::Writer(e) => Some(e),
         }
     }
@@ -66,6 +74,12 @@ impl std::error::Error for OrchestratorError {
 impl From<QuantizeError> for OrchestratorError {
     fn from(e: QuantizeError) -> Self {
         OrchestratorError::Quantize(e)
+    }
+}
+
+impl From<ApexError> for OrchestratorError {
+    fn from(e: ApexError) -> Self {
+        OrchestratorError::Apex(e)
     }
 }
 
@@ -99,10 +113,23 @@ pub struct StagedTensor {
 /// single [`write`] that drains all staged state into the sink.
 ///
 /// `[`write`] consumes `self`; the orchestrator is single-shot.
+///
+/// Policy selection: by default the orchestrator routes per-tensor type
+/// decisions through [`StandardPolicy::target_for`] (mirroring
+/// llama.cpp's `llama_tensor_get_type_impl`). When constructed via
+/// [`new_with_apex`] it routes through [`ApexPolicy::target_for`]
+/// instead — used by `--quant apex-<tier>` on the convert-v2 CLI per
+/// ADR-033 §"Plan" / Pa. The shape-misalignment fallback
+/// ([`tensor_type_fallback`]) runs for both policies; only the
+/// type-pick algorithm changes.
 pub struct ConvertOrchestrator {
     ftype: LlamaFtype,
     arch: ArchName,
     hparams: HParams,
+    /// `Some` when an Apex tier was selected; mutually exclusive with
+    /// the StandardPolicy path. The two policies cannot run in the same
+    /// convert invocation.
+    apex_policy: Option<ApexPolicy>,
     metadata: Vec<(String, MetaValue)>,
     tensors: Vec<StagedTensor>,
 }
@@ -119,6 +146,33 @@ impl ConvertOrchestrator {
             ftype,
             arch,
             hparams,
+            apex_policy: None,
+            metadata: Vec::new(),
+            tensors: Vec::new(),
+        }
+    }
+
+    /// Construct an orchestrator that routes per-tensor type decisions
+    /// through `apex_policy` instead of [`StandardPolicy`]. `ftype` is
+    /// the closest-standard approximation for the GGUF
+    /// `general.file_type` byte (see `quant_selector::approximate_for_apex`);
+    /// every tensor's recorded ggml_type comes from `apex_policy`
+    /// regardless.
+    ///
+    /// The `arch` argument MUST match `apex_policy.arch` — the convert
+    /// dispatcher already does this when it builds the policy from the
+    /// detected arch.
+    pub fn new_with_apex(
+        ftype: LlamaFtype,
+        arch: ArchName,
+        hparams: HParams,
+        apex_policy: ApexPolicy,
+    ) -> Self {
+        Self {
+            ftype,
+            arch,
+            hparams,
+            apex_policy: Some(apex_policy),
             metadata: Vec::new(),
             tensors: Vec::new(),
         }
@@ -172,6 +226,7 @@ impl ConvertOrchestrator {
             ftype,
             arch,
             hparams,
+            apex_policy,
             metadata,
             tensors,
         } = self;
@@ -258,7 +313,20 @@ impl ConvertOrchestrator {
                 layer_index: t.layer_index,
             };
             let category = TensorCategory::classify(&t.name);
-            let ggml_type = policy.target_for(&mut qs, &tref, category)?;
+            // Branch on policy: ApexPolicy if `--quant apex-<tier>`,
+            // else StandardPolicy. Both feed through
+            // `tensor_type_fallback` for shape misalignment — the Apex
+            // policy doesn't apply the fallback internally (its
+            // `target_for` returns the unfallback'd algorithmic pick).
+            // Per ADR §"shape_fallback contract" the second-misalignment
+            // case still surfaces as `QuantizeError::NotBlockAligned`.
+            let ggml_type = match &apex_policy {
+                Some(ap) => {
+                    let picked = ap.target_for(&tref)?;
+                    tensor_type_fallback(picked, tref.n_per_row())?
+                }
+                None => policy.target_for(&mut qs, &tref, category)?,
+            };
 
             // n_per_row = innermost dim per GGUF convention.
             let n_per_row = tref.n_per_row();

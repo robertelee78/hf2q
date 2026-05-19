@@ -201,18 +201,17 @@ fn run(cli: Cli) -> Result<(), AppError> {
 /// read, orchestrator, IO — pipeline-internal issues). Mirrors the
 /// existing legacy `cmd_convert` exit-code convention.
 fn cmd_convert_v2(args: cli::ConvertV2CliArgs) -> Result<(), AppError> {
-    use crate::convert::{run_convert_v2, ConvertV2Args, ConvertV2Error};
-    use crate::quantize::ggml_quants::LlamaFtype;
+    use crate::convert::{run_convert_v2, ConvertV2Args, ConvertV2Error, QuantSelector};
 
-    let ftype = LlamaFtype::from_name(&args.quant).ok_or_else(|| {
-        AppError::Input(anyhow::anyhow!(
-            "unknown --quant value `{}` (no LlamaFtype mapping)",
-            args.quant
-        ))
-    })?;
+    // QuantSelector parses both standard ftypes (`q5_k_m`, `q8_0`, ...)
+    // and Apex tiers (`apex-balanced`, `apex-i-quality`, ...). Reserved
+    // names (`dwq`, bare `apex`, `tq1_0`, `tq2_0`) surface as typed
+    // errors per ADR §6 reserved-name stubs.
+    let selector = QuantSelector::from_name(&args.quant)
+        .map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
     let resolved = ConvertV2Args {
         hf_dir: args.hf_dir,
-        ftype,
+        selector,
         output: args.output,
     };
     run_convert_v2(resolved).map_err(|e| match e {
@@ -220,7 +219,10 @@ fn cmd_convert_v2(args: cli::ConvertV2CliArgs) -> Result<(), AppError> {
         | ConvertV2Error::UnmappedTensor { .. }
         | ConvertV2Error::MissingHparam { .. }
         | ConvertV2Error::IncompleteExpertGroup { .. }
-        | ConvertV2Error::DuplicateExpertIndex { .. } => AppError::Input(anyhow::anyhow!("{e}")),
+        | ConvertV2Error::DuplicateExpertIndex { .. }
+        | ConvertV2Error::ApexMissingLayerCount
+        | ConvertV2Error::ApexCustomOutOfScope { .. }
+        | ConvertV2Error::Apex(_) => AppError::Input(anyhow::anyhow!("{e}")),
         ConvertV2Error::Source(_) | ConvertV2Error::Orchestrator(_) | ConvertV2Error::Io(_) => {
             AppError::Conversion(anyhow::anyhow!("{e}"))
         }

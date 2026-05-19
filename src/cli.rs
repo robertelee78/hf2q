@@ -147,9 +147,17 @@ pub struct ConvertV2CliArgs {
     /// shards).
     pub hf_dir: PathBuf,
 
-    /// File-type to quantize to (e.g. `q4_0`, `q5_k_m`, `q8_0`,
-    /// `f16`). Parsed via `LlamaFtype::from_name`; unrecognized values
-    /// surface as input errors.
+    /// File-type to quantize to. Accepts:
+    ///   - Standard llama.cpp ftypes: `f32`, `f16`, `bf16`, `q4_0`,
+    ///     `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q2_k`, `q3_k_s/m/l`,
+    ///     `q4_k_s/m`, `q5_k_s/m`, `q6_k`, `iq4_nl`.
+    ///   - Apex algorithmic tiers (MoE arches only): `apex-quality`,
+    ///     `apex-i-quality`, `apex-balanced`, `apex-i-balanced`,
+    ///     `apex-compact`, `apex-i-compact`, `apex-mini`.
+    ///
+    /// Parsed via `QuantSelector::from_name`; unrecognized values
+    /// surface as input errors. Per
+    /// [[feedback-no-backwards-compat-2026-05-18]]: no legacy aliases.
     #[arg(long)]
     pub quant: String,
 

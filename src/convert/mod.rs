@@ -22,11 +22,13 @@
 pub mod arch;
 pub mod cli_driver;
 pub mod orchestrator;
+pub mod quant_selector;
 pub mod source_dtype;
 pub mod source_reader;
 
 pub use cli_driver::{run_convert_v2, ConvertV2Args, ConvertV2Error};
 pub use orchestrator::{ConvertOrchestrator, OrchestratorError};
+pub use quant_selector::{approximate_for_apex, QuantSelector, QuantSelectorError};
 pub use source_reader::{HfModelSource, HfTensor, SourceError};
 
 #[cfg(test)]

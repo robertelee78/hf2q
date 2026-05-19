@@ -31,10 +31,12 @@ use crate::convert::arch::{
 };
 use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped};
 use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
+use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
 use crate::convert::source_reader::SourceError;
 use crate::convert::{ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError};
+use crate::quantize::ggml_quants::apex::{ApexError, ApexPolicy};
 use crate::quantize::ggml_quants::standard_policy::HParams;
-use crate::quantize::ggml_quants::{ArchName, LlamaFtype};
+use crate::quantize::ggml_quants::ArchName;
 
 // ============================================================================
 // Public API
@@ -43,16 +45,21 @@ use crate::quantize::ggml_quants::{ArchName, LlamaFtype};
 /// Arguments for [`run_convert_v2`]. Mirrors the
 /// `hf2q convert-v2 <hf-dir> --quant <name> -o <out.gguf>` CLI surface
 /// but is constructible directly from integration tests (the `--quant`
-/// string is already resolved to a [`LlamaFtype`] here).
+/// string is already resolved to a [`QuantSelector`] here).
+///
+/// `selector` is the unified `--quant <name>` parse result — either a
+/// standard llama.cpp ftype, an Apex algorithmic tier, or (out of v1
+/// scope) an `apex-custom` tensor-type-file path. See
+/// [`crate::convert::quant_selector::QuantSelector`].
 #[derive(Debug, Clone)]
 pub struct ConvertV2Args {
     /// HuggingFace model directory — must contain `config.json` plus
     /// either `model.safetensors` or `model.safetensors.index.json` +
     /// shards.
     pub hf_dir: PathBuf,
-    /// Resolved file-type for the convert run. CLI parse with
-    /// `LlamaFtype::from_name(&s)`.
-    pub ftype: LlamaFtype,
+    /// Resolved `--quant <name>` selector. Standard ftypes route through
+    /// `StandardPolicy`; Apex tiers route through `ApexPolicy`.
+    pub selector: QuantSelector,
     /// Destination GGUF path. Existing files are overwritten.
     pub output: PathBuf,
 }
@@ -112,6 +119,20 @@ pub enum ConvertV2Error {
     /// `build_metadata`'s `[]` indexing — that contract is the per-arch
     /// mapper's, not the driver's, to enforce.
     MissingHparam { key: &'static str },
+    /// `--quant apex-<tier>` was selected but `config.json` is missing
+    /// `num_hidden_layers` (Apex needs it for the EDGE/NEAR/MID per-layer
+    /// gradient).
+    ApexMissingLayerCount,
+    /// `--quant apex-custom --tensor-type-file <path>` is the reserved
+    /// per-tensor override path per ADR Decision §"Per-model APEX config
+    /// override". Out of v1 convert-v2 scope; surfaces here as a typed
+    /// error stub for the future P4b wiring. `path` carries the
+    /// operator-supplied tensor-type-file (preserved for diagnostics).
+    ApexCustomOutOfScope { path: PathBuf },
+    /// `ApexPolicy::new` rejected the source arch / hparams (unsupported
+    /// arch, dense model, etc.). Wraps the typed `ApexError` so callers
+    /// see the canonical mudler-aligned diagnostic.
+    Apex(ApexError),
 }
 
 impl std::fmt::Display for ConvertV2Error {
@@ -157,6 +178,17 @@ impl std::fmt::Display for ConvertV2Error {
                 f,
                 "convert-v2: config.json is missing required hparam `{key}`"
             ),
+            ConvertV2Error::ApexMissingLayerCount => write!(
+                f,
+                "convert-v2: --quant apex-<tier> requires `num_hidden_layers` in config.json"
+            ),
+            ConvertV2Error::ApexCustomOutOfScope { path } => write!(
+                f,
+                "convert-v2: --quant apex-custom --tensor-type-file `{}` is reserved \
+                 (out of v1 scope)",
+                path.display()
+            ),
+            ConvertV2Error::Apex(e) => write!(f, "convert-v2/apex: {e}"),
         }
     }
 }
@@ -167,6 +199,7 @@ impl std::error::Error for ConvertV2Error {
             ConvertV2Error::Source(e) => Some(e),
             ConvertV2Error::Orchestrator(e) => Some(e),
             ConvertV2Error::Io(e) => Some(e),
+            ConvertV2Error::Apex(e) => Some(e),
             _ => None,
         }
     }
@@ -187,6 +220,12 @@ impl From<OrchestratorError> for ConvertV2Error {
 impl From<std::io::Error> for ConvertV2Error {
     fn from(e: std::io::Error) -> Self {
         ConvertV2Error::Io(e)
+    }
+}
+
+impl From<ApexError> for ConvertV2Error {
+    fn from(e: ApexError) -> Self {
+        ConvertV2Error::Apex(e)
     }
 }
 
@@ -221,14 +260,42 @@ pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
     let arch = detect_arch(&src.config)?;
 
     // ----- 3. Build orchestrator -------------------------------------------
+    // The selector branches the policy:
+    //   - Standard(ftype): orchestrator runs StandardPolicy.
+    //   - Apex(tier): build ApexPolicy { tier, n_layers, n_expert }
+    //     from config.json + the detected arch; orchestrator routes
+    //     per-tensor decisions through it. The `general.file_type` byte
+    //     carries `approximate_for_apex(tier)` as the closest standard
+    //     ftype (purely cosmetic — per-tensor ggml_types are recorded
+    //     on each tensor info entry).
+    //   - ApexCustom(path): out of v1 convert-v2 scope; typed error.
     let hparams = build_hparams(&src.config)?;
-    let mut orch = ConvertOrchestrator::new(args.ftype, arch, hparams);
+    let (mut orch, ftype_for_metadata) = match &args.selector {
+        QuantSelector::Standard(ftype) => {
+            let orch = ConvertOrchestrator::new(*ftype, arch, hparams);
+            (orch, *ftype)
+        }
+        QuantSelector::Apex(tier) => {
+            let n_layers = config_n_layers(&src.config)
+                .ok_or(ConvertV2Error::ApexMissingLayerCount)?;
+            let n_expert = hparams.n_expert;
+            let apex_policy = ApexPolicy::new(*tier, arch, n_layers, n_expert)?;
+            let ftype = approximate_for_apex(*tier);
+            let orch = ConvertOrchestrator::new_with_apex(ftype, arch, hparams, apex_policy);
+            (orch, ftype)
+        }
+        QuantSelector::ApexCustom(path) => {
+            return Err(ConvertV2Error::ApexCustomOutOfScope {
+                path: path.clone(),
+            });
+        }
+    };
 
     // ----- 4-5. Map + stage every tensor (with MoE expert fusion) ---------
     stage_tensors(&mut orch, arch, &src.tensors, &src.config)?;
 
     // ----- 6. Emit metadata -------------------------------------------------
-    let ftype_u32 = args.ftype as u32;
+    let ftype_u32 = ftype_for_metadata as u32;
     for (k, v) in build_metadata_for_arch(arch, &src.config, ftype_u32) {
         orch.add_metadata(k, v);
     }
@@ -243,6 +310,18 @@ pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
     use std::io::Write as _;
     bw.flush()?;
     Ok(())
+}
+
+/// Extract `num_hidden_layers` from the HF config. Required by
+/// `ApexPolicy::new` for the per-layer EDGE/NEAR/MID gradient. Returns
+/// `None` if the field is missing or non-positive — surfaces as
+/// [`ConvertV2Error::ApexMissingLayerCount`] at the caller.
+fn config_n_layers(config: &serde_json::Value) -> Option<u32> {
+    config
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .filter(|&x| x > 0)
+        .map(|x| x as u32)
 }
 
 // ============================================================================
@@ -776,6 +855,8 @@ struct MoeGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quantize::ggml_quants::apex::ApexTier;
+    use crate::quantize::ggml_quants::LlamaFtype;
     use serde_json::json;
 
     /// model_type=llama → ArchName::Llama3.
@@ -959,6 +1040,63 @@ mod tests {
                 assert_eq!(key, "num_attention_heads");
             }
             other => panic!("expected MissingHparam, got {other:?}"),
+        }
+    }
+
+    // ========================================================================
+    // QuantSelector parse tests (mission-spec required ~6 new tests)
+    // ========================================================================
+
+    /// "q5_k_m" → QuantSelector::Standard(MostlyQ5_K_M).
+    #[test]
+    fn parse_quant_selector_standard_round_trip() {
+        let sel = QuantSelector::from_name("q5_k_m").expect("must parse");
+        assert_eq!(sel, QuantSelector::Standard(LlamaFtype::MostlyQ5_K_M));
+    }
+
+    /// "apex-balanced" → QuantSelector::Apex(ApexTier::Balanced).
+    #[test]
+    fn parse_quant_selector_apex_round_trip() {
+        let sel = QuantSelector::from_name("apex-balanced").expect("must parse");
+        assert_eq!(sel, QuantSelector::Apex(ApexTier::Balanced));
+    }
+
+    /// "apex-i-quality" → QuantSelector::Apex(ApexTier::IQuality). Covers
+    /// the I-prefix imatrix tier surface.
+    #[test]
+    fn parse_quant_selector_apex_i_variant() {
+        let sel = QuantSelector::from_name("apex-i-quality").expect("must parse");
+        assert_eq!(sel, QuantSelector::Apex(ApexTier::IQuality));
+    }
+
+    /// "apex-custom" → Err(ApexCustomRequiresTensorTypeFile).
+    #[test]
+    fn parse_quant_selector_apex_custom_errors() {
+        use crate::convert::quant_selector::QuantSelectorError;
+        let err = QuantSelector::from_name("apex-custom").expect_err("must error");
+        assert!(matches!(
+            err,
+            QuantSelectorError::ApexCustomRequiresTensorTypeFile
+        ));
+    }
+
+    /// "dwq" → Err(DwqReserved). Reserved name per ADR Decision §6.
+    #[test]
+    fn parse_quant_selector_dwq_reserved() {
+        use crate::convert::quant_selector::QuantSelectorError;
+        let err = QuantSelector::from_name("dwq").expect_err("must error");
+        assert!(matches!(err, QuantSelectorError::DwqReserved));
+    }
+
+    /// "apex-nano" → Err(ApexTierOutOfScope). Mudler's experimental
+    /// tiers were dropped from v1's surface.
+    #[test]
+    fn parse_quant_selector_apex_nano_out_of_scope() {
+        use crate::convert::quant_selector::QuantSelectorError;
+        let err = QuantSelector::from_name("apex-nano").expect_err("must error");
+        match err {
+            QuantSelectorError::ApexTierOutOfScope { tier } => assert_eq!(tier, "nano"),
+            other => panic!("expected ApexTierOutOfScope, got {other:?}"),
         }
     }
 }
