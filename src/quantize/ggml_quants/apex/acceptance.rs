@@ -380,9 +380,21 @@ mod tests {
         let mut tested_entries: usize = 0;
 
         for entry in manifest_entries() {
+            // Unknown arch labels are a divergence (catches manifest
+            // typos like `gemmA4`). The non-I gate (§Pa) catches the
+            // same class of bug independently, but pinning it here too
+            // means a P4b regression doesn't pass silently.
             let arch = match ArchName::from_label(&entry.arch) {
                 Some(a) => a,
-                None => continue,
+                None => {
+                    divergences.push(format!(
+                        "── unknown arch label `{}` in manifest entry (tier={}, fp={})",
+                        entry.arch,
+                        entry.tier,
+                        &entry.fingerprint[..16],
+                    ));
+                    continue;
+                }
             };
             // Per ADR §"Acceptance criteria (overall)" #4: I-tier gate
             // applies to {gemma4, qwen35moe} only (the inference-supported
@@ -543,10 +555,23 @@ mod tests {
             tested_entries += 1;
         }
 
-        assert!(
-            tested_entries > 0,
-            "§P4b gate must exercise at least one (arch, base_tier) pair — \
-             manifest entries are filtered too aggressively or empty"
+        // Pin the expected coverage so a future manifest addition that
+        // drops an in-scope entry fails this gate loudly. The closed
+        // set at 2026-05-19 is 9 manifest entries:
+        //   - gemma4    × {quality, balanced, compact}      (3 entries)
+        //   - qwen35moe × {quality, balanced, compact} × 2  (6 entries — base + carnice MTP)
+        // MiniMaxM2 is convert-only in v1 (skipped by the arch filter
+        // above). The four experimental tiers (nano / i-nano / micro
+        // / i-micro) are out of v1 scope per ADR §"Decision" §5. If
+        // this pin needs to change, update ADR-033 §P4b at the same
+        // commit with the new closed list and rationale.
+        const EXPECTED_TESTED_ENTRIES: usize = 9;
+        assert_eq!(
+            tested_entries, EXPECTED_TESTED_ENTRIES,
+            "§P4b gate must exercise exactly {EXPECTED_TESTED_ENTRIES} \
+             manifest entries — got {tested_entries}. Either a manifest entry \
+             was dropped, an arch was renamed, or the in-scope filter \
+             changed; update ADR-033 §P4b and this constant at the same commit."
         );
 
         if !divergences.is_empty() {
