@@ -27,7 +27,7 @@ pub mod source_dtype;
 pub mod source_reader;
 pub mod tokenizer;
 
-pub use cli_driver::{run_convert_v2, ConvertV2Args, ConvertV2Error};
+pub use cli_driver::{run_convert, ConvertArgs, ConvertError};
 pub use orchestrator::{ConvertOrchestrator, OrchestratorError, PlanEntry, StreamingWriter};
 pub use quant_selector::{approximate_for_apex, QuantSelector, QuantSelectorError};
 pub use source_reader::{HfModelSource, HfTensor, SourceError, TensorMeta};

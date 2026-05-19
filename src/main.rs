@@ -161,20 +161,21 @@ fn run(cli: Cli) -> Result<(), AppError> {
         // --yes, mutually-exclusive-flags) is a user-input mistake;
         // exit-3 is the documented signal.
         Command::Cache(args) => serve::cmd_cache(args).map_err(AppError::Input),
-        Command::ConvertV2(args) => cmd_convert_v2(args),
+        Command::Convert(args) => cmd_convert(args),
     }
 }
 
-/// ADR-033 P4 — drive the new convert pipeline.
+/// ADR-033 P4 — drive the convert pipeline.
 ///
-/// Parses `--quant <name>` via `LlamaFtype::from_name`, hands the
-/// resolved args to [`crate::convert::run_convert_v2`], and maps the
-/// typed `ConvertV2Error` onto `AppError::Input` (parse / arch / missing
-/// tensor — operator-input issues) vs `AppError::Conversion` (source
-/// read, orchestrator, IO — pipeline-internal issues). Mirrors the
-/// existing legacy `cmd_convert` exit-code convention.
-fn cmd_convert_v2(args: cli::ConvertV2CliArgs) -> Result<(), AppError> {
-    use crate::convert::{run_convert_v2, ConvertV2Args, ConvertV2Error, QuantSelector};
+/// Parses `--quant <name>` via `QuantSelector::from_name`, resolves the
+/// HF input directory (positional `<hf_dir>` OR auto-download via
+/// `--repo <hf_repo>`; mutually exclusive — B1), hands the result to
+/// [`crate::convert::run_convert`], and maps the typed `ConvertError`
+/// onto `AppError::Input` (parse / arch / missing tensor — operator-input
+/// issues) vs `AppError::Conversion` (source read, orchestrator, IO —
+/// pipeline-internal issues).
+fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
+    use crate::convert::{run_convert, ConvertArgs, ConvertError, QuantSelector};
 
     // QuantSelector parses both standard ftypes (`q5_k_m`, `q8_0`, ...)
     // and Apex tiers (`apex-balanced`, `apex-i-quality`, ...). Reserved
@@ -182,32 +183,138 @@ fn cmd_convert_v2(args: cli::ConvertV2CliArgs) -> Result<(), AppError> {
     // errors per ADR §6 reserved-name stubs.
     let selector = QuantSelector::from_name(&args.quant)
         .map_err(|e| AppError::Input(anyhow::anyhow!("{e}")))?;
-    let resolved = ConvertV2Args {
-        hf_dir: args.hf_dir,
+
+    // ----- B1: resolve HF input directory ---------------------------------
+    // Exactly one of {positional <hf_dir>, --repo <hf_repo>} must be set.
+    // clap's `conflicts_with` rejects the "both set" case at parse time;
+    // we still guard here as defense-in-depth so the typed error variant
+    // survives any future plumbing change that bypasses clap.
+    let hf_dir = match (args.hf_dir, args.repo) {
+        (Some(_), Some(_)) => {
+            return Err(AppError::Input(anyhow::anyhow!(
+                "{}",
+                ConvertError::RepoAndDirMutuallyExclusive
+            )));
+        }
+        (Some(path), None) => path,
+        (None, Some(repo)) => {
+            download_repo_via_hf_cli(&repo).map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?
+        }
+        (None, None) => {
+            return Err(AppError::Input(anyhow::anyhow!(
+                "convert: either positional `<hf_dir>` or `--repo <hf_repo>` is required"
+            )));
+        }
+    };
+
+    let resolved = ConvertArgs {
+        hf_dir,
         selector,
         output: args.output,
         imatrix: args.imatrix,
         imatrix_corpus: args.imatrix_corpus,
         imatrix_out: args.imatrix_out,
     };
-    run_convert_v2(resolved).map_err(|e| match e {
-        ConvertV2Error::UnsupportedArch { .. }
-        | ConvertV2Error::UnmappedTensor { .. }
-        | ConvertV2Error::MissingHparam { .. }
-        | ConvertV2Error::IncompleteExpertGroup { .. }
-        | ConvertV2Error::DuplicateExpertIndex { .. }
-        | ConvertV2Error::ApexMissingLayerCount
-        | ConvertV2Error::ApexCustomOutOfScope { .. }
-        | ConvertV2Error::Apex(_)
-        | ConvertV2Error::Tokenizer(_)
-        | ConvertV2Error::Imatrix(_)
-        | ConvertV2Error::ImatrixRequiredForITier { .. } => {
+    run_convert(resolved).map_err(|e| match e {
+        ConvertError::UnsupportedArch { .. }
+        | ConvertError::UnmappedTensor { .. }
+        | ConvertError::MissingHparam { .. }
+        | ConvertError::IncompleteExpertGroup { .. }
+        | ConvertError::DuplicateExpertIndex { .. }
+        | ConvertError::ApexMissingLayerCount
+        | ConvertError::ApexCustomOutOfScope { .. }
+        | ConvertError::Apex(_)
+        | ConvertError::Tokenizer(_)
+        | ConvertError::Imatrix(_)
+        | ConvertError::ImatrixRequiredForITier { .. }
+        | ConvertError::RepoAndDirMutuallyExclusive => {
             AppError::Input(anyhow::anyhow!("{e}"))
         }
-        ConvertV2Error::Source(_) | ConvertV2Error::Orchestrator(_) | ConvertV2Error::Io(_) => {
+        ConvertError::Source(_)
+        | ConvertError::Orchestrator(_)
+        | ConvertError::Io(_)
+        | ConvertError::HfDownload { .. } => {
             AppError::Conversion(anyhow::anyhow!("{e}"))
         }
     })
+}
+
+/// B1 — sanitize an HF repo id for filesystem use.
+///
+/// Replaces every `/` with `__` so `google/gemma-4-26b-a4b-it` becomes
+/// `google__gemma-4-26b-a4b-it`. Other characters pass through.
+/// Centralized as a pure function so the unit test can pin the contract
+/// without invoking the download subprocess.
+fn sanitize_repo_for_cache_dir(repo: &str) -> String {
+    repo.replace('/', "__")
+}
+
+/// B1 — shell out to `huggingface-cli download <repo> --local-dir <cache>`
+/// and return the cache directory on success.
+///
+/// `<cache>` = `~/.cache/hf2q/repos/<sanitize_repo_for_cache_dir(repo)>/`.
+/// The directory is created if missing; existing partial downloads are
+/// resumed by `huggingface-cli`'s own logic. Stdout/stderr stream
+/// through to the operator's terminal so download progress is visible;
+/// on non-zero exit we capture the tail of stderr into the typed
+/// `ConvertError::HfDownload` variant.
+fn download_repo_via_hf_cli(repo: &str) -> Result<PathBuf, crate::convert::ConvertError> {
+    use crate::convert::ConvertError;
+
+    // Resolve cache root: ~/.cache/hf2q/repos/<sanitized>/.
+    // `home::home_dir()` is unavailable in std; fall back to $HOME env.
+    let home = std::env::var("HOME").map_err(|_| ConvertError::HfDownload {
+        repo: repo.to_string(),
+        exit_code: None,
+        stderr: "HOME env var not set — cannot resolve ~/.cache/hf2q/repos/".to_string(),
+    })?;
+    let cache_dir = PathBuf::from(home)
+        .join(".cache")
+        .join("hf2q")
+        .join("repos")
+        .join(sanitize_repo_for_cache_dir(repo));
+    std::fs::create_dir_all(&cache_dir).map_err(|e| ConvertError::HfDownload {
+        repo: repo.to_string(),
+        exit_code: None,
+        stderr: format!("failed to create cache dir `{}`: {e}", cache_dir.display()),
+    })?;
+
+    eprintln!(
+        "[hf2q convert --repo] downloading {repo} → {} via huggingface-cli",
+        cache_dir.display()
+    );
+
+    let output = std::process::Command::new("huggingface-cli")
+        .arg("download")
+        .arg(repo)
+        .arg("--local-dir")
+        .arg(&cache_dir)
+        .output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            return Err(ConvertError::HfDownload {
+                repo: repo.to_string(),
+                exit_code: None,
+                stderr: format!(
+                    "failed to spawn `huggingface-cli`: {e} \
+                     (is huggingface-cli on PATH? `pip install -U huggingface_hub[cli]`)"
+                ),
+            });
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(ConvertError::HfDownload {
+            repo: repo.to_string(),
+            exit_code: output.status.code(),
+            stderr,
+        });
+    }
+
+    Ok(cache_dir)
 }
 
 fn cmd_gguf_patch(args: cli::GgufPatchArgs) -> Result<(), AppError> {
@@ -329,5 +436,67 @@ fn cmd_completions(args: cli::CompletionsArgs) -> Result<()> {
     generate(args.shell, &mut cmd, "hf2q", &mut std::io::stdout());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B1 — `/` in the HF repo id is replaced with `__` so the
+    /// resulting string is filesystem-safe. Pins the exact spec from
+    /// the rename/B1 mission.
+    #[test]
+    fn sanitize_repo_for_cache_dir_replaces_slash_with_double_underscore() {
+        assert_eq!(
+            sanitize_repo_for_cache_dir("google/gemma-4-26b-a4b-it"),
+            "google__gemma-4-26b-a4b-it"
+        );
+    }
+
+    /// B1 — repo without `/` passes through unchanged (degenerate input
+    /// from a custom local URL alias; we still want it filesystem-safe).
+    #[test]
+    fn sanitize_repo_for_cache_dir_passes_through_when_no_slash() {
+        assert_eq!(sanitize_repo_for_cache_dir("local-only"), "local-only");
+    }
+
+    /// B1 — repo with multiple `/` (uncommon HF nested-org pattern)
+    /// replaces every separator, not just the first.
+    #[test]
+    fn sanitize_repo_for_cache_dir_replaces_every_slash() {
+        assert_eq!(
+            sanitize_repo_for_cache_dir("org/sub/model"),
+            "org__sub__model"
+        );
+    }
+
+    /// B1 — `cmd_convert` rejects "both `<hf_dir>` and `--repo`" with
+    /// the typed `RepoAndDirMutuallyExclusive` variant, mapped to
+    /// `AppError::Input` (exit code 3). clap's `conflicts_with` should
+    /// catch this at parse time; this test pins the defense-in-depth
+    /// path in case clap's rules change.
+    #[test]
+    fn cmd_convert_rejects_repo_and_dir_both_set() {
+        let args = cli::ConvertCliArgs {
+            hf_dir: Some(PathBuf::from("/tmp/example")),
+            repo: Some("org/repo".to_string()),
+            quant: "q8_0".to_string(),
+            output: PathBuf::from("/tmp/out.gguf"),
+            imatrix: None,
+            imatrix_corpus: None,
+            imatrix_out: None,
+        };
+        let err = cmd_convert(args).expect_err("must error");
+        match err {
+            AppError::Input(e) => {
+                let s = format!("{e:#}");
+                assert!(
+                    s.contains("mutually exclusive"),
+                    "expected mutually-exclusive diagnostic, got `{s}`"
+                );
+            }
+            other => panic!("expected AppError::Input, got {other:?}"),
+        }
+    }
 }
 

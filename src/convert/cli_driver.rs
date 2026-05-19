@@ -1,28 +1,29 @@
-//! `hf2q convert-v2 <hf-dir> --quant <name> -o <out.gguf>` driver.
+//! `hf2q convert <hf-dir> --quant <name> -o <out.gguf>` driver.
 //!
-//! First operator-facing entry point for the new ADR-033 convert
-//! pipeline. Composes [`HfModelSource::open`] → per-arch
-//! `map_tensor_name` + `build_metadata` → [`ConvertOrchestrator`] into a
-//! single end-to-end run. Streaming throughout: the source reader
-//! mmaps each safetensors shard and yields F32 tensors lazily; the
-//! orchestrator quantizes + writes one tensor at a time. Per ADR-033
-//! §"Open Issues / Real-Model Findings" 2026-05-18, this fixed the
-//! 4× SIGKILL-137 on a 26B-param real-model convert.
+//! Historically introduced as `convert-v2` (ADR-033 P4); B4 retired the
+//! `-v2` suffix on 2026-05-19 once P6 deleted the legacy pipeline.
+//! Per [[feedback-no-backwards-compat-2026-05-18]] no alias is kept —
+//! the historical name fails loudly.
+//!
+//! First operator-facing entry point for the ADR-033 convert pipeline.
+//! Composes [`HfModelSource::open`] → per-arch `map_tensor_name` +
+//! `build_metadata` → [`ConvertOrchestrator`] into a single end-to-end
+//! run. Streaming throughout: the source reader mmaps each safetensors
+//! shard and yields F32 tensors lazily; the orchestrator quantizes +
+//! writes one tensor at a time. Per ADR-033 §"Open Issues / Real-Model
+//! Findings" 2026-05-18, this fixed the 4× SIGKILL-137 on a 26B-param
+//! real-model convert.
 //!
 //! Per ADR-033 §P0-§P3: this driver does NOT introduce any new
 //! quantization or write logic — every byte emitted comes from the
 //! orchestrator. Per [[feedback-no-loop-suppression-2026-05-17]]: an
 //! unsupported arch / unmapped tensor / missing expert surfaces as a
-//! typed [`ConvertV2Error`]; the orchestrator already rejects shape
+//! typed [`ConvertError`]; the orchestrator already rejects shape
 //! misalignments at the policy/quantizer layer.
 //!
 //! Per [[feedback-no-backwards-compat-2026-05-18]]: no migration shims,
 //! no `--quant` aliases for legacy names — `LlamaFtype::from_name` is
 //! the single source of truth.
-//!
-//! The legacy two-pass pipeline at `src/main.rs::cmd_convert` is
-//! intentionally untouched; this lives alongside it until P6 deletes the
-//! old path.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -54,8 +55,8 @@ use crate::quantize::ggml_quants::ArchName;
 // Public API
 // ============================================================================
 
-/// Arguments for [`run_convert_v2`]. Mirrors the
-/// `hf2q convert-v2 <hf-dir> --quant <name> -o <out.gguf>` CLI surface
+/// Arguments for [`run_convert`]. Mirrors the
+/// `hf2q convert <hf-dir> --quant <name> -o <out.gguf>` CLI surface
 /// but is constructible directly from integration tests (the `--quant`
 /// string is already resolved to a [`QuantSelector`] here).
 ///
@@ -64,7 +65,7 @@ use crate::quantize::ggml_quants::ArchName;
 /// scope) an `apex-custom` tensor-type-file path. See
 /// [`crate::convert::quant_selector::QuantSelector`].
 #[derive(Debug, Clone)]
-pub struct ConvertV2Args {
+pub struct ConvertArgs {
     /// HuggingFace model directory — must contain `config.json` plus
     /// either `model.safetensors` or `model.safetensors.index.json` +
     /// shards.
@@ -90,19 +91,19 @@ pub struct ConvertV2Args {
     pub imatrix_out: Option<PathBuf>,
 }
 
-/// Errors raised by [`run_convert_v2`]. Wraps the typed errors from the
+/// Errors raised by [`run_convert`]. Wraps the typed errors from the
 /// source reader + orchestrator + filesystem layers, and adds two
 /// driver-only variants:
 ///
-/// - [`ConvertV2Error::UnsupportedArch`] — `config.json::model_type` /
+/// - [`ConvertError::UnsupportedArch`] — `config.json::model_type` /
 ///   `architectures` did not match any of the 8 supported arches.
-/// - [`ConvertV2Error::UnmappedTensor`] — a safetensors tensor name was
+/// - [`ConvertError::UnmappedTensor`] — a safetensors tensor name was
 ///   not recognized by the selected arch's `map_tensor_name`.
 ///
 /// Per [[feedback-no-loop-suppression-2026-05-17]] both surface as
 /// typed errors — never silently skipped.
 #[derive(Debug)]
-pub enum ConvertV2Error {
+pub enum ConvertError {
     /// `HfModelSource::open` / `iter_tensors` / `materialize_tensor`
     /// failure (missing config, malformed safetensors, unsupported
     /// source dtype, missing FP8 sibling-scale, etc.).
@@ -177,27 +178,41 @@ pub enum ConvertV2Error {
     /// provided. Per the no-silent-fallback rule we refuse to silently
     /// degrade to the non-I sibling tier.
     ImatrixRequiredForITier { tier: &'static str },
+    /// B1 — operator supplied BOTH a positional `<hf_dir>` AND `--repo`.
+    /// Exactly one input source is required. Per
+    /// [[feedback-no-loop-suppression-2026-05-17]]: refuse rather than
+    /// silently pick one.
+    RepoAndDirMutuallyExclusive,
+    /// B1 — `huggingface-cli download <repo>` exited non-zero. Captures
+    /// the exit code (`None` if the process was killed by a signal)
+    /// plus the captured stderr so the operator can diagnose auth /
+    /// network / missing-binary failures.
+    HfDownload {
+        repo: String,
+        exit_code: Option<i32>,
+        stderr: String,
+    },
 }
 
-impl std::fmt::Display for ConvertV2Error {
+impl std::fmt::Display for ConvertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConvertV2Error::Source(e) => write!(f, "convert-v2/source: {e}"),
-            ConvertV2Error::Orchestrator(e) => write!(f, "convert-v2/orchestrator: {e}"),
-            ConvertV2Error::Io(e) => write!(f, "convert-v2/io: {e}"),
-            ConvertV2Error::UnsupportedArch { arch_name } => {
+            ConvertError::Source(e) => write!(f, "convert/source: {e}"),
+            ConvertError::Orchestrator(e) => write!(f, "convert/orchestrator: {e}"),
+            ConvertError::Io(e) => write!(f, "convert/io: {e}"),
+            ConvertError::UnsupportedArch { arch_name } => {
                 write!(
                     f,
-                    "convert-v2: unsupported architecture `{arch_name}` \
+                    "convert: unsupported architecture `{arch_name}` \
                      (supported: llama, gemma3, bert, nomic_bert, qwen3_moe, \
                      qwen3_vl, minimax_m2)"
                 )
             }
-            ConvertV2Error::UnmappedTensor { hf_name, arch } => write!(
+            ConvertError::UnmappedTensor { hf_name, arch } => write!(
                 f,
-                "convert-v2: tensor `{hf_name}` not recognized by `{arch}` mapper"
+                "convert: tensor `{hf_name}` not recognized by `{arch}` mapper"
             ),
-            ConvertV2Error::IncompleteExpertGroup {
+            ConvertError::IncompleteExpertGroup {
                 gguf_name,
                 layer,
                 kind_label,
@@ -205,92 +220,109 @@ impl std::fmt::Display for ConvertV2Error {
                 n_experts_config,
             } => write!(
                 f,
-                "convert-v2: expert group `{gguf_name}` (layer={layer}, kind={kind_label}) \
+                "convert: expert group `{gguf_name}` (layer={layer}, kind={kind_label}) \
                  only saw {present_count}/{n_experts_config} experts"
             ),
-            ConvertV2Error::DuplicateExpertIndex {
+            ConvertError::DuplicateExpertIndex {
                 gguf_name,
                 layer,
                 kind_label,
                 expert_index,
             } => write!(
                 f,
-                "convert-v2: duplicate expert index {expert_index} for \
+                "convert: duplicate expert index {expert_index} for \
                  `{gguf_name}` (layer={layer}, kind={kind_label})"
             ),
-            ConvertV2Error::MissingHparam { key } => write!(
+            ConvertError::MissingHparam { key } => write!(
                 f,
-                "convert-v2: config.json is missing required hparam `{key}`"
+                "convert: config.json is missing required hparam `{key}`"
             ),
-            ConvertV2Error::ApexMissingLayerCount => write!(
+            ConvertError::ApexMissingLayerCount => write!(
                 f,
-                "convert-v2: --quant apex-<tier> requires `num_hidden_layers` in config.json"
+                "convert: --quant apex-<tier> requires `num_hidden_layers` in config.json"
             ),
-            ConvertV2Error::ApexCustomOutOfScope { path } => write!(
+            ConvertError::ApexCustomOutOfScope { path } => write!(
                 f,
-                "convert-v2: --quant apex-custom --tensor-type-file `{}` is reserved \
+                "convert: --quant apex-custom --tensor-type-file `{}` is reserved \
                  (out of v1 scope)",
                 path.display()
             ),
-            ConvertV2Error::Apex(e) => write!(f, "convert-v2/apex: {e}"),
-            ConvertV2Error::Tokenizer(e) => write!(f, "convert-v2/tokenizer: {e}"),
-            ConvertV2Error::Imatrix(e) => write!(f, "convert-v2/imatrix: {e}"),
-            ConvertV2Error::ImatrixRequiredForITier { tier } => write!(
+            ConvertError::Apex(e) => write!(f, "convert/apex: {e}"),
+            ConvertError::Tokenizer(e) => write!(f, "convert/tokenizer: {e}"),
+            ConvertError::Imatrix(e) => write!(f, "convert/imatrix: {e}"),
+            ConvertError::ImatrixRequiredForITier { tier } => write!(
                 f,
-                "convert-v2: --quant apex-{tier} requires `--imatrix <file>` \
+                "convert: --quant apex-{tier} requires `--imatrix <file>` \
                  (or `--imatrix-corpus <name>` once ADR-033 §Pi Phase B ships)"
+            ),
+            ConvertError::RepoAndDirMutuallyExclusive => write!(
+                f,
+                "convert: `--repo <hf_repo>` and positional `<hf_dir>` are mutually exclusive — \
+                 pass exactly one"
+            ),
+            ConvertError::HfDownload {
+                repo,
+                exit_code,
+                stderr,
+            } => write!(
+                f,
+                "convert: `huggingface-cli download {repo}` exited with status {} — stderr:\n{}",
+                exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "<signal>".to_string()),
+                stderr.trim_end()
             ),
         }
     }
 }
 
-impl std::error::Error for ConvertV2Error {
+impl std::error::Error for ConvertError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ConvertV2Error::Source(e) => Some(e),
-            ConvertV2Error::Orchestrator(e) => Some(e),
-            ConvertV2Error::Io(e) => Some(e),
-            ConvertV2Error::Apex(e) => Some(e),
-            ConvertV2Error::Tokenizer(e) => Some(e),
-            ConvertV2Error::Imatrix(e) => Some(e),
+            ConvertError::Source(e) => Some(e),
+            ConvertError::Orchestrator(e) => Some(e),
+            ConvertError::Io(e) => Some(e),
+            ConvertError::Apex(e) => Some(e),
+            ConvertError::Tokenizer(e) => Some(e),
+            ConvertError::Imatrix(e) => Some(e),
             _ => None,
         }
     }
 }
 
-impl From<crate::quantize::imatrix::ImatrixError> for ConvertV2Error {
+impl From<crate::quantize::imatrix::ImatrixError> for ConvertError {
     fn from(e: crate::quantize::imatrix::ImatrixError) -> Self {
-        ConvertV2Error::Imatrix(e)
+        ConvertError::Imatrix(e)
     }
 }
 
-impl From<SourceError> for ConvertV2Error {
+impl From<SourceError> for ConvertError {
     fn from(e: SourceError) -> Self {
-        ConvertV2Error::Source(e)
+        ConvertError::Source(e)
     }
 }
 
-impl From<OrchestratorError> for ConvertV2Error {
+impl From<OrchestratorError> for ConvertError {
     fn from(e: OrchestratorError) -> Self {
-        ConvertV2Error::Orchestrator(e)
+        ConvertError::Orchestrator(e)
     }
 }
 
-impl From<std::io::Error> for ConvertV2Error {
+impl From<std::io::Error> for ConvertError {
     fn from(e: std::io::Error) -> Self {
-        ConvertV2Error::Io(e)
+        ConvertError::Io(e)
     }
 }
 
-impl From<ApexError> for ConvertV2Error {
+impl From<ApexError> for ConvertError {
     fn from(e: ApexError) -> Self {
-        ConvertV2Error::Apex(e)
+        ConvertError::Apex(e)
     }
 }
 
-impl From<TokenizerError> for ConvertV2Error {
+impl From<TokenizerError> for ConvertError {
     fn from(e: TokenizerError) -> Self {
-        ConvertV2Error::Tokenizer(e)
+        ConvertError::Tokenizer(e)
     }
 }
 
@@ -311,13 +343,13 @@ impl From<TokenizerError> for ConvertV2Error {
 ///      orchestrator.
 ///    - `ExpertGroup{..}` → buffer in the expert accumulator.
 ///    - `Drop` → discard (the arch mapper signed off explicitly).
-///    - `None` → typed [`ConvertV2Error::UnmappedTensor`].
+///    - `None` → typed [`ConvertError::UnmappedTensor`].
 /// 5. Drain the expert accumulator: assert every group has exactly
 ///    `n_experts` slices, sort by `expert_index`, flatten into the
 ///    fused 3-D shape `[in, out, n_experts]`, push to the orchestrator.
 /// 6. Emit metadata via the arch's `build_metadata`.
 /// 7. [`ConvertOrchestrator::write`] → BufWriter over the output file.
-pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
+pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // ----- 1. Open source (mmap, metadata-only) ---------------------------
     // Per ADR-033 §"Open Issues / Real-Model Findings" 2026-05-18: the
     // source reader does NOT load every safetensors shard into RAM. It
@@ -346,7 +378,7 @@ pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
         }
         QuantSelector::Apex(tier) => {
             let n_layers = config_n_layers(&src.config)
-                .ok_or(ConvertV2Error::ApexMissingLayerCount)?;
+                .ok_or(ConvertError::ApexMissingLayerCount)?;
             let n_expert = hparams.n_expert;
 
             // ADR-033 §Pi: resolve the imatrix surface. Phase A accepts a
@@ -427,7 +459,7 @@ pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
             (orch, ftype)
         }
         QuantSelector::ApexCustom(path) => {
-            return Err(ConvertV2Error::ApexCustomOutOfScope {
+            return Err(ConvertError::ApexCustomOutOfScope {
                 path: path.clone(),
             });
         }
@@ -445,7 +477,7 @@ pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
     // real-model convert-v2 smoke test on
     // /opt/hf2q/models/google-gemma-4-26b-a4b-it. Per
     // [[feedback-no-loop-suppression-2026-05-17]] we surface every
-    // tokenizer-parse failure as a typed `ConvertV2Error::Tokenizer`
+    // tokenizer-parse failure as a typed `ConvertError::Tokenizer`
     // variant rather than skipping silently — that exact silent skip
     // is what produced the bug.
     for (k, v) in build_tokenizer_metadata(&args.hf_dir, arch)? {
@@ -504,7 +536,7 @@ fn resolve_imatrix_input(
     tier: &crate::quantize::ggml_quants::apex::ApexTier,
     imatrix_path: Option<&std::path::Path>,
     imatrix_corpus: Option<&str>,
-) -> Result<Option<crate::quantize::imatrix::ImatrixData>, ConvertV2Error> {
+) -> Result<Option<crate::quantize::imatrix::ImatrixData>, ConvertError> {
     use crate::quantize::imatrix::{CorpusSource, ImatrixData, ImatrixError};
 
     if let Some(path) = imatrix_path {
@@ -530,7 +562,7 @@ fn resolve_imatrix_input(
         .into());
     }
     if tier.requires_imatrix() {
-        return Err(ConvertV2Error::ImatrixRequiredForITier {
+        return Err(ConvertError::ImatrixRequiredForITier {
             tier: tier.cli_name(),
         });
     }
@@ -540,7 +572,7 @@ fn resolve_imatrix_input(
 /// Extract `num_hidden_layers` from the HF config. Required by
 /// `ApexPolicy::new` for the per-layer EDGE/NEAR/MID gradient. Returns
 /// `None` if the field is missing or non-positive — surfaces as
-/// [`ConvertV2Error::ApexMissingLayerCount`] at the caller.
+/// [`ConvertError::ApexMissingLayerCount`] at the caller.
 fn config_n_layers(config: &serde_json::Value) -> Option<u32> {
     effective_config(config)
         .get("num_hidden_layers")
@@ -561,8 +593,8 @@ fn config_n_layers(config: &serde_json::Value) -> Option<u32> {
 /// — older configs sometimes ship one without the other.
 ///
 /// Per ADR-033 the supported arches are a closed set (8 entries); any
-/// other arch surfaces as [`ConvertV2Error::UnsupportedArch`].
-fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertV2Error> {
+/// other arch surfaces as [`ConvertError::UnsupportedArch`].
+fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
     let model_type = config.get("model_type").and_then(|v| v.as_str());
     let architectures: Vec<&str> = config
         .get("architectures")
@@ -635,7 +667,7 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertV2Error> {
         .map(|s| s.to_string())
         .or_else(|| architectures.first().map(|s| s.to_string()))
         .unwrap_or_else(|| "<missing model_type and architectures>".into());
-    Err(ConvertV2Error::UnsupportedArch {
+    Err(ConvertError::UnsupportedArch {
         arch_name: observed,
     })
 }
@@ -670,12 +702,12 @@ pub fn effective_config(config: &serde_json::Value) -> &serde_json::Value {
 /// `target_for`'s GQA + counter-walk branches. Mirrors the convention
 /// in the per-arch `build_metadata` mappers (default `n_head_kv` to
 /// `n_head`, `n_expert` to zero when absent).
-fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertV2Error> {
+fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertError> {
     let config = effective_config(config);
     let n_head = config
         .get("num_attention_heads")
         .and_then(|v| v.as_u64())
-        .ok_or(ConvertV2Error::MissingHparam {
+        .ok_or(ConvertError::MissingHparam {
             key: "num_attention_heads",
         })? as u32;
     let n_head_kv = config
@@ -1020,7 +1052,7 @@ impl PlanStep {
         &self,
         src: &HfModelSource,
         synthesized: &[HfTensor],
-    ) -> Result<Vec<f32>, ConvertV2Error> {
+    ) -> Result<Vec<f32>, ConvertError> {
         match self {
             PlanStep::Direct { hf_name, .. } => {
                 let ht = src.materialize_tensor(hf_name)?;
@@ -1037,7 +1069,7 @@ impl PlanStep {
                 for name in member_hf_names {
                     let ht = src.materialize_tensor(name)?;
                     if ht.data.len() != per_expert_elems {
-                        return Err(ConvertV2Error::Source(SourceError::Safetensors(format!(
+                        return Err(ConvertError::Source(SourceError::Safetensors(format!(
                             "fused expert slice `{name}`: data len {} != expected per-expert {}",
                             ht.data.len(),
                             per_expert_elems
@@ -1051,7 +1083,7 @@ impl PlanStep {
             }
             PlanStep::Synthesized { synth_idx, .. } => {
                 let t = synthesized.get(*synth_idx).ok_or_else(|| {
-                    ConvertV2Error::Source(SourceError::Safetensors(format!(
+                    ConvertError::Source(SourceError::Safetensors(format!(
                         "synthesized tensor index {synth_idx} out of range"
                     )))
                 })?;
@@ -1094,7 +1126,7 @@ fn build_convert_plan(
     arch: ArchName,
     src: &HfModelSource,
     synthesized: &[HfTensor],
-) -> Result<ConvertPlan, ConvertV2Error> {
+) -> Result<ConvertPlan, ConvertError> {
     let n_experts = src
         .config
         .get("num_experts")
@@ -1139,7 +1171,7 @@ fn build_convert_plan(
                 // corrupt checkpoint). Per no-loop-suppression: surface
                 // instead of silent overwrite.
                 if group.members.iter().any(|m| m.expert_index == expert_index) {
-                    return Err(ConvertV2Error::DuplicateExpertIndex {
+                    return Err(ConvertError::DuplicateExpertIndex {
                         gguf_name,
                         layer,
                         kind_label: expert_kind_label(kind),
@@ -1156,14 +1188,14 @@ fn build_convert_plan(
                 // tracing it lets operators audit what was discarded
                 // without changing behavior.
                 tracing::debug!(
-                    target: "convert_v2",
+                    target: "convert",
                     arch = arch.name(),
                     tensor = %meta.name,
-                    "convert-v2: explicit drop per arch mapper"
+                    "convert: explicit drop per arch mapper"
                 );
             }
             MapOutcome::Unmapped => {
-                return Err(ConvertV2Error::UnmappedTensor {
+                return Err(ConvertError::UnmappedTensor {
                     hf_name: meta.name.clone(),
                     arch: arch.name().to_string(),
                 });
@@ -1189,7 +1221,7 @@ fn build_convert_plan(
             source_dtype,
         } = group;
         if expected_n_experts == 0 {
-            return Err(ConvertV2Error::IncompleteExpertGroup {
+            return Err(ConvertError::IncompleteExpertGroup {
                 gguf_name,
                 layer,
                 kind_label: expert_kind_label(kind),
@@ -1198,7 +1230,7 @@ fn build_convert_plan(
             });
         }
         if members.len() != expected_n_experts {
-            return Err(ConvertV2Error::IncompleteExpertGroup {
+            return Err(ConvertError::IncompleteExpertGroup {
                 gguf_name,
                 layer,
                 kind_label: expert_kind_label(kind),
@@ -1211,7 +1243,7 @@ fn build_convert_plan(
         // Sanity: expert indices are contiguous [0, n_experts).
         for (i, m) in members.iter().enumerate() {
             if m.expert_index != i {
-                return Err(ConvertV2Error::IncompleteExpertGroup {
+                return Err(ConvertError::IncompleteExpertGroup {
                     gguf_name,
                     layer,
                     kind_label: expert_kind_label(kind),
@@ -1265,10 +1297,10 @@ fn build_convert_plan(
             }
             MapOutcome::Drop => {
                 tracing::debug!(
-                    target: "convert_v2",
+                    target: "convert",
                     arch = arch.name(),
                     tensor = %t.name,
-                    "convert-v2: synthesized tensor explicit-drop per arch mapper"
+                    "convert: synthesized tensor explicit-drop per arch mapper"
                 );
             }
             MapOutcome::Expert { .. } => {
@@ -1276,13 +1308,13 @@ fn build_convert_plan(
                 // any arch. If a future arch needs them, route through
                 // the same fusion accumulator above. For now this is a
                 // hard error rather than a silent skip.
-                return Err(ConvertV2Error::UnmappedTensor {
+                return Err(ConvertError::UnmappedTensor {
                     hf_name: t.name.clone(),
                     arch: arch.name().to_string(),
                 });
             }
             MapOutcome::Unmapped => {
-                return Err(ConvertV2Error::UnmappedTensor {
+                return Err(ConvertError::UnmappedTensor {
                     hf_name: t.name.clone(),
                     arch: arch.name().to_string(),
                 });
@@ -1517,7 +1549,7 @@ mod tests {
     fn detect_arch_unsupported_errors() {
         let cfg = json!({ "model_type": "mamba" });
         match detect_arch(&cfg).expect_err("must error") {
-            ConvertV2Error::UnsupportedArch { arch_name } => {
+            ConvertError::UnsupportedArch { arch_name } => {
                 assert_eq!(arch_name, "mamba");
             }
             other => panic!("expected UnsupportedArch, got {other:?}"),
@@ -1530,7 +1562,7 @@ mod tests {
     fn detect_arch_completely_missing_errors() {
         let cfg = json!({});
         match detect_arch(&cfg).expect_err("must error") {
-            ConvertV2Error::UnsupportedArch { arch_name } => {
+            ConvertError::UnsupportedArch { arch_name } => {
                 assert!(arch_name.contains("missing"));
             }
             other => panic!("expected UnsupportedArch, got {other:?}"),
@@ -1563,7 +1595,7 @@ mod tests {
     fn build_hparams_missing_head_count_errors() {
         let cfg = json!({});
         match build_hparams(&cfg).expect_err("must error") {
-            ConvertV2Error::MissingHparam { key } => {
+            ConvertError::MissingHparam { key } => {
                 assert_eq!(key, "num_attention_heads");
             }
             other => panic!("expected MissingHparam, got {other:?}"),
@@ -1649,7 +1681,7 @@ mod tests {
         let err =
             super::resolve_imatrix_input(&ApexTier::IBalanced, None, None).unwrap_err();
         match err {
-            ConvertV2Error::ImatrixRequiredForITier { tier } => {
+            ConvertError::ImatrixRequiredForITier { tier } => {
                 assert_eq!(tier, "i-balanced")
             }
             other => panic!("expected ImatrixRequiredForITier, got {other:?}"),
@@ -1687,7 +1719,7 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            ConvertV2Error::Imatrix(
+            ConvertError::Imatrix(
                 crate::quantize::imatrix::ImatrixError::InTreeGenerationNotYetShipped { corpus },
             ) => assert_eq!(corpus, "cdv3"),
             other => panic!("expected InTreeGenerationNotYetShipped, got {other:?}"),
@@ -1705,7 +1737,7 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            ConvertV2Error::Imatrix(
+            ConvertError::Imatrix(
                 crate::quantize::imatrix::ImatrixError::UnknownBakedCorpus { name, .. },
             ) => assert_eq!(name, "wikitext-9000"),
             other => panic!("expected UnknownBakedCorpus, got {other:?}"),
@@ -1724,8 +1756,8 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            ConvertV2Error::Imatrix(_) => { /* OK: surfaced from loader */ }
-            other => panic!("expected ConvertV2Error::Imatrix, got {other:?}"),
+            ConvertError::Imatrix(_) => { /* OK: surfaced from loader */ }
+            other => panic!("expected ConvertError::Imatrix, got {other:?}"),
         }
     }
 

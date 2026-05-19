@@ -78,7 +78,7 @@ impl FingerprintHParams {
     ///
     /// Returns `None` when the required `model_type` /
     /// `num_hidden_layers` / `hidden_size` keys are absent; the caller
-    /// surfaces those as a typed `ConvertV2Error` upstream.
+    /// surfaces those as a typed `ConvertError` upstream.
     pub fn from_config(config: &serde_json::Value) -> Option<Self> {
         let model_type = config.get("model_type")?.as_str()?.to_string();
         let num_hidden_layers = config.get("num_hidden_layers")?.as_u64()? as u32;

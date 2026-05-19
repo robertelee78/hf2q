@@ -99,19 +99,38 @@ pub enum Command {
     /// ADR-033 — convert a HuggingFace model directory to GGUF via
     /// the unified policy/quantizer/writer pipeline (the only convert
     /// path post-P6). Per [[feedback-no-backwards-compat-2026-05-18]]:
-    /// no migration shims; no alias for legacy `--quant` values.
-    ConvertV2(ConvertV2CliArgs),
+    /// no migration shims; no alias for legacy `--quant` values; no
+    /// `convert-v2` alias (the historical name retired 2026-05-19 via
+    /// B4 rename).
+    Convert(ConvertCliArgs),
 }
 
-/// `hf2q convert-v2 <hf-dir> --quant <name> -o <out.gguf>` clap args.
+/// `hf2q convert <hf-dir> --quant <name> -o <out.gguf>` clap args.
 ///
-/// Resolved to [`crate::convert::ConvertV2Args`] in `main.rs::cmd_convert_v2`.
+/// Resolved to [`crate::convert::ConvertArgs`] in `main.rs::cmd_convert`.
 #[derive(clap::Args, Debug, Clone)]
-pub struct ConvertV2CliArgs {
+pub struct ConvertCliArgs {
     /// HuggingFace model directory (must contain `config.json` plus
     /// either `model.safetensors` or `model.safetensors.index.json` +
-    /// shards).
-    pub hf_dir: PathBuf,
+    /// shards). Optional: when omitted, `--repo <hf_repo>` must be
+    /// supplied so the driver can shell out to `huggingface-cli download`
+    /// before the convert proceeds. Mutually exclusive with `--repo`.
+    #[arg(conflicts_with = "repo")]
+    pub hf_dir: Option<PathBuf>,
+
+    /// Auto-download a HuggingFace repo via `huggingface-cli download`
+    /// before converting. The repo is cached at
+    /// `~/.cache/hf2q/repos/<sanitized_repo>/` (forward slashes replaced
+    /// with `__`); a subsequent `--repo <same>` reuses the cached
+    /// directory. Mutually exclusive with the positional `<hf_dir>`;
+    /// exactly one of the two must be supplied.
+    ///
+    /// Operator must have `huggingface-cli` on PATH and (for gated
+    /// repos) a valid token at `~/.huggingface/token` or
+    /// `HF_TOKEN` env. Partial downloads resume on re-invocation per
+    /// `huggingface-cli`'s own logic.
+    #[arg(long, conflicts_with = "hf_dir")]
+    pub repo: Option<String>,
 
     /// File-type to quantize to. Accepts:
     ///   - Standard llama.cpp ftypes: `f32`, `f16`, `bf16`, `q4_0`,

@@ -615,17 +615,21 @@ fn build_convert_args(
     input_dir: &Path,
     gguf_path: &Path,
 ) -> Result<Vec<String>, String> {
-    // ADR-033 P6: smoke harness drives the unified `convert-v2` surface.
-    // ConvertV2's surface is narrower than the legacy `convert`: positional
+    // ADR-033 P6: smoke harness drives the unified `convert` surface.
+    // Convert's surface is narrower than the pre-P6 legacy: positional
     // `hf_dir`, `--quant`, `-o` only. Legacy axes (`--yes`, `--skip-quality`,
-    // `--format gguf`, `--emit-vision-tower`) are gone — convert-v2 is
+    // `--format gguf`, `--emit-vision-tower`) are gone — convert is
     // GGUF-only, non-interactive by default, and emits the mmproj sidecar
     // automatically when the source `config.json` carries a `vision_config`
     // (`src/convert/arch/gemma4_mmproj.rs`). `_entry.has_vision` is therefore
-    // unused at the smoke-arg layer — the convert-v2 pipeline does its own
+    // unused at the smoke-arg layer — the convert pipeline does its own
     // arch-driven decision.
+    //
+    // Historical note: introduced as `convert-v2` in ADR-033 P4; B4
+    // renamed to `convert` on 2026-05-19 (no alias kept per
+    // [[feedback-no-backwards-compat-2026-05-18]]).
     let convert_args: Vec<String> = vec![
-        "convert-v2".into(),
+        "convert".into(),
         input_dir.to_str().ok_or("input_dir not UTF-8")?.into(),
         "--quant".into(),
         args.quant.clone(),
@@ -1361,16 +1365,16 @@ mod tests {
         );
     }
 
-    /// ADR-033 P6: smoke harness drives `hf2q convert-v2` with the
-    /// narrower surface (positional `hf_dir`, `--quant`, `-o` only).
-    /// The mmproj sidecar emission decision moved into convert-v2's
-    /// arch-driven layer (`src/convert/arch/gemma4_mmproj.rs`), so the
-    /// smoke harness no longer wires `--emit-vision-tower` at the argv
-    /// layer — the legacy `--with-vision` smoke flag is now a no-op
-    /// at the argv layer; arch detection inside convert-v2 owns the
-    /// decision.
+    /// ADR-033 P6 + B4 rename (2026-05-19): smoke harness drives
+    /// `hf2q convert` with the narrower surface (positional `hf_dir`,
+    /// `--quant`, `-o` only). The mmproj sidecar emission decision
+    /// moved into the convert pipeline's arch-driven layer
+    /// (`src/convert/arch/gemma4_mmproj.rs`), so the smoke harness no
+    /// longer wires `--emit-vision-tower` at the argv layer — the
+    /// legacy `--with-vision` smoke flag is now a no-op at the argv
+    /// layer; arch detection inside convert owns the decision.
     #[test]
-    fn build_convert_args_uses_convert_v2_surface() {
+    fn build_convert_args_uses_convert_surface() {
         let args = args_for("qwen35", "q4_0");
         let entry = ArchRegistry::global().get("qwen35").unwrap();
         let convert_args = build_convert_args(
@@ -1382,25 +1386,34 @@ mod tests {
         .unwrap();
         assert_eq!(
             convert_args.first().map(|s| s.as_str()),
-            Some("convert-v2"),
-            "smoke harness must invoke `hf2q convert-v2` (ADR-033 P6); got {:?}",
+            Some("convert"),
+            "smoke harness must invoke `hf2q convert` (ADR-033 P6 + B4 rename); got {:?}",
             convert_args
         );
         assert!(
             convert_args.iter().any(|a| a == "--quant"),
-            "convert-v2 invocation must pass --quant; got {:?}",
+            "convert invocation must pass --quant; got {:?}",
             convert_args
         );
         assert!(
             convert_args.iter().any(|a| a == "-o"),
-            "convert-v2 invocation must pass -o; got {:?}",
+            "convert invocation must pass -o; got {:?}",
             convert_args
         );
-        // Legacy axes must be absent — they don't exist on convert-v2.
-        for legacy in ["--emit-vision-tower", "--yes", "--skip-quality", "--format", "--input"] {
+        // Legacy axes must be absent — they don't exist on the new convert surface.
+        // The historical `convert-v2` alias is intentionally not retained per
+        // [[feedback-no-backwards-compat-2026-05-18]].
+        for legacy in [
+            "convert-v2",
+            "--emit-vision-tower",
+            "--yes",
+            "--skip-quality",
+            "--format",
+            "--input",
+        ] {
             assert!(
                 !convert_args.iter().any(|a| a == legacy),
-                "{legacy} is a legacy convert axis that must not appear post-P6; got {:?}",
+                "{legacy} is a legacy convert axis that must not appear post-P6/B4; got {:?}",
                 convert_args
             );
         }
@@ -1408,8 +1421,9 @@ mod tests {
 
     /// ADR-033 P6: `--with-vision` is accepted on the smoke surface for
     /// CLI-compat but no longer changes the argv (arch-driven decision
-    /// moved inside convert-v2). Locks the no-op behaviour so a future
-    /// refactor can't accidentally regress to `--emit-vision-tower`.
+    /// moved inside the convert pipeline). Locks the no-op behaviour
+    /// so a future refactor can't accidentally regress to
+    /// `--emit-vision-tower`.
     #[test]
     fn build_convert_args_with_vision_does_not_alter_argv() {
         let mut args = args_for("qwen35", "q4_0");
@@ -1424,7 +1438,7 @@ mod tests {
         .unwrap();
         assert!(
             !convert_args.iter().any(|a| a == "--emit-vision-tower"),
-            "convert-v2 has no --emit-vision-tower flag; got {:?}",
+            "convert has no --emit-vision-tower flag; got {:?}",
             convert_args
         );
     }

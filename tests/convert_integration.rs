@@ -1,7 +1,12 @@
-//! ADR-033 P4 — integration test for `hf2q convert-v2`.
+//! ADR-033 P4 — integration test for `hf2q convert`.
+//!
+//! Historically introduced as `convert-v2` (ADR-033 P4); B4 renamed the
+//! subcommand to `convert` on 2026-05-19 once P6 deleted the legacy
+//! pipeline. Per [[feedback-no-backwards-compat-2026-05-18]] no alias
+//! is retained — this test drives the canonical `convert` surface.
 //!
 //! Synthesizes a tiny Llama-3-shaped HuggingFace directory in a
-//! tempdir, runs the `hf2q convert-v2` CLI against it at `q8_0`, and
+//! tempdir, runs the `hf2q convert` CLI against it at `q8_0`, and
 //! re-parses the output GGUF via `mlx_native::gguf::GgufFile` to
 //! assert tensor count + metadata count + per-tensor name / ggml_type.
 //!
@@ -207,7 +212,7 @@ fn synthesize_tiny_llama3_no_norms(dir: &Path) {
     write_minimal_tokenizer_fixture(dir, VOCAB);
 }
 
-/// Drive `hf2q convert-v2` end-to-end over a tiny Llama-3 fixture and
+/// Drive `hf2q convert` end-to-end over a tiny Llama-3 fixture and
 /// assert the output GGUF round-trips. Targets `q8_0` so every 2-D
 /// weight lands on Q8_0 (positional code 3 in mlx_native's enum).
 ///
@@ -217,14 +222,14 @@ fn synthesize_tiny_llama3_no_norms(dir: &Path) {
 /// - 11 metadata KV pairs (Llama3 build_metadata output)
 /// - every expected tensor name present with ggml_type Q8_0
 #[test]
-fn convert_v2_llama3_tiny_round_trip() {
+fn convert_llama3_tiny_round_trip() {
     let model_dir = tempfile::tempdir().unwrap();
     synthesize_tiny_llama3_no_norms(model_dir.path());
 
     let out = tempfile::NamedTempFile::new().unwrap();
     Command::cargo_bin("hf2q")
         .unwrap()
-        .arg("convert-v2")
+        .arg("convert")
         .arg(model_dir.path())
         .arg("--quant")
         .arg("q8_0")
@@ -289,12 +294,12 @@ fn convert_v2_llama3_tiny_round_trip() {
 }
 
 /// Sibling test — feeding an unsupported `model_type` surfaces typed
-/// `ConvertV2Error::UnsupportedArch`, which the CLI dispatcher maps to
+/// `ConvertError::UnsupportedArch`, which the CLI dispatcher maps to
 /// `AppError::Input` → exit code 3 + diagnostic mentioning the
 /// offending arch. Per [[feedback-no-loop-suppression-2026-05-17]]:
 /// never silent fallback.
 #[test]
-fn convert_v2_unsupported_arch_errors_typed() {
+fn convert_unsupported_arch_errors_typed() {
     let dir = tempfile::tempdir().unwrap();
 
     // Write a minimal safetensors + config with an unsupported model_type.
@@ -313,7 +318,7 @@ fn convert_v2_unsupported_arch_errors_typed() {
     let out = tempfile::NamedTempFile::new().unwrap();
     let assert = Command::cargo_bin("hf2q")
         .unwrap()
-        .arg("convert-v2")
+        .arg("convert")
         .arg(dir.path())
         .arg("--quant")
         .arg("q8_0")
@@ -322,7 +327,7 @@ fn convert_v2_unsupported_arch_errors_typed() {
         .assert()
         .failure();
     // Exit code 3 = EXIT_INPUT_ERROR per src/main.rs (AppError::Input
-    // dispatch in cmd_convert_v2 wrapper).
+    // dispatch in cmd_convert wrapper).
     assert
         .code(3)
         .stderr(predicates::str::contains("mamba"));
@@ -483,7 +488,7 @@ fn synthesize_tiny_qwen35moe_for_apex(dir: &Path) {
     write_minimal_tokenizer_fixture(dir, VOCAB);
 }
 
-/// Drive `hf2q convert-v2 --quant apex-balanced` end-to-end on a synthetic
+/// Drive `hf2q convert --quant apex-balanced` end-to-end on a synthetic
 /// tiny Qwen3MoE fixture and assert the output GGUF round-trips with the
 /// correct per-tensor ggml_types per `tier_rules(Balanced)`.
 ///
@@ -511,14 +516,14 @@ fn synthesize_tiny_qwen35moe_for_apex(dir: &Path) {
 /// `apex_policy_dense_model_errors` unit tests; this integration test
 /// covers the happy-path wiring only.
 #[test]
-fn convert_v2_apex_balanced_tiny_qwen35moe_round_trip() {
+fn convert_apex_balanced_tiny_qwen35moe_round_trip() {
     let model_dir = tempfile::tempdir().unwrap();
     synthesize_tiny_qwen35moe_for_apex(model_dir.path());
 
     let out = tempfile::NamedTempFile::new().unwrap();
     Command::cargo_bin("hf2q")
         .unwrap()
-        .arg("convert-v2")
+        .arg("convert")
         .arg(model_dir.path())
         .arg("--quant")
         .arg("apex-balanced")
@@ -774,7 +779,7 @@ fn synthesize_tiny_gemma4_real_arch(dir: &Path) {
     write_minimal_tokenizer_fixture(dir, VOCAB);
 }
 
-/// Drive `hf2q convert-v2 --quant q8_0` end-to-end on the synthetic
+/// Drive `hf2q convert --quant q8_0` end-to-end on the synthetic
 /// real-arch Gemma 4 fixture and assert the output GGUF round-trips
 /// with every expected tensor name + ggml_type.
 ///
@@ -790,14 +795,14 @@ fn synthesize_tiny_gemma4_real_arch(dir: &Path) {
 ///  - every expected GGUF tensor name present with Q8_0 (positional 3)
 ///  - the fused expert tensors land as 3-D with the right inner dim
 #[test]
-fn convert_v2_gemma4_real_arch_round_trip() {
+fn convert_gemma4_real_arch_round_trip() {
     let model_dir = tempfile::tempdir().unwrap();
     synthesize_tiny_gemma4_real_arch(model_dir.path());
 
     let out = tempfile::NamedTempFile::new().unwrap();
     Command::cargo_bin("hf2q")
         .unwrap()
-        .arg("convert-v2")
+        .arg("convert")
         .arg(model_dir.path())
         .arg("--quant")
         .arg("q8_0")
@@ -1077,7 +1082,7 @@ fn convert_v2_gemma4_real_arch_round_trip() {
 /// overhead (cargo loads ~150 MB of debug-info itself on first invoke).
 /// This is the spec'd bound from ADR-033's "Open Issues" section.
 #[test]
-fn convert_v2_streaming_rss_under_bound_2026_05_18() {
+fn convert_streaming_rss_under_bound_2026_05_18() {
     use safetensors::tensor::TensorView;
     let dir = tempfile::tempdir().unwrap();
 
@@ -1160,18 +1165,18 @@ fn convert_v2_streaming_rss_under_bound_2026_05_18() {
     #[cfg(target_os = "linux")]
     cmd.args(["-f", "%M"]);
     cmd.arg(&hf2q_bin)
-        .arg("convert-v2")
+        .arg("convert")
         .arg(dir.path())
         .arg("--quant")
         .arg("q8_0")
         .arg("-o")
         .arg(out.path());
-    let result = cmd.output().expect("spawn /usr/bin/time hf2q convert-v2");
+    let result = cmd.output().expect("spawn /usr/bin/time hf2q convert");
 
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
         result.status.success(),
-        "convert-v2 subprocess failed (status {:?}): stderr={stderr}",
+        "convert subprocess failed (status {:?}): stderr={stderr}",
         result.status.code()
     );
 
@@ -1190,7 +1195,7 @@ fn convert_v2_streaming_rss_under_bound_2026_05_18() {
         let bound = (4 * f32_bytes_per_tensor as u64) + (512 * 1024 * 1024);
         assert!(
             peak < bound,
-            "convert-v2 peak RSS {} bytes ({} MiB) exceeded streaming bound {} bytes ({} MiB) — \
+            "convert peak RSS {} bytes ({} MiB) exceeded streaming bound {} bytes ({} MiB) — \
              the pipeline is buffering tensors instead of streaming them. \
              Buffered worst case would be ~{} MiB. See ADR-033 §Open Issues / Real-Model Findings.",
             peak,

@@ -49,10 +49,9 @@ Metal kernels we own end-to-end.
 | **Status** | Pre-release on M-series Macs. Some paths are fast and well-tested (batched prefill, TQ KV cache, Qwen 3.5 / 3.6 convert + serve); others are incomplete or actively under investigation (spec-decode wire-up, multi-arch coverage). See the ADR ledger for per-feature status. |
 
 ```bash
-# Convert a HuggingFace model to a Q4_K_M GGUF
+# Convert a HuggingFace model to a Q4_K_M GGUF (auto-downloads via --repo)
 hf2q convert \
   --repo google/gemma-4-26b-it \
-  --format gguf \
   --quant q4_k_m \
   --output models/gemma-4-26b-it-q4_k_m/out.gguf
 
@@ -125,7 +124,7 @@ anything misbehaves.
 
 | Command | What it does |
 |---|---|
-| `hf2q convert-v2` | HuggingFace safetensors → GGUF (streaming convert, ADR-033 unified pipeline). |
+| `hf2q convert` | HuggingFace safetensors → GGUF (streaming convert, ADR-033 unified pipeline). |
 | `hf2q gguf-patch` | Rewrite a GGUF's metadata in place (e.g. inject a chat template). |
 | `hf2q info` | Inspect a GGUF model without loading weights. |
 | `hf2q generate` | Single-shot text generation from a GGUF on the local GPU. |
@@ -140,7 +139,7 @@ Run `hf2q <command> --help` for the full flag surface.
 
 ### Quantization variants
 
-The convert-v2 pipeline accepts two families of `--quant <name>`
+The `hf2q convert` pipeline accepts two families of `--quant <name>`
 values, parsed via
 [`QuantSelector::from_name`](src/convert/quant_selector.rs):
 
@@ -156,18 +155,27 @@ Reserved names surface as typed errors with actionable hints:
 
 ## Quick start: convert + serve a model
 
-The convert-v2 pipeline reads a pre-downloaded HuggingFace model
-directory (config.json + safetensors + tokenizer.json) and emits a
-single GGUF that loads in stock `llama.cpp` and in `hf2q serve`.
+The `hf2q convert` pipeline reads a HuggingFace model directory
+(config.json + safetensors + tokenizer.json) and emits a single GGUF
+that loads in stock `llama.cpp` and in `hf2q serve`. The source can
+be a path that already exists on disk OR a `--repo <hf_repo>` that
+the driver auto-downloads via `huggingface-cli`.
 
 ```bash
-# 1. Pre-download the HF source (`hf2q convert-v2` does not auto-fetch).
+# 1. Pre-download the HF source explicitly:
 huggingface-cli download google/gemma-4-26b-a4b-it \
   --local-dir ./models/google-gemma-4-26b-a4b-it
 
 # 2. Convert to Q5_K_M. Streaming convert keeps peak memory ~5 GB
 #    even on a 48 GB-source 26 B-param model. ~8-15 min on M-series.
-hf2q convert-v2 ./models/google-gemma-4-26b-a4b-it \
+hf2q convert ./models/google-gemma-4-26b-a4b-it \
+  --quant q5_k_m \
+  -o ./out/gemma4-26b-q5_k_m.gguf
+
+# Alternative: --repo auto-downloads via huggingface-cli into
+# ~/.cache/hf2q/repos/google__gemma-4-26b-a4b-it/ and then converts.
+# Mutually exclusive with the positional path form above.
+hf2q convert --repo google/gemma-4-26b-a4b-it \
   --quant q5_k_m \
   -o ./out/gemma4-26b-q5_k_m.gguf
 
@@ -187,7 +195,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 For MoE models, pass an APEX tier instead of a standard ftype:
 
 ```bash
-hf2q convert-v2 ./models/Qwen3.5-35B-A3B \
+hf2q convert ./models/Qwen3.5-35B-A3B \
   --quant apex-balanced \
   -o ./out/qwen35-apex-balanced.gguf
 ```
