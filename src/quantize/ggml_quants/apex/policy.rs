@@ -43,6 +43,7 @@ use super::super::ggml_type::GgmlType;
 use super::super::tensor_ref::{ArchName, TensorRef};
 use super::arches::{classify_moe_tensor, is_apex_supported_arch, MoeTensorRole};
 use super::error::ApexError;
+use super::mudler_config::MudlerConfig;
 use super::rules::{
     attn_region, exp_region, shared_region, tier_rules, ApexTier, AttnRegion, ExpRegion,
     SharedRegion,
@@ -62,7 +63,16 @@ use super::rules::{
 /// Post-construction, `target_for` is infallible w.r.t. these
 /// preconditions; the only runtime errors are `MissingLayerIndex` /
 /// `LayerIndexOutOfRange` (dispatcher bugs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// ADR §9 per-model override: when the CLI driver's fingerprint
+/// dispatch matches a manifest entry, it wraps the matched
+/// `MudlerConfig` via [`ApexPolicy::with_mudler_override`]. The
+/// override path lifts every `target_for` query through the vendored
+/// per-tensor map and surfaces missing tensors as
+/// [`ApexError::TensorNotInMudlerConfig`] — no silent fall-through to
+/// the algorithmic generator (ADR §9 line 102: "the vendored config's
+/// rules win over the algorithmic generator's output").
+#[derive(Debug, Clone, Copy)]
 pub struct ApexPolicy {
     /// The selected Apex tier.
     pub tier: ApexTier,
@@ -77,6 +87,12 @@ pub struct ApexPolicy {
     pub n_expert: u32,
     /// Arch for tensor classification.
     pub arch: ArchName,
+    /// ADR §9 per-model override. When `Some`, `target_for` consults
+    /// the vendored per-tensor map first; algorithmic generator is
+    /// bypassed entirely. `'static` because the cache lives in the
+    /// process-wide `mudler_config::cache_slot`. Defaults to `None`
+    /// (algorithmic).
+    pub mudler_override: Option<&'static MudlerConfig>,
 }
 
 impl ApexPolicy {
@@ -111,7 +127,22 @@ impl ApexPolicy {
             n_layers,
             n_expert,
             arch,
+            mudler_override: None,
         })
+    }
+
+    /// Attach an ADR §9 mudler per-model override to the policy.
+    ///
+    /// The override wins over `target_for`'s algorithmic generator for
+    /// every tensor name present in the parsed [`MudlerConfig`]; a
+    /// missing tensor surfaces as
+    /// [`ApexError::TensorNotInMudlerConfig`] rather than fall
+    /// through. Caller (CLI driver) is responsible for logging the
+    /// match for debug transparency — see ADR §9 line 104's "surprise
+    /// risk" mitigation.
+    pub fn with_mudler_override(mut self, mudler: &'static MudlerConfig) -> Self {
+        self.mudler_override = Some(mudler);
+        self
     }
 
     /// Decide the disk-format `GgmlType` for one tensor.
@@ -125,6 +156,58 @@ impl ApexPolicy {
     ///   3. For role ∈ {TokenEmbd, Output, RouterGate, Norm}: return
     ///      the hardcoded picks (Q6_K / Q5_0 / F32).
     pub fn target_for(&self, tensor: &TensorRef) -> Result<GgmlType, ApexError> {
+        // ADR §9 per-model override: if the CLI driver attached a
+        // mudler config, IT IS authoritative (line 102). We do NOT
+        // fall through to the algorithmic generator on a tensor miss
+        // — `mudler_config::MudlerConfig::target_for` surfaces a
+        // typed `TensorNotInMudlerConfig` so the no-silent-fallback
+        // rule holds.
+        //
+        // Exception: structural tensors that mudler's files do NOT
+        // enumerate (norms, token_embd, output, router gate). For
+        // those, the algorithmic generator's hardcoded picks (F32 /
+        // Q6_K / Q5_0) apply — they're not part of mudler's per-tier
+        // surface by design (mudler's `generate_config.sh` only emits
+        // the routed/shared/attn/ssm lines). To keep the override
+        // strict on the tensors mudler DOES enumerate (and silent on
+        // the ones it doesn't), we apply override-first for the
+        // four MoE roles below; the structural arms below fall
+        // through to the algorithmic hardcodes.
+        if let Some(mudler) = self.mudler_override {
+            if mudler.contains_match(tensor.name) {
+                return mudler.target_for(tensor.name);
+            }
+            // Structural tensors mudler doesn't enumerate: token_embd,
+            // output, output_norm, blk.N.{attn,ffn}_norm, router gate
+            // (ffn_gate_inp). Fall through to the algorithmic
+            // hardcodes below — this preserves the override's
+            // strictness on the enumerated tensors (per-layer attn /
+            // exps / shexp / ssm) while letting the small structural
+            // set use llama.cpp's defaults, exactly mirroring stock
+            // `llama-quantize --tensor-type-file`'s semantics.
+            let role = classify_moe_tensor(self.arch, tensor.name);
+            match role {
+                MoeTensorRole::TokenEmbd
+                | MoeTensorRole::Output
+                | MoeTensorRole::RouterGate
+                | MoeTensorRole::Norm => {
+                    // OK — fall through to algorithmic below.
+                }
+                MoeTensorRole::RoutedExpert
+                | MoeTensorRole::SharedExpert
+                | MoeTensorRole::Attention
+                | MoeTensorRole::Ssm
+                | MoeTensorRole::Other => {
+                    // Mudler's surface SHOULD enumerate these. Missing
+                    // entry → typed error per the strict-override rule.
+                    return Err(ApexError::TensorNotInMudlerConfig {
+                        source_path: mudler.source_path.to_string(),
+                        tensor_name: tensor.name.to_string(),
+                    });
+                }
+            }
+        }
+
         let role = classify_moe_tensor(self.arch, tensor.name);
 
         // Per-tier rule table for `RoutedExpert / SharedExpert / Attention / Ssm`.
@@ -420,5 +503,55 @@ mod tests {
 
         let attn = tref("blk.10.attn_q.weight", ArchName::Gemma4, Some(10));
         assert_eq!(p.target_for(&attn).unwrap(), GgmlType::Q3_K);
+    }
+
+    /// ADR §9 per-model override end-to-end smoke. Build an
+    /// ApexPolicy at the algorithmic level, then attach the
+    /// gemma4_26b_balanced.txt mudler config. The override MUST win
+    /// for enumerated tensors and the structural fall-through MUST
+    /// still produce Q5_0 / Q6_K / F32 for router-gate / token-embd
+    /// / norms (mudler doesn't enumerate those).
+    #[test]
+    fn apex_policy_with_mudler_override_wins_for_enumerated_tensors() {
+        use super::super::fingerprint::vendor_config_content;
+        use super::super::mudler_config::MudlerConfig;
+
+        // 30-layer Gemma4 MoE @ balanced — same arch as
+        // gemma4_26b_balanced.txt. The vendored file sets
+        // `blk.0.ffn_gate_exps=Q6_K` at edge layers and
+        // `blk.5.ffn_gate_exps=Q5_K` at the near band.
+        let content =
+            vendor_config_content("vendor/apex-quant/configs/gemma4_26b_balanced.txt")
+                .unwrap();
+        // The override leaks; that's intentional for the
+        // process-wide cache. For this test we leak a fresh copy so
+        // the `&'static` lifetime is satisfied without polluting the
+        // production cache slot.
+        let mudler: &'static MudlerConfig = Box::leak(Box::new(
+            MudlerConfig::parse(content, "test/gemma4_26b_balanced.txt").unwrap(),
+        ));
+        let p = ApexPolicy::new(ApexTier::Balanced, ArchName::Gemma4, 30, 128)
+            .unwrap()
+            .with_mudler_override(mudler);
+
+        // Override wins for enumerated routed-expert tensors.
+        let exp_0 = tref("blk.0.ffn_gate_exps.weight", ArchName::Gemma4, Some(0));
+        assert_eq!(p.target_for(&exp_0).unwrap(), GgmlType::Q6_K);
+        let exp_5 = tref("blk.5.ffn_gate_exps.weight", ArchName::Gemma4, Some(5));
+        assert_eq!(p.target_for(&exp_5).unwrap(), GgmlType::Q5_K);
+
+        // Structural fall-through: router gate stays Q5_0
+        // (algorithmic hardcode; mudler doesn't enumerate it).
+        let rg = tref("blk.5.ffn_gate_inp.weight", ArchName::Gemma4, Some(5));
+        assert_eq!(p.target_for(&rg).unwrap(), GgmlType::Q5_0);
+
+        // token_embd is structural; falls through to algorithmic
+        // Q6_K hardcode.
+        let te = tref("token_embd.weight", ArchName::Gemma4, None);
+        assert_eq!(p.target_for(&te).unwrap(), GgmlType::Q6_K);
+
+        // Norms are structural; F32.
+        let nm = tref("blk.5.attn_norm.weight", ArchName::Gemma4, Some(5));
+        assert_eq!(p.target_for(&nm).unwrap(), GgmlType::F32);
     }
 }

@@ -1,0 +1,396 @@
+{
+  "_doc": "ADR-033 §9 per-model APEX fingerprint manifest. Maps a stable SHA-256 hash over a 9-tuple of HF config.json hparams (model_type, num_hidden_layers, hidden_size, num_experts, num_attention_heads, num_key_value_heads, intermediate_size, moe_intermediate_size, mtp_num_hidden_layers) to a vendored mudler/apex-quant tensor-type-file. When `convert-v2 --quant apex-<tier>` runs and detect_apex_config returns Some, the per-tensor overlay from `mudler_config_path` wins over ApexPolicy's algorithmic generator (per ADR Decision §3 + §9). Regenerated at vendor-time only; runtime is read-only. Mudler SHA pin: 63c5048b7dc9ff230f2397d7bc445ca28894b769.",
+  "_schema_version": 1,
+  "_mudler_sha": "63c5048b7dc9ff230f2397d7bc445ca28894b769",
+  "_fingerprint_fields": [
+    "model_type",
+    "num_hidden_layers",
+    "hidden_size",
+    "num_experts",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "intermediate_size",
+    "moe_intermediate_size",
+    "mtp_num_hidden_layers"
+  ],
+  "entries": [
+    {
+      "fingerprint": "79ce3481c1eaf4ebdc833b01e9e970fca7c08824c080abc0f5f735dd97c440a1",
+      "model_id_pattern": "google/gemma-4-26b-a4b-(it|pt)(-.+)?",
+      "arch": "gemma4",
+      "tier": "quality",
+      "mudler_config_path": "vendor/apex-quant/configs/gemma4_26b_quality.txt",
+      "expected_hparams": {
+        "model_type": "gemma4_text",
+        "num_hidden_layers": 30,
+        "hidden_size": 2816,
+        "num_experts": 128,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "intermediate_size": 2112,
+        "moe_intermediate_size": 704,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "79ce3481c1eaf4ebdc833b01e9e970fca7c08824c080abc0f5f735dd97c440a1",
+      "model_id_pattern": "google/gemma-4-26b-a4b-(it|pt)(-.+)?",
+      "arch": "gemma4",
+      "tier": "i-quality",
+      "mudler_config_path": "vendor/apex-quant/configs/gemma4_26b_quality.txt",
+      "expected_hparams": {
+        "model_type": "gemma4_text",
+        "num_hidden_layers": 30,
+        "hidden_size": 2816,
+        "num_experts": 128,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "intermediate_size": 2112,
+        "moe_intermediate_size": 704,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "79ce3481c1eaf4ebdc833b01e9e970fca7c08824c080abc0f5f735dd97c440a1",
+      "model_id_pattern": "google/gemma-4-26b-a4b-(it|pt)(-.+)?",
+      "arch": "gemma4",
+      "tier": "balanced",
+      "mudler_config_path": "vendor/apex-quant/configs/gemma4_26b_balanced.txt",
+      "expected_hparams": {
+        "model_type": "gemma4_text",
+        "num_hidden_layers": 30,
+        "hidden_size": 2816,
+        "num_experts": 128,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "intermediate_size": 2112,
+        "moe_intermediate_size": 704,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "79ce3481c1eaf4ebdc833b01e9e970fca7c08824c080abc0f5f735dd97c440a1",
+      "model_id_pattern": "google/gemma-4-26b-a4b-(it|pt)(-.+)?",
+      "arch": "gemma4",
+      "tier": "i-balanced",
+      "mudler_config_path": "vendor/apex-quant/configs/gemma4_26b_balanced.txt",
+      "expected_hparams": {
+        "model_type": "gemma4_text",
+        "num_hidden_layers": 30,
+        "hidden_size": 2816,
+        "num_experts": 128,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "intermediate_size": 2112,
+        "moe_intermediate_size": 704,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "79ce3481c1eaf4ebdc833b01e9e970fca7c08824c080abc0f5f735dd97c440a1",
+      "model_id_pattern": "google/gemma-4-26b-a4b-(it|pt)(-.+)?",
+      "arch": "gemma4",
+      "tier": "compact",
+      "mudler_config_path": "vendor/apex-quant/configs/gemma4_26b_compact.txt",
+      "expected_hparams": {
+        "model_type": "gemma4_text",
+        "num_hidden_layers": 30,
+        "hidden_size": 2816,
+        "num_experts": 128,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "intermediate_size": 2112,
+        "moe_intermediate_size": 704,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "79ce3481c1eaf4ebdc833b01e9e970fca7c08824c080abc0f5f735dd97c440a1",
+      "model_id_pattern": "google/gemma-4-26b-a4b-(it|pt)(-.+)?",
+      "arch": "gemma4",
+      "tier": "i-compact",
+      "mudler_config_path": "vendor/apex-quant/configs/gemma4_26b_compact.txt",
+      "expected_hparams": {
+        "model_type": "gemma4_text",
+        "num_hidden_layers": 30,
+        "hidden_size": 2816,
+        "num_experts": 128,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "intermediate_size": 2112,
+        "moe_intermediate_size": 704,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "79ce3481c1eaf4ebdc833b01e9e970fca7c08824c080abc0f5f735dd97c440a1",
+      "model_id_pattern": "google/gemma-4-26b-a4b-(it|pt)(-.+)?",
+      "arch": "gemma4",
+      "tier": "mini",
+      "mudler_config_path": "vendor/apex-quant/configs/gemma4_26b_mini.txt",
+      "expected_hparams": {
+        "model_type": "gemma4_text",
+        "num_hidden_layers": 30,
+        "hidden_size": 2816,
+        "num_experts": 128,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "intermediate_size": 2112,
+        "moe_intermediate_size": 704,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "9676b7abea7495049a8d6432a71caeac394fc7c4cbeb950b6ec0d27cd8c5c223",
+      "model_id_pattern": "Qwen/Qwen3\\.[56]-35B-A3B(-.+)?",
+      "arch": "qwen35moe",
+      "tier": "quality",
+      "mudler_config_path": "vendor/apex-quant/configs/qwen35a3b_quality.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "9676b7abea7495049a8d6432a71caeac394fc7c4cbeb950b6ec0d27cd8c5c223",
+      "model_id_pattern": "Qwen/Qwen3\\.[56]-35B-A3B(-.+)?",
+      "arch": "qwen35moe",
+      "tier": "i-quality",
+      "mudler_config_path": "vendor/apex-quant/configs/qwen35a3b_quality.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "9676b7abea7495049a8d6432a71caeac394fc7c4cbeb950b6ec0d27cd8c5c223",
+      "model_id_pattern": "Qwen/Qwen3\\.[56]-35B-A3B(-.+)?",
+      "arch": "qwen35moe",
+      "tier": "balanced",
+      "mudler_config_path": "vendor/apex-quant/configs/qwen35a3b_balanced.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "9676b7abea7495049a8d6432a71caeac394fc7c4cbeb950b6ec0d27cd8c5c223",
+      "model_id_pattern": "Qwen/Qwen3\\.[56]-35B-A3B(-.+)?",
+      "arch": "qwen35moe",
+      "tier": "i-balanced",
+      "mudler_config_path": "vendor/apex-quant/configs/qwen35a3b_balanced.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "9676b7abea7495049a8d6432a71caeac394fc7c4cbeb950b6ec0d27cd8c5c223",
+      "model_id_pattern": "Qwen/Qwen3\\.[56]-35B-A3B(-.+)?",
+      "arch": "qwen35moe",
+      "tier": "compact",
+      "mudler_config_path": "vendor/apex-quant/configs/qwen35a3b_compact.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "9676b7abea7495049a8d6432a71caeac394fc7c4cbeb950b6ec0d27cd8c5c223",
+      "model_id_pattern": "Qwen/Qwen3\\.[56]-35B-A3B(-.+)?",
+      "arch": "qwen35moe",
+      "tier": "i-compact",
+      "mudler_config_path": "vendor/apex-quant/configs/qwen35a3b_compact.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "9676b7abea7495049a8d6432a71caeac394fc7c4cbeb950b6ec0d27cd8c5c223",
+      "model_id_pattern": "Qwen/Qwen3\\.[56]-35B-A3B(-.+)?",
+      "arch": "qwen35moe",
+      "tier": "mini",
+      "mudler_config_path": "vendor/apex-quant/configs/qwen35a3b_mini.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 0
+      }
+    },
+    {
+      "fingerprint": "4d1512c7ae74ee2782901c568a6d0d848fe84dfe5f80e308863cb9ebd95919ee",
+      "model_id_pattern": "(carnice|qwen[36_]+(opus[0-9]*_distill|heretic|coder)?)[/_-]?Qwen3\\.6.*MTP.*",
+      "arch": "qwen35moe",
+      "tier": "quality",
+      "mudler_config_path": "vendor/apex-quant/configs/carnice_qwen36_mtp_quality.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 1
+      }
+    },
+    {
+      "fingerprint": "4d1512c7ae74ee2782901c568a6d0d848fe84dfe5f80e308863cb9ebd95919ee",
+      "model_id_pattern": "(carnice|qwen[36_]+(opus[0-9]*_distill|heretic|coder)?)[/_-]?Qwen3\\.6.*MTP.*",
+      "arch": "qwen35moe",
+      "tier": "i-quality",
+      "mudler_config_path": "vendor/apex-quant/configs/carnice_qwen36_mtp_quality.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 1
+      }
+    },
+    {
+      "fingerprint": "4d1512c7ae74ee2782901c568a6d0d848fe84dfe5f80e308863cb9ebd95919ee",
+      "model_id_pattern": "(carnice|qwen[36_]+(opus[0-9]*_distill|heretic|coder)?)[/_-]?Qwen3\\.6.*MTP.*",
+      "arch": "qwen35moe",
+      "tier": "balanced",
+      "mudler_config_path": "vendor/apex-quant/configs/carnice_qwen36_mtp_balanced.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 1
+      }
+    },
+    {
+      "fingerprint": "4d1512c7ae74ee2782901c568a6d0d848fe84dfe5f80e308863cb9ebd95919ee",
+      "model_id_pattern": "(carnice|qwen[36_]+(opus[0-9]*_distill|heretic|coder)?)[/_-]?Qwen3\\.6.*MTP.*",
+      "arch": "qwen35moe",
+      "tier": "i-balanced",
+      "mudler_config_path": "vendor/apex-quant/configs/carnice_qwen36_mtp_balanced.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 1
+      }
+    },
+    {
+      "fingerprint": "4d1512c7ae74ee2782901c568a6d0d848fe84dfe5f80e308863cb9ebd95919ee",
+      "model_id_pattern": "(carnice|qwen[36_]+(opus[0-9]*_distill|heretic|coder)?)[/_-]?Qwen3\\.6.*MTP.*",
+      "arch": "qwen35moe",
+      "tier": "compact",
+      "mudler_config_path": "vendor/apex-quant/configs/carnice_qwen36_mtp_compact.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 1
+      }
+    },
+    {
+      "fingerprint": "4d1512c7ae74ee2782901c568a6d0d848fe84dfe5f80e308863cb9ebd95919ee",
+      "model_id_pattern": "(carnice|qwen[36_]+(opus[0-9]*_distill|heretic|coder)?)[/_-]?Qwen3\\.6.*MTP.*",
+      "arch": "qwen35moe",
+      "tier": "i-compact",
+      "mudler_config_path": "vendor/apex-quant/configs/carnice_qwen36_mtp_compact.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 1
+      }
+    },
+    {
+      "fingerprint": "4d1512c7ae74ee2782901c568a6d0d848fe84dfe5f80e308863cb9ebd95919ee",
+      "model_id_pattern": "(carnice|qwen[36_]+(opus[0-9]*_distill|heretic|coder)?)[/_-]?Qwen3\\.6.*MTP.*",
+      "arch": "qwen35moe",
+      "tier": "mini",
+      "mudler_config_path": "vendor/apex-quant/configs/carnice_qwen36_mtp_mini.txt",
+      "expected_hparams": {
+        "model_type": "qwen3_5_moe_text",
+        "num_hidden_layers": 40,
+        "hidden_size": 2048,
+        "num_experts": 256,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 2,
+        "intermediate_size": 0,
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 1
+      }
+    }
+  ]
+}

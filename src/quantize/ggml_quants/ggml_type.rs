@@ -174,6 +174,60 @@ impl GgmlType {
             GgmlType::MXFP4 => "mxfp4",
         }
     }
+
+    /// Case-insensitive parse of a `GgmlType` name.
+    ///
+    /// Accepts the canonical lowercase tokens from [`Self::name`] AND
+    /// the uppercase variants emitted by `mudler/apex-quant`'s
+    /// `configs/<model>_<tier>.txt` files (e.g. `Q5_K`, `Q6_K`, `Q8_0`).
+    /// Used by the ADR-033 §9 mudler-config parser to lift the vendored
+    /// per-tensor overlay into typed `GgmlType` values.
+    ///
+    /// Returns `None` for unknown strings; the caller (mudler parser)
+    /// surfaces those as typed `ApexError::MudlerConfigParse`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        // ASCII lowercase fold — every token we accept is ASCII; avoid
+        // a `String` allocation for the common case.
+        let mut buf = [0u8; 16];
+        let bytes = name.as_bytes();
+        if bytes.len() > buf.len() {
+            return None;
+        }
+        for (i, &b) in bytes.iter().enumerate() {
+            buf[i] = b.to_ascii_lowercase();
+        }
+        let lower = std::str::from_utf8(&buf[..bytes.len()]).ok()?;
+        Some(match lower {
+            "f32" => GgmlType::F32,
+            "f16" => GgmlType::F16,
+            "bf16" => GgmlType::BF16,
+            "q4_0" => GgmlType::Q4_0,
+            "q4_1" => GgmlType::Q4_1,
+            "q5_0" => GgmlType::Q5_0,
+            "q5_1" => GgmlType::Q5_1,
+            "q8_0" => GgmlType::Q8_0,
+            "q8_1" => GgmlType::Q8_1,
+            "iq4_nl" => GgmlType::IQ4_NL,
+            "q2_k" => GgmlType::Q2_K,
+            "q3_k" => GgmlType::Q3_K,
+            "q4_k" => GgmlType::Q4_K,
+            "q5_k" => GgmlType::Q5_K,
+            "q6_k" => GgmlType::Q6_K,
+            "q8_k" => GgmlType::Q8_K,
+            "iq2_xxs" => GgmlType::IQ2_XXS,
+            "iq2_xs" => GgmlType::IQ2_XS,
+            "iq3_xxs" => GgmlType::IQ3_XXS,
+            "iq1_s" => GgmlType::IQ1_S,
+            "iq3_s" => GgmlType::IQ3_S,
+            "iq2_s" => GgmlType::IQ2_S,
+            "iq4_xs" => GgmlType::IQ4_XS,
+            "iq1_m" => GgmlType::IQ1_M,
+            "tq1_0" => GgmlType::TQ1_0,
+            "tq2_0" => GgmlType::TQ2_0,
+            "mxfp4" => GgmlType::MXFP4,
+            _ => return None,
+        })
+    }
 }
 
 impl TryFrom<u32> for GgmlType {
@@ -278,6 +332,33 @@ mod tests {
         assert_eq!(GgmlType::Q4_0.row_size(64), 36);
         // 32 elements at Q5_0 = 1 block × 22 bytes
         assert_eq!(GgmlType::Q5_0.row_size(32), 22);
+    }
+
+    /// Mudler's `configs/<model>_<tier>.txt` files mix lowercase
+    /// (`q5_K`, `iq4_xs`) and uppercase (`Q5_K`, `Q8_0`) variants for
+    /// the same logical type. `from_name` MUST fold both to the same
+    /// `GgmlType`. Used by the ADR-033 §9 mudler-config parser.
+    #[test]
+    fn from_name_case_insensitive_for_mudler_configs() {
+        // Canonical lowercase set.
+        assert_eq!(GgmlType::from_name("q5_k"), Some(GgmlType::Q5_K));
+        assert_eq!(GgmlType::from_name("q6_k"), Some(GgmlType::Q6_K));
+        assert_eq!(GgmlType::from_name("q8_0"), Some(GgmlType::Q8_0));
+        assert_eq!(GgmlType::from_name("iq4_xs"), Some(GgmlType::IQ4_XS));
+        assert_eq!(GgmlType::from_name("iq2_s"), Some(GgmlType::IQ2_S));
+
+        // Mixed-case as emitted by vendor configs.
+        assert_eq!(GgmlType::from_name("Q5_K"), Some(GgmlType::Q5_K));
+        assert_eq!(GgmlType::from_name("Q6_K"), Some(GgmlType::Q6_K));
+        assert_eq!(GgmlType::from_name("Q8_0"), Some(GgmlType::Q8_0));
+        assert_eq!(GgmlType::from_name("q5_K"), Some(GgmlType::Q5_K));
+
+        // Unknown tokens surface as None.
+        assert_eq!(GgmlType::from_name("notatype"), None);
+        assert_eq!(GgmlType::from_name(""), None);
+        // Over-length input (would overflow the 16-byte scratch buffer)
+        // returns None instead of panicking.
+        assert_eq!(GgmlType::from_name("very_long_unknown_type_name"), None);
     }
 
     #[test]

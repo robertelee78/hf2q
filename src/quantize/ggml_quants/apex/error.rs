@@ -96,6 +96,58 @@ pub enum ApexError {
         layer_index: usize,
         n_layers: u32,
     },
+
+    /// ADR-033 §9: the manifest matched the source model's
+    /// fingerprint, but the referenced `mudler_config_path` is not
+    /// present in the compile-time vendor-content bake
+    /// (`fingerprint::VENDOR_CONFIGS`). Hard error per the
+    /// no-silent-fallback rule — a matched fingerprint MUST resolve
+    /// to a usable config, else the operator's manifest is
+    /// inconsistent with the baked vendor surface.
+    ///
+    /// In practice this fires only if a vendor regen updates the
+    /// manifest JSON without also updating the `include_str!` table
+    /// in `fingerprint.rs`. The unit test
+    /// `every_manifest_entry_has_baked_vendor_content` catches it at
+    /// build time.
+    #[error(
+        "ADR-033 §9: manifest matched fingerprint `{fingerprint}` → \
+         `{mudler_config_path}`, but that config is not in the \
+         compile-time vendor bake; add it to fingerprint::VENDOR_CONFIGS"
+    )]
+    FingerprintConfigMissing {
+        fingerprint: String,
+        mudler_config_path: String,
+    },
+
+    /// A mudler config file failed to parse — either a malformed
+    /// line (missing `=`) or an unknown `GgmlType` token. Carries the
+    /// source-relative line number for easy bisection.
+    #[error(
+        "mudler config parse error at {source_path}:{line_number}: {detail}"
+    )]
+    MudlerConfigParse {
+        source_path: String,
+        line_number: usize,
+        detail: String,
+    },
+
+    /// ADR-033 §9 + the no-silent-fallback rule: a fingerprint match
+    /// resolved to a mudler per-model config, but the tensor name
+    /// hasn't been assigned a `GgmlType` in that config. We do NOT
+    /// silently fall back to the algorithmic generator — per ADR
+    /// "the vendored config's rules win over the algorithmic
+    /// generator's output". A missing tensor surfaces as this typed
+    /// error so the operator can fix the manifest (add the tensor) or
+    /// switch off the per-model override.
+    #[error(
+        "tensor `{tensor_name}` not present in mudler config {source_path}; \
+         per-model override is authoritative (no silent fallback to algorithmic generator)"
+    )]
+    TensorNotInMudlerConfig {
+        source_path: String,
+        tensor_name: String,
+    },
 }
 
 impl ApexError {

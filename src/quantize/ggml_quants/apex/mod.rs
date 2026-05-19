@@ -18,10 +18,12 @@
 //!     generator** path only.
 //!
 //! Module layout:
-//!   - `rules`   — per-tier 7-tuples + layer-region partitioning
-//!   - `arches`  — MoE tensor-name classifier + supported-arch gate
-//!   - `policy`  — `ApexPolicy::target_for` (the QuantPolicy entry point)
-//!   - `error`   — `ApexError` typed error taxonomy
+//!   - `rules`            — per-tier 7-tuples + layer-region partitioning
+//!   - `arches`           — MoE tensor-name classifier + supported-arch gate
+//!   - `policy`           — `ApexPolicy::target_for` (the QuantPolicy entry point)
+//!   - `error`            — `ApexError` typed error taxonomy
+//!   - `fingerprint`      — ADR §9 per-model manifest + SHA-256 dispatch
+//!   - `mudler_config`    — ADR §9 mudler tensor-type-file parser
 //!
 //! Per [[feedback-no-loop-suppression-2026-05-17]]: every failure path
 //! returns a typed `ApexError` — no silent F16 escape, no implicit
@@ -31,6 +33,8 @@
 
 pub mod arches;
 pub mod error;
+pub mod fingerprint;
+pub mod mudler_config;
 pub mod policy;
 pub mod rules;
 
@@ -39,6 +43,8 @@ pub use arches::{
     classify_moe_tensor, is_apex_supported_arch, MoeTensorRole, SUPPORTED_APEX_ARCHES,
 };
 pub use error::ApexError;
+pub use fingerprint::{detect_apex_config, ApexConfigRef, FingerprintHParams};
+pub use mudler_config::{load_mudler_config, MudlerConfig};
 pub use policy::ApexPolicy;
 pub use rules::{
     attn_region, exp_region, shared_region, tier_rules, ApexTier, AttnRegion, ExpRegion,

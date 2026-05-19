@@ -44,7 +44,9 @@ use crate::convert::{
     build_tokenizer_metadata, ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError,
 };
 use crate::quantize::ggml_quants::SourceDtype;
-use crate::quantize::ggml_quants::apex::{ApexError, ApexPolicy};
+use crate::quantize::ggml_quants::apex::{
+    detect_apex_config, load_mudler_config, ApexError, ApexPolicy, FingerprintHParams,
+};
 use crate::quantize::ggml_quants::standard_policy::HParams;
 use crate::quantize::ggml_quants::ArchName;
 
@@ -308,7 +310,33 @@ pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
             let n_layers = config_n_layers(&src.config)
                 .ok_or(ConvertV2Error::ApexMissingLayerCount)?;
             let n_expert = hparams.n_expert;
-            let apex_policy = ApexPolicy::new(*tier, arch, n_layers, n_expert)?;
+            let mut apex_policy = ApexPolicy::new(*tier, arch, n_layers, n_expert)?;
+            // ADR-033 §9 — per-model APEX config override.
+            //
+            // Hash the source config.json's 9-tuple of identifying
+            // hparams; if it matches a vendored mudler config in
+            // `data/apex-references/manifest.json`, attach the
+            // per-tensor overlay to the policy. The override wins
+            // over the algorithmic generator silently (per ADR §9
+            // line 104 "fingerprint match is invisible to the
+            // user"), but we log the match to stderr so the operator
+            // can audit which config fired — mitigates the
+            // "surprising override" risk called out in the ADR.
+            let effective = effective_config(&src.config);
+            if let Some(fp_hparams) = FingerprintHParams::from_config(effective) {
+                if let Some(entry) = detect_apex_config(&fp_hparams, *tier) {
+                    let mudler = load_mudler_config(entry)?;
+                    apex_policy = apex_policy.with_mudler_override(mudler);
+                    eprintln!(
+                        "[hf2q apex] auto-detected APEX config: {} \
+                         (fingerprint={}, tier={}, arch={})",
+                        entry.mudler_config_path,
+                        &entry.fingerprint[..16],
+                        entry.tier,
+                        entry.arch,
+                    );
+                }
+            }
             let ftype = approximate_for_apex(*tier);
             let orch = ConvertOrchestrator::new_with_apex(ftype, arch, hparams, apex_policy);
             (orch, ftype)
