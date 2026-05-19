@@ -3,6 +3,16 @@
 //! Implements the GGUF v3 binary format directly using standard Rust I/O.
 //! Handles HF-to-GGUF tensor name mapping, GGML dtype selection, and metadata encoding.
 
+// ADR-033 §P2 — submodule scaffolding for the seek-back writer that
+// replaces the two-pass writer slice in THIS file. The submodules live
+// under `src/backends/gguf/` (writer.rs + types.rs); P6 deletes this
+// file in its entirety, at which point `src/backends/gguf/mod.rs`
+// becomes the module root. Until then both coexist — the legacy
+// two-pass writer in this file stays load-bearing for in-tree callers,
+// and the new code is callable as `crate::backends::gguf::writer::GgufWriter`.
+pub mod types;
+pub mod writer;
+
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write as IoWrite};
 use std::path::Path;
