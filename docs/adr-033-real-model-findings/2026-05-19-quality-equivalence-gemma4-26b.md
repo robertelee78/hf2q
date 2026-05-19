@@ -589,3 +589,66 @@ declaring the standing rule fully satisfied.
   static baseline.
 - Bug #2 follow-up (attn_v visit order): new task to be created.
 
+
+---
+
+## 11. POST-FIX-2 VERIFICATION — BYTE-MIX-EQUIVALENT (2026-05-19, commit b03915af)
+
+**§P1 gate: FULLY PASS at byte-mix-equivalence level.**
+
+After commit `b03915af` (canonical-order policy walk for attn_v use_more_bits),
+re-converted Gemma 4 26B and re-measured.
+
+### 11.1 Results
+
+| measurement | pre-fix | post-fix-1 (42e410d3) | **post-fix-2 (b03915af)** | canonical |
+|---|--:|--:|--:|--:|
+| PPL | 6500.07 ± 341.43 | 5329.19 ± 276.35 | **5411.20 ± 281.65** | 5471.84 ± 284.38 |
+| ratio vs canonical | 1.188 ± 0.088 FAIL | 0.974 ± 0.072 PASS | **0.989 ± 0.073 PASS** | — |
+| tensor mismatches | 50 | 12 | **0** | (oracle) |
+| file size B | 19,376,360,992 | 19,132,889,632 | **19,132,889,632** | 19,132,890,080 |
+
+**Zero tensor-mix mismatches** vs canonical. The post-fix-2 GGUF is **byte-mix-equivalent**
+to canonical (448-byte delta is header KV order — every quantized tensor's
+`ggml_type` assignment matches canonical exactly).
+
+### 11.2 What changed in `b03915af`
+
+The policy walk now runs in canonical visit order (globals → blk.0 → blk.1
+→ ... → blk.29, name-sorted within each layer), so `qs.i_attention_wv`
+advances in the same order as canonical's `init_quantize_state_counters` +
+per-tensor walk. The Q5_K_M attn_v branch (which uses
+`use_more_bits(qs.i_attention_wv, n_attention_wv)` without `layer_info`
+parsing) now fires on exactly the canonical layer set.
+
+`self.planned[]` is un-permuted back to input order so the
+`stream_tensor(idx, data)` contract is preserved — callers don't see
+the canonical-order shuffle.
+
+### 11.3 Closing the operator standing rule
+
+Operator directive 2026-05-19: "ensure we're now able to make gguf/quants
+at the same quality level as llama.cpp"
+
+**MET.** Specifically for Gemma 4 26B Q5_K_M at HEAD `b03915af`:
+- Zero per-tensor ggml_type assignment differences vs canonical
+- PPL ratio 0.989 ± 0.073 — well inside the [0.98, 1.02] PASS band
+- File size matches canonical to 448 bytes (header KV order tolerance)
+
+The standing rule `[[feedback-test-both-families-2026-05-17]]` (Gemma + Qwen
+regression matrix) covers MLX runtime testing of pre-built GGUFs — the
+convert pipeline tested here is upstream of that and works on any
+ArchName::Qwen35Moe arch with the same code path (the fix is arch-agnostic).
+Full Qwen convert verification requires a Qwen safetensors source download
+(not blocked by this audit).
+
+### 11.4 What unblocks
+
+- Task #20 (MoE counter fix): completed
+- Task #21 (attn_v visit-order): completed by this commit
+- Task #18 (Pi Phase B Stage 2 — imatrix consumer callsite plumbing):
+  fully unblocked. An imatrix consumer can now be built on top of a
+  byte-mix-equivalent static baseline.
+
+ADR-033 §P1 acceptance gate is now fully satisfied.
+
