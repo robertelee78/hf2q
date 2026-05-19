@@ -64,3 +64,6 @@ iter*_audit.json
 # the matrix report is per-run output.
 tests/fixtures/vision/*.png
 tests/fixtures/vision/last_e2e_report.json
+
+# ADR-033 P6: temporary byte-cmp output (large quantized GGUFs)
+/tmp/

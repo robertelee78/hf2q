@@ -611,26 +611,27 @@ fn run_q4_0_pipeline(
 ///    per Decision 18 / commit 18cbaaa.
 fn build_convert_args(
     args: &SmokeArgs,
-    entry: &ArchEntry,
+    _entry: &ArchEntry,
     input_dir: &Path,
     gguf_path: &Path,
 ) -> Result<Vec<String>, String> {
-    let mut convert_args: Vec<String> = vec![
-        "convert".into(),
-        "--input".into(),
+    // ADR-033 P6: smoke harness drives the unified `convert-v2` surface.
+    // ConvertV2's surface is narrower than the legacy `convert`: positional
+    // `hf_dir`, `--quant`, `-o` only. Legacy axes (`--yes`, `--skip-quality`,
+    // `--format gguf`, `--emit-vision-tower`) are gone — convert-v2 is
+    // GGUF-only, non-interactive by default, and emits the mmproj sidecar
+    // automatically when the source `config.json` carries a `vision_config`
+    // (`src/convert/arch/gemma4_mmproj.rs`). `_entry.has_vision` is therefore
+    // unused at the smoke-arg layer — the convert-v2 pipeline does its own
+    // arch-driven decision.
+    let convert_args: Vec<String> = vec![
+        "convert-v2".into(),
         input_dir.to_str().ok_or("input_dir not UTF-8")?.into(),
-        "--format".into(),
-        "gguf".into(),
         "--quant".into(),
         args.quant.clone(),
-        "--output".into(),
+        "-o".into(),
         gguf_path.to_str().ok_or("gguf_path not UTF-8")?.into(),
-        "--yes".into(),
-        "--skip-quality".into(),
     ];
-    if args.with_vision && entry.has_vision {
-        convert_args.push("--emit-vision-tower".into());
-    }
     Ok(convert_args)
 }
 
@@ -1360,11 +1361,57 @@ mod tests {
         );
     }
 
-    /// `--with-vision` + `entry.has_vision` ⇒ `--emit-vision-tower`
-    /// is in the convert args. Locks Decision 16 §CLI's documented
-    /// `[--with-vision]` flag wiring.
+    /// ADR-033 P6: smoke harness drives `hf2q convert-v2` with the
+    /// narrower surface (positional `hf_dir`, `--quant`, `-o` only).
+    /// The mmproj sidecar emission decision moved into convert-v2's
+    /// arch-driven layer (`src/convert/arch/gemma4_mmproj.rs`), so the
+    /// smoke harness no longer wires `--emit-vision-tower` at the argv
+    /// layer — the legacy `--with-vision` smoke flag is now a no-op
+    /// at the argv layer; arch detection inside convert-v2 owns the
+    /// decision.
     #[test]
-    fn build_convert_args_with_vision_appends_emit_vision_tower() {
+    fn build_convert_args_uses_convert_v2_surface() {
+        let args = args_for("qwen35", "q4_0");
+        let entry = ArchRegistry::global().get("qwen35").unwrap();
+        let convert_args = build_convert_args(
+            &args,
+            entry,
+            Path::new("/in"),
+            Path::new("/out.gguf"),
+        )
+        .unwrap();
+        assert_eq!(
+            convert_args.first().map(|s| s.as_str()),
+            Some("convert-v2"),
+            "smoke harness must invoke `hf2q convert-v2` (ADR-033 P6); got {:?}",
+            convert_args
+        );
+        assert!(
+            convert_args.iter().any(|a| a == "--quant"),
+            "convert-v2 invocation must pass --quant; got {:?}",
+            convert_args
+        );
+        assert!(
+            convert_args.iter().any(|a| a == "-o"),
+            "convert-v2 invocation must pass -o; got {:?}",
+            convert_args
+        );
+        // Legacy axes must be absent — they don't exist on convert-v2.
+        for legacy in ["--emit-vision-tower", "--yes", "--skip-quality", "--format", "--input"] {
+            assert!(
+                !convert_args.iter().any(|a| a == legacy),
+                "{legacy} is a legacy convert axis that must not appear post-P6; got {:?}",
+                convert_args
+            );
+        }
+    }
+
+    /// ADR-033 P6: `--with-vision` is accepted on the smoke surface for
+    /// CLI-compat but no longer changes the argv (arch-driven decision
+    /// moved inside convert-v2). Locks the no-op behaviour so a future
+    /// refactor can't accidentally regress to `--emit-vision-tower`.
+    #[test]
+    fn build_convert_args_with_vision_does_not_alter_argv() {
         let mut args = args_for("qwen35", "q4_0");
         args.with_vision = true;
         let entry = ArchRegistry::global().get("qwen35").unwrap();
@@ -1376,58 +1423,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            convert_args.iter().any(|a| a == "--emit-vision-tower"),
-            "must include --emit-vision-tower; got {:?}",
-            convert_args
-        );
-    }
-
-    /// `--with-vision` is FALSE ⇒ no `--emit-vision-tower` in convert
-    /// args. The default-off path stays untouched.
-    #[test]
-    fn build_convert_args_without_with_vision_omits_emit_vision_tower() {
-        let args = args_for("qwen35", "q4_0");
-        // with_vision defaults false in args_for.
-        assert!(!args.with_vision);
-        let entry = ArchRegistry::global().get("qwen35").unwrap();
-        let convert_args = build_convert_args(
-            &args,
-            entry,
-            Path::new("/in"),
-            Path::new("/out.gguf"),
-        )
-        .unwrap();
-        assert!(
             !convert_args.iter().any(|a| a == "--emit-vision-tower"),
-            "must NOT include --emit-vision-tower when with_vision=false; got {:?}",
-            convert_args
-        );
-    }
-
-    /// `--with-vision` set BUT arch has `has_vision=false` ⇒ flag is
-    /// suppressed. Catches a future mistake where the smoke harness
-    /// passes --emit-vision-tower against an arch (e.g. qwen35moe)
-    /// whose checkpoints don't ship a vision_config — Decision 16
-    /// §CLI: the `--with-vision` flag is honored only when the arch
-    /// actually has a vision-tower path.
-    #[test]
-    fn build_convert_args_arch_without_vision_suppresses_flag_even_if_user_asked() {
-        let mut args = args_for("qwen35moe", "q4_0");
-        args.with_vision = true;
-        let entry = ArchRegistry::global().get("qwen35moe").unwrap();
-        // qwen35moe's entry has has_vision=false (Robert's MoE target
-        // dropped vision_config — see qwen35moe.rs:226).
-        assert!(!entry.has_vision);
-        let convert_args = build_convert_args(
-            &args,
-            entry,
-            Path::new("/in"),
-            Path::new("/out.gguf"),
-        )
-        .unwrap();
-        assert!(
-            !convert_args.iter().any(|a| a == "--emit-vision-tower"),
-            "qwen35moe must NOT request --emit-vision-tower even when user passes --with-vision; got {:?}",
+            "convert-v2 has no --emit-vision-tower flag; got {:?}",
             convert_args
         );
     }

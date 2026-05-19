@@ -273,11 +273,10 @@ impl MlxAffineLinear {
     /// Errors if `k` is not a multiple of the Q4_0 block size (32) —
     /// the same alignment requirement that `quantize_row_q4_0` enforces.
     pub fn q4_0_round_trip_drift(&self) -> Result<RoundTripDrift> {
-        use crate::quantize::q_legacy::{
-            dequantize_row_q4_0_bytes, quantize_row_q4_0_to_bytes,
-        };
+        use crate::quantize::ggml_quants::q4_0::{quantize as q4_0_quantize, BLOCK_BYTES as Q4_0_BLOCK_BYTES, QK4_0};
+        use half::f16;
 
-        let qk = 32usize; // QK4_0 block size — production Q4_0 codec constant.
+        let qk = QK4_0; // 32 — production Q4_0 codec constant.
         if self.k % qk != 0 {
             return Err(anyhow!(
                 "q4_0_round_trip_drift: k={} not a multiple of Q4_0 block size {}",
@@ -294,14 +293,28 @@ impl MlxAffineLinear {
 
         // Per-row Q4_0 round-trip — production codec is row-aligned to
         // QK4_0.  For each row of length k we quantize → bytes → dequant
-        // and accumulate drift.
+        // and accumulate drift. The dequantize is a trivial unpack of the
+        // 18-byte block (2-byte f16 scale + 16-byte nibble payload), so
+        // we inline it here rather than re-introducing a legacy helper.
         let mut w_rt_row = vec![0f32; self.k];
         for i in 0..self.n {
             let row = &w_dwq[i * self.k..(i + 1) * self.k];
-            let q4_0_bytes = quantize_row_q4_0_to_bytes(row)
-                .map_err(|e| anyhow!("quantize_row_q4_0_to_bytes row={i}: {e:?}"))?;
-            let _ = dequantize_row_q4_0_bytes(&q4_0_bytes, &mut w_rt_row)
-                .map_err(|e| anyhow!("dequantize_row_q4_0_bytes row={i}: {e:?}"))?;
+            let q4_0_bytes = q4_0_quantize(row, self.k, None);
+            // Dequantize each block: bytes = [d_lo, d_hi, qs_0..qs_15].
+            // For j ∈ [0, qk/2): y[j] = ((qs[j] & 0xF) - 8) × d
+            //                   y[j + qk/2] = ((qs[j] >> 4) - 8) × d
+            let nb = self.k / qk;
+            for b in 0..nb {
+                let blk = &q4_0_bytes[b * Q4_0_BLOCK_BYTES..(b + 1) * Q4_0_BLOCK_BYTES];
+                let d = f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                let qs = &blk[2..2 + qk / 2];
+                for j in 0..(qk / 2) {
+                    let x0 = ((qs[j] & 0x0F) as i32 - 8) as f32;
+                    let x1 = ((qs[j] >> 4) as i32 - 8) as f32;
+                    w_rt_row[b * qk + j] = x0 * d;
+                    w_rt_row[b * qk + j + qk / 2] = x1 * d;
+                }
+            }
             for j in 0..self.k {
                 let signal = row[j];
                 let drift = (signal - w_rt_row[j]).abs();

@@ -29,7 +29,7 @@
 
 use half::f16;
 
-use crate::quantize::k_quant::make_qx_quants;
+use super::common::make_qx_quants;
 
 pub const QK5_0: usize = 32;
 pub const BLOCK_BYTES: usize = 2 + 4 + QK5_0 / 2; // 22
@@ -169,7 +169,7 @@ fn quantize_row_impl(x: &[f32], qw: &[f32], out: &mut Vec<u8>) {
             weight[j] = qwb[j] * (sigma2 + xb[j] * xb[j]).sqrt();
         }
 
-        let d = make_qx_quants(QK5_0, 16, xb, &mut l, 1, Some(&weight));
+        let d = make_qx_quants(QK5_0, 16, xb, &mut l, 1, &weight);
 
         let d_f16 = f16::from_f32(d);
         out.extend_from_slice(&d_f16.to_le_bytes());
