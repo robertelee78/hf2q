@@ -711,7 +711,21 @@ mod tests {
         // Walk every tensor enumerated in the mudler config + a
         // representative structural-fall-through set. For each, the
         // I and non-I policies must produce identical output.
-        let mut probed_enumerated: usize = 0;
+        //
+        // Pin the exact enumerated count (not a `>= floor`) so an
+        // upstream vendor-sync that shrinks OR grows the fixture by
+        // even one entry is surfaced. The proof rests on the closed
+        // fixture; drift must be reviewed, not silently absorbed.
+        const EXPECTED_ENUMERATED_COUNT: usize = 450;
+        assert_eq!(
+            mudler.map.len(),
+            EXPECTED_ENUMERATED_COUNT,
+            "§P4b override-equivalence fixture drift: gemma4_26b_balanced.txt \
+             now enumerates {} tensors (was {EXPECTED_ENUMERATED_COUNT}). If \
+             the upstream vendor sync intentionally changed the surface, update \
+             this constant + ADR-033 §P4b at the same commit.",
+            mudler.map.len(),
+        );
         for (name, _expected) in mudler.map.iter() {
             let canonical_name = format!("{name}.weight");
             let layer_index = canonical_name
@@ -735,15 +749,7 @@ mod tests {
                  be tier-independent (see policy.rs:277-310). Update both \
                  the override branch and this test at the same commit.",
             );
-            probed_enumerated += 1;
         }
-        assert!(
-            probed_enumerated >= 50,
-            "§P4b override-equivalence probed only {probed_enumerated} enumerated \
-             tensors; gemma4_26b_balanced.txt is expected to enumerate ≥50 (per-layer \
-             attn/exps/shexp). If the vendored file shrank intentionally, lower the \
-             floor; if it shrank unexpectedly, the upstream vendor sync regressed."
-        );
 
         // Structural fall-through arms: must produce IDENTICAL output
         // on I and non-I sibling policies. Hard-coded set covers
@@ -773,6 +779,58 @@ mod tests {
                  produced non-I={a:?}, I={b:?} — fall-through arms in \
                  policy.rs must stay tier-independent.",
             );
+        }
+
+        // Strict override-miss error branch (policy.rs:297-309): when
+        // a non-structural-role tensor is queried but not in the
+        // override map, both I and non-I must surface
+        // `TensorNotInMudlerConfig` with the same source_path +
+        // tensor_name. Crafted out-of-range names: gemma4_26b config
+        // enumerates blk.0..29; blk.99.* sits outside.
+        //
+        // Per codex review on commit 0acde511: the previous test
+        // covered only `Ok(_)` parity; the error branch needs the
+        // same equivalence to discharge the §P4b proof for the
+        // override-miss path.
+        for name in [
+            "blk.99.ffn_gate_exps.weight",   // RoutedExpert
+            "blk.99.ffn_gate_shexp.weight",  // SharedExpert
+            "blk.99.attn_q.weight",          // Attention
+        ] {
+            let shape = [4096usize, 1];
+            let tref = TensorRef {
+                name,
+                shape: &shape,
+                source_dtype: SourceDtype::BF16,
+                arch: ArchName::Gemma4,
+                layer_index: Some(99),
+            };
+            let a_res = non_i.target_for(&tref);
+            let b_res = i.target_for(&tref);
+            match (&a_res, &b_res) {
+                (Err(ApexError::TensorNotInMudlerConfig {
+                    source_path: a_path,
+                    tensor_name: a_name,
+                }), Err(ApexError::TensorNotInMudlerConfig {
+                    source_path: b_path,
+                    tensor_name: b_name,
+                })) => {
+                    assert_eq!(
+                        a_path, b_path,
+                        "§P4b override-miss source_path drift: non-I={a_path}, I={b_path}",
+                    );
+                    assert_eq!(
+                        a_name, b_name,
+                        "§P4b override-miss tensor_name drift: non-I={a_name}, I={b_name}",
+                    );
+                }
+                _ => panic!(
+                    "§P4b override-miss expected TensorNotInMudlerConfig from both \
+                     siblings for `{name}` — non-I={a_res:?}, I={b_res:?}. If the \
+                     enumerated arms changed semantics, update both this assertion \
+                     and ADR-033 §P4b at the same commit."
+                ),
+            }
         }
     }
 
