@@ -29,6 +29,7 @@ use crate::backends::gguf::types::MetaValue;
 use crate::convert::arch::{
     bert, gemma4, gemma4_mmproj, llama3, minimax_m2, nomic_bert, qwen35moe, qwen3vl_text,
 };
+use crate::convert::arch::gemma4::MappedTensor as Gemma4Mapped;
 use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped};
 use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
 use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
@@ -292,7 +293,19 @@ pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
     };
 
     // ----- 4-5. Map + stage every tensor (with MoE expert fusion) ---------
-    stage_tensors(&mut orch, arch, &src.tensors, &src.config)?;
+    //
+    // Some arches require tensors that are NOT in the safetensors but
+    // ARE part of the canonical GGUF (e.g. Gemma 4's `rope_freqs.weight`
+    // proportional-rope mask, synthesized at convert time per
+    // `gemma.py::Gemma4Model::generate_extra_tensors`). We compute them
+    // here and append to the source list BEFORE the staging loop so they
+    // flow through the same map/stage path as on-disk tensors (the
+    // gemma4 mapper recognizes `rope_freqs.weight` via the
+    // `Direct(s) → push_direct` path, and the orchestrator's F32-keep
+    // gate emits them raw — see `is_f32_keep_tensor`).
+    let mut hf_tensors: Vec<HfTensor> = src.tensors;
+    hf_tensors.extend(synthesized_tensors_for_arch(arch, &src.config));
+    stage_tensors(&mut orch, arch, &hf_tensors, &src.config)?;
 
     // ----- 6. Emit metadata -------------------------------------------------
     let ftype_u32 = ftype_for_metadata as u32;
@@ -478,6 +491,31 @@ fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertV2Error> 
 // Per-arch dispatchers (map_tensor_name + build_metadata)
 // ============================================================================
 
+/// Per-arch synthesized-tensor dispatcher.
+///
+/// Returns the list of `HfTensor`s that need to be appended to the
+/// safetensors-derived tensor list before staging. Currently only
+/// Gemma 4 has synthesized tensors (the `rope_freqs.weight`
+/// proportional-rope mask — `gemma.py:702-718`).
+///
+/// The synthesized tensors are pushed through the SAME mapping +
+/// staging path as on-disk tensors: the per-arch mapper must recognize
+/// the synthesized tensor's name and the orchestrator's F32-keep gate
+/// (`orchestrator::is_f32_keep_tensor`) must emit them raw.
+fn synthesized_tensors_for_arch(
+    arch: ArchName,
+    config: &serde_json::Value,
+) -> Vec<HfTensor> {
+    let config = effective_config(config);
+    match arch {
+        ArchName::Gemma4 => gemma4::build_synthesized_tensors(config),
+        // Other arches have no synthesized tensors at v1 (Qwen3MoE,
+        // MiniMaxM2, Llama3, Bert, NomicBert, Qwen3VlText, Gemma4Mmproj
+        // — all read every tensor straight from safetensors).
+        _ => Vec::new(),
+    }
+}
+
 /// Per-arch `build_metadata` dispatcher.
 ///
 /// Gemma4Mmproj's mapper takes a `vision_config` sub-object rather
@@ -545,10 +583,7 @@ fn map_tensor(arch: ArchName, hf_name: &str) -> MapOutcome {
             Some(s) => MapOutcome::Direct(s),
             None => MapOutcome::Unmapped,
         },
-        ArchName::Gemma4 => match gemma4::map_tensor_name(hf_name) {
-            Some(s) => MapOutcome::Direct(s),
-            None => MapOutcome::Unmapped,
-        },
+        ArchName::Gemma4 => lift_gemma4_mapped(gemma4::map_tensor_name(hf_name)),
         ArchName::Gemma4Mmproj => match gemma4_mmproj::map_tensor_name(hf_name) {
             Some(s) => MapOutcome::Direct(s),
             None => MapOutcome::Unmapped,
@@ -568,6 +603,27 @@ fn map_tensor(arch: ArchName, hf_name: &str) -> MapOutcome {
         ArchName::Qwen35Moe => lift_qwen_mapped(qwen35moe::map_tensor_name(hf_name)),
         ArchName::MiniMaxM2 => lift_minimax_mapped(minimax_m2::map_tensor_name(hf_name)),
         ArchName::Falcon => MapOutcome::Unmapped,
+    }
+}
+
+/// Adapt the Gemma 4 mapper's `MappedTensor` shape (`Direct` /
+/// `Drop`) to the unified driver `MapOutcome`. Gemma 4 needs the `Drop`
+/// variant because its safetensors contain vision/audio sidecar
+/// tensors (`model.vision_tower.*`, `model.embed_vision.*`, etc.) that
+/// the per-arch mapper signs off as off-path for the text-decoder GGUF;
+/// the dense `Option<String>` shape can't express that distinction
+/// without conflating it with "unmapped tensor = bug".
+///
+/// Surfaced 2026-05-18 by the real-model finding at
+/// `docs/adr-033-real-model-findings/2026-05-18-gemma4-arch-mismatch.md`
+/// — the operator's google-gemma-4-26b-a4b-it ships 220+ vision-tower
+/// tensors alongside the text decoder, and the convert-v2 driver must
+/// silently route those to the mmproj sidecar instead of erroring.
+fn lift_gemma4_mapped(m: Option<Gemma4Mapped>) -> MapOutcome {
+    match m {
+        Some(Gemma4Mapped::Direct(s)) => MapOutcome::Direct(s),
+        Some(Gemma4Mapped::Drop) => MapOutcome::Drop,
+        None => MapOutcome::Unmapped,
     }
 }
 

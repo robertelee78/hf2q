@@ -513,3 +513,420 @@ fn convert_v2_apex_balanced_tiny_qwen35moe_round_trip() {
         assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
     }
 }
+
+// ----------------------------------------------------------------------------
+// Gemma 4 real-arch round-trip
+// ----------------------------------------------------------------------------
+
+/// Synthesize a tiny Gemma 4-shaped HF safetensors directory matching
+/// the REAL google-gemma-4-26b-a4b-it tensor layout:
+///   - multimodal wrapper (`model.language_model.*` prefix on every
+///     text-decoder tensor)
+///   - pre-fused MoE experts (`experts.gate_up_proj` 3-D + `experts.down_proj`
+///     3-D)
+///   - parallel dense FFN (`mlp.{gate,up,down}_proj`) alongside the
+///     routed experts
+///   - router projection (`router.proj.weight`)
+///   - one off-path vision-tower tensor (verifies the
+///     `MappedTensor::Drop` path silently discards rather than erroring)
+///
+/// Shape choices (all Q8_0 block-aligned at block=32):
+///   - hidden_size = 32, moe_intermediate_size = 32, intermediate_size = 32
+///   - num_experts = 4
+///   - num_hidden_layers = 2
+///   - vocab_size = 64
+///
+/// Norms / `layer_scalar` / `router.scale` / `router.per_expert_scale`
+/// are intentionally omitted — they're 1-D / scalar tensors that the
+/// orchestrator's StandardPolicy routes to F32, which has no quantizer
+/// (the same constraint the Llama-3 and Qwen3MoE integration tests
+/// document). The mapper's handling of those names is exercised by the
+/// unit tests in `src/convert/arch/gemma4.rs`.
+fn synthesize_tiny_gemma4_real_arch(dir: &Path) {
+    const HIDDEN: usize = 32;
+    const MOE_FFN: usize = 32;
+    const DENSE_FFN: usize = 32;
+    const VOCAB: usize = 64;
+    const LAYERS: usize = 2;
+    const N_EXPERTS: usize = 4;
+
+    let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+
+    let mk_f32_bytes = |numel: usize, seed: u32| -> Vec<u8> {
+        (0..numel)
+            .flat_map(|i| {
+                let x = ((i as u32).wrapping_mul(2654435761).wrapping_add(seed)) as i32;
+                let f = (x as f32) / (i32::MAX as f32);
+                f.to_le_bytes()
+            })
+            .collect()
+    };
+
+    // ---- Globals (under language_model. wrapper) -------------------------
+    tensors.push((
+        "model.language_model.embed_tokens.weight".into(),
+        vec![VOCAB, HIDDEN],
+        mk_f32_bytes(VOCAB * HIDDEN, 1),
+    ));
+
+    // ---- One off-path vision-tower tensor: verifies Drop --------------
+    // Per the gemma4 mapper, anything matching `model.vision_tower.` /
+    // `model.embed_vision.` / etc. returns `MappedTensor::Drop` and the
+    // driver silently discards it. If the driver instead routed it
+    // through `UnmappedTensor`, the convert run would fail — that
+    // failure would surface here as a non-zero exit code.
+    tensors.push((
+        "model.vision_tower.patch_embedder.input_proj.weight".into(),
+        vec![HIDDEN, HIDDEN],
+        mk_f32_bytes(HIDDEN * HIDDEN, 999),
+    ));
+
+    // ---- Per-block -------------------------------------------------------
+    for li in 0..LAYERS {
+        let s = (li as u32) * 1000;
+
+        // Attention Q/K/V/O.
+        for (idx, suffix) in ["q_proj", "k_proj", "v_proj", "o_proj"].iter().enumerate() {
+            tensors.push((
+                format!("model.language_model.layers.{li}.self_attn.{suffix}.weight"),
+                vec![HIDDEN, HIDDEN],
+                mk_f32_bytes(HIDDEN * HIDDEN, s + 10 + idx as u32),
+            ));
+        }
+
+        // Parallel dense FFN (Gemma 4 has BOTH this AND experts).
+        for (idx, suffix) in ["gate_proj", "up_proj", "down_proj"].iter().enumerate() {
+            // gate/up: [ffn, hidden]; down: [hidden, ffn].
+            let py_shape = match *suffix {
+                "down_proj" => vec![HIDDEN, DENSE_FFN],
+                _ => vec![DENSE_FFN, HIDDEN],
+            };
+            let numel: usize = py_shape.iter().product();
+            tensors.push((
+                format!("model.language_model.layers.{li}.mlp.{suffix}.weight"),
+                py_shape,
+                mk_f32_bytes(numel, s + 100 + idx as u32),
+            ));
+        }
+
+        // Pre-fused MoE experts. `gate_up_proj` is gate+up concatenated
+        // along axis 1 → HF shape `[n_experts, 2*moe_ffn, hidden]`.
+        // `down_proj` is the standard per-expert down → HF shape
+        // `[n_experts, hidden, moe_ffn]`.
+        tensors.push((
+            format!("model.language_model.layers.{li}.experts.gate_up_proj"),
+            vec![N_EXPERTS, 2 * MOE_FFN, HIDDEN],
+            mk_f32_bytes(N_EXPERTS * 2 * MOE_FFN * HIDDEN, s + 200),
+        ));
+        tensors.push((
+            format!("model.language_model.layers.{li}.experts.down_proj"),
+            vec![N_EXPERTS, HIDDEN, MOE_FFN],
+            mk_f32_bytes(N_EXPERTS * HIDDEN * MOE_FFN, s + 201),
+        ));
+
+        // Router projection — `[n_experts, hidden]`.
+        tensors.push((
+            format!("model.language_model.layers.{li}.router.proj.weight"),
+            vec![N_EXPERTS, HIDDEN],
+            mk_f32_bytes(N_EXPERTS * HIDDEN, s + 300),
+        ));
+    }
+
+    let views: Vec<(String, TensorView<'_>)> = tensors
+        .iter()
+        .map(|(n, sh, b)| {
+            let v = TensorView::new(Dtype::F32, sh.clone(), b).expect("TensorView");
+            (n.clone(), v)
+        })
+        .collect();
+    let view_refs: Vec<(String, &TensorView<'_>)> =
+        views.iter().map(|(n, v)| (n.clone(), v)).collect();
+    let st_bytes =
+        safetensors::tensor::serialize(view_refs, None).expect("serialize safetensors");
+    fs::write(dir.join("model.safetensors"), st_bytes).expect("write safetensors");
+
+    // Minimal Gemma 4 config matching the real google-gemma-4-26b-a4b-it
+    // shape (multimodal wrapper + nested text_config). The driver's
+    // `effective_config` flattens `text_config` so the per-arch mapper
+    // sees the inner text-decoder fields directly.
+    let cfg = serde_json::json!({
+        "_name_or_path": "synthetic/Gemma-4-Tiny-Real-Arch-Test",
+        "architectures": ["Gemma4ForConditionalGeneration"],
+        "model_type": "gemma4",
+        "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": HIDDEN,
+            "intermediate_size": DENSE_FFN,
+            "moe_intermediate_size": MOE_FFN,
+            "num_hidden_layers": LAYERS,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "head_dim": 8,
+            "global_head_dim": 8,
+            "max_position_embeddings": 8192,
+            "rms_norm_eps": 1.0e-6,
+            "sliding_window": 1024,
+            "num_experts": N_EXPERTS,
+            "top_k_experts": 2,
+            "vocab_size": VOCAB,
+            // ---- Gemma 4-specific required hparams (gemma.py:659-666) ----
+            "num_kv_shared_layers": 0,
+            "hidden_size_per_layer_input": 0,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "use_double_wide_mlp": false,
+            "rope_parameters": {
+                "full_attention": {
+                    "rope_theta": 1_000_000.0,
+                    "rope_type": "proportional",
+                    "partial_rotary_factor": 0.25,
+                }
+            }
+        },
+    });
+    fs::write(
+        dir.join("config.json"),
+        serde_json::to_string_pretty(&cfg).unwrap(),
+    )
+    .expect("write config.json");
+}
+
+/// Drive `hf2q convert-v2 --quant q8_0` end-to-end on the synthetic
+/// real-arch Gemma 4 fixture and assert the output GGUF round-trips
+/// with every expected tensor name + ggml_type.
+///
+/// Acceptance:
+///  - exit code 0 (the prior gemma3-shape mapper failed with
+///    `UnmappedTensor` on `experts.gate_up_proj`,
+///    `post_feedforward_layernorm_2`, etc.; this test locks in the
+///    real-arch port)
+///  - 21 tensors emitted (1 global + 10 per-layer × 2 layers; the off-path
+///    vision-tower tensor is silently dropped via `MappedTensor::Drop`)
+///  - `general.architecture = "gemma4"` (NOT `"gemma3"` — the prior
+///    mapper got this wrong; locked in per `gemma4.rs` quirk #8)
+///  - every expected GGUF tensor name present with Q8_0 (positional 3)
+///  - the fused expert tensors land as 3-D with the right inner dim
+#[test]
+fn convert_v2_gemma4_real_arch_round_trip() {
+    let model_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_gemma4_real_arch(model_dir.path());
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .arg("convert-v2")
+        .arg(model_dir.path())
+        .arg("--quant")
+        .arg("q8_0")
+        .arg("-o")
+        .arg(out.path())
+        .assert()
+        .success();
+
+    let gguf = mlx_native::gguf::GgufFile::open(out.path()).expect("parse output GGUF");
+
+    // Tensor count: 1 global (embed) + per-layer (4 attn + 3 mlp + 2 experts
+    // + 1 router) × 2 layers + 1 synthesized rope_freqs.weight = 22. The
+    // vision-tower tensor is dropped silently by the gemma4 mapper.
+    assert_eq!(
+        gguf.tensor_count(),
+        22,
+        "expected 22 tensors (1 embed + 10 per-layer × 2 + 1 rope_freqs; vision dropped)"
+    );
+
+    // Architecture must be `gemma4`, NOT `gemma3` (the prior mapper got
+    // this wrong; see gemma4.rs quirk #8).
+    assert_eq!(
+        gguf.metadata_string("general.architecture"),
+        Some("gemma4"),
+        "Gemma 4 emits general.architecture=gemma4 (LLM_ARCH_GEMMA4)"
+    );
+
+    // Required Gemma 4 KV pairs — all under the `gemma4.*` prefix.
+    assert_eq!(gguf.metadata_u32("gemma4.embedding_length"), Some(32));
+    assert_eq!(gguf.metadata_u32("gemma4.block_count"), Some(2));
+    assert_eq!(gguf.metadata_u32("gemma4.expert_count"), Some(4));
+    assert_eq!(gguf.metadata_u32("gemma4.expert_used_count"), Some(2));
+    assert_eq!(
+        gguf.metadata_u32("gemma4.expert_feed_forward_length"),
+        Some(32)
+    );
+
+    // ---- New Gemma 4-specific KV pairs (gemma.py:659-700) ----
+    assert_eq!(
+        gguf.metadata_u32("gemma4.attention.shared_kv_layers"),
+        Some(0),
+        "shared_kv_layers from num_kv_shared_layers (gemma.py:660)"
+    );
+    assert_eq!(
+        gguf.metadata_u32("gemma4.embedding_length_per_layer_input"),
+        Some(0),
+        "embedding_length_per_layer_input default 0 (gemma.py:663)"
+    );
+    // sliding_window_pattern is array-of-bool, len=block_count=2.
+    use mlx_native::gguf::MetadataValue;
+    let swa_meta = gguf
+        .metadata("gemma4.attention.sliding_window_pattern")
+        .expect("sliding_window_pattern present");
+    let swa_arr = match swa_meta {
+        MetadataValue::Array(v) => v,
+        other => panic!("expected Array for sliding_window_pattern, got {other:?}"),
+    };
+    assert_eq!(swa_arr.len(), 2, "swa pattern array length = block_count");
+    let bools: Vec<bool> = swa_arr
+        .iter()
+        .map(|v| match v {
+            MetadataValue::Bool(b) => *b,
+            other => panic!("swa pattern element not Bool: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        bools,
+        vec![true, false],
+        "layer 0 sliding, layer 1 full per fixture layer_types"
+    );
+    // RoPE dims: global = global_head_dim = 8; swa = head_dim * 1.0 = 8.
+    assert_eq!(gguf.metadata_u32("gemma4.rope.dimension_count"), Some(8));
+    assert_eq!(gguf.metadata_u32("gemma4.rope.dimension_count_swa"), Some(8));
+    // head_count_kv stays scalar (no num_global_key_value_heads in fixture).
+    assert_eq!(gguf.metadata_u32("gemma4.attention.head_count_kv"), Some(4));
+    // feed_forward_length stays scalar (use_double_wide_mlp=false).
+    assert_eq!(gguf.metadata_u32("gemma4.feed_forward_length"), Some(32));
+
+    // file_type round-trips as Q8_0 (= 7 per LlamaFtype::MostlyQ8_0).
+    assert_eq!(gguf.metadata_u32("general.file_type"), Some(7));
+
+    // ---- Synthesized rope_freqs.weight tensor (gemma.py:702-718) ----
+    let rope_freqs = gguf
+        .tensor_info("rope_freqs.weight")
+        .expect("rope_freqs.weight present (synthesized by build_synthesized_tensors)");
+    // F32 = positional 0 in mlx_native's GgmlType enum.
+    assert_eq!(
+        rope_freqs.ggml_type as u32, 0,
+        "rope_freqs.weight must be F32 (positional 0), got {}",
+        rope_freqs.ggml_type as u32
+    );
+    // Shape: 1-D of length global_head_dim/2 = 8/2 = 4.
+    assert_eq!(
+        rope_freqs.shape,
+        vec![4],
+        "rope_freqs.weight shape = [global_head_dim/2]"
+    );
+    // byte_len: 4 elements × 4 bytes/F32 = 16.
+    assert_eq!(rope_freqs.byte_len, 16);
+
+    // ---- On-disk PAYLOAD assertion (codex re-review 2026-05-18 §3) ----
+    //
+    // gemma.py:713-715 specifies the synthesized values exactly:
+    //   n_rot_full = int(global_head_dim * partial_rotary_factor_full / 2)
+    //              = int(8 * 0.25 / 2) = 1
+    //   table_len  = global_head_dim / 2 = 4
+    //   values     = [1.0]*n_rot_full + [1e30]*(table_len - n_rot_full)
+    //              = [1.0, 1e30, 1e30, 1e30]
+    //
+    // We read the raw 16 bytes at `tensor_data_offset + info.offset` and
+    // parse them as 4 little-endian f32s. The presence of 1e30 is the
+    // load-bearing semantic — it tells the proportional-rope path to
+    // collapse the unrotated dims via `freq * 1e30 ≈ +inf`. Any silent
+    // truncation by the writer / dequantizer would show up here.
+    use std::io::{Read, Seek, SeekFrom};
+    let abs_offset = gguf.tensor_data_offset() + rope_freqs.offset;
+    let mut f = std::fs::File::open(out.path()).expect("re-open output gguf");
+    f.seek(SeekFrom::Start(abs_offset))
+        .expect("seek to rope_freqs payload");
+    let mut bytes = [0u8; 16];
+    f.read_exact(&mut bytes)
+        .expect("read 16 bytes of rope_freqs payload");
+    let payload: [f32; 4] = [
+        f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+        f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        f32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        f32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+    ];
+    assert_eq!(
+        payload,
+        [1.0_f32, 1.0e30_f32, 1.0e30_f32, 1.0e30_f32],
+        "rope_freqs.weight payload must be exactly [1.0, 1e30, 1e30, 1e30] \
+         (gemma.py:713-715: n_rot_full=1, n_unrot_full=3 for global_head_dim=8, prf=0.25)"
+    );
+
+    // Per-tensor name + ggml_type. Q8_0 = positional 3.
+    let expected_names: &[&str] = &[
+        "token_embd.weight",
+        // layer 0
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+        "blk.0.attn_output.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_up.weight",
+        "blk.0.ffn_down.weight",
+        "blk.0.ffn_gate_up_exps.weight",
+        "blk.0.ffn_down_exps.weight",
+        "blk.0.ffn_gate_inp.weight",
+        // layer 1
+        "blk.1.attn_q.weight",
+        "blk.1.attn_k.weight",
+        "blk.1.attn_v.weight",
+        "blk.1.attn_output.weight",
+        "blk.1.ffn_gate.weight",
+        "blk.1.ffn_up.weight",
+        "blk.1.ffn_down.weight",
+        "blk.1.ffn_gate_up_exps.weight",
+        "blk.1.ffn_down_exps.weight",
+        "blk.1.ffn_gate_inp.weight",
+    ];
+    for name in expected_names {
+        let info = gguf
+            .tensor_info(name)
+            .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
+        assert_eq!(
+            info.ggml_type as u32, 3,
+            "tensor `{name}` expected positional Q8_0 (3), got {}",
+            info.ggml_type as u32
+        );
+        assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
+    }
+
+    // The vision-tower tensor MUST be absent from the text-decoder GGUF
+    // (silently dropped by the gemma4 mapper's `Drop` variant).
+    assert!(
+        gguf.tensor_info("v.patch_embedder.input_proj.weight")
+            .is_none(),
+        "vision-tower tensor must be absent from the text-decoder GGUF"
+    );
+
+    // Fused expert tensors land as 3-D with the right inner dim (hidden).
+    // GGUF shape order is innermost-first, so `blk.0.ffn_gate_up_exps`
+    // has shape `[hidden=32, 2*moe_ffn=64, n_experts=4]`.
+    let exps = gguf
+        .tensor_info("blk.0.ffn_gate_up_exps.weight")
+        .expect("ffn_gate_up_exps present");
+    assert_eq!(
+        exps.shape.len(),
+        3,
+        "ffn_gate_up_exps must be 3-D (got {:?})",
+        exps.shape
+    );
+    // The mlx-native reader reverses GGUF's innermost-first storage back
+    // to outermost-first `[rows, cols]` for downstream Candle-style
+    // loaders (see /opt/mlx-native/src/gguf/mod.rs:1005-1008). So the
+    // user-facing shape lines up with the original HF `[n_experts,
+    // 2*moe_ffn, hidden]` orientation, even though the on-disk GGUF
+    // bytes encode `[hidden, 2*moe_ffn, n_experts]` innermost-first.
+    assert_eq!(
+        exps.shape, vec![4_usize, 64, 32],
+        "ffn_gate_up_exps shape mismatch — expected reader-orientation \
+         [n_experts=4, 2*moe_ffn=64, hidden=32]"
+    );
+
+    let down = gguf
+        .tensor_info("blk.0.ffn_down_exps.weight")
+        .expect("ffn_down_exps present");
+    // HF `[n_experts=4, hidden=32, moe_ffn=32]` round-trips to the same
+    // shape via the reader's reverse-on-load.
+    assert_eq!(
+        down.shape,
+        vec![4_usize, 32, 32],
+        "ffn_down_exps shape mismatch"
+    );
+}

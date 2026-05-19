@@ -302,6 +302,38 @@ impl ConvertOrchestrator {
                 continue;
             }
 
+            if is_f32_keep_tensor(&t.name) {
+                // F32-keep gate — emit the F32 row-major payload as-is.
+                //
+                // Mirrors llama.cpp's quantize-decision predicate at
+                // `/opt/llama.cpp/src/llama-quant.cpp:293-355`:
+                //
+                //   1. 1-D tensors are never quantized
+                //      (`ggml_n_dims(tensor) < 2 → return false`).
+                //   2. `rope_freqs.weight` is a 1-D freq-factors table
+                //      for Gemma 4's proportional RoPE
+                //      (`/opt/llama.cpp/conversion/gemma.py:702-718`);
+                //      it carries small/exact magic values like `1e30`
+                //      that DO NOT survive quantization or F16 cast.
+                //
+                // Per [[feedback-no-loop-suppression-2026-05-17]] the
+                // gate is a positive-list (canonical name match) rather
+                // than a silent shape-based fallthrough — if a different
+                // synthesized tensor needs F32-keep, it must be added
+                // here explicitly.
+                let mut payload = Vec::with_capacity(t.data.len() * 4);
+                for &x in &t.data {
+                    payload.extend_from_slice(&x.to_le_bytes());
+                }
+                prepared.push(Prepared {
+                    name: t.name.clone(),
+                    dims_gguf,
+                    ggml_type: GgmlType::F32,
+                    payload,
+                });
+                continue;
+            }
+
             // Build a TensorRef for the policy. Shape is already
             // GGUF-order (innermost first), so we pass `&t.shape`
             // directly; `TensorRef::n_per_row()` reads `shape[0]`.
@@ -365,6 +397,25 @@ impl ConvertOrchestrator {
         w.finalize()?;
         Ok(())
     }
+}
+
+/// Predicate: should this tensor be emitted as F32-raw, skipping the
+/// policy / quantizer entirely?
+///
+/// Currently matches the Gemma 4 synthesized `rope_freqs.weight` table
+/// (`crate::convert::arch::gemma4::build_synthesized_tensors`). The table
+/// is 1-D and carries exact `1.0` / `1e30` magic values; quantizing or
+/// even F16-casting it would lose the `1e30` masks (saturates to F16
+/// inf or quantizes to zero) and break the proportional-RoPE collapse.
+///
+/// Future synthesized small-1-D tensors (e.g. `altup` / `laurel` / other
+/// `rope_*` tables) should be added by exact-name match — never by a
+/// broad `shape.len() == 1` heuristic, which would also swallow norm
+/// tensors and corrupt them.
+fn is_f32_keep_tensor(name: &str) -> bool {
+    // Gemma 4 ROPE_FREQS table — see
+    // `src/convert/arch/gemma4.rs::GEMMA4_ROPE_FREQS_TENSOR_NAME`.
+    name == "rope_freqs.weight"
 }
 
 // -----------------------------------------------------------------------------
