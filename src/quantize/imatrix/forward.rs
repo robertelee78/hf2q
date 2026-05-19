@@ -506,25 +506,64 @@ pub fn compute_imatrix(
     };
     let n_experts = gemma.config.num_experts;
 
+    // Extract BOS token id from the F16 GGUF for the per-chunk
+    // BOS-replacement that canonical llama-imatrix performs (see
+    // `/opt/llama.cpp/tools/imatrix/imatrix.cpp:1012-1014`:
+    //     if (add_bos && j == 0) {
+    //         tokens[seq_start] = llama_vocab_bos(vocab);
+    //     }
+    // — replaces the first token of each chunk with BOS when the
+    // vocab is configured to add BOS. Without this step every
+    // mid-corpus chunk starts with whatever token happens to land
+    // at the chunk boundary, and the LM's positional prior is
+    // wrong from the first activation onward).
+    //
+    // Re-open the F16 GGUF header (cheap; mmap header parse) to
+    // read `tokenizer.ggml.bos_token_id` — mirrors the canonical
+    // pattern at `src/serve/api/engine.rs:2243`.
+    let bos_token_id: Option<u32> = mlx_native::gguf::GgufFile::open(&f16_path)
+        .ok()
+        .and_then(|g| g.metadata_u32("tokenizer.ggml.bos_token_id"));
+
     // ---- 4. Tokenize corpus -------------------------------------------
-    let encoding =
-        gemma
-            .tokenizer
-            .encode(params.corpus.text.as_str(), false)
-            .map_err(|e| ImatrixError::TokenizationFailed {
-                detail: format!("{e:?}"),
-            })?;
+    //
+    // Pass `add_special_tokens=true` to mirror llama-imatrix's
+    // `common_tokenize(prompt, /*add_special=*/true, parse_special)`
+    // at `/opt/llama.cpp/tools/imatrix/imatrix.cpp:932`. This adds
+    // the BOS at index 0 if the vocab is configured to do so;
+    // matches the canonical chunk-boundary tokenization.
+    let encoding = gemma
+        .tokenizer
+        .encode(params.corpus.text.as_str(), /* add_special_tokens */ true)
+        .map_err(|e| ImatrixError::TokenizationFailed {
+            detail: format!("{e:?}"),
+        })?;
     let tokens: Vec<u32> = encoding.get_ids().to_vec();
 
-    // ---- 5. Chunk -----------------------------------------------------
-    let chunks = super::corpus::chunk_tokens(&tokens, params.n_ctx as usize);
-    if chunks.is_empty() {
+    // ---- 5. Chunk + per-chunk BOS replacement -------------------------
+    let raw_chunks = super::corpus::chunk_tokens(&tokens, params.n_ctx as usize);
+    if raw_chunks.is_empty() {
         return Err(ImatrixError::CorpusTooShort {
             corpus_label: params.corpus.label.clone(),
             token_count: tokens.len(),
             n_ctx: params.n_ctx,
         });
     }
+    // Materialize each chunk as an owned Vec so the BOS replacement
+    // doesn't mutate the underlying corpus buffer (chunk_tokens
+    // returns read-only slices into `tokens`).
+    let chunks: Vec<Vec<u32>> = raw_chunks
+        .iter()
+        .map(|chunk| {
+            let mut owned: Vec<u32> = chunk.to_vec();
+            if let Some(bos) = bos_token_id {
+                if !owned.is_empty() {
+                    owned[0] = bos;
+                }
+            }
+            owned
+        })
+        .collect();
     let chunk_count = chunks.len();
 
     // ---- 6. Build shared collector ------------------------------------
@@ -570,9 +609,11 @@ pub fn compute_imatrix(
         // We don't need it for imatrix; the activations were captured
         // via the installed collector during the prefill itself.
         let result: anyhow::Result<u32> = with_collector(collector, || {
-            gemma
-                .weights
-                .forward_prefill(chunk, /* max_decode_tokens */ 1, &mut gemma.ctx)
+            gemma.weights.forward_prefill(
+                chunk.as_slice(),
+                /* max_decode_tokens */ 1,
+                &mut gemma.ctx,
+            )
         });
         result.map_err(|e| ImatrixError::ForwardPassFailed {
             chunk_index,

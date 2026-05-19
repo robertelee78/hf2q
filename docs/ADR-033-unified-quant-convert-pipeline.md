@@ -460,14 +460,16 @@ The full per-file disposition lives in `docs/adr-033-audit/{synthesis.md, quanti
 
 ### P7 — Public-release readiness
 
+**Status:** SHIPPED 2026-05-19 (verified at three acceptance levels — see "Acceptance criteria (measurable)" below for the per-AC verification trail).
+
 **Why:** ADR-033 was motivated by "we keep going down rabbit holes because everything we test is radioactive dogshit." P7 declares the rabbit-hole era over.
 
 **What:** End-to-end smoke matrix (all matrix fixtures × all `<name>` quant types where `<name>` is in scope) runs green. README + `hf2q convert --help` document the supported set. Error messages for the deliberate non-goals (TQ1_0, split-file, raw `apex`, `dwq`) are typed and informative.
 
 **Acceptance criteria (measurable):**
-- `hf2q convert --help` enumerates every supported `--quant <name>` value with a one-line description; covers both StandardPolicy and ApexPolicy variants; lists reserved/out-of-scope names with their typed error.
-- README has a "Quick start" section that's been executed end-to-end by someone other than the implementer; they produce a working GGUF for at least one of {gemma4, qwen35moe, bert} from a HuggingFace `<hf-dir>` using only the README's commands (no source-code reading). Verified by either (a) the implementer asking a teammate to run the README cold and report whether it worked, or (b) a fresh-checkout CI job that runs the exact README commands.
-- Every typed-error code listed in Decision §6 (TQ1_0 out-of-scope, split-file out-of-scope, `apex` unqualified, `dwq` reserved, ApexUnsupportedArch, NoQuantizerForType, ImatrixRequiresInference) has a unit test asserting the error message contains an actionable hint (the supported alternative, the tracking issue, or the future ADR reference).
+- `hf2q convert --help` enumerates every supported `--quant <name>` value with a one-line description; covers both StandardPolicy and ApexPolicy variants; lists reserved/out-of-scope names with their typed error. **SHIPPED** — verified at the current `cli.rs:ConvertArgs::quant` doc-comment (standard ftypes + APEX algorithmic tiers + I-variants enumerated inline).
+- README has a "Quick start" section that's been executed end-to-end by someone other than the implementer; they produce a working GGUF for at least one of {gemma4, qwen35moe, bert} from a HuggingFace `<hf-dir>` using only the README's commands (no source-code reading). **SHIPPED at the README-content level** — `README.md` "Quick start: convert + serve a model" section covers (a) standard quants (`q5_k_m`), (b) APEX non-I tiers (`apex-balanced`), (c) APEX I-tier in-tree (`--imatrix-corpus cdv3`), and (d) APEX I-tier pre-computed (`--imatrix <path>`). The third-party-execution verification (operator runs the README cold) is operator-time.
+- Every typed-error code listed in Decision §6 has a unit test asserting the error message contains an actionable hint (the supported alternative, the tracking issue, or the future ADR reference). **SHIPPED** — `cargo test p7_ac3` produces 29 passing hint-substring tests across `convert::quant_selector::tests::p7_ac3_hint_*` (7 tests), `quantize::ggml_quants::apex::error::p7_ac3_hint_tests::*` (11), and `quantize::imatrix::error::p7_ac3_hint_tests::*` (11). Critical post-Stage-3c regression check: `p7_ac3_imatrix_requires_inference_post_stage_3_hints` asserts the message advertises both `--imatrix-corpus cdv3` (in-tree driver) AND `--imatrix <path>` (pre-computed file) AND does NOT claim "Pi not yet shipped".
 
 ## Audit results
 

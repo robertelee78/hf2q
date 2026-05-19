@@ -157,3 +157,166 @@ pub enum ImatrixError {
         n_ctx: u32,
     },
 }
+
+#[cfg(test)]
+mod p7_ac3_hint_tests {
+    //! ADR-033 §P7 AC#3 — every typed-error MESSAGE must carry the
+    //! actionable hint. Variant-only `matches!()` checks don't catch
+    //! hint regressions, so each variant's `.to_string()` is
+    //! substring-checked here.
+
+    use super::*;
+
+    #[test]
+    fn p7_ac3_not_an_imatrix_lists_expectation() {
+        let msg = ImatrixError::NotAnImatrix {
+            path: "/tmp/foo.gguf".to_string(),
+            actual: "llama".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("/tmp/foo.gguf"), "msg should echo path: {msg}");
+        assert!(msg.contains("imatrix"), "msg should reference imatrix: {msg}");
+        assert!(msg.contains("llama"), "msg should report actual general.type: {msg}");
+    }
+
+    #[test]
+    fn p7_ac3_missing_kv_names_field() {
+        let msg = ImatrixError::MissingKv {
+            path: "/tmp/x.gguf".to_string(),
+            key: "imatrix.chunk_count",
+        }
+        .to_string();
+        assert!(msg.contains("imatrix.chunk_count"), "msg should name the key: {msg}");
+        assert!(msg.contains("/tmp/x.gguf"), "msg should echo path: {msg}");
+    }
+
+    #[test]
+    fn p7_ac3_unknown_baked_corpus_lists_supported() {
+        let msg = ImatrixError::UnknownBakedCorpus {
+            name: "wikitext-9000".to_string(),
+            supported: &["cdv3", "mudler", "user-file"],
+        }
+        .to_string();
+        assert!(msg.contains("wikitext-9000"), "msg should echo bad name: {msg}");
+        assert!(msg.contains("cdv3"), "msg should list a supported value: {msg}");
+        assert!(
+            msg.contains("user-file"),
+            "msg should mention the operator-supplied option: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_in_tree_generation_deprecated_variant_unused_post_stage_3c() {
+        // This variant exists in the taxonomy but is no longer
+        // returned anywhere in production code (`resolve_imatrix_input`
+        // now drives `compute_imatrix` directly when --imatrix-corpus
+        // is set, instead of returning this variant). The message
+        // still points operators at the workaround, which is fine for
+        // the file-load surface; but the variant itself is dead code.
+        //
+        // Keeping a hint test on it so a future cleanup that removes
+        // the variant is forced to also remove this test (loud break).
+        let msg = ImatrixError::InTreeGenerationNotYetShipped {
+            corpus: "cdv3".to_string(),
+        }
+        .to_string();
+        assert!(
+            msg.contains("llama-imatrix") || msg.contains("--imatrix"),
+            "msg should point at the file-based workaround: {msg}"
+        );
+        assert!(msg.contains("cdv3"), "msg should echo the corpus: {msg}");
+    }
+
+    #[test]
+    fn p7_ac3_shape_mismatch_carries_diagnostic_dims() {
+        let msg = ImatrixError::ShapeMismatch {
+            tensor: "blk.0.attn_q.weight".to_string(),
+            m: 2,
+            n_per_row: 4,
+            got: 5,
+            expected: 8,
+        }
+        .to_string();
+        assert!(msg.contains("blk.0.attn_q.weight"), "msg should name tensor: {msg}");
+        assert!(msg.contains("2"), "msg should carry m: {msg}");
+        assert!(msg.contains("4"), "msg should carry n_per_row: {msg}");
+        assert!(msg.contains("5"), "msg should carry got: {msg}");
+        assert!(msg.contains("8"), "msg should carry expected: {msg}");
+    }
+
+    #[test]
+    fn p7_ac3_convert_failed_carries_detail() {
+        let msg = ImatrixError::ConvertFailed {
+            detail: "hf_dir `/tmp/bogus` does not exist".to_string(),
+        }
+        .to_string();
+        assert!(
+            msg.contains("convert to F16 GGUF failed"),
+            "msg should name the failed step: {msg}"
+        );
+        assert!(msg.contains("/tmp/bogus"), "msg should carry upstream detail: {msg}");
+    }
+
+    #[test]
+    fn p7_ac3_model_load_failed_carries_detail() {
+        let msg = ImatrixError::ModelLoadFailed {
+            detail: "GGUF magic mismatch".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("model load failed"), "msg should name the step: {msg}");
+        assert!(msg.contains("GGUF magic mismatch"), "msg should carry detail: {msg}");
+    }
+
+    #[test]
+    fn p7_ac3_unsupported_arch_for_driver_lists_supported() {
+        let msg = ImatrixError::UnsupportedArchForDriver {
+            arch: "qwen3moe".to_string(),
+            supported: &["gemma4"],
+        }
+        .to_string();
+        assert!(msg.contains("qwen3moe"), "msg should echo bad arch: {msg}");
+        assert!(msg.contains("gemma4"), "msg should list supported arches: {msg}");
+        assert!(
+            msg.contains("not yet wired") || msg.contains("supported"),
+            "msg should explain the gap: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_tokenization_failed_carries_detail() {
+        let msg = ImatrixError::TokenizationFailed {
+            detail: "Encoding error: invalid UTF-8 at byte 42".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("tokenizer"), "msg should name the step: {msg}");
+        assert!(msg.contains("byte 42"), "msg should carry upstream detail: {msg}");
+    }
+
+    #[test]
+    fn p7_ac3_forward_pass_failed_locates_chunk() {
+        let msg = ImatrixError::ForwardPassFailed {
+            chunk_index: 7,
+            chunk_count: 100,
+            detail: "GPU OOM".to_string(),
+        }
+        .to_string();
+        assert!(
+            msg.contains("7") && msg.contains("100"),
+            "msg should locate chunk_index/chunk_count: {msg}"
+        );
+        assert!(msg.contains("GPU OOM"), "msg should carry upstream detail: {msg}");
+    }
+
+    #[test]
+    fn p7_ac3_corpus_too_short_carries_dims() {
+        let msg = ImatrixError::CorpusTooShort {
+            corpus_label: "user-file:tiny.txt".to_string(),
+            token_count: 32,
+            n_ctx: 512,
+        }
+        .to_string();
+        assert!(msg.contains("user-file:tiny.txt"), "msg should echo label: {msg}");
+        assert!(msg.contains("32"), "msg should carry token_count: {msg}");
+        assert!(msg.contains("512"), "msg should carry n_ctx: {msg}");
+    }
+}

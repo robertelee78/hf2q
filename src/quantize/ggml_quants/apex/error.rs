@@ -149,26 +149,30 @@ pub enum ApexError {
         tensor_name: String,
     },
 
-    /// ADR-033 §Pi: an `apex-i-*` tier was requested but Pi (the imatrix
-    /// subsystem) hasn't shipped yet, so no per-row activation-importance
-    /// data is available. Per the no-silent-fallback rule we reject with
-    /// a typed error rather than silently producing non-I bytes (the
-    /// current `tier_rules` map identical TierRules for {Quality,
-    /// IQuality}, {Balanced, IBalanced}, {Compact, ICompact} pairs — so
-    /// running an I-tier without imatrix would emit bytes byte-identical
-    /// to the non-I sibling, defeating the purpose of asking for I).
+    /// ADR-033 §Pi: an `apex-i-*` tier was requested but no per-row
+    /// imatrix data was supplied. Per the no-silent-fallback rule we
+    /// reject with a typed error rather than silently producing non-I
+    /// bytes (the current `tier_rules` map identical TierRules for
+    /// {Quality, IQuality}, {Balanced, IBalanced}, {Compact, ICompact}
+    /// pairs — so running an I-tier without imatrix would emit bytes
+    /// byte-identical to the non-I sibling, defeating the purpose of
+    /// asking for I).
     ///
-    /// `supported_for_imatrix` is the set of arches that have a hf2q
-    /// inference forward-pass + imatrix-driver wired in. v1 ships with
-    /// this set EMPTY (Pi is open work); callers should treat any
-    /// `apex-i-*` request as REJECTED until Pi lands.
+    /// `supported_for_imatrix` is the set of arches that can consume
+    /// imatrix data for I-tier policy dispatch. Operators reaching
+    /// this error should:
+    ///   - run `hf2q convert ... --imatrix-corpus cdv3` (Stage 3.0
+    ///     drives in-tree generation for Gemma 4); OR
+    ///   - run `llama-imatrix -m <gguf> -f cdv3.txt -o <out>` and
+    ///     pass `<out>` via `--imatrix <path>` (works on any
+    ///     supported arch).
     #[error(
         "Apex tier `{tier}` requires per-row imatrix data (ADR-033 §Pi). \
-         hf2q's imatrix subsystem (Pi) is not yet shipped; \
+         No imatrix was supplied for arch `{arch}`; \
          supported_for_imatrix arches: {supported_for_imatrix:?}. \
-         Use the non-I sibling tier (e.g. apex-balanced for apex-i-balanced) \
-         OR supply a pre-computed imatrix file via --imatrix <path> \
-         (also pending Pi). See ADR-033 §Pi for the tracking issue."
+         Pass `--imatrix-corpus cdv3` (Gemma 4 in-tree driver) \
+         OR `--imatrix <path>` (pre-computed `.imatrix.gguf` from \
+         stock `llama-imatrix`)."
     )]
     ImatrixRequiresInference {
         tier: &'static str,
@@ -185,5 +189,180 @@ impl ApexError {
             arch: arch.name(),
             supported: super::arches::SUPPORTED_APEX_ARCHES,
         }
+    }
+}
+
+#[cfg(test)]
+mod p7_ac3_hint_tests {
+    //! ADR-033 §P7 AC#3 — every typed error's MESSAGE must contain
+    //! the actionable hint the operator needs to recover. Variant-only
+    //! matching via `matches!(...)` doesn't catch hint regressions; the
+    //! tests below `.to_string()` each variant and substring-match the
+    //! hint text.
+
+    use super::*;
+    use super::super::arches::SUPPORTED_APEX_ARCHES;
+
+    #[test]
+    fn p7_ac3_unsupported_arch_lists_supported() {
+        let msg = ApexError::UnsupportedArch {
+            arch: "falcon",
+            supported: SUPPORTED_APEX_ARCHES,
+        }
+        .to_string();
+        assert!(msg.contains("falcon"), "msg should echo bad arch: {msg}");
+        assert!(
+            msg.contains("gemma4") || msg.contains("qwen"),
+            "msg should list at least one supported arch: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_dense_model_not_supported() {
+        let msg = ApexError::DenseModelNotSupported {
+            arch: "llama",
+            n_expert: 1,
+        }
+        .to_string();
+        assert!(msg.contains("MoE"), "msg should explain MoE requirement: {msg}");
+        assert!(msg.contains("q5_k_m"), "msg should suggest dense fallback: {msg}");
+    }
+
+    #[test]
+    fn p7_ac3_unsupported_tier_lists_supported() {
+        let msg = ApexError::UnsupportedTier {
+            tier: "nano".to_string(),
+            supported: super::super::rules::SUPPORTED_APEX_TIERS,
+        }
+        .to_string();
+        assert!(msg.contains("nano"), "msg should echo bad tier: {msg}");
+        assert!(msg.contains("balanced"), "msg should list supported tiers: {msg}");
+        assert!(
+            msg.contains("apex-custom"),
+            "msg should mention apex-custom escape hatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_custom_requires_tensor_type_file() {
+        let msg = ApexError::CustomRequiresTensorTypeFile.to_string();
+        assert!(
+            msg.contains("apex-custom") || msg.contains("--tensor-type-file"),
+            "msg should name the missing flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_missing_hparam_names_field() {
+        let msg = ApexError::MissingHParam {
+            hparam: "num_hidden_layers",
+        }
+        .to_string();
+        assert!(
+            msg.contains("num_hidden_layers"),
+            "msg should name the missing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_missing_layer_index_names_tensor() {
+        let msg = ApexError::MissingLayerIndex {
+            name: "blk.5.attn_q.weight".to_string(),
+        }
+        .to_string();
+        assert!(
+            msg.contains("blk.5.attn_q.weight"),
+            "msg should echo offending tensor name: {msg}"
+        );
+        assert!(
+            msg.contains("layer_index"),
+            "msg should reference the missing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_layer_index_out_of_range_carries_values() {
+        let msg = ApexError::LayerIndexOutOfRange {
+            name: "blk.40.attn_q.weight".to_string(),
+            layer_index: 40,
+            n_layers: 30,
+        }
+        .to_string();
+        assert!(msg.contains("40"), "msg should include layer_index: {msg}");
+        assert!(msg.contains("30"), "msg should include n_layers: {msg}");
+        assert!(
+            msg.contains("blk.40.attn_q.weight"),
+            "msg should echo the tensor: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_fingerprint_config_missing_names_path() {
+        let msg = ApexError::FingerprintConfigMissing {
+            fingerprint: "deadbeef".to_string(),
+            mudler_config_path: "vendor/apex-quant/configs/x.txt".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("vendor/apex-quant/configs/x.txt"));
+        assert!(
+            msg.contains("VENDOR_CONFIGS"),
+            "msg should point at the fix site: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_mudler_config_parse_locates() {
+        let msg = ApexError::MudlerConfigParse {
+            source_path: "foo.txt".to_string(),
+            line_number: 42,
+            detail: "missing `=` separator".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("foo.txt:42"), "msg should locate at file:line: {msg}");
+        assert!(msg.contains("missing `=`"), "msg should carry detail: {msg}");
+    }
+
+    #[test]
+    fn p7_ac3_tensor_not_in_mudler_config_names_both() {
+        let msg = ApexError::TensorNotInMudlerConfig {
+            source_path: "x.txt".to_string(),
+            tensor_name: "blk.0.attn_q.weight".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("blk.0.attn_q.weight"));
+        assert!(msg.contains("x.txt"));
+        assert!(
+            msg.contains("authoritative") || msg.contains("no silent fallback"),
+            "msg should explain why this errors instead of fallback: {msg}"
+        );
+    }
+
+    /// **Critical post-Stage-3c hint test**: the operator command in
+    /// the error message MUST point at the now-shipped paths
+    /// (`--imatrix-corpus cdv3` for Gemma 4 in-tree, or `--imatrix
+    /// <path>` for pre-computed). Earlier message said "Pi is not yet
+    /// shipped" which was stale after commit 9fd50afa.
+    #[test]
+    fn p7_ac3_imatrix_requires_inference_post_stage_3_hints() {
+        let msg = ApexError::ImatrixRequiresInference {
+            tier: "i-balanced",
+            arch: "gemma4",
+            supported_for_imatrix: &["qwen3moe", "gemma4"],
+        }
+        .to_string();
+        assert!(msg.contains("i-balanced"), "msg should echo bad tier: {msg}");
+        assert!(msg.contains("gemma4"), "msg should echo arch: {msg}");
+        assert!(
+            msg.contains("--imatrix-corpus") && msg.contains("cdv3"),
+            "msg should advertise the in-tree driver path (Stage 3c): {msg}"
+        );
+        assert!(
+            msg.contains("--imatrix") && msg.contains("llama-imatrix"),
+            "msg should advertise the pre-computed file path: {msg}"
+        );
+        assert!(
+            !msg.contains("not yet shipped") && !msg.contains("pending Pi"),
+            "msg must NOT claim Pi is unshipped (post-Stage-3c regression check): {msg}"
+        );
     }
 }

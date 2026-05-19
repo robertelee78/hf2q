@@ -204,6 +204,40 @@ The driver looks up the fingerprint manifest and, on match, logs
 `[hf2q apex] auto-detected APEX config: vendor/apex-quant/configs/<file>`
 before quantizing — confirming the exact per-tensor overlay in use.
 
+### I-tier APEX (imatrix-aware quantization)
+
+The `apex-i-*` tiers (`apex-i-quality`, `apex-i-balanced`,
+`apex-i-compact`) require per-row activation-importance data
+(imatrix). Two ways to supply it:
+
+```bash
+# A. In-tree: hf2q runs its own forward pass over a calibration corpus.
+#    Stage 3.0 supports Gemma 4 only; other arches use option B.
+hf2q convert ./models/google-gemma-4-26b-a4b-it \
+  --quant apex-i-balanced \
+  --imatrix-corpus cdv3 \
+  -o ./out/gemma4-26b-apex-i-balanced.gguf
+
+# B. Pre-computed: pass an external `.imatrix.gguf` (works for any
+#    supported arch — Qwen 3.5/3.6 MoE included).
+llama-imatrix -m ./out/qwen35-f16.gguf \
+  -f data/calibration/cdv3.txt \
+  -o /tmp/qwen35.imatrix.gguf
+hf2q convert ./models/Qwen3.5-35B-A3B \
+  --quant apex-i-balanced \
+  --imatrix /tmp/qwen35.imatrix.gguf \
+  -o ./out/qwen35-apex-i-balanced.gguf
+```
+
+The in-tree path (option A) writes a temporary F16 GGUF, drives
+the forward pass over `cdv3` (bartowski's calibration corpus, baked
+into the binary), and consumes the resulting per-tensor
+sum-of-squared-activations to choose the per-layer mix. Wall time
+is dominated by the forward pass: roughly seconds per 512-token
+chunk × ~100 chunks on a 26B-A4B Gemma 4 model = operator-coffee-time,
+not CI-time. Add `--imatrix-out <path>` to also write the computed
+imatrix to disk for reuse.
+
 ## Architecture
 
 A full source-grounded architecture map lives in

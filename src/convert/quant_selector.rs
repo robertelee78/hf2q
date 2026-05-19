@@ -364,6 +364,107 @@ mod tests {
         }
     }
 
+    // ============================================================================
+    // ADR-033 §P7 AC#3 — every typed-error variant's MESSAGE contains
+    // the actionable hint the operator needs to recover (the supported
+    // alternative / the tracking issue / the future-ADR reference).
+    //
+    // Variant-only matching is not enough: a future refactor that
+    // removes the hint from the `#[error(...)]` template would not be
+    // caught by `matches!(err, Variant)`. These tests `.to_string()`
+    // the error and assert substring presence, so the user-facing
+    // diagnostic stays informative.
+    // ============================================================================
+
+    #[test]
+    fn p7_ac3_hint_dwq_reserved() {
+        let msg = QuantSelectorError::DwqReserved.to_string();
+        assert!(msg.contains("dwq"), "msg should name the rejected flag: {msg}");
+        assert!(
+            msg.contains("reserved") || msg.contains("future"),
+            "msg should hint at the reserved/future-pipeline status: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_hint_apex_unqualified() {
+        let err = QuantSelectorError::ApexUnqualified {
+            supported: SUPPORTED_APEX_TIERS,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("apex"), "msg should name the flag: {msg}");
+        // Must enumerate the supported tier names so the operator
+        // can immediately pick one.
+        assert!(msg.contains("balanced"), "msg should list `balanced`: {msg}");
+        assert!(msg.contains("mini"), "msg should list `mini`: {msg}");
+        assert!(
+            msg.contains("apex-custom"),
+            "msg should mention the apex-custom escape hatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_hint_tq_out_of_v1_scope() {
+        let msg = QuantSelectorError::TqOutOfV1Scope {
+            name: "tq1_0".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("tq1_0"), "msg should echo the rejected name: {msg}");
+        assert!(
+            msg.contains("out of v1") || msg.contains("scope"),
+            "msg should hint at the scope reason: {msg}"
+        );
+        assert!(
+            msg.contains("Quantizer"),
+            "msg should reference the missing Quantizer impl: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_hint_unknown_apex_tier_lists_supported() {
+        let msg = QuantSelectorError::UnknownApexTier {
+            tier: "bogus".to_string(),
+            supported: SUPPORTED_APEX_TIERS,
+        }
+        .to_string();
+        assert!(msg.contains("bogus"), "msg should echo the bad tier: {msg}");
+        assert!(
+            msg.contains("balanced"),
+            "msg should list the supported tiers (e.g. `balanced`): {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_hint_apex_custom_requires_tensor_type_file() {
+        let msg = QuantSelectorError::ApexCustomRequiresTensorTypeFile.to_string();
+        assert!(
+            msg.contains("apex-custom") || msg.contains("--tensor-type-file"),
+            "msg should name the missing flag the operator must supply: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_hint_apex_tier_out_of_scope() {
+        let msg = QuantSelectorError::ApexTierOutOfScope {
+            tier: "nano".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("nano"), "msg should echo the rejected tier: {msg}");
+        assert!(
+            msg.contains("apex-custom") || msg.contains("scope"),
+            "msg should hint at the escape hatch or scope reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn p7_ac3_hint_unknown_quant() {
+        let msg = QuantSelectorError::UnknownQuant {
+            name: "garbage".to_string(),
+        }
+        .to_string();
+        assert!(msg.contains("garbage"), "msg should echo the bad name: {msg}");
+    }
+
     #[test]
     fn approximate_for_apex_table() {
         assert_eq!(approximate_for_apex(ApexTier::Quality), LlamaFtype::MostlyQ6_K);
