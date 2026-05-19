@@ -24,6 +24,72 @@ use std::path::Path;
 use assert_cmd::Command;
 use safetensors::tensor::{Dtype, TensorView};
 
+/// Drop a minimal `tokenizer.json` + `tokenizer_config.json` alongside
+/// every fixture so the convert-v2 driver's tokenizer-metadata
+/// emitter has something to read. The driver hard-fails when
+/// tokenizer.json is missing per ADR-033's no-silent-skip contract
+/// (see `convert::tokenizer::TokenizerError::TokenizerJsonMissing`);
+/// the test fixture must therefore mirror what a real HF repo ships.
+///
+/// `vocab_size` MUST match `config.json::vocab_size` /
+/// `text_config::vocab_size` — the emitter cross-checks both before
+/// writing the GGUF KV section.
+///
+/// Returns `(bos_id, eos_id)` so test assertions can pin them
+/// against the recovered metadata.
+fn write_minimal_tokenizer_fixture(dir: &Path, vocab_size: usize) -> (u32, u32) {
+    assert!(
+        vocab_size >= 16,
+        "minimal tokenizer needs at least 16 ids for the 4 special tokens"
+    );
+    // Base BPE: ids 0..(vocab_size-4). Use a deterministic synthetic
+    // pattern so the emitter sees a well-formed vocab map.
+    let base_count = vocab_size - 4;
+    let mut vocab = serde_json::Map::with_capacity(base_count);
+    for i in 0..base_count {
+        vocab.insert(format!("tok{i}"), serde_json::json!(i as u64));
+    }
+    let bos_id = (vocab_size - 4) as u64;
+    let eos_id = (vocab_size - 3) as u64;
+    let pad_id = (vocab_size - 2) as u64;
+    let unk_id = (vocab_size - 1) as u64;
+    let tokenizer_json = serde_json::json!({
+        "model": {
+            "type": "BPE",
+            "byte_fallback": true,
+            "vocab": vocab,
+            "merges": []
+        },
+        "added_tokens": [
+            {"id": bos_id, "content": "<bos>", "special": true},
+            {"id": eos_id, "content": "<eos>", "special": true},
+            {"id": pad_id, "content": "<pad>", "special": true},
+            {"id": unk_id, "content": "<unk>", "special": true},
+        ]
+    });
+    fs::write(
+        dir.join("tokenizer.json"),
+        serde_json::to_string_pretty(&tokenizer_json).unwrap(),
+    )
+    .unwrap();
+
+    let tokenizer_config = serde_json::json!({
+        "bos_token": "<bos>",
+        "eos_token": "<eos>",
+        "pad_token": "<pad>",
+        "unk_token": "<unk>",
+        "add_bos_token": true,
+        "add_eos_token": false,
+    });
+    fs::write(
+        dir.join("tokenizer_config.json"),
+        serde_json::to_string_pretty(&tokenizer_config).unwrap(),
+    )
+    .unwrap();
+
+    (bos_id as u32, eos_id as u32)
+}
+
 /// Synthesize a tiny Llama-3-shaped safetensors directory WITHOUT 1-D
 /// RMSNorm tensors. Rationale: the orchestrator's StandardPolicy
 /// routes 1-D norm tensors to F32, and `quantizer_for(F32)` returns
@@ -134,6 +200,11 @@ fn synthesize_tiny_llama3_no_norms(dir: &Path) {
         serde_json::to_string_pretty(&cfg).unwrap(),
     )
     .expect("write config.json");
+
+    // ADR-033 tokenizer wiring: every fixture must drop a tokenizer.json
+    // so the convert-v2 driver's tokenizer-metadata emitter can produce
+    // the GGUF KV pairs llama.cpp's vocab loader requires.
+    write_minimal_tokenizer_fixture(dir, VOCAB);
 }
 
 /// Drive `hf2q convert-v2` end-to-end over a tiny Llama-3 fixture and
@@ -169,8 +240,12 @@ fn convert_v2_llama3_tiny_round_trip() {
     //    7 per-block × 2 layers: q, k, v, o, ffn_gate, ffn_up, ffn_down).
     assert_eq!(gguf.tensor_count(), 16);
 
-    // Metadata count: Llama3's build_metadata emits 11 KV pairs.
-    assert_eq!(gguf.metadata_count(), 11);
+    // Metadata count: Llama3's build_metadata emits 11 KV pairs + the
+    // ADR-033 tokenizer-metadata emitter adds 11 (model + tokens +
+    // scores + token_type + bos/eos/unk/pad + add_bos_token +
+    // add_space_prefix + pre; merges array is empty in this fixture so
+    // the KV is skipped; no chat_template for llama).
+    assert_eq!(gguf.metadata_count(), 11 + 11);
     assert_eq!(gguf.metadata_string("general.architecture"), Some("llama"));
     assert_eq!(gguf.metadata_u32("llama.embedding_length"), Some(32));
     assert_eq!(gguf.metadata_u32("llama.block_count"), Some(2));
@@ -402,6 +477,10 @@ fn synthesize_tiny_qwen35moe_for_apex(dir: &Path) {
         serde_json::to_string_pretty(&cfg).unwrap(),
     )
     .expect("write config.json");
+
+    // ADR-033 tokenizer wiring: drop a minimal tokenizer.json so the
+    // convert-v2 driver's tokenizer-metadata emitter has input.
+    write_minimal_tokenizer_fixture(dir, VOCAB);
 }
 
 /// Drive `hf2q convert-v2 --quant apex-balanced` end-to-end on a synthetic
@@ -688,6 +767,11 @@ fn synthesize_tiny_gemma4_real_arch(dir: &Path) {
         serde_json::to_string_pretty(&cfg).unwrap(),
     )
     .expect("write config.json");
+
+    // ADR-033 tokenizer wiring: drop a minimal tokenizer.json so the
+    // convert-v2 driver's tokenizer-metadata emitter has input. Vocab
+    // size MUST match text_config.vocab_size above (VOCAB).
+    write_minimal_tokenizer_fixture(dir, VOCAB);
 }
 
 /// Drive `hf2q convert-v2 --quant q8_0` end-to-end on the synthetic
@@ -937,6 +1021,41 @@ fn convert_v2_gemma4_real_arch_round_trip() {
         vec![4_usize, 32, 32],
         "ffn_down_exps shape mismatch"
     );
+
+    // ---- Tokenizer metadata (ADR-033 P3 tokenizer wiring) ----
+    // The convert-v2 driver now emits the `tokenizer.*` KV block per
+    // gemma.py:625-653 (`Gemma4Model.set_vocab`). Real-model load on
+    // /opt/hf2q/models/google-gemma-4-26b-a4b-it failed pre-port with
+    // llama.cpp's "error loading model vocabulary: key not found in
+    // model: tokenizer.ggml.model"; pin every emitted key here.
+    assert_eq!(
+        gguf.metadata_string("tokenizer.ggml.model"),
+        Some("gemma4"),
+        "Gemma 4 tokenizer.ggml.model = `gemma4` per gemma.py:649"
+    );
+    let tokens_meta = gguf
+        .metadata("tokenizer.ggml.tokens")
+        .expect("tokens array must be present");
+    let tokens_len = match tokens_meta {
+        mlx_native::gguf::MetadataValue::Array(v) => v.len(),
+        other => panic!("tokenizer.ggml.tokens not Array: {other:?}"),
+    };
+    assert_eq!(
+        tokens_len, 64,
+        "tokens array length must equal config.json::text_config::vocab_size = 64"
+    );
+    // BOS/EOS ids from the fixture's added_tokens (4 special tokens at
+    // the tail: bos=vocab-4, eos=vocab-3 → 60, 61).
+    assert_eq!(
+        gguf.metadata_u32("tokenizer.ggml.bos_token_id"),
+        Some(60),
+        "bos_token_id = vocab_size - 4 per fixture layout"
+    );
+    assert_eq!(
+        gguf.metadata_u32("tokenizer.ggml.eos_token_id"),
+        Some(61),
+        "eos_token_id = vocab_size - 3 per fixture layout"
+    );
 }
 
 // ============================================================================
@@ -1021,6 +1140,11 @@ fn convert_v2_streaming_rss_under_bound_2026_05_18() {
         .unwrap(),
     )
     .unwrap();
+
+    // ADR-033 tokenizer wiring: drop a minimal tokenizer.json so the
+    // convert-v2 driver succeeds end-to-end. Vocab size must match
+    // config.json::vocab_size = 64 above.
+    write_minimal_tokenizer_fixture(dir.path(), 64);
 
     // Drive convert-v2 as a subprocess and parse its peak RSS via
     // `/usr/bin/time -l` (macOS) / `time -v` (Linux). assert_cmd's

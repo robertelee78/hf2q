@@ -39,7 +39,10 @@ use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
 use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
 use crate::convert::orchestrator::PlanEntry;
 use crate::convert::source_reader::SourceError;
-use crate::convert::{ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError};
+use crate::convert::tokenizer::TokenizerError;
+use crate::convert::{
+    build_tokenizer_metadata, ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError,
+};
 use crate::quantize::ggml_quants::SourceDtype;
 use crate::quantize::ggml_quants::apex::{ApexError, ApexPolicy};
 use crate::quantize::ggml_quants::standard_policy::HParams;
@@ -141,6 +144,12 @@ pub enum ConvertV2Error {
     /// arch, dense model, etc.). Wraps the typed `ApexError` so callers
     /// see the canonical mudler-aligned diagnostic.
     Apex(ApexError),
+    /// `tokenizer::build_tokenizer_metadata` failed — missing /
+    /// malformed `tokenizer.json`, unresolvable EOS token, etc. Per
+    /// [[feedback-no-loop-suppression-2026-05-17]] this surfaces here
+    /// rather than producing a GGUF that llama.cpp rejects with
+    /// `key not found in model: tokenizer.ggml.model`.
+    Tokenizer(TokenizerError),
 }
 
 impl std::fmt::Display for ConvertV2Error {
@@ -197,6 +206,7 @@ impl std::fmt::Display for ConvertV2Error {
                 path.display()
             ),
             ConvertV2Error::Apex(e) => write!(f, "convert-v2/apex: {e}"),
+            ConvertV2Error::Tokenizer(e) => write!(f, "convert-v2/tokenizer: {e}"),
         }
     }
 }
@@ -208,6 +218,7 @@ impl std::error::Error for ConvertV2Error {
             ConvertV2Error::Orchestrator(e) => Some(e),
             ConvertV2Error::Io(e) => Some(e),
             ConvertV2Error::Apex(e) => Some(e),
+            ConvertV2Error::Tokenizer(e) => Some(e),
             _ => None,
         }
     }
@@ -234,6 +245,12 @@ impl From<std::io::Error> for ConvertV2Error {
 impl From<ApexError> for ConvertV2Error {
     fn from(e: ApexError) -> Self {
         ConvertV2Error::Apex(e)
+    }
+}
+
+impl From<TokenizerError> for ConvertV2Error {
+    fn from(e: TokenizerError) -> Self {
+        ConvertV2Error::Tokenizer(e)
     }
 }
 
@@ -306,6 +323,19 @@ pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
     // ----- 4. Emit metadata (orchestrator buffers it for begin_write) ----
     let ftype_u32 = ftype_for_metadata as u32;
     for (k, v) in build_metadata_for_arch(arch, &src.config, ftype_u32) {
+        orch.add_metadata(k, v);
+    }
+
+    // ----- 4b. Emit tokenizer metadata --------------------------------
+    // llama.cpp's vocab loader rejects any GGUF that is missing
+    // `tokenizer.ggml.model` — failure mode reported 2026-05-18 by the
+    // real-model convert-v2 smoke test on
+    // /opt/hf2q/models/google-gemma-4-26b-a4b-it. Per
+    // [[feedback-no-loop-suppression-2026-05-17]] we surface every
+    // tokenizer-parse failure as a typed `ConvertV2Error::Tokenizer`
+    // variant rather than skipping silently — that exact silent skip
+    // is what produced the bug.
+    for (k, v) in build_tokenizer_metadata(&args.hf_dir, arch)? {
         orch.add_metadata(k, v);
     }
 

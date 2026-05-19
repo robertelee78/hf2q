@@ -493,6 +493,29 @@ After the Gemma 4 mapper rewrite shipped (mlx-native `93383cd`, hf2q `46c54876`)
 
 **Real-model re-run:** the operator should re-attempt `hf2q convert-v2 /opt/hf2q/models/google-gemma-4-26b-a4b-it --quant q5_k_m -o gemma4-26b-q5_k_m.gguf` on a 64 GB system after this commit lands. Expected peak RSS: well under 4 GB (mmap'd safetensors pages are anonymous-cache, not RSS-counted on macOS / Linux; the heap holds at most one F32 + one Q5_K_M payload at a time).
 
+### 2026-05-18 — Tokenizer metadata missing from convert-v2 output (FIXED at the same commit)
+
+After the streaming-OOM fix above produced a valid 18 GB Q5_K_M GGUF in 8m 22s (peak footprint 4.94 GB) from `google/gemma-4-26b-a4b-it`, `llama-cli -m <output>` rejected the file with `error loading model vocabulary: key not found in model: tokenizer.ggml.model`. Inspection: the convert-v2 output had 24 KV pairs, all `gemma4.*` or `general.*`, and **zero** `tokenizer.*` entries. The legacy `cmd_convert` pipeline emits the full tokenizer block from `src/backends/gguf.rs::load_tokenizer_metadata` (lines 2742-3200), but convert-v2 never wired in an equivalent — `run_convert_v2` jumped straight from `build_metadata_for_arch` to `begin_write` and dropped tokenizer-parse from its responsibilities.
+
+**Fix landed at this commit — new `src/convert/tokenizer.rs` module + cli_driver integration.** Surface:
+
+- **`build_tokenizer_metadata(model_dir: &Path, arch: ArchName) -> Result<Vec<(String, MetaValue)>, TokenizerError>`** ports the legacy emitter's logic into a focused, convert-v2-only module. Reads `tokenizer.json` + `tokenizer_config.json`, merges base BPE + `added_tokens`, cross-checks against `config.json::vocab_size` (or `text_config.vocab_size` for multimodal-wrapper configs), classifies token types via `LlamaHfVocab` rules + Gemma 4's USER_DEFINED `visible_tokens` set (gemma.py:630-642), resolves BOS/EOS/UNK/PAD ids in the merged vocab, and emits 11-13 GGUF KVs per arch.
+- **`TokenizerError`** is a typed-error surface — per [[feedback-no-loop-suppression-2026-05-17]] no silent fallback. Variants: `TokenizerJsonMissing`, `TokenizerJsonMalformed`, `TokenizerJsonMissingModel`, `ConfigMissingVocabSize`, `SpecialTokenUnresolvable`, `AddedTokenIdOutOfRange`. Each variant matches one of the silent-corruption failure modes that produced the 2026-04-30 DWQ48/46 truncated-vocab regression.
+- **Per-arch `tokenizer.ggml.model` dispatch (gemma.py:649 + legacy `determine_tokenizer_model_name`):** Gemma 4 → `"gemma4"` (unconditional, gemma.py:649); BPE + byte_fallback → `"llama"` (SentencePiece-style); BPE without byte_fallback → `"gpt2"`.
+- **Per-arch `tokenizer.ggml.pre` dispatch (llama-vocab.cpp:1948-2061):** `Qwen35Moe → qwen35`, `Qwen3VlText → qwen2`, `Gemma4 / Gemma4Mmproj → gemma4`, `Llama3 / MiniMaxM2 → llama-bpe`, `Bert / NomicBert → default`.
+- **Flags fixed per gemma.py:652-653:** `add_bos_token = true`, `add_space_prefix = false`. The legacy emitter applied these unconditionally; every convert-v2 arch wants both.
+- **Chat-template priority chain (ADR-012 chat-template-auto-inject 2026-04-30):** `chat_template.jinja` sidecar → `tokenizer_config.json[chat_template]` → `chat_templates::arch_default_chat_template(arch.name())` → graceful skip.
+
+**Driver wiring at `src/convert/cli_driver.rs::run_convert_v2`:** new step 4b between `build_metadata_for_arch` and `plan_tensors` (~10 LOC). `ConvertV2Error::Tokenizer(TokenizerError)` variant added; `main.rs` cmd_convert_v2 routes it to `AppError::Input` (input-side typed-error class).
+
+**Validation:**
+
+1. **Unit tests** (`src/convert/tokenizer.rs::tests`): 8 tests covering the Gemma 4 emit happy path (model="gemma4", pre="gemma4", BOS/EOS ids, NORMAL/CONTROL classification), Llama 3 emit (model="llama", pre="llama-bpe"), Qwen35MoE pre-tokenizer dispatch, plus the 4 typed-error paths (missing tokenizer.json, missing vocab_size, unresolvable eos, byte-token / look-special heuristic pin).
+2. **Integration test** (`tests/convert_v2_integration.rs::convert_v2_gemma4_real_arch_round_trip`): now drops a 64-id synthetic tokenizer fixture into the gemma4 model dir and asserts `tokenizer.ggml.model == "gemma4"`, `tokenizer.ggml.tokens.len() == 64`, `tokenizer.ggml.bos_token_id == 60`, `tokenizer.ggml.eos_token_id == 61`. Llama3 round-trip metadata count assertion bumped from 11 to 22 (11 arch KVs + 11 tokenizer KVs). New shared helper `write_minimal_tokenizer_fixture(dir, vocab_size)` writes a deterministic fixture for every existing fixture builder.
+3. **Real-model load test:** `llama-cli -m /opt/hf2q/tmp/byte-cmp/gemma4-hf2q-q5_k_m.gguf -p "hi" -n 4 --no-warmup -no-cnv -ngl 999` now loads without the `key not found in model: tokenizer.ggml.model` error.
+
+Per [[feedback-no-backwards-compat-2026-05-18]]: the new `src/convert/tokenizer.rs` is the canonical convert-v2 path; the legacy block at `src/backends/gguf.rs:2742-3200` remains load-bearing only because P6 has not yet retired `cmd_convert`. When P6 lands, the legacy emitter is **deleted**, not aliased.
+
 ## Open questions for the operator
 
 All major open questions resolved in the 2026-05-18 interview. Remaining minor checkpoints (not blocking ADR finalization; resolve at the indicated phase boundary):

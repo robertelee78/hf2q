@@ -222,7 +222,8 @@ fn cmd_convert_v2(args: cli::ConvertV2CliArgs) -> Result<(), AppError> {
         | ConvertV2Error::DuplicateExpertIndex { .. }
         | ConvertV2Error::ApexMissingLayerCount
         | ConvertV2Error::ApexCustomOutOfScope { .. }
-        | ConvertV2Error::Apex(_) => AppError::Input(anyhow::anyhow!("{e}")),
+        | ConvertV2Error::Apex(_)
+        | ConvertV2Error::Tokenizer(_) => AppError::Input(anyhow::anyhow!("{e}")),
         ConvertV2Error::Source(_) | ConvertV2Error::Orchestrator(_) | ConvertV2Error::Io(_) => {
             AppError::Conversion(anyhow::anyhow!("{e}"))
         }
