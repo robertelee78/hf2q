@@ -380,6 +380,26 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
 - Phase A operator workaround: run stock `llama-imatrix -m <f16-gguf> -f data/calibration/cdv3.txt -o <out>.imatrix.gguf`, then `hf2q convert-v2 --quant apex-i-balanced --imatrix <out>.imatrix.gguf`. The contract sketch for the eventual `ImatrixCollector` trait lives in `src/quantize/imatrix/forward.rs` module-doc.
 - The `--imatrix-corpus` flag surfaces the typed `InTreeGenerationNotYetShipped` error pointing operators at the workaround above. Per the no-loop-suppression rule it's loud, not silent.
 
+**Phase B partial progress 2026-05-19** (commits `1995336e` → `27b69cea`):
+
+- Stage 1 (hook trait): `ImatrixCollector` trait + thread-local intercept slot installed in `forward.rs`. Done.
+- Stage 2 (callsite plumbing): `dispatch_qmatmul` (single intercept entry point — 47 call sites threaded through it) carries an `ImatrixHint` 8th arg (None / Global / Layered). The intercept fires once per matmul on F32 dense activations. Done at `652ca902`.
+- Stage 2.5 (per-row chunking): intercept slices the m×n_per_row buffer into m per-token rows + calls `collector.record` once per row, mirroring `imatrix.cpp:380-393`. Done at `33f10112`. Codex finding (shape-mismatch was eprintln+skip; should be typed `ImatrixError::ShapeMismatch` propagated through `dispatch_qmatmul`) shipped at `27b69cea`.
+
+**Stage 3 scope expansion identified 2026-05-19** — MoE intercept blocker:
+
+`dispatch_qmatmul` intercept covers DENSE matmuls only. MoE fused tensors (`blk.<i>.ffn_gate_up_exps.weight`, `blk.<i>.ffn_down_exps.weight`) dispatch via a SEPARATE kernel (`mlx_native::quantized_matmul_id_ggml_pooled` / `GgmlQuantizedMatmulIdParams`) that does NOT route through `dispatch_qmatmul`. Source verification: ~12 dispatch sites across `src/serve/forward_mlx.rs` (4: 5237, 5324, 7490, 7517), `src/serve/forward_prefill_batched.rs` (2: 2668, 2753), `src/inference/models/qwen35/gpu_ffn.rs` (6: 2560, 2569, 2674, 2946, 2955, 3040).
+
+Implication: for MoE arches (Gemma4-A4B with 128 experts, Qwen35Moe with 256 experts), the dense-only intercept produces an imatrix with `attn_q/k/v/o`, `output`, and `token_embd` entries but ZERO entries for the per-layer expert tensors. APEX I-tier quantize would then fall back to algorithmic defaults for the expert tensors — which is most of the parameter weight on a 26B-A4B model. Downstream-quality acceptance would likely fail.
+
+Stage 3 must therefore:
+1. Add a parallel intercept entry point for `quantized_matmul_id` dispatches (let's call it `intercept_qmatmul_id_with_hint`) that captures: the shared input activation row + the per-token routed expert IDs (from `moe_expert_ids` buffer) + the per-expert weight count.
+2. Extend `ImatrixCollector::record` (or add `record_moe_routed`) so the collector can split per-expert. The existing `Accumulator::absorb_moe(expert_id, row)` API at `accumulator.rs:129` already supports this — only the intercept→collector wiring is missing.
+3. Wire all ~12 MoE-id dispatch callsites with an `ImatrixHint::Layered { tag: "ffn_gate_up_exps" | "ffn_down_exps", layer }` argument.
+4. The driver itself (`compute_imatrix`) calls `run_convert` (to produce an F16 GGUF in tempfile) + `GemmaLoadedModel::load` (or `Qwen35LoadedModel::load`) + tokenize corpus + chunk + `with_collector { forward_prefill }` loop + return `ImatrixData { provenance: Computed { corpus_label, n_ctx } }`.
+
+Estimated complexity: 12 callsite edits + ~150 LOC for the MoE intercept + ~250 LOC for the driver + integration tests. Tracked as task #18 (in_progress).
+
 **Acceptance gate (Phase A):**
 
 - **Round-trip stability:** `imatrix_data_round_trip_is_byte_stable` test writes an imatrix → reloads → re-writes → asserts byte-identical. PASS.

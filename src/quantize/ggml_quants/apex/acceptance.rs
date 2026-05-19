@@ -263,6 +263,16 @@ mod tests {
             // llama-quantize --tensor-type-file semantics).
             let canonical_name = format!("{key}.weight");
             let layer_index = parse_layer_index(&canonical_name);
+            // **Placeholder shape**: `ApexPolicy::target_for` +
+            // `classify_moe_tensor` are name- and layer-driven only —
+            // the role classifier doesn't consult `tensor.shape`
+            // (grep confirms zero `tensor.shape` hits in
+            // `apex/arches.rs` + `apex/policy.rs` as of 2026-05-19).
+            // If future ApexPolicy logic introduces shape-sensitive
+            // role dispatch (per codex review on 25931974), this
+            // test would mask the divergence — update both the
+            // classifier AND every `let shape = ...` line in this
+            // test at the same commit.
             let shape = [4096usize, 1];
             let tref = TensorRef {
                 name: &canonical_name,
