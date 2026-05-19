@@ -9700,7 +9700,8 @@ pub fn dispatch_qmatmul(
                 }
             }
         },
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("imatrix intercept: {e}"))?;
 
     // ADR-029 iter-40 H40 — annotate the next-captured dispatch with this
     // call's exact reads/writes so the graph_opt reorder pass (graph.rs

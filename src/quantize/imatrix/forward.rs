@@ -175,9 +175,12 @@ where
 /// per absorbed row — NOT once per dispatch.
 ///
 /// If the materialized buffer length doesn't equal `m * n_per_row` the
-/// intercept emits a diagnostic to stderr and skips this dispatch
-/// (no panic — losing imatrix data for one dispatch is a recoverable
-/// situation; crashing the forward pass mid-corpus is not).
+/// intercept returns [`ImatrixError::ShapeMismatch`]. Per the codex
+/// review 2026-05-19 + [[feedback-no-loop-suppression-2026-05-17]] this
+/// is a typed error, not a silent skip — silently dropping activation
+/// data would bias the imatrix output. The `dispatch_qmatmul` caller
+/// propagates as an `anyhow::Error` and the forward pass aborts loudly
+/// so the operator sees the wiring bug.
 ///
 /// Fast path overhead: one `RefCell::borrow().is_none()` check (one
 /// load + branch). Per [[feedback-no-loop-suppression-2026-05-17]] this
@@ -187,56 +190,51 @@ pub fn intercept_qmatmul_with_hint<F>(
     m: usize,
     n_per_row: usize,
     materialize_buffer: F,
-) where
+) -> Result<(), ImatrixError>
+where
     F: FnOnce() -> Option<Vec<f32>>,
 {
     // Fast path: if no collector installed, return immediately.
     if !is_active() {
-        return;
+        return Ok(());
     }
     // No allocation until we know the collector wants this dispatch.
     let name = match hint {
-        ImatrixHint::None => return,
+        ImatrixHint::None => return Ok(()),
         ImatrixHint::Global(s) => s.to_string(),
         ImatrixHint::Layered { tag, layer } => format!("blk.{layer}.{tag}.weight"),
     };
 
-    IMATRIX_COLLECTOR.with(|slot| {
+    IMATRIX_COLLECTOR.with(|slot| -> Result<(), ImatrixError> {
         let mut borrow = slot.borrow_mut();
         let collector = match borrow.as_deref_mut() {
             Some(c) => c,
-            None => return,
+            None => return Ok(()),
         };
         let buf = match materialize_buffer() {
             Some(r) => r,
-            None => return,
+            None => return Ok(()),
         };
-        // Defense-in-depth: the dispatch_qmatmul caller knows `m` and
-        // `weight.info.cols`, so this assertion catches a wiring bug
-        // (wrong arg) before it corrupts the imatrix.
         let expected = m.saturating_mul(n_per_row);
         if buf.len() != expected {
-            eprintln!(
-                "[hf2q imatrix intercept] buffer/shape mismatch for {name}: \
-                 got {} f32 values, expected m*n_per_row = {}*{} = {}; skipping dispatch",
-                buf.len(),
+            return Err(ImatrixError::ShapeMismatch {
+                tensor: name,
                 m,
                 n_per_row,
+                got: buf.len(),
                 expected,
-            );
-            return;
+            });
         }
         if n_per_row == 0 || m == 0 {
-            // Defensive: no rows to record. The intercept never crashes
-            // the forward pass; the caller has already paid the sync
-            // cost so just return.
-            return;
+            // Zero-row dispatch — nothing to absorb, not an error.
+            return Ok(());
         }
         // imatrix.cpp:380-393 — accumulate per token row.
         for row in buf.chunks_exact(n_per_row) {
             collector.record(&name, row);
         }
-    });
+        Ok(())
+    })
 }
 
 /// True when a collector is currently installed on this thread. Used by
@@ -291,11 +289,12 @@ mod tests {
     use super::*;
     use crate::quantize::imatrix::corpus::CorpusSource;
 
-    /// `intercept_qmatmul_with_hint` is a no-op when no collector is installed.
+    /// `intercept_qmatmul_with_hint` is a no-op (Ok) when no collector
+    /// is installed.
     #[test]
     fn intercept_noop_without_collector() {
         let mut materialized = false;
-        intercept_qmatmul_with_hint(
+        let result = intercept_qmatmul_with_hint(
             ImatrixHint::Layered { tag: "attn_q", layer: 0 },
             /* m */ 1,
             /* n_per_row */ 2,
@@ -304,19 +303,20 @@ mod tests {
                 Some(vec![1.0, 2.0])
             },
         );
+        assert!(result.is_ok(), "no-collector path returns Ok");
         assert!(!materialized, "materialize closure should not fire");
         assert!(!is_active());
     }
 
-    /// `intercept_qmatmul_with_hint(None, ...)` is a no-op even with collector
-    /// installed (used for non-imatrix-tracked matmuls).
+    /// `intercept_qmatmul_with_hint(None, ...)` is a no-op (Ok) even
+    /// with collector installed (used for non-imatrix-tracked matmuls).
     #[test]
     fn intercept_noop_with_none_hint() {
         let collector = RecorderCollector::default();
         with_collector(collector, || {
             assert!(is_active());
             let mut materialized = false;
-            intercept_qmatmul_with_hint(
+            let result = intercept_qmatmul_with_hint(
                 ImatrixHint::None,
                 /* m */ 1,
                 /* n_per_row */ 1,
@@ -325,13 +325,14 @@ mod tests {
                     Some(vec![1.0])
                 },
             );
+            assert!(result.is_ok(), "None hint returns Ok");
             assert!(!materialized, "None hint → closure should not fire");
         });
     }
 
     /// `Layered` hint + installed collector + m=1 → record() fires
     /// exactly once with the formatted canonical GGUF name and the
-    /// full single-row slice.
+    /// full single-row slice; returns Ok.
     #[test]
     fn intercept_fires_with_collector_and_layered_hint() {
         use std::sync::Mutex;
@@ -346,12 +347,13 @@ mod tests {
 
         RECORDS.lock().unwrap().clear();
         with_collector(StaticCollector, || {
-            intercept_qmatmul_with_hint(
+            let result = intercept_qmatmul_with_hint(
                 ImatrixHint::Layered { tag: "attn_q", layer: 0 },
                 /* m */ 1,
                 /* n_per_row */ 3,
                 || Some(vec![1.0, 2.0, 3.0]),
             );
+            assert!(result.is_ok());
         });
 
         let records = RECORDS.lock().unwrap();
@@ -378,12 +380,13 @@ mod tests {
         RECORDS.lock().unwrap().clear();
         with_collector(StaticCollector, || {
             // m=3 tokens × n_per_row=2 = 6-wide buffer.
-            intercept_qmatmul_with_hint(
+            let result = intercept_qmatmul_with_hint(
                 ImatrixHint::Layered { tag: "ffn_gate", layer: 5 },
                 /* m */ 3,
                 /* n_per_row */ 2,
                 || Some(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
             );
+            assert!(result.is_ok());
         });
 
         let records = RECORDS.lock().unwrap();
@@ -394,11 +397,13 @@ mod tests {
         assert_eq!(records[2].1, vec![5.0, 6.0]);
     }
 
-    /// Buffer/shape mismatch is a typed-style skip (eprintln + no
-    /// records emitted). Crashing the forward pass mid-corpus would
-    /// lose all imatrix data; the closure is allowed to fail.
+    /// Buffer/shape mismatch returns a typed `ShapeMismatch` error
+    /// (no records emitted). Per the codex review 2026-05-19 +
+    /// [[feedback-no-loop-suppression-2026-05-17]] this is a typed
+    /// error, not a silent skip — silently dropping activation data
+    /// would bias the imatrix output.
     #[test]
-    fn intercept_skips_on_buffer_shape_mismatch() {
+    fn intercept_errors_typed_on_buffer_shape_mismatch() {
         use std::sync::Mutex;
         static RECORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -411,12 +416,28 @@ mod tests {
 
         RECORDS.lock().unwrap().clear();
         with_collector(C, || {
-            intercept_qmatmul_with_hint(
+            let result = intercept_qmatmul_with_hint(
                 ImatrixHint::Layered { tag: "attn_q", layer: 0 },
                 /* m */ 2,
                 /* n_per_row */ 4, // expects 8 floats
                 || Some(vec![1.0; 5]), // returns 5 — mismatch
             );
+            match result {
+                Err(ImatrixError::ShapeMismatch {
+                    tensor,
+                    m,
+                    n_per_row,
+                    got,
+                    expected,
+                }) => {
+                    assert_eq!(tensor, "blk.0.attn_q.weight");
+                    assert_eq!(m, 2);
+                    assert_eq!(n_per_row, 4);
+                    assert_eq!(got, 5);
+                    assert_eq!(expected, 8);
+                }
+                other => panic!("expected ShapeMismatch, got {other:?}"),
+            }
         });
         assert!(RECORDS.lock().unwrap().is_empty(), "no records on shape mismatch");
     }
@@ -436,12 +457,13 @@ mod tests {
 
         RECORDS.lock().unwrap().clear();
         with_collector(C, || {
-            intercept_qmatmul_with_hint(
+            let result = intercept_qmatmul_with_hint(
                 ImatrixHint::Global("token_embd.weight"),
                 /* m */ 1,
                 /* n_per_row */ 4,
                 || Some(vec![0.0; 4]),
             );
+            assert!(result.is_ok());
         });
         let r = RECORDS.lock().unwrap();
         assert_eq!(r.len(), 1);

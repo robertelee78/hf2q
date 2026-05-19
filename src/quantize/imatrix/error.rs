@@ -77,4 +77,23 @@ pub enum ImatrixError {
          and pass it via `--imatrix <out>.imatrix.gguf`."
     )]
     InTreeGenerationNotYetShipped { corpus: String },
+
+    /// Phase B intercept: the materialized input buffer doesn't hold
+    /// `m * n_per_row` F32 values. Indicates a wiring bug in the
+    /// `dispatch_qmatmul` callsite (wrong `m` argument, wrong
+    /// `weight.info.cols`, or a buffer allocated with extra padding
+    /// past valid data). Per [[feedback-no-loop-suppression-2026-05-17]]
+    /// this is a typed error, not a silent skip — silently dropping
+    /// activation data biases the imatrix output.
+    #[error(
+        "imatrix intercept: buffer/shape mismatch for `{tensor}`: \
+         got {got} f32 values, expected m*n_per_row = {m}*{n_per_row} = {expected}"
+    )]
+    ShapeMismatch {
+        tensor: String,
+        m: usize,
+        n_per_row: usize,
+        got: usize,
+        expected: usize,
+    },
 }
