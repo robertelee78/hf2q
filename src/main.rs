@@ -16,6 +16,7 @@ pub mod cli;
 // (workspace v0.1.0 split). See `src/core/mod.rs` for the boundary
 // rule and the planned submodule layout.
 pub mod core;
+pub mod convert;
 mod debug;
 mod doctor;
 pub mod models;
