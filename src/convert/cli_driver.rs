@@ -1,9 +1,13 @@
 //! `hf2q convert-v2 <hf-dir> --quant <name> -o <out.gguf>` driver.
 //!
 //! First operator-facing entry point for the new ADR-033 convert
-//! pipeline. Composes [`HfModelSource::load`] → per-arch
+//! pipeline. Composes [`HfModelSource::open`] → per-arch
 //! `map_tensor_name` + `build_metadata` → [`ConvertOrchestrator`] into a
-//! single end-to-end run.
+//! single end-to-end run. Streaming throughout: the source reader
+//! mmaps each safetensors shard and yields F32 tensors lazily; the
+//! orchestrator quantizes + writes one tensor at a time. Per ADR-033
+//! §"Open Issues / Real-Model Findings" 2026-05-18, this fixed the
+//! 4× SIGKILL-137 on a 26B-param real-model convert.
 //!
 //! Per ADR-033 §P0-§P3: this driver does NOT introduce any new
 //! quantization or write logic — every byte emitted comes from the
@@ -33,8 +37,10 @@ use crate::convert::arch::gemma4::MappedTensor as Gemma4Mapped;
 use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped};
 use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
 use crate::convert::quant_selector::{approximate_for_apex, QuantSelector};
+use crate::convert::orchestrator::PlanEntry;
 use crate::convert::source_reader::SourceError;
 use crate::convert::{ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError};
+use crate::quantize::ggml_quants::SourceDtype;
 use crate::quantize::ggml_quants::apex::{ApexError, ApexPolicy};
 use crate::quantize::ggml_quants::standard_policy::HParams;
 use crate::quantize::ggml_quants::ArchName;
@@ -78,8 +84,9 @@ pub struct ConvertV2Args {
 /// typed errors — never silently skipped.
 #[derive(Debug)]
 pub enum ConvertV2Error {
-    /// `HfModelSource::load` failure (missing config, malformed
-    /// safetensors, unsupported source dtype, etc.).
+    /// `HfModelSource::open` / `iter_tensors` / `materialize_tensor`
+    /// failure (missing config, malformed safetensors, unsupported
+    /// source dtype, missing FP8 sibling-scale, etc.).
     Source(SourceError),
     /// `ConvertOrchestrator::write` failure (policy reject, quantizer
     /// reject, writer I/O failure).
@@ -238,7 +245,7 @@ impl From<ApexError> for ConvertV2Error {
 /// directory.
 ///
 /// Flow:
-/// 1. [`HfModelSource::load`] reads safetensors + `config.json` to F32.
+/// 1. [`HfModelSource::open`] mmaps safetensors + reads `config.json`. Tensor metadata only.
 /// 2. Detect arch from `config["model_type"]` / `config["architectures"]`.
 /// 3. Build a [`ConvertOrchestrator`] pinned to that arch + ftype +
 ///    [`HParams`] from config.
@@ -254,8 +261,12 @@ impl From<ApexError> for ConvertV2Error {
 /// 6. Emit metadata via the arch's `build_metadata`.
 /// 7. [`ConvertOrchestrator::write`] → BufWriter over the output file.
 pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
-    // ----- 1. Load source ---------------------------------------------------
-    let src = HfModelSource::load(&args.hf_dir)?;
+    // ----- 1. Open source (mmap, metadata-only) ---------------------------
+    // Per ADR-033 §"Open Issues / Real-Model Findings" 2026-05-18: the
+    // source reader does NOT load every safetensors shard into RAM. It
+    // mmaps each shard and records a flat tensor index. Payload bytes are
+    // read one tensor at a time in the streaming stage below.
+    let src = HfModelSource::open(&args.hf_dir)?;
 
     // ----- 2. Detect arch ---------------------------------------------------
     let arch = detect_arch(&src.config)?;
@@ -292,36 +303,47 @@ pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
         }
     };
 
-    // ----- 4-5. Map + stage every tensor (with MoE expert fusion) ---------
-    //
-    // Some arches require tensors that are NOT in the safetensors but
-    // ARE part of the canonical GGUF (e.g. Gemma 4's `rope_freqs.weight`
-    // proportional-rope mask, synthesized at convert time per
-    // `gemma.py::Gemma4Model::generate_extra_tensors`). We compute them
-    // here and append to the source list BEFORE the staging loop so they
-    // flow through the same map/stage path as on-disk tensors (the
-    // gemma4 mapper recognizes `rope_freqs.weight` via the
-    // `Direct(s) → push_direct` path, and the orchestrator's F32-keep
-    // gate emits them raw — see `is_f32_keep_tensor`).
-    let mut hf_tensors: Vec<HfTensor> = src.tensors;
-    hf_tensors.extend(synthesized_tensors_for_arch(arch, &src.config));
-    stage_tensors(&mut orch, arch, &hf_tensors, &src.config)?;
-
-    // ----- 6. Emit metadata -------------------------------------------------
+    // ----- 4. Emit metadata (orchestrator buffers it for begin_write) ----
     let ftype_u32 = ftype_for_metadata as u32;
     for (k, v) in build_metadata_for_arch(arch, &src.config, ftype_u32) {
         orch.add_metadata(k, v);
     }
 
-    // ----- 7. Write GGUF ----------------------------------------------------
+    // ----- 5. Plan + stream tensors (with MoE expert fusion) -------------
+    //
+    // Some arches require tensors that are NOT in the safetensors but
+    // ARE part of the canonical GGUF (e.g. Gemma 4's `rope_freqs.weight`
+    // proportional-rope mask, synthesized at convert time per
+    // `gemma.py::Gemma4Model::generate_extra_tensors`). We synthesize
+    // them here as fully-materialized F32 `HfTensor`s and flow them
+    // through the same map/plan/stream path as on-disk tensors.
+    let synthesized: Vec<HfTensor> = synthesized_tensors_for_arch(arch, &src.config);
+    let plan = build_convert_plan(arch, &src, &synthesized)?;
+
+    // 5a. Orchestrator plan-phase: feed every tensor's metadata, no
+    // payload bytes.
+    let plan_entries: Vec<PlanEntry> = plan.steps.iter().map(|s| s.plan_entry()).collect();
+    orch.plan_tensors(plan_entries)?;
+
+    // 5b. Begin writing — header + KVs + tensor-info reservations.
     let f = File::create(&args.output)?;
-    let mut bw = BufWriter::new(f);
-    orch.write(&mut bw)?;
-    // BufWriter::drop flushes, but we surface flush errors explicitly so
-    // callers see disk-full / EIO at the convert-v2 boundary instead of
-    // a silent partial write.
-    use std::io::Write as _;
-    bw.flush()?;
+    let bw = BufWriter::new(f);
+    let mut sw = orch.begin_write(bw)?;
+
+    // 5c. Stream every tensor's data in plan order. MoE fusion happens
+    // inline: each Fused step loads N expert slices in expert_index
+    // order, concatenates their F32 buffers, and pushes the fused
+    // payload to the writer. Per-call peak memory is bounded by the
+    // single largest tensor (Direct) or the largest fused group (Fused).
+    for (idx, step) in plan.steps.iter().enumerate() {
+        let data: Vec<f32> = step.materialize(&src, &synthesized)?;
+        sw.stream_tensor(idx, &data)?;
+        // `data` drops here — the next iteration's allocation reuses
+        // the freed pages.
+    }
+
+    // 5d. Finalize — seek-back to fill tensor offsets, flush.
+    sw.finalize()?;
     Ok(())
 }
 
@@ -695,50 +717,219 @@ fn expert_role_to_kind(r: ExpertRole) -> ExpertKind {
 }
 
 // ============================================================================
-// Tensor staging + MoE expert fusion
+// Convert plan + streaming MoE expert fusion
 // ============================================================================
+//
+// Per ADR-033 §"Open Issues / Real-Model Findings" 2026-05-18: the
+// previous staging path collected every HF tensor's F32 payload into a
+// `Vec<HfTensor>` and then handed the full vector to the orchestrator
+// (which copied it again into its internal `Vec<StagedTensor>`). For
+// Gemma 4 26B this peaked at ~104 GB RSS on a 48 GB safetensors source
+// and got SIGKILL'd on a 64 GB Mac. The new staging path runs in two
+// metadata-only passes (plan + streaming-iteration index) and a single
+// data pass (one tensor's F32 buffer alive at a time).
+//
+// The MoE expert-fusion case is the only one where multiple HF tensors
+// fuse into one GGUF tensor, so the streaming data pass holds at most
+// one fused group's experts in memory simultaneously (e.g. Gemma 4 26B
+// with 128 experts at ~10 MB each = ~1.3 GB per group — fits easily).
 
-/// One per-expert slice buffered until its group is complete.
-///
-/// The orchestrator's `add_tensor` takes ONE tensor at a time; MoE
-/// arches need to BUFFER every expert of a `(layer, kind)` group and
-/// emit a single fused 3-D tensor once all `n_experts` have been seen.
-/// This is the buffer entry.
-struct ExpertSlice {
-    expert_index: usize,
-    /// PyTorch-order shape (`[out, in]` for gate/up; `[hidden, ffn]`
-    /// for down). Reversed to GGUF order at fusion time.
-    py_shape: Vec<usize>,
-    /// F32 row-major data, length = `py_shape.iter().product()`.
-    data: Vec<f32>,
-    source_dtype: crate::quantize::ggml_quants::SourceDtype,
+/// One step of the convert plan: either a direct 1:1 HF→GGUF mapping,
+/// an MoE expert fusion that consumes N HF tensors, or a synthesized
+/// tensor (produced by `synthesized_tensors_for_arch`, not on disk).
+#[derive(Debug, Clone)]
+enum PlanStep {
+    /// One HF safetensors tensor → one GGUF tensor (1:1 rename + shape
+    /// reverse). Carries the canonical GGUF name + shape + source dtype
+    /// + (optional) layer index.
+    Direct {
+        hf_name: String,
+        gguf_name: String,
+        /// GGUF-order shape (PyTorch order reversed).
+        gguf_shape: Vec<usize>,
+        source_dtype: SourceDtype,
+        layer_index: Option<usize>,
+    },
+    /// N MoE expert slices fuse into one 3-D GGUF tensor of shape
+    /// `[in, out, n_experts]`. `member_hf_names` is in expert_index
+    /// order (sorted at plan build time).
+    Fused {
+        gguf_name: String,
+        /// GGUF-order shape = `[per_expert_shape.reverse(), n_experts]`.
+        gguf_shape_fused: Vec<usize>,
+        /// HF tensor names of every expert slice, sorted by
+        /// expert_index so the stream-time concatenation produces the
+        /// `torch.stack(slices, dim=0)` byte layout.
+        member_hf_names: Vec<String>,
+        /// PyTorch-order shape of ONE expert slice. Used for the
+        /// per-slice length-check at stream time.
+        per_expert_py_shape: Vec<usize>,
+        source_dtype: SourceDtype,
+        layer_index: Option<usize>,
+    },
+    /// A synthesized tensor (currently only Gemma 4's `rope_freqs.weight`).
+    /// `synth_idx` indexes into the synthesized tensor list passed to
+    /// `PlanStep::materialize`.
+    Synthesized {
+        gguf_name: String,
+        gguf_shape: Vec<usize>,
+        source_dtype: SourceDtype,
+        layer_index: Option<usize>,
+        synth_idx: usize,
+    },
 }
 
-/// Stage every HF tensor into the orchestrator. The MoE accumulator is
-/// drained at the end (after every safetensors tensor has been
-/// processed), and any group that did not see exactly `n_experts`
-/// experts surfaces as [`ConvertV2Error::IncompleteExpertGroup`].
-fn stage_tensors(
-    orch: &mut ConvertOrchestrator,
+impl PlanStep {
+    /// Cheap projection to an orchestrator `PlanEntry` (no payload).
+    fn plan_entry(&self) -> PlanEntry {
+        match self {
+            PlanStep::Direct {
+                gguf_name,
+                gguf_shape,
+                source_dtype,
+                layer_index,
+                ..
+            } => PlanEntry {
+                name: gguf_name.clone(),
+                shape: gguf_shape.clone(),
+                source_dtype: *source_dtype,
+                layer_index: *layer_index,
+            },
+            PlanStep::Fused {
+                gguf_name,
+                gguf_shape_fused,
+                source_dtype,
+                layer_index,
+                ..
+            } => PlanEntry {
+                name: gguf_name.clone(),
+                shape: gguf_shape_fused.clone(),
+                source_dtype: *source_dtype,
+                layer_index: *layer_index,
+            },
+            PlanStep::Synthesized {
+                gguf_name,
+                gguf_shape,
+                source_dtype,
+                layer_index,
+                ..
+            } => PlanEntry {
+                name: gguf_name.clone(),
+                shape: gguf_shape.clone(),
+                source_dtype: *source_dtype,
+                layer_index: *layer_index,
+            },
+        }
+    }
+
+    /// Pull the F32 data for this step from the source / synthesized
+    /// list. For `Direct` and `Synthesized` this is one allocation; for
+    /// `Fused` this is a single concatenated allocation containing
+    /// every expert slice's F32 data in expert_index order.
+    fn materialize(
+        &self,
+        src: &HfModelSource,
+        synthesized: &[HfTensor],
+    ) -> Result<Vec<f32>, ConvertV2Error> {
+        match self {
+            PlanStep::Direct { hf_name, .. } => {
+                let ht = src.materialize_tensor(hf_name)?;
+                Ok(ht.data)
+            }
+            PlanStep::Fused {
+                member_hf_names,
+                per_expert_py_shape,
+                ..
+            } => {
+                let per_expert_elems: usize = per_expert_py_shape.iter().product();
+                let mut fused: Vec<f32> =
+                    Vec::with_capacity(per_expert_elems * member_hf_names.len());
+                for name in member_hf_names {
+                    let ht = src.materialize_tensor(name)?;
+                    if ht.data.len() != per_expert_elems {
+                        return Err(ConvertV2Error::Source(SourceError::Safetensors(format!(
+                            "fused expert slice `{name}`: data len {} != expected per-expert {}",
+                            ht.data.len(),
+                            per_expert_elems
+                        ))));
+                    }
+                    fused.extend_from_slice(&ht.data);
+                    // `ht` drops here — only `fused` (which already
+                    // copied the bytes) stays live.
+                }
+                Ok(fused)
+            }
+            PlanStep::Synthesized { synth_idx, .. } => {
+                let t = synthesized.get(*synth_idx).ok_or_else(|| {
+                    ConvertV2Error::Source(SourceError::Safetensors(format!(
+                        "synthesized tensor index {synth_idx} out of range"
+                    )))
+                })?;
+                Ok(t.data.clone())
+            }
+        }
+    }
+}
+
+/// A complete convert plan: every step in deterministic emission order.
+/// Built once from the source's tensor metadata + the synthesized
+/// tensor list; consumed twice — once by the orchestrator's plan-phase
+/// (metadata only) and once by the streaming-write phase (one
+/// `materialize` call per step, F32 bytes allocated and dropped within
+/// one iteration).
+struct ConvertPlan {
+    steps: Vec<PlanStep>,
+}
+
+/// Build the convert plan from the source's tensor metadata + the
+/// synthesized tensor list. **No payload bytes touched.**
+///
+/// The plan walks the source's metadata once, classifying each tensor
+/// via `map_tensor`:
+///   - `Direct` → push a `PlanStep::Direct` entry in source order.
+///   - `Expert` → buffer into a `(layer, kind)` accumulator (just the
+///     HF name + expert index + per-expert PyTorch shape — no data).
+///   - `Drop` → trace and skip.
+///   - `Unmapped` → typed error.
+///
+/// The accumulator is drained at the end into `PlanStep::Fused` entries
+/// in `(layer, kind)` order (deterministic — matches the previous
+/// buffered staging behavior). Synthesized tensors are appended in
+/// their original order.
+///
+/// Per [[feedback-no-loop-suppression-2026-05-17]]: incomplete /
+/// duplicate / non-contiguous expert groups surface as typed errors
+/// here, before any GGUF bytes are written.
+fn build_convert_plan(
     arch: ArchName,
-    hf_tensors: &[HfTensor],
-    config: &serde_json::Value,
-) -> Result<(), ConvertV2Error> {
-    // MoE accumulator: (layer, kind) -> Vec<ExpertSlice>. Capacity
-    // sized to n_experts when known; defaults to zero (dense arches
-    // never insert into this map).
-    let n_experts = config
+    src: &HfModelSource,
+    synthesized: &[HfTensor],
+) -> Result<ConvertPlan, ConvertV2Error> {
+    let n_experts = src
+        .config
         .get("num_experts")
-        .or_else(|| config.get("num_local_experts"))
+        .or_else(|| src.config.get("num_local_experts"))
         .and_then(|v| v.as_u64())
         .map(|x| x as usize);
 
-    let mut moe_accum: HashMap<(usize, ExpertKindKey), MoeGroup> = HashMap::new();
+    let mut direct_steps: Vec<PlanStep> = Vec::new();
+    let mut moe_accum: HashMap<(usize, ExpertKindKey), MoePlanGroup> = HashMap::new();
 
-    for ht in hf_tensors {
-        match map_tensor(arch, &ht.name) {
+    for meta in src.tensor_metas() {
+        match map_tensor(arch, &meta.name) {
             MapOutcome::Direct(gguf_name) => {
-                push_direct(orch, &gguf_name, ht);
+                let gguf_shape: Vec<usize> = meta.shape.iter().rev().copied().collect();
+                let layer_index = gguf_name
+                    .strip_prefix("blk.")
+                    .and_then(|s| s.split('.').next())
+                    .and_then(|s| s.parse::<usize>().ok());
+                direct_steps.push(PlanStep::Direct {
+                    hf_name: meta.name.clone(),
+                    gguf_name,
+                    gguf_shape,
+                    source_dtype: meta.source_dtype,
+                    layer_index,
+                });
             }
             MapOutcome::Expert {
                 gguf_name,
@@ -747,15 +938,17 @@ fn stage_tensors(
                 kind,
             } => {
                 let key = (layer, ExpertKindKey::from(kind));
-                let group = moe_accum.entry(key).or_insert_with(|| MoeGroup {
+                let group = moe_accum.entry(key).or_insert_with(|| MoePlanGroup {
                     gguf_name: gguf_name.clone(),
                     kind,
-                    slices: Vec::with_capacity(n_experts.unwrap_or(0)),
+                    members: Vec::with_capacity(n_experts.unwrap_or(0)),
+                    per_expert_py_shape: meta.shape.clone(),
+                    source_dtype: meta.source_dtype,
                 });
                 // Detect duplicate expert indices (mapper bug or
                 // corrupt checkpoint). Per no-loop-suppression: surface
                 // instead of silent overwrite.
-                if group.slices.iter().any(|s| s.expert_index == expert_index) {
+                if group.members.iter().any(|m| m.expert_index == expert_index) {
                     return Err(ConvertV2Error::DuplicateExpertIndex {
                         gguf_name,
                         layer,
@@ -763,11 +956,9 @@ fn stage_tensors(
                         expert_index,
                     });
                 }
-                group.slices.push(ExpertSlice {
+                group.members.push(MoePlanMember {
+                    hf_name: meta.name.clone(),
                     expert_index,
-                    py_shape: ht.shape.clone(),
-                    data: ht.data.clone(),
-                    source_dtype: ht.source_dtype,
                 });
             }
             MapOutcome::Drop => {
@@ -777,69 +968,64 @@ fn stage_tensors(
                 tracing::debug!(
                     target: "convert_v2",
                     arch = arch.name(),
-                    tensor = %ht.name,
+                    tensor = %meta.name,
                     "convert-v2: explicit drop per arch mapper"
                 );
             }
             MapOutcome::Unmapped => {
                 return Err(ConvertV2Error::UnmappedTensor {
-                    hf_name: ht.name.clone(),
+                    hf_name: meta.name.clone(),
                     arch: arch.name().to_string(),
                 });
             }
         }
     }
 
-    // ----- Drain MoE accumulator ------------------------------------------
-    // The orchestrator's add_tensor takes one tensor at a time, so the
-    // accumulator BUFFERS every expert of a (layer, kind) group and
-    // emits a single fused 3-D tensor once all `n_experts` slices are
-    // present. We sort by expert_index, flatten the F32 data, and push
-    // one StagedTensor per group.
+    // ----- Drain MoE accumulator into fused plan steps --------------------
     let expected_n_experts = n_experts.unwrap_or(0);
-    let mut groups: Vec<((usize, ExpertKindKey), MoeGroup)> = moe_accum.into_iter().collect();
-    // Deterministic emission order: by (layer, kind). The orchestrator
-    // does not require any specific order, but a stable order makes
-    // diffing two convert-v2 runs byte-identical at the staging step.
+    let mut groups: Vec<((usize, ExpertKindKey), MoePlanGroup)> =
+        moe_accum.into_iter().collect();
+    // Deterministic emission order: by (layer, kind). Two convert-v2
+    // runs on the same input produce identical plan orders.
     groups.sort_by_key(|(k, _)| (k.0, k.1 as u8));
 
+    let mut fused_steps: Vec<PlanStep> = Vec::with_capacity(groups.len());
     for ((layer, _kind_key), group) in groups {
-        let MoeGroup {
+        let MoePlanGroup {
             gguf_name,
             kind,
-            mut slices,
+            mut members,
+            per_expert_py_shape,
+            source_dtype,
         } = group;
         if expected_n_experts == 0 {
-            // No `num_experts` / `num_local_experts` in config but we
-            // saw expert slices — config is incoherent. Carry the
-            // best-effort diagnostic.
             return Err(ConvertV2Error::IncompleteExpertGroup {
                 gguf_name,
                 layer,
                 kind_label: expert_kind_label(kind),
-                present_count: slices.len(),
+                present_count: members.len(),
                 n_experts_config: 0,
             });
         }
-        if slices.len() != expected_n_experts {
+        if members.len() != expected_n_experts {
             return Err(ConvertV2Error::IncompleteExpertGroup {
                 gguf_name,
                 layer,
                 kind_label: expert_kind_label(kind),
-                present_count: slices.len(),
+                present_count: members.len(),
                 n_experts_config: expected_n_experts,
             });
         }
-        slices.sort_by_key(|s| s.expert_index);
+        members.sort_by_key(|m| m.expert_index);
 
         // Sanity: expert indices are contiguous [0, n_experts).
-        for (i, s) in slices.iter().enumerate() {
-            if s.expert_index != i {
+        for (i, m) in members.iter().enumerate() {
+            if m.expert_index != i {
                 return Err(ConvertV2Error::IncompleteExpertGroup {
                     gguf_name,
                     layer,
                     kind_label: expert_kind_label(kind),
-                    present_count: slices.len(),
+                    present_count: members.len(),
                     n_experts_config: expected_n_experts,
                 });
             }
@@ -849,63 +1035,100 @@ fn stage_tensors(
         // each per-expert PyTorch shape `[out, in]` reversed to GGUF
         // `[in, out]`, then an outer `n_experts` slot appended →
         // fused GGUF shape `[in, out, n_experts]` (innermost-first).
-        // Data is `torch.stack(slices, dim=0)` in PyTorch axis order,
-        // which in row-major bytes is just the concatenation of every
-        // slice's F32 data in expert_index order.
-        let per_expert_py_shape = slices[0].py_shape.clone();
-        // All slices must have the same per-expert shape — the mapper
-        // contract guarantees this. Sanity-check defensively.
-        for s in &slices {
-            debug_assert_eq!(
-                s.py_shape, per_expert_py_shape,
-                "expert slice shape mismatch for `{gguf_name}` (layer={layer})"
-            );
-        }
-        let mut fused_shape_gguf: Vec<usize> =
+        let mut gguf_shape_fused: Vec<usize> =
             per_expert_py_shape.iter().rev().copied().collect();
-        fused_shape_gguf.push(expected_n_experts);
+        gguf_shape_fused.push(expected_n_experts);
 
-        // Flatten data: concatenate every slice's F32 buffer in
-        // expert_index order. Row-major contiguity is preserved.
-        let per_expert_elems: usize = per_expert_py_shape.iter().product();
-        let mut fused_data: Vec<f32> =
-            Vec::with_capacity(per_expert_elems * expected_n_experts);
-        let source_dtype = slices[0].source_dtype;
-        for s in slices {
-            debug_assert_eq!(s.data.len(), per_expert_elems);
-            fused_data.extend_from_slice(&s.data);
-        }
-
-        orch.add_tensor(
+        let member_hf_names: Vec<String> = members.into_iter().map(|m| m.hf_name).collect();
+        fused_steps.push(PlanStep::Fused {
             gguf_name,
-            fused_shape_gguf,
-            fused_data,
+            gguf_shape_fused,
+            member_hf_names,
+            per_expert_py_shape,
             source_dtype,
-            Some(layer),
-        );
+            layer_index: Some(layer),
+        });
     }
 
-    Ok(())
+    // ----- Append synthesized tensors -------------------------------------
+    // Currently only Gemma 4's `rope_freqs.weight`; routed through
+    // `map_tensor` to get the canonical GGUF name (`Direct` outcome).
+    // The driver's old code path appended them to a `Vec<HfTensor>`
+    // BEFORE staging; we mirror the same insertion order here so the
+    // GGUF layout matches byte-for-byte.
+    let mut synth_steps: Vec<PlanStep> = Vec::new();
+    for (synth_idx, t) in synthesized.iter().enumerate() {
+        match map_tensor(arch, &t.name) {
+            MapOutcome::Direct(gguf_name) => {
+                let gguf_shape: Vec<usize> = t.shape.iter().rev().copied().collect();
+                let layer_index = gguf_name
+                    .strip_prefix("blk.")
+                    .and_then(|s| s.split('.').next())
+                    .and_then(|s| s.parse::<usize>().ok());
+                synth_steps.push(PlanStep::Synthesized {
+                    gguf_name,
+                    gguf_shape,
+                    source_dtype: t.source_dtype,
+                    layer_index,
+                    synth_idx,
+                });
+            }
+            MapOutcome::Drop => {
+                tracing::debug!(
+                    target: "convert_v2",
+                    arch = arch.name(),
+                    tensor = %t.name,
+                    "convert-v2: synthesized tensor explicit-drop per arch mapper"
+                );
+            }
+            MapOutcome::Expert { .. } => {
+                // Synthesized MoE experts are not currently produced by
+                // any arch. If a future arch needs them, route through
+                // the same fusion accumulator above. For now this is a
+                // hard error rather than a silent skip.
+                return Err(ConvertV2Error::UnmappedTensor {
+                    hf_name: t.name.clone(),
+                    arch: arch.name().to_string(),
+                });
+            }
+            MapOutcome::Unmapped => {
+                return Err(ConvertV2Error::UnmappedTensor {
+                    hf_name: t.name.clone(),
+                    arch: arch.name().to_string(),
+                });
+            }
+        }
+    }
+
+    // Final plan order: direct → fused → synthesized. Matches the
+    // previous buffered staging path (direct tensors emitted in source
+    // order, fused tensors emitted after all directs, synthesized
+    // appended last per the old `hf_tensors.extend(synthesized_*)` ordering).
+    let mut steps: Vec<PlanStep> =
+        Vec::with_capacity(direct_steps.len() + fused_steps.len() + synth_steps.len());
+    steps.extend(direct_steps);
+    steps.extend(fused_steps);
+    steps.extend(synth_steps);
+    Ok(ConvertPlan { steps })
 }
 
-/// Map a `Direct` HF tensor into the orchestrator. PyTorch shape
-/// `[out, in]` (or any rank) reverses to GGUF order (innermost-first).
-/// 1-D RMSNorm / bias tensors stay 1-D after `reverse()` — that's the
-/// intended GGUF representation; the orchestrator's policy decides
-/// whether to F32-pass-through or quantize.
-fn push_direct(orch: &mut ConvertOrchestrator, gguf_name: &str, ht: &HfTensor) {
-    let gguf_shape: Vec<usize> = ht.shape.iter().rev().copied().collect();
-    let layer_index = gguf_name
-        .strip_prefix("blk.")
-        .and_then(|s| s.split('.').next())
-        .and_then(|s| s.parse::<usize>().ok());
-    orch.add_tensor(
-        gguf_name.to_string(),
-        gguf_shape,
-        ht.data.clone(),
-        ht.source_dtype,
-        layer_index,
-    );
+/// Inside-MoE-accumulator membership record. One per `(layer, kind,
+/// expert_index)` triple. **No payload bytes** — the F32 data is loaded
+/// lazily during the streaming-write phase from the HF name.
+struct MoePlanMember {
+    hf_name: String,
+    expert_index: usize,
+}
+
+/// Per-(layer, kind) MoE accumulator entry used during plan building.
+struct MoePlanGroup {
+    gguf_name: String,
+    kind: ExpertKind,
+    members: Vec<MoePlanMember>,
+    /// PyTorch-order shape of ONE expert slice. The fused GGUF shape is
+    /// `per_expert_py_shape.reverse() ++ [n_experts]`.
+    per_expert_py_shape: Vec<usize>,
+    source_dtype: SourceDtype,
 }
 
 // ----- ExpertKind helpers ----------------------------------------------------
@@ -938,13 +1161,6 @@ fn expert_kind_label(k: ExpertKind) -> &'static str {
         ExpertKind::Up => "up",
         ExpertKind::Down => "down",
     }
-}
-
-/// Buffered per-(layer, kind) MoE group used during staging.
-struct MoeGroup {
-    gguf_name: String,
-    kind: ExpertKind,
-    slices: Vec<ExpertSlice>,
 }
 
 // ============================================================================

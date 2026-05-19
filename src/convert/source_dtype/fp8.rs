@@ -1,7 +1,7 @@
 //! `float8_e4m3fn` (1-bit sign + 4-bit exponent + 3-bit mantissa, no
 //! Inf, single NaN encoding) dequantizer with HF block-wise scaling.
 //!
-//! Used by [`crate::convert::source_reader::HfModelSource::load`] when
+//! Used by [`crate::convert::source_reader::HfModelSource::open`] when
 //! `config.json::quantization_config.quant_method == "fp8"`. This is the
 //! source format DeepSeek-V3, MiniMax-M2.7, and similar large-MoE
 //! releases publish; the convert pipeline upcasts to F32 in-memory

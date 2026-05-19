@@ -27,15 +27,15 @@ pub mod source_dtype;
 pub mod source_reader;
 
 pub use cli_driver::{run_convert_v2, ConvertV2Args, ConvertV2Error};
-pub use orchestrator::{ConvertOrchestrator, OrchestratorError};
+pub use orchestrator::{ConvertOrchestrator, OrchestratorError, PlanEntry, StreamingWriter};
 pub use quant_selector::{approximate_for_apex, QuantSelector, QuantSelectorError};
-pub use source_reader::{HfModelSource, HfTensor, SourceError};
+pub use source_reader::{HfModelSource, HfTensor, SourceError, TensorMeta};
 
 #[cfg(test)]
 mod tests {
     //! End-to-end acceptance test for the new Llama3 convert path:
     //! synthesize a tiny Llama-3-shaped safetensors directory + config,
-    //! run it through `HfModelSource::load` + `map_tensor_name` +
+    //! run it through `HfModelSource::open` + `map_tensor_name` +
     //! `ConvertOrchestrator`, then re-parse via `mlx_native::gguf::GgufFile`
     //! and verify every tensor name + shape round-trips.
 
@@ -141,7 +141,7 @@ mod tests {
         // though we'll exclude it from the orchestrator feed (norm
         // tensors hit the policy's F32 passthrough — see the
         // module-level caveat above). Including it in the safetensors
-        // file exercises `HfModelSource::load` for 1-D shapes too.
+        // file exercises `HfModelSource::open` for 1-D shapes too.
         tensors.push((
             "model.embed_tokens.weight".into(),
             vec![VOCAB, HIDDEN],
@@ -255,13 +255,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         synthesize_tiny_llama3(dir.path());
 
-        // ----- 2. Load via HfModelSource ------------------------------
-        let src = HfModelSource::load(dir.path()).expect("HfModelSource::load");
+        // ----- 2. Open via HfModelSource (streaming-mmap, no buffered Vec) ----
+        let src = HfModelSource::open(dir.path()).expect("HfModelSource::open");
         assert_eq!(
-            src.tensors.len(),
+            src.tensor_count(),
             3 + 9 * 2,
             "expected 21 HF tensors in the synthetic model (3 globals + 9 per-block × 2 layers)"
         );
+        // Materialize them into a vec for the test's downstream
+        // assertions. (Real driver code streams one at a time; this test
+        // checks the path-mapping, so it doesn't matter that the test
+        // itself collects.)
+        let src_tensors: Vec<HfTensor> = src
+            .iter_tensors()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream");
 
         // ----- 3. Build the orchestrator at MostlyQ8_0 + Llama3 ------
         // Q8_0 has block_size=32; every weight's innermost dim is 32 or
@@ -287,7 +295,7 @@ mod tests {
             orch.add_metadata(k, v);
         }
 
-        // ----- 5. Map + add every tensor ----------------------------
+        // ----- 5. Map + plan every tensor ---------------------------
         // Strategy:
         //   - Map HF name → GGUF name via `llama3::map_tensor_name`.
         //   - Skip 1-D RMSNorm weights (policy → F32 → no Quantizer;
@@ -302,7 +310,9 @@ mod tests {
         //     since the orchestrator uses it for QsState counters.
         let mut expected_gguf_names: Vec<String> = Vec::new();
         let mut expected_shapes: HashMap<String, Vec<usize>> = HashMap::new();
-        for ht in &src.tensors {
+        let mut plan: Vec<PlanEntry> = Vec::new();
+        let mut datas: Vec<Vec<f32>> = Vec::new();
+        for ht in &src_tensors {
             let gguf_name = llama3::map_tensor_name(&ht.name)
                 .unwrap_or_else(|| panic!("unmapped HF tensor `{}`", ht.name));
 
@@ -313,8 +323,7 @@ mod tests {
             }
 
             // PyTorch [out, in] → GGUF [in, out]. The orchestrator
-            // requires GGUF order (innermost-first); see the doc on
-            // `StagedTensor::shape`.
+            // requires GGUF order (innermost-first).
             let gguf_shape: Vec<usize> = ht.shape.iter().rev().copied().collect();
 
             // `mlx_native::gguf::GgufFile` REVERSES on parse — so the
@@ -330,13 +339,13 @@ mod tests {
                 .and_then(|s| s.split('.').next())
                 .and_then(|s| s.parse::<usize>().ok());
 
-            orch.add_tensor(
-                gguf_name,
-                gguf_shape,
-                ht.data.clone(),
-                ht.source_dtype,
+            plan.push(PlanEntry {
+                name: gguf_name,
+                shape: gguf_shape,
+                source_dtype: ht.source_dtype,
                 layer_index,
-            );
+            });
+            datas.push(ht.data.clone());
         }
 
         // Sanity: 2-D tensor count.
@@ -349,11 +358,17 @@ mod tests {
             "expected 16 quantizable 2-D tensors (2 globals + 7 per-block × 2 layers)"
         );
 
+        orch.plan_tensors(plan).expect("plan");
+
         // ----- 6. Write to disk + reparse ---------------------------
         let out = tempfile::NamedTempFile::new().unwrap();
         {
             let f = fs::File::create(out.path()).unwrap();
-            orch.write(f).expect("orchestrator write");
+            let mut sw = orch.begin_write(f).expect("begin_write");
+            for (idx, d) in datas.iter().enumerate() {
+                sw.stream_tensor(idx, d).expect("stream");
+            }
+            sw.finalize().expect("finalize");
         }
 
         let gguf = mlx_native::gguf::GgufFile::open(out.path()).expect("parse output GGUF");

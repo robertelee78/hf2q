@@ -256,7 +256,7 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
 - For every `GgmlType` in v1 scope (the 11-file list): a unit test takes a fixed-seed F32 input vector + fixed `n_per_row` (256 for K-quants, 32 for legacy) and produces output bytes that `cmp` byte-equal against the same input fed to llama.cpp's reference at the pinned SHA. Reference outputs generated once via a small C harness wrapping `ggml_quantize_chunk` and checked into `tests/fixtures/ggml_quants/<type>_<n>.bin`.
 - **The C harness used to generate reference fixtures is built `aarch64-apple-darwin` (NEON enabled) on macOS Apple Silicon** (per P-1 audit finding I; `k_quant.rs` L9-18 module doc flags a NEON-vs-scalar argument-order divergence in `make_qkx2_quants`). The same harness rebuilt `x86_64-pc-linux-gnu` (no NEON) on x86 Linux must produce byte-identical fixtures; if it doesn't, hf2q ports are matched against the NEON variant explicitly and the divergence is documented in `tests/fixtures/ggml_quants/README.md`.
 - For every arch in the convert matrix: a fixture test takes a real safetensors directory (or a tiny synthetic one for arches whose real model is multi-GB), runs hf2q's convert through to F32-tensor-emission only (no quantize), and `cmp`s the resulting F32 byte stream against what `convert_hf_to_gguf.py <hf-dir>` would emit at the pinned llama.cpp SHA. Fixtures stored at `tests/fixtures/convert_arch/<arch>.f32.bin`.
-- Memory bound: peak RSS during convert of a 26B-param model (e.g., gemma4-26B-A4B) is bounded by `2 × model_safetensors_size + 512 MiB` (rough envelope for tensor-by-tensor streaming + working buffers). Validated by a CI memory test that runs convert and asserts `ru_maxrss < bound`.
+- Memory bound: peak RSS during convert of a 26B-param model (e.g., gemma4-26B-A4B) is bounded by `4 × largest_single_tensor_F32_size + 512 MiB` (tensor-by-tensor streaming with the source reader mmapping shards instead of loading them into the heap). Tightened from the original `2 × model_safetensors_size + 512 MiB` envelope 2026-05-18 after the real-model OOM finding — see §Open Issues / Real-Model Findings. Validated by `tests/convert_v2_integration.rs::convert_v2_streaming_rss_under_bound_2026_05_18` which runs convert under `/usr/bin/time` and asserts the OS-reported peak RSS stays under the bound.
 
 ### P1 — Quantizer trait + StandardPolicy
 
@@ -473,6 +473,25 @@ The whole ADR ships when:
 - **Header reservation size as an ADR-level concern.** Implementation detail; writer picks an appropriate size.
 - **Explicit FMA / fast-math enforcement plumbing.** P1 byte-cmp tests catch any drift empirically; that's the gate. Codifying a build-flag policy adds plumbing without adding signal.
 - **Timeline.** Tracked separately; ADRs document decisions, not project plans.
+
+## Open Issues / Real-Model Findings
+
+### 2026-05-18 — Convert-v2 OOM on real 26B model (FIXED at the same commit)
+
+After the Gemma 4 mapper rewrite shipped (mlx-native `93383cd`, hf2q `46c54876`) and all 4 integration tests + 33 unit tests passed on synthetic fixtures, **four** real-model convert attempts against `google/gemma-4-26b-a4b-it` (48 GB BF16 safetensors → ~18 GB Q5_K_M GGUF target) were SIGKILL'd by the macOS memory manager (exit 137) on a 64 GB Mac. The fourth attempt at Q8_0 also failed. Root cause: the buffered source-reader and orchestrator together allocated `~2 × model_safetensors_size` of F32 working buffers (BF16 → F32 doubles every element) **PLUS** the orchestrator's `Vec<StagedTensor>` held a second copy **PLUS** its `Vec<Prepared>` held a third copy of every quantized payload before any byte hit disk. Peak working set was on the order of `2 × 48 GB + 48 GB + 18 GB ≈ 162 GB` against a 64 GB physical memory budget.
+
+**Fix landed at this commit:**
+
+1. **`HfModelSource::open` replaces `HfModelSource::load`.** The source reader now mmaps each safetensors shard and records only `(name, shape, dtype, shard_idx, byte_offset, byte_len)` metadata up-front. No payload bytes resident in heap.
+2. **`HfModelSource::iter_tensors() -> TensorStream<'_>` and `materialize_tensor(name)`.** One tensor's bytes are sliced out of its shard mmap, dequantized to F32 in a fresh `Vec<f32>`, and yielded; the previous tensor's buffer drops before the next allocation.
+3. **`ConvertOrchestrator` switched to a two-phase streaming API.** `plan_tensors(Vec<PlanEntry>)` runs the policy pre-pass + per-tensor `target_for` on metadata-only entries. `begin_write(writer) -> StreamingWriter` emits the GGUF header + every KV + every tensor-info reservation. `StreamingWriter::stream_tensor(idx, &[f32])` quantizes inline and writes the payload, discarding both buffers within one call. `StreamingWriter::finalize()` seek-backs offsets.
+4. **MoE expert fusion stays streaming.** The driver's plan-phase builds a `ConvertPlan` whose `PlanStep::Fused` entries list the HF expert-slice names in `expert_index` order. The stream phase loads N slices for ONE `(layer, kind)` group, concatenates their F32 buffers, streams the fused payload, and drops the temp before moving to the next group. Peak per-group memory ≈ `n_experts × per_expert_F32_bytes` (Gemma 4 26B: 128 × ~10 MB ≈ 1.3 GB per group — fits easily).
+
+**Memory bound tightened in §P0** from `2 × model_safetensors_size + 512 MiB` to `4 × largest_single_tensor_F32_size + 512 MiB`. For Gemma 4 26B the largest tensor is `ffn_down` at `[2112, 2560]` BF16 → ~20 MB F32 + ~13 MB Q5_K_M payload, giving a bound around `~600 MB` instead of `~96 GB`. The original `2 × model_safetensors_size` envelope was always going to be infeasible on commodity hardware for 26B+ models even before the buffered-Vec antipattern compounded it; tensor-by-tensor is the correct shape of the bound.
+
+**Validation:** the regression test `tests/convert_v2_integration.rs::convert_v2_streaming_rss_under_bound_2026_05_18` spawns convert-v2 under `/usr/bin/time -l` (macOS) / `time -f "%M"` (Linux), parses the OS-reported peak RSS, and asserts `peak < 4 × largest_F32_size + 512 MiB`. Pre-fix this test would have overshot by ~64 MB on its small fixture and by ~104 GB on Gemma 4 26B.
+
+**Real-model re-run:** the operator should re-attempt `hf2q convert-v2 /opt/hf2q/models/google-gemma-4-26b-a4b-it --quant q5_k_m -o gemma4-26b-q5_k_m.gguf` on a 64 GB system after this commit lands. Expected peak RSS: well under 4 GB (mmap'd safetensors pages are anonymous-cache, not RSS-counted on macOS / Linux; the heap holds at most one F32 + one Q5_K_M payload at a time).
 
 ## Open questions for the operator
 

@@ -1,18 +1,38 @@
 //! `ConvertOrchestrator` — end-to-end driver wiring the new
 //! `StandardPolicy` → `GgmlQuantizer` → `GgufWriter` pipeline.
 //!
-//! Per ADR-033 §P3. The orchestrator owns the buffering / sequencing
-//! around the three composable pieces; it does NOT introduce any new
-//! quantization or write logic — every byte emitted comes from one of:
+//! Per ADR-033 §P3 + the real-model OOM finding 2026-05-18: the
+//! orchestrator was refactored from a buffered API (collect every
+//! tensor's F32 payload into `Vec<StagedTensor>` before quantize +
+//! collect every quantized payload into `Vec<Prepared>` before write)
+//! into a **streaming** API that quantizes and writes one tensor at a
+//! time. Peak resident set during convert is now bounded by the largest
+//! single tensor's F32 working buffer + its quantized payload, instead
+//! of the whole model. See ADR-033 §"Open Issues / Real-Model Findings"
+//! for the full triage.
 //!
-//! 1. [`GgufWriter::write_metadata_kv`] for KV pairs,
-//! 2. [`GgmlQuantizer::quantize`] for non-vision tensor payloads,
-//! 3. `half::f16::from_f32(...).to_le_bytes()` for vision/audio
-//!    tensors that match [`is_vision_tensor_pattern`] /
-//!    [`is_audio_tensor_pattern`] (the ADR-mandated dispatcher gate).
+//! Lifecycle (single-shot):
+//!
+//! 1. [`ConvertOrchestrator::new`] / [`ConvertOrchestrator::new_with_apex`]
+//!    — pin to one `ftype` / `arch` / shape.
+//! 2. [`add_metadata`] — stage GGUF KV pairs (cheap, metadata-only).
+//! 3. [`plan_tensors`] — provide the FULL list of tensors as
+//!    [`PlanEntry`] (name + shape + source_dtype + layer_index — no
+//!    payload bytes). The orchestrator runs the policy pre-pass + per-
+//!    tensor `target_for` decisions, recording each tensor's ggml_type
+//!    and payload size in a compact `Vec<PlannedTensor>`.
+//! 4. [`begin_write`] — emit the GGUF header, every KV, every
+//!    tensor-info reservation, and pad-to-alignment. Returns a
+//!    [`StreamingWriter`] handle that owns the underlying sink.
+//! 5. [`StreamingWriter::stream_tensor`] — one call per planned tensor,
+//!    in plan order. Caller hands over the F32 row-major data; the
+//!    orchestrator quantizes inline, streams the payload, and discards
+//!    both the F32 + quantized buffers before returning.
+//! 6. [`StreamingWriter::finalize`] — seek-back to fill tensor offsets,
+//!    flush, return the underlying writer.
 //!
 //! No silent F16 demotion outside the vision/audio gate — any other
-//! quantization/shape failure surfaces as [`OrchestratorError`].
+//! quantization / shape failure surfaces as [`OrchestratorError`].
 
 use std::io::{Seek, Write};
 
@@ -21,18 +41,20 @@ use half::f16;
 use crate::backends::gguf::types::MetaValue;
 use crate::backends::gguf::writer::{GgufWriter, WriterError};
 use crate::quantize::ggml_quants::apex::{ApexError, ApexPolicy};
+use crate::quantize::ggml_quants::quantizer::Quantizer;
 use crate::quantize::ggml_quants::standard_policy::{
     tensor_type_fallback, HParams, LlmType, QsState, StandardPolicy, TensorCategory,
 };
-use crate::quantize::ggml_quants::quantizer::Quantizer;
 use crate::quantize::ggml_quants::{
     is_audio_tensor_pattern, is_vision_tensor_pattern, quantizer_for, ArchName, GgmlType,
     LlamaFtype, QuantizeError, SourceDtype, TensorRef,
 };
 
-/// Errors raised by [`ConvertOrchestrator::write`]. Wraps the typed
-/// errors from the policy / quantizer / writer layers — no silent
-/// demotion paths exist anywhere inside `write`.
+/// Errors raised by [`ConvertOrchestrator::plan_tensors`] /
+/// [`ConvertOrchestrator::begin_write`] /
+/// [`StreamingWriter::stream_tensor`] / [`StreamingWriter::finalize`].
+/// Wraps the typed errors from the policy / quantizer / writer layers —
+/// no silent demotion paths exist anywhere inside the orchestrator.
 #[derive(Debug)]
 pub enum OrchestratorError {
     /// `StandardPolicy::target_for` or `GgmlQuantizer::quantize`
@@ -49,6 +71,14 @@ pub enum OrchestratorError {
     /// Underlying `GgufWriter` failure (I/O, payload-size mismatch,
     /// duplicate / missing tensor payload). Propagated unmodified.
     Writer(WriterError),
+
+    /// Caller violated the streaming protocol — e.g. called
+    /// `stream_tensor` with an out-of-bounds plan index, or in the
+    /// wrong plan order, or with F32 data whose `len()` does not match
+    /// the plan's `shape.iter().product()`. Per
+    /// [[feedback-no-loop-suppression-2026-05-17]]: hard error, never
+    /// silent skip.
+    StreamProtocol(String),
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -57,6 +87,7 @@ impl std::fmt::Display for OrchestratorError {
             OrchestratorError::Quantize(e) => write!(f, "convert/quantize: {e}"),
             OrchestratorError::Apex(e) => write!(f, "convert/apex: {e}"),
             OrchestratorError::Writer(e) => write!(f, "convert/writer: {e}"),
+            OrchestratorError::StreamProtocol(s) => write!(f, "convert/stream-protocol: {s}"),
         }
     }
 }
@@ -67,6 +98,7 @@ impl std::error::Error for OrchestratorError {
             OrchestratorError::Quantize(e) => Some(e),
             OrchestratorError::Apex(e) => Some(e),
             OrchestratorError::Writer(e) => Some(e),
+            OrchestratorError::StreamProtocol(_) => None,
         }
     }
 }
@@ -89,30 +121,41 @@ impl From<WriterError> for OrchestratorError {
     }
 }
 
-/// A tensor staged inside the orchestrator before [`write`] runs.
+/// One tensor in the convert plan — name + GGUF-order shape +
+/// `source_dtype` + optional layer index. **No payload bytes.**
 ///
-/// `shape` is **GGUF order** (innermost dim first; see the
+/// `shape` is in GGUF order (innermost dim first; see the
 /// [`GgufWriter::reserve_tensor_info`] doc). For a PyTorch-shape weight
 /// `[out_dim, in_dim]`, callers reverse to `[in_dim, out_dim]` once at
 /// the safetensors → orchestrator boundary; the orchestrator does NOT
 /// re-reverse internally. Per ADR-033 §P2 codex-0d28ae3f review.
 #[derive(Debug, Clone)]
-pub struct StagedTensor {
+pub struct PlanEntry {
     pub name: String,
     /// GGUF-order shape (innermost-first). `shape[0]` is `n_per_row`.
     pub shape: Vec<usize>,
-    /// F32 row-major data, `shape.iter().product()` elements.
-    pub data: Vec<f32>,
     pub source_dtype: SourceDtype,
     pub layer_index: Option<usize>,
 }
 
-/// Pipeline driver for the new ADR-033 convert path.
-///
-/// Lifecycle: [`new`] → repeated [`add_metadata`] + [`add_tensor`] →
-/// single [`write`] that drains all staged state into the sink.
-///
-/// `[`write`] consumes `self`; the orchestrator is single-shot.
+/// Internal representation of one tensor after the policy has decided
+/// its ggml_type. Carries the GGUF-order dims + ggml_type + the expected
+/// f32 element count for stream-time validation. **No payload bytes.**
+#[derive(Debug, Clone)]
+struct PlannedTensor {
+    name: String,
+    dims_gguf: Vec<u64>,
+    ggml_type: GgmlType,
+    /// `shape.iter().product()` — used to validate the F32 buffer the
+    /// caller hands to `stream_tensor` matches the plan.
+    expected_numel: usize,
+    /// Innermost dim — `quantizer.quantize(..., n_per_row, ..)` consumes
+    /// this. Stored to avoid recomputing from dims_gguf at stream time.
+    n_per_row: usize,
+}
+
+/// Pipeline driver for the new ADR-033 convert path. See module-level
+/// docs for the lifecycle contract.
 ///
 /// Policy selection: by default the orchestrator routes per-tensor type
 /// decisions through [`StandardPolicy::target_for`] (mirroring
@@ -131,7 +174,9 @@ pub struct ConvertOrchestrator {
     /// convert invocation.
     apex_policy: Option<ApexPolicy>,
     metadata: Vec<(String, MetaValue)>,
-    tensors: Vec<StagedTensor>,
+    /// Populated by `plan_tensors`. Empty before planning, in plan order
+    /// during/after planning. Drained slot-by-slot during streaming.
+    planned: Vec<PlannedTensor>,
 }
 
 impl ConvertOrchestrator {
@@ -148,7 +193,7 @@ impl ConvertOrchestrator {
             hparams,
             apex_policy: None,
             metadata: Vec::new(),
-            tensors: Vec::new(),
+            planned: Vec::new(),
         }
     }
 
@@ -174,62 +219,40 @@ impl ConvertOrchestrator {
             hparams,
             apex_policy: Some(apex_policy),
             metadata: Vec::new(),
-            tensors: Vec::new(),
+            planned: Vec::new(),
         }
     }
 
     /// Stage one GGUF metadata KV pair. Written in insertion order
-    /// during [`write`].
+    /// during [`begin_write`].
     pub fn add_metadata(&mut self, key: String, value: MetaValue) {
         self.metadata.push((key, value));
     }
 
-    /// Stage one tensor. `shape` is GGUF order (innermost first);
-    /// `data` is row-major F32 with `shape.iter().product()` elements.
-    /// `layer_index` is `Some(i)` for `blk.<i>.*` tensors, `None` for
-    /// globals (`token_embd`, `output`, etc.).
-    pub fn add_tensor(
+    /// Plan every tensor in one batch.
+    ///
+    /// Runs the policy pre-pass (counts `n_attention_wv` / `n_ffn_down`
+    /// / `n_ffn_gate` / `n_ffn_up` so QsState has them populated before
+    /// per-tensor `target_for`), then walks `entries` in order, picking
+    /// a `ggml_type` per tensor and recording it.
+    ///
+    /// **Metadata-only** — no F32 / payload bytes touched. After this
+    /// returns, the caller can begin writing; payload bytes are then
+    /// pulled in via `stream_tensor` one tensor at a time.
+    ///
+    /// Per [[feedback-no-loop-suppression-2026-05-17]]: every typed
+    /// policy / quantizer error surfaces here, before any GGUF bytes
+    /// are emitted. Clean failure mode — no partial files.
+    pub fn plan_tensors(
         &mut self,
-        name: String,
-        shape: Vec<usize>,
-        data: Vec<f32>,
-        source_dtype: SourceDtype,
-        layer_index: Option<usize>,
-    ) {
-        self.tensors.push(StagedTensor {
-            name,
-            shape,
-            data,
-            source_dtype,
-            layer_index,
-        });
-    }
-
-    /// Drive the full pipeline:
-    ///
-    /// 1. Write the GGUF header.
-    /// 2. Write every staged metadata KV pair.
-    /// 3. For each staged tensor — decide target type (vision/audio
-    ///    pattern → F16 directly, else [`StandardPolicy::target_for`]),
-    ///    quantize / pack the payload, [`reserve_tensor_info`] the
-    ///    GGUF tensor-info entry (with placeholder offset).
-    /// 4. Pad to ALIGNMENT and stream every payload.
-    /// 5. Finalize (seek-back to fill offsets).
-    ///
-    /// The split point between steps 3 and 4 is intentional: the writer
-    /// needs ALL `reserve_tensor_info` calls before `pad_to_alignment`
-    /// (the header layout is dims-info-first, payload-after), so we
-    /// produce all payloads up-front into a `Vec<Vec<u8>>` and stream
-    /// them after padding.
-    pub fn write<W: Write + Seek>(self, writer: W) -> Result<(), OrchestratorError> {
-        let Self {
-            ftype,
-            arch,
-            hparams,
-            apex_policy,
-            metadata,
-            tensors,
-        } = self;
+        entries: Vec<PlanEntry>,
+    ) -> Result<(), OrchestratorError> {
+        if !self.planned.is_empty() {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "plan_tensors called twice (already planned {} tensors)",
+                self.planned.len()
+            )));
+        }
 
         // -----------------------------------------------------------------
         // Pre-pass: count attn_v / ffn_down / ffn_gate / ffn_up tensors
@@ -245,11 +268,11 @@ impl ConvertOrchestrator {
         let mut n_ffn_down: i32 = 0;
         let mut n_ffn_gate: i32 = 0;
         let mut n_ffn_up: i32 = 0;
-        for t in &tensors {
-            if is_vision_tensor_pattern(&t.name) || is_audio_tensor_pattern(&t.name) {
+        for e in &entries {
+            if is_vision_tensor_pattern(&e.name) || is_audio_tensor_pattern(&e.name) {
                 continue;
             }
-            match TensorCategory::classify(&t.name) {
+            match TensorCategory::classify(&e.name) {
                 cat if cat.is_attn_v() => n_attention_wv += 1,
                 TensorCategory::FfnDown => n_ffn_down += 1,
                 TensorCategory::FfnGate => n_ffn_gate += 1,
@@ -258,7 +281,7 @@ impl ConvertOrchestrator {
             }
         }
 
-        let mut qs = QsState::new(ftype, arch, LlmType::Other, hparams);
+        let mut qs = QsState::new(self.ftype, self.arch, LlmType::Other, self.hparams);
         qs.n_attention_wv = n_attention_wv;
         qs.n_ffn_down = n_ffn_down;
         qs.n_ffn_gate = n_ffn_gate;
@@ -266,135 +289,222 @@ impl ConvertOrchestrator {
 
         let policy = StandardPolicy::new();
 
-        // -----------------------------------------------------------------
-        // First pass over tensors: decide types, build payloads. We do
-        // this BEFORE touching the writer so that any typed error from
-        // the policy / quantizer surfaces before any bytes are written
-        // (clean failure mode).
-        // -----------------------------------------------------------------
-        struct Prepared {
-            name: String,
-            dims_gguf: Vec<u64>,
-            ggml_type: GgmlType,
-            payload: Vec<u8>,
-        }
-        let mut prepared: Vec<Prepared> = Vec::with_capacity(tensors.len());
+        // Per-tensor: pick ggml_type. Payload size is also recorded for
+        // stream-time validation. No payload bytes consumed here.
+        let mut planned: Vec<PlannedTensor> = Vec::with_capacity(entries.len());
+        for e in &entries {
+            let dims_gguf: Vec<u64> = e.shape.iter().map(|&d| d as u64).collect();
+            let expected_numel: usize = e.shape.iter().product();
+            let n_per_row = e.shape[0];
 
-        for t in &tensors {
-            let dims_gguf: Vec<u64> = t.shape.iter().map(|&d| d as u64).collect();
-
-            if is_vision_tensor_pattern(&t.name) || is_audio_tensor_pattern(&t.name) {
+            let ggml_type = if is_vision_tensor_pattern(&e.name)
+                || is_audio_tensor_pattern(&e.name)
+            {
                 // Vision / audio modality gate — emit F16 directly.
                 // Per ADR-033 Decision §"Vision / audio tensor patterns",
                 // this is the ONLY place outside the policy where a
                 // ggml_type is chosen, and the ONLY place where F16
                 // demotion is permitted.
-                let mut payload = Vec::with_capacity(t.data.len() * 2);
-                for &x in &t.data {
-                    payload.extend_from_slice(&f16::from_f32(x).to_le_bytes());
-                }
-                prepared.push(Prepared {
-                    name: t.name.clone(),
-                    dims_gguf,
-                    ggml_type: GgmlType::F16,
-                    payload,
-                });
-                continue;
-            }
-
-            if is_f32_keep_tensor(&t.name) {
+                GgmlType::F16
+            } else if is_f32_keep_tensor(&e.name, e.shape.len()) {
                 // F32-keep gate — emit the F32 row-major payload as-is.
-                //
-                // Mirrors llama.cpp's quantize-decision predicate at
-                // `/opt/llama.cpp/src/llama-quant.cpp:293-355`:
-                //
-                //   1. 1-D tensors are never quantized
-                //      (`ggml_n_dims(tensor) < 2 → return false`).
-                //   2. `rope_freqs.weight` is a 1-D freq-factors table
-                //      for Gemma 4's proportional RoPE
-                //      (`/opt/llama.cpp/conversion/gemma.py:702-718`);
-                //      it carries small/exact magic values like `1e30`
-                //      that DO NOT survive quantization or F16 cast.
-                //
-                // Per [[feedback-no-loop-suppression-2026-05-17]] the
-                // gate is a positive-list (canonical name match) rather
-                // than a silent shape-based fallthrough — if a different
-                // synthesized tensor needs F32-keep, it must be added
-                // here explicitly.
-                let mut payload = Vec::with_capacity(t.data.len() * 4);
-                for &x in &t.data {
-                    payload.extend_from_slice(&x.to_le_bytes());
+                // Mirrors llama.cpp's `tensor_allows_quantization`
+                // predicate at `llama-quant.cpp:285-353`. See
+                // `is_f32_keep_tensor` doc for the rule list.
+                GgmlType::F32
+            } else {
+                let tref = TensorRef {
+                    name: &e.name,
+                    shape: &e.shape,
+                    source_dtype: e.source_dtype,
+                    arch: self.arch,
+                    layer_index: e.layer_index,
+                };
+                let category = TensorCategory::classify(&e.name);
+                // Branch on policy: ApexPolicy if `--quant apex-<tier>`,
+                // else StandardPolicy. Both feed through
+                // `tensor_type_fallback` for shape misalignment.
+                match &self.apex_policy {
+                    Some(ap) => {
+                        let picked = ap.target_for(&tref)?;
+                        tensor_type_fallback(picked, tref.n_per_row())?
+                    }
+                    None => policy.target_for(&mut qs, &tref, category)?,
                 }
-                prepared.push(Prepared {
-                    name: t.name.clone(),
-                    dims_gguf,
-                    ggml_type: GgmlType::F32,
-                    payload,
-                });
-                continue;
-            }
-
-            // Build a TensorRef for the policy. Shape is already
-            // GGUF-order (innermost first), so we pass `&t.shape`
-            // directly; `TensorRef::n_per_row()` reads `shape[0]`.
-            let tref = TensorRef {
-                name: &t.name,
-                shape: &t.shape,
-                source_dtype: t.source_dtype,
-                arch,
-                layer_index: t.layer_index,
-            };
-            let category = TensorCategory::classify(&t.name);
-            // Branch on policy: ApexPolicy if `--quant apex-<tier>`,
-            // else StandardPolicy. Both feed through
-            // `tensor_type_fallback` for shape misalignment — the Apex
-            // policy doesn't apply the fallback internally (its
-            // `target_for` returns the unfallback'd algorithmic pick).
-            // Per ADR §"shape_fallback contract" the second-misalignment
-            // case still surfaces as `QuantizeError::NotBlockAligned`.
-            let ggml_type = match &apex_policy {
-                Some(ap) => {
-                    let picked = ap.target_for(&tref)?;
-                    tensor_type_fallback(picked, tref.n_per_row())?
-                }
-                None => policy.target_for(&mut qs, &tref, category)?,
             };
 
-            // n_per_row = innermost dim per GGUF convention.
-            let n_per_row = tref.n_per_row();
-            let quantizer = quantizer_for(ggml_type)?;
-            let payload = quantizer.quantize(&t.data, n_per_row, None)?;
-
-            prepared.push(Prepared {
-                name: t.name.clone(),
+            planned.push(PlannedTensor {
+                name: e.name.clone(),
                 dims_gguf,
                 ggml_type,
-                payload,
+                expected_numel,
+                n_per_row,
             });
         }
 
-        // -----------------------------------------------------------------
-        // Drive the seek-back writer end-to-end.
-        // -----------------------------------------------------------------
+        self.planned = planned;
+        Ok(())
+    }
+
+    /// Number of planned tensors. Zero before `plan_tensors` runs.
+    pub fn planned_count(&self) -> usize {
+        self.planned.len()
+    }
+
+    /// Open the GGUF writer in streaming mode.
+    ///
+    /// Writes the GGUF header, every staged KV pair, every tensor-info
+    /// reservation (with placeholder offsets), and pads to alignment.
+    /// Returns a [`StreamingWriter`] that holds the underlying sink +
+    /// the plan; callers then push one tensor's F32 data at a time via
+    /// [`StreamingWriter::stream_tensor`] in plan order.
+    ///
+    /// Per the lifecycle contract: `plan_tensors` MUST be called first.
+    /// Calling `begin_write` with zero planned tensors writes a
+    /// header-only GGUF (acceptance test 4).
+    pub fn begin_write<W: Write + Seek>(
+        self,
+        writer: W,
+    ) -> Result<StreamingWriter<W>, OrchestratorError> {
+        let Self {
+            metadata,
+            planned,
+            ..
+        } = self;
+
         let mut w = GgufWriter::new(writer);
-        w.write_header(prepared.len() as u64, metadata.len() as u64)?;
+        w.write_header(planned.len() as u64, metadata.len() as u64)?;
 
         for (k, v) in &metadata {
             w.write_metadata_kv(k, v)?;
         }
 
-        // Reserve tensor-info entries (placeholders for offsets).
-        for p in &prepared {
+        // Reserve every tensor-info entry (placeholder offsets — filled
+        // by `finalize` via seek-back). Per ADR-033 §P2: this is the
+        // exact ordering the seek-back writer requires (all info entries
+        // BEFORE pad_to_alignment BEFORE the first payload).
+        for p in &planned {
             w.reserve_tensor_info(&p.name, &p.dims_gguf, p.ggml_type)?;
         }
 
-        // Pad to ALIGNMENT, then stream payloads in order.
         w.pad_to_alignment()?;
-        for (idx, p) in prepared.iter().enumerate() {
-            w.stream_tensor_payload(idx, &p.payload)?;
+
+        Ok(StreamingWriter {
+            writer: w,
+            planned,
+            next_idx: 0,
+        })
+    }
+}
+
+/// Streaming GGUF writer returned by [`ConvertOrchestrator::begin_write`].
+///
+/// Owns the underlying sink + the plan. Each call to `stream_tensor`
+/// quantizes one tensor's F32 data, emits its payload, and discards
+/// both buffers before returning. Peak resident set per call:
+/// `expected_numel × 4 bytes` (F32) + the quantized payload.
+pub struct StreamingWriter<W: Write + Seek> {
+    writer: GgufWriter<W>,
+    planned: Vec<PlannedTensor>,
+    next_idx: usize,
+}
+
+impl<W: Write + Seek> StreamingWriter<W> {
+    /// Number of tensors remaining to stream.
+    pub fn tensors_remaining(&self) -> usize {
+        self.planned.len() - self.next_idx
+    }
+
+    /// Total number of planned tensors (constant for the lifetime of
+    /// the writer).
+    pub fn planned_count(&self) -> usize {
+        self.planned.len()
+    }
+
+    /// Stream one tensor's F32 row-major data. The orchestrator
+    /// quantizes inline, writes the payload, and drops the quantized
+    /// buffer before returning. The caller's F32 buffer is borrowed
+    /// (not consumed) and may be dropped after this returns.
+    ///
+    /// Must be called in plan order — the orchestrator validates this
+    /// via `tensor_idx == self.next_idx` and rejects out-of-order calls
+    /// per the no-loop-suppression rule.
+    ///
+    /// `data.len()` must equal the planned tensor's
+    /// `shape.iter().product()`; otherwise this returns
+    /// [`OrchestratorError::StreamProtocol`].
+    pub fn stream_tensor(
+        &mut self,
+        tensor_idx: usize,
+        data: &[f32],
+    ) -> Result<(), OrchestratorError> {
+        if tensor_idx >= self.planned.len() {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "stream_tensor: idx {tensor_idx} out of range (planned {})",
+                self.planned.len()
+            )));
+        }
+        if tensor_idx != self.next_idx {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "stream_tensor: out-of-order call (got idx {tensor_idx}, expected {})",
+                self.next_idx
+            )));
         }
 
-        w.finalize()?;
+        let p = &self.planned[tensor_idx];
+        if data.len() != p.expected_numel {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "stream_tensor: tensor `{}` data length {} != planned numel {}",
+                p.name,
+                data.len(),
+                p.expected_numel
+            )));
+        }
+
+        // Build payload inline — three branches mirror the policy
+        // decisions made in `plan_tensors`:
+        //   - F16: vision/audio gate, fixed F16 cast (2 bytes/elem).
+        //   - F32: rope_freqs.weight & co. (4 bytes/elem, identity).
+        //   - Other: `quantizer_for(ggml_type).quantize(...)`.
+        let payload: Vec<u8> = match p.ggml_type {
+            GgmlType::F16 => {
+                let mut v = Vec::with_capacity(data.len() * 2);
+                for &x in data {
+                    v.extend_from_slice(&f16::from_f32(x).to_le_bytes());
+                }
+                v
+            }
+            GgmlType::F32 => {
+                let mut v = Vec::with_capacity(data.len() * 4);
+                for &x in data {
+                    v.extend_from_slice(&x.to_le_bytes());
+                }
+                v
+            }
+            _ => {
+                let quantizer = quantizer_for(p.ggml_type)?;
+                quantizer.quantize(data, p.n_per_row, None)?
+            }
+        };
+
+        self.writer.stream_tensor_payload(tensor_idx, &payload)?;
+        self.next_idx += 1;
+        Ok(())
+    }
+
+    /// Seek-back to fill tensor offsets and flush. Must be called after
+    /// every planned tensor has been streamed; otherwise the writer
+    /// surfaces `WriterError::MissingTensorPayloads` per the existing
+    /// `GgufWriter::finalize` contract.
+    pub fn finalize(mut self) -> Result<(), OrchestratorError> {
+        if self.next_idx != self.planned.len() {
+            return Err(OrchestratorError::StreamProtocol(format!(
+                "finalize: only {} of {} planned tensors streamed",
+                self.next_idx,
+                self.planned.len()
+            )));
+        }
+        self.writer.finalize()?;
         Ok(())
     }
 }
@@ -402,31 +512,110 @@ impl ConvertOrchestrator {
 /// Predicate: should this tensor be emitted as F32-raw, skipping the
 /// policy / quantizer entirely?
 ///
-/// Currently matches the Gemma 4 synthesized `rope_freqs.weight` table
-/// (`crate::convert::arch::gemma4::build_synthesized_tensors`). The table
-/// is 1-D and carries exact `1.0` / `1e30` magic values; quantizing or
-/// even F16-casting it would lose the `1e30` masks (saturates to F16
-/// inf or quantizes to zero) and break the proportional-RoPE collapse.
+/// Mirrors llama.cpp's canonical `tensor_allows_quantization` at
+/// `/opt/llama.cpp/src/llama-quant.cpp:285-353` (`quantize` returning
+/// false → caller writes the source dtype unchanged, which for our F32
+/// in-memory representation means F32 on disk).
 ///
-/// Future synthesized small-1-D tensors (e.g. `altup` / `laurel` / other
-/// `rope_*` tables) should be added by exact-name match — never by a
-/// broad `shape.len() == 1` heuristic, which would also swallow norm
-/// tensors and corrupt them.
-fn is_f32_keep_tensor(name: &str) -> bool {
-    // Gemma 4 ROPE_FREQS table — see
-    // `src/convert/arch/gemma4.rs::GEMMA4_ROPE_FREQS_TENSOR_NAME`.
-    name == "rope_freqs.weight"
+/// **Rules** (inverted from llama-quant.cpp; we return `true` to mean
+/// "keep as F32"):
+///
+/// 1. `n_dims < 2` — scalars and 1-D vectors are never quantized
+///    (per `llama-quant.cpp:293`).  Catches `router.scale`,
+///    `router.per_expert_scale`, `layer_scalar`, all `*_norm.weight`
+///    that happen to be 1-D, etc.
+/// 2. Name does NOT end in `.weight` — `llama-quant.cpp:298`
+///    "ends with 'weight'" gate.  Catches `.scale` sub-name extensions
+///    Gemma 4 uses for router scales.
+/// 3. Name contains `_norm.weight` — `llama-quant.cpp:301`.
+/// 4. Name contains `ffn_gate_inp.weight` — `llama-quant.cpp:307`,
+///    the router-gate projection is small and stays F32.
+/// 5. Name contains `altup` / `laurel` / `per_layer_model_proj` —
+///    `llama-quant.cpp:310-314` (Gemma3n; benign for arches that
+///    don't carry these patterns).
+/// 6. Name contains `ssm_conv1d` / `shortconv.conv.weight` /
+///    `time_mix_*` / `attn_rel_b.weight` / `.position_embd` /
+///    `sam.pos_embd` / `sam.neck.` / `sam.net_` / `.rel_pos` /
+///    `.patch_embd` / `.patch_merger` — `llama-quant.cpp:322-352`.
+/// 7. Gemma 4 synthesized `rope_freqs.weight` — the table carries
+///    exact `1.0` / `1e30` magic values; quantizing would saturate
+///    `1e30` to inf (F16) or zero (Q4_0). Already covered by rule
+///    (3) `_norm.weight` ? No — `rope_freqs.weight` doesn't contain
+///    `_norm`, but it IS 1-D so rule (1) catches it.  Keep the
+///    explicit rule too as a load-bearing comment anchor.
+///
+/// **NOT included** (intentionally — these ARE quantized in llama.cpp):
+///   - `output.weight` is quantized by default (only kept F32 when
+///     `--quantize-output-tensor 0` per `llama-quant.cpp:303`).
+///   - `token_embd.weight` is quantized normally.
+///   - Per-layer dense `mlp.{gate,up,down}_proj.weight` always quantized.
+fn is_f32_keep_tensor(name: &str, n_dims: usize) -> bool {
+    // Rule (1): scalars + 1-D vectors. llama-quant.cpp:293.
+    if n_dims < 2 {
+        return true;
+    }
+    // Rule (2): names not ending in `.weight` (Gemma 4 emits
+    // `.scale` sub-names that lack the `.weight` suffix per
+    // `gemma.py::format_tensor_name` `suffix=".scale"`). llama-quant.cpp:298.
+    if !name.ends_with(".weight") {
+        return true;
+    }
+    // Rules (3)-(7): substring patterns. Same order as llama-quant.cpp
+    // for readability.
+    name.contains("_norm.weight")        // (3) llama-quant.cpp:301
+        || name.contains("ffn_gate_inp.weight") // (4) llama-quant.cpp:307
+        || name.contains("altup")        // (5) llama-quant.cpp:310
+        || name.contains("laurel")       // (5) llama-quant.cpp:311
+        || name.contains("per_layer_model_proj") // (5) llama-quant.cpp:314
+        || name.contains("ssm_conv1d")   // (6) llama-quant.cpp:322
+        || name.contains("shortconv.conv.weight") // (6) llama-quant.cpp:323
+        || name.contains("time_mix_first.weight")
+        || name.contains("time_mix_w0.weight")
+        || name.contains("time_mix_w1.weight")
+        || name.contains("time_mix_w2.weight")
+        || name.contains("time_mix_v0.weight")
+        || name.contains("time_mix_v1.weight")
+        || name.contains("time_mix_v2.weight")
+        || name.contains("time_mix_a0.weight")
+        || name.contains("time_mix_a1.weight")
+        || name.contains("time_mix_a2.weight")
+        || name.contains("time_mix_g1.weight")
+        || name.contains("time_mix_g2.weight")
+        || name.contains("time_mix_decay_w1.weight")
+        || name.contains("time_mix_decay_w2.weight")
+        || name.contains("time_mix_lerp_fused.weight")
+        || name.contains("attn_rel_b.weight")  // (6) llama-quant.cpp:343
+        || name.contains(".position_embd") // (6) llama-quant.cpp:346
+        || name.contains("sam.pos_embd")   // (6) llama-quant.cpp:347
+        || name.contains("sam.neck.")      // (6) llama-quant.cpp:348
+        || name.contains("sam.net_")       // (6) llama-quant.cpp:349
+        || name.contains(".rel_pos")       // (6) llama-quant.cpp:350
+        || name.contains(".patch_embd")    // (6) llama-quant.cpp:351
+        || name.contains(".patch_merger")  // (6) llama-quant.cpp:352
+        || name == "rope_freqs.weight"     // (7) Gemma 4 synthesized
 }
 
 // -----------------------------------------------------------------------------
 // Synthetic-end-to-end driver — usable from integration tests + adhoc probes.
 // -----------------------------------------------------------------------------
 
-/// Run a self-contained synthetic conversion: build an orchestrator,
-/// seed it with `metadata` + `tensors`, and write to the supplied sink.
-/// Equivalent to using [`ConvertOrchestrator`] directly; exists so
-/// callers (P3 integration tests, downstream P4 driver tests) have one
-/// stable entry point.
+/// A staged-tensor record for the synthetic driver. Carries the full
+/// F32 payload so tests can plumb everything in one buffer (the streaming
+/// driver pulls data on-demand from `HfModelSource::iter_tensors`).
+#[derive(Debug, Clone)]
+pub struct StagedTensor {
+    pub name: String,
+    /// GGUF-order shape (innermost-first).
+    pub shape: Vec<usize>,
+    pub data: Vec<f32>,
+    pub source_dtype: SourceDtype,
+    pub layer_index: Option<usize>,
+}
+
+/// Run a self-contained synthetic conversion: plan all tensors, then
+/// stream their payloads in plan order. Equivalent to driving the
+/// orchestrator directly; exists so callers (P3 integration tests,
+/// downstream P4 driver tests) have one stable entry point.
 pub fn convert_synthetic<W: Write + Seek>(
     ftype: LlamaFtype,
     arch: ArchName,
@@ -439,10 +628,21 @@ pub fn convert_synthetic<W: Write + Seek>(
     for (k, v) in metadata {
         orch.add_metadata(k, v);
     }
-    for t in tensors {
-        orch.add_tensor(t.name, t.shape, t.data, t.source_dtype, t.layer_index);
+    let entries: Vec<PlanEntry> = tensors
+        .iter()
+        .map(|t| PlanEntry {
+            name: t.name.clone(),
+            shape: t.shape.clone(),
+            source_dtype: t.source_dtype,
+            layer_index: t.layer_index,
+        })
+        .collect();
+    orch.plan_tensors(entries)?;
+    let mut sw = orch.begin_write(writer)?;
+    for (idx, t) in tensors.iter().enumerate() {
+        sw.stream_tensor(idx, &t.data)?;
     }
-    orch.write(writer)
+    sw.finalize()
 }
 
 #[cfg(test)]
@@ -475,11 +675,7 @@ mod tests {
     /// existing `mlx_native::gguf::GgufFile` reader. Asserts:
     ///   - tensor count / metadata count round-trip
     ///   - every tensor name + ggml_type round-trips
-    ///   - the policy-picked types match expectations for Q5_K_M:
-    ///       token_embd.weight (tied) → Q6_K (output branch bump)
-    ///       output.weight             → Q6_K (output branch)
-    ///       blk.0.attn_q.weight       → Q5_K (passthrough)
-    ///       blk.0.ffn_down.weight     → Q6_K (use_more_bits @ i=0)
+    ///   - the policy-picked types match expectations for Q5_K_M.
     #[test]
     fn smoke_q5_k_m_round_trip_via_reader() {
         let mut orch = ConvertOrchestrator::new(
@@ -488,54 +684,56 @@ mod tests {
             default_hparams(),
         );
 
-        // Required GGUF metadata keys for the reader to accept the
-        // file. `general.architecture` is the only one the reader
-        // strictly needs; we add a second for the count round-trip.
         orch.add_metadata(
             "general.architecture".to_string(),
             MetaValue::String("llama".into()),
         );
         orch.add_metadata("general.alignment".to_string(), MetaValue::U32(32));
 
-        // Tensor shapes are GGUF order (innermost-first). 256-aligned
-        // so Q5_K / Q6_K stay on their primary types (no shape
-        // fallback). One-row tensors so payloads stay small.
         let n_per_row = 256usize;
         let shape = vec![n_per_row, 1];
-
-        orch.add_tensor(
-            "token_embd.weight".into(),
-            shape.clone(),
+        let entries = vec![
+            PlanEntry {
+                name: "token_embd.weight".into(),
+                shape: shape.clone(),
+                source_dtype: SourceDtype::F32,
+                layer_index: None,
+            },
+            PlanEntry {
+                name: "output.weight".into(),
+                shape: shape.clone(),
+                source_dtype: SourceDtype::F32,
+                layer_index: None,
+            },
+            PlanEntry {
+                name: "blk.0.attn_q.weight".into(),
+                shape: shape.clone(),
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(0),
+            },
+            PlanEntry {
+                name: "blk.0.ffn_down.weight".into(),
+                shape: shape.clone(),
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(0),
+            },
+        ];
+        let datas = vec![
             deterministic_data(n_per_row, 1),
-            SourceDtype::F32,
-            None,
-        );
-        orch.add_tensor(
-            "output.weight".into(),
-            shape.clone(),
             deterministic_data(n_per_row, 2),
-            SourceDtype::F32,
-            None,
-        );
-        orch.add_tensor(
-            "blk.0.attn_q.weight".into(),
-            shape.clone(),
             deterministic_data(n_per_row, 3),
-            SourceDtype::F32,
-            Some(0),
-        );
-        orch.add_tensor(
-            "blk.0.ffn_down.weight".into(),
-            shape.clone(),
             deterministic_data(n_per_row, 4),
-            SourceDtype::F32,
-            Some(0),
-        );
+        ];
+        orch.plan_tensors(entries).expect("plan");
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         {
             let f = std::fs::File::create(tmp.path()).unwrap();
-            orch.write(f).expect("orchestrator write");
+            let mut sw = orch.begin_write(f).expect("begin_write");
+            for (idx, d) in datas.iter().enumerate() {
+                sw.stream_tensor(idx, d).expect("stream");
+            }
+            sw.finalize().expect("finalize");
         }
 
         // Round-trip via the canonical reader (mlx-native).
@@ -559,31 +757,17 @@ mod tests {
             .tensor_info("blk.0.ffn_down.weight")
             .expect("ffn_down present");
 
-        // Shape round-trip. We wrote GGUF order [256, 1]; the
-        // mlx_native reader REVERSES on parse (gguf/mod.rs:1008
-        // `shape.reverse()`), so info.shape comes back in PyTorch
-        // order [1, 256]. This is an existing reader convention we
-        // assert against, not a writer requirement.
+        // Shape round-trip — mlx_native reverses on parse, returns PyTorch order.
         assert_eq!(token.shape, vec![1, 256]);
         assert_eq!(output.shape, vec![1, 256]);
         assert_eq!(attn_q.shape, vec![1, 256]);
         assert_eq!(ffn_down.shape, vec![1, 256]);
 
-        // Type round-trip per StandardPolicy at Q5_K_M:
-        // - token_embd (tied) routes to OUTPUT branch → Q6_K
-        // - output.weight                              → Q6_K
-        // - blk.0.attn_q                               → Q5_K (passthrough)
-        // - blk.0.ffn_down (use_more_bits @ i=0)       → Q6_K
-        //
-        // mlx_native's GgmlType is a position-indexed enum (not
-        // repr(wire_code)) — F32=0 F16=1 Q4_0=2 Q8_0=3 Q4_K=4 Q5_K=5
-        // Q6_K=6. We compare against those positional codes.
         assert_eq!(token.ggml_type as u32, 6, "token_embd → Q6_K");
         assert_eq!(output.ggml_type as u32, 6, "output → Q6_K");
         assert_eq!(attn_q.ggml_type as u32, 5, "attn_q → Q5_K");
         assert_eq!(ffn_down.ggml_type as u32, 6, "ffn_down (i=0) → Q6_K");
 
-        // Offsets must be ALIGNMENT-aligned per spec.
         assert_eq!(token.offset % 32, 0);
         assert_eq!(output.offset % 32, 0);
         assert_eq!(attn_q.offset % 32, 0);
@@ -592,12 +776,7 @@ mod tests {
 
     /// Acceptance test 2 — vision pattern dispatch. A vision-named
     /// tensor must skip [`StandardPolicy::target_for`] entirely and
-    /// emit F16 directly. We assert:
-    ///   - the on-disk ggml_type for `model.visual.patch_embd.weight`
-    ///     is `F16` (wire code 1), NOT the Q5_K_M policy result.
-    ///   - a same-shape non-vision tensor on the same conversion DOES
-    ///     go through the policy (sanity that we didn't disable the
-    ///     policy entirely).
+    /// emit F16 directly.
     #[test]
     fn vision_pattern_emits_f16_skipping_policy() {
         let mut orch = ConvertOrchestrator::new(
@@ -610,36 +789,34 @@ mod tests {
             MetaValue::String("gemma4_mmproj".into()),
         );
 
-        // Shape with n_per_row=15 — deliberately NOT block-aligned for
-        // any K-quant. If the orchestrator wrongly routed this through
-        // the policy it would return `NotBlockAligned`. The vision
-        // gate must rescue it (F16 has no block-size constraint).
         let n_per_row = 15usize;
         let shape = vec![n_per_row, 2];
-        let data = deterministic_data(n_per_row * 2, 7);
+        let data_vis = deterministic_data(n_per_row * 2, 7);
 
-        orch.add_tensor(
-            "model.visual.patch_embd.weight".into(),
-            shape.clone(),
-            data,
-            SourceDtype::F32,
-            None,
-        );
-
-        // Sanity sibling — a non-vision tensor that DOES round through
-        // the policy. Use a 256-aligned shape so Q5_K is reachable.
-        orch.add_tensor(
-            "blk.0.attn_q.weight".into(),
-            vec![256, 1],
-            deterministic_data(256, 8),
-            SourceDtype::F32,
-            Some(0),
-        );
+        let entries = vec![
+            PlanEntry {
+                name: "model.visual.patch_embd.weight".into(),
+                shape: shape.clone(),
+                source_dtype: SourceDtype::F32,
+                layer_index: None,
+            },
+            PlanEntry {
+                name: "blk.0.attn_q.weight".into(),
+                shape: vec![256, 1],
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(0),
+            },
+        ];
+        let data_attn = deterministic_data(256, 8);
+        orch.plan_tensors(entries).expect("plan");
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         {
             let f = std::fs::File::create(tmp.path()).unwrap();
-            orch.write(f).expect("orchestrator write");
+            let mut sw = orch.begin_write(f).expect("begin_write");
+            sw.stream_tensor(0, &data_vis).expect("stream vis");
+            sw.stream_tensor(1, &data_attn).expect("stream attn");
+            sw.finalize().expect("finalize");
         }
 
         let gguf =
@@ -648,19 +825,16 @@ mod tests {
         let visual = gguf
             .tensor_info("model.visual.patch_embd.weight")
             .expect("vision tensor present");
-        // mlx_native's GgmlType is positional: F16 is enum position 1.
         assert_eq!(
             visual.ggml_type as u32, 1,
             "vision tensor must emit F16 (positional code 1), got {}",
             visual.ggml_type as u32
         );
-        // F16 byte length sanity: 15*2 elems * 2 bytes = 60 bytes.
         assert_eq!(visual.byte_len, 60);
 
         let attn_q = gguf
             .tensor_info("blk.0.attn_q.weight")
             .expect("policy tensor present");
-        // Q5_K is enum position 5 in mlx_native's positional enum.
         assert_eq!(
             attn_q.ggml_type as u32, 5,
             "non-vision sibling must still route through policy → Q5_K"
@@ -670,8 +844,7 @@ mod tests {
     /// Acceptance test 3 — no-fallback typed error. A non-vision /
     /// non-audio tensor with `n_per_row = 15` at a K-quant ftype must
     /// surface `QuantizeError::NotBlockAligned` instead of silently
-    /// demoting to F16. Per ADR §"shape_fallback contract" +
-    /// [[feedback-no-loop-suppression-2026-05-17]].
+    /// demoting to F16.
     #[test]
     fn unquantizable_row_surfaces_typed_error() {
         let mut orch = ConvertOrchestrator::new(
@@ -684,25 +857,17 @@ mod tests {
             MetaValue::String("llama".into()),
         );
 
-        // n_per_row = 15 — not divisible by 256 (Q5_K), not by 32
-        // (Q5_1 first-downshift). The shape_fallback contract demands
-        // an `Err(NotBlockAligned)` here rather than silent F16 demotion.
         let n_per_row = 15usize;
-        let shape = vec![n_per_row, 1];
+        let entries = vec![PlanEntry {
+            name: "blk.0.attn_q.weight".into(),
+            shape: vec![n_per_row, 1],
+            source_dtype: SourceDtype::F32,
+            layer_index: Some(0),
+        }];
 
-        orch.add_tensor(
-            "blk.0.attn_q.weight".into(),
-            shape,
-            deterministic_data(n_per_row, 9),
-            SourceDtype::F32,
-            Some(0),
-        );
-
-        // Write to an in-memory sink so we don't litter the FS on the
-        // error path.
-        let mut buf = std::io::Cursor::new(Vec::<u8>::new());
-        let err = orch.write(&mut buf).expect_err("must error");
-
+        // The plan-time policy reject is the failure point — no bytes
+        // are committed to the sink (begin_write never runs).
+        let err = orch.plan_tensors(entries).expect_err("must error");
         match err {
             OrchestratorError::Quantize(QuantizeError::NotBlockAligned {
                 n_per_row: 15,
@@ -712,15 +877,110 @@ mod tests {
                 "expected OrchestratorError::Quantize(NotBlockAligned {{ n_per_row: 15, .. }}), got {other:?}"
             ),
         }
+    }
 
-        // And the failure mode must be clean: no bytes were committed
-        // to the sink (the early prepare-pass error fires BEFORE
-        // `write_header`). Sanity that the orchestrator doesn't leave
-        // a partial / corrupt GGUF behind for callers to clean up.
+    /// `stream_tensor` rejects out-of-order calls.
+    #[test]
+    fn stream_tensor_rejects_out_of_order() {
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ5_K_M,
+            ArchName::Llama3,
+            default_hparams(),
+        );
+        orch.add_metadata(
+            "general.architecture".to_string(),
+            MetaValue::String("llama".into()),
+        );
+        let n_per_row = 256usize;
+        let entries = vec![
+            PlanEntry {
+                name: "blk.0.attn_q.weight".into(),
+                shape: vec![n_per_row, 1],
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(0),
+            },
+            PlanEntry {
+                name: "blk.1.attn_q.weight".into(),
+                shape: vec![n_per_row, 1],
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(1),
+            },
+        ];
+        orch.plan_tensors(entries).expect("plan");
+        let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+        let mut sw = orch.begin_write(&mut buf).expect("begin_write");
+        let data = deterministic_data(n_per_row, 5);
+        // Try to stream idx 1 before idx 0 — protocol violation.
+        let err = sw.stream_tensor(1, &data).expect_err("must error");
         assert!(
-            buf.get_ref().is_empty(),
-            "expected zero bytes on error path, got {}",
-            buf.get_ref().len()
+            matches!(err, OrchestratorError::StreamProtocol(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// `stream_tensor` rejects wrong data length.
+    #[test]
+    fn stream_tensor_rejects_wrong_length() {
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ5_K_M,
+            ArchName::Llama3,
+            default_hparams(),
+        );
+        orch.add_metadata(
+            "general.architecture".to_string(),
+            MetaValue::String("llama".into()),
+        );
+        orch.plan_tensors(vec![PlanEntry {
+            name: "blk.0.attn_q.weight".into(),
+            shape: vec![256, 1],
+            source_dtype: SourceDtype::F32,
+            layer_index: Some(0),
+        }])
+        .expect("plan");
+        let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+        let mut sw = orch.begin_write(&mut buf).expect("begin_write");
+        let bogus = deterministic_data(128, 5); // wrong length
+        let err = sw.stream_tensor(0, &bogus).expect_err("must error");
+        assert!(
+            matches!(err, OrchestratorError::StreamProtocol(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// `finalize` rejects incomplete streaming.
+    #[test]
+    fn finalize_rejects_incomplete_stream() {
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ5_K_M,
+            ArchName::Llama3,
+            default_hparams(),
+        );
+        orch.add_metadata(
+            "general.architecture".to_string(),
+            MetaValue::String("llama".into()),
+        );
+        orch.plan_tensors(vec![
+            PlanEntry {
+                name: "blk.0.attn_q.weight".into(),
+                shape: vec![256, 1],
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(0),
+            },
+            PlanEntry {
+                name: "blk.1.attn_q.weight".into(),
+                shape: vec![256, 1],
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(1),
+            },
+        ])
+        .expect("plan");
+        let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+        let sw = orch.begin_write(&mut buf).expect("begin_write");
+        // Drop without streaming anything — finalize should reject.
+        let err = sw.finalize().expect_err("must error");
+        assert!(
+            matches!(err, OrchestratorError::StreamProtocol(_)),
+            "got {err:?}"
         );
     }
 
@@ -728,8 +988,6 @@ mod tests {
 
     #[test]
     fn convert_synthetic_entry_point_works() {
-        // Exercises the `convert_synthetic` helper to make sure it
-        // wires identically to direct ConvertOrchestrator use.
         let metadata = vec![(
             "general.architecture".to_string(),
             MetaValue::String("llama".into()),
@@ -758,23 +1016,22 @@ mod tests {
         let gguf = mlx_native::gguf::GgufFile::open(tmp.path()).expect("parse");
         assert_eq!(gguf.tensor_count(), 1);
         let t = gguf.tensor_info("blk.0.attn_q.weight").unwrap();
-        // mlx_native's GgmlType is positional: Q5_K = 5.
         assert_eq!(t.ggml_type as u32, 5);
     }
 
     #[test]
     fn empty_conversion_writes_header_only_gguf() {
-        // Zero tensors / zero metadata — sanity for the writer
-        // edge case (header alignment only).
-        let orch = ConvertOrchestrator::new(
+        let mut orch = ConvertOrchestrator::new(
             LlamaFtype::MostlyQ5_K_M,
             ArchName::Llama3,
             default_hparams(),
         );
+        orch.plan_tensors(Vec::new()).expect("plan empty");
         let tmp = tempfile::NamedTempFile::new().unwrap();
         {
             let mut f = std::fs::File::create(tmp.path()).unwrap();
-            orch.write(&mut f).expect("empty write");
+            let sw = orch.begin_write(&mut f).expect("begin_write");
+            sw.finalize().expect("finalize empty");
             f.flush().unwrap();
         }
         let gguf = mlx_native::gguf::GgufFile::open(tmp.path()).expect("parse");
