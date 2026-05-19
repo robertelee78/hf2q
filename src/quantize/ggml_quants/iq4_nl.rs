@@ -27,6 +27,8 @@
 
 use half::f16;
 
+use super::common::{best_index_int8, GROUP_MAX_EPS};
+
 pub const QK4_NL: usize = 32;
 pub const BLOCK_BYTES: usize = 2 + QK4_NL / 2; // 18
 
@@ -35,36 +37,6 @@ pub const BLOCK_BYTES: usize = 2 + QK4_NL / 2; // 18
 const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
-
-/// `GROUP_MAX_EPS` at `ggml-quants.c:16`.
-const GROUP_MAX_EPS: f32 = 1e-15;
-
-/// `best_index_int8` at `ggml-quants.c:24-33` — bisection over a
-/// monotonic codebook, picking the nearer of the two bracketing values.
-#[inline]
-fn best_index_int8(val: &[i8], x: f32) -> usize {
-    let n = val.len();
-    if x <= val[0] as f32 {
-        return 0;
-    }
-    if x >= val[n - 1] as f32 {
-        return n - 1;
-    }
-    let (mut ml, mut mu) = (0usize, n - 1);
-    while mu - ml > 1 {
-        let mav = (ml + mu) / 2;
-        if x < val[mav] as f32 {
-            mu = mav;
-        } else {
-            ml = mav;
-        }
-    }
-    if x - (val[mu - 1] as f32) < (val[mu] as f32) - x {
-        mu - 1
-    } else {
-        mu
-    }
-}
 
 /// Pure-Rust mirror of `quantize_row_iq4_nl_impl` at `ggml-quants.c:4794`,
 /// specialized to `super_block_size == block_size == QK4_NL == 32` (the

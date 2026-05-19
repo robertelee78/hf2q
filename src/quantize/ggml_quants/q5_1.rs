@@ -31,118 +31,10 @@
 
 use half::f16;
 
+use super::common::make_qkx3_quants;
+
 pub const QK5_1: usize = 32;
 pub const BLOCK_BYTES: usize = 2 + 2 + 4 + QK5_1 / 2; // 24
-
-/// Replicates llama.cpp's `nearest_int` (ggml-quants.c:559) — round-half-to-even
-/// via the 12582912.f magic shift. Must be bit-exact for byte parity.
-#[inline]
-fn nearest_int(fval: f32) -> i32 {
-    debug_assert!(fval.abs() <= 4194303.0);
-    let val = fval + 12582912.0;
-    let i = val.to_bits() as i32;
-    (i & 0x007fffff) - 0x00400000
-}
-
-/// Pure-Rust port of `make_qkx3_quants` (ggml-quants.c:931).
-/// Returns `(scale, the_min)` where `the_min == -min` (see line 1010).
-/// `L` is filled with quantized indices in `[0, nmax]`.
-fn make_qkx3_quants(
-    n: usize,
-    nmax: i32,
-    x: &[f32],
-    weights: &[f32],
-    l_out: &mut [u8],
-    laux: &mut [u8],
-    rmin: f32,
-    rdelta: f32,
-    nstep: i32,
-    use_mad: bool,
-) -> (f32, f32) {
-    let mut min = x[0];
-    let mut max = x[0];
-    let mut sum_w = weights[0];
-    let mut sum_x = sum_w * x[0];
-    for i in 1..n {
-        if x[i] < min {
-            min = x[i];
-        }
-        if x[i] > max {
-            max = x[i];
-        }
-        let w = weights[i];
-        sum_w += w;
-        sum_x += w * x[i];
-    }
-    if min > 0.0 {
-        min = 0.0;
-    }
-    if max <= min {
-        for i in 0..n {
-            l_out[i] = 0;
-        }
-        return (0.0, -min);
-    }
-    let mut iscale = nmax as f32 / (max - min);
-    let mut scale = 1.0 / iscale;
-    let mut best_mad = 0.0f32;
-    for i in 0..n {
-        let l = nearest_int(iscale * (x[i] - min));
-        l_out[i] = l.max(0).min(nmax) as u8;
-        let mut diff = scale * (l_out[i] as f32) + min - x[i];
-        diff = if use_mad { diff.abs() } else { diff * diff };
-        let w = weights[i];
-        best_mad += w * diff;
-    }
-    if nstep < 1 {
-        return (scale, -min);
-    }
-    for is in 0..=nstep {
-        let iscale_try = (rmin + rdelta * (is as f32) + (nmax as f32)) / (max - min);
-        let mut sum_l = 0.0f32;
-        let mut sum_l2 = 0.0f32;
-        let mut sum_xl = 0.0f32;
-        for i in 0..n {
-            let l = nearest_int(iscale_try * (x[i] - min));
-            let l = l.max(0).min(nmax);
-            laux[i] = l as u8;
-            let w = weights[i];
-            let lf = l as f32;
-            sum_l += w * lf;
-            sum_l2 += w * lf * lf;
-            sum_xl += w * lf * x[i];
-        }
-        let d_det = sum_w * sum_l2 - sum_l * sum_l;
-        if d_det > 0.0 {
-            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d_det;
-            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d_det;
-            if this_min > 0.0 {
-                this_min = 0.0;
-                this_scale = sum_xl / sum_l2;
-            }
-            let mut mad = 0.0f32;
-            for i in 0..n {
-                let mut diff = this_scale * (laux[i] as f32) + this_min - x[i];
-                diff = if use_mad { diff.abs() } else { diff * diff };
-                let w = weights[i];
-                mad += w * diff;
-            }
-            if mad < best_mad {
-                for i in 0..n {
-                    l_out[i] = laux[i];
-                }
-                best_mad = mad;
-                scale = this_scale;
-                min = this_min;
-            }
-            // Silence unused-assignment lints — Rust doesn't complain here in
-            // practice but mirrors C scoping.
-            let _ = iscale;
-            iscale = iscale_try;
-        }
-    }
-    (scale, -min)
-}
 
 /// Pure-Rust port of `quantize_row_q5_1_ref` (ggml-quants.c:189).
 fn quantize_row_q5_1_ref(x: &[f32], out: &mut Vec<u8>) {
@@ -222,19 +114,25 @@ fn quantize_row_q5_1_impl(x: &[f32], quant_weights: &[f32], out: &mut Vec<u8>) {
         for j in 0..QK5_1 {
             weight[j] = qw[j] * (sigma2 + xb[j] * xb[j]).sqrt();
         }
-        let (d, the_min) = make_qkx3_quants(
-            QK5_1, 31, xb, &weight, &mut l_buf, &mut laux, -0.9, 0.05, 36, false,
+        let mut the_min = 0.0f32;
+        let d = make_qkx3_quants(
+            QK5_1,
+            31,
+            xb,
+            Some(&weight),
+            &mut l_buf,
+            &mut the_min,
+            &mut laux,
+            -0.9,
+            0.05,
+            36,
+            false,
         );
         // C: y[ib].d = FP32_TO_FP16(d);
         // C: y[ib].m = FP32_TO_FP16(-min);  where `min` in the C local is the
         // post-solver `min` (negated again via `-min` to produce the stored
-        // value). `make_qkx3_quants` returns `*the_min = -min`, so the C
-        // expression `-min` (with min == the_min from the out-param, after
-        // line `min = this_min` updates) is the C local — but the value the
-        // function ultimately writes is `*the_min = -min` then C does
-        // `FP32_TO_FP16(-min)` using its own local `min` (which is the raw
-        // post-solver value, not -min). We return `(scale, -min)` so to match
-        // C's `FP32_TO_FP16(-min)` we negate `the_min` again.
+        // value). `make_qkx3_quants` writes `*the_min = -min`, so to match
+        // C's `FP32_TO_FP16(-min)` we negate `the_min` once more.
         let d_f16 = f16::from_f32(d);
         let m_f16 = f16::from_f32(-the_min);
         out.extend_from_slice(&d_f16.to_le_bytes());

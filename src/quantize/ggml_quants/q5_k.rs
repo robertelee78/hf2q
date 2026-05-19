@@ -50,316 +50,11 @@
 
 use half::f16;
 
+use super::common::{make_qkx2_quants, make_qkx3_quants, make_qp_quants, nearest_int};
+
 pub const QK_K: usize = 256;
 pub const K_SCALE_SIZE: usize = 12;
 pub const BLOCK_BYTES: usize = 2 + 2 + K_SCALE_SIZE + QK_K / 8 + QK_K / 2; // 176
-
-const GROUP_MAX_EPS: f32 = 1e-15;
-
-/// Replicates llama.cpp's `nearest_int` (ggml-quants.c:559) — round-half-to-even
-/// via the 12582912.f magic shift. Must be bit-exact for byte parity.
-#[inline]
-fn nearest_int(fval: f32) -> i32 {
-    debug_assert!(fval.abs() <= 4194303.0);
-    let val = fval + 12582912.0;
-    let i = val.to_bits() as i32;
-    (i & 0x007fffff) - 0x00400000
-}
-
-/// Pure-Rust port of `make_qkx2_quants` (ggml-quants.c:737-816).
-/// Returns `(scale, the_min)` where `the_min == -min` (the C call site
-/// receives `*the_min = -min` written at the function end, and the
-/// post-solver C-local `min` is clamped to ≤ 0, so `the_min ≥ 0`).
-fn make_qkx2_quants(
-    n: usize,
-    nmax: i32,
-    x: &[f32],
-    weights: &[f32],
-    l_out: &mut [u8],
-    laux: &mut [u8],
-    rmin: f32,
-    rdelta: f32,
-    nstep: i32,
-    use_mad: bool,
-) -> (f32, f32) {
-    let mut min = x[0];
-    let mut max = x[0];
-    let mut sum_w = weights[0];
-    let mut sum_x = sum_w * x[0];
-    for i in 1..n {
-        if x[i] < min {
-            min = x[i];
-        }
-        if x[i] > max {
-            max = x[i];
-        }
-        let w = weights[i];
-        sum_w += w;
-        sum_x += w * x[i];
-    }
-    if min > 0.0 {
-        min = 0.0;
-    }
-    if max == min {
-        for i in 0..n {
-            l_out[i] = 0;
-        }
-        return (0.0, -min);
-    }
-    let mut iscale = (nmax as f32) / (max - min);
-    let mut scale = 1.0 / iscale;
-    let mut best_error = 0.0f32;
-    for i in 0..n {
-        let l = nearest_int(iscale * (x[i] - min));
-        l_out[i] = l.max(0).min(nmax) as u8;
-        let mut diff = scale * (l_out[i] as f32) + min - x[i];
-        diff = if use_mad { diff.abs() } else { diff * diff };
-        let w = weights[i];
-        best_error += w * diff;
-    }
-    if nstep < 1 {
-        return (scale, -min);
-    }
-    for is in 0..=nstep {
-        let iscale_try = (rmin + rdelta * (is as f32) + (nmax as f32)) / (max - min);
-        let mut sum_l = 0.0f32;
-        let mut sum_l2 = 0.0f32;
-        let mut sum_xl = 0.0f32;
-        for i in 0..n {
-            let l = nearest_int(iscale_try * (x[i] - min));
-            let l = l.max(0).min(nmax);
-            laux[i] = l as u8;
-            let w = weights[i];
-            let lf = l as f32;
-            sum_l += w * lf;
-            sum_l2 += w * lf * lf;
-            sum_xl += w * lf * x[i];
-        }
-        let d_det = sum_w * sum_l2 - sum_l * sum_l;
-        if d_det > 0.0 {
-            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d_det;
-            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d_det;
-            if this_min > 0.0 {
-                this_min = 0.0;
-                this_scale = sum_xl / sum_l2;
-            }
-            let mut cur_error = 0.0f32;
-            for i in 0..n {
-                let mut diff = this_scale * (laux[i] as f32) + this_min - x[i];
-                diff = if use_mad { diff.abs() } else { diff * diff };
-                let w = weights[i];
-                cur_error += w * diff;
-            }
-            if cur_error < best_error {
-                for i in 0..n {
-                    l_out[i] = laux[i];
-                }
-                best_error = cur_error;
-                scale = this_scale;
-                min = this_min;
-            }
-            // Silence unused-assignment lint; C reassigns `iscale` here.
-            let _ = iscale;
-            iscale = iscale_try;
-        }
-    }
-    (scale, -min)
-}
-
-/// Pure-Rust port of `make_qkx3_quants` (ggml-quants.c:931-1012).
-/// Same return convention as `make_qkx2_quants`: `(scale, -min)`.
-/// Diverges from qkx2 by: (a) initial branch uses `max <= min` (vs
-/// `max == min`), (b) initial-pass clamping mirrors the inner-loop
-/// clamp `[0, nmax]`, (c) returns immediately if `nstep < 1` after
-/// the initial pass.
-fn make_qkx3_quants(
-    n: usize,
-    nmax: i32,
-    x: &[f32],
-    weights: &[f32],
-    l_out: &mut [u8],
-    laux: &mut [u8],
-    rmin: f32,
-    rdelta: f32,
-    nstep: i32,
-    use_mad: bool,
-) -> (f32, f32) {
-    let mut min = x[0];
-    let mut max = x[0];
-    let mut sum_w = weights[0];
-    let mut sum_x = sum_w * x[0];
-    for i in 1..n {
-        if x[i] < min {
-            min = x[i];
-        }
-        if x[i] > max {
-            max = x[i];
-        }
-        let w = weights[i];
-        sum_w += w;
-        sum_x += w * x[i];
-    }
-    if min > 0.0 {
-        min = 0.0;
-    }
-    if max <= min {
-        for i in 0..n {
-            l_out[i] = 0;
-        }
-        return (0.0, -min);
-    }
-    let mut iscale = (nmax as f32) / (max - min);
-    let mut scale = 1.0 / iscale;
-    let mut best_mad = 0.0f32;
-    for i in 0..n {
-        let l = nearest_int(iscale * (x[i] - min));
-        l_out[i] = l.max(0).min(nmax) as u8;
-        let mut diff = scale * (l_out[i] as f32) + min - x[i];
-        diff = if use_mad { diff.abs() } else { diff * diff };
-        let w = weights[i];
-        best_mad += w * diff;
-    }
-    if nstep < 1 {
-        return (scale, -min);
-    }
-    for is in 0..=nstep {
-        let iscale_try = (rmin + rdelta * (is as f32) + (nmax as f32)) / (max - min);
-        let mut sum_l = 0.0f32;
-        let mut sum_l2 = 0.0f32;
-        let mut sum_xl = 0.0f32;
-        for i in 0..n {
-            let l = nearest_int(iscale_try * (x[i] - min));
-            let l = l.max(0).min(nmax);
-            laux[i] = l as u8;
-            let w = weights[i];
-            let lf = l as f32;
-            sum_l += w * lf;
-            sum_l2 += w * lf * lf;
-            sum_xl += w * lf * x[i];
-        }
-        let d_det = sum_w * sum_l2 - sum_l * sum_l;
-        if d_det > 0.0 {
-            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d_det;
-            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d_det;
-            if this_min > 0.0 {
-                this_min = 0.0;
-                this_scale = sum_xl / sum_l2;
-            }
-            let mut mad = 0.0f32;
-            for i in 0..n {
-                let mut diff = this_scale * (laux[i] as f32) + this_min - x[i];
-                diff = if use_mad { diff.abs() } else { diff * diff };
-                let w = weights[i];
-                mad += w * diff;
-            }
-            if mad < best_mad {
-                for i in 0..n {
-                    l_out[i] = laux[i];
-                }
-                best_mad = mad;
-                scale = this_scale;
-                min = this_min;
-            }
-            let _ = iscale;
-            iscale = iscale_try;
-        }
-    }
-    (scale, -min)
-}
-
-/// Pure-Rust port of `make_qp_quants` (ggml-quants.c:1014-1085).
-/// Unsigned positive-quant solver — operates on a tiny n=8 vector (the
-/// sub-scales or sub-mins of a Q5_K super-block) with `nmax=63`.
-fn make_qp_quants(n: usize, nmax: i32, x: &[f32], l_out: &mut [u8], quant_weights: &[f32]) -> f32 {
-    let mut max = 0.0f32;
-    for i in 0..n {
-        if x[i] > max {
-            max = x[i];
-        }
-    }
-    if max < GROUP_MAX_EPS {
-        for i in 0..n {
-            l_out[i] = 0;
-        }
-        return 0.0;
-    }
-    let mut iscale = (nmax as f32) / max;
-    for i in 0..n {
-        // C: `L[i] = nearest_int(iscale * x[i])` — note: NO clamp here in
-        // the initial pass, matching the C source exactly. The cast to
-        // uint8_t is implicit; `nearest_int` returns i32 and the cast
-        // wraps to 0..=255. For our domain (`x ≥ 0`, `iscale*x ≤ nmax=63`)
-        // the value fits in u8 without wrapping.
-        l_out[i] = nearest_int(iscale * x[i]) as u8;
-    }
-    let scale = 1.0 / iscale;
-    let mut best_mse = 0.0f32;
-    for i in 0..n {
-        let diff = x[i] - scale * (l_out[i] as f32);
-        let w = quant_weights[i];
-        best_mse += w * diff * diff;
-    }
-    for is in -4..=4i32 {
-        if is == 0 {
-            continue;
-        }
-        let iscale_is = (0.1 * (is as f32) + (nmax as f32)) / max;
-        let scale_is = 1.0 / iscale_is;
-        let mut mse = 0.0f32;
-        for i in 0..n {
-            let l = nearest_int(iscale_is * x[i]);
-            let l = l.min(nmax);
-            let diff = x[i] - scale_is * (l as f32);
-            let w = quant_weights[i];
-            mse += w * diff * diff;
-        }
-        if mse < best_mse {
-            best_mse = mse;
-            iscale = iscale_is;
-        }
-    }
-    let mut sumlx = 0.0f32;
-    let mut suml2 = 0.0f32;
-    for i in 0..n {
-        let mut l = nearest_int(iscale * x[i]);
-        l = l.min(nmax);
-        l_out[i] = l as u8;
-        let w = quant_weights[i];
-        sumlx += w * x[i] * (l as f32);
-        suml2 += w * (l as f32) * (l as f32);
-    }
-    for _itry in 0..5 {
-        let mut n_changed = 0;
-        for i in 0..n {
-            let w = quant_weights[i];
-            let li = l_out[i] as f32;
-            let mut slx = sumlx - w * x[i] * li;
-            let mut sl2 = suml2 - w * li * li;
-            if slx > 0.0 && sl2 > 0.0 {
-                let new_l = nearest_int(x[i] * sl2 / slx);
-                let new_l = new_l.min(nmax);
-                if new_l != l_out[i] as i32 {
-                    slx += w * x[i] * (new_l as f32);
-                    sl2 += w * (new_l as f32) * (new_l as f32);
-                    if slx * slx * suml2 > sumlx * sumlx * sl2 {
-                        l_out[i] = new_l as u8;
-                        sumlx = slx;
-                        suml2 = sl2;
-                        n_changed += 1;
-                    }
-                }
-            }
-        }
-        if n_changed == 0 {
-            break;
-        }
-    }
-    if suml2 > 0.0 {
-        sumlx / suml2
-    } else {
-        0.0
-    }
-}
 
 /// Mirror of `get_scale_min_k4` (ggml-quants.c:818-825) — unpacks the
 /// 6-bit sub-scale and sub-min for sub-block `j` from the 12-byte
@@ -493,12 +188,14 @@ fn quantize_row_q5_k_ref(x: &[f32], out: &mut Vec<u8>) {
             for l in 0..32 {
                 weights[l] = av_x + xb[32 * j + l].abs();
             }
-            let (scale, the_min) = make_qkx2_quants(
+            let mut the_min = 0.0f32;
+            let scale = make_qkx2_quants(
                 32,
                 31,
                 &xb[32 * j..32 * j + 32],
                 &weights,
                 &mut l_full[32 * j..32 * j + 32],
+                &mut the_min,
                 &mut laux,
                 -0.5,
                 0.1,
@@ -580,12 +277,14 @@ fn quantize_row_q5_k_impl(x: &[f32], quant_weights: &[f32], out: &mut Vec<u8>) {
             }
             sw[j] = sumw;
 
-            let (scale, the_min) = make_qkx3_quants(
+            let mut the_min = 0.0f32;
+            let scale = make_qkx3_quants(
                 32,
                 31,
                 &xb[32 * j..32 * j + 32],
-                &weights,
+                Some(&weights),
                 &mut l_full[32 * j..32 * j + 32],
+                &mut the_min,
                 &mut laux,
                 -0.9,
                 0.05,

@@ -22,18 +22,10 @@
 
 use half::f16;
 
+use super::common::make_qkx3_quants;
+
 pub const QK4_1: usize = 32;
 pub const BLOCK_BYTES: usize = 2 + 2 + QK4_1 / 2; // 20
-
-/// Mirror of llama.cpp's `nearest_int` (`ggml-quants.c:559`) — bit-trick
-/// round-to-nearest-even via float bias `12582912 = 1.5 * 2^23`.
-#[inline]
-fn nearest_int(fval: f32) -> i32 {
-    debug_assert!(fval.abs() <= 4_194_303.0);
-    let val = fval + 12_582_912.0;
-    let i = val.to_bits();
-    (i & 0x007f_ffff) as i32 - 0x0040_0000
-}
 
 /// Quantize an F32 buffer to Q4_1 bytes.
 ///
@@ -167,125 +159,6 @@ fn quantize_row_impl(x: &[f32], quant_weights: &[f32], out: &mut Vec<u8>) {
             out.push(l_arr[j] | (l_arr[j + 16] << 4));
         }
     }
-}
-
-/// `make_qkx3_quants` (`ggml-quants.c:931-1012`).
-///
-/// Q4_1's `_impl` always passes a non-null weights slice, so the weight-
-/// optional branches of the C source are kept here for fidelity but the
-/// caller-side path is always `Some(weights)`.
-#[allow(clippy::too_many_arguments)]
-fn make_qkx3_quants(
-    n: usize,
-    nmax: i32,
-    x: &[f32],
-    weights: Option<&[f32]>,
-    l: &mut [u8],
-    the_min: &mut f32,
-    l_aux: &mut [u8],
-    rmin: f32,
-    rdelta: f32,
-    nstep: i32,
-    use_mad: bool,
-) -> f32 {
-    let mut min = x[0];
-    let mut max = x[0];
-    let mut sum_w = match weights {
-        Some(w) => w[0],
-        None => x[0] * x[0],
-    };
-    let mut sum_x = sum_w * x[0];
-    for i in 1..n {
-        if x[i] < min {
-            min = x[i];
-        }
-        if x[i] > max {
-            max = x[i];
-        }
-        let w = match weights {
-            Some(ws) => ws[i],
-            None => x[i] * x[i],
-        };
-        sum_w += w;
-        sum_x += w * x[i];
-    }
-    if min > 0.0 {
-        min = 0.0;
-    }
-    if max <= min {
-        for li in l.iter_mut().take(n) {
-            *li = 0;
-        }
-        *the_min = -min;
-        return 0.0;
-    }
-    let mut iscale = nmax as f32 / (max - min);
-    let mut scale = 1.0 / iscale;
-    let mut best_mad = 0.0f32;
-    for i in 0..n {
-        let li = nearest_int(iscale * (x[i] - min));
-        let li_c = li.max(0).min(nmax) as u8;
-        l[i] = li_c;
-        let mut diff = scale * li_c as f32 + min - x[i];
-        diff = if use_mad { diff.abs() } else { diff * diff };
-        let w = match weights {
-            Some(ws) => ws[i],
-            None => x[i] * x[i],
-        };
-        best_mad += w * diff;
-    }
-    if nstep < 1 {
-        *the_min = -min;
-        return scale;
-    }
-    for is in 0..=nstep {
-        iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
-        let mut sum_l = 0.0f32;
-        let mut sum_l2 = 0.0f32;
-        let mut sum_xl = 0.0f32;
-        for i in 0..n {
-            let li_raw = nearest_int(iscale * (x[i] - min));
-            let li = li_raw.max(0).min(nmax) as u8;
-            l_aux[i] = li;
-            let w = match weights {
-                Some(ws) => ws[i],
-                None => x[i] * x[i],
-            };
-            let li_f = li as f32;
-            sum_l += w * li_f;
-            sum_l2 += w * li_f * li_f;
-            sum_xl += w * li_f * x[i];
-        }
-        let d_det = sum_w * sum_l2 - sum_l * sum_l;
-        if d_det > 0.0 {
-            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d_det;
-            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d_det;
-            if this_min > 0.0 {
-                this_min = 0.0;
-                this_scale = sum_xl / sum_l2;
-            }
-            let mut mad = 0.0f32;
-            for i in 0..n {
-                let mut diff = this_scale * l_aux[i] as f32 + this_min - x[i];
-                diff = if use_mad { diff.abs() } else { diff * diff };
-                let w = match weights {
-                    Some(ws) => ws[i],
-                    None => x[i] * x[i],
-                };
-                mad += w * diff;
-            }
-            if mad < best_mad {
-                for i in 0..n {
-                    l[i] = l_aux[i];
-                }
-                best_mad = mad;
-                scale = this_scale;
-                min = this_min;
-            }
-        }
-    }
-    *the_min = -min;
-    scale
 }
 
 #[cfg(test)]
