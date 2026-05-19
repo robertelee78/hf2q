@@ -14,6 +14,8 @@
 //! v1 set (11 files): q2_k, q3_k, q4_0, q4_1, q5_0, q5_1, q4_k, q5_k,
 //! q6_k, q8_0, iq4_nl. Per ADR-033 §P0 amendment A.
 
+pub mod error;
+pub mod ggml_type;
 pub mod iq4_nl;
 pub mod q2_k;
 pub mod q3_k;
@@ -25,3 +27,9 @@ pub mod q5_1;
 pub mod q5_k;
 pub mod q6_k;
 pub mod q8_0;
+pub mod quantizer;
+
+// P1 trait surface — per ADR-033 Decision §"Quantizer trait" + §"Per-tensor IR".
+pub use error::QuantizeError;
+pub use ggml_type::GgmlType;
+pub use quantizer::{quantizer_for, GgmlQuantizer, Quantizer};
