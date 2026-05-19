@@ -122,6 +122,22 @@ impl ApexPolicy {
                 n_expert,
             });
         }
+        // ADR-033 §Pi: I-tier variants require per-row imatrix data.
+        // v1's `tier_rules` maps {Quality,IQuality}, {Balanced,IBalanced},
+        // {Compact,ICompact} to identical TierRules — so absent imatrix
+        // data the I-tier silently produces bytes byte-identical to its
+        // non-I sibling, defeating the operator's intent. Reject upfront
+        // until Pi ships an inference-side imatrix driver.
+        // SUPPORTED_FOR_IMATRIX is empty in v1; once Pi lands for a given
+        // arch, append the arch's `name()` slot here.
+        if tier.requires_imatrix() {
+            const SUPPORTED_FOR_IMATRIX: &[&str] = &[];
+            return Err(ApexError::ImatrixRequiresInference {
+                tier: tier.cli_name(),
+                arch: arch.name(),
+                supported_for_imatrix: SUPPORTED_FOR_IMATRIX,
+            });
+        }
         Ok(Self {
             tier,
             n_layers,
@@ -553,5 +569,50 @@ mod tests {
         // Norms are structural; F32.
         let nm = tref("blk.5.attn_norm.weight", ArchName::Gemma4, Some(5));
         assert_eq!(p.target_for(&nm).unwrap(), GgmlType::F32);
+    }
+
+    /// ADR-033 §Pi gate: requesting any `i-*` tier without imatrix
+    /// support shipped MUST hard-error with `ImatrixRequiresInference`,
+    /// not silently degrade to the non-I sibling's bytes.
+    /// `SUPPORTED_FOR_IMATRIX` is empty in v1 (Pi pending), so all three
+    /// I-tier variants reject on every arch.
+    #[test]
+    fn apex_policy_rejects_i_tier_without_imatrix() {
+        for tier in [
+            ApexTier::IQuality,
+            ApexTier::IBalanced,
+            ApexTier::ICompact,
+        ] {
+            let err = ApexPolicy::new(tier, ArchName::Gemma4, 30, 128).unwrap_err();
+            match err {
+                ApexError::ImatrixRequiresInference {
+                    tier: t,
+                    arch,
+                    supported_for_imatrix,
+                } => {
+                    assert_eq!(t, tier.cli_name());
+                    assert_eq!(arch, "gemma4");
+                    assert_eq!(supported_for_imatrix, &[] as &[&str]);
+                }
+                other => panic!(
+                    "expected ImatrixRequiresInference for {tier:?}, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// The non-I siblings (`Quality`, `Balanced`, `Compact`, `Mini`)
+    /// MUST still construct cleanly — the §Pi gate is I-tier-only.
+    #[test]
+    fn apex_policy_accepts_non_i_tiers() {
+        for tier in [
+            ApexTier::Quality,
+            ApexTier::Balanced,
+            ApexTier::Compact,
+            ApexTier::Mini,
+        ] {
+            ApexPolicy::new(tier, ArchName::Gemma4, 30, 128)
+                .unwrap_or_else(|e| panic!("non-I tier {tier:?} rejected: {e}"));
+        }
     }
 }

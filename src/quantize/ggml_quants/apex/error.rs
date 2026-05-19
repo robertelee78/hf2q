@@ -148,6 +148,33 @@ pub enum ApexError {
         source_path: String,
         tensor_name: String,
     },
+
+    /// ADR-033 §Pi: an `apex-i-*` tier was requested but Pi (the imatrix
+    /// subsystem) hasn't shipped yet, so no per-row activation-importance
+    /// data is available. Per the no-silent-fallback rule we reject with
+    /// a typed error rather than silently producing non-I bytes (the
+    /// current `tier_rules` map identical TierRules for {Quality,
+    /// IQuality}, {Balanced, IBalanced}, {Compact, ICompact} pairs — so
+    /// running an I-tier without imatrix would emit bytes byte-identical
+    /// to the non-I sibling, defeating the purpose of asking for I).
+    ///
+    /// `supported_for_imatrix` is the set of arches that have a hf2q
+    /// inference forward-pass + imatrix-driver wired in. v1 ships with
+    /// this set EMPTY (Pi is open work); callers should treat any
+    /// `apex-i-*` request as REJECTED until Pi lands.
+    #[error(
+        "Apex tier `{tier}` requires per-row imatrix data (ADR-033 §Pi). \
+         hf2q's imatrix subsystem (Pi) is not yet shipped; \
+         supported_for_imatrix arches: {supported_for_imatrix:?}. \
+         Use the non-I sibling tier (e.g. apex-balanced for apex-i-balanced) \
+         OR supply a pre-computed imatrix file via --imatrix <path> \
+         (also pending Pi). See ADR-033 §Pi for the tracking issue."
+    )]
+    ImatrixRequiresInference {
+        tier: &'static str,
+        arch: &'static str,
+        supported_for_imatrix: &'static [&'static str],
+    },
 }
 
 impl ApexError {
