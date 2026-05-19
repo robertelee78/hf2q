@@ -140,6 +140,23 @@ pub struct ConvertCliArgs {
     ///     `apex-i-quality`, `apex-balanced`, `apex-i-balanced`,
     ///     `apex-compact`, `apex-i-compact`, `apex-mini`.
     ///
+    /// Reserved / out-of-scope names (per ADR §P7 AC#1 + Decision §6).
+    /// Each surfaces a typed `QuantSelectorError` variant with an
+    /// operator-actionable hint pointing at the supported alternative:
+    ///   - `dwq` → `DwqReserved` (reserved for the future Apple MLX
+    ///     `dwq.py` port — separate ADR).
+    ///   - `tq1_0`, `tq2_0` → `TqOutOfV1Scope` (recognized ftypes
+    ///     without a Quantizer impl in v1).
+    ///   - bare `apex` → `ApexUnqualified` (must pick an explicit
+    ///     tier; no implicit default).
+    ///   - `apex-custom` → `ApexCustomRequiresTensorTypeFile`
+    ///     (requires `--tensor-type-file <path>`).
+    ///   - `apex-nano`, `apex-i-nano`, `apex-micro`, `apex-i-micro` →
+    ///     `ApexTierOutOfScope` (mudler experimental tiers dropped
+    ///     from v1; reach via `apex-custom`).
+    ///   - any other `apex-<x>` → `UnknownApexTier` (lists the
+    ///     supported tier set in the message).
+    ///
     /// Parsed via `QuantSelector::from_name`; unrecognized values
     /// surface as input errors. Per
     /// [[feedback-no-backwards-compat-2026-05-18]]: no legacy aliases.
