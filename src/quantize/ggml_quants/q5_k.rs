@@ -399,12 +399,20 @@ fn finalize_block(
     d_f16: f16,
     dmin_f16: f16,
     scales: &[u8; K_SCALE_SIZE],
+    l_init: &[u8; QK_K],
     out: &mut Vec<u8>,
 ) {
     let d_back = f16::to_f32(d_f16);
     let dmin_back = f16::to_f32(dmin_f16);
 
-    let mut l = [0u8; QK_K];
+    // C preserves the prior L[] (populated by the per-sub-block
+    // make_qkx2/make_qkx3 + make_qp passes) for sub-blocks where the
+    // reconstructed `d == 0` (`continue;` at ggml-quants.c:1631-1663
+    // and :1750-1782). Codex review of commit 0bd0e7eb (2026-05-18)
+    // flagged that starting from zeros diverges when any sub-block hits
+    // sc==0 or f16(d)==0. Initialize from the caller's pre-populated
+    // L[].
+    let mut l: [u8; QK_K] = *l_init;
     for j in 0..QK_K / 32 {
         let (sc, m) = get_scale_min_k4(j, scales);
         let d = d_back * (sc as f32);
@@ -471,9 +479,10 @@ fn quantize_row_q5_k_ref(x: &[f32], out: &mut Vec<u8>) {
 
         let mut max_scale: f32 = 0.0;
         let mut max_min: f32 = 0.0;
-        // Throwaway storage for the per-sub-block L (only needed for the
-        // make_qkx2 contract; the final L is recomputed in `finalize_block`).
-        let mut l_per_sub = [0u8; 32];
+        // Per-codex 0bd0e7eb review: L[QK_K] must accumulate across all
+        // sub-blocks (matching C's `L[QK_K]` in q5_K_ref) so finalize_block
+        // preserves correct values for d==0 sub-blocks.
+        let mut l_full = [0u8; QK_K];
         for j in 0..QK_K / 32 {
             // weights[l] = av_x + |x[l]|; av_x = sqrt(sum_x2 / 32)
             let mut sum_x2 = 0.0f32;
@@ -489,7 +498,7 @@ fn quantize_row_q5_k_ref(x: &[f32], out: &mut Vec<u8>) {
                 31,
                 &xb[32 * j..32 * j + 32],
                 &weights,
-                &mut l_per_sub,
+                &mut l_full[32 * j..32 * j + 32],
                 &mut laux,
                 -0.5,
                 0.1,
@@ -498,7 +507,6 @@ fn quantize_row_q5_k_ref(x: &[f32], out: &mut Vec<u8>) {
             );
             scales_arr[j] = scale;
             mins[j] = the_min;
-            // (l_per_sub is intentionally discarded — only scale/min are used.)
             let _ = &mut l_buf;
 
             if scale > max_scale {
@@ -528,7 +536,7 @@ fn quantize_row_q5_k_ref(x: &[f32], out: &mut Vec<u8>) {
         let d_f16 = f16::from_f32(max_scale / 63.0);
         let dmin_f16 = f16::from_f32(max_min / 63.0);
 
-        finalize_block(xb, d_f16, dmin_f16, &scales_packed, out);
+        finalize_block(xb, d_f16, dmin_f16, &scales_packed, &l_full, out);
     }
 }
 
@@ -543,7 +551,9 @@ fn quantize_row_q5_k_impl(x: &[f32], quant_weights: &[f32], out: &mut Vec<u8>) {
     let mut ls_arr = [0u8; QK_K / 32];
     let mut lm_arr = [0u8; QK_K / 32];
     let mut weights = [0.0f32; 32];
-    let mut l_per_sub = [0u8; 32];
+    // Per-codex 0bd0e7eb: accumulate full L[QK_K] across sub-blocks so
+    // finalize_block preserves prior values for d==0 sub-blocks.
+    let mut l_full = [0u8; QK_K];
     let mut laux = [0u8; 32];
 
     for i in 0..nb {
@@ -575,7 +585,7 @@ fn quantize_row_q5_k_impl(x: &[f32], quant_weights: &[f32], out: &mut Vec<u8>) {
                 31,
                 &xb[32 * j..32 * j + 32],
                 &weights,
-                &mut l_per_sub,
+                &mut l_full[32 * j..32 * j + 32],
                 &mut laux,
                 -0.9,
                 0.05,
@@ -598,7 +608,7 @@ fn quantize_row_q5_k_impl(x: &[f32], quant_weights: &[f32], out: &mut Vec<u8>) {
         let d_f16 = f16::from_f32(d_block);
         let dmin_f16 = f16::from_f32(m_block);
 
-        finalize_block(xb, d_f16, dmin_f16, &scales_packed, out);
+        finalize_block(xb, d_f16, dmin_f16, &scales_packed, &l_full, out);
     }
 }
 

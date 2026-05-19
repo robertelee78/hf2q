@@ -251,10 +251,17 @@ fn finalize_block(
     x: &[f32],
     y_d: f32,
     y_scales: &[u8; 12],
+    l_init: &[i8; QK_K],
     y_hmask: &mut [u8; QK_K / 8],
     y_qs: &mut [u8; QK_K / 4],
 ) {
-    let mut l_buf = [0i8; QK_K];
+    // C preserves the prior L[] populated by `make_q3_quants` / `make_qx_quants`
+    // for sub-blocks where the reconstructed `d == 0` (the `continue;` at
+    // `ggml-quants.c:1209-1216` and `:1343-1350`). Codex review of commit
+    // 0bd0e7eb (2026-05-18) flagged that starting from a fresh zeroed buffer
+    // diverges when any sub-block hits sc==0 or f16(d)==0. Initialize from
+    // the caller's pre-populated L[] to mirror C exactly.
+    let mut l_buf: [i8; QK_K] = *l_init;
     // C reads d as `GGML_FP16_TO_FP32(y[i].d) * sc`, i.e. after F16
     // round-trip — not the original F32 scale. Mirror that exactly.
     let d_fp16_rt: f32 = f16::from_f32(y_d).to_f32();
@@ -262,21 +269,7 @@ fn finalize_block(
         let sc = unpack_sub_scale(y_scales, j);
         let d = d_fp16_rt * (sc as f32);
         if d == 0.0 {
-            // C `continue;` — leave L[16*j .. 16*j+16] at their default
-            // initial value. The `_ref` and `_impl` C code uses a stack
-            // `int8_t L[QK_K]` that was already written by the earlier
-            // `make_q3_quants`/`make_qx_quants` loop, so the "leave as-
-            // is" branch keeps those values. We re-fill `l_buf` from
-            // the FRESH 1/d-recompute path; on the d==0 branch we leave
-            // l_buf at 0, which biases to L=4 (>3 → hmask set, then
-            // L=0 in qs). That matches what C does for a zero
-            // sub-scale on garbage L: the zero-d branch is unreachable
-            // on the noim path when max_scale!=0 because every
-            // sub-scale uses the same iscale; on the im path it can
-            // happen only if d_block * sc rounds to 0, in which case
-            // the original L is already random-ish from
-            // make_qx_quants. We must match C byte-for-byte though, so
-            // we leave l_buf alone (matches C "skip this sub-block").
+            // C `continue;` — preserves the prior L[16*j .. 16*j+16].
             continue;
         }
         for ii in 0..16 {
@@ -360,7 +353,7 @@ fn quantize_row_ref(src: &[f32], out: &mut Vec<u8>) {
 
         let mut y_hmask = [0u8; QK_K / 8];
         let mut y_qs = [0u8; QK_K / 4];
-        finalize_block(x, y_d, &y_scales, &mut y_hmask, &mut y_qs);
+        finalize_block(x, y_d, &y_scales, &l_tmp, &mut y_hmask, &mut y_qs);
 
         out.extend_from_slice(&y_hmask);
         out.extend_from_slice(&y_qs);
@@ -427,7 +420,7 @@ fn quantize_row_impl(x: &[f32], imatrix: &[f32], out: &mut Vec<u8>) {
 
         let mut y_hmask = [0u8; QK_K / 8];
         let mut y_qs = [0u8; QK_K / 4];
-        finalize_block(xb, y_d, &y_scales, &mut y_hmask, &mut y_qs);
+        finalize_block(xb, y_d, &y_scales, &l_tmp, &mut y_hmask, &mut y_qs);
 
         out.extend_from_slice(&y_hmask);
         out.extend_from_slice(&y_qs);
