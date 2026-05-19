@@ -29,7 +29,8 @@ use crate::backends::gguf::types::MetaValue;
 use crate::convert::arch::{
     bert, gemma4, gemma4_mmproj, llama3, minimax_m2, nomic_bert, qwen35moe, qwen3vl_text,
 };
-use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor};
+use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped};
+use crate::convert::arch::qwen35moe::{ExpertKind, MappedTensor as QwenMapped};
 use crate::convert::source_reader::SourceError;
 use crate::convert::{ConvertOrchestrator, HfModelSource, HfTensor, OrchestratorError};
 use crate::quantize::ggml_quants::standard_policy::HParams;
@@ -272,7 +273,9 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertV2Error> {
             "gemma3" | "gemma" => return Ok(ArchName::Gemma4),
             "bert" => return Ok(ArchName::Bert),
             "nomic_bert" => return Ok(ArchName::NomicBert),
-            "qwen3_moe" => return Ok(ArchName::Qwen35Moe),
+            // qwen3_moe (canonical) + qwen3_5_moe_text and qwen3_6_moe_text
+            // variants operator's models use (per codex 3b478164 review).
+            "qwen3_moe" | "qwen3_5_moe_text" | "qwen3_6_moe_text" => return Ok(ArchName::Qwen35Moe),
             "qwen3_vl" | "qwen3_vl_moe" | "qwen3_vl_text" => return Ok(ArchName::Qwen3VlText),
             "minimax_m2" => return Ok(ArchName::MiniMaxM2),
             _ => {}
@@ -292,7 +295,12 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertV2Error> {
             }
             "BertForMaskedLM" | "BertModel" => return Ok(ArchName::Bert),
             "NomicBertModel" => return Ok(ArchName::NomicBert),
-            "Qwen3MoeForCausalLM" => return Ok(ArchName::Qwen35Moe),
+            // Qwen3MoeForCausalLM (canonical) + Qwen3_5MoeForCausalLM /
+            // Qwen3_6MoeForCausalLM operator-released variants (per codex
+            // 3b478164 review).
+            "Qwen3MoeForCausalLM" | "Qwen3_5MoeForCausalLM" | "Qwen3_6MoeForCausalLM" => {
+                return Ok(ArchName::Qwen35Moe);
+            }
             "Qwen3VLForConditionalGeneration"
             | "Qwen3VLMoeForConditionalGeneration"
             | "Qwen3VLTextForCausalLM" => {
@@ -435,16 +443,21 @@ fn map_tensor(arch: ArchName, hf_name: &str) -> MapOutcome {
             Some(s) => MapOutcome::Direct(s),
             None => MapOutcome::Unmapped,
         },
-        ArchName::Qwen35Moe => lift_mapped_tensor(qwen35moe::map_tensor_name(hf_name)),
-        ArchName::MiniMaxM2 => lift_mapped_tensor(minimax_m2::map_tensor_name(hf_name)),
+        ArchName::Qwen35Moe => lift_qwen_mapped(qwen35moe::map_tensor_name(hf_name)),
+        ArchName::MiniMaxM2 => lift_minimax_mapped(minimax_m2::map_tensor_name(hf_name)),
         ArchName::Falcon => MapOutcome::Unmapped,
     }
 }
 
-fn lift_mapped_tensor(m: Option<MappedTensor>) -> MapOutcome {
+/// Adapt Qwen35MoE's `MappedTensor` shape (Direct / ExpertGroup / Drop)
+/// to the unified driver `MapOutcome`. Per the qwen35moe.rs module-level
+/// comment, this is the "first MoE arch" enum shape — its `ExpertKind`
+/// flavors (Gate / Up / Down) map directly onto the driver's
+/// accumulator key.
+fn lift_qwen_mapped(m: Option<QwenMapped>) -> MapOutcome {
     match m {
-        Some(MappedTensor::Direct(s)) => MapOutcome::Direct(s),
-        Some(MappedTensor::ExpertGroup {
+        Some(QwenMapped::Direct(s)) => MapOutcome::Direct(s),
+        Some(QwenMapped::ExpertGroup {
             gguf_name,
             layer,
             expert_index,
@@ -455,8 +468,51 @@ fn lift_mapped_tensor(m: Option<MappedTensor>) -> MapOutcome {
             expert_index,
             kind,
         },
-        Some(MappedTensor::Drop) => MapOutcome::Drop,
+        Some(QwenMapped::Drop) => MapOutcome::Drop,
         None => MapOutcome::Unmapped,
+    }
+}
+
+/// Adapt MiniMax-M2's distinct `MappedTensor` shape (Dense / Router /
+/// ExpertWeight) to the unified driver `MapOutcome`.
+///
+/// Mapping rationale:
+///  - `Dense { gguf, .. }` and `Router { gguf, .. }` collapse to
+///    `Direct(gguf)` — both surface as 1:1 renames at the driver layer.
+///    The Dense-vs-Router distinction matters for QUANT policy
+///    selection inside the orchestrator (Router tensors might want a
+///    different policy in the future), but the driver does not gate
+///    on it.
+///  - `ExpertWeight { layer, expert, role, gguf_stacked, .. }` carries
+///    the same load-bearing info as Qwen's `ExpertGroup` but in a
+///    distinct enum shape. We translate `role` (Gate/Up/Down) onto
+///    Qwen's `ExpertKind` so the driver's MoE accumulator has one
+///    canonical key type.
+fn lift_minimax_mapped(m: Option<MiniMaxMapped>) -> MapOutcome {
+    match m {
+        Some(MiniMaxMapped::Dense { gguf, .. }) => MapOutcome::Direct(gguf),
+        Some(MiniMaxMapped::Router { gguf, .. }) => MapOutcome::Direct(gguf),
+        Some(MiniMaxMapped::ExpertWeight {
+            layer,
+            expert,
+            role,
+            gguf_stacked,
+            ..
+        }) => MapOutcome::Expert {
+            gguf_name: gguf_stacked,
+            layer: layer as usize,
+            expert_index: expert as usize,
+            kind: expert_role_to_kind(role),
+        },
+        None => MapOutcome::Unmapped,
+    }
+}
+
+fn expert_role_to_kind(r: ExpertRole) -> ExpertKind {
+    match r {
+        ExpertRole::Gate => ExpertKind::Gate,
+        ExpertRole::Up => ExpertKind::Up,
+        ExpertRole::Down => ExpertKind::Down,
     }
 }
 
@@ -749,6 +805,27 @@ mod tests {
             detect_arch(&json!({ "model_type": "qwen3_moe" })).unwrap(),
             ArchName::Qwen35Moe
         );
+    }
+
+    /// Codex 3b478164 review locked in: operator-released variants
+    /// `qwen3_5_moe_text` and `qwen3_6_moe_text` also resolve to
+    /// ArchName::Qwen35Moe.
+    #[test]
+    fn detect_arch_qwen35moe_release_variants_codex_3b478164() {
+        for mt in ["qwen3_5_moe_text", "qwen3_6_moe_text"] {
+            assert_eq!(
+                detect_arch(&json!({ "model_type": mt })).unwrap(),
+                ArchName::Qwen35Moe,
+                "model_type={mt} should resolve to Qwen35Moe"
+            );
+        }
+        for cls in ["Qwen3_5MoeForCausalLM", "Qwen3_6MoeForCausalLM"] {
+            assert_eq!(
+                detect_arch(&json!({ "architectures": [cls] })).unwrap(),
+                ArchName::Qwen35Moe,
+                "architectures=[{cls}] should resolve to Qwen35Moe"
+            );
+        }
     }
 
     /// All three qwen3_vl flavors land on Qwen3VlText.
