@@ -50,7 +50,10 @@ pub mod gguf_writer;
 pub use accumulator::{Accumulator, AccumulatorRegistry};
 pub use corpus::{CorpusBytes, CorpusSource, BAKED_CORPUS_NAMES};
 pub use error::ImatrixError;
-pub use forward::{compute_imatrix, ComputeImatrixParams};
+pub use forward::{
+    clear_moe_hint, clear_name_hint, compute_imatrix, intercept_qmatmul, is_active, set_moe_hint,
+    set_name_hint, with_collector, with_name_hint, ComputeImatrixParams, ImatrixCollector,
+};
 pub use gguf_loader::LoadedImatrix;
 pub use gguf_writer::{write_imatrix, write_imatrix_to_path};
 

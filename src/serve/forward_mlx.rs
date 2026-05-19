@@ -9634,6 +9634,41 @@ pub fn dispatch_qmatmul(
     output: &MlxBuffer,
     m: u32,
 ) -> Result<()> {
+    // ADR-033 §Pi Stage 1 — imatrix collector intercept.
+    //
+    // When a Phase-B driver has installed an `ImatrixCollector` AND set
+    // a tensor-name hint via `imatrix::forward::set_name_hint(...)`
+    // immediately before this call, capture the input activations
+    // BEFORE the matmul fires. The intercept itself is a single
+    // `Cell::get()` on a thread-local — in the production decode path
+    // (no collector, no name hint) it adds exactly one branch and falls
+    // through.
+    //
+    // The closure that materializes the F32 row is opaque to the
+    // intercept — it's only invoked when collection is active, so the
+    // commit_and_wait sync barrier never fires in production.
+    //
+    // Per ADR-033 §Risk 2 amendment (2026-05-19): Metal-native
+    // accumulation is acceptable; we read the input buffer post-sync on
+    // this same Metal-backed GraphSession instead of re-running on CPU.
+    crate::quantize::imatrix::intercept_qmatmul(|| {
+        // Materialize the input row. We must drain any pending GPU
+        // work that wrote to `input` before reading it on the host.
+        // `commit_and_wait` is a hard sync — only acceptable because
+        // this closure is gated on collector-present.
+        if let Err(e) = session.encoder_mut().commit_and_wait() {
+            eprintln!("[hf2q imatrix intercept] commit_and_wait failed: {e}");
+            return None;
+        }
+        match input.as_slice::<f32>() {
+            Ok(slice) => Some(slice.to_vec()),
+            Err(e) => {
+                eprintln!("[hf2q imatrix intercept] input.as_slice::<f32>() failed: {e}");
+                None
+            }
+        }
+    });
+
     // ADR-029 iter-40 H40 — annotate the next-captured dispatch with this
     // call's exact reads/writes so the graph_opt reorder pass (graph.rs
     // `ComputeGraph::reorder`) can detect non-conflicts between adjacent
