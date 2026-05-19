@@ -189,8 +189,9 @@ pub struct ConvertCliArgs {
     /// "Phase B" — SHIPPED 2026-05-19 (Stage 3c). The driver converts
     /// the source `<hf_dir>` to a temporary F16 GGUF, loads it via the
     /// per-arch inference path, tokenizes the corpus, and runs
-    /// `forward_prefill` over `n_ctx=512`-sized chunks while
-    /// intercepting per-tensor activations.
+    /// `forward_prefill` over `--imatrix-n-ctx`-sized chunks (default
+    /// 512, matching stock `llama-imatrix -c 512`) while intercepting
+    /// per-tensor activations.
     ///
     /// **Stage 3.0 supports Gemma 4 only.** Other arches (Qwen 3.5/3.6
     /// MoE, MiniMax-M2) surface
