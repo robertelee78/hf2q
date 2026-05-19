@@ -20,8 +20,9 @@ use half::f16;
 
 use crate::backends::gguf::types::MetaValue;
 use crate::backends::gguf::writer::{GgufWriter, WriterError};
+use crate::quantize::ggml_quants::apex::{ApexError, ApexPolicy};
 use crate::quantize::ggml_quants::standard_policy::{
-    HParams, LlmType, QsState, StandardPolicy, TensorCategory,
+    tensor_type_fallback, HParams, LlmType, QsState, StandardPolicy, TensorCategory,
 };
 use crate::quantize::ggml_quants::quantizer::Quantizer;
 use crate::quantize::ggml_quants::{

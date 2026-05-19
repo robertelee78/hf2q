@@ -112,10 +112,21 @@ pub fn classify_moe_tensor(arch: ArchName, name: &str) -> MoeTensorRole {
         return MoeTensorRole::Norm;
     }
 
+    // --- Router gate (per-token expert selector) — checked BEFORE
+    //     `_shexp` to handle the `ffn_gate_inp_shexp` corner case ---
+    // `blk.<i>.ffn_gate_inp.weight` selects which experts run for the
+    // current token. `blk.<i>.ffn_gate_inp_shexp.weight` (QWEN3_NEXT
+    // architecture) is the shared-expert router gate. Both are router
+    // gates, not shared-expert weights. Codex 867dba20 review caught
+    // the original ordering would misclassify the shexp variant.
+    if name.contains("ffn_gate_inp") {
+        return MoeTensorRole::RouterGate;
+    }
+
     // --- MoE expert tensors ---
-    // SHARED first (suffix `_shexp.weight`): mudler's
-    // `ffn_{gate,up,down}_shexp` tensors are always-active per-token
-    // experts. The `shexp` substring is unique to shared experts.
+    // SHARED: mudler's `ffn_{gate,up,down}_shexp` tensors are always-
+    // active per-token experts. The `shexp` substring is unique to
+    // shared experts (after we've already filtered router gates above).
     if name.contains("_shexp.weight") || name.contains("_shexp_") {
         return MoeTensorRole::SharedExpert;
     }
@@ -126,14 +137,6 @@ pub fn classify_moe_tensor(arch: ArchName, name: &str) -> MoeTensorRole {
     // above.
     if name.contains("_exps.weight") || name.contains("_exps_") {
         return MoeTensorRole::RoutedExpert;
-    }
-
-    // --- Router gate (per-token expert selector) ---
-    // `blk.<i>.ffn_gate_inp.weight` selects which experts run for the
-    // current token. Not in mudler's algorithmic config but standard
-    // llama.cpp convention is Q5_0 / preserved high-precision.
-    if name.contains("ffn_gate_inp") {
-        return MoeTensorRole::RouterGate;
     }
 
     // --- Attention ---
@@ -214,6 +217,24 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Codex 867dba20 review locked in: `ffn_gate_inp_shexp.weight`
+    /// (QWEN3_NEXT shared-expert router gate) was misclassified as
+    /// SharedExpert because `_shexp.weight` matched first. After fix,
+    /// `ffn_gate_inp` is checked BEFORE shexp suffixes.
+    #[test]
+    fn classify_ffn_gate_inp_shexp_as_router_codex_867dba20() {
+        assert_eq!(
+            classify_moe_tensor(ArchName::Qwen35Moe, "blk.3.ffn_gate_inp_shexp.weight"),
+            MoeTensorRole::RouterGate,
+            "ffn_gate_inp_shexp.weight is a router gate (QWEN3_NEXT), not a shared expert"
+        );
+        // Plain ffn_gate_inp is still router (unchanged).
+        assert_eq!(
+            classify_moe_tensor(ArchName::Qwen35Moe, "blk.3.ffn_gate_inp.weight"),
+            MoeTensorRole::RouterGate,
+        );
     }
 
     #[test]
