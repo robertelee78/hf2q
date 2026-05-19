@@ -162,21 +162,34 @@ pub struct ConvertCliArgs {
 
     /// Auto-generate an imatrix in-memory during convert by running the
     /// hf2q decoder over the named calibration corpus. ADR-033 §Pi
-    /// "Phase B" — currently DEFERRED; setting this flag returns a
-    /// typed `InTreeGenerationNotYetShipped` error pointing at the
-    /// `--imatrix <file>` workaround.
+    /// "Phase B" — SHIPPED 2026-05-19 (Stage 3c). The driver converts
+    /// the source `<hf_dir>` to a temporary F16 GGUF, loads it via the
+    /// per-arch inference path, tokenizes the corpus, and runs
+    /// `forward_prefill` over `n_ctx=512`-sized chunks while
+    /// intercepting per-tensor activations.
     ///
-    /// Accepted values: `cdv3` (bartowski's default), `mudler` (not
-    /// bundled in Phase A), or `user-file:<path>` for an operator-supplied
-    /// `.txt` corpus.
+    /// **Stage 3.0 supports Gemma 4 only.** Other arches (Qwen 3.5/3.6
+    /// MoE, MiniMax-M2) surface
+    /// `ImatrixError::UnsupportedArchForDriver`. For those, use the
+    /// `--imatrix <file>` flag with a pre-computed
+    /// `.imatrix.gguf` from stock `llama-imatrix` until Stage 3b.4
+    /// adds Qwen35Moe driver wiring.
+    ///
+    /// Accepted values: `cdv3` (bartowski's default, baked at compile
+    /// time), `mudler` (selector parses but the corpus itself is
+    /// not yet bundled — typed CorpusRead error), or
+    /// `user-file:<path>` for an operator-supplied `.txt` corpus.
+    ///
+    /// Wall time: roughly seconds per chunk × ~100 chunks on a 26B-A4B
+    /// Gemma 4 — operator-coffee-time, not CI-time.
     #[arg(long, conflicts_with = "imatrix")]
     pub imatrix_corpus: Option<String>,
 
-    /// Optional side-effect: write the imatrix used by this convert run
-    /// to the given path. Useful when an in-tree corpus run (Phase B,
-    /// once shipped) should persist the computed imatrix for reuse.
-    /// Has no effect when `--imatrix <file>` already loaded a
-    /// pre-computed imatrix unless the operator wants to round-trip.
+    /// Optional side-effect: write the imatrix used by this convert
+    /// run to the given path. Useful both for caching in-tree-computed
+    /// imatrices (`--imatrix-corpus`) and for round-tripping
+    /// pre-computed ones (`--imatrix <file>`). The on-disk format
+    /// matches stock `llama-imatrix --output-format gguf`.
     #[arg(long)]
     pub imatrix_out: Option<PathBuf>,
 }
