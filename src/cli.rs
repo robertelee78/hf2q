@@ -130,6 +130,36 @@ pub struct ConvertV2CliArgs {
     /// Destination GGUF file. Existing files are overwritten.
     #[arg(short, long)]
     pub output: PathBuf,
+
+    /// Pre-computed imatrix file (`.imatrix.gguf`). Required for I-tier
+    /// APEX variants (`apex-i-quality`, `apex-i-balanced`, `apex-i-compact`)
+    /// per ADR-033 §Pi. Mutually exclusive with `--imatrix-corpus`.
+    ///
+    /// Phase A workaround for in-tree generation: run stock
+    /// `llama-imatrix -m <gguf> -f data/calibration/cdv3.txt -o <out>.imatrix.gguf`
+    /// and pass `<out>.imatrix.gguf` here.
+    #[arg(long, conflicts_with = "imatrix_corpus")]
+    pub imatrix: Option<PathBuf>,
+
+    /// Auto-generate an imatrix in-memory during convert by running the
+    /// hf2q decoder over the named calibration corpus. ADR-033 §Pi
+    /// "Phase B" — currently DEFERRED; setting this flag returns a
+    /// typed `InTreeGenerationNotYetShipped` error pointing at the
+    /// `--imatrix <file>` workaround.
+    ///
+    /// Accepted values: `cdv3` (bartowski's default), `mudler` (not
+    /// bundled in Phase A), or `user-file:<path>` for an operator-supplied
+    /// `.txt` corpus.
+    #[arg(long, conflicts_with = "imatrix")]
+    pub imatrix_corpus: Option<String>,
+
+    /// Optional side-effect: write the imatrix used by this convert run
+    /// to the given path. Useful when an in-tree corpus run (Phase B,
+    /// once shipped) should persist the computed imatrix for reuse.
+    /// Has no effect when `--imatrix <file>` already loaded a
+    /// pre-computed imatrix unless the operator wants to round-trip.
+    #[arg(long)]
+    pub imatrix_out: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]

@@ -9,5 +9,12 @@
 //! (e.g. `quantize::ggml_quants::quantizer::Quantizer`,
 //! `quantize::ggml_quants::LlamaFtype`,
 //! `quantize::ggml_quants::apex::ApexPolicy`).
+//!
+//! The `imatrix` submodule implements ADR-033 §Pi — in-tree imatrix
+//! generation + `.imatrix.gguf` read/write. See
+//! [`imatrix`] for the full Phase A surface (corpus loader,
+//! accumulator, gguf writer/loader); Phase B (forward-pass driver) is
+//! deferred per the §Pi worker report.
 
 pub mod ggml_quants;
+pub mod imatrix;

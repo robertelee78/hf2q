@@ -186,6 +186,9 @@ fn cmd_convert_v2(args: cli::ConvertV2CliArgs) -> Result<(), AppError> {
         hf_dir: args.hf_dir,
         selector,
         output: args.output,
+        imatrix: args.imatrix,
+        imatrix_corpus: args.imatrix_corpus,
+        imatrix_out: args.imatrix_out,
     };
     run_convert_v2(resolved).map_err(|e| match e {
         ConvertV2Error::UnsupportedArch { .. }
@@ -196,7 +199,11 @@ fn cmd_convert_v2(args: cli::ConvertV2CliArgs) -> Result<(), AppError> {
         | ConvertV2Error::ApexMissingLayerCount
         | ConvertV2Error::ApexCustomOutOfScope { .. }
         | ConvertV2Error::Apex(_)
-        | ConvertV2Error::Tokenizer(_) => AppError::Input(anyhow::anyhow!("{e}")),
+        | ConvertV2Error::Tokenizer(_)
+        | ConvertV2Error::Imatrix(_)
+        | ConvertV2Error::ImatrixRequiredForITier { .. } => {
+            AppError::Input(anyhow::anyhow!("{e}"))
+        }
         ConvertV2Error::Source(_) | ConvertV2Error::Orchestrator(_) | ConvertV2Error::Io(_) => {
             AppError::Conversion(anyhow::anyhow!("{e}"))
         }

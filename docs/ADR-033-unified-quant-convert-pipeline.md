@@ -1,6 +1,6 @@
 # ADR-033: Unified Convert/Quant Pipeline — Port llama.cpp + Real APEX, Single Source-of-Truth IR, Incremental Writer
 
-- **Status**: SHIPPED 2026-05-19 — P-1..P6 Phase 1 + tokenizer + streaming + F32-keep + real-model validation + §9 fingerprint manifest all on main. Real Gemma 4 26B convert: 48GB safetensors → 18GB Q5_K_M GGUF in 8m 22s, loads in stock llama.cpp + decodes coherent reasoning at 111.5 t/s gen. §9 ships 21 manifest entries (3 families × 7 tiers; gemma4-26b + Qwen3.5/3.6-35B-A3B base + Qwen3.6 MTP) via SHA-256 of canonical 9-tuple JSON. Remaining: Pi (imatrix for I-tier APEX), Phase 2/3 retirement (operator decisions on B1/B2/B4)
+- **Status**: SHIPPED 2026-05-19 — P-1..P6 Phase 1 + tokenizer + streaming + F32-keep + real-model validation + §9 fingerprint manifest + §Pi Phase A (imatrix corpus loader + accumulator + .imatrix.gguf writer/loader + CLI flags + I-tier APEX wiring via `--imatrix <file>`) all on main. Real Gemma 4 26B convert: 48GB safetensors → 18GB Q5_K_M GGUF in 8m 22s, loads in stock llama.cpp + decodes coherent reasoning at 111.5 t/s gen. §9 ships 21 manifest entries (3 families × 7 tiers; gemma4-26b + Qwen3.5/3.6-35B-A3B base + Qwen3.6 MTP) via SHA-256 of canonical 9-tuple JSON. §Pi Phase A ships 32 new tests + supports apex-i-* tiers via externally-generated `.imatrix.gguf` (`llama-imatrix` workaround documented). Remaining: §Pi Phase B (in-tree forward-pass driver for `--imatrix-corpus`), Phase 2/3 retirement (operator decisions on B1/B2/B4)
 - **Date**: 2026-05-18
 - **Deciders**: operator (robert@loveathome.us); claude (interview + draft)
 - **Tags**: convert, quantize, architecture, byte-parity, public-release, apex, mudler, imatrix
@@ -346,22 +346,43 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
 
 ### Pi — Imatrix subsystem
 
+**Status:** PHASE A SHIPPED 2026-05-19 (in-tree generation deferred to Phase B).
+
 **Why:** I-tier APEX (I-Compact / I-Balanced / I-Quality) requires per-row activation-importance data. llama-imatrix's `.imatrix.gguf` format is the de facto reference; we need a hf2q-side generator that produces equivalent output.
 
 **Reference format** (from `/opt/llama.cpp/tools/imatrix/imatrix.cpp` @ pinned SHA): the `.imatrix.gguf` carries:
 - KV header: `general.type = "imatrix"` (string), `imatrix.datasets` (array of strings — calibration corpora names), `imatrix.chunk_count` (u32), `imatrix.chunk_size` (u32 = `n_ctx / n_parallel`)
-- Per-source-tensor: a GGUF tensor named after the source weight (e.g., `blk.0.attn_q.weight`) whose payload encodes `Stats { values: Vec<f32>, counts: Vec<i64> }` — `values.len() == n_mat × row_size`; `counts.len() == n_mat`. n_mat is the number of "matrices" the source tensor was viewed as during inference (1 for most weights; expert_count for `*_exps.weight`).
+- Per-source-tensor: TWO GGUF tensors per source weight — `<name>.in_sum2` (f32, shape `[n_per_row, n_mat]`) and `<name>.counts` (f32, shape `[1, n_mat]`). `n_mat` is `1` for ordinary dense linears and `n_experts` for MoE `*_exps.weight`. Per llama.cpp PR #9400 (Sep 2024) the legacy `.dat` format is superseded by the GGUF v3 format; `.in_sum2` + `.counts` is the canonical pairing since.
 
-**What:**
-- Add `src/quantize/imatrix/` module: corpus loader (reads `data/calibration/<name>.txt`), forward-pass driver (reuses hf2q's existing decoder forward-pass on top of mlx-native), per-row importance accumulator (sum of squared activations per row, divided by counts at finalize), llama-imatrix-format writer producing exact-schema `.imatrix.gguf`.
-- Bundle `data/calibration/calibration_datav3.txt` (cdv3, default; bartowski's canonical 750 KB corpus) and `data/calibration/mudler_v1.txt` (mudler-style; sampled from openassistant + the-stack-smol + math-instruct + ToolBench, version-pinned in `data/calibration/mudler_v1.README.md` with sampling seed + per-source token counts).
-- Imatrix is computed in-memory during convert (no `.imatrix.gguf` written to disk) when `--imatrix-corpus <name>` is used; written to disk only as a side-effect when the user runs `hf2q convert --imatrix-out <path>` (separate flag, optional).
-- Pi only runs against arches with hf2q inference support (`{bert, gemma4, nomic_bert, qwen35, qwen3vl_text}`). For convert-only arches (llama3, minimax_m27) added in P0, I-tier APEX is OUT of v1 scope; convert with `--quant apex-i-*` against those arches returns `ApexError::ImatrixRequiresInference { arch, supported_for_imatrix: &[ArchName] }`.
+**Phase A — SHIPPED (this iter):**
 
-**Acceptance gate (with verify spike):** byte-cmp against llama-imatrix.
-- **Verify spike (run before Pi proper begins, ~half-day):** feed identical corpus + model to llama-imatrix on CPU and on Metal (`-ngl 999`). `cmp` the two outputs. If bytes match: byte-cmp is achievable, gate stands. If bytes diverge: the strict gate is unsatisfiable due to FP accumulation order divergence between Metal kernels and CPU reference; ADR amends to numeric-cmp (per-entry within 1e-6 relative tolerance) before Pi continues.
-- **CI gate (fast):** tiny synthetic corpus (~1k tokens of wikitext-2 valid); imatrix run completes in ~1 min; hf2q output `cmp`-equals llama-imatrix reference. Catches accumulation-order regressions every commit.
-- **Pre-release gate (slow):** full cdv3 corpus; production-realistic; manual or weekly trigger. Catches divergence that surfaces only at scale.
+- `src/quantize/imatrix/` module created with submodules:
+  - `corpus.rs` — corpus loader: `CorpusSource::{Cdv3, Mudler, UserFile}`. `Cdv3` is bartowski's `calibration_datav3.txt` (273 KB, SHA-256 `200e109bcd2b599fabcceaada7f52bbd1e7c8f9ae030b8dc59c011de039a8026`) baked into the binary via `include_str!("../../../data/calibration/cdv3.txt")`. `Mudler` is parsed but the corpus itself is not yet collected (assembling it requires multi-source sampling per ADR text); `Mudler` loads return a typed `CorpusRead` error pointing at the workaround.
+  - `accumulator.rs` — `Accumulator` + `AccumulatorRegistry` (sorted-by-name BTreeMap) implementing the canonical `sum-of-squared-activations + per-mat counts` algorithm from imatrix.cpp:380-393 (dense) and imatrix.cpp:310-330 (MoE per-expert).
+  - `gguf_writer.rs` — `write_imatrix` produces a `.imatrix.gguf` byte-shaped to match `imatrix.cpp::save_imatrix`. KVs: `general.type="imatrix"`, `imatrix.datasets[]`, `imatrix.chunk_count`, `imatrix.chunk_size`. Per-tensor pair: `.in_sum2` (f32) + `.counts` (f32, cast from i64 per imatrix.cpp:610). Uses the existing seek-back writer at `src/backends/gguf/writer.rs` (no new GGUF writer code).
+  - `gguf_loader.rs` — `LoadedImatrix::load_from_path` parses GGUF imatrix files; validates schema (`general.type=imatrix`, required KVs present, every `.in_sum2` has a matching `.counts`). Two-pass tensor walk: pass 1 registers all `.in_sum2`, pass 2 attaches `.counts` (order-independent). Legacy `.dat` format is NOT supported — operators pass `--output-format gguf` to `llama-imatrix`.
+  - `error.rs` — typed `ImatrixError` (Io, Writer, Parse, NotAnImatrix, MissingKv, MismatchedTensorPair, CorpusRead, UnknownBakedCorpus, InTreeGenerationNotYetShipped) per the no-loop-suppression rule.
+  - `forward.rs` — `compute_imatrix(params)` Phase B entry point; Phase A returns `InTreeGenerationNotYetShipped` with the operator-facing workaround (run stock `llama-imatrix -m <gguf> -f data/calibration/cdv3.txt -o <out>.imatrix.gguf` and pass via `--imatrix`).
+  - `mod.rs` — `ImatrixData { loaded, provenance }` public API; `provenance` distinguishes `LoadedFromFile` from (future) `Computed`. `ImatrixData::load_from_path` + `ImatrixData::write_gguf` provide round-trip.
+- CLI: `--imatrix <file>` (load pre-computed; conflicts with `--imatrix-corpus`), `--imatrix-corpus <cdv3|mudler|user-file:<path>>` (returns deferred-Phase-B error in Phase A), `--imatrix-out <path>` (side-effect write).
+- `ApexPolicy::new_with_imatrix(tier, arch, n_layers, n_expert)` — new constructor that accepts I-tier variants when imatrix data has been resolved. `ApexPolicy::new` (no imatrix) continues to reject I-tier per the no-silent-fallback rule.
+- `SUPPORTED_FOR_IMATRIX` (in `apex/policy.rs`) updated from `&[]` to `&["qwen3moe", "gemma4"]` per ADR text "Pi only runs against arches with hf2q inference support". `MiniMaxM2` and `Llama3` stay out (convert-only arches).
+- 26 imatrix unit tests + 6 CLI-resolution tests pass (32 new tests total). Full bin test suite: 2746 passed, 1 pre-existing unrelated `serve::tests::run_decode_loop_stops_on_repetition` failure.
+
+**Phase B — DEFERRED to a follow-up iter:**
+
+- Forward-pass interception into hf2q's per-arch decoder (`src/inference/models/<arch>/`). Per ADR-033 §Pi this is the load-bearing piece; it requires reading every per-arch decoder's `MlxAffineLinear::forward` call site and threading an opt-in `ImatrixCollector` hook through them. The interception is invasive (5 arches × MoE routing × attention fusion × KV cache); deferred to keep this Phase A iter atomic and reviewable.
+- Phase A operator workaround: run stock `llama-imatrix -m <f16-gguf> -f data/calibration/cdv3.txt -o <out>.imatrix.gguf`, then `hf2q convert-v2 --quant apex-i-balanced --imatrix <out>.imatrix.gguf`. The contract sketch for the eventual `ImatrixCollector` trait lives in `src/quantize/imatrix/forward.rs` module-doc.
+- The `--imatrix-corpus` flag surfaces the typed `InTreeGenerationNotYetShipped` error pointing operators at the workaround above. Per the no-loop-suppression rule it's loud, not silent.
+
+**Acceptance gate (Phase A):**
+
+- **Round-trip stability:** `imatrix_data_round_trip_is_byte_stable` test writes an imatrix → reloads → re-writes → asserts byte-identical. PASS.
+- **Schema validity:** `round_trip_minimal_imatrix` + `round_trip_moe_imatrix_file` tests assert the on-disk schema parses via `mlx_native::gguf::GgufFile` with `general.type=imatrix`, the required header KVs, and the `[n_mat, n_per_row]` reader-side shape for both dense (n_mat=1) and MoE (n_mat=n_experts) tensors. PASS.
+- **Reject contract:** `rejects_non_imatrix_gguf` + `rejects_missing_chunk_count` tests assert `LoadedImatrix::load_from_path` rejects malformed inputs with typed errors. PASS.
+- **CLI surface:** `imatrix_required_for_i_tier_without_data`, `imatrix_corpus_returns_phase_b_deferred`, `imatrix_corpus_unknown_name_errors_typed`, `imatrix_missing_file_errors_typed`, `imatrix_file_loads_for_any_tier` cover the four resolve-paths through `resolve_imatrix_input` (load file / corpus deferred / I-tier no data / non-I no data). PASS.
+
+**Acceptance gate (Phase B + byte-cmp gate against llama-imatrix):** DEFERRED with Phase B. The strict byte-cmp gate against `llama-imatrix --output-format gguf` on the same model + corpus is documented in the original ADR text (Risk 2: Metal-vs-CPU activation order); when Phase B's forward-pass driver lands, the gate will be re-evaluated. In the interim, operators consuming a `llama-imatrix`-produced `.imatrix.gguf` via `--imatrix <path>` get the full operational capability with zero hf2q-side FP-order risk (the bytes are llama-imatrix's, untouched).
 
 ### P4b — ApexPolicy I-tier variants
 

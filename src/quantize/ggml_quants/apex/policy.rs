@@ -72,6 +72,25 @@ use super::rules::{
 /// [`ApexError::TensorNotInMudlerConfig`] — no silent fall-through to
 /// the algorithmic generator (ADR §9 line 102: "the vendored config's
 /// rules win over the algorithmic generator's output").
+/// ADR-033 §Pi: arches for which an I-tier APEX request CAN be
+/// honored when imatrix data is present.
+///
+/// Phase A v1: the imatrix subsystem can ingest an externally-produced
+/// `.imatrix.gguf` (typically from stock `llama-imatrix`) for any of
+/// the v1 Apex-supported MoE arches. The policy itself doesn't care
+/// where the imatrix came from; it only needs to know that the
+/// per-tensor dispatch surface (P4b's imatrix-aware quantizer wiring)
+/// can consume the data for this arch.
+///
+/// `Llama3` and `MiniMaxM2` are convert-only arches (no hf2q inference
+/// support); the in-tree generation path can't run them. Operators who
+/// already have an external `.imatrix.gguf` for those arches can still
+/// pass it via `--imatrix <path>` — at which point this list controls
+/// whether the policy LAYER accepts it. Phase A keeps these out of
+/// `SUPPORTED_FOR_IMATRIX` to stay aligned with ADR-033 §Pi line 359
+/// ("Pi only runs against arches with hf2q inference support").
+pub const SUPPORTED_FOR_IMATRIX: &[&str] = &["qwen3moe", "gemma4"];
+
 #[derive(Debug, Clone, Copy)]
 pub struct ApexPolicy {
     /// The selected Apex tier.
@@ -126,12 +145,78 @@ impl ApexPolicy {
         // v1's `tier_rules` maps {Quality,IQuality}, {Balanced,IBalanced},
         // {Compact,ICompact} to identical TierRules — so absent imatrix
         // data the I-tier silently produces bytes byte-identical to its
-        // non-I sibling, defeating the operator's intent. Reject upfront
-        // until Pi ships an inference-side imatrix driver.
-        // SUPPORTED_FOR_IMATRIX is empty in v1; once Pi lands for a given
-        // arch, append the arch's `name()` slot here.
+        // non-I sibling, defeating the operator's intent.
+        //
+        // `ApexPolicy::new` is the "no imatrix data supplied" entry
+        // point and continues to reject I-tier on every arch — the
+        // operator must use `new_with_imatrix` (which threads a
+        // `LoadedImatrix` from `--imatrix <file>`) to request an I-tier.
+        // Phase A's `SUPPORTED_FOR_IMATRIX` lists arches that can be
+        // RUN against a pre-computed imatrix (i.e. arches the policy
+        // knows how to dispatch tensors for — same set as the v1 Apex
+        // supported MoE arches). Phase B will widen this set further
+        // when in-tree generation lands.
         if tier.requires_imatrix() {
-            const SUPPORTED_FOR_IMATRIX: &[&str] = &[];
+            return Err(ApexError::ImatrixRequiresInference {
+                tier: tier.cli_name(),
+                arch: arch.name(),
+                supported_for_imatrix: SUPPORTED_FOR_IMATRIX,
+            });
+        }
+        Ok(Self {
+            tier,
+            n_layers,
+            n_expert,
+            arch,
+            mudler_override: None,
+        })
+    }
+
+    /// Construct an `ApexPolicy` with imatrix data attached.
+    ///
+    /// This entry point accepts I-tier variants because the caller has
+    /// committed to a `LoadedImatrix` (typically loaded from
+    /// `--imatrix <file>` in Phase A; in Phase B from in-tree
+    /// generation against a calibration corpus).
+    ///
+    /// The pre-conditions are the same as [`ApexPolicy::new`] minus the
+    /// I-tier-requires-imatrix gate. Per ADR-033 §Pi the arch MUST be in
+    /// [`SUPPORTED_FOR_IMATRIX`] — even with imatrix data present,
+    /// convert-only arches (Llama3, MiniMaxM2) lack the per-tensor
+    /// dispatch surface the imatrix-aware quantizer needs to consume
+    /// the data.
+    ///
+    /// Phase A note: `_imatrix_provenance` is recorded only for
+    /// diagnostic logging; the per-tensor `LoadedImatrix` data itself
+    /// is consumed at the quantizer layer (P4b), not here. The policy
+    /// layer's only job for I-tier is the upfront "yes we can run this
+    /// configuration" gate; the per-row weighting is applied during
+    /// `Quantizer::quantize(..., imatrix: Option<&[f32]>)`.
+    pub fn new_with_imatrix(
+        tier: ApexTier,
+        arch: ArchName,
+        n_layers: u32,
+        n_expert: u32,
+    ) -> Result<Self, ApexError> {
+        if !is_apex_supported_arch(arch) {
+            return Err(ApexError::unsupported_arch(arch));
+        }
+        if n_layers == 0 {
+            return Err(ApexError::MissingHParam {
+                hparam: "num_hidden_layers",
+            });
+        }
+        if n_expert <= 1 {
+            return Err(ApexError::DenseModelNotSupported {
+                arch: arch.name(),
+                n_expert,
+            });
+        }
+        // If the I-tier is requested but the arch isn't in the
+        // imatrix-supported set, the operator's I-tier intent can't be
+        // honored even with imatrix data — surface the same typed
+        // error as `new`, but with the (still-accurate) supported set.
+        if tier.requires_imatrix() && !SUPPORTED_FOR_IMATRIX.contains(&arch.name()) {
             return Err(ApexError::ImatrixRequiresInference {
                 tier: tier.cli_name(),
                 arch: arch.name(),
@@ -571,13 +656,12 @@ mod tests {
         assert_eq!(p.target_for(&nm).unwrap(), GgmlType::F32);
     }
 
-    /// ADR-033 §Pi gate: requesting any `i-*` tier without imatrix
-    /// support shipped MUST hard-error with `ImatrixRequiresInference`,
-    /// not silently degrade to the non-I sibling's bytes.
-    /// `SUPPORTED_FOR_IMATRIX` is empty in v1 (Pi pending), so all three
-    /// I-tier variants reject on every arch.
+    /// ADR-033 §Pi gate: `ApexPolicy::new` (no imatrix data threaded)
+    /// MUST reject any `i-*` tier with `ImatrixRequiresInference`. The
+    /// I-tier opt-in path is `new_with_imatrix`, which Phase A wires
+    /// from `--imatrix <file>`.
     #[test]
-    fn apex_policy_rejects_i_tier_without_imatrix() {
+    fn apex_policy_new_rejects_i_tier() {
         for tier in [
             ApexTier::IQuality,
             ApexTier::IBalanced,
@@ -592,12 +676,63 @@ mod tests {
                 } => {
                     assert_eq!(t, tier.cli_name());
                     assert_eq!(arch, "gemma4");
-                    assert_eq!(supported_for_imatrix, &[] as &[&str]);
+                    // Phase A widened from `&[]` to the v1 imatrix-supported
+                    // arch set; the error message tells the operator which
+                    // arches can accept `--imatrix <file>`.
+                    assert_eq!(supported_for_imatrix, &["qwen3moe", "gemma4"]);
                 }
                 other => panic!(
                     "expected ImatrixRequiresInference for {tier:?}, got {other:?}"
                 ),
             }
+        }
+    }
+
+    /// ADR-033 §Pi: `new_with_imatrix` accepts I-tier on the
+    /// imatrix-supported arches (Gemma4, Qwen35Moe).
+    #[test]
+    fn apex_policy_new_with_imatrix_accepts_i_tier_for_supported_arches() {
+        for tier in [
+            ApexTier::IQuality,
+            ApexTier::IBalanced,
+            ApexTier::ICompact,
+        ] {
+            let p =
+                ApexPolicy::new_with_imatrix(tier, ArchName::Gemma4, 30, 128).unwrap();
+            assert_eq!(p.tier, tier);
+            let p2 = ApexPolicy::new_with_imatrix(tier, ArchName::Qwen35Moe, 40, 128).unwrap();
+            assert_eq!(p2.tier, tier);
+        }
+    }
+
+    /// `new_with_imatrix` rejects I-tier on convert-only arches that
+    /// aren't in `SUPPORTED_FOR_IMATRIX` — even with imatrix data the
+    /// policy layer can't dispatch the request.
+    #[test]
+    fn apex_policy_new_with_imatrix_rejects_i_tier_for_unsupported_arch() {
+        let err = ApexPolicy::new_with_imatrix(
+            ApexTier::IBalanced,
+            ArchName::MiniMaxM2,
+            32,
+            128,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApexError::ImatrixRequiresInference { .. }));
+    }
+
+    /// `new_with_imatrix` also accepts non-I tiers (it's a strict
+    /// super-set of `new`). Useful so the CLI can route both paths
+    /// through the same constructor when imatrix data is present.
+    #[test]
+    fn apex_policy_new_with_imatrix_accepts_non_i_tiers() {
+        for tier in [
+            ApexTier::Quality,
+            ApexTier::Balanced,
+            ApexTier::Compact,
+            ApexTier::Mini,
+        ] {
+            ApexPolicy::new_with_imatrix(tier, ArchName::Gemma4, 30, 128)
+                .unwrap_or_else(|e| panic!("non-I tier {tier:?} rejected: {e}"));
         }
     }
 

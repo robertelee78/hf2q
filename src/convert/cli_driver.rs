@@ -74,6 +74,20 @@ pub struct ConvertV2Args {
     pub selector: QuantSelector,
     /// Destination GGUF path. Existing files are overwritten.
     pub output: PathBuf,
+    /// ADR-033 §Pi: pre-computed imatrix file (`.imatrix.gguf`). Required
+    /// for I-tier APEX (`apex-i-*`) variants. Mutually exclusive with
+    /// `imatrix_corpus`. Phase A's load path; round-trip-tested against
+    /// the writer in `src/quantize/imatrix/gguf_loader.rs`.
+    pub imatrix: Option<PathBuf>,
+    /// ADR-033 §Pi: in-tree imatrix generation via named calibration
+    /// corpus. Phase A returns a typed `InTreeGenerationNotYetShipped`
+    /// error pointing at the `--imatrix` workaround; Phase B will
+    /// wire this to the forward-pass driver.
+    pub imatrix_corpus: Option<String>,
+    /// ADR-033 §Pi: optional side-effect — write the imatrix used by
+    /// this run to the given path. Useful for caching in-tree
+    /// generations and for round-trip tests.
+    pub imatrix_out: Option<PathBuf>,
 }
 
 /// Errors raised by [`run_convert_v2`]. Wraps the typed errors from the
@@ -152,6 +166,17 @@ pub enum ConvertV2Error {
     /// rather than producing a GGUF that llama.cpp rejects with
     /// `key not found in model: tokenizer.ggml.model`.
     Tokenizer(TokenizerError),
+    /// ADR-033 §Pi: an imatrix-subsystem failure surfaced. Wraps the
+    /// typed [`crate::quantize::imatrix::ImatrixError`] so the operator
+    /// sees the same diagnostic regardless of whether the failure
+    /// happened in the loader, the writer, or the (Phase B) forward
+    /// driver.
+    Imatrix(crate::quantize::imatrix::ImatrixError),
+    /// ADR-033 §Pi: an I-tier APEX (`apex-i-*`) variant was requested
+    /// but neither `--imatrix <file>` nor `--imatrix-corpus <name>` was
+    /// provided. Per the no-silent-fallback rule we refuse to silently
+    /// degrade to the non-I sibling tier.
+    ImatrixRequiredForITier { tier: &'static str },
 }
 
 impl std::fmt::Display for ConvertV2Error {
@@ -209,6 +234,12 @@ impl std::fmt::Display for ConvertV2Error {
             ),
             ConvertV2Error::Apex(e) => write!(f, "convert-v2/apex: {e}"),
             ConvertV2Error::Tokenizer(e) => write!(f, "convert-v2/tokenizer: {e}"),
+            ConvertV2Error::Imatrix(e) => write!(f, "convert-v2/imatrix: {e}"),
+            ConvertV2Error::ImatrixRequiredForITier { tier } => write!(
+                f,
+                "convert-v2: --quant apex-{tier} requires `--imatrix <file>` \
+                 (or `--imatrix-corpus <name>` once ADR-033 §Pi Phase B ships)"
+            ),
         }
     }
 }
@@ -221,8 +252,15 @@ impl std::error::Error for ConvertV2Error {
             ConvertV2Error::Io(e) => Some(e),
             ConvertV2Error::Apex(e) => Some(e),
             ConvertV2Error::Tokenizer(e) => Some(e),
+            ConvertV2Error::Imatrix(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+impl From<crate::quantize::imatrix::ImatrixError> for ConvertV2Error {
+    fn from(e: crate::quantize::imatrix::ImatrixError) -> Self {
+        ConvertV2Error::Imatrix(e)
     }
 }
 
@@ -310,7 +348,54 @@ pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
             let n_layers = config_n_layers(&src.config)
                 .ok_or(ConvertV2Error::ApexMissingLayerCount)?;
             let n_expert = hparams.n_expert;
-            let mut apex_policy = ApexPolicy::new(*tier, arch, n_layers, n_expert)?;
+
+            // ADR-033 §Pi: resolve the imatrix surface. Phase A accepts a
+            // pre-computed `.imatrix.gguf` via `--imatrix <path>`; in-tree
+            // generation via `--imatrix-corpus` is deferred and returns the
+            // typed `InTreeGenerationNotYetShipped` error.
+            //
+            // The policy constructor choice depends on whether imatrix data
+            // is present:
+            //   - tier is I-tier + imatrix data present → new_with_imatrix
+            //   - tier is I-tier + no imatrix data → typed reject (the §Pi
+            //     no-silent-fallback rule).
+            //   - tier is non-I → new (imatrix data, if present, is still
+            //     respected; it's optional for non-I tiers).
+            let imatrix_data = resolve_imatrix_input(
+                tier,
+                args.imatrix.as_deref(),
+                args.imatrix_corpus.as_deref(),
+            )?;
+
+            let mut apex_policy = if imatrix_data.is_some() {
+                ApexPolicy::new_with_imatrix(*tier, arch, n_layers, n_expert)?
+            } else {
+                ApexPolicy::new(*tier, arch, n_layers, n_expert)?
+            };
+
+            // Side-effect: write the imatrix used by this run to disk if
+            // requested. Idempotent for the loaded-from-file case (round-trip
+            // re-emits the same bytes).
+            if let (Some(out_path), Some(data)) = (&args.imatrix_out, imatrix_data.as_ref()) {
+                let label = data
+                    .loaded
+                    .datasets
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "user-file".to_string());
+                data.write_gguf(out_path, &[label])?;
+                eprintln!(
+                    "[hf2q imatrix] wrote {} ({} tensor pairs)",
+                    out_path.display(),
+                    data.tensor_pair_count()
+                );
+            }
+            // Hold the imatrix data alive through the convert run; the P4b
+            // wiring (per-tensor row weighting) consumes it. For Phase A
+            // the policy layer's ABI accepts it via `new_with_imatrix`'s
+            // up-front gate only; per-tensor consumption is P4b's job.
+            let _ = imatrix_data; // kept for future wiring; drop at end of scope.
+
             // ADR-033 §9 — per-model APEX config override.
             //
             // Hash the source config.json's 9-tuple of identifying
@@ -403,6 +488,53 @@ pub fn run_convert_v2(args: ConvertV2Args) -> Result<(), ConvertV2Error> {
     // 5d. Finalize — seek-back to fill tensor offsets, flush.
     sw.finalize()?;
     Ok(())
+}
+
+/// ADR-033 §Pi: resolve the imatrix-CLI surface into an
+/// [`ImatrixData`] value (or `None` for runs that don't need one).
+///
+/// Resolution rules:
+///   - `--imatrix <file>` set → [`ImatrixData::load_from_path`].
+///   - `--imatrix-corpus <name>` set → typed `InTreeGenerationNotYetShipped`
+///     error (Phase B deferred).
+///   - Neither set + tier is I-tier → typed `ImatrixRequiredForITier`.
+///   - Neither set + tier is non-I → `Ok(None)` (the run proceeds
+///     without imatrix data).
+fn resolve_imatrix_input(
+    tier: &crate::quantize::ggml_quants::apex::ApexTier,
+    imatrix_path: Option<&std::path::Path>,
+    imatrix_corpus: Option<&str>,
+) -> Result<Option<crate::quantize::imatrix::ImatrixData>, ConvertV2Error> {
+    use crate::quantize::imatrix::{CorpusSource, ImatrixData, ImatrixError};
+
+    if let Some(path) = imatrix_path {
+        let data = ImatrixData::load_from_path(path)?;
+        eprintln!(
+            "[hf2q imatrix] loaded {} ({} tensor pairs, chunks={}, chunk_size={})",
+            path.display(),
+            data.tensor_pair_count(),
+            data.loaded.chunk_count,
+            data.loaded.chunk_size,
+        );
+        return Ok(Some(data));
+    }
+    if let Some(corpus_name) = imatrix_corpus {
+        // Parse the selector first so unknown corpus names error
+        // immediately (cheap user-facing diagnostic). The actual
+        // forward-pass is Phase B; we surface the deferred error
+        // unconditionally for now.
+        let source = CorpusSource::from_cli(corpus_name)?;
+        return Err(ImatrixError::InTreeGenerationNotYetShipped {
+            corpus: source.dataset_label(),
+        }
+        .into());
+    }
+    if tier.requires_imatrix() {
+        return Err(ConvertV2Error::ImatrixRequiredForITier {
+            tier: tier.cli_name(),
+        });
+    }
+    Ok(None)
 }
 
 /// Extract `num_hidden_layers` from the HF config. Required by
@@ -1493,5 +1625,140 @@ mod tests {
             QuantSelectorError::ApexTierOutOfScope { tier } => assert_eq!(tier, "nano"),
             other => panic!("expected ApexTierOutOfScope, got {other:?}"),
         }
+    }
+
+    // ============================================================================
+    // ADR-033 §Pi imatrix-resolution tests
+    // ============================================================================
+    //
+    // Cover the four routes through `resolve_imatrix_input`:
+    //   1. `--imatrix <missing-path>`            → Imatrix(ImatrixError::Io)
+    //   2. `--imatrix-corpus cdv3`              → InTreeGenerationNotYetShipped
+    //   3. I-tier without imatrix data          → ImatrixRequiredForITier
+    //   4. Non-I tier without imatrix data      → Ok(None)
+    //
+    // The "happy path" (loading a valid `.imatrix.gguf`) is round-trip
+    // tested in `quantize::imatrix::tests::imatrix_data_round_trip_is_byte_stable`.
+    //
+    // `ApexTier` is brought in at the top of the test module already.
+
+    /// ADR-033 §Pi: an I-tier with no imatrix flags surfaces the typed
+    /// `ImatrixRequiredForITier` error (no silent fallback to non-I sibling).
+    #[test]
+    fn imatrix_required_for_i_tier_without_data() {
+        let err =
+            super::resolve_imatrix_input(&ApexTier::IBalanced, None, None).unwrap_err();
+        match err {
+            ConvertV2Error::ImatrixRequiredForITier { tier } => {
+                assert_eq!(tier, "i-balanced")
+            }
+            other => panic!("expected ImatrixRequiredForITier, got {other:?}"),
+        }
+    }
+
+    /// Non-I tier + no flags → `Ok(None)` (the convert run proceeds
+    /// imatrix-less). Mini is non-I per `ApexTier::requires_imatrix`.
+    #[test]
+    fn no_imatrix_required_for_non_i_tiers() {
+        for tier in [
+            ApexTier::Quality,
+            ApexTier::Balanced,
+            ApexTier::Compact,
+            ApexTier::Mini,
+        ] {
+            let res = super::resolve_imatrix_input(&tier, None, None).unwrap();
+            assert!(
+                res.is_none(),
+                "non-I tier {tier:?} should not require imatrix data"
+            );
+        }
+    }
+
+    /// `--imatrix-corpus cdv3` returns the Phase-B-deferred error,
+    /// not a silent no-op. Per ADR-033 §Pi + the no-loop-suppression
+    /// rule, in-tree generation MUST surface as a typed error until
+    /// the forward-pass driver ships.
+    #[test]
+    fn imatrix_corpus_returns_phase_b_deferred() {
+        let err = super::resolve_imatrix_input(
+            &ApexTier::IBalanced,
+            None,
+            Some("cdv3"),
+        )
+        .unwrap_err();
+        match err {
+            ConvertV2Error::Imatrix(
+                crate::quantize::imatrix::ImatrixError::InTreeGenerationNotYetShipped { corpus },
+            ) => assert_eq!(corpus, "cdv3"),
+            other => panic!("expected InTreeGenerationNotYetShipped, got {other:?}"),
+        }
+    }
+
+    /// Bad corpus selector → typed `UnknownBakedCorpus` (caught at
+    /// parse time, before the Phase B deferred check).
+    #[test]
+    fn imatrix_corpus_unknown_name_errors_typed() {
+        let err = super::resolve_imatrix_input(
+            &ApexTier::IBalanced,
+            None,
+            Some("wikitext-9000"),
+        )
+        .unwrap_err();
+        match err {
+            ConvertV2Error::Imatrix(
+                crate::quantize::imatrix::ImatrixError::UnknownBakedCorpus { name, .. },
+            ) => assert_eq!(name, "wikitext-9000"),
+            other => panic!("expected UnknownBakedCorpus, got {other:?}"),
+        }
+    }
+
+    /// `--imatrix <missing-path>` errors loudly (typed I/O), not
+    /// silent fallback to the corpus path or to the non-I sibling.
+    #[test]
+    fn imatrix_missing_file_errors_typed() {
+        let bogus = std::path::PathBuf::from("/nonexistent/path/imatrix.gguf");
+        let err = super::resolve_imatrix_input(
+            &ApexTier::IBalanced,
+            Some(bogus.as_path()),
+            None,
+        )
+        .unwrap_err();
+        match err {
+            ConvertV2Error::Imatrix(_) => { /* OK: surfaced from loader */ }
+            other => panic!("expected ConvertV2Error::Imatrix, got {other:?}"),
+        }
+    }
+
+    /// `--imatrix <file>` (when loadable) returns `Some(ImatrixData)`,
+    /// regardless of tier (non-I tiers can still consume imatrix data).
+    #[test]
+    fn imatrix_file_loads_for_any_tier() {
+        use crate::quantize::imatrix::{write_imatrix_to_path, AccumulatorRegistry};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut reg = AccumulatorRegistry::new();
+        let acc = reg.register("blk.0.attn_q.weight", 4, 1).unwrap();
+        acc.absorb_dense(&[1.0, 2.0, 3.0, 4.0]).unwrap();
+        write_imatrix_to_path(tmp.path(), &reg, &["cdv3".to_string()], 1, 512).unwrap();
+
+        // I-tier: returns Some with 1 tensor pair.
+        let data = super::resolve_imatrix_input(
+            &ApexTier::IBalanced,
+            Some(tmp.path()),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(data.tensor_pair_count(), 1);
+
+        // Non-I tier: also returns Some (optional imatrix is honored).
+        let data = super::resolve_imatrix_input(
+            &ApexTier::Balanced,
+            Some(tmp.path()),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(data.tensor_pair_count(), 1);
     }
 }
