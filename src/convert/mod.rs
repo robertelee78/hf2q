@@ -21,6 +21,7 @@
 
 pub mod arch;
 pub mod orchestrator;
+pub mod source_dtype;
 pub mod source_reader;
 
 pub use orchestrator::{ConvertOrchestrator, OrchestratorError};
