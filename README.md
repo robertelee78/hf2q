@@ -125,17 +125,14 @@ anything misbehaves.
 
 | Command | What it does |
 |---|---|
-| `hf2q convert` | HuggingFace → GGUF or mlx-lm safetensors (with quantization). |
+| `hf2q convert-v2` | HuggingFace safetensors → GGUF (streaming convert, ADR-033 unified pipeline). |
 | `hf2q gguf-patch` | Rewrite a GGUF's metadata in place (e.g. inject a chat template). |
-| `hf2q info` | Inspect an HF or GGUF model without converting. |
-| `hf2q validate` | Quality check (cosine similarity, KL, perplexity) against a reference. |
+| `hf2q info` | Inspect a GGUF model without loading weights. |
 | `hf2q generate` | Single-shot text generation from a GGUF on the local GPU. |
 | `hf2q serve` | OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/embeddings`). |
 | `hf2q parity` | ADR-009 parity validation against locked reference outputs. |
 | `hf2q smoke` | ADR-012 end-gate smoke test for a registered architecture. |
 | `hf2q cache` | Manage `~/.cache/hf2q/` (list / size / clear). |
-| `hf2q dwq-train` | DWQ training over every `Linear` in a GGUF (ADR-020). |
-| `hf2q dwq-overlay-drift` | Measure DWQ overlay drift through the round-trip. |
 | `hf2q doctor` | Diagnose hardware, cache, RuVector, disk. |
 | `hf2q completions` | Generate shell completions. |
 
@@ -143,44 +140,61 @@ Run `hf2q <command> --help` for the full flag surface.
 
 ### Quantization variants
 
-The convert pipeline supports four families of `--quant` values (the
-canonical `QuantMethod` enum lives at `src/cli.rs:1167`):
+The convert-v2 pipeline accepts two families of `--quant <name>`
+values, parsed via
+[`QuantSelector::from_name`](src/convert/quant_selector.rs):
 
 | Family | Variants | Notes |
 |---|---|---|
-| Float passthrough | `f16`, `bf16`, `auto` | No quantization; `auto` selects per-tensor. |
-| Legacy block | `q2`, `q4` (alias `q4_0`), `q8` (alias `q8_0`) | `llama.cpp`-compatible block formats. |
-| K-quant | `q2_k`, `q2_k_s`, `q3_k_{s,m,l}`, `q4_k_{s,m}`, `q5_k_{s,m}`, `q6_k` | Per-row scale + min, 256-element super-blocks. |
-| Imatrix-K-quant | `imatrix-q2_k{,_s}`, `imatrix-q3_k_{s,m,l}`, `imatrix-q4_k_{s,m}`, `imatrix-q5_k_{s,m}`, `imatrix-q6_k`, `imatrix-adaptive` | Same K-quant codecs, sensitivity-weighted with an activation imatrix. |
-| Dynamic / mixed | `dynamic-quant-{4-6,4-8,6-8,2-8}` | Mixed-precision per-layer sensitivity-driven bit pair. |
+| Standard llama.cpp ftypes | `f32`, `f16`, `bf16`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q2_k`, `q3_k_{s,m,l}`, `q4_k_{s,m}`, `q5_k_{s,m}`, `q6_k`, `iq4_nl` | Byte-identical to stock `llama-quantize` output for the same ftype. |
+| APEX algorithmic tiers (MoE arches only) | `apex-quality`, `apex-i-quality`, `apex-balanced`, `apex-i-balanced`, `apex-compact`, `apex-i-compact`, `apex-mini` | Per-tier overlay derived from `mudler/apex-quant`. Auto-detects against the per-model fingerprint manifest at [`data/apex-references/manifest.json`](data/apex-references/manifest.json) (ADR-033 §9). I-tier variants reserved pending the imatrix subsystem (Pi). |
 
-DWQ training (`hf2q dwq-train`, ADR-020) produces a separate
-mlx-format safetensors overlay layered on top of an existing GGUF; it
-is not selectable through `--quant`.
+Reserved names surface as typed errors with actionable hints:
+`--quant dwq` → "reserved for the future DWQ-train pipeline";
+`--quant apex` (unqualified) → suggests `apex-balanced` etc.;
+`--quant tq1_0`/`tq2_0` → "recognized ftype but out of v1 scope".
 
-The full menu and per-arch availability live in
-`docs/converting-a-model.md`.
+## Quick start: convert + serve a model
 
-## Quick start: serve a model
+The convert-v2 pipeline reads a pre-downloaded HuggingFace model
+directory (config.json + safetensors + tokenizer.json) and emits a
+single GGUF that loads in stock `llama.cpp` and in `hf2q serve`.
 
 ```bash
-# Convert (one-time, ~10-30 min depending on model size + quant)
-hf2q convert \
-  --repo Qwen/Qwen3.5-35B-A3B-Instruct \
-  --format gguf \
-  --quant q4_k_m \
-  --output models/qwen35-q4_k_m/out.gguf
+# 1. Pre-download the HF source (`hf2q convert-v2` does not auto-fetch).
+huggingface-cli download google/gemma-4-26b-a4b-it \
+  --local-dir ./models/google-gemma-4-26b-a4b-it
 
-# Serve
-hf2q serve \
-  --model models/qwen35-q4_k_m/out.gguf \
-  --port 8080
+# 2. Convert to Q5_K_M. Streaming convert keeps peak memory ~5 GB
+#    even on a 48 GB-source 26 B-param model. ~8-15 min on M-series.
+hf2q convert-v2 ./models/google-gemma-4-26b-a4b-it \
+  --quant q5_k_m \
+  -o ./out/gemma4-26b-q5_k_m.gguf
 
-# Use it (OpenAI SDK works out of the box)
+# 3a. Test load with stock llama.cpp (single-shot generation):
+llama-cli -m ./out/gemma4-26b-q5_k_m.gguf \
+  -p "What is the capital of France?" -n 64 --temp 0 --seed 42
+
+# 3b. Serve with hf2q's OpenAI-compatible HTTP API:
+hf2q serve --model ./out/gemma4-26b-q5_k_m.gguf --port 8080
+
+# 4. Use it (OpenAI SDK works out of the box)
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen35","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"gemma4","messages":[{"role":"user","content":"hello"}]}'
 ```
+
+For MoE models, pass an APEX tier instead of a standard ftype:
+
+```bash
+hf2q convert-v2 ./models/Qwen3.5-35B-A3B \
+  --quant apex-balanced \
+  -o ./out/qwen35-apex-balanced.gguf
+```
+
+The driver looks up the fingerprint manifest and, on match, logs
+`[hf2q apex] auto-detected APEX config: vendor/apex-quant/configs/<file>`
+before quantizing — confirming the exact per-tensor overlay in use.
 
 ## Architecture
 
