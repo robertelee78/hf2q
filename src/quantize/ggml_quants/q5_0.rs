@@ -54,17 +54,19 @@ pub fn quantize(src: &[f32], n_per_row: usize, imatrix: Option<&[f32]>) -> Vec<u
         src.len(),
         n_per_row
     );
-    // The imatrix may be either per-row (len == n_per_row, reused across
-    // every row — mirrors how `ggml_quantize_chunk` passes a single
-    // `quant_weights` pointer through `quantize_q5_0` without advancing
-    // it per row) or per-element (len == src.len(), one slice per row).
+    // imatrix is per-row (len == n_per_row), reused across every row —
+    // mirrors how `ggml_quantize_chunk` passes a single `quant_weights`
+    // pointer through `quantize_q5_0` (ggml-quants.c:2151) without
+    // advancing it per row. (Codex review finding 2026-05-18 on commit
+    // 4c5bc91e flagged a pre-existing per-element variant that diverged
+    // from C — removed per [[feedback-no-backwards-compat-2026-05-18]].)
     if let Some(qw) = imatrix {
-        assert!(
-            qw.len() == n_per_row || qw.len() == src.len(),
-            "imatrix len {} must equal n_per_row {} or src len {}",
+        assert_eq!(
             qw.len(),
             n_per_row,
-            src.len()
+            "imatrix len {} must equal n_per_row {} (per-row weights, reused across rows)",
+            qw.len(),
+            n_per_row,
         );
     }
 
@@ -76,14 +78,7 @@ pub fn quantize(src: &[f32], n_per_row: usize, imatrix: Option<&[f32]>) -> Vec<u
         let x_row = &src[row * n_per_row..(row + 1) * n_per_row];
         match imatrix {
             None => quantize_row_ref(x_row, &mut out),
-            Some(qw_all) => {
-                let qw_row = if qw_all.len() == n_per_row {
-                    qw_all
-                } else {
-                    &qw_all[row * n_per_row..(row + 1) * n_per_row]
-                };
-                quantize_row_impl(x_row, qw_row, &mut out);
-            }
+            Some(qw) => quantize_row_impl(x_row, qw, &mut out),
         }
     }
 
