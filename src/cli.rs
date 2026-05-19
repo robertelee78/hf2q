@@ -125,6 +125,37 @@ pub enum Command {
     /// relative_rms, bias_fraction).  CPU-only; no model load, no
     /// serve.
     DwqOverlayDrift(DwqOverlayDriftArgs),
+
+    /// ADR-033 P4 — convert a HuggingFace model directory to GGUF via
+    /// the new unified policy/quantizer/writer pipeline.
+    ///
+    /// First operator-facing entry point for the new pipeline. Sits
+    /// alongside `hf2q convert` (the legacy two-pass pipeline) until
+    /// P6 deletes the old path. Per
+    /// [[feedback-no-backwards-compat-2026-05-18]]: no migration shims;
+    /// no alias for legacy `--quant` values.
+    ConvertV2(ConvertV2CliArgs),
+}
+
+/// `hf2q convert-v2 <hf-dir> --quant <name> -o <out.gguf>` clap args.
+///
+/// Resolved to [`crate::convert::ConvertV2Args`] in `main.rs::cmd_convert_v2`.
+#[derive(clap::Args, Debug, Clone)]
+pub struct ConvertV2CliArgs {
+    /// HuggingFace model directory (must contain `config.json` plus
+    /// either `model.safetensors` or `model.safetensors.index.json` +
+    /// shards).
+    pub hf_dir: PathBuf,
+
+    /// File-type to quantize to (e.g. `q4_0`, `q5_k_m`, `q8_0`,
+    /// `f16`). Parsed via `LlamaFtype::from_name`; unrecognized values
+    /// surface as input errors.
+    #[arg(long)]
+    pub quant: String,
+
+    /// Destination GGUF file. Existing files are overwritten.
+    #[arg(short, long)]
+    pub output: PathBuf,
 }
 
 #[derive(clap::Args, Debug)]

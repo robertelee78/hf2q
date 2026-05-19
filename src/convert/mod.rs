@@ -20,10 +20,12 @@
 //! F16 demotion.
 
 pub mod arch;
+pub mod cli_driver;
 pub mod orchestrator;
 pub mod source_dtype;
 pub mod source_reader;
 
+pub use cli_driver::{run_convert_v2, ConvertV2Args, ConvertV2Error};
 pub use orchestrator::{ConvertOrchestrator, OrchestratorError};
 pub use source_reader::{HfModelSource, HfTensor, SourceError};
 

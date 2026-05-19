@@ -188,7 +188,43 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Cache(args) => serve::cmd_cache(args).map_err(AppError::Input),
         Command::DwqTrain(args) => cmd_dwq_train(args),
         Command::DwqOverlayDrift(args) => cmd_dwq_overlay_drift(args),
+        Command::ConvertV2(args) => cmd_convert_v2(args),
     }
+}
+
+/// ADR-033 P4 — drive the new convert pipeline.
+///
+/// Parses `--quant <name>` via `LlamaFtype::from_name`, hands the
+/// resolved args to [`crate::convert::run_convert_v2`], and maps the
+/// typed `ConvertV2Error` onto `AppError::Input` (parse / arch / missing
+/// tensor — operator-input issues) vs `AppError::Conversion` (source
+/// read, orchestrator, IO — pipeline-internal issues). Mirrors the
+/// existing legacy `cmd_convert` exit-code convention.
+fn cmd_convert_v2(args: cli::ConvertV2CliArgs) -> Result<(), AppError> {
+    use crate::convert::{run_convert_v2, ConvertV2Args, ConvertV2Error};
+    use crate::quantize::ggml_quants::LlamaFtype;
+
+    let ftype = LlamaFtype::from_name(&args.quant).ok_or_else(|| {
+        AppError::Input(anyhow::anyhow!(
+            "unknown --quant value `{}` (no LlamaFtype mapping)",
+            args.quant
+        ))
+    })?;
+    let resolved = ConvertV2Args {
+        hf_dir: args.hf_dir,
+        ftype,
+        output: args.output,
+    };
+    run_convert_v2(resolved).map_err(|e| match e {
+        ConvertV2Error::UnsupportedArch { .. }
+        | ConvertV2Error::UnmappedTensor { .. }
+        | ConvertV2Error::MissingHparam { .. }
+        | ConvertV2Error::IncompleteExpertGroup { .. }
+        | ConvertV2Error::DuplicateExpertIndex { .. } => AppError::Input(anyhow::anyhow!("{e}")),
+        ConvertV2Error::Source(_) | ConvertV2Error::Orchestrator(_) | ConvertV2Error::Io(_) => {
+            AppError::Conversion(anyhow::anyhow!("{e}"))
+        }
+    })
 }
 
 /// ADR-020 AC#7 foundation F2 — wire `MlxAffineLinear::q4_0_round_trip_drift`
