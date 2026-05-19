@@ -186,9 +186,14 @@ impl<W: Write + Seek> GgufWriter<W> {
     /// Reserve a tensor-info entry: `name | n_dims u32 | dims[n_dims] u64
     /// | ggml_type u32 | offset u64 placeholder`.
     ///
-    /// `dims` must already be in GGUF order (innermost / row first —
-    /// reversed from PyTorch / safetensors ordering). Callers that work
-    /// from safetensors shapes should reverse before passing.
+    /// **Contract — dims MUST be GGUF order** (innermost / row first;
+    /// reversed from PyTorch / safetensors). For a PyTorch shape
+    /// `[128, 1408, 2816]`, pass `[2816, 1408, 128]`. The OLD writer
+    /// at `src/backends/gguf.rs:4191` reversed internally — this new
+    /// writer DOES NOT (per codex 0d28ae3f review). Convert-pipeline
+    /// callers reverse at the safetensors → TensorRef boundary and
+    /// pass GGUF-order dims here. If you're writing convert glue, do
+    /// the reverse once at the boundary, not inside the loop.
     ///
     /// Returns the tensor index the caller passes to
     /// `stream_tensor_payload` later. Indices are dense and sequential.

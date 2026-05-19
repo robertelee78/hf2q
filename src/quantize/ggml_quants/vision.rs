@@ -39,23 +39,32 @@ pub fn is_vision_tensor_pattern(tensor_name: &str) -> bool {
         || tensor_name.contains("vit.")
         || tensor_name.starts_with("visual.")
         || tensor_name.contains(".visual.")
+        // Per codex 0d28ae3f review: the old inline filter at
+        // `src/backends/gguf.rs:339` caught `embed_vision` with NO
+        // trailing dot — e.g. Gemma's `model.embed_vision.weight`.
+        // Adding here as the canonical source.
+        || tensor_name.contains("embed_vision")
 }
 
 /// Returns `true` iff the GGUF tensor name belongs to an audio tower /
 /// whisper-style encoder path.
 ///
 /// Substrings checked (in source order):
-/// 1. `audio_tower.`  — surfaced by the writer-side inline filter at
-///    `backends/gguf.rs:322-333` for HF multi-modal audio adapters
-/// 2. `audio_model.`  — mirror of `vision_model.` for audio-side towers
-/// 3. `whisper.`      — Whisper-derived encoders (also `model.audio_tower.whisper.`
-///    which is already caught by the substring check)
+/// 1. `audio_tower`   — HF multi-modal audio adapters (Gemma audio etc.).
+///    NO trailing dot — matches the old inline filter at
+///    `src/backends/gguf.rs:339` which used `contains("audio_tower")`
+///    and caught e.g. `model.audio_tower_proj.weight`. Codex 0d28ae3f
+///    review flagged the dot-bearing form as too strict.
+/// 2. `audio_model.`  — mirror of `vision_model.` for audio-side towers.
+///    Trailing dot kept; no prior canonical source — NEW per ADR.
+/// 3. `whisper.`      — Whisper-derived encoders. Trailing dot kept to
+///    avoid false-positives on model-name substrings like
+///    `whispering`. NEW per ADR (no prior canonical source).
 ///
 /// Per ADR-033 amendment E: NEW companion to `is_vision_tensor_pattern`.
-/// No prior canonical source — this fn IS the canonical source.
 #[inline]
 pub fn is_audio_tensor_pattern(tensor_name: &str) -> bool {
-    tensor_name.contains("audio_tower.")
+    tensor_name.contains("audio_tower")
         || tensor_name.contains("audio_model.")
         || tensor_name.contains("whisper.")
 }
@@ -112,12 +121,30 @@ mod tests {
         assert!(!is_vision_tensor_pattern("blk.0.vitamin.weight"));
     }
 
+    /// Per codex 0d28ae3f review: the old inline filter at
+    /// `src/backends/gguf.rs:339` caught `embed_vision` (no dot) for
+    /// Gemma's `model.embed_vision.weight`. Lock the fix in.
+    #[test]
+    fn vision_matches_embed_vision_codex_0d28ae3f() {
+        assert!(is_vision_tensor_pattern("model.embed_vision.weight"));
+        assert!(is_vision_tensor_pattern("model.embed_vision.norm.weight"));
+    }
+
     // ---- is_audio_tensor_pattern: 3 substrings × positive/negative ----
 
     #[test]
     fn audio_matches_audio_tower_dot() {
         assert!(is_audio_tensor_pattern("audio_tower.encoder.layers.0.attn"));
         assert!(is_audio_tensor_pattern("model.audio_tower.proj.weight"));
+    }
+
+    /// Per codex 0d28ae3f review: the old inline filter used
+    /// `contains("audio_tower")` (no dot) and caught e.g.
+    /// `model.audio_tower_proj.weight`. Lock the fix in.
+    #[test]
+    fn audio_matches_audio_tower_no_dot_codex_0d28ae3f() {
+        assert!(is_audio_tensor_pattern("model.audio_tower_proj.weight"));
+        assert!(is_audio_tensor_pattern("audio_tower_v2.encoder"));
     }
 
     #[test]
