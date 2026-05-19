@@ -76,6 +76,39 @@ impl ArchName {
             ArchName::Falcon => "falcon",
         }
     }
+
+    /// Inverse of [`Self::name`] — parse a canonical lowercase arch
+    /// label (the form stored in `general.architecture` and in
+    /// `data/apex-references/manifest.json::entries[].arch`) back into
+    /// an [`ArchName`].
+    ///
+    /// Returns `None` for unknown labels. Per
+    /// [[feedback-no-backwards-compat-2026-05-18]] adding a new arch
+    /// is an explicit code change — there's no implicit aliasing or
+    /// stem-stripping.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "gemma4" => Some(ArchName::Gemma4),
+            "gemma4_mmproj" => Some(ArchName::Gemma4Mmproj),
+            // Two explicit labels for the same arch:
+            //   - "qwen3moe" — upstream GGUF metadata convention
+            //     (`general.architecture` value).
+            //   - "qwen35moe" — hf2q-internal label used in
+            //     `data/apex-references/manifest.json` (distinguishes
+            //     the operator's qwen3.5/3.6 family from a pure qwen3
+            //     series for fingerprint-routing purposes).
+            // Both are explicit code-level entries per the "no
+            // implicit aliasing / migration" rule.
+            "qwen3moe" | "qwen35moe" => Some(ArchName::Qwen35Moe),
+            "qwen3vl" => Some(ArchName::Qwen3VlText),
+            "bert" => Some(ArchName::Bert),
+            "nomic-bert" => Some(ArchName::NomicBert),
+            "llama" => Some(ArchName::Llama3),
+            "minimax-m2" => Some(ArchName::MiniMaxM2),
+            "falcon" => Some(ArchName::Falcon),
+            _ => None,
+        }
+    }
 }
 
 /// Per-tensor reference passed into `QuantPolicy::target_for`.

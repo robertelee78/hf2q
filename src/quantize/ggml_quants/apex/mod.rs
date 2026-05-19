@@ -31,6 +31,7 @@
 //! UPSTREAM at the convert dispatcher; ApexPolicy is not even called
 //! for those tensors.
 
+pub mod acceptance;
 pub mod arches;
 pub mod error;
 pub mod fingerprint;
@@ -43,7 +44,10 @@ pub use arches::{
     classify_moe_tensor, is_apex_supported_arch, MoeTensorRole, SUPPORTED_APEX_ARCHES,
 };
 pub use error::ApexError;
-pub use fingerprint::{detect_apex_config, ApexConfigRef, FingerprintHParams};
+pub use fingerprint::{
+    detect_apex_config, manifest_entries, vendor_config_content, ApexConfigRef,
+    FingerprintHParams,
+};
 pub use mudler_config::{load_mudler_config, MudlerConfig};
 pub use policy::ApexPolicy;
 pub use rules::{

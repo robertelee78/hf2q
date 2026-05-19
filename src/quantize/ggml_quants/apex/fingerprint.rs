@@ -314,6 +314,14 @@ pub fn manifest_entry_count() -> usize {
     manifest().len()
 }
 
+/// Public iterator over all manifest entries. Required by the §Pa
+/// exhaustive acceptance gate at `tests/apex_rules.rs` which walks
+/// every (family × tier) entry and diffs ApexPolicy::target_for
+/// against the vendored config tensor list.
+pub fn manifest_entries() -> &'static [ApexConfigRef] {
+    manifest()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
