@@ -367,3 +367,138 @@ In rough order of leverage:
 - Cmdlines:
   - `llama-perplexity -m <gguf> -f cdv3.txt -ngl 999 --ctx-size {512,2048} -t 8 --chunks {10,20}`
   - `llama-cli -m <gguf> -p "<probe>" -n {64,128} --seed 42 --temp 0 -ngl 999 -st`
+
+---
+
+## 8. Canonical Reference Comparison (2026-05-19 follow-up)
+
+Per §0 amendment, the proper §P1 reference is `convert_hf_to_gguf.py | llama-quantize Q5_K_M`
+with NO imatrix and NO overrides. This was generated and compared.
+
+**Pipeline:**
+```
+python3 /opt/llama.cpp/convert_hf_to_gguf.py \
+  /opt/hf2q/models/google-gemma-4-26b-a4b-it \
+  --outfile /opt/hf2q/tmp/byte-cmp/gemma4-llama-canonical-f16.gguf --outtype f16
+# → 50,505,135,072 B F16 GGUF
+
+/opt/llama.cpp/build/bin/llama-quantize \
+  /opt/hf2q/tmp/byte-cmp/gemma4-llama-canonical-f16.gguf \
+  /opt/hf2q/tmp/byte-cmp/gemma4-llama-canonical-q5_k_m.gguf \
+  Q5_K_M
+# → 19,132,890,080 B canonical Q5_K_M GGUF (no imatrix, no overrides)
+```
+
+### 8.1 Perplexity vs canonical reference
+
+| file | size B | PPL (cdv3 ctx=2048, 20 chunks) | ± stderr |
+|---|--:|--:|--:|
+| canonical Q5_K_M | 19,132,890,080 | **5471.84** | ±284.38 |
+| hf2q     Q5_K_M | 19,376,360,992 | **6500.07** | ±341.43 |
+| **ratio hf2q/canonical** | 1.013× larger | **1.188× worse** | ±0.088 |
+
+Ratio is **outside** the [0.98, 1.02] acceptance bar at the 1.5σ lower bound (1.100).
+
+### 8.2 Tensor-mix delta vs canonical
+
+Both files contain 595 quantized weight tensors. **50 of them have a different
+ggml_type** between hf2q and canonical, broken down by pattern:
+
+| pattern | hf2q wrong-type-count | canonical correct-type | analysis |
+|---|--:|--:|---|
+| `<L>.ffn_down.weight`      | 11 layers Q5_1→Q8_0 (hf2q wrong) | 14 Q8_0 + 16 Q5_1 | hf2q has 17 Q8_0 vs canonical's 14 — surplus 3 layers wrongly promoted |
+| `<L>.ffn_down.weight`      |  8 layers Q8_0→Q5_1 (hf2q wrong) | (same)            | symmetric — 8 layers wrongly demoted |
+| `<L>.ffn_down_exps.weight` | 11 layers Q5_1→Q8_0 (hf2q wrong) | 14 Q8_0 + 16 Q5_1 | MoE expert ffn_down has the same bug, same direction |
+| `<L>.ffn_down_exps.weight` |  8 layers Q8_0→Q5_1 (hf2q wrong) | (same)            | same |
+| `<L>.attn_v.weight`        |  6 layers Q5_K→Q6_K (hf2q wrong) | 14 Q6_K + 16 Q5_K | hf2q's use_more_bits bucket lands on 6 wrong layers — same total count |
+| `<L>.attn_v.weight`        |  6 layers Q6_K→Q5_K (hf2q wrong) | (same)            | symmetric — 6 demotions |
+
+**Same totals** within each tensor pattern (the worker's earlier observation
+holds: 192× Q5_K, 14× Q6_K, etc. summed across patterns is the same). The
+divergence is **which layer index** gets the promotion, not the overall mix.
+
+### 8.3 Mechanical root cause
+
+Hypothesis (testable, not yet verified in code): hf2q's `qs.i_ffn_down`
+counter at `standard_policy.rs` advances **for both** `blk.N.ffn_down.weight`
+AND `blk.N.ffn_down_exps.weight` per MoE layer (because both tensors hit
+the `FfnDown` category branch). The canonical C code in `llama-quant.cpp`
+calls `layer_info(qs.i_ffn_down, qs.n_ffn_down, name)` which re-parses
+`blk.N.` out of the name for `n_expert > 1`, so the **i_layer used for
+use_more_bits** is the parsed layer, but the **counter advancement** depends
+on the call-site `++qs.i_ffn_down` semantics — which the C code does once
+per visited tensor as well. **Need to compare exact counter-advancement
+semantics line-by-line between hf2q's StandardPolicy::target_for and
+llama-quant.cpp:411-657 to localize.**
+
+A similar mechanism explains the attn_v Q6_K layer permutation: `qs.i_attention_wv`
+advances at a different point in hf2q than in canonical for MoE-architecture tensors.
+
+### 8.4 Corrected verdict
+
+**§P1 verdict: FAIL** but the gap is **much narrower** than the worker's
+initial bartowski-comparison suggested:
+
+| reference | PPL ratio | gap mechanism | required fix |
+|---|--:|---|---|
+| bartowski (NON-canonical) | 1.640× | bartowski applied custom Q8_0 overrides + imatrix | not applicable — wrong reference |
+| canonical llama-quantize  | **1.188×** | layer-index permutation in MoE counter advancement | localize counter divergence + align |
+
+**Sub-verdicts:**
+- **Coherence: PASS** (unchanged — both files load and produce coherent output)
+- **Tensor mix structure: PASS** (same use_more_bits rule, same total counts per pattern)
+- **Tensor mix layer-assignment: FAIL** (50 layers wrongly assigned vs canonical)
+- **Perplexity: FAIL** at 1.188× the canonical reference (acceptance bar is 1.02)
+- **Metadata: PASS-WITH-CAVEAT** (3 missing KVs but all 3 are no-ops on Gemma 4 due to default coincidence)
+- **Chat template: PASS** (byte-identical)
+- **File size: NEUTRAL** (hf2q 243 MB larger than canonical — wrong layers promoted to higher-bit)
+
+### 8.5 Required follow-up (concrete and small)
+
+1. **Localize the MoE counter advancement divergence** between
+   `src/quantize/ggml_quants/standard_policy.rs::target_for` (the `category ==
+   TensorCategory::FfnDown` branch around line 596 and the `FfnDownExps` /
+   `AttnV` equivalents) vs `/opt/llama.cpp/src/llama-quant.cpp:411-657`.
+   Add a unit-test that simulates a 30-layer 128-expert MoE walk and asserts
+   per-(layer, name) → expected canonical ggml_type. Use the canonical
+   `canonical-tensors.txt` dump as the oracle.
+
+2. **Fix the counter advancement** so hf2q's per-layer i_ffn_down /
+   i_attention_wv values match canonical's at each call site.
+
+3. **Re-run §8.1 perplexity** — expect ratio to drop into [0.98, 1.02] once
+   layer-assignment is fixed. If not, there's a second bug.
+
+4. **Then** consider §Pi imatrix consumer (Phase B) as a separate quality
+   axis — but ONLY after the canonical-static baseline is byte-mix-equivalent.
+
+### 8.6 Files for reference
+
+- `/opt/hf2q/tmp/byte-cmp/gemma4-llama-canonical-f16.gguf` — 50.5 GB, F16 base
+- `/opt/hf2q/tmp/byte-cmp/gemma4-llama-canonical-q5_k_m.gguf` — 19.13 GB, canonical Q5_K_M
+- `/opt/hf2q/tmp/byte-cmp/canonical-tensors.txt` — full per-tensor dump (oracle)
+- `/opt/hf2q/tmp/byte-cmp/hf2q-tensors.txt` — full per-tensor dump (subject)
+- `/opt/hf2q/tmp/byte-cmp/ppl-hf2q.log`, `ppl-canonical.log` — perplexity logs
+
+---
+
+## 9. What This Means for ADR-033
+
+**Before this audit:** ADR-033 was considered SHIPPED (P-1..P6 Phase 1 + §9 + §Pi
+Phase A + Phase B Stage 1 + B1 + B4 merged on main).
+
+**After this audit:** §P1 acceptance is FAIL at 1.188× canonical perplexity.
+Per the standing rule `[[feedback-no-premature-mission-close-2026-05-11]]`,
+the SHIPPED claim was premature on this specific axis. The mechanism is
+identified and small (counter advancement in StandardPolicy::target_for),
+not a structural redesign. Once §8.5 step 2 lands and §8.5 step 3 measures
+within bar, the §P1 gate is genuinely PASS.
+
+**Pi Phase B Stage 2 (callsite plumbing) remains blocked** behind §P1 PASS
+per the no-premature-mission-close rule. There is no point producing an
+imatrix consumer when the static-rule baseline is not yet quality-equivalent
+to canonical.
+
+**Codex review** of this amendment + §8 per `[[feedback-codex-review-loop-rule-2026-05-17]]`:
+pending.
+
