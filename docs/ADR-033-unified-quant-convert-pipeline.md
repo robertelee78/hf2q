@@ -435,6 +435,8 @@ Estimated complexity: 12 callsite edits + ~150 LOC for the MoE intercept + ~250 
 
 ### P6 — Delete superseded code
 
+**Status:** SHIPPED (verified 2026-05-19 — all delete-listed files are gone, `src/quantize/mod.rs` is now 20 lines exposing only `ggml_quants` + `imatrix`, the 3 retired env vars no longer appear in `parse_env`, and `METHOD_K_QUANT_CODEC_DIRECT` is removed from the codebase). The full test suite is green: 2773 passed, 1 pre-existing flaky (`serve::tests::run_decode_loop_stops_on_repetition`).
+
 **Why:** The new policy + writer + IR shipped in P1–P4b makes the old subsystems redundant.
 
 **What:** Per P-1's audit, delete:

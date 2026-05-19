@@ -11,10 +11,13 @@
 //! `quantize::ggml_quants::apex::ApexPolicy`).
 //!
 //! The `imatrix` submodule implements ADR-033 §Pi — in-tree imatrix
-//! generation + `.imatrix.gguf` read/write. See
-//! [`imatrix`] for the full Phase A surface (corpus loader,
-//! accumulator, gguf writer/loader); Phase B (forward-pass driver) is
-//! deferred per the §Pi worker report.
+//! generation + `.imatrix.gguf` read/write. Phase A (corpus loader,
+//! accumulator, gguf writer/loader, file-based `--imatrix <path>`)
+//! AND Phase B (forward-pass driver wired through the convert
+//! orchestrator, exposed as `--imatrix-corpus <name>`) BOTH
+//! SHIPPED 2026-05-19. Gemma 4 is the Stage 3.0 driver arch; other
+//! arches consume pre-computed `.imatrix.gguf` via `--imatrix
+//! <path>` until Stage 3b.4 adds Qwen35Moe driver wiring.
 
 pub mod ggml_quants;
 pub mod imatrix;
