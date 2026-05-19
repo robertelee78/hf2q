@@ -351,7 +351,7 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
 
 ### Pi — Imatrix subsystem
 
-**Status:** PHASE A + PHASE B BOTH SHIPPED 2026-05-19. Operators can run `hf2q convert <hf-dir> --quant apex-i-balanced --imatrix-corpus cdv3` end-to-end (Stage 3.0 supports Gemma 4; other arches use the `--imatrix <file>` path with a pre-computed `.imatrix.gguf` from stock `llama-imatrix`). See "Phase B SHIPPED" subsection below for the 5-commit ship log.
+**Status:** PHASE A + PHASE B BOTH SHIPPED 2026-05-19. Operators can run `hf2q convert <hf-dir> --quant apex-i-balanced --imatrix-corpus cdv3` end-to-end (Stage 3.0 supports Gemma 4; other arches use the `--imatrix <file>` path with a pre-computed `.imatrix.gguf` from stock `llama-imatrix`). See "Phase B — SHIPPED" and "Stage 3 SHIPPED" subsections below for the full ship log.
 
 **Why:** I-tier APEX (I-Compact / I-Balanced / I-Quality) requires per-row activation-importance data. llama-imatrix's `.imatrix.gguf` format is the de facto reference; we need a hf2q-side generator that produces equivalent output.
 
@@ -366,27 +366,23 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
   - `accumulator.rs` — `Accumulator` + `AccumulatorRegistry` (sorted-by-name BTreeMap) implementing the canonical `sum-of-squared-activations + per-mat counts` algorithm from imatrix.cpp:380-393 (dense) and imatrix.cpp:310-330 (MoE per-expert).
   - `gguf_writer.rs` — `write_imatrix` produces a `.imatrix.gguf` byte-shaped to match `imatrix.cpp::save_imatrix`. KVs: `general.type="imatrix"`, `imatrix.datasets[]`, `imatrix.chunk_count`, `imatrix.chunk_size`. Per-tensor pair: `.in_sum2` (f32) + `.counts` (f32, cast from i64 per imatrix.cpp:610). Uses the existing seek-back writer at `src/backends/gguf/writer.rs` (no new GGUF writer code).
   - `gguf_loader.rs` — `LoadedImatrix::load_from_path` parses GGUF imatrix files; validates schema (`general.type=imatrix`, required KVs present, every `.in_sum2` has a matching `.counts`). Two-pass tensor walk: pass 1 registers all `.in_sum2`, pass 2 attaches `.counts` (order-independent). Legacy `.dat` format is NOT supported — operators pass `--output-format gguf` to `llama-imatrix`.
-  - `error.rs` — typed `ImatrixError` (Io, Writer, Parse, NotAnImatrix, MissingKv, MismatchedTensorPair, CorpusRead, UnknownBakedCorpus, InTreeGenerationNotYetShipped) per the no-loop-suppression rule.
-  - `forward.rs` — `compute_imatrix(params)` Phase B entry point; Phase A returns `InTreeGenerationNotYetShipped` with the operator-facing workaround (run stock `llama-imatrix -m <gguf> -f data/calibration/cdv3.txt -o <out>.imatrix.gguf` and pass via `--imatrix`).
-  - `mod.rs` — `ImatrixData { loaded, provenance }` public API; `provenance` distinguishes `LoadedFromFile` from (future) `Computed`. `ImatrixData::load_from_path` + `ImatrixData::write_gguf` provide round-trip.
-- CLI: `--imatrix <file>` (load pre-computed; conflicts with `--imatrix-corpus`), `--imatrix-corpus <cdv3|mudler|user-file:<path>>` (returns deferred-Phase-B error in Phase A), `--imatrix-out <path>` (side-effect write).
+  - `error.rs` — typed `ImatrixError` per the no-loop-suppression rule. Current variants (post-Stage-3c): `Io, Writer, Parse, NotAnImatrix, MissingKv, MismatchedTensorPair, CorpusRead, UnknownBakedCorpus, ShapeMismatch, ConvertFailed, ModelLoadFailed, UnsupportedArchForDriver, TokenizationFailed, ForwardPassFailed, CorpusTooShort`. The `InTreeGenerationNotYetShipped` placeholder variant existed in Phase A and was deleted at commit `1f761b13` per [[feedback-no-backwards-compat-2026-05-18]] once Stage 3c made it unreachable.
+  - `forward.rs` — `compute_imatrix(params)` is the in-tree imatrix generation entry point. Phase A returned a deferred-typed placeholder; Stage 3c (SHIPPED 2026-05-19) now runs the full pipeline: HF dir → F16 GGUF temp → load → tokenize → chunk → forward_prefill loop → `ImatrixData`. The operator-facing workaround (run stock `llama-imatrix` and pass via `--imatrix <file>`) remains supported for arches outside the Stage 3.0 driver scope.
+  - `mod.rs` — `ImatrixData { loaded, provenance }` public API; `provenance` distinguishes `LoadedFromFile` (operator-supplied) from `Computed` (in-tree driver). `ImatrixData::load_from_path` + `ImatrixData::write_gguf` provide round-trip.
+- CLI: `--imatrix <file>` (load pre-computed; conflicts with `--imatrix-corpus`), `--imatrix-corpus <cdv3|mudler|user-file:<path>>` (drives the in-tree Stage 3c pipeline on arches in the driver-supported set; other arches surface `UnsupportedArchForDriver`), `--imatrix-out <path>` (side-effect write).
 - `ApexPolicy::new_with_imatrix(tier, arch, n_layers, n_expert)` — new constructor that accepts I-tier variants when imatrix data has been resolved. `ApexPolicy::new` (no imatrix) continues to reject I-tier per the no-silent-fallback rule.
 - `SUPPORTED_FOR_IMATRIX` (in `apex/policy.rs`) updated from `&[]` to `&["qwen3moe", "gemma4"]` per ADR text "Pi only runs against arches with hf2q inference support". `MiniMaxM2` and `Llama3` stay out (convert-only arches).
 - 26 imatrix unit tests + 6 CLI-resolution tests pass (32 new tests total). Full bin test suite: 2746 passed, 1 pre-existing unrelated `serve::tests::run_decode_loop_stops_on_repetition` failure.
 
-**Phase B — DEFERRED to a follow-up iter:**
+**Phase B — SHIPPED 2026-05-19.** Phase B was originally deferred from the Phase A iter to keep that ship atomic; the in-tree forward-pass interception into hf2q's per-arch decoders is invasive (5 arches × MoE routing × attention fusion × KV cache) so it landed in five sequential stages. The original Phase A operator workaround (`llama-imatrix` external + `--imatrix <file>` ingestion) is still supported as the `LoadedFromFile` provenance path; the `Computed` provenance now drives entirely in-tree. See Stage 1-3 trail below for the full ship log.
 
-- Forward-pass interception into hf2q's per-arch decoder (`src/inference/models/<arch>/`). Per ADR-033 §Pi this is the load-bearing piece; it requires reading every per-arch decoder's `MlxAffineLinear::forward` call site and threading an opt-in `ImatrixCollector` hook through them. The interception is invasive (5 arches × MoE routing × attention fusion × KV cache); deferred to keep this Phase A iter atomic and reviewable.
-- Phase A operator workaround: run stock `llama-imatrix -m <f16-gguf> -f data/calibration/cdv3.txt -o <out>.imatrix.gguf`, then `hf2q convert-v2 --quant apex-i-balanced --imatrix <out>.imatrix.gguf`. The contract sketch for the eventual `ImatrixCollector` trait lives in `src/quantize/imatrix/forward.rs` module-doc.
-- The `--imatrix-corpus` flag surfaces the typed `InTreeGenerationNotYetShipped` error pointing operators at the workaround above. Per the no-loop-suppression rule it's loud, not silent.
-
-**Phase B partial progress 2026-05-19** (commits `1995336e` → `27b69cea`):
+**Phase B Stage 1+2 — intercept scaffolding 2026-05-19** (commits `1995336e` → `27b69cea`):
 
 - Stage 1 (hook trait): `ImatrixCollector` trait + thread-local intercept slot installed in `forward.rs`. Done.
 - Stage 2 (callsite plumbing): `dispatch_qmatmul` (single intercept entry point — 47 call sites threaded through it) carries an `ImatrixHint` 8th arg (None / Global / Layered). The intercept fires once per matmul on F32 dense activations. Done at `652ca902`.
 - Stage 2.5 (per-row chunking): intercept slices the m×n_per_row buffer into m per-token rows + calls `collector.record` once per row, mirroring `imatrix.cpp:380-393`. Done at `33f10112`. Codex finding (shape-mismatch was eprintln+skip; should be typed `ImatrixError::ShapeMismatch` propagated through `dispatch_qmatmul`) shipped at `27b69cea`.
 
-**Stage 3 SHIPPED 2026-05-19** (commits `903d4e8a`, `fe1b9cbd`, `236fbc26`, this commit):
+**Stage 3 SHIPPED 2026-05-19** (commits `903d4e8a`, `fe1b9cbd`, `236fbc26`, `9fd50afa`, `e4999036`, `1f761b13`):
 
 - Stage 3a: `intercept_qmatmul_id_with_hint` + `ImatrixCollector::record_moe` trait extension. Mirrors `imatrix.cpp:310-330` for `GGML_OP_MUL_MAT_ID`.
 - Stage 3b.1: Gemma 4 MoE callsite wiring in `src/serve/forward_prefill_batched.rs` (2 sites: `ffn_gate_up_exps` at L2668, `ffn_down_exps` at L2753).
@@ -414,7 +410,7 @@ Stage 3 must therefore:
 3. Wire all ~12 MoE-id dispatch callsites with an `ImatrixHint::Layered { tag: "ffn_gate_up_exps" | "ffn_down_exps", layer }` argument.
 4. The driver itself (`compute_imatrix`) calls `run_convert` (to produce an F16 GGUF in tempfile) + `GemmaLoadedModel::load` (or `Qwen35LoadedModel::load`) + tokenize corpus + chunk + `with_collector { forward_prefill }` loop + return `ImatrixData { provenance: Computed { corpus_label, n_ctx } }`.
 
-Estimated complexity: 12 callsite edits + ~150 LOC for the MoE intercept + ~250 LOC for the driver + integration tests. Tracked as task #18 (in_progress).
+Estimated complexity (historical, pre-ship): 12 callsite edits + ~150 LOC for the MoE intercept + ~250 LOC for the driver + integration tests. Actual ship landed in 4 stages (3a / 3b.1 / 3b.2 / 3c) at commits `903d4e8a`, `fe1b9cbd`, `236fbc26`, `9fd50afa`, with `e4999036` retiring the deferred-tag CLI help and `1f761b13` deleting the unreachable `InTreeGenerationNotYetShipped` variant.
 
 **Acceptance gate (Phase A):**
 
