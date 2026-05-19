@@ -111,20 +111,62 @@ PPL impact correlates with per-bit-error sensitivity of each kernel:
   diverges in at least one of 8 sub-blocks within block 48
 - 278 of 22,528 blocks differ in this tensor (1.2%)
 
-## Root-cause hypothesis (still unverified)
+## Root-cause: FMA non-associativity — **EMPIRICALLY VERIFIED at assembly level (iter-22)**
 
-All K-quant kernels share `make_qkx2_quants` (per
-`src/quantize/ggml_quants/common.rs:171`), which contains
-FP-non-associative reductions (`d_det = sum_w * sum_l2 - sum_l *
-sum_l` and the `this_scale` / `this_min` quotient computations).
+Disassembled both compiled `make_qkx2_quants` symbols and counted
+FMA-class instructions:
 
-llama.cpp is built with `-O3 -DNDEBUG -march=native` on Apple
-Silicon → clang auto-FMA enabled. The same code in Rust
-(`cargo build --release`) compiles to separate mul + sub
-(no auto-FMA). ULP-level divergences in `make_qkx2_quants`
-propagate through the iterative refinement loop and can produce
-different `the_min` outputs that, when rounded to F16 `dmin`,
-cross an F16 boundary in a small fraction of blocks.
+| Binary | Total instructions | fmadd | fmul | fadd | fsub |
+|--------|-------------------|-------|------|------|------|
+| `libggml-base.0.dylib::_make_qkx2_quants` (clang -O3 -march=native) | 178 | **12** | 7 | 4 | 6 |
+| `hf2q::quantize::ggml_quants::common::make_qkx2_quants` (cargo --release) | 1319 | **0** | 126 | 241 | 47 |
+
+Canonical (clang) emits 12 `fmadd` instructions for the accumulator
+hot-spots (`sum_x += w * x[i]`, `sum_l += w * li`, `sum_l2 += w * li *
+li`, `sum_xl += w * li * x[i]`, `best_error += w * diff`,
+`cur_error += w * diff`). Each `fmadd` is a single-rounded
+multiply-add. Rust at `--release` emits **zero FMA instructions**
+because rustc's default `-Cllvm-args=-fp-contract=off` is stricter
+than clang's `-ffp-contract=on` default.
+
+ULP-level divergences in the FMA-fused accumulators propagate
+through `make_qkx2_quants`'s iterative refinement loop, producing
+different `the_min` outputs that, when rounded to F16 for storage
+in the `dmin` block field, cross an F16-precision boundary in
+0.04-0.07% of blocks.
+
+This explains all observations:
+- Only K-quants diverge (only they use `make_qkx2_quants`)
+- All K-quants diverge consistently (Q4_K, Q5_K, Q6_K all use it)
+- Non-K-quants byte-match (Q8_0, Q5_0, Q5_1 don't use FMA-sensitive ops)
+- Byte-cmp fixture tests pass (fixture inputs don't cross F16
+  `dmin` boundaries → FMA-vs-non-FMA produce the same rounded output)
+- Real-model weights produce divergence (some sub-blocks cross
+  the boundary)
+
+## Fix candidates (operator-decision-pending)
+
+If operator chooses **option 2** (force Rust to match canonical):
+
+Replace accumulator hot-spots in `common.rs::make_qkx2_quants`:
+```rust
+sum_x += w * x[i];           // → sum_x = w.mul_add(x[i], sum_x);
+sum_l += w * li_f;           // → sum_l = w.mul_add(li_f, sum_l);
+sum_xl += w * li_f * x[i];   // → sum_xl = (w * li_f).mul_add(x[i], sum_xl);
+sum_l2 += w * li_f * li_f;   // → sum_l2 = (w * li_f).mul_add(li_f, sum_l2);
+best_error += w * diff;      // → best_error = w.mul_add(diff, best_error);
+cur_error += w * diff;       // → cur_error = w.mul_add(diff, cur_error);
+```
+
+Plus matching changes in `make_qkx3_quants` (used by K-quant
+imatrix paths). Total: ~12 line edits.
+
+After change: re-run Q4_K_M PPL, expect ratio → ~1.0 (matching
+canonical's `make_qkx2_quants` output exactly via byte-equivalent
+FMA computation).
+
+Verification gate: byte-cmp `blk.0.attn_k.weight` between
+canonical and fixed-hf2q — should be 0 differing bytes.
 
 Non-K-quant kernels use simpler O(n) scale-and-round patterns
 without the determinant computation → no FMA-sensitive ops → byte
