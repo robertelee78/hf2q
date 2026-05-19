@@ -66,18 +66,6 @@ pub enum ImatrixError {
         supported: &'static [&'static str],
     },
 
-    /// Phase B (forward-pass interception) is not yet shipped. Used when
-    /// `--imatrix-corpus <name>` is requested but hf2q's in-tree
-    /// imatrix generator is still on the TODO list (the Phase A
-    /// deliverable for ADR-033 §Pi).
-    #[error(
-        "imatrix: in-tree imatrix generation (Phase B forward-pass driver) is not yet \
-         shipped (ADR-033 §Pi). Workaround: generate a `.imatrix.gguf` with stock \
-         `llama-imatrix -m <gguf> -f data/calibration/{corpus}.txt -o <out>.imatrix.gguf` \
-         and pass it via `--imatrix <out>.imatrix.gguf`."
-    )]
-    InTreeGenerationNotYetShipped { corpus: String },
-
     /// Phase B intercept: the materialized input buffer doesn't hold
     /// `m * n_per_row` F32 values. Indicates a wiring bug in the
     /// `dispatch_qmatmul` callsite (wrong `m` argument, wrong
@@ -203,28 +191,6 @@ mod p7_ac3_hint_tests {
             msg.contains("user-file"),
             "msg should mention the operator-supplied option: {msg}"
         );
-    }
-
-    #[test]
-    fn p7_ac3_in_tree_generation_deprecated_variant_unused_post_stage_3c() {
-        // This variant exists in the taxonomy but is no longer
-        // returned anywhere in production code (`resolve_imatrix_input`
-        // now drives `compute_imatrix` directly when --imatrix-corpus
-        // is set, instead of returning this variant). The message
-        // still points operators at the workaround, which is fine for
-        // the file-load surface; but the variant itself is dead code.
-        //
-        // Keeping a hint test on it so a future cleanup that removes
-        // the variant is forced to also remove this test (loud break).
-        let msg = ImatrixError::InTreeGenerationNotYetShipped {
-            corpus: "cdv3".to_string(),
-        }
-        .to_string();
-        assert!(
-            msg.contains("llama-imatrix") || msg.contains("--imatrix"),
-            "msg should point at the file-based workaround: {msg}"
-        );
-        assert!(msg.contains("cdv3"), "msg should echo the corpus: {msg}");
     }
 
     #[test]
