@@ -64,14 +64,28 @@ use crate::quantize::ggml_quants::ArchName;
 /// orchestrator will emit, or the [`super::gguf_loader::LoadedImatrix`]
 /// at convert time won't find the per-tensor accumulator.
 ///
-/// For MoE FUSED tensors (`ffn_gate_up_exps.weight`,
-/// `ffn_down_exps.weight`), the same input row is read by ALL routed
-/// experts in one dispatch — canonical llama-imatrix accumulates
-/// **per-input-row** sum-of-squares, which is invariant under which
-/// expert reads it. So `record` fires once per token row for those
-/// dispatches just like for ordinary dense tensors; the per-expert
-/// counts come from the routing decision the collector observes
-/// separately (or are derived from the dense routing weights).
+/// Two intercept paths feed this trait:
+///
+///   - [`intercept_qmatmul_with_hint`] — dense matmuls
+///     (`dispatch_qmatmul`). Calls [`Self::record`] once per token
+///     row.
+///   - [`intercept_qmatmul_id_with_hint`] — MoE fused matmuls
+///     (`quantized_matmul_id_ggml_pooled`,
+///     [`mlx_native::GgmlQuantizedMatmulIdParams`]). Calls
+///     [`Self::record_moe`] once per (token, routed-expert) pair —
+///     up to `top_k` calls per token, with the SAME input row but a
+///     different `expert_id` argument each time.
+///
+/// Both intercepts deliver exactly one token row per call. The MoE
+/// per-expert split mirrors canonical `imatrix.cpp:310-330` for
+/// `GGML_OP_MUL_MAT_ID`: each routed expert sees the activation in
+/// its own per-expert `Accumulator` slot at
+/// `values[expert_id * n_per_row + j]`.
+///
+/// Required methods: implementations MUST define both. Dense-only
+/// test collectors typically impl `record_moe` as a panic / no-op;
+/// MoE-aware production collectors dispatch via
+/// [`super::accumulator::Accumulator::absorb_moe`].
 pub trait ImatrixCollector {
     /// Called by `intercept_qmatmul_with_hint` BEFORE the matmul.
     /// `tensor_name` is the canonical GGUF tensor name being
@@ -81,6 +95,20 @@ pub trait ImatrixCollector {
     /// per-token rows before invoking this — implementations can
     /// assume every call delivers exactly one row.
     fn record(&mut self, tensor_name: &str, input_row: &[f32]);
+
+    /// Called by `intercept_qmatmul_id_with_hint` BEFORE the MoE
+    /// fused matmul, ONCE per (token, routed-expert) pair.
+    /// `tensor_name` is the canonical GGUF name (e.g.
+    /// `"blk.5.ffn_gate_up_exps.weight"`); `expert_id` is the index
+    /// of the routed expert in `0..n_experts`; `input_row` is the
+    /// shared per-token F32 activation row (same value for every
+    /// routed expert of that token).
+    ///
+    /// Mirrors `imatrix.cpp:310-330` for `GGML_OP_MUL_MAT_ID`. The
+    /// collector typically stores per-expert sum-of-squares at
+    /// `values[expert_id * n_per_row + j]` and bumps
+    /// `counts[expert_id] += 1` per call.
+    fn record_moe(&mut self, tensor_name: &str, expert_id: usize, input_row: &[f32]);
 }
 
 thread_local! {
@@ -245,6 +273,124 @@ pub fn is_active() -> bool {
     IMATRIX_COLLECTOR.with(|slot| slot.borrow().is_some())
 }
 
+/// Intercept entry point for MoE FUSED matmuls dispatched through
+/// `mlx_native::quantized_matmul_id_ggml_pooled` (the
+/// [`mlx_native::GgmlQuantizedMatmulIdParams`] path used by Qwen3.5/3.6
+/// MoE and Gemma 4-A4B's MoE expert dispatches). The dense intercept
+/// [`intercept_qmatmul_with_hint`] does NOT see these — they bypass
+/// `dispatch_qmatmul` entirely.
+///
+/// Contract per `imatrix.cpp:310-330` (canonical llama-imatrix for
+/// `GGML_OP_MUL_MAT_ID`):
+///
+/// ```text
+/// for each token in 0..n_tokens:
+///   row = input_buffer[token * n_per_row..(token+1) * n_per_row]
+///   for j in 0..top_k:
+///     expert_id = expert_ids[token * top_k + j]
+///     e.values[expert_id * n_per_row + col] += row[col]² for col
+///     e.counts[expert_id] += 1
+/// ```
+///
+/// The intercept fires [`ImatrixCollector::record_moe`] exactly
+/// `n_tokens * top_k` times: once per (token, routed-expert) pair,
+/// with the SAME row but a different `expert_id` each iteration.
+///
+/// Materialization closures:
+///   - `materialize_input` produces the F32 input buffer as a single
+///     `Vec<f32>` of length `n_tokens * n_per_row`. The intercept
+///     site does `commit_and_wait + as_slice::<f32>()` on the input
+///     MlxBuffer (same as the dense path).
+///   - `materialize_expert_ids` produces the routing buffer as a
+///     `Vec<u32>` of length `n_tokens * top_k`. Read from
+///     `moe_expert_ids`; that buffer is populated upstream by
+///     `fused_moe_routing_f32`.
+///
+/// Either closure returning `None` causes the intercept to silently
+/// skip this dispatch — the production materialization path can fail
+/// if the GPU encoder is in a weird state, and one missing dispatch
+/// is recoverable (the next chunk's data still feeds the imatrix).
+/// Shape mismatches (closures return wrong-size buffers) ARE typed
+/// errors per the no-loop-suppression rule.
+///
+/// Fast path: same single `is_active()` load + branch as the dense
+/// intercept; closures are only invoked when a collector is installed
+/// and the hint is non-`None`.
+pub fn intercept_qmatmul_id_with_hint<FInput, FIds>(
+    hint: ImatrixHint<'_>,
+    n_tokens: usize,
+    top_k: usize,
+    n_per_row: usize,
+    materialize_input: FInput,
+    materialize_expert_ids: FIds,
+) -> Result<(), ImatrixError>
+where
+    FInput: FnOnce() -> Option<Vec<f32>>,
+    FIds: FnOnce() -> Option<Vec<u32>>,
+{
+    if !is_active() {
+        return Ok(());
+    }
+    let name = match hint {
+        ImatrixHint::None => return Ok(()),
+        ImatrixHint::Global(s) => s.to_string(),
+        ImatrixHint::Layered { tag, layer } => format!("blk.{layer}.{tag}.weight"),
+    };
+
+    IMATRIX_COLLECTOR.with(|slot| -> Result<(), ImatrixError> {
+        let mut borrow = slot.borrow_mut();
+        let collector = match borrow.as_deref_mut() {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        let input = match materialize_input() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        let expert_ids = match materialize_expert_ids() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        let expected_input = n_tokens.saturating_mul(n_per_row);
+        if input.len() != expected_input {
+            return Err(ImatrixError::ShapeMismatch {
+                tensor: name,
+                m: n_tokens,
+                n_per_row,
+                got: input.len(),
+                expected: expected_input,
+            });
+        }
+        let expected_ids = n_tokens.saturating_mul(top_k);
+        if expert_ids.len() != expected_ids {
+            return Err(ImatrixError::ShapeMismatch {
+                tensor: format!("{name}::expert_ids"),
+                m: n_tokens,
+                n_per_row: top_k,
+                got: expert_ids.len(),
+                expected: expected_ids,
+            });
+        }
+
+        if n_tokens == 0 || n_per_row == 0 || top_k == 0 {
+            return Ok(());
+        }
+
+        // imatrix.cpp:310-330 — for each routed expert of each token,
+        // accumulate the SAME shared row into the per-expert slot.
+        for tok in 0..n_tokens {
+            let row = &input[tok * n_per_row..(tok + 1) * n_per_row];
+            for k_idx in 0..top_k {
+                let expert_id = expert_ids[tok * top_k + k_idx] as usize;
+                collector.record_moe(&name, expert_id, row);
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Driver-side parameters for an in-tree imatrix run.
 #[derive(Debug, Clone)]
 pub struct ComputeImatrixParams {
@@ -343,6 +489,9 @@ mod tests {
             fn record(&mut self, name: &str, row: &[f32]) {
                 RECORDS.lock().unwrap().push((name.to_string(), row.to_vec()));
             }
+            fn record_moe(&mut self, _name: &str, _expert_id: usize, _row: &[f32]) {
+                unreachable!("dense-only test collector — record_moe not exercised");
+            }
         }
 
         RECORDS.lock().unwrap().clear();
@@ -374,6 +523,9 @@ mod tests {
         impl ImatrixCollector for StaticCollector {
             fn record(&mut self, name: &str, row: &[f32]) {
                 RECORDS.lock().unwrap().push((name.to_string(), row.to_vec()));
+            }
+            fn record_moe(&mut self, _name: &str, _expert_id: usize, _row: &[f32]) {
+                unreachable!("dense-only test collector — record_moe not exercised");
             }
         }
 
@@ -411,6 +563,9 @@ mod tests {
         impl ImatrixCollector for C {
             fn record(&mut self, name: &str, _row: &[f32]) {
                 RECORDS.lock().unwrap().push(name.to_string());
+            }
+            fn record_moe(&mut self, _name: &str, _expert_id: usize, _row: &[f32]) {
+                unreachable!("dense-only test collector — record_moe not exercised");
             }
         }
 
@@ -452,6 +607,9 @@ mod tests {
         impl ImatrixCollector for C {
             fn record(&mut self, name: &str, _row: &[f32]) {
                 RECORDS.lock().unwrap().push(name.to_string());
+            }
+            fn record_moe(&mut self, _name: &str, _expert_id: usize, _row: &[f32]) {
+                unreachable!("dense-only test collector — record_moe not exercised");
             }
         }
 
@@ -508,5 +666,218 @@ mod tests {
     struct RecorderCollector;
     impl ImatrixCollector for RecorderCollector {
         fn record(&mut self, _name: &str, _row: &[f32]) {}
+        fn record_moe(&mut self, _name: &str, _expert_id: usize, _row: &[f32]) {}
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // MoE intercept tests — `intercept_qmatmul_id_with_hint`.
+    // Mirrors the canonical `imatrix.cpp:310-330` for
+    // `GGML_OP_MUL_MAT_ID`: per (token, routed-expert) accumulation.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// No collector → no-op (Ok), neither closure invoked.
+    #[test]
+    fn moe_intercept_noop_without_collector() {
+        let mut input_materialized = false;
+        let mut ids_materialized = false;
+        let result = intercept_qmatmul_id_with_hint(
+            ImatrixHint::Layered { tag: "ffn_gate_up_exps", layer: 0 },
+            /* n_tokens */ 2,
+            /* top_k */ 2,
+            /* n_per_row */ 4,
+            || {
+                input_materialized = true;
+                Some(vec![0.0; 8])
+            },
+            || {
+                ids_materialized = true;
+                Some(vec![0u32; 4])
+            },
+        );
+        assert!(result.is_ok());
+        assert!(!input_materialized, "input closure should not fire");
+        assert!(!ids_materialized, "expert_ids closure should not fire");
+    }
+
+    /// `None` hint → no-op even with collector installed.
+    #[test]
+    fn moe_intercept_noop_with_none_hint() {
+        with_collector(RecorderCollector::default(), || {
+            let mut input_materialized = false;
+            let mut ids_materialized = false;
+            let result = intercept_qmatmul_id_with_hint(
+                ImatrixHint::None,
+                1,
+                1,
+                1,
+                || {
+                    input_materialized = true;
+                    Some(vec![0.0])
+                },
+                || {
+                    ids_materialized = true;
+                    Some(vec![0u32])
+                },
+            );
+            assert!(result.is_ok());
+            assert!(!input_materialized);
+            assert!(!ids_materialized);
+        });
+    }
+
+    /// **MoE canonical accumulation invariant.**
+    ///
+    /// For n_tokens=2 × top_k=2 × n_per_row=3:
+    ///   - input  = [t0_row.., t1_row..] = [1,2,3, 4,5,6]
+    ///   - ids    = [t0_e0, t0_e1, t1_e0, t1_e1] = [7, 9, 9, 11]
+    ///
+    /// Expected `record_moe` calls (4 total, in
+    /// `for tok { for k { ... } }` order):
+    ///   (name="blk.5.ffn_gate_up_exps.weight", expert=7,  row=[1,2,3])
+    ///   (name="blk.5.ffn_gate_up_exps.weight", expert=9,  row=[1,2,3])
+    ///   (name="blk.5.ffn_gate_up_exps.weight", expert=9,  row=[4,5,6])
+    ///   (name="blk.5.ffn_gate_up_exps.weight", expert=11, row=[4,5,6])
+    ///
+    /// This is the exact wiring `imatrix.cpp:310-330` produces.
+    #[test]
+    fn moe_intercept_fires_per_token_per_routed_expert() {
+        use std::sync::Mutex;
+        static RECORDS: Mutex<Vec<(String, usize, Vec<f32>)>> = Mutex::new(Vec::new());
+
+        struct MoeCollector;
+        impl ImatrixCollector for MoeCollector {
+            fn record(&mut self, _name: &str, _row: &[f32]) {
+                panic!("MoE intercept should only call record_moe, not record");
+            }
+            fn record_moe(&mut self, name: &str, expert_id: usize, row: &[f32]) {
+                RECORDS
+                    .lock()
+                    .unwrap()
+                    .push((name.to_string(), expert_id, row.to_vec()));
+            }
+        }
+
+        RECORDS.lock().unwrap().clear();
+        with_collector(MoeCollector, || {
+            let result = intercept_qmatmul_id_with_hint(
+                ImatrixHint::Layered { tag: "ffn_gate_up_exps", layer: 5 },
+                /* n_tokens */ 2,
+                /* top_k */ 2,
+                /* n_per_row */ 3,
+                || Some(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                || Some(vec![7u32, 9, 9, 11]),
+            );
+            assert!(result.is_ok());
+        });
+
+        let recs = RECORDS.lock().unwrap();
+        assert_eq!(recs.len(), 4, "n_tokens * top_k = 2 * 2 = 4 calls");
+        assert!(recs.iter().all(|r| r.0 == "blk.5.ffn_gate_up_exps.weight"));
+        // Token 0 row=[1,2,3] routes to experts 7 and 9.
+        assert_eq!(recs[0].1, 7);
+        assert_eq!(recs[0].2, vec![1.0, 2.0, 3.0]);
+        assert_eq!(recs[1].1, 9);
+        assert_eq!(recs[1].2, vec![1.0, 2.0, 3.0]);
+        // Token 1 row=[4,5,6] routes to experts 9 and 11.
+        assert_eq!(recs[2].1, 9);
+        assert_eq!(recs[2].2, vec![4.0, 5.0, 6.0]);
+        assert_eq!(recs[3].1, 11);
+        assert_eq!(recs[3].2, vec![4.0, 5.0, 6.0]);
+    }
+
+    /// Input buffer / shape mismatch → typed `ShapeMismatch` error
+    /// (no records emitted). Same no-suppression contract as the
+    /// dense intercept.
+    #[test]
+    fn moe_intercept_errors_typed_on_input_shape_mismatch() {
+        use std::sync::Mutex;
+        static CALLS: Mutex<u32> = Mutex::new(0);
+
+        struct C;
+        impl ImatrixCollector for C {
+            fn record(&mut self, _name: &str, _row: &[f32]) {}
+            fn record_moe(&mut self, _name: &str, _expert_id: usize, _row: &[f32]) {
+                *CALLS.lock().unwrap() += 1;
+            }
+        }
+        *CALLS.lock().unwrap() = 0;
+        with_collector(C, || {
+            let result = intercept_qmatmul_id_with_hint(
+                ImatrixHint::Layered { tag: "ffn_gate_up_exps", layer: 0 },
+                /* n_tokens */ 2,
+                /* top_k */ 2,
+                /* n_per_row */ 4, // expects 8 input floats
+                || Some(vec![1.0; 5]), // returns 5 — mismatch
+                || Some(vec![0u32; 4]),
+            );
+            match result {
+                Err(ImatrixError::ShapeMismatch { tensor, expected, got, .. }) => {
+                    assert_eq!(tensor, "blk.0.ffn_gate_up_exps.weight");
+                    assert_eq!(expected, 8);
+                    assert_eq!(got, 5);
+                }
+                other => panic!("expected ShapeMismatch, got {other:?}"),
+            }
+        });
+        assert_eq!(*CALLS.lock().unwrap(), 0, "no records on shape mismatch");
+    }
+
+    /// expert_ids buffer length mismatch → typed `ShapeMismatch`
+    /// (uses the `::expert_ids` suffix in `tensor` so the operator
+    /// can distinguish input-buffer vs ids-buffer mismatch at a
+    /// glance).
+    #[test]
+    fn moe_intercept_errors_typed_on_expert_ids_shape_mismatch() {
+        with_collector(RecorderCollector::default(), || {
+            let result = intercept_qmatmul_id_with_hint(
+                ImatrixHint::Layered { tag: "ffn_down_exps", layer: 3 },
+                /* n_tokens */ 2,
+                /* top_k */ 4,
+                /* n_per_row */ 2,
+                || Some(vec![1.0; 4]), // input ok (2*2=4)
+                || Some(vec![0u32; 7]), // expert_ids expects 2*4=8, got 7
+            );
+            match result {
+                Err(ImatrixError::ShapeMismatch { tensor, expected, got, .. }) => {
+                    assert_eq!(tensor, "blk.3.ffn_down_exps.weight::expert_ids");
+                    assert_eq!(expected, 8);
+                    assert_eq!(got, 7);
+                }
+                other => panic!("expected ShapeMismatch, got {other:?}"),
+            }
+        });
+    }
+
+    /// Zero-token / zero-row / zero-top_k → Ok with no calls.
+    /// Defensive: a degenerate dispatch shouldn't crash but also
+    /// shouldn't generate spurious accumulator entries.
+    #[test]
+    fn moe_intercept_zero_dims_no_calls() {
+        use std::sync::Mutex;
+        static CALLS: Mutex<u32> = Mutex::new(0);
+        struct C;
+        impl ImatrixCollector for C {
+            fn record(&mut self, _name: &str, _row: &[f32]) {}
+            fn record_moe(&mut self, _name: &str, _expert_id: usize, _row: &[f32]) {
+                *CALLS.lock().unwrap() += 1;
+            }
+        }
+        for (n_tokens, top_k, n_per_row) in
+            [(0usize, 2usize, 4usize), (2, 0, 4), (2, 2, 0)]
+        {
+            *CALLS.lock().unwrap() = 0;
+            with_collector(C, || {
+                let result = intercept_qmatmul_id_with_hint(
+                    ImatrixHint::Layered { tag: "ffn_gate_up_exps", layer: 0 },
+                    n_tokens,
+                    top_k,
+                    n_per_row,
+                    || Some(vec![0.0; n_tokens * n_per_row]),
+                    || Some(vec![0u32; n_tokens * top_k]),
+                );
+                assert!(result.is_ok());
+            });
+            assert_eq!(*CALLS.lock().unwrap(), 0);
+        }
     }
 }
