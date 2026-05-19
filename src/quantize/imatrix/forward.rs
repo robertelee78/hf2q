@@ -43,7 +43,7 @@
 //! `llama-imatrix` and feed it back via `--imatrix <file>` — Phase A
 //! loader path. Both producer and consumer coexist per the brief.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 use super::corpus::CorpusBytes;
@@ -64,23 +64,18 @@ use crate::quantize::ggml_quants::ArchName;
 /// orchestrator will emit, or the [`super::gguf_loader::LoadedImatrix`]
 /// at convert time won't find the per-tensor accumulator.
 ///
-/// For MoE expert tensors, the per-expert routing is exposed via
-/// [`Self::record_moe`]. Dense linears use [`Self::record`].
+/// For MoE FUSED tensors (`ffn_gate_up_exps.weight`,
+/// `ffn_down_exps.weight`), the same input row is read by ALL routed
+/// experts in one dispatch — canonical llama-imatrix accumulates
+/// **per-input-row** sum-of-squares, which is invariant under which
+/// expert reads it. So one [`Self::record`] call per fused-MoE
+/// dispatch is correct.
 pub trait ImatrixCollector {
-    /// Called by `dispatch_qmatmul` BEFORE the matmul. `tensor_name` is
-    /// the canonical GGUF tensor name being multiplied against;
+    /// Called by `dispatch_qmatmul` BEFORE the matmul. `tensor_name`
+    /// is the canonical GGUF tensor name being multiplied against;
     /// `input_row` is the per-token F32 activation row. For multi-token
     /// prefill batches the caller invokes this once per token row.
     fn record(&mut self, tensor_name: &str, input_row: &[f32]);
-
-    /// MoE per-expert variant. `expert_id` is the chosen expert slot;
-    /// the caller is responsible for invoking this once per routed
-    /// (token, expert) pair. Default impl forwards to [`Self::record`]
-    /// with a synthetic per-expert name suffix — concrete collectors
-    /// should override.
-    fn record_moe(&mut self, tensor_name: &str, _expert_id: usize, input_row: &[f32]) {
-        self.record(tensor_name, input_row);
-    }
 }
 
 thread_local! {
@@ -90,27 +85,34 @@ thread_local! {
     /// outer `Option` is the fast-path `is_none()` check; when `None`
     /// the hot path takes ONE branch and proceeds.
     static IMATRIX_COLLECTOR: RefCell<Option<Box<dyn ImatrixCollector>>> = const { RefCell::new(None) };
+}
 
-    /// Current tensor-name hint for the next [`dispatch_qmatmul`] call
-    /// on this thread, or `None` for "don't collect this dispatch".
-    ///
-    /// Held as `RefCell<Option<String>>` so the in-tree driver can
-    /// install runtime-built names (`format!("blk.{layer}.attn_q.weight")`)
-    /// without leaking memory. The production fast path early-exits via
-    /// the cheaper [`NAME_HINT_PRESENT`] `Cell<bool>` BEFORE this
-    /// `RefCell` is touched — so the hot decode path never pays the
-    /// borrow-tracking cost.
-    static IMATRIX_NAME_HINT: RefCell<Option<String>> = const { RefCell::new(None) };
-
-    /// Cheap "is a name hint set?" probe — `Cell<bool>`, one load on the
-    /// hot path. Kept in sync with [`IMATRIX_NAME_HINT`] by every
-    /// setter.
-    static NAME_HINT_PRESENT: Cell<bool> = const { Cell::new(false) };
-
-    /// Optional MoE expert-id hint. When set alongside
-    /// [`IMATRIX_NAME_HINT`], the intercept site routes through
-    /// [`ImatrixCollector::record_moe`] instead of `record`.
-    static IMATRIX_EXPERT_HINT: Cell<Option<usize>> = const { Cell::new(None) };
+/// Cheap-to-construct hint that gets lazily formatted into a canonical
+/// GGUF tensor name when (and only when) an [`ImatrixCollector`] is
+/// active. The intercept site reads this enum inline — no thread-local
+/// String, no `format!` allocation on the production fast path.
+///
+/// Stage 2 plumbing replaced Stage 1's thread-local `IMATRIX_NAME_HINT`
+/// with this inline-hint API. Per [[feedback-no-backwards-compat-2026-05-18]]
+/// the thread-local API has been deleted, not aliased.
+#[derive(Debug, Clone, Copy)]
+pub enum ImatrixHint<'a> {
+    /// Skip — intercept is a no-op regardless of collector state. Use
+    /// for matmuls whose inputs are post-RoPE / post-norm activations
+    /// being read by SDPA (the `sdpa_out`-driven `o_proj` is named,
+    /// but the *output* projection's "input" is the attention's output
+    /// row — capturing it doesn't help an imatrix of the o_proj weight
+    /// itself; the relevant capture is upstream).
+    None,
+    /// Global tensor: GGUF name is exactly `name` (no formatting).
+    /// Example: `ImatrixHint::Global("token_embd.weight")`.
+    Global(&'a str),
+    /// Per-block tensor: GGUF name is `"blk.{layer}.{tag}.weight"`.
+    /// `tag` is the canonical GGUF middle slot — e.g., `"attn_q"`,
+    /// `"attn_k"`, `"attn_v"`, `"attn_output"`, `"ffn_gate"`,
+    /// `"ffn_up"`, `"ffn_down"`, `"ffn_gate_inp"`,
+    /// `"ffn_gate_up_exps"`, `"ffn_down_exps"`.
+    Layered { tag: &'a str, layer: usize },
 }
 
 /// Install `collector` into the thread-local slot for the duration of
@@ -144,81 +146,33 @@ where
     body()
 }
 
-/// Set the tensor-name hint for the next `dispatch_qmatmul` call on
-/// this thread. Caller is responsible for clearing via
-/// [`clear_name_hint`] after the call (or via [`with_name_hint`]).
+/// Intercept entry point — called by [`crate::serve::forward_mlx::dispatch_qmatmul`]
+/// at the top of the function. Returns immediately if no collector is
+/// installed (the production-default fast path).
 ///
-/// Accepts `impl Into<String>` so callers can pass runtime-built names
-/// (`format!("blk.{layer}.attn_q.weight")`) without leaking statics.
-pub fn set_name_hint(name: impl Into<String>) {
-    let s = name.into();
-    IMATRIX_NAME_HINT.with(|slot| *slot.borrow_mut() = Some(s));
-    NAME_HINT_PRESENT.with(|p| p.set(true));
-}
-
-/// Clear the tensor-name hint.
-pub fn clear_name_hint() {
-    IMATRIX_NAME_HINT.with(|slot| *slot.borrow_mut() = None);
-    NAME_HINT_PRESENT.with(|p| p.set(false));
-}
-
-/// Set both the tensor-name hint and an MoE expert-id hint. Mirrors the
-/// pairing convention in `dispatch_qmatmul` for MoE indirect matmuls.
-pub fn set_moe_hint(name: impl Into<String>, expert_id: usize) {
-    set_name_hint(name);
-    IMATRIX_EXPERT_HINT.with(|slot| slot.set(Some(expert_id)));
-}
-
-/// Clear both the name + expert hint.
-pub fn clear_moe_hint() {
-    clear_name_hint();
-    IMATRIX_EXPERT_HINT.with(|slot| slot.set(None));
-}
-
-/// Run `body` with `name` installed as the active tensor-name hint, and
-/// clear the hint at the end. The hint is overwritten — not stacked —
-/// so nested calls see only the inner-most name.
-pub fn with_name_hint<F, R>(name: impl Into<String>, body: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    set_name_hint(name);
-    let out = body();
-    clear_name_hint();
-    out
-}
-
-/// Intercept entry point — called by `dispatch_qmatmul` at the top of
-/// the function. Returns immediately if no collector is installed or no
-/// name hint is set (the production-default fast path).
+/// `hint` carries the canonical GGUF tensor name (or `None` to skip
+/// this dispatch). `materialize_row` is a closure that produces the
+/// F32 input row when invoked — kept opaque so the intercept site
+/// decides the sync strategy (`commit_and_wait + as_slice`, or a no-op
+/// for already-host data). The closure is NOT called when collection
+/// is disabled.
 ///
-/// `materialize_row` is a closure that produces the F32 input row when
-/// invoked — kept opaque so the intercept site decides the sync
-/// strategy (commit_and_wait + as_slice, or a no-op for already-host
-/// data). The closure is NOT called when collection is disabled.
-///
-/// This is the **only** Stage 1 surface the runtime needs. The trait +
-/// install API above is what the in-tree driver (Stage 2) consumes.
-pub fn intercept_qmatmul<F>(materialize_row: F)
+/// Fast path overhead: one `RefCell::borrow().is_none()` check (one
+/// load + branch). Per [[feedback-no-loop-suppression-2026-05-17]] this
+/// is a one-branch addition, not a runtime-degradation path.
+pub fn intercept_qmatmul_with_hint<F>(hint: ImatrixHint<'_>, materialize_row: F)
 where
     F: FnOnce() -> Option<Vec<f32>>,
 {
-    // Fast path: a single `Cell<bool>::get()` load. When no in-tree
-    // driver is active (production decode / serve), this is the only
-    // overhead — one load + one branch + return.
-    if !NAME_HINT_PRESENT.with(|p| p.get()) {
+    // Fast path: if no collector installed, return immediately.
+    if !is_active() {
         return;
     }
-    let expert = IMATRIX_EXPERT_HINT.with(|slot| slot.get());
-
-    // Snapshot the name out of the RefCell into an owned String so we
-    // can drop the borrow before invoking the collector (which itself
-    // borrows IMATRIX_COLLECTOR mutably — keeping both borrows live
-    // would not be problematic since they're different cells, but a
-    // single-borrow style is cheaper and easier to audit).
-    let name = match IMATRIX_NAME_HINT.with(|slot| slot.borrow().clone()) {
-        Some(n) => n,
-        None => return,
+    // No allocation until we know the collector wants this dispatch.
+    let name = match hint {
+        ImatrixHint::None => return,
+        ImatrixHint::Global(s) => s.to_string(),
+        ImatrixHint::Layered { tag, layer } => format!("blk.{layer}.{tag}.weight"),
     };
 
     IMATRIX_COLLECTOR.with(|slot| {
@@ -231,10 +185,7 @@ where
             Some(r) => r,
             None => return,
         };
-        match expert {
-            Some(eid) => collector.record_moe(&name, eid, &row),
-            None => collector.record(&name, &row),
-        }
+        collector.record(&name, &row);
     });
 }
 
@@ -290,41 +241,41 @@ mod tests {
     use super::*;
     use crate::quantize::imatrix::corpus::CorpusSource;
 
-    /// `intercept_qmatmul` is a no-op when no collector is installed.
+    /// `intercept_qmatmul_with_hint` is a no-op when no collector is installed.
     #[test]
     fn intercept_noop_without_collector() {
-        // No collector, no name hint — closure should never fire.
         let mut materialized = false;
-        intercept_qmatmul(|| {
-            materialized = true;
-            Some(vec![1.0, 2.0])
-        });
+        intercept_qmatmul_with_hint(
+            ImatrixHint::Layered { tag: "attn_q", layer: 0 },
+            || {
+                materialized = true;
+                Some(vec![1.0, 2.0])
+            },
+        );
         assert!(!materialized, "materialize closure should not fire");
         assert!(!is_active());
     }
 
-    /// `intercept_qmatmul` is a no-op when collector is installed but
-    /// no name hint is set.
+    /// `intercept_qmatmul_with_hint(None, ...)` is a no-op even with collector
+    /// installed (used for non-imatrix-tracked matmuls).
     #[test]
-    fn intercept_noop_without_name_hint() {
+    fn intercept_noop_with_none_hint() {
         let collector = RecorderCollector::default();
         with_collector(collector, || {
             assert!(is_active());
             let mut materialized = false;
-            intercept_qmatmul(|| {
+            intercept_qmatmul_with_hint(ImatrixHint::None, || {
                 materialized = true;
                 Some(vec![1.0])
             });
-            assert!(!materialized, "no name hint → closure should not fire");
+            assert!(!materialized, "None hint → closure should not fire");
         });
     }
 
-    /// `with_name_hint` + installed collector → record() fires.
+    /// `Layered` hint + installed collector → record() fires with the
+    /// formatted canonical GGUF name.
     #[test]
-    fn intercept_fires_with_collector_and_name() {
-        // RecorderCollector is module-private; verify via a shared
-        // counter in a static so we can read it after `with_collector`
-        // restores the slot.
+    fn intercept_fires_with_collector_and_layered_hint() {
         use std::sync::Mutex;
         static RECORDS: Mutex<Vec<(String, Vec<f32>)>> = Mutex::new(Vec::new());
 
@@ -337,9 +288,10 @@ mod tests {
 
         RECORDS.lock().unwrap().clear();
         with_collector(StaticCollector, || {
-            with_name_hint("blk.0.attn_q.weight", || {
-                intercept_qmatmul(|| Some(vec![1.0, 2.0, 3.0]));
-            });
+            intercept_qmatmul_with_hint(
+                ImatrixHint::Layered { tag: "attn_q", layer: 0 },
+                || Some(vec![1.0, 2.0, 3.0]),
+            );
         });
 
         let records = RECORDS.lock().unwrap();
@@ -348,33 +300,28 @@ mod tests {
         assert_eq!(records[0].1, vec![1.0, 2.0, 3.0]);
     }
 
-    /// `set_moe_hint` routes through `record_moe`.
+    /// `Global` hint records under the verbatim name (no formatting).
     #[test]
-    fn intercept_moe_routing() {
+    fn intercept_global_hint_records_verbatim() {
         use std::sync::Mutex;
-        static MOE_HITS: Mutex<Vec<(String, usize, Vec<f32>)>> = Mutex::new(Vec::new());
+        static RECORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-        struct MoeCollector;
-        impl ImatrixCollector for MoeCollector {
-            fn record(&mut self, _name: &str, _row: &[f32]) {
-                panic!("expected record_moe path, not record");
-            }
-            fn record_moe(&mut self, name: &str, expert_id: usize, row: &[f32]) {
-                MOE_HITS.lock().unwrap().push((name.to_string(), expert_id, row.to_vec()));
+        struct C;
+        impl ImatrixCollector for C {
+            fn record(&mut self, name: &str, _row: &[f32]) {
+                RECORDS.lock().unwrap().push(name.to_string());
             }
         }
 
-        MOE_HITS.lock().unwrap().clear();
-        with_collector(MoeCollector, || {
-            set_moe_hint("blk.0.ffn_gate_exps.weight", 7);
-            intercept_qmatmul(|| Some(vec![0.5, 0.5]));
-            clear_moe_hint();
+        RECORDS.lock().unwrap().clear();
+        with_collector(C, || {
+            intercept_qmatmul_with_hint(ImatrixHint::Global("token_embd.weight"), || {
+                Some(vec![0.0; 4])
+            });
         });
-
-        let hits = MOE_HITS.lock().unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, "blk.0.ffn_gate_exps.weight");
-        assert_eq!(hits[0].1, 7);
+        let r = RECORDS.lock().unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0], "token_embd.weight");
     }
 
     /// `with_collector` restores the previous slot at exit.

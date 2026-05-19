@@ -1112,14 +1112,17 @@ impl MlxModelWeights {
                     Some(t0)
                 } else { None };
                 dispatch_qmatmul(&mut s, reg, dev, &pf_norm_out,
-                    &self.layers[layer_idx].attn.q_proj, &mut pf_q, seq_len as u32)?;
+                    &self.layers[layer_idx].attn.q_proj, &mut pf_q, seq_len as u32,
+                    crate::quantize::imatrix::ImatrixHint::Layered { tag: "attn_q", layer: layer_idx })?;
                 dispatch_qmatmul(&mut s, reg, dev, &pf_norm_out,
-                    &self.layers[layer_idx].attn.k_proj, &mut pf_k, seq_len as u32)?;
+                    &self.layers[layer_idx].attn.k_proj, &mut pf_k, seq_len as u32,
+                    crate::quantize::imatrix::ImatrixHint::Layered { tag: "attn_k", layer: layer_idx })?;
                 let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
                 if !v_is_k {
                     dispatch_qmatmul(&mut s, reg, dev, &pf_norm_out,
                         self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
-                        &mut pf_v, seq_len as u32)?;
+                        &mut pf_v, seq_len as u32,
+                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "attn_v", layer: layer_idx })?;
                 }
                 if let Some(t0) = qkv_t0 {
                     bucket_finish!(s, exec, t0, &PROFILE_QKV_MM_NS, &PROFILE_QKV_MM_COUNT,
@@ -2209,7 +2212,8 @@ impl MlxModelWeights {
                     );
                     dispatch_qmatmul(&mut s, reg, dev, &pf_sdpa_out,
                         &self.layers[layer_idx].attn.o_proj,
-                        &mut pf_attn_out, seq_len as u32)?;
+                        &mut pf_attn_out, seq_len as u32,
+                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "attn_output", layer: layer_idx })?;
                 } else {
                     let o_info = &self.layers[layer_idx].attn.o_proj.info;
                     let perm021_params = mlx_native::GgmlQuantizedMatmulPerm021Params {
@@ -2524,13 +2528,16 @@ impl MlxModelWeights {
                 } else { None };
                 dispatch_qmatmul(&mut s, reg, dev, &pf_norm_out,
                     &self.layers[layer_idx].mlp.gate_proj,
-                    &mut pf_mlp_gate, seq_len as u32)?;
+                    &mut pf_mlp_gate, seq_len as u32,
+                    crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_gate", layer: layer_idx })?;
                 dispatch_qmatmul(&mut s, reg, dev, &pf_norm_out,
                     &self.layers[layer_idx].mlp.up_proj,
-                    &mut pf_mlp_up, seq_len as u32)?;
+                    &mut pf_mlp_up, seq_len as u32,
+                    crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_up", layer: layer_idx })?;
                 dispatch_qmatmul(&mut s, reg, dev, &pf_router_norm_out,
                     &self.layers[layer_idx].moe.router_proj,
-                    &mut pf_router_logits, seq_len as u32)?;
+                    &mut pf_router_logits, seq_len as u32,
+                    crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_gate_inp", layer: layer_idx })?;
                 if let Some(t0) = gur_t0 {
                     bucket_finish!(s, exec, t0, &PROFILE_MLP_GUR_MM_NS, &PROFILE_MLP_GUR_MM_COUNT, 3, "gur_mm");
                 }
@@ -2587,7 +2594,8 @@ impl MlxModelWeights {
                 } else { None };
                 dispatch_qmatmul(&mut s, reg, dev, &pf_mlp_fused,
                     &self.layers[layer_idx].mlp.down_proj,
-                    &mut pf_mlp_down, seq_len as u32)?;
+                    &mut pf_mlp_down, seq_len as u32,
+                    crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_down", layer: layer_idx })?;
                 if let Some(t0) = dn_t0 {
                     bucket_finish!(s, exec, t0, &PROFILE_MLP_DN_MM_NS, &PROFILE_MLP_DN_MM_COUNT, 1, "mlp_dn");
                 }
@@ -3168,6 +3176,7 @@ impl MlxModelWeights {
                     q6k,
                     &mut self.activations.logits,
                     1,
+                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
                 ).map_err(|e| anyhow::anyhow!("batched lm_head Q6_K: {e}"))?;
             } else if let Some(ref q8) = self.lm_head_q8 {
                 s.barrier_between(
@@ -3180,6 +3189,7 @@ impl MlxModelWeights {
                     q8,
                     &mut self.activations.logits,
                     1,
+                    crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
                 ).map_err(|e| anyhow::anyhow!("batched lm_head Q8: {e}"))?;
             } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
                 s.barrier_between(

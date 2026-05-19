@@ -1060,14 +1060,17 @@ impl MlxModelWeights {
                         &[&self.activations.attn_q, &self.activations.attn_k, &self.activations.attn_v],
                     );
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                        &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1)?;
+                        &self.layers[layer_idx].attn.q_proj, &mut self.activations.attn_q, 1,
+                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "attn_q", layer: layer_idx })?;
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                        &self.layers[layer_idx].attn.k_proj, &mut self.activations.attn_k, 1)?;
+                        &self.layers[layer_idx].attn.k_proj, &mut self.activations.attn_k, 1,
+                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "attn_k", layer: layer_idx })?;
                     let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
                     if !v_is_k {
                         dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                             self.layers[layer_idx].attn.v_proj.as_ref().unwrap(),
-                            &mut self.activations.attn_v, 1)?;
+                            &mut self.activations.attn_v, 1,
+                            crate::quantize::imatrix::ImatrixHint::Layered { tag: "attn_v", layer: layer_idx })?;
                     }
 
                     // -- Fused per-head RMS norm + RoPE on Q and K --
@@ -1461,7 +1464,8 @@ impl MlxModelWeights {
                         &[&self.activations.attn_out],
                     );
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.sdpa_out,
-                        &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1)?;
+                        &self.layers[layer_idx].attn.o_proj, &mut self.activations.attn_out, 1,
+                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "attn_output", layer: layer_idx })?;
 
                     if dump_here {
                         s.finish().map_err(|e| anyhow::anyhow!("dump finish: {e}"))?;
@@ -1529,12 +1533,15 @@ impl MlxModelWeights {
                           &self.activations.moe_router_logits],
                     );
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                        &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1)?;
+                        &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1,
+                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_gate", layer: layer_idx })?;
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
-                        &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1)?;
+                        &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1,
+                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_up", layer: layer_idx })?;
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.router_norm_out,
                         &self.layers[layer_idx].moe.router_proj,
-                        &mut self.activations.moe_router_logits, 1)?;
+                        &mut self.activations.moe_router_logits, 1,
+                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_gate_inp", layer: layer_idx })?;
 
                     // B10: gelu_mul + moe_routing [2 concurrent]
                     s.barrier_between(
@@ -1583,7 +1590,8 @@ impl MlxModelWeights {
                         &[&self.activations.mlp_down],
                     );
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.mlp_fused,
-                        &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1)?;
+                        &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1,
+                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_down", layer: layer_idx })?;
 
                     let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
                     s.barrier_between(
@@ -1824,6 +1832,7 @@ impl MlxModelWeights {
                         q6k,
                         &mut self.activations.logits,
                         1,
+                        crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
                     ).map_err(|e| anyhow::anyhow!("prefill lm_head Q6_K T{tok_i}: {e}"))?;
                 } else if let Some(ref q8) = self.lm_head_q8 {
                     s.barrier_between(
@@ -1836,6 +1845,7 @@ impl MlxModelWeights {
                         q8,
                         &mut self.activations.logits,
                         1,
+                        crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
                     ).map_err(|e| anyhow::anyhow!("prefill lm_head Q8 T{tok_i}: {e}"))?;
                 } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
                     s.barrier_between(

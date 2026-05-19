@@ -51,8 +51,8 @@ pub use accumulator::{Accumulator, AccumulatorRegistry};
 pub use corpus::{CorpusBytes, CorpusSource, BAKED_CORPUS_NAMES};
 pub use error::ImatrixError;
 pub use forward::{
-    clear_moe_hint, clear_name_hint, compute_imatrix, intercept_qmatmul, is_active, set_moe_hint,
-    set_name_hint, with_collector, with_name_hint, ComputeImatrixParams, ImatrixCollector,
+    compute_imatrix, intercept_qmatmul_with_hint, is_active, with_collector,
+    ComputeImatrixParams, ImatrixCollector, ImatrixHint,
 };
 pub use gguf_loader::LoadedImatrix;
 pub use gguf_writer::{write_imatrix, write_imatrix_to_path};
