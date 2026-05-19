@@ -76,7 +76,9 @@ Collapse the five overlapping quantizer impls + two-pass writer + seven-field IR
 8. **CLI surface:**
    ```
    hf2q convert <hf-dir> --quant <name>
-                          [--imatrix <file> | --imatrix-corpus {cdv3,mudler,user-file}]
+                          [--imatrix <file> | --imatrix-corpus {cdv3,mudler,user-file:<path>}]
+                          [--imatrix-n-ctx <N>]          # default 512; only honored with --imatrix-corpus
+                          [--imatrix-out <path>]         # side-effect write of computed/loaded imatrix
                           [--tensor-type-file <file>]    # only for --quant apex-custom
                           [-o out.gguf]
    ```
@@ -369,7 +371,7 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
   - `error.rs` — typed `ImatrixError` per the no-loop-suppression rule. Current variants (post-Stage-3c): `Io, Writer, Parse, NotAnImatrix, MissingKv, MismatchedTensorPair, CorpusRead, UnknownBakedCorpus, ShapeMismatch, ConvertFailed, ModelLoadFailed, UnsupportedArchForDriver, TokenizationFailed, ForwardPassFailed, CorpusTooShort`. The `InTreeGenerationNotYetShipped` placeholder variant existed in Phase A and was deleted at commit `1f761b13` per [[feedback-no-backwards-compat-2026-05-18]] once Stage 3c made it unreachable.
   - `forward.rs` — `compute_imatrix(params)` is the in-tree imatrix generation entry point. Phase A returned a deferred-typed placeholder; Stage 3c (SHIPPED 2026-05-19) now runs the full pipeline: HF dir → F16 GGUF temp → load → tokenize → chunk → forward_prefill loop → `ImatrixData`. The operator-facing workaround (run stock `llama-imatrix` and pass via `--imatrix <file>`) remains supported for arches outside the Stage 3.0 driver scope.
   - `mod.rs` — `ImatrixData { loaded, provenance }` public API; `provenance` distinguishes `LoadedFromFile` (operator-supplied) from `Computed` (in-tree driver). `ImatrixData::load_from_path` + `ImatrixData::write_gguf` provide round-trip.
-- CLI: `--imatrix <file>` (load pre-computed; conflicts with `--imatrix-corpus`), `--imatrix-corpus <cdv3|mudler|user-file:<path>>` (drives the in-tree Stage 3c pipeline on arches in the driver-supported set; other arches surface `UnsupportedArchForDriver`), `--imatrix-out <path>` (side-effect write).
+- CLI: `--imatrix <file>` (load pre-computed; conflicts with `--imatrix-corpus`), `--imatrix-corpus <cdv3|mudler|user-file:<path>>` (drives the in-tree Stage 3c pipeline on arches in the driver-supported set; other arches surface `UnsupportedArchForDriver`), `--imatrix-out <path>` (side-effect write), `--imatrix-n-ctx <N>` (context length for the in-tree forward-pass loop; default 512 matching stock `llama-imatrix -c 512`; only honored when `--imatrix-corpus` is set; `n_ctx > 0` enforced via typed `ConvertError::ImatrixNCtxInvalid`).
 - `ApexPolicy::new_with_imatrix(tier, arch, n_layers, n_expert)` — new constructor that accepts I-tier variants when imatrix data has been resolved. `ApexPolicy::new` (no imatrix) continues to reject I-tier per the no-silent-fallback rule.
 - `SUPPORTED_FOR_IMATRIX` (in `apex/policy.rs`) updated from `&[]` to `&["qwen3moe", "gemma4"]` per ADR text "Pi only runs against arches with hf2q inference support". `MiniMaxM2` and `Llama3` stay out (convert-only arches).
 - 26 imatrix unit tests + 6 CLI-resolution tests pass (32 new tests total). Full bin test suite: 2746 passed, 1 pre-existing unrelated `serve::tests::run_decode_loop_stops_on_repetition` failure.

@@ -146,7 +146,7 @@ values, parsed via
 | Family | Variants | Notes |
 |---|---|---|
 | Standard llama.cpp ftypes | `f32`, `f16`, `bf16`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `q2_k`, `q3_k_{s,m,l}`, `q4_k_{s,m}`, `q5_k_{s,m}`, `q6_k`, `iq4_nl` | Byte-identical to stock `llama-quantize` output for the same ftype. |
-| APEX algorithmic tiers (MoE arches only) | `apex-quality`, `apex-i-quality`, `apex-balanced`, `apex-i-balanced`, `apex-compact`, `apex-i-compact`, `apex-mini` | Per-tier overlay derived from `mudler/apex-quant`. Auto-detects against the per-model fingerprint manifest at [`data/apex-references/manifest.json`](data/apex-references/manifest.json) (ADR-033 §9). I-tier variants reserved pending the imatrix subsystem (Pi). |
+| APEX algorithmic tiers (MoE arches only) | `apex-quality`, `apex-i-quality`, `apex-balanced`, `apex-i-balanced`, `apex-compact`, `apex-i-compact`, `apex-mini` | Per-tier overlay derived from `mudler/apex-quant`. Auto-detects against the per-model fingerprint manifest at [`data/apex-references/manifest.json`](data/apex-references/manifest.json) (ADR-033 §9). I-tier variants require imatrix data via `--imatrix <file>` or `--imatrix-corpus <name>` (Pi shipped 2026-05-19 — see [I-tier APEX](#i-tier-apex-imatrix-aware-quantization) below). |
 
 Reserved names surface as typed errors with actionable hints:
 `--quant dwq` → "reserved for the future DWQ-train pipeline";
@@ -235,8 +235,17 @@ into the binary), and consumes the resulting per-tensor
 sum-of-squared-activations to choose the per-layer mix. Wall time
 is dominated by the forward pass: roughly seconds per 512-token
 chunk × ~100 chunks on a 26B-A4B Gemma 4 model = operator-coffee-time,
-not CI-time. Add `--imatrix-out <path>` to also write the computed
-imatrix to disk for reuse.
+not CI-time.
+
+Optional flags:
+- `--imatrix-out <path>` — write the computed (or loaded) imatrix
+  to disk for reuse across multiple `--quant apex-i-*` runs against
+  the same base model.
+- `--imatrix-n-ctx <N>` — override the default 512-token chunk size
+  (matches stock `llama-imatrix -c 512`). Larger `N` means fewer,
+  longer chunks per forward-pass loop; useful when matching imatrices
+  produced by stock `llama-imatrix -c <other>`. Must be `> 0`;
+  passing `0` surfaces a typed `ConvertError::ImatrixNCtxInvalid`.
 
 ## Architecture
 
