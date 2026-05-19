@@ -96,4 +96,64 @@ pub enum ImatrixError {
         got: usize,
         expected: usize,
     },
+
+    /// Phase B Stage 3 driver: `run_convert` failed when converting
+    /// the source HF directory to a temporary F16 GGUF. Wraps the
+    /// upstream `ConvertError` debug-formatted (avoids a circular
+    /// dependency on `ConvertError` from this module).
+    #[error("imatrix driver: convert to F16 GGUF failed: {detail}")]
+    ConvertFailed { detail: String },
+
+    /// Phase B Stage 3 driver: `LoadedModel::load` failed on the
+    /// temporary F16 GGUF. Wraps the upstream `anyhow::Error`
+    /// debug-formatted.
+    #[error("imatrix driver: model load failed: {detail}")]
+    ModelLoadFailed { detail: String },
+
+    /// Phase B Stage 3 driver: the source arch isn't yet wired for
+    /// in-tree imatrix generation. Listed arches have the inference
+    /// path (per-arch decoder + tokenizer) the driver needs;
+    /// everything else is an explicit-error opt-in code change.
+    #[error(
+        "imatrix driver: arch `{arch}` is not yet wired for in-tree imatrix generation; \
+         supported arches: {supported:?}"
+    )]
+    UnsupportedArchForDriver {
+        arch: String,
+        supported: &'static [&'static str],
+    },
+
+    /// Phase B Stage 3 driver: tokenization of the calibration corpus
+    /// failed (HF tokenizers crate error). Wraps the upstream error
+    /// debug-formatted.
+    #[error("imatrix driver: tokenizer encode failed: {detail}")]
+    TokenizationFailed { detail: String },
+
+    /// Phase B Stage 3 driver: `forward_prefill` failed mid-chunk.
+    /// `chunk_index` is 0-based, `chunk_count` is the total number of
+    /// chunks the driver planned to walk. Wraps the upstream
+    /// `anyhow::Error`.
+    #[error(
+        "imatrix driver: forward pass failed on chunk {chunk_index}/{chunk_count}: {detail}"
+    )]
+    ForwardPassFailed {
+        chunk_index: usize,
+        chunk_count: usize,
+        detail: String,
+    },
+
+    /// Phase B Stage 3 driver: the corpus tokenized into too few
+    /// tokens to fill even one chunk of size `n_ctx`. Per the
+    /// canonical llama-imatrix behavior at `imatrix.cpp:960` partial
+    /// trailing chunks are dropped; an all-trailing corpus produces
+    /// zero chunks and an empty imatrix is meaningless.
+    #[error(
+        "imatrix driver: corpus `{corpus_label}` tokenized to {token_count} tokens, \
+         insufficient for even one chunk of size {n_ctx}"
+    )]
+    CorpusTooShort {
+        corpus_label: String,
+        token_count: usize,
+        n_ctx: u32,
+    },
 }

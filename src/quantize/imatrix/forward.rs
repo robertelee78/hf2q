@@ -406,27 +406,205 @@ pub struct ComputeImatrixParams {
     pub arch: ArchName,
 }
 
-/// Stage 2 entry point — in-tree forward-pass driver.
+/// Stage 3 — in-tree forward-pass driver for imatrix generation.
 ///
-/// Implementation status: SCAFFOLD. Returns
-/// [`ImatrixError::InTreeGenerationNotYetShipped`] for arches that don't
-/// yet have driver wiring. The hook infrastructure (trait,
-/// thread-local, intercept) IS shipped — only the model-load +
-/// forward-pass-drive logic is deferred.
-pub fn compute_imatrix(params: &ComputeImatrixParams) -> Result<(), ImatrixError> {
-    // Stage 2 will:
-    //   1. Convert hf_dir to F16 GGUF in a tempfile (via run_convert
-    //      with --quant f16).
-    //   2. Load the F16 GGUF via the existing inference loader.
-    //   3. Tokenize params.corpus via the per-arch tokenizer.
-    //   4. Chunk via super::corpus::chunk_tokens(&tokens, n_ctx).
-    //   5. Build a MyCollector struct implementing ImatrixCollector;
-    //      populate its registry on each `record` call.
-    //   6. For each chunk: install the collector via with_collector;
-    //      drive the per-arch decoder forward pass; uninstall.
-    //   7. Return ImatrixData { loaded, provenance: Computed }.
-    Err(ImatrixError::InTreeGenerationNotYetShipped {
-        corpus: params.corpus.label.clone(),
+/// Pipeline (per ADR-033 §Pi):
+///   1. Convert `hf_dir` to a temporary F16 GGUF via `run_convert`.
+///   2. Load the F16 GGUF via `LoadedModel::load` (Gemma 4 only for
+///      Stage 3.0; Qwen35Moe and others surface
+///      [`ImatrixError::UnsupportedArchForDriver`]).
+///   3. Tokenize `params.corpus` via the model's tokenizer.
+///   4. Chunk tokens into `params.n_ctx`-sized windows via
+///      [`super::corpus::chunk_tokens`]; partial trailing chunks
+///      dropped (mirrors `imatrix.cpp:960`).
+///   5. For each chunk: install a
+///      [`AccumulatorRegistry`]-backed collector via
+///      [`with_collector`]; call `forward_prefill(chunk, 1, &mut ctx)`;
+///      collector is automatically dropped on scope exit.
+///   6. Pack the accumulated registry into [`super::ImatrixData`]
+///      with [`super::ImatrixProvenance::Computed`] provenance.
+///
+/// All failure modes surface as typed [`ImatrixError`] variants
+/// (ConvertFailed / ModelLoadFailed / UnsupportedArchForDriver /
+/// TokenizationFailed / ForwardPassFailed / CorpusTooShort) per the
+/// no-loop-suppression rule.
+///
+/// Cost note: a single chunk of `forward_prefill` on a 26B-A4B Gemma
+/// model takes several seconds; a full cdv3 corpus (~50k tokens at
+/// n_ctx=512 ⇒ ~100 chunks) is operator-time, not CI-time. The
+/// driver intentionally has no per-test fixture — operators invoke
+/// it via `hf2q convert <hf-dir> --quant apex-i-balanced
+/// --imatrix-corpus cdv3` once Stage 3c.2 wires the CLI surface.
+pub fn compute_imatrix(
+    params: &ComputeImatrixParams,
+) -> Result<super::ImatrixData, ImatrixError> {
+    use crate::quantize::ggml_quants::ArchName as Arch;
+    use std::sync::{Arc, Mutex};
+
+    // ---- 1. Validate input + create tempdir for F16 GGUF ---------------
+    if !params.hf_dir.is_dir() {
+        return Err(ImatrixError::ConvertFailed {
+            detail: format!(
+                "hf_dir `{}` does not exist or is not a directory",
+                params.hf_dir.display()
+            ),
+        });
+    }
+    // Only Gemma 4 is wired for the driver in Stage 3.0. Other arches
+    // surface a typed error pointing at the supported set.
+    if !matches!(params.arch, Arch::Gemma4) {
+        return Err(ImatrixError::UnsupportedArchForDriver {
+            arch: params.arch.name().to_string(),
+            supported: &["gemma4"],
+        });
+    }
+    let tmp = tempfile::tempdir().map_err(ImatrixError::Io)?;
+    let f16_path = tmp.path().join("model.f16.gguf");
+
+    // ---- 2. Run convert to F16 GGUF -----------------------------------
+    let convert_args = crate::convert::cli_driver::ConvertArgs {
+        hf_dir: params.hf_dir.clone(),
+        selector: crate::convert::quant_selector::QuantSelector::Standard(
+            crate::quantize::ggml_quants::llama_ftype::LlamaFtype::MostlyF16,
+        ),
+        output: f16_path.clone(),
+        imatrix: None,
+        imatrix_corpus: None,
+        imatrix_out: None,
+    };
+    crate::convert::cli_driver::run_convert(convert_args).map_err(|e| {
+        ImatrixError::ConvertFailed {
+            detail: format!("{e:?}"),
+        }
+    })?;
+
+    // ---- 3. Load model via existing inference loader -------------------
+    let load_opts = crate::serve::api::engine::LoadOptions {
+        model_path: f16_path.clone(),
+        tokenizer_path: None,
+        config_path: None,
+        dwq_overlay_path: None,
+        kv_persist_dir: None,
+    };
+    let loaded = crate::serve::api::engine::LoadedModel::load(&load_opts).map_err(|e| {
+        ImatrixError::ModelLoadFailed {
+            detail: format!("{e:?}"),
+        }
+    })?;
+    let mut gemma = match loaded {
+        crate::serve::api::engine::LoadedModel::Gemma(g) => g,
+        // Stage 3.0 only supports Gemma 4. Qwen35Moe / Qwen3VlText
+        // would land here but we caught them at the arch-validate
+        // check above; this arm is defensive against arch
+        // double-detection drift.
+        _ => {
+            return Err(ImatrixError::UnsupportedArchForDriver {
+                arch: format!("{:?}", params.arch),
+                supported: &["gemma4"],
+            })
+        }
+    };
+    let n_experts = gemma.config.num_experts;
+
+    // ---- 4. Tokenize corpus -------------------------------------------
+    let encoding =
+        gemma
+            .tokenizer
+            .encode(params.corpus.text.as_str(), false)
+            .map_err(|e| ImatrixError::TokenizationFailed {
+                detail: format!("{e:?}"),
+            })?;
+    let tokens: Vec<u32> = encoding.get_ids().to_vec();
+
+    // ---- 5. Chunk -----------------------------------------------------
+    let chunks = super::corpus::chunk_tokens(&tokens, params.n_ctx as usize);
+    if chunks.is_empty() {
+        return Err(ImatrixError::CorpusTooShort {
+            corpus_label: params.corpus.label.clone(),
+            token_count: tokens.len(),
+            n_ctx: params.n_ctx,
+        });
+    }
+    let chunk_count = chunks.len();
+
+    // ---- 6. Build shared collector ------------------------------------
+    let registry = Arc::new(Mutex::new(super::accumulator::AccumulatorRegistry::new()));
+
+    /// MoE-aware collector backed by a shared `AccumulatorRegistry`.
+    /// Registers each tensor lazily on first record; dense tensors
+    /// get `n_mat=1`, MoE-routed tensors get `n_mat=n_experts`.
+    /// Per [[feedback-no-loop-suppression-2026-05-17]]: shape /
+    /// expert-id violations panic the forward pass loudly rather
+    /// than silently corrupt the accumulator — collection is one-
+    /// shot operator-time, recovery doesn't help.
+    struct SharedCollector {
+        registry: Arc<Mutex<super::accumulator::AccumulatorRegistry>>,
+        n_experts: usize,
+    }
+    impl ImatrixCollector for SharedCollector {
+        fn record(&mut self, name: &str, row: &[f32]) {
+            let mut reg = self.registry.lock().expect("imatrix registry mutex poisoned");
+            let acc = reg
+                .register(name, row.len(), 1)
+                .expect("imatrix dense register: shape mismatch (re-register with different n_per_row)");
+            acc.absorb_dense(row)
+                .expect("imatrix dense absorb: row length mismatch (intercept should have caught)");
+        }
+        fn record_moe(&mut self, name: &str, expert_id: usize, row: &[f32]) {
+            let mut reg = self.registry.lock().expect("imatrix registry mutex poisoned");
+            let acc = reg
+                .register(name, row.len(), self.n_experts)
+                .expect("imatrix moe register: shape mismatch (re-register with different shape)");
+            acc.absorb_moe(expert_id, row)
+                .expect("imatrix moe absorb: expert_id out of range or row mismatch");
+        }
+    }
+
+    // ---- 7. Drive forward pass over each chunk ------------------------
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        let collector = SharedCollector {
+            registry: Arc::clone(&registry),
+            n_experts,
+        };
+        // forward_prefill returns the argmax of the last-row logits.
+        // We don't need it for imatrix; the activations were captured
+        // via the installed collector during the prefill itself.
+        let result: anyhow::Result<u32> = with_collector(collector, || {
+            gemma
+                .weights
+                .forward_prefill(chunk, /* max_decode_tokens */ 1, &mut gemma.ctx)
+        });
+        result.map_err(|e| ImatrixError::ForwardPassFailed {
+            chunk_index,
+            chunk_count,
+            detail: format!("{e:?}"),
+        })?;
+    }
+
+    // ---- 8. Pack into ImatrixData -------------------------------------
+    let registry = Arc::try_unwrap(registry)
+        .map_err(|_| ImatrixError::ForwardPassFailed {
+            chunk_index: 0,
+            chunk_count: 0,
+            detail:
+                "internal: registry Arc had outstanding clones at pack time (collector leak)"
+                    .to_string(),
+        })?
+        .into_inner()
+        .expect("imatrix registry mutex poisoned");
+    let loaded = super::gguf_loader::LoadedImatrix {
+        source_path: format!("<computed:{}>", params.corpus.label),
+        datasets: vec![params.corpus.label.clone()],
+        chunk_count: chunk_count as u32,
+        chunk_size: params.n_ctx,
+        registry,
+    };
+    Ok(super::ImatrixData {
+        loaded,
+        provenance: super::ImatrixProvenance::Computed {
+            corpus_label: params.corpus.label.clone(),
+            n_ctx: params.n_ctx,
+        },
     })
 }
 
@@ -638,23 +816,54 @@ mod tests {
         assert!(!is_active());
     }
 
-    /// Stage 2: `compute_imatrix` returns the deferred error (no panic /
-    /// silent no-op). Composes with the no-loop-suppression rule.
+    /// Stage 3 driver: `compute_imatrix` on a missing `hf_dir` should
+    /// surface `ImatrixError::ConvertFailed` (it can't proceed past
+    /// the hf_dir validation gate). Per
+    /// [[feedback-no-loop-suppression-2026-05-17]] this is a typed
+    /// error, not a silent no-op.
     #[test]
-    fn compute_imatrix_returns_deferred_error() {
+    fn compute_imatrix_errors_typed_on_missing_hf_dir() {
         let corpus = CorpusBytes::load(&CorpusSource::Cdv3).unwrap();
         let params = ComputeImatrixParams {
-            hf_dir: PathBuf::from("/tmp/non-existent-fixture"),
+            hf_dir: PathBuf::from("/tmp/non-existent-fixture-imatrix-driver"),
             corpus,
             n_ctx: 512,
             arch: ArchName::Gemma4,
         };
         let err = compute_imatrix(&params).unwrap_err();
         match err {
-            ImatrixError::InTreeGenerationNotYetShipped { corpus } => {
-                assert_eq!(corpus, "cdv3");
+            ImatrixError::ConvertFailed { detail } => {
+                assert!(
+                    detail.contains("does not exist") || detail.contains("not a directory"),
+                    "detail should describe missing hf_dir, got: {detail}"
+                );
             }
-            other => panic!("expected InTreeGenerationNotYetShipped, got {other:?}"),
+            other => panic!("expected ConvertFailed, got {other:?}"),
+        }
+    }
+
+    /// Stage 3 driver: arches outside the Stage 3.0 supported set
+    /// (Gemma 4 only) surface `UnsupportedArchForDriver` BEFORE
+    /// touching the filesystem (cheap upfront validation per the
+    /// "fail fast at boundaries" rule).
+    #[test]
+    fn compute_imatrix_errors_typed_on_unsupported_arch() {
+        let corpus = CorpusBytes::load(&CorpusSource::Cdv3).unwrap();
+        let params = ComputeImatrixParams {
+            // Provide a real-ish path so the hf_dir-existence check
+            // doesn't short-circuit first. /tmp is always a dir.
+            hf_dir: PathBuf::from("/tmp"),
+            corpus,
+            n_ctx: 512,
+            arch: ArchName::Qwen35Moe,
+        };
+        let err = compute_imatrix(&params).unwrap_err();
+        match err {
+            ImatrixError::UnsupportedArchForDriver { arch, supported } => {
+                assert_eq!(arch, "qwen3moe");
+                assert_eq!(supported, &["gemma4"]);
+            }
+            other => panic!("expected UnsupportedArchForDriver, got {other:?}"),
         }
     }
 

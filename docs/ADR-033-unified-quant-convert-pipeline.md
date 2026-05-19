@@ -386,7 +386,23 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
 - Stage 2 (callsite plumbing): `dispatch_qmatmul` (single intercept entry point — 47 call sites threaded through it) carries an `ImatrixHint` 8th arg (None / Global / Layered). The intercept fires once per matmul on F32 dense activations. Done at `652ca902`.
 - Stage 2.5 (per-row chunking): intercept slices the m×n_per_row buffer into m per-token rows + calls `collector.record` once per row, mirroring `imatrix.cpp:380-393`. Done at `33f10112`. Codex finding (shape-mismatch was eprintln+skip; should be typed `ImatrixError::ShapeMismatch` propagated through `dispatch_qmatmul`) shipped at `27b69cea`.
 
-**Stage 3 scope expansion identified 2026-05-19** — MoE intercept blocker:
+**Stage 3 SHIPPED 2026-05-19** (commits `903d4e8a`, `fe1b9cbd`, `236fbc26`, this commit):
+
+- Stage 3a: `intercept_qmatmul_id_with_hint` + `ImatrixCollector::record_moe` trait extension. Mirrors `imatrix.cpp:310-330` for `GGML_OP_MUL_MAT_ID`.
+- Stage 3b.1: Gemma 4 MoE callsite wiring in `src/serve/forward_prefill_batched.rs` (2 sites: `ffn_gate_up_exps` at L2668, `ffn_down_exps` at L2753).
+- Stage 3b.2: Qwen 3.5/3.6 MoE callsite wiring (6 sites threaded through `dispatch_moe_id_routed` helper in `src/inference/models/qwen35/gpu_ffn.rs`). Added `layer_idx: usize` to `build_moe_ffn_layer_gpu_q_into{,_with_arena}` + propagated through 4 callers in `forward_gpu.rs` + 1 test caller.
+- Stage 3c.1: `compute_imatrix(params) -> Result<ImatrixData, ImatrixError>` driver in `src/quantize/imatrix/forward.rs`. Pipeline: validate hf_dir → `run_convert(--quant f16)` to tempfile → `LoadedModel::load` → tokenize corpus → `chunk_tokens` → `with_collector` × N chunks → pack `ImatrixData { provenance: Computed { corpus_label, n_ctx } }`. Stage 3.0 wires Gemma 4 only; other arches surface `UnsupportedArchForDriver`.
+- Stage 3c.2: CLI integration. `resolve_imatrix_input` now drives `compute_imatrix` when `--imatrix-corpus <name>` is set (previously surfaced `InTreeGenerationNotYetShipped`). Extended `resolve_imatrix_input` signature with `hf_dir` + `arch`.
+- New typed errors: `ImatrixError::{ConvertFailed, ModelLoadFailed, UnsupportedArchForDriver, TokenizationFailed, ForwardPassFailed, CorpusTooShort}`.
+- Tests: 2773 passed (was 2746 at Phase A ship; +27 across Stages 1-3). 1 pre-existing flaky.
+- **Operator command**: `hf2q convert <hf-dir> --quant apex-i-balanced --imatrix-corpus cdv3` — now produces an end-to-end I-tier APEX GGUF with in-tree-computed imatrix on Gemma 4 26B. Wall time: ~minutes per chunk × ~100 chunks ≈ operator-coffee-time. Not CI-time.
+
+**Stage 3 deferred sub-tasks** (out of MVP):
+- Stage 3b.3: affine-MoE intercept (DWQ-overlay format; no current operator demand).
+- Stage 3b.4: Qwen35Moe driver wiring (needs `Qwen35LoadedModel::forward_prefill` chat-completion path which is still iter-228b scope).
+- `--imatrix-n-ctx <N>` CLI flag (currently hardcoded to 512 matching stock `llama-imatrix -c 512`).
+
+**Stage 3 historical scope analysis** (kept for archival reference; MoE intercept blocker described below is now RESOLVED):
 
 `dispatch_qmatmul` intercept covers DENSE matmuls only. MoE fused tensors (`blk.<i>.ffn_gate_up_exps.weight`, `blk.<i>.ffn_down_exps.weight`) dispatch via a SEPARATE kernel (`mlx_native::quantized_matmul_id_ggml_pooled` / `GgmlQuantizedMatmulIdParams`) that does NOT route through `dispatch_qmatmul`. Source verification: ~12 dispatch sites across `src/serve/forward_mlx.rs` (4: 5237, 5324, 7490, 7517), `src/serve/forward_prefill_batched.rs` (2: 2668, 2753), `src/inference/models/qwen35/gpu_ffn.rs` (6: 2560, 2569, 2674, 2946, 2955, 3040).
 

@@ -397,6 +397,8 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
                 tier,
                 args.imatrix.as_deref(),
                 args.imatrix_corpus.as_deref(),
+                &args.hf_dir,
+                arch,
             )?;
 
             let mut apex_policy = if imatrix_data.is_some() {
@@ -525,19 +527,31 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
 /// ADR-033 §Pi: resolve the imatrix-CLI surface into an
 /// [`ImatrixData`] value (or `None` for runs that don't need one).
 ///
-/// Resolution rules:
+/// Resolution rules (in priority order):
 ///   - `--imatrix <file>` set → [`ImatrixData::load_from_path`].
-///   - `--imatrix-corpus <name>` set → typed `InTreeGenerationNotYetShipped`
-///     error (Phase B deferred).
+///   - `--imatrix-corpus <name>` set → drive Stage 3
+///     [`compute_imatrix`] over the corpus, returning the produced
+///     `ImatrixData { provenance: Computed }`. Driver-side failures
+///     surface as typed `ImatrixError` (ConvertFailed,
+///     ModelLoadFailed, UnsupportedArchForDriver, etc.) wrapped via
+///     `ConvertError::Imatrix`.
 ///   - Neither set + tier is I-tier → typed `ImatrixRequiredForITier`.
 ///   - Neither set + tier is non-I → `Ok(None)` (the run proceeds
 ///     without imatrix data).
+///
+/// `hf_dir` and `arch` are required for the corpus-driven path
+/// (Stage 3 driver needs them to convert + load the model
+/// in-tree). Unused for the `--imatrix <file>` and tier-only paths.
 fn resolve_imatrix_input(
     tier: &crate::quantize::ggml_quants::apex::ApexTier,
     imatrix_path: Option<&std::path::Path>,
     imatrix_corpus: Option<&str>,
+    hf_dir: &std::path::Path,
+    arch: crate::quantize::ggml_quants::ArchName,
 ) -> Result<Option<crate::quantize::imatrix::ImatrixData>, ConvertError> {
-    use crate::quantize::imatrix::{CorpusSource, ImatrixData, ImatrixError};
+    use crate::quantize::imatrix::{
+        compute_imatrix, ComputeImatrixParams, CorpusBytes, CorpusSource, ImatrixData,
+    };
 
     if let Some(path) = imatrix_path {
         let data = ImatrixData::load_from_path(path)?;
@@ -551,15 +565,43 @@ fn resolve_imatrix_input(
         return Ok(Some(data));
     }
     if let Some(corpus_name) = imatrix_corpus {
-        // Parse the selector first so unknown corpus names error
-        // immediately (cheap user-facing diagnostic). The actual
-        // forward-pass is Phase B; we surface the deferred error
-        // unconditionally for now.
+        // Stage 3c.2 (ADR-033 §Pi Phase B): in-tree forward-pass
+        // driver. Loads the source HF dir → F16 GGUF tempfile, runs
+        // the per-arch decoder forward pass over `corpus_name`'s
+        // tokenized chunks, returns the computed imatrix.
+        //
+        // Stage 3.0 wires Gemma 4 only; other arches surface a typed
+        // `UnsupportedArchForDriver` error (NOT a silent fallback to
+        // the workaround). Operators with Qwen 3.5/3.6 etc. should
+        // continue using stock `llama-imatrix` + `--imatrix <path>`
+        // until Stage 3b.4 adds Qwen35Moe driver wiring.
         let source = CorpusSource::from_cli(corpus_name)?;
-        return Err(ImatrixError::InTreeGenerationNotYetShipped {
-            corpus: source.dataset_label(),
-        }
-        .into());
+        let corpus = CorpusBytes::load(&source)?;
+        let label = source.dataset_label();
+        eprintln!(
+            "[hf2q imatrix] computing in-tree on corpus `{label}` \
+             ({} bytes, ~{} words)",
+            corpus.byte_count(),
+            corpus.approx_word_count(),
+        );
+        // ADR-033 §Pi: default n_ctx for imatrix collection is 512
+        // (matches stock llama-imatrix's default `-c 512`). Operators
+        // wanting a different n_ctx today would need a future
+        // `--imatrix-n-ctx` flag — out of Stage 3.0 scope.
+        let params = ComputeImatrixParams {
+            hf_dir: hf_dir.to_path_buf(),
+            corpus,
+            n_ctx: 512,
+            arch,
+        };
+        let data = compute_imatrix(&params)?;
+        eprintln!(
+            "[hf2q imatrix] computed {} tensor pairs, chunks={}, chunk_size={}",
+            data.tensor_pair_count(),
+            data.loaded.chunk_count,
+            data.loaded.chunk_size,
+        );
+        return Ok(Some(data));
     }
     if tier.requires_imatrix() {
         return Err(ConvertError::ImatrixRequiredForITier {
@@ -1705,10 +1747,24 @@ mod tests {
 
     /// ADR-033 §Pi: an I-tier with no imatrix flags surfaces the typed
     /// `ImatrixRequiredForITier` error (no silent fallback to non-I sibling).
+    /// Test-only sentinel hf_dir for paths that don't actually
+    /// reach the driver (imatrix-path or no-imatrix branches). The
+    /// driver path is exercised separately by
+    /// `imatrix_corpus_drives_in_tree_and_errors_typed`.
+    fn dummy_hf_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from("/tmp/imatrix-test-unused")
+    }
+
     #[test]
     fn imatrix_required_for_i_tier_without_data() {
-        let err =
-            super::resolve_imatrix_input(&ApexTier::IBalanced, None, None).unwrap_err();
+        let err = super::resolve_imatrix_input(
+            &ApexTier::IBalanced,
+            None,
+            None,
+            &dummy_hf_dir(),
+            crate::quantize::ggml_quants::ArchName::Gemma4,
+        )
+        .unwrap_err();
         match err {
             ConvertError::ImatrixRequiredForITier { tier } => {
                 assert_eq!(tier, "i-balanced")
@@ -1727,7 +1783,14 @@ mod tests {
             ApexTier::Compact,
             ApexTier::Mini,
         ] {
-            let res = super::resolve_imatrix_input(&tier, None, None).unwrap();
+            let res = super::resolve_imatrix_input(
+                &tier,
+                None,
+                None,
+                &dummy_hf_dir(),
+                crate::quantize::ggml_quants::ArchName::Gemma4,
+            )
+            .unwrap();
             assert!(
                 res.is_none(),
                 "non-I tier {tier:?} should not require imatrix data"
@@ -1735,34 +1798,76 @@ mod tests {
         }
     }
 
-    /// `--imatrix-corpus cdv3` returns the Phase-B-deferred error,
-    /// not a silent no-op. Per ADR-033 §Pi + the no-loop-suppression
-    /// rule, in-tree generation MUST surface as a typed error until
-    /// the forward-pass driver ships.
+    /// **Stage 3c.2 — `--imatrix-corpus cdv3` drives the in-tree
+    /// driver.** With a missing hf_dir the driver fails fast at the
+    /// validate step → `ConvertFailed`. (Stage 3.0 has no end-to-end
+    /// CI test on a real 26B HF model — that's operator-time per
+    /// `compute_imatrix`'s doc.)
     #[test]
-    fn imatrix_corpus_returns_phase_b_deferred() {
+    fn imatrix_corpus_drives_in_tree_and_errors_typed() {
+        let bogus_hf = std::path::PathBuf::from(
+            "/tmp/imatrix-corpus-driver-test-nonexistent",
+        );
         let err = super::resolve_imatrix_input(
             &ApexTier::IBalanced,
             None,
             Some("cdv3"),
+            &bogus_hf,
+            crate::quantize::ggml_quants::ArchName::Gemma4,
         )
         .unwrap_err();
         match err {
             ConvertError::Imatrix(
-                crate::quantize::imatrix::ImatrixError::InTreeGenerationNotYetShipped { corpus },
-            ) => assert_eq!(corpus, "cdv3"),
-            other => panic!("expected InTreeGenerationNotYetShipped, got {other:?}"),
+                crate::quantize::imatrix::ImatrixError::ConvertFailed { detail },
+            ) => {
+                assert!(
+                    detail.contains("does not exist")
+                        || detail.contains("not a directory"),
+                    "detail should describe missing hf_dir, got: {detail}"
+                );
+            }
+            other => panic!("expected ConvertFailed, got {other:?}"),
+        }
+    }
+
+    /// **Stage 3c.2 — `--imatrix-corpus` on an unsupported arch
+    /// surfaces `UnsupportedArchForDriver`** BEFORE attempting any
+    /// convert/load. Stage 3.0 supports Gemma 4 only.
+    #[test]
+    fn imatrix_corpus_unsupported_arch_errors_typed() {
+        let err = super::resolve_imatrix_input(
+            &ApexTier::IBalanced,
+            None,
+            Some("cdv3"),
+            // /tmp always exists so the hf_dir check passes; the
+            // UnsupportedArchForDriver check fires next.
+            &std::path::PathBuf::from("/tmp"),
+            crate::quantize::ggml_quants::ArchName::Qwen35Moe,
+        )
+        .unwrap_err();
+        match err {
+            ConvertError::Imatrix(
+                crate::quantize::imatrix::ImatrixError::UnsupportedArchForDriver {
+                    arch,
+                    ..
+                },
+            ) => {
+                assert_eq!(arch, "qwen3moe");
+            }
+            other => panic!("expected UnsupportedArchForDriver, got {other:?}"),
         }
     }
 
     /// Bad corpus selector → typed `UnknownBakedCorpus` (caught at
-    /// parse time, before the Phase B deferred check).
+    /// parse time, before the in-tree driver runs).
     #[test]
     fn imatrix_corpus_unknown_name_errors_typed() {
         let err = super::resolve_imatrix_input(
             &ApexTier::IBalanced,
             None,
             Some("wikitext-9000"),
+            &dummy_hf_dir(),
+            crate::quantize::ggml_quants::ArchName::Gemma4,
         )
         .unwrap_err();
         match err {
@@ -1782,6 +1887,8 @@ mod tests {
             &ApexTier::IBalanced,
             Some(bogus.as_path()),
             None,
+            &dummy_hf_dir(),
+            crate::quantize::ggml_quants::ArchName::Gemma4,
         )
         .unwrap_err();
         match err {
@@ -1807,6 +1914,8 @@ mod tests {
             &ApexTier::IBalanced,
             Some(tmp.path()),
             None,
+            &dummy_hf_dir(),
+            crate::quantize::ggml_quants::ArchName::Gemma4,
         )
         .unwrap()
         .unwrap();
@@ -1817,6 +1926,8 @@ mod tests {
             &ApexTier::Balanced,
             Some(tmp.path()),
             None,
+            &dummy_hf_dir(),
+            crate::quantize::ggml_quants::ArchName::Gemma4,
         )
         .unwrap()
         .unwrap();
