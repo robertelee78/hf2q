@@ -14,4 +14,9 @@
 //! v1 set (11 files): q2_k, q3_k, q4_0, q4_1, q5_0, q5_1, q4_k, q5_k,
 //! q6_k, q8_0, iq4_nl. Per ADR-033 §P0 amendment A.
 
+pub mod iq4_nl;
+pub mod q4_0;
+pub mod q4_1;
+pub mod q5_0;
+pub mod q5_1;
 pub mod q8_0;
