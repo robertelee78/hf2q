@@ -67,3 +67,4 @@ tests/fixtures/vision/last_e2e_report.json
 
 # ADR-033 P6: temporary byte-cmp output (large quantized GGUFs)
 /tmp/
+models
