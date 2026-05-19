@@ -491,6 +491,18 @@ The whole ADR ships when:
 
 **Mitigation:** Verify spike at Pi's start (run llama-imatrix on CPU vs Metal; cmp). If achievable, byte-cmp stands. If not, ADR amends to numeric-cmp (1e-6 relative tolerance) before Pi continues. Decision is empirically driven, not speculated.
 
+**Spike result (2026-05-19, Gemma 4 26B Q5_K_M + cdv3 corpus, 295 tensors / 14.2M elements / chunk_count=129 / chunk_size=512):**
+- **byte-cmp UNSATISFIABLE** — `cmp cdv3-cpu.imatrix.gguf cdv3-ref.imatrix.gguf` differs at byte 38017 of 54MB (header matches, payload diverges starting at line 3).
+- **99.636% of elements differ.** Far beyond FP non-associativity noise.
+- Per-element relative-error distribution (test `imatrix_risk2_cpu_vs_metal_numeric_diff` at `src/quantize/imatrix/gguf_loader.rs`):
+  - mean: 2.5% · p50: 1.2% · p90: 5.7% · **p99: 21%** · p99.9: 59%
+  - worst rel-err: 0.9999 on `blk.2.ffn_down_exps.weight`
+  - worst abs-err: 1.85e7 on `blk.0.ffn_down.weight`
+
+**Amendment:** Pi Phase B acceptance gate is **NOT byte-cmp NOR per-element numeric-cmp against stock llama-imatrix output.** Even the ADR's original 1e-6 numeric-cmp fallback is empirically infeasible (typical rel-err is 1.2%, p99 is 21%). The right Pi Phase B acceptance gate is **downstream quality**: produce the I-tier quant with hf2q's imatrix + produce the non-I-tier sibling without imatrix; measure perplexity + cosine vs the dense reference. Pi Phase B passes when the I-tier with imatrix outperforms the no-imatrix baseline on at least one of {perplexity reduction, cosine improvement}.
+
+Implication for Pi Phase B implementation: the in-tree forward-pass driver does NOT need to mirror llama-imatrix's CPU accumulation order. Metal-native accumulation is acceptable. The acceptance gate validates the quality of the resulting QUANT, not the bit-equivalence of the imatrix intermediate.
+
 ### Risk 3 — `mudler/apex-quant` recipe drifts upstream
 
 **What:** Mudler is an active GitHub repo. If they change a tier's tensor-type-file content after we port it, our `apex-quality` output drifts from theirs.

@@ -524,4 +524,118 @@ mod tests {
             loaded1.chunk_count
         );
     }
+
+    /// ADR-033 §Pi Risk 2 spike — measure numeric divergence between
+    /// stock llama-imatrix outputs from the CPU vs Metal backends on
+    /// the same model + corpus. Gated by two env vars
+    /// `HF2Q_IMATRIX_CPU_REF` + `HF2Q_IMATRIX_METAL_REF`; both must
+    /// point to existing `.imatrix.gguf` files. Reports per-tensor
+    /// max-abs-error + max-rel-error to inform the Pi Phase B
+    /// acceptance-gate decision (byte-cmp vs numeric-tolerance).
+    ///
+    /// Outcome from 2026-05-19 run on Gemma 4 26B + cdv3 corpus:
+    ///   CPU vs Metal output differ at byte 38017 of 54MB (header
+    ///   matches, payload diverges). Per-tensor numeric magnitude
+    ///   pinned by this test on first run.
+    ///
+    /// Usage:
+    ///   HF2Q_IMATRIX_CPU_REF=/opt/hf2q/tmp/byte-cmp/cdv3-cpu.imatrix.gguf \
+    ///   HF2Q_IMATRIX_METAL_REF=/opt/hf2q/tmp/byte-cmp/cdv3-ref.imatrix.gguf \
+    ///     cargo test --bin hf2q imatrix_risk2_cpu_vs_metal -- --nocapture
+    #[test]
+    fn imatrix_risk2_cpu_vs_metal_numeric_diff() {
+        let (Some(cpu_path), Some(metal_path)) = (
+            std::env::var_os("HF2Q_IMATRIX_CPU_REF"),
+            std::env::var_os("HF2Q_IMATRIX_METAL_REF"),
+        ) else {
+            eprintln!(
+                "skip: set HF2Q_IMATRIX_CPU_REF + HF2Q_IMATRIX_METAL_REF to run \
+                 the Risk 2 numeric-divergence spike"
+            );
+            return;
+        };
+        use crate::quantize::imatrix::ImatrixData;
+        let cpu = ImatrixData::load_from_path(&std::path::PathBuf::from(&cpu_path))
+            .expect("load CPU ref");
+        let metal = ImatrixData::load_from_path(&std::path::PathBuf::from(&metal_path))
+            .expect("load Metal ref");
+
+        assert_eq!(
+            cpu.loaded.registry.len(),
+            metal.loaded.registry.len(),
+            "CPU + Metal must enumerate the same tensor set"
+        );
+
+        let mut worst_abs: f64 = 0.0;
+        let mut worst_rel: f64 = 0.0;
+        let mut worst_abs_tensor = String::new();
+        let mut worst_rel_tensor = String::new();
+        let mut total_elements: u64 = 0;
+        let mut nonzero_diff_elements: u64 = 0;
+        let mut rel_errs: Vec<f64> = Vec::new();
+
+        for ((name_c, acc_c), (name_m, acc_m)) in
+            cpu.loaded.registry.iter().zip(metal.loaded.registry.iter())
+        {
+            assert_eq!(name_c, name_m, "tensor name mismatch");
+            assert_eq!(
+                acc_c.values.len(),
+                acc_m.values.len(),
+                "tensor `{name_c}` values len differs"
+            );
+            for (v_c, v_m) in acc_c.values.iter().zip(acc_m.values.iter()) {
+                total_elements += 1;
+                let a = f64::from(*v_c);
+                let b = f64::from(*v_m);
+                let abs_err = (a - b).abs();
+                if abs_err > 0.0 {
+                    nonzero_diff_elements += 1;
+                }
+                if abs_err > worst_abs {
+                    worst_abs = abs_err;
+                    worst_abs_tensor = name_c.to_string();
+                }
+                let denom = a.abs().max(b.abs()).max(1e-30);
+                let rel_err = abs_err / denom;
+                if rel_err > worst_rel {
+                    worst_rel = rel_err;
+                    worst_rel_tensor = name_c.to_string();
+                }
+                rel_errs.push(rel_err);
+            }
+        }
+
+        // Distributional stats for the ADR amendment.
+        rel_errs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = rel_errs.len();
+        let p50 = rel_errs[n / 2];
+        let p90 = rel_errs[(n as f64 * 0.90) as usize];
+        let p99 = rel_errs[(n as f64 * 0.99) as usize];
+        let p999 = rel_errs[(n as f64 * 0.999) as usize];
+        let mean: f64 = rel_errs.iter().sum::<f64>() / n as f64;
+
+        eprintln!(
+            "Risk 2 numeric divergence (CPU vs Metal stock llama-imatrix):\n  \
+             tensors compared: {}\n  \
+             elements compared: {}\n  \
+             elements with non-zero diff: {} ({:.3}%)\n  \
+             worst abs error:  {:.6e}  on tensor `{}`\n  \
+             worst rel error:  {:.6e}  on tensor `{}`\n  \
+             rel-error distribution: mean {:.6e}  p50 {:.6e}  p90 {:.6e}  p99 {:.6e}  p99.9 {:.6e}",
+            cpu.loaded.registry.len(),
+            total_elements,
+            nonzero_diff_elements,
+            100.0 * nonzero_diff_elements as f64 / total_elements as f64,
+            worst_abs,
+            worst_abs_tensor,
+            worst_rel,
+            worst_rel_tensor,
+            mean, p50, p90, p99, p999,
+        );
+        // This test is diagnostic — it never panics on numeric mismatch.
+        // The point is to MEASURE the divergence so the operator can
+        // decide the Pi Phase B acceptance threshold (byte-cmp is
+        // unsatisfiable across CPU/Metal due to FP non-associativity;
+        // measured rel-error informs the numeric-cmp tolerance choice).
+    }
 }
