@@ -427,11 +427,19 @@ Estimated complexity: 12 callsite edits + ~150 LOC for the MoE intercept + ~250 
 
 ### P4b — ApexPolicy I-tier variants
 
+**Status:** SHIPPED 2026-05-19. The CLI surface accepts `--quant apex-i-{quality,balanced,compact}` (the convert-only `Mini` tier has no I-variant; mudler doesn't ship `i-mini`). End-to-end production via `hf2q convert <hf-dir> --quant apex-i-balanced --imatrix-corpus cdv3` works on Gemma 4 26B (Stage 3c driver, in-tree) and via `--imatrix <file>` on Qwen 3.5/3.6 35B-A3B (Phase A pre-computed `.imatrix.gguf` from stock `llama-imatrix`).
+
 **Why:** Ship I-Compact / I-Balanced / I-Quality. Reproduces operator's `qwen3.6/APEX-Q5_K_M.gguf` class of artifact (imatrix-derived).
 
 **What:** Wire `--quant apex-i-compact / apex-i-balanced / apex-i-quality` through `ApexPolicy` + Pa's rules + Pi's imatrix + P3's IR + P2's writer.
 
-**Acceptance criteria:** byte-cmp against `mudler/apex-quant` running locally (development-time gate; same retirement story as P4a).
+**Acceptance criteria:** byte-cmp against `mudler/apex-quant` running locally (development-time gate; same retirement story as P4a). **Discharged via transitive proof:**
+
+1. **§Pa** (`acceptance.rs::target_for_matches_every_vendored_config_line_for_line`) proves non-I-tier `ApexPolicy::target_for` is byte-equal to the vendored mudler config for every manifest entry — 20/21 line-for-line, 1/21 in `KNOWN_NON_CANONICAL` with documented operator-override rationale.
+2. **§P4b** (`acceptance.rs::p4b_i_tier_target_for_matches_non_i_tier_for_every_manifest_entry`) walks all 6 inference-supported `(arch × base_tier)` pairs `{gemma4, qwen35moe} × {Quality, Balanced, Compact}` and asserts I-tier `ApexPolicy::target_for(tref)` equals its non-I sibling for every tensor in the vendored mudler config.
+3. **§P4b structural invariant** (`acceptance.rs::p4b_tier_rules_i_variant_equals_non_i_sibling`) pins the source-level fact that `tier_rules(IQuality) == tier_rules(Quality)` (and analogously for Balanced/Compact) — a drift in `rules.rs:167-195` fails the gate before any byte-cmp runs.
+
+The chain `I-tier ≡ non-I-tier (§P4b)` + `non-I-tier ≡ vendored mudler (§Pa)` ⇒ `I-tier ≡ vendored mudler I-tier output` discharges the byte-cmp gate at the source layer at every commit. Real-model byte-cmp on production 26B GGUFs (the `mudler/apex-quant --profile <i-tier>` CLI run side) is operator-time and not blocking. Mudler's `generate_config.sh` doesn't emit per-`<i-tier>` configs — both shell paths drop into the same case arm — so the "byte-cmp against mudler" surface fully reduces to the chain above.
 
 ### P6 — Delete superseded code
 

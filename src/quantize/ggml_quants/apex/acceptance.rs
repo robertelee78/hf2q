@@ -307,4 +307,259 @@ mod tests {
         let dot = rest.find('.')?;
         rest[..dot].parse::<usize>().ok()
     }
+
+    /// Pair every imatrix-gated tier with its non-I sibling. Returns
+    /// `None` for tiers that have no I-variant (currently only `Mini`).
+    fn i_sibling(base: ApexTier) -> Option<ApexTier> {
+        match base {
+            ApexTier::Quality => Some(ApexTier::IQuality),
+            ApexTier::Balanced => Some(ApexTier::IBalanced),
+            ApexTier::Compact => Some(ApexTier::ICompact),
+            _ => None,
+        }
+    }
+
+    /// **ADR-033 §P4b structural invariant.**
+    ///
+    /// Mudler treats the I-tier and non-I-tier as identical
+    /// `tier_rules` 7-tuples (verified at `rules.rs:167-195`: each I
+    /// variant shares a single match arm with its non-I sibling). This
+    /// test pins that invariant so a future drift in `rules.rs`
+    /// (e.g., someone splits the match arm to add an I-tier-only
+    /// tweak) fails the gate loudly.
+    ///
+    /// Together with `p4b_i_tier_target_for_matches_non_i_tier_*`
+    /// below, this gives source-level byte-cmp equivalence between
+    /// `--quant apex-i-<tier>` and `--quant apex-<tier>` at the
+    /// per-tensor target_for layer — which combined with §Pa's gate
+    /// (non-I tier ≡ vendored mudler config) transitively proves
+    /// I-tier ≡ vendored mudler config. The byte-cmp end-to-end on
+    /// real models is operator-time but the source-level invariant
+    /// holds at every commit.
+    #[test]
+    fn p4b_tier_rules_i_variant_equals_non_i_sibling() {
+        use super::super::rules::tier_rules;
+        for base in [ApexTier::Quality, ApexTier::Balanced, ApexTier::Compact] {
+            let i = i_sibling(base).expect("non-Mini base tiers have an I sibling");
+            assert_eq!(
+                tier_rules(base),
+                tier_rules(i),
+                "§P4b: tier_rules({base:?}) must structurally equal tier_rules({i:?}) \
+                 — mudler treats the I-prefix as `use imatrix at quantize time`, not a \
+                 different per-tensor type table. If you've intentionally diverged the \
+                 tables, update both ADR-033 §P4b and the comment at rules.rs:167-195 \
+                 at the same commit."
+            );
+        }
+    }
+
+    /// **ADR-033 §P4b end-to-end policy gate.**
+    ///
+    /// For every gemma4/qwen35moe manifest entry whose tier is in
+    /// `{Quality, Balanced, Compact}`, walk every tensor in the
+    /// vendored mudler config and assert
+    /// `ApexPolicy::new_with_imatrix(ITier, ...).target_for(tref)`
+    /// equals
+    /// `ApexPolicy::new(BaseTier, ...).target_for(tref)`.
+    ///
+    /// The acceptance chain:
+    ///   §Pa: non-I-tier `target_for` ≡ vendored mudler config
+    ///        (already proven by `target_for_matches_every_vendored_config_line_for_line`)
+    ///   §P4b: I-tier `target_for` ≡ non-I-tier `target_for`
+    ///        (this test)
+    /// Therefore: I-tier `target_for` ≡ vendored mudler config.
+    ///
+    /// MiniMaxM2 is excluded because v1 routes its I-tier requests to
+    /// `ApexError::ImatrixRequiresInference` (per ADR §"Acceptance
+    /// criteria (overall)" #4 — "MiniMax-M2.7 is convert-only in v1").
+    /// `Mini` is excluded because mudler doesn't ship an `i-mini`
+    /// surface (see `ApexTier::requires_imatrix`).
+    #[test]
+    fn p4b_i_tier_target_for_matches_non_i_tier_for_every_manifest_entry() {
+        let mut divergences: Vec<String> = Vec::new();
+        let mut tested_entries: usize = 0;
+
+        for entry in manifest_entries() {
+            let arch = match ArchName::from_label(&entry.arch) {
+                Some(a) => a,
+                None => continue,
+            };
+            // Per ADR §"Acceptance criteria (overall)" #4: I-tier gate
+            // applies to {gemma4, qwen35moe} only (the inference-supported
+            // subset); MiniMax-M2.7 is convert-only in v1.
+            if !matches!(arch, ArchName::Gemma4 | ArchName::Qwen35Moe) {
+                continue;
+            }
+            let base_tier = match ApexTier::from_cli_name(&entry.tier) {
+                Some(t) if !t.requires_imatrix() => t,
+                _ => continue,
+            };
+            let i_tier = match i_sibling(base_tier) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            let content = match vendor_config_content(&entry.mudler_config_path) {
+                Some(c) => c,
+                None => {
+                    divergences.push(format!(
+                        "vendor config not baked: {}",
+                        entry.mudler_config_path
+                    ));
+                    continue;
+                }
+            };
+            let mudler =
+                match MudlerConfig::parse(content, "tests::acceptance:p4b_vendor_config") {
+                    Ok(m) => m,
+                    Err(e) => {
+                        divergences.push(format!(
+                            "── {family} (tier={tier}) MudlerConfig::parse failed: {e}",
+                            family = entry.model_id_pattern,
+                            tier = entry.tier,
+                        ));
+                        continue;
+                    }
+                };
+
+            let n_hidden = match entry
+                .expected_hparams
+                .get("num_hidden_layers")
+                .and_then(|v| v.as_u64())
+            {
+                Some(n) => n as u32,
+                None => {
+                    divergences.push(format!(
+                        "── {family} (tier={tier}) expected_hparams.num_hidden_layers missing",
+                        family = entry.model_id_pattern,
+                        tier = entry.tier,
+                    ));
+                    continue;
+                }
+            };
+            let n_mtp = entry
+                .expected_hparams
+                .get("mtp_num_hidden_layers")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let n_layers = n_hidden + n_mtp;
+            let n_expert = match entry
+                .expected_hparams
+                .get("num_experts")
+                .and_then(|v| v.as_u64())
+            {
+                Some(n) => n as u32,
+                None => {
+                    divergences.push(format!(
+                        "── {family} (tier={tier}) expected_hparams.num_experts missing",
+                        family = entry.model_id_pattern,
+                        tier = entry.tier,
+                    ));
+                    continue;
+                }
+            };
+
+            let non_i = match ApexPolicy::new(base_tier, arch, n_layers, n_expert) {
+                Ok(p) => p,
+                Err(e) => {
+                    divergences.push(format!(
+                        "── {family} (tier={tier}) non-I ApexPolicy::new failed: {e}",
+                        family = entry.model_id_pattern,
+                        tier = entry.tier,
+                    ));
+                    continue;
+                }
+            };
+            let i = match ApexPolicy::new_with_imatrix(i_tier, arch, n_layers, n_expert) {
+                Ok(p) => p,
+                Err(e) => {
+                    divergences.push(format!(
+                        "── {family} (tier=i-{tier}) I ApexPolicy::new_with_imatrix failed: {e}",
+                        family = entry.model_id_pattern,
+                        tier = entry.tier,
+                    ));
+                    continue;
+                }
+            };
+
+            // Walk every tensor in the vendored config, sorted for
+            // deterministic diagnostic output.
+            let mut keys: Vec<(&String, &super::super::super::ggml_type::GgmlType)> =
+                mudler.map.iter().collect();
+            keys.sort_by(|a, b| a.0.cmp(b.0));
+
+            let mut mismatches: Vec<String> = Vec::new();
+            for (key, _expected) in &keys {
+                let canonical_name = format!("{key}.weight");
+                let layer_index = parse_layer_index(&canonical_name);
+                // See `check_entry_against_config`'s shape-placeholder
+                // note: target_for is shape-blind on apex paths.
+                let shape = [4096usize, 1];
+                let tref = TensorRef {
+                    name: &canonical_name,
+                    shape: &shape,
+                    source_dtype: SourceDtype::BF16,
+                    arch,
+                    layer_index,
+                };
+                let non_i_out = non_i.target_for(&tref);
+                let i_out = i.target_for(&tref);
+                match (non_i_out, i_out) {
+                    (Ok(a), Ok(b)) if a == b => {}
+                    (Ok(a), Ok(b)) => mismatches.push(format!(
+                        "  • {tensor}: non-I = {a}, I = {b}",
+                        tensor = key,
+                        a = a.name(),
+                        b = b.name(),
+                    )),
+                    (Ok(a), Err(e)) => mismatches.push(format!(
+                        "  • {tensor}: non-I = {a}, I raised {e}",
+                        tensor = key,
+                        a = a.name(),
+                    )),
+                    (Err(e), Ok(b)) => mismatches.push(format!(
+                        "  • {tensor}: non-I raised {e}, I = {b}",
+                        tensor = key,
+                        b = b.name(),
+                    )),
+                    (Err(ea), Err(eb)) if format!("{ea}") == format!("{eb}") => {}
+                    (Err(ea), Err(eb)) => mismatches.push(format!(
+                        "  • {tensor}: non-I raised {ea}, I raised {eb}",
+                        tensor = key,
+                    )),
+                }
+            }
+
+            if !mismatches.is_empty() {
+                divergences.push(format!(
+                    "── {family} (base={base}, I={iname}, fp={fp}) ──\n{detail}",
+                    family = entry.model_id_pattern,
+                    base = base_tier.cli_name(),
+                    iname = i_tier.cli_name(),
+                    fp = &entry.fingerprint[..16],
+                    detail = mismatches.join("\n"),
+                ));
+            }
+            tested_entries += 1;
+        }
+
+        assert!(
+            tested_entries > 0,
+            "§P4b gate must exercise at least one (arch, base_tier) pair — \
+             manifest entries are filtered too aggressively or empty"
+        );
+
+        if !divergences.is_empty() {
+            panic!(
+                "§P4b I-tier acceptance gate FAILED — I-tier ApexPolicy diverged from \
+                 its non-I sibling on {n_diverged} entries (tested {tested_entries} \
+                 (arch × base_tier) pairs):\n\n{joined}\n\n\
+                 Per ADR-033 §P4b mudler treats I and non-I as identical type-tables; \
+                 a divergence here means rules.rs drifted from generate_config.sh or \
+                 the I-tier construction path overrode something it shouldn't.",
+                n_diverged = divergences.len(),
+                joined = divergences.join("\n\n"),
+            );
+        }
+    }
 }
