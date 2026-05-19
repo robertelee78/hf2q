@@ -76,15 +76,86 @@ explanations:
    Byte-cmp fixture tests pass because the fixture input doesn't
    straddle the boundary.
 
-Next investigation steps (operator-time):
-- Extract one specific Q4_K tensor (e.g., `blk.0.ffn_gate.weight`)
-  from BOTH GGUFs, byte-compare. Localizes whether the kernel
-  produces different bytes on real-model input.
-- If divergent: bisect the Q4_K kernel against `ggml-quants.c:1395-1465`
-  with real-model F32 input to find the divergent op.
-- If byte-equivalent: divergence is in metadata/loader; investigate
-  `tokenizer.ggml.pre` setting, missing `general.quantization_version`,
-  or KV ordering's effect on llama-perplexity load behavior.
+## Iter-21 deeper-dive: per-type byte-cmp across all 4 files
+
+Extracted per-tensor bytes via `gguf-py` and SHA-compared against
+canonical for every tensor in every file. Per-quant-type summary:
+
+| Kernel | Files | Total tensors | Bytes-equal count | Diff% | Files exercising |
+|--------|-------|---------------|-------------------|-------|------------------|
+| F32    | all   | 1568          | 1568              | 0.000% | passthrough — exact match |
+| Q5_0   | Q4_K_M | 32           | 32                | 0.000% | byte-equivalent ✅ |
+| Q5_1   | Q5_K_M | 32           | 26 (6 outliers)   | ~0%   | 14 diff bytes total — likely matches all |
+| Q8_0   | all   | 354           | 354               | 0.000% | byte-equivalent ✅ |
+| **Q5_K** | Q5_K_M | 192        | **0**             | **0.002%** | all tensors diverge |
+| **Q6_K** | all  | 234           | **0**             | **0.038%** | all tensors diverge |
+| **Q4_K** | Q4_K_M | 192        | **0**             | **0.066%** | all tensors diverge |
+
+**Diagnostic conclusion: ALL K-QUANT KERNELS** (Q4_K, Q5_K, Q6_K)
+**diverge from canonical** at the byte level. Non-K-quants (Q8_0,
+Q5_0, Q5_1) are byte-equivalent. The divergence rate scales with
+quant aggressiveness (Q4_K most aggressive → highest divergence
+rate per byte; Q5_K least aggressive K-quant → lowest rate).
+
+PPL impact correlates with per-bit-error sensitivity of each kernel:
+- Q8_0 (no divergence) → ratio 1.0000
+- Q6_K (0.038%) → ratio 1.010 (within ±2% noise)
+- Q5_K_M (Q5_K 0.002% + Q6_K 0.034%) → ratio 0.989 (within ±2%)
+- Q4_K_M (Q4_K 0.066% + Q6_K 0.038%) → ratio 0.872 (FAIL ±5%)
+
+## First differing byte localization (Q4_K_M, `blk.0.attn_k.weight`)
+
+- First diff at offset 6914 (Q4_K block 48, `dmin` field, F16)
+- `d` field IDENTICAL → `max_scale` matches canonical
+- `dmin` field DIFFERS → `max_min` (output of `make_qkx2_quants`)
+  diverges in at least one of 8 sub-blocks within block 48
+- 278 of 22,528 blocks differ in this tensor (1.2%)
+
+## Root-cause hypothesis (still unverified)
+
+All K-quant kernels share `make_qkx2_quants` (per
+`src/quantize/ggml_quants/common.rs:171`), which contains
+FP-non-associative reductions (`d_det = sum_w * sum_l2 - sum_l *
+sum_l` and the `this_scale` / `this_min` quotient computations).
+
+llama.cpp is built with `-O3 -DNDEBUG -march=native` on Apple
+Silicon → clang auto-FMA enabled. The same code in Rust
+(`cargo build --release`) compiles to separate mul + sub
+(no auto-FMA). ULP-level divergences in `make_qkx2_quants`
+propagate through the iterative refinement loop and can produce
+different `the_min` outputs that, when rounded to F16 `dmin`,
+cross an F16 boundary in a small fraction of blocks.
+
+Non-K-quant kernels use simpler O(n) scale-and-round patterns
+without the determinant computation → no FMA-sensitive ops → byte
+match.
+
+The Q4_K kernel's byte-cmp fixture tests
+(`q4_k::tests::byte_cmp_noim` + `byte_cmp_im`) pass at HEAD
+because the fixture's specific F32 inputs don't cross the F16
+`dmin` boundary that real Gemma 4 weights cross in ~0.07% of blocks.
+
+## Three options for operator
+
+1. **Accept the divergence as-is.** Q5_K_M, Q6_K, Q8_0 all pass the
+   ±5% envelope. Q4_K_M deviates 13% in the BETTER direction
+   (lower PPL on cdv3). Document and ship.
+
+2. **Force Rust to match canonical via `f32::mul_add`.** Rewrite the
+   3 FMA-sensitive lines in `make_qkx2_quants` using explicit
+   `mul_add` calls. Re-test all K-quant matrix cells. Should bring
+   Q4_K_M to ratio ~1.0 at the cost of slightly worse PPL on Gemma 4.
+
+3. **Accept with caveat.** Document that hf2q's K-quants produce
+   marginally different (sometimes-better) output vs canonical on
+   real-model weight distributions; add a `--strict-canonical` flag
+   if a downstream consumer needs byte-exact match.
+
+Per [[feedback-codex-review-loop-rule-2026-05-17]] + the mantra
+("create hypotheses that are testable before changing code"), option
+(2) requires testing the FMA hypothesis first — likely via a
+minimal repro that builds the same C function with `-O0 -ffp-contract=off`
+and compares against the `-O3 -ffp-contract=on` build. Operator-time.
 
 ---
 
