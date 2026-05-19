@@ -10,6 +10,7 @@
 //! their orchestration shell, not with the static quantizer hierarchy.
 
 pub mod dwq_k_quantizer;
+pub mod ggml_quants; // ADR-033 P0 — pure-Rust kernel ports; will replace siblings in P6.
 pub mod k_quant;
 pub mod k_quant_codec;
 pub mod k_quant_codec_quantizer;
