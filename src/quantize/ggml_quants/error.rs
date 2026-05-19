@@ -42,4 +42,8 @@ pub enum QuantizeError {
     /// without advancement.
     #[error("imatrix len {im_len} must equal n_per_row {n_per_row} (per-row weights)")]
     ImatrixLenMismatch { n_per_row: usize, im_len: usize },
+
+    /// Numeric `u32` value didn't decode to a known `LlamaFtype`.
+    #[error("unknown llama_ftype value {0} (not in supported set)")]
+    UnknownLlamaFtype(u32),
 }

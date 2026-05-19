@@ -17,6 +17,7 @@
 pub mod error;
 pub mod ggml_type;
 pub mod iq4_nl;
+pub mod llama_ftype;
 pub mod q2_k;
 pub mod q3_k;
 pub mod q4_0;
@@ -28,8 +29,13 @@ pub mod q5_k;
 pub mod q6_k;
 pub mod q8_0;
 pub mod quantizer;
+pub mod standard_policy;
+pub mod tensor_ref;
 
 // P1 trait surface — per ADR-033 Decision §"Quantizer trait" + §"Per-tensor IR".
 pub use error::QuantizeError;
 pub use ggml_type::GgmlType;
+pub use llama_ftype::LlamaFtype;
 pub use quantizer::{quantizer_for, GgmlQuantizer, Quantizer};
+pub use standard_policy::{tensor_type_fallback, StandardPolicy, TensorCategory};
+pub use tensor_ref::{ArchName, SourceDtype, TensorRef};
