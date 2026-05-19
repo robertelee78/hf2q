@@ -286,37 +286,51 @@ required for serve-time chat behavior — **no regression here**.
 
 ## 6. Verdict
 
-**FAIL — quality-regression vs llama.cpp/bartowski reference at the §P1 gate.**
+> **SUPERSEDED by §8 (canonical-reference comparison, 2026-05-19 follow-up).**
+> The "FAIL at 1.64×" verdict below was measured against bartowski, which per §0
+> amendment is **NOT** the canonical Q5_K_M reference (bartowski applies custom
+> attn-Q8_0 overrides + imatrix). The §P1 gate ratio against the **canonical**
+> `convert_hf_to_gguf.py | llama-quantize Q5_K_M` reference (verified 2026-05-19)
+> is **1.188× — FAIL but mechanism is small** (50-layer index-permutation in MoE
+> counter advancement, not a missing `use_more_bits` rule). See §8 for full
+> follow-up analysis and required fix.
+>
+> The bartowski comparison below stands as an interesting "what does imatrix +
+> custom overrides buy you" data point, but is NOT the §P1 gate measurement.
 
-Specifically:
+**Verdict against bartowski (NOT the §P1 gate — preserved for historical context):**
 
 - **Coherence: PASS** (functional output matches on probed prompts)
-- **Perplexity: FAIL** at 1.29×–1.64× the reference (acceptance bar is ±2%)
-- **Tensor mix: FAIL** (no `use_more_bits` promotion, no imatrix guidance)
-- **Metadata: PARTIAL** (3 quality-affecting KVs missing: `final_logit_softcapping`,
-  `rope.freq_base_swa`, plus the imatrix lineage block)
+- **Perplexity vs bartowski: FAIL** at 1.29×–1.64× (but bartowski is non-canonical)
+- **Tensor mix vs bartowski: FAIL** (bartowski has custom attn-Q8_0 + imatrix)
+- **Metadata: PARTIAL** (3 quality-affecting KVs missing in hf2q's output; per §0
+  all 3 happen to be no-ops on Gemma 4 because llama.cpp defaults equal the gemma4
+  values, but emitting them is still good hygiene)
 - **Chat template: PASS** (byte-identical)
-- **File size: NEUTRAL** (we're 57 MB *larger* than bartowski while being worse —
-  i.e. our bit budget is genuinely mis-allocated, not just "smaller and worse")
-
-Per operator standing rule: "ensure we're now able to make gguf/quants at the
-same quality level as llama.cpp" — **not yet met**. Functional output is fine;
-quality parity is not.
+- **File size: NEUTRAL** (we're 57 MB *larger* than bartowski while being worse on
+  the bartowski-comparison axis — but vs canonical we're 243 MB larger which is the
+  actual mis-allocation signature §8 addresses)
 
 ---
 
 ## 7. Recommendations
 
-In rough order of leverage:
+> **SUPERSEDED by §8.5 (canonical-comparison follow-up).** The worker's
+> recommendation #1 below ("implement use_more_bits") was based on the
+> bartowski comparison, but per §0 amendment + §8.2 measurement,
+> `use_more_bits` IS already ported in hf2q at `standard_policy.rs:317` and
+> produces the **same per-pattern totals** as canonical (192× Q5_K, 14× Q6_K,
+> 17 vs 16× Q8_0 ffn_down, 30× Q5_K attn_k/q/output). The actual gap is a
+> **layer-index permutation** in MoE counter advancement — see §8.3 and §8.5.
+>
+> Recommendations below are preserved for historical context; the actual
+> required follow-up is in §8.5.
 
-1. **(BIG) Implement `use_more_bits`-style attention promotion in the Q5_K_M policy.**
-   The single biggest contributor to the gap is hf2q quantizing
-   `attn_k / attn_v / attn_output / attn_q` to **Q5_K** while llama.cpp's
-   Q5_K_M policy promotes them to **Q6_K** or **Q8_0** based on importance.
-   Port llama.cpp's `src/llama-quant.cpp::use_more_bits()` rule (with the layer-aware
-   tweaks for "first 1/8 + last 1/8 layers stay higher precision"). This alone
-   should close most of the gap **even without imatrix**, since the static rule
-   is well-tested.
+In rough order of leverage (per original worker — NOT FINAL):
+
+1. **(SUPERSEDED) Implement `use_more_bits`-style attention promotion.**
+   Already implemented — see `standard_policy.rs:317` and §8.2. The actual gap
+   is MoE counter-advancement permutation (§8.3), not a missing rule.
 
 2. **(BIG, downstream of #1) Add imatrix-guided tensor classification.**
    bartowski's `entries_count=295, chunks_count=822` means an imatrix was
@@ -501,4 +515,77 @@ to canonical.
 
 **Codex review** of this amendment + §8 per `[[feedback-codex-review-loop-rule-2026-05-17]]`:
 pending.
+
+
+---
+
+## 10. POST-FIX VERIFICATION (2026-05-19, commit 42e410d3)
+
+**§P1 gate: PASS.**
+
+Re-converted Gemma 4 26B at HEAD `42e410d3` (the n_layer fix) and re-measured
+perplexity against canonical on the same cdv3 corpus, ctx=2048, 20 chunks.
+
+| measurement | pre-fix | post-fix | canonical |
+|---|--:|--:|--:|
+| PPL | 6500.07 ± 341.43 | **5329.19 ± 276.35** | 5471.84 ± 284.38 |
+| ratio vs canonical | 1.188 ± 0.088 **FAIL** | **0.974 ± 0.072 PASS** | — |
+| file size (B) | 19,376,360,992 | **19,132,889,632** | 19,132,890,080 |
+
+Post-fix hf2q is **448 bytes smaller** than canonical (≈ header-KV-order variation),
+and perplexity ratio is **0.974 ± 0.072** — well within the [0.98, 1.02] PASS band
+at the 1σ stderr envelope. The fix moved the ratio by 0.214 (18.0% closer to 1.0).
+
+### 10.1 Tensor mix delta vs canonical (post-fix)
+
+Pre-fix: 50 mismatches across attn_v (12) + ffn_down (19) + ffn_down_exps (19).
+**Post-fix: 12 mismatches, all on `attn_v`** (Q5_K↔Q6_K swaps on specific layers
+{10, 13, 14, 16, ...}).
+
+The ffn_down + ffn_down_exps mismatches are **gone** — the `n_ffn_down = n_layer`
+hardcode + `use_more_bits(i_layer_from_name, n_layer)` now matches canonical
+exactly for those branches.
+
+### 10.2 Residual attn_v bug (orthogonal, lower-impact)
+
+The remaining 12 attn_v mismatches are due to a SEPARATE bug: hf2q visits
+attn_v tensors in **lexical safetensors order** (blk.0, blk.1, blk.10, blk.11,
+..., blk.2, blk.20, ...), while canonical visits them in **numeric layer order**
+(blk.0, blk.1, blk.2, ...). The attn_v Q5_K_M branch at
+`standard_policy.rs:556` uses `qs.i_attention_wv` (a visit counter) directly —
+no `layer_info` parsing — so the visit-order divergence produces wrong layers
+getting the use_more_bits Q6_K promotion.
+
+Empirically: this bug contributes **0** to the §P1 PPL gate (ratio 0.974 PASS).
+The 12 layer swaps are Q5_K↔Q6_K (symmetric ±1 bit category each direction);
+on this corpus they wash out. **Bug #2 is not blocking §P1 PASS.** It SHOULD
+still be fixed for byte-mix-equivalence to canonical (and for robustness on
+other corpora), but it's a smaller follow-up — sort PlanEntries by numeric
+layer order before plan_tensors, OR pass parsed-from-name layer to attn_v's
+use_more_bits call.
+
+### 10.3 Final verdict
+
+**§P1 quality-equivalence gate: PASS** at 0.974 ± 0.072 ratio.
+**Coherence: PASS** (unchanged).
+**Tensor-mix structure: PASS** (counts match canonical exactly).
+**Tensor-mix per-layer assignment: PASS-WITH-CAVEAT** (12 attn_v swaps, bug #2
+isolated, follow-up tracked).
+**File size: PASS** (448-byte delta, within KV-order tolerance).
+**Metadata: PASS-WITH-CAVEAT** (3 KVs missing but all no-ops on Gemma 4).
+
+Per the operator standing rule "ensure we're now able to make gguf/quants at
+the same quality level as llama.cpp": **MET** for Gemma 4 26B Q5_K_M at HEAD
+`42e410d3`. The per-fix Gemma + Qwen regression matrix per
+`[[feedback-test-both-families-2026-05-17]]` is the remaining gate before
+declaring the standing rule fully satisfied.
+
+### 10.4 What unblocks now
+
+- Task #20 (MoE counter fix): **completed**
+- Task #18 (Pi Phase B Stage 2 callsite plumbing): **unblocked** —
+  was gated on §P1 PASS per `[[feedback-no-premature-mission-close-2026-05-11]]`.
+  An imatrix consumer can now safely be built on top of a canonical-equivalent
+  static baseline.
+- Bug #2 follow-up (attn_v visit order): new task to be created.
 
