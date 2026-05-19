@@ -194,12 +194,17 @@ pub struct TensorRef<'a> {
 
 `ArchName` is closed enum — adding a new arch is an explicit code change, NOT silent runtime detection.
 
-### Vision tensor pattern (canonical source)
+### Vision / audio tensor patterns (canonical source)
 
-The vision-tensor F16-emit gate is `crate::quantize::layer_mix::is_vision_tensor_pattern(name)`. The function (at `src/quantize/layer_mix.rs:366` HEAD `ebecc21c`) returns `true` iff the name contains any of:
+The vision-tensor F16-emit gate is `crate::quantize::vision::is_vision_tensor_pattern(name)` and its sibling `is_audio_tensor_pattern(name)`. Together they decide whether a tensor is "modality-side" (Pa policy bypassed, F16 emitted directly) or "language-side" (policy decides).
+
+`is_vision_tensor_pattern` returns `true` iff the name contains any of:
 `model.visual.` | `vision_tower.` | `vision_model.` | `vit.` | (prefix) `visual.` | `.visual.`
 
-This is the **only** place that vision-pattern membership is decided. The convert dispatcher checks it BEFORE calling `QuantPolicy::target_for`. P-1 audit confirms whether this function lives or gets moved to `src/quantize/vision.rs` (the current `layer_mix.rs` is on the delete-list); if moved, the new location takes the same name.
+`is_audio_tensor_pattern` (NEW per P-1 audit finding E) returns `true` iff the name contains any of:
+`audio_tower.` | `audio_model.` | `whisper.`
+
+These are the **only** places modality-pattern membership is decided. The convert dispatcher checks `is_vision_tensor_pattern(name) || is_audio_tensor_pattern(name)` BEFORE calling `QuantPolicy::target_for`. The current `layer_mix.rs::is_vision_tensor_pattern` (at `src/quantize/layer_mix.rs:366`, HEAD `85bee70e`) ports verbatim to `src/quantize/vision.rs`; the audio sibling is new code. The three inline duplicate vision checks at `backends/gguf.rs:322-333, 721-724, 905-909` (per P-1 audit) are deleted.
 
 ### QuantPolicy trait (Decision §3 concrete)
 
@@ -241,13 +246,15 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
 **Why:** Today's hf2q-side kernels are scattered across `k_quant.rs` (5541 LOC) and `static_quant.rs` (468 LOC); the per-arch safetensors→F32 mapping for inference lives in `src/inference/models/<arch>/` but ONLY covers `{bert, gemma4, nomic_bert, qwen35, qwen3vl_text}` (verified at HEAD `ebecc21c` via `ls src/inference/models/`). The convert path additionally needs Llama-3-8B (dense decoder test fixture) and MiniMax-M2.7 (3rd MoE for APEX validation), neither of which exists in inference. **Per operator decision 2026-05-18: P0 adds tensor-mapping for these arches in `src/convert/arch/` (a NEW dir; convert-side mapping is independent of inference-side forward-pass code) — inference support for these arches is deferred to a separate effort.**
 
 **What:**
-- Port `ggml-quants.c` quantize-side functions one per file under `src/quantize/ggml_quants/`. v1 set: `{q4_0.rs, q4_1.rs, q5_0.rs, q5_1.rs, q4_k.rs, q5_k.rs, q6_k.rs, q8_0.rs, iq4_nl.rs}` (9 files). Maps 1:1 with `quantize_row_q4_0` / `quantize_row_q4_1` / ... in `/opt/llama.cpp/ggml/src/ggml-quants.c` at the pinned SHA. Pre-existing logic in `k_quant.rs` is either ported into these files (per P-1 classification) or deleted.
+- Port `ggml-quants.c` quantize-side functions one per file under `src/quantize/ggml_quants/`. **v1 set (11 files)**: `{q2_k.rs, q3_k.rs, q4_0.rs, q4_1.rs, q5_0.rs, q5_1.rs, q4_k.rs, q5_k.rs, q6_k.rs, q8_0.rs, iq4_nl.rs}`. Maps 1:1 with `quantize_row_q2_K` / `quantize_row_q3_K` / `quantize_row_q4_0` / ... in `/opt/llama.cpp/ggml/src/ggml-quants.c` at the pinned SHA. (Q2_K + Q3_K added per P-1 audit finding A: their dequant is externally referenced by `src/quality/mod.rs:612` and `src/backends/gguf.rs` size estimator at L1275 / L1458 / L2207 / L2566 / L2819 / L3085; dropping them would break those call sites.) Pre-existing logic in `k_quant.rs` is either ported into these files (per P-1 classification) or deleted.
+- **Imatrix-aware variants are NEW code for the 6 legacy types.** Per P-1 audit finding F, `src/quantize/q_legacy.rs` has zero `*_impl` (imatrix-aware) variants today. llama.cpp's `quantize_row_q4_0_impl` (ggml-quants.c:2008) accepts a `quant_weights` arg and dispatches on null. The new `Quantizer::quantize(src, n_per_row, imatrix: Option<&[f32]>)` requires imatrix-aware code for every legacy type. For `{q4_0, q4_1, q5_0, q5_1, q8_0, iq4_nl}` P0 ships BOTH the no-imatrix path (port of `quantize_row_<T>_ref`) AND the imatrix path (port of `quantize_row_<T>_impl`). The K-family files already had `_imatrix` variants in `k_quant.rs`, so this asymmetry only affects the 6 legacy files.
 - Per-arch convert-side mapping at `src/convert/arch/<arch>.rs` for the full convert matrix: `{gemma4, qwen35moe, qwen3vl, gemma4_mmproj, bert, nomic_bert, llama3, minimax_m2}`. Each is a port of the corresponding `/opt/llama.cpp/conversion/*.py` module, restricted to tensor-name + shape mapping (no inference logic). For arches already in `src/inference/models/`, the convert-side mapper REUSES the inference-side tensor-name conventions; for new arches (`llama3`, `minimax_m2`), it's the only mapping that exists.
 - A single `ArchName::detect(config_json: &Value) -> Result<ArchName>` reads `config.json::model_type` and `config.json::architectures` to dispatch. Failure is typed: `ConvertError::UnsupportedArch { detected: String, supported: Vec<&str> }`.
 - **FP8 source-dtype support (NEW v1 scope per Decision §10):** add `src/convert/source_dtype/fp8.rs` implementing the block-wise `float8_e4m3fn` → F32 dequantize. Reads `quantization_config.weight_block_size` from `config.json` (typically `[128, 128]`); per-tensor, reads block scales stored alongside the FP8 payload (per HF convention: `<tensor>.weight` (FP8) + `<tensor>.weight_scale_inv` (F32 block scales)). Modules listed in `quantization_config.modules_to_not_convert` are read as F32 / BF16 directly. Required by MiniMax-M2.7 which ships in FP8.
 
 **Acceptance criteria:**
-- For every `GgmlType` in v1 scope (the 9-file list): a unit test takes a fixed-seed F32 input vector + fixed `n_per_row` (256 for K-quants, 32 for legacy) and produces output bytes that `cmp` byte-equal against the same input fed to llama.cpp's reference at the pinned SHA. Reference outputs generated once via a small C harness wrapping `ggml_quantize_chunk` and checked into `tests/fixtures/ggml_quants/<type>_<n>.bin`.
+- For every `GgmlType` in v1 scope (the 11-file list): a unit test takes a fixed-seed F32 input vector + fixed `n_per_row` (256 for K-quants, 32 for legacy) and produces output bytes that `cmp` byte-equal against the same input fed to llama.cpp's reference at the pinned SHA. Reference outputs generated once via a small C harness wrapping `ggml_quantize_chunk` and checked into `tests/fixtures/ggml_quants/<type>_<n>.bin`.
+- **The C harness used to generate reference fixtures is built `aarch64-apple-darwin` (NEON enabled) on macOS Apple Silicon** (per P-1 audit finding I; `k_quant.rs` L9-18 module doc flags a NEON-vs-scalar argument-order divergence in `make_qkx2_quants`). The same harness rebuilt `x86_64-pc-linux-gnu` (no NEON) on x86 Linux must produce byte-identical fixtures; if it doesn't, hf2q ports are matched against the NEON variant explicitly and the divergence is documented in `tests/fixtures/ggml_quants/README.md`.
 - For every arch in the convert matrix: a fixture test takes a real safetensors directory (or a tiny synthetic one for arches whose real model is multi-GB), runs hf2q's convert through to F32-tensor-emission only (no quantize), and `cmp`s the resulting F32 byte stream against what `convert_hf_to_gguf.py <hf-dir>` would emit at the pinned llama.cpp SHA. Fixtures stored at `tests/fixtures/convert_arch/<arch>.f32.bin`.
 - Memory bound: peak RSS during convert of a 26B-param model (e.g., gemma4-26B-A4B) is bounded by `2 × model_safetensors_size + 512 MiB` (rough envelope for tensor-by-tensor streaming + working buffers). Validated by a CI memory test that runs convert and asserts `ru_maxrss < bound`.
 
@@ -266,11 +273,18 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
 
 **Why:** The two-pass writer at `backends/gguf.rs:282–1259` is the iter-99 / Bug-B-sequel bug-class home. A seek-back single-pass writer is structurally simpler and eliminates an entire class of "header / payload offset mismatch" bugs.
 
-**What:** New writer in `src/backends/gguf/writer.rs`. Reserves a header region, streams tensor payloads to disk via the `Quantizer` trait, seeks back to fill the header. Single-file output only. Old two-pass writer deleted in P6. GGUF version 3 (matches `const GGUF_VERSION: u32 = 3` at HEAD).
+**What:** New writer in `src/backends/gguf/writer.rs`. Reserves a header region, streams tensor payloads to disk via the `Quantizer` trait, seeks back to fill the header. Single-file output only. Old two-pass writers deleted in P6. GGUF version 3 (matches `const GGUF_VERSION: u32 = 3` at HEAD).
+
+- **`backends/gguf.rs:282-1259` contains TWO complete two-pass writers**, not one (per P-1 audit finding B): `Backend::write` (L282-738) for text GGUF and `write_mmproj_gguf` (L887-1189) for mmproj GGUF. Both must be replaced together; deleting only one leaves the bug-class half-alive in the other. The new writer is parametric on (text | mmproj) via the metadata builder, not two separate writers.
+- **No zero-pad write site exists in the new writer** (per P-1 audit finding C). The four sites at `backends/gguf.rs:639-641, 659-661, 677-679, 1132-1134` (`if current_pos < target_pos { write zeros }`) are the literal iter-99 bug-class targets; the seek-back design has no pass-1 prediction and therefore no need to pad-correct.
+- **F16 demotion logic is moved into `QuantPolicy::target_for`** as typed errors, not buried in the writer (per P-1 audit finding D). The two inline F16 fallback sites at `backends/gguf.rs:496-502` (K-quant row-misalignment → F16) and `:511-521` (block-32 misalignment → F16) are deleted; the policy's `target_for` returns `Err` instead, and the dispatcher routes vision-tensor F16 via `is_vision_tensor_pattern` / `is_audio_tensor_pattern` before calling the policy.
+- **Three inline vision-pattern checks** at `backends/gguf.rs:322-333, 721-724, 905-909` (per P-1 audit finding E) consolidate to `is_vision_tensor_pattern` + the new sibling `is_audio_tensor_pattern` (the text-filter at L322-333 covers `audio_tower` substrings the mmproj-filter doesn't).
 
 **Acceptance criteria:**
 - All P1 byte-cmp gates pass under the new writer.
 - A streaming-property test runs `hf2q convert <hf-dir> --quant q5_k_m -o out.gguf` while monitoring open file descriptors via `lsof` (or platform equivalent). The only output-side file descriptor that is open at any point during convert is `out.gguf` itself; no intermediate `.f16.gguf` or `.tmp.gguf` ever appears in the process's fd table or in the working directory. Test asserts `find . -name '*.gguf' -newer <start_marker>` returns only `out.gguf` after convert exits.
+- **No zero-pad write site** in the new writer: `grep -nE 'write.*(zero|null|0u8\\s*;)' src/backends/gguf/writer.rs` returns no matches (no `write_zeros`-shaped call, no `vec![0u8; n]` write, no `seek_write_pad`). This is structurally enforced — the seek-back design has no pass-1 prediction.
+- **No inline F16 demotion** in the new writer: `grep -nE 'F16|MOSTLY_F16|fallback' src/backends/gguf/writer.rs` returns no matches outside the dispatcher's explicit vision/audio path. Demotion to F16 lives in `QuantPolicy::target_for` as a typed `Err` and in the upstream dispatcher's vision/audio gate, never in the writer.
 - Memory bound carries from P0 (`2 × model_safetensors_size + 512 MiB` peak RSS).
 
 ### P3 — Collapse `TensorQuantInfo` to `QuantizedTensor`
@@ -346,7 +360,18 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
 
 **Why:** The new policy + writer + IR shipped in P1–P4b makes the old subsystems redundant.
 
-**What:** Per P-1's audit, delete: `quantize/k_quant_codec_quantizer.rs`, `quantize/variant_quantizer.rs`, `quantize/dwq_k_quantizer.rs`, `quantize/mixed.rs`, `quantize/static_quant.rs`, `src/calibrate/dwq.rs` (hf2q's homebrew DWQ — operator: "current DWQ is fake DWQ; real DWQ = future Apple MLX `dwq.py` port; reserve `--quant dwq` for that ADR"). Plus the `backends/gguf.rs:282–1259` two-pass-writer slice. Plus whatever P-1 classified as DELETE in the 16,867 LOC.
+**What:** Per P-1's audit, delete:
+- The 5 superseded quantizer impls: `quantize/k_quant_codec_quantizer.rs`, `quantize/variant_quantizer.rs`, `quantize/dwq_k_quantizer.rs`, `quantize/mixed.rs`, `quantize/static_quant.rs` (3,428 LOC; see `docs/adr-033-audit/delete-listed.md`).
+- `src/calibrate/dwq.rs` — hf2q's homebrew DWQ (operator: "current DWQ is fake DWQ; real DWQ = future Apple MLX `dwq.py` port; reserve `--quant dwq` for that ADR").
+- `src/calibrate/apex.rs` — superseded by `ApexPolicy` + Pi imatrix subsystem (per P-1 audit finding H; not in original delete-list, surfaced during external-caller analysis).
+- `src/quantize/k_quant_codec.rs` — pure dispatch shim (1,452 LOC, no kernels; per audit).
+- `src/quantize/mod.rs` — orchestration only (~6,432 LOC delete; trait scaffolding reshaped in-place; per audit).
+- The k_quant.rs test-mod (2,474 LOC) and the q_legacy.rs test-mod (896 LOC); kernel code in those files MOVES to the new `src/quantize/ggml_quants/<type>.rs` (per P0 ports).
+- `backends/gguf.rs:282–1259` two-pass-writer slice AND its mmproj-writer sibling (`write_mmproj_gguf`, L887-1189; per P-1 audit finding B — two writers, not one).
+- The three `backends/gguf.rs` branches at L1334, L2075, L4835 that switch on `METHOD_K_QUANT_CODEC_DIRECT` (per `docs/adr-033-audit/delete-listed.md` note 1; outside the writer slice but tendrils of the same delete chain).
+- Per [[feedback-no-backwards-compat-2026-05-18]]: NO migration shims, NO env-var deprecation aliases, NO `cli::QuantMethod` legacy-name aliases. The 3 retired env vars (`HF2Q_STREAMING_PHASE3`, `HF2Q_STREAMING_PHASE3_MUT`, `HF2Q_USE_LEGACY_DWQ_Q4_0`) are deleted from `parse_env`; callers compile-fail and get fixed at the same commit.
+
+The full per-file disposition lives in `docs/adr-033-audit/{synthesis.md, quantize-mod.md, k-quant.md, k-quant-codec.md, q-legacy.md, layer-mix.md, gguf-writer.md, main-dispatch.md, delete-listed.md}`.
 
 `cargo build --release && cargo test --release` between each delete commit. **Pre-condition: the test suite is green at start-of-P6.** If it's not (today, this is unverified), P-1 includes a "green the suite first" sub-step.
 
@@ -367,11 +392,41 @@ Phases run sequentially. Every phase has a binary acceptance gate; later phases 
 
 ## Audit results
 
-(P-1 populates this section. Empty until P-1 runs.)
+Populated 2026-05-18 by 7 parallel P-1 audit agents. Per-file detail at `docs/adr-033-audit/<name>.md`; full synthesis at `docs/adr-033-audit/synthesis.md`. Findings A–M surfaced during audit are folded into the relevant §Plan / §Decision sections above (e.g., P0's 11-file set, P2's two-writer replacement, vision/audio gate).
 
-| File::Function | LOC | Disposition | Rationale |
-|---|---|---|---|
-| _to be populated_ | | | |
+### Disposition totals
+
+| File / scope | LOC | DELETE LOC | MODIFY LOC | KEEP LOC | Audit file |
+|---|---|---|---|---|---|
+| `src/quantize/mod.rs` | 6,440 | ~6,432 | 8 (trait reshape) | 0 | `docs/adr-033-audit/quantize-mod.md` |
+| `src/quantize/k_quant.rs` | 5,541 | 2,474 (test mod) | 3,067 (5 K-quant files + common helpers) | 0 | `docs/adr-033-audit/k-quant.md` |
+| `src/quantize/k_quant_codec.rs` | 1,452 | 1,452 | 0 | 0 | `docs/adr-033-audit/k-quant-codec.md` |
+| `src/quantize/q_legacy.rs` | 2,130 | 0 (file is mv+split+cfg-rehome) | ~1,801 (6 legacy-quant files) | ~157 (dequant utils + QLegacyError) | `docs/adr-033-audit/q-legacy.md` |
+| `src/quantize/layer_mix.rs` | 1,304 | ~1,107 | ~190 (standard_policy.rs) | 8 (vision.rs) | `docs/adr-033-audit/layer-mix.md` |
+| **5-file subtotal** | **16,867** | **~11,465** | **~5,066** | **~165** | — |
+| `src/backends/gguf.rs:282-1259` writer slice (text + mmproj writers) | ~977 | ~480 (9 regions; 4 zero-pad sites; size predictor; inline F16) | ~295 (8 regions; seek-back writer) | ~286 (KV-pair enc, tensor-name canon) | `docs/adr-033-audit/gguf-writer.md` |
+| `src/main.rs` dispatch arms (L1043-3453) | ~3,445 | ~1,473 (17 regions; 5 dispatch arms + 3 DWQ subcmds + 11 stale CLI variants) | ~395 (6 regions; cli::QuantMethod rewrite, cmd_convert single-arm collapse) | ~1,577 (CLI bootstrap, serve, unrelated subcmds) | `docs/adr-033-audit/main-dispatch.md` |
+| 5 ADR delete-listed files (`dwq_k_quantizer`, `k_quant_codec_quantizer`, `mixed`, `static_quant`, `variant_quantizer`) | 3,428 | 3,428 | 0 | 0 | `docs/adr-033-audit/delete-listed.md` |
+
+**Grand totals: DELETE ~16,846 LOC | MODIFY ~5,756 LOC (kernel ports + policy port + writer rewrite + CLI reshape) | KEEP ~2,028 LOC (CLI bootstrap, quality-test utils, dequant round-trip helpers, KV-pair encoding).**
+
+### Audit-driven amendments folded into the Plan
+
+| # | Finding | ADR section amended |
+|---|---|---|
+| A | P0 v1 set is 11 files (added Q2_K + Q3_K) | §P0 "What" |
+| B | gguf.rs has TWO two-pass writers (text + mmproj) | §P2 "What" |
+| C | 4 zero-pad fallback sites at gguf.rs:639/659/677/1132 deleted under seek-back | §P2 "What" / "Acceptance criteria" |
+| D | 2 inline F16 fallback sites (gguf.rs:496-502, :511-521) → typed errors in policy | §P2 "What" / "Acceptance criteria" |
+| E | New `is_audio_tensor_pattern` sibling to vision gate; consolidate 3 inline gguf.rs duplicates | §"Vision / audio tensor patterns" |
+| F | q_legacy gets imatrix-aware variants ADDED in P0 (none exist today) | §P0 "What" |
+| G | StandardPolicy::target_for is COMPLETE port of llama_tensor_get_type_impl (no deferred branches) | §P1 "What" |
+| H | `src/calibrate/apex.rs` added to P6 delete list (ADR orphan) | §P6 "What" |
+| I | NEON-order caveat for C harness fixture generation | §P0 "Acceptance criteria" |
+| K | `cli::QuantMethod` rewritten to Decision §6's surface (17 variants → ~20 new) | §P1 / §P6 "What" |
+| M | 3 retired env vars deleted (no migration code) | §P6 "What" (and [[feedback-no-backwards-compat-2026-05-18]]) |
+
+J (the `#[from]` edge on QLegacyError) and L (vision-gate move) are implementation details captured in `docs/adr-033-audit/synthesis.md` without separate ADR amendments.
 
 ## Acceptance criteria (overall)
 
