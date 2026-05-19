@@ -349,7 +349,12 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertV2Error> {
     if let Some(mt) = model_type {
         match mt {
             "llama" => return Ok(ArchName::Llama3),
-            "gemma3" | "gemma" => return Ok(ArchName::Gemma4),
+            // gemma3 (Gemma 3 architecture) + gemma4 / gemma4_text (Gemma 4
+            // release strings — operator's google-gemma-4-26b-a4b-it has
+            // model_type="gemma4" with nested text_config.model_type=
+            // "gemma4_text"). Surfaced 2026-05-18 by real-model convert
+            // smoke test against /opt/hf2q/models/google-gemma-4-26b-a4b-it.
+            "gemma3" | "gemma" | "gemma4" | "gemma4_text" => return Ok(ArchName::Gemma4),
             "bert" => return Ok(ArchName::Bert),
             "nomic_bert" => return Ok(ArchName::NomicBert),
             // qwen3_moe (canonical) + qwen3_5_moe_text and qwen3_6_moe_text
@@ -369,7 +374,16 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertV2Error> {
             // Both Gemma3*ForCausalLM and Gemma3ForConditionalGeneration
             // are produced by HF for the same gemma-3 family; we accept
             // the prefix.
-            s if s.starts_with("Gemma3") || s.starts_with("Gemma2") || s == "GemmaForCausalLM" => {
+            // Gemma3*/Gemma2*/GemmaForCausalLM + Gemma4*ForConditionalGeneration
+            // / Gemma4ForCausalLM. The operator's gemma-4-26b release uses
+            // "Gemma4ForConditionalGeneration" (multimodal config wrapping
+            // the text decoder). Prefix-match covers both -ForCausalLM and
+            // -ForConditionalGeneration suffixes.
+            s if s.starts_with("Gemma3")
+                || s.starts_with("Gemma2")
+                || s.starts_with("Gemma4")
+                || s == "GemmaForCausalLM" =>
+            {
                 return Ok(ArchName::Gemma4);
             }
             "BertForMaskedLM" | "BertModel" => return Ok(ArchName::Bert),
@@ -877,6 +891,28 @@ mod tests {
             detect_arch(&json!({ "model_type": "gemma" })).unwrap(),
             ArchName::Gemma4
         );
+    }
+
+    /// Real Gemma 4 release strings: model_type="gemma4" / "gemma4_text",
+    /// architectures=["Gemma4ForConditionalGeneration"]. Surfaced 2026-05-18
+    /// by real-model convert smoke test against
+    /// /opt/hf2q/models/google-gemma-4-26b-a4b-it.
+    #[test]
+    fn detect_arch_gemma4_release_variants_real_model_2026_05_18() {
+        for mt in ["gemma4", "gemma4_text"] {
+            assert_eq!(
+                detect_arch(&json!({ "model_type": mt })).unwrap(),
+                ArchName::Gemma4,
+                "model_type={mt} should resolve to Gemma4"
+            );
+        }
+        for cls in ["Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"] {
+            assert_eq!(
+                detect_arch(&json!({ "architectures": [cls] })).unwrap(),
+                ArchName::Gemma4,
+                "architectures=[{cls}] should resolve to Gemma4"
+            );
+        }
     }
 
     /// model_type=qwen3_moe → ArchName::Qwen35Moe.
