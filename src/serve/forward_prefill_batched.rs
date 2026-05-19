@@ -2658,6 +2658,37 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("batched gate_up_id (affine) L{layer_idx}: {e}"))?;
                     let _ = ggml_type_gu;
                 } else {
+                    // ADR-033 §Pi Phase B Stage 3b — MoE intercept for
+                    // `ffn_gate_up_exps`. Captures the shared per-token
+                    // input row + per-token routed expert IDs. Fires
+                    // `seq_len * top_k` times into the collector when
+                    // a Phase B driver is installed; no-op otherwise.
+                    crate::quantize::imatrix::intercept_qmatmul_id_with_hint(
+                        crate::quantize::imatrix::ImatrixHint::Layered {
+                            tag: "ffn_gate_up_exps",
+                            layer: layer_idx,
+                        },
+                        seq_len,
+                        top_k,
+                        hs,
+                        || {
+                            if let Err(e) = s.encoder_mut().commit_and_wait() {
+                                eprintln!(
+                                    "[hf2q imatrix moe intercept] commit_and_wait failed: {e}"
+                                );
+                                return None;
+                            }
+                            pf_moe_norm_out
+                                .as_slice::<f32>()
+                                .ok()
+                                .map(|sl| sl.to_vec())
+                        },
+                        || pf_expert_ids.as_slice::<u32>().ok().map(|sl| sl.to_vec()),
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("imatrix moe intercept (gate_up) L{layer_idx}: {e}")
+                    })?;
+
                     s.quantized_matmul_id_ggml_pooled(
                         reg, dev,
                         &pf_moe_norm_out,
@@ -2743,6 +2774,34 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("batched down_id (affine) L{layer_idx}: {e}"))?;
                     let _ = ggml_type_dn;
                 } else {
+                    // ADR-033 §Pi Phase B Stage 3b — MoE intercept for
+                    // `ffn_down_exps`. Captures the post-SwiGLU input
+                    // row + per-row routed expert ID (top_k=1 since
+                    // each post-swiglu row already corresponds to ONE
+                    // (token, expert) pair).
+                    crate::quantize::imatrix::intercept_qmatmul_id_with_hint(
+                        crate::quantize::imatrix::ImatrixHint::Layered {
+                            tag: "ffn_down_exps",
+                            layer: layer_idx,
+                        },
+                        seq_len * top_k,
+                        1,
+                        moe_int,
+                        || {
+                            if let Err(e) = s.encoder_mut().commit_and_wait() {
+                                eprintln!(
+                                    "[hf2q imatrix moe intercept] commit_and_wait failed: {e}"
+                                );
+                                return None;
+                            }
+                            pf_moe_swiglu.as_slice::<f32>().ok().map(|sl| sl.to_vec())
+                        },
+                        || pf_expert_ids.as_slice::<u32>().ok().map(|sl| sl.to_vec()),
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("imatrix moe intercept (down) L{layer_idx}: {e}")
+                    })?;
+
                     s.quantized_matmul_id_ggml_pooled(
                         reg, dev,
                         &pf_moe_swiglu,
