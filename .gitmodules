@@ -1,0 +1,3 @@
+[submodule "vendor/apex-quant"]
+	path = vendor/apex-quant
+	url = https://github.com/mudler/apex-quant.git
