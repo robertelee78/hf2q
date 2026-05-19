@@ -9677,23 +9677,30 @@ pub fn dispatch_qmatmul(
     // Per ADR-033 §Risk 2 amendment (2026-05-19): Metal-native
     // accumulation is acceptable; we read the input buffer post-sync on
     // this same Metal-backed GraphSession instead of re-running on CPU.
-    crate::quantize::imatrix::intercept_qmatmul_with_hint(imatrix_hint, || {
-        // Materialize the input row. We must drain any pending GPU
-        // work that wrote to `input` before reading it on the host.
-        // `commit_and_wait` is a hard sync — only acceptable because
-        // this closure is gated on collector-present.
-        if let Err(e) = session.encoder_mut().commit_and_wait() {
-            eprintln!("[hf2q imatrix intercept] commit_and_wait failed: {e}");
-            return None;
-        }
-        match input.as_slice::<f32>() {
-            Ok(slice) => Some(slice.to_vec()),
-            Err(e) => {
-                eprintln!("[hf2q imatrix intercept] input.as_slice::<f32>() failed: {e}");
-                None
+    crate::quantize::imatrix::intercept_qmatmul_with_hint(
+        imatrix_hint,
+        m as usize,
+        weight.info.cols,
+        || {
+            // Materialize the input buffer. We must drain any pending GPU
+            // work that wrote to `input` before reading it on the host.
+            // `commit_and_wait` is a hard sync — only acceptable because
+            // this closure is gated on collector-present.
+            if let Err(e) = session.encoder_mut().commit_and_wait() {
+                eprintln!("[hf2q imatrix intercept] commit_and_wait failed: {e}");
+                return None;
             }
-        }
-    });
+            match input.as_slice::<f32>() {
+                Ok(slice) => Some(slice.to_vec()),
+                Err(e) => {
+                    eprintln!(
+                        "[hf2q imatrix intercept] input.as_slice::<f32>() failed: {e}"
+                    );
+                    None
+                }
+            }
+        },
+    );
 
     // ADR-029 iter-40 H40 — annotate the next-captured dispatch with this
     // call's exact reads/writes so the graph_opt reorder pass (graph.rs

@@ -68,13 +68,18 @@ use crate::quantize::ggml_quants::ArchName;
 /// `ffn_down_exps.weight`), the same input row is read by ALL routed
 /// experts in one dispatch — canonical llama-imatrix accumulates
 /// **per-input-row** sum-of-squares, which is invariant under which
-/// expert reads it. So one [`Self::record`] call per fused-MoE
-/// dispatch is correct.
+/// expert reads it. So `record` fires once per token row for those
+/// dispatches just like for ordinary dense tensors; the per-expert
+/// counts come from the routing decision the collector observes
+/// separately (or are derived from the dense routing weights).
 pub trait ImatrixCollector {
-    /// Called by `dispatch_qmatmul` BEFORE the matmul. `tensor_name`
-    /// is the canonical GGUF tensor name being multiplied against;
-    /// `input_row` is the per-token F32 activation row. For multi-token
-    /// prefill batches the caller invokes this once per token row.
+    /// Called by `intercept_qmatmul_with_hint` BEFORE the matmul.
+    /// `tensor_name` is the canonical GGUF tensor name being
+    /// multiplied against; `input_row` is exactly ONE token's F32
+    /// activation row, length `n_per_row`. The intercept site is
+    /// responsible for slicing the m-row prefill buffer into
+    /// per-token rows before invoking this — implementations can
+    /// assume every call delivers exactly one row.
     fn record(&mut self, tensor_name: &str, input_row: &[f32]);
 }
 
@@ -151,17 +156,38 @@ where
 /// installed (the production-default fast path).
 ///
 /// `hint` carries the canonical GGUF tensor name (or `None` to skip
-/// this dispatch). `materialize_row` is a closure that produces the
-/// F32 input row when invoked — kept opaque so the intercept site
-/// decides the sync strategy (`commit_and_wait + as_slice`, or a no-op
-/// for already-host data). The closure is NOT called when collection
-/// is disabled.
+/// this dispatch). `m` is the number of token rows in the input buffer
+/// (i.e. the M dimension of the matmul; decode m=1, prefill m=seq_len).
+/// `n_per_row` is the per-row activation width (K dimension of the
+/// matmul; equal to `weight.info.cols`). `materialize_buffer` is a
+/// closure that produces the FULL F32 input as a single `Vec<f32>` of
+/// length `m * n_per_row` when invoked — kept opaque so the intercept
+/// site decides the sync strategy (`commit_and_wait + as_slice`, or a
+/// no-op for already-host data). The closure is NOT called when
+/// collection is disabled.
+///
+/// Per-row dispatch: the intercept slices the materialized buffer into
+/// `m` contiguous chunks of `n_per_row` and calls
+/// [`ImatrixCollector::record`] once per token row. This matches the
+/// canonical llama-imatrix semantics at
+/// `/opt/llama.cpp/tools/imatrix/imatrix.cpp:380-393` where the
+/// per-row sum-of-squares accumulator advances `counts[mat_id] += 1`
+/// per absorbed row — NOT once per dispatch.
+///
+/// If the materialized buffer length doesn't equal `m * n_per_row` the
+/// intercept emits a diagnostic to stderr and skips this dispatch
+/// (no panic — losing imatrix data for one dispatch is a recoverable
+/// situation; crashing the forward pass mid-corpus is not).
 ///
 /// Fast path overhead: one `RefCell::borrow().is_none()` check (one
 /// load + branch). Per [[feedback-no-loop-suppression-2026-05-17]] this
 /// is a one-branch addition, not a runtime-degradation path.
-pub fn intercept_qmatmul_with_hint<F>(hint: ImatrixHint<'_>, materialize_row: F)
-where
+pub fn intercept_qmatmul_with_hint<F>(
+    hint: ImatrixHint<'_>,
+    m: usize,
+    n_per_row: usize,
+    materialize_buffer: F,
+) where
     F: FnOnce() -> Option<Vec<f32>>,
 {
     // Fast path: if no collector installed, return immediately.
@@ -181,11 +207,35 @@ where
             Some(c) => c,
             None => return,
         };
-        let row = match materialize_row() {
+        let buf = match materialize_buffer() {
             Some(r) => r,
             None => return,
         };
-        collector.record(&name, &row);
+        // Defense-in-depth: the dispatch_qmatmul caller knows `m` and
+        // `weight.info.cols`, so this assertion catches a wiring bug
+        // (wrong arg) before it corrupts the imatrix.
+        let expected = m.saturating_mul(n_per_row);
+        if buf.len() != expected {
+            eprintln!(
+                "[hf2q imatrix intercept] buffer/shape mismatch for {name}: \
+                 got {} f32 values, expected m*n_per_row = {}*{} = {}; skipping dispatch",
+                buf.len(),
+                m,
+                n_per_row,
+                expected,
+            );
+            return;
+        }
+        if n_per_row == 0 || m == 0 {
+            // Defensive: no rows to record. The intercept never crashes
+            // the forward pass; the caller has already paid the sync
+            // cost so just return.
+            return;
+        }
+        // imatrix.cpp:380-393 — accumulate per token row.
+        for row in buf.chunks_exact(n_per_row) {
+            collector.record(&name, row);
+        }
     });
 }
 
@@ -247,6 +297,8 @@ mod tests {
         let mut materialized = false;
         intercept_qmatmul_with_hint(
             ImatrixHint::Layered { tag: "attn_q", layer: 0 },
+            /* m */ 1,
+            /* n_per_row */ 2,
             || {
                 materialized = true;
                 Some(vec![1.0, 2.0])
@@ -264,16 +316,22 @@ mod tests {
         with_collector(collector, || {
             assert!(is_active());
             let mut materialized = false;
-            intercept_qmatmul_with_hint(ImatrixHint::None, || {
-                materialized = true;
-                Some(vec![1.0])
-            });
+            intercept_qmatmul_with_hint(
+                ImatrixHint::None,
+                /* m */ 1,
+                /* n_per_row */ 1,
+                || {
+                    materialized = true;
+                    Some(vec![1.0])
+                },
+            );
             assert!(!materialized, "None hint → closure should not fire");
         });
     }
 
-    /// `Layered` hint + installed collector → record() fires with the
-    /// formatted canonical GGUF name.
+    /// `Layered` hint + installed collector + m=1 → record() fires
+    /// exactly once with the formatted canonical GGUF name and the
+    /// full single-row slice.
     #[test]
     fn intercept_fires_with_collector_and_layered_hint() {
         use std::sync::Mutex;
@@ -290,6 +348,8 @@ mod tests {
         with_collector(StaticCollector, || {
             intercept_qmatmul_with_hint(
                 ImatrixHint::Layered { tag: "attn_q", layer: 0 },
+                /* m */ 1,
+                /* n_per_row */ 3,
                 || Some(vec![1.0, 2.0, 3.0]),
             );
         });
@@ -298,6 +358,67 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].0, "blk.0.attn_q.weight");
         assert_eq!(records[0].1, vec![1.0, 2.0, 3.0]);
+    }
+
+    /// Multi-token prefill (m > 1) → record() fires once per token row
+    /// with the per-row slice of length n_per_row. Mirrors canonical
+    /// llama-imatrix per-row accumulation (imatrix.cpp:380-393).
+    #[test]
+    fn intercept_chunks_multi_token_prefill_into_per_row_records() {
+        use std::sync::Mutex;
+        static RECORDS: Mutex<Vec<(String, Vec<f32>)>> = Mutex::new(Vec::new());
+
+        struct StaticCollector;
+        impl ImatrixCollector for StaticCollector {
+            fn record(&mut self, name: &str, row: &[f32]) {
+                RECORDS.lock().unwrap().push((name.to_string(), row.to_vec()));
+            }
+        }
+
+        RECORDS.lock().unwrap().clear();
+        with_collector(StaticCollector, || {
+            // m=3 tokens × n_per_row=2 = 6-wide buffer.
+            intercept_qmatmul_with_hint(
+                ImatrixHint::Layered { tag: "ffn_gate", layer: 5 },
+                /* m */ 3,
+                /* n_per_row */ 2,
+                || Some(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            );
+        });
+
+        let records = RECORDS.lock().unwrap();
+        assert_eq!(records.len(), 3, "one record per token row");
+        assert!(records.iter().all(|r| r.0 == "blk.5.ffn_gate.weight"));
+        assert_eq!(records[0].1, vec![1.0, 2.0]);
+        assert_eq!(records[1].1, vec![3.0, 4.0]);
+        assert_eq!(records[2].1, vec![5.0, 6.0]);
+    }
+
+    /// Buffer/shape mismatch is a typed-style skip (eprintln + no
+    /// records emitted). Crashing the forward pass mid-corpus would
+    /// lose all imatrix data; the closure is allowed to fail.
+    #[test]
+    fn intercept_skips_on_buffer_shape_mismatch() {
+        use std::sync::Mutex;
+        static RECORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+        struct C;
+        impl ImatrixCollector for C {
+            fn record(&mut self, name: &str, _row: &[f32]) {
+                RECORDS.lock().unwrap().push(name.to_string());
+            }
+        }
+
+        RECORDS.lock().unwrap().clear();
+        with_collector(C, || {
+            intercept_qmatmul_with_hint(
+                ImatrixHint::Layered { tag: "attn_q", layer: 0 },
+                /* m */ 2,
+                /* n_per_row */ 4, // expects 8 floats
+                || Some(vec![1.0; 5]), // returns 5 — mismatch
+            );
+        });
+        assert!(RECORDS.lock().unwrap().is_empty(), "no records on shape mismatch");
     }
 
     /// `Global` hint records under the verbatim name (no formatting).
@@ -315,9 +436,12 @@ mod tests {
 
         RECORDS.lock().unwrap().clear();
         with_collector(C, || {
-            intercept_qmatmul_with_hint(ImatrixHint::Global("token_embd.weight"), || {
-                Some(vec![0.0; 4])
-            });
+            intercept_qmatmul_with_hint(
+                ImatrixHint::Global("token_embd.weight"),
+                /* m */ 1,
+                /* n_per_row */ 4,
+                || Some(vec![0.0; 4]),
+            );
         });
         let r = RECORDS.lock().unwrap();
         assert_eq!(r.len(), 1);
