@@ -255,37 +255,41 @@ impl ConvertOrchestrator {
         }
 
         // -----------------------------------------------------------------
-        // Pre-pass: count attn_v / ffn_down / ffn_gate / ffn_up tensors
-        // so QsState has the n_* counters populated before target_for is
-        // called per-tensor. Mirrors llama.cpp's count-pass at
-        // `llama-quant.cpp:llama_model_quantize_impl` immediately before
-        // the per-tensor loop (`llama-quant.cpp:1010-1054`).
+        // Pre-pass: count attn_v tensors and hardcode n_ffn_{down,gate,up}
+        // to hparams.n_layer.
+        //
+        // Mirrors `init_quantize_state_counters` at
+        // `/opt/llama.cpp/src/llama-quant.cpp:837-852`:
+        //   - attn_v counter is INCREMENTED per visited attn_v-like tensor
+        //   - ffn_{down,gate,up} counters are HARDCODED to `n_layer`
+        //
+        // The hardcode matters for MoE arches where both `<L>.ffn_down.weight`
+        // AND `<L>.ffn_down_exps.weight` classify as `TensorCategory::FfnDown`.
+        // Counting tensors would double the denominator (e.g., 60 instead of
+        // 30 for a Gemma 4 26B MoE with 30 layers), causing `use_more_bits`
+        // to land on the wrong layer indices — measured 1.188× perplexity
+        // regression vs canonical on Gemma 4 26B Q5_K_M (see
+        // `docs/adr-033-real-model-findings/2026-05-19-quality-equivalence-gemma4-26b.md`
+        // §8 for the diagnosis trace).
         //
         // The counters do NOT count vision/audio tensors — those skip
         // the policy entirely and don't increment any `i_*` counter.
         // -----------------------------------------------------------------
         let mut n_attention_wv: i32 = 0;
-        let mut n_ffn_down: i32 = 0;
-        let mut n_ffn_gate: i32 = 0;
-        let mut n_ffn_up: i32 = 0;
         for e in &entries {
             if is_vision_tensor_pattern(&e.name) || is_audio_tensor_pattern(&e.name) {
                 continue;
             }
-            match TensorCategory::classify(&e.name) {
-                cat if cat.is_attn_v() => n_attention_wv += 1,
-                TensorCategory::FfnDown => n_ffn_down += 1,
-                TensorCategory::FfnGate => n_ffn_gate += 1,
-                TensorCategory::FfnUp => n_ffn_up += 1,
-                _ => {}
+            if TensorCategory::classify(&e.name).is_attn_v() {
+                n_attention_wv += 1;
             }
         }
 
         let mut qs = QsState::new(self.ftype, self.arch, LlmType::Other, self.hparams);
         qs.n_attention_wv = n_attention_wv;
-        qs.n_ffn_down = n_ffn_down;
-        qs.n_ffn_gate = n_ffn_gate;
-        qs.n_ffn_up = n_ffn_up;
+        qs.n_ffn_down = self.hparams.n_layer as i32;
+        qs.n_ffn_gate = self.hparams.n_layer as i32;
+        qs.n_ffn_up = self.hparams.n_layer as i32;
 
         let policy = StandardPolicy::new();
 
@@ -667,6 +671,7 @@ mod tests {
             n_expert: 0,
             n_head: 32,
             n_head_kv: 8,
+            n_layer: 32,
         }
     }
 
@@ -1017,6 +1022,107 @@ mod tests {
         assert_eq!(gguf.tensor_count(), 1);
         let t = gguf.tensor_info("blk.0.attn_q.weight").unwrap();
         assert_eq!(t.ggml_type as u32, 5);
+    }
+
+    /// Regression test for ADR-033 §P1 quality-equivalence gate failure
+    /// (2026-05-19, findings doc §8). Pre-fix, the pre-pass counted every
+    /// tensor classified as `FfnDown` toward `n_ffn_down`, which for a MoE
+    /// architecture inflates the denominator threefold (per layer:
+    /// `<L>.ffn_down.weight` + `<L>.ffn_down_exps.weight` +
+    /// `<L>.ffn_down_exps.scale` — all match the substring "ffn_down").
+    ///
+    /// Canonical's `init_quantize_state_counters`
+    /// (`/opt/llama.cpp/src/llama-quant.cpp:837-852`) hardcodes
+    /// `n_ffn_down = n_ffn_gate = n_ffn_up = hparams.n_layer` precisely
+    /// to side-step this. Post-fix, hf2q does the same: the denominator
+    /// must equal `n_layer` regardless of how many tensors classify
+    /// as FfnDown.
+    ///
+    /// Construct a 30-layer 128-expert MoE entry list with the three
+    /// per-layer FfnDown-matching tensors and assert that the resulting
+    /// `use_more_bits` boundary lands on the canonical layer set
+    /// {0,1,2,5,8,11,14,17,20,23,26,27,28,29} (14 layers TRUE for n=30),
+    /// not the broken {0..10, 13, 16, 19, 22, 25, 28} (17 layers TRUE
+    /// for the inflated n=90 case).
+    #[test]
+    fn moe_ffn_down_use_more_bits_uses_n_layer_not_counted_tensors() {
+        const N_LAYER: u32 = 30;
+        let hparams = HParams {
+            n_expert: 128,
+            n_head: 8,
+            n_head_kv: 1,
+            n_layer: N_LAYER,
+        };
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ5_K_M,
+            ArchName::Gemma4,
+            hparams,
+        );
+        orch.add_metadata(
+            "general.architecture".to_string(),
+            MetaValue::String("gemma4".into()),
+        );
+
+        // Build entries that mirror Gemma 4's per-layer FfnDown matches.
+        // Use n_per_row=256 to avoid shape_fallback (Q5_K block_size=256),
+        // so the type we get out is the raw `target_for` decision — no
+        // legacy-quant downshift to confuse the assertion.
+        let n_per_row = 256usize;
+        let shape = vec![n_per_row, 64];
+        let mut entries: Vec<PlanEntry> = Vec::new();
+        for li in 0..N_LAYER as usize {
+            // The .scale tensor is the silent extra match — it triples
+            // the pre-pass count if the fix is reverted.
+            entries.push(PlanEntry {
+                name: format!("blk.{li}.ffn_down.weight"),
+                shape: shape.clone(),
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(li),
+            });
+            entries.push(PlanEntry {
+                name: format!("blk.{li}.ffn_down_exps.scale"),
+                shape: vec![128usize, 1],
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(li),
+            });
+            entries.push(PlanEntry {
+                name: format!("blk.{li}.ffn_down_exps.weight"),
+                shape: shape.clone(),
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(li),
+            });
+        }
+        orch.plan_tensors(entries).expect("plan");
+
+        // Canonical use_more_bits(i, 30) TRUE-set for the Q5_K_M Q6_K
+        // promotion on ffn_down. See
+        // `docs/adr-033-real-model-findings/2026-05-19-quality-equivalence-gemma4-26b.md`
+        // §8.2 for the bartowski/canonical agreement on this set.
+        let canonical_promoted: std::collections::HashSet<usize> = [
+            0, 1, 2, 5, 8, 11, 14, 17, 20, 23, 26, 27, 28, 29,
+        ].into_iter().collect();
+
+        // Walk planned tensors and assert: for each blk.<i>.ffn_down.weight
+        // the picked type is Q6_K iff i ∈ canonical_promoted.
+        let mut q6k_layers: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for pt in orch.planned.iter() {
+            if pt.name.ends_with(".ffn_down.weight") && pt.name.starts_with("blk.") {
+                let layer: usize = pt.name
+                    .strip_prefix("blk.")
+                    .and_then(|s| s.split('.').next())
+                    .and_then(|s| s.parse().ok())
+                    .expect("layer parse");
+                if matches!(pt.ggml_type, crate::quantize::ggml_quants::GgmlType::Q6_K) {
+                    q6k_layers.insert(layer);
+                }
+            }
+        }
+
+        assert_eq!(
+            q6k_layers, canonical_promoted,
+            "ffn_down Q6_K promotion must match canonical use_more_bits(i, n_layer=30); \
+             pre-fix bug had n_ffn_down=90 and would produce 17 layers including {{3,4,6,7,9,10,13,16,19,22,25}}."
+        );
     }
 
     #[test]

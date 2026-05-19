@@ -723,11 +723,18 @@ fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertError> {
         .and_then(|v| v.as_u64())
         .map(|x| x as u32)
         .unwrap_or(0);
+    let n_layer = config
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .ok_or(ConvertError::MissingHparam {
+            key: "num_hidden_layers",
+        })? as u32;
 
     Ok(HParams {
         n_expert,
         n_head,
         n_head_kv,
+        n_layer,
     })
 }
 
@@ -1572,22 +1579,44 @@ mod tests {
     /// HParams: num_key_value_heads defaults to num_attention_heads.
     #[test]
     fn build_hparams_defaults_kv_heads_to_head_count() {
-        let cfg = json!({ "num_attention_heads": 8 });
+        let cfg = json!({ "num_attention_heads": 8, "num_hidden_layers": 16 });
         let hp = build_hparams(&cfg).unwrap();
         assert_eq!(hp.n_head, 8);
         assert_eq!(hp.n_head_kv, 8);
         assert_eq!(hp.n_expert, 0);
+        assert_eq!(hp.n_layer, 16);
     }
 
     /// HParams: num_experts (Qwen3MoE) and num_local_experts (MiniMax)
     /// both populate n_expert.
     #[test]
     fn build_hparams_picks_up_moe_expert_count() {
-        let cfg_qwen = json!({ "num_attention_heads": 32, "num_experts": 128 });
-        let cfg_minimax =
-            json!({ "num_attention_heads": 32, "num_local_experts": 32 });
+        let cfg_qwen = json!({
+            "num_attention_heads": 32,
+            "num_experts": 128,
+            "num_hidden_layers": 30,
+        });
+        let cfg_minimax = json!({
+            "num_attention_heads": 32,
+            "num_local_experts": 32,
+            "num_hidden_layers": 40,
+        });
         assert_eq!(build_hparams(&cfg_qwen).unwrap().n_expert, 128);
         assert_eq!(build_hparams(&cfg_minimax).unwrap().n_expert, 32);
+        assert_eq!(build_hparams(&cfg_qwen).unwrap().n_layer, 30);
+    }
+
+    /// HParams missing num_hidden_layers → typed error (per the canonical
+    /// `init_quantize_state_counters` dependency on `hparams.n_layer`).
+    #[test]
+    fn build_hparams_missing_n_layer_errors() {
+        let cfg = json!({ "num_attention_heads": 8 });
+        match build_hparams(&cfg).expect_err("must error") {
+            ConvertError::MissingHparam { key } => {
+                assert_eq!(key, "num_hidden_layers");
+            }
+            other => panic!("expected MissingHparam, got {other:?}"),
+        }
     }
 
     /// HParams missing num_attention_heads → typed error.

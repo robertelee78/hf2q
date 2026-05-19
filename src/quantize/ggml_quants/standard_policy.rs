@@ -204,6 +204,14 @@ pub struct HParams {
     pub n_head: u32,
     /// `qs.model.hparams.n_head_kv(il=0)` — number of KV heads.
     pub n_head_kv: u32,
+    /// `qs.model.hparams.n_layer` — number of transformer layers. This is the
+    /// canonical denominator for `use_more_bits` on ffn_down/gate/up per
+    /// `llama-quant.cpp:850` (`init_quantize_state_counters` hardcodes
+    /// `n_ffn_down = n_ffn_gate = n_ffn_up = hparams.n_layer`). Critical for
+    /// MoE architectures where both `<L>.ffn_down.weight` AND
+    /// `<L>.ffn_down_exps.weight` classify as `FfnDown` — counting tensors
+    /// double-counts the denominator.
+    pub n_layer: u32,
 }
 
 impl HParams {
@@ -778,6 +786,7 @@ mod tests {
             n_expert: 0,
             n_head: 32,
             n_head_kv: 8,
+            n_layer: 32,
         };
         QsState::new(ftype, arch, LlmType::Other, hparams)
     }

@@ -289,6 +289,7 @@ mod tests {
                 n_expert: 0,
                 n_head,
                 n_head_kv,
+                n_layer: 2,
             },
         );
 
