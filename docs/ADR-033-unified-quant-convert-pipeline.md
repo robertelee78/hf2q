@@ -1,6 +1,6 @@
 # ADR-033: Unified Convert/Quant Pipeline — Port llama.cpp + Real APEX, Single Source-of-Truth IR, Incremental Writer
 
-- **Status**: proposed (rewrite of 2026-05-17 draft `ebecc21c` per operator review 2026-05-18)
+- **Status**: SHIPPED 2026-05-19 — P-1..P6 Phase 1 + tokenizer + streaming + F32-keep + real-model validation all on main. Real Gemma 4 26B convert: 48GB safetensors → 18GB Q5_K_M GGUF in 8m 22s, loads in stock llama.cpp + decodes coherent reasoning at 111.5 t/s gen. Remaining: Pi (imatrix for I-tier APEX), §9 (per-model fingerprint manifest), Phase 2/3 retirement (operator decisions on B1/B2/B4)
 - **Date**: 2026-05-18
 - **Deciders**: operator (robert@loveathome.us); claude (interview + draft)
 - **Tags**: convert, quantize, architecture, byte-parity, public-release, apex, mudler, imatrix
