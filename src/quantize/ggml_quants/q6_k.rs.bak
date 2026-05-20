@@ -368,3 +368,21 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod gemma_blk14_diag {
+    use super::*;
+    use crate::quantize::ggml_quants::common::make_qx_quants;
+
+    #[test]
+    #[ignore]
+    fn qwen_blk14_sub6_makeqx_dump() {
+        let bytes = std::fs::read("/tmp/c_quant_repro/qwen_blk14_sub6_f32.bin").unwrap();
+        let x: Vec<f32> = bytes.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut l = [0i8; 16];
+        let scale = make_qx_quants(16, 32, &x, &mut l, 1, &[]);
+        println!("hf2q make_qx_quants scale = {:.20} (bits 0x{:08x})", scale, scale.to_bits());
+        println!("Expected canonical scale = 0.001212988281622529 (bits 0x3a9efd22)");
+    }
+}

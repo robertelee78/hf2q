@@ -120,8 +120,8 @@ pub fn make_qx_quants(
         // (scale[12]=194 vs 195) verified via 12-variant C reproducer
         // matrix at /tmp/c_quant_repro/variants_search.c — canonical lib
         // and `-ffp-contract=off` both produce 195; `=on` produces 194.
-        sumlx += w * x[i] * li as f32;
-        suml2 += w * (li as f32) * (li as f32);
+        sumlx = (w * x[i]).mul_add(li as f32, sumlx);
+        suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
     }
     let mut scale = if suml2 != 0.0 { sumlx / suml2 } else { 0.0 };
     if return_early {
@@ -153,8 +153,8 @@ pub fn make_qx_quants(
             } else {
                 x[i].abs().sqrt()
             };
-            sumlx += w * x[i] * li as f32;
-            suml2 += w * (li as f32) * (li as f32);
+            sumlx = (w * x[i]).mul_add(li as f32, sumlx);
+            suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
         }
         if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
             for i in 0..n {
@@ -482,8 +482,8 @@ pub fn make_qp_quants(
         l[i] = li as u8;
         let w = quant_weights[i];
         // 2026-05-20: plain matches canonical fp-contract=off (same as make_qx_quants).
-        sumlx += w * x[i] * li as f32;
-        suml2 += w * (li as f32) * (li as f32);
+        sumlx = (w * x[i]).mul_add(li as f32, sumlx);
+        suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
     }
     for _itry in 0..5 {
         let mut n_changed = 0;
