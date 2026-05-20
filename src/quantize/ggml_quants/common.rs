@@ -233,9 +233,9 @@ pub fn make_qkx2_quants(
         let li_c = li.max(0).min(nmax) as u8;
         l[i] = li_c;
         // 2026-05-20: plain *+ matches canonical (neutral per bisection).
-        let mut diff = scale * li_c as f32 + min - x[i];
+        let mut diff = scale.mul_add(li_c as f32, min) - x[i];
         diff = if use_mad { diff.abs() } else { diff * diff };
-        best_error += weights[i] * diff;
+        best_error = weights[i].mul_add(diff, best_error);
     }
     if nstep < 1 {
         *the_min = -min;
@@ -271,9 +271,9 @@ pub fn make_qkx2_quants(
             }
             let mut cur_error = 0.0f32;
             for i in 0..n {
-                let mut diff = this_scale * l_aux[i] as f32 + this_min - x[i];
+                let mut diff = this_scale.mul_add(l_aux[i] as f32, this_min) - x[i];
                 diff = if use_mad { diff.abs() } else { diff * diff };
-                cur_error += weights[i] * diff;
+                cur_error = weights[i].mul_add(diff, cur_error);
             }
             if cur_error < best_error {
                 for i in 0..n {
