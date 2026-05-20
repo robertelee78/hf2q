@@ -690,6 +690,78 @@ fn convert_q4_k_m_tiny_qwen35moe_round_trip() {
     );
 }
 
+/// CLI-subprocess sibling to `convert_q4_k_m_tiny_qwen35moe_round_trip`
+/// — exercises the Q5_K rayon dispatch path via `--quant q5_k_m`.
+/// Same fixture (HIDDEN=256 → exactly one block per row), different
+/// quant flag. Asserts ≥1 tensor lands on positional Q5_K (5).
+#[test]
+fn convert_q5_k_m_tiny_qwen35moe_round_trip() {
+    let model_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_qwen35moe_for_apex(model_dir.path());
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .arg("convert")
+        .arg(model_dir.path())
+        .arg("--quant")
+        .arg("q5_k_m")
+        .arg("-o")
+        .arg(out.path())
+        .assert()
+        .success();
+
+    let gguf = mlx_native::gguf::GgufFile::open(out.path()).expect("parse output GGUF");
+
+    assert_eq!(gguf.tensor_count(), 16, "expected 16 tensors");
+    assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen3moe"));
+
+    // file_type = MostlyQ5_K_M = 17.
+    assert_eq!(
+        gguf.metadata_u32("general.file_type"),
+        Some(17),
+        "Q5_K_M LlamaFtype is MostlyQ5_K_M = 17"
+    );
+
+    let expected_names: &[&str] = &[
+        "token_embd.weight",
+        "output.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+        "blk.0.attn_output.weight",
+        "blk.0.ffn_gate_exps.weight",
+        "blk.0.ffn_up_exps.weight",
+        "blk.0.ffn_down_exps.weight",
+        "blk.1.attn_q.weight",
+        "blk.1.attn_k.weight",
+        "blk.1.attn_v.weight",
+        "blk.1.attn_output.weight",
+        "blk.1.ffn_gate_exps.weight",
+        "blk.1.ffn_up_exps.weight",
+        "blk.1.ffn_down_exps.weight",
+    ];
+
+    // Assert ≥1 tensor at positional Q5_K (5) — proves Q5_K rayon
+    // dispatch ran through CLI subprocess.
+    let mut saw_q5k = false;
+    for name in expected_names {
+        let info = gguf
+            .tensor_info(name)
+            .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
+        if info.ggml_type as u32 == 5 {
+            saw_q5k = true;
+        }
+        assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
+    }
+    assert!(
+        saw_q5k,
+        "expected at least one tensor at Q5_K (positional 5) — \
+         Q5_K rayon path did not execute through CLI subprocess. \
+         (Q5_K_M routes some tensors to Q5_K via StandardPolicy.)"
+    );
+}
+
 // ----------------------------------------------------------------------------
 // Gemma 4 real-arch round-trip
 // ----------------------------------------------------------------------------
