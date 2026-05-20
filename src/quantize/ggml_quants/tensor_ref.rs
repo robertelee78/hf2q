@@ -41,8 +41,21 @@ pub enum ArchName {
     Gemma4,
     /// Google Gemma 4 multimodal projector (mmproj sidecar).
     Gemma4Mmproj,
-    /// Qwen 3.5/3.6 MoE-A3B family (qwen3moe upstream).
+    /// Qwen 3.5/3.6 MoE-A3B family — older dense-MoE variant (gguf
+    /// upstream label `qwen3moe`, no linear-attention, no MTP heads,
+    /// no shared experts). Used for HF arches like `Qwen3MoeForCausalLM`.
+    /// See [`ArchName::Qwen35MoeFull`] for the newer Qwen 3.5
+    /// multimodal/MTP variant.
     Qwen35Moe,
+    /// Qwen 3.5 MoE-A3B with linear-attention + MTP heads (gguf
+    /// upstream label `qwen35moe`, gguf-py `MODEL_ARCH.QWEN35MOE`).
+    /// Handles `Qwen3_5MoeForConditionalGeneration` (multimodal-wrapping
+    /// `model.language_model.*` + `model.visual.*`) and
+    /// `Qwen3_5MoeForCausalLM` (text-only). Canonical handler:
+    /// `/opt/llama.cpp/conversion/qwen.py:626-628 Qwen3_5MoeTextModel`
+    /// (inherits `_Qwen35MtpMixin`, `_Qwen35MRopeMixin`,
+    /// `_LinearAttentionVReorderBase`).
+    Qwen35MoeFull,
     /// Qwen3-VL text-side decoder.
     Qwen3VlText,
     /// BERT family (BAAI bge-large-en, etc.).
@@ -68,6 +81,7 @@ impl ArchName {
             ArchName::Gemma4 => "gemma4",
             ArchName::Gemma4Mmproj => "gemma4_mmproj",
             ArchName::Qwen35Moe => "qwen3moe",
+            ArchName::Qwen35MoeFull => "qwen35moe",
             ArchName::Qwen3VlText => "qwen3vl",
             ArchName::Bert => "bert",
             ArchName::NomicBert => "nomic-bert",
@@ -99,7 +113,10 @@ impl ArchName {
             //     series for fingerprint-routing purposes).
             // Both are explicit code-level entries per the "no
             // implicit aliasing / migration" rule.
-            "qwen3moe" | "qwen35moe" => Some(ArchName::Qwen35Moe),
+            // "qwen3moe" — older dense-MoE upstream label
+            "qwen3moe" => Some(ArchName::Qwen35Moe),
+            // "qwen35moe" — newer linear-attn + MTP variant
+            "qwen35moe" => Some(ArchName::Qwen35MoeFull),
             "qwen3vl" => Some(ArchName::Qwen3VlText),
             "bert" => Some(ArchName::Bert),
             "nomic-bert" => Some(ArchName::NomicBert),

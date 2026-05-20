@@ -398,8 +398,15 @@ mod tests {
             };
             // Per ADR §"Acceptance criteria (overall)" #4: I-tier gate
             // applies to {gemma4, qwen35moe} only (the inference-supported
-            // subset); MiniMax-M2.7 is convert-only in v1.
-            if !matches!(arch, ArchName::Gemma4 | ArchName::Qwen35Moe) {
+            // subset); MiniMax-M2.7 is convert-only in v1. Includes both
+            // ArchName::Qwen35Moe (older qwen3moe label) and
+            // ArchName::Qwen35MoeFull (newer qwen35moe label) — the
+            // manifest's `arch` field uses the canonical "qwen35moe"
+            // label which from_label resolves to Qwen35MoeFull.
+            if !matches!(
+                arch,
+                ArchName::Gemma4 | ArchName::Qwen35Moe | ArchName::Qwen35MoeFull
+            ) {
                 continue;
             }
             let base_tier = match ApexTier::from_cli_name(&entry.tier) {

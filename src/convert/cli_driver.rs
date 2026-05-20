@@ -32,8 +32,10 @@ use std::path::PathBuf;
 
 use crate::backends::gguf::types::MetaValue;
 use crate::convert::arch::bake::BakeOp;
+use crate::convert::arch::qwen35moe_full::Qwen35MoeFullCtx;
 use crate::convert::arch::{
-    bake, bert, gemma4, gemma4_mmproj, llama3, minimax_m2, nomic_bert, qwen35moe, qwen3vl_text,
+    bake, bert, gemma4, gemma4_mmproj, llama3, minimax_m2, nomic_bert, qwen35moe, qwen35moe_full,
+    qwen3vl_text,
 };
 use crate::convert::arch::gemma4::MappedTensor as Gemma4Mapped;
 use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped};
@@ -218,7 +220,7 @@ impl std::fmt::Display for ConvertError {
                 write!(
                     f,
                     "convert: unsupported architecture `{arch_name}` \
-                     (supported: llama, gemma3, bert, nomic_bert, qwen3_moe, \
+                     (supported: llama, gemma3, bert, nomic_bert, qwen3_moe, qwen3_5_moe, \
                      qwen3_vl, minimax_m2)"
                 )
             }
@@ -685,9 +687,19 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
             "gemma3" | "gemma" | "gemma4" | "gemma4_text" => return Ok(ArchName::Gemma4),
             "bert" => return Ok(ArchName::Bert),
             "nomic_bert" => return Ok(ArchName::NomicBert),
-            // qwen3_moe (canonical) + qwen3_5_moe_text and qwen3_6_moe_text
-            // variants operator's models use (per codex 3b478164 review).
-            "qwen3_moe" | "qwen3_5_moe_text" | "qwen3_6_moe_text" => return Ok(ArchName::Qwen35Moe),
+            // qwen3_moe (canonical Qwen 3.6 dense MoE). The Qwen 3.5/3.6
+            // linear-attention + MTP variants route to Qwen35MoeFull
+            // (the qwen35moe canonical arch) below.
+            "qwen3_moe" => return Ok(ArchName::Qwen35Moe),
+            // Qwen 3.5/3.6 with linear-attention + MTP. Top-level
+            // `qwen3_5_moe` is the multimodal-VLM
+            // `Qwen3_5MoeForConditionalGeneration` config (operator's
+            // /opt/hf2q/models/Qwen-Qwen3.5-35B-A3B has this at config.json:6).
+            // The `_text` variants are the nested text_config.model_type
+            // that text-only `Qwen3_5MoeForCausalLM` checkpoints expose.
+            "qwen3_5_moe" | "qwen3_6_moe" | "qwen3_5_moe_text" | "qwen3_6_moe_text" => {
+                return Ok(ArchName::Qwen35MoeFull)
+            }
             "qwen3_vl" | "qwen3_vl_moe" | "qwen3_vl_text" => return Ok(ArchName::Qwen3VlText),
             "minimax_m2" => return Ok(ArchName::MiniMaxM2),
             _ => {}
@@ -716,11 +728,19 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
             }
             "BertForMaskedLM" | "BertModel" => return Ok(ArchName::Bert),
             "NomicBertModel" => return Ok(ArchName::NomicBert),
-            // Qwen3MoeForCausalLM (canonical) + Qwen3_5MoeForCausalLM /
-            // Qwen3_6MoeForCausalLM operator-released variants (per codex
-            // 3b478164 review).
-            "Qwen3MoeForCausalLM" | "Qwen3_5MoeForCausalLM" | "Qwen3_6MoeForCausalLM" => {
-                return Ok(ArchName::Qwen35Moe);
+            // Qwen3MoeForCausalLM (canonical) — older dense MoE.
+            "Qwen3MoeForCausalLM" => return Ok(ArchName::Qwen35Moe),
+            // Qwen 3.5/3.6 with linear-attention + MTP. Includes both
+            // text-only ForCausalLM and multimodal-VLM
+            // ForConditionalGeneration releases (the latter is the
+            // operator's locally-downloaded
+            // /opt/hf2q/models/Qwen-Qwen3.5-35B-A3B variant — config
+            // has architectures=["Qwen3_5MoeForConditionalGeneration"]).
+            "Qwen3_5MoeForCausalLM"
+            | "Qwen3_6MoeForCausalLM"
+            | "Qwen3_5MoeForConditionalGeneration"
+            | "Qwen3_6MoeForConditionalGeneration" => {
+                return Ok(ArchName::Qwen35MoeFull);
             }
             "Qwen3VLForConditionalGeneration"
             | "Qwen3VLMoeForConditionalGeneration"
@@ -865,6 +885,13 @@ fn build_metadata_for_arch(
         ArchName::Bert => bert::build_metadata(config, ftype),
         ArchName::NomicBert => nomic_bert::build_metadata(config, ftype),
         ArchName::Qwen35Moe => qwen35moe::build_metadata(config, ftype),
+        ArchName::Qwen35MoeFull => {
+            let mut kvs = qwen35moe::build_metadata(config, ftype);
+            if let Some(ctx) = build_qwen35moe_full_ctx(config) {
+                kvs.extend(qwen35moe_full::build_metadata(&ctx, config));
+            }
+            kvs
+        }
         ArchName::Qwen3VlText => qwen3vl_text::build_metadata(config, ftype),
         ArchName::MiniMaxM2 => minimax_m2::build_metadata(config, ftype),
         // Falcon is a placeholder in ArchName for target_for's branch
@@ -928,7 +955,13 @@ pub struct SplitOutput {
     pub bake: BakeOp,
 }
 
-fn map_tensor(arch: ArchName, hf_name: &str) -> MapOutcome {
+fn map_tensor(
+    arch: ArchName,
+    hf_name: &str,
+    hf_shape: &[usize],
+    qwen35moe_full_ctx: Option<&Qwen35MoeFullCtx>,
+) -> MapOutcome {
+    let _ = hf_shape;
     match arch {
         ArchName::Llama3 => match llama3::map_tensor_name(hf_name) {
             Some(s) => MapOutcome::Direct(s),
@@ -952,9 +985,77 @@ fn map_tensor(arch: ArchName, hf_name: &str) -> MapOutcome {
             None => MapOutcome::Unmapped,
         },
         ArchName::Qwen35Moe => lift_qwen_mapped(qwen35moe::map_tensor_name(hf_name)),
+        ArchName::Qwen35MoeFull => match qwen35moe_full_ctx {
+            Some(ctx) => lift_qwen35moe_full_mapped(qwen35moe_full::map_tensor_name(
+                hf_name, hf_shape, ctx,
+            )),
+            None => MapOutcome::Unmapped,
+        },
         ArchName::MiniMaxM2 => lift_minimax_mapped(minimax_m2::map_tensor_name(hf_name)),
         ArchName::Falcon => MapOutcome::Unmapped,
     }
+}
+
+/// Adapt the Qwen 3.5 MoE-full mapper's `MappedTensor` shape (Direct /
+/// DirectWithBake / SplitInto / Drop) to the driver-level
+/// [`MapOutcome`].
+fn lift_qwen35moe_full_mapped(m: Option<qwen35moe_full::MappedTensor>) -> MapOutcome {
+    match m {
+        Some(qwen35moe_full::MappedTensor::Direct(s)) => MapOutcome::Direct(s),
+        Some(qwen35moe_full::MappedTensor::DirectWithBake { gguf_name, bake }) => {
+            MapOutcome::DirectWithBake { gguf_name, bake }
+        }
+        Some(qwen35moe_full::MappedTensor::SplitInto(outputs)) => MapOutcome::SplitInto(outputs),
+        Some(qwen35moe_full::MappedTensor::Drop) => MapOutcome::Drop,
+        None => MapOutcome::Unmapped,
+    }
+}
+
+/// Build a [`Qwen35MoeFullCtx`] from the HF `config.json` for arches
+/// dispatched to [`qwen35moe_full::map_tensor_name`]. Returns `None`
+/// if any required hparam is missing — that surfaces as
+/// `MapOutcome::Unmapped` for every tensor, producing a typed
+/// `UnmappedTensor` error per the no-fallback rule.
+///
+/// Reads from the effective text-config (top-level OR nested
+/// `text_config` for multimodal-wrapping `ConditionalGeneration`
+/// variants). Detects multimodal wrapping from
+/// `architectures` containing `ForConditionalGeneration`.
+fn build_qwen35moe_full_ctx(config: &serde_json::Value) -> Option<Qwen35MoeFullCtx> {
+    let text = effective_config(config);
+    let num_hidden_layers = text.get("num_hidden_layers")?.as_u64()? as usize;
+    let num_experts = text
+        .get("num_experts")
+        .or_else(|| text.get("num_local_experts"))?
+        .as_u64()? as usize;
+    let moe_intermediate_size = text.get("moe_intermediate_size")?.as_u64()? as usize;
+    let hidden_size = text.get("hidden_size")?.as_u64()? as usize;
+    let linear_num_key_heads = text.get("linear_num_key_heads")?.as_u64()? as usize;
+    let linear_num_value_heads = text.get("linear_num_value_heads")?.as_u64()? as usize;
+    let linear_key_head_dim = text.get("linear_key_head_dim")?.as_u64()? as usize;
+    let linear_value_head_dim = text.get("linear_value_head_dim")?.as_u64()? as usize;
+
+    let multimodal_wrapping = config
+        .get("architectures")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str())
+                .any(|s| s.ends_with("ForConditionalGeneration"))
+        })
+        .unwrap_or(false);
+
+    Some(Qwen35MoeFullCtx {
+        num_hidden_layers,
+        num_experts,
+        moe_intermediate_size,
+        hidden_size,
+        linear_num_key_heads,
+        linear_num_value_heads,
+        linear_key_head_dim,
+        linear_value_head_dim,
+        multimodal_wrapping,
+    })
 }
 
 /// Adapt the Gemma 4 mapper's `MappedTensor` shape (`Direct` /
@@ -1258,11 +1359,22 @@ fn build_convert_plan(
         .and_then(|v| v.as_u64())
         .map(|x| x as usize);
 
+    // Build per-arch context (e.g. Qwen 3.5 MoE-full needs hparams
+    // for V-head reorder, MTP layer shift, expert split). For arches
+    // that don't need a ctx this is None; for arches that DO need
+    // one but the config is missing required fields it's also None
+    // and every tensor surfaces as UnmappedTensor — per the
+    // no-fallback rule.
+    let qwen35moe_full_ctx: Option<Qwen35MoeFullCtx> = match arch {
+        ArchName::Qwen35MoeFull => build_qwen35moe_full_ctx(&src.config),
+        _ => None,
+    };
+
     let mut direct_steps: Vec<PlanStep> = Vec::new();
     let mut moe_accum: HashMap<(usize, ExpertKindKey), MoePlanGroup> = HashMap::new();
 
     for meta in src.tensor_metas() {
-        match map_tensor(arch, &meta.name) {
+        match map_tensor(arch, &meta.name, &meta.shape, qwen35moe_full_ctx.as_ref()) {
             MapOutcome::Direct(gguf_name) => {
                 let gguf_shape: Vec<usize> = meta.shape.iter().rev().copied().collect();
                 let layer_index = gguf_name
@@ -1443,7 +1555,7 @@ fn build_convert_plan(
     // GGUF layout matches byte-for-byte.
     let mut synth_steps: Vec<PlanStep> = Vec::new();
     for (synth_idx, t) in synthesized.iter().enumerate() {
-        match map_tensor(arch, &t.name) {
+        match map_tensor(arch, &t.name, &t.shape, qwen35moe_full_ctx.as_ref()) {
             MapOutcome::Direct(gguf_name) => {
                 let gguf_shape: Vec<usize> = t.shape.iter().rev().copied().collect();
                 let layer_index = gguf_name
@@ -1631,20 +1743,45 @@ mod tests {
     /// ArchName::Qwen35Moe.
     #[test]
     fn detect_arch_qwen35moe_release_variants_codex_3b478164() {
-        for mt in ["qwen3_5_moe_text", "qwen3_6_moe_text"] {
+        // Qwen 3.5/3.6 variants with linear-attn + MTP now route to
+        // ArchName::Qwen35MoeFull (the qwen35moe canonical arch) per
+        // the new handler at src/convert/arch/qwen35moe_full.rs.
+        // The older qwen3_moe canonical (no linear-attn, no MTP)
+        // remains on ArchName::Qwen35Moe.
+        for mt in [
+            "qwen3_5_moe",
+            "qwen3_6_moe",
+            "qwen3_5_moe_text",
+            "qwen3_6_moe_text",
+        ] {
             assert_eq!(
                 detect_arch(&json!({ "model_type": mt })).unwrap(),
-                ArchName::Qwen35Moe,
-                "model_type={mt} should resolve to Qwen35Moe"
+                ArchName::Qwen35MoeFull,
+                "model_type={mt} should resolve to Qwen35MoeFull"
             );
         }
-        for cls in ["Qwen3_5MoeForCausalLM", "Qwen3_6MoeForCausalLM"] {
+        for cls in [
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_6MoeForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_6MoeForConditionalGeneration",
+        ] {
             assert_eq!(
                 detect_arch(&json!({ "architectures": [cls] })).unwrap(),
-                ArchName::Qwen35Moe,
-                "architectures=[{cls}] should resolve to Qwen35Moe"
+                ArchName::Qwen35MoeFull,
+                "architectures=[{cls}] should resolve to Qwen35MoeFull"
             );
         }
+        // Older Qwen 3.6 dense MoE (no linear-attn, no MTP) keeps
+        // routing to ArchName::Qwen35Moe.
+        assert_eq!(
+            detect_arch(&json!({ "model_type": "qwen3_moe" })).unwrap(),
+            ArchName::Qwen35Moe
+        );
+        assert_eq!(
+            detect_arch(&json!({ "architectures": ["Qwen3MoeForCausalLM"] })).unwrap(),
+            ArchName::Qwen35Moe
+        );
     }
 
     /// All three qwen3_vl flavors land on Qwen3VlText.

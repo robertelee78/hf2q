@@ -73,7 +73,13 @@ pub enum MoeTensorRole {
 }
 
 /// v1 Apex supported arch CLI names. Used in error messages.
-pub const SUPPORTED_APEX_ARCHES: &[&str] = &["qwen3moe", "gemma4", "minimax-m2"];
+/// Both `qwen3moe` (older dense MoE) and `qwen35moe` (newer
+/// linear-attn + MTP variant) use the same APEX policy because the
+/// per-tensor classification (FFN gate/up/down, attention, norms) is
+/// suffix-based and arch-agnostic; the new arch label is added so
+/// `ArchName::Qwen35MoeFull` resolves through the same APEX path
+/// as `ArchName::Qwen35Moe`.
+pub const SUPPORTED_APEX_ARCHES: &[&str] = &["qwen3moe", "qwen35moe", "gemma4", "minimax-m2"];
 
 /// Classify a tensor by name + arch.
 ///
@@ -183,7 +189,10 @@ pub fn classify_moe_tensor(arch: ArchName, name: &str) -> MoeTensorRole {
 pub const fn is_apex_supported_arch(arch: ArchName) -> bool {
     matches!(
         arch,
-        ArchName::Qwen35Moe | ArchName::Gemma4 | ArchName::MiniMaxM2
+        ArchName::Qwen35Moe
+            | ArchName::Qwen35MoeFull
+            | ArchName::Gemma4
+            | ArchName::MiniMaxM2
     )
 }
 

@@ -567,7 +567,9 @@ fn determine_tokenizer_model_name(model_section: &serde_json::Value, arch: ArchN
 fn determine_pre_tokenizer_type(arch: ArchName) -> String {
     match arch {
         // llama-vocab.cpp:2042 — Qwen3.5 / Qwen3.6 family.
-        ArchName::Qwen35Moe => "qwen35".into(),
+        // Both the older qwen3moe variant AND the new qwen35moe
+        // (linear-attn + MTP) use the same pre-tokenizer rules.
+        ArchName::Qwen35Moe | ArchName::Qwen35MoeFull => "qwen35".into(),
         // llama-vocab.cpp:2035 — Qwen2-family pre-tokenizer also used
         // by Qwen3-VL text-side decoders.
         ArchName::Qwen3VlText => "qwen2".into(),

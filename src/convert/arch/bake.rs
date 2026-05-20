@@ -98,6 +98,23 @@ pub enum BakeOp {
         half: SplitHalf,
     },
 
+    /// Per-row V-head reorder. The buffer is interpreted as
+    /// `row_count` rows; each row's `row_count_scalars` (which equals
+    /// `num_k_heads * num_v_per_k * head_dim_in_row`) scalars are
+    /// reordered independently using the same grouped→tiled swap as
+    /// [`BakeOp::ReorderVHeads`]. Used by Qwen 3.5/3.6
+    /// `linear_attn.out_proj.weight` where the column axis (input
+    /// dim) carries the V-head layout. Mirrors canonical
+    /// `qwen.py:5402-5408` (case 6 in orphan
+    /// `src/models/qwen35/mod.rs:670-705`) — `dim=-1` with
+    /// `head_dim=head_v_dim`.
+    ReorderVHeadsPerRow {
+        row_count: usize,
+        num_k_heads: usize,
+        num_v_per_k: usize,
+        head_dim_in_row: usize,
+    },
+
     /// Pure shape operation: caller-side metadata fix-up for tensors
     /// that store singleton dimensions in safetensors that GGUF
     /// doesn't carry. Currently used for Qwen 3.5/3.6 linear-attn
@@ -146,6 +163,15 @@ impl fmt::Display for BakeOp {
             } => write!(
                 f,
                 "SplitAxisHalf {{ outer={outer_count}, axis={axis_size}, inner={inner_count}, half={half:?} }}"
+            ),
+            BakeOp::ReorderVHeadsPerRow {
+                row_count,
+                num_k_heads,
+                num_v_per_k,
+                head_dim_in_row,
+            } => write!(
+                f,
+                "ReorderVHeadsPerRow {{ rows={row_count}, nk={num_k_heads}, nv_per_k={num_v_per_k}, head_dim_in_row={head_dim_in_row} }}"
             ),
             BakeOp::Squeeze => write!(f, "Squeeze"),
         }
@@ -299,6 +325,43 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
                     ),
                 };
                 out.extend_from_slice(&data[range_start..range_end]);
+            }
+            Ok(out)
+        }
+        BakeOp::ReorderVHeadsPerRow {
+            row_count,
+            num_k_heads,
+            num_v_per_k,
+            head_dim_in_row,
+        } => {
+            let row_scalars = num_k_heads * num_v_per_k * head_dim_in_row;
+            let expected_len = row_count * row_scalars;
+            if data.len() != expected_len {
+                return Err(BakeError {
+                    op: op.clone(),
+                    buffer_len: data.len(),
+                    reason: format!(
+                        "buffer of {} elements != expected {row_count}*{num_k_heads}*{num_v_per_k}*{head_dim_in_row}={expected_len}",
+                        data.len()
+                    ),
+                });
+            }
+            let mut out = data.clone();
+            // Per-row reorder: each row of `row_scalars` elements is
+            // interpreted as [num_k_heads, num_v_per_k, head_dim_in_row]
+            // (C-order); we swap the outer two axes.
+            let nk = *num_k_heads;
+            let nv = *num_v_per_k;
+            let hd = *head_dim_in_row;
+            for r in 0..*row_count {
+                let row_off = r * row_scalars;
+                for k in 0..nk {
+                    for v in 0..nv {
+                        let src_off = row_off + (k * nv + v) * hd;
+                        let dst_off = row_off + (v * nk + k) * hd;
+                        out[dst_off..dst_off + hd].copy_from_slice(&data[src_off..src_off + hd]);
+                    }
+                }
             }
             Ok(out)
         }
@@ -596,6 +659,80 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.reason.contains("expected"));
+    }
+
+    #[test]
+    fn reorder_v_heads_per_row_2x3_swap_within_each_row() {
+        // 2 rows, each row laid out as [nk=2, nv_per_k=3, head_dim_in_row=2].
+        // Per row: 12 elements. Total: 24.
+        // Row 0: [a0_v0(0,1) a0_v1(2,3) a0_v2(4,5) | a1_v0(6,7) a1_v1(8,9) a1_v2(10,11)]
+        // After swap to [nv_per_k=3, nk=2, head_dim_in_row=2]:
+        //   [a0_v0(0,1) a1_v0(6,7) | a0_v1(2,3) a1_v1(8,9) | a0_v2(4,5) a1_v2(10,11)]
+        let inp: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let out = apply_bake_op(
+            inp,
+            &BakeOp::ReorderVHeadsPerRow {
+                row_count: 2,
+                num_k_heads: 2,
+                num_v_per_k: 3,
+                head_dim_in_row: 2,
+            },
+        )
+        .unwrap();
+        let row0_expect = [0.0, 1.0, 6.0, 7.0, 2.0, 3.0, 8.0, 9.0, 4.0, 5.0, 10.0, 11.0];
+        let row1_expect = [12.0, 13.0, 18.0, 19.0, 14.0, 15.0, 20.0, 21.0, 16.0, 17.0, 22.0, 23.0];
+        assert_eq!(out[0..12], row0_expect);
+        assert_eq!(out[12..24], row1_expect);
+    }
+
+    #[test]
+    fn reorder_v_heads_per_row_buffer_mismatch_errors() {
+        let inp = vec![0.0_f32; 23];
+        let err = apply_bake_op(
+            inp,
+            &BakeOp::ReorderVHeadsPerRow {
+                row_count: 2,
+                num_k_heads: 2,
+                num_v_per_k: 3,
+                head_dim_in_row: 2,
+            },
+        )
+        .unwrap_err();
+        assert!(err.reason.contains("expected"));
+    }
+
+    #[test]
+    fn reorder_v_heads_per_row_preserves_row_boundaries() {
+        // 3 rows, distinct sentinels per row. After reorder, each
+        // row's elements must stay within its row boundaries.
+        let mut inp = Vec::with_capacity(36);
+        for r in 0..3 {
+            for i in 0..12 {
+                inp.push(1000.0 * (r as f32 + 1.0) + i as f32);
+            }
+        }
+        let out = apply_bake_op(
+            inp,
+            &BakeOp::ReorderVHeadsPerRow {
+                row_count: 3,
+                num_k_heads: 2,
+                num_v_per_k: 3,
+                head_dim_in_row: 2,
+            },
+        )
+        .unwrap();
+        // Row 0: all values in 1000.x range
+        for &v in &out[0..12] {
+            assert!(v >= 1000.0 && v < 2000.0, "row 0 leaked: {v}");
+        }
+        // Row 1: all values in 2000.x range
+        for &v in &out[12..24] {
+            assert!(v >= 2000.0 && v < 3000.0, "row 1 leaked: {v}");
+        }
+        // Row 2: all values in 3000.x range
+        for &v in &out[24..36] {
+            assert!(v >= 3000.0 && v < 4000.0, "row 2 leaked: {v}");
+        }
     }
 
     #[test]

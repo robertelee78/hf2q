@@ -347,7 +347,7 @@ mod p7_ac3_hint_tests {
         let msg = ApexError::ImatrixRequiresInference {
             tier: "i-balanced",
             arch: "gemma4",
-            supported_for_imatrix: &["qwen3moe", "gemma4"],
+            supported_for_imatrix: &["qwen3moe", "qwen35moe", "gemma4"],
         }
         .to_string();
         assert!(msg.contains("i-balanced"), "msg should echo bad tier: {msg}");

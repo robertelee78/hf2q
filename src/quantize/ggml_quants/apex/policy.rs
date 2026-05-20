@@ -89,7 +89,7 @@ use super::rules::{
 /// whether the policy LAYER accepts it. Phase A keeps these out of
 /// `SUPPORTED_FOR_IMATRIX` to stay aligned with ADR-033 §Pi line 359
 /// ("Pi only runs against arches with hf2q inference support").
-pub const SUPPORTED_FOR_IMATRIX: &[&str] = &["qwen3moe", "gemma4"];
+pub const SUPPORTED_FOR_IMATRIX: &[&str] = &["qwen3moe", "qwen35moe", "gemma4"];
 
 #[derive(Debug, Clone, Copy)]
 pub struct ApexPolicy {
@@ -857,7 +857,7 @@ mod tests {
                     // Phase A widened from `&[]` to the v1 imatrix-supported
                     // arch set; the error message tells the operator which
                     // arches can accept `--imatrix <file>`.
-                    assert_eq!(supported_for_imatrix, &["qwen3moe", "gemma4"]);
+                    assert_eq!(supported_for_imatrix, &["qwen3moe", "qwen35moe", "gemma4"]);
                 }
                 other => panic!(
                     "expected ImatrixRequiresInference for {tier:?}, got {other:?}"

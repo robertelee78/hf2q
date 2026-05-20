@@ -103,6 +103,12 @@ pub struct Qwen35MoeFullCtx {
     /// `num_v_per_k`.
     pub linear_num_value_heads: usize,
 
+    /// `linear_key_head_dim` — elements per K (and Q) head in
+    /// linear-attn layers. Used by `in_proj_qkv` to compute the
+    /// byte offset of the V-row slice (Q rows + K rows pass through
+    /// unchanged; only V rows get the reorder).
+    pub linear_key_head_dim: usize,
+
     /// `linear_value_head_dim` — elements per V head.
     pub linear_value_head_dim: usize,
 
@@ -166,7 +172,11 @@ pub enum MappedTensor {
 /// All branches that emit a `norm.weight` (except
 /// `linear_attn.norm.weight`) attach a [`BakeOp::AddOne`] bake —
 /// mirrors canonical `qwen.py:303-304`.
-pub fn map_tensor_name(hf_name: &str, ctx: &Qwen35MoeFullCtx) -> Option<MappedTensor> {
+pub fn map_tensor_name(
+    hf_name: &str,
+    hf_shape: &[usize],
+    ctx: &Qwen35MoeFullCtx,
+) -> Option<MappedTensor> {
     // ---- Multimodal prefix strip --------------------------------------
     let canonical = if ctx.multimodal_wrapping {
         if let Some(stripped) = hf_name.strip_prefix("model.language_model.") {
@@ -192,7 +202,7 @@ pub fn map_tensor_name(hf_name: &str, ctx: &Qwen35MoeFullCtx) -> Option<MappedTe
 
     // ---- MTP family ---------------------------------------------------
     if let Some(rest) = canonical_ref.strip_prefix("mtp.") {
-        return map_mtp(rest, ctx);
+        return map_mtp(rest, hf_shape, ctx);
     }
 
     // ---- Globals ------------------------------------------------------
@@ -222,13 +232,18 @@ pub fn map_tensor_name(hf_name: &str, ctx: &Qwen35MoeFullCtx) -> Option<MappedTe
     }
     let rest = &rest_with_dot[1..];
 
-    map_per_block(layer, rest, ctx)
+    map_per_block(layer, rest, hf_shape, ctx)
 }
 
 /// Per-block dispatcher. Handles norms, full-attention projections,
 /// linear-attention SSM tensors, MoE router gate, per-expert
 /// gate_up_proj split + down_proj direct, shared experts.
-fn map_per_block(layer: usize, rest: &str, ctx: &Qwen35MoeFullCtx) -> Option<MappedTensor> {
+fn map_per_block(
+    layer: usize,
+    rest: &str,
+    hf_shape: &[usize],
+    ctx: &Qwen35MoeFullCtx,
+) -> Option<MappedTensor> {
     let blk = |suffix: &str| format!("blk.{layer}.{suffix}");
 
     // ---- Block-level norms (the +1 bake applies) ----------------------
@@ -274,7 +289,7 @@ fn map_per_block(layer: usize, rest: &str, ctx: &Qwen35MoeFullCtx) -> Option<Map
 
     // ---- Linear-attention SSM family ----------------------------------
     if let Some(la_rest) = rest.strip_prefix("linear_attn.") {
-        return map_linear_attn(layer, la_rest, ctx);
+        return map_linear_attn(layer, la_rest, hf_shape, ctx);
     }
 
     // ---- MoE router + per-expert + shared experts ---------------------
@@ -290,7 +305,12 @@ fn map_per_block(layer: usize, rest: &str, ctx: &Qwen35MoeFullCtx) -> Option<Map
 /// The norm.weight here is NOT baked +1 — it's the one explicit
 /// exception in canonical `qwen.py:303` (`.endswith("norm.weight") and
 /// not name.endswith("linear_attn.norm.weight")`).
-fn map_linear_attn(layer: usize, la_rest: &str, _ctx: &Qwen35MoeFullCtx) -> Option<MappedTensor> {
+fn map_linear_attn(
+    layer: usize,
+    la_rest: &str,
+    hf_shape: &[usize],
+    ctx: &Qwen35MoeFullCtx,
+) -> Option<MappedTensor> {
     let blk = |suffix: &str| format!("blk.{layer}.{suffix}");
 
     match la_rest {
@@ -313,34 +333,85 @@ fn map_linear_attn(layer: usize, la_rest: &str, _ctx: &Qwen35MoeFullCtx) -> Opti
             bake: BakeOp::Squeeze,
         }),
 
-        // in_proj_qkv / in_proj_z / out_proj need V-head reorder.
-        // The exact slice and dim depend on the tensor shape and
-        // the QKV layout. Per canonical `qwen.py:354-369` and orphan
-        // `src/models/qwen35/mod.rs:454+`:
+        // in_proj_qkv: HF shape [nk*(qd+kd) + nk*nv_per_k*vd, cols]
+        // — Q rows + K rows + V rows packed along axis 0. Q and K
+        // rows pass through unchanged; ONLY the V rows get the
+        // grouped→tiled head reorder. Per canonical
+        // `qwen.py:5384-5392` + orphan `mod.rs:552-616`.
         //
-        // - in_proj_qkv: shape [nk*(qd+kd+nv_per_k*vd), hidden].
-        //   Only the V rows (offset = nk*(qd+kd), length = nk*nv_per_k*vd)
-        //   need the reorder; Q and K rows are passed through.
-        //   This requires knowing the head dims (qd=linear_key_head_dim,
-        //   kd=linear_key_head_dim, vd=linear_value_head_dim) — context
-        //   doesn't currently carry qd/kd separately. Defer to a
-        //   subsequent commit once Qwen35MoeFullCtx is extended.
-        //
-        // - in_proj_z: shape [nk*nv_per_k*vd, hidden]. Full reorder
-        //   on the row dim.
-        //
-        // - out_proj: shape [hidden, nk*nv_per_k*vd]. Reorder on
-        //   col dim — currently apply_bake_op operates on row-major
-        //   flat buffers; col-axis reorder requires a transposed
-        //   BakeOp variant (deferred).
-        //
-        // For now (no-stub policy): the three reorder-requiring
-        // tensors return None, surfacing UnmappedTensor with a
-        // typed error so the operator sees exactly which tensor
-        // patterns need additional work. This matches the
-        // [[feedback-no-loop-suppression-2026-05-17]] contract:
-        // surface, don't silently degrade.
-        "in_proj_qkv.weight" | "in_proj_z.weight" | "out_proj.weight" => None,
+        // The flat F32 buffer is `total_rows * cols` elements, where
+        // total_rows = shape[0] and cols = shape[1] (if 2-D).
+        // V slice start = (qd+kd) * nk * cols (Q+K rows × cols),
+        // V slice length = nv_per_k * vd * nk * cols.
+        // Each V "head" treats `vd * cols` scalars as one head_dim
+        // block; reorder swaps the outer [nk, nv_per_k] axes.
+        "in_proj_qkv.weight" => {
+            let cols = if hf_shape.len() >= 2 { hf_shape[1] } else { 1 };
+            let nk = ctx.linear_num_key_heads;
+            let nv_per_k = ctx.num_v_per_k();
+            let qd = ctx.linear_key_head_dim;
+            let kd = ctx.linear_key_head_dim;
+            let vd = ctx.linear_value_head_dim;
+            let v_slice_start = (qd + kd) * nk * cols;
+            let v_slice_len = nv_per_k * vd * nk * cols;
+            Some(MappedTensor::DirectWithBake {
+                gguf_name: blk("ssm_in_proj_qkv.weight"),
+                bake: BakeOp::ReorderVHeads {
+                    num_k_heads: nk,
+                    num_v_per_k: nv_per_k,
+                    head_dim: vd * cols,
+                    slice: Some(v_slice_start..(v_slice_start + v_slice_len)),
+                },
+            })
+        }
+
+        // in_proj_z: HF shape [nk * nv_per_k * vd, cols]. ALL rows
+        // get reorder (no Q/K to skip). Treat each "head" as
+        // `vd * cols` scalars laid out as [nk, nv_per_k, vd*cols] →
+        // swap outer two axes. Per canonical `qwen.py:5394-5396` +
+        // orphan `mod.rs:624-637`.
+        "in_proj_z.weight" => {
+            let cols = if hf_shape.len() >= 2 { hf_shape[1] } else { 1 };
+            let nk = ctx.linear_num_key_heads;
+            let nv_per_k = ctx.num_v_per_k();
+            let vd = ctx.linear_value_head_dim;
+            Some(MappedTensor::DirectWithBake {
+                gguf_name: blk("ssm_in_proj_z.weight"),
+                bake: BakeOp::ReorderVHeads {
+                    num_k_heads: nk,
+                    num_v_per_k: nv_per_k,
+                    head_dim: vd * cols,
+                    slice: None,
+                },
+            })
+        }
+
+        // out_proj: HF shape [hidden, nk * nv_per_k * vd]. PER-ROW
+        // reorder of the column axis: each row's cols elements are
+        // laid out as [nk, nv_per_k, vd] → swap [nk, nv_per_k]. Per
+        // canonical `qwen.py:5402-5408` + orphan `mod.rs:670-705`.
+        "out_proj.weight" => {
+            if hf_shape.len() < 2 {
+                return None;
+            }
+            let rows = hf_shape[0];
+            let nk = ctx.linear_num_key_heads;
+            let nv_per_k = ctx.num_v_per_k();
+            let vd = ctx.linear_value_head_dim;
+            // Sanity: each row must equal nk * nv_per_k * vd.
+            if hf_shape[1] != nk * nv_per_k * vd {
+                return None;
+            }
+            Some(MappedTensor::DirectWithBake {
+                gguf_name: blk("ssm_out.weight"),
+                bake: BakeOp::ReorderVHeadsPerRow {
+                    row_count: rows,
+                    num_k_heads: nk,
+                    num_v_per_k: nv_per_k,
+                    head_dim_in_row: vd,
+                },
+            })
+        }
 
         _ => None,
     }
@@ -439,7 +510,7 @@ fn map_mlp(layer: usize, mlp_rest: &str, ctx: &Qwen35MoeFullCtx) -> Option<Mappe
 /// transformer layer body (input_layernorm, q_proj, etc.) gets the
 /// same per-block treatment as a normal layer — including the +1
 /// norm bake.
-fn map_mtp(rest: &str, ctx: &Qwen35MoeFullCtx) -> Option<MappedTensor> {
+fn map_mtp(rest: &str, hf_shape: &[usize], ctx: &Qwen35MoeFullCtx) -> Option<MappedTensor> {
     let n_layer = ctx.num_hidden_layers;
     let mtp_blk = |suffix: &str| format!("blk.{n_layer}.{suffix}");
 
@@ -479,7 +550,7 @@ fn map_mtp(rest: &str, ctx: &Qwen35MoeFullCtx) -> Option<MappedTensor> {
         return None;
     }
     let inner = &inner_with_dot[1..];
-    map_per_block(bid + n_layer, inner, ctx)
+    map_per_block(bid + n_layer, inner, hf_shape, ctx)
 }
 
 /// Emit Qwen 3.5 MoE-specific GGUF metadata KVs. Called by the
@@ -569,7 +640,7 @@ mod tests {
         // Sized to match operator's Qwen-Qwen3.5-35B-A3B multimodal
         // VLM: 80 hidden layers, 128 experts, moe_intermediate=768,
         // hidden=2048, linear: 16 K heads, 32 V heads (2 per K),
-        // head_dim=128.
+        // key_head_dim=128, value_head_dim=128.
         Qwen35MoeFullCtx {
             num_hidden_layers: 80,
             num_experts: 128,
@@ -577,6 +648,7 @@ mod tests {
             hidden_size: 2048,
             linear_num_key_heads: 16,
             linear_num_value_heads: 32,
+            linear_key_head_dim: 128,
             linear_value_head_dim: 128,
             multimodal_wrapping: true,
         }
@@ -592,18 +664,18 @@ mod tests {
     #[test]
     fn globals_with_multimodal_prefix() {
         let ctx = vlm_ctx();
-        match map_tensor_name("model.language_model.embed_tokens.weight", &ctx) {
+        match map_tensor_name("model.language_model.embed_tokens.weight", &[], &ctx) {
             Some(MappedTensor::Direct(s)) => assert_eq!(s, "token_embd.weight"),
             other => panic!("unexpected: {other:?}"),
         }
-        match map_tensor_name("model.language_model.norm.weight", &ctx) {
+        match map_tensor_name("model.language_model.norm.weight", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "output_norm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
             }
             other => panic!("unexpected: {other:?}"),
         }
-        match map_tensor_name("lm_head.weight", &ctx) {
+        match map_tensor_name("lm_head.weight", &[], &ctx) {
             Some(MappedTensor::Direct(s)) => assert_eq!(s, "output.weight"),
             other => panic!("unexpected: {other:?}"),
         }
@@ -612,7 +684,7 @@ mod tests {
     #[test]
     fn globals_text_only() {
         let ctx = text_only_ctx();
-        match map_tensor_name("model.embed_tokens.weight", &ctx) {
+        match map_tensor_name("model.embed_tokens.weight", &[], &ctx) {
             Some(MappedTensor::Direct(s)) => assert_eq!(s, "token_embd.weight"),
             other => panic!("unexpected: {other:?}"),
         }
@@ -621,7 +693,7 @@ mod tests {
     #[test]
     fn visual_tensors_drop_in_multimodal() {
         let ctx = vlm_ctx();
-        match map_tensor_name("model.visual.blocks.0.attn.qkv.weight", &ctx) {
+        match map_tensor_name("model.visual.blocks.0.attn.qkv.weight", &[], &ctx) {
             Some(MappedTensor::Drop) => {}
             other => panic!("expected Drop, got: {other:?}"),
         }
@@ -630,10 +702,7 @@ mod tests {
     #[test]
     fn input_layernorm_gets_plus_one_bake() {
         let ctx = vlm_ctx();
-        match map_tensor_name(
-            "model.language_model.layers.5.input_layernorm.weight",
-            &ctx,
-        ) {
+        match map_tensor_name("model.language_model.layers.5.input_layernorm.weight", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "blk.5.attn_norm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
@@ -645,10 +714,7 @@ mod tests {
     #[test]
     fn post_attention_layernorm_gets_plus_one_bake() {
         let ctx = vlm_ctx();
-        match map_tensor_name(
-            "model.language_model.layers.3.post_attention_layernorm.weight",
-            &ctx,
-        ) {
+        match map_tensor_name("model.language_model.layers.3.post_attention_layernorm.weight", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "blk.3.attn_post_norm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
@@ -662,10 +728,7 @@ mod tests {
         // The single exception in canonical qwen.py:303 — every other
         // norm gets +1 EXCEPT linear_attn.norm.weight.
         let ctx = vlm_ctx();
-        match map_tensor_name(
-            "model.language_model.layers.0.linear_attn.norm.weight",
-            &ctx,
-        ) {
+        match map_tensor_name("model.language_model.layers.0.linear_attn.norm.weight", &[], &ctx) {
             Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.0.ssm_norm.weight"),
             other => panic!("expected Direct (no bake), got: {other:?}"),
         }
@@ -674,7 +737,7 @@ mod tests {
     #[test]
     fn linear_attn_a_log_neg_exp() {
         let ctx = vlm_ctx();
-        match map_tensor_name("model.language_model.layers.0.linear_attn.A_log", &ctx) {
+        match map_tensor_name("model.language_model.layers.0.linear_attn.A_log", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "blk.0.ssm_a.weight");
                 assert_eq!(bake, BakeOp::NegExp);
@@ -686,10 +749,7 @@ mod tests {
     #[test]
     fn linear_attn_conv1d_squeeze() {
         let ctx = vlm_ctx();
-        match map_tensor_name(
-            "model.language_model.layers.0.linear_attn.conv1d.weight",
-            &ctx,
-        ) {
+        match map_tensor_name("model.language_model.layers.0.linear_attn.conv1d.weight", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "blk.0.ssm_conv1d.weight");
                 assert_eq!(bake, BakeOp::Squeeze);
@@ -701,46 +761,165 @@ mod tests {
     #[test]
     fn linear_attn_in_proj_a_b_direct_rename() {
         let ctx = vlm_ctx();
-        match map_tensor_name(
-            "model.language_model.layers.0.linear_attn.in_proj_a.weight",
-            &ctx,
-        ) {
+        match map_tensor_name("model.language_model.layers.0.linear_attn.in_proj_a.weight", &[], &ctx) {
             Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.0.ssm_alpha.weight"),
             other => panic!("unexpected: {other:?}"),
         }
-        match map_tensor_name(
-            "model.language_model.layers.0.linear_attn.in_proj_b.weight",
-            &ctx,
-        ) {
+        match map_tensor_name("model.language_model.layers.0.linear_attn.in_proj_b.weight", &[], &ctx) {
             Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.0.ssm_beta.weight"),
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
-    fn linear_attn_in_proj_qkv_z_out_proj_surfaces_unmapped() {
-        // These need V-head reorder over specific slices/columns
-        // which the current Qwen35MoeFullCtx + BakeOp::ReorderVHeads
-        // can't fully express (col-axis reorder and qd/kd split
-        // require a richer context). Per no-stub: return None and
-        // let the caller surface UnmappedTensor — operator-visible.
+    fn linear_attn_in_proj_qkv_v_only_reorder_with_slice() {
         let ctx = vlm_ctx();
-        for name in [
+        // operator's config: nk=16, qd=kd=vd=128, nv_per_k=2, cols=2048.
+        // shape[0] = nk*(qd+kd) + nk*nv_per_k*vd = 16*256 + 16*2*128 = 4096+4096 = 8192
+        // shape[1] = cols = 2048
+        let hf_shape = [8192_usize, 2048];
+        match map_tensor_name(
             "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
-            "model.language_model.layers.0.linear_attn.in_proj_z.weight",
-            "model.language_model.layers.0.linear_attn.out_proj.weight",
-        ] {
-            assert!(
-                map_tensor_name(name, &ctx).is_none(),
-                "expected None for {name} (V-head reorder not yet wired)",
-            );
+            &hf_shape,
+            &ctx,
+        ) {
+            Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
+                assert_eq!(gguf_name, "blk.0.ssm_in_proj_qkv.weight");
+                match bake {
+                    BakeOp::ReorderVHeads {
+                        num_k_heads,
+                        num_v_per_k,
+                        head_dim,
+                        slice,
+                    } => {
+                        assert_eq!(num_k_heads, 16);
+                        assert_eq!(num_v_per_k, 2);
+                        assert_eq!(head_dim, 128 * 2048); // vd * cols
+                        // V slice starts after Q+K rows:
+                        // (qd+kd)*nk*cols = (128+128)*16*2048
+                        let expect_start = (128 + 128) * 16 * 2048;
+                        let expect_len = 2 * 128 * 16 * 2048;
+                        let r = slice.expect("expected sliced reorder");
+                        assert_eq!(r.start, expect_start);
+                        assert_eq!(r.end - r.start, expect_len);
+                    }
+                    other => panic!("expected ReorderVHeads, got {other:?}"),
+                }
+            }
+            other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn linear_attn_in_proj_z_full_reorder_no_slice() {
+        let ctx = vlm_ctx();
+        // shape[0] = nk * nv_per_k * vd = 16*2*128 = 4096
+        // shape[1] = cols = 2048
+        let hf_shape = [4096_usize, 2048];
+        match map_tensor_name(
+            "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+            &hf_shape,
+            &ctx,
+        ) {
+            Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
+                assert_eq!(gguf_name, "blk.0.ssm_in_proj_z.weight");
+                match bake {
+                    BakeOp::ReorderVHeads {
+                        num_k_heads,
+                        num_v_per_k,
+                        head_dim,
+                        slice,
+                    } => {
+                        assert_eq!(num_k_heads, 16);
+                        assert_eq!(num_v_per_k, 2);
+                        assert_eq!(head_dim, 128 * 2048);
+                        assert!(slice.is_none(), "in_proj_z reorders full buffer");
+                    }
+                    other => panic!("expected ReorderVHeads, got {other:?}"),
+                }
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linear_attn_out_proj_per_row_col_reorder() {
+        let ctx = vlm_ctx();
+        // shape: [hidden, nk*nv_per_k*vd] = [2048, 4096]
+        let hf_shape = [2048_usize, 4096];
+        match map_tensor_name(
+            "model.language_model.layers.0.linear_attn.out_proj.weight",
+            &hf_shape,
+            &ctx,
+        ) {
+            Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
+                assert_eq!(gguf_name, "blk.0.ssm_out.weight");
+                match bake {
+                    BakeOp::ReorderVHeadsPerRow {
+                        row_count,
+                        num_k_heads,
+                        num_v_per_k,
+                        head_dim_in_row,
+                    } => {
+                        assert_eq!(row_count, 2048);
+                        assert_eq!(num_k_heads, 16);
+                        assert_eq!(num_v_per_k, 2);
+                        assert_eq!(head_dim_in_row, 128);
+                    }
+                    other => panic!("expected ReorderVHeadsPerRow, got {other:?}"),
+                }
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linear_attn_out_proj_rejects_mismatched_cols() {
+        let ctx = vlm_ctx();
+        // shape[1] != nk * nv_per_k * vd (16*2*128=4096); use bogus.
+        let hf_shape = [2048_usize, 3000];
+        assert!(map_tensor_name(
+            "model.language_model.layers.0.linear_attn.out_proj.weight",
+            &hf_shape,
+            &ctx,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn linear_attn_v_reorder_arms_no_longer_surface_unmapped_with_shape() {
+        // Regression: the three tensors that previously returned None
+        // (in_proj_qkv, in_proj_z, out_proj — pre-`ReorderVHeadsPerRow`
+        // + pre-`linear_key_head_dim`) now route through the right
+        // bake op when shape is supplied. This test pins that fact.
+        let ctx = vlm_ctx();
+        // in_proj_qkv shape: [8192, 2048]
+        assert!(map_tensor_name(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            &[8192, 2048],
+            &ctx,
+        )
+        .is_some());
+        // in_proj_z shape: [4096, 2048]
+        assert!(map_tensor_name(
+            "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+            &[4096, 2048],
+            &ctx,
+        )
+        .is_some());
+        // out_proj shape: [2048, 4096]
+        assert!(map_tensor_name(
+            "model.language_model.layers.0.linear_attn.out_proj.weight",
+            &[2048, 4096],
+            &ctx,
+        )
+        .is_some());
     }
 
     #[test]
     fn mlp_router_gate_direct() {
         let ctx = vlm_ctx();
-        match map_tensor_name("model.language_model.layers.7.mlp.gate.weight", &ctx) {
+        match map_tensor_name("model.language_model.layers.7.mlp.gate.weight", &[], &ctx) {
             Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.7.ffn_gate_inp.weight"),
             other => panic!("unexpected: {other:?}"),
         }
@@ -760,7 +939,7 @@ mod tests {
         ];
         for (hf_suffix, gguf_suffix) in cases {
             let hf = format!("model.language_model.layers.2.{hf_suffix}");
-            match map_tensor_name(&hf, &ctx) {
+            match map_tensor_name(&hf, &[], &ctx) {
                 Some(MappedTensor::Direct(s)) => assert_eq!(s, format!("blk.2.{gguf_suffix}")),
                 other => panic!("unexpected for {hf}: {other:?}"),
             }
@@ -772,10 +951,7 @@ mod tests {
         let ctx = vlm_ctx();
         // No `.weight` suffix in canonical safetensors layout for this
         // pre-fused tensor (per operator's safetensors index inspection).
-        match map_tensor_name(
-            "model.language_model.layers.9.mlp.experts.gate_up_proj",
-            &ctx,
-        ) {
+        match map_tensor_name("model.language_model.layers.9.mlp.experts.gate_up_proj", &[], &ctx) {
             Some(MappedTensor::SplitInto(outputs)) => {
                 assert_eq!(outputs.len(), 2);
                 assert_eq!(outputs[0].gguf_name, "blk.9.ffn_gate_exps.weight");
@@ -800,10 +976,7 @@ mod tests {
     #[test]
     fn mlp_experts_down_proj_direct_rename() {
         let ctx = vlm_ctx();
-        match map_tensor_name(
-            "model.language_model.layers.9.mlp.experts.down_proj",
-            &ctx,
-        ) {
+        match map_tensor_name("model.language_model.layers.9.mlp.experts.down_proj", &[], &ctx) {
             Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.9.ffn_down_exps.weight"),
             other => panic!("unexpected: {other:?}"),
         }
@@ -813,25 +986,25 @@ mod tests {
     fn mtp_helpers_remap_to_next_block_layer() {
         let ctx = vlm_ctx();
         // n_layer = 80, so MTP block lives at blk.80.
-        match map_tensor_name("mtp.fc.weight", &ctx) {
+        match map_tensor_name("mtp.fc.weight", &[], &ctx) {
             Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.80.eh_proj.weight"),
             other => panic!("unexpected: {other:?}"),
         }
-        match map_tensor_name("mtp.pre_fc_norm_embedding.weight", &ctx) {
+        match map_tensor_name("mtp.pre_fc_norm_embedding.weight", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "blk.80.enorm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
             }
             other => panic!("unexpected: {other:?}"),
         }
-        match map_tensor_name("mtp.pre_fc_norm_hidden.weight", &ctx) {
+        match map_tensor_name("mtp.pre_fc_norm_hidden.weight", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "blk.80.hnorm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
             }
             other => panic!("unexpected: {other:?}"),
         }
-        match map_tensor_name("mtp.norm.weight", &ctx) {
+        match map_tensor_name("mtp.norm.weight", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "blk.80.shared_head_norm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
@@ -844,7 +1017,7 @@ mod tests {
     fn mtp_layer_body_tensors_remap_to_n_plus_bid() {
         let ctx = vlm_ctx();
         // mtp.layers.0.input_layernorm.weight → blk.80.attn_norm.weight (with +1 bake)
-        match map_tensor_name("mtp.layers.0.input_layernorm.weight", &ctx) {
+        match map_tensor_name("mtp.layers.0.input_layernorm.weight", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "blk.80.attn_norm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
@@ -852,7 +1025,7 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         // mtp.layers.0.self_attn.q_proj.weight → blk.80.attn_q.weight
-        match map_tensor_name("mtp.layers.0.self_attn.q_proj.weight", &ctx) {
+        match map_tensor_name("mtp.layers.0.self_attn.q_proj.weight", &[], &ctx) {
             Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.80.attn_q.weight"),
             other => panic!("unexpected: {other:?}"),
         }
@@ -861,7 +1034,7 @@ mod tests {
     #[test]
     fn unmapped_name_returns_none() {
         let ctx = vlm_ctx();
-        assert!(map_tensor_name("model.totally_made_up_tensor.weight", &ctx).is_none());
-        assert!(map_tensor_name("garbage", &ctx).is_none());
+        assert!(map_tensor_name("model.totally_made_up_tensor.weight", &[], &ctx).is_none());
+        assert!(map_tensor_name("garbage", &[], &ctx).is_none());
     }
 }
