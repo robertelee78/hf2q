@@ -232,6 +232,27 @@ pub struct ConvertCliArgs {
     /// of more memory per forward pass.
     #[arg(long)]
     pub imatrix_n_ctx: Option<u32>,
+
+    /// Export the multimodal projector (mmproj) sidecar instead of
+    /// the text decoder. Mirrors canonical
+    /// `python3 convert_hf_to_gguf.py --mmproj` at
+    /// `/opt/llama.cpp/convert_hf_to_gguf.py:117-118`.
+    ///
+    /// When set, hf2q routes the input model through the per-arch
+    /// mmproj mapper (currently Gemma 4 vision: SigLIP encoder +
+    /// Gemma-3 MLP projector). The output GGUF carries the vision
+    /// tower (`v.*`) + projector (`mm.*`) tensors and the
+    /// `clip.*` metadata schema; text-decoder tensors are silently
+    /// dropped (they're written separately by a non-`--mmproj` run).
+    /// Conventional output filename: `<basename>-mmproj.gguf` —
+    /// operator picks via `--output`.
+    ///
+    /// Currently supported arches: Gemma 4 multimodal
+    /// (`Gemma4ForConditionalGeneration` with `vision_config`).
+    /// Other multimodal arches surface
+    /// `ConvertError::UnsupportedArch`.
+    #[arg(long, default_value_t = false)]
+    pub mmproj: bool,
 }
 
 #[derive(clap::Args, Debug)]

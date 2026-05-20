@@ -101,6 +101,9 @@ pub struct ConvertArgs {
     /// surfaces `ImatrixError::CorpusTooShort` if the tokenized corpus
     /// can't fill even one chunk of size `n_ctx`.
     pub imatrix_n_ctx: Option<u32>,
+    /// `--mmproj` flag: export the vision projector (mmproj) sidecar
+    /// GGUF instead of the text decoder. See `ConvertCliArgs::mmproj`.
+    pub mmproj: bool,
 }
 
 /// Errors raised by [`run_convert`]. Wraps the typed errors from the
@@ -379,7 +382,69 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     let src = HfModelSource::open(&args.hf_dir)?;
 
     // ----- 2. Detect arch ---------------------------------------------------
-    let arch = detect_arch(&src.config)?;
+    let detected_arch = detect_arch(&src.config)?;
+    // `--mmproj` overrides arch routing to the vision-projector sidecar
+    // mapper. Mirrors canonical `convert_hf_to_gguf.py:223,229,233` —
+    // when `--mmproj` is set, the script swaps `TEXT_MODEL_MAP` for
+    // `MMPROJ_MODEL_MAP`. Requires a `vision_config` sub-object in the
+    // root config.json (Gemma 4 / Gemma 3 ForConditionalGeneration).
+    let arch = if args.mmproj {
+        if src.config.get("vision_config").is_none() {
+            return Err(ConvertError::UnsupportedArch {
+                arch_name: format!(
+                    "{detected_arch:?} (--mmproj requires a `vision_config` sub-object in config.json; not present)"
+                ),
+            });
+        }
+        match detected_arch {
+            ArchName::Gemma4 => {
+                // Two Gemma vision variants ship under the same
+                // `model_type=gemma4` umbrella:
+                //   - Gemma 3 vision (SigLIP-style): tensor names
+                //     `model.vision_tower.vision_model.embeddings.*` +
+                //     `.encoder.layers.<N>.*`. Canonical handler is
+                //     `Gemma3VisionModel` (`gemma.py:251-302`).
+                //   - Gemma 4 vision: tensor names
+                //     `model.vision_tower.encoder.layers.<N>.*` (no
+                //     `vision_model` infix) + audio sibling at
+                //     `model.audio_tower.*`. Canonical handler is
+                //     `Gemma4VisionAudioModel` (`gemma.py:768+`).
+                //     The patch embedder needs a 2-D → 4-D reshape +
+                //     permute; the projector type is `GEMMA4V` not
+                //     `gemma3`.
+                //
+                // hf2q's existing `src/convert/arch/gemma4_mmproj.rs`
+                // implements the FIRST variant (Gemma 3 vision); the
+                // Gemma 4 variant requires a separate arch port that
+                // is not yet shipped. Detect from a known marker
+                // tensor and fail fast with a typed error.
+                let has_gemma4_vision = src
+                    .tensor_metas()
+                    .any(|m| m.name.starts_with("model.vision_tower.encoder.layers."));
+                if has_gemma4_vision {
+                    return Err(ConvertError::UnsupportedArch {
+                        arch_name: "Gemma4VisionAudio (model.vision_tower.encoder.layers.* convention) — \
+                                     port from /opt/llama.cpp/conversion/gemma.py:768-840 \
+                                     (`Gemma4VisionAudioModel`) pending; the existing \
+                                     gemma4_mmproj.rs implements the SigLIP/Gemma 3 vision \
+                                     convention and does not match this model's tensor names. \
+                                     Track at ADR-033 task #63."
+                            .to_string(),
+                    });
+                }
+                ArchName::Gemma4Mmproj
+            }
+            other => {
+                return Err(ConvertError::UnsupportedArch {
+                    arch_name: format!(
+                        "--mmproj not supported for {other:?} yet (only Gemma 3 vision shipped)"
+                    ),
+                });
+            }
+        }
+    } else {
+        detected_arch
+    };
 
     // ----- 3. Build orchestrator -------------------------------------------
     // The selector branches the policy:
@@ -914,11 +979,23 @@ fn build_metadata_for_arch(
     // Per-arch mappers don't each have to handle this; we resolve at the
     // driver boundary. Surfaced 2026-05-18 by the operator's
     // google-gemma-4-26b-a4b-it real-model convert smoke test.
+    //
+    // Mmproj exception: `Gemma4Mmproj::build_metadata` expects the
+    // `vision_config` SUB-OBJECT (not the text_config); we extract it
+    // explicitly. Canonical's `convert_hf_to_gguf.py --mmproj` does
+    // the equivalent via `MmprojModel.__init__` reading
+    // `hparams["vision_config"]`.
+    if matches!(arch, ArchName::Gemma4Mmproj) {
+        let vision = config
+            .get("vision_config")
+            .expect("--mmproj routing requires vision_config (validated in run_convert)");
+        return gemma4_mmproj::build_metadata(vision, ftype);
+    }
     let config = effective_config(config);
     match arch {
         ArchName::Llama3 => llama3::build_metadata(config, ftype),
         ArchName::Gemma4 => gemma4::build_metadata(config, ftype),
-        ArchName::Gemma4Mmproj => gemma4_mmproj::build_metadata(config, ftype),
+        ArchName::Gemma4Mmproj => unreachable!("handled above"),
         ArchName::Bert => bert::build_metadata(config, ftype),
         ArchName::NomicBert => nomic_bert::build_metadata(config, ftype),
         ArchName::Qwen35Moe => qwen35moe::build_metadata(config, ftype),
@@ -1096,7 +1173,12 @@ fn map_tensor(
         ArchName::Gemma4 => lift_gemma4_mapped(gemma4::map_tensor_name(hf_name)),
         ArchName::Gemma4Mmproj => match gemma4_mmproj::map_tensor_name(hf_name) {
             Some(s) => MapOutcome::Direct(s),
-            None => MapOutcome::Unmapped,
+            // In mmproj mode we silently DROP non-vision tensors
+            // (text decoder, audio, embed_audio). The arch is only
+            // routed here when `--mmproj` is set (see run_convert
+            // override), so the unmapped names are expected drops —
+            // mirrors canonical's MMPROJ_MODEL_MAP behavior.
+            None => MapOutcome::Drop,
         },
         ArchName::Bert => match bert::map_tensor_name(hf_name) {
             Some(s) => MapOutcome::Direct(s),

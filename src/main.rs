@@ -215,6 +215,7 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
         imatrix_corpus: args.imatrix_corpus,
         imatrix_out: args.imatrix_out,
         imatrix_n_ctx: args.imatrix_n_ctx,
+        mmproj: args.mmproj,
     };
     run_convert(resolved).map_err(|e| match e {
         ConvertError::UnsupportedArch { .. }
@@ -488,6 +489,7 @@ mod tests {
             imatrix_corpus: None,
             imatrix_out: None,
             imatrix_n_ctx: None,
+            mmproj: false,
         };
         let err = cmd_convert(args).expect_err("must error");
         match err {
