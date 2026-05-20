@@ -819,6 +819,72 @@ fn convert_q6_k_tiny_qwen35moe_round_trip() {
     assert!(saw_q6k, "expected ≥1 tensor at Q6_K (positional 6)");
 }
 
+/// CLI-subprocess sibling — exercises IQ4_NL via `--quant iq4_nl`.
+/// IQ4_NL is the non-linear-codebook I-quant variant; its kernel has
+/// its own `make_qx_quants`-style scale refinement loop with chained
+/// `w*q*xb[j]` FMA patterns documented at b05b5297 (kernel matches
+/// canonical -ffp-contract=off behavior). Block size is 32 (not 256
+/// like K-quants) so the HIDDEN=256 fixture works without alignment
+/// concerns. Asserts ≥1 tensor at positional IQ4_NL (20).
+#[test]
+fn convert_iq4_nl_tiny_qwen35moe_round_trip() {
+    let model_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_qwen35moe_for_apex(model_dir.path());
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .arg("convert")
+        .arg(model_dir.path())
+        .arg("--quant")
+        .arg("iq4_nl")
+        .arg("-o")
+        .arg(out.path())
+        .assert()
+        .success();
+
+    let gguf = mlx_native::gguf::GgufFile::open(out.path()).expect("parse output GGUF");
+    assert_eq!(gguf.tensor_count(), 16);
+    assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen3moe"));
+    // file_type = MostlyIQ4_NL = 25.
+    assert_eq!(gguf.metadata_u32("general.file_type"), Some(25));
+
+    let expected_names: &[&str] = &[
+        "token_embd.weight",
+        "output.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+        "blk.0.attn_output.weight",
+        "blk.0.ffn_gate_exps.weight",
+        "blk.0.ffn_up_exps.weight",
+        "blk.0.ffn_down_exps.weight",
+        "blk.1.attn_q.weight",
+        "blk.1.attn_k.weight",
+        "blk.1.attn_v.weight",
+        "blk.1.attn_output.weight",
+        "blk.1.ffn_gate_exps.weight",
+        "blk.1.ffn_up_exps.weight",
+        "blk.1.ffn_down_exps.weight",
+    ];
+
+    // Rust-enum positional discriminants (mlx_native::ops::quantized_matmul_ggml::GgmlType):
+    // F32=0, F16=1, Q4_0=2, Q8_0=3, Q4_K=4, Q5_K=5, Q6_K=6, I16=7, Q5_1=8, IQ4_NL=9.
+    // (These are Rust enum order — NOT GGML wire codes. The on-disk GGUF
+    // uses wire codes, but mlx-native's GgmlFile::open maps wire → enum.)
+    let mut saw_iq4_nl = false;
+    for name in expected_names {
+        let info = gguf
+            .tensor_info(name)
+            .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
+        if info.ggml_type as u32 == 9 {
+            saw_iq4_nl = true;
+        }
+        assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
+    }
+    assert!(saw_iq4_nl, "expected ≥1 tensor at IQ4_NL (positional 9)");
+}
+
 // ----------------------------------------------------------------------------
 // Gemma 4 real-arch round-trip
 // ----------------------------------------------------------------------------
