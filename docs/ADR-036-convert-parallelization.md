@@ -1,6 +1,6 @@
 # ADR-036: Parallelize convert pipeline — close the 3.4× wall-clock gap
 
-**Status**: Proposed (post-§P1)
+**Status**: **SHIPPED 2026-05-19** (commit `3b24daea`) — all 11 kernels parallelized via `par_chunks_exact_mut`; Q4_K_M 10.1× speedup (12:05→1:12), 0/658 byte-cmp mismatches across Q4_K_M / Q5_K_M / IQ4_NL / Q4_0 validation runs. hf2q convert is now 3.0–3.3× FASTER than canonical pipeline.
 **Date**: 2026-05-19
 **Related**: ADR-033 §P1 (byte-equivalence), ADR-035 (codec ownership)
 

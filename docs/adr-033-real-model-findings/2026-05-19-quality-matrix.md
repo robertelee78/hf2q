@@ -26,12 +26,21 @@ F16 GGUF → `llama-quantize <type>` ≠ HF → `hf2q convert --quant <type>`).
 
 ## Benchmark — hf2q vs canonical pipeline (Gemma 4 26B Q4_K_M, M5 Max)
 
+### After ADR-036 Layer A (commit `3b24daea`)
+
 | Pipeline                                                             | Wall clock | CPU user | Cores active |
 |----------------------------------------------------------------------|-----------:|---------:|-------------:|
-| **canonical** (`convert_hf_to_gguf.py --outtype f16` + `llama-quantize Q4_K_M`) | **3:35**   | 691s + ~55s | 443% (4-5)   |
-| **hf2q** (`hf2q convert --quant q4_k_m`)                             | 12:05      | 662s     | ~93% (1)     |
+| canonical (`convert_hf_to_gguf.py --outtype f16` + `llama-quantize Q4_K_M`) | 3:35   | ~746s    | 443% (~5)    |
+| **hf2q parallel** (`hf2q convert --quant q4_k_m`)                    | **1:12**   | 796s     | 1120% (~11)  |
 
-CPU-work is comparable (662s vs 691s+55s). hf2q is 3.4× slower wall-clock because the convert orchestrator processes tensors sequentially (no rayon parallelism). Per-tensor parallelization is a clean follow-up optimization that should close the gap entirely without affecting byte-equivalence.
+hf2q is now **3.0× FASTER than canonical wall-clock** while doing slightly more CPU work (the F16 round-trip + BF16→F32 cast accounts for the small user-time delta). 10.1× speedup vs pre-ADR-036 sequential (12:05).
+
+### Pre-ADR-036 sequential (historical, commit `48862d40`)
+
+| Pipeline                                                             | Wall clock | CPU user | Cores active |
+|----------------------------------------------------------------------|-----------:|---------:|-------------:|
+| canonical                                                            | 3:35       | ~746s    | 443% (~5)    |
+| hf2q sequential                                                      | 12:05      | 662s     | 93% (1)      |
 
 Reproducibility (second-run validation): re-running both pipelines on the same source produced byte-identical Q4_K_M outputs (`scripts/byte_cmp_gguf.py: All 658 tensors byte-identical`).
 
