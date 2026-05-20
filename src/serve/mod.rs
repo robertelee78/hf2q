@@ -2088,6 +2088,40 @@ fn detect_greedy_repetition_loop(decoded_tokens: &[u32]) -> Option<(usize, usize
     detect_greedy_repetition_loop_with_text(decoded_tokens, |_| String::new())
 }
 
+/// Count consecutive copies of `key` ending at the tail of `decoded_tokens`,
+/// starting from a known floor of `min_confirmed` already-verified copies.
+/// Walks backward block-by-block and stops at the first mismatch or stream
+/// start. Returns the total observed count (≥ `min_confirmed`).
+///
+/// Surfaces a truthful count to callers — the user-facing log line
+/// "repeated N times" needs to reflect the actual run length, not the
+/// detector's internal threshold (3 or 8). When a model genuinely emits
+/// 40 copies of an 8-token cycle, the stop reason should say so.
+fn count_consecutive_cycle_copies(
+    decoded_tokens: &[u32],
+    key: &[u32],
+    min_confirmed: usize,
+) -> usize {
+    let ngram = key.len();
+    let n = decoded_tokens.len();
+    let mut actual = min_confirmed;
+    let mut probe_start = match n.checked_sub((min_confirmed + 1) * ngram) {
+        Some(p) => p,
+        None => return actual,
+    };
+    loop {
+        if &decoded_tokens[probe_start..probe_start + ngram] != key {
+            break;
+        }
+        actual += 1;
+        probe_start = match probe_start.checked_sub(ngram) {
+            Some(p) => p,
+            None => break,
+        };
+    }
+    actual
+}
+
 /// Smart loop detector. Same cycle-discovery as the basic variant, but
 /// when a candidate cycle is found, the closure decodes it to text and
 /// the rep-threshold scales with the cycle's "content character ratio":
@@ -2151,7 +2185,9 @@ where
         // STRUCTURAL when we have actual decoded text AND its alphabetic
         // content is below the threshold.
         if total_chars == 0.0 {
-            return Some((ngram, MIN_OCCURRENCES_CONTENT));
+            let actual =
+                count_consecutive_cycle_copies(decoded_tokens, key, MIN_OCCURRENCES_CONTENT);
+            return Some((ngram, actual));
         }
         let alpha = cycle_text.chars().filter(|c| c.is_alphabetic()).count() as f32;
         let alpha_ratio = alpha / total_chars;
@@ -2159,7 +2195,9 @@ where
         if alpha_ratio >= STRUCTURAL_ALPHA_THRESHOLD {
             // Content-bearing cycle (real text loop) — fire at the
             // lower threshold immediately.
-            return Some((ngram, MIN_OCCURRENCES_CONTENT));
+            let actual =
+                count_consecutive_cycle_copies(decoded_tokens, key, MIN_OCCURRENCES_CONTENT);
+            return Some((ngram, actual));
         }
 
         // Structural / punctuation-dominant cycle (table separator, list
@@ -2179,7 +2217,9 @@ where
             }
         }
         if all_match2 {
-            return Some((ngram, MIN_OCCURRENCES_STRUCTURAL));
+            let actual =
+                count_consecutive_cycle_copies(decoded_tokens, key, MIN_OCCURRENCES_STRUCTURAL);
+            return Some((ngram, actual));
         }
     }
     None
@@ -6289,18 +6329,21 @@ mod tests {
 
     #[test]
     fn detect_repetition_does_not_overcount_with_overlapping_increment() {
-        // Pin the non-overlap invariant: an all-same-token sequence MUST NOT
-        // report more than `window/ngram` occurrences (otherwise short n-grams
-        // would over-count and produce false positives at the threshold). For
-        // a 128-token all-zero window, ngram=8 should report ≤16 occurrences.
+        // Pin the non-overlap invariant: occurrences MUST count non-overlapping
+        // blocks of `ngram` tokens. For 200 zeros at ngram=2 the truthful count
+        // is exactly 100 blocks (not 199 overlapping bigrams). The pre-9f797761
+        // detector used a 128-token window-scan that could over-count short
+        // n-grams; the current consecutive-only walk (in `ngram`-sized steps)
+        // is non-overlapping by construction.
         let toks: Vec<u32> = vec![0; 200];
         let result = detect_greedy_repetition_loop(&toks);
         assert!(result.is_some());
         let (ngram, occ) = result.unwrap();
         assert!(
-            occ <= 128 / ngram,
-            "non-overlap invariant violated: ngram={ngram} occ={occ} > {}",
-            128 / ngram
+            occ.saturating_mul(ngram) <= toks.len(),
+            "non-overlap invariant violated: ngram={ngram} occ={occ}, occ*ngram={} > n={}",
+            occ.saturating_mul(ngram),
+            toks.len()
         );
     }
 
@@ -6996,7 +7039,13 @@ mod tests {
         match outcome.stop_reason {
             DecodeStopReason::RepetitionLoop { ngram, repeats } => {
                 assert!(ngram >= 8, "expected ngram >= 8, got {ngram}");
-                assert!(repeats >= 4, "expected repeats >= 4, got {repeats}");
+                // In the streaming decode loop the detector fires exactly at
+                // MIN_OCCURRENCES_CONTENT (3) — the loop stops before more
+                // cycles can accumulate. `repeats` reports the actual observed
+                // count at firing time, which for streaming is always the
+                // threshold. (Pre-9f797761 the threshold was 4; the relaxation
+                // to 3 lowered this assertion accordingly.)
+                assert!(repeats >= 3, "expected repeats >= 3, got {repeats}");
             }
             other => panic!("expected RepetitionLoop, got {other:?}"),
         }
