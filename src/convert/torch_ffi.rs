@@ -11,10 +11,11 @@
 //! for 1000/1000 uniform random f32 inputs in [-10, 5]; libm only
 //! matches 919/1000.
 //!
-//! Opt-in via `--ffi-torch-exp <path>` (defaults to discovering
-//! `libtorch_cpu.dylib` via `HF2Q_LIBTORCH_PATH` env or the Python
-//! torch install path). When loaded, `BakeOp::NegExp` uses Sleef
-//! instead of Rust's `f32::exp`.
+//! Opt-in via `--ffi-torch-exp [<path>]`. With no value, the flag
+//! resolves to a hardcoded `default_missing_value` for the operator's
+//! pyenv-installed libtorch (see `cli.rs`). When loaded, `BakeOp::NegExp`
+//! uses Sleef instead of Rust's `f32::exp`. The flag is unset by
+//! default — `try_init` is only called when the operator opts in.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
