@@ -23,7 +23,9 @@ These remaining sub-percent differences are functionally negligible. The convert
 
 **Gemma 4 26B-A4B-IT Q4_K_M** (full 658-tensor canonical convert+quantize): **OVERALL 120 / 16,745,650,462 bytes diff = 0.000001%** — essentially byte-identical. Per-type: F32 0/46,056,568 ✅, **Q4_K 120/9,347,272,704 = 0.000001%** (13 of 192 tensors with 2-27 bytes residual each; 12 are `blk.X.ffn_gate_up_exps.weight` MoE-expert-fused-gate-up tensors, 1 is `blk.29.attn_output.weight`), Q5_0 0/2,856,730,624 ✅, **Q6_K 0/667,054,080 = 0.000000% — CLOSED ✅**, Q8_0 0/3,863,078,912 ✅.
 
-**Qwen 3.5 35B-A3B in-tree K-quant diagnostics** (commit `be112aec`):
+**Qwen 3.5 35B-A3B real-model Q4_K_M byte-cmp** (full pipeline at HEAD `843feb4e`, 2026-05-20): **OVERALL 180 / 21,701,419,520 bytes diff = 0.000001%**. Per-type: F16 0/1.05MB ✅, F32 0/89MB ✅, **Q4_K 180/16.35GB = 0.000001%**, **Q6_K 0/5.26GB = 0.000000% ✅ CLOSED**. hf2q convert wall time 3m49s (vs canonical ~10min for the F16 step alone).
+
+**Qwen 3.5 in-tree K-quant diagnostics** (commit `be112aec`):
 - `qwen35_q4k_broad_sample_dump`: **0 / 21,888 bytes ✅**
 - `qwen35_q4k_multi_tensor_dump` (blk_0_attn_gate + ssm_out + ffn_gate_exps): **0 / 4,608 bytes ✅**
 - `qwen35_q6k_broad_sample_dump`: **0 / 16,380 bytes ✅**
