@@ -350,6 +350,59 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// 2026-05-20 — diff localization for the invariant 11-byte ssm_out row 100
+    /// residual. Q4_K block layout:
+    ///   [0..2]   d (f16)
+    ///   [2..4]   dmin (f16)
+    ///   [4..16]  scales (12 bytes packed 6-bit)
+    ///   [16..144] qs (128 bytes 4-bit quants)
+    /// Print per-block per-region diff to localize the residual.
+    #[test]
+    #[ignore]
+    fn qwen35_ssm_out_row100_q4k_diff_breakdown() {
+        let f32_bytes = std::fs::read("/tmp/c_quant_repro/qwen35_blk_0_ssm_out_weight_row100_f32.bin").unwrap();
+        let canonical = std::fs::read("/tmp/c_quant_repro/qwen35_blk_0_ssm_out_weight_row100_q4k.bin").unwrap();
+        let f32: Vec<f32> = f32_bytes.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let n_per_row = f32.len();
+        let q4k = quantize(&f32, n_per_row, None);
+        let n_blocks = n_per_row / 256;
+        let mut total_diff = 0usize;
+        for blk in 0..n_blocks {
+            let s = blk * 144;
+            let mine = &q4k[s..s+144];
+            let canon = &canonical[s..s+144];
+            let d_diff = mine[0..2] != canon[0..2];
+            let dmin_diff = mine[2..4] != canon[2..4];
+            let scales_diff: usize = mine[4..16].iter().zip(canon[4..16].iter()).filter(|(a,b)| a != b).count();
+            let qs_diff: usize = mine[16..144].iter().zip(canon[16..144].iter()).filter(|(a,b)| a != b).count();
+            let blk_diff = (if d_diff {2} else {0}) + (if dmin_diff {2} else {0}) + scales_diff + qs_diff;
+            total_diff += blk_diff;
+            if blk_diff > 0 {
+                println!("blk {}: d_diff={} dmin_diff={} scales_diff={} qs_diff={} (total {})",
+                    blk, d_diff, dmin_diff, scales_diff, qs_diff, blk_diff);
+                if d_diff {
+                    println!("  hf2q  d (f16 LE bytes): {:02x} {:02x}", mine[0], mine[1]);
+                    println!("  canon d (f16 LE bytes): {:02x} {:02x}", canon[0], canon[1]);
+                }
+                if dmin_diff {
+                    println!("  hf2q  dmin (f16 LE bytes): {:02x} {:02x}", mine[2], mine[3]);
+                    println!("  canon dmin (f16 LE bytes): {:02x} {:02x}", canon[2], canon[3]);
+                }
+                if scales_diff > 0 {
+                    print!("  hf2q  scales[12]:  ");
+                    for b in &mine[4..16] { print!("{:02x} ", b); }
+                    println!();
+                    print!("  canon scales[12]: ");
+                    for b in &canon[4..16] { print!("{:02x} ", b); }
+                    println!();
+                }
+            }
+        }
+        println!("\nTotal: {}/{} bytes diff", total_diff, n_blocks * 144);
+    }
+
     /// 2026-05-20 Qwen 3.5 Q4_K BROAD diagnostic — sample 16 rows across 5
     /// tensors (incl. different layers, MoE experts, token_embd). 0 diff
     /// across all = strong evidence make_qkx2_quants is byte-identical post
