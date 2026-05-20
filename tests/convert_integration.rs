@@ -762,6 +762,63 @@ fn convert_q5_k_m_tiny_qwen35moe_round_trip() {
     );
 }
 
+/// CLI-subprocess sibling — exercises Q6_K via `--quant q6_k`.
+/// Same fixture; asserts ≥1 tensor lands on positional Q6_K (6).
+#[test]
+fn convert_q6_k_tiny_qwen35moe_round_trip() {
+    let model_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_qwen35moe_for_apex(model_dir.path());
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .arg("convert")
+        .arg(model_dir.path())
+        .arg("--quant")
+        .arg("q6_k")
+        .arg("-o")
+        .arg(out.path())
+        .assert()
+        .success();
+
+    let gguf = mlx_native::gguf::GgufFile::open(out.path()).expect("parse output GGUF");
+    assert_eq!(gguf.tensor_count(), 16);
+    assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen3moe"));
+    // file_type = MostlyQ6_K = 18.
+    assert_eq!(gguf.metadata_u32("general.file_type"), Some(18));
+
+    let expected_names: &[&str] = &[
+        "token_embd.weight",
+        "output.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+        "blk.0.attn_output.weight",
+        "blk.0.ffn_gate_exps.weight",
+        "blk.0.ffn_up_exps.weight",
+        "blk.0.ffn_down_exps.weight",
+        "blk.1.attn_q.weight",
+        "blk.1.attn_k.weight",
+        "blk.1.attn_v.weight",
+        "blk.1.attn_output.weight",
+        "blk.1.ffn_gate_exps.weight",
+        "blk.1.ffn_up_exps.weight",
+        "blk.1.ffn_down_exps.weight",
+    ];
+
+    let mut saw_q6k = false;
+    for name in expected_names {
+        let info = gguf
+            .tensor_info(name)
+            .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
+        if info.ggml_type as u32 == 6 {
+            saw_q6k = true;
+        }
+        assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
+    }
+    assert!(saw_q6k, "expected ≥1 tensor at Q6_K (positional 6)");
+}
+
 // ----------------------------------------------------------------------------
 // Gemma 4 real-arch round-trip
 // ----------------------------------------------------------------------------
