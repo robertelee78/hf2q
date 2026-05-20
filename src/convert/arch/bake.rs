@@ -124,6 +124,13 @@ pub enum BakeOp {
     /// plan-build code is responsible for emitting the squeezed GGUF
     /// shape.
     Squeeze,
+
+    /// Composite operation: apply a sequence of [`BakeOp`]s
+    /// left-to-right to the buffer. Used by Qwen 3.5/3.6 linear-attn
+    /// tensors that need both a V-head reorder AND a value
+    /// transform (e.g. `A_log` = reorder rows + NegExp), or a
+    /// squeeze followed by a sliced reorder (`conv1d.weight`).
+    Sequence(Vec<BakeOp>),
 }
 
 /// Which half of a [`BakeOp::SplitAxisHalf`] to select.
@@ -174,6 +181,16 @@ impl fmt::Display for BakeOp {
                 "ReorderVHeadsPerRow {{ rows={row_count}, nk={num_k_heads}, nv_per_k={num_v_per_k}, head_dim_in_row={head_dim_in_row} }}"
             ),
             BakeOp::Squeeze => write!(f, "Squeeze"),
+            BakeOp::Sequence(ops) => {
+                write!(f, "Sequence([")?;
+                for (i, op) in ops.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{op}")?;
+                }
+                write!(f, "])")
+            }
         }
     }
 }
@@ -371,6 +388,18 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
             // data is byte-identical. Plan-build is responsible for
             // emitting the squeezed shape via `gguf_shape`.
             Ok(data)
+        }
+        BakeOp::Sequence(ops) => {
+            // Apply each op left-to-right. The intermediate buffer
+            // passes through unchanged on Squeeze, has its length
+            // changed on Slice/SplitAxisHalf, and has its layout
+            // changed by reorder variants. Composite operations
+            // (e.g. A_log = ReorderVHeads + NegExp) chain here.
+            let mut buf = data;
+            for inner in ops {
+                buf = apply_bake_op(buf, inner)?;
+            }
+            Ok(buf)
         }
     }
 }

@@ -329,28 +329,131 @@ fn map_linear_attn(
 ) -> Option<MappedTensor> {
     let blk = |suffix: &str| format!("blk.{layer}.{suffix}");
 
+    // Pre-compute reorder parameters for linear-attn tensors. Per
+    // canonical `_LinearAttentionVReorderBase.modify_tensors`
+    // (qwen.py:469-517) the V-head grouped→tiled reorder applies to
+    // EVERY linear_attn tensor (A_log, dt_bias, in_proj_a/b,
+    // in_proj_qkv, in_proj_z, conv1d, out_proj) — not just the three
+    // I originally implemented. Missing reorders on A_log /
+    // dt_bias / in_proj_a/b / conv1d V-portion produced garbled
+    // generation output (verified live 2026-05-19 on operator's model).
+    let nk = ctx.linear_num_key_heads;
+    let nv_per_k = ctx.num_v_per_k();
+    let vd = ctx.linear_value_head_dim;
+    let kd = ctx.linear_key_head_dim;
+    let reorder_required = ctx.linear_num_key_heads != ctx.linear_num_value_heads;
+
     match la_rest {
-        // No-bake renames first (simplest cases).
+        // norm.weight: no bake (the one canonical exception at
+        // qwen.py:303 — linear_attn.norm.weight does NOT get +1).
         "norm.weight" => Some(MappedTensor::Direct(blk("ssm_norm.weight"))),
-        "dt_bias" => Some(MappedTensor::Direct(blk("ssm_dt.bias"))),
-        "in_proj_a.weight" => Some(MappedTensor::Direct(blk("ssm_alpha.weight"))),
-        "in_proj_b.weight" => Some(MappedTensor::Direct(blk("ssm_beta.weight"))),
 
-        // A_log: element-wise -exp transform. GGUF target is bare
-        // `blk.<N>.ssm_a` (no `.weight` suffix) per
-        // /opt/llama.cpp/src/llama-arch.cpp:407 format string —
-        // matches canonical's 1-D parameter convention.
-        "A_log" => Some(MappedTensor::DirectWithBake {
-            gguf_name: blk("ssm_a"),
-            bake: BakeOp::NegExp,
-        }),
+        // dt_bias: 1-D parameter [nv_heads]. Reorder along last axis
+        // with head_dim=1. Canonical qwen.py:497-503.
+        "dt_bias" => {
+            if reorder_required {
+                Some(MappedTensor::DirectWithBake {
+                    gguf_name: blk("ssm_dt.bias"),
+                    bake: BakeOp::ReorderVHeads {
+                        num_k_heads: nk,
+                        num_v_per_k: nv_per_k,
+                        head_dim: 1,
+                        slice: None,
+                    },
+                })
+            } else {
+                Some(MappedTensor::Direct(blk("ssm_dt.bias")))
+            }
+        }
 
-        // conv1d.weight: safetensors shape [hidden, 1, kernel] but
-        // GGUF expects [hidden, kernel] — squeeze the singleton.
-        "conv1d.weight" => Some(MappedTensor::DirectWithBake {
-            gguf_name: blk("ssm_conv1d.weight"),
-            bake: BakeOp::Squeeze,
-        }),
+        // in_proj_a.weight / in_proj_b.weight: 2-D [nv_heads, cols].
+        // Reorder rows with head_dim=1 (which in flat layout becomes
+        // head_dim_in_bake = 1 * cols = cols). Canonical qwen.py:493-495.
+        "in_proj_a.weight" | "in_proj_b.weight" => {
+            let cols = if hf_shape.len() >= 2 { hf_shape[1] } else { 1 };
+            let gguf_name = if la_rest == "in_proj_a.weight" {
+                blk("ssm_alpha.weight")
+            } else {
+                blk("ssm_beta.weight")
+            };
+            if reorder_required {
+                Some(MappedTensor::DirectWithBake {
+                    gguf_name,
+                    bake: BakeOp::ReorderVHeads {
+                        num_k_heads: nk,
+                        num_v_per_k: nv_per_k,
+                        head_dim: cols,
+                        slice: None,
+                    },
+                })
+            } else {
+                Some(MappedTensor::Direct(gguf_name))
+            }
+        }
+
+        // A_log: 1-D [nv_heads]. Reorder rows (head_dim=1) then apply
+        // -exp value transform. Canonical _LinearAttentionVReorderBase
+        // reorders FIRST (qwen.py:497-503), then super() →
+        // Qwen3NextModel applies -torch.exp (qwen.py:297). GGUF target
+        // is bare `blk.<N>.ssm_a` (no `.weight` suffix).
+        "A_log" => {
+            let neg_exp = BakeOp::NegExp;
+            let bake = if reorder_required {
+                BakeOp::Sequence(vec![
+                    BakeOp::ReorderVHeads {
+                        num_k_heads: nk,
+                        num_v_per_k: nv_per_k,
+                        head_dim: 1,
+                        slice: None,
+                    },
+                    neg_exp,
+                ])
+            } else {
+                neg_exp
+            };
+            Some(MappedTensor::DirectWithBake {
+                gguf_name: blk("ssm_a"),
+                bake,
+            })
+        }
+
+        // conv1d.weight: safetensors [hidden, 1, kernel]. Canonical
+        // (qwen.py:507-513): squeeze → [hidden, kernel], then reorder
+        // ONLY the V channel portion (rows after qk_channels = head_k_dim
+        // * nk * 2) with head_dim = head_v_dim. Q+K channels pass
+        // through unchanged. Flat-buffer interpretation: V portion
+        // starts at offset `qk_channels * kernel`, length
+        // `nk * nv_per_k * vd * kernel`, head_dim_in_bake = vd * kernel.
+        "conv1d.weight" => {
+            // hf_shape is [hidden, 1, kernel]; pull kernel out.
+            let kernel = if hf_shape.len() >= 3 {
+                hf_shape[2]
+            } else {
+                // Fallback: shape may already be squeezed (2-D) in
+                // some checkpoints. Bare squeeze still required.
+                if hf_shape.len() >= 2 { hf_shape[1] } else { 1 }
+            };
+            let bake = if reorder_required {
+                let qk_channels = kd * nk * 2;
+                let v_off = qk_channels * kernel;
+                let v_len = nk * nv_per_k * vd * kernel;
+                BakeOp::Sequence(vec![
+                    BakeOp::Squeeze,
+                    BakeOp::ReorderVHeads {
+                        num_k_heads: nk,
+                        num_v_per_k: nv_per_k,
+                        head_dim: vd * kernel,
+                        slice: Some(v_off..(v_off + v_len)),
+                    },
+                ])
+            } else {
+                BakeOp::Squeeze
+            };
+            Some(MappedTensor::DirectWithBake {
+                gguf_name: blk("ssm_conv1d.weight"),
+                bake,
+            })
+        }
 
         // in_proj_qkv: HF shape [nk*(qd+kd) + nk*nv_per_k*vd, cols]
         // — Q rows + K rows + V rows packed along axis 0. Q and K
@@ -978,38 +1081,99 @@ mod tests {
     }
 
     #[test]
-    fn linear_attn_a_log_neg_exp() {
+    fn linear_attn_a_log_reorder_then_neg_exp() {
+        // A_log gets BOTH ReorderVHeads (head_dim=1, since A_log is
+        // 1-D [nv_heads]) AND -exp value transform per canonical's
+        // _LinearAttentionVReorderBase + Qwen3NextModel chain
+        // (qwen.py:497-503 reorder, then qwen.py:297 NegExp).
         let ctx = vlm_ctx();
         match map_tensor_name("model.language_model.layers.0.linear_attn.A_log", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "blk.0.ssm_a");
-                assert_eq!(bake, BakeOp::NegExp);
+                match bake {
+                    BakeOp::Sequence(ref ops) => {
+                        assert_eq!(ops.len(), 2);
+                        match ops[0] {
+                            BakeOp::ReorderVHeads { head_dim, .. } => assert_eq!(head_dim, 1),
+                            ref other => panic!("expected ReorderVHeads first, got {other:?}"),
+                        }
+                        assert_eq!(ops[1], BakeOp::NegExp);
+                    }
+                    other => panic!("expected Sequence, got {other:?}"),
+                }
             }
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
-    fn linear_attn_conv1d_squeeze() {
+    fn linear_attn_conv1d_squeeze_then_partial_reorder() {
+        // conv1d.weight: safetensors [hidden, 1, kernel]. Per canonical
+        // qwen.py:507-513 the bake is Squeeze + reorder ONLY the V
+        // channel portion (after qk_channels = head_k_dim * nk * 2).
         let ctx = vlm_ctx();
-        match map_tensor_name("model.language_model.layers.0.linear_attn.conv1d.weight", &[], &ctx) {
+        match map_tensor_name(
+            "model.language_model.layers.0.linear_attn.conv1d.weight",
+            &[2048, 1, 4],
+            &ctx,
+        ) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
                 assert_eq!(gguf_name, "blk.0.ssm_conv1d.weight");
-                assert_eq!(bake, BakeOp::Squeeze);
+                match bake {
+                    BakeOp::Sequence(ref ops) => {
+                        assert_eq!(ops.len(), 2);
+                        assert_eq!(ops[0], BakeOp::Squeeze);
+                        match ops[1] {
+                            BakeOp::ReorderVHeads { head_dim, ref slice, .. } => {
+                                assert_eq!(head_dim, 128 * 4); // vd * kernel
+                                let r = slice.as_ref().expect("expected V-portion slice");
+                                // qk_channels = 128*16*2 = 4096; v_off = 4096*4 = 16384
+                                assert_eq!(r.start, 16384);
+                            }
+                            ref other => panic!("expected ReorderVHeads 2nd, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Sequence, got {other:?}"),
+                }
             }
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
-    fn linear_attn_in_proj_a_b_direct_rename() {
+    fn linear_attn_in_proj_a_b_reorder_with_cols_head_dim() {
+        // in_proj_a / in_proj_b are 2-D [nv_heads, cols] and need
+        // row reorder with head_dim=cols (effective per-row block
+        // size) when num_k_heads != num_v_heads. Per canonical
+        // qwen.py:493-495.
         let ctx = vlm_ctx();
-        match map_tensor_name("model.language_model.layers.0.linear_attn.in_proj_a.weight", &[], &ctx) {
-            Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.0.ssm_alpha.weight"),
+        match map_tensor_name(
+            "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+            &[32, 2048],
+            &ctx,
+        ) {
+            Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
+                assert_eq!(gguf_name, "blk.0.ssm_alpha.weight");
+                match bake {
+                    BakeOp::ReorderVHeads {
+                        head_dim, slice, ..
+                    } => {
+                        assert_eq!(head_dim, 2048); // cols
+                        assert!(slice.is_none());
+                    }
+                    other => panic!("expected ReorderVHeads, got {other:?}"),
+                }
+            }
             other => panic!("unexpected: {other:?}"),
         }
-        match map_tensor_name("model.language_model.layers.0.linear_attn.in_proj_b.weight", &[], &ctx) {
-            Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.0.ssm_beta.weight"),
+        match map_tensor_name(
+            "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+            &[32, 2048],
+            &ctx,
+        ) {
+            Some(MappedTensor::DirectWithBake { gguf_name, .. }) => {
+                assert_eq!(gguf_name, "blk.0.ssm_beta.weight");
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }

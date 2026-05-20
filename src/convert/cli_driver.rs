@@ -1441,7 +1441,17 @@ fn build_convert_plan(
                 // GGUF + llama.cpp's ggml_ssm_conv expect `[hidden,
                 // kernel]` (2-D matrix). The element data is preserved
                 // bit-exact; only the shape vector changes.
-                if matches!(bake, BakeOp::Squeeze) {
+                // Also handle Squeeze nested inside Sequence (the
+                // canonical conv1d composite: Squeeze + V-portion
+                // ReorderVHeads).
+                fn contains_squeeze(op: &BakeOp) -> bool {
+                    match op {
+                        BakeOp::Squeeze => true,
+                        BakeOp::Sequence(inner) => inner.iter().any(contains_squeeze),
+                        _ => false,
+                    }
+                }
+                if contains_squeeze(&bake) {
                     gguf_shape.retain(|d| *d != 1);
                 }
                 let layer_index = gguf_name
