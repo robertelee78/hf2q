@@ -119,8 +119,8 @@ pub fn make_qx_quants(
         } else {
             x[i].abs().sqrt()
         };
-        sumlx = (w * x[i]).mul_add(li as f32, sumlx);
-        suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
+        sumlx += w * x[i] * li as f32;
+        suml2 += w * (li as f32) * (li as f32);
     }
     let mut scale = if suml2 != 0.0 { sumlx / suml2 } else { 0.0 };
     if return_early {
@@ -152,18 +152,8 @@ pub fn make_qx_quants(
             } else {
                 x[i].abs().sqrt()
             };
-            // Refinement loop (canonical lines 617-623): clang emits plain
-            // `fmul; fadd` (NO FMA) for these sums — disassembly of
-            // `_quantize_row_q6_K_ref` in `libggml-base.0.12.0.dylib` shows
-            // 32 `fmadd s` total, exactly matching ONE inner loop's worth
-            // (2*16). The 18 `is`-loop iterations all emit `fmul; fadd`
-            // separately (2-rounded). Therefore the refinement-loop sums
-            // must NOT use `.mul_add()`; only the initial pass (lines
-            // 122-123 above) FMAs to match canonical. Per ADR-033 §P1
-            // Q6_K closure (token_embd + attn_v 0.007373% residual root
-            // cause), 2026-05-20.
-            sumlx += w * x[i] * li as f32;
-            suml2 += w * (li as f32) * (li as f32);
+            sumlx = (w * x[i]).mul_add(li as f32, sumlx);
+            suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
         }
         if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
             for i in 0..n {
