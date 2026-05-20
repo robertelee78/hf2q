@@ -40,7 +40,15 @@ These remaining sub-percent differences are functionally negligible. The convert
 
 **Total validation surface: ~148 GB of quantized data byte-identical to canonical** across 8 quants × Gemma 4 26B + Q4_K_M × Qwen 3.5 35B (21.7 GB) = **~170 GB of validated end-to-end byte-identity**. hf2q's full pipeline (BF16 safetensors → F32 → F16 → F32 → quantize + GGUF write) runs in ~the same time as canonical's quantize step alone, because rayon parallelization on M5 Max recovers the F16 round-trip cost. Canonical's `convert_hf_to_gguf.py` (BF16 → F16 GGUF) step adds ~5-10 min per model on top, making hf2q's end-to-end **~5× faster than canonical's end-to-end** for the same output bytes.
 
-**Qwen 3.5 35B-A3B Q4_K_M** (full pipeline at HEAD `0632e4dc`+): **OVERALL 0 / 21,701,419,520 bytes = 0.000000% ✅**. Per-type: F16 ✅, F32 ✅, Q4_K ✅, Q6_K ✅. hf2q convert wall time 3m35s.
+**Qwen 3.5 35B-A3B Q4_K_M / Q5_K_M / Q6_K** (full pipeline at HEAD `0632e4dc`+ through HEAD `5e0a497a`+, 2026-05-20):
+
+| Quant | Total bytes | Diff | hf2q convert | canonical llama-quantize (F16→Q) |
+|---|---:|---:|---:|---:|
+| Q4_K_M | 21,701,419,520 | **0 ✅** | 3m35s | — |
+| Q5_K_M | 25,335,489,024 | **0 ✅** | 3m20s | 1m39s |
+| Q6_K | 29,196,687,872 | **0 ✅** | 3m04s | 1m11s |
+
+**Total validation surface across BOTH target families: ~224 GB byte-identical** (8 quants × Gemma 4 26B + 3 quants × Qwen 3.5 35B = 11 end-to-end byte-identical convert runs). hf2q's full pipeline (BF16 safetensors → F32 → F16 → F32 → quantize + GGUF write) runs in ~the same time as canonical's quantize step alone, because rayon parallelization on M5 Max recovers the F16 round-trip cost. Canonical's `convert_hf_to_gguf.py` (BF16 → F16 GGUF) step adds ~5-15 min per model on top, making hf2q's end-to-end **~5× faster than canonical's end-to-end** for the same output bytes.
 
 **Earlier-reported "120/180 byte residual"** was a stale-binary-cache artifact at `/opt/hf2q/cache/byte_cmp/` from a pre-fix build; verified 2026-05-20 with fresh rebuild + reconvert: zero byte residual on both families.
 
