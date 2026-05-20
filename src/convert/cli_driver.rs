@@ -642,16 +642,31 @@ fn resolve_imatrix_input(
     Ok(None)
 }
 
-/// Extract `num_hidden_layers` from the HF config. Required by
-/// `ApexPolicy::new` for the per-layer EDGE/NEAR/MID gradient. Returns
-/// `None` if the field is missing or non-positive — surfaces as
-/// [`ConvertError::ApexMissingLayerCount`] at the caller.
+/// Extract the effective layer count from the HF config — equals
+/// `num_hidden_layers + mtp_num_hidden_layers` (the latter defaults
+/// to 0 when not present). Required by `ApexPolicy::new` and the
+/// orchestrator's policy walk for the per-layer EDGE/NEAR/MID
+/// gradient.
+///
+/// Per canonical `_Qwen35MtpMixin.__init__` (qwen.py:550-555),
+/// `block_count = num_hidden_layers + mtp_num_hidden_layers` when
+/// MTP is present — so a Qwen 3.5 model with 40 transformer layers
+/// + 1 MTP block has 41 GGUF blocks (the MTP block lives at
+/// `blk.{num_hidden_layers}`).
+///
+/// Returns `None` if `num_hidden_layers` is missing or non-positive —
+/// surfaces as [`ConvertError::ApexMissingLayerCount`] at the caller.
 fn config_n_layers(config: &serde_json::Value) -> Option<u32> {
-    effective_config(config)
+    let cfg = effective_config(config);
+    let base = cfg
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
-        .filter(|&x| x > 0)
-        .map(|x| x as u32)
+        .filter(|&x| x > 0)?;
+    let mtp = cfg
+        .get("mtp_num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    Some((base + mtp) as u32)
 }
 
 // ============================================================================
@@ -816,12 +831,21 @@ fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertError> {
         .and_then(|v| v.as_u64())
         .map(|x| x as u32)
         .unwrap_or(0);
-    let n_layer = config
+    let n_hidden = config
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
         .ok_or(ConvertError::MissingHparam {
             key: "num_hidden_layers",
-        })? as u32;
+        })?;
+    // MTP-aware: include nextn-block layer count in HParams.n_layer
+    // so the policy walks 0..(n_hidden+mtp) and recognizes the MTP
+    // block at index n_hidden. See [`config_n_layers`] for the
+    // canonical rationale.
+    let n_mtp = config
+        .get("mtp_num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let n_layer = (n_hidden + n_mtp) as u32;
 
     Ok(HParams {
         n_expert,
@@ -887,13 +911,15 @@ fn build_metadata_for_arch(
         ArchName::Bert => bert::build_metadata(config, ftype),
         ArchName::NomicBert => nomic_bert::build_metadata(config, ftype),
         ArchName::Qwen35Moe => qwen35moe::build_metadata(config, ftype),
-        ArchName::Qwen35MoeFull => {
-            let mut kvs = qwen35moe::build_metadata(config, ftype);
-            if let Some(ctx) = build_qwen35moe_full_ctx(config) {
-                kvs.extend(qwen35moe_full::build_metadata(&ctx, config));
-            }
-            kvs
-        }
+        ArchName::Qwen35MoeFull => match build_qwen35moe_full_ctx(config) {
+            Some(ctx) => qwen35moe_full::build_metadata(&ctx, config, ftype),
+            // Config missing required hparams. Fall back to the older
+            // qwen3moe metadata layout (which uses `general.architecture
+            // = "qwen3moe"`) so at minimum SOME metadata is written;
+            // this case is also caught at map_tensor → UnmappedTensor
+            // for every tensor when ctx is missing.
+            None => qwen35moe::build_metadata(config, ftype),
+        },
         ArchName::Qwen3VlText => qwen3vl_text::build_metadata(config, ftype),
         ArchName::MiniMaxM2 => minimax_m2::build_metadata(config, ftype),
         // Falcon is a placeholder in ArchName for target_for's branch
@@ -999,7 +1025,7 @@ fn map_tensor(
 }
 
 /// Adapt the Qwen 3.5 MoE-full mapper's `MappedTensor` shape (Direct /
-/// DirectWithBake / SplitInto / Drop) to the driver-level
+/// DirectWithBake / SplitInto / ExpertGroup / Drop) to the driver-level
 /// [`MapOutcome`].
 fn lift_qwen35moe_full_mapped(m: Option<qwen35moe_full::MappedTensor>) -> MapOutcome {
     match m {
@@ -1008,6 +1034,17 @@ fn lift_qwen35moe_full_mapped(m: Option<qwen35moe_full::MappedTensor>) -> MapOut
             MapOutcome::DirectWithBake { gguf_name, bake }
         }
         Some(qwen35moe_full::MappedTensor::SplitInto(outputs)) => MapOutcome::SplitInto(outputs),
+        Some(qwen35moe_full::MappedTensor::ExpertGroup {
+            gguf_name,
+            layer,
+            expert_index,
+            kind,
+        }) => MapOutcome::Expert {
+            gguf_name,
+            layer,
+            expert_index,
+            kind,
+        },
         Some(qwen35moe_full::MappedTensor::Drop) => MapOutcome::Drop,
         None => MapOutcome::Unmapped,
     }
@@ -1354,10 +1391,14 @@ fn build_convert_plan(
     src: &HfModelSource,
     synthesized: &[HfTensor],
 ) -> Result<ConvertPlan, ConvertError> {
-    let n_experts = src
-        .config
+    // Multimodal-wrapping configs nest the text-decoder hparams under
+    // `text_config` (Qwen3_5MoeForConditionalGeneration / Gemma 4 omni).
+    // effective_config returns text_config when present, otherwise the
+    // root — same convention as build_metadata.
+    let n_experts_cfg = effective_config(&src.config);
+    let n_experts = n_experts_cfg
         .get("num_experts")
-        .or_else(|| src.config.get("num_local_experts"))
+        .or_else(|| n_experts_cfg.get("num_local_experts"))
         .and_then(|v| v.as_u64())
         .map(|x| x as usize);
 

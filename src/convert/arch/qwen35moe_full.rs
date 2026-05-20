@@ -65,6 +65,7 @@
 
 use crate::backends::gguf::types::MetaValue;
 use crate::convert::arch::bake::{BakeOp, SplitHalf};
+use crate::convert::arch::qwen35moe::ExpertKind;
 use crate::convert::cli_driver::SplitOutput;
 
 /// HF hparams a [`map_tensor_name`] call needs to construct concrete
@@ -148,6 +149,21 @@ pub enum MappedTensor {
     /// One HF tensor → N GGUF tensors. Used for the pre-fused
     /// `mlp.experts.gate_up_proj` split.
     SplitInto(Vec<SplitOutput>),
+
+    /// One HF tensor is one slice of a fused GGUF expert tensor. Used
+    /// for the per-expert layout in the MTP block (mtp.layers.0.mlp.
+    /// experts.<E>.<kind>_proj.weight) — the MTP block stores experts
+    /// per-expert even though the main model layers pre-fuse them.
+    /// The caller accumulates every expert of a given `(layer, kind)`
+    /// group and emits a single 3-D GGUF tensor named `gguf_name`
+    /// once `expert_index` covers `[0, n_experts)`. Mirrors the
+    /// older `qwen35moe::MappedTensor::ExpertGroup` semantics.
+    ExpertGroup {
+        gguf_name: String,
+        layer: usize,
+        expert_index: usize,
+        kind: ExpertKind,
+    },
 
     /// Known-discardable per the canonical Python converter (e.g.
     /// `model.visual.*` vision encoder tensors for the text-only
@@ -451,6 +467,39 @@ fn map_mlp(layer: usize, mlp_rest: &str, ctx: &Qwen35MoeFullCtx) -> Option<Mappe
             Some(MappedTensor::Direct(blk("ffn_down_exps.weight")))
         }
 
+        // Per-expert layout (MTP block uses this even though the main
+        // model layers pre-fuse experts into one tensor — verified
+        // 2026-05-19 on operator's Qwen-Qwen3.5-35B-A3B safetensors
+        // which has 256 mtp.layers.0.mlp.experts.<E>.{gate,up,down}_proj.weight
+        // tensors). Routes through ExpertGroup so the orchestrator
+        // accumulates and fuses at plan-build time.
+        rest if rest.starts_with("experts.") && rest != "experts.gate_up_proj"
+            && rest != "experts.gate_up_proj.weight"
+            && rest != "experts.down_proj"
+            && rest != "experts.down_proj.weight" =>
+        {
+            let expert_rest = rest.strip_prefix("experts.")?;
+            let dot = expert_rest.find('.')?;
+            let (expert_str, kind_with_dot) = expert_rest.split_at(dot);
+            let expert_index: usize = expert_str.parse().ok()?;
+            if expert_index.to_string() != expert_str {
+                return None;
+            }
+            let kind_tail = &kind_with_dot[1..];
+            let (kind, gguf_suffix) = match kind_tail {
+                "gate_proj.weight" => (ExpertKind::Gate, "ffn_gate_exps.weight"),
+                "up_proj.weight" => (ExpertKind::Up, "ffn_up_exps.weight"),
+                "down_proj.weight" => (ExpertKind::Down, "ffn_down_exps.weight"),
+                _ => return None,
+            };
+            Some(MappedTensor::ExpertGroup {
+                gguf_name: blk(gguf_suffix),
+                layer,
+                expert_index,
+                kind,
+            })
+        }
+
         "experts.gate_up_proj" | "experts.gate_up_proj.weight" => {
             // Pre-fused 3-D `[n_expert, 2*n_ff, n_embd]` → split into
             // `ffn_gate_exps` (first half) + `ffn_up_exps` (second half).
@@ -553,43 +602,135 @@ fn map_mtp(rest: &str, hf_shape: &[usize], ctx: &Qwen35MoeFullCtx) -> Option<Map
     map_per_block(bid + n_layer, inner, hf_shape, ctx)
 }
 
-/// Emit Qwen 3.5 MoE-specific GGUF metadata KVs. Called by the
-/// orchestrator after the standard arch/general KVs are written.
-///
-/// Per gguf-py `MODEL_ARCH.QWEN35MOE`:
-/// - `qwen35moe.rope.dimension_sections = [11, 11, 10, 0]` (MRoPE)
-/// - `qwen35moe.nextn_predict_layers = mtp_num_hidden_layers` (when MTP)
-/// - `qwen35moe.attention.output_gate = attn_output_gate` (when set)
-/// - `qwen35moe.expert_count = num_experts`
-/// - `qwen35moe.expert_used_count = num_experts_per_tok` (top-k)
-/// - `qwen35moe.expert_feed_forward_length = moe_intermediate_size`
-pub fn build_metadata(ctx: &Qwen35MoeFullCtx, config: &serde_json::Value) -> Vec<(String, MetaValue)> {
-    let mut kvs = Vec::new();
+/// Emit the full set of `qwen35moe.*` + `general.*` GGUF metadata KVs.
+/// Mirrors gguf-py `MODEL_ARCH.QWEN35MOE` and the canonical
+/// `Qwen3_5MoeTextModel.set_gguf_parameters` chain (qwen.py:522-616
+/// for `_Qwen35MRopeMixin` + `_Qwen35MtpMixin` + inherited Qwen3MoE
+/// hparams).
+pub fn build_metadata(
+    ctx: &Qwen35MoeFullCtx,
+    config: &serde_json::Value,
+    file_type: u32,
+) -> Vec<(String, MetaValue)> {
+    let text = effective_text_config(config);
+    let name = config
+        .get("_name_or_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("model")
+        .to_string();
 
-    // Expert metadata
-    kvs.push((
-        "qwen35moe.expert_count".into(),
-        MetaValue::U32(ctx.num_experts as u32),
-    ));
-    if let Some(top_k) = effective_text_field(config, "num_experts_per_tok").and_then(|v| v.as_u64()) {
-        kvs.push((
+    let hidden_size = text
+        .get("hidden_size")
+        .and_then(|v| v.as_u64())
+        .expect("config missing hidden_size") as u32;
+    let n_layers_base = text
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .expect("config missing num_hidden_layers") as u32;
+    let n_mtp = text
+        .get("mtp_num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let n_layers = n_layers_base + n_mtp;
+    let n_head = text
+        .get("num_attention_heads")
+        .and_then(|v| v.as_u64())
+        .expect("config missing num_attention_heads") as u32;
+    let n_head_kv = text
+        .get("num_key_value_heads")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as u32)
+        .unwrap_or(n_head);
+    let ctx_len = text
+        .get("max_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .expect("config missing max_position_embeddings") as u32;
+    let rms_eps = text
+        .get("rms_norm_eps")
+        .and_then(|v| v.as_f64())
+        .expect("config missing rms_norm_eps") as f32;
+    let moe_ffn = text
+        .get("moe_intermediate_size")
+        .and_then(|v| v.as_u64())
+        .expect("config missing moe_intermediate_size") as u32;
+    let n_experts = text
+        .get("num_experts")
+        .or_else(|| text.get("num_local_experts"))
+        .and_then(|v| v.as_u64())
+        .expect("config missing num_experts") as u32;
+    let n_experts_used = text
+        .get("num_experts_per_tok")
+        .and_then(|v| v.as_u64())
+        .expect("config missing num_experts_per_tok") as u32;
+    let rope_theta = text
+        .get("rope_theta")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10000.0) as f32;
+
+    let mut kvs: Vec<(String, MetaValue)> = vec![
+        (
+            "general.architecture".into(),
+            MetaValue::String("qwen35moe".into()),
+        ),
+        ("general.name".into(), MetaValue::String(name)),
+        ("qwen35moe.context_length".into(), MetaValue::U32(ctx_len)),
+        (
+            "qwen35moe.embedding_length".into(),
+            MetaValue::U32(hidden_size),
+        ),
+        ("qwen35moe.block_count".into(), MetaValue::U32(n_layers)),
+        (
+            "qwen35moe.feed_forward_length".into(),
+            MetaValue::U32(moe_ffn),
+        ),
+        (
+            "qwen35moe.attention.head_count".into(),
+            MetaValue::U32(n_head),
+        ),
+        (
+            "qwen35moe.attention.head_count_kv".into(),
+            MetaValue::U32(n_head_kv),
+        ),
+        (
+            "qwen35moe.attention.layer_norm_rms_epsilon".into(),
+            MetaValue::F32(rms_eps),
+        ),
+        (
+            "qwen35moe.rope.freq_base".into(),
+            MetaValue::F32(rope_theta),
+        ),
+        (
+            "qwen35moe.expert_count".into(),
+            MetaValue::U32(n_experts),
+        ),
+        (
             "qwen35moe.expert_used_count".into(),
-            MetaValue::U32(top_k as u32),
-        ));
-    }
-    kvs.push((
-        "qwen35moe.expert_feed_forward_length".into(),
-        MetaValue::U32(ctx.moe_intermediate_size as u32),
-    ));
+            MetaValue::U32(n_experts_used),
+        ),
+        (
+            "qwen35moe.expert_feed_forward_length".into(),
+            MetaValue::U32(moe_ffn),
+        ),
+        ("general.file_type".into(), MetaValue::U32(file_type)),
+    ];
 
     // MRoPE dimension sections (always written; default per
     // `_Qwen35MRopeMixin._QWEN35_DEFAULT_MROPE_SECTION` qwen.py:526).
-    let mrope: Vec<u32> = effective_text_field(config, "mrope_section")
+    let mrope: Vec<u32> = text
+        .get("rope_parameters")
+        .and_then(|rp| rp.get("mrope_section"))
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|x| x.as_u64().map(|n| n as u32))
                 .collect()
+        })
+        .or_else(|| {
+            text.get("mrope_section").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as u32))
+                    .collect()
+            })
         })
         .unwrap_or_else(|| vec![11, 11, 10, 0]);
     kvs.push((
@@ -597,8 +738,8 @@ pub fn build_metadata(ctx: &Qwen35MoeFullCtx, config: &serde_json::Value) -> Vec
         MetaValue::ArrayU32(mrope),
     ));
 
-    // attn_output_gate (Qwen 3.5/3.6 attention quirk).
-    if let Some(gate) = effective_text_field(config, "attn_output_gate").and_then(|v| v.as_bool()) {
+    // attn_output_gate (Qwen 3.5 attention quirk).
+    if let Some(gate) = text.get("attn_output_gate").and_then(|v| v.as_bool()) {
         kvs.push((
             "qwen35moe.attention.output_gate".into(),
             MetaValue::Bool(gate),
@@ -606,31 +747,24 @@ pub fn build_metadata(ctx: &Qwen35MoeFullCtx, config: &serde_json::Value) -> Vec
     }
 
     // nextn_predict_layers — emitted only when MTP is present.
-    if let Some(n_mtp) = effective_text_field(config, "mtp_num_hidden_layers")
-        .and_then(|v| v.as_u64())
-        .filter(|&n| n > 0)
-    {
+    if n_mtp > 0 {
         kvs.push((
             "qwen35moe.nextn_predict_layers".into(),
-            MetaValue::U32(n_mtp as u32),
+            MetaValue::U32(n_mtp),
         ));
     }
 
+    let _ = ctx; // future per-arch metadata may need ctx fields
     kvs
 }
 
-/// Look up a field that may live at the top level of `config` or
-/// nested under `config.text_config`. Mirrors canonical
-/// `convert_hf_to_gguf.py` behavior for multimodal-wrapping configs.
-fn effective_text_field<'a>(
-    config: &'a serde_json::Value,
-    field: &str,
-) -> Option<&'a serde_json::Value> {
-    if let Some(v) = config.get(field) {
-        return Some(v);
-    }
-    config.get("text_config").and_then(|tc| tc.get(field))
+/// Resolve the effective text-decoder config: nested `text_config`
+/// for multimodal-wrapping `ConditionalGeneration` configs, otherwise
+/// the root.
+fn effective_text_config(config: &serde_json::Value) -> &serde_json::Value {
+    config.get("text_config").unwrap_or(config)
 }
+
 
 #[cfg(test)]
 mod tests {
