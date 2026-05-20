@@ -23,6 +23,7 @@ pub mod arch;
 pub mod cli_driver;
 pub mod orchestrator;
 pub mod quant_selector;
+pub mod sleef_expf;
 pub mod source_dtype;
 pub mod source_reader;
 pub mod tokenizer;

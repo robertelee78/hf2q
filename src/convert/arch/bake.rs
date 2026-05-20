@@ -228,19 +228,17 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
             Ok(data)
         }
         BakeOp::NegExp => {
-            // Element-wise `x → -exp(x)` using Rust's libm-backed
-            // `f32::exp()`. Note: PyTorch's `torch.exp` produces
-            // 1-ULP-different results on a small fraction of inputs
-            // (verified 2026-05-19); neither libm `expf` nor Apple
-            // Accelerate `vvexpf` bit-matches PyTorch for the full
-            // input space. The 1-ULP diff propagates verbatim into
-            // F32-keep `ssm_a` tensors (28-30 of 30 layers affected,
-            // ~3-5 bytes per 128-byte tensor). Sub-machine-precision
-            // diff; downstream Q4_0 quantization (4-bit blocks) is
-            // unaffected since both 1-ULP-different F32 values
-            // collapse into the same 4-bit code.
+            // Element-wise `x → -exp(x)` via pure-Rust port of SLEEF's
+            // `xexpf` polynomial (`crate::convert::sleef_expf`). SLEEF
+            // is what PyTorch's CPU `torch.exp` uses internally on
+            // ARM64 macOS; using Rust's libm-backed `f32::exp()` here
+            // would produce 1-ULP-different values on ~8% of inputs,
+            // breaking ADR-033 §P1 byte-identity for `ssm_a` tensors.
+            // Verified bit-identical to `torch.exp` for input
+            // -3.796875 → 0x3cb7d5c0 (the documented divergence point
+            // where libm produced 0x3cb7d5bf).
             for x in data.iter_mut() {
-                *x = -x.exp();
+                *x = -crate::convert::sleef_expf::sleef_expf(*x);
             }
             Ok(data)
         }
