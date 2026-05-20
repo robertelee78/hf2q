@@ -53,6 +53,18 @@ Two root causes closed the historical gaps:
 Remaining matrix cells (per ADR §1 AC#2) are operator-time follow-ups:
 `q4_0`, `q4_k_s`, `q5_k_s`, `iq4_nl`, plus the APEX tier matrix.
 
+**Cross-family verification (Qwen)**: blocked by arch support. The supported set
+in hf2q convert (`src/convert/arch/`) is `llama, gemma3, bert, nomic_bert,
+qwen3_moe, qwen3_vl, minimax_m2`. The downloaded `Qwen/Qwen3.5-35B-A3B`
+declares `architectures: ["Qwen3_5MoeForConditionalGeneration"]` with
+`model_type: qwen3_5_moe` and an interleaved `linear_attention` + `full_attention`
+layer schedule — this is a new architecture distinct from `qwen3_moe`. Adding
+`qwen3_5_moe` support is a separate work item (per-arch tensor mapping +
+linear-attention layer handling), not a §P1 issue. Once arch support lands,
+the same byte-cmp + PPL gates from this matrix should re-run against
+Qwen3.5/3.6 to satisfy the [[feedback-test-both-families]] rule. Until then,
+the §P1 closure stands on Gemma 4 alone.
+
 ## Verdict summary
 
 **3 of 4 measured cells PASS the exit criterion** (|ratio − 1| < 0.05):
