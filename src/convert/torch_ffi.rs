@@ -16,7 +16,7 @@
 //! torch install path). When loaded, `BakeOp::NegExp` uses Sleef
 //! instead of Rust's `f32::exp`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use libloading::{Library, Symbol};
 
@@ -34,8 +34,10 @@ use libloading::{Library, Symbol};
 type SleefExpfFn = unsafe extern "C" fn(std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t;
 
 /// Process-singleton (same rationale as `canonical_ffi`: libtorch_cpu
-/// has global state and shouldn't be dlopen'd more than once).
-static TORCH_SINGLETON: OnceLock<Result<TorchExpInner, String>> = OnceLock::new();
+/// has global state and shouldn't be dlopen'd more than once). Stored
+/// alongside the resolving path so a second `try_init` with a different
+/// path is rejected rather than silently using the first lib.
+static TORCH_SINGLETON: OnceLock<Result<(PathBuf, TorchExpInner), String>> = OnceLock::new();
 
 struct TorchExpInner {
     _lib: Library,
@@ -47,13 +49,17 @@ unsafe impl Sync for TorchExpInner {}
 
 /// Try-load libtorch_cpu and resolve `Sleef_expf4_u10advsimd`. Fails
 /// fast if the symbol is missing. First successful load is process-wide
-/// sticky; subsequent calls return a handle to the same library.
+/// sticky; subsequent calls with the same path return Ok using the
+/// cached handle. Subsequent calls with a different path return an
+/// error rather than silently using the first lib — libtorch has global
+/// state and the process is committed to one path for its lifetime.
 pub fn try_init(path: impl AsRef<Path>) -> Result<(), String> {
     let path = path.as_ref();
+    let path_buf = path.to_path_buf();
     let result = TORCH_SINGLETON.get_or_init(|| {
         // SAFETY: dlopen is unsafe; we trust the user-provided libtorch.
-        let lib = unsafe { Library::new(path) }
-            .map_err(|e| format!("dlopen {}: {}", path.display(), e))?;
+        let lib = unsafe { Library::new(&path_buf) }
+            .map_err(|e| format!("dlopen {}: {}", path_buf.display(), e))?;
 
         // SAFETY: SleefExpfFn matches the C ABI of
         // `Sleef_expf4_u10advsimd` exactly: takes/returns float32x4_t
@@ -65,9 +71,22 @@ pub fn try_init(path: impl AsRef<Path>) -> Result<(), String> {
             *sym
         };
 
-        Ok(TorchExpInner { sleef_expf4, _lib: lib })
+        Ok((path_buf.clone(), TorchExpInner { sleef_expf4, _lib: lib }))
     });
-    result.as_ref().map(|_| ()).map_err(|e| e.clone())
+    match result {
+        Err(e) => Err(e.clone()),
+        Ok((cached_path, _)) => {
+            if cached_path != path {
+                Err(format!(
+                    "libtorch FFI already initialized with {}; cannot re-init with {}",
+                    cached_path.display(),
+                    path.display()
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Returns true if the libtorch FFI has been successfully loaded.
@@ -76,13 +95,15 @@ pub fn is_loaded() -> bool {
 }
 
 /// Apply Sleef expf to a slice in-place. Processes in 4-wide NEON
-/// chunks; scalar tail for `len % 4 != 0`. Panics if libtorch FFI
-/// hasn't been initialized via `try_init` — callers must check
-/// `is_loaded` first or this is a programming error.
+/// chunks; the `< 4` tail is loaded into a zero-padded 4-wide buffer,
+/// vectorized, and only the original positions are copied back.
 ///
-/// Returns Ok iff Sleef produced bit-identical results to torch.exp.
+/// Returns Err if `try_init` has not been called (or it failed). The
+/// per-call result is not re-verified against torch.exp — that
+/// invariant is established once by the `sleef_matches_torch_for_known_divergent_input`
+/// test against PyTorch's installed lib.
 pub fn exp_inplace(data: &mut [f32]) -> Result<(), String> {
-    let Some(Ok(inner)) = TORCH_SINGLETON.get() else {
+    let Some(Ok((_, inner))) = TORCH_SINGLETON.get() else {
         return Err("libtorch FFI not initialized; call try_init() first".into());
     };
 
