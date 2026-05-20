@@ -227,6 +227,48 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// 2026-05-20 broad-sample diagnostic — confirm the make_qx_quants
+    /// fix at b921616e is globally robust on Qwen 3.5 Q6_K, not just
+    /// output.weight row 149. Samples 12 rows across 4 Q6_K tensors.
+    #[test]
+    #[ignore]
+    fn qwen35_q6k_broad_sample_dump() {
+        let cases: &[(&str, usize, &[usize])] = &[
+            ("output_weight", 2048, &[0, 149, 100000]),
+            ("blk_0_attn_qkv_weight", 2048, &[0, 100, 1000]),
+            ("blk_0_ffn_down_exps_weight", 512, &[0, 1000, 50000]),
+            ("blk_10_attn_qkv_weight", 2048, &[0, 500, 1500]),
+        ];
+        let mut grand_total_diff = 0usize;
+        let mut grand_total = 0usize;
+        for (name, n_per_row, rows) in cases {
+            for &row_idx in *rows {
+                let f32_path = format!("/tmp/c_quant_repro/qwen35_{}_row{}_f32.bin", name, row_idx);
+                let q6k_path = format!("/tmp/c_quant_repro/qwen35_{}_row{}_q6k.bin", name, row_idx);
+                let f32_bytes = std::fs::read(&f32_path)
+                    .unwrap_or_else(|_| panic!("{} must exist", f32_path));
+                let canonical = std::fs::read(&q6k_path)
+                    .unwrap_or_else(|_| panic!("{} must exist", q6k_path));
+                let n_blocks = n_per_row / 256;
+                assert_eq!(f32_bytes.len(), n_per_row * 4);
+                assert_eq!(canonical.len(), n_blocks * BLOCK_BYTES);
+                let f32: Vec<f32> = f32_bytes.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let q6k = quantize(&f32, *n_per_row, None);
+                let diff: usize = q6k.iter().zip(canonical.iter())
+                    .filter(|(a, b)| a != b).count();
+                if diff > 0 {
+                    println!("{} row {}: {} bytes differ", name, row_idx, diff);
+                }
+                grand_total_diff += diff;
+                grand_total += q6k.len();
+            }
+        }
+        println!("\nQ6_K BROAD GRAND TOTAL: {}/{} bytes differ ({:.6}%)",
+            grand_total_diff, grand_total, 100.0 * grand_total_diff as f64 / grand_total as f64);
+    }
+
     /// One-off bisection harness for the Qwen 3.5 lm_head Q6_K block 1199 residual.
     /// Reads the exact 2048 F32 values that canonical reads for row 149 of
     /// output.weight (extracted from canonical's F16 GGUF) and prints what
