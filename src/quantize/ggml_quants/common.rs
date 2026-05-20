@@ -232,11 +232,10 @@ pub fn make_qkx2_quants(
         let li = nearest_int(iscale * (x[i] - min));
         let li_c = li.max(0).min(nmax) as u8;
         l[i] = li_c;
-        // FMA: clang fuses `scale * li_c + min` into fmadd, then subtracts x[i].
-        // 2 rounding ops vs Rust's 3 (fmul + fadd + fsub).
-        let mut diff = scale.mul_add(li_c as f32, min) - x[i];
+        // 2026-05-20: plain *+ matches canonical (neutral per bisection).
+        let mut diff = scale * li_c as f32 + min - x[i];
         diff = if use_mad { diff.abs() } else { diff * diff };
-        best_error = weights[i].mul_add(diff, best_error);
+        best_error += weights[i] * diff;
     }
     if nstep < 1 {
         *the_min = -min;
@@ -272,7 +271,7 @@ pub fn make_qkx2_quants(
             for i in 0..n {
                 let mut diff = this_scale * l_aux[i] as f32 + this_min - x[i];
                 diff = if use_mad { diff.abs() } else { diff * diff };
-                cur_error = weights[i].mul_add(diff, cur_error);
+                cur_error += weights[i] * diff;
             }
             if cur_error < best_error {
                 for i in 0..n {
