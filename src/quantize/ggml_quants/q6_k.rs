@@ -227,6 +227,42 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// One-off bisection harness for the Qwen 3.5 lm_head Q6_K block 1199 residual.
+    /// Reads the exact 2048 F32 values that canonical reads for row 149 of
+    /// output.weight (extracted from canonical's F16 GGUF) and prints what
+    /// hf2q's Q6_K kernel produces for block 7. Compared against canonical's
+    /// linked-library output (scales[12] should be -61/195).
+    #[test]
+    #[ignore]
+    fn qwen35_lm_head_row149_q6k_block7_dump() {
+        let bytes = std::fs::read("/tmp/c_quant_repro/row149_canonical_f32.bin")
+            .expect("/tmp/c_quant_repro/row149_canonical_f32.bin must exist");
+        assert_eq!(bytes.len(), 8192, "expected 2048 F32 = 8192 bytes");
+        let mut f32_vals = Vec::with_capacity(2048);
+        for chunk in bytes.chunks_exact(4) {
+            f32_vals.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        let q6k_bytes = quantize(&f32_vals, 2048, None);
+        assert_eq!(q6k_bytes.len(), 8 * BLOCK_BYTES);
+        let blk7 = &q6k_bytes[7 * BLOCK_BYTES..8 * BLOCK_BYTES];
+        let ql_hex: String = blk7[..8].iter().map(|b| format!("{:02x}", b)).collect();
+        let scales_i8: Vec<i8> = blk7[192..208].iter().map(|&b| b as i8).collect();
+        let scales_u8: Vec<u8> = blk7[192..208].to_vec();
+        println!("hf2q row149 block7: ql[..8]={}", ql_hex);
+        println!("hf2q row149 block7: scales i8 = {:?}", scales_i8);
+        println!("hf2q row149 block7: scales u8 = {:?}", scales_u8);
+        println!("hf2q row149 block7: d (f16) = {:02x} {:02x}", blk7[208], blk7[209]);
+        // Canonical reference: scales u8 = [81, 87, 68, 164, 145, 72, 104, 196, 67, 50, 170, 100, 195, 160, 200, 128]
+        let canon: Vec<u8> = vec![81, 87, 68, 164, 145, 72, 104, 196, 67, 50, 170, 100, 195, 160, 200, 128];
+        for ib in 0..16 {
+            if scales_u8[ib] != canon[ib] {
+                println!("  MISMATCH ib={} hf2q={} canon={} delta={}",
+                    ib, scales_u8[ib], canon[ib],
+                    scales_u8[ib] as i32 - canon[ib] as i32);
+            }
+        }
+    }
+
     fn fixture_path(name: &str) -> PathBuf {
         let manifest = std::env::var("CARGO_MANIFEST_DIR")
             .expect("CARGO_MANIFEST_DIR not set by cargo test");
