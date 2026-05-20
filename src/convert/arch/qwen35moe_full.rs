@@ -271,7 +271,7 @@ fn map_per_block(
     }
     if rest == "post_attention_layernorm.weight" {
         return Some(MappedTensor::DirectWithBake {
-            gguf_name: blk("attn_post_norm.weight"),
+            gguf_name: blk("post_attention_norm.weight"),
             bake: BakeOp::AddOne,
         });
     }
@@ -336,9 +336,12 @@ fn map_linear_attn(
         "in_proj_a.weight" => Some(MappedTensor::Direct(blk("ssm_alpha.weight"))),
         "in_proj_b.weight" => Some(MappedTensor::Direct(blk("ssm_beta.weight"))),
 
-        // A_log: element-wise -exp transform.
+        // A_log: element-wise -exp transform. GGUF target is bare
+        // `blk.<N>.ssm_a` (no `.weight` suffix) per
+        // /opt/llama.cpp/src/llama-arch.cpp:407 format string —
+        // matches canonical's 1-D parameter convention.
         "A_log" => Some(MappedTensor::DirectWithBake {
-            gguf_name: blk("ssm_a.weight"),
+            gguf_name: blk("ssm_a"),
             bake: BakeOp::NegExp,
         }),
 
@@ -371,7 +374,9 @@ fn map_linear_attn(
             let v_slice_start = (qd + kd) * nk * cols;
             let v_slice_len = nv_per_k * vd * nk * cols;
             Some(MappedTensor::DirectWithBake {
-                gguf_name: blk("ssm_in_proj_qkv.weight"),
+                // Linear-attn in_proj_qkv → attn_qkv per
+                // qwen35moe.cpp:88 (LLM_TENSOR_ATTN_QKV).
+                gguf_name: blk("attn_qkv.weight"),
                 bake: BakeOp::ReorderVHeads {
                     num_k_heads: nk,
                     num_v_per_k: nv_per_k,
@@ -392,7 +397,9 @@ fn map_linear_attn(
             let nv_per_k = ctx.num_v_per_k();
             let vd = ctx.linear_value_head_dim;
             Some(MappedTensor::DirectWithBake {
-                gguf_name: blk("ssm_in_proj_z.weight"),
+                // Linear-attn in_proj_z → attn_gate per
+                // qwen35moe.cpp:89 (LLM_TENSOR_ATTN_GATE).
+                gguf_name: blk("attn_gate.weight"),
                 bake: BakeOp::ReorderVHeads {
                     num_k_heads: nk,
                     num_v_per_k: nv_per_k,
@@ -565,22 +572,25 @@ fn map_mtp(rest: &str, hf_shape: &[usize], ctx: &Qwen35MoeFullCtx) -> Option<Map
 
     // Top-level MTP helpers.
     match rest {
-        "fc.weight" => return Some(MappedTensor::Direct(mtp_blk("eh_proj.weight"))),
+        // MTP helpers — per llama-arch.cpp:448-453 the GGUF names use
+        // the `nextn.` infix (blk.<N>.nextn.eh_proj /
+        // .nextn.enorm / .nextn.hnorm / .nextn.shared_head_norm).
+        "fc.weight" => return Some(MappedTensor::Direct(mtp_blk("nextn.eh_proj.weight"))),
         "pre_fc_norm_embedding.weight" => {
             return Some(MappedTensor::DirectWithBake {
-                gguf_name: mtp_blk("enorm.weight"),
+                gguf_name: mtp_blk("nextn.enorm.weight"),
                 bake: BakeOp::AddOne,
             });
         }
         "pre_fc_norm_hidden.weight" => {
             return Some(MappedTensor::DirectWithBake {
-                gguf_name: mtp_blk("hnorm.weight"),
+                gguf_name: mtp_blk("nextn.hnorm.weight"),
                 bake: BakeOp::AddOne,
             });
         }
         "norm.weight" => {
             return Some(MappedTensor::DirectWithBake {
-                gguf_name: mtp_blk("shared_head_norm.weight"),
+                gguf_name: mtp_blk("nextn.shared_head_norm.weight"),
                 bake: BakeOp::AddOne,
             });
         }
@@ -667,6 +677,51 @@ pub fn build_metadata(
         .and_then(|v| v.as_f64())
         .unwrap_or(10000.0) as f32;
 
+    // SSM + linear-attention hparams. Per canonical
+    // `Qwen3NextModel.set_gguf_parameters` (qwen.py:276-285):
+    //   ssm.conv_kernel = linear_conv_kernel_dim
+    //   ssm.state_size  = linear_key_head_dim
+    //   ssm.group_count = linear_num_key_heads
+    //   ssm.time_step_rank = linear_num_value_heads
+    //   ssm.inner_size  = linear_value_head_dim * linear_num_value_heads
+    //   attention.full_attention_interval = full_attention_interval (default 4)
+    //   rope.dimension_count = int(rope_dim * partial_rotary_factor)
+    //     where rope_dim = head_dim || (hidden_size / num_attention_heads)
+    let linear_conv_kernel_dim = text
+        .get("linear_conv_kernel_dim")
+        .and_then(|v| v.as_u64())
+        .expect("config missing linear_conv_kernel_dim") as u32;
+    let linear_key_head_dim = text
+        .get("linear_key_head_dim")
+        .and_then(|v| v.as_u64())
+        .expect("config missing linear_key_head_dim") as u32;
+    let linear_num_key_heads = text
+        .get("linear_num_key_heads")
+        .and_then(|v| v.as_u64())
+        .expect("config missing linear_num_key_heads") as u32;
+    let linear_num_value_heads = text
+        .get("linear_num_value_heads")
+        .and_then(|v| v.as_u64())
+        .expect("config missing linear_num_value_heads") as u32;
+    let linear_value_head_dim = text
+        .get("linear_value_head_dim")
+        .and_then(|v| v.as_u64())
+        .expect("config missing linear_value_head_dim") as u32;
+    let ssm_inner_size = linear_value_head_dim * linear_num_value_heads;
+    let full_attn_interval = text
+        .get("full_attention_interval")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4) as u32;
+    let head_dim = text
+        .get("head_dim")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| (hidden_size as u64) / (n_head as u64)) as u32;
+    let partial_rotary_factor = text
+        .get("partial_rotary_factor")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.25);
+    let rope_dim_count = ((head_dim as f64) * partial_rotary_factor) as u32;
+
     let mut kvs: Vec<(String, MetaValue)> = vec![
         (
             "general.architecture".into(),
@@ -700,6 +755,24 @@ pub fn build_metadata(
             MetaValue::F32(rope_theta),
         ),
         (
+            "qwen35moe.rope.dimension_count".into(),
+            MetaValue::U32(rope_dim_count),
+        ),
+        // attention.{key,value}_length — per canonical
+        // /opt/llama.cpp/conversion/base.py:1217-1218 emit head_dim
+        // when present in config. llama.cpp's hparam loader uses these
+        // to set `n_embd_head_k`/`n_embd_head_v`; absent, it defaults
+        // to `hidden / n_head` which is WRONG for Qwen 3.5 where
+        // head_dim=256 but hidden/n_head=128.
+        (
+            "qwen35moe.attention.key_length".into(),
+            MetaValue::U32(head_dim),
+        ),
+        (
+            "qwen35moe.attention.value_length".into(),
+            MetaValue::U32(head_dim),
+        ),
+        (
             "qwen35moe.expert_count".into(),
             MetaValue::U32(n_experts),
         ),
@@ -711,12 +784,44 @@ pub fn build_metadata(
             "qwen35moe.expert_feed_forward_length".into(),
             MetaValue::U32(moe_ffn),
         ),
+        // SSM (linear-attention) hparams
+        (
+            "qwen35moe.ssm.conv_kernel".into(),
+            MetaValue::U32(linear_conv_kernel_dim),
+        ),
+        (
+            "qwen35moe.ssm.state_size".into(),
+            MetaValue::U32(linear_key_head_dim),
+        ),
+        (
+            "qwen35moe.ssm.group_count".into(),
+            MetaValue::U32(linear_num_key_heads),
+        ),
+        (
+            "qwen35moe.ssm.time_step_rank".into(),
+            MetaValue::U32(linear_num_value_heads),
+        ),
+        (
+            "qwen35moe.ssm.inner_size".into(),
+            MetaValue::U32(ssm_inner_size),
+        ),
+        (
+            "qwen35moe.attention.full_attention_interval".into(),
+            MetaValue::U32(full_attn_interval),
+        ),
         ("general.file_type".into(), MetaValue::U32(file_type)),
     ];
 
-    // MRoPE dimension sections (always written; default per
-    // `_Qwen35MRopeMixin._QWEN35_DEFAULT_MROPE_SECTION` qwen.py:526).
-    let mrope: Vec<u32> = text
+    // MRoPE dimension sections. The Qwen 3.5 config ships
+    // [11, 11, 10] (3 values) but llama.cpp's GGUF reader expects
+    // exactly 4 (the time dimension occupies the trailing slot,
+    // defaulting to 0). Canonical pads in `base.py:1174-1180`:
+    //   while len(mrope_section) < 4: mrope_section.append(0)
+    //   self.gguf_writer.add_rope_dimension_sections(mrope_section[:4])
+    // The `_Qwen35MRopeMixin._QWEN35_DEFAULT_MROPE_SECTION` (qwen.py:526)
+    // default `[11, 11, 10, 0]` only fires when `mrope_section` is
+    // entirely absent.
+    let mut mrope: Vec<u32> = text
         .get("rope_parameters")
         .and_then(|rp| rp.get("mrope_section"))
         .and_then(|v| v.as_array())
@@ -733,6 +838,10 @@ pub fn build_metadata(
             })
         })
         .unwrap_or_else(|| vec![11, 11, 10, 0]);
+    while mrope.len() < 4 {
+        mrope.push(0);
+    }
+    mrope.truncate(4);
     kvs.push((
         "qwen35moe.rope.dimension_sections".into(),
         MetaValue::ArrayU32(mrope),
@@ -850,7 +959,7 @@ mod tests {
         let ctx = vlm_ctx();
         match map_tensor_name("model.language_model.layers.3.post_attention_layernorm.weight", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
-                assert_eq!(gguf_name, "blk.3.attn_post_norm.weight");
+                assert_eq!(gguf_name, "blk.3.post_attention_norm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
             }
             other => panic!("unexpected: {other:?}"),
@@ -873,7 +982,7 @@ mod tests {
         let ctx = vlm_ctx();
         match map_tensor_name("model.language_model.layers.0.linear_attn.A_log", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
-                assert_eq!(gguf_name, "blk.0.ssm_a.weight");
+                assert_eq!(gguf_name, "blk.0.ssm_a");
                 assert_eq!(bake, BakeOp::NegExp);
             }
             other => panic!("unexpected: {other:?}"),
@@ -918,7 +1027,7 @@ mod tests {
             &ctx,
         ) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
-                assert_eq!(gguf_name, "blk.0.ssm_in_proj_qkv.weight");
+                assert_eq!(gguf_name, "blk.0.attn_qkv.weight");
                 match bake {
                     BakeOp::ReorderVHeads {
                         num_k_heads,
@@ -956,7 +1065,7 @@ mod tests {
             &ctx,
         ) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
-                assert_eq!(gguf_name, "blk.0.ssm_in_proj_z.weight");
+                assert_eq!(gguf_name, "blk.0.attn_gate.weight");
                 match bake {
                     BakeOp::ReorderVHeads {
                         num_k_heads,
@@ -1121,26 +1230,26 @@ mod tests {
         let ctx = vlm_ctx();
         // n_layer = 80, so MTP block lives at blk.80.
         match map_tensor_name("mtp.fc.weight", &[], &ctx) {
-            Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.80.eh_proj.weight"),
+            Some(MappedTensor::Direct(s)) => assert_eq!(s, "blk.80.nextn.eh_proj.weight"),
             other => panic!("unexpected: {other:?}"),
         }
         match map_tensor_name("mtp.pre_fc_norm_embedding.weight", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
-                assert_eq!(gguf_name, "blk.80.enorm.weight");
+                assert_eq!(gguf_name, "blk.80.nextn.enorm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
             }
             other => panic!("unexpected: {other:?}"),
         }
         match map_tensor_name("mtp.pre_fc_norm_hidden.weight", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
-                assert_eq!(gguf_name, "blk.80.hnorm.weight");
+                assert_eq!(gguf_name, "blk.80.nextn.hnorm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
             }
             other => panic!("unexpected: {other:?}"),
         }
         match map_tensor_name("mtp.norm.weight", &[], &ctx) {
             Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
-                assert_eq!(gguf_name, "blk.80.shared_head_norm.weight");
+                assert_eq!(gguf_name, "blk.80.nextn.shared_head_norm.weight");
                 assert_eq!(bake, BakeOp::AddOne);
             }
             other => panic!("unexpected: {other:?}"),

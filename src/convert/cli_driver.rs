@@ -1434,7 +1434,16 @@ fn build_convert_plan(
                 });
             }
             MapOutcome::DirectWithBake { gguf_name, bake } => {
-                let gguf_shape: Vec<usize> = meta.shape.iter().rev().copied().collect();
+                let mut gguf_shape: Vec<usize> = meta.shape.iter().rev().copied().collect();
+                // Squeeze drops every singleton dim from gguf_shape —
+                // the safetensors stores Qwen 3.5/3.6 linear_attn
+                // `conv1d.weight` as `[hidden, 1, kernel]` (3-D) but
+                // GGUF + llama.cpp's ggml_ssm_conv expect `[hidden,
+                // kernel]` (2-D matrix). The element data is preserved
+                // bit-exact; only the shape vector changes.
+                if matches!(bake, BakeOp::Squeeze) {
+                    gguf_shape.retain(|d| *d != 1);
+                }
                 let layer_index = gguf_name
                     .strip_prefix("blk.")
                     .and_then(|s| s.split('.').next())
