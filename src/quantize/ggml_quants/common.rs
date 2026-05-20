@@ -270,7 +270,7 @@ pub fn make_qkx2_quants(
             }
             let mut cur_error = 0.0f32;
             for i in 0..n {
-                let mut diff = this_scale.mul_add(l_aux[i] as f32, this_min) - x[i];
+                let mut diff = this_scale * l_aux[i] as f32 + this_min - x[i];
                 diff = if use_mad { diff.abs() } else { diff * diff };
                 cur_error = weights[i].mul_add(diff, cur_error);
             }
@@ -345,14 +345,14 @@ pub fn make_qkx3_quants(
         let li = nearest_int(iscale * (x[i] - min));
         let li_c = li.max(0).min(nmax) as u8;
         l[i] = li_c;
-        // FMA: clang fuses `scale * li_c + min` to fmadd; mirror.
-        let mut diff = scale.mul_add(li_c as f32, min) - x[i];
+        // 2026-05-20: plain *+ matches canonical (neutral per make_qkx2 bisection).
+        let mut diff = scale * li_c as f32 + min - x[i];
         diff = if use_mad { diff.abs() } else { diff * diff };
         let w = match weights {
             Some(ws) => ws[i],
             None => x[i] * x[i],
         };
-        best_mad = w.mul_add(diff, best_mad);
+        best_mad += w * diff;
     }
     if nstep < 1 {
         *the_min = -min;
@@ -388,13 +388,13 @@ pub fn make_qkx3_quants(
             }
             let mut mad = 0.0f32;
             for i in 0..n {
-                let mut diff = this_scale.mul_add(l_aux[i] as f32, this_min) - x[i];
+                let mut diff = this_scale * l_aux[i] as f32 + this_min - x[i];
                 diff = if use_mad { diff.abs() } else { diff * diff };
                 let w = match weights {
                     Some(ws) => ws[i],
                     None => x[i] * x[i],
                 };
-                mad = w.mul_add(diff, mad);
+                mad += w * diff;
             }
             if mad < best_mad {
                 for i in 0..n {
