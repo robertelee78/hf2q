@@ -446,11 +446,10 @@ pub fn make_qp_quants(
     let scale = 1.0 / iscale;
     let mut best_mse = 0.0f32;
     for i in 0..n {
-        // FMA: clang fuses `x - scale*l` to fnmsub (fmsub negated).
-        let diff = scale.mul_add(-(l[i] as f32), x[i]);
+        // 2026-05-20: plain matches canonical fp-contract=off.
+        let diff = x[i] - scale * l[i] as f32;
         let w = quant_weights[i];
-        // FMA: clang fuses `w * diff * diff + best_mse` into (fmul + fmadd).
-        best_mse = (w * diff).mul_add(diff, best_mse);
+        best_mse += w * diff * diff;
     }
     for is in -4i32..=4i32 {
         if is == 0 {
@@ -464,9 +463,9 @@ pub fn make_qp_quants(
             if li > nmax {
                 li = nmax;
             }
-            let diff = scale_is.mul_add(-(li as f32), x[i]);
+            let diff = x[i] - scale_is * li as f32;
             let w = quant_weights[i];
-            mse = (w * diff).mul_add(diff, mse);
+            mse += w * diff * diff;
         }
         if mse < best_mse {
             best_mse = mse;
@@ -482,27 +481,26 @@ pub fn make_qp_quants(
         }
         l[i] = li as u8;
         let w = quant_weights[i];
-        // FMA: same pattern as make_qx_quants accumulators.
-        sumlx = (w * x[i]).mul_add(li as f32, sumlx);
-        suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
+        // 2026-05-20: plain matches canonical fp-contract=off (same as make_qx_quants).
+        sumlx += w * x[i] * li as f32;
+        suml2 += w * (li as f32) * (li as f32);
     }
     for _itry in 0..5 {
         let mut n_changed = 0;
         for i in 0..n {
             let w = quant_weights[i];
             let cur_l = l[i] as f32;
-            // FMA-subtract: clang fuses these as `fmsub slx, w*x[i], cur_l, sumlx`.
-            // Rust equivalent: (a*b).mul_add(-c, d) = a*b*(-c)+d = d - a*b*c.
-            let mut slx = (w * x[i]).mul_add(-cur_l, sumlx);
-            let mut sl2 = (w * cur_l).mul_add(-cur_l, suml2);
+            // 2026-05-20: plain matches canonical fp-contract=off.
+            let mut slx = sumlx - w * x[i] * cur_l;
+            let mut sl2 = suml2 - w * cur_l * cur_l;
             if slx > 0.0 && sl2 > 0.0 {
                 let mut new_l = nearest_int(x[i] * sl2 / slx);
                 if new_l > nmax {
                     new_l = nmax;
                 }
                 if new_l as u8 != l[i] {
-                    slx = (w * x[i]).mul_add(new_l as f32, slx);
-                    sl2 = (w * (new_l as f32)).mul_add(new_l as f32, sl2);
+                    slx += w * x[i] * new_l as f32;
+                    sl2 += w * (new_l as f32) * (new_l as f32);
                     if slx * slx * suml2 > sumlx * sumlx * sl2 {
                         l[i] = new_l as u8;
                         sumlx = slx;
