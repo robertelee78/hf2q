@@ -987,4 +987,78 @@ mod tests {
             diffs
         );
     }
+
+    /// Microbench: pure-Rust Q4_K_M kernel throughput on a real Gemma 4
+    /// 26B tensor (`blk.0.attn_k.weight`, 2816 × 2048 f32 = 22.5 MiB
+    /// input → 3.1 MiB Q4_K_M output). Runs `N` iterations and reports
+    /// median ns/element + MiB/s output bandwidth.
+    ///
+    /// `#[ignore]`'d because (a) it depends on the same external fixture
+    /// `/tmp/blk0_attn_k_f32.bin` that `real_model_byte_cmp_blk0_attn_k`
+    /// uses, and (b) it's a wall-clock measurement that doesn't belong
+    /// in the regular CI gate. Run with:
+    ///
+    ///     cargo test --release --bin hf2q q4k_bench -- --ignored --nocapture
+    ///
+    /// Reports both single-threaded and (with `rayon` enabled, which is
+    /// always on in the production `quantize()` path per ADR-036) the
+    /// parallel result. ADR-033 §P1 benchmark track.
+    #[test]
+    #[ignore]
+    fn q4k_microbench_blk0_attn_k_gemma() {
+        let f32_path = "/tmp/blk0_attn_k_f32.bin";
+        if !std::path::Path::new(f32_path).exists() {
+            eprintln!("[skip] fixture {} missing", f32_path);
+            return;
+        }
+        let raw = fs::read(f32_path).expect("read fixture");
+        let n_elem = raw.len() / 4;
+        let mut input = Vec::with_capacity(n_elem);
+        for i in 0..n_elem {
+            let b = [raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]];
+            input.push(f32::from_le_bytes(b));
+        }
+        let n_per_row = 2816usize;
+        let n_rows = n_elem / n_per_row;
+        assert_eq!(n_rows, 2048);
+
+        // Warm up — first call may pay one-time costs (Vec allocation,
+        // page faults on output buffer, branch predictor priming).
+        let _ = quantize(&input, n_per_row, None);
+
+        const ITERS: usize = 5;
+        let mut wall_ns = Vec::with_capacity(ITERS);
+        let mut out_bytes = 0usize;
+        for _ in 0..ITERS {
+            let t0 = std::time::Instant::now();
+            let out = quantize(&input, n_per_row, None);
+            let dt = t0.elapsed().as_nanos() as u64;
+            out_bytes = out.len();
+            wall_ns.push(dt);
+        }
+        wall_ns.sort();
+        let median_ns = wall_ns[ITERS / 2];
+
+        let input_bytes = n_elem * 4;
+        let in_mib_s = (input_bytes as f64 / 1.048_576e6) / (median_ns as f64 / 1e9);
+        let out_mib_s = (out_bytes as f64 / 1.048_576e6) / (median_ns as f64 / 1e9);
+        let ns_per_elem = median_ns as f64 / n_elem as f64;
+
+        eprintln!(
+            "\nQ4_K_M microbench (Gemma blk.0.attn_k 2816×2048 = {} f32):\n  \
+             median wall:    {:.3} ms  ({} iters)\n  \
+             input bandwidth: {:.1} MiB/s\n  \
+             output bandwidth:{:.1} MiB/s\n  \
+             per-element:    {:.3} ns/f32\n  \
+             ({} ns total, all iters: {:?})",
+            n_elem,
+            median_ns as f64 / 1e6,
+            ITERS,
+            in_mib_s,
+            out_mib_s,
+            ns_per_elem,
+            median_ns,
+            wall_ns,
+        );
+    }
 }
