@@ -21,4 +21,5 @@ pub mod llama3;
 pub mod minimax_m2;
 pub mod nomic_bert;
 pub mod qwen35moe;
+pub mod qwen35moe_full;
 pub mod qwen3vl_text;
