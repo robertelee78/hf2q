@@ -152,8 +152,18 @@ pub fn make_qx_quants(
             } else {
                 x[i].abs().sqrt()
             };
-            sumlx = (w * x[i]).mul_add(li as f32, sumlx);
-            suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
+            // Refinement loop (canonical lines 617-623): clang emits plain
+            // `fmul; fadd` (NO FMA) for these sums — disassembly of
+            // `_quantize_row_q6_K_ref` in `libggml-base.0.12.0.dylib` shows
+            // 32 `fmadd s` total, exactly matching ONE inner loop's worth
+            // (2*16). The 18 `is`-loop iterations all emit `fmul; fadd`
+            // separately (2-rounded). Therefore the refinement-loop sums
+            // must NOT use `.mul_add()`; only the initial pass (lines
+            // 122-123 above) FMAs to match canonical. Per ADR-033 §P1
+            // Q6_K closure (token_embd + attn_v 0.007373% residual root
+            // cause), 2026-05-20.
+            sumlx += w * x[i] * li as f32;
+            suml2 += w * (li as f32) * (li as f32);
         }
         if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
             for i in 0..n {
@@ -580,18 +590,34 @@ mod tests {
         assert!(d.is_finite());
     }
 
-    /// ADR-033 §P1 documentation: this is a 1-ULP boundary case for the
-    /// `sumlx² > best*suml2` comparison in make_qx_quants is-loop. The
-    /// specific F32 input below comes from Gemma 4 blk.0.attn_v block 113
-    /// sub-block 14. Canonical clang at -O3 -march=native produces
-    /// scale=2.2222194821e-3 (0x3b11a2a8) via per-chunk NEON 4-wide
-    /// pairwise-reduce; Rust's scalar .mul_add accumulation produces
-    /// 2.30e-3 (0x3b16f785) due to a 1-ULP sumlx difference flipping
-    /// is=-9 acceptance. Closing this specific case via NEON intrinsics
-    /// broke 13 other sub-blocks (different boundary cases match
-    /// different clang patterns). Documented as a per-block-boundary
-    /// inherent residual; the cross-compiler reduction-order mismatch
-    /// is fundamental on this F32 distribution.
+    /// ADR-033 §P1 Q6_K residual fixture — Gemma 4 blk.0.attn_v block 113
+    /// sub-block 14. Canonical scale=2.2222194821e-3 (0x3b11a2a8); current
+    /// Rust scale=2.3035716731e-3 (0x3b16f785). Test pinned `#[ignore]`'d
+    /// until the NEON port lands.
+    ///
+    /// **Disassembly-verified codegen** (2026-05-20, /opt/llama.cpp HEAD
+    /// `e15384a5c`, Apple clang `-O3 -DNDEBUG -arch arm64`, NO `-march`):
+    /// in `quantize_row_q6_K_ref` (`_quantize_row_q6_K_ref` symbol,
+    /// `ggml-quants.c.o`):
+    ///   - **initial pass** is VECTORIZED — 16 elements processed as
+    ///     4×fmul.4s chunks; each chunk's `(x³·L, w·l·l)` partial products
+    ///     are horizontally reduced by SCALAR fadd ladder
+    ///     `((sumlx_prev + lane0) + lane1) + lane2 + lane3` per chunk;
+    ///   - **is-loop** is SCALAR — 32 `fmadd s_, s_, s_, s_` instructions
+    ///     (16 sumlx + 16 suml2), single-rounded per element.
+    /// Rust port emits 0 fmla.4s + 0 scalar fmadd anywhere in the function
+    /// despite explicit `.mul_add()` — LLVM auto-vec drops FMA semantics
+    /// during loop vectorization. That, plus left-to-right vs reassociated
+    /// reduction order in the initial pass, accounts for the divergence.
+    ///
+    /// **Real-model Gemma 4 26B Q4_K_M byte-cmp** (HEAD `57bab20c`,
+    /// `scripts/fast_byte_cmp.py`, 2026-05-20): Q6_K = 49,181 / 667,054,080
+    /// bytes = 0.007373% across all 14 tensors (`token_embd.weight` carries
+    /// 92.4% of the residual at 45,429/605,552,640). Q4_K essentially closed
+    /// (120/9.3GB = 0.000001%, 13/192 tensors). Closure plan: cfg-gated
+    /// `std::arch::aarch64` NEON port of make_qx_quants that mirrors
+    /// canonical's mixed pattern (vectorized initial pass + scalar fmadd
+    /// is-loop) bit-for-bit.
     #[test]
     #[ignore]
     fn q6k_blk113_subblk14_byte_match() {
