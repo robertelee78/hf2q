@@ -120,9 +120,10 @@ fn quantize_block_iq4_nl(
             l_buf[j] = l as u8;
             let q = values[l] as f32;
             let w = weight[j];
-            // 2026-05-20: plain *+ matches canonical built behavior (canonical's
-            // chained `w*q*xb[j]` doesn't auto-FMA at effective fp-contract=off level,
-            // same finding as make_qx_quants at b921616e).
+            // 2026-05-20: .mul_add() matches canonical for Gemma 4 IQ4_NL byte-cmp;
+            // empirically tested at /tmp/iq4nl_test.log — switching to plain += in
+            // initial pass regresses Gemma 0 → 48K bytes diff. (Analogous to
+            // make_qx_quants 6985cd56 fix DOES NOT apply here — different kernel.)
             sumqx = (w * q).mul_add(xb[j], sumqx);
             sumq2 = (w * q).mul_add(q, sumq2);
         }
