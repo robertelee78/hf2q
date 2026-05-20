@@ -1343,21 +1343,32 @@ mod tests {
     #[test]
     fn mlp_shared_experts_direct() {
         let ctx = vlm_ctx();
-        let cases = [
+        // The three shared-expert projections route through Direct.
+        let direct_cases = [
             ("mlp.shared_expert.gate_proj.weight", "ffn_gate_shexp.weight"),
             ("mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight"),
             ("mlp.shared_expert.down_proj.weight", "ffn_down_shexp.weight"),
-            (
-                "mlp.shared_expert_gate.weight",
-                "ffn_gate_inp_shexp.weight",
-            ),
         ];
-        for (hf_suffix, gguf_suffix) in cases {
+        for (hf_suffix, gguf_suffix) in direct_cases {
             let hf = format!("model.language_model.layers.2.{hf_suffix}");
             match map_tensor_name(&hf, &[], &ctx) {
                 Some(MappedTensor::Direct(s)) => assert_eq!(s, format!("blk.2.{gguf_suffix}")),
                 other => panic!("unexpected for {hf}: {other:?}"),
             }
+        }
+        // shared_expert_gate is squeezed (1, hidden) → (hidden) so it
+        // lands in is_f32_keep_tensor's 1-D F32 path (matching
+        // canonical /opt/llama.cpp/conversion/base.py:825-826).
+        match map_tensor_name(
+            "model.language_model.layers.2.mlp.shared_expert_gate.weight",
+            &[],
+            &ctx,
+        ) {
+            Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
+                assert_eq!(gguf_name, "blk.2.ffn_gate_inp_shexp.weight");
+                assert_eq!(bake, BakeOp::Squeeze);
+            }
+            other => panic!("expected DirectWithBake Squeeze, got {other:?}"),
         }
     }
 

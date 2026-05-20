@@ -837,7 +837,14 @@ mod tests {
         assert_eq!(attn_q.shape, vec![1, 256]);
         assert_eq!(ffn_down.shape, vec![1, 256]);
 
-        assert_eq!(token.ggml_type as u32, 6, "token_embd → Q6_K");
+        // Per canonical llama-quant.cpp:181 + the has_tied_embeddings
+        // detection in plan_tensors: when output.weight IS present in
+        // entries, the model is NOT tied, so token_embd hits the
+        // non-tied TOKEN_EMBD branch (standard_policy.rs:452) which
+        // for Q5_K_M ftype falls through to the default base type Q5_K.
+        // Pre-tied-detection-fix this test asserted token=Q6_K (the
+        // BROKEN promote-as-tied behavior).
+        assert_eq!(token.ggml_type as u32, 5, "token_embd (non-tied) → Q5_K");
         assert_eq!(output.ggml_type as u32, 6, "output → Q6_K");
         assert_eq!(attn_q.ggml_type as u32, 5, "attn_q → Q5_K");
         assert_eq!(ffn_down.ggml_type as u32, 6, "ffn_down (i=0) → Q6_K");
