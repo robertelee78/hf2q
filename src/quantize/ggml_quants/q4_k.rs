@@ -652,6 +652,13 @@ mod tests {
         let cases: &[(&str, usize, &[usize])] = &[
             ("blk_0_attn_q_weight", 2816, &[0, 100, 1000]),
             ("blk_5_ffn_gate_weight", 2816, &[0, 100, 500]),
+            ("blk_1_attn_k_weight", 2816, &[0, 100]),
+            ("blk_10_attn_k_weight", 2816, &[0, 200]),
+            ("blk_10_attn_q_weight", 2816, &[0, 500]),
+            ("blk_15_ffn_gate_weight", 2816, &[0, 1000]),
+            ("blk_25_ffn_up_weight", 2816, &[0, 300]),
+            ("blk_0_ffn_up_weight", 2816, &[0, 100]),
+            ("blk_28_attn_q_weight", 2816, &[0, 50]),
         ];
         let mut grand_total_diff = 0usize;
         let mut grand_total = 0usize;
