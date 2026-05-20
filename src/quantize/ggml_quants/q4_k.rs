@@ -350,6 +350,175 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// 2026-05-20 — Instrumented copy of make_qkx2_quants that prints which iteration
+    /// is accepted as "best" and the running best_error. For diagnosing the 3.4%
+    /// structural mins[1] divergence between hf2q and canonical on ssm_out row 100
+    /// block 13 sub-block 1.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    fn make_qkx2_quants_instrumented(
+        n: usize,
+        nmax: i32,
+        x: &[f32],
+        weights: &[f32],
+        l: &mut [u8],
+        the_min: &mut f32,
+        l_aux: &mut [u8],
+        rmin: f32,
+        rdelta: f32,
+        nstep: i32,
+        use_mad: bool,
+    ) -> f32 {
+        use super::super::common::nearest_int;
+        let mut min = x[0];
+        let mut max = x[0];
+        let mut sum_w = weights[0];
+        let mut sum_x = sum_w * x[0];
+        for i in 1..n {
+            if x[i] < min { min = x[i]; }
+            if x[i] > max { max = x[i]; }
+            let w = weights[i];
+            sum_w += w;
+            sum_x = w.mul_add(x[i], sum_x);
+        }
+        if min > 0.0 { min = 0.0; }
+        if max == min {
+            for li in l.iter_mut().take(n) { *li = 0; }
+            *the_min = -min;
+            return 0.0;
+        }
+        let mut iscale = nmax as f32 / (max - min);
+        let mut scale = 1.0 / iscale;
+        // Try canonical's likely form: fma at best_error += site
+        let mut best_error = 0.0f32;
+        for i in 0..n {
+            let li = nearest_int(iscale * (x[i] - min));
+            let li_c = li.max(0).min(nmax) as u8;
+            l[i] = li_c;
+            let mut diff = scale * li_c as f32 + min - x[i];
+            diff = if use_mad { diff.abs() } else { diff * diff };
+            best_error = weights[i].mul_add(diff, best_error);  // fma re-added
+        }
+        println!("  INIT: scale={:.10} min={:.10} best_error_FMA={:.10e}", scale, min, best_error);
+        let mut accepted_is: i32 = -1;
+        for is in 0..=nstep {
+            iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
+            let mut sum_l = 0.0f32;
+            let mut sum_l2 = 0.0f32;
+            let mut sum_xl = 0.0f32;
+            for i in 0..n {
+                let li_raw = nearest_int(iscale * (x[i] - min));
+                let li = li_raw.max(0).min(nmax) as u8;
+                l_aux[i] = li;
+                let w = weights[i];
+                let li_f = li as f32;
+                sum_l = w.mul_add(li_f, sum_l);
+                sum_l2 = (w * li_f).mul_add(li_f, sum_l2);
+                sum_xl = (w * li_f).mul_add(x[i], sum_xl);
+            }
+            let d_det = sum_w.mul_add(sum_l2, -sum_l * sum_l);
+            if d_det > 0.0 {
+                let mut this_scale = sum_w.mul_add(sum_xl, -sum_x * sum_l) / d_det;
+                let mut this_min = sum_l2.mul_add(sum_x, -sum_l * sum_xl) / d_det;
+                let used_fallback = this_min > 0.0;
+                if used_fallback {
+                    this_min = 0.0;
+                    this_scale = sum_xl / sum_l2;
+                }
+                // Try canonical's likely vectorized form: fma at the cur_error += site
+                let mut cur_error = 0.0f32;
+                for i in 0..n {
+                    let mut diff = this_scale * l_aux[i] as f32 + this_min - x[i];
+                    diff = if use_mad { diff.abs() } else { diff * diff };
+                    cur_error = weights[i].mul_add(diff, cur_error);  // fma re-added
+                }
+                let accepted = cur_error < best_error;
+                println!("  is={:2}: this_scale={:.10} this_min={:.10} cur_error={:.10e} fb={} {}",
+                    is, this_scale, this_min, cur_error, used_fallback,
+                    if accepted {"<-ACCEPTED"} else {""});
+                if accepted {
+                    for i in 0..n { l[i] = l_aux[i]; }
+                    best_error = cur_error;
+                    scale = this_scale;
+                    min = this_min;
+                    accepted_is = is;
+                }
+            } else {
+                println!("  is={:2}: d_det<=0, skipped", is);
+            }
+        }
+        println!("  FINAL: scale={:.10} min={:.10} accepted_is={}", scale, min, accepted_is);
+        *the_min = -min;
+        scale
+    }
+
+    /// 2026-05-20 — INTERMEDIATE-VALUE diagnostic: call make_qkx2_quants directly on
+    /// sub-block 1 of block 13 of ssm_out row 100. Print mins[1] F32 bits + computed
+    /// inv_min*mins[1] product and rounding. Recover canonical's expected min from
+    /// canonical's lm[1]=25 byte + dmin F16 bytes. Diagnoses whether hf2q's iteration
+    /// loop accepts a different "best" than canonical's at this boundary.
+    #[test]
+    #[ignore]
+    fn qwen35_ssm_out_row100_blk13_subblk1_makeqkx2_dump() {
+        let f32_bytes = std::fs::read("/tmp/c_quant_repro/qwen35_blk_0_ssm_out_weight_row100_f32.bin").unwrap();
+        let canonical = std::fs::read("/tmp/c_quant_repro/qwen35_blk_0_ssm_out_weight_row100_q4k.bin").unwrap();
+        let f32: Vec<f32> = f32_bytes.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let blk13_offset = 13 * 256;
+        let sub1_offset = blk13_offset + 32; // sub-block 1 of block 13
+        let sub: &[f32] = &f32[sub1_offset..sub1_offset + 32];
+
+        // Compute weights as Q4_K_ref does
+        let sum_x2: f32 = sub.iter().map(|v| v * v).sum();
+        let av_x = (sum_x2 / 32.0).sqrt();
+        let weights: Vec<f32> = sub.iter().map(|v| av_x + v.abs()).collect();
+
+        let mut l = [0u8; 32];
+        let mut l_aux = [0u8; 32];
+        let mut the_min = 0.0f32;
+        let scale = make_qkx2_quants_instrumented(32, 15, sub, &weights, &mut l, &mut the_min, &mut l_aux,
+            -1.0, 0.1, 20, false);
+        let _min_alias = -the_min;  // make_qkx2 writes -min into the_min
+        // Actually the function writes `*the_min = -min`. So our recovered min:
+        // *the_min holds -min. Since min is the F32 returned to caller as mins[j],
+        // mins[1] = *the_min = -min. Let me name it more carefully:
+        let mins_1_hf2q = the_min;  // == -min from make_qkx2's perspective
+        println!("hf2q sub-block 1 of block 13 (row 100):");
+        println!("  scale = {:.30} (bits 0x{:08x})", scale, scale.to_bits());
+        println!("  mins[1] = {:.30} (bits 0x{:08x})", mins_1_hf2q, mins_1_hf2q.to_bits());
+
+        // Read canonical's block 13: extract dmin F16, lm[1]=25, mins/scales pack
+        let canon_blk13 = &canonical[13*144..14*144];
+        let canon_dmin_u16 = u16::from_le_bytes([canon_blk13[2], canon_blk13[3]]);
+        // half F16 → F32
+        let canon_dmin = half::f16::from_bits(canon_dmin_u16).to_f32();
+        // canonical max_min = dmin * 63 (inverse of `dmin = max_min/63`)
+        let canon_max_min = canon_dmin * 63.0;
+        let canon_inv_min = 63.0 / canon_max_min;
+        // canonical lm[1] = 25 (per the diff breakdown). lm[1] = nearest_int(inv_min*mins[1]).
+        // So canon mins[1] = 25 / inv_min, give or take rounding.
+        // Specifically: lm = 25 implies inv_min*mins[1] is in [24.5, 25.5).
+        let canon_mins_1_approx_low = 24.5 / canon_inv_min;
+        let canon_mins_1_approx_high = 25.5 / canon_inv_min;
+        println!("\ncanonical recovered:");
+        println!("  dmin F16 bytes: {:02x} {:02x}", canon_blk13[2], canon_blk13[3]);
+        println!("  dmin F32 = {:.30}", canon_dmin);
+        println!("  max_min = {:.30} (= dmin*63)", canon_max_min);
+        println!("  inv_min = {:.30} (= 63/max_min)", canon_inv_min);
+        println!("  mins[1] in range [{:.10}, {:.10}) for lm[1]=25", canon_mins_1_approx_low, canon_mins_1_approx_high);
+
+        // Now compute hf2q's inv_min*mins[1] product and verify the round
+        // For hf2q we need max_min which requires running make_qkx2 for ALL 8 sub-blocks.
+        // Skipping that — use canonical's inv_min (since 7 of 8 lm[i] match, they must be ≈ equal).
+        let hf2q_product_approx = canon_inv_min * mins_1_hf2q;
+        println!("\nhf2q mins[1] * canon inv_min = {:.10}", hf2q_product_approx);
+        println!("  → nearest_int = {}", (hf2q_product_approx + 0.5).floor() as i32);
+        let canon_product_low = 24.5;
+        let canon_product_high = 25.5;
+        println!("\nCANON product range for lm[1]=25: [{}, {})", canon_product_low, canon_product_high);
+        println!("Δ (hf2q - canon_mid_25.0): {:.10}", hf2q_product_approx - 25.0);
+    }
+
     /// 2026-05-20 — diff localization for the invariant 11-byte ssm_out row 100
     /// residual. Q4_K block layout:
     ///   [0..2]   d (f16)
