@@ -350,6 +350,90 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// 2026-05-20 Qwen 3.5 Q4_K multi-tensor diagnostic — sample 3 tensors
+    /// (blk.0.attn_gate, blk.0.ssm_out, blk.0.ffn_gate_exps), read F32 row 0
+    /// from canonical's F16 GGUF + Q4_K_M bytes from canonical's quantized GGUF,
+    /// run hf2q's Q4_K kernel, dump per-tensor byte-diff. If 0 across all three,
+    /// the make_qkx2_quants kernel is effectively byte-identical to canonical
+    /// post-b921616e on the Qwen 3.5 distribution.
+    #[test]
+    #[ignore]
+    fn qwen35_q4k_multi_tensor_dump() {
+        let cases: &[(&str, usize, usize)] = &[
+            ("blk_0_attn_gate_weight", 2048, 8),
+            ("blk_0_ssm_out_weight", 4096, 16),
+            ("blk_0_ffn_gate_exps_weight", 2048, 8),
+        ];
+        let mut grand_total_diff = 0usize;
+        let mut grand_total = 0usize;
+        for (name, n_per_row, n_blocks) in cases {
+            let f32_path = format!("/tmp/c_quant_repro/qwen35_{}_row0_f32.bin", name);
+            let q4k_path = format!("/tmp/c_quant_repro/qwen35_{}_row0_q4k.bin", name);
+            let f32_bytes = std::fs::read(&f32_path)
+                .unwrap_or_else(|_| panic!("{} must exist", f32_path));
+            let canonical = std::fs::read(&q4k_path)
+                .unwrap_or_else(|_| panic!("{} must exist", q4k_path));
+            assert_eq!(f32_bytes.len(), n_per_row * 4);
+            assert_eq!(canonical.len(), n_blocks * 144);
+            let f32: Vec<f32> = f32_bytes.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let q4k = quantize(&f32, *n_per_row, None);
+            assert_eq!(q4k.len(), canonical.len());
+            let diff: usize = q4k.iter().zip(canonical.iter())
+                .filter(|(a, b)| a != b).count();
+            println!("{}: {}/{} bytes differ ({:.4}%)",
+                name, diff, q4k.len(), 100.0 * diff as f64 / q4k.len() as f64);
+            grand_total_diff += diff;
+            grand_total += q4k.len();
+        }
+        println!("\nGRAND TOTAL: {}/{} bytes differ ({:.4}%)",
+            grand_total_diff, grand_total, 100.0 * grand_total_diff as f64 / grand_total as f64);
+    }
+
+    /// 2026-05-20 diagnostic: read canonical Qwen 3.5 blk.0.attn_gate.weight
+    /// row 0 (n_per_row=2048) — F32 from canonical's F16 GGUF + Q4_K_M bytes
+    /// from canonical's quantized GGUF — run hf2q's Q4_K kernel, dump per-block
+    /// byte-diff. Establishes whether make_qkx2_quants needs further fixes for
+    /// Qwen 3.5 K-quant distribution post-b921616e make_qx_quants fix.
+    #[test]
+    #[ignore]
+    fn qwen35_blk0_attn_gate_row0_q4k_dump() {
+        let f32_bytes = std::fs::read("/tmp/c_quant_repro/qwen35_blk0_attn_gate_row0_f32.bin")
+            .expect("/tmp/c_quant_repro/qwen35_blk0_attn_gate_row0_f32.bin must exist");
+        assert_eq!(f32_bytes.len(), 8192, "expected 2048 F32 = 8192 bytes");
+        let f32: Vec<f32> = f32_bytes.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let canonical = std::fs::read("/tmp/c_quant_repro/qwen35_blk0_attn_gate_row0_q4k.bin")
+            .expect("canonical Q4_K bytes");
+        assert_eq!(canonical.len(), 8 * 144, "expected 8 blocks × 144 bytes");
+
+        let q4k = quantize(&f32, 2048, None);
+        assert_eq!(q4k.len(), 8 * 144, "hf2q output mismatched length");
+
+        let mut total_diff_bytes = 0;
+        for blk_idx in 0..8 {
+            let blk_start = blk_idx * 144;
+            let blk_end = blk_start + 144;
+            let hf2q_blk = &q4k[blk_start..blk_end];
+            let canon_blk = &canonical[blk_start..blk_end];
+            let blk_diff: usize = hf2q_blk.iter().zip(canon_blk.iter())
+                .filter(|(a, b)| a != b).count();
+            total_diff_bytes += blk_diff;
+            if blk_diff > 0 {
+                println!("Block {}: {} bytes differ", blk_idx, blk_diff);
+                let hex_h = hf2q_blk[..16].iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                let hex_c = canon_blk[..16].iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                println!("  hf2q  d/dmin/scales12: {}", hex_h);
+                println!("  canon d/dmin/scales12: {}", hex_c);
+            }
+        }
+        println!("\nTotal: {}/{} bytes differ ({:.4}%)",
+            total_diff_bytes, 8 * 144, 100.0 * total_diff_bytes as f64 / (8.0 * 144.0));
+    }
+
     fn fixture_path(name: &str) -> PathBuf {
         let manifest = std::env::var("CARGO_MANIFEST_DIR")
             .expect("CARGO_MANIFEST_DIR not set by cargo test");
