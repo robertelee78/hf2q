@@ -695,11 +695,13 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
             // `qwen3_5_moe` is the multimodal-VLM
             // `Qwen3_5MoeForConditionalGeneration` config (operator's
             // /opt/hf2q/models/Qwen-Qwen3.5-35B-A3B has this at config.json:6).
-            // The `_text` variants are the nested text_config.model_type
+            // The `_text` variant is the nested text_config.model_type
             // that text-only `Qwen3_5MoeForCausalLM` checkpoints expose.
-            "qwen3_5_moe" | "qwen3_6_moe" | "qwen3_5_moe_text" | "qwen3_6_moe_text" => {
-                return Ok(ArchName::Qwen35MoeFull)
-            }
+            // Note: "Qwen 3.6" is a model VERSION name; all locally-
+            // available qwen3.6-* models use Qwen3_5* arch strings
+            // (canonical does NOT define a Qwen3_6Moe* arch — verified
+            // via grep on /opt/llama.cpp/conversion).
+            "qwen3_5_moe" | "qwen3_5_moe_text" => return Ok(ArchName::Qwen35MoeFull),
             "qwen3_vl" | "qwen3_vl_moe" | "qwen3_vl_text" => return Ok(ArchName::Qwen3VlText),
             "minimax_m2" => return Ok(ArchName::MiniMaxM2),
             _ => {}
@@ -730,16 +732,16 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
             "NomicBertModel" => return Ok(ArchName::NomicBert),
             // Qwen3MoeForCausalLM (canonical) — older dense MoE.
             "Qwen3MoeForCausalLM" => return Ok(ArchName::Qwen35Moe),
-            // Qwen 3.5/3.6 with linear-attention + MTP. Includes both
+            // Qwen 3.5 (and the "3.6" model versions that use the same
+            // arch strings) with linear-attention + MTP. Includes both
             // text-only ForCausalLM and multimodal-VLM
             // ForConditionalGeneration releases (the latter is the
             // operator's locally-downloaded
             // /opt/hf2q/models/Qwen-Qwen3.5-35B-A3B variant — config
             // has architectures=["Qwen3_5MoeForConditionalGeneration"]).
-            "Qwen3_5MoeForCausalLM"
-            | "Qwen3_6MoeForCausalLM"
-            | "Qwen3_5MoeForConditionalGeneration"
-            | "Qwen3_6MoeForConditionalGeneration" => {
+            // Canonical at /opt/llama.cpp/conversion/qwen.py:626 only
+            // registers Qwen3_5MoeFor* (no Qwen3_6Moe* arch exists).
+            "Qwen3_5MoeForCausalLM" | "Qwen3_5MoeForConditionalGeneration" => {
                 return Ok(ArchName::Qwen35MoeFull);
             }
             "Qwen3VLForConditionalGeneration"
@@ -1743,17 +1745,17 @@ mod tests {
     /// ArchName::Qwen35Moe.
     #[test]
     fn detect_arch_qwen35moe_release_variants_codex_3b478164() {
-        // Qwen 3.5/3.6 variants with linear-attn + MTP now route to
+        // Qwen 3.5 variants with linear-attn + MTP route to
         // ArchName::Qwen35MoeFull (the qwen35moe canonical arch) per
         // the new handler at src/convert/arch/qwen35moe_full.rs.
         // The older qwen3_moe canonical (no linear-attn, no MTP)
         // remains on ArchName::Qwen35Moe.
-        for mt in [
-            "qwen3_5_moe",
-            "qwen3_6_moe",
-            "qwen3_5_moe_text",
-            "qwen3_6_moe_text",
-        ] {
+        //
+        // Note: "Qwen 3.6" is a model VERSION name; all locally-
+        // available qwen3.6-* models use Qwen3_5* arch strings
+        // (canonical /opt/llama.cpp/conversion/qwen.py:626 only
+        // registers Qwen3_5Moe*).
+        for mt in ["qwen3_5_moe", "qwen3_5_moe_text"] {
             assert_eq!(
                 detect_arch(&json!({ "model_type": mt })).unwrap(),
                 ArchName::Qwen35MoeFull,
@@ -1762,9 +1764,7 @@ mod tests {
         }
         for cls in [
             "Qwen3_5MoeForCausalLM",
-            "Qwen3_6MoeForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
-            "Qwen3_6MoeForConditionalGeneration",
         ] {
             assert_eq!(
                 detect_arch(&json!({ "architectures": [cls] })).unwrap(),
@@ -1772,7 +1772,7 @@ mod tests {
                 "architectures=[{cls}] should resolve to Qwen35MoeFull"
             );
         }
-        // Older Qwen 3.6 dense MoE (no linear-attn, no MTP) keeps
+        // Older Qwen 3 dense MoE (no linear-attn, no MTP) keeps
         // routing to ArchName::Qwen35Moe.
         assert_eq!(
             detect_arch(&json!({ "model_type": "qwen3_moe" })).unwrap(),
