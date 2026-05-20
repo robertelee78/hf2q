@@ -24,6 +24,17 @@ F16 GGUF → `llama-quantize <type>` ≠ HF → `hf2q convert --quant <type>`).
 
 ---
 
+## Benchmark — hf2q vs canonical pipeline (Gemma 4 26B Q4_K_M, M5 Max)
+
+| Pipeline                                                             | Wall clock | CPU user | Cores active |
+|----------------------------------------------------------------------|-----------:|---------:|-------------:|
+| **canonical** (`convert_hf_to_gguf.py --outtype f16` + `llama-quantize Q4_K_M`) | **3:35**   | 691s + ~55s | 443% (4-5)   |
+| **hf2q** (`hf2q convert --quant q4_k_m`)                             | 12:05      | 662s     | ~93% (1)     |
+
+CPU-work is comparable (662s vs 691s+55s). hf2q is 3.4× slower wall-clock because the convert orchestrator processes tensors sequentially (no rayon parallelism). Per-tensor parallelization is a clean follow-up optimization that should close the gap entirely without affecting byte-equivalence.
+
+Reproducibility (second-run validation): re-running both pipelines on the same source produced byte-identical Q4_K_M outputs (`scripts/byte_cmp_gguf.py: All 658 tensors byte-identical`).
+
 ## Matrix — UPDATED 2026-05-19 POST-CLOSURE (commit `50fd89c2`)
 
 | Quant   | Canonical PPL          | hf2q PPL              | Ratio  | Tensors | Verdict |
