@@ -330,6 +330,16 @@ impl ConvertOrchestrator {
         qs.n_ffn_down = self.hparams.n_layer as i32;
         qs.n_ffn_gate = self.hparams.n_layer as i32;
         qs.n_ffn_up = self.hparams.n_layer as i32;
+        // Mirror canonical /opt/llama.cpp/src/llama-quant.cpp:181:
+        // has_tied_embeddings starts true and is cleared when
+        // `output.weight` is observed in the model. Without this clear,
+        // non-tied models (those with a real output.weight tensor)
+        // incorrectly promote token_embd.weight via the Output/tied
+        // branch in StandardPolicy::target_for at standard_policy.rs:411.
+        // Detection: scan the plan's entries for an "output.weight" name.
+        if entries.iter().any(|e| e.name == "output.weight") {
+            qs.has_tied_embeddings = false;
+        }
 
         let policy = StandardPolicy::new();
 

@@ -569,7 +569,15 @@ fn map_mlp(layer: usize, mlp_rest: &str, ctx: &Qwen35MoeFullCtx) -> Option<Mappe
         "shared_expert.down_proj.weight" => {
             Some(MappedTensor::Direct(blk("ffn_down_shexp.weight")))
         }
-        "shared_expert_gate.weight" => Some(MappedTensor::Direct(blk("ffn_gate_inp_shexp.weight"))),
+        // shared_expert_gate: safetensors shape [1, hidden] (2-D with
+        // singleton leading dim) — canonical squeezes to 1-D so it
+        // becomes an `is_f32_keep_tensor` 1-D candidate and stays F32.
+        // Without the Squeeze, the residual [1, hidden] gets Q4_0
+        // quantized (byte-diverges from canonical Q4_0 output).
+        "shared_expert_gate.weight" => Some(MappedTensor::DirectWithBake {
+            gguf_name: blk("ffn_gate_inp_shexp.weight"),
+            bake: BakeOp::Squeeze,
+        }),
 
         "experts.down_proj" | "experts.down_proj.weight" => {
             // Pre-fused 3-D `[n_expert, n_embd, n_ff]` — direct map.
