@@ -598,6 +598,98 @@ fn convert_apex_balanced_tiny_qwen35moe_round_trip() {
     }
 }
 
+/// CLI-subprocess test that EXERCISES the Q4_K rayon dispatch path
+/// (closes the non-blocking coverage gap surfaced by codex's sweep
+/// audit at commit `c70fca7b`).
+///
+/// Re-uses the `synthesize_tiny_qwen35moe_for_apex` fixture (HIDDEN=256
+/// = exactly one Q4_K block per row → no K-quant misalignment fallback)
+/// but invokes `hf2q convert --quant q4_k_m` so the standard policy
+/// routes FFN-expert tensors to Q4_K (positional 4). Verifies:
+///  - exit code 0
+///  - tensor count 16 (same shape as apex-balanced sibling test)
+///  - at least one tensor lands on Q4_K (positional 4) — confirms
+///    `q4_k::quantize`'s `par_chunks_exact_mut` rayon path ran via
+///    the full CLI → cli_driver → orchestrator → dispatch chain
+///  - all offsets 32-aligned
+///
+/// Without this test, a regression in the CLI/orchestrator wiring that
+/// silently skipped the Q4_K dispatch (e.g. a fallthrough to F16) would
+/// not be caught by the kernel-level `byte_cmp_*` tests (which exercise
+/// the kernel in isolation) nor by the orchestrator synthetic tests
+/// (which don't run via CLI subprocess).
+#[test]
+fn convert_q4_k_m_tiny_qwen35moe_round_trip() {
+    let model_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_qwen35moe_for_apex(model_dir.path());
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .arg("convert")
+        .arg(model_dir.path())
+        .arg("--quant")
+        .arg("q4_k_m")
+        .arg("-o")
+        .arg(out.path())
+        .assert()
+        .success();
+
+    let gguf = mlx_native::gguf::GgufFile::open(out.path()).expect("parse output GGUF");
+
+    // Same shape as the apex sibling: 2 globals + 7 per-layer × 2 layers = 16.
+    assert_eq!(gguf.tensor_count(), 16, "expected 16 tensors");
+    assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen3moe"));
+
+    // file_type = MostlyQ4_K_M = 15.
+    assert_eq!(
+        gguf.metadata_u32("general.file_type"),
+        Some(15),
+        "Q4_K_M LlamaFtype is MostlyQ4_K_M = 15"
+    );
+
+    let expected_names: &[&str] = &[
+        "token_embd.weight",
+        "output.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+        "blk.0.attn_output.weight",
+        "blk.0.ffn_gate_exps.weight",
+        "blk.0.ffn_up_exps.weight",
+        "blk.0.ffn_down_exps.weight",
+        "blk.1.attn_q.weight",
+        "blk.1.attn_k.weight",
+        "blk.1.attn_v.weight",
+        "blk.1.attn_output.weight",
+        "blk.1.ffn_gate_exps.weight",
+        "blk.1.ffn_up_exps.weight",
+        "blk.1.ffn_down_exps.weight",
+    ];
+
+    // mlx_native positional GgmlType: F32=0, F16=1, Q4_0=2, Q8_0=3,
+    // Q4_K=4, Q5_K=5, Q6_K=6. Assert AT LEAST ONE tensor lands on Q4_K
+    // (positional 4) — proves the rayon-parallel Q4_K dispatch ran
+    // through the full CLI→orchestrator→kernel chain.
+    let mut saw_q4k = false;
+    for name in expected_names {
+        let info = gguf
+            .tensor_info(name)
+            .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
+        if info.ggml_type as u32 == 4 {
+            saw_q4k = true;
+        }
+        // All offsets must be 32-aligned per GGUF spec, regardless of type.
+        assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
+    }
+    assert!(
+        saw_q4k,
+        "expected at least one tensor at Q4_K (positional 4) — \
+         Q4_K rayon path did not execute through CLI subprocess. \
+         (Q4_K_M routes some tensors to Q4_K via StandardPolicy.)"
+    );
+}
+
 // ----------------------------------------------------------------------------
 // Gemma 4 real-arch round-trip
 // ----------------------------------------------------------------------------
