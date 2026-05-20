@@ -251,11 +251,16 @@ pub fn make_qkx2_quants(
             l_aux[i] = li;
             let w = weights[i];
             let li_f = li as f32;
-            // 2026-05-20: plain *+ matches canonical current SHA (e15384a5c) behavior.
-            // Older fixtures from c779f619 had FMA — now regenerated to current SHA.
-            sum_l += w * li_f;
-            sum_l2 += w * li_f * li_f;
-            sum_xl += w * li_f * x[i];
+            // FMA: clang auto-fuses these into fmadd on -O3 -march=native for the
+            // ORIGINAL canonical fixture (pin c779f6198, when §P1 byte-identity
+            // was first achieved at hf2q commit 50fd89c2). The c9c05d1f revert to
+            // plain `+=` was based on a verbatim C reproducer compiled at a
+            // different time — same source, different build cache state, gave
+            // different effective fp-contract behavior. Restoring .mul_add()
+            // here matches the canonical reference we actually byte-match against.
+            sum_l = w.mul_add(li_f, sum_l);
+            sum_l2 = (w * li_f).mul_add(li_f, sum_l2);
+            sum_xl = (w * li_f).mul_add(x[i], sum_xl);
         }
         // FMA: clang fuses `a*b - c*d` into `fmul(-c, d)` + `fmadd(a, b, prev)`
         // — 2 rounding ops vs Rust's default 3 (2 fmul + 1 fsub). Use
@@ -371,11 +376,16 @@ pub fn make_qkx3_quants(
                 None => x[i] * x[i],
             };
             let li_f = li as f32;
-            // 2026-05-20: plain *+ matches canonical current SHA (e15384a5c) behavior.
-            // Older fixtures from c779f619 had FMA — now regenerated to current SHA.
-            sum_l += w * li_f;
-            sum_l2 += w * li_f * li_f;
-            sum_xl += w * li_f * x[i];
+            // FMA: clang auto-fuses these into fmadd on -O3 -march=native for the
+            // ORIGINAL canonical fixture (pin c779f6198, when §P1 byte-identity
+            // was first achieved at hf2q commit 50fd89c2). The c9c05d1f revert to
+            // plain `+=` was based on a verbatim C reproducer compiled at a
+            // different time — same source, different build cache state, gave
+            // different effective fp-contract behavior. Restoring .mul_add()
+            // here matches the canonical reference we actually byte-match against.
+            sum_l = w.mul_add(li_f, sum_l);
+            sum_l2 = (w * li_f).mul_add(li_f, sum_l2);
+            sum_xl = (w * li_f).mul_add(x[i], sum_xl);
         }
         // FMA: same a*b - c*d divergence as make_qkx2_quants. Use mul_add
         // so clang's 2-rounding fmadd chain is matched on the imatrix path.
