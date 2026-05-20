@@ -346,14 +346,13 @@ pub fn make_qkx3_quants(
         let li = nearest_int(iscale * (x[i] - min));
         let li_c = li.max(0).min(nmax) as u8;
         l[i] = li_c;
-        // 2026-05-20: plain *+ matches canonical (neutral per make_qkx2 bisection).
-        let mut diff = scale * li_c as f32 + min - x[i];
+        let mut diff = scale.mul_add(li_c as f32, min) - x[i];
         diff = if use_mad { diff.abs() } else { diff * diff };
         let w = match weights {
             Some(ws) => ws[i],
             None => x[i] * x[i],
         };
-        best_mad += w * diff;
+        best_mad = w.mul_add(diff, best_mad);
     }
     if nstep < 1 {
         *the_min = -min;
@@ -391,13 +390,13 @@ pub fn make_qkx3_quants(
             }
             let mut mad = 0.0f32;
             for i in 0..n {
-                let mut diff = this_scale * l_aux[i] as f32 + this_min - x[i];
+                let mut diff = this_scale.mul_add(l_aux[i] as f32, this_min) - x[i];
                 diff = if use_mad { diff.abs() } else { diff * diff };
                 let w = match weights {
                     Some(ws) => ws[i],
                     None => x[i] * x[i],
                 };
-                mad += w * diff;
+                mad = w.mul_add(diff, mad);
             }
             if mad < best_mad {
                 for i in 0..n {
@@ -446,10 +445,9 @@ pub fn make_qp_quants(
     let scale = 1.0 / iscale;
     let mut best_mse = 0.0f32;
     for i in 0..n {
-        // 2026-05-20: plain matches canonical fp-contract=off.
-        let diff = x[i] - scale * l[i] as f32;
+        let diff = scale.mul_add(-(l[i] as f32), x[i]);
         let w = quant_weights[i];
-        best_mse += w * diff * diff;
+        best_mse = (w * diff).mul_add(diff, best_mse);
     }
     for is in -4i32..=4i32 {
         if is == 0 {
@@ -463,9 +461,9 @@ pub fn make_qp_quants(
             if li > nmax {
                 li = nmax;
             }
-            let diff = x[i] - scale_is * li as f32;
+            let diff = scale_is.mul_add(-(li as f32), x[i]);
             let w = quant_weights[i];
-            mse += w * diff * diff;
+            mse = (w * diff).mul_add(diff, mse);
         }
         if mse < best_mse {
             best_mse = mse;
@@ -490,17 +488,16 @@ pub fn make_qp_quants(
         for i in 0..n {
             let w = quant_weights[i];
             let cur_l = l[i] as f32;
-            // 2026-05-20: plain matches canonical fp-contract=off.
-            let mut slx = sumlx - w * x[i] * cur_l;
-            let mut sl2 = suml2 - w * cur_l * cur_l;
+            let mut slx = (w * x[i]).mul_add(-cur_l, sumlx);
+            let mut sl2 = (w * cur_l).mul_add(-cur_l, suml2);
             if slx > 0.0 && sl2 > 0.0 {
                 let mut new_l = nearest_int(x[i] * sl2 / slx);
                 if new_l > nmax {
                     new_l = nmax;
                 }
                 if new_l as u8 != l[i] {
-                    slx += w * x[i] * new_l as f32;
-                    sl2 += w * (new_l as f32) * (new_l as f32);
+                    slx = (w * x[i]).mul_add(new_l as f32, slx);
+                    sl2 = (w * (new_l as f32)).mul_add(new_l as f32, sl2);
                     if slx * slx * suml2 > sumlx * sumlx * sl2 {
                         l[i] = new_l as u8;
                         sumlx = slx;
