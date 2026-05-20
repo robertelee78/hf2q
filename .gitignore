@@ -3,6 +3,12 @@
 # (which holds GGUFs), not `src/inference/models/` (the module tree).
 /models/
 
+# Top-level cache symlink — points to external volume scratch space for
+# multi-GB intermediate artifacts (byte-cmp F16 GGUFs, etc.). The
+# external-volume backing is operator-managed at
+# `/Volumes/Extreme Pro/hf2q-models/cache/`. Never commit cache content.
+/cache
+
 # Build artifacts
 /target
 
