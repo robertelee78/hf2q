@@ -31,8 +31,9 @@ use std::io::BufWriter;
 use std::path::PathBuf;
 
 use crate::backends::gguf::types::MetaValue;
+use crate::convert::arch::bake::BakeOp;
 use crate::convert::arch::{
-    bert, gemma4, gemma4_mmproj, llama3, minimax_m2, nomic_bert, qwen35moe, qwen3vl_text,
+    bake, bert, gemma4, gemma4_mmproj, llama3, minimax_m2, nomic_bert, qwen35moe, qwen3vl_text,
 };
 use crate::convert::arch::gemma4::MappedTensor as Gemma4Mapped;
 use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped};
@@ -888,6 +889,24 @@ fn build_metadata_for_arch(
 /// one match-arm per outcome.
 enum MapOutcome {
     Direct(String),
+    /// 1:1 rename plus a post-load data transform applied inside
+    /// `PlanStep::materialize`. Used by per-arch mappers that need to
+    /// add 1.0 to norm.weight, negate-exp an SSM A_log, reorder V
+    /// heads, etc. — see [`crate::convert::arch::bake::BakeOp`].
+    DirectWithBake {
+        gguf_name: String,
+        bake: BakeOp,
+    },
+    /// One HF tensor splits into multiple GGUF tensors (fan-out). Used
+    /// by per-arch mappers handling pre-fused safetensors layouts like
+    /// the Qwen 3.5 multimodal `mlp.experts.gate_up_proj` that needs
+    /// to be split into `ffn_gate_exps` + `ffn_up_exps`, or the SSM
+    /// `in_proj_qkvz` that splits into `attn_qkv` + `attn_gate`. Each
+    /// output carries its own GGUF name + GGUF-order shape + bake
+    /// (typically a slice). Outputs are emitted in the order given;
+    /// the plan-build code expands the vec into N separate
+    /// `PlanStep::Direct` entries, all referencing the same HF source.
+    SplitInto(Vec<SplitOutput>),
     Expert {
         gguf_name: String,
         layer: usize,
@@ -896,6 +915,17 @@ enum MapOutcome {
     },
     Drop,
     Unmapped,
+}
+
+/// One output of a [`MapOutcome::SplitInto`] fan-out. The plan-build
+/// code emits a `PlanStep::Direct` for each `SplitOutput` carrying
+/// `bake` (typically a [`BakeOp::Slice`] picking out this output's
+/// portion of the shared HF tensor) and the GGUF-order `gguf_shape`.
+#[derive(Debug, Clone)]
+pub struct SplitOutput {
+    pub gguf_name: String,
+    pub gguf_shape: Vec<usize>,
+    pub bake: BakeOp,
 }
 
 fn map_tensor(arch: ArchName, hf_name: &str) -> MapOutcome {
@@ -1044,10 +1074,20 @@ enum PlanStep {
     Direct {
         hf_name: String,
         gguf_name: String,
-        /// GGUF-order shape (PyTorch order reversed).
+        /// GGUF-order shape (PyTorch order reversed). When `bake` is a
+        /// [`BakeOp::Slice`] this shape reflects the SLICED output
+        /// (i.e. the GGUF shape after the slice is applied), not the
+        /// raw HF tensor shape; the slice itself is the source-side
+        /// selector applied during `materialize`.
         gguf_shape: Vec<usize>,
         source_dtype: SourceDtype,
         layer_index: Option<usize>,
+        /// Post-load data transform applied in `materialize` after the
+        /// F32 buffer is read from safetensors. `None` is a pure
+        /// rename (the prior behavior pre-ADR-034-P2). `Some(...)`
+        /// triggers a Qwen 3.5/3.6 transform per the
+        /// [`crate::convert::arch::bake::BakeOp`] vocabulary.
+        bake: Option<BakeOp>,
     },
     /// N MoE expert slices fuse into one 3-D GGUF tensor of shape
     /// `[in, out, n_experts]`. `member_hf_names` is in expert_index
@@ -1131,9 +1171,16 @@ impl PlanStep {
         synthesized: &[HfTensor],
     ) -> Result<Vec<f32>, ConvertError> {
         match self {
-            PlanStep::Direct { hf_name, .. } => {
+            PlanStep::Direct { hf_name, bake, .. } => {
                 let ht = src.materialize_tensor(hf_name)?;
-                Ok(ht.data)
+                match bake {
+                    None => Ok(ht.data),
+                    Some(op) => bake::apply_bake_op(ht.data, op).map_err(|e| {
+                        ConvertError::Source(SourceError::Safetensors(format!(
+                            "bake op failed on `{hf_name}`: {e}"
+                        )))
+                    }),
+                }
             }
             PlanStep::Fused {
                 member_hf_names,
@@ -1228,7 +1275,46 @@ fn build_convert_plan(
                     gguf_shape,
                     source_dtype: meta.source_dtype,
                     layer_index,
+                    bake: None,
                 });
+            }
+            MapOutcome::DirectWithBake { gguf_name, bake } => {
+                let gguf_shape: Vec<usize> = meta.shape.iter().rev().copied().collect();
+                let layer_index = gguf_name
+                    .strip_prefix("blk.")
+                    .and_then(|s| s.split('.').next())
+                    .and_then(|s| s.parse::<usize>().ok());
+                direct_steps.push(PlanStep::Direct {
+                    hf_name: meta.name.clone(),
+                    gguf_name,
+                    gguf_shape,
+                    source_dtype: meta.source_dtype,
+                    layer_index,
+                    bake: Some(bake),
+                });
+            }
+            MapOutcome::SplitInto(outputs) => {
+                if outputs.is_empty() {
+                    return Err(ConvertError::UnmappedTensor {
+                        hf_name: meta.name.clone(),
+                        arch: arch.name().to_string(),
+                    });
+                }
+                for out in outputs {
+                    let layer_index = out
+                        .gguf_name
+                        .strip_prefix("blk.")
+                        .and_then(|s| s.split('.').next())
+                        .and_then(|s| s.parse::<usize>().ok());
+                    direct_steps.push(PlanStep::Direct {
+                        hf_name: meta.name.clone(),
+                        gguf_name: out.gguf_name,
+                        gguf_shape: out.gguf_shape,
+                        source_dtype: meta.source_dtype,
+                        layer_index,
+                        bake: Some(out.bake),
+                    });
+                }
             }
             MapOutcome::Expert {
                 gguf_name,
@@ -1379,6 +1465,22 @@ fn build_convert_plan(
                     tensor = %t.name,
                     "convert: synthesized tensor explicit-drop per arch mapper"
                 );
+            }
+            MapOutcome::DirectWithBake { .. } | MapOutcome::SplitInto(_) => {
+                // BakeOp transforms and SplitInto fan-out are NOT
+                // supported for synthesized tensors. Synthesized
+                // tensors are produced internally (e.g. Gemma 4's
+                // rope_freqs) at known shape with no further transform
+                // needed; if a future arch's synthesized tensor needs
+                // a bake, route it through `PlanStep::Synthesized`
+                // with a new `bake` field — that surface change is
+                // deferred until an actual caller appears. Per
+                // [[feedback-no-loop-suppression-2026-05-17]]: surface
+                // as a hard error, no silent fallback.
+                return Err(ConvertError::UnmappedTensor {
+                    hf_name: t.name.clone(),
+                    arch: arch.name().to_string(),
+                });
             }
             MapOutcome::Expert { .. } => {
                 // Synthesized MoE experts are not currently produced by

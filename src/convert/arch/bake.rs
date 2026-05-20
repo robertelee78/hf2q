@@ -81,6 +81,39 @@ pub enum BakeOp {
         head_dim: usize,
         slice: Option<Range<usize>>,
     },
+
+    /// Split a 3-D buffer of logical shape
+    /// `[outer_count, axis_size, inner_count]` (C-contiguous,
+    /// outer-first) along the middle axis into halves. `half=First`
+    /// returns the first `axis_size/2` rows per outer; `half=Second`
+    /// returns the second half. Mirrors canonical
+    /// `/opt/llama.cpp/conversion/qwen.py:99-112` — the pre-fused
+    /// `mlp.experts.gate_up_proj` (HF shape `[n_expert, 2*n_ff,
+    /// n_embd]`) splits into separate gate and up tensors before
+    /// downstream MoE merge.
+    SplitAxisHalf {
+        outer_count: usize,
+        axis_size: usize,
+        inner_count: usize,
+        half: SplitHalf,
+    },
+
+    /// Pure shape operation: caller-side metadata fix-up for tensors
+    /// that store singleton dimensions in safetensors that GGUF
+    /// doesn't carry. Currently used for Qwen 3.5/3.6 linear-attn
+    /// `conv1d.weight` whose safetensors shape is `[hidden, 1,
+    /// kernel]` and GGUF expects `[hidden, kernel]`. No element
+    /// transform — `apply_bake_op` is a no-op for this variant; the
+    /// plan-build code is responsible for emitting the squeezed GGUF
+    /// shape.
+    Squeeze,
+}
+
+/// Which half of a [`BakeOp::SplitAxisHalf`] to select.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitHalf {
+    First,
+    Second,
 }
 
 impl fmt::Display for BakeOp {
@@ -105,6 +138,16 @@ impl fmt::Display for BakeOp {
                     "ReorderVHeads {{ nk={num_k_heads}, nv_per_k={num_v_per_k}, head_dim={head_dim} }}"
                 ),
             },
+            BakeOp::SplitAxisHalf {
+                outer_count,
+                axis_size,
+                inner_count,
+                half,
+            } => write!(
+                f,
+                "SplitAxisHalf {{ outer={outer_count}, axis={axis_size}, inner={inner_count}, half={half:?} }}"
+            ),
+            BakeOp::Squeeze => write!(f, "Squeeze"),
         }
     }
 }
@@ -216,6 +259,55 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
                 }
             }
             Ok(out)
+        }
+        BakeOp::SplitAxisHalf {
+            outer_count,
+            axis_size,
+            inner_count,
+            half,
+        } => {
+            if axis_size % 2 != 0 {
+                return Err(BakeError {
+                    op: op.clone(),
+                    buffer_len: data.len(),
+                    reason: format!(
+                        "axis_size {axis_size} not divisible by 2 for SplitAxisHalf"
+                    ),
+                });
+            }
+            let expected_len = outer_count * axis_size * inner_count;
+            if data.len() != expected_len {
+                return Err(BakeError {
+                    op: op.clone(),
+                    buffer_len: data.len(),
+                    reason: format!(
+                        "buffer of {} elements != expected {outer_count}*{axis_size}*{inner_count}={expected_len}",
+                        data.len()
+                    ),
+                });
+            }
+            let half_axis = axis_size / 2;
+            let out_per_outer = half_axis * inner_count;
+            let mut out = Vec::with_capacity(outer_count * out_per_outer);
+            for o in 0..*outer_count {
+                let outer_off = o * axis_size * inner_count;
+                let (range_start, range_end) = match half {
+                    SplitHalf::First => (outer_off, outer_off + half_axis * inner_count),
+                    SplitHalf::Second => (
+                        outer_off + half_axis * inner_count,
+                        outer_off + axis_size * inner_count,
+                    ),
+                };
+                out.extend_from_slice(&data[range_start..range_end]);
+            }
+            Ok(out)
+        }
+        BakeOp::Squeeze => {
+            // Squeeze is a metadata-only shape op for callers that
+            // need to drop singleton dims from `gguf_shape`; element
+            // data is byte-identical. Plan-build is responsible for
+            // emitting the squeezed shape via `gguf_shape`.
+            Ok(data)
         }
     }
 }
@@ -387,6 +479,132 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.reason.contains("required"));
+    }
+
+    #[test]
+    fn split_axis_half_first_returns_leading_rows_per_outer() {
+        // Mirrors canonical /opt/llama.cpp/conversion/qwen.py:99-112 on
+        // a small fixture: HF `[n_expert=2, 2*n_ff=4, n_embd=3]`
+        // gate_up_proj. First-half = gate, second-half = up.
+        //   expert 0: [ a0 a1 a2 | b0 b1 b2 | c0 c1 c2 | d0 d1 d2 ]
+        //                ^ gate=ab     ^ up=cd
+        //   expert 1: [ e0 e1 e2 | f0 f1 f2 | g0 g1 g2 | h0 h1 h2 ]
+        //                ^ gate=ef     ^ up=gh
+        let inp: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let first = apply_bake_op(
+            inp.clone(),
+            &BakeOp::SplitAxisHalf {
+                outer_count: 2,
+                axis_size: 4,
+                inner_count: 3,
+                half: SplitHalf::First,
+            },
+        )
+        .unwrap();
+        // Per expert: take rows 0 and 1, drop rows 2 and 3.
+        // expert 0: 0..6
+        // expert 1: 12..18
+        let expect_first: Vec<f32> = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0].to_vec();
+        assert_eq!(first, expect_first);
+    }
+
+    #[test]
+    fn split_axis_half_second_returns_trailing_rows_per_outer() {
+        let inp: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let second = apply_bake_op(
+            inp,
+            &BakeOp::SplitAxisHalf {
+                outer_count: 2,
+                axis_size: 4,
+                inner_count: 3,
+                half: SplitHalf::Second,
+            },
+        )
+        .unwrap();
+        let expect_second: Vec<f32> = [6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0].to_vec();
+        assert_eq!(second, expect_second);
+    }
+
+    #[test]
+    fn split_axis_half_first_plus_second_reconstructs_per_outer() {
+        // Concatenating First and Second halves per-outer must yield
+        // the original buffer. This is the byte-correctness invariant
+        // that the canonical Python split holds.
+        let inp: Vec<f32> = (0..120).map(|i| (i as f32) * 0.5).collect();
+        let outer = 3_usize;
+        let axis = 8_usize;
+        let inner = 5_usize;
+        assert_eq!(outer * axis * inner, inp.len());
+        let first = apply_bake_op(
+            inp.clone(),
+            &BakeOp::SplitAxisHalf {
+                outer_count: outer,
+                axis_size: axis,
+                inner_count: inner,
+                half: SplitHalf::First,
+            },
+        )
+        .unwrap();
+        let second = apply_bake_op(
+            inp.clone(),
+            &BakeOp::SplitAxisHalf {
+                outer_count: outer,
+                axis_size: axis,
+                inner_count: inner,
+                half: SplitHalf::Second,
+            },
+        )
+        .unwrap();
+        let half_axis = axis / 2;
+        let mut recon = Vec::with_capacity(inp.len());
+        for o in 0..outer {
+            let off_first = o * half_axis * inner;
+            let off_second = o * half_axis * inner;
+            recon.extend_from_slice(&first[off_first..off_first + half_axis * inner]);
+            recon.extend_from_slice(&second[off_second..off_second + half_axis * inner]);
+        }
+        assert_eq!(recon, inp);
+    }
+
+    #[test]
+    fn split_axis_half_rejects_odd_axis() {
+        let inp = vec![0.0_f32; 15]; // 3 * 5 * 1 = 15, axis=5 (odd)
+        let err = apply_bake_op(
+            inp,
+            &BakeOp::SplitAxisHalf {
+                outer_count: 3,
+                axis_size: 5,
+                inner_count: 1,
+                half: SplitHalf::First,
+            },
+        )
+        .unwrap_err();
+        assert!(err.reason.contains("not divisible by 2"));
+    }
+
+    #[test]
+    fn split_axis_half_rejects_buffer_length_mismatch() {
+        let inp = vec![0.0_f32; 23];
+        let err = apply_bake_op(
+            inp,
+            &BakeOp::SplitAxisHalf {
+                outer_count: 2,
+                axis_size: 4,
+                inner_count: 3,
+                half: SplitHalf::First,
+            },
+        )
+        .unwrap_err();
+        assert!(err.reason.contains("expected"));
+    }
+
+    #[test]
+    fn squeeze_is_data_identity() {
+        // Squeeze is shape-only — element data is preserved bit-exact.
+        // Plan-build handles the gguf_shape adjustment.
+        let inp: Vec<f32> = vec![1.5, -2.25, 3.125, 0.0];
+        let out = apply_bake_op(inp.clone(), &BakeOp::Squeeze).unwrap();
+        assert_eq!(out, inp);
     }
 
     #[test]
