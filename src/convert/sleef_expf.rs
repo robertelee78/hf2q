@@ -84,14 +84,24 @@ pub fn sleef_expf(d: f32) -> f32 {
     // Order matters for 1-ULP: the outer `+ 1.0` is the LAST op.
     let u = 1.0_f32 + (s * s).mul_add(u, s);
 
-    // ldexp: e^x = e^s · 2^q. For normal q (in [-126, 127]) just pack
-    // the exponent bits. SLEEF's `vldexp2_vf_vf_vi2` splits q for large
-    // magnitudes; for our ssm_a `-exp(A_log)` inputs, A_log is small
-    // (typically in [-10, 0]), so q stays well within normal range.
-    // Defensive: clamp q to avoid bit-shift UB on extreme inputs.
-    let q_clamped = q_int.clamp(-126, 127);
-    let two_q = f32::from_bits(((127_i32 + q_clamped) as u32) << 23);
-    let y = u * two_q;
+    // ldexp: e^x = e^s · 2^q via SLEEF's two-step split (`vldexp2_vf_vf_vi2`,
+    // sleefsimdsp.c). For d in [-104, 100], q ranges over roughly
+    // [-150, 144] — bigger than the f32 normal exponent window
+    // [-126, 127]. Naive clamp truncates subnormal/near-overflow
+    // regions (codex audit at 563b948b caught: `d = -100` → q = -144
+    // should give a subnormal, clamp gave 2^-126). SLEEF avoids this
+    // by splitting q two ways:
+    //   q1 = q >> 1   (arithmetic shift; halves magnitude)
+    //   q2 = q - q1   (remainder; q1 + q2 == q exactly)
+    // then result = u · 2^q1 · 2^q2. Both halves stay within ±75 for
+    // any q in [-150, 150], so bit-packing each via `(127+e) << 23` is
+    // always safe and the product reaches the full subnormal/overflow
+    // range correctly.
+    let q1 = q_int >> 1;
+    let q2 = q_int - q1;
+    let two_q1 = f32::from_bits(((127_i32 + q1) as u32) << 23);
+    let two_q2 = f32::from_bits(((127_i32 + q2) as u32) << 23);
+    let y = u * two_q1 * two_q2;
 
     if d < EXPF_UNDERFLOW {
         0.0
@@ -159,6 +169,63 @@ mod tests {
         assert_eq!(sleef_expf(f32::NEG_INFINITY), 0.0);
         // NaN propagates through (input NaN → output NaN).
         assert!(sleef_expf(f32::NAN).is_nan());
+    }
+
+    /// Codex audit at commit `563b948b` caught a gap: the original
+    /// `q_int.clamp(-126, 127)` truncated subnormal results for inputs
+    /// like `d = -100` (q = -144). Now using SLEEF's two-step split
+    /// `2^q = 2^q1 · 2^q2` with `q1 = q >> 1; q2 = q - q1` so subnormal
+    /// and near-overflow ranges are correctly produced.
+    ///
+    /// Ground truth from `python3 -c "torch.tensor([X], dtype=torch.float32).exp()"`:
+    ///   torch.exp(-100.0) = 3.78e-44 = 0x0000001b (subnormal)
+    ///   torch.exp(-90.0)  = 8.19e-40 = 0x0008ec28 (subnormal)
+    ///   torch.exp(  90.0) = +inf      = 0x7f800000 (overflow)
+    #[test]
+    fn matches_torch_in_subnormal_and_overflow_ranges() {
+        // d = -100: q ≈ -144, requires vldexp2 split for correct subnormal.
+        let r = sleef_expf(-100.0);
+        assert_eq!(
+            r.to_bits(),
+            0x0000001b,
+            "sleef_expf(-100): expected torch 0x0000001b (subnormal), got 0x{:08x}",
+            r.to_bits()
+        );
+
+        // d = -90: q ≈ -129, just below normal range boundary.
+        let r = sleef_expf(-90.0);
+        assert_eq!(
+            r.to_bits(),
+            0x0008ec28,
+            "sleef_expf(-90): expected torch 0x0008ec28 (subnormal), got 0x{:08x}",
+            r.to_bits()
+        );
+
+        // d = 90: q ≈ 130, IEEE-overflows naturally to +inf during u * 2^q1 * 2^q2.
+        let r = sleef_expf(90.0);
+        assert_eq!(
+            r.to_bits(),
+            0x7f800000,
+            "sleef_expf(90): expected torch +inf 0x7f800000, got 0x{:08x}",
+            r.to_bits()
+        );
+
+        // d = -104 (exactly at the underflow guard): the guard kicks in first.
+        let r = sleef_expf(-104.0);
+        assert_eq!(r, 0.0, "sleef_expf(-104) should hit underflow guard → 0");
+
+        // d = 100 (exactly at the overflow guard): polynomial path produces a
+        // finite f32 (torch.exp(100) ≈ 2.69e+43 ≈ infinity in f32, since f32 max ≈ 3.4e+38).
+        // Sleef's explicit guard `d > 100 → +inf` is `>` not `>=`, so at d=100 we
+        // take the polynomial path; verify it overflows naturally to +inf via IEEE
+        // arithmetic in `u * 2^q1 * 2^q2`.
+        let r = sleef_expf(100.0);
+        assert_eq!(
+            r.to_bits(),
+            0x7f800000,
+            "sleef_expf(100): expected +inf (natural IEEE overflow), got 0x{:08x}",
+            r.to_bits()
+        );
     }
 
     /// Sweep test: across 1024 uniform-random-ish f32 inputs in [-10, 5],
