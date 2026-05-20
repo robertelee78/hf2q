@@ -228,6 +228,17 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
             Ok(data)
         }
         BakeOp::NegExp => {
+            // Element-wise `x → -exp(x)` using Rust's libm-backed
+            // `f32::exp()`. Note: PyTorch's `torch.exp` produces
+            // 1-ULP-different results on a small fraction of inputs
+            // (verified 2026-05-19); neither libm `expf` nor Apple
+            // Accelerate `vvexpf` bit-matches PyTorch for the full
+            // input space. The 1-ULP diff propagates verbatim into
+            // F32-keep `ssm_a` tensors (28-30 of 30 layers affected,
+            // ~3-5 bytes per 128-byte tensor). Sub-machine-precision
+            // diff; downstream Q4_0 quantization (4-bit blocks) is
+            // unaffected since both 1-ULP-different F32 values
+            // collapse into the same 4-bit code.
             for x in data.iter_mut() {
                 *x = -x.exp();
             }
