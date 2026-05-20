@@ -228,17 +228,34 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
             Ok(data)
         }
         BakeOp::NegExp => {
-            // Element-wise `x → -exp(x)` using Rust's libm-backed
-            // `f32::exp()`. Note: PyTorch's `torch.exp` produces
-            // 1-ULP-different results on a small fraction of inputs
-            // (verified 2026-05-19); neither libm `expf` nor Apple
-            // Accelerate `vvexpf` bit-matches PyTorch for the full
-            // input space. The 1-ULP diff propagates verbatim into
-            // F32-keep `ssm_a` tensors (28-30 of 30 layers affected,
-            // ~3-5 bytes per 128-byte tensor). Sub-machine-precision
-            // diff; downstream Q4_0 quantization (4-bit blocks) is
-            // unaffected since both 1-ULP-different F32 values
-            // collapse into the same 4-bit code.
+            // Element-wise `x → -exp(x)`.
+            //
+            // ADR-033 §P1 ssm_a byte-identity: PyTorch's `torch.exp`
+            // produces 1-ULP-different results from Rust's libm-backed
+            // `f32::exp()` on ~8% of uniform random inputs in [-10, 5]
+            // (verified 2026-05-20). torch's CPU expf on ARM uses
+            // SLEEF's vectorized `Sleef_expf4_u10advsimd` which IS
+            // bit-matchable via direct FFI to libtorch_cpu.dylib.
+            //
+            // When `crate::convert::torch_ffi` has been initialized
+            // (via `--ffi-torch-exp <path>`), we use SLEEF for the
+            // exp step; otherwise we use Rust's f32::exp(). NO
+            // FALLBACK per mantra: if SLEEF was requested but
+            // unavailable, init returns an error before this code
+            // executes.
+            #[cfg(target_arch = "aarch64")]
+            if crate::convert::torch_ffi::is_loaded() {
+                crate::convert::torch_ffi::exp_inplace(&mut data)
+                    .map_err(|e| BakeError {
+                        op: op.clone(),
+                        buffer_len: data.len(),
+                        reason: format!("torch_ffi sleef exp failed: {e}"),
+                    })?;
+                for x in data.iter_mut() {
+                    *x = -*x;
+                }
+                return Ok(data);
+            }
             for x in data.iter_mut() {
                 *x = -x.exp();
             }

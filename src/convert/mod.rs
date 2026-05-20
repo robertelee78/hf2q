@@ -26,6 +26,7 @@ pub mod quant_selector;
 pub mod source_dtype;
 pub mod source_reader;
 pub mod tokenizer;
+pub mod torch_ffi;
 
 pub use cli_driver::{run_convert, ConvertArgs, ConvertError};
 pub use orchestrator::{ConvertOrchestrator, OrchestratorError, PlanEntry, StreamingWriter};

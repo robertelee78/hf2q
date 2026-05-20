@@ -216,6 +216,7 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
         imatrix_out: args.imatrix_out,
         imatrix_n_ctx: args.imatrix_n_ctx,
         ffi_canonical: args.ffi_canonical,
+        ffi_torch_exp: args.ffi_torch_exp,
     };
     run_convert(resolved).map_err(|e| match e {
         ConvertError::UnsupportedArch { .. }
@@ -490,6 +491,7 @@ mod tests {
             imatrix_out: None,
             imatrix_n_ctx: None,
             ffi_canonical: None,
+            ffi_torch_exp: None,
         };
         let err = cmd_convert(args).expect_err("must error");
         match err {

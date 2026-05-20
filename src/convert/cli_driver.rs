@@ -110,6 +110,13 @@ pub struct ConvertArgs {
     /// boundary cases that don't close in Rust). Setting this guarantees
     /// byte-identity to canonical's emit across all input distributions.
     pub ffi_canonical: Option<PathBuf>,
+
+    /// ADR-033 §P1 ssm_a byte-identity: when `Some`, loads PyTorch's
+    /// `libtorch_cpu.dylib` at this path and dispatches the `NegExp`
+    /// bake operation through SLEEF's `Sleef_expf4_u10advsimd`. Closes
+    /// the ~8% of inputs where libm.expf differs from torch.exp by 1 ULP.
+    /// Default `None` ⇒ uses Rust's `f32::exp()`.
+    pub ffi_torch_exp: Option<PathBuf>,
 }
 
 /// Errors raised by [`run_convert`]. Wraps the typed errors from the
@@ -548,6 +555,22 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
                 ),
             ))?;
         orch.enable_canonical_ffi(std::sync::Arc::new(ffi));
+    }
+
+    // ADR-033 §P1 ssm_a byte-identity: init torch FFI before bake
+    // operations run (planning + per-tensor BakeOp::NegExp consults the
+    // singleton). NO FALLBACK — if user passes --ffi-torch-exp but the
+    // library is missing/malformed, error out.
+    if let Some(torch_path) = &args.ffi_torch_exp {
+        crate::convert::torch_ffi::try_init(torch_path).map_err(|e| {
+            ConvertError::Orchestrator(
+                crate::convert::orchestrator::OrchestratorError::Quantize(
+                    crate::quantize::ggml_quants::QuantizeError::CanonicalFfi(format!(
+                        "torch FFI init failed: {e}"
+                    )),
+                ),
+            )
+        })?;
     }
 
     // 5a. Orchestrator plan-phase: feed every tensor's metadata, no

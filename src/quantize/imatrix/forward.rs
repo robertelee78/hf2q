@@ -481,6 +481,7 @@ pub fn compute_imatrix(
         // Imatrix-driver inner convert is F16-only — no quantize calls,
         // so FFI dispatch is irrelevant.
         ffi_canonical: None,
+        ffi_torch_exp: None,
     };
     crate::convert::cli_driver::run_convert(convert_args).map_err(|e| {
         ImatrixError::ConvertFailed {

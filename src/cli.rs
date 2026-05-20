@@ -253,6 +253,24 @@ pub struct ConvertCliArgs {
     /// SHA).
     #[arg(long, num_args = 0..=1, default_missing_value = "/opt/llama.cpp/build/bin/libggml-base.0.dylib")]
     pub ffi_canonical: Option<PathBuf>,
+
+    /// ADR-033 §P1 ssm_a byte-identity opt-in: dispatch the `NegExp`
+    /// bake operation (`x → -exp(x)`, used for SSM `A_log` → `ssm_a`)
+    /// through PyTorch's SLEEF-backed `Sleef_expf4_u10advsimd` from
+    /// `libtorch_cpu.dylib` instead of Rust's libm-backed `f32::exp()`.
+    /// Closes the ~8% of inputs where torch.exp and libm.expf differ
+    /// by 1 ULP.
+    ///
+    /// Argument forms:
+    ///   - `--ffi-torch-exp` (no value) ⇒ default path
+    ///     `/Users/robert/.pyenv/versions/3.13.12/lib/python3.13/site-packages/torch/lib/libtorch_cpu.dylib`
+    ///   - `--ffi-torch-exp=<path>` ⇒ explicit dylib path
+    ///
+    /// Verified bit-identical to `torch.tensor.exp()` for 1000/1000
+    /// uniform random f32 inputs in [-10, 5]. NO FALLBACK: if init
+    /// fails the convert errors out per mantra.
+    #[arg(long, num_args = 0..=1, default_missing_value = "/Users/robert/.pyenv/versions/3.13.12/lib/python3.13/site-packages/torch/lib/libtorch_cpu.dylib")]
+    pub ffi_torch_exp: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
