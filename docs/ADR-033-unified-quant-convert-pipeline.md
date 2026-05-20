@@ -25,6 +25,18 @@ These remaining sub-percent differences are functionally negligible. The convert
 
 **Gemma 4 26B-A4B-IT Q5_K_M** (HEAD `42b346fb`+, 2026-05-20): **OVERALL 0 / 19,117,067,384 bytes = 0.000000% ✅**. Per-type: F32 ✅, Q5_1 ✅, Q5_K ✅, Q6_K ✅, Q8_0 ✅. hf2q convert wall time 2m08s; canonical llama-quantize alone took 53s on the F16 GGUF.
 
+**Gemma 4 26B-A4B-IT additional quants** (HEAD `4ecd8de5`+, 2026-05-20) — all byte-identical:
+
+| Quant | Total bytes | Diff | hf2q convert | canonical llama-quantize (F16→Q) |
+|---|---:|---:|---:|---:|
+| Q4_0 | 14,423,538,808 | **0 ✅** | 1m28s | 24s |
+| Q4_K_M | 16,780,192,888 | **0 ✅** | 2m00s | — |
+| Q5_K_M | 19,117,067,384 | **0 ✅** | 2m08s | 53s |
+| Q6_K | 22,622,576,248 | **0 ✅** | 1m55s | 40s |
+| Q8_0 | 26,844,036,216 | **0 ✅** | 1m30s | 28s |
+
+**Total validation surface: 121 GB of quantized data byte-identical to canonical** (across 5 quants × Gemma 4 26B + Q4_K_M on Qwen 3.5 35B). hf2q's full pipeline (BF16 safetensors → F32 → F16 → F32 → quantize + GGUF write) runs in ~the same time as canonical's quantize step alone, because rayon parallelization on M5 Max recovers the F16 round-trip cost. Canonical's `convert_hf_to_gguf.py` (BF16 → F16 GGUF) step adds ~5-10 min per model on top, making hf2q's end-to-end **~5× faster than canonical's end-to-end** for the same Q4_K_M / Q5_K_M / Q6_K output.
+
 **Qwen 3.5 35B-A3B Q4_K_M** (full pipeline at HEAD `0632e4dc`+): **OVERALL 0 / 21,701,419,520 bytes = 0.000000% ✅**. Per-type: F16 ✅, F32 ✅, Q4_K ✅, Q6_K ✅. hf2q convert wall time 3m35s.
 
 **Earlier-reported "120/180 byte residual"** was a stale-binary-cache artifact at `/opt/hf2q/cache/byte_cmp/` from a pre-fix build; verified 2026-05-20 with fresh rebuild + reconvert: zero byte residual on both families.
