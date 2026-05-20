@@ -136,8 +136,7 @@ pub fn make_qx_quants(
         if is == 0 {
             continue;
         }
-        // 2026-05-20: fma matches canonical `=on` fusion of `nmax + 0.1*is`.
-        iscale = -0.1f32.mul_add(is as f32, nmax_f) / max;
+        iscale = -(nmax_f + 0.1 * (is as f32)) / max;
         sumlx = 0.0;
         suml2 = 0.0;
         for i in 0..n {
