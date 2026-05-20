@@ -114,11 +114,14 @@ pub fn make_qx_quants(
         } else {
             x[i].abs().sqrt()
         };
-        // FMA: clang auto-fuses these into fmadd on -O3 -march=native (4 fmadd
-        // instructions verified in _make_qx_quants binary). Rust at --release
-        // doesn't auto-FMA (fp-contract=off default), so use explicit mul_add.
-        sumlx = (w * x[i]).mul_add(li as f32, sumlx);
-        suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
+        // Plain `*` + `+=` matches canonical's BUILT behavior (effective
+        // fp-contract=off). Earlier `.mul_add()` calls forced =on-level
+        // fusion which produces a 1-byte diff on Qwen 3.5 lm_head Q6_K
+        // (scale[12]=194 vs 195) verified via 12-variant C reproducer
+        // matrix at /tmp/c_quant_repro/variants_search.c — canonical lib
+        // and `-ffp-contract=off` both produce 195; `=on` produces 194.
+        sumlx += w * x[i] * li as f32;
+        suml2 += w * (li as f32) * (li as f32);
     }
     let mut scale = if suml2 != 0.0 { sumlx / suml2 } else { 0.0 };
     if return_early {
@@ -150,8 +153,8 @@ pub fn make_qx_quants(
             } else {
                 x[i].abs().sqrt()
             };
-            sumlx = (w * x[i]).mul_add(li as f32, sumlx);
-            suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
+            sumlx += w * x[i] * li as f32;
+            suml2 += w * (li as f32) * (li as f32);
         }
         if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
             for i in 0..n {
