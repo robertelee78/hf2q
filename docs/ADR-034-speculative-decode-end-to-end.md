@@ -509,6 +509,12 @@ Each phase ships compiled, tested, gated. Phases run sequentially; no phase begi
 
 ### P2 — Qwen MTP convert (both 27B dense + 35B-A3B MoE in lockstep) (~700 LOC; smaller than original estimate because runtime kernel edit removed per codex review)
 
+**Reference-acquisition update 2026-05-19** (post-audit of locally-available safetensors at HEAD `bc04f3b8`): the operator's locally-downloaded Qwen 3.5/3.6 safetensors corpus is more constrained than the original P0 scope assumed:
+- `/opt/hf2q/models/Qwen-Qwen3.5-35B-A3B` (the only safetensors download) is the **MULTIMODAL VLM** variant: 1,811 tensor patterns = 785 `mtp.*` + ~1,000 `model.language_model.*` + ~26 `model.visual.blocks.*`. Architecture: `Qwen3_5MoeForConditionalGeneration`. Tensor prefix is `model.language_model.*` (multimodal wrapping), NOT `model.*`. Experts are **already FUSED** in the safetensors (`mlp.experts.down_proj` and `mlp.experts.gate_up_proj` are single tensors per layer, NOT per-expert) — this is a different on-disk layout vs the Qwen 3.6 27B/35B-A3B text-only variants the original P2 scope assumed. Has `shared_expert.*` tensors (Qwen3MoE dropped shared experts; Qwen3.5MoE re-adds them).
+- Other locally-available Qwen 3.5/3.6 models (`qwen3.6-35b-a3b-4bit-DWQ`, `qwen3.6-35b-a3b-abliterix-ega-abliterated-apex`, `qwen3.6-35b-a3b-abliterix-ega-abliterated-q4_0-flat`) are **GGUF-only** (no safetensors) — they can be runtime targets but cannot be P2 byte-cmp gate sources.
+
+**Implication**: P2 byte-cmp G1 needs EITHER (a) operator downloads a text-only Qwen 3.6 27B or 35B-A3B safetensors (e.g. `Qwen/Qwen3.6-27B` or `Qwen/Qwen3.6-35B-A3B` non-VLM HF releases) to match the original P2 scope, OR (b) P2 scope expands to cover the multimodal `Qwen3_5MoeForConditionalGeneration` variant with the `model.language_model.*` prefix and pre-fused expert layout. Option (b) adds ~200 LOC for the prefix-stripping path, ~100 LOC for the pre-fused expert handling (no fusion-at-convert needed; just one tensor → one GGUF tensor), plus the vision-encoder filter (drop `model.visual.*` or wire to a separate `mmproj` GGUF — text-only convert can simply drop). Operator decision required at P0 boundary.
+
 **Scope**:
 - Add `ArchName::Qwen35` variant + dispatch in `src/quantize/ggml_quants/tensor_ref.rs:38` and `src/convert/cli_driver.rs`.
 - New file `src/convert/arch/qwen35.rs` — dense Qwen 3.5/3.6 convert mapper. Copy-edit the existing pattern from `qwen35moe.rs`; remove MoE expert-fusion arms; add MTP arms per §3.5 table.
