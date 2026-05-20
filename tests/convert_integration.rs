@@ -885,6 +885,66 @@ fn convert_iq4_nl_tiny_qwen35moe_round_trip() {
     assert!(saw_iq4_nl, "expected ≥1 tensor at IQ4_NL (positional 9)");
 }
 
+/// CLI-subprocess sibling — exercises Q4_0 via `--quant q4_0`.
+/// Q4_0 is the simplest legacy quant: block size 32, 18 bytes per
+/// block, no `make_qkx2`-style scale refinement loop. Used as a
+/// CLI regression net for the simplest dispatch path.
+/// Positional Q4_0 = 2 in mlx_native's GgmlType enum.
+#[test]
+fn convert_q4_0_tiny_qwen35moe_round_trip() {
+    let model_dir = tempfile::tempdir().unwrap();
+    synthesize_tiny_qwen35moe_for_apex(model_dir.path());
+
+    let out = tempfile::NamedTempFile::new().unwrap();
+    Command::cargo_bin("hf2q")
+        .unwrap()
+        .arg("convert")
+        .arg(model_dir.path())
+        .arg("--quant")
+        .arg("q4_0")
+        .arg("-o")
+        .arg(out.path())
+        .assert()
+        .success();
+
+    let gguf = mlx_native::gguf::GgufFile::open(out.path()).expect("parse output GGUF");
+    assert_eq!(gguf.tensor_count(), 16);
+    assert_eq!(gguf.metadata_string("general.architecture"), Some("qwen3moe"));
+    // file_type = MostlyQ4_0 = 2.
+    assert_eq!(gguf.metadata_u32("general.file_type"), Some(2));
+
+    let expected_names: &[&str] = &[
+        "token_embd.weight",
+        "output.weight",
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+        "blk.0.attn_output.weight",
+        "blk.0.ffn_gate_exps.weight",
+        "blk.0.ffn_up_exps.weight",
+        "blk.0.ffn_down_exps.weight",
+        "blk.1.attn_q.weight",
+        "blk.1.attn_k.weight",
+        "blk.1.attn_v.weight",
+        "blk.1.attn_output.weight",
+        "blk.1.ffn_gate_exps.weight",
+        "blk.1.ffn_up_exps.weight",
+        "blk.1.ffn_down_exps.weight",
+    ];
+
+    let mut saw_q4_0 = false;
+    for name in expected_names {
+        let info = gguf
+            .tensor_info(name)
+            .unwrap_or_else(|| panic!("missing GGUF tensor `{name}`"));
+        if info.ggml_type as u32 == 2 {
+            saw_q4_0 = true;
+        }
+        assert_eq!(info.offset % 32, 0, "tensor `{name}` offset not aligned");
+    }
+    assert!(saw_q4_0, "expected ≥1 tensor at Q4_0 (positional 2)");
+}
+
 // ----------------------------------------------------------------------------
 // Gemma 4 real-arch round-trip
 // ----------------------------------------------------------------------------
