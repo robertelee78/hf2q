@@ -210,9 +210,11 @@ mod tests {
             r.to_bits()
         );
 
-        // d = -104 (exactly at the underflow guard): the guard kicks in first.
+        // d = -104 (exactly at the underflow guard): code computes y first, then
+        // the explicit `d < -104` post-selection guard overrides to 0.0 (mirrors
+        // SLEEF's `vsel_vf_vo_vf_vf` post-mask pattern in sleefsimdsp.c:1332).
         let r = sleef_expf(-104.0);
-        assert_eq!(r, 0.0, "sleef_expf(-104) should hit underflow guard → 0");
+        assert_eq!(r, 0.0, "sleef_expf(-104) post-guard → 0");
 
         // d = 100 (exactly at the overflow guard): polynomial path produces a
         // finite f32 (torch.exp(100) ≈ 2.69e+43 ≈ infinity in f32, since f32 max ≈ 3.4e+38).
