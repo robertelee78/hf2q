@@ -118,7 +118,7 @@ fn quantize_row_ref(x: &[f32], out: &mut Vec<u8>) {
             // for that tensor, but other distributions may exercise it.
             let mut sum_x2 = 0.0f32;
             for &v in sub {
-                sum_x2 = v.mul_add(v, sum_x2);
+                sum_x2 += v * v;
             }
             let av_x = (sum_x2 / 32.0).sqrt();
             for l in 0..32 {
@@ -245,7 +245,7 @@ fn quantize_row_impl(x: &[f32], quant_weights: &[f32], out: &mut Vec<u8>) {
 
         let mut sum_x2 = 0.0f32;
         for &v in xb {
-            sum_x2 = v.mul_add(v, sum_x2);
+            sum_x2 += v * v;
         }
         let sigma2 = 2.0 * sum_x2 / QK_K as f32;
         let _av_x = sigma2.sqrt();
