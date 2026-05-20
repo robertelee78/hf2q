@@ -375,6 +375,19 @@ impl HfModelSource {
         // switches dispatch.
         let fp8_cfg = Fp8Config::from_config(&config)?;
 
+        // ----- per-arch source-tensor drop list ----------------------------
+        // BERT's `embeddings.position_ids` is an I64 lookup table —
+        // canonical `bert.py:filter_tensors` drops it before the dtype
+        // check fires. Mirror that so unsupported-but-known-non-weight
+        // dtypes don't surface as errors. Strictness preserved: only
+        // tensor names that match the static drop list bypass the dtype
+        // check; truly unexpected unsupported dtypes still error.
+        let model_type = config
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
         // ----- shard discovery ---------------------------------------------
         let shards_map: BTreeMap<String, PathBuf> =
             discover_shards(model_dir).map_err(|e| SourceError::Discover(format!("{e:#}")))?;
@@ -433,6 +446,13 @@ impl HfModelSource {
             // re-sorts internally.
             for name in meta.offset_keys() {
                 let info = meta.info(&name).expect("offset_keys yields names that index_map contains");
+                // Per-arch drop list: skip known non-weight tensors
+                // (e.g. BERT's I64 `embeddings.position_ids`) before the
+                // dtype check. Mirrors canonical's per-class
+                // `filter_tensors` override.
+                if super::arch::should_drop_source_tensor(&model_type, &name) {
+                    continue;
+                }
                 let source_dtype = match info.dtype {
                     Dtype::F32 => SourceDtype::F32,
                     Dtype::F16 => SourceDtype::F16,

@@ -652,7 +652,16 @@ fn is_f32_keep_tensor(name: &str, n_dims: usize) -> bool {
     }
     // Rules (3)-(7): substring patterns. Same order as llama-quant.cpp
     // for readability.
-    name.contains("_norm.weight")        // (3) llama-quant.cpp:301
+    //
+    // BERT positional + token-type embeddings — `llama-quant.cpp:317-318`
+    // (exact match via `LLM_TN(arch)(LLM_TENSOR_POS_EMBD/TOKEN_TYPES, "weight")`,
+    // which expands to the bare `position_embd.weight` / `token_types.weight`
+    // names for BERT-family arches). The later `.position_embd`
+    // substring rule catches multimodal SAM-style names with a leading
+    // dot (e.g. `v.position_embd`), so it does NOT cover this case.
+    name == "position_embd.weight"       // BERT — llama-quant.cpp:317
+        || name == "token_types.weight"  // BERT — llama-quant.cpp:318
+        || name.contains("_norm.weight")        // (3) llama-quant.cpp:301
         || name.contains("ffn_gate_inp.weight") // (4) llama-quant.cpp:307
         || name.contains("altup")        // (5) llama-quant.cpp:310
         || name.contains("laurel")       // (5) llama-quant.cpp:311
