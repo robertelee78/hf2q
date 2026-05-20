@@ -15,7 +15,11 @@
 set -euo pipefail
 
 HF_DIR=${1:-/opt/hf2q/models/google-gemma-4-26b-a4b-it}
-OUT_DIR=${2:-/tmp/hf2q_byte_cmp}
+# Default to external-volume cache (operator directive 2026-05-20: model
+# cache lives on the same external volume as `models/` since the system
+# disk is space-constrained). `/opt/hf2q/cache` is a symlink to
+# `/Volumes/Extreme Pro/hf2q-models/cache`. Overridable via $2 / env.
+OUT_DIR=${2:-/opt/hf2q/cache/byte_cmp}
 QUANT=${QUANT:-q4_k_m}
 
 mkdir -p "$OUT_DIR"
