@@ -4,7 +4,7 @@ Byte-cmp ground truth for the per-`GgmlType` Rust quantizer ports under `src/qua
 
 ## Pins
 
-- llama.cpp: `data/llama_cpp_pin.txt` (currently `c779f619802c310798ca8c89695cec7dcfe38a99`)
+- llama.cpp: `data/llama_cpp_pin.txt` (currently `e15384a5cb092b080c2a01c0b9e3f8635079d6df`; updated 2026-05-20 from prior `c779f619` — synthetic mulberry32 fixtures verified byte-identical between both SHAs by `scripts/ggml_quants_harness/generate_all.sh` re-run with current build + `git diff tests/fixtures/ggml_quants/` showing zero changes)
 - Build flags: `GGML_NATIVE=ON` on `aarch64-apple-darwin` (NEON enabled — see ADR-033 §P0 acceptance finding I)
 - PRNG: mulberry32 with input_seed=1, imatrix_seed=2 (constants; changing them is an ADR amendment because all fixtures regenerate)
 
