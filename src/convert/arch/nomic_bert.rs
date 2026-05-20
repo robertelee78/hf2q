@@ -191,9 +191,16 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
     let n_layers = pick_u64("n_layer", "num_hidden_layers");
     let n_head = pick_u64("n_head", "num_attention_heads");
 
-    let ctx_len = config["max_position_embeddings"]
-        .as_u64()
-        .expect("config.json missing required key `max_position_embeddings`") as u32;
+    // Accept BOTH `max_position_embeddings` (standard HF) AND
+    // `n_positions` (nomic-bert v2-moe / GPT-style configs). Mirrors
+    // canonical `find_hparam(["n_positions", "max_position_embeddings"])`
+    // in `/opt/llama.cpp/conversion/base.py`.
+    let ctx_len = config
+        .get("max_position_embeddings")
+        .or_else(|| config.get("n_positions"))
+        .and_then(|v| v.as_u64())
+        .expect("config.json missing required key `max_position_embeddings` (or `n_positions`)")
+        as u32;
 
     // Optional with defaults.
     let ffn_len = config

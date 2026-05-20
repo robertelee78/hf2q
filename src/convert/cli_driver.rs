@@ -812,8 +812,14 @@ pub fn effective_config(config: &serde_json::Value) -> &serde_json::Value {
 /// `n_head`, `n_expert` to zero when absent).
 fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertError> {
     let config = effective_config(config);
+    // Accept BOTH HF naming conventions: most arches use
+    // `num_attention_heads`; nomic-bert / older HF variants use `n_head`.
+    // Mirrors canonical `find_hparam(["n_heads", "num_attention_heads"])`
+    // in `/opt/llama.cpp/conversion/llama.py:131` and similar in bert.py.
     let n_head = config
         .get("num_attention_heads")
+        .or_else(|| config.get("n_head"))
+        .or_else(|| config.get("n_heads"))
         .and_then(|v| v.as_u64())
         .ok_or(ConvertError::MissingHparam {
             key: "num_attention_heads",
@@ -831,8 +837,12 @@ fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertError> {
         .and_then(|v| v.as_u64())
         .map(|x| x as u32)
         .unwrap_or(0);
+    // Accept BOTH conventions: standard HF uses `num_hidden_layers`;
+    // nomic-bert v2-moe uses bare `n_layer`. Same find_hparam pattern
+    // as canonical at `/opt/llama.cpp/conversion/base.py`.
     let n_hidden = config
         .get("num_hidden_layers")
+        .or_else(|| config.get("n_layer"))
         .and_then(|v| v.as_u64())
         .ok_or(ConvertError::MissingHparam {
             key: "num_hidden_layers",
