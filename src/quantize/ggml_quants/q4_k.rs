@@ -350,6 +350,50 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// 2026-05-20 Qwen 3.5 Q4_K BROAD diagnostic — sample 16 rows across 5
+    /// tensors (incl. different layers, MoE experts, token_embd). 0 diff
+    /// across all = strong evidence make_qkx2_quants is byte-identical post
+    /// b921616e on the Qwen 3.5 distribution.
+    #[test]
+    #[ignore]
+    fn qwen35_q4k_broad_sample_dump() {
+        let cases: &[(&str, usize, &[usize])] = &[
+            ("blk_0_attn_gate_weight", 2048, &[0, 100, 1000]),
+            ("blk_0_ssm_out_weight", 4096, &[0, 100, 500]),
+            ("token_embd_weight", 2048, &[0, 1000, 10000, 100000]),
+            ("blk_20_attn_gate_weight", 2048, &[0, 100, 1000]),
+            ("blk_0_ffn_up_exps_weight", 2048, &[0, 1000, 10000]),
+        ];
+        let mut grand_total_diff = 0usize;
+        let mut grand_total = 0usize;
+        for (name, n_per_row, rows) in cases {
+            for &row_idx in *rows {
+                let f32_path = format!("/tmp/c_quant_repro/qwen35_{}_row{}_f32.bin", name, row_idx);
+                let q4k_path = format!("/tmp/c_quant_repro/qwen35_{}_row{}_q4k.bin", name, row_idx);
+                let f32_bytes = std::fs::read(&f32_path)
+                    .unwrap_or_else(|_| panic!("{} must exist", f32_path));
+                let canonical = std::fs::read(&q4k_path)
+                    .unwrap_or_else(|_| panic!("{} must exist", q4k_path));
+                let n_blocks = n_per_row / 256;
+                assert_eq!(f32_bytes.len(), n_per_row * 4);
+                assert_eq!(canonical.len(), n_blocks * 144);
+                let f32: Vec<f32> = f32_bytes.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let q4k = quantize(&f32, *n_per_row, None);
+                let diff: usize = q4k.iter().zip(canonical.iter())
+                    .filter(|(a, b)| a != b).count();
+                if diff > 0 {
+                    println!("{} row {}: {} bytes differ", name, row_idx, diff);
+                }
+                grand_total_diff += diff;
+                grand_total += q4k.len();
+            }
+        }
+        println!("\nBROAD GRAND TOTAL: {}/{} bytes differ ({:.6}%)",
+            grand_total_diff, grand_total, 100.0 * grand_total_diff as f64 / grand_total as f64);
+    }
+
     /// 2026-05-20 Qwen 3.5 Q4_K multi-tensor diagnostic — sample 3 tensors
     /// (blk.0.attn_gate, blk.0.ssm_out, blk.0.ffn_gate_exps), read F32 row 0
     /// from canonical's F16 GGUF + Q4_K_M bytes from canonical's quantized GGUF,
