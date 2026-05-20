@@ -643,6 +643,41 @@ mod tests {
         println!("\nTotal: {}/{} bytes diff", total_diff, n_blocks * 144);
     }
 
+    /// 2026-05-20 Gemma 4 Q4_K broader sampler — beyond just blk.0.attn_k.
+    /// Verifies how widespread the input-distribution boundary residuals are
+    /// across the Gemma Q4_K tensor population.
+    #[test]
+    #[ignore]
+    fn gemma_q4k_broad_sample_dump() {
+        let cases: &[(&str, usize, &[usize])] = &[
+            ("blk_0_attn_q_weight", 2816, &[0, 100, 1000]),
+            ("blk_5_ffn_gate_weight", 2816, &[0, 100, 500]),
+        ];
+        let mut grand_total_diff = 0usize;
+        let mut grand_total = 0usize;
+        for (name, n_per_row, rows) in cases {
+            for &row_idx in *rows {
+                let f32_path = format!("/tmp/c_quant_repro/gemma_{}_row{}_f32.bin", name, row_idx);
+                let q4k_path = format!("/tmp/c_quant_repro/gemma_{}_row{}_q4k.bin", name, row_idx);
+                let f32_bytes = std::fs::read(&f32_path).unwrap_or_else(|_| panic!("{} must exist", f32_path));
+                let canonical = std::fs::read(&q4k_path).unwrap_or_else(|_| panic!("{} must exist", q4k_path));
+                let n_blocks = n_per_row / 256;
+                assert_eq!(f32_bytes.len(), n_per_row * 4);
+                assert_eq!(canonical.len(), n_blocks * 144);
+                let f32: Vec<f32> = f32_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                let q4k = quantize(&f32, *n_per_row, None);
+                let diff: usize = q4k.iter().zip(canonical.iter()).filter(|(a, b)| a != b).count();
+                if diff > 0 {
+                    println!("{} row {}: {} bytes differ", name, row_idx, diff);
+                }
+                grand_total_diff += diff;
+                grand_total += q4k.len();
+            }
+        }
+        println!("\nGEMMA Q4_K BROAD GRAND TOTAL: {}/{} bytes differ ({:.6}%)",
+            grand_total_diff, grand_total, 100.0 * grand_total_diff as f64 / grand_total as f64);
+    }
+
     /// 2026-05-20 Qwen 3.5 Q4_K BROAD diagnostic — sample 16 rows across 5
     /// tensors (incl. different layers, MoE experts, token_embd). 0 diff
     /// across all = strong evidence make_qkx2_quants is byte-identical post
