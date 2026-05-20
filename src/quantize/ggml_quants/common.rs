@@ -645,6 +645,109 @@ mod tests {
         );
     }
 
+    /// Diagnostic for ADR-033 Q4_K residual investigation — runs our
+    /// `make_qkx2_quants` on the exact 32 F32 inputs of Gemma 4
+    /// blk.8.ffn_gate_up_exps block 1055656 sub-block 7 (the largest
+    /// single-block residual in real-model byte-cmp). Verified 2026-05-20:
+    /// produces bit-identical output to canonical's verbatim C reproducer
+    /// (scale=0x3be60a3e, min=0x3d2e1b55, L=[3,5,5,8,11,0,8,9,5,1,9,3,9,8,
+    /// 7,5,4,11,14,3,0,3,8,5,7,3,10,7,4,5,5,1]). Therefore the residual
+    /// is NOT in this sub-block's make_qkx2_quants — must be in the F32
+    /// inputs derivation or cross-sub-block max_scale/max_min computation
+    /// (see `diag_blk1055656_full_quantize_row_ref` for full-block test).
+    #[test]
+    #[ignore]
+    fn diag_blk1055656_subblock7_make_qkx2() {
+        let bytes = match std::fs::read("/tmp/blk1055656_subblock7_f32.bin") {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("[skip] fixture missing — regenerate with python extract");
+                return;
+            }
+        };
+        let mut x = Vec::with_capacity(32);
+        for chunk in bytes.chunks_exact(4) {
+            x.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        assert_eq!(x.len(), 32);
+        // Reproduce hf2q's Q4_K weights formula (q4_k.rs:119-126).
+        let mut sum_x2 = 0.0f32;
+        for &v in &x {
+            sum_x2 = v.mul_add(v, sum_x2);
+        }
+        let av_x = (sum_x2 / 32.0).sqrt();
+        let weights: Vec<f32> = x.iter().map(|&v| av_x + v.abs()).collect();
+        let mut l = vec![0u8; 32];
+        let mut l_aux = vec![0u8; 32];
+        let mut the_min = 0.0f32;
+        let scale = super::make_qkx2_quants(
+            32, 15, &x, &weights, &mut l, &mut the_min, &mut l_aux,
+            -1.0, 0.1, 20, false,
+        );
+        eprintln!("hf2q av_x  = {:.10e} (bits=0x{:08x})", av_x, av_x.to_bits());
+        eprintln!("hf2q scale = {:.10e} (bits=0x{:08x})", scale, scale.to_bits());
+        eprintln!("hf2q min   = {:.10e} (bits=0x{:08x})", the_min, the_min.to_bits());
+        eprintln!("hf2q L     = {:?}", l);
+        eprintln!("");
+        eprintln!("canonical: scale=0x3be60a3e min=0x3d2e1b55");
+        eprintln!("           L = [3,5,5,8,11,0,8,9,5,1,9,3,9,8,7,5,4,11,14,3,0,3,8,5,7,3,10,7,4,5,5,1]");
+    }
+
+    /// Full-block diagnostic for ADR-033 Q4_K residual investigation —
+    /// runs hf2q's full `quantize_row_ref` (via super::super::q4_k::quantize)
+    /// on Gemma 4 blk.8.ffn_gate_up_exps block 1055656's 256 F32 inputs,
+    /// compares output to canonical's 144 bytes for that exact block.
+    /// Reveals whether the 22-byte residual is in the F32 derivation
+    /// (canonical F16 vs production BF16→F32→F16 mismatch) or in the
+    /// cross-sub-block max_scale/max_min derivation.
+    #[test]
+    #[ignore]
+    fn diag_blk1055656_full_quantize_row_ref() {
+        let bytes = match std::fs::read("/tmp/blk1055656_full_256_f32.bin") {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("[skip] fixture missing");
+                return;
+            }
+        };
+        let mut x = Vec::with_capacity(256);
+        for chunk in bytes.chunks_exact(4) {
+            x.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        assert_eq!(x.len(), 256);
+        let actual = crate::quantize::ggml_quants::q4_k::quantize(&x, 256, None);
+        assert_eq!(actual.len(), 144);
+        let expected = match std::fs::read("/tmp/blk1055656_canonical_q4k.bin") {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("[skip] canonical-expected missing");
+                return;
+            }
+        };
+        assert_eq!(expected.len(), 144);
+        let mut diffs = 0;
+        for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+            if a != e {
+                diffs += 1;
+                if diffs <= 5 {
+                    let field = match i {
+                        0..=1 => format!("d[{}]", i),
+                        2..=3 => format!("dmin[{}]", i - 2),
+                        4..=15 => format!("scales[{}]", i - 4),
+                        _ => format!("qs[{}]", i - 16),
+                    };
+                    eprintln!("  diff byte {} ({}): hf2q=0x{:02x} canon=0x{:02x}", i, field, a, e);
+                }
+            }
+        }
+        eprintln!("diffs: {}/144 bytes", diffs);
+        if diffs == 0 {
+            eprintln!("✅ FULL-BLOCK BYTE-IDENTICAL — F32 input + kernel both match canonical");
+        } else {
+            eprintln!("✗ diverged — residual NOT closed by kernel-on-fixture (issue elsewhere)");
+        }
+    }
+
     #[test]
     fn make_qkx2_quants_zero_block() {
         let x = vec![0.0f32; 32];
