@@ -478,6 +478,9 @@ pub fn compute_imatrix(
         // passes through). `imatrix_n_ctx` is consulted ONLY when
         // `imatrix_corpus` is set, so None here is structurally safe.
         imatrix_n_ctx: None,
+        // Imatrix-driver inner convert is F16-only — no quantize calls,
+        // so FFI dispatch is irrelevant.
+        ffi_canonical: None,
     };
     crate::convert::cli_driver::run_convert(convert_args).map_err(|e| {
         ImatrixError::ConvertFailed {

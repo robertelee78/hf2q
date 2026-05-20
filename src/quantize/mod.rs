@@ -19,5 +19,6 @@
 //! arches consume pre-computed `.imatrix.gguf` via `--imatrix
 //! <path>` until Stage 3b.4 adds Qwen35Moe driver wiring.
 
+pub mod canonical_ffi;
 pub mod ggml_quants;
 pub mod imatrix;

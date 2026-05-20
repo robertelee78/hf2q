@@ -101,6 +101,15 @@ pub struct ConvertArgs {
     /// surfaces `ImatrixError::CorpusTooShort` if the tokenized corpus
     /// can't fill even one chunk of size `n_ctx`.
     pub imatrix_n_ctx: Option<u32>,
+    /// ADR-033 §P1 byte-identity: when `Some`, dispatches per-tensor
+    /// quantize through canonical libggml-base.0.dylib at this path.
+    /// `Some("default")` resolves to
+    /// `/opt/llama.cpp/build/bin/libggml-base.0.dylib` (matches pinned
+    /// SHA in `data/llama_cpp_pin.txt`). `None` ⇒ pure-Rust kernels
+    /// (default; closes Gemma to sub-0.001% but has Qwen input-distribution
+    /// boundary cases that don't close in Rust). Setting this guarantees
+    /// byte-identity to canonical's emit across all input distributions.
+    pub ffi_canonical: Option<PathBuf>,
 }
 
 /// Errors raised by [`run_convert`]. Wraps the typed errors from the
@@ -523,6 +532,23 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // through the same map/plan/stream path as on-disk tensors.
     let synthesized: Vec<HfTensor> = synthesized_tensors_for_arch(arch, &src.config);
     let plan = build_convert_plan(arch, &src, &synthesized)?;
+
+    // ADR-033 §P1 FFI: if --ffi-canonical is set, load canonical libggml
+    // and attach to the orchestrator before begin_write. The handle is
+    // Arc<>-shared into the StreamingWriter so per-tensor stream_tensor
+    // calls can dispatch through canonical's exported quantize_q* /
+    // quantize_iq* symbols. NO FALLBACK: if the library can't be loaded
+    // or any required symbol is missing, the convert errors out per
+    // [[feedback-no-loop-suppression-2026-05-17]].
+    if let Some(ffi_path) = &args.ffi_canonical {
+        let ffi = crate::quantize::canonical_ffi::CanonicalQuant::load(ffi_path)
+            .map_err(|e| ConvertError::Orchestrator(
+                crate::convert::orchestrator::OrchestratorError::Quantize(
+                    crate::quantize::ggml_quants::QuantizeError::CanonicalFfi(e.to_string()),
+                ),
+            ))?;
+        orch.enable_canonical_ffi(std::sync::Arc::new(ffi));
+    }
 
     // 5a. Orchestrator plan-phase: feed every tensor's metadata, no
     // payload bytes.

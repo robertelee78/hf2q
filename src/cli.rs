@@ -232,6 +232,27 @@ pub struct ConvertCliArgs {
     /// of more memory per forward pass.
     #[arg(long)]
     pub imatrix_n_ctx: Option<u32>,
+
+    /// ADR-033 §P1 byte-identity opt-in: dispatch per-tensor quantize
+    /// through canonical `libggml-base.0.dylib` instead of hf2q's
+    /// pure-Rust kernels. Guarantees byte-identity to canonical's emit
+    /// across all input distributions (closes the 1-ULP boundary cases
+    /// that no clean source-level Rust pattern can satisfy across both
+    /// Gemma and Qwen value distributions).
+    ///
+    /// Argument forms:
+    ///   - `--ffi-canonical` (no value) ⇒ default path
+    ///     `/opt/llama.cpp/build/bin/libggml-base.0.dylib`
+    ///   - `--ffi-canonical=<path>` ⇒ explicit dylib path
+    ///
+    /// When unset, hf2q uses the pure-Rust ggml_quants kernels (default
+    /// — Gemma matches OLD canonical to <0.001%, Qwen has
+    /// ~0.03%/tensor residual). The FFI path makes hf2q a runtime
+    /// consumer of canonical libggml-base; the library ABI is not
+    /// guaranteed stable across SHAs (pinned to `data/llama_cpp_pin.txt`
+    /// SHA).
+    #[arg(long, num_args = 0..=1, default_missing_value = "/opt/llama.cpp/build/bin/libggml-base.0.dylib")]
+    pub ffi_canonical: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]

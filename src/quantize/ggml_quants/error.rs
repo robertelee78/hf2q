@@ -52,4 +52,12 @@ pub enum QuantizeError {
     /// Port of the runtime_error at `llama-quant.cpp:427-432`.
     #[error("bad/missing layer index for tensor {name} (n_layer = {n_layer})")]
     BadLayerForTensor { name: String, n_layer: i32 },
+
+    /// `--ffi-canonical` dispatch failed (dlopen, missing symbol,
+    /// size-mismatch, etc.). Wraps the typed `FfiError` from
+    /// `canonical_ffi::FfiError`. Surfaced as a string to keep the
+    /// trait-level error type Clone/PartialEq-able (libloading errors
+    /// are not Clone).
+    #[error("canonical FFI: {0}")]
+    CanonicalFfi(String),
 }

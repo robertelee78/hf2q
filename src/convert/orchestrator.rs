@@ -177,6 +177,14 @@ pub struct ConvertOrchestrator {
     /// Populated by `plan_tensors`. Empty before planning, in plan order
     /// during/after planning. Drained slot-by-slot during streaming.
     planned: Vec<PlannedTensor>,
+    /// ADR-033 §P1 FFI: when `Some`, dispatches per-tensor quantize calls
+    /// through canonical libggml-base.0.dylib's exported `quantize_q*` /
+    /// `quantize_iq*` functions instead of the pure-Rust kernels. Opt-in
+    /// via `--ffi-canonical`. Guarantees byte-identity to canonical's
+    /// emit across all input distributions (closes the kernel-port
+    /// 1-ULP boundary cases at the cost of a runtime libggml-base.0.dylib
+    /// dependency).
+    ffi_canonical: Option<std::sync::Arc<crate::quantize::canonical_ffi::CanonicalQuant>>,
 }
 
 impl ConvertOrchestrator {
@@ -194,6 +202,7 @@ impl ConvertOrchestrator {
             apex_policy: None,
             metadata: Vec::new(),
             planned: Vec::new(),
+            ffi_canonical: None,
         }
     }
 
@@ -220,7 +229,20 @@ impl ConvertOrchestrator {
             apex_policy: Some(apex_policy),
             metadata: Vec::new(),
             planned: Vec::new(),
+            ffi_canonical: None,
         }
+    }
+
+    /// Enable ADR-033 §P1 canonical FFI dispatch. After this call,
+    /// `stream_tensor` routes quantize through canonical libggml-base
+    /// for the byte-identity guarantee. Must be called BEFORE
+    /// `stream_tensor`. Returns the FFI handle for ownership transfer
+    /// across orchestrator clones (caller-side keep-alive).
+    pub fn enable_canonical_ffi(
+        &mut self,
+        ffi: std::sync::Arc<crate::quantize::canonical_ffi::CanonicalQuant>,
+    ) {
+        self.ffi_canonical = Some(ffi);
     }
 
     /// Stage one GGUF metadata KV pair. Written in insertion order
@@ -472,7 +494,21 @@ impl ConvertOrchestrator {
             writer: w,
             planned,
             next_idx: 0,
+            ffi_canonical: self.ffi_canonical.clone(),
         })
+    }
+}
+
+impl<W: Write + Seek> StreamingWriter<W> {
+    /// Override the FFI handle after construction. Most callers should
+    /// set this on the `ConvertOrchestrator` before `begin_write` so
+    /// it propagates automatically.
+    pub fn with_canonical_ffi(
+        mut self,
+        ffi: Option<std::sync::Arc<crate::quantize::canonical_ffi::CanonicalQuant>>,
+    ) -> Self {
+        self.ffi_canonical = ffi;
+        self
     }
 }
 
@@ -486,6 +522,11 @@ pub struct StreamingWriter<W: Write + Seek> {
     writer: GgufWriter<W>,
     planned: Vec<PlannedTensor>,
     next_idx: usize,
+    /// ADR-033 §P1 FFI handle. When `Some`, `stream_tensor` dispatches
+    /// quantize through canonical libggml-base.0.dylib instead of the
+    /// pure-Rust kernels. Set via `with_canonical_ffi` builder before
+    /// streaming starts.
+    ffi_canonical: Option<std::sync::Arc<crate::quantize::canonical_ffi::CanonicalQuant>>,
 }
 
 impl<W: Write + Seek> StreamingWriter<W> {
@@ -561,7 +602,6 @@ impl<W: Write + Seek> StreamingWriter<W> {
                 v
             }
             _ => {
-                let quantizer = quantizer_for(p.ggml_type)?;
                 // ADR-033 §P1 F16-round-trip: convert_hf_to_gguf.py stores
                 // weight tensors as F16 in the intermediate GGUF (see
                 // /opt/llama.cpp/conversion/base.py:875-876), and
@@ -573,7 +613,33 @@ impl<W: Write + Seek> StreamingWriter<W> {
                 // kernel. Per-element scalar round-trip; matches numpy's
                 // ndarray.astype(float16).astype(float32) used by canonical.
                 let f16_rt: Vec<f32> = data.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
-                quantizer.quantize(&f16_rt, p.n_per_row, None)?
+
+                // ADR-033 §P1 byte-identity: when --ffi-canonical is set,
+                // dispatch quantize through canonical libggml-base's exported
+                // quantize_q* / quantize_iq* symbols instead of the pure-Rust
+                // kernels. Guarantees byte-identity across all input
+                // distributions (no source-level Rust pattern can match
+                // clang's auto-vec NEON reduction order on every boundary
+                // case). Per [[feedback-no-loop-suppression-2026-05-17]] +
+                // mantra: NO FALLBACK to Rust kernel if FFI fails — surface
+                // the typed error.
+                if let Some(ffi) = &self.ffi_canonical {
+                    let total_bytes = p.ggml_type.row_size(p.n_per_row)
+                        * (f16_rt.len() / p.n_per_row);
+                    let mut payload = vec![0u8; total_bytes];
+                    ffi.quantize(
+                        p.ggml_type,
+                        &f16_rt,
+                        p.n_per_row,
+                        None,
+                        &mut payload,
+                    )
+                    .map_err(|e| QuantizeError::CanonicalFfi(e.to_string()))?;
+                    payload
+                } else {
+                    let quantizer = quantizer_for(p.ggml_type)?;
+                    quantizer.quantize(&f16_rt, p.n_per_row, None)?
+                }
             }
         };
 
