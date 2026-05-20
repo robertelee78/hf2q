@@ -111,11 +111,11 @@ fn quantize_row_ref(x: &[f32], out: &mut Vec<u8>) {
         let mut max_min = 0.0f32;
         for j in 0..QK_K / 32 {
             let sub = &xb[32 * j..32 * (j + 1)];
-            // FMA: clang fuses `sum_x2 + v*v` into fmadd at -O3 -march=native;
-            // mirror Q5_K's _ref path (q5_k.rs:185) for consistency. The
-            // single-tensor byte-cmp on blk.0.attn_k passed without this
-            // because the av_x ULP delta didn't propagate to L[] selection
-            // for that tensor, but other distributions may exercise it.
+            // sum_x2 accumulation. Bit-neutral whether `.mul_add()` or
+            // plain `+=` is used here (verified on real-model Gemma 4
+            // ffn_gate_up_exps block 1055656 sub-block 7, 2026-05-20). The
+            // remaining 120-byte Q4_K residual on Gemma 4 originates in
+            // make_qkx2_quants's iterative refinement, NOT in this sum.
             let mut sum_x2 = 0.0f32;
             for &v in sub {
                 sum_x2 = v.mul_add(v, sum_x2);

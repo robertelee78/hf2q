@@ -97,11 +97,15 @@ pub fn make_qx_quants(
         rmse_type = -rmse_type;
         return_early = true;
     }
-    // Initial pass: scalar .mul_add accumulation matches canonical's emit
-    // for this loop. Canonical writes `L[i] = l+nmax` in the loop body,
-    // which limits clang's auto-vectorization — the side effect on L
-    // serializes the loop, producing scalar `fmla`-style reduction that
-    // matches Rust's .mul_add. Empirically verified bit-identical.
+    // Initial pass uses plain `*` + `+=` (NO `.mul_add()`). Real-model
+    // byte-cmp on Gemma 4 26B Q4_K_M (commit `6985cd56`) showed that
+    // canonical's compiled `_quantize_row_q6_K_ref` emits only 32 `fmadd s`
+    // = exactly the refinement loop's one specialized iteration. The
+    // initial pass has the `L[i] = l + nmax;` side-effect inside the body
+    // which serializes clang and produces scalar `fmul; fadd` (NO FMA).
+    // Mirroring that pattern here closed the Q6_K residual from 49,181 →
+    // 0 bytes on Gemma 4 26B and 0 bytes on every Qwen 3.5 in-tree
+    // diagnostic. Refinement loop below (lines 155-156) keeps `.mul_add()`.
     let mut sumlx: f32 = 0.0;
     let mut suml2: f32 = 0.0;
     for i in 0..n {
@@ -234,7 +238,10 @@ pub fn make_qkx2_quants(
         // 2026-05-20: plain *+ matches canonical (neutral per bisection).
         let mut diff = scale.mul_add(li_c as f32, min) - x[i];
         diff = if use_mad { diff.abs() } else { diff * diff };
-        best_error = weights[i].mul_add(diff, best_error);
+        // 2026-05-20: canonical init-loop accumulates w*diff^2 via fmul+fadd (NOT fmadd).
+        // Using FMA here produces best_error ~1.4e-12 lower than canonical, which flips
+        // the is=5 acceptance gate for Qwen3.5 ssm_out row 100 blk 13 sub 1.
+        best_error += weights[i] * diff;
     }
     if nstep < 1 {
         *the_min = -min;
