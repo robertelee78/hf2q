@@ -35,16 +35,22 @@ CPU-work is comparable (662s vs 691s+55s). hf2q is 3.4× slower wall-clock becau
 
 Reproducibility (second-run validation): re-running both pipelines on the same source produced byte-identical Q4_K_M outputs (`scripts/byte_cmp_gguf.py: All 658 tensors byte-identical`).
 
-## Matrix — UPDATED 2026-05-19 POST-CLOSURE (commit `50fd89c2`)
+## Matrix — UPDATED 2026-05-19 POST-CLOSURE (commits `50fd89c2` + `27b055fa`)
 
 | Quant   | Canonical PPL          | hf2q PPL              | Ratio  | Tensors | Verdict |
 |---------|------------------------|-----------------------|--------|---------|---------|
+| Q4_0    | n/a (not measured)     | n/a                   | n/a    | **658/658 byte-identical** | 🏆 EXACT |
+| Q4_K_S  | n/a (not measured)     | n/a                   | n/a    | **658/658 byte-identical** | 🏆 EXACT |
 | Q4_K_M  | 13183.4003 ± 697.92    | 13183.4003 ± 697.92   | 1.0000 | **658/658 byte-identical** | 🏆 EXACT |
+| Q5_K_S  | n/a (not measured)     | n/a                   | n/a    | **658/658 byte-identical** | 🏆 EXACT |
 | Q5_K_M  | 5458.7019 ± 283.97     | 5458.7019 ± 283.97    | 1.0000 | **658/658 byte-identical** | 🏆 EXACT |
 | Q6_K    | 4150.6105 ± 211.32     | 4150.6105 ± 211.32    | 1.0000 | **658/658 byte-identical** | 🏆 EXACT |
 | Q8_0    | 4119.9252 ± 206.98     | 4119.9252 ± 206.98    | 1.0000 | **658/658 byte-identical** | 🏆 EXACT |
+| IQ4_NL  | n/a (not measured)     | n/a                   | n/a    | **658/658 byte-identical** | 🏆 EXACT |
 
-All four cells: per-tensor byte-cmp via `scripts/byte_cmp_gguf.py` reports zero diffs across every F32/Q4_K/Q5_K/Q5_0/Q5_1/Q6_K/Q8_0 tensor; PPL is bit-for-bit identical between canonical `convert_hf_to_gguf.py --outtype f16 | llama-quantize <type>` and `hf2q convert --quant <type>`. File-size delta remains 448 bytes (header-KV ordering only — not a tensor-data difference).
+**Total: 8 quants × 658 tensors = 5,264 per-tensor byte-equivalence verifications, ALL pass.** Per-tensor byte-cmp via `scripts/byte_cmp_gguf.py` reports zero diffs across every F32/Q4_0/Q4_K/Q5_0/Q5_1/Q5_K/Q6_K/Q8_0/IQ4_NL tensor; where PPL was measured (Q4_K_M / Q5_K_M / Q6_K / Q8_0), it is bit-for-bit identical between canonical `convert_hf_to_gguf.py --outtype f16 | llama-quantize <type>` and `hf2q convert --quant <type>`. File-size delta remains 448 bytes (header-KV ordering only — not a tensor-data difference).
+
+The IQ4_NL closure required a separate FMA fix on top of the K-quant fixes — its own kernel at `src/quantize/ggml_quants/iq4_nl.rs` has `sumqx`/`sumq2`/`sigma2` accumulator hotspots in a structurally different scale-selection loop. Same mul_add pattern, different kernel file. Commit `27b055fa`.
 
 Two root causes closed the historical gaps:
 
