@@ -18,6 +18,7 @@
 //! byte-identical (verified at fixture-generation time).
 
 use half::f16;
+use rayon::prelude::*;
 
 pub const QK8_0: usize = 32;
 pub const BLOCK_BYTES: usize = 2 + QK8_0; // 34
@@ -43,9 +44,11 @@ pub fn quantize(src: &[f32], n_per_row: usize, _imatrix: Option<&[f32]>) -> Vec<
     );
 
     let total_blocks = src.len() / QK8_0;
-    let mut out = Vec::with_capacity(total_blocks * BLOCK_BYTES);
-
-    for block_idx in 0..total_blocks {
+    // ADR-036 Layer A: Q8_0 blocks are fully independent (no cross-block
+    // state). Parallelize per block. par_chunks_exact_mut on a
+    // pre-allocated output preserves block ordering.
+    let mut out = vec![0u8; total_blocks * BLOCK_BYTES];
+    out.par_chunks_exact_mut(BLOCK_BYTES).enumerate().for_each(|(block_idx, dst)| {
         let block = &src[block_idx * QK8_0..(block_idx + 1) * QK8_0];
 
         let mut amax = 0.0f32;
@@ -60,13 +63,13 @@ pub fn quantize(src: &[f32], n_per_row: usize, _imatrix: Option<&[f32]>) -> Vec<
         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
 
         let d_f16 = f16::from_f32(d);
-        out.extend_from_slice(&d_f16.to_le_bytes());
+        dst[0..2].copy_from_slice(&d_f16.to_le_bytes());
 
-        for &v in block {
+        for (i, &v) in block.iter().enumerate() {
             let q = (v * id).round() as i8;
-            out.push(q as u8);
+            dst[2 + i] = q as u8;
         }
-    }
+    });
 
     out
 }

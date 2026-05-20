@@ -49,6 +49,7 @@
 //!   bits 0/1, 2/3, 4/5, 6/7 cover the four chunks.
 
 use half::f16;
+use rayon::prelude::*;
 
 use super::common::{make_qkx2_quants, make_qkx3_quants, make_qp_quants, nearest_int};
 
@@ -340,21 +341,22 @@ pub fn quantize(src: &[f32], n_per_row: usize, imatrix: Option<&[f32]>) -> Vec<u
         );
     }
 
-    let total_blocks = src.len() / QK_K;
-    let mut out = Vec::with_capacity(total_blocks * BLOCK_BYTES);
-
-    match imatrix {
-        None => {
-            quantize_row_q5_k_ref(src, &mut out);
+    let nrow = src.len() / n_per_row;
+    let row_blocks = n_per_row / QK_K;
+    let row_bytes = row_blocks * BLOCK_BYTES;
+    // ADR-036 Layer A: each row's Q5_K quantization is block-local
+    // (per-block state in ref/impl, no cross-row reads). Parallelize.
+    let mut out = vec![0u8; nrow * row_bytes];
+    out.par_chunks_exact_mut(row_bytes).enumerate().for_each(|(row, dst)| {
+        let row_x = &src[row * n_per_row..(row + 1) * n_per_row];
+        let mut tmp = Vec::with_capacity(row_bytes);
+        match imatrix {
+            None => quantize_row_q5_k_ref(row_x, &mut tmp),
+            Some(qw) => quantize_row_q5_k_impl(row_x, qw, &mut tmp),
         }
-        Some(qw) => {
-            let nrow = src.len() / n_per_row;
-            for row in 0..nrow {
-                let row_x = &src[row * n_per_row..(row + 1) * n_per_row];
-                quantize_row_q5_k_impl(row_x, qw, &mut out);
-            }
-        }
-    }
+        debug_assert_eq!(tmp.len(), row_bytes);
+        dst.copy_from_slice(&tmp);
+    });
 
     out
 }

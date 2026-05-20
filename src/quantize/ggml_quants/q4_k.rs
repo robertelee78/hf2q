@@ -33,6 +33,7 @@
 //! 0..3 and 4..7 respectively.
 
 use half::f16;
+use rayon::prelude::*;
 
 use super::common::{make_qkx2_quants, make_qkx3_quants, make_qp_quants, nearest_int};
 
@@ -72,15 +73,22 @@ pub fn quantize(src: &[f32], n_per_row: usize, imatrix: Option<&[f32]>) -> Vec<u
 
     let n_rows = src.len() / n_per_row;
     let row_blocks = n_per_row / QK_K;
-    let mut out = Vec::with_capacity(n_rows * row_blocks * BLOCK_BYTES);
-
-    for row in 0..n_rows {
+    let row_bytes = row_blocks * BLOCK_BYTES;
+    // ADR-036 Layer A: each row's quantization is independent (per-row
+    // scratch state, no cross-row reads/writes). Parallelize via rayon
+    // par_chunks_exact_mut into a pre-allocated output. Byte output is
+    // unchanged — the §P1 byte-cmp regression gate validates.
+    let mut out = vec![0u8; n_rows * row_bytes];
+    out.par_chunks_exact_mut(row_bytes).enumerate().for_each(|(row, dst)| {
         let row_x = &src[row * n_per_row..(row + 1) * n_per_row];
+        let mut tmp = Vec::with_capacity(row_bytes);
         match imatrix {
-            None => quantize_row_ref(row_x, &mut out),
-            Some(qw) => quantize_row_impl(row_x, qw, &mut out),
+            None => quantize_row_ref(row_x, &mut tmp),
+            Some(qw) => quantize_row_impl(row_x, qw, &mut tmp),
         }
-    }
+        debug_assert_eq!(tmp.len(), row_bytes);
+        dst.copy_from_slice(&tmp);
+    });
 
     out
 }

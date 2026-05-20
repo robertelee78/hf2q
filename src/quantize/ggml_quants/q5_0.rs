@@ -28,6 +28,7 @@
 //! with Q4_0/Q4_1/Q5_1).
 
 use half::f16;
+use rayon::prelude::*;
 
 use super::common::make_qx_quants;
 
@@ -72,15 +73,19 @@ pub fn quantize(src: &[f32], n_per_row: usize, imatrix: Option<&[f32]>) -> Vec<u
 
     let nrow = src.len() / n_per_row;
     let blocks_per_row = n_per_row / QK5_0;
-    let mut out = Vec::with_capacity(nrow * blocks_per_row * BLOCK_BYTES);
-
-    for row in 0..nrow {
+    let row_bytes = blocks_per_row * BLOCK_BYTES;
+    // ADR-036 Layer A: per-row parallelism.
+    let mut out = vec![0u8; nrow * row_bytes];
+    out.par_chunks_exact_mut(row_bytes).enumerate().for_each(|(row, dst)| {
         let x_row = &src[row * n_per_row..(row + 1) * n_per_row];
+        let mut tmp = Vec::with_capacity(row_bytes);
         match imatrix {
-            None => quantize_row_ref(x_row, &mut out),
-            Some(qw) => quantize_row_impl(x_row, qw, &mut out),
+            None => quantize_row_ref(x_row, &mut tmp),
+            Some(qw) => quantize_row_impl(x_row, qw, &mut tmp),
         }
-    }
+        debug_assert_eq!(tmp.len(), row_bytes);
+        dst.copy_from_slice(&tmp);
+    });
 
     out
 }

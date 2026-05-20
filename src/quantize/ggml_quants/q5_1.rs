@@ -30,6 +30,7 @@
 //!   directly; the difference is intentional, see lines 211 vs 2189).
 
 use half::f16;
+use rayon::prelude::*;
 
 use super::common::make_qkx3_quants;
 
@@ -188,21 +189,22 @@ pub fn quantize(src: &[f32], n_per_row: usize, imatrix: Option<&[f32]>) -> Vec<u
         );
     }
 
-    let total_blocks = src.len() / QK5_1;
-    let mut out = Vec::with_capacity(total_blocks * BLOCK_BYTES);
-
-    match imatrix {
-        None => {
-            quantize_row_q5_1_ref(src, &mut out);
+    let nrow = src.len() / n_per_row;
+    let blocks_per_row = n_per_row / QK5_1;
+    let row_bytes = blocks_per_row * BLOCK_BYTES;
+    // ADR-036 Layer A: per-row parallelism (each block in ref/impl is
+    // independent — same justification as Q5_K).
+    let mut out = vec![0u8; nrow * row_bytes];
+    out.par_chunks_exact_mut(row_bytes).enumerate().for_each(|(row, dst)| {
+        let row_x = &src[row * n_per_row..(row + 1) * n_per_row];
+        let mut tmp = Vec::with_capacity(row_bytes);
+        match imatrix {
+            None => quantize_row_q5_1_ref(row_x, &mut tmp),
+            Some(qw) => quantize_row_q5_1_impl(row_x, qw, &mut tmp),
         }
-        Some(qw) => {
-            let nrow = src.len() / n_per_row;
-            for row in 0..nrow {
-                let row_x = &src[row * n_per_row..(row + 1) * n_per_row];
-                quantize_row_q5_1_impl(row_x, qw, &mut out);
-            }
-        }
-    }
+        debug_assert_eq!(tmp.len(), row_bytes);
+        dst.copy_from_slice(&tmp);
+    });
 
     out
 }

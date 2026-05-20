@@ -26,6 +26,7 @@
 //! and on every real on-disk conversion we emit. We unify on that.
 
 use half::f16;
+use rayon::prelude::*;
 
 use super::common::{best_index_int8, GROUP_MAX_EPS};
 
@@ -216,19 +217,20 @@ pub fn quantize(src: &[f32], n_per_row: usize, imatrix: Option<&[f32]>) -> Vec<u
     let ntry: i32 = 7;
     let nblock_per_row = n_per_row / QK4_NL;
     let nrows = src.len() / n_per_row;
-    let mut out = vec![0u8; nrows * nblock_per_row * BLOCK_BYTES];
-
-    for row in 0..nrows {
+    let row_bytes = nblock_per_row * BLOCK_BYTES;
+    // ADR-036 Layer A: rows are independent; the iq4_nl per-block kernel
+    // (`quantize_block_iq4_nl`) writes into the slice the caller passes
+    // — no shared output state between blocks. Parallelize across rows.
+    let mut out = vec![0u8; nrows * row_bytes];
+    out.par_chunks_exact_mut(row_bytes).enumerate().for_each(|(row, row_dst)| {
         let row_src = &src[row * n_per_row..(row + 1) * n_per_row];
-        let row_out_start = row * nblock_per_row * BLOCK_BYTES;
         for ibl in 0..nblock_per_row {
             let xb = &row_src[ibl * QK4_NL..(ibl + 1) * QK4_NL];
             let qw_block = imatrix.map(|im| &im[ibl * QK4_NL..(ibl + 1) * QK4_NL]);
-            let blk_start = row_out_start + ibl * BLOCK_BYTES;
-            let blk_out = &mut out[blk_start..blk_start + BLOCK_BYTES];
+            let blk_out = &mut row_dst[ibl * BLOCK_BYTES..(ibl + 1) * BLOCK_BYTES];
             quantize_block_iq4_nl(xb, blk_out, &KVALUES_IQ4NL, qw_block, ntry);
         }
-    }
+    });
 
     out
 }

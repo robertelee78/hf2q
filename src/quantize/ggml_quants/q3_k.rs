@@ -26,6 +26,7 @@
 //! packs four 2-bit values per byte across the four 32-element groups.
 
 use half::f16;
+use rayon::prelude::*;
 
 use super::common::{make_qx_quants, nearest_int, GROUP_MAX_EPS};
 
@@ -347,21 +348,21 @@ pub fn quantize(src: &[f32], n_per_row: usize, imatrix: Option<&[f32]>) -> Vec<u
         );
     }
 
-    let total_blocks = src.len() / QK_K;
-    let mut out = Vec::with_capacity(total_blocks * BLOCK_BYTES);
-
     let nrow = src.len() / n_per_row;
-    match imatrix {
-        None => {
-            quantize_row_ref(src, &mut out);
+    let row_blocks = n_per_row / QK_K;
+    let row_bytes = row_blocks * BLOCK_BYTES;
+    // ADR-036 Layer A: per-row parallelism.
+    let mut out = vec![0u8; nrow * row_bytes];
+    out.par_chunks_exact_mut(row_bytes).enumerate().for_each(|(row, dst)| {
+        let row_src = &src[row * n_per_row..(row + 1) * n_per_row];
+        let mut tmp = Vec::with_capacity(row_bytes);
+        match imatrix {
+            None => quantize_row_ref(row_src, &mut tmp),
+            Some(im) => quantize_row_impl(row_src, im, &mut tmp),
         }
-        Some(im) => {
-            for row in 0..nrow {
-                let row_src = &src[row * n_per_row..(row + 1) * n_per_row];
-                quantize_row_impl(row_src, im, &mut out);
-            }
-        }
-    }
+        debug_assert_eq!(tmp.len(), row_bytes);
+        dst.copy_from_slice(&tmp);
+    });
 
     out
 }
