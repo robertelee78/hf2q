@@ -131,6 +131,36 @@ pub enum BakeOp {
     /// transform (e.g. `A_log` = reorder rows + NegExp), or a
     /// squeeze followed by a sliced reorder (`conv1d.weight`).
     Sequence(Vec<BakeOp>),
+
+    /// Llama Q/K RoPE-halves permute. Mirrors canonical
+    /// `/opt/llama.cpp/conversion/llama.py:98-104` —
+    /// `LlamaModel.permute(weights, n_head, n_head_kv_or_n_head)`:
+    ///
+    /// ```text
+    /// weights.reshape(n_head, 2, head_dim/2, *inner)
+    ///        .swapaxes(1, 2)
+    ///        .reshape(weights.shape)
+    /// ```
+    ///
+    /// The first axis of the 2-D weight `[n_head * head_dim, inner]`
+    /// is interpreted as `[n_head, 2, head_dim/2]` (HF native layout
+    /// where each head's `head_dim` rows are split into two halves
+    /// representing real/imag pairs for the RoPE rotation). After
+    /// swap+reshape, the layout becomes the llama.cpp convention
+    /// where pairs are interleaved as `[real, imag, real, imag, ...]`
+    /// in the row axis.
+    ///
+    /// Applied to `attn_q.weight` (with `n_head = num_attention_heads`)
+    /// and `attn_k.weight` (with `n_head = num_key_value_heads`). The
+    /// bias counterparts use `inner = 1`. For Llama 3 8B
+    /// non-GQA-overlapping case: `n_head=32`/`8`, `head_dim=128`,
+    /// `inner=4096` (q/k weights) or `inner=1` (q/k biases — absent
+    /// in Llama 3 since `attention_bias=false`).
+    PermuteRopeHalves {
+        n_head: usize,
+        head_dim: usize,
+        inner: usize,
+    },
 }
 
 /// Which half of a [`BakeOp::SplitAxisHalf`] to select.
@@ -181,6 +211,14 @@ impl fmt::Display for BakeOp {
                 "ReorderVHeadsPerRow {{ rows={row_count}, nk={num_k_heads}, nv_per_k={num_v_per_k}, head_dim_in_row={head_dim_in_row} }}"
             ),
             BakeOp::Squeeze => write!(f, "Squeeze"),
+            BakeOp::PermuteRopeHalves {
+                n_head,
+                head_dim,
+                inner,
+            } => write!(
+                f,
+                "PermuteRopeHalves {{ n_head={n_head}, head_dim={head_dim}, inner={inner} }}"
+            ),
             BakeOp::Sequence(ops) => {
                 write!(f, "Sequence([")?;
                 for (i, op) in ops.iter().enumerate() {
@@ -426,6 +464,63 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
             }
             Ok(buf)
         }
+        BakeOp::PermuteRopeHalves {
+            n_head,
+            head_dim,
+            inner,
+        } => {
+            // Llama Q/K RoPE-halves permute.
+            //
+            // Input layout (HF native, row-major, C-contiguous):
+            //   `[n_head, 2, head_dim/2, inner]` viewed as
+            //   `[n_head * head_dim, inner]`.
+            //
+            // The middle axes (size 2 and size head_dim/2) are swapped:
+            //   reshape: `[n_head, head_dim/2, 2, inner]`
+            //   flatten: `[n_head * head_dim, inner]`
+            //
+            // Row-mapping in the flat 2-D form (with col-fast inner):
+            //   For output row r' = h*head_dim + r_out where
+            //     r_out = row * 2 + half  (row ∈ [0, head_dim/2), half ∈ [0, 2))
+            //   The source row is r = h*head_dim + half*(head_dim/2) + row.
+            let nh = *n_head;
+            let hd = *head_dim;
+            let inr = *inner;
+            if hd % 2 != 0 {
+                return Err(BakeError {
+                    op: op.clone(),
+                    buffer_len: data.len(),
+                    reason: format!("head_dim {hd} not even (RoPE halves require divisibility)"),
+                });
+            }
+            let expected_elems = nh * hd * inr;
+            if data.len() != expected_elems {
+                return Err(BakeError {
+                    op: op.clone(),
+                    buffer_len: data.len(),
+                    reason: format!(
+                        "buffer len {} != n_head*head_dim*inner = {nh}*{hd}*{inr} = {expected_elems}",
+                        data.len()
+                    ),
+                });
+            }
+            let half_hd = hd / 2;
+            let mut out = vec![0.0f32; expected_elems];
+            for h in 0..nh {
+                let head_base_in = h * hd * inr;
+                let head_base_out = h * hd * inr;
+                for r_out in 0..hd {
+                    let half = r_out % 2;
+                    let row = r_out / 2;
+                    let src_row = half * half_hd + row;
+                    let src_offset = head_base_in + src_row * inr;
+                    let dst_offset = head_base_out + r_out * inr;
+                    out[dst_offset..dst_offset + inr]
+                        .copy_from_slice(&data[src_offset..src_offset + inr]);
+                }
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -459,6 +554,109 @@ mod tests {
                 -x.exp()
             );
         }
+    }
+
+    /// Cross-validation against canonical Python permute:
+    ///   weights.reshape(n_head, 2, head_dim/2, inner).swapaxes(1, 2).reshape(...)
+    ///
+    /// For n_head=2, head_dim=4, inner=1: input rows 0..8 form
+    ///   [[h0_half0_row0], [h0_half0_row1], [h0_half1_row0], [h0_half1_row1],
+    ///    [h1_half0_row0], [h1_half0_row1], [h1_half1_row0], [h1_half1_row1]]
+    /// Output (after swap so axes are [h, row, half]):
+    ///   [[h0_row0_half0], [h0_row0_half1], [h0_row1_half0], [h0_row1_half1], ...]
+    /// = output picks rows in order src=[0, 2, 1, 3, 4, 6, 5, 7].
+    #[test]
+    fn permute_rope_halves_n2_hd4_inner1() {
+        let inp: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let out = apply_bake_op(
+            inp,
+            &BakeOp::PermuteRopeHalves {
+                n_head: 2,
+                head_dim: 4,
+                inner: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(out, vec![0.0, 2.0, 1.0, 3.0, 4.0, 6.0, 5.0, 7.0]);
+    }
+
+    /// Inner=3 (each row has 3 cols), n_head=1, head_dim=4. Source 12
+    /// elements laid out as 4 rows of 3 cols:
+    ///   [a0, a1, a2,   b0, b1, b2,   c0, c1, c2,   d0, d1, d2]
+    /// Permute reorders rows to src=[0, 2, 1, 3]:
+    ///   [a0, a1, a2,   c0, c1, c2,   b0, b1, b2,   d0, d1, d2]
+    #[test]
+    fn permute_rope_halves_n1_hd4_inner3() {
+        #[rustfmt::skip]
+        let inp: Vec<f32> = vec![
+            10.0, 11.0, 12.0,   // row 0 (half=0, row_in_half=0)
+            20.0, 21.0, 22.0,   // row 1 (half=0, row_in_half=1)
+            30.0, 31.0, 32.0,   // row 2 (half=1, row_in_half=0)
+            40.0, 41.0, 42.0,   // row 3 (half=1, row_in_half=1)
+        ];
+        let out = apply_bake_op(
+            inp,
+            &BakeOp::PermuteRopeHalves {
+                n_head: 1,
+                head_dim: 4,
+                inner: 3,
+            },
+        )
+        .unwrap();
+        #[rustfmt::skip]
+        let expected = vec![
+            10.0, 11.0, 12.0,   // out row 0 = src row 0 (half=0, r=0)
+            30.0, 31.0, 32.0,   // out row 1 = src row 2 (half=1, r=0)
+            20.0, 21.0, 22.0,   // out row 2 = src row 1 (half=0, r=1)
+            40.0, 41.0, 42.0,   // out row 3 = src row 3 (half=1, r=1)
+        ];
+        assert_eq!(out, expected);
+    }
+
+    /// Larger head_dim=8 case. For n_head=1, head_dim=8, inner=1:
+    /// output rows map to source rows = [0, 4, 1, 5, 2, 6, 3, 7]
+    /// (per the row formula `src = half*(head_dim/2) + row`).
+    #[test]
+    fn permute_rope_halves_n1_hd8_inner1() {
+        let inp: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let out = apply_bake_op(
+            inp,
+            &BakeOp::PermuteRopeHalves {
+                n_head: 1,
+                head_dim: 8,
+                inner: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(out, vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]);
+    }
+
+    #[test]
+    fn permute_rope_halves_rejects_odd_head_dim() {
+        let inp = vec![0.0_f32; 6];
+        let result = apply_bake_op(
+            inp,
+            &BakeOp::PermuteRopeHalves {
+                n_head: 1,
+                head_dim: 3,
+                inner: 2,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn permute_rope_halves_rejects_size_mismatch() {
+        let inp = vec![0.0_f32; 7]; // expects n_head*head_dim*inner = 8
+        let result = apply_bake_op(
+            inp,
+            &BakeOp::PermuteRopeHalves {
+                n_head: 1,
+                head_dim: 4,
+                inner: 2,
+            },
+        );
+        assert!(result.is_err());
     }
 
     #[test]

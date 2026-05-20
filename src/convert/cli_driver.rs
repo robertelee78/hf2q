@@ -984,16 +984,103 @@ pub struct SplitOutput {
     pub bake: BakeOp,
 }
 
+/// Per-arch context for Llama 3 Q/K RoPE-halves permute.
+/// Built once at convert start from `config.json`; threaded through
+/// `map_tensor` so the per-tensor mapper can attach a BakeOp without
+/// re-parsing config on every tensor.
+#[derive(Debug, Clone)]
+struct Llama3Ctx {
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    inner: usize,
+}
+
+/// Build Llama 3 RoPE permute context from `config.json`. Returns
+/// `None` if any required key is absent or if `hidden_size` isn't
+/// divisible by `num_attention_heads` (would indicate a malformed
+/// config; callers should surface that as `UnmappedTensor`).
+///
+/// Mirrors canonical `/opt/llama.cpp/conversion/llama.py:131-141` —
+/// `n_head = find_hparam(["n_heads","num_attention_heads"])`;
+/// `n_kv_head = find_hparam(["n_kv_heads","num_key_value_heads"])`.
+fn build_llama3_ctx(config: &serde_json::Value) -> Option<Llama3Ctx> {
+    let text = effective_config(config);
+    let hidden_size = text.get("hidden_size")?.as_u64()? as usize;
+    let n_head = text
+        .get("num_attention_heads")
+        .or_else(|| text.get("n_heads"))?
+        .as_u64()? as usize;
+    let n_kv_head = text
+        .get("num_key_value_heads")
+        .or_else(|| text.get("n_kv_heads"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(n_head);
+    if n_head == 0 || hidden_size % n_head != 0 {
+        return None;
+    }
+    Some(Llama3Ctx {
+        n_head,
+        n_kv_head,
+        head_dim: hidden_size / n_head,
+        inner: hidden_size,
+    })
+}
+
+/// Attach the RoPE-halves permute bake to Llama 3 Q/K projections.
+/// Mirrors canonical `llama.py:137-141`:
+///   `if name.endswith("q_proj.weight"|"q_proj.bias"): permute(.., n_head, n_head)`
+///   `if name.endswith("k_proj.weight"|"k_proj.bias"): permute(.., n_head, n_kv_head)`
+/// (Note: `permute` overrides `n_head` to `n_kv_head` for K — see
+/// `LlamaModel.permute:99-100`.)
+fn llama3_attach_bake(
+    gguf_name: &str,
+    hf_name: &str,
+    ctx: &Llama3Ctx,
+) -> Option<crate::convert::arch::bake::BakeOp> {
+    use crate::convert::arch::bake::BakeOp;
+    let is_weight = hf_name.ends_with(".weight");
+    let is_bias = hf_name.ends_with(".bias");
+    let inner = if is_weight {
+        ctx.inner
+    } else if is_bias {
+        1
+    } else {
+        return None;
+    };
+    // gguf_name strips the layer prefix; match on suffix.
+    if gguf_name.ends_with("attn_q.weight") || gguf_name.ends_with("attn_q.bias") {
+        Some(BakeOp::PermuteRopeHalves {
+            n_head: ctx.n_head,
+            head_dim: ctx.head_dim,
+            inner,
+        })
+    } else if gguf_name.ends_with("attn_k.weight") || gguf_name.ends_with("attn_k.bias") {
+        Some(BakeOp::PermuteRopeHalves {
+            n_head: ctx.n_kv_head,
+            head_dim: ctx.head_dim,
+            inner,
+        })
+    } else {
+        None
+    }
+}
+
 fn map_tensor(
     arch: ArchName,
     hf_name: &str,
     hf_shape: &[usize],
     qwen35moe_full_ctx: Option<&Qwen35MoeFullCtx>,
+    llama3_ctx: Option<&Llama3Ctx>,
 ) -> MapOutcome {
     let _ = hf_shape;
     match arch {
         ArchName::Llama3 => match llama3::map_tensor_name(hf_name) {
-            Some(s) => MapOutcome::Direct(s),
+            Some(gguf_name) => match llama3_ctx.and_then(|c| llama3_attach_bake(&gguf_name, hf_name, c)) {
+                Some(bake) => MapOutcome::DirectWithBake { gguf_name, bake },
+                None => MapOutcome::Direct(gguf_name),
+            },
             None => MapOutcome::Unmapped,
         },
         ArchName::Gemma4 => lift_gemma4_mapped(gemma4::map_tensor_name(hf_name)),
@@ -1413,12 +1500,16 @@ fn build_convert_plan(
         ArchName::Qwen35MoeFull => build_qwen35moe_full_ctx(&src.config),
         _ => None,
     };
+    let llama3_ctx: Option<Llama3Ctx> = match arch {
+        ArchName::Llama3 => build_llama3_ctx(&src.config),
+        _ => None,
+    };
 
     let mut direct_steps: Vec<PlanStep> = Vec::new();
     let mut moe_accum: HashMap<(usize, ExpertKindKey), MoePlanGroup> = HashMap::new();
 
     for meta in src.tensor_metas() {
-        match map_tensor(arch, &meta.name, &meta.shape, qwen35moe_full_ctx.as_ref()) {
+        match map_tensor(arch, &meta.name, &meta.shape, qwen35moe_full_ctx.as_ref(), llama3_ctx.as_ref()) {
             MapOutcome::Direct(gguf_name) => {
                 let gguf_shape: Vec<usize> = meta.shape.iter().rev().copied().collect();
                 let layer_index = gguf_name
@@ -1618,7 +1709,7 @@ fn build_convert_plan(
     // GGUF layout matches byte-for-byte.
     let mut synth_steps: Vec<PlanStep> = Vec::new();
     for (synth_idx, t) in synthesized.iter().enumerate() {
-        match map_tensor(arch, &t.name, &t.shape, qwen35moe_full_ctx.as_ref()) {
+        match map_tensor(arch, &t.name, &t.shape, qwen35moe_full_ctx.as_ref(), llama3_ctx.as_ref()) {
             MapOutcome::Direct(gguf_name) => {
                 let gguf_shape: Vec<usize> = t.shape.iter().rev().copied().collect();
                 let layer_index = gguf_name
