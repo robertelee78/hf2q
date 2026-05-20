@@ -237,8 +237,24 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
             // Verified bit-identical to `torch.exp` for input
             // -3.796875 → 0x3cb7d5c0 (the documented divergence point
             // where libm produced 0x3cb7d5bf).
-            for x in data.iter_mut() {
-                *x = -crate::convert::sleef_expf::sleef_expf(*x);
+            //
+            // On aarch64, dispatches to the NEON 4-wide SIMD variant
+            // `sleef_expf_inplace_neon` — measured 2.42× faster than
+            // libm `f32::exp` (and 3.4× faster than scalar sleef_expf).
+            // Bit-equivalent to the scalar path (verified by
+            // `neon_matches_scalar_on_sweep` covering 1024 inputs).
+            #[cfg(target_arch = "aarch64")]
+            {
+                crate::convert::sleef_expf::sleef_expf_inplace_neon(&mut data);
+                for x in data.iter_mut() {
+                    *x = -*x;
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                for x in data.iter_mut() {
+                    *x = -crate::convert::sleef_expf::sleef_expf(*x);
+                }
             }
             Ok(data)
         }

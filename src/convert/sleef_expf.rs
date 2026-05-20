@@ -112,6 +112,102 @@ pub fn sleef_expf(d: f32) -> f32 {
     }
 }
 
+/// NEON 4-wide explicit-SIMD variant of [`sleef_expf`]. Processes
+/// 4 f32 inputs in parallel via `std::arch::aarch64`. The scalar
+/// fallback for the `< 4` tail uses the same `sleef_expf` so the
+/// per-element bit-equivalence to torch is preserved.
+///
+/// Per [[feedback-we-port-never-ffi-2026-05-20]] this is a PURE-RUST
+/// port — `std::arch::aarch64::*` are Rust intrinsics around the
+/// ARM AAPCS NEON ABI, NOT FFI to a C library. The polynomial
+/// coefficients are the same `POLY0..POLY5` constants used by the
+/// scalar path (verbatim from SLEEF's `sleefsimdsp.c:1321-1326`).
+///
+/// FMA semantics: Rust's `vfmaq_f32(a, b, c)` returns `a + b*c`
+/// (per `core::arch::aarch64` docs). SLEEF's `vmla_vf_vf_vf_vf`
+/// returns `a*b + c`. So when porting `vmla(a, b, c)` we call
+/// `vfmaq_f32(c, a, b)`.
+///
+/// Bit-equivalence to scalar `sleef_expf` is the contract: every
+/// 4-wide lane must produce the same bits as scalar evaluation on
+/// the same input. Verified by `neon_matches_scalar_on_sweep` test.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn sleef_expf_inplace_neon(data: &mut [f32]) {
+    use std::arch::aarch64::*;
+
+    let n = data.len();
+    let n4 = n - (n % 4);
+    let mut i = 0;
+    // SAFETY: pointer arithmetic stays within `data.as_mut_ptr()..+n4`,
+    // all vld1q_f32 / vst1q_f32 read/write exactly 4 lanes. Intrinsics
+    // are safe wrt aliasing because we only have one `&mut [f32]`.
+    unsafe {
+        while i < n4 {
+            let v_d = vld1q_f32(data.as_ptr().add(i));
+
+            // q_i = round_ties_even(d * R_LN2F)
+            let v_q_f = vmulq_f32(v_d, vdupq_n_f32(R_LN2F));
+            let v_q_i = vcvtnq_s32_f32(v_q_f);
+            let v_qf = vcvtq_f32_s32(v_q_i);
+
+            // Cody-Waite reduction: s = d - q*L2Uf - q*L2Lf.
+            // SLEEF `vmla(q, -L2Uf, d)` = q*(-L2Uf) + d.
+            // Rust `vfmaq_f32(d, q, neg_l2u)` = d + q*neg_l2u. Same.
+            let v_neg_l2u = vdupq_n_f32(-L2UF);
+            let v_s = vfmaq_f32(v_d, v_qf, v_neg_l2u);
+            let v_neg_l2l = vdupq_n_f32(-L2LF);
+            let v_s = vfmaq_f32(v_s, v_qf, v_neg_l2l);
+
+            // Horner-form polynomial. SLEEF: `u = vmla(u, s, NEXT)` =
+            // u*s + NEXT. Rust: `vfmaq_f32(NEXT, u, s)` = NEXT + u*s.
+            let v_u = vdupq_n_f32(POLY0);
+            let v_u = vfmaq_f32(vdupq_n_f32(POLY1), v_u, v_s);
+            let v_u = vfmaq_f32(vdupq_n_f32(POLY2), v_u, v_s);
+            let v_u = vfmaq_f32(vdupq_n_f32(POLY3), v_u, v_s);
+            let v_u = vfmaq_f32(vdupq_n_f32(POLY4), v_u, v_s);
+            let v_u = vfmaq_f32(vdupq_n_f32(POLY5), v_u, v_s);
+
+            // u = 1.0 + (s*s) * u + s — order: outer +1.0 LAST.
+            // SLEEF: `1.0 + vmla(s*s, u, s)` = 1.0 + (s*s)*u + s.
+            // Rust: 1.0 + vfmaq_f32(s, s_sq, u) = 1.0 + (s + s_sq*u). Same algebraically AND same FMA order.
+            let v_s_sq = vmulq_f32(v_s, v_s);
+            let v_inner = vfmaq_f32(v_s, v_s_sq, v_u);
+            let v_u = vaddq_f32(vdupq_n_f32(1.0), v_inner);
+
+            // vldexp2 two-step split: 2^q = 2^q1 * 2^q2 where q1 = q>>1.
+            let v_q1 = vshrq_n_s32(v_q_i, 1);
+            let v_q2 = vsubq_s32(v_q_i, v_q1);
+            let v_127 = vdupq_n_s32(127);
+            let v_e1 = vshlq_n_s32(vaddq_s32(v_q1, v_127), 23);
+            let v_e2 = vshlq_n_s32(vaddq_s32(v_q2, v_127), 23);
+            let v_two_q1 = vreinterpretq_f32_s32(v_e1);
+            let v_two_q2 = vreinterpretq_f32_s32(v_e2);
+            let v_y = vmulq_f32(vmulq_f32(v_u, v_two_q1), v_two_q2);
+
+            // Edge masks: d < -104 → 0; d > 100 → +inf.
+            let v_neg104 = vdupq_n_f32(EXPF_UNDERFLOW);
+            let v_p100 = vdupq_n_f32(EXPF_OVERFLOW);
+            let v_zero = vdupq_n_f32(0.0);
+            let v_inf = vreinterpretq_f32_u32(vdupq_n_u32(0x7f800000));
+            let m_under = vcltq_f32(v_d, v_neg104);
+            let m_over = vcltq_f32(v_p100, v_d);
+            // vbslq_f32(mask, a, b): mask?a:b per lane.
+            let v_y = vbslq_f32(m_under, v_zero, v_y);
+            let v_y = vbslq_f32(m_over, v_inf, v_y);
+
+            vst1q_f32(data.as_mut_ptr().add(i), v_y);
+            i += 4;
+        }
+    }
+    // Scalar tail (length < 4). Each element re-uses `sleef_expf` so
+    // the bit-equivalence contract holds.
+    while i < n {
+        data[i] = sleef_expf(data[i]);
+        i += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +323,165 @@ mod tests {
             0x7f800000,
             "sleef_expf(100): expected +inf (natural IEEE overflow), got 0x{:08x}",
             r.to_bits()
+        );
+    }
+
+    /// Pinned: the NEON 4-wide variant must produce bit-identical
+    /// results to the scalar variant on the documented divergence
+    /// point. Tests on a 4-wide buffer (the natural NEON unit) plus
+    /// a 7-wide buffer (exercises the 4 SIMD + 3 scalar tail path).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_matches_scalar_on_known_divergence_point() {
+        let mut data4 = vec![-3.796875_f32; 4];
+        sleef_expf_inplace_neon(&mut data4);
+        for (i, &x) in data4.iter().enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                0x3cb7d5c0,
+                "NEON lane {} mismatch: expected 0x3cb7d5c0 (torch), got 0x{:08x}",
+                i,
+                x.to_bits()
+            );
+        }
+
+        // 7 elements: 4-wide SIMD + 3-element scalar tail.
+        let mut data7: Vec<f32> = vec![
+            -3.796875, 0.0, 1.0, -1.0, // first 4 → SIMD path
+            -100.0, 90.0, -3.796875,    // last 3 → scalar tail
+        ];
+        sleef_expf_inplace_neon(&mut data7);
+        let expected = [
+            0x3cb7d5c0_u32, // -3.796875 → torch
+            0x3f800000,     // exp(0) = 1
+            0x402df854,     // exp(1) ≈ e
+            0x3ebc5ab2,     // exp(-1) ≈ 1/e
+            0x0000001b,     // exp(-100) subnormal
+            0x7f800000,     // exp(90) → +inf
+            0x3cb7d5c0,     // -3.796875 again (in tail)
+        ];
+        for (i, (&x, &e)) in data7.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                e,
+                "lane {} (mixed SIMD/tail) mismatch: expected 0x{:08x}, got 0x{:08x}",
+                i,
+                e,
+                x.to_bits()
+            );
+        }
+    }
+
+    /// Pinned: every input in the random sweep produces bit-equivalent
+    /// output between scalar and NEON variants. If the NEON FMA order
+    /// or polynomial coefficient ordering drifts, this catches it.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_matches_scalar_on_sweep() {
+        // Same deterministic mulberry32-ish sweep as
+        // `sweep_shows_libm_divergence` but checking NEON ≡ scalar.
+        let mut x: u32 = 0xCAFEBABE;
+        const N: usize = 1024;
+        let mut input: Vec<f32> = Vec::with_capacity(N);
+        for _ in 0..N {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            input.push((x as f32 / u32::MAX as f32) * 15.0 - 10.0);
+        }
+        let mut scalar_out = vec![0.0_f32; N];
+        for (i, &v) in input.iter().enumerate() {
+            scalar_out[i] = sleef_expf(v);
+        }
+        let mut neon_out = input.clone();
+        sleef_expf_inplace_neon(&mut neon_out);
+        let mut differ = 0;
+        for (i, (&s, &nu)) in scalar_out.iter().zip(neon_out.iter()).enumerate() {
+            if s.to_bits() != nu.to_bits() {
+                if differ < 5 {
+                    eprintln!(
+                        "  divergence at idx {}: input={}, scalar=0x{:08x}, neon=0x{:08x}",
+                        i, input[i], s.to_bits(), nu.to_bits()
+                    );
+                }
+                differ += 1;
+            }
+        }
+        assert_eq!(
+            differ, 0,
+            "NEON sleef_expf must bit-match scalar on every input; {differ}/{N} differed"
+        );
+    }
+
+    /// Microbench: time NEON `sleef_expf_inplace_neon` vs scalar
+    /// `sleef_expf` loop vs libm `f32::exp` on 1M f32. Establishes
+    /// the speedup from the 4-wide SIMD port — expected to close
+    /// the ~20% libm cost gap measured at scalar.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn sleef_expf_neon_microbench() {
+        const N: usize = 1_000_000;
+        let mut data: Vec<f32> = Vec::with_capacity(N);
+        let mut x: u32 = 0xCAFEBABE;
+        for _ in 0..N {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            data.push((x as f32 / u32::MAX as f32) * 15.0 - 10.0);
+        }
+        const ITERS: usize = 5;
+
+        // libm baseline.
+        let mut libm_buf = vec![0f32; N];
+        let mut libm_ns = Vec::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let t0 = std::time::Instant::now();
+            for i in 0..N {
+                libm_buf[i] = data[i].exp();
+            }
+            libm_ns.push(t0.elapsed().as_nanos() as u64);
+            std::hint::black_box(&libm_buf);
+        }
+        libm_ns.sort();
+
+        // Scalar sleef.
+        let mut scalar_buf = vec![0f32; N];
+        let mut scalar_ns = Vec::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let t0 = std::time::Instant::now();
+            for i in 0..N {
+                scalar_buf[i] = sleef_expf(data[i]);
+            }
+            scalar_ns.push(t0.elapsed().as_nanos() as u64);
+            std::hint::black_box(&scalar_buf);
+        }
+        scalar_ns.sort();
+
+        // NEON sleef.
+        let mut neon_ns = Vec::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let mut neon_buf = data.clone();
+            let t0 = std::time::Instant::now();
+            sleef_expf_inplace_neon(&mut neon_buf);
+            neon_ns.push(t0.elapsed().as_nanos() as u64);
+            std::hint::black_box(&neon_buf);
+        }
+        neon_ns.sort();
+
+        let libm_med = libm_ns[ITERS / 2] as f64;
+        let scalar_med = scalar_ns[ITERS / 2] as f64;
+        let neon_med = neon_ns[ITERS / 2] as f64;
+
+        eprintln!(
+            "\nsleef NEON microbench (N = {} f32, {} iters):\n  \
+             libm  f32::exp:           {:.3} ms   {:.1} M elem/s    [1.00× ref]\n  \
+             scalar sleef_expf:        {:.3} ms   {:.1} M elem/s    [{:.2}× vs libm]\n  \
+             NEON sleef_expf_inplace:  {:.3} ms   {:.1} M elem/s    [{:.2}× vs libm]",
+            N, ITERS,
+            libm_med / 1e6, N as f64 / (libm_med / 1e9) / 1e6,
+            scalar_med / 1e6, N as f64 / (scalar_med / 1e9) / 1e6, scalar_med / libm_med,
+            neon_med / 1e6, N as f64 / (neon_med / 1e9) / 1e6, neon_med / libm_med,
         );
     }
 
