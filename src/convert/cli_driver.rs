@@ -852,6 +852,7 @@ fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertError> {
         n_head,
         n_head_kv,
         n_layer,
+        n_mtp_layers: n_mtp as u32,
     })
 }
 

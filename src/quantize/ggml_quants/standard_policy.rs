@@ -212,6 +212,17 @@ pub struct HParams {
     /// `<L>.ffn_down_exps.weight` classify as `FfnDown` — counting tensors
     /// double-counts the denominator.
     pub n_layer: u32,
+    /// Number of MTP (Multi-Token Prediction) layers appended at the end
+    /// of the block sequence. Zero for non-MTP archs. For Qwen 3.5/3.6 MoE
+    /// this is `mtp_num_hidden_layers` from HF config (typically 1). The
+    /// MTP layers occupy indices `[n_layer - n_mtp_layers, n_layer - 1]`.
+    /// Used to identify which layer indices are MTP for canonical's
+    /// per-MTP-layer storage-type rules (e.g. `ffn_gate_inp` is F16 on
+    /// MTP layers vs F32 on regular layers — canonical's
+    /// `match_model_tensor_name(name, FFN_GATE_INP, bid)` returns False
+    /// for `bid >= n_text_layers`, causing the F32-keep override to
+    /// not apply and the tensor to default to F16 storage).
+    pub n_mtp_layers: u32,
 }
 
 impl HParams {
@@ -787,6 +798,7 @@ mod tests {
             n_head: 32,
             n_head_kv: 8,
             n_layer: 32,
+            n_mtp_layers: 0,
         };
         QsState::new(ftype, arch, LlmType::Other, hparams)
     }

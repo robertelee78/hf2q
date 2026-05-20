@@ -290,6 +290,7 @@ mod tests {
                 n_head,
                 n_head_kv,
                 n_layer: 2,
+                n_mtp_layers: 0,
             },
         );
 

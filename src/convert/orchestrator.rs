@@ -357,14 +357,31 @@ impl ConvertOrchestrator {
             let expected_numel: usize = e.shape.iter().product();
             let n_per_row = e.shape[0];
 
+            // MTP-layer override: canonical `convert_hf_to_gguf.py:base.py:821-851`
+            // applies F32-keep for ffn_gate_inp/ffn_gate_inp_shexp via
+            // `match_model_tensor_name(name, FFN_GATE_INP, bid)` which returns
+            // False when `bid >= n_text_layers` (MTP layer is not in the arch's
+            // per-layer FFN_GATE_INP tensor map). The F32 override therefore
+            // doesn't apply on MTP layers, and the tensor falls through to F16
+            // default storage (base.py:875). Mirror this here.
+            let is_mtp_layer = self.hparams.n_mtp_layers > 0
+                && e.layer_index
+                    .map(|li| li >= (self.hparams.n_layer - self.hparams.n_mtp_layers) as usize)
+                    .unwrap_or(false);
+            let mtp_ffn_gate_inp_demote = is_mtp_layer
+                && (e.name.contains("ffn_gate_inp.weight")
+                    || e.name.contains("ffn_gate_inp_shexp.weight"));
+
             let ggml_type = if is_vision_tensor_pattern(&e.name)
                 || is_audio_tensor_pattern(&e.name)
+                || mtp_ffn_gate_inp_demote
             {
                 // Vision / audio modality gate — emit F16 directly.
                 // Per ADR-033 Decision §"Vision / audio tensor patterns",
                 // this is the ONLY place outside the policy where a
                 // ggml_type is chosen, and the ONLY place where F16
-                // demotion is permitted.
+                // demotion is permitted. Also covers MTP-layer
+                // ffn_gate_inp demotion (canonical base.py:875).
                 GgmlType::F16
             } else if is_f32_keep_tensor(&e.name, e.shape.len()) {
                 // F32-keep gate — emit the F32 row-major payload as-is.
@@ -741,6 +758,7 @@ mod tests {
             n_head: 32,
             n_head_kv: 8,
             n_layer: 32,
+            n_mtp_layers: 0,
         }
     }
 
@@ -1128,6 +1146,7 @@ mod tests {
             n_head: 8,
             n_head_kv: 1,
             n_layer: N_LAYER,
+            n_mtp_layers: 0,
         };
         let mut orch = ConvertOrchestrator::new(
             LlamaFtype::MostlyQ5_K_M,
@@ -1223,6 +1242,7 @@ mod tests {
             n_head: 8,
             n_head_kv: 1,
             n_layer: N_LAYER,
+            n_mtp_layers: 0,
         };
         let mut orch = ConvertOrchestrator::new(
             LlamaFtype::MostlyQ5_K_M,
