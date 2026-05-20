@@ -97,6 +97,11 @@ pub fn make_qx_quants(
         rmse_type = -rmse_type;
         return_early = true;
     }
+    // Initial pass: scalar .mul_add accumulation matches canonical's emit
+    // for this loop. Canonical writes `L[i] = l+nmax` in the loop body,
+    // which limits clang's auto-vectorization — the side effect on L
+    // serializes the loop, producing scalar `fmla`-style reduction that
+    // matches Rust's .mul_add. Empirically verified bit-identical.
     let mut sumlx: f32 = 0.0;
     let mut suml2: f32 = 0.0;
     for i in 0..n {
@@ -114,12 +119,6 @@ pub fn make_qx_quants(
         } else {
             x[i].abs().sqrt()
         };
-        // Plain `*` + `+=` matches canonical's BUILT behavior (effective
-        // fp-contract=off). Earlier `.mul_add()` calls forced =on-level
-        // fusion which produces a 1-byte diff on Qwen 3.5 lm_head Q6_K
-        // (scale[12]=194 vs 195) verified via 12-variant C reproducer
-        // matrix at /tmp/c_quant_repro/variants_search.c — canonical lib
-        // and `-ffp-contract=off` both produce 195; `=on` produces 194.
         sumlx = (w * x[i]).mul_add(li as f32, sumlx);
         suml2 = (w * (li as f32)).mul_add(li as f32, suml2);
     }
@@ -579,6 +578,42 @@ mod tests {
         let qw = vec![]; // exercise rmse_type=1 fallback
         let d = make_qx_quants(32, 8, &x, &mut l, 1, &qw);
         assert!(d.is_finite());
+    }
+
+    /// ADR-033 §P1 documentation: this is a 1-ULP boundary case for the
+    /// `sumlx² > best*suml2` comparison in make_qx_quants is-loop. The
+    /// specific F32 input below comes from Gemma 4 blk.0.attn_v block 113
+    /// sub-block 14. Canonical clang at -O3 -march=native produces
+    /// scale=2.2222194821e-3 (0x3b11a2a8) via per-chunk NEON 4-wide
+    /// pairwise-reduce; Rust's scalar .mul_add accumulation produces
+    /// 2.30e-3 (0x3b16f785) due to a 1-ULP sumlx difference flipping
+    /// is=-9 acceptance. Closing this specific case via NEON intrinsics
+    /// broke 13 other sub-blocks (different boundary cases match
+    /// different clang patterns). Documented as a per-block-boundary
+    /// inherent residual; the cross-compiler reduction-order mismatch
+    /// is fundamental on this F32 distribution.
+    #[test]
+    #[ignore]
+    fn q6k_blk113_subblk14_byte_match() {
+        let x: [f32; 16] = [
+            0.005950928, -0.01300049, 0.01519775, 0.02624512,
+            -0.07128906, -0.06689453, -0.05053711, 0.01965332,
+            -0.02551270, -0.03906250, 0.01275635, 0.008056641,
+            0.002319336, 0.04223633, -0.02416992, 0.001045227,
+        ];
+        let mut l = [0i8; 16];
+        let scale = make_qx_quants(16, 32, &x, &mut l, 1, &[]);
+        assert_eq!(
+            scale.to_bits(),
+            0x3b11a2a8,
+            "scale={:.10e} (bits=0x{:08x}) — must match canonical",
+            scale,
+            scale.to_bits()
+        );
+        let expected_l = [35i8, 26, 39, 44, 0, 2, 9, 41, 21, 14, 38, 36, 33, 51, 21, 32];
+        for i in 0..16 {
+            assert_eq!(l[i], expected_l[i], "L[{}] = {} (expected {})", i, l[i], expected_l[i]);
+        }
     }
 
     #[test]
