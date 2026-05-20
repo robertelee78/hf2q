@@ -350,6 +350,77 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// 2026-05-20 — Instrumented trace of hf2q's make_qkx2 on Gemma block 3083 sub-block 6.
+    /// Reveals which iteration is accepted and the cur_error values at the boundary.
+    #[test]
+    #[ignore]
+    fn gemma_blk3083_sub6_hf2q_trace() {
+        let f32_bytes = std::fs::read("/tmp/c_quant_repro/gemma_blk3083_sub6_f32.bin").unwrap();
+        let w_bytes = std::fs::read("/tmp/c_quant_repro/gemma_blk3083_sub6_weights.bin").unwrap();
+        let x: Vec<f32> = f32_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let w: Vec<f32> = w_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let mut l = [0u8; 32];
+        let mut l_aux = [0u8; 32];
+        let mut the_min = 0.0f32;
+        let scale = make_qkx2_quants_instrumented(32, 15, &x, &w, &mut l, &mut the_min, &mut l_aux, -1.0, 0.1, 20, false);
+        println!("FINAL hf2q scale={:.10} the_min={:.10}", scale, the_min);
+    }
+
+    /// 2026-05-20 — Run hf2q's make_qkx2_quants on each of 8 sub-blocks of Gemma
+    /// block 3083 (row 280 of blk.0.attn_k). Compare scale F32 bits to canonical's
+    /// standalone output (from /tmp/c_quant_repro/canon_qkx2_sub*).
+    #[test]
+    #[ignore]
+    fn gemma_blk3083_subblocks_scale_compare() {
+        use super::super::common::make_qkx2_quants;
+        // Canonical-recovered scales (from canon_qkx2_sub*.c standalone runs)
+        let canon_scales: [f32; 8] = [
+            0.0069445884,  // sub 0
+            0.0069021727,  // sub 1
+            0.0085167065,  // sub 2
+            0.0089343758,  // sub 3
+            0.0099748811,  // sub 4
+            0.0061270911,  // sub 5
+            0.0100716567,  // sub 6 — MAX
+            0.0056068259,  // sub 7
+        ];
+        let mut hf2q_scales = [0.0f32; 8];
+        for j in 0..8 {
+            let f32_path = format!("/tmp/c_quant_repro/gemma_blk3083_sub{}_f32.bin", j);
+            let w_path = format!("/tmp/c_quant_repro/gemma_blk3083_sub{}_weights.bin", j);
+            let f32_bytes = std::fs::read(&f32_path).unwrap();
+            let w_bytes = std::fs::read(&w_path).unwrap();
+            let x: Vec<f32> = f32_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let w: Vec<f32> = w_bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let mut l = [0u8; 32];
+            let mut l_aux = [0u8; 32];
+            let mut the_min = 0.0f32;
+            let scale = make_qkx2_quants(32, 15, &x, &w, &mut l, &mut the_min, &mut l_aux, -1.0, 0.1, 20, false);
+            hf2q_scales[j] = scale;
+        }
+        let mut max_scale_canon = 0.0f32;
+        let mut max_scale_hf2q = 0.0f32;
+        println!("Sub | canon scale (F32, bits) | hf2q scale (F32, bits)         | Δ");
+        for j in 0..8 {
+            let c = canon_scales[j];
+            let h = hf2q_scales[j];
+            if c > max_scale_canon { max_scale_canon = c; }
+            if h > max_scale_hf2q { max_scale_hf2q = h; }
+            let delta = h - c;
+            let marker = if delta.abs() > 1e-8 { " ← DIVERGES" } else { "" };
+            println!("{:3} | {:.10} 0x{:08x}     | {:.10} 0x{:08x} | {:+.3e}{}",
+                j, c, c.to_bits(), h, h.to_bits(), delta, marker);
+        }
+        let d_canon = max_scale_canon / 63.0;
+        let d_hf2q = max_scale_hf2q / 63.0;
+        let d_canon_f16 = half::f16::from_f32(d_canon);
+        let d_hf2q_f16 = half::f16::from_f32(d_hf2q);
+        println!("\nmax_scale canon = {:.10} (bits 0x{:08x})", max_scale_canon, max_scale_canon.to_bits());
+        println!("max_scale hf2q  = {:.10} (bits 0x{:08x})", max_scale_hf2q, max_scale_hf2q.to_bits());
+        println!("d (F16) canon = 0x{:04x} = {:?}", d_canon_f16.to_bits(), d_canon_f16.to_le_bytes());
+        println!("d (F16) hf2q  = 0x{:04x} = {:?}", d_hf2q_f16.to_bits(), d_hf2q_f16.to_le_bytes());
+    }
+
     /// 2026-05-20 — Instrumented copy of make_qkx2_quants that prints which iteration
     /// is accepted as "best" and the running best_error. For diagnosing the 3.4%
     /// structural mins[1] divergence between hf2q and canonical on ssm_out row 100
