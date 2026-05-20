@@ -58,10 +58,11 @@ fn quantize_block_iq4_nl(
     let block_size = QK4_NL;
 
     // sigma2 = (2/super_block_size) * sum(x^2)  — :4801-4803
-    // FMA: clang fuses `sigma2 + v*v` into fmadd at -O3 -march=native.
+    // 2026-05-20: plain `+= v * v` matches canonical built behavior
+    // (effective fp-contract=off per make_qx_quants finding b921616e).
     let mut sigma2 = 0.0f32;
     for &v in x.iter() {
-        sigma2 = v.mul_add(v, sigma2);
+        sigma2 += v * v;
     }
     sigma2 *= 2.0 / (super_block_size as f32);
 
@@ -119,9 +120,11 @@ fn quantize_block_iq4_nl(
             l_buf[j] = l as u8;
             let q = values[l] as f32;
             let w = weight[j];
-            // FMA: clang fuses `w*q*x + sum` as fmul(w,q)+fmadd; mirror.
-            sumqx = (w * q).mul_add(xb[j], sumqx);
-            sumq2 = (w * q).mul_add(q, sumq2);
+            // 2026-05-20: plain *+ matches canonical built behavior (canonical's
+            // chained `w*q*xb[j]` doesn't auto-FMA at effective fp-contract=off level,
+            // same finding as make_qx_quants at b921616e).
+            sumqx += w * q * xb[j];
+            sumq2 += w * q * q;
         }
         d = if sumq2 > 0.0 { sumqx / sumq2 } else { 0.0 };
         let mut best = d * sumqx;
@@ -141,8 +144,8 @@ fn quantize_block_iq4_nl(
                     let l = best_index_int8(values, al);
                     let q = values[l] as f32;
                     let w = weight[j];
-                    sumqx_t = (w * q).mul_add(xb[j], sumqx_t);
-                    sumq2_t = (w * q).mul_add(q, sumq2_t);
+                    sumqx_t += w * q * xb[j];
+                    sumq2_t += w * q * q;
                 }
                 if sumq2_t > 0.0 && sumqx_t * sumqx_t > best * sumq2_t {
                     d = sumqx_t / sumq2_t;
