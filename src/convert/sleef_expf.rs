@@ -230,6 +230,87 @@ mod tests {
         );
     }
 
+    /// Microbench: time `sleef_expf` vs Rust's `f32::exp` (libm) on a
+    /// 1M-element f32 buffer representative of a real ssm_a bake input.
+    /// `#[ignore]`'d — run with:
+    ///
+    ///     cargo test --release --bin hf2q sleef_expf_microbench -- --ignored --nocapture
+    ///
+    /// Establishes that the pure-Rust SLEEF port doesn't impose a
+    /// catastrophic perf cost vs libm — important since `BakeOp::NegExp`
+    /// runs on every `ssm_a` tensor at convert time. Per ADR-036 the
+    /// outer convert is rayon-parallel so this measurement is single-
+    /// threaded kernel throughput.
+    #[test]
+    #[ignore]
+    fn sleef_expf_microbench() {
+        // Deterministic seed; matches the `sweep_shows_libm_divergence`
+        // distribution so we measure on the same input domain as the
+        // correctness sweep.
+        const N: usize = 1_000_000;
+        let mut data: Vec<f32> = Vec::with_capacity(N);
+        let mut x: u32 = 0xCAFEBABE;
+        for _ in 0..N {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            data.push((x as f32 / u32::MAX as f32) * 15.0 - 10.0);
+        }
+
+        const ITERS: usize = 5;
+
+        // libm baseline.
+        let mut libm_buf = vec![0f32; N];
+        let mut libm_ns = Vec::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let t0 = std::time::Instant::now();
+            for i in 0..N {
+                libm_buf[i] = data[i].exp();
+            }
+            libm_ns.push(t0.elapsed().as_nanos() as u64);
+            // Black-box: prevent the loop from being optimized away.
+            std::hint::black_box(&libm_buf);
+        }
+        libm_ns.sort();
+        let libm_median = libm_ns[ITERS / 2];
+
+        // sleef_expf (the production path used by BakeOp::NegExp).
+        let mut sleef_buf = vec![0f32; N];
+        let mut sleef_ns = Vec::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let t0 = std::time::Instant::now();
+            for i in 0..N {
+                sleef_buf[i] = sleef_expf(data[i]);
+            }
+            sleef_ns.push(t0.elapsed().as_nanos() as u64);
+            std::hint::black_box(&sleef_buf);
+        }
+        sleef_ns.sort();
+        let sleef_median = sleef_ns[ITERS / 2];
+
+        let libm_mhz = (N as f64 / (libm_median as f64 / 1e9)) / 1e6;
+        let sleef_mhz = (N as f64 / (sleef_median as f64 / 1e9)) / 1e6;
+        let ratio = sleef_median as f64 / libm_median as f64;
+
+        eprintln!(
+            "\nsleef_expf vs libm exp microbench (N = {} f32, {} iters):\n  \
+             libm  f32::exp:     {:.3} ms median  ({:.1} M elem/s)\n  \
+             sleef_expf (port):  {:.3} ms median  ({:.1} M elem/s)\n  \
+             cost ratio:         {:.2}× (1.0 = same speed)\n  \
+             libm all iters:    {:?}\n  \
+             sleef all iters:   {:?}",
+            N,
+            ITERS,
+            libm_median as f64 / 1e6,
+            libm_mhz,
+            sleef_median as f64 / 1e6,
+            sleef_mhz,
+            ratio,
+            libm_ns,
+            sleef_ns,
+        );
+    }
+
     /// Sweep test: across 1024 uniform-random-ish f32 inputs in [-10, 5],
     /// sleef_expf should NEVER agree with libm 100% of the time (we know
     /// from empirical measurement ~92% agree, ~8% diverge by 1-ULP).
