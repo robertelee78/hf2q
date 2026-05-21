@@ -183,7 +183,59 @@ overhead doesn't amortize across the 2 tokens efficiently.
 - **Multi-week scope**: implement `forward_gpu_batched_decode` for seq_len ∈
   [2, 8] to unlock K=N speedup on MoE A3B.
 
-### Iteration 2026-05-21 (cont. 2) — Why MTPLX hits 63 tok/s on M5 Max and we hit 22
+### Iteration 2026-05-21 (cont. 3) — Task #89 batched_decode concrete design
+
+Code-reading deep dive at HEAD `4e3b8ed7` to scope the cross-length SDPA
+work (= Option A from `spec_decode_cli.rs:26-32` = task #89 = critical
+foundation for Routes A and B).
+
+**Root cause located**: `gpu_full_attn.rs:1865+` (`apply_flash_attn_prefill_seq_major_resume`)
+allocates BF16 mirror buffers sized for the FULL slot capacity:
+
+```rust
+let k_bf16_slot = device.alloc_buffer(
+    kv_slot_elems * 2,  // n_kv_heads * kv_capacity * head_dim
+    DType::BF16, vec![1, nkv, cap, d]).map_err(...)?;
+```
+
+Then casts F32 → BF16 over the entire `[0..max_seq_len)` even though the
+kernel reads only `[0..kv_seq_len)`. For 35B-A3B with `max_seq=2200` and
+`kv_seq_len=27` (just after prefill), that's 99% wasted cast work — but
+99% of a small buffer. The real cost is the 7+ kernel dispatches per FA
+layer (BF16 casts, permutes, FA resume, output permute, cast back to F32),
+each with ~5-20μs launch overhead. With 4 FA layers on 35B-A3B that's
+~200-300μs absolute. The other ~9-10ms comes from the 36 LA layers each
+allocating their `DnPrefillArena` (~22 buffers each).
+
+**F32 sdpa kernel already supports seq_len > 1**:
+`/opt/mlx-native/src/shaders/sdpa.metal` handles batched Q via `abs_pos =
+kv_seq_len - seq_len + q_pos` with `do_causal` + `kv_capacity` stride. No
+new kernel needed.
+
+**Concrete first-step plan (Step 1)**: add a small-batched-decode F32 fast
+path in `apply_sdpa_with_kv_cache` (gpu_full_attn.rs:2209) BEFORE the BF16
+resume branch:
+
+```
+if head_dim == 256
+   && cur_len > 0
+   && (1..16).contains(&seq_len)
+   && slot.k.is_some()
+   && slot.tq.is_none() {
+    write_kv_with_optional_tq_encode(...)?;
+    let q_hm = permute_seq_head_dim_to_head_seq_dim(q_seq_major, ...);
+    apply_sdpa_causal_with_capacity(...)?;  // F32 sdpa, kv_capacity=max_seq_len
+    return permute_021(out_hm, ...);
+}
+```
+
+Test gates: (a) byte-identical determinism 3/3 runs on 27B K=1 BATCHED;
+(b) coherent output; (c) T_v(2) on 35B-A3B drops ≥ 20% from 17.7ms;
+(d) 27B K=1 BATCHED speedup unchanged or better.
+
+Step 2 (next iter): lift FA prefill arenas off when seq_len < 16. Step 3:
+LA layer batched_decode path. Full task #89 scope ~1500 LOC across all 3
+steps.
 
 Operator asked: "obviously our peers are doing something better than us? or wtf?
 why can they be faster and we can not." Direct answer after reading
