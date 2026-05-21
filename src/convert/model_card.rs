@@ -229,6 +229,403 @@ pub fn split_base_model(raw: &str) -> (Option<String>, Option<String>, Option<St
     (Some(pretty_name), Some(pretty_org), Some(repo_url))
 }
 
+/// Result of parsing a HuggingFace model id (e.g.
+/// `"nomic-ai/nomic-xlm-2048"`) into its canonical name components
+/// per `/opt/llama.cpp/gguf-py/gguf/metadata.py:240-362` —
+/// `Metadata.get_model_id_components`.
+///
+/// All fields are `None` when the input doesn't decompose into the
+/// expected `<org>/<basename>(-<size_label>)?(-<finetune>)?(-<version>)?`
+/// pattern. Canonical returns `(None,) * 6` for these cases; we
+/// mirror by returning a default-constructed struct.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelIdComponents {
+    /// `model_full_name_component` — the part after the `/` (or the
+    /// whole input if no `/`). Title-cased with spaces for the GGUF
+    /// `general.name` field per canonical's observed output.
+    pub name: Option<String>,
+    /// `org_component` — title-cased to match canonical's
+    /// `general.organization` output (e.g. `"nomic-ai"` → `"Nomic Ai"`).
+    pub organization: Option<String>,
+    /// `basename` — the leading alphabetic-starting parts before the
+    /// first version/size/finetune marker. Lowercase, hyphen-joined.
+    pub basename: Option<String>,
+    /// `finetune` — joined finetune-marker parts (e.g. `"chat"`,
+    /// `"instruct"`). Lowercase, hyphen-joined.
+    pub finetune: Option<String>,
+    /// `version` — joined version-marker parts (e.g. `"v2"`, `"2048"`).
+    /// Lowercase, hyphen-joined.
+    pub version: Option<String>,
+    /// `size_label` — joined size-marker parts (e.g. `"7B"`, `"8x7B"`).
+    /// NOT computed by this function — populated only when the size
+    /// label is part of the model id itself; the param-count-derived
+    /// size_label needs a tensor walk and is handled separately by
+    /// the caller.
+    pub size_label: Option<String>,
+}
+
+/// Port of `Metadata.get_model_id_components` at
+/// `/opt/llama.cpp/gguf-py/gguf/metadata.py:240-362`. Splits a
+/// HuggingFace model id like `"nomic-ai/nomic-xlm-2048"` into the
+/// canonical-equivalent components emitted as `general.*` GGUF
+/// metadata keys.
+///
+/// Heuristic rules (in scan order, per part of the dash-split name):
+///   - Version markers: `(v|iter)?\d+(\.\d+)*` regex (case-insensitive).
+///     Pure-numeric parts (`"2048"`) and `v`-prefixed (`"v2"`,
+///     `"v1.5"`) both match.
+///   - Quant types: `i?q\d(_\w)*` or `b?fp?(16|32)`. Uppercased.
+///   - Size labels (only when not at index 0): regex
+///     `(([A]|\d+[x])?\d+([._]\d+)?[KMBT][\d]?|small|mini|medium|large|x?xl)`.
+///     Per-format normalization (lower-case kmbt, underscore→dot, etc).
+///   - Finetune markers (only when not at index 0):
+///     `chat|instruct|vision|lora`.
+///   - Everything else: if at the start of the name and starts with
+///     an alphabetic character (or is a version part), tagged as
+///     `basename`. Once a non-basename part appears, all subsequent
+///     untagged parts are tagged `finetune`.
+///   - Trailing version parts that were also tagged `basename` lose
+///     their basename annotation (so `v2` in `nomic-xlm-v2` becomes
+///     just `version`).
+///
+/// If `size_label`, `finetune`, AND `version` would all be `None`
+/// after parsing, the basename is also cleared — canonical's "too
+/// ambiguous" exit at `metadata.py:358-361`.
+pub fn get_model_id_components(model_id: &str) -> ModelIdComponents {
+    let mut out = ModelIdComponents::default();
+    if model_id.contains(' ') {
+        // "human sentence" form; canonical preserves it as the name.
+        out.name = Some(model_id.to_string());
+        return out;
+    }
+    let (org_component, full_name) = match model_id.split_once('/') {
+        Some((org, name)) if !org.starts_with('.') => (Some(org), name),
+        _ => (None, model_id),
+    };
+
+    if full_name.is_empty() {
+        return out;
+    }
+
+    let mut name_parts: Vec<String> = full_name
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let n = name_parts.len();
+    let mut tags: Vec<NameTagSet> = (0..n).map(|_| NameTagSet::default()).collect();
+
+    for (i, part) in name_parts.iter_mut().enumerate() {
+        if is_version_marker(part) {
+            tags[i].version = true;
+        } else if let Some(upper) = quant_type_uppercased(part) {
+            tags[i].kind = true;
+            *part = upper;
+        } else if i > 0 {
+            if let Some(normalized) = normalize_size_label(part) {
+                tags[i].size_label = true;
+                *part = normalized;
+            } else if matches!(
+                part.to_ascii_lowercase().as_str(),
+                "chat" | "instruct" | "vision" | "lora"
+            ) {
+                tags[i].finetune = true;
+            }
+        }
+    }
+
+    // Ignore word-based size labels when there's at least one
+    // number-based one present.
+    let has_numeric_size_label = name_parts
+        .iter()
+        .zip(tags.iter())
+        .filter(|(_, t)| t.size_label)
+        .any(|(n, _)| n.chars().any(|c| c.is_ascii_digit()));
+    if has_numeric_size_label {
+        for (part, t) in name_parts.iter().zip(tags.iter_mut()) {
+            if t.size_label && part.chars().all(|c| c.is_alphabetic()) {
+                t.size_label = false;
+            }
+        }
+    }
+
+    // Find basename: walk left-to-right. At-start untagged
+    // alphabetic-starting parts (or version parts) become basename;
+    // once a non-basename part appears, subsequent untagged parts
+    // become finetune.
+    let mut at_start = true;
+    for (part, t) in name_parts.iter().zip(tags.iter_mut()) {
+        let untagged = !t.has_any();
+        if at_start
+            && ((untagged && part.chars().next().is_some_and(|c| c.is_alphabetic()))
+                || t.version)
+        {
+            t.basename = true;
+        } else {
+            at_start = false;
+            if !t.has_any() {
+                t.finetune = true;
+            }
+        }
+    }
+
+    // Remove basename annotation from trailing version parts.
+    for t in tags.iter_mut().rev() {
+        if t.basename && t.count() > 1 {
+            t.basename = false;
+        } else {
+            break;
+        }
+    }
+
+    let basename = collect_joined(&name_parts, &tags, |t| t.basename);
+    let size_label = collect_joined_dedup(&name_parts, &tags, |t| t.size_label);
+    let finetune = collect_joined(&name_parts, &tags, |t| t.finetune);
+    let version = collect_joined(&name_parts, &tags, |t| t.version && !t.basename);
+
+    let too_ambiguous = size_label.is_none() && finetune.is_none() && version.is_none();
+    let final_basename = if too_ambiguous { None } else { basename };
+
+    out.name = Some(title_case_hyphenated(full_name));
+    out.organization = org_component.map(title_case_hyphenated);
+    out.basename = final_basename;
+    out.finetune = finetune;
+    out.version = version;
+    out.size_label = size_label;
+    out
+}
+
+/// Tag-set helper for `get_model_id_components`. Each name part may
+/// carry multiple tags simultaneously (e.g. `v2` is both basename
+/// and version until the trailing-version cleanup removes basename).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct NameTagSet {
+    basename: bool,
+    size_label: bool,
+    finetune: bool,
+    version: bool,
+    kind: bool,
+}
+
+impl NameTagSet {
+    fn has_any(&self) -> bool {
+        self.basename || self.size_label || self.finetune || self.version || self.kind
+    }
+    fn count(&self) -> usize {
+        (self.basename as usize)
+            + (self.size_label as usize)
+            + (self.finetune as usize)
+            + (self.version as usize)
+            + (self.kind as usize)
+    }
+}
+
+fn collect_joined<F>(
+    parts: &[String],
+    tags: &[NameTagSet],
+    pred: F,
+) -> Option<String>
+where
+    F: Fn(&NameTagSet) -> bool,
+{
+    let joined: String = parts
+        .iter()
+        .zip(tags.iter())
+        .filter(|(_, t)| pred(t))
+        .map(|(p, _)| p.as_str())
+        .collect::<Vec<_>>()
+        .join("-");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+fn collect_joined_dedup<F>(
+    parts: &[String],
+    tags: &[NameTagSet],
+    pred: F,
+) -> Option<String>
+where
+    F: Fn(&NameTagSet) -> bool,
+{
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (part, t) in parts.iter().zip(tags.iter()) {
+        if pred(t) && seen.insert(part.clone()) {
+            out.push(part.as_str());
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join("-"))
+    }
+}
+
+/// Match canonical's version regex `(v|iter)?\d+([.]\d+)*`
+/// (case-insensitive). Differs slightly from
+/// [`is_version_part`] used by `title_case_hyphenated`: the
+/// former also matches pure-numeric parts like `"2048"`, the
+/// latter only `v`/`iter` prefixed.
+fn is_version_marker(part: &str) -> bool {
+    let lower = part.to_ascii_lowercase();
+    let rest = lower.strip_prefix('v').or_else(|| lower.strip_prefix("iter")).unwrap_or(&lower);
+    if rest.is_empty() {
+        return false;
+    }
+    let mut chars = rest.chars().peekable();
+    if !chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    while let Some(&c) = chars.peek() {
+        if c != '.' {
+            return false;
+        }
+        chars.next();
+        if !chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+    }
+    true
+}
+
+/// Match `i?q\d(_\w)*|b?fp?(16|32)` (case-insensitive). Returns the
+/// uppercased form when matched, `None` otherwise.
+fn quant_type_uppercased(part: &str) -> Option<String> {
+    let lower = part.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    // Check b?fp?(16|32) variants first.
+    if matches!(lower.as_str(), "fp16" | "fp32" | "bfp16" | "bfp32" | "f16" | "f32" | "bf16" | "bf32") {
+        return Some(part.to_ascii_uppercase());
+    }
+    // Check `i?q\d(_\w)*` (e.g. `q4`, `q4_k`, `q4_k_m`, `iq2_xxs`).
+    let mut idx = 0;
+    if bytes.get(idx) == Some(&b'i') {
+        idx += 1;
+    }
+    if bytes.get(idx) != Some(&b'q') {
+        return None;
+    }
+    idx += 1;
+    if !bytes.get(idx).is_some_and(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    idx += 1;
+    while idx < bytes.len() {
+        if bytes[idx] != b'_' {
+            return None;
+        }
+        idx += 1;
+        if idx >= bytes.len() || !(bytes[idx].is_ascii_alphanumeric()) {
+            return None;
+        }
+        while idx < bytes.len() && bytes[idx].is_ascii_alphanumeric() {
+            idx += 1;
+        }
+    }
+    Some(part.to_ascii_uppercase())
+}
+
+/// Match the size-label regex (e.g. `"7B"`, `"13B"`, `"8x7B"`,
+/// `"1.5B"`, `"500M"`). Returns the normalized form (kmbt
+/// upper-cased, underscores converted to dots) when matched, `None`
+/// otherwise.
+///
+/// Mirrors `metadata.py:286-315`. We omit the LoRA-vs-context-length
+/// disambiguation branch (`total_params != 0` check) since hf2q
+/// doesn't pass `total_params` into the heuristic — it computes
+/// `size_label` from the tensor walk independently.
+fn normalize_size_label(part: &str) -> Option<String> {
+    let lower = part.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "small" | "mini" | "medium" | "large" | "xl" | "xxl"
+    ) {
+        return Some(part.to_string());
+    }
+    // `(([A]|\d+[x])?\d+([._]\d+)?[KMBT][\d]?)`. Strict regex
+    // implemented as a small state machine.
+    let bytes = lower.as_bytes();
+    let mut idx = 0;
+    // Optional prefix: `A` or `\d+x`.
+    if bytes.get(idx) == Some(&b'a') {
+        idx += 1;
+    } else {
+        let start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        if idx > start && bytes.get(idx) == Some(&b'x') {
+            idx += 1;
+        } else {
+            idx = 0;
+        }
+    }
+    // Core: `\d+([._]\d+)?`.
+    let core_start = idx;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx == core_start {
+        return None;
+    }
+    if let Some(&b) = bytes.get(idx) {
+        if b == b'.' || b == b'_' {
+            idx += 1;
+            let frac_start = idx;
+            while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+                idx += 1;
+            }
+            if idx == frac_start {
+                return None;
+            }
+        }
+    }
+    // Suffix: `[KMBT][\d]?`.
+    let suffix_idx = idx;
+    let suffix_char = bytes.get(idx)?;
+    if !matches!(*suffix_char, b'k' | b'm' | b'b' | b't') {
+        return None;
+    }
+    idx += 1;
+    if let Some(b) = bytes.get(idx) {
+        if b.is_ascii_digit() {
+            idx += 1;
+        }
+    }
+    if idx != bytes.len() {
+        return None;
+    }
+
+    // Normalize: underscore → dot, kmbt → upper.
+    let mut out: Vec<u8> = part.bytes().collect();
+    for b in out.iter_mut() {
+        if *b == b'_' {
+            *b = b'.';
+        }
+    }
+    if let Some(b) = out.get_mut(suffix_idx) {
+        b.make_ascii_uppercase();
+    }
+    Some(String::from_utf8(out).expect("ASCII-only"))
+}
+
 /// Title-case a hyphenated identifier the way canonical
 /// `Metadata.load` does for the `base_model.name` / `organization`
 /// fields. Splits on `-`, capitalizes the first letter of each part,
@@ -426,6 +823,126 @@ language:
         let card = parse_yaml_frontmatter(frontmatter);
         assert_eq!(card.license.as_deref(), Some("apache-2.0"));
         assert_eq!(card.base_models.len(), 1);
+    }
+
+    /// Canonical-fidelity test for the nomic v2-moe model id. The
+    /// observed canonical Q8_0 GGUF dump emits:
+    /// - general.name = 'Nomic Xlm 2048'
+    /// - general.version = '2048'
+    /// - general.organization = 'Nomic Ai'
+    /// - general.basename = 'nomic-xlm'
+    /// Our `get_model_id_components` must produce these values for
+    /// input `"nomic-ai/nomic-xlm-2048"`.
+    #[test]
+    fn get_model_id_components_nomic_v2_moe() {
+        let c = get_model_id_components("nomic-ai/nomic-xlm-2048");
+        assert_eq!(c.name.as_deref(), Some("Nomic Xlm 2048"));
+        assert_eq!(c.organization.as_deref(), Some("Nomic Ai"));
+        assert_eq!(c.basename.as_deref(), Some("nomic-xlm"));
+        assert_eq!(c.version.as_deref(), Some("2048"));
+        assert_eq!(c.finetune, None);
+        assert_eq!(c.size_label, None);
+    }
+
+    /// Llama-3-8B-Instruct style. Mirrors the canonical example from
+    /// `metadata.py` docs: basename, size_label, finetune all set.
+    #[test]
+    fn get_model_id_components_llama_3_8b_instruct() {
+        let c = get_model_id_components("meta-llama/Meta-Llama-3-8B-Instruct");
+        // Expected per canonical heuristic:
+        //   parts: ["Meta", "Llama", "3", "8B", "Instruct"]
+        //   "Meta", "Llama" → basename (alphabetic, start)
+        //   "3"             → version + basename (at_start with version tag)
+        //   "8B"            → size_label
+        //   "Instruct"      → finetune
+        // Trailing-version cleanup walks backwards and BREAKS at the
+        // first non-basename part. The walk hits "Instruct" first
+        // (only `finetune`) → break immediately, so "3" keeps its
+        // basename tag. Result:
+        //   basename = "Meta-Llama-3" (includes the 3)
+        //   version = None (filtered out — `version && !basename`)
+        assert_eq!(c.name.as_deref(), Some("Meta Llama 3 8B Instruct"));
+        assert_eq!(c.organization.as_deref(), Some("Meta Llama"));
+        assert_eq!(c.basename.as_deref(), Some("Meta-Llama-3"));
+        assert_eq!(c.version, None);
+        assert_eq!(c.size_label.as_deref(), Some("8B"));
+        assert_eq!(c.finetune.as_deref(), Some("Instruct"));
+    }
+
+    /// Trailing version cleanup test. `nomic-xlm-v2` should produce
+    /// basename=`nomic-xlm` + version=`v2`, NOT basename=`nomic-xlm-v2`.
+    #[test]
+    fn get_model_id_components_trailing_version_strips_basename() {
+        let c = get_model_id_components("nomic-ai/nomic-xlm-v2");
+        assert_eq!(c.basename.as_deref(), Some("nomic-xlm"));
+        assert_eq!(c.version.as_deref(), Some("v2"));
+    }
+
+    /// No `/` in id → organization = None, basename derived from
+    /// whole string.
+    #[test]
+    fn get_model_id_components_no_org_slash() {
+        let c = get_model_id_components("orphan-model-7B");
+        assert_eq!(c.organization, None);
+        assert_eq!(c.basename.as_deref(), Some("orphan-model"));
+        assert_eq!(c.size_label.as_deref(), Some("7B"));
+    }
+
+    /// "Human sentence" id (contains a space) → preserved as name.
+    #[test]
+    fn get_model_id_components_human_sentence() {
+        let c = get_model_id_components("Some Long Display Name");
+        assert_eq!(c.name.as_deref(), Some("Some Long Display Name"));
+        assert_eq!(c.organization, None);
+        assert_eq!(c.basename, None);
+    }
+
+    /// Ambiguous id with no size_label / version / finetune → basename
+    /// dropped (canonical "too ambiguous" exit at `metadata.py:358-361`).
+    #[test]
+    fn get_model_id_components_too_ambiguous_drops_basename() {
+        let c = get_model_id_components("acme/widget");
+        assert_eq!(c.name.as_deref(), Some("Widget"));
+        assert_eq!(c.organization.as_deref(), Some("Acme"));
+        assert_eq!(c.basename, None); // ambiguous
+        assert_eq!(c.size_label, None);
+        assert_eq!(c.finetune, None);
+        assert_eq!(c.version, None);
+    }
+
+    /// MoE-style `8x7B` size label normalizes correctly.
+    #[test]
+    fn normalize_size_label_moe_form() {
+        assert_eq!(normalize_size_label("8x7B"), Some("8x7B".to_string()));
+        assert_eq!(normalize_size_label("8x7b"), Some("8x7B".to_string()));
+    }
+
+    #[test]
+    fn normalize_size_label_with_decimal() {
+        assert_eq!(normalize_size_label("1.5B"), Some("1.5B".to_string()));
+        assert_eq!(normalize_size_label("1_5b"), Some("1.5B".to_string()));
+    }
+
+    #[test]
+    fn normalize_size_label_rejects_non_size() {
+        assert_eq!(normalize_size_label("foo"), None);
+        assert_eq!(normalize_size_label("2048"), None); // no K/M/B/T suffix
+        assert_eq!(normalize_size_label("XYZ"), None);
+    }
+
+    #[test]
+    fn is_version_marker_matches_pure_numeric() {
+        assert!(is_version_marker("2048"));
+        assert!(is_version_marker("v2"));
+        assert!(is_version_marker("V1"));
+        assert!(is_version_marker("iter3"));
+        assert!(is_version_marker("1.5"));
+    }
+
+    #[test]
+    fn is_version_marker_rejects_alpha_suffix() {
+        assert!(!is_version_marker("v2a"));
+        assert!(!is_version_marker("v"));
     }
 
     #[test]

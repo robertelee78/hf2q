@@ -51,7 +51,7 @@
 
 use crate::backends::gguf::types::MetaValue;
 use crate::convert::arch::bake::BakeOp;
-use crate::convert::model_card::{split_base_model, ModelCard};
+use crate::convert::model_card::{get_model_id_components, split_base_model, ModelCard};
 
 /// Per-arch context plumbed into [`map_tensor_name`] when the tensor
 /// transform depends on hparams that aren't recoverable from the
@@ -357,11 +357,20 @@ pub fn build_metadata(
     file_type: u32,
     model_card: Option<&ModelCard>,
 ) -> Vec<(String, MetaValue)> {
-    let name = config
+    let raw_name = config
         .get("_name_or_path")
         .and_then(|v| v.as_str())
-        .unwrap_or("model")
-        .to_string();
+        .unwrap_or("model");
+    // Parse the HF model id into canonical `general.*` components.
+    // For nomic v2-moe (`"nomic-ai/nomic-xlm-2048"`) this gives:
+    //   name = "Nomic Xlm 2048", organization = "Nomic Ai",
+    //   basename = "nomic-xlm", version = "2048".
+    // Used only on the v2-moe branch — v1.5 keeps the legacy raw
+    // `_name_or_path` for `general.name` (no byte-cmp gate established
+    // for the v1.5 nomic path yet, and changing it would break the
+    // existing v1.5 metadata-builder tests).
+    let id_components = get_model_id_components(raw_name);
+    let raw_name_string = raw_name.to_string();
 
     // Pull a required `u64` from either of two HF keys.
     let pick_u64 = |k_gpt: &str, k_hf: &str| -> u32 {
@@ -513,12 +522,41 @@ pub fn build_metadata(
             ) as u32;
         let n_layers_per_moe = moe_every_n.unwrap();
         let _ = n_head_kv; // canonical doesn't emit head_count_kv for nomic
-        let mut kv_v2moe: Vec<(String, MetaValue)> = vec![
-            (
-                "general.architecture".into(),
-                MetaValue::String(arch_name.into()),
-            ),
-            ("general.name".into(), MetaValue::String(name)),
+        let mut kv_v2moe: Vec<(String, MetaValue)> = Vec::with_capacity(64);
+        kv_v2moe.push((
+            "general.architecture".into(),
+            MetaValue::String(arch_name.into()),
+        ));
+        // `general.type` is hardcoded `"model"` for all model GGUFs
+        // canonical emits (vs `"adapter"` for LoRA). See canonical's
+        // implicit default at `metadata.py`.
+        kv_v2moe.push(("general.type".into(), MetaValue::String("model".into())));
+        // v2-moe path uses the title-cased name from
+        // `get_model_id_components` to match canonical's observed
+        // `general.name = "Nomic Xlm 2048"`. Falls back to the raw
+        // `_name_or_path` for "human sentence" / unparseable inputs.
+        let v2moe_name = id_components
+            .name
+            .clone()
+            .unwrap_or_else(|| raw_name_string.clone());
+        kv_v2moe.push(("general.name".into(), MetaValue::String(v2moe_name)));
+        // `general.{version, organization, basename}` come from the
+        // name-parser heuristic (`get_model_id_components` port of
+        // `metadata.py:240-362`). Only emitted when the parser
+        // produced a value — canonical's same gating.
+        if let Some(v) = &id_components.version {
+            kv_v2moe.push(("general.version".into(), MetaValue::String(v.clone())));
+        }
+        if let Some(o) = &id_components.organization {
+            kv_v2moe.push(("general.organization".into(), MetaValue::String(o.clone())));
+        }
+        if let Some(b) = &id_components.basename {
+            kv_v2moe.push(("general.basename".into(), MetaValue::String(b.clone())));
+        }
+        // TODO follow-up iteration: `general.size_label` from the
+        // tensor walk (canonical's `gguf.size_label(total_params,
+        // shared_params, expert_params, expert_count)`).
+        kv_v2moe.extend([
             (format!("{arch_name}.block_count"), MetaValue::U32(n_layers)),
             (format!("{arch_name}.context_length"), MetaValue::U32(ctx_len)),
             (
@@ -566,7 +604,7 @@ pub fn build_metadata(
                 format!("{arch_name}.expert_used_count"),
                 MetaValue::U32(moe_top_k),
             ),
-        ];
+        ]);
         // HF model-card metadata (from README.md YAML frontmatter).
         // Canonical emits these in a fixed order via
         // `gguf-py/gguf/metadata.py::Metadata.set_gguf_meta_model`.
@@ -640,7 +678,7 @@ pub fn build_metadata(
                 "general.architecture".into(),
                 MetaValue::String(arch_name.into()),
             ),
-            ("general.name".into(), MetaValue::String(name)),
+            ("general.name".into(), MetaValue::String(raw_name_string.clone())),
             (format!("{arch_name}.context_length"), MetaValue::U32(ctx_len)),
             (
                 format!("{arch_name}.embedding_length"),
@@ -1013,6 +1051,11 @@ mod tests {
             by_key["general.architecture"],
             MetaValue::String("nomic-bert".into())
         );
+        // v1.5 path keeps the raw `_name_or_path` for backward
+        // compat (no byte-cmp gate established for v1.5 nomic yet).
+        // The v2-moe path uses the title-cased
+        // `get_model_id_components` name to match canonical's
+        // observed `general.name = "Nomic Xlm 2048"`.
         assert_eq!(
             by_key["general.name"],
             MetaValue::String("nomic-ai/nomic-embed-text-v1.5".into())
