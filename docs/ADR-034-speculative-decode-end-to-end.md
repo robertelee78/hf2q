@@ -237,6 +237,40 @@ Step 2 (next iter): lift FA prefill arenas off when seq_len < 16. Step 3:
 LA layer batched_decode path. Full task #89 scope ~1500 LOC across all 3
 steps.
 
+### Iteration 2026-05-21 (cont. 4) — Step 1 design PIVOT after empirical profile
+
+**Two mantra catches this iteration before writing wrong code:**
+
+**Issue 1 — Chesterton's fence on F32 sdpa**: gpu_full_attn.rs:2438-2447
+explicitly documents "Legacy SDPA: all-NaN at qL ≤ 15 on Qwen3.6 ...
+qL=15 NaN, qL=17 coherent." Original Step 1 design (F32 sdpa bypass of
+BF16 resume) targeted a kernel that DOESN'T WORK at qL=2 in production.
+
+**Issue 2 — Per-kernel profile shows wrong bottleneck**:
+`HF2Q_PROFILE_W5B8=1` on 35B-A3B K=1 BATCHED steady-state decode:
+
+| Section | Time | % of T_v(2) |
+|---|---:|---:|
+| **fa.ops1_4** (QKV+norm+RoPE × 4 FA layers) | **9.33 ms** | **53%** |
+| fa.sdpa_total (4 FA layers) | 1.87 ms | 11% |
+| fa.ops6_7 (output projection) | 1.88 ms | 11% |
+| layer.linear_total (30 LA aggregated) | 1.03 ms | 6% |
+| layer.ffn_dispatch (40 FFN dispatches) | 2.00 ms | 11% |
+
+fa.ops1_4 = 2.33 ms per FA layer at seq_len=2 vs ~0.18 ms/layer expected
+at decode-equivalent compute. The bottleneck is NOT sdpa; it's the
+QKV-projection-arena + LayerEncoderSession orchestration designed for
+big batched prefill, proportionally ruinous at seq_len=2.
+
+**Revised Step 1 design**: bypass `FaProjectionsArena` + `LayerEncoderSession`
+for seq_len < 16. Use decode-mode `pooled_alloc_buffer` for QKV/Gate
+projections + per-stage `LayerEncoder::plain()`. Same kernels (they handle
+seq_len natively); just lift off the prefill-only orchestration. ~300-500 LOC.
+
+Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
+Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
+break-even on 35B-A3B, then small win above.
+
 Operator asked: "obviously our peers are doing something better than us? or wtf?
 why can they be faster and we can not." Direct answer after reading
 `/opt/MTPLX/mtplx/gdn_capture.py`:
