@@ -41,6 +41,24 @@
 
 **Pattern revealed (DECREASING-lead → CROSSOVER)**: hf2q's lead **shrinks monotonically** with model size/MoE complexity and **crosses over** around MoE-256 scale. The prior ADR-036 claim of "3.0× faster on Gemma 4 26B" (memory entry from 2026-05-19, [[project_adr033_p1_byte_identical_2026_05_19]]) **does NOT reproduce** at HEAD `ac00b224` with fresh consistent methodology. Possible causes for the stale claim: cold-cache vs warm-cache state, concurrent load during the original bench, or different bench framing (Step 2 alone vs total pipeline). The fresh measurement is the authoritative one.
 
+**Real underlying pattern (revealed by per-step decomposition)**: hf2q is consistently ~1.62× the wall of canonical's pure `llama-quantize` Step 2 alone, REGARDLESS of model size. The "win/loss" outcome is determined by how much canonical Step 1 work the model triggers:
+
+| Model | hf2q wall | canonical Step 2 alone | hf2q/Step2 ratio | canonical Step 1 wall |
+|---|---:|---:|---:|---:|
+| Llama 3 8B | 34.6s | 34.8s | **0.99×** | 9.6s |
+| Gemma 4 26B-A4B | 102.74s | 61.84s | **1.66×** | 54.83s |
+| Qwen 3.5 35B-A3B | 183.08s | 113.22s | **1.62×** | 21.72s |
+
+Gemma 4 26B has 54.83s of canonical Step 1 work (Python doing per-expert `.transpose(1,2)`), so hf2q saves the most by skipping it. Qwen 3.5 35B has only 21.72s of canonical Step 1 (experts ship pre-fused on disk), so hf2q's per-tensor quantize overhead dominates. The correct framing is: **hf2q's quantize work is ~1.62× as expensive as canonical's `llama-quantize` Step 2; hf2q "wins" when canonical's Python Step 1 is the dominant cost, "loses" when canonical's Python Step 1 is cheap**.
+
+**Hypothesis testing log (mantra "code + test == truth")**:
+
+1. **H1 — F16 round-trip parallelization** at `orchestrator.rs:593`: par_iter the `data.iter().map(|x| f16::from_f32(x).to_f32())`. Bench at HEAD `fa083c60`: 194.65s (11.57s WORSE than 183.08s baseline). **FALSIFIED.** Reverted at `e7d84134` with warning comment; rayon's per-tensor work-stealing overhead exceeds the gain since the quantize kernel that follows is already rayon-parallel per-row.
+
+2. **H2 — `BakeOp::MoeExpertTranspose` parallelization** at `bake.rs:600`: par_chunks_exact_mut across the outer expert loop. Bench: 195.24s (12.16s WORSE). **FALSIFIED on a wrong premise** — code-grep revealed `MoeExpertTranspose` is used only by Nomic v2-moe (which is small); Qwen 3.5 uses `BakeOp::SplitAxisHalf` (just a slice). The bench measured pure noise (~6.6% variance). Reverted; transpose is memory-bandwidth-bound and Nomic's small dims make it cheap regardless.
+
+**Falsified-hypothesis lesson**: Before parallelizing, verify the target op is actually in the hot path for the model under test via code-grep. Estimating "this LOOKS expensive" without confirming it's reachable is a guess, not science.
+
 **Real per-model breakdown**:
 - **Llama 3 8B dense**: hf2q wins by 28% — canonical's per-tensor Python overhead dominates on small-tensor-count dense models
 - **Gemma 4 26B MoE-128**: hf2q wins by 14% — meaningful but modest; rayon per-row parallelism on 128 experts amortizes IO savings only marginally

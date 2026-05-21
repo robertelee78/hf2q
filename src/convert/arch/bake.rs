@@ -597,6 +597,16 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
                     ),
                 });
             }
+            // Per-expert transpose. The naive triple-nested loop with
+            // scattered writes is memory-bandwidth-bound on Apple Silicon
+            // (each `h` iteration strides by `ni` bytes, defeating the
+            // hardware prefetcher). Parallelizing the outer `e` loop via
+            // rayon was attempted at 2026-05-21 and produced no measurable
+            // speedup (Qwen 3.5 bench was unaffected because Qwen 3.5
+            // uses `BakeOp::SplitAxisHalf`, not this op — only Nomic
+            // v2-moe uses this transpose, and Nomic's small dims make the
+            // op cheap regardless). Kept serial since the only consumer
+            // is Nomic v2-moe.
             let mut out = vec![0.0f32; expected_elems];
             for e in 0..ne {
                 let in_base = e * ni * nh;
