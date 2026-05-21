@@ -183,6 +183,59 @@ overhead doesn't amortize across the 2 tokens efficiently.
 - **Multi-week scope**: implement `forward_gpu_batched_decode` for seq_len ∈
   [2, 8] to unlock K=N speedup on MoE A3B.
 
+### Iteration 2026-05-21 (cont. 2) — Why MTPLX hits 63 tok/s on M5 Max and we hit 22
+
+Operator asked: "obviously our peers are doing something better than us? or wtf?
+why can they be faster and we can not." Direct answer after reading
+`/opt/MTPLX/mtplx/gdn_capture.py`:
+
+**MTPLX's structural advantages over our K=1 BATCHED:**
+
+1. **Per-position GDN state capture** (`gdn_capture.py:128-201` 80-line Metal
+   kernel, plus Rust dispatch + cache wiring). MTPLX runs Gated DeltaNet in
+   "capture mode" that writes `states[B, T, Hv, Dv, Dk]` — the recurrent state
+   at EVERY position in the batch. On partial-reject of K drafts, they pick
+   `states[accepted]` as the next-iter active state. This **unlocks K=3 (D3)
+   batched spec-decode on hybrid Qwen** — which we cannot currently do because
+   `LinearAttnStateSlot` only ping-pongs between {before, after-N-tokens} with
+   no intermediate states.
+
+2. **D3 vs D1**: at 60% accept E[tokens/cycle] = 1 + 0.6 + 0.36 + 0.216 = **2.18**
+   tokens for D3 vs **1.6** tokens for D1. ~36% more tokens per verifier call.
+
+3. **temp=0.6 stochastic sampling** (not greedy temp=0). MTPLX's recorded
+   `63.056 tok/s` is at temp=0.6; their greedy `60.108 tok/s` is still 2.7× ours.
+
+4. **Custom drafter** (`Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed`) fine-tuned
+   for spec-decode acceptance.
+
+5. **MLX framework batched-prefill kernels** vs our hand-ported mlx-native FA
+   prefill. The T_v(N)/T_v(1) ratio likely flatter on mature MLX.
+
+6. **`performance-cold` profile + `--max` fans** = full thermal headroom.
+
+**The single biggest structural lever**: GDN capture. Without it, K≥2 degenerates
+(empirically reproduced this session at HEAD `5505cdfc`). With it + a fast
+batched-decode forward path, K=3 should give ~2× on 27B and likely 1.5-1.8× on
+35B-A3B once the prefill-path overhead is eliminated (task #89).
+
+**Port plan for GDN capture (task #90)**:
+- ~80-line Metal kernel `gated_delta_net_capture` mirroring MTPLX's source at
+  `gdn_capture.py:132-194`. State buffer shape `[B, T, Hv, Dv, Dk]`. Step loop
+  inside kernel reads `parent_state` from `states[t-1]` (or `state_in` for t=0)
+  and writes `state_t = states + ((b·T+t)·Hv+hv)·Dv+dv)·Dk`.
+- Rust dispatch wrapper in mlx-native: `dispatch_gated_delta_net_with_capture`.
+- Extend `LinearAttnStateSlot` with optional `capture_states: Option<MlxBuffer>`
+  shaped `[B, T_max, Hv, Dv, Dk]`. T_max = max spec depth + 1.
+- Modify `build_delta_net_layer` (and prefill resume variants) to use capture
+  variant when `kv_cache.in_speculative_decode == true`.
+- Modify `HybridKvCache::rollback_to(absolute_pos)` to select `capture_states
+  [pos - prior_len]` as the new active recurrent state.
+- Scope: ~600-1200 LOC across mlx-native + hf2q.
+
+Total path-to-D3 budget: GDN capture (~1000 LOC) + batched_decode (~1500 LOC)
++ K=N spec_decode integration (~300 LOC) ≈ **3000 LOC** for the 2× target.
+
 ### What an engineer needs (besides this section)
 
 - Read [[project_adr034_readiness_final_2026_05_21]] memory entry for cross-cutting findings
