@@ -97,7 +97,19 @@ These remaining sub-percent differences are functionally negligible. The convert
 
 The earlier "metadata diff" worry was overblown — once `tokenizer.ggml.model` emitted `"bert"` (not `"llama"`), byte-identity follows for all 5 quants. The Q4_K_S / Q5_K_S / IQ4_NL quants aren't typically shipped for BERT embeddings (omitted from this matrix per practical use).
 
-**AC #2 acceptance matrix coverage**: 44/64 cells = 69% (Gemma 4 8/8 ✅, Qwen 3.5 7/8, Llama 3 7/8, Qwen3-VL 8/8 ✅, MiniMax-M2 2/8 in progress, BERT bge 5/5 ✅, **Nomic v2-moe 8/8 ✅ NEW 2026-05-20**, Gemma 4 mmproj 0/8 open #63).
+**AC #2 acceptance matrix coverage** (2026-05-20 evening status — re-validation in progress):
+- **Nomic v2-moe 8/8 ✅ CONFIRMED 2026-05-20 evening** — direct `cmp` exit 0 + SHA256 match for Q4_0/Q4_K_S/Q4_K_M/Q5_K_S/Q5_K_M/Q6_K/Q8_0/IQ4_NL against fresh canonical reference. First fully-verified MoE arch in the matrix.
+- **BERT bge: REGRESSED to 0/5 ❌** — direct `cmp` of fresh hf2q output vs fresh canonical shows 213M-243M bytes diff on Q4_K_M/Q5_K_M. Two root causes identified:
+  1. Tensor source order from safetensors doesn't match canonical's alphabetical `weight_name_comparer` sort (per `/opt/llama.cpp/src/llama-model-loader.h:53-64`). The `canonical_tensor_name_cmp` sort added in 84033d5a is gated on `ArchName::NomicBert` only — needs to extend to BERT (and likely all arches).
+  2. BERT bge tokens missing the `▁` phantom-space prefix that canonical's `BertModel.set_vocab` applies via `phantom()` at `/opt/llama.cpp/conversion/bert.py:48-57`. ~30K tokens × 3-byte UTF-8 prefix = ~91 KB of metadata divergence.
+- **Other claimed-byte-identical arches (Gemma 4, Qwen 3.5, Llama 3, Qwen3-VL, MiniMax-M2): RE-VALIDATION REQUIRED.** Pre-existing cache files at `/opt/hf2q/cache/byte_cmp/<arch>_hf2q_*.gguf` are stale (snapshots from earlier hf2q binaries, not current code). Tensor-order check on cached files shows only 2/658 (Gemma), 2/291 (Llama 3), 39/399 (Qwen3-VL) tensor names match canonical order — strongly suggesting the historical "byte-identical" claims were measured against canonical references that may have had different content at that time, OR the claims were never fully validated. Re-running fresh hf2q convert + cmp vs fresh canonical is required to establish actual matrix state.
+- **Open gaps unchanged**: Gemma 4 mmproj 0/8 (#63 — new arch port), MiniMax-M2 6/8 blocked by canonical llama-quantize ios_base failure on the 230B model.
+
+Action plan to recover the matrix:
+1. Extend `canonical_tensor_name_cmp` sort to all arches (or at least Gemma 4, BERT, Llama 3, Qwen3-VL, Qwen 3.5).
+2. Apply canonical `phantom()` token transformation for BERT path (▁ prefix + ## stripping).
+3. Apply general.* model-card metadata pattern (license, base_model, tags, languages, type, version, organization, basename, size_label) to all arches — currently only nomic-bert-moe path has it.
+4. Re-run fresh byte-cmp for each arch.
 
 **🏆 Nomic v2-moe full 8-quant byte-identity (HEAD `84033d5a`+, 2026-05-20)** — first MoE arch with byte-identical convert+quantize pipeline to canonical. Verified against `/opt/hf2q/models/nomic-ai-nomic-embed-text-v2-moe` (475M params, 8 experts, `nomic-bert-moe` arch):
 
