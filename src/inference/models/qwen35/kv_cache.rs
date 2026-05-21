@@ -1346,6 +1346,50 @@ impl HybridKvCache {
     /// Reset all per-seq write cursors and zero out the recurrent/conv state.
     /// Does NOT zero the K/V buffers (callers overwrite them on subsequent
     /// tokens).
+    /// Truncate every full-attention slot's `current_len[0]` to
+    /// `new_len`. Independently from the MTP slot (see
+    /// [`HybridKvCache::truncate_mtp_to`]) because the two slot families
+    /// have different base offsets: full-attn slots get populated during
+    /// prefill (`current_len` starts at `prompt_len`), but MTP slot
+    /// starts empty at decode (`current_len = 0`).
+    ///
+    /// **Use case (ADR-034 K=N speculative, partial reject)**: after a
+    /// batched verifier forward has written `spec_k + 1` positions but
+    /// only `accepted + 1` of them are valid (the rest were drafted
+    /// off-path tokens that the target rejected), this method rolls
+    /// each full-attn slot back so next iter's forward writes start at
+    /// the correct slot index. Without rollback the next iter's writes
+    /// append AFTER the stale entries, leaving duplicate rope-positions
+    /// in the slot — attention double-counts those positions and quality
+    /// degrades (the "the the the…" / "** ** **" attractor bug at K=N
+    /// chain).
+    ///
+    /// Targets only `full_attn` slots. Linear-attention DeltaNet state
+    /// is invariant under this call (its recurrent / conv-state buffers
+    /// don't carry a per-token cursor).
+    pub fn truncate_full_attn_to(&mut self, new_len: u32) {
+        for slot in self.full_attn.iter_mut() {
+            for c in slot.current_len.iter_mut() {
+                if *c > new_len {
+                    *c = new_len;
+                }
+            }
+        }
+    }
+
+    /// Truncate the optional MTP slot's `current_len[0]` to `new_len`.
+    /// Counterpart to [`HybridKvCache::truncate_full_attn_to`] for the
+    /// MTP-draft slot in K=N speculative decoding.
+    pub fn truncate_mtp_to(&mut self, new_len: u32) {
+        if let Some(slot) = self.mtp_slot.as_mut() {
+            for c in slot.current_len.iter_mut() {
+                if *c > new_len {
+                    *c = new_len;
+                }
+            }
+        }
+    }
+
     pub fn reset(&mut self) {
         for slot in self.full_attn.iter_mut() {
             for c in slot.current_len.iter_mut() {

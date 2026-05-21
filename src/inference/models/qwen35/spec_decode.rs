@@ -286,10 +286,38 @@ impl<'a> SpecDecode<'a> {
                 let vsz = vocab as usize;
                 let mtp_t0 = if mtp_profile { Some(Instant::now()) } else { None };
 
-                // Chain `spec_k` MTP forward steps producing drafts[0..spec_k-1].
-                // Each writes the MTP KV slot at positions [next_pos..next_pos+spec_k-1].
-                // (Catch-up: NOT implemented in this iteration — see notes below
-                // about MTP-slot vs verifier-slot alignment on FULL accept.)
+                // Snapshot pre-iter slot lengths so we can roll back precisely
+                // on partial reject. Verifier full-attn slots start at
+                // prompt_len after prefill; MTP slot starts at 0 (MTP isn't
+                // exercised during prefill). The K=N path advances each by a
+                // KNOWN amount (spec_k+1 entries for verifier batched verify,
+                // spec_k+1 for MTP chained draft + catch-up).
+                let prior_full_attn_len: u32 = self
+                    .kv_cache
+                    .full_attn
+                    .first()
+                    .map(|s| s.current_len[0])
+                    .unwrap_or(0);
+                let prior_mtp_len: u32 = self
+                    .kv_cache
+                    .mtp_slot
+                    .as_ref()
+                    .map(|s| s.current_len[0])
+                    .unwrap_or(0);
+
+                // Chain `spec_k + 1` MTP forward steps:
+                //   - steps 0..spec_k-1 produce drafts[0..spec_k-1] AND write MTP
+                //     KV slot at positions [next_pos..next_pos+spec_k-1]
+                //   - step spec_k is a CATCH-UP that writes MTP slot at
+                //     `next_pos+spec_k` (the position of drafts[spec_k-1]) so
+                //     the MTP slot's `current_len` matches the verifier slot's
+                //     `current_len` after batched verify (both at
+                //     prior_len + spec_k + 1). Without this, MTP slot falls
+                //     behind by 1 per iter and attention at next iter's MTP
+                //     step 0 sees a positional gap → quality collapses.
+                //     The catch-up step's logits are discarded; the bonus
+                //     token (if all drafts accepted) is taken from the
+                //     verifier's stronger row-spec_k prediction instead.
                 let drafts: Vec<u32> = {
                     let hidden_ref = &hidden_t;
                     let kv_cache_ref = &mut self.kv_cache;
@@ -297,7 +325,7 @@ impl<'a> SpecDecode<'a> {
                         let mut out = Vec::with_capacity(spec_k);
                         let mut chain_hidden: Option<MlxBuffer> = None;
                         let mut chain_token = token_next;
-                        for k in 0..spec_k {
+                        for k in 0..=spec_k {
                             let embed = embed_token_on_device(
                                 token_embd,
                                 chain_token,
@@ -321,15 +349,18 @@ impl<'a> SpecDecode<'a> {
                                         "SpecDecode K={spec_k} chained MTP step {k} pos {mtp_pos}"
                                     )
                                 })?;
-                            let tok = argmax_logits_gpu(
-                                device,
-                                registry,
-                                &draft_logits,
-                                mtp_vocab,
-                            )?;
-                            out.push(tok);
-                            chain_hidden = Some(draft_hidden);
-                            chain_token = tok;
+                            if k < spec_k {
+                                let tok = argmax_logits_gpu(
+                                    device,
+                                    registry,
+                                    &draft_logits,
+                                    mtp_vocab,
+                                )?;
+                                out.push(tok);
+                                chain_hidden = Some(draft_hidden);
+                                chain_token = tok;
+                            }
+                            // k == spec_k: catch-up step. Slot write only.
                         }
                         Ok::<Vec<u32>, anyhow::Error>(out)
                     })?
@@ -397,22 +428,40 @@ impl<'a> SpecDecode<'a> {
                     }
                 }
                 if accepted == spec_k && !emitted_corrected && !hit_eos {
-                    // All drafts accepted: DO NOT emit a "bonus" token from
-                    // verify_logits[spec_k]. Reason — the verifier slot wrote
-                    // positions [next_pos..next_pos+spec_k] (spec_k+1 entries)
-                    // but the MTP slot only wrote [next_pos..next_pos+spec_k-1]
-                    // (spec_k entries). MTP would fall behind by 1 per iter.
-                    // Instead, defer the bonus to next iter: set logits_t to
-                    // verify_logits[spec_k] (predicts position next_pos+spec_k+1)
-                    // and preemitted_argmax=false so next iter naturally pushes
-                    // it as its `token_next`. Verifier slot is at next_pos+spec_k
-                    // (last accepted draft); next iter will write at the bonus
-                    // position. MTP slot also at next_pos+spec_k-1; next iter's
-                    // MTP step 0 writes at next_pos+spec_k aligning with the
-                    // verifier's last write — no gap.
+                    // All drafts accepted: emit the bonus token (verifier's
+                    // prediction at row spec_k, predicting position
+                    // next_pos+spec_k+1). No truncate — verifier slot wrote
+                    // spec_k+1 valid entries [next_pos..next_pos+spec_k] AND
+                    // MTP slot also wrote spec_k+1 valid entries via the
+                    // catch-up step, so both slots are aligned at
+                    // (prior_len + spec_k + 1) with no stale tail.
+                    let bonus_row =
+                        &verify_logits[spec_k * vsz..(spec_k + 1) * vsz];
+                    let bonus = greedy_argmax_slice(bonus_row);
+                    if generated.len() < max_new {
+                        generated.push(bonus);
+                    }
                     next_iter_hidden_row = spec_k as u64;
-                    next_iter_logits =
-                        verify_logits[spec_k * vsz..(spec_k + 1) * vsz].to_vec();
+                    next_iter_logits = bonus_row.to_vec();
+                    if self.is_eos(bonus) {
+                        hit_eos = true;
+                    }
+                } else if emitted_corrected {
+                    // Partial reject at draft index `accepted`. Verifier
+                    // and MTP slots each wrote spec_k+1 entries this iter
+                    // but only the first `accepted + 1` are valid in each
+                    // (input chain stayed valid only as long as drafts
+                    // were accepted). Roll BOTH back to
+                    // `prior_slot_len + accepted + 1` — slot-specific
+                    // because verifier and MTP have different base
+                    // offsets (verifier starts at prompt_len, MTP at 0).
+                    let valid_count = (accepted as u32) + 1;
+                    self.kv_cache.truncate_full_attn_to(
+                        prior_full_attn_len + valid_count,
+                    );
+                    self.kv_cache.truncate_mtp_to(
+                        prior_mtp_len + valid_count,
+                    );
                 }
 
                 // State update for next iter.
@@ -429,12 +478,12 @@ impl<'a> SpecDecode<'a> {
                     )
                 })?;
                 logits_t = next_iter_logits;
-                // For partial-reject we emitted the corrected token, so
-                // pre-emit so next iter doesn't re-push it. For full-accept
-                // we did NOT emit a bonus (deferred to next iter to keep
-                // MTP/verifier slots aligned), so next iter should naturally
-                // push its computed token_next from logits_t.
-                preemitted_argmax = emitted_corrected;
+                // Both full-accept (bonus emitted) and partial-reject
+                // (corrected emitted) paths just pushed a token at the
+                // tail. Next iter computes `token_next = argmax(logits_t)`
+                // which yields the SAME token; mark preemitted so it
+                // doesn't get pushed twice.
+                preemitted_argmax = true;
 
                 if mtp_profile {
                     let iter_ms = iter_t0
