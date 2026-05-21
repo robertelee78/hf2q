@@ -663,13 +663,26 @@ pub fn build_metadata(
         .get("num_global_key_value_heads")
         .and_then(|v| v.as_u64())
         .map(|x| x as u32);
+    // Canonical emits the per-layer array as INT32 (signed) not
+    // UINT32 — verified against canonical Q4_K_M dump where
+    // `gemma4.attention.head_count_kv = [INT32]`. The Python
+    // `add_head_count_kv` overload with a list calls
+    // `add_array(..., GGUFValueType.INT32, ...)` for the array form
+    // even though the scalar form uses UINT32. Mirror exactly for
+    // byte-cmp parity.
     let head_count_kv_kv: MetaValue = if let Some(num_global_kv) = num_global_kv {
         if num_global_kv != n_head_kv {
-            let arr: Vec<u32> = sliding_window_pattern
+            let arr: Vec<i32> = sliding_window_pattern
                 .iter()
-                .map(|&is_swa| if is_swa { n_head_kv } else { num_global_kv })
+                .map(|&is_swa| {
+                    if is_swa {
+                        n_head_kv as i32
+                    } else {
+                        num_global_kv as i32
+                    }
+                })
                 .collect();
-            MetaValue::ArrayU32(arr)
+            MetaValue::ArrayI32(arr)
         } else {
             MetaValue::U32(n_head_kv)
         }
@@ -1492,12 +1505,13 @@ mod tests {
             "rope.dimension_count_swa = int(head_dim * partial_rotary_factor=1.0)"
         );
 
-        // head_count_kv: array-of-u32 because num_global_key_value_heads=2 ≠
+        // head_count_kv: array-of-i32 because num_global_key_value_heads=2 ≠
         // num_key_value_heads=8. Entries: 2 for global (full_attention)
-        // layers, 8 for swa layers.
+        // layers, 8 for swa layers. INT32 per canonical's
+        // `add_head_count_kv(list)` emit type.
         let hck = match &by_key["gemma4.attention.head_count_kv"] {
-            MetaValue::ArrayU32(v) => v.clone(),
-            other => panic!("expected ArrayU32 for head_count_kv (global=2 ≠ swa=8), got {other:?}"),
+            MetaValue::ArrayI32(v) => v.clone(),
+            other => panic!("expected ArrayI32 for head_count_kv (global=2 ≠ swa=8), got {other:?}"),
         };
         assert_eq!(hck.len(), 30, "head_count_kv array length = block_count");
         for (i, &hck_i) in hck.iter().enumerate() {
@@ -1843,9 +1857,11 @@ mod tests {
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         // swa layers (0,1) → num_key_value_heads=4
         // full layers (2,3) → num_global_key_value_heads=2
+        // ArrayI32 per canonical's `add_head_count_kv(list)` emit type
+        // (verified against canonical Gemma 4 GGUF dump).
         assert_eq!(
             by_key["gemma4.attention.head_count_kv"],
-            MetaValue::ArrayU32(vec![4, 4, 2, 2]),
+            MetaValue::ArrayI32(vec![4, 4, 2, 2]),
         );
     }
 

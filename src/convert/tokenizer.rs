@@ -590,9 +590,85 @@ pub fn build_tokenizer_metadata(
             "tokenizer.ggml.add_sep_token".into(),
             MetaValue::Bool(true),
         ));
+    } else if arch == ArchName::Gemma4 {
+        // Gemma 4 canonical tokenizer order (verified against
+        // `/opt/llama.cpp/conversion/gemma.py::Gemma4Model::set_vocab`
+        // at lines 645-653 + dump positions 36-48):
+        //   model, tokens, scores, token_type, merges, bos, eos, unk,
+        //   pad, mask, chat_template, add_space_prefix, add_bos_token.
+        // No `tokenizer.ggml.pre` — Gemma 4 doesn't call
+        // `add_tokenizer_pre`.
+        kv.push((
+            "tokenizer.ggml.model".into(),
+            MetaValue::String(tokenizer_model_name),
+        ));
+        kv.push((
+            "tokenizer.ggml.tokens".into(),
+            MetaValue::ArrayString(tokens),
+        ));
+        kv.push((
+            "tokenizer.ggml.scores".into(),
+            MetaValue::ArrayF32(scores),
+        ));
+        kv.push((
+            "tokenizer.ggml.token_type".into(),
+            MetaValue::ArrayI32(token_types),
+        ));
+        if !merges.is_empty() {
+            kv.push((
+                "tokenizer.ggml.merges".into(),
+                MetaValue::ArrayString(merges),
+            ));
+        }
+        if let Some(id) = bos_id {
+            kv.push(("tokenizer.ggml.bos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = eos_id {
+            kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = unk_id {
+            kv.push((
+                "tokenizer.ggml.unknown_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        if let Some(id) = pad_id {
+            kv.push((
+                "tokenizer.ggml.padding_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        if let Some(id) = mask_id {
+            kv.push((
+                "tokenizer.ggml.mask_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        // Chat template inserted INLINE here (between mask and
+        // add_space_prefix) per canonical Gemma 4 dump position 46.
+        // This is a deliberate per-arch ordering — the generic
+        // chat-template emit at the END of this function is skipped
+        // for Gemma 4 (gated on `chat_template_emitted_inline` below).
+        let gemma_chat = resolve_gemma_chat_template(model_dir, &tokenizer_config, arch);
+        if let Some(tmpl) = &gemma_chat {
+            kv.push((
+                "tokenizer.chat_template".into(),
+                MetaValue::String(tmpl.clone()),
+            ));
+        }
+        kv.push((
+            "tokenizer.ggml.add_space_prefix".into(),
+            MetaValue::Bool(false),
+        ));
+        kv.push((
+            "tokenizer.ggml.add_bos_token".into(),
+            MetaValue::Bool(true),
+        ));
     } else {
         // BPE / WordPiece order — historical hf2q emit sequence,
-        // preserved for byte-cmp parity on Gemma 4 / Llama 3 / BERT bge.
+        // preserved for byte-cmp parity on Llama 3 / BERT bge / Qwen.
+        // Per-arch refinements pending (e.g. mask_token_id, exact
+        // ordering) — see ADR-033 §10 action plan.
         kv.push((
             "tokenizer.ggml.model".into(),
             MetaValue::String(tokenizer_model_name),
@@ -654,25 +730,19 @@ pub fn build_tokenizer_metadata(
     //   3. arch-default from `chat_templates::arch_default_chat_template`
     //   4. graceful skip — the runtime falls back to its built-in
     //      template loader.
-    let chat_template_path = model_dir.join("chat_template.jinja");
-    let template: Option<String> = if chat_template_path.exists() {
-        std::fs::read_to_string(&chat_template_path).ok()
-    } else if let Some(s) = tokenizer_config
-        .as_ref()
-        .and_then(|c| c.get("chat_template"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-    {
-        Some(s)
-    } else {
-        crate::core::chat_templates::arch_default_chat_template(arch.name())
-            .map(|s| s.to_string())
-    };
-    if let Some(tmpl) = template {
-        kv.push((
-            "tokenizer.chat_template".into(),
-            MetaValue::String(tmpl),
-        ));
+    //
+    // Skipped for Gemma 4 — the Gemma branch above emits
+    // `tokenizer.chat_template` INLINE between mask_token_id and
+    // add_space_prefix per canonical's dump position. Other arches
+    // continue to use the end-of-block position for backward compat.
+    if arch != ArchName::Gemma4 {
+        let template = resolve_gemma_chat_template(model_dir, &tokenizer_config, arch);
+        if let Some(tmpl) = template {
+            kv.push((
+                "tokenizer.chat_template".into(),
+                MetaValue::String(tmpl),
+            ));
+        }
     }
 
     Ok(kv)
@@ -681,6 +751,32 @@ pub fn build_tokenizer_metadata(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve the chat template via the canonical priority chain:
+///   1. `chat_template.jinja` sidecar file
+///   2. `tokenizer_config.json[chat_template]`
+///   3. arch-default from `chat_templates::arch_default_chat_template`
+///   4. `None` (graceful skip — runtime loader falls back)
+fn resolve_gemma_chat_template(
+    model_dir: &Path,
+    tokenizer_config: &Option<serde_json::Value>,
+    arch: ArchName,
+) -> Option<String> {
+    let chat_template_path = model_dir.join("chat_template.jinja");
+    if chat_template_path.exists() {
+        return std::fs::read_to_string(&chat_template_path).ok();
+    }
+    if let Some(s) = tokenizer_config
+        .as_ref()
+        .and_then(|c| c.get("chat_template"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    {
+        return Some(s);
+    }
+    crate::core::chat_templates::arch_default_chat_template(arch.name())
+        .map(|s| s.to_string())
+}
 
 /// Read `type_vocab_size` from `config.json`. Defaults to 1 if absent
 /// (matches canonical `bert.py:233` —
@@ -990,6 +1086,9 @@ mod tests {
             .expect("must succeed for a well-formed Gemma 4 fixture");
 
         // The set of keys is fixed — quickly assert it without ordering.
+        // NOTE: Gemma 4 canonical does NOT emit `tokenizer.ggml.pre`
+        // (gemma.py:645 calls only `add_tokenizer_model`, never
+        // `add_tokenizer_pre`). Our Gemma 4 branch mirrors this.
         let keys: HashSet<&str> = kv.iter().map(|(k, _)| k.as_str()).collect();
         for required in [
             "tokenizer.ggml.model",
@@ -1003,17 +1102,17 @@ mod tests {
             "tokenizer.ggml.padding_token_id",
             "tokenizer.ggml.add_bos_token",
             "tokenizer.ggml.add_space_prefix",
-            "tokenizer.ggml.pre",
         ] {
             assert!(keys.contains(required), "missing key {required}");
         }
+        assert!(
+            !keys.contains("tokenizer.ggml.pre"),
+            "Gemma 4 canonical does NOT emit tokenizer.ggml.pre"
+        );
 
         // Per-value sanity (gemma.py:649 contract).
         let model_name = lookup_str(&kv, "tokenizer.ggml.model");
         assert_eq!(model_name, "gemma4");
-
-        let pre = lookup_str(&kv, "tokenizer.ggml.pre");
-        assert_eq!(pre, "gemma4");
 
         let bos = lookup_u32(&kv, "tokenizer.ggml.bos_token_id");
         assert_eq!(bos, bos_id);
