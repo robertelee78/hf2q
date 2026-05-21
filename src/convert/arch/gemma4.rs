@@ -611,98 +611,36 @@ pub fn build_metadata(
         model_card,
         sampling,
     );
-    kv.reserve(40);
-    kv.extend([
-        ("gemma4.context_length".into(), MetaValue::U32(ctx_len)),
-        (
-            "gemma4.embedding_length".into(),
-            MetaValue::U32(hidden_size),
-        ),
-        ("gemma4.block_count".into(), MetaValue::U32(n_layers)),
-        (
-            "gemma4.attention.head_count".into(),
-            MetaValue::U32(n_head),
-        ),
-        (
-            "gemma4.attention.key_length".into(),
-            MetaValue::U32(global_head_dim),
-        ),
-        (
-            "gemma4.attention.value_length".into(),
-            MetaValue::U32(global_head_dim),
-        ),
-        (
-            "gemma4.attention.key_length_swa".into(),
-            MetaValue::U32(head_dim),
-        ),
-        (
-            "gemma4.attention.value_length_swa".into(),
-            MetaValue::U32(head_dim),
-        ),
-        (
-            "gemma4.attention.layer_norm_rms_epsilon".into(),
-            MetaValue::F32(rms_eps),
-        ),
-        ("gemma4.rope.freq_base".into(), MetaValue::F32(rope_theta)),
-        (
-            "gemma4.attention.sliding_window".into(),
-            MetaValue::U32(sliding_window),
-        ),
-        // ---- Gemma 4-specific KV (gemma.py:659-700) -----------------------
-        //
-        // `shared_kv_layers` count — runtime needs this to know how many
-        // tail layers reuse the prior layer's K/V cache. Per
-        // `gemma.py:660` + `llama-arch.cpp:245` canonical key
-        // `%s.attention.shared_kv_layers`.
-        (
-            "gemma4.attention.shared_kv_layers".into(),
-            MetaValue::U32(num_kv_shared_layers),
-        ),
-        // Per-layer extra-embedding width. `gemma.py:663` gates this on
-        // `hparams.get(...) or 0` — present even when zero (`gemma4` real
-        // checkpoint has `hidden_size_per_layer_input: 0`). Canonical key
-        // `%s.embedding_length_per_layer_input` per `llama-arch.cpp:170`.
-        (
-            "gemma4.embedding_length_per_layer_input".into(),
-            MetaValue::U32(hidden_size_per_layer_input),
-        ),
-        // Per-layer SWA mask as array-of-bool. `gemma.py:665-666` —
-        // `[t == "sliding_attention" for t in self.hparams["layer_types"]]`.
-        // Canonical key `%s.attention.sliding_window_pattern` per
-        // `llama-arch.cpp:232`. Array length = `n_layers`.
-        (
-            "gemma4.attention.sliding_window_pattern".into(),
-            MetaValue::ArrayBool(sliding_window_pattern.clone()),
-        ),
-        // RoPE dimension count for global-attention layers
-        // (`gemma.py:697,699` — `int(head_dim_full)` since the
-        // proportional-rope unrotated dims are masked via the synthesized
-        // `rope_freqs.weight` tensor, not by reducing the dim).
-        // Canonical key `%s.rope.dimension_count`.
-        (
-            "gemma4.rope.dimension_count".into(),
-            MetaValue::U32(n_rot_full),
-        ),
-        // RoPE dimension count for sliding-window layers
-        // (`gemma.py:696,698,700` — `int(head_dim_swa * partial_rotary_factor_swa)`).
-        // Canonical key `%s.rope.dimension_count_swa` per
-        // `llama-arch.cpp:248`.
-        (
-            "gemma4.rope.dimension_count_swa".into(),
-            MetaValue::U32(n_rot_swa),
-        ),
-    ]);
-
-    // ---- feed_forward_length — scalar vs array (gemma.py:680-684) --------
+    // Canonical Gemma 4 arch-KV emit order (verified against
+    // `/opt/hf2q/cache/byte_cmp/google-gemma-4-26b-a4b-it_canonical_q4_k_m.gguf`
+    // dump, positions 13-35):
     //
-    // When `use_double_wide_mlp` is `true` (Gemma 4-specific dwm tier),
-    // the last `num_kv_shared_layers` block entries are 2*n_ff and the
-    // rest are n_ff. Default `false` emits the canonical scalar.
+    //   block_count, context_length, embedding_length,
+    //   feed_forward_length, attention.head_count,
+    //   attention.head_count_kv, rope.freq_base, rope.freq_base_swa,
+    //   attention.layer_norm_rms_epsilon, expert_count,
+    //   expert_used_count, attention.key_length,
+    //   attention.value_length, final_logit_softcapping,
+    //   attention.sliding_window, attention.shared_kv_layers,
+    //   embedding_length_per_layer_input,
+    //   attention.sliding_window_pattern, attention.key_length_swa,
+    //   attention.value_length_swa, expert_feed_forward_length,
+    //   rope.dimension_count, rope.dimension_count_swa
+    //
+    // The order mirrors Python dict insertion semantics across
+    // `base.py::TextModel.set_gguf_parameters` →
+    // `gemma.py::Gemma3Model.set_gguf_parameters` →
+    // `gemma.py::Gemma4Model.set_gguf_parameters` (each `add_*` call
+    // inserts on first write, updates value on subsequent writes
+    // without changing position).
+
+    // Pre-compute the conditional `feed_forward_length` value (scalar
+    // vs array depending on `use_double_wide_mlp`).
     let use_double_wide_mlp = config
         .get("use_double_wide_mlp")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if use_double_wide_mlp {
+    let feed_forward_length_kv: MetaValue = if use_double_wide_mlp {
         let first_kv_shared_layer_idx = n_layers.saturating_sub(num_kv_shared_layers);
         let n_ff_arr: Vec<u32> = (0..n_layers)
             .map(|il| {
@@ -713,57 +651,71 @@ pub fn build_metadata(
                 }
             })
             .collect();
-        kv.push((
-            "gemma4.feed_forward_length".into(),
-            MetaValue::ArrayU32(n_ff_arr),
-        ));
+        MetaValue::ArrayU32(n_ff_arr)
     } else {
-        kv.push((
-            "gemma4.feed_forward_length".into(),
-            MetaValue::U32(ffn_len),
-        ));
-    }
+        MetaValue::U32(ffn_len)
+    };
 
-    // ---- head_count_kv — scalar vs array (gemma.py:687-691) --------------
-    //
-    // Per-layer KV head count differs between global and sliding-window
-    // layers when `num_global_key_value_heads` is present AND differs from
-    // `num_key_value_heads`. Array entries are
-    // `num_key_value_heads if is_swa else num_global_key_value_heads`.
+    // Pre-compute the conditional `attention.head_count_kv` value
+    // (scalar vs per-layer array depending on
+    // `num_global_key_value_heads` presence + value).
     let num_global_kv = config
         .get("num_global_key_value_heads")
         .and_then(|v| v.as_u64())
         .map(|x| x as u32);
-    if let Some(num_global_kv) = num_global_kv {
+    let head_count_kv_kv: MetaValue = if let Some(num_global_kv) = num_global_kv {
         if num_global_kv != n_head_kv {
-            let head_count_kv_arr: Vec<u32> = sliding_window_pattern
+            let arr: Vec<u32> = sliding_window_pattern
                 .iter()
                 .map(|&is_swa| if is_swa { n_head_kv } else { num_global_kv })
                 .collect();
-            kv.push((
-                "gemma4.attention.head_count_kv".into(),
-                MetaValue::ArrayU32(head_count_kv_arr),
-            ));
+            MetaValue::ArrayU32(arr)
         } else {
-            // Present but equal — scalar form is byte-equivalent.
-            kv.push((
-                "gemma4.attention.head_count_kv".into(),
-                MetaValue::U32(n_head_kv),
-            ));
+            MetaValue::U32(n_head_kv)
         }
     } else {
+        MetaValue::U32(n_head_kv)
+    };
+
+    // Position 13: block_count (FIRST add in canonical base.py:1112).
+    kv.push(("gemma4.block_count".into(), MetaValue::U32(n_layers)));
+    // Positions 14-17: context_length, embedding_length,
+    // feed_forward_length, attention.head_count (base.py:1114-1128).
+    kv.push(("gemma4.context_length".into(), MetaValue::U32(ctx_len)));
+    kv.push((
+        "gemma4.embedding_length".into(),
+        MetaValue::U32(hidden_size),
+    ));
+    kv.push(("gemma4.feed_forward_length".into(), feed_forward_length_kv));
+    kv.push((
+        "gemma4.attention.head_count".into(),
+        MetaValue::U32(n_head),
+    ));
+    // Position 18: attention.head_count_kv (base.py:1130 — scalar;
+    // Gemma4Model overwrites with array via dict-update at gemma.py:693).
+    kv.push(("gemma4.attention.head_count_kv".into(), head_count_kv_kv));
+    // Positions 19-20: rope.freq_base, rope.freq_base_swa
+    // (base.py:1182-1186).
+    kv.push(("gemma4.rope.freq_base".into(), MetaValue::F32(rope_theta)));
+    if let Some(swa_theta) = config
+        .get("rope_parameters")
+        .and_then(|v| v.get("sliding_attention"))
+        .and_then(|v| v.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+    {
         kv.push((
-            "gemma4.attention.head_count_kv".into(),
-            MetaValue::U32(n_head_kv),
+            "gemma4.rope.freq_base_swa".into(),
+            MetaValue::F32(swa_theta as f32),
         ));
     }
 
-    // ---- MoE-only KV (skipped on dense Gemma 4 forks) --------------------
-    //
-    // `num_experts` is the canonical Gemma 4 HF key (NOT `num_local_experts`
-    // — that's Qwen / Mixtral). `top_k_experts` is the per-token activated
-    // count (Gemma 4-specific name; llama.cpp normalizes to `expert_used_count`
-    // metadata regardless of HF key).
+    // Position 21: attention.layer_norm_rms_epsilon (base.py:1189).
+    kv.push((
+        "gemma4.attention.layer_norm_rms_epsilon".into(),
+        MetaValue::F32(rms_eps),
+    ));
+    // Positions 22-23: expert_count, expert_used_count
+    // (base.py:1194-1199 — only emitted when present in hparams).
     if let Some(n_experts) = config.get("num_experts").and_then(|v| v.as_u64()) {
         kv.push((
             "gemma4.expert_count".into(),
@@ -780,6 +732,61 @@ pub fn build_metadata(
             MetaValue::U32(top_k as u32),
         ));
     }
+    // Positions 24-25: attention.key_length, attention.value_length
+    // (base.py:1217-1218 — initial scalar; then Gemma4Model overwrites
+    // with global_head_dim at gemma.py:671-672 — same dict position).
+    kv.push((
+        "gemma4.attention.key_length".into(),
+        MetaValue::U32(global_head_dim),
+    ));
+    kv.push((
+        "gemma4.attention.value_length".into(),
+        MetaValue::U32(global_head_dim),
+    ));
+    // Position 26: final_logit_softcapping (gemma.py:95-97 — Gemma3+ only).
+    if let Some(softcap) = config
+        .get("final_logit_softcapping")
+        .and_then(|v| v.as_f64())
+    {
+        kv.push((
+            "gemma4.final_logit_softcapping".into(),
+            MetaValue::F32(softcap as f32),
+        ));
+    }
+    // Position 27: attention.sliding_window (gemma.py:98).
+    kv.push((
+        "gemma4.attention.sliding_window".into(),
+        MetaValue::U32(sliding_window),
+    ));
+    // Position 28: attention.shared_kv_layers (Gemma4Model first-write,
+    // gemma.py:659).
+    kv.push((
+        "gemma4.attention.shared_kv_layers".into(),
+        MetaValue::U32(num_kv_shared_layers),
+    ));
+    // Position 29: embedding_length_per_layer_input (gemma.py:663).
+    kv.push((
+        "gemma4.embedding_length_per_layer_input".into(),
+        MetaValue::U32(hidden_size_per_layer_input),
+    ));
+    // Position 30: attention.sliding_window_pattern (gemma.py:666).
+    kv.push((
+        "gemma4.attention.sliding_window_pattern".into(),
+        MetaValue::ArrayBool(sliding_window_pattern.clone()),
+    ));
+    // Positions 31-32: attention.key_length_swa, attention.value_length_swa
+    // (gemma.py:673-674 — first-write Gemma4Model after the scalar
+    // key_length/value_length updates).
+    kv.push((
+        "gemma4.attention.key_length_swa".into(),
+        MetaValue::U32(head_dim),
+    ));
+    kv.push((
+        "gemma4.attention.value_length_swa".into(),
+        MetaValue::U32(head_dim),
+    ));
+    // Position 33: expert_feed_forward_length (gemma.py:677-678 — only
+    // when `expert_intermediate_size` / `moe_intermediate_size` is set).
     if let Some(moe_ffn) = config
         .get("moe_intermediate_size")
         .or_else(|| config.get("expert_intermediate_size"))
@@ -790,37 +797,16 @@ pub fn build_metadata(
             MetaValue::U32(moe_ffn as u32),
         ));
     }
-
-    // `final_logit_softcapping` — Gemma 3+ specific. Canonical
-    // `gemma.py:147-148` emits when present in hparams.
-    if let Some(softcap) = config
-        .get("final_logit_softcapping")
-        .and_then(|v| v.as_f64())
-    {
-        kv.push((
-            "gemma4.final_logit_softcapping".into(),
-            MetaValue::F32(softcap as f32),
-        ));
-    }
-
-    // `rope.freq_base_swa` — sliding-window RoPE theta. Canonical
-    // `base.py:1185-1187` emits via
-    // `rope_parameters["sliding_attention"]["rope_theta"]`. For
-    // Gemma 4 the SWA layers use a separate (smaller) theta than
-    // the global layers; verified against canonical dump where
-    // `rope.freq_base = 1000000` (global) and
-    // `rope.freq_base_swa = 10000` (SWA).
-    if let Some(swa_theta) = config
-        .get("rope_parameters")
-        .and_then(|v| v.get("sliding_attention"))
-        .and_then(|v| v.get("rope_theta"))
-        .and_then(|v| v.as_f64())
-    {
-        kv.push((
-            "gemma4.rope.freq_base_swa".into(),
-            MetaValue::F32(swa_theta as f32),
-        ));
-    }
+    // Positions 34-35: rope.dimension_count, rope.dimension_count_swa
+    // (gemma.py:699-700).
+    kv.push((
+        "gemma4.rope.dimension_count".into(),
+        MetaValue::U32(n_rot_full),
+    ));
+    kv.push((
+        "gemma4.rope.dimension_count_swa".into(),
+        MetaValue::U32(n_rot_swa),
+    ));
 
     // Canonical emits `general.quantization_version` + `general.file_type`
     // LAST (positions 49-50 in the Q4_K_M dump). `cli_driver` pulls
