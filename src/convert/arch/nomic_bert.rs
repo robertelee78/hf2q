@@ -561,6 +561,17 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
                 format!("{arch_name}.expert_used_count"),
                 MetaValue::U32(moe_top_k),
             ),
+            // Canonical emits these last (positions 50-51 in the
+            // Q8_0 GGUF dump): `general.quantization_version=2` is
+            // added by `llama-quantize` (matches GGUF spec), and
+            // `general.file_type` is added by the convert step's
+            // `add_file_type(ftype)` at `base.py:1220`. We emit both
+            // here since hf2q's convert+quantize is a single pipeline.
+            (
+                "general.quantization_version".into(),
+                MetaValue::U32(2),
+            ),
+            ("general.file_type".into(), MetaValue::U32(file_type)),
         ]
     } else {
         // v1.5 path (unchanged): preserve historical key set + order
@@ -1078,6 +1089,14 @@ mod tests {
             !by_key.contains_key("nomic-bert.context_length"),
             "v2-moe must NOT emit nomic-bert.* prefix"
         );
+        // general.quantization_version + file_type are emitted at the
+        // end of the v2-moe metadata block — canonical's
+        // llama-quantize step writes them at GGUF positions 50-51.
+        assert_eq!(
+            by_key["general.quantization_version"],
+            MetaValue::U32(2)
+        );
+        assert_eq!(by_key["general.file_type"], MetaValue::U32(17));
     }
 
     /// Sibling — verify the BERT-style key fallback (`hidden_size`,

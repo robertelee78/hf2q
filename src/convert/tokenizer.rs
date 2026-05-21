@@ -377,6 +377,8 @@ pub fn build_tokenizer_metadata(
     let eos_id = resolve_special_token_id("eos_token", &tokenizer_config, &vocab_entries);
     let unk_id = resolve_special_token_id("unk_token", &tokenizer_config, &vocab_entries);
     let pad_id = resolve_special_token_id("pad_token", &tokenizer_config, &vocab_entries);
+    let sep_id = resolve_special_token_id("sep_token", &tokenizer_config, &vocab_entries);
+    let mask_id = resolve_special_token_id("mask_token", &tokenizer_config, &vocab_entries);
 
     // For Unigram-tokenizer models (XLM-RoBERTa, sentencepiece-derived),
     // canonical reads per-token scores from `sentencepiece.bpe.model`
@@ -506,21 +508,91 @@ pub fn build_tokenizer_metadata(
             MetaValue::U32(id),
         ));
     }
-    // gemma.py:652-653: add_bos_token=True + add_space_prefix=False.
-    // The legacy emitter applied these unconditionally; we preserve
-    // that surface — every arch convert-v2 supports today wants both.
+    // SEP / MASK token ids — emitted by canonical `SpecialVocab.add_to_gguf`
+    // when those entries are present in `special_tokens_map.json` /
+    // `tokenizer_config.json`. Note: canonical writes the field as
+    // `seperator_token_id` (sic — `bert.py` typo upstream); we mirror
+    // exactly for byte-cmp parity. Mask token is only emitted on
+    // models that carry one (XLM-RoBERTa-family / sentencepiece).
+    if let Some(id) = sep_id {
+        kv.push((
+            "tokenizer.ggml.seperator_token_id".into(),
+            MetaValue::U32(id),
+        ));
+    }
+    if let Some(id) = mask_id {
+        kv.push((
+            "tokenizer.ggml.mask_token_id".into(),
+            MetaValue::U32(id),
+        ));
+    }
+    // gemma.py:652-653: add_bos_token=True + add_space_prefix=False
+    // for BPE/WordPiece. For Unigram (XLM-RoBERTa-style — nomic v2-moe,
+    // sentencepiece), `add_space_prefix` is True (sentencepiece's
+    // `normalizer_spec.add_dummy_prefix=True` per `bert.py:152`).
     kv.push((
         "tokenizer.ggml.add_bos_token".into(),
         MetaValue::Bool(true),
     ));
+    let add_space_prefix = model_type == "Unigram";
     kv.push((
         "tokenizer.ggml.add_space_prefix".into(),
-        MetaValue::Bool(false),
+        MetaValue::Bool(add_space_prefix),
     ));
     kv.push((
         "tokenizer.ggml.pre".into(),
         MetaValue::String(pre_tokenizer),
     ));
+
+    // ----- Unigram-specific tokenizer metadata (XLM-RoBERTa parity) ----
+    //
+    // Canonical `_xlmroberta_set_vocab` at `bert.py:227-236` emits four
+    // additional KV pairs on the Unigram path:
+    //   - `tokenizer.ggml.token_type_count` ← `hparams.type_vocab_size`
+    //     (default 1)
+    //   - `tokenizer.ggml.remove_extra_whitespaces` ←
+    //     `sentencepiece_model.normalizer_spec.remove_extra_whitespaces`
+    //     (always True for the `nmt_nfkc` normalizer that XLM-RoBERTa
+    //     uses; canonical's tokenizer.json fallback uses
+    //     `tokenizer.clean_up_tokenization_spaces` which is also True
+    //     for the same model class).
+    //   - `tokenizer.ggml.precompiled_charsmap` ←
+    //     `sentencepiece_model.normalizer_spec.precompiled_charsmap`
+    //     bytes (237 KB for XLM-RoBERTa-base; verified byte-identical
+    //     to tokenizer.json's base64-decoded
+    //     `normalizer.precompiled_charsmap`). This is the bulk of the
+    //     tokenizer metadata payload — closing the byte-cmp gap to
+    //     canonical Q8_0 GGUF.
+    if model_type == "Unigram" {
+        let type_vocab_size = read_type_vocab_size_from_config(model_dir).unwrap_or(1);
+        kv.push((
+            "tokenizer.ggml.token_type_count".into(),
+            MetaValue::U32(type_vocab_size),
+        ));
+        kv.push((
+            "tokenizer.ggml.remove_extra_whitespaces".into(),
+            MetaValue::Bool(true),
+        ));
+        if let Some(cm_bytes) = extract_precompiled_charsmap(&tokenizer_json) {
+            kv.push((
+                "tokenizer.ggml.precompiled_charsmap".into(),
+                MetaValue::ArrayU8(cm_bytes),
+            ));
+        }
+        // Canonical `SpecialVocab` adds `add_eos_token=true` and
+        // `add_sep_token=true` for XLM-RoBERTa-family models (see
+        // dump: indices 48-49 in the canonical Q8_0 nomic v2-moe
+        // GGUF). These are gated on `model_type == "Unigram"` because
+        // BPE/WordPiece checkpoints don't carry the sep_token at all.
+        kv.push((
+            "tokenizer.ggml.add_eos_token".into(),
+            MetaValue::Bool(true),
+        ));
+        kv.push((
+            "tokenizer.ggml.add_sep_token".into(),
+            MetaValue::Bool(true),
+        ));
+    }
 
     // ----- 12. Chat template (when available) -------------------------
     // Priority chain (ADR-012 chat-template-auto-inject 2026-04-30):
@@ -556,6 +628,37 @@ pub fn build_tokenizer_metadata(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Read `type_vocab_size` from `config.json`. Defaults to 1 if absent
+/// (matches canonical `bert.py:233` —
+/// `self.hparams.get("type_vocab_size", 1)`).
+fn read_type_vocab_size_from_config(dir: &Path) -> Option<u32> {
+    let path = dir.join("config.json");
+    let s = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    v.get("type_vocab_size")
+        .or_else(|| v.get("text_config").and_then(|tc| tc.get("type_vocab_size")))
+        .and_then(|x| x.as_u64())
+        .map(|n| n as u32)
+}
+
+/// Decode `tokenizer.json`'s `normalizer.precompiled_charsmap` field
+/// (base64-encoded) into the raw byte array that GGUF expects.
+///
+/// Mirrors canonical `bert.py:144` —
+/// `precompiled_charsmap = b64decode(tokenizer_json["normalizer"]["precompiled_charsmap"])`
+/// in the tokenizer.json fallback path; the sentencepiece-direct path
+/// at `bert.py:154` reads
+/// `sentencepiece_model.normalizer_spec.precompiled_charsmap` and the
+/// two are byte-identical (verified for nomic v2-moe).
+fn extract_precompiled_charsmap(tokenizer_json: &serde_json::Value) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let b64 = tokenizer_json
+        .get("normalizer")?
+        .get("precompiled_charsmap")?
+        .as_str()?;
+    base64::engine::general_purpose::STANDARD.decode(b64).ok()
+}
 
 /// Read the model's full `vocab_size` from `config.json`, preferring
 /// `text_config.vocab_size` (Gemma 4 / Qwen3-VL multimodal-wrapper
