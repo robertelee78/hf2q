@@ -2035,12 +2035,16 @@ fn build_convert_plan(
     //
     // hf2q's convert+quantize is a single pipeline (no separate
     // llama-quantize step), so we apply the same sort here before
-    // emitting plan steps. Only enabled for `ArchName::NomicBert` for
-    // now — other arches' byte-cmp gates passed under the existing
-    // source-order behavior and reordering would risk regressing them.
-    if matches!(arch, ArchName::NomicBert) {
-        steps.sort_by(|a, b| canonical_tensor_name_cmp(a.plan_entry().name.as_str(), b.plan_entry().name.as_str()));
-    }
+    // emitting plan steps. Applied to ALL arches as of 2026-05-20
+    // evening — the earlier per-arch gating was based on stale
+    // byte-cmp claims (ADR-033 §10 re-validation note at commit
+    // bbc9ab8e). Canonical sorts every model the same way; we mirror.
+    steps.sort_by(|a, b| {
+        canonical_tensor_name_cmp(
+            a.plan_entry().name.as_str(),
+            b.plan_entry().name.as_str(),
+        )
+    });
     Ok(ConvertPlan { steps })
 }
 
