@@ -31,13 +31,15 @@
 
 **Smoke test (#58) PASSED**: hf2q-converted Llama 3 8B Q4_K_M loads + generates tokens in stock `/opt/llama.cpp/build/bin/llama-cli` (verified at HEAD `4a5784ce` and Qwen 3.5 35B at 113 t/s decode per project memory).
 
-**Perf benchmark 2026-05-21 at HEAD `ac00b224`, M5 Max — three-model FRESH consistent-methodology scaling study:**
+**Perf benchmark 2026-05-21 at HEAD `fbaf002f` (POST `read_floats_to_f32` parallelization), M5 Max — three-model FRESH consistent-methodology scaling study:**
 
-| Model | Arch | hf2q wall | canonical Step 1 (BF16→F16) | canonical Step 2 (F16→Q4_K_M) | canonical TOTAL | Ratio | Output SHA256 (both pipelines match) |
+| Model | Arch | hf2q wall (post-opt) | canonical Step 1 | canonical Step 2 | canonical TOTAL | Ratio (post-opt) | Output SHA256 (byte-identical) |
 |---|---|---:|---:|---:|---:|---:|---|
-| Llama 3 8B | dense | **34.6s** | 9.6s | 34.8s | 44.4s | **hf2q 1.28× faster** | `031317c1…cc0066b3` |
-| Gemma 4 26B-A4B | MoE-128 | **102.74s** | 54.83s | 61.84s | 116.67s | **hf2q 1.14× faster** | `dbd8dfcb…21a4b60fa5` |
-| Qwen 3.5 35B-A3B | MoE-256 + MTP + linear-attn | **183.08s** | 21.72s | 113.22s | 134.94s | **hf2q 1.36× SLOWER** | `1f18aae6…d028b7af3` |
+| Llama 3 8B | dense | **31.04s** | 9.6s | 34.8s | 44.4s | **hf2q 1.43× faster** | `031317c1…cc0066b3` |
+| Gemma 4 26B-A4B | MoE-128 | **86.85s** | 54.83s | 61.84s | 116.67s | **hf2q 1.34× faster** | `dbd8dfcb…21a4b60fa5` |
+| Qwen 3.5 35B-A3B | MoE-256 + MTP + linear-attn | **144.51s** | 21.72s | 113.22s | 134.94s | **hf2q 1.07× canonical** (was 1.36× SLOWER) | `1f18aae6…d028b7af3` |
+
+**Pre-optimization baseline** (HEAD `ac00b224`, pre-`fbaf002f`): Llama 3 34.6s / Gemma 4 102.74s / Qwen 3.5 183.08s. Post-opt: 31.04s / 86.85s / 144.51s = **-10% / -15% / -21% wall reduction**. The win **scales with model size** — bigger models have more BF16→F32 work on the main thread, which is exactly the path that the fix parallelized.
 
 **Pattern revealed (DECREASING-lead → CROSSOVER)**: hf2q's lead **shrinks monotonically** with model size/MoE complexity and **crosses over** around MoE-256 scale. The prior ADR-036 claim of "3.0× faster on Gemma 4 26B" (memory entry from 2026-05-19, [[project_adr033_p1_byte_identical_2026_05_19]]) **does NOT reproduce** at HEAD `ac00b224` with fresh consistent methodology. Possible causes for the stale claim: cold-cache vs warm-cache state, concurrent load during the original bench, or different bench framing (Step 2 alone vs total pipeline). The fresh measurement is the authoritative one.
 
@@ -60,6 +62,14 @@ Gemma 4 26B has 54.83s of canonical Step 1 work (Python doing per-expert `.trans
 3. **H3 — Buffer-reuse for F16 RT** at `orchestrator.rs`: hoist the `Vec::collect()` allocation to a reusable `StreamingWriter` field so the 82 fused-expert tensors don't each pay page-fault-on-write costs. Bench: 190.73s (7.65s WORSE). **FALSIFIED.** The allocation cost was NOT the bottleneck either. Reverted with documenting warning comment.
 
 **Stop-the-bleeding lesson**: Three blind hypothesis tests yielded no perf win. The cumulative variance is ~12s = 6.6% across runs, suggesting the 183.08s baseline may itself be on the favourable side of the noise band — three optimizations measuring as +7s, +11s, +12s could all be within noise. The 1.62×-canonical wall ratio is a real performance characteristic, but **localizing the actual bottleneck needs a real profiler** (cargo-instruments, Apple Xcode Instruments time profile, or dtrace) — not more blind grep-and-rayon-the-loop. Future perf work on Qwen 3.5 should start by capturing a flame graph or per-function CPU sample.
+
+4. **H4 — Profile-driven: parallelize `read_floats_to_f32`** at `src/core/mlx_safetensors_loader.rs:440`. Captured `sample(1)` profile of the running Qwen 3.5 convert (45s sample, PID 80984); top-of-stack analysis revealed `read_floats_to_f32` consumed 1803 main-thread samples (~40% of main-thread wall) — the BF16→F32 safetensors conversion was a serial loop blocking rayon workers downstream. Replaced `.chunks_exact(2).for_each(push)` with `.par_chunks_exact(2).map(...).collect()` for all three branches (BF16/F16/F32). **SHIPPED at `fbaf002f` (2026-05-21)**. Per-element transform → byte-identity preserved by construction. Wall-time impact:
+   - **Qwen 3.5 35B: 183.08s → 144.51s** (-21%)
+   - **Gemma 4 26B: 102.74s → 86.85s** (-15%)
+   - **Llama 3 8B: 34.6s → 31.04s** (-10%)
+   - All three SHA256-byte-identical to canonical. Same user CPU; modest peak-memory rise (+0.5 GB on Qwen 3.5 due to parallel collect intermediates).
+   
+   **Why H4 worked when H1 failed (both are par_iter on F16/BF16 conversion)**: H1 was a *small per-call op* (one F16 RT call per quantized tensor, called many times by rayon-parallel kernels — rayon overhead per call exceeded the gain). H4 is a *huge per-call op* (one BF16→F32 conversion of multi-GB safetensor chunks, called from the main thread — rayon overhead amortized over GB of data; the resulting wall savings unblock the main thread for downstream `stream_tensor` dispatch). **Placement matters.** Without the profiler the read-path serial loop was invisible.
 
 **Real per-model breakdown**:
 - **Llama 3 8B dense**: hf2q wins by 28% — canonical's per-tensor Python overhead dominates on small-tensor-count dense models
