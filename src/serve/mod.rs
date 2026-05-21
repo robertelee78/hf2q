@@ -2894,15 +2894,23 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             let mut decode_tps_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
             let mut generated_per_run: Vec<usize> = Vec::with_capacity(BENCH_NUM_RUNS);
             let mut accept_pct_runs: Vec<f64> = Vec::with_capacity(BENCH_NUM_RUNS);
+            // ADR-034 task #91 (2026-05-21) codex review #2 — benchmark
+            // path was ignoring sampler. Now plumbed through so
+            // `--benchmark --temperature 0.6` exercises MH.
+            let bench_sampler = crate::inference::models::qwen35::spec_decode::SpecSampler::new(
+                args.temperature as f32,
+                0,
+            );
             for run_idx in 0..BENCH_NUM_RUNS {
-                let result = SpecDecode::run_with_eos_set(
+                let result = SpecDecode::run_with_sampler_eos_set(
                     &model,
                     &prompt_tokens,
                     args.max_tokens,
                     eos_token_ids.clone(),
                     max_seq as u32,
+                    bench_sampler,
                 )
-                .context("qwen35 SpecDecode::run_with_eos_set (benchmark)")?;
+                .context("qwen35 SpecDecode::run_with_sampler_eos_set (benchmark)")?;
                 let prefill_tps = if result.stats.prefill_elapsed.as_secs_f64() > 0.0 {
                     prompt_len as f64 / result.stats.prefill_elapsed.as_secs_f64()
                 } else {

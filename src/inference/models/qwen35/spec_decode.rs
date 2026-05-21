@@ -419,6 +419,19 @@ impl<'a> SpecDecode<'a> {
                 .unwrap_or(0);
 
             if spec_k >= 2 {
+                // ADR-034 task #91 (2026-05-21) codex review #3 — the K=N
+                // path still uses greedy argmax accept-prefix. MH stochastic
+                // acceptance is NOT wired into K=N yet (Step 4 of task #91
+                // design). Emit a single-shot warn so operators don't
+                // silently get greedy behavior when they expected MH.
+                if is_mh && self.stats.proposed == 0 {
+                    eprintln!(
+                        "[hf2q WARN] HF2Q_SPEC_DECODE_K={} forces K=N chain which is GREEDY-ONLY at HEAD; \
+                         --temperature {} sampler is ignored on this path. \
+                         Use K=1 BATCHED (unset HF2Q_SPEC_DECODE_K) for MH stochastic acceptance.",
+                        spec_k, self.sampler.temperature,
+                    );
+                }
                 let hidden_size_u32 = self.verifier.cfg.hidden_size;
                 let vsz = vocab as usize;
                 let mtp_t0 = if mtp_profile { Some(Instant::now()) } else { None };
@@ -739,6 +752,21 @@ impl<'a> SpecDecode<'a> {
                     .as_deref() == Ok("1");
 
             if two_calls {
+                // ADR-034 task #91 (2026-05-21) codex review #3 —
+                // K1_TWO_CALLS path is greedy-only; MH would require
+                // sampling decisions between forward A and B which the
+                // current "interleaved accept/reject" doesn't support.
+                // Warn once per generation so operators see when their
+                // sampler is silently ignored.
+                if is_mh && self.stats.accepted == 0 && self.stats.rejected == 0 {
+                    eprintln!(
+                        "[hf2q WARN] HF2Q_SPEC_DECODE_K1_TWO_CALLS=1 forces the K=1 two-call \
+                         interleaved path which is GREEDY-ONLY; --temperature {} sampler is \
+                         ignored on this path. Use HF2Q_SPEC_DECODE_K1=1 (without TWO_CALLS) \
+                         for MH stochastic acceptance.",
+                        self.sampler.temperature,
+                    );
+                }
                 // --- Step A: forward [token_next] at next_pos ---
                 let pos_a = vec![next_pos; 4];
                 let (logits_a, hidden_a) = self
