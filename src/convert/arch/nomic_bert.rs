@@ -95,6 +95,23 @@ pub fn map_tensor_name(hf_name: &str) -> Option<String> {
         "embeddings.word_embeddings.weight" => {
             return Some("token_embd.weight".to_string())
         }
+        // Present in nomic-bert v2-moe (XLM-RoBERTa-style, segment IDs
+        // re-introduced). Maps to BERT-family `token_types.weight`
+        // (`MODEL_TENSOR.TOKEN_TYPES` in GGUF). Canonical handles via
+        // BertModel inheritance at `bert.py:88-90`. NomicBert v1.5
+        // didn't have this tensor — see prior assumption at function
+        // doc-comment.
+        "embeddings.token_type_embeddings.weight" => {
+            return Some("token_types.weight".to_string())
+        }
+        // Present in nomic-bert v2-moe (XLM-RoBERTa LayerNorm at the
+        // embedding output). Maps to `token_embd_norm.{weight,bias}`.
+        "embeddings.LayerNorm.weight" => {
+            return Some("token_embd_norm.weight".to_string())
+        }
+        "embeddings.LayerNorm.bias" => {
+            return Some("token_embd_norm.bias".to_string())
+        }
         "emb_ln.weight" => return Some("token_embd_norm.weight".to_string()),
         "emb_ln.bias" => return Some("token_embd_norm.bias".to_string()),
         _ => {}

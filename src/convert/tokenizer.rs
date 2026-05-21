@@ -200,12 +200,71 @@ pub fn build_tokenizer_metadata(
         .ok_or_else(|| TokenizerError::TokenizerJsonMissingModel {
             dir: model_dir.display().to_string(),
         })?;
-    let vocab_obj = model_section
-        .get("vocab")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| TokenizerError::TokenizerJsonMissingModel {
-            dir: model_dir.display().to_string(),
-        })?;
+
+    // The `model.vocab` shape depends on `model.type`:
+    //   - BPE / WordPiece / etc.:    Object<String, u64>   (token → id)
+    //   - Unigram (XLM-RoBERTa,
+    //              SentencePiece):   Array<[String, f32]>  (index = id)
+    //
+    // The Unigram case (used by nomic-bert-v2-moe and other
+    // sentencepiece-derived models) is handled here so the upstream
+    // tokenizer.json loader doesn't have to special-case it. Scores
+    // are not currently emitted (would land as
+    // `tokenizer.ggml.scores` per canonical bert.py:230) — that's
+    // a follow-up for full XLM-RoBERTa parity.
+    let model_type = model_section
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mut id_to_token: HashMap<u32, String>;
+    let base_vocab_size: usize;
+    let mut token_scores: Vec<f32> = Vec::new(); // only populated for Unigram
+    if model_type == "Unigram" {
+        let vocab_arr = model_section
+            .get("vocab")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| TokenizerError::TokenizerJsonMissingModel {
+                dir: model_dir.display().to_string(),
+            })?;
+        base_vocab_size = vocab_arr.len();
+        id_to_token = HashMap::with_capacity(base_vocab_size + 64);
+        token_scores = Vec::with_capacity(base_vocab_size);
+        for (idx, entry) in vocab_arr.iter().enumerate() {
+            // Each entry is [token, score]
+            let arr = entry
+                .as_array()
+                .ok_or_else(|| TokenizerError::TokenizerJsonMissingModel {
+                    dir: model_dir.display().to_string(),
+                })?;
+            let token = arr
+                .first()
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| TokenizerError::TokenizerJsonMissingModel {
+                    dir: model_dir.display().to_string(),
+                })?;
+            let score = arr
+                .get(1)
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32;
+            id_to_token.insert(idx as u32, token.to_string());
+            token_scores.push(score);
+        }
+    } else {
+        let vocab_obj = model_section
+            .get("vocab")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| TokenizerError::TokenizerJsonMissingModel {
+                dir: model_dir.display().to_string(),
+            })?;
+        base_vocab_size = vocab_obj.len();
+        id_to_token = HashMap::with_capacity(base_vocab_size + 64);
+        for (tok, id_val) in vocab_obj.iter() {
+            if let Some(id) = id_val.as_u64() {
+                id_to_token.insert(id as u32, tok.clone());
+            }
+        }
+    }
+    let _ = token_scores; // TODO: emit as tokenizer.ggml.scores for Unigram path
 
     // ----- 2. Optional tokenizer_config.json (special tokens + flags) ---
     // Missing or malformed is non-fatal — the BOS/EOS lookup just yields
@@ -215,19 +274,6 @@ pub fn build_tokenizer_metadata(
     )
     .ok()
     .and_then(|s| serde_json::from_str(&s).ok());
-
-    // ----- 3. Merge base BPE + added_tokens ---------------------------
-    // Same logic as legacy load_tokenizer_metadata; ports the
-    // 2026-05-02 fix for added_tokens that lie above the base BPE range
-    // (Qwen3.6 ids 248044-248069 for `<|im_end|>` etc.).
-    let base_vocab_size = vocab_obj.len();
-    let mut id_to_token: HashMap<u32, String> =
-        HashMap::with_capacity(base_vocab_size + 64);
-    for (tok, id_val) in vocab_obj.iter() {
-        if let Some(id) = id_val.as_u64() {
-            id_to_token.insert(id as u32, tok.clone());
-        }
-    }
 
     let added_tokens_arr = tokenizer_json
         .get("added_tokens")
