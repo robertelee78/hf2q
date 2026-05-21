@@ -97,8 +97,9 @@ These remaining sub-percent differences are functionally negligible. The convert
 
 The earlier "metadata diff" worry was overblown — once `tokenizer.ggml.model` emitted `"bert"` (not `"llama"`), byte-identity follows for all 5 quants. The Q4_K_S / Q5_K_S / IQ4_NL quants aren't typically shipped for BERT embeddings (omitted from this matrix per practical use).
 
-**AC #2 acceptance matrix coverage** (2026-05-20 evening status — re-validation in progress):
-- **Nomic v2-moe 8/8 ✅ CONFIRMED 2026-05-20 evening** — direct `cmp` exit 0 + SHA256 match for Q4_0/Q4_K_S/Q4_K_M/Q5_K_S/Q5_K_M/Q6_K/Q8_0/IQ4_NL against fresh canonical reference. First fully-verified MoE arch in the matrix.
+**AC #2 acceptance matrix coverage** (2026-05-20 late-evening status):
+- **Nomic v2-moe 8/8 ✅ CONFIRMED 2026-05-20** — direct `cmp` exit 0 + SHA256 match for Q4_0/Q4_K_S/Q4_K_M/Q5_K_S/Q5_K_M/Q6_K/Q8_0/IQ4_NL against fresh canonical reference. First fully-verified MoE arch.
+- **Gemma 4 26B-A4B Q4_K_M ✅ CONFIRMED 2026-05-20 late-evening** — direct `cmp` exit 0 + SHA256 `dbd8dfcb...` match against `/opt/hf2q/cache/byte_cmp/google-gemma-4-26b-a4b-it_canonical_q4_k_m.gguf` (16,796,015,584 bytes). Second fully-verified arch (first dense + sparse-MoE hybrid). Closure path: tensor-sort enabled for all arches (2b44234e) + `emit_general_prelude` helper integration (2fe23b50) + final_logit_softcapping + rope.freq_base_swa (1fb96b29) + arch KV reorder to canonical order (258567fd) + INT32 head_count_kv array type + Gemma-specific tokenizer order (0db120f0). Other Gemma 4 quants (Q4_0/Q4_K_S/Q5_K_S/Q5_K_M/Q6_K/Q8_0/IQ4_NL) validation in flight.
 - **BERT bge: REGRESSED to 0/5 ❌** — direct `cmp` of fresh hf2q output vs fresh canonical shows 213M-243M bytes diff on Q4_K_M/Q5_K_M. Two root causes identified:
   1. Tensor source order from safetensors doesn't match canonical's alphabetical `weight_name_comparer` sort (per `/opt/llama.cpp/src/llama-model-loader.h:53-64`). The `canonical_tensor_name_cmp` sort added in 84033d5a is gated on `ArchName::NomicBert` only — needs to extend to BERT (and likely all arches).
   2. BERT bge tokens missing the `▁` phantom-space prefix that canonical's `BertModel.set_vocab` applies via `phantom()` at `/opt/llama.cpp/conversion/bert.py:48-57`. ~30K tokens × 3-byte UTF-8 prefix = ~91 KB of metadata divergence.
