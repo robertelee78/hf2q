@@ -738,32 +738,141 @@ fn normalize_size_label(part: &str) -> Option<String> {
 /// against `general.base_model.0.name = 'Nomic Embed Text v2 Moe
 /// Unsupervised'` in the canonical Q8_0 dump for nomic v2-moe.
 fn title_case_hyphenated(s: &str) -> String {
+    // Port of canonical's `Metadata.id_to_title` at
+    // `/opt/llama.cpp/gguf-py/gguf/metadata.py:235-237`:
+    //   return ' '.join([w.title() if w.islower() and not re.match(
+    //       r'^(v\d+(?:\.\d+)*|\d.*)$', w) else w
+    //       for w in string.strip().replace('-', ' ').split()])
+    //
+    // Algorithm: split on `-`, then per-word — if the word is all
+    // lowercase (Python `str.islower()` true: has cased chars and
+    // none are uppercase) AND does NOT match `v\d+(.\d+)*` or
+    // `\d.*`, apply Python's `str.title()` (uppercase each
+    // alphabetic block separated by non-alpha). Otherwise keep
+    // as-is.
+    //
+    // Examples (verified against canonical's output):
+    //   "google-gemma-4-26b-a4b-it" → "Google Gemma 4 26b A4B It"
+    //     - "google"/"gemma"/"it" → title → "Google"/"Gemma"/"It"
+    //     - "4" → not lowercase (no cased chars) → keep "4"
+    //     - "26b" → matches `\d.*` → keep "26b"
+    //     - "a4b" → lowercase, no regex match → title → "A4B"
+    //   "nomic-xlm-2048" → "Nomic Xlm 2048"
+    //   "Meta-Llama-3-8B-Instruct" → "Meta Llama 3 8B Instruct"
+    //     - all words already mixed-case → islower=False → keep
+    //   "nomic-embed-text-v2-moe-unsupervised"
+    //     → "Nomic Embed Text v2 Moe Unsupervised"
+    //     - "v2" → matches `v\d+` → keep
     s.split('-')
+        .filter(|p| !p.is_empty())
         .map(|part| {
-            if is_version_part(part) {
-                // Version markers (e.g. `v2`, `v1.5`, `iter3`) keep
-                // their lowercase prefix to match canonical's
-                // `general.base_model.<i>.name` formatting. Verified
-                // against the nomic v2-moe canonical Q8_0 dump:
-                // `'Nomic Embed Text v2 Moe Unsupervised'`.
-                part.to_string()
+            if should_title_case(part) {
+                python_str_title(part)
             } else {
-                let mut chars = part.chars();
-                match chars.next() {
-                    Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-                    None => String::new(),
-                }
+                part.to_string()
             }
         })
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+/// Mirrors Python's `str.islower()` for a single word:
+///   - Returns True if there is at least one cased character AND all
+///     cased characters are lowercase.
+///   - Returns False if there are no cased characters (e.g. "4",
+///     "123") or if any cased character is uppercase.
+fn is_python_islower(s: &str) -> bool {
+    let mut has_cased = false;
+    for c in s.chars() {
+        if c.is_alphabetic() {
+            has_cased = true;
+            if !c.is_lowercase() {
+                return false;
+            }
+        }
+    }
+    has_cased
+}
+
+/// Mirrors canonical's regex `^(v\d+(?:\.\d+)*|\d.*)$` — match if the
+/// word is a version marker like `v2`, `v1.5` OR starts with a digit
+/// like `26b`, `7B`, `8x7B`.
+fn is_version_or_digit_start(s: &str) -> bool {
+    // `v\d+(\.\d+)*` variant
+    if let Some(rest) = s.strip_prefix('v') {
+        if !rest.is_empty()
+            && rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            let mut chars = rest.chars().peekable();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let mut all_match = true;
+            while let Some(&c) = chars.peek() {
+                if c != '.' {
+                    all_match = false;
+                    break;
+                }
+                chars.next();
+                if !chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    all_match = false;
+                    break;
+                }
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_digit() {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if all_match && chars.peek().is_none() {
+                return true;
+            }
+        }
+    }
+    // `\d.*` variant — word starts with a digit.
+    s.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
+fn should_title_case(s: &str) -> bool {
+    is_python_islower(s) && !is_version_or_digit_start(s)
+}
+
+/// Port of Python's `str.title()`: capitalize the first letter of
+/// each alphabetic block (separated by any non-alphabetic char),
+/// lowercase the rest.
+fn python_str_title(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_is_alpha = false;
+    for c in s.chars() {
+        if c.is_alphabetic() {
+            if !prev_is_alpha {
+                out.extend(c.to_uppercase());
+            } else {
+                out.extend(c.to_lowercase());
+            }
+            prev_is_alpha = true;
+        } else {
+            out.push(c);
+            prev_is_alpha = false;
+        }
+    }
+    out
+}
+
 /// Detect a version-marker name part like `v2`, `v1.5`, `iter3`.
+/// Used historically by `title_case_hyphenated` before the
+/// `id_to_title` rewrite; retained for legacy callers + tests.
 /// Mirrors canonical's version regex at `metadata.py:279`:
 /// `(v|iter)?\d+([.]\d+)*` — but here we use the stricter form
 /// `(v|iter)\d+(\.\d+)*` because pure-numeric parts like `2048` are
 /// title-case fine (no leading letter to upper).
+#[allow(dead_code)]
 fn is_version_part(part: &str) -> bool {
     let lower = part.to_ascii_lowercase();
     let rest = if let Some(r) = lower.strip_prefix('v') {
@@ -1053,6 +1162,68 @@ language:
     fn is_version_marker_rejects_alpha_suffix() {
         assert!(!is_version_marker("v2a"));
         assert!(!is_version_marker("v"));
+    }
+
+    /// Canonical `id_to_title` parity tests. Verifies the four exact
+    /// cases observed in canonical's gguf-dump for our test models:
+    /// Gemma 4, Nomic v2-moe, Nomic v1.5 base_model, Llama 3.
+    #[test]
+    fn title_case_hyphenated_matches_canonical_id_to_title() {
+        // Gemma 4 dir name "google-gemma-4-26b-a4b-it" — verified
+        // against canonical's `general.name = 'Google Gemma 4 26b A4B It'`.
+        assert_eq!(
+            title_case_hyphenated("google-gemma-4-26b-a4b-it"),
+            "Google Gemma 4 26b A4B It"
+        );
+        // Nomic v2-moe `_name_or_path` is "nomic-ai/nomic-xlm-2048";
+        // we feed just the "nomic-xlm-2048" full-name component here.
+        assert_eq!(
+            title_case_hyphenated("nomic-xlm-2048"),
+            "Nomic Xlm 2048"
+        );
+        // Nomic v2-moe base_model[0] is
+        // "nomic-ai/nomic-embed-text-v2-moe-unsupervised"; v2 keeps
+        // lowercase per the version-marker regex skip.
+        assert_eq!(
+            title_case_hyphenated("nomic-embed-text-v2-moe-unsupervised"),
+            "Nomic Embed Text v2 Moe Unsupervised"
+        );
+        // Llama 3 has mixed-case input, all words islower=False → kept as-is.
+        assert_eq!(
+            title_case_hyphenated("Meta-Llama-3-8B-Instruct"),
+            "Meta Llama 3 8B Instruct"
+        );
+    }
+
+    #[test]
+    fn python_str_title_matches_python_semantics() {
+        assert_eq!(python_str_title("a4b"), "A4B");
+        assert_eq!(python_str_title("abc"), "Abc");
+        assert_eq!(python_str_title("hello world"), "Hello World");
+        assert_eq!(python_str_title("aBc"), "Abc"); // lowercases the rest
+        assert_eq!(python_str_title("123"), "123");
+    }
+
+    #[test]
+    fn is_python_islower_matches_python_semantics() {
+        assert!(is_python_islower("abc")); // has lowercase, no upper
+        assert!(is_python_islower("a4b")); // mixed alpha+digit, all lower
+        assert!(!is_python_islower("ABC")); // all upper
+        assert!(!is_python_islower("aBc")); // mixed case
+        assert!(!is_python_islower("123")); // no cased chars
+        assert!(!is_python_islower("4")); // no cased chars
+    }
+
+    #[test]
+    fn is_version_or_digit_start_canonical_regex() {
+        assert!(is_version_or_digit_start("v2"));
+        assert!(is_version_or_digit_start("v1.5"));
+        assert!(is_version_or_digit_start("26b")); // \d.*
+        assert!(is_version_or_digit_start("7B"));
+        assert!(is_version_or_digit_start("4"));
+        assert!(!is_version_or_digit_start("google"));
+        assert!(!is_version_or_digit_start("v")); // no digits after v
+        assert!(!is_version_or_digit_start("a4b")); // doesn't start with digit or 'v\d+'
     }
 
     #[test]
