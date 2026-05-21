@@ -133,7 +133,10 @@ impl MtpWeights {
         })
     }
 
-    /// Run the MTP block for a single-token draft step.
+    /// Run the MTP block for a single-token draft step. Convenience wrapper
+    /// over [`MtpWeights::forward_draft_with_hidden`] that drops the returned
+    /// hidden buffer — use the `_with_hidden` variant when you intend to
+    /// chain a second MTP step (K=N speculative decoding).
     ///
     /// Inputs:
     /// - `prev_hidden`: verifier hidden state for token `t`, shape `[1, H]`.
@@ -151,6 +154,30 @@ impl MtpWeights {
         registry: &mut KernelRegistry,
         cfg: &Qwen35Config,
     ) -> Result<MlxBuffer> {
+        let (logits, _hidden) = self.forward_draft_with_hidden(
+            prev_hidden, embed_t, kv_cache, position_ids, device, registry, cfg,
+        )?;
+        Ok(logits)
+    }
+
+    /// Same as [`forward_draft`] but also returns the inner-block hidden
+    /// state (`forward_ffn_residual` output, BEFORE `shared_head_norm` +
+    /// `lm_head`). The hidden buffer can be fed as `prev_hidden` into a
+    /// chained second MTP step for K=N speculative decoding (DeepSeek-V3 /
+    /// MTPLX `draft2_fn` pattern at `/opt/MTPLX/mtplx/generation.py:2153`).
+    ///
+    /// Shape contract: `hidden.element_count() == hidden_size` (single-token
+    /// draft step).
+    pub fn forward_draft_with_hidden(
+        &self,
+        prev_hidden: &MlxBuffer,
+        embed_t: &MlxBuffer,
+        kv_cache: &mut HybridKvCache,
+        position_ids: &[i32],
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        cfg: &Qwen35Config,
+    ) -> Result<(MlxBuffer, MlxBuffer)> {
         ensure!(
             position_ids.len() == 4,
             "MTP forward_draft expects exactly 4 IMROPE position ids, got {}",
@@ -214,7 +241,7 @@ impl MtpWeights {
                 t_proj + t_attn + t_ffn + t_head,
             );
         }
-        Ok(logits)
+        Ok((logits, hidden))
     }
 
     fn project_embedding_and_hidden(

@@ -252,12 +252,214 @@ impl<'a> SpecDecode<'a> {
             // it shares the global pool's residency-set owner.
             let cfg = self.verifier.cfg.clone();
             let mtp_vocab = mtp.vocab_size;
-            let kv_cache_ref = &mut self.kv_cache;
-            let hidden_ref = &hidden_t;
             let token_embd = &self.verifier.token_embd;
             // ADR-028 iter-154: per-step MTP profile gated on HF2Q_MTP_PROFILE=1.
             let mtp_profile = std::env::var("HF2Q_MTP_PROFILE").as_deref() == Ok("1");
+
+            // ADR-034 SOTA path (2026-05-21): K=N chained MTP draft.
+            //
+            // HF2Q_SPEC_DECODE_K=N (N >= 2) enables DeepSeek-V3 / MTPLX-style
+            // multi-step lookahead: chain MTP forward N times (each step
+            // re-uses the prior step's inner-FFN hidden state as `prev_hidden`),
+            // then do ONE batched verify of [token_next, draft_0, ..., draft_{N-1}]
+            // and sequential accept-prefix walk.
+            //
+            // Speedup model (vs K=0 single-token verify):
+            //   E[tokens/iter] = (1 + p + p^2 + ... + p^N) at acceptance rate p
+            //   T_per_iter ≈ T_v(N+1) + N * T_d  (one batched verify + N MTP drafts)
+            //
+            // At N=2, p=0.75: 2.31 tokens / iter; verify cost ~1.3*T_v(1); MTP cost
+            // ~2*T_d. Empirical reference: MTPLX `draft2_fn` at
+            // `/opt/MTPLX/mtplx/generation.py:2153`.
+            //
+            // KV semantics on partial-accept: same pattern as the existing K=1
+            // reject path (no explicit cache rollback; next iter's verifier
+            // forward overwrites stale positions because each forward writes at
+            // the explicit `next_pos` it's given).
+            let spec_k: usize = std::env::var("HF2Q_SPEC_DECODE_K")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+
+            if spec_k >= 2 {
+                let hidden_size_u32 = self.verifier.cfg.hidden_size;
+                let vsz = vocab as usize;
+                let mtp_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+
+                // Chain `spec_k` MTP forward steps producing drafts[0..spec_k-1].
+                // Each writes the MTP KV slot at positions [next_pos..next_pos+spec_k-1].
+                // (Catch-up: NOT implemented in this iteration — see notes below
+                // about MTP-slot vs verifier-slot alignment on FULL accept.)
+                let drafts: Vec<u32> = {
+                    let hidden_ref = &hidden_t;
+                    let kv_cache_ref = &mut self.kv_cache;
+                    self.verifier.with_gpu_cache_mut(|device, registry| {
+                        let mut out = Vec::with_capacity(spec_k);
+                        let mut chain_hidden: Option<MlxBuffer> = None;
+                        let mut chain_token = token_next;
+                        for k in 0..spec_k {
+                            let embed = embed_token_on_device(
+                                token_embd,
+                                chain_token,
+                                cfg.hidden_size,
+                                device,
+                            )?;
+                            let mtp_pos = next_pos + k as i32;
+                            let prev_h = chain_hidden.as_ref().unwrap_or(hidden_ref);
+                            let (draft_logits, draft_hidden) = mtp
+                                .forward_draft_with_hidden(
+                                    prev_h,
+                                    &embed,
+                                    kv_cache_ref,
+                                    &[mtp_pos; 4],
+                                    device,
+                                    registry,
+                                    &cfg,
+                                )
+                                .with_context(|| {
+                                    format!(
+                                        "SpecDecode K={spec_k} chained MTP step {k} pos {mtp_pos}"
+                                    )
+                                })?;
+                            let tok = argmax_logits_gpu(
+                                device,
+                                registry,
+                                &draft_logits,
+                                mtp_vocab,
+                            )?;
+                            out.push(tok);
+                            chain_hidden = Some(draft_hidden);
+                            chain_token = tok;
+                        }
+                        Ok::<Vec<u32>, anyhow::Error>(out)
+                    })?
+                };
+                let mtp_ms = mtp_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+                self.stats.proposed += spec_k;
+
+                // Single batched verify of K+1 tokens.
+                let verify_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+                let mut verify_input = Vec::with_capacity(spec_k + 1);
+                verify_input.push(token_next);
+                verify_input.extend(drafts.iter().copied());
+                let verify_positions = positions_for_range(next_pos, spec_k + 1);
+                let (verify_logits, verify_hidden) = self
+                    .verifier
+                    .forward_gpu_with_hidden(
+                        &verify_input,
+                        &verify_positions,
+                        &mut self.kv_cache,
+                    )
+                    .with_context(|| {
+                        format!("SpecDecode K={spec_k} batched verify pos {next_pos}")
+                    })?;
+                let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+                ensure!(
+                    verify_logits.len() == (spec_k + 1) * vsz,
+                    "K={spec_k} batched verify: expected {} logits, got {}",
+                    (spec_k + 1) * vsz,
+                    verify_logits.len()
+                );
+
+                // Accept-prefix walk. Stop at first mismatch; emit accepted
+                // drafts + 1 corrected token at the mismatch position.
+                let mut accepted = 0usize;
+                let mut emitted_corrected = false;
+                let mut next_iter_logits: Vec<f32> = Vec::new();
+                let mut next_iter_hidden_row: u64 = 0;
+                let mut hit_eos = false;
+                for i in 0..spec_k {
+                    let row = &verify_logits[i * vsz..(i + 1) * vsz];
+                    let target_pred = greedy_argmax_slice(row);
+                    if target_pred == drafts[i] {
+                        generated.push(drafts[i]);
+                        self.stats.accepted += 1;
+                        accepted += 1;
+                        if self.is_eos(drafts[i]) {
+                            hit_eos = true;
+                            break;
+                        }
+                        if generated.len() >= max_new {
+                            break;
+                        }
+                    } else {
+                        // Reject: emit corrected token; pre-emit so next iter
+                        // doesn't re-draft from this position.
+                        generated.push(target_pred);
+                        self.stats.rejected += 1;
+                        emitted_corrected = true;
+                        next_iter_hidden_row = i as u64;
+                        next_iter_logits = row.to_vec();
+                        if self.is_eos(target_pred) {
+                            hit_eos = true;
+                        }
+                        break;
+                    }
+                }
+                if accepted == spec_k && !emitted_corrected && !hit_eos {
+                    // All drafts accepted: DO NOT emit a "bonus" token from
+                    // verify_logits[spec_k]. Reason — the verifier slot wrote
+                    // positions [next_pos..next_pos+spec_k] (spec_k+1 entries)
+                    // but the MTP slot only wrote [next_pos..next_pos+spec_k-1]
+                    // (spec_k entries). MTP would fall behind by 1 per iter.
+                    // Instead, defer the bonus to next iter: set logits_t to
+                    // verify_logits[spec_k] (predicts position next_pos+spec_k+1)
+                    // and preemitted_argmax=false so next iter naturally pushes
+                    // it as its `token_next`. Verifier slot is at next_pos+spec_k
+                    // (last accepted draft); next iter will write at the bonus
+                    // position. MTP slot also at next_pos+spec_k-1; next iter's
+                    // MTP step 0 writes at next_pos+spec_k aligning with the
+                    // verifier's last write — no gap.
+                    next_iter_hidden_row = spec_k as u64;
+                    next_iter_logits =
+                        verify_logits[spec_k * vsz..(spec_k + 1) * vsz].to_vec();
+                }
+
+                // State update for next iter.
+                hidden_pos = next_pos + accepted as i32;
+                hidden_t = nth_hidden_row(
+                    &verify_hidden,
+                    hidden_size_u32,
+                    next_iter_hidden_row,
+                )
+                .with_context(|| {
+                    format!(
+                        "SpecDecode K={spec_k} accept-walk row {} hidden slice",
+                        next_iter_hidden_row
+                    )
+                })?;
+                logits_t = next_iter_logits;
+                // For partial-reject we emitted the corrected token, so
+                // pre-emit so next iter doesn't re-push it. For full-accept
+                // we did NOT emit a bonus (deferred to next iter to keep
+                // MTP/verifier slots aligned), so next iter should naturally
+                // push its computed token_next from logits_t.
+                preemitted_argmax = emitted_corrected;
+
+                if mtp_profile {
+                    let iter_ms = iter_t0
+                        .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                    eprintln!(
+                        "[MTP_PROFILE_KN] iter K={} accepted={}/{}: mtp={:.2} ver={:.2} ITER={:.2}",
+                        spec_k,
+                        accepted,
+                        spec_k,
+                        mtp_ms.unwrap_or(0.0),
+                        v_ms.unwrap_or(0.0),
+                        iter_ms,
+                    );
+                }
+                if hit_eos || generated.len() >= max_new {
+                    break;
+                }
+                continue;
+            }
+
+            // ---- legacy K=0 / K=1 path (single MTP draft + 1-or-2-token verify) ----
             let mtp_t0 = if mtp_profile { Some(Instant::now()) } else { None };
+            let kv_cache_ref = &mut self.kv_cache;
+            let hidden_ref = &hidden_t;
             let proposed = self.verifier.with_gpu_cache_mut(|device, registry| {
                 let embed_next = embed_token_on_device(token_embd, token_next, cfg.hidden_size, device)?;
                 let draft_logits = mtp
