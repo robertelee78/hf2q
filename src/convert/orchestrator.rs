@@ -590,6 +590,10 @@ impl<W: Write + Seek> StreamingWriter<W> {
                 // subnormals, propagating identical inputs into the K-quant
                 // kernel. Per-element scalar round-trip; matches numpy's
                 // ndarray.astype(float16).astype(float32) used by canonical.
+                // Parallel par_iter attempted at 2026-05-21 and falsified:
+                // 183s → 194s (slower; rayon work-stealing overhead exceeds
+                // gain since this runs once per tensor and the quantize
+                // kernel that follows is already rayon-parallel per-row).
                 let f16_rt: Vec<f32> = data.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
                 quantizer.quantize(&f16_rt, p.n_per_row, None)?
             }
