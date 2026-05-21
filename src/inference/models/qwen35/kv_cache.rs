@@ -113,6 +113,33 @@ pub struct LinearAttnStateSlot {
     /// DeltaNet recurrent state (scratch, write target for GDN kernel).
     /// Same shape as `recurrent`.  Swapped with `recurrent` each decode step.
     pub recurrent_scratch: MlxBuffer,
+    /// ADR-034 task #90 Step 2 (2026-05-21) — per-position recurrent
+    /// state capture buffer for K=N speculative decoding partial-reject
+    /// rollback.
+    ///
+    /// Shape: `[D_k, D_v, num_v_heads, n_tokens_max, n_seqs]` f32 with
+    /// `D_k` innermost — same as `recurrent` extended with a `n_tokens_max`
+    /// axis. `n_tokens_max` = `MAX_SPEC_DEPTH + 1` (≤ 8 for current
+    /// implementation; the prefill chunk path never uses this slot).
+    ///
+    /// `None` (the default) when the cache was constructed in non-spec
+    /// mode — non-capture `dispatch_gated_delta_net_decode` is used and
+    /// the recurrent-only ping-pong is byte-identical to pre-#90 behavior.
+    ///
+    /// `Some(buf)` when the cache was constructed via
+    /// [`HybridKvCache::new_with_spec_decode_capacity`]. The K=N spec
+    /// runner routes `build_delta_net_layer` through
+    /// `dispatch_gated_delta_net_decode_with_capture`, which writes
+    /// per-position state into `capture_states` each token. On partial-
+    /// reject of K drafts, the runner copies
+    /// `capture_states[..., accepted_idx, ...]` → `recurrent` via
+    /// [`HybridKvCache::rollback_la_to`].
+    ///
+    /// Memory cost (Qwen 3.5/3.6 D_k=D_v=128, n_v_heads=8, n_seqs=1,
+    /// n_tokens_max=4): 2 MB per LA layer. ~60-90 MB total per forward
+    /// across 30+ LA layers. Allocated once per spec-decode cache
+    /// construction; freed when the cache drops.
+    pub capture_states: Option<MlxBuffer>,
 }
 
 impl FullAttnKvSlot {
@@ -1390,6 +1417,141 @@ impl HybridKvCache {
         }
     }
 
+    /// ADR-034 task #90 Step 2 (2026-05-21) — lazily allocate the
+    /// per-position capture buffer on every linear-attention slot for
+    /// K=N speculative decoding. Idempotent: re-calling with the SAME
+    /// `n_tokens_max` is a no-op; re-calling with a LARGER value
+    /// reallocates (re-allocations clear the existing capture content).
+    ///
+    /// Caller MUST invoke this once before entering a K=N spec-decode
+    /// loop with `n_tokens_max = MAX_SPEC_DEPTH + 1`. After this returns
+    /// Ok, every `linear_attn[i].capture_states` is `Some(buf)` with
+    /// shape `[D_k, D_v, num_v_heads, n_tokens_max, n_seqs]` F32
+    /// (matching the mlx-native `dispatch_gated_delta_net_decode_with_capture`
+    /// kernel's buffer 9 contract — see project_adr034_task90_gdn_kernel_shipped).
+    ///
+    /// On partial-reject of K drafts, [`Self::rollback_la_to`] copies
+    /// `capture_states[..., accepted_idx, ...]` → `recurrent` (active).
+    ///
+    /// # Errors
+    /// Returns `Err` when buffer alloc fails (OOM).
+    pub fn ensure_la_capture(
+        &mut self,
+        cfg: &Qwen35Config,
+        device: &MlxDevice,
+        n_tokens_max: u32,
+    ) -> Result<()> {
+        if n_tokens_max == 0 {
+            return Err(anyhow!(
+                "ensure_la_capture: n_tokens_max must be > 0"
+            ));
+        }
+        let d_k = cfg.linear_key_head_dim as usize;
+        let d_v = cfg.linear_value_head_dim as usize;
+        let n_v_heads = cfg.linear_num_value_heads as usize;
+        let n_seqs = self.n_seqs as usize;
+        let state_elems = d_k * d_v * n_v_heads * n_seqs;
+        let capture_elems = state_elems * (n_tokens_max as usize);
+        let shape = vec![d_k, d_v, n_v_heads, n_tokens_max as usize, n_seqs];
+
+        for slot in self.linear_attn.iter_mut() {
+            // Skip re-alloc when the existing capture is already at the
+            // requested capacity. Match by element_count to be tolerant
+            // of shape vec representation differences.
+            if let Some(buf) = slot.capture_states.as_ref() {
+                if buf.element_count() == capture_elems {
+                    continue;
+                }
+            }
+            let cap_buf = device
+                .alloc_buffer(capture_elems * 4, DType::F32, shape.clone())
+                .map_err(|e| anyhow!("alloc capture_states: {e}"))?;
+            slot.capture_states = Some(cap_buf);
+        }
+        Ok(())
+    }
+
+    /// ADR-034 task #90 Step 2 (2026-05-21) — roll back every linear-
+    /// attention slot's `recurrent` (active) state to
+    /// `capture_states[..., accepted_idx, ...]`. Called on partial-reject
+    /// in K=N spec-decode.
+    ///
+    /// Pre-conditions:
+    /// - [`Self::ensure_la_capture`] was called for this cache.
+    /// - `accepted_idx < n_tokens_max` (the value passed to
+    ///   `ensure_la_capture`).
+    /// - The most-recent forward through these LA slots used
+    ///   `dispatch_gated_delta_net_decode_with_capture` (i.e. wrote
+    ///   per-position states into `capture_states`).
+    ///
+    /// Post-condition: every `linear_attn[i].recurrent` contains
+    /// `capture_states[..., accepted_idx, ...]`. The `recurrent_scratch`
+    /// buffer is left untouched (it will be overwritten by the next
+    /// forward).
+    ///
+    /// # Errors
+    /// Returns `Err` when any slot lacks `capture_states` (caller bug:
+    /// forgot to call `ensure_la_capture`).
+    pub fn rollback_la_to(&mut self, accepted_idx: u32) -> Result<()> {
+        // ADR-034 task #90 Step 2 (codex audit 2026-05-21) — the
+        // capture-buffer layout assumes n_seqs == 1 (production Qwen
+        // 3.5/3.6 case). For n_seqs > 1, the per-token slice math
+        // below would interleave incorrectly because the capture buffer
+        // is laid out with n_tokens_max as the slowest-varying axis
+        // before n_seqs, while the kernel writes assume sequence-major
+        // layout. Guard against the n_seqs > 1 case until the layout is
+        // explicitly designed for batched-seq rollback.
+        if self.n_seqs > 1 {
+            return Err(anyhow!(
+                "rollback_la_to: n_seqs > 1 not supported (capture buffer \
+                 layout assumes n_seqs=1; production Qwen 3.5/3.6 is \
+                 always n_seqs=1). Implement per-sequence slice math \
+                 before extending to batched-seq inference."
+            ));
+        }
+        for (i, slot) in self.linear_attn.iter_mut().enumerate() {
+            let capture = slot.capture_states.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "rollback_la_to: linear_attn[{}].capture_states is None — \
+                     caller must call ensure_la_capture before rollback",
+                    i
+                )
+            })?;
+            let state_elems = slot.recurrent.element_count();
+            let capture_elems = capture.element_count();
+            if capture_elems % state_elems != 0 {
+                return Err(anyhow!(
+                    "rollback_la_to: linear_attn[{}].capture_states elements {} \
+                     not a multiple of recurrent elements {}",
+                    i, capture_elems, state_elems
+                ));
+            }
+            let n_tokens_max = capture_elems / state_elems;
+            if (accepted_idx as usize) >= n_tokens_max {
+                return Err(anyhow!(
+                    "rollback_la_to: accepted_idx {} >= n_tokens_max {} \
+                     for linear_attn[{}]",
+                    accepted_idx, n_tokens_max, i
+                ));
+            }
+            // Copy capture[accepted_idx] → recurrent. Slice the capture
+            // buffer at the correct offset and copy state_elems f32s.
+            let capture_slice = capture.as_slice::<f32>().map_err(|e| {
+                anyhow!("rollback_la_to: linear_attn[{}].capture as_slice: {e}", i)
+            })?;
+            let src_offset = (accepted_idx as usize) * state_elems;
+            let src = &capture_slice[src_offset..src_offset + state_elems];
+            let dst = slot.recurrent.as_mut_slice::<f32>().map_err(|e| {
+                anyhow!(
+                    "rollback_la_to: linear_attn[{}].recurrent as_mut_slice: {e}",
+                    i
+                )
+            })?;
+            dst.copy_from_slice(src);
+        }
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         for slot in self.full_attn.iter_mut() {
             for c in slot.current_len.iter_mut() {
@@ -1845,6 +2007,11 @@ impl HybridKvCache {
                 + s.conv_state_scratch.element_count() * 4
                 + s.recurrent.element_count() * 4
                 + s.recurrent_scratch.element_count() * 4;
+            // ADR-034 task #90 Step 2 (2026-05-21) — count capture
+            // buffer when allocated (None in non-spec mode = 0 bytes).
+            if let Some(buf) = s.capture_states.as_ref() {
+                n += buf.element_count() * 4;
+            }
         }
         n
     }
@@ -1985,6 +2152,12 @@ fn alloc_linear_attn_slot(
         conv_state_scratch,
         recurrent,
         recurrent_scratch,
+        // ADR-034 task #90 Step 2 (2026-05-21) — capture buffer is
+        // lazily allocated when the cache enters spec-decode mode (call
+        // `HybridKvCache::ensure_la_capture(n_tokens_max)` before
+        // dispatching K=N spec decode). Default = None preserves
+        // byte-identical pre-#90 behavior for all non-spec paths.
+        capture_states: None,
     })
 }
 
@@ -5424,5 +5597,172 @@ mod tests {
         // norms_per_pos=1] = 2*2*64*1 elems × 4 bytes = 1024 bytes.
         assert_eq!(buffers.k_norms.byte_len(), 1024);
         assert_eq!(buffers.k_norms.shape(), &[2, 2, 64, 1]);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-034 task #90 Step 2 (2026-05-21) — capture_states allocator
+    // + rollback_la_to tests.
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn ensure_la_capture_allocates_when_none_2026_05_21() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return, // Skip on systems without Metal.
+        };
+        let cfg = moe_cfg_40layer();
+        let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
+        // Pre-condition: every LA slot has capture_states = None.
+        for s in &cache.linear_attn {
+            assert!(s.capture_states.is_none(), "pre-ensure: capture_states must be None");
+        }
+        cache.ensure_la_capture(&cfg, &device, 4).expect("ensure_la_capture");
+        // Post-condition: every LA slot has a properly-sized capture buffer.
+        let expected_elems = (cfg.linear_key_head_dim as usize)
+            * (cfg.linear_value_head_dim as usize)
+            * (cfg.linear_num_value_heads as usize)
+            * 4   // n_tokens_max
+            * 1; // n_seqs
+        for (i, s) in cache.linear_attn.iter().enumerate() {
+            let buf = s.capture_states.as_ref()
+                .unwrap_or_else(|| panic!("LA[{i}] capture None after ensure"));
+            assert_eq!(buf.element_count(), expected_elems,
+                "LA[{i}] capture element_count mismatch");
+            assert_eq!(buf.dtype(), DType::F32, "LA[{i}] capture must be F32");
+        }
+    }
+
+    #[test]
+    fn ensure_la_capture_idempotent_at_same_n_tokens_2026_05_21() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let cfg = moe_cfg_40layer();
+        let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
+        cache.ensure_la_capture(&cfg, &device, 4).expect("first call");
+        // Snapshot the buffer pointer/identity for one slot.
+        let first_elems = cache.linear_attn[0].capture_states.as_ref().unwrap().element_count();
+        cache.ensure_la_capture(&cfg, &device, 4).expect("second call — same size");
+        let second_elems = cache.linear_attn[0].capture_states.as_ref().unwrap().element_count();
+        assert_eq!(first_elems, second_elems,
+            "idempotent ensure at same n_tokens_max must preserve buffer size");
+    }
+
+    #[test]
+    fn ensure_la_capture_reallocs_when_larger_2026_05_21() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let cfg = moe_cfg_40layer();
+        let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
+        cache.ensure_la_capture(&cfg, &device, 4).expect("first call");
+        let first_elems = cache.linear_attn[0].capture_states.as_ref().unwrap().element_count();
+        cache.ensure_la_capture(&cfg, &device, 8).expect("second call — larger");
+        let second_elems = cache.linear_attn[0].capture_states.as_ref().unwrap().element_count();
+        assert!(second_elems > first_elems,
+            "larger n_tokens_max must reallocate to bigger buffer");
+        assert_eq!(second_elems, 2 * first_elems,
+            "n_tokens_max=8 should double the buffer vs n_tokens_max=4");
+    }
+
+    #[test]
+    fn ensure_la_capture_rejects_zero_2026_05_21() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let cfg = moe_cfg_40layer();
+        let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
+        assert!(cache.ensure_la_capture(&cfg, &device, 0).is_err(),
+            "n_tokens_max=0 must reject");
+    }
+
+    #[test]
+    fn rollback_la_to_copies_capture_slice_2026_05_21() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let cfg = moe_cfg_40layer();
+        let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
+        cache.ensure_la_capture(&cfg, &device, 4).expect("ensure");
+
+        // Construct a known-pattern capture buffer for LA[0]:
+        // capture[i, j, h, t, s] = (t * 1000 + (i*100) + j) as f32.
+        let state_elems = cache.linear_attn[0].recurrent.element_count();
+        let n_tokens_max = 4usize;
+        {
+            let cap = cache.linear_attn[0].capture_states.as_mut().unwrap();
+            let cap_slice = cap.as_mut_slice::<f32>().expect("cap mut");
+            assert_eq!(cap_slice.len(), state_elems * n_tokens_max);
+            for t in 0..n_tokens_max {
+                for (idx, v) in cap_slice
+                    [t * state_elems..(t + 1) * state_elems]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *v = (t * 1000 + idx) as f32;
+                }
+            }
+        }
+        // Also fill LA[1] capture with a different pattern.
+        {
+            let cap = cache.linear_attn[1].capture_states.as_mut().unwrap();
+            let cap_slice = cap.as_mut_slice::<f32>().expect("cap mut");
+            for t in 0..n_tokens_max {
+                for (idx, v) in cap_slice
+                    [t * state_elems..(t + 1) * state_elems]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *v = (t * 1000 + idx + 99) as f32;
+                }
+            }
+        }
+
+        cache.rollback_la_to(2).expect("rollback to idx=2");
+
+        // LA[0].recurrent should now equal capture[2*state_elems..]
+        let rec0 = cache.linear_attn[0].recurrent.as_slice::<f32>().expect("rec0");
+        for (idx, &v) in rec0.iter().enumerate() {
+            assert_eq!(v, (2 * 1000 + idx) as f32,
+                "LA[0].recurrent[{idx}] after rollback to idx=2");
+        }
+        // LA[1].recurrent should equal capture[2*state_elems..] from LA[1]'s buffer
+        let rec1 = cache.linear_attn[1].recurrent.as_slice::<f32>().expect("rec1");
+        for (idx, &v) in rec1.iter().enumerate() {
+            assert_eq!(v, (2 * 1000 + idx + 99) as f32,
+                "LA[1].recurrent[{idx}] after rollback to idx=2");
+        }
+    }
+
+    #[test]
+    fn rollback_la_to_rejects_no_capture_2026_05_21() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let cfg = moe_cfg_40layer();
+        let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
+        // Did NOT call ensure_la_capture.
+        assert!(cache.rollback_la_to(0).is_err(),
+            "rollback without ensure_la_capture must error");
+    }
+
+    #[test]
+    fn rollback_la_to_rejects_out_of_range_idx_2026_05_21() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let cfg = moe_cfg_40layer();
+        let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
+        cache.ensure_la_capture(&cfg, &device, 4).expect("ensure");
+        assert!(cache.rollback_la_to(4).is_err(),
+            "rollback idx=4 with n_tokens_max=4 must error (need idx < n_tokens_max)");
+        assert!(cache.rollback_la_to(99).is_err(),
+            "rollback idx=99 must error");
     }
 }
