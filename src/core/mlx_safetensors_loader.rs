@@ -448,6 +448,13 @@ pub fn read_floats_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
     // serial loop. par_chunks_exact's default work-stealing chunk size
     // (≥1) means small tensors stay effectively serial; only the multi-
     // GB safetensors chunks pay any rayon overhead.
+    //
+    // `with_min_len(1024)` batching was tested 2026-05-21 → only -2.4%
+    // wall (within ~6.6% noise band); reverted. The 14915 worker samples
+    // in `rayon::bridge_producer_consumer` reported by the post-opt
+    // profile turned out NOT to be reducible by simple batching at this
+    // call-site; further investigation would need controlled multi-run
+    // statistics not a single bench.
     match dtype {
         Dtype::F32 => {
             if bytes.len() % 4 != 0 {
