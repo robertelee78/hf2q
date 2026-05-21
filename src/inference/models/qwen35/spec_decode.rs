@@ -419,19 +419,13 @@ impl<'a> SpecDecode<'a> {
                 .unwrap_or(0);
 
             if spec_k >= 2 {
-                // ADR-034 task #91 (2026-05-21) codex review #3 — the K=N
-                // path still uses greedy argmax accept-prefix. MH stochastic
-                // acceptance is NOT wired into K=N yet (Step 4 of task #91
-                // design). Emit a single-shot warn so operators don't
-                // silently get greedy behavior when they expected MH.
-                if is_mh && self.stats.proposed == 0 {
-                    eprintln!(
-                        "[hf2q WARN] HF2Q_SPEC_DECODE_K={} forces K=N chain which is GREEDY-ONLY at HEAD; \
-                         --temperature {} sampler is ignored on this path. \
-                         Use K=1 BATCHED (unset HF2Q_SPEC_DECODE_K) for MH stochastic acceptance.",
-                        spec_k, self.sampler.temperature,
-                    );
-                }
+                // ADR-034 task #91 Step 4 (2026-05-21) — K=N path supports MH
+                // stochastic acceptance via leviathan_accept_prefix. When
+                // sampler.temperature > 0, chain drafts are sampled
+                // stochastically from softmax(draft_logits, temp); the
+                // accept walk uses Leviathan-2023 §2.3 per-position
+                // residual-sampling. Greedy temp <= 0 path is
+                // byte-identical to pre-Step-4 K=N behavior.
                 // ADR-034 task #90 Step 4 (2026-05-21) — lazy allocate the
                 // per-LA-slot capture buffer ONCE on first K=N iter. Subsequent
                 // iters reuse (ensure_la_capture is idempotent at same
@@ -484,11 +478,22 @@ impl<'a> SpecDecode<'a> {
                 //     The catch-up step's logits are discarded; the bonus
                 //     token (if all drafts accepted) is taken from the
                 //     verifier's stronger row-spec_k prediction instead.
-                let drafts: Vec<u32> = {
+                // ADR-034 task #91 Step 4 (2026-05-21) — chained MTP draft
+                // loop now captures the per-position draft probability
+                // distribution when `is_mh`, so the accept walk below can
+                // call leviathan_accept_prefix. In greedy mode
+                // `draft_probs_per_pos` is left empty (zero-cost).
+                let (drafts, draft_probs_per_pos): (Vec<u32>, Vec<Vec<f32>>) = {
                     let hidden_ref = &hidden_t;
                     let kv_cache_ref = &mut self.kv_cache;
+                    let rng_ref = &mut rng;
                     self.verifier.with_gpu_cache_mut(|device, registry| {
                         let mut out = Vec::with_capacity(spec_k);
+                        let mut out_probs: Vec<Vec<f32>> = if is_mh {
+                            Vec::with_capacity(spec_k)
+                        } else {
+                            Vec::new()
+                        };
                         let mut chain_hidden: Option<MlxBuffer> = None;
                         let mut chain_token = token_next;
                         for k in 0..=spec_k {
@@ -516,19 +521,35 @@ impl<'a> SpecDecode<'a> {
                                     )
                                 })?;
                             if k < spec_k {
-                                let tok = argmax_logits_gpu(
-                                    device,
-                                    registry,
-                                    &draft_logits,
-                                    mtp_vocab,
-                                )?;
+                                let tok = if is_mh {
+                                    // MH: download F32 draft_logits, softmax with
+                                    // temp, sample stochastically. Store the
+                                    // probability vector so leviathan_accept_prefix
+                                    // below has q_v at each draft position.
+                                    let logits_cpu = super::gpu_full_attn::download_f32(&draft_logits)?;
+                                    let probs = crate::inference::spec_decode::dflash
+                                        ::rejection_sampler::softmax_with_temp(
+                                            &logits_cpu,
+                                            sampler_temp,
+                                        );
+                                    let t = sample_from_probs(&probs, rng_ref);
+                                    out_probs.push(probs);
+                                    t
+                                } else {
+                                    argmax_logits_gpu(
+                                        device,
+                                        registry,
+                                        &draft_logits,
+                                        mtp_vocab,
+                                    )?
+                                };
                                 out.push(tok);
                                 chain_hidden = Some(draft_hidden);
                                 chain_token = tok;
                             }
                             // k == spec_k: catch-up step. Slot write only.
                         }
-                        Ok::<Vec<u32>, anyhow::Error>(out)
+                        Ok::<(Vec<u32>, Vec<Vec<f32>>), anyhow::Error>((out, out_probs))
                     })?
                 };
                 let mtp_ms = mtp_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
@@ -560,15 +581,40 @@ impl<'a> SpecDecode<'a> {
 
                 // Accept-prefix walk. Stop at first mismatch; emit accepted
                 // drafts + 1 corrected token at the mismatch position.
+                //
+                // ADR-034 task #91 Step 4 (2026-05-21) — At temp > 0, replace
+                // strict argmax-match with Leviathan-2023 §2.3 stochastic
+                // MH per-position acceptance via `leviathan_accept_prefix`.
+                // At temp <= 0 (greedy), byte-identical to pre-Step-4 walk.
                 let mut accepted = 0usize;
                 let mut emitted_corrected = false;
                 let mut next_iter_logits: Vec<f32> = Vec::new();
                 let mut next_iter_hidden_row: u64 = 0;
                 let mut hit_eos = false;
-                for i in 0..spec_k {
-                    let row = &verify_logits[i * vsz..(i + 1) * vsz];
-                    let target_pred = greedy_argmax_slice(row);
-                    if target_pred == drafts[i] {
+                if is_mh {
+                    // Build target_probs for all spec_k+1 positions (one per
+                    // verify row). leviathan_accept_prefix contract requires
+                    // exactly drafts.len() + 1 target probability vectors.
+                    let target_probs_per_pos: Vec<Vec<f32>> = (0..=spec_k)
+                        .map(|i| {
+                            let row = &verify_logits[i * vsz..(i + 1) * vsz];
+                            crate::inference::spec_decode::dflash
+                                ::rejection_sampler::softmax_with_temp(row, sampler_temp)
+                        })
+                        .collect();
+                    let (accept_count, continuation) =
+                        crate::inference::spec_decode::dflash
+                            ::rejection_sampler::leviathan_accept_prefix(
+                                &drafts,
+                                &target_probs_per_pos,
+                                &draft_probs_per_pos,
+                                &mut rng,
+                            );
+                    // Push accepted drafts; honor max_new / EOS as in greedy.
+                    for i in 0..accept_count {
+                        if generated.len() >= max_new {
+                            break;
+                        }
                         generated.push(drafts[i]);
                         self.stats.accepted += 1;
                         accepted += 1;
@@ -576,24 +622,86 @@ impl<'a> SpecDecode<'a> {
                             hit_eos = true;
                             break;
                         }
-                        if generated.len() >= max_new {
+                    }
+                    if !hit_eos && generated.len() < max_new {
+                        if accept_count == spec_k {
+                            // Full accept — `continuation` is the stochastic
+                            // bonus sampled from target_probs_per_pos[spec_k].
+                            // Apply the same row-cap to next_iter_hidden_row
+                            // that the greedy path uses (Step 6 Strategy A).
+                            generated.push(continuation);
+                            let hidden_row_cap: u64 = match std::env::var(
+                                "HF2Q_SPEC_DECODE_KN_HIDDEN_ROW_CAP",
+                            )
+                            .as_deref()
+                            {
+                                Ok("off") | Ok("max") => spec_k as u64,
+                                Ok(other) => other.parse::<u64>().unwrap_or(0),
+                                _ => 0,
+                            };
+                            next_iter_hidden_row =
+                                (spec_k as u64).min(hidden_row_cap);
+                            next_iter_logits = verify_logits
+                                [spec_k * vsz..(spec_k + 1) * vsz]
+                                .to_vec();
+                            if self.is_eos(continuation) {
+                                hit_eos = true;
+                            }
+                        } else {
+                            // Partial reject at index accept_count.
+                            // `continuation` is the residual-sampled
+                            // replacement token at that position; push it
+                            // (pre-emit) so the next iter's token_next
+                            // reuses it.
+                            generated.push(continuation);
+                            self.stats.rejected += 1;
+                            emitted_corrected = true;
+                            next_iter_hidden_row = accept_count as u64;
+                            next_iter_logits = verify_logits
+                                [accept_count * vsz..(accept_count + 1) * vsz]
+                                .to_vec();
+                            if self.is_eos(continuation) {
+                                hit_eos = true;
+                            }
+                        }
+                    }
+                } else {
+                    for i in 0..spec_k {
+                        let row = &verify_logits[i * vsz..(i + 1) * vsz];
+                        let target_pred = greedy_argmax_slice(row);
+                        if target_pred == drafts[i] {
+                            generated.push(drafts[i]);
+                            self.stats.accepted += 1;
+                            accepted += 1;
+                            if self.is_eos(drafts[i]) {
+                                hit_eos = true;
+                                break;
+                            }
+                            if generated.len() >= max_new {
+                                break;
+                            }
+                        } else {
+                            // Reject: emit corrected token; pre-emit so next iter
+                            // doesn't re-draft from this position.
+                            generated.push(target_pred);
+                            self.stats.rejected += 1;
+                            emitted_corrected = true;
+                            next_iter_hidden_row = i as u64;
+                            next_iter_logits = row.to_vec();
+                            if self.is_eos(target_pred) {
+                                hit_eos = true;
+                            }
                             break;
                         }
-                    } else {
-                        // Reject: emit corrected token; pre-emit so next iter
-                        // doesn't re-draft from this position.
-                        generated.push(target_pred);
-                        self.stats.rejected += 1;
-                        emitted_corrected = true;
-                        next_iter_hidden_row = i as u64;
-                        next_iter_logits = row.to_vec();
-                        if self.is_eos(target_pred) {
-                            hit_eos = true;
-                        }
-                        break;
                     }
                 }
-                if accepted == spec_k && !emitted_corrected && !hit_eos {
+                if !is_mh && accepted == spec_k && !emitted_corrected && !hit_eos {
+                    // GREEDY full-accept: emit the argmax bonus token. MH
+                    // full-accept already pushed `continuation` above (the
+                    // stochastic bonus sampled from target_probs[spec_k]) and
+                    // set next_iter_hidden_row / next_iter_logits, so this
+                    // block must NOT re-run for MH.
+                    //
                     // All drafts accepted: emit the bonus token (verifier's
                     // prediction at row spec_k, predicting position
                     // next_pos+spec_k+1). No truncate — verifier slot wrote
