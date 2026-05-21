@@ -271,6 +271,43 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 5) — Arena-lift hypothesis FALSIFIED
+
+Implemented + A/B tested the Step 1 design from the previous iteration.
+Result: **zero measurable effect**. Hypothesis falsified.
+
+A/B at 35B-A3B Q4_K_M K=1 BATCHED, 100 tok, 3 reps each:
+
+| `HF2Q_SMALL_BATCH_NO_ARENA_THRESHOLD` | Mean tok/s | Mean accept |
+|---|---:|---:|
+| 1 (legacy `seq_len > 1` arena alloc) | 85.5 | 63.9% |
+| 8 (new no-arena for seq ≤ 8) | 84.8 | 65.2% |
+
+Within noise. W5B8 profile confirms fa.ops1_4 at seq_len=2 unchanged at
+9.39-9.62 ms (legacy 9.33 ms).
+
+**Falsified premise**: arena setup was already amortized perfectly across
+the 4 FA layers. The 9.5 ms is in the kernel-call work, NOT orchestration.
+
+**Real bottleneck (revised)**: Metal dispatch overhead. ~9 kernel dispatches
+per FA layer (norm + 4 projections + 2 per-head norms + 2 RoPE) × 4 FA
+layers = ~36 dispatches × ~250 μs launch = ~9 ms. Matches empirical.
+
+**Real fix candidates**:
+1. Kernel FUSION: combine norm + QKV projection + RoPE into ONE kernel
+   per FA layer (~3× fewer dispatches → ~3 ms reduction).
+2. Combine Q/K/V/Gate into a single `qkvg` mega-projection (~4× fewer
+   matmul dispatches → ~2 ms reduction).
+3. Extend `use_fused_stage_ab` (gpu_full_attn.rs:2818) to support
+   cur_len > 0 — currently restricted to cur_len == 0 prefill case,
+   excludes K=1 BATCHED.
+
+All three are bigger refactors than the original arena-lift. Real Step 1
+budget: ~800-1500 LOC across mlx-native shader work + Rust dispatch.
+
+Per mantra "code + test == truth": hypothesis falsified by empirical A/B
+before shipping. Pivot to fusion-based approach.
+
 Operator asked: "obviously our peers are doing something better than us? or wtf?
 why can they be faster and we can not." Direct answer after reading
 `/opt/MTPLX/mtplx/gdn_capture.py`:
