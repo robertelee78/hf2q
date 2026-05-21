@@ -2023,7 +2023,66 @@ fn build_convert_plan(
     steps.extend(direct_steps);
     steps.extend(fused_steps);
     steps.extend(synth_steps);
+
+    // Canonical-equivalent sort: llama-quantize stores tensors in a
+    // `std::map<string, ..., weight_name_comparer>` (see
+    // `/opt/llama.cpp/src/llama-model-loader.h:53-64`), so the output
+    // GGUF emits tensors in the comparator's order:
+    //   - non-`blk.N.*` tensors first (layer = -1 from failed sscanf),
+    //     sorted alphabetically among themselves
+    //   - then `blk.N.*` tensors with numeric N order, within each
+    //     layer alphabetical by GGUF name
+    //
+    // hf2q's convert+quantize is a single pipeline (no separate
+    // llama-quantize step), so we apply the same sort here before
+    // emitting plan steps. Only enabled for `ArchName::NomicBert` for
+    // now — other arches' byte-cmp gates passed under the existing
+    // source-order behavior and reordering would risk regressing them.
+    if matches!(arch, ArchName::NomicBert) {
+        steps.sort_by(|a, b| canonical_tensor_name_cmp(a.plan_entry().name.as_str(), b.plan_entry().name.as_str()));
+    }
     Ok(ConvertPlan { steps })
+}
+
+/// Port of canonical's `weight_name_comparer` at
+/// `/opt/llama.cpp/src/llama-model-loader.h:53-64`. Sorts tensor names
+/// so that non-`blk.N.` names come first (alphabetically), then
+/// `blk.N.` names with numeric N order, then alphabetical within
+/// each layer.
+fn canonical_tensor_name_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_layer = parse_blk_layer(a);
+    let b_layer = parse_blk_layer(b);
+    if a_layer != b_layer {
+        return a_layer.cmp(&b_layer);
+    }
+    a.cmp(b)
+}
+
+/// Extract the layer index from a `blk.<N>.` prefixed name, mirroring
+/// canonical's `sscanf(a.c_str(), "blk.%d.", &a_layer)` initialized
+/// to `-1`. Returns `-1` when the prefix doesn't match (so non-`blk.`
+/// names sort BEFORE `blk.N.` names per the i32 ordering).
+fn parse_blk_layer(name: &str) -> i32 {
+    let Some(rest) = name.strip_prefix("blk.") else {
+        return -1;
+    };
+    let mut end = 0;
+    for (i, c) in rest.char_indices() {
+        if c.is_ascii_digit() {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return -1;
+    }
+    // Require a `.` immediately after the digits (matches `blk.%d.`
+    // literal in the canonical sscanf).
+    if !rest[end..].starts_with('.') {
+        return -1;
+    }
+    rest[..end].parse::<i32>().unwrap_or(-1)
 }
 
 /// Inside-MoE-accumulator membership record. One per `(layer, kind,

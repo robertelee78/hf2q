@@ -182,8 +182,17 @@ pub fn map_tensor_name(
         // BertModel inheritance at `bert.py:88-90`. NomicBert v1.5
         // didn't have this tensor — see prior assumption at function
         // doc-comment.
+        // Source shape is [1, 768] (type_vocab_size=1, n_embd). Canonical
+        // squeezes the singleton dim before emitting — see the
+        // canonical Q8_0 GGUF dump where `token_types.weight` is 1-D
+        // `[768]`, not 2-D `[768, 1]`. We attach `BakeOp::Squeeze` to
+        // drop singleton dims from the gguf_shape; the element data is
+        // preserved byte-exact.
         "embeddings.token_type_embeddings.weight" => {
-            return Some(MappedTensor::Direct("token_types.weight".to_string()))
+            return Some(MappedTensor::DirectWithBake {
+                gguf_name: "token_types.weight".to_string(),
+                bake: BakeOp::Squeeze,
+            })
         }
         // Present in nomic-bert v2-moe (XLM-RoBERTa LayerNorm at the
         // embedding output). Maps to `token_embd_norm.{weight,bias}`.
@@ -771,7 +780,9 @@ mod tests {
             ("emb_ln.weight", "token_embd_norm.weight"),
             ("emb_ln.bias", "token_embd_norm.bias"),
             // Globals (v2-moe layout: XLM-RoBERTa-style)
-            ("embeddings.token_type_embeddings.weight", "token_types.weight"),
+            // token_type_embeddings has a Squeeze bake (singleton dim
+            // drop); verified separately in
+            // `nomic_bert_token_types_weight_emits_squeeze_bake` below.
             ("embeddings.LayerNorm.weight", "token_embd_norm.weight"),
             ("embeddings.LayerNorm.bias", "token_embd_norm.bias"),
             // Per-block — sample at L=0, L=5, L=11 (nomic-embed v1.5
@@ -811,6 +822,22 @@ mod tests {
 
         for &(hf, expected_gguf) in cases {
             assert_direct(hf, expected_gguf);
+        }
+    }
+
+    /// Sibling — `embeddings.token_type_embeddings.weight` must emit
+    /// `DirectWithBake(Squeeze)` so the singleton-dim
+    /// `[1, 768]` source shape becomes 1-D `[768]` in the GGUF
+    /// (canonical-observed `token_types.weight` shape).
+    #[test]
+    fn nomic_bert_token_types_weight_emits_squeeze_bake() {
+        let ctx = ctx_v15();
+        match map_tensor_name("embeddings.token_type_embeddings.weight", NO_SHAPE, &ctx) {
+            Some(MappedTensor::DirectWithBake { gguf_name, bake }) => {
+                assert_eq!(gguf_name, "token_types.weight");
+                assert_eq!(bake, BakeOp::Squeeze);
+            }
+            other => panic!("expected DirectWithBake(Squeeze), got {other:?}"),
         }
     }
 

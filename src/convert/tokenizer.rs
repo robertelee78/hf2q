@@ -328,8 +328,34 @@ pub fn build_tokenizer_metadata(
     };
 
     // ----- 5. Build ordered tokens array, gap-filling with [PAD{i}]. ----
+    //
+    // For Unigram (XLM-RoBERTa) tokenizers, canonical
+    // `_xlmroberta_set_vocab` at `bert.py:210-213` does a
+    // realignment AFTER initializing `tokens = [f"[PAD{i}]" for i in
+    // range(vocab_size)]`:
+    //
+    //     tokens = [b'<s>', b'<pad>', b'</s>', b'<unk>'] + tokens[3:-1]
+    //
+    // The slice `tokens[3:-1]` drops index 0..3 (which the new
+    // specials replace) AND the last entry, then prepends 4 specials.
+    // The net effect on the padding pattern: for `i >= 4`, `tokens[i]`
+    // becomes `"[PAD{i-1}]"` (shifted by one). The PAD entries that
+    // sentencepiece doesn't later overwrite keep this shifted naming.
+    //
+    // For nomic v2-moe at vocab_size=250048: real-token indices
+    // 4..=250001 (incl. <mask> at 250001) come from tokenizer.json;
+    // indices 250002..=250047 stay as PADs and need the canonical
+    // shifted naming ("[PAD250001]" at index 250002, etc.) for
+    // byte-cmp parity.
+    let unigram_realigned = model_type == "Unigram";
     let mut tokens: Vec<String> = (0..target_vocab_size)
-        .map(|i| format!("[PAD{i}]"))
+        .map(|i| {
+            if unigram_realigned && i >= 4 {
+                format!("[PAD{}]", i - 1)
+            } else {
+                format!("[PAD{i}]")
+            }
+        })
         .collect();
     let mut filled_ids: HashSet<u32> = HashSet::new();
     for (id, token) in &id_to_token {
