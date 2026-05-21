@@ -31,6 +31,14 @@
 
 **Smoke test (#58) PASSED**: hf2q-converted Llama 3 8B Q4_K_M loads + generates tokens in stock `/opt/llama.cpp/build/bin/llama-cli` (verified at HEAD `4a5784ce` and Qwen 3.5 35B at 113 t/s decode per project memory).
 
+**Perf benchmark 2026-05-21 at HEAD `966e4aae`, M5 Max, Llama 3 8B Q4_K_M**:
+- hf2q one-shot (streaming, no intermediate F16): **34.6s wall, 1017% CPU**
+- canonical convert_hf_to_gguf.py (BF16→F16): 9.6s
+- canonical llama-quantize (F16→Q4_K_M): 34.8s @ 729% CPU
+- canonical TOTAL: **44.4s wall** (two-step pipeline)
+- **hf2q is 1.28× faster end-to-end on this 8B dense model.** Earlier benchmark on Gemma 4 26B MoE (commit `3b24daea`, ADR-036) measured 3.0× faster due to per-tensor parallelization amortizing better with more tensors + 256 experts.
+- Both outputs SHA256-match: `031317c1e1eb80b9c2a12def0ff6f251168dbfd2734fb3695187e208cc0066b3`.
+
 - **Status**: SHIPPED + **§P1 BYTE-IDENTICAL 2026-05-19** (8 quants on Gemma 4, commits `50fd89c2`/`a280dd04`/`48862d40`/`27b055fa`/`22775346`; root commit `50fd89c2`) — P-1..P6 Phase 1 + tokenizer + streaming + F32-keep + real-model validation + §9 fingerprint manifest + §Pi Phase A (imatrix corpus loader + accumulator + .imatrix.gguf writer/loader + CLI flags + I-tier APEX wiring via `--imatrix <file>`) all on main. B1 (`--repo` auto-download via `huggingface-cli`) + B4 (`convert-v2` → `convert` rename; no alias per [[feedback-no-backwards-compat-2026-05-18]]) also shipped 2026-05-19. **§P1 quality-equivalence gate: PASS at BYTE-IDENTICAL level vs canonical `convert_hf_to_gguf.py --outtype f16 | llama-quantize Q4_K_M` (commit `50fd89c2`).** Per-arch scope: §P1 byte-identical is a per-arch correctness gate; **Gemma 4 26B-A4B-IT: GREEN** (8 quants × 658 tensors = 5,264 verifications, commits `50fd89c2`/`a280dd04`/`48862d40`/`27b055fa`/`22775346`); **Qwen 3.5 35B-A3B (multimodal VLM): GREEN BYTE-IDENTICAL** on real-model Q4_K_M (0/21,701,419,520 bytes diff at HEAD `42b346fb`, 2026-05-20 — see "Authoritative real-model byte-cmp" table below). Convert successfully produces GGUFs at multiple quant tiers from operator's `/opt/hf2q/models/Qwen-Qwen3.5-35B-A3B` (`Qwen3_5MoeForConditionalGeneration`, 1,811 safetensors patterns including 785 mtp.* + 26 model.visual.* dropped). Stock `/opt/llama.cpp/build/bin/llama-cli` loads + decodes **coherent English chain-of-thought** across multiple quants and prompts (113-116 tok/s decode).
 
 §P1 byte-cmp vs canonical `convert_hf_to_gguf.py | llama-quantize <tier>` (Qwen 3.5 35B-A3B):
