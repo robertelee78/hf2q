@@ -137,7 +137,7 @@ const GEMMA4_26B: &str = "/opt/hf2q/models/google-gemma-4-26b-a4b-it";
 const QWEN35_35B: &str = "/opt/hf2q/models/Qwen-Qwen3.5-35B-A3B";
 const LLAMA3_8B: &str = "/opt/hf2q/models/NousResearch-Meta-Llama-3-8B";
 const MINIMAX_M2: &str = "/opt/hf2q/models/MiniMaxAI-MiniMax-M2";
-const QWEN3VL_TEXT: &str = "/opt/hf2q/models/Qwen-Qwen3-VL";
+const QWEN3VL_TEXT: &str = "/opt/hf2q/models/Qwen-Qwen3-VL-8B-Instruct";
 
 // Gemma 4 26B-A4B-IT
 smoke_test!(smoke_gemma4_26b_q4_k_m, GEMMA4_26B, "q4_k_m");
