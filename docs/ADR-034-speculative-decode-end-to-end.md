@@ -99,6 +99,13 @@ DFlash coverage: Gemma 4 26B/31B (Workstream B Phase 5), Qwen 3.5/3.6 27B/35B-A3
 
 Two-pronged deep audit (2026-05-19) — claude as primary, codex as independent spot-checker. Codex was given a fixed JSON-schema review prompt and read the source independently; its verdict is in `/tmp/cfa-mtp-audit/codex-last.txt` (preserved for the record).
 
+**REVISION 2026-05-21 at HEAD `193802f3`** — empirical re-verification during ADR-034 prep deep-research:
+- Convert side MTP arms: **LANDED** in `qwen35moe_full.rs:687-705` via ADR-033 §P1 closure work. SHA256-byte-identical to canonical's PR #22673 output on Qwen 3.5 35B-A3B (4 nextn.* tensors at blk.40 in `/opt/hf2q/cache/byte_cmp/Qwen-Qwen3.5-35B-A3B_canonical_q4_k_m.gguf`).
+- Runtime DENSE MTP: **EMPIRICALLY WORKING**. Tested at HEAD `193802f3` on `froggeric/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-Q8_0-mtp.gguf` (downloaded during this prep session) — coherent haiku output + **63.6% MTP acceptance rate** at 20.1 tok/s. See [[project_adr034_qwen36_27b_mtp_working_2026_05_21]].
+- Runtime MoE MTP: **BROKEN** by a hardcoded-dense FFN loader (`mtp_weights_load.rs:268-291`). Fails on canonical-converted Qwen 3.5 35B-A3B MTP GGUF with typed error. See [[project_adr034_mtp_loader_moe_bug_2026_05_21]]. Fix scope: 300-500 LOC enum refactor + MoE forward dispatch.
+- DFlash scaffold: **STILL UNVALIDATED**. 7011 LOC + zero numerical-parity coverage against `/opt/dflash/dflash/model_mlx.py`. Parity harness scaffold landed in this prep session at `scripts/parity/` + `tests/parity_*.rs`; awaits Python-side implementation.
+- B-W-1 heisenbug (Phase -2 prereq): per ADR-015 §iter61a-2 receipts at line 114, closed at commits `aa5b410` (mlx-native) + `c8809fc` (hf2q). Determinism check not re-verified in this prep session against HEAD `193802f3` — recommended action before P-1 starts.
+
 **Claimed status (per prior ADRs and `model_card.md` style docs)**:
 - ADR-013 P10 ("MTP load path") — "Pending (simple, MTP load-only)" then later marked complete
 - ADR-013 P14 ("MTP speculative-decoding execution (COMPLETE)") — claims merged on main at `79140ec` 2026-04-25 with 4 passing tests
