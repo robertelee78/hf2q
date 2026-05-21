@@ -22,6 +22,97 @@
 
 ---
 
+## 🎯 START HERE — Current state at HEAD `21be1efd` (2026-05-21)
+
+> **READ THIS FIRST.** §1 and §2 below describe the audit baseline at HEAD `eab0220b`
+> (2026-05-19) — substantial work has landed since. This section is the authoritative
+> hand-off summary for an engineer picking up ADR-034 today.
+
+### Per-cell empirical state
+
+| Cell | Status | Evidence | Remaining work |
+|---|---|---|---|
+| **A — Qwen 3.6 27B dense MTP** | ✅ **WORKING** | Coherent haiku output + **66.1% MTP acceptance** at 20.1 tok/s (Q8_0). Determinism PASS 3/3 byte-identical. K=1 dispatch via `qwen35 spec` path. | P1 parity harness (G2 gate); P6 perf gate vs MTPLX 63 tok/s ref |
+| **A — Qwen 3.5/3.6 35B-A3B MoE-MTP** | 🚨 **LOADER BUG** | `MTP loader hardcodes dense FFN tensor names; canonical GGUF emits MoE-style names. Fails on Qwen 3.5 35B-A3B Q4_K_M (SHA byte-identical to canonical).` | **300-500 LOC enum refactor** of `MtpWeights::ffn` + MoE forward dispatch in `mtp_weights_load.rs:268-291` + `mtp.rs::forward_ffn_residual` |
+| **B — Qwen 3.6 DFlash** | 🟡 **DISPATCH NOT WIRED** | DFlash drafter loads + safetensors validated (test passes), but `cmd_generate_qwen35` doesn't call `try_dispatch_dflash_spec_decode`. Silently falls through to MTP path. | **~50-100 LOC** to wire `try_dispatch_dflash_spec_decode` into `cmd_generate_qwen35` (line ~2686 in `src/serve/mod.rs`), mirroring the generic `cmd_generate` call at line 1291 |
+| **C — Gemma 4 26B DFlash** | ✅ **WORKING** | "**Paris**." coherent output via DFlash path at 19.3 tok/s. End-to-end pipeline runs (drafter load → upload → prefill capture → draft + verify rounds → coherent output). | P1 parity harness; P5 sampled-path (Leviathan-2023); P6 perf gate |
+| **D — Gemma 4 -assistant** | Phase 7, deferred | Not in v1 scope | — |
+
+### Data assets on disk
+
+| Asset | Location | Size | Use |
+|---|---|---:|---|
+| Qwen 3.6 27B MTP GGUF (Q4_K_M + Q8_0) | `/opt/hf2q/models/Qwen3.6-27B-MTP-GGUF/` | 46 GB | Cell A target |
+| Qwen 3.5 35B-A3B safetensors (MoE + MTP heads) | `/opt/hf2q/models/Qwen-Qwen3.5-35B-A3B/` | 67 GB | Cell A 35B-A3B target |
+| Qwen 3.5 35B-A3B Q4_K_M canonical ref GGUF (byte-identical to hf2q convert) | `/opt/hf2q/cache/byte_cmp/Qwen-Qwen3.5-35B-A3B_canonical_q4_k_m.gguf` | 20 GB | Test target for MoE MTP loader fix |
+| Gemma 4 26B-A4B safetensors + canonical Q8_0 GGUF | `/opt/hf2q/models/google-gemma-4-26b-a4b-it/`, `/opt/hf2q/cache/byte_cmp/` | 50 + 24 GB | Cell C target |
+| z-lab/Qwen3.6-27B-DFlash drafter | `/opt/hf2q/models/dflash-drafters/z-lab__Qwen3.6-27B-DFlash/` | 3.3 GB | Cell B drafter |
+| z-lab/Qwen3.6-35B-A3B-DFlash drafter | `/opt/hf2q/models/dflash-drafters/z-lab__Qwen3.6-35B-A3B-DFlash/` | 948 MB | Cell B 35B drafter |
+| z-lab/gemma-4-26B-A4B-it-DFlash drafter | `/opt/hf2q/models/dflash-drafters/z-lab__gemma-4-26B-A4B-it-DFlash/` | 858 MB | Cell C drafter (✅ tested) |
+
+**External-drive disk (`/Volumes/Extreme Pro`) is at 100% capacity** — additional Qwen 3.6 27B / 35B BF16 safetensors downloads need disk freed first.
+
+### What's already landed (DO NOT redo)
+
+- ✅ MTP convert arms (`qwen35moe_full.rs:687-705`) — byte-identical to canonical
+- ✅ `+1` bake on norm.weight tensors (`BakeOp::AddOne` applied at 10 sites)
+- ✅ MTP runtime DENSE forward path (`mtp.rs::forward_draft`) — empirically working
+- ✅ DFlash scaffold (7011 LOC) — config + weights loaders validated against real files via 6 new tests at HEAD `21be1efd`
+- ✅ Parity harness scaffold (`scripts/parity/` + `tests/parity_*.rs`) — Python ref scripts SKELETONS only; Rust tests skip-clean
+- ✅ Determinism (Phase -2 prereq) — PASS at HEAD `21be1efd`
+- ✅ HF2Q_SPEC_DFLASH env wiring (works for non-qwen35 archs)
+- ✅ HF2Q_SPEC_DECODE env wiring (works for qwen35 MTP path)
+- ✅ B-W-1 heisenbug closed per ADR-015 iter61a-2 receipts
+- ✅ External pins all intact and verified
+
+### Recommended execution sequence (revised after empirical prep)
+
+1. **P-1 docs/supersession** (~30 min, 50 LOC) — mark ADR-013 P14 as superseded
+2. **P3.1 MoE MTP loader fix** (~2-4 hrs, **300-500 LOC**) — unblocks Cell A 35B-A3B
+   - File: `src/inference/models/qwen35/mtp_weights_load.rs`
+   - Approach: enum `MtpFfnWeights { Dense, Moe, MoeQ }`; detect via `gguf.tensor_info("blk.N.ffn_gate_exps.weight").is_some()`; reuse existing `MoeFfnWeightsGpu::from_cpu` and `MoeFfnWeightsGpuQ::from_quantized`
+   - Test gate: `hf2q generate` on `cache/byte_cmp/Qwen-Qwen3.5-35B-A3B_canonical_q4_k_m.gguf` must produce coherent text + report accept rate > 30%
+   - See memory [[project_adr034_mtp_loader_moe_bug_2026_05_21]]
+3. **P1.1 mtp_parity.py impl** (~2-4 hrs, 200-400 LOC) — unblocks G2 gate
+   - Build on `scripts/parity/mtp_parity.py` scaffold
+   - Use Qwen 3.6 27B MTP GGUF (on disk) + HF transformers OR /opt/MTPLX/mtplx as reference
+   - Dump intermediates: enorm/hnorm outputs, eh_proj sum, attn output, ffn output, final logits
+   - Compare via `tests/parity_mtp_python_ref.rs` (scaffold landed, skip-clean)
+4. **P1.2 dflash_parity.py impl** (~2-3 hrs, 150-250 LOC) — unblocks G2 DFlash gate
+   - Build on `scripts/parity/dflash_parity.py` scaffold
+   - Use `/opt/dflash/dflash/model_mlx.py` (582 LOC reference) + Gemma 4 26B target (best-ready cell)
+   - Dump intermediates: per-layer drafter outputs + final logits
+   - Compare via `tests/parity_dflash_python_ref.rs`
+5. **P5.1 Qwen DFlash dispatch wiring** (~1 hr, **50-100 LOC**) — unblocks Cell B
+   - Find `cmd_generate_qwen35` at `src/serve/mod.rs:2686`
+   - Add `try_dispatch_dflash_spec_decode(...)` call before MTP/per-token-decode block
+   - Mirror the structure already present in generic `cmd_generate` at line 1291
+   - Test gate: `HF2Q_SPEC_DFLASH=1 HF2Q_DFLASH_DRAFTER_PATH=... hf2q generate ...` produces `[HF2Q_SPEC_DFLASH=1]` banner + coherent text on Qwen 3.6 27B target
+6. **Run parity gates** against all 3 working cells (A-27B, B-27B, C-Gemma-26B)
+7. **P4 DFlash audit via parity diff** (~300 LOC remaining of original 600) — close gaps surfaced by parity harness
+8. **P5.2 Leviathan-2023 rejection sampler** validation
+9. **P6 perf gates** (~200 LOC scripting) — F1/F2/F3 measurements
+
+**Total remaining: ~1450 LOC** (originally estimated ~2500; -40% because ADR-033 §P1 landed the convert side AND this prep session validated the load/dispatch layers).
+
+### What an engineer needs (besides this section)
+
+- Read [[project_adr034_readiness_final_2026_05_21]] memory entry for cross-cutting findings
+- Read [[project_adr034_mtp_loader_moe_bug_2026_05_21]] for the concrete P3.1 bug detail
+- Read [[project_adr034_qwen36_27b_mtp_working_2026_05_21]] for the empirical evidence chain
+- Read [[project_adr034_prep_session_summary_2026_05_21]] for the data inventory
+- Run `bash scripts/coherence-harness/determinism_check.sh ...` to re-verify Phase -2 at their HEAD
+
+### Sections below — note staleness
+
+- §1.2 has a 2026-05-21 REVISION block but the main text describes HEAD `eab0220b`
+- §2.2 "What's missing" table — **partially stale**: convert MTP arms ARE landed; DFlash config+weights ARE validated
+- §3.5 corrected 2026-05-21 (MoE row added; original "dense even for MoE" claim falsified)
+- §4 phase LOC estimates — **stale by ~40%**, see "Recommended execution sequence" above for revised
+- §5 risks — still relevant but missing the MoE MTP loader bug + Qwen DFlash dispatch wiring
+
+---
+
 ## 0. Mantra alignment
 
 > "DO NOT BE LAZY. We have plenty of time to do it right. No short cuts. Never make assumptions. Always dive deep and ensure you know the problem you're solving. Make use of search as needed. Measure 3x, cut once. No fallback. No stub (todo later) code. Just pure excellence, done the right way the entire time. Also recall Chesterton's fence; always understand current fully before changing it."
