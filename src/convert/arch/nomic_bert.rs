@@ -567,6 +567,54 @@ pub fn build_metadata(
                 MetaValue::String(sl.to_string()),
             ));
         }
+        // HF model-card metadata (license, base_model, tags, languages).
+        // CANONICAL ORDER: emitted BEFORE the per-arch keys (verified
+        // against the canonical Q8_0 GGUF dump for nomic v2-moe —
+        // positions 8-17 vs the arch keys at 18-31).
+        if let Some(card) = model_card {
+            if let Some(license) = &card.license {
+                kv_v2moe.push(("general.license".into(), MetaValue::String(license.clone())));
+            }
+            if !card.base_models.is_empty() {
+                kv_v2moe.push((
+                    "general.base_model.count".into(),
+                    MetaValue::U32(card.base_models.len() as u32),
+                ));
+                for (i, entry) in card.base_models.iter().enumerate() {
+                    let (name, org, url) = split_base_model(&entry.raw);
+                    if let Some(name) = name {
+                        kv_v2moe.push((
+                            format!("general.base_model.{i}.name"),
+                            MetaValue::String(name),
+                        ));
+                    }
+                    if let Some(org) = org {
+                        kv_v2moe.push((
+                            format!("general.base_model.{i}.organization"),
+                            MetaValue::String(org),
+                        ));
+                    }
+                    if let Some(url) = url {
+                        kv_v2moe.push((
+                            format!("general.base_model.{i}.repo_url"),
+                            MetaValue::String(url),
+                        ));
+                    }
+                }
+            }
+            if !card.tags.is_empty() {
+                kv_v2moe.push((
+                    "general.tags".into(),
+                    MetaValue::ArrayString(card.tags.clone()),
+                ));
+            }
+            if !card.languages.is_empty() {
+                kv_v2moe.push((
+                    "general.languages".into(),
+                    MetaValue::ArrayString(card.languages.clone()),
+                ));
+            }
+        }
         kv_v2moe.extend([
             (format!("{arch_name}.block_count"), MetaValue::U32(n_layers)),
             (format!("{arch_name}.context_length"), MetaValue::U32(ctx_len)),
@@ -616,65 +664,14 @@ pub fn build_metadata(
                 MetaValue::U32(moe_top_k),
             ),
         ]);
-        // HF model-card metadata (from README.md YAML frontmatter).
-        // Canonical emits these in a fixed order via
-        // `gguf-py/gguf/metadata.py::Metadata.set_gguf_meta_model`.
-        // For nomic v2-moe the observed subset is:
-        //   general.license, general.base_model.{count, 0.*},
-        //   general.tags, general.languages.
-        // The basename / version / organization / size_label fields
-        // require the name-parsing heuristic at `metadata.py:240-355`
-        // — separate iteration (size_label also needs param-counting).
-        if let Some(card) = model_card {
-            if let Some(license) = &card.license {
-                kv_v2moe.push(("general.license".into(), MetaValue::String(license.clone())));
-            }
-            if !card.base_models.is_empty() {
-                kv_v2moe.push((
-                    "general.base_model.count".into(),
-                    MetaValue::U32(card.base_models.len() as u32),
-                ));
-                for (i, entry) in card.base_models.iter().enumerate() {
-                    let (name, org, url) = split_base_model(&entry.raw);
-                    if let Some(name) = name {
-                        kv_v2moe.push((
-                            format!("general.base_model.{i}.name"),
-                            MetaValue::String(name),
-                        ));
-                    }
-                    if let Some(org) = org {
-                        kv_v2moe.push((
-                            format!("general.base_model.{i}.organization"),
-                            MetaValue::String(org),
-                        ));
-                    }
-                    if let Some(url) = url {
-                        kv_v2moe.push((
-                            format!("general.base_model.{i}.repo_url"),
-                            MetaValue::String(url),
-                        ));
-                    }
-                }
-            }
-            if !card.tags.is_empty() {
-                kv_v2moe.push((
-                    "general.tags".into(),
-                    MetaValue::ArrayString(card.tags.clone()),
-                ));
-            }
-            if !card.languages.is_empty() {
-                kv_v2moe.push((
-                    "general.languages".into(),
-                    MetaValue::ArrayString(card.languages.clone()),
-                ));
-            }
-        }
-        // Canonical emits these last (positions 50-51 in the
-        // Q8_0 GGUF dump): `general.quantization_version=2` is
-        // added by `llama-quantize` (matches GGUF spec), and
-        // `general.file_type` is added by the convert step's
-        // `add_file_type(ftype)` at `base.py:1220`. We emit both
-        // here since hf2q's convert+quantize is a single pipeline.
+        // Canonical emits `general.quantization_version` and
+        // `general.file_type` LAST (positions 50-51 in the canonical
+        // Q8_0 GGUF dump — AFTER all tokenizer.* keys). `cli_driver`'s
+        // metadata-emit phase pulls these two keys out of the prelude
+        // and re-emits them after the tokenizer block. We still place
+        // them here at the end of the arch keys for v1.5-style
+        // single-shot consumers; cli_driver's reorder is a no-op when
+        // they're already at the end.
         kv_v2moe.push((
             "general.quantization_version".into(),
             MetaValue::U32(2),

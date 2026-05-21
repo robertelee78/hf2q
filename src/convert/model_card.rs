@@ -103,6 +103,14 @@ fn extract_frontmatter_block(contents: &str) -> Option<&str> {
 fn parse_yaml_frontmatter(text: &str) -> ModelCard {
     let mut card = ModelCard::default();
     let mut lines = text.lines().peekable();
+    // `pipeline_tag` is collected separately and APPENDED to `tags`
+    // at the end, matching canonical `metadata.py:556-557`:
+    //   use_array_model_card_metadata("tags", "tags")
+    //   use_array_model_card_metadata("tags", "pipeline_tag")
+    // Canonical's call order means `pipeline_tag` always lands AFTER
+    // the YAML `tags:` entries regardless of which appears first in
+    // the YAML file.
+    let mut pipeline_tag: Option<String> = None;
 
     while let Some(line) = lines.next() {
         if line.is_empty() || line.trim_start().starts_with('#') {
@@ -130,6 +138,14 @@ fn parse_yaml_frontmatter(text: &str) -> ModelCard {
             "tags" => {
                 card.tags = read_block_list(&mut lines);
             }
+            // Canonical `metadata.py:557` appends `pipeline_tag` to the
+            // `tags` array AFTER tags itself is set. We accumulate
+            // here and append below.
+            "pipeline_tag" => {
+                if !after_colon.is_empty() {
+                    pipeline_tag = Some(unquote_scalar(after_colon).to_string());
+                }
+            }
             "language" => {
                 card.languages = read_block_list(&mut lines);
             }
@@ -148,6 +164,10 @@ fn parse_yaml_frontmatter(text: &str) -> ModelCard {
                 }
             }
         }
+    }
+
+    if let Some(pt) = pipeline_tag {
+        card.tags.push(pt);
     }
 
     card
@@ -856,12 +876,19 @@ language:
 ";
         let card = parse_yaml_frontmatter(frontmatter);
         assert_eq!(card.license.as_deref(), Some("apache-2.0"));
+        // Canonical `metadata.py:556-557` appends `pipeline_tag` to
+        // `tags`, so the final tags array has 4 entries (the 3 tags +
+        // "sentence-similarity" from pipeline_tag). This duplication
+        // is canonical-observed: the Q8_0 nomic v2-moe GGUF dump
+        // shows `tags = ['sentence-transformers', 'sentence-similarity',
+        // 'feature-extraction', 'sentence-similarity']`.
         assert_eq!(
             card.tags,
             vec![
                 "sentence-transformers",
                 "sentence-similarity",
-                "feature-extraction"
+                "feature-extraction",
+                "sentence-similarity"
             ]
         );
         assert_eq!(card.languages, vec!["en", "es", "no"]);

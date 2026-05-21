@@ -467,103 +467,46 @@ pub fn build_tokenizer_metadata(
     let merges = extract_merges(model_section);
 
     // ----- 11. Assemble KV list ---------------------------------------
-    let mut kv: Vec<(String, MetaValue)> = Vec::with_capacity(16);
-    kv.push((
-        "tokenizer.ggml.model".into(),
-        MetaValue::String(tokenizer_model_name),
-    ));
-    kv.push((
-        "tokenizer.ggml.tokens".into(),
-        MetaValue::ArrayString(tokens),
-    ));
-    kv.push((
-        "tokenizer.ggml.scores".into(),
-        MetaValue::ArrayF32(scores),
-    ));
-    kv.push((
-        "tokenizer.ggml.token_type".into(),
-        MetaValue::ArrayI32(token_types),
-    ));
-    if !merges.is_empty() {
-        kv.push((
-            "tokenizer.ggml.merges".into(),
-            MetaValue::ArrayString(merges),
-        ));
-    }
-    if let Some(id) = bos_id {
-        kv.push(("tokenizer.ggml.bos_token_id".into(), MetaValue::U32(id)));
-    }
-    if let Some(id) = eos_id {
-        kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
-    }
-    if let Some(id) = unk_id {
-        kv.push((
-            "tokenizer.ggml.unknown_token_id".into(),
-            MetaValue::U32(id),
-        ));
-    }
-    if let Some(id) = pad_id {
-        kv.push((
-            "tokenizer.ggml.padding_token_id".into(),
-            MetaValue::U32(id),
-        ));
-    }
-    // SEP / MASK token ids — emitted by canonical `SpecialVocab.add_to_gguf`
-    // when those entries are present in `special_tokens_map.json` /
-    // `tokenizer_config.json`. Note: canonical writes the field as
-    // `seperator_token_id` (sic — `bert.py` typo upstream); we mirror
-    // exactly for byte-cmp parity. Mask token is only emitted on
-    // models that carry one (XLM-RoBERTa-family / sentencepiece).
-    if let Some(id) = sep_id {
-        kv.push((
-            "tokenizer.ggml.seperator_token_id".into(),
-            MetaValue::U32(id),
-        ));
-    }
-    if let Some(id) = mask_id {
-        kv.push((
-            "tokenizer.ggml.mask_token_id".into(),
-            MetaValue::U32(id),
-        ));
-    }
-    // gemma.py:652-653: add_bos_token=True + add_space_prefix=False
-    // for BPE/WordPiece. For Unigram (XLM-RoBERTa-style — nomic v2-moe,
-    // sentencepiece), `add_space_prefix` is True (sentencepiece's
-    // `normalizer_spec.add_dummy_prefix=True` per `bert.py:152`).
-    kv.push((
-        "tokenizer.ggml.add_bos_token".into(),
-        MetaValue::Bool(true),
-    ));
-    let add_space_prefix = model_type == "Unigram";
-    kv.push((
-        "tokenizer.ggml.add_space_prefix".into(),
-        MetaValue::Bool(add_space_prefix),
-    ));
-    kv.push((
-        "tokenizer.ggml.pre".into(),
-        MetaValue::String(pre_tokenizer),
-    ));
-
-    // ----- Unigram-specific tokenizer metadata (XLM-RoBERTa parity) ----
     //
-    // Canonical `_xlmroberta_set_vocab` at `bert.py:227-236` emits four
-    // additional KV pairs on the Unigram path:
-    //   - `tokenizer.ggml.token_type_count` ← `hparams.type_vocab_size`
-    //     (default 1)
-    //   - `tokenizer.ggml.remove_extra_whitespaces` ←
-    //     `sentencepiece_model.normalizer_spec.remove_extra_whitespaces`
-    //     (always True for the `nmt_nfkc` normalizer that XLM-RoBERTa
-    //     uses; canonical's tokenizer.json fallback uses
-    //     `tokenizer.clean_up_tokenization_spaces` which is also True
-    //     for the same model class).
-    //   - `tokenizer.ggml.precompiled_charsmap` ←
-    //     `sentencepiece_model.normalizer_spec.precompiled_charsmap`
-    //     bytes (237 KB for XLM-RoBERTa-base; verified byte-identical
-    //     to tokenizer.json's base64-decoded
-    //     `normalizer.precompiled_charsmap`). This is the bulk of the
-    //     tokenizer metadata payload — closing the byte-cmp gap to
-    //     canonical Q8_0 GGUF.
+    // Unigram (XLM-RoBERTa) and BPE/WordPiece paths emit in different
+    // canonical orders. Unigram order mirrors canonical
+    // `_xlmroberta_set_vocab` at `bert.py:227-236` exactly — verified
+    // against the Q8_0 nomic v2-moe GGUF dump (lines 32-49). BPE /
+    // WordPiece keeps the historical hf2q order (no upstream byte-cmp
+    // gate that pins the exact order; reordering would risk regressing
+    // Gemma 4 / Llama 3 / BERT bge byte-cmp tests).
+    let mut kv: Vec<(String, MetaValue)> = Vec::with_capacity(20);
     if model_type == "Unigram" {
+        // Canonical Unigram emit order:
+        //   model, pre, tokens, scores, token_type,
+        //   add_space_prefix, token_type_count,
+        //   remove_extra_whitespaces, precompiled_charsmap,
+        //   bos, eos, unk, seperator, padding, mask,
+        //   add_bos_token, add_eos_token, add_sep_token.
+        kv.push((
+            "tokenizer.ggml.model".into(),
+            MetaValue::String(tokenizer_model_name),
+        ));
+        kv.push((
+            "tokenizer.ggml.pre".into(),
+            MetaValue::String(pre_tokenizer),
+        ));
+        kv.push((
+            "tokenizer.ggml.tokens".into(),
+            MetaValue::ArrayString(tokens),
+        ));
+        kv.push((
+            "tokenizer.ggml.scores".into(),
+            MetaValue::ArrayF32(scores),
+        ));
+        kv.push((
+            "tokenizer.ggml.token_type".into(),
+            MetaValue::ArrayI32(token_types),
+        ));
+        kv.push((
+            "tokenizer.ggml.add_space_prefix".into(),
+            MetaValue::Bool(true),
+        ));
         let type_vocab_size = read_type_vocab_size_from_config(model_dir).unwrap_or(1);
         kv.push((
             "tokenizer.ggml.token_type_count".into(),
@@ -579,11 +522,40 @@ pub fn build_tokenizer_metadata(
                 MetaValue::ArrayU8(cm_bytes),
             ));
         }
-        // Canonical `SpecialVocab` adds `add_eos_token=true` and
-        // `add_sep_token=true` for XLM-RoBERTa-family models (see
-        // dump: indices 48-49 in the canonical Q8_0 nomic v2-moe
-        // GGUF). These are gated on `model_type == "Unigram"` because
-        // BPE/WordPiece checkpoints don't carry the sep_token at all.
+        if let Some(id) = bos_id {
+            kv.push(("tokenizer.ggml.bos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = eos_id {
+            kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = unk_id {
+            kv.push((
+                "tokenizer.ggml.unknown_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        if let Some(id) = sep_id {
+            kv.push((
+                "tokenizer.ggml.seperator_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        if let Some(id) = pad_id {
+            kv.push((
+                "tokenizer.ggml.padding_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        if let Some(id) = mask_id {
+            kv.push((
+                "tokenizer.ggml.mask_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        kv.push((
+            "tokenizer.ggml.add_bos_token".into(),
+            MetaValue::Bool(true),
+        ));
         kv.push((
             "tokenizer.ggml.add_eos_token".into(),
             MetaValue::Bool(true),
@@ -591,6 +563,61 @@ pub fn build_tokenizer_metadata(
         kv.push((
             "tokenizer.ggml.add_sep_token".into(),
             MetaValue::Bool(true),
+        ));
+    } else {
+        // BPE / WordPiece order — historical hf2q emit sequence,
+        // preserved for byte-cmp parity on Gemma 4 / Llama 3 / BERT bge.
+        kv.push((
+            "tokenizer.ggml.model".into(),
+            MetaValue::String(tokenizer_model_name),
+        ));
+        kv.push((
+            "tokenizer.ggml.tokens".into(),
+            MetaValue::ArrayString(tokens),
+        ));
+        kv.push((
+            "tokenizer.ggml.scores".into(),
+            MetaValue::ArrayF32(scores),
+        ));
+        kv.push((
+            "tokenizer.ggml.token_type".into(),
+            MetaValue::ArrayI32(token_types),
+        ));
+        if !merges.is_empty() {
+            kv.push((
+                "tokenizer.ggml.merges".into(),
+                MetaValue::ArrayString(merges),
+            ));
+        }
+        if let Some(id) = bos_id {
+            kv.push(("tokenizer.ggml.bos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = eos_id {
+            kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = unk_id {
+            kv.push((
+                "tokenizer.ggml.unknown_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        if let Some(id) = pad_id {
+            kv.push((
+                "tokenizer.ggml.padding_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        kv.push((
+            "tokenizer.ggml.add_bos_token".into(),
+            MetaValue::Bool(true),
+        ));
+        kv.push((
+            "tokenizer.ggml.add_space_prefix".into(),
+            MetaValue::Bool(false),
+        ));
+        kv.push((
+            "tokenizer.ggml.pre".into(),
+            MetaValue::String(pre_tokenizer),
         ));
     }
 

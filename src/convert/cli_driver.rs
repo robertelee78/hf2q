@@ -576,13 +576,35 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // GGUF-side `_exps.` check — equivalent results).
     let size_label = compute_size_label_for_arch(arch, &src, &src.config);
     let ftype_u32 = ftype_for_metadata as u32;
-    for (k, v) in build_metadata_for_arch(
+    let arch_metadata = build_metadata_for_arch(
         arch,
         &src.config,
         ftype_u32,
         model_card.as_ref(),
         size_label.as_deref(),
-    ) {
+    );
+
+    // Canonical emits `general.quantization_version` and
+    // `general.file_type` AFTER the tokenizer block (positions 50-51 of
+    // the canonical Q8_0 GGUF dump for nomic v2-moe). Split them out
+    // of the arch metadata into a postlude that emits last. Other
+    // arches' build_metadata may also place these at the end of their
+    // vec; we pull them out by exact key match so non-MoE paths still
+    // emit in the same canonical-tail position.
+    const POSTLUDE_KEYS: &[&str] = &[
+        "general.quantization_version",
+        "general.file_type",
+    ];
+    let mut prelude: Vec<(String, MetaValue)> = Vec::with_capacity(arch_metadata.len());
+    let mut postlude: Vec<(String, MetaValue)> = Vec::with_capacity(POSTLUDE_KEYS.len());
+    for (k, v) in arch_metadata {
+        if POSTLUDE_KEYS.contains(&k.as_str()) {
+            postlude.push((k, v));
+        } else {
+            prelude.push((k, v));
+        }
+    }
+    for (k, v) in prelude {
         orch.add_metadata(k, v);
     }
 
@@ -596,6 +618,11 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // variant rather than skipping silently — that exact silent skip
     // is what produced the bug.
     for (k, v) in build_tokenizer_metadata(&args.hf_dir, arch)? {
+        orch.add_metadata(k, v);
+    }
+    // Postlude: general.quantization_version + general.file_type
+    // emitted last (per canonical order).
+    for (k, v) in postlude {
         orch.add_metadata(k, v);
     }
 
