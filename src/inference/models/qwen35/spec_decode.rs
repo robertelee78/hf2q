@@ -1043,7 +1043,36 @@ impl<'a> SpecDecode<'a> {
                 let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
                 let post_t0 = if mtp_profile { Some(Instant::now()) } else { None };
-                let verified = greedy_argmax_last_token(&verify_logits, vocab);
+                // ADR-034 task #91 Step 3 (2026-05-21) — MH stochastic
+                // acceptance for K=0 path. At temp > 0:
+                //   accept iff u < min(1, p_target(proposed) / q_draft(proposed))
+                //   on reject: emit replacement from residual max(0, p - q)
+                // Greedy temp=0 path is byte-identical to pre-Step-3.
+                let last_verify_logits = last_logits(&verify_logits, vocab)?;
+                let (verified, mh_accepted_k0): (u32, Option<bool>) = if is_mh {
+                    let draft_probs = draft_probs_opt
+                        .as_ref()
+                        .expect("MH mode must have draft_probs from MTP draft sampling");
+                    let target_probs = crate::inference::spec_decode::dflash
+                        ::rejection_sampler::softmax_with_temp(last_verify_logits, sampler_temp);
+                    let step = crate::inference::spec_decode::dflash
+                        ::rejection_sampler::leviathan_step(
+                            proposed,
+                            &target_probs,
+                            draft_probs,
+                            &mut rng,
+                        );
+                    match step {
+                        crate::inference::spec_decode::dflash::rejection_sampler::SampleStep::Accept => {
+                            (proposed, Some(true))
+                        }
+                        crate::inference::spec_decode::dflash::rejection_sampler::SampleStep::Reject {
+                            replacement_token,
+                        } => (replacement_token, Some(false)),
+                    }
+                } else {
+                    (greedy_argmax_last_token(&verify_logits, vocab), None)
+                };
                 let argmax_ms = post_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
                 let slice_t0 = if mtp_profile { Some(Instant::now()) } else { None };
@@ -1074,14 +1103,32 @@ impl<'a> SpecDecode<'a> {
                     );
                 }
 
-                if proposed == verified && generated.len() < max_new {
+                // ADR-034 task #91 Step 3 — accept/reject decision now
+                // sourced from MH step at temp>0, falls back to greedy
+                // proposed==verified at temp=0 (byte-identical).
+                let k0_accepted = match mh_accepted_k0 {
+                    Some(b) => b,                     // MH path: accept iff leviathan_step returned Accept
+                    None => proposed == verified,     // greedy: argmax-match
+                };
+                if k0_accepted && generated.len() < max_new {
                     generated.push(verified);
                     preemitted_argmax = true;
                     self.stats.accepted += 1;
                     if self.is_eos(verified) {
                         break;
                     }
+                } else if !k0_accepted && is_mh && generated.len() < max_new {
+                    // MH reject: push the residual replacement so the next
+                    // iter's token_next reuses it (preemitted invariant).
+                    generated.push(verified);
+                    preemitted_argmax = true;
+                    self.stats.rejected += 1;
+                    if self.is_eos(verified) {
+                        break;
+                    }
                 } else {
+                    // Greedy reject: don't push; next iter's token_next will
+                    // be argmax(logits_t) = verified deterministically.
                     self.stats.rejected += 1;
                 }
             }
