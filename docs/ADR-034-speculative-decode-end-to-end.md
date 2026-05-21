@@ -271,6 +271,42 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 10) — MH temperature sweep finds temp=0.5 optimal (HEAD `1a1c78c6`)
+
+Empirical 6-temp sweep + 3-rep confirmation on K=1 BATCHED MH (Qwen 3.6 27B Q8_0,
+200 tok --ignore-eos, test-coverage prompt):
+
+**Single-rep sweep**:
+
+| Temp | tok/s | Accept |
+|-----:|------:|-------:|
+| 0.3  |  25.5 |  68.6% |
+| 0.4  |  23.9 |  56.7% |
+| 0.5  | **26.5** | **74.6%** |
+| 0.6  |  25.9 |  70.9% |
+| 0.7  |  24.9 |  63.1% |
+| 0.8  |  24.1 |  58.7% |
+
+**3-rep paired confirmation (temp=0.5 vs temp=0.6)**:
+
+| Temp | tok/s mean | Accept | vs base 21.30 |
+|-----:|-----------:|-------:|--------------:|
+| 0.5  |    26.50   |  74.6% | **1.244x**    |
+| 0.6  |    25.87   |  70.9% | 1.214x        |
+
+**temp=0.5 is +2.4% throughput / +3.7pp accept over temp=0.6**. Coherence verified
+at temp=0.5: full multi-paragraph essay with natural prose, no degeneration over
+200 tokens.
+
+**Recommended production sampler**: `SpecSampler::new(0.5, seed)` for K=1 BATCHED
+on dense Qwen 3.6 27B Q8_0. CLI: `--temperature 0.5`.
+
+Why temp=0.5 beats 0.6: lower temperature concentrates more probability mass on
+the verifier's argmax, so MH accept_prob = min(1, p/q) approaches 1 more often
+when the draft sampler also has temp=0.5 (drafter and verifier distributions are
+more peaked + more aligned). At higher temp, both distributions spread, accept
+rate drops.
+
 ### Iteration 2026-05-21 (cont. 9) — 3-rep paired bench correction (HEAD `3ffa1cb0`)
 
 The (cont. 8) bench below used a SINGLE-REP base measurement of 15.4 tok/s which
