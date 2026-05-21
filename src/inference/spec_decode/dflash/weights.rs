@@ -302,4 +302,82 @@ mod tests {
         assert!((780_000_000..=900_000_000).contains(&bytes),
             "expected ~820MB data, got {bytes}");
     }
+
+    /// ADR-034 prep 2026-05-21: real-safetensors validation across all 3 downloaded
+    /// DFlash drafters. Each runtime-skips if the local file is absent.
+    ///
+    /// Validates that `DFlashWeights::load` can:
+    ///   1. Parse the safetensors header
+    ///   2. Resolve every expected manifest entry against the actual tensor names
+    ///   3. Honor the lifetime-binding ('data outlives the SafeTensors view)
+    ///
+    /// This is the lowest-level "real-file loads correctly" check. It does NOT
+    /// exercise the forward path (that needs the full parity harness per
+    /// ADR-034 P1 — see scripts/parity/).
+    fn load_real_drafter(dir: &str, cfg: &super::super::config::DFlashConfig) -> Option<usize> {
+        let path = format!("{dir}/model.safetensors");
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("skipping: {path} not on disk");
+            return None;
+        }
+        let file = DFlashWeightsFile::open(&path).expect("file open");
+        let w = DFlashWeights::load(file.bytes(), cfg).expect("validated load");
+        Some(w.total_data_bytes())
+    }
+
+    #[test]
+    fn loads_real_qwen36_27b_dflash_safetensors_2026_05_21() {
+        let dir = "/opt/hf2q/models/dflash-drafters/z-lab__Qwen3.6-27B-DFlash";
+        let cfg_path = format!("{dir}/config.json");
+        if !std::path::Path::new(&cfg_path).exists() {
+            eprintln!("skipping: {cfg_path} not on disk");
+            return;
+        }
+        let cfg = super::super::config::DFlashConfig::from_json_path(&cfg_path)
+            .expect("parse cfg");
+        let Some(bytes) = load_real_drafter(dir, &cfg) else { return };
+        // 27B drafter: 5 layers × (~150M params) ≈ 1.6 GB.  We saw 3.3 GB on disk
+        // for the directory but ~1.6 GB is the model.safetensors itself.
+        assert!(
+            (1_000_000_000..=4_000_000_000).contains(&bytes),
+            "expected ~1.6-3.3GB drafter weights, got {bytes}"
+        );
+    }
+
+    #[test]
+    fn loads_real_qwen36_35b_a3b_dflash_safetensors_2026_05_21() {
+        let dir = "/opt/hf2q/models/dflash-drafters/z-lab__Qwen3.6-35B-A3B-DFlash";
+        let cfg_path = format!("{dir}/config.json");
+        if !std::path::Path::new(&cfg_path).exists() {
+            eprintln!("skipping: {cfg_path} not on disk");
+            return;
+        }
+        let cfg = super::super::config::DFlashConfig::from_json_path(&cfg_path)
+            .expect("parse cfg");
+        let Some(bytes) = load_real_drafter(dir, &cfg) else { return };
+        // 35B-A3B drafter: 8 layers × (smaller hidden=2048) ≈ 800 MB.
+        assert!(
+            (500_000_000..=1_500_000_000).contains(&bytes),
+            "expected ~800MB-1GB drafter weights, got {bytes}"
+        );
+    }
+
+    #[test]
+    fn loads_real_gemma4_26b_dflash_safetensors_2026_05_21() {
+        let dir = "/opt/hf2q/models/dflash-drafters/z-lab__gemma-4-26B-A4B-it-DFlash";
+        let cfg_path = format!("{dir}/config.json");
+        if !std::path::Path::new(&cfg_path).exists() {
+            eprintln!("skipping: {cfg_path} not on disk");
+            return;
+        }
+        let cfg = super::super::config::DFlashConfig::from_json_path(&cfg_path)
+            .expect("parse cfg");
+        let Some(bytes) = load_real_drafter(dir, &cfg) else { return };
+        // Gemma 4 26B drafter: 5 layers × hidden=2816 ≈ 800 MB (same family as
+        // the embedded config test above).
+        assert!(
+            (700_000_000..=900_000_000).contains(&bytes),
+            "expected ~820MB drafter weights, got {bytes}"
+        );
+    }
 }

@@ -367,4 +367,81 @@ pub(crate) mod tests {
             e => panic!("expected Invalid sliding_window, got {e:?}"),
         }
     }
+
+    /// Real-drafter config parse — ADR-034 prep validation 2026-05-21. Drafter
+    /// configs downloaded during prep deep-research session (Qwen 3.6 27B-DFlash,
+    /// Qwen 3.6 35B-A3B-DFlash, gemma-4-26B-A4B-it-DFlash). Each test runtime-skips
+    /// if the local drafter dir is absent.
+    fn try_parse_real(path: &str) -> Option<DFlashConfig> {
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping: {path} not on disk");
+            return None;
+        }
+        Some(
+            DFlashConfig::from_json_path(path).unwrap_or_else(|e| panic!("parse {path}: {e}")),
+        )
+    }
+
+    #[test]
+    fn parses_real_qwen36_27b_dflash_config_2026_05_21() {
+        let path = "/opt/hf2q/models/dflash-drafters/z-lab__Qwen3.6-27B-DFlash/config.json";
+        let Some(cfg) = try_parse_real(path) else { return };
+        // Per the actual drafter config inspected during ADR-034 prep:
+        // target hidden=5120 (matches Qwen 3.6 27B dense); 5 layers (4 sliding + 1 full);
+        // 32/8 attn/kv heads; intermediate=17408; target has 64 layers.
+        assert_eq!(cfg.hidden_size, 5120);
+        assert_eq!(cfg.num_hidden_layers, 5);
+        assert_eq!(cfg.num_attention_heads, 32);
+        assert_eq!(cfg.num_key_value_heads, 8);
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(cfg.intermediate_size, 17408);
+        assert_eq!(cfg.target_layer_ids, vec![1, 16, 31, 46, 61]);
+        assert_eq!(cfg.num_target_layers, 64);
+        assert_eq!(cfg.sliding_window, Some(2048));
+        // Qwen drafter: no final_logit_softcapping (Gemma-specific)
+        assert_eq!(cfg.final_logit_softcapping, None);
+        assert_eq!(cfg.layer_types.len(), 5);
+        assert_eq!(cfg.layer_types[4], LayerType::FullAttention);
+        assert!(cfg.is_sliding(0));
+        assert!(!cfg.is_sliding(4));
+    }
+
+    #[test]
+    fn parses_real_qwen36_35b_a3b_dflash_config_2026_05_21() {
+        let path = "/opt/hf2q/models/dflash-drafters/z-lab__Qwen3.6-35B-A3B-DFlash/config.json";
+        let Some(cfg) = try_parse_real(path) else { return };
+        // Per the actual drafter config: target hidden=2048 (Qwen 3.5/3.6 35B-A3B);
+        // 8 layers (all full_attention); 32/4 attn/kv heads; intermediate=6144;
+        // target has 40 layers.
+        assert_eq!(cfg.hidden_size, 2048);
+        assert_eq!(cfg.num_hidden_layers, 8);
+        assert_eq!(cfg.num_attention_heads, 32);
+        assert_eq!(cfg.num_key_value_heads, 4);
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(cfg.intermediate_size, 6144);
+        assert_eq!(cfg.target_layer_ids, vec![1, 10, 19, 28, 37]);
+        assert_eq!(cfg.num_target_layers, 40);
+        // All-full-attention drafter: no sliding_window required
+        assert_eq!(cfg.layer_types.len(), 8);
+        for i in 0..8 {
+            assert_eq!(cfg.layer_types[i], LayerType::FullAttention);
+            assert!(!cfg.is_sliding(i));
+        }
+    }
+
+    #[test]
+    fn parses_real_gemma4_26b_dflash_config_2026_05_21() {
+        let path =
+            "/opt/hf2q/models/dflash-drafters/z-lab__gemma-4-26B-A4B-it-DFlash/config.json";
+        let Some(cfg) = try_parse_real(path) else { return };
+        // Per the actual drafter config: target hidden=2816 (Gemma 4 26B A4B);
+        // 5 layers (4 sliding + 1 full); 32/8 attn/kv; intermediate=5632; target has 30 layers;
+        // sliding_window=2048; final_logit_softcapping=30.0 (Gemma-specific).
+        assert_eq!(cfg.hidden_size, 2816);
+        assert_eq!(cfg.num_hidden_layers, 5);
+        assert_eq!(cfg.target_layer_ids, vec![1, 6, 11, 17, 22, 27]);
+        assert_eq!(cfg.num_target_layers, 30);
+        assert_eq!(cfg.sliding_window, Some(2048));
+        assert_eq!(cfg.final_logit_softcapping, Some(30.0));
+    }
 }
