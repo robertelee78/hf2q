@@ -590,6 +590,60 @@ pub fn build_tokenizer_metadata(
             "tokenizer.ggml.add_sep_token".into(),
             MetaValue::Bool(true),
         ));
+    } else if arch == ArchName::Llama3 {
+        // Llama 3 BPE / gpt2 emit order — canonical
+        // `_set_vocab_gpt2` at /opt/llama.cpp/conversion/base.py:1603-1611:
+        //   add_tokenizer_model("gpt2")
+        //   add_tokenizer_pre(tokpre)            ← right after model
+        //   add_token_list(tokens)
+        //   add_token_types(toktypes)
+        //   SpecialVocab.add_to_gguf:
+        //     - merges
+        //     - special tokens (bos, eos; unk/pad absent in Llama 3
+        //       tokenizer_config.json so no handlers fire)
+        //     - add_*_token (add_bos_token, add_sep_token only;
+        //       Llama 3 tokenizer_config has both flags)
+        //
+        // No `scores` (BPE does not call `add_token_scores`).
+        // No `add_space_prefix` (canonical doesn't emit it for GPT-2 BPE).
+        // No `unknown_token_id` / `padding_token_id` (absent in
+        //   tokenizer_config.json).
+        kv.push((
+            "tokenizer.ggml.model".into(),
+            MetaValue::String(tokenizer_model_name),
+        ));
+        kv.push((
+            "tokenizer.ggml.pre".into(),
+            MetaValue::String(pre_tokenizer),
+        ));
+        kv.push((
+            "tokenizer.ggml.tokens".into(),
+            MetaValue::ArrayString(tokens),
+        ));
+        kv.push((
+            "tokenizer.ggml.token_type".into(),
+            MetaValue::ArrayI32(token_types),
+        ));
+        if !merges.is_empty() {
+            kv.push((
+                "tokenizer.ggml.merges".into(),
+                MetaValue::ArrayString(merges),
+            ));
+        }
+        if let Some(id) = bos_id {
+            kv.push(("tokenizer.ggml.bos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = eos_id {
+            kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
+        }
+        kv.push((
+            "tokenizer.ggml.add_bos_token".into(),
+            MetaValue::Bool(true),
+        ));
+        kv.push((
+            "tokenizer.ggml.add_sep_token".into(),
+            MetaValue::Bool(false),
+        ));
     } else if arch == ArchName::Gemma4 {
         // Gemma 4 canonical tokenizer order (verified against
         // `/opt/llama.cpp/conversion/gemma.py::Gemma4Model::set_vocab`

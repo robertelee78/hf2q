@@ -116,7 +116,7 @@ pub fn build_metadata(
     model_dir_basename: Option<&str>,
 ) -> Vec<(String, MetaValue)> {
     use crate::convert::model_card::{
-        emit_general_prelude, get_model_id_components,
+        emit_general_postlude, emit_general_prelude, get_model_id_components,
     };
     // Llama 3 config.json typically has `_name_or_path = None`; fall
     // back to the model directory's basename
@@ -224,7 +224,11 @@ pub fn build_metadata(
         "llama.rope.dimension_count".into(),
         MetaValue::U32(head_dim),
     ));
-    kv.push(("general.file_type".into(), MetaValue::U32(file_type)));
+    // Canonical postlude — general.quantization_version (2) +
+    // general.file_type. The cli_driver postlude-split logic pulls
+    // both keys back out and re-emits them AFTER the tokenizer block
+    // to match canonical's dump position.
+    kv.extend(emit_general_postlude(file_type));
     kv
 }
 

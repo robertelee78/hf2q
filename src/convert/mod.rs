@@ -383,9 +383,10 @@ mod tests {
         // Tensor count: 16 (2 globals + 7×2 per-block).
         assert_eq!(gguf.tensor_count(), 16);
 
-        // Metadata round-trip: 17 Llama3 KV pairs present (architecture,
-        // type, name, basename, size_label, 12 llama.*, file_type).
-        assert_eq!(gguf.metadata_count(), 17);
+        // Metadata round-trip: 18 Llama3 KV pairs present (architecture,
+        // type, name, basename, size_label, 12 llama.*,
+        // quantization_version, file_type).
+        assert_eq!(gguf.metadata_count(), 18);
         assert_eq!(gguf.metadata_string("general.architecture"), Some("llama"));
         assert_eq!(gguf.metadata_u32("llama.embedding_length"), Some(32));
         assert_eq!(gguf.metadata_u32("llama.block_count"), Some(2));
