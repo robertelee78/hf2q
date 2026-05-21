@@ -1185,7 +1185,8 @@ fn map_tensor(
             None => MapOutcome::Unmapped,
         },
         ArchName::NomicBert => match nomic_bert::map_tensor_name(hf_name) {
-            Some(s) => MapOutcome::Direct(s),
+            Some(nomic_bert::MappedTensor::Direct(s)) => MapOutcome::Direct(s),
+            Some(nomic_bert::MappedTensor::Drop) => MapOutcome::Drop,
             None => MapOutcome::Unmapped,
         },
         ArchName::Qwen3VlText => match qwen3vl_text::map_tensor_name(hf_name) {

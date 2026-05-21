@@ -1,11 +1,11 @@
-//! NomicBert (nomic-embed-text v1 / v1.5) HF→GGUF tensor-name + metadata
-//! mapper.
+//! NomicBert (nomic-embed-text v1 / v1.5 / v2-moe) HF→GGUF tensor-name
+//! + metadata mapper.
 //!
 //! Port of `/opt/llama.cpp/conversion/bert.py::NomicBertModel`'s name
 //! mapping (transitively via `BertModel::modify_tensors` →
-//! `gguf-py/gguf/tensor_mapping.py`) and `set_gguf_parameters`. Strictly
-//! the dense `nomic-bert` path — the MoE variant (`nomic-bert-moe`) is
-//! out of v1 scope and routes through a separate mapper.
+//! `gguf-py/gguf/tensor_mapping.py`) and `set_gguf_parameters`. Covers
+//! BOTH the dense v1.5 path AND the v2-moe path (with caveats called
+//! out in the table below).
 //!
 //! Per ADR-033 §P0 "Per-arch convert-side mapping": this is the
 //! convert-side tensor-name + KV mapper for `LLM_ARCH_NOMIC_BERT`.
@@ -51,49 +51,100 @@
 
 use crate::backends::gguf::types::MetaValue;
 
+/// Output of the NomicBert tensor-name mapper.
+///
+/// `Direct(s)` is "emit this tensor under GGUF name `s`"; `Drop` is
+/// "canonical's `filter_tensors` deliberately discards this — do NOT
+/// surface as an `UnmappedTensor` error". The caller turns these into
+/// `MapOutcome::Direct` / `MapOutcome::Drop` in `cli_driver`. Any HF
+/// name not handled here returns `None`, which the caller surfaces as
+/// `MapOutcome::Unmapped` (typed error per
+/// [[feedback-no-loop-suppression-2026-05-17]]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MappedTensor {
+    /// Emit under the given GGUF tensor name.
+    Direct(String),
+    /// Canonical drops this tensor in
+    /// `/opt/llama.cpp/conversion/bert.py` (`BertModel.filter_tensors`
+    /// at `bert.py:72-92` or `NomicBertModel.filter_tensors` at
+    /// `bert.py:362-369`). Do not error; just skip.
+    Drop,
+}
+
 /// Translate one HuggingFace tensor name (as seen in `model.safetensors`)
-/// to its canonical GGUF tensor name. Returns `None` if `hf_name` is not
-/// one of the NomicBert weight kinds.
+/// to a [`MappedTensor`] outcome. Returns `None` for genuinely unknown
+/// names so the caller can raise a typed `UnmappedTensor`.
 ///
 /// Accepts an optional `bert.` HF prefix (some checkpoints — typically
 /// those exported from a wrapping `BertForMaskedLM`-style head — carry
 /// it; nomic-embed-text-v1/v1.5 typically does not). Mirrors the strip
 /// in `BertModel.filter_tensors` (`/opt/llama.cpp/conversion/bert.py:72-73`).
 ///
-/// NomicBert weight kinds (one global pair + seven per-block):
+/// NomicBert weight kinds. v1.5 columns vs v2-moe columns:
 ///
-/// | HF name                                          | GGUF name                            |
-/// |--------------------------------------------------|--------------------------------------|
-/// | `embeddings.word_embeddings.weight`              | `token_embd.weight`                  |
-/// | `emb_ln.weight`                                  | `token_embd_norm.weight`             |
-/// | `emb_ln.bias`                                    | `token_embd_norm.bias`               |
-/// | `encoder.layers.<N>.attn.Wqkv.weight`            | `blk.<N>.attn_qkv.weight`            |
-/// | `encoder.layers.<N>.attn.out_proj.weight`        | `blk.<N>.attn_output.weight`         |
-/// | `encoder.layers.<N>.norm1.weight`                | `blk.<N>.attn_output_norm.weight`    |
-/// | `encoder.layers.<N>.norm1.bias`                  | `blk.<N>.attn_output_norm.bias`      |
-/// | `encoder.layers.<N>.mlp.fc11.weight`             | `blk.<N>.ffn_gate.weight`            |
-/// | `encoder.layers.<N>.mlp.fc12.weight`             | `blk.<N>.ffn_up.weight`              |
-/// | `encoder.layers.<N>.mlp.fc2.weight`              | `blk.<N>.ffn_down.weight`            |
-/// | `encoder.layers.<N>.norm2.weight`                | `blk.<N>.layer_output_norm.weight`   |
-/// | `encoder.layers.<N>.norm2.bias`                  | `blk.<N>.layer_output_norm.bias`     |
+/// | HF name                                          | GGUF name                            | v1.5 | v2-moe |
+/// |--------------------------------------------------|--------------------------------------|:----:|:------:|
+/// | `embeddings.word_embeddings.weight`              | `token_embd.weight`                  |  ✓   |   ✓    |
+/// | `embeddings.token_type_embeddings.weight`        | `token_types.weight`                 |      |   ✓    |
+/// | `embeddings.LayerNorm.weight`                    | `token_embd_norm.weight`             |      |   ✓    |
+/// | `embeddings.LayerNorm.bias`                      | `token_embd_norm.bias`               |      |   ✓    |
+/// | `emb_ln.weight`                                  | `token_embd_norm.weight`             |  ✓   |        |
+/// | `emb_ln.bias`                                    | `token_embd_norm.bias`               |  ✓   |        |
+/// | `encoder.layers.<N>.attn.Wqkv.weight`            | `blk.<N>.attn_qkv.weight`            |  ✓   |   ✓    |
+/// | `encoder.layers.<N>.attn.Wqkv.bias`              | `blk.<N>.attn_qkv.bias`              |      |   ✓    |
+/// | `encoder.layers.<N>.attn.out_proj.weight`        | `blk.<N>.attn_output.weight`         |  ✓   |   ✓    |
+/// | `encoder.layers.<N>.attn.out_proj.bias`          | `blk.<N>.attn_output.bias`           |      |   ✓    |
+/// | `encoder.layers.<N>.norm1.weight`                | `blk.<N>.attn_output_norm.weight`    |  ✓   |   ✓    |
+/// | `encoder.layers.<N>.norm1.bias`                  | `blk.<N>.attn_output_norm.bias`      |  ✓   |   ✓    |
+/// | `encoder.layers.<N>.mlp.fc11.weight`             | `blk.<N>.ffn_gate.weight`            |  ✓   |        |
+/// | `encoder.layers.<N>.mlp.fc12.weight`             | `blk.<N>.ffn_up.weight`              |  ✓   |        |
+/// | `encoder.layers.<N>.mlp.fc2.weight`              | `blk.<N>.ffn_down.weight`            |  ✓   |   ✓    |
+/// | `encoder.layers.<N>.mlp.fc2.bias`                | `blk.<N>.ffn_down.bias`              |      |   ✓    |
+/// | `encoder.layers.<N>.mlp.fc1.weight`              | `blk.<N>.ffn_up.weight`              |      |  ✓ †   |
+/// | `encoder.layers.<N>.mlp.fc1.bias`                | `blk.<N>.ffn_up.bias`                |      |  ✓ †   |
+/// | `encoder.layers.<N>.mlp.router.layer.weight`     | `blk.<N>.ffn_gate_inp.weight`        |      |  ✓ ‡   |
+/// | `encoder.layers.<N>.norm2.weight`                | `blk.<N>.layer_output_norm.weight`   |  ✓   |   ✓    |
+/// | `encoder.layers.<N>.norm2.bias`                  | `blk.<N>.layer_output_norm.bias`     |  ✓   |   ✓    |
 ///
-/// Returns `None` for:
-///   - `embeddings.position_embeddings.weight` (unused; RoPE replaces
-///     absolute positions). Caller should warn + drop.
-///   - `embeddings.token_type_embeddings.weight` (unused; NomicBert
-///     drops segment IDs vs plain BERT). Caller should warn + drop.
-///   - Any linear-projection bias (`.attn.Wqkv.bias`, `.attn.out_proj.bias`,
-///     `.mlp.fc11.bias`, `.mlp.fc12.bias`, `.mlp.fc2.bias`) — NomicBertModel
-///     asserts these don't exist on the non-MoE path.
-///   - Any other name.
-pub fn map_tensor_name(hf_name: &str) -> Option<String> {
+/// `†` Dense FFN layers only (those where `bid % moe_every_n_layers != 0`
+/// in v2-moe; canonical bert.py:340 asserts `activation_function == "gelu"`
+/// when `is_moe`, so the v2-moe dense path is GELU and uses fc1/fc2 with
+/// biases). MoE layers don't have fc1/fc2.
+///
+/// `‡` MoE layers only (`mlp.router.layer.weight` is the routing
+/// projection; emitted as `ffn_gate_inp.weight` per
+/// `tensor_mapping.py:438-442`).
+///
+/// Returns `Some(MappedTensor::Drop)` for:
+///   - `mlp.experts.bias` — canonical `NomicBertModel.filter_tensors`
+///     drops this single-vector expert bias at `bert.py:366-369`.
+///     Not loaded by llama.cpp's nomic-bert-moe inference path.
+///   - `pooler.dense.weight/bias` — canonical `BertModel.filter_tensors`
+///     drops the pooler (`bert.py:74-81`).
+///   - `embeddings.position_embeddings.weight` — unused on NomicBert
+///     (RoPE replaces absolute positions); canonical drops it via
+///     `BertModel.filter_tensors` at `bert.py:82-90`.
+///
+/// Returns `None` (`Unmapped` at caller) for:
+///   - `encoder.layers.<N>.mlp.experts.mlp.w1` /
+///     `encoder.layers.<N>.mlp.experts.mlp.w2` — these v2-moe expert
+///     weight tensors require a shape-aware bake (view to
+///     `[E, F, H]` for w1; same view + transpose-last-two for w2).
+///     They will be surfaced as `MappedTensor::DirectWithBake` once
+///     `BakeOp::MoeExpertReshape` / `MoeExpertTranspose` lands. Until
+///     then, the typed `UnmappedTensor` error correctly signals that
+///     v2-moe expert weight conversion is INCOMPLETE — matches
+///     [[feedback-no-loop-suppression-2026-05-17]] / no-stub rule.
+///   - Any structurally-rejected name (wrong prefix, malformed layer
+///     index, unknown per-block suffix).
+pub fn map_tensor_name(hf_name: &str) -> Option<MappedTensor> {
     // Strip the optional `bert.` prefix — see BertModel.filter_tensors.
     let name = hf_name.strip_prefix("bert.").unwrap_or(hf_name);
 
     // ---- Globals (embedding table + embedding LayerNorm) -----------------
     match name {
         "embeddings.word_embeddings.weight" => {
-            return Some("token_embd.weight".to_string())
+            return Some(MappedTensor::Direct("token_embd.weight".to_string()))
         }
         // Present in nomic-bert v2-moe (XLM-RoBERTa-style, segment IDs
         // re-introduced). Maps to BERT-family `token_types.weight`
@@ -102,18 +153,29 @@ pub fn map_tensor_name(hf_name: &str) -> Option<String> {
         // didn't have this tensor — see prior assumption at function
         // doc-comment.
         "embeddings.token_type_embeddings.weight" => {
-            return Some("token_types.weight".to_string())
+            return Some(MappedTensor::Direct("token_types.weight".to_string()))
         }
         // Present in nomic-bert v2-moe (XLM-RoBERTa LayerNorm at the
         // embedding output). Maps to `token_embd_norm.{weight,bias}`.
         "embeddings.LayerNorm.weight" => {
-            return Some("token_embd_norm.weight".to_string())
+            return Some(MappedTensor::Direct("token_embd_norm.weight".to_string()))
         }
         "embeddings.LayerNorm.bias" => {
-            return Some("token_embd_norm.bias".to_string())
+            return Some(MappedTensor::Direct("token_embd_norm.bias".to_string()))
         }
-        "emb_ln.weight" => return Some("token_embd_norm.weight".to_string()),
-        "emb_ln.bias" => return Some("token_embd_norm.bias".to_string()),
+        "emb_ln.weight" => {
+            return Some(MappedTensor::Direct("token_embd_norm.weight".to_string()))
+        }
+        "emb_ln.bias" => {
+            return Some(MappedTensor::Direct("token_embd_norm.bias".to_string()))
+        }
+        // BertModel.filter_tensors drops the pooler at `bert.py:74-81`.
+        "pooler.dense.weight" | "pooler.dense.bias" => return Some(MappedTensor::Drop),
+        // BertModel.filter_tensors drops position embeddings at
+        // `bert.py:82-90`. NomicBert uses RoPE — these are absent on
+        // v1.5/v2-moe checkpoints anyway, but if a stray export carries
+        // them, Drop matches canonical.
+        "embeddings.position_embeddings.weight" => return Some(MappedTensor::Drop),
         _ => {}
     }
 
@@ -130,26 +192,55 @@ pub fn map_tensor_name(hf_name: &str) -> Option<String> {
     }
     let rest = &rest_with_dot[1..]; // skip the dot
 
+    // `mlp.experts.bias` is a single (n_embd,) shared expert bias that
+    // NomicBertModel.filter_tensors at `bert.py:366-369` drops. NOT a
+    // per-expert bias — llama.cpp's nomic-bert-moe inference doesn't
+    // consume it.
+    if rest == "mlp.experts.bias" {
+        return Some(MappedTensor::Drop);
+    }
+
     let suffix = match rest {
-        // Fused QKV — weight only (no bias on non-MoE NomicBert).
+        // Fused QKV.
+        // v1.5 has weight only; v2-moe has weight + bias.
         "attn.Wqkv.weight" => "attn_qkv.weight",
-        // Attention output projection — weight only.
+        "attn.Wqkv.bias" => "attn_qkv.bias",
+        // Attention output projection.
+        // v1.5 has weight only; v2-moe has weight + bias.
         "attn.out_proj.weight" => "attn_output.weight",
-        // Post-attention LayerNorm — weight + bias.
+        "attn.out_proj.bias" => "attn_output.bias",
+        // Post-attention LayerNorm — weight + bias on both v1.5 and v2-moe.
         "norm1.weight" => "attn_output_norm.weight",
         "norm1.bias" => "attn_output_norm.bias",
-        // SwiGLU FFN — fc11 is the gate, fc12 is the up, fc2 is the down.
-        // All weight-only.
+        // v1.5 SwiGLU FFN — fc11 is the gate, fc12 is the up,
+        // fc2 is the down. All weight-only on v1.5.
         "mlp.fc11.weight" => "ffn_gate.weight",
         "mlp.fc12.weight" => "ffn_up.weight",
+        // v2-moe dense FFN (layers where `bid % moe_every_n_layers != 0`)
+        // is plain GELU: fc1 is the up, fc2 is the down. Both weight + bias.
+        "mlp.fc1.weight" => "ffn_up.weight",
+        "mlp.fc1.bias" => "ffn_up.bias",
+        // `fc2` is shared between v1.5 (weight only) and v2-moe dense
+        // (weight + bias).
         "mlp.fc2.weight" => "ffn_down.weight",
+        "mlp.fc2.bias" => "ffn_down.bias",
+        // v2-moe routing projection — `tensor_mapping.py:442` maps
+        // `encoder.layers.{bid}.mlp.router.layer` to FFN_GATE_INP.
+        "mlp.router.layer.weight" => "ffn_gate_inp.weight",
         // End-of-layer LayerNorm — weight + bias.
         "norm2.weight" => "layer_output_norm.weight",
         "norm2.bias" => "layer_output_norm.bias",
+        // v2-moe expert weights (`mlp.experts.mlp.w1` /
+        // `mlp.experts.mlp.w2`) need a shape-aware bake — view to
+        // `[E, F, H]` + (for w2) transpose-last-two-dims. The bake
+        // infrastructure for this lands in a follow-up commit; for
+        // now they surface as `Unmapped` so the convert pipeline
+        // hard-errors rather than silently emitting wrong-shape data.
+        // Per [[feedback-no-loop-suppression-2026-05-17]].
         _ => return None,
     };
 
-    Some(format!("blk.{layer}.{suffix}"))
+    Some(MappedTensor::Direct(format!("blk.{layer}.{suffix}")))
 }
 
 /// Build the GGUF metadata KV pairs for a NomicBert model from its HF
@@ -283,26 +374,42 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Small helper — assert that `map_tensor_name(hf)` returns
+    /// `Some(MappedTensor::Direct(gguf))`. Keeps the per-case row
+    /// noise low in the table tests.
+    #[track_caller]
+    fn assert_direct(hf: &str, expected_gguf: &str) {
+        let got = map_tensor_name(hf);
+        match got.as_ref() {
+            Some(MappedTensor::Direct(s)) => assert_eq!(
+                s.as_str(),
+                expected_gguf,
+                "map_tensor_name({hf:?}) = Direct({s:?}), want Direct({expected_gguf:?})"
+            ),
+            other => panic!(
+                "map_tensor_name({hf:?}) = {other:?}, want Some(Direct({expected_gguf:?}))"
+            ),
+        }
+    }
+
     /// Acceptance test 1 — round-trip the canonical table for every HF
-    /// name kind. Asserts `map_tensor_name(hf) → Some(gguf)` with the
-    /// exact pair from the rustdoc table above.
+    /// name kind. Asserts `map_tensor_name(hf) → Some(Direct(gguf))`
+    /// with the exact pair from the rustdoc table above.
     #[test]
     fn nomic_bert_tensor_name_round_trip() {
         let cases: &[(&str, &str)] = &[
-            // Globals
+            // Globals (v1.5 layout)
             ("embeddings.word_embeddings.weight", "token_embd.weight"),
             ("emb_ln.weight", "token_embd_norm.weight"),
             ("emb_ln.bias", "token_embd_norm.bias"),
+            // Globals (v2-moe layout: XLM-RoBERTa-style)
+            ("embeddings.token_type_embeddings.weight", "token_types.weight"),
+            ("embeddings.LayerNorm.weight", "token_embd_norm.weight"),
+            ("embeddings.LayerNorm.bias", "token_embd_norm.bias"),
             // Per-block — sample at L=0, L=5, L=11 (nomic-embed v1.5
             // has 12 layers so 0/5/11 covers edge/mid/depth).
-            (
-                "encoder.layers.0.attn.Wqkv.weight",
-                "blk.0.attn_qkv.weight",
-            ),
-            (
-                "encoder.layers.5.attn.Wqkv.weight",
-                "blk.5.attn_qkv.weight",
-            ),
+            ("encoder.layers.0.attn.Wqkv.weight", "blk.0.attn_qkv.weight"),
+            ("encoder.layers.5.attn.Wqkv.weight", "blk.5.attn_qkv.weight"),
             (
                 "encoder.layers.11.attn.Wqkv.weight",
                 "blk.11.attn_qkv.weight",
@@ -319,18 +426,11 @@ mod tests {
                 "encoder.layers.3.norm1.bias",
                 "blk.3.attn_output_norm.bias",
             ),
-            (
-                "encoder.layers.7.mlp.fc11.weight",
-                "blk.7.ffn_gate.weight",
-            ),
-            (
-                "encoder.layers.7.mlp.fc12.weight",
-                "blk.7.ffn_up.weight",
-            ),
-            (
-                "encoder.layers.7.mlp.fc2.weight",
-                "blk.7.ffn_down.weight",
-            ),
+            // v1.5 SwiGLU FFN tensors.
+            ("encoder.layers.7.mlp.fc11.weight", "blk.7.ffn_gate.weight"),
+            ("encoder.layers.7.mlp.fc12.weight", "blk.7.ffn_up.weight"),
+            ("encoder.layers.7.mlp.fc2.weight", "blk.7.ffn_down.weight"),
+            // End-of-layer LayerNorm.
             (
                 "encoder.layers.9.norm2.weight",
                 "blk.9.layer_output_norm.weight",
@@ -342,12 +442,7 @@ mod tests {
         ];
 
         for &(hf, expected_gguf) in cases {
-            let got = map_tensor_name(hf);
-            assert_eq!(
-                got.as_deref(),
-                Some(expected_gguf),
-                "map_tensor_name({hf:?}) = {got:?}, want Some({expected_gguf:?})"
-            );
+            assert_direct(hf, expected_gguf);
         }
     }
 
@@ -358,66 +453,92 @@ mod tests {
     /// `BertModel.filter_tensors`).
     #[test]
     fn nomic_bert_strips_optional_bert_prefix() {
-        assert_eq!(
-            map_tensor_name("bert.embeddings.word_embeddings.weight").as_deref(),
-            Some("token_embd.weight"),
+        assert_direct("bert.embeddings.word_embeddings.weight", "token_embd.weight");
+        assert_direct(
+            "bert.encoder.layers.0.attn.Wqkv.weight",
+            "blk.0.attn_qkv.weight",
         );
-        assert_eq!(
-            map_tensor_name("bert.encoder.layers.0.attn.Wqkv.weight").as_deref(),
-            Some("blk.0.attn_qkv.weight"),
+        assert_direct(
+            "bert.encoder.layers.4.mlp.fc11.weight",
+            "blk.4.ffn_gate.weight",
         );
-        assert_eq!(
-            map_tensor_name("bert.encoder.layers.4.mlp.fc11.weight").as_deref(),
-            Some("blk.4.ffn_gate.weight"),
+        assert_direct("bert.emb_ln.bias", "token_embd_norm.bias");
+    }
+
+    /// Acceptance test 1c — v2-moe block-level patterns: biased
+    /// attention, GELU dense FFN (fc1/fc2), router, and `mlp.experts.bias`
+    /// drop. Mirrors `/opt/llama.cpp/conversion/bert.py::NomicBertModel`
+    /// at the v2-moe `is_moe=True` branch.
+    #[test]
+    fn nomic_bert_v2_moe_block_patterns_map() {
+        // Biased attention (Wqkv + out_proj) — v2-moe only.
+        assert_direct("encoder.layers.0.attn.Wqkv.bias", "blk.0.attn_qkv.bias");
+        assert_direct("encoder.layers.5.attn.Wqkv.bias", "blk.5.attn_qkv.bias");
+        assert_direct(
+            "encoder.layers.0.attn.out_proj.bias",
+            "blk.0.attn_output.bias",
         );
-        assert_eq!(
-            map_tensor_name("bert.emb_ln.bias").as_deref(),
-            Some("token_embd_norm.bias"),
+        assert_direct(
+            "encoder.layers.11.attn.out_proj.bias",
+            "blk.11.attn_output.bias",
+        );
+
+        // GELU dense FFN — v2-moe layers where `bid % moe_every_n_layers != 0`
+        // use fc1/fc2 with biases.
+        assert_direct("encoder.layers.0.mlp.fc1.weight", "blk.0.ffn_up.weight");
+        assert_direct("encoder.layers.0.mlp.fc1.bias", "blk.0.ffn_up.bias");
+        assert_direct("encoder.layers.0.mlp.fc2.bias", "blk.0.ffn_down.bias");
+        assert_direct("encoder.layers.10.mlp.fc1.weight", "blk.10.ffn_up.weight");
+
+        // MoE routing projection.
+        assert_direct(
+            "encoder.layers.1.mlp.router.layer.weight",
+            "blk.1.ffn_gate_inp.weight",
+        );
+        assert_direct(
+            "encoder.layers.11.mlp.router.layer.weight",
+            "blk.11.ffn_gate_inp.weight",
         );
     }
 
-    /// Sibling — unknown names must surface as `None`. Per
-    /// [[feedback-no-loop-suppression-2026-05-17]]: the caller is
-    /// expected to error on this, never silently skip. This covers the
-    /// three NomicBert-specific quirks that MUST be rejected:
-    ///   - position embeddings (RoPE replaces them; HF checkpoints
-    ///     typically omit this anyway)
-    ///   - token_type embeddings (NomicBert drops segments)
-    ///   - linear-projection biases (non-MoE NomicBert is weights-only
-    ///     on Wqkv / out_proj / fc11 / fc12 / fc2)
+    /// Acceptance test 1d — canonical filter_tensors drops. Mirrors
+    /// `bert.py:74-90` (pooler + position_embeddings) and `bert.py:366-369`
+    /// (`mlp.experts.bias`).
     #[test]
-    fn nomic_bert_tensor_name_rejects_unknown_kinds() {
-        // Unused position-embedding table (RoPE replaces it).
+    fn nomic_bert_filter_tensors_drops_are_drop_outcome() {
+        assert_eq!(
+            map_tensor_name("pooler.dense.weight"),
+            Some(MappedTensor::Drop)
+        );
+        assert_eq!(
+            map_tensor_name("pooler.dense.bias"),
+            Some(MappedTensor::Drop)
+        );
         assert_eq!(
             map_tensor_name("embeddings.position_embeddings.weight"),
-            None
-        );
-        // Unused token-type-embedding table.
-        assert_eq!(
-            map_tensor_name("embeddings.token_type_embeddings.weight"),
-            None
-        );
-        // Linear-projection biases (NomicBert non-MoE has none).
-        assert_eq!(
-            map_tensor_name("encoder.layers.0.attn.Wqkv.bias"),
-            None
+            Some(MappedTensor::Drop)
         );
         assert_eq!(
-            map_tensor_name("encoder.layers.0.attn.out_proj.bias"),
-            None
+            map_tensor_name("encoder.layers.0.mlp.experts.bias"),
+            Some(MappedTensor::Drop)
         );
         assert_eq!(
-            map_tensor_name("encoder.layers.0.mlp.fc11.bias"),
-            None
+            map_tensor_name("encoder.layers.11.mlp.experts.bias"),
+            Some(MappedTensor::Drop)
         );
-        assert_eq!(
-            map_tensor_name("encoder.layers.0.mlp.fc12.bias"),
-            None
-        );
-        assert_eq!(
-            map_tensor_name("encoder.layers.0.mlp.fc2.bias"),
-            None
-        );
+    }
+
+    /// Sibling — genuinely-unknown names must surface as `None` so the
+    /// caller raises `UnmappedTensor`. Per
+    /// [[feedback-no-loop-suppression-2026-05-17]]: never silently skip.
+    ///
+    /// This deliberately includes `mlp.experts.mlp.w1` and `.w2` —
+    /// those need shape-aware bakes (view to `[E, F, H]` + transpose for
+    /// w2) that aren't wired yet. Failing the convert with a typed
+    /// error is the correct behavior until [[BakeOp::MoeExpertReshape]]
+    /// + [[BakeOp::MoeExpertTranspose]] land.
+    #[test]
+    fn nomic_bert_tensor_name_rejects_unknown_kinds() {
         // Wrong prefix (singular `layer` is BERT, not nomic-bert).
         assert_eq!(
             map_tensor_name("encoder.layer.0.attention.self.Wqkv.weight"),
@@ -428,11 +549,11 @@ mod tests {
             map_tensor_name("encoder.layers.0.attention.self.query.weight"),
             None
         );
-        // Plain-GELU BERT FFN names (fc1) do NOT exist on nomic non-MoE.
-        assert_eq!(
-            map_tensor_name("encoder.layers.0.mlp.fc1.weight"),
-            None
-        );
+        // v1.5 SwiGLU has no biases on fc11/fc12 — these names should
+        // never appear on either v1.5 or v2-moe checkpoints, so they're
+        // structural rejects (not Drop).
+        assert_eq!(map_tensor_name("encoder.layers.0.mlp.fc11.bias"), None);
+        assert_eq!(map_tensor_name("encoder.layers.0.mlp.fc12.bias"), None);
         // Malformed layer index (leading zero).
         assert_eq!(
             map_tensor_name("encoder.layers.01.attn.Wqkv.weight"),
@@ -448,10 +569,22 @@ mod tests {
             map_tensor_name("encoder.layers.0.unknown.weight"),
             None
         );
-        // pooler — BertModel filter_tensors drops these; we just
-        // return None (the convert pipeline reads it as "not a
-        // weight we emit").
-        assert_eq!(map_tensor_name("pooler.dense.weight"), None);
+        // v2-moe expert weights — pending BakeOp wiring, currently
+        // surface as Unmapped (typed error). When BakeOp lands, these
+        // assertions should flip to assert `MappedTensor::DirectWithBake`
+        // (or a future variant).
+        assert_eq!(
+            map_tensor_name("encoder.layers.1.mlp.experts.mlp.w1"),
+            None,
+            "v2-moe expert UP weight needs BakeOp wiring — should be \
+             Unmapped (typed error) until that lands"
+        );
+        assert_eq!(
+            map_tensor_name("encoder.layers.1.mlp.experts.mlp.w2"),
+            None,
+            "v2-moe expert DOWN weight needs BakeOp wiring — should be \
+             Unmapped (typed error) until that lands"
+        );
     }
 
     /// Acceptance test 2 — feed a minimal hand-written config.json with
