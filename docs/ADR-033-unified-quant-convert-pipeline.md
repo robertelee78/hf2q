@@ -106,10 +106,14 @@ The earlier "metadata diff" worry was overblown — once `tokenizer.ggml.model` 
 - **Open gaps unchanged**: Gemma 4 mmproj 0/8 (#63 — new arch port), MiniMax-M2 6/8 blocked by canonical llama-quantize ios_base failure on the 230B model.
 
 Action plan to recover the matrix:
-1. Extend `canonical_tensor_name_cmp` sort to all arches (or at least Gemma 4, BERT, Llama 3, Qwen3-VL, Qwen 3.5).
+1. ✅ Extend `canonical_tensor_name_cmp` sort to all arches — landed 2b44234e.
 2. Apply canonical `phantom()` token transformation for BERT path (▁ prefix + ## stripping).
 3. Apply general.* model-card metadata pattern (license, base_model, tags, languages, type, version, organization, basename, size_label) to all arches — currently only nomic-bert-moe path has it.
-4. Re-run fresh byte-cmp for each arch.
+4. Add `general.sampling.{top_k, top_p, temp}` from generation_config.json (Gemma has these; canonical emits per `base.py`).
+5. Apply per-arch tokenizer extras (e.g. Gemma's mask_token_id, Llama's tokenizer fields).
+6. Re-run fresh byte-cmp for each arch.
+
+**Gemma 4 sort-only result (2026-05-20 evening at HEAD 2b44234e)**: fresh hf2q Q4_K_M (16,796,015,136 B) vs cached canonical Q4_K_M (16,796,015,584 B). Size delta: 448 B. Bytes diff: **3,419,677,721 / 16,796,015,136 = 20.4%**. First divergence at byte 17 (inside the GGUF header's kv_count field): hf2q emits 37 KV pairs, canonical emits 47. 10 missing KVs identified by gguf-dump: general.{type, sampling.top_k, sampling.top_p, sampling.temp, finetune, basename, size_label, quantization_version} + tokenizer.ggml.mask_token_id + tokenizer.chat_template. The sort fixed tensor ordering (the bulk of canonical-Gemma's downstream content); the residual 20% diff cascades from the kv_count divergence at byte 17 — shifting all downstream offsets. Closing requires the general.* model-card port (action plan step 3-5).
 
 **🏆 Nomic v2-moe full 8-quant byte-identity (HEAD `84033d5a`+, 2026-05-20)** — first MoE arch with byte-identical convert+quantize pipeline to canonical. Verified against `/opt/hf2q/models/nomic-ai-nomic-embed-text-v2-moe` (475M params, 8 experts, `nomic-bert-moe` arch):
 
