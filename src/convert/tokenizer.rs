@@ -49,8 +49,11 @@ use crate::quantize::ggml_quants::ArchName;
 // ---------------------------------------------------------------------------
 
 const TOKEN_TYPE_NORMAL: i32 = 1;
-// 2 = UNKNOWN — unused; `<unk>` lives in added_tokens with special=true,
-// so it's classified as CONTROL in line with LlamaHfVocab.get_token_type().
+// UNKNOWN — used for the `<unk>` token on Unigram-tokenizer models
+// (XLM-RoBERTa / sentencepiece). Canonical `bert.py:214-218` realigns
+// the UNK token to UNKNOWN even though `added_tokens` carries it with
+// `special=True`; we replicate that classification here.
+const TOKEN_TYPE_UNKNOWN: i32 = 2;
 const TOKEN_TYPE_CONTROL: i32 = 3;
 const TOKEN_TYPE_USER_DEFINED: i32 = 4;
 const TOKEN_TYPE_UNUSED: i32 = 5;
@@ -264,7 +267,10 @@ pub fn build_tokenizer_metadata(
             }
         }
     }
-    let _ = token_scores; // TODO: emit as tokenizer.ggml.scores for Unigram path
+    // `token_scores` is consumed below at the score-array build step
+    // (only for the Unigram path; BPE/WordPiece still emit `-1000.0`
+    // placeholders since their tokenizer.ggml.scores is by convention
+    // unused on those models).
 
     // ----- 2. Optional tokenizer_config.json (special tokens + flags) ---
     // Missing or malformed is non-fatal — the BOS/EOS lookup just yields
@@ -363,7 +369,41 @@ pub fn build_tokenizer_metadata(
     .copied()
     .collect();
 
-    let scores: Vec<f32> = vec![-1000.0; target_vocab_size];
+    // ----- 8. Resolve special token ids against merged vocab ----------
+    // (Moved BEFORE token-type classification so `unk_id` can be used to
+    //  flag the UNK token as UNKNOWN rather than CONTROL — mirrors
+    //  canonical `bert.py:214-218` `_xlmroberta_set_vocab` realignment.)
+    let bos_id = resolve_special_token_id("bos_token", &tokenizer_config, &vocab_entries);
+    let eos_id = resolve_special_token_id("eos_token", &tokenizer_config, &vocab_entries);
+    let unk_id = resolve_special_token_id("unk_token", &tokenizer_config, &vocab_entries);
+    let pad_id = resolve_special_token_id("pad_token", &tokenizer_config, &vocab_entries);
+
+    // For Unigram-tokenizer models (XLM-RoBERTa, sentencepiece-derived),
+    // canonical reads per-token scores from `sentencepiece.bpe.model`
+    // and prepends 0.0 for [<s>, <pad>, </s>, <unk>] via
+    // `_xlmroberta_set_vocab` at `bert.py:210-218`. The
+    // `tokenizer.json` for these models already carries the same scores
+    // in the post-realignment order (indices 0..3 = 0.0 for the four
+    // special tokens, index 4+ = sentencepiece scores), so we just use
+    // them directly. Padding entries beyond the tokenizer.json vocab
+    // get `-10000.0` (canonical's UNUSED placeholder at `bert.py:162`).
+    //
+    // For BPE / WordPiece models the GGUF convention is to emit
+    // `-1000.0` placeholders (the tokenizer.ggml.scores field is unused
+    // by llama.cpp's BPE / WordPiece tokenizers — see
+    // `LlamaHfVocab` codepath).
+    let scores: Vec<f32> = if model_type == "Unigram" {
+        let mut s = vec![-10000.0_f32; target_vocab_size];
+        for (i, score) in token_scores.iter().enumerate() {
+            if i < target_vocab_size {
+                s[i] = *score;
+            }
+        }
+        s
+    } else {
+        vec![-1000.0_f32; target_vocab_size]
+    };
+
     let token_types: Vec<i32> = tokens
         .iter()
         .enumerate()
@@ -371,6 +411,20 @@ pub fn build_tokenizer_metadata(
             let id_u32 = id as u32;
             if !filled_ids.contains(&id_u32) {
                 return TOKEN_TYPE_UNUSED;
+            }
+            // For Unigram tokenizers (XLM-RoBERTa / sentencepiece),
+            // the UNK token is UNKNOWN, not CONTROL. Mirrors canonical
+            // `bert.py:214-218` for the XLM-RoBERTa realignment, and
+            // `bert.py:172-173` (sentencepiece) which sets
+            // `IsUnknown(token_id) → UNKNOWN`. Checked BEFORE the
+            // `added_special_flag` test below because the UNK token is
+            // typically in `added_tokens` with `special=True`.
+            //
+            // BPE / WordPiece tokenizers (Gemma, Llama, BERT, etc.) keep
+            // the legacy classification: UNK lives in `added_tokens`
+            // with `special=True` → CONTROL.
+            if model_type == "Unigram" && unk_id == Some(id_u32) {
+                return TOKEN_TYPE_UNKNOWN;
             }
             if arch == ArchName::Gemma4 && visible_tokens.contains(token.as_str()) {
                 return TOKEN_TYPE_USER_DEFINED;
@@ -387,12 +441,6 @@ pub fn build_tokenizer_metadata(
             TOKEN_TYPE_NORMAL
         })
         .collect();
-
-    // ----- 8. Resolve special token ids against merged vocab ----------
-    let bos_id = resolve_special_token_id("bos_token", &tokenizer_config, &vocab_entries);
-    let eos_id = resolve_special_token_id("eos_token", &tokenizer_config, &vocab_entries);
-    let unk_id = resolve_special_token_id("unk_token", &tokenizer_config, &vocab_entries);
-    let pad_id = resolve_special_token_id("pad_token", &tokenizer_config, &vocab_entries);
 
     // Hard-fail if tokenizer_config.json declared an eos_token but we
     // cannot map it to an id in the resolved vocab. That exact
