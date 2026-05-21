@@ -164,15 +164,27 @@ fn quantize_block_iq4_nl(
     let d_final = scale0;
     let dh = f16::from_f32(d_final);
 
-    if !all_zero && ntry > 0 {
-        // Final L re-fill from d_final — :4890-4895
+    // Final L re-fill at :4890-4895 runs UNCONDITIONALLY on `ntry > 0`,
+    // including when all_zero. Canonical's logic:
+    //   float id = scales[0] ? 1/scales[0] : 0;
+    //   for (j) L[j] = best_index_int8(values, id * x[j]);
+    // When all_zero: scales[0]=0 → id=0 → id*x[j]=0 → best_index_int8(0)
+    // returns the codebook index closest to zero (= 8 for the standard
+    // kvalues_iq4nl table where index 8 = value 1). That gives L[j]=8
+    // for all j → packed q4 byte = 8 | (8<<4) = 0x88.
+    //
+    // The prior `if !all_zero && ntry > 0` guard short-circuited the
+    // re-fill when all_zero, leaving L=0 from init → q4=0x00 → 587K-byte
+    // residual on Llama 3 IQ4_NL (token_embd.weight row 124 had at least
+    // one all-zero block; same class issue on Qwen 3.5 IQ4_NL at 121M
+    // bytes). Canonical's unconditional re-fill always writes the
+    // codebook-closest-to-zero index when scale is zero. Fixed 2026-05-21.
+    if ntry > 0 {
         let id = if scale0 != 0.0 { 1.0 / scale0 } else { 0.0 };
         for j in 0..super_block_size {
             l_buf[j] = best_index_int8(values, id * x[j]) as u8;
         }
     }
-    // If all_zero: L stayed all-zero from init, q4 will be all-zero
-    // (and dh=0 since scale0 stays 0) — matches :4805-4806 invariant.
 
     // Nibble-pack — :4898-4902, single iteration i=0
     for j in 0..16 {
