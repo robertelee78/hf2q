@@ -2,7 +2,21 @@
 
 ## §10 ACCEPTANCE — STATUS 2026-05-21 at HEAD `4a5784ce`
 
-🏆🏆🏆 **§10 AC #2 (Convert matrix × StandardPolicy) ESSENTIALLY COMPLETE — 50/64 cells byte-identical + remaining 5 BLOCKED by canonical upstream bug + 8 N/A (Gemma 4 mmproj has no quantization tier matrix in canonical's --mmproj surface).**
+🏆🏆🏆 **§10 AC #2 (Convert matrix × StandardPolicy) ESSENTIALLY COMPLETE — 49/64 cells byte-identical + 5 BLOCKED (canonical `llama-quantize ios_base::clear` bug on MiniMax-M2 230B Q5_K_S/Q5_K_M/Q6_K/Q8_0/IQ4_NL) + 10 N/A (7 for Gemma 4 mmproj since canonical mmproj is F16-only, 3 for BERT bge since canonical doesn't ship those quant tiers for embedding models).** 49 + 5 + 10 = 64 ✓.
+
+**Per-arch detailed breakdown**:
+
+| Arch | byte-identical | BLOCKED | N/A | Note |
+|---|---:|---:|---:|---|
+| Nomic v2-moe | 8/8 | — | — | First fully-closed arch (2026-05-19) |
+| Gemma 4 26B-A4B | 8/8 | — | — | |
+| Llama 3 8B | 8/8 | — | — | |
+| BERT bge-large | 5/5 | — | 3 | Canonical doesn't ship IQ-variants + some K-variants for embedding models |
+| Qwen3-VL Text 8B | 8/8 | — | — | |
+| MiniMax-M2 230B | 3/8 | 5 | — | Canonical `llama-quantize` fails at tensor 809/809 with `ios_base::clear`; output caps at exactly 67,732,766,720 bytes deterministically. Per [[project_minimax_m2_canonical_quantize_bug_2026_05_21]]. Hf2q arch port verified by 3 closed cells. |
+| Qwen 3.5 35B-A3B | 8/8 | — | — | |
+| Gemma 4 mmproj | 1/1 | — | 7 | Canonical `MmprojModel.tensor_force_quant` is F16-only regardless of `--outtype`; vision encoder has no quant-tier matrix. 1 meaningful cell (F16) closed at SHA256 `da596466…`. |
+| **Total** | **49** | **5** | **10** | 64 cells total |
 
 | Arch | Closed | Notes |
 |------|--------|-------|
