@@ -376,13 +376,31 @@ impl ConvertOrchestrator {
                 || is_audio_tensor_pattern(&e.name)
                 || mtp_ffn_gate_inp_demote
             {
-                // Vision / audio modality gate — emit F16 directly.
-                // Per ADR-033 Decision §"Vision / audio tensor patterns",
-                // this is the ONLY place outside the policy where a
-                // ggml_type is chosen, and the ONLY place where F16
-                // demotion is permitted. Also covers MTP-layer
-                // ffn_gate_inp demotion (canonical base.py:875).
-                GgmlType::F16
+                // Vision / audio modality gate. Canonical's
+                // MmprojModel.tensor_force_quant (base.py) returns:
+                //   - F16 if ftype == MOSTLY_F16 and name in
+                //     {.patch_embd.weight, .patch_merger.weight}
+                //   - F32 otherwise for patch_embd/patch_merger
+                //   - default False (no force) for other tensors → then
+                //     n_dims<2 / substring rules apply per
+                //     `tensor_allows_quantization` (llama-quant.cpp:285+)
+                //
+                // hf2q's rule: vision tensors that match F32-keep
+                // patterns (1-D scalars, *_norm.weight, .position_embd,
+                // etc.) STAY F32. The exception is .patch_embd which
+                // gets F16 when the current ftype is f16 (matches
+                // canonical's tensor_force_quant intent).
+                // mtp_ffn_gate_inp_demote stays F16 unconditionally
+                // (per canonical base.py:875).
+                if mtp_ffn_gate_inp_demote {
+                    GgmlType::F16
+                } else if is_f32_keep_tensor(&e.name, e.shape.len())
+                    && !e.name.contains(".patch_embd")
+                {
+                    GgmlType::F32
+                } else {
+                    GgmlType::F16
+                }
             } else if is_f32_keep_tensor(&e.name, e.shape.len()) {
                 // F32-keep gate — emit the F32 row-major payload as-is.
                 // Mirrors llama.cpp's `tensor_allows_quantization`
