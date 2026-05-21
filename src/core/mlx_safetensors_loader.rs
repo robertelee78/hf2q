@@ -39,6 +39,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use rayon::prelude::*;
 use safetensors::{tensor::Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
 
@@ -438,6 +439,15 @@ pub fn unpack_u32_packed(bytes: &[u8], n_u32: usize, bits: u32) -> Result<Vec<u8
 /// `Vec<f32>`.  All inputs are little-endian per the safetensors
 /// spec.
 pub fn read_floats_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
+    // Parallel BF16/F16/F32 → F32 conversion. Profile of Qwen 3.5 35B
+    // convert (2026-05-21, `sample(1)` PID 80984) showed this function
+    // consumes ~40% of the main-thread wall-time (1803 / 4500 main-thread
+    // samples) — bigger contributor than F16 round-trip or BakeOps. The
+    // per-element transform is pure (no shared state, no FP ordering
+    // hazards), so par_chunks_exact preserves byte-identity vs the
+    // serial loop. par_chunks_exact's default work-stealing chunk size
+    // (≥1) means small tensors stay effectively serial; only the multi-
+    // GB safetensors chunks pay any rayon overhead.
     match dtype {
         Dtype::F32 => {
             if bytes.len() % 4 != 0 {
@@ -446,11 +456,10 @@ pub fn read_floats_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
                     bytes.len()
                 ));
             }
-            let mut out = Vec::with_capacity(bytes.len() / 4);
-            for c in bytes.chunks_exact(4) {
-                out.push(f32::from_le_bytes(c.try_into().unwrap()));
-            }
-            Ok(out)
+            Ok(bytes
+                .par_chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect())
         }
         Dtype::F16 => {
             if bytes.len() % 2 != 0 {
@@ -459,12 +468,10 @@ pub fn read_floats_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
                     bytes.len()
                 ));
             }
-            let mut out = Vec::with_capacity(bytes.len() / 2);
-            for c in bytes.chunks_exact(2) {
-                let h = half::f16::from_le_bytes(c.try_into().unwrap());
-                out.push(h.to_f32());
-            }
-            Ok(out)
+            Ok(bytes
+                .par_chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes(c.try_into().unwrap()).to_f32())
+                .collect())
         }
         Dtype::BF16 => {
             if bytes.len() % 2 != 0 {
@@ -473,12 +480,10 @@ pub fn read_floats_to_f32(bytes: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
                     bytes.len()
                 ));
             }
-            let mut out = Vec::with_capacity(bytes.len() / 2);
-            for c in bytes.chunks_exact(2) {
-                let bf = half::bf16::from_le_bytes(c.try_into().unwrap());
-                out.push(bf.to_f32());
-            }
-            Ok(out)
+            Ok(bytes
+                .par_chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes(c.try_into().unwrap()).to_f32())
+                .collect())
         }
         other => Err(anyhow!(
             "read_floats_to_f32: dtype {other:?} not supported (expected F32/F16/BF16)"
