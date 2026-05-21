@@ -567,6 +567,12 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // README.md or the frontmatter block is absent — arches that don't
     // consume the model card ignore the parameter.
     let model_card = crate::convert::model_card::parse_readme_frontmatter(&args.hf_dir);
+    let sampling = crate::convert::model_card::parse_generation_config(&args.hf_dir);
+    let dir_basename: Option<String> = args
+        .hf_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(String::from);
     // Pre-compute `general.size_label` for MoE arches by walking the
     // source tensors. Mirrors canonical's
     // `gguf_writer.get_total_parameter_count()` + `gguf.size_label()`
@@ -582,6 +588,8 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
         ftype_u32,
         model_card.as_ref(),
         size_label.as_deref(),
+        sampling.as_ref(),
+        dir_basename.as_deref(),
     );
 
     // Canonical emits `general.quantization_version` and
@@ -1023,6 +1031,8 @@ fn build_metadata_for_arch(
     ftype: u32,
     model_card: Option<&crate::convert::model_card::ModelCard>,
     size_label: Option<&str>,
+    sampling: Option<&crate::convert::model_card::SamplingConfig>,
+    model_dir_basename: Option<&str>,
 ) -> Vec<(String, MetaValue)> {
     // Multimodal-wrapper flatten: text-decoder hparams live in
     // config["text_config"] for Gemma 4 / Qwen3-VL omni-shape configs.
@@ -1044,7 +1054,13 @@ fn build_metadata_for_arch(
     let config = effective_config(config);
     match arch {
         ArchName::Llama3 => llama3::build_metadata(config, ftype),
-        ArchName::Gemma4 => gemma4::build_metadata(config, ftype),
+        ArchName::Gemma4 => gemma4::build_metadata(
+            config,
+            ftype,
+            model_card,
+            sampling,
+            model_dir_basename,
+        ),
         ArchName::Gemma4Mmproj => unreachable!("handled above"),
         ArchName::Bert => bert::build_metadata(config, ftype),
         ArchName::NomicBert => nomic_bert::build_metadata(config, ftype, model_card, size_label),

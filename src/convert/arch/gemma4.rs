@@ -470,12 +470,33 @@ fn is_offpath_modality_tensor(hf_name: &str) -> bool {
 ///                                      older forks).
 ///
 /// `file_type` is the chosen `LlamaFtype` as a `u32`.
-pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String, MetaValue)> {
-    let name = config
+pub fn build_metadata(
+    config: &serde_json::Value,
+    file_type: u32,
+    model_card: Option<&crate::convert::model_card::ModelCard>,
+    sampling: Option<&crate::convert::model_card::SamplingConfig>,
+    model_dir_basename: Option<&str>,
+) -> Vec<(String, MetaValue)> {
+    use crate::convert::model_card::{
+        emit_general_postlude, emit_general_prelude, get_model_id_components,
+    };
+    // Gemma 4 config.json typically has `_name_or_path = None`; we
+    // fall back to the model directory's basename (e.g.
+    // "google-gemma-4-26b-a4b-it") so the canonical
+    // `get_model_id_components` heuristic can produce the
+    // alphabet-aware basename/finetune/size_label fields that
+    // canonical's GGUF dump shows.
+    let raw_name = config
         .get("_name_or_path")
         .and_then(|v| v.as_str())
-        .unwrap_or("model")
-        .to_string();
+        .map(|s| s.to_string())
+        .or_else(|| model_dir_basename.map(|s| s.to_string()))
+        .unwrap_or_else(|| "model".to_string());
+    let id_components = get_model_id_components(&raw_name);
+    let display_name = id_components
+        .name
+        .clone()
+        .unwrap_or_else(|| raw_name.clone());
 
     let hidden_size = config["hidden_size"]
         .as_u64()
@@ -578,12 +599,20 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
     let n_rot_full = global_head_dim;
     let n_rot_swa = (head_dim as f64 * partial_rotary_factor_swa) as u32;
 
-    let mut kv: Vec<(String, MetaValue)> = vec![
-        (
-            "general.architecture".into(),
-            MetaValue::String("gemma4".into()),
-        ),
-        ("general.name".into(), MetaValue::String(name)),
+    // Emit the canonical `general.*` prelude — architecture, type,
+    // sampling.*, name, version/organization/finetune/basename,
+    // size_label, license, base_model.*, tags, languages — in
+    // canonical order matching `Metadata.set_gguf_meta_model`.
+    let mut kv: Vec<(String, MetaValue)> = emit_general_prelude(
+        "gemma4",
+        display_name,
+        &id_components,
+        None, // Gemma's size_label comes from name parsing ("26B-a4B")
+        model_card,
+        sampling,
+    );
+    kv.reserve(40);
+    kv.extend([
         ("gemma4.context_length".into(), MetaValue::U32(ctx_len)),
         (
             "gemma4.embedding_length".into(),
@@ -662,7 +691,7 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
             "gemma4.rope.dimension_count_swa".into(),
             MetaValue::U32(n_rot_swa),
         ),
-    ];
+    ]);
 
     // ---- feed_forward_length — scalar vs array (gemma.py:680-684) --------
     //
@@ -762,7 +791,12 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
         ));
     }
 
-    kv.push(("general.file_type".into(), MetaValue::U32(file_type)));
+    // Canonical emits `general.quantization_version` + `general.file_type`
+    // LAST (positions 49-50 in the Q4_K_M dump). `cli_driver` pulls
+    // these out of the prelude into a postlude that emits after the
+    // tokenizer block. Place them here at the end of the arch keys so
+    // single-shot consumers also see them last.
+    kv.extend(emit_general_postlude(file_type));
 
     kv
 }
@@ -1351,7 +1385,7 @@ mod tests {
             },
         });
 
-        let kv = build_metadata(&cfg, 17 /* MostlyQ5_K_M */);
+        let kv = build_metadata(&cfg, 17 /* MostlyQ5_K_M */, None, None, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
@@ -1362,9 +1396,14 @@ mod tests {
             MetaValue::String("gemma4".into()),
             "Gemma 4 emits general.architecture=gemma4 (LLM_ARCH_GEMMA4)"
         );
+        // Title-cased via the canonical `id_to_title` heuristic; the
+        // raw `google/gemma-4-26b-a4b-it` decomposes into org="google"
+        // + full_name="gemma-4-26b-a4b-it" which title-cases the
+        // alphabetic parts and keeps digit-start "26b" + version "4"
+        // as-is.
         assert_eq!(
             by_key["general.name"],
-            MetaValue::String("google/gemma-4-26b-a4b-it".into())
+            MetaValue::String("Gemma 4 26b A4B It".into())
         );
         assert_eq!(by_key["gemma4.context_length"], MetaValue::U32(262144));
         assert_eq!(by_key["gemma4.embedding_length"], MetaValue::U32(2816));
@@ -1485,14 +1524,16 @@ mod tests {
             // num_global_key_value_heads omitted → head_count_kv stays scalar
             // use_double_wide_mlp omitted → feed_forward_length stays scalar
         });
-        let kv = build_metadata(&cfg, 0);
+        let kv = build_metadata(&cfg, 0, None, None, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
+        // When `_name_or_path` is absent, falls back to literal
+        // "model" string → title-cased to "Model" by the canonical
+        // `id_to_title` heuristic.
         assert_eq!(
             by_key["general.name"],
-            MetaValue::String("model".into()),
-            "name defaults to 'model' when _name_or_path absent"
+            MetaValue::String("Model".into()),
         );
         assert_eq!(
             by_key["gemma4.attention.head_count_kv"],
@@ -1615,7 +1656,7 @@ mod tests {
             "layer_types": ["sliding_attention"],
         });
         for &ftype in &[0u32, 1, 7, 15, 17, 23] {
-            let kv = build_metadata(&cfg, ftype);
+            let kv = build_metadata(&cfg, ftype, None, None, None);
             let by_key: std::collections::HashMap<_, _> =
                 kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
             assert_eq!(
@@ -1673,7 +1714,7 @@ mod tests {
             "layer_types": ["sliding_attention"],
             // num_kv_shared_layers DELIBERATELY OMITTED
         });
-        let _ = build_metadata(&cfg, 0);
+        let _ = build_metadata(&cfg, 0, None, None, None);
     }
 
     /// `layer_types` is REQUIRED per `gemma.py:665-666`. Without it we
@@ -1693,7 +1734,7 @@ mod tests {
             "num_kv_shared_layers": 0,
             // layer_types DELIBERATELY OMITTED
         });
-        let _ = build_metadata(&cfg, 0);
+        let _ = build_metadata(&cfg, 0, None, None, None);
     }
 
     /// `layer_types` length must match `num_hidden_layers`. Per the
@@ -1714,7 +1755,7 @@ mod tests {
             "num_kv_shared_layers": 0,
             "layer_types": ["sliding_attention", "full_attention"],  // len=2, but n_layers=3
         });
-        let _ = build_metadata(&cfg, 0);
+        let _ = build_metadata(&cfg, 0, None, None, None);
     }
 
     // -----------------------------------------------------------------------
@@ -1745,7 +1786,7 @@ mod tests {
             ],
             "use_double_wide_mlp": true,
         });
-        let kv = build_metadata(&cfg, 0);
+        let kv = build_metadata(&cfg, 0, None, None, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         // first_kv_shared_layer_idx = 6 - 2 = 4. Layers [0..4) → 64;
@@ -1780,7 +1821,7 @@ mod tests {
                 "full_attention",
             ],
         });
-        let kv = build_metadata(&cfg, 0);
+        let kv = build_metadata(&cfg, 0, None, None, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         // swa layers (0,1) → num_key_value_heads=4
@@ -1808,7 +1849,7 @@ mod tests {
             "num_kv_shared_layers": 0,
             "layer_types": ["sliding_attention", "full_attention"],
         });
-        let kv = build_metadata(&cfg, 0);
+        let kv = build_metadata(&cfg, 0, None, None, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         assert_eq!(

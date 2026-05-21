@@ -51,7 +51,9 @@
 
 use crate::backends::gguf::types::MetaValue;
 use crate::convert::arch::bake::BakeOp;
-use crate::convert::model_card::{get_model_id_components, split_base_model, ModelCard};
+use crate::convert::model_card::{
+    emit_general_postlude, emit_general_prelude, get_model_id_components, ModelCard,
+};
 
 /// Per-arch context plumbed into [`map_tensor_name`] when the tensor
 /// transform depends on hparams that aren't recoverable from the
@@ -532,15 +534,6 @@ pub fn build_metadata(
             ) as u32;
         let n_layers_per_moe = moe_every_n.unwrap();
         let _ = n_head_kv; // canonical doesn't emit head_count_kv for nomic
-        let mut kv_v2moe: Vec<(String, MetaValue)> = Vec::with_capacity(64);
-        kv_v2moe.push((
-            "general.architecture".into(),
-            MetaValue::String(arch_name.into()),
-        ));
-        // `general.type` is hardcoded `"model"` for all model GGUFs
-        // canonical emits (vs `"adapter"` for LoRA). See canonical's
-        // implicit default at `metadata.py`.
-        kv_v2moe.push(("general.type".into(), MetaValue::String("model".into())));
         // v2-moe path uses the title-cased name from
         // `get_model_id_components` to match canonical's observed
         // `general.name = "Nomic Xlm 2048"`. Falls back to the raw
@@ -549,81 +542,15 @@ pub fn build_metadata(
             .name
             .clone()
             .unwrap_or_else(|| raw_name_string.clone());
-        kv_v2moe.push(("general.name".into(), MetaValue::String(v2moe_name)));
-        // `general.{version, organization, basename}` come from the
-        // name-parser heuristic (`get_model_id_components` port of
-        // `metadata.py:240-362`). Only emitted when the parser
-        // produced a value — canonical's same gating.
-        if let Some(v) = &id_components.version {
-            kv_v2moe.push(("general.version".into(), MetaValue::String(v.clone())));
-        }
-        if let Some(o) = &id_components.organization {
-            kv_v2moe.push(("general.organization".into(), MetaValue::String(o.clone())));
-        }
-        if let Some(b) = &id_components.basename {
-            kv_v2moe.push(("general.basename".into(), MetaValue::String(b.clone())));
-        }
-        // `general.size_label` is pre-computed from the tensor walk
-        // by `cli_driver::run_convert` (per canonical's
-        // `gguf.size_label(total_params, shared_params, expert_params,
-        // expert_count)` formula at `utility.py:44-52`). Only
-        // emitted when the caller provides a value — `None` means
-        // the size couldn't be computed (e.g. orphan unit-test
-        // fixture with no model dir).
-        if let Some(sl) = size_label {
-            kv_v2moe.push((
-                "general.size_label".into(),
-                MetaValue::String(sl.to_string()),
-            ));
-        }
-        // HF model-card metadata (license, base_model, tags, languages).
-        // CANONICAL ORDER: emitted BEFORE the per-arch keys (verified
-        // against the canonical Q8_0 GGUF dump for nomic v2-moe —
-        // positions 8-17 vs the arch keys at 18-31).
-        if let Some(card) = model_card {
-            if let Some(license) = &card.license {
-                kv_v2moe.push(("general.license".into(), MetaValue::String(license.clone())));
-            }
-            if !card.base_models.is_empty() {
-                kv_v2moe.push((
-                    "general.base_model.count".into(),
-                    MetaValue::U32(card.base_models.len() as u32),
-                ));
-                for (i, entry) in card.base_models.iter().enumerate() {
-                    let (name, org, url) = split_base_model(&entry.raw);
-                    if let Some(name) = name {
-                        kv_v2moe.push((
-                            format!("general.base_model.{i}.name"),
-                            MetaValue::String(name),
-                        ));
-                    }
-                    if let Some(org) = org {
-                        kv_v2moe.push((
-                            format!("general.base_model.{i}.organization"),
-                            MetaValue::String(org),
-                        ));
-                    }
-                    if let Some(url) = url {
-                        kv_v2moe.push((
-                            format!("general.base_model.{i}.repo_url"),
-                            MetaValue::String(url),
-                        ));
-                    }
-                }
-            }
-            if !card.tags.is_empty() {
-                kv_v2moe.push((
-                    "general.tags".into(),
-                    MetaValue::ArrayString(card.tags.clone()),
-                ));
-            }
-            if !card.languages.is_empty() {
-                kv_v2moe.push((
-                    "general.languages".into(),
-                    MetaValue::ArrayString(card.languages.clone()),
-                ));
-            }
-        }
+        let mut kv_v2moe = emit_general_prelude(
+            arch_name,
+            v2moe_name,
+            &id_components,
+            size_label,
+            model_card,
+            None, // Nomic embedding models don't ship generation_config.json
+        );
+        kv_v2moe.reserve(20);
         kv_v2moe.extend([
             (format!("{arch_name}.block_count"), MetaValue::U32(n_layers)),
             (format!("{arch_name}.context_length"), MetaValue::U32(ctx_len)),
@@ -678,14 +605,10 @@ pub fn build_metadata(
         // Q8_0 GGUF dump — AFTER all tokenizer.* keys). `cli_driver`'s
         // metadata-emit phase pulls these two keys out of the prelude
         // and re-emits them after the tokenizer block. We still place
-        // them here at the end of the arch keys for v1.5-style
-        // single-shot consumers; cli_driver's reorder is a no-op when
-        // they're already at the end.
-        kv_v2moe.push((
-            "general.quantization_version".into(),
-            MetaValue::U32(2),
-        ));
-        kv_v2moe.push(("general.file_type".into(), MetaValue::U32(file_type)));
+        // them here at the end of the arch keys for single-shot
+        // consumers; cli_driver's reorder is a no-op when they're
+        // already at the end.
+        kv_v2moe.extend(emit_general_postlude(file_type));
         kv_v2moe
     } else {
         // v1.5 path (unchanged): preserve historical key set + order
