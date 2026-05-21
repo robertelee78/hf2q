@@ -27,7 +27,187 @@
 //! `general.*` metadata block entirely rather than emitting half a
 //! card.
 
+use crate::backends::gguf::types::MetaValue;
 use std::path::Path;
+
+/// Parsed `generation_config.json` sampling defaults. Only the
+/// canonical-emitted fields are tracked (`top_k`, `top_p`,
+/// `temperature`). Other fields are silently ignored.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SamplingConfig {
+    pub top_k: Option<i32>,
+    pub top_p: Option<f32>,
+    pub temperature: Option<f32>,
+}
+
+impl SamplingConfig {
+    pub fn is_empty(&self) -> bool {
+        self.top_k.is_none() && self.top_p.is_none() && self.temperature.is_none()
+    }
+}
+
+/// Read `<dir>/generation_config.json` and extract the sampling
+/// defaults that canonical's `Metadata.load_generation_config` +
+/// `set_gguf_meta_model` emit as `general.sampling.{top_k, top_p,
+/// temp}`. Returns `None` if the file doesn't exist or can't be
+/// parsed.
+pub fn parse_generation_config(dir: &Path) -> Option<SamplingConfig> {
+    let path = dir.join("generation_config.json");
+    let s = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let mut cfg = SamplingConfig::default();
+    if let Some(n) = v.get("top_k").and_then(|x| x.as_i64()) {
+        cfg.top_k = Some(n as i32);
+    }
+    if let Some(n) = v.get("top_p").and_then(|x| x.as_f64()) {
+        cfg.top_p = Some(n as f32);
+    }
+    if let Some(n) = v.get("temperature").and_then(|x| x.as_f64()) {
+        cfg.temperature = Some(n as f32);
+    }
+    if cfg.is_empty() {
+        None
+    } else {
+        Some(cfg)
+    }
+}
+
+/// Emit the `general.*` KV pairs in canonical order, mirroring
+/// `/opt/llama.cpp/gguf-py/gguf/metadata.py::Metadata.set_gguf_meta_model`
+/// at lines 634-731. Canonical emit order (preserving conditional
+/// gating on Option fields):
+///
+///   1. architecture       (from `arch_name` arg)
+///   2. type = "model"     (`set_type` at base.py:905-906)
+///   3. sampling.top_k     (when `generation_config.json` present)
+///   4. sampling.top_p     (when present)
+///   5. sampling.temp      (when present)
+///   6. name               (mandatory; title-cased canonical display form)
+///   7. author             (NOT emitted by hf2q — canonical only emits
+///                          when `model_card['author']` is set)
+///   8. version            (from `id_components.version`)
+///   9. organization       (from `id_components.organization`)
+///   10. finetune          (from `id_components.finetune`)
+///   11. basename          (from `id_components.basename`)
+///   12. description       (NOT emitted)
+///   13. quantized_by      (NOT emitted)
+///   14. size_label        (preferred `size_label_override`, else
+///                          `id_components.size_label`)
+///   15. license           (from `model_card.license`)
+///   16. base_model.count + .{N}.{name,organization,repo_url}
+///   17. tags
+///   18. languages
+///
+/// The function returns the prelude as an ordered `Vec` so callers
+/// can splice it into the larger metadata layout (architecture is
+/// included as the first entry per canonical order).
+pub fn emit_general_prelude(
+    arch_name: &str,
+    name: String,
+    id_components: &ModelIdComponents,
+    size_label_override: Option<&str>,
+    model_card: Option<&ModelCard>,
+    sampling: Option<&SamplingConfig>,
+) -> Vec<(String, MetaValue)> {
+    let mut kv: Vec<(String, MetaValue)> = Vec::with_capacity(32);
+    kv.push((
+        "general.architecture".into(),
+        MetaValue::String(arch_name.into()),
+    ));
+    kv.push(("general.type".into(), MetaValue::String("model".into())));
+    if let Some(s) = sampling {
+        if let Some(v) = s.top_k {
+            kv.push(("general.sampling.top_k".into(), MetaValue::I32(v)));
+        }
+        if let Some(v) = s.top_p {
+            kv.push(("general.sampling.top_p".into(), MetaValue::F32(v)));
+        }
+        if let Some(v) = s.temperature {
+            kv.push(("general.sampling.temp".into(), MetaValue::F32(v)));
+        }
+    }
+    kv.push(("general.name".into(), MetaValue::String(name)));
+    if let Some(v) = &id_components.version {
+        kv.push(("general.version".into(), MetaValue::String(v.clone())));
+    }
+    if let Some(o) = &id_components.organization {
+        kv.push((
+            "general.organization".into(),
+            MetaValue::String(o.clone()),
+        ));
+    }
+    if let Some(f) = &id_components.finetune {
+        kv.push(("general.finetune".into(), MetaValue::String(f.clone())));
+    }
+    if let Some(b) = &id_components.basename {
+        kv.push(("general.basename".into(), MetaValue::String(b.clone())));
+    }
+    let size_label_final: Option<String> = size_label_override
+        .map(String::from)
+        .or_else(|| id_components.size_label.clone());
+    if let Some(sl) = size_label_final {
+        kv.push(("general.size_label".into(), MetaValue::String(sl)));
+    }
+    if let Some(card) = model_card {
+        if let Some(license) = &card.license {
+            kv.push((
+                "general.license".into(),
+                MetaValue::String(license.clone()),
+            ));
+        }
+        if !card.base_models.is_empty() {
+            kv.push((
+                "general.base_model.count".into(),
+                MetaValue::U32(card.base_models.len() as u32),
+            ));
+            for (i, entry) in card.base_models.iter().enumerate() {
+                let (name, org, url) = split_base_model(&entry.raw);
+                if let Some(name) = name {
+                    kv.push((
+                        format!("general.base_model.{i}.name"),
+                        MetaValue::String(name),
+                    ));
+                }
+                if let Some(org) = org {
+                    kv.push((
+                        format!("general.base_model.{i}.organization"),
+                        MetaValue::String(org),
+                    ));
+                }
+                if let Some(url) = url {
+                    kv.push((
+                        format!("general.base_model.{i}.repo_url"),
+                        MetaValue::String(url),
+                    ));
+                }
+            }
+        }
+        if !card.tags.is_empty() {
+            kv.push((
+                "general.tags".into(),
+                MetaValue::ArrayString(card.tags.clone()),
+            ));
+        }
+        if !card.languages.is_empty() {
+            kv.push((
+                "general.languages".into(),
+                MetaValue::ArrayString(card.languages.clone()),
+            ));
+        }
+    }
+    kv
+}
+
+/// Emit the `general.{quantization_version, file_type}` postlude
+/// in canonical order (verified position 50-51 of the Q8_0 GGUF
+/// dumps for both Gemma 4 and Nomic v2-moe). These come AFTER the
+/// tokenizer block in canonical's combined convert+quantize output.
+pub fn emit_general_postlude(file_type: u32) -> Vec<(String, MetaValue)> {
+    vec![
+        ("general.quantization_version".into(), MetaValue::U32(2)),
+        ("general.file_type".into(), MetaValue::U32(file_type)),
+    ]
+}
 
 /// One entry in the `base_model:` list of the YAML frontmatter.
 /// HuggingFace convention is `"<org>/<repo>"` (e.g.
@@ -1212,6 +1392,134 @@ language:
         assert!(!is_python_islower("aBc")); // mixed case
         assert!(!is_python_islower("123")); // no cased chars
         assert!(!is_python_islower("4")); // no cased chars
+    }
+
+    /// Canonical-fidelity test: emit_general_prelude on Gemma 4-style
+    /// inputs should produce the observed canonical KV layout (excluding
+    /// the model-card fields since Gemma's HF card differs from nomic):
+    ///   architecture, type, sampling.top_k, sampling.top_p,
+    ///   sampling.temp, name, finetune, basename, size_label.
+    #[test]
+    fn emit_general_prelude_gemma_layout() {
+        let id_components = get_model_id_components("google-gemma-4-26b-a4b-it");
+        let sampling = SamplingConfig {
+            top_k: Some(64),
+            top_p: Some(0.95),
+            temperature: Some(1.0),
+        };
+        let kv = emit_general_prelude(
+            "gemma4",
+            "Google Gemma 4 26b A4B It".to_string(),
+            &id_components,
+            None,
+            None,
+            Some(&sampling),
+        );
+        let keys: Vec<&str> = kv.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "general.architecture",
+                "general.type",
+                "general.sampling.top_k",
+                "general.sampling.top_p",
+                "general.sampling.temp",
+                "general.name",
+                "general.finetune",
+                "general.basename",
+                "general.size_label",
+            ]
+        );
+        let by_key: std::collections::HashMap<_, _> =
+            kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        assert_eq!(
+            by_key["general.architecture"],
+            MetaValue::String("gemma4".into())
+        );
+        assert_eq!(
+            by_key["general.type"],
+            MetaValue::String("model".into())
+        );
+        assert_eq!(by_key["general.sampling.top_k"], MetaValue::I32(64));
+        assert_eq!(
+            by_key["general.name"],
+            MetaValue::String("Google Gemma 4 26b A4B It".into())
+        );
+        assert_eq!(
+            by_key["general.finetune"],
+            MetaValue::String("it".into())
+        );
+        assert_eq!(
+            by_key["general.basename"],
+            MetaValue::String("google-gemma-4".into())
+        );
+        assert_eq!(
+            by_key["general.size_label"],
+            MetaValue::String("26B-a4B".into())
+        );
+    }
+
+    /// Canonical-fidelity test: emit_general_prelude on Nomic v2-moe
+    /// inputs (with model card) should produce: architecture, type,
+    /// name, version, organization, basename, size_label (override
+    /// for MoE), license, base_model.{count, 0.name, 0.organization,
+    /// 0.repo_url}, tags, languages.
+    #[test]
+    fn emit_general_prelude_nomic_v2moe_layout() {
+        let id_components = get_model_id_components("nomic-ai/nomic-xlm-2048");
+        let card = ModelCard {
+            license: Some("apache-2.0".into()),
+            tags: vec![
+                "sentence-transformers".into(),
+                "sentence-similarity".into(),
+            ],
+            languages: vec!["en".into(), "es".into()],
+            base_models: vec![BaseModelEntry {
+                raw: "nomic-ai/nomic-embed-text-v2-moe-unsupervised".into(),
+            }],
+        };
+        let kv = emit_general_prelude(
+            "nomic-bert-moe",
+            "Nomic Xlm 2048".to_string(),
+            &id_components,
+            Some("8x277M"), // MoE size_label override
+            Some(&card),
+            None, // no generation_config for embedding model
+        );
+        let keys: Vec<&str> = kv.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "general.architecture",
+                "general.type",
+                "general.name",
+                "general.version",
+                "general.organization",
+                "general.basename",
+                "general.size_label",
+                "general.license",
+                "general.base_model.count",
+                "general.base_model.0.name",
+                "general.base_model.0.organization",
+                "general.base_model.0.repo_url",
+                "general.tags",
+                "general.languages",
+            ]
+        );
+        let by_key: std::collections::HashMap<_, _> =
+            kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        assert_eq!(
+            by_key["general.architecture"],
+            MetaValue::String("nomic-bert-moe".into())
+        );
+        assert_eq!(
+            by_key["general.size_label"],
+            MetaValue::String("8x277M".into())
+        );
+        assert_eq!(
+            by_key["general.organization"],
+            MetaValue::String("Nomic Ai".into())
+        );
     }
 
     #[test]
