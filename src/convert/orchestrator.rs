@@ -590,10 +590,14 @@ impl<W: Write + Seek> StreamingWriter<W> {
                 // subnormals, propagating identical inputs into the K-quant
                 // kernel. Per-element scalar round-trip; matches numpy's
                 // ndarray.astype(float16).astype(float32) used by canonical.
-                // Parallel par_iter attempted at 2026-05-21 and falsified:
-                // 183s → 194s (slower; rayon work-stealing overhead exceeds
-                // gain since this runs once per tensor and the quantize
+                // Parallel par_iter attempted 2026-05-21 → 183s → 194s
+                // (FALSIFIED; rayon overhead > gain since the quantize
                 // kernel that follows is already rayon-parallel per-row).
+                // Buffer-reuse via `StreamingWriter` field attempted
+                // 2026-05-21 → 183s → 190s (FALSIFIED; allocation was
+                // not the bottleneck either). The 1.62×-canonical wall
+                // characteristic needs a real profiler to localize, not
+                // blind hypothesis-testing — see ADR-033 perf section.
                 let f16_rt: Vec<f32> = data.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
                 quantizer.quantize(&f16_rt, p.n_per_row, None)?
             }

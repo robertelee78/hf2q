@@ -57,7 +57,9 @@ Gemma 4 26B has 54.83s of canonical Step 1 work (Python doing per-expert `.trans
 
 2. **H2 — `BakeOp::MoeExpertTranspose` parallelization** at `bake.rs:600`: par_chunks_exact_mut across the outer expert loop. Bench: 195.24s (12.16s WORSE). **FALSIFIED on a wrong premise** — code-grep revealed `MoeExpertTranspose` is used only by Nomic v2-moe (which is small); Qwen 3.5 uses `BakeOp::SplitAxisHalf` (just a slice). The bench measured pure noise (~6.6% variance). Reverted; transpose is memory-bandwidth-bound and Nomic's small dims make it cheap regardless.
 
-**Falsified-hypothesis lesson**: Before parallelizing, verify the target op is actually in the hot path for the model under test via code-grep. Estimating "this LOOKS expensive" without confirming it's reachable is a guess, not science.
+3. **H3 — Buffer-reuse for F16 RT** at `orchestrator.rs`: hoist the `Vec::collect()` allocation to a reusable `StreamingWriter` field so the 82 fused-expert tensors don't each pay page-fault-on-write costs. Bench: 190.73s (7.65s WORSE). **FALSIFIED.** The allocation cost was NOT the bottleneck either. Reverted with documenting warning comment.
+
+**Stop-the-bleeding lesson**: Three blind hypothesis tests yielded no perf win. The cumulative variance is ~12s = 6.6% across runs, suggesting the 183.08s baseline may itself be on the favourable side of the noise band — three optimizations measuring as +7s, +11s, +12s could all be within noise. The 1.62×-canonical wall ratio is a real performance characteristic, but **localizing the actual bottleneck needs a real profiler** (cargo-instruments, Apple Xcode Instruments time profile, or dtrace) — not more blind grep-and-rayon-the-loop. Future perf work on Qwen 3.5 should start by capturing a flame graph or per-function CPU sample.
 
 **Real per-model breakdown**:
 - **Llama 3 8B dense**: hf2q wins by 28% — canonical's per-tensor Python overhead dominates on small-tensor-count dense models
