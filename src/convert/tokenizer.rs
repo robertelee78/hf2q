@@ -1670,12 +1670,15 @@ mod tests {
 
     #[test]
     fn does_token_look_special_pinned_pattern() {
-        // Mirrors gguf.rs:6865-6892 — pin the heuristic so reviewers
-        // see the same behavior across both emitters.
-        for s in &["<|im_end|>", "<eos>", "<think>", "<|tool_call|>"] {
+        // Aligned with canonical TextModel.does_token_look_special at
+        // /opt/llama.cpp/conversion/base.py:1232-1253 — STRICT bracket
+        // forms only. Bare `<...>` tokens are USER_DEFINED, not CONTROL.
+        // See commit 6693a52e for the alignment that closed Qwen3-VL
+        // byte-cmp.
+        for s in &["<|im_end|>", "<|tool_call|>", "<pad>", "<mask>", "<unused0>"] {
             assert!(does_token_look_special(s), "{s} should look special");
         }
-        for s in &["abc", "<unk>", "<>", "<", ">"] {
+        for s in &["abc", "<unk>", "<>", "<", ">", "<eos>", "<think>"] {
             assert!(!does_token_look_special(s), "{s} should NOT look special");
         }
     }
