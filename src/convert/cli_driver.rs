@@ -567,8 +567,22 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // README.md or the frontmatter block is absent — arches that don't
     // consume the model card ignore the parameter.
     let model_card = crate::convert::model_card::parse_readme_frontmatter(&args.hf_dir);
+    // Pre-compute `general.size_label` for MoE arches by walking the
+    // source tensors. Mirrors canonical's
+    // `gguf_writer.get_total_parameter_count()` + `gguf.size_label()`
+    // pipeline at `gguf-py/gguf/utility.py:44-52`. Per-arch expert
+    // detection: nomic_bert v2-moe uses HF name pattern
+    // `mlp.experts.mlp.w` to flag expert tensors (vs the canonical
+    // GGUF-side `_exps.` check — equivalent results).
+    let size_label = compute_size_label_for_arch(arch, &src, &src.config);
     let ftype_u32 = ftype_for_metadata as u32;
-    for (k, v) in build_metadata_for_arch(arch, &src.config, ftype_u32, model_card.as_ref()) {
+    for (k, v) in build_metadata_for_arch(
+        arch,
+        &src.config,
+        ftype_u32,
+        model_card.as_ref(),
+        size_label.as_deref(),
+    ) {
         orch.add_metadata(k, v);
     }
 
@@ -981,6 +995,7 @@ fn build_metadata_for_arch(
     config: &serde_json::Value,
     ftype: u32,
     model_card: Option<&crate::convert::model_card::ModelCard>,
+    size_label: Option<&str>,
 ) -> Vec<(String, MetaValue)> {
     // Multimodal-wrapper flatten: text-decoder hparams live in
     // config["text_config"] for Gemma 4 / Qwen3-VL omni-shape configs.
@@ -1005,7 +1020,7 @@ fn build_metadata_for_arch(
         ArchName::Gemma4 => gemma4::build_metadata(config, ftype),
         ArchName::Gemma4Mmproj => unreachable!("handled above"),
         ArchName::Bert => bert::build_metadata(config, ftype),
-        ArchName::NomicBert => nomic_bert::build_metadata(config, ftype, model_card),
+        ArchName::NomicBert => nomic_bert::build_metadata(config, ftype, model_card, size_label),
         ArchName::Qwen35Moe => qwen35moe::build_metadata(config, ftype),
         ArchName::Qwen35MoeFull => match build_qwen35moe_full_ctx(config) {
             Some(ctx) => qwen35moe_full::build_metadata(&ctx, config, ftype),
@@ -1275,6 +1290,43 @@ fn lift_qwen35moe_full_mapped(m: Option<qwen35moe_full::MappedTensor>) -> MapOut
 /// `text_config` for multimodal-wrapping `ConditionalGeneration`
 /// variants). Detects multimodal wrapping from
 /// `architectures` containing `ForConditionalGeneration`.
+/// Compute `general.size_label` for arches that emit it. Returns
+/// `None` when the arch doesn't (yet) participate in the size_label
+/// metadata field — currently only `ArchName::NomicBert` on the
+/// v2-moe path. Mirrors canonical's
+/// `gguf-py/gguf/utility.py::size_label` formula.
+///
+/// For nomic v2-moe expert tensors are detected by HF tensor-name
+/// pattern `.mlp.experts.mlp.w` (suffix `w1` or `w2`). All other
+/// tensors are "shared". `num_experts` from config drives the
+/// per-expert division.
+fn compute_size_label_for_arch(
+    arch: ArchName,
+    src: &HfModelSource,
+    config: &serde_json::Value,
+) -> Option<String> {
+    use crate::convert::model_card::compute_size_label;
+    match arch {
+        ArchName::NomicBert => {
+            let nomic_ctx = build_nomic_bert_ctx(config);
+            let n_experts = nomic_ctx.num_experts? as u32;
+            // Drop `mlp.experts.bias` from the walk (canonical's
+            // `NomicBertModel.filter_tensors` at `bert.py:366-369`
+            // discards it; including it inflates `shared_params`).
+            let iter = src.tensor_metas().filter_map(|m| {
+                let stripped = m.name.strip_prefix("bert.").unwrap_or(&m.name);
+                if stripped.contains("mlp.experts.bias") {
+                    return None;
+                }
+                let is_expert = stripped.contains(".mlp.experts.mlp.w");
+                Some((m.numel() as u64, is_expert))
+            });
+            Some(compute_size_label(iter, n_experts))
+        }
+        _ => None,
+    }
+}
+
 /// Build the `NomicBertCtx` from the HF `config.json`. v1.5 returns a
 /// ctx with `num_experts = None`; v2-moe carries
 /// `num_experts` / `num_local_experts` per canonical

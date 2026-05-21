@@ -356,6 +356,7 @@ pub fn build_metadata(
     config: &serde_json::Value,
     file_type: u32,
     model_card: Option<&ModelCard>,
+    size_label: Option<&str>,
 ) -> Vec<(String, MetaValue)> {
     let raw_name = config
         .get("_name_or_path")
@@ -553,9 +554,19 @@ pub fn build_metadata(
         if let Some(b) = &id_components.basename {
             kv_v2moe.push(("general.basename".into(), MetaValue::String(b.clone())));
         }
-        // TODO follow-up iteration: `general.size_label` from the
-        // tensor walk (canonical's `gguf.size_label(total_params,
-        // shared_params, expert_params, expert_count)`).
+        // `general.size_label` is pre-computed from the tensor walk
+        // by `cli_driver::run_convert` (per canonical's
+        // `gguf.size_label(total_params, shared_params, expert_params,
+        // expert_count)` formula at `utility.py:44-52`). Only
+        // emitted when the caller provides a value — `None` means
+        // the size couldn't be computed (e.g. orphan unit-test
+        // fixture with no model dir).
+        if let Some(sl) = size_label {
+            kv_v2moe.push((
+                "general.size_label".into(),
+                MetaValue::String(sl.to_string()),
+            ));
+        }
         kv_v2moe.extend([
             (format!("{arch_name}.block_count"), MetaValue::U32(n_layers)),
             (format!("{arch_name}.context_length"), MetaValue::U32(ctx_len)),
@@ -1040,7 +1051,7 @@ mod tests {
             "rotary_emb_base": 1000.0,
         });
 
-        let kv = build_metadata(&cfg, 17 /* MostlyQ5_K_M */, None);
+        let kv = build_metadata(&cfg, 17 /* MostlyQ5_K_M */, None, None);
 
         // Check count + keyset (don't depend on insertion order).
         assert_eq!(kv.len(), 12, "NomicBert emits 12 KV pairs at v1");
@@ -1118,7 +1129,7 @@ mod tests {
             "num_experts": 8,
             "moe_top_k": 2,
         });
-        let kv = build_metadata(&cfg, 17, None);
+        let kv = build_metadata(&cfg, 17, None, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
@@ -1217,7 +1228,7 @@ mod tests {
             // rotary_emb_base omitted → defaults to 10000.0
             // _name_or_path omitted → defaults to "model"
         });
-        let kv = build_metadata(&cfg, 0, None);
+        let kv = build_metadata(&cfg, 0, None, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
