@@ -133,7 +133,49 @@ pub fn build_metadata(
     let raw_name = model_dir_basename
         .map(|s| s.to_string())
         .unwrap_or_else(|| "model".to_string());
-    let id_components = get_model_id_components(&raw_name);
+    let mut id_components = get_model_id_components(&raw_name);
+    // mmproj ID-component override: canonical's Metadata.get_model_id_components
+    // at /opt/llama.cpp/gguf-py/gguf/metadata.py:295-309 reclassifies a
+    // numeric size_label part as `finetune` when its implied parameter
+    // count is far from the model's total_params. For mmproj sidecars,
+    // total_params is the vision tower (~440M for Gemma 4 26B-A4B-IT),
+    // while the directory name carries `26b-a4b-it` — `26b` (= 26e9
+    // params) is FAR from 440M, so canonical moves it from size_label
+    // to finetune. Result: size_label='a4B', finetune='26b-it'.
+    //
+    // We replicate the post-classification step: when our size_label
+    // ends with `B-a<digit>B` (the Gemma 4 26B-a4B form), keep only
+    // the `a<digit>B` portion as size_label and prepend the leading
+    // <num>b to finetune. Lowercase the `b` (canonical does this via
+    // `part = part[:-1] + part[-1].lower()` at metadata.py:309 when
+    // reclassifying to context-length/finetune).
+    if let Some(sl) = id_components.size_label.clone() {
+        // Match `<digits>B-a<digit>B` shape.
+        if let Some(dash_idx) = sl.find("-a") {
+            let (prefix, suffix) = sl.split_at(dash_idx);
+            // prefix should be like "26B" and suffix like "-a4B"
+            if prefix.ends_with('B')
+                && prefix.len() >= 2
+                && prefix[..prefix.len() - 1].chars().all(|c| c.is_ascii_digit())
+                && suffix.starts_with("-a")
+            {
+                // Reclassify prefix → finetune (lowercased `b` per canonical).
+                let prefix_lower = format!(
+                    "{}{}",
+                    &prefix[..prefix.len() - 1],
+                    prefix[prefix.len() - 1..].to_ascii_lowercase()
+                );
+                // Strip the leading dash from suffix → new size_label.
+                let new_size_label = suffix.strip_prefix('-').unwrap_or(suffix).to_string();
+                let finetune_prefixed = match &id_components.finetune {
+                    Some(existing) => format!("{}-{}", prefix_lower, existing),
+                    None => prefix_lower,
+                };
+                id_components.size_label = Some(new_size_label);
+                id_components.finetune = Some(finetune_prefixed);
+            }
+        }
+    }
     let display_name = id_components
         .name
         .clone()

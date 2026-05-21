@@ -199,6 +199,33 @@ pub enum BakeOp {
         n_inner: usize,
         n_embd: usize,
     },
+
+    /// ViT patch-embedder 2-D → 4-D reshape + permute. The HF source is
+    /// a 2-D linear-projection weight of shape
+    /// `[out_features, patch_h * patch_w * channels]` (row-major,
+    /// inner axis = flattened patch in (h, w, c) order). Canonical's
+    /// /opt/llama.cpp/conversion/gemma.py:834-838 (Gemma 4 vision):
+    ///
+    /// ```python
+    /// n_embd, ksize_sq_c = data_torch.shape       # (1152, 768)
+    /// patch_size = int((ksize_sq_c // 3) ** 0.5)  # 16
+    /// data_torch = data_torch.reshape(n_embd, patch_size, patch_size, 3)
+    /// data_torch = data_torch.permute(0, 3, 1, 2).contiguous()
+    /// ```
+    ///
+    /// Result is logical `[out_features, channels, patch_h, patch_w]`
+    /// (CHW per channel — torch conv2d kernel layout). GGUF stores
+    /// reversed-axis order so the dump shows
+    /// `[patch_w, patch_h, channels, out_features]`.
+    ///
+    /// For Gemma 4 26B-A4B-IT mmproj `v.patch_embd.weight`:
+    /// `out_features=1152`, `patch_h=16`, `patch_w=16`, `channels=3`.
+    PatchEmbedderReshape {
+        out_features: usize,
+        patch_h: usize,
+        patch_w: usize,
+        channels: usize,
+    },
 }
 
 /// Which half of a [`BakeOp::SplitAxisHalf`] to select.
@@ -272,6 +299,15 @@ impl fmt::Display for BakeOp {
             } => write!(
                 f,
                 "MoeExpertTranspose {{ n_experts={n_experts}, n_inner={n_inner}, n_embd={n_embd} }}"
+            ),
+            BakeOp::PatchEmbedderReshape {
+                out_features,
+                patch_h,
+                patch_w,
+                channels,
+            } => write!(
+                f,
+                "PatchEmbedderReshape {{ out={out_features}, h={patch_h}, w={patch_w}, c={channels} }}"
             ),
             BakeOp::Sequence(ops) => {
                 write!(f, "Sequence([")?;
@@ -640,6 +676,55 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
                     let dst_offset = head_base_out + r_out * inr;
                     out[dst_offset..dst_offset + inr]
                         .copy_from_slice(&data[src_offset..src_offset + inr]);
+                }
+            }
+            Ok(out)
+        }
+        BakeOp::PatchEmbedderReshape {
+            out_features,
+            patch_h,
+            patch_w,
+            channels,
+        } => {
+            // Reshape 2-D [out_features, patch_h*patch_w*channels]
+            // (HF, inner = HWC) to logical 4-D [out_features, channels,
+            // patch_h, patch_w] (CHW per channel — torch conv2d kernel
+            // layout). Element transform per canonical
+            // /opt/llama.cpp/conversion/gemma.py:834-838:
+            //   .reshape(out, patch_h, patch_w, channels) → axes 0,1,2,3
+            //   .permute(0, 3, 1, 2)                        → axes 0,3,1,2
+            //
+            // Row-major in/out indexing:
+            //   in [e, h, w, c]  → idx = ((e*patch_h + h)*patch_w + w)*channels + c
+            //   out[e, c, h, w]  → idx = ((e*channels + c)*patch_h + h)*patch_w + w
+            let out_n = *out_features;
+            let ph = *patch_h;
+            let pw = *patch_w;
+            let ch = *channels;
+            let inner = ph * pw * ch;
+            let expected = out_n * inner;
+            if data.len() != expected {
+                return Err(BakeError {
+                    op: op.clone(),
+                    buffer_len: data.len(),
+                    reason: format!(
+                        "buffer len {} != out_features*patch_h*patch_w*channels = {out_n}*{ph}*{pw}*{ch} = {expected}",
+                        data.len()
+                    ),
+                });
+            }
+            let mut out = vec![0.0f32; expected];
+            for e in 0..out_n {
+                let in_base = e * inner;
+                let out_base = e * inner; // same outer stride: ch*ph*pw == ph*pw*ch
+                for h in 0..ph {
+                    for w in 0..pw {
+                        for c in 0..ch {
+                            let in_idx = in_base + (h * pw + w) * ch + c;
+                            let out_idx = out_base + (c * ph + h) * pw + w;
+                            out[out_idx] = data[in_idx];
+                        }
+                    }
                 }
             }
             Ok(out)

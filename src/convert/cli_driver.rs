@@ -1399,7 +1399,41 @@ fn map_tensor(
         },
         ArchName::Gemma4VisionMmproj => {
             match crate::convert::arch::gemma4_vision_mmproj::map_tensor_name(hf_name) {
-                Some(s) => MapOutcome::Direct(s),
+                Some(gguf_name) => {
+                    // Patch embedder reshape: HF stores
+                    // `patch_embedder.input_proj.weight` as 2-D
+                    // `[out_features, patch_h*patch_w*channels]`; GGUF
+                    // wants 4-D `[out_features, channels, patch_h, patch_w]`.
+                    // Per canonical gemma.py:834-838 + ADR-033 task #73.
+                    if gguf_name == "v.patch_embd.weight" {
+                        // hf_shape is the SAFETENSORS shape (PyTorch
+                        // order, outer-first): `[out_features, inner]`
+                        // where inner = patch_h*patch_w*channels.
+                        // For Gemma 4 26B-A4B-IT: [1152, 768] (= 16² × 3).
+                        if hf_shape.len() == 2 {
+                            let out_features = hf_shape[0];
+                            let inner = hf_shape[1];
+                            // Standard Gemma 4 vision: 3 RGB channels.
+                            let channels = 3;
+                            if inner % channels == 0 {
+                                let patch_sq = inner / channels;
+                                let patch_size = (patch_sq as f64).sqrt() as usize;
+                                if patch_size * patch_size == patch_sq {
+                                    return MapOutcome::DirectWithBake {
+                                        gguf_name,
+                                        bake: BakeOp::PatchEmbedderReshape {
+                                            out_features,
+                                            patch_h: patch_size,
+                                            patch_w: patch_size,
+                                            channels,
+                                        },
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    MapOutcome::Direct(gguf_name)
+                }
                 // Drop non-vision tensors (text decoder, etc.) silently —
                 // same convention as Gemma4Mmproj.
                 None => MapOutcome::Drop,
@@ -1981,6 +2015,17 @@ fn build_convert_plan(
                         n_embd,
                     } => {
                         gguf_shape = vec![*n_inner, *n_embd, *n_experts];
+                    }
+                    BakeOp::PatchEmbedderReshape {
+                        out_features,
+                        patch_h,
+                        patch_w,
+                        channels,
+                    } => {
+                        // 2-D HF `[out, h*w*c]` → 4-D logical
+                        // `[out, c, h, w]`. GGUF stores innermost-first,
+                        // so the dump shows `[w, h, c, out]`.
+                        gguf_shape = vec![*patch_w, *patch_h, *channels, *out_features];
                     }
                     _ => {}
                 }
