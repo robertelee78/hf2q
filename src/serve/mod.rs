@@ -2949,14 +2949,25 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         // `<|endoftext|>` AND `<|im_end|>` (qwen3 chat-template stop).
         // Previously single-eos let `<|im_end|>` slip past, causing
         // MTP K1 path to run to max_tokens (ADR-028 iter-263..265).
-        let result = SpecDecode::run_with_eos_set(
+        //
+        // ADR-034 task #91 (2026-05-21): plumb CLI --temperature through
+        // to SpecDecode via SpecSampler. temp == 0.0 keeps greedy path
+        // (byte-identical to pre-#91); temp > 0.0 engages Metropolis-
+        // Hastings stochastic acceptance at K=1 BATCHED. Default seed=0
+        // for reproducibility in stochastic mode.
+        let sampler = crate::inference::models::qwen35::spec_decode::SpecSampler::new(
+            args.temperature as f32,
+            0,
+        );
+        let result = SpecDecode::run_with_sampler_eos_set(
             &model,
             &prompt_tokens,
             args.max_tokens,
             eos_token_ids.clone(),
             max_seq as u32,
+            sampler,
         )
-        .context("qwen35 SpecDecode::run_with_eos_set")?;
+        .context("qwen35 SpecDecode::run_with_sampler_eos_set")?;
 
         let prefill_tok_s = if result.stats.prefill_elapsed.as_secs_f64() > 0.0 {
             prompt_len as f64 / result.stats.prefill_elapsed.as_secs_f64()

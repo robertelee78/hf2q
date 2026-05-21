@@ -76,10 +76,79 @@ fn greedy_argmax_slice(logits_row: &[f32]) -> u32 {
         .0
 }
 
+/// ADR-034 task #91 (2026-05-21) — sample a token from a probability
+/// distribution via inverse-CDF (single uniform draw). Used by the
+/// stochastic MH paths to (a) sample the drafter's proposed token from
+/// the MTP softmax, (b) sample the "bonus" / next-token after accept,
+/// and (c) sample replacement on residual-distribution reject.
+///
+/// Caller must ensure `probs` sums to ~1.0 (we normalize defensively to
+/// guard against accumulated rounding when computed via
+/// `softmax_with_temp`). Empty input or all-zero probs returns 0.
+fn sample_from_probs(probs: &[f32], rng: &mut rand::rngs::StdRng) -> u32 {
+    use rand::Rng;
+    if probs.is_empty() {
+        return 0;
+    }
+    let total: f32 = probs.iter().sum();
+    if total <= 0.0 {
+        return 0;
+    }
+    let u: f32 = rng.gen::<f32>() * total;
+    let mut acc = 0.0f32;
+    for (i, &p) in probs.iter().enumerate() {
+        acc += p;
+        if u < acc {
+            return i as u32;
+        }
+    }
+    (probs.len() - 1) as u32
+}
+
 use super::gpu_full_attn::upload_f32;
 use super::io_heads::greedy_argmax_last_token;
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
+
+/// ADR-034 task #91 (2026-05-21) — Sampler configuration for stochastic
+/// (temp > 0) Metropolis-Hastings spec-decode acceptance.
+///
+/// At `temperature <= 0.0` the runner uses greedy argmax matching at every
+/// accept site (byte-identical to the legacy behavior shipped at HEAD
+/// `3be36936`). At `temperature > 0.0` the runner uses Leviathan-2023
+/// §2.3 stochastic acceptance via [`super::super::super::spec_decode::dflash::rejection_sampler::leviathan_step`]
+/// — accept probability `min(1, p/q)` with residual-sampling on reject.
+///
+/// `seed` is for reproducibility: same seed + same prompt → same generated
+/// trajectory (in stochastic mode). The runner uses `StdRng::seed_from_u64`.
+#[derive(Debug, Clone, Copy)]
+pub struct SpecSampler {
+    pub temperature: f32,
+    pub seed: u64,
+}
+
+impl SpecSampler {
+    /// Greedy sampler (no MH; argmax at every accept site). Default.
+    pub const fn greedy() -> Self {
+        Self { temperature: 0.0, seed: 0 }
+    }
+
+    /// Stochastic sampler with the given temperature + seed.
+    pub const fn new(temperature: f32, seed: u64) -> Self {
+        Self { temperature, seed }
+    }
+
+    /// True if MH stochastic acceptance applies (temperature > 0).
+    pub fn is_stochastic(&self) -> bool {
+        self.temperature > 0.0
+    }
+}
+
+impl Default for SpecSampler {
+    fn default() -> Self {
+        Self::greedy()
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct SpecDecodeStats {
@@ -118,6 +187,9 @@ pub struct SpecDecode<'a> {
     /// (or omitted the key entirely).
     eos_token_ids: Vec<u32>,
     stats: SpecDecodeStats,
+    /// ADR-034 task #91 (2026-05-21) — see [`SpecSampler`]. Default
+    /// is `greedy()` for byte-identical behavior with pre-#91 code.
+    sampler: SpecSampler,
 }
 
 impl<'a> SpecDecode<'a> {
@@ -159,7 +231,46 @@ impl<'a> SpecDecode<'a> {
             kv_cache,
             eos_token_ids,
             stats: SpecDecodeStats::default(),
+            sampler: SpecSampler::greedy(),
         })
+    }
+
+    /// ADR-034 task #91 (2026-05-21) — builder-style sampler installer.
+    /// Call after [`Self::new_with_eos_set`]; default sampler is
+    /// [`SpecSampler::greedy()`] (byte-identical to pre-#91 behavior).
+    pub fn with_sampler(mut self, sampler: SpecSampler) -> Self {
+        self.sampler = sampler;
+        self
+    }
+
+    /// ADR-034 task #91 (2026-05-21) — multi-EOS constructor with sampler.
+    /// At `sampler.temperature > 0` the runner uses Metropolis-Hastings
+    /// stochastic acceptance (Leviathan-2023 §2.3) at every accept site
+    /// in the K=1 BATCHED path. At `temperature <= 0` runs greedy
+    /// argmax-match (default).
+    pub fn new_with_sampler_eos_set(
+        verifier: &'a Qwen35Model,
+        max_seq_len: u32,
+        eos_token_ids: Vec<u32>,
+        sampler: SpecSampler,
+    ) -> Result<Self> {
+        Ok(Self::new_with_eos_set(verifier, max_seq_len, eos_token_ids)?
+            .with_sampler(sampler))
+    }
+
+    /// ADR-034 task #91 (2026-05-21) — sampler-aware entry point.
+    /// Mirrors [`Self::run_with_eos_set`] + threads `sampler`.
+    pub fn run_with_sampler_eos_set(
+        verifier: &'a Qwen35Model,
+        prompt: &[u32],
+        max_new: usize,
+        eos_token_ids: Vec<u32>,
+        max_seq_len: u32,
+        sampler: SpecSampler,
+    ) -> Result<SpecDecodeResult> {
+        let mut runner =
+            Self::new_with_sampler_eos_set(verifier, max_seq_len, eos_token_ids, sampler)?;
+        runner.run_prompt(prompt, max_new)
     }
 
     pub fn run(verifier: &'a Qwen35Model, prompt: &[u32], max_new: usize) -> Result<Vec<u32>> {
@@ -232,13 +343,39 @@ impl<'a> SpecDecode<'a> {
         let mut hidden_pos = prompt.len() as i32 - 1;
         let mut preemitted_argmax = false;
 
+        // ADR-034 task #91 (2026-05-21) — stochastic MH state. The runner
+        // hoists the RNG to function scope so deterministic-seed runs
+        // produce byte-identical output across the entire generation.
+        // When `sampler.temperature <= 0` `is_mh` is false and the RNG
+        // is never read — greedy paths are byte-identical to pre-#91.
+        let is_mh = self.sampler.is_stochastic();
+        let sampler_temp = self.sampler.temperature;
+        let mut rng = {
+            use rand::SeedableRng;
+            rand::rngs::StdRng::seed_from_u64(self.sampler.seed)
+        };
+
         let decode_start = Instant::now();
         while generated.len() < max_new {
             // ADR-028 iter-159: whole-iter timer to find loop overhead.
             let mtp_profile_iter = std::env::var("HF2Q_MTP_PROFILE").as_deref() == Ok("1");
             let iter_t0 = if mtp_profile_iter { Some(Instant::now()) } else { None };
 
-            let token_next = greedy_argmax_last_token(&logits_t, vocab);
+            // ADR-034 task #91 (2026-05-21) — MH stochastic mode requires
+            // the per-iter `token_next` to MATCH the previously-preemitted
+            // token (when one was preemitted), because the next-iter
+            // sampling result is non-deterministic from logits_t alone.
+            // In greedy mode argmax(logits_t) deterministically reconstructs
+            // the preemitted token, so this branch is a no-op for greedy.
+            let token_next = if preemitted_argmax {
+                *generated.last().expect("preemitted_argmax implies generated non-empty")
+            } else if is_mh {
+                let probs = crate::inference::spec_decode::dflash
+                    ::rejection_sampler::softmax_with_temp(&logits_t, sampler_temp);
+                sample_from_probs(&probs, &mut rng)
+            } else {
+                greedy_argmax_last_token(&logits_t, vocab)
+            };
             if !preemitted_argmax {
                 generated.push(token_next);
             }
@@ -509,21 +646,52 @@ impl<'a> SpecDecode<'a> {
             let mtp_t0 = if mtp_profile { Some(Instant::now()) } else { None };
             let kv_cache_ref = &mut self.kv_cache;
             let hidden_ref = &hidden_t;
-            let proposed = self.verifier.with_gpu_cache_mut(|device, registry| {
-                let embed_next = embed_token_on_device(token_embd, token_next, cfg.hidden_size, device)?;
-                let draft_logits = mtp
-                    .forward_draft(
-                        hidden_ref,
-                        &embed_next,
-                        kv_cache_ref,
-                        &[next_pos; 4],
-                        device,
-                        registry,
-                        &cfg,
-                    )
-                    .context("SpecDecode MTP forward_draft")?;
-                argmax_logits_gpu(device, registry, &draft_logits, mtp_vocab)
-            })?;
+            // ADR-034 task #91 (2026-05-21): MH path needs the FULL draft
+            // distribution (q_v at the proposed token + residual support
+            // for reject), not just argmax. Greedy path is unchanged.
+            //
+            // Return tuple: (proposed_token, optional_draft_probs).
+            //   - Greedy (is_mh=false): (argmax(draft_logits), None)
+            //   - MH (is_mh=true):     (sampled_token, Some(softmax(draft_logits, temp)))
+            // ADR-034 task #91 — closure returns the draft_logits buffer
+            // and (in MH mode) a CPU-downloaded copy of the F32 logits.
+            // Stochastic sampling + softmax happen OUTSIDE the GPU
+            // closure to avoid borrowing `rng` across the closure boundary.
+            let (draft_token_argmax, draft_logits_cpu_opt): (Option<u32>, Option<Vec<f32>>) =
+                self.verifier.with_gpu_cache_mut(|device, registry| {
+                    let embed_next = embed_token_on_device(
+                        token_embd, token_next, cfg.hidden_size, device,
+                    )?;
+                    let draft_logits = mtp
+                        .forward_draft(
+                            hidden_ref,
+                            &embed_next,
+                            kv_cache_ref,
+                            &[next_pos; 4],
+                            device,
+                            registry,
+                            &cfg,
+                        )
+                        .context("SpecDecode MTP forward_draft")?;
+                    if is_mh {
+                        let logits_cpu = super::gpu_full_attn::download_f32(&draft_logits)?;
+                        Ok::<_, anyhow::Error>((None, Some(logits_cpu)))
+                    } else {
+                        let tok = argmax_logits_gpu(device, registry, &draft_logits, mtp_vocab)?;
+                        Ok::<_, anyhow::Error>((Some(tok), None))
+                    }
+                })?;
+            let (proposed, draft_probs_opt): (u32, Option<Vec<f32>>) = if let Some(
+                logits_cpu,
+            ) = draft_logits_cpu_opt
+            {
+                let draft_probs = crate::inference::spec_decode::dflash
+                    ::rejection_sampler::softmax_with_temp(&logits_cpu, sampler_temp);
+                let sampled = sample_from_probs(&draft_probs, &mut rng);
+                (sampled, Some(draft_probs))
+            } else {
+                (draft_token_argmax.expect("argmax token present in greedy mode"), None)
+            };
             let mtp_ms = mtp_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
             self.stats.proposed += 1;
 
@@ -693,25 +861,62 @@ impl<'a> SpecDecode<'a> {
                 );
                 let logits_row0 = &verify_logits[0..vsz];
                 let logits_row1 = &verify_logits[vsz..2 * vsz];
-                let verified_at_n1 = greedy_argmax_slice(logits_row0);
+
+                // ADR-034 task #91 (2026-05-21) — Metropolis-Hastings
+                // acceptance branch. At temp > 0, instead of strict
+                // argmax-match, use Leviathan-2023 §2.3:
+                //   accept_prob = min(1, p_target(proposed) / q_draft(proposed))
+                //   on accept:  emit proposed + sampled bonus from softmax(logits_row1, temp)
+                //   on reject:  emit replacement sampled from residual max(0, p-q)
+                //
+                // At temp <= 0 (sampler.is_stochastic() == false), this
+                // computes the same greedy verified_at_n1 as before —
+                // byte-identical to pre-#91 behavior.
+                let (accepted_mh, k1_replacement_or_verified): (bool, u32) = if is_mh {
+                    let draft_probs = draft_probs_opt
+                        .as_ref()
+                        .expect("MH mode must have draft_probs from MTP draft sampling");
+                    let target_probs = crate::inference::spec_decode::dflash
+                        ::rejection_sampler::softmax_with_temp(logits_row0, sampler_temp);
+                    let step = crate::inference::spec_decode::dflash
+                        ::rejection_sampler::leviathan_step(
+                            proposed,
+                            &target_probs,
+                            draft_probs,
+                            &mut rng,
+                        );
+                    match step {
+                        crate::inference::spec_decode::dflash::rejection_sampler::SampleStep::Accept => {
+                            (true, proposed)
+                        }
+                        crate::inference::spec_decode::dflash::rejection_sampler::SampleStep::Reject {
+                            replacement_token,
+                        } => (false, replacement_token),
+                    }
+                } else {
+                    let v = greedy_argmax_slice(logits_row0);
+                    (v == proposed, v)
+                };
+                let verified_at_n1 = k1_replacement_or_verified;
                 if std::env::var("HF2Q_SPEC_DECODE_K1_TRACE").as_deref() == Ok("1") {
                     let h_count = verify_hidden.element_count();
                     let next_iter_tn_dbg = greedy_argmax_slice(logits_row1);
                     eprintln!(
-                        "[K1_TRACE] iter={} pos={} tn={} prop={} v_at_n1={} (match={}) nitn={} verify_hidden_elems={} (expected 2*h={})",
+                        "[K1_TRACE] iter={} pos={} tn={} prop={} v_at_n1={} (match={}) nitn={} verify_hidden_elems={} (expected 2*h={}) mh={}",
                         self.stats.proposed,
                         next_pos,
                         token_next,
                         proposed,
                         verified_at_n1,
-                        verified_at_n1 == proposed,
+                        accepted_mh,
                         next_iter_tn_dbg,
                         h_count,
                         2 * hidden_size_u32 as usize,
+                        is_mh,
                     );
                 }
 
-                if verified_at_n1 == proposed {
+                if accepted_mh {
                     // ACCEPT: draft_1 was correct.
                     // Emit BOTH proposed (=token at N+1, draft confirmed)
                     // AND argmax(logits_row1) (=token at N+2, "free" since
@@ -728,7 +933,14 @@ impl<'a> SpecDecode<'a> {
                     // with NO_AMORT, the bug is in the speculative push.
                     let no_amort = std::env::var("HF2Q_SPEC_DECODE_K1_NO_AMORT")
                         .as_deref() == Ok("1");
-                    let next_iter_token_next = greedy_argmax_slice(logits_row1);
+                    // ADR-034 task #91 — stochastic bonus token in MH mode.
+                    let next_iter_token_next = if is_mh {
+                        let row1_probs = crate::inference::spec_decode::dflash
+                            ::rejection_sampler::softmax_with_temp(logits_row1, sampler_temp);
+                        sample_from_probs(&row1_probs, &mut rng)
+                    } else {
+                        greedy_argmax_slice(logits_row1)
+                    };
                     generated.push(proposed);
                     if !no_amort
                         && generated.len() < max_new
