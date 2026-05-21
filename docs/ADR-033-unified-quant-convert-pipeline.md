@@ -97,7 +97,30 @@ These remaining sub-percent differences are functionally negligible. The convert
 
 The earlier "metadata diff" worry was overblown — once `tokenizer.ggml.model` emitted `"bert"` (not `"llama"`), byte-identity follows for all 5 quants. The Q4_K_S / Q5_K_S / IQ4_NL quants aren't typically shipped for BERT embeddings (omitted from this matrix per practical use).
 
-**AC #2 acceptance matrix coverage**: 36/64 cells = 56% (Gemma 4 8/8 ✅, Qwen 3.5 7/8, Llama 3 7/8, Qwen3-VL 8/8 ✅, MiniMax-M2 2/8 in progress, BERT bge 5/5 ✅, Nomic v2-moe 0/8 open #67, Gemma 4 mmproj 0/8 open #63).
+**AC #2 acceptance matrix coverage**: 44/64 cells = 69% (Gemma 4 8/8 ✅, Qwen 3.5 7/8, Llama 3 7/8, Qwen3-VL 8/8 ✅, MiniMax-M2 2/8 in progress, BERT bge 5/5 ✅, **Nomic v2-moe 8/8 ✅ NEW 2026-05-20**, Gemma 4 mmproj 0/8 open #63).
+
+**🏆 Nomic v2-moe full 8-quant byte-identity (HEAD `84033d5a`+, 2026-05-20)** — first MoE arch with byte-identical convert+quantize pipeline to canonical. Verified against `/opt/hf2q/models/nomic-ai-nomic-embed-text-v2-moe` (475M params, 8 experts, `nomic-bert-moe` arch):
+
+| Quant   | bytes differ |
+|---------|--------------|
+| Q4_0    | 0            |
+| Q4_K_S  | 0            |
+| Q4_K_M  | 0            |
+| Q5_K_S  | 0            |
+| Q5_K_M  | 0            |
+| Q6_K    | 0            |
+| Q8_0    | 0            |
+| IQ4_NL  | 0            |
+
+Q8_0 SHA256: `6933f670d965de23c268ca095341430def7c1503ea82161c564cef4c49a952c6` (both canonical + hf2q). 512,225,248 bytes byte-for-byte identical.
+
+Closure landed across 9 commits (cf40ce44 → 84033d5a). Key infrastructure:
+1. **BakeOps**: `MoeExpertReshape` (w1) + `MoeExpertTranspose` (w2) for nomic MegaBlocks expert layout; `Squeeze` for `token_types.weight` singleton dim.
+2. **Model-card reader** (`src/convert/model_card.rs`, 26 unit tests): hand-rolled YAML frontmatter parser + canonical `get_model_id_components` port (name parser heuristic) + canonical `model_weight_count_rounded_notation` + canonical MoE `size_label` formula.
+3. **Hparam parity**: AutoConfig-injected overrides for v2-moe (`layer_norm_eps=1e-12`, `rope_theta=1000.0`, `max_position_embeddings=2048 → ctx_len=2046` via `_xlmroberta_tokenizer_init` offset, `head_dim=64` → `attention.{key,value}_length`).
+4. **Tokenizer Unigram parity**: real sentencepiece scores (not `-1000.0` placeholders), `UNK → UNKNOWN` token-type, `precompiled_charsmap` from base64-decoded tokenizer.json, `seperator_token_id` (sic — canonical typo mirrored), `mask_token_id`, `add_eos_token`/`add_sep_token`, XLM-RoBERTa PAD-realignment shift (tokens[i] = `"[PAD{i-1}]"` for `i >= 4`).
+5. **KV ordering**: model card BEFORE arch keys, tokenizer in canonical Unigram order, `general.{quantization_version, file_type}` at the very end after tokenizer block.
+6. **Tensor ordering**: port of canonical's `weight_name_comparer` (`/opt/llama.cpp/src/llama-model-loader.h:53-64`) — non-blk first (alphabetical), then blk.N (numeric N, alphabetical within).
 
 **Known open: IQ4_NL data-dependent boundary case.** The IQ4_NL kernel diverges from canonical at FP rounding boundaries that depend on weight distribution. Gemma 4 weights don't hit the boundary (0 bytes diff on full 16.7 GB IQ4_NL). Llama 3 weights hit it sparsely (587 KB / 4.6 GB = 0.013%). Qwen 3.5 weights hit it densely on `ffn_gate_exps` + `ffn_up_exps` 3D MoE tensors (121 MB / 18.6 GB = 0.65%). Single-axis hypothesis tests (split FMA, no-FMA initial pass) regressed Gemma to 48 KB diff — wrong direction. Likely a multi-site clang fusion divergence in the inner loops that needs disassembly-driven instruction-level matching. Tracked at task #65; not blocking the ADR-033 §10 byte-cmp gate at the family level since the other 7 quants per arch all match.
 
