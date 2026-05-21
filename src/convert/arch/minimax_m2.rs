@@ -231,7 +231,23 @@ pub fn map_tensor_name(hf_name: &str) -> Option<MappedTensor> {
                 gguf: format!("blk.{layer}.ffn_gate_inp.weight"),
             });
         }
-        "block_sparse_moe.e_score_correction" => {
+        // Real MiniMax-M2 HF checkpoints emit this as
+        // `e_score_correction_bias` (single token; canonical
+        // `/opt/llama.cpp/conversion/base.py:537-538` renames the
+        // `_bias` suffix to `.bias` before mapping). Mirrors GGUF
+        // `MODEL_TENSOR.FFN_EXP_PROBS_B` named `blk.{bid}.exp_probs_b`
+        // with the standard `.bias` suffix.
+        "block_sparse_moe.e_score_correction_bias"
+        | "block_sparse_moe.e_score_correction.bias" => {
+            return Some(MappedTensor::Router {
+                hf: hf_name.to_string(),
+                gguf: format!("blk.{layer}.exp_probs_b.bias"),
+            });
+        }
+        // Defensive: if a future MiniMax variant ships the bare
+        // `.weight` form, still map (no canonical sighting yet).
+        "block_sparse_moe.e_score_correction"
+        | "block_sparse_moe.e_score_correction.weight" => {
             return Some(MappedTensor::Router {
                 hf: hf_name.to_string(),
                 gguf: format!("blk.{layer}.exp_probs_b.weight"),
