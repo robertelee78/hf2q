@@ -161,6 +161,44 @@ pub enum BakeOp {
         head_dim: usize,
         inner: usize,
     },
+
+    /// Nomic-bert-moe expert UP-weight reshape. Pure metadata: the
+    /// safetensors stores `mlp.experts.mlp.w1` as a 2-D tensor of
+    /// shape `[n_experts * n_inner, n_embd]` (MegaBlocks-style row-
+    /// major flat layout), but llama.cpp's `nomic-bert-moe` arch
+    /// expects `ffn_up_exps.weight` as a 3-D tensor of shape
+    /// `[n_experts, n_inner, n_embd]` (PyTorch order; equivalent
+    /// GGUF-order `[n_embd, n_inner, n_experts]`). The byte stream
+    /// is byte-identical between the two views because both are
+    /// row-major / C-contiguous with the same innermost-fastest
+    /// `n_embd` axis. Plan-build is responsible for emitting the 3-D
+    /// `gguf_shape` via the same path as [`BakeOp::Squeeze`].
+    ///
+    /// Mirrors canonical `/opt/llama.cpp/conversion/bert.py:373-376`:
+    /// `data_torch.view(n_experts, self.hparams["n_inner"], self.hparams["n_embd"])`.
+    MoeExpertReshape {
+        n_experts: usize,
+        n_inner: usize,
+        n_embd: usize,
+    },
+
+    /// Nomic-bert-moe expert DOWN-weight reshape + per-expert
+    /// transpose. The safetensors stores `mlp.experts.mlp.w2` as a
+    /// 2-D tensor of shape `[n_experts * n_inner, n_embd]`. Canonical
+    /// applies `.view(n_experts, n_inner, n_embd).transpose(1, 2)`
+    /// to yield logical PyTorch shape `[n_experts, n_embd, n_inner]`
+    /// (equivalent GGUF-order `[n_inner, n_embd, n_experts]`). The
+    /// transpose moves data: per expert `e`, the inner `[n_inner,
+    /// n_embd]` matrix at offset `e * n_inner * n_embd` is transposed
+    /// to `[n_embd, n_inner]`.
+    ///
+    /// Mirrors canonical `/opt/llama.cpp/conversion/bert.py:377-380`:
+    /// `data_torch = data_torch.view(n_experts, n_inner, n_embd).transpose(1, 2)`.
+    MoeExpertTranspose {
+        n_experts: usize,
+        n_inner: usize,
+        n_embd: usize,
+    },
 }
 
 /// Which half of a [`BakeOp::SplitAxisHalf`] to select.
@@ -218,6 +256,22 @@ impl fmt::Display for BakeOp {
             } => write!(
                 f,
                 "PermuteRopeHalves {{ n_head={n_head}, head_dim={head_dim}, inner={inner} }}"
+            ),
+            BakeOp::MoeExpertReshape {
+                n_experts,
+                n_inner,
+                n_embd,
+            } => write!(
+                f,
+                "MoeExpertReshape {{ n_experts={n_experts}, n_inner={n_inner}, n_embd={n_embd} }}"
+            ),
+            BakeOp::MoeExpertTranspose {
+                n_experts,
+                n_inner,
+                n_embd,
+            } => write!(
+                f,
+                "MoeExpertTranspose {{ n_experts={n_experts}, n_inner={n_inner}, n_embd={n_embd} }}"
             ),
             BakeOp::Sequence(ops) => {
                 write!(f, "Sequence([")?;
@@ -452,6 +506,75 @@ pub fn apply_bake_op(mut data: Vec<f32>, op: &BakeOp) -> Result<Vec<f32>, BakeEr
             // emitting the squeezed shape via `gguf_shape`.
             Ok(data)
         }
+        BakeOp::MoeExpertReshape {
+            n_experts,
+            n_inner,
+            n_embd,
+        } => {
+            // Pure metadata reshape from `[n_experts * n_inner, n_embd]`
+            // (HF MegaBlocks flat layout) to `[n_experts, n_inner,
+            // n_embd]` (canonical view). Byte stream is identical: both
+            // layouts are row-major with `n_embd` as the fastest axis,
+            // and the (n_experts, n_inner) splitting of the outer
+            // dimension preserves the existing element ordering.
+            // Plan-build is responsible for emitting the 3-D
+            // `gguf_shape`.
+            let expected_elems = n_experts * n_inner * n_embd;
+            if data.len() != expected_elems {
+                return Err(BakeError {
+                    op: op.clone(),
+                    buffer_len: data.len(),
+                    reason: format!(
+                        "buffer len {} != n_experts*n_inner*n_embd = {n_experts}*{n_inner}*{n_embd} = {expected_elems}",
+                        data.len()
+                    ),
+                });
+            }
+            Ok(data)
+        }
+        BakeOp::MoeExpertTranspose {
+            n_experts,
+            n_inner,
+            n_embd,
+        } => {
+            // Per-expert transpose: input is flat `[n_experts * n_inner,
+            // n_embd]` (HF MegaBlocks layout), output is logical
+            // `[n_experts, n_embd, n_inner]` (canonical `.transpose(1,
+            // 2)` of the 3-D view). For each expert `e`, the inner
+            // `[n_inner, n_embd]` slab at offset `e * n_inner * n_embd`
+            // is transposed to `[n_embd, n_inner]`.
+            //
+            // Row-major indexing in/out:
+            //   in [e, i, h]  -> idx = ((e * n_inner) + i) * n_embd + h
+            //   out[e, h, i]  -> idx = ((e * n_embd)  + h) * n_inner + i
+            let ne = *n_experts;
+            let ni = *n_inner;
+            let nh = *n_embd;
+            let expected_elems = ne * ni * nh;
+            if data.len() != expected_elems {
+                return Err(BakeError {
+                    op: op.clone(),
+                    buffer_len: data.len(),
+                    reason: format!(
+                        "buffer len {} != n_experts*n_inner*n_embd = {ne}*{ni}*{nh} = {expected_elems}",
+                        data.len()
+                    ),
+                });
+            }
+            let mut out = vec![0.0f32; expected_elems];
+            for e in 0..ne {
+                let in_base = e * ni * nh;
+                let out_base = e * nh * ni;
+                for i in 0..ni {
+                    let in_row = in_base + i * nh;
+                    for h in 0..nh {
+                        let out_idx = out_base + h * ni + i;
+                        out[out_idx] = data[in_row + h];
+                    }
+                }
+            }
+            Ok(out)
+        }
         BakeOp::Sequence(ops) => {
             // Apply each op left-to-right. The intermediate buffer
             // passes through unchanged on Squeeze, has its length
@@ -654,6 +777,149 @@ mod tests {
                 n_head: 1,
                 head_dim: 4,
                 inner: 2,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    /// MoeExpertReshape is byte-identity. Verify the buffer passes
+    /// through unchanged for a small `[E=2, F=3, H=4]` example.
+    #[test]
+    fn moe_expert_reshape_is_byte_identity() {
+        // Element values chosen so each is uniquely identifiable.
+        let mut inp = Vec::with_capacity(2 * 3 * 4);
+        for e in 0..2u32 {
+            for i in 0..3u32 {
+                for h in 0..4u32 {
+                    let v = (e * 100 + i * 10 + h) as f32;
+                    inp.push(v);
+                }
+            }
+        }
+        let expected = inp.clone();
+        let out = apply_bake_op(
+            inp,
+            &BakeOp::MoeExpertReshape {
+                n_experts: 2,
+                n_inner: 3,
+                n_embd: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(out, expected, "MoeExpertReshape must preserve byte order");
+    }
+
+    #[test]
+    fn moe_expert_reshape_rejects_size_mismatch() {
+        let inp = vec![0.0_f32; 23];
+        let result = apply_bake_op(
+            inp,
+            &BakeOp::MoeExpertReshape {
+                n_experts: 2,
+                n_inner: 3,
+                n_embd: 4,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    /// MoeExpertTranspose per-expert transposes a `[n_inner=3, n_embd=4]`
+    /// matrix to `[n_embd=4, n_inner=3]`. Hand-built input/expected
+    /// covers two experts: e=0 has elements 0..12 (in row-major
+    /// `[i=0..3, h=0..4]`), e=1 has elements 100..112.
+    ///
+    /// In:  e=0 row-major over (i,h) =
+    ///   [ 0  1  2  3 ; 4  5  6  7 ; 8  9 10 11 ]
+    /// Out: e=0 row-major over (h,i) =
+    ///   [ 0  4  8 ; 1  5  9 ; 2  6 10 ; 3  7 11 ]
+    #[test]
+    fn moe_expert_transpose_two_experts_explicit_layout() {
+        let mut inp = Vec::with_capacity(2 * 3 * 4);
+        for e in [0_u32, 100] {
+            for v in 0_u32..12 {
+                inp.push((e + v) as f32);
+            }
+        }
+
+        let out = apply_bake_op(
+            inp,
+            &BakeOp::MoeExpertTranspose {
+                n_experts: 2,
+                n_inner: 3,
+                n_embd: 4,
+            },
+        )
+        .unwrap();
+
+        // Expected per expert: 4 rows of 3 cols each, transposed.
+        let expert0: Vec<f32> = vec![
+            0.0, 4.0, 8.0, // h=0 across i=0,1,2
+            1.0, 5.0, 9.0, // h=1
+            2.0, 6.0, 10.0, // h=2
+            3.0, 7.0, 11.0, // h=3
+        ];
+        let expert1: Vec<f32> = vec![
+            100.0, 104.0, 108.0, // h=0
+            101.0, 105.0, 109.0,
+            102.0, 106.0, 110.0,
+            103.0, 107.0, 111.0,
+        ];
+        let mut expected = expert0;
+        expected.extend(expert1);
+        assert_eq!(out, expected);
+    }
+
+    /// Round-trip property: applying MoeExpertTranspose to a known
+    /// `[E, F, H]` arrangement, then applying it again with swapped
+    /// `n_inner`/`n_embd` (so the second pass transposes `[H, F]`
+    /// back to `[F, H]`) must yield the original buffer byte-for-byte.
+    #[test]
+    fn moe_expert_transpose_round_trip_with_swapped_dims() {
+        let e_count = 3_usize;
+        let f_count = 5_usize;
+        let h_count = 7_usize;
+        let mut inp: Vec<f32> = (0..(e_count * f_count * h_count))
+            .map(|i| i as f32)
+            .collect();
+        let original = inp.clone();
+
+        // First pass: [E, F, H] (HF flat) → [E, H, F] (canonical post-transpose).
+        inp = apply_bake_op(
+            inp,
+            &BakeOp::MoeExpertTranspose {
+                n_experts: e_count,
+                n_inner: f_count,
+                n_embd: h_count,
+            },
+        )
+        .unwrap();
+        assert_ne!(inp, original, "first transpose must move data");
+
+        // Second pass: treat as [E, H, F] and transpose back to [E, F, H].
+        // The op's `n_inner` arg names the SECOND dim of the input view,
+        // so we now pass n_inner=h_count, n_embd=f_count.
+        inp = apply_bake_op(
+            inp,
+            &BakeOp::MoeExpertTranspose {
+                n_experts: e_count,
+                n_inner: h_count,
+                n_embd: f_count,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(inp, original, "double transpose must restore");
+    }
+
+    #[test]
+    fn moe_expert_transpose_rejects_size_mismatch() {
+        let inp = vec![0.0_f32; 5];
+        let result = apply_bake_op(
+            inp,
+            &BakeOp::MoeExpertTranspose {
+                n_experts: 2,
+                n_inner: 3,
+                n_embd: 4,
             },
         );
         assert!(result.is_err());

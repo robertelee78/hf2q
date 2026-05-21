@@ -1160,8 +1160,8 @@ fn map_tensor(
     hf_shape: &[usize],
     qwen35moe_full_ctx: Option<&Qwen35MoeFullCtx>,
     llama3_ctx: Option<&Llama3Ctx>,
+    nomic_bert_ctx: &nomic_bert::NomicBertCtx,
 ) -> MapOutcome {
-    let _ = hf_shape;
     match arch {
         ArchName::Llama3 => match llama3::map_tensor_name(hf_name) {
             Some(gguf_name) => match llama3_ctx.and_then(|c| llama3_attach_bake(&gguf_name, hf_name, c)) {
@@ -1184,8 +1184,11 @@ fn map_tensor(
             Some(s) => MapOutcome::Direct(s),
             None => MapOutcome::Unmapped,
         },
-        ArchName::NomicBert => match nomic_bert::map_tensor_name(hf_name) {
+        ArchName::NomicBert => match nomic_bert::map_tensor_name(hf_name, hf_shape, nomic_bert_ctx) {
             Some(nomic_bert::MappedTensor::Direct(s)) => MapOutcome::Direct(s),
+            Some(nomic_bert::MappedTensor::DirectWithBake { gguf_name, bake }) => {
+                MapOutcome::DirectWithBake { gguf_name, bake }
+            }
             Some(nomic_bert::MappedTensor::Drop) => MapOutcome::Drop,
             None => MapOutcome::Unmapped,
         },
@@ -1264,6 +1267,21 @@ fn lift_qwen35moe_full_mapped(m: Option<qwen35moe_full::MappedTensor>) -> MapOut
 /// `text_config` for multimodal-wrapping `ConditionalGeneration`
 /// variants). Detects multimodal wrapping from
 /// `architectures` containing `ForConditionalGeneration`.
+/// Build the `NomicBertCtx` from the HF `config.json`. v1.5 returns a
+/// ctx with `num_experts = None`; v2-moe carries
+/// `num_experts` / `num_local_experts` per canonical
+/// `/opt/llama.cpp/conversion/bert.py:372`. Missing-on-v2-moe surfaces
+/// to the convert pipeline as `UnmappedTensor` on the expert
+/// tensors — typed error per the no-fallback rule.
+fn build_nomic_bert_ctx(config: &serde_json::Value) -> nomic_bert::NomicBertCtx {
+    let num_experts = config
+        .get("num_experts")
+        .or_else(|| config.get("num_local_experts"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    nomic_bert::NomicBertCtx { num_experts }
+}
+
 fn build_qwen35moe_full_ctx(config: &serde_json::Value) -> Option<Qwen35MoeFullCtx> {
     let text = effective_config(config);
     let num_hidden_layers = text.get("num_hidden_layers")?.as_u64()? as usize;
@@ -1620,12 +1638,16 @@ fn build_convert_plan(
         ArchName::Llama3 => build_llama3_ctx(&src.config),
         _ => None,
     };
+    let nomic_bert_ctx: nomic_bert::NomicBertCtx = match arch {
+        ArchName::NomicBert => build_nomic_bert_ctx(&src.config),
+        _ => nomic_bert::NomicBertCtx { num_experts: None },
+    };
 
     let mut direct_steps: Vec<PlanStep> = Vec::new();
     let mut moe_accum: HashMap<(usize, ExpertKindKey), MoePlanGroup> = HashMap::new();
 
     for meta in src.tensor_metas() {
-        match map_tensor(arch, &meta.name, &meta.shape, qwen35moe_full_ctx.as_ref(), llama3_ctx.as_ref()) {
+        match map_tensor(arch, &meta.name, &meta.shape, qwen35moe_full_ctx.as_ref(), llama3_ctx.as_ref(), &nomic_bert_ctx) {
             MapOutcome::Direct(gguf_name) => {
                 let gguf_shape: Vec<usize> = meta.shape.iter().rev().copied().collect();
                 let layer_index = gguf_name
@@ -1661,6 +1683,28 @@ fn build_convert_plan(
                 }
                 if contains_squeeze(&bake) {
                     gguf_shape.retain(|d| *d != 1);
+                }
+                // MoE expert weight bakes: replace the 2-D safetensors
+                // shape `[E*F, H]` with the canonical 3-D layout. GGUF
+                // order is fastest-varying first, so:
+                //   MoeExpertReshape  → `[H, F, E]` (HF→ no data move)
+                //   MoeExpertTranspose → `[F, H, E]` (per-expert transpose)
+                match &bake {
+                    BakeOp::MoeExpertReshape {
+                        n_experts,
+                        n_inner,
+                        n_embd,
+                    } => {
+                        gguf_shape = vec![*n_embd, *n_inner, *n_experts];
+                    }
+                    BakeOp::MoeExpertTranspose {
+                        n_experts,
+                        n_inner,
+                        n_embd,
+                    } => {
+                        gguf_shape = vec![*n_inner, *n_embd, *n_experts];
+                    }
+                    _ => {}
                 }
                 let layer_index = gguf_name
                     .strip_prefix("blk.")
@@ -1825,7 +1869,7 @@ fn build_convert_plan(
     // GGUF layout matches byte-for-byte.
     let mut synth_steps: Vec<PlanStep> = Vec::new();
     for (synth_idx, t) in synthesized.iter().enumerate() {
-        match map_tensor(arch, &t.name, &t.shape, qwen35moe_full_ctx.as_ref(), llama3_ctx.as_ref()) {
+        match map_tensor(arch, &t.name, &t.shape, qwen35moe_full_ctx.as_ref(), llama3_ctx.as_ref(), &nomic_bert_ctx) {
             MapOutcome::Direct(gguf_name) => {
                 let gguf_shape: Vec<usize> = t.shape.iter().rev().copied().collect();
                 let layer_index = gguf_name
