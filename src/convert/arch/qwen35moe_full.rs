@@ -799,9 +799,16 @@ pub fn build_metadata(
         .get("num_experts_per_tok")
         .and_then(|v| v.as_u64())
         .expect("config missing num_experts_per_tok") as u32;
+    // Canonical reads rope_theta from rope_parameters.rope_theta first
+    // (base.py:1042-1052 mirrors the HF config's nested rope dict into
+    // self.rope_parameters then base.py:1139-ish reads it for the write).
+    // Qwen 3.5 ships `rope_parameters: { rope_theta: 10000000, ... }`;
+    // older models still use top-level rope_theta.
     let rope_theta = text
-        .get("rope_theta")
+        .get("rope_parameters")
+        .and_then(|rp| rp.get("rope_theta"))
         .and_then(|v| v.as_f64())
+        .or_else(|| text.get("rope_theta").and_then(|v| v.as_f64()))
         .unwrap_or(10000.0) as f32;
 
     // SSM + linear-attention hparams. Per canonical
@@ -984,13 +991,11 @@ pub fn build_metadata(
             MetaValue::U32(n_mtp),
         ));
     }
-    // attn_output_gate (Qwen 3.5 attention quirk) — preserved.
-    if let Some(gate) = text.get("attn_output_gate").and_then(|v| v.as_bool()) {
-        kvs.push((
-            "qwen35moe.attention.output_gate".into(),
-            MetaValue::Bool(gate),
-        ));
-    }
+    // NOTE: canonical does NOT emit `qwen35moe.attention.output_gate`.
+    // The HF config carries `attn_output_gate: true` but canonical's
+    // Qwen 3.5 set_gguf_parameters intentionally omits it from GGUF
+    // (it's baked into the tensor topology — attn_output is gated via
+    // the existence of `blk.<N>.attn_output_gate.weight` tensor).
     kvs.extend(emit_general_postlude(file_type));
     let _ = ctx; // future per-arch metadata may need ctx fields
     kvs
