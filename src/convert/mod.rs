@@ -297,7 +297,7 @@ mod tests {
         );
 
         // ----- 4. Emit metadata -------------------------------------
-        for (k, v) in llama3::build_metadata(&src.config, 7 /* Q8_0 */) {
+        for (k, v) in llama3::build_metadata(&src.config, 7 /* Q8_0 */, None, None, None) {
             orch.add_metadata(k, v);
         }
 
@@ -383,8 +383,9 @@ mod tests {
         // Tensor count: 16 (2 globals + 7×2 per-block).
         assert_eq!(gguf.tensor_count(), 16);
 
-        // Metadata round-trip: all 11 Llama3 KV pairs present.
-        assert_eq!(gguf.metadata_count(), 11);
+        // Metadata round-trip: 17 Llama3 KV pairs present (architecture,
+        // type, name, basename, size_label, 12 llama.*, file_type).
+        assert_eq!(gguf.metadata_count(), 17);
         assert_eq!(gguf.metadata_string("general.architecture"), Some("llama"));
         assert_eq!(gguf.metadata_u32("llama.embedding_length"), Some(32));
         assert_eq!(gguf.metadata_u32("llama.block_count"), Some(2));

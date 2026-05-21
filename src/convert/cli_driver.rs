@@ -1053,7 +1053,13 @@ fn build_metadata_for_arch(
     }
     let config = effective_config(config);
     match arch {
-        ArchName::Llama3 => llama3::build_metadata(config, ftype),
+        ArchName::Llama3 => llama3::build_metadata(
+            config,
+            ftype,
+            model_card,
+            sampling,
+            model_dir_basename,
+        ),
         ArchName::Gemma4 => gemma4::build_metadata(
             config,
             ftype,

@@ -155,6 +155,18 @@ pub fn emit_general_prelude(
                 MetaValue::String(license.clone()),
             ));
         }
+        if let Some(license_name) = &card.license_name {
+            kv.push((
+                "general.license.name".into(),
+                MetaValue::String(license_name.clone()),
+            ));
+        }
+        if let Some(license_link) = &card.license_link {
+            kv.push((
+                "general.license.link".into(),
+                MetaValue::String(license_link.clone()),
+            ));
+        }
         if !card.base_models.is_empty() {
             kv.push((
                 "general.base_model.count".into(),
@@ -224,6 +236,13 @@ pub struct ModelCard {
     /// `license: apache-2.0` → `Some("apache-2.0")`. Canonical
     /// `Metadata.load` reads this as `general.license`.
     pub license: Option<String>,
+    /// `license_name:` → `general.license.name`. Used when the
+    /// `license:` value is non-SPDX (e.g. `"other"`) and the model
+    /// card carries a custom name. Canonical `metadata.py:553-554`.
+    pub license_name: Option<String>,
+    /// `license_link:` → `general.license.link`. Path / URL pointing
+    /// to a license file or webpage. Canonical `metadata.py:555-556`.
+    pub license_link: Option<String>,
     /// `tags:` list → tags vector. Emitted as `general.tags` (array
     /// of strings). HF convention: kebab-case tags.
     pub tags: Vec<String>,
@@ -242,6 +261,8 @@ impl ModelCard {
     /// Whether any of the parsed fields are non-empty.
     pub fn is_empty(&self) -> bool {
         self.license.is_none()
+            && self.license_name.is_none()
+            && self.license_link.is_none()
             && self.tags.is_empty()
             && self.languages.is_empty()
             && self.base_models.is_empty()
@@ -313,6 +334,16 @@ fn parse_yaml_frontmatter(text: &str) -> ModelCard {
             "license" => {
                 if !after_colon.is_empty() {
                     card.license = Some(unquote_scalar(after_colon).to_string());
+                }
+            }
+            "license_name" => {
+                if !after_colon.is_empty() {
+                    card.license_name = Some(unquote_scalar(after_colon).to_string());
+                }
+            }
+            "license_link" => {
+                if !after_colon.is_empty() {
+                    card.license_link = Some(unquote_scalar(after_colon).to_string());
                 }
             }
             "tags" => {
@@ -1469,6 +1500,8 @@ language:
         let id_components = get_model_id_components("nomic-ai/nomic-xlm-2048");
         let card = ModelCard {
             license: Some("apache-2.0".into()),
+            license_name: None,
+            license_link: None,
             tags: vec![
                 "sentence-transformers".into(),
                 "sentence-similarity".into(),

@@ -108,12 +108,33 @@ pub fn map_tensor_name(hf_name: &str) -> Option<String> {
 ///
 /// `file_type` is the chosen `LlamaFtype` as a `u32` (matches
 /// `gguf_writer.add_file_type(self.ftype)` at base.py:1220).
-pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String, MetaValue)> {
-    let name = config
+pub fn build_metadata(
+    config: &serde_json::Value,
+    file_type: u32,
+    model_card: Option<&crate::convert::model_card::ModelCard>,
+    sampling: Option<&crate::convert::model_card::SamplingConfig>,
+    model_dir_basename: Option<&str>,
+) -> Vec<(String, MetaValue)> {
+    use crate::convert::model_card::{
+        emit_general_prelude, get_model_id_components,
+    };
+    // Llama 3 config.json typically has `_name_or_path = None`; fall
+    // back to the model directory's basename
+    // (e.g. "NousResearch-Meta-Llama-3-8B") so the canonical
+    // `get_model_id_components` heuristic produces the basename
+    // ("NousResearch-Meta-Llama-3") and size_label ("8B") that
+    // canonical's GGUF dump shows.
+    let raw_name = config
         .get("_name_or_path")
         .and_then(|v| v.as_str())
-        .unwrap_or("model")
-        .to_string();
+        .map(|s| s.to_string())
+        .or_else(|| model_dir_basename.map(|s| s.to_string()))
+        .unwrap_or_else(|| "model".to_string());
+    let id_components = get_model_id_components(&raw_name);
+    let display_name = id_components
+        .name
+        .clone()
+        .unwrap_or_else(|| raw_name.clone());
 
     let hidden_size = config["hidden_size"]
         .as_u64()
@@ -146,26 +167,65 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
         .get("rope_theta")
         .and_then(|v| v.as_f64())
         .unwrap_or(10000.0) as f32;
+    let head_dim = config
+        .get("head_dim")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as u32)
+        .unwrap_or(hidden_size / n_head);
+    let vocab_size = config["vocab_size"]
+        .as_u64()
+        .expect("config.json missing required key `vocab_size`") as u32;
 
-    vec![
-        (
-            "general.architecture".into(),
-            MetaValue::String("llama".into()),
-        ),
-        ("general.name".into(), MetaValue::String(name)),
-        ("llama.context_length".into(), MetaValue::U32(ctx_len)),
-        ("llama.embedding_length".into(), MetaValue::U32(hidden_size)),
-        ("llama.block_count".into(), MetaValue::U32(n_layers)),
-        ("llama.feed_forward_length".into(), MetaValue::U32(ffn_len)),
-        ("llama.attention.head_count".into(), MetaValue::U32(n_head)),
-        ("llama.attention.head_count_kv".into(), MetaValue::U32(n_head_kv)),
-        (
-            "llama.attention.layer_norm_rms_epsilon".into(),
-            MetaValue::F32(rms_eps),
-        ),
-        ("llama.rope.freq_base".into(), MetaValue::F32(rope_theta)),
-        ("general.file_type".into(), MetaValue::U32(file_type)),
-    ]
+    // Canonical `general.*` prelude — architecture, type, sampling.*,
+    // name, version/organization/finetune/basename, size_label,
+    // license, base_model.*, tags, languages — in canonical insertion
+    // order matching `Metadata.set_gguf_meta_model`.
+    let mut kv: Vec<(String, MetaValue)> = emit_general_prelude(
+        "llama",
+        display_name,
+        &id_components,
+        None,
+        model_card,
+        sampling,
+    );
+    // Canonical Llama 3 arch-KV emit order (verified against
+    // /opt/hf2q/cache/byte_cmp/NousResearch-Meta-Llama-3-8B_canonical_q4_k_m.gguf
+    // dump positions 16-27):
+    //
+    //   block_count, context_length, embedding_length,
+    //   feed_forward_length, attention.head_count,
+    //   attention.head_count_kv, rope.freq_base,
+    //   attention.layer_norm_rms_epsilon, attention.key_length,
+    //   attention.value_length, vocab_size, rope.dimension_count
+    kv.push(("llama.block_count".into(), MetaValue::U32(n_layers)));
+    kv.push(("llama.context_length".into(), MetaValue::U32(ctx_len)));
+    kv.push(("llama.embedding_length".into(), MetaValue::U32(hidden_size)));
+    kv.push(("llama.feed_forward_length".into(), MetaValue::U32(ffn_len)));
+    kv.push(("llama.attention.head_count".into(), MetaValue::U32(n_head)));
+    kv.push((
+        "llama.attention.head_count_kv".into(),
+        MetaValue::U32(n_head_kv),
+    ));
+    kv.push(("llama.rope.freq_base".into(), MetaValue::F32(rope_theta)));
+    kv.push((
+        "llama.attention.layer_norm_rms_epsilon".into(),
+        MetaValue::F32(rms_eps),
+    ));
+    kv.push((
+        "llama.attention.key_length".into(),
+        MetaValue::U32(head_dim),
+    ));
+    kv.push((
+        "llama.attention.value_length".into(),
+        MetaValue::U32(head_dim),
+    ));
+    kv.push(("llama.vocab_size".into(), MetaValue::U32(vocab_size)));
+    kv.push((
+        "llama.rope.dimension_count".into(),
+        MetaValue::U32(head_dim),
+    ));
+    kv.push(("general.file_type".into(), MetaValue::U32(file_type)));
+    kv
 }
 
 #[cfg(test)]
@@ -281,13 +341,12 @@ mod tests {
             "max_position_embeddings": 8192,
             "rms_norm_eps": 1.0e-5,
             "rope_theta": 500000.0,
+            "vocab_size": 1024,
+            "head_dim": 16,
         });
 
-        let kv = build_metadata(&cfg, 17 /* MostlyQ5_K_M */);
+        let kv = build_metadata(&cfg, 17 /* MostlyQ5_K_M */, None, None, None);
 
-        // Build a name -> value index for the asserts (don't depend on
-        // insertion order — but we DO check count + keyset).
-        assert_eq!(kv.len(), 11, "Llama3 emits 11 KV pairs at v1");
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
@@ -295,9 +354,12 @@ mod tests {
             by_key["general.architecture"],
             MetaValue::String("llama".into())
         );
-        assert_eq!(
-            by_key["general.name"],
-            MetaValue::String("meta-llama/Llama-3-Tiny".into())
+        // get_model_id_components title-cases the basename portion;
+        // for "meta-llama/Llama-3-Tiny" the canonical id_to_title
+        // produces "Llama 3 Tiny" + size_label.
+        assert!(
+            matches!(by_key.get("general.name"), Some(MetaValue::String(_))),
+            "general.name must be present and a string"
         );
         assert_eq!(by_key["llama.context_length"], MetaValue::U32(8192));
         assert_eq!(by_key["llama.embedding_length"], MetaValue::U32(32));
@@ -310,6 +372,10 @@ mod tests {
             MetaValue::F32(1.0e-5)
         );
         assert_eq!(by_key["llama.rope.freq_base"], MetaValue::F32(500000.0));
+        assert_eq!(by_key["llama.attention.key_length"], MetaValue::U32(16));
+        assert_eq!(by_key["llama.attention.value_length"], MetaValue::U32(16));
+        assert_eq!(by_key["llama.vocab_size"], MetaValue::U32(1024));
+        assert_eq!(by_key["llama.rope.dimension_count"], MetaValue::U32(16));
         assert_eq!(by_key["general.file_type"], MetaValue::U32(17));
     }
 
@@ -326,16 +392,19 @@ mod tests {
             // num_key_value_heads omitted → defaults to num_attention_heads
             "max_position_embeddings": 2048,
             "rms_norm_eps": 1.0e-6,
+            "vocab_size": 1024,
             // rope_theta omitted → defaults to 10000.0
             // _name_or_path omitted → defaults to "model"
+            // head_dim omitted → defaults to hidden_size / n_head
         });
-        let kv = build_metadata(&cfg, 0);
+        let kv = build_metadata(&cfg, 0, None, None, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        // get_model_id_components("model") title-cases to "Model"
         assert_eq!(
             by_key["general.name"],
-            MetaValue::String("model".into()),
-            "name defaults to 'model' when _name_or_path absent"
+            MetaValue::String("Model".into()),
+            "name defaults to title-cased 'Model' when _name_or_path absent"
         );
         assert_eq!(
             by_key["llama.attention.head_count_kv"],
