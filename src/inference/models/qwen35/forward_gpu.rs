@@ -3036,6 +3036,22 @@ impl Qwen35Model {
                             format!("delta_net_with_arena layer {layer_idx}")
                         })?
                     } else {
+                        // ADR-034 task #90 Step 3 (2026-05-21) — when the
+                        // current LA slot has capture_states allocated
+                        // (K=N spec-decode active), thread it through so
+                        // the GDN decode kernel writes per-position
+                        // recurrent state for partial-reject rollback.
+                        // Slot is byte-identical to pre-#90 when capture
+                        // is None.
+                        let state_capture_ref: Option<&MlxBuffer> = if linear_slot_idx
+                            != usize::MAX
+                        {
+                            kv_cache.linear_attn[linear_slot_idx]
+                                .capture_states
+                                .as_ref()
+                        } else {
+                            None
+                        };
                         build_delta_net_layer(
                             &device,
                             &mut registry,
@@ -3053,6 +3069,7 @@ impl Qwen35Model {
                             shape.d_v,
                             shape.conv_kernel,
                             shape.rms_norm_eps,
+                            state_capture_ref,
                         )
                         .with_context(|| format!("delta_net layer {layer_idx}"))?
                     };
@@ -5001,6 +5018,17 @@ impl Qwen35Model {
                                 &zero_rec_buf_out,
                             )
                         };
+                        // ADR-034 task #90 Step 3 — same capture wire as
+                        // the main decode path above.
+                        let state_capture_ref: Option<&MlxBuffer> = if linear_slot_idx
+                            != usize::MAX
+                        {
+                            kv_cache.linear_attn[linear_slot_idx]
+                                .capture_states
+                                .as_ref()
+                        } else {
+                            None
+                        };
                         let out = build_delta_net_layer(
                             &device,
                             &mut registry,
@@ -5018,6 +5046,7 @@ impl Qwen35Model {
                             shape.d_v,
                             shape.conv_kernel,
                             shape.rms_norm_eps,
+                            state_capture_ref,
                         )
                         .with_context(|| format!("delta_net legacy greedy layer {layer_idx}"))?;
 

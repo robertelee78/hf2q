@@ -1859,6 +1859,15 @@ pub fn apply_ssm_norm_and_gate(
 ///
 /// `output`: `[seq_len, hidden_size]` F32.
 #[allow(clippy::too_many_arguments)]
+/// ADR-034 task #90 Step 3 (2026-05-21): when `state_capture` is `Some`,
+/// the GDN decode dispatch routes through
+/// [`mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode_with_capture`]
+/// — writing per-position recurrent state into the supplied buffer for K=N
+/// spec-decode partial-reject rollback (paired with
+/// `HybridKvCache::rollback_la_to`).
+///
+/// Default callers pass `None` for byte-identical pre-#90 behavior.
+#[allow(clippy::too_many_arguments)]
 pub fn build_delta_net_layer(
     device: &MlxDevice,
     registry: &mut KernelRegistry,
@@ -1876,6 +1885,16 @@ pub fn build_delta_net_layer(
     d_v: u32,
     k_width: u32,
     rms_norm_eps: f32,
+    // ADR-034 task #90 Step 3 (2026-05-21) — per-position capture buffer.
+    // `None`  → legacy `dispatch_gated_delta_net_decode` (byte-identical
+    //           to pre-#90).
+    // `Some(buf)` → `dispatch_gated_delta_net_decode_with_capture`. Buffer
+    //          must be sized [D_k, D_v, n_v_heads, n_tokens_capacity,
+    //          n_seqs] F32 with `n_tokens_capacity >= seq_len` (kernel
+    //          writes the first `seq_len` token-slots). Caller is
+    //          responsible for allocation via
+    //          `HybridKvCache::ensure_la_capture`.
+    state_capture: Option<&MlxBuffer>,
 ) -> Result<MlxBuffer> {
     let qkv_channels = 2 * n_k_heads * d_k + n_v_heads * d_v;
     let z_channels = n_v_heads * d_v;
@@ -2068,13 +2087,47 @@ pub fn build_delta_net_layer(
         // legacy 128-thread kernel for non-NSG shapes (e.g. test-only D_k=8).
         let nsg_compatible = d_k % 32 == 0 && d_k / 32 <= mlx_native::ops::gated_delta_net_decode::MAX_NSG;
         if nsg_compatible {
-            dispatch_gated_delta_net_decode(
-                &mut enc, registry, device.metal_device(),
-                &q_scaled, &k_normed, &v_gpu,
-                &g_buf, &beta_buf, state_in,
-                &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
-            ).context("dispatch_gated_delta_net_decode (build_delta_net_layer decode)")?;
+            // ADR-034 task #90 Step 3 (2026-05-21) — capture variant when
+            // K=N spec-decode active. Captures per-position recurrent
+            // state for rollback on partial-reject.
+            if let Some(capture_buf) = state_capture {
+                use mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode_with_capture;
+                dispatch_gated_delta_net_decode_with_capture(
+                    &mut enc, registry, device.metal_device(),
+                    &q_scaled, &k_normed, &v_gpu,
+                    &g_buf, &beta_buf, state_in,
+                    &attn_out_buf, state_out, &gdn_params_buf, capture_buf,
+                    gdn_params,
+                ).context("dispatch_gated_delta_net_decode_with_capture (build_delta_net_layer K=N spec)")?;
+            } else {
+                dispatch_gated_delta_net_decode(
+                    &mut enc, registry, device.metal_device(),
+                    &q_scaled, &k_normed, &v_gpu,
+                    &g_buf, &beta_buf, state_in,
+                    &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
+                ).context("dispatch_gated_delta_net_decode (build_delta_net_layer decode)")?;
+            }
         } else {
+            // Non-NSG-compatible shape: capture not supported on the
+            // legacy 128-thread kernel (used only by test fixtures with
+            // D_k=8 etc; production qwen3.5/3.6 always satisfies
+            // NSG-compatible).
+            //
+            // ADR-034 task #90 Step 3 codex audit hardening (2026-05-21):
+            // explicitly REJECT capture on the non-NSG path so a future
+            // non-NSG production shape that enables capture doesn't
+            // silently lose its rollback contract. Production never hits
+            // this branch with state_capture=Some at HEAD.
+            if state_capture.is_some() {
+                return Err(anyhow!(
+                    "build_delta_net_layer: state_capture is Some but D_k={} \
+                     is not NSG-compatible (only D_k % 32 == 0 with D_k/32 \
+                     <= MAX_NSG supports the capture kernel). Either disable \
+                     capture for this shape or port the capture path to the \
+                     legacy 128-thread kernel.",
+                    d_k
+                ));
+            }
             dispatch_gated_delta_net(
                 &mut enc, registry, device.metal_device(),
                 &q_scaled, &k_normed, &v_gpu,
@@ -3555,6 +3608,7 @@ mod tests {
             shape.d_v,
             shape.conv_kernel,
             shape.rms_norm_eps,
+            None, // ADR-034 task #90 Step 3 — no capture in this test
         )
         .expect("build_delta_net_layer");
 
@@ -3712,6 +3766,7 @@ mod tests {
             shape.d_v,
             shape.conv_kernel,
             shape.rms_norm_eps,
+            None, // ADR-034 task #90 Step 3 — no capture in this test
         )
         .expect("build_delta_net_layer");
 
@@ -3870,6 +3925,7 @@ mod tests {
             &conv_in_gpu, &conv_out_gpu, &state_in_gpu, &state_out_gpu,
             2, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
+            None, // ADR-034 task #90 Step 3 — no capture in this test
         ).expect("build_delta_net_layer seq=2");
         device.command_encoder().expect("sync").commit_and_wait().expect("wait");
         let gpu_out_b = download_f32(&gpu_out_b_buf).expect("download");
@@ -4032,6 +4088,7 @@ mod tests {
             &state_zeros_gpu, &state_scratch_mono,
             2, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
+            None, // ADR-034 task #90 Step 3 — no capture in this test
         ).expect("mono");
         flush(&device);
         let mono_out = download_f32(&mono_buf).expect("dl mono");
@@ -4053,6 +4110,7 @@ mod tests {
             &state_t0_in, &state_t0_out,
             1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
+            None, // ADR-034 task #90 Step 3 — no capture in this test
         ).expect("chunk t0");
         // Required: decode path commit() without wait — flush before reading.
         flush(&device);
@@ -4069,6 +4127,7 @@ mod tests {
             &state_t0_out, &state_t1_out,
             1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
+            None, // ADR-034 task #90 Step 3 — no capture in this test
         ).expect("chunk t1");
         flush(&device);
         let t1_out = download_f32(&t1_buf).expect("dl t1");
