@@ -376,34 +376,6 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
     let n_layers = pick_u64("n_layer", "num_hidden_layers");
     let n_head = pick_u64("n_head", "num_attention_heads");
 
-    // Accept BOTH `max_position_embeddings` (standard HF) AND
-    // `n_positions` (nomic-bert v2-moe / GPT-style configs). Mirrors
-    // canonical `find_hparam(["n_positions", "max_position_embeddings"])`
-    // in `/opt/llama.cpp/conversion/base.py`.
-    let ctx_len = config
-        .get("max_position_embeddings")
-        .or_else(|| config.get("n_positions"))
-        .and_then(|v| v.as_u64())
-        .expect("config.json missing required key `max_position_embeddings` (or `n_positions`)")
-        as u32;
-
-    // Optional with defaults.
-    let ffn_len = config
-        .get("n_inner")
-        .and_then(|v| v.as_u64())
-        .map(|x| x as u32)
-        .unwrap_or(4 * hidden_size);
-
-    let ln_eps = config
-        .get("layer_norm_epsilon")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1.0e-12) as f32;
-
-    let rope_theta = config
-        .get("rotary_emb_base")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(10000.0) as f32;
-
     // NomicBert has no GQA — head_count_kv == head_count.
     let n_head_kv = n_head;
 
@@ -423,57 +395,101 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
         .and_then(|v| v.as_u64())
         .filter(|&n| n > 0)
         .map(|n| n as u32);
-    let arch_name = if moe_every_n.is_some() {
-        "nomic-bert-moe"
+    let is_moe = moe_every_n.is_some();
+    let arch_name = if is_moe { "nomic-bert-moe" } else { "nomic-bert" };
+
+    // Hparam selection mirrors what canonical sees AFTER
+    // `transformers.AutoConfig.from_pretrained` injects defaults.
+    // For nomic v2-moe (transformers v5.5+), the injected fields that
+    // override the explicit config.json values are:
+    //   - `layer_norm_eps = 1e-12` (BERT-family default, takes priority
+    //     over config's `layer_norm_epsilon = 1e-5` per
+    //     `base.py:1191` find_hparam priority).
+    //   - `max_position_embeddings = 2048` (BERT-family default; then
+    //     `_xlmroberta_tokenizer_init` at `bert.py:104-111` subtracts
+    //     `1 + pad_token_id` if max_position_embeddings is in hparams).
+    //   - `head_dim = hidden_size / num_attention_heads` (transformers
+    //     fills in when omitted from config).
+    //   - `rope_parameters = {rope_theta: 1000.0, rope_type: 'default'}`
+    //     (nomic_bert-specific transformers default; overrides config's
+    //     `rotary_emb_base = 10000`).
+    //
+    // Verified by `python3 -c "from transformers import AutoConfig;
+    // print(AutoConfig.from_pretrained(<v2-moe-dir>).to_dict())"` at
+    // commit 28525977. The injected values reproduce in canonical's
+    // GGUF dump as: `context_length=2046`, `rope.freq_base=1000.0`,
+    // `attention.layer_norm_epsilon=1e-12`, `attention.key_length=64`,
+    // `attention.value_length=64`.
+    let head_dim = hidden_size / n_head;
+    let pad_token_id = config
+        .get("pad_token_id")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+    let n_positions_raw = config
+        .get("max_position_embeddings")
+        .or_else(|| config.get("n_positions"))
+        .and_then(|v| v.as_u64())
+        .expect("config.json missing required key `max_position_embeddings` (or `n_positions`)")
+        as u32;
+    let ctx_len = if is_moe {
+        // v2-moe uses Unigram (XLM-RoBERTa); canonical subtracts
+        // `1 + pad_token_id` from max_position_embeddings via
+        // `_xlmroberta_tokenizer_init`. For nomic v2-moe with
+        // `pad_token_id=1` and AutoConfig-injected
+        // `max_position_embeddings=2048`: `2048 - 2 = 2046`.
+        let offset = 1 + pad_token_id.expect(
+            "v2-moe config.json: pad_token_id required for context_length offset",
+        );
+        n_positions_raw.saturating_sub(offset)
     } else {
-        "nomic-bert"
+        n_positions_raw
     };
 
-    let mut kv: Vec<(String, MetaValue)> = vec![
-        (
-            "general.architecture".into(),
-            MetaValue::String(arch_name.into()),
-        ),
-        ("general.name".into(), MetaValue::String(name)),
-        (format!("{arch_name}.context_length"), MetaValue::U32(ctx_len)),
-        (
-            format!("{arch_name}.embedding_length"),
-            MetaValue::U32(hidden_size),
-        ),
-        (format!("{arch_name}.block_count"), MetaValue::U32(n_layers)),
-        (
-            format!("{arch_name}.feed_forward_length"),
-            MetaValue::U32(ffn_len),
-        ),
-        (
-            format!("{arch_name}.attention.head_count"),
-            MetaValue::U32(n_head),
-        ),
-        (
-            format!("{arch_name}.attention.head_count_kv"),
-            MetaValue::U32(n_head_kv),
-        ),
-        (
-            format!("{arch_name}.attention.layer_norm_epsilon"),
-            MetaValue::F32(ln_eps),
-        ),
-        (
-            format!("{arch_name}.rope.freq_base"),
-            MetaValue::F32(rope_theta),
-        ),
-        // Pooling type 1 == LLAMA_POOLING_TYPE_MEAN. Nomic Embed v1/v1.5/v2-moe
-        // are mean-pooled embedding models.
-        (format!("{arch_name}.pooling_type"), MetaValue::U32(1)),
-        ("general.file_type".into(), MetaValue::U32(file_type)),
-    ];
+    let ffn_len = config
+        .get("n_inner")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as u32)
+        .unwrap_or(4 * hidden_size);
 
-    if let Some(n_layers_per_moe) = moe_every_n {
-        // Required MoE hparams. `num_experts` / `num_local_experts`
-        // and `moe_top_k` must both be present on a true v2-moe
-        // checkpoint; a malformed config that has `moe_every_n_layers`
-        // but is missing these hard-errors here (matches the
-        // no-fallback rule — silent default would produce a GGUF
-        // that loads but inferences wrong).
+    // layer_norm_epsilon: for v2-moe canonical sees AutoConfig-injected
+    // `layer_norm_eps = 1e-12` (BERT default; priority over config's
+    // 1e-5 per `find_hparam` order). For v1.5 the config-explicit
+    // value (typically 1e-12) is used directly.
+    let ln_eps = if is_moe {
+        1.0e-12_f32
+    } else {
+        config
+            .get("layer_norm_epsilon")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0e-12) as f32
+    };
+
+    // rope_freq_base: for v2-moe canonical sees AutoConfig-injected
+    // `rope_parameters.rope_theta = 1000.0` (nomic_bert-specific
+    // transformers default; priority over config's
+    // `rotary_emb_base = 10000`). For v1.5 the config value applies.
+    let rope_theta = if is_moe {
+        1000.0_f32
+    } else {
+        config
+            .get("rotary_emb_base")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(10000.0) as f32
+    };
+
+    if is_moe {
+        // v2-moe path — emit the canonical key order observed in
+        // gguf-dump of the canonical reference convert (verified at
+        // commit 28525977). Canonical's order is:
+        //   architecture, name, block_count, context_length,
+        //   embedding_length, feed_forward_length, head_count,
+        //   rope.freq_base, attention.layer_norm_epsilon,
+        //   expert_count, attention.key_length, attention.value_length,
+        //   attention.causal, pooling_type, moe_every_n_layers,
+        //   expert_used_count, file_type
+        // Mirroring this exact order helps the KV-section bytes
+        // line up. (Tensor data bytes are the other independent
+        // axis of byte-identity.)
         let n_experts = config
             .get("num_experts")
             .or_else(|| config.get("num_local_experts"))
@@ -490,21 +506,101 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
                 "v2-moe config.json: `moe_every_n_layers` present but \
                  `moe_top_k` / `num_experts_per_tok` missing",
             ) as u32;
-        kv.push((
-            format!("{arch_name}.expert_count"),
-            MetaValue::U32(n_experts),
-        ));
-        kv.push((
-            format!("{arch_name}.expert_used_count"),
-            MetaValue::U32(moe_top_k),
-        ));
-        kv.push((
-            format!("{arch_name}.moe_every_n_layers"),
-            MetaValue::U32(n_layers_per_moe),
-        ));
+        let n_layers_per_moe = moe_every_n.unwrap();
+        let _ = n_head_kv; // canonical doesn't emit head_count_kv for nomic
+        vec![
+            (
+                "general.architecture".into(),
+                MetaValue::String(arch_name.into()),
+            ),
+            ("general.name".into(), MetaValue::String(name)),
+            (format!("{arch_name}.block_count"), MetaValue::U32(n_layers)),
+            (format!("{arch_name}.context_length"), MetaValue::U32(ctx_len)),
+            (
+                format!("{arch_name}.embedding_length"),
+                MetaValue::U32(hidden_size),
+            ),
+            (
+                format!("{arch_name}.feed_forward_length"),
+                MetaValue::U32(ffn_len),
+            ),
+            (
+                format!("{arch_name}.attention.head_count"),
+                MetaValue::U32(n_head),
+            ),
+            (
+                format!("{arch_name}.rope.freq_base"),
+                MetaValue::F32(rope_theta),
+            ),
+            (
+                format!("{arch_name}.attention.layer_norm_epsilon"),
+                MetaValue::F32(ln_eps),
+            ),
+            (
+                format!("{arch_name}.expert_count"),
+                MetaValue::U32(n_experts),
+            ),
+            (
+                format!("{arch_name}.attention.key_length"),
+                MetaValue::U32(head_dim),
+            ),
+            (
+                format!("{arch_name}.attention.value_length"),
+                MetaValue::U32(head_dim),
+            ),
+            (
+                format!("{arch_name}.attention.causal"),
+                MetaValue::Bool(false),
+            ),
+            (format!("{arch_name}.pooling_type"), MetaValue::U32(1)),
+            (
+                format!("{arch_name}.moe_every_n_layers"),
+                MetaValue::U32(n_layers_per_moe),
+            ),
+            (
+                format!("{arch_name}.expert_used_count"),
+                MetaValue::U32(moe_top_k),
+            ),
+        ]
+    } else {
+        // v1.5 path (unchanged): preserve historical key set + order
+        // for the working bge-style WordPiece + non-MoE convert.
+        vec![
+            (
+                "general.architecture".into(),
+                MetaValue::String(arch_name.into()),
+            ),
+            ("general.name".into(), MetaValue::String(name)),
+            (format!("{arch_name}.context_length"), MetaValue::U32(ctx_len)),
+            (
+                format!("{arch_name}.embedding_length"),
+                MetaValue::U32(hidden_size),
+            ),
+            (format!("{arch_name}.block_count"), MetaValue::U32(n_layers)),
+            (
+                format!("{arch_name}.feed_forward_length"),
+                MetaValue::U32(ffn_len),
+            ),
+            (
+                format!("{arch_name}.attention.head_count"),
+                MetaValue::U32(n_head),
+            ),
+            (
+                format!("{arch_name}.attention.head_count_kv"),
+                MetaValue::U32(n_head_kv),
+            ),
+            (
+                format!("{arch_name}.attention.layer_norm_epsilon"),
+                MetaValue::F32(ln_eps),
+            ),
+            (
+                format!("{arch_name}.rope.freq_base"),
+                MetaValue::F32(rope_theta),
+            ),
+            (format!("{arch_name}.pooling_type"), MetaValue::U32(1)),
+            ("general.file_type".into(), MetaValue::U32(file_type)),
+        ]
     }
-
-    kv
 }
 
 #[cfg(test)]
@@ -890,6 +986,11 @@ mod tests {
     /// (`set_gguf_parameters` MoE branch).
     #[test]
     fn nomic_bert_v2_moe_metadata_uses_nomic_bert_moe_arch() {
+        // Config fixture mirrors the real nomic-embed-text-v2-moe
+        // hparams that canonical sees via `AutoConfig.from_pretrained`:
+        // the `n_positions=2048` + `pad_token_id=1` combination drives
+        // canonical's `_xlmroberta_tokenizer_init` to compute
+        // `ctx_len = 2048 - (1 + 1) = 2046`.
         let cfg = json!({
             "_name_or_path": "nomic-ai/nomic-embed-text-v2-moe",
             "n_embd": 768,
@@ -897,8 +998,9 @@ mod tests {
             "n_head": 12,
             "n_inner": 3072,
             "n_positions": 2048,
-            "layer_norm_epsilon": 1.0e-5,
-            "rotary_emb_base": 10000.0,
+            "pad_token_id": 1,
+            "layer_norm_epsilon": 1.0e-5, // config says 1e-5; AutoConfig override → 1e-12
+            "rotary_emb_base": 10000.0,   // config says 10000; AutoConfig override → 1000
             "moe_every_n_layers": 2,
             "num_experts": 8,
             "moe_top_k": 2,
@@ -910,12 +1012,12 @@ mod tests {
         assert_eq!(
             by_key["general.architecture"],
             MetaValue::String("nomic-bert-moe".into()),
-            "v2-moe must switch the arch name to nomic-bert-moe"
         );
-        // Per-arch keys all use the new prefix.
+        // Per-arch keys: canonical-equivalent values + key set.
         assert_eq!(
             by_key["nomic-bert-moe.context_length"],
-            MetaValue::U32(2048)
+            MetaValue::U32(2046),
+            "v2-moe: ctx_len = n_positions - (1 + pad_token_id) = 2046",
         );
         assert_eq!(
             by_key["nomic-bert-moe.embedding_length"],
@@ -931,8 +1033,29 @@ mod tests {
             MetaValue::U32(12)
         );
         assert_eq!(
-            by_key["nomic-bert-moe.attention.head_count_kv"],
-            MetaValue::U32(12)
+            by_key["nomic-bert-moe.attention.layer_norm_epsilon"],
+            MetaValue::F32(1.0e-12),
+            "v2-moe: AutoConfig overrides config 1e-5 with BERT-default 1e-12"
+        );
+        assert_eq!(
+            by_key["nomic-bert-moe.rope.freq_base"],
+            MetaValue::F32(1000.0),
+            "v2-moe: AutoConfig injects rope_parameters.rope_theta=1000.0"
+        );
+        // Head-dim derived keys (canonical TextModel emits when head_dim
+        // is in hparams — AutoConfig fills it from hidden_size/n_head).
+        assert_eq!(
+            by_key["nomic-bert-moe.attention.key_length"],
+            MetaValue::U32(64)
+        );
+        assert_eq!(
+            by_key["nomic-bert-moe.attention.value_length"],
+            MetaValue::U32(64)
+        );
+        // attention.causal=false (BertModel.set_gguf_parameters at bert.py:33).
+        assert_eq!(
+            by_key["nomic-bert-moe.attention.causal"],
+            MetaValue::Bool(false)
         );
         // MoE-specific keys.
         assert_eq!(by_key["nomic-bert-moe.expert_count"], MetaValue::U32(8));
@@ -943,6 +1066,12 @@ mod tests {
         assert_eq!(
             by_key["nomic-bert-moe.moe_every_n_layers"],
             MetaValue::U32(2)
+        );
+        // Canonical does NOT emit head_count_kv for nomic (config has
+        // no `num_key_value_heads`).
+        assert!(
+            !by_key.contains_key("nomic-bert-moe.attention.head_count_kv"),
+            "v2-moe must NOT emit head_count_kv (canonical doesn't)"
         );
         // No legacy `nomic-bert.*` keys leaked through.
         assert!(
