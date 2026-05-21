@@ -271,6 +271,32 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 9) — 3-rep paired bench correction (HEAD `3ffa1cb0`)
+
+The (cont. 8) bench below used a SINGLE-REP base measurement of 15.4 tok/s which
+was a cold-cache outlier. Re-bench at HEAD `3ffa1cb0` using `scripts/adr034_mtp_paired_bench.sh`
+(3 reps alt-paired, Qwen 3.6 27B Q8_0, 200 tok --ignore-eos, prompt = test-coverage essay):
+
+| Mode (3-rep mean)          | tok/s | Accept | vs base 21.30 | Coherence |
+|----------------------------|------:|-------:|--------------:|-----------|
+| base (no spec)             | 21.30 |    -   | 1.00x         | ok        |
+| K=1 BATCHED greedy temp=0  | 24.53 |  60.0% | **1.15x**     | ok        |
+| K=1 BATCHED MH temp=0.6    | 25.93 |  70.9% | **1.22x**     | ok        |
+| K=2 cap=0 greedy temp=0    | 22.83 |  48.5% | 1.07x         | partial ~150 tok |
+
+**Production-best mode**: K=1 BATCHED MH temp=0.6 at **1.22x with full coherence**.
+MH temp=0.6 adds **+6% relative** to K=1 BATCHED greedy (1.22 / 1.15). K=2 cap=0 greedy
+adds NO value over K=1 BATCHED greedy (1.07x vs 1.15x).
+
+The (cont. 8) "1.68x" claim is RETRACTED — it was inflated by an anomalous 15.4 t/s
+single-rep base. All other (cont. 8) findings (K=2 MH coherence collapse, K=3 MH accept
+regression) remain valid since they were comparisons WITHIN the same rep.
+
+Per mantra "Measure 3x, cut once" — single-rep speedup claims are unreliable. All
+future ADR perf claims must cite N>=3 alt-paired runs with declared base mean.
+
+Memory updated: `[[project_adr034_3rep_baselines_2026_05_21]]`.
+
 ### Iteration 2026-05-21 (cont. 8) — Task #91 Step 4 SHIPPED but K=N MH hypothesis FALSIFIED (HEAD `88cab142`)
 
 **Step 4 shipped**: K=N path now honors `--temperature` via `leviathan_accept_prefix`. +147 / -39 LOC across the chained MTP draft loop and accept walk (drafts sampled stochastically with `softmax_with_temp` + `sample_from_probs`; target probs built per verify row; greedy path byte-identical via structural branch).
