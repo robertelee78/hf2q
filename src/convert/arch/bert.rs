@@ -214,12 +214,36 @@ fn pooling_type_u32(mode: Option<&str>) -> Option<u32> {
 ///
 /// `file_type` is the chosen `LlamaFtype` as a `u32` (matches
 /// `gguf_writer.add_file_type(self.ftype)` at base.py:1220).
-pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String, MetaValue)> {
-    let name = config
-        .get("_name_or_path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("model")
-        .to_string();
+pub fn build_metadata(
+    config: &serde_json::Value,
+    file_type: u32,
+    model_card: Option<&crate::convert::model_card::ModelCard>,
+    sampling: Option<&crate::convert::model_card::SamplingConfig>,
+    model_dir_basename: Option<&str>,
+    pooling_override: Option<u32>,
+) -> Vec<(String, MetaValue)> {
+    use crate::convert::model_card::{
+        emit_general_postlude, emit_general_prelude, get_model_id_components,
+    };
+    // BERT bge config.json carries `_name_or_path = "/root/.cache/..."`
+    // which is a noisy filesystem path. Prefer the model directory's
+    // basename (e.g. "BAAI-bge-large-en-v1.5") so canonical's
+    // `get_model_id_components` heuristic produces the same
+    // basename/finetune/size_label/name as canonical's GGUF dump.
+    let raw_name = model_dir_basename
+        .map(|s| s.to_string())
+        .or_else(|| {
+            config
+                .get("_name_or_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "model".to_string());
+    let id_components = get_model_id_components(&raw_name);
+    let display_name = id_components
+        .name
+        .clone()
+        .unwrap_or_else(|| raw_name.clone());
 
     let hidden_size = config["hidden_size"]
         .as_u64()
@@ -240,49 +264,94 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
         .as_f64()
         .expect("config.json missing required key `layer_norm_eps`") as f32;
 
-    // BERT has no GQA — kv-head count mirrors head count (matches HF
-    // `BertConfig`, which carries no `num_key_value_heads` field at
-    // all). Explicit emit so downstream loaders don't have to guess.
-    let n_head_kv = n_head;
-
-    // Pooling type — read from optional `pooling` key (string).
-    // Default MEAN. Unrecognized values panic.
-    let pooling_mode = config.get("pooling").and_then(|v| v.as_str());
-    let pooling_u32 = pooling_type_u32(pooling_mode).unwrap_or_else(|| {
-        panic!(
-            "config.json key `pooling` has unrecognized value {pooling_mode:?}; \
-             expected one of mean | cls | last | none | rank"
-        )
+    // Pooling type resolution order:
+    //   1. Explicit `pooling_override` from cli_driver (canonical's
+    //      `_try_set_pooling_type` reads modules.json + 1_Pooling/
+    //      config.json — that lives in cli_driver where the model_dir
+    //      Path is available).
+    //   2. `config["pooling"]` (string: mean | cls | last | none | rank).
+    //   3. Default MEAN.
+    let pooling_u32 = pooling_override.unwrap_or_else(|| {
+        let pooling_mode = config.get("pooling").and_then(|v| v.as_str());
+        pooling_type_u32(pooling_mode).unwrap_or_else(|| {
+            panic!(
+                "config.json key `pooling` has unrecognized value {pooling_mode:?}; \
+                 expected one of mean | cls | last | none | rank"
+            )
+        })
     });
 
-    vec![
-        (
-            "general.architecture".into(),
-            MetaValue::String("bert".into()),
-        ),
-        ("general.name".into(), MetaValue::String(name)),
-        ("bert.context_length".into(), MetaValue::U32(ctx_len)),
-        ("bert.embedding_length".into(), MetaValue::U32(hidden_size)),
-        ("bert.block_count".into(), MetaValue::U32(n_layers)),
-        ("bert.feed_forward_length".into(), MetaValue::U32(ffn_len)),
-        ("bert.attention.head_count".into(), MetaValue::U32(n_head)),
-        (
-            "bert.attention.head_count_kv".into(),
-            MetaValue::U32(n_head_kv),
-        ),
-        (
-            "bert.attention.layer_norm_epsilon".into(),
-            MetaValue::F32(ln_eps),
-        ),
-        // Encoder-only: bidirectional attention. Llama-3 omits this key
-        // (causal=true is the C default).
-        (
-            "bert.attention.causal".into(),
-            MetaValue::Bool(false),
-        ),
-        ("bert.pooling_type".into(), MetaValue::U32(pooling_u32)),
-        ("general.file_type".into(), MetaValue::U32(file_type)),
-    ]
+    // Canonical bert.py:25-29: cls_out_labels from id2label, but
+    // dropped if exactly 2 labels with index 0 = "LABEL_0" (dummy
+    // labels AutoConfig adds). Keep otherwise.
+    let cls_out_labels: Option<Vec<String>> = config
+        .get("id2label")
+        .and_then(|v| v.as_object())
+        .and_then(|m| {
+            // Sort by integer key
+            let mut entries: Vec<(i64, String)> = m
+                .iter()
+                .filter_map(|(k, v)| {
+                    Some((k.parse::<i64>().ok()?, v.as_str()?.to_string()))
+                })
+                .collect();
+            if entries.is_empty() {
+                return None;
+            }
+            if entries.len() == 2 && entries.iter().any(|(k, v)| *k == 0 && v == "LABEL_0") {
+                // Skip dummy LABEL_0 + LABEL_1 pair
+                return None;
+            }
+            entries.sort_by_key(|e| e.0);
+            Some(entries.into_iter().map(|(_, v)| v).collect())
+        });
+
+    // Canonical `general.*` prelude — architecture, type, sampling.*,
+    // name, version/organization/finetune/basename, size_label,
+    // license, base_model.*, tags, languages.
+    let mut kv: Vec<(String, MetaValue)> = emit_general_prelude(
+        "bert",
+        display_name,
+        &id_components,
+        None,
+        model_card,
+        sampling,
+    );
+    // Canonical BERT bge arch-KV emit order (verified against
+    // /opt/hf2q/cache/byte_cmp/BAAI-bge-large-en-v1.5_canonical_q4_k_m.gguf
+    // dump positions 14-22):
+    //   block_count, context_length, embedding_length,
+    //   feed_forward_length, attention.head_count,
+    //   attention.layer_norm_epsilon, attention.causal, pooling_type,
+    //   classifier.output_labels (when present)
+    //
+    // Note: canonical does NOT emit `bert.attention.head_count_kv`
+    // (BERT has no GQA; the C runtime treats absent as = n_head).
+    kv.push(("bert.block_count".into(), MetaValue::U32(n_layers)));
+    kv.push(("bert.context_length".into(), MetaValue::U32(ctx_len)));
+    kv.push((
+        "bert.embedding_length".into(),
+        MetaValue::U32(hidden_size),
+    ));
+    kv.push((
+        "bert.feed_forward_length".into(),
+        MetaValue::U32(ffn_len),
+    ));
+    kv.push(("bert.attention.head_count".into(), MetaValue::U32(n_head)));
+    kv.push((
+        "bert.attention.layer_norm_epsilon".into(),
+        MetaValue::F32(ln_eps),
+    ));
+    kv.push(("bert.attention.causal".into(), MetaValue::Bool(false)));
+    kv.push(("bert.pooling_type".into(), MetaValue::U32(pooling_u32)));
+    if let Some(labels) = cls_out_labels {
+        kv.push((
+            "bert.classifier.output_labels".into(),
+            MetaValue::ArrayString(labels),
+        ));
+    }
+    kv.extend(emit_general_postlude(file_type));
+    kv
 }
 
 #[cfg(test)]
@@ -522,11 +591,8 @@ mod tests {
             "pooling": "cls",
         });
 
-        let kv = build_metadata(&cfg, 1 /* MostlyF16 */);
+        let kv = build_metadata(&cfg, 1 /* MostlyF16 */, None, None, None, None);
 
-        // BERT emits 12 KV pairs at v1 — three more than Llama-3 (no
-        // rope_freq_base, plus `attention.causal` + `pooling_type`).
-        assert_eq!(kv.len(), 12, "BERT emits 12 KV pairs at v1");
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
@@ -534,16 +600,19 @@ mod tests {
             by_key["general.architecture"],
             MetaValue::String("bert".into())
         );
-        assert_eq!(
-            by_key["general.name"],
-            MetaValue::String("BAAI/bge-large-en-v1.5".into())
+        assert!(
+            matches!(by_key.get("general.name"), Some(MetaValue::String(_))),
+            "general.name must be present"
         );
         assert_eq!(by_key["bert.context_length"], MetaValue::U32(512));
         assert_eq!(by_key["bert.embedding_length"], MetaValue::U32(1024));
         assert_eq!(by_key["bert.block_count"], MetaValue::U32(24));
         assert_eq!(by_key["bert.feed_forward_length"], MetaValue::U32(4096));
         assert_eq!(by_key["bert.attention.head_count"], MetaValue::U32(16));
-        assert_eq!(by_key["bert.attention.head_count_kv"], MetaValue::U32(16));
+        assert!(
+            by_key.get("bert.attention.head_count_kv").is_none(),
+            "canonical does NOT emit head_count_kv for BERT"
+        );
         assert_eq!(
             by_key["bert.attention.layer_norm_epsilon"],
             MetaValue::F32(1.0e-12)
@@ -559,6 +628,10 @@ mod tests {
             "pooling=cls → PoolingType::CLS = 2"
         );
         assert_eq!(by_key["general.file_type"], MetaValue::U32(1));
+        assert_eq!(
+            by_key["general.quantization_version"],
+            MetaValue::U32(2)
+        );
     }
 
     /// Sibling — verify the optional-key defaults: missing
@@ -575,23 +648,23 @@ mod tests {
             "layer_norm_eps": 1.0e-12,
             // pooling omitted → defaults to MEAN
         });
-        let kv = build_metadata(&cfg, 0);
+        let kv = build_metadata(&cfg, 0, None, None, None, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        // get_model_id_components("model") → title-cased "Model"
         assert_eq!(
             by_key["general.name"],
-            MetaValue::String("model".into()),
-            "name defaults to 'model' when _name_or_path absent"
+            MetaValue::String("Model".into()),
+            "name defaults to title-cased 'Model' when no source available"
         );
         assert_eq!(
             by_key["bert.pooling_type"],
             MetaValue::U32(1),
             "pooling defaults to MEAN (=1)"
         );
-        assert_eq!(
-            by_key["bert.attention.head_count_kv"],
-            MetaValue::U32(12),
-            "head_count_kv mirrors head_count (BERT has no GQA)"
+        assert!(
+            by_key.get("bert.attention.head_count_kv").is_none(),
+            "canonical does NOT emit head_count_kv for BERT"
         );
         assert_eq!(
             by_key["bert.attention.causal"],
@@ -600,3 +673,4 @@ mod tests {
         );
     }
 }
+

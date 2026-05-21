@@ -582,6 +582,16 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // GGUF-side `_exps.` check — equivalent results).
     let size_label = compute_size_label_for_arch(arch, &src, &src.config);
     let ftype_u32 = ftype_for_metadata as u32;
+    // BERT: resolve pooling type via canonical's `_try_set_pooling_type`
+    // path (modules.json → "Pooling" mod's `path` key → 1_Pooling/
+    // config.json → pooling_mode_*_token bools). Returned as the
+    // canonical PoolingType enum u32 (0=NONE/RANK/MEAN/CLS/LAST per
+    // gguf.PoolingType).
+    let bert_pooling_override = if matches!(arch, ArchName::Bert) {
+        resolve_bert_pooling_type(&args.hf_dir)
+    } else {
+        None
+    };
     let arch_metadata = build_metadata_for_arch(
         arch,
         &src.config,
@@ -590,6 +600,7 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
         size_label.as_deref(),
         sampling.as_ref(),
         dir_basename.as_deref(),
+        bert_pooling_override,
     );
 
     // Canonical emits `general.quantization_version` and
@@ -917,6 +928,54 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
 /// (architectures / model_type / vision_config / text_config), and
 /// `build_hparams` was reading `num_attention_heads` from the outer
 /// config → MissingHparam error.
+/// Resolve BERT pooling type by walking `modules.json` to find a
+/// `*Pooling` entry's `path`, then reading that subdir's
+/// `config.json` for `pooling_mode_*_token` booleans. Port of
+/// canonical's `TextModel._try_set_pooling_type` at
+/// /opt/llama.cpp/conversion/base.py:1883-1915.
+///
+/// Returns `Some(PoolingType as u32)` if a Pooling module is found
+/// AND its config carries a recognized mode. Otherwise `None` (BERT
+/// build_metadata then falls back to `config["pooling"]` or MEAN).
+///
+/// PoolingType enum values match canonical's `gguf.PoolingType`:
+///   0 = NONE, 1 = MEAN, 2 = CLS, 3 = LAST, 4 = RANK.
+fn resolve_bert_pooling_type(model_dir: &std::path::Path) -> Option<u32> {
+    let modules_path = model_dir.join("modules.json");
+    let modules_raw = std::fs::read_to_string(&modules_path).ok()?;
+    let modules: serde_json::Value = serde_json::from_str(&modules_raw).ok()?;
+    let pooling_subdir = modules
+        .as_array()?
+        .iter()
+        .find_map(|m| {
+            let ty = m.get("type")?.as_str()?;
+            if ty.ends_with("Pooling") {
+                m.get("path")?.as_str().map(String::from)
+            } else {
+                None
+            }
+        })?;
+    let pooling_config_path = model_dir.join(pooling_subdir).join("config.json");
+    let pooling_raw = std::fs::read_to_string(&pooling_config_path).ok()?;
+    let pooling: serde_json::Value = serde_json::from_str(&pooling_raw).ok()?;
+    if pooling.get("pooling_mode_mean_tokens").and_then(|v| v.as_bool()) == Some(true) {
+        Some(1) // MEAN
+    } else if pooling.get("pooling_mode_cls_token").and_then(|v| v.as_bool()) == Some(true) {
+        Some(2) // CLS
+    } else if pooling.get("pooling_mode_lasttoken").and_then(|v| v.as_bool()) == Some(true) {
+        Some(3) // LAST
+    } else if let Some(mode) = pooling.get("pooling_mode").and_then(|v| v.as_str()) {
+        match mode {
+            "mean" => Some(1),
+            "cls" => Some(2),
+            "lasttoken" => Some(3),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
 pub fn effective_config(config: &serde_json::Value) -> &serde_json::Value {
     // Gemma 4 / Qwen3-VL-omni pattern: `text_config` is the text decoder.
     if let Some(text) = config.get("text_config") {
@@ -1033,6 +1092,7 @@ fn build_metadata_for_arch(
     size_label: Option<&str>,
     sampling: Option<&crate::convert::model_card::SamplingConfig>,
     model_dir_basename: Option<&str>,
+    bert_pooling_override: Option<u32>,
 ) -> Vec<(String, MetaValue)> {
     // Multimodal-wrapper flatten: text-decoder hparams live in
     // config["text_config"] for Gemma 4 / Qwen3-VL omni-shape configs.
@@ -1068,7 +1128,14 @@ fn build_metadata_for_arch(
             model_dir_basename,
         ),
         ArchName::Gemma4Mmproj => unreachable!("handled above"),
-        ArchName::Bert => bert::build_metadata(config, ftype),
+        ArchName::Bert => bert::build_metadata(
+            config,
+            ftype,
+            model_card,
+            sampling,
+            model_dir_basename,
+            bert_pooling_override,
+        ),
         ArchName::NomicBert => nomic_bert::build_metadata(config, ftype, model_card, size_label),
         ArchName::Qwen35Moe => qwen35moe::build_metadata(config, ftype),
         ArchName::Qwen35MoeFull => match build_qwen35moe_full_ctx(config) {

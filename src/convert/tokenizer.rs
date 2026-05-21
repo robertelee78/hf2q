@@ -405,6 +405,9 @@ pub fn build_tokenizer_metadata(
     let pad_id = resolve_special_token_id("pad_token", &tokenizer_config, &vocab_entries);
     let sep_id = resolve_special_token_id("sep_token", &tokenizer_config, &vocab_entries);
     let mask_id = resolve_special_token_id("mask_token", &tokenizer_config, &vocab_entries);
+    // BERT-class encoders only: cls/sep tokens substitute for bos/eos
+    // when those keys are absent (canonical vocab.py:194-197).
+    let cls_id = resolve_special_token_id("cls_token", &tokenizer_config, &vocab_entries);
 
     // For Unigram-tokenizer models (XLM-RoBERTa, sentencepiece-derived),
     // canonical reads per-token scores from `sentencepiece.bpe.model`
@@ -589,6 +592,106 @@ pub fn build_tokenizer_metadata(
         kv.push((
             "tokenizer.ggml.add_sep_token".into(),
             MetaValue::Bool(true),
+        ));
+    } else if arch == ArchName::Bert {
+        // BERT (BAAI bge / similar WordPiece encoders) emit order —
+        // canonical `BertModel.set_vocab` at /opt/llama.cpp/conversion/bert.py:39-66:
+        //   add_token_type_count(type_vocab_size)
+        //   phantom-prefix transform on tokens (▁ for normal, strip ##
+        //     for subword, leave CONTROL unchanged)
+        //   add_tokenizer_model("bert")
+        //   add_tokenizer_pre(tokpre)              ← right after model
+        //   add_token_list(tokens)
+        //   add_token_types(toktypes)
+        //   SpecialVocab.add_to_gguf:
+        //     - no merges (WordPiece has no merges)
+        //     - bos (=cls fallback), eos (=sep fallback), unk, sep, pad, mask
+        //     - add_bos_token, add_eos_token (TemplateProcessing parse),
+        //       add_sep_token (defaults to False)
+        //
+        // Apply phantom transform per bert.py:48-54: tokens are mutated
+        // in-place at this point. CONTROL keeps original; ## prefix
+        // stripped; else prepend U+2581.
+        let phantom_tokens: Vec<String> = tokens
+            .iter()
+            .zip(token_types.iter())
+            .map(|(tok, ty)| {
+                if *ty == TOKEN_TYPE_CONTROL {
+                    tok.clone()
+                } else if let Some(stripped) = tok.strip_prefix("##") {
+                    stripped.to_string()
+                } else {
+                    format!("\u{2581}{tok}")
+                }
+            })
+            .collect();
+        let type_vocab_size = read_type_vocab_size_from_config(model_dir).unwrap_or(1);
+        kv.push((
+            "tokenizer.ggml.token_type_count".into(),
+            MetaValue::U32(type_vocab_size),
+        ));
+        kv.push((
+            "tokenizer.ggml.model".into(),
+            MetaValue::String(tokenizer_model_name),
+        ));
+        kv.push((
+            "tokenizer.ggml.pre".into(),
+            MetaValue::String(pre_tokenizer),
+        ));
+        kv.push((
+            "tokenizer.ggml.tokens".into(),
+            MetaValue::ArrayString(phantom_tokens),
+        ));
+        kv.push((
+            "tokenizer.ggml.token_type".into(),
+            MetaValue::ArrayI32(token_types),
+        ));
+        // BERT bge has no bos/eos in tokenizer_config.json; canonical's
+        // SpecialVocab._try_load_from_tokenizer_json at vocab.py:194-197
+        // falls back: bos = cls (=101 for [CLS]), eos = sep (=102 for [SEP]).
+        let bos_resolved = bos_id.or(cls_id);
+        let eos_resolved = eos_id.or(sep_id);
+        if let Some(id) = bos_resolved {
+            kv.push(("tokenizer.ggml.bos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = eos_resolved {
+            kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = unk_id {
+            kv.push((
+                "tokenizer.ggml.unknown_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        if let Some(id) = sep_id {
+            kv.push((
+                "tokenizer.ggml.seperator_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        if let Some(id) = pad_id {
+            kv.push((
+                "tokenizer.ggml.padding_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        if let Some(id) = mask_id {
+            kv.push((
+                "tokenizer.ggml.mask_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        kv.push((
+            "tokenizer.ggml.add_bos_token".into(),
+            MetaValue::Bool(true),
+        ));
+        kv.push((
+            "tokenizer.ggml.add_eos_token".into(),
+            MetaValue::Bool(true),
+        ));
+        kv.push((
+            "tokenizer.ggml.add_sep_token".into(),
+            MetaValue::Bool(false),
         ));
     } else if arch == ArchName::Llama3 {
         // Llama 3 BPE / gpt2 emit order — canonical
@@ -996,8 +1099,14 @@ fn determine_pre_tokenizer_type(arch: ArchName) -> String {
         ArchName::Gemma4 | ArchName::Gemma4Mmproj => "gemma4".into(),
         // llama-vocab.cpp:1951-1959 — LLaMA 3 BPE family.
         ArchName::Llama3 | ArchName::MiniMaxM2 => "llama-bpe".into(),
-        // Bert + Nomic-BERT use the default pre-tokenizer.
-        ArchName::Bert | ArchName::NomicBert => "default".into(),
+        // BERT: BAAI bge tokenizer hashes to the same chkhsh as
+        // jinaai/jina-embeddings-v2-base-en
+        // (`0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f`)
+        // → canonical maps both to `jina-v2-en` per base.py:1431-1433.
+        // The hash collision is intentional — same tokenizer config.
+        ArchName::Bert => "jina-v2-en".into(),
+        // Nomic-BERT uses the default pre-tokenizer.
+        ArchName::NomicBert => "default".into(),
         // Falcon is a `target_for` placeholder, never reaches convert-v2.
         ArchName::Falcon => "default".into(),
     }
@@ -1423,3 +1532,4 @@ mod tests {
         }
     }
 }
+
