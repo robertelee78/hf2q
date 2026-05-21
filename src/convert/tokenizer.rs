@@ -593,6 +593,78 @@ pub fn build_tokenizer_metadata(
             "tokenizer.ggml.add_sep_token".into(),
             MetaValue::Bool(true),
         ));
+    } else if arch == ArchName::Qwen3VlText {
+        // Qwen3-VL Text decoder emit order — canonical
+        // `Qwen2Model.set_vocab` calls `_set_vocab_gpt2` (base.py:1603-1611):
+        //   model = 'gpt2'
+        //   pre = 'qwen2'  ← right after model
+        //   tokens, token_type, merges
+        //   SpecialVocab.add_to_gguf:
+        //     - special tokens in INSERTION ORDER (Python dict): the
+        //       tokenizer.json path sets eos + pad (via the
+        //       tokenizer_config bos=null, eos="<|im_end|>",
+        //       pad="<|endoftext|>" flow at vocab.py:294-313), THEN
+        //       config.json fills bos via _try_load_from_config_json
+        //       (vocab.py:316-328 reads `bos_token_id` from config.json,
+        //       lands at 151643). Net iteration order: eos, pad, bos.
+        //     - add_bos_token from tokenizer_config's `add_bos_token: false`
+        //       (canonical vocab.py:294-297).
+        //   chat_template emitted at the end via add_chat_template.
+        //
+        // No `scores` (BPE doesn't call add_token_scores).
+        // No `add_space_prefix`.
+        // No `unknown_token_id` / `seperator_token_id` / `mask_token_id`
+        //   (not present in tokenizer_config for Qwen3-VL).
+        kv.push((
+            "tokenizer.ggml.model".into(),
+            MetaValue::String(tokenizer_model_name),
+        ));
+        kv.push((
+            "tokenizer.ggml.pre".into(),
+            MetaValue::String(pre_tokenizer),
+        ));
+        kv.push((
+            "tokenizer.ggml.tokens".into(),
+            MetaValue::ArrayString(tokens),
+        ));
+        kv.push((
+            "tokenizer.ggml.token_type".into(),
+            MetaValue::ArrayI32(token_types),
+        ));
+        if !merges.is_empty() {
+            kv.push((
+                "tokenizer.ggml.merges".into(),
+                MetaValue::ArrayString(merges),
+            ));
+        }
+        // Canonical insertion order: eos → pad → bos
+        // (tokenizer_config sets eos+pad first via SpecialVocab's
+        // _try_load_from_tokenizer_json; config.json then adds bos via
+        // _try_load_from_config_json since bos isn't yet set).
+        if let Some(id) = eos_id {
+            kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = pad_id {
+            kv.push((
+                "tokenizer.ggml.padding_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
+        // bos_id from config.json's `bos_token_id` (NOT
+        // tokenizer_config's `bos_token` which is null for Qwen3-VL).
+        // Read directly from config.json via the helper below.
+        let bos_from_config = read_bos_token_id_from_config(model_dir);
+        if let Some(id) = bos_from_config.or(bos_id) {
+            kv.push(("tokenizer.ggml.bos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(cfg) = tokenizer_config.as_ref() {
+            if let Some(v) = cfg.get("add_bos_token").and_then(|v| v.as_bool()) {
+                kv.push((
+                    "tokenizer.ggml.add_bos_token".into(),
+                    MetaValue::Bool(v),
+                ));
+            }
+        }
     } else if arch == ArchName::Bert {
         // BERT (BAAI bge / similar WordPiece encoders) emit order —
         // canonical `BertModel.set_vocab` at /opt/llama.cpp/conversion/bert.py:39-66:
@@ -938,6 +1010,24 @@ fn resolve_gemma_chat_template(
 /// Read `type_vocab_size` from `config.json`. Defaults to 1 if absent
 /// (matches canonical `bert.py:233` —
 /// `self.hparams.get("type_vocab_size", 1)`).
+/// Read `bos_token_id` from `<dir>/config.json` (NOT
+/// tokenizer_config.json). Used by Qwen3-VL tokenizer branch
+/// since its tokenizer_config has `bos_token: null` but its
+/// config.json carries an explicit `bos_token_id: 151643`.
+///
+/// Mirrors canonical's `SpecialVocab._try_load_from_config_json`
+/// (vocab.py:316-328) which iterates special_token_types and reads
+/// `<typ>_token_id` from the HF config.
+fn read_bos_token_id_from_config(dir: &Path) -> Option<u32> {
+    let path = dir.join("config.json");
+    let s = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    v.get("bos_token_id")
+        .or_else(|| v.get("text_config").and_then(|tc| tc.get("bos_token_id")))
+        .and_then(|x| x.as_u64())
+        .map(|n| n as u32)
+}
+
 fn read_type_vocab_size_from_config(dir: &Path) -> Option<u32> {
     let path = dir.join("config.json");
     let s = std::fs::read_to_string(&path).ok()?;
@@ -1532,4 +1622,5 @@ mod tests {
         }
     }
 }
+
 

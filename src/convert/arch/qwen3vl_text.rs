@@ -245,12 +245,34 @@ fn count_deepstack_layers(config: &serde_json::Value) -> u32 {
 ///
 /// `file_type` is the chosen `LlamaFtype` as a `u32` (matches
 /// `gguf_writer.add_file_type(self.ftype)` at base.py:1220).
-pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String, MetaValue)> {
-    let name = config
-        .get("_name_or_path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("model")
-        .to_string();
+pub fn build_metadata(
+    config: &serde_json::Value,
+    file_type: u32,
+    model_card: Option<&crate::convert::model_card::ModelCard>,
+    sampling: Option<&crate::convert::model_card::SamplingConfig>,
+    model_dir_basename: Option<&str>,
+    n_deepstack_override: Option<u32>,
+) -> Vec<(String, MetaValue)> {
+    use crate::convert::model_card::{
+        emit_general_postlude, emit_general_prelude, get_model_id_components,
+    };
+    // Qwen3-VL config.json's `_name_or_path` typically points at a
+    // local snapshot dir. Prefer the model directory's basename for
+    // get_model_id_components, matching canonical's behavior.
+    let raw_name = model_dir_basename
+        .map(|s| s.to_string())
+        .or_else(|| {
+            config
+                .get("_name_or_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "model".to_string());
+    let id_components = get_model_id_components(&raw_name);
+    let display_name = id_components
+        .name
+        .clone()
+        .unwrap_or_else(|| raw_name.clone());
 
     let hidden_size = config["hidden_size"]
         .as_u64()
@@ -286,18 +308,20 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
         .and_then(|v| v.as_u64())
         .map(|x| x as u32);
 
-    // M-RoPE (multi-modal RoPE) section split, optional. Per
+    // M-RoPE (multi-modal RoPE) section split. Per
     // `base.py:1174-1180`: pad to 4 entries with trailing zeros, take
-    // first 4. Present on every Qwen3-VL release; absent on text-only
-    // Qwen3 variants.
-    let mrope_section: Option<Vec<u32>> = config
+    // first 4. Canonical emits as INT32 array (ArrayI32) — checked
+    // against `Qwen-Qwen3-VL-8B-Instruct_canonical_q4_k_m.gguf` dump
+    // position 21: `[INT32] | 4 | qwen3vl.rope.dimension_sections =
+    // [24, 20, 20, 0]`.
+    let mrope_section: Option<Vec<i32>> = config
         .get("rope_scaling")
         .and_then(|rs| rs.get("mrope_section"))
         .and_then(|m| m.as_array())
         .map(|arr| {
-            let mut out: Vec<u32> = arr
+            let mut out: Vec<i32> = arr
                 .iter()
-                .filter_map(|v| v.as_u64().map(|x| x as u32))
+                .filter_map(|v| v.as_i64().map(|x| x as i32))
                 .collect();
             while out.len() < 4 {
                 out.push(0);
@@ -306,20 +330,39 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
             out
         });
 
-    let n_deepstack = count_deepstack_layers(config);
+    // n_deepstack_layers comes from vision_config which lives at the
+    // ORIGINAL config level (sibling to text_config). The caller
+    // (cli_driver) has access to the un-unwrapped config and computes
+    // this before invoking us. Fall back to the local-config probe
+    // (works only on non-multimodal-wrapper variants).
+    let n_deepstack = n_deepstack_override.unwrap_or_else(|| count_deepstack_layers(config));
 
-    let mut kv: Vec<(String, MetaValue)> = Vec::with_capacity(16);
-    kv.push((
-        "general.architecture".into(),
-        MetaValue::String("qwen3vl".into()),
-    ));
-    kv.push(("general.name".into(), MetaValue::String(name)));
+    // Canonical `general.*` prelude — architecture, type, sampling.*,
+    // name, version/organization/finetune/basename, size_label,
+    // license, base_model.*, tags, languages.
+    let mut kv: Vec<(String, MetaValue)> = emit_general_prelude(
+        "qwen3vl",
+        display_name,
+        &id_components,
+        None,
+        model_card,
+        sampling,
+    );
+    // Canonical Qwen3-VL arch-KV emit order (verified against
+    // /opt/hf2q/cache/byte_cmp/Qwen-Qwen3-VL-8B-Instruct_canonical_q4_k_m.gguf
+    // dump positions 15-26):
+    //   block_count, context_length, embedding_length,
+    //   feed_forward_length, attention.head_count,
+    //   attention.head_count_kv, rope.dimension_sections,
+    //   rope.freq_base, attention.layer_norm_rms_epsilon,
+    //   attention.key_length, attention.value_length,
+    //   n_deepstack_layers
+    kv.push(("qwen3vl.block_count".into(), MetaValue::U32(n_layers)));
     kv.push(("qwen3vl.context_length".into(), MetaValue::U32(ctx_len)));
     kv.push((
         "qwen3vl.embedding_length".into(),
         MetaValue::U32(hidden_size),
     ));
-    kv.push(("qwen3vl.block_count".into(), MetaValue::U32(n_layers)));
     kv.push((
         "qwen3vl.feed_forward_length".into(),
         MetaValue::U32(ffn_len),
@@ -332,27 +375,26 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
         "qwen3vl.attention.head_count_kv".into(),
         MetaValue::U32(n_head_kv),
     ));
+    if let Some(sections) = mrope_section {
+        kv.push((
+            "qwen3vl.rope.dimension_sections".into(),
+            MetaValue::ArrayI32(sections),
+        ));
+    }
+    kv.push(("qwen3vl.rope.freq_base".into(), MetaValue::F32(rope_theta)));
+    kv.push((
+        "qwen3vl.attention.layer_norm_rms_epsilon".into(),
+        MetaValue::F32(rms_eps),
+    ));
     if let Some(hd) = head_dim {
         kv.push(("qwen3vl.attention.key_length".into(), MetaValue::U32(hd)));
         kv.push(("qwen3vl.attention.value_length".into(), MetaValue::U32(hd)));
     }
     kv.push((
-        "qwen3vl.attention.layer_norm_rms_epsilon".into(),
-        MetaValue::F32(rms_eps),
-    ));
-    kv.push(("qwen3vl.rope.freq_base".into(), MetaValue::F32(rope_theta)));
-    if let Some(sections) = mrope_section {
-        kv.push((
-            "qwen3vl.rope.dimension_sections".into(),
-            MetaValue::ArrayU32(sections),
-        ));
-    }
-    kv.push((
         "qwen3vl.n_deepstack_layers".into(),
         MetaValue::U32(n_deepstack),
     ));
-    kv.push(("general.file_type".into(), MetaValue::U32(file_type)));
-
+    kv.extend(emit_general_postlude(file_type));
     kv
 }
 
@@ -558,7 +600,7 @@ mod tests {
             },
         });
 
-        let kv = build_metadata(&cfg, 17 /* MostlyQ5_K_M */);
+        let kv = build_metadata(&cfg, 17 /* MostlyQ5_K_M */, None, None, None, None);
 
         // 16 KV pairs when head_dim + mrope_section + deepstack are all present:
         //   architecture, name, context_length, embedding_length, block_count,
@@ -640,7 +682,7 @@ mod tests {
             // vision_config omitted → n_deepstack_layers = 0
             // _name_or_path omitted → defaults to "model"
         });
-        let kv = build_metadata(&cfg, 0);
+        let kv = build_metadata(&cfg, 0, None, None, None, None);
         // With head_dim absent and mrope absent: 15 - 2 (key+value length) - 1
         // (mrope_sections) = 12 entries.
         assert_eq!(kv.len(), 12, "12 KVs when head_dim + mrope absent");
@@ -706,7 +748,7 @@ mod tests {
                 }
             },
         });
-        let kv = build_metadata(&cfg, 0);
+        let kv = build_metadata(&cfg, 0, None, None, None, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         assert_eq!(
@@ -730,7 +772,7 @@ mod tests {
             "rms_norm_eps": 1.0e-6,
         });
         for &ftype in &[0u32, 1, 7, 15, 17, 23] {
-            let kv = build_metadata(&cfg, ftype);
+            let kv = build_metadata(&cfg, ftype, None, None, None, None);
             let by_key: std::collections::HashMap<_, _> =
                 kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
             assert_eq!(

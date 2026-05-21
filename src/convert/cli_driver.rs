@@ -592,6 +592,23 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     } else {
         None
     };
+    // Qwen3-VL deepstack count comes from vision_config (sibling to
+    // text_config at root). After `effective_config()` unwraps to
+    // text_config the vision_config is invisible — so we read it from
+    // the original src.config here. Mirrors canonical
+    // /opt/llama.cpp/conversion/qwen3vl.py:255-258 path.
+    let qwen3vl_n_deepstack = if matches!(arch, ArchName::Qwen3VlText) {
+        let vc = src
+            .config
+            .get("thinker_config")
+            .and_then(|tc| tc.get("vision_config"))
+            .or_else(|| src.config.get("vision_config"));
+        vc.and_then(|v| v.get("deepstack_visual_indexes"))
+            .and_then(|a| a.as_array())
+            .map(|a| a.len() as u32)
+    } else {
+        None
+    };
     let arch_metadata = build_metadata_for_arch(
         arch,
         &src.config,
@@ -601,6 +618,7 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
         sampling.as_ref(),
         dir_basename.as_deref(),
         bert_pooling_override,
+        qwen3vl_n_deepstack,
     );
 
     // Canonical emits `general.quantization_version` and
@@ -1093,6 +1111,7 @@ fn build_metadata_for_arch(
     sampling: Option<&crate::convert::model_card::SamplingConfig>,
     model_dir_basename: Option<&str>,
     bert_pooling_override: Option<u32>,
+    qwen3vl_n_deepstack: Option<u32>,
 ) -> Vec<(String, MetaValue)> {
     // Multimodal-wrapper flatten: text-decoder hparams live in
     // config["text_config"] for Gemma 4 / Qwen3-VL omni-shape configs.
@@ -1147,7 +1166,14 @@ fn build_metadata_for_arch(
             // for every tensor when ctx is missing.
             None => qwen35moe::build_metadata(config, ftype),
         },
-        ArchName::Qwen3VlText => qwen3vl_text::build_metadata(config, ftype),
+        ArchName::Qwen3VlText => qwen3vl_text::build_metadata(
+            config,
+            ftype,
+            model_card,
+            sampling,
+            model_dir_basename,
+            qwen3vl_n_deepstack,
+        ),
         ArchName::MiniMaxM2 => minimax_m2::build_metadata(config, ftype),
         // Falcon is a placeholder in ArchName for target_for's branch
         // expression; it is NOT a convert-v2 supported arch. Reaching
