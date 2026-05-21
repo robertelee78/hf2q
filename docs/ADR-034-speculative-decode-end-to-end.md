@@ -335,9 +335,10 @@ The net HF → GGUF table (citing both the converter remap step and the tensor_m
 | `mtp.layers.0.self_attn.o_proj.weight` | `blk.{N}.attn_output.weight` | — |
 | `mtp.layers.0.self_attn.q_norm.weight` | `blk.{N}.attn_q_norm.weight` | Per-head Q norm (Qwen3 quirk). **✅ `+1` baked** (post-remap matches rule). |
 | `mtp.layers.0.self_attn.k_norm.weight` | `blk.{N}.attn_k_norm.weight` | Per-head K norm. **✅ `+1` baked** (post-remap matches rule). |
-| `mtp.layers.0.mlp.gate_proj.weight` | `blk.{N}.ffn_gate.weight` | Inner FFN is **dense**, not MoE — even for MoE-A3B targets. |
-| `mtp.layers.0.mlp.up_proj.weight` | `blk.{N}.ffn_up.weight` | — |
-| `mtp.layers.0.mlp.down_proj.weight` | `blk.{N}.ffn_down.weight` | — |
+| `mtp.layers.0.mlp.gate_proj.weight` (dense MTP variant) | `blk.{N}.ffn_gate.weight` | Dense path. **CORRECTION 2026-05-21**: ADR-034's original claim "Inner FFN is dense even for MoE-A3B targets" was **falsified empirically** during prep deep-research — see MoE row below. |
+| `mtp.layers.0.mlp.experts.{E}.{gate,up,down}_proj.weight` (MoE MTP — Qwen 3.5/3.6 35B-A3B) | `blk.{N}.{ffn_gate_exps,ffn_up_exps,ffn_down_exps}.weight` + `blk.{N}.ffn_gate_inp.weight` + `blk.{N}.ffn_{gate,up,down}_shexp.weight` + `blk.{N}.ffn_gate_inp_shexp.weight` | **Inner FFN matches main-stack FFN topology** — MoE for MoE-A3B targets, dense for dense targets. Verified: `/opt/hf2q/models/Qwen-Qwen3.5-35B-A3B/model.safetensors.index.json` has 773 `mtp.layers.0.mlp.experts.*` tensors; canonical Q4_K_M output emits 16 MoE-style tensors at `blk.40.*`. The current hf2q MTP loader (`src/inference/models/qwen35/mtp_weights_load.rs:268-291`) hardcodes the dense path → **fails to load canonical MoE-MTP GGUFs** (typed error: `tensor 'blk.40.ffn_gate.weight' not found`). P3 must fix this. See [[project_adr034_mtp_loader_moe_bug_2026_05_21]]. |
+| `mtp.layers.0.mlp.up_proj.weight` (dense path only) | `blk.{N}.ffn_up.weight` | — |
+| `mtp.layers.0.mlp.down_proj.weight` (dense path only) | `blk.{N}.ffn_down.weight` | — |
 | (Qwen 3.5 `attn_output_gate=true` variant) `mtp.layers.0.self_attn.gate_proj.weight` | `blk.{N}.attn_gate.weight` | Output-gate path; matched per `attn_output_gate` flag in config. |
 
 **GGUF metadata keys** (re-derived from `/opt/llama.cpp/src/llama-arch.cpp:194,448-453`):
