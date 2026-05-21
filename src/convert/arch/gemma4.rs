@@ -791,6 +791,37 @@ pub fn build_metadata(
         ));
     }
 
+    // `final_logit_softcapping` — Gemma 3+ specific. Canonical
+    // `gemma.py:147-148` emits when present in hparams.
+    if let Some(softcap) = config
+        .get("final_logit_softcapping")
+        .and_then(|v| v.as_f64())
+    {
+        kv.push((
+            "gemma4.final_logit_softcapping".into(),
+            MetaValue::F32(softcap as f32),
+        ));
+    }
+
+    // `rope.freq_base_swa` — sliding-window RoPE theta. Canonical
+    // `base.py:1185-1187` emits via
+    // `rope_parameters["sliding_attention"]["rope_theta"]`. For
+    // Gemma 4 the SWA layers use a separate (smaller) theta than
+    // the global layers; verified against canonical dump where
+    // `rope.freq_base = 1000000` (global) and
+    // `rope.freq_base_swa = 10000` (SWA).
+    if let Some(swa_theta) = config
+        .get("rope_parameters")
+        .and_then(|v| v.get("sliding_attention"))
+        .and_then(|v| v.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+    {
+        kv.push((
+            "gemma4.rope.freq_base_swa".into(),
+            MetaValue::F32(swa_theta as f32),
+        ));
+    }
+
     // Canonical emits `general.quantization_version` + `general.file_type`
     // LAST (positions 49-50 in the Q4_K_M dump). `cli_driver` pulls
     // these out of the prelude into a postlude that emits after the
