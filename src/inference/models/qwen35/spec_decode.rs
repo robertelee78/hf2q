@@ -629,6 +629,19 @@ impl<'a> SpecDecode<'a> {
                             // bonus sampled from target_probs_per_pos[spec_k].
                             // Apply the same row-cap to next_iter_hidden_row
                             // that the greedy path uses (Step 6 Strategy A).
+                            //
+                            // KNOWN ARCHITECTURAL LIMITATION (not a bug):
+                            // hidden_t (next_iter) comes from verify_hidden[0]
+                            // (capped) while `continuation` is sampled from
+                            // row spec_k's distribution. Greedy has the same
+                            // mismatch (row spec_k argmax vs row 0 hidden);
+                            // MH amplifies it via temperature variance. The
+                            // K=2 attractor collapse documented at
+                            // project_adr034_task91_step4_falsified_2026_05_21
+                            // is the empirical consequence. Closing this
+                            // requires task #89 (cross-length SDPA to unify
+                            // batched vs decode kernel) or tree decoding
+                            // (multiple candidates avoid compounding-draft).
                             generated.push(continuation);
                             let hidden_row_cap: u64 = match std::env::var(
                                 "HF2Q_SPEC_DECODE_KN_HIDDEN_ROW_CAP",
