@@ -432,6 +432,22 @@ impl<'a> SpecDecode<'a> {
                         spec_k, self.sampler.temperature,
                     );
                 }
+                // ADR-034 task #90 Step 4 (2026-05-21) — lazy allocate the
+                // per-LA-slot capture buffer ONCE on first K=N iter. Subsequent
+                // iters reuse (ensure_la_capture is idempotent at same
+                // n_tokens_max). The buffer size covers spec_k+1 positions
+                // (1 verified token + spec_k drafts batched). Once allocated
+                // forward_gpu_impl detects la_capture_active and routes the
+                // LA layer dispatch through dispatch_gated_delta_net_decode_with_capture
+                // via build_delta_net_layer (Step 3 wiring). On partial-reject
+                // below we copy capture[accepted_idx] → recurrent.
+                if self.stats.proposed == 0 {
+                    self.verifier.with_gpu_cache_mut(|device, _registry| {
+                        self.kv_cache
+                            .ensure_la_capture(&self.verifier.cfg, device, (spec_k + 1) as u32)
+                            .context("K=N: ensure_la_capture")
+                    })?;
+                }
                 let hidden_size_u32 = self.verifier.cfg.hidden_size;
                 let vsz = vocab as usize;
                 let mtp_t0 = if mtp_profile { Some(Instant::now()) } else { None };
@@ -612,6 +628,24 @@ impl<'a> SpecDecode<'a> {
                     self.kv_cache.truncate_mtp_to(
                         prior_mtp_len + valid_count,
                     );
+                    // ADR-034 task #90 Step 4 (2026-05-21) — roll back the
+                    // DeltaNet recurrent state via the per-position capture
+                    // buffer. accepted_idx = `accepted` (the LA state AFTER
+                    // the `accepted`-th token of the batch, which is the
+                    // last token whose prefix was correct). The next iter's
+                    // forward will read `recurrent` (active) and start fresh
+                    // from that state.
+                    //
+                    // Without this, K>=2 on hybrid Qwen 3.5/3.6 degenerates
+                    // because the DeltaNet recurrent state has been advanced
+                    // by spec_k+1 tokens (during the batched verify) but
+                    // only `accepted+1` of those tokens are valid; the next
+                    // iter would attend over a stale state ahead by
+                    // `spec_k - accepted` steps. See task #86 root-cause
+                    // memo for the "the the the..." attractor empirics.
+                    self.kv_cache
+                        .rollback_la_to(accepted as u32)
+                        .context("K=N partial-reject: rollback_la_to")?;
                 }
 
                 // State update for next iter.

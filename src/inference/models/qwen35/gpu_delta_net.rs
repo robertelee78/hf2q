@@ -2478,13 +2478,38 @@ pub fn build_delta_net_layer(
             // test coverage and any future architecture with D_k != 128.
             let decode_kernel_eligible = d_k % 32 == 0 && d_k <= 128;
             if decode_kernel_eligible {
-                dispatch_gated_delta_net_decode(
-                    &mut enc, registry, device.metal_device(),
-                    &q_scaled, &k_normed, &v_gpu,
-                    &g_buf, &beta_buf, state_in,
-                    &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
-                ).context("dispatch_gated_delta_net_decode prefill")?;
+                // ADR-034 task #90 Step 4 codex audit (2026-05-21) — the
+                // seq > 1 prefill branch was IGNORING state_capture even
+                // when set. Route through dispatch_gated_delta_net_decode
+                // _with_capture when capture is engaged, else legacy
+                // dispatch_gated_delta_net_decode (byte-identical to
+                // pre-Step-4).
+                if let Some(capture_buf) = state_capture {
+                    use mlx_native::ops::gated_delta_net_decode::dispatch_gated_delta_net_decode_with_capture;
+                    dispatch_gated_delta_net_decode_with_capture(
+                        &mut enc, registry, device.metal_device(),
+                        &q_scaled, &k_normed, &v_gpu,
+                        &g_buf, &beta_buf, state_in,
+                        &attn_out_buf, state_out, &gdn_params_buf, capture_buf,
+                        gdn_params,
+                    ).context("dispatch_gated_delta_net_decode_with_capture prefill (K=N spec)")?;
+                } else {
+                    dispatch_gated_delta_net_decode(
+                        &mut enc, registry, device.metal_device(),
+                        &q_scaled, &k_normed, &v_gpu,
+                        &g_buf, &beta_buf, state_in,
+                        &attn_out_buf, state_out, &gdn_params_buf, gdn_params,
+                    ).context("dispatch_gated_delta_net_decode prefill")?;
+                }
             } else {
+                if state_capture.is_some() {
+                    return Err(anyhow!(
+                        "build_delta_net_layer prefill: state_capture is Some but \
+                         D_k={} not decode-kernel-eligible (D_k % 32 == 0 && D_k <= 128); \
+                         capture path requires NSG-compatible shape.",
+                        d_k
+                    ));
+                }
                 dispatch_gated_delta_net(
                     &mut enc, registry, device.metal_device(),
                     &q_scaled, &k_normed, &v_gpu,

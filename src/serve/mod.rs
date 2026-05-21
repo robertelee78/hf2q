@@ -2967,11 +2967,22 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
             args.temperature as f32,
             0,
         );
+        // ADR-034 task #90 Step 4 codex audit (2026-05-21) — honor
+        // --ignore-eos by passing an EMPTY eos set when ignore_eos=true.
+        // Was previously bug: spec_decode path silently kept the EOS set
+        // even at --ignore-eos, causing K=N generation to stop at
+        // <|im_end|> after ~8-14 tokens. Mirrors the dispatch_dflash_cli
+        // pattern at src/serve/spec_decode_cli.rs:123.
+        let effective_eos_for_spec: Vec<u32> = if args.ignore_eos {
+            Vec::new()
+        } else {
+            eos_token_ids.clone()
+        };
         let result = SpecDecode::run_with_sampler_eos_set(
             &model,
             &prompt_tokens,
             args.max_tokens,
-            eos_token_ids.clone(),
+            effective_eos_for_spec,
             max_seq as u32,
             sampler,
         )

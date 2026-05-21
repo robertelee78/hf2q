@@ -2374,7 +2374,21 @@ impl Qwen35Model {
         // typical DN shape (h, n_k_heads, n_v_heads, d_k, d_v) drawn from
         // the GGUF config — sums to a few hundred MB across the 23 slots,
         // well within M5 Max 128 GB unified memory.
+        // ADR-034 task #90 Step 4 (2026-05-21) — when any LA slot has
+        // capture_states allocated (signals K=N speculative decode is
+        // active), force the non-arena decode path so build_delta_net_layer
+        // can route through dispatch_gated_delta_net_decode_with_capture
+        // (Step 3). The arena variant (build_delta_net_layer_with_arena)
+        // dispatches the chunked-prefill kernel which doesn't write
+        // per-position capture; bypassing it for small-batch K=N spec
+        // verify (seq_len ∈ [2, 8]) is acceptable — the arena perf gain
+        // doesn't amortize at small seq anyway.
+        let la_capture_active = kv_cache
+            .linear_attn
+            .iter()
+            .any(|s| s.capture_states.is_some());
         let mut dn_prefill_arena: Option<super::DnPrefillArena> = if seq_len > 1
+            && !la_capture_active
             && layer_weights_gpu.iter().any(|l| matches!(l, LayerWeightsGpu::LinearAttn { .. }))
         {
             let dn_shape = DeltaNetLayerShape::from_config(cfg);
