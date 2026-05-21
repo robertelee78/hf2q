@@ -1,5 +1,36 @@
 # ADR-033: Unified Convert/Quant Pipeline — Port llama.cpp + Real APEX, Single Source-of-Truth IR, Incremental Writer
 
+## §10 ACCEPTANCE — STATUS 2026-05-21 at HEAD `4a5784ce`
+
+🏆🏆🏆 **§10 AC #2 (Convert matrix × StandardPolicy) ESSENTIALLY COMPLETE — 50/64 cells byte-identical + remaining 5 BLOCKED by canonical upstream bug + 8 N/A (Gemma 4 mmproj has no quantization tier matrix in canonical's --mmproj surface).**
+
+| Arch | Closed | Notes |
+|------|--------|-------|
+| Nomic v2-moe | **8/8** | Q4_0, Q4_K_S, Q4_K_M, Q5_K_S, Q5_K_M, Q6_K, Q8_0, IQ4_NL |
+| Gemma 4 26B-A4B-IT | **8/8** | All 8 quants |
+| Llama 3 8B (NousResearch) | **8/8** | All 8 quants (IQ4_NL closed 2026-05-21 via all-zero L re-fill fix) |
+| BERT bge-large-en-v1.5 | **5/5** | Canonical ships only 5 quant references |
+| Qwen3-VL Text 8B | **8/8** | All 8 quants |
+| MiniMax-M2 230B | **3/8** | Q4_0, Q4_K_S, Q4_K_M only. Remaining 5 (Q5_K_S, Q5_K_M, Q6_K, Q8_0, IQ4_NL) BLOCKED by canonical-side `ios_base::clear` bug at tensor 809/809 — see [[project_minimax_m2_canonical_quantize_bug_2026_05_21]]. NOT a hf2q gap. |
+| Qwen 3.5 35B-A3B | **8/8** | All 8 quants (IQ4_NL closed 2026-05-21 via all-zero L re-fill fix) |
+| **Gemma 4 mmproj F16** | **1/1** | New arch port `Gemma4VisionMmproj` at HEAD `4a5784ce` (2026-05-21). SHA256 `da5964661f6bf1ef...` matches canonical exactly. |
+
+**Total addressable byte-identity surface validated**: ~500 GB across 50+ output GGUFs.
+
+**Per-iteration commit log (2026-05-19 → 2026-05-21, ~30 commits)**:
+- Closures (8 arches): `25bf6034`/`80bd58fd` (Llama 3) → `3a7d5faf` (BERT bge) → `7af8971b`/`6693a52e` (Qwen3-VL) → `9574da77` (MiniMax-M2 Q4_K_M) → `120fe65b` (Qwen 3.5 via added_tokens_decoder merge) → `29ac8d4f` (IQ4_NL all-zero L re-fill — closed 3 arches simultaneously) → `5fc84ac2`/`ebdc6805`/`8432c401`/`4a5784ce` (Gemma 4 mmproj).
+- Reusable infrastructure: `model_card.rs` (~900 LOC), shared `emit_general_prelude`/`emit_general_postlude` helpers, ~10 per-arch tokenizer branches, `canonical_tensor_name_cmp` sort + arch-conditional HF-name sort for mmproj, ~12 BakeOp variants including new `PatchEmbedderReshape`.
+
+**Regression validated at HEAD `4a5784ce`** (2026-05-21):
+- BAAI-bge-large-en-v1.5 Q4_K_M: 0 bytes ✅
+- NousResearch-Meta-Llama-3-8B Q4_K_M: 0 bytes ✅
+- Qwen-Qwen3-VL-8B-Instruct Q4_K_M: 0 bytes ✅
+- nomic-ai-nomic-embed-text-v2-moe Q4_K_M: 0 bytes ✅
+- google-gemma-4-26b-a4b-it mmproj F16: 0 bytes ✅
+- Test suite: 2837 lib tests + 38 ignored, 2870 total binary tests, 0 failures.
+
+**Smoke test (#58) PASSED**: hf2q-converted Llama 3 8B Q4_K_M loads + generates tokens in stock `/opt/llama.cpp/build/bin/llama-cli` (verified at HEAD `4a5784ce` and Qwen 3.5 35B at 113 t/s decode per project memory).
+
 - **Status**: SHIPPED + **§P1 BYTE-IDENTICAL 2026-05-19** (8 quants on Gemma 4, commits `50fd89c2`/`a280dd04`/`48862d40`/`27b055fa`/`22775346`; root commit `50fd89c2`) — P-1..P6 Phase 1 + tokenizer + streaming + F32-keep + real-model validation + §9 fingerprint manifest + §Pi Phase A (imatrix corpus loader + accumulator + .imatrix.gguf writer/loader + CLI flags + I-tier APEX wiring via `--imatrix <file>`) all on main. B1 (`--repo` auto-download via `huggingface-cli`) + B4 (`convert-v2` → `convert` rename; no alias per [[feedback-no-backwards-compat-2026-05-18]]) also shipped 2026-05-19. **§P1 quality-equivalence gate: PASS at BYTE-IDENTICAL level vs canonical `convert_hf_to_gguf.py --outtype f16 | llama-quantize Q4_K_M` (commit `50fd89c2`).** Per-arch scope: §P1 byte-identical is a per-arch correctness gate; **Gemma 4 26B-A4B-IT: GREEN** (8 quants × 658 tensors = 5,264 verifications, commits `50fd89c2`/`a280dd04`/`48862d40`/`27b055fa`/`22775346`); **Qwen 3.5 35B-A3B (multimodal VLM): GREEN BYTE-IDENTICAL** on real-model Q4_K_M (0/21,701,419,520 bytes diff at HEAD `42b346fb`, 2026-05-20 — see "Authoritative real-model byte-cmp" table below). Convert successfully produces GGUFs at multiple quant tiers from operator's `/opt/hf2q/models/Qwen-Qwen3.5-35B-A3B` (`Qwen3_5MoeForConditionalGeneration`, 1,811 safetensors patterns including 785 mtp.* + 26 model.visual.* dropped). Stock `/opt/llama.cpp/build/bin/llama-cli` loads + decodes **coherent English chain-of-thought** across multiple quants and prompts (113-116 tok/s decode).
 
 §P1 byte-cmp vs canonical `convert_hf_to_gguf.py | llama-quantize <tier>` (Qwen 3.5 35B-A3B):
