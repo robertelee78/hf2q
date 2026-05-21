@@ -92,6 +92,35 @@
 
 **Total remaining: ~2100 LOC** (originally estimated ~2500; -16% net). The savings from ADR-033 §P1 + the MoE MTP loader fix (~750 LOC saved) are partially offset by the corrected P5.1 scope (~600-1400 LOC actual vs 50-100 LOC originally estimated). P5.1 was MIS-scoped in the 2026-05-21 readiness assessment; the corrected number is grounded in reading `dispatch_dflash_generate`'s body.
 
+### Iteration 2026-05-21 — K=N hard limit on hybrid Qwen, K=1 BATCHED bench (HEAD `5505cdfc`)
+
+This iteration corrected two false alarms and characterized a real architectural limit:
+
+1. **False alarm — "pre-existing prefill non-determinism at max_seq>180"** was a `tail -4 | head -2` filter artifact. With a positional filter (`sed -n '/^prefill:/,$p' | tail -n +2 | tr -d '\n' | head -c 80`) the first 80 chars of the generated text are byte-identical across `--max-tokens` 12 / 50 / 100 / 128 (Qwen 3.6 27B Q8_0 MTP). Greedy IS deterministic across `max_seq_len` capacities. Memory entry updated.
+
+2. **Kernel-divergence root cause for K=N divergence from greedy** — confirmed empirically:
+   - Greedy (`HF2Q_SPEC_DECODE=0`, single-token decode kernel) byte-identical to `K=1 TWO_CALLS` (`HF2Q_SPEC_DECODE_K1_TWO_CALLS=1`, two single-token decode forwards).
+   - `K=1 BATCHED` (single 2-token forward via `flash_attn_prefill_resume`) diverges from greedy at token ~22 — DIFFERENT correct sequence, not degenerate text.
+   - `flash_attn_vec` (decode, F32) and `flash_attn_prefill_resume` (prefill, BF16 internal) produce slightly different logits → different argmax on close calls. This is rounding, not a bug.
+
+3. **K=2 BATCHED degeneracy root cause** — DeltaNet recurrent state cannot be rolled back on partial reject. Qwen 3.5/3.6 are hybrid: 4 full-attn layers + 30 linear-attention (Gated DeltaNet) layers. Full-attn slots are rolled back by `truncate_full_attn_to(prior+accepted+1)` (just resets the `current_len` cursor). DeltaNet state is RECURRENT — it advances by N+1 token-steps inside one batched forward. On reject of any of those drafts, the recurrent state is "ahead" with no rollback mechanism. Over ~70 iterations the drift accumulates and the model collapses to the "the the the…" attractor. `LinearAttnStateSlot` has a `conv_state` / `conv_state_scratch` ping-pong but it only supports {all accept, all reject} rollback (the scratch holds state-after-N, the active holds state-before).
+
+4. **K=1 BATCHED PROVEN COHERENT + FASTER** at 200 tokens (3 reps, deterministic):
+   - spec mean: 23.93 tok/s @ 60% accept
+   - base mean: 21.17 tok/s
+   - **speedup: 1.13×**
+   - Quality: full coherent essay through to 200 tokens, no degeneracy.
+   - K=1 emits a different valid continuation from greedy at temp=0 (due to kernel rounding noted above), but the continuation itself is high-quality.
+
+**Path forward for K≥2 on hybrid Qwen (multi-week scope):**
+- **(a)** Per-token DN state snapshot — before each spec iter, copy `conv_state` and `recurrent_state` for all 30 LA layers. On partial reject, recompute prefix from snapshot. Extra: 30 × (conv_state + recurrent_state) bytes per iter + copy time. For 27B: ~5 MB per snapshot, microseconds.
+- **(b)** Per-step DN forward — run the verifier as N+1 sequential single-token forwards, swapping `conv_state` after each. Loses batched-prefill speedup; equivalent to K=1 cost × (N+1).
+- **(c)** Recompute prefix on reject — call DN forward from scratch on accepted-prefix when partial-reject happens. Costs (avg-accept) × per-layer-recompute per reject.
+
+For pure-attention models (Llama 3, Gemma 4 standard layers without DN), K≥2 should work natively because all attention slots are roll-backable. The hybrid case is the bottleneck.
+
+**Recommendation**: ship K=1 BATCHED as the default `HF2Q_SPEC_DECODE=1` mode (set `HF2Q_SPEC_DECODE_K1=1` automatically when MTP weights are present) and document K=N as experimental until per-layer DN snapshot lands.
+
 ### What an engineer needs (besides this section)
 
 - Read [[project_adr034_readiness_final_2026_05_21]] memory entry for cross-cutting findings
