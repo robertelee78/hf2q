@@ -640,7 +640,10 @@ pub fn build_tokenizer_metadata(
                 MetaValue::U32(id),
             ));
         }
-    } else if arch == ArchName::Qwen3VlText {
+    } else if matches!(
+        arch,
+        ArchName::Qwen3VlText | ArchName::Qwen35Moe | ArchName::Qwen35MoeFull
+    ) {
         // Qwen3-VL Text decoder emit order — canonical
         // `Qwen2Model.set_vocab` calls `_set_vocab_gpt2` (base.py:1603-1611):
         //   model = 'gpt2'

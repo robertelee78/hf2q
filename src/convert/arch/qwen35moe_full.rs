@@ -732,13 +732,29 @@ pub fn build_metadata(
     ctx: &Qwen35MoeFullCtx,
     config: &serde_json::Value,
     file_type: u32,
+    model_card: Option<&crate::convert::model_card::ModelCard>,
+    sampling: Option<&crate::convert::model_card::SamplingConfig>,
+    model_dir_basename: Option<&str>,
+    size_label_override: Option<&str>,
 ) -> Vec<(String, MetaValue)> {
+    use crate::convert::model_card::{
+        emit_general_postlude, emit_general_prelude, get_model_id_components,
+    };
     let text = effective_text_config(config);
-    let name = config
-        .get("_name_or_path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("model")
-        .to_string();
+    let raw_name = model_dir_basename
+        .map(|s| s.to_string())
+        .or_else(|| {
+            config
+                .get("_name_or_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "model".to_string());
+    let id_components = get_model_id_components(&raw_name);
+    let display_name = id_components
+        .name
+        .clone()
+        .unwrap_or_else(|| raw_name.clone());
 
     let hidden_size = text
         .get("hidden_size")
@@ -833,147 +849,149 @@ pub fn build_metadata(
         .unwrap_or(0.25);
     let rope_dim_count = ((head_dim as f64) * partial_rotary_factor) as u32;
 
-    let mut kvs: Vec<(String, MetaValue)> = vec![
-        (
-            "general.architecture".into(),
-            MetaValue::String("qwen35moe".into()),
-        ),
-        ("general.name".into(), MetaValue::String(name)),
-        ("qwen35moe.context_length".into(), MetaValue::U32(ctx_len)),
-        (
-            "qwen35moe.embedding_length".into(),
-            MetaValue::U32(hidden_size),
-        ),
-        ("qwen35moe.block_count".into(), MetaValue::U32(n_layers)),
-        (
-            "qwen35moe.feed_forward_length".into(),
-            MetaValue::U32(moe_ffn),
-        ),
-        (
-            "qwen35moe.attention.head_count".into(),
-            MetaValue::U32(n_head),
-        ),
-        (
-            "qwen35moe.attention.head_count_kv".into(),
-            MetaValue::U32(n_head_kv),
-        ),
-        (
-            "qwen35moe.attention.layer_norm_rms_epsilon".into(),
-            MetaValue::F32(rms_eps),
-        ),
-        (
-            "qwen35moe.rope.freq_base".into(),
-            MetaValue::F32(rope_theta),
-        ),
-        (
-            "qwen35moe.rope.dimension_count".into(),
-            MetaValue::U32(rope_dim_count),
-        ),
-        // attention.{key,value}_length — per canonical
-        // /opt/llama.cpp/conversion/base.py:1217-1218 emit head_dim
-        // when present in config. llama.cpp's hparam loader uses these
-        // to set `n_embd_head_k`/`n_embd_head_v`; absent, it defaults
-        // to `hidden / n_head` which is WRONG for Qwen 3.5 where
-        // head_dim=256 but hidden/n_head=128.
-        (
-            "qwen35moe.attention.key_length".into(),
-            MetaValue::U32(head_dim),
-        ),
-        (
-            "qwen35moe.attention.value_length".into(),
-            MetaValue::U32(head_dim),
-        ),
-        (
-            "qwen35moe.expert_count".into(),
-            MetaValue::U32(n_experts),
-        ),
-        (
-            "qwen35moe.expert_used_count".into(),
-            MetaValue::U32(n_experts_used),
-        ),
-        (
-            "qwen35moe.expert_feed_forward_length".into(),
-            MetaValue::U32(moe_ffn),
-        ),
-        // SSM (linear-attention) hparams
-        (
-            "qwen35moe.ssm.conv_kernel".into(),
-            MetaValue::U32(linear_conv_kernel_dim),
-        ),
-        (
-            "qwen35moe.ssm.state_size".into(),
-            MetaValue::U32(linear_key_head_dim),
-        ),
-        (
-            "qwen35moe.ssm.group_count".into(),
-            MetaValue::U32(linear_num_key_heads),
-        ),
-        (
-            "qwen35moe.ssm.time_step_rank".into(),
-            MetaValue::U32(linear_num_value_heads),
-        ),
-        (
-            "qwen35moe.ssm.inner_size".into(),
-            MetaValue::U32(ssm_inner_size),
-        ),
-        (
-            "qwen35moe.attention.full_attention_interval".into(),
-            MetaValue::U32(full_attn_interval),
-        ),
-        ("general.file_type".into(), MetaValue::U32(file_type)),
-    ];
-
-    // MRoPE dimension sections. The Qwen 3.5 config ships
-    // [11, 11, 10] (3 values) but llama.cpp's GGUF reader expects
-    // exactly 4 (the time dimension occupies the trailing slot,
-    // defaulting to 0). Canonical pads in `base.py:1174-1180`:
-    //   while len(mrope_section) < 4: mrope_section.append(0)
-    //   self.gguf_writer.add_rope_dimension_sections(mrope_section[:4])
-    // The `_Qwen35MRopeMixin._QWEN35_DEFAULT_MROPE_SECTION` (qwen.py:526)
-    // default `[11, 11, 10, 0]` only fires when `mrope_section` is
-    // entirely absent.
-    let mut mrope: Vec<u32> = text
+    // MRoPE dimension sections — canonical Qwen 3.5 emits as INT32.
+    let mut mrope_section: Vec<i32> = text
         .get("rope_parameters")
         .and_then(|rp| rp.get("mrope_section"))
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|x| x.as_u64().map(|n| n as u32))
+                .filter_map(|x| x.as_i64().map(|n| n as i32))
                 .collect()
         })
         .or_else(|| {
             text.get("mrope_section").and_then(|v| v.as_array()).map(|arr| {
                 arr.iter()
-                    .filter_map(|x| x.as_u64().map(|n| n as u32))
+                    .filter_map(|x| x.as_i64().map(|n| n as i32))
                     .collect()
             })
         })
         .unwrap_or_else(|| vec![11, 11, 10, 0]);
-    while mrope.len() < 4 {
-        mrope.push(0);
+    while mrope_section.len() < 4 {
+        mrope_section.push(0);
     }
-    mrope.truncate(4);
+    mrope_section.truncate(4);
+
+    // Optional MoE shared expert FFN length (Qwen 3.5 only — Qwen3MoE
+    // dropped them; Qwen 3.5 re-adds them via shared_expert.* tensors).
+    let shared_expert_ffn = text
+        .get("shared_expert_intermediate_size")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as u32);
+
+    // Canonical Qwen 3.5 emits prelude → arch block → tokenizer → postlude.
+    let mut kvs: Vec<(String, MetaValue)> = emit_general_prelude(
+        "qwen35moe",
+        display_name,
+        &id_components,
+        size_label_override,
+        model_card,
+        sampling,
+    );
+    // Canonical Qwen 3.5 arch-KV emit order (verified against
+    // /opt/hf2q/cache/byte_cmp/Qwen-Qwen3.5-35B-A3B_canonical_q4_k_m.gguf
+    // dump positions 19-40):
+    //   block_count, context_length, embedding_length,
+    //   attention.head_count, attention.head_count_kv,
+    //   rope.dimension_sections, rope.freq_base,
+    //   attention.layer_norm_rms_epsilon, expert_count,
+    //   expert_used_count, attention.key_length,
+    //   attention.value_length, expert_feed_forward_length,
+    //   expert_shared_feed_forward_length, ssm.conv_kernel,
+    //   ssm.state_size, ssm.group_count, ssm.time_step_rank,
+    //   ssm.inner_size, full_attention_interval,
+    //   rope.dimension_count, nextn_predict_layers
+    kvs.push(("qwen35moe.block_count".into(), MetaValue::U32(n_layers)));
+    kvs.push(("qwen35moe.context_length".into(), MetaValue::U32(ctx_len)));
+    kvs.push((
+        "qwen35moe.embedding_length".into(),
+        MetaValue::U32(hidden_size),
+    ));
+    kvs.push((
+        "qwen35moe.attention.head_count".into(),
+        MetaValue::U32(n_head),
+    ));
+    kvs.push((
+        "qwen35moe.attention.head_count_kv".into(),
+        MetaValue::U32(n_head_kv),
+    ));
     kvs.push((
         "qwen35moe.rope.dimension_sections".into(),
-        MetaValue::ArrayU32(mrope),
+        MetaValue::ArrayI32(mrope_section),
     ));
-
-    // attn_output_gate (Qwen 3.5 attention quirk).
-    if let Some(gate) = text.get("attn_output_gate").and_then(|v| v.as_bool()) {
+    kvs.push((
+        "qwen35moe.rope.freq_base".into(),
+        MetaValue::F32(rope_theta),
+    ));
+    kvs.push((
+        "qwen35moe.attention.layer_norm_rms_epsilon".into(),
+        MetaValue::F32(rms_eps),
+    ));
+    kvs.push(("qwen35moe.expert_count".into(), MetaValue::U32(n_experts)));
+    kvs.push((
+        "qwen35moe.expert_used_count".into(),
+        MetaValue::U32(n_experts_used),
+    ));
+    kvs.push((
+        "qwen35moe.attention.key_length".into(),
+        MetaValue::U32(head_dim),
+    ));
+    kvs.push((
+        "qwen35moe.attention.value_length".into(),
+        MetaValue::U32(head_dim),
+    ));
+    kvs.push((
+        "qwen35moe.expert_feed_forward_length".into(),
+        MetaValue::U32(moe_ffn),
+    ));
+    if let Some(s) = shared_expert_ffn {
         kvs.push((
-            "qwen35moe.attention.output_gate".into(),
-            MetaValue::Bool(gate),
+            "qwen35moe.expert_shared_feed_forward_length".into(),
+            MetaValue::U32(s),
         ));
     }
-
-    // nextn_predict_layers — emitted only when MTP is present.
+    kvs.push((
+        "qwen35moe.ssm.conv_kernel".into(),
+        MetaValue::U32(linear_conv_kernel_dim),
+    ));
+    kvs.push((
+        "qwen35moe.ssm.state_size".into(),
+        MetaValue::U32(linear_key_head_dim),
+    ));
+    kvs.push((
+        "qwen35moe.ssm.group_count".into(),
+        MetaValue::U32(linear_num_key_heads),
+    ));
+    kvs.push((
+        "qwen35moe.ssm.time_step_rank".into(),
+        MetaValue::U32(linear_num_value_heads),
+    ));
+    kvs.push((
+        "qwen35moe.ssm.inner_size".into(),
+        MetaValue::U32(ssm_inner_size),
+    ));
+    kvs.push((
+        "qwen35moe.full_attention_interval".into(),
+        MetaValue::U32(full_attn_interval),
+    ));
+    kvs.push((
+        "qwen35moe.rope.dimension_count".into(),
+        MetaValue::U32(rope_dim_count),
+    ));
     if n_mtp > 0 {
         kvs.push((
             "qwen35moe.nextn_predict_layers".into(),
             MetaValue::U32(n_mtp),
         ));
     }
-
+    // attn_output_gate (Qwen 3.5 attention quirk) — preserved.
+    if let Some(gate) = text.get("attn_output_gate").and_then(|v| v.as_bool()) {
+        kvs.push((
+            "qwen35moe.attention.output_gate".into(),
+            MetaValue::Bool(gate),
+        ));
+    }
+    kvs.extend(emit_general_postlude(file_type));
     let _ = ctx; // future per-arch metadata may need ctx fields
     kvs
 }

@@ -1158,7 +1158,15 @@ fn build_metadata_for_arch(
         ArchName::NomicBert => nomic_bert::build_metadata(config, ftype, model_card, size_label),
         ArchName::Qwen35Moe => qwen35moe::build_metadata(config, ftype),
         ArchName::Qwen35MoeFull => match build_qwen35moe_full_ctx(config) {
-            Some(ctx) => qwen35moe_full::build_metadata(&ctx, config, ftype),
+            Some(ctx) => qwen35moe_full::build_metadata(
+                &ctx,
+                config,
+                ftype,
+                model_card,
+                sampling,
+                model_dir_basename,
+                size_label,
+            ),
             // Config missing required hparams. Fall back to the older
             // qwen3moe metadata layout (which uses `general.architecture
             // = "qwen3moe"`) so at minimum SOME metadata is written;
