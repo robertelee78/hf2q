@@ -320,4 +320,54 @@ mod tests {
         assert_eq!(got.len(), expected.len(), "IQ4_NL im length mismatch");
         assert_eq!(got, expected, "IQ4_NL im byte-cmp failed");
     }
+
+    /// Regression test for the all-zero block kernel fix (commit 29ac8d4f,
+    /// 2026-05-21). When `amax < GROUP_MAX_EPS = 1e-15` (effectively
+    /// all-zero input), canonical's `quantize_row_iq4_nl_impl` at
+    /// /opt/llama.cpp/ggml/src/ggml-quants.c:4888-4895 runs the final
+    /// L re-fill UNCONDITIONALLY on `ntry > 0` (which is 7 for the
+    /// quantize_iq4_nl entry point):
+    ///
+    /// ```c
+    /// dh[0] = GGML_FP32_TO_FP16(scales[0]);  // 0.0
+    /// if (ntry > 0) {
+    ///     float id = scales[0] ? 1/scales[0] : 0;     // id = 0
+    ///     for (int j = 0; j < super_block_size; ++j) {
+    ///         L[j] = best_index_int8(16, values, id*x[j]);  // best_index_int8(0)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// `best_index_int8` of `0.0` against the `kvalues_iq4nl` table
+    /// `{-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}`
+    /// returns index 8 (value `1`, closest to zero). So `L[j] = 8` for
+    /// all j → packed `q4[i] = 8 | (8 << 4) = 0x88` per byte.
+    ///
+    /// The all-zero block in GGUF format is therefore:
+    /// - 2 bytes f16 d = `0x0000` (FP32→FP16 of 0.0)
+    /// - 16 bytes qs = `0x88` repeated
+    ///
+    /// Pre-fix hf2q skipped the L re-fill when `all_zero`, producing
+    /// 18 zero bytes instead — caused 587K-byte residual on Llama 3
+    /// IQ4_NL token_embd.weight + 121M-byte residual on Qwen 3.5 IQ4_NL.
+    #[test]
+    fn iq4_nl_all_zero_block_writes_0x88_qs_2026_05_21() {
+        // 32 zero F32 inputs → one IQ4_NL block of 18 bytes
+        let input = vec![0.0f32; 32];
+        let got = quantize(&input, 32, None);
+
+        assert_eq!(got.len(), 18, "IQ4_NL block is 18 bytes (2 f16 d + 16 qs)");
+        // d = f16(0.0) = 0x0000 little-endian
+        assert_eq!(got[0], 0, "d[0] = 0x00");
+        assert_eq!(got[1], 0, "d[1] = 0x00");
+        // qs = 0x88 repeated 16 times (L=8 packed as 8|(8<<4) = 0x88)
+        for i in 2..18 {
+            assert_eq!(
+                got[i], 0x88,
+                "qs[{}] should be 0x88 (packed L=8 from best_index_int8(0)), got 0x{:02x}",
+                i - 2,
+                got[i]
+            );
+        }
+    }
 }
