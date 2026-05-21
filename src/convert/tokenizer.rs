@@ -540,10 +540,29 @@ fn determine_tokenizer_model_name(model_section: &serde_json::Value, arch: ArchN
     if arch == ArchName::Gemma4 {
         return "gemma4".into();
     }
+    // BERT family is hard-wired to "bert" per canonical
+    // `/opt/llama.cpp/conversion/bert.py:59`:
+    //   `self.gguf_writer.add_tokenizer_model("bert")`.
+    // Nomic-BERT inherits from BertModel and uses the same string
+    // for the WordPiece path. The XLM-RoBERTa nomic-bert-v2-moe
+    // variant uses "t5" instead (sentencepiece-based; see
+    // `bert.py:227`) — detected via Unigram tokenizer type below.
+    if arch == ArchName::Bert {
+        return "bert".into();
+    }
     let model_type = model_section
         .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    if arch == ArchName::NomicBert {
+        // Standard nomic-bert-v1.5 ships WordPiece; v2-moe ships
+        // Unigram (XLM-RoBERTa-style → canonical maps to "t5").
+        return if model_type == "Unigram" {
+            "t5".into()
+        } else {
+            "bert".into()
+        };
+    }
     let byte_fallback = model_section
         .get("byte_fallback")
         .and_then(|v| v.as_bool())
