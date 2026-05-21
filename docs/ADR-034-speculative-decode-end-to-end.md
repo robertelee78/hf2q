@@ -271,6 +271,25 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 6) — Task #87 SHIPPED + task #91 design
+
+**Task #87 SHIPPED at HEAD `3be36936`**: K=1 BATCHED auto-default for dense
+MTP variant. 14 LOC change in spec_decode.rs gating on
+`mtp.ffn_kind() == MtpFfnKind::Dense`. Empirical:
+- Dense 27B Q8_0: 23.83 vs 21.40 base = **1.11× speedup** (was silent
+  0.91× regression — closed).
+- MoE 35B-A3B Q4_K_M: 112.35 tok/s unchanged (auto K=0 preserved).
+- Determinism 3/3 byte-identical; 115/0 tests pass.
+
+**Task #91 design (Metropolis-Hastings)**: deep scoping revealed the
+`leviathan_step` primitive ALREADY EXISTS at
+`src/inference/spec_decode/dflash/rejection_sampler.rs:94-159` (Leviathan-2023
+§2.3, identical to MTPLX's sampling.py math). Task is wiring, not
+reimplementation. Scope: ~330 LOC across 5 steps (temperature plumbing →
+K=1 BATCHED MH branch → K=0 MH → K=N MH → tests). Expected at temp=0.6 on
+27B: K=1 BATCHED 1.11× → ~1.30-1.40× via accept rate boost from 60% →
+80-90%.
+
 ### Iteration 2026-05-21 (cont. 5) — Arena-lift hypothesis FALSIFIED
 
 Implemented + A/B tested the Step 1 design from the previous iteration.
