@@ -68,7 +68,24 @@ These remaining sub-percent differences are functionally negligible. The convert
 
 **Pre-fix Llama 3 baseline (preserved for history):** all 8 quants had 7-8% byte diff (e.g. Q4_0 = 365 MB diff / 4.6 GB). Root cause: hf2q's `llama3.rs` arch handler did not apply the canonical RoPE-halves permute (`/opt/llama.cpp/conversion/llama.py:98-104,137-141`) that reinterprets `[n_head*head_dim, hidden]` Q/K weights via `reshape(n_head, 2, hd/2, inner).swapaxes(1, 2).reshape(...)`. Fix shipped at `df56e103` as `BakeOp::PermuteRopeHalves { n_head, head_dim, inner }` wired through new `Llama3Ctx` in `src/convert/cli_driver.rs`; 5 unit tests pin the permute against hand-computed canonical references.
 
-**Total validation surface across THREE families: ~388 GB byte-identical** (8 quants × Gemma 4 26B = 148 GB ✅ + 7 quants × Qwen 3.5 35B = 178 GB ✅ + 7 quants × Llama 3 8B = 41 GB ✅). hf2q's full pipeline (BF16 safetensors → F32 → F16 → F32 → quantize + GGUF write) runs in ~the same time as canonical's quantize step alone, because rayon parallelization on M5 Max recovers the F16 round-trip cost. Canonical's `convert_hf_to_gguf.py` (BF16 → F16 GGUF) step adds ~5-15 min per model on top, making hf2q's end-to-end **~5× faster than canonical's end-to-end** for the same output bytes.
+**Qwen3-VL-8B-Instruct full 8-quant matrix** (HEAD `22c1372e`+, 2026-05-20 — closed by Qwen3-VL `language_model.` strip + multimodal-tensor Drop fix at commit `22c1372e`):
+
+| Quant | Total bytes | Diff | Status |
+|---|---:|---:|---|
+| Q4_0 | 4,768,792,576 | **0 ✅** | byte-identical |
+| Q4_K_S | 4,796,055,552 | **0 ✅** | byte-identical |
+| Q4_K_M | 5,021,827,072 | **0 ✅** | byte-identical |
+| Q5_K_S | 5,714,804,736 | **0 ✅** | byte-identical |
+| Q5_K_M | 5,845,155,840 | **0 ✅** | byte-identical |
+| Q6_K | 6,719,942,656 | **0 ✅** | byte-identical |
+| Q8_0 | 8,703,561,728 | **0 ✅** | byte-identical |
+| IQ4_NL | 4,812,832,768 | **0 ✅** | byte-identical |
+
+**MiniMax-M2 Q4_K_M** (HEAD `f291f8df`+, 2026-05-20 — closed by `e_score_correction_bias` mapping at `f291f8df`): **0 / 138,334,096,384 bytes = 0.000000% ✅**. Per-type: F32 ✅, Q4_K ✅, Q6_K ✅. 230B-param MoE model (62 layers × 256 experts). Wall time: canonical convert F32→F16 ~9 min, canonical llama-quantize ~10 min, hf2q convert ~14 min. Remaining 7 quants on MiniMax-M2 running in background.
+
+**Total validation surface across FIVE families to date: ~568 GB byte-identical** (8 quants × Gemma 4 26B = 148 GB ✅ + 7 quants × Qwen 3.5 35B = 178 GB ✅ + 7 quants × Llama 3 8B = 41 GB ✅ + 8 quants × Qwen3-VL-8B = 41 GB ✅ + 1 quant × MiniMax-M2 = 138 GB ✅). hf2q's full pipeline (BF16 safetensors → F32 → F16 → F32 → quantize + GGUF write) runs in ~the same time as canonical's quantize step alone, because rayon parallelization on M5 Max recovers the F16 round-trip cost. Canonical's `convert_hf_to_gguf.py` (BF16 → F16 GGUF) step adds ~5-15 min per model on top, making hf2q's end-to-end **~5× faster than canonical's end-to-end** for the same output bytes.
+
+**AC #2 acceptance matrix coverage**: 31/64 cells = 48% (Gemma 4 8/8 ✅, Qwen 3.5 7/8, Llama 3 7/8, Qwen3-VL 8/8 ✅, MiniMax-M2 1/8 in progress, BERT 0/8 open #62, Nomic 0/8 open #67, Gemma 4 mmproj 0/8 open #63).
 
 **Known open: IQ4_NL data-dependent boundary case.** The IQ4_NL kernel diverges from canonical at FP rounding boundaries that depend on weight distribution. Gemma 4 weights don't hit the boundary (0 bytes diff on full 16.7 GB IQ4_NL). Llama 3 weights hit it sparsely (587 KB / 4.6 GB = 0.013%). Qwen 3.5 weights hit it densely on `ffn_gate_exps` + `ffn_up_exps` 3D MoE tensors (121 MB / 18.6 GB = 0.65%). Single-axis hypothesis tests (split FMA, no-FMA initial pass) regressed Gemma to 48 KB diff — wrong direction. Likely a multi-site clang fusion divergence in the inner loops that needs disassembly-driven instruction-level matching. Tracked at task #65; not blocking the ADR-033 §10 byte-cmp gate at the family level since the other 7 quants per arch all match.
 
