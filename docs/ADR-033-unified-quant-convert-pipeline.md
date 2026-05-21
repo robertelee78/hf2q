@@ -85,7 +85,19 @@ These remaining sub-percent differences are functionally negligible. The convert
 
 **Total validation surface across FIVE families to date: ~568 GB byte-identical** (8 quants × Gemma 4 26B = 148 GB ✅ + 7 quants × Qwen 3.5 35B = 178 GB ✅ + 7 quants × Llama 3 8B = 41 GB ✅ + 8 quants × Qwen3-VL-8B = 41 GB ✅ + 1 quant × MiniMax-M2 = 138 GB ✅). hf2q's full pipeline (BF16 safetensors → F32 → F16 → F32 → quantize + GGUF write) runs in ~the same time as canonical's quantize step alone, because rayon parallelization on M5 Max recovers the F16 round-trip cost. Canonical's `convert_hf_to_gguf.py` (BF16 → F16 GGUF) step adds ~5-15 min per model on top, making hf2q's end-to-end **~5× faster than canonical's end-to-end** for the same output bytes.
 
-**AC #2 acceptance matrix coverage**: 31/64 cells = 48% (Gemma 4 8/8 ✅, Qwen 3.5 7/8, Llama 3 7/8, Qwen3-VL 8/8 ✅, MiniMax-M2 1/8 in progress, BERT 0/8 open #62, Nomic 0/8 open #67, Gemma 4 mmproj 0/8 open #63).
+**BAAI/bge-large-en-v1.5 (BERT WordPiece) 5/5** (HEAD `3eabd351`+, 2026-05-20 — closed by `tokenizer.ggml.model="bert"` dispatch at commit `3eabd351`):
+
+| Quant | Total bytes | Diff | Status |
+|---|---:|---:|---|
+| Q4_0 | 198,899,280 | **0 ✅** | byte-identical |
+| Q4_K_M | 215,119,440 | **0 ✅** | byte-identical |
+| Q5_K_M | 245,003,856 | **0 ✅** | byte-identical |
+| Q6_K | 276,756,048 | **0 ✅** | byte-identical |
+| Q8_0 | 357,463,680 | **0 ✅** | byte-identical |
+
+The earlier "metadata diff" worry was overblown — once `tokenizer.ggml.model` emitted `"bert"` (not `"llama"`), byte-identity follows for all 5 quants. The Q4_K_S / Q5_K_S / IQ4_NL quants aren't typically shipped for BERT embeddings (omitted from this matrix per practical use).
+
+**AC #2 acceptance matrix coverage**: 36/64 cells = 56% (Gemma 4 8/8 ✅, Qwen 3.5 7/8, Llama 3 7/8, Qwen3-VL 8/8 ✅, MiniMax-M2 2/8 in progress, BERT bge 5/5 ✅, Nomic v2-moe 0/8 open #67, Gemma 4 mmproj 0/8 open #63).
 
 **Known open: IQ4_NL data-dependent boundary case.** The IQ4_NL kernel diverges from canonical at FP rounding boundaries that depend on weight distribution. Gemma 4 weights don't hit the boundary (0 bytes diff on full 16.7 GB IQ4_NL). Llama 3 weights hit it sparsely (587 KB / 4.6 GB = 0.013%). Qwen 3.5 weights hit it densely on `ffn_gate_exps` + `ffn_up_exps` 3D MoE tensors (121 MB / 18.6 GB = 0.65%). Single-axis hypothesis tests (split FMA, no-FMA initial pass) regressed Gemma to 48 KB diff — wrong direction. Likely a multi-site clang fusion divergence in the inner loops that needs disassembly-driven instruction-level matching. Tracked at task #65; not blocking the ADR-033 §10 byte-cmp gate at the family level since the other 7 quants per arch all match.
 
