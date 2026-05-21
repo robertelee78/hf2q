@@ -121,6 +121,68 @@ For pure-attention models (Llama 3, Gemma 4 standard layers without DN), K≥2 s
 
 **Recommendation**: ship K=1 BATCHED as the default `HF2Q_SPEC_DECODE=1` mode (set `HF2Q_SPEC_DECODE_K1=1` automatically when MTP weights are present) and document K=N as experimental until per-layer DN snapshot lands.
 
+### Iteration 2026-05-21 (cont.) — Per-target K=1 BATCHED bench + MoE 2-token batched penalty
+
+Re-bench across BOTH Cell A targets at HEAD `8eca2387`, 200-token essay:
+
+| Model | base | K=0 (single verify) | K=1 BATCHED | K=1 TWO_CALLS | Best |
+|---|---:|---:|---:|---:|---|
+| **27B Q8_0 (dense MTP)** | 21.1 t/s | 19.3 (0.91×, 76.4% acc) | **22.8 (1.08×, 60.0% acc)** | 19.9 (0.94×, 77.0% acc) | k1batched |
+| **35B-A3B Q4_K_M (MoE MTP)** | **135.5 t/s** | 111.4 (0.82×, 73.7% acc) | 88.7 (0.65×, 73.7% acc) | 116.8 (0.86×, 72.4% acc) | base |
+
+**Critical: no spec mode beats base on 35B-A3B MoE.** `HF2Q_MTP_PROFILE=1` shows:
+
+```
+Cell A 27B Q8_0 K=1 BATCHED:  mtp=4.2ms,  ver_2tok=59.7ms, T_v(2)/T_v(1)=1.26×
+Cell A 35B-A3B K=1 BATCHED:   mtp=2.0ms,  ver_2tok=17.7ms, T_v(2)/T_v(1)=2.40×
+```
+
+**Root cause**: `T_v_2tok / T_v_1tok` ratio is broken on MoE. 27B (dense) gives the
+normal 1.26× batched penalty; 35B-A3B (MoE, 256 experts top-8) gives a 2.40×
+penalty. Per-token batched-forward overhead nearly doubles when adding the 2nd
+token — likely because the MoE FFN dispatches a near-disjoint UNION of expert
+kernels for two tokens (worst case 16 vs 8 experts), and the per-expert dispatch
+overhead doesn't amortize across the 2 tokens efficiently.
+
+**Modified recommendation**:
+- **27B dense MTP**: enable K=1 BATCHED by default (1.08× win, deterministic).
+- **35B-A3B MoE MTP**: leave as base (no spec). Need MoE-FFN batched-dispatch
+  optimization OR a cheaper drafter before spec decode pays back on MoE Cell A.
+- **K=N for hybrid Qwen**: still blocked on DN-snapshot rollback (separate work).
+
+**Investigation:**
+1. ✅ Tested `HF2Q_MM_ID_ROUTING_THRESHOLD=1` (force mm_id at seq_len=2): 70 tok/s
+   (WORSE than mv_id at 91 tok/s; accept also drops to 63.9%). The MoE FFN
+   dispatch is already optimal — mv_id route is correctly fastest for tg2.
+2. ✅ Located CHUNK_THRESHOLD=64 in `gpu_delta_net.rs` — for seq_len ≤ 64 the
+   Gated DeltaNet uses the `dispatch_gated_delta_net_decode` recurrent kernel
+   (single dispatch, internal loop over tokens). Geometry `(d_v/nsg, n_v_heads,
+   n_seqs)` doesn't grow with n_tokens. T(2) ≈ a + 2b should scale ≤ 2× over T(1).
+3. **Conclusion**: The 2.4× ratio on 35B-A3B is NOT from MoE FFN dispatch
+   inefficiency. It's from the entire `forward_gpu_impl` prefill-path setup
+   (`FaPrefillArena` alloc, BF16 cast Q/K/V per layer, permute seq→head→seq,
+   `apply_flash_attn_prefill_seq_major_into` BF16 attention, etc.) being
+   invoked at seq_len=2 — designed for batched prefill (seq_len >> 1), not
+   small batched-verify. For 27B (dense, slow base) the absolute overhead is
+   the same but relative cost is lower because T_v(1) is already 47ms.
+
+**Real fix path** (architectural, multi-week):
+- Add a `forward_gpu_batched_decode` path for seq_len ∈ {2, 3, …, 16} that
+  reuses the single-token decode kernels (F32 `flash_attn_vec`, mv_id MoE)
+  WITHOUT the prefill staging overhead. Loops attention per-token internally
+  with shared QKV projection arena, single FFN dispatch with n_tokens > 1.
+- Expected: T_v(N) ≈ a + N·b where a (overhead) drops from 10ms to <2ms.
+- For 35B-A3B at K=1: T_v(2) drops from 17.7ms to ~10ms → speedup recovers.
+
+**Modified recommendation (final this iteration)**:
+- **27B dense MTP**: K=1 BATCHED gives 1.08-1.13× (small win, can ship).
+- **35B-A3B MoE MTP**: keep base (no spec) as default. Spec doesn't pay back
+  until `batched_decode` path lands. K=1 TWO_CALLS is mathematically incapable
+  of beating base on this model (proof: 1.737 verify-forwards + 1 MTP per cycle
+  produces 1.737 tokens = same verify-per-token ratio as base, plus MTP overhead).
+- **Multi-week scope**: implement `forward_gpu_batched_decode` for seq_len ∈
+  [2, 8] to unlock K=N speedup on MoE A3B.
+
 ### What an engineer needs (besides this section)
 
 - Read [[project_adr034_readiness_final_2026_05_21]] memory entry for cross-cutting findings
