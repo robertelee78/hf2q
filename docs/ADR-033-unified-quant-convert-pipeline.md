@@ -31,13 +31,27 @@
 
 **Smoke test (#58) PASSED**: hf2q-converted Llama 3 8B Q4_K_M loads + generates tokens in stock `/opt/llama.cpp/build/bin/llama-cli` (verified at HEAD `4a5784ce` and Qwen 3.5 35B at 113 t/s decode per project memory).
 
-**Perf benchmark 2026-05-21 at HEAD `966e4aae`, M5 Max, Llama 3 8B Q4_K_M**:
-- hf2q one-shot (streaming, no intermediate F16): **34.6s wall, 1017% CPU**
-- canonical convert_hf_to_gguf.py (BF16→F16): 9.6s
-- canonical llama-quantize (F16→Q4_K_M): 34.8s @ 729% CPU
-- canonical TOTAL: **44.4s wall** (two-step pipeline)
-- **hf2q is 1.28× faster end-to-end on this 8B dense model.** Earlier benchmark on Gemma 4 26B MoE (commit `3b24daea`, ADR-036) measured 3.0× faster due to per-tensor parallelization amortizing better with more tensors + 256 experts.
-- Both outputs SHA256-match: `031317c1e1eb80b9c2a12def0ff6f251168dbfd2734fb3695187e208cc0066b3`.
+**Perf benchmark 2026-05-21 at HEAD `8d730a53`, M5 Max** (three-model scaling study):
+
+| Model | Params | Arch | hf2q wall | canonical Step 1 (BF16→F16) | canonical Step 2 (F16→Q4_K_M) | canonical TOTAL | Ratio | Output SHA256 |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| Llama 3 8B | 8 B | dense | **34.6s** | 9.6s | 34.8s | 44.4s | **hf2q 1.28× faster** | `031317c1…cc0066b3` |
+| Gemma 4 26B-A4B (ADR-036) | 26 B | MoE-128 | **72s (1:12)** | — | — | 215s (3:35) | **hf2q 3.0× faster** | (byte-identical, per ADR-036) |
+| Qwen 3.5 35B-A3B | 35 B | MoE-256 + MTP + linear-attn | **183.08s (3:03)** | 21.72s | 113.22s | 134.94s (2:14) | **hf2q 1.36× SLOWER** | `1f18aae6…d028b7af3` |
+
+**Reading**: hf2q's lead is NOT monotone in model size — it's model-architecture-dependent. Pattern at this snapshot:
+- Llama 3 8B dense: hf2q **wins by 28%** (canonical's per-tensor Python overhead dominates on small-tensor-count models)
+- Gemma 4 26B MoE-128: hf2q **wins by 200%** (rayon per-row parallelism on 128 expert tensors × 5 ffn slots = sweet spot)
+- Qwen 3.5 35B MoE-256 + MTP + linear-attn: **canonical wins by 36%** — the BREAK in the trend
+
+**Hypothesis for the Qwen 3.5 regression** (not yet verified; falsifiable code+test predictions):
+1. **F16 round-trip cost dominates on pre-fused MoE**: Qwen 3.5's safetensors ship `mlp.experts.gate_up_proj` as a single fused tensor (256 experts × 2 projections concatenated on axis 0). hf2q does F32→F16→F32 round-trip per tensor for byte-identical matching with canonical's intermediate F16. On 256-expert × 2-proj × 41-layer fused tensors this is `~256·41·2 = 21,000` redundant round-trips. Falsifiable: pin a profile sample and confirm F32→F16→F32 cycles ≥ 30% of hf2q wall.
+2. **MTP/linear-attn transform serialization**: hf2q applies `BakeOp::AddOne` (norm+1) + `BakeOp::ReorderVHeadsPerRow` + `BakeOp::NegExp` (ssm_a sleef) inline with the quantize pipeline. Canonical does these in Python during Step 1 (single-threaded but skipped during Step 2). On 41 MTP layers this means ~533 transformed tensors that block other rayon work-stealing slots.
+3. **Memory-mapped safetensors thrash**: 67 GB safetensors mmapped + 20 GB output write = 87 GB total IO. Canonical: 67 GB read + 70 GB F16 write + 70 GB F16 read + 20 GB Q4_K_M write = 227 GB IO. hf2q saves 140 GB IO ≈ 23 s at 6 GB/s NVMe, but loses ~71 s elsewhere — net 48 s slower.
+
+**Disk savings remain real**: hf2q skips 70 GB intermediate F16 on disk regardless of wall-time. **Streaming RSS bound holds**: peak memory footprint 6.55 GB ≪ canonical's 6.48 GB Step 1 (Python) + 4.95 GB Step 2 (llama-quantize) — comparable, with hf2q being slightly higher due to held BF16 mmap region.
+
+**Honest reporting**: hf2q is NOT universally faster than canonical. The Qwen 3.5 regression is a real optimization target, not a "model-size-favors-canonical" pattern (35B isn't pathologically large). Future investigation: profile the F16 round-trip path + MoE expert tensor handling. Tracked as a follow-up optimization (no separate ADR yet; not gating §10 AC #2 closure since byte-identical correctness is preserved).
 
 - **Status**: SHIPPED + **§P1 BYTE-IDENTICAL 2026-05-19** (8 quants on Gemma 4, commits `50fd89c2`/`a280dd04`/`48862d40`/`27b055fa`/`22775346`; root commit `50fd89c2`) — P-1..P6 Phase 1 + tokenizer + streaming + F32-keep + real-model validation + §9 fingerprint manifest + §Pi Phase A (imatrix corpus loader + accumulator + .imatrix.gguf writer/loader + CLI flags + I-tier APEX wiring via `--imatrix <file>`) all on main. B1 (`--repo` auto-download via `huggingface-cli`) + B4 (`convert-v2` → `convert` rename; no alias per [[feedback-no-backwards-compat-2026-05-18]]) also shipped 2026-05-19. **§P1 quality-equivalence gate: PASS at BYTE-IDENTICAL level vs canonical `convert_hf_to_gguf.py --outtype f16 | llama-quantize Q4_K_M` (commit `50fd89c2`).** Per-arch scope: §P1 byte-identical is a per-arch correctness gate; **Gemma 4 26B-A4B-IT: GREEN** (8 quants × 658 tensors = 5,264 verifications, commits `50fd89c2`/`a280dd04`/`48862d40`/`27b055fa`/`22775346`); **Qwen 3.5 35B-A3B (multimodal VLM): GREEN BYTE-IDENTICAL** on real-model Q4_K_M (0/21,701,419,520 bytes diff at HEAD `42b346fb`, 2026-05-20 — see "Authoritative real-model byte-cmp" table below). Convert successfully produces GGUFs at multiple quant tiers from operator's `/opt/hf2q/models/Qwen-Qwen3.5-35B-A3B` (`Qwen3_5MoeForConditionalGeneration`, 1,811 safetensors patterns including 785 mtp.* + 26 model.visual.* dropped). Stock `/opt/llama.cpp/build/bin/llama-cli` loads + decodes **coherent English chain-of-thought** across multiple quants and prompts (113-116 tok/s decode).
 
