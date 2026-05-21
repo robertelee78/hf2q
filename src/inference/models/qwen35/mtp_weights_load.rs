@@ -2,11 +2,11 @@ use anyhow::{bail, ensure, Context, Result};
 use mlx_native::gguf::GgufFile;
 use mlx_native::{MlxBuffer, MlxDevice};
 
-use super::ffn::DenseFfnWeights;
-use super::gpu_ffn::{DenseFfnWeightsGpu};
+use super::ffn::{DenseFfnWeights, MoeFfnShape};
+use super::gpu_ffn::{DenseFfnWeightsGpu, MoeFfnWeightsGpuQ};
 use super::gpu_full_attn::{upload_bf16_from_f32, upload_f32_weight, upload_q4_0_from_f32};
-use super::mtp::{MtpFullAttnWeightsGpu, MtpWeights};
-use super::weight_loader::load_f32_tensor;
+use super::mtp::{MtpFfnWeightsGpu, MtpFullAttnWeightsGpu, MtpWeights};
+use super::weight_loader::{load_f32_tensor, load_moe_ffn_quantized};
 use super::Qwen35Config;
 
 pub fn load_mtp_weights_if_present(
@@ -177,7 +177,11 @@ pub fn load_mtp_weights_if_present(
 pub(super) fn mtp_tensor_names(gguf: &GgufFile, layer_index: u32) -> Vec<String> {
     let p = format!("blk.{layer_index}.");
     let nextn = format!("{p}nextn.");
+    // Inner-block tensor suffixes for both dense MTP (Qwen 3.6 27B) and MoE
+    // MTP (Qwen 3.5/3.6 35B-A3B). The two FFN schemas are mutually exclusive
+    // at a given block, so listing both in the membership set is safe.
     let inner = [
+        // Attention (shared by both variants).
         "attn_norm.weight",
         "post_attention_norm.weight",
         "attn_q.weight",
@@ -187,9 +191,19 @@ pub(super) fn mtp_tensor_names(gguf: &GgufFile, layer_index: u32) -> Vec<String>
         "attn_output.weight",
         "attn_q_norm.weight",
         "attn_k_norm.weight",
+        // Dense FFN (Qwen 3.6 27B dense-MTP).
         "ffn_gate.weight",
         "ffn_up.weight",
         "ffn_down.weight",
+        // MoE FFN (Qwen 3.5/3.6 35B-A3B MoE-MTP).
+        "ffn_gate_inp.weight",
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+        "ffn_gate_inp_shexp.weight",
+        "ffn_gate_shexp.weight",
+        "ffn_up_shexp.weight",
+        "ffn_down_shexp.weight",
     ];
     let mut names = Vec::new();
     for name in gguf.tensor_names() {
@@ -270,8 +284,32 @@ fn load_mtp_ffn(
     cfg: &Qwen35Config,
     layer_index: u32,
     device: &MlxDevice,
-) -> Result<(DenseFfnWeightsGpu, u32)> {
+) -> Result<(MtpFfnWeightsGpu, u32)> {
     let p = format!("blk.{layer_index}");
+    let has_dense = gguf.tensor_info(&format!("{p}.ffn_gate.weight")).is_some();
+    let has_moe = gguf
+        .tensor_info(&format!("{p}.ffn_gate_exps.weight"))
+        .is_some();
+    match (has_dense, has_moe) {
+        (true, false) => load_mtp_dense_ffn(gguf, cfg, &p, device),
+        (false, true) => load_mtp_moe_ffn(gguf, cfg, layer_index, &p, device),
+        (true, true) => bail!(
+            "qwen35 MTP loader: block {layer_index} has BOTH dense (`{p}.ffn_gate.weight`) and \
+             MoE (`{p}.ffn_gate_exps.weight`) FFN tensors — GGUF is malformed"
+        ),
+        (false, false) => bail!(
+            "qwen35 MTP loader: block {layer_index} has NEITHER dense (`{p}.ffn_gate.weight`) \
+             nor MoE (`{p}.ffn_gate_exps.weight`) inner FFN tensors"
+        ),
+    }
+}
+
+fn load_mtp_dense_ffn(
+    gguf: &GgufFile,
+    cfg: &Qwen35Config,
+    p: &str,
+    device: &MlxDevice,
+) -> Result<(MtpFfnWeightsGpu, u32)> {
     let h = cfg.hidden_size as usize;
     let gate = load_f32_tensor(gguf, &format!("{p}.ffn_gate.weight"), device)
         .with_context(|| format!("{p}.ffn_gate.weight"))?;
@@ -284,9 +322,66 @@ fn load_mtp_ffn(
     ensure!(up.len() == intermediate * h, "{p}.ffn_up.weight shape mismatch");
     ensure!(down.len() == h * intermediate, "{p}.ffn_down.weight shape mismatch");
     let weights = DenseFfnWeights { gate, up, down };
+    let dense_gpu =
+        DenseFfnWeightsGpu::from_cpu(&weights, device).context("MTP upload dense FFN")?;
+    let intermediate_size = intermediate as u32;
     Ok((
-        DenseFfnWeightsGpu::from_cpu(&weights, device).context("MTP upload dense FFN")?,
-        intermediate as u32,
+        MtpFfnWeightsGpu::Dense {
+            weights: dense_gpu,
+            intermediate_size,
+        },
+        intermediate_size,
+    ))
+}
+
+fn load_mtp_moe_ffn(
+    gguf: &GgufFile,
+    cfg: &Qwen35Config,
+    layer_index: u32,
+    p: &str,
+    device: &MlxDevice,
+) -> Result<(MtpFfnWeightsGpu, u32)> {
+    let moe_cfg = cfg.moe.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "qwen35 MTP loader: block {layer_index} has MoE FFN tensors (`{p}.ffn_gate_exps.weight`) \
+             but `cfg.moe` is None — the model metadata is inconsistent"
+        )
+    })?;
+    // Load with the same quantized path used by every other MoE layer; this
+    // keeps expert weights as native GGML blocks (no F32 expansion) and
+    // matches what the verifier's main forward path consumes.
+    let weights_q = load_moe_ffn_quantized(gguf, layer_index, device)
+        .with_context(|| format!("MTP MoE FFN layer {layer_index}"))?;
+    let moe_gpu = MoeFfnWeightsGpuQ::from_quantized(
+        weights_q.expert_gate_q.clone(),
+        weights_q.expert_up_q.clone(),
+        weights_q.expert_down_q.clone(),
+        weights_q.ggml_type_gate_up,
+        weights_q.ggml_type_down,
+        moe_cfg.num_experts,
+        moe_cfg.moe_intermediate_size,
+        cfg.hidden_size,
+        &weights_q.router,
+        &weights_q.shared_gate_logit,
+        &weights_q.shared_gate,
+        &weights_q.shared_up,
+        &weights_q.shared_down,
+        device,
+    )
+    .with_context(|| format!("MTP MoE upload layer {layer_index}"))?;
+    let shape = MoeFfnShape {
+        hidden_size: cfg.hidden_size,
+        num_experts: moe_cfg.num_experts,
+        num_experts_per_tok: moe_cfg.num_experts_per_tok,
+        moe_intermediate_size: moe_cfg.moe_intermediate_size,
+        shared_intermediate_size: moe_cfg.shared_expert_intermediate_size,
+    };
+    Ok((
+        MtpFfnWeightsGpu::Moe {
+            weights: moe_gpu,
+            shape,
+        },
+        moe_cfg.moe_intermediate_size,
     ))
 }
 

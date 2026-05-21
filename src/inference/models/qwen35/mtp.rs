@@ -12,8 +12,10 @@ use mlx_native::ops::elementwise::elementwise_add;
 use mlx_native::ops::rms_norm;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
-use super::ffn::DenseFfnShape;
-use super::gpu_ffn::{build_dense_ffn_layer_gpu, DenseFfnWeightsGpu};
+use super::ffn::{DenseFfnShape, MoeFfnShape};
+use super::gpu_ffn::{
+    build_dense_ffn_layer_gpu, build_moe_ffn_layer_gpu_q, DenseFfnWeightsGpu, MoeFfnWeightsGpuQ,
+};
 use super::gpu_full_attn::{
     apply_imrope, apply_linear_projection_f32, apply_q_or_k_per_head_rms_norm,
     apply_sdpa_with_kv_cache, apply_sigmoid_gate_multiply,
@@ -30,6 +32,9 @@ pub struct MtpWeights {
     pub layer_index: u32,
     pub hidden_size: u32,
     pub vocab_size: u32,
+    /// For dense MTP this is the dense FFN intermediate dim. For MoE MTP
+    /// it's the per-expert (moe) intermediate dim — useful for diagnostics
+    /// only; dispatch consults [`MtpFfnWeightsGpu`] directly.
     pub intermediate_size: u32,
     pub(super) loaded_tensor_names: Vec<String>,
     pub(super) enorm: MlxBuffer,
@@ -51,7 +56,31 @@ pub struct MtpWeights {
     pub(super) shared_head_norm: MlxBuffer,
     pub(super) shared_head_head: MlxBuffer,
     pub(super) attn: MtpFullAttnWeightsGpu,
-    pub(super) ffn: DenseFfnWeightsGpu,
+    pub(super) ffn: MtpFfnWeightsGpu,
+}
+
+/// Inner-FFN variant for the MTP block.
+///
+/// Qwen 3.6 27B dense-MTP target emits a SwiGLU dense FFN at the MTP block:
+/// `blk.{N}.ffn_gate.weight`, `ffn_up.weight`, `ffn_down.weight`.
+///
+/// Qwen 3.5/3.6 35B-A3B MoE-MTP target emits the same MoE FFN schema used by
+/// regular MoE layers at the MTP block: 8 tensors (`ffn_gate_inp`,
+/// `ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`, plus 4 shared-expert).
+/// The MoE variant uses the production quantized path
+/// ([`MoeFfnWeightsGpuQ`]) so expert weights stay native GGML blocks on Metal,
+/// matching the rest of the verifier stack (no F32 expansion).
+pub(super) enum MtpFfnWeightsGpu {
+    /// Dense SwiGLU FFN (Qwen 3.6 27B dense-MTP convention).
+    Dense {
+        weights: DenseFfnWeightsGpu,
+        intermediate_size: u32,
+    },
+    /// Quantized MoE FFN (Qwen 3.5/3.6 35B-A3B MoE-MTP convention).
+    Moe {
+        weights: MoeFfnWeightsGpuQ,
+        shape: MoeFfnShape,
+    },
 }
 
 pub(super) struct MtpFullAttnWeightsGpu {
@@ -412,18 +441,29 @@ impl MtpWeights {
         .context("MTP fused residual norm")?;
         enc.commit();
 
-        build_dense_ffn_layer_gpu(
-            device,
-            registry,
-            &ffn_input,
-            &self.ffn,
-            DenseFfnShape {
-                hidden_size: h,
-                intermediate_size: self.intermediate_size,
-            },
-            Some(&ffn_residual),
-        )
-        .context("MTP dense FFN")
+        match &self.ffn {
+            MtpFfnWeightsGpu::Dense { weights, intermediate_size } => build_dense_ffn_layer_gpu(
+                device,
+                registry,
+                &ffn_input,
+                weights,
+                DenseFfnShape {
+                    hidden_size: h,
+                    intermediate_size: *intermediate_size,
+                },
+                Some(&ffn_residual),
+            )
+            .context("MTP dense FFN"),
+            MtpFfnWeightsGpu::Moe { weights, shape } => build_moe_ffn_layer_gpu_q(
+                device,
+                registry,
+                &ffn_input,
+                weights,
+                *shape,
+                Some(&ffn_residual),
+            )
+            .context("MTP MoE FFN"),
+        }
     }
 
     fn forward_shared_head(
