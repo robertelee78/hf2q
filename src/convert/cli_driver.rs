@@ -2275,12 +2275,40 @@ fn build_convert_plan(
     // evening — the earlier per-arch gating was based on stale
     // byte-cmp claims (ADR-033 §10 re-validation note at commit
     // bbc9ab8e). Canonical sorts every model the same way; we mirror.
-    steps.sort_by(|a, b| {
-        canonical_tensor_name_cmp(
-            a.plan_entry().name.as_str(),
-            b.plan_entry().name.as_str(),
-        )
-    });
+    if matches!(arch, ArchName::Gemma4Mmproj | ArchName::Gemma4VisionMmproj) {
+        // Canonical mmproj output preserves HF safetensors iteration
+        // order (which is alphabetical by HF tensor name in the
+        // model.safetensors.index.json that
+        // `convert_hf_to_gguf.py` iterates). Sorting by GGUF name
+        // (canonical_tensor_name_cmp) would shuffle the per-block
+        // tensor order vs canonical — verified against
+        // /tmp/gemma_canon_mmproj_f16.gguf dump: canonical layer-0
+        // order is ln1, ffn_down, ffn_gate, ffn_up, attn_post_norm,
+        // ffn_post_norm, ln2, attn_k_norm, attn_k, attn_out,
+        // attn_q_norm, attn_q, attn_v — which matches the HF index's
+        // alphabetical-by-HF-name order.
+        steps.sort_by(|a, b| {
+            // mmproj doesn't fuse MoE experts (Fused) — only Direct +
+            // Synthesized. For Fused (shouldn't appear), fall back to
+            // the gguf_name. For Synthesized, use gguf_name. For Direct,
+            // sort by HF source name (the canonical iteration key).
+            let key_of = |step: &PlanStep| -> String {
+                match step {
+                    PlanStep::Direct { hf_name, .. } => hf_name.clone(),
+                    PlanStep::Fused { gguf_name, .. } => gguf_name.clone(),
+                    PlanStep::Synthesized { gguf_name, .. } => gguf_name.clone(),
+                }
+            };
+            key_of(a).cmp(&key_of(b))
+        });
+    } else {
+        steps.sort_by(|a, b| {
+            canonical_tensor_name_cmp(
+                a.plan_entry().name.as_str(),
+                b.plan_entry().name.as_str(),
+            )
+        });
+    }
     Ok(ConvertPlan { steps })
 }
 
