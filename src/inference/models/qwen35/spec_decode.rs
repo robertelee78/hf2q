@@ -541,8 +541,20 @@ impl<'a> SpecDecode<'a> {
             // OVERWRITING the stale K/V. No explicit GPU rollback —
             // hidden_pos = next_pos (not next_pos+1) ensures only
             // [0..=next_pos] is read in the meantime.
-            let k1_batched =
-                std::env::var("HF2Q_SPEC_DECODE_K1").as_deref() == Ok("1");
+            //
+            // ADR-034 iter 2026-05-21 (task #87): K=1 BATCHED is now the
+            // default for DENSE MTP variant (empirically 1.08-1.13× on
+            // Qwen 3.6 27B Q8_0 — see project_adr034_k1_batched_shipped
+            // memory entry). For MoE MTP variant (Qwen 3.5/3.6 35B-A3B)
+            // the 2-token batched verify costs T_v(2)/T_v(1)=2.4× —
+            // unprofitable until task #89 fusion lands. Env override
+            // HF2Q_SPEC_DECODE_K1=1 forces ON; =0 forces OFF; unset →
+            // auto per variant.
+            let k1_batched = match std::env::var("HF2Q_SPEC_DECODE_K1").as_deref() {
+                Ok("1") => true,
+                Ok("0") => false,
+                _ => matches!(mtp.ffn_kind(), super::mtp::MtpFfnKind::Dense),
+            };
 
             let verify_t0 = if mtp_profile { Some(Instant::now()) } else { None };
             let hidden_size_u32 = self.verifier.cfg.hidden_size;
