@@ -303,6 +303,36 @@ pub fn build_tokenizer_metadata(
             }
         }
     }
+    // ALSO merge tokenizer_config.json's `added_tokens_decoder` dict.
+    // Canonical's `AutoTokenizer.get_added_vocab()` returns the UNION
+    // of tokenizer.json's added_tokens AND tokenizer_config's
+    // added_tokens_decoder. Some HF releases (e.g. Qwen 3.5) ship
+    // domain-specific added tokens ONLY in tokenizer_config (audio/tts
+    // tokens at IDs 248070-248076 for Qwen-Qwen3.5-35B-A3B). Without
+    // this merge they classify as UNUSED instead of CONTROL.
+    if let Some(cfg) = tokenizer_config.as_ref() {
+        if let Some(decoder) = cfg.get("added_tokens_decoder").and_then(|v| v.as_object()) {
+            for (id_str, entry) in decoder {
+                let Ok(id) = id_str.parse::<u32>() else {
+                    continue;
+                };
+                let Some(content) = entry.get("content").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let is_special = entry
+                    .get("special")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                // First-write-wins to preserve tokenizer.json's
+                // canonical content when both sources have the same id.
+                id_to_token.entry(id).or_insert_with(|| content.to_string());
+                added_ids.insert(id);
+                if is_special {
+                    added_special_flag.insert(id);
+                }
+            }
+        }
+    }
 
     // ----- 4. Resolve target vocab_size from config.json --------------
     let max_observed_id = id_to_token.keys().max().copied().unwrap_or(0) as usize;
