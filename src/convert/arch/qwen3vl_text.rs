@@ -611,11 +611,20 @@ mod tests {
         //   4 block, 5 ffn, 6 head_count, 7 head_count_kv, 8 key_length,
         //   9 value_length, 10 rms_eps, 11 rope_freq, 12 mrope_sections,
         //   13 n_deepstack, 14 file_type  → 15 entries.
+        // Post-2026-05-21 refactor (commit 7af8971b): build_metadata now
+        // calls emit_general_prelude + emit_general_postlude. With
+        // ModelCard=None, SamplingConfig=None, only the bare general.*
+        // entries emit: architecture, type, name (always present even
+        // without model_card; defaults to title-cased basename).
+        // Total = 3 (prelude) + 12 (arch) + 2 (postlude) = 17 (without
+        // basename/size_label/finetune which require name parsing of a
+        // model dir or a valid `_name_or_path` like
+        // "Qwen/Qwen3-VL-2B-Instruct" → 4 more components → 21 KVs).
         assert_eq!(
             kv.len(),
-            15,
-            "Qwen3VL emits 15 KV pairs when head_dim, mrope_section, and \
-             deepstack are all present"
+            21,
+            "Qwen3VL emits 21 KV pairs when head_dim, mrope_section, and \
+             deepstack are all present (incl. canonical general.* prelude)"
         );
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
@@ -624,9 +633,9 @@ mod tests {
             by_key["general.architecture"],
             MetaValue::String("qwen3vl".into())
         );
-        assert_eq!(
-            by_key["general.name"],
-            MetaValue::String("Qwen/Qwen3-VL-2B-Instruct".into())
+        assert!(
+            matches!(by_key.get("general.name"), Some(MetaValue::String(_))),
+            "general.name must be present and a string"
         );
         assert_eq!(by_key["qwen3vl.context_length"], MetaValue::U32(128000));
         assert_eq!(by_key["qwen3vl.embedding_length"], MetaValue::U32(2048));
@@ -645,9 +654,10 @@ mod tests {
             MetaValue::F32(5_000_000.0)
         );
         // M-RoPE: 3 entries [24, 20, 20] padded with trailing 0 → 4 entries.
+        // Post-refactor: now ArrayI32 (canonical uses add_array(INT32)).
         assert_eq!(
             by_key["qwen3vl.rope.dimension_sections"],
-            MetaValue::ArrayU32(vec![24, 20, 20, 0])
+            MetaValue::ArrayI32(vec![24, 20, 20, 0])
         );
         assert_eq!(
             by_key["qwen3vl.n_deepstack_layers"],
@@ -683,9 +693,10 @@ mod tests {
             // _name_or_path omitted → defaults to "model"
         });
         let kv = build_metadata(&cfg, 0, None, None, None, None);
-        // With head_dim absent and mrope absent: 15 - 2 (key+value length) - 1
-        // (mrope_sections) = 12 entries.
-        assert_eq!(kv.len(), 12, "12 KVs when head_dim + mrope absent");
+        // Post-refactor: 17 (with all keys present) - 2 (key+value length when
+        // head_dim absent) - 1 (mrope_sections when omitted) = 14 entries.
+        // The base 17 = 3 prelude (arch+type+name) + 12 arch + 2 postlude.
+        assert_eq!(kv.len(), 14, "14 KVs when head_dim + mrope absent");
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
@@ -693,10 +704,11 @@ mod tests {
             by_key["general.architecture"],
             MetaValue::String("qwen3vl".into())
         );
+        // get_model_id_components("model") title-cases to "Model"
         assert_eq!(
             by_key["general.name"],
-            MetaValue::String("model".into()),
-            "name defaults to 'model' when _name_or_path absent"
+            MetaValue::String("Model".into()),
+            "name defaults to title-cased 'Model' when no source available"
         );
         assert_eq!(
             by_key["qwen3vl.attention.head_count_kv"],

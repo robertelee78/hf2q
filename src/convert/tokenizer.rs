@@ -1084,13 +1084,20 @@ fn is_byte_token(token: &str) -> bool {
 
 /// Mirror of llama.cpp's `Model.does_token_look_special` heuristic.
 fn does_token_look_special(token: &str) -> bool {
-    if token.starts_with("<|") && token.ends_with("|>") {
-        return true;
-    }
-    if token.starts_with('<') && token.ends_with('>') && token.len() > 2 && token != "<unk>" {
-        return true;
-    }
-    false
+    // Port of canonical `TextModel.does_token_look_special` at
+    // /opt/llama.cpp/conversion/base.py:1232-1253. STRICTER than the
+    // earlier hf2q heuristic — bare `<...>` tokens like `<tool_call>`,
+    // `<think>`, `</think>` are NOT marked special by canonical (they
+    // remain USER_DEFINED, not CONTROL). Only specific bracket forms
+    // count:
+    //   - exact match: <pad>, <mask>, <2mass>, [@BOS@]
+    //   - `<|...|>`  (Qwen / Gemma / many BPEs)
+    //   - `<｜...｜>` (deepseek-coder; FULLWIDTH VERTICAL BAR U+FF5C)
+    //   - `<unused...>` (gemma)
+    matches!(token, "<pad>" | "<mask>" | "<2mass>" | "[@BOS@]")
+        || (token.starts_with("<|") && token.ends_with("|>"))
+        || (token.starts_with("<\u{ff5c}") && token.ends_with("\u{ff5c}>"))
+        || (token.starts_with("<unused") && token.ends_with('>'))
 }
 
 /// Resolve a special-token name (`bos_token` / `eos_token` /
