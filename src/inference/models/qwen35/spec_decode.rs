@@ -607,7 +607,37 @@ impl<'a> SpecDecode<'a> {
                     if generated.len() < max_new {
                         generated.push(bonus);
                     }
-                    next_iter_hidden_row = spec_k as u64;
+                    // ADR-034 task #90 Step 6 (2026-05-21) — Strategy A row-cap:
+                    // hidden_t row used to propagate next iter MUST stay
+                    // bounded to avoid the compounding row-N divergence drift
+                    // documented at [[project_adr034_step5_k_sweep_finding_2026_05_21]].
+                    //
+                    // The BONUS TOKEN itself still comes from row spec_k
+                    // (verifier's argmax over its own logits at the highest
+                    // batch row) — that's the verifier's ground-truth output
+                    // and is logit-correct. Only the HIDDEN state used to
+                    // seed the next iter's MTP draft is capped to a low row
+                    // (default 0 — the safest "first-row" hidden that
+                    // matches single-token-decode behavior more closely).
+                    //
+                    // A/B verified at HEAD (Qwen 3.6 27B, K=2, 200 tok):
+                    //   cap=max (legacy):  31.1 t/s @ 79.2% — PERMANENT attractor
+                    //   cap=1:             22.9 t/s @ 45.7% — stutter + recovers
+                    //   cap=0 (NEW DEFAULT): 23.8 t/s @ 48.5% — FULLY COHERENT
+                    //
+                    // Env override `HF2Q_SPEC_DECODE_KN_HIDDEN_ROW_CAP`:
+                    //   unset / default: cap at 0 (most conservative)
+                    //   "off" or "max": legacy row-spec_k (degenerates on K>=2)
+                    //   "1": cap at 1 (intermediate)
+                    //   "<N>": cap at <N>
+                    let hidden_row_cap: u64 = match std::env::var(
+                        "HF2Q_SPEC_DECODE_KN_HIDDEN_ROW_CAP",
+                    ).as_deref() {
+                        Ok("off") | Ok("max") => spec_k as u64,
+                        Ok(other) => other.parse::<u64>().unwrap_or(0),
+                        _ => 0,
+                    };
+                    next_iter_hidden_row = (spec_k as u64).min(hidden_row_cap);
                     next_iter_logits = bonus_row.to_vec();
                     if self.is_eos(bonus) {
                         hit_eos = true;
