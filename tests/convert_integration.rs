@@ -245,12 +245,13 @@ fn convert_llama3_tiny_round_trip() {
     //    7 per-block × 2 layers: q, k, v, o, ffn_gate, ffn_up, ffn_down).
     assert_eq!(gguf.tensor_count(), 16);
 
-    // Metadata count: Llama3's build_metadata emits 11 KV pairs + the
-    // ADR-033 tokenizer-metadata emitter adds 11 (model + tokens +
-    // scores + token_type + bos/eos/unk/pad + add_bos_token +
-    // add_space_prefix + pre; merges array is empty in this fixture so
-    // the KV is skipped; no chat_template for llama).
-    assert_eq!(gguf.metadata_count(), 11 + 11);
+    // Metadata count: post-2026-05-21 refactor (commit 25bf6034) the
+    // Llama 3 build_metadata emits 18 KV pairs (general.* prelude
+    // + 12 llama.* arch keys + quantization_version + file_type
+    // postlude) and the Llama 3-specific tokenizer branch emits 8
+    // (model + pre + tokens + token_type + bos + eos + add_bos_token
+    // + add_sep_token; merges array empty in fixture → skipped).
+    assert_eq!(gguf.metadata_count(), 18 + 8);
     assert_eq!(gguf.metadata_string("general.architecture"), Some("llama"));
     assert_eq!(gguf.metadata_u32("llama.embedding_length"), Some(32));
     assert_eq!(gguf.metadata_u32("llama.block_count"), Some(2));
