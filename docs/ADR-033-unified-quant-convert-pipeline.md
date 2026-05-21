@@ -39,7 +39,26 @@
 | Gemma 4 26B-A4B | MoE-128 | **86.85s** | 54.83s | 61.84s | 116.67s | **hf2q 1.34× faster** | `dbd8dfcb…21a4b60fa5` |
 | Qwen 3.5 35B-A3B | MoE-256 + MTP + linear-attn | **144.51s** | 21.72s | 113.22s | 134.94s | **hf2q 1.07× canonical** (was 1.36× SLOWER) | `1f18aae6…d028b7af3` |
 
-**Pre-optimization baseline** (HEAD `ac00b224`, pre-`fbaf002f`): Llama 3 34.6s / Gemma 4 102.74s / Qwen 3.5 183.08s. Post-opt: 31.04s / 86.85s / 144.51s = **-10% / -15% / -21% wall reduction**. The win **scales with model size** — bigger models have more BF16→F32 work on the main thread, which is exactly the path that the fix parallelized.
+**Pre-optimization baseline** (HEAD `ac00b224`, pre-`fbaf002f`): Llama 3 34.6s / Gemma 4 102.74s / Qwen 3.5 183.08s. Post-opt: 31.04s / 86.85s / 144.51s = **-10% / -15% / -21% wall reduction** (single-run, cold-cache anchored). The win **scales with model size** — bigger models have more BF16→F32 work on the main thread, which is exactly the path that the fix parallelized.
+
+**🔬 Bench noise characterization (HEAD `2812fac6`, 3-run Qwen 3.5 study, 2026-05-21):**
+
+| Run | Wall | User | Sys | Cache state |
+|---|---:|---:|---:|---|
+| 1 | **139.17s** | 1511.55s | 67.84s | first run (partial cold) |
+| 2 | **118.71s** | 1493.69s | 34.87s | warm |
+| 3 | **116.12s** | 1490.48s | 29.65s | warm |
+| **mean / σ** | **124.67s** / **12.63s** | — | — | — |
+| **CoV** | **~10%** | — | — | — |
+
+All three runs SHA256-byte-identical (`1f18aae6…d028b7af3`).
+
+**Cache-aware honest reporting**: prior single-run anchors at 144.51s (H4 measurement) and 183.08s (H4 baseline) were both influenced by initial cold-cache state of the 67 GB BF16 safetensors. Steady-state warm-cache wall is **~117-119s**, much closer to canonical's 113.22s pure-Step-2 time. In warm-cache steady state:
+- hf2q Qwen 3.5: **~118s** (warm) vs canonical TOTAL 134.94s → **hf2q is ~1.14× faster than canonical** (NOT 1.07× canonical-or-slower as anchored on cold-cache run).
+- The "21% improvement" claim for H4 should be read as "**17–37% wall reduction depending on cache state**" — single-run benches cannot pin a tighter number.
+- H5's measured -2.4% improvement was correctly rejected as within the 10% CoV noise band.
+
+**Methodology lesson**: cache state on multi-GB safetensors dominates single-run wall-time. Future convert-pipeline benches should either (a) report N≥3 mean + variance, or (b) explicitly declare cold/warm-cache state. The earlier single-run numbers in this section are FIRST-RUN measurements — useful as ceiling estimates but biased high.
 
 **Pattern revealed (DECREASING-lead → CROSSOVER)**: hf2q's lead **shrinks monotonically** with model size/MoE complexity and **crosses over** around MoE-256 scale. The prior ADR-036 claim of "3.0× faster on Gemma 4 26B" (memory entry from 2026-05-19, [[project_adr033_p1_byte_identical_2026_05_19]]) **does NOT reproduce** at HEAD `ac00b224` with fresh consistent methodology. Possible causes for the stale claim: cold-cache vs warm-cache state, concurrent load during the original bench, or different bench framing (Step 2 alone vs total pipeline). The fresh measurement is the authoritative one.
 
