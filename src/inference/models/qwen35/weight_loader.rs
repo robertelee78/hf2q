@@ -1057,23 +1057,35 @@ pub fn load_moe_ffn_quantized(
     let ggml_type_down = down_info.ggml_type;
 
     let supported = |t: GgmlType| matches!(t,
-        GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K
+        GgmlType::Q4_0
+            | GgmlType::Q5_1
+            | GgmlType::Q8_0
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::IQ4_NL
     );
 
     // Validate that the types are supported by quantized_matmul_id_ggml.
-    // Q4_K/Q5_K use the mv_id kernel (mm_id not yet ported); Q4_0/Q8_0/Q6_K
-    // also use mv_id for decode and mm_id for prefill batches > 8 tokens.
+    // Per `mlx-native/src/ops/quantized_matmul_id_ggml.rs`:
+    //  - Q4_K/Q5_K use mv_id (decode) + mm_id (prefill ports landed ADR-022 Phase 2)
+    //  - Q4_0/Q8_0/Q6_K use mv_id (decode) + mm_id (prefill > 8 tok)
+    //  - Q5_1 / IQ4_NL: mv_id + mm_id + mm_id_tensor all ported (ADR-022 Phase 1).
+    //    The allowlist was missing these since the ports landed; canonical
+    //    IQ4_NL MoE GGUFs (e.g. Qwen 3.5 35B-A3B canonical IQ4_NL) carry
+    //    blk.{i}.ffn_{gate,up}_exps.weight as IQ4_NL and blk.{i}.ffn_down_exps
+    //    as IQ4_NL or Q5_K — both kernel-supported but previously load-rejected.
     if !supported(ggml_type_gate_up) {
         return Err(anyhow!(
             "layer {layer_idx}: gate/up expert weights have unsupported quant type {:?} \
-             (expected Q4_0, Q8_0, Q4_K, Q5_K, or Q6_K)",
+             (expected Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, or IQ4_NL)",
             ggml_type_gate_up
         ));
     }
     if !supported(ggml_type_down) {
         return Err(anyhow!(
             "layer {layer_idx}: down expert weights have unsupported quant type {:?} \
-             (expected Q4_0, Q8_0, Q4_K, Q5_K, or Q6_K)",
+             (expected Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, or IQ4_NL)",
             ggml_type_down
         ));
     }

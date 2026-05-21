@@ -34,7 +34,7 @@
 |---|---|---|---|
 | **A — Qwen 3.6 27B dense MTP** | ✅ **WORKING** | Coherent haiku output + **66.1% MTP acceptance** at 20.1 tok/s (Q8_0). Determinism PASS 3/3 byte-identical. K=1 dispatch via `qwen35 spec` path. | P1 parity harness (G2 gate); P6 perf gate vs MTPLX 63 tok/s ref |
 | **A — Qwen 3.5/3.6 35B-A3B MoE-MTP** | ✅ **WORKING** | Coherent "**Paris**." haiku at temp=0 on canonical Q4_K_M GGUF (SHA byte-identical to canonical). **59.1% MTP acceptance** at 110.9 tok/s. Determinism PASS 3/3 byte-identical. K=1 dispatch via `qwen35 spec` path. Fix landed at HEAD (this session): enum refactor `MtpFfnWeightsGpu::{Dense, Moe}` in `mtp.rs` + detection/dispatch in `mtp_weights_load.rs::load_mtp_ffn` — reuses production `MoeFfnWeightsGpuQ` quantized path. | P1 parity harness (G2 gate); P6 perf gate |
-| **B — Qwen 3.6 DFlash** | 🟡 **DISPATCH NOT WIRED** | DFlash drafter loads + safetensors validated (test passes), but `cmd_generate_qwen35` doesn't call `try_dispatch_dflash_spec_decode`. Silently falls through to MTP path. | **~50-100 LOC** to wire `try_dispatch_dflash_spec_decode` into `cmd_generate_qwen35` (line ~2686 in `src/serve/mod.rs`), mirroring the generic `cmd_generate` call at line 1291 |
+| **B — Qwen 3.6 DFlash** | 🚨 **ARCH INTEGRATION** | DFlash drafter loads + safetensors validated (test passes), but `try_dispatch_dflash_spec_decode` requires `target: &mut MlxModelWeights` and calls `target.install_dflash_capture`, `target.rollback_kv`, `target.forward_decode_verify_batched`. `Qwen35Model` does NOT implement any of these (separate forward stack with `HybridKvCache`). Empirically verified at HEAD `afbf5684`: no `install_dflash_capture` / `rollback_kv` / `forward_decode_verify_batched` exists anywhere under `src/inference/models/qwen35/`. | **500-1500 LOC integration** (originally estimated at 50-100 LOC — corrected 2026-05-21 after reading `dispatch_dflash_generate` body). Options: (a) implement DFlash capture session on `Qwen35Model` + `HybridKvCache.rollback_to(pos)` + `forward_decode_verify_batched` for the Qwen35 hybrid stack, or (b) introduce a `DFlashTarget` trait that both `MlxModelWeights` and `Qwen35Model` implement (more refactor up-front but cleaner long-term). |
 | **C — Gemma 4 26B DFlash** | ✅ **WORKING** | "**Paris**." coherent output via DFlash path at 19.3 tok/s. End-to-end pipeline runs (drafter load → upload → prefill capture → draft + verify rounds → coherent output). | P1 parity harness; P5 sampled-path (Leviathan-2023); P6 perf gate |
 | **D — Gemma 4 -assistant** | Phase 7, deferred | Not in v1 scope | — |
 
@@ -80,17 +80,17 @@
    - Use `/opt/dflash/dflash/model_mlx.py` (582 LOC reference) + Gemma 4 26B target (best-ready cell)
    - Dump intermediates: per-layer drafter outputs + final logits
    - Compare via `tests/parity_dflash_python_ref.rs`
-5. **P5.1 Qwen DFlash dispatch wiring** (~1 hr, **50-100 LOC**) — unblocks Cell B
-   - Find `cmd_generate_qwen35` at `src/serve/mod.rs:2686`
-   - Add `try_dispatch_dflash_spec_decode(...)` call before MTP/per-token-decode block
-   - Mirror the structure already present in generic `cmd_generate` at line 1291
+5. **P5.1 Qwen DFlash arch integration** (~500-1500 LOC, **NOT a simple wire-up** — corrected 2026-05-21)
+   - The original "~50-100 LOC" estimate was wrong: `try_dispatch_dflash_spec_decode` requires `target: &mut MlxModelWeights` and calls `install_dflash_capture` / `rollback_kv` / `forward_decode_verify_batched`. `Qwen35Model` does not implement any of these.
+   - Path (a): port `install_dflash_capture` to `Qwen35Model` + add `HybridKvCache.rollback_to(pos)` + implement `forward_decode_verify_batched` for the Qwen35 hybrid attention stack. Reuse existing `apply_sdpa_with_kv_cache` infra. Expected: ~800-1200 LOC.
+   - Path (b): introduce a `DFlashTarget` trait in `src/inference/spec_decode/dflash/target.rs`, refactor `MlxModelWeights` methods behind it, then add a `Qwen35Model` impl. Cleaner separation but more up-front refactor. Expected: ~600-1000 LOC.
    - Test gate: `HF2Q_SPEC_DFLASH=1 HF2Q_DFLASH_DRAFTER_PATH=... hf2q generate ...` produces `[HF2Q_SPEC_DFLASH=1]` banner + coherent text on Qwen 3.6 27B target
 6. **Run parity gates** against all 3 working cells (A-27B, B-27B, C-Gemma-26B)
 7. **P4 DFlash audit via parity diff** (~300 LOC remaining of original 600) — close gaps surfaced by parity harness
 8. **P5.2 Leviathan-2023 rejection sampler** validation
 9. **P6 perf gates** (~200 LOC scripting) — F1/F2/F3 measurements
 
-**Total remaining: ~1050 LOC** (originally estimated ~2500; -58% because ADR-033 §P1 landed the convert side, this prep session validated the load/dispatch layers, AND the MoE MTP loader fix landed at ~130 LOC vs the original 300-500 LOC scope estimate).
+**Total remaining: ~2100 LOC** (originally estimated ~2500; -16% net). The savings from ADR-033 §P1 + the MoE MTP loader fix (~750 LOC saved) are partially offset by the corrected P5.1 scope (~600-1400 LOC actual vs 50-100 LOC originally estimated). P5.1 was MIS-scoped in the 2026-05-21 readiness assessment; the corrected number is grounded in reading `dispatch_dflash_generate`'s body.
 
 ### What an engineer needs (besides this section)
 
