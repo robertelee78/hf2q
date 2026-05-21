@@ -108,6 +108,18 @@ Gemma 4 26B has 54.83s of canonical Step 1 work (Python doing per-expert `.trans
 
 5. **H5 — Profile-driven: `with_min_len(1024)` batching** at `src/core/mlx_safetensors_loader.rs:440`. Post-H4 re-profile (PID 92808, 60s sample) showed `rayon::bridge_producer_consumer::helper` at 14915 worker samples (~24% of active worker CPU) — rayon's per-element work-stealing recursion overhead. Added `.with_min_len(1024)` to force ≥1024-element batches per task. Bench: **141.07s wall vs 144.51s H4 baseline = -3.44s = 2.4% reduction.** SHA256 byte-identical preserved. **Within the observed ~6.6% noise band — REVERTED** (1 bench cannot distinguish 2.4% from disk-cache effects). Per the "Measure 3x, cut once" mantra: a marginal change that's indistinguishable from noise should not ship without controlled multi-run statistics. The 14915 bridge_producer_consumer samples may be irreducible at this call-site, OR they may need a different batching strategy (e.g., `par_chunks_mut` on pre-allocated output) to actually move wall.
 
+6. **H6 — Config experiment: `RAYON_NUM_THREADS=12`** (P-cores only on M5 Max which has 12 P + 6 E cores). Hypothesis: E-cores contribute work-stealing tax that slows the P-cores. **DEFINITIVELY FALSIFIED** across 3 runs (compare baseline 3-run vs H6 3-run, same model + commit):
+
+   | Config | Run 1 | Run 2 | Run 3 | Mean | σ | Warm-cache (R2+R3) |
+   |---|---:|---:|---:|---:|---:|---:|
+   | baseline (18 threads default) | 139.17 | 118.71 | 116.12 | 124.67s | 12.63 | 117.42s |
+   | H6 (12 threads) | 166.86 | 137.93 | 140.02 | 148.27s | 15.93 | **138.98s** |
+   | **Delta warm-cache** | — | — | — | — | — | **+21.56s = +18.4% SLOWER** |
+
+   Cohen's d ≈ 1.64 (large effect). All 3 H6 runs SHA256 byte-identical (`1f18aae6…d028b7af3`). The 18% regression is reproducible — RUN 1's spike was cold-cache; RUN 2-3 are warm and still ~18% slower than baseline warm.
+
+   **Conclusion**: M5 Max E-cores DO contribute useful work for the memory-bandwidth-bound convert workload. Removing them loses 33% of parallel memory streams; the "savings from no slow-core work-stealing" don't compensate. **No code change made** (env var experiment only); documented here so future tuning attempts don't repeat.
+
 **Real per-model breakdown**:
 - **Llama 3 8B dense**: hf2q wins by 28% — canonical's per-tensor Python overhead dominates on small-tensor-count dense models
 - **Gemma 4 26B MoE-128**: hf2q wins by 14% — meaningful but modest; rayon per-row parallelism on 128 experts amortizes IO savings only marginally
