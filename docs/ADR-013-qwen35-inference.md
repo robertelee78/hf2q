@@ -777,9 +777,11 @@ Variant coverage (all GPU): Dense (GEMM), MoE F32 (`mul_mm_id`), MoE GGUF-loaded
 
 Tests: 9 unit tests in `activation_capture_real::tests` + 1 end-to-end test in `quantize::dwq_activation::tests::activation_calibration_with_real_model_wrapper_succeeds` — all passing through the GPU path. Stale "P11 follow-up" notes elsewhere in the inference module retired.
 
-### P14 — MTP speculative-decoding execution (COMPLETE)
+### P14 — MTP speculative-decoding execution (COMPLETE — partially SUPERSEDED by ADR-034)
 
 **Status:** ✅ **COMPLETE on `main`** at commit `79140ec` (2026-04-25 merge of `cfa/p14/codex`). CFA dual-mode session `cfa-20260425-adr013-p14`; queen-judged 337-253 over Claude scaffold branch (real Metal `forward_draft` + file-discipline + `--speculative` CLI + honest receipts decided it).
+
+**🔁 SUPERSEDED-by-ADR-034 (2026-05-21):** the P14 scope as ORIGINALLY documented covered ONLY the dense-FFN MTP block (`inner_block = dense SwiGLU`); see "Phase B: `MtpWeights::forward_draft` GPU full-attention + **dense-FFN** inner block (NOT DeltaNet)" below. Empirical work for ADR-034 P3.1 (2026-05-21, HEAD `afbf5684`) discovered the MTP inner FFN actually MATCHES the main-stack topology — MoE for MoE-A3B targets, dense for dense targets. Qwen 3.5/3.6 35B-A3B emits 8 MoE-style tensors at `blk.{num_hidden_layers}.*` (`ffn_gate_inp` + 3 stacked `ffn_*_exps` + 4 shared-expert); the P14 dense-only loader failed at load time on those GGUFs. ADR-034 P3.1 added the missing `MtpFfnWeightsGpu::Moe` branch + dispatch (~150 LOC across `mtp.rs` + `mtp_weights_load.rs` + `weight_loader.rs`) and empirically validated 8/8 quants on Qwen 3.5 35B-A3B canonical GGUFs. The original P14 dense-MTP path is preserved unchanged and still passes regression gates (Qwen 3.6 27B `Q8_0` at 63.6% MTP acceptance). The P14 status remains COMPLETE for its original-scope (dense-MTP); the MoE-MTP extension lives in ADR-034. See [[project_adr034_moe_mtp_loader_shipped_2026_05_21]] memory entry + ADR-034 START HERE for empirical receipts.
 
 **Scope:** Execute the Multi-Token Prediction (MTP) draft head introduced by the DeepSeek-V3-style `mtp_num_hidden_layers: 1` block Qwen3.5 ships. Convert-side tensor layout is fixed by ADR-012 P11 (`blk.{num_hidden_layers}.nextn.*`); P14 reads those tensors at load time and drives a draft/accept/reject speculative-decoding loop that accepts the draft token when its logit agrees with the verifier, rejects-and-resamples otherwise.
 
