@@ -44,6 +44,19 @@ pub fn is_vision_tensor_pattern(tensor_name: &str) -> bool {
         // trailing dot — e.g. Gemma's `model.embed_vision.weight`.
         // Adding here as the canonical source.
         || tensor_name.contains("embed_vision")
+        // GGUF-side vision namespace: per
+        // /opt/llama.cpp/tools/mtmd/clip-impl.h, vision encoder tensors
+        // are written under the `v.` prefix (`v.blk.<N>.*`,
+        // `v.patch_embd.weight`, `v.position_embd.weight`, `v.std_bias`,
+        // `v.std_scale`, `v.post_ln.*`). The convert orchestrator uses
+        // the POST-MAPPED GGUF name, so this branch is what catches
+        // gemma4_mmproj + gemma4_vision_mmproj output tensors after
+        // map_tensor_name has rewritten them. Added 2026-05-21 for
+        // task #73 (Gemma 4 VisionAudio mmproj port).
+        || tensor_name.starts_with("v.")
+        // Same for projector tensors under `mm.` (mm.input_projection.weight,
+        // mm.soft_emb_norm.weight). Always F16 per mmproj schema.
+        || tensor_name.starts_with("mm.")
 }
 
 /// Returns `true` iff the GGUF tensor name belongs to an audio tower /

@@ -1273,7 +1273,7 @@ fn determine_pre_tokenizer_type(arch: ArchName) -> String {
         // by Qwen3-VL text-side decoders.
         ArchName::Qwen3VlText => "qwen2".into(),
         // llama-vocab.cpp:2005 — Gemma 4 (and Gemma 3 → same bucket).
-        ArchName::Gemma4 | ArchName::Gemma4Mmproj => "gemma4".into(),
+        ArchName::Gemma4 | ArchName::Gemma4Mmproj | ArchName::Gemma4VisionMmproj => "gemma4".into(),
         // llama-vocab.cpp:1951-1959 — LLaMA 3 BPE family.
         ArchName::Llama3 => "llama-bpe".into(),
         // llama-vocab.cpp — MiniMax-M2 has its own pre-tokenizer bucket

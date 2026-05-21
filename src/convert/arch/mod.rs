@@ -17,6 +17,7 @@ pub mod bake;
 pub mod bert;
 pub mod gemma4;
 pub mod gemma4_mmproj;
+pub mod gemma4_vision_mmproj;
 pub mod llama3;
 pub mod minimax_m2;
 pub mod nomic_bert;

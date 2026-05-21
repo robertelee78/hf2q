@@ -39,8 +39,23 @@ pub enum ArchName {
     // --- v1 production arches ---
     /// Google Gemma 4 (Gemma3-architecture compatible).
     Gemma4,
-    /// Google Gemma 4 multimodal projector (mmproj sidecar).
+    /// Google Gemma 4 multimodal projector (mmproj sidecar) —
+    /// **Gemma 3 SigLIP variant**. Tensor naming
+    /// `model.vision_tower.vision_model.encoder.layers.<N>.*` with the
+    /// SigLIP-style block (q_proj, k_proj, mlp.fc1, mlp.fc2,
+    /// layer_norm1, layer_norm2). Handles the Gemma 3 4B/12B vision
+    /// release. For the Gemma 4 26B-A4B-IT vision tower (transformer-
+    /// style with SwiGLU + per-head q/k_norm) see
+    /// [`ArchName::Gemma4VisionMmproj`].
     Gemma4Mmproj,
+    /// Google Gemma 4 vision mmproj — **transformer-style variant**
+    /// shipped with the 26B-A4B-IT release. Tensor naming
+    /// `model.vision_tower.encoder.layers.<N>.*` (plural `layers`, no
+    /// `vision_model` infix), block has SwiGLU FFN + post-attn/post-ffn
+    /// norms + per-head q/k_norm. Projector type 'gemma4v'. Canonical
+    /// handler `/opt/llama.cpp/conversion/gemma.py:769-840
+    /// Gemma4VisionAudioModel`.
+    Gemma4VisionMmproj,
     /// Qwen 3.5/3.6 MoE-A3B family — older dense-MoE variant (gguf
     /// upstream label `qwen3moe`, no linear-attention, no MTP heads,
     /// no shared experts). Used for HF arches like `Qwen3MoeForCausalLM`.
@@ -80,6 +95,7 @@ impl ArchName {
         match self {
             ArchName::Gemma4 => "gemma4",
             ArchName::Gemma4Mmproj => "gemma4_mmproj",
+            ArchName::Gemma4VisionMmproj => "gemma4_vision_mmproj",
             ArchName::Qwen35Moe => "qwen3moe",
             ArchName::Qwen35MoeFull => "qwen35moe",
             ArchName::Qwen3VlText => "qwen3vl",
@@ -104,6 +120,7 @@ impl ArchName {
         match label {
             "gemma4" => Some(ArchName::Gemma4),
             "gemma4_mmproj" => Some(ArchName::Gemma4Mmproj),
+            "gemma4_vision_mmproj" => Some(ArchName::Gemma4VisionMmproj),
             // Two explicit labels for the same arch:
             //   - "qwen3moe" — upstream GGUF metadata convention
             //     (`general.architecture` value).

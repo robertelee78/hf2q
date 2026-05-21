@@ -422,17 +422,12 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
                     .tensor_metas()
                     .any(|m| m.name.starts_with("model.vision_tower.encoder.layers."));
                 if has_gemma4_vision {
-                    return Err(ConvertError::UnsupportedArch {
-                        arch_name: "Gemma4VisionAudio (model.vision_tower.encoder.layers.* convention) — \
-                                     port from /opt/llama.cpp/conversion/gemma.py:768-840 \
-                                     (`Gemma4VisionAudioModel`) pending; the existing \
-                                     gemma4_mmproj.rs implements the SigLIP/Gemma 3 vision \
-                                     convention and does not match this model's tensor names. \
-                                     Track at ADR-033 task #63."
-                            .to_string(),
-                    });
+                    // Gemma 4 26B-A4B-IT transformer-style vision tower.
+                    // Mapper at src/convert/arch/gemma4_vision_mmproj.rs.
+                    ArchName::Gemma4VisionMmproj
+                } else {
+                    ArchName::Gemma4Mmproj
                 }
-                ArchName::Gemma4Mmproj
             }
             other => {
                 return Err(ConvertError::UnsupportedArch {
@@ -632,10 +627,24 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
         "general.quantization_version",
         "general.file_type",
     ];
+    // mmproj sidecars use a DIFFERENT KV order than text decoders:
+    // general.file_type lives EARLY (after general.size_label, before
+    // clip.*), while general.quantization_version remains last. The
+    // generic postlude split (file_type → end) breaks this. For mmproj
+    // we trust the build_metadata's emit order — only quantization_version
+    // is pulled to postlude.
+    let postlude_keys: &[&str] = if matches!(
+        arch,
+        ArchName::Gemma4Mmproj | ArchName::Gemma4VisionMmproj
+    ) {
+        &["general.quantization_version"]
+    } else {
+        POSTLUDE_KEYS
+    };
     let mut prelude: Vec<(String, MetaValue)> = Vec::with_capacity(arch_metadata.len());
-    let mut postlude: Vec<(String, MetaValue)> = Vec::with_capacity(POSTLUDE_KEYS.len());
+    let mut postlude: Vec<(String, MetaValue)> = Vec::with_capacity(postlude_keys.len());
     for (k, v) in arch_metadata {
-        if POSTLUDE_KEYS.contains(&k.as_str()) {
+        if postlude_keys.contains(&k.as_str()) {
             postlude.push((k, v));
         } else {
             prelude.push((k, v));
@@ -654,8 +663,14 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // tokenizer-parse failure as a typed `ConvertError::Tokenizer`
     // variant rather than skipping silently — that exact silent skip
     // is what produced the bug.
-    for (k, v) in build_tokenizer_metadata(&args.hf_dir, arch)? {
-        orch.add_metadata(k, v);
+    // mmproj sidecars do NOT carry tokenizer metadata. Canonical's
+    // MmprojModel base (base.py:2152+) explicitly skips set_vocab. The
+    // text-decoder GGUF (written separately) owns the tokenizer; the
+    // mmproj sidecar is consumed alongside it by the runtime.
+    if !matches!(arch, ArchName::Gemma4Mmproj | ArchName::Gemma4VisionMmproj) {
+        for (k, v) in build_tokenizer_metadata(&args.hf_dir, arch)? {
+            orch.add_metadata(k, v);
+        }
     }
     // Postlude: general.quantization_version + general.file_type
     // emitted last (per canonical order).
@@ -1130,6 +1145,27 @@ fn build_metadata_for_arch(
             .expect("--mmproj routing requires vision_config (validated in run_convert)");
         return gemma4_mmproj::build_metadata(vision, ftype);
     }
+    if matches!(arch, ArchName::Gemma4VisionMmproj) {
+        let vision = config
+            .get("vision_config")
+            .expect("--mmproj routing requires vision_config (validated in run_convert)");
+        // Gemma 4 text decoder hidden_size lives at root + text_config
+        // (multimodal wrapper). Read root first, then text_config sub-object.
+        let text_hidden = config
+            .get("text_config")
+            .and_then(|tc| tc.get("hidden_size"))
+            .or_else(|| config.get("hidden_size"))
+            .and_then(|v| v.as_u64())
+            .expect("--mmproj Gemma4Vision requires text_config.hidden_size") as u32;
+        return crate::convert::arch::gemma4_vision_mmproj::build_metadata(
+            vision,
+            text_hidden,
+            ftype,
+            model_card,
+            sampling,
+            model_dir_basename,
+        );
+    }
     let config = effective_config(config);
     match arch {
         ArchName::Llama3 => llama3::build_metadata(
@@ -1147,6 +1183,7 @@ fn build_metadata_for_arch(
             model_dir_basename,
         ),
         ArchName::Gemma4Mmproj => unreachable!("handled above"),
+        ArchName::Gemma4VisionMmproj => unreachable!("handled above"),
         ArchName::Bert => bert::build_metadata(
             config,
             ftype,
@@ -1360,6 +1397,14 @@ fn map_tensor(
             // mirrors canonical's MMPROJ_MODEL_MAP behavior.
             None => MapOutcome::Drop,
         },
+        ArchName::Gemma4VisionMmproj => {
+            match crate::convert::arch::gemma4_vision_mmproj::map_tensor_name(hf_name) {
+                Some(s) => MapOutcome::Direct(s),
+                // Drop non-vision tensors (text decoder, etc.) silently —
+                // same convention as Gemma4Mmproj.
+                None => MapOutcome::Drop,
+            }
+        }
         ArchName::Bert => match bert::map_tensor_name(hf_name) {
             Some(s) => MapOutcome::Direct(s),
             None => MapOutcome::Unmapped,
@@ -2891,3 +2936,4 @@ mod tests {
         assert_eq!(data.tensor_pair_count(), 1);
     }
 }
+
