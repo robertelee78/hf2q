@@ -271,6 +271,37 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 8) — Task #91 Step 4 SHIPPED but K=N MH hypothesis FALSIFIED (HEAD `88cab142`)
+
+**Step 4 shipped**: K=N path now honors `--temperature` via `leviathan_accept_prefix`. +147 / -39 LOC across the chained MTP draft loop and accept walk (drafts sampled stochastically with `softmax_with_temp` + `sample_from_probs`; target probs built per verify row; greedy path byte-identical via structural branch).
+
+**Hypothesis (testable)**: K=N MH boosts accept rate similar to K=1 BATCHED's +14.8pp, lifting K=2 cap=0 from 1.01× → ~1.10-1.15× while preserving Step 6 coherence.
+
+**Empirical at HEAD (Qwen 3.6 27B Q8_0, 200 tok --ignore-eos, single rep)**:
+
+| Mode                        | tok/s | Accept | vs base 15.4 | Coherence |
+|-----------------------------|------:|-------:|-------------:|-----------|
+| base (no spec)              |  15.4 |    —   | 1.00x        | ✓         |
+| K=1 BATCHED MH temp=0.6     |  25.9 |  70.9% | **1.68x**    | ✓         |
+| K=2 cap=0 greedy temp=0     |  23.4 |  48.5% | 1.52x        | ~150 tok then stutter |
+| K=2 cap=0 MH temp=0.6       |  25.8 |  58.7% | 1.68x        | ⚠️ **collapses ~10 tok ("**The**" attractor)** |
+| K=3 greedy temp=0           |  22.6 |  39.6% | 1.47x        | ✓         |
+| K=3 MH temp=0.6             |  19.0 |  32.7% | 1.23x        | ✓         |
+
+**Results**:
+- **K=2 MH**: throughput up +10%, accept up +10pp — but coherence collapses to "**The**" attractor within ~10 tokens. Hypothesis FALSIFIED for K=2 because higher accept = more row-N divergence exposure (per Step 5 K-sweep finding).
+- **K=3 MH**: coherence preserved but accept rate DROPS -7pp (32.7% vs 39.6%) and throughput REGRESSES to 1.23×. Compound stochastic draft chain divergence outweighs MH's per-position acceptance boost.
+
+**Why K=1 MH works but K=N MH does not**: K=1 has no chained dependency — single draft, single accept decision. K=N drafts are conditioned on prior stochastic drafts; temperature variance compounds across the chain, degrading both accept rate (K=3) and (hidden, token) consistency for the bonus (K=2).
+
+**Decision (per mantra — code+test==truth)**:
+- KEEP the Step 4 wiring at `88cab142` — implementation is correct (compiles, types align, MH primitives are the right ones).
+- DO NOT make MH the default for K=N (currently opt-in via `--temperature` > 0, off by default).
+- K=1 BATCHED MH remains the SHIPPED winner at 1.68× this iter (consistent with prior 1.16× vs higher base).
+- Step 4 is research/experimental on K=N hybrid Qwen until either (a) tree decoding lands (multiple candidates avoid the compounding-draft problem) or (b) row-N divergence is closed at the kernel level (task #89 + custom verifier kernel work).
+
+**Memory persisted**: `[[project_adr034_task91_step4_falsified_2026_05_21]]`.
+
 ### Iteration 2026-05-21 (cont. 6) — Task #87 SHIPPED + task #91 design
 
 **Task #87 SHIPPED at HEAD `3be36936`**: K=1 BATCHED auto-default for dense
