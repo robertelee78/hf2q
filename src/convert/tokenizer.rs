@@ -593,6 +593,53 @@ pub fn build_tokenizer_metadata(
             "tokenizer.ggml.add_sep_token".into(),
             MetaValue::Bool(true),
         ));
+    } else if arch == ArchName::MiniMaxM2 {
+        // MiniMax-M2 emit order — canonical `TextModel._set_vocab_gpt2`
+        // at base.py:1603-1611, mirrored against the canonical Q4_K_M
+        // dump for /opt/hf2q/cache/byte_cmp/MiniMaxAI-MiniMax-M2_canonical_q4_k_m.gguf:
+        //   model = 'gpt2'
+        //   pre = 'minimax-m2'  ← right after model
+        //   tokens, token_type, merges
+        //   bos_token_id, eos_token_id, unknown_token_id ← canonical
+        //     Python dict insertion order. MiniMax-M2's
+        //     tokenizer_config.json has bos+eos+unk all populated, so
+        //     SpecialVocab.add_to_gguf iterates special_token_types
+        //     ('bos', 'eos', 'unk', ...) in that order.
+        //   chat_template emitted at end via existing dispatch.
+        kv.push((
+            "tokenizer.ggml.model".into(),
+            MetaValue::String(tokenizer_model_name),
+        ));
+        kv.push((
+            "tokenizer.ggml.pre".into(),
+            MetaValue::String(pre_tokenizer),
+        ));
+        kv.push((
+            "tokenizer.ggml.tokens".into(),
+            MetaValue::ArrayString(tokens),
+        ));
+        kv.push((
+            "tokenizer.ggml.token_type".into(),
+            MetaValue::ArrayI32(token_types),
+        ));
+        if !merges.is_empty() {
+            kv.push((
+                "tokenizer.ggml.merges".into(),
+                MetaValue::ArrayString(merges),
+            ));
+        }
+        if let Some(id) = bos_id {
+            kv.push(("tokenizer.ggml.bos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = eos_id {
+            kv.push(("tokenizer.ggml.eos_token_id".into(), MetaValue::U32(id)));
+        }
+        if let Some(id) = unk_id {
+            kv.push((
+                "tokenizer.ggml.unknown_token_id".into(),
+                MetaValue::U32(id),
+            ));
+        }
     } else if arch == ArchName::Qwen3VlText {
         // Qwen3-VL Text decoder emit order — canonical
         // `Qwen2Model.set_vocab` calls `_set_vocab_gpt2` (base.py:1603-1611):
@@ -1195,7 +1242,11 @@ fn determine_pre_tokenizer_type(arch: ArchName) -> String {
         // llama-vocab.cpp:2005 — Gemma 4 (and Gemma 3 → same bucket).
         ArchName::Gemma4 | ArchName::Gemma4Mmproj => "gemma4".into(),
         // llama-vocab.cpp:1951-1959 — LLaMA 3 BPE family.
-        ArchName::Llama3 | ArchName::MiniMaxM2 => "llama-bpe".into(),
+        ArchName::Llama3 => "llama-bpe".into(),
+        // llama-vocab.cpp — MiniMax-M2 has its own pre-tokenizer bucket
+        // (verified against canonical convert_hf_to_gguf.py output:
+        // `tokenizer.ggml.pre = 'minimax-m2'`).
+        ArchName::MiniMaxM2 => "minimax-m2".into(),
         // BERT: BAAI bge tokenizer hashes to the same chkhsh as
         // jinaai/jina-embeddings-v2-base-en
         // (`0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f`)

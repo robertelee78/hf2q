@@ -1174,7 +1174,14 @@ fn build_metadata_for_arch(
             model_dir_basename,
             qwen3vl_n_deepstack,
         ),
-        ArchName::MiniMaxM2 => minimax_m2::build_metadata(config, ftype),
+        ArchName::MiniMaxM2 => minimax_m2::build_metadata(
+            config,
+            ftype,
+            model_card,
+            sampling,
+            model_dir_basename,
+            size_label,
+        ),
         // Falcon is a placeholder in ArchName for target_for's branch
         // expression; it is NOT a convert-v2 supported arch. Reaching
         // this arm means detect_arch returned Falcon, which it
@@ -1449,6 +1456,22 @@ fn compute_size_label_for_arch(
 ) -> Option<String> {
     use crate::convert::model_card::compute_size_label;
     match arch {
+        ArchName::MiniMaxM2 => {
+            // MiniMax-M2 MoE: experts under
+            // `model.layers.<N>.block_sparse_moe.experts.<E>.w[1-3]`.
+            // Canonical `Metadata.set_size_label` (utility.py:44-52)
+            // formats as `{expert_count}x{pretty_size}`.
+            let n_experts = config
+                .get("num_local_experts")
+                .or_else(|| config.get("num_experts"))
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)?;
+            let iter = src.tensor_metas().map(|m| {
+                let is_expert = m.name.contains(".block_sparse_moe.experts.");
+                (m.numel() as u64, is_expert)
+            });
+            Some(compute_size_label(iter, n_experts))
+        }
         ArchName::NomicBert => {
             let nomic_ctx = build_nomic_bert_ctx(config);
             let n_experts = nomic_ctx.num_experts? as u32;

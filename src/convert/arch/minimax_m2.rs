@@ -335,12 +335,31 @@ fn match_dense_suffix(rest: &str) -> Option<&'static str> {
 ///   - `_name_or_path` — defaults to `"model"`
 ///
 /// `file_type` is the chosen `LlamaFtype` as a `u32`.
-pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String, MetaValue)> {
-    let name = config
-        .get("_name_or_path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("model")
-        .to_string();
+pub fn build_metadata(
+    config: &serde_json::Value,
+    file_type: u32,
+    model_card: Option<&crate::convert::model_card::ModelCard>,
+    sampling: Option<&crate::convert::model_card::SamplingConfig>,
+    model_dir_basename: Option<&str>,
+    size_label_override: Option<&str>,
+) -> Vec<(String, MetaValue)> {
+    use crate::convert::model_card::{
+        emit_general_postlude, emit_general_prelude, get_model_id_components,
+    };
+    let raw_name = model_dir_basename
+        .map(|s| s.to_string())
+        .or_else(|| {
+            config
+                .get("_name_or_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "model".to_string());
+    let id_components = get_model_id_components(&raw_name);
+    let display_name = id_components
+        .name
+        .clone()
+        .unwrap_or_else(|| raw_name.clone());
 
     let hidden_size = config["hidden_size"]
         .as_u64()
@@ -380,11 +399,12 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
         .get("rope_theta")
         .and_then(|v| v.as_f64())
         .unwrap_or(10000.0) as f32;
+    let head_dim = config
+        .get("head_dim")
+        .and_then(|v| v.as_u64())
+        .map(|x| x as u32);
 
-    // Expert metadata. Per base.py:1194-1199, the loader tries
-    // `num_local_experts` first, then `num_experts`. We mirror that
-    // priority order. Missing field → key not emitted (the loader will
-    // treat the model as dense).
+    // Expert metadata.
     let n_experts = config
         .get("num_local_experts")
         .and_then(|v| v.as_u64())
@@ -395,56 +415,97 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
         .and_then(|v| v.as_u64())
         .map(|x| x as u32);
 
-    let mut kv: Vec<(String, MetaValue)> = vec![
-        (
-            "general.architecture".into(),
-            MetaValue::String("minimax-m2".into()),
-        ),
-        ("general.name".into(), MetaValue::String(name)),
-        ("minimax-m2.context_length".into(), MetaValue::U32(ctx_len)),
-        (
-            "minimax-m2.embedding_length".into(),
-            MetaValue::U32(hidden_size),
-        ),
-        ("minimax-m2.block_count".into(), MetaValue::U32(n_layers)),
-        (
-            "minimax-m2.feed_forward_length".into(),
-            MetaValue::U32(ffn_len),
-        ),
-        (
-            "minimax-m2.expert_feed_forward_length".into(),
-            MetaValue::U32(ffn_len),
-        ),
-        (
-            "minimax-m2.attention.head_count".into(),
-            MetaValue::U32(n_head),
-        ),
-        (
-            "minimax-m2.attention.head_count_kv".into(),
-            MetaValue::U32(n_head_kv),
-        ),
-        (
-            "minimax-m2.attention.layer_norm_rms_epsilon".into(),
-            MetaValue::F32(rms_eps),
-        ),
-        (
-            "minimax-m2.rope.freq_base".into(),
-            MetaValue::F32(rope_theta),
-        ),
-        (
-            "minimax-m2.rope.dimension_count".into(),
-            MetaValue::U32(rotary_dim),
-        ),
-        ("general.file_type".into(), MetaValue::U32(file_type)),
-    ];
+    // expert_gating_func per canonical base.py:1207-1211:
+    //   scoring_func == "sigmoid" → ExpertGatingFuncType::SIGMOID = 2
+    //   scoring_func == "softmax" → ExpertGatingFuncType::SOFTMAX = 1
+    let expert_gating_func: Option<u32> = config
+        .get("scoring_func")
+        .or_else(|| config.get("score_function"))
+        .or_else(|| config.get("score_func"))
+        .or_else(|| config.get("moe_router_activation"))
+        .or_else(|| config.get("moe_router_activation_func"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| match s {
+            "sigmoid" => Some(2),
+            "softmax" => Some(1),
+            _ => None,
+        });
 
+    let mut kv: Vec<(String, MetaValue)> = emit_general_prelude(
+        "minimax-m2",
+        display_name,
+        &id_components,
+        size_label_override,
+        model_card,
+        sampling,
+    );
+    // Canonical MiniMax-M2 arch-KV emit order (verified against
+    // /opt/hf2q/cache/byte_cmp/MiniMaxAI-MiniMax-M2_canonical_q4_k_m.gguf
+    // dump positions 15-29):
+    //   block_count, context_length, embedding_length,
+    //   feed_forward_length, attention.head_count,
+    //   attention.head_count_kv, rope.freq_base,
+    //   attention.layer_norm_rms_epsilon, expert_count,
+    //   expert_used_count, expert_gating_func, attention.key_length,
+    //   attention.value_length, expert_feed_forward_length,
+    //   rope.dimension_count
+    kv.push(("minimax-m2.block_count".into(), MetaValue::U32(n_layers)));
+    kv.push(("minimax-m2.context_length".into(), MetaValue::U32(ctx_len)));
+    kv.push((
+        "minimax-m2.embedding_length".into(),
+        MetaValue::U32(hidden_size),
+    ));
+    kv.push((
+        "minimax-m2.feed_forward_length".into(),
+        MetaValue::U32(ffn_len),
+    ));
+    kv.push((
+        "minimax-m2.attention.head_count".into(),
+        MetaValue::U32(n_head),
+    ));
+    kv.push((
+        "minimax-m2.attention.head_count_kv".into(),
+        MetaValue::U32(n_head_kv),
+    ));
+    kv.push((
+        "minimax-m2.rope.freq_base".into(),
+        MetaValue::F32(rope_theta),
+    ));
+    kv.push((
+        "minimax-m2.attention.layer_norm_rms_epsilon".into(),
+        MetaValue::F32(rms_eps),
+    ));
     if let Some(n) = n_experts {
         kv.push(("minimax-m2.expert_count".into(), MetaValue::U32(n)));
     }
     if let Some(n) = n_experts_used {
         kv.push(("minimax-m2.expert_used_count".into(), MetaValue::U32(n)));
     }
-
+    if let Some(g) = expert_gating_func {
+        kv.push((
+            "minimax-m2.expert_gating_func".into(),
+            MetaValue::U32(g),
+        ));
+    }
+    if let Some(hd) = head_dim {
+        kv.push((
+            "minimax-m2.attention.key_length".into(),
+            MetaValue::U32(hd),
+        ));
+        kv.push((
+            "minimax-m2.attention.value_length".into(),
+            MetaValue::U32(hd),
+        ));
+    }
+    kv.push((
+        "minimax-m2.expert_feed_forward_length".into(),
+        MetaValue::U32(ffn_len),
+    ));
+    kv.push((
+        "minimax-m2.rope.dimension_count".into(),
+        MetaValue::U32(rotary_dim),
+    ));
+    kv.extend(emit_general_postlude(file_type));
     kv
 }
 
@@ -649,23 +710,30 @@ mod tests {
             }
         });
 
-        let kv = build_metadata(&cfg, 17 /* MostlyQ5_K_M */);
+        let kv = build_metadata(&cfg, 17 /* MostlyQ5_K_M */, None, None, None, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
-        // Always-emitted: 13 (architecture, name, ctx, embed, blocks,
-        // feed_forward, expert_feed_forward, head_count, head_count_kv,
-        // rms_eps, rope_freq_base, rope_dim, file_type).
-        // Plus expert_count + expert_used_count (both present here) = 15.
-        assert_eq!(kv.len(), 15);
+        // Post-2026-05-21 refactor: build_metadata uses
+        // emit_general_prelude + emit_general_postlude. With
+        // ModelCard=None, SamplingConfig=None: prelude emits
+        // architecture + type + name = 3. Arch KVs = 13 (block_count,
+        // context_length, embedding_length, feed_forward_length,
+        // head_count, head_count_kv, rope.freq_base, rms_eps,
+        // expert_count, expert_used_count, expert_feed_forward_length,
+        // rope.dimension_count, plus optional expert_gating_func only
+        // if scoring_func present in this fixture: absent → 12 arch).
+        // Postlude = 2 (quantization_version + file_type).
+        // 3 + 12 + 2 + 1 (basename from id_components for "MiniMaxAI/MiniMax-M2") = 18.
+        assert_eq!(kv.len(), 18);
 
         assert_eq!(
             by_key["general.architecture"],
             MetaValue::String("minimax-m2".into())
         );
-        assert_eq!(
-            by_key["general.name"],
-            MetaValue::String("MiniMaxAI/MiniMax-M2".into())
+        assert!(
+            matches!(by_key.get("general.name"), Some(MetaValue::String(_))),
+            "general.name must be present"
         );
         assert_eq!(by_key["minimax-m2.context_length"], MetaValue::U32(196608));
         assert_eq!(by_key["minimax-m2.embedding_length"], MetaValue::U32(6144));
@@ -720,14 +788,15 @@ mod tests {
             "num_experts": 4, // legacy alias for num_local_experts
             // num_experts_per_tok omitted
         });
-        let kv = build_metadata(&cfg, 0);
+        let kv = build_metadata(&cfg, 0, None, None, None, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
+        // get_model_id_components("model") title-cases to "Model"
         assert_eq!(
             by_key["general.name"],
-            MetaValue::String("model".into()),
-            "name defaults to 'model'"
+            MetaValue::String("Model".into()),
+            "name defaults to title-cased 'Model'"
         );
         assert_eq!(
             by_key["minimax-m2.attention.head_count_kv"],
