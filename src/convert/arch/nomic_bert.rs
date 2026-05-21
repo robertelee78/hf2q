@@ -51,6 +51,7 @@
 
 use crate::backends::gguf::types::MetaValue;
 use crate::convert::arch::bake::BakeOp;
+use crate::convert::model_card::{split_base_model, ModelCard};
 
 /// Per-arch context plumbed into [`map_tensor_name`] when the tensor
 /// transform depends on hparams that aren't recoverable from the
@@ -351,7 +352,11 @@ pub fn map_tensor_name(
 ///
 /// `file_type` is the chosen ggml file-type as a `u32` (matches
 /// `gguf_writer.add_file_type(self.ftype)` at base.py).
-pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String, MetaValue)> {
+pub fn build_metadata(
+    config: &serde_json::Value,
+    file_type: u32,
+    model_card: Option<&ModelCard>,
+) -> Vec<(String, MetaValue)> {
     let name = config
         .get("_name_or_path")
         .and_then(|v| v.as_str())
@@ -508,7 +513,7 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
             ) as u32;
         let n_layers_per_moe = moe_every_n.unwrap();
         let _ = n_head_kv; // canonical doesn't emit head_count_kv for nomic
-        vec![
+        let mut kv_v2moe: Vec<(String, MetaValue)> = vec![
             (
                 "general.architecture".into(),
                 MetaValue::String(arch_name.into()),
@@ -561,18 +566,72 @@ pub fn build_metadata(config: &serde_json::Value, file_type: u32) -> Vec<(String
                 format!("{arch_name}.expert_used_count"),
                 MetaValue::U32(moe_top_k),
             ),
-            // Canonical emits these last (positions 50-51 in the
-            // Q8_0 GGUF dump): `general.quantization_version=2` is
-            // added by `llama-quantize` (matches GGUF spec), and
-            // `general.file_type` is added by the convert step's
-            // `add_file_type(ftype)` at `base.py:1220`. We emit both
-            // here since hf2q's convert+quantize is a single pipeline.
-            (
-                "general.quantization_version".into(),
-                MetaValue::U32(2),
-            ),
-            ("general.file_type".into(), MetaValue::U32(file_type)),
-        ]
+        ];
+        // HF model-card metadata (from README.md YAML frontmatter).
+        // Canonical emits these in a fixed order via
+        // `gguf-py/gguf/metadata.py::Metadata.set_gguf_meta_model`.
+        // For nomic v2-moe the observed subset is:
+        //   general.license, general.base_model.{count, 0.*},
+        //   general.tags, general.languages.
+        // The basename / version / organization / size_label fields
+        // require the name-parsing heuristic at `metadata.py:240-355`
+        // — separate iteration (size_label also needs param-counting).
+        if let Some(card) = model_card {
+            if let Some(license) = &card.license {
+                kv_v2moe.push(("general.license".into(), MetaValue::String(license.clone())));
+            }
+            if !card.base_models.is_empty() {
+                kv_v2moe.push((
+                    "general.base_model.count".into(),
+                    MetaValue::U32(card.base_models.len() as u32),
+                ));
+                for (i, entry) in card.base_models.iter().enumerate() {
+                    let (name, org, url) = split_base_model(&entry.raw);
+                    if let Some(name) = name {
+                        kv_v2moe.push((
+                            format!("general.base_model.{i}.name"),
+                            MetaValue::String(name),
+                        ));
+                    }
+                    if let Some(org) = org {
+                        kv_v2moe.push((
+                            format!("general.base_model.{i}.organization"),
+                            MetaValue::String(org),
+                        ));
+                    }
+                    if let Some(url) = url {
+                        kv_v2moe.push((
+                            format!("general.base_model.{i}.repo_url"),
+                            MetaValue::String(url),
+                        ));
+                    }
+                }
+            }
+            if !card.tags.is_empty() {
+                kv_v2moe.push((
+                    "general.tags".into(),
+                    MetaValue::ArrayString(card.tags.clone()),
+                ));
+            }
+            if !card.languages.is_empty() {
+                kv_v2moe.push((
+                    "general.languages".into(),
+                    MetaValue::ArrayString(card.languages.clone()),
+                ));
+            }
+        }
+        // Canonical emits these last (positions 50-51 in the
+        // Q8_0 GGUF dump): `general.quantization_version=2` is
+        // added by `llama-quantize` (matches GGUF spec), and
+        // `general.file_type` is added by the convert step's
+        // `add_file_type(ftype)` at `base.py:1220`. We emit both
+        // here since hf2q's convert+quantize is a single pipeline.
+        kv_v2moe.push((
+            "general.quantization_version".into(),
+            MetaValue::U32(2),
+        ));
+        kv_v2moe.push(("general.file_type".into(), MetaValue::U32(file_type)));
+        kv_v2moe
     } else {
         // v1.5 path (unchanged): preserve historical key set + order
         // for the working bge-style WordPiece + non-MoE convert.
@@ -943,7 +1002,7 @@ mod tests {
             "rotary_emb_base": 1000.0,
         });
 
-        let kv = build_metadata(&cfg, 17 /* MostlyQ5_K_M */);
+        let kv = build_metadata(&cfg, 17 /* MostlyQ5_K_M */, None);
 
         // Check count + keyset (don't depend on insertion order).
         assert_eq!(kv.len(), 12, "NomicBert emits 12 KV pairs at v1");
@@ -1016,7 +1075,7 @@ mod tests {
             "num_experts": 8,
             "moe_top_k": 2,
         });
-        let kv = build_metadata(&cfg, 17);
+        let kv = build_metadata(&cfg, 17, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 
@@ -1115,7 +1174,7 @@ mod tests {
             // rotary_emb_base omitted → defaults to 10000.0
             // _name_or_path omitted → defaults to "model"
         });
-        let kv = build_metadata(&cfg, 0);
+        let kv = build_metadata(&cfg, 0, None);
         let by_key: std::collections::HashMap<_, _> =
             kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
 

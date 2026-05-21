@@ -560,8 +560,15 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     };
 
     // ----- 4. Emit metadata (orchestrator buffers it for begin_write) ----
+    // Read README.md YAML frontmatter (HF model card) up-front so the
+    // arch's `build_metadata` can emit `general.{license, tags,
+    // languages, base_model.*}` per canonical's
+    // `gguf-py/gguf/metadata.py::Metadata.load`. `None` if there's no
+    // README.md or the frontmatter block is absent — arches that don't
+    // consume the model card ignore the parameter.
+    let model_card = crate::convert::model_card::parse_readme_frontmatter(&args.hf_dir);
     let ftype_u32 = ftype_for_metadata as u32;
-    for (k, v) in build_metadata_for_arch(arch, &src.config, ftype_u32) {
+    for (k, v) in build_metadata_for_arch(arch, &src.config, ftype_u32, model_card.as_ref()) {
         orch.add_metadata(k, v);
     }
 
@@ -973,6 +980,7 @@ fn build_metadata_for_arch(
     arch: ArchName,
     config: &serde_json::Value,
     ftype: u32,
+    model_card: Option<&crate::convert::model_card::ModelCard>,
 ) -> Vec<(String, MetaValue)> {
     // Multimodal-wrapper flatten: text-decoder hparams live in
     // config["text_config"] for Gemma 4 / Qwen3-VL omni-shape configs.
@@ -997,7 +1005,7 @@ fn build_metadata_for_arch(
         ArchName::Gemma4 => gemma4::build_metadata(config, ftype),
         ArchName::Gemma4Mmproj => unreachable!("handled above"),
         ArchName::Bert => bert::build_metadata(config, ftype),
-        ArchName::NomicBert => nomic_bert::build_metadata(config, ftype),
+        ArchName::NomicBert => nomic_bert::build_metadata(config, ftype, model_card),
         ArchName::Qwen35Moe => qwen35moe::build_metadata(config, ftype),
         ArchName::Qwen35MoeFull => match build_qwen35moe_full_ctx(config) {
             Some(ctx) => qwen35moe_full::build_metadata(&ctx, config, ftype),

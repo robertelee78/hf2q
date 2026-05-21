@@ -21,6 +21,7 @@
 
 pub mod arch;
 pub mod cli_driver;
+pub mod model_card;
 pub mod orchestrator;
 pub mod quant_selector;
 pub mod sleef_expf;
