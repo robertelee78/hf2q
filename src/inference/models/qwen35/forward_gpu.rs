@@ -3055,16 +3055,17 @@ impl Qwen35Model {
                         // (K=N spec-decode active), thread it through so
                         // the GDN decode kernel writes per-position
                         // recurrent state for partial-reject rollback.
-                        // Slot is byte-identical to pre-#90 when capture
-                        // is None.
-                        let state_capture_ref: Option<&MlxBuffer> = if linear_slot_idx
-                            != usize::MAX
-                        {
-                            kv_cache.linear_attn[linear_slot_idx]
-                                .capture_states
-                                .as_ref()
+                        // Step 4c (2026-05-21) — paired conv capture.
+                        // Slot is byte-identical to pre-#90 when both
+                        // captures are None.
+                        let (state_capture_ref, conv_capture_ref): (
+                            Option<&MlxBuffer>,
+                            Option<&MlxBuffer>,
+                        ) = if linear_slot_idx != usize::MAX {
+                            let slot = &kv_cache.linear_attn[linear_slot_idx];
+                            (slot.capture_states.as_ref(), slot.conv_capture_states.as_ref())
                         } else {
-                            None
+                            (None, None)
                         };
                         build_delta_net_layer(
                             &device,
@@ -3084,6 +3085,7 @@ impl Qwen35Model {
                             shape.conv_kernel,
                             shape.rms_norm_eps,
                             state_capture_ref,
+                            conv_capture_ref,
                         )
                         .with_context(|| format!("delta_net layer {layer_idx}"))?
                     };
@@ -5032,16 +5034,16 @@ impl Qwen35Model {
                                 &zero_rec_buf_out,
                             )
                         };
-                        // ADR-034 task #90 Step 3 — same capture wire as
-                        // the main decode path above.
-                        let state_capture_ref: Option<&MlxBuffer> = if linear_slot_idx
-                            != usize::MAX
-                        {
-                            kv_cache.linear_attn[linear_slot_idx]
-                                .capture_states
-                                .as_ref()
+                        // ADR-034 task #90 Step 3+4c — same capture wire
+                        // as the main decode path above.
+                        let (state_capture_ref, conv_capture_ref): (
+                            Option<&MlxBuffer>,
+                            Option<&MlxBuffer>,
+                        ) = if linear_slot_idx != usize::MAX {
+                            let slot = &kv_cache.linear_attn[linear_slot_idx];
+                            (slot.capture_states.as_ref(), slot.conv_capture_states.as_ref())
                         } else {
-                            None
+                            (None, None)
                         };
                         let out = build_delta_net_layer(
                             &device,
@@ -5061,6 +5063,7 @@ impl Qwen35Model {
                             shape.conv_kernel,
                             shape.rms_norm_eps,
                             state_capture_ref,
+                            conv_capture_ref,
                         )
                         .with_context(|| format!("delta_net legacy greedy layer {layer_idx}"))?;
 

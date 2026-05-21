@@ -93,7 +93,9 @@ use mlx_native::ops::quantized_matmul_ggml::{
 };
 use mlx_native::ops::repeat_tiled::{dispatch_repeat_tiled_f32, RepeatTiledParams};
 use mlx_native::ops::rms_norm;
-use mlx_native::ops::ssm_conv::{dispatch_ssm_conv, SsmConvParams};
+use mlx_native::ops::ssm_conv::{
+    dispatch_ssm_conv, dispatch_ssm_conv_with_capture, SsmConvParams,
+};
 // ADR-015 iter14: `build_ssm_norm_gate_params` lifted inline to
 // `pooled_alloc_buffer` at every call site for unretained-refs ARC anchoring.
 use mlx_native::ops::ssm_norm_gate::dispatch_ssm_norm_gate;
@@ -1885,16 +1887,15 @@ pub fn build_delta_net_layer(
     d_v: u32,
     k_width: u32,
     rms_norm_eps: f32,
-    // ADR-034 task #90 Step 3 (2026-05-21) — per-position capture buffer.
-    // `None`  → legacy `dispatch_gated_delta_net_decode` (byte-identical
-    //           to pre-#90).
-    // `Some(buf)` → `dispatch_gated_delta_net_decode_with_capture`. Buffer
-    //          must be sized [D_k, D_v, n_v_heads, n_tokens_capacity,
-    //          n_seqs] F32 with `n_tokens_capacity >= seq_len` (kernel
-    //          writes the first `seq_len` token-slots). Caller is
-    //          responsible for allocation via
-    //          `HybridKvCache::ensure_la_capture`.
+    // ADR-034 task #90 Step 3 (2026-05-21) — per-position recurrent
+    // capture buffer.
     state_capture: Option<&MlxBuffer>,
+    // ADR-034 task #90 Step 4c (2026-05-21) — per-position conv1d
+    // capture buffer. Paired with `state_capture` (both Some or both
+    // None — caller ensures via `HybridKvCache::ensure_la_capture`).
+    // Shape `[n_seqs, n_tokens_capacity, K-1, channels]` F32 per the
+    // mlx-native `dispatch_ssm_conv_with_capture` kernel contract.
+    conv_state_capture: Option<&MlxBuffer>,
 ) -> Result<MlxBuffer> {
     let qkv_channels = 2 * n_k_heads * d_k + n_v_heads * d_v;
     let z_channels = n_v_heads * d_v;
@@ -2045,11 +2046,23 @@ pub fn build_delta_net_layer(
         )?;
         enc.memory_barrier();
         // Op 3: ssm_conv — reads conv_state_in (GPU ping-pong), writes qkv_conv + conv_state_out.
-        dispatch_ssm_conv(
-            &mut enc, registry, device.metal_device(),
-            &qkv_raw, &weights.ssm_conv1d, conv_state_in, conv_state_out,
-            &qkv_conv, &ssm_params_buf, ssm_conv_params,
-        ).context("dispatch_ssm_conv ops3")?;
+        // ADR-034 task #90 Step 4c (2026-05-21) — when conv_state_capture is
+        // Some, route through the fused-capture variant which writes
+        // per-position conv state for K=N spec-decode rollback. Legacy
+        // path otherwise (byte-identical to pre-Step-4c).
+        if let Some(conv_capture_buf) = conv_state_capture {
+            dispatch_ssm_conv_with_capture(
+                &mut enc, registry, device.metal_device(),
+                &qkv_raw, &weights.ssm_conv1d, conv_state_in,
+                &qkv_conv, conv_capture_buf, &ssm_params_buf, ssm_conv_params,
+            ).context("dispatch_ssm_conv_with_capture ops3 decode (K=N spec)")?;
+        } else {
+            dispatch_ssm_conv(
+                &mut enc, registry, device.metal_device(),
+                &qkv_raw, &weights.ssm_conv1d, conv_state_in, conv_state_out,
+                &qkv_conv, &ssm_params_buf, ssm_conv_params,
+            ).context("dispatch_ssm_conv ops3")?;
+        }
         enc.memory_barrier();
         // Ops 5+6a+6b: l2_norm_q, l2_norm_k, alpha, beta (concurrent)
         let q_l2 = apply_l2_norm_per_head(
@@ -2179,11 +2192,22 @@ pub fn build_delta_net_layer(
                 &weights.attn_gate, seq_len, hidden_size, z_channels,
             )?;
             enc.memory_barrier();
-            dispatch_ssm_conv(
-                &mut enc, registry, device.metal_device(),
-                &qkv_raw, &weights.ssm_conv1d, conv_state_in, conv_state_out,
-                &qkv_conv, &ssm_params_buf, ssm_conv_params,
-            ).context("dispatch_ssm_conv ops3 prefill")?;
+            // ADR-034 task #90 Step 4c (2026-05-21) — prefill ssm_conv
+            // also routes through capture variant when conv_state_capture
+            // is engaged (K=N spec-decode batched verify path).
+            if let Some(conv_capture_buf) = conv_state_capture {
+                dispatch_ssm_conv_with_capture(
+                    &mut enc, registry, device.metal_device(),
+                    &qkv_raw, &weights.ssm_conv1d, conv_state_in,
+                    &qkv_conv, conv_capture_buf, &ssm_params_buf, ssm_conv_params,
+                ).context("dispatch_ssm_conv_with_capture ops3 prefill (K=N spec)")?;
+            } else {
+                dispatch_ssm_conv(
+                    &mut enc, registry, device.metal_device(),
+                    &qkv_raw, &weights.ssm_conv1d, conv_state_in, conv_state_out,
+                    &qkv_conv, &ssm_params_buf, ssm_conv_params,
+                ).context("dispatch_ssm_conv ops3 prefill")?;
+            }
             // P21 Stage 3 hypothesis test: pooled scratches (qkv_raw/qkv_conv from
             // pooled_alloc_buffer), no CPU read between this and ops5-9. Downgrade
             // commit_and_wait → commit_labeled. If iter58b reproduces, revert.
@@ -3633,7 +3657,8 @@ mod tests {
             shape.d_v,
             shape.conv_kernel,
             shape.rms_norm_eps,
-            None, // ADR-034 task #90 Step 3 — no capture in this test
+            None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
+            None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
         )
         .expect("build_delta_net_layer");
 
@@ -3791,7 +3816,8 @@ mod tests {
             shape.d_v,
             shape.conv_kernel,
             shape.rms_norm_eps,
-            None, // ADR-034 task #90 Step 3 — no capture in this test
+            None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
+            None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
         )
         .expect("build_delta_net_layer");
 
@@ -3950,7 +3976,8 @@ mod tests {
             &conv_in_gpu, &conv_out_gpu, &state_in_gpu, &state_out_gpu,
             2, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
-            None, // ADR-034 task #90 Step 3 — no capture in this test
+            None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
+            None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
         ).expect("build_delta_net_layer seq=2");
         device.command_encoder().expect("sync").commit_and_wait().expect("wait");
         let gpu_out_b = download_f32(&gpu_out_b_buf).expect("download");
@@ -4113,7 +4140,8 @@ mod tests {
             &state_zeros_gpu, &state_scratch_mono,
             2, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
-            None, // ADR-034 task #90 Step 3 — no capture in this test
+            None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
+            None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
         ).expect("mono");
         flush(&device);
         let mono_out = download_f32(&mono_buf).expect("dl mono");
@@ -4135,7 +4163,8 @@ mod tests {
             &state_t0_in, &state_t0_out,
             1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
-            None, // ADR-034 task #90 Step 3 — no capture in this test
+            None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
+            None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
         ).expect("chunk t0");
         // Required: decode path commit() without wait — flush before reading.
         flush(&device);
@@ -4152,7 +4181,8 @@ mod tests {
             &state_t0_out, &state_t1_out,
             1, shape.hidden_size, shape.n_k_heads, shape.n_v_heads,
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
-            None, // ADR-034 task #90 Step 3 — no capture in this test
+            None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
+            None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
         ).expect("chunk t1");
         flush(&device);
         let t1_out = download_f32(&t1_buf).expect("dl t1");

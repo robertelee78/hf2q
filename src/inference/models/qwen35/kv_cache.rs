@@ -140,6 +140,30 @@ pub struct LinearAttnStateSlot {
     /// across 30+ LA layers. Allocated once per spec-decode cache
     /// construction; freed when the cache drops.
     pub capture_states: Option<MlxBuffer>,
+    /// ADR-034 task #90 Step 4c (2026-05-21) — per-position conv1d
+    /// state capture buffer for K=N speculative decoding rollback.
+    ///
+    /// Shape: `[n_seqs, n_tokens_max, K-1, channels]` F32 with channels
+    /// innermost — matches the mlx-native
+    /// `dispatch_ssm_conv_with_capture` kernel (commit 92e322b) buffer 4
+    /// contract.
+    ///
+    /// `None` (default) when cache was constructed in non-spec mode —
+    /// non-capture `dispatch_ssm_conv` is used and conv ping-pong is
+    /// byte-identical to pre-#90 behavior.
+    ///
+    /// `Some(buf)` when [`HybridKvCache::ensure_la_capture`] has been
+    /// called. The K=N spec runner routes `build_delta_net_layer`
+    /// through the capture variant, which writes per-position conv state.
+    /// On partial-reject of K drafts, the runner copies
+    /// `conv_capture_states[..., accepted_idx, ...]` → `conv_state`
+    /// (active) via [`HybridKvCache::rollback_la_to`] — paired with the
+    /// recurrent capture rollback to fully restore DeltaNet state.
+    ///
+    /// Memory cost (Qwen 3.5/3.6 conv_channels=8192, K-1=3, n_seqs=1,
+    /// n_tokens_max=4): 384 KB per LA layer. ~12 MB total per forward
+    /// across 30+ LA layers.
+    pub conv_capture_states: Option<MlxBuffer>,
 }
 
 impl FullAttnKvSlot {
@@ -1454,19 +1478,58 @@ impl HybridKvCache {
         let capture_elems = state_elems * (n_tokens_max as usize);
         let shape = vec![d_k, d_v, n_v_heads, n_tokens_max as usize, n_seqs];
 
+        // ADR-034 task #90 Step 4c (2026-05-21) — also allocate the
+        // companion conv1d state capture buffer. Layout per the
+        // mlx-native `dispatch_ssm_conv_with_capture` kernel contract
+        // (commit 92e322b): [n_seqs, n_tokens_max, K-1, channels] F32
+        // with channels innermost.
+        let conv_channels = conv_channels_for(cfg) as usize;
+        let k_minus1 = (cfg.linear_conv_kernel_dim.saturating_sub(1)) as usize;
+        let conv_state_elems = conv_channels * k_minus1 * n_seqs;
+        let conv_capture_elems = (n_seqs)
+            * (n_tokens_max as usize)
+            * k_minus1
+            * conv_channels;
+        let conv_shape = vec![n_seqs, n_tokens_max as usize, k_minus1, conv_channels];
+
         for slot in self.linear_attn.iter_mut() {
-            // Skip re-alloc when the existing capture is already at the
-            // requested capacity. Match by element_count to be tolerant
-            // of shape vec representation differences.
+            // Recurrent capture: skip re-alloc at same size; re-alloc
+            // when larger.
             if let Some(buf) = slot.capture_states.as_ref() {
                 if buf.element_count() == capture_elems {
+                    // continue to conv check
+                } else {
+                    let cap_buf = device
+                        .alloc_buffer(capture_elems * 4, DType::F32, shape.clone())
+                        .map_err(|e| anyhow!("alloc capture_states: {e}"))?;
+                    slot.capture_states = Some(cap_buf);
+                }
+            } else {
+                let cap_buf = device
+                    .alloc_buffer(capture_elems * 4, DType::F32, shape.clone())
+                    .map_err(|e| anyhow!("alloc capture_states: {e}"))?;
+                slot.capture_states = Some(cap_buf);
+            }
+            // Conv capture (Step 4c): same idempotence semantics.
+            if let Some(buf) = slot.conv_capture_states.as_ref() {
+                if buf.element_count() == conv_capture_elems {
                     continue;
                 }
             }
-            let cap_buf = device
-                .alloc_buffer(capture_elems * 4, DType::F32, shape.clone())
-                .map_err(|e| anyhow!("alloc capture_states: {e}"))?;
-            slot.capture_states = Some(cap_buf);
+            let conv_cap_buf = device
+                .alloc_buffer(conv_capture_elems * 4, DType::F32, conv_shape.clone())
+                .map_err(|e| anyhow!("alloc conv_capture_states: {e}"))?;
+            // Sanity: conv_state_elems must equal one per-token slice
+            // of the capture buffer (defensive — wiring contract for
+            // rollback_la_to).
+            debug_assert_eq!(
+                conv_state_elems,
+                conv_capture_elems / (n_tokens_max as usize),
+                "ensure_la_capture: conv per-token elems ({}) must equal conv_state_elems ({})",
+                conv_capture_elems / (n_tokens_max as usize),
+                conv_state_elems,
+            );
+            slot.conv_capture_states = Some(conv_cap_buf);
         }
         Ok(())
     }
@@ -1509,6 +1572,10 @@ impl HybridKvCache {
                  before extending to batched-seq inference."
             ));
         }
+        // ADR-034 task #90 Step 4c (2026-05-21) — rollback also copies
+        // the per-position conv state. Both buffers must be allocated
+        // (ensure_la_capture allocates them in lockstep) for the
+        // rollback to be consistent. Mismatch is a caller bug.
         for (i, slot) in self.linear_attn.iter_mut().enumerate() {
             let capture = slot.capture_states.as_ref().ok_or_else(|| {
                 anyhow!(
@@ -1548,6 +1615,85 @@ impl HybridKvCache {
                 )
             })?;
             dst.copy_from_slice(src);
+
+            // ADR-034 task #90 Step 4c (2026-05-21) — also roll back the
+            // conv1d ring buffer. Layout: [n_seqs=1, n_tokens_max, K-1,
+            // channels]. accepted_idx selects the (s=0, t=accepted_idx)
+            // slice of size (K-1)*channels — but the active `conv_state`
+            // buffer has layout [n_seqs=1, channels, K-1] (channels-major
+            // with K-1 stride 1), so we need a re-indexed copy not a
+            // flat memcpy.
+            let conv_capture = slot.conv_capture_states.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "rollback_la_to: linear_attn[{}].conv_capture_states is None — \
+                     ensure_la_capture must allocate both buffers in lockstep",
+                    i
+                )
+            })?;
+            let conv_state_elems = slot.conv_state.element_count();
+            let conv_capture_elems = conv_capture.element_count();
+            if conv_capture_elems % conv_state_elems != 0 {
+                return Err(anyhow!(
+                    "rollback_la_to: linear_attn[{}].conv_capture_states elems {} \
+                     not a multiple of conv_state elems {}",
+                    i, conv_capture_elems, conv_state_elems
+                ));
+            }
+            let conv_n_tokens_max = conv_capture_elems / conv_state_elems;
+            if (accepted_idx as usize) >= conv_n_tokens_max {
+                return Err(anyhow!(
+                    "rollback_la_to: accepted_idx {} >= conv n_tokens_max {} \
+                     for linear_attn[{}]",
+                    accepted_idx, conv_n_tokens_max, i
+                ));
+            }
+            // Extract per_t = (K-1) * channels from layout. With n_seqs=1
+            // each per-token slice is exactly conv_state_elems elements.
+            let conv_per_t = conv_state_elems;
+            let conv_src_offset = (accepted_idx as usize) * conv_per_t;
+            let conv_capture_slice = conv_capture.as_slice::<f32>().map_err(|e| {
+                anyhow!(
+                    "rollback_la_to: linear_attn[{}].conv_capture as_slice: {e}", i
+                )
+            })?;
+            let conv_src = &conv_capture_slice[conv_src_offset..conv_src_offset + conv_per_t];
+
+            // Re-index from capture [K-1, channels] (channels innermost)
+            // to active conv_state [channels, K-1] (K-1 innermost).
+            // Channels and K-1 are accessible via the shape of conv_state.
+            let conv_shape = slot.conv_state.shape().to_vec();
+            // conv_state shape per alloc_linear_attn_state_slots: [channels, K-1, n_seqs]
+            // For n_seqs=1 the trailing 1 may or may not be present; sniff length.
+            if conv_shape.len() < 2 {
+                return Err(anyhow!(
+                    "rollback_la_to: linear_attn[{}].conv_state shape too short: {:?}",
+                    i, conv_shape
+                ));
+            }
+            let channels = conv_shape[0];
+            let k_minus1 = conv_shape[1];
+            if channels * k_minus1 != conv_per_t {
+                return Err(anyhow!(
+                    "rollback_la_to: linear_attn[{}] conv_state channels*k_minus1 ({}*{}={}) != \
+                     per_t ({})",
+                    i, channels, k_minus1, channels * k_minus1, conv_per_t
+                ));
+            }
+            let conv_dst = slot.conv_state.as_mut_slice::<f32>().map_err(|e| {
+                anyhow!(
+                    "rollback_la_to: linear_attn[{}].conv_state as_mut_slice: {e}", i
+                )
+            })?;
+            // Capture layout: capture[i, c] at offset i*channels + c
+            // (channels innermost). conv_state layout: state[c, i] at
+            // offset c*k_minus1 + i (k_minus1 innermost). Re-index:
+            for k_i in 0..k_minus1 {
+                for c in 0..channels {
+                    let src_idx = k_i * channels + c;
+                    let dst_idx = c * k_minus1 + k_i;
+                    conv_dst[dst_idx] = conv_src[src_idx];
+                }
+            }
         }
         Ok(())
     }
@@ -2012,6 +2158,11 @@ impl HybridKvCache {
             if let Some(buf) = s.capture_states.as_ref() {
                 n += buf.element_count() * 4;
             }
+            // ADR-034 task #90 Step 4c (2026-05-21) — count conv capture
+            // companion buffer when allocated.
+            if let Some(buf) = s.conv_capture_states.as_ref() {
+                n += buf.element_count() * 4;
+            }
         }
         n
     }
@@ -2152,12 +2303,11 @@ fn alloc_linear_attn_slot(
         conv_state_scratch,
         recurrent,
         recurrent_scratch,
-        // ADR-034 task #90 Step 2 (2026-05-21) — capture buffer is
-        // lazily allocated when the cache enters spec-decode mode (call
-        // `HybridKvCache::ensure_la_capture(n_tokens_max)` before
-        // dispatching K=N spec decode). Default = None preserves
-        // byte-identical pre-#90 behavior for all non-spec paths.
+        // ADR-034 task #90 Step 2 (2026-05-21) — recurrent capture
+        // buffer. Step 4c adds the companion conv_capture_states field.
+        // Both lazy-allocate via `HybridKvCache::ensure_la_capture`.
         capture_states: None,
+        conv_capture_states: None,
     })
 }
 
