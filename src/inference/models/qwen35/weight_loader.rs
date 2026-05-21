@@ -1052,6 +1052,22 @@ pub fn load_moe_ffn_quantized(
         .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_gate_exps not found in GGUF"))?;
     let ggml_type_gate_up = gate_info.ggml_type;
 
+    // ADR-034 post-codex audit (2026-05-21): the kernel dispatch path uses
+    // `ggml_type_gate_up` (derived from `ffn_gate_exps`) to interpret the
+    // bytes of BOTH gate and up expert buffers. A malformed GGUF where
+    // `ffn_up_exps` has a different ggml_type would be silently dequantized
+    // with the wrong block geometry. Refuse to load such inputs.
+    let up_info = gguf
+        .tensor_info(&format!("{p}.ffn_up_exps.weight"))
+        .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_up_exps not found in GGUF"))?;
+    anyhow::ensure!(
+        up_info.ggml_type == ggml_type_gate_up,
+        "layer {layer_idx}: ffn_up_exps quant type {:?} differs from ffn_gate_exps {:?}; \
+         malformed GGUF — both must share the same ggml_type for routed-matmul dispatch",
+        up_info.ggml_type,
+        ggml_type_gate_up,
+    );
+
     let down_info = gguf.tensor_info(&format!("{p}.ffn_down_exps.weight"))
         .ok_or_else(|| anyhow!("layer {layer_idx}: ffn_down_exps not found in GGUF"))?;
     let ggml_type_down = down_info.ggml_type;

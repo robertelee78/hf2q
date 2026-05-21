@@ -14,7 +14,8 @@ use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::ffn::{DenseFfnShape, MoeFfnShape};
 use super::gpu_ffn::{
-    build_dense_ffn_layer_gpu, build_moe_ffn_layer_gpu_q, DenseFfnWeightsGpu, MoeFfnWeightsGpuQ,
+    build_dense_ffn_layer_gpu, build_moe_ffn_layer_gpu_q_into, DenseFfnWeightsGpu,
+    MoeFfnWeightsGpuQ,
 };
 use super::gpu_full_attn::{
     apply_imrope, apply_linear_projection_f32, apply_q_or_k_per_head_rms_norm,
@@ -95,6 +96,15 @@ pub(super) struct MtpFullAttnWeightsGpu {
     pub(super) wo: MlxBuffer,
 }
 
+/// Test-friendly indicator for which inner-FFN variant a loaded MTP block
+/// carries. Used by integration tests that need to assert the loader took
+/// the dense or MoE path on a real GGUF without exposing the GPU buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtpFfnKind {
+    Dense,
+    Moe,
+}
+
 impl MtpWeights {
     pub fn len(&self) -> usize {
         self.loaded_tensor_names.len()
@@ -102,6 +112,16 @@ impl MtpWeights {
 
     pub fn is_empty(&self) -> bool {
         self.loaded_tensor_names.is_empty()
+    }
+
+    /// Variant indicator for the inner FFN block. Mainly used by tests
+    /// validating that the loader picked the right dispatch path for a
+    /// given GGUF (dense for Qwen 3.6 27B; MoE for Qwen 3.5/3.6 35B-A3B).
+    pub fn ffn_kind(&self) -> MtpFfnKind {
+        match &self.ffn {
+            MtpFfnWeightsGpu::Dense { .. } => MtpFfnKind::Dense,
+            MtpFfnWeightsGpu::Moe { .. } => MtpFfnKind::Moe,
+        }
     }
 
     pub fn has_tensor_suffix(&self, suffix: &str) -> bool {
@@ -454,15 +474,36 @@ impl MtpWeights {
                 Some(&ffn_residual),
             )
             .context("MTP dense FFN"),
-            MtpFfnWeightsGpu::Moe { weights, shape } => build_moe_ffn_layer_gpu_q(
-                device,
-                registry,
-                &ffn_input,
-                weights,
-                *shape,
-                Some(&ffn_residual),
-            )
-            .context("MTP MoE FFN"),
+            MtpFfnWeightsGpu::Moe { weights, shape } => {
+                // ADR-034 post-codex audit (2026-05-21): route through the
+                // external-encoder variant with the REAL MTP layer index
+                // (`self.layer_index`, typically num_hidden_layers — e.g. 40
+                // for Qwen 3.5 35B-A3B) so the imatrix intercept tag emitted
+                // by `build_moe_ffn_layer_gpu_q_into` reflects the actual
+                // MTP block name (`blk.{layer_index}.ffn_*_exps.weight`).
+                // The legacy wrapper `build_moe_ffn_layer_gpu_q` hardcodes
+                // `layer_idx=0` (gpu_ffn.rs:2263); using it from production
+                // would silently mis-tag MTP expert records.
+                let mut enc = device
+                    .command_encoder()
+                    .context("MTP enc moe_ffn_q")?;
+                let out = build_moe_ffn_layer_gpu_q_into(
+                    &mut enc,
+                    device,
+                    registry,
+                    &ffn_input,
+                    weights,
+                    *shape,
+                    Some(&ffn_residual),
+                    self.layer_index as usize,
+                )
+                .context("MTP MoE FFN")?;
+                // Match the legacy wrapper's commit policy: seq=1 (the only
+                // MTP draft shape) uses non-blocking commit so the next
+                // command buffer pipelines across the boundary on Metal.
+                enc.commit();
+                Ok(out)
+            }
         }
     }
 

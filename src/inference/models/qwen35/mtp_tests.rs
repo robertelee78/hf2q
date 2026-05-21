@@ -1,6 +1,7 @@
 use super::load_mtp_weights_if_present;
 use super::super::gpu_full_attn::upload_f32;
 use super::super::kv_cache::HybridKvCache;
+use super::super::mtp::MtpFfnKind;
 use super::super::mtp_weights_load::mtp_tensor_names;
 use super::super::{default_layer_types, Qwen35Config, Qwen35LayerKind, Qwen35Variant};
 use mlx_native::gguf::GgufFile;
@@ -282,4 +283,137 @@ fn test_cfg_layer_types_not_all_full() {
     let cfg = tiny_cfg(1);
     assert_eq!(cfg.layer_types[0], Qwen35LayerKind::LinearAttention);
     assert_eq!(cfg.layer_types[1], Qwen35LayerKind::FullAttention);
+}
+
+/// ADR-034 P3.1 regression gate (2026-05-21 at HEAD `1cfefea0`):
+///
+/// Canonical Qwen 3.5 35B-A3B MoE-MTP GGUFs emit 8 MoE-style tensors at the
+/// MTP block (`blk.40.ffn_gate_inp/ffn_{gate,up,down}_exps/ffn_{gate,up,down,gate_inp}_shexp`).
+/// Before HEAD `afbf5684` the MTP loader hardcoded the dense FFN tensor
+/// names and crashed at load time. This test asserts the structural
+/// outcome of the fix:
+///
+///   1. `load_mtp_weights_if_present` succeeds against a canonical MoE-MTP GGUF
+///   2. The resulting `MtpWeights::ffn_kind()` returns `MtpFfnKind::Moe`
+///   3. `loaded_tensor_names` contains MoE expert tensor suffixes (so
+///      `has_tensor_suffix("ffn_gate_exps.weight")` reports them)
+///   4. `layer_index` matches the model's MTP block index (40 for 35B-A3B)
+///
+/// Skips when the canonical fixture isn't present locally (CI / contributor
+/// environments without the 20 GB GGUF on disk). The empirical 8/8 quant
+/// sweep in the cover commits validates the runtime path; this test locks
+/// in the LOAD-side structural contract as a CI-side gate.
+#[test]
+fn mtp_loads_canonical_moe_mtp_q4_k_m_with_moe_variant_2026_05_21() {
+    let Some(device) = try_device() else { return };
+    let path = std::path::PathBuf::from(
+        "/opt/hf2q/cache/byte_cmp/Qwen-Qwen3.5-35B-A3B_canonical_q4_k_m.gguf",
+    );
+    if !path.exists() {
+        eprintln!(
+            "skipping: canonical MoE-MTP fixture not at {}; this test \
+             requires the 20 GB Qwen 3.5 35B-A3B Q4_K_M GGUF to exercise \
+             the MoE inner-FFN load path",
+            path.display()
+        );
+        return;
+    }
+    let gguf = match GgufFile::open(&path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let cfg = Qwen35Config::from_gguf(&gguf).expect("cfg");
+    let result = load_mtp_weights_if_present(&gguf, &cfg, &device)
+        .expect("MoE-MTP loader must succeed on canonical Q4_K_M GGUF");
+    let mtp = result.expect("canonical Q4_K_M ships MTP weights");
+
+    // Structural assertions on the MoE-MTP branch.
+    assert_eq!(
+        mtp.ffn_kind(),
+        MtpFfnKind::Moe,
+        "canonical Qwen 3.5 35B-A3B MoE-MTP must load via MtpFfnWeightsGpu::Moe branch"
+    );
+    assert_eq!(
+        mtp.layer_index, cfg.num_hidden_layers,
+        "MTP block sits at blk.{{num_hidden_layers}}"
+    );
+
+    // MoE-specific tensor names must be reflected in loaded_tensor_names
+    // (the mtp_tensor_names membership set was extended in the cover fix).
+    assert!(
+        mtp.has_tensor_suffix("ffn_gate_exps.weight"),
+        "MoE expert gate tensor must be tracked"
+    );
+    assert!(
+        mtp.has_tensor_suffix("ffn_up_exps.weight"),
+        "MoE expert up tensor must be tracked"
+    );
+    assert!(
+        mtp.has_tensor_suffix("ffn_down_exps.weight"),
+        "MoE expert down tensor must be tracked"
+    );
+    assert!(
+        mtp.has_tensor_suffix("ffn_gate_inp.weight"),
+        "MoE router must be tracked"
+    );
+    assert!(
+        mtp.has_tensor_suffix("ffn_gate_inp_shexp.weight"),
+        "MoE shared-expert sigmoid gate must be tracked"
+    );
+
+    // The dense suffix MUST NOT appear in a MoE-MTP GGUF — guard against
+    // silent fall-through if a future loader change accidentally pulls
+    // dense names back in.
+    assert!(
+        !mtp.has_tensor_suffix("ffn_gate.weight"),
+        "MoE-MTP GGUF must not advertise dense ffn_gate.weight at the MTP block"
+    );
+}
+
+/// Companion to the MoE-MTP gate: locks in the dense-MTP path against a
+/// regression. Qwen 3.6 27B emits a dense SwiGLU FFN at the MTP block
+/// (`blk.64.ffn_{gate,up,down}.weight`). The loader must take the Dense
+/// branch and `ffn_kind()` must report Dense.
+///
+/// Skips when the 27 GB Qwen 3.6 27B MTP GGUF isn't present locally.
+#[test]
+fn mtp_loads_canonical_dense_mtp_q8_0_with_dense_variant_2026_05_21() {
+    let Some(device) = try_device() else { return };
+    let path = std::path::PathBuf::from(
+        "/opt/hf2q/models/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-Q8_0-mtp.gguf",
+    );
+    if !path.exists() {
+        eprintln!(
+            "skipping: canonical dense MTP fixture not at {}",
+            path.display()
+        );
+        return;
+    }
+    let gguf = match GgufFile::open(&path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let cfg = Qwen35Config::from_gguf(&gguf).expect("cfg");
+    let result = load_mtp_weights_if_present(&gguf, &cfg, &device)
+        .expect("dense MTP loader must succeed on canonical Qwen 3.6 27B GGUF");
+    let mtp = result.expect("canonical Qwen 3.6 27B Q8_0 ships MTP weights");
+
+    assert_eq!(
+        mtp.ffn_kind(),
+        MtpFfnKind::Dense,
+        "canonical Qwen 3.6 27B dense-MTP must load via MtpFfnWeightsGpu::Dense branch"
+    );
+    assert_eq!(mtp.layer_index, cfg.num_hidden_layers);
+    assert!(mtp.has_tensor_suffix("ffn_gate.weight"));
+    assert!(mtp.has_tensor_suffix("ffn_up.weight"));
+    assert!(mtp.has_tensor_suffix("ffn_down.weight"));
+    // MoE suffixes MUST NOT appear in a dense MTP GGUF.
+    assert!(!mtp.has_tensor_suffix("ffn_gate_exps.weight"));
+    assert!(!mtp.has_tensor_suffix("ffn_gate_inp.weight"));
 }
