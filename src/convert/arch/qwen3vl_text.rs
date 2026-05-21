@@ -111,6 +111,21 @@ pub fn map_tensor_name(hf_name: &str) -> Option<String> {
     // should fall through to the unmapped path.
     let name = hf_name.strip_prefix("thinker.").unwrap_or(hf_name);
 
+    // Strip the `language_model.` infix (canonical base.py:540 —
+    // `if "language_model." in name: name = name.replace("language_model.", "")`).
+    // Real Qwen3-VL-8B / Qwen3-VL-MOE checkpoints wrap the text decoder
+    // tensors as `model.language_model.layers.*.self_attn.q_proj.weight`;
+    // after this strip they become `model.layers.*.self_attn.q_proj.weight`,
+    // which the per-block mapper below recognizes. Surfaced 2026-05-20
+    // by Qwen-Qwen3-VL-8B-Instruct real-model convert smoke test.
+    let stripped: String;
+    let name: &str = if name.contains("language_model.") {
+        stripped = name.replace("language_model.", "");
+        &stripped
+    } else {
+        name
+    };
+
     // ---- Reject vision-side tensors explicitly (deepstack + visual
     // tower live in mmproj, NOT in the text decoder). ----------------
     if name.starts_with("visual.") || name.starts_with("model.visual.") {

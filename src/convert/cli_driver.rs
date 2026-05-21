@@ -1190,7 +1190,30 @@ fn map_tensor(
         },
         ArchName::Qwen3VlText => match qwen3vl_text::map_tensor_name(hf_name) {
             Some(s) => MapOutcome::Direct(s),
-            None => MapOutcome::Unmapped,
+            None => {
+                // Mirror canonical TextModel.filter_tensors at
+                // `/opt/llama.cpp/conversion/base.py:1064-1078` which
+                // SILENTLY DROPS multimodal-side tensors (visual,
+                // audio, vision-projector) rather than erroring. The
+                // mmproj sidecar is written by a separate `--mmproj`
+                // run. Unmapped genuinely-unknown names still surface
+                // as Unmapped (typed error).
+                if hf_name.contains("visual.")
+                    || hf_name.contains("vision.")
+                    || hf_name.contains("audio.")
+                    || hf_name.contains("audio_tower.")
+                    || hf_name.starts_with("mtp.")
+                    || hf_name.contains("patch_embed")
+                    || hf_name.contains("patch_embedding")
+                    || hf_name.contains("patch_merger.")
+                    || hf_name.contains("merger.")
+                    || hf_name.contains("vit.")
+                {
+                    MapOutcome::Drop
+                } else {
+                    MapOutcome::Unmapped
+                }
+            }
         },
         ArchName::Qwen35Moe => lift_qwen_mapped(qwen35moe::map_tensor_name(hf_name)),
         ArchName::Qwen35MoeFull => match qwen35moe_full_ctx {
