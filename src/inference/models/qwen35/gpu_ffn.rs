@@ -1230,19 +1230,19 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
 
     // ADR-034 task #93 (2026-05-21) — fused gate+up+silu_mul Q8_0 path.
     //
-    // When `HF2Q_FUSED_GATE_UP_SILU=1` AND seq_len==1 AND ggml_type==Q8_0,
-    // dispatch a single fused kernel replacing the 3-dispatch sequence
-    // (gate_proj + up_proj + silu_mul). Saves 2 Metal launches per layer
-    // (~50μs each → ~100μs/layer × 64 layers = ~6.4ms verifier savings).
+    // When `HF2Q_FUSED_GATE_UP_SILU=1` AND ggml_type==Q8_0, dispatch a single
+    // fused kernel replacing the 3-dispatch sequence (gate_proj + up_proj
+    // + silu_mul). Saves 2 Metal launches per layer (~25-50μs each).
     //
-    // Parity gate: `cargo test --test adr_034_task93_fused_gate_up_silu_q8_0_parity`
-    // in mlx-native confirms byte-identical (within 1e-5 F32 tolerance) output
-    // vs the unfused sequence at HEAD mlx-native a1a871f.
+    // Step 2 (2026-05-21 cont. 17): parity verified at m=1, m=2, m=4 (mlx-native
+    // tests/adr_034_task93_fused_gate_up_silu_q8_0_parity.rs PASSES 3/3).
+    // The kernel handles arbitrary m via threadgroups.y = m — no seq_len
+    // restriction. This unlocks the SPEC K=1 BATCHED verify path (m=2)
+    // which is the dominant cost (~92% of iter time).
     //
-    // Default OFF until 3-rep paired bench confirms ≥ 1.30× vs base on
-    // Qwen 3.6 27B Q8_0. Flip default-ON once gated.
-    let fused_eligible = seq_len == 1
-        && matches!(
+    // Default OFF until 3-rep paired bench at m>1 confirms ≥1.10× spec
+    // speedup improvement. Then flip default-ON.
+    let fused_eligible = matches!(
             weights.ggml_type_gate_up,
             mlx_native::ops::quantized_matmul_ggml::GgmlType::Q8_0
         )

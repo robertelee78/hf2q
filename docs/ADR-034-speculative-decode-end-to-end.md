@@ -271,6 +271,56 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 17) — Task #93 Step 2: m=2 parity passes but spec gain is noise
+
+Removed the `seq_len == 1` restriction in `build_dense_ffn_layer_gpu_q_into_pooled`
+after parity tests at m∈{1,2,4} ALL PASSED on mlx-native `b9eff9c`.
+
+Initial m=2/m=4 test failures (max_abs_diff=3e2) were a TEST BUG: silu_mul was
+called with `n = intermediate_size` instead of `n = intermediate_size * m`,
+processing only the first input row. After fix: 3/3 PASS.
+
+**3-rep paired bench (Qwen 3.6 27B Q8_0, HF2Q_FUSED_GATE_UP_SILU=1):**
+
+| Path                                          | Mean tok/s | vs cont. 16 (m=1 only) |
+|-----------------------------------------------|-----------:|-----------------------:|
+| BASE + fused (m=1 path only fires)            |      21.93 |     21.83 (~flat)      |
+| SPEC K=1 BATCHED MH temp=0.5 + fused (m=2)    |      25.83 |     26.13 (~flat)      |
+
+**Hypothesis FALSIFIED**: removing the seq_len==1 restriction was projected
+to enable m=2 fusion on spec's seq=2 verifier and unlock ~+9% spec gain.
+Empirical: no measurable change (within run-to-run noise).
+
+**Why fused-m=2 doesn't help spec**: at m=1 (decode), each kernel dispatch is
+dominated by Metal launch overhead (~25-50μs); fusion saves that overhead by
+collapsing 3 dispatches → 1. At m=2, per-dispatch compute roughly doubles,
+so launch overhead becomes a smaller FRACTION of dispatch cost. The same
+absolute saving (~3.5ms) is now drowned by the m=2 compute cost growth.
+
+**Implication**: the path to spec speedup is NOT MLP fusion. The SPEC K=1
+BATCHED verifier is bottlenecked by the BF16 `flash_attn_prefill_resume`
+kernel at seq_len=2 (per cont. 4 finding: T_v(2)/T_v(1) = 1.26× on dense).
+Fusing more dispatches won't help; the dominant cost is the attention kernel
+itself.
+
+**Cell A 27B production state (HF2Q_FUSED_GATE_UP_SILU=1 now eligible at
+all m for Q8_0)**:
+
+| Mode                                  | tok/s | vs base unfused 20.97 |
+|---------------------------------------|------:|----------------------:|
+| BASE + fused                          | 21.93 |          1.046×        |
+| SPEC K=1 BATCHED MH temp=0.5 + fused  | 25.83 |          **1.232×**    |
+
+The +4.6% base gain remains. SPEC speedup unchanged from the unfused 1.244×
+(within noise).
+
+**Re-prioritized open multi-week work**:
+1. ~~Fused MLP m=1~~ — SHIPPED (+4.6% base)
+2. ~~Fused MLP m=2 unlocking spec~~ — FALSIFIED (no gain)
+3. **Cross-length SDPA at seq=2** (task #89) — the actual spec bottleneck
+4. Custom Metal kernel fusing BF16 attention path at seq=2-8
+5. Extend fused MLP to Q4_K_M, IQ4_NL, Q5_K_M, Q6_K (incremental base gains)
+
 ### Iteration 2026-05-21 (cont. 16) — Task #93 fused-MLP Q8_0 SHIPPED (m=1 path); seq=2 fused next
 
 Per operator directive ("multi-week fixes ARE the right thing; can't punt").
