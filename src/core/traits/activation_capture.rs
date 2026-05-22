@@ -90,8 +90,32 @@ pub struct LayerActivations {
 impl LayerActivations {
     /// Total number of f32 values across all captured tensors (for memory
     /// accounting / logs).
+    ///
+    /// When [`Self::target_layer_filter`] is `Some`, this reports the
+    /// **filter-aware** count — only target layers are counted, since
+    /// non-target indices hold empty Vecs (codex /cfa 2026-05-21).
+    /// When `None`, returns the full
+    /// `num_layers * seq_len * hidden_size * 2` count.
     pub fn element_count(&self) -> usize {
-        (self.num_layers as usize) * (self.seq_len as usize) * (self.hidden_size as usize) * 2
+        let per_layer = (self.seq_len as usize) * (self.hidden_size as usize) * 2;
+        match self.target_layer_filter.as_ref() {
+            Some(filter) => filter
+                .iter()
+                .filter(|&&i| i < (self.num_layers as usize))
+                .count()
+                * per_layer,
+            None => (self.num_layers as usize) * per_layer,
+        }
+    }
+
+    /// ADR-034 task #78 Step 3c.A.4 (2026-05-21) — convenience helper
+    /// that returns `true` if `layer_idx` should be downloaded by the
+    /// capture writer. Encapsulates the filter check at the two layer-
+    /// loop push sites in `forward_gpu_impl`. Per codex /cfa suggestion.
+    pub fn is_target_layer(&self, layer_idx: usize) -> bool {
+        self.target_layer_filter
+            .as_ref()
+            .map_or(true, |f| f.contains(&layer_idx))
     }
 
     /// Validate internal shape consistency. Returns the first error, or Ok.
@@ -115,11 +139,22 @@ impl LayerActivations {
             );
         }
         let expected_per_layer = (self.seq_len as usize) * (self.hidden_size as usize);
-        let is_target = |i: usize| -> bool {
-            self.target_layer_filter
-                .as_ref()
-                .map_or(true, |f| f.contains(&i))
-        };
+        // ADR-034 task #78 Step 3c.A.4 (cont. — codex /cfa Minor #2):
+        // reject out-of-range filter entries so a typo like
+        // `target_layer_filter=Some(vec![999])` doesn't silently pass
+        // (all in-range layers would be empty + accepted).
+        if let Some(filter) = self.target_layer_filter.as_ref() {
+            for &f in filter {
+                if f >= (self.num_layers as usize) {
+                    anyhow::bail!(
+                        "LayerActivations: target_layer_filter contains out-of-range index {} (num_layers={})",
+                        f,
+                        self.num_layers,
+                    );
+                }
+            }
+        }
+        let is_target = |i: usize| -> bool { self.is_target_layer(i) };
         for (i, v) in self.layer_inputs.iter().enumerate() {
             // Non-target indices are allowed to be empty when a filter
             // is set; only enforce the full per-layer length on target

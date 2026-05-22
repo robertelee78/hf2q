@@ -1983,6 +1983,12 @@ impl Qwen35Model {
         let hidden = hidden_out.ok_or_else(|| {
             anyhow!("forward_gpu_with_hidden_dflash: hidden buffer was not captured")
         })?;
+        // Codex /cfa 2026-05-21 Suggestion #1: defensive `acts.validate()`
+        // here catches writer bugs (filter not honored, OOB index, etc.)
+        // with clear diagnostics before write_layer_slab dereferences
+        // potentially-empty slabs.
+        acts.validate()
+            .context("forward_gpu_with_hidden_dflash: LayerActivations validate")?;
         // Post-process: copy target slabs out of `acts.layer_outputs`
         // into the session's flat hidden_output buffer.
         if acts.layer_outputs.len() != n_layers {
@@ -3206,11 +3212,7 @@ impl Qwen35Model {
             // memory + GPU→CPU bandwidth for the DFlash capture use
             // case (typically 4 of 64 layers).
             if let Some(ref mut acts) = capture {
-                let is_target = acts
-                    .target_layer_filter
-                    .as_ref()
-                    .map_or(true, |f| f.contains(&layer_idx));
-                if is_target {
+                if acts.is_target_layer(layer_idx) {
                     let f32_data = download_f32(&hidden)
                         .context("capture layer_input download")?;
                     acts.layer_inputs.push(f32_data);
@@ -4170,11 +4172,7 @@ impl Qwen35Model {
             // target_layer_filter when set; see the matching block at
             // the start of the layer loop for rationale.
             if let Some(ref mut acts) = capture {
-                let is_target = acts
-                    .target_layer_filter
-                    .as_ref()
-                    .map_or(true, |f| f.contains(&layer_idx));
-                if is_target {
+                if acts.is_target_layer(layer_idx) {
                     let f32_data = download_f32(&hidden)
                         .context("capture layer_output download")?;
                     acts.layer_outputs.push(f32_data);
