@@ -87,7 +87,50 @@ pub fn try_dispatch_dflash_spec_decode(
     if std::env::var("HF2Q_SPEC_DFLASH").as_deref() != Ok("1") {
         return Ok(None);
     }
-    eprintln!("[HF2Q_SPEC_DFLASH=1] loading DFlash drafter — coherent at temp=0, SLOWER than baseline (Option A pending for perf parity)");
+    let xlen_sdpa = std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() == Ok("1");
+    // Mirror forward_mlx.rs:1322-1325's accepted truthy values for
+    // HF2Q_FULL_F16_KV so this guard doesn't reject a user-configured
+    // `HF2Q_FULL_F16_KV=true` that the V-alloc path WOULD accept.
+    let full_f16_kv = std::env::var("HF2Q_FULL_F16_KV")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "on"))
+        .unwrap_or(false);
+    // ADR-034 Cell C — fail-loud early instead of crashing mid-layer-loop with
+    // "xlen SDPA L0: V is not F16 (got U8); HF2Q_FULL_F16_KV=1 required".
+    // The xlen SDPA path at forward_prefill_batched.rs:1475-1501 requires F16
+    // V cache and is incompatible with TQ-HB 8-bit V quantization. Catch the
+    // user error here BEFORE we load the drafter (which takes ~80ms) instead
+    // of letting it crash after the first round's verify forward starts.
+    if xlen_sdpa && !full_f16_kv {
+        anyhow::bail!(
+            "HF2Q_DFLASH_XLEN_SDPA=1 requires HF2Q_FULL_F16_KV=1 (xlen cross-length SDPA \
+             path needs F16 V cache; default TQ-HB 8-bit V quantization is incompatible). \
+             Set both env vars, or unset HF2Q_DFLASH_XLEN_SDPA to fall back to Option C \
+             (re-prefill from start_pos=0 each round, slower but doesn't require F16 V).",
+        );
+    }
+    if xlen_sdpa {
+        // ADR-034 2026-05-22: Option A xlen SDPA path is WIRED + delivers
+        // 1.62× over Option C on Gemma 4 26B-A4B-it Q5_K_M code-gen (3-rep
+        // paired bench at HEAD 7da12c37: Option A 45.7 t/s vs Option C
+        // 28.2 t/s) AND produces byte-identical output to base autoregressive
+        // at temp=0 greedy. Still 0.40× of base generation — drafter
+        // overhead exceeds Gemma's compact autoregressive cost; production
+        // parity needs drafter training or tree decoding.
+        eprintln!(
+            "[HF2Q_SPEC_DFLASH=1 + HF2Q_DFLASH_XLEN_SDPA=1] loading DFlash drafter — Option A \
+             (cross-length SDPA), byte-identical to base at temp=0 greedy, 1.62× over Option C \
+             on Gemma but still 0.40× of base generation (research-quality)"
+        );
+    } else {
+        // Option C — historical default; slower AND text diverges from base
+        // due to F16/BF16 accumulation order in re-prefill from start_pos=0.
+        eprintln!(
+            "[HF2Q_SPEC_DFLASH=1] loading DFlash drafter — Option C re-prefill, slower than \
+             baseline + diverges from base autoregressive at temp=0; set HF2Q_DFLASH_XLEN_SDPA=1 \
+             + HF2Q_FULL_F16_KV=1 for Option A (1.62× faster + byte-identical to base)"
+        );
+    }
 
     use crate::inference::spec_decode::dflash::{
         config::DFlashConfig,
