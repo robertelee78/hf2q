@@ -1407,6 +1407,8 @@ impl MlxModelWeights {
                         mask_type: mask_type_val,
                         sliding_window: sliding_window_val,
                         softcap: 0.0,
+                        // ADR-034 task #89: decode path = single query.
+                        q_seq_len: FlashAttnVecParams::DEFAULT_Q_SEQ_LEN,
                     };
                     mlx_native::ops::flash_attn_vec::flash_attn_vec(
                         s.encoder_mut(), reg, dev,

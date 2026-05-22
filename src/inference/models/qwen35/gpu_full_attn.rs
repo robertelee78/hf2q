@@ -267,6 +267,8 @@ fn dispatch_decode_sdpa_with_optional_tq(
             mask_type: 0,
             sliding_window: 0,
             softcap: 0.0,
+            // ADR-034 task #89: legacy decode path = single query.
+            q_seq_len: FlashAttnVecParams::DEFAULT_Q_SEQ_LEN,
         };
         // iter-29 (sub-sub-iter 23c-α) + iter-34 (sub-sub-iter 23c-β.5):
         // F32 fallback path. Only reachable when slot.tq is None OR
