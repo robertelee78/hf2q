@@ -226,7 +226,7 @@ At temperature=0, the spec-decode loop emits tokens consistent with the spec pat
 - N-gram speculation: diverges from token 1
 - MTP K=1 BATCHED: diverges at ~14 tokens
 
-**Production gate (HISTORICAL framing — falsified)**: `scripts/coherence-harness/determinism_check.sh` was designed to produce byte-identical output between `HF2Q_SPEC_DFLASH=0` and `HF2Q_SPEC_DFLASH=1` on 18 coherence golden prompts. This gate would FAIL past the divergence window. Needs re-scope to accept-walk-internal consistency (spec output matches what its OWN batched verifier would emit on the same KV state) — see ADR-034 G3 row.
+**Production gate (HISTORICAL framing — never actually implemented as described)**: The original ADR-030 framing referenced `scripts/coherence-harness/determinism_check.sh` as a gate producing byte-identical output between `HF2Q_SPEC_DFLASH=0` and `HF2Q_SPEC_DFLASH=1` on 18 coherence golden prompts. **Empirical at HEAD `2bd38d09` 2026-05-22**: the script that actually exists at that path tests something different — it's a **5× cold-process within-path determinism check** (5 reps of the same model+prompt+config produce byte-identical first-token top-3 logit line). It does NOT compare HF2Q_SPEC_DFLASH=0 vs =1. So this gate was never actually implemented as the ADR described, AND if it had been it would have been falsified at HEAD `04e8dc9d` (see G3 row). The within-path determinism check IS still useful for catching forward-pass Heisenbugs (per script header). Needs re-scope to accept-walk-internal consistency — see ADR-034 G3 row at line 1501.
 
 #### 3.2.2 Stochastic (temperature>0) — distribution-preserving rejection sampling
 
@@ -456,9 +456,16 @@ signature.
 
 - K=0 falsifier (`verifier.rs:36-41`): with empty drafts, verify-forward
   must be byte-identical to single-token `forward_decode`
-- **Determinism gate**: `scripts/coherence-harness/determinism_check.sh
-  --spec-dflash-phase=3 --temp=0` on all 18 golden fixtures + 100 random
-  prompts; require byte-identity
+- **Determinism gate (HISTORICAL framing — see §3.2 CAVEAT)**: original plan
+  was `scripts/coherence-harness/determinism_check.sh --spec-dflash-phase=3
+  --temp=0` on all 18 golden fixtures + 100 random prompts requiring
+  byte-identity to base. EMPIRICALLY FALSIFIED: the script as built only
+  does within-path 5-rep determinism (does NOT compare HF2Q_SPEC_DFLASH=0
+  vs =1), and even if it did compare, byte-identity to base would fail
+  past the divergence window per the cumulative byte-identity scrub.
+  Re-scope: within-path 5-rep determinism within the spec path itself is
+  a valid Heisenbug catcher and remains useful; cross-path byte-identity
+  is FALSIFIED and the gate needs re-scope.
 - **Perf gate**: alt-pair thermal-fair single-token forward_decode vs
   forward_decode_verify(K=1) must show ≤ 5% verify-mode overhead
 
@@ -564,7 +571,7 @@ Synthesizing §3.2 + §3.5 into a single coherence contract:
 
 | Scenario | Coherence guarantee | Measured by | Gate |
 |---|---|---|---|
-| **Greedy (temp=0)** | Byte-identical output to single-token decode | `determinism_check.sh` on 18 golden + 100 random | Hard merge-block at Phase 3, Phase 4, Phase 5 |
+| **Greedy (temp=0) (HISTORICAL — see §3.2 CAVEAT)** | ~~Byte-identical output to single-token decode~~ FALSIFIED — re-scoped to accept-walk consistency with own batched verifier | ~~`determinism_check.sh` on 18 golden + 100 random~~ — that script as built only does within-path 5-rep determinism (does not compare spec-on vs spec-off); cross-path byte-identity is FALSIFIED | Hard merge-block needs re-scope per ADR-034 G3 |
 | **Numerical noise** | argmax-stable across all golden fixtures (≤1e-4 logit delta tolerated) | logit-delta scan in Phase 4 gate | If flip observed → enable `HF2Q_SPEC_DFLASH_GREEDY_TIEBREAK=1` |
 | **Stochastic (temp>0)** | Distribution-preserved (Leviathan exact) | KL≤0.01 + log-prob ratio ∈ [0.98,1.02] + top-50 5-gram Jaccard ≥ 0.95 | Hard merge-block at Phase 6 |
 | **EOS handling** | spec-decode must stop at first EOS in accepted prefix (not after K tokens) | `eos_handling_test.rs` (new) | merge-block at Phase 4 |
@@ -682,7 +689,7 @@ Every gate is hard-merge-blocking; failure halts the phase and surfaces to opera
 | Draft numerical parity vs Python | 2 | correctness | ≤ 1e-3 max-abs logit delta | `tests/fixtures/dflash_draft_parity/` (new) |
 | K=0 verify byte-identity | 3 | coherence | exact match | `tests/coherence_golden/*` |
 | Verify overhead at K=1 | 3 | perf | ≤ 5% over single-token | `scripts/bench-decode.sh --verify-mode` |
-| Greedy spec-decode byte-identity | 4 | coherence | exact match on 18 golden + 100 random | `scripts/coherence-harness/determinism_check.sh` |
+| Greedy spec-decode byte-identity (HISTORICAL — FALSIFIED, see §3.2 CAVEAT) | 4 | coherence | ~~exact match on 18 golden + 100 random~~ — needs re-scope to accept-walk consistency | `scripts/coherence-harness/determinism_check.sh` (within-path 5-rep determinism only) |
 | Per-layer KV rollback correctness | 4 | correctness | exact match | `tests/spec_decode/kv_rollback_per_layer.rs` (new) |
 | Greedy speedup at tg100/2000/5000 | 4 | perf | ≥ 1.6× at all three | `scripts/bench-decode.sh tg{100,2000,5000}` |
 | Long-context (needle-haystack) coherence | 4 | coherence | retrieval pass rate unchanged | `scripts/bench-needle-haystack.sh` |
