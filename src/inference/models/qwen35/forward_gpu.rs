@@ -2000,6 +2000,159 @@ impl Qwen35Model {
         Ok((logits, hidden))
     }
 
+    /// ADR-034 task #78 Step 3c.A.2 (2026-05-21) — embed tokens to a
+    /// fresh GPU F32 buffer of shape `[tokens.len(), hidden_size]`.
+    ///
+    /// Public wrapper around the module-private `embed_tokens_gpu` helper.
+    /// Used by the Qwen35-side DFlash orchestrator (Step 3c.B) to build
+    /// the drafter's input block `[last_token, mask × K]` before calling
+    /// `dispatch_dflash_model_forward`.
+    ///
+    /// Errors:
+    ///   * `tokens` is empty.
+    ///   * Any `tokens[i]` exceeds the embed table's vocab size.
+    ///   * GPU upload failure.
+    ///
+    /// Semantics match `MlxModelWeights::embed_tokens` — Qwen35Model's
+    /// `embed_tokens_gpu` helper performs the CPU gather + GPU upload
+    /// path used by every standard `forward_gpu_impl` call. Note that
+    /// Qwen35 does NOT scale embeddings by sqrt(hidden_size) the way
+    /// Gemma does; this matches the bare gather behavior in
+    /// `io_heads::embed_tokens`.
+    pub fn embed_tokens_gpu(&self, tokens: &[u32]) -> Result<MlxBuffer> {
+        if tokens.is_empty() {
+            return Err(anyhow!("embed_tokens_gpu: tokens must be non-empty"));
+        }
+        let cfg = &self.cfg;
+        self.ensure_gpu_cache_primed()?;
+        self.with_gpu_cache_mut(|device, _reg| {
+            embed_tokens_gpu(tokens, &self.token_embd, cfg.vocab_size, cfg.hidden_size, device)
+        })
+    }
+
+    /// ADR-034 task #78 Step 3c.A.3 (2026-05-21) — apply target's
+    /// `lm_head` (Q4_0 quantized output projection) to a pre-normed
+    /// host-side hidden buffer and return per-position argmaxes.
+    ///
+    /// Use case: the DFlash drafter produces `h_final` (already passed
+    /// through the drafter's own final_norm). The orchestrator needs
+    /// to convert each row of `h_final` to a target-vocab argmax by
+    /// running ONLY the target's lm_head (skipping target's final_norm,
+    /// which would double-norm). This matches
+    /// `MlxModelWeights::per_position_argmax_from_hidden_opt(_,
+    /// apply_final_norm=false, _)`.
+    ///
+    /// Layout:
+    ///   * `host` is `[n_pos, hidden_size]` row-major F32.
+    ///   * Returns `Vec<u32>` length `n_pos` — one argmax per row.
+    ///
+    /// Errors:
+    ///   * `host.len() != n_pos * hidden_size`.
+    ///   * `n_pos == 0`.
+    ///   * Any GPU dispatch / download failure.
+    ///
+    /// The math is byte-equivalent (within Q4_0 quant rounding) to
+    /// taking `forward_gpu_with_hidden`'s logits for the same hidden
+    /// row, because both paths dispatch the same
+    /// `apply_linear_projection_f32(..., lm_head_q4, ...)` kernel with
+    /// the same inputs.
+    pub fn per_position_argmax_from_normed_hidden(
+        &self,
+        host: &[f32],
+        n_pos: u32,
+    ) -> Result<Vec<u32>> {
+        let hs = self.cfg.hidden_size as usize;
+        let vocab = self.cfg.vocab_size as usize;
+        let expected = (n_pos as usize) * hs;
+        if n_pos == 0 {
+            return Err(anyhow!(
+                "per_position_argmax_from_normed_hidden: n_pos must be > 0"
+            ));
+        }
+        if host.len() != expected {
+            return Err(anyhow!(
+                "per_position_argmax_from_normed_hidden: host.len()={} != n_pos({}) * hidden_size({}) = {}",
+                host.len(),
+                n_pos,
+                hs,
+                expected,
+            ));
+        }
+        self.ensure_gpu_cache_primed()?;
+        // Borrow device + registry + output_head.lm_head_q4 from the
+        // thread-local cache. The borrow is scoped to the closure so
+        // it's released before any subsequent forward call would
+        // need it.
+        let self_ptr = self as *const _ as *const ();
+        let logits_f32 = GPU_CACHE.with(|cell| -> Result<Vec<f32>> {
+            let mut guard = cell.borrow_mut();
+            let cache = guard.as_mut().ok_or_else(|| {
+                anyhow!(
+                    "per_position_argmax_from_normed_hidden: GPU_CACHE not initialized"
+                )
+            })?;
+            ensure!(
+                cache.model_ptr == self_ptr,
+                "per_position_argmax_from_normed_hidden: GPU_CACHE belongs to a different Qwen35Model"
+            );
+            let device = &cache.device;
+            let registry = &mut cache.registry;
+            let lm_head_q4 = &cache.output_head.lm_head_q4;
+            // Upload host hidden to a fresh GPU buffer of the right
+            // shape. NOT pooled — the buffer is consumed once and
+            // dropped at end of scope.
+            let input = upload_f32(host, device)
+                .context("per_position_argmax_from_normed_hidden: upload host hidden")?;
+            // Encode + commit lm_head only (no rms_norm — caller has
+            // already applied drafter's own final_norm).
+            let mut enc = device
+                .command_encoder()
+                .context("per_position_argmax_from_normed_hidden: command_encoder")?;
+            let logits_buf = apply_linear_projection_f32(
+                &mut enc,
+                registry,
+                device,
+                &input,
+                lm_head_q4,
+                n_pos,
+                hs as u32,
+                vocab as u32,
+            )
+            .context("per_position_argmax_from_normed_hidden: lm_head projection")?;
+            enc.commit_and_wait_labeled("per_position_argmax_from_normed_hidden")
+                .context("per_position_argmax_from_normed_hidden: commit_and_wait")?;
+            // Download logits to host F32 then drop the GPU buffer.
+            let logits = download_f32(&logits_buf)
+                .context("per_position_argmax_from_normed_hidden: download_f32 logits")?;
+            let expected_logits = (n_pos as usize) * vocab;
+            ensure!(
+                logits.len() == expected_logits,
+                "per_position_argmax_from_normed_hidden: downloaded logits len {} != {} * {} = {}",
+                logits.len(),
+                n_pos,
+                vocab,
+                expected_logits,
+            );
+            Ok(logits)
+        })?;
+        // CPU argmax per row. Single-pass linear scan; matches the
+        // semantics used in Qwen35DFlashTarget::forward_decode_verify_batched
+        // and MlxModelWeights' per-position argmax path.
+        let mut argmaxes = Vec::with_capacity(n_pos as usize);
+        for row in logits_f32.chunks_exact(vocab) {
+            let mut best_idx = 0u32;
+            let mut best_val = f32::NEG_INFINITY;
+            for (i, &v) in row.iter().enumerate() {
+                if v > best_val {
+                    best_val = v;
+                    best_idx = i as u32;
+                }
+            }
+            argmaxes.push(best_idx);
+        }
+        Ok(argmaxes)
+    }
+
     /// Eagerly initialize `GPU_CACHE` if not already primed. SpecDecode
     /// calls this BEFORE its first `HybridKvCache::new` so the kv_cache
     /// is allocated against the same `MlxDevice` the verifier uses;
