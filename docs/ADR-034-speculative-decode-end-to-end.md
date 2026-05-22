@@ -22,7 +22,7 @@
 
 ---
 
-## 🎯 START HERE — Current state at HEAD `061e7ff8` (2026-05-22)
+## 🎯 START HERE — Current state at HEAD `dddfc1b5` (2026-05-22)
 
 > **READ THIS FIRST.** §1 and §2 below describe the audit baseline at HEAD `eab0220b`
 > (2026-05-19) — substantial work has landed since. This section is the authoritative
@@ -33,12 +33,12 @@
 | Cell | Status | Evidence | Remaining work |
 |---|---|---|---|
 | **A — Qwen 3.6 27B dense MTP** | ✅ **1.244-1.332× SHIPPED; short-context absolute throughput peer-competitive; 64K parity unproven** | Auto-default K=1 BATCHED + Metropolis-Hastings stochastic acceptance (task #87 + #91 SHIPPED). 3-rep paired bench at HEAD `6a7ecf4c`: base 21.30 t/s; K=1 BATCHED greedy temp=0 24.53 t/s @ 60.0% accept (1.15×); **K=1 BATCHED MH temp=0.5 26.50 t/s @ 74.6% accept (1.244× on essay) / 28.33 t/s @ 86.9% accept (1.332× on code-gen)**. Throughput matches reported MTPLX D=2 absolute (26.35 t/s @ 80.6% accept) under non-identical conditions (short ctx vs 64K, stock vs fine-tuned drafter; see cont. 14 caveats). Determinism PASS 3/3 byte-identical (greedy AND seeded MH temp=0.5). 51/51 lib tests pass + parity_mtp_python_ref pass. **Production recommendation (workload-dependent, see Mission status table at line 47): code-gen `--temperature 0`, essay `--temperature 0.5`**. | **Multi-week work that must NOT be punted** (per user directive 2026-05-21): (1) fused-MLP Metal kernels (Q8_0/Q4_K_M/IQ4_NL) projected ~1.461× on dense; (2) 64K context parity bench vs MTPLX; (3) custom fine-tuned drafter (training). |
-| **A — Qwen 3.5/3.6 35B-A3B MoE-MTP** | ⚠️ **CORRECT but spec_decode is NET-NEGATIVE on MoE** | Loader works on 8/8 quants (Q4_0..Q8_0..IQ4_NL — all produce identical "**Paris**." at 85.7-100% MTP accept). BUT empirical paired bench at HEAD `0d19f4b0` (Q4_K_M, 200 tok): base 135.8 t/s, K=0 spec 111 t/s (0.82×), K=1 BATCHED 88 t/s (0.65×), K=2 cap=0 75.7 t/s @ 42.1% accept (0.56×). All spec modes SLOWER than base. T_v(N)/T_v(1) ratio = 2.4× (vs 1.26× on dense) — MoE batched-verifier overhead doesn't amortize. Loader fix shipped at afbf5684+66f2008f. | **Task #89** (forward_gpu_batched_decode) required to make spec_decode profitable on MoE. Until then, base K=0 is default (HF2Q_SPEC_DECODE unset). |
+| **A — Qwen 3.5/3.6 35B-A3B MoE-MTP** | ⚠️ **CORRECT but spec_decode is NET-NEGATIVE on MoE; K=N incoherent same as dense** | Loader works on 8/8 quants (Q4_0..Q8_0..IQ4_NL — all produce identical "**Paris**." at 85.7-100% MTP accept). Empirical paired bench at HEAD `dddfc1b5` (2026-05-22, canonical Q4_K_M, 128 tok code-gen, 3-rep): **Base 136.1 t/s; K=0/auto 113.9 t/s @ 93.7% accept (0.84× base); K=1 BATCHED forced 98.6 t/s @ 84.1% accept (0.72×); K=2 87.6 t/s @ 56.1% accept (0.64×).** All spec modes SLOWER than base. T_v(N)/T_v(1) ratio = 2.4× (vs 1.26× on dense) — MoE batched-verifier overhead doesn't amortize. **K=2 on MoE produces INCOHERENT output** (e.g., `def_fibonacci(n):` with underscore, duplicated lines, repeated `n.` / `terms.` spamming) — same row-N kernel divergence pattern as dense K=N (see §K=N CORRECTION block). Improvements vs HEAD `0d19f4b0` baseline (Q4_K_M 200 tok): K=1 BATCHED 88 → 98.6 t/s (+12%), K=2 accept 42.1% → 56.1% (+14pp). Loader fix shipped at `afbf5684`+`66f2008f`. | **Task #89** (forward_gpu_batched_decode = batched-prefill kernel unification) required to make spec_decode profitable on MoE. K=N coherence fix needs same task #89 batched-prefill unification (close row-N hidden divergence). Until then, base K=0 (no spec) is default for MoE (HF2Q_SPEC_DECODE unset). |
 | **B — Qwen 3.6 DFlash** | ✅ **WIRED + COHERENT, 0.77× of production winner post-task #95** | Task #95 (compile-drafter lever) SHIPPED in 10 sub-iters A-H at HEAD `f23b9274`. Warmup-corrected 3-rep paired bench at HEAD `f23b9274`: DFlash BS=4 code-gen 23.17 t/s (was 18.4 pre-#95, +26% cumulative), BS=2 code-gen 21.63 (+28.8%), BS=4 essay 20.97 (+24.1%), BS=2 essay 20.73 (+25.6%). Codex /cfa cleared cumulative work (Critical 0, Major 0, Minor 2 doc-only). **Real lever per peer-code read of MTPLX** (commit `e9358fde` 2026-05-21): MTPLX's 2.24× advantage is from `mx.compile`-compiled chained drafter (~17 commit boundaries eliminated), NOT fused projections kernels (peer code confirms they don't have one either). Task #89's vec-extension Steps 1-3b SHIPPED but EMPIRICALLY did not close the perf gap on its own — encoder fusion saves only ~1-2 ms (noise band); fa.ops1_4 at seq_len=2 cur_len>0 is COMPUTE-bound. | DFlash drafter forward cost remains structural. Closure to MTP K=1 production parity needs drafter training (smaller/faster drafter) or tree decoding (EAGLE-2/Medusa). DFlash on Qwen35 stays opt-in via HF2Q_SPEC_DFLASH=1 (default OFF). Users should use `HF2Q_SPEC_DECODE=1 --temperature 0` (code-gen 1.36×) or `0.5` (essay 1.26×) for production. |
 | **C — Gemma 4 26B DFlash** | ⚠️ **COHERENT, Option A WIRED + 1.62× over Option C + generated text byte-identical to base at temp=0 greedy; still 0.40× of base generation rate** | Empirical 3-rep paired bench at HEAD `7da12c37` (2026-05-22, Gemma 4 26B-A4B-it Q5_K_M, `HF2Q_FULL_F16_KV=1`, 64 tok code-gen, generation rate per `--- mlx-native: [ Prompt: X t/s \| Generation: Y t/s ]`): **Base generation 113.2 t/s (112.7/114.8/112.1); Option A (HF2Q_DFLASH_XLEN_SDPA=1) 45.7 t/s = 0.40× base; Option C (default, re-prefill from start_pos=0) 28.2 t/s = 0.25× base. Option A delivers 1.62× over Option C.** Coherence finding: Option A's generated text is BYTE-IDENTICAL to base autoregressive at temp=0 greedy (modulo run-metadata variance like load timing and prefill numbers) — both produce `"Here is the most efficient way to implement this using an iterative approach. ... def fibonacci_sequence(n):"`. Option C produces a DIFFERENT coherent response (`"Here is the standard, most efficient way to compute the Fibonacci sequence iteratively in Python ... def fibonacci_iterative(n):"`). Option A is BOTH faster AND more faithful to autoregressive — Option C's re-prefill F16/BF16 accumulation order flips argmax on close logits. Earlier ADR claim "Option A pending / required for perf gate" was MISLEADING: orchestrator branch + forward_prefill_batched resume-SDPA already wired at orchestrator.rs:802-855 / forward_prefill_batched.rs:578-583. Gating: `HF2Q_DFLASH_XLEN_SDPA=1` + `HF2Q_FULL_F16_KV=1` (xlen SDPA requires F16 V cache, NOT compatible with TQ-HB 8-bit V quantization). | Option A is the correct production path for Gemma DFlash (when user accepts F16 KV memory cost). Still 0.40× of base generation — DFlash drafter overhead exceeds Gemma's compact autoregressive cost regardless of verifier path. Production parity requires drafter training (smaller drafter) or tree decoding. Historical Q8_0 paired bench at HEAD `6d80e6be` 2026-05-21 (Option C, pre-Option-A-discovery): base 92.9, DFlash 19.2 = 0.21× of base — also research-quality. |
 | **D — Gemma 4 -assistant** | Phase 7, deferred | Not in v1 scope | — |
 
-### Mission status at HEAD `061e7ff8` (2026-05-22) — FUNCTIONALLY COMPLETE
+### Mission status at HEAD `dddfc1b5` (2026-05-22) — FUNCTIONALLY COMPLETE
 
 **Production winner is workload-dependent**:
 
@@ -93,7 +93,7 @@ Saved cost: ~8-17 ms per drafter forward × per round → ~10-20% DFlash through
 
 1. **CPU-sync removal at `mtp.rs:575` (task #96)**: replacing `commit_and_wait` with `commit_labeled` yielded only +0.7% (noise-band) on the safe greedy path AND broke MH path correctness (download_f32 → MlxBuffer::as_slice is RAW memory access per `mlx-native/src/buffer.rs:291-293`: "caller must ensure ... No GPU command buffer that writes this buffer is currently in flight" — not a sync point; would read stale/partial draft_logits). Codex /cfa caught the Critical before push. Reverted. So even if the lever worked, it would NOT meaningfully close the K=N gap.
 
-2. **Empirical K-sweep on Qwen 3.6 27B Q8_0 code-gen greedy temp=0, 128 tok, 3-rep** (HEAD `061e7ff8`):
+2. **Empirical K-sweep on Qwen 3.6 27B Q8_0 (dense) code-gen greedy temp=0, 128 tok, 3-rep** (HEAD `061e7ff8`):
 
    | K | tok/s (mean) | accept | coherence | vs K=0 |
    |---|---:|---:|:---|---:|
@@ -102,6 +102,8 @@ Saved cost: ~8-17 ms per drafter forward × per round → ~10-20% DFlash through
    | K=3 | 28.2 | 56.7% | ⚠️ degrades partially (`"fibs[-1] + fibs[-2] + fibs[-2]"`) | **0.94× (-6%)** |
 
    K=N is BOTH slower AND incoherent. Accept rate collapses from 91% (K=0) → 55-57% (K=2/K=3). Closing only the CPU-sync gap cannot recover this — the bottleneck is **kernel divergence at verifier batch row N** (verify_hidden[row] differs between batched verify vs truncated dispatch), not commit overhead.
+
+   **MoE 35B-A3B shows the SAME pattern** at HEAD `dddfc1b5` (canonical Q4_K_M, 128 tok code-gen, 3-rep): K=0 113.9 t/s @ 93.7% coherent; K=2 87.6 t/s @ 56.1% — INCOHERENT (`"def_fibonacci(n):"` with underscore, duplicated lines, repeated `n.` / `terms.` spamming). Accept rate collapses 93.7% → 56.1% at K=2 on MoE too. The row-N kernel divergence is a STRUCTURAL property of the K=N verifier path (batched-prefill vs truncated single-token dispatch), independent of dense vs MoE FFN.
 
 **Real K=N structural lever**: unify K=0 / K=N verifier kernels through a single batched-prefill path (task #89), OR pure tree decoding (EAGLE-2/Medusa) that bypasses the chained-draft accept-walk entirely. Both multi-week. CPU-sync optimization is NOT the right fix.
 
@@ -404,7 +406,7 @@ This iteration corrected two false alarms and characterized a real architectural
    - `K=1 BATCHED` (single 2-token forward via `flash_attn_prefill_resume`) diverges from greedy at token ~22 — DIFFERENT correct sequence, not degenerate text.
    - `flash_attn_vec` (decode, F32) and `flash_attn_prefill_resume` (prefill, BF16 internal) produce slightly different logits → different argmax on close calls. This is rounding, not a bug.
 
-3. **K=2 BATCHED degeneracy root cause** — DeltaNet recurrent state cannot be rolled back on partial reject. Qwen 3.5/3.6 are hybrid: 4 full-attn layers + 30 linear-attention (Gated DeltaNet) layers. Full-attn slots are rolled back by `truncate_full_attn_to(prior+accepted+1)` (just resets the `current_len` cursor). DeltaNet state is RECURRENT — it advances by N+1 token-steps inside one batched forward. On reject of any of those drafts, the recurrent state is "ahead" with no rollback mechanism. Over ~70 iterations the drift accumulates and the model collapses to the "the the the…" attractor. `LinearAttnStateSlot` has a `conv_state` / `conv_state_scratch` ping-pong but it only supports {all accept, all reject} rollback (the scratch holds state-after-N, the active holds state-before).
+3. **K=2 BATCHED degeneracy root cause (HISTORICAL diagnosis; SUPERSEDED by §K=N CORRECTION at line ~91)** — Original diagnosis said DeltaNet recurrent state cannot be rolled back on partial reject. Qwen 3.5/3.6 are hybrid: 4 full-attn layers + 30 linear-attention (Gated DeltaNet) layers. Full-attn slots are rolled back by `truncate_full_attn_to(prior+accepted+1)`. DeltaNet state is recurrent and was thought to drift on partial-reject. **CORRECTION at HEAD `dddfc1b5` 2026-05-22**: GDN per-position state capture kernel + `rollback_la_to` ARE shipped (task #90 SHIPPED at mlx-native `e6fce4f` 2026-05-21; LinearAttnStateSlot has `conv_capture_states` + `rollback_la_to`). K=N code path uses `rollback_la_to` correctly. The remaining K=N incoherence at HEAD `dddfc1b5` (Qwen 3.6 27B dense AND Qwen 3.5 35B-A3B MoE both show K=2 garbled output, accept rate collapsing 91% → 55% and 94% → 56% respectively) is from **verifier row-N kernel divergence** — `verify_hidden[row N]` produced by the K-batch path differs from the same hidden state produced by the truncated single-token path. NOT a DN rollback issue. See §K=N CORRECTION block at line ~91 for the corrected diagnosis. The fix needs task #89 batched-prefill kernel unification (close row-N hidden divergence) or tree decoding.
 
 4. **K=1 BATCHED PROVEN COHERENT + FASTER** at 200 tokens (3 reps, deterministic):
    - spec mean: 23.93 tok/s @ 60% accept
@@ -413,14 +415,14 @@ This iteration corrected two false alarms and characterized a real architectural
    - Quality: full coherent essay through to 200 tokens, no degeneracy.
    - K=1 emits a different valid continuation from greedy at temp=0 (due to kernel rounding noted above), but the continuation itself is high-quality.
 
-**Path forward for K≥2 on hybrid Qwen (multi-week scope):**
-- **(a)** Per-token DN state snapshot — before each spec iter, copy `conv_state` and `recurrent_state` for all 30 LA layers. On partial reject, recompute prefix from snapshot. Extra: 30 × (conv_state + recurrent_state) bytes per iter + copy time. For 27B: ~5 MB per snapshot, microseconds.
-- **(b)** Per-step DN forward — run the verifier as N+1 sequential single-token forwards, swapping `conv_state` after each. Loses batched-prefill speedup; equivalent to K=1 cost × (N+1).
-- **(c)** Recompute prefix on reject — call DN forward from scratch on accepted-prefix when partial-reject happens. Costs (avg-accept) × per-layer-recompute per reject.
+**Path forward for K≥2 on hybrid Qwen (HISTORICAL — three options below were enumerated when DN-snapshot rollback was the believed blocker; option (a) was SHIPPED via task #90 at mlx-native `e6fce4f` 2026-05-21 — `conv_capture_states` + `rollback_la_to`):**
+- **(a) SHIPPED** — Per-position DN state snapshot at mlx-native `e6fce4f`. `LinearAttnStateSlot` now has `conv_capture_states` (per-position state at every t inside one batched forward) + `rollback_la_to(pos)` (snap recurrent state back to accepted-prefix). K=N partial-reject rollback works.
+- **(b) NOT NEEDED** — Per-step DN forward would have lost batched-prefill speedup.
+- **(c) NOT NEEDED** — Recompute-prefix-on-reject avoided.
 
-For pure-attention models (Llama 3, Gemma 4 standard layers without DN), K≥2 should work natively because all attention slots are roll-backable. The hybrid case is the bottleneck.
+For pure-attention models (Llama 3, Gemma 4 standard layers without DN), K≥2 still works natively.
 
-**Recommendation**: ship K=1 BATCHED as the default `HF2Q_SPEC_DECODE=1` mode (set `HF2Q_SPEC_DECODE_K1=1` automatically when MTP weights are present) and document K=N as experimental until per-layer DN snapshot lands.
+**Recommendation (updated at HEAD `dddfc1b5` 2026-05-22)**: ship K=1 BATCHED as the default `HF2Q_SPEC_DECODE=1` mode for DENSE MTP (task #87 SHIPPED at `3be36936`; MH stochastic via task #91 at `dc654349`). For MoE, K=0 auto-default. K=N (K≥2) remains research-quality because of the verifier row-N kernel divergence (NOT the DN-rollback issue that task #90 closed) — both dense and MoE K=2 produce incoherent output despite working DN rollback. Real fix needs task #89 batched-prefill kernel unification (close row-N hidden divergence) or tree decoding.
 
 ### Iteration 2026-05-21 (cont.) — Per-target K=1 BATCHED bench + MoE 2-token batched penalty
 
@@ -449,7 +451,7 @@ overhead doesn't amortize across the 2 tokens efficiently.
 - **27B dense MTP**: enable K=1 BATCHED by default (1.08× win, deterministic).
 - **35B-A3B MoE MTP**: leave as base (no spec). Need MoE-FFN batched-dispatch
   optimization OR a cheaper drafter before spec decode pays back on MoE Cell A.
-- **K=N for hybrid Qwen**: still blocked on DN-snapshot rollback (separate work).
+- **K=N for hybrid Qwen**: **SUPERSEDED at HEAD `dddfc1b5`** — was thought to be blocked on DN-snapshot rollback; GDN per-position state capture + `rollback_la_to` SHIPPED via task #90 at mlx-native `e6fce4f`. K=N still incoherent at HEAD `dddfc1b5` due to verifier row-N kernel divergence (separate structural issue) — see §K=N CORRECTION block at line ~91. Fix needs task #89 batched-prefill kernel unification or tree decoding.
 
 **Investigation:**
 1. ✅ Tested `HF2Q_MM_ID_ROUTING_THRESHOLD=1` (force mm_id at seq_len=2): 70 tok/s
@@ -1201,10 +1203,14 @@ why can they be faster and we can not." Direct answer after reading
    kernel, plus Rust dispatch + cache wiring). MTPLX runs Gated DeltaNet in
    "capture mode" that writes `states[B, T, Hv, Dv, Dk]` — the recurrent state
    at EVERY position in the batch. On partial-reject of K drafts, they pick
-   `states[accepted]` as the next-iter active state. This **unlocks K=3 (D3)
-   batched spec-decode on hybrid Qwen** — which we cannot currently do because
-   `LinearAttnStateSlot` only ping-pongs between {before, after-N-tokens} with
-   no intermediate states.
+   `states[accepted]` as the next-iter active state.
+   **STATUS at HEAD `dddfc1b5`: PORTED — task #90 SHIPPED** the per-position GDN
+   state capture kernel + `LinearAttnStateSlot.conv_capture_states` + `rollback_la_to(pos)`
+   at mlx-native `e6fce4f` 2026-05-21. We CAN do K=N partial-reject rollback now;
+   the original "cannot currently do" framing is superseded. **However**, K=N is
+   still incoherent at HEAD `dddfc1b5` due to a DIFFERENT structural issue —
+   verifier row-N kernel divergence (see §K=N CORRECTION block at line ~91) —
+   NOT the DN-rollback issue that task #90 closed.
 
 2. **D3 vs D1**: at 60% accept E[tokens/cycle] = 1 + 0.6 + 0.36 + 0.216 = **2.18**
    tokens for D3 vs **1.6** tokens for D1. ~36% more tokens per verifier call.
