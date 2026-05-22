@@ -60,35 +60,71 @@ impl<'a> DFlashTarget for Qwen35DFlashTarget<'a> {
         self.model.dflash_capture.is_some()
     }
 
-    /// Roll back the cache by `trim` positions across full-attn + mtp slots.
+    /// Roll back the cache by `trim` positions across full-attn + mtp +
+    /// linear-attn slots.
     ///
-    /// LA-state rollback (recurrent + conv) is NOT applied here. The
-    /// HybridKvCache's `rollback_la_to(accepted_idx)` requires a prior
-    /// `ensure_la_capture()` call to populate the per-position capture
-    /// buffers (see task #90 Step 4c). The DFlash orchestrator's
-    /// integration with Qwen35Model (Step 3c) will arrange that capture
-    /// before the verify forward. Until then, callers should only invoke
-    /// this rollback at points where LA state correctness is irrelevant
-    /// (e.g., end-of-generation cleanup, prefix re-init).
+    /// LA-state rollback uses the per-position capture buffer (task #90
+    /// Step 4c machinery). If the capture buffer is set up (caller
+    /// arranged `ensure_la_capture` before the verify forward), this
+    /// method copies capture[accepted_idx] back into the active
+    /// `recurrent` + `conv_state` buffers, restoring the LA state to
+    /// what it was after the last accepted token.
+    ///
+    /// If the capture buffer is NOT set up (no prior `ensure_la_capture`),
+    /// LA rollback is silently skipped. Full-attn + MTP cursors still
+    /// get decremented (those have no capture-buffer dependency). This
+    /// "best-effort" behavior matches what the Step 3c orchestrator
+    /// will eventually arrange — pre-verify capture install.
+    ///
+    /// `accepted_idx` math: capture buffer covers `n_tokens_max = K+1`
+    /// positions (the batched verify size). `trim` positions to discard
+    /// means `accept_count = K + 1 - trim` tokens are kept, and
+    /// `accepted_idx = accept_count - 1 = K - trim = n_tokens_max - 1 - trim`.
     fn rollback_kv(&mut self, trim: usize) {
         if trim == 0 {
             return;
         }
-        // current_len is a `[u32; n_seqs]` per slot. We use seq 0 as the
-        // canonical cursor (DFlash spec-decode runs single-sequence).
         let trim_u32 = trim as u32;
+        // Full-attn cursor rollback. current_len is `[u32; n_seqs]` per slot.
         for slot in self.kv_cache.full_attn.iter_mut() {
             for c in slot.current_len.iter_mut() {
                 *c = c.saturating_sub(trim_u32);
             }
         }
+        // MTP slot cursor rollback (if model has MTP).
         if let Some(mtp) = self.kv_cache.mtp_slot.as_mut() {
             for c in mtp.current_len.iter_mut() {
                 *c = c.saturating_sub(trim_u32);
             }
         }
-        // LA recurrent + conv state rollback is a no-op here — covered in
-        // Step 3c which will set up the capture buffer pre-verify.
+        // LA-state rollback — only if capture buffer was set up pre-verify.
+        if !self.kv_cache.linear_attn.is_empty() {
+            let first = &self.kv_cache.linear_attn[0];
+            if let Some(capture) = first.capture_states.as_ref() {
+                let recurrent_elems = first.recurrent.element_count();
+                if recurrent_elems > 0 {
+                    let capture_elems = capture.element_count();
+                    let n_tokens_max = capture_elems / recurrent_elems;
+                    // Skip if trim exceeds the captured window — caller bug
+                    // (would have to discard more than was just verified).
+                    if (trim_u32 as usize) < n_tokens_max && n_tokens_max > 0 {
+                        let accepted_idx =
+                            (n_tokens_max as u32) - 1 - trim_u32;
+                        // Best-effort: log + skip on error rather than
+                        // propagating (the trait method is infallible by
+                        // signature; orchestrator already preserved
+                        // forward-pass correctness even without LA rollback).
+                        if let Err(e) = self.kv_cache.rollback_la_to(accepted_idx) {
+                            eprintln!(
+                                "[Qwen35DFlashTarget] rollback_la_to({}) failed: {} \
+                                 — LA state may be stale by {} positions",
+                                accepted_idx, e, trim
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Run a batched verify forward over `tokens` starting at
