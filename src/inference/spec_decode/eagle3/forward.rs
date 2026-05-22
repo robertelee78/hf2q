@@ -4280,6 +4280,30 @@ mod tests {
     }
 
     #[test]
+    fn adr_037_e4b10b1_gate_permute_rejects_wrong_element_count_2026_05_22() {
+        // Codex /cfa E4b.10b.1 Minor fix (2026-05-22): explicit
+        // regression for the element_count() invariant.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        // Allocate F32 buffer with wrong element count for the
+        // (seq=2, heads=4, hd=4) shape (expected = 32, actual = 8).
+        let bad_data = vec![0.0f32; 8];
+        let bad = upload_f32_to_gpu(&device, &bad_data, vec![8]);
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_permute_seq_to_head_outer(
+            &mut enc, &mut registry, &device, &bad, 2, 4, 4, "permute_wrong_count",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("input has 8 elements"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn adr_037_e4b10b1_gate_permute_rejects_zero_dim_2026_05_22() {
         let device = match MlxDevice::new() {
             Ok(d) => d,
