@@ -17,7 +17,9 @@
 | E1 codex /cfa gate | ✅ PASSED | mlx-native `3ea809f` | Codex re-review confirms **0 Critical + 0 Major** remaining. Fixed: K/V dtype validation, buffer byte-length validation, output-layout doc, CPU-ref precision caveat, unused struct, register() reduce-dep doc. Added 3 negative-path validation tests (all PASS). |
 | **Phase E1 totals** | ✅ **CLOSED** | mlx-native `3ea809f` | **24/24** integration tests PASS (21 parity + 3 negative-path) + **6/6** lib unit tests PASS = **30/30** total. |
 | E2 — EAGLE-3 drafter training | ⏳ TODO | — | Multi-week training (~1wk H100 compute). |
-| E3 — drafter loader + multi-layer hidden plumbing | ⏳ TODO | — | ~500 LOC, ~3-5 days |
+| E3a — multi-layer hidden plumbing | ✅ SHIPPED | hf2q `db495137` | `Eagle3HiddenCollector` with `[seq_len, num_aux, hidden_size]` row-major layout (transpose of DFlash; chosen so `concatenated_hidden()` returns buffer directly with no permute). 15/15 unit tests PASS: constructor validation, slab writes, layout-matches-vLLM, lifecycle, realistic Qwen35-shaped allocation. |
+| E3b — eagle3_weights.rs (1-layer loader) | ⏳ TODO | — | Next iter. Mirrors qwen35 weights loader + EAGLE-3-specific layers: hidden_norm, input_layernorm, fc projection, optional fc_norm per-aux. Per /opt/vllm/vllm/model_executor/models/llama_eagle3.py:38-122. |
+| E3 codex /cfa gate | ⏳ TODO | — | After E3b |
 | E4 — drafter forward + dynamic tree expansion | ⏳ TODO | — | ~600 LOC, ~5-7 days |
 | E5 — tree-walk-accept + KV rollback | ⏳ TODO | — | ~350 LOC, ~3-4 days |
 | E6 — orchestrator + HF2Q_SPEC_EAGLE3 env flag | ⏳ TODO | — | ~500 LOC, ~5-7 days |
