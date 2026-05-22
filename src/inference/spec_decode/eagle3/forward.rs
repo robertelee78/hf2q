@@ -18,7 +18,7 @@ use super::config::Eagle3DrafterConfig;
 use super::tensors::Eagle3DrafterTensors;
 use crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32;
 use anyhow::{anyhow, Context, Result};
-use mlx_native::{CommandEncoder, KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 /// EAGLE-3 FC projection.
 ///
@@ -54,12 +54,44 @@ pub fn dispatch_eagle3_fc(
     cfg: &Eagle3DrafterConfig,
     seq_len: u32,
 ) -> Result<MlxBuffer> {
-    let fc_in = cfg.fc_input_size() as u32;
-    let hidden = cfg.hidden_size as u32;
-    // Defensive dimension check — guarantees fail-fast diagnostics
-    // before the matmul kernel attempts strided reads on a buffer
-    // sized for the wrong shape.
-    let expected_input_elems = (seq_len as usize) * (fc_in as usize);
+    // Codex /cfa E4b.2 Critical (2026-05-22): input dtype must be
+    // F32. apply_linear_projection_f32 only debug-asserts this;
+    // a release build with BF16/U8 input would mis-stride reads.
+    // Fail-fast here at the wrapper.
+    if concat_hidden_gpu.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "dispatch_eagle3_fc: concat_hidden dtype must be F32, got {:?}",
+            concat_hidden_gpu.dtype()
+        ));
+    }
+    // Codex /cfa E4b.2 Major (2026-05-22): use try_from instead of
+    // `as u32` to catch silent truncation on adversarial config.
+    let fc_in_usize = cfg.fc_input_size();
+    let hidden_usize = cfg.hidden_size;
+    let fc_in: u32 = u32::try_from(fc_in_usize).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_fc: fc_input_size ({}) exceeds u32::MAX",
+            fc_in_usize
+        )
+    })?;
+    let hidden: u32 = u32::try_from(hidden_usize).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_fc: hidden_size ({}) exceeds u32::MAX",
+            hidden_usize
+        )
+    })?;
+    // Codex /cfa E4b.2 Major (2026-05-22): checked multiply for the
+    // expected element count. Otherwise large seq_len could wrap on
+    // release and let an undersized buffer pass validation.
+    let expected_input_elems = (seq_len as usize)
+        .checked_mul(fc_in_usize)
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_fc: seq_len ({}) * fc_input_size ({}) overflows usize",
+                seq_len,
+                fc_in_usize
+            )
+        })?;
     let actual_elems = concat_hidden_gpu.element_count();
     if actual_elems != expected_input_elems {
         return Err(anyhow!(
@@ -370,6 +402,50 @@ mod tests {
         assert!(
             msg.contains("concat_hidden has"),
             "expected shape error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b2_gate_fc_rejects_non_f32_input_dtype_2026_05_22() {
+        // Codex /cfa E4b.2 Critical fix (2026-05-22): wrapper must
+        // reject non-F32 input even though apply_linear_projection_f32
+        // only debug-asserts this. Validates the hard check.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_fc_weight(
+            &manifest,
+            &vec![0u8; cfg.hidden_size * cfg.fc_input_size() * 2],
+        );
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        // Allocate a BF16 input with the correct element count. Wrapper
+        // should reject due to wrong dtype, not pass through.
+        let seq_len = 2_u32;
+        let elem_count = (seq_len as usize) * cfg.fc_input_size();
+        let bad_input = device
+            .alloc_buffer(
+                elem_count * 2, // BF16 size
+                DType::BF16,
+                vec![seq_len as usize, cfg.fc_input_size()],
+            )
+            .expect("alloc bad input");
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_fc(
+            &mut enc, &mut registry, &device, &bad_input, &tensors, &cfg, seq_len,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dtype must be F32"),
+            "expected F32-dtype error, got: {msg}"
         );
     }
 
