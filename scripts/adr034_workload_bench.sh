@@ -45,6 +45,22 @@ if [[ ! -x "$HF2Q" ]]; then
     exit 2
 fi
 
+# Defensive: kill any stale hf2q generate processes from previous bench
+# runs that may have been left running (e.g., timeout-orphaned wrappers,
+# background bench runs killed mid-flight, etc.). Without this, stale
+# processes compete for GPU + cache space and produce corrupted bench
+# results — empirically observed at HEAD `b40db9a8` 2026-05-22 when a
+# 37-minute-old stale process from a prior iter contended for GPU and
+# dropped base throughput from 22 t/s → 2.8 t/s.
+#
+# Only matches `hf2q generate` (not the harness/build/test processes),
+# so won't kill the user's own development workflow.
+if pgrep -f "hf2q generate" > /dev/null 2>&1; then
+    echo "warn: killing stale 'hf2q generate' processes from prior runs" >&2
+    pkill -f "hf2q generate" 2>/dev/null || true
+    sleep 3
+fi
+
 PROMPT_ESSAY="Write a short essay about the importance of test coverage in software:"
 PROMPT_CODEGEN="Write a Python function that computes the Fibonacci sequence iteratively:"
 
