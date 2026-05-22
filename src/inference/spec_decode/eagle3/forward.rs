@@ -23,6 +23,9 @@ use super::tensors::Eagle3DrafterTensors;
 use crate::inference::models::qwen35::gpu_full_attn::{
     apply_imrope, apply_linear_projection_f32,
 };
+use mlx_native::ops::tree_attention::{
+    self as tree_attn_ops, TreeAttentionParams,
+};
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::add_bias_row_2d::dispatch_add_bias_row_2d_f32;
 use mlx_native::ops::feature_concat::dispatch_feature_concat_f32;
@@ -1177,6 +1180,200 @@ pub fn dispatch_eagle3_rope(
         sections,
     )
     .with_context(|| format!("apply_imrope {label}"))
+}
+
+// ----------------------------------------------------------------
+// Phase E4b.6 — tree attention dispatch (Phase E1 kernel integration)
+// ----------------------------------------------------------------
+//
+// Wraps mlx-native's `tree_attention` (Phase E1) with Eagle3 config
+// validation and buffer-shape contracts. The caller supplies Q/K/V
+// already in head-outer layout (`[num_heads, q_seq_len, head_dim]` for
+// Q; `[num_kv_heads, kv_capacity, head_dim]` for K/V) and a tree mask
+// from `ExpandedTree::build_tree_mask` (Phase E4a).
+//
+// Layout note: Q/K/V projections in earlier sub-phases produce
+// `[seq, num_heads * head_dim]` (seq-outer). A permute_021_f32 step
+// is needed to feed this dispatch; the orchestrator (E4b.9 future)
+// will own that step so this wrapper stays focused on the kernel
+// surface.
+
+/// Sentinel value for attended positions in the tree mask. Matches
+/// `mlx_native::ops::tree_attention::TREE_MASK_ATTENDED` (0.0) so
+/// callers don't need to depend on mlx-native to construct masks.
+pub const EAGLE3_TREE_MASK_ATTENDED: f32 = 0.0;
+
+/// Sentinel value for masked positions (-65504.0 = -MAXHALF; matches
+/// the flash_attn_vec implicit-causal sentinel that tree_attention
+/// chains through for early-exit on all-masked chunks).
+pub const EAGLE3_TREE_MASK_MASKED: f32 = -65504.0;
+
+/// Dispatch tree-aware self-attention.
+///
+/// # Arguments
+/// * `q` — F32 `[num_q_heads, q_seq_len, head_dim]` (post-RoPE,
+///   head-outer; caller must permute from `[seq, n_q, hd]` if upstream
+///   primitives produced seq-outer).
+/// * `k` — F32 or F16 `[num_kv_heads, kv_capacity, head_dim]`
+///   (post-RoPE K cache; only first `q_seq_len` positions valid for
+///   tree decoding).
+/// * `v` — same dtype + shape as `k` (post-projection V cache).
+/// * `tree_mask` — F32 `[q_seq_len, mask_stride]` from
+///   `ExpandedTree::build_tree_mask` (Phase E4a). Cell `(i, j)`
+///   is `EAGLE3_TREE_MASK_ATTENDED` (0.0) if tree-node `i` can
+///   attend to KV position `j`, `EAGLE3_TREE_MASK_MASKED`
+///   (-65504.0) otherwise.
+/// * `kv_seq_len` — number of valid KV positions in `k` and `v`
+///   (typically `prefix_len + q_seq_len` for tree decoding).
+/// * `kv_capacity` — allocated capacity (stride between KV heads
+///   in `k` / `v`; must be `>= kv_seq_len`).
+/// * `mask_stride` — stride between tree mask rows (must be
+///   `>= kv_seq_len`).
+/// * `q_seq_len` — number of tree-node queries (tree.len()).
+/// * `scale` — typically `1.0 / sqrt(head_dim)`.
+///
+/// Returns a freshly allocated F32 output buffer with layout
+/// `[q_seq_len, num_q_heads, head_dim]` (query-outer, head-inner,
+/// dim-innermost — see Phase E1 layout contract).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_eagle3_tree_attention(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q: &MlxBuffer,
+    k: &MlxBuffer,
+    v: &MlxBuffer,
+    tree_mask: &MlxBuffer,
+    cfg: &Eagle3DrafterConfig,
+    q_seq_len: u32,
+    kv_seq_len: u32,
+    kv_capacity: u32,
+    mask_stride: u32,
+    scale: f32,
+) -> Result<MlxBuffer> {
+    // Codex-style validation patterns (preemptively applied).
+    if q_seq_len == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_tree_attention: q_seq_len must be > 0"
+        ));
+    }
+    if kv_seq_len == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_tree_attention: kv_seq_len must be > 0"
+        ));
+    }
+    if kv_capacity < kv_seq_len {
+        return Err(anyhow!(
+            "dispatch_eagle3_tree_attention: kv_capacity ({}) must be >= kv_seq_len ({})",
+            kv_capacity,
+            kv_seq_len
+        ));
+    }
+    if mask_stride < kv_seq_len {
+        return Err(anyhow!(
+            "dispatch_eagle3_tree_attention: mask_stride ({}) must be >= kv_seq_len ({})",
+            mask_stride,
+            kv_seq_len
+        ));
+    }
+    if !scale.is_finite() {
+        return Err(anyhow!(
+            "dispatch_eagle3_tree_attention: scale ({}) must be finite",
+            scale
+        ));
+    }
+
+    let num_q_heads: u32 = u32::try_from(cfg.num_q_heads).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_tree_attention: num_q_heads ({}) exceeds u32::MAX",
+            cfg.num_q_heads
+        )
+    })?;
+    let num_kv_heads: u32 = u32::try_from(cfg.num_kv_heads).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_tree_attention: num_kv_heads ({}) exceeds u32::MAX",
+            cfg.num_kv_heads
+        )
+    })?;
+    let head_dim: u32 = u32::try_from(cfg.head_dim).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_tree_attention: head_dim ({}) exceeds u32::MAX",
+            cfg.head_dim
+        )
+    })?;
+
+    // Output buffer allocation: [q_seq_len, num_q_heads, head_dim] F32.
+    let out_elems = (q_seq_len as usize)
+        .checked_mul(num_q_heads as usize)
+        .and_then(|v| v.checked_mul(cfg.head_dim))
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_tree_attention: out elements (q={} * n_q={} * hd={}) overflows usize",
+                q_seq_len,
+                num_q_heads,
+                cfg.head_dim
+            )
+        })?;
+    if out_elems > (u32::MAX as usize) {
+        return Err(anyhow!(
+            "dispatch_eagle3_tree_attention: out elements ({}) exceeds u32::MAX",
+            out_elems
+        ));
+    }
+    let out_bytes = out_elems
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_tree_attention: out bytes ({} * 4) overflows usize",
+                out_elems
+            )
+        })?;
+    let output = device
+        .alloc_buffer(
+            out_bytes,
+            DType::F32,
+            vec![q_seq_len as usize, num_q_heads as usize, cfg.head_dim],
+        )
+        .map_err(|e| anyhow!("alloc tree_attention output: {e}"))?;
+
+    // tmp buffer for the reduce pass: sized by mlx-native helper.
+    let tmp_bytes =
+        tree_attn_ops::tmp_buffer_bytes(num_q_heads, head_dim, q_seq_len);
+    let tmp = device
+        .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+        .map_err(|e| anyhow!("alloc tree_attention tmp: {e}"))?;
+
+    let params = TreeAttentionParams {
+        num_heads: num_q_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        kv_capacity,
+        scale,
+        q_seq_len,
+        mask_stride,
+    };
+
+    // Memory barrier: tree_attention reads Q, K, V, tree_mask that
+    // were written by upstream dispatches (RoPE, projections, mask
+    // upload) in the same encoder.
+    encoder.memory_barrier();
+
+    tree_attn_ops::tree_attention(
+        encoder,
+        registry,
+        device,
+        q,
+        k,
+        v,
+        tree_mask,
+        &output,
+        &tmp,
+        &params,
+    )
+    .context("tree_attention")?;
+
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -2664,6 +2861,247 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("dtype must be F32"), "got: {err}");
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E4b.6 tests — tree_attention dispatch via Phase E1 kernel
+    // ----------------------------------------------------------------
+
+    fn cfg_for_attention_dk128() -> Eagle3DrafterConfig {
+        // head_dim=128 to exercise the new mlx-native dk128 kernel
+        // template. num_q_heads × head_dim = 4 × 128 = 512 hidden;
+        // keeps test fast while exercising production-shaped head_dim.
+        Eagle3DrafterConfig {
+            hidden_size: 512,
+            intermediate_size: 1024,
+            head_dim: 128,
+            num_q_heads: 4,
+            num_kv_heads: 2,
+            vocab_size: 1000,
+            draft_vocab_size: 1000,
+            target_hidden_size: 512,
+            num_aux_hidden_states: 3,
+            rms_norm_eps: 1e-6,
+            norm_before_fc: false,
+            fc_norm: false,
+            use_qk_norm: false,
+            attention_bias: false,
+            tie_lm_head: true,
+            include_draft_id_mapping: false,
+            has_own_embed_tokens: false,
+            rope_theta: 1_000_000.0,
+            rope_dim: 128,
+        }
+    }
+
+    /// CPU reference for tree attention: matches the mlx-native
+    /// `cpu_tree_sdpa` semantics used in Phase E1.3 tests, adapted
+    /// for our Q layout `[num_heads, q_seq, head_dim]` (head-outer).
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_tree_attention_reference(
+        q: &[f32],         // [num_q_heads, q_seq_len, head_dim]
+        k: &[f32],         // [num_kv_heads, kv_capacity, head_dim]
+        v: &[f32],         // [num_kv_heads, kv_capacity, head_dim]
+        mask: &[f32],      // [q_seq_len, mask_stride]
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        q_seq_len: usize,
+        kv_seq_len: usize,
+        kv_capacity: usize,
+        mask_stride: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let heads_per_kv = num_q_heads / num_kv_heads;
+        // Output layout: [q_seq_len, num_q_heads, head_dim].
+        let mut out = vec![0.0f32; q_seq_len * num_q_heads * head_dim];
+        for h in 0..num_q_heads {
+            let kv_h = h / heads_per_kv;
+            for iq1 in 0..q_seq_len {
+                let q_off = h * q_seq_len * head_dim + iq1 * head_dim;
+                let mask_row = iq1 * mask_stride;
+                let mut scores = Vec::<(usize, f32)>::new();
+                for k_pos in 0..kv_seq_len {
+                    if mask[mask_row + k_pos] == EAGLE3_TREE_MASK_MASKED {
+                        continue;
+                    }
+                    let k_off = kv_h * kv_capacity * head_dim + k_pos * head_dim;
+                    let mut dot = 0.0f64;
+                    for d in 0..head_dim {
+                        dot += q[q_off + d] as f64 * k[k_off + d] as f64;
+                    }
+                    scores.push((k_pos, dot as f32 * scale));
+                }
+                if scores.is_empty() {
+                    continue;
+                }
+                let max_s = scores
+                    .iter()
+                    .map(|(_, s)| *s)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let exp_s: Vec<f32> =
+                    scores.iter().map(|(_, s)| (*s - max_s).exp()).collect();
+                let sum_e: f32 = exp_s.iter().sum();
+                let inv = if sum_e == 0.0 { 0.0 } else { 1.0 / sum_e };
+                // Output: [q_seq, n_q, hd] layout.
+                let o_off = iq1 * num_q_heads * head_dim + h * head_dim;
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for ((k_pos, _), &es) in scores.iter().zip(exp_s.iter()) {
+                        let weight = es * inv;
+                        let v_off = kv_h * kv_capacity * head_dim + k_pos * head_dim;
+                        acc += weight * v[v_off + d];
+                    }
+                    out[o_off + d] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn adr_037_e4b6_tree_attention_cpu_parity_dk128_fixed_square_2026_05_22() {
+        // Use head_dim=128 (Qwen 3.6 27B production shape) +
+        // fixed-square tree (root + 4 leaves; depth=2) over a
+        // prefix of 27 tokens. Exercises both the new dk128
+        // kernel template AND non-trivial tree masking.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = cfg_for_attention_dk128();
+
+        let num_q_heads = cfg.num_q_heads;
+        let num_kv_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let q_seq_len = 5_u32; // 1 root + 4 leaves
+        let prefix_len = 27_usize;
+        let kv_seq_len = (prefix_len + q_seq_len as usize) as u32; // 32
+        let kv_capacity = 64_u32;
+        let mask_stride = kv_seq_len;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        // Random Q [n_q, q_seq, hd]
+        let q_elems = num_q_heads * (q_seq_len as usize) * head_dim;
+        let mut q_data = vec![0.0f32; q_elems];
+        fill_random(&mut q_data, 0xC60);
+        // Random K/V [n_kv, kv_capacity, hd] — initialize past
+        // kv_seq_len with junk (mask should mask them).
+        let kv_elems = num_kv_heads * (kv_capacity as usize) * head_dim;
+        let mut k_data = vec![0.0f32; kv_elems];
+        fill_random(&mut k_data, 0xC61);
+        let mut v_data = vec![0.0f32; kv_elems];
+        fill_random(&mut v_data, 0xC62);
+
+        // Build fixed-square mask: tree-nodes occupy positions
+        // [prefix_len, prefix_len + q_seq_len). Root at 27, leaves at
+        // 28..32. Each leaf attends prefix + root + self.
+        let mask_elems = (q_seq_len as usize) * (mask_stride as usize);
+        let mut mask_data = vec![EAGLE3_TREE_MASK_MASKED; mask_elems];
+        for iq1 in 0..(q_seq_len as usize) {
+            let row_base = iq1 * (mask_stride as usize);
+            // Prefix always attended
+            for k in 0..prefix_len {
+                mask_data[row_base + k] = EAGLE3_TREE_MASK_ATTENDED;
+            }
+            // Self
+            mask_data[row_base + prefix_len + iq1] = EAGLE3_TREE_MASK_ATTENDED;
+            // Leaves (iq1 > 0) attend root (iq1=0 at prefix_len)
+            if iq1 > 0 {
+                mask_data[row_base + prefix_len] = EAGLE3_TREE_MASK_ATTENDED;
+            }
+        }
+
+        // CPU reference
+        let cpu_out = cpu_tree_attention_reference(
+            &q_data, &k_data, &v_data, &mask_data,
+            num_q_heads, num_kv_heads, head_dim,
+            q_seq_len as usize, kv_seq_len as usize, kv_capacity as usize,
+            mask_stride as usize, scale,
+        );
+
+        // GPU
+        let q_gpu = upload_f32_to_gpu(&device, &q_data,
+            vec![num_q_heads, q_seq_len as usize, head_dim]);
+        let k_gpu = upload_f32_to_gpu(&device, &k_data,
+            vec![num_kv_heads, kv_capacity as usize, head_dim]);
+        let v_gpu = upload_f32_to_gpu(&device, &v_data,
+            vec![num_kv_heads, kv_capacity as usize, head_dim]);
+        let mask_gpu = upload_f32_to_gpu(&device, &mask_data,
+            vec![q_seq_len as usize, mask_stride as usize]);
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_tree_attention(
+            &mut enc, &mut registry, &device,
+            &q_gpu, &k_gpu, &v_gpu, &mask_gpu,
+            &cfg, q_seq_len, kv_seq_len, kv_capacity, mask_stride, scale,
+        )
+        .expect("tree attn dispatch");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        assert_eq!(gpu_out.len(), cpu_out.len());
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            // Softmax + GEMM in F32 input × F32 KV gives ~1e-3
+            // relative; absolute bound at scale ~ 1/sqrt(128) ≈ 0.088
+            // and Q/K random in [-1,1) is well within 5e-3.
+            assert!(d < 5e-3, "tree_attention parity: diff={d} > 5e-3");
+        }
+        eprintln!("tree_attention dk128 fixed-square parity max_diff={max_diff:.6e}");
+    }
+
+    #[test]
+    fn adr_037_e4b6_gate_tree_attention_rejects_zero_q_seq_len_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = cfg_for_attention_dk128();
+        // Dummy buffers — won't actually be read because validation
+        // fails before kernel dispatch.
+        let dummy = device
+            .alloc_buffer(4, DType::F32, vec![1])
+            .expect("alloc dummy");
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_tree_attention(
+            &mut enc, &mut registry, &device,
+            &dummy, &dummy, &dummy, &dummy,
+            &cfg, 0, 1, 1, 1, 1.0,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("q_seq_len must be > 0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b6_gate_tree_attention_rejects_kv_capacity_less_than_seq_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = cfg_for_attention_dk128();
+        let dummy = device.alloc_buffer(4, DType::F32, vec![1]).expect("alloc");
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_tree_attention(
+            &mut enc, &mut registry, &device,
+            &dummy, &dummy, &dummy, &dummy,
+            &cfg, 1, 10, 5, 10, 1.0, // kv_capacity 5 < kv_seq_len 10
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("kv_capacity"),
+            "got: {err}"
+        );
     }
 
     #[test]
