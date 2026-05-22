@@ -31,6 +31,7 @@ use mlx_native::ops::add_bias_row_2d::dispatch_add_bias_row_2d_f32;
 use mlx_native::ops::elementwise::elementwise_add;
 use mlx_native::ops::feature_concat::dispatch_feature_concat_f32;
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
+use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 /// EAGLE-3 FC projection.
@@ -1520,6 +1521,157 @@ pub fn dispatch_eagle3_residual_add(
     )
     .map_err(|e| anyhow!("elementwise_add residual: {e}"))?;
     Ok(out)
+}
+
+// ----------------------------------------------------------------
+// Phase E4b.8 — SwiGLU MLP: down(silu(gate(x)) * up(x))
+// ----------------------------------------------------------------
+//
+// Per vLLM `llama_eagle3.py:120` `hidden_states = self.mlp(hidden_states)`.
+// Standard Llama/Qwen SwiGLU MLP:
+//   gate = gate_proj(x)        # [seq, intermediate]
+//   up   = up_proj(x)          # [seq, intermediate]
+//   act  = silu(gate) * up     # [seq, intermediate]
+//   out  = down_proj(act)      # [seq, hidden]
+//
+// No bias on the MLP weights (standard for Llama/Qwen SwiGLU).
+
+/// Dispatch the SwiGLU MLP block.
+///
+/// Input: `[seq, hidden_size]` F32 (post-attention-residual hidden).
+/// Output: `[seq, hidden_size]` F32 (MLP output, ready for residual add).
+pub fn dispatch_eagle3_mlp(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    // Codex-validated boundary checks.
+    if input.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "dispatch_eagle3_mlp: input dtype must be F32, got {:?}",
+            input.dtype()
+        ));
+    }
+    if seq_len == 0 {
+        return Err(anyhow!("dispatch_eagle3_mlp: seq_len must be > 0"));
+    }
+    let hidden_usize = cfg.hidden_size;
+    let inter_usize = cfg.intermediate_size;
+    if hidden_usize == 0 || inter_usize == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_mlp: hidden_size ({}) and intermediate_size ({}) must be > 0",
+            hidden_usize,
+            inter_usize
+        ));
+    }
+    let expected_input_elems = (seq_len as usize)
+        .checked_mul(hidden_usize)
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_mlp: seq_len ({}) * hidden_size ({}) overflows usize",
+                seq_len,
+                hidden_usize
+            )
+        })?;
+    if input.element_count() != expected_input_elems {
+        return Err(anyhow!(
+            "dispatch_eagle3_mlp: input has {} elements, expected {} (seq={} * hidden={})",
+            input.element_count(),
+            expected_input_elems,
+            seq_len,
+            hidden_usize
+        ));
+    }
+    // Memory barrier: input may be the residual add output from a
+    // prior dispatch in the same encoder.
+    encoder.memory_barrier();
+
+    // 1. gate_proj(input) — [seq, hidden] → [seq, intermediate].
+    let gate = dispatch_eagle3_projection_with_optional_bias(
+        encoder, registry, device,
+        input,
+        &tensors.mlp_gate,
+        None, // no bias on standard SwiGLU
+        seq_len,
+        hidden_usize,
+        inter_usize,
+        "mlp_gate",
+    )?;
+    // 2. up_proj(input) — [seq, hidden] → [seq, intermediate].
+    let up = dispatch_eagle3_projection_with_optional_bias(
+        encoder, registry, device,
+        input,
+        &tensors.mlp_up,
+        None,
+        seq_len,
+        hidden_usize,
+        inter_usize,
+        "mlp_up",
+    )?;
+
+    // 3. silu(gate) * up → activated [seq, intermediate]. Both gate
+    // and up were just written by the two prior matmuls — barrier.
+    let n_h_usize = (seq_len as usize).checked_mul(inter_usize).ok_or_else(|| {
+        anyhow!(
+            "dispatch_eagle3_mlp: seq_len ({}) * intermediate ({}) overflows usize",
+            seq_len,
+            inter_usize
+        )
+    })?;
+    if n_h_usize > (u32::MAX as usize) {
+        return Err(anyhow!(
+            "dispatch_eagle3_mlp: silu_mul element count ({}) exceeds u32::MAX",
+            n_h_usize
+        ));
+    }
+    let n_h: u32 = n_h_usize as u32;
+    let activated_bytes = n_h_usize
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow!("dispatch_eagle3_mlp: activated bytes overflow"))?;
+    let activated = device
+        .alloc_buffer(
+            activated_bytes,
+            DType::F32,
+            vec![seq_len as usize, inter_usize],
+        )
+        .map_err(|e| anyhow!("alloc mlp activated: {e}"))?;
+    let mut silu_params = device
+        .alloc_buffer(4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("alloc mlp silu_params: {e}"))?;
+    silu_params
+        .as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("silu_params slice: {e}"))?[0] = n_h;
+    encoder.memory_barrier(); // silu_mul reads gate + up
+    dispatch_silu_mul(
+        encoder,
+        registry,
+        device.metal_device(),
+        &gate,
+        &up,
+        &activated,
+        &silu_params,
+        n_h,
+    )
+    .map_err(|e| anyhow!("dispatch_silu_mul: {e}"))?;
+
+    // 4. down_proj(activated) — [seq, intermediate] → [seq, hidden].
+    // dispatch_eagle3_projection_with_optional_bias inserts no
+    // pre-matmul barrier; the silu_mul write to `activated` needs one.
+    encoder.memory_barrier();
+    dispatch_eagle3_projection_with_optional_bias(
+        encoder, registry, device,
+        &activated,
+        &tensors.mlp_down,
+        None,
+        seq_len,
+        inter_usize,
+        hidden_usize,
+        "mlp_down",
+    )
 }
 
 #[cfg(test)]
@@ -3396,6 +3548,178 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("b has"), "got: {err}");
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E4b.8 tests — SwiGLU MLP
+    // ----------------------------------------------------------------
+
+    /// CPU reference SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    fn silu_f32(x: f32) -> f32 {
+        x / (1.0 + (-x).exp())
+    }
+
+    /// CPU SwiGLU MLP reference: down(silu(gate(x)) * up(x)).
+    /// Uses BF16-quantized weights to match what the GPU GEMMs compute.
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_swiglu_mlp_reference(
+        input: &[f32],                 // [seq, hidden]
+        gate_weight_bf16_q: &[f32],    // [inter, hidden]
+        up_weight_bf16_q: &[f32],      // [inter, hidden]
+        down_weight_bf16_q: &[f32],    // [hidden, inter]
+        seq_len: usize,
+        hidden: usize,
+        inter: usize,
+    ) -> Vec<f32> {
+        // gate = input @ gate^T → [seq, inter]
+        let gate = cpu_fc_reference(input, gate_weight_bf16_q, seq_len, hidden, inter);
+        // up = input @ up^T → [seq, inter]
+        let up = cpu_fc_reference(input, up_weight_bf16_q, seq_len, hidden, inter);
+        // activated = silu(gate) * up → [seq, inter]
+        let mut activated = vec![0.0f32; seq_len * inter];
+        for i in 0..(seq_len * inter) {
+            activated[i] = silu_f32(gate[i]) * up[i];
+        }
+        // out = activated @ down^T → [seq, hidden]
+        cpu_fc_reference(&activated, down_weight_bf16_q, seq_len, inter, hidden)
+    }
+
+    #[test]
+    fn adr_037_e4b8_mlp_cpu_parity_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let seq_len: u32 = 4;
+        let hidden = cfg.hidden_size;
+        let inter = cfg.intermediate_size;
+
+        // Synthesize input + 3 random weights.
+        let mut input_data = vec![0.0f32; (seq_len as usize) * hidden];
+        fill_random(&mut input_data, 0xE80);
+        let mut gate_w = vec![0.0f32; inter * hidden];
+        fill_random(&mut gate_w, 0xE81);
+        let mut up_w = vec![0.0f32; inter * hidden];
+        fill_random(&mut up_w, 0xE82);
+        let mut down_w = vec![0.0f32; hidden * inter];
+        fill_random(&mut down_w, 0xE83);
+
+        // CPU ref uses BF16-quantized weights.
+        let gate_q: Vec<f32> = gate_w.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let up_q: Vec<f32> = up_w.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let down_q: Vec<f32> = down_w.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let cpu_out = cpu_swiglu_mlp_reference(
+            &input_data, &gate_q, &up_q, &down_q,
+            seq_len as usize, hidden, inter,
+        );
+
+        // GPU: blob with all 3 MLP weights overridden.
+        let manifest = expected_manifest(&cfg);
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "layers.0.mlp.gate_proj.weight".to_string(),
+            f32_to_bf16_bytes(&gate_w),
+        );
+        overrides.insert(
+            "layers.0.mlp.up_proj.weight".to_string(),
+            f32_to_bf16_bytes(&up_w),
+        );
+        overrides.insert(
+            "layers.0.mlp.down_proj.weight".to_string(),
+            f32_to_bf16_bytes(&down_w),
+        );
+        let blob = build_blob_with_overrides(&manifest, &overrides);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let input_gpu = upload_f32_to_gpu(
+            &device, &input_data, vec![seq_len as usize, hidden],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_mlp(
+            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+        )
+        .expect("dispatch_eagle3_mlp");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        assert_eq!(gpu_out.len(), (seq_len as usize) * hidden);
+        // Compute relative tolerance: 3 chained BF16 GEMMs + silu_mul
+        // amplify intermediate values significantly (silu output can
+        // be ~|gate| magnitude; silu(gate)*up can spike). Final down
+        // output magnitudes can reach ~sqrt(inter) * gate_mag^2.
+        // Use a max(abs)-scaled tolerance instead of fixed-absolute.
+        let max_abs_cpu = cpu_out.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        // Allow ~1% relative error per output element (compounds three
+        // BF16 GEMMs + silu nonlinearity).
+        let rel_tol = max_abs_cpu * 1e-2;
+        let abs_tol = 1e-3; // floor for near-zero outputs
+        let tol = rel_tol.max(abs_tol);
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            assert!(
+                d < tol,
+                "mlp parity: diff={d} > tol={tol} (max_abs={max_abs_cpu})"
+            );
+        }
+        eprintln!(
+            "mlp parity max_diff={max_diff:.6e} (max_abs={max_abs_cpu:.6e}, rel={:.6e})",
+            max_diff / max_abs_cpu.max(1e-9)
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b8_gate_mlp_rejects_non_f32_input_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let seq_len = 2_u32;
+        let bf16 = device
+            .alloc_buffer((seq_len as usize) * cfg.hidden_size * 2, DType::BF16,
+                vec![seq_len as usize, cfg.hidden_size])
+            .expect("alloc bad");
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_mlp(
+            &mut enc, &mut registry, &device, &bf16, &tensors, &cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("dtype must be F32"), "got: {err}");
+    }
+
+    #[test]
+    fn adr_037_e4b8_gate_mlp_rejects_zero_seq_len_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let empty = device.alloc_buffer(4, DType::F32, vec![1]).expect("alloc");
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_mlp(
+            &mut enc, &mut registry, &device, &empty, &tensors, &cfg, 0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("seq_len must be > 0"), "got: {err}");
     }
 
     #[test]
