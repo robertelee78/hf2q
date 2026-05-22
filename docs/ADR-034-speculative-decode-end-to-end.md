@@ -271,6 +271,46 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 15) — Profile-driven correction: verifier dominates, NOT drafter (HEAD `a03d449d`)
+
+Empirical `HF2Q_MTP_PROFILE=1` profile on K=1 BATCHED MH temp=0.5 (Qwen 3.6 27B
+Q8_0, 50 tok). Steady-state per-iter (iters 9-28 averaged):
+
+| Step                      | ms/iter | % of iter |
+|---------------------------|--------:|----------:|
+| MTP drafter forward       |    ~4.4 |   **6.8%** |
+| Verifier forward (seq=2)  |   ~59.5 |  **91.8%** |
+| Other (sample/slice/copy) |    ~0.9 |    1.4%   |
+| **Iter total**            | **~64.8** | 100%    |
+
+**Falsifies prior assumption** (cont. 14): MTPLX's `device_d2_core` fused
+drafter is NOT the structural gap. Drafter is only 6.8% of our iter — fusing
+it would yield ~3.4% throughput, not the multi-x gap we'd been chasing.
+
+**Real prize**: verifier MLP fusion. Qwen 3.6 27B has 64 transformer layers,
+each with an MLP (gate + up + SwiGLU + down + residual ≈ 5 separate Metal
+dispatches in our impl). Fusing per layer saves 4 dispatches × 64 layers =
+**256 saved Metal launches × ~50μs = ~12.8 ms verifier savings**.
+
+**Projected impact**:
+
+| Metric              | Current | After fused MLP |
+|---------------------|--------:|----------------:|
+| Verifier time       | 59.5 ms |        ~46.7 ms |
+| Iter time           | 64.8 ms |        ~52.0 ms |
+| Throughput          | 26.5 t/s |        ~33 t/s |
+| Speedup vs base 21.30 | 1.244× |          **~1.55×** |
+
+This would be a STRONG ship. Multi-week scope to implement Q8_0 / Q4_K_M /
+IQ4_NL quantized fused-MLP Metal kernels (MTPLX's `gate_up_swiglu_*_qmv4`
+covers Q4 only — we need broader quant coverage).
+
+**Reference**: `/opt/MTPLX/native_extensions/verify_mlp/gate_up/gate_up.metal`
+(375 LOC) + `gate_up_swiglu_qmv4_rowwise` / `gate_up_swiglu_down_qmv4_rowwise` /
+`gate_up_swiglu_down_residual_qmv4_rowwise` declarations in `gate_up.h`.
+
+Memory: `project_adr034_profile_verifier_dominates_2026_05_21`.
+
 ### Iteration 2026-05-21 (cont. 14) — MTPLX absolute throughput comparison: we ARE peer-competitive (HEAD `47853d25`)
 
 Read `/opt/MTPLX/benchmarks/results/depth2-auto-policy-m5max-64k.json` — MTPLX
