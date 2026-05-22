@@ -610,6 +610,28 @@ fn dispatch_eagle3_projection_with_optional_bias(
             ));
         }
     }
+    // Codex /cfa E4b.4 Major (2026-05-22): bound the OUTPUT product
+    // before the callee allocates `(seq_len * out_features) * 4` bytes
+    // (where the multiply is `u32` and can wrap). Also relevant for
+    // the bias-add kernel which computes `params.m * params.n` as
+    // uint internally — products above u32::MAX corrupt the grid.
+    let out_elems_usize = (seq_len as usize)
+        .checked_mul(out_features_usize)
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_projection ({}): seq_len ({}) * out_features ({}) overflows usize",
+                label,
+                seq_len,
+                out_features_usize
+            )
+        })?;
+    if out_elems_usize > (u32::MAX as usize) {
+        return Err(anyhow!(
+            "dispatch_eagle3_projection ({}): output elements ({}) exceeds u32::MAX (downstream kernels use u32 grid)",
+            label,
+            out_elems_usize
+        ));
+    }
     // Dispatch the matmul.
     let out = apply_linear_projection_f32(
         encoder, registry, device,
