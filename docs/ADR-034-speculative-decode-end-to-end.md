@@ -81,6 +81,52 @@ All three approaches preserve the greedy byte-identity invariant (the new path p
 
 **ROI projection:** if task #89 closes the fa.ops1_4 gap to seq_len=20 levels (4.298 → ~0.42 ms per FA layer per forward), verify-forward time drops from 61.76 ms → ~45.8 ms (-26%), DFlash BS=2 throughput improves from 16.1 → ~21 t/s. Still not enough to beat MTP K=1 BATCHED MH (30.2 t/s) — drafter cost (22.99 ms) is the second-order bottleneck. To beat MTP, BOTH task #89 AND a fused chained drafter forward (MTPLX-style mx.compile fusion) would be needed.
 
+### Peer-code informed task #89 design (2026-05-21, llama.cpp reference)
+
+Per user directive "read peer code, don't guess" — surveyed peer codebases for the canonical small-qL + cur_len>0 dispatch pattern:
+
+**llama.cpp** (`/opt/llama.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp:2516-2524`):
+
+```cpp
+bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
+    const int64_t ne00 = op->src[0]->ne[0]; // head size
+    const int64_t ne01 = op->src[0]->ne[1]; // batch size = qL
+    // use vec kernel if the batch size is small and if the head size is supported
+    return (ne01 < 20) && (ne00 % 32 == 0);
+}
+```
+
+llama.cpp routes ALL qL < 20 through `kernel_flash_attn_ext_vec` (the vec kernel) with `OP_FLASH_ATTN_EXT_VEC_NQPSG = 1` (one query per threadgroup). For ne01 ∈ [2, 19], the dispatch becomes:
+
+```cpp
+ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
+```
+
+Which is just `ne01 threadgroups` in the X dimension (one per query position). The vec kernel handles any cur_len natively because it iterates over the full KV cache per query, computing per-position causal masks.
+
+**HF2Q current state** (`/opt/mlx-native/src/ops/flash_attn_vec.rs:191`):
+
+```rust
+let threadgroups = MTLSize::new(1, params.num_heads as u64, nwg as u64);
+```
+
+The HF2Q `flash_attn_vec` kernel hardcodes `qL = 1` in:
+- Output buffer shape `[num_heads, 1, head_dim]` (line 131)
+- Threadgroup grid `(1, num_heads, nwg)` (line 191)
+- Causal mask logic (single query → attend to entire `[0..kv_seq_len)`)
+
+The shader itself doesn't take a query-index parameter — it assumes the single query lives at position `kv_seq_len - 1`.
+
+**Concrete task #89 plan (multi-week):**
+
+1. **Kernel-level**: extend `flash_attn_vec_dk256` shader to accept `qL` and a per-query position offset. Each threadgroup computes one (query, head) pair; the causal mask for query `q` attends to `[0..kv_seq_len - qL + q + 1]`.
+2. **Dispatch wrapper**: extend `flash_attn_vec` to accept `qL: u32`, output `[num_heads, qL, head_dim]`, dispatch `(qL, num_heads, nwg)` threadgroups.
+3. **Routing in `apply_sdpa_with_kv_cache`**: add a new branch BEFORE the resume_path_eligible check for `head_dim == 256 && cur_len > 0 && seq_len ∈ [2, 8]` that calls the new vec path. Falls through to the resume kernel for larger seq_len.
+4. **Fused-stage extension**: lift the `cur_len == 0` predicate on `use_fused_stage_ab` since the new vec path handles the FA dispatch inside the fused encoder (replaces `apply_flash_attn_prefill_seq_major_into` at line 3133 with a vec variant when seq_len < 16).
+5. **Parity tests**: byte-identical to the resume path at qL=2,4,8 on Qwen 3.6 27B.
+
+**Hypothesis-test protocol**: before kernel work, write a unit test that dispatches the existing `flash_attn_vec_dk256` shader with `MTLSize::new(2, n_heads, nwg)` and observes the output. Expected: garbage at output[h][1] (the second query slot) because the shader's threadgroup_position_in_grid.x is unused. If correct, this falsifies "trivially use grid.x=qL" and proves a kernel rewrite is needed.
+
 ### Data assets on disk
 
 | Asset | Location | Size | Use |
