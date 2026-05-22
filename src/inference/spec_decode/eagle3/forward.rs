@@ -10,14 +10,20 @@
 //! - **E4b.1** `tensors.rs`: GPU upload pipeline (SHIPPED).
 //! - **E4b.2** `dispatch_eagle3_fc` (this file): projects
 //!   `[seq, num_aux * H]` → `[seq, H]` via the BF16 `fc.weight`.
-//! - **E4b.3+** TODO: input_layernorm, hidden_norm, concat,
-//!   self-attn (via Phase E1 `tree_attention` kernel), MLP, final
-//!   norm, lm_head, top-K extraction.
+//! - **E4b.3** `dispatch_eagle3_input_layernorm` +
+//!   `dispatch_eagle3_hidden_norm` + `dispatch_eagle3_concat_2x_hidden`
+//!   (this file): per vLLM `llama_eagle3.py:102-106` first-layer pre-attn:
+//!   normalize embeds + hidden states separately, then concat along the
+//!   last dim to produce the `[seq, 2*H]` input to Q/K/V projections.
+//! - **E4b.4+** TODO: self-attn (via Phase E1 `tree_attention`
+//!   kernel), MLP, final norm, lm_head, top-K extraction.
 
 use super::config::Eagle3DrafterConfig;
 use super::tensors::Eagle3DrafterTensors;
 use crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32;
 use anyhow::{anyhow, Context, Result};
+use mlx_native::ops::feature_concat::dispatch_feature_concat_f32;
+use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 /// EAGLE-3 FC projection.
@@ -105,6 +111,291 @@ pub fn dispatch_eagle3_fc(
         seq_len, fc_in, hidden,
     )
     .context("dispatch_eagle3_fc")
+}
+
+// ----------------------------------------------------------------
+// Phase E4b.3 — first-layer pre-attention norms + concat
+// ----------------------------------------------------------------
+//
+// Per vLLM `llama_eagle3.py:102-106`:
+//
+//     embeds = self.input_layernorm(embeds)
+//     hidden_states, residual = self._residual_norm(hidden_states)
+//     hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+//
+// `_residual_norm` is `hidden_norm` per `llama_eagle3.py:69-75`.
+// The concat is along the last dim (feature axis) yielding the
+// `[seq, 2 * hidden_size]` input to Q/K/V projections.
+
+/// Build the `[eps, dim]` F32 params buffer required by
+/// `dispatch_rms_norm`. Allocates a fresh tiny buffer per call.
+fn alloc_rms_norm_params_eagle3(
+    device: &MlxDevice,
+    eps: f32,
+    dim: u32,
+) -> Result<MlxBuffer> {
+    let mut params = device
+        .alloc_buffer(8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("alloc eagle3 rms_norm params: {e}"))?;
+    let slice = params
+        .as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("eagle3 rms_norm params slice: {e}"))?;
+    slice[0] = eps;
+    slice[1] = dim as f32;
+    Ok(params)
+}
+
+/// Shared internal helper: RMSNorm an `[seq, hidden_size]` F32
+/// tensor against the given F32 RMSNorm weight. Returns a freshly
+/// allocated F32 output buffer. Used by both `input_layernorm` and
+/// `hidden_norm` since they have the same shape contract and
+/// dtype rules.
+///
+/// Codex /cfa E4b.3 (preemptive applies E4b.2 patterns):
+/// - dtype check at boundary (input + weight must be F32)
+/// - u32::try_from for hidden_size
+/// - checked_mul for element count
+fn dispatch_eagle3_rms_norm_seq_x_hidden(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    norm_weight: &MlxBuffer,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+    label: &str,
+) -> Result<MlxBuffer> {
+    if input.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "dispatch_eagle3_rms_norm ({}): input dtype must be F32, got {:?}",
+            label,
+            input.dtype()
+        ));
+    }
+    if norm_weight.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "dispatch_eagle3_rms_norm ({}): norm weight dtype must be F32 (RMSNorm \
+             weights cast BF16→F32 at upload per ADR-030 iter-106), got {:?}",
+            label,
+            norm_weight.dtype()
+        ));
+    }
+    let hidden_usize = cfg.hidden_size;
+    let hidden: u32 = u32::try_from(hidden_usize).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_rms_norm ({}): hidden_size ({}) exceeds u32::MAX",
+            label,
+            hidden_usize
+        )
+    })?;
+    let expected_elems = (seq_len as usize)
+        .checked_mul(hidden_usize)
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_rms_norm ({}): seq_len ({}) * hidden_size ({}) overflows usize",
+                label,
+                seq_len,
+                hidden_usize
+            )
+        })?;
+    let actual = input.element_count();
+    if actual != expected_elems {
+        return Err(anyhow!(
+            "dispatch_eagle3_rms_norm ({}): input has {} elements, expected {} (seq_len={} * hidden_size={})",
+            label, actual, expected_elems, seq_len, hidden
+        ));
+    }
+    let out = device
+        .alloc_buffer(
+            expected_elems * 4,
+            DType::F32,
+            vec![seq_len as usize, hidden_usize],
+        )
+        .map_err(|e| anyhow!("alloc {label} output: {e}"))?;
+    let params = alloc_rms_norm_params_eagle3(device, cfg.rms_norm_eps, hidden)?;
+    dispatch_rms_norm(
+        encoder,
+        registry,
+        device.metal_device(),
+        input,
+        norm_weight,
+        &out,
+        &params,
+        seq_len,
+        hidden,
+    )
+    .with_context(|| format!("dispatch_rms_norm {label}"))?;
+    Ok(out)
+}
+
+/// Dispatch `input_layernorm` of the embedded input tokens.
+///
+/// Mirrors vLLM `llama_eagle3.py:104` `embeds =
+/// self.input_layernorm(embeds)`. Input: `[seq, hidden_size]` F32
+/// embedding lookup result. Output: `[seq, hidden_size]` F32
+/// normalized embeds, ready for concat with the hidden-states branch.
+pub fn dispatch_eagle3_input_layernorm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    embeds_gpu: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    dispatch_eagle3_rms_norm_seq_x_hidden(
+        encoder,
+        registry,
+        device,
+        embeds_gpu,
+        &tensors.input_layernorm,
+        cfg,
+        seq_len,
+        "input_layernorm",
+    )
+}
+
+/// Dispatch `hidden_norm` of the FC-projected target hidden state.
+///
+/// Mirrors vLLM `llama_eagle3.py:69` (`self.hidden_norm =
+/// RMSNorm(config.hidden_size, ...)`) + line 84-86 / 91-93
+/// (`_residual_norm` applies `hidden_norm`). Input: `[seq, hidden_size]`
+/// F32 — typically the output of `dispatch_eagle3_fc`. Output:
+/// `[seq, hidden_size]` F32 normalized, ready for concat.
+pub fn dispatch_eagle3_hidden_norm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    fc_output_gpu: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    dispatch_eagle3_rms_norm_seq_x_hidden(
+        encoder,
+        registry,
+        device,
+        fc_output_gpu,
+        &tensors.hidden_norm,
+        cfg,
+        seq_len,
+        "hidden_norm",
+    )
+}
+
+/// Concatenate `[seq, hidden_size]` embeds (column-left) with
+/// `[seq, hidden_size]` hidden-states (column-right) into a fresh
+/// `[seq, 2 * hidden_size]` F32 buffer.
+///
+/// Per vLLM `llama_eagle3.py:106`: `hidden_states = torch.cat(
+/// [embeds, hidden_states], dim=-1)`. The output is the input to
+/// the layer-0 Q/K/V projections (which have input width
+/// `2 * hidden_size` — see `Eagle3DrafterConfig::qkv_input_width`).
+///
+/// Uses mlx-native's `dispatch_feature_concat_f32` primitive (a
+/// strided memcpy — no FP arithmetic, byte-identical to the
+/// reference torch.cat for any F32 input).
+pub fn dispatch_eagle3_concat_2x_hidden(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    embeds_normed: &MlxBuffer,
+    hidden_normed: &MlxBuffer,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    if embeds_normed.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "dispatch_eagle3_concat_2x_hidden: embeds_normed dtype must be F32, got {:?}",
+            embeds_normed.dtype()
+        ));
+    }
+    if hidden_normed.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "dispatch_eagle3_concat_2x_hidden: hidden_normed dtype must be F32, got {:?}",
+            hidden_normed.dtype()
+        ));
+    }
+    let hidden_usize = cfg.hidden_size;
+    let hidden: u32 = u32::try_from(hidden_usize).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_concat_2x_hidden: hidden_size ({}) exceeds u32::MAX",
+            hidden_usize
+        )
+    })?;
+    let dst_stride: u32 = hidden.checked_mul(2).ok_or_else(|| {
+        anyhow!(
+            "dispatch_eagle3_concat_2x_hidden: 2 * hidden_size ({}) exceeds u32::MAX",
+            hidden_usize
+        )
+    })?;
+    let per_branch_elems = (seq_len as usize)
+        .checked_mul(hidden_usize)
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_concat_2x_hidden: seq_len ({}) * hidden_size ({}) overflows usize",
+                seq_len,
+                hidden_usize
+            )
+        })?;
+    let total_elems = per_branch_elems.checked_mul(2).ok_or_else(|| {
+        anyhow!(
+            "dispatch_eagle3_concat_2x_hidden: dst total elements (2 * {}) overflows usize",
+            per_branch_elems
+        )
+    })?;
+    if embeds_normed.element_count() != per_branch_elems {
+        return Err(anyhow!(
+            "dispatch_eagle3_concat_2x_hidden: embeds_normed has {} elements, expected {} (seq_len={} * hidden_size={})",
+            embeds_normed.element_count(),
+            per_branch_elems,
+            seq_len,
+            hidden
+        ));
+    }
+    if hidden_normed.element_count() != per_branch_elems {
+        return Err(anyhow!(
+            "dispatch_eagle3_concat_2x_hidden: hidden_normed has {} elements, expected {} (seq_len={} * hidden_size={})",
+            hidden_normed.element_count(),
+            per_branch_elems,
+            seq_len,
+            hidden
+        ));
+    }
+    let dst = device
+        .alloc_buffer(
+            total_elems * 4,
+            DType::F32,
+            vec![seq_len as usize, 2 * hidden_usize],
+        )
+        .map_err(|e| anyhow!("alloc concat output: {e}"))?;
+    // Copy embeds → dst columns [0, hidden).
+    dispatch_feature_concat_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        embeds_normed,
+        &dst,
+        seq_len,
+        hidden,
+        0,
+        dst_stride,
+    )
+    .context("dispatch_feature_concat_f32 embeds branch")?;
+    // Copy hidden → dst columns [hidden, 2*hidden).
+    dispatch_feature_concat_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        hidden_normed,
+        &dst,
+        seq_len,
+        hidden,
+        hidden,
+        dst_stride,
+    )
+    .context("dispatch_feature_concat_f32 hidden branch")?;
+    Ok(dst)
 }
 
 #[cfg(test)]
@@ -446,6 +737,314 @@ mod tests {
         assert!(
             msg.contains("dtype must be F32"),
             "expected F32-dtype error, got: {msg}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E4b.3 tests — input_layernorm + hidden_norm + concat
+    // ----------------------------------------------------------------
+
+    /// CPU reference RMSNorm: out[s, d] = x[s, d] / sqrt(mean(x^2) + eps) * w[d].
+    fn cpu_rms_norm_f32(
+        input: &[f32],   // [seq, dim]
+        weight: &[f32],  // [dim]
+        seq_len: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; seq_len * dim];
+        for s in 0..seq_len {
+            let row = &input[s * dim..(s + 1) * dim];
+            // Use f64 accumulator (matches mlx-native's rms_norm_f32_v2 scheme).
+            let mean_sq: f64 = row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>()
+                / (dim as f64);
+            let inv_rms = 1.0 / ((mean_sq as f32 + eps).sqrt());
+            for d in 0..dim {
+                out[s * dim + d] = row[d] * inv_rms * weight[d];
+            }
+        }
+        out
+    }
+
+    /// Build a synthetic safetensors blob with custom bytes for one
+    /// or more tensors keyed by name. Other manifest tensors get
+    /// zero bytes.
+    fn build_blob_with_overrides(
+        manifest: &[ExpectedTensor],
+        overrides: &std::collections::HashMap<String, Vec<u8>>,
+    ) -> Vec<u8> {
+        let mut storage: Vec<Vec<u8>> = Vec::with_capacity(manifest.len());
+        for exp in manifest {
+            let elem_bytes = match exp.dtype {
+                SafeDtype::BF16 => 2,
+                SafeDtype::I64 => 8,
+                _ => panic!("unexpected dtype in test"),
+            };
+            let nelem: usize = exp.shape.iter().product();
+            if let Some(bytes) = overrides.get(&exp.name) {
+                assert_eq!(bytes.len(), nelem * elem_bytes, "override bytes for {}", exp.name);
+                storage.push(bytes.clone());
+            } else {
+                storage.push(vec![0u8; nelem * elem_bytes]);
+            }
+        }
+        let mut tensors: BTreeMap<String, TensorView> = BTreeMap::new();
+        for (i, exp) in manifest.iter().enumerate() {
+            let view =
+                TensorView::new(exp.dtype, exp.shape.clone(), storage[i].as_slice())
+                    .expect("synthetic view");
+            tensors.insert(exp.name.clone(), view);
+        }
+        safetensors::serialize(
+            &tensors,
+            None::<std::collections::HashMap<String, String>>,
+        )
+        .expect("serialize")
+    }
+
+    #[test]
+    fn adr_037_e4b3_input_layernorm_cpu_parity_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+
+        let seq_len: u32 = 4;
+        let hidden = cfg.hidden_size;
+
+        // Random F32 input + BF16-quantized weight (RMSNorm weights
+        // are uploaded BF16 → F32 cast; CPU ref uses the BF16-quantized
+        // F32 values so parity matches what kernel computes).
+        let mut input_data = vec![0.0f32; (seq_len as usize) * hidden];
+        fill_random(&mut input_data, 0xE10);
+        let mut weight_f32 = vec![0.0f32; hidden];
+        fill_random(&mut weight_f32, 0xE11);
+        let weight_bf16_bytes = f32_to_bf16_bytes(&weight_f32);
+        let weight_bf16_q: Vec<f32> = weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+
+        let cpu_out = cpu_rms_norm_f32(
+            &input_data, &weight_bf16_q,
+            seq_len as usize, hidden, cfg.rms_norm_eps,
+        );
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "layers.0.input_layernorm.weight".to_string(),
+            weight_bf16_bytes,
+        );
+        let blob = build_blob_with_overrides(&manifest, &overrides);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let input_gpu = upload_f32_to_gpu(
+            &device, &input_data, vec![seq_len as usize, hidden],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_input_layernorm(
+            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+        )
+        .expect("dispatch_eagle3_input_layernorm");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            assert!(d < 1e-3, "input_layernorm parity: diff={d} > 1e-3");
+        }
+        eprintln!("input_layernorm parity max_diff={max_diff:.6e}");
+    }
+
+    #[test]
+    fn adr_037_e4b3_hidden_norm_cpu_parity_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+
+        let seq_len: u32 = 4;
+        let hidden = cfg.hidden_size;
+
+        let mut input_data = vec![0.0f32; (seq_len as usize) * hidden];
+        fill_random(&mut input_data, 0xE20);
+        let mut weight_f32 = vec![0.0f32; hidden];
+        fill_random(&mut weight_f32, 0xE21);
+        let weight_bf16_bytes = f32_to_bf16_bytes(&weight_f32);
+        let weight_bf16_q: Vec<f32> = weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+
+        let cpu_out = cpu_rms_norm_f32(
+            &input_data, &weight_bf16_q,
+            seq_len as usize, hidden, cfg.rms_norm_eps,
+        );
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "layers.0.hidden_norm.weight".to_string(),
+            weight_bf16_bytes,
+        );
+        let blob = build_blob_with_overrides(&manifest, &overrides);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let input_gpu = upload_f32_to_gpu(
+            &device, &input_data, vec![seq_len as usize, hidden],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_hidden_norm(
+            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+        )
+        .expect("dispatch_eagle3_hidden_norm");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            assert!(d < 1e-3, "hidden_norm parity: diff={d} > 1e-3");
+        }
+        eprintln!("hidden_norm parity max_diff={max_diff:.6e}");
+    }
+
+    #[test]
+    fn adr_037_e4b3_concat_2x_hidden_layout_matches_vllm_2026_05_22() {
+        // Verify the concat produces [seq, 2*H] with embeds-left,
+        // hidden-right column ordering per vLLM torch.cat([embeds,
+        // hidden_states], dim=-1).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
+        let _tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let seq_len: u32 = 3;
+        let hidden = cfg.hidden_size;
+        // Sentinel inputs: embeds = positive ramp (1.0..), hidden_states
+        // = negative ramp (-1.0..). The concat result must place each
+        // row's positive values FIRST (cols 0..hidden) then negative
+        // (cols hidden..2*hidden).
+        let mut embeds_data = vec![0.0f32; (seq_len as usize) * hidden];
+        let mut hidden_data = vec![0.0f32; (seq_len as usize) * hidden];
+        for s in 0..(seq_len as usize) {
+            for d in 0..hidden {
+                embeds_data[s * hidden + d] = (s * 1000 + d + 1) as f32;
+                hidden_data[s * hidden + d] = -((s * 1000 + d + 1) as f32);
+            }
+        }
+        let embeds_gpu = upload_f32_to_gpu(
+            &device, &embeds_data, vec![seq_len as usize, hidden],
+        );
+        let hidden_gpu = upload_f32_to_gpu(
+            &device, &hidden_data, vec![seq_len as usize, hidden],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_concat_2x_hidden(
+            &mut enc, &mut registry, &device,
+            &embeds_gpu, &hidden_gpu, &cfg, seq_len,
+        )
+        .expect("concat dispatch");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        assert_eq!(gpu_out.len(), (seq_len as usize) * 2 * hidden);
+
+        // Row-major [seq, 2*hidden]: row s, col c = gpu_out[s*2H + c].
+        for s in 0..(seq_len as usize) {
+            for d in 0..hidden {
+                let left = gpu_out[s * 2 * hidden + d];
+                let right = gpu_out[s * 2 * hidden + hidden + d];
+                let expected_pos = (s * 1000 + d + 1) as f32;
+                assert_eq!(left, expected_pos, "embeds (s={s} d={d})");
+                assert_eq!(right, -expected_pos, "hidden_states (s={s} d={d})");
+            }
+        }
+    }
+
+    #[test]
+    fn adr_037_e4b3_input_layernorm_rejects_non_f32_input_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let seq_len = 2_u32;
+        let bf16_input = device
+            .alloc_buffer(
+                (seq_len as usize) * cfg.hidden_size * 2,
+                DType::BF16,
+                vec![seq_len as usize, cfg.hidden_size],
+            )
+            .expect("alloc bad input");
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_input_layernorm(
+            &mut enc, &mut registry, &device, &bf16_input, &tensors, &cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("dtype must be F32"),
+            "expected F32-dtype error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b3_concat_rejects_wrong_input_elements_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
+        let _tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let seq_len = 2_u32;
+        let good_data = vec![0.0f32; (seq_len as usize) * cfg.hidden_size];
+        let good_gpu = upload_f32_to_gpu(
+            &device, &good_data, vec![seq_len as usize, cfg.hidden_size],
+        );
+        // hidden branch undersized
+        let bad_data = vec![0.0f32; 10];
+        let bad_gpu = upload_f32_to_gpu(&device, &bad_data, vec![10]);
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_concat_2x_hidden(
+            &mut enc, &mut registry, &device, &good_gpu, &bad_gpu, &cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("hidden_normed has"),
+            "expected element-count error, got: {err}"
         );
     }
 
