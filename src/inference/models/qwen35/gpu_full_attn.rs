@@ -3226,25 +3226,84 @@ pub fn build_gated_attn_layer(
         enc.memory_barrier();
 
         // Op 2: Q/K/V/G projections (all read from x_norm).
-        // Pool-aware path: seq_len=1 (decode) goes to the arena pool, seq_len>1
-        // (prefill) auto-falls-back to unpooled inside the helper because some
-        // prefill consumers download K/V to CPU (see apply_sdpa_with_kv_cache).
-        let q_flat = apply_linear_projection_f32_pooled(
-            &mut enc, registry, device, &x_norm,
-            &weights_gpu.wq, seq_len, hidden_size, q_total,
-        )?;
-        let k_flat = apply_linear_projection_f32_pooled(
-            &mut enc, registry, device, &x_norm,
-            &weights_gpu.wk, seq_len, hidden_size, kv_total,
-        )?;
-        let v_flat = apply_linear_projection_f32_pooled(
-            &mut enc, registry, device, &x_norm,
-            &weights_gpu.wv, seq_len, hidden_size, kv_total,
-        )?;
-        let gate_flat = apply_linear_projection_f32_pooled(
-            &mut enc, registry, device, &x_norm,
-            &weights_gpu.w_gate, seq_len, hidden_size, q_total,
-        )?;
+        //
+        // ADR-034 task #94 (2026-05-21) — fused dual Q4_0 path also wired
+        // into this non-arena (seq=1 decode) site. Arena (seq>1) wiring at
+        // line ~2946 mirrors this. Saves 2 dispatches per FA layer × 16 FA
+        // layers = 32 saved dispatches per base decode token. At seq=1 the
+        // launch-overhead-bound regime makes this measurable (per cont. 16
+        // fused MLP shipped +4.1%).
+        let use_fused_qkvg = std::env::var("HF2Q_FUSED_QKVG").as_deref() == Ok("1")
+            && weights_gpu.wq.dtype() == DType::U8
+            && weights_gpu.wk.dtype() == DType::U8
+            && weights_gpu.wv.dtype() == DType::U8
+            && weights_gpu.w_gate.dtype() == DType::U8;
+        let (q_flat, k_flat, v_flat, gate_flat) = if use_fused_qkvg {
+            // Allocate 4 destination buffers via the pool (same as helper
+            // does internally) so the fused dispatch can write all 4.
+            let q_bytes = (seq_len * q_total) as usize * 4;
+            let kv_bytes = (seq_len * kv_total) as usize * 4;
+            let q_flat = super::decode_pool::pooled_alloc_buffer(
+                device, q_bytes, DType::F32,
+                vec![seq_len as usize, q_total as usize],
+            )
+            .map_err(|e| anyhow!("alloc q_flat (qkvg fused): {e}"))?;
+            let gate_flat = super::decode_pool::pooled_alloc_buffer(
+                device, q_bytes, DType::F32,
+                vec![seq_len as usize, q_total as usize],
+            )
+            .map_err(|e| anyhow!("alloc gate_flat (qkvg fused): {e}"))?;
+            let k_flat = super::decode_pool::pooled_alloc_buffer(
+                device, kv_bytes, DType::F32,
+                vec![seq_len as usize, kv_total as usize],
+            )
+            .map_err(|e| anyhow!("alloc k_flat (qkvg fused): {e}"))?;
+            let v_flat = super::decode_pool::pooled_alloc_buffer(
+                device, kv_bytes, DType::F32,
+                vec![seq_len as usize, kv_total as usize],
+            )
+            .map_err(|e| anyhow!("alloc v_flat (qkvg fused): {e}"))?;
+            // Fused Q + gate.
+            mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
+                &mut enc, registry, device,
+                &weights_gpu.wq, &weights_gpu.w_gate, &x_norm,
+                &q_flat, &gate_flat,
+                mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
+                    m: seq_len, output_size: q_total, hidden_size,
+                },
+            )?;
+            // Fused K + V.
+            mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
+                &mut enc, registry, device,
+                &weights_gpu.wk, &weights_gpu.wv, &x_norm,
+                &k_flat, &v_flat,
+                mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
+                    m: seq_len, output_size: kv_total, hidden_size,
+                },
+            )?;
+            (q_flat, k_flat, v_flat, gate_flat)
+        } else {
+            // Pool-aware path: seq_len=1 (decode) goes to the arena pool, seq_len>1
+            // (prefill) auto-falls-back to unpooled inside the helper because some
+            // prefill consumers download K/V to CPU (see apply_sdpa_with_kv_cache).
+            let q_flat = apply_linear_projection_f32_pooled(
+                &mut enc, registry, device, &x_norm,
+                &weights_gpu.wq, seq_len, hidden_size, q_total,
+            )?;
+            let k_flat = apply_linear_projection_f32_pooled(
+                &mut enc, registry, device, &x_norm,
+                &weights_gpu.wk, seq_len, hidden_size, kv_total,
+            )?;
+            let v_flat = apply_linear_projection_f32_pooled(
+                &mut enc, registry, device, &x_norm,
+                &weights_gpu.wv, seq_len, hidden_size, kv_total,
+            )?;
+            let gate_flat = apply_linear_projection_f32_pooled(
+                &mut enc, registry, device, &x_norm,
+                &weights_gpu.w_gate, seq_len, hidden_size, q_total,
+            )?;
+            (q_flat, k_flat, v_flat, gate_flat)
+        };
         // Barrier: ops 3 read from q_flat / k_flat written above.
         enc.memory_barrier();
 
