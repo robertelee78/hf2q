@@ -2943,11 +2943,26 @@ pub fn build_gated_attn_layer(
         //   - HF2Q_FUSED_QKVG=1
         //   - weights are Q4_0 (DType::U8). FA weights are ALWAYS Q4_0 per
         //     FullAttnWeightsGpu::from_cpu line 334-337 — universal path.
+        // Codex cont. 23 hardening: DType::U8 alone is "raw bytes" — verify
+        // byte-len matches Q4_0 block layout (18 bytes per 32-element block)
+        // to ensure we're not feeding the kernel some other U8-packed quant.
+        const Q4_0_BLOCK_BYTES: usize = 18;
+        const Q4_0_BLOCK_VALUES: u32 = 32;
+        let q_w_bytes_expected = (q_total as usize)
+            * (hidden_size / Q4_0_BLOCK_VALUES) as usize
+            * Q4_0_BLOCK_BYTES;
+        let kv_w_bytes_expected = (kv_total as usize)
+            * (hidden_size / Q4_0_BLOCK_VALUES) as usize
+            * Q4_0_BLOCK_BYTES;
+        let is_q4_0 = |buf: &MlxBuffer, expected: usize| {
+            buf.dtype() == DType::U8 && buf.byte_len() == expected
+        };
         let use_fused_qkvg = std::env::var("HF2Q_FUSED_QKVG").as_deref() == Ok("1")
-            && weights_gpu.wq.dtype() == DType::U8
-            && weights_gpu.wk.dtype() == DType::U8
-            && weights_gpu.wv.dtype() == DType::U8
-            && weights_gpu.w_gate.dtype() == DType::U8;
+            && hidden_size % Q4_0_BLOCK_VALUES == 0
+            && is_q4_0(&weights_gpu.wq, q_w_bytes_expected)
+            && is_q4_0(&weights_gpu.w_gate, q_w_bytes_expected)
+            && is_q4_0(&weights_gpu.wk, kv_w_bytes_expected)
+            && is_q4_0(&weights_gpu.wv, kv_w_bytes_expected);
         if use_fused_qkvg {
             // Fused Q + gate (both [hidden, q_total]).
             mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
@@ -3233,11 +3248,26 @@ pub fn build_gated_attn_layer(
         // layers = 32 saved dispatches per base decode token. At seq=1 the
         // launch-overhead-bound regime makes this measurable (per cont. 16
         // fused MLP shipped +4.1%).
+        // Codex cont. 23 hardening: DType::U8 alone is "raw bytes" — verify
+        // byte-len matches Q4_0 block layout (18 bytes per 32-element block)
+        // to ensure we're not feeding the kernel some other U8-packed quant.
+        const Q4_0_BLOCK_BYTES: usize = 18;
+        const Q4_0_BLOCK_VALUES: u32 = 32;
+        let q_w_bytes_expected = (q_total as usize)
+            * (hidden_size / Q4_0_BLOCK_VALUES) as usize
+            * Q4_0_BLOCK_BYTES;
+        let kv_w_bytes_expected = (kv_total as usize)
+            * (hidden_size / Q4_0_BLOCK_VALUES) as usize
+            * Q4_0_BLOCK_BYTES;
+        let is_q4_0 = |buf: &MlxBuffer, expected: usize| {
+            buf.dtype() == DType::U8 && buf.byte_len() == expected
+        };
         let use_fused_qkvg = std::env::var("HF2Q_FUSED_QKVG").as_deref() == Ok("1")
-            && weights_gpu.wq.dtype() == DType::U8
-            && weights_gpu.wk.dtype() == DType::U8
-            && weights_gpu.wv.dtype() == DType::U8
-            && weights_gpu.w_gate.dtype() == DType::U8;
+            && hidden_size % Q4_0_BLOCK_VALUES == 0
+            && is_q4_0(&weights_gpu.wq, q_w_bytes_expected)
+            && is_q4_0(&weights_gpu.w_gate, q_w_bytes_expected)
+            && is_q4_0(&weights_gpu.wk, kv_w_bytes_expected)
+            && is_q4_0(&weights_gpu.wv, kv_w_bytes_expected);
         let (q_flat, k_flat, v_flat, gate_flat) = if use_fused_qkvg {
             // Allocate 4 destination buffers via the pool (same as helper
             // does internally) so the fused dispatch can write all 4.
