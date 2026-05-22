@@ -40,6 +40,7 @@ use crate::inference::models::qwen35::gpu_full_attn::{
     permute_seq_head_dim_to_head_seq_dim_cpu, upload_f32,
 };
 use mlx_native::ops::sdpa::{sdpa, SdpaParams};
+use mlx_native::ops::transpose::permute_021_f32;
 
 /// Logical-bounded F32 download for DFlash drafter CPU-read sites.
 ///
@@ -1183,72 +1184,123 @@ pub fn dispatch_dflash_sdpa_cross_length(
         ));
     }
 
-    // Finalize Q (commit pending dispatches).
-    encoder.commit_and_wait().context("commit before sdpa cross-length permute")?;
+    // ADR-034 task #95 sub-iter F (2026-05-22) — GPU permute path.
+    //
+    // Was: commit_and_wait + CPU download_f32_logical + CPU permute +
+    // upload_f32 for both Q (seq→head-major) and output (head→seq-
+    // major). 4 CPU memcpy round-trips per call, 2 commit_and_wait
+    // boundaries.
+    //
+    // Now: in-encoder permute_021_f32 dispatches for both Q and output,
+    // ONE commit_and_wait at the end. The Q permute happens BEFORE the
+    // SDPA dispatch in the SAME encoder via memory_barrier. The output
+    // permute happens AFTER the SDPA dispatch in the same encoder.
+    //
+    // Env opt-out HF2Q_DFLASH_SDPA_CPU=1 falls back to the legacy
+    // CPU-permute path for A/B testing during sub-iter F bench
+    // validation. Sub-iter G (later) removes the opt-out + CPU paths
+    // after burn-in.
+    //
+    // Output: seq-major `[L, H_q, D]` F32 (matches the original
+    // contract). q_hm is local to this function — pooled-alloc lets it
+    // outlive the deferred commit.
 
-    // CPU permute Q seq-major [L, H_q, D] → head-major [1, H_q, L, D].
-    // q_seq_major can come from apply_imrope (pool-allocated, bucket-rounded
-    // storage); use logical element count to avoid permuting trailing junk.
-    let q_cpu = download_f32_logical(q_seq_major)?;
-    let q_hm_cpu = permute_seq_head_dim_to_head_seq_dim_cpu(
-        &q_cpu,
-        q_seq_len as usize,
-        n_heads as usize,
-        head_dim as usize,
-    );
-    let q_hm = upload_f32(&q_hm_cpu, device)?;
+    let l = q_seq_len as usize;
+    let nh = n_heads as usize;
+    let d = head_dim as usize;
+    let out_elem = nh * l * d;
 
-    // Allocate output buffer head-major [1, H_q, L, D].
-    let out_elem = (n_heads as usize) * (q_seq_len as usize) * (head_dim as usize);
+    let use_cpu_permute =
+        std::env::var("HF2Q_DFLASH_SDPA_CPU").as_deref() == Ok("1");
+
+    if use_cpu_permute {
+        // ── Legacy CPU permute path (sub-iter F opt-out) ──
+        encoder.commit_and_wait().context("commit before sdpa cross-length permute (CPU)")?;
+        let q_cpu = download_f32_logical(q_seq_major)?;
+        let q_hm_cpu = permute_seq_head_dim_to_head_seq_dim_cpu(&q_cpu, l, nh, d);
+        let q_hm = upload_f32(&q_hm_cpu, device)?;
+
+        let out_hm = device
+            .alloc_buffer(out_elem * 4, DType::F32, vec![1, nh, l, d])
+            .map_err(|e| anyhow!("alloc sdpa cross-length output (CPU): {e}"))?;
+        let params = SdpaParams {
+            n_heads, n_kv_heads, head_dim,
+            seq_len: q_seq_len, kv_seq_len, scale,
+            kv_capacity: cache_layer.capacity, do_causal,
+        };
+        let mut enc2 = device.command_encoder().context("enc sdpa cross-length (CPU)")?;
+        sdpa(&mut enc2, registry, device, &q_hm, &cache_layer.keys, &cache_layer.values, &out_hm, &params, 1)
+            .map_err(|e| anyhow!("sdpa cross-length (CPU): {e}"))?;
+        enc2.commit_and_wait().context("commit sdpa cross-length (CPU)")?;
+        let out_hm_cpu = download_f32_logical(&out_hm)?;
+        let mut out_sm_cpu = vec![0.0f32; out_elem];
+        for h in 0..nh {
+            for t in 0..l {
+                let src = (h * l + t) * d;
+                let dst = (t * nh + h) * d;
+                out_sm_cpu[dst..dst + d].copy_from_slice(&out_hm_cpu[src..src + d]);
+            }
+        }
+        return upload_f32(&out_sm_cpu, device)
+            .map_err(|e| anyhow!("upload sdpa cross-length output (CPU): {e}"));
+    }
+
+    // ── Sub-iter F GPU permute path ──
+    //
+    // Use the SAME encoder for Q permute + SDPA + output permute.
+    // q_seq_major was written by the caller's earlier dispatches; the
+    // caller committed that encoder before opening the one we receive.
+    // Metal serial queue ordering guarantees the producer's writes are
+    // visible. Q permute reads q_seq_major; barrier before SDPA reads
+    // q_hm; barrier between SDPA and output permute.
+
+    let q_hm = device
+        .alloc_buffer(out_elem * 4, DType::F32, vec![nh, l, d])
+        .map_err(|e| anyhow!("alloc q_hm: {e}"))?;
     let out_hm = device
-        .alloc_buffer(
-            out_elem * 4,
-            DType::F32,
-            vec![1, n_heads as usize, q_seq_len as usize, head_dim as usize],
-        )
-        .map_err(|e| anyhow!("alloc sdpa cross-length output: {e}"))?;
+        .alloc_buffer(out_elem * 4, DType::F32, vec![1, nh, l, d])
+        .map_err(|e| anyhow!("alloc sdpa cross-length output_hm: {e}"))?;
+    let out_sm = device
+        .alloc_buffer(out_elem * 4, DType::F32, vec![l, nh, d])
+        .map_err(|e| anyhow!("alloc sdpa cross-length output_sm: {e}"))?;
 
-    // SDPA params: separate Q seq_len + KV seq_len + capacity.
-    // kv_seq_len is now an explicit parameter (was cache_layer.seq_len) so
-    // callers can include slack-written prop K/V in the kv range.
+    // Step 1: GPU permute Q seq-major [L, H_q, D] → head-major [H_q, L, D].
+    permute_021_f32(
+        encoder, registry, device.metal_device(),
+        q_seq_major, &q_hm,
+        l, nh, d,
+    )
+    .map_err(|e| anyhow!("permute_021_f32 q seq->hm: {e}"))?;
+    encoder.memory_barrier();
+
+    // Step 2: SDPA dispatch in same encoder.
     let params = SdpaParams {
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        seq_len: q_seq_len,
-        kv_seq_len,
-        scale,
-        kv_capacity: cache_layer.capacity,
-        do_causal,
+        n_heads, n_kv_heads, head_dim,
+        seq_len: q_seq_len, kv_seq_len, scale,
+        kv_capacity: cache_layer.capacity, do_causal,
     };
-
-    // Fresh encoder for SDPA dispatch.
-    let mut enc2 = device.command_encoder().context("enc sdpa cross-length")?;
     sdpa(
-        &mut enc2, registry, device,
+        encoder, registry, device,
         &q_hm, &cache_layer.keys, &cache_layer.values,
         &out_hm, &params, 1,
     )
     .map_err(|e| anyhow!("sdpa cross-length: {e}"))?;
-    enc2.commit_and_wait().context("commit sdpa cross-length")?;
+    encoder.memory_barrier();
 
-    // CPU permute output head-major → seq-major. `out_hm` was created by
-    // `device.alloc_buffer` (not pooled), so its element_count already
-    // equals storage — `download_f32_logical` is defensive parity with
-    // the other dflash download sites.
-    let out_hm_cpu = download_f32_logical(&out_hm)?;
-    let mut out_sm_cpu = vec![0.0f32; out_elem];
-    let nh = n_heads as usize;
-    let l = q_seq_len as usize;
-    let d = head_dim as usize;
-    for h in 0..nh {
-        for t in 0..l {
-            let src = (h * l + t) * d;
-            let dst = (t * nh + h) * d;
-            out_sm_cpu[dst..dst + d].copy_from_slice(&out_hm_cpu[src..src + d]);
-        }
-    }
-    upload_f32(&out_sm_cpu, device).map_err(|e| anyhow!("upload sdpa cross-length output: {e}"))
+    // Step 3: GPU permute output head-major [H_q, L, D] → seq-major [L, H_q, D].
+    permute_021_f32(
+        encoder, registry, device.metal_device(),
+        &out_hm, &out_sm,
+        nh, l, d,
+    )
+    .map_err(|e| anyhow!("permute_021_f32 out hm->seq: {e}"))?;
+
+    // Commit + wait. The wait is needed because the caller uses
+    // out_sm as input to o_proj in a separate encoder. (Future sub-
+    // iter G could lift this commit too if o_proj fuses into this
+    // encoder.)
+    encoder.commit_and_wait().context("commit sdpa cross-length (GPU)")?;
+    Ok(out_sm)
 }
 
 /// Dispatch the O projection: `o_proj @ attn_out`.
