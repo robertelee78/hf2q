@@ -372,64 +372,48 @@ pub fn expand_dynamic_tree<D: Drafter>(
 }
 
 // ----------------------------------------------------------------
-// Phase E6 (2026-05-22) — cache-aware orchestrator.
+// Phase E6 (2026-05-22) — cache-aware orchestrator (tree-mask design).
 // ----------------------------------------------------------------
 //
 // `expand_dynamic_tree_with_cache` extends best-first dynamic tree
-// expansion to maintain a drafter KV cache invariant:
+// expansion to drive a drafter KV cache. The cache grows monotonically
+// throughout expansion — never rolled back during the tree walk. Each
+// predict_topk uses a tree-aware attention mask that selects only the
+// ancestor chain of the expanding node (the drafter implementation
+// computes this mask from its own tree-node→cache-slot mapping).
 //
-//     before each predict_topk(node) call:
-//         cache.len() == depth(node)
-//         cache slots [0..depth(node)) hold K/V for ancestors
+// ## Why monotonic growth (not rollback)
 //
-// Because best-first expansion can jump between branches (e.g.
-// expand A, then expand B which is A's sibling), the orchestrator
-// must ROLLBACK the cache when the new node's ancestor chain
-// diverges from the previously expanded node's chain.
+// An earlier (buggy) iteration rolled back the cache when expansion
+// moved between branches. The bug: rolling back to expand sibling A2
+// drops A1's K/V; later admissions of A1's descendants (B1, B2, ...)
+// then have NO ANCESTOR K/V to attend to. The tree-mask design avoids
+// this by keeping ALL admitted nodes in cache; per-call mask selects
+// the relevant ancestors.
 
 /// Trait abstracting the cache-control surface that
-/// `expand_dynamic_tree_with_cache` needs. Implemented by
-/// `GpuDrafter`. Lets us write the orchestrator generically while
-/// keeping the cache type out of the dynamic_tree module's import
-/// surface.
+/// `expand_dynamic_tree_with_cache` needs.
 pub trait CacheControlDrafter: Drafter {
     /// Returns current cache length. `0` when no cache is attached.
     fn cache_len(&self) -> usize;
-    /// Rollback to keep only the indicated cache slots (in their
-    /// listed order). See `DrafterKvCache::rollback_to_accepted`
-    /// for semantics.
-    fn rollback_cache(&mut self, accepted: &[usize]) -> Result<()>;
     /// Reset cache to empty.
     fn clear_cache(&mut self);
 }
 
-/// Cache-aware dynamic tree expansion.
+/// Cache-aware dynamic tree expansion (tree-mask design).
 ///
-/// Same best-first algorithm as `expand_dynamic_tree` but maintains
-/// the drafter KV cache invariant by rolling back the cache between
-/// branches.
+/// Best-first algorithm identical to `expand_dynamic_tree`; the only
+/// addition is calling `drafter.clear_cache()` at entry. The drafter
+/// implementation maintains the tree-node→cache-slot mapping and
+/// builds tree-aware masks inside its `predict_topk` — the
+/// orchestrator does not see the cache directly.
 ///
 /// # Cache state contract
 ///
-/// At entry: `drafter.cache_len()` must equal 0 (orchestrator calls
-/// `drafter.clear_cache()` first). At exit: cache holds K/V for
-/// the longest branch the expansion reached (the cache state is
-/// "garbage" from the caller's perspective — they should typically
-/// rollback again to keep only the ACCEPTED path after tree-walk).
-///
-/// # Algorithm
-///
-/// Maintains `cache_nodes: Vec<usize>` — tree-node indices currently
-/// occupying cache slots in order. After admitting node `c` whose
-/// parent is `p`:
-///
-/// 1. Build ancestor chain of `c` (excluding `c`): `[root, ...,
-///    p]`.
-/// 2. If `cache_nodes != ancestors`, rollback to keep only the
-///    ancestor positions (which is the only state cache-aware
-///    predict_topk will accept).
-/// 3. Call `drafter.predict_topk(c)` which appends `c`'s K/V to
-///    cache. Update `cache_nodes` by appending `c`.
+/// At entry: drafter cache is cleared. At exit: cache holds K/V for
+/// EVERY admitted-and-expanded node (cache.len() == count of internal
+/// tree nodes). Caller should rollback to keep only the accepted path
+/// after tree-walk-accept.
 pub fn expand_dynamic_tree_with_cache<D: CacheControlDrafter>(
     root_token: u32,
     drafter: &mut D,
@@ -451,24 +435,17 @@ pub fn expand_dynamic_tree_with_cache<D: CacheControlDrafter>(
     depths.push(0);
     cum.push(0.0);
 
-    // `cache_nodes[i]` = tree-node index currently in cache slot i.
-    // After expanding node N, N's K/V is appended at the END of
-    // cache, so cache_nodes.push(N).
-    let mut cache_nodes: Vec<usize> = Vec::with_capacity(cfg.budget);
-
     let mut heap = BinaryHeap::<PendingCandidate>::new();
     let mut seq_counter: usize = 0;
 
-    // Seed by expanding the root. cache_nodes goes [] → [0].
+    // Seed by expanding the root. Drafter records root's cache slot.
     if cfg.budget > 1 && cfg.max_depth >= 1 {
         let view = TreeContextView {
             tokens: &tokens,
             parents: &parents,
         };
-        // Cache must be empty before root expansion (we just cleared).
         let candidates = drafter.predict_topk(view, 0, cfg.top_k)?;
         validate_candidates(&candidates, cfg.top_k)?;
-        cache_nodes.push(0);
         debug_assert_eq!(drafter.cache_len(), 1);
 
         for cand in candidates {
@@ -502,48 +479,15 @@ pub fn expand_dynamic_tree_with_cache<D: CacheControlDrafter>(
 
         // Only expand if we'll potentially admit more children.
         if tokens.len() < cfg.budget && new_depth < cfg.max_depth {
-            // Build the required cache-node sequence for expanding
-            // child_idx: ancestors of child_idx, root first.
-            let mut required: Vec<usize> = Vec::with_capacity(new_depth);
-            let mut cursor = Some(parent_idx);
-            while let Some(idx) = cursor {
-                required.push(idx);
-                cursor = parents[idx];
-            }
-            required.reverse();
-            // Rollback cache to match `required` if the cache state
-            // diverged from it.
-            if cache_nodes != required {
-                // Map each required node to its current cache slot.
-                let mut keep_slots: Vec<usize> = Vec::with_capacity(required.len());
-                for &node in &required {
-                    let slot = cache_nodes
-                        .iter()
-                        .position(|&n| n == node)
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "expand_dynamic_tree_with_cache: required ancestor \
-                                 {} not present in cache_nodes {:?} — orchestrator \
-                                 bookkeeping bug",
-                                node, cache_nodes
-                            )
-                        })?;
-                    keep_slots.push(slot);
-                }
-                drafter.rollback_cache(&keep_slots)?;
-                cache_nodes = required;
-                debug_assert_eq!(drafter.cache_len(), cache_nodes.len());
-            }
-            // Now expand. predict_topk will append child_idx's K/V
-            // at the end of cache.
+            // Tree-mask design: cache grows monotonically; no rollback.
+            // Drafter's predict_topk builds the tree-aware mask
+            // internally from its tree_node_cache_slot mapping.
             let view = TreeContextView {
                 tokens: &tokens,
                 parents: &parents,
             };
             let candidates = drafter.predict_topk(view, child_idx, cfg.top_k)?;
             validate_candidates(&candidates, cfg.top_k)?;
-            cache_nodes.push(child_idx);
-            debug_assert_eq!(drafter.cache_len(), cache_nodes.len());
 
             let parent_cum = cum[child_idx];
             for cand in candidates {
@@ -642,16 +586,30 @@ mod tests {
             node_to_expand: usize,
             top_k: usize,
         ) -> Result<Vec<DraftCandidate>> {
-            // Verify the orchestrator's cache invariant at entry.
-            let path = tree.path_tokens(node_to_expand);
+            // Phase E6 tree-mask design: orchestrator no longer
+            // maintains cache.len() == path.len()-1. Instead, every
+            // ancestor of node_to_expand must have been previously
+            // expanded (in best-first ordering, parents are always
+            // expanded before children — verify that here).
             self.predict_entry_lens.push(self.cache_slots.len());
-            assert_eq!(
-                self.cache_slots.len() + 1,
-                path.len(),
-                "cache invariant violated: cache.len()={} path.len()={}",
-                self.cache_slots.len(),
-                path.len(),
-            );
+            let mut cursor = tree.parents[node_to_expand];
+            let mut required_ancestor_count = 0;
+            while let Some(idx) = cursor {
+                required_ancestor_count += 1;
+                // The mock doesn't have a tree-idx → slot map; we
+                // just verify the COUNT of ancestors is at most the
+                // current cache length (ancestors must have already
+                // produced their cache slot).
+                assert!(
+                    required_ancestor_count <= self.cache_slots.len(),
+                    "expanding node {} but cache.len()={} < ancestor count {} \
+                     (ancestor not yet expanded — orchestrator bug)",
+                    node_to_expand,
+                    self.cache_slots.len(),
+                    required_ancestor_count,
+                );
+                cursor = tree.parents[idx];
+            }
             let candidates = self.inner.predict_topk(tree, node_to_expand, top_k)?;
             // Simulate the cache-aware forward APPENDING this node's K/V.
             self.cache_slots.push(self.next_appended_tag);
@@ -663,28 +621,6 @@ mod tests {
     impl<D: Drafter> CacheControlDrafter for CacheTrackingMock<D> {
         fn cache_len(&self) -> usize {
             self.cache_slots.len()
-        }
-        fn rollback_cache(&mut self, accepted: &[usize]) -> Result<()> {
-            self.rollback_history.push(accepted.to_vec());
-            // Validate slots are in range + unique.
-            let mut seen = HashSet::new();
-            for &s in accepted {
-                if s >= self.cache_slots.len() {
-                    anyhow::bail!(
-                        "rollback slot {} >= cache.len() {}",
-                        s,
-                        self.cache_slots.len()
-                    );
-                }
-                if !seen.insert(s) {
-                    anyhow::bail!("duplicate slot {} in rollback", s);
-                }
-            }
-            self.cache_slots = accepted
-                .iter()
-                .map(|&i| self.cache_slots[i])
-                .collect();
-            Ok(())
         }
         fn clear_cache(&mut self) {
             self.cache_slots.clear();
@@ -729,43 +665,32 @@ mod tests {
         let tree = expand_dynamic_tree_with_cache(123, &mut mock, &cfg)
             .expect("expand");
         assert_eq!(tree.len(), 5);
-        // Orchestrator only EXPANDS up to max_depth-1: budget=5,
-        // max_depth=4 chains as root → A1 → A2 → A3 → A4. Expansions
-        // happen on root, A1, A2, A3 (4 predict_topk calls); A4 is
-        // admitted but new_depth==max_depth, so no expansion.
-        // Final cache.len() = 4.
+        // Phase E6 tree-mask design: orchestrator no longer issues
+        // rollbacks. Cache grows monotonically with each expansion.
+        // budget=5, max_depth=4 chains as root → A1 → A2 → A3 → A4.
+        // Expansions happen on root, A1, A2, A3 (4 predict_topk calls);
+        // A4 admitted at max_depth, no expansion. Final cache.len()=4.
         assert_eq!(mock.cache_len(), 4);
-        // No rollbacks for linear chain.
         assert!(
             mock.rollback_history.is_empty(),
-            "linear chain should never rollback; got {:?}",
-            mock.rollback_history
+            "tree-mask design: no rollbacks during expansion"
         );
-        // Cache len at predict_topk entry = depth of node = 0,1,2,3.
+        // Cache len at predict_topk entry = depth of node = 0,1,2,3
+        // (still matches linear-chain depth since no siblings interleave).
         assert_eq!(mock.predict_entry_lens, vec![0, 1, 2, 3]);
     }
 
     #[test]
-    fn adr_037_e6_cache_orchestrator_sibling_expansion_triggers_rollback_2026_05_22() {
-        // Setup designed to force best-first to switch between
-        // branches: budget=4, top_k=3, max_depth=2. Root expands to
-        // 3 children A,B,C (cum -0.5 each via slope 0). Best-first
-        // pops in seq order: A first. Then A is expanded to depth 2.
-        // After admitting 1 of A's grandchildren (cum -1.0), the
-        // next best on heap is B (cum -0.5) vs A's other
-        // grandchildren (cum -1.0+...). With slope -0.5 for the
-        // CHILDREN slot ordering: children cumulative drop steeply.
-        //
-        // We use BiasedMockDrafter to make some subtrees more
-        // attractive (deeper expansion) — but the key for this test
-        // is that we SEE at least one rollback when expansion
-        // switches between branches.
+    fn adr_037_e6_cache_orchestrator_sibling_expansion_no_rollback_2026_05_22() {
+        // Phase E6 tree-mask design (correction over earlier rollback
+        // design which was buggy): with multiple branches in flight,
+        // cache grows monotonically — no rollbacks. The drafter
+        // builds tree-aware masks per call.
         let cfg = DynamicTreeConfig {
             budget: 6,
             max_depth: 2,
             top_k: 3,
         };
-        // Inner with steep slope so cumulative log_probs spread out.
         let inner = MockDrafter {
             vocab_size: 1000,
             base_log_prob: -0.5,
@@ -774,22 +699,46 @@ mod tests {
         let mut mock = CacheTrackingMock::new(inner);
         let tree = expand_dynamic_tree_with_cache(0, &mut mock, &cfg)
             .expect("expand");
-        // Tree should fill the budget.
         assert_eq!(tree.len(), 6);
-        // Should have at least one rollback because expanding multiple
-        // depth-1 children means switching branches.
+        // Cache grows monotonically; never rolls back during expansion.
         assert!(
-            !mock.rollback_history.is_empty(),
-            "expected at least one rollback when expanding multiple branches"
+            mock.rollback_history.is_empty(),
+            "tree-mask design: cache never rolls back during expansion"
         );
-        // The cache invariant must have held at every predict_topk call
-        // (the mock asserts this in predict_topk).
-        // Cache len after each predict_topk = depth(node)+1 (root has
-        // depth 0, so call 1 leaves cache.len()=1).
-        assert!(
-            !mock.predict_entry_lens.is_empty(),
-            "must have expansion calls"
-        );
+        // Must have made some predict_topk calls.
+        assert!(!mock.predict_entry_lens.is_empty());
+    }
+
+    #[test]
+    fn adr_037_e6_cache_orchestrator_deep_tree_cross_branch_no_panic_2026_05_22() {
+        // CRITICAL regression test for the rollback-design bug fixed
+        // in tree-mask v2: at max_depth >= 3, best-first interleaves
+        // sibling and descendant expansions. The buggy rollback design
+        // would drop ancestor K/V mid-expansion; the new design keeps
+        // every ancestor in cache and uses per-call mask.
+        //
+        // This test would PANIC in the buggy design with "ancestor
+        // not yet expanded" — the orchestrator would have rolled
+        // off the ancestor before its descendant got popped.
+        let cfg = DynamicTreeConfig {
+            budget: 12,
+            max_depth: 4,
+            top_k: 3,
+        };
+        let inner = MockDrafter {
+            vocab_size: 1000,
+            base_log_prob: -0.5,
+            log_prob_slope: -1.0,
+        };
+        let mut mock = CacheTrackingMock::new(inner);
+        let tree = expand_dynamic_tree_with_cache(0, &mut mock, &cfg)
+            .expect("max_depth=4 + cross-branch must not panic");
+        // Tree filled up.
+        assert!(tree.len() <= cfg.budget);
+        // Cache grew to at least (admitted internal nodes) entries.
+        assert!(mock.cache_len() >= 1);
+        // Cache size = number of predict_topk calls.
+        assert_eq!(mock.cache_len(), mock.predict_entry_lens.len());
     }
 
     #[test]
@@ -815,13 +764,10 @@ mod tests {
     }
 
     #[test]
-    fn adr_037_e6_cache_orchestrator_rollback_invariant_2026_05_22() {
-        // After any rollback, the cache_nodes (in our mock, simulated
-        // by cache_slots) must be a prefix of the ancestor chain of
-        // the node about to be expanded. The mock's predict_topk
-        // asserts cache.len()+1 == path.len() at entry — covered
-        // implicitly. Here we verify rollback_history contents make
-        // sense.
+    fn adr_037_e6_cache_orchestrator_no_rollback_history_2026_05_22() {
+        // Tree-mask design: orchestrator NEVER calls rollback during
+        // expansion. (Rollback is only used after tree-walk-accept,
+        // which is outside the orchestrator.)
         let cfg = DynamicTreeConfig {
             budget: 4,
             max_depth: 2,
@@ -835,17 +781,10 @@ mod tests {
         let mut mock = CacheTrackingMock::new(inner);
         let _ = expand_dynamic_tree_with_cache(0, &mut mock, &cfg)
             .expect("expand");
-        // Each rollback's slots must be sorted-ascending (orchestrator
-        // builds them via root→parent ancestor walk).
-        for slots in &mock.rollback_history {
-            for w in slots.windows(2) {
-                assert!(
-                    w[0] < w[1],
-                    "rollback slots should be ascending root→parent, got {:?}",
-                    slots
-                );
-            }
-        }
+        assert!(
+            mock.rollback_history.is_empty(),
+            "orchestrator should not call rollback in tree-mask design"
+        );
     }
 
     #[test]

@@ -71,26 +71,31 @@ pub struct GpuDrafter<'a> {
     /// depths[i] for tree-aware decoding; for this iteration's
     /// single-token path we use linear positions starting at base_pos).
     pub base_pos: u32,
-    /// Optional drafter KV cache (Phase E5b Step 3).
+    /// Optional drafter KV cache (Phase E5b Step 3 + Phase E6 fix).
     ///
     /// When `Some`, `predict_topk` uses the cache-aware forward
-    /// (`dispatch_eagle3_drafter_forward_with_kv_cache`), which
-    /// conditions on the full root-to-node ancestor chain via cached
-    /// K/V — lifting the `path.len() == 1` cap from E4b.10b.3.
-    ///
-    /// **Cache state invariant**: at the start of each `predict_topk`
-    /// call, `cache.len()` must equal `path.len() - 1` where `path`
-    /// is the parent-chain tokens from root to `node_to_expand`. The
-    /// orchestrator maintains this invariant by calling
-    /// [`Self::rollback_cache`] when switching to a different branch
-    /// (e.g. picking a sibling instead of a descendant). After the
-    /// call, `cache.len()` advances by 1 (new node's K/V appended).
+    /// (`dispatch_eagle3_drafter_forward_with_kv_cache`) and conditions
+    /// on the full root-to-node ancestor chain. Cache grows
+    /// monotonically across `predict_topk` calls (no rollback during
+    /// tree expansion); tree-aware mask selects ancestors per call.
     ///
     /// When `None`, `predict_topk` falls back to the unbatched
     /// single-token-decode path with the original `path.len() == 1`
     /// guard (Phase E4b.10b.3 behavior preserved for backward
     /// compatibility).
     pub kv_cache: Option<DrafterKvCache>,
+    /// Phase E6 tree-mask design (2026-05-22): tree-node-idx →
+    /// cache slot index. Set after each `predict_topk` call in cache
+    /// mode. Used by subsequent calls to build the tree-aware
+    /// attention mask: every ancestor of `node_to_expand` whose
+    /// `tree_node_cache_slot` is `Some` becomes an attended position.
+    ///
+    /// This replaces the buggy rollback-based design (Step 3 + Phase
+    /// E6 v1): when expanding A2 (sibling of A1) dropped A1's K/V
+    /// from cache, later expansion of A1's child B1 had no way to
+    /// recover A1's K/V. The tree-mask design keeps ALL nodes in
+    /// cache and uses the per-call mask to scope attention.
+    pub tree_node_cache_slot: Vec<Option<usize>>,
 }
 
 // Manual Debug — MlxBuffer/MlxDevice don't impl Debug consistently
@@ -182,6 +187,7 @@ impl<'a> GpuDrafter<'a> {
             embed_table,
             base_pos,
             kv_cache: None,
+            tree_node_cache_slot: Vec::new(),
         })
     }
 
@@ -211,16 +217,19 @@ impl<'a> GpuDrafter<'a> {
             cache.len()
         );
         self.kv_cache = Some(cache);
+        self.tree_node_cache_slot.clear();
         Ok(())
     }
 
     /// Reset the attached KV cache to empty (no-op if no cache).
     /// Called by the orchestrator at the start of each new spec-decode
-    /// step before tree expansion begins.
+    /// step before tree expansion begins. Also clears the tree-node
+    /// → cache-slot mapping.
     pub fn clear_kv_cache(&mut self) {
         if let Some(c) = self.kv_cache.as_mut() {
             c.clear();
         }
+        self.tree_node_cache_slot.clear();
     }
 
     /// Rollback the KV cache to keep only the positions in `accepted`
@@ -279,9 +288,6 @@ impl<'a> super::dynamic_tree::CacheControlDrafter for GpuDrafter<'a> {
     fn cache_len(&self) -> usize {
         self.kv_cache_len()
     }
-    fn rollback_cache(&mut self, accepted: &[usize]) -> Result<()> {
-        self.rollback_kv_cache(accepted)
-    }
     fn clear_cache(&mut self) {
         self.clear_kv_cache();
     }
@@ -302,24 +308,33 @@ impl<'a> Drafter for GpuDrafter<'a> {
             "GpuDrafter::predict_topk: empty path from node_to_expand {}",
             node_to_expand
         );
-        // Phase E5b Step 3 (2026-05-22): when a KV cache is attached,
-        // condition on the full root-to-node ancestor chain via the
-        // cache. Otherwise fall back to the E4b.10b.3 single-token
-        // decode path (root-only, path.len() == 1).
+        // Phase E6 tree-mask design (2026-05-22):
+        //   cache mode: cache grows monotonically; every ancestor of
+        //     node_to_expand whose K/V was previously appended is
+        //     looked up via self.tree_node_cache_slot. Mask selects
+        //     ancestor slots + the new slot (= cache.len()).
+        //   no-cache mode: preserves E4b.10b.3 — only root expansion.
         let has_cache = self.kv_cache.is_some();
         if has_cache {
-            // Cache invariant: cache.len() must equal path.len() - 1
-            // at entry. Ancestors [0..path.len()-1) are already in
-            // cache; node_to_expand's K/V will be appended in this
-            // call.
-            let cache_len = self.kv_cache.as_ref().unwrap().len();
-            ensure!(
-                cache_len + 1 == path.len(),
-                "GpuDrafter::predict_topk (cache mode): cache.len()={} but path.len()-1={} \
-                 (orchestrator must rollback/extend cache to match path before predict_topk)",
-                cache_len,
-                path.len() - 1
-            );
+            // Every ancestor of node_to_expand (excluding node itself)
+            // must have a recorded cache slot — i.e., must have been
+            // expanded previously. The orchestrator ensures this by
+            // expanding parents before children (best-first invariant:
+            // a node can only be on the heap after its parent has been
+            // expanded).
+            let mut cursor = tree.parents[node_to_expand];
+            while let Some(idx) = cursor {
+                ensure!(
+                    idx < self.tree_node_cache_slot.len()
+                        && self.tree_node_cache_slot[idx].is_some(),
+                    "GpuDrafter::predict_topk (tree-mask cache mode): ancestor {} of \
+                     node_to_expand {} has no recorded cache slot (orchestrator must \
+                     expand parents before children)",
+                    idx,
+                    node_to_expand,
+                );
+                cursor = tree.parents[idx];
+            }
         } else {
             // Codex /cfa E4 final-gate Major 2 re-review (2026-05-22):
             // cache-less single-token decode supports root expansion only.
@@ -372,18 +387,61 @@ impl<'a> Drafter for GpuDrafter<'a> {
             )
         })?;
         // Dispatch the appropriate forward variant.
-        let logits_vec = if let Some(cache) = self.kv_cache.as_mut() {
-            super::forward::dispatch_eagle3_drafter_forward_with_kv_cache(
+        let logits_vec = if self.kv_cache.is_some() {
+            // Phase E6: build tree-aware mask BEFORE the cache append.
+            // Cache state at entry: cache.len() = N (some non-negative
+            // integer, monotonically growing). After append: cache.len()
+            // = N+1 with node_to_expand's K/V at slot N.
+            //
+            // Mask shape [1, N+1]:
+            //   mask[0, ancestor_slot] = ATTENDED for each ancestor
+            //   mask[0, N]             = ATTENDED (self)
+            //   mask[0, _]             = MASKED otherwise
+            let pre_len = self.kv_cache.as_ref().unwrap().len();
+            let new_kv_len = pre_len + 1;
+            let mut mask: Vec<f32> = vec![
+                super::forward::EAGLE3_TREE_MASK_MASKED;
+                new_kv_len
+            ];
+            // Self.
+            mask[pre_len] = super::forward::EAGLE3_TREE_MASK_ATTENDED;
+            // Ancestors.
+            let mut cursor = tree.parents[node_to_expand];
+            while let Some(idx) = cursor {
+                // Safe: pre-loop validated every ancestor has a slot.
+                let slot = self.tree_node_cache_slot[idx].unwrap();
+                // Defensive: ancestor slot must be in range [0, pre_len)
+                // since cache grew monotonically.
+                ensure!(
+                    slot < pre_len,
+                    "GpuDrafter::predict_topk: ancestor {} slot {} >= pre_len {}",
+                    idx, slot, pre_len
+                );
+                mask[slot] = super::forward::EAGLE3_TREE_MASK_ATTENDED;
+                cursor = tree.parents[idx];
+            }
+            // Dispatch with tree-aware mask.
+            let cache = self.kv_cache.as_mut().unwrap();
+            let result = super::forward::dispatch_eagle3_drafter_forward_with_kv_cache(
                 self.device,
                 self.registry,
                 self.target_aux,
                 &embed_gpu,
                 self.tensors,
                 self.cfg,
-                1, // seq_len = 1 (single new tree node per call)
+                1,
                 abs_pos,
                 cache,
-            )?
+                Some(&mask),
+            )?;
+            // Record node_to_expand's cache slot (= pre_len, since
+            // cache.append wrote at slot pre_len). Grow vec if needed.
+            if node_to_expand >= self.tree_node_cache_slot.len() {
+                self.tree_node_cache_slot
+                    .resize(node_to_expand + 1, None);
+            }
+            self.tree_node_cache_slot[node_to_expand] = Some(pre_len);
+            result
         } else {
             super::forward::dispatch_eagle3_drafter_forward(
                 self.device,
@@ -1005,10 +1063,13 @@ mod tests {
     }
 
     #[test]
-    fn adr_037_e5b_step3_cache_mode_rejects_cache_len_path_mismatch_2026_05_22() {
-        // Cache empty but path has depth-1 node → orchestrator violated
-        // the cache.len() == path.len()-1 invariant. predict_topk
-        // must reject so the orchestrator catches its bookkeeping bug.
+    fn adr_037_e6_tree_mask_rejects_unexpanded_ancestor_2026_05_22() {
+        // Phase E6 tree-mask design (replaces the buggy v1 rollback
+        // design's cache.len()==path.len()-1 invariant): the new
+        // invariant is "every ancestor of node_to_expand must have
+        // a recorded cache slot from a prior predict_topk". Calling
+        // predict_topk on a depth-1 node without first expanding its
+        // root parent must fail-fast so orchestrator bugs surface.
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -1029,16 +1090,14 @@ mod tests {
         )
         .expect("alloc cache");
         drafter.attach_kv_cache(cache).expect("attach");
-        // cache.len()=0 but we're trying to expand a depth-1 node
-        // whose path = [root, child]; need cache.len()=1.
         let view = TreeContextView {
             tokens: &[10_u32, 20],
             parents: &[None, Some(0)],
         };
         let err = drafter.predict_topk(view, 1, 3).unwrap_err();
         assert!(
-            err.to_string().contains("cache.len()=0 but path.len()-1=1"),
-            "expected cache len mismatch, got: {err}"
+            err.to_string().contains("has no recorded cache slot"),
+            "expected tree-mask invariant error, got: {err}"
         );
     }
 
@@ -1170,6 +1229,57 @@ mod tests {
         );
         // Validate the produced tree structure.
         tree.validate().expect("ExpandedTree::validate");
+    }
+
+    #[test]
+    fn adr_037_e6_tree_mask_gpu_max_depth_4_no_panic_2026_05_22() {
+        // CRITICAL regression test: max_depth=4 + cross-branch
+        // expansion would have panicked in the rollback-based design
+        // (Phase E6 v1). The tree-mask design (Phase E6 v2) keeps
+        // ALL admitted nodes in cache + builds per-call masks via
+        // GpuDrafter::tree_node_cache_slot.
+        use crate::inference::spec_decode::eagle3::dynamic_tree::{
+            expand_dynamic_tree_with_cache, DynamicTreeConfig,
+        };
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_buf, embed_table) =
+            match step3_build_drafter_scaffolding(&device) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        // Cache capacity must >= number of internal nodes admitted.
+        let cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 64, cfg.head_dim,
+        )
+        .expect("cache");
+        drafter.attach_kv_cache(cache).expect("attach");
+        let tree_cfg = DynamicTreeConfig {
+            budget: 16,
+            max_depth: 4,
+            top_k: 3,
+        };
+        let tree = expand_dynamic_tree_with_cache(123, &mut drafter, &tree_cfg)
+            .expect("max_depth=4 cross-branch must succeed");
+        // Tree must respect budget.
+        assert!(tree.len() <= tree_cfg.budget);
+        tree.validate().expect("ExpandedTree::validate");
+        // Cache should now hold one slot per internal (expanded) node.
+        let internal_count = tree.depths.iter().filter(|&&d| d < tree_cfg.max_depth).count();
+        assert!(
+            drafter.kv_cache_len() <= internal_count,
+            "cache slots {} should match internal nodes {}",
+            drafter.kv_cache_len(),
+            internal_count
+        );
     }
 
     #[test]

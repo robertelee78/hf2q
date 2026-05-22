@@ -1902,6 +1902,14 @@ pub fn dispatch_eagle3_drafter_forward(
 ///   (multi-token batched expansion deferred).
 /// * `base_pos`: RoPE position for the new token(s). For tree
 ///   decode this is the absolute KV position of the new node.
+/// * `mask_override`: optional `[seq_len, cache.len() + seq_len]` row-major
+///   F32 attention mask. Values are passed to tree_attention via the
+///   same `EAGLE3_TREE_MASK_ATTENDED` / `EAGLE3_TREE_MASK_BLOCKED`
+///   sentinels. When `None`, builds an all-attended mask (sound only
+///   for trees with no cross-branch cache state; see Phase E6 tree-mask
+///   design). When `Some`, length must equal `seq_len * (cache.len()
+///   + seq_len)` and the function trusts the caller to encode the
+///   tree-aware attention scope.
 ///
 /// Returns logits as a CPU `Vec<f32>` of shape `[seq_len, draft_vocab_size]`.
 pub fn dispatch_eagle3_drafter_forward_with_kv_cache(
@@ -1914,6 +1922,7 @@ pub fn dispatch_eagle3_drafter_forward_with_kv_cache(
     seq_len: u32,
     base_pos: u32,
     cache: &mut DrafterKvCache,
+    mask_override: Option<&[f32]>,
 ) -> Result<Vec<f32>> {
     // ---- Validate cache shape vs cfg. ----
     if cache.num_kv_heads != cfg.num_kv_heads {
@@ -2079,13 +2088,28 @@ pub fn dispatch_eagle3_drafter_forward_with_kv_cache(
         .command_encoder()
         .map_err(|e| anyhow!("dispatch_eagle3_drafter_forward_with_kv_cache enc2: {e}"))?;
 
-    // Mask: [seq_len, kv_seq_len], all attended (single-token decode
-    // case — the new node attends to all ancestors + itself).
+    // Mask: [seq_len, kv_seq_len]. With mask_override Some, the
+    // caller supplies a tree-aware mask (Phase E6); otherwise build
+    // all-attended for the no-cross-branch case.
     let mask_stride = kv_seq_len;
     let mask_elems = s_usize
         .checked_mul(mask_stride as usize)
         .ok_or_else(|| anyhow!("mask seq_len * mask_stride overflows usize"))?;
-    let mask_data = vec![EAGLE3_TREE_MASK_ATTENDED; mask_elems];
+    let mask_data = if let Some(m) = mask_override {
+        if m.len() != mask_elems {
+            return Err(anyhow!(
+                "dispatch_eagle3_drafter_forward_with_kv_cache: mask_override has {} elements, \
+                 expected {} (seq_len {} * (cache.len()+seq_len) {})",
+                m.len(),
+                mask_elems,
+                s_usize,
+                mask_stride
+            ));
+        }
+        m.to_vec()
+    } else {
+        vec![EAGLE3_TREE_MASK_ATTENDED; mask_elems]
+    };
     let mask_bytes = mask_data
         .len()
         .checked_mul(std::mem::size_of::<f32>())
@@ -5290,6 +5314,7 @@ mod tests {
             &target_aux_gpu, &embeds_gpu,
             &tensors, &cfg, 1, 0,
             &mut cache,
+            None,
         )
         .expect("forward with cache");
         assert_eq!(cache.len(), 1);
@@ -5321,6 +5346,7 @@ mod tests {
             &target_aux_gpu, &embeds_gpu,
             &tensors, &cfg, 1, 0,
             &mut cache,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -5350,6 +5376,7 @@ mod tests {
             &target_aux_gpu, &embeds_gpu,
             &tensors, &cfg, 1, 0,
             &mut cache,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -5379,6 +5406,7 @@ mod tests {
             &target_aux_gpu, &embeds_gpu,
             &tensors, &cfg, 2, 0,
             &mut cache,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -5409,6 +5437,7 @@ mod tests {
             &target_aux_gpu, &embeds_gpu,
             &tensors, &cfg, 1, 0,
             &mut cache,
+            None,
         )
         .expect("first call");
         assert_eq!(cache.len(), 1);
@@ -5417,6 +5446,7 @@ mod tests {
             &target_aux_gpu, &embeds_gpu,
             &tensors, &cfg, 1, 1,
             &mut cache,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -5463,6 +5493,7 @@ mod tests {
             &target_aux_gpu, &embeds_gpu,
             &tensors, &cfg, 1, 0,
             &mut cache,
+            None,
         )
         .expect("with cache");
         assert_eq!(logits_ref.len(), logits_cache.len());
@@ -5505,6 +5536,7 @@ mod tests {
             &target_aux_gpu, &embeds_gpu,
             &tensors, &cfg, 1, 0,
             &mut cache,
+            None,
         )
         .expect("first");
         assert_eq!(cache.len(), 1);
@@ -5513,6 +5545,7 @@ mod tests {
             &target_aux_gpu, &embeds_gpu,
             &tensors, &cfg, 1, 1,
             &mut cache,
+            None,
         )
         .expect("second");
         assert_eq!(cache.len(), 2);
