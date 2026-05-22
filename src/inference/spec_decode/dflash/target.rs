@@ -58,32 +58,23 @@ use super::hidden_capture::DFlashCaptureSession;
 pub trait DFlashTarget {
     /// Install a DFlash hidden-capture session so the next
     /// `forward_decode_verify_batched` populates it with per-position
-    /// hidden states. Returns no value — failure to install is silently
-    /// idempotent (re-install overwrites).
-    fn install_capture(&mut self, session: DFlashCaptureSession);
+    /// hidden states. Re-install overwrites.
+    ///
+    /// Method names match the existing inherent methods on
+    /// `MlxModelWeights` so call sites don't need rewriting.
+    fn install_dflash_capture(&mut self, session: DFlashCaptureSession);
 
     /// Take back the previously-installed capture session (consuming it).
-    /// Returns `None` if no session is installed. After this call,
-    /// subsequent forwards revert to legacy non-capturing behavior.
-    fn take_capture(&mut self) -> Option<DFlashCaptureSession>;
+    fn take_dflash_capture(&mut self) -> Option<DFlashCaptureSession>;
 
     /// True if a capture session is currently installed.
-    fn has_capture(&self) -> bool;
+    fn has_dflash_capture(&self) -> bool;
 
-    /// Roll the KV cache back by `trim` positions. Used by the
-    /// orchestrator after a partial-reject to discard the K/V written
-    /// for the rejected suffix. Idempotent: `trim=0` is a no-op.
+    /// Roll the KV cache back by `trim` positions.
     fn rollback_kv(&mut self, trim: usize);
 
     /// Run a batched verify forward over `tokens` starting at
-    /// `start_seq_pos`. Returns a `Vec<u32>` of length `tokens.len()`
-    /// containing the per-position argmax (top-1 token) at each
-    /// position's logits.
-    ///
-    /// This is the per-position equivalent of the orchestrator's
-    /// `accept_prefix_argmax` reference: position `i`'s argmax is the
-    /// token the target would emit if asked to decode after
-    /// `tokens[0..=i]` autoregressively.
+    /// `start_seq_pos`. Returns per-position argmax (Vec length == tokens.len()).
     fn forward_decode_verify_batched(
         &mut self,
         tokens: &[u32],
@@ -94,26 +85,25 @@ pub trait DFlashTarget {
 
 /// Blanket delegation impl for [`crate::serve::forward_mlx::MlxModelWeights`].
 ///
-/// All methods delegate to the existing inherent methods on
-/// `MlxModelWeights` — this commit is non-behavioral, just exposes the
-/// existing methods through the trait so future iterations can refactor
-/// the orchestrator to be generic over `T: DFlashTarget`.
+/// Trait methods share names with inherent methods. Within each `fn` body
+/// we call the inherent method via `MlxModelWeights::method(self, ...)`
+/// universal function call syntax to disambiguate from the trait
+/// (otherwise `self.method(...)` would resolve to the trait itself and
+/// recurse infinitely).
 impl DFlashTarget for crate::serve::forward_mlx::MlxModelWeights {
-    fn install_capture(&mut self, session: DFlashCaptureSession) {
-        self.install_dflash_capture(session)
+    fn install_dflash_capture(&mut self, session: DFlashCaptureSession) {
+        Self::install_dflash_capture(self, session)
     }
 
-    fn take_capture(&mut self) -> Option<DFlashCaptureSession> {
-        self.take_dflash_capture()
+    fn take_dflash_capture(&mut self) -> Option<DFlashCaptureSession> {
+        Self::take_dflash_capture(self)
     }
 
-    fn has_capture(&self) -> bool {
-        self.has_dflash_capture()
+    fn has_dflash_capture(&self) -> bool {
+        Self::has_dflash_capture(self)
     }
 
     fn rollback_kv(&mut self, trim: usize) {
-        // Delegate to the inherent rollback_kv (NOT recursive — `self`
-        // here is `MlxModelWeights`, the inherent method exists there).
         Self::rollback_kv(self, trim)
     }
 
