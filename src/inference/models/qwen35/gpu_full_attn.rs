@@ -59,13 +59,17 @@ use mlx_native::ops::rope_multi::{
 use mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual;
 use mlx_native::ops::sdpa::{sdpa, SdpaParams};
 use mlx_native::ops::sdpa_decode::dispatch_sdpa_decode;
-use mlx_native::ops::flash_attn_vec::{flash_attn_vec, tmp_buffer_bytes as flash_attn_vec_tmp_bytes, FlashAttnVecParams};
+use mlx_native::ops::flash_attn_vec::{
+    flash_attn_vec, tmp_buffer_bytes as flash_attn_vec_tmp_bytes,
+    tmp_buffer_bytes_with_qL as flash_attn_vec_tmp_bytes_with_qL,
+    FlashAttnVecParams,
+};
 use mlx_native::ops::sigmoid_mul::dispatch_sigmoid_mul;
 use mlx_native::ops::flash_attn_prefill::{
     dispatch_flash_attn_prefill_bf16_d256, dispatch_flash_attn_prefill_bf16_d256_resume,
     FlashAttnPrefillParams, FlashAttnPrefillResumeParams,
 };
-use mlx_native::ops::transpose::{permute_021_bf16, permute_021_bf16_to_f32};
+use mlx_native::ops::transpose::{permute_021_bf16, permute_021_bf16_to_f32, permute_021_f32};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::encoder_stage::LayerEncoder;
@@ -2488,6 +2492,125 @@ pub fn apply_sdpa_with_kv_cache(
             let new_len = kv_seq_len;
             slot.current_len[0] = new_len;
             return Ok(out_uploaded);
+        }
+
+        // ── ADR-034 task #89 Step 3a (2026-05-21): vec_small_path ──
+        //
+        // For small-seq-len verify forwards (DFlash K+1 = 2..8, K=N MTP
+        // K = 2..8) at cur_len > 0, the legacy resume path casts the
+        // FULL KV slot (n_kv_heads × kv_capacity × head_dim) F32 → BF16
+        // every layer to feed the BF16 prefill kernel. That cast is
+        // bandwidth-dominated and scales with capacity, NOT with the
+        // 2..8 queries actually being computed. Profile at HEAD
+        // `50e117cf` showed fa.sdpa_total = 0.307 ms / FA layer / forward
+        // at seq_len=2.
+        //
+        // The extended `flash_attn_vec` (ADR-034 task #89 Steps 1+2
+        // SHIPPED at mlx-native 471c769) handles qL ∈ [1, kv_seq_len]
+        // natively against the F32 KV slot — no BF16 casts. The kernel
+        // dispatches `qL` threadgroups in grid.x, one per (query, head)
+        // pair, with per-query causal mask `abs_pos = kv_seq_len - qL +
+        // iq1`. Empirically parity-verified at qL ∈ {1, 2, 4, 8} on
+        // Qwen 3.6 27B FA shape (head_dim=256, n_heads=24, n_kv_heads=4)
+        // — mlx-native commit 471c769 tests 9/9 PASS.
+        //
+        // Routing condition mirrors the existing seq=1 vec path
+        // (head_dim==256 + slot.k/v Some) extended to seq_len ∈ [2, 8].
+        // Upper bound 8 chosen to match typical DFlash block_size and
+        // MTPLX D=2..8 — beyond 8 the resume path's BF16 cast amortizes
+        // better via the prefill tiled kernel.
+        let vec_small_path_eligible = head_dim == 256
+            && cur_len > 0
+            && seq_len >= 2
+            && seq_len <= 8
+            && slot.k.is_some()
+            && slot.v.is_some()
+            && std::env::var("HF2Q_NO_VEC_SMALL_PATH").as_deref() != Ok("1");
+        if fa_trace {
+            eprintln!(
+                "[FA_TRACE] vec_small_path_eligible={} (engages BEFORE resume)",
+                vec_small_path_eligible,
+            );
+        }
+        if vec_small_path_eligible {
+            let _w5b10_kernel = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FaSdpaKernel,
+            );
+            let kbuf = slot.k.as_ref().expect(
+                "vec_small_path: slot.k.is_some() guard above passed",
+            );
+            let vbuf = slot.v.as_ref().expect(
+                "vec_small_path: slot.v.is_some() guard above passed",
+            );
+
+            let seq = seq_len as usize;
+            let nh = n_heads as usize;
+            let d = head_dim as usize;
+
+            // ── Permute Q seq-major [seq, nh, d] → head-major [nh, seq, d] ──
+            // The vec kernel expects Q in head-major layout (matches the
+            // existing decode path where seq=1 makes both layouts
+            // coincide). At seq>1 we explicitly permute via the GPU
+            // kernel.
+            let q_hm = device
+                .alloc_buffer(
+                    seq * nh * d * 4,
+                    DType::F32,
+                    vec![nh, seq, d],
+                )
+                .map_err(|e| anyhow!("vec_small_path: alloc q_hm: {e}"))?;
+            // ── Allocate output buffer ──
+            //
+            // Shader writes seq-major [seq, nh, d] (per
+            // flash_attn_vec.metal:314 rid = iq2 + iq1 * n_heads).
+            // The function-level out_buf was allocated as `[seq, nh, d]`
+            // F32 earlier — reuse it directly.
+            //
+            // Tmp buffer sized for qL > 1.
+            let tmp_bytes = flash_attn_vec_tmp_bytes_with_qL(
+                n_heads, head_dim, seq_len,
+            );
+            let tmp_elems = tmp_bytes / 4;
+            let tmp_buf = device
+                .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_elems])
+                .map_err(|e| anyhow!("vec_small_path: alloc tmp: {e}"))?;
+
+            let mut enc = device
+                .command_encoder()
+                .context("vec_small_path: command_encoder")?;
+            permute_021_f32(
+                &mut enc, registry, device.metal_device(),
+                q_seq_major, &q_hm,
+                seq, nh, d,
+            )
+            .context("vec_small_path: permute Q seq->head major")?;
+            // RAW barrier: vec kernel reads q_hm written by the permute.
+            enc.memory_barrier();
+
+            let params = FlashAttnVecParams {
+                num_heads: n_heads,
+                num_kv_heads: n_kv_heads,
+                head_dim,
+                kv_seq_len,
+                kv_capacity: max_seq_len,
+                scale: 1.0 / (d as f32).sqrt(),
+                mask_type: 1, // causal
+                sliding_window: 0,
+                softcap: 0.0,
+                q_seq_len: seq_len,
+            };
+            flash_attn_vec(
+                &mut enc, registry, device,
+                &q_hm, kbuf, vbuf, &out_buf, &tmp_buf,
+                &params,
+            )
+            .context("vec_small_path: flash_attn_vec dispatch")?;
+            enc.commit_and_wait_labeled("layer.full_attn.vec_small_path")
+                .context("vec_small_path: commit")?;
+
+            // Update current_len cursor.
+            slot.current_len[0] = kv_seq_len;
+            return Ok(out_buf);
         }
 
         // ── ADR-017 Phase E.a B.2-fix + B.5: FA RESUME path
