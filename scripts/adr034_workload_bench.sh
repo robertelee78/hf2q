@@ -183,6 +183,9 @@ echo "    ALL 12 configs (5 code-gen + 5 essay dense + 2 MoE) match documented v
 echo "  Length-sweep MTP K=1 greedy code-gen at HEAD 2912c295 (1-rep per length):"
 echo "    128 tok:  MTP 30.0 @ 91% vs Base 20.7 = 1.45× | 256 tok: MTP 30.0 @ 91% vs Base 20.6 = 1.46× | 512 tok: MTP 29.5 @ 90% vs Base 20.8 = 1.42× | 1024 tok: MTP 29.1 @ 93.8% vs Base 21.0 = 1.39×"
 echo "    Production winner SUSTAINS 1.39-1.46x speedup across 128→1024 output lengths; accept rate IMPROVES at longer outputs (91% → 93.8%); no degradation."
+echo "  MTP MH temperature sweep essay prompt at HEAD 436a4b01 (3-rep each, vs base 21.9):"
+echo "    temp=0.3: 26.27 @ 69.3% = 1.20× | temp=0.5: 27.53 @ 77.8% = 1.26× WINNER | temp=0.7: 24.43 @ 58.0% = 1.12× | temp=0.9: 23.93 @ 54.2% = 1.09×"
+echo "    Accept rate PEAKS at temp=0.5 (77.8%); sharp drop to 58% at temp=0.7. The --temperature 0.5 production recommendation is empirically validated as the MH accept-rate optimum."
 echo
 echo "Production recommendation:"
 echo "  Code-gen / deterministic: HF2Q_SPEC_DECODE=1 --temperature 0     (1.36x base, MTP K=1 greedy wins)"
