@@ -250,10 +250,35 @@ pub fn try_dispatch_qwen35_dflash_spec_decode(
     if std::env::var("HF2Q_SPEC_DFLASH").as_deref() != Ok("1") {
         return Ok(None);
     }
+    // ADR-034 task #78 Step 5 (2026-05-21) — empirical bench result at
+    // HEAD e10946cf on Qwen 3.6 27B Q8_0 + 128 tokens + temp=0:
+    //   BS=2:  16.1 tok/s    (best DFlash result)
+    //   BS=4:  12.3 tok/s
+    //   BS=8:   8.7 tok/s
+    //   BS=16:  3.8 tok/s    (drafter default)
+    //   ----
+    //   Base MTP K=1 BATCHED MH: 30.2 tok/s @ 92.4% accept
+    //
+    // DFlash on Qwen35 is currently 0.53x the production winner at the
+    // optimal block_size. Root cause: K+1 batched verify uses the BF16
+    // prefill_resume kernel which is slower per-token than the F32
+    // flash_attn_vec single-token decode used by MTP K=1. Task #89
+    // (forward_gpu_batched_decode for seq_len[2,8]) is the prerequisite
+    // to close this gap.
+    //
+    // Correctness: verified greedy-coherent (orchestrator emitted a
+    // valid haiku at BS=16 vs base path's degenerate "test coverage:"
+    // loop on the same prompt — see commit e10946cf bench data).
+    //
+    // The flag is kept opt-in (default OFF) so future improvements can
+    // be validated without changing production behavior.
     eprintln!(
-        "[HF2Q_SPEC_DFLASH=1 qwen35] Step 4 (2026-05-21) — DFlash orchestrator UNBENCHED \
-         on Qwen35; if perf <= base / current production winner you should fall back to \
-         MTP K=1 BATCHED MH (HF2Q_SPEC_DECODE=1)."
+        "[HF2Q_SPEC_DFLASH=1 qwen35] WARNING: empirical bench (2026-05-21) shows \
+         DFlash at best ~0.53x production MTP K=1 BATCHED MH path (16 vs 30 tok/s \
+         on Qwen 3.6 27B Q8_0). Root cause: BF16 prefill_resume per-token cost; \
+         task #89 (batched_decode for seq_len[2,8]) is the prerequisite to close \
+         the gap. Use HF2Q_SPEC_DECODE=1 + --temperature 0.5 for the production \
+         winner instead."
     );
 
     use crate::inference::spec_decode::dflash::{
