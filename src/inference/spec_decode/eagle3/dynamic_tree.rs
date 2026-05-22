@@ -35,7 +35,7 @@
 //! `build_tree_mask_from_parents` test helper at
 //! `mlx-native/tests/test_tree_attention_e1_1_parity.rs`).
 
-use super::drafter::{validate_candidates, Drafter};
+use super::drafter::{validate_candidates, Drafter, TreeContextView};
 use anyhow::{anyhow, ensure, Result};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -79,12 +79,19 @@ impl DynamicTreeConfig {
 }
 
 /// Output of [`expand_dynamic_tree`].
+///
+/// Codex /cfa E4a Critical (2026-05-22): `cum_log_probs` is `Vec<f64>`,
+/// not `Vec<f32>`. f32 accumulation at extreme depths × extreme
+/// log_probs (even with `LOG_PROB_FLOOR`) can yield `f64` -> `f32`
+/// cast underflow to `-inf`, which would later fail downstream
+/// finite-checks despite valid input. f64 internally + at the public
+/// surface is the simpler invariant to maintain.
 #[derive(Debug, Clone)]
 pub struct ExpandedTree {
     pub tokens: Vec<u32>,
     pub parents: Vec<Option<usize>>,
     pub depths: Vec<usize>,
-    pub cum_log_probs: Vec<f32>,
+    pub cum_log_probs: Vec<f64>,
 }
 
 impl ExpandedTree {
@@ -110,12 +117,30 @@ impl ExpandedTree {
     ///
     /// `mask_stride = prefix_len + tree.len()`. The buffer is sized
     /// `tree.len() * mask_stride` floats.
-    pub fn build_tree_mask(&self, prefix_len: usize) -> Vec<f32> {
+    ///
+    /// Codex /cfa E4a Major (2026-05-22): returns `Result<Vec<f32>>`
+    /// with checked arithmetic. Large prefix_len could overflow the
+    /// total size on extreme shapes; previously this would panic on
+    /// debug or wrap on release. Now an explicit error is returned.
+    pub fn build_tree_mask(&self, prefix_len: usize) -> Result<Vec<f32>> {
         const ATTENDED: f32 = 0.0;
         const MASKED: f32 = -65504.0;
         let q = self.len();
-        let mask_stride = prefix_len + q;
-        let mut mask = vec![MASKED; q * mask_stride];
+        let mask_stride = prefix_len.checked_add(q).ok_or_else(|| {
+            anyhow!(
+                "build_tree_mask: prefix_len ({}) + tree.len ({}) overflows usize",
+                prefix_len,
+                q
+            )
+        })?;
+        let total = q.checked_mul(mask_stride).ok_or_else(|| {
+            anyhow!(
+                "build_tree_mask: tree.len ({}) * mask_stride ({}) overflows usize",
+                q,
+                mask_stride
+            )
+        })?;
+        let mut mask = vec![MASKED; total];
         for iq1 in 0..q {
             let row_base = iq1 * mask_stride;
             // Prefix always attended.
@@ -129,7 +154,7 @@ impl ExpandedTree {
                 cur = self.parents[node];
             }
         }
-        mask
+        Ok(mask)
     }
 
     /// Verify internal consistency (debug/test aid). Checks:
@@ -151,7 +176,7 @@ impl ExpandedTree {
         ensure!(self.parents[0].is_none(), "root (index 0) must have no parent");
         ensure!(self.depths[0] == 0, "root depth must be 0");
         ensure!(
-            self.cum_log_probs[0] == 0.0,
+            self.cum_log_probs[0] == 0.0_f64,
             "root cum_log_prob must be exactly 0.0"
         );
         for i in 1..n {
@@ -182,34 +207,44 @@ impl ExpandedTree {
     }
 }
 
-/// Heap entry: priority is cum_log_prob (max-heap), tie-broken by
-/// smaller node_idx (earlier-inserted = closer to root). The
-/// tiebreaker is deterministic so test fixtures are reproducible.
+/// Pending-admission heap entry. Codex /cfa E4a Critical 1 fix
+/// (2026-05-22): the algorithm uses a "pending candidate" heap, NOT a
+/// "committed node" heap. Each heap entry is a CANDIDATE we MIGHT
+/// admit — the heap orders candidates by their `would-be` cumulative
+/// log-prob from root, so admission is GLOBALLY best-first (not just
+/// locally best-first within each parent's batch).
+///
+/// Without this, batch-committing a parent's top-K children before
+/// considering grandchildren of a higher-prob sibling-of-the-parent
+/// would admit lower-prob nodes ahead of higher-prob ones — violating
+/// EAGLE-2's published "best-first" admission guarantee.
 #[derive(Debug, Clone, Copy)]
-struct HeapEntry {
+struct PendingCandidate {
+    parent_idx: usize,
+    token: u32,
     cum_log_prob: f64,
-    node_idx: usize,
+    /// Insertion sequence number for deterministic tiebreaks. Earlier
+    /// insertions win ties so test fixtures are reproducible.
+    seq: usize,
 }
 
-impl PartialEq for HeapEntry {
+impl PartialEq for PendingCandidate {
     fn eq(&self, other: &Self) -> bool {
-        self.cum_log_prob == other.cum_log_prob && self.node_idx == other.node_idx
+        self.cum_log_prob == other.cum_log_prob && self.seq == other.seq
     }
 }
-impl Eq for HeapEntry {}
-impl Ord for HeapEntry {
+impl Eq for PendingCandidate {}
+impl Ord for PendingCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is max-heap. We want: highest cum_log_prob first.
-        // Tie-break by SMALLER node_idx first → flip the natural
-        // ordering on node_idx so a smaller idx is "greater" for the
-        // heap.
+        // BinaryHeap is max-heap. Highest cum_log_prob wins. Tiebreak:
+        // SMALLER seq wins (insert-order, deterministic).
         self.cum_log_prob
             .partial_cmp(&other.cum_log_prob)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| other.node_idx.cmp(&self.node_idx))
+            .then_with(|| other.seq.cmp(&self.seq))
     }
 }
-impl PartialOrd for HeapEntry {
+impl PartialOrd for PendingCandidate {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -217,15 +252,21 @@ impl PartialOrd for HeapEntry {
 
 /// Expand a dynamic tree starting from `root_token`.
 ///
-/// Algorithm: best-first expansion with a max-heap by
-/// `cumulative_log_prob`. Returns when `tree.len() == cfg.budget` or
-/// the queue is empty (every reachable node was expanded — happens
-/// when `top_k * (cfg.max_depth - 1) + 1 < cfg.budget`).
+/// Algorithm: GLOBALLY best-first expansion via a pending-candidate
+/// heap ordered by cumulative log-prob from root.
 ///
-/// Drafter contract: see `drafter.rs`. The drafter is called with
-/// `parent_node_idx` (0 for the root expansion); each call must
-/// return up to `top_k` candidates with strictly-decreasing
-/// finite log_probs over distinct tokens.
+/// 1. Push root, expand it once to seed the heap with its top-K children.
+/// 2. Loop until budget reached or heap empty:
+///    a. Pop the globally-best pending candidate.
+///    b. ADMIT it as a new tree node (with proper parent / depth /
+///       cum_log_prob).
+///    c. If the new node is below max_depth, query the drafter for ITS
+///       top-K children and push them onto the heap as new pending
+///       candidates.
+///
+/// This guarantees that every admitted non-root node has the highest
+/// cumulative log-prob of any node that COULD be admitted next — the
+/// global best-first invariant from the EAGLE-2 paper.
 pub fn expand_dynamic_tree<D: Drafter>(
     root_token: u32,
     drafter: &mut D,
@@ -236,7 +277,7 @@ pub fn expand_dynamic_tree<D: Drafter>(
     let mut tokens: Vec<u32> = Vec::with_capacity(cfg.budget);
     let mut parents: Vec<Option<usize>> = Vec::with_capacity(cfg.budget);
     let mut depths: Vec<usize> = Vec::with_capacity(cfg.budget);
-    let mut cum: Vec<f32> = Vec::with_capacity(cfg.budget);
+    let mut cum: Vec<f64> = Vec::with_capacity(cfg.budget);
 
     // Root.
     tokens.push(root_token);
@@ -244,47 +285,78 @@ pub fn expand_dynamic_tree<D: Drafter>(
     depths.push(0);
     cum.push(0.0);
 
-    let mut heap = BinaryHeap::<HeapEntry>::with_capacity(cfg.budget);
-    heap.push(HeapEntry {
-        cum_log_prob: 0.0,
-        node_idx: 0,
-    });
+    let mut heap = BinaryHeap::<PendingCandidate>::new();
+    let mut seq_counter: usize = 0;
 
-    while tokens.len() < cfg.budget {
-        let Some(entry) = heap.pop() else {
-            break; // queue exhausted
+    // Seed the heap by expanding the root once (if budget > 1 AND max_depth >= 1).
+    if cfg.budget > 1 && cfg.max_depth >= 1 {
+        let view = TreeContextView {
+            tokens: &tokens,
+            parents: &parents,
         };
-        let parent_idx = entry.node_idx;
-        if depths[parent_idx] >= cfg.max_depth {
-            continue; // max depth reached for this subtree
-        }
-        let candidates = drafter.predict_topk(parent_idx, cfg.top_k)?;
+        let candidates = drafter.predict_topk(view, 0, cfg.top_k)?;
         validate_candidates(&candidates, cfg.top_k)?;
-
         for cand in candidates {
-            if tokens.len() >= cfg.budget {
-                break;
-            }
-            let child_idx = tokens.len();
-            let child_cum = (cum[parent_idx] as f64) + (cand.log_prob as f64);
-            // Defensive: cum_log_prob accumulation in f64 could in
-            // principle hit NEG_INFINITY at extreme depths × extreme
-            // log_probs. Validate finiteness.
+            let child_cum = cand.log_prob as f64;
             ensure!(
                 child_cum.is_finite(),
-                "cumulative log_prob overflowed at depth {} (parent_cum={}, edge={})",
-                depths[parent_idx] + 1,
-                cum[parent_idx],
-                cand.log_prob
+                "seed cum_log_prob not finite: {}",
+                child_cum
             );
-            tokens.push(cand.token);
-            parents.push(Some(parent_idx));
-            depths.push(depths[parent_idx] + 1);
-            cum.push(child_cum as f32);
-            heap.push(HeapEntry {
+            heap.push(PendingCandidate {
+                parent_idx: 0,
+                token: cand.token,
                 cum_log_prob: child_cum,
-                node_idx: child_idx,
+                seq: seq_counter,
             });
+            seq_counter += 1;
+        }
+    }
+
+    // Globally best-first admission loop.
+    while tokens.len() < cfg.budget {
+        let Some(pending) = heap.pop() else {
+            break; // queue exhausted
+        };
+        // Admit this candidate as a new tree node.
+        let parent_idx = pending.parent_idx;
+        let child_idx = tokens.len();
+        let new_depth = depths[parent_idx] + 1;
+        tokens.push(pending.token);
+        parents.push(Some(parent_idx));
+        depths.push(new_depth);
+        cum.push(pending.cum_log_prob);
+
+        // Only expand if we'll potentially admit more children. When
+        // tokens.len() == cfg.budget after the admit above, the next
+        // loop iter exits anyway; calling the drafter to produce
+        // candidates we'll never admit is wasted work AND lets buggy
+        // tests with under-specified scripts crash unnecessarily.
+        if tokens.len() < cfg.budget && new_depth < cfg.max_depth {
+            let view = TreeContextView {
+                tokens: &tokens,
+                parents: &parents,
+            };
+            let candidates = drafter.predict_topk(view, child_idx, cfg.top_k)?;
+            validate_candidates(&candidates, cfg.top_k)?;
+            let parent_cum = cum[child_idx];
+            for cand in candidates {
+                let child_cum = parent_cum + (cand.log_prob as f64);
+                ensure!(
+                    child_cum.is_finite(),
+                    "cumulative log_prob overflowed at depth {} (parent_cum={}, edge={})",
+                    new_depth + 1,
+                    parent_cum,
+                    cand.log_prob
+                );
+                heap.push(PendingCandidate {
+                    parent_idx: child_idx,
+                    token: cand.token,
+                    cum_log_prob: child_cum,
+                    seq: seq_counter,
+                });
+                seq_counter += 1;
+            }
         }
     }
 
@@ -315,7 +387,8 @@ mod tests {
     impl Drafter for ScriptedDrafter {
         fn predict_topk(
             &mut self,
-            _parent_node_idx: usize,
+            _tree: super::super::drafter::TreeContextView<'_>,
+            _node_to_expand: usize,
             _top_k: usize,
         ) -> Result<Vec<DraftCandidate>> {
             let script = self.scripts[self.call_count].clone();
@@ -359,22 +432,20 @@ mod tests {
     }
 
     #[test]
-    fn adr_037_e4a_fixed_square_via_uniform_drafter_2026_05_22() {
-        // top_k=4, max_depth=2, budget=large → root + 4 children.
-        // Children all have same log_prob (mock returns slope) so the
-        // root expansion exhausts its 4 candidates, then each child
-        // gets popped. Since cum_log_prob is strictly DECREASING with
-        // depth (slope = -0.5), depth-2 expansions also occur until
-        // budget reached.
+    fn adr_037_e4a_fixed_square_via_max_depth_1_2026_05_22() {
+        // Codex /cfa E4a fix (2026-05-22): with the new global
+        // best-first algorithm, max_depth must equal 1 to get a
+        // "fixed-square 4-leaf" shape — otherwise grandchildren of
+        // the best root-child would interleave with root's siblings
+        // (correct EAGLE-2 behavior, but not "fixed square" semantics).
         let cfg = DynamicTreeConfig {
-            budget: 5, // root + 4 children only
-            max_depth: 2,
+            budget: 5, // root + 4 children
+            max_depth: 1, // no grandchildren — every child stays at depth 1
             top_k: 4,
         };
         let mut d = MockDrafter::default();
         let tree = expand_dynamic_tree(0, &mut d, &cfg).unwrap();
         assert_eq!(tree.len(), 5);
-        // All 4 children parent on root.
         for i in 1..5 {
             assert_eq!(tree.parents[i], Some(0));
             assert_eq!(tree.depths[i], 1);
@@ -442,80 +513,42 @@ mod tests {
     }
 
     #[test]
-    fn adr_037_e4a_scripted_tree_shape_matches_priority_2026_05_22() {
-        // Drafter scripts: root returns 2 cands, child[0] returns 2
-        // cands, child[1] returns 2 cands. budget=5.
+    fn adr_037_e4a_global_best_first_admits_grandchild_before_sibling_2026_05_22() {
+        // Codex /cfa E4a Critical 1 (2026-05-22): proves the algorithm
+        // admits nodes in GLOBAL best-first order, not just local
+        // best-first within each parent's batch.
         //
-        // Root cum=0.0 → pop root → push A (cum=-0.5) + B (cum=-1.0).
-        // Pop A (highest) → push A1 (-0.5-0.3=-0.8) + A2 (-0.5-0.6=-1.1).
-        // Pop B (cum=-1.0) → push B1 (-1.0-0.3=-1.3) + B2 (-1.0-0.6=-1.6).
-        //   But budget=5 means only A1 fits (tree.len becomes 5 after A1, so B's
-        //   second child B2 is dropped... actually let me retrace.
+        // Scripts:
+        //   script[0] (root → 2 children): A(-0.1), B(-2.0).  BIG gap.
+        //   script[1] (A → 2 children): A1(-0.5), A2(-1.0).
+        //                cums: A1 = -0.1 + -0.5 = -0.6,
+        //                      A2 = -0.1 + -1.0 = -1.1.
+        //   script[2] (A1 → 1 child): A1_1(-0.5).
+        //                cum: A1_1 = -0.6 + -0.5 = -1.1.
         //
-        // After root expand: tree=[R, A, B], len=3.
-        // After A expand: tree=[R, A, B, A1, A2], len=5 → budget reached.
-        // So B never expands.
+        // budget = 4. Expected admission ORDER:
+        //   1. Seed heap with A(-0.1), B(-2.0).
+        //   2. Pop A(-0.1), admit. Expand. Heap: B(-2.0), A1(-0.6), A2(-1.1).
+        //   3. Pop A1(-0.6), admit. Expand A1 → A1_1(-1.1). Heap: B(-2.0), A2(-1.1), A1_1(-1.1).
+        //   4. Pop A2(-1.1) (tied with A1_1 but A2 has smaller seq → wins).
+        //      Admit A2. tokens.len() = 4 = budget. STOP.
         //
-        // Verify: 5 nodes, parents = [None, 0, 0, 1, 1].
+        // Final tree: tokens=[R, A, A1, A2], parents=[None, 0, 1, 1],
+        // depths=[0, 1, 2, 2]. The proof: A2 (depth 2) and A1 (depth 2)
+        // are admitted BEFORE B (depth 1, sibling of A) — because A's
+        // subtree's cumulative log-prob is globally higher than B's.
         let d = ScriptedDrafter {
             scripts: vec![
                 vec![
-                    DraftCandidate { token: 100, log_prob: -0.5 },
-                    DraftCandidate { token: 101, log_prob: -1.0 },
+                    DraftCandidate { token: 100, log_prob: -0.1 },  // A
+                    DraftCandidate { token: 200, log_prob: -2.0 },  // B
                 ],
                 vec![
-                    DraftCandidate { token: 200, log_prob: -0.3 },
-                    DraftCandidate { token: 201, log_prob: -0.6 },
+                    DraftCandidate { token: 110, log_prob: -0.5 },  // A1
+                    DraftCandidate { token: 120, log_prob: -1.0 },  // A2
                 ],
                 vec![
-                    DraftCandidate { token: 300, log_prob: -0.3 },
-                    DraftCandidate { token: 301, log_prob: -0.6 },
-                ],
-            ],
-            call_count: 0,
-        };
-        let cfg = DynamicTreeConfig {
-            budget: 5,
-            max_depth: 4,
-            top_k: 2,
-        };
-        let mut d = d;
-        let tree = expand_dynamic_tree(1, &mut d, &cfg).unwrap();
-        assert_eq!(tree.len(), 5);
-        assert_eq!(tree.tokens, vec![1, 100, 101, 200, 201]);
-        assert_eq!(
-            tree.parents,
-            vec![None, Some(0), Some(0), Some(1), Some(1)]
-        );
-        assert_eq!(tree.depths, vec![0, 1, 1, 2, 2]);
-        // Cum log_probs: [0, -0.5, -1.0, -0.8, -1.1].
-        let expected = [0.0, -0.5, -1.0, -0.8, -1.1];
-        for (i, &exp) in expected.iter().enumerate() {
-            assert!(
-                (tree.cum_log_probs[i] - exp).abs() < 1e-5,
-                "cum[{}] = {} != {}",
-                i,
-                tree.cum_log_probs[i],
-                exp
-            );
-        }
-    }
-
-    #[test]
-    fn adr_037_e4a_build_tree_mask_matches_phase_e1_contract_2026_05_22() {
-        // Build a small tree and verify the mask buffer matches the
-        // contract used by mlx-native's tree_attention_e1_1_parity tests
-        // (build_tree_mask_from_parents test helper).
-        // Tree: root, child0 (parent root), child1 (parent root),
-        // grandchild (parent child0).
-        let d = ScriptedDrafter {
-            scripts: vec![
-                vec![
-                    DraftCandidate { token: 10, log_prob: -0.2 },
-                    DraftCandidate { token: 20, log_prob: -0.5 },
-                ],
-                vec![
-                    DraftCandidate { token: 11, log_prob: -0.3 },
+                    DraftCandidate { token: 111, log_prob: -0.5 },  // A1_1
                 ],
             ],
             call_count: 0,
@@ -527,10 +560,53 @@ mod tests {
         };
         let mut d = d;
         let tree = expand_dynamic_tree(1, &mut d, &cfg).unwrap();
-        assert_eq!(tree.parents, vec![None, Some(0), Some(0), Some(1)]);
+        assert_eq!(tree.len(), 4);
+        // CRITICAL ASSERTION: B (depth 1) is NOT in the tree, even
+        // though it's a direct child of root. Instead, A's subtree
+        // expanded deeper because globally better cum_log_prob.
+        assert_eq!(tree.tokens, vec![1, 100, 110, 120]);
+        assert_eq!(tree.parents, vec![None, Some(0), Some(1), Some(1)]);
+        assert_eq!(tree.depths, vec![0, 1, 2, 2]);
+        // Cum log_probs (f64): [0, -0.1, -0.6, -1.1].
+        let expected = [0.0, -0.1, -0.6, -1.1];
+        // Tolerance accommodates f32 → f64 cast (drafter log_probs are
+        // f32, accumulated in f64). -0.1 as f32 has rounding error
+        // ~1.5e-9 when promoted back to f64.
+        for (i, &exp) in expected.iter().enumerate() {
+            assert!(
+                (tree.cum_log_probs[i] - exp).abs() < 1e-6,
+                "cum[{}] = {} != {}",
+                i,
+                tree.cum_log_probs[i],
+                exp
+            );
+        }
+        // Verify NO node with token 200 (B) exists.
+        assert!(!tree.tokens.contains(&200), "B (low-prob sibling) should NOT have been admitted ahead of A's grandchildren");
+    }
+
+    #[test]
+    fn adr_037_e4a_build_tree_mask_matches_phase_e1_contract_2026_05_22() {
+        // Hand-construct a deterministic ExpandedTree (independent of
+        // algorithm) and verify the mask buffer matches the contract
+        // used by mlx-native's tree_attention_e1_1_parity tests
+        // (build_tree_mask_from_parents test helper).
+        //
+        // Tree shape:
+        //   0 (root)
+        //   ├── 1 (child0)
+        //   │   └── 3 (grandchild)
+        //   └── 2 (child1)
+        let tree = ExpandedTree {
+            tokens: vec![1, 10, 20, 11],
+            parents: vec![None, Some(0), Some(0), Some(1)],
+            depths: vec![0, 1, 1, 2],
+            cum_log_probs: vec![0.0, -0.2, -0.5, -0.5],
+        };
+        tree.validate().expect("hand-built tree must validate");
 
         let prefix_len = 5;
-        let mask = tree.build_tree_mask(prefix_len);
+        let mask = tree.build_tree_mask(prefix_len).expect("build_tree_mask ok");
         let q = tree.len();
         let mask_stride = prefix_len + q;
         assert_eq!(mask.len(), q * mask_stride);
@@ -595,7 +671,8 @@ mod tests {
         impl Drafter for BadDrafter {
             fn predict_topk(
                 &mut self,
-                _parent: usize,
+                _tree: super::super::drafter::TreeContextView<'_>,
+                _node_to_expand: usize,
                 _top_k: usize,
             ) -> Result<Vec<DraftCandidate>> {
                 Ok(vec![
@@ -617,7 +694,7 @@ mod tests {
             tokens: vec![1, 2, 3],
             parents: vec![None, Some(2), Some(0)], // parent[1] = 2 violates topological order
             depths: vec![0, 1, 1],
-            cum_log_probs: vec![0.0, -0.5, -0.5],
+            cum_log_probs: vec![0.0_f64, -0.5, -0.5],
         };
         let err = bad.validate().unwrap_err().to_string();
         assert!(err.contains("topological"), "got: {err}");

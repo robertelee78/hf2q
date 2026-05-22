@@ -49,25 +49,61 @@ pub struct DraftCandidate {
 /// `f64` accumulation without overflow.
 pub const LOG_PROB_FLOOR: f32 = f32::MIN / 2.0;
 
+/// Borrowed view of the tree-so-far, passed to the drafter.
+///
+/// Codex /cfa E4a Major (2026-05-22): the drafter needs to know the
+/// PATH from root to the node it's expanding (so it can compute the
+/// correct hidden state via its own KV cache). Passing parent_node_idx
+/// alone is insufficient — the drafter would need an out-of-band
+/// way to know which token was assigned to which tree-node-idx. This
+/// view bundles the info the drafter needs to walk the parent chain.
+#[derive(Debug, Clone, Copy)]
+pub struct TreeContextView<'a> {
+    /// Token id at each committed tree-node-idx, in commit order.
+    /// `tokens[0]` is the root token.
+    pub tokens: &'a [u32],
+    /// Parent tree-node-idx for each committed node; `None` for root.
+    pub parents: &'a [Option<usize>],
+}
+
+impl<'a> TreeContextView<'a> {
+    /// Walk from `node_idx` up to root, returning tokens along the
+    /// path (root first, then walk down to `node_idx`).
+    pub fn path_tokens(&self, node_idx: usize) -> Vec<u32> {
+        let mut rev: Vec<u32> = Vec::new();
+        let mut cur = Some(node_idx);
+        while let Some(i) = cur {
+            rev.push(self.tokens[i]);
+            cur = self.parents[i];
+        }
+        rev.reverse();
+        rev
+    }
+}
+
 /// Drafter abstraction consumed by dynamic-tree expansion.
 ///
 /// `&mut self` so implementations can maintain a per-call KV cache.
 pub trait Drafter {
-    /// Predict the top-K next tokens given the parent tree-node-idx.
+    /// Predict the top-K next tokens that would follow `node_to_expand`
+    /// in the current tree.
     ///
-    /// For the ROOT call (`parent_node_idx == 0`, depth 0), the
-    /// drafter conditions on the target model's hidden state at the
-    /// most-recently-generated token.
+    /// `tree` provides the committed tree-so-far (tokens + parents) so
+    /// the drafter can walk the parent chain to determine the
+    /// conditioning context. `node_to_expand` is the node whose
+    /// CHILDREN we want to predict.
     ///
-    /// For subsequent calls, the drafter conditions on the parent
-    /// node's KV state plus the parent's token id.
+    /// For the ROOT call (`node_to_expand == 0`, depth 0), the drafter
+    /// conditions on the target model's hidden state at the
+    /// most-recently-generated token (tokens[0]).
     ///
     /// Returns up to `top_k` candidates ordered by `log_prob`
     /// descending. May return fewer than `top_k` if the drafter's
     /// effective vocabulary is smaller (rare in practice).
     fn predict_topk(
         &mut self,
-        parent_node_idx: usize,
+        tree: TreeContextView<'_>,
+        node_to_expand: usize,
         top_k: usize,
     ) -> Result<Vec<DraftCandidate>>;
 }
@@ -145,12 +181,13 @@ impl Default for MockDrafter {
 impl Drafter for MockDrafter {
     fn predict_topk(
         &mut self,
-        parent_node_idx: usize,
+        _tree: TreeContextView<'_>,
+        node_to_expand: usize,
         top_k: usize,
     ) -> Result<Vec<DraftCandidate>> {
         let mut out = Vec::with_capacity(top_k);
         for j in 0..top_k {
-            let token = ((parent_node_idx * 1000 + j) as u32) % self.vocab_size;
+            let token = ((node_to_expand * 1000 + j) as u32) % self.vocab_size;
             let log_prob = self.base_log_prob + (j as f32) * self.log_prob_slope;
             out.push(DraftCandidate { token, log_prob });
         }
@@ -179,13 +216,14 @@ pub struct BiasedMockDrafter {
 impl Drafter for BiasedMockDrafter {
     fn predict_topk(
         &mut self,
-        parent_node_idx: usize,
+        _tree: TreeContextView<'_>,
+        node_to_expand: usize,
         top_k: usize,
     ) -> Result<Vec<DraftCandidate>> {
         let mut out = Vec::with_capacity(top_k);
-        let is_biased = self.bias_nodes.contains(&parent_node_idx);
+        let is_biased = self.bias_nodes.contains(&node_to_expand);
         for j in 0..top_k {
-            let token = ((parent_node_idx * 1000 + j + 7) as u32) % self.vocab_size;
+            let token = ((node_to_expand * 1000 + j + 7) as u32) % self.vocab_size;
             let log_prob = if is_biased {
                 -0.1 + (j as f32) * (-0.05)
             } else {
@@ -253,10 +291,19 @@ mod tests {
         assert!(err.contains("exceeds top_k"), "got: {err}");
     }
 
+    fn empty_tree_view() -> TreeContextView<'static> {
+        static EMPTY_TOKENS: &[u32] = &[];
+        static EMPTY_PARENTS: &[Option<usize>] = &[];
+        TreeContextView {
+            tokens: EMPTY_TOKENS,
+            parents: EMPTY_PARENTS,
+        }
+    }
+
     #[test]
     fn adr_037_e4a_mock_drafter_produces_unique_descending_candidates_2026_05_22() {
         let mut d = MockDrafter::default();
-        let cands = d.predict_topk(0, 4).unwrap();
+        let cands = d.predict_topk(empty_tree_view(), 0, 4).unwrap();
         validate_candidates(&cands, 4).expect("mock must be valid");
         assert_eq!(cands.len(), 4);
     }
@@ -264,9 +311,9 @@ mod tests {
     #[test]
     fn adr_037_e4a_mock_drafter_uses_parent_idx_in_token_2026_05_22() {
         let mut d = MockDrafter::default();
-        let c0 = d.predict_topk(0, 1).unwrap();
-        let c5 = d.predict_topk(5, 1).unwrap();
-        assert_ne!(c0[0].token, c5[0].token, "different parent → different token");
+        let c0 = d.predict_topk(empty_tree_view(), 0, 1).unwrap();
+        let c5 = d.predict_topk(empty_tree_view(), 5, 1).unwrap();
+        assert_ne!(c0[0].token, c5[0].token, "different node → different token");
     }
 
     #[test]
@@ -279,11 +326,25 @@ mod tests {
             log_prob_slope: -0.5,
             bias_nodes,
         };
-        let unbiased = d.predict_topk(0, 2).unwrap();
-        let biased = d.predict_topk(3, 2).unwrap();
+        let unbiased = d.predict_topk(empty_tree_view(), 0, 2).unwrap();
+        let biased = d.predict_topk(empty_tree_view(), 3, 2).unwrap();
         // Biased path's top-1 log_prob (−0.1) > unbiased top-1 (−0.5).
         assert!(biased[0].log_prob > unbiased[0].log_prob);
         validate_candidates(&biased, 2).unwrap();
+    }
+
+    #[test]
+    fn adr_037_e4a_tree_context_view_path_tokens_walks_to_root_2026_05_22() {
+        // Tree: 10 ─ 20 ─ 30.
+        let tokens = [10, 20, 30];
+        let parents: [Option<usize>; 3] = [None, Some(0), Some(1)];
+        let view = TreeContextView {
+            tokens: &tokens,
+            parents: &parents,
+        };
+        assert_eq!(view.path_tokens(0), vec![10]);
+        assert_eq!(view.path_tokens(1), vec![10, 20]);
+        assert_eq!(view.path_tokens(2), vec![10, 20, 30]);
     }
 
     #[test]
