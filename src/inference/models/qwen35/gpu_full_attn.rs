@@ -2925,29 +2925,84 @@ pub fn build_gated_attn_layer(
         enc.encoder().memory_barrier();
 
         // Op 2: Q/K/V/G projections — all read from arena.x_norm_buf, write
-        // into arena.{q,k,v,gate}_proj_buf via apply_linear_projection_f32_into.
-        // Each call needs &mut on a distinct arena field; we sequence them so
-        // the unique &mut borrows don't overlap.
-        apply_linear_projection_f32_into(
-            enc.encoder(), registry, device, &arena.x_norm_buf,
-            &weights_gpu.wq, &mut arena.q_proj_buf,
-            seq_len, hidden_size, q_total,
-        )?;
-        apply_linear_projection_f32_into(
-            enc.encoder(), registry, device, &arena.x_norm_buf,
-            &weights_gpu.wk, &mut arena.k_proj_buf,
-            seq_len, hidden_size, kv_total,
-        )?;
-        apply_linear_projection_f32_into(
-            enc.encoder(), registry, device, &arena.x_norm_buf,
-            &weights_gpu.wv, &mut arena.v_proj_buf,
-            seq_len, hidden_size, kv_total,
-        )?;
-        apply_linear_projection_f32_into(
-            enc.encoder(), registry, device, &arena.x_norm_buf,
-            &weights_gpu.w_gate, &mut arena.gate_proj_buf,
-            seq_len, hidden_size, q_total,
-        )?;
+        // into arena.{q,k,v,gate}_proj_buf.
+        //
+        // ADR-034 task #94 (2026-05-21) — fused dual Q4_0 projection path.
+        // When HF2Q_FUSED_QKVG=1, dispatch 2 fused kernels (q+gate and k+v)
+        // instead of 4 separate quantized_matmul_ggml calls. Each fused
+        // kernel loads x_norm ONCE and computes both projections inline,
+        // saving 1 dispatch per pair. Net: 4 dispatches → 2 dispatches per
+        // FA layer × 16 FA layers = 32 dispatches saved per verifier
+        // forward at seq=2.
+        //
+        // Parity gate: mlx-native parity tests at m=1, m=2, m=4 all PASS
+        // (byte-identical to unfused at 1e-5 F32 tolerance) — see
+        // adr_034_task94_fused_dual_proj_q4_0_parity at HEAD adca132.
+        //
+        // Eligibility:
+        //   - HF2Q_FUSED_QKVG=1
+        //   - weights are Q4_0 (DType::U8). FA weights are ALWAYS Q4_0 per
+        //     FullAttnWeightsGpu::from_cpu line 334-337 — universal path.
+        let use_fused_qkvg = std::env::var("HF2Q_FUSED_QKVG").as_deref() == Ok("1")
+            && weights_gpu.wq.dtype() == DType::U8
+            && weights_gpu.wk.dtype() == DType::U8
+            && weights_gpu.wv.dtype() == DType::U8
+            && weights_gpu.w_gate.dtype() == DType::U8;
+        if use_fused_qkvg {
+            // Fused Q + gate (both [hidden, q_total]).
+            mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
+                enc.encoder(),
+                registry,
+                device,
+                &weights_gpu.wq,
+                &weights_gpu.w_gate,
+                &arena.x_norm_buf,
+                &arena.q_proj_buf,
+                &arena.gate_proj_buf,
+                mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
+                    m: seq_len,
+                    output_size: q_total,
+                    hidden_size,
+                },
+            )?;
+            // Fused K + V (both [hidden, kv_total]).
+            mlx_native::ops::fused_dual_proj_q4_0::dispatch_fused_dual_proj_q4_0(
+                enc.encoder(),
+                registry,
+                device,
+                &weights_gpu.wk,
+                &weights_gpu.wv,
+                &arena.x_norm_buf,
+                &arena.k_proj_buf,
+                &arena.v_proj_buf,
+                mlx_native::ops::fused_dual_proj_q4_0::FusedDualProjQ4_0Args {
+                    m: seq_len,
+                    output_size: kv_total,
+                    hidden_size,
+                },
+            )?;
+        } else {
+            apply_linear_projection_f32_into(
+                enc.encoder(), registry, device, &arena.x_norm_buf,
+                &weights_gpu.wq, &mut arena.q_proj_buf,
+                seq_len, hidden_size, q_total,
+            )?;
+            apply_linear_projection_f32_into(
+                enc.encoder(), registry, device, &arena.x_norm_buf,
+                &weights_gpu.wk, &mut arena.k_proj_buf,
+                seq_len, hidden_size, kv_total,
+            )?;
+            apply_linear_projection_f32_into(
+                enc.encoder(), registry, device, &arena.x_norm_buf,
+                &weights_gpu.wv, &mut arena.v_proj_buf,
+                seq_len, hidden_size, kv_total,
+            )?;
+            apply_linear_projection_f32_into(
+                enc.encoder(), registry, device, &arena.x_norm_buf,
+                &weights_gpu.w_gate, &mut arena.gate_proj_buf,
+                seq_len, hidden_size, q_total,
+            )?;
+        }
         // Barrier: ops 3 read from q_proj/k_proj written above.
         enc.encoder().memory_barrier();
 

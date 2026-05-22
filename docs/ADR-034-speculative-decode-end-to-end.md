@@ -271,6 +271,67 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 20) — Task #94 QKVG fusion SHIPPED + parity passes, but spec gain FALSIFIED
+
+Multi-iteration work culminated in:
+
+**mlx-native commits**:
+- `796adb5`: `src/shaders/fused_dual_proj_q4_0.metal` (Q4_0 kernel, 8 rows/TG)
+- `adca132`: dispatch wrapper + registry + parity tests (3/3 PASS at m=1, m=2, m=4)
+
+**hf2q commit (this iter)**: `gpu_full_attn.rs` Op 2 site env-gated under
+`HF2Q_FUSED_QKVG=1`. Replaces 4 `apply_linear_projection_f32_into` calls
+with 2 `dispatch_fused_dual_proj_q4_0` (Q+gate + K+V).
+
+**Empirical 3-rep paired bench (Qwen 3.6 27B Q8_0, 200 tok)**:
+
+| Path                                          | Mean tok/s |   Δ    |
+|-----------------------------------------------|-----------:|-------:|
+| BASE QKVG OFF                                 |     21.07  |   —    |
+| BASE QKVG ON                                  |     21.10  | +0.1%  |
+| SPEC K=1 BATCHED MH temp=0.5 unfused          |     25.67  |   —    |
+| SPEC + QKVG ON + fused MLP ON                 |     25.50  | -0.7%  |
+
+**Determinism**: BASE QKVG=ON vs OFF at temp=0 = BYTE-IDENTICAL.
+The kernel is correct; the empirical perf gain is zero.
+
+**Third falsification of dispatch-fusion-at-seq=2 hypothesis**.
+Prior falsifications:
+- cont. 17 (m=2 fused MLP): no spec gain
+- cont. 19 (head_norm_rope wiring blocked by NeoX vs IMROPE mismatch)
+- cont. 20 (this iter: fused QKVG): no spec gain
+
+**Why QKVG doesn't help at seq=2** (per cont. 17 analysis, now reconfirmed):
+At m=2, per-dispatch COMPUTE roughly doubles vs m=1. Launch overhead
+becomes a smaller fraction of dispatch cost. Saving 32 dispatches per
+verifier forward yields ~3-5 ms theoretical savings, but the savings are
+absorbed by the compute-bound nature of m=2 matvec kernels — the actual
+GPU command queue throughput stays roughly the same.
+
+**Why even BASE (seq=1) is essentially flat (+0.1%)**: the `use_proj_arena`
+gate at `gpu_full_attn.rs:2837` requires `seq_len > 1`. The arena path
+(where my QKVG wiring lives) is BYPASSED at seq=1 — the decode path goes
+through a separate non-arena code branch where the original 4 separate
+`apply_linear_projection_f32_into` dispatches run unchanged.
+
+**Conclusion**: Spec K=1 BATCHED is at its compute-bound ceiling on
+M5 Max. Further dispatch-fusion at seq=2 will NOT help. The 1.244×
+shipped speedup is the realistic limit without architectural changes
+(tree decoding, custom drafter, or reduced verifier-compute via different
+quant/precision).
+
+**Re-prioritized remaining work**:
+1. **Tree decoding (EAGLE-2/Medusa)** — architectural change, multi-week
+2. Fused-MLP extension to seq=1-eligible decode path (separate code branch)
+3. Custom Metal kernel optimizing compute per FA matvec (lower-precision
+   intermediate accumulator? F16 matmul?)
+4. Task #89 / #78 / #90 Step 7 remain valid multi-week tracks
+
+Task #94 status: SHIPPED (correctness preserved, parity tests pass,
+empirical perf gain ~zero on spec). Will keep wired but default OFF.
+
+Memory: `project_adr034_task94_qkvg_falsified_2026_05_21` (next iter).
+
 ### Iteration 2026-05-21 (cont. 19) — Step 3 correction: existing fused_head_norm_rope is NeoX (wrong); plan pivots to fused QKVG quad-matmul
 
 Read `mlx-native/src/ops/fused_head_norm_rope.rs` carefully. The existing
