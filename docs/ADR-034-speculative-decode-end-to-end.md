@@ -55,6 +55,15 @@ The auto-default when MTP weights present is K=1 BATCHED greedy (task #87 / comm
 - MTP K=1 greedy: 29.93 ± 0.10 @ 91.0% accept = 1.36× base
 - MTP K=1 MH temp=0.5: 28.63 ± 0.05 @ 84.1% accept = 1.30× base
 
+**DFlash block_size sweep workload sensitivity** (at HEAD `60b1f18b`):
+
+| Workload | BS=2 | BS=4 | BS=8 | Peak BS | Peak tok/s |
+|---|---:|---:|---:|---:|---:|
+| Essay / creative | 16.5 | 16.9 | 8.7 (drop) | BS=4 | 16.9 |
+| Code-gen | 16.8 | 18.4 | 17.4 | BS=4 | 18.4 |
+
+Both workloads peak at BS=4 (corresponds to drafter proposing K=3 drafts per round). Below that, per-round overhead dominates; above that, accept rate falls faster than BS grows. The drafter ships with default `block_size=16` (K=15 drafts) which is OPT-OUT slower on both — set `HF2Q_DFLASH_BLOCK_SIZE=4` for peak DFlash perf. Even at peak, DFlash is **0.62× of MTP K=1 greedy on code-gen** (18.4 / 29.9) and **0.61× on essay** (16.9 / 27.5). DFlash remains opt-in / research-quality on Qwen35.
+
 **ADR-034 cell summary**:
 
 | Cell | Status | Production-ready? |
