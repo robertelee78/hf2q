@@ -37,6 +37,7 @@ pub mod drafter;
 pub mod drafter_gpu;
 pub mod dynamic_tree;
 pub mod forward;
+pub mod kv_cache;
 pub mod multi_layer_hidden;
 pub mod tensors;
 pub mod tree_walk;
