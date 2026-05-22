@@ -70,6 +70,7 @@ use mlx_native::ops::flash_attn_prefill::{
     FlashAttnPrefillParams, FlashAttnPrefillResumeParams,
 };
 use mlx_native::ops::transpose::{permute_021_bf16, permute_021_bf16_to_f32, permute_021_f32};
+use mlx_native::ops::tree_attention::{self as tree_attn_ops, TreeAttentionParams};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use super::encoder_stage::LayerEncoder;
@@ -1602,6 +1603,221 @@ pub fn apply_flash_attn_prefill_seq_major_into(
     // [`apply_flash_attn_prefill_seq_major`] for the "open + delegate +
     // commit_labeled" composition that preserves the legacy behavior.
     Ok(())
+}
+
+/// Parameters for Qwen3.5 tree-verify attention.
+///
+/// Field names mirror [`TreeAttentionParams`] except that `num_q_heads`
+/// names the query-head count at the Qwen call site.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen35TreeVerifyParams {
+    pub num_q_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub q_seq_len: u32,
+    pub kv_seq_len: u32,
+    pub kv_capacity: u32,
+    pub mask_stride: u32,
+    pub scale: f32,
+}
+
+/// Dispatch tree-aware self-attention for the Qwen 3.6 27B verifier path.
+///
+/// Wraps `mlx_native::ops::tree_attention::tree_attention` (Phase E1 kernel)
+/// with Qwen35-specific validation and DDD bounded-context isolation so the
+/// `models/qwen35` module never imports from `spec_decode/eagle3`.
+///
+/// # Arguments
+///
+/// * `enc` — live `CommandEncoder`; must not yet be committed.
+/// * `device` — the `MlxDevice` owning the buffers.
+/// * `registry` — kernel pipeline registry.
+/// * `q_head_outer` — F32 `[num_q_heads, q_seq_len, head_dim]` (post-RoPE,
+///   head-outer). Caller must permute from seq-outer if upstream produced
+///   `[seq, n_q, hd]` layout.
+/// * `k_head_outer` — F32 `[num_kv_heads, kv_capacity, head_dim]` (KV cache).
+/// * `v_head_outer` — F32 `[num_kv_heads, kv_capacity, head_dim]` (KV cache).
+/// * `tree_mask` — F32 `[q_seq_len, mask_stride]` from
+///   `ExpandedTree::build_tree_mask`. Cell `(i, j)` is `0.0` (attended) or
+///   `-65504.0` (masked).
+/// * `params` — see [`Qwen35TreeVerifyParams`].
+///
+/// Returns a freshly allocated F32 output buffer with layout
+/// `[q_seq_len, num_q_heads, head_dim]` (query-outer, head-inner).
+///
+/// # Errors
+///
+/// * `head_dim != 128` — only the dk128 path is wired for Qwen 3.6 27B.
+/// * `q_seq_len == 0` or `kv_seq_len == 0`.
+/// * `num_q_heads == 0` or `num_kv_heads == 0`.
+/// * `kv_capacity < kv_seq_len`.
+/// * `mask_stride < kv_seq_len`.
+/// * `scale` not finite.
+/// * `num_q_heads % num_kv_heads != 0`.
+/// * Overflow in any byte-size computation.
+/// * Any underlying `mlx_native` allocation or dispatch failure.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_qwen35_tree_verify_attention(
+    enc: &mut mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    q_head_outer: &MlxBuffer,
+    k_head_outer: &MlxBuffer,
+    v_head_outer: &MlxBuffer,
+    tree_mask: &MlxBuffer,
+    params: Qwen35TreeVerifyParams,
+) -> Result<MlxBuffer> {
+    if params.head_dim != 128 {
+        return Err(anyhow!(
+            "dispatch_qwen35_tree_verify_attention: head_dim must be 128 \
+             (Qwen3.5 tree-verify dispatcher); got {}. Other head_dims need \
+             a different target-model wrapper.",
+            params.head_dim
+        ));
+    }
+    if params.q_seq_len == 0 {
+        return Err(anyhow!(
+            "dispatch_qwen35_tree_verify_attention: q_seq_len must be > 0"
+        ));
+    }
+    if params.kv_seq_len == 0 {
+        return Err(anyhow!(
+            "dispatch_qwen35_tree_verify_attention: kv_seq_len must be > 0"
+        ));
+    }
+    if params.kv_capacity < params.kv_seq_len {
+        return Err(anyhow!(
+            "dispatch_qwen35_tree_verify_attention: kv_capacity ({}) must be >= kv_seq_len ({})",
+            params.kv_capacity,
+            params.kv_seq_len
+        ));
+    }
+    if params.mask_stride < params.kv_seq_len {
+        return Err(anyhow!(
+            "dispatch_qwen35_tree_verify_attention: mask_stride ({}) must be >= kv_seq_len ({})",
+            params.mask_stride,
+            params.kv_seq_len
+        ));
+    }
+    if !params.scale.is_finite() {
+        return Err(anyhow!(
+            "dispatch_qwen35_tree_verify_attention: scale ({}) must be finite",
+            params.scale
+        ));
+    }
+    if params.num_q_heads == 0 || params.num_kv_heads == 0 {
+        return Err(anyhow!(
+            "dispatch_qwen35_tree_verify_attention: num_q_heads and num_kv_heads must be > 0"
+        ));
+    }
+    if params.num_q_heads % params.num_kv_heads != 0 {
+        return Err(anyhow!(
+            "dispatch_qwen35_tree_verify_attention: num_q_heads ({}) must be divisible by num_kv_heads ({})",
+            params.num_q_heads,
+            params.num_kv_heads
+        ));
+    }
+
+    let mul = |a: usize, b: usize, ctx: &str| -> Result<usize> {
+        a.checked_mul(b).ok_or_else(|| {
+            anyhow!("dispatch_qwen35_tree_verify_attention: {ctx} overflows usize")
+        })
+    };
+
+    let q = params.q_seq_len as usize;
+    let nq = params.num_q_heads as usize;
+    let nkv = params.num_kv_heads as usize;
+    let d = params.head_dim as usize;
+    let cap = params.kv_capacity as usize;
+    let stride = params.mask_stride as usize;
+
+    let out_elems = mul(mul(q, nq, "q_seq_len*num_q_heads")?, d, "out elements")?;
+    let out_bytes = mul(out_elems, std::mem::size_of::<f32>(), "out bytes")?;
+    let kv_req_bytes = mul(
+        mul(mul(nkv, cap, "num_kv_heads*kv_capacity")?, d, "kv elements")?,
+        std::mem::size_of::<f32>(),
+        "kv bytes",
+    )?;
+    let mask_req_bytes = mul(
+        mul(q, stride, "q_seq_len*mask_stride")?,
+        std::mem::size_of::<f32>(),
+        "mask bytes",
+    )?;
+    // Phase E6 CFA Phase 3 follow-up: drop the local `tmp_bytes_checked`
+    // cross-check. The previous double-computation re-encoded
+    // mlx-native's private `NWG=32` constant in a hand-rolled formula —
+    // if upstream changes NWG, the cross-check silently drifts and
+    // fires spurious "overflowed or saturated" errors. Trust
+    // `tree_attn_ops::tmp_buffer_bytes` (which is the single source
+    // of truth for the kernel's scratch sizing) and let mlx-native's
+    // internal validation handle overflow.
+    let tmp_bytes =
+        tree_attn_ops::tmp_buffer_bytes(params.num_q_heads, params.head_dim, params.q_seq_len);
+
+    if q_head_outer.byte_len() < out_bytes {
+        return Err(anyhow!(
+            "dispatch_qwen35_tree_verify_attention: q buffer too small: have {} bytes, need >= {}",
+            q_head_outer.byte_len(),
+            out_bytes
+        ));
+    }
+    if k_head_outer.byte_len() < kv_req_bytes {
+        return Err(anyhow!(
+            "dispatch_qwen35_tree_verify_attention: k buffer too small: have {} bytes, need >= {}",
+            k_head_outer.byte_len(),
+            kv_req_bytes
+        ));
+    }
+    if v_head_outer.byte_len() < kv_req_bytes {
+        return Err(anyhow!(
+            "dispatch_qwen35_tree_verify_attention: v buffer too small: have {} bytes, need >= {}",
+            v_head_outer.byte_len(),
+            kv_req_bytes
+        ));
+    }
+    if tree_mask.byte_len() < mask_req_bytes {
+        return Err(anyhow!(
+            "dispatch_qwen35_tree_verify_attention: tree_mask buffer too small: have {} bytes, need >= {}",
+            tree_mask.byte_len(),
+            mask_req_bytes
+        ));
+    }
+
+    let output = device
+        .alloc_buffer(out_bytes, DType::F32, vec![q, nq, d])
+        .map_err(|e| anyhow!("alloc qwen35_tree_verify output: {e}"))?;
+    let tmp = device
+        .alloc_buffer(tmp_bytes, DType::F32, vec![tmp_bytes / 4])
+        .map_err(|e| anyhow!("alloc qwen35_tree_verify tmp: {e}"))?;
+
+    let tree_params = TreeAttentionParams {
+        num_heads: params.num_q_heads,
+        num_kv_heads: params.num_kv_heads,
+        head_dim: params.head_dim,
+        kv_seq_len: params.kv_seq_len,
+        kv_capacity: params.kv_capacity,
+        scale: params.scale,
+        q_seq_len: params.q_seq_len,
+        mask_stride: params.mask_stride,
+    };
+
+    enc.memory_barrier();
+
+    tree_attn_ops::tree_attention(
+        enc,
+        registry,
+        device,
+        q_head_outer,
+        k_head_outer,
+        v_head_outer,
+        tree_mask,
+        &output,
+        &tmp,
+        &tree_params,
+    )
+    .context("qwen35_tree_verify: tree_attention")?;
+
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4227,6 +4443,9 @@ pub fn apply_gated_attn_layer_decode_into(
 mod tests {
     use super::*;
     use super::super::full_attn::{FullAttnLayerWeights, FullAttnShape};
+    use crate::inference::spec_decode::eagle3::config::Eagle3DrafterConfig;
+    use crate::inference::spec_decode::eagle3::forward::dispatch_eagle3_tree_attention;
+    use mlx_native::ops::tree_attention::{TREE_MASK_ATTENDED, TREE_MASK_MASKED};
 
     fn mk_rand(seed: &mut u32, n: usize, scale: f32) -> Vec<f32> {
         (0..n)
@@ -4275,6 +4494,192 @@ mod tests {
         };
         let seq_len = 4u32;
         (shape, weights, seq_len)
+    }
+
+    fn qwen35_tree_verify_params(
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        q_seq_len: u32,
+        kv_seq_len: u32,
+    ) -> Qwen35TreeVerifyParams {
+        Qwen35TreeVerifyParams {
+            num_q_heads,
+            num_kv_heads,
+            head_dim: 128,
+            q_seq_len,
+            kv_seq_len,
+            kv_capacity: kv_seq_len,
+            mask_stride: kv_seq_len,
+            scale: 1.0 / 128.0_f32.sqrt(),
+        }
+    }
+
+    fn qwen35_tree_verify_eagle_cfg(
+        num_q_heads: usize,
+        num_kv_heads: usize,
+    ) -> Eagle3DrafterConfig {
+        Eagle3DrafterConfig {
+            hidden_size: num_q_heads * 128,
+            intermediate_size: num_q_heads * 256,
+            head_dim: 128,
+            num_q_heads,
+            num_kv_heads,
+            vocab_size: 1000,
+            draft_vocab_size: 1000,
+            target_hidden_size: num_q_heads * 128,
+            num_aux_hidden_states: 3,
+            rms_norm_eps: 1e-6,
+            norm_before_fc: false,
+            fc_norm: false,
+            use_qk_norm: false,
+            attention_bias: false,
+            tie_lm_head: true,
+            include_draft_id_mapping: false,
+            has_own_embed_tokens: false,
+            rope_theta: 1_000_000.0,
+            rope_dim: 128,
+        }
+    }
+
+    fn causal_tree_mask(q_seq_len: u32, kv_seq_len: u32) -> Vec<f32> {
+        let q = q_seq_len as usize;
+        let kv = kv_seq_len as usize;
+        let mut mask = vec![TREE_MASK_MASKED; q * kv];
+        for i in 0..q {
+            for j in 0..=i.min(kv.saturating_sub(1)) {
+                mask[i * kv + j] = TREE_MASK_ATTENDED;
+            }
+        }
+        mask
+    }
+
+    #[test]
+    fn dispatch_qwen35_tree_verify_head_dim_128_smoke_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let params = qwen35_tree_verify_params(40, 8, 4, 8);
+        let mut q_seed = 0x510_u32;
+        let mut k_seed = 0x511_u32;
+        let mut v_seed = 0x512_u32;
+        let q = upload_f32(&mk_rand(&mut q_seed, 40 * 4 * 128, 0.1), &device).unwrap();
+        let k = upload_f32(&mk_rand(&mut k_seed, 8 * 8 * 128, 0.1), &device).unwrap();
+        let v = upload_f32(&mk_rand(&mut v_seed, 8 * 8 * 128, 0.1), &device).unwrap();
+        let mask = upload_f32(&causal_tree_mask(4, 8), &device).unwrap();
+        let mut enc = device.command_encoder().expect("encoder");
+
+        let out = dispatch_qwen35_tree_verify_attention(
+            &mut enc, &device, &mut registry, &q, &k, &v, &mask, params,
+        )
+        .expect("dispatch");
+        enc.commit_and_wait().expect("commit");
+
+        assert_eq!(out.dtype(), DType::F32);
+        assert_eq!(out.shape(), &[4, 40, 128]);
+        assert!(download_f32(&out).unwrap().iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn dispatch_qwen35_tree_verify_rejects_head_dim_256_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let dummy = device.alloc_buffer(4, DType::F32, vec![1]).expect("dummy");
+        let mut enc = device.command_encoder().expect("encoder");
+        let mut params = qwen35_tree_verify_params(40, 8, 4, 8);
+        params.head_dim = 256;
+        let err = dispatch_qwen35_tree_verify_attention(
+            &mut enc, &device, &mut registry, &dummy, &dummy, &dummy, &dummy, params,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("head_dim"), "got: {err}");
+    }
+
+    #[test]
+    fn dispatch_qwen35_tree_verify_chain_mask_byte_identity_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let params = qwen35_tree_verify_params(40, 8, 4, 4);
+        let mut q_seed = 0x520_u32;
+        let mut k_seed = 0x521_u32;
+        let mut v_seed = 0x522_u32;
+        let q = upload_f32(&mk_rand(&mut q_seed, 40 * 4 * 128, 0.1), &device).unwrap();
+        let k = upload_f32(&mk_rand(&mut k_seed, 8 * 4 * 128, 0.1), &device).unwrap();
+        let v = upload_f32(&mk_rand(&mut v_seed, 8 * 4 * 128, 0.1), &device).unwrap();
+        let mask = upload_f32(&causal_tree_mask(4, 4), &device).unwrap();
+        let cfg = qwen35_tree_verify_eagle_cfg(40, 8);
+        let mut enc = device.command_encoder().expect("encoder");
+
+        let qwen_out = dispatch_qwen35_tree_verify_attention(
+            &mut enc, &device, &mut registry, &q, &k, &v, &mask, params,
+        )
+        .expect("qwen dispatch");
+        let eagle_out = dispatch_eagle3_tree_attention(
+            &mut enc,
+            &mut registry,
+            &device,
+            &q,
+            &k,
+            &v,
+            &mask,
+            &cfg,
+            params.q_seq_len,
+            params.kv_seq_len,
+            params.kv_capacity,
+            params.mask_stride,
+            params.scale,
+        )
+        .expect("eagle dispatch");
+        enc.commit_and_wait().expect("commit");
+
+        let qwen = download_f32(&qwen_out).unwrap();
+        let eagle = download_f32(&eagle_out).unwrap();
+        assert_eq!(qwen.len(), eagle.len());
+        for (i, (qv, ev)) in qwen.iter().zip(eagle.iter()).enumerate() {
+            assert_eq!(qv.to_bits(), ev.to_bits(), "output[{i}]");
+        }
+    }
+
+    #[test]
+    fn dispatch_qwen35_tree_verify_overflow_q_seq_len_zero_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let dummy = device.alloc_buffer(4, DType::F32, vec![1]).expect("dummy");
+        let mut enc = device.command_encoder().expect("encoder");
+        let params = qwen35_tree_verify_params(40, 8, 0, 8);
+        let err = dispatch_qwen35_tree_verify_attention(
+            &mut enc, &device, &mut registry, &dummy, &dummy, &dummy, &dummy, params,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("q_seq_len"), "got: {err}");
+    }
+
+    #[test]
+    fn dispatch_qwen35_tree_verify_mask_stride_too_small_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let dummy = device.alloc_buffer(4, DType::F32, vec![1]).expect("dummy");
+        let mut enc = device.command_encoder().expect("encoder");
+        let mut params = qwen35_tree_verify_params(40, 8, 4, 8);
+        params.mask_stride = 7;
+        let err = dispatch_qwen35_tree_verify_attention(
+            &mut enc, &device, &mut registry, &dummy, &dummy, &dummy, &dummy, params,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mask_stride"), "got: {err}");
     }
 
     /// Round-trip `upload_f32`/`download_f32` preserves contents.
