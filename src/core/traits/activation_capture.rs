@@ -52,8 +52,13 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 pub struct LayerActivations {
     /// Per-layer residual-stream inputs. `len() == num_layers`.
+    /// When [`Self::target_layer_filter`] is `Some`, non-target indices
+    /// receive empty `Vec<f32>` entries (length-preserving so
+    /// `layer_inputs[layer_idx]` is still valid indexing).
     pub layer_inputs: Vec<Vec<f32>>,
     /// Per-layer residual-stream outputs. `len() == num_layers`.
+    /// When [`Self::target_layer_filter`] is `Some`, non-target indices
+    /// receive empty `Vec<f32>` entries.
     pub layer_outputs: Vec<Vec<f32>>,
     /// Number of hidden layers captured (== `len()` of both vecs above).
     pub num_layers: u32,
@@ -61,6 +66,25 @@ pub struct LayerActivations {
     pub seq_len: u32,
     /// Residual-stream hidden dimension.
     pub hidden_size: u32,
+    /// ADR-034 task #78 Step 3c.A.4 (2026-05-21) — when `Some`, the
+    /// capture writer ONLY populates `layer_inputs` / `layer_outputs`
+    /// at the listed indices; non-target indices receive an empty Vec.
+    ///
+    /// Use case: DFlash speculative decoding captures hidden states at
+    /// just `drafter.target_layer_ids ∪ {final_layer_idx}` — typically
+    /// 4–5 layers out of 64. Without this filter, the LayerActivations
+    /// capture path would `download_f32` ALL 64 layers per forward,
+    /// consuming `2 * 64 * seq_len * hidden_size * 4` bytes (~5 GB for
+    /// P=2000 on Qwen 3.6 27B). With the filter, only the target layers
+    /// pay the GPU→CPU download + heap alloc — ~10x reduction at
+    /// typical drafter configs.
+    ///
+    /// Default `None` preserves the original DWQ-calibration semantics
+    /// (ALL layers captured) so this is a backward-compatible
+    /// extension. Filter values are treated as a set — order is not
+    /// significant, duplicates are tolerated (the downstream check is
+    /// `contains`).
+    pub target_layer_filter: Option<Vec<usize>>,
 }
 
 impl LayerActivations {
@@ -71,6 +95,10 @@ impl LayerActivations {
     }
 
     /// Validate internal shape consistency. Returns the first error, or Ok.
+    ///
+    /// When `target_layer_filter` is `Some`, non-target indices are
+    /// allowed to be empty `Vec<f32>`. Target indices must have the
+    /// expected `seq_len * hidden_size` length.
     pub fn validate(&self) -> Result<()> {
         if self.layer_inputs.len() != self.num_layers as usize {
             anyhow::bail!(
@@ -87,7 +115,25 @@ impl LayerActivations {
             );
         }
         let expected_per_layer = (self.seq_len as usize) * (self.hidden_size as usize);
+        let is_target = |i: usize| -> bool {
+            self.target_layer_filter
+                .as_ref()
+                .map_or(true, |f| f.contains(&i))
+        };
         for (i, v) in self.layer_inputs.iter().enumerate() {
+            // Non-target indices are allowed to be empty when a filter
+            // is set; only enforce the full per-layer length on target
+            // layers.
+            if !is_target(i) {
+                if !v.is_empty() {
+                    anyhow::bail!(
+                        "LayerActivations: layer_inputs[{}] non-target index expected empty, got len={}",
+                        i,
+                        v.len(),
+                    );
+                }
+                continue;
+            }
             if v.len() != expected_per_layer {
                 anyhow::bail!(
                     "LayerActivations: layer_inputs[{}].len() = {} != seq_len({}) * hidden_size({}) = {}",
@@ -100,6 +146,16 @@ impl LayerActivations {
             }
         }
         for (i, v) in self.layer_outputs.iter().enumerate() {
+            if !is_target(i) {
+                if !v.is_empty() {
+                    anyhow::bail!(
+                        "LayerActivations: layer_outputs[{}] non-target index expected empty, got len={}",
+                        i,
+                        v.len(),
+                    );
+                }
+                continue;
+            }
             if v.len() != expected_per_layer {
                 anyhow::bail!(
                     "LayerActivations: layer_outputs[{}].len() = {} != {}",
@@ -202,6 +258,7 @@ impl ActivationCapture for MockActivationCapture {
             num_layers: self.num_layers,
             seq_len: seq as u32,
             hidden_size: self.hidden_size,
+            target_layer_filter: None,
         })
     }
 }
@@ -222,6 +279,7 @@ mod tests {
             num_layers: 3,
             seq_len: 2,
             hidden_size: 4,
+            target_layer_filter: None,
         };
         act.validate().expect("should validate");
     }
@@ -234,6 +292,7 @@ mod tests {
             num_layers: 3,
             seq_len: 2,
             hidden_size: 4,
+            target_layer_filter: None,
         };
         assert!(act.validate().is_err());
     }
@@ -246,6 +305,7 @@ mod tests {
             num_layers: 3,
             seq_len: 2,
             hidden_size: 4,
+            target_layer_filter: None,
         };
         assert!(act.validate().is_err());
     }
@@ -258,8 +318,61 @@ mod tests {
             num_layers: 3,
             seq_len: 2,
             hidden_size: 4,
+            target_layer_filter: None,
         };
         assert_eq!(act.element_count(), 3 * 2 * 4 * 2);
+    }
+
+    #[test]
+    fn activations_validate_accepts_filtered_layers_2026_05_21() {
+        // ADR-034 task #78 Step 3c.A.4 — target_layer_filter=Some lets
+        // non-target indices be empty Vec without failing validate.
+        let act = LayerActivations {
+            layer_inputs: vec![
+                vec![0.0; 8],
+                vec![], // non-target, empty allowed
+                vec![0.0; 8],
+            ],
+            layer_outputs: vec![
+                vec![0.0; 8],
+                vec![],
+                vec![0.0; 8],
+            ],
+            num_layers: 3,
+            seq_len: 2,
+            hidden_size: 4,
+            target_layer_filter: Some(vec![0, 2]),
+        };
+        act.validate().expect("filtered validate should pass");
+    }
+
+    #[test]
+    fn activations_validate_rejects_filtered_target_short_2026_05_21() {
+        // Even with filter set, target indices must have full length.
+        let act = LayerActivations {
+            layer_inputs: vec![vec![0.0; 4] /* short */, vec![], vec![0.0; 8]],
+            layer_outputs: vec![vec![0.0; 8], vec![], vec![0.0; 8]],
+            num_layers: 3,
+            seq_len: 2,
+            hidden_size: 4,
+            target_layer_filter: Some(vec![0, 2]),
+        };
+        assert!(act.validate().is_err());
+    }
+
+    #[test]
+    fn activations_validate_rejects_non_target_nonempty_2026_05_21() {
+        // Non-target index with a non-empty Vec is treated as a writer
+        // bug (filter not honored).
+        let act = LayerActivations {
+            layer_inputs: vec![vec![0.0; 8], vec![0.0; 8] /* should be empty */, vec![0.0; 8]],
+            layer_outputs: vec![vec![0.0; 8], vec![], vec![0.0; 8]],
+            num_layers: 3,
+            seq_len: 2,
+            hidden_size: 4,
+            target_layer_filter: Some(vec![0, 2]),
+        };
+        assert!(act.validate().is_err());
     }
 
     #[test]

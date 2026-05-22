@@ -1956,13 +1956,17 @@ impl Qwen35Model {
         // Allocate scratch LayerActivations. The capture path inside
         // forward_gpu_impl pushes one Vec<f32> per layer into
         // `layer_outputs` (length = seq_len * hidden_size), already
-        // GPU-synced via download_f32.
+        // GPU-synced via download_f32. With `target_layer_filter` set,
+        // only DFlash target layers actually get downloaded — non-target
+        // layers receive an empty Vec, saving ~10× memory + GPU→CPU
+        // bandwidth for typical drafter configs (4 of 64 layers).
         let mut acts = LayerActivations {
             num_layers: n_layers as u32,
             seq_len: seq_len as u32,
             hidden_size: hs as u32,
             layer_inputs: Vec::with_capacity(n_layers),
             layer_outputs: Vec::with_capacity(n_layers),
+            target_layer_filter: Some(session.target_layer_ids.clone()),
         };
         let mut hidden_out = None;
         let logits = self.forward_gpu_impl(
@@ -3194,9 +3198,25 @@ impl Qwen35Model {
             // layer to CPU F32 if a capture target is bound. Cost: ~20 MB
             // download per layer (seq_len × hidden × 4 bytes), single
             // GPU→CPU transfer; well-amortized over the per-layer compute.
+            //
+            // ADR-034 task #78 Step 3c.A.4 (2026-05-21) — when
+            // `target_layer_filter` is set, only listed indices download
+            // hidden; others push an empty Vec to preserve the
+            // `layer_inputs[i]`/`layer_outputs[i]` invariant. Saves ~10×
+            // memory + GPU→CPU bandwidth for the DFlash capture use
+            // case (typically 4 of 64 layers).
             if let Some(ref mut acts) = capture {
-                let f32_data = download_f32(&hidden).context("capture layer_input download")?;
-                acts.layer_inputs.push(f32_data);
+                let is_target = acts
+                    .target_layer_filter
+                    .as_ref()
+                    .map_or(true, |f| f.contains(&layer_idx));
+                if is_target {
+                    let f32_data = download_f32(&hidden)
+                        .context("capture layer_input download")?;
+                    acts.layer_inputs.push(f32_data);
+                } else {
+                    acts.layer_inputs.push(Vec::new());
+                }
             }
 
             // --- Attention ---
@@ -4145,9 +4165,22 @@ impl Qwen35Model {
             // ADR-012 P9b GPU capture path: download residual leaving this
             // layer to CPU F32 if a capture target is bound. Pairs with the
             // layer_input download at the start of the loop.
+            //
+            // ADR-034 task #78 Step 3c.A.4 (2026-05-21) — filter to
+            // target_layer_filter when set; see the matching block at
+            // the start of the layer loop for rationale.
             if let Some(ref mut acts) = capture {
-                let f32_data = download_f32(&hidden).context("capture layer_output download")?;
-                acts.layer_outputs.push(f32_data);
+                let is_target = acts
+                    .target_layer_filter
+                    .as_ref()
+                    .map_or(true, |f| f.contains(&layer_idx));
+                if is_target {
+                    let f32_data = download_f32(&hidden)
+                        .context("capture layer_output download")?;
+                    acts.layer_outputs.push(f32_data);
+                } else {
+                    acts.layer_outputs.push(Vec::new());
+                }
             }
 
             // --- Optional dump (HF2Q_DUMP_LAYER_N env gate) ---

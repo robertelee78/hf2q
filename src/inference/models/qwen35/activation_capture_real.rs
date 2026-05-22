@@ -142,6 +142,7 @@ pub fn run_calibration_prompt_gpu(
         num_layers: model.cfg.num_hidden_layers,
         seq_len,
         hidden_size: model.cfg.hidden_size,
+        target_layer_filter: None,
     };
 
     let _logits = model
