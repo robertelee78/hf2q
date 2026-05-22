@@ -869,27 +869,77 @@ pub fn dispatch_dflash_decoder_layer_attention(
     )
     .context("layer attn: k_prop rope")?;
 
-    // -------- Phase B: commit + CPU download + cache writes --------
-    enc.commit_and_wait().context("layer attn: commit phase A")?;
+    // -------- Phase B: GPU cache writes (in-encoder, no wait) --------
+    //
+    // ADR-034 task #95 sub-iter C (2026-05-22) — was: commit_and_wait
+    // + download_f32_logical CPU memcpy + CPU cache writes. Replaced
+    // with in-encoder GPU dispatches via append_seq_major_kv_gpu +
+    // write_slack_kv_gpu (sub-iters A + B, parity-verified at
+    // mlx-native + hf2q be54bd0d).
+    //
+    // The cache writes happen in the SAME encoder as Phase A — after a
+    // memory_barrier so the dispatch_kv_cache_copy_seq_f32_dual kernel
+    // sees the RoPE'd K/V buffers. Metal serial queue ordering
+    // guarantees the next encoder (SDPA below) sees the cache writes
+    // after this encoder's commit completes.
+    //
+    // Env opt-out HF2Q_DFLASH_KV_CPU=1 falls back to the legacy CPU
+    // bridge for A/B testing during sub-iter D bench validation. Once
+    // sub-iter D confirms no regression (and sub-iter E ships), the
+    // opt-out and the CPU bridge are removed.
+    //
+    // RAW barrier: cache-write dispatches read k_ctx_roped / v_ctx /
+    // k_prop_roped / v_prop (written by RoPE + projections above).
+    enc.memory_barrier();
 
-    // download_f32_logical: K buffers come from apply_imrope which uses
-    // `pooled_alloc_buffer` (qwen35/gpu_full_attn.rs:649) that can be
-    // bucket-rounded.  We must truncate to the logical element count
-    // before appending into the cursor-mode cache, otherwise stale
-    // trailing pool bytes appear as extra "ctx" positions (iter-63 bug).
-    let k_ctx_cpu = download_f32_logical(&k_ctx_roped).context("download k_ctx")?;
-    let v_ctx_cpu = download_f32_logical(&v_ctx).context("download v_ctx")?;
-    cache_layer
-        .append_seq_major_kv(&k_ctx_cpu, &v_ctx_cpu, s, n_kv, head_dim)
-        .context("layer attn: append ctx K/V to cache")?;
-    debug_assert_eq!(cache_layer.seq_len, prior_offset + s);
-
-    let k_prop_cpu = download_f32_logical(&k_prop_roped).context("download k_prop")?;
-    let v_prop_cpu = download_f32_logical(&v_prop).context("download v_prop")?;
-    cache_layer
-        .write_slack_kv(&k_prop_cpu, &v_prop_cpu, l, n_kv, head_dim)
-        .context("layer attn: write prop K/V to cache slack")?;
-    debug_assert_eq!(cache_layer.seq_len, prior_offset + s, "slack must not advance seq_len");
+    let use_cpu_bridge =
+        std::env::var("HF2Q_DFLASH_KV_CPU").as_deref() == Ok("1");
+    if use_cpu_bridge {
+        // ── Legacy CPU bridge (sub-iter D opt-out) ──
+        enc.commit_and_wait().context("layer attn: commit phase A (CPU bridge)")?;
+        let k_ctx_cpu = download_f32_logical(&k_ctx_roped).context("download k_ctx")?;
+        let v_ctx_cpu = download_f32_logical(&v_ctx).context("download v_ctx")?;
+        cache_layer
+            .append_seq_major_kv(&k_ctx_cpu, &v_ctx_cpu, s, n_kv, head_dim)
+            .context("layer attn: append ctx K/V to cache (CPU)")?;
+        debug_assert_eq!(cache_layer.seq_len, prior_offset + s);
+        let k_prop_cpu = download_f32_logical(&k_prop_roped).context("download k_prop")?;
+        let v_prop_cpu = download_f32_logical(&v_prop).context("download v_prop")?;
+        cache_layer
+            .write_slack_kv(&k_prop_cpu, &v_prop_cpu, l, n_kv, head_dim)
+            .context("layer attn: write prop K/V to cache slack (CPU)")?;
+        debug_assert_eq!(cache_layer.seq_len, prior_offset + s);
+    } else {
+        // ── Sub-iter C path: in-encoder GPU cache writes ──
+        //
+        // append_seq_major_kv_gpu first (it advances cache_layer.seq_len
+        // by s, which is required for the SDPA call's kv_seq_len
+        // computation below). write_slack_kv_gpu second; it does NOT
+        // advance seq_len (slack semantics).
+        cache_layer
+            .append_seq_major_kv_gpu(
+                &mut enc, registry, device.metal_device(),
+                &k_ctx_roped, &v_ctx, s, n_kv, head_dim,
+            )
+            .context("layer attn: append_seq_major_kv_gpu")?;
+        debug_assert_eq!(cache_layer.seq_len, prior_offset + s);
+        // Barrier between append and slack-write since both target the
+        // same cache buffers (different positions per head, but Metal
+        // MTLDispatchTypeConcurrent reorders within an encoder).
+        enc.memory_barrier();
+        cache_layer
+            .write_slack_kv_gpu(
+                &mut enc, registry, device.metal_device(),
+                &k_prop_roped, &v_prop, l, n_kv, head_dim,
+            )
+            .context("layer attn: write_slack_kv_gpu")?;
+        debug_assert_eq!(cache_layer.seq_len, prior_offset + s, "slack must not advance seq_len");
+        // commit_labeled (no wait) — Metal serial queue ordering makes
+        // the SDPA encoder below see the cache writes after this CB
+        // completes. Saves the ~500us-1ms wait latency vs the legacy
+        // commit_and_wait at the top of this branch.
+        enc.commit_labeled("dflash.decoder_layer_attention.phase_a_kv_writes");
+    }
 
     // -------- Phase C: cross-length SDPA --------
     // kv_seq_len = ctx (now in cache via append) + L (prop in slack)
