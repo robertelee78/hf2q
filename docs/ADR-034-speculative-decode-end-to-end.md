@@ -32,7 +32,7 @@
 
 | Cell | Status | Evidence | Remaining work |
 |---|---|---|---|
-| **A — Qwen 3.6 27B dense MTP** | ✅ **PEER-COMPETITIVE: 1.244-1.332× SHIPPED** | Auto-default K=1 BATCHED + Metropolis-Hastings stochastic acceptance (task #87 + #91 SHIPPED). 3-rep paired bench at HEAD `6a7ecf4c`: base 21.30 t/s; K=1 BATCHED greedy temp=0 24.53 t/s @ 60.0% accept (1.15×); **K=1 BATCHED MH temp=0.5 26.50 t/s @ 74.6% accept (1.244× on essay) / 28.33 t/s @ 86.9% accept (1.332× on code-gen)**. Throughput effectively matches MTPLX D=2 peer benchmark (26.35 t/s @ 80.6% accept on their custom-tuned drafter) — gap is the -6pp accept rate from using stock vs fine-tuned drafter. Determinism PASS 3/3 byte-identical (greedy AND seeded MH temp=0.5). 51/51 lib tests pass + parity_mtp_python_ref pass. **Production recommendation: `--temperature 0.5`**. | Custom fine-tuned drafter (~+6pp accept) would close last-mile but requires training — out of scope. Fused-MLP Metal kernels (~50-80% verifier dispatch reduction) potential multi-week optimization. |
+| **A — Qwen 3.6 27B dense MTP** | ✅ **1.244-1.332× SHIPPED; short-context absolute throughput peer-competitive; 64K parity unproven** | Auto-default K=1 BATCHED + Metropolis-Hastings stochastic acceptance (task #87 + #91 SHIPPED). 3-rep paired bench at HEAD `6a7ecf4c`: base 21.30 t/s; K=1 BATCHED greedy temp=0 24.53 t/s @ 60.0% accept (1.15×); **K=1 BATCHED MH temp=0.5 26.50 t/s @ 74.6% accept (1.244× on essay) / 28.33 t/s @ 86.9% accept (1.332× on code-gen)**. Throughput matches reported MTPLX D=2 absolute (26.35 t/s @ 80.6% accept) under non-identical conditions (short ctx vs 64K, stock vs fine-tuned drafter; see cont. 14 caveats). Determinism PASS 3/3 byte-identical (greedy AND seeded MH temp=0.5). 51/51 lib tests pass + parity_mtp_python_ref pass. **Production recommendation: `--temperature 0.5`**. | **Multi-week work that must NOT be punted** (per user directive 2026-05-21): (1) fused-MLP Metal kernels (Q8_0/Q4_K_M/IQ4_NL) projected ~1.461× on dense; (2) 64K context parity bench vs MTPLX; (3) custom fine-tuned drafter (training). |
 | **A — Qwen 3.5/3.6 35B-A3B MoE-MTP** | ⚠️ **CORRECT but spec_decode is NET-NEGATIVE on MoE** | Loader works on 8/8 quants (Q4_0..Q8_0..IQ4_NL — all produce identical "**Paris**." at 85.7-100% MTP accept). BUT empirical paired bench at HEAD `0d19f4b0` (Q4_K_M, 200 tok): base 135.8 t/s, K=0 spec 111 t/s (0.82×), K=1 BATCHED 88 t/s (0.65×), K=2 cap=0 75.7 t/s @ 42.1% accept (0.56×). All spec modes SLOWER than base. T_v(N)/T_v(1) ratio = 2.4× (vs 1.26× on dense) — MoE batched-verifier overhead doesn't amortize. Loader fix shipped at afbf5684+66f2008f. | **Task #89** (forward_gpu_batched_decode) required to make spec_decode profitable on MoE. Until then, base K=0 is default (HF2Q_SPEC_DECODE unset). |
 | **B — Qwen 3.6 DFlash** | 🚨 **ARCH INTEGRATION** | DFlash drafter loads + safetensors validated (test passes), but `try_dispatch_dflash_spec_decode` requires `target: &mut MlxModelWeights` and calls `target.install_dflash_capture`, `target.rollback_kv`, `target.forward_decode_verify_batched`. `Qwen35Model` does NOT implement any of these (separate forward stack with `HybridKvCache`). Empirically verified at HEAD `afbf5684`: no `install_dflash_capture` / `rollback_kv` / `forward_decode_verify_batched` exists anywhere under `src/inference/models/qwen35/`. | **500-1500 LOC integration** (originally estimated at 50-100 LOC — corrected 2026-05-21 after reading `dispatch_dflash_generate` body). Options: (a) implement DFlash capture session on `Qwen35Model` + `HybridKvCache.rollback_to(pos)` + `forward_decode_verify_batched` for the Qwen35 hybrid stack, or (b) introduce a `DFlashTarget` trait that both `MlxModelWeights` and `Qwen35Model` implement (more refactor up-front but cleaner long-term). |
 | **C — Gemma 4 26B DFlash** | ⚠️ **COHERENT but 4.8× SLOWER than base** | Q8_0 paired bench 3 reps at HEAD `6d80e6be` (2026-05-21): base 92.9 t/s, DFlash 19.2 t/s = 0.21× (4.8× slowdown). Coherence is byte-identical to single-token decode at temp=0 (proven by e2e test). The "WORKING" claim in earlier ADR revisions was correctness-only — never measured against base. Source code at `src/serve/spec_decode_cli.rs:26-32` is honest: "Option C re-prefills full prefix from start_pos=0 each round; Option A (cross-length SDPA in flash_attn_prefill) deferred." | **Option A** = cross-length SDPA path (same scope as task #89 `forward_gpu_batched_decode`). Required for any perf gate. ~1500 LOC. |
@@ -294,18 +294,24 @@ proj), NOT 5 — `silu_mul` is already fused and residual add is already folded
 into the same command buffer. Full fusion (gate+up+silu+down → 1 dispatch)
 saves 3 dispatches × 64 layers = **192 saved Metal launches × ~50μs ≈ 9.6 ms**.
 
-**Projected impact (corrected)**:
+**Projected impact (corrected per codex review cont. 15-correction-2)**:
+
+Codex flagged a math inconsistency: `1.746 tok/iter × (1000/64.8 ms)` =
+**26.94 t/s** theoretical, but the measured-throughput anchor is **26.5 t/s**.
+The ~0.4 t/s gap likely reflects per-iter overhead not captured in the
+3-phase profile (drafter + verifier + "other") — e.g., outer-loop bookkeeping,
+preemit token computation, RNG draws between iters. Using the measured
+anchor for projection (preserves the gap proportionally):
 
 | Metric              | Current | After fused MLP |
 |---------------------|--------:|----------------:|
 | Verifier time       | 59.5 ms |        ~49.9 ms |
 | Iter time           | 64.8 ms |        ~55.2 ms |
-| Throughput per iter | 1.746 tok | 1.746 tok    |
-| Throughput          | 26.5 t/s |       ~31.6 t/s |
-| Speedup vs base 21.30 | 1.244× |          **~1.484×** |
+| Anchor throughput   | 26.5 t/s | 26.5 × (64.8/55.2) = ~31.1 t/s |
+| Speedup vs base 21.30 | 1.244× |          **~1.461×** |
 
-(Prior cont. 15 "~1.55×" estimate was based on 5-dispatch MLP assumption;
-true count of 4 yields slightly lower but still meaningful ~1.48× projection.)
+(Codex review pointed out the 1.746-tok/iter × 64.8-ms anchor mix overstated
+the speedup by ~0.02× — softened from "~1.484×" to ~1.461×.)
 
 This would be a STRONG ship. Multi-week scope to implement Q8_0 / Q4_K_M /
 IQ4_NL quantized fused-MLP Metal kernels (MTPLX's `gate_up_swiglu_*_qmv4`
@@ -334,12 +340,25 @@ authoritative D=2 benchmark on M5 Max:
 - Model: stock Q8_0 GGUF (NOT custom drafter)
 - HEAD: `47853d25`
 
-**Throughput is effectively identical (26.50 vs 26.35, within noise).**
+**Observed absolute throughputs are within ~0.6% (26.50 vs 26.35).** Per codex
+review (cont. 15-correction-2), this comparison is NOT apples-to-apples:
 
-The accept rate gap (74.6% vs 80.6%, -6pp) reflects MTPLX's custom fine-tuned
-drafter (`Qwen3.6-27B-MTPLX-Optimized-Speed`). Without custom training, our
-stock-drafter accept rate is ~6pp below peer best — a structural limit unless
-we train our own drafter (out of scope).
+| Dimension     | hf2q                          | MTPLX                         |
+|---------------|-------------------------------|-------------------------------|
+| Context       | Short (essay/code-gen ~25 tok) | 64K                           |
+| Drafter       | Stock GGUF                    | Fine-tuned (Optimized-Speed)  |
+| Sampler       | MH temp=0.5                   | MH (theirs)                   |
+| Quant         | Q8_0                          | Affine (likely BF16/F16)      |
+| Fan/thermal   | Unknown                       | Their JSON env documents tuning |
+| Prompt style  | Essay + code-gen              | Coding-agent                  |
+
+Several dimensions differ — the throughput convergence is suggestive but
+NOT a proof of parity. Long-context (64K) parity remains unproven for hf2q.
+
+The observed accept-rate gap (74.6% vs 80.6%, -6pp) is also confounded:
+plausible contributions include MTPLX's custom-tuned drafter, longer context
+(potentially higher predictability of completion text), and any sampler
+configuration differences between the two stacks.
 
 **Important correction**: prior memory `[[project_adr034_mtplx_gdn_capture_2026_05_21]]`
 claimed "MTPLX 2.24x peer ref remains 2x ahead". That figure is MTPLX's
