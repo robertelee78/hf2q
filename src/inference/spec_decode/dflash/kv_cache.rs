@@ -301,6 +301,74 @@ impl DFlashLayerKvCache {
         // Intentionally NOT advancing seq_len — caller's responsibility.
         Ok(())
     }
+
+    /// ADR-034 task #95 sub-iter B (2026-05-21) — GPU-side equivalent
+    /// of [`Self::write_slack_kv`].
+    ///
+    /// Writes seq-major source K/V into the cache's SLACK space at
+    /// positions `[seq_len..seq_len+n)` via a single
+    /// `dispatch_kv_cache_copy_seq_f32_dual` dispatch in the
+    /// caller-supplied encoder. Does NOT advance `self.seq_len` —
+    /// matches the CPU contract.
+    ///
+    /// Identical kernel to [`Self::append_seq_major_kv_gpu`] (the
+    /// kernel just takes a `seq_pos_start` arg) — the difference is
+    /// purely the seq_len bookkeeping. Pair with the same caller
+    /// contract: no `commit_and_wait` between the producer of `src_k`
+    /// / `src_v` and this dispatch; use `memory_barrier()` in the
+    /// same encoder.
+    ///
+    /// Used by the spec-decode K-batch path where the drafter writes
+    /// candidate K/V into slack so SDPA can see them at `kv_seq_len =
+    /// seq_len + n` capacity without committing them to the persistent
+    /// cache (next iteration overwrites them).
+    ///
+    /// Errors if `seq_len + n > capacity`.
+    pub fn write_slack_kv_gpu(
+        &self,
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &mlx_native::metal::DeviceRef,
+        src_k: &MlxBuffer,
+        src_v: &MlxBuffer,
+        n: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> anyhow::Result<()> {
+        if self.seq_len.saturating_add(n) > self.capacity {
+            return Err(anyhow::anyhow!(
+                "dflash write_slack_kv_gpu layer {} would exceed capacity: seq_len={}, n={}, capacity={}",
+                self.layer_idx, self.seq_len, n, self.capacity
+            ));
+        }
+        let expected_src_elems = (n as u64)
+            * (num_kv_heads as u64)
+            * (head_dim as u64);
+        for (name, b) in [("src_k", src_k), ("src_v", src_v)] {
+            if (b.element_count() as u64) < expected_src_elems {
+                return Err(anyhow::anyhow!(
+                    "dflash write_slack_kv_gpu: {} has {} elements, need {}",
+                    name, b.element_count(), expected_src_elems
+                ));
+            }
+        }
+        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual(
+            encoder, registry, device,
+            src_k, src_v,
+            &self.keys, &self.values,
+            num_kv_heads,
+            head_dim,
+            self.capacity,
+            /* seq_pos_start = */ self.seq_len,
+            /* n_tokens = */ n,
+            /* src_tok_offset = */ 0,
+        )
+        .map_err(|e| anyhow::anyhow!(
+            "dflash write_slack_kv_gpu dispatch: {e}"
+        ))?;
+        // Intentionally NOT advancing seq_len — caller's responsibility.
+        Ok(())
+    }
 }
 
 /// Full drafter KV cache: one [`DFlashLayerKvCache`] per draft layer.
@@ -713,6 +781,144 @@ mod tests {
         eprintln!(
             "task #95 sub-iter A parity OK: n_new={}, n_kv_heads={}, head_dim={}, capacity={}",
             n_new, h, d, cap,
+        );
+    }
+
+    /// ADR-034 task #95 sub-iter B (2026-05-21) — parity test:
+    /// CPU `write_slack_kv` vs GPU `write_slack_kv_gpu` must produce
+    /// byte-identical cache state on the same input + seq_len cursor.
+    ///
+    /// Sequence:
+    ///   1. Append a non-trivial prefix (n_ctx=3) via CPU
+    ///      `append_seq_major_kv` to set `seq_len > 0` (the slack-write
+    ///      semantics only make sense when seq_len > 0).
+    ///   2. Build distinguishable slack input (n_slack=2, marker
+    ///      values).
+    ///   3. Path A: CPU `write_slack_kv` writes to positions
+    ///      [seq_len..seq_len+n_slack).
+    ///   4. Path B: GPU `write_slack_kv_gpu` writes the same slack to
+    ///      a separate cache_gpu (which has the SAME prefix already
+    ///      written via the CPU path).
+    ///   5. Compare both caches' [0..seq_len+n_slack) range — the
+    ///      prefix should match (both wrote it via CPU) AND the slack
+    ///      should match (path A vs path B), AND neither should have
+    ///      advanced `seq_len`.
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn adr_034_task_95_write_slack_kv_gpu_parity_2026_05_21() {
+        use mlx_native::DType;
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let max_full = 64u32;
+
+        let mut cache_cpu = DFlashKvCache::new(&device, &cfg, max_full).expect("cache_cpu alloc");
+        let mut cache_gpu = DFlashKvCache::new(&device, &cfg, max_full).expect("cache_gpu alloc");
+
+        let layer_idx = 4usize; // full-attention layer
+        let h = cfg.num_key_value_heads as u32;
+        let d = cfg.head_dim as u32;
+        let n_h = h as usize;
+        let dim = d as usize;
+
+        // ── Phase 1: append common prefix to BOTH caches via CPU ──
+        let n_ctx = 3u32;
+        let n_ctx_elems = (n_ctx as usize) * n_h * dim;
+        let mut k_ctx = vec![0.0f32; n_ctx_elems];
+        let mut v_ctx = vec![0.0f32; n_ctx_elems];
+        // Markers in [1.0, 2.0) — must be distinct from slack markers
+        for t in 0..(n_ctx as usize) {
+            for head in 0..n_h {
+                for dimi in 0..dim {
+                    let row = (t * n_h + head) * dim;
+                    k_ctx[row + dimi] = 1.0 + ((t * 100 + head * 10 + dimi) as f32) / 1000.0;
+                    v_ctx[row + dimi] = 1.5 + ((t * 100 + head * 10 + dimi) as f32) / 1000.0;
+                }
+            }
+        }
+        cache_cpu.layers[layer_idx]
+            .append_seq_major_kv(&k_ctx, &v_ctx, n_ctx, h, d)
+            .expect("CPU append ctx");
+        cache_gpu.layers[layer_idx]
+            .append_seq_major_kv(&k_ctx, &v_ctx, n_ctx, h, d)
+            .expect("seed cache_gpu prefix via CPU path");
+        assert_eq!(cache_cpu.layers[layer_idx].seq_len, n_ctx);
+        assert_eq!(cache_gpu.layers[layer_idx].seq_len, n_ctx);
+
+        // ── Phase 2: build slack input (distinct markers in [2.0, 3.0)) ──
+        let n_slack = 2u32;
+        let n_slack_elems = (n_slack as usize) * n_h * dim;
+        let mut k_slack = vec![0.0f32; n_slack_elems];
+        let mut v_slack = vec![0.0f32; n_slack_elems];
+        for t in 0..(n_slack as usize) {
+            for head in 0..n_h {
+                for dimi in 0..dim {
+                    let row = (t * n_h + head) * dim;
+                    k_slack[row + dimi] = 2.0 + ((t * 100 + head * 10 + dimi) as f32) / 1000.0;
+                    v_slack[row + dimi] = 2.5 + ((t * 100 + head * 10 + dimi) as f32) / 1000.0;
+                }
+            }
+        }
+
+        // ── Path A: CPU slack write ──
+        cache_cpu.layers[layer_idx]
+            .write_slack_kv(&k_slack, &v_slack, n_slack, h, d)
+            .expect("CPU slack write");
+
+        // ── Path B: GPU slack write ──
+        let mut src_k = device
+            .alloc_buffer(n_slack_elems * 4, DType::F32, vec![n_slack as usize, n_h, dim])
+            .expect("alloc src_k");
+        let mut src_v = device
+            .alloc_buffer(n_slack_elems * 4, DType::F32, vec![n_slack as usize, n_h, dim])
+            .expect("alloc src_v");
+        src_k.as_mut_slice::<f32>().expect("src_k slice").copy_from_slice(&k_slack);
+        src_v.as_mut_slice::<f32>().expect("src_v slice").copy_from_slice(&v_slack);
+
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut enc = device.command_encoder().expect("encoder");
+        cache_gpu.layers[layer_idx]
+            .write_slack_kv_gpu(
+                &mut enc, &mut registry, device.metal_device(),
+                &src_k, &src_v,
+                n_slack, h, d,
+            )
+            .expect("GPU slack write");
+        enc.commit_and_wait().expect("commit GPU slack");
+
+        // ── Compare ──
+        // Both seq_len cursors MUST remain at n_ctx (slack write does
+        // not advance).
+        assert_eq!(cache_cpu.layers[layer_idx].seq_len, n_ctx, "CPU seq_len unchanged");
+        assert_eq!(cache_gpu.layers[layer_idx].seq_len, n_ctx, "GPU seq_len unchanged");
+
+        let cap = cache_cpu.layers[layer_idx].capacity as usize;
+        let k_cpu = cache_cpu.layers[layer_idx].keys.as_slice::<f32>().expect("k_cpu");
+        let k_gpu = cache_gpu.layers[layer_idx].keys.as_slice::<f32>().expect("k_gpu");
+        let v_cpu = cache_cpu.layers[layer_idx].values.as_slice::<f32>().expect("v_cpu");
+        let v_gpu = cache_gpu.layers[layer_idx].values.as_slice::<f32>().expect("v_gpu");
+
+        // Compare WRITTEN region: prefix [0..n_ctx) + slack [n_ctx..n_ctx+n_slack).
+        // Both paths wrote prefix via CPU + slack via their respective paths.
+        for head in 0..n_h {
+            for t in 0..((n_ctx + n_slack) as usize) {
+                let off = (head * cap + t) * dim;
+                let k_cpu_row = &k_cpu[off..off + dim];
+                let k_gpu_row = &k_gpu[off..off + dim];
+                let v_cpu_row = &v_cpu[off..off + dim];
+                let v_gpu_row = &v_gpu[off..off + dim];
+                assert_eq!(
+                    k_cpu_row, k_gpu_row,
+                    "K parity mismatch at head={head} t={t} (n_ctx={n_ctx}, n_slack={n_slack})",
+                );
+                assert_eq!(
+                    v_cpu_row, v_gpu_row,
+                    "V parity mismatch at head={head} t={t}",
+                );
+            }
+        }
+        eprintln!(
+            "task #95 sub-iter B parity OK: n_ctx={}, n_slack={}, n_kv_heads={}, head_dim={}",
+            n_ctx, n_slack, h, d,
         );
     }
 
