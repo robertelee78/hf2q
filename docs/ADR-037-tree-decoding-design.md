@@ -21,6 +21,9 @@
 | E3b — eagle3 drafter weights schema + loader | ✅ SHIPPED | hf2q `3b78d2bc` | `Eagle3DrafterConfig` (7 architectural gates) + `Eagle3Weights` strict manifest loader with synthetic safetensors validation. 26/26 unit tests PASS: config validation, manifest structure (12 invariant tests), conditional tensor gates (5 gates × validation), 5 safetensors load-path tests using synthetic in-memory blobs. |
 | E3 codex /cfa gate | ✅ PASSED | hf2q `6936473d` | Codex re-review confirms **0 Critical + 0 Major** remaining. Fixed: checked_mul overflow guards, vLLM d2t/t2d name normalization, `has_own_embed_tokens` config gate, defensive `cfg.validate()` at loader entry, stale mod.rs doc. Added 4 negative-path validation tests proving each fix fires. |
 | **Phase E3 totals** | ✅ **CLOSED** | hf2q `6936473d` | **45/45** unit tests PASS (15 E3a + 26 E3b + 4 codex-fix validations). |
+| E4a — dynamic tree expansion algo | ✅ SHIPPED | hf2q `8601772f` | EAGLE-2 GLOBAL best-first expansion via pending-candidate heap (codex caught batch-commit Critical → fixed). `Drafter` trait + `TreeContextView` carrying tokens/parents slices so GPU drafter can walk parent chain. `ExpandedTree` with f64 cum_log_probs (codex caught f32 underflow risk → fixed). `build_tree_mask` returns Result<Vec<f32>> with checked overflow (codex caught raw arithmetic → fixed). 21/21 tests PASS including explicit global-best-first proof (grandchild of A beats sibling of A when A's subtree has globally higher cum). |
+| E4b — GPU drafter forward | ⏳ TODO | — | Next iterations (multi-step). Wraps mlx-native primitives to run the 1-layer transformer drafter on Eagle3Weights, implements `Drafter` trait. |
+| E4 codex /cfa gate | ⏳ TODO | — | After E4b |
 | E4 — drafter forward + dynamic tree expansion | ⏳ TODO | — | ~600 LOC, ~5-7 days |
 | E5 — tree-walk-accept + KV rollback | ⏳ TODO | — | ~350 LOC, ~3-4 days |
 | E6 — orchestrator + HF2Q_SPEC_EAGLE3 env flag | ⏳ TODO | — | ~500 LOC, ~5-7 days |
