@@ -89,6 +89,21 @@ Saved cost: ~8-17 ms per drafter forward × per round → ~10-20% DFlash through
 
 **Previously-believed target REVISED**: I previously documented "fused projections Metal kernel" (single dispatch for norm + Q+K+V+Gate + per-head norms + RoPE) as the structural lever. Reading MTPLX's `/opt/MTPLX/native_extensions/verify_mlp/gate_up/gate_up.metal` shows their only attention-side fused kernel is the MLP (gate + up + silu_mul, which corresponds to our task #93 SHIPPED). They do NOT have a fused projections kernel either. Their advantage is the compiled drafter, not a deeper attention fusion. Task #89's vec-extension building blocks (Steps 1-3b SHIPPED) remain useful but don't unlock the perf gap — the real gap is the drafter compile pattern.
 
+**Concrete refactor path identified (task #95, 2026-05-21)**: research at HEAD `e9358fde` identified the exact CPU↔GPU boundary:
+- `DFlashLayerKvCache.keys`/`.values` ARE already `MlxBuffer` (GPU-resident, see `kv_cache.rs:46-48`)
+- The CPU roundtrip is ONLY in the WRITE PATH: `append_seq_major_kv` + `write_slack_kv` take `&[f32]` CPU slices and use `as_mut_slice` to memcpy into the GPU buffer
+- Callers at `dispatch_dflash_decoder_layer_attention` (forward.rs:880-891) do `download_f32_logical(&k_ctx_roped)` BEFORE the cache write, which forces the `commit_and_wait` at forward.rs:873
+
+Fix (200-400 LOC, multi-iteration):
+1. Add `append_seq_major_kv_gpu(encoder, k_gpu_seq, v_gpu_seq, ...)` to `DFlashLayerKvCache` that dispatches `mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual` (already exists; Qwen35 HybridKvCache uses it).
+2. Add `write_slack_kv_gpu` for the slack-write path.
+3. Update `dispatch_dflash_decoder_layer_attention:873` to call GPU variants in the SAME encoder; replace `commit_and_wait` with `memory_barrier`.
+4. Remove the `download_f32_logical(...)` CPU bridges at forward.rs:880, 881, 887, 888.
+
+Per-layer savings: 1 commit_and_wait → 1 memory_barrier = ~500μs-1ms. Across 5 drafter layers = 2.5-5 ms / drafter forward = ~8% DFlash perf. Same lever applies to Cell A 35B-A3B MoE K=N MTP (currently net-negative due to identical CPU-sync pattern between MTP depth=1 and depth=2).
+
+Sub-iteration breakdown documented in tasks.md task #95.
+
 **Task #89 building blocks shipped** (ready for future fused-projections work):
 - `flash_attn_vec` extended to qL>=1 (mlx-native 471c769) — parity-verified at qL=1,2,4,8
 - `apply_sdpa_with_kv_cache` vec_small_path branch (hf2q c14efb3b) — opt-out HF2Q_NO_VEC_SMALL_PATH=1
