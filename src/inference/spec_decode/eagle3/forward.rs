@@ -127,6 +127,11 @@ pub fn dispatch_eagle3_fc(
 // The concat is along the last dim (feature axis) yielding the
 // `[seq, 2 * hidden_size]` input to Q/K/V projections.
 
+/// Maximum `dim` that survives `as f32` without precision loss.
+/// Above 2^24, f32 mantissa rounds to even — params[1] would lose
+/// integer fidelity. Codex /cfa E4b.3 Minor (2026-05-22).
+const RMS_NORM_DIM_F32_EXACT_MAX: u32 = 1 << 24;
+
 /// Build the `[eps, dim]` F32 params buffer required by
 /// `dispatch_rms_norm`. Allocates a fresh tiny buffer per call.
 fn alloc_rms_norm_params_eagle3(
@@ -134,6 +139,12 @@ fn alloc_rms_norm_params_eagle3(
     eps: f32,
     dim: u32,
 ) -> Result<MlxBuffer> {
+    if dim > RMS_NORM_DIM_F32_EXACT_MAX {
+        return Err(anyhow!(
+            "alloc_rms_norm_params_eagle3: dim {} exceeds 2^24 — `as f32` would round-to-even",
+            dim
+        ));
+    }
     let mut params = device
         .alloc_buffer(8, DType::F32, vec![2])
         .map_err(|e| anyhow!("alloc eagle3 rms_norm params: {e}"))?;
@@ -180,7 +191,22 @@ fn dispatch_eagle3_rms_norm_seq_x_hidden(
             norm_weight.dtype()
         ));
     }
+    // Codex /cfa E4b.3 Major (2026-05-22): reject zero seq_len. A
+    // zero-element dispatch is structurally meaningless and existing
+    // kernels (e.g. mlx-native::ops::rms_norm) reject zero rows.
+    if seq_len == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_rms_norm ({}): seq_len must be > 0",
+            label
+        ));
+    }
     let hidden_usize = cfg.hidden_size;
+    if hidden_usize == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_rms_norm ({}): hidden_size must be > 0",
+            label
+        ));
+    }
     let hidden: u32 = u32::try_from(hidden_usize).map_err(|_| {
         anyhow!(
             "dispatch_eagle3_rms_norm ({}): hidden_size ({}) exceeds u32::MAX",
@@ -188,6 +214,20 @@ fn dispatch_eagle3_rms_norm_seq_x_hidden(
             hidden_usize
         )
     })?;
+    // Codex /cfa E4b.3 Critical 3 (2026-05-22): validate weight
+    // element count. Wrappers receive `&tensors.input_layernorm`
+    // which is upload-time-validated, but the internal helper's
+    // contract is "F32 RMSNorm weight" — adding the length check
+    // here surfaces shape mismatches before the kernel reads past
+    // the gain buffer.
+    if norm_weight.element_count() != hidden_usize {
+        return Err(anyhow!(
+            "dispatch_eagle3_rms_norm ({}): weight has {} elements, expected hidden_size {}",
+            label,
+            norm_weight.element_count(),
+            hidden_usize
+        ));
+    }
     let expected_elems = (seq_len as usize)
         .checked_mul(hidden_usize)
         .ok_or_else(|| {
@@ -205,9 +245,21 @@ fn dispatch_eagle3_rms_norm_seq_x_hidden(
             label, actual, expected_elems, seq_len, hidden
         ));
     }
+    // Codex /cfa E4b.3 Critical 1 (2026-05-22): checked byte multiply.
+    // Without this, `expected_elems * 4` could overflow usize on
+    // release, causing alloc_buffer to allocate too small.
+    let out_bytes = expected_elems
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_rms_norm ({}): expected_elems ({}) * 4 overflows usize",
+                label,
+                expected_elems
+            )
+        })?;
     let out = device
         .alloc_buffer(
-            expected_elems * 4,
+            out_bytes,
             DType::F32,
             vec![seq_len as usize, hidden_usize],
         )
@@ -316,7 +368,18 @@ pub fn dispatch_eagle3_concat_2x_hidden(
             hidden_normed.dtype()
         ));
     }
+    // Codex /cfa E4b.3 Major (2026-05-22): reject zero seq_len.
+    if seq_len == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_concat_2x_hidden: seq_len must be > 0"
+        ));
+    }
     let hidden_usize = cfg.hidden_size;
+    if hidden_usize == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_concat_2x_hidden: hidden_size must be > 0"
+        ));
+    }
     let hidden: u32 = u32::try_from(hidden_usize).map_err(|_| {
         anyhow!(
             "dispatch_eagle3_concat_2x_hidden: hidden_size ({}) exceeds u32::MAX",
@@ -362,9 +425,19 @@ pub fn dispatch_eagle3_concat_2x_hidden(
             hidden
         ));
     }
+    // Codex /cfa E4b.3 Critical 2 (2026-05-22): checked byte multiply
+    // for dst allocation.
+    let total_bytes = total_elems
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_concat_2x_hidden: total_elems ({}) * 4 overflows usize",
+                total_elems
+            )
+        })?;
     let dst = device
         .alloc_buffer(
-            total_elems * 4,
+            total_bytes,
             DType::F32,
             vec![seq_len as usize, 2 * hidden_usize],
         )
@@ -1011,6 +1084,65 @@ mod tests {
         assert!(
             err.to_string().contains("dtype must be F32"),
             "expected F32-dtype error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b3_gate_input_layernorm_rejects_zero_seq_len_2026_05_22() {
+        // Codex /cfa E4b.3 Major fix (2026-05-22): zero seq_len was
+        // structurally meaningless but previously slipped through.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let empty_input = device
+            .alloc_buffer(4, DType::F32, vec![1])
+            .expect("alloc empty");
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_input_layernorm(
+            &mut enc, &mut registry, &device, &empty_input, &tensors, &cfg, 0,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("seq_len must be > 0"),
+            "expected seq_len-zero error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b3_gate_concat_rejects_zero_seq_len_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("weights load");
+        let _tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let empty_a = device
+            .alloc_buffer(4, DType::F32, vec![1])
+            .expect("alloc a");
+        let empty_b = device
+            .alloc_buffer(4, DType::F32, vec![1])
+            .expect("alloc b");
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_concat_2x_hidden(
+            &mut enc, &mut registry, &device, &empty_a, &empty_b, &cfg, 0,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("seq_len must be > 0"),
+            "expected seq_len-zero error, got: {err}"
         );
     }
 
