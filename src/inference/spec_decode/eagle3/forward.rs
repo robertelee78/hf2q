@@ -1701,6 +1701,13 @@ pub fn dispatch_eagle3_final_norm(
     cfg: &Eagle3DrafterConfig,
     seq_len: u32,
 ) -> Result<MlxBuffer> {
+    // Codex /cfa E4b.9 Major (2026-05-22): RAW barrier before reading
+    // final_residual. In the orchestrator path, final_residual is the
+    // post-MLP-residual-add buffer (written by E4b.7's
+    // dispatch_eagle3_residual_add in the same encoder). Without this
+    // barrier the final_norm kernel could read partially-written data.
+    // Same pattern as E4b.4/E4b.5a/E4b.6/E4b.7 (5th time now).
+    encoder.memory_barrier();
     dispatch_eagle3_rms_norm_seq_x_hidden(
         encoder,
         registry,
