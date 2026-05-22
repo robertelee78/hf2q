@@ -922,6 +922,172 @@ mod tests {
         );
     }
 
+    /// ADR-034 task #95 codex /cfa follow-up (2026-05-22) — extended
+    /// parity test covering interleaved cursor-mutation sequences.
+    ///
+    /// Per codex audit on cumulative sub-iters A-G (HEAD 17852489):
+    /// existing parity tests cover the core CPU vs GPU layout
+    /// equivalence but not multi-step cursor behavior. This test
+    /// exercises:
+    ///   append 3 -> append 2 -> rollback 1 -> append 1 -> slack 2
+    ///
+    /// Both CPU and GPU paths must produce byte-identical cache state
+    /// + identical seq_len cursor through the full sequence. Catches:
+    ///   - GPU append cursor advance != CPU
+    ///   - GPU rollback decrement bookkeeping
+    ///   - GPU append AFTER rollback writes to the right offset
+    ///   - GPU slack-write doesn't disturb the rollback'd cursor
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn adr_034_task_95_interleaved_cursor_parity_2026_05_22() {
+        use mlx_native::DType;
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let max_full = 64u32;
+
+        let mut cache_cpu = DFlashKvCache::new(&device, &cfg, max_full).expect("cache_cpu alloc");
+        let mut cache_gpu = DFlashKvCache::new(&device, &cfg, max_full).expect("cache_gpu alloc");
+
+        let layer_idx = 4usize; // full-attention layer
+        let h = cfg.num_key_value_heads as u32;
+        let d = cfg.head_dim as u32;
+        let n_h = h as usize;
+        let dim = d as usize;
+        let mut registry = mlx_native::KernelRegistry::new();
+
+        // Helper: build distinguishable seq-major K/V input with marker
+        // base. Each (t, head, dimi) gets a unique value derived from
+        // marker_base + t * 1000 + head * 10 + dimi / 100.0.
+        let mk_input = |n: u32, marker_base: f32| -> (Vec<f32>, Vec<f32>) {
+            let n_elems = (n as usize) * n_h * dim;
+            let mut k = vec![0.0f32; n_elems];
+            let mut v = vec![0.0f32; n_elems];
+            for t in 0..(n as usize) {
+                for head in 0..n_h {
+                    for dimi in 0..dim {
+                        let row = (t * n_h + head) * dim;
+                        let val = marker_base
+                            + (t as f32) * 1000.0
+                            + (head as f32) * 10.0
+                            + (dimi as f32) / 100.0;
+                        k[row + dimi] = val;
+                        v[row + dimi] = val + 0.5;
+                    }
+                }
+            }
+            (k, v)
+        };
+
+        // Helper: upload host slice to MlxBuffer.
+        let mk_gpu = |data: &[f32]| -> MlxBuffer {
+            let mut buf = device
+                .alloc_buffer(data.len() * 4, DType::F32, vec![data.len()])
+                .expect("alloc src");
+            buf.as_mut_slice::<f32>()
+                .expect("src slice")
+                .copy_from_slice(data);
+            buf
+        };
+
+        // ── Step 1: append 3 ──
+        let (k1, v1) = mk_input(3, 10.0);
+        cache_cpu.layers[layer_idx]
+            .append_seq_major_kv(&k1, &v1, 3, h, d)
+            .expect("CPU step 1 append");
+        let src_k1 = mk_gpu(&k1);
+        let src_v1 = mk_gpu(&v1);
+        let mut enc = device.command_encoder().expect("enc step 1");
+        cache_gpu.layers[layer_idx]
+            .append_seq_major_kv_gpu(&mut enc, &mut registry, device.metal_device(), &src_k1, &src_v1, 3, h, d)
+            .expect("GPU step 1 append");
+        enc.commit_and_wait().expect("commit step 1");
+        assert_eq!(cache_cpu.layers[layer_idx].seq_len, 3);
+        assert_eq!(cache_gpu.layers[layer_idx].seq_len, 3);
+
+        // ── Step 2: append 2 ──
+        let (k2, v2) = mk_input(2, 20.0);
+        cache_cpu.layers[layer_idx]
+            .append_seq_major_kv(&k2, &v2, 2, h, d)
+            .expect("CPU step 2 append");
+        let src_k2 = mk_gpu(&k2);
+        let src_v2 = mk_gpu(&v2);
+        let mut enc = device.command_encoder().expect("enc step 2");
+        cache_gpu.layers[layer_idx]
+            .append_seq_major_kv_gpu(&mut enc, &mut registry, device.metal_device(), &src_k2, &src_v2, 2, h, d)
+            .expect("GPU step 2 append");
+        enc.commit_and_wait().expect("commit step 2");
+        assert_eq!(cache_cpu.layers[layer_idx].seq_len, 5);
+        assert_eq!(cache_gpu.layers[layer_idx].seq_len, 5);
+
+        // ── Step 3: rollback 1 ──
+        cache_cpu.layers[layer_idx].rollback(1);
+        cache_gpu.layers[layer_idx].rollback(1);
+        assert_eq!(cache_cpu.layers[layer_idx].seq_len, 4);
+        assert_eq!(cache_gpu.layers[layer_idx].seq_len, 4);
+
+        // ── Step 4: append 1 (writes at position 4 = where the
+        //           rolled-back position used to be) ──
+        let (k3, v3) = mk_input(1, 30.0);
+        cache_cpu.layers[layer_idx]
+            .append_seq_major_kv(&k3, &v3, 1, h, d)
+            .expect("CPU step 4 append");
+        let src_k3 = mk_gpu(&k3);
+        let src_v3 = mk_gpu(&v3);
+        let mut enc = device.command_encoder().expect("enc step 4");
+        cache_gpu.layers[layer_idx]
+            .append_seq_major_kv_gpu(&mut enc, &mut registry, device.metal_device(), &src_k3, &src_v3, 1, h, d)
+            .expect("GPU step 4 append");
+        enc.commit_and_wait().expect("commit step 4");
+        assert_eq!(cache_cpu.layers[layer_idx].seq_len, 5);
+        assert_eq!(cache_gpu.layers[layer_idx].seq_len, 5);
+
+        // ── Step 5: slack-write 2 (does NOT advance seq_len) ──
+        let (ks, vs) = mk_input(2, 40.0);
+        cache_cpu.layers[layer_idx]
+            .write_slack_kv(&ks, &vs, 2, h, d)
+            .expect("CPU step 5 slack");
+        let src_ks = mk_gpu(&ks);
+        let src_vs = mk_gpu(&vs);
+        let mut enc = device.command_encoder().expect("enc step 5");
+        cache_gpu.layers[layer_idx]
+            .write_slack_kv_gpu(&mut enc, &mut registry, device.metal_device(), &src_ks, &src_vs, 2, h, d)
+            .expect("GPU step 5 slack");
+        enc.commit_and_wait().expect("commit step 5");
+        // Slack does NOT advance.
+        assert_eq!(cache_cpu.layers[layer_idx].seq_len, 5);
+        assert_eq!(cache_gpu.layers[layer_idx].seq_len, 5);
+
+        // ── Compare written regions ──
+        // Positions [0..5) hold append data (steps 1+2 then partially
+        // overwritten by step 4 at position 4 after rollback). Slack
+        // positions [5..7) hold step 5 data. Compare both ranges.
+        let cap = cache_cpu.layers[layer_idx].capacity as usize;
+        let k_cpu = cache_cpu.layers[layer_idx].keys.as_slice::<f32>().expect("k_cpu");
+        let k_gpu = cache_gpu.layers[layer_idx].keys.as_slice::<f32>().expect("k_gpu");
+        let v_cpu = cache_cpu.layers[layer_idx].values.as_slice::<f32>().expect("v_cpu");
+        let v_gpu = cache_gpu.layers[layer_idx].values.as_slice::<f32>().expect("v_gpu");
+        // Compare positions [0..7) — appends [0..5) + slack [5..7).
+        for head in 0..n_h {
+            for t in 0..7usize {
+                let off = (head * cap + t) * dim;
+                assert_eq!(
+                    &k_cpu[off..off + dim],
+                    &k_gpu[off..off + dim],
+                    "K parity mismatch at head={head} t={t}",
+                );
+                assert_eq!(
+                    &v_cpu[off..off + dim],
+                    &v_gpu[off..off + dim],
+                    "V parity mismatch at head={head} t={t}",
+                );
+            }
+        }
+        eprintln!(
+            "task #95 codex follow-up parity OK: append 3→5, rollback 1, append 1, slack 2 \
+             (seq_len cursor = 5 in both, written region [0..7) byte-identical)",
+        );
+    }
+
     #[test]
     fn would_overflow_full_attn_logic() {
         // Synthetic full-attention cache; can't actually alloc without
