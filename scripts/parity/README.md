@@ -25,10 +25,10 @@ hf2q forward path with byte-identical inputs, compare max-abs-diff.
 
 ## Tests
 
-- `tests/parity/mtp_python_ref.rs` — loads the `.npy` dumps + runs
+- `tests/parity_mtp_python_ref.rs` — loads the `.npy` dumps + runs
   `MtpWeights::forward_draft` on the SAME (token, hidden_state) inputs;
   asserts max-abs-diff < threshold for each intermediate.
-- `tests/parity/dflash_python_ref.rs` — same shape for DFlash.
+- `tests/parity_dflash_python_ref.rs` — same shape for DFlash.
 
 ## Threshold
 
@@ -42,8 +42,8 @@ Per ADR-034 §6 G2 (numerical-parity committed-ε ladder):
 - 🟡 Scaffold created
 - ⚪ `mtp_parity.py` — not yet implemented (blocked on Qwen 3.6 MTP-bearing safetensors download)
 - ⚪ `dflash_parity.py` — not yet implemented (blocked on /opt/dflash z-lab drafter checkpoint download)
-- ⚪ `tests/parity/mtp_python_ref.rs` — not yet implemented
-- ⚪ `tests/parity/dflash_python_ref.rs` — not yet implemented
+- ⚪ `tests/parity_mtp_python_ref.rs` — not yet implemented
+- ⚪ `tests/parity_dflash_python_ref.rs` — not yet implemented
 
 ## Notes from prep deep-research
 
