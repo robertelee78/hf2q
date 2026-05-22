@@ -189,11 +189,28 @@ impl Eagle3DrafterConfig {
             "num_aux_hidden_states must be <= 64 (matches Eagle3HiddenCollector)"
         );
         ensure!(self.rms_norm_eps > 0.0, "rms_norm_eps must be > 0");
-        ensure!(self.rope_theta > 0.0, "rope_theta must be > 0");
-        ensure!(self.rope_dim > 0, "rope_dim must be > 0");
+        // Codex /cfa E4b.5b Minor (2026-05-22): finite-check on rope_theta
+        // (rejects +inf/NaN that would later fail in rope_multi).
         ensure!(
-            self.rope_dim <= self.head_dim,
-            "rope_dim ({}) must be <= head_dim ({})",
+            self.rope_theta.is_finite() && self.rope_theta > 0.0,
+            "rope_theta ({}) must be finite and > 0",
+            self.rope_theta
+        );
+        ensure!(self.rope_dim > 0, "rope_dim must be > 0");
+        // Codex /cfa E4b.5b Minor: kernel requires head_dim even
+        // (NeoX pairing depends on head_dim/2).
+        ensure!(
+            self.head_dim % 2 == 0,
+            "head_dim ({}) must be even (NeoX RoPE pairing requires head_dim/2)",
+            self.head_dim
+        );
+        // Codex /cfa E4b.5b Major (2026-05-22): kernel pairs NeoX dims
+        // as (p, p + head_dim/2) — partial rotation `rope_dim < head_dim`
+        // would rotate the wrong second-half coordinates. Require full
+        // rotation until a partial-NeoX kernel ships.
+        ensure!(
+            self.rope_dim == self.head_dim,
+            "rope_dim ({}) must equal head_dim ({}) — partial rotation not supported by apply_imrope NeoX pairing",
             self.rope_dim,
             self.head_dim
         );

@@ -1021,18 +1021,43 @@ fn build_eagle3_pos_buf(
     let slice = buf
         .as_mut_slice::<i32>()
         .map_err(|e| anyhow!("eagle3 rope pos_buf slice: {e}"))?;
+    // Codex /cfa E4b.5b Major (2026-05-22): reject positions above
+    // i32::MAX instead of silently saturating (saturation produces
+    // wrong RoPE angles).
     let pos_values: Vec<i32> = if let Some(p) = positions_override {
-        // Tree positions: pre-computed by caller using tree depths.
-        p.iter()
-            .map(|&v| {
-                i32::try_from(v).unwrap_or(i32::MAX) // saturate on overflow
-            })
-            .collect()
+        let mut out = Vec::with_capacity(p.len());
+        for (i, &v) in p.iter().enumerate() {
+            let iv = i32::try_from(v).map_err(|_| {
+                anyhow!(
+                    "build_eagle3_pos_buf: positions_override[{}] = {} exceeds i32::MAX (kernel uses signed i32 positions)",
+                    i,
+                    v
+                )
+            })?;
+            out.push(iv);
+        }
+        out
     } else {
-        // Linear chain: base_pos + i for i in 0..seq_len.
-        (0..l)
-            .map(|i| (base_pos as i64 + i as i64).min(i32::MAX as i64) as i32)
-            .collect()
+        let mut out = Vec::with_capacity(l);
+        for i in 0..l {
+            let v = (base_pos as i64).checked_add(i as i64).ok_or_else(|| {
+                anyhow!(
+                    "build_eagle3_pos_buf: base_pos ({}) + {} overflows i64",
+                    base_pos,
+                    i
+                )
+            })?;
+            if v > (i32::MAX as i64) {
+                return Err(anyhow!(
+                    "build_eagle3_pos_buf: linear position {} (base_pos {} + offset {}) exceeds i32::MAX",
+                    v,
+                    base_pos,
+                    i
+                ));
+            }
+            out.push(v as i32);
+        }
+        out
     };
     for axis in 0..4 {
         let dst = &mut slice[axis * l..(axis + 1) * l];
@@ -2577,6 +2602,39 @@ mod tests {
         assert!(
             err.to_string().contains("positions_override len"),
             "expected positions-len error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b5b_gate_rope_rejects_position_above_i32_max_2026_05_22() {
+        // Codex /cfa E4b.5b Major fix (2026-05-22): positions above
+        // i32::MAX must be rejected, not silently saturated.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let seq_len = 2_u32;
+        let num_heads = cfg.num_q_heads as u32;
+        let total = (seq_len as usize) * (num_heads as usize) * cfg.head_dim;
+        let input = upload_f32_to_gpu(
+            &device,
+            &vec![0.0f32; total],
+            vec![seq_len as usize * num_heads as usize, cfg.head_dim],
+        );
+        // u32 value above i32::MAX
+        let bad_positions = vec![0u32, (i32::MAX as u32) + 1];
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_rope(
+            &mut enc, &mut registry, &device,
+            &input, &cfg, seq_len, num_heads,
+            Some(&bad_positions), 0, "rope_overflow",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds i32::MAX"),
+            "expected i32::MAX rejection, got: {err}"
         );
     }
 
