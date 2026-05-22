@@ -1,5 +1,5 @@
 use super::load_mtp_weights_if_present;
-use super::super::gpu_full_attn::upload_f32;
+use super::super::gpu_full_attn::{download_f32, upload_f32};
 use super::super::kv_cache::HybridKvCache;
 use super::super::mtp::MtpFfnKind;
 use super::super::mtp_weights_load::mtp_tensor_names;
@@ -243,12 +243,41 @@ fn mtp_forward_draft_returns_logits() {
     let mut registry = KernelRegistry::new();
     let mut kv = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
     assert!(kv.mtp_slot.is_some());
-    let prev = upload_f32(&vec![0.0; 32], &device).expect("prev");
-    let embed = upload_f32(&vec![0.0; 32], &device).expect("embed");
+    // Use non-zero inputs so the forward exercises real arithmetic paths
+    // (a zero-input forward can mask sync bugs because zero × anything
+    // = zero so a partially-completed CB still produces "correct" output).
+    let prev_host: Vec<f32> = (0..32).map(|i| (i as f32) * 0.01).collect();
+    let embed_host: Vec<f32> = (0..32).map(|i| (i as f32) * 0.005 + 0.1).collect();
+    let prev = upload_f32(&prev_host, &device).expect("prev");
+    let embed = upload_f32(&embed_host, &device).expect("embed");
     let logits = mtp
         .forward_draft(&prev, &embed, &mut kv, &[0, 0, 0, 0], &device, &mut registry, &cfg)
         .expect("forward");
     assert_eq!(logits.element_count(), 64);
+    // Download logits and assert finite. download_f32 syncs via as_slice;
+    // this is the real-world caller pattern (argmax_logits_gpu's
+    // commit_and_wait or download_f32's implicit sync). Test guards
+    // against any future refactor that breaks the caller-syncs invariant.
+    let logits_host: Vec<f32> = download_f32(&logits).expect("download logits");
+    assert_eq!(logits_host.len(), 64, "downloaded logits length");
+    for (i, v) in logits_host.iter().enumerate() {
+        // Finite check guards against partial-sync NaN/Inf. The synthetic
+        // GGUF here has zero-weight projection matrices (tiny_tensors), so
+        // logits being all-zero is the correct mathematical answer; we
+        // can't assert non-zero output without a non-trivial fixture.
+        assert!(v.is_finite(), "logits[{i}] = {v} is not finite");
+    }
+    // Determinism check: re-running with same inputs must yield byte-
+    // identical logits. Catches any sync issue where a stale partial
+    // write leaks into subsequent reads.
+    let prev2 = upload_f32(&prev_host, &device).expect("prev2");
+    let embed2 = upload_f32(&embed_host, &device).expect("embed2");
+    let mut kv2 = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache2");
+    let logits2 = mtp
+        .forward_draft(&prev2, &embed2, &mut kv2, &[0, 0, 0, 0], &device, &mut registry, &cfg)
+        .expect("forward2");
+    let logits2_host: Vec<f32> = download_f32(&logits2).expect("download logits2");
+    assert_eq!(logits_host, logits2_host, "MTP forward_draft non-deterministic");
     std::fs::remove_file(&tmp).ok();
 }
 

@@ -572,7 +572,18 @@ impl MtpWeights {
             self.vocab_size,
         )
         .context("MTP shared head projection")?;
-        enc.commit_and_wait().context("MTP commit logits")?;
+        // ADR-034 task #96 (2026-05-22) — `commit_labeled` (no CPU wait).
+        // Every production caller of `forward_shared_head` syncs
+        // downstream: argmax_logits_gpu (spec_decode.rs:1445 commit_and_wait)
+        // for greedy, or download_f32 (.as_slice) for MH. Metal serial
+        // queue ordering guarantees this CB completes before the next
+        // encoder's commit. Saves the CPU wait latency.
+        //
+        // Same lever pattern as task #95 sub-iter H proved safe for the
+        // DFlash drafter forward (codex /cfa cleared cumulative work
+        // 2026-05-22). For K=N MTP the savings scale linearly with
+        // spec_k (one CPU wait eliminated per chained draft step).
+        enc.commit_labeled("mtp.forward_shared_head");
         Ok(logits)
     }
 }
