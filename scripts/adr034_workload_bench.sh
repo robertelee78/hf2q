@@ -192,6 +192,7 @@ echo "    EXTENDED (SYNTHETIC):  2K (~2012 tok): Base 21.1, MTP 24.0 @ 61.5% = 1
 echo "    NATURAL ~400 tok (real code+question, 3-rep at HEAD 81698cb5): Base 20.93, MTP 28.57 @ 85.3% = 1.36x ✓ (matches production claim)"
 echo "    NATURAL 1K+ tok (real Rust source as context, 1-rep at HEAD 0abca852): 1K (~1572): Base 21.3, MTP 19.7 @ 33.3% = 0.92x REGRESSES | 2K (~2652): Base 20.6, MTP 19.4 @ 34.0% = 0.94x REGRESSES | 4K (~4970): Base 14.7, MTP 12.8 @ 50.0% = 0.87x REGRESSES"
 echo "    REFINED conclusion: regression is REAL on natural prompts too, just at different threshold (synth degrades at 2K, natural degrades at 1K). Production recommendation NOW BOUNDED to short natural prompts (~≤500 tok)."
+echo "    ROOT CAUSE (HF2Q_MTP_PROFILE=1 at HEAD cda4b6cc): short ~24 tok prompt: mtp=4.08ms ver=60.30ms ITER=64.40ms accept=82.4%; long ~2.6K natural: mtp=4.13 ver=64.50 (+7%) ITER=68.71 (+6.7%) accept=60.0% (-22pp). Per-round verifier cost grows ONLY +7%; throughput drop is DOMINATED by accept-rate collapse. Fix needs drafter quality (training or tree decoding), NOT task #89 batched-prefill kernel unification."
 echo
 echo "Production recommendation:"
 echo "  Code-gen / deterministic: HF2Q_SPEC_DECODE=1 --temperature 0     (1.36x base, MTP K=1 greedy wins)"
