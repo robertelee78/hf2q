@@ -741,6 +741,215 @@ pub fn dispatch_eagle3_v_proj(
     )
 }
 
+// ----------------------------------------------------------------
+// Phase E4b.5a — Q/K per-head RMSNorm (Qwen-style)
+// ----------------------------------------------------------------
+//
+// Per-head normalization: input `[seq, num_heads, head_dim]` flat
+// gets RMSNorm applied along the `head_dim` axis using the F32
+// `q_norm.weight` / `k_norm.weight` of shape `[head_dim]`.
+//
+// The flat input layout `[seq * num_heads * head_dim]` lets us
+// dispatch `dispatch_rms_norm` with rows = seq * num_heads,
+// dim = head_dim (same trick as
+// `dflash::forward::dispatch_dflash_head_norm`).
+//
+// Gated by `cfg.use_qk_norm` (Qwen-3 style). Llama-style targets
+// have this off and the dispatch is skipped at the orchestrator.
+
+/// Internal helper for both Q and K head-norms. Returns a freshly
+/// allocated F32 output of the same shape as `proj`.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_eagle3_head_norm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    proj: &MlxBuffer,
+    norm_weight: &MlxBuffer,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+    num_heads: u32,
+    label: &str,
+) -> Result<MlxBuffer> {
+    if proj.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "dispatch_eagle3_head_norm ({}): proj dtype must be F32, got {:?}",
+            label,
+            proj.dtype()
+        ));
+    }
+    if norm_weight.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "dispatch_eagle3_head_norm ({}): norm weight dtype must be F32 (BF16→F32 at upload), got {:?}",
+            label,
+            norm_weight.dtype()
+        ));
+    }
+    if seq_len == 0 || num_heads == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_head_norm ({}): seq_len ({}) and num_heads ({}) must both be > 0",
+            label, seq_len, num_heads
+        ));
+    }
+    let head_dim_usize = cfg.head_dim;
+    if head_dim_usize == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_head_norm ({}): head_dim must be > 0",
+            label
+        ));
+    }
+    let head_dim: u32 = u32::try_from(head_dim_usize).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_head_norm ({}): head_dim ({}) exceeds u32::MAX",
+            label,
+            head_dim_usize
+        )
+    })?;
+    if head_dim > RMS_NORM_DIM_F32_EXACT_MAX {
+        return Err(anyhow!(
+            "dispatch_eagle3_head_norm ({}): head_dim ({}) exceeds 2^24 — params[1] would lose F32 precision",
+            label,
+            head_dim
+        ));
+    }
+    if norm_weight.element_count() != head_dim_usize {
+        return Err(anyhow!(
+            "dispatch_eagle3_head_norm ({}): weight has {} elements, expected head_dim {}",
+            label,
+            norm_weight.element_count(),
+            head_dim
+        ));
+    }
+    // rows = seq * num_heads. checked + bounded by u32::MAX for the
+    // kernel's grid (mirrors E4b.4 output-product bound).
+    let rows_usize = (seq_len as usize)
+        .checked_mul(num_heads as usize)
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_head_norm ({}): seq_len ({}) * num_heads ({}) overflows usize",
+                label, seq_len, num_heads
+            )
+        })?;
+    if rows_usize > (u32::MAX as usize) {
+        return Err(anyhow!(
+            "dispatch_eagle3_head_norm ({}): rows ({}) exceeds u32::MAX",
+            label,
+            rows_usize
+        ));
+    }
+    let rows: u32 = rows_usize as u32;
+    // expected element count for proj = rows * head_dim
+    let expected_elems = rows_usize
+        .checked_mul(head_dim_usize)
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_head_norm ({}): rows ({}) * head_dim ({}) overflows usize",
+                label, rows_usize, head_dim_usize
+            )
+        })?;
+    if proj.element_count() != expected_elems {
+        return Err(anyhow!(
+            "dispatch_eagle3_head_norm ({}): proj has {} elements, expected {} (rows={} * head_dim={})",
+            label, proj.element_count(), expected_elems, rows, head_dim
+        ));
+    }
+    let out_bytes = expected_elems
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_head_norm ({}): expected_elems ({}) * 4 overflows usize",
+                label, expected_elems
+            )
+        })?;
+    let out = device
+        .alloc_buffer(
+            out_bytes,
+            DType::F32,
+            vec![seq_len as usize, num_heads as usize, head_dim_usize],
+        )
+        .map_err(|e| anyhow!("alloc {label} output: {e}"))?;
+    let params = alloc_rms_norm_params_eagle3(device, cfg.rms_norm_eps, head_dim)?;
+    dispatch_rms_norm(
+        encoder,
+        registry,
+        device.metal_device(),
+        proj,
+        norm_weight,
+        &out,
+        &params,
+        rows,
+        head_dim,
+    )
+    .with_context(|| format!("dispatch_rms_norm {label}"))?;
+    Ok(out)
+}
+
+/// Per-head RMSNorm on the Q projection output.
+///
+/// Input: `[seq, num_q_heads * head_dim]` F32 (q_proj output).
+/// Output: `[seq, num_q_heads, head_dim]` F32 normalized.
+/// Returns an error if `cfg.use_qk_norm = false` (the orchestrator
+/// must check the gate; calling this in non-QK-norm mode is a bug).
+pub fn dispatch_eagle3_q_head_norm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    q_proj_out: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    let q_norm = tensors.q_norm.as_ref().ok_or_else(|| {
+        anyhow!(
+            "dispatch_eagle3_q_head_norm: q_norm absent (use_qk_norm = {})",
+            cfg.use_qk_norm
+        )
+    })?;
+    let num_q_heads: u32 = u32::try_from(cfg.num_q_heads).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_q_head_norm: num_q_heads ({}) exceeds u32::MAX",
+            cfg.num_q_heads
+        )
+    })?;
+    dispatch_eagle3_head_norm(
+        encoder, registry, device,
+        q_proj_out, q_norm, cfg, seq_len, num_q_heads,
+        "q_norm",
+    )
+}
+
+/// Per-head RMSNorm on the K projection output.
+///
+/// Input: `[seq, num_kv_heads * head_dim]` F32 (k_proj output).
+/// Output: `[seq, num_kv_heads, head_dim]` F32 normalized.
+pub fn dispatch_eagle3_k_head_norm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    k_proj_out: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    let k_norm = tensors.k_norm.as_ref().ok_or_else(|| {
+        anyhow!(
+            "dispatch_eagle3_k_head_norm: k_norm absent (use_qk_norm = {})",
+            cfg.use_qk_norm
+        )
+    })?;
+    let num_kv_heads: u32 = u32::try_from(cfg.num_kv_heads).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_k_head_norm: num_kv_heads ({}) exceeds u32::MAX",
+            cfg.num_kv_heads
+        )
+    })?;
+    dispatch_eagle3_head_norm(
+        encoder, registry, device,
+        k_proj_out, k_norm, cfg, seq_len, num_kv_heads,
+        "k_norm",
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -1707,6 +1916,212 @@ mod tests {
             err.to_string().contains("seq_len must be > 0"),
             "got: {err}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E4b.5a tests — Q/K per-head norm
+    // ----------------------------------------------------------------
+
+    fn cfg_qk_norm_tiny() -> Eagle3DrafterConfig {
+        let mut c = tiny_cfg();
+        c.use_qk_norm = true;
+        c
+    }
+
+    #[test]
+    fn adr_037_e4b5a_q_head_norm_cpu_parity_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = cfg_qk_norm_tiny();
+        let seq_len: u32 = 4;
+        let n_heads = cfg.num_q_heads;
+        let head_dim = cfg.head_dim;
+        let total_elems = (seq_len as usize) * n_heads * head_dim;
+
+        // Random F32 input (treated as flat [seq*n_heads, head_dim]).
+        let mut proj_data = vec![0.0f32; total_elems];
+        fill_random(&mut proj_data, 0xA51);
+        // Random F32 q_norm weight, BF16-truncated for upload.
+        let mut weight_f32 = vec![0.0f32; head_dim];
+        fill_random(&mut weight_f32, 0xA52);
+
+        // CPU reference per row (seq * head): RMSNorm over head_dim.
+        let weight_bf16_q: Vec<f32> =
+            weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let cpu_out = cpu_rms_norm_f32(
+            &proj_data,
+            &weight_bf16_q,
+            (seq_len as usize) * n_heads, // rows
+            head_dim,
+            cfg.rms_norm_eps,
+        );
+
+        // GPU: build synthetic blob with custom q_norm weight,
+        // upload, dispatch.
+        let manifest = expected_manifest(&cfg);
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "layers.0.self_attn.q_norm.weight".to_string(),
+            f32_to_bf16_bytes(&weight_f32),
+        );
+        let blob = build_blob_with_overrides(&manifest, &overrides);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let proj_gpu = upload_f32_to_gpu(
+            &device,
+            &proj_data,
+            vec![seq_len as usize, n_heads * head_dim],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_q_head_norm(
+            &mut enc, &mut registry, &device, &proj_gpu, &tensors, &cfg, seq_len,
+        )
+        .expect("q_head_norm");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            assert!(d < 1e-3, "q_head_norm parity: diff={d} > 1e-3");
+        }
+        eprintln!("q_head_norm parity max_diff={max_diff:.6e}");
+    }
+
+    #[test]
+    fn adr_037_e4b5a_k_head_norm_cpu_parity_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = cfg_qk_norm_tiny();
+        let seq_len: u32 = 4;
+        let n_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let total_elems = (seq_len as usize) * n_heads * head_dim;
+
+        let mut proj_data = vec![0.0f32; total_elems];
+        fill_random(&mut proj_data, 0xA61);
+        let mut weight_f32 = vec![0.0f32; head_dim];
+        fill_random(&mut weight_f32, 0xA62);
+
+        let weight_bf16_q: Vec<f32> =
+            weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let cpu_out = cpu_rms_norm_f32(
+            &proj_data,
+            &weight_bf16_q,
+            (seq_len as usize) * n_heads,
+            head_dim,
+            cfg.rms_norm_eps,
+        );
+
+        let manifest = expected_manifest(&cfg);
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "layers.0.self_attn.k_norm.weight".to_string(),
+            f32_to_bf16_bytes(&weight_f32),
+        );
+        let blob = build_blob_with_overrides(&manifest, &overrides);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let proj_gpu = upload_f32_to_gpu(
+            &device,
+            &proj_data,
+            vec![seq_len as usize, n_heads * head_dim],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_k_head_norm(
+            &mut enc, &mut registry, &device, &proj_gpu, &tensors, &cfg, seq_len,
+        )
+        .expect("k_head_norm");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            assert!(d < 1e-3, "k_head_norm parity: diff={d} > 1e-3");
+        }
+        eprintln!("k_head_norm parity max_diff={max_diff:.6e}");
+    }
+
+    #[test]
+    fn adr_037_e4b5a_q_head_norm_errors_when_use_qk_norm_false_2026_05_22() {
+        // Calling q_head_norm when cfg.use_qk_norm=false should
+        // fail-fast: q_norm tensor is None.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg(); // use_qk_norm = false
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let seq_len = 2_u32;
+        let n = (seq_len as usize) * cfg.num_q_heads * cfg.head_dim;
+        let proj_data = vec![0.0f32; n];
+        let proj_gpu = upload_f32_to_gpu(
+            &device, &proj_data,
+            vec![seq_len as usize, cfg.num_q_heads * cfg.head_dim],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_q_head_norm(
+            &mut enc, &mut registry, &device, &proj_gpu, &tensors, &cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("q_norm absent"),
+            "expected absent-tensor error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b5a_gate_q_head_norm_rejects_non_f32_input_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = cfg_qk_norm_tiny();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let seq_len = 2_u32;
+        let n = (seq_len as usize) * cfg.num_q_heads * cfg.head_dim;
+        let bad = device
+            .alloc_buffer(
+                n * 2,
+                DType::BF16,
+                vec![seq_len as usize, cfg.num_q_heads * cfg.head_dim],
+            )
+            .expect("alloc bad");
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_q_head_norm(
+            &mut enc, &mut registry, &device, &bad, &tensors, &cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("dtype must be F32"), "got: {err}");
     }
 
     #[test]
