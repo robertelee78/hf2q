@@ -31,4 +31,5 @@ pub mod config;
 pub mod drafter;
 pub mod dynamic_tree;
 pub mod multi_layer_hidden;
+pub mod tensors;
 pub mod weights;
