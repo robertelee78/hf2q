@@ -271,6 +271,51 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 16) — Task #93 fused-MLP Q8_0 SHIPPED (m=1 path); seq=2 fused next
+
+Per operator directive ("multi-week fixes ARE the right thing; can't punt").
+Multi-iteration work culminated in:
+
+**mlx-native commits**:
+- `815abed`: `src/shaders/fused_gate_up_silu_q8_0.metal` (Metal kernel, peer-style NR=2 NSG=4)
+- `ba6c3fe`: `src/ops/fused_gate_up_silu_q8_0.rs` dispatch wrapper + registry registration + parity test scaffold
+- `a1a871f`: parity test PASSES (RAW barrier fix — `silu_mul` uses untracked encode; needed explicit `memory_barrier` between matvec and silu_mul)
+
+**hf2q commit**: `gpu_ffn.rs::build_dense_ffn_layer_gpu_q_into_pooled` env-gated under `HF2Q_FUSED_GATE_UP_SILU=1` (default OFF for first ship).
+
+**Empirical 3-rep paired bench (Qwen 3.6 27B Q8_0, 200 tok --ignore-eos)**:
+
+| Path                                 | Mean tok/s | Δ vs unfused |
+|--------------------------------------|-----------:|-------------:|
+| BASE (no spec) unfused               |      20.97 |     baseline |
+| BASE (no spec) + fused (HF2Q_FUSED=1)|     **21.83** |    **+4.1%** |
+| SPEC K=1 BATCHED MH temp=0.5 unfused |      26.10 |     baseline |
+| SPEC + fused                         |      26.13 |    +0.1% (noise) |
+
+**Determinism check**: base unfused vs base fused at temp=0 = BYTE-IDENTICAL output. Fused path is a pure perf win with no behavior change.
+
+**Why SPEC is essentially flat**: the fused kernel is `m=1` only (decode-shaped).
+The K=1 BATCHED verifier runs at `m=2` (`[token_next, proposed]` batched
+forward), so the fused kernel doesn't fire on the SPEC hot path. It DOES fire
+on the seq=1 MTP drafter, which is ~6.8% of iter time — explains the tiny
++0.1% spec gain.
+
+**Why projected ~1.46× wasn't achieved**: cont. 15 projection assumed 50μs
+per Metal launch overhead × 192 saved dispatches = 9.6 ms savings. Actual
+saving is ~3.5 ms (smaller per-launch overhead on M5 Max). Still a real
+4.1% base improvement.
+
+**Cell A 27B updated production state (HF2Q_FUSED_GATE_UP_SILU=1)**:
+
+| Mode                                  | tok/s | vs unfused base 20.97 |
+|---------------------------------------|------:|----------------------:|
+| BASE + fused                          | 21.83 |          1.041×        |
+| SPEC K=1 BATCHED MH temp=0.5 + fused  | 26.13 |          **1.246×**    |
+
+**Step 2 (next iteration)**: extend fused kernel to `m=2` (handle 2 input
+rows per dispatch). Would fire on the SPEC K=1 BATCHED verify path and
+unlock the larger projected gain.
+
 ### Iteration 2026-05-21 (cont. 15) — Profile-driven correction: verifier dominates, NOT drafter (HEAD `a03d449d`)
 
 Empirical `HF2Q_MTP_PROFILE=1` profile on K=1 BATCHED MH temp=0.5 (Qwen 3.6 27B

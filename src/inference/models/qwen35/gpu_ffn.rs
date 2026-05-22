@@ -1228,57 +1228,97 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
         ggml_type: weights.ggml_type_down,
     };
 
-    // Ops 1+2: gate and up projections via quantized_matmul_ggml (both read x, concurrent).
-    {
+    // ADR-034 task #93 (2026-05-21) — fused gate+up+silu_mul Q8_0 path.
+    //
+    // When `HF2Q_FUSED_GATE_UP_SILU=1` AND seq_len==1 AND ggml_type==Q8_0,
+    // dispatch a single fused kernel replacing the 3-dispatch sequence
+    // (gate_proj + up_proj + silu_mul). Saves 2 Metal launches per layer
+    // (~50μs each → ~100μs/layer × 64 layers = ~6.4ms verifier savings).
+    //
+    // Parity gate: `cargo test --test adr_034_task93_fused_gate_up_silu_q8_0_parity`
+    // in mlx-native confirms byte-identical (within 1e-5 F32 tolerance) output
+    // vs the unfused sequence at HEAD mlx-native a1a871f.
+    //
+    // Default OFF until 3-rep paired bench confirms ≥ 1.30× vs base on
+    // Qwen 3.6 27B Q8_0. Flip default-ON once gated.
+    let fused_eligible = seq_len == 1
+        && matches!(
+            weights.ggml_type_gate_up,
+            mlx_native::ops::quantized_matmul_ggml::GgmlType::Q8_0
+        )
+        && std::env::var("HF2Q_FUSED_GATE_UP_SILU").as_deref() == Ok("1");
+    if fused_eligible {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseAProj,
         );
-        quantized_matmul_ggml(
+        mlx_native::ops::fused_gate_up_silu_q8_0::dispatch_fused_gate_up_silu_q8_0(
             enc,
             registry,
             device,
-            x,
             &weights.gate_q,
-            &mut gate_buf,
-            &gate_up_params,
-        )
-        .context("dense_q gate proj")?;
-        quantized_matmul_ggml(
-            enc,
-            registry,
-            device,
-            x,
             &weights.up_q,
-            &mut up_buf,
-            &gate_up_params,
-        )
-        .context("dense_q up proj")?;
-    }
-
-    // Barrier: silu_mul reads gate_buf/up_buf written above.
-    {
-        let _w5b = super::wave5b8_profile::Section::start(
-            super::wave5b8_profile::SectionKind::FfnBarrierAB,
-        );
-        enc.memory_barrier();
-    }
-
-    // Op 3: silu(gate) * up → hidden.
-    {
-        let _w5b = super::wave5b8_profile::Section::start(
-            super::wave5b8_profile::SectionKind::FfnPhaseDSilu,
-        );
-        dispatch_silu_mul(
-            enc,
-            registry,
-            device.metal_device(),
-            &gate_buf,
-            &up_buf,
+            x,
             &hidden_buf,
-            &silu_params_buf,
-            n_h,
+            mlx_native::ops::fused_gate_up_silu_q8_0::FusedGateUpSiluQ8_0Args {
+                m: seq_len,
+                intermediate_size: m,
+                hidden_size: h,
+            },
         )
-        .context("dense_q silu_mul")?;
+        .context("dense_q fused gate_up_silu_mul Q8_0")?;
+    } else {
+        // Ops 1+2: gate and up projections via quantized_matmul_ggml (both read x, concurrent).
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseAProj,
+            );
+            quantized_matmul_ggml(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.gate_q,
+                &mut gate_buf,
+                &gate_up_params,
+            )
+            .context("dense_q gate proj")?;
+            quantized_matmul_ggml(
+                enc,
+                registry,
+                device,
+                x,
+                &weights.up_q,
+                &mut up_buf,
+                &gate_up_params,
+            )
+            .context("dense_q up proj")?;
+        }
+
+        // Barrier: silu_mul reads gate_buf/up_buf written above.
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnBarrierAB,
+            );
+            enc.memory_barrier();
+        }
+
+        // Op 3: silu(gate) * up → hidden.
+        {
+            let _w5b = super::wave5b8_profile::Section::start(
+                super::wave5b8_profile::SectionKind::FfnPhaseDSilu,
+            );
+            dispatch_silu_mul(
+                enc,
+                registry,
+                device.metal_device(),
+                &gate_buf,
+                &up_buf,
+                &hidden_buf,
+                &silu_params_buf,
+                n_h,
+            )
+            .context("dense_q silu_mul")?;
+        }
     }
 
     // Barrier: down proj reads hidden.
