@@ -39,6 +39,7 @@ use super::config::Eagle3DrafterConfig;
 use super::drafter::{
     extract_top_k_from_row_logits, DraftCandidate, Drafter, TreeContextView,
 };
+use super::kv_cache::DrafterKvCache;
 use super::tensors::Eagle3DrafterTensors;
 use anyhow::{anyhow, ensure, Result};
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -70,6 +71,26 @@ pub struct GpuDrafter<'a> {
     /// depths[i] for tree-aware decoding; for this iteration's
     /// single-token path we use linear positions starting at base_pos).
     pub base_pos: u32,
+    /// Optional drafter KV cache (Phase E5b Step 3).
+    ///
+    /// When `Some`, `predict_topk` uses the cache-aware forward
+    /// (`dispatch_eagle3_drafter_forward_with_kv_cache`), which
+    /// conditions on the full root-to-node ancestor chain via cached
+    /// K/V — lifting the `path.len() == 1` cap from E4b.10b.3.
+    ///
+    /// **Cache state invariant**: at the start of each `predict_topk`
+    /// call, `cache.len()` must equal `path.len() - 1` where `path`
+    /// is the parent-chain tokens from root to `node_to_expand`. The
+    /// orchestrator maintains this invariant by calling
+    /// [`Self::rollback_cache`] when switching to a different branch
+    /// (e.g. picking a sibling instead of a descendant). After the
+    /// call, `cache.len()` advances by 1 (new node's K/V appended).
+    ///
+    /// When `None`, `predict_topk` falls back to the unbatched
+    /// single-token-decode path with the original `path.len() == 1`
+    /// guard (Phase E4b.10b.3 behavior preserved for backward
+    /// compatibility).
+    pub kv_cache: Option<DrafterKvCache>,
 }
 
 // Manual Debug — MlxBuffer/MlxDevice don't impl Debug consistently
@@ -160,7 +181,66 @@ impl<'a> GpuDrafter<'a> {
             target_aux,
             embed_table,
             base_pos,
+            kv_cache: None,
         })
+    }
+
+    /// Attach a pre-allocated drafter KV cache. Cache shape must
+    /// match `cfg.num_kv_heads` and `cfg.head_dim`.
+    ///
+    /// After this call, `predict_topk` uses the cache-aware forward
+    /// and accepts paths of arbitrary depth (subject to cache
+    /// capacity and the invariant that cache.len() == path.len()-1
+    /// at entry of each `predict_topk` call).
+    pub fn attach_kv_cache(&mut self, cache: DrafterKvCache) -> Result<()> {
+        ensure!(
+            cache.num_kv_heads == self.cfg.num_kv_heads,
+            "GpuDrafter::attach_kv_cache: cache.num_kv_heads ({}) != cfg.num_kv_heads ({})",
+            cache.num_kv_heads,
+            self.cfg.num_kv_heads
+        );
+        ensure!(
+            cache.head_dim == self.cfg.head_dim,
+            "GpuDrafter::attach_kv_cache: cache.head_dim ({}) != cfg.head_dim ({})",
+            cache.head_dim,
+            self.cfg.head_dim
+        );
+        ensure!(
+            cache.len() == 0,
+            "GpuDrafter::attach_kv_cache: cache must be empty at attach (len={})",
+            cache.len()
+        );
+        self.kv_cache = Some(cache);
+        Ok(())
+    }
+
+    /// Reset the attached KV cache to empty (no-op if no cache).
+    /// Called by the orchestrator at the start of each new spec-decode
+    /// step before tree expansion begins.
+    pub fn clear_kv_cache(&mut self) {
+        if let Some(c) = self.kv_cache.as_mut() {
+            c.clear();
+        }
+    }
+
+    /// Rollback the KV cache to keep only the positions in `accepted`
+    /// (in accepted-order). Delegates to
+    /// [`DrafterKvCache::rollback_to_accepted`]. Errors if no cache
+    /// is attached.
+    ///
+    /// The orchestrator calls this after [`crate::inference::spec_decode::eagle3::tree_walk::walk_tree_accept`]
+    /// produces the accepted-node list, to compact the cache for the
+    /// next spec-decode step.
+    pub fn rollback_kv_cache(&mut self, accepted: &[usize]) -> Result<()> {
+        let cache = self.kv_cache.as_mut().ok_or_else(|| {
+            anyhow!("GpuDrafter::rollback_kv_cache: no cache attached")
+        })?;
+        cache.rollback_to_accepted(accepted)
+    }
+
+    /// Returns the current cache length, or 0 if no cache attached.
+    pub fn kv_cache_len(&self) -> usize {
+        self.kv_cache.as_ref().map(|c| c.len()).unwrap_or(0)
     }
 
     /// Look up the embedding for `token` from the CPU embed table.
@@ -207,31 +287,38 @@ impl<'a> Drafter for GpuDrafter<'a> {
             "GpuDrafter::predict_topk: empty path from node_to_expand {}",
             node_to_expand
         );
-        // Codex /cfa E4 final-gate Major 2 re-review (2026-05-22):
-        // single-token decode mode ONLY conditions on the last path
-        // token. predict_topk MUST therefore reject any path with
-        // more than ONE token (i.e. node_to_expand at depth >= 1).
-        //
-        // The previous `path.len() <= 2` guard incorrectly allowed
-        // expanding a depth-1 child to depth-2 grandchildren — the
-        // depth-1 child's drafter conditioning context is "root
-        // token + child token", but we'd only feed the child token,
-        // dropping the root's contribution.
-        //
-        // Only ROOT expansion (path.len() == 1) is semantically
-        // correct under single-token decode. Tree configs must
-        // therefore use max_depth == 1 (root + 1 layer of children)
-        // until Phase E4b.10b.4 / E5 ships drafter KV cache.
-        ensure!(
-            path.len() == 1,
-            "GpuDrafter::predict_topk: path length {} != 1 (only ROOT expansion \
-             supported in single-token decode — limit DynamicTreeConfig.max_depth=1 \
-             until path-conditioned drafter KV cache ships)",
-            path.len()
-        );
-        // Single-token decode: use the LAST path token as the input
-        // embedding. (Multi-token batch decode for KV cache prefill
-        // is Phase E4b.10b.4.)
+        // Phase E5b Step 3 (2026-05-22): when a KV cache is attached,
+        // condition on the full root-to-node ancestor chain via the
+        // cache. Otherwise fall back to the E4b.10b.3 single-token
+        // decode path (root-only, path.len() == 1).
+        let has_cache = self.kv_cache.is_some();
+        if has_cache {
+            // Cache invariant: cache.len() must equal path.len() - 1
+            // at entry. Ancestors [0..path.len()-1) are already in
+            // cache; node_to_expand's K/V will be appended in this
+            // call.
+            let cache_len = self.kv_cache.as_ref().unwrap().len();
+            ensure!(
+                cache_len + 1 == path.len(),
+                "GpuDrafter::predict_topk (cache mode): cache.len()={} but path.len()-1={} \
+                 (orchestrator must rollback/extend cache to match path before predict_topk)",
+                cache_len,
+                path.len() - 1
+            );
+        } else {
+            // Codex /cfa E4 final-gate Major 2 re-review (2026-05-22):
+            // cache-less single-token decode supports root expansion only.
+            ensure!(
+                path.len() == 1,
+                "GpuDrafter::predict_topk (no-cache mode): path length {} != 1 \
+                 (only ROOT expansion supported without KV cache — attach a cache \
+                 via attach_kv_cache to enable depth>1 path conditioning)",
+                path.len()
+            );
+        }
+        // Use the LAST path token as the input embedding (node_to_expand's
+        // token). Cache-aware forward conditions on ancestors via the cache;
+        // cache-less forward sees only this token.
         let last_token = *path.last().unwrap();
         let embed_vec = self.lookup_embedding(last_token)?;
         ensure!(
@@ -254,12 +341,7 @@ impl<'a> Drafter for GpuDrafter<'a> {
             .map_err(|e| anyhow!("GpuDrafter::predict_topk: embed slice: {e}"))?
             .copy_from_slice(&embed_vec);
 
-        // Codex /cfa E4b.10b.3 Major fix (2026-05-22): position is
-        // depth-adjusted via `path.len() - 1` so deeper tree nodes
-        // get different RoPE positions. Prior version passed
-        // `self.base_pos` unchanged for all depths — every node got
-        // the SAME RoPE position which produced identical attention
-        // patterns at every depth.
+        // Depth-adjusted RoPE position.
         let depth_from_root = path.len() - 1; // node_to_expand's depth
         let depth_u32: u32 = u32::try_from(depth_from_root).map_err(|_| {
             anyhow!(
@@ -274,26 +356,31 @@ impl<'a> Drafter for GpuDrafter<'a> {
                 depth_u32
             )
         })?;
-        // Run the full forward chain via the orchestrator helper.
-        // NOTE (codex /cfa E4b.10b.3 Major #1, deferred to E4b.10b.4):
-        // single-token decode here means deeper nodes are NOT
-        // conditioned on the full root-to-node draft prefix or
-        // drafter KV state. The forward sees only the LAST path
-        // token + target_aux + the depth-adjusted RoPE position.
-        // This is correct for the tree's depth-1 children (root
-        // depth + 1 RoPE) but loses ancestor-token conditioning
-        // for depth >= 2. Full path conditioning requires drafter
-        // KV cache management (next iter).
-        let logits_vec = super::forward::dispatch_eagle3_drafter_forward(
-            self.device,
-            self.registry,
-            self.target_aux,
-            &embed_gpu,
-            self.tensors,
-            self.cfg,
-            1, // seq_len = 1 (single-token decode)
-            abs_pos,
-        )?;
+        // Dispatch the appropriate forward variant.
+        let logits_vec = if let Some(cache) = self.kv_cache.as_mut() {
+            super::forward::dispatch_eagle3_drafter_forward_with_kv_cache(
+                self.device,
+                self.registry,
+                self.target_aux,
+                &embed_gpu,
+                self.tensors,
+                self.cfg,
+                1, // seq_len = 1 (single new tree node per call)
+                abs_pos,
+                cache,
+            )?
+        } else {
+            super::forward::dispatch_eagle3_drafter_forward(
+                self.device,
+                self.registry,
+                self.target_aux,
+                &embed_gpu,
+                self.tensors,
+                self.cfg,
+                1, // seq_len = 1
+                abs_pos,
+            )?
+        };
 
         // Extract top-K from logits row.
         let raw_candidates = extract_top_k_from_row_logits(&logits_vec, top_k)?;
@@ -688,6 +775,356 @@ mod tests {
         assert!(
             err.to_string().contains("path length 2 != 1"),
             "got: {err}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E5b Step 3 tests — cache-mode predict_topk lifts max_depth.
+    // ----------------------------------------------------------------
+
+    /// Helper: standard drafter test scaffolding (cfg + tensors +
+    /// target_aux buffer + embed table) shared by Step 3 tests.
+    fn step3_build_drafter_scaffolding(
+        device: &MlxDevice,
+    ) -> Option<(
+        Eagle3DrafterConfig,
+        Eagle3DrafterTensors,
+        MlxBuffer,
+        Vec<f32>,
+    )> {
+        let cfg = cfg_for_drafter_test();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_test_blob(&manifest);
+        let weights = Eagle3Weights::load(&blob, &cfg).ok()?;
+        let tensors = Eagle3DrafterTensors::upload(device, &cfg, &weights).ok()?;
+        let mut target_aux_data = vec![0.0f32; cfg.fc_input_size()];
+        for (i, v) in target_aux_data.iter_mut().enumerate() {
+            *v = pseudo_random(0xA0FFEE + i as u64) * 0.5;
+        }
+        let mut target_aux_buf = device
+            .alloc_buffer(
+                cfg.fc_input_size() * 4,
+                DType::F32,
+                vec![1, cfg.fc_input_size()],
+            )
+            .ok()?;
+        target_aux_buf
+            .as_mut_slice::<f32>()
+            .ok()?
+            .copy_from_slice(&target_aux_data);
+        let mut embed_table = vec![0.0f32; cfg.vocab_size * cfg.hidden_size];
+        for (i, v) in embed_table.iter_mut().enumerate() {
+            *v = pseudo_random(0xB0FFEE + i as u64) * 0.5;
+        }
+        Some((cfg, tensors, target_aux_buf, embed_table))
+    }
+
+    #[test]
+    fn adr_037_e5b_step3_attach_kv_cache_validates_num_kv_heads_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_buf, embed_table) =
+            match step3_build_drafter_scaffolding(&device) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        // Wrong num_kv_heads.
+        let bad_cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads + 1, 4, cfg.head_dim,
+        )
+        .expect("alloc cache");
+        let err = drafter.attach_kv_cache(bad_cache).unwrap_err();
+        assert!(
+            err.to_string().contains("num_kv_heads"),
+            "expected num_kv_heads mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e5b_step3_attach_kv_cache_validates_head_dim_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_buf, embed_table) =
+            match step3_build_drafter_scaffolding(&device) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        let bad_cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 4, cfg.head_dim + 1,
+        )
+        .expect("alloc cache");
+        let err = drafter.attach_kv_cache(bad_cache).unwrap_err();
+        assert!(
+            err.to_string().contains("head_dim"),
+            "expected head_dim mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e5b_step3_attach_kv_cache_rejects_nonempty_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_buf, embed_table) =
+            match step3_build_drafter_scaffolding(&device) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        let mut cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 4, cfg.head_dim,
+        )
+        .expect("alloc cache");
+        // Append one row to make it non-empty.
+        let dummy_row = vec![0.0_f32; cfg.num_kv_heads * cfg.head_dim];
+        cache.append(&dummy_row, &dummy_row).expect("append");
+        let err = drafter.attach_kv_cache(cache).unwrap_err();
+        assert!(
+            err.to_string().contains("must be empty"),
+            "expected non-empty rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e5b_step3_cache_mode_predict_topk_depth_0_works_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_buf, embed_table) =
+            match step3_build_drafter_scaffolding(&device) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        let cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 4, cfg.head_dim,
+        )
+        .expect("alloc cache");
+        drafter.attach_kv_cache(cache).expect("attach");
+        assert_eq!(drafter.kv_cache_len(), 0);
+        // Root expansion.
+        let view = TreeContextView {
+            tokens: &[123_u32],
+            parents: &[None],
+        };
+        let candidates = drafter
+            .predict_topk(view, 0, 3)
+            .expect("predict_topk cache mode depth 0");
+        validate_candidates(&candidates, 3).expect("contract");
+        assert_eq!(candidates.len(), 3);
+        // Cache should now hold root's K/V.
+        assert_eq!(drafter.kv_cache_len(), 1);
+    }
+
+    #[test]
+    fn adr_037_e5b_step3_cache_mode_predict_topk_depth_1_works_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_buf, embed_table) =
+            match step3_build_drafter_scaffolding(&device) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        let cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 4, cfg.head_dim,
+        )
+        .expect("alloc cache");
+        drafter.attach_kv_cache(cache).expect("attach");
+
+        // Step 1: expand root → cache.len() goes 0 → 1.
+        let view_root = TreeContextView {
+            tokens: &[10_u32],
+            parents: &[None],
+        };
+        let root_cands = drafter
+            .predict_topk(view_root, 0, 3)
+            .expect("root expansion");
+        assert_eq!(drafter.kv_cache_len(), 1);
+        // Step 2: expand depth-1 child → cache.len() 1 → 2.
+        let child_token = root_cands[0].token;
+        let view_child = TreeContextView {
+            tokens: &[10_u32, child_token],
+            parents: &[None, Some(0)],
+        };
+        let child_cands = drafter
+            .predict_topk(view_child, 1, 3)
+            .expect("depth-1 expansion (cache mode lifts path.len()==1 cap)");
+        validate_candidates(&child_cands, 3).expect("contract");
+        assert_eq!(drafter.kv_cache_len(), 2);
+    }
+
+    #[test]
+    fn adr_037_e5b_step3_cache_mode_rejects_cache_len_path_mismatch_2026_05_22() {
+        // Cache empty but path has depth-1 node → orchestrator violated
+        // the cache.len() == path.len()-1 invariant. predict_topk
+        // must reject so the orchestrator catches its bookkeeping bug.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_buf, embed_table) =
+            match step3_build_drafter_scaffolding(&device) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        let cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 4, cfg.head_dim,
+        )
+        .expect("alloc cache");
+        drafter.attach_kv_cache(cache).expect("attach");
+        // cache.len()=0 but we're trying to expand a depth-1 node
+        // whose path = [root, child]; need cache.len()=1.
+        let view = TreeContextView {
+            tokens: &[10_u32, 20],
+            parents: &[None, Some(0)],
+        };
+        let err = drafter.predict_topk(view, 1, 3).unwrap_err();
+        assert!(
+            err.to_string().contains("cache.len()=0 but path.len()-1=1"),
+            "expected cache len mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e5b_step3_clear_kv_cache_resets_to_zero_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_buf, embed_table) =
+            match step3_build_drafter_scaffolding(&device) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        let cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 4, cfg.head_dim,
+        )
+        .expect("alloc cache");
+        drafter.attach_kv_cache(cache).expect("attach");
+        // Populate via one predict_topk.
+        let view = TreeContextView {
+            tokens: &[10_u32],
+            parents: &[None],
+        };
+        let _ = drafter.predict_topk(view, 0, 3).expect("predict");
+        assert_eq!(drafter.kv_cache_len(), 1);
+        drafter.clear_kv_cache();
+        assert_eq!(drafter.kv_cache_len(), 0);
+    }
+
+    #[test]
+    fn adr_037_e5b_step3_rollback_kv_cache_delegates_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_buf, embed_table) =
+            match step3_build_drafter_scaffolding(&device) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        let cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 4, cfg.head_dim,
+        )
+        .expect("alloc cache");
+        drafter.attach_kv_cache(cache).expect("attach");
+        // Populate to depth 2 via two predict_topk calls.
+        let view_root = TreeContextView {
+            tokens: &[10_u32],
+            parents: &[None],
+        };
+        let root_cands = drafter
+            .predict_topk(view_root, 0, 3)
+            .expect("root expansion");
+        let child_tok = root_cands[0].token;
+        let view_child = TreeContextView {
+            tokens: &[10_u32, child_tok],
+            parents: &[None, Some(0)],
+        };
+        let _ = drafter
+            .predict_topk(view_child, 1, 3)
+            .expect("child expansion");
+        assert_eq!(drafter.kv_cache_len(), 2);
+        // Rollback to keep only root.
+        drafter.rollback_kv_cache(&[0]).expect("rollback");
+        assert_eq!(drafter.kv_cache_len(), 1);
+    }
+
+    #[test]
+    fn adr_037_e5b_step3_rollback_kv_cache_errs_without_attached_cache_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_buf, embed_table) =
+            match step3_build_drafter_scaffolding(&device) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        let err = drafter.rollback_kv_cache(&[0]).unwrap_err();
+        assert!(
+            err.to_string().contains("no cache attached"),
+            "expected no-cache error, got: {err}"
         );
     }
 
