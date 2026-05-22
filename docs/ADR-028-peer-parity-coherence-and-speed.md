@@ -464,8 +464,20 @@ spec-decode-2026-05-09.md`):
 **Operator decision points** (NO implementation starts until approved):
 1. Approve scope (12-20 hrs engineering across multiple iters)?
 2. Acceptance criteria: minimum decode 88 t/s, stretch ≥ 100 t/s?
-3. Quality gate: temp=0 greedy byte-identical to default decode (vLLM
-   contract preserves this; temp>0 may differ slightly)?
+3. Quality gate (HISTORICAL framing — see CAVEAT below): temp=0 greedy
+   byte-identical to default decode (vLLM contract preserves this;
+   temp>0 may differ slightly)?
+   **EMPIRICAL CORRECTION (HEAD `ebca62c3` 2026-05-22)**: This
+   quality-gate framing was based on the now-falsified assumption
+   that spec-decode is byte-identical to default decode at temp=0.
+   ADR-030 §3.2.1, ADR-034 §START HERE G3 row + §3.5b empirical
+   caveat document the falsification — the spec path's batched-prefill
+   verifier kernel (F16/BF16) differs from F32 `flash_attn_vec`
+   single-token decode; argmax flips on close logits compound across
+   rounds. The valid quality gate is accept-walk consistency with the
+   spec path's own batched-prefill verifier argmax, not byte-identity
+   to default decode. See ADR-034 G3 row at line 1501 + §3.5b at line
+   1654.
 4. Phasing: incremental commits with byte-identity gates at each phase,
    OR build complete + validate at end?
 
@@ -7165,9 +7177,13 @@ D. **KV cache rollback support** (hf2q):
    - `MlxKvCache::counter_visible_len` for ds4-style counter
    - Estimated: 1 week
 
-E. **Coherence + correctness gates**:
+E. **Coherence + correctness gates** (HISTORICAL framing — superseded at HEAD `ebca62c3` 2026-05-22):
    - 5-fixture parity test (greedy decode produces SAME tokens
-     as non-spec greedy)
+     as non-spec greedy) — **FALSIFIED**: spec decode is NOT byte-
+     identical to non-spec greedy on real models (batched verifier
+     kernel ≠ F32 single-token decode). The correct gate is
+     accept-walk-internal consistency. See ADR-030 §3.2 CAVEAT +
+     ADR-034 G3 row at line 1501.
    - Acceptance rate measurement at varied temps
    - Estimated: 1 week
 
@@ -9431,6 +9447,8 @@ metadata coverage or vocab size.
 
 ### iter-267 — name-based EOS resolver shipped, exposes K1 TRAJECTORY DIVERGENCE
 
+> **⚠️ HISTORICAL DIAGNOSTIC ARC (iter-267 through iter-270) — corrected at HEAD `ebca62c3` 2026-05-22**: This iter-267 onwards section bisects a "K1 TRAJECTORY DIVERGENCE" believed to be a code-side bug in the spec-decode logic (e.g., free-token amortization, KV-state mishandling, 2-token batched verifier, MoE batched verify, etc.). The empirical correction at HEAD `ebca62c3` shows the divergence is NOT a code bug — it is the **structural kernel-precision divergence** between the batched K+1 verify kernel (BF16/F16) and the F32 `flash_attn_vec` single-token decode kernel. Argmax flips on close logits compound across rounds, producing different token sequences without any bug in the spec-decode dispatcher. The bisects in iter-268/269/270 correctly observed the divergence but misdiagnosed the root cause; the `verifier.rs:119` byte-identity contract they cite was itself based on the now-falsified misreading of the Leviathan-2023 proof scope. See ADR-030 §3.2 CAVEAT + ADR-034 G3 row at line 1501 + §3.5b at line 1654 for the full framework-level analysis. The diagnostic content below is preserved as historical context — readers should NOT treat the "bug location candidates" as actionable; there is no bug, only kernel precision divergence.
+
 Implemented robust EOS resolver in `Qwen35LoadedModel::load`
 (`engine_qwen35.rs:286-335`):
 
@@ -9470,12 +9488,13 @@ is correct defensive code, but the issue is that **K1's trajectory
 diverges from non-spec greedy**.  K1 is emitting different tokens
 than MTP-off would emit at the same positions.
 
-**Standing rule violated**: per `inference/spec_decode/verifier.rs:119`:
+**Standing rule violated (HISTORICAL — SUPERSEDED at HEAD `ebca62c3` 2026-05-22)**:
+per the then-stated `inference/spec_decode/verifier.rs:119` contract:
 
 > "At temperature=0 (greedy), spec-decode is byte-identical to
 > default."
 
-K1 violates this.  Either:
+K1 violates this.  Initial diagnosis (also HISTORICAL):
 - The "free token" amortization (line 432-437 emits both `proposed`
   AND `next_iter_token_next` per accept) introduces tokens the
   verifier never actually saw at the right context
@@ -9483,11 +9502,25 @@ K1 violates this.  Either:
   written this iter; next iter overwrites it via verifier.forward")
   has a subtle bug where the next iter's verifier sees stale state
 
-**iter-268 plan**: bisect K1 trajectory divergence
+**iter-268 plan (HISTORICAL — bisect did not find a bug because there
+isn't one)**: bisect K1 trajectory divergence:
 1. Capture MTP-off greedy 50 tokens (ground truth)
 2. Run K1=1 with `HF2Q_SPEC_DECODE_K1_NO_AMORT=1` — should match
    greedy if ONLY the amortization is buggy
 3. If NO_AMORT matches greedy: free-token push at line 437 is the bug
+
+**CORRECTED diagnosis at HEAD `ebca62c3` 2026-05-22**: The K1
+trajectory divergence is NOT a bug in spec-decode logic — it is the
+structural kernel-precision divergence between the batched K+1 verify
+kernel (BF16/F16) and the F32 `flash_attn_vec` single-token decode
+kernel. Argmax flips on close logits compound across rounds. The
+`verifier.rs:119` contract has been corrected to scope the byte-
+identity claim to "WHEN BOTH PATHS USE THE SAME VERIFIER" (synthetic
+GroundTruthVerifier in unit tests; NOT a claim for real models). See
+ADR-030 §3.2 CAVEAT + ADR-034 G3 row at line 1501 + §3.5b at line
+1654 for the full framework-level analysis. The "iter-268 bisect"
+investigation would not have found a code-side bug — the divergence
+is structural to the kernel-precision mismatch.
 4. If NO_AMORT also diverges: 2-token verifier or reject path is the
    bug — bisect via `HF2Q_SPEC_DECODE_K1_TRACE=1`
 

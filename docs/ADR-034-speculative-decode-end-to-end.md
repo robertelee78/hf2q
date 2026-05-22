@@ -1683,9 +1683,9 @@ Each phase ships compiled, tested, gated. Phases run sequentially; no phase begi
 
 ### Phase -2 — Close B-W-1 greedy-decode heisenbug (mandatory prereq) (~variable; ADR-015 iter61a-4 scope)
 
-**Scope**: This ADR's G3 contract (greedy byte-identical) is unconditional and requires deterministic base decode. If the B-W-1 heisenbug (ADR-015 iter61a-3 localized to FullAttn layer 3 prefill, status 2026-04-30: open) is still open at the time ADR-034 starts, closing it is the **first action**. No ADR-034 P-1 work begins until determinism is restored.
+**Scope (HISTORICAL framing — see §START HERE G3 row at line 1501 for the corrected scope)**: This ADR's G3 contract was originally framed as "greedy byte-identical (unconditional)" and required deterministic base decode. The G3 contract has been re-scoped at HEAD `ebca62c3` 2026-05-22 to accept-walk consistency with the spec path's own batched-prefill verifier argmax — NOT byte-identity to single-token base decode (which is empirically falsified across all 4 spec-decode paths). The B-W-1 heisenbug remediation is still relevant for within-path determinism (same prompt → same output across reps), which is empirically verified at 3-rep PASS for greedy AND seeded MH.
 
-**Acceptance**: `scripts/coherence-harness/determinism_check.sh` passes on the Qwen 3.6 35B-A3B APEX-Q5_K_M and Gemma 4 26B-A4B Q6_K targets for N≥10 runs on the same deterministic prompt; byte-identical output across all runs.
+**Acceptance (HISTORICAL)**: `scripts/coherence-harness/determinism_check.sh` passes on the Qwen 3.6 35B-A3B APEX-Q5_K_M and Gemma 4 26B-A4B Q6_K targets for N≥10 runs on the same deterministic prompt; byte-identical output across all runs. This is still a valid within-path determinism gate; it is NOT a base-byte-identity gate (which has been falsified).
 
 **Skip condition**: if `determinism_check.sh` passes today (operator-verified before P-1 starts), Phase -2 closes immediately as already-satisfied; ADR-015's iter61a-3 memo gets a closing addendum.
 
@@ -1799,9 +1799,9 @@ Each phase ships compiled, tested, gated. Phases run sequentially; no phase begi
 
 **Scope**:
 - Run P1's numerical-parity harness (now G2-gating) against `froggeric/Qwen3.6-27B-MTP-GGUF` AND against our hf2q-converted Qwen 3.6 27B MTP GGUF (from P2). Fix any kernel-precision bugs that surface (Bug A / Bug B class — likely candidates: rope theta typo, head_dim mismatch in inner attn, attn_output_gate path on Qwen 3.5 vs 3.6).
-- Run G3 (greedy byte-identical) on the N=18 existing golden fixtures at `tests/coherence_golden/` (per ADR-030 §2.3 inventory: 18 fixtures across `hello-my-name-is`, `the-quick-brown-fox`, `what-is-22` prompts and gemma-4/qwen35/dwq46/apex/apex-q5km model variants), each extended to 2k decode tokens. Fix any divergence. **G3 is unconditional**: if base decode is non-deterministic (Phase -2's B-W-1 closure failed), this ADR halts. No softening.
+- Run G3 (HISTORICAL framing — re-scoped at HEAD `ebca62c3` per §START HERE G3 row at line 1501): the original "greedy byte-identical" gate over 18 golden fixtures × 2k tokens has been falsified — see §3.5b empirical caveat at line 1654 + ADR-030 §3.2 CAVEAT. Replacement gate: accept-walk consistency with the spec path's own batched-prefill verifier argmax + within-path 3-rep determinism. **The corrected G3 is unconditional within its valid scope** (accept-walk consistency, not base byte-identity).
 - Run G4 (acceptance rate). Acceptance rate measurement requires running `spec_bench.sh` on N=100 prompts of varying length (256/512/1024/2048) at greedy. Floor: max(70 %, measured-vLLM-floor-on-same-model). The "70 %" is a *public* reference number; the gate uses whichever is higher.
-- Add `tests/spec_decode_real_qwen36_27b.rs` and `..._35b_a3b.rs` — full end-to-end byte-identity + acceptance regression-pin. **Operator-only tests** (gated behind `HF2Q_REAL_MODEL_TESTS=1`); a synthetic-shape sibling lives in CI.
+- Add `tests/spec_decode_real_qwen36_27b.rs` and `..._35b_a3b.rs` — full end-to-end accept-walk-consistency + acceptance regression-pin (HISTORICAL framing was "byte-identity", re-scoped per G3 row at line 1501). **Operator-only tests** (gated behind `HF2Q_REAL_MODEL_TESTS=1`); a synthetic-shape sibling lives in CI.
 - README.md Status row update: Qwen MTP marked **"correctness-shipped; perf TBD under P6"** — explicitly distinguishes correctness (P3) from full ship (P6). The full-ship label arrives only after P6's F1/F2/F3 all green.
 
 **Acceptance**: G2 + G3 + G4 all green on both Qwen targets. Acceptance ≥ floor. README status reflects partial ship only (no "MTP shipped" claim until P6 lands).
