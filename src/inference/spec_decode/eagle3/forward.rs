@@ -32,6 +32,7 @@ use mlx_native::ops::elementwise::elementwise_add;
 use mlx_native::ops::feature_concat::dispatch_feature_concat_f32;
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
+use mlx_native::ops::transpose::permute_021_f32;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 /// EAGLE-3 FC projection.
@@ -1672,6 +1673,109 @@ pub fn dispatch_eagle3_mlp(
         hidden_usize,
         "mlp_down",
     )
+}
+
+// ----------------------------------------------------------------
+// Phase E4b.10b.1 — Q/K/V permute glue (seq-outer → head-outer)
+// ----------------------------------------------------------------
+//
+// E4b.4 Q/K/V projections produce buffers in `[seq, num_heads,
+// head_dim]` row-major flat layout (seq-outer; equivalent to
+// `[seq, num_heads * head_dim]` since trailing dims contiguous).
+// E4b.6 `tree_attention` expects head-outer `[num_heads, seq,
+// head_dim]` (the kernel reads `Q[(iq2 * q_l + iq1) * DK + d]` =
+// `Q[heads-major, queries-minor, dim-innermost]`).
+//
+// Wraps mlx-native's `permute_021_f32` to bridge the two layouts.
+// The kernel name reflects the underlying primitive: dim_b ↔ dim_a
+// swap of a 3D tensor `[A, B, C]` → `[B, A, C]`. For Q with
+// `[seq, n_q, hd]` this gives `[n_q, seq, hd]` — exactly what
+// tree_attention expects.
+
+/// Permute Q from `[seq, num_q_heads, head_dim]` to
+/// `[num_q_heads, seq, head_dim]`. Same shape for K (with
+/// num_kv_heads) and V.
+///
+/// # Arguments
+/// * `seq_outer`: F32 input `[seq * num_heads * head_dim]` flat.
+/// * `seq_len`, `num_heads`, `head_dim`: layout dims of input.
+///
+/// Returns a freshly allocated F32 buffer in head-outer layout.
+pub fn dispatch_eagle3_permute_seq_to_head_outer(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    seq_outer: &MlxBuffer,
+    seq_len: u32,
+    num_heads: u32,
+    head_dim_usize: usize,
+    label: &str,
+) -> Result<MlxBuffer> {
+    if seq_outer.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "dispatch_eagle3_permute_seq_to_head_outer ({}): input dtype must be F32, got {:?}",
+            label,
+            seq_outer.dtype()
+        ));
+    }
+    if seq_len == 0 || num_heads == 0 || head_dim_usize == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_permute_seq_to_head_outer ({}): all dims must be > 0 (seq={}, heads={}, hd={})",
+            label, seq_len, num_heads, head_dim_usize
+        ));
+    }
+    let total_elems = (seq_len as usize)
+        .checked_mul(num_heads as usize)
+        .and_then(|v| v.checked_mul(head_dim_usize))
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_permute_seq_to_head_outer ({}): seq * heads * head_dim overflows usize",
+                label
+            )
+        })?;
+    if total_elems > (u32::MAX as usize) {
+        return Err(anyhow!(
+            "dispatch_eagle3_permute_seq_to_head_outer ({}): total elements ({}) exceeds u32::MAX",
+            label,
+            total_elems
+        ));
+    }
+    if seq_outer.element_count() != total_elems {
+        return Err(anyhow!(
+            "dispatch_eagle3_permute_seq_to_head_outer ({}): input has {} elements, expected {} (seq={} * heads={} * hd={})",
+            label, seq_outer.element_count(), total_elems, seq_len, num_heads, head_dim_usize
+        ));
+    }
+    let total_bytes = total_elems
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_permute_seq_to_head_outer ({}): byte size overflows usize",
+                label
+            )
+        })?;
+    let out = device
+        .alloc_buffer(
+            total_bytes,
+            DType::F32,
+            vec![num_heads as usize, seq_len as usize, head_dim_usize],
+        )
+        .map_err(|e| anyhow!("alloc {label} permute output: {e}"))?;
+    // RAW barrier: input may have been written by the prior dispatch
+    // (Q/K/V projection or head-norm) in the same encoder.
+    encoder.memory_barrier();
+    permute_021_f32(
+        encoder,
+        registry,
+        device.metal_device(),
+        seq_outer,
+        &out,
+        seq_len as usize,
+        num_heads as usize,
+        head_dim_usize,
+    )
+    .map_err(|e| anyhow!("permute_021_f32 {label}: {e}"))?;
+    Ok(out)
 }
 
 // ----------------------------------------------------------------
@@ -4043,6 +4147,152 @@ mod tests {
             err.to_string().contains("embed_tokens"),
             "got: {err}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E4b.10b.1 tests — Q/K/V permute (seq-outer → head-outer)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn adr_037_e4b10b1_permute_sentinel_layout_2026_05_22() {
+        // Sentinel test: input [seq=3, heads=2, hd=4] with values
+        // (s * 1000 + h * 100 + d). Verify output layout
+        // [heads=2, seq=3, hd=4] reads (h, s, d) correctly.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let seq = 3_u32;
+        let n_heads = 2_u32;
+        let hd = 4_usize;
+        let total = (seq as usize) * (n_heads as usize) * hd;
+
+        // Build seq-outer input with distinct sentinel values per (s, h, d).
+        let mut input_data = vec![0.0f32; total];
+        for s in 0..(seq as usize) {
+            for h in 0..(n_heads as usize) {
+                for d in 0..hd {
+                    let val = (s * 1000 + h * 100 + d) as f32;
+                    let idx = s * (n_heads as usize) * hd + h * hd + d;
+                    input_data[idx] = val;
+                }
+            }
+        }
+        let input_gpu = upload_f32_to_gpu(
+            &device, &input_data,
+            vec![seq as usize, n_heads as usize, hd],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_permute_seq_to_head_outer(
+            &mut enc, &mut registry, &device,
+            &input_gpu, seq, n_heads, hd, "permute_sentinel",
+        )
+        .expect("permute dispatch");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        assert_eq!(gpu_out.len(), total);
+        // Output layout: [heads, seq, hd]. Verify (h, s, d) reads correctly.
+        for h in 0..(n_heads as usize) {
+            for s in 0..(seq as usize) {
+                for d in 0..hd {
+                    let expected = (s * 1000 + h * 100 + d) as f32;
+                    let out_idx = h * (seq as usize) * hd + s * hd + d;
+                    assert_eq!(
+                        gpu_out[out_idx], expected,
+                        "head={} seq={} dim={} mismatch: got {}",
+                        h, s, d, gpu_out[out_idx]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adr_037_e4b10b1_permute_cpu_parity_random_2026_05_22() {
+        // Random input + CPU reference permutation.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let seq = 5_u32;
+        let n_heads = 8_u32;
+        let hd = 16_usize;
+        let total = (seq as usize) * (n_heads as usize) * hd;
+
+        let mut input_data = vec![0.0f32; total];
+        fill_random(&mut input_data, 0xB10B);
+        let input_gpu = upload_f32_to_gpu(
+            &device, &input_data,
+            vec![seq as usize, n_heads as usize, hd],
+        );
+
+        // CPU reference: [s, h, d] → [h, s, d].
+        let mut cpu_out = vec![0.0f32; total];
+        for s in 0..(seq as usize) {
+            for h in 0..(n_heads as usize) {
+                for d in 0..hd {
+                    let src = s * (n_heads as usize) * hd + h * hd + d;
+                    let dst = h * (seq as usize) * hd + s * hd + d;
+                    cpu_out[dst] = input_data[src];
+                }
+            }
+        }
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_permute_seq_to_head_outer(
+            &mut enc, &mut registry, &device,
+            &input_gpu, seq, n_heads, hd, "permute_random",
+        )
+        .expect("permute dispatch");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        // Permutation is a pure copy — bit-exact expected.
+        for (i, (g, c)) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                c.to_bits(),
+                "byte-identity violated at idx {i}: gpu={g} cpu={c}"
+            );
+        }
+    }
+
+    #[test]
+    fn adr_037_e4b10b1_gate_permute_rejects_non_f32_input_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let bf16 = device
+            .alloc_buffer(64, DType::BF16, vec![2, 4, 4])
+            .expect("alloc bad");
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_permute_seq_to_head_outer(
+            &mut enc, &mut registry, &device, &bf16, 2, 4, 4, "permute_bad",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("dtype must be F32"), "got: {err}");
+    }
+
+    #[test]
+    fn adr_037_e4b10b1_gate_permute_rejects_zero_dim_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let dummy = device.alloc_buffer(4, DType::F32, vec![1]).expect("alloc");
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_permute_seq_to_head_outer(
+            &mut enc, &mut registry, &device, &dummy, 0, 4, 4, "permute_zero",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("all dims must be > 0"), "got: {err}");
     }
 
     #[test]
