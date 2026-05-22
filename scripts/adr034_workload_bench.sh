@@ -93,6 +93,38 @@ echo "  reps/config:  $N_REPS"
 echo "  max_tokens:   $MAX_TOKENS"
 echo
 
+# ── Warmup pass ──
+#
+# Run a 1-rep throwaway invocation of EACH config-class (base + spec
+# + dflash) at small max_tokens=16 to populate:
+#   - macOS unified-memory page cache for the GGUF + DFlash drafter
+#   - Metal pipeline cache (PSO JIT compile for all kernels touched)
+#   - GPU thermal warmup
+#
+# Without this, the first config of the actual measurement run shows
+# cold-cache numbers 15-25% below steady-state — empirically observed
+# at HEAD ce3d32e6 (commit 6e94724d documents the +19-24% post-task-#95
+# bench discrepancy this caused before warmup was added).
+#
+# Captured into /dev/null; no output. ~30s total at small max_tokens.
+echo "Warmup pass (populates page cache + Metal pipelines + GPU thermal)..."
+(
+    HF2Q_QWEN36_AUTOREG=1 HF2Q_SPEC_DECODE=0 \
+        "$HF2Q" generate --model "$GGUF" --prompt "warmup" \
+        --max-tokens 16 --temperature 0 --no-thinking --ignore-eos \
+        > /dev/null 2>&1 || true
+    HF2Q_QWEN36_AUTOREG=1 HF2Q_SPEC_DECODE=1 \
+        "$HF2Q" generate --model "$GGUF" --prompt "warmup" \
+        --max-tokens 16 --temperature 0 --no-thinking --ignore-eos \
+        > /dev/null 2>&1 || true
+    HF2Q_QWEN36_AUTOREG=1 HF2Q_SPEC_DFLASH=1 HF2Q_DFLASH_BLOCK_SIZE=4 \
+        "$HF2Q" generate --model "$GGUF" --prompt "warmup" \
+        --max-tokens 16 --temperature 0 --no-thinking --ignore-eos \
+        > /dev/null 2>&1 || true
+)
+echo "  done"
+echo
+
 echo "=== Essay prompt (creative / high-entropy) ==="
 echo "  Prompt: '$PROMPT_ESSAY'"
 echo
@@ -113,11 +145,15 @@ run_config "DFlash BS=2"           "$PROMPT_CODEGEN" "HF2Q_SPEC_DFLASH=1 HF2Q_DF
 run_config "DFlash BS=4"           "$PROMPT_CODEGEN" "HF2Q_SPEC_DFLASH=1 HF2Q_DFLASH_BLOCK_SIZE=4"  "--temperature 0"
 echo
 
-echo "Reference baseline (HEAD 00b9ac54 on Qwen 3.6 27B Q8_0):"
-echo "  Essay:    Base 21.9, MTP greedy 26.2 @ 68%, MTP MH 27.5 @ 78%, DFlash BS=2 16.5, BS=4 16.9"
-echo "  Code-gen: Base 22.0, MTP greedy 29.9 @ 91%, MTP MH 28.6 @ 84%, DFlash BS=2 16.8, BS=4 18.4"
+echo "Reference baselines (Qwen 3.6 27B Q8_0):"
+echo "  Pre task #95 (HEAD 00b9ac54):"
+echo "    Essay:    Base 21.9, MTP greedy 26.2 @ 68%, MTP MH 27.5 @ 78%, DFlash BS=2 16.5, BS=4 16.9"
+echo "    Code-gen: Base 22.0, MTP greedy 29.9 @ 91%, MTP MH 28.6 @ 84%, DFlash BS=2 16.8, BS=4 18.4"
+echo "  Post task #95 + warmup-corrected (HEAD bpdwu121g 2026-05-22):"
+echo "    Essay:    Base 21.9, MTP greedy 26.5 @ 68%, MTP MH 27.4 @ 78%, DFlash BS=2 19.9, BS=4 20.2"
+echo "    Code-gen: Base 22.0, MTP greedy 29.9 @ 91%, MTP MH 28.6 @ 84%, DFlash BS=2 20.8, BS=4 22.4"
 echo
 echo "Production recommendation:"
 echo "  Code-gen / deterministic: HF2Q_SPEC_DECODE=1 --temperature 0     (1.36x base, MTP K=1 greedy wins)"
 echo "  Essay / creative:         HF2Q_SPEC_DECODE=1 --temperature 0.5   (1.26x base, MTP K=1 MH wins)"
-echo "  DFlash opt-in:            HF2Q_SPEC_DFLASH=1 HF2Q_DFLASH_BLOCK_SIZE=4  (0.61-0.62x of MTP greedy; research-quality only)"
+echo "  DFlash opt-in:            HF2Q_SPEC_DFLASH=1 HF2Q_DFLASH_BLOCK_SIZE=4  (0.75x of MTP greedy on code-gen post-task-#95; research-quality but closer to viable)"
