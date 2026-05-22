@@ -1250,30 +1250,57 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
         std::env::var("HF2Q_FUSED_GATE_UP_SILU").as_deref(),
         Ok("0") | Ok("false") | Ok("off"),
     );
-    let fused_eligible = matches!(
-            weights.ggml_type_gate_up,
-            mlx_native::ops::quantized_matmul_ggml::GgmlType::Q8_0
-        )
-        && !fused_off;
+    // ADR-034 task #93 cont. 25 (2026-05-21) — Q4_K added to fused dispatch.
+    // Parity tests (mlx-native adr_034_task93_fused_gate_up_silu_q4_K_parity)
+    // 3/3 PASS at m∈{1,2,4} — byte-identical to unfused at 1e-5 F32 tolerance.
+    // Bench validation pending availability of a Q4_K_M dense Qwen GGUF;
+    // wire-in is correctness-preserving regardless.
+    let fused_q8_0 = matches!(
+        weights.ggml_type_gate_up,
+        mlx_native::ops::quantized_matmul_ggml::GgmlType::Q8_0
+    );
+    let fused_q4_k = matches!(
+        weights.ggml_type_gate_up,
+        mlx_native::ops::quantized_matmul_ggml::GgmlType::Q4_K
+    );
+    let fused_eligible = (fused_q8_0 || fused_q4_k) && !fused_off;
     if fused_eligible {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseAProj,
         );
-        mlx_native::ops::fused_gate_up_silu_q8_0::dispatch_fused_gate_up_silu_q8_0(
-            enc,
-            registry,
-            device,
-            &weights.gate_q,
-            &weights.up_q,
-            x,
-            &hidden_buf,
-            mlx_native::ops::fused_gate_up_silu_q8_0::FusedGateUpSiluQ8_0Args {
-                m: seq_len,
-                intermediate_size: m,
-                hidden_size: h,
-            },
-        )
-        .context("dense_q fused gate_up_silu_mul Q8_0")?;
+        if fused_q4_k {
+            mlx_native::ops::fused_gate_up_silu_q4_K::dispatch_fused_gate_up_silu_q4_K(
+                enc,
+                registry,
+                device,
+                &weights.gate_q,
+                &weights.up_q,
+                x,
+                &hidden_buf,
+                mlx_native::ops::fused_gate_up_silu_q4_K::FusedGateUpSiluQ4_KArgs {
+                    m: seq_len,
+                    intermediate_size: m,
+                    hidden_size: h,
+                },
+            )
+            .context("dense_q fused gate_up_silu_mul Q4_K")?;
+        } else {
+            mlx_native::ops::fused_gate_up_silu_q8_0::dispatch_fused_gate_up_silu_q8_0(
+                enc,
+                registry,
+                device,
+                &weights.gate_q,
+                &weights.up_q,
+                x,
+                &hidden_buf,
+                mlx_native::ops::fused_gate_up_silu_q8_0::FusedGateUpSiluQ8_0Args {
+                    m: seq_len,
+                    intermediate_size: m,
+                    hidden_size: h,
+                },
+            )
+            .context("dense_q fused gate_up_silu_mul Q8_0")?;
+        }
     } else {
         // Ops 1+2: gate and up projections via quantized_matmul_ggml (both read x, concurrent).
         {
