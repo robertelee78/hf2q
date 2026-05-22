@@ -3701,6 +3701,37 @@ mod tests {
     }
 
     #[test]
+    fn adr_037_e4b8_gate_mlp_rejects_wrong_input_shape_2026_05_22() {
+        // Codex /cfa E4b.8 Minor fix (2026-05-22): explicit wrong-shape
+        // regression for the MLP wrapper (inner helper has its own test
+        // in E4b.4, but the MLP boundary check should be covered too).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let seq_len = 4_u32;
+        // input has wrong size: should be seq * hidden = 1024, allocate 100.
+        let bad_data = vec![0.0f32; 100];
+        let bad = upload_f32_to_gpu(&device, &bad_data, vec![100]);
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_mlp(
+            &mut enc, &mut registry, &device, &bad, &tensors, &cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("input has 100 elements"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn adr_037_e4b8_gate_mlp_rejects_zero_seq_len_2026_05_22() {
         let device = match MlxDevice::new() {
             Ok(d) => d,
