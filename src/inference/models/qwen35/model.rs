@@ -122,6 +122,18 @@ pub struct Qwen35Model {
     /// Optional MTP draft block. Executed only by speculative decoding, never
     /// by the verifier's main layer loop.
     pub mtp: Option<MtpWeights>,
+    /// ADR-034 task #78 Step 3a (2026-05-21) — DFlash hidden-capture session
+    /// for target verify. `None` means DFlash is inactive (legacy
+    /// non-capturing forward). Set via the
+    /// [`crate::inference::spec_decode::dflash::target::DFlashTarget`] trait
+    /// impl when an orchestrator round installs a capture session, taken
+    /// back at the end of the round.
+    ///
+    /// The actual hooking into the layer-loop is pending Step 3c; this
+    /// field exists now so the DFlashTarget trait impl (Step 3b) can
+    /// store/take/check it.
+    #[doc(hidden)]
+    pub dflash_capture: Option<crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession>,
 }
 
 impl Qwen35Model {
@@ -162,6 +174,7 @@ impl Qwen35Model {
             output_weight: vec![0.0f32; h * vocab],
             output_norm: vec![1.0f32; h],
             mtp: None,
+            dflash_capture: None,
             cfg,
         }
     }
@@ -354,6 +367,7 @@ impl Qwen35Model {
             output_weight,
             output_norm,
             mtp,
+            dflash_capture: None,
         })
     }
 
