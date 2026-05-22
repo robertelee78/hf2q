@@ -17,8 +17,13 @@
 //!     tie_lm_head, include_draft_id_mapping, has_own_embed_tokens).
 //!   * `weights.rs` defines `Eagle3Weights` strict manifest loader
 //!     with vLLM d2t/t2d name normalization (per `llama_eagle3.py:415-419`).
-//! - **Phase E4-E8**: drafter forward + dynamic tree + tree-walk +
-//!   orchestrator + empirical validation + final closure.
+//! - **Phase E4** (SHIPPED): dynamic tree expansion algorithm (E4a)
+//!   + 14-stage drafter forward chain (E4b.1-E4b.10b.3) +
+//!   GpuDrafter Drafter trait impl. 92/92 tests PASS across the
+//!   full eagle3 module. Single-token decode mode (depth ≤ 1 trees);
+//!   full path conditioning via drafter KV cache deferred to E5+.
+//! - **Phase E5+**: tree-walk-accept + KV rollback + orchestrator +
+//!   empirical validation + final closure.
 //!
 //! Peer reference: `/opt/vllm/vllm/model_executor/models/llama_eagle3.py`
 //! (MIT). Production-deployed EAGLE-3 in vLLM consumes

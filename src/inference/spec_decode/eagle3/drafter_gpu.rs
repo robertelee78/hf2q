@@ -191,6 +191,21 @@ impl<'a> Drafter for GpuDrafter<'a> {
             "GpuDrafter::predict_topk: empty path from node_to_expand {}",
             node_to_expand
         );
+        // Codex /cfa E4 final-gate Major 2 (2026-05-22): single-token
+        // decode mode only conditions on the LAST path token. For
+        // depth >= 2 expansion (node_to_expand a grandchild or deeper),
+        // ancestor token conditioning is dropped — the Drafter trait
+        // semantics are violated. Fail fast here so callers can't
+        // silently get path-conditioning-free predictions. Full path
+        // conditioning requires drafter KV cache reuse (Phase E4b.10b.4
+        // follow-up or absorbed into Phase E5).
+        ensure!(
+            path.len() <= 2,
+            "GpuDrafter::predict_topk: path length {} > 2 (depth >= 2 not supported \
+             without drafter KV cache — limit DynamicTreeConfig.max_depth to 1 \
+             until Phase E4b.10b.4 ships path-conditioned forward)",
+            path.len()
+        );
         // Single-token decode: use the LAST path token as the input
         // embedding. (Multi-token batch decode for KV cache prefill
         // is Phase E4b.10b.4.)
@@ -258,7 +273,52 @@ impl<'a> Drafter for GpuDrafter<'a> {
         )?;
 
         // Extract top-K from logits row.
-        let candidates = extract_top_k_from_row_logits(&logits_vec, top_k)?;
+        let raw_candidates = extract_top_k_from_row_logits(&logits_vec, top_k)?;
+        // Codex /cfa E4 final-gate Major 1 (2026-05-22): when the
+        // drafter uses fast-vocab projection (draft_vocab_size <
+        // vocab_size), lm_head produces logits over the DRAFT vocab.
+        // The returned token IDs must be remapped through
+        // `tensors.draft_id_to_target_id` to target-vocab IDs so the
+        // tree expansion + KV cache + sampler operate in target's
+        // vocabulary space.
+        let candidates = if let Some(map) = &self.tensors.draft_id_to_target_id {
+            let mut remapped = Vec::with_capacity(raw_candidates.len());
+            for c in raw_candidates {
+                let draft_idx = c.token as usize;
+                ensure!(
+                    draft_idx < map.len(),
+                    "GpuDrafter::predict_topk: draft token {} exceeds draft_id_to_target_id length {}",
+                    c.token,
+                    map.len()
+                );
+                let target_id = map[draft_idx];
+                ensure!(
+                    target_id >= 0 && (target_id as usize) < self.cfg.vocab_size,
+                    "GpuDrafter::predict_topk: draft_id_to_target_id[{}] = {} not in [0, vocab_size={})",
+                    draft_idx,
+                    target_id,
+                    self.cfg.vocab_size
+                );
+                let target_u32: u32 = u32::try_from(target_id).map_err(|_| {
+                    anyhow!(
+                        "GpuDrafter::predict_topk: target_id {} exceeds u32::MAX",
+                        target_id
+                    )
+                })?;
+                remapped.push(DraftCandidate {
+                    token: target_u32,
+                    log_prob: c.log_prob,
+                });
+            }
+            remapped
+        } else {
+            // No mapping: draft_vocab_size == vocab_size assumed.
+            // (Config validation in dispatch_eagle3_lm_head enforces
+            // this for the tied-lm-head path; the untied path with
+            // draft_vocab < vocab REQUIRES the mapping or downstream
+            // consumers would treat draft IDs as target IDs.)
+            raw_candidates
+        };
         Ok(candidates)
     }
 }
@@ -467,19 +527,66 @@ mod tests {
         assert_eq!(candidates.len(), 3);
 
         // Full integration: expand_dynamic_tree consumes the drafter.
+        // Codex /cfa E4 final-gate Major 2 fix: max_depth=1 only —
+        // higher depths require drafter KV cache (deferred).
         let tree_cfg = DynamicTreeConfig {
-            budget: 5,
-            max_depth: 3,
+            budget: 4,
+            max_depth: 1,
             top_k: 3,
         };
         let tree = expand_dynamic_tree(123_u32, &mut drafter, &tree_cfg)
             .expect("expand_dynamic_tree with GpuDrafter");
-        // Tree must contain at least the root + 1 child + 1 grandchild
-        // (budget=5 with top_k=3 fills quickly).
+        // Tree must contain root + up to top_k children at depth 1.
         assert!(tree.len() >= 2, "tree should expand beyond root");
         assert!(tree.len() <= tree_cfg.budget, "tree must respect budget");
+        // All non-root nodes at depth 1.
+        for d in tree.depths.iter().skip(1) {
+            assert_eq!(*d, 1, "max_depth=1 cap");
+        }
         // Validate the tree structure.
         tree.validate().expect("ExpandedTree::validate");
+    }
+
+    #[test]
+    fn adr_037_e4_final_gate_predict_topk_rejects_depth_2_path_2026_05_22() {
+        // Codex /cfa E4 final-gate Major 2 regression (2026-05-22):
+        // calling predict_topk on a tree node at depth >= 2 must
+        // fail-fast (path length > 2) since single-token decode
+        // can't condition on full ancestor chain.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = cfg_for_drafter_test();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_test_blob(&manifest);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let target_aux_data = vec![0.1f32; cfg.fc_input_size()];
+        let mut target_aux_buf = device
+            .alloc_buffer(cfg.fc_input_size() * 4, DType::F32, vec![1, cfg.fc_input_size()])
+            .expect("alloc");
+        target_aux_buf
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&target_aux_data);
+        let embed_table = vec![0.0f32; cfg.vocab_size * cfg.hidden_size];
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("construct");
+        // Depth-2 tree: root → child → grandchild.
+        let view = TreeContextView {
+            tokens: &[10, 20, 30],
+            parents: &[None, Some(0), Some(1)],
+        };
+        let err = drafter.predict_topk(view, 2, 3).unwrap_err();
+        assert!(
+            err.to_string().contains("path length 3 > 2"),
+            "got: {err}"
+        );
     }
 
     #[test]

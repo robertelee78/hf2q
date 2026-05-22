@@ -10,13 +10,20 @@
 //! - **E4b.1** `tensors.rs`: GPU upload pipeline (SHIPPED).
 //! - **E4b.2** `dispatch_eagle3_fc` (this file): projects
 //!   `[seq, num_aux * H]` → `[seq, H]` via the BF16 `fc.weight`.
-//! - **E4b.3** `dispatch_eagle3_input_layernorm` +
-//!   `dispatch_eagle3_hidden_norm` + `dispatch_eagle3_concat_2x_hidden`
-//!   (this file): per vLLM `llama_eagle3.py:102-106` first-layer pre-attn:
-//!   normalize embeds + hidden states separately, then concat along the
-//!   last dim to produce the `[seq, 2*H]` input to Q/K/V projections.
-//! - **E4b.4+** TODO: self-attn (via Phase E1 `tree_attention`
-//!   kernel), MLP, final norm, lm_head, top-K extraction.
+//! - **E4b.3** norms + concat (input_layernorm, hidden_norm,
+//!   concat_2x_hidden) per vLLM `llama_eagle3.py:102-106`.
+//! - **E4b.4** Q/K/V projections from the [seq, 2*hidden] concat
+//!   input (optional attention_bias).
+//! - **E4b.5a/b** Optional Qwen-style Q/K head-norm + tree-position-
+//!   aware RoPE.
+//! - **E4b.6** tree_attention dispatch via Phase E1 kernel (+ dk128
+//!   retrofit for Qwen 3.6 27B).
+//! - **E4b.7** O projection + residual add.
+//! - **E4b.8** SwiGLU MLP (down(silu(gate) * up)).
+//! - **E4b.9** final norm + lm_head with tied/untied lm_head handling.
+//! - **E4b.10b.1** Q/K/V permute (seq-outer ↔ head-outer).
+//! - **E4b.10b.2** post_attention_layernorm + full forward
+//!   orchestrator (`dispatch_eagle3_drafter_forward` — public API).
 
 use super::config::Eagle3DrafterConfig;
 use super::tensors::Eagle3DrafterTensors;
