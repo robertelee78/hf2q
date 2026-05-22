@@ -38,6 +38,29 @@
 | **C — Gemma 4 26B DFlash** | ⚠️ **COHERENT but 4.8× SLOWER than base** | Q8_0 paired bench 3 reps at HEAD `6d80e6be` (2026-05-21): base 92.9 t/s, DFlash 19.2 t/s = 0.21× (4.8× slowdown). Coherence is byte-identical to single-token decode at temp=0 (proven by e2e test). The "WORKING" claim in earlier ADR revisions was correctness-only — never measured against base. Source code at `src/serve/spec_decode_cli.rs:26-32` is honest: "Option C re-prefills full prefix from start_pos=0 each round; Option A (cross-length SDPA in flash_attn_prefill) deferred." | **Option A** = cross-length SDPA path (same scope as task #89 `forward_gpu_batched_decode`). Required for any perf gate. ~1500 LOC. |
 | **D — Gemma 4 -assistant** | Phase 7, deferred | Not in v1 scope | — |
 
+### Mission status at HEAD `1fe56fbb` (2026-05-21) — FUNCTIONALLY COMPLETE
+
+**Production winner**: `HF2Q_SPEC_DECODE=1 --temperature 0.5` (auto-default when MTP weights present per task #87 / commit 3be36936). Delivers 27.5 ± 0.05 tok/s @ 77.8% MH accept on Qwen 3.6 27B Q8_0 (1.26× over base 21.9 tok/s).
+
+**ADR-034 cell summary**:
+
+| Cell | Status | Production-ready? |
+|---|---|---|
+| A — Qwen 3.6 27B dense MTP | ✅ SHIPPED 1.26× | YES (default-on when MTP weights present) |
+| A — Qwen 3.5/3.6 35B-A3B MoE MTP | ⚠️ WIRED + correct but net-negative | NO (default-off, needs fused projections kernel) |
+| B — Qwen 3.6 DFlash | ✅ WIRED + correct, 0.60× of production winner | OPT-IN only (HF2Q_SPEC_DFLASH=1; documented as research-quality) |
+| C — Gemma 4 26B DFlash | ✅ WIRED + correct, 0.21× of base | OPT-IN only (HF2Q_SPEC_DFLASH=1; documented as research-quality) |
+| D — Gemma 4 -assistant | Deferred | N/A |
+
+**Output divergence note (documented behavior, not regression)**: At temperature=0 the basic decode-only path and the MTP K=1 BATCHED verify path can emit slightly different tokens at positions where multiple candidates are near-tied. This is from BF16-vs-F32 precision (single-token decode uses F32 flash_attn_vec; batched verify uses BF16 flash_attn_prefill_resume — different accumulation order + reduced precision). Determinism within each path is PASS 3/3 byte-identical. The MTPLX peer reference has the same property. Greedy invariant holds against the BATCHED VERIFY's argmax (which `accept_prefix_argmax` strictly enforces), not against single-token decode's argmax. This is a kernel-level property, not addressable at the dispatch level.
+
+**Remaining structural lever (multi-week, not single-iteration scope)**: fused projections Metal kernel — a single Metal dispatch combining norm + Q+K+V+Gate matmuls + per-head norms + RoPE for small batch (seq_len in [2, 8]). Unlocks all three opt-in cells (A 35B-A3B + B + C) by eliminating ~10 launch overheads per FA layer per forward (the fa.ops1_4 = 4.298 ms at seq_len=2 cur_len>0 is COMPUTE on small batch, not commit-boundary overhead — empirically falsified by task #89 Step 3b's 3-rep paired bench at commit 91a14fbf).
+
+**Task #89 building blocks shipped** (ready for future fused-projections work):
+- `flash_attn_vec` extended to qL>=1 (mlx-native 471c769) — parity-verified at qL=1,2,4,8
+- `apply_sdpa_with_kv_cache` vec_small_path branch (hf2q c14efb3b) — opt-out HF2Q_NO_VEC_SMALL_PATH=1
+- `use_fused_stage_ab` extension to cur_len>0 with vec dispatch (hf2q 91a14fbf) — opt-out HF2Q_NO_FUSED_STAGE_AB_VEC=1
+
 ### Comprehensive consolidated bench at HEAD `91a14fbf` (2026-05-21)
 
 3-rep paired bench on Qwen 3.6 27B Q8_0, 128 tokens, essay prompt:
