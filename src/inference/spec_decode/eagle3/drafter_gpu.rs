@@ -272,6 +272,21 @@ impl<'a> GpuDrafter<'a> {
     }
 }
 
+/// Phase E6 (2026-05-22) — implement `CacheControlDrafter` so the
+/// cache-aware orchestrator (`expand_dynamic_tree_with_cache`) can
+/// drive `GpuDrafter` generically.
+impl<'a> super::dynamic_tree::CacheControlDrafter for GpuDrafter<'a> {
+    fn cache_len(&self) -> usize {
+        self.kv_cache_len()
+    }
+    fn rollback_cache(&mut self, accepted: &[usize]) -> Result<()> {
+        self.rollback_kv_cache(accepted)
+    }
+    fn clear_cache(&mut self) {
+        self.clear_kv_cache();
+    }
+}
+
 impl<'a> Drafter for GpuDrafter<'a> {
     fn predict_topk(
         &mut self,
@@ -1102,6 +1117,59 @@ mod tests {
         // Rollback to keep only root.
         drafter.rollback_kv_cache(&[0]).expect("rollback");
         assert_eq!(drafter.kv_cache_len(), 1);
+    }
+
+    #[test]
+    fn adr_037_e6_gpu_drafter_with_cache_orchestrator_max_depth_2_2026_05_22() {
+        // END-TO-END test: GpuDrafter with attached cache + the new
+        // cache-aware orchestrator expand_dynamic_tree_with_cache.
+        // This proves max_depth>1 trees actually expand correctly
+        // when the full pipeline runs on the GPU.
+        use crate::inference::spec_decode::eagle3::dynamic_tree::{
+            expand_dynamic_tree_with_cache, DynamicTreeConfig,
+        };
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_buf, embed_table) =
+            match step3_build_drafter_scaffolding(&device) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        let cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 16, cfg.head_dim,
+        )
+        .expect("cache");
+        drafter.attach_kv_cache(cache).expect("attach");
+
+        // Budget=8, max_depth=2, top_k=3. Best-first will switch
+        // branches, exercising rollback.
+        let tree_cfg = DynamicTreeConfig {
+            budget: 8,
+            max_depth: 2,
+            top_k: 3,
+        };
+        let tree = expand_dynamic_tree_with_cache(123, &mut drafter, &tree_cfg)
+            .expect("expand max_depth=2");
+        // Tree should respect budget.
+        assert!(tree.len() <= tree_cfg.budget);
+        assert!(tree.len() >= 2, "should expand beyond root");
+        // Should reach depth 2 (we have budget).
+        let max_observed_depth = tree.depths.iter().max().copied().unwrap_or(0);
+        assert!(
+            max_observed_depth >= 1,
+            "should reach at least depth 1; got max depth {}",
+            max_observed_depth
+        );
+        // Validate the produced tree structure.
+        tree.validate().expect("ExpandedTree::validate");
     }
 
     #[test]

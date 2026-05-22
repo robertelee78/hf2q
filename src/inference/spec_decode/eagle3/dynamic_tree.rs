@@ -371,6 +371,212 @@ pub fn expand_dynamic_tree<D: Drafter>(
     Ok(out)
 }
 
+// ----------------------------------------------------------------
+// Phase E6 (2026-05-22) — cache-aware orchestrator.
+// ----------------------------------------------------------------
+//
+// `expand_dynamic_tree_with_cache` extends best-first dynamic tree
+// expansion to maintain a drafter KV cache invariant:
+//
+//     before each predict_topk(node) call:
+//         cache.len() == depth(node)
+//         cache slots [0..depth(node)) hold K/V for ancestors
+//
+// Because best-first expansion can jump between branches (e.g.
+// expand A, then expand B which is A's sibling), the orchestrator
+// must ROLLBACK the cache when the new node's ancestor chain
+// diverges from the previously expanded node's chain.
+
+/// Trait abstracting the cache-control surface that
+/// `expand_dynamic_tree_with_cache` needs. Implemented by
+/// `GpuDrafter`. Lets us write the orchestrator generically while
+/// keeping the cache type out of the dynamic_tree module's import
+/// surface.
+pub trait CacheControlDrafter: Drafter {
+    /// Returns current cache length. `0` when no cache is attached.
+    fn cache_len(&self) -> usize;
+    /// Rollback to keep only the indicated cache slots (in their
+    /// listed order). See `DrafterKvCache::rollback_to_accepted`
+    /// for semantics.
+    fn rollback_cache(&mut self, accepted: &[usize]) -> Result<()>;
+    /// Reset cache to empty.
+    fn clear_cache(&mut self);
+}
+
+/// Cache-aware dynamic tree expansion.
+///
+/// Same best-first algorithm as `expand_dynamic_tree` but maintains
+/// the drafter KV cache invariant by rolling back the cache between
+/// branches.
+///
+/// # Cache state contract
+///
+/// At entry: `drafter.cache_len()` must equal 0 (orchestrator calls
+/// `drafter.clear_cache()` first). At exit: cache holds K/V for
+/// the longest branch the expansion reached (the cache state is
+/// "garbage" from the caller's perspective — they should typically
+/// rollback again to keep only the ACCEPTED path after tree-walk).
+///
+/// # Algorithm
+///
+/// Maintains `cache_nodes: Vec<usize>` — tree-node indices currently
+/// occupying cache slots in order. After admitting node `c` whose
+/// parent is `p`:
+///
+/// 1. Build ancestor chain of `c` (excluding `c`): `[root, ...,
+///    p]`.
+/// 2. If `cache_nodes != ancestors`, rollback to keep only the
+///    ancestor positions (which is the only state cache-aware
+///    predict_topk will accept).
+/// 3. Call `drafter.predict_topk(c)` which appends `c`'s K/V to
+///    cache. Update `cache_nodes` by appending `c`.
+pub fn expand_dynamic_tree_with_cache<D: CacheControlDrafter>(
+    root_token: u32,
+    drafter: &mut D,
+    cfg: &DynamicTreeConfig,
+) -> Result<ExpandedTree> {
+    cfg.validate()?;
+
+    // Cache must start clean.
+    drafter.clear_cache();
+
+    let mut tokens: Vec<u32> = Vec::with_capacity(cfg.budget);
+    let mut parents: Vec<Option<usize>> = Vec::with_capacity(cfg.budget);
+    let mut depths: Vec<usize> = Vec::with_capacity(cfg.budget);
+    let mut cum: Vec<f64> = Vec::with_capacity(cfg.budget);
+
+    // Root.
+    tokens.push(root_token);
+    parents.push(None);
+    depths.push(0);
+    cum.push(0.0);
+
+    // `cache_nodes[i]` = tree-node index currently in cache slot i.
+    // After expanding node N, N's K/V is appended at the END of
+    // cache, so cache_nodes.push(N).
+    let mut cache_nodes: Vec<usize> = Vec::with_capacity(cfg.budget);
+
+    let mut heap = BinaryHeap::<PendingCandidate>::new();
+    let mut seq_counter: usize = 0;
+
+    // Seed by expanding the root. cache_nodes goes [] → [0].
+    if cfg.budget > 1 && cfg.max_depth >= 1 {
+        let view = TreeContextView {
+            tokens: &tokens,
+            parents: &parents,
+        };
+        // Cache must be empty before root expansion (we just cleared).
+        let candidates = drafter.predict_topk(view, 0, cfg.top_k)?;
+        validate_candidates(&candidates, cfg.top_k)?;
+        cache_nodes.push(0);
+        debug_assert_eq!(drafter.cache_len(), 1);
+
+        for cand in candidates {
+            let child_cum = cand.log_prob as f64;
+            ensure!(
+                child_cum.is_finite(),
+                "seed cum_log_prob not finite: {}",
+                child_cum
+            );
+            heap.push(PendingCandidate {
+                parent_idx: 0,
+                token: cand.token,
+                cum_log_prob: child_cum,
+                seq: seq_counter,
+            });
+            seq_counter += 1;
+        }
+    }
+
+    while tokens.len() < cfg.budget {
+        let Some(pending) = heap.pop() else {
+            break;
+        };
+        let parent_idx = pending.parent_idx;
+        let child_idx = tokens.len();
+        let new_depth = depths[parent_idx] + 1;
+        tokens.push(pending.token);
+        parents.push(Some(parent_idx));
+        depths.push(new_depth);
+        cum.push(pending.cum_log_prob);
+
+        // Only expand if we'll potentially admit more children.
+        if tokens.len() < cfg.budget && new_depth < cfg.max_depth {
+            // Build the required cache-node sequence for expanding
+            // child_idx: ancestors of child_idx, root first.
+            let mut required: Vec<usize> = Vec::with_capacity(new_depth);
+            let mut cursor = Some(parent_idx);
+            while let Some(idx) = cursor {
+                required.push(idx);
+                cursor = parents[idx];
+            }
+            required.reverse();
+            // Rollback cache to match `required` if the cache state
+            // diverged from it.
+            if cache_nodes != required {
+                // Map each required node to its current cache slot.
+                let mut keep_slots: Vec<usize> = Vec::with_capacity(required.len());
+                for &node in &required {
+                    let slot = cache_nodes
+                        .iter()
+                        .position(|&n| n == node)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "expand_dynamic_tree_with_cache: required ancestor \
+                                 {} not present in cache_nodes {:?} — orchestrator \
+                                 bookkeeping bug",
+                                node, cache_nodes
+                            )
+                        })?;
+                    keep_slots.push(slot);
+                }
+                drafter.rollback_cache(&keep_slots)?;
+                cache_nodes = required;
+                debug_assert_eq!(drafter.cache_len(), cache_nodes.len());
+            }
+            // Now expand. predict_topk will append child_idx's K/V
+            // at the end of cache.
+            let view = TreeContextView {
+                tokens: &tokens,
+                parents: &parents,
+            };
+            let candidates = drafter.predict_topk(view, child_idx, cfg.top_k)?;
+            validate_candidates(&candidates, cfg.top_k)?;
+            cache_nodes.push(child_idx);
+            debug_assert_eq!(drafter.cache_len(), cache_nodes.len());
+
+            let parent_cum = cum[child_idx];
+            for cand in candidates {
+                let child_cum = parent_cum + (cand.log_prob as f64);
+                ensure!(
+                    child_cum.is_finite(),
+                    "cumulative log_prob overflowed at depth {} (parent_cum={}, edge={})",
+                    new_depth + 1,
+                    parent_cum,
+                    cand.log_prob
+                );
+                heap.push(PendingCandidate {
+                    parent_idx: child_idx,
+                    token: cand.token,
+                    cum_log_prob: child_cum,
+                    seq: seq_counter,
+                });
+                seq_counter += 1;
+            }
+        }
+    }
+
+    let out = ExpandedTree {
+        tokens,
+        parents,
+        depths,
+        cum_log_probs: cum,
+    };
+    out.validate()
+        .map_err(|e| anyhow!("expand_dynamic_tree_with_cache produced invalid tree: {}", e))?;
+    Ok(out)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -394,6 +600,251 @@ mod tests {
             let script = self.scripts[self.call_count].clone();
             self.call_count += 1;
             Ok(script)
+        }
+    }
+
+    /// Phase E6 (2026-05-22) — mock that wraps any Drafter and
+    /// tracks cache state (len + slots + rollback history) so tests
+    /// can verify the orchestrator's cache bookkeeping invariants
+    /// without needing a GPU.
+    struct CacheTrackingMock<D: Drafter> {
+        inner: D,
+        /// Simulated cache content: tree-node indices in slot order.
+        cache_slots: Vec<u64>,
+        /// Sequence counter that we APPEND to cache_slots on each
+        /// predict_topk to produce unique slot tags (we don't have
+        /// access to node_to_expand from inside predict_topk in a
+        /// way that's preserved across rollbacks).
+        next_appended_tag: u64,
+        /// History of rollback calls (slots argument) for assertions.
+        rollback_history: Vec<Vec<usize>>,
+        /// History of cache len AT predict_topk entry, for invariant
+        /// checks ("cache_len == path_len - 1").
+        predict_entry_lens: Vec<usize>,
+    }
+
+    impl<D: Drafter> CacheTrackingMock<D> {
+        fn new(inner: D) -> Self {
+            Self {
+                inner,
+                cache_slots: Vec::new(),
+                next_appended_tag: 1,
+                rollback_history: Vec::new(),
+                predict_entry_lens: Vec::new(),
+            }
+        }
+    }
+
+    impl<D: Drafter> Drafter for CacheTrackingMock<D> {
+        fn predict_topk(
+            &mut self,
+            tree: super::super::drafter::TreeContextView<'_>,
+            node_to_expand: usize,
+            top_k: usize,
+        ) -> Result<Vec<DraftCandidate>> {
+            // Verify the orchestrator's cache invariant at entry.
+            let path = tree.path_tokens(node_to_expand);
+            self.predict_entry_lens.push(self.cache_slots.len());
+            assert_eq!(
+                self.cache_slots.len() + 1,
+                path.len(),
+                "cache invariant violated: cache.len()={} path.len()={}",
+                self.cache_slots.len(),
+                path.len(),
+            );
+            let candidates = self.inner.predict_topk(tree, node_to_expand, top_k)?;
+            // Simulate the cache-aware forward APPENDING this node's K/V.
+            self.cache_slots.push(self.next_appended_tag);
+            self.next_appended_tag += 1;
+            Ok(candidates)
+        }
+    }
+
+    impl<D: Drafter> CacheControlDrafter for CacheTrackingMock<D> {
+        fn cache_len(&self) -> usize {
+            self.cache_slots.len()
+        }
+        fn rollback_cache(&mut self, accepted: &[usize]) -> Result<()> {
+            self.rollback_history.push(accepted.to_vec());
+            // Validate slots are in range + unique.
+            let mut seen = HashSet::new();
+            for &s in accepted {
+                if s >= self.cache_slots.len() {
+                    anyhow::bail!(
+                        "rollback slot {} >= cache.len() {}",
+                        s,
+                        self.cache_slots.len()
+                    );
+                }
+                if !seen.insert(s) {
+                    anyhow::bail!("duplicate slot {} in rollback", s);
+                }
+            }
+            self.cache_slots = accepted
+                .iter()
+                .map(|&i| self.cache_slots[i])
+                .collect();
+            Ok(())
+        }
+        fn clear_cache(&mut self) {
+            self.cache_slots.clear();
+        }
+    }
+
+    #[test]
+    fn adr_037_e6_cache_orchestrator_root_only_no_expansion_2026_05_22() {
+        // budget=1 → no expansion past root, cache should remain
+        // empty (no predict_topk calls).
+        let cfg = DynamicTreeConfig {
+            budget: 1,
+            max_depth: 4,
+            top_k: 3,
+        };
+        let inner = MockDrafter::default();
+        let mut mock = CacheTrackingMock::new(inner);
+        let tree = expand_dynamic_tree_with_cache(123, &mut mock, &cfg)
+            .expect("expand");
+        assert_eq!(tree.len(), 1);
+        assert_eq!(mock.cache_len(), 0);
+        assert!(mock.rollback_history.is_empty());
+        assert!(mock.predict_entry_lens.is_empty());
+    }
+
+    #[test]
+    fn adr_037_e6_cache_orchestrator_linear_chain_no_rollbacks_2026_05_22() {
+        // top_k=1, max_depth=4, budget=5 → linear chain. Each
+        // expansion adds the only child; cache extends without ever
+        // rolling back.
+        let cfg = DynamicTreeConfig {
+            budget: 5,
+            max_depth: 4,
+            top_k: 1,
+        };
+        let inner = MockDrafter {
+            vocab_size: 1000,
+            base_log_prob: -0.5,
+            log_prob_slope: 0.0,
+        };
+        let mut mock = CacheTrackingMock::new(inner);
+        let tree = expand_dynamic_tree_with_cache(123, &mut mock, &cfg)
+            .expect("expand");
+        assert_eq!(tree.len(), 5);
+        // Orchestrator only EXPANDS up to max_depth-1: budget=5,
+        // max_depth=4 chains as root → A1 → A2 → A3 → A4. Expansions
+        // happen on root, A1, A2, A3 (4 predict_topk calls); A4 is
+        // admitted but new_depth==max_depth, so no expansion.
+        // Final cache.len() = 4.
+        assert_eq!(mock.cache_len(), 4);
+        // No rollbacks for linear chain.
+        assert!(
+            mock.rollback_history.is_empty(),
+            "linear chain should never rollback; got {:?}",
+            mock.rollback_history
+        );
+        // Cache len at predict_topk entry = depth of node = 0,1,2,3.
+        assert_eq!(mock.predict_entry_lens, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn adr_037_e6_cache_orchestrator_sibling_expansion_triggers_rollback_2026_05_22() {
+        // Setup designed to force best-first to switch between
+        // branches: budget=4, top_k=3, max_depth=2. Root expands to
+        // 3 children A,B,C (cum -0.5 each via slope 0). Best-first
+        // pops in seq order: A first. Then A is expanded to depth 2.
+        // After admitting 1 of A's grandchildren (cum -1.0), the
+        // next best on heap is B (cum -0.5) vs A's other
+        // grandchildren (cum -1.0+...). With slope -0.5 for the
+        // CHILDREN slot ordering: children cumulative drop steeply.
+        //
+        // We use BiasedMockDrafter to make some subtrees more
+        // attractive (deeper expansion) — but the key for this test
+        // is that we SEE at least one rollback when expansion
+        // switches between branches.
+        let cfg = DynamicTreeConfig {
+            budget: 6,
+            max_depth: 2,
+            top_k: 3,
+        };
+        // Inner with steep slope so cumulative log_probs spread out.
+        let inner = MockDrafter {
+            vocab_size: 1000,
+            base_log_prob: -0.5,
+            log_prob_slope: -1.0,
+        };
+        let mut mock = CacheTrackingMock::new(inner);
+        let tree = expand_dynamic_tree_with_cache(0, &mut mock, &cfg)
+            .expect("expand");
+        // Tree should fill the budget.
+        assert_eq!(tree.len(), 6);
+        // Should have at least one rollback because expanding multiple
+        // depth-1 children means switching branches.
+        assert!(
+            !mock.rollback_history.is_empty(),
+            "expected at least one rollback when expanding multiple branches"
+        );
+        // The cache invariant must have held at every predict_topk call
+        // (the mock asserts this in predict_topk).
+        // Cache len after each predict_topk = depth(node)+1 (root has
+        // depth 0, so call 1 leaves cache.len()=1).
+        assert!(
+            !mock.predict_entry_lens.is_empty(),
+            "must have expansion calls"
+        );
+    }
+
+    #[test]
+    fn adr_037_e6_cache_orchestrator_clear_called_at_entry_2026_05_22() {
+        // Pre-populate the mock cache, then verify expand clears it
+        // before starting.
+        let cfg = DynamicTreeConfig {
+            budget: 2,
+            max_depth: 1,
+            top_k: 1,
+        };
+        let inner = MockDrafter::default();
+        let mut mock = CacheTrackingMock::new(inner);
+        mock.cache_slots = vec![99, 88, 77]; // garbage from a previous call
+        let _ = expand_dynamic_tree_with_cache(0, &mut mock, &cfg)
+            .expect("expand should clear cache at entry");
+        // budget=2 max_depth=1: root expanded once (1 call), child
+        // admitted but new_depth==max_depth so no expansion. Final
+        // cache.len() = 1.
+        assert_eq!(mock.cache_len(), 1);
+        // First predict_topk should have seen cache.len()=0 (cleared).
+        assert_eq!(mock.predict_entry_lens[0], 0);
+    }
+
+    #[test]
+    fn adr_037_e6_cache_orchestrator_rollback_invariant_2026_05_22() {
+        // After any rollback, the cache_nodes (in our mock, simulated
+        // by cache_slots) must be a prefix of the ancestor chain of
+        // the node about to be expanded. The mock's predict_topk
+        // asserts cache.len()+1 == path.len() at entry — covered
+        // implicitly. Here we verify rollback_history contents make
+        // sense.
+        let cfg = DynamicTreeConfig {
+            budget: 4,
+            max_depth: 2,
+            top_k: 3,
+        };
+        let inner = MockDrafter {
+            vocab_size: 1000,
+            base_log_prob: -0.5,
+            log_prob_slope: -1.0,
+        };
+        let mut mock = CacheTrackingMock::new(inner);
+        let _ = expand_dynamic_tree_with_cache(0, &mut mock, &cfg)
+            .expect("expand");
+        // Each rollback's slots must be sorted-ascending (orchestrator
+        // builds them via root→parent ancestor walk).
+        for slots in &mock.rollback_history {
+            for w in slots.windows(2) {
+                assert!(
+                    w[0] < w[1],
+                    "rollback slots should be ascending root→parent, got {:?}",
+                    slots
+                );
+            }
         }
     }
 
