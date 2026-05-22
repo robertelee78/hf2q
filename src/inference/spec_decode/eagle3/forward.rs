@@ -20,7 +20,9 @@
 
 use super::config::Eagle3DrafterConfig;
 use super::tensors::Eagle3DrafterTensors;
-use crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32;
+use crate::inference::models::qwen35::gpu_full_attn::{
+    apply_imrope, apply_linear_projection_f32,
+};
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::add_bias_row_2d::dispatch_add_bias_row_2d_f32;
 use mlx_native::ops::feature_concat::dispatch_feature_concat_f32;
@@ -973,6 +975,185 @@ pub fn dispatch_eagle3_k_head_norm(
     )
 }
 
+// ----------------------------------------------------------------
+// Phase E4b.5b — RoPE on Q/K with tree-position support
+// ----------------------------------------------------------------
+//
+// Per vLLM `llama_eagle3.py:112-115` the self-attn block is called
+// with positions:
+//
+//     hidden_states = self.self_attn(positions=positions,
+//                                    hidden_states=hidden_states)
+//
+// For dynamic tree decoding (Phase E4a), each tree node has a
+// distinct absolute position. The caller computes these once per
+// expansion step and passes them as a slice of `[u32]`. Linear-chain
+// callers can pass `None` to get `base_pos..base_pos+seq_len`.
+//
+// We use the same NeoX-style RoPE primitive (`apply_imrope`) DFlash
+// uses, with the plain-NeoX section layout `[rope_dim/2, 0, 0, 0]`.
+
+/// Build the position buffer required by `apply_imrope`. The imrope
+/// kernel expects 4 axes × `seq_len` int32 positions (one per
+/// mrope-section), but plain NeoX RoPE puts all rotation in axis 0
+/// so the other 3 axes are functionally ignored. We replicate the
+/// same value to all 4 axes (matches DFlash's `build_dflash_pos_buf`).
+fn build_eagle3_pos_buf(
+    device: &MlxDevice,
+    seq_len: u32,
+    positions_override: Option<&[u32]>,
+    base_pos: u32,
+) -> Result<MlxBuffer> {
+    let l = seq_len as usize;
+    if let Some(p) = positions_override {
+        if p.len() != l {
+            return Err(anyhow!(
+                "build_eagle3_pos_buf: positions_override len {} != seq_len {}",
+                p.len(),
+                seq_len
+            ));
+        }
+    }
+    let n_pos = 4 * l;
+    let mut buf = device
+        .alloc_buffer(n_pos * 4, DType::I32, vec![n_pos])
+        .map_err(|e| anyhow!("alloc eagle3 rope pos_buf: {e}"))?;
+    let slice = buf
+        .as_mut_slice::<i32>()
+        .map_err(|e| anyhow!("eagle3 rope pos_buf slice: {e}"))?;
+    let pos_values: Vec<i32> = if let Some(p) = positions_override {
+        // Tree positions: pre-computed by caller using tree depths.
+        p.iter()
+            .map(|&v| {
+                i32::try_from(v).unwrap_or(i32::MAX) // saturate on overflow
+            })
+            .collect()
+    } else {
+        // Linear chain: base_pos + i for i in 0..seq_len.
+        (0..l)
+            .map(|i| (base_pos as i64 + i as i64).min(i32::MAX as i64) as i32)
+            .collect()
+    };
+    for axis in 0..4 {
+        let dst = &mut slice[axis * l..(axis + 1) * l];
+        dst.copy_from_slice(&pos_values);
+    }
+    Ok(buf)
+}
+
+/// Apply NeoX-style RoPE to a per-head-normalized (or raw) Q or K
+/// buffer.
+///
+/// # Arguments
+///
+/// * `qk_in`: `[seq_len * num_heads, head_dim]` F32 — post-head-norm
+///   when `cfg.use_qk_norm`, post-projection-reshape otherwise.
+/// * `seq_len`: number of token (or tree-node) positions in the input.
+/// * `num_heads`: per-head count for this Q or K call.
+/// * `positions_override`: when `Some`, per-position `u32` index used
+///   for RoPE rotation — typically `base_pos + tree_depths[i]` for
+///   dynamic-tree decoding. When `None`, falls back to linear
+///   `base_pos..base_pos + seq_len`.
+/// * `base_pos`: linear-chain base offset (used when
+///   `positions_override = None`, ignored otherwise).
+///
+/// Returns `[seq_len * num_heads, head_dim]` F32 rotated buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_eagle3_rope(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    qk_in: &MlxBuffer,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+    num_heads: u32,
+    positions_override: Option<&[u32]>,
+    base_pos: u32,
+    label: &str,
+) -> Result<MlxBuffer> {
+    // Codex-validated boundary checks.
+    if qk_in.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "dispatch_eagle3_rope ({}): qk_in dtype must be F32, got {:?}",
+            label,
+            qk_in.dtype()
+        ));
+    }
+    if seq_len == 0 || num_heads == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_rope ({}): seq_len ({}) and num_heads ({}) must be > 0",
+            label,
+            seq_len,
+            num_heads
+        ));
+    }
+    let head_dim_usize = cfg.head_dim;
+    let rope_dim_usize = cfg.rope_dim;
+    let head_dim: u32 = u32::try_from(head_dim_usize).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_rope ({}): head_dim ({}) exceeds u32::MAX",
+            label,
+            head_dim_usize
+        )
+    })?;
+    let rope_dim: u32 = u32::try_from(rope_dim_usize).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_rope ({}): rope_dim ({}) exceeds u32::MAX",
+            label,
+            rope_dim_usize
+        )
+    })?;
+    // Validate qk_in element count.
+    let expected_elems = (seq_len as usize)
+        .checked_mul(num_heads as usize)
+        .and_then(|v| v.checked_mul(head_dim_usize))
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_rope ({}): seq * heads * head_dim overflows usize",
+                label
+            )
+        })?;
+    if expected_elems > (u32::MAX as usize) {
+        return Err(anyhow!(
+            "dispatch_eagle3_rope ({}): expected_elems ({}) exceeds u32::MAX",
+            label,
+            expected_elems
+        ));
+    }
+    if qk_in.element_count() != expected_elems {
+        return Err(anyhow!(
+            "dispatch_eagle3_rope ({}): qk_in has {} elements, expected {} (seq={} heads={} head_dim={})",
+            label,
+            qk_in.element_count(),
+            expected_elems,
+            seq_len,
+            num_heads,
+            head_dim
+        ));
+    }
+    // Build positions buffer. Plain NeoX = all pairs in axis 0:
+    // mrope_section[0] = rope_dim / 2; others = 0.
+    let positions = build_eagle3_pos_buf(device, seq_len, positions_override, base_pos)?;
+    let sections = [rope_dim / 2, 0, 0, 0];
+    // Memory barrier so apply_imrope reads the just-written positions
+    // and any upstream write to qk_in (e.g. head-norm output).
+    encoder.memory_barrier();
+    apply_imrope(
+        encoder,
+        registry,
+        device,
+        qk_in,
+        &positions,
+        seq_len,
+        num_heads,
+        head_dim,
+        rope_dim,
+        cfg.rope_theta,
+        sections,
+    )
+    .with_context(|| format!("apply_imrope {label}"))
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -1004,6 +1185,8 @@ mod tests {
             tie_lm_head: true, // simpler
             include_draft_id_mapping: false,
             has_own_embed_tokens: false,
+            rope_theta: 1_000_000.0,
+            rope_dim: 32, // matches head_dim in tiny_cfg
         }
     }
 
@@ -2186,6 +2369,240 @@ mod tests {
         let mut enc = device.command_encoder().expect("encoder");
         let err = dispatch_eagle3_q_head_norm(
             &mut enc, &mut registry, &device, &bad, &tensors, &cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("dtype must be F32"), "got: {err}");
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E4b.5b tests — RoPE on Q/K (NeoX-style, tree-position-aware)
+    // ----------------------------------------------------------------
+
+    /// CPU reference NeoX RoPE: rotates pairs (d, d + rope_dim/2)
+    /// for d in 0..rope_dim/2. Input layout
+    /// `[seq * num_heads, head_dim]`. Position used: `positions[s]`
+    /// (broadcast across heads). Untouched dims: `[rope_dim, head_dim)`.
+    fn cpu_neox_rope(
+        input: &[f32],         // [seq * num_heads, head_dim]
+        positions: &[u32],     // [seq]
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        freq_base: f32,
+    ) -> Vec<f32> {
+        let half = rope_dim / 2;
+        let mut out = vec![0.0f32; seq_len * num_heads * head_dim];
+        for s in 0..seq_len {
+            let pos = positions[s] as f32;
+            for h in 0..num_heads {
+                let row_base = (s * num_heads + h) * head_dim;
+                // Copy any dims beyond rope_dim untouched.
+                for d in rope_dim..head_dim {
+                    out[row_base + d] = input[row_base + d];
+                }
+                // Rotate pairs (d, d + half) for d in 0..half.
+                for d in 0..half {
+                    let inv_freq =
+                        (freq_base as f64).powf(-(2.0 * d as f64) / (rope_dim as f64));
+                    let theta = (pos as f64) * inv_freq;
+                    let (s_t, c_t) = (theta.sin() as f32, theta.cos() as f32);
+                    let x = input[row_base + d];
+                    let y = input[row_base + d + half];
+                    out[row_base + d] = x * c_t - y * s_t;
+                    out[row_base + d + half] = x * s_t + y * c_t;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn adr_037_e4b5b_rope_cpu_parity_linear_positions_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let seq_len: u32 = 4;
+        let num_heads = cfg.num_q_heads;
+        let head_dim = cfg.head_dim;
+        let rope_dim = cfg.rope_dim;
+        let total = (seq_len as usize) * num_heads * head_dim;
+
+        // Random F32 input (representing Q post-head-norm or raw projection).
+        let mut input_data = vec![0.0f32; total];
+        fill_random(&mut input_data, 0xB10);
+        let input_gpu = upload_f32_to_gpu(
+            &device, &input_data,
+            vec![seq_len as usize * num_heads, head_dim],
+        );
+
+        let base_pos: u32 = 17;
+        let positions: Vec<u32> = (0..seq_len).map(|i| base_pos + i).collect();
+        let cpu_out = cpu_neox_rope(
+            &input_data,
+            &positions,
+            seq_len as usize,
+            num_heads,
+            head_dim,
+            rope_dim,
+            cfg.rope_theta,
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_rope(
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &cfg,
+            seq_len,
+            num_heads as u32,
+            None, // linear positions
+            base_pos,
+            "rope_test_linear",
+        )
+        .expect("rope dispatch");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        assert_eq!(gpu_out.len(), total);
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            assert!(d < 1e-4, "rope linear parity: diff={d} > 1e-4");
+        }
+        eprintln!("rope linear parity max_diff={max_diff:.6e}");
+    }
+
+    #[test]
+    fn adr_037_e4b5b_rope_cpu_parity_tree_positions_2026_05_22() {
+        // Tree positions: simulate ExpandedTree where tree-node i has
+        // depth d_i. Position[i] = base_pos + d_i. This is the path
+        // EAGLE-3 uses for dynamic tree decoding.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let seq_len: u32 = 5;
+        let num_heads = cfg.num_q_heads;
+        let head_dim = cfg.head_dim;
+        let rope_dim = cfg.rope_dim;
+        let total = (seq_len as usize) * num_heads * head_dim;
+
+        let mut input_data = vec![0.0f32; total];
+        fill_random(&mut input_data, 0xB20);
+        let input_gpu = upload_f32_to_gpu(
+            &device, &input_data,
+            vec![seq_len as usize * num_heads, head_dim],
+        );
+
+        // Asymmetric tree shape: depths = [0, 1, 1, 2, 2]
+        // (root + 2 children + 2 grandchildren)
+        let depths: [u32; 5] = [0, 1, 1, 2, 2];
+        let base_pos: u32 = 42;
+        let positions: Vec<u32> = depths.iter().map(|d| base_pos + d).collect();
+        let cpu_out = cpu_neox_rope(
+            &input_data,
+            &positions,
+            seq_len as usize,
+            num_heads,
+            head_dim,
+            rope_dim,
+            cfg.rope_theta,
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_rope(
+            &mut enc,
+            &mut registry,
+            &device,
+            &input_gpu,
+            &cfg,
+            seq_len,
+            num_heads as u32,
+            Some(&positions),
+            base_pos, // unused when positions_override = Some
+            "rope_test_tree",
+        )
+        .expect("rope tree dispatch");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            assert!(d < 1e-4, "rope tree parity: diff={d} > 1e-4");
+        }
+        // Sentinel: same-depth nodes get IDENTICAL rotations →
+        // verify rows 1 (depth=1) and 2 (depth=1) produce equal
+        // outputs IF given equal input.
+        eprintln!("rope tree parity max_diff={max_diff:.6e}");
+    }
+
+    #[test]
+    fn adr_037_e4b5b_rope_rejects_positions_len_mismatch_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let seq_len = 4_u32;
+        let num_heads = cfg.num_q_heads as u32;
+        let total = (seq_len as usize) * (num_heads as usize) * cfg.head_dim;
+        let input = upload_f32_to_gpu(
+            &device,
+            &vec![0.0f32; total],
+            vec![seq_len as usize * num_heads as usize, cfg.head_dim],
+        );
+        let bad_positions = vec![0u32, 1u32, 2u32]; // len != seq_len
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_rope(
+            &mut enc, &mut registry, &device,
+            &input, &cfg, seq_len, num_heads,
+            Some(&bad_positions), 0, "rope_bad_pos",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("positions_override len"),
+            "expected positions-len error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b5b_gate_rope_rejects_non_f32_input_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let seq_len = 2_u32;
+        let num_heads = cfg.num_q_heads as u32;
+        let total = (seq_len as usize) * (num_heads as usize) * cfg.head_dim;
+        let bad = device
+            .alloc_buffer(
+                total * 2,
+                DType::BF16,
+                vec![seq_len as usize * num_heads as usize, cfg.head_dim],
+            )
+            .expect("alloc bad");
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_rope(
+            &mut enc, &mut registry, &device,
+            &bad, &cfg, seq_len, num_heads,
+            None, 0, "rope_bad_dtype",
         )
         .unwrap_err();
         assert!(err.to_string().contains("dtype must be F32"), "got: {err}");

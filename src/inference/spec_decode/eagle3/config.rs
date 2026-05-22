@@ -88,6 +88,13 @@ pub struct Eagle3DrafterConfig {
     /// Default true for backward-compat; published EAGLE-3 checkpoints
     /// usually omit duplicate embeddings to save disk.
     pub has_own_embed_tokens: bool,
+    /// RoPE base frequency. Qwen 3.6: 1_000_000; Llama 3: 500_000;
+    /// older Llama/Mistral: 10_000. Must be > 0.
+    pub rope_theta: f32,
+    /// RoPE rotation dimension. For full rotation: equals head_dim
+    /// (Qwen/Llama default). Partial-rotation models use a smaller
+    /// value. Must be even (RoPE rotates pairs) and `<= head_dim`.
+    pub rope_dim: usize,
 }
 
 impl Eagle3DrafterConfig {
@@ -182,6 +189,19 @@ impl Eagle3DrafterConfig {
             "num_aux_hidden_states must be <= 64 (matches Eagle3HiddenCollector)"
         );
         ensure!(self.rms_norm_eps > 0.0, "rms_norm_eps must be > 0");
+        ensure!(self.rope_theta > 0.0, "rope_theta must be > 0");
+        ensure!(self.rope_dim > 0, "rope_dim must be > 0");
+        ensure!(
+            self.rope_dim <= self.head_dim,
+            "rope_dim ({}) must be <= head_dim ({})",
+            self.rope_dim,
+            self.head_dim
+        );
+        ensure!(
+            self.rope_dim % 2 == 0,
+            "rope_dim ({}) must be even (RoPE rotates pairs)",
+            self.rope_dim
+        );
         // Overflow guards: fc_input_size + qkv_input_width fit in usize
         // at every realistic shape, but the multiply could overflow on
         // adversarial input.
@@ -224,6 +244,8 @@ pub(crate) mod tests {
             tie_lm_head: false,
             include_draft_id_mapping: true,
             has_own_embed_tokens: true,
+            rope_theta: 1_000_000.0, // Qwen 3.6 default
+            rope_dim: 128,           // full rotation (== head_dim above)
         }
     }
 

@@ -550,6 +550,8 @@ mod tests {
             tie_lm_head: false,
             include_draft_id_mapping: true,
             has_own_embed_tokens: true,
+            rope_theta: 1_000_000.0,
+            rope_dim: 32,
         }
     }
 
