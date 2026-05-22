@@ -83,7 +83,11 @@ Both workloads peak at BS=4 (corresponds to drafter proposing K=3 drafts per rou
 
 The divergence point ("rapidly" vs "weekly", position ~14) is precisely the BF16-vs-F32 precision flip — at that position the top-2 logits are within F32 epsilon, BF16's reduced mantissa rounds differently, the argmax flips. Both paths produce coherent, semantically correct text.
 
-**Remaining structural lever (multi-week, not single-iteration scope)**: fused projections Metal kernel — a single Metal dispatch combining norm + Q+K+V+Gate matmuls + per-head norms + RoPE for small batch (seq_len in [2, 8]). Unlocks all three opt-in cells (A 35B-A3B + B + C) by eliminating ~10 launch overheads per FA layer per forward (the fa.ops1_4 = 4.298 ms at seq_len=2 cur_len>0 is COMPUTE on small batch, not commit-boundary overhead — empirically falsified by task #89 Step 3b's 3-rep paired bench at commit 91a14fbf).
+**Remaining structural lever (CORRECTED via peer-code read 2026-05-21, multi-week, not single-iteration scope)**: **compiled chained drafter forward** — a Rust equivalent of MTPLX's `mx.compile(draft2_fn, ...)` pattern (see `/opt/MTPLX/mtplx/generation.py:2174`). MTPLX achieves 2.24× over their base by COMPILING the D=2 chained drafter into ONE Metal command buffer with internal data dependencies, eliminating the ~17 `commit_and_wait` boundaries that the current Rust drafter has (DFlash drafter has 2 per attention block × 5 layers + prelude/epilogue ≈ 17 CB commits; each ~500μs-1ms).
+
+Saved cost: ~8-17 ms per drafter forward × per round → ~10-20% DFlash throughput. Plus same lever applies to K=N MTP path (currently bottlenecked on per-iteration CPU sync between MTP depth=1 and depth=2 calls).
+
+**Previously-believed target REVISED**: I previously documented "fused projections Metal kernel" (single dispatch for norm + Q+K+V+Gate + per-head norms + RoPE) as the structural lever. Reading MTPLX's `/opt/MTPLX/native_extensions/verify_mlp/gate_up/gate_up.metal` shows their only attention-side fused kernel is the MLP (gate + up + silu_mul, which corresponds to our task #93 SHIPPED). They do NOT have a fused projections kernel either. Their advantage is the compiled drafter, not a deeper attention fusion. Task #89's vec-extension building blocks (Steps 1-3b SHIPPED) remain useful but don't unlock the perf gap — the real gap is the drafter compile pattern.
 
 **Task #89 building blocks shipped** (ready for future fused-projections work):
 - `flash_attn_vec` extended to qL>=1 (mlx-native 471c769) — parity-verified at qL=1,2,4,8
