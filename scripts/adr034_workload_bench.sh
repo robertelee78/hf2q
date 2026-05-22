@@ -155,6 +155,10 @@ echo "    Code-gen: Base 22.0, MTP greedy 29.9 @ 91%, MTP MH 28.6 @ 84%, DFlash 
 echo "  Post task #95 sub-iter H (HEAD 1f130770 2026-05-22, warmup-corrected):"
 echo "    Essay:    Base 21.9, MTP greedy 26.4 @ 68%, MTP MH 27.5 @ 78%, DFlash BS=2 20.7, BS=4 21.0"
 echo "    Code-gen: Base 22.0, MTP greedy 30.0 @ 91%, MTP MH 28.6 @ 84%, DFlash BS=2 21.6, BS=4 23.2"
+echo "  Post K=N CORRECTION + ADR scrub (HEAD e044131d 2026-05-22, warmup-corrected, stability validation):"
+echo "    Essay:    Base 21.9, MTP greedy 26.6 @ 68%, MTP MH 27.6 @ 78%, DFlash BS=2 20.8, BS=4 21.0"
+echo "    Code-gen: Base 22.0, MTP greedy 30.0 @ 91%, MTP MH 28.7 @ 84%, DFlash BS=2 21.6, BS=4 23.1"
+echo "    State stable vs sub-iter H (±0.2 t/s noise band). No regression from task #96 revert + ADR correction."
 echo
 echo "Production recommendation:"
 echo "  Code-gen / deterministic: HF2Q_SPEC_DECODE=1 --temperature 0     (1.36x base, MTP K=1 greedy wins)"
