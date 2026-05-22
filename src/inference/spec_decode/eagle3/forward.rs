@@ -1409,6 +1409,13 @@ pub fn dispatch_eagle3_o_proj(
     cfg: &Eagle3DrafterConfig,
     q_seq_len: u32,
 ) -> Result<MlxBuffer> {
+    // Codex /cfa E4b.7 Major (2026-05-22): RAW barrier before reading
+    // attn_out. In the chained orchestrator path, attn_out is
+    // tree_attention's output (written by the prior kernel dispatch in
+    // the same encoder). Without this barrier, the o_proj matmul could
+    // read partially-written data. Mirrors the pattern from E4b.5a
+    // (head_norm) and E4b.6 (tree_attention).
+    encoder.memory_barrier();
     dispatch_eagle3_projection_with_optional_bias(
         encoder, registry, device,
         attn_out,
