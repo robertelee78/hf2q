@@ -39,4 +39,5 @@ pub mod dynamic_tree;
 pub mod forward;
 pub mod multi_layer_hidden;
 pub mod tensors;
+pub mod tree_walk;
 pub mod weights;
