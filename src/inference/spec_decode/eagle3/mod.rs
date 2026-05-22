@@ -23,4 +23,6 @@
 //! to the drafter's hidden_size, then fed into a 1-layer transformer
 //! drafter alongside the input embeddings.
 
+pub mod config;
 pub mod multi_layer_hidden;
+pub mod weights;
