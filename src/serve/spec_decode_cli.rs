@@ -28,7 +28,7 @@
 //! historical "GREEN coherence" gate is itself superseded — the test
 //! asserts byte-identity but would fail past the divergence window
 //! (it's `#[ignore]`d in CI; needs re-scope to accept-walk consistency).
-//! See ADR-034 G3 row at line 1506.
+//! See ADR-034 G3 row at line 1501.
 //!
 //! Performance is currently SLOWER than baseline single-token decode
 //! (~10× slowdown at N=8 tokens on M5 Max) because the orchestrator's

@@ -43,7 +43,7 @@
 //! 26B-A4B-it Q5_K_M, Fibonacci prompt, temp=0 greedy): Option A
 //! diverges from base at ~135 tokens (single-token argmax flip
 //! `element` → `term`), Option C diverges from token 1. See ADR-034
-//! §START HERE G3 row at line 1506 + §3.5b empirical caveat at line
+//! §START HERE G3 row at line 1501 + §3.5b empirical caveat at line
 //! 1647 for the full framework-level analysis.
 //!
 //! Phase 4 first piece (this commit): orchestrator state struct + the
@@ -160,7 +160,7 @@ pub fn step_round_from_argmaxes(
 /// temp=0 greedy): Option A diverges at ~135 tokens via single-token
 /// argmax flip (`element` → `term`), cascading thereafter; Option C
 /// (re-prefill) diverges from token 1. See ADR-034 G3 row + §3.5b
-/// empirical caveat at line 1647 for the full framework-level analysis.
+/// empirical caveat at line 1654 for the full framework-level analysis.
 pub fn dispatch_dflash_spec_decode_round_target_side<T: super::target::DFlashTarget>(
     target: &mut T,
     last_committed_token: u32,
@@ -222,8 +222,8 @@ pub fn dispatch_dflash_spec_decode_round_target_side<T: super::target::DFlashTar
 /// `flash_attn_vec` (F32); argmax flips on close logits compound
 /// across rounds. Empirical at HEAD `6ad9d04c` 2026-05-22: Gemma
 /// DFlash Option A diverges from base at ~135 tokens; Option C from
-/// token 1. See ADR-034 G3 row at line 1506 + §3.5b empirical caveat
-/// at line 1647.
+/// token 1. See ADR-034 G3 row at line 1501 + §3.5b empirical caveat
+/// at line 1654.
 ///
 /// Proof chain (for within-orchestrator accept-walk consistency):
 /// - Drafter is consulted but its drafts only commit when they match
@@ -1252,7 +1252,7 @@ mod tests {
     /// re-scoped to verify accept-walk-internal consistency (spec-decode
     /// output equals what its OWN batched verifier would emit on the
     /// same KV state), not byte-identity to base. See ADR-034 G3 row
-    /// at line 1506 + §3.5b empirical caveat at line 1647.
+    /// at line 1501 + §3.5b empirical caveat at line 1654.
     ///
     /// If this test fails: investigate by per-token diff between
     /// baseline_new and spec_new. The first divergence position
@@ -1497,7 +1497,7 @@ mod tests {
         // flips on close logits compound across rounds. This gate
         // would fail past the divergence window. Needs re-scope to
         // accept-walk-internal consistency. See ADR-034 G3 row at
-        // line 1506.
+        // line 1501.
         // -----------------------------------------------------------------
         assert_eq!(
             spec_new.len(),

@@ -1288,7 +1288,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // OWN batched-prefill verifier argmax (NOT byte-identical to
     // single-token decode — at HEAD 6ad9d04c Option A diverges at
     // ~135 tok via single-token argmax flip; Option C from token 1;
-    // see ADR-034 §START HERE Cell C row + G3 gate at line 1506).
+    // see ADR-034 §START HERE Cell C row + G3 gate at line 1501).
     // Performance:
     //   Option A (HF2Q_DFLASH_XLEN_SDPA=1 + HF2Q_FULL_F16_KV=1):
     //     45.7 t/s = 0.40× base 113.2 t/s (1.62× over Option C).
@@ -2884,7 +2884,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // spec path's OWN batched-prefill verifier argmax is preserved
     // at temperature=0 (NOT byte-identity to single-token decode —
     // empirically falsified at HEAD 6ad9d04c; see ADR-034 G3 row
-    // at line 1506 + qwen35_orchestrator.rs module doc).
+    // at line 1501 + qwen35_orchestrator.rs module doc).
     //
     // Empirical perf validated at HEAD 334008e9 2026-05-22 — see
     // ADR-034 Cell B 27B (0.77x of MTP K=1 greedy) + Cell B 35B-A3B

@@ -22,7 +22,7 @@
 
 ---
 
-## 🎯 START HERE — Current state at HEAD `dddfc1b5` (2026-05-22)
+## 🎯 START HERE — Current state at HEAD `f0a413ef` (2026-05-22)
 
 > **READ THIS FIRST.** §1 and §2 below describe the audit baseline at HEAD `eab0220b`
 > (2026-05-19) — substantial work has landed since. This section is the authoritative
@@ -39,7 +39,11 @@
 | **C — Gemma 4 26B DFlash** | ⚠️ **COHERENT, Option A WIRED + 1.62× over Option C + byte-identical to base for ~135 tokens then diverges via argmax flip; still 0.40× of base generation rate** | Empirical 3-rep paired bench at HEAD `7da12c37` (2026-05-22, Gemma 4 26B-A4B-it Q5_K_M, `HF2Q_FULL_F16_KV=1`, 64 tok code-gen, generation rate per `--- mlx-native: [ Prompt: X t/s \| Generation: Y t/s ]`): **Base generation 113.2 t/s (112.7/114.8/112.1); Option A (HF2Q_DFLASH_XLEN_SDPA=1) 45.7 t/s = 0.40× base; Option C (default, re-prefill from start_pos=0) 28.2 t/s = 0.25× base. Option A delivers 1.62× over Option C.** Coherence empirically validated at HEAD `6a8a8f6f` 2026-05-22 (Fibonacci prompt, 64/128/256 tok temp=0 greedy): Option A is byte-identical to base autoregressive for ~135 tokens then diverges at a single-token argmax flip (`# Iterate from the 3rd element` base vs `# Iterate from the 3rd term` Option A), cascading to fully different code structure by 256 tok (`print(f"Fibonacci sequence ...")` base vs `result = fibonacci_sequence(n_terms); print(f"The first ...")` Option A). Same BF16/F16 precision divergence root cause as Qwen35 DFlash but with much longer prefix-safe window (Gemma has ~135 tok before divergence vs Qwen35 27B DFlash ~30 tok). Option C produces a DIFFERENT coherent response from start (`"Here is the standard, most efficient way..."`) — Option C's re-prefill F16/BF16 accumulation order flips argmax much earlier. Option A is BOTH faster AND more faithful to autoregressive for the first ~135 tokens. Earlier ADR claim "Option A pending / required for perf gate" was MISLEADING: orchestrator branch + forward_prefill_batched resume-SDPA already wired at orchestrator.rs:802-855 / forward_prefill_batched.rs:578-583. Gating: `HF2Q_DFLASH_XLEN_SDPA=1` + `HF2Q_FULL_F16_KV=1` (xlen SDPA requires F16 V cache, NOT compatible with TQ-HB 8-bit V quantization). | Option A is the better Gemma DFlash path (when user accepts F16 KV memory cost) — faster than Option C AND longer prefix-safe window vs base, even though both eventually diverge. Still 0.40× of base generation — DFlash drafter overhead exceeds Gemma's compact autoregressive cost regardless of verifier path. Production parity requires drafter training (smaller drafter) or tree decoding. Historical Q8_0 paired bench at HEAD `6d80e6be` 2026-05-21 (Option C, pre-Option-A-discovery): base 92.9, DFlash 19.2 = 0.21× of base — also research-quality. |
 | **D — Gemma 4 -assistant** | Phase 7, deferred | Not in v1 scope | — |
 
-### Mission status at HEAD `dddfc1b5` (2026-05-22) — FUNCTIONALLY COMPLETE
+### Mission status at HEAD `f0a413ef` (2026-05-22) — FUNCTIONALLY COMPLETE + EMPIRICALLY VALIDATED
+
+> **Empirical validation at HEAD `f0a413ef`** (3-rep paired, this session): ALL 12 cell-level configurations match documented values within ±0.3 t/s noise. **Dense Qwen 3.6 27B Q8_0 (10 configs)**: code-gen Base 21.93 / MTP greedy 29.93 @ 91% (**1.36× = code-gen WINNER**) / MTP MH 0.5 28.77 @ 84% / DFlash BS=2 21.63 / BS=4 23.17 (0.77× of MTP greedy); essay Base 21.90 / MTP greedy 26.57 @ 68% / MTP MH 0.5 27.57 @ 78% (**1.26× = essay WINNER**) / DFlash BS=2 20.73 / BS=4 20.97. **MoE Qwen 3.5 35B-A3B Q4_K_M (2 configs)**: Base 136.13 / K=0 auto 113.63 @ 93.7% (0.83× base — spec still net-negative on MoE).
+
+> **Planned-test reality check**: ADR-034 plan text references several harness scripts that **were never actually created** at HEAD `f0a413ef`: `scripts/spec_bench.sh`, `scripts/adr034_gate.sh`, `tests/parity/mtp_python_ref.rs`, `tests/parity/dflash_python_ref.rs`, `scripts/mtp_parity.py`, `scripts/dflash_dump_wrapper.py`. The actually-existing parity scripts are at `scripts/parity/{mtp_parity.py,dflash_parity.py}` (note the different path). Plan text mentioning the never-created scripts is HISTORICAL and should be read as planning, not as current deliverables.
 
 **Production winner is workload-dependent**:
 

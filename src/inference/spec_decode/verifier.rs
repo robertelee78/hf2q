@@ -130,7 +130,7 @@ pub trait Verifier {
 /// is NOT the case — the batched-prefill verifier (F16/BF16) differs
 /// from single-token decode (F32 `flash_attn_vec`); argmax flips on
 /// close logits compound across rounds. See ADR-034 G3 row at line
-/// 1506 + §3.5b empirical caveat at line 1647. The synthetic
+/// 1501 + §3.5b empirical caveat at line 1654. The synthetic
 /// `GroundTruthVerifier` test below uses a deterministic CPU oracle
 /// so within that test the contract holds by construction; the
 /// contract does NOT extend to real models.
@@ -486,8 +486,8 @@ mod tests {
         // Real models have batched-prefill verifier kernels (F16/BF16)
         // that differ from single-token decode (F32 flash_attn_vec);
         // argmax flips on close logits compound across rounds. See
-        // ADR-034 §START HERE G3 row at line 1506 + §3.5b empirical
-        // caveat at line 1647 for the falsified base-byte-identity
+        // ADR-034 §START HERE G3 row at line 1501 + §3.5b empirical
+        // caveat at line 1654 for the falsified base-byte-identity
         // claim across all 4 real spec-decode paths.
         let prompt = vec![1u32, 2, 3, 1, 2, 3, 4]; // has [1,2,3] repetition for proposer
         let vocab = 256u32;
