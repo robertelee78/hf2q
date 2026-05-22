@@ -125,6 +125,17 @@ impl<'a> GpuDrafter<'a> {
             expected_target_aux,
             cfg.fc_input_size()
         );
+        // Codex /cfa E4b.10b.3 Minor (2026-05-22): also validate the
+        // shape dimensions match the documented [1, fc_input_size]
+        // contract (element_count alone allows [fc_input_size] or
+        // [fc_input_size, 1] to pass).
+        let shape = target_aux.shape();
+        ensure!(
+            shape == [1, expected_target_aux],
+            "GpuDrafter::new: target_aux shape {:?} != [1, {}]",
+            shape,
+            expected_target_aux
+        );
         Ok(Self {
             cfg,
             tensors,
@@ -205,9 +216,36 @@ impl<'a> Drafter for GpuDrafter<'a> {
             .map_err(|e| anyhow!("GpuDrafter::predict_topk: embed slice: {e}"))?
             .copy_from_slice(&embed_vec);
 
+        // Codex /cfa E4b.10b.3 Major fix (2026-05-22): position is
+        // depth-adjusted via `path.len() - 1` so deeper tree nodes
+        // get different RoPE positions. Prior version passed
+        // `self.base_pos` unchanged for all depths — every node got
+        // the SAME RoPE position which produced identical attention
+        // patterns at every depth.
+        let depth_from_root = path.len() - 1; // node_to_expand's depth
+        let depth_u32: u32 = u32::try_from(depth_from_root).map_err(|_| {
+            anyhow!(
+                "GpuDrafter::predict_topk: depth {} exceeds u32::MAX",
+                depth_from_root
+            )
+        })?;
+        let abs_pos = self.base_pos.checked_add(depth_u32).ok_or_else(|| {
+            anyhow!(
+                "GpuDrafter::predict_topk: base_pos {} + depth {} overflows u32",
+                self.base_pos,
+                depth_u32
+            )
+        })?;
         // Run the full forward chain via the orchestrator helper.
-        // Note: we re-derive base_pos via `path.len() - 1` for the
-        // single-token decode (last-position-in-path).
+        // NOTE (codex /cfa E4b.10b.3 Major #1, deferred to E4b.10b.4):
+        // single-token decode here means deeper nodes are NOT
+        // conditioned on the full root-to-node draft prefix or
+        // drafter KV state. The forward sees only the LAST path
+        // token + target_aux + the depth-adjusted RoPE position.
+        // This is correct for the tree's depth-1 children (root
+        // depth + 1 RoPE) but loses ancestor-token conditioning
+        // for depth >= 2. Full path conditioning requires drafter
+        // KV cache management (next iter).
         let logits_vec = super::forward::dispatch_eagle3_drafter_forward(
             self.device,
             self.registry,
@@ -216,7 +254,7 @@ impl<'a> Drafter for GpuDrafter<'a> {
             self.tensors,
             self.cfg,
             1, // seq_len = 1 (single-token decode)
-            self.base_pos,
+            abs_pos,
         )?;
 
         // Extract top-K from logits row.
