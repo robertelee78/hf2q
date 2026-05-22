@@ -10,6 +10,7 @@
 //! accessible but no caller exists in `cmd_generate*` until Phase 3.
 
 pub mod dflash;
+pub mod eagle3;
 pub mod ngram_orchestrator;
 pub mod ngram_proposer;
 pub mod verifier;
