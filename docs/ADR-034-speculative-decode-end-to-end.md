@@ -271,6 +271,57 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 13) — MTPLX peer-code read + H2 hypothesis falsification (HEAD `5be21730`)
+
+**Peer-code finding** (corrects prior assumption):
+
+Deep-read of MTPLX `/opt/MTPLX/mtplx/generation.py` (5713 LOC). Key facts:
+
+1. **MTPLX uses BATCHED verify just like us** (line 4709):
+   ```python
+   verify_input = [primary] + draft_tokens
+   verify_logits, verify_hidden = rt.forward_ar(mx.array([verify_input]), ...)
+   ```
+   Not sequential single-token verifies as previously speculated.
+
+2. **The real structural difference is fused drafter** (line 2133,
+   `_make_device_d2_draft_core`):
+   ```python
+   compiled = mx.compile(draft2_fn, ...)
+   ```
+   MTPLX's D=2 fast path uses `mx.compile` to fuse both MTP forwards (depth 1
+   and depth 2) into a SINGLE dispatch. Our path has 2 separate Metal dispatches
+   per K=2 chain. Drafter latency is the structural gap.
+
+3. **MTPLX fast path requires `draft_sampler.temperature <= 0` (greedy
+   drafter)**. Verifier can still be MH/stochastic.
+
+**H2 hypothesis (testable)**: Greedy drafter + MH verifier might match our
+stochastic-drafter MH at lower drafter cost (no CPU download / softmax /
+sample per step). Approximated by `--temperature 0.001` (near one-hot drafter
+q ~ δ).
+
+**3-rep paired bench (Qwen 3.6 27B Q8_0, 200 tok --ignore-eos)**:
+
+| Mode                            | tok/s mean | Accept | vs temp=0.5 |
+|---------------------------------|-----------:|-------:|------------:|
+| K=1 BATCHED MH temp=0.001       |      23.93 |  60.0% | -8.4%       |
+| K=1 BATCHED MH temp=0.5 (best)  |      26.13 |  74.6% | 0           |
+
+**H2 FALSIFIED.** temp=0.001 is SLOWER (-8.4%) AND lower accept rate (-14.6pp).
+Accept rate at temp=0.001 (60.0%) matches K=1 BATCHED GREEDY, confirming that
+one-hot drafter devolves MH semantics to strict argmax-match.
+
+The MH speed gain at temp=0.5 comes from BOTH stochastic drafter (creates
+matches with verifier's stochastic-equivalent distribution) AND MH verifier
+(residual-sampling on reject). Greedy-drafter-only paths lose the boost.
+
+**Conclusion**: K=1 BATCHED MH temp=0.5 stochastic drafter remains production-best.
+Closing remaining gap to MTPLX 2.24× requires fused drafter kernel (mx.compile
+equivalent in mlx-native) — multi-week scope.
+
+Memory: `project_adr034_mtplx_peer_code_insights_2026_05_21`.
+
 ### Iteration 2026-05-21 (cont. 12) — Determinism + test validation at HEAD `2eaf904b`
 
 Two-track validation:
