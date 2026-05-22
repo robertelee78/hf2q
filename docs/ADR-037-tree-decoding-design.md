@@ -1,9 +1,18 @@
 # ADR-037 — EAGLE-3 with dynamic tree port (max coherence + perf)
 
-- **Status**: 📐 **DRAFT v2** — design + multi-week implementation plan
-- **Date**: 2026-05-22 (HEAD `9690fc69`)
+- **Status**: 🚧 **IN PROGRESS** — Phase E1.1 SHIPPED (foundation), E1.2-E8 remaining
+- **Date**: 2026-05-22 (HEAD `9690fc69` v2; mlx-native `310f5cb` Phase E1.1)
 - **Supersedes**: nothing
 - **Author note**: v1 (earlier in this conversation) recommended Medusa-first because it was "simpler to implement". Operator pushed back: *"why do you focus on simple instead of correct for max coherence and perf? ... it literally takes longer to do the wrong things many times, then eventually the right thing ... better to just do the right thing 1st"*. v2 commits to the empirically-best published architecture from the start.
+
+## Phase status
+
+| Phase | Status | Commit | Notes |
+|---|---|---|---|
+| E1.1 — tree=1 parity | ✅ SHIPPED | mlx-native `310f5cb` | 5/5 byte-identity tests PASS (dk256 basic/GQA/long/unaligned + dk512 basic). 6/6 lib unit tests PASS. Foundation derisked. |
+| E1.2-E1.5 — chain/fixed-tree/dynamic-tree/prefix+tree parity | ⏳ TODO | — | Next sub-iters |
+| E1 codex /cfa gate | ⏳ TODO | — | After E1.2-E1.5 |
+| E2-E8 | ⏳ TODO | — | Per §4 schedule |
 
 ## 0. The right thing first
 
