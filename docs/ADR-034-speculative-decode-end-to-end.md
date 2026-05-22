@@ -127,6 +127,75 @@ The shader itself doesn't take a query-index parameter — it assumes the single
 
 **Hypothesis-test protocol**: before kernel work, write a unit test that dispatches the existing `flash_attn_vec_dk256` shader with `MTLSize::new(2, n_heads, nwg)` and observes the output. Expected: garbage at output[h][1] (the second query slot) because the shader's threadgroup_position_in_grid.x is unused. If correct, this falsifies "trivially use grid.x=qL" and proves a kernel rewrite is needed.
 
+### Task #89 progress at HEAD `c14efb3b` (2026-05-21)
+
+**Step 1 (mlx-native 6857957)**: extended `flash_attn_vec` shader Q-lookup + abs_pos formulas to qL>=1. Backward-compatible at qL=1.
+
+**Step 2 (mlx-native 471c769)**: fixed S/M section offset (`nrows = n_heads * qL`) + reduce dispatch grid + qL-aware tmp buffer. 4 new parity tests on Qwen 3.6 27B FA shape at qL=1,2,4,8 — all PASS within 1e-2 F32. 9/9 flash_attn_vec integration tests pass.
+
+**Step 3a (hf2q c14efb3b)**: added `vec_small_path` branch in `apply_sdpa_with_kv_cache` for `head_dim==256 && cur_len>0 && seq_len in [2,8] && slot.k/v present`. Env opt-out `HF2Q_NO_VEC_SMALL_PATH=1`.
+
+3-rep paired bench (Qwen 3.6 27B Q8_0 DFlash BS=2, 128 tokens):
+
+| Path | rep 1 | rep 2 | rep 3 | avg |
+|---|---:|---:|---:|---:|
+| vec_small_path engaged | 14.2 | 14.1 | 14.3 | 14.2 |
+| vec_small_path disabled | 14.2 | 14.2 | 14.2 | 14.2 |
+| **delta** | | | | **0** |
+
+Empirically NEUTRAL — matches profile prediction (fa.sdpa_total = 5.6% of FA layer time so routing SDPA alone can't move the needle). Building block validated for Step 3b.
+
+Codex /cfa verdict on Step 3a: Critical 0, Major 0, Minor 1 (doc comment only, fixed in follow-up). Layout correct, no double-dispatch risk, no RAW hazards, Qwen35 has no softcap/sliding-window so hardcoded 0/0 is right. **Key Step 3b warning from codex: "the fused CB is deferred past function return, so q_hm and tmp_buf cannot be local scratch unless they are held in arena/hold-vec or the CB is committed before they drop."**
+
+### Step 3b plan (the actual perf lever — multi-iteration)
+
+Extend `use_fused_stage_ab` to allow `cur_len > 0 && seq_len < 16` so the ops1-4 + KV-write + SDPA + ops6-7 collapse into ONE Metal command buffer at spec-decode verify, eliminating ~3 separate-CB launch overheads per FA layer per forward (~4 ms savings at seq_len=2).
+
+**Per-file changes**:
+
+1. `gpu_full_attn.rs:2818` — extend predicate:
+   ```rust
+   let use_fused_stage_ab = use_arena
+       && fa_proj_arena.is_some()
+       && kv_cache_slot
+           .as_deref()
+           .map(|s| s.current_len[0] == 0
+               || (s.current_len[0] > 0 && seq_len < 16))  // NEW
+           .unwrap_or(false)
+       && !super::dump_bisect::is_enabled();
+   ```
+
+2. `gpu_full_attn.rs:3203` — remove `// == 0 by predicate` comment (now stale).
+
+3. `gpu_full_attn.rs:3258` — conditionally dispatch:
+   ```rust
+   if cur_len_u32 == 0 || seq_len >= 16 {
+       // existing fresh-prefill bridge
+       apply_flash_attn_prefill_seq_major_into(enc.encoder(), ..., fa_pre)?;
+   } else {
+       // NEW: vec dispatch inside fused encoder for cur_len > 0 + seq_len < 16
+       // 1. Permute arena.q_rope_buf SEQ→HEAD using permute_021_f32 with
+       //    SCRATCH FROM ARENA (NOT local — codex /cfa warning).
+       // 2. Allocate tmp via tmp_buffer_bytes_with_qL — also from arena.
+       // 3. flash_attn_vec(..., q_seq_len=seq_len) writes seq-major into
+       //    out_seq (which already has the right byte extent).
+       // 4. No commit; the encoder is moved into fused_stage_a_enc by the
+       //    caller for ops6-7 fusion.
+   }
+   ```
+
+4. `fa_projections_arena.rs` — add 2 new arena slots:
+   - `q_rope_hm_buf: MlxBuffer` shape `[nh, seq, d]` F32 — head-major Q for vec dispatch
+   - `flash_attn_vec_tmp_buf: MlxBuffer` sized via `tmp_buffer_bytes_with_qL(nh, d, max_qL=16)`
+
+5. Parity test: add an integration test that runs ONE FA layer at seq_len=2 + cur_len=64 through BOTH paths (fused-vec and current resume) and verifies byte-identical output within F32 tolerance.
+
+**Scope**: ~150 LOC core + ~100 LOC arena + ~150 LOC tests = ~400 LOC.
+
+**ROI estimate**: closing the 4.298 ms fa.ops1_4 cost difference at seq_len=2 saves ~16 ms per verify → DFlash BS=2 throughput 14.2 → ~18 t/s (+27%). Still below MTP K=1 BATCHED MH (30 t/s) but unlocks the path. Same lever helps Cell A 35B-A3B MoE (currently net-negative) and Cell C Gemma DFlash (currently 4.8× slower).
+
+**Risk**: this is at the heart of all FA layers. Production correctness depends on bit-identical output to the resume path. Mandatory parity tests before shipping.
+
 ### Data assets on disk
 
 | Asset | Location | Size | Use |

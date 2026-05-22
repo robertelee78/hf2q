@@ -2559,12 +2559,22 @@ pub fn apply_sdpa_with_kv_cache(
                     vec![nh, seq, d],
                 )
                 .map_err(|e| anyhow!("vec_small_path: alloc q_hm: {e}"))?;
-            // ── Allocate output buffer ──
+            // ── Reuse function-level out_buf ──
             //
             // Shader writes seq-major [seq, nh, d] (per
             // flash_attn_vec.metal:314 rid = iq2 + iq1 * n_heads).
-            // The function-level out_buf was allocated as `[seq, nh, d]`
-            // F32 earlier — reuse it directly.
+            // The function-level out_buf was allocated via
+            // pooled_alloc_buffer at line ~2251 with the metadata shape
+            // `vec![1, nh, seq, d]` (a head-major annotation — flat byte
+            // count `nh * seq * d * 4` is what matters for the kernel
+            // write + downstream ops6_7 flat consumption). The vec
+            // kernel writes seq-major into the same byte extent, which
+            // is what all apply_sdpa_with_kv_cache paths contract to
+            // return (the fallback at line ~2756 explicitly permutes
+            // HEAD→SEQ before returning; new_path / resume_path return
+            // seq-major buffers from the prefill kernel). Codex /cfa
+            // 2026-05-21 confirmed the layout is correct + flagged this
+            // comment was previously misleading.
             //
             // Tmp buffer sized for qL > 1.
             let tmp_bytes = flash_attn_vec_tmp_bytes_with_qL(
