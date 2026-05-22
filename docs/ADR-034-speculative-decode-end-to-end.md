@@ -40,7 +40,20 @@
 
 ### Mission status at HEAD `1fe56fbb` (2026-05-21) — FUNCTIONALLY COMPLETE
 
-**Production winner**: `HF2Q_SPEC_DECODE=1 --temperature 0.5` (auto-default when MTP weights present per task #87 / commit 3be36936). Delivers 27.5 ± 0.05 tok/s @ 77.8% MH accept on Qwen 3.6 27B Q8_0 (1.26× over base 21.9 tok/s).
+**Production winner is workload-dependent**:
+
+| Workload | Recommended config | Throughput on Qwen 3.6 27B Q8_0 |
+|---|---|---|
+| Code-gen / deterministic prompts | `HF2Q_SPEC_DECODE=1 --temperature 0` (greedy K=1 BATCHED) | **29.9 ± 0.1 tok/s @ 91.0% accept = 1.36× base** |
+| Essay / creative writing | `HF2Q_SPEC_DECODE=1 --temperature 0.5` (K=1 MH stochastic) | **27.5 ± 0.05 tok/s @ 77.8% accept = 1.26× base** |
+| Mixed | `--temperature 0.5` is the safer default (slightly worse on code-gen, much better on essay) | n/a |
+
+The auto-default when MTP weights present is K=1 BATCHED greedy (task #87 / commit 3be36936); MH activates only when caller sets temperature > 0 (task #91 / commit dc654349). On code-gen workloads (where target argmax is high-confidence), greedy's higher accept rate wins; on essay workloads (where multiple tokens are plausible), MH's accept-rate boost wins.
+
+3-rep paired bench at HEAD `b2462706` on code-gen prompt `"Write a Python function that computes the Fibonacci sequence iteratively:"`:
+- Base: 21.97 ± 0.05 tok/s
+- MTP K=1 greedy: 29.93 ± 0.10 @ 91.0% accept = 1.36× base
+- MTP K=1 MH temp=0.5: 28.63 ± 0.05 @ 84.1% accept = 1.30× base
 
 **ADR-034 cell summary**:
 
