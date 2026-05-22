@@ -38,6 +38,49 @@
 | **C — Gemma 4 26B DFlash** | ⚠️ **COHERENT but 4.8× SLOWER than base** | Q8_0 paired bench 3 reps at HEAD `6d80e6be` (2026-05-21): base 92.9 t/s, DFlash 19.2 t/s = 0.21× (4.8× slowdown). Coherence is byte-identical to single-token decode at temp=0 (proven by e2e test). The "WORKING" claim in earlier ADR revisions was correctness-only — never measured against base. Source code at `src/serve/spec_decode_cli.rs:26-32` is honest: "Option C re-prefills full prefix from start_pos=0 each round; Option A (cross-length SDPA in flash_attn_prefill) deferred." | **Option A** = cross-length SDPA path (same scope as task #89 `forward_gpu_batched_decode`). Required for any perf gate. ~1500 LOC. |
 | **D — Gemma 4 -assistant** | Phase 7, deferred | Not in v1 scope | — |
 
+### Profile-driven evidence for task #89 (2026-05-21 at HEAD `aa39e426`)
+
+A fresh `HF2Q_PROFILE_W5B8=1` + `HF2Q_DFLASH_PROFILE=1` run of the Qwen35 DFlash path at BS=2 (32 tok generation, Qwen 3.6 27B Q8_0) pins the bottleneck:
+
+**Per-round wall-clock breakdown (mean across 87 rounds, BS=2, 128 tok run):**
+
+| Stage | ms/round | % of round |
+|---|---:|---:|
+| embed | 0.02 | 0.0% |
+| extract_drafter_concat | 0.36 | 0.4% |
+| drafter_fwd | 22.99 | 26% |
+| drafter_argmax | 2.15 | 2.4% |
+| **verify** | **61.76** | **70%** |
+| trim/append | 0.71 | 0.8% |
+| **TOTAL** | **87.99** | 100% |
+
+**FA-layer-per-event breakdown (W5B8 profile, mean across captured events):**
+
+| Section | seq_len=2 (verify) | seq_len=20 (init prefill) | ratio |
+|---|---:|---:|---:|
+| fa.ops1_4 | **4.298 ms** | 0.422 ms | **10.2× slower** |
+| fa.sdpa_total | 0.307 ms | n/a | — |
+| fa.sdpa.kernel | 0.273 ms | 0.328 ms | 0.83× |
+| fa.ops6_7 | 0.291 ms | 0.105 ms | 2.8× |
+| layer.full_total | 5.442 ms | 4.164 ms | 1.31× |
+
+**Diagnosis** (mantra-aligned, no guessing):
+
+The `use_fused_stage_ab` predicate at `gpu_full_attn.rs:2818` gates the optimized single-encoder fused-stage path on `cur_len[0] == 0`. The fused stage encodes ops1-4 + KV-write + prefill-bridge + ops6-7 into ONE Metal command buffer with intra-encoder barriers. When `cur_len > 0` (every per-round verify forward in DFlash + every K=N MTP step + every Cell C round), the predicate fails, and execution falls into the non-fused fallback path with separate command encoders + commits per op → ~10× per-FA-layer overhead.
+
+The underlying FA prefill kernels (`apply_flash_attn_prefill_seq_major`, line 1602) are gated on `head_dim == 256 && cur_len == 0 && seq_len >= 16` for the same reason — the optimized kernel doesn't handle the offset KV-write case at small seq_len.
+
+Code comment at line 3078 makes the predicate explicit: `let cur_len_u32 = slot.current_len[0]; // == 0 by predicate` — so just lifting the gate would crash. The fix requires NEW kernel paths for `cur_len > 0 + seq_len < 16`.
+
+**Task #89 scope (confirmed multi-week):** write a fused-stage-ab variant that handles `cur_len > 0 + seq_len < 16` correctly. Either:
+- (a) Extend the existing FA prefill kernels to accept `cur_len > 0` (kernel-level work).
+- (b) Write a new dispatch path that uses `apply_flash_attn_prefill_seq_major_resume` (the existing resume variant, line 1931) inside the fused encoder.
+- (c) Write a new kernel that fuses small-seq-len resume with the rest of stage_ab.
+
+All three approaches preserve the greedy byte-identity invariant (the new path produces same outputs as the fallback) — verified by the existing FA-projections-arena kernel-equivalence parity test pattern.
+
+**ROI projection:** if task #89 closes the fa.ops1_4 gap to seq_len=20 levels (4.298 → ~0.42 ms per FA layer per forward), verify-forward time drops from 61.76 ms → ~45.8 ms (-26%), DFlash BS=2 throughput improves from 16.1 → ~21 t/s. Still not enough to beat MTP K=1 BATCHED MH (30.2 t/s) — drafter cost (22.99 ms) is the second-order bottleneck. To beat MTP, BOTH task #89 AND a fused chained drafter forward (MTPLX-style mx.compile fusion) would be needed.
+
 ### Data assets on disk
 
 | Asset | Location | Size | Use |
