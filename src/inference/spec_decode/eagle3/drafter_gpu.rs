@@ -252,6 +252,54 @@ impl<'a> GpuDrafter<'a> {
         self.kv_cache.as_ref().map(|c| c.len()).unwrap_or(0)
     }
 
+    /// Build the per-call tree-aware attention mask for expanding
+    /// `node_to_expand`. Pure function over `tree`, the
+    /// `tree_node_cache_slot` mapping, and `pre_len` (cache length
+    /// BEFORE the predict_topk call's K/V append).
+    ///
+    /// Mask shape: `[1, pre_len + 1]` row-major.
+    ///   `mask[0, slot] = ATTENDED` for each ancestor's recorded slot.
+    ///   `mask[0, pre_len] = ATTENDED` (self).
+    ///   `mask[0, _] = MASKED` otherwise (non-ancestors stored in cache
+    ///     from previously expanded sibling/cousin branches).
+    ///
+    /// Validates every ancestor has a recorded cache slot. Errors
+    /// if an ancestor slot is out of range.
+    pub fn build_tree_mask_for(
+        &self,
+        tree: &TreeContextView<'_>,
+        node_to_expand: usize,
+        pre_len: usize,
+    ) -> Result<Vec<f32>> {
+        let new_kv_len = pre_len + 1;
+        let mut mask: Vec<f32> = vec![
+            super::forward::EAGLE3_TREE_MASK_MASKED;
+            new_kv_len
+        ];
+        mask[pre_len] = super::forward::EAGLE3_TREE_MASK_ATTENDED;
+        let mut cursor = tree.parents[node_to_expand];
+        while let Some(idx) = cursor {
+            ensure!(
+                idx < self.tree_node_cache_slot.len()
+                    && self.tree_node_cache_slot[idx].is_some(),
+                "GpuDrafter::build_tree_mask_for: ancestor {} of node_to_expand {} \
+                 has no recorded cache slot",
+                idx,
+                node_to_expand,
+            );
+            let slot = self.tree_node_cache_slot[idx].unwrap();
+            ensure!(
+                slot < pre_len,
+                "GpuDrafter::build_tree_mask_for: ancestor {} slot {} >= pre_len {} \
+                 (orchestrator violated monotonic-cache invariant)",
+                idx, slot, pre_len
+            );
+            mask[slot] = super::forward::EAGLE3_TREE_MASK_ATTENDED;
+            cursor = tree.parents[idx];
+        }
+        Ok(mask)
+    }
+
     /// Look up the embedding for `token` from the CPU embed table.
     /// Returns a freshly-allocated `Vec<f32>` of length `hidden_size`.
     fn lookup_embedding(&self, token: u32) -> Result<Vec<f32>> {
@@ -398,28 +446,7 @@ impl<'a> Drafter for GpuDrafter<'a> {
             //   mask[0, N]             = ATTENDED (self)
             //   mask[0, _]             = MASKED otherwise
             let pre_len = self.kv_cache.as_ref().unwrap().len();
-            let new_kv_len = pre_len + 1;
-            let mut mask: Vec<f32> = vec![
-                super::forward::EAGLE3_TREE_MASK_MASKED;
-                new_kv_len
-            ];
-            // Self.
-            mask[pre_len] = super::forward::EAGLE3_TREE_MASK_ATTENDED;
-            // Ancestors.
-            let mut cursor = tree.parents[node_to_expand];
-            while let Some(idx) = cursor {
-                // Safe: pre-loop validated every ancestor has a slot.
-                let slot = self.tree_node_cache_slot[idx].unwrap();
-                // Defensive: ancestor slot must be in range [0, pre_len)
-                // since cache grew monotonically.
-                ensure!(
-                    slot < pre_len,
-                    "GpuDrafter::predict_topk: ancestor {} slot {} >= pre_len {}",
-                    idx, slot, pre_len
-                );
-                mask[slot] = super::forward::EAGLE3_TREE_MASK_ATTENDED;
-                cursor = tree.parents[idx];
-            }
+            let mask = self.build_tree_mask_for(&tree, node_to_expand, pre_len)?;
             // Dispatch with tree-aware mask.
             let cache = self.kv_cache.as_mut().unwrap();
             let result = super::forward::dispatch_eagle3_drafter_forward_with_kv_cache(
@@ -1229,6 +1256,186 @@ mod tests {
         );
         // Validate the produced tree structure.
         tree.validate().expect("ExpandedTree::validate");
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E6 unit tests — tree mask construction (no GPU needed).
+    // ----------------------------------------------------------------
+
+    fn drafter_for_mask_test() -> Option<(MlxDevice, KernelRegistry, Eagle3DrafterConfig, Eagle3DrafterTensors, MlxBuffer, Vec<f32>)> {
+        let device = MlxDevice::new().ok()?;
+        let registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_buf, embed_table) = step3_build_drafter_scaffolding(&device)?;
+        Some((device, registry, cfg, tensors, target_aux_buf, embed_table))
+    }
+
+    #[test]
+    fn adr_037_e6_build_tree_mask_root_no_ancestors_2026_05_22() {
+        // Root (node 0) has no ancestors. Mask = [ATTENDED] (only
+        // the new slot, which is also root's slot).
+        let (device, mut registry, cfg, tensors, target_aux_buf, embed_table) =
+            match drafter_for_mask_test() {
+                Some(t) => t,
+                None => return,
+            };
+        let drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        let view = TreeContextView {
+            tokens: &[10_u32],
+            parents: &[None],
+        };
+        let mask = drafter
+            .build_tree_mask_for(&view, 0, 0)
+            .expect("root mask");
+        assert_eq!(mask.len(), 1);
+        assert_eq!(
+            mask[0],
+            crate::inference::spec_decode::eagle3::forward::EAGLE3_TREE_MASK_ATTENDED
+        );
+    }
+
+    #[test]
+    fn adr_037_e6_build_tree_mask_depth_1_attends_root_only_2026_05_22() {
+        // Tree: 0 (root) → 1 (child). Suppose root is in cache slot 0.
+        // Expanding child (depth=1) with pre_len=1: mask = [ATTENDED
+        // (root in slot 0), ATTENDED (self in slot 1)].
+        let (device, mut registry, cfg, tensors, target_aux_buf, embed_table) =
+            match drafter_for_mask_test() {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        // Manually populate tree_node_cache_slot — simulate that root
+        // was previously expanded into slot 0.
+        drafter.tree_node_cache_slot.push(Some(0));
+        let view = TreeContextView {
+            tokens: &[10_u32, 20],
+            parents: &[None, Some(0)],
+        };
+        let mask = drafter
+            .build_tree_mask_for(&view, 1, 1)
+            .expect("depth-1 mask");
+        use crate::inference::spec_decode::eagle3::forward::{
+            EAGLE3_TREE_MASK_ATTENDED, EAGLE3_TREE_MASK_MASKED,
+        };
+        assert_eq!(mask.len(), 2);
+        assert_eq!(mask[0], EAGLE3_TREE_MASK_ATTENDED, "root attended");
+        assert_eq!(mask[1], EAGLE3_TREE_MASK_ATTENDED, "self attended");
+        // Verify masked default doesn't leak in.
+        for (i, &v) in mask.iter().enumerate() {
+            assert!(
+                v == EAGLE3_TREE_MASK_ATTENDED || v == EAGLE3_TREE_MASK_MASKED,
+                "mask[{i}] = {v} not a valid sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn adr_037_e6_build_tree_mask_blocks_sibling_in_cache_2026_05_22() {
+        // KEY TEST. Tree: 0 (root) → 1 (A), 0 → 2 (B). Both A and B
+        // are children of root. Suppose cache state is:
+        //   slot 0: root, slot 1: A, slot 2: B.
+        // Now we want to expand A's hypothetical depth-2 child (node 3
+        // with parent 1=A). Mask:
+        //   slot 0 (root)    → ATTENDED (ancestor)
+        //   slot 1 (A)       → ATTENDED (ancestor)
+        //   slot 2 (B)       → MASKED   (NOT ancestor — sibling of A)
+        //   slot 3 (self)    → ATTENDED
+        let (device, mut registry, cfg, tensors, target_aux_buf, embed_table) =
+            match drafter_for_mask_test() {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        // Cache layout: slot 0 = root, slot 1 = A, slot 2 = B.
+        drafter.tree_node_cache_slot = vec![Some(0), Some(1), Some(2)];
+        // Tree: root, A(parent=root), B(parent=root), node 3 (parent=A).
+        let view = TreeContextView {
+            tokens: &[10_u32, 20, 30, 40],
+            parents: &[None, Some(0), Some(0), Some(1)],
+        };
+        let mask = drafter
+            .build_tree_mask_for(&view, 3, 3)
+            .expect("depth-2 mask");
+        use crate::inference::spec_decode::eagle3::forward::{
+            EAGLE3_TREE_MASK_ATTENDED, EAGLE3_TREE_MASK_MASKED,
+        };
+        assert_eq!(mask.len(), 4);
+        assert_eq!(mask[0], EAGLE3_TREE_MASK_ATTENDED, "root attended");
+        assert_eq!(mask[1], EAGLE3_TREE_MASK_ATTENDED, "A (parent of 3) attended");
+        assert_eq!(
+            mask[2], EAGLE3_TREE_MASK_MASKED,
+            "B (sibling of A — NOT ancestor of 3) must be MASKED — this is the bug-fix invariant"
+        );
+        assert_eq!(mask[3], EAGLE3_TREE_MASK_ATTENDED, "self attended");
+    }
+
+    #[test]
+    fn adr_037_e6_build_tree_mask_deep_chain_attends_all_ancestors_2026_05_22() {
+        // 5-deep chain: 0 → 1 → 2 → 3 → 4 (each child has only one
+        // parent). Cache layout: each ancestor at its own slot.
+        // Expanding node 4 with pre_len=4: all of [root, 1, 2, 3]
+        // should be ATTENDED + self at slot 4.
+        let (device, mut registry, cfg, tensors, target_aux_buf, embed_table) =
+            match drafter_for_mask_test() {
+                Some(t) => t,
+                None => return,
+            };
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        drafter.tree_node_cache_slot = vec![Some(0), Some(1), Some(2), Some(3)];
+        let view = TreeContextView {
+            tokens: &[10_u32, 20, 30, 40, 50],
+            parents: &[None, Some(0), Some(1), Some(2), Some(3)],
+        };
+        let mask = drafter
+            .build_tree_mask_for(&view, 4, 4)
+            .expect("deep chain mask");
+        use crate::inference::spec_decode::eagle3::forward::EAGLE3_TREE_MASK_ATTENDED;
+        assert_eq!(mask.len(), 5);
+        for (i, &v) in mask.iter().enumerate() {
+            assert_eq!(v, EAGLE3_TREE_MASK_ATTENDED, "slot {} should be attended", i);
+        }
+    }
+
+    #[test]
+    fn adr_037_e6_build_tree_mask_rejects_missing_ancestor_2026_05_22() {
+        // Calling on node 1 when root (idx 0) has no cache slot
+        // recorded → error.
+        let (device, mut registry, cfg, tensors, target_aux_buf, embed_table) =
+            match drafter_for_mask_test() {
+                Some(t) => t,
+                None => return,
+            };
+        let drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        // tree_node_cache_slot is empty.
+        let view = TreeContextView {
+            tokens: &[10_u32, 20],
+            parents: &[None, Some(0)],
+        };
+        let err = drafter.build_tree_mask_for(&view, 1, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("has no recorded cache slot"),
+            "expected missing-slot error, got: {err}"
+        );
     }
 
     #[test]
