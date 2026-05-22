@@ -94,13 +94,15 @@ pub struct Eagle3DrafterTensors {
     pub q_norm: Option<MlxBuffer>,
     /// `[head_dim]` F32. None when `use_qk_norm = false`.
     pub k_norm: Option<MlxBuffer>,
-    /// `[num_q_heads * head_dim]` BF16. Present when `attention_bias = true`.
+    /// `[num_q_heads * head_dim]` F32 (cast from BF16 at upload for
+    /// add_bias_row_2d_f32 compatibility). Present when
+    /// `attention_bias = true`.
     pub q_bias: Option<MlxBuffer>,
-    /// `[num_kv_heads * head_dim]` BF16.
+    /// `[num_kv_heads * head_dim]` F32.
     pub k_bias: Option<MlxBuffer>,
-    /// `[num_kv_heads * head_dim]` BF16.
+    /// `[num_kv_heads * head_dim]` F32.
     pub v_bias: Option<MlxBuffer>,
-    /// `[hidden_size]` BF16.
+    /// `[hidden_size]` F32.
     pub o_bias: Option<MlxBuffer>,
     /// `[intermediate_size, hidden_size]` BF16 SwiGLU gate proj.
     pub mlp_gate: MlxBuffer,
@@ -273,21 +275,26 @@ impl Eagle3DrafterTensors {
         } else {
             (None, None)
         };
+        // Q/K/V/O biases cast BF16 → F32 at upload time so the
+        // `add_bias_row_2d_f32` kernel can consume them directly.
+        // Same rationale as RMSNorm weights (ADR-030 iter-106): the
+        // bias-add kernel declares F32 bias and would mis-stride a
+        // BF16 buffer.
         let (q_bias, k_bias, v_bias, o_bias) = if cfg.attention_bias {
             (
-                Some(upload_bf16(
+                Some(upload_bf16_as_f32(
                     device,
                     fetch(weights, "layers.0.self_attn.q_proj.bias")?,
                 )?),
-                Some(upload_bf16(
+                Some(upload_bf16_as_f32(
                     device,
                     fetch(weights, "layers.0.self_attn.k_proj.bias")?,
                 )?),
-                Some(upload_bf16(
+                Some(upload_bf16_as_f32(
                     device,
                     fetch(weights, "layers.0.self_attn.v_proj.bias")?,
                 )?),
-                Some(upload_bf16(
+                Some(upload_bf16_as_f32(
                     device,
                     fetch(weights, "layers.0.self_attn.o_proj.bias")?,
                 )?),
@@ -365,9 +372,11 @@ impl Eagle3DrafterTensors {
         if let Some(b) = &tensors.k_norm {
             debug_assert_eq!(b.dtype(), DType::F32);
         }
+        // Biases now cast to F32 at upload (matches add_bias_row_2d_f32
+        // kernel input expectation).
         for opt in [&tensors.q_bias, &tensors.k_bias, &tensors.v_bias, &tensors.o_bias] {
             if let Some(b) = opt {
-                debug_assert_eq!(b.dtype(), DType::BF16);
+                debug_assert_eq!(b.dtype(), DType::F32);
             }
         }
 

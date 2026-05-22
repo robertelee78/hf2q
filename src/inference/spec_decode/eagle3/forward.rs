@@ -22,6 +22,7 @@ use super::config::Eagle3DrafterConfig;
 use super::tensors::Eagle3DrafterTensors;
 use crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32;
 use anyhow::{anyhow, Context, Result};
+use mlx_native::ops::add_bias_row_2d::dispatch_add_bias_row_2d_f32;
 use mlx_native::ops::feature_concat::dispatch_feature_concat_f32;
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -442,6 +443,7 @@ pub fn dispatch_eagle3_concat_2x_hidden(
             vec![seq_len as usize, 2 * hidden_usize],
         )
         .map_err(|e| anyhow!("alloc concat output: {e}"))?;
+    // Marker — concat dispatch is appended below.
     // Copy embeds → dst columns [0, hidden).
     dispatch_feature_concat_f32(
         encoder,
@@ -469,6 +471,252 @@ pub fn dispatch_eagle3_concat_2x_hidden(
     )
     .context("dispatch_feature_concat_f32 hidden branch")?;
     Ok(dst)
+}
+
+// ----------------------------------------------------------------
+// Phase E4b.4 — Q/K/V projections from the concat input
+// ----------------------------------------------------------------
+//
+// Per vLLM `llama_eagle3.py:111-115`: after the concat step produces
+// `[seq, 2 * hidden_size]`, the layer-0 Q/K/V projections map it to:
+//   - Q: `[seq, num_q_heads * head_dim]`
+//   - K: `[seq, num_kv_heads * head_dim]`
+//   - V: `[seq, num_kv_heads * head_dim]`
+//
+// Each projection is a BF16 GEMM (or GEMV for seq=1) wrapping
+// `apply_linear_projection_f32`. Optional per-projection bias-add
+// (configurable via `attention_bias`) is applied as a fused
+// post-step via `dispatch_add_bias_row_2d_f32`.
+
+/// Internal helper: dispatch one projection (`weight @ input^T`) +
+/// optional bias-add. Returns the F32 output buffer.
+///
+/// Codex /cfa patterns applied:
+/// - input dtype check at boundary (must be F32)
+/// - u32::try_from for usize→u32 conversions
+/// - checked_mul for both element-count + byte-multiply
+/// - bias.element_count() validated against `out_features`
+/// - zero-seq rejection
+#[allow(clippy::too_many_arguments)]
+fn dispatch_eagle3_projection_with_optional_bias(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    weight: &MlxBuffer,
+    bias: Option<&MlxBuffer>,
+    seq_len: u32,
+    in_features_usize: usize,
+    out_features_usize: usize,
+    label: &str,
+) -> Result<MlxBuffer> {
+    if input.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "dispatch_eagle3_projection ({}): input dtype must be F32, got {:?}",
+            label,
+            input.dtype()
+        ));
+    }
+    if seq_len == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_projection ({}): seq_len must be > 0",
+            label
+        ));
+    }
+    if in_features_usize == 0 || out_features_usize == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_projection ({}): in_features ({}) and out_features ({}) must be > 0",
+            label,
+            in_features_usize,
+            out_features_usize
+        ));
+    }
+    let in_features: u32 = u32::try_from(in_features_usize).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_projection ({}): in_features ({}) exceeds u32::MAX",
+            label,
+            in_features_usize
+        )
+    })?;
+    let out_features: u32 = u32::try_from(out_features_usize).map_err(|_| {
+        anyhow!(
+            "dispatch_eagle3_projection ({}): out_features ({}) exceeds u32::MAX",
+            label,
+            out_features_usize
+        )
+    })?;
+    // Validate input element count.
+    let expected_in_elems = (seq_len as usize)
+        .checked_mul(in_features_usize)
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_projection ({}): seq_len ({}) * in_features ({}) overflows usize",
+                label,
+                seq_len,
+                in_features_usize
+            )
+        })?;
+    if input.element_count() != expected_in_elems {
+        return Err(anyhow!(
+            "dispatch_eagle3_projection ({}): input has {} elements, expected {} (seq_len={} * in_features={})",
+            label,
+            input.element_count(),
+            expected_in_elems,
+            seq_len,
+            in_features
+        ));
+    }
+    // Validate weight dtype + element count.
+    if weight.dtype() != DType::BF16 {
+        return Err(anyhow!(
+            "dispatch_eagle3_projection ({}): weight dtype must be BF16, got {:?}",
+            label,
+            weight.dtype()
+        ));
+    }
+    let expected_w_elems = out_features_usize
+        .checked_mul(in_features_usize)
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_projection ({}): out * in overflows usize",
+                label
+            )
+        })?;
+    if weight.element_count() != expected_w_elems {
+        return Err(anyhow!(
+            "dispatch_eagle3_projection ({}): weight has {} elements, expected {} (out * in = {} * {})",
+            label,
+            weight.element_count(),
+            expected_w_elems,
+            out_features,
+            in_features
+        ));
+    }
+    // Validate bias if present.
+    if let Some(b) = bias {
+        if b.dtype() != DType::F32 {
+            return Err(anyhow!(
+                "dispatch_eagle3_projection ({}): bias dtype must be F32 (cast from BF16 at upload), got {:?}",
+                label,
+                b.dtype()
+            ));
+        }
+        if b.element_count() != out_features_usize {
+            return Err(anyhow!(
+                "dispatch_eagle3_projection ({}): bias has {} elements, expected out_features {}",
+                label,
+                b.element_count(),
+                out_features
+            ));
+        }
+    }
+    // Dispatch the matmul.
+    let out = apply_linear_projection_f32(
+        encoder, registry, device,
+        input, weight,
+        seq_len, in_features, out_features,
+    )
+    .with_context(|| format!("apply_linear_projection_f32 {label}"))?;
+    // Optional bias add — `add_bias_row_2d_f32` broadcasts `[N]` bias
+    // across rows of the `[M, N]` output, in-place.
+    if let Some(b) = bias {
+        // Memory barrier between the matmul (writes `out`) and the
+        // bias-add (reads+writes `out` in-place). Metal command
+        // encoders don't insert implicit barriers between sequential
+        // compute dispatches with R/W dependency on the same buffer
+        // (mirrors qwen35/gpu_full_attn.rs:901 pattern).
+        encoder.memory_barrier();
+        dispatch_add_bias_row_2d_f32(
+            encoder,
+            registry,
+            device.metal_device(),
+            &out,
+            b,
+            &out,
+            seq_len,
+            out_features,
+        )
+        .with_context(|| format!("dispatch_add_bias_row_2d_f32 {label}"))?;
+    }
+    Ok(out)
+}
+
+/// Dispatch the Q projection from the layer-0 concat input.
+///
+/// Input: `[seq, 2 * hidden_size]` F32 (output of
+/// `dispatch_eagle3_concat_2x_hidden`).
+/// Weight: `[num_q_heads * head_dim, 2 * hidden_size]` BF16.
+/// Optional bias: `[num_q_heads * head_dim]` F32.
+/// Output: `[seq, num_q_heads * head_dim]` F32.
+pub fn dispatch_eagle3_q_proj(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    concat_input: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    dispatch_eagle3_projection_with_optional_bias(
+        encoder, registry, device,
+        concat_input,
+        &tensors.q_proj,
+        tensors.q_bias.as_ref(),
+        seq_len,
+        cfg.qkv_input_width(),
+        cfg.q_proj_out(),
+        "q_proj",
+    )
+}
+
+/// Dispatch the K projection from the layer-0 concat input.
+///
+/// Input: `[seq, 2 * hidden_size]` F32. Weight: BF16. Optional bias.
+/// Output: `[seq, num_kv_heads * head_dim]` F32.
+pub fn dispatch_eagle3_k_proj(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    concat_input: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    dispatch_eagle3_projection_with_optional_bias(
+        encoder, registry, device,
+        concat_input,
+        &tensors.k_proj,
+        tensors.k_bias.as_ref(),
+        seq_len,
+        cfg.qkv_input_width(),
+        cfg.kv_proj_out(),
+        "k_proj",
+    )
+}
+
+/// Dispatch the V projection from the layer-0 concat input.
+///
+/// Input: `[seq, 2 * hidden_size]` F32. Weight: BF16. Optional bias.
+/// Output: `[seq, num_kv_heads * head_dim]` F32.
+pub fn dispatch_eagle3_v_proj(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    concat_input: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    dispatch_eagle3_projection_with_optional_bias(
+        encoder, registry, device,
+        concat_input,
+        &tensors.v_proj,
+        tensors.v_bias.as_ref(),
+        seq_len,
+        cfg.qkv_input_width(),
+        cfg.kv_proj_out(),
+        "v_proj",
+    )
 }
 
 #[cfg(test)]
@@ -1143,6 +1391,299 @@ mod tests {
         assert!(
             err.to_string().contains("seq_len must be > 0"),
             "expected seq_len-zero error, got: {err}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E4b.4 tests — Q/K/V projections
+    // ----------------------------------------------------------------
+
+    /// Run Q projection through GPU + CPU reference, return both outputs.
+    fn run_q_proj_with_overrides(
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        cfg: &Eagle3DrafterConfig,
+        seq_len: u32,
+        q_weight_f32: &[f32],   // [q_out, qkv_in]
+        q_bias_f32: Option<&[f32]>, // [q_out] when attention_bias=true
+        input_data: &[f32],     // [seq, qkv_in]
+    ) -> (Vec<f32>, Vec<f32>) {
+        let manifest = expected_manifest(cfg);
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            f32_to_bf16_bytes(q_weight_f32),
+        );
+        if let Some(b) = q_bias_f32 {
+            overrides.insert(
+                "layers.0.self_attn.q_proj.bias".to_string(),
+                f32_to_bf16_bytes(b),
+            );
+        }
+        let blob = build_blob_with_overrides(&manifest, &overrides);
+        let weights = Eagle3Weights::load(&blob, cfg).expect("weights load");
+        let tensors =
+            Eagle3DrafterTensors::upload(device, cfg, &weights).expect("upload");
+        let input_gpu = upload_f32_to_gpu(
+            device,
+            input_data,
+            vec![seq_len as usize, cfg.qkv_input_width()],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_q_proj(
+            &mut enc, registry, device, &input_gpu, &tensors, cfg, seq_len,
+        )
+        .expect("dispatch_eagle3_q_proj");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: Vec<f32> = out_buf
+            .as_slice::<f32>()
+            .expect("output slice")
+            .to_vec();
+
+        // CPU reference uses BF16-quantized weights + bias.
+        let weight_bf16_q: Vec<f32> =
+            q_weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let mut cpu_out = cpu_fc_reference(
+            input_data,
+            &weight_bf16_q,
+            seq_len as usize,
+            cfg.qkv_input_width(),
+            cfg.q_proj_out(),
+        );
+        if let Some(b) = q_bias_f32 {
+            let b_q: Vec<f32> = b.iter().map(|&v| bf16_quantize_f32(v)).collect();
+            for s in 0..(seq_len as usize) {
+                for d in 0..cfg.q_proj_out() {
+                    cpu_out[s * cfg.q_proj_out() + d] += b_q[d];
+                }
+            }
+        }
+        (gpu_out, cpu_out)
+    }
+
+    #[test]
+    fn adr_037_e4b4_q_proj_cpu_parity_no_bias_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg(); // attention_bias = false
+        let seq_len: u32 = 4;
+        let qkv_in = cfg.qkv_input_width();
+        let q_out = cfg.q_proj_out();
+
+        let mut input_data = vec![0.0f32; (seq_len as usize) * qkv_in];
+        fill_random(&mut input_data, 0xF40);
+        let mut q_weight = vec![0.0f32; q_out * qkv_in];
+        fill_random(&mut q_weight, 0xF41);
+
+        let (gpu_out, cpu_out) = run_q_proj_with_overrides(
+            &device,
+            &mut registry,
+            &cfg,
+            seq_len,
+            &q_weight,
+            None,
+            &input_data,
+        );
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            // 2*hidden inner-dim (=512) gives more accumulation than
+            // E4b.2's 3*hidden (=768) but the input/weight ranges
+            // are similar; 5e-2 stays adequate.
+            assert!(d < 5e-2, "q_proj parity: diff={d} > 5e-2");
+        }
+        eprintln!("q_proj parity max_diff={max_diff:.6e}");
+    }
+
+    fn cfg_with_bias() -> Eagle3DrafterConfig {
+        let mut c = tiny_cfg();
+        c.attention_bias = true;
+        c
+    }
+
+    #[test]
+    fn adr_037_e4b4_q_proj_cpu_parity_with_bias_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = cfg_with_bias();
+        let seq_len: u32 = 4;
+        let qkv_in = cfg.qkv_input_width();
+        let q_out = cfg.q_proj_out();
+
+        let mut input_data = vec![0.0f32; (seq_len as usize) * qkv_in];
+        fill_random(&mut input_data, 0xF50);
+        let mut q_weight = vec![0.0f32; q_out * qkv_in];
+        fill_random(&mut q_weight, 0xF51);
+        let mut q_bias = vec![0.0f32; q_out];
+        fill_random(&mut q_bias, 0xF52);
+
+        let (gpu_out, cpu_out) = run_q_proj_with_overrides(
+            &device,
+            &mut registry,
+            &cfg,
+            seq_len,
+            &q_weight,
+            Some(&q_bias),
+            &input_data,
+        );
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            // Same tolerance as no-bias path; the memory_barrier
+            // between matmul + bias-add ensures bias reads the
+            // committed matmul output. Without the barrier, we
+            // observed diffs of 0.156-0.794 from racy bias reads
+            // of partially-written matmul output (debugged during
+            // E4b.4 implementation 2026-05-22).
+            assert!(d < 5e-2, "q_proj+bias parity: diff={d} > 5e-2");
+        }
+        eprintln!("q_proj+bias parity max_diff={max_diff:.6e}");
+    }
+
+    #[test]
+    fn adr_037_e4b4_k_proj_output_shape_matches_kv_proj_out_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let seq_len = 3_u32;
+        let input_data = vec![0.0f32; (seq_len as usize) * cfg.qkv_input_width()];
+        let input_gpu = upload_f32_to_gpu(
+            &device,
+            &input_data,
+            vec![seq_len as usize, cfg.qkv_input_width()],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let k_out = dispatch_eagle3_k_proj(
+            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+        )
+        .expect("k_proj");
+        enc.commit_and_wait().expect("commit");
+        // K output shape: [seq, num_kv_heads * head_dim].
+        assert_eq!(k_out.dtype(), DType::F32);
+        assert_eq!(
+            k_out.element_count(),
+            (seq_len as usize) * cfg.kv_proj_out()
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b4_v_proj_output_shape_matches_kv_proj_out_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let seq_len = 3_u32;
+        let input_data = vec![0.0f32; (seq_len as usize) * cfg.qkv_input_width()];
+        let input_gpu = upload_f32_to_gpu(
+            &device,
+            &input_data,
+            vec![seq_len as usize, cfg.qkv_input_width()],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let v_out = dispatch_eagle3_v_proj(
+            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+        )
+        .expect("v_proj");
+        enc.commit_and_wait().expect("commit");
+        assert_eq!(v_out.dtype(), DType::F32);
+        assert_eq!(
+            v_out.element_count(),
+            (seq_len as usize) * cfg.kv_proj_out()
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b4_gate_q_proj_rejects_non_f32_input_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let seq_len = 2_u32;
+        let bad_input = device
+            .alloc_buffer(
+                (seq_len as usize) * cfg.qkv_input_width() * 2,
+                DType::BF16,
+                vec![seq_len as usize, cfg.qkv_input_width()],
+            )
+            .expect("alloc bad");
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_q_proj(
+            &mut enc, &mut registry, &device, &bad_input, &tensors, &cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("dtype must be F32"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b4_gate_q_proj_rejects_zero_seq_len_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let empty = device
+            .alloc_buffer(4, DType::F32, vec![1])
+            .expect("alloc empty");
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_q_proj(
+            &mut enc, &mut registry, &device, &empty, &tensors, &cfg, 0,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("seq_len must be > 0"),
+            "got: {err}"
         );
     }
 
