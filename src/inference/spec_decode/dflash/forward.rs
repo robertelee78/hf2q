@@ -942,27 +942,49 @@ pub fn dispatch_dflash_decoder_layer_attention(
         enc.commit_labeled("dflash.decoder_layer_attention.phase_a_kv_writes");
     }
 
-    // -------- Phase C: cross-length SDPA --------
-    // kv_seq_len = ctx (now in cache via append) + L (prop in slack)
+    // -------- Phase C+D: cross-length SDPA + O proj (fused encoder) --------
+    //
+    // ADR-034 task #95 sub-iter G (2026-05-22) — sdpa_cross_length's
+    // GPU path no longer commits internally; o_proj fuses into the
+    // SAME encoder. Single terminal commit_and_wait at the end
+    // replaces the prior 2 commit boundaries (sdpa_enc + o_enc).
+    //
+    // CPU opt-out path (HF2Q_DFLASH_SDPA_CPU=1) still commits inside
+    // sdpa_cross_length — we detect that by re-checking the env var
+    // here so o_proj uses a fresh encoder in that branch (preserving
+    // legacy semantics for A/B parity).
+    //
+    // kv_seq_len = ctx (in cache) + L (slack-written prop).
     let kv_seq_len = cache_layer.seq_len + l;
     let mut sdpa_enc = device
         .command_encoder()
-        .context("decoder_layer_attention: open encoder for sdpa")?;
+        .context("decoder_layer_attention: open encoder for sdpa+o_proj")?;
     let attn_out = dispatch_dflash_sdpa_cross_length(
         &mut sdpa_enc, registry, device, &q_roped, cache_layer, cfg, l, kv_seq_len, do_causal,
     )
     .context("layer attn: sdpa cross-length")?;
-    // dispatch_dflash_sdpa_cross_length commits internally; sdpa_enc is dead.
 
-    // -------- Phase D: O proj --------
-    let mut o_enc = device
-        .command_encoder()
-        .context("decoder_layer_attention: open encoder for o_proj")?;
-    let attn_proj = dispatch_dflash_o_proj(
-        &mut o_enc, registry, device, &attn_out, layer_weights, cfg, l,
-    )
-    .context("layer attn: o_proj")?;
-    o_enc.commit_and_wait().context("layer attn: commit o_proj")?;
+    // Branch: CPU opt-out path already committed internally; open
+    // fresh o_enc. GPU path (default) reuses sdpa_enc for o_proj fusion.
+    let attn_proj = if std::env::var("HF2Q_DFLASH_SDPA_CPU").as_deref() == Ok("1") {
+        let mut o_enc = device
+            .command_encoder()
+            .context("decoder_layer_attention: open encoder for o_proj (CPU opt-out)")?;
+        let p = dispatch_dflash_o_proj(
+            &mut o_enc, registry, device, &attn_out, layer_weights, cfg, l,
+        )
+        .context("layer attn: o_proj (CPU opt-out)")?;
+        o_enc.commit_and_wait().context("layer attn: commit o_proj (CPU opt-out)")?;
+        p
+    } else {
+        // Fused: o_proj into the SAME sdpa_enc encoder.
+        let p = dispatch_dflash_o_proj(
+            &mut sdpa_enc, registry, device, &attn_out, layer_weights, cfg, l,
+        )
+        .context("layer attn: o_proj (fused)")?;
+        sdpa_enc.commit_and_wait().context("layer attn: commit sdpa+o_proj (fused)")?;
+        p
+    };
 
     Ok(attn_proj)
 }
@@ -1295,11 +1317,20 @@ pub fn dispatch_dflash_sdpa_cross_length(
     )
     .map_err(|e| anyhow!("permute_021_f32 out hm->seq: {e}"))?;
 
-    // Commit + wait. The wait is needed because the caller uses
-    // out_sm as input to o_proj in a separate encoder. (Future sub-
-    // iter G could lift this commit too if o_proj fuses into this
-    // encoder.)
-    encoder.commit_and_wait().context("commit sdpa cross-length (GPU)")?;
+    // ADR-034 task #95 sub-iter G (2026-05-22) — DO NOT commit here.
+    // Caller continues with this encoder for o_proj fusion (see
+    // dispatch_dflash_decoder_layer_attention). Caller commits at the
+    // end of the layer attention block.
+    //
+    // out_sm buffer lives in the function's stack frame and is
+    // returned by value — it outlives the encoder commit by design
+    // (Rust ownership keeps it alive until the caller drops it after
+    // o_proj reads it).
+    //
+    // The barrier above ensures o_proj's read of out_sm is ordered
+    // correctly with the permute write that produced it within this
+    // encoder.
+    encoder.memory_barrier();
     Ok(out_sm)
 }
 
