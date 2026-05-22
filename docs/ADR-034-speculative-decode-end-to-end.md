@@ -54,6 +54,13 @@
 
 **Output divergence note (documented behavior, not regression)**: At temperature=0 the basic decode-only path and the MTP K=1 BATCHED verify path can emit slightly different tokens at positions where multiple candidates are near-tied. This is from BF16-vs-F32 precision (single-token decode uses F32 flash_attn_vec; batched verify uses BF16 flash_attn_prefill_resume — different accumulation order + reduced precision). Determinism within each path is PASS 3/3 byte-identical. The MTPLX peer reference has the same property. Greedy invariant holds against the BATCHED VERIFY's argmax (which `accept_prefix_argmax` strictly enforces), not against single-token decode's argmax. This is a kernel-level property, not addressable at the dispatch level.
 
+**Concrete empirical evidence at HEAD `4127768b`** (essay prompt, temp=0, Qwen 3.6 27B Q8_0):
+- 24 tokens: base + MTP K=1 greedy produce BYTE-IDENTICAL output: `"In the fast-paced world of software development, where features"`
+- 64 tokens: divergence at position ~14: base emits `"...shipped rapidly and user expectations are high, **test coverage**..."`; spec emits `"...shipped weekly, sometimes even hourly cycles, the temptation..."`
+- Determinism (same config, 3 reps): file-level diff shows only timing-line variance (`hf2q load: ready in 9.52s` vs `9.59s`). Generated text bytes IDENTICAL.
+
+The divergence point ("rapidly" vs "weekly", position ~14) is precisely the BF16-vs-F32 precision flip — at that position the top-2 logits are within F32 epsilon, BF16's reduced mantissa rounds differently, the argmax flips. Both paths produce coherent, semantically correct text.
+
 **Remaining structural lever (multi-week, not single-iteration scope)**: fused projections Metal kernel — a single Metal dispatch combining norm + Q+K+V+Gate matmuls + per-head norms + RoPE for small batch (seq_len in [2, 8]). Unlocks all three opt-in cells (A 35B-A3B + B + C) by eliminating ~10 launch overheads per FA layer per forward (the fa.ops1_4 = 4.298 ms at seq_len=2 cur_len>0 is COMPUTE on small batch, not commit-boundary overhead — empirically falsified by task #89 Step 3b's 3-rep paired bench at commit 91a14fbf).
 
 **Task #89 building blocks shipped** (ready for future fused-projections work):
