@@ -1674,6 +1674,104 @@ pub fn dispatch_eagle3_mlp(
     )
 }
 
+// ----------------------------------------------------------------
+// Phase E4b.9 — final norm + lm_head (logits projection)
+// ----------------------------------------------------------------
+//
+// Per vLLM `llama_eagle3.py:218-221`:
+//
+//     hidden_states, _ = self.norm(hidden_states, residual)
+//     # ... (returns hidden_states, aux_output)
+//
+// and `Eagle3LlamaForCausalLM::compute_logits` at line 363-385 uses
+// `self.lm_head` (a separate ParallelLMHead) by default, or shares
+// with embed_tokens when `tie_lm_head = true`.
+
+/// Apply the model-level final RMSNorm before lm_head.
+///
+/// Input: `[seq, hidden_size]` F32 (typically the final residual
+/// stream value, post-MLP + post-residual-add).
+/// Output: `[seq, hidden_size]` F32 normalized.
+pub fn dispatch_eagle3_final_norm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    final_residual: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    dispatch_eagle3_rms_norm_seq_x_hidden(
+        encoder,
+        registry,
+        device,
+        final_residual,
+        &tensors.norm,
+        cfg,
+        seq_len,
+        "final_norm",
+    )
+}
+
+/// Apply the lm_head linear projection to produce per-token logits.
+///
+/// Input: `[seq, hidden_size]` F32 (post-final-norm).
+/// Output: `[seq, draft_vocab_size]` F32 logits.
+///
+/// When `cfg.tie_lm_head = true`, the drafter shares its embed_tokens
+/// weight with lm_head. The embed_tokens table has shape
+/// `[vocab_size, hidden_size]`, which used as `lm_head` projects to
+/// `vocab_size` outputs (NOT `draft_vocab_size`). When the published
+/// config sets `draft_vocab_size < vocab_size`, tying requires a
+/// separate `lm_head.weight` of shape `[draft_vocab_size, hidden_size]`
+/// — that's why most EAGLE-3 checkpoints don't tie. We surface this
+/// constraint as a clear error rather than silently producing
+/// vocab_size-wide logits.
+pub fn dispatch_eagle3_lm_head(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    normed_hidden: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    // Memory barrier: normed_hidden is the output of final_norm
+    // (written in the same encoder).
+    encoder.memory_barrier();
+    let (weight, out_features) = if cfg.tie_lm_head {
+        // Tied: use embed_tokens as the projection weight.
+        let emb = tensors.embed_tokens.as_ref().ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_lm_head: tie_lm_head=true requires embed_tokens, but has_own_embed_tokens=false (drafter shares target embeddings — caller must supply the target's embedding table)"
+            )
+        })?;
+        if cfg.draft_vocab_size != cfg.vocab_size {
+            return Err(anyhow!(
+                "dispatch_eagle3_lm_head: tie_lm_head=true requires draft_vocab_size ({}) == vocab_size ({}); use a separate lm_head.weight for fast-vocab-projection",
+                cfg.draft_vocab_size,
+                cfg.vocab_size,
+            ));
+        }
+        (emb, cfg.vocab_size)
+    } else {
+        let lh = tensors.lm_head.as_ref().ok_or_else(|| {
+            anyhow!("dispatch_eagle3_lm_head: tie_lm_head=false requires lm_head tensor")
+        })?;
+        (lh, cfg.draft_vocab_size)
+    };
+    dispatch_eagle3_projection_with_optional_bias(
+        encoder, registry, device,
+        normed_hidden,
+        weight,
+        None, // lm_head has no bias
+        seq_len,
+        cfg.hidden_size,
+        out_features,
+        "lm_head",
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -3751,6 +3849,193 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("seq_len must be > 0"), "got: {err}");
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E4b.9 tests — final norm + lm_head
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn adr_037_e4b9_final_norm_cpu_parity_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let seq_len: u32 = 4;
+        let hidden = cfg.hidden_size;
+
+        let mut input_data = vec![0.0f32; (seq_len as usize) * hidden];
+        fill_random(&mut input_data, 0xF90);
+        let mut weight_f32 = vec![0.0f32; hidden];
+        fill_random(&mut weight_f32, 0xF91);
+
+        let weight_bf16_q: Vec<f32> =
+            weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let cpu_out = cpu_rms_norm_f32(
+            &input_data, &weight_bf16_q,
+            seq_len as usize, hidden, cfg.rms_norm_eps,
+        );
+
+        let manifest = expected_manifest(&cfg);
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("norm.weight".to_string(), f32_to_bf16_bytes(&weight_f32));
+        let blob = build_blob_with_overrides(&manifest, &overrides);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let input_gpu = upload_f32_to_gpu(&device, &input_data,
+            vec![seq_len as usize, hidden]);
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_final_norm(
+            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+        )
+        .expect("final_norm");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            assert!(d < 1e-3, "final_norm parity: diff={d} > 1e-3");
+        }
+        eprintln!("final_norm parity max_diff={max_diff:.6e}");
+    }
+
+    /// Config for lm_head test with smaller vocab to keep test fast.
+    fn cfg_for_lm_head_test() -> Eagle3DrafterConfig {
+        let mut c = tiny_cfg();
+        // tiny_cfg has tie_lm_head=true; we want untied for this test.
+        c.tie_lm_head = false;
+        c
+    }
+
+    #[test]
+    fn adr_037_e4b9_lm_head_cpu_parity_untied_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = cfg_for_lm_head_test();
+        let seq_len: u32 = 3;
+        let hidden = cfg.hidden_size;
+        let dvocab = cfg.draft_vocab_size;
+
+        let mut input_data = vec![0.0f32; (seq_len as usize) * hidden];
+        fill_random(&mut input_data, 0xFA0);
+        let mut weight_f32 = vec![0.0f32; dvocab * hidden];
+        fill_random(&mut weight_f32, 0xFA1);
+
+        let weight_bf16_q: Vec<f32> =
+            weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let cpu_out = cpu_fc_reference(
+            &input_data, &weight_bf16_q,
+            seq_len as usize, hidden, dvocab,
+        );
+
+        let manifest = expected_manifest(&cfg);
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "lm_head.weight".to_string(),
+            f32_to_bf16_bytes(&weight_f32),
+        );
+        let blob = build_blob_with_overrides(&manifest, &overrides);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let input_gpu = upload_f32_to_gpu(&device, &input_data,
+            vec![seq_len as usize, hidden]);
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_lm_head(
+            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+        )
+        .expect("lm_head untied");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        assert_eq!(gpu_out.len(), (seq_len as usize) * dvocab);
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            assert!(d < 5e-2, "lm_head parity: diff={d} > 5e-2");
+        }
+        eprintln!("lm_head untied parity max_diff={max_diff:.6e}");
+    }
+
+    #[test]
+    fn adr_037_e4b9_gate_lm_head_tied_requires_full_vocab_2026_05_22() {
+        // Codex-style pre-emptive: tying lm_head with embed_tokens
+        // requires draft_vocab_size == vocab_size (since embed_tokens
+        // has shape [vocab_size, hidden], not [draft_vocab_size, hidden]).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let mut cfg = tiny_cfg();
+        cfg.tie_lm_head = true;
+        cfg.has_own_embed_tokens = true;
+        cfg.draft_vocab_size = 500; // != vocab_size = 1000
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let seq_len = 2_u32;
+        let input = upload_f32_to_gpu(&device,
+            &vec![0.0f32; (seq_len as usize) * cfg.hidden_size],
+            vec![seq_len as usize, cfg.hidden_size]);
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_lm_head(
+            &mut enc, &mut registry, &device, &input, &tensors, &cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("draft_vocab_size"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b9_gate_lm_head_tied_requires_embed_tokens_2026_05_22() {
+        // tie_lm_head=true + has_own_embed_tokens=false should
+        // fail-fast since the drafter shares target's embeddings
+        // (which our trait doesn't yet plumb through).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let mut cfg = tiny_cfg();
+        cfg.tie_lm_head = true;
+        cfg.has_own_embed_tokens = false; // no embed_tokens in manifest
+        cfg.draft_vocab_size = cfg.vocab_size; // satisfy the other check
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        let seq_len = 2_u32;
+        let input = upload_f32_to_gpu(&device,
+            &vec![0.0f32; (seq_len as usize) * cfg.hidden_size],
+            vec![seq_len as usize, cfg.hidden_size]);
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_lm_head(
+            &mut enc, &mut registry, &device, &input, &tensors, &cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("embed_tokens"),
+            "got: {err}"
+        );
     }
 
     #[test]
