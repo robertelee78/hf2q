@@ -113,13 +113,16 @@ pub fn try_dispatch_dflash_spec_decode(
         // ADR-034 2026-05-22: Option A xlen SDPA path is WIRED + delivers
         // 1.62× over Option C on Gemma 4 26B-A4B-it Q5_K_M code-gen (3-rep
         // paired bench at HEAD 7da12c37: Option A 45.7 t/s vs Option C
-        // 28.2 t/s) AND produces byte-identical output to base autoregressive
-        // at temp=0 greedy. Still 0.40× of base generation — drafter
+        // 28.2 t/s) AND produces output byte-identical to base autoregressive
+        // for ~135 tokens then diverges via single-token argmax flip at
+        // temp=0 greedy (empirical at HEAD 6a8a8f6f 2026-05-22:
+        // base "element" vs Option A "term" at gen token ~135, cascading).
+        // Still 0.40× of base generation — drafter
         // overhead exceeds Gemma's compact autoregressive cost; production
         // parity needs drafter training or tree decoding.
         eprintln!(
             "[HF2Q_SPEC_DFLASH=1 + HF2Q_DFLASH_XLEN_SDPA=1] loading DFlash drafter — Option A \
-             (cross-length SDPA), byte-identical to base at temp=0 greedy, 1.62× over Option C \
+             (cross-length SDPA), byte-identical to base for ~135 tokens then diverges via argmax flip at temp=0 greedy, 1.62× over Option C \
              on Gemma but still 0.40× of base generation (research-quality)"
         );
     } else {
@@ -128,7 +131,7 @@ pub fn try_dispatch_dflash_spec_decode(
         eprintln!(
             "[HF2Q_SPEC_DFLASH=1] loading DFlash drafter — Option C re-prefill, slower than \
              baseline + diverges from base autoregressive at temp=0; set HF2Q_DFLASH_XLEN_SDPA=1 \
-             + HF2Q_FULL_F16_KV=1 for Option A (1.62× faster + byte-identical to base)"
+             + HF2Q_FULL_F16_KV=1 for Option A (1.62× faster + byte-identical to base for ~135 tokens then diverges)"
         );
     }
 
