@@ -184,9 +184,10 @@ pub fn extract_top_k_from_row_logits(
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
-    /// Local comparable wrapper so f32 can be ordered via total_cmp
-    /// (handles NaN already rejected; this is for the deterministic
-    /// tiebreaker by token id when log_probs are equal).
+    /// Local comparable wrapper so f32 can be ordered via partial_cmp
+    /// (NaN inputs are already rejected at entry, so partial_cmp's
+    /// None case is unreachable; the deterministic tiebreaker by
+    /// token id makes the ordering total).
     #[derive(Debug, Clone, Copy)]
     struct LogProbToken {
         log_prob: f32,
@@ -215,23 +216,51 @@ pub fn extract_top_k_from_row_logits(
         }
     }
 
-    let mut heap: BinaryHeap<Reverse<LogProbToken>> = BinaryHeap::with_capacity(effective_k + 1);
+    // Codex /cfa E4b.10a Major (2026-05-22): select using UNCLAMPED
+    // f64 log-probs; clamp only at materialization. Pre-selection
+    // clamping was collapsing distinct tail log_probs to LOG_PROB_FLOOR,
+    // causing tie-break to pick smaller-token instead of mathematically
+    // higher logit (e.g. logits=[0.0, -3e38, -2e38], top_k=2 should
+    // keep tokens 0 and 2; pre-clamp clamped both -3e38 and -2e38 to
+    // floor → tie-break picked 1 instead of 2).
+    #[derive(Debug, Clone, Copy)]
+    struct LogProbTokenF64 {
+        log_prob: f64,
+        token: u32,
+    }
+    impl PartialEq for LogProbTokenF64 {
+        fn eq(&self, other: &Self) -> bool {
+            self.log_prob == other.log_prob && self.token == other.token
+        }
+    }
+    impl Eq for LogProbTokenF64 {}
+    impl Ord for LogProbTokenF64 {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.log_prob
+                .partial_cmp(&other.log_prob)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| other.token.cmp(&self.token))
+        }
+    }
+    impl PartialOrd for LogProbTokenF64 {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    // Silence unused-Ord warning from the prior helper.
+    let _ = std::marker::PhantomData::<LogProbToken>;
+
+    let mut heap: BinaryHeap<Reverse<LogProbTokenF64>> =
+        BinaryHeap::with_capacity(effective_k + 1);
     for (i, &v) in row_logits.iter().enumerate() {
-        let log_prob_f64 = (v as f64) - log_sumexp;
-        let log_prob = if log_prob_f64.is_finite() {
-            (log_prob_f64 as f32).max(LOG_PROB_FLOOR)
-        } else {
-            LOG_PROB_FLOOR
-        };
-        let candidate = LogProbToken {
+        let log_prob = (v as f64) - log_sumexp;
+        let candidate = LogProbTokenF64 {
             log_prob,
             token: i as u32,
         };
         if heap.len() < effective_k {
             heap.push(Reverse(candidate));
         } else if let Some(Reverse(min)) = heap.peek() {
-            // Larger log_prob ALWAYS replaces; equal log_prob with
-            // SMALLER token replaces (matches LogProbToken's Ord).
             if candidate > *min {
                 heap.pop();
                 heap.push(Reverse(candidate));
@@ -239,12 +268,23 @@ pub fn extract_top_k_from_row_logits(
         }
     }
 
-    // Drain heap → sort descending by log_prob.
+    // Drain heap → sort descending by log_prob, then clamp at floor
+    // when materializing DraftCandidate (so the Phase E4a finite
+    // contract is satisfied without losing ordering information).
     let mut out: Vec<DraftCandidate> = heap
         .into_iter()
-        .map(|Reverse(lpt)| DraftCandidate {
-            token: lpt.token,
-            log_prob: lpt.log_prob,
+        .map(|Reverse(lpt)| {
+            // Clamp at floor; for valid finite f64 in the typical
+            // log-softmax range this is a no-op.
+            let lp = if lpt.log_prob.is_finite() {
+                (lpt.log_prob as f32).max(LOG_PROB_FLOOR)
+            } else {
+                LOG_PROB_FLOOR
+            };
+            DraftCandidate {
+                token: lpt.token,
+                log_prob: lp,
+            }
         })
         .collect();
     out.sort_by(|a, b| {
@@ -595,6 +635,28 @@ mod tests {
         let logits: Vec<f32> = (0..1000).map(|i| (i as f32) * 0.01 - 5.0).collect();
         let out = extract_top_k_from_row_logits(&logits, 10).unwrap();
         validate_candidates(&out, 10).expect("Phase E4a contract");
+    }
+
+    #[test]
+    fn adr_037_e4b10a_gate_top_k_preserves_order_under_clamp_2026_05_22() {
+        // Codex /cfa E4b.10a Major regression (2026-05-22): clamping
+        // BEFORE heap selection collapsed distinct tail log_probs to
+        // LOG_PROB_FLOOR, causing tie-break to pick smaller-token
+        // instead of mathematically higher logit. With unclamped f64
+        // selection, the ordering must be preserved.
+        //
+        // Logits: [0.0, -3e38, -2e38]. top_k=2 must return tokens
+        // 0 (highest logit) and 2 (next-highest at -2e38 > -3e38).
+        // With pre-clamp behavior, both -3e38 and -2e38 collapsed
+        // to LOG_PROB_FLOOR and tiebreak picked token 1 wrong.
+        let logits = vec![0.0f32, -3e38, -2e38];
+        let out = extract_top_k_from_row_logits(&logits, 2).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].token, 0, "highest logit");
+        assert_eq!(
+            out[1].token, 2,
+            "next-highest is -2e38 (token 2), NOT -3e38 (token 1)"
+        );
     }
 
     #[test]
