@@ -287,19 +287,25 @@ Q8_0, 50 tok). Steady-state per-iter (iters 9-28 averaged):
 drafter is NOT the structural gap. Drafter is only 6.8% of our iter — fusing
 it would yield ~3.4% throughput, not the multi-x gap we'd been chasing.
 
-**Real prize**: verifier MLP fusion. Qwen 3.6 27B has 64 transformer layers,
-each with an MLP (gate + up + SwiGLU + down + residual ≈ 5 separate Metal
-dispatches in our impl). Fusing per layer saves 4 dispatches × 64 layers =
-**256 saved Metal launches × ~50μs = ~12.8 ms verifier savings**.
+**Real prize**: verifier MLP fusion. Qwen 3.6 27B has 64 transformer layers.
+**CORRECTED count (read from `src/inference/models/qwen35/gpu_ffn.rs:1003-1006`)**:
+our MLP is **4 dispatches per layer** (gate proj + up proj + silu_mul + down
+proj), NOT 5 — `silu_mul` is already fused and residual add is already folded
+into the same command buffer. Full fusion (gate+up+silu+down → 1 dispatch)
+saves 3 dispatches × 64 layers = **192 saved Metal launches × ~50μs ≈ 9.6 ms**.
 
-**Projected impact**:
+**Projected impact (corrected)**:
 
 | Metric              | Current | After fused MLP |
 |---------------------|--------:|----------------:|
-| Verifier time       | 59.5 ms |        ~46.7 ms |
-| Iter time           | 64.8 ms |        ~52.0 ms |
-| Throughput          | 26.5 t/s |        ~33 t/s |
-| Speedup vs base 21.30 | 1.244× |          **~1.55×** |
+| Verifier time       | 59.5 ms |        ~49.9 ms |
+| Iter time           | 64.8 ms |        ~55.2 ms |
+| Throughput per iter | 1.746 tok | 1.746 tok    |
+| Throughput          | 26.5 t/s |       ~31.6 t/s |
+| Speedup vs base 21.30 | 1.244× |          **~1.484×** |
+
+(Prior cont. 15 "~1.55×" estimate was based on 5-dispatch MLP assumption;
+true count of 4 yields slightly lower but still meaningful ~1.48× projection.)
 
 This would be a STRONG ship. Multi-week scope to implement Q8_0 / Q4_K_M /
 IQ4_NL quantized fused-MLP Metal kernels (MTPLX's `gate_up_swiglu_*_qmv4`
