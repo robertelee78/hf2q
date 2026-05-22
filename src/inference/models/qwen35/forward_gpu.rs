@@ -1592,7 +1592,6 @@ impl Qwen35Model {
             &[],
             None,
             None,
-            None,
         )
     }
 
@@ -1615,7 +1614,6 @@ impl Qwen35Model {
             None,
             OutputHeadMode::Last,
             &[],
-            None,
             None,
             None,
         )
@@ -1672,7 +1670,6 @@ impl Qwen35Model {
             &[],
             None,
             Some(&mut topk_slot),
-            None,
         )?;
         topk_slot.ok_or_else(|| {
             anyhow!(
@@ -1735,7 +1732,6 @@ impl Qwen35Model {
             soft_tokens,
             None,
             None,
-            None,
         )
     }
 
@@ -1795,7 +1791,6 @@ impl Qwen35Model {
             soft_tokens,
             deepstack,
             None,
-            None,
         )
     }
 
@@ -1842,7 +1837,6 @@ impl Qwen35Model {
             &[],
             None,
             None,
-            None,
         )?;
         let h = self.cfg.hidden_size as usize;
         anyhow::ensure!(
@@ -1884,10 +1878,115 @@ impl Qwen35Model {
             &[],
             None,
             None,
-            None,
         )?;
         let hidden = hidden_out
             .ok_or_else(|| anyhow!("forward_gpu_with_hidden: hidden buffer was not captured"))?;
+        Ok((logits, hidden))
+    }
+
+    /// ADR-034 task #78 Step 3c.A (2026-05-21) — DFlash-aware variant of
+    /// [`Self::forward_gpu_with_hidden`].
+    ///
+    /// When `dflash_capture` is `Some`, allocates a [`LayerActivations`]
+    /// buffer, runs the forward with that buffer set, then post-processes
+    /// `layer_outputs[layer_idx]` into the session via `write_layer_slab`
+    /// for each `layer_idx` in `session.target_layer_ids`.
+    ///
+    /// **Design rationale (cont. 39)**: Qwen35Model::forward_gpu_impl
+    /// takes `&self` (immutable). The original "thread `&mut session` into
+    /// the layer loop" approach would have required either interior
+    /// mutability or refactoring 8+ &self call sites. Instead, we reuse
+    /// the existing ADR-012 P9b LayerActivations capture path (which
+    /// already calls `download_f32(&hidden)` with implicit GPU sync at
+    /// the end of each layer) and extract just the target slabs at the
+    /// end. The download_f32 path was production-tested for activation-
+    /// aware DWQ calibration so its GPU-sync correctness is already known
+    /// good.
+    ///
+    /// Memory cost: `n_layers * seq_len * hidden_size * 4` bytes for the
+    /// scratch LayerActivations. For Qwen 3.6 27B (64 layers × 4 tokens ×
+    /// 5120 floats) this is ~5 MB per round — small relative to the
+    /// model itself.
+    ///
+    /// When `dflash_capture` is `None`, behavior is byte-identical to
+    /// [`Self::forward_gpu_with_hidden`].
+    pub fn forward_gpu_with_hidden_dflash(
+        &self,
+        tokens: &[u32],
+        positions_flat: &[i32],
+        kv_cache: &mut HybridKvCache,
+        dflash_capture: Option<&mut crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession>,
+    ) -> Result<(Vec<f32>, MlxBuffer)> {
+        let Some(session) = dflash_capture else {
+            return self.forward_gpu_with_hidden(tokens, positions_flat, kv_cache);
+        };
+        // Validate session layout matches this forward call before
+        // running the (expensive) forward — fail fast.
+        let seq_len = tokens.len();
+        let hs = self.cfg.hidden_size as usize;
+        if session.seq_len != seq_len {
+            return Err(anyhow!(
+                "forward_gpu_with_hidden_dflash: session.seq_len={} != tokens.len()={}",
+                session.seq_len,
+                seq_len,
+            ));
+        }
+        if session.hidden_size != hs {
+            return Err(anyhow!(
+                "forward_gpu_with_hidden_dflash: session.hidden_size={} != cfg.hidden_size={}",
+                session.hidden_size,
+                hs,
+            ));
+        }
+        let n_layers = self.layers.len();
+        for &layer_idx in &session.target_layer_ids {
+            if layer_idx >= n_layers {
+                return Err(anyhow!(
+                    "forward_gpu_with_hidden_dflash: target_layer_ids[i]={} >= n_layers={}",
+                    layer_idx,
+                    n_layers,
+                ));
+            }
+        }
+        // Allocate scratch LayerActivations. The capture path inside
+        // forward_gpu_impl pushes one Vec<f32> per layer into
+        // `layer_outputs` (length = seq_len * hidden_size), already
+        // GPU-synced via download_f32.
+        let mut acts = LayerActivations {
+            num_layers: n_layers as u32,
+            seq_len: seq_len as u32,
+            hidden_size: hs as u32,
+            layer_inputs: Vec::with_capacity(n_layers),
+            layer_outputs: Vec::with_capacity(n_layers),
+        };
+        let mut hidden_out = None;
+        let logits = self.forward_gpu_impl(
+            tokens,
+            positions_flat,
+            kv_cache,
+            Some(&mut acts),
+            Some(&mut hidden_out),
+            OutputHeadMode::All,
+            &[],
+            None,
+            None,
+        )?;
+        let hidden = hidden_out.ok_or_else(|| {
+            anyhow!("forward_gpu_with_hidden_dflash: hidden buffer was not captured")
+        })?;
+        // Post-process: copy target slabs out of `acts.layer_outputs`
+        // into the session's flat hidden_output buffer.
+        if acts.layer_outputs.len() != n_layers {
+            return Err(anyhow!(
+                "forward_gpu_with_hidden_dflash: expected layer_outputs.len()={} after forward, got {}",
+                n_layers,
+                acts.layer_outputs.len(),
+            ));
+        }
+        for (capture_idx, &layer_idx) in session.target_layer_ids.clone().iter().enumerate() {
+            let slab = &acts.layer_outputs[layer_idx];
+            session.write_layer_slab(capture_idx, slab)?;
+        }
         Ok((logits, hidden))
     }
 
@@ -2004,7 +2103,6 @@ impl Qwen35Model {
             &[],
             None,
             None,
-            None,
         )
     }
 
@@ -2019,20 +2117,7 @@ impl Qwen35Model {
         soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
         deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
         topk_out: Option<&mut Option<(Vec<u32>, Vec<f32>)>>,
-        // ADR-034 task #78 Step 3c.A.1 (2026-05-21 cont. 38) — optional
-        // DFlash hidden-capture session. When `Some`, the layer loop
-        // downloads `hidden` to CPU at the end of each layer matching
-        // `cap.target_layer_ids` and writes it into the session via
-        // `cap.write_layer_slab(capture_idx, slab)`. When `None` the
-        // forward path is byte-identical to pre-Step 3c.A.1 behavior.
-        // Step 3c.A.1 just plumbs the param; layer-hook insertion comes
-        // in next iteration after caller signatures are updated.
-        mut dflash_capture: Option<&mut crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession>,
     ) -> Result<Vec<f32>> {
-        // dflash_capture is reserved for the per-layer hook landing in a
-        // follow-up iteration. Silence unused-variable lint until the
-        // hook is wired.
-        let _ = &mut dflash_capture;
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
         }

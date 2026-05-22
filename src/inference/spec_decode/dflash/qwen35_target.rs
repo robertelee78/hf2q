@@ -148,10 +148,18 @@ impl<'a> DFlashTarget for Qwen35DFlashTarget<'a> {
     /// `start_seq_pos`. Returns per-position argmax (Vec length =
     /// tokens.len()).
     ///
-    /// Internals: calls `Qwen35Model::forward_gpu_with_hidden` with
-    /// positions broadcast from `start_seq_pos`, then extracts argmax
-    /// of each per-token logits row. Identical math to
+    /// Internals: calls `Qwen35Model::forward_gpu_with_hidden_dflash`
+    /// (which delegates to `forward_gpu_with_hidden` when no capture is
+    /// installed) with positions broadcast from `start_seq_pos`, then
+    /// extracts argmax of each per-token logits row. Identical math to
     /// `MlxModelWeights::forward_decode_verify_batched`.
+    ///
+    /// **Step 3c.A wiring (cont. 39)**: when `self.dflash_capture` is
+    /// `Some`, the call routes through `forward_gpu_with_hidden_dflash`
+    /// which post-processes the verifier's per-layer hidden states into
+    /// the session via the LayerActivations capture path. The session is
+    /// then consumed by the orchestrator's drafter input
+    /// (`extract_drafter_concat`) on the next round.
     fn forward_decode_verify_batched(
         &mut self,
         tokens: &[u32],
@@ -175,11 +183,17 @@ impl<'a> DFlashTarget for Qwen35DFlashTarget<'a> {
             );
         let seq_len = tokens.len();
 
-        // Forward call. `forward_gpu_with_hidden` returns
-        // (logits: Vec<f32>[seq_len * vocab_size], hidden: MlxBuffer).
-        let (logits, _hidden) = self
-            .model
-            .forward_gpu_with_hidden(tokens, &positions_flat, self.kv_cache)?;
+        // Forward call. `forward_gpu_with_hidden_dflash` returns
+        // (logits: Vec<f32>[seq_len * vocab_size], hidden: MlxBuffer)
+        // and additionally populates `self.dflash_capture` if set.
+        // When no capture is installed it delegates to the plain
+        // `forward_gpu_with_hidden` path with no extra overhead.
+        let (logits, _hidden) = self.model.forward_gpu_with_hidden_dflash(
+            tokens,
+            &positions_flat,
+            self.kv_cache,
+            self.dflash_capture.as_mut(),
+        )?;
 
         let vocab = self.model.cfg.vocab_size as usize;
         if logits.len() != seq_len * vocab {
