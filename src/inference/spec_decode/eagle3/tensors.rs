@@ -302,7 +302,7 @@ impl Eagle3DrafterTensors {
         let mlp_down =
             upload_bf16(device, fetch(weights, "layers.0.mlp.down_proj.weight")?)?;
 
-        Ok(Self {
+        let tensors = Self {
             embed_tokens,
             fc,
             input_norm,
@@ -326,12 +326,60 @@ impl Eagle3DrafterTensors {
             mlp_gate,
             mlp_up,
             mlp_down,
-        })
+        };
+
+        // Codex /cfa E4b.1 Minor (2026-05-22): post-upload dtype
+        // tripwire. Mirrors DFlash's invariant guards. Defense against
+        // ADR-030 iter-106-style RMSNorm-over-BF16 silent corruption:
+        // if a future refactor mistakenly routes an RMSNorm weight
+        // through `upload_bf16` instead of `upload_bf16_as_f32`, this
+        // catches it BEFORE the rms_norm_f32 kernel reads adjacent
+        // BF16 elements as misinterpreted F32 bits.
+        debug_assert_eq!(tensors.fc.dtype(), DType::BF16);
+        debug_assert_eq!(tensors.norm.dtype(), DType::F32);
+        debug_assert_eq!(tensors.input_layernorm.dtype(), DType::F32);
+        debug_assert_eq!(tensors.hidden_norm.dtype(), DType::F32);
+        debug_assert_eq!(tensors.post_attention_layernorm.dtype(), DType::F32);
+        debug_assert_eq!(tensors.q_proj.dtype(), DType::BF16);
+        debug_assert_eq!(tensors.k_proj.dtype(), DType::BF16);
+        debug_assert_eq!(tensors.v_proj.dtype(), DType::BF16);
+        debug_assert_eq!(tensors.o_proj.dtype(), DType::BF16);
+        debug_assert_eq!(tensors.mlp_gate.dtype(), DType::BF16);
+        debug_assert_eq!(tensors.mlp_up.dtype(), DType::BF16);
+        debug_assert_eq!(tensors.mlp_down.dtype(), DType::BF16);
+        if let Some(b) = &tensors.embed_tokens {
+            debug_assert_eq!(b.dtype(), DType::BF16);
+        }
+        if let Some(b) = &tensors.input_norm {
+            debug_assert_eq!(b.dtype(), DType::F32);
+        }
+        for b in &tensors.fc_norm {
+            debug_assert_eq!(b.dtype(), DType::F32);
+        }
+        if let Some(b) = &tensors.lm_head {
+            debug_assert_eq!(b.dtype(), DType::BF16);
+        }
+        if let Some(b) = &tensors.q_norm {
+            debug_assert_eq!(b.dtype(), DType::F32);
+        }
+        if let Some(b) = &tensors.k_norm {
+            debug_assert_eq!(b.dtype(), DType::F32);
+        }
+        for opt in [&tensors.q_bias, &tensors.k_bias, &tensors.v_bias, &tensors.o_bias] {
+            if let Some(b) = opt {
+                debug_assert_eq!(b.dtype(), DType::BF16);
+            }
+        }
+
+        Ok(tensors)
     }
 
-    /// Total GPU-resident bytes across all uploaded buffers. Useful
-    /// for memory accounting and tests that verify the F32-cast
-    /// expansion math (BF16 norm weights become 2x bigger on GPU).
+    /// Total GPU-resident bytes across all uploaded Metal buffers.
+    ///
+    /// Codex /cfa E4b.1 Minor (2026-05-22): excludes
+    /// `draft_id_to_target_id` — that mapping lives on CPU as
+    /// `Vec<i64>`, NOT in a Metal buffer. Use `cpu_resident_bytes()`
+    /// for that and `total_resident_bytes()` for the sum.
     pub fn gpu_resident_bytes(&self) -> usize {
         let mut total = 0;
         total += self.fc.byte_len();
@@ -358,9 +406,8 @@ impl Eagle3DrafterTensors {
         if let Some(b) = &self.lm_head {
             total += b.byte_len();
         }
-        if let Some(v) = &self.draft_id_to_target_id {
-            total += v.len() * std::mem::size_of::<i64>();
-        }
+        // draft_id_to_target_id is CPU-resident; not counted here
+        // (codex /cfa E4b.1 Minor fix 2026-05-22).
         if let Some(b) = &self.q_norm {
             total += b.byte_len();
         }
@@ -380,6 +427,19 @@ impl Eagle3DrafterTensors {
             total += b.byte_len();
         }
         total
+    }
+
+    /// Bytes resident on CPU (currently only the `draft_id_to_target_id`
+    /// vocab-remap vector when present).
+    pub fn cpu_resident_bytes(&self) -> usize {
+        self.draft_id_to_target_id
+            .as_ref()
+            .map_or(0, |v| v.len() * std::mem::size_of::<i64>())
+    }
+
+    /// Total resident bytes = GPU + CPU.
+    pub fn total_resident_bytes(&self) -> usize {
+        self.gpu_resident_bytes() + self.cpu_resident_bytes()
     }
 }
 
@@ -599,7 +659,10 @@ mod tests {
             weights.tensors.iter().map(|t| t.data().len()).sum();
         let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights)
             .expect("upload to GPU");
-        let gpu_bytes = tensors.gpu_resident_bytes();
+        // Test uses TOTAL bytes (gpu + cpu) since safetensors_data_bytes
+        // counts the I64 mapping which is CPU-resident (codex /cfa
+        // E4b.1 Minor 2026-05-22).
+        let total_bytes = tensors.total_resident_bytes();
         // F32-cast RMSNorm tensors double in size (BF16 2bpe → F32 4bpe).
         // tiny_cfg has: input_layernorm + hidden_norm + post_attention_layernorm
         // + q_norm + k_norm + 3 fc_norm + norm = 8 cast norms.
@@ -613,9 +676,20 @@ mod tests {
             + cfg.hidden_size; // final norm
         let cast_expansion_bytes = cast_elems * 2; // BF16(2) → F32(4) adds 2 bytes per elem
         assert_eq!(
-            gpu_bytes,
+            total_bytes,
             safetensors_data_bytes + cast_expansion_bytes,
-            "gpu bytes = safetensors data ({safetensors_data_bytes}) + F32 cast expansion ({cast_expansion_bytes})"
+            "total bytes (gpu+cpu) = safetensors data ({safetensors_data_bytes}) + F32 cast expansion ({cast_expansion_bytes})"
+        );
+        // Also verify gpu/cpu split is consistent.
+        assert_eq!(
+            tensors.gpu_resident_bytes() + tensors.cpu_resident_bytes(),
+            total_bytes
+        );
+        // CPU bytes = draft_vocab_size * 8 bytes (i64 mapping).
+        assert_eq!(
+            tensors.cpu_resident_bytes(),
+            cfg.draft_vocab_size * 8,
+            "CPU bytes should be draft_vocab_size * 8 (i64 mapping)"
         );
     }
 }
