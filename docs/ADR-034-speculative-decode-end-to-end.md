@@ -89,6 +89,30 @@ Saved cost: ~8-17 ms per drafter forward × per round → ~10-20% DFlash through
 
 **Previously-believed target REVISED**: I previously documented "fused projections Metal kernel" (single dispatch for norm + Q+K+V+Gate + per-head norms + RoPE) as the structural lever. Reading MTPLX's `/opt/MTPLX/native_extensions/verify_mlp/gate_up/gate_up.metal` shows their only attention-side fused kernel is the MLP (gate + up + silu_mul, which corresponds to our task #93 SHIPPED). They do NOT have a fused projections kernel either. Their advantage is the compiled drafter, not a deeper attention fusion. Task #89's vec-extension building blocks (Steps 1-3b SHIPPED) remain useful but don't unlock the perf gap — the real gap is the drafter compile pattern.
 
+**Task #95 COMPLETED at HEAD `ffa526ff` (2026-05-22)** — compiled-drafter lever shipped in 8 sub-iterations:
+
+| Sub-iter | Commit | Description | Cumulative perf |
+|---|---|---|---:|
+| A | `26d96cad` | `append_seq_major_kv_gpu` + parity test PASS | baseline ~17.87 t/s |
+| B | `be54bd0d` | `write_slack_kv_gpu` + parity test PASS | ~17.87 t/s |
+| C+D | `f25348d3` | Wire GPU cache writes into drafter attention | 18.10 (+1.3%) |
+| F | `c49133de` | GPU permute in `dispatch_dflash_sdpa_cross_length` | 18.20 (+1.8%) |
+| G | `17852489` | Fuse `o_proj` into sdpa encoder | 18.43 (+3.1%) |
+| (codex) | `9bc8c0ce` | Interleaved-cursor parity test per codex /cfa | — |
+| E | `ffa526ff` | Remove env-gated CPU opt-outs (120 LOC dead code cleanup) | **18.50 (+3.5%)** |
+
+**Final result**: Qwen 3.6 27B Q8_0 DFlash BS=4 code-gen 128 tok, 3-rep paired: **18.50 ± 0.10 tok/s** (was 17.87 at the corrected ADR target identification commit `e9358fde`). **+3.5% cumulative DFlash perf** with byte-identical output preserved throughout.
+
+**Test gates passed**:
+- 3 task #95 parity tests (`append`, `slack`, `interleaved-cursor`) all PASS
+- 51/51 lib tests still PASS
+- Codex /cfa cleared cumulative work (Critical 0, Major 0, Minor 1 doc-only)
+- Byte-identical generated text vs CPU paths at temp=0 greedy across all sub-iters
+
+**What this proved**: the corrected ADR target diagnosis was right. MTPLX's 2.24× advantage isn't from a fused projections Metal kernel (peer code confirmed they don't have one either) — it's from `mx.compile`-compiled chained drafter. The Rust-side equivalent (in-encoder GPU kernel dispatches replacing CPU bridges + commit_and_wait boundaries) is now shipped and delivering real perf with byte-identical output.
+
+DFlash on Qwen35 remains opt-in / research-quality at 18.50 tok/s — still below MTP K=1 BATCHED MH production winner (27.5 tok/s) because the drafter forward cost is structural. But the compile-drafter pattern is now PROVEN, and could be extended to the K=N MTP path (Cell A 35B-A3B) where identical CPU-sync patterns exist between MTP depth=1 and depth=2 calls.
+
 **Concrete refactor path identified (task #95, 2026-05-21)**: research at HEAD `e9358fde` identified the exact CPU↔GPU boundary:
 - `DFlashLayerKvCache.keys`/`.values` ARE already `MlxBuffer` (GPU-resident, see `kv_cache.rs:46-48`)
 - The CPU roundtrip is ONLY in the WRITE PATH: `append_seq_major_kv` + `write_slack_kv` take `&[f32]` CPU slices and use `as_mut_slice` to memcpy into the GPU buffer
