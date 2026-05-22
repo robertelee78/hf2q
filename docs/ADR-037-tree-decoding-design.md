@@ -1,7 +1,7 @@
 # ADR-037 — EAGLE-3 with dynamic tree port (max coherence + perf)
 
-- **Status**: 🚧 **IN PROGRESS** — Phase E1.1 SHIPPED (foundation), E1.2-E8 remaining
-- **Date**: 2026-05-22 (HEAD `9690fc69` v2; mlx-native `310f5cb` Phase E1.1)
+- **Status**: 🚧 **IN PROGRESS** — Phase E1 CLOSED (kernel + 5 parity classes + codex Critical 0); E2-E8 remaining
+- **Date**: 2026-05-22 (HEAD v2 `9690fc69`; mlx-native `3ea809f` Phase E1 closure)
 - **Supersedes**: nothing
 - **Author note**: v1 (earlier in this conversation) recommended Medusa-first because it was "simpler to implement". Operator pushed back: *"why do you focus on simple instead of correct for max coherence and perf? ... it literally takes longer to do the wrong things many times, then eventually the right thing ... better to just do the right thing 1st"*. v2 commits to the empirically-best published architecture from the start.
 
@@ -11,11 +11,18 @@
 |---|---|---|---|
 | E1.1 — tree=1 parity | ✅ SHIPPED | mlx-native `310f5cb` | 5/5 byte-identity tests PASS (dk256 basic/GQA/long/unaligned + dk512 basic). 6/6 lib unit tests PASS. Foundation derisked. |
 | E1.2 — chain parity (qL>1) | ✅ SHIPPED | mlx-native `b2844bc` | 5/5 byte-identity tests PASS (dk256 qL=2/4 + GQA qL=8 + dk512 qL=4 + long-context kv=512 qL=4). qL>1 contract extends E1.1 structural argument: per-row causal-mimicking mask + identical FMA order + reused reduce kernel → bit-equality. |
-| E1.3 — fixed-square tree vs CPU ref | ⏳ TODO | — | Non-causal mask within tree segment. Requires CPU reference (no flash_attn_vec equivalent). |
-| E1.4 — dynamic asymmetric tree vs CPU ref | ⏳ TODO | — | Irregular tree shape per depth. |
-| E1.5 — prefix+tree combined parity | ⏳ TODO | — | Long prefix (kv=512) + small tree (qL=8). |
-| E1 codex /cfa gate | ⏳ TODO | — | After E1.3-E1.5 |
-| E2-E8 | ⏳ TODO | — | Per §4 schedule |
+| E1.3 — fixed-square tree vs CPU ref | ✅ SHIPPED | mlx-native `f2da58d` | 4/4 PASS within 1e-2 tolerance (dk256 / dk256 GQA / dk512 / dk256 long-prefix). First non-causal-within-tree mask. Surfaced output-layout bug: actual layout is `[q_seq_len, num_heads, head_dim]` (rid = iq2 + iq1 * n_heads), not [heads, queries, dim] like Q input. |
+| E1.4 — dynamic asymmetric tree vs CPU ref | ✅ SHIPPED | mlx-native `9d3ffd1` | 4/4 PASS within 1e-2 (dk256 / dk256 GQA / dk512 / chain-as-degenerate-tree). 8-node max-depth-4 asymmetric tree with varying per-depth branching factor. Validates arbitrary EAGLE-2 dynamic-expansion-shape topology. |
+| E1.5 — prefix+tree combined parity | ✅ SHIPPED | mlx-native `9d3ffd1` | 3/3 PASS within 1e-2 (dk256 / dk256 GQA / dk512). 504-token natural prefix + 8-node asymmetric tree on top = kv 512. Closest synthetic to production EAGLE-3 long-context dispatch shape. |
+| E1 codex /cfa gate | ✅ PASSED | mlx-native `3ea809f` | Codex re-review confirms **0 Critical + 0 Major** remaining. Fixed: K/V dtype validation, buffer byte-length validation, output-layout doc, CPU-ref precision caveat, unused struct, register() reduce-dep doc. Added 3 negative-path validation tests (all PASS). |
+| **Phase E1 totals** | ✅ **CLOSED** | mlx-native `3ea809f` | **24/24** integration tests PASS (21 parity + 3 negative-path) + **6/6** lib unit tests PASS = **30/30** total. |
+| E2 — EAGLE-3 drafter training | ⏳ TODO | — | Multi-week training (~1wk H100 compute). |
+| E3 — drafter loader + multi-layer hidden plumbing | ⏳ TODO | — | ~500 LOC, ~3-5 days |
+| E4 — drafter forward + dynamic tree expansion | ⏳ TODO | — | ~600 LOC, ~5-7 days |
+| E5 — tree-walk-accept + KV rollback | ⏳ TODO | — | ~350 LOC, ~3-4 days |
+| E6 — orchestrator + HF2Q_SPEC_EAGLE3 env flag | ⏳ TODO | — | ~500 LOC, ~5-7 days |
+| E7 — 3-rep paired empirical validation | ⏳ TODO | — | Target: ≥1.3× on 2K natural + ≥1.5× on long code-gen |
+| E8 — codex /cfa final + ADR-034 update + merge | ⏳ TODO | — | Mission closure |
 
 ## 0. The right thing first
 
