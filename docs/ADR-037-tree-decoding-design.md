@@ -10,8 +10,11 @@
 | Phase | Status | Commit | Notes |
 |---|---|---|---|
 | E1.1 — tree=1 parity | ✅ SHIPPED | mlx-native `310f5cb` | 5/5 byte-identity tests PASS (dk256 basic/GQA/long/unaligned + dk512 basic). 6/6 lib unit tests PASS. Foundation derisked. |
-| E1.2-E1.5 — chain/fixed-tree/dynamic-tree/prefix+tree parity | ⏳ TODO | — | Next sub-iters |
-| E1 codex /cfa gate | ⏳ TODO | — | After E1.2-E1.5 |
+| E1.2 — chain parity (qL>1) | ✅ SHIPPED | mlx-native `b2844bc` | 5/5 byte-identity tests PASS (dk256 qL=2/4 + GQA qL=8 + dk512 qL=4 + long-context kv=512 qL=4). qL>1 contract extends E1.1 structural argument: per-row causal-mimicking mask + identical FMA order + reused reduce kernel → bit-equality. |
+| E1.3 — fixed-square tree vs CPU ref | ⏳ TODO | — | Non-causal mask within tree segment. Requires CPU reference (no flash_attn_vec equivalent). |
+| E1.4 — dynamic asymmetric tree vs CPU ref | ⏳ TODO | — | Irregular tree shape per depth. |
+| E1.5 — prefix+tree combined parity | ⏳ TODO | — | Long prefix (kv=512) + small tree (qL=8). |
+| E1 codex /cfa gate | ⏳ TODO | — | After E1.3-E1.5 |
 | E2-E8 | ⏳ TODO | — | Per §4 schedule |
 
 ## 0. The right thing first
