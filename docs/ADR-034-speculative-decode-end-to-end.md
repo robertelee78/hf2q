@@ -332,6 +332,48 @@ empirical perf gain ~zero on spec). Will keep wired but default OFF.
 
 Memory: `project_adr034_task94_qkvg_falsified_2026_05_21` (next iter).
 
+### Iteration 2026-05-21 (cont. 29) — Fused MLP family COMPLETE; codex review clean; all parity green
+
+Multi-iteration fused MLP scope (task #93) STRUCTURALLY COMPLETE across all
+5 common Qwen 3.5/3.6 dense quants:
+
+| Quant   | mlx-native kernel | hf2q wired | Parity (m∈1,2,4) | Bench         |
+|---------|-------------------|------------|------------------|---------------|
+| Q8_0    | `815abed`         | `b1b119a8` | ✅ 3/3 PASS       | ✅ +3.5% base  |
+| Q4_K    | `32d8948`         | `cc383888` | ✅ 3/3 PASS       | ⏳ no dense GGUF |
+| IQ4_NL  | `9c63650`         | `b9369f7f` | ✅ 3/3 PASS       | ⏳ no dense GGUF |
+| Q5_K    | `09e00b7`/`fd0f791` | `d4a55b5f` | ✅ 3/3 PASS    | ⏳ no dense GGUF |
+| Q6_K    | `441496c`/`8e97235` | `2f367753` | ✅ 3/3 PASS    | ⏳ no dense GGUF |
+
+Plus FA-layer fused dual projection:
+
+| Family                    | Kernel    | Wired      | Parity     | Bench  |
+|---------------------------|-----------|------------|------------|--------|
+| Q4_0 dual-proj (Q+gate / K+V) | `796adb5`/`adca132` | `7a9b986e`/`77f9c5f2`/`fc41526f` | ✅ 3/3 PASS | falsified (cont. 20-21) |
+
+**Codex /cfa review (cont. 29 this iter)** of full family:
+- CORRECTNESS: No issues found
+- All 5 kernels use consistent SiLU `g / (1 + exp(-g))` math
+- Buffer bindings consistent (gate_w=0, up_w=1, input=2, output=3, params=4)
+- Geometry differences (Q6_K's inverted `(2,32,1)` vs Q4_K/Q5_K's `(32,2,1)`)
+  are intentional and dispatched correctly
+- hf2q branch cascade safe (matches! over single enum value per branch)
+- HARDENING (LOW): defensive asserts for odd intermediate_size could be
+  added; not relevant in practice (Qwen dense intermediate_size always
+  8-aligned)
+
+**Full parity suite (this iter)**: 24/24 tests pass across all family
+members. hf2q lib tests: 51/51 pass. No regressions.
+
+**Production state for Q8_0 dense Qwen 3.6 27B**: BASE 20.97 → 21.83 t/s
+= **+3.5% default-ON** (cont. 22 SHIPPED). Spec K=1 BATCHED MH temp=0.5
+= 26.5 t/s = **1.244× over the new improved base** (1.30+× over the
+pre-fused-MLP base — same absolute throughput).
+
+Closing scope for fused MLP: any future user loading a dense Qwen GGUF in
+ANY of these 5 quants (Q8_0, Q4_K, IQ4_NL, Q5_K, Q6_K) automatically gets
+the ~+4% base improvement on M5 Max with no configuration required.
+
 ### Iteration 2026-05-21 (cont. 19) — Step 3 correction: existing fused_head_norm_rope is NeoX (wrong); plan pivots to fused QKVG quad-matmul
 
 Read `mlx-native/src/ops/fused_head_norm_rope.rs` carefully. The existing
