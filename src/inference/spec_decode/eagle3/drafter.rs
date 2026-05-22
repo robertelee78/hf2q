@@ -184,38 +184,6 @@ pub fn extract_top_k_from_row_logits(
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
-    /// Local comparable wrapper so f32 can be ordered via partial_cmp
-    /// (NaN inputs are already rejected at entry, so partial_cmp's
-    /// None case is unreachable; the deterministic tiebreaker by
-    /// token id makes the ordering total).
-    #[derive(Debug, Clone, Copy)]
-    struct LogProbToken {
-        log_prob: f32,
-        token: u32,
-    }
-    impl PartialEq for LogProbToken {
-        fn eq(&self, other: &Self) -> bool {
-            self.log_prob == other.log_prob && self.token == other.token
-        }
-    }
-    impl Eq for LogProbToken {}
-    impl Ord for LogProbToken {
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            // Order by log_prob ASC for min-heap semantics. Tiebreak
-            // by SMALLER token first (deterministic, matches typical
-            // argmax behavior).
-            self.log_prob
-                .partial_cmp(&other.log_prob)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| other.token.cmp(&self.token))
-        }
-    }
-    impl PartialOrd for LogProbToken {
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-
     // Codex /cfa E4b.10a Major (2026-05-22): select using UNCLAMPED
     // f64 log-probs; clamp only at materialization. Pre-selection
     // clamping was collapsing distinct tail log_probs to LOG_PROB_FLOOR,
@@ -223,6 +191,13 @@ pub fn extract_top_k_from_row_logits(
     // higher logit (e.g. logits=[0.0, -3e38, -2e38], top_k=2 should
     // keep tokens 0 and 2; pre-clamp clamped both -3e38 and -2e38 to
     // floor → tie-break picked 1 instead of 2).
+    //
+    // Tie-break: smaller token wins on log_prob equality
+    // (deterministic, matches typical argmax behavior). Ord
+    // implemented via partial_cmp; the f64 inputs are guaranteed
+    // finite by the log_sumexp computation above (max_logit and
+    // sum_exp >= 1 ensure log_sumexp is finite, so log_prob =
+    // logit - log_sumexp is finite).
     #[derive(Debug, Clone, Copy)]
     struct LogProbTokenF64 {
         log_prob: f64,
@@ -247,8 +222,6 @@ pub fn extract_top_k_from_row_logits(
             Some(self.cmp(other))
         }
     }
-    // Silence unused-Ord warning from the prior helper.
-    let _ = std::marker::PhantomData::<LogProbToken>;
 
     let mut heap: BinaryHeap<Reverse<LogProbTokenF64>> =
         BinaryHeap::with_capacity(effective_k + 1);
