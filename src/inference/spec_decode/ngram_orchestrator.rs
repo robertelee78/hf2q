@@ -111,13 +111,25 @@ pub struct NgramRoundProfile {
 /// Run spec-decode against `target` using the n-gram proposer for K
 /// draft tokens per round.
 ///
-/// # Greedy invariant
+/// # Greedy accept-walk consistency invariant (NOT byte-identity to base)
 ///
-/// At temp=0 (the only mode this function supports), output is
-/// byte-identical to running `target.forward_decode` in a loop on the
-/// same prompt — confirmed by the same algebra DFlash uses
-/// (`accept_prefix_argmax` only commits target's own argmax on
-/// rejection).
+/// At temp=0 (the only mode this function supports), the orchestrator's
+/// accept-walk commits tokens consistent with its OWN batched-prefill
+/// verifier's argmax (`accept_prefix_argmax` only accepts on match).
+///
+/// This is NOT byte-identical to running `target.forward_decode` in a
+/// loop on the same prompt. The batched-prefill verifier kernel
+/// (default F16, BF16 in some configurations) differs from the
+/// single-token decode kernel (F32 flash_attn_vec); argmax can flip
+/// on close logits and compound across rounds. Empirical at HEAD
+/// 6f1d1282 2026-05-22 (Gemma 4 26B-A4B-it Q5_K_M, Fibonacci prompt,
+/// HF2Q_FULL_F16_KV=1, 128 tok temp=0 greedy): N-gram emits "Here is
+/// the most efficient way to implement an iterative Fibonacci
+/// function" while base autoregressive emits "Here is the most
+/// efficient way to implement this using an iterative approach" —
+/// diverges from token 1. Same precision-flip phenomenon as DFlash
+/// (see qwen35_orchestrator.rs:62-90 module doc) and MTP K=1 BATCHED
+/// (ADR-034 "Output divergence note").
 ///
 /// # Errors
 ///
@@ -152,10 +164,12 @@ pub fn dispatch_ngram_generate(
     let final_layer_idx = target.layers.len() - 1;
     let combined_capture_ids: Vec<usize> = vec![final_layer_idx];
 
-    // Match baseline's allocation exactly to preserve greedy byte-
-    // identity: baseline uses `forward_prefill_batched(prompt,
-    // max_new_tokens, 0, gpu)`, which sizes the linear KV cache to
-    // `prompt_len + max_new_tokens` slots — exactly enough for
+    // Match baseline's allocation exactly to preserve KV-cache state
+    // progression equivalence (NOT byte-identity to base — see Greedy
+    // accept-walk consistency invariant module doc): baseline uses
+    // `forward_prefill_batched(prompt, max_new_tokens, 0, gpu)`, which
+    // sizes the linear KV cache to `prompt_len + max_new_tokens` slots
+    // — exactly enough for
     // max_new_tokens decode positions.  Our verify rounds write to the
     // SAME slot range as baseline (each accepted draft consumes one
     // decode slot; rejected drafts get rolled back via `rollback_kv`

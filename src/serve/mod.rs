@@ -1304,10 +1304,31 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // pure-CPU n-gram proposer from ADR-029 Phase 1 instead of the
     // DFlash drafter.  Workload-specific accelerator: needs ~80%
     // acceptance to beat baseline (per iter-212 verify_prefill cost
-    // analysis); shines on quote-heavy / repetitive workloads
+    // analysis); theoretically targets quote-heavy / repetitive workloads
     // (translate-this-code, summarize-this-text) per vLLM literature.
-    // Greedy invariant identical to DFlash: at temp=0 output is
-    // byte-identical to single-token decode.  Default OFF.
+    //
+    // Empirical at HEAD 6f1d1282 2026-05-22 (Gemma 4 26B-A4B-it Q5_K_M,
+    // HF2Q_FULL_F16_KV=1, 128 tok temp=0 greedy):
+    //   Fibonacci code-gen:        N-gram 19.6 t/s vs base 113.2 = 0.17× base
+    //   "Translate verbatim" prompt: N-gram 16.5 t/s vs base 111.6 = 0.15× base
+    // N-gram is NET-NEGATIVE on tested workloads. Even the "repetitive"
+    // case doesn't manifest the expected acceleration.
+    //
+    // Greedy invariant: at temp=0 the N-gram path's accept-walk emits
+    // tokens consistent with its OWN batched-prefill verifier's argmax.
+    // This is NOT byte-identical to single-token Qwen35/Gemma decode —
+    // the batched-prefill verifier kernel (default F16 with blk path,
+    // or BF16 via flash_attn_prefill_resume when HF2Q_DFLASH_XLEN_SDPA=1)
+    // differs from the F32 flash_attn_vec single-token decode kernel.
+    // Argmax flips on close logits compound across rounds, the same
+    // precision-flip phenomenon documented for DFlash + MTP K=1 BATCHED.
+    // Empirical at HEAD 6f1d1282 on Fibonacci prompt: N-gram emits
+    // "Here is the most efficient way to implement an iterative
+    // Fibonacci function" while base emits "Here is the most efficient
+    // way to implement this using an iterative approach" — diverges
+    // from token 1.
+    //
+    // Default OFF.
     if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_ngram_spec_decode(
         &mut mlx_w,
         &prompt_tokens,
