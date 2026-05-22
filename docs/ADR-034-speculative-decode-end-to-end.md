@@ -271,6 +271,31 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 12) — Determinism + test validation at HEAD `2eaf904b`
+
+Two-track validation:
+
+**Determinism (3/3 byte-identical across runs)**:
+- Greedy temp=0: 3/3 runs produce identical 80-token generation ✓
+- MH temp=0.5 (default seed): 3/3 runs produce identical 80-token generation ✓
+- Diff shows ONLY load time + cold-cache prefill ms differ (expected); generated
+  text byte-identical.
+
+This confirms `SpecSampler::new(temperature, seed)` with default seed=0 produces
+reproducible MH output. Critical for production replay + bug reproduction.
+
+**Test suite at HEAD**:
+- `cargo test -p hf2q --lib`: 51/51 pass, 0 failed (1.34s)
+- `cargo test -p hf2q --test parity_mtp_python_ref`: 1/1 pass (MTP parity vs
+  Python ref still holds after Step 4 wiring)
+
+No regressions from Step 4 (`88cab142`) or the inline doc commit (`2eaf904b`).
+
+**MoE 35B-A3B retest skipped**: prior bench established MoE spec is net-negative
+due to T_v(2)/T_v(1) cost ratio = 2.4x (cost-bound, not accept-rate-bound). MH
+only affects accept rate, not the cost ratio, so theory predicts MH won't help
+on MoE either. Confirmation deferred until a GGUF is available locally.
+
 ### Iteration 2026-05-21 (cont. 11) — temp=0.5 generality confirmed across prompts (HEAD `333a3790`)
 
 3-rep paired bench on a SECOND prompt (Rust code-generation) confirms temp=0.5
