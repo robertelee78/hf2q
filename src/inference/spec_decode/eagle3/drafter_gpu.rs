@@ -136,6 +136,22 @@ impl<'a> GpuDrafter<'a> {
             shape,
             expected_target_aux
         );
+        // Codex /cfa E4 final-gate Major 1 (2026-05-22, re-review):
+        // when draft_vocab_size < vocab_size, the manifest MUST
+        // include draft_id_to_target_id (else predict_topk would
+        // return draft-space token IDs that downstream consumers
+        // treat as target-space). Enforce at constructor instead of
+        // silently mis-mapping at predict_topk time.
+        if cfg.draft_vocab_size != cfg.vocab_size {
+            ensure!(
+                tensors.draft_id_to_target_id.is_some(),
+                "GpuDrafter::new: draft_vocab_size ({}) != vocab_size ({}) requires \
+                 tensors.draft_id_to_target_id to be present (set cfg.include_draft_id_mapping=true \
+                 and provide the mapping in the safetensors blob)",
+                cfg.draft_vocab_size,
+                cfg.vocab_size
+            );
+        }
         Ok(Self {
             cfg,
             tensors,
@@ -545,6 +561,46 @@ mod tests {
         }
         // Validate the tree structure.
         tree.validate().expect("ExpandedTree::validate");
+    }
+
+    #[test]
+    fn adr_037_e4_final_gate_constructor_rejects_fast_vocab_without_mapping_2026_05_22() {
+        // Codex /cfa E4 final-gate Major 1 re-review fix (2026-05-22):
+        // when draft_vocab_size < vocab_size, the manifest MUST
+        // include draft_id_to_target_id. Constructor must reject
+        // the inconsistent config (else predict_topk would return
+        // draft-space tokens that downstream treats as target-space).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let mut cfg = cfg_for_drafter_test();
+        cfg.draft_vocab_size = 500; // < vocab_size = 1000
+        cfg.include_draft_id_mapping = false; // INCONSISTENT
+        let manifest = expected_manifest(&cfg);
+        let blob = build_test_blob(&manifest);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let target_aux_data = vec![0.1f32; cfg.fc_input_size()];
+        let mut target_aux_buf = device
+            .alloc_buffer(cfg.fc_input_size() * 4, DType::F32, vec![1, cfg.fc_input_size()])
+            .expect("alloc");
+        target_aux_buf
+            .as_mut_slice::<f32>()
+            .unwrap()
+            .copy_from_slice(&target_aux_data);
+        let embed_table = vec![0.0f32; cfg.vocab_size * cfg.hidden_size];
+
+        let err = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("draft_vocab_size") && err.to_string().contains("requires"),
+            "expected fast-vocab-without-mapping error, got: {err}"
+        );
     }
 
     #[test]
