@@ -26,6 +26,7 @@
 //!   orchestrator (`dispatch_eagle3_drafter_forward` — public API).
 
 use super::config::Eagle3DrafterConfig;
+use super::kv_cache::DrafterKvCache;
 use super::tensors::Eagle3DrafterTensors;
 use crate::inference::models::qwen35::gpu_full_attn::{
     apply_imrope, apply_linear_projection_f32,
@@ -1836,6 +1837,301 @@ pub fn dispatch_eagle3_drafter_forward(
     )?;
     enc.commit_and_wait()
         .map_err(|e| anyhow!("dispatch_eagle3_drafter_forward: commit: {e}"))?;
+    Ok(logits
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("logits slice: {e}"))?
+        .to_vec())
+}
+
+// ----------------------------------------------------------------
+// Phase E5b Step 2 — cache-aware drafter forward.
+// ----------------------------------------------------------------
+//
+// Same 14-stage chain as `dispatch_eagle3_drafter_forward`, but
+// integrates a `DrafterKvCache` so that ancestor K/V positions
+// participate in `tree_attention`. This is the structural unlock
+// for `max_depth > 1` tree decoding (lifts the deferred E4b.10b.3
+// Major #1 path conditioning cap on `GpuDrafter::predict_topk`).
+//
+// ## Flow
+//
+// 1. **Encoder 1**: fc → norms → concat → Q/K/V → optional qk_norm →
+//    RoPE → permute. Commit + wait so K_perm/V_perm host views are
+//    valid for the cache append.
+// 2. **CPU append**: gather per-head, per-position rows of
+//    `[num_kv_heads, seq_len, head_dim]` K_perm and V_perm into the
+//    cache slot at `cache.len()`. Apple unified memory makes this
+//    an in-place mutation (no actual transfer).
+// 3. **Encoder 2**: tree_attention reads directly from `cache.k_buf`
+//    and `cache.v_buf` with `kv_seq_len = cache.len()` (ancestors +
+//    just-appended new positions). Then o_proj → residual →
+//    post_attn_norm → MLP → residual → final_norm → lm_head.
+//
+// ## Mask
+//
+// For the supported case `seq_len == 1` (single new tree node per
+// call), the mask is `[1, cache.len()]` all attended — the new
+// token can see every ancestor + itself. Multi-token batched
+// expansion (`seq_len > 1`) requires a per-node mask reflecting
+// the tree topology and is not supported in this primitive.
+//
+// ## RoPE positions
+//
+// The caller supplies `base_pos`. For tree decoding, `base_pos`
+// should be the absolute KV position of the new node — equal to
+// `target_prefix_len + depth_in_tree` of the new node. Siblings at
+// the same depth share `base_pos`. The caller is responsible for
+// this mapping; this primitive treats `base_pos` opaquely.
+//
+// ## Cache state on error
+//
+// If any step fails AFTER the cache append, the cache will have
+// the new K/V already appended but the forward will return Err.
+// Callers must either roll back the cache (via
+// `rollback_to_accepted` with an index list that excludes the
+// failed positions) or discard the cache and start fresh.
+
+/// Run the full Eagle3 drafter forward chain with a persistent KV
+/// cache. See module docs for flow + invariants.
+///
+/// Inputs:
+/// * `cache`: `DrafterKvCache` whose `num_kv_heads`, `head_dim` must
+///   match `cfg`. `cache.len() + seq_len <= cache.capacity` required.
+///   New K/V is appended at positions `[cache.len(), cache.len()+seq_len)`.
+/// * `seq_len`: must be `1` in this initial Step-2 implementation
+///   (multi-token batched expansion deferred).
+/// * `base_pos`: RoPE position for the new token(s). For tree
+///   decode this is the absolute KV position of the new node.
+///
+/// Returns logits as a CPU `Vec<f32>` of shape `[seq_len, draft_vocab_size]`.
+pub fn dispatch_eagle3_drafter_forward_with_kv_cache(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    target_aux_gpu: &MlxBuffer,
+    embeds_gpu: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+    base_pos: u32,
+    cache: &mut DrafterKvCache,
+) -> Result<Vec<f32>> {
+    // ---- Validate cache shape vs cfg. ----
+    if cache.num_kv_heads != cfg.num_kv_heads {
+        return Err(anyhow!(
+            "dispatch_eagle3_drafter_forward_with_kv_cache: cache.num_kv_heads ({}) != cfg.num_kv_heads ({})",
+            cache.num_kv_heads,
+            cfg.num_kv_heads
+        ));
+    }
+    if cache.head_dim != cfg.head_dim {
+        return Err(anyhow!(
+            "dispatch_eagle3_drafter_forward_with_kv_cache: cache.head_dim ({}) != cfg.head_dim ({})",
+            cache.head_dim,
+            cfg.head_dim
+        ));
+    }
+    if seq_len != 1 {
+        return Err(anyhow!(
+            "dispatch_eagle3_drafter_forward_with_kv_cache: seq_len must be 1 in Step-2 (got {})",
+            seq_len
+        ));
+    }
+    let s_usize = seq_len as usize;
+    let post_len = cache
+        .len()
+        .checked_add(s_usize)
+        .ok_or_else(|| anyhow!("cache len + seq_len overflows usize"))?;
+    if post_len > cache.capacity {
+        return Err(anyhow!(
+            "dispatch_eagle3_drafter_forward_with_kv_cache: cache would overflow (len={} + seq_len={} > capacity={})",
+            cache.len(),
+            s_usize,
+            cache.capacity
+        ));
+    }
+
+    // ---- Encoder 1: compute Q/K/V for the new tokens. ----
+    let mut enc1 = device
+        .command_encoder()
+        .map_err(|e| anyhow!("dispatch_eagle3_drafter_forward_with_kv_cache enc1: {e}"))?;
+
+    let fc_out = dispatch_eagle3_fc(
+        &mut enc1, registry, device, target_aux_gpu, tensors, cfg, seq_len,
+    )?;
+    let embeds_normed = dispatch_eagle3_input_layernorm(
+        &mut enc1, registry, device, embeds_gpu, tensors, cfg, seq_len,
+    )?;
+    let hidden_normed = dispatch_eagle3_hidden_norm(
+        &mut enc1, registry, device, &fc_out, tensors, cfg, seq_len,
+    )?;
+    let concat = dispatch_eagle3_concat_2x_hidden(
+        &mut enc1, registry, device, &embeds_normed, &hidden_normed, cfg, seq_len,
+    )?;
+    let q = dispatch_eagle3_q_proj(
+        &mut enc1, registry, device, &concat, tensors, cfg, seq_len,
+    )?;
+    let k = dispatch_eagle3_k_proj(
+        &mut enc1, registry, device, &concat, tensors, cfg, seq_len,
+    )?;
+    let v = dispatch_eagle3_v_proj(
+        &mut enc1, registry, device, &concat, tensors, cfg, seq_len,
+    )?;
+    let (q_normed, k_normed) = if cfg.use_qk_norm {
+        let qn = dispatch_eagle3_q_head_norm(
+            &mut enc1, registry, device, &q, tensors, cfg, seq_len,
+        )?;
+        let kn = dispatch_eagle3_k_head_norm(
+            &mut enc1, registry, device, &k, tensors, cfg, seq_len,
+        )?;
+        (qn, kn)
+    } else {
+        (q, k)
+    };
+    let q_roped = dispatch_eagle3_rope(
+        &mut enc1, registry, device, &q_normed, cfg, seq_len,
+        u32::try_from(cfg.num_q_heads).map_err(|_| anyhow!("num_q_heads overflow"))?,
+        None, base_pos, "q_rope",
+    )?;
+    let k_roped = dispatch_eagle3_rope(
+        &mut enc1, registry, device, &k_normed, cfg, seq_len,
+        u32::try_from(cfg.num_kv_heads).map_err(|_| anyhow!("num_kv_heads overflow"))?,
+        None, base_pos, "k_rope",
+    )?;
+    let q_perm = dispatch_eagle3_permute_seq_to_head_outer(
+        &mut enc1, registry, device, &q_roped,
+        seq_len,
+        u32::try_from(cfg.num_q_heads).map_err(|_| anyhow!("num_q_heads overflow"))?,
+        cfg.head_dim, "q_permute",
+    )?;
+    let k_perm = dispatch_eagle3_permute_seq_to_head_outer(
+        &mut enc1, registry, device, &k_roped,
+        seq_len,
+        u32::try_from(cfg.num_kv_heads).map_err(|_| anyhow!("num_kv_heads overflow"))?,
+        cfg.head_dim, "k_permute",
+    )?;
+    let v_perm = dispatch_eagle3_permute_seq_to_head_outer(
+        &mut enc1, registry, device, &v,
+        seq_len,
+        u32::try_from(cfg.num_kv_heads).map_err(|_| anyhow!("num_kv_heads overflow"))?,
+        cfg.head_dim, "v_permute",
+    )?;
+
+    enc1.commit_and_wait()
+        .map_err(|e| anyhow!("dispatch_eagle3_drafter_forward_with_kv_cache enc1 commit: {e}"))?;
+
+    // ---- CPU-side append: gather K_perm + V_perm into cache slots. ----
+    //
+    // K_perm shape: [num_kv_heads, seq_len, head_dim] flat row-major.
+    // Cache.k_buf:  [num_kv_heads, capacity, head_dim] flat row-major.
+    // For each new position p in 0..seq_len:
+    //   for each head h:
+    //     dst[h, cache.len()+p, :] = src[h, p, :]
+    //
+    // Use cache.append which validates row shape + bumps len. Builds
+    // a [num_kv_heads * head_dim] row in row-major order matching the
+    // append() contract.
+    let num_kv_heads = cfg.num_kv_heads;
+    let head_dim = cfg.head_dim;
+    let row_elems = num_kv_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| anyhow!("num_kv_heads * head_dim overflows usize"))?;
+    // Pull slice views before the per-row loop; views remain valid
+    // for the lifetime of the buffer.
+    let k_perm_data: Vec<f32> = k_perm
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("k_perm slice: {e}"))?
+        .to_vec();
+    let v_perm_data: Vec<f32> = v_perm
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("v_perm slice: {e}"))?
+        .to_vec();
+    for p in 0..s_usize {
+        let mut k_row = vec![0.0_f32; row_elems];
+        let mut v_row = vec![0.0_f32; row_elems];
+        for h in 0..num_kv_heads {
+            let src_offset = h * s_usize * head_dim + p * head_dim;
+            let dst_offset = h * head_dim;
+            k_row[dst_offset..dst_offset + head_dim]
+                .copy_from_slice(&k_perm_data[src_offset..src_offset + head_dim]);
+            v_row[dst_offset..dst_offset + head_dim]
+                .copy_from_slice(&v_perm_data[src_offset..src_offset + head_dim]);
+        }
+        cache.append(&k_row, &v_row).with_context(|| {
+            format!("cache append at position {} of {}", p, s_usize)
+        })?;
+    }
+
+    // ---- Encoder 2: tree_attention from cache + rest of chain. ----
+    let kv_seq_len = u32::try_from(cache.len()).map_err(|_| {
+        anyhow!(
+            "cache len {} exceeds u32::MAX",
+            cache.len()
+        )
+    })?;
+    let kv_capacity = u32::try_from(cache.capacity).map_err(|_| {
+        anyhow!(
+            "cache capacity {} exceeds u32::MAX",
+            cache.capacity
+        )
+    })?;
+
+    let mut enc2 = device
+        .command_encoder()
+        .map_err(|e| anyhow!("dispatch_eagle3_drafter_forward_with_kv_cache enc2: {e}"))?;
+
+    // Mask: [seq_len, kv_seq_len], all attended (single-token decode
+    // case — the new node attends to all ancestors + itself).
+    let mask_stride = kv_seq_len;
+    let mask_elems = s_usize
+        .checked_mul(mask_stride as usize)
+        .ok_or_else(|| anyhow!("mask seq_len * mask_stride overflows usize"))?;
+    let mask_data = vec![EAGLE3_TREE_MASK_ATTENDED; mask_elems];
+    let mask_bytes = mask_data
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow!("mask bytes overflows usize"))?;
+    let mut mask_gpu = device
+        .alloc_buffer(
+            mask_bytes,
+            DType::F32,
+            vec![s_usize, mask_stride as usize],
+        )
+        .map_err(|e| anyhow!("alloc mask: {e}"))?;
+    mask_gpu
+        .as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("mask slice: {e}"))?
+        .copy_from_slice(&mask_data);
+
+    let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+    let attn_out = dispatch_eagle3_tree_attention(
+        &mut enc2, registry, device,
+        &q_perm, &cache.k_buf, &cache.v_buf, &mask_gpu,
+        cfg, seq_len, kv_seq_len, kv_capacity, mask_stride, scale,
+    )?;
+    let o_out = dispatch_eagle3_o_proj(
+        &mut enc2, registry, device, &attn_out, tensors, cfg, seq_len,
+    )?;
+    let attn_residual = dispatch_eagle3_residual_add(
+        &mut enc2, registry, device, &o_out, &hidden_normed, cfg, seq_len,
+    )?;
+    let post_attn_normed = dispatch_eagle3_post_attention_layernorm(
+        &mut enc2, registry, device, &attn_residual, tensors, cfg, seq_len,
+    )?;
+    let mlp_out = dispatch_eagle3_mlp(
+        &mut enc2, registry, device, &post_attn_normed, tensors, cfg, seq_len,
+    )?;
+    let final_residual = dispatch_eagle3_residual_add(
+        &mut enc2, registry, device, &mlp_out, &attn_residual, cfg, seq_len,
+    )?;
+    let final_normed = dispatch_eagle3_final_norm(
+        &mut enc2, registry, device, &final_residual, tensors, cfg, seq_len,
+    )?;
+    let logits = dispatch_eagle3_lm_head(
+        &mut enc2, registry, device, &final_normed, tensors, cfg, seq_len,
+    )?;
+    enc2.commit_and_wait()
+        .map_err(|e| anyhow!("dispatch_eagle3_drafter_forward_with_kv_cache enc2 commit: {e}"))?;
+
     Ok(logits
         .as_slice::<f32>()
         .map_err(|e| anyhow!("logits slice: {e}"))?
@@ -4911,6 +5207,321 @@ mod tests {
             err.to_string().contains("hidden_normed has"),
             "expected element-count error, got: {err}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E5b Step 2 tests — cache-aware drafter forward variant.
+    // ----------------------------------------------------------------
+
+    /// Mirror of the E4b.10b.2 weights/inputs setup but factored so
+    /// both `dispatch_eagle3_drafter_forward` and
+    /// `dispatch_eagle3_drafter_forward_with_kv_cache` share the
+    /// exact same inputs for byte-identity equivalence testing.
+    fn e5b_test_setup(
+        device: &MlxDevice,
+        seq_len: u32,
+    ) -> Option<(Eagle3DrafterConfig, Eagle3DrafterTensors, MlxBuffer, MlxBuffer)> {
+        let cfg = cfg_for_full_forward_test();
+        let manifest = expected_manifest(&cfg);
+        let mut overrides = std::collections::HashMap::new();
+        for tensor in &manifest {
+            let name_hash: u64 = tensor.name
+                .bytes()
+                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            let n_elem: usize = tensor.shape.iter().product();
+            if tensor.dtype == safetensors::tensor::Dtype::BF16 {
+                let mut vals = vec![0.0f32; n_elem];
+                for (i, v) in vals.iter_mut().enumerate() {
+                    let seed = name_hash.wrapping_add(i as u64);
+                    let is_norm = tensor.name.contains("norm");
+                    *v = if is_norm {
+                        1.0 + pseudo_random(seed) * 0.1
+                    } else {
+                        pseudo_random(seed) * 0.044
+                    };
+                }
+                overrides.insert(tensor.name.clone(), f32_to_bf16_bytes(&vals));
+            }
+        }
+        let blob = build_blob_with_overrides(&manifest, &overrides);
+        let weights = Eagle3Weights::load(&blob, &cfg).ok()?;
+        let tensors = Eagle3DrafterTensors::upload(device, &cfg, &weights).ok()?;
+
+        let mut target_aux = vec![0.0f32; (seq_len as usize) * cfg.fc_input_size()];
+        for (i, v) in target_aux.iter_mut().enumerate() {
+            *v = pseudo_random(0xC0FFEE + i as u64) * 0.5;
+        }
+        let mut embeds = vec![0.0f32; (seq_len as usize) * cfg.hidden_size];
+        for (i, v) in embeds.iter_mut().enumerate() {
+            *v = pseudo_random(0xD0FFEE + i as u64) * 0.5;
+        }
+        let target_aux_gpu = upload_f32_to_gpu(
+            device,
+            &target_aux,
+            vec![seq_len as usize, cfg.fc_input_size()],
+        );
+        let embeds_gpu = upload_f32_to_gpu(
+            device,
+            &embeds,
+            vec![seq_len as usize, cfg.hidden_size],
+        );
+        Some((cfg, tensors, target_aux_gpu, embeds_gpu))
+    }
+
+    #[test]
+    fn adr_037_e5b_step2_smoke_empty_cache_appends_one_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
+            match e5b_test_setup(&device, 1) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 1, cfg.head_dim,
+        )
+        .expect("alloc cache");
+        assert_eq!(cache.len(), 0);
+        let logits = dispatch_eagle3_drafter_forward_with_kv_cache(
+            &device, &mut registry,
+            &target_aux_gpu, &embeds_gpu,
+            &tensors, &cfg, 1, 0,
+            &mut cache,
+        )
+        .expect("forward with cache");
+        assert_eq!(cache.len(), 1);
+        assert_eq!(logits.len(), cfg.draft_vocab_size);
+        for (i, &v) in logits.iter().enumerate() {
+            assert!(v.is_finite(), "logits[{i}] = {v} not finite");
+        }
+    }
+
+    #[test]
+    fn adr_037_e5b_step2_rejects_wrong_cache_num_kv_heads_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
+            match e5b_test_setup(&device, 1) {
+                Some(t) => t,
+                None => return,
+            };
+        // Wrong num_kv_heads (cfg uses 2, cache uses 3).
+        let mut cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads + 1, 1, cfg.head_dim,
+        )
+        .expect("alloc cache");
+        let err = dispatch_eagle3_drafter_forward_with_kv_cache(
+            &device, &mut registry,
+            &target_aux_gpu, &embeds_gpu,
+            &tensors, &cfg, 1, 0,
+            &mut cache,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("num_kv_heads"),
+            "expected num_kv_heads mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e5b_step2_rejects_wrong_cache_head_dim_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
+            match e5b_test_setup(&device, 1) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 1, cfg.head_dim + 1,
+        )
+        .expect("alloc cache");
+        let err = dispatch_eagle3_drafter_forward_with_kv_cache(
+            &device, &mut registry,
+            &target_aux_gpu, &embeds_gpu,
+            &tensors, &cfg, 1, 0,
+            &mut cache,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("head_dim"),
+            "expected head_dim mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e5b_step2_rejects_seq_len_not_1_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
+            match e5b_test_setup(&device, 2) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 4, cfg.head_dim,
+        )
+        .expect("alloc cache");
+        let err = dispatch_eagle3_drafter_forward_with_kv_cache(
+            &device, &mut registry,
+            &target_aux_gpu, &embeds_gpu,
+            &tensors, &cfg, 2, 0,
+            &mut cache,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("seq_len must be 1"),
+            "expected seq_len reject, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e5b_step2_rejects_cache_overflow_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
+            match e5b_test_setup(&device, 1) {
+                Some(t) => t,
+                None => return,
+            };
+        // capacity=1, populate once, then call again to overflow.
+        let mut cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 1, cfg.head_dim,
+        )
+        .expect("alloc cache");
+        let _ = dispatch_eagle3_drafter_forward_with_kv_cache(
+            &device, &mut registry,
+            &target_aux_gpu, &embeds_gpu,
+            &tensors, &cfg, 1, 0,
+            &mut cache,
+        )
+        .expect("first call");
+        assert_eq!(cache.len(), 1);
+        let err = dispatch_eagle3_drafter_forward_with_kv_cache(
+            &device, &mut registry,
+            &target_aux_gpu, &embeds_gpu,
+            &tensors, &cfg, 1, 1,
+            &mut cache,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("would overflow"),
+            "expected overflow, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e5b_step2_equivalence_with_unbatched_at_len_zero_2026_05_22() {
+        // GOLDEN TEST. At cache.len() = 0 and cache.capacity = 1
+        // (so the cache buffer layout exactly matches the
+        // [num_kv_heads, seq_len, head_dim] K_perm/V_perm of the
+        // existing unbatched variant), the cache-aware forward must
+        // produce bit-identical logits to dispatch_eagle3_drafter_forward.
+        //
+        // This is the core correctness invariant of Phase E5b Step 2:
+        // it proves the encoder split + CPU-side cache append + buffer
+        // hand-off to encoder 2 produces no value drift.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
+            match e5b_test_setup(&device, 1) {
+                Some(t) => t,
+                None => return,
+            };
+        // Reference: unbatched variant.
+        let logits_ref = dispatch_eagle3_drafter_forward(
+            &device, &mut registry,
+            &target_aux_gpu, &embeds_gpu,
+            &tensors, &cfg, 1, 0,
+        )
+        .expect("unbatched");
+        // New cache-aware variant.
+        let mut cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 1, cfg.head_dim,
+        )
+        .expect("cache");
+        let logits_cache = dispatch_eagle3_drafter_forward_with_kv_cache(
+            &device, &mut registry,
+            &target_aux_gpu, &embeds_gpu,
+            &tensors, &cfg, 1, 0,
+            &mut cache,
+        )
+        .expect("with cache");
+        assert_eq!(logits_ref.len(), logits_cache.len());
+        for (i, (a, b)) in logits_ref.iter().zip(logits_cache.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "logits drift at idx {}: ref={} cache={}",
+                i, a, b,
+            );
+        }
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn adr_037_e5b_step2_incremental_two_calls_grows_cache_2026_05_22() {
+        // Two sequential calls with the SAME embed input (single-token
+        // decode), capacity=2. Cache len goes 0→1→2; both outputs must
+        // be finite. Cache.len() should equal 2 after the second call.
+        //
+        // Functional value: this is the multi-depth tree-decode flow
+        // (depth=0 root → depth=1 child, both using the same input
+        // since the test doesn't have a real drafter loop yet).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let (cfg, tensors, target_aux_gpu, embeds_gpu) =
+            match e5b_test_setup(&device, 1) {
+                Some(t) => t,
+                None => return,
+            };
+        let mut cache = DrafterKvCache::new(
+            &device, cfg.num_kv_heads, 2, cfg.head_dim,
+        )
+        .expect("cache");
+        let logits1 = dispatch_eagle3_drafter_forward_with_kv_cache(
+            &device, &mut registry,
+            &target_aux_gpu, &embeds_gpu,
+            &tensors, &cfg, 1, 0,
+            &mut cache,
+        )
+        .expect("first");
+        assert_eq!(cache.len(), 1);
+        let logits2 = dispatch_eagle3_drafter_forward_with_kv_cache(
+            &device, &mut registry,
+            &target_aux_gpu, &embeds_gpu,
+            &tensors, &cfg, 1, 1,
+            &mut cache,
+        )
+        .expect("second");
+        assert_eq!(cache.len(), 2);
+        for (i, &v) in logits1.iter().enumerate() {
+            assert!(v.is_finite(), "first logits[{i}] = {v} not finite");
+        }
+        for (i, &v) in logits2.iter().enumerate() {
+            assert!(v.is_finite(), "second logits[{i}] = {v} not finite");
+        }
     }
 
     #[test]
