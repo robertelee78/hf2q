@@ -333,7 +333,24 @@ pub fn try_dispatch_qwen35_dflash_spec_decode(
     // Drafter cache capacity: worst case is prompt_len + max_new_tokens
     // committed tokens fed as drafter context. Use the +32 buffer +
     // 2048 floor as the Gemma path does.
-    let drafter_cache_cap = (prompt_tokens.len() + max_new_tokens + 32).max(2048) as u32;
+    //
+    // Codex /cfa 2026-05-21 High: bound against model max_position_embeddings
+    // and use checked_add to avoid usize overflow or u32 truncation at
+    // huge --max-tokens.
+    let max_pos = model.cfg.max_position_embeddings as usize;
+    let bounded_max_new = max_new_tokens.min(max_pos);
+    let drafter_cache_cap_usize = prompt_tokens
+        .len()
+        .checked_add(bounded_max_new)
+        .and_then(|s| s.checked_add(32))
+        .ok_or_else(|| anyhow::anyhow!("drafter_cache_cap overflow"))?
+        .max(2048);
+    anyhow::ensure!(
+        drafter_cache_cap_usize <= u32::MAX as usize,
+        "drafter_cache_cap {} > u32::MAX",
+        drafter_cache_cap_usize,
+    );
+    let drafter_cache_cap = drafter_cache_cap_usize as u32;
     let mut drafter_cache = model.with_gpu_cache_mut(|device, _reg| {
         DFlashKvCache::new(device, &drafter_cfg, drafter_cache_cap)
             .context("allocate Qwen35 DFlash drafter KV cache")
@@ -351,7 +368,28 @@ pub fn try_dispatch_qwen35_dflash_spec_decode(
     // positions starting at output.len()-1. Worst case at the FINAL
     // round: output.len() = prompt_len + max_new_tokens, so the cache
     // needs `prompt_len + max_new_tokens + block_size` slots.
-    let kv_max_seq = (prompt_tokens.len() + max_new_tokens + block_size as usize) as u32;
+    //
+    // Codex /cfa 2026-05-21 High: clamp against model
+    // max_position_embeddings + use checked_add to avoid usize overflow
+    // and u32 truncation. We share `bounded_max_new` with the drafter
+    // cache calc above so both bounds agree.
+    let kv_max_seq_usize = prompt_tokens
+        .len()
+        .checked_add(bounded_max_new)
+        .and_then(|s| s.checked_add(block_size as usize))
+        .ok_or_else(|| anyhow::anyhow!("kv_max_seq overflow"))?;
+    anyhow::ensure!(
+        kv_max_seq_usize <= u32::MAX as usize,
+        "kv_max_seq {} > u32::MAX",
+        kv_max_seq_usize,
+    );
+    anyhow::ensure!(
+        kv_max_seq_usize <= max_pos + block_size as usize,
+        "kv_max_seq {} exceeds model max_position_embeddings+block_size = {}",
+        kv_max_seq_usize,
+        max_pos + block_size as usize,
+    );
+    let kv_max_seq = kv_max_seq_usize as u32;
     let mut kv_cache = model.with_gpu_cache_mut(|device, _reg| {
         crate::inference::models::qwen35::kv_cache::HybridKvCache::new(
             &model.cfg,

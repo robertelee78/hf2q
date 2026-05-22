@@ -144,6 +144,13 @@ pub fn dispatch_qwen35_dflash_generate(
             block_size,
         );
     }
+    // Codex /cfa 2026-05-21 Medium: max_new_tokens=0 must return prompt
+    // unchanged. Previously the function would still run initial
+    // prefill, emit first_token, push it onto output, and return —
+    // violating the documented `n_generated <= max_new_tokens` contract.
+    if max_new_tokens == 0 {
+        return Ok(prompt_tokens.to_vec());
+    }
 
     let hs = target.model.cfg.hidden_size as usize;
     let final_layer_idx = target.model.layers.len() - 1;
