@@ -11,6 +11,7 @@
 
 pub mod dflash;
 pub mod eagle3;
+pub mod eagle3_orchestrator;
 pub mod ngram_orchestrator;
 pub mod ngram_proposer;
 pub mod verifier;
