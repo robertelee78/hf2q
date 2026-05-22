@@ -28,6 +28,7 @@ use mlx_native::ops::tree_attention::{
 };
 use anyhow::{anyhow, Context, Result};
 use mlx_native::ops::add_bias_row_2d::dispatch_add_bias_row_2d_f32;
+use mlx_native::ops::elementwise::elementwise_add;
 use mlx_native::ops::feature_concat::dispatch_feature_concat_f32;
 use mlx_native::ops::rms_norm::dispatch_rms_norm;
 use mlx_native::{CommandEncoder, DType, KernelRegistry, MlxBuffer, MlxDevice};
@@ -1374,6 +1375,144 @@ pub fn dispatch_eagle3_tree_attention(
     .context("tree_attention")?;
 
     Ok(output)
+}
+
+// ----------------------------------------------------------------
+// Phase E4b.7 — O projection + residual add
+// ----------------------------------------------------------------
+//
+// After tree_attention produces `[q_seq, num_q_heads, head_dim]`
+// F32, the O projection maps it back to `[q_seq, hidden_size]` via
+// the BF16 o_proj weight `[hidden_size, num_q_heads * head_dim]`.
+// Per vLLM `llama_eagle3.py:117`, the residual stream then adds
+// the pre-attention input back.
+//
+// Layout reuse: tree_attention's `[q_seq, num_q_heads, head_dim]`
+// row-major flat IS equivalent to `[q_seq, num_q_heads * head_dim]`
+// row-major flat (trailing dims contiguous) — no permute step needed
+// to feed into apply_linear_projection_f32.
+
+/// Dispatch the O projection from tree_attention output.
+///
+/// Input: `[q_seq, num_q_heads, head_dim]` F32 (tree_attention output;
+/// also valid as `[q_seq, num_q_heads * head_dim]` since the trailing
+/// dims are contiguous).
+/// Weight: `[hidden_size, num_q_heads * head_dim]` BF16.
+/// Optional bias: `[hidden_size]` F32 (gated by `attention_bias`).
+/// Output: `[q_seq, hidden_size]` F32.
+pub fn dispatch_eagle3_o_proj(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    attn_out: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    q_seq_len: u32,
+) -> Result<MlxBuffer> {
+    dispatch_eagle3_projection_with_optional_bias(
+        encoder, registry, device,
+        attn_out,
+        &tensors.o_proj,
+        tensors.o_bias.as_ref(),
+        q_seq_len,
+        cfg.q_proj_out(), // input width = num_q_heads * head_dim
+        cfg.hidden_size,  // output width = hidden_size
+        "o_proj",
+    )
+}
+
+/// Element-wise residual add: `out = a + b`. Both inputs must be F32
+/// `[seq, hidden_size]` (same shape).
+///
+/// Allocates a fresh output buffer (vLLM keeps both `hidden_states`
+/// and `residual` live for the next layer; allocating fresh avoids
+/// the in-place R/W barrier needed for elementwise+matmul chains).
+pub fn dispatch_eagle3_residual_add(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    a: &MlxBuffer,
+    b: &MlxBuffer,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    if a.dtype() != DType::F32 || b.dtype() != DType::F32 {
+        return Err(anyhow!(
+            "dispatch_eagle3_residual_add: inputs must be F32, got a={:?} b={:?}",
+            a.dtype(),
+            b.dtype()
+        ));
+    }
+    if seq_len == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_residual_add: seq_len must be > 0"
+        ));
+    }
+    let hidden_usize = cfg.hidden_size;
+    if hidden_usize == 0 {
+        return Err(anyhow!(
+            "dispatch_eagle3_residual_add: hidden_size must be > 0"
+        ));
+    }
+    let n_elements = (seq_len as usize)
+        .checked_mul(hidden_usize)
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_residual_add: seq_len ({}) * hidden_size ({}) overflows usize",
+                seq_len,
+                hidden_usize
+            )
+        })?;
+    if n_elements > (u32::MAX as usize) {
+        return Err(anyhow!(
+            "dispatch_eagle3_residual_add: n_elements ({}) exceeds u32::MAX",
+            n_elements
+        ));
+    }
+    if a.element_count() != n_elements {
+        return Err(anyhow!(
+            "dispatch_eagle3_residual_add: a has {} elements, expected {} (seq={} * hidden={})",
+            a.element_count(),
+            n_elements,
+            seq_len,
+            hidden_usize
+        ));
+    }
+    if b.element_count() != n_elements {
+        return Err(anyhow!(
+            "dispatch_eagle3_residual_add: b has {} elements, expected {} (seq={} * hidden={})",
+            b.element_count(),
+            n_elements,
+            seq_len,
+            hidden_usize
+        ));
+    }
+    let out_bytes = n_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            anyhow!(
+                "dispatch_eagle3_residual_add: n_elements * 4 overflows usize"
+            )
+        })?;
+    let out = device
+        .alloc_buffer(out_bytes, DType::F32, vec![seq_len as usize, hidden_usize])
+        .map_err(|e| anyhow!("alloc residual_add output: {e}"))?;
+    // Memory barrier: inputs may have been written by upstream
+    // dispatches in the same encoder (o_proj writes a; pre-attn
+    // residual may have been computed earlier).
+    encoder.memory_barrier();
+    elementwise_add(
+        encoder,
+        registry,
+        device.metal_device(),
+        a,
+        b,
+        &out,
+        n_elements,
+        DType::F32,
+    )
+    .map_err(|e| anyhow!("elementwise_add residual: {e}"))?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -3102,6 +3241,154 @@ mod tests {
             err.to_string().contains("kv_capacity"),
             "got: {err}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E4b.7 tests — O projection + residual add
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn adr_037_e4b7_o_proj_cpu_parity_no_bias_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg(); // attention_bias=false
+        let seq_len: u32 = 4;
+        // Input to o_proj is the attention output: [seq, num_q*head_dim].
+        let in_features = cfg.q_proj_out();
+        let out_features = cfg.hidden_size;
+
+        let mut input_data = vec![0.0f32; (seq_len as usize) * in_features];
+        fill_random(&mut input_data, 0xD70);
+        let mut weight_f32 = vec![0.0f32; out_features * in_features];
+        fill_random(&mut weight_f32, 0xD71);
+
+        // CPU reference: BF16-quantized weight matmul.
+        let weight_bf16_q: Vec<f32> =
+            weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let cpu_out = cpu_fc_reference(
+            &input_data,
+            &weight_bf16_q,
+            seq_len as usize,
+            in_features,
+            out_features,
+        );
+
+        // GPU: synthetic safetensors blob with custom o_proj.weight.
+        let manifest = expected_manifest(&cfg);
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "layers.0.self_attn.o_proj.weight".to_string(),
+            f32_to_bf16_bytes(&weight_f32),
+        );
+        let blob = build_blob_with_overrides(&manifest, &overrides);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let input_gpu = upload_f32_to_gpu(
+            &device,
+            &input_data,
+            vec![seq_len as usize, in_features],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_o_proj(
+            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+        )
+        .expect("o_proj dispatch");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            assert!(d < 5e-2, "o_proj parity: diff={d} > 5e-2");
+        }
+        eprintln!("o_proj parity max_diff={max_diff:.6e}");
+    }
+
+    #[test]
+    fn adr_037_e4b7_residual_add_cpu_parity_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let seq_len: u32 = 4;
+        let hidden = cfg.hidden_size;
+        let n = (seq_len as usize) * hidden;
+
+        let mut a_data = vec![0.0f32; n];
+        let mut b_data = vec![0.0f32; n];
+        fill_random(&mut a_data, 0xE70);
+        fill_random(&mut b_data, 0xE71);
+        let cpu_out: Vec<f32> = a_data.iter().zip(b_data.iter()).map(|(a, b)| a + b).collect();
+
+        let a_gpu = upload_f32_to_gpu(&device, &a_data, vec![seq_len as usize, hidden]);
+        let b_gpu = upload_f32_to_gpu(&device, &b_data, vec![seq_len as usize, hidden]);
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_residual_add(
+            &mut enc, &mut registry, &device, &a_gpu, &b_gpu, &cfg, seq_len,
+        )
+        .expect("residual_add");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        // F32 add — should be bit-exact (no precision loss).
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            assert_eq!(g.to_bits(), c.to_bits(), "residual_add bit-equal expected");
+        }
+    }
+
+    #[test]
+    fn adr_037_e4b7_gate_residual_add_rejects_non_f32_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let seq_len = 2_u32;
+        let n = (seq_len as usize) * cfg.hidden_size;
+        let bf16 = device
+            .alloc_buffer(n * 2, DType::BF16, vec![seq_len as usize, cfg.hidden_size])
+            .expect("alloc bf16");
+        let f32_buf = device
+            .alloc_buffer(n * 4, DType::F32, vec![seq_len as usize, cfg.hidden_size])
+            .expect("alloc f32");
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_residual_add(
+            &mut enc, &mut registry, &device, &bf16, &f32_buf, &cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must be F32"), "got: {err}");
+    }
+
+    #[test]
+    fn adr_037_e4b7_gate_residual_add_rejects_shape_mismatch_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let seq_len = 4_u32;
+        let n = (seq_len as usize) * cfg.hidden_size;
+        let good = upload_f32_to_gpu(&device, &vec![0.0f32; n], vec![seq_len as usize, cfg.hidden_size]);
+        let bad = upload_f32_to_gpu(&device, &vec![0.0f32; 10], vec![10]);
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_residual_add(
+            &mut enc, &mut registry, &device, &good, &bad, &cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("b has"), "got: {err}");
     }
 
     #[test]
