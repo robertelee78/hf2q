@@ -751,7 +751,6 @@ impl Qwen35Model {
             output_weight,
             output_norm,
             mtp: None,
-            dflash_capture: None,
         })
     }
 }

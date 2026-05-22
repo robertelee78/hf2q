@@ -38,26 +38,43 @@ use super::target::DFlashTarget;
 pub struct Qwen35DFlashTarget<'a> {
     pub model: &'a mut Qwen35Model,
     pub kv_cache: &'a mut HybridKvCache,
+    /// ADR-034 task #78 Step 3c.A (2026-05-21 cont. 37) — capture session
+    /// lives on the wrapper, NOT on Qwen35Model.
+    ///
+    /// Rationale: Qwen35Model's forward_gpu_impl takes `&self` (immutable)
+    /// — putting capture on the model and threading it through &self would
+    /// require either interior mutability (RefCell, ugly) or refactoring
+    /// 8+ &self callers in spec_decode.rs to &mut (high churn). Instead,
+    /// the orchestrator stack-frame owns the capture and passes it as
+    /// `Option<&mut DFlashCaptureSession>` into a new
+    /// `Qwen35Model::forward_gpu_with_hidden_dflash` variant (Step 3c.A
+    /// follow-up).
+    pub dflash_capture: Option<DFlashCaptureSession>,
 }
 
 impl<'a> Qwen35DFlashTarget<'a> {
-    /// Construct from mutable refs to model + cache.
+    /// Construct from mutable refs to model + cache. Capture starts as `None`;
+    /// install via the [`DFlashTarget::install_dflash_capture`] trait method.
     pub fn new(model: &'a mut Qwen35Model, kv_cache: &'a mut HybridKvCache) -> Self {
-        Self { model, kv_cache }
+        Self {
+            model,
+            kv_cache,
+            dflash_capture: None,
+        }
     }
 }
 
 impl<'a> DFlashTarget for Qwen35DFlashTarget<'a> {
     fn install_dflash_capture(&mut self, session: DFlashCaptureSession) {
-        self.model.dflash_capture = Some(session);
+        self.dflash_capture = Some(session);
     }
 
     fn take_dflash_capture(&mut self) -> Option<DFlashCaptureSession> {
-        self.model.dflash_capture.take()
+        self.dflash_capture.take()
     }
 
     fn has_dflash_capture(&self) -> bool {
-        self.model.dflash_capture.is_some()
+        self.dflash_capture.is_some()
     }
 
     /// Roll back the cache by `trim` positions across full-attn + mtp +
