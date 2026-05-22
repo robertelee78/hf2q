@@ -1080,6 +1080,11 @@ pub fn load_moe_ffn_quantized(
             | GgmlType::Q5_K
             | GgmlType::Q6_K
             | GgmlType::IQ4_NL
+            // ADR-033 §Pi Task #18 2026-05-22 — IQ4_XS mv_id ported
+            // at mlx-native@ff13e58. Required for apex-quality /
+            // apex-i-quality MoE GGUFs (mudler's canonical mid-layer
+            // expert quant).
+            | GgmlType::IQ4_XS
     );
 
     // Validate that the types are supported by quantized_matmul_id_ggml.
@@ -1087,21 +1092,19 @@ pub fn load_moe_ffn_quantized(
     //  - Q4_K/Q5_K use mv_id (decode) + mm_id (prefill ports landed ADR-022 Phase 2)
     //  - Q4_0/Q8_0/Q6_K use mv_id (decode) + mm_id (prefill > 8 tok)
     //  - Q5_1 / IQ4_NL: mv_id + mm_id + mm_id_tensor all ported (ADR-022 Phase 1).
-    //    The allowlist was missing these since the ports landed; canonical
-    //    IQ4_NL MoE GGUFs (e.g. Qwen 3.5 35B-A3B canonical IQ4_NL) carry
-    //    blk.{i}.ffn_{gate,up}_exps.weight as IQ4_NL and blk.{i}.ffn_down_exps
-    //    as IQ4_NL or Q5_K — both kernel-supported but previously load-rejected.
+    //  - IQ4_XS: mv_id ported (ADR-033 §Pi Task #16); mm_id pending —
+    //    prefill at m > 8 will surface a typed dispatch error (fail-loud).
     if !supported(ggml_type_gate_up) {
         return Err(anyhow!(
             "layer {layer_idx}: gate/up expert weights have unsupported quant type {:?} \
-             (expected Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, or IQ4_NL)",
+             (expected Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, or IQ4_XS)",
             ggml_type_gate_up
         ));
     }
     if !supported(ggml_type_down) {
         return Err(anyhow!(
             "layer {layer_idx}: down expert weights have unsupported quant type {:?} \
-             (expected Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, or IQ4_NL)",
+             (expected Q4_0, Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, or IQ4_XS)",
             ggml_type_down
         ));
     }
