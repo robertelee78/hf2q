@@ -1675,6 +1675,36 @@ pub fn dispatch_eagle3_mlp(
     )
 }
 
+/// Apply `post_attention_layernorm` (the layer-internal RMSNorm
+/// applied between attention residual and MLP).
+///
+/// Input: `[seq, hidden_size]` F32 (typically the attention residual
+/// `o_out + hidden_normed` from E4b.7).
+/// Output: `[seq, hidden_size]` F32 normalized, ready for MLP.
+pub fn dispatch_eagle3_post_attention_layernorm(
+    encoder: &mut CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    attn_residual: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+) -> Result<MlxBuffer> {
+    // RAW barrier: attn_residual is the output of E4b.7's
+    // dispatch_eagle3_residual_add, written in the same encoder.
+    encoder.memory_barrier();
+    dispatch_eagle3_rms_norm_seq_x_hidden(
+        encoder,
+        registry,
+        device,
+        attn_residual,
+        &tensors.post_attention_layernorm,
+        cfg,
+        seq_len,
+        "post_attention_layernorm",
+    )
+}
+
 // ----------------------------------------------------------------
 // Phase E4b.10b.1 — Q/K/V permute glue (seq-outer → head-outer)
 // ----------------------------------------------------------------
@@ -4317,6 +4347,290 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("all dims must be > 0"), "got: {err}");
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E4b.10b.2 tests — post_attention_layernorm + full orchestrator
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn adr_037_e4b10b2_post_attention_layernorm_cpu_parity_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = tiny_cfg();
+        let seq_len: u32 = 4;
+        let hidden = cfg.hidden_size;
+
+        let mut input_data = vec![0.0f32; (seq_len as usize) * hidden];
+        fill_random(&mut input_data, 0xB22);
+        let mut weight_f32 = vec![0.0f32; hidden];
+        fill_random(&mut weight_f32, 0xB23);
+        let weight_bf16_q: Vec<f32> =
+            weight_f32.iter().map(|&v| bf16_quantize_f32(v)).collect();
+        let cpu_out = cpu_rms_norm_f32(
+            &input_data, &weight_bf16_q,
+            seq_len as usize, hidden, cfg.rms_norm_eps,
+        );
+
+        let manifest = expected_manifest(&cfg);
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "layers.0.post_attention_layernorm.weight".to_string(),
+            f32_to_bf16_bytes(&weight_f32),
+        );
+        let blob = build_blob_with_overrides(&manifest, &overrides);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let input_gpu = upload_f32_to_gpu(&device, &input_data,
+            vec![seq_len as usize, hidden]);
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let out_buf = dispatch_eagle3_post_attention_layernorm(
+            &mut enc, &mut registry, &device, &input_gpu, &tensors, &cfg, seq_len,
+        )
+        .expect("post_attention_layernorm");
+        enc.commit_and_wait().expect("commit");
+
+        let gpu_out: &[f32] = out_buf.as_slice::<f32>().expect("output slice");
+        let mut max_diff = 0.0f32;
+        for (g, c) in gpu_out.iter().zip(cpu_out.iter()) {
+            let d = (g - c).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+            assert!(d < 1e-3, "post_attention_layernorm parity: diff={d}");
+        }
+        eprintln!("post_attention_layernorm parity max_diff={max_diff:.6e}");
+    }
+
+    /// Full forward orchestrator: chains all 14 primitives from E4b.2-E4b.10b.1
+    /// end-to-end on synthetic data, asserting:
+    ///   1. The chain compiles + doesn't panic.
+    ///   2. Output shape is [seq, draft_vocab_size].
+    ///   3. Output is finite (no NaN/inf from accumulated dispatches).
+    ///   4. Determinism: same input twice → identical output.
+    /// Full-forward test config: head_dim=128 (tree_attention dk128
+    /// kernel) + tie_lm_head=false (avoids embed_tokens requirement).
+    fn cfg_for_full_forward_test() -> Eagle3DrafterConfig {
+        let mut c = cfg_for_attention_dk128();
+        c.tie_lm_head = false; // separate lm_head.weight in manifest
+        c
+    }
+
+    #[test]
+    fn adr_037_e4b10b2_full_forward_chain_finite_and_deterministic_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = cfg_for_full_forward_test();
+        let seq_len: u32 = 2;
+        let hidden = cfg.hidden_size;
+        let dvocab = cfg.draft_vocab_size;
+
+        // For full chain test, we need ALL 13 weight tensors populated
+        // with sensible values. Use zeros (matmul produces zeros, norm
+        // divides by ~eps; output will be very small magnitudes but
+        // finite, validating the pipeline composes).
+        let manifest = expected_manifest(&cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+
+        // Inputs: random target_aux_hidden + embeds. K/V are computed
+        // fresh per call from the concat (no prior KV cache — the
+        // tree_mask covers only the new positions for this simple test).
+        let target_aux = vec![0.1f32; (seq_len as usize) * cfg.fc_input_size()];
+        let embeds = vec![0.1f32; (seq_len as usize) * hidden];
+        let target_aux_gpu = upload_f32_to_gpu(&device, &target_aux,
+            vec![seq_len as usize, cfg.fc_input_size()]);
+        let embeds_gpu = upload_f32_to_gpu(&device, &embeds,
+            vec![seq_len as usize, hidden]);
+
+        // Run forward TWICE — second run must produce bit-identical output.
+        let logits_run1 = run_full_eagle3_forward(
+            &device, &mut registry, &target_aux_gpu, &embeds_gpu,
+            &tensors, &cfg, seq_len,
+        );
+        let logits_run2 = run_full_eagle3_forward(
+            &device, &mut registry, &target_aux_gpu, &embeds_gpu,
+            &tensors, &cfg, seq_len,
+        );
+
+        // Shape check.
+        assert_eq!(
+            logits_run1.len(),
+            (seq_len as usize) * dvocab,
+            "logits shape"
+        );
+        // Finite check.
+        for (i, &v) in logits_run1.iter().enumerate() {
+            assert!(v.is_finite(), "logits[{i}] = {v} is not finite");
+        }
+        // Determinism: bit-exact across runs.
+        for (i, (a, b)) in logits_run1.iter().zip(logits_run2.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "non-deterministic at idx {i}: run1={a} run2={b}"
+            );
+        }
+        // Then verify top-K extraction works on the logits.
+        let row0_logits = &logits_run1[..dvocab];
+        let top_k = crate::inference::spec_decode::eagle3::drafter::extract_top_k_from_row_logits(
+            row0_logits, 5,
+        )
+        .expect("top-K extraction");
+        assert_eq!(top_k.len(), 5);
+        // Validate against Phase E4a Drafter contract.
+        crate::inference::spec_decode::eagle3::drafter::validate_candidates(
+            &top_k, 5,
+        )
+        .expect("Phase E4a contract");
+    }
+
+    /// Helper: run the full Eagle3 forward chain end-to-end and
+    /// return the logits as a Vec<f32>.
+    fn run_full_eagle3_forward(
+        device: &MlxDevice,
+        registry: &mut KernelRegistry,
+        target_aux_gpu: &MlxBuffer,
+        embeds_gpu: &MlxBuffer,
+        tensors: &Eagle3DrafterTensors,
+        cfg: &Eagle3DrafterConfig,
+        seq_len: u32,
+    ) -> Vec<f32> {
+        let mut enc = device.command_encoder().expect("encoder");
+
+        // 1. fc projection: [seq, num_aux*hidden] → [seq, hidden]
+        let fc_out = dispatch_eagle3_fc(
+            &mut enc, registry, device, target_aux_gpu, tensors, cfg, seq_len,
+        )
+        .expect("fc");
+
+        // 2. embeds_normed = input_layernorm(embeds)
+        let embeds_normed = dispatch_eagle3_input_layernorm(
+            &mut enc, registry, device, embeds_gpu, tensors, cfg, seq_len,
+        )
+        .expect("input_layernorm");
+
+        // 3. hidden_normed = hidden_norm(fc_out)
+        let hidden_normed = dispatch_eagle3_hidden_norm(
+            &mut enc, registry, device, &fc_out, tensors, cfg, seq_len,
+        )
+        .expect("hidden_norm");
+
+        // 4. concat: [seq, 2*hidden]
+        let concat = dispatch_eagle3_concat_2x_hidden(
+            &mut enc, registry, device, &embeds_normed, &hidden_normed, cfg, seq_len,
+        )
+        .expect("concat");
+
+        // 5-7. Q/K/V projections.
+        let q = dispatch_eagle3_q_proj(
+            &mut enc, registry, device, &concat, tensors, cfg, seq_len,
+        )
+        .expect("q_proj");
+        let k = dispatch_eagle3_k_proj(
+            &mut enc, registry, device, &concat, tensors, cfg, seq_len,
+        )
+        .expect("k_proj");
+        let v = dispatch_eagle3_v_proj(
+            &mut enc, registry, device, &concat, tensors, cfg, seq_len,
+        )
+        .expect("v_proj");
+
+        // 8. Optional Q/K head-norm (skipped for tiny_cfg use_qk_norm=false).
+        let (q_normed, k_normed) = (q, k);
+
+        // 9. RoPE on Q and K (linear positions for this simple test).
+        let q_roped = dispatch_eagle3_rope(
+            &mut enc, registry, device, &q_normed, cfg, seq_len,
+            cfg.num_q_heads as u32, None, 0, "q_rope",
+        )
+        .expect("q_rope");
+        let k_roped = dispatch_eagle3_rope(
+            &mut enc, registry, device, &k_normed, cfg, seq_len,
+            cfg.num_kv_heads as u32, None, 0, "k_rope",
+        )
+        .expect("k_rope");
+
+        // 10. Permute Q/K/V from seq-outer to head-outer.
+        let q_perm = dispatch_eagle3_permute_seq_to_head_outer(
+            &mut enc, registry, device, &q_roped,
+            seq_len, cfg.num_q_heads as u32, cfg.head_dim, "q_permute",
+        )
+        .expect("q_permute");
+        let k_perm = dispatch_eagle3_permute_seq_to_head_outer(
+            &mut enc, registry, device, &k_roped,
+            seq_len, cfg.num_kv_heads as u32, cfg.head_dim, "k_permute",
+        )
+        .expect("k_permute");
+        let v_perm = dispatch_eagle3_permute_seq_to_head_outer(
+            &mut enc, registry, device, &v,
+            seq_len, cfg.num_kv_heads as u32, cfg.head_dim, "v_permute",
+        )
+        .expect("v_permute");
+
+        // 11. tree_attention. For this simple test, K/V cache size
+        // equals seq_len (no prefix); mask is "all attended".
+        let kv_seq_len = seq_len;
+        let kv_capacity = seq_len;
+        let mask_stride = kv_seq_len;
+        // Build all-attended mask [seq, mask_stride] F32 zeros.
+        let mask_elems = (seq_len as usize) * (mask_stride as usize);
+        let mask_data = vec![EAGLE3_TREE_MASK_ATTENDED; mask_elems];
+        let mask_gpu = upload_f32_to_gpu(device, &mask_data,
+            vec![seq_len as usize, mask_stride as usize]);
+        let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+        let attn_out = dispatch_eagle3_tree_attention(
+            &mut enc, registry, device,
+            &q_perm, &k_perm, &v_perm, &mask_gpu,
+            cfg, seq_len, kv_seq_len, kv_capacity, mask_stride, scale,
+        )
+        .expect("tree_attention");
+
+        // 12. O projection + residual add (residual = hidden_normed
+        // per vLLM line 84-86 _residual_norm convention).
+        let o_out = dispatch_eagle3_o_proj(
+            &mut enc, registry, device, &attn_out, tensors, cfg, seq_len,
+        )
+        .expect("o_proj");
+        let attn_residual = dispatch_eagle3_residual_add(
+            &mut enc, registry, device, &o_out, &hidden_normed, cfg, seq_len,
+        )
+        .expect("attn_residual_add");
+
+        // 13. post_attention_layernorm + MLP + residual add.
+        let post_attn_normed = dispatch_eagle3_post_attention_layernorm(
+            &mut enc, registry, device, &attn_residual, tensors, cfg, seq_len,
+        )
+        .expect("post_attention_layernorm");
+        let mlp_out = dispatch_eagle3_mlp(
+            &mut enc, registry, device, &post_attn_normed, tensors, cfg, seq_len,
+        )
+        .expect("mlp");
+        let final_residual = dispatch_eagle3_residual_add(
+            &mut enc, registry, device, &mlp_out, &attn_residual, cfg, seq_len,
+        )
+        .expect("final_residual_add");
+
+        // 14. final_norm + lm_head.
+        let final_normed = dispatch_eagle3_final_norm(
+            &mut enc, registry, device, &final_residual, tensors, cfg, seq_len,
+        )
+        .expect("final_norm");
+        let logits = dispatch_eagle3_lm_head(
+            &mut enc, registry, device, &final_normed, tensors, cfg, seq_len,
+        )
+        .expect("lm_head");
+        enc.commit_and_wait().expect("commit");
+
+        logits.as_slice::<f32>().expect("logits slice").to_vec()
     }
 
     #[test]
