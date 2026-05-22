@@ -2674,6 +2674,393 @@ pub fn qwen35_tree_verify_full_layer(
     Ok(hidden_states_out)
 }
 
+// ADR-037 Phase E6 — qwen35_tree_verify_full_layer_q (F2: Q4_0 production variant)
+// ================================================================
+
+/// Shape parameters for [`qwen35_tree_verify_full_layer_q`].
+///
+/// Field-set-identical to [`Qwen35TreeVerifyFullLayerShape`] but a distinct
+/// type — this prevents call-site mismatch between the F32-cast path (F1) and
+/// the Q4_0 path (F2) at compile time. No existing call sites of F1 are affected.
+///
+/// `intermediate_size` is duplicated with `DenseFfnWeightsGpuQ.intermediate_size`
+/// for ergonomics; the function body cross-checks consistency at entry
+/// (`INV-Q-shape-weights-cross-check`).
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen35TreeVerifyFullLayerShapeQ {
+    /// All 13 attention-side shape fields forwarded to `qwen35_tree_verify_attention_block`.
+    pub attn: Qwen35TreeVerifyLayerShape,
+    /// FFN intermediate dim. Qwen 3.6 27B: 27648.
+    pub intermediate_size: u32,
+}
+
+impl Qwen35TreeVerifyFullLayerShapeQ {
+    /// Validate all invariants. Returns `Err` with a descriptive message.
+    pub fn validate(&self) -> Result<()> {
+        self.attn.validate()?;
+        let h = self.attn.hidden_size as usize;
+        let m = self.intermediate_size as usize;
+        if self.intermediate_size == 0 {
+            return Err(anyhow!(
+                "Qwen35TreeVerifyFullLayerShapeQ: intermediate_size must be > 0"
+            ));
+        }
+        let _overflow_check = (m as u64)
+            .checked_mul(h as u64)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Qwen35TreeVerifyFullLayerShapeQ: intermediate_size ({}) * hidden_size ({}) \
+                     overflows u64 — too large for activated scratch allocation",
+                    m, h
+                )
+            })?;
+        m.checked_mul(h).ok_or_else(|| {
+            anyhow!(
+                "Qwen35TreeVerifyFullLayerShapeQ: intermediate_size ({}) * hidden_size ({}) \
+                 overflows usize",
+                m, h
+            )
+        })?;
+        Ok(())
+    }
+}
+
+/// Run one complete Qwen3.5 transformer layer in tree-verify mode — Q4_0 production variant.
+///
+/// This is the **Q4_0 production path** (F2). See [`qwen35_tree_verify_full_layer`] for the
+/// F32-cast reference variant (F1). Differs from F1 in exactly one parameter:
+/// `ffn_weights: &DenseFfnWeightsGpu` (F1) → `ffn_weights: &DenseFfnWeightsGpuQ` (F2).
+///
+/// # Memory budget (Qwen 3.6 27B, 64 layers)
+///
+/// - BF16 path (F1):  17408 × 5120 × 2 × 2 bytes ≈ 357 MB/layer × 64 ≈ **22 GB** — OOM on M5 Max 128 GB
+/// - Q4_0 path (F2):  17408 × 5120 × 4/8 × 1.125 bytes ≈ 50 MB/layer × 64 ≈ **3 GB** — production-viable
+///
+/// F2 is the **only production-viable** path for Qwen 3.6 27B tree-verify on 128 GB M5 Max.
+///
+/// # Op order (6 MLP-extension steps after the attention block)
+///
+///  1. `post_attn_norm`: row-wise RMSNorm of `attn_out` using `weights.post_attn_norm`.
+///  2. `gate_proj`:  `post_attn_normed @ ffn_weights.gate_q^T`  → `[tree_seq_len, intermediate_size]`.
+///  3. `up_proj`:    `post_attn_normed @ ffn_weights.up_q^T`    → `[tree_seq_len, intermediate_size]`.
+///  4. `silu_mul`:   `silu(gate_proj) * up_proj`                → `activated`.
+///  5. `down_proj`:  `activated @ ffn_weights.down_q^T`         → `[tree_seq_len, hidden_size]`.
+///  6. `residual`:   `ffn_residual + ffn_out`  where `ffn_residual = attn_out` (PRE-norm value).
+///
+/// Routing is automatic: `apply_linear_projection_f32` dispatches to `quantized_matmul_ggml`
+/// when the weight buffer's dtype is `DType::U8` (gpu_full_attn.rs U8 branch). No new
+/// dispatch logic is introduced.
+///
+/// # Encoder lifecycle
+///
+/// Two encoders sequentially:
+/// - The caller-provided `enc` is forwarded to `qwen35_tree_verify_attention_block`,
+///   which commits it internally (mid-block commit for CPU KV-cache append + terminal commit).
+/// - A fresh `enc2` is opened on `device` for the 6-stage MLP+norm+residual chain
+///   and committed via `commit_and_wait()` before return.
+/// - Caller does NOT need to commit any further encoder.
+///
+/// # Cache invariant
+///
+/// `k_cache` and `v_cache` are appended exactly once by the inner attention
+/// block (slots `[prefix_len, prefix_len + tree_seq_len)`). The MLP-extension
+/// encoder does NOT touch them.
+///
+/// # ggml_type validation invariant (INV-Q-ggml-type-validation)
+///
+/// At function entry, BEFORE shape.validate(), this function asserts:
+///   `weights.ggml_type_gate_up == GgmlType::Q4_0`
+/// AND
+///   `weights.ggml_type_down == GgmlType::Q4_0`.
+///
+/// `apply_linear_projection_f32` hardcodes `GgmlType::Q4_0` in its U8 branch. Passing
+/// Q5_K / Q6_K / IQ4_NL weights would silently mis-dequantize without this guard.
+/// Future CFAs that thread per-projection ggml_type through the dispatcher may relax
+/// this strict check.
+///
+/// # shape↔weights cross-check invariant (INV-Q-shape-weights-cross-check)
+///
+/// After shape.validate(), the function asserts:
+///   `shape.attn.hidden_size == weights.hidden_size`
+/// AND
+///   `shape.intermediate_size == weights.intermediate_size`.
+///
+/// These fields come from different sources (model config vs disk). A mismatch would
+/// silently corrupt matmul m/n/k dimensions.
+///
+/// # Cross-variant parity (AC-7)
+///
+/// Q4_0 GPU output ≈ F32-cast (F1) GPU output within |.|_inf < 0.20 on identical
+/// F32 source weights. This proves the Q4_0 path performs the same computation
+/// as F1 up to Q4_0 dequant slop.
+///
+/// # Return value
+///
+/// `[tree_seq_len, hidden_size]` F32 = `ffn_residual + ffn_out`
+/// where `ffn_residual = attn_block(hidden_states_in)`.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen35_tree_verify_full_layer_q(
+    enc: mlx_native::CommandEncoder,
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    hidden_states_in: &MlxBuffer,
+    tree_mask: &MlxBuffer,
+    tree_positions: &MlxBuffer,
+    k_cache: &mut MlxBuffer,
+    v_cache: &mut MlxBuffer,
+    weights: &FullAttnWeightsGpu,
+    ffn_weights: &super::gpu_ffn::DenseFfnWeightsGpuQ,
+    shape: Qwen35TreeVerifyFullLayerShapeQ,
+) -> Result<MlxBuffer> {
+    // ── STEP 0a: ggml_type validation (INV-Q-ggml-type-validation) ──────
+    // MUST fire BEFORE shape.validate() — defense-in-depth ordering.
+    // apply_linear_projection_f32's U8 branch hardcodes GgmlType::Q4_0; a
+    // non-Q4_0 buffer would silently mis-dequantize without this guard.
+    if ffn_weights.ggml_type_gate_up != GgmlType::Q4_0 {
+        return Err(anyhow!(
+            "qwen35_tree_verify_full_layer_q: ggml_type_gate_up must be Q4_0 \
+             (got {:?}). Future CFAs will support Q5_K/Q6_K mixed-quant via \
+             per-projection ggml_type threading through apply_linear_projection_f32.",
+            ffn_weights.ggml_type_gate_up
+        ));
+    }
+    if ffn_weights.ggml_type_down != GgmlType::Q4_0 {
+        return Err(anyhow!(
+            "qwen35_tree_verify_full_layer_q: ggml_type_down must be Q4_0 \
+             (got {:?}). Future CFAs will support Q5_K/Q6_K mixed-quant via \
+             per-projection ggml_type threading through apply_linear_projection_f32.",
+            ffn_weights.ggml_type_down
+        ));
+    }
+
+    // ── STEP 0b: Validate full-layer shape ───────────────────────────────
+    shape.validate()?;
+
+    let seq = shape.attn.tree_seq_len as usize;
+    let h = shape.attn.hidden_size as usize;
+    let m = shape.intermediate_size as usize;
+
+    // ── STEP 0c: shape↔weights cross-check (INV-Q-shape-weights-cross-check) ──
+    // Shape fields come from model config; weights fields come from disk.
+    // A mismatch silently corrupts matmul m/n/k dimensions without this guard.
+    if shape.attn.hidden_size != ffn_weights.hidden_size {
+        return Err(anyhow!(
+            "qwen35_tree_verify_full_layer_q: shape.attn.hidden_size ({}) != \
+             ffn_weights.hidden_size ({}). Shape and weights were built from \
+             different model configs.",
+            shape.attn.hidden_size, ffn_weights.hidden_size
+        ));
+    }
+    if shape.intermediate_size != ffn_weights.intermediate_size {
+        return Err(anyhow!(
+            "qwen35_tree_verify_full_layer_q: shape.intermediate_size ({}) != \
+             ffn_weights.intermediate_size ({}). Shape and weights were built from \
+             different model configs.",
+            shape.intermediate_size, ffn_weights.intermediate_size
+        ));
+    }
+
+    // ── STEP 0d: Weight element-count checks (Q4_0 byte lengths) ────────
+    // Q4_0 block geometry: 32 elements per block, 18 bytes per block.
+    // For a weight matrix [rows, cols]: bytes = rows * (cols / 32) * 18.
+    // Equivalently: bytes = rows * cols / 2 + rows * cols / 16.
+    // Use checked arithmetic; compare with != (exact equality, not <).
+    let gate_blocks_per_row = h
+        .checked_div(32)
+        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q: hidden_size {} not divisible by 32 (Q4_0 block)", h))?;
+    if h % 32 != 0 {
+        return Err(anyhow!(
+            "qwen35_tree_verify_full_layer_q: hidden_size ({}) must be divisible by 32 for Q4_0 block encoding",
+            h
+        ));
+    }
+    let gate_expected_bytes = m
+        .checked_mul(gate_blocks_per_row)
+        .and_then(|v| v.checked_mul(18))
+        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q: gate Q4_0 byte count overflows usize"))?;
+    if ffn_weights.gate_q.element_count() != gate_expected_bytes {
+        return Err(anyhow!(
+            "qwen35_tree_verify_full_layer_q: gate_q has {} bytes, \
+             expected exactly {} (intermediate_size={} * hidden_size={} Q4_0 encoding: \
+             {} rows × {} blocks/row × 18 bytes/block)",
+            ffn_weights.gate_q.element_count(), gate_expected_bytes,
+            m, h, m, gate_blocks_per_row
+        ));
+    }
+    if ffn_weights.up_q.element_count() != gate_expected_bytes {
+        return Err(anyhow!(
+            "qwen35_tree_verify_full_layer_q: up_q has {} bytes, \
+             expected exactly {} (intermediate_size={} * hidden_size={} Q4_0 encoding)",
+            ffn_weights.up_q.element_count(), gate_expected_bytes, m, h
+        ));
+    }
+    // down_proj: [hidden_size, intermediate_size] → rows=h, cols=m
+    let down_blocks_per_row = m
+        .checked_div(32)
+        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q: intermediate_size {} not divisible by 32 (Q4_0 block)", m))?;
+    if m % 32 != 0 {
+        return Err(anyhow!(
+            "qwen35_tree_verify_full_layer_q: intermediate_size ({}) must be divisible by 32 for Q4_0 block encoding",
+            m
+        ));
+    }
+    let down_expected_bytes = h
+        .checked_mul(down_blocks_per_row)
+        .and_then(|v| v.checked_mul(18))
+        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q: down Q4_0 byte count overflows usize"))?;
+    if ffn_weights.down_q.element_count() != down_expected_bytes {
+        return Err(anyhow!(
+            "qwen35_tree_verify_full_layer_q: down_q has {} bytes, \
+             expected exactly {} (hidden_size={} * intermediate_size={} Q4_0 encoding: \
+             {} rows × {} blocks/row × 18 bytes/block)",
+            ffn_weights.down_q.element_count(), down_expected_bytes,
+            h, m, h, down_blocks_per_row
+        ));
+    }
+
+    // ── STEP A: Attention sub-block ──────────────────────────────────────
+    // Returns attn_out = hidden_states_in + attn_residual [tree_seq_len, hidden_size] F32.
+    // Terminal commit is done inside the block; all GPU work is host-coherent on return.
+    let attn_out = qwen35_tree_verify_attention_block(
+        enc, device, registry,
+        hidden_states_in, tree_mask, tree_positions,
+        k_cache, v_cache,
+        weights, shape.attn,
+    )
+    .context("qwen35_tree_verify_full_layer_q: attention block")?;
+
+    // ── STEP B: ffn_residual = attn_out (PRE-norm, same buffer ARC) ──────
+    // The FFN residual stream is the pre-norm attn_out per Qwen3.5 layer
+    // composition (forward_cpu.rs:133-149 + llama.cpp qwen35moe.cpp).
+    let ffn_residual = attn_out.clone();
+
+    // ── STEP C: Open fresh encoder for MLP+norm+residual chain ───────────
+    // attn_out is host-coherent (prior encoder commit_and_wait'd); enc2
+    // reads it from device memory — no upload needed under Apple unified memory.
+    let mut enc2 = device.command_encoder()
+        .context("qwen35_tree_verify_full_layer_q: alloc enc2")?;
+
+    // ── STEP D: post_attn_norm — RMSNorm(attn_out, weights.post_attn_norm) ──
+    let rms_out_bytes = seq * h * std::mem::size_of::<f32>();
+    let post_attn_normed = super::decode_pool::pooled_alloc_buffer(
+        device, rms_out_bytes, DType::F32, vec![seq, h],
+    )
+    .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: alloc post_attn_normed: {e}"))?;
+    let mut rms_params = super::decode_pool::pooled_alloc_buffer(device, 8, DType::F32, vec![2])
+        .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: alloc rms_params: {e}"))?;
+    {
+        let s = rms_params.as_mut_slice::<f32>()
+            .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: rms_params slice: {e}"))?;
+        s[0] = shape.attn.rms_norm_eps;
+        s[1] = h as f32;
+    }
+    rms_norm::dispatch_rms_norm(
+        &mut enc2, registry, device.metal_device(),
+        &attn_out,
+        &weights.post_attn_norm,
+        &post_attn_normed,
+        &rms_params,
+        shape.attn.tree_seq_len,
+        shape.attn.hidden_size,
+    )
+    .context("qwen35_tree_verify_full_layer_q: post_attn_norm")?;
+
+    // BARRIER (1): RAW — post_attn_norm writes post_attn_normed;
+    // gate_proj and up_proj matmuls read post_attn_normed.
+    enc2.memory_barrier();
+
+    // ── STEP F+G: gate_proj and up_proj — concurrent (both read post_attn_normed) ──
+    // apply_linear_projection_f32 auto-routes U8 dtype → quantized_matmul_ggml Q4_0.
+    let gate_buf = apply_linear_projection_f32(
+        &mut enc2, registry, device,
+        &post_attn_normed,
+        &ffn_weights.gate_q,
+        shape.attn.tree_seq_len,
+        shape.attn.hidden_size,
+        shape.intermediate_size,
+    )
+    .context("qwen35_tree_verify_full_layer_q: gate_proj")?;
+
+    let up_buf = apply_linear_projection_f32(
+        &mut enc2, registry, device,
+        &post_attn_normed,
+        &ffn_weights.up_q,
+        shape.attn.tree_seq_len,
+        shape.attn.hidden_size,
+        shape.intermediate_size,
+    )
+    .context("qwen35_tree_verify_full_layer_q: up_proj")?;
+
+    // BARRIER (2): RAW — gate_proj/up_proj write gate_buf/up_buf;
+    // silu_mul reads both.
+    enc2.memory_barrier();
+
+    // ── STEP I: silu_mul — silu(gate_buf) * up_buf → activated_buf ──────
+    let n_silu_elems = seq
+        .checked_mul(m)
+        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q: seq * intermediate overflows usize"))?;
+    if n_silu_elems > (u32::MAX as usize) {
+        return Err(anyhow!(
+            "qwen35_tree_verify_full_layer_q: seq ({}) * intermediate ({}) = {} exceeds u32::MAX",
+            seq, m, n_silu_elems
+        ));
+    }
+    let n_silu: u32 = n_silu_elems as u32;
+    let activated_bytes = n_silu_elems
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow!("qwen35_tree_verify_full_layer_q: activated_bytes overflow"))?;
+    let activated_buf = device
+        .alloc_buffer(activated_bytes, DType::F32, vec![seq, m])
+        .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: alloc activated_buf: {e}"))?;
+    let mut silu_params = super::decode_pool::pooled_alloc_buffer(device, 4, DType::U32, vec![1])
+        .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: alloc silu_params: {e}"))?;
+    silu_params.as_mut_slice::<u32>()
+        .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: silu_params slice: {e}"))?[0] = n_silu;
+    dispatch_silu_mul(
+        &mut enc2, registry, device.metal_device(),
+        &gate_buf, &up_buf, &activated_buf,
+        &silu_params, n_silu,
+    )
+    .context("qwen35_tree_verify_full_layer_q: dispatch_silu_mul")?;
+
+    // BARRIER (3): RAW — silu_mul writes activated_buf; down_proj reads it.
+    enc2.memory_barrier();
+
+    // ── STEP K: down_proj — activated_buf → ffn_out [tree_seq_len, hidden_size] ──
+    let ffn_out = apply_linear_projection_f32(
+        &mut enc2, registry, device,
+        &activated_buf,
+        &ffn_weights.down_q,
+        shape.attn.tree_seq_len,
+        shape.intermediate_size,
+        shape.attn.hidden_size,
+    )
+    .context("qwen35_tree_verify_full_layer_q: down_proj")?;
+
+    // BARRIER (4): RAW — down_proj writes ffn_out; elementwise_add reads
+    // ffn_out and ffn_residual.
+    enc2.memory_barrier();
+
+    // ── STEP M: residual add — hidden_states_out = ffn_residual + ffn_out ──
+    let hs_elems = seq * h;
+    let out_bytes = hs_elems * std::mem::size_of::<f32>();
+    let hidden_states_out = device
+        .alloc_buffer(out_bytes, DType::F32, vec![seq, h])
+        .map_err(|e| anyhow!("qwen35_tree_verify_full_layer_q: alloc hidden_states_out: {e}"))?;
+    elementwise_add(
+        &mut enc2, registry, device.metal_device(),
+        &ffn_residual, &ffn_out, &hidden_states_out,
+        hs_elems, DType::F32,
+    )
+    .context("qwen35_tree_verify_full_layer_q: residual add")?;
+
+    // ── STEP N: terminal commit ───────────────────────────────────────────
+    enc2.commit_and_wait()
+        .context("qwen35_tree_verify_full_layer_q: enc2 terminal commit")?;
+
+    Ok(hidden_states_out)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn apply_flash_attn_prefill_seq_major(
     device: &MlxDevice,
@@ -8738,5 +9125,930 @@ mod tests {
             }
         }
         eprintln!("AC-6 PASS: 3× byte-identical (0 ULP) determinism across K/V cache resets");
+    }
+
+    // ADR-037 Phase E6 — qwen35_tree_verify_full_layer_q tests (AC-1 through AC-7)
+    // ================================================================
+
+    /// Build a Qwen35TreeVerifyFullLayerShapeQ for the tiny parity fixture.
+    fn full_layer_shape_q_tiny(intermediate_size: u32) -> Qwen35TreeVerifyFullLayerShapeQ {
+        Qwen35TreeVerifyFullLayerShapeQ {
+            attn: layer_shape(128, 2, 1, 2, 4, 8),
+            intermediate_size,
+        }
+    }
+
+    /// Quantize F32 weight data to Q4_0 bytes and upload as a U8 MlxBuffer.
+    fn upload_q4_0(data: &[f32], n_per_row: usize, device: &MlxDevice) -> MlxBuffer {
+        use crate::quantize::ggml_quants::q4_0;
+        let bytes = q4_0::quantize(data, n_per_row, None);
+        let mut buf = device
+            .alloc_buffer(bytes.len(), mlx_native::DType::U8, vec![bytes.len()])
+            .expect("alloc Q4_0 buf");
+        buf.as_mut_slice::<u8>()
+            .expect("q-buf slice")
+            .copy_from_slice(&bytes);
+        buf
+    }
+
+    /// CPU-side Q4_0 dequantize (mirrors mlx-native's dequantize_q4_0 exactly).
+    ///
+    /// Block layout: 2-byte F16 scale + 16 packed-nibble bytes = 18 bytes for 32 elements.
+    fn dequant_q4_0_cpu(data: &[u8]) -> Vec<f32> {
+        const BLOCK_BYTES: usize = 18;
+        const BLOCK_ELEMS: usize = 32;
+        assert!(data.len() % BLOCK_BYTES == 0, "Q4_0 data not block-aligned");
+        let num_blocks = data.len() / BLOCK_BYTES;
+        let mut out = vec![0.0f32; num_blocks * BLOCK_ELEMS];
+        for i in 0..num_blocks {
+            let block = &data[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES];
+            // F16 scale in little-endian
+            let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+            let qs = &block[2..18];
+            let out_block = &mut out[i * BLOCK_ELEMS..(i + 1) * BLOCK_ELEMS];
+            for j in 0..16 {
+                let x0 = (qs[j] & 0x0F) as i16 - 8;
+                let x1 = (qs[j] >> 4) as i16 - 8;
+                out_block[j]      = x0 as f32 * d;
+                out_block[j + 16] = x1 as f32 * d;
+            }
+        }
+        out
+    }
+
+    /// Build DenseFfnWeightsGpuQ (Q4_0) from random F32 data.
+    ///
+    /// Returns the GPU weights AND the original F32 arrays (for AC-7 cross-variant).
+    fn ffn_weights_q4_0(
+        hidden_size: usize,
+        intermediate_size: usize,
+        seed: &mut u32,
+        device: &MlxDevice,
+    ) -> (super::super::gpu_ffn::DenseFfnWeightsGpuQ, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let gate_f32 = mk_rand(seed, intermediate_size * hidden_size, 0.05);
+        let up_f32   = mk_rand(seed, intermediate_size * hidden_size, 0.05);
+        let down_f32 = mk_rand(seed, hidden_size * intermediate_size, 0.05);
+
+        let gate_q = upload_q4_0(&gate_f32, hidden_size, device);
+        let up_q   = upload_q4_0(&up_f32,   hidden_size, device);
+        let down_q = upload_q4_0(&down_f32, intermediate_size, device);
+
+        let weights_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
+            gate_q,
+            up_q,
+            down_q,
+            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_down: GgmlType::Q4_0,
+            intermediate_size: intermediate_size as u32,
+            hidden_size: hidden_size as u32,
+        };
+        (weights_q, gate_f32, up_f32, down_f32)
+    }
+
+    /// AC-1 — Qwen35TreeVerifyFullLayerShapeQ::validate() rejects all invalid shapes.
+    #[test]
+    fn qwen35_tree_verify_full_layer_q_shape_validate_2026_05_22() {
+        // (a) intermediate_size = 0 rejected.
+        {
+            let shape = Qwen35TreeVerifyFullLayerShapeQ {
+                attn: layer_shape(128, 2, 1, 2, 4, 8),
+                intermediate_size: 0,
+            };
+            let err = shape.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("intermediate_size"),
+                "(a) zero intermediate_size not rejected: {err}"
+            );
+        }
+
+        // (b) large but non-overflowing intermediate_size (1M) accepted.
+        {
+            let shape = Qwen35TreeVerifyFullLayerShapeQ {
+                attn: layer_shape(128, 2, 1, 2, 4, 8),
+                intermediate_size: 1024 * 1024,
+            };
+            shape.validate().expect("(b) large but valid intermediate_size should pass");
+        }
+
+        // (c) embedded attn.head_dim != 128 rejected (propagates from inner validate).
+        {
+            let mut attn = layer_shape(128, 2, 1, 2, 4, 8);
+            attn.head_dim = 256;
+            let shape = Qwen35TreeVerifyFullLayerShapeQ { attn, intermediate_size: 192 };
+            let err = shape.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("head_dim"),
+                "(c) head_dim != 128 not propagated: {err}"
+            );
+        }
+
+        // (d) valid Qwen 3.6 27B shape accepts.
+        {
+            let attn = Qwen35TreeVerifyLayerShape {
+                hidden_size: 5120,
+                num_q_heads: 40,
+                num_kv_heads: 8,
+                head_dim: 128,
+                tree_seq_len: 4,
+                cache_prefix_len: 64,
+                kv_capacity: 128,
+                mask_stride: 68,
+                rotary_dim: 64,
+                freq_base: 1e7,
+                mrope_section: [11, 11, 10, 0],
+                rms_norm_eps: 1e-6,
+                attn_output_gate: true,
+            };
+            let shape = Qwen35TreeVerifyFullLayerShapeQ { attn, intermediate_size: 27648 };
+            shape.validate().expect("(d) valid Qwen 3.6 27B shape must pass");
+        }
+        eprintln!("AC-1 (Q4_0) PASS: shape validate rejects all invalid shapes");
+    }
+
+    /// AC-2 — Production GQA smoke test at Qwen 3.6 27B layer-0 shape with real Q4_0 weights.
+    #[test]
+    fn qwen35_tree_verify_full_layer_q_smoke_production_gqa_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+
+        let hidden_size: usize = 5120;
+        let num_q_heads: usize = 40;
+        let num_kv_heads: usize = 8;
+        let head_dim: usize = 128;
+        let intermediate_size: usize = 27648;
+        let tree_seq_len: usize = 4;
+        let cache_prefix_len: usize = 64;
+        let kv_capacity: usize = 128;
+
+        let attn_shape = Qwen35TreeVerifyLayerShape {
+            hidden_size: hidden_size as u32,
+            num_q_heads: num_q_heads as u32,
+            num_kv_heads: num_kv_heads as u32,
+            head_dim: head_dim as u32,
+            tree_seq_len: tree_seq_len as u32,
+            cache_prefix_len: cache_prefix_len as u32,
+            kv_capacity: kv_capacity as u32,
+            mask_stride: (cache_prefix_len + tree_seq_len) as u32,
+            rotary_dim: 64,
+            freq_base: 1e7,
+            mrope_section: [11, 11, 10, 0],
+            rms_norm_eps: 1e-6,
+            attn_output_gate: true,
+        };
+        let full_shape_q = Qwen35TreeVerifyFullLayerShapeQ {
+            attn: attn_shape,
+            intermediate_size: intermediate_size as u32,
+        };
+
+        let mut seed = 0xF003_u32;
+        let attn_weights = layer_weights_f32(
+            hidden_size, num_q_heads, num_kv_heads, head_dim,
+            &mut seed, &device,
+        );
+        let (ffn_gpu_q, _, _, _) = ffn_weights_q4_0(hidden_size, intermediate_size, &mut seed, &device);
+
+        let hidden_data = mk_rand(&mut seed, tree_seq_len * hidden_size, 0.1);
+        let hidden_in = upload_f32(&hidden_data, &device).unwrap();
+        let tree_mask = causal_tree_mask_with_prefix(
+            tree_seq_len as u32, cache_prefix_len as u32,
+            (cache_prefix_len + tree_seq_len) as u32, &device,
+        );
+        let tree_pos = upload_positions(tree_seq_len, cache_prefix_len as u32, &device);
+        let mut k_cache = alloc_kv_cache(num_kv_heads, kv_capacity, head_dim, &device);
+        let mut v_cache = alloc_kv_cache(num_kv_heads, kv_capacity, head_dim, &device);
+
+        let enc = device.command_encoder().expect("encoder");
+        let out = qwen35_tree_verify_full_layer_q(
+            enc, &device, &mut registry,
+            &hidden_in, &tree_mask, &tree_pos,
+            &mut k_cache, &mut v_cache,
+            &attn_weights, &ffn_gpu_q, full_shape_q,
+        ).expect("AC-2 Q4_0: full_layer_q call failed");
+
+        // (a) output dtype F32
+        assert_eq!(out.dtype(), DType::F32, "AC-2(a) Q4_0 dtype");
+        // (b) output shape [tree_seq_len, hidden_size]
+        assert_eq!(out.shape(), &[tree_seq_len, hidden_size], "AC-2(b) Q4_0 shape");
+        // (c) all-finite
+        let out_data = download_f32(&out).unwrap();
+        assert!(out_data.iter().all(|v| v.is_finite()), "AC-2(c) Q4_0 non-finite output");
+        // (d) K cache slot [64, 68) is non-zero
+        let k_data = k_cache.as_slice::<f32>().expect("k_cache slice");
+        let slot_start = 0 * kv_capacity * head_dim + cache_prefix_len * head_dim;
+        let slot = &k_data[slot_start..slot_start + head_dim];
+        assert!(
+            slot.iter().any(|&v| v != 0.0),
+            "AC-2(d) Q4_0 K cache slot [64, 68) still all-zero"
+        );
+        // (e) V cache slot [64, 68) is non-zero
+        let v_data = v_cache.as_slice::<f32>().expect("v_cache slice");
+        let v_slot = &v_data[slot_start..slot_start + head_dim];
+        assert!(
+            v_slot.iter().any(|&v| v != 0.0),
+            "AC-2(e) Q4_0 V cache slot [64, 68) still all-zero"
+        );
+        eprintln!(
+            "AC-2 (Q4_0) PASS: production GQA smoke hidden={hidden_size} nq={num_q_heads} \
+             nkv={num_kv_heads} d={head_dim} intermediate={intermediate_size} \
+             tree_seq={tree_seq_len} prefix={cache_prefix_len}"
+        );
+    }
+
+    /// AC-3 — Negative-path validation: 7 invariants each rejected with descriptive error.
+    /// All 7 invoke the FULL function entry (not just shape.validate()).
+    #[test]
+    fn qwen35_tree_verify_full_layer_q_negative_paths_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+
+        let h: usize = 128;
+        let nq: usize = 2;
+        let nkv: usize = 1;
+        let d: usize = 128;
+        let seq: usize = 2;
+        let prefix: usize = 4;
+        let cap: usize = 8;
+        let m: usize = 192;
+
+        let mut seed = 0xA003_u32;
+        let base_attn_weights = layer_weights_f32(h, nq, nkv, d, &mut seed, &device);
+        let (base_ffn_q, _, _, _) = ffn_weights_q4_0(h, m, &mut seed, &device);
+
+        let make_inputs = |device: &MlxDevice, seed: &mut u32| {
+            let hidden_in = upload_f32(&mk_rand(seed, seq * h, 0.1), device).unwrap();
+            let mask = causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, device);
+            let pos = upload_positions(seq, prefix as u32, device);
+            let k_cache = alloc_kv_cache(nkv, cap, d, device);
+            let v_cache = alloc_kv_cache(nkv, cap, d, device);
+            (hidden_in, mask, pos, k_cache, v_cache)
+        };
+
+        let valid_shape_q = Qwen35TreeVerifyFullLayerShapeQ {
+            attn: layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32),
+            intermediate_size: m as u32,
+        };
+
+        // (a) gate_q wrong byte length.
+        {
+            use crate::quantize::ggml_quants::q4_0;
+            // Correct Q4_0 bytes for [m, h]: m*(h/32)*18. Generate one block fewer.
+            let wrong_gate_f32 = mk_rand(&mut seed, m * h, 0.05);
+            let correct_bytes = q4_0::quantize(&wrong_gate_f32, h, None);
+            // Deliberately truncate by 1 byte.
+            let mut wrong_bytes = correct_bytes.clone();
+            wrong_bytes.pop();
+            let mut wrong_gate_buf = device
+                .alloc_buffer(wrong_bytes.len(), DType::U8, vec![wrong_bytes.len()])
+                .unwrap();
+            wrong_gate_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&wrong_bytes);
+
+            let wrong_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
+                gate_q: wrong_gate_buf,
+                up_q:   base_ffn_q.up_q.clone(),
+                down_q: base_ffn_q.down_q.clone(),
+                ggml_type_gate_up: GgmlType::Q4_0,
+                ggml_type_down: GgmlType::Q4_0,
+                intermediate_size: m as u32,
+                hidden_size: h as u32,
+            };
+            let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
+            let enc = device.command_encoder().unwrap();
+            let err = qwen35_tree_verify_full_layer_q(
+                enc, &device, &mut registry,
+                &hidden_in, &mask, &pos,
+                &mut k_cache, &mut v_cache,
+                &base_attn_weights, &wrong_ffn_q, valid_shape_q,
+            ).unwrap_err();
+            assert!(
+                err.to_string().contains("gate"),
+                "(a) gate_q wrong byte length not caught: {err}"
+            );
+        }
+
+        // (b) up_q wrong byte length.
+        {
+            use crate::quantize::ggml_quants::q4_0;
+            let wrong_up_f32 = mk_rand(&mut seed, m * h, 0.05);
+            let correct_bytes = q4_0::quantize(&wrong_up_f32, h, None);
+            let mut wrong_bytes = correct_bytes.clone();
+            wrong_bytes.pop();
+            let mut wrong_up_buf = device
+                .alloc_buffer(wrong_bytes.len(), DType::U8, vec![wrong_bytes.len()])
+                .unwrap();
+            wrong_up_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&wrong_bytes);
+
+            let wrong_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
+                gate_q: base_ffn_q.gate_q.clone(),
+                up_q:   wrong_up_buf,
+                down_q: base_ffn_q.down_q.clone(),
+                ggml_type_gate_up: GgmlType::Q4_0,
+                ggml_type_down: GgmlType::Q4_0,
+                intermediate_size: m as u32,
+                hidden_size: h as u32,
+            };
+            let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
+            let enc = device.command_encoder().unwrap();
+            let err = qwen35_tree_verify_full_layer_q(
+                enc, &device, &mut registry,
+                &hidden_in, &mask, &pos,
+                &mut k_cache, &mut v_cache,
+                &base_attn_weights, &wrong_ffn_q, valid_shape_q,
+            ).unwrap_err();
+            assert!(
+                err.to_string().contains("up"),
+                "(b) up_q wrong byte length not caught: {err}"
+            );
+        }
+
+        // (c) down_q wrong byte length.
+        {
+            use crate::quantize::ggml_quants::q4_0;
+            let wrong_down_f32 = mk_rand(&mut seed, h * m, 0.05);
+            let correct_bytes = q4_0::quantize(&wrong_down_f32, m, None);
+            let mut wrong_bytes = correct_bytes.clone();
+            wrong_bytes.pop();
+            let mut wrong_down_buf = device
+                .alloc_buffer(wrong_bytes.len(), DType::U8, vec![wrong_bytes.len()])
+                .unwrap();
+            wrong_down_buf.as_mut_slice::<u8>().unwrap().copy_from_slice(&wrong_bytes);
+
+            let wrong_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
+                gate_q: base_ffn_q.gate_q.clone(),
+                up_q:   base_ffn_q.up_q.clone(),
+                down_q: wrong_down_buf,
+                ggml_type_gate_up: GgmlType::Q4_0,
+                ggml_type_down: GgmlType::Q4_0,
+                intermediate_size: m as u32,
+                hidden_size: h as u32,
+            };
+            let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
+            let enc = device.command_encoder().unwrap();
+            let err = qwen35_tree_verify_full_layer_q(
+                enc, &device, &mut registry,
+                &hidden_in, &mask, &pos,
+                &mut k_cache, &mut v_cache,
+                &base_attn_weights, &wrong_ffn_q, valid_shape_q,
+            ).unwrap_err();
+            assert!(
+                err.to_string().contains("down"),
+                "(c) down_q wrong byte length not caught: {err}"
+            );
+        }
+
+        // (d) shape.intermediate_size = 0 — propagates from shape.validate() via full entry.
+        {
+            let bad_shape = Qwen35TreeVerifyFullLayerShapeQ {
+                attn: layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32),
+                intermediate_size: 0,
+            };
+            let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
+            let enc = device.command_encoder().unwrap();
+            let err = qwen35_tree_verify_full_layer_q(
+                enc, &device, &mut registry,
+                &hidden_in, &mask, &pos,
+                &mut k_cache, &mut v_cache,
+                &base_attn_weights, &base_ffn_q, bad_shape,
+            ).unwrap_err();
+            assert!(
+                err.to_string().contains("intermediate_size"),
+                "(d) intermediate_size=0 not rejected via full entry: {err}"
+            );
+        }
+
+        // (e) head_dim != 128 — propagates from attn validate via full entry.
+        {
+            let mut bad_attn = layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32);
+            bad_attn.head_dim = 256;
+            let bad_shape = Qwen35TreeVerifyFullLayerShapeQ {
+                attn: bad_attn,
+                intermediate_size: m as u32,
+            };
+            let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
+            let enc = device.command_encoder().unwrap();
+            let err = qwen35_tree_verify_full_layer_q(
+                enc, &device, &mut registry,
+                &hidden_in, &mask, &pos,
+                &mut k_cache, &mut v_cache,
+                &base_attn_weights, &base_ffn_q, bad_shape,
+            ).unwrap_err();
+            assert!(
+                err.to_string().contains("head_dim"),
+                "(e) head_dim != 128 not propagated via full entry: {err}"
+            );
+        }
+
+        // (f) ggml_type_gate_up != Q4_0 — INV-Q-ggml-type-validation fires BEFORE shape.validate().
+        {
+            let wrong_type_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
+                gate_q: base_ffn_q.gate_q.clone(),
+                up_q:   base_ffn_q.up_q.clone(),
+                down_q: base_ffn_q.down_q.clone(),
+                ggml_type_gate_up: GgmlType::Q5_K,
+                ggml_type_down: GgmlType::Q4_0,
+                intermediate_size: m as u32,
+                hidden_size: h as u32,
+            };
+            let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
+            let enc = device.command_encoder().unwrap();
+            let err = qwen35_tree_verify_full_layer_q(
+                enc, &device, &mut registry,
+                &hidden_in, &mask, &pos,
+                &mut k_cache, &mut v_cache,
+                &base_attn_weights, &wrong_type_ffn_q, valid_shape_q,
+            ).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("ggml_type_gate_up"),
+                "(f) ggml_type_gate_up != Q4_0 not caught: {msg}"
+            );
+            assert!(
+                msg.contains("Q4_0"),
+                "(f) error does not mention Q4_0 requirement: {msg}"
+            );
+        }
+
+        // (g) weights.hidden_size != shape.attn.hidden_size — INV-Q-shape-weights-cross-check.
+        {
+            let wrong_hidden_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
+                gate_q: base_ffn_q.gate_q.clone(),
+                up_q:   base_ffn_q.up_q.clone(),
+                down_q: base_ffn_q.down_q.clone(),
+                ggml_type_gate_up: GgmlType::Q4_0,
+                ggml_type_down: GgmlType::Q4_0,
+                intermediate_size: m as u32,
+                hidden_size: h as u32 + 1, // mismatch
+            };
+            let (hidden_in, mask, pos, mut k_cache, mut v_cache) = make_inputs(&device, &mut seed);
+            let enc = device.command_encoder().unwrap();
+            let err = qwen35_tree_verify_full_layer_q(
+                enc, &device, &mut registry,
+                &hidden_in, &mask, &pos,
+                &mut k_cache, &mut v_cache,
+                &base_attn_weights, &wrong_hidden_ffn_q, valid_shape_q,
+            ).unwrap_err();
+            assert!(
+                err.to_string().contains("hidden_size"),
+                "(g) hidden_size mismatch not caught: {err}"
+            );
+        }
+
+        eprintln!("AC-3 (Q4_0) PASS: all 7 negative paths reject with descriptive errors via full function entry");
+    }
+
+    /// AC-4 — CPU reference parity at tiny shape (Q4_0 dequant ref).
+    ///
+    /// Tolerance: |GPU - CPU|_inf < 0.15 (Q4_0 dequant slop budget per spec).
+    #[test]
+    fn qwen35_tree_verify_full_layer_q_cpu_reference_parity_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+
+        let h: usize = 128;
+        let nq: usize = 2;
+        let nkv: usize = 1;
+        let d: usize = 128;
+        let seq: usize = 2;
+        let prefix: usize = 4;
+        let cap: usize = 8;
+        let m: usize = 192;
+        let q_total = nq * d;
+        let kv_total = nkv * d;
+
+        let full_shape_q = full_layer_shape_q_tiny(m as u32);
+        let mut seed = 0xC003_u32;
+
+        // Build CPU attn weights (non-zero for all projections).
+        let cpu_attn_weights = FullAttnLayerWeights {
+            attn_norm:      vec![1.0f32; h],
+            post_attn_norm: mk_rand(&mut seed, h, 0.5),
+            wq:     mk_rand(&mut seed, q_total * h, 0.05),
+            wk:     mk_rand(&mut seed, kv_total * h, 0.05),
+            wv:     mk_rand(&mut seed, kv_total * h, 0.05),
+            w_gate: mk_rand(&mut seed, q_total * h, 0.05),
+            attn_q_norm: vec![1.0f32; d],
+            attn_k_norm: vec![1.0f32; d],
+            wo:     mk_rand(&mut seed, h * q_total, 0.05),
+        };
+
+        // Generate F32 FFN weights, then quantize to Q4_0.
+        let gate_f32 = mk_rand(&mut seed, m * h, 0.05);
+        let up_f32   = mk_rand(&mut seed, m * h, 0.05);
+        let down_f32 = mk_rand(&mut seed, h * m, 0.05);
+
+        // Quantize F32 → Q4_0 bytes.
+        use crate::quantize::ggml_quants::q4_0;
+        let gate_q_bytes = q4_0::quantize(&gate_f32, h, None);
+        let up_q_bytes   = q4_0::quantize(&up_f32,   h, None);
+        let down_q_bytes = q4_0::quantize(&down_f32, m, None);
+
+        // CPU-side dequant: these are the weights the Q4_0 GPU kernel sees.
+        let gate_dq = dequant_q4_0_cpu(&gate_q_bytes);
+        let up_dq   = dequant_q4_0_cpu(&up_q_bytes);
+        let down_dq = dequant_q4_0_cpu(&down_q_bytes);
+
+        // Upload GPU weights.
+        let gpu_attn_weights = FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
+        let make_u8_buf = |bytes: &[u8], device: &MlxDevice| -> MlxBuffer {
+            let mut buf = device
+                .alloc_buffer(bytes.len(), DType::U8, vec![bytes.len()])
+                .expect("alloc q4_0 buf");
+            buf.as_mut_slice::<u8>().unwrap().copy_from_slice(bytes);
+            buf
+        };
+        let gpu_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
+            gate_q: make_u8_buf(&gate_q_bytes, &device),
+            up_q:   make_u8_buf(&up_q_bytes,   &device),
+            down_q: make_u8_buf(&down_q_bytes,  &device),
+            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_down: GgmlType::Q4_0,
+            intermediate_size: m as u32,
+            hidden_size: h as u32,
+        };
+
+        // Input data.
+        let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
+        let hidden_in = upload_f32(&hidden_data, &device).unwrap();
+
+        let mask_stride = prefix + seq;
+        let tree_mask_data: Vec<f32> = {
+            let mut mv = vec![mlx_native::ops::tree_attention::TREE_MASK_MASKED; seq * mask_stride];
+            for i in 0..seq {
+                for j in 0..prefix + i + 1 {
+                    if j < mask_stride {
+                        mv[i * mask_stride + j] = mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
+                    }
+                }
+            }
+            mv
+        };
+        let tree_mask = upload_f32(&tree_mask_data, &device).unwrap();
+        let tree_pos = upload_positions(seq, prefix as u32, &device);
+
+        let mut k_cache = alloc_kv_cache(nkv, cap, d, &device);
+        let mut v_cache = alloc_kv_cache(nkv, cap, d, &device);
+
+        let enc = device.command_encoder().expect("encoder");
+        let gpu_out = qwen35_tree_verify_full_layer_q(
+            enc, &device, &mut registry,
+            &hidden_in, &tree_mask, &tree_pos,
+            &mut k_cache, &mut v_cache,
+            &gpu_attn_weights, &gpu_ffn_q, full_shape_q,
+        ).expect("AC-4 Q4_0: GPU full_layer_q");
+
+        let gpu_data = download_f32(&gpu_out).unwrap();
+
+        // CPU reference with Q4_0-dequantized weights.
+        let mut k_cache_cpu = vec![0.0f32; nkv * cap * d];
+        let mut v_cache_cpu = vec![0.0f32; nkv * cap * d];
+        let positions: Vec<[i32; 4]> = (0..seq)
+            .map(|i| { let p = (prefix + i) as i32; [p, p, p, p] })
+            .collect();
+
+        let cpu_data = cpu_tree_verify_full_layer_ref(
+            &hidden_data, &tree_mask_data, &positions,
+            &mut k_cache_cpu, &mut v_cache_cpu,
+            &cpu_attn_weights,
+            &gate_dq, &up_dq, &down_dq,
+            h, nq, nkv, d, seq, cap, prefix,
+            mask_stride, m,
+            64, 1e7, [11, 11, 10, 0], 1e-6,
+        );
+
+        assert_eq!(gpu_data.len(), cpu_data.len(), "AC-4 Q4_0: output length mismatch");
+
+        let max_diff: f32 = gpu_data.iter().zip(cpu_data.iter())
+            .map(|(g, c)| (g - c).abs())
+            .fold(0.0f32, f32::max);
+
+        eprintln!("AC-4 (Q4_0): |GPU-CPU|_inf = {max_diff:.6e}");
+        assert!(
+            max_diff < 0.15,
+            "AC-4 (Q4_0) FAIL: |GPU-CPU|_inf = {max_diff:.6e} >= 0.15 (Q4_0 dequant slop budget). \
+             Check dequant_q4_0_cpu matches mlx-native's Q4_0 dequant or gate/up/down routing."
+        );
+        eprintln!("AC-4 (Q4_0) PASS: CPU reference parity |GPU-CPU|_inf = {max_diff:.6e} < 0.15");
+    }
+
+    /// AC-5 — Composition equivalence: qwen35_tree_verify_full_layer_q ≡
+    /// attention_block + manual RMSNorm + CPU MLP ref.
+    #[test]
+    fn qwen35_tree_verify_full_layer_q_composition_equivalence_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+
+        let h: usize = 128;
+        let nq: usize = 2;
+        let nkv: usize = 1;
+        let d: usize = 128;
+        let seq: usize = 2;
+        let prefix: usize = 4;
+        let cap: usize = 8;
+        let m: usize = 192;
+        let q_total = nq * d;
+        let kv_total = nkv * d;
+
+        let full_shape_q = full_layer_shape_q_tiny(m as u32);
+        let mut seed = 0xB003_u32;
+
+        let cpu_attn_weights = FullAttnLayerWeights {
+            attn_norm:      vec![1.0f32; h],
+            post_attn_norm: vec![1.0f32; h],
+            wq:     mk_rand(&mut seed, q_total * h, 0.05),
+            wk:     mk_rand(&mut seed, kv_total * h, 0.05),
+            wv:     mk_rand(&mut seed, kv_total * h, 0.05),
+            w_gate: mk_rand(&mut seed, q_total * h, 0.05),
+            attn_q_norm: vec![1.0f32; d],
+            attn_k_norm: vec![1.0f32; d],
+            wo:     mk_rand(&mut seed, h * q_total, 0.05),
+        };
+
+        let gate_f32 = mk_rand(&mut seed, m * h, 0.05);
+        let up_f32   = mk_rand(&mut seed, m * h, 0.05);
+        let down_f32 = mk_rand(&mut seed, h * m, 0.05);
+        use crate::quantize::ggml_quants::q4_0;
+        let gate_q_bytes = q4_0::quantize(&gate_f32, h, None);
+        let up_q_bytes   = q4_0::quantize(&up_f32,   h, None);
+        let down_q_bytes = q4_0::quantize(&down_f32, m, None);
+        let gate_dq = dequant_q4_0_cpu(&gate_q_bytes);
+        let up_dq   = dequant_q4_0_cpu(&up_q_bytes);
+        let down_dq = dequant_q4_0_cpu(&down_q_bytes);
+
+        let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
+
+        let gpu_attn_weights = FullAttnWeightsGpu::from_cpu_f32(&cpu_attn_weights, &device).unwrap();
+        let make_u8_buf = |bytes: &[u8], device: &MlxDevice| -> MlxBuffer {
+            let mut buf = device
+                .alloc_buffer(bytes.len(), DType::U8, vec![bytes.len()])
+                .expect("alloc q4_0 buf");
+            buf.as_mut_slice::<u8>().unwrap().copy_from_slice(bytes);
+            buf
+        };
+        let gpu_ffn_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
+            gate_q: make_u8_buf(&gate_q_bytes, &device),
+            up_q:   make_u8_buf(&up_q_bytes,   &device),
+            down_q: make_u8_buf(&down_q_bytes,  &device),
+            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_down: GgmlType::Q4_0,
+            intermediate_size: m as u32,
+            hidden_size: h as u32,
+        };
+
+        let hidden_in = upload_f32(&hidden_data, &device).unwrap();
+        let mask_stride = prefix + seq;
+        let tree_mask_data: Vec<f32> = {
+            let mut mv = vec![mlx_native::ops::tree_attention::TREE_MASK_MASKED; seq * mask_stride];
+            for i in 0..seq {
+                for j in 0..prefix + i + 1 {
+                    if j < mask_stride {
+                        mv[i * mask_stride + j] = mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
+                    }
+                }
+            }
+            mv
+        };
+        let tree_mask = upload_f32(&tree_mask_data, &device).unwrap();
+        let tree_pos = upload_positions(seq, prefix as u32, &device);
+        let mut k_cache = alloc_kv_cache(nkv, cap, d, &device);
+        let mut v_cache = alloc_kv_cache(nkv, cap, d, &device);
+
+        let enc = device.command_encoder().expect("enc");
+        let gpu_out = qwen35_tree_verify_full_layer_q(
+            enc, &device, &mut registry,
+            &hidden_in, &tree_mask, &tree_pos,
+            &mut k_cache, &mut v_cache,
+            &gpu_attn_weights, &gpu_ffn_q, full_shape_q,
+        ).expect("AC-5 Q4_0: GPU full_layer_q");
+        let gpu_data = download_f32(&gpu_out).unwrap();
+
+        // CPU reference using dequantized weights.
+        let mut k_cache_cpu = vec![0.0f32; nkv * cap * d];
+        let mut v_cache_cpu = vec![0.0f32; nkv * cap * d];
+        let positions: Vec<[i32; 4]> = (0..seq)
+            .map(|i| { let p = (prefix + i) as i32; [p, p, p, p] })
+            .collect();
+        let cpu_data = cpu_tree_verify_full_layer_ref(
+            &hidden_data, &tree_mask_data, &positions,
+            &mut k_cache_cpu, &mut v_cache_cpu,
+            &cpu_attn_weights,
+            &gate_dq, &up_dq, &down_dq,
+            h, nq, nkv, d, seq, cap, prefix,
+            mask_stride, m,
+            64, 1e7, [11, 11, 10, 0], 1e-6,
+        );
+
+        assert_eq!(gpu_data.len(), cpu_data.len(), "AC-5 Q4_0: length mismatch");
+        let max_diff: f32 = gpu_data.iter().zip(cpu_data.iter())
+            .map(|(g, c)| (g - c).abs())
+            .fold(0.0f32, f32::max);
+
+        eprintln!("AC-5 (Q4_0): |GPU-CPU|_inf = {max_diff:.6e}");
+        assert!(
+            max_diff < 0.15,
+            "AC-5 (Q4_0) FAIL: composition divergence {max_diff:.6e} >= 0.15"
+        );
+        eprintln!("AC-5 (Q4_0) PASS: composition equivalence |GPU-CPU|_inf = {max_diff:.6e} < 0.15");
+    }
+
+    /// AC-6 — 3-rep byte-identity determinism (0 ULP via to_bits()).
+    #[test]
+    fn qwen35_tree_verify_full_layer_q_byte_identity_3rep_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+
+        let h: usize = 128;
+        let nq: usize = 2;
+        let nkv: usize = 1;
+        let d: usize = 128;
+        let seq: usize = 2;
+        let prefix: usize = 4;
+        let cap: usize = 8;
+        let m: usize = 192;
+
+        let full_shape_q = full_layer_shape_q_tiny(m as u32);
+        let mut seed = 0xD003_u32;
+        let attn_weights = layer_weights_f32(h, nq, nkv, d, &mut seed, &device);
+        let (ffn_gpu_q, _, _, _) = ffn_weights_q4_0(h, m, &mut seed, &device);
+
+        let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
+        let mask = causal_tree_mask_with_prefix(seq as u32, prefix as u32, (prefix + seq) as u32, &device);
+        let pos = upload_positions(seq, prefix as u32, &device);
+
+        let mut outputs: Vec<Vec<u32>> = Vec::new();
+
+        for rep in 0..3 {
+            let hidden_in = upload_f32(&hidden_data, &device).unwrap();
+            let mut k_cache = alloc_kv_cache(nkv, cap, d, &device);
+            let mut v_cache = alloc_kv_cache(nkv, cap, d, &device);
+            let enc = device.command_encoder().expect("enc");
+            let out = qwen35_tree_verify_full_layer_q(
+                enc, &device, &mut registry,
+                &hidden_in, &mask, &pos,
+                &mut k_cache, &mut v_cache,
+                &attn_weights, &ffn_gpu_q, full_shape_q,
+            ).unwrap_or_else(|e| panic!("AC-6 Q4_0: rep {} failed: {e}", rep));
+            let bits: Vec<u32> = download_f32(&out).unwrap()
+                .iter().map(|f| f.to_bits()).collect();
+            outputs.push(bits);
+        }
+
+        for rep in 1..3 {
+            let first = &outputs[0];
+            let this  = &outputs[rep];
+            assert_eq!(first.len(), this.len(), "AC-6 Q4_0: rep {rep} length mismatch");
+            for (i, (a, b)) in first.iter().zip(this.iter()).enumerate() {
+                assert_eq!(
+                    a, b,
+                    "AC-6 (Q4_0) FAIL: rep {rep} output[{i}] differs: {:#010x} vs {:#010x}",
+                    a, b
+                );
+            }
+        }
+        eprintln!("AC-6 (Q4_0) PASS: 3× byte-identical (0 ULP) determinism");
+    }
+
+    /// AC-7 — Cross-variant parity: Q4_0 GPU ≈ F32-cast GPU on identical-input weights.
+    ///
+    /// Load-bearing: catches silent kernel-routing bugs where the Q4_0 path
+    /// accidentally routes through the BF16 dispatcher.
+    #[test]
+    fn qwen35_tree_verify_full_layer_q_cross_variant_parity_2026_05_22() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+
+        let h: usize = 128;
+        let nq: usize = 2;
+        let nkv: usize = 1;
+        let d: usize = 128;
+        let seq: usize = 2;
+        let prefix: usize = 4;
+        let cap: usize = 8;
+        let m: usize = 192;
+
+        let mut seed = 0xE003_u32;
+        let attn_weights = layer_weights_f32(h, nq, nkv, d, &mut seed, &device);
+
+        // Generate the SAME F32 weight arrays — both paths reuse these exact bits.
+        let gate_f32 = mk_rand(&mut seed, m * h, 0.05);
+        let up_f32   = mk_rand(&mut seed, m * h, 0.05);
+        let down_f32 = mk_rand(&mut seed, h * m, 0.05);
+
+        // Path A (F1 — F32-cast): upload F32 weights to DenseFfnWeightsGpu.
+        use super::super::gpu_ffn::DenseFfnWeightsGpu;
+        use super::super::ffn::DenseFfnWeights;
+        let ffn_cpu_weights = DenseFfnWeights {
+            gate: gate_f32.clone(),
+            up:   up_f32.clone(),
+            down: down_f32.clone(),
+        };
+        let ffn_gpu_f32 = DenseFfnWeightsGpu::from_cpu(&ffn_cpu_weights, &device).unwrap();
+        let full_shape_f32 = Qwen35TreeVerifyFullLayerShape {
+            attn: layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32),
+            intermediate_size: m as u32,
+        };
+
+        // Path B (F2 — Q4_0): quantize the SAME F32 arrays to Q4_0 blocks.
+        use crate::quantize::ggml_quants::q4_0;
+        let gate_q_bytes = q4_0::quantize(&gate_f32, h, None);
+        let up_q_bytes   = q4_0::quantize(&up_f32,   h, None);
+        let down_q_bytes = q4_0::quantize(&down_f32, m, None);
+        let make_u8_buf = |bytes: &[u8], device: &MlxDevice| -> MlxBuffer {
+            let mut buf = device
+                .alloc_buffer(bytes.len(), DType::U8, vec![bytes.len()])
+                .expect("alloc q4_0 buf");
+            buf.as_mut_slice::<u8>().unwrap().copy_from_slice(bytes);
+            buf
+        };
+        let ffn_gpu_q = super::super::gpu_ffn::DenseFfnWeightsGpuQ {
+            gate_q: make_u8_buf(&gate_q_bytes, &device),
+            up_q:   make_u8_buf(&up_q_bytes,   &device),
+            down_q: make_u8_buf(&down_q_bytes,  &device),
+            ggml_type_gate_up: GgmlType::Q4_0,
+            ggml_type_down: GgmlType::Q4_0,
+            intermediate_size: m as u32,
+            hidden_size: h as u32,
+        };
+        let full_shape_q = Qwen35TreeVerifyFullLayerShapeQ {
+            attn: layer_shape(h as u32, nq as u32, nkv as u32, seq as u32, prefix as u32, cap as u32),
+            intermediate_size: m as u32,
+        };
+
+        // Shared inputs (same hidden_in + mask + positions for both paths).
+        let hidden_data = mk_rand(&mut seed, seq * h, 0.1);
+        let mask_stride = prefix + seq;
+        let tree_mask_data: Vec<f32> = {
+            let mut mv = vec![mlx_native::ops::tree_attention::TREE_MASK_MASKED; seq * mask_stride];
+            for i in 0..seq {
+                for j in 0..prefix + i + 1 {
+                    if j < mask_stride {
+                        mv[i * mask_stride + j] = mlx_native::ops::tree_attention::TREE_MASK_ATTENDED;
+                    }
+                }
+            }
+            mv
+        };
+        let tree_mask = upload_f32(&tree_mask_data, &device).unwrap();
+        let tree_pos = upload_positions(seq, prefix as u32, &device);
+
+        // Run Path A (F1 — F32-cast). Fresh caches.
+        let hidden_in_a = upload_f32(&hidden_data, &device).unwrap();
+        let mut k_cache_a = alloc_kv_cache(nkv, cap, d, &device);
+        let mut v_cache_a = alloc_kv_cache(nkv, cap, d, &device);
+        let enc_a = device.command_encoder().expect("enc_a");
+        let out_a = qwen35_tree_verify_full_layer(
+            enc_a, &device, &mut registry,
+            &hidden_in_a, &tree_mask, &tree_pos,
+            &mut k_cache_a, &mut v_cache_a,
+            &attn_weights, &ffn_gpu_f32, full_shape_f32,
+        ).expect("AC-7: F1 path failed");
+        let data_a = download_f32(&out_a).unwrap();
+
+        // Run Path B (F2 — Q4_0). Fresh caches (cache writes accumulate).
+        let hidden_in_b = upload_f32(&hidden_data, &device).unwrap();
+        let mut k_cache_b = alloc_kv_cache(nkv, cap, d, &device);
+        let mut v_cache_b = alloc_kv_cache(nkv, cap, d, &device);
+        let enc_b = device.command_encoder().expect("enc_b");
+        let out_b = qwen35_tree_verify_full_layer_q(
+            enc_b, &device, &mut registry,
+            &hidden_in_b, &tree_mask, &tree_pos,
+            &mut k_cache_b, &mut v_cache_b,
+            &attn_weights, &ffn_gpu_q, full_shape_q,
+        ).expect("AC-7: F2 path failed");
+        let data_b = download_f32(&out_b).unwrap();
+
+        assert_eq!(data_a.len(), data_b.len(), "AC-7: output length mismatch F1 vs F2");
+
+        let max_diff: f32 = data_a.iter().zip(data_b.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        eprintln!("AC-7 (cross-variant): |F32-cast - Q4_0|_inf = {max_diff:.6e}");
+        assert!(
+            max_diff < 0.20,
+            "AC-7 FAIL: cross-variant divergence |F32-cast - Q4_0|_inf = {max_diff:.6e} >= 0.20. \
+             Check that gate/up/down use &ffn_weights.gate_q/.up_q/.down_q (U8 buffers) \
+             and that apply_linear_projection_f32's U8 branch is routing to quantized_matmul_ggml."
+        );
+        eprintln!(
+            "AC-7 PASS: Q4_0 GPU ≈ F32-cast GPU at |.|_inf = {max_diff:.6e} < 0.20 \
+             (proves Q4_0 path performs same computation as F32-cast within Q4_0 dequant slop)"
+        );
     }
 }
