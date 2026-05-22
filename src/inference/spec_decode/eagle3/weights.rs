@@ -73,6 +73,8 @@ pub enum Eagle3WeightsError {
     },
     #[error("eagle3 weights: unexpected extra tensor `{0}` not in manifest")]
     Extra(String),
+    #[error("eagle3 weights: invalid config: {0}")]
+    Config(String),
 }
 
 /// Default dtype for floating tensors (BF16 per EAGLE-3 paper +
@@ -136,10 +138,15 @@ pub fn expected_manifest(cfg: &Eagle3DrafterConfig) -> Vec<ExpectedTensor> {
     let mut m = Vec::with_capacity(est);
 
     // === Leading globals ===
-    m.push(ExpectedTensor::float(
-        "embed_tokens.weight",
-        vec![cfg.vocab_size, h],
-    ));
+    // embed_tokens is OPTIONAL — vLLM peer (llama_eagle3.py:449-450)
+    // treats missing EAGLE embed weights as valid and shares the
+    // target's embedding table. Codex /cfa E3 Major (2026-05-22).
+    if cfg.has_own_embed_tokens {
+        m.push(ExpectedTensor::float(
+            "embed_tokens.weight",
+            vec![cfg.vocab_size, h],
+        ));
+    }
     m.push(ExpectedTensor::float("fc.weight", vec![h, fc_in]));
 
     // Optional: input_norm (single RMSNorm over fc_input_size).
@@ -298,26 +305,72 @@ impl<'data> Eagle3Weights<'data> {
     /// expected-tensor manifest derived from `cfg`. Strict: every
     /// expected tensor MUST be present with the expected dtype + shape;
     /// no extra tensors allowed.
+    ///
+    /// Codex /cfa E3 Major (2026-05-22): vLLM EAGLE-3 checkpoints
+    /// sometimes use `d2t` as the safetensors key for the draft→target
+    /// vocab mapping and `t2d` for the inverse. Per vLLM
+    /// `llama_eagle3.py:415-419`, `d2t` is canonically renamed to
+    /// `draft_id_to_target_id` and `t2d` is skipped. We apply the
+    /// same normalization here so vLLM-format checkpoints load
+    /// without manual remapping.
     pub fn load(
         bytes: &'data [u8],
         cfg: &Eagle3DrafterConfig,
     ) -> Result<Self, Eagle3WeightsError> {
+        // Codex /cfa E3 Major (2026-05-22): defensive cfg.validate()
+        // at the loader entry. Without this, an invalid config silently
+        // builds a wrong manifest and surfaces as confusing
+        // Missing/Shape errors at load time.
+        cfg.validate()
+            .map_err(|e| Eagle3WeightsError::Config(e.to_string()))?;
+
         let st = SafeTensors::deserialize(bytes)?;
         let manifest = expected_manifest(cfg);
+
+        // Apply vLLM EAGLE-3 name normalization: d2t → draft_id_to_target_id;
+        // t2d skipped. Build a name-resolver closure so the rest of
+        // the loader works in canonical name space.
+        let resolve_name = |incoming: &str| -> Option<String> {
+            if incoming == "t2d" {
+                None // skipped per vLLM line 416
+            } else if incoming == "d2t" {
+                Some("draft_id_to_target_id".to_string())
+            } else {
+                Some(incoming.to_string())
+            }
+        };
 
         // Build name set for the "no extras" check.
         let expected_names: std::collections::HashSet<&str> =
             manifest.iter().map(|t| t.name.as_str()).collect();
         for name in st.names() {
             let name_str: &str = name;
-            if !expected_names.contains(name_str) {
-                return Err(Eagle3WeightsError::Extra(name.to_string()));
+            match resolve_name(name_str) {
+                None => continue, // skipped tensor — not an error
+                Some(canonical) => {
+                    if !expected_names.contains(canonical.as_str()) {
+                        return Err(Eagle3WeightsError::Extra(name.to_string()));
+                    }
+                }
+            }
+        }
+
+        // For lookup, build a map from canonical → raw safetensors name.
+        let mut canonical_to_raw: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for raw_name in st.names() {
+            let raw: &str = raw_name;
+            if let Some(canonical) = resolve_name(raw) {
+                canonical_to_raw.insert(canonical, raw.to_string());
             }
         }
 
         let mut tensors = Vec::with_capacity(manifest.len());
         for exp in &manifest {
-            let view = st.tensor(&exp.name).map_err(|e| match e {
+            let raw_name = canonical_to_raw
+                .get(exp.name.as_str())
+                .ok_or_else(|| Eagle3WeightsError::Missing(exp.name.clone()))?;
+            let view = st.tensor(raw_name).map_err(|e| match e {
                 safetensors::SafeTensorError::TensorNotFound(_) => {
                     Eagle3WeightsError::Missing(exp.name.clone())
                 }
@@ -770,6 +823,88 @@ mod tests {
         assert!(
             matches!(err, Eagle3WeightsError::Shape { ref name, .. } if name == "fc.weight"),
             "got: {err:?}"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Codex /cfa E3 gate (2026-05-22) — negative-path validation tests.
+    // Each proves a specific codex finding fix actually fires.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn adr_037_e3_gate_has_own_embed_tokens_gates_embed_tensor_2026_05_22() {
+        // Codex Major 2: vLLM peer treats missing EAGLE embed weights
+        // as valid (drafter shares target's embeddings).
+        let mut cfg = qwen35_default();
+        cfg.has_own_embed_tokens = false;
+        let m = expected_manifest(&cfg);
+        assert!(
+            m.iter().all(|t| t.name != "embed_tokens.weight"),
+            "embed_tokens.weight should be absent when has_own_embed_tokens=false"
+        );
+        // Loading a synthetic blob without embed_tokens still works.
+        let blob = build_synthetic_safetensors(&m);
+        Eagle3Weights::load(&blob, &cfg).expect("loader accepts shared-embed manifest");
+    }
+
+    #[test]
+    fn adr_037_e3_gate_d2t_canonicalized_to_draft_id_to_target_id_2026_05_22() {
+        // Codex Major 1: vLLM-format checkpoints emit `d2t` as the
+        // safetensors key; loader must canonicalize to
+        // `draft_id_to_target_id`. We build a synthetic blob using
+        // the raw `d2t` name and the canonical-named manifest's
+        // other tensors, then verify load succeeds.
+        let cfg = qwen35_default();
+        let canonical_manifest = expected_manifest(&cfg);
+        // Rebuild manifest with `d2t` instead of `draft_id_to_target_id`
+        // to drive the synthetic-blob builder.
+        let mut raw_manifest = canonical_manifest.clone();
+        for t in raw_manifest.iter_mut() {
+            if t.name == "draft_id_to_target_id" {
+                t.name = "d2t".to_string();
+            }
+        }
+        let blob = build_synthetic_safetensors(&raw_manifest);
+        // Loader sees `d2t` in the file, canonicalizes to
+        // `draft_id_to_target_id`, then matches the canonical manifest.
+        let w = Eagle3Weights::load(&blob, &cfg).expect("d2t normalization should work");
+        // Lookup uses canonical name — works because manifest stored
+        // canonical names, even though the file used `d2t`.
+        let map = w.tensor("draft_id_to_target_id").expect("found by canonical");
+        assert_eq!(map.shape(), &[cfg.draft_vocab_size]);
+    }
+
+    #[test]
+    fn adr_037_e3_gate_t2d_skipped_at_load_2026_05_22() {
+        // Codex Major 1 part 2: vLLM peer skips `t2d` (inverse mapping)
+        // when loading. Adding a `t2d` tensor to the synthetic blob
+        // should NOT trigger Extra error.
+        let cfg = qwen35_default();
+        let mut manifest = expected_manifest(&cfg);
+        manifest.push(ExpectedTensor::int_i64(
+            "t2d",
+            vec![cfg.vocab_size],
+        ));
+        let blob = build_synthetic_safetensors(&manifest);
+        // Original cfg expected manifest — load with cfg, NOT
+        // augmented manifest, so loader does its own resolution.
+        Eagle3Weights::load(&blob, &cfg).expect("t2d should be silently skipped");
+    }
+
+    #[test]
+    fn adr_037_e3_gate_load_validates_config_2026_05_22() {
+        // Codex Major 3: load() must call cfg.validate() at entry.
+        // Construct an invalid config and a (vacuously) tiny blob —
+        // load should fail with Config(), not panic on later math.
+        let mut cfg = qwen35_default();
+        cfg.num_q_heads = 32; // 32 * 128 = 4096 != 5120 → invariant violated
+        // Build SOME synthetic blob (empty manifest is fine since
+        // validate fires first).
+        let blob = build_synthetic_safetensors(&[]);
+        let err = Eagle3Weights::load(&blob, &cfg).unwrap_err();
+        assert!(
+            matches!(err, Eagle3WeightsError::Config(_)),
+            "expected Config error, got: {err:?}"
         );
     }
 

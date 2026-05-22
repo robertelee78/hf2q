@@ -80,6 +80,14 @@ pub struct Eagle3DrafterConfig {
     /// integer mapping tensor of shape `[draft_vocab_size]`. Peer:
     /// vLLM line 332-335.
     pub include_draft_id_mapping: bool,
+    /// If true, drafter ships its own `embed_tokens.weight` in the
+    /// safetensors file. If false, the drafter shares the target's
+    /// embedding table (no `embed_tokens.weight` in manifest). Per
+    /// vLLM peer behavior at `llama_eagle3.py:449-450`: missing
+    /// embed_tokens is valid (drafter borrows target's embeddings).
+    /// Default true for backward-compat; published EAGLE-3 checkpoints
+    /// usually omit duplicate embeddings to save disk.
+    pub has_own_embed_tokens: bool,
 }
 
 impl Eagle3DrafterConfig {
@@ -126,14 +134,34 @@ impl Eagle3DrafterConfig {
             self.num_q_heads,
             self.num_kv_heads,
         );
+        // Codex /cfa E3 Critical (2026-05-22): checked multiply
+        // before equality. Adversarial config (e.g. num_q_heads=
+        // usize::MAX / 2 + 1, head_dim=2) would wrap on raw multiply
+        // and accidentally satisfy `== hidden_size`.
+        let q_out = self.num_q_heads.checked_mul(self.head_dim).ok_or_else(|| {
+            anyhow!(
+                "num_q_heads * head_dim overflows usize (num_q_heads={}, head_dim={})",
+                self.num_q_heads,
+                self.head_dim
+            )
+        })?;
         ensure!(
-            self.num_q_heads * self.head_dim == self.hidden_size,
+            q_out == self.hidden_size,
             "num_q_heads * head_dim ({} * {} = {}) must equal hidden_size ({})",
             self.num_q_heads,
             self.head_dim,
-            self.num_q_heads * self.head_dim,
+            q_out,
             self.hidden_size,
         );
+        // kv_proj_out() reuse — checked here once so the helper can
+        // stay simple at call sites.
+        let _kv_out = self.num_kv_heads.checked_mul(self.head_dim).ok_or_else(|| {
+            anyhow!(
+                "num_kv_heads * head_dim overflows usize (num_kv_heads={}, head_dim={})",
+                self.num_kv_heads,
+                self.head_dim
+            )
+        })?;
         ensure!(self.vocab_size > 0, "vocab_size must be > 0");
         ensure!(self.draft_vocab_size > 0, "draft_vocab_size must be > 0");
         ensure!(
@@ -195,6 +223,7 @@ pub(crate) mod tests {
             attention_bias: false,
             tie_lm_head: false,
             include_draft_id_mapping: true,
+            has_own_embed_tokens: true,
         }
     }
 
