@@ -206,16 +206,27 @@ The verbatim DFlash MLX algorithm at `block_size=16`:
 
 ### 3.2 Sampling regime contracts (the coherence guarantee)
 
+> **⚠️ EMPIRICAL CORRECTION (HEAD `08fcb5d3` 2026-05-22)**: All claims of "byte-identical to single-token decode" / "byte-identical to base" in this ADR (including §3.2.1, §3.2.3, §3.4 Phase 3/Phase 4 gates, Phase 6 success criteria, §1 family table at lines 48-51, §2 premise at line 62, §5 review takeaways at lines 933/1067/1142) are HISTORICAL. Empirical work at HEAD `08fcb5d3` across 4 spec-decode paths (DFlash Qwen35, DFlash Gemma Option A/C, MTP K=1 BATCHED, N-gram) falsified the byte-identity claim. The valid invariant is **accept-walk consistency with the spec path's OWN batched-prefill verifier argmax**, NOT byte-identity to F32 single-token decode. Root cause: batched-prefill verifier kernels (F16-with-blk, BF16 `flash_attn_prefill_resume`, BF16 K+1 MTP verify) differ from F32 `flash_attn_vec`; argmax flips on close logits compound across rounds. See ADR-034 §START HERE G3 row at line 1501 + §3.5b empirical caveat at line 1654 for the full framework-level analysis. Production gates referenced in this ADR's Phase 3/4 would FAIL past divergence windows (Qwen35 ~30 tok, Gemma Option A ~135 tok, Gemma Option C/N-gram from token 1, MTP ~14 tok); they need re-scope to accept-walk-internal consistency.
+
 This is the load-bearing decision that satisfies "we need to ensure that we do not lose coherence":
 
-#### 3.2.1 Greedy (temperature=0) — byte-identical guarantee
+#### 3.2.1 Greedy (temperature=0) — accept-walk consistency invariant (NOT byte-identity to base)
 
-At temperature=0, the spec-decode loop is **provably byte-identical** to single-token decode by the following argument (per `verifier.rs:117-125` and Leviathan 2023):
-- `accept_prefix` only accepts `draft[i]` if `draft[i] == argmax(target_logits[i])`
-- At the first mismatch, the accepted token is `argmax(target_logits[i])` — exactly what single-token greedy decode would emit
-- After accept_count tokens, KV state is identical (within numerical noise — see §3.2.3) to what single-token decode would have produced
+**HISTORICAL framing was "provably byte-identical to single-token decode"** — empirically FALSIFIED at HEAD `08fcb5d3` 2026-05-22. See top-level CAVEAT at §3.2 above + ADR-034 §START HERE G3 row at line 1501 + §3.5b empirical caveat at line 1654 for the full framework-level correction.
 
-**Production gate**: at temp=0, `scripts/coherence-harness/determinism_check.sh` must produce byte-identical output between `HF2Q_SPEC_DFLASH=0` and `HF2Q_SPEC_DFLASH=1` on all 18 coherence golden prompts. This is a **hard merge-blocking gate** — no exceptions.
+At temperature=0, the spec-decode loop emits tokens consistent with the spec path's OWN batched-prefill verifier argmax (per `verifier.rs:117-125` and Leviathan 2023):
+- `accept_prefix` only accepts `draft[i]` if `draft[i] == argmax(verifier_logits[i])` (the verifier's argmax, NOT single-token decode's argmax)
+- At the first mismatch, the accepted token is `argmax(verifier_logits[i])`
+- After accept_count tokens, KV state is consistent with what the same batched-prefill verifier would have produced sequentially
+
+**This is NOT byte-identity to single-token decode.** The batched-prefill verifier kernel (default F16-with-blk, or BF16 `flash_attn_prefill_resume` in xlen mode) differs from F32 `flash_attn_vec` single-token decode; argmax flips on close logits compound across rounds. Empirical divergence windows at HEAD `08fcb5d3`:
+- Qwen35 DFlash (27B Q8_0): diverges from base at ~30 tokens
+- Gemma DFlash Option A (26B Q5_K_M, HF2Q_FULL_F16_KV=1): byte-identical for ~135 tokens then diverges via single-token argmax flip (`element` → `term`)
+- Gemma DFlash Option C: diverges from token 1
+- N-gram speculation: diverges from token 1
+- MTP K=1 BATCHED: diverges at ~14 tokens
+
+**Production gate (HISTORICAL framing — falsified)**: `scripts/coherence-harness/determinism_check.sh` was designed to produce byte-identical output between `HF2Q_SPEC_DFLASH=0` and `HF2Q_SPEC_DFLASH=1` on 18 coherence golden prompts. This gate would FAIL past the divergence window. Needs re-scope to accept-walk-internal consistency (spec output matches what its OWN batched verifier would emit on the same KV state) — see ADR-034 G3 row.
 
 #### 3.2.2 Stochastic (temperature>0) — distribution-preserving rejection sampling
 
@@ -241,13 +252,20 @@ This preserves the **exact target distribution** (Leviathan §2.3 proof). The im
 
 All three thresholds derived from Leviathan §4 + vLLM's `tests/spec_decode/test_rejection_sampler.py` empirical bounds.
 
-#### 3.2.3 Numerical-noise floor (the one place greedy is NOT byte-identical)
+#### 3.2.3 Numerical-noise floor — EMPIRICALLY argmax DOES flip across rounds (HISTORICAL "never" claim falsified)
 
-Single-token decode runs one token through 30 layers; multi-token verify runs 16 tokens through 30 layers in batched form. The batched matmuls have slightly different reduction order than single-token matvecs (different SIMD lane assignment). This is a known F32 floating-point non-associativity issue — typical numerical delta is ≤ 1e-6 per layer, accumulating to ≤ 1e-4 at lm_head.
+Single-token decode runs one token through 30 layers via F32 `flash_attn_vec`; multi-token verify runs K+1 tokens through 30 layers via the batched-prefill kernel (default F16-with-blk, or BF16 `flash_attn_prefill_resume` in xlen mode). The batched matmuls have different reduction order than single-token matvecs (different SIMD lane assignment + different precision) — F32/BF16/F16 floating-point non-associativity. Typical numerical delta is ≤ 1e-6 per layer, accumulating to ≤ 1e-4 at lm_head.
 
-Empirically (per ADR-028 iter-93 fused-norm work), this delta has **never** flipped an argmax on the golden fixtures. But to be safe:
-- **Phase 3 gate** (§4.3): run the determinism check on all 18 golden fixtures + 100 randomly-generated 64-token prompts from `tests/fixtures/random_prompts.jsonl`. If any argmax flip is observed, escalate to operator before proceeding to Phase 4.
-- **Mitigation if observed**: introduce `HF2Q_SPEC_DFLASH_GREEDY_TIEBREAK=1` flag that forces the verify forward to use the same matmul kernel call sequence as single-token decode at the cost of ~5% verify-pass overhead. Default OFF; operator-flagged ON only if golden-fixture flip observed.
+**Empirical correction at HEAD `08fcb5d3` 2026-05-22**: The HISTORICAL claim "this delta has **never** flipped an argmax on the golden fixtures" is FALSIFIED. Argmax DOES flip on close logits across ADR-034's four spec-decode families (with Gemma Option A/C split as two subpaths below):
+- Qwen35 DFlash 27B Fibonacci 32 tok: `def fibonacci(n):` (DFlash) vs `def fibonacci(n: int) -> list:` (base) — argmax flip at token ~10
+- Gemma Option A 256 tok: `element` (base) vs `term` (Option A) — single-token argmax flip at ~135
+- Gemma Option C: divergence from token 1
+- N-gram: divergence from token 1 (`implement an iterative Fibonacci function` vs base `implement this using an iterative approach`)
+- MTP K=1 BATCHED essay: `rapidly` (base) vs `weekly` (MTP) — argmax flip at position ~14
+
+The Phase 3 determinism check would have observed these flips (the gate was never actually run end-to-end on real models past the divergence window). The HF2Q_SPEC_DFLASH_GREEDY_TIEBREAK mitigation flag was never implemented because the kernel divergence isn't a simple noise floor — it's a structural property of different verifier kernels.
+
+The correct framing per ADR-034 §3.5b: the Leviathan-2023 proof's scope is the VERIFIER's distribution, not the single-token decode kernel's distribution. The accept-walk consistency invariant holds within-orchestrator; byte-identity to single-token decode does not.
 
 ### 3.3 Module layout
 
