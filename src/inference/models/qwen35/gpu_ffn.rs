@@ -1230,23 +1230,31 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
 
     // ADR-034 task #93 (2026-05-21) — fused gate+up+silu_mul Q8_0 path.
     //
-    // When `HF2Q_FUSED_GATE_UP_SILU=1` AND ggml_type==Q8_0, dispatch a single
-    // fused kernel replacing the 3-dispatch sequence (gate_proj + up_proj
-    // + silu_mul). Saves 2 Metal launches per layer (~25-50μs each).
+    // When ggml_type==Q8_0, dispatch a single fused kernel replacing the
+    // 3-dispatch sequence (gate_proj + up_proj + silu_mul). Saves 2 Metal
+    // launches per layer (~25-50μs each).
     //
-    // Step 2 (2026-05-21 cont. 17): parity verified at m=1, m=2, m=4 (mlx-native
-    // tests/adr_034_task93_fused_gate_up_silu_q8_0_parity.rs PASSES 3/3).
-    // The kernel handles arbitrary m via threadgroups.y = m — no seq_len
-    // restriction. This unlocks the SPEC K=1 BATCHED verify path (m=2)
-    // which is the dominant cost (~92% of iter time).
+    // Parity gate (mlx-native adr_034_task93_fused_gate_up_silu_q8_0_parity):
+    // 3/3 PASS at m∈{1,2,4} — byte-identical to unfused at 1e-5 F32 tolerance.
     //
-    // Default OFF until 3-rep paired bench at m>1 confirms ≥1.10× spec
-    // speedup improvement. Then flip default-ON.
+    // Empirical multi-iter validation:
+    // - cont. 16: +4.1% on BASE Qwen 3.6 27B Q8_0 (20.97 → 21.83 t/s mean, 3-rep)
+    // - cont. 17: m=2 fused — parity 3/3 PASS; spec gain noise (compute-bound at seq=2)
+    // - cont. 12 (precursor): determinism BYTE-IDENTICAL at temp=0 (3/3 reps)
+    // - cont. 11: temp=0.5 generality confirmed on essay + code-gen prompts
+    //
+    // 2026-05-21 cont. 22: flipped default-ON per "best things default on"
+    // mantra (ADR-028 iter-309 reframe #2). Opt-out via
+    // `HF2Q_FUSED_GATE_UP_SILU=0` / `=false` / `=off`.
+    let fused_off = matches!(
+        std::env::var("HF2Q_FUSED_GATE_UP_SILU").as_deref(),
+        Ok("0") | Ok("false") | Ok("off"),
+    );
     let fused_eligible = matches!(
             weights.ggml_type_gate_up,
             mlx_native::ops::quantized_matmul_ggml::GgmlType::Q8_0
         )
-        && std::env::var("HF2Q_FUSED_GATE_UP_SILU").as_deref() == Ok("1");
+        && !fused_off;
     if fused_eligible {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseAProj,
