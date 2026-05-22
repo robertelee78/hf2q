@@ -59,16 +59,42 @@
 //!       prior_captured, verify_captured, n_committed)
 //! ```
 //!
-//! ## Greedy byte-identity invariant
+//! ## Greedy accept-walk consistency invariant (NOT byte-identity to base)
 //!
-//! At temperature=0, this orchestrator emits tokens byte-identical to
-//! single-token Qwen35 decode for the same prompt. Proof chain:
+//! At temperature=0, this orchestrator emits tokens that match its OWN
+//! K+1-token batched verifier's argmax at each accepted position. Proof
+//! chain:
 //! - `step_round_from_argmaxes` only accepts a draft when it equals the
 //!   target's argmax at that position.
-//! - The "free" continuation at `accept_count` is the target's argmax —
-//!   exactly what single-token decode would emit there.
+//! - The "free" continuation at `accept_count` is the target's argmax
+//!   from the same batched verifier forward.
 //! - `Qwen35DFlashTarget::rollback_kv` (task #78 Step 3b) discards the
 //!   rejected K - accept_count positions across full-attn + MTP + LA.
+//!
+//! **HOWEVER, this is NOT byte-identical to single-token Qwen35 decode**
+//! (empirical at HEAD 334008e9 2026-05-22, Qwen 3.6 27B Q8_0, Fibonacci
+//! prompt, 32 tok temp=0): single-token decode emits
+//! `"def fibonacci(n: int) -> list:\n    \"\"\"\n    Compute the
+//! Fibonacci numbers iteratively..."` (typed, well-structured) while
+//! DFlash emits `"def fibonacci(n):\n    if n <= 0:\n        return 0\n
+//! elif n == 1\n    a, b"` (untyped, broken grammar). Root cause is the
+//! same BF16-vs-F32 precision divergence documented at ADR-034 §START
+//! HERE "Output divergence note" — DFlash uses the BF16
+//! `flash_attn_prefill_resume` verifier (because batched verify needs
+//! K+1 tokens at offset positions), while single-token decode uses the
+//! F32 `flash_attn_vec` kernel. Argmax flips on close logits compound
+//! across rounds → different complete continuation.
+//!
+//! Production guidance: DFlash on Qwen35 is research-quality only. The
+//! output is BOTH non-byte-identical to base AND visibly coherence-
+//! degraded at longer lengths (empirical at HEAD 334008e9: 27B
+//! Fibonacci 128-tok run produced `a, b =  a, b =  a, b = b, a + b =
+//! b, a + b, a + b` followed by EOS + loop back into
+//! `<|im_end|><|im_start|>user` chat markers + duplicated lines in
+//! the thinking process; 35B-A3B Fibonacci 128-tok run produced
+//! duplicated `def fibonacci(n):` + duplicated `return [0]` lines).
+//! For production use, switch to `HF2Q_SPEC_DECODE=1 --temperature 0`
+//! (code-gen 1.37× base) or `0.5` (essay 1.26× base).
 //!
 //! ## Non-greedy (Metropolis-Hastings) is out of scope here
 //!

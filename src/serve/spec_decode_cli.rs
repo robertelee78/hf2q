@@ -270,18 +270,27 @@ fn resolve_qwen35_drafter_path() -> Result<PathBuf> {
 ///
 /// ## Correctness vs performance
 ///
-/// At temperature=0 (greedy), output is byte-identical to single-token
-/// Qwen35 decode per the orchestrator's `step_round_from_argmaxes`
-/// + greedy-byte-identity proof (see `qwen35_orchestrator.rs` module
-/// doc).
+/// At temperature=0 (greedy), the orchestrator's accept-walk emits
+/// tokens consistent with its OWN batched verifier's argmax at each
+/// accepted position. This is NOT byte-identical to single-token
+/// Qwen35 decode output — empirical at HEAD 334008e9 shows divergence
+/// at 32 tokens already (root cause: BF16 prefill_resume verifier vs
+/// F32 flash_attn_vec single-token decode). See `qwen35_orchestrator.rs`
+/// module doc for the full empirical evidence and ADR-034's "Output
+/// divergence note" for the same phenomenon affecting MTP K=1 BATCHED.
 ///
-/// Performance is UNVALIDATED at the time of wiring (Step 4). Cell C
-/// Gemma 4 DFlash was empirically 4.8x SLOWER than baseline because the
-/// MlxModelWeights orchestrator uses Option C re-prefill. The Qwen35
-/// orchestrator uses Option A (xlen verify) which avoids the
-/// re-prefill — first empirical bench result will determine whether
-/// Qwen35 DFlash beats the current production winner (MTP K=1 BATCHED
-/// MH at 25.6 tok/s on Qwen 3.6 27B).
+/// Performance VALIDATED (post-task #95 closure 2026-05-22 at HEAD
+/// 334008e9, 128 tok 3-rep paired): Qwen35 DFlash is research-quality —
+/// 27B DFlash 23.17 t/s = 0.77x of MTP K=1 greedy production winner
+/// (was 0.62x pre-task-#95; the compile-drafter lever shipped +26%
+/// cumulative); 35B-A3B DFlash 42.7 t/s = 0.31x of base autoregressive
+/// (136.1) or 0.43x of MTP K=1 BATCHED forced (98.6). Both show
+/// duplication artifacts (row-N kernel divergence). The Qwen35
+/// orchestrator uses Option A (xlen verify) so the per-round forward
+/// is incremental, NOT the Option C re-prefill that makes Gemma Cell C
+/// 0.25x of base (per ADR-034 line 38 empirical at HEAD 7da12c37).
+/// Closure to production parity needs drafter training
+/// or tree decoding (multi-week).
 pub fn try_dispatch_qwen35_dflash_spec_decode(
     model: &mut crate::inference::models::qwen35::model::Qwen35Model,
     prompt_tokens: &[u32],
@@ -293,35 +302,48 @@ pub fn try_dispatch_qwen35_dflash_spec_decode(
     if std::env::var("HF2Q_SPEC_DFLASH").as_deref() != Ok("1") {
         return Ok(None);
     }
-    // ADR-034 task #78 Step 5 (2026-05-21) — empirical bench result at
-    // HEAD e10946cf on Qwen 3.6 27B Q8_0 + 128 tokens + temp=0:
-    //   BS=2:  16.1 tok/s    (best DFlash result)
-    //   BS=4:  12.3 tok/s
-    //   BS=8:   8.7 tok/s
-    //   BS=16:  3.8 tok/s    (drafter default)
-    //   ----
-    //   Base MTP K=1 BATCHED MH: 30.2 tok/s @ 92.4% accept
+    // ADR-034 task #95 closure + 35B-A3B empirical (2026-05-22) — bench
+    // result at HEAD 334008e9 on Qwen 3.6 27B Q8_0 + Qwen 3.5 35B-A3B Q4_K_M,
+    // 128 tokens, temp=0 greedy, 3-rep paired:
     //
-    // DFlash on Qwen35 is currently 0.53x the production winner at the
-    // optimal block_size. Root cause: K+1 batched verify uses the BF16
-    // prefill_resume kernel which is slower per-token than the F32
-    // flash_attn_vec single-token decode used by MTP K=1. Task #89
-    // (forward_gpu_batched_decode for seq_len[2,8]) is the prerequisite
-    // to close this gap.
+    //   Qwen 3.6 27B dense MTP target + 27B DFlash drafter:
+    //     DFlash BS=4: 23.17 tok/s  (post-task #95 +26% over pre-#95 18.4)
+    //     MTP K=1 greedy code-gen winner: 30.0 tok/s @ 91% accept
+    //     DFlash / MTP greedy = 0.77x  (was 0.62x pre-#95)
     //
-    // Correctness: verified greedy-coherent (orchestrator emitted a
-    // valid haiku at BS=16 vs base path's degenerate "test coverage:"
-    // loop on the same prompt — see commit e10946cf bench data).
+    //   Qwen 3.5 35B-A3B MoE MTP target + 35B-A3B DFlash drafter:
+    //     DFlash BS=4: 42.7 tok/s
+    //     Base autoregressive: 136.1 tok/s
+    //     DFlash / base = 0.31x
+    //     MTP K=1 BATCHED forced (MoE): 98.6 tok/s
+    //     DFlash / MTP K=1 = 0.43x
     //
-    // The flag is kept opt-in (default OFF) so future improvements can
-    // be validated without changing production behavior.
+    // Coherence: both targets produce coherence-degraded text at temp=0
+    // greedy. 27B Fibonacci 128-tok run becomes garbled at ~30 tok
+    // (`a, b =  a, b =  a, b = b, a + b = b, a + b, a + b` + return wrong
+    // type), hits EOS, loops back into `<|im_end|><|im_start|>user` chat
+    // markers, and duplicates lines in the thinking process. 35B-A3B
+    // Fibonacci 128-tok run shows duplicated `def fibonacci(n):` +
+    // duplicated `return [0]` lines but stays closer to the structure.
+    // Same row-N kernel divergence pattern as K=N MTP (see ADR-034
+    // §K=N CORRECTION block). NOT a DN-rollback issue (task #90 SHIPPED).
+    //
+    // Closure to production parity needs drafter training (smaller/faster
+    // drafter) or tree decoding (EAGLE-2/Medusa) bypassing the chained
+    // accept-walk. Both multi-week scope.
+    //
+    // The flag is kept opt-in (default OFF) so users default to the
+    // production winner (MTP K=1 greedy code-gen / MH temp=0.5 essay).
     eprintln!(
-        "[HF2Q_SPEC_DFLASH=1 qwen35] WARNING: empirical bench (2026-05-21) shows \
-         DFlash at best ~0.53x production MTP K=1 BATCHED MH path (16 vs 30 tok/s \
-         on Qwen 3.6 27B Q8_0). Root cause: BF16 prefill_resume per-token cost; \
-         task #89 (batched_decode for seq_len[2,8]) is the prerequisite to close \
-         the gap. Use HF2Q_SPEC_DECODE=1 + --temperature 0.5 for the production \
-         winner instead."
+        "[HF2Q_SPEC_DFLASH=1 qwen35] WARNING: empirical bench (HEAD 334008e9 2026-05-22, \
+         128 tok 3-rep paired) — DFlash is research-quality on Qwen35: 27B DFlash \
+         23.17 t/s = 0.77x of MTP K=1 greedy (was 0.62x pre-task #95); 35B-A3B DFlash \
+         42.7 t/s = 0.31x of base (136.1) or 0.43x of MTP K=1 BATCHED (98.6). Output \
+         is coherence-degraded at longer lengths (27B Fibonacci 128-tok becomes \
+         garbled `a, b = a, b = ...` + hits EOS + loops into chat markers; 35B-A3B \
+         shows duplicated lines). Row-N kernel divergence vs single-token decode. \
+         For production use HF2Q_SPEC_DECODE=1 --temperature 0 (code-gen 1.37x base) \
+         or 0.5 (essay 1.26x base)."
     );
 
     use crate::inference::spec_decode::dflash::{

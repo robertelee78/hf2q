@@ -50,11 +50,18 @@ use super::hidden_capture::DFlashCaptureSession;
 ///
 /// # Byte-identity contract
 ///
-/// `forward_decode_verify_batched` MUST be a pure dispatcher-equivalent
-/// of K+1 sequential single-token decodes (no semantic change vs the
-/// non-DFlash decode path). This is what enables the orchestrator's
-/// greedy byte-identity invariant: at temperature=0, DFlash's committed
-/// tokens are byte-identical to what single-token decode would emit.
+/// `forward_decode_verify_batched` MUST be a dispatcher-equivalent of
+/// K+1 sequential single-token decodes IN TERMS OF KV-CACHE STATE
+/// PROGRESSION (the K+1 forwards advance the cache by K+1 positions
+/// regardless of which verifier kernel is used). It does NOT
+/// guarantee byte-identical logits/argmax to the single-token F32
+/// `flash_attn_vec` kernel — the batched verify uses a DIFFERENT
+/// kernel (e.g. BF16 `flash_attn_prefill_resume` on Qwen35) and
+/// argmax can flip on close logits. Empirical: Qwen35 DFlash on
+/// Qwen 3.6 27B emits different output from single-token decode at
+/// 32 tokens already (see `qwen35_orchestrator.rs` module doc). The
+/// orchestrator's accept-walk only guarantees consistency with its
+/// own batched verifier, not with single-token decode.
 pub trait DFlashTarget {
     /// Install a DFlash hidden-capture session so the next
     /// `forward_decode_verify_batched` populates it with per-position
