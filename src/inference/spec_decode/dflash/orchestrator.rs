@@ -141,8 +141,8 @@ pub fn step_round_from_argmaxes(
 /// single-token decode would emit at that position; `accept_prefix_argmax`
 /// only accepts drafts that match those argmaxes, falling through to
 /// target's own argmax at the first mismatch.
-pub fn dispatch_dflash_spec_decode_round_target_side(
-    target: &mut crate::serve::forward_mlx::MlxModelWeights,
+pub fn dispatch_dflash_spec_decode_round_target_side<T: super::target::DFlashTarget>(
+    target: &mut T,
     last_committed_token: u32,
     drafts: &[u32],
     current_seq_pos: usize,
