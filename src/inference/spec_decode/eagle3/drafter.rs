@@ -108,6 +108,154 @@ pub trait Drafter {
     ) -> Result<Vec<DraftCandidate>>;
 }
 
+/// ADR-037 Phase E4b.10a (2026-05-22) — CPU-side top-K extraction
+/// from F32 logits. Used by GPU drafter implementations after
+/// downloading the lm_head output to convert logits → top-K
+/// DraftCandidates conforming to the Phase E4a contract.
+///
+/// Algorithm:
+/// 1. Compute log_softmax for numerical-stable log probabilities:
+///        max_logit = max(logits)
+///        log_sumexp = max_logit + log(sum(exp(logits - max_logit)))
+///        log_prob[i] = logits[i] - log_sumexp
+/// 2. Partial sort by log_prob descending via BinaryHeap of size K.
+/// 3. Clamp any extreme log_probs at `LOG_PROB_FLOOR` so the
+///    expansion algorithm's finite-check (per `validate_candidates`)
+///    passes even at deep-tail tokens with log_prob ≈ -inf.
+///
+/// Complexity: O(V log K) where V = vocab_size, K = top_k.
+///
+/// # Errors
+/// Returns `Err` if:
+/// - `row_logits` is empty
+/// - `top_k` is 0
+/// - any logit is non-finite (NaN/inf — drafter contract requires
+///   finite inputs; the lm_head GEMM should not produce these on
+///   sane weights)
+///
+/// # Returns
+/// Up to `top_k` candidates ordered by log_prob descending,
+/// passing `validate_candidates`. May return fewer than `top_k`
+/// if `row_logits.len() < top_k`.
+pub fn extract_top_k_from_row_logits(
+    row_logits: &[f32],
+    top_k: usize,
+) -> Result<Vec<DraftCandidate>> {
+    ensure!(
+        !row_logits.is_empty(),
+        "extract_top_k: row_logits is empty"
+    );
+    ensure!(top_k > 0, "extract_top_k: top_k must be > 0");
+
+    // Validate finite logits (drafter contract).
+    for (i, &v) in row_logits.iter().enumerate() {
+        ensure!(
+            v.is_finite(),
+            "extract_top_k: row_logits[{}] = {} is not finite",
+            i,
+            v
+        );
+    }
+
+    // Reject vocab sizes that don't fit in u32 (DraftCandidate.token is u32).
+    ensure!(
+        row_logits.len() <= (u32::MAX as usize),
+        "extract_top_k: row_logits.len() ({}) exceeds u32::MAX",
+        row_logits.len()
+    );
+
+    let effective_k = top_k.min(row_logits.len());
+
+    // Compute log_sumexp in f64 for stability.
+    let max_logit: f32 = row_logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut sum_exp: f64 = 0.0;
+    for &v in row_logits.iter() {
+        sum_exp += ((v - max_logit) as f64).exp();
+    }
+    // sum_exp >= 1 (since e^0 = 1 contributed by max_logit).
+    let log_sumexp = (max_logit as f64) + sum_exp.ln();
+
+    // Partial sort via min-heap of size K: pop smallest each iteration
+    // when heap is full and new item is larger. `BinaryHeap` is a
+    // max-heap by default; wrap in `Reverse` to make it a min-heap.
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    /// Local comparable wrapper so f32 can be ordered via total_cmp
+    /// (handles NaN already rejected; this is for the deterministic
+    /// tiebreaker by token id when log_probs are equal).
+    #[derive(Debug, Clone, Copy)]
+    struct LogProbToken {
+        log_prob: f32,
+        token: u32,
+    }
+    impl PartialEq for LogProbToken {
+        fn eq(&self, other: &Self) -> bool {
+            self.log_prob == other.log_prob && self.token == other.token
+        }
+    }
+    impl Eq for LogProbToken {}
+    impl Ord for LogProbToken {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            // Order by log_prob ASC for min-heap semantics. Tiebreak
+            // by SMALLER token first (deterministic, matches typical
+            // argmax behavior).
+            self.log_prob
+                .partial_cmp(&other.log_prob)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| other.token.cmp(&self.token))
+        }
+    }
+    impl PartialOrd for LogProbToken {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut heap: BinaryHeap<Reverse<LogProbToken>> = BinaryHeap::with_capacity(effective_k + 1);
+    for (i, &v) in row_logits.iter().enumerate() {
+        let log_prob_f64 = (v as f64) - log_sumexp;
+        let log_prob = if log_prob_f64.is_finite() {
+            (log_prob_f64 as f32).max(LOG_PROB_FLOOR)
+        } else {
+            LOG_PROB_FLOOR
+        };
+        let candidate = LogProbToken {
+            log_prob,
+            token: i as u32,
+        };
+        if heap.len() < effective_k {
+            heap.push(Reverse(candidate));
+        } else if let Some(Reverse(min)) = heap.peek() {
+            // Larger log_prob ALWAYS replaces; equal log_prob with
+            // SMALLER token replaces (matches LogProbToken's Ord).
+            if candidate > *min {
+                heap.pop();
+                heap.push(Reverse(candidate));
+            }
+        }
+    }
+
+    // Drain heap → sort descending by log_prob.
+    let mut out: Vec<DraftCandidate> = heap
+        .into_iter()
+        .map(|Reverse(lpt)| DraftCandidate {
+            token: lpt.token,
+            log_prob: lpt.log_prob,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.log_prob
+            .partial_cmp(&a.log_prob)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.token.cmp(&b.token))
+    });
+    Ok(out)
+}
+
 /// Validate a `predict_topk` result. Used by the expansion algorithm
 /// at every drafter call site so a buggy drafter implementation
 /// fails fast with a clear diagnostic rather than corrupting the
@@ -345,6 +493,131 @@ mod tests {
         assert_eq!(view.path_tokens(0), vec![10]);
         assert_eq!(view.path_tokens(1), vec![10, 20]);
         assert_eq!(view.path_tokens(2), vec![10, 20, 30]);
+    }
+
+    // ----------------------------------------------------------------
+    // Phase E4b.10a tests — top-K extraction
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn adr_037_e4b10a_top_k_basic_descending_2026_05_22() {
+        // Logits [3, 1, 2, 0]; top-3 should be (0, 3.0), (2, 2.0), (1, 1.0).
+        // log_softmax base = log(e^3 + e^1 + e^2 + e^0) ≈ 3.44
+        // log_probs: [3-3.44, 1-3.44, 2-3.44, 0-3.44] = [-0.44, -2.44, -1.44, -3.44]
+        let logits = vec![3.0f32, 1.0, 2.0, 0.0];
+        let out = extract_top_k_from_row_logits(&logits, 3).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].token, 0);
+        assert_eq!(out[1].token, 2);
+        assert_eq!(out[2].token, 1);
+        // Validate via Phase E4a contract.
+        validate_candidates(&out, 3).expect("must pass validate_candidates");
+    }
+
+    #[test]
+    fn adr_037_e4b10a_top_k_log_probs_sum_via_softmax_2026_05_22() {
+        // Sanity: log_softmax of [a, a, a] gives log_prob = -ln(N) for each.
+        // Pick logits [0, 0, 0, 0] → log_prob = -ln(4) ≈ -1.386 for all.
+        let logits = vec![0.0f32; 4];
+        let out = extract_top_k_from_row_logits(&logits, 4).unwrap();
+        assert_eq!(out.len(), 4);
+        let expected = -(4.0f32).ln();
+        for c in &out {
+            assert!(
+                (c.log_prob - expected).abs() < 1e-5,
+                "log_prob {} != {expected}",
+                c.log_prob
+            );
+        }
+    }
+
+    #[test]
+    fn adr_037_e4b10a_top_k_returns_at_most_vocab_size_2026_05_22() {
+        // top_k > vocab_size → returns vocab_size candidates.
+        let logits = vec![1.0f32, 2.0, 3.0];
+        let out = extract_top_k_from_row_logits(&logits, 10).unwrap();
+        assert_eq!(out.len(), 3, "vocab=3 caps the output count");
+        // Descending order.
+        assert_eq!(out[0].token, 2);
+        assert_eq!(out[1].token, 1);
+        assert_eq!(out[2].token, 0);
+    }
+
+    #[test]
+    fn adr_037_e4b10a_top_k_rejects_empty_logits_2026_05_22() {
+        let err = extract_top_k_from_row_logits(&[], 1).unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn adr_037_e4b10a_top_k_rejects_top_k_zero_2026_05_22() {
+        let err = extract_top_k_from_row_logits(&[1.0, 2.0], 0).unwrap_err();
+        assert!(err.to_string().contains("top_k must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn adr_037_e4b10a_top_k_rejects_nan_logit_2026_05_22() {
+        let logits = vec![1.0f32, f32::NAN, 2.0];
+        let err = extract_top_k_from_row_logits(&logits, 2).unwrap_err();
+        assert!(err.to_string().contains("not finite"), "got: {err}");
+    }
+
+    #[test]
+    fn adr_037_e4b10a_top_k_rejects_inf_logit_2026_05_22() {
+        let logits = vec![1.0f32, f32::INFINITY, 2.0];
+        let err = extract_top_k_from_row_logits(&logits, 2).unwrap_err();
+        assert!(err.to_string().contains("not finite"), "got: {err}");
+    }
+
+    #[test]
+    fn adr_037_e4b10a_top_k_deterministic_tie_break_by_smaller_token_2026_05_22() {
+        // All logits equal → top-2 = (token 0, token 1) by deterministic
+        // tiebreaker (smaller token wins on log_prob ties).
+        let logits = vec![5.0f32; 10];
+        let out = extract_top_k_from_row_logits(&logits, 2).unwrap();
+        assert_eq!(out.len(), 2);
+        // Per LogProbToken's Ord, smaller token "wins" → top-2 are
+        // tokens 0 and 1 (smallest).
+        let mut tokens: Vec<u32> = out.iter().map(|c| c.token).collect();
+        tokens.sort();
+        assert_eq!(tokens, vec![0, 1]);
+        // Both log_probs equal -ln(10).
+        let expected = -(10.0f32).ln();
+        for c in &out {
+            assert!((c.log_prob - expected).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn adr_037_e4b10a_top_k_passes_validate_candidates_2026_05_22() {
+        // Sanity-check the Phase E4a contract: returned candidates
+        // must pass validate_candidates(top_k).
+        let logits: Vec<f32> = (0..1000).map(|i| (i as f32) * 0.01 - 5.0).collect();
+        let out = extract_top_k_from_row_logits(&logits, 10).unwrap();
+        validate_candidates(&out, 10).expect("Phase E4a contract");
+    }
+
+    #[test]
+    fn adr_037_e4b10a_top_k_clamps_extreme_log_probs_at_floor_2026_05_22() {
+        // Very large logit differences → extreme log_probs that
+        // might underflow to -inf without clamping. Verify the
+        // floor protects against this.
+        // logit[0] = 100, others = 0 → log_softmax for token 0 ≈ 0;
+        // for others ≈ -100. The -100 is finite so no clamp fires
+        // unless log_sumexp computation collides.
+        // For a true test of LOG_PROB_FLOOR, we'd need values that
+        // overflow to -inf; here we just check finiteness.
+        let logits = vec![100.0f32, 0.0, 0.0, 0.0];
+        let out = extract_top_k_from_row_logits(&logits, 4).unwrap();
+        for c in &out {
+            assert!(c.log_prob.is_finite(), "log_prob must be finite");
+            assert!(
+                c.log_prob >= LOG_PROB_FLOOR,
+                "log_prob {} below floor {}",
+                c.log_prob,
+                LOG_PROB_FLOOR
+            );
+        }
     }
 
     #[test]
