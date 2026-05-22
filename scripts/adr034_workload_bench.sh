@@ -188,8 +188,9 @@ echo "    temp=0.3: 26.27 @ 69.3% = 1.20× | temp=0.5: 27.53 @ 77.8% = 1.26× WI
 echo "    Accept rate PEAKS at temp=0.5 (77.8%); sharp drop to 58% at temp=0.7. The --temperature 0.5 production recommendation is empirically validated as the MH accept-rate optimum."
 echo "  Prompt-length sweep MTP K=1 greedy code-gen at HEAD f8cffd53 / 4a294830 (1-rep, gen 64 tok):"
 echo "    short prompt (~13 tok):  Base 22.1, MTP 29.1 @ 88.2% = 1.32× | med (~212 tok): Base 22.0, MTP 31.2 @ 96.9% = 1.42× | long (~812 tok): Base 21.8, MTP 30.1 @ 100% = 1.38×"
-echo "    EXTENDED:  2K (~2012 tok): Base 21.1, MTP 24.0 @ 61.5% = 1.14× (DEGRADES) | 4K (~4012 tok): Base 20.1, MTP 12.6 @ 82.9% = 0.63× (REGRESSES vs base)"
-echo "    Production winner SCALES at ≤~1K tok, DEGRADES at 2K, NET-NEGATIVE at 4K. Use HF2Q_SPEC_DECODE=1 only for short-context workloads (≤~1K tok) until long-context regression is investigated."
+echo "    EXTENDED (SYNTHETIC):  2K (~2012 tok): Base 21.1, MTP 24.0 @ 61.5% = 1.14× (DEGRADES) | 4K (~4012 tok): Base 20.1, MTP 12.6 @ 82.9% = 0.63× (REGRESSES vs base)"
+echo "    REFINED at HEAD 81698cb5 with NATURAL ~400-tok prompt (real code-context + question, 3-rep): Base 20.93, MTP 28.57 @ 85.3% = 1.36x (matches production claim)."
+echo "    Regression at synthetic 2K/4K may be PROMPT-CONTENT dependent (synthetic repetitive filler triggers drafter pathology) — natural prompts at ~400 tok still hit 1.36x. Production recommendation REMAINS HF2Q_SPEC_DECODE=1 for typical ≤~1K natural prompts."
 echo
 echo "Production recommendation:"
 echo "  Code-gen / deterministic: HF2Q_SPEC_DECODE=1 --temperature 0     (1.36x base, MTP K=1 greedy wins)"
