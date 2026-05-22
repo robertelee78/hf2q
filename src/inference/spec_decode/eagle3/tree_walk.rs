@@ -100,17 +100,35 @@ pub fn walk_tree_accept(
 
 /// Result-like summary of an accept-walk. Wraps the indices with
 /// convenience accessors.
+///
+/// Fields are private to prevent constructing invalid summaries
+/// (codex /cfa E5a Minor 2026-05-22: public fields let callers
+/// build `AcceptWalk { accepted: vec![999], tree: &t }` where 999
+/// > t.len() — accessors would then panic on out-of-range indices).
+/// Use [`walk_and_summarize`] to construct.
 #[derive(Debug, Clone)]
 pub struct AcceptWalk<'tree> {
-    pub accepted: Vec<usize>,
-    pub tree: &'tree ExpandedTree,
+    accepted: Vec<usize>,
+    tree: &'tree ExpandedTree,
 }
 
 impl<'tree> AcceptWalk<'tree> {
-    /// Number of accepted nodes including root.
+    /// Borrow the accepted indices.
+    pub fn accepted(&self) -> &[usize] {
+        &self.accepted
+    }
+    /// Borrow the backing tree.
+    pub fn tree(&self) -> &ExpandedTree {
+        self.tree
+    }
+    /// Number of accepted nodes including root. Always >= 1 since
+    /// `walk_tree_accept` always includes root.
     pub fn len(&self) -> usize {
         self.accepted.len()
     }
+    /// Always `false` for any `AcceptWalk` constructed via
+    /// `walk_and_summarize` (root is always present). Retained for
+    /// API completeness.
     pub fn is_empty(&self) -> bool {
         self.accepted.is_empty()
     }
@@ -386,9 +404,41 @@ mod tests {
             }
         }
         let accepted = walk_tree_accept(&tree, &verifier_argmax).expect("walk");
-        // Walk should accept the longest matching chain — at least root + 1.
-        assert!(accepted.len() >= 2, "walk should accept beyond root");
+        // Codex /cfa E5a Minor (2026-05-22): tighten the integration
+        // assertion. The verifier picks the next-admitted-direct-child
+        // at each level, so the walk should follow the chain of
+        // "first child of each ancestor" all the way down.
+        //
         // First node accepted is always root.
         assert_eq!(accepted[0], 0);
+        // Walk should accept at least root + 1.
+        assert!(accepted.len() >= 2, "walk should accept beyond root");
+        // Every step (i, i+1) must follow the verifier picks: the
+        // next admitted child of accepted[i] should be accepted[i+1].
+        for w in accepted.windows(2) {
+            let parent = w[0];
+            let child = w[1];
+            assert_eq!(
+                tree.parents[child],
+                Some(parent),
+                "accept walk should follow direct-child edges"
+            );
+            assert_eq!(
+                tree.tokens[child], verifier_argmax[parent],
+                "accept walk should match verifier_argmax at each parent"
+            );
+        }
+        // Walk terminates when verifier_argmax[last_accepted] != any
+        // child's token. Check that condition holds at the leaf of
+        // the accept walk.
+        let last = *accepted.last().unwrap();
+        let no_matching_child = (last + 1..tree.len())
+            .find(|&c| tree.parents[c] == Some(last) && tree.tokens[c] == verifier_argmax[last])
+            .is_none();
+        assert!(
+            no_matching_child,
+            "walk should have stopped because no direct child of {} matches argmax {}",
+            last, verifier_argmax[last]
+        );
     }
 }
