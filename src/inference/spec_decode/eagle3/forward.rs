@@ -869,6 +869,15 @@ fn dispatch_eagle3_head_norm(
         )
         .map_err(|e| anyhow!("alloc {label} output: {e}"))?;
     let params = alloc_rms_norm_params_eagle3(device, cfg.rms_norm_eps, head_dim)?;
+    // Codex /cfa E4b.5a Major (2026-05-22): RAW barrier before
+    // dispatch_rms_norm reads `proj`. Q/K head-norm is chained
+    // after q_proj/k_proj in the orchestrator (E4b.6+), and Metal
+    // serial command queues don't insert implicit barriers between
+    // sequential compute dispatches with R/W dependency on the
+    // same buffer (see E4b.4 commit message — same class of bug
+    // caused diffs 0.156-0.794 there). Insert at the wrapper so
+    // callers don't have to remember.
+    encoder.memory_barrier();
     dispatch_rms_norm(
         encoder,
         registry,
@@ -899,6 +908,15 @@ pub fn dispatch_eagle3_q_head_norm(
     cfg: &Eagle3DrafterConfig,
     seq_len: u32,
 ) -> Result<MlxBuffer> {
+    // Codex /cfa E4b.5a Major (2026-05-22): enforce config gate at
+    // the wrapper. Without this, an inconsistent (cfg=false, tensor=Some)
+    // bundle would silently apply Q-norm in non-QK mode, feeding wrong
+    // values into RoPE.
+    if !cfg.use_qk_norm {
+        return Err(anyhow!(
+            "dispatch_eagle3_q_head_norm: cfg.use_qk_norm is false — orchestrator must check the gate before calling"
+        ));
+    }
     let q_norm = tensors.q_norm.as_ref().ok_or_else(|| {
         anyhow!(
             "dispatch_eagle3_q_head_norm: q_norm absent (use_qk_norm = {})",
@@ -931,6 +949,11 @@ pub fn dispatch_eagle3_k_head_norm(
     cfg: &Eagle3DrafterConfig,
     seq_len: u32,
 ) -> Result<MlxBuffer> {
+    if !cfg.use_qk_norm {
+        return Err(anyhow!(
+            "dispatch_eagle3_k_head_norm: cfg.use_qk_norm is false — orchestrator must check the gate before calling"
+        ));
+    }
     let k_norm = tensors.k_norm.as_ref().ok_or_else(|| {
         anyhow!(
             "dispatch_eagle3_k_head_norm: k_norm absent (use_qk_norm = {})",
@@ -2087,9 +2110,53 @@ mod tests {
             &mut enc, &mut registry, &device, &proj_gpu, &tensors, &cfg, seq_len,
         )
         .unwrap_err();
+        // Now codex /cfa Major fix gates cfg.use_qk_norm BEFORE
+        // tensor-absent check; either gate-error OR absent-error
+        // is acceptable here (gate fires first).
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("q_norm absent"),
-            "expected absent-tensor error, got: {err}"
+            msg.contains("use_qk_norm is false") || msg.contains("q_norm absent"),
+            "expected gate or absent-tensor error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e4b5a_gate_q_head_norm_rejects_when_cfg_off_with_tensor_present_2026_05_22() {
+        // Codex /cfa E4b.5a Major fix (2026-05-22): cfg gate must be
+        // enforced even when the tensor happens to be present (an
+        // inconsistent config/tensor bundle is a bug, not silent fallback).
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        // Load tensors with use_qk_norm=true (so q_norm is present)
+        let load_cfg = cfg_qk_norm_tiny();
+        let manifest = expected_manifest(&load_cfg);
+        let blob = build_blob_with_overrides(&manifest, &std::collections::HashMap::new());
+        let weights = Eagle3Weights::load(&blob, &load_cfg).expect("load");
+        let tensors =
+            Eagle3DrafterTensors::upload(&device, &load_cfg, &weights).expect("upload");
+        // But call with use_qk_norm=false (forces gate rejection)
+        let mut dispatch_cfg = load_cfg.clone();
+        dispatch_cfg.use_qk_norm = false;
+
+        let seq_len = 2_u32;
+        let n = (seq_len as usize) * dispatch_cfg.num_q_heads * dispatch_cfg.head_dim;
+        let proj_data = vec![0.0f32; n];
+        let proj_gpu = upload_f32_to_gpu(
+            &device, &proj_data,
+            vec![seq_len as usize, dispatch_cfg.num_q_heads * dispatch_cfg.head_dim],
+        );
+
+        let mut enc = device.command_encoder().expect("encoder");
+        let err = dispatch_eagle3_q_head_norm(
+            &mut enc, &mut registry, &device, &proj_gpu, &tensors, &dispatch_cfg, seq_len,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cfg.use_qk_norm is false"),
+            "expected gate error, got: {err}"
         );
     }
 
