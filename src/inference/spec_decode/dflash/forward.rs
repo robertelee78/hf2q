@@ -37,49 +37,9 @@ use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::ops::softcap::dispatch_softcap;
 use crate::inference::models::qwen35::gpu_full_attn::{
     apply_imrope, apply_linear_projection_f32, apply_sdpa_causal_from_seq_major,
-    permute_seq_head_dim_to_head_seq_dim_cpu, upload_f32,
 };
 use mlx_native::ops::sdpa::{sdpa, SdpaParams};
 use mlx_native::ops::transpose::permute_021_f32;
-
-/// Logical-bounded F32 download for DFlash drafter CPU-read sites.
-///
-/// `MlxBuffer::as_slice` returns a view of the full storage, which can
-/// be bucket-rounded by `decode_pool::pooled_alloc_buffer` (used inside
-/// `apply_imrope`). Bucket-rounded storage is safe for GPU-only feeds
-/// (the qwen35 hot path's contract), but the DFlash drafter must
-/// CPU-read the K/V projections to populate the cursor-mode cache, and
-/// the trailing bucket padding must NOT be appended.
-///
-/// This helper truncates to `buf.element_count()` (the product of the
-/// buffer's logical shape) before copying to a `Vec<f32>`. When the
-/// allocator returned a non-pooled buffer (e.g. `apply_linear_projection_f32`)
-/// `element_count()` equals storage and the helper is a no-op vs
-/// `download_f32`.
-///
-/// See `src/inference/models/qwen35/gpu_full_attn.rs:649` (apply_imrope
-/// pool alloc + the `kv_cache_slot=Some` GPU-only safety note that we
-/// explicitly do not satisfy in the DFlash drafter).
-fn download_f32_logical(buf: &MlxBuffer) -> Result<Vec<f32>> {
-    if buf.dtype() != DType::F32 {
-        return Err(anyhow!(
-            "download_f32_logical: buffer dtype {} != f32",
-            buf.dtype()
-        ));
-    }
-    let storage: &[f32] = buf.as_slice().map_err(|e| anyhow!("as_slice: {e}"))?;
-    let logical = buf.element_count();
-    if storage.len() < logical {
-        return Err(anyhow!(
-            "download_f32_logical: storage slice len {} < logical element_count {} \
-             (shape {:?})",
-            storage.len(),
-            logical,
-            buf.shape(),
-        ));
-    }
-    Ok(storage[..logical].to_vec())
-}
 
 /// Build the `[eps, dim]` F32 params buffer required by [`dispatch_rms_norm`].
 ///
@@ -872,87 +832,59 @@ pub fn dispatch_dflash_decoder_layer_attention(
 
     // -------- Phase B: GPU cache writes (in-encoder, no wait) --------
     //
-    // ADR-034 task #95 sub-iter C (2026-05-22) — was: commit_and_wait
-    // + download_f32_logical CPU memcpy + CPU cache writes. Replaced
-    // with in-encoder GPU dispatches via append_seq_major_kv_gpu +
-    // write_slack_kv_gpu (sub-iters A + B, parity-verified at
-    // mlx-native + hf2q be54bd0d).
+    // ADR-034 task #95 sub-iter C+E (2026-05-22) — in-encoder GPU
+    // dispatches via append_seq_major_kv_gpu + write_slack_kv_gpu
+    // (sub-iters A + B, parity-verified, codex /cfa clean). Cache writes
+    // happen in the SAME encoder as Phase A — RAW barrier before the
+    // kv_cache_copy kernel reads the RoPE'd K/V buffers. Metal serial
+    // queue ordering guarantees the SDPA encoder below sees the cache
+    // writes after this encoder's commit completes.
     //
-    // The cache writes happen in the SAME encoder as Phase A — after a
-    // memory_barrier so the dispatch_kv_cache_copy_seq_f32_dual kernel
-    // sees the RoPE'd K/V buffers. Metal serial queue ordering
-    // guarantees the next encoder (SDPA below) sees the cache writes
-    // after this encoder's commit completes.
-    //
-    // Env opt-out HF2Q_DFLASH_KV_CPU=1 falls back to the legacy CPU
-    // bridge for A/B testing during sub-iter D bench validation. Once
-    // sub-iter D confirms no regression (and sub-iter E ships), the
-    // opt-out and the CPU bridge are removed.
-    //
-    // RAW barrier: cache-write dispatches read k_ctx_roped / v_ctx /
-    // k_prop_roped / v_prop (written by RoPE + projections above).
+    // The HF2Q_DFLASH_KV_CPU opt-out (sub-iter D burn-in) was removed
+    // in sub-iter E (this revision) per codex /cfa verdict + 3-rep
+    // paired bench + 3 task #95 parity tests all GREEN. The legacy CPU
+    // methods (append_seq_major_kv / write_slack_kv on
+    // DFlashLayerKvCache) remain as test references and serve to
+    // anchor the parity contract in kv_cache.rs tests.
     enc.memory_barrier();
 
-    let use_cpu_bridge =
-        std::env::var("HF2Q_DFLASH_KV_CPU").as_deref() == Ok("1");
-    if use_cpu_bridge {
-        // ── Legacy CPU bridge (sub-iter D opt-out) ──
-        enc.commit_and_wait().context("layer attn: commit phase A (CPU bridge)")?;
-        let k_ctx_cpu = download_f32_logical(&k_ctx_roped).context("download k_ctx")?;
-        let v_ctx_cpu = download_f32_logical(&v_ctx).context("download v_ctx")?;
-        cache_layer
-            .append_seq_major_kv(&k_ctx_cpu, &v_ctx_cpu, s, n_kv, head_dim)
-            .context("layer attn: append ctx K/V to cache (CPU)")?;
-        debug_assert_eq!(cache_layer.seq_len, prior_offset + s);
-        let k_prop_cpu = download_f32_logical(&k_prop_roped).context("download k_prop")?;
-        let v_prop_cpu = download_f32_logical(&v_prop).context("download v_prop")?;
-        cache_layer
-            .write_slack_kv(&k_prop_cpu, &v_prop_cpu, l, n_kv, head_dim)
-            .context("layer attn: write prop K/V to cache slack (CPU)")?;
-        debug_assert_eq!(cache_layer.seq_len, prior_offset + s);
-    } else {
-        // ── Sub-iter C path: in-encoder GPU cache writes ──
-        //
-        // append_seq_major_kv_gpu first (it advances cache_layer.seq_len
-        // by s, which is required for the SDPA call's kv_seq_len
-        // computation below). write_slack_kv_gpu second; it does NOT
-        // advance seq_len (slack semantics).
-        cache_layer
-            .append_seq_major_kv_gpu(
-                &mut enc, registry, device.metal_device(),
-                &k_ctx_roped, &v_ctx, s, n_kv, head_dim,
-            )
-            .context("layer attn: append_seq_major_kv_gpu")?;
-        debug_assert_eq!(cache_layer.seq_len, prior_offset + s);
-        // Barrier between append and slack-write since both target the
-        // same cache buffers (different positions per head, but Metal
-        // MTLDispatchTypeConcurrent reorders within an encoder).
-        enc.memory_barrier();
-        cache_layer
-            .write_slack_kv_gpu(
-                &mut enc, registry, device.metal_device(),
-                &k_prop_roped, &v_prop, l, n_kv, head_dim,
-            )
-            .context("layer attn: write_slack_kv_gpu")?;
-        debug_assert_eq!(cache_layer.seq_len, prior_offset + s, "slack must not advance seq_len");
-        // commit_labeled (no wait) — Metal serial queue ordering makes
-        // the SDPA encoder below see the cache writes after this CB
-        // completes. Saves the ~500us-1ms wait latency vs the legacy
-        // commit_and_wait at the top of this branch.
-        enc.commit_labeled("dflash.decoder_layer_attention.phase_a_kv_writes");
-    }
+    // append_seq_major_kv_gpu first (advances cache_layer.seq_len by s,
+    // required for the SDPA call's kv_seq_len computation below).
+    // write_slack_kv_gpu second — does NOT advance seq_len (slack
+    // semantics; caller's reads via SDPA still see the slack as part of
+    // kv_seq_len = cache.seq_len + l).
+    cache_layer
+        .append_seq_major_kv_gpu(
+            &mut enc, registry, device.metal_device(),
+            &k_ctx_roped, &v_ctx, s, n_kv, head_dim,
+        )
+        .context("layer attn: append_seq_major_kv_gpu")?;
+    debug_assert_eq!(cache_layer.seq_len, prior_offset + s);
+    // Barrier between append and slack-write since both target the
+    // same cache buffers (different positions per head, but Metal
+    // MTLDispatchTypeConcurrent reorders within an encoder).
+    enc.memory_barrier();
+    cache_layer
+        .write_slack_kv_gpu(
+            &mut enc, registry, device.metal_device(),
+            &k_prop_roped, &v_prop, l, n_kv, head_dim,
+        )
+        .context("layer attn: write_slack_kv_gpu")?;
+    debug_assert_eq!(cache_layer.seq_len, prior_offset + s, "slack must not advance seq_len");
+    // commit_labeled (no wait) — Metal serial queue ordering makes the
+    // SDPA encoder below see the cache writes after this CB completes.
+    enc.commit_labeled("dflash.decoder_layer_attention.phase_a_kv_writes");
 
     // -------- Phase C+D: cross-length SDPA + O proj (fused encoder) --------
     //
-    // ADR-034 task #95 sub-iter G (2026-05-22) — sdpa_cross_length's
-    // GPU path no longer commits internally; o_proj fuses into the
-    // SAME encoder. Single terminal commit_and_wait at the end
-    // replaces the prior 2 commit boundaries (sdpa_enc + o_enc).
-    //
-    // CPU opt-out path (HF2Q_DFLASH_SDPA_CPU=1) still commits inside
-    // sdpa_cross_length — we detect that by re-checking the env var
-    // here so o_proj uses a fresh encoder in that branch (preserving
-    // legacy semantics for A/B parity).
+    // ADR-034 task #95 sub-iter G+E (2026-05-22) — fused encoder:
+    // sdpa_cross_length + o_proj share ONE sdpa_enc, with one terminal
+    // commit_and_wait. Replaces the prior 2-commit pattern (sdpa_enc +
+    // o_enc). The HF2Q_DFLASH_SDPA_CPU opt-out was removed in sub-iter
+    // E (this revision) per codex /cfa verdict + 3 parity tests + 3-rep
+    // paired bench all GREEN. CPU permute path retained inside
+    // sdpa_cross_length as fallback would be dead code — removed there
+    // too in this revision.
     //
     // kv_seq_len = ctx (in cache) + L (slack-written prop).
     let kv_seq_len = cache_layer.seq_len + l;
@@ -963,28 +895,11 @@ pub fn dispatch_dflash_decoder_layer_attention(
         &mut sdpa_enc, registry, device, &q_roped, cache_layer, cfg, l, kv_seq_len, do_causal,
     )
     .context("layer attn: sdpa cross-length")?;
-
-    // Branch: CPU opt-out path already committed internally; open
-    // fresh o_enc. GPU path (default) reuses sdpa_enc for o_proj fusion.
-    let attn_proj = if std::env::var("HF2Q_DFLASH_SDPA_CPU").as_deref() == Ok("1") {
-        let mut o_enc = device
-            .command_encoder()
-            .context("decoder_layer_attention: open encoder for o_proj (CPU opt-out)")?;
-        let p = dispatch_dflash_o_proj(
-            &mut o_enc, registry, device, &attn_out, layer_weights, cfg, l,
-        )
-        .context("layer attn: o_proj (CPU opt-out)")?;
-        o_enc.commit_and_wait().context("layer attn: commit o_proj (CPU opt-out)")?;
-        p
-    } else {
-        // Fused: o_proj into the SAME sdpa_enc encoder.
-        let p = dispatch_dflash_o_proj(
-            &mut sdpa_enc, registry, device, &attn_out, layer_weights, cfg, l,
-        )
-        .context("layer attn: o_proj (fused)")?;
-        sdpa_enc.commit_and_wait().context("layer attn: commit sdpa+o_proj (fused)")?;
-        p
-    };
+    let attn_proj = dispatch_dflash_o_proj(
+        &mut sdpa_enc, registry, device, &attn_out, layer_weights, cfg, l,
+    )
+    .context("layer attn: o_proj (fused)")?;
+    sdpa_enc.commit_and_wait().context("layer attn: commit sdpa+o_proj (fused)")?;
 
     Ok(attn_proj)
 }
@@ -1218,56 +1133,21 @@ pub fn dispatch_dflash_sdpa_cross_length(
     // SDPA dispatch in the SAME encoder via memory_barrier. The output
     // permute happens AFTER the SDPA dispatch in the same encoder.
     //
-    // Env opt-out HF2Q_DFLASH_SDPA_CPU=1 falls back to the legacy
-    // CPU-permute path for A/B testing during sub-iter F bench
-    // validation. Sub-iter G (later) removes the opt-out + CPU paths
-    // after burn-in.
-    //
     // Output: seq-major `[L, H_q, D]` F32 (matches the original
-    // contract). q_hm is local to this function — pooled-alloc lets it
-    // outlive the deferred commit.
+    // contract).
+    //
+    // The HF2Q_DFLASH_SDPA_CPU opt-out (sub-iter F burn-in) was removed
+    // in sub-iter E (this revision). All 3 task #95 parity tests + the
+    // 3-rep paired bench + codex /cfa audit cleared the GPU path. The
+    // CPU permute / download / upload bridges were ~50 LOC of dead-code
+    // path; removed to keep the function intent-clear.
 
     let l = q_seq_len as usize;
     let nh = n_heads as usize;
     let d = head_dim as usize;
     let out_elem = nh * l * d;
 
-    let use_cpu_permute =
-        std::env::var("HF2Q_DFLASH_SDPA_CPU").as_deref() == Ok("1");
-
-    if use_cpu_permute {
-        // ── Legacy CPU permute path (sub-iter F opt-out) ──
-        encoder.commit_and_wait().context("commit before sdpa cross-length permute (CPU)")?;
-        let q_cpu = download_f32_logical(q_seq_major)?;
-        let q_hm_cpu = permute_seq_head_dim_to_head_seq_dim_cpu(&q_cpu, l, nh, d);
-        let q_hm = upload_f32(&q_hm_cpu, device)?;
-
-        let out_hm = device
-            .alloc_buffer(out_elem * 4, DType::F32, vec![1, nh, l, d])
-            .map_err(|e| anyhow!("alloc sdpa cross-length output (CPU): {e}"))?;
-        let params = SdpaParams {
-            n_heads, n_kv_heads, head_dim,
-            seq_len: q_seq_len, kv_seq_len, scale,
-            kv_capacity: cache_layer.capacity, do_causal,
-        };
-        let mut enc2 = device.command_encoder().context("enc sdpa cross-length (CPU)")?;
-        sdpa(&mut enc2, registry, device, &q_hm, &cache_layer.keys, &cache_layer.values, &out_hm, &params, 1)
-            .map_err(|e| anyhow!("sdpa cross-length (CPU): {e}"))?;
-        enc2.commit_and_wait().context("commit sdpa cross-length (CPU)")?;
-        let out_hm_cpu = download_f32_logical(&out_hm)?;
-        let mut out_sm_cpu = vec![0.0f32; out_elem];
-        for h in 0..nh {
-            for t in 0..l {
-                let src = (h * l + t) * d;
-                let dst = (t * nh + h) * d;
-                out_sm_cpu[dst..dst + d].copy_from_slice(&out_hm_cpu[src..src + d]);
-            }
-        }
-        return upload_f32(&out_sm_cpu, device)
-            .map_err(|e| anyhow!("upload sdpa cross-length output (CPU): {e}"));
-    }
-
-    // ── Sub-iter F GPU permute path ──
+    // ── GPU permute path (only path; sub-iter F shipped, E removed CPU) ──
     //
     // Use the SAME encoder for Q permute + SDPA + output permute.
     // q_seq_major was written by the caller's earlier dispatches; the
