@@ -153,6 +153,80 @@ impl DFlashLayerKvCache {
         Ok(())
     }
 
+    /// ADR-034 task #95 sub-iter A (2026-05-21) — GPU-side equivalent
+    /// of [`Self::append_seq_major_kv`].
+    ///
+    /// Takes GPU buffers + a caller-supplied encoder. Dispatches
+    /// [`mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual`]
+    /// — the same kernel Qwen35 HybridKvCache uses — to permute
+    /// seq-major `[n_new, num_kv_heads, head_dim]` source K/V into the
+    /// head-major `[num_kv_heads, capacity, head_dim]` cache storage at
+    /// the current `self.seq_len` offset, in one GPU dispatch.
+    ///
+    /// Caller must NOT have committed the source buffers' producing
+    /// encoder yet — the kernel reads `src_k` / `src_v` after the
+    /// caller's prior writes are GPU-ordered. Use `memory_barrier()` in
+    /// the same encoder between producer and this dispatch.
+    ///
+    /// Eliminates the `download_f32_logical(src) → CPU memcpy → cache`
+    /// roundtrip in the existing call site at
+    /// `dispatch_dflash_decoder_layer_attention` (forward.rs:880-891),
+    /// which forces a `commit_and_wait` per layer attention. Saves
+    /// ~500μs-1ms per layer × 5 layers = 2.5-5 ms per drafter forward.
+    ///
+    /// On success: increments `self.seq_len` by `n_new`.
+    pub fn append_seq_major_kv_gpu(
+        &mut self,
+        encoder: &mut mlx_native::CommandEncoder,
+        registry: &mut mlx_native::KernelRegistry,
+        device: &mlx_native::metal::DeviceRef,
+        src_k: &MlxBuffer,
+        src_v: &MlxBuffer,
+        n_new: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> anyhow::Result<()> {
+        if self.would_overflow(n_new) {
+            return Err(anyhow::anyhow!(
+                "dflash KV cache layer {} (gpu) would overflow: seq_len={}, n_new={}, capacity={}",
+                self.layer_idx, self.seq_len, n_new, self.capacity
+            ));
+        }
+        if self.is_sliding && self.seq_len.saturating_add(n_new) > self.capacity {
+            return Err(anyhow::anyhow!(
+                "dflash KV cache layer {} (sliding, gpu) would wrap past capacity {}",
+                self.layer_idx, self.capacity,
+            ));
+        }
+        let expected_src_elems = (n_new as u64)
+            * (num_kv_heads as u64)
+            * (head_dim as u64);
+        for (name, b) in [("src_k", src_k), ("src_v", src_v)] {
+            if (b.element_count() as u64) < expected_src_elems {
+                return Err(anyhow::anyhow!(
+                    "dflash append_seq_major_kv_gpu: {} has {} elements, need {}",
+                    name, b.element_count(), expected_src_elems
+                ));
+            }
+        }
+        mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_dual(
+            encoder, registry, device,
+            src_k, src_v,
+            &self.keys, &self.values,
+            num_kv_heads,
+            head_dim,
+            self.capacity,
+            /* seq_pos_start = */ self.seq_len,
+            /* n_tokens = */ n_new,
+            /* src_tok_offset = */ 0,
+        )
+        .map_err(|e| anyhow::anyhow!(
+            "dflash append_seq_major_kv_gpu dispatch: {e}"
+        ))?;
+        self.seq_len += n_new;
+        Ok(())
+    }
+
     /// Roll back the cache by `n` positions. Used after a spec-decode
     /// verify step rejects `n` of the proposed positions — those K/V
     /// writes must be undone so the next step starts from the correct
@@ -524,6 +598,122 @@ mod tests {
                 assert_eq!(k_storage[dst], 9.0, "post-append at t={t} head={head}");
             }
         }
+    }
+
+    /// ADR-034 task #95 sub-iter A (2026-05-21) — parity test:
+    /// CPU `append_seq_major_kv` vs GPU `append_seq_major_kv_gpu`
+    /// must produce byte-identical cache state on the same input.
+    ///
+    /// Sequence:
+    ///   1. Build a synthetic input `[n_new=3, n_kv_heads, head_dim]`
+    ///      F32 with distinguishable per-(t, h, d) values.
+    ///   2. Path A: allocate cache_cpu + run `append_seq_major_kv` (CPU memcpy).
+    ///   3. Path B: allocate cache_gpu + upload input to MlxBuffer + run
+    ///      `append_seq_major_kv_gpu` in a fresh encoder + commit_and_wait.
+    ///   4. Compare cache_cpu.keys/values vs cache_gpu.keys/values byte-for-byte.
+    ///   5. Assert both `seq_len` cursors advanced by n_new.
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn adr_034_task_95_append_seq_major_kv_gpu_parity_2026_05_21() {
+        use mlx_native::DType;
+        let cfg = gemma4_26b_a4b_dflash_config();
+        let device = MlxDevice::new().expect("Metal device available on M5 Max");
+        let max_full = 64u32;
+
+        // Path A: CPU cache
+        let mut cache_cpu = DFlashKvCache::new(&device, &cfg, max_full).expect("cache_cpu alloc");
+        // Path B: GPU cache
+        let mut cache_gpu = DFlashKvCache::new(&device, &cfg, max_full).expect("cache_gpu alloc");
+
+        let layer_idx = 4usize; // full-attention layer
+        let h = cfg.num_key_value_heads as u32;
+        let d = cfg.head_dim as u32;
+        let n_new = 3u32;
+        let n_h = h as usize;
+        let dim = d as usize;
+        let total = (n_new as usize) * n_h * dim;
+
+        // Distinguishable values: t * 10000 + head * 100 + dim.
+        let mut k_input = vec![0.0f32; total];
+        let mut v_input = vec![0.0f32; total];
+        for t in 0..(n_new as usize) {
+            for head in 0..n_h {
+                for dimi in 0..dim {
+                    let row = (t * n_h + head) * dim;
+                    k_input[row + dimi] = (t * 10000 + head * 100 + dimi) as f32;
+                    v_input[row + dimi] = (t * 10000 + head * 100 + dimi) as f32 + 0.5;
+                }
+            }
+        }
+
+        // ── Path A: CPU append ──
+        cache_cpu.layers[layer_idx]
+            .append_seq_major_kv(&k_input, &v_input, n_new, h, d)
+            .expect("CPU append");
+
+        // ── Path B: GPU append ──
+        // Upload k_input + v_input to MlxBuffers.
+        let mut src_k = device
+            .alloc_buffer(total * 4, DType::F32, vec![n_new as usize, n_h, dim])
+            .expect("alloc src_k");
+        let mut src_v = device
+            .alloc_buffer(total * 4, DType::F32, vec![n_new as usize, n_h, dim])
+            .expect("alloc src_v");
+        src_k
+            .as_mut_slice::<f32>()
+            .expect("src_k slice")
+            .copy_from_slice(&k_input);
+        src_v
+            .as_mut_slice::<f32>()
+            .expect("src_v slice")
+            .copy_from_slice(&v_input);
+
+        let mut registry = mlx_native::KernelRegistry::new();
+        let mut enc = device.command_encoder().expect("encoder");
+        cache_gpu.layers[layer_idx]
+            .append_seq_major_kv_gpu(
+                &mut enc, &mut registry, device.metal_device(),
+                &src_k, &src_v,
+                n_new, h, d,
+            )
+            .expect("GPU append");
+        enc.commit_and_wait().expect("commit GPU append");
+
+        // ── Compare ──
+        assert_eq!(cache_cpu.layers[layer_idx].seq_len, n_new, "CPU seq_len");
+        assert_eq!(cache_gpu.layers[layer_idx].seq_len, n_new, "GPU seq_len");
+
+        let k_cpu = cache_cpu.layers[layer_idx].keys.as_slice::<f32>().expect("k_cpu");
+        let k_gpu = cache_gpu.layers[layer_idx].keys.as_slice::<f32>().expect("k_gpu");
+        let v_cpu = cache_cpu.layers[layer_idx].values.as_slice::<f32>().expect("v_cpu");
+        let v_gpu = cache_gpu.layers[layer_idx].values.as_slice::<f32>().expect("v_gpu");
+
+        // Compare only the WRITTEN region (head * cap + 0..n_new) per head.
+        // Tail bytes after seq_len are uninitialized in both paths and
+        // not part of the contract.
+        let cap = cache_cpu.layers[layer_idx].capacity as usize;
+        for head in 0..n_h {
+            for t in 0..(n_new as usize) {
+                let off = (head * cap + t) * dim;
+                let k_cpu_row = &k_cpu[off..off + dim];
+                let k_gpu_row = &k_gpu[off..off + dim];
+                let v_cpu_row = &v_cpu[off..off + dim];
+                let v_gpu_row = &v_gpu[off..off + dim];
+                assert_eq!(
+                    k_cpu_row, k_gpu_row,
+                    "K parity mismatch at head={head} t={t}: cpu={:?} gpu={:?}",
+                    k_cpu_row, k_gpu_row,
+                );
+                assert_eq!(
+                    v_cpu_row, v_gpu_row,
+                    "V parity mismatch at head={head} t={t}",
+                );
+            }
+        }
+        eprintln!(
+            "task #95 sub-iter A parity OK: n_new={}, n_kv_heads={}, head_dim={}, capacity={}",
+            n_new, h, d, cap,
+        );
     }
 
     #[test]
