@@ -271,6 +271,42 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 18) — Step 3: granular profile reveals fa.ops1_4 is 76% of FA time; fused_head_norm_rope kernel exists but UNWIRED
+
+`HF2Q_PROFILE_W5B8=1` on SPEC K=1 BATCHED MH temp=0.5 at seq_len=2 reveals
+the actual bottleneck:
+
+| Section                          | total ms |  % of FA |
+|----------------------------------|---------:|---------:|
+| layer.full_total (16 FA layers)  |    56.37 |  100%    |
+| ↳ **fa.ops1_4** (norm+QKV+norm+RoPE) | **42.79** | **76%** |
+| ↳ fa.sdpa_total                  |     3.61 |    6%    |
+| ↳ fa.ops6_7                      |     3.63 |    6%    |
+| layer.ffn_dispatch (all 64 MLPs) |     6.51 | —        |
+
+**fa.ops1_4 contains 9 dispatches + 3 barriers per FA layer × 16 = 144
+dispatches per verifier forward at seq=2.** At 297μs effective per dispatch,
+that's 42.79 ms total — the dominant cost.
+
+**Available unused kernel**: `mlx-native/src/ops/fused_head_norm_rope.rs` has
+`dispatch_fused_head_norm_rope_{bf16,f32}` which fuses per-head RMS norm
++ IMROPE into a SINGLE dispatch. Grep confirms ZERO call sites in hf2q —
+the kernel is built into the metallib but never invoked.
+
+**Projected impact of wiring**: per FA layer, current Op 3 + Op 4 = 4
+dispatches (Q norm + K norm + Q rope + K rope) + 1 barrier. After fusion:
+2 dispatches (Q norm+rope fused + K norm+rope fused) + 0 barriers.
+
+Saved: 32 dispatches + 16 barriers per verifier forward at seq=2.
+At ~150-200μs effective: ~4.8-6.4 ms saved.
+
+Verifier 59.5 → ~53-54.7 ms. Throughput 26.5 → ~29-30 t/s.
+Speedup: 1.244× → **~1.36-1.41×** (projected).
+
+This is the right next multi-week target after the MLP fusion plateau.
+
+Memory: `project_adr034_task93_step3_profile_finding_2026_05_21`.
+
 ### Iteration 2026-05-21 (cont. 17) — Task #93 Step 2: m=2 parity passes but spec gain is noise
 
 Removed the `seq_len == 1` restriction in `build_dense_ffn_layer_gpu_q_into_pooled`
