@@ -84,6 +84,7 @@ impl Quantizer for GgmlQuantizer {
             GgmlType::Q5_1 => super::q5_1::quantize(src, n_per_row, imatrix),
             GgmlType::Q8_0 => super::q8_0::quantize(src, n_per_row, imatrix),
             GgmlType::IQ4_NL => super::iq4_nl::quantize(src, n_per_row, imatrix),
+            GgmlType::IQ4_XS => super::iq4_xs::quantize(src, n_per_row, imatrix),
             GgmlType::Q2_K => super::q2_k::quantize(src, n_per_row, imatrix),
             GgmlType::Q3_K => super::q3_k::quantize(src, n_per_row, imatrix),
             GgmlType::Q4_K => super::q4_k::quantize(src, n_per_row, imatrix),
@@ -108,6 +109,7 @@ pub fn quantizer_for(ty: GgmlType) -> Result<GgmlQuantizer, QuantizeError> {
         | GgmlType::Q5_1
         | GgmlType::Q8_0
         | GgmlType::IQ4_NL
+        | GgmlType::IQ4_XS
         | GgmlType::Q2_K
         | GgmlType::Q3_K
         | GgmlType::Q4_K

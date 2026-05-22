@@ -19,6 +19,7 @@ pub mod common;
 pub mod error;
 pub mod ggml_type;
 pub mod iq4_nl;
+pub mod iq4_xs;
 pub mod llama_ftype;
 pub mod q2_k;
 pub mod q3_k;

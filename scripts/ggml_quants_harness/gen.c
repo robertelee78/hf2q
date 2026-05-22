@@ -55,6 +55,7 @@ static enum ggml_type parse_type(const char *s) {
     if (!strcmp(s, "q5_1"))   return GGML_TYPE_Q5_1;
     if (!strcmp(s, "q8_0"))   return GGML_TYPE_Q8_0;
     if (!strcmp(s, "iq4_nl")) return GGML_TYPE_IQ4_NL;
+    if (!strcmp(s, "iq4_xs")) return GGML_TYPE_IQ4_XS;
     if (!strcmp(s, "q2_k"))   return GGML_TYPE_Q2_K;
     if (!strcmp(s, "q3_k"))   return GGML_TYPE_Q3_K;
     if (!strcmp(s, "q4_k"))   return GGML_TYPE_Q4_K;
@@ -77,7 +78,7 @@ int main(int argc, char **argv) {
     if (argc != 8) {
         fprintf(stderr,
             "usage: %s <type> <n_per_row> <n_rows> <input_seed> <imatrix_seed|none> <out_input> <out_expected>\n"
-            "  <type>: q4_0 q4_1 q5_0 q5_1 q8_0 iq4_nl q2_k q3_k q4_k q5_k q6_k\n",
+            "  <type>: q4_0 q4_1 q5_0 q5_1 q8_0 iq4_nl iq4_xs q2_k q3_k q4_k q5_k q6_k\n",
             argv[0]);
         return 2;
     }
