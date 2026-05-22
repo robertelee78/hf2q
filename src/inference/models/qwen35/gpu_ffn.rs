@@ -1271,7 +1271,11 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
         weights.ggml_type_gate_up,
         mlx_native::ops::quantized_matmul_ggml::GgmlType::Q5_K
     );
-    let fused_eligible = (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q5_k) && !fused_off;
+    let fused_q6_k = matches!(
+        weights.ggml_type_gate_up,
+        mlx_native::ops::quantized_matmul_ggml::GgmlType::Q6_K
+    );
+    let fused_eligible = (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q5_k || fused_q6_k) && !fused_off;
     if fused_eligible {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseAProj,
@@ -1308,6 +1312,22 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
                 },
             )
             .context("dense_q fused gate_up_silu_mul Q5_K")?;
+        } else if fused_q6_k {
+            mlx_native::ops::fused_gate_up_silu_q6_K::dispatch_fused_gate_up_silu_q6_K(
+                enc,
+                registry,
+                device,
+                &weights.gate_q,
+                &weights.up_q,
+                x,
+                &hidden_buf,
+                mlx_native::ops::fused_gate_up_silu_q6_K::FusedGateUpSiluQ6_KArgs {
+                    m: seq_len,
+                    intermediate_size: m,
+                    hidden_size: h,
+                },
+            )
+            .context("dense_q fused gate_up_silu_mul Q6_K")?;
         } else if fused_q4_k {
             mlx_native::ops::fused_gate_up_silu_q4_K::dispatch_fused_gate_up_silu_q4_K(
                 enc,
