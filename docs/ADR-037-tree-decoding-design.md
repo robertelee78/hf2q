@@ -18,8 +18,9 @@
 | **Phase E1 totals** | ✅ **CLOSED** | mlx-native `3ea809f` | **24/24** integration tests PASS (21 parity + 3 negative-path) + **6/6** lib unit tests PASS = **30/30** total. |
 | E2 — EAGLE-3 drafter training | ⏳ TODO | — | Multi-week training (~1wk H100 compute). |
 | E3a — multi-layer hidden plumbing | ✅ SHIPPED | hf2q `db495137` | `Eagle3HiddenCollector` with `[seq_len, num_aux, hidden_size]` row-major layout (transpose of DFlash; chosen so `concatenated_hidden()` returns buffer directly with no permute). 15/15 unit tests PASS: constructor validation, slab writes, layout-matches-vLLM, lifecycle, realistic Qwen35-shaped allocation. |
-| E3b — eagle3_weights.rs (1-layer loader) | ⏳ TODO | — | Next iter. Mirrors qwen35 weights loader + EAGLE-3-specific layers: hidden_norm, input_layernorm, fc projection, optional fc_norm per-aux. Per /opt/vllm/vllm/model_executor/models/llama_eagle3.py:38-122. |
-| E3 codex /cfa gate | ⏳ TODO | — | After E3b |
+| E3b — eagle3 drafter weights schema + loader | ✅ SHIPPED | hf2q `3b78d2bc` | `Eagle3DrafterConfig` (7 architectural gates) + `Eagle3Weights` strict manifest loader with synthetic safetensors validation. 26/26 unit tests PASS: config validation, manifest structure (12 invariant tests), conditional tensor gates (5 gates × validation), 5 safetensors load-path tests using synthetic in-memory blobs. |
+| E3 codex /cfa gate | ✅ PASSED | hf2q `6936473d` | Codex re-review confirms **0 Critical + 0 Major** remaining. Fixed: checked_mul overflow guards, vLLM d2t/t2d name normalization, `has_own_embed_tokens` config gate, defensive `cfg.validate()` at loader entry, stale mod.rs doc. Added 4 negative-path validation tests proving each fix fires. |
+| **Phase E3 totals** | ✅ **CLOSED** | hf2q `6936473d` | **45/45** unit tests PASS (15 E3a + 26 E3b + 4 codex-fix validations). |
 | E4 — drafter forward + dynamic tree expansion | ⏳ TODO | — | ~600 LOC, ~5-7 days |
 | E5 — tree-walk-accept + KV rollback | ⏳ TODO | — | ~350 LOC, ~3-4 days |
 | E6 — orchestrator + HF2Q_SPEC_EAGLE3 env flag | ⏳ TODO | — | ~500 LOC, ~5-7 days |
