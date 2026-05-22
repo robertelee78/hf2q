@@ -1263,12 +1263,32 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
         weights.ggml_type_gate_up,
         mlx_native::ops::quantized_matmul_ggml::GgmlType::Q4_K
     );
-    let fused_eligible = (fused_q8_0 || fused_q4_k) && !fused_off;
+    let fused_iq4_nl = matches!(
+        weights.ggml_type_gate_up,
+        mlx_native::ops::quantized_matmul_ggml::GgmlType::IQ4_NL
+    );
+    let fused_eligible = (fused_q8_0 || fused_q4_k || fused_iq4_nl) && !fused_off;
     if fused_eligible {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseAProj,
         );
-        if fused_q4_k {
+        if fused_iq4_nl {
+            mlx_native::ops::fused_gate_up_silu_iq4_nl::dispatch_fused_gate_up_silu_iq4_nl(
+                enc,
+                registry,
+                device,
+                &weights.gate_q,
+                &weights.up_q,
+                x,
+                &hidden_buf,
+                mlx_native::ops::fused_gate_up_silu_iq4_nl::FusedGateUpSiluIq4NlArgs {
+                    m: seq_len,
+                    intermediate_size: m,
+                    hidden_size: h,
+                },
+            )
+            .context("dense_q fused gate_up_silu_mul IQ4_NL")?;
+        } else if fused_q4_k {
             mlx_native::ops::fused_gate_up_silu_q4_K::dispatch_fused_gate_up_silu_q4_K(
                 enc,
                 registry,
