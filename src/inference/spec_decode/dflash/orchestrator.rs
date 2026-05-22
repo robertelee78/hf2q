@@ -25,15 +25,26 @@
 //! 5. **Rollback**: target KV by `K - accept_count` positions (the
 //!    rejected proposals' KV writes); drafter cache by the same.
 //!
-//! ## Greedy byte-identity invariant (the coherence guarantee)
+//! ## Greedy accept-walk consistency invariant (NOT byte-identity to base)
 //!
-//! At temperature=0, this orchestrator must produce **byte-identical**
-//! output to single-token target decode. The mathematical guarantee:
-//! `accept_prefix_argmax` only accepts a draft token `d_i` if it equals
-//! `argmax(target_logits_at_i)`. The "free" token at position
-//! `accept_count` is `argmax(target_logits_at_accept_count)` — exactly
-//! what greedy single-token decode would emit. KV rollback after the
-//! K-positional verify undoes only the rejected portion.
+//! At temperature=0, this orchestrator emits tokens consistent with the
+//! spec path's OWN batched-prefill verifier argmax. The mathematical
+//! guarantee: `accept_prefix_argmax` only accepts a draft token `d_i`
+//! if it equals `argmax(verifier_logits_at_i)`. The "free" token at
+//! position `accept_count` is `argmax(verifier_logits_at_accept_count)`.
+//! KV rollback after the K-positional verify undoes only the rejected
+//! portion.
+//!
+//! **This is NOT byte-identity to single-token target decode** — the
+//! batched-prefill verifier kernel (F16-with-blk, or BF16 prefill_resume
+//! when HF2Q_DFLASH_XLEN_SDPA=1) differs from the F32 `flash_attn_vec`
+//! single-token decode kernel. Argmax flips on close logits compound
+//! across rounds. Empirical at HEAD `6ad9d04c` 2026-05-22 (Gemma 4
+//! 26B-A4B-it Q5_K_M, Fibonacci prompt, temp=0 greedy): Option A
+//! diverges from base at ~135 tokens (single-token argmax flip
+//! `element` → `term`), Option C diverges from token 1. See ADR-034
+//! §START HERE G3 row at line 1506 + §3.5b empirical caveat at line
+//! 1647 for the full framework-level analysis.
 //!
 //! Phase 4 first piece (this commit): orchestrator state struct + the
 //! pure-math step round (propose → verify result → accept → next-state).
@@ -132,15 +143,24 @@ pub fn step_round_from_argmaxes(
 /// caller appends these to the output sequence and advances seq_pos
 /// by `committed_tokens.len()`.
 ///
-/// # Greedy byte-identity guarantee
+/// # Greedy accept-walk consistency invariant (NOT byte-identity to base)
 ///
-/// At temperature=0 (greedy), this function emits tokens
-/// byte-identical to single-token target decode for the same prompt.
-/// Proof: `forward_decode_verify_batched` runs target's exact
-/// dispatchers on K+1 tokens; argmax at each position is what
-/// single-token decode would emit at that position; `accept_prefix_argmax`
-/// only accepts drafts that match those argmaxes, falling through to
-/// target's own argmax at the first mismatch.
+/// At temperature=0 (greedy), this function emits tokens consistent
+/// with the spec path's OWN batched-prefill verifier argmax (i.e., what
+/// `forward_decode_verify_batched` would emit at each position).
+/// `accept_prefix_argmax` only accepts drafts that match those verifier
+/// argmaxes, falling through to the verifier's own argmax at the first
+/// mismatch.
+///
+/// **This is NOT byte-identity to single-token target decode** — the
+/// batched-prefill verifier kernel (F16/BF16) produces argmax sequences
+/// that diverge from the F32 `flash_attn_vec` single-token decode kernel
+/// on close logits. Empirical at HEAD `6ad9d04c` 2026-05-22 (Gemma 4
+/// 26B-A4B-it Q5_K_M, Fibonacci prompt, HF2Q_FULL_F16_KV=1, 256 tok
+/// temp=0 greedy): Option A diverges at ~135 tokens via single-token
+/// argmax flip (`element` → `term`), cascading thereafter; Option C
+/// (re-prefill) diverges from token 1. See ADR-034 G3 row + §3.5b
+/// empirical caveat at line 1647 for the full framework-level analysis.
 pub fn dispatch_dflash_spec_decode_round_target_side<T: super::target::DFlashTarget>(
     target: &mut T,
     last_committed_token: u32,
@@ -191,15 +211,26 @@ pub fn dispatch_dflash_spec_decode_round_target_side<T: super::target::DFlashTar
 /// output sequence and advances `current_seq_pos` by
 /// `committed_tokens.len()`.
 ///
-/// # Greedy byte-identity invariant (mantra-coherence)
+/// # Greedy accept-walk consistency invariant (NOT byte-identity to base)
 ///
 /// At temperature=0 (no sampler — pure argmax), this function's
-/// committed_tokens is byte-identical to what single-token target
-/// decode would emit. Proof chain:
+/// committed_tokens is consistent with the spec path's OWN batched-
+/// prefill verifier argmax (via `step_round_from_argmaxes`).
+///
+/// **This is NOT byte-identical to single-token target decode**. The
+/// batched verifier kernel (F16/BF16) differs from single-token
+/// `flash_attn_vec` (F32); argmax flips on close logits compound
+/// across rounds. Empirical at HEAD `6ad9d04c` 2026-05-22: Gemma
+/// DFlash Option A diverges from base at ~135 tokens; Option C from
+/// token 1. See ADR-034 G3 row at line 1506 + §3.5b empirical caveat
+/// at line 1647.
+///
+/// Proof chain (for within-orchestrator accept-walk consistency):
 /// - Drafter is consulted but its drafts only commit when they match
-///   target's argmax (per step_round_from_argmaxes)
-/// - target.forward_decode_verify_batched is bit-exact same dispatcher
-///   sequence as single-token tail
+///   the VERIFIER's argmax (per step_round_from_argmaxes)
+/// - `target.forward_decode_verify_batched` runs the batched-prefill
+///   verifier kernel sequence; this is a DIFFERENT kernel sequence
+///   from single-token tail decode
 /// - target.rollback_kv discards rejected positions
 ///
 /// # Arguments
@@ -467,14 +498,21 @@ pub fn dispatch_dflash_generate_one_round_with_initial_capture(
 ///
 /// This avoids double target-forward per round.
 ///
-/// # Greedy byte-identity invariant
+/// # Greedy accept-walk consistency invariant (NOT byte-identity to base)
 ///
 /// At temperature = 0, the output (after `prompt_tokens.len()`) is
-/// byte-identical to what single-token target decode would produce.
+/// consistent with the spec path's OWN batched-prefill verifier argmax.
 /// Proven by composition: `step_round_from_argmaxes` only accepts
-/// drafts that match target's argmax; `target.rollback_kv` discards
-/// rejected positions; per-round capture is just additive
-/// instrumentation that doesn't change target's compute.
+/// drafts that match the verifier's argmax; `target.rollback_kv`
+/// discards rejected positions; per-round capture is just additive
+/// instrumentation that doesn't change verifier compute.
+///
+/// **This is NOT byte-identical to what single-token target decode
+/// would produce** — the batched-prefill verifier kernel differs from
+/// the F32 `flash_attn_vec` single-token decode kernel; argmax flips
+/// on close logits compound across rounds. Empirical at HEAD
+/// `6ad9d04c` (Gemma): Option A diverges at ~135 tok; Option C from
+/// token 1. See module-level docs in this file and ADR-034 G3 row.
 ///
 /// # Arguments
 ///
@@ -716,8 +754,12 @@ pub fn dispatch_dflash_generate(
         //    know; we want predictions at positions 1..block_size).
         //    iter-71: route through batched argmax impl (one command
         //    buffer for all block_size positions instead of K+1
-        //    separate commit-and-wait syncs).  Bit-identical to the
-        //    un-batched path at temp=0 (verified by the e2e gate).
+        //    separate commit-and-wait syncs). Bit-identical to the
+        //    un-batched path at temp=0 WITHIN this orchestrator's own
+        //    verifier kernel (verified by the e2e gate's accept-walk
+        //    self-consistency, which is what the gate actually
+        //    measures — NOT byte-identity to base autoregressive,
+        //    which is empirically falsified per ADR-034 G3 row).
         let t0_drafter_argmax = if profile_on { Some(std::time::Instant::now()) } else { None };
         let drafts: Vec<u32> = {
             let h_final_slice: &[f32] = h_final
@@ -1198,10 +1240,19 @@ mod tests {
     /// [`MlxModelWeights::rollback_kv`], then runs
     /// [`dispatch_dflash_generate`] for the same N tokens.
     ///
-    /// **The coherence assertion**: spec-decode output[prompt_len..]
-    /// must be byte-identical to the baseline at temp=0. This is the
-    /// fundamental greedy-spec-decode correctness guarantee — any
-    /// divergence is a bug.
+    /// **The coherence assertion (HISTORICAL — empirically falsified
+    /// at HEAD `6ad9d04c` 2026-05-22)**: this test asserts
+    /// `spec_new == baseline_new` at temp=0 greedy. The assertion was
+    /// based on the falsified assumption that DFlash output matches
+    /// single-token decode byte-for-byte. Empirically: Gemma DFlash
+    /// Option A diverges from base at ~135 tokens (single-token argmax
+    /// flip); Option C diverges from token 1. The batched-prefill
+    /// verifier kernel ≠ F32 single-token decode kernel; argmax flips
+    /// on close logits compound across rounds. This test should be
+    /// re-scoped to verify accept-walk-internal consistency (spec-decode
+    /// output equals what its OWN batched verifier would emit on the
+    /// same KV state), not byte-identity to base. See ADR-034 G3 row
+    /// at line 1506 + §3.5b empirical caveat at line 1647.
     ///
     /// If this test fails: investigate by per-token diff between
     /// baseline_new and spec_new. The first divergence position
@@ -1438,11 +1489,15 @@ mod tests {
         }
 
         // -----------------------------------------------------------------
-        // COHERENCE GATE: spec must produce byte-identical output to
-        // baseline at temp=0.  This is the greedy-spec-decode
-        // correctness invariant: accept_prefix_argmax only accepts a
-        // draft when it matches target's argmax, so committed tokens
-        // are always identical to single-token decode.
+        // COHERENCE GATE (HISTORICAL — empirically falsified at HEAD
+        // 6ad9d04c 2026-05-22): asserts spec_new == baseline_new at
+        // temp=0 greedy. Empirically: Gemma DFlash Option A diverges
+        // at ~135 tok; Option C from token 1. The batched-prefill
+        // verifier kernel ≠ F32 single-token decode kernel; argmax
+        // flips on close logits compound across rounds. This gate
+        // would fail past the divergence window. Needs re-scope to
+        // accept-walk-internal consistency. See ADR-034 G3 row at
+        // line 1506.
         // -----------------------------------------------------------------
         assert_eq!(
             spec_new.len(),

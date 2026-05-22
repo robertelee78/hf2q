@@ -20,8 +20,15 @@
 //!
 //! ## Correctness vs performance
 //!
-//! Coherence (byte-identity vs single-token decode at temp=0) is GREEN
-//! per `e2e_dispatch_dflash_generate_gemma4_26b` on real models.
+//! Coherence: accept-walk consistent with the spec path's OWN batched-
+//! prefill verifier argmax at temp=0. This is NOT byte-identity to
+//! single-token decode — empirical at HEAD `6ad9d04c` 2026-05-22:
+//! Gemma DFlash Option A diverges from base at ~135 tokens; Option C
+//! from token 1. The `e2e_dispatch_dflash_generate_gemma4_26b` test's
+//! historical "GREEN coherence" gate is itself superseded — the test
+//! asserts byte-identity but would fail past the divergence window
+//! (it's `#[ignore]`d in CI; needs re-scope to accept-walk consistency).
+//! See ADR-034 G3 row at line 1506.
 //!
 //! Performance is currently SLOWER than baseline single-token decode
 //! (~10× slowdown at N=8 tokens on M5 Max) because the orchestrator's

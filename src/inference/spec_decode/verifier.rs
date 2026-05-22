@@ -114,14 +114,30 @@ pub trait Verifier {
 /// - `model_token` is the model's argmax at position `accept_count` —
 ///   this is the "free" extra token gained from the verify pass.
 ///
-/// # Greedy decode contract
+/// # Greedy accept-walk contract (scoped to the verifier providing
+/// `logits_per_pos`)
 ///
-/// At temperature=0 (greedy), spec-decode is byte-identical to default
-/// decode: the accepted prefix is exactly what default decode would
-/// have produced, and `model_token` is the next token default decode
-/// would emit. Stochastic sampling (temperature>0) requires a more
-/// involved acceptance distribution per Leviathan et al. (2023); this
-/// function is the greedy variant and matches vLLM's
+/// At temperature=0 (greedy), `accept_prefix` accepts drafts that
+/// match the verifier's argmax at each position. The "free"
+/// `model_token` is the verifier's argmax at `accept_count`. So the
+/// committed sequence is byte-identical to what THE SAME VERIFIER
+/// would emit when called single-token at each position with the
+/// same KV state.
+///
+/// **Important kernel-scope note**: this contract is byte-identical
+/// to single-token decode IFF the verifier providing `logits_per_pos`
+/// uses the same kernel as single-token decode. In real models this
+/// is NOT the case — the batched-prefill verifier (F16/BF16) differs
+/// from single-token decode (F32 `flash_attn_vec`); argmax flips on
+/// close logits compound across rounds. See ADR-034 G3 row at line
+/// 1506 + §3.5b empirical caveat at line 1647. The synthetic
+/// `GroundTruthVerifier` test below uses a deterministic CPU oracle
+/// so within that test the contract holds by construction; the
+/// contract does NOT extend to real models.
+///
+/// Stochastic sampling (temperature>0) requires a more involved
+/// acceptance distribution per Leviathan et al. (2023); this function
+/// is the greedy variant and matches vLLM's
 /// `RejectionSampler.greedy_match` semantics.
 pub fn accept_prefix(drafts: &[u32], logits_per_pos: &VerifyLogits) -> (usize, u32) {
     if logits_per_pos.is_empty() {
@@ -457,11 +473,22 @@ mod tests {
     fn spec_decode_byte_identity_vs_default_decode() {
         // ADR-029 PHASE 2 ACCEPTANCE GATE: the spec-decode loop driven
         // by the n-gram proposer + a ground-truth verifier MUST produce
-        // a byte-identical generated sequence to default decode. This
-        // is the fundamental correctness invariant of greedy spec
-        // decode (Leviathan et al. 2023): accepted prefix is exactly
-        // what default decode would produce; the K+1th model token is
-        // the next token default decode would emit.
+        // a byte-identical generated sequence to default decode WHEN
+        // BOTH PATHS USE THE SAME UNDERLYING VERIFIER. This test uses
+        // GroundTruthVerifier (synthetic deterministic CPU verifier),
+        // so spec and default both query the same deterministic oracle
+        // — no kernel-precision divergence is possible. The Leviathan-
+        // 2023 proof of accept-walk consistency holds here by
+        // construction.
+        //
+        // CAVEAT: this test does NOT establish byte-identity between
+        // spec-decode and base autoregressive decode on REAL models.
+        // Real models have batched-prefill verifier kernels (F16/BF16)
+        // that differ from single-token decode (F32 flash_attn_vec);
+        // argmax flips on close logits compound across rounds. See
+        // ADR-034 §START HERE G3 row at line 1506 + §3.5b empirical
+        // caveat at line 1647 for the falsified base-byte-identity
+        // claim across all 4 real spec-decode paths.
         let prompt = vec![1u32, 2, 3, 1, 2, 3, 4]; // has [1,2,3] repetition for proposer
         let vocab = 256u32;
         let n_tokens = 30;
@@ -477,7 +504,7 @@ mod tests {
         assert!(spec_out.len() >= cmp_len);
         assert_eq!(
             &spec_out[..cmp_len], &default_out[..cmp_len],
-            "spec-decode must be byte-identical to default decode under greedy"
+            "spec-decode must match default decode under greedy WHEN BOTH PATHS USE THE SAME VERIFIER (synthetic GroundTruthVerifier here; real-model claim is falsified — see ADR-034 G3)"
         );
     }
 

@@ -1284,10 +1284,17 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // runs dispatch_dflash_generate, prints the decoded text and
     // returns Ok(Some(())) — caller exits cmd_generate immediately.
     //
-    // Coherence (temp=0) is byte-identical to single-token decode per
-    // e2e_dispatch_dflash_generate_gemma4_26b.  Performance is slower
-    // than baseline (Option C re-prefill cost) until iter-66+ lands
-    // cross-length SDPA — this is why the flag is opt-in.
+    // Coherence (temp=0): accept-walk consistent with the spec path's
+    // OWN batched-prefill verifier argmax (NOT byte-identical to
+    // single-token decode — at HEAD 6ad9d04c Option A diverges at
+    // ~135 tok via single-token argmax flip; Option C from token 1;
+    // see ADR-034 §START HERE Cell C row + G3 gate at line 1506).
+    // Performance:
+    //   Option A (HF2Q_DFLASH_XLEN_SDPA=1 + HF2Q_FULL_F16_KV=1):
+    //     45.7 t/s = 0.40× base 113.2 t/s (1.62× over Option C).
+    //   Option C (default, re-prefill from start_pos=0):
+    //     28.2 t/s = 0.25× base.
+    // Both research-quality; flag is opt-in.
     if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_dflash_spec_decode(
         &mut mlx_w,
         &prompt_tokens,
@@ -2873,13 +2880,18 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     // /opt/hf2q/models/dflash-drafters/z-lab__Qwen3.6-27B-DFlash),
     // runs dispatch_qwen35_dflash_generate, prints the decoded text,
     // and returns Ok(()) before reaching the standard SpecDecode
-    // / per-token branch. Greedy byte-identity preserved at
-    // temperature=0 per the orchestrator's accept-prefix walk.
+    // / per-token branch. Greedy accept-walk consistency with the
+    // spec path's OWN batched-prefill verifier argmax is preserved
+    // at temperature=0 (NOT byte-identity to single-token decode —
+    // empirically falsified at HEAD 6ad9d04c; see ADR-034 G3 row
+    // at line 1506 + qwen35_orchestrator.rs module doc).
     //
-    // Empirical perf vs the production MTP K=1 BATCHED MH path is
-    // unvalidated as of this wire-up — see the eprintln warning in
-    // try_dispatch_qwen35_dflash_spec_decode. Default OFF preserves
-    // current production perf parity.
+    // Empirical perf validated at HEAD 334008e9 2026-05-22 — see
+    // ADR-034 Cell B 27B (0.77x of MTP K=1 greedy) + Cell B 35B-A3B
+    // (0.31x of base) rows. Output is coherence-degraded at long
+    // lengths (27B 128-tok run garbles; see the eprintln warning in
+    // try_dispatch_qwen35_dflash_spec_decode). Default OFF preserves
+    // production perf parity AND faithful base-autoregressive output.
     let mut model = model;
     if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_qwen35_dflash_spec_decode(
         &mut model,
