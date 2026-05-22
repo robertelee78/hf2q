@@ -175,10 +175,11 @@ echo "  Post K=N CORRECTION + ADR scrub (HEAD e044131d 2026-05-22, warmup-correc
 echo "    Essay:    Base 21.9, MTP greedy 26.6 @ 68%, MTP MH 27.6 @ 78%, DFlash BS=2 20.8, BS=4 21.0"
 echo "    Code-gen: Base 22.0, MTP greedy 30.0 @ 91%, MTP MH 28.7 @ 84%, DFlash BS=2 21.6, BS=4 23.1"
 echo "    State stable vs sub-iter H (±0.2 t/s noise band). No regression from task #96 revert + ADR correction."
-echo "  Post 10-iter doc-scrub + pkill defense (HEAD eeaa51be / 3074807b 2026-05-22, focused 3-rep):"
+echo "  Post 10-iter doc-scrub + pkill defense (HEAD eeaa51be / 3074807b / a2478294 2026-05-22, focused 3-rep):"
 echo "    Code-gen: Base 21.93, MTP greedy 29.93 @ 91% (1.36x base), MTP MH 28.77 @ 84%, DFlash BS=2 21.63, BS=4 23.17 (0.77x of MTP greedy)"
 echo "    Essay:    Base 21.90, MTP greedy 26.57 @ 68%, MTP MH 27.57 @ 78% (1.26x base), DFlash BS=2 20.73, BS=4 20.97"
-echo "    ALL 10 configs (5 code-gen + 5 essay) match documented values within ±0.1 t/s noise band. Production state empirically stable across 10-iter cumulative doc-scrub period (45+ stale claims corrected, zero code-side drift)."
+echo "    MoE 35B-A3B Q4_K_M: Base 136.13, K=0/auto 113.63 @ 93.7% (0.83x base; spec still net-negative on MoE per ADR-034 §3.5)"
+echo "    ALL 12 configs (5 code-gen + 5 essay dense + 2 MoE) match documented values within ±0.3 t/s noise band. Production state empirically stable across 10-iter cumulative doc-scrub period (45+ stale claims corrected, zero code-side drift)."
 echo
 echo "Production recommendation:"
 echo "  Code-gen / deterministic: HF2Q_SPEC_DECODE=1 --temperature 0     (1.36x base, MTP K=1 greedy wins)"
