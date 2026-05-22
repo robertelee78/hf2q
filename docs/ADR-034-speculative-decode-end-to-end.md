@@ -22,7 +22,7 @@
 
 ---
 
-## 🎯 START HERE — Current state at HEAD `6a7ecf4c` (2026-05-21)
+## 🎯 START HERE — Current state at HEAD `061e7ff8` (2026-05-22)
 
 > **READ THIS FIRST.** §1 and §2 below describe the audit baseline at HEAD `eab0220b`
 > (2026-05-19) — substantial work has landed since. This section is the authoritative
@@ -32,13 +32,13 @@
 
 | Cell | Status | Evidence | Remaining work |
 |---|---|---|---|
-| **A — Qwen 3.6 27B dense MTP** | ✅ **1.244-1.332× SHIPPED; short-context absolute throughput peer-competitive; 64K parity unproven** | Auto-default K=1 BATCHED + Metropolis-Hastings stochastic acceptance (task #87 + #91 SHIPPED). 3-rep paired bench at HEAD `6a7ecf4c`: base 21.30 t/s; K=1 BATCHED greedy temp=0 24.53 t/s @ 60.0% accept (1.15×); **K=1 BATCHED MH temp=0.5 26.50 t/s @ 74.6% accept (1.244× on essay) / 28.33 t/s @ 86.9% accept (1.332× on code-gen)**. Throughput matches reported MTPLX D=2 absolute (26.35 t/s @ 80.6% accept) under non-identical conditions (short ctx vs 64K, stock vs fine-tuned drafter; see cont. 14 caveats). Determinism PASS 3/3 byte-identical (greedy AND seeded MH temp=0.5). 51/51 lib tests pass + parity_mtp_python_ref pass. **Production recommendation: `--temperature 0.5`**. | **Multi-week work that must NOT be punted** (per user directive 2026-05-21): (1) fused-MLP Metal kernels (Q8_0/Q4_K_M/IQ4_NL) projected ~1.461× on dense; (2) 64K context parity bench vs MTPLX; (3) custom fine-tuned drafter (training). |
+| **A — Qwen 3.6 27B dense MTP** | ✅ **1.244-1.332× SHIPPED; short-context absolute throughput peer-competitive; 64K parity unproven** | Auto-default K=1 BATCHED + Metropolis-Hastings stochastic acceptance (task #87 + #91 SHIPPED). 3-rep paired bench at HEAD `6a7ecf4c`: base 21.30 t/s; K=1 BATCHED greedy temp=0 24.53 t/s @ 60.0% accept (1.15×); **K=1 BATCHED MH temp=0.5 26.50 t/s @ 74.6% accept (1.244× on essay) / 28.33 t/s @ 86.9% accept (1.332× on code-gen)**. Throughput matches reported MTPLX D=2 absolute (26.35 t/s @ 80.6% accept) under non-identical conditions (short ctx vs 64K, stock vs fine-tuned drafter; see cont. 14 caveats). Determinism PASS 3/3 byte-identical (greedy AND seeded MH temp=0.5). 51/51 lib tests pass + parity_mtp_python_ref pass. **Production recommendation (workload-dependent, see Mission status table at line 47): code-gen `--temperature 0`, essay `--temperature 0.5`**. | **Multi-week work that must NOT be punted** (per user directive 2026-05-21): (1) fused-MLP Metal kernels (Q8_0/Q4_K_M/IQ4_NL) projected ~1.461× on dense; (2) 64K context parity bench vs MTPLX; (3) custom fine-tuned drafter (training). |
 | **A — Qwen 3.5/3.6 35B-A3B MoE-MTP** | ⚠️ **CORRECT but spec_decode is NET-NEGATIVE on MoE** | Loader works on 8/8 quants (Q4_0..Q8_0..IQ4_NL — all produce identical "**Paris**." at 85.7-100% MTP accept). BUT empirical paired bench at HEAD `0d19f4b0` (Q4_K_M, 200 tok): base 135.8 t/s, K=0 spec 111 t/s (0.82×), K=1 BATCHED 88 t/s (0.65×), K=2 cap=0 75.7 t/s @ 42.1% accept (0.56×). All spec modes SLOWER than base. T_v(N)/T_v(1) ratio = 2.4× (vs 1.26× on dense) — MoE batched-verifier overhead doesn't amortize. Loader fix shipped at afbf5684+66f2008f. | **Task #89** (forward_gpu_batched_decode) required to make spec_decode profitable on MoE. Until then, base K=0 is default (HF2Q_SPEC_DECODE unset). |
-| **B — Qwen 3.6 DFlash** | ✅ **WIRED + COHERENT, 0.60× production winner — needs fused projections kernel (not just batched_decode)** | Task #78 Steps 3a-4 SHIPPED at HEAD `e10946cf`. Task #89 Steps 1-3b SHIPPED at HEAD `91a14fbf` extending `flash_attn_vec` to qL>=1 + routing for seq_len[2,8]+cur_len>0 + extending fused stage_ab to cur_len>0 with vec inside. **3-rep paired bench at HEAD `91a14fbf` (essay prompt): DFlash BS=2 = 16.5 ± 0.15 t/s, BS=4 = 16.9 ± 0.10 t/s. Base = 21.9 t/s, MTP K=1 MH temp=0.5 = 27.5 t/s. DFlash is 0.75× of basic base and 0.60× of production winner.** Coherence: greedy-byte-identity verified across all paths (Steps 3a + 3b both produce same output as resume path). **Task #89's vec-extension hypothesis FALSIFIED empirically** — encoder fusion saves only ~1-2 ms commit boundary (lost in noise); fa.ops1_4 4.298 ms cost at seq_len=2 cur_len>0 is COMPUTE (Q4_0 matmuls + norms + RoPE on small batch), NOT encoder overhead. | **Fused projections kernel** (single Metal dispatch combining norm + Q+K+V+Gate matmuls + per-head norms + RoPE) is the actual structural lever. Multi-week Metal kernel work. Also unlocks Cell A 35B-A3B + Cell C Gemma DFlash. Until then, DFlash on Qwen35 stays opt-in (default OFF) and users should use `HF2Q_SPEC_DECODE=1 --temperature 0.5` (production winner). |
+| **B — Qwen 3.6 DFlash** | ✅ **WIRED + COHERENT, 0.77× of production winner post-task #95** | Task #95 (compile-drafter lever) SHIPPED in 10 sub-iters A-H at HEAD `f23b9274`. Warmup-corrected 3-rep paired bench at HEAD `f23b9274`: DFlash BS=4 code-gen 23.17 t/s (was 18.4 pre-#95, +26% cumulative), BS=2 code-gen 21.63 (+28.8%), BS=4 essay 20.97 (+24.1%), BS=2 essay 20.73 (+25.6%). Codex /cfa cleared cumulative work (Critical 0, Major 0, Minor 2 doc-only). **Real lever per peer-code read of MTPLX** (commit `e9358fde` 2026-05-21): MTPLX's 2.24× advantage is from `mx.compile`-compiled chained drafter (~17 commit boundaries eliminated), NOT fused projections kernels (peer code confirms they don't have one either). Task #89's vec-extension Steps 1-3b SHIPPED but EMPIRICALLY did not close the perf gap on its own — encoder fusion saves only ~1-2 ms (noise band); fa.ops1_4 at seq_len=2 cur_len>0 is COMPUTE-bound. | DFlash drafter forward cost remains structural. Closure to MTP K=1 production parity needs drafter training (smaller/faster drafter) or tree decoding (EAGLE-2/Medusa). DFlash on Qwen35 stays opt-in via HF2Q_SPEC_DFLASH=1 (default OFF). Users should use `HF2Q_SPEC_DECODE=1 --temperature 0` (code-gen 1.36×) or `0.5` (essay 1.26×) for production. |
 | **C — Gemma 4 26B DFlash** | ⚠️ **COHERENT but 4.8× SLOWER than base** | Q8_0 paired bench 3 reps at HEAD `6d80e6be` (2026-05-21): base 92.9 t/s, DFlash 19.2 t/s = 0.21× (4.8× slowdown). Coherence is byte-identical to single-token decode at temp=0 (proven by e2e test). The "WORKING" claim in earlier ADR revisions was correctness-only — never measured against base. Source code at `src/serve/spec_decode_cli.rs:26-32` is honest: "Option C re-prefills full prefix from start_pos=0 each round; Option A (cross-length SDPA in flash_attn_prefill) deferred." | **Option A** = cross-length SDPA path (same scope as task #89 `forward_gpu_batched_decode`). Required for any perf gate. ~1500 LOC. |
 | **D — Gemma 4 -assistant** | Phase 7, deferred | Not in v1 scope | — |
 
-### Mission status at HEAD `1fe56fbb` (2026-05-21) — FUNCTIONALLY COMPLETE
+### Mission status at HEAD `061e7ff8` (2026-05-22) — FUNCTIONALLY COMPLETE
 
 **Production winner is workload-dependent**:
 
@@ -50,27 +50,28 @@
 
 The auto-default when MTP weights present is K=1 BATCHED greedy (task #87 / commit 3be36936); MH activates only when caller sets temperature > 0 (task #91 / commit dc654349). On code-gen workloads (where target argmax is high-confidence), greedy's higher accept rate wins; on essay workloads (where multiple tokens are plausible), MH's accept-rate boost wins.
 
-3-rep paired bench at HEAD `b2462706` on code-gen prompt `"Write a Python function that computes the Fibonacci sequence iteratively:"`:
+3-rep paired bench at HEAD `b2462706` (historical; numbers confirmed reproducible at HEAD `061e7ff8` 2026-05-22: K=0/K=1 BATCHED greedy 30.0 t/s @ 91.0% accept, K=2 25.4 t/s @ 54.9% — incoherent, K=3 28.2 t/s @ 56.7% — partially degenerate) on code-gen prompt `"Write a Python function that computes the Fibonacci sequence iteratively:"`:
 - Base: 21.97 ± 0.05 tok/s
 - MTP K=1 greedy: 29.93 ± 0.10 @ 91.0% accept = 1.36× base
 - MTP K=1 MH temp=0.5: 28.63 ± 0.05 @ 84.1% accept = 1.30× base
 
-**DFlash block_size sweep workload sensitivity** (at HEAD `60b1f18b`):
+**DFlash block_size sweep workload sensitivity** (at HEAD `f23b9274`, warmup-corrected post-task #95):
 
-| Workload | BS=2 | BS=4 | BS=8 | Peak BS | Peak tok/s |
-|---|---:|---:|---:|---:|---:|
-| Essay / creative | 16.5 | 16.9 | 8.7 (drop) | BS=4 | 16.9 |
-| Code-gen | 16.8 | 18.4 | 17.4 | BS=4 | 18.4 |
+| Workload | BS=2 | BS=4 | Peak BS | Peak tok/s |
+|---|---:|---:|---:|---:|
+| Essay / creative | 20.73 | 20.97 | BS=4 | 20.97 |
+| Code-gen | 21.63 | 23.17 | BS=4 | 23.17 |
 
-Both workloads peak at BS=4 (corresponds to drafter proposing K=3 drafts per round). Below that, per-round overhead dominates; above that, accept rate falls faster than BS grows. The drafter ships with default `block_size=16` (K=15 drafts) which is OPT-OUT slower on both — set `HF2Q_DFLASH_BLOCK_SIZE=4` for peak DFlash perf. Even at peak, DFlash is **0.62× of MTP K=1 greedy on code-gen** (18.4 / 29.9) and **0.61× on essay** (16.9 / 27.5). DFlash remains opt-in / research-quality on Qwen35.
+Both workloads peak at BS=4 (corresponds to drafter proposing K=3 drafts per round). Below that, per-round overhead dominates; above that, accept rate falls faster than BS grows. The drafter ships with default `block_size=16` (K=15 drafts) which is OPT-OUT slower on both — set `HF2Q_DFLASH_BLOCK_SIZE=4` for peak DFlash perf. Post-task #95: DFlash BS=4 code-gen at **0.77× of MTP K=1 greedy** (23.17 / 30.0), BS=4 essay at **0.76× of MTP K=1 MH temp=0.5** (20.97 / 27.5). Substantially closer to viable than pre-#95 (0.62× / 0.61×). DFlash remains opt-in / research-quality on Qwen35.
 
 **ADR-034 cell summary**:
 
 | Cell | Status | Production-ready? |
 |---|---|---|
-| A — Qwen 3.6 27B dense MTP | ✅ SHIPPED 1.26× | YES (default-on when MTP weights present) |
-| A — Qwen 3.5/3.6 35B-A3B MoE MTP | ⚠️ WIRED + correct but net-negative | NO (default-off, needs fused projections kernel) |
-| B — Qwen 3.6 DFlash | ✅ WIRED + correct, 0.60× of production winner | OPT-IN only (HF2Q_SPEC_DFLASH=1; documented as research-quality) |
+| A — Qwen 3.6 27B dense MTP (K=0/K=1) | ✅ SHIPPED 1.20-1.36× | YES (default-on when MTP weights present) |
+| A — Qwen 3.6 27B dense MTP (K=N≥2) | ❌ Incoherent + net-negative at HEAD `061e7ff8` | NO (research-quality; needs unified batched-prefill or tree decoding) |
+| A — Qwen 3.5/3.6 35B-A3B MoE MTP | ⚠️ WIRED + correct but net-negative | NO (default-off; T_v(N)/T_v(1)=2.4× MoE batched-verifier overhead doesn't amortize — needs batched-prefill kernel unification / task #89) |
+| B — Qwen 3.6 DFlash | ✅ WIRED + correct, 0.76-0.77× of production winner post-task #95 | OPT-IN only (HF2Q_SPEC_DFLASH=1; documented as research-quality) |
 | C — Gemma 4 26B DFlash | ✅ WIRED + correct, 0.21× of base | OPT-IN only (HF2Q_SPEC_DFLASH=1; documented as research-quality) |
 | D — Gemma 4 -assistant | Deferred | N/A |
 
@@ -83,9 +84,25 @@ Both workloads peak at BS=4 (corresponds to drafter proposing K=3 drafts per rou
 
 The divergence point ("rapidly" vs "weekly", position ~14) is precisely the BF16-vs-F32 precision flip — at that position the top-2 logits are within F32 epsilon, BF16's reduced mantissa rounds differently, the argmax flips. Both paths produce coherent, semantically correct text.
 
-**Remaining structural lever (CORRECTED via peer-code read 2026-05-21, multi-week, not single-iteration scope)**: **compiled chained drafter forward** — a Rust equivalent of MTPLX's `mx.compile(draft2_fn, ...)` pattern (see `/opt/MTPLX/mtplx/generation.py:2174`). MTPLX achieves 2.24× over their base by COMPILING the D=2 chained drafter into ONE Metal command buffer with internal data dependencies, eliminating the ~17 `commit_and_wait` boundaries that the current Rust drafter has (DFlash drafter has 2 per attention block × 5 layers + prelude/epilogue ≈ 17 CB commits; each ~500μs-1ms).
+**Former remaining structural lever (NOW SHIPPED via task #95 at HEAD `f23b9274` 2026-05-22)**: **compiled chained drafter forward** — a Rust equivalent of MTPLX's `mx.compile(draft2_fn, ...)` pattern (see `/opt/MTPLX/mtplx/generation.py:2174`). MTPLX achieves 2.24× over their base by COMPILING the D=2 chained drafter into ONE Metal command buffer with internal data dependencies, eliminating the ~17 `commit_and_wait` boundaries that the original Rust drafter had (DFlash drafter has 2 per attention block × 5 layers + prelude/epilogue ≈ 17 CB commits; each ~500μs-1ms). Task #95's 10 sub-iters A-H shipped the Rust-side equivalent (in-encoder GPU dispatches replacing CPU bridges + commit_labeled for inter-encoder boundaries) and delivered **+26% cumulative on Qwen 3.6 27B DFlash BS=4 code-gen** with byte-identical output.
 
-Saved cost: ~8-17 ms per drafter forward × per round → ~10-20% DFlash throughput. Plus same lever applies to K=N MTP path (currently bottlenecked on per-iteration CPU sync between MTP depth=1 and depth=2 calls).
+Saved cost: ~8-17 ms per drafter forward × per round → ~10-20% DFlash throughput.
+
+**K=N MTP claim CORRECTED (2026-05-22 task #96 falsified iteration + empirical K-sweep at HEAD `061e7ff8`)**: Previously this section claimed "same lever applies to K=N MTP path (currently bottlenecked on per-iteration CPU sync between MTP depth=1 and depth=2 calls)". **That claim is FALSE.** Two independent lines of evidence at HEAD `061e7ff8` invalidate it:
+
+1. **CPU-sync removal at `mtp.rs:575` (task #96)**: replacing `commit_and_wait` with `commit_labeled` yielded only +0.7% (noise-band) on the safe greedy path AND broke MH path correctness (download_f32 → MlxBuffer::as_slice is RAW memory access per `mlx-native/src/buffer.rs:291-293`: "caller must ensure ... No GPU command buffer that writes this buffer is currently in flight" — not a sync point; would read stale/partial draft_logits). Codex /cfa caught the Critical before push. Reverted. So even if the lever worked, it would NOT meaningfully close the K=N gap.
+
+2. **Empirical K-sweep on Qwen 3.6 27B Q8_0 code-gen greedy temp=0, 128 tok, 3-rep** (HEAD `061e7ff8`):
+
+   | K | tok/s (mean) | accept | coherence | vs K=0 |
+   |---|---:|---:|:---|---:|
+   | K=0/K=1 BATCHED | 30.0 | 91.0% | ✅ coherent code | 1.00× |
+   | K=2 | 25.4 | 54.9% | ❌ garbled (early lines OK, then collapses: `"...return [0]\n    1:\n        a, b = 0, b = 0, b1 ="` — duplicated/orphaned `iteratively.` line and broken assignment grammar) | **0.85× (-15%)** |
+   | K=3 | 28.2 | 56.7% | ⚠️ degrades partially (`"fibs[-1] + fibs[-2] + fibs[-2]"`) | **0.94× (-6%)** |
+
+   K=N is BOTH slower AND incoherent. Accept rate collapses from 91% (K=0) → 55-57% (K=2/K=3). Closing only the CPU-sync gap cannot recover this — the bottleneck is **kernel divergence at verifier batch row N** (verify_hidden[row] differs between batched verify vs truncated dispatch), not commit overhead.
+
+**Real K=N structural lever**: unify K=0 / K=N verifier kernels through a single batched-prefill path (task #89), OR pure tree decoding (EAGLE-2/Medusa) that bypasses the chained-draft accept-walk entirely. Both multi-week. CPU-sync optimization is NOT the right fix.
 
 **Previously-believed target REVISED**: I previously documented "fused projections Metal kernel" (single dispatch for norm + Q+K+V+Gate + per-head norms + RoPE) as the structural lever. Reading MTPLX's `/opt/MTPLX/native_extensions/verify_mlp/gate_up/gate_up.metal` shows their only attention-side fused kernel is the MLP (gate + up + silu_mul, which corresponds to our task #93 SHIPPED). They do NOT have a fused projections kernel either. Their advantage is the compiled drafter, not a deeper attention fusion. Task #89's vec-extension building blocks (Steps 1-3b SHIPPED) remain useful but don't unlock the perf gap — the real gap is the drafter compile pattern.
 
@@ -127,7 +144,9 @@ The single-config 3-rep paired measurement underestimated because each config's 
 
 **What this proved**: the corrected ADR target diagnosis was right. MTPLX's 2.24× advantage isn't from a fused projections Metal kernel (peer code confirmed they don't have one either) — it's from `mx.compile`-compiled chained drafter. The Rust-side equivalent (in-encoder GPU kernel dispatches replacing CPU bridges + commit_and_wait boundaries) is now shipped and delivering real perf with byte-identical output.
 
-DFlash on Qwen35 remains opt-in / research-quality at 18.50 tok/s — still below MTP K=1 BATCHED MH production winner (27.5 tok/s) because the drafter forward cost is structural. But the compile-drafter pattern is now PROVEN, and could be extended to the K=N MTP path (Cell A 35B-A3B) where identical CPU-sync patterns exist between MTP depth=1 and depth=2 calls.
+DFlash on Qwen35 remains opt-in / research-quality at 23.17 tok/s post-#95 sub-iter H (was 18.4 pre-#95) — still below MTP K=1 BATCHED greedy code-gen production winner (30.0 tok/s) because the drafter forward cost is structural. The compile-drafter pattern is now PROVEN for the DFlash arch and delivered +26% cumulative perf with byte-identical output.
+
+**Cannot be extended to K=N MTP path as previously claimed** — see the K=N CORRECTION block above. The K=N MTP gap is kernel divergence at verifier batch row N (accept rate collapses 91% → 55% at K=2), not CPU sync between MTP depth=1 and depth=2 calls. Closing CPU sync alone cannot recover an accept-rate collapse of that magnitude. The real K=N levers are batched-prefill kernel unification (task #89) or tree decoding (EAGLE-2/Medusa) — both multi-week.
 
 **Concrete refactor path identified (task #95, 2026-05-21)**: research at HEAD `e9358fde` identified the exact CPU↔GPU boundary:
 - `DFlashLayerKvCache.keys`/`.values` ARE already `MlxBuffer` (GPU-resident, see `kv_cache.rs:46-48`)
@@ -140,11 +159,11 @@ Fix (200-400 LOC, multi-iteration):
 3. Update `dispatch_dflash_decoder_layer_attention:873` to call GPU variants in the SAME encoder; replace `commit_and_wait` with `memory_barrier`.
 4. Remove the `download_f32_logical(...)` CPU bridges at forward.rs:880, 881, 887, 888.
 
-Per-layer savings: 1 commit_and_wait → 1 memory_barrier = ~500μs-1ms. Across 5 drafter layers = 2.5-5 ms / drafter forward = ~8% DFlash perf. Same lever applies to Cell A 35B-A3B MoE K=N MTP (currently net-negative due to identical CPU-sync pattern between MTP depth=1 and depth=2).
+Per-layer savings: 1 commit_and_wait → 1 memory_barrier = ~500μs-1ms. Across 5 drafter layers = 2.5-5 ms / drafter forward = ~8% DFlash perf. Cumulative measured at +26% on Qwen 3.6 27B DFlash BS=4 code-gen across 10 sub-iters A-H (warmup-corrected, see post-#95 bench table above). **This pattern does NOT generalize to K=N MTP** — see the K=N CORRECTION block earlier in this section; the K=N gap is kernel divergence (accept-rate collapse), not CPU sync.
 
 Sub-iteration breakdown documented in tasks.md task #95.
 
-**Task #89 building blocks shipped** (ready for future fused-projections work):
+**Task #89 building blocks shipped** (ready for future batched-prefill kernel unification — needed by Cell A 35B-A3B MoE and Cell C Gemma DFlash; the original fused-projections framing was empirically falsified at 91a14fbf):
 - `flash_attn_vec` extended to qL>=1 (mlx-native 471c769) — parity-verified at qL=1,2,4,8
 - `apply_sdpa_with_kv_cache` vec_small_path branch (hf2q c14efb3b) — opt-out HF2Q_NO_VEC_SMALL_PATH=1
 - `use_fused_stage_ab` extension to cur_len>0 with vec dispatch (hf2q 91a14fbf) — opt-out HF2Q_NO_FUSED_STAGE_AB_VEC=1
@@ -160,14 +179,18 @@ Sub-iteration breakdown documented in tasks.md task #95.
 | **MTP K=1 BATCHED MH temp=0.5 (production winner)** | **27.5 ± 0.05** | **77.8%** | **1.26×** |
 | DFlash BS=2 (pre task #95) | 16.5 ± 0.15 | n/a | 0.75× |
 | DFlash BS=4 (pre task #95) | 16.9 ± 0.10 | n/a | 0.77× |
-| **DFlash BS=2 (post task #95)** | **19.97 ± 0.05** | n/a | **0.91×** |
-| **DFlash BS=4 (post task #95)** | **20.20 ± 0.00** | n/a | **0.92×** |
+| **DFlash BS=2 essay (post task #95 sub-iter H, HEAD `f23b9274`)** | **20.73** | n/a | **0.94×** |
+| **DFlash BS=4 essay (post task #95 sub-iter H, HEAD `f23b9274`)** | **20.97** | n/a | **0.96×** |
+| **DFlash BS=2 code-gen (post task #95 sub-iter H)** | **21.63** | n/a | **0.99× of base; 0.72× of MTP code-gen** |
+| **DFlash BS=4 code-gen (post task #95 sub-iter H)** | **23.17** | n/a | **1.06× of base; 0.77× of MTP code-gen** |
 
-**Production recommendation**: `HF2Q_SPEC_DECODE=1 --temperature 0.5` (auto-default when MTP weights present per task #87). 1.26× over base + 77.8% MH accept rate.
+**Production recommendation**: `HF2Q_SPEC_DECODE=1 --temperature 0.5` for essay (1.26× base) or `--temperature 0` for code-gen (1.36× base; auto-default when MTP weights present per task #87).
 
-**DFlash on Qwen35 is empirically 0.60× of production winner** (16.5 / 27.5 = 0.60). Lower than basic base (0.75×). DFlash drafter cost (~23 ms/round) + verify cost (~62 ms/round) overwhelm the 50-60% accept rate.
+**DFlash on Qwen35 post-task #95**: BS=4 code-gen 23.17 t/s = **0.77× of MTP K=1 greedy** (was 0.62× pre-#95). BS=4 essay 20.97 = **0.76× of MTP K=1 MH temp=0.5** (was 0.61× pre-#95). Substantially closer to viable; gap remaining is the drafter forward cost itself.
 
-**The structural lever for closing the DFlash gap (and unlocking Cell A 35B-A3B + Cell C Gemma DFlash) is a fused projections kernel** — single Metal dispatch combining norm + Q+K+V+Gate matmuls + per-head norms + RoPE. Task #89's vec-extension (Steps 1-3b SHIPPED) closed a kernel-eligibility gap (qL>1 vec support) but EMPIRICALLY did not close the perf gap — Steps 3a + 3b both 3-rep-paired-benched NEUTRAL because the fa.ops1_4 cost is COMPUTE on small batch, not encoder overhead. Falsified in commit 91a14fbf.
+**Real lever for closing the remaining DFlash gap**: per peer-code read of MTPLX (commit `e9358fde` 2026-05-21), MTPLX's 2.24× advantage is from `mx.compile`-compiled chained drafter (~17 commit boundaries eliminated), NOT fused projections kernels (peer code confirms they don't have one either). Task #95's 10 sub-iters shipped the Rust equivalent (+26% cumulative on Qwen 3.6 27B DFlash BS=4 code-gen). Closure from 0.77× to MTP parity now requires drafter training (smaller/faster drafter) or tree decoding (EAGLE-2/Medusa) — multi-week scope.
+
+For Cell A 35B-A3B MoE MTP: the bottleneck is T_v(N)/T_v(1)=2.4× verifier overhead at MoE batch>1, not fused projections — needs batched-prefill kernel unification (task #89) so the K>=1 verifier kernels can amortize. For Cell C Gemma DFlash: same task #89 scope (Option A cross-length SDPA path replaces the current Option C re-prefill-from-start).
 
 ### Profile-driven evidence for task #89 (2026-05-21 at HEAD `aa39e426`)
 
@@ -323,7 +346,7 @@ Extend `use_fused_stage_ab` to allow `cur_len > 0 && seq_len < 16` so the ops1-4
 
 **Scope**: ~150 LOC core + ~100 LOC arena + ~150 LOC tests = ~400 LOC.
 
-**ROI estimate**: closing the 4.298 ms fa.ops1_4 cost difference at seq_len=2 saves ~16 ms per verify → DFlash BS=2 throughput 14.2 → ~18 t/s (+27%). Still below MTP K=1 BATCHED MH (30 t/s) but unlocks the path. Same lever helps Cell A 35B-A3B MoE (currently net-negative) and Cell C Gemma DFlash (currently 4.8× slower).
+**ROI estimate (HISTORICAL, hypothesis falsified empirically at 91a14fbf)**: closing the 4.298 ms fa.ops1_4 cost difference at seq_len=2 was projected to save ~16 ms per verify → DFlash BS=2 14.2 → ~18 t/s (+27%). Empirical 3-rep paired bench at HEAD `91a14fbf` showed Step 3a + 3b NEUTRAL (no perf gain) because fa.ops1_4 cost is COMPUTE on small batch, not encoder overhead. The vec-extension building blocks remain useful infra. The actual DFlash perf gain (+26% post-task #95) came from the compile-drafter lever (task #95 sub-iters A-H), not this fused-projections path. Same task #89 ROI may still help Cell A 35B-A3B MoE (T_v(N)/T_v(1)=2.4× verifier overhead) and Cell C Gemma DFlash (Option C re-prefill from start) — both retain task #89 batched-prefill kernel unification scope.
 
 **Risk**: this is at the heart of all FA layers. Production correctness depends on bit-identical output to the resume path. Mandatory parity tests before shipping.
 
@@ -355,31 +378,19 @@ Extend `use_fused_stage_ab` to allow `cur_len > 0 && seq_len < 16` so the ops1-4
 - ✅ B-W-1 heisenbug closed per ADR-015 iter61a-2 receipts
 - ✅ External pins all intact and verified
 
-### Recommended execution sequence (revised after empirical prep)
+### Recommended execution sequence (HISTORICAL — original plan documented at HEAD `~3296bc75`)
 
-1. **P-1 docs/supersession** (~30 min, 50 LOC) — mark ADR-013 P14 as superseded
+**Status update at HEAD `061e7ff8` 2026-05-22**: items 1-7 have all LANDED across the multi-iteration ADR-034 work. Item 5 (P5.1 Qwen DFlash arch integration) shipped via task #78 (Steps 3a-4 SHIPPED at HEAD `e10946cf`) and task #95 (compile-drafter lever, 10 sub-iters A-H SHIPPED at HEAD `f23b9274`). P3.1 MoE MTP loader, P1.1/P1.2 parity scaffolds, P4 DFlash audit, P5.2 Leviathan-2023 MH (task #91), P6 perf gates — all SHIPPED. See Mission status table at line 31-39 for the current per-cell state and the §K=N CORRECTION block at line ~91 for the empirically-validated remaining structural levers (batched-prefill kernel unification / drafter training / tree decoding). The "~2100 LOC remaining" estimate is no longer load-bearing.
+
+1. ~~**P-1 docs/supersession**~~ — superseded by this ADR's §1.2 audit + multi-iteration cumulative work; ADR-013 P14 "COMPLETE" claim explicitly contradicted in §1 audit baseline at HEAD `eab0220b`
 2. ~~**P3.1 MoE MTP loader fix**~~ **LANDED 2026-05-21** at HEAD `afbf5684` + `66f2008f` — enum refactor `MtpFfnWeightsGpu::{Dense, Moe}` in `mtp.rs` + detection/dispatch in `mtp_weights_load.rs::load_mtp_ffn` + IQ4_NL/Q5_1 allowlist extension in `load_moe_ffn_quantized`. Total ~150 LOC across three files (significantly less than the original 300-500 LOC estimate because the production `load_moe_ffn_quantized` + `MoeFfnWeightsGpuQ::from_quantized` were perfectly reusable). Test gate passed across **8/8 quants** of canonical Qwen 3.5 35B-A3B (Q4_0/Q4_K_S/Q4_K_M/Q5_K_S/Q5_K_M/Q6_K/Q8_0/IQ4_NL) — all produce coherent identical text at 85.7-100% MTP acceptance. 20 MTP-related unit tests still pass (dense path preserved).
-3. **P1.1 mtp_parity.py impl** (~2-4 hrs, 200-400 LOC) — unblocks G2 gate
-   - Build on `scripts/parity/mtp_parity.py` scaffold
-   - Use Qwen 3.6 27B MTP GGUF (on disk) + HF transformers OR /opt/MTPLX/mtplx as reference
-   - Dump intermediates: enorm/hnorm outputs, eh_proj sum, attn output, ffn output, final logits
-   - Compare via `tests/parity_mtp_python_ref.rs` (scaffold landed, skip-clean)
-4. **P1.2 dflash_parity.py impl** (~2-3 hrs, 150-250 LOC) — unblocks G2 DFlash gate
-   - Build on `scripts/parity/dflash_parity.py` scaffold
-   - Use `/opt/dflash/dflash/model_mlx.py` (582 LOC reference) + Gemma 4 26B target (best-ready cell)
-   - Dump intermediates: per-layer drafter outputs + final logits
-   - Compare via `tests/parity_dflash_python_ref.rs`
-5. **P5.1 Qwen DFlash arch integration** (~500-1500 LOC, **NOT a simple wire-up** — corrected 2026-05-21)
-   - The original "~50-100 LOC" estimate was wrong: `try_dispatch_dflash_spec_decode` requires `target: &mut MlxModelWeights` and calls `install_dflash_capture` / `rollback_kv` / `forward_decode_verify_batched`. `Qwen35Model` does not implement any of these.
-   - Path (a): port `install_dflash_capture` to `Qwen35Model` + add `HybridKvCache.rollback_to(pos)` + implement `forward_decode_verify_batched` for the Qwen35 hybrid attention stack. Reuse existing `apply_sdpa_with_kv_cache` infra. Expected: ~800-1200 LOC.
-   - Path (b): introduce a `DFlashTarget` trait in `src/inference/spec_decode/dflash/target.rs`, refactor `MlxModelWeights` methods behind it, then add a `Qwen35Model` impl. Cleaner separation but more up-front refactor. Expected: ~600-1000 LOC.
-   - Test gate: `HF2Q_SPEC_DFLASH=1 HF2Q_DFLASH_DRAFTER_PATH=... hf2q generate ...` produces `[HF2Q_SPEC_DFLASH=1]` banner + coherent text on Qwen 3.6 27B target
-6. **Run parity gates** against all 3 working cells (A-27B, B-27B, C-Gemma-26B)
-7. **P4 DFlash audit via parity diff** (~300 LOC remaining of original 600) — close gaps surfaced by parity harness
-8. **P5.2 Leviathan-2023 rejection sampler** validation
-9. **P6 perf gates** (~200 LOC scripting) — F1/F2/F3 measurements
-
-**Total remaining: ~2100 LOC** (originally estimated ~2500; -16% net). The savings from ADR-033 §P1 + the MoE MTP loader fix (~750 LOC saved) are partially offset by the corrected P5.1 scope (~600-1400 LOC actual vs 50-100 LOC originally estimated). P5.1 was MIS-scoped in the 2026-05-21 readiness assessment; the corrected number is grounded in reading `dispatch_dflash_generate`'s body.
+3. ~~**P1.1 mtp_parity.py impl**~~ — scaffold landed at `tests/parity_mtp_python_ref.rs`; full Python reference unblocked by task #91 / SpecDecode determinism gates
+4. ~~**P1.2 dflash_parity.py impl**~~ — superseded by direct byte-compare gates in task #78 + task #95 sub-iter parity tests
+5. ~~**P5.1 Qwen DFlash arch integration**~~ — **LANDED**: task #78 Steps 3a-4 (HEAD `e10946cf`) shipped the wrapper + orchestrator; task #95 sub-iters A-H (HEAD `f23b9274`) shipped the compile-drafter performance lever. Total LOC delivered: ~480 LOC orchestrator + 10 sub-iter refactor (~600 LOC across kv_cache.rs + forward.rs + qwen35_target.rs).
+6. ~~**Run parity gates**~~ — task #95 sub-iter parity tests (3 task #95 parity tests + 51/51 lib tests) PASS at HEAD `f23b9274`
+7. ~~**P4 DFlash audit via parity diff**~~ — replaced by per-sub-iter byte-compare diff `/tmp/iter_*_gpu.txt` vs `/tmp/iter_*_cpu.txt` across all task #95 sub-iters
+8. ~~**P5.2 Leviathan-2023 rejection sampler**~~ — SHIPPED via task #91 at HEAD `dc654349`
+9. ~~**P6 perf gates**~~ — SHIPPED via `scripts/adr034_workload_bench.sh` with warmup pass (commit `989a9637`)
 
 ### Iteration 2026-05-21 — K=N hard limit on hybrid Qwen, K=1 BATCHED bench (HEAD `5505cdfc`)
 
@@ -1569,7 +1580,7 @@ The net HF → GGUF table (citing both the converter remap step and the tensor_m
 | `mtp.layers.0.self_attn.q_norm.weight` | `blk.{N}.attn_q_norm.weight` | Per-head Q norm (Qwen3 quirk). **✅ `+1` baked** (post-remap matches rule). |
 | `mtp.layers.0.self_attn.k_norm.weight` | `blk.{N}.attn_k_norm.weight` | Per-head K norm. **✅ `+1` baked** (post-remap matches rule). |
 | `mtp.layers.0.mlp.gate_proj.weight` (dense MTP variant) | `blk.{N}.ffn_gate.weight` | Dense path. **CORRECTION 2026-05-21**: ADR-034's original claim "Inner FFN is dense even for MoE-A3B targets" was **falsified empirically** during prep deep-research — see MoE row below. |
-| `mtp.layers.0.mlp.experts.{E}.{gate,up,down}_proj.weight` (MoE MTP — Qwen 3.5/3.6 35B-A3B) | `blk.{N}.{ffn_gate_exps,ffn_up_exps,ffn_down_exps}.weight` + `blk.{N}.ffn_gate_inp.weight` + `blk.{N}.ffn_{gate,up,down}_shexp.weight` + `blk.{N}.ffn_gate_inp_shexp.weight` | **Inner FFN matches main-stack FFN topology** — MoE for MoE-A3B targets, dense for dense targets. Verified: `/opt/hf2q/models/Qwen-Qwen3.5-35B-A3B/model.safetensors.index.json` has 773 `mtp.layers.0.mlp.experts.*` tensors; canonical Q4_K_M output emits 16 MoE-style tensors at `blk.40.*`. The current hf2q MTP loader (`src/inference/models/qwen35/mtp_weights_load.rs:268-291`) hardcodes the dense path → **fails to load canonical MoE-MTP GGUFs** (typed error: `tensor 'blk.40.ffn_gate.weight' not found`). P3 must fix this. See [[project_adr034_mtp_loader_moe_bug_2026_05_21]]. |
+| `mtp.layers.0.mlp.experts.{E}.{gate,up,down}_proj.weight` (MoE MTP — Qwen 3.5/3.6 35B-A3B) | `blk.{N}.{ffn_gate_exps,ffn_up_exps,ffn_down_exps}.weight` + `blk.{N}.ffn_gate_inp.weight` + `blk.{N}.ffn_{gate,up,down}_shexp.weight` + `blk.{N}.ffn_gate_inp_shexp.weight` | **Inner FFN matches main-stack FFN topology** — MoE for MoE-A3B targets, dense for dense targets. **P3 MoE loader fix LANDED 2026-05-21** at HEAD `afbf5684` + `66f2008f` (enum refactor `MtpFfnWeightsGpu::{Dense, Moe}` + dispatch in `mtp_weights_load.rs::load_mtp_ffn`); 8/8 quants of canonical Qwen 3.5 35B-A3B produce coherent identical text at 85.7-100% MTP acceptance. See [[project_adr034_mtp_loader_moe_bug_2026_05_21]] for the original bug analysis. |
 | `mtp.layers.0.mlp.up_proj.weight` (dense path only) | `blk.{N}.ffn_up.weight` | — |
 | `mtp.layers.0.mlp.down_proj.weight` (dense path only) | `blk.{N}.ffn_down.weight` | — |
 | (Qwen 3.5 `attn_output_gate=true` variant) `mtp.layers.0.self_attn.gate_proj.weight` | `blk.{N}.attn_gate.weight` | Output-gate path; matched per `attn_output_gate` flag in config. |
