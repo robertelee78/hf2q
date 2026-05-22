@@ -108,16 +108,19 @@ impl<'a> DFlashTarget for Qwen35DFlashTarget<'a> {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
-        // Build positions: for Qwen35 RoPE, positions are a flat [seq_len * 4]
-        // i32 array where each token has 4 position values (one per RoPE
-        // axis: t, h, w, padding). For DFlash on text-only Qwen35, all 4
-        // axes use the same value (no vision/multi-axis spans).
+        // Build positions: Qwen35 RoPE expects an AXIS-MAJOR layout
+        // `[axis0_t0, axis0_t1, ..., axis0_tN-1, axis1_t0, ..., axis3_tN-1]`
+        // — 4 contiguous per-axis spans of length `seq_len` each. Use the
+        // canonical helper `positions_for_range` from
+        // `crate::inference::models::qwen35::spec_decode` to guarantee
+        // the right layout (cont. — codex /cfa caught a previous
+        // token-major layout bug in this wrapper).
+        let positions_flat =
+            crate::inference::models::qwen35::spec_decode::positions_for_range(
+                start_seq_pos as i32,
+                tokens.len(),
+            );
         let seq_len = tokens.len();
-        let mut positions_flat = Vec::with_capacity(seq_len * 4);
-        for i in 0..seq_len {
-            let p = (start_seq_pos + i) as i32;
-            positions_flat.extend_from_slice(&[p, p, p, p]);
-        }
 
         // Forward call. `forward_gpu_with_hidden` returns
         // (logits: Vec<f32>[seq_len * vocab_size], hidden: MlxBuffer).
