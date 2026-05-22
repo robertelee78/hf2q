@@ -2904,6 +2904,17 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         return Ok(());
     }
 
+    if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_qwen35_eagle3_spec_decode(
+        &mut model,
+        &prompt_tokens,
+        args.max_tokens,
+        &eos_token_ids,
+        args.ignore_eos,
+        &tokenizer,
+    )? {
+        return Ok(());
+    }
+
     let spec_env = std::env::var("HF2Q_SPEC_DECODE").ok();
     let mut use_spec_decode = match spec_env.as_deref() {
         Some("0") => false,

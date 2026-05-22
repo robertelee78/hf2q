@@ -5811,6 +5811,217 @@ impl Qwen35Model {
     }
 }
 
+impl Qwen35Model {
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_tree_verify_gpu(
+        &self,
+        tree_tokens: &[u32],
+        tree_mask: &[f32],
+        tree_positions_flat: &[i32],
+        prefix_len: usize,
+        kv_cache: &mut HybridKvCache,
+        hidden_collector: &mut crate::inference::spec_decode::eagle3::multi_layer_hidden::Eagle3HiddenCollector,
+    ) -> Result<Vec<f32>> {
+        if tree_tokens.is_empty() {
+            return Err(anyhow!("forward_tree_verify_gpu: tree_tokens must be non-empty"));
+        }
+        let tree_seq_len = tree_tokens.len();
+        let mask_stride = prefix_len
+            .checked_add(tree_seq_len)
+            .ok_or_else(|| anyhow!("forward_tree_verify_gpu: prefix_len + tree_seq_len overflow"))?;
+        ensure!(
+            tree_mask.len() == tree_seq_len * mask_stride,
+            "forward_tree_verify_gpu: tree_mask len {} != tree_seq_len({}) * mask_stride({})",
+            tree_mask.len(),
+            tree_seq_len,
+            mask_stride
+        );
+        ensure!(
+            tree_positions_flat.len() == tree_seq_len * 4,
+            "forward_tree_verify_gpu: tree_positions len {} != tree_seq_len({}) * 4",
+            tree_positions_flat.len(),
+            tree_seq_len
+        );
+        ensure!(
+            hidden_collector.seq_len() == tree_seq_len,
+            "forward_tree_verify_gpu: collector seq_len {} != tree_seq_len {}",
+            hidden_collector.seq_len(),
+            tree_seq_len
+        );
+        ensure!(
+            hidden_collector.hidden_size() == self.cfg.hidden_size as usize,
+            "forward_tree_verify_gpu: collector hidden_size {} != model hidden_size {}",
+            hidden_collector.hidden_size(),
+            self.cfg.hidden_size
+        );
+        ensure!(
+            prefix_len + tree_seq_len <= kv_cache.max_seq_len as usize,
+            "forward_tree_verify_gpu: prefix_len {} + tree_seq_len {} > kv_cache.max_seq_len {}",
+            prefix_len,
+            tree_seq_len,
+            kv_cache.max_seq_len
+        );
+        self.ensure_gpu_cache_primed()?;
+        hidden_collector.reset();
+        let self_ptr = self as *const _ as *const ();
+        GPU_CACHE.with(|cell| -> Result<Vec<f32>> {
+            let mut guard = cell.borrow_mut();
+            let cache = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("forward_tree_verify_gpu: GPU_CACHE not initialized"))?;
+            ensure!(
+                cache.model_ptr == self_ptr,
+                "forward_tree_verify_gpu: GPU_CACHE belongs to a different Qwen35Model"
+            );
+            let device = &cache.device;
+            let registry = &mut cache.registry;
+            let cfg = &self.cfg;
+            let mut hidden = embed_tokens_gpu(
+                tree_tokens,
+                &self.token_embd,
+                cfg.vocab_size,
+                cfg.hidden_size,
+                device,
+            )
+            .context("forward_tree_verify_gpu: embed tree tokens")?;
+            let tree_mask_buf =
+                upload_tree_f32_pooled(device, tree_mask, vec![tree_seq_len, mask_stride])
+                    .context("forward_tree_verify_gpu: upload tree_mask")?;
+            let tree_pos_buf =
+                upload_tree_i32_pooled(device, tree_positions_flat, vec![tree_seq_len, 4])
+                    .context("forward_tree_verify_gpu: upload tree_positions")?;
+            for (layer_idx, layer_gpu) in cache.layer_weights.iter().enumerate() {
+                let (attn, ffn_q) = match layer_gpu {
+                    LayerWeightsGpu::FullAttn { attn, ffn } => {
+                        let FfnWeightsGpu::DenseQ(ffn_q) = ffn else {
+                            return Err(anyhow!(
+                                "forward_tree_verify_gpu: layer {layer_idx} FFN must be DenseQ"
+                            ));
+                        };
+                        (attn, ffn_q)
+                    }
+                    LayerWeightsGpu::LinearAttn { .. } => {
+                        return Err(anyhow!(
+                            "forward_tree_verify_gpu: layer {layer_idx} is LinearAttn; F3 supports full-attention DenseQ only"
+                        ));
+                    }
+                };
+                let full_attn_rank = match kv_cache.slot_index_for_layer(layer_idx as u32) {
+                    Some(super::kv_cache::LayerSlot::Full(rank)) => rank as usize,
+                    other => {
+                        return Err(anyhow!(
+                            "forward_tree_verify_gpu: layer {layer_idx}: expected FullAttn slot, got {:?}",
+                            other
+                        ))
+                    }
+                };
+                let slot = &mut kv_cache.full_attn[full_attn_rank];
+                let k_cache = slot.k.as_mut().ok_or_else(|| {
+                    anyhow!("forward_tree_verify_gpu: F32 K cache missing for layer {layer_idx}")
+                })?;
+                let v_cache = slot.v.as_mut().ok_or_else(|| {
+                    anyhow!("forward_tree_verify_gpu: F32 V cache missing for layer {layer_idx}")
+                })?;
+                let shape = super::gpu_full_attn::Qwen35TreeVerifyFullLayerShapeQ {
+                    attn: super::gpu_full_attn::Qwen35TreeVerifyLayerShape {
+                        hidden_size: cfg.hidden_size,
+                        num_q_heads: cfg.num_attention_heads,
+                        num_kv_heads: cfg.num_key_value_heads,
+                        head_dim: cfg.head_dim,
+                        tree_seq_len: tree_seq_len as u32,
+                        cache_prefix_len: prefix_len as u32,
+                        kv_capacity: kv_cache.max_seq_len as u32,
+                        mask_stride: mask_stride as u32,
+                        rotary_dim: cfg.rotary_dim,
+                        freq_base: cfg.rope_theta as f32,
+                        mrope_section: cfg.mrope_section,
+                        rms_norm_eps: cfg.rms_norm_eps,
+                        attn_output_gate: cfg.attn_output_gate,
+                    },
+                    intermediate_size: ffn_q.intermediate_size,
+                };
+                let enc = device
+                    .command_encoder()
+                    .context("forward_tree_verify_gpu: command_encoder")?;
+                hidden = super::gpu_full_attn::qwen35_tree_verify_full_layer_q(
+                    enc,
+                    device,
+                    registry,
+                    &hidden,
+                    &tree_mask_buf,
+                    &tree_pos_buf,
+                    k_cache,
+                    v_cache,
+                    attn,
+                    ffn_q,
+                    shape,
+                )
+                .with_context(|| format!("forward_tree_verify_gpu: layer {layer_idx}"))?;
+                if let Some(capture_idx) = hidden_collector.capture_index_for(layer_idx) {
+                    let slab = download_f32(&hidden).with_context(|| {
+                        format!("forward_tree_verify_gpu: download capture layer {layer_idx}")
+                    })?;
+                    hidden_collector
+                        .write_layer_slab(capture_idx, &slab)
+                        .with_context(|| {
+                            format!("forward_tree_verify_gpu: write capture layer {layer_idx}")
+                        })?;
+                }
+            }
+            ensure!(
+                hidden_collector.is_complete(),
+                "forward_tree_verify_gpu: hidden collector incomplete after {} layers",
+                cache.layer_weights.len()
+            );
+            apply_output_head_gpu(
+                device,
+                registry,
+                &hidden,
+                &cache.output_head,
+                tree_seq_len as u32,
+                cfg.hidden_size,
+                cfg.vocab_size,
+                cfg.rms_norm_eps,
+            )
+            .context("forward_tree_verify_gpu: output head")
+        })
+    }
+}
+
+fn upload_tree_f32_pooled(
+    device: &MlxDevice,
+    data: &[f32],
+    shape: Vec<usize>,
+) -> Result<MlxBuffer> {
+    let bytes = data
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow!("upload_tree_f32_pooled: byte size overflow"))?;
+    let mut buf = super::decode_pool::pooled_alloc_buffer(device, bytes, DType::F32, shape)
+        .map_err(|e| anyhow!("upload_tree_f32_pooled: alloc: {e}"))?;
+    buf.as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("upload_tree_f32_pooled: slice: {e}"))?
+        .copy_from_slice(data);
+    Ok(buf)
+}
+
+fn upload_tree_i32_pooled(
+    device: &MlxDevice,
+    data: &[i32],
+    shape: Vec<usize>,
+) -> Result<MlxBuffer> {
+    let bytes = data
+        .len()
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or_else(|| anyhow!("upload_tree_i32_pooled: byte size overflow"))?;
+    let mut buf = super::decode_pool::pooled_alloc_buffer(device, bytes, DType::I32, shape)
+        .map_err(|e| anyhow!("upload_tree_i32_pooled: alloc: {e}"))?;
+    buf.as_mut_slice::<i32>()
+        .map_err(|e| anyhow!("upload_tree_i32_pooled: slice: {e}"))?
+        .copy_from_slice(data);
+    Ok(buf)
+}
+
 // ================================================================
 // Tests
 // ================================================================

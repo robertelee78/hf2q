@@ -547,6 +547,96 @@ pub fn try_dispatch_qwen35_dflash_spec_decode(
     Ok(Some(()))
 }
 
+/// Dispatch Qwen35 EAGLE-3 tree-verify decoding when
+/// `HF2Q_SPEC_EAGLE3=1` is set. Missing drafter artifacts return `Ok(None)`
+/// so the caller falls through to established decode paths.
+pub fn try_dispatch_qwen35_eagle3_spec_decode(
+    model: &mut crate::inference::models::qwen35::model::Qwen35Model,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    eos_token_ids: &[u32],
+    ignore_eos: bool,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<Option<()>> {
+    if std::env::var("HF2Q_SPEC_EAGLE3").as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    eprintln!(
+        "[HF2Q_SPEC_EAGLE3=1 qwen35] research-quality EAGLE-3 tree-verify path. \
+         Default production paths remain HF2Q_SPEC_DECODE / HF2Q_SPEC_DFLASH."
+    );
+
+    let Some(drafter_dir) = resolve_qwen35_eagle3_drafter_path()? else {
+        eprintln!(
+            "HF2Q_SPEC_EAGLE3=1 but HF2Q_EAGLE3_DRAFTER_PATH is unset; falling back to standard decode."
+        );
+        return Ok(None);
+    };
+    if !drafter_dir.is_dir() {
+        eprintln!(
+            "HF2Q_SPEC_EAGLE3=1 but drafter dir {} does not exist; falling back to standard decode.",
+            drafter_dir.display()
+        );
+        return Ok(None);
+    }
+    let weights_path = drafter_dir.join("model.safetensors");
+    if !weights_path.exists() {
+        eprintln!(
+            "HF2Q_SPEC_EAGLE3=1 but drafter weights {} do not exist; falling back to standard decode.",
+            weights_path.display()
+        );
+        return Ok(None);
+    }
+
+    use crate::inference::spec_decode::eagle3::tensors::Eagle3DrafterTensors;
+    use crate::inference::spec_decode::eagle3::weights::Eagle3Weights;
+    use crate::inference::spec_decode::eagle3_orchestrator::{
+        default_qwen35_eagle3_drafter_config, Eagle3Orchestrator, Eagle3OrchestratorConfig,
+    };
+
+    let drafter_cfg = default_qwen35_eagle3_drafter_config(model);
+    let weights_bytes = std::fs::read(&weights_path)
+        .with_context(|| format!("read EAGLE-3 drafter weights {}", weights_path.display()))?;
+    let weights = Eagle3Weights::load(&weights_bytes, &drafter_cfg)
+        .map_err(|e| anyhow::anyhow!("load EAGLE-3 drafter weights: {e}"))?;
+    model
+        .ensure_gpu_cache_primed()
+        .context("ensure_gpu_cache_primed before EAGLE-3 drafter upload")?;
+    let drafter_tensors = model.with_gpu_cache_mut(|device, _| {
+        Eagle3DrafterTensors::upload(device, &drafter_cfg, &weights)
+            .map_err(|e| anyhow::anyhow!("upload EAGLE-3 drafter tensors: {e}"))
+    })?;
+
+    let cfg =
+        Eagle3OrchestratorConfig::qwen35_default(model, max_new_tokens.max(1), eos_token_ids, ignore_eos);
+    let max_seq = prompt_tokens
+        .len()
+        .checked_add(max_new_tokens)
+        .and_then(|v| v.checked_add(cfg.dynamic_tree.budget))
+        .ok_or_else(|| anyhow::anyhow!("EAGLE-3 max_seq overflow"))?
+        .max(128)
+        .min(model.cfg.max_position_embeddings as usize);
+    let mut orchestrator =
+        Eagle3Orchestrator::new(model, cfg, &drafter_cfg, &drafter_tensors, max_seq)?;
+    let started = std::time::Instant::now();
+    let tokens = orchestrator.generate(model, prompt_tokens, Some(tokenizer))?;
+    eprintln!(
+        "[HF2Q_SPEC_EAGLE3] {} new tokens in {:.2}s ({:.1} tok/s)",
+        tokens.len(),
+        started.elapsed().as_secs_f64(),
+        tokens.len() as f64 / started.elapsed().as_secs_f64().max(1e-6),
+    );
+    Ok(Some(()))
+}
+
+fn resolve_qwen35_eagle3_drafter_path() -> Result<Option<std::path::PathBuf>> {
+    match std::env::var("HF2Q_EAGLE3_DRAFTER_PATH") {
+        Ok(s) if !s.trim().is_empty() => Ok(Some(std::path::PathBuf::from(s))),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("read HF2Q_EAGLE3_DRAFTER_PATH: {e}")),
+    }
+}
+
 /// Resolve `K` for the n-gram proposer.  Default = 3 per
 /// ADR-029 Phase 1 / vLLM literature (`k=3, max_ngram=3, min_ngram=1`).
 fn resolve_ngram_k() -> Result<u32> {
