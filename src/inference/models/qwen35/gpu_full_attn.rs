@@ -2950,11 +2950,45 @@ pub fn build_gated_attn_layer(
     //  - F11 (zero-init alloc): one new per-call alloc (`out_seq`),
     //    matching the wrapper at gpu_full_attn.rs:1411-1413 byte-for-byte.
     //    No new ad-hoc allocations introduced.
+    // ADR-034 task #89 Step 3b (2026-05-21) — extend fused stage to
+    // `cur_len > 0` when `seq_len < 16`. The fresh-prefill case
+    // (`cur_len == 0`) uses `apply_flash_attn_prefill_seq_major_into`
+    // inside the fused encoder; the new vec-small case (cur_len > 0 +
+    // seq_len < 16) dispatches `flash_attn_vec` with `q_seq_len =
+    // seq_len` instead. The vec kernel handles the offset KV-write
+    // case natively (q_l > 1 path empirically parity-verified at
+    // mlx-native 471c769, qL=1,2,4,8 on Qwen 3.6 27B FA shape).
+    //
+    // ROI: closes the fa.ops1_4 launch-overhead gap (4.298 ms at
+    // seq_len=2 cur_len>0 vs 0.422 ms at seq_len=20 cur_len=0) by
+    // collapsing ops1-4 + KV-write + SDPA + ops6-7 into ONE Metal
+    // command buffer at spec-decode verify forwards.
+    //
+    // Default ON because qL>1 vec is parity-verified end-to-end at
+    // the kernel level (mlx-native test_flash_attn_vec.rs:328-600) +
+    // routing level (hf2q vec_small_path 3-rep paired bench shows
+    // byte-identical output at qL=2 vs resume path). Env opt-out
+    // HF2Q_NO_FUSED_STAGE_AB_VEC=1 disables just the new vec-small
+    // branch; the cur_len==0 fused path is unaffected.
+    let allow_vec_small_in_fused =
+        std::env::var("HF2Q_NO_FUSED_STAGE_AB_VEC").as_deref() != Ok("1");
     let use_fused_stage_ab = use_arena
         && fa_proj_arena.is_some()
         && kv_cache_slot
             .as_deref()
-            .map(|s| s.current_len[0] == 0)
+            .map(|s| {
+                let cur = s.current_len[0];
+                // cur_len==0: existing fresh-prefill path.
+                // cur_len>0 + seq_len<16 + head_dim==256 + slot.k/v F32:
+                //   new vec-small path inside fused encoder.
+                cur == 0
+                    || (allow_vec_small_in_fused
+                        && cur > 0
+                        && seq_len < 16
+                        && head_dim == 256
+                        && s.k.is_some()
+                        && s.v.is_some())
+            })
             .unwrap_or(false)
         && !super::dump_bisect::is_enabled();
 
@@ -3210,7 +3244,12 @@ pub fn build_gated_attn_layer(
                 "use_fused_stage_ab implies fa_arena.is_some()"
             );
 
-            let cur_len_u32 = slot.current_len[0]; // == 0 by predicate
+            // ADR-034 task #89 Step 3b (2026-05-21) — cur_len may now be
+            // > 0 when seq_len < 16 + head_dim == 256 (vec-small path
+            // inside fused encoder; see predicate at use_fused_stage_ab
+            // above). Pre-task-#89 invariant `cur_len_u32 == 0` is now
+            // a SUBSET of the eligibility condition, NOT the whole.
+            let cur_len_u32 = slot.current_len[0];
             let max_sl = max_seq_len as usize;
             let kv_write_tokens =
                 (seq_len as usize).min(max_sl.saturating_sub(cur_len_u32 as usize));
@@ -3259,19 +3298,124 @@ pub fn build_gated_attn_layer(
                 hold.push(out_seq.clone());
             }
 
-            // Encode the FA bridge body (8 dispatches + 5 intra-encoder
-            // barriers) into the SAME `enc`. iter89e2-E's `_into` variant.
+            // Encode the FA bridge body into the SAME `enc`.
+            //
+            // ADR-034 task #89 Step 3b (2026-05-21) — dispatch branch:
+            // - cur_len == 0: existing fresh-prefill BF16 kernel (8
+            //   dispatches + 5 intra-encoder barriers via the _into
+            //   wrapper). Byte-identical to pre-task-#89.
+            // - cur_len > 0 (only fires when predicate above allowed,
+            //   i.e. seq_len < 16 + head_dim == 256 + slot.k/v F32):
+            //   flash_attn_vec with q_seq_len = seq_len. Reads slot.k/v
+            //   F32 head-major directly (no BF16 cast of the full
+            //   capacity). Saves the prefill kernel's BF16 setup +
+            //   eliminates the launch overhead that motivated this
+            //   step (4.298 ms fa.ops1_4 at seq_len=2 cur_len>0 vs
+            //   0.422 ms at seq_len=20 cur_len=0).
+            //
+            // Buffer-lifetime contract (codex /cfa 2026-05-21): the
+            // fused encoder is deferred (moved into fused_stage_a_enc
+            // for ops6-7 fusion). Any vec-path scratch buffers MUST
+            // outlive the deferred commit. We use `pooled_alloc_buffer`
+            // from the thread-local decode_pool, which keeps allocations
+            // alive until `reset_decode_pool` is called (top of next
+            // forward) — same lifetime contract as the existing arena
+            // scratches at forward_gpu_impl level.
             {
                 let _w5b10_kernel = super::wave5b8_profile::Section::start(
                     super::wave5b8_profile::SectionKind::FaSdpaKernel,
                 );
-                apply_flash_attn_prefill_seq_major_into(
-                    enc.encoder(), device, registry,
-                    &arena.q_rope_buf, &arena.k_rope_buf, &arena.v_proj_buf,
-                    &out_seq,
-                    seq_len, n_heads, n_kv_heads, head_dim,
-                    fa_pre,
-                )?;
+                if cur_len_u32 == 0 {
+                    apply_flash_attn_prefill_seq_major_into(
+                        enc.encoder(), device, registry,
+                        &arena.q_rope_buf, &arena.k_rope_buf, &arena.v_proj_buf,
+                        &out_seq,
+                        seq_len, n_heads, n_kv_heads, head_dim,
+                        fa_pre,
+                    )?;
+                } else {
+                    // ── ADR-034 task #89 Step 3b vec-small inside fused ──
+                    //
+                    // Pooled-alloc q_hm (head-major Q) + tmp (qL-aware).
+                    // Both live in the thread-local decode_pool which
+                    // is reset only at the top of the NEXT forward —
+                    // so they outlive the deferred commit by design.
+                    let q_hm = super::decode_pool::pooled_alloc_buffer(
+                        device,
+                        (seq * nh * d) * 4,
+                        DType::F32,
+                        vec![nh, seq, d],
+                    )
+                    .map_err(|e| anyhow!(
+                        "vec-small in fused stage: alloc q_hm: {e}"
+                    ))?;
+                    let tmp_bytes = flash_attn_vec_tmp_bytes_with_qL(
+                        n_heads, head_dim, seq_len,
+                    );
+                    let tmp_elems = tmp_bytes / 4;
+                    let tmp_buf = super::decode_pool::pooled_alloc_buffer(
+                        device, tmp_bytes, DType::F32, vec![tmp_elems],
+                    )
+                    .map_err(|e| anyhow!(
+                        "vec-small in fused stage: alloc tmp: {e}"
+                    ))?;
+
+                    // Permute arena.q_rope_buf SEQ-MAJOR [seq, nh, d]
+                    // → HEAD-MAJOR [nh, seq, d] into the SAME encoder.
+                    permute_021_f32(
+                        enc.encoder(), registry, device.metal_device(),
+                        &arena.q_rope_buf, &q_hm,
+                        seq, nh, d,
+                    )
+                    .context("vec-small in fused stage: permute Q seq->head")?;
+                    // RAW barrier: vec kernel reads q_hm just written.
+                    enc.encoder().memory_barrier();
+
+                    // slot.k / slot.v are F32 head-major at full
+                    // kv_capacity stride. The vec kernel reads them in
+                    // that exact layout (see flash_attn_vec.metal:131-135).
+                    // Predicate guard above ensures both are Some.
+                    let kbuf = slot.k.as_ref().expect(
+                        "vec-small in fused stage: slot.k.is_some() by predicate",
+                    );
+                    let vbuf = slot.v.as_ref().expect(
+                        "vec-small in fused stage: slot.v.is_some() by predicate",
+                    );
+
+                    let vec_params = FlashAttnVecParams {
+                        num_heads: n_heads,
+                        num_kv_heads: n_kv_heads,
+                        head_dim,
+                        kv_seq_len,
+                        kv_capacity: max_seq_len,
+                        scale: 1.0 / (d as f32).sqrt(),
+                        mask_type: 1, // causal
+                        sliding_window: 0,
+                        softcap: 0.0,
+                        q_seq_len: seq_len,
+                    };
+                    flash_attn_vec(
+                        enc.encoder(), registry, device,
+                        &q_hm, kbuf, vbuf, &out_seq, &tmp_buf,
+                        &vec_params,
+                    )
+                    .context("vec-small in fused stage: flash_attn_vec dispatch")?;
+
+                    // Push pooled clones into the K-batch hold-vec when
+                    // present, mirroring the existing out_seq hold pattern
+                    // (line ~3247). Defends against cross-iteration drop
+                    // races even though pooled buffers' lifetimes already
+                    // extend to next reset_decode_pool.
+                    if let Some(hold) = out_seq_hold.as_deref_mut() {
+                        hold.push(q_hm.clone());
+                        hold.push(tmp_buf.clone());
+                    }
+                    // We do NOT drop q_hm / tmp_buf here — they're held
+                    // by the decode_pool's in_use list (ARC) until the
+                    // next reset_decode_pool. The encoder's pending
+                    // dispatches reference them via the encode call.
+                    let _ = (q_hm, tmp_buf);
+                }
             }
 
             // Update KV cursor (CPU-only counter; safe before GPU completes).
