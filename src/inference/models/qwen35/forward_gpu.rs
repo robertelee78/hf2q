@@ -2024,6 +2024,46 @@ impl Qwen35Model {
             return Err(anyhow!("embed_tokens_gpu: tokens must be non-empty"));
         }
         let cfg = &self.cfg;
+        // Codex /cfa (cont. 40): the underlying io_heads::embed_tokens
+        // uses `assert!` / `assert_eq!` for table shape + token range
+        // (io_heads.rs:35 / io_heads.rs:48). Convert those to explicit
+        // Result-returning checks here so a public-API caller does not
+        // observe panics.
+        let h = cfg.hidden_size as usize;
+        if h == 0 {
+            return Err(anyhow!(
+                "embed_tokens_gpu: cfg.hidden_size must be > 0"
+            ));
+        }
+        if self.token_embd.len() % h != 0 {
+            return Err(anyhow!(
+                "embed_tokens_gpu: token_embd.len()={} not divisible by hidden_size={}",
+                self.token_embd.len(),
+                h,
+            ));
+        }
+        // The embed table may have extra rows beyond cfg.vocab_size for
+        // special tokens (e.g. <|im_start|>=248045 beyond a 248044-row
+        // base table). The internal `embed_tokens_gpu` helper already
+        // computes `embed_vocab` from `token_embd.len() / hidden_size`
+        // (see line ~475); we mirror that here for the bound check so
+        // valid special tokens don't false-fail.
+        let embed_vocab = self.token_embd.len() / h;
+        if embed_vocab == 0 {
+            return Err(anyhow!(
+                "embed_tokens_gpu: token_embd is empty (vocab=0)"
+            ));
+        }
+        for (i, &tok) in tokens.iter().enumerate() {
+            if (tok as usize) >= embed_vocab {
+                return Err(anyhow!(
+                    "embed_tokens_gpu: tokens[{}]={} out of range (embed_vocab={})",
+                    i,
+                    tok,
+                    embed_vocab,
+                ));
+            }
+        }
         self.ensure_gpu_cache_primed()?;
         self.with_gpu_cache_mut(|device, _reg| {
             embed_tokens_gpu(tokens, &self.token_embd, cfg.vocab_size, cfg.hidden_size, device)
