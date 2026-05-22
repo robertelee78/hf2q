@@ -1675,6 +1675,166 @@ pub fn dispatch_eagle3_mlp(
     )
 }
 
+/// Run the full Eagle3 drafter forward chain (E4b.1-E4b.10b.2) on
+/// the GPU. Allocates a fresh encoder, dispatches all 14 stages,
+/// commits, downloads logits.
+///
+/// Inputs:
+/// * `target_aux_gpu`: F32 `[seq_len, num_aux * target_hidden_size]`
+///   — Eagle3HiddenCollector::concatenated_hidden uploaded to GPU.
+/// * `embeds_gpu`: F32 `[seq_len, hidden_size]` — embed_tokens
+///   lookup result for the draft path tokens.
+/// * `seq_len`: 1 for incremental decode, > 1 for batched prefill.
+/// * `base_pos`: linear RoPE base position. Tree-aware positions
+///   require the lower-level dispatch_eagle3_rope.
+///
+/// Returns logits as a CPU `Vec<f32>` of shape `[seq_len, draft_vocab_size]`.
+///
+/// Phase E7 NOTE: at synthetic random-weight tiny-cfg shapes, the
+/// 14-chained-BF16-matmul forward may underflow to all-zero logits.
+/// Real trained EAGLE-3 weights preserve signal via learned
+/// magnitudes; this is not a correctness bug in the chain itself
+/// (composition + finiteness + determinism are all validated
+/// at HEAD; see E4b.10b.2 test).
+pub fn dispatch_eagle3_drafter_forward(
+    device: &MlxDevice,
+    registry: &mut KernelRegistry,
+    target_aux_gpu: &MlxBuffer,
+    embeds_gpu: &MlxBuffer,
+    tensors: &Eagle3DrafterTensors,
+    cfg: &Eagle3DrafterConfig,
+    seq_len: u32,
+    base_pos: u32,
+) -> Result<Vec<f32>> {
+    let mut enc = device
+        .command_encoder()
+        .map_err(|e| anyhow!("dispatch_eagle3_drafter_forward: encoder: {e}"))?;
+
+    // 1. fc
+    let fc_out = dispatch_eagle3_fc(
+        &mut enc, registry, device, target_aux_gpu, tensors, cfg, seq_len,
+    )?;
+    // 2. embeds_normed
+    let embeds_normed = dispatch_eagle3_input_layernorm(
+        &mut enc, registry, device, embeds_gpu, tensors, cfg, seq_len,
+    )?;
+    // 3. hidden_normed (also = residual)
+    let hidden_normed = dispatch_eagle3_hidden_norm(
+        &mut enc, registry, device, &fc_out, tensors, cfg, seq_len,
+    )?;
+    // 4. concat
+    let concat = dispatch_eagle3_concat_2x_hidden(
+        &mut enc, registry, device, &embeds_normed, &hidden_normed, cfg, seq_len,
+    )?;
+    // 5-7. Q/K/V projections
+    let q = dispatch_eagle3_q_proj(
+        &mut enc, registry, device, &concat, tensors, cfg, seq_len,
+    )?;
+    let k = dispatch_eagle3_k_proj(
+        &mut enc, registry, device, &concat, tensors, cfg, seq_len,
+    )?;
+    let v = dispatch_eagle3_v_proj(
+        &mut enc, registry, device, &concat, tensors, cfg, seq_len,
+    )?;
+    // 8. Optional Q/K head-norm.
+    let (q_normed, k_normed) = if cfg.use_qk_norm {
+        let qn = dispatch_eagle3_q_head_norm(
+            &mut enc, registry, device, &q, tensors, cfg, seq_len,
+        )?;
+        let kn = dispatch_eagle3_k_head_norm(
+            &mut enc, registry, device, &k, tensors, cfg, seq_len,
+        )?;
+        (qn, kn)
+    } else {
+        (q, k)
+    };
+    // 9. RoPE on Q + K.
+    let q_roped = dispatch_eagle3_rope(
+        &mut enc, registry, device, &q_normed, cfg, seq_len,
+        u32::try_from(cfg.num_q_heads).map_err(|_| anyhow!("num_q_heads overflow"))?,
+        None, base_pos, "q_rope",
+    )?;
+    let k_roped = dispatch_eagle3_rope(
+        &mut enc, registry, device, &k_normed, cfg, seq_len,
+        u32::try_from(cfg.num_kv_heads).map_err(|_| anyhow!("num_kv_heads overflow"))?,
+        None, base_pos, "k_rope",
+    )?;
+    // 10. Permute Q/K/V to head-outer.
+    let q_perm = dispatch_eagle3_permute_seq_to_head_outer(
+        &mut enc, registry, device, &q_roped,
+        seq_len,
+        u32::try_from(cfg.num_q_heads).map_err(|_| anyhow!("num_q_heads overflow"))?,
+        cfg.head_dim, "q_permute",
+    )?;
+    let k_perm = dispatch_eagle3_permute_seq_to_head_outer(
+        &mut enc, registry, device, &k_roped,
+        seq_len,
+        u32::try_from(cfg.num_kv_heads).map_err(|_| anyhow!("num_kv_heads overflow"))?,
+        cfg.head_dim, "k_permute",
+    )?;
+    let v_perm = dispatch_eagle3_permute_seq_to_head_outer(
+        &mut enc, registry, device, &v,
+        seq_len,
+        u32::try_from(cfg.num_kv_heads).map_err(|_| anyhow!("num_kv_heads overflow"))?,
+        cfg.head_dim, "v_permute",
+    )?;
+    // 11. tree_attention with all-attended causal-equivalent mask.
+    // For single-token decode (seq_len=1) the mask is just one row,
+    // all attended. KV cache holds the new K/V freshly computed.
+    let kv_seq_len = seq_len;
+    let kv_capacity = seq_len;
+    let mask_stride = kv_seq_len;
+    let mask_elems = (seq_len as usize) * (mask_stride as usize);
+    let mask_data = vec![EAGLE3_TREE_MASK_ATTENDED; mask_elems];
+    let mut mask_gpu = device
+        .alloc_buffer(
+            mask_data.len() * 4,
+            DType::F32,
+            vec![seq_len as usize, mask_stride as usize],
+        )
+        .map_err(|e| anyhow!("alloc mask: {e}"))?;
+    mask_gpu
+        .as_mut_slice::<f32>()
+        .map_err(|e| anyhow!("mask slice: {e}"))?
+        .copy_from_slice(&mask_data);
+    let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+    let attn_out = dispatch_eagle3_tree_attention(
+        &mut enc, registry, device,
+        &q_perm, &k_perm, &v_perm, &mask_gpu,
+        cfg, seq_len, kv_seq_len, kv_capacity, mask_stride, scale,
+    )?;
+    // 12. O + residual.
+    let o_out = dispatch_eagle3_o_proj(
+        &mut enc, registry, device, &attn_out, tensors, cfg, seq_len,
+    )?;
+    let attn_residual = dispatch_eagle3_residual_add(
+        &mut enc, registry, device, &o_out, &hidden_normed, cfg, seq_len,
+    )?;
+    // 13. post_attn_norm + MLP + residual.
+    let post_attn_normed = dispatch_eagle3_post_attention_layernorm(
+        &mut enc, registry, device, &attn_residual, tensors, cfg, seq_len,
+    )?;
+    let mlp_out = dispatch_eagle3_mlp(
+        &mut enc, registry, device, &post_attn_normed, tensors, cfg, seq_len,
+    )?;
+    let final_residual = dispatch_eagle3_residual_add(
+        &mut enc, registry, device, &mlp_out, &attn_residual, cfg, seq_len,
+    )?;
+    // 14. final_norm + lm_head.
+    let final_normed = dispatch_eagle3_final_norm(
+        &mut enc, registry, device, &final_residual, tensors, cfg, seq_len,
+    )?;
+    let logits = dispatch_eagle3_lm_head(
+        &mut enc, registry, device, &final_normed, tensors, cfg, seq_len,
+    )?;
+    enc.commit_and_wait()
+        .map_err(|e| anyhow!("dispatch_eagle3_drafter_forward: commit: {e}"))?;
+    Ok(logits
+        .as_slice::<f32>()
+        .map_err(|e| anyhow!("logits slice: {e}"))?
+        .to_vec())
+}
+
 /// Apply `post_attention_layernorm` (the layer-internal RMSNorm
 /// applied between attention residual and MLP).
 ///

@@ -29,6 +29,7 @@
 
 pub mod config;
 pub mod drafter;
+pub mod drafter_gpu;
 pub mod dynamic_tree;
 pub mod forward;
 pub mod multi_layer_hidden;
