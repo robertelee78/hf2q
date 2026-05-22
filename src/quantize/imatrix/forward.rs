@@ -410,17 +410,20 @@ pub struct ComputeImatrixParams {
 ///
 /// Pipeline (per ADR-033 §Pi):
 ///   1. Convert `hf_dir` to a temporary F16 GGUF via `run_convert`.
-///   2. Load the F16 GGUF via `LoadedModel::load` (Gemma 4 only for
-///      Stage 3.0; Qwen35Moe and others surface
-///      [`ImatrixError::UnsupportedArchForDriver`]).
+///   2. Load the F16 GGUF via `LoadedModel::load`. Supported arches:
+///      Gemma 4 (Stage 3.0) and Qwen 3.5/3.6 MoE (Stage 3b.4); other
+///      arches surface [`ImatrixError::UnsupportedArchForDriver`].
 ///   3. Tokenize `params.corpus` via the model's tokenizer.
 ///   4. Chunk tokens into `params.n_ctx`-sized windows via
 ///      [`super::corpus::chunk_tokens`]; partial trailing chunks
 ///      dropped (mirrors `imatrix.cpp:960`).
 ///   5. For each chunk: install a
 ///      [`AccumulatorRegistry`]-backed collector via
-///      [`with_collector`]; call `forward_prefill(chunk, 1, &mut ctx)`;
-///      collector is automatically dropped on scope exit.
+///      [`with_collector`]; call the arch-specific prefill primitive
+///      (Gemma: `forward_prefill(chunk, 1, &mut ctx)`; Qwen35Moe:
+///      `Qwen35Model::forward_gpu_last_logits(chunk, positions,
+///      &mut kv_cache)`); collector is automatically dropped on
+///      scope exit.
 ///   6. Pack the accumulated registry into [`super::ImatrixData`]
 ///      with [`super::ImatrixProvenance::Computed`] provenance.
 ///
@@ -452,33 +455,52 @@ pub fn compute_imatrix(
             ),
         });
     }
-    // Only Gemma 4 is wired for the driver in Stage 3.0. Other arches
-    // surface a typed error pointing at the supported set.
-    if !matches!(params.arch, Arch::Gemma4) {
+    // Stage 3.0 (Gemma 4) + Stage 3b.4 (Qwen 3.5/3.6 MoE) are wired
+    // for the driver. Other arches surface a typed error pointing at
+    // the supported set.
+    if !matches!(
+        params.arch,
+        Arch::Gemma4 | Arch::Qwen35Moe | Arch::Qwen35MoeFull,
+    ) {
         return Err(ImatrixError::UnsupportedArchForDriver {
             arch: params.arch.name().to_string(),
-            supported: &["gemma4"],
+            supported: &["gemma4", "qwen35moe"],
         });
     }
     let tmp = tempfile::tempdir().map_err(ImatrixError::Io)?;
-    let f16_path = tmp.path().join("model.f16.gguf");
+    // Inner-convert quant: F16 for Gemma 4 (the loader accepts F16
+    // expert weights for the SwiGLU MoE kernel), Q8_0 for Qwen 3.5/3.6
+    // MoE (Qwen35Model::load_from_gguf rejects F16 expert weights —
+    // `gate/up expert weights have unsupported quant type F16`. Q8_0
+    // is the canonical llama-imatrix inner format anyway: it's lossless
+    // enough at 8 bits/weight that imatrix importance weighting is
+    // representative of the underlying activation distribution).
+    let inner_ftype = match params.arch {
+        Arch::Qwen35Moe | Arch::Qwen35MoeFull => {
+            crate::quantize::ggml_quants::llama_ftype::LlamaFtype::MostlyQ8_0
+        }
+        _ => crate::quantize::ggml_quants::llama_ftype::LlamaFtype::MostlyF16,
+    };
+    let inner_ext = match inner_ftype {
+        crate::quantize::ggml_quants::llama_ftype::LlamaFtype::MostlyQ8_0 => "q8_0",
+        _ => "f16",
+    };
+    let f16_path = tmp.path().join(format!("model.{inner_ext}.gguf"));
 
-    // ---- 2. Run convert to F16 GGUF -----------------------------------
+    // ---- 2. Run inner convert (F16 / Q8_0) ----------------------------
     let convert_args = crate::convert::cli_driver::ConvertArgs {
         hf_dir: params.hf_dir.clone(),
-        selector: crate::convert::quant_selector::QuantSelector::Standard(
-            crate::quantize::ggml_quants::llama_ftype::LlamaFtype::MostlyF16,
-        ),
+        selector: crate::convert::quant_selector::QuantSelector::Standard(inner_ftype),
         output: f16_path.clone(),
         imatrix: None,
         imatrix_corpus: None,
         imatrix_out: None,
-        // The inner F16 convert never collects an imatrix (it's the
-        // F16 build that the imatrix driver itself feeds forward
-        // passes through). `imatrix_n_ctx` is consulted ONLY when
+        // The inner convert never collects an imatrix (it's the inner
+        // build that the imatrix driver itself feeds forward passes
+        // through). `imatrix_n_ctx` is consulted ONLY when
         // `imatrix_corpus` is set, so None here is structurally safe.
         imatrix_n_ctx: None,
-        // The inner F16 convert is always text-decoder; mmproj sidecar
+        // The inner convert is always text-decoder; mmproj sidecar
         // export is operator-initiated via the top-level CLI flag.
         mmproj: false,
     };
@@ -496,26 +518,11 @@ pub fn compute_imatrix(
         dwq_overlay_path: None,
         kv_persist_dir: None,
     };
-    let loaded = crate::serve::api::engine::LoadedModel::load(&load_opts).map_err(|e| {
+    let mut loaded = crate::serve::api::engine::LoadedModel::load(&load_opts).map_err(|e| {
         ImatrixError::ModelLoadFailed {
             detail: format!("{e:?}"),
         }
     })?;
-    let mut gemma = match loaded {
-        crate::serve::api::engine::LoadedModel::Gemma(g) => g,
-        // Stage 3.0 only supports Gemma 4. Qwen35Moe / Qwen3VlText
-        // would land here but we caught them at the arch-validate
-        // check above; this arm is defensive against arch
-        // double-detection drift.
-        _ => {
-            return Err(ImatrixError::UnsupportedArchForDriver {
-                arch: format!("{:?}", params.arch),
-                supported: &["gemma4"],
-            })
-        }
-    };
-    let n_experts = gemma.config.num_experts;
-
     // Extract BOS token id from the F16 GGUF for the per-chunk
     // BOS-replacement that canonical llama-imatrix performs (see
     // `/opt/llama.cpp/tools/imatrix/imatrix.cpp:1012-1014`:
@@ -530,7 +537,9 @@ pub fn compute_imatrix(
     //
     // Re-open the F16 GGUF header (cheap; mmap header parse) to
     // read `tokenizer.ggml.bos_token_id` — mirrors the canonical
-    // pattern at `src/serve/api/engine.rs:2243`.
+    // pattern at `src/serve/api/engine.rs:2243`. Qwen 3.5/3.6 GGUFs
+    // typically omit this key (tokenizer adds no BOS), so `None` is
+    // expected and disables per-chunk BOS replacement for those arches.
     let bos_token_id: Option<u32> = mlx_native::gguf::GgufFile::open(&f16_path)
         .ok()
         .and_then(|g| g.metadata_u32("tokenizer.ggml.bos_token_id"));
@@ -542,8 +551,8 @@ pub fn compute_imatrix(
     // at `/opt/llama.cpp/tools/imatrix/imatrix.cpp:932`. This adds
     // the BOS at index 0 if the vocab is configured to do so;
     // matches the canonical chunk-boundary tokenization.
-    let encoding = gemma
-        .tokenizer
+    let tokenizer = loaded.tokenizer();
+    let encoding = tokenizer
         .encode(params.corpus.text.as_str(), /* add_special_tokens */ true)
         .map_err(|e| ImatrixError::TokenizationFailed {
             detail: format!("{e:?}"),
@@ -610,26 +619,119 @@ pub fn compute_imatrix(
     }
 
     // ---- 7. Drive forward pass over each chunk ------------------------
-    for (chunk_index, chunk) in chunks.iter().enumerate() {
-        let collector = SharedCollector {
-            registry: Arc::clone(&registry),
-            n_experts,
-        };
-        // forward_prefill returns the argmax of the last-row logits.
-        // We don't need it for imatrix; the activations were captured
-        // via the installed collector during the prefill itself.
-        let result: anyhow::Result<u32> = with_collector(collector, || {
-            gemma.weights.forward_prefill(
-                chunk.as_slice(),
-                /* max_decode_tokens */ 1,
-                &mut gemma.ctx,
-            )
-        });
-        result.map_err(|e| ImatrixError::ForwardPassFailed {
-            chunk_index,
-            chunk_count,
-            detail: format!("{e:?}"),
-        })?;
+    //
+    // Arch-specific prefill: Gemma 4 uses `forward_prefill(chunk, 1,
+    // &mut ctx)` (Stage 3.0); Qwen 3.5/3.6 MoE uses
+    // `Qwen35Model::forward_gpu_last_logits(chunk, positions, &mut
+    // kv_cache)` with a fresh HybridKvCache per chunk + 4-axis
+    // mRoPE positions (Stage 3b.4). Both call the same intercept
+    // hooks (`intercept_qmatmul_with_hint` for dense matmuls,
+    // `intercept_qmatmul_id_with_hint` for MoE-routed matmuls).
+    use crate::serve::api::engine::LoadedModel;
+    let n_experts = match &loaded {
+        LoadedModel::Gemma(g) => g.config.num_experts,
+        LoadedModel::Qwen35(q) => q
+            .model
+            .cfg
+            .moe
+            .as_ref()
+            .map(|m| m.num_experts as usize)
+            .ok_or_else(|| ImatrixError::UnsupportedArchForDriver {
+                arch: format!("{} (dense — imatrix driver is MoE-only)", params.arch.name()),
+                supported: &["gemma4", "qwen35moe"],
+            })?,
+        _ => {
+            return Err(ImatrixError::UnsupportedArchForDriver {
+                arch: format!("{:?}", params.arch),
+                supported: &["gemma4", "qwen35moe"],
+            })
+        }
+    };
+
+    match &mut loaded {
+        LoadedModel::Gemma(gemma) => {
+            for (chunk_index, chunk) in chunks.iter().enumerate() {
+                let collector = SharedCollector {
+                    registry: Arc::clone(&registry),
+                    n_experts,
+                };
+                // forward_prefill returns the argmax of the last-row
+                // logits. We don't need it for imatrix; the activations
+                // were captured via the installed collector during the
+                // prefill itself.
+                let result: anyhow::Result<u32> = with_collector(collector, || {
+                    gemma.weights.forward_prefill(
+                        chunk.as_slice(),
+                        /* max_decode_tokens */ 1,
+                        &mut gemma.ctx,
+                    )
+                });
+                result.map_err(|e| ImatrixError::ForwardPassFailed {
+                    chunk_index,
+                    chunk_count,
+                    detail: format!("{e:?}"),
+                })?;
+            }
+        }
+        LoadedModel::Qwen35(qwen) => {
+            // Allocate ONE HybridKvCache sized for the largest chunk
+            // (all chunks are `n_ctx` except possibly the final tail
+            // which `chunk_tokens` drops). Reset per chunk via fresh
+            // allocation so positions always restart at 0 — matches
+            // canonical llama-imatrix's per-chunk seq reset semantics.
+            use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+            use mlx_native::MlxDevice;
+            let device = MlxDevice::new().map_err(|e| ImatrixError::ForwardPassFailed {
+                chunk_index: 0,
+                chunk_count,
+                detail: format!("MlxDevice::new: {e:?}"),
+            })?;
+            let max_seq = params.n_ctx;
+            for (chunk_index, chunk) in chunks.iter().enumerate() {
+                // 4-axis mRoPE positions [4 * len] axis-major, all axes
+                // = 0..len. Matches `build_positions(0, len)` at
+                // `forward_gpu.rs:7035` — text-only chunks have no
+                // vision regions so all four axes use the linear text
+                // position.
+                let chunk_len = chunk.len();
+                let mut positions = vec![0i32; 4 * chunk_len];
+                for axis in 0..4 {
+                    for t in 0..chunk_len {
+                        positions[axis * chunk_len + t] = t as i32;
+                    }
+                }
+                let mut kv_cache = HybridKvCache::new(
+                    &qwen.model.cfg,
+                    &device,
+                    max_seq,
+                    /* n_parallel */ 1,
+                )
+                .map_err(|e| ImatrixError::ForwardPassFailed {
+                    chunk_index,
+                    chunk_count,
+                    detail: format!("HybridKvCache::new: {e:?}"),
+                })?;
+                let collector = SharedCollector {
+                    registry: Arc::clone(&registry),
+                    n_experts,
+                };
+                let result: anyhow::Result<Vec<f32>> = with_collector(collector, || {
+                    qwen.model
+                        .forward_gpu_last_logits(chunk.as_slice(), &positions, &mut kv_cache)
+                });
+                result.map_err(|e| ImatrixError::ForwardPassFailed {
+                    chunk_index,
+                    chunk_count,
+                    detail: format!("{e:?}"),
+                })?;
+            }
+        }
+        _ => {
+            return Err(ImatrixError::UnsupportedArchForDriver {
+                arch: format!("{:?}", params.arch),
+                supported: &["gemma4", "qwen35moe"],
+            })
+        }
     }
 
     // ---- 8. Pack into ImatrixData -------------------------------------
@@ -893,10 +995,12 @@ mod tests {
         }
     }
 
-    /// Stage 3 driver: arches outside the Stage 3.0 supported set
-    /// (Gemma 4 only) surface `UnsupportedArchForDriver` BEFORE
-    /// touching the filesystem (cheap upfront validation per the
-    /// "fail fast at boundaries" rule).
+    /// Stage 3 driver: arches outside the Stage 3.0 + Stage 3b.4
+    /// supported set (Gemma 4 + Qwen 3.5/3.6 MoE) surface
+    /// `UnsupportedArchForDriver` BEFORE touching the filesystem
+    /// (cheap upfront validation per the "fail fast at boundaries"
+    /// rule). MiniMax-M2 is the canonical out-of-scope MoE used for
+    /// this regression check.
     #[test]
     fn compute_imatrix_errors_typed_on_unsupported_arch() {
         let corpus = CorpusBytes::load(&CorpusSource::Cdv3).unwrap();
@@ -906,15 +1010,74 @@ mod tests {
             hf_dir: PathBuf::from("/tmp"),
             corpus,
             n_ctx: 512,
-            arch: ArchName::Qwen35Moe,
+            arch: ArchName::MiniMaxM2,
         };
         let err = compute_imatrix(&params).unwrap_err();
         match err {
             ImatrixError::UnsupportedArchForDriver { arch, supported } => {
-                assert_eq!(arch, "qwen3moe");
-                assert_eq!(supported, &["gemma4"]);
+                assert_eq!(arch, "minimax-m2");
+                assert_eq!(supported, &["gemma4", "qwen35moe"]);
             }
             other => panic!("expected UnsupportedArchForDriver, got {other:?}"),
+        }
+    }
+
+    /// Stage 3b.4 (SHIPPED 2026-05-22): `Arch::Qwen35Moe` is NOW
+    /// accepted by the arch-validation gate at the head of
+    /// `compute_imatrix`. We don't drive a real Qwen MoE forward pass
+    /// in this unit test (operator-time, multi-GB model load); we
+    /// only assert the gate has been lifted — the next failure
+    /// mode is the `ConvertFailed` from the missing hf_dir, which
+    /// proves we passed the arch gate.
+    #[test]
+    fn compute_imatrix_qwen35moe_passes_arch_gate() {
+        let corpus = CorpusBytes::load(&CorpusSource::Cdv3).unwrap();
+        let params = ComputeImatrixParams {
+            hf_dir: PathBuf::from("/tmp/non-existent-fixture-qwen35moe-driver"),
+            corpus,
+            n_ctx: 512,
+            arch: ArchName::Qwen35Moe,
+        };
+        let err = compute_imatrix(&params).unwrap_err();
+        // Past the arch gate ⇒ next error is ConvertFailed (missing
+        // hf_dir). NOT UnsupportedArchForDriver.
+        match err {
+            ImatrixError::ConvertFailed { detail } => {
+                assert!(
+                    detail.contains("does not exist") || detail.contains("not a directory"),
+                    "detail should describe missing hf_dir, got: {detail}"
+                );
+            }
+            ImatrixError::UnsupportedArchForDriver { arch, .. } => panic!(
+                "Stage 3b.4 regression: Qwen35Moe should pass arch gate but got \
+                 UnsupportedArchForDriver(arch={arch:?})"
+            ),
+            other => panic!("expected ConvertFailed past arch gate, got {other:?}"),
+        }
+    }
+
+    /// Same as above but for the newer GGUF arch label `qwen35moe`
+    /// (resolved to [`ArchName::Qwen35MoeFull`]). Both `Qwen35Moe`
+    /// (older `qwen3moe` label) and `Qwen35MoeFull` (newer
+    /// `qwen35moe` label) must pass the Stage 3b.4 arch gate per the
+    /// match arm at `forward.rs:compute_imatrix`.
+    #[test]
+    fn compute_imatrix_qwen35moe_full_passes_arch_gate() {
+        let corpus = CorpusBytes::load(&CorpusSource::Cdv3).unwrap();
+        let params = ComputeImatrixParams {
+            hf_dir: PathBuf::from("/tmp/non-existent-fixture-qwen35moefull-driver"),
+            corpus,
+            n_ctx: 512,
+            arch: ArchName::Qwen35MoeFull,
+        };
+        let err = compute_imatrix(&params).unwrap_err();
+        match err {
+            ImatrixError::ConvertFailed { .. } => { /* expected: past the arch gate */ }
+            ImatrixError::UnsupportedArchForDriver { arch, .. } => panic!(
+                "Stage 3b.4 regression: Qwen35MoeFull should pass arch gate but got \
+                 UnsupportedArchForDriver(arch={arch:?})"
+            ),
+            other => panic!("expected ConvertFailed past arch gate, got {other:?}"),
         }
     }
 

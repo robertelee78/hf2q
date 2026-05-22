@@ -170,9 +170,14 @@ fn dispatch_moe_id_routed(
             legacy_params.top_k as usize,
             legacy_params.k as usize,
             || {
-                if let Err(e) = enc.commit_and_wait() {
+                // `commit_wait_and_rotate` syncs the input buffer
+                // (so we can safely read F32 host-side) AND rotates
+                // to a fresh CB so the matmul dispatch below doesn't
+                // hit the Metal `MTLCommandBufferStatusCommitted`
+                // assertion at `setCurrentCommandEncoder:` line 323.
+                if let Err(e) = enc.commit_wait_and_rotate() {
                     eprintln!(
-                        "[hf2q imatrix moe intercept ({label})] commit_and_wait failed: {e}"
+                        "[hf2q imatrix moe intercept ({label})] commit_wait_and_rotate failed: {e}"
                     );
                     return None;
                 }

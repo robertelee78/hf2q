@@ -9686,11 +9686,13 @@ pub fn dispatch_qmatmul(
         weight.info.cols,
         || {
             // Materialize the input buffer. We must drain any pending GPU
-            // work that wrote to `input` before reading it on the host.
-            // `commit_and_wait` is a hard sync — only acceptable because
-            // this closure is gated on collector-present.
-            if let Err(e) = session.encoder_mut().commit_and_wait() {
-                eprintln!("[hf2q imatrix intercept] commit_and_wait failed: {e}");
+            // work that wrote to `input` before reading it on the host,
+            // AND rotate to a fresh CB so subsequent dispatches don't
+            // hit Metal's `MTLCommandBufferStatusCommitted` assertion.
+            // `commit_wait_and_rotate` is a hard sync — only acceptable
+            // because this closure is gated on collector-present.
+            if let Err(e) = session.encoder_mut().commit_wait_and_rotate() {
+                eprintln!("[hf2q imatrix intercept] commit_wait_and_rotate failed: {e}");
                 return None;
             }
             match input.as_slice::<f32>() {

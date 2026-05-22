@@ -15,9 +15,9 @@
 //! accumulator, gguf writer/loader, file-based `--imatrix <path>`)
 //! AND Phase B (forward-pass driver wired through the convert
 //! orchestrator, exposed as `--imatrix-corpus <name>`) BOTH
-//! SHIPPED 2026-05-19. Gemma 4 is the Stage 3.0 driver arch; other
-//! arches consume pre-computed `.imatrix.gguf` via `--imatrix
-//! <path>` until Stage 3b.4 adds Qwen35Moe driver wiring.
+//! SHIPPED 2026-05-19. Stage 3.0 (Gemma 4) + Stage 3b.4 (Qwen 3.5/3.6
+//! MoE) are the driver-supported arches; other arches consume
+//! pre-computed `.imatrix.gguf` via `--imatrix <path>`.
 
 pub mod ggml_quants;
 pub mod imatrix;

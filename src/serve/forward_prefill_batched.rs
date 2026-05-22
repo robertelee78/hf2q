@@ -2672,9 +2672,14 @@ impl MlxModelWeights {
                         top_k,
                         hs,
                         || {
-                            if let Err(e) = s.encoder_mut().commit_and_wait() {
+                            // Sync + rotate CB so the follow-on MoE
+                            // matmul dispatch can re-use the encoder
+                            // without hitting Metal's
+                            // `MTLCommandBufferStatusCommitted`
+                            // assertion at `setCurrentCommandEncoder:`.
+                            if let Err(e) = s.encoder_mut().commit_wait_and_rotate() {
                                 eprintln!(
-                                    "[hf2q imatrix moe intercept] commit_and_wait failed: {e}"
+                                    "[hf2q imatrix moe intercept] commit_wait_and_rotate failed: {e}"
                                 );
                                 return None;
                             }
@@ -2788,9 +2793,14 @@ impl MlxModelWeights {
                         1,
                         moe_int,
                         || {
-                            if let Err(e) = s.encoder_mut().commit_and_wait() {
+                            // Sync + rotate CB so the follow-on MoE
+                            // matmul dispatch can re-use the encoder
+                            // without hitting Metal's
+                            // `MTLCommandBufferStatusCommitted`
+                            // assertion at `setCurrentCommandEncoder:`.
+                            if let Err(e) = s.encoder_mut().commit_wait_and_rotate() {
                                 eprintln!(
-                                    "[hf2q imatrix moe intercept] commit_and_wait failed: {e}"
+                                    "[hf2q imatrix moe intercept] commit_wait_and_rotate failed: {e}"
                                 );
                                 return None;
                             }

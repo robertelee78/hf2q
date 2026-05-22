@@ -2829,7 +2829,9 @@ mod tests {
 
     /// **Stage 3c.2 — `--imatrix-corpus` on an unsupported arch
     /// surfaces `UnsupportedArchForDriver`** BEFORE attempting any
-    /// convert/load. Stage 3.0 supports Gemma 4 only.
+    /// convert/load. Stage 3.0 (Gemma 4) + Stage 3b.4 (Qwen 3.5/3.6
+    /// MoE) are the supported driver arches; MiniMax-M2 is the
+    /// canonical out-of-scope MoE used here.
     #[test]
     fn imatrix_corpus_unsupported_arch_errors_typed() {
         let err = super::resolve_imatrix_input(
@@ -2839,7 +2841,7 @@ mod tests {
             // /tmp always exists so the hf_dir check passes; the
             // UnsupportedArchForDriver check fires next.
             &std::path::PathBuf::from("/tmp"),
-            crate::quantize::ggml_quants::ArchName::Qwen35Moe,
+            crate::quantize::ggml_quants::ArchName::MiniMaxM2,
             512,
         )
         .unwrap_err();
@@ -2847,12 +2849,41 @@ mod tests {
             ConvertError::Imatrix(
                 crate::quantize::imatrix::ImatrixError::UnsupportedArchForDriver {
                     arch,
-                    ..
+                    supported,
                 },
             ) => {
-                assert_eq!(arch, "qwen3moe");
+                assert_eq!(arch, "minimax-m2");
+                assert_eq!(supported, &["gemma4", "qwen35moe"]);
             }
             other => panic!("expected UnsupportedArchForDriver, got {other:?}"),
+        }
+    }
+
+    /// **Stage 3b.4 SHIPPED 2026-05-22 — `--imatrix-corpus` on
+    /// Qwen35Moe now passes the arch gate** and reaches the inner
+    /// convert step. The hf_dir is bogus so the next error mode is
+    /// `ConvertFailed`, which proves we passed the arch gate.
+    #[test]
+    fn imatrix_corpus_qwen35moe_passes_arch_gate() {
+        let err = super::resolve_imatrix_input(
+            &ApexTier::IQuality,
+            None,
+            Some("cdv3"),
+            &std::path::PathBuf::from("/tmp/non-existent-fixture-qwen35moe-cli"),
+            crate::quantize::ggml_quants::ArchName::Qwen35Moe,
+            512,
+        )
+        .unwrap_err();
+        match err {
+            ConvertError::Imatrix(
+                crate::quantize::imatrix::ImatrixError::UnsupportedArchForDriver { arch, .. },
+            ) => panic!(
+                "Stage 3b.4 regression: Qwen35Moe should pass arch gate but got \
+                 UnsupportedArchForDriver(arch={arch:?})"
+            ),
+            // Past arch gate. Any other error variant is fine — what
+            // matters is that the typed gate is now lifted.
+            _ => {}
         }
     }
 

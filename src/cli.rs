@@ -193,12 +193,12 @@ pub struct ConvertCliArgs {
     /// 512, matching stock `llama-imatrix -c 512`) while intercepting
     /// per-tensor activations.
     ///
-    /// **Stage 3.0 supports Gemma 4 only.** Other arches (Qwen 3.5/3.6
-    /// MoE, MiniMax-M2) surface
+    /// **Supported arches: Gemma 4 (Stage 3.0) + Qwen 3.5/3.6 MoE
+    /// (Stage 3b.4 SHIPPED 2026-05-22).** Other arches (MiniMax-M2,
+    /// dense Qwen, BERT, etc.) surface
     /// `ImatrixError::UnsupportedArchForDriver`. For those, use the
     /// `--imatrix <file>` flag with a pre-computed
-    /// `.imatrix.gguf` from stock `llama-imatrix` until Stage 3b.4
-    /// adds Qwen35Moe driver wiring.
+    /// `.imatrix.gguf` from stock `llama-imatrix`.
     ///
     /// Accepted values: `cdv3` (bartowski's default, baked at compile
     /// time), `mudler` (selector parses but the corpus itself is

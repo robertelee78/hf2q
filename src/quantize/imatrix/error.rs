@@ -235,13 +235,17 @@ mod p7_ac3_hint_tests {
 
     #[test]
     fn p7_ac3_unsupported_arch_for_driver_lists_supported() {
+        // Stage 3b.4 SHIPPED 2026-05-22 — Qwen35Moe is now supported.
+        // MiniMax-M2 is the canonical still-unsupported MoE used in
+        // this hint test.
         let msg = ImatrixError::UnsupportedArchForDriver {
-            arch: "qwen3moe".to_string(),
-            supported: &["gemma4"],
+            arch: "minimax-m2".to_string(),
+            supported: &["gemma4", "qwen35moe"],
         }
         .to_string();
-        assert!(msg.contains("qwen3moe"), "msg should echo bad arch: {msg}");
+        assert!(msg.contains("minimax-m2"), "msg should echo bad arch: {msg}");
         assert!(msg.contains("gemma4"), "msg should list supported arches: {msg}");
+        assert!(msg.contains("qwen35moe"), "msg should list qwen35moe (Stage 3b.4): {msg}");
         assert!(
             msg.contains("not yet wired") || msg.contains("supported"),
             "msg should explain the gap: {msg}"
