@@ -169,21 +169,34 @@ pub fn dispatch_qwen35_dflash_generate(
         }
     }
 
-    // ─── Prime GPU cache + LA capture before any verify ─────────────
+    // ─── Prime GPU cache (LA capture allocated later) ──────────────
     target
         .model
         .ensure_gpu_cache_primed()
         .context("ensure_gpu_cache_primed")?;
-    // `ensure_la_capture` needs the model's `MlxDevice` — fetch from
-    // GPU_CACHE. block_size is the worst-case per-round verify size
-    // (covers initial prefill which uses prompt_len ≥ 1; LA capture
-    // window only needs to cover ONE verify forward at a time, since
-    // rollback happens before the next forward).
-    target.model.with_gpu_cache_mut(|device, _reg| {
-        target
-            .kv_cache
-            .ensure_la_capture(&target.model.cfg, device, block_size)
-    })?;
+    //
+    // CRITICAL ORDERING (codex /cfa 2026-05-21 caught this):
+    // `ensure_la_capture(block_size)` allocates LA capture buffers
+    // sized for `block_size` tokens. `forward_gpu_impl` activates the
+    // LA capture branch whenever ANY linear_attn slot has
+    // `capture_states.is_some()` (see forward_gpu.rs:2705
+    // `la_capture_active`). The capture branch dispatches
+    // `ssm_conv_with_capture` which requires
+    // `conv_capture.element_count() == n_tokens * (k_width-1) *
+    // channels * n_seqs` for the EXACT n_tokens of the current
+    // forward (mlx-native ssm_conv.rs:355).
+    //
+    // Initial prefill has `n_tokens = prompt_tokens.len() ≥ block_size`
+    // (typically much larger). If we allocate LA capture for
+    // block_size and then run initial prefill, the conv kernel
+    // mismatch would fail.
+    //
+    // Solution: do NOT allocate LA capture until AFTER initial prefill.
+    // Initial prefill runs with `capture_states = None` → arena path,
+    // no per-position capture. Then before the first verify, we
+    // allocate ensure_la_capture(block_size) so subsequent verify
+    // forwards (all at seq_len = block_size) match exactly. Rollback
+    // works because each round has its own per-verify capture buffer.
 
     let mut output: Vec<u32> = prompt_tokens.to_vec();
 
@@ -214,6 +227,19 @@ pub fn dispatch_qwen35_dflash_generate(
     let drafter_target_layer_ids = drafter_cfg.target_layer_ids.clone();
     let n_target_layers = drafter_target_layer_ids.len();
     let row_stride = n_target_layers * hs;
+
+    // ─── Allocate LA rollback capture (sized for per-round verify) ─
+    //
+    // Initial prefill done above ran with no LA capture (avoiding the
+    // size-mismatch fault flagged by codex /cfa 2026-05-21). Now that
+    // every subsequent forward has `seq_len = block_size`, allocate
+    // capture buffers EXACTLY this size — both the recurrent and conv
+    // capture kernels are happy with the exact match.
+    target.model.with_gpu_cache_mut(|device, _reg| {
+        target
+            .kv_cache
+            .ensure_la_capture(&target.model.cfg, device, block_size)
+    })?;
 
     // ─── Multi-round loop (Option A) ────────────────────────────────
     let profile_on = std::env::var("HF2Q_DFLASH_PROFILE").as_deref() == Ok("1");
