@@ -186,6 +186,9 @@ echo "    Production winner SUSTAINS 1.39-1.46x speedup across 128→1024 output
 echo "  MTP MH temperature sweep essay prompt at HEAD 436a4b01 (3-rep each, vs base 21.9):"
 echo "    temp=0.3: 26.27 @ 69.3% = 1.20× | temp=0.5: 27.53 @ 77.8% = 1.26× WINNER | temp=0.7: 24.43 @ 58.0% = 1.12× | temp=0.9: 23.93 @ 54.2% = 1.09×"
 echo "    Accept rate PEAKS at temp=0.5 (77.8%); sharp drop to 58% at temp=0.7. The --temperature 0.5 production recommendation is empirically validated as the MH accept-rate optimum."
+echo "  Prompt-length sweep MTP K=1 greedy code-gen at HEAD f8cffd53 (1-rep, gen 64 tok):"
+echo "    short prompt (~13 tok):  Base 22.1, MTP 29.1 @ 88.2% = 1.32× | med (~212 tok): Base 22.0, MTP 31.2 @ 96.9% = 1.42× | long (~812 tok): Base 21.8, MTP 30.1 @ 100% = 1.38×"
+echo "    Accept rate IMPROVES with prompt length (88% → 97% → 100% at ~812 tok); drafter is MORE accurate when given more context. Base throughput STABLE (decode-bound)."
 echo
 echo "Production recommendation:"
 echo "  Code-gen / deterministic: HF2Q_SPEC_DECODE=1 --temperature 0     (1.36x base, MTP K=1 greedy wins)"
