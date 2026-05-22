@@ -2,7 +2,7 @@
 
 - **Status**: 🚧 **IN PROGRESS** — Phases E1 + E3 + E4 + E5 + E6 (drafter side + Qwen35 verifier dispatcher + per-layer tree-verify block) SHIPPED at hf2q `f027d4f7`. **193/193 ADR-037 tests PASS single-threaded** plus 5 new per-layer tests including 190+ LOC CPU scalar reference parity at `|GPU-CPU|_inf = 2.23e-4` and byte-identity (0.0 diff) chain parity. Two /cfa dual-mode sessions shipped Phase E6 closure: session #1 codex won 361/343 on adversarial bug catch (Claude's modulo-by-zero panic class); session #2 claude won 92/74 on test rigor (codex's no-op T5 alias + scale=0.0 zero-weights identity-path tests). Remaining: multi-layer model integration + HF2Q_SPEC_EAGLE3 env flag wiring, E2 drafter training (multi-week H100 compute), E7 empirical validation, E8 final closure.
 
-> **Future-iter alternative considered**: HASS / Hydra (2024, 3.5× ceiling) — multiple parallel transformer drafters. Acknowledged in §2 comparison table. Higher implementation complexity (N drafters, per-drafter weight management + sync overhead) for a lower published ceiling than EAGLE-3 (4.06×). If EAGLE-3 empirical numbers under-deliver vs the paper, HASS becomes the candidate alternative — but only after EAGLE-3 closes its empirical validation phase. Per operator: "finish eagle-3 either way, but don't forget about the more complex one".
+> **HASS / Hydra is IN-SCOPE as Phase E9 — not deferred.** Per operator 2026-05-22: *"HASS/Hydra ← need this as part of our goal though, after eagle-3, we should never put off hard work, I've said this many times"*. Sequencing: EAGLE-3 closes first (E1-E8), then HASS/Hydra ships as Phase E9 on top of the same Qwen35 tree-verify infrastructure. The ensemble of EAGLE-3 + HASS gives us **two empirically-validated drafter families** to pick from at serve time (HF2Q_SPEC_DRAFTER={eagle3|hass}), maximizing coverage across workloads. See Phase E9 row + new §10 "HASS/Hydra plan" for design.
 - **Date**: 2026-05-22 (HEAD v2 `9690fc69`; mlx-native `3ea809f` Phase E1 closure)
 - **Supersedes**: nothing
 - **Author note**: v1 (earlier in this conversation) recommended Medusa-first because it was "simpler to implement". Operator pushed back: *"why do you focus on simple instead of correct for max coherence and perf? ... it literally takes longer to do the wrong things many times, then eventually the right thing ... better to just do the right thing 1st"*. v2 commits to the empirically-best published architecture from the start.
@@ -52,7 +52,8 @@
 | HF2Q_SPEC_EAGLE3 env flag | ⏳ TODO | — | Wire serve-layer env flag analogous to HF2Q_SPEC_DECODE / HF2Q_SPEC_DFLASH so production users can opt in |
 | E2 — EAGLE-3 drafter training | ⏳ TODO | — | Multi-week H100 compute |
 | E7 — 3-rep paired empirical validation | ⏳ TODO | — | Target: ≥1.3× on 2K natural + ≥1.5× on long code-gen (blocked on E2 trained weights) |
-| E8 — codex /cfa final + ADR-034 update + merge | ⏳ TODO | — | Mission closure |
+| E8 — codex /cfa final + ADR-034 update + merge | ⏳ TODO | — | EAGLE-3 closure |
+| **E9 — HASS / Hydra drafter family (IN-SCOPE; not deferred)** | ⏳ TODO | — | Multiple parallel transformer drafters (3.5× published ceiling). Reuses Qwen35 tree-verify dispatcher + per-layer block from E6. New: parallel-drafter forward orchestration + HASS-specific training recipe + HF2Q_SPEC_DRAFTER={eagle3\|hass} serve flag. See §10. |
 
 ## 0. The right thing first
 
@@ -230,9 +231,11 @@ Per the operator's directive: skipping straight to EAGLE-3 saves ~3000 LOC of Me
 - Medusa port (~3000 LOC throwaway — see §2 last paragraph)
 - EAGLE-1 port (EAGLE-3 supersets it on every metric)
 - Static tree (EAGLE-2 dynamic tree is strictly better per published numbers)
-- MoE 35B-A3B variant (follow-up ADR after E8)
+- MoE 35B-A3B variant (follow-up ADR after E9)
 - Lookahead / REST / n-gram (lower ceiling than EAGLE-3)
 - Hand-rolled training without published recipe (would waste weeks)
+
+> ~~HASS / Hydra~~ — **MOVED IN-SCOPE as Phase E9** per operator 2026-05-22 ("never put off hard work"). See header note + Phase E9 row + new §10a HASS/Hydra plan.
 
 ## 8. First concrete step (next iteration)
 
@@ -251,10 +254,58 @@ This is the smallest unit that derisks the rest of the port. If tree-attention k
 - llama.cpp peer code: `/opt/llama.cpp/common/speculative.cpp`
 - EAGLE-3 paper (Li et al. 2024c) — for training recipe + architecture details
 
-## 10. Decision
+## 10. HASS / Hydra plan (Phase E9 — IN-SCOPE; not deferred)
 
-**Approved scope**: implement EAGLE-3 with dynamic tree decoding in 8 phases (E1-E8) per §4. No Medusa fallback, no incremental "stepping stones". Commit to the architecture that delivers max coherence + perf from phase 1.
+### 10.1 Why HASS + why now
 
-**First-action next iteration**: Phase E1.1 — `mlx-native/src/shaders/tree_attention.metal` skeleton + tree=1 parity test.
+Per operator 2026-05-22: *"HASS/Hydra ← need this as part of our goal though"* + *"never put off hard work"*. HASS has a 3.5× published ceiling vs EAGLE-3's 4.06×, BUT:
 
-**Acceptance for full ADR-037 closure**: Phase E7 empirical validation shows EAGLE-3 ≥1.3× base on pinned 2K natural prompt + ≥1.5× on long code-gen, AND Phase E8 codex /cfa final clean.
+- HASS uses **multiple parallel transformer drafters** (vs EAGLE-3's single drafter). Each drafter sees a different snapshot of target hidden states + draft tokens, giving the verifier multiple candidate sequences per round.
+- The two architectures are **not redundant**: HASS's ensemble can outperform EAGLE-3 on workloads where the verifier's accept distribution is heavy-tailed and dynamic tree budget is misallocated by a single drafter's confidence signal.
+- Both ship to the same Qwen35 tree-verify infrastructure (the per-layer block + dispatcher from E6 is the foundation). Marginal LOC for HASS ≈ parallel-drafter forward orchestration + HASS-specific training recipe + serve flag wiring — meaningful but bounded.
+
+The empirically-optimal answer at production is **"both drafter families, picked per workload"**, not "the one with the higher paper number".
+
+### 10.2 HASS architecture (peer reference)
+
+Reference repos: `https://github.com/HArmonizedSS/HASS` (Hydra is an earlier name in the lineage). Architecture (from paper + repo):
+
+- **N parallel drafters** (typically N=4 for HASS-Vicuna). Each is a 1-layer transformer.
+- Drafter `i` consumes target hidden states from layer subset `L_i` (overlapping across drafters → diversity). EAGLE-3 uses a single drafter with multi-layer concatenated hidden; HASS distributes layer assignment across drafters.
+- Each drafter generates its own candidate sequence of length `D` (depth). Tree topology can be either: (a) **static** — each drafter contributes a depth-D chain → N×D candidates, or (b) **dynamic** — best-first expansion across the union of all drafter outputs.
+- Verifier accepts the longest matching prefix across the N parallel drafter outputs in one tree-verify pass.
+
+### 10.3 Phase E9 sub-phase plan
+
+| Sub-phase | Goal | Estimated LOC |
+|---|---|---|
+| E9.1 | HASS drafter weights schema + manifest loader (extends `Eagle3Weights`); N×1-layer-transformer struct | 500 |
+| E9.2 | Parallel-drafter forward orchestrator: runs N drafters in parallel encoders, fuses outputs into a single ExpandedTree | 600 |
+| E9.3 | HASS-specific training recipe + drafter training (multi-week H100 compute, parallels E2) | external |
+| E9.4 | Serve-layer `HF2Q_SPEC_DRAFTER={eagle3\|hass}` flag wiring | 200 |
+| E9.5 | Empirical 3-rep paired validation: HASS vs EAGLE-3 vs base on pinned long-context fixtures; pick per-workload defaults | external |
+| E9.6 | Codex /cfa final + ADR-037 update + merge | external |
+
+### 10.4 Reuse opportunities (why this is bounded)
+
+- Qwen35 tree-verify dispatcher (E6 SHIPPED) — unchanged
+- Qwen35 per-layer tree-verify block (E6 SHIPPED) — unchanged
+- Tree-walk-accept algorithm (E5a SHIPPED) — unchanged
+- DrafterKvCache (E5b SHIPPED) — N caches, one per drafter
+- Dynamic-tree best-first expansion (E4a SHIPPED) — extends to multi-drafter union
+- mlx-native dk128 tree_attention kernel — unchanged
+- Eagle3HiddenCollector — extended (HASS needs per-drafter layer-subset assignment, but the collection plumbing is the same)
+
+### 10.5 HASS-vs-EAGLE-3 decision matrix (per-workload defaults to be empirically validated in E9.5)
+
+Hypothesis to test: HASS wins on long-context heterogeneous workloads (chat, RAG with mixed retrieval); EAGLE-3 wins on homogeneous workloads (code-gen, single-domain). Tested in E9.5.
+
+## 11. Decision
+
+**Approved scope**: implement EAGLE-3 with dynamic tree decoding in 8 phases (E1-E8), then HASS / Hydra as Phase E9 per §10. No Medusa fallback, no incremental "stepping stones". Commit to the architecture that delivers max coherence + perf from phase 1.
+
+**First-action next iteration**: Phase E1.1 — `mlx-native/src/shaders/tree_attention.metal` skeleton + tree=1 parity test. (SHIPPED.)
+
+**Acceptance for ADR-037 closure (EAGLE-3 portion)**: Phase E7 empirical validation shows EAGLE-3 ≥1.3× base on pinned 2K natural prompt + ≥1.5× on long code-gen, AND Phase E8 codex /cfa final clean.
+
+**Acceptance for full mission closure**: Phase E9.5 empirical validation establishes per-workload winner between HASS and EAGLE-3, AND E9.6 codex /cfa final clean, AND HF2Q_SPEC_DRAFTER serve flag ships.
