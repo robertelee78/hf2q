@@ -1903,10 +1903,15 @@ impl Qwen35Model {
     /// aware DWQ calibration so its GPU-sync correctness is already known
     /// good.
     ///
-    /// Memory cost: `n_layers * seq_len * hidden_size * 4` bytes for the
-    /// scratch LayerActivations. For Qwen 3.6 27B (64 layers × 4 tokens ×
-    /// 5120 floats) this is ~5 MB per round — small relative to the
-    /// model itself.
+    /// Memory cost: `2 * n_layers * seq_len * hidden_size * 4` bytes for
+    /// the scratch LayerActivations (the capture path inside
+    /// `forward_gpu_impl` populates BOTH `layer_inputs` and
+    /// `layer_outputs`; we only consume `layer_outputs` but pay for both).
+    /// For Qwen 3.6 27B (64 layers × 4 tokens × 5120 floats × 2) this is
+    /// ~10 MB per round — small relative to the model itself. For
+    /// seq_len=200 ≈ 500 MB; production DFlash uses K+1 ≤ 8 so this is
+    /// not a concern. If profiling later shows this matters, an
+    /// output-only capture mode can be added.
     ///
     /// When `dflash_capture` is `None`, behavior is byte-identical to
     /// [`Self::forward_gpu_with_hidden`].
@@ -1983,7 +1988,12 @@ impl Qwen35Model {
                 acts.layer_outputs.len(),
             ));
         }
-        for (capture_idx, &layer_idx) in session.target_layer_ids.clone().iter().enumerate() {
+        // Index loop avoids cloning session.target_layer_ids — the
+        // borrow checker accepts this because `acts.layer_outputs` and
+        // `session.target_layer_ids` are disjoint, and `write_layer_slab`
+        // takes only the capture_idx + slab (not the layer_ids).
+        for capture_idx in 0..session.target_layer_ids.len() {
+            let layer_idx = session.target_layer_ids[capture_idx];
             let slab = &acts.layer_outputs[layer_idx];
             session.write_layer_slab(capture_idx, slab)?;
         }
