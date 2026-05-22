@@ -89,39 +89,40 @@ Saved cost: ~8-17 ms per drafter forward × per round → ~10-20% DFlash through
 
 **Previously-believed target REVISED**: I previously documented "fused projections Metal kernel" (single dispatch for norm + Q+K+V+Gate + per-head norms + RoPE) as the structural lever. Reading MTPLX's `/opt/MTPLX/native_extensions/verify_mlp/gate_up/gate_up.metal` shows their only attention-side fused kernel is the MLP (gate + up + silu_mul, which corresponds to our task #93 SHIPPED). They do NOT have a fused projections kernel either. Their advantage is the compiled drafter, not a deeper attention fusion. Task #89's vec-extension building blocks (Steps 1-3b SHIPPED) remain useful but don't unlock the perf gap — the real gap is the drafter compile pattern.
 
-**Task #95 COMPLETED at HEAD `ffa526ff` (2026-05-22)** — compiled-drafter lever shipped in 8 sub-iterations:
+**Task #95 COMPLETED at HEAD `f23b9274` (2026-05-22)** — compiled-drafter lever shipped in 10 sub-iterations:
 
-| Sub-iter | Commit | Description | Cumulative perf |
-|---|---|---|---:|
-| A | `26d96cad` | `append_seq_major_kv_gpu` + parity test PASS | baseline ~17.87 t/s |
-| B | `be54bd0d` | `write_slack_kv_gpu` + parity test PASS | ~17.87 t/s |
-| C+D | `f25348d3` | Wire GPU cache writes into drafter attention | 18.10 (+1.3%) |
-| F | `c49133de` | GPU permute in `dispatch_dflash_sdpa_cross_length` | 18.20 (+1.8%) |
-| G | `17852489` | Fuse `o_proj` into sdpa encoder | 18.43 (+3.1%) |
-| (codex) | `9bc8c0ce` | Interleaved-cursor parity test per codex /cfa | — |
-| E | `ffa526ff` | Remove env-gated CPU opt-outs (120 LOC dead code cleanup) | **18.50 (+3.5%)** |
+| Sub-iter | Commit | Description |
+|---|---|---|
+| A | `26d96cad` | `append_seq_major_kv_gpu` + parity test PASS |
+| B | `be54bd0d` | `write_slack_kv_gpu` + parity test PASS |
+| C+D | `f25348d3` | Wire GPU cache writes into drafter attention |
+| F | `c49133de` | GPU permute in `dispatch_dflash_sdpa_cross_length` |
+| G | `17852489` | Fuse `o_proj` into sdpa encoder |
+| (codex) | `9bc8c0ce` | Interleaved-cursor parity test per codex /cfa |
+| E | `ffa526ff` | Remove env-gated CPU opt-outs (120 LOC dead code cleanup) |
+| (bench fix) | `989a9637` | Bench warmup pass (caught cold-cache pollution underestimating cumulative gain by ~5×) |
+| H | `1f130770` | `commit_labeled` (no CPU wait) for 3 inter-encoder boundaries (sdpa+oproj, residual+MLP, model_forward prelude) |
+| (script) | `f23b9274` | Bench script footer w/ pre/post baselines |
 
-**Final result**: Qwen 3.6 27B Q8_0 DFlash BS=4 code-gen 128 tok, 3-rep paired: **18.50 ± 0.10 tok/s** in single-config bench (was 17.87 at the corrected ADR target identification commit `e9358fde`). **+3.5% measured on single-config 3-rep**.
+**Full warmup-corrected workload bench at HEAD `f23b9274` (Qwen 3.6 27B Q8_0, 128 tok, 3-rep paired):**
 
-**HOWEVER**: full workload bench (essay + code-gen across all configs at post-`ce3d32e6` HEAD, warm-cache, second pass) reveals the true cumulative gain is **MUCH larger**:
-
-| Config | Pre-#95 baseline (HEAD 00b9ac54) | Post-#95 (HEAD ce3d32e6) | Δ |
+| Config | Pre-#95 (HEAD 00b9ac54) | Post-#95 sub-iter H | Δ |
 |---|---:|---:|---:|
-| DFlash BS=2 essay | 16.5 | **19.97** ± 0.05 | **+21%** |
-| DFlash BS=4 essay | 16.9 | **20.20** ± 0.00 | **+19.5%** |
-| DFlash BS=2 code-gen | 16.8 | **20.80** ± 0.00 | **+24%** |
-| DFlash BS=4 code-gen | 18.4 | **22.30** ± 0.00 | **+21%** |
+| DFlash BS=2 essay | 16.5 | **20.73** | **+25.6%** |
+| DFlash BS=4 essay | 16.9 | **20.97** | **+24.1%** |
+| DFlash BS=2 code-gen | 16.8 | **21.63** | **+28.8%** |
+| **DFlash BS=4 code-gen** | **18.4** | **23.17** | **+26%** |
 
-DFlash BS=4 code-gen now at **22.3 tok/s = 0.75× of MTP greedy** (was 0.62× pre-#95). Still not beating MTP K=1, but the gap narrowed substantially.
+DFlash BS=4 code-gen now at **23.17 tok/s = 0.77× of MTP greedy** (was 0.62× pre-#95). Substantially closer to viable but still below MTP K=1 production winner.
 
-The single-config 3-rep paired measurement underestimated because each config's first rep was cold-cache. The workload bench's `N_REPS=3` had the first config run cold, then subsequent reps were warm — accurately reflects the post-warmup steady-state per config.
+The single-config 3-rep paired measurement underestimated because each config's first rep was cold-cache. The workload bench's added warmup pass (commit `989a9637`) eliminates this pollution.
 
-**Cumulative DFlash perf** improvement vs the ADR-034 baseline (HEAD 00b9ac54 documented in §Comprehensive consolidated bench above): **+19% to +24%** across workload and block_size. Byte-identical output preserved throughout (verified at every sub-iter).
+**Cumulative DFlash perf** improvement vs the ADR-034 baseline (HEAD 00b9ac54): **+24% to +29%** across workload and block_size. Byte-identical output preserved throughout (verified at every sub-iter).
 
 **Test gates passed**:
 - 3 task #95 parity tests (`append`, `slack`, `interleaved-cursor`) all PASS
 - 51/51 lib tests still PASS
-- Codex /cfa cleared cumulative work (Critical 0, Major 0, Minor 1 doc-only)
+- Codex /cfa on cumulative A-H at HEAD `f23b9274`: **Critical 0, Major 0, Minor 2** (async error propagation note for commit_labeled CBs — no data-race; pool-vs-direct alloc prompt-framing). Recommendation: **"call ADR-034 task #95 DONE for this chain"**
 - Byte-identical generated text vs CPU paths at temp=0 greedy across all sub-iters
 
 **What this proved**: the corrected ADR target diagnosis was right. MTPLX's 2.24× advantage isn't from a fused projections Metal kernel (peer code confirmed they don't have one either) — it's from `mx.compile`-compiled chained drafter. The Rust-side equivalent (in-encoder GPU kernel dispatches replacing CPU bridges + commit_and_wait boundaries) is now shipped and delivering real perf with byte-identical output.
