@@ -271,6 +271,15 @@ impl<'a> GpuDrafter<'a> {
         node_to_expand: usize,
         pre_len: usize,
     ) -> Result<Vec<f32>> {
+        // Bounds check first so we return a typed error instead of
+        // panicking on indexing if a malformed TreeContextView is
+        // passed in.
+        ensure!(
+            node_to_expand < tree.parents.len(),
+            "GpuDrafter::build_tree_mask_for: node_to_expand {} >= tree.parents.len() {}",
+            node_to_expand,
+            tree.parents.len(),
+        );
         let new_kv_len = pre_len + 1;
         let mut mask: Vec<f32> = vec![
             super::forward::EAGLE3_TREE_MASK_MASKED;
@@ -1410,6 +1419,32 @@ mod tests {
         for (i, &v) in mask.iter().enumerate() {
             assert_eq!(v, EAGLE3_TREE_MASK_ATTENDED, "slot {} should be attended", i);
         }
+    }
+
+    #[test]
+    fn adr_037_e6_build_tree_mask_rejects_out_of_range_node_2026_05_22() {
+        // node_to_expand >= tree.parents.len() must error, not panic.
+        let (device, mut registry, cfg, tensors, target_aux_buf, embed_table) =
+            match drafter_for_mask_test() {
+                Some(t) => t,
+                None => return,
+            };
+        let drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("drafter");
+        let view = TreeContextView {
+            tokens: &[10_u32],
+            parents: &[None],
+        };
+        let err = drafter
+            .build_tree_mask_for(&view, 5, 0)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("node_to_expand 5"),
+            "expected OOB error, got: {err}"
+        );
     }
 
     #[test]
