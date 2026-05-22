@@ -899,7 +899,11 @@ pub fn dispatch_dflash_decoder_layer_attention(
         &mut sdpa_enc, registry, device, &attn_out, layer_weights, cfg, l,
     )
     .context("layer attn: o_proj (fused)")?;
-    sdpa_enc.commit_and_wait().context("layer attn: commit sdpa+o_proj (fused)")?;
+    // ADR-034 task #95 sub-iter H (2026-05-22) — commit_labeled (no wait).
+    // The caller's next encoder (residual_add) reads attn_proj; Metal
+    // serial queue ordering guarantees this CB completes before the
+    // next CB dispatches. Saves the CPU wait latency.
+    sdpa_enc.commit_labeled("dflash.decoder_layer_attention.sdpa_oproj_fused");
 
     Ok(attn_proj)
 }
@@ -961,7 +965,10 @@ pub fn dispatch_dflash_model_forward(
     enc.memory_barrier();
     let h_ctx = dispatch_dflash_hidden_norm(&mut enc, registry, device, &fc_out, model, cfg, ctx_chunk_size)
         .context("model_forward: hidden_norm")?;
-    enc.commit_and_wait().context("model_forward: commit prelude")?;
+    // ADR-034 task #95 sub-iter H (2026-05-22) — commit_labeled (no wait).
+    // h_ctx is consumed by every layer's attention encoder; Metal serial
+    // queue ordering preserves correctness without the CPU wait.
+    enc.commit_labeled("dflash.model_forward.prelude_fc_hidden_norm");
 
     // -------- Loop over decoder layers --------
     let mut h_curr_owned: Option<MlxBuffer> = None;
@@ -1048,7 +1055,10 @@ pub fn dispatch_dflash_decoder_layer(
 
     let h_out = dispatch_dflash_residual_add(&mut enc, registry, device, &h_after_attn, &mlp_out)
         .context("decoder_layer: residual 2")?;
-    enc.commit_and_wait().context("decoder_layer: commit residual+MLP")?;
+    // ADR-034 task #95 sub-iter H (2026-05-22) — commit_labeled (no wait).
+    // The next layer's attention encoder reads h_out; Metal serial queue
+    // ordering preserves correctness without the CPU wait.
+    enc.commit_labeled("dflash.decoder_layer.residual_mlp");
 
     Ok(h_out)
 }
