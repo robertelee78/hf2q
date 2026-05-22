@@ -1592,6 +1592,7 @@ impl Qwen35Model {
             &[],
             None,
             None,
+            None,
         )
     }
 
@@ -1614,6 +1615,7 @@ impl Qwen35Model {
             None,
             OutputHeadMode::Last,
             &[],
+            None,
             None,
             None,
         )
@@ -1670,6 +1672,7 @@ impl Qwen35Model {
             &[],
             None,
             Some(&mut topk_slot),
+            None,
         )?;
         topk_slot.ok_or_else(|| {
             anyhow!(
@@ -1732,6 +1735,7 @@ impl Qwen35Model {
             soft_tokens,
             None,
             None,
+            None,
         )
     }
 
@@ -1791,6 +1795,7 @@ impl Qwen35Model {
             soft_tokens,
             deepstack,
             None,
+            None,
         )
     }
 
@@ -1837,6 +1842,7 @@ impl Qwen35Model {
             &[],
             None,
             None,
+            None,
         )?;
         let h = self.cfg.hidden_size as usize;
         anyhow::ensure!(
@@ -1876,6 +1882,7 @@ impl Qwen35Model {
             Some(&mut hidden_out),
             OutputHeadMode::All,
             &[],
+            None,
             None,
             None,
         )?;
@@ -1997,6 +2004,7 @@ impl Qwen35Model {
             &[],
             None,
             None,
+            None,
         )
     }
 
@@ -2011,7 +2019,20 @@ impl Qwen35Model {
         soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
         deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
         topk_out: Option<&mut Option<(Vec<u32>, Vec<f32>)>>,
+        // ADR-034 task #78 Step 3c.A.1 (2026-05-21 cont. 38) — optional
+        // DFlash hidden-capture session. When `Some`, the layer loop
+        // downloads `hidden` to CPU at the end of each layer matching
+        // `cap.target_layer_ids` and writes it into the session via
+        // `cap.write_layer_slab(capture_idx, slab)`. When `None` the
+        // forward path is byte-identical to pre-Step 3c.A.1 behavior.
+        // Step 3c.A.1 just plumbs the param; layer-hook insertion comes
+        // in next iteration after caller signatures are updated.
+        mut dflash_capture: Option<&mut crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession>,
     ) -> Result<Vec<f32>> {
+        // dflash_capture is reserved for the per-layer hook landing in a
+        // follow-up iteration. Silence unused-variable lint until the
+        // hook is wired.
+        let _ = &mut dflash_capture;
         if tokens.is_empty() {
             return Err(anyhow!("forward_gpu: tokens must be non-empty"));
         }
