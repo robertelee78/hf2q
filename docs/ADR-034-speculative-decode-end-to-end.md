@@ -271,6 +271,37 @@ Expected: fa.ops1_4 drops 9.33 → ~3 ms. T_v(2) drops 17.7 → ~11 ms.
 Cycle = 11 + 2 (MTP) = 13 ms per 1.737 tokens = 7.5 ms/tok vs base 7.4 —
 break-even on 35B-A3B, then small win above.
 
+### Iteration 2026-05-21 (cont. 19) — Step 3 correction: existing fused_head_norm_rope is NeoX (wrong); plan pivots to fused QKVG quad-matmul
+
+Read `mlx-native/src/ops/fused_head_norm_rope.rs` carefully. The existing
+kernel is **NeoX RoPE convention** (per its module doc:
+"applies the NeoX-convention rotary embedding using precomputed cos/sin
+caches"). Qwen 3.6 / 3.5 use **IMROPE** (Interleaved Multi-section RoPE,
+`RopeMultiMode::Imrope` in `mlx-native/src/ops/rope_multi.rs:53`).
+
+These are NOT compatible — IMROPE has per-section theta cycling
+(`sector % 3` across 3 axes) and uses positions[4] vec, while NeoX uses
+single-axis positions. **The unwired kernel is not a drop-in.**
+
+A new fused norm+IMROPE kernel would require ~300-500 LOC Metal port
+(similar scope to fused_gate_up_silu_q8_0). Multi-iteration.
+
+**Pivot to a simpler nearby win**: fuse Q+K+V+gate projections
+(`apply_linear_projection_f32_into` calls in `gpu_full_attn.rs:2931-2950`)
+into ONE quad-matmul kernel. All 4 read the same `x_norm_buf`; loading x
+once and computing 4 dot products inline saves 3 dispatches per FA layer
+× 16 FA layers = **48 dispatches saved**.
+
+At ~297μs effective per dispatch at seq=2: ~14 ms saved per verifier
+forward. Verifier 59.5 → ~45.5 ms. Throughput 26.5 → ~37 t/s.
+Speedup vs base 21.30: 1.244× → **~1.74×** (projected, multi-week scope).
+
+This is a direct extension of the fused_gate_up_silu_q8_0 pattern
+(2 weights → 4 weights, no silu). Same NR=2 NSG=4 dispatch geometry.
+Reusable design.
+
+Step 4 of task #93 starts here.
+
 ### Iteration 2026-05-21 (cont. 18) — Step 3: granular profile reveals fa.ops1_4 is 76% of FA time; fused_head_norm_rope kernel exists but UNWIRED
 
 `HF2Q_PROFILE_W5B8=1` on SPEC K=1 BATCHED MH temp=0.5 at seq_len=2 reveals
