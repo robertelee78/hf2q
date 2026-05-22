@@ -207,19 +207,26 @@ impl<'a> Drafter for GpuDrafter<'a> {
             "GpuDrafter::predict_topk: empty path from node_to_expand {}",
             node_to_expand
         );
-        // Codex /cfa E4 final-gate Major 2 (2026-05-22): single-token
-        // decode mode only conditions on the LAST path token. For
-        // depth >= 2 expansion (node_to_expand a grandchild or deeper),
-        // ancestor token conditioning is dropped — the Drafter trait
-        // semantics are violated. Fail fast here so callers can't
-        // silently get path-conditioning-free predictions. Full path
-        // conditioning requires drafter KV cache reuse (Phase E4b.10b.4
-        // follow-up or absorbed into Phase E5).
+        // Codex /cfa E4 final-gate Major 2 re-review (2026-05-22):
+        // single-token decode mode ONLY conditions on the last path
+        // token. predict_topk MUST therefore reject any path with
+        // more than ONE token (i.e. node_to_expand at depth >= 1).
+        //
+        // The previous `path.len() <= 2` guard incorrectly allowed
+        // expanding a depth-1 child to depth-2 grandchildren — the
+        // depth-1 child's drafter conditioning context is "root
+        // token + child token", but we'd only feed the child token,
+        // dropping the root's contribution.
+        //
+        // Only ROOT expansion (path.len() == 1) is semantically
+        // correct under single-token decode. Tree configs must
+        // therefore use max_depth == 1 (root + 1 layer of children)
+        // until Phase E4b.10b.4 / E5 ships drafter KV cache.
         ensure!(
-            path.len() <= 2,
-            "GpuDrafter::predict_topk: path length {} > 2 (depth >= 2 not supported \
-             without drafter KV cache — limit DynamicTreeConfig.max_depth to 1 \
-             until Phase E4b.10b.4 ships path-conditioned forward)",
+            path.len() == 1,
+            "GpuDrafter::predict_topk: path length {} != 1 (only ROOT expansion \
+             supported in single-token decode — limit DynamicTreeConfig.max_depth=1 \
+             until path-conditioned drafter KV cache ships)",
             path.len()
         );
         // Single-token decode: use the LAST path token as the input
@@ -640,7 +647,46 @@ mod tests {
         };
         let err = drafter.predict_topk(view, 2, 3).unwrap_err();
         assert!(
-            err.to_string().contains("path length 3 > 2"),
+            err.to_string().contains("path length 3 != 1"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn adr_037_e4_final_gate_predict_topk_rejects_depth_1_path_2026_05_22() {
+        // Codex /cfa E4 final-gate Major 2 closure (2026-05-22):
+        // even depth-1 (single-child) expansion violates conditioning
+        // semantics since the path "root → child" would need both
+        // tokens but single-token decode only consumes the last.
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry = KernelRegistry::new();
+        let cfg = cfg_for_drafter_test();
+        let manifest = expected_manifest(&cfg);
+        let blob = build_test_blob(&manifest);
+        let weights = Eagle3Weights::load(&blob, &cfg).expect("load");
+        let tensors = Eagle3DrafterTensors::upload(&device, &cfg, &weights).expect("upload");
+        let target_aux_data = vec![0.1f32; cfg.fc_input_size()];
+        let mut target_aux_buf = device
+            .alloc_buffer(cfg.fc_input_size() * 4, DType::F32, vec![1, cfg.fc_input_size()])
+            .expect("alloc");
+        target_aux_buf.as_mut_slice::<f32>().unwrap().copy_from_slice(&target_aux_data);
+        let embed_table = vec![0.0f32; cfg.vocab_size * cfg.hidden_size];
+        let mut drafter = GpuDrafter::new(
+            &cfg, &tensors, &device, &mut registry,
+            &target_aux_buf, &embed_table, 0,
+        )
+        .expect("construct");
+        // Depth-1 tree: root → child.
+        let view = TreeContextView {
+            tokens: &[10, 20],
+            parents: &[None, Some(0)],
+        };
+        let err = drafter.predict_topk(view, 1, 3).unwrap_err();
+        assert!(
+            err.to_string().contains("path length 2 != 1"),
             "got: {err}"
         );
     }
