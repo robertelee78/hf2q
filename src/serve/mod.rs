@@ -2846,6 +2846,31 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
         .min(model.cfg.max_position_embeddings as usize);
     let sample_logits = qwen35_generate_uses_sampling(&args);
 
+    // ADR-034 task #78 Step 4 (2026-05-21) — HF2Q_SPEC_DFLASH=1 opt-in.
+    // When set, this branch loads the Qwen35 DFlash drafter from
+    // HF2Q_DFLASH_DRAFTER_PATH (default
+    // /opt/hf2q/models/dflash-drafters/z-lab__Qwen3.6-27B-DFlash),
+    // runs dispatch_qwen35_dflash_generate, prints the decoded text,
+    // and returns Ok(()) before reaching the standard SpecDecode
+    // / per-token branch. Greedy byte-identity preserved at
+    // temperature=0 per the orchestrator's accept-prefix walk.
+    //
+    // Empirical perf vs the production MTP K=1 BATCHED MH path is
+    // unvalidated as of this wire-up — see the eprintln warning in
+    // try_dispatch_qwen35_dflash_spec_decode. Default OFF preserves
+    // current production perf parity.
+    let mut model = model;
+    if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_qwen35_dflash_spec_decode(
+        &mut model,
+        &prompt_tokens,
+        args.max_tokens,
+        &eos_token_ids,
+        args.ignore_eos,
+        &tokenizer,
+    )? {
+        return Ok(());
+    }
+
     let spec_env = std::env::var("HF2Q_SPEC_DECODE").ok();
     let mut use_spec_decode = match spec_env.as_deref() {
         Some("0") => false,

@@ -184,6 +184,231 @@ pub fn try_dispatch_dflash_spec_decode(
     Ok(Some(()))
 }
 
+/// ADR-034 task #78 Step 4 (2026-05-21) — default Qwen35 DFlash drafter
+/// path. The z-lab drafter ships at this absolute location after
+/// `hf-download` (see /opt/hf2q/models/dflash-drafters/README).
+///
+/// Default chosen as the Qwen 3.6 27B dense drafter — matches the
+/// production Cell A 27B target. Users can override via
+/// `HF2Q_DFLASH_DRAFTER_PATH` for the 35B-A3B variant or any other
+/// future drafter.
+const DEFAULT_QWEN35_DRAFTER_DIR: &str =
+    "/opt/hf2q/models/dflash-drafters/z-lab__Qwen3.6-27B-DFlash";
+
+/// Resolve the Qwen35 DFlash drafter directory.
+fn resolve_qwen35_drafter_path() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("HF2Q_DFLASH_DRAFTER_PATH") {
+        return Ok(PathBuf::from(p));
+    }
+    Ok(PathBuf::from(DEFAULT_QWEN35_DRAFTER_DIR))
+}
+
+/// ADR-034 task #78 Step 4 (2026-05-21) — dispatch Qwen35 DFlash
+/// spec-decode when `HF2Q_SPEC_DFLASH=1` is set, from the Qwen35-side
+/// `cmd_generate_qwen35` call path.
+///
+/// Mirrors [`try_dispatch_dflash_spec_decode`] (which handles the
+/// MlxModelWeights / Gemma 4 target), adapted for Qwen35Model +
+/// HybridKvCache via the [`Qwen35DFlashTarget`] wrapper.
+///
+/// Returns `Ok(None)` when `HF2Q_SPEC_DFLASH` is unset (caller falls
+/// through to the standard SpecDecode / decode path). Returns
+/// `Ok(Some(()))` after writing the decoded text to stdout. Returns
+/// `Err(_)` for drafter load failures or
+/// `dispatch_qwen35_dflash_generate` failures.
+///
+/// ## Env vars
+///
+/// - `HF2Q_SPEC_DFLASH` (= "1") — opt in.
+/// - `HF2Q_DFLASH_DRAFTER_PATH` — override the drafter directory.
+///   Default = `/opt/hf2q/models/dflash-drafters/z-lab__Qwen3.6-27B-DFlash`.
+/// - `HF2Q_DFLASH_BLOCK_SIZE` — override the block size K+1 (default
+///   reads `drafter_cfg.block_size`, falling back to 8 if absent).
+///
+/// ## Correctness vs performance
+///
+/// At temperature=0 (greedy), output is byte-identical to single-token
+/// Qwen35 decode per the orchestrator's `step_round_from_argmaxes`
+/// + greedy-byte-identity proof (see `qwen35_orchestrator.rs` module
+/// doc).
+///
+/// Performance is UNVALIDATED at the time of wiring (Step 4). Cell C
+/// Gemma 4 DFlash was empirically 4.8x SLOWER than baseline because the
+/// MlxModelWeights orchestrator uses Option C re-prefill. The Qwen35
+/// orchestrator uses Option A (xlen verify) which avoids the
+/// re-prefill — first empirical bench result will determine whether
+/// Qwen35 DFlash beats the current production winner (MTP K=1 BATCHED
+/// MH at 25.6 tok/s on Qwen 3.6 27B).
+pub fn try_dispatch_qwen35_dflash_spec_decode(
+    model: &mut crate::inference::models::qwen35::model::Qwen35Model,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    eos_token_ids: &[u32],
+    ignore_eos: bool,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<Option<()>> {
+    if std::env::var("HF2Q_SPEC_DFLASH").as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    eprintln!(
+        "[HF2Q_SPEC_DFLASH=1 qwen35] Step 4 (2026-05-21) — DFlash orchestrator UNBENCHED \
+         on Qwen35; if perf <= base / current production winner you should fall back to \
+         MTP K=1 BATCHED MH (HF2Q_SPEC_DECODE=1)."
+    );
+
+    use crate::inference::spec_decode::dflash::{
+        config::DFlashConfig,
+        kv_cache::DFlashKvCache,
+        qwen35_orchestrator::dispatch_qwen35_dflash_generate,
+        qwen35_target::Qwen35DFlashTarget,
+        tensors::DFlashModelTensors,
+        weights::{DFlashWeights, DFlashWeightsFile},
+    };
+
+    let drafter_dir = resolve_qwen35_drafter_path()?;
+    if !drafter_dir.is_dir() {
+        anyhow::bail!(
+            "HF2Q_SPEC_DFLASH=1 (qwen35 path) but drafter dir {} does not exist. \
+             Set HF2Q_DFLASH_DRAFTER_PATH or fetch \
+             z-lab/Qwen3.6-27B-DFlash from HuggingFace first.",
+            drafter_dir.display(),
+        );
+    }
+    let cfg_path = drafter_dir.join("config.json");
+    let weights_path = drafter_dir.join("model.safetensors");
+    for p in [&cfg_path, &weights_path] {
+        anyhow::ensure!(
+            p.exists(),
+            "DFlash drafter artifact missing: {}",
+            p.display()
+        );
+    }
+
+    // --ignore-eos parity with Gemma path: pass empty eos slice so the
+    // orchestrator generates the full max_new_tokens regardless of EOS.
+    let effective_eos: &[u32] = if ignore_eos { &[] } else { eos_token_ids };
+
+    let t_load = std::time::Instant::now();
+    let drafter_cfg = DFlashConfig::from_json_path(&cfg_path)
+        .context("parse Qwen35 DFlash drafter config.json")?;
+
+    // block_size resolution: prefer drafter_cfg.block_size (set by
+    // z-lab — Qwen 3.6 27B drafter ships block_size=16), allow env
+    // override.
+    let block_size: u32 = match std::env::var("HF2Q_DFLASH_BLOCK_SIZE") {
+        Ok(s) => {
+            let n: u32 = s.parse().with_context(|| {
+                format!("HF2Q_DFLASH_BLOCK_SIZE must be integer; got {s:?}")
+            })?;
+            anyhow::ensure!(n >= 2, "HF2Q_DFLASH_BLOCK_SIZE must be >= 2; got {n}");
+            n
+        }
+        Err(_) => {
+            // drafter_cfg.block_size is usize; the orchestrator + GPU
+            // dispatch all take u32. Validate it fits.
+            let bs = drafter_cfg.block_size;
+            anyhow::ensure!(
+                bs >= 2 && bs <= u32::MAX as usize,
+                "drafter_cfg.block_size out of range: {bs}"
+            );
+            bs as u32
+        }
+    };
+
+    let drafter_file = DFlashWeightsFile::open(&weights_path)
+        .context("open Qwen35 DFlash drafter safetensors")?;
+    let drafter_weights = DFlashWeights::load(drafter_file.bytes(), &drafter_cfg)
+        .context("validate + load Qwen35 DFlash drafter weights")?;
+    // Drafter weights upload to the SAME MlxDevice as the Qwen35Model
+    // (avoids the "MlxBufferPool cannot mix residency-enabled devices"
+    // failure). The Qwen35Model holds its GPU state in a thread-local
+    // cache, so we go through `with_gpu_cache_mut` to fetch the device.
+    model
+        .ensure_gpu_cache_primed()
+        .context("ensure_gpu_cache_primed before drafter upload")?;
+    let drafter_tensors = model.with_gpu_cache_mut(|device, _reg| {
+        DFlashModelTensors::upload(device, &drafter_cfg, &drafter_weights)
+            .context("upload Qwen35 DFlash drafter weights to GPU")
+    })?;
+    // Drafter cache capacity: worst case is prompt_len + max_new_tokens
+    // committed tokens fed as drafter context. Use the +32 buffer +
+    // 2048 floor as the Gemma path does.
+    let drafter_cache_cap = (prompt_tokens.len() + max_new_tokens + 32).max(2048) as u32;
+    let mut drafter_cache = model.with_gpu_cache_mut(|device, _reg| {
+        DFlashKvCache::new(device, &drafter_cfg, drafter_cache_cap)
+            .context("allocate Qwen35 DFlash drafter KV cache")
+    })?;
+    eprintln!(
+        "[HF2Q_SPEC_DFLASH qwen35] drafter loaded in {:.2}s (cfg={}, block_size={block_size}, \
+         cache_cap={drafter_cache_cap}, target_layers={:?})",
+        t_load.elapsed().as_secs_f64(),
+        cfg_path.display(),
+        drafter_cfg.target_layer_ids,
+    );
+
+    // Allocate a fresh HybridKvCache sized for the worst-case forward.
+    // The orchestrator's per-round verify writes K+1 (=block_size)
+    // positions starting at output.len()-1. Worst case at the FINAL
+    // round: output.len() = prompt_len + max_new_tokens, so the cache
+    // needs `prompt_len + max_new_tokens + block_size` slots.
+    let kv_max_seq = (prompt_tokens.len() + max_new_tokens + block_size as usize) as u32;
+    let mut kv_cache = model.with_gpu_cache_mut(|device, _reg| {
+        crate::inference::models::qwen35::kv_cache::HybridKvCache::new(
+            &model.cfg,
+            device,
+            kv_max_seq,
+            1,
+        )
+        .context("alloc Qwen35 DFlash HybridKvCache")
+    })?;
+
+    // The orchestrator's `gpu` argument is required by the trait
+    // signature (`DFlashTarget::forward_decode_verify_batched`) but
+    // is IGNORED by the Qwen35 impl (Qwen35Model uses its own
+    // thread-local GPU_CACHE — see Qwen35DFlashTarget::
+    // forward_decode_verify_batched signature `_gpu`). We construct a
+    // fresh GpuContext just to satisfy the type-checker. The
+    // residency-enabled second MlxDevice coexists with the model's
+    // GPU_CACHE device because each device owns its own
+    // ResidencySet (see /opt/mlx-native/src/device.rs:46 — no shared
+    // residency state across MlxDevice instances). Existing Qwen35
+    // diagnostic paths (`qwen35_export_layer_states`,
+    // `qwen35_dump_layer_states` in serve/mod.rs) already use this
+    // pattern.
+    let mut gpu = crate::serve::gpu::GpuContext::new()
+        .map_err(|e| anyhow::anyhow!("GpuContext::new for trait API: {e}"))?;
+
+    let t_gen = std::time::Instant::now();
+    let mut target = Qwen35DFlashTarget::new(model, &mut kv_cache);
+    let output_tokens = dispatch_qwen35_dflash_generate(
+        &mut target,
+        &drafter_tensors,
+        &mut drafter_cache,
+        &drafter_cfg,
+        prompt_tokens,
+        max_new_tokens,
+        block_size,
+        effective_eos,
+        &mut gpu,
+    )
+    .context("dispatch_qwen35_dflash_generate")?;
+    let gen_elapsed = t_gen.elapsed();
+
+    let new_tokens = &output_tokens[prompt_tokens.len()..];
+    let decoded = tokenizer
+        .decode(new_tokens, /*skip_special=*/ false)
+        .unwrap_or_else(|e| format!("<decode failed: {e}>"));
+    println!("{decoded}");
+    eprintln!(
+        "[HF2Q_SPEC_DFLASH qwen35] {} new tokens in {:.2}s ({:.1} tok/s)",
+        new_tokens.len(),
+        gen_elapsed.as_secs_f64(),
+        new_tokens.len() as f64 / gen_elapsed.as_secs_f64().max(1e-6),
+    );
+
+    Ok(Some(()))
+}
+
 /// Resolve `K` for the n-gram proposer.  Default = 3 per
 /// ADR-029 Phase 1 / vLLM literature (`k=3, max_ngram=3, min_ngram=1`).
 fn resolve_ngram_k() -> Result<u32> {
