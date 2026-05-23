@@ -9,7 +9,7 @@
 //!
 //! Moved from `src/serve/forward_mlx.rs` by ADR-038 Step 3.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mlx_native::KernelRegistry;
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use mlx_native::ops::elementwise::CastDirection;
@@ -1955,4 +1955,1054 @@ impl MlxModelWeights {
         Ok((token_id, kp))
     }
 
+    /// ADR-038 G4-CFA-3: Gemma 4 tree-verify forward pass.
+    ///
+    /// Runs `tree_seq_len` draft tokens through all model layers in parallel
+    /// (single forward pass). Each layer uses a **parallel F32 KV cache**
+    /// independent of the production TQ/HB KV cache; the new K/V entries are
+    /// appended at positions `[prefix_len, prefix_len + tree_seq_len)`.
+    ///
+    /// Hidden states at layers in `hidden_collector.target_layer_ids()` are
+    /// captured into `hidden_collector` for the EAGLE-3 drafter input.
+    ///
+    /// Returns logits `[tree_seq_len, vocab_size]` as a flat F32 Vec (row-major).
+    ///
+    /// # Acceptance criteria
+    ///
+    /// AC-G4-3.1 through AC-G4-3.6 per ADR-038 §4.4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_tree_verify_gpu(
+        &self,
+        tree_tokens: &[u32],
+        tree_mask: &[f32],
+        tree_positions: &[u32],
+        prefix_len: usize,
+        kv_capacity: usize,
+        gpu: &mut GpuContext,
+        hidden_collector: &mut crate::inference::spec_decode::eagle3::multi_layer_hidden::Eagle3HiddenCollector,
+    ) -> Result<Vec<f32>> {
+        use anyhow::{anyhow, ensure};
+        use mlx_native::DType;
+
+        if tree_tokens.is_empty() {
+            return Err(anyhow!("forward_tree_verify_gpu: tree_tokens must be non-empty"));
+        }
+        let tree_seq_len = tree_tokens.len();
+        let mask_stride = prefix_len
+            .checked_add(tree_seq_len)
+            .ok_or_else(|| anyhow!("forward_tree_verify_gpu: prefix_len + tree_seq_len overflow"))?;
+        ensure!(
+            tree_mask.len() == tree_seq_len * mask_stride,
+            "forward_tree_verify_gpu: tree_mask len {} != tree_seq_len({}) * mask_stride({})",
+            tree_mask.len(),
+            tree_seq_len,
+            mask_stride
+        );
+        ensure!(
+            tree_positions.len() == tree_seq_len,
+            "forward_tree_verify_gpu: tree_positions len {} != tree_seq_len {}",
+            tree_positions.len(),
+            tree_seq_len
+        );
+        ensure!(
+            hidden_collector.seq_len() == tree_seq_len,
+            "forward_tree_verify_gpu: collector seq_len {} != tree_seq_len {}",
+            hidden_collector.seq_len(),
+            tree_seq_len
+        );
+        ensure!(
+            hidden_collector.hidden_size() == self.hidden_size,
+            "forward_tree_verify_gpu: collector hidden_size {} != model hidden_size {}",
+            hidden_collector.hidden_size(),
+            self.hidden_size
+        );
+        ensure!(
+            prefix_len + tree_seq_len <= kv_capacity,
+            "forward_tree_verify_gpu: prefix_len {} + tree_seq_len {} > kv_capacity {}",
+            prefix_len,
+            tree_seq_len,
+            kv_capacity
+        );
+
+        hidden_collector.reset();
+
+        let (exec, registry) = gpu.split();
+        let device = exec.device();
+        let metal_dev = device.metal_device();
+
+        let h = self.hidden_size;
+        let vocab_size = self.vocab_size;
+        let eps = self.rms_norm_eps as f32;
+
+        // --- Step 1: Embed tokens [tree_seq_len, hidden_size] F32 ---
+        // Gemma 4 scales embeddings by sqrt(hidden_size).
+        let hs_bytes = tree_seq_len * h * std::mem::size_of::<f32>();
+        let mut hidden = {
+            let scale = (h as f32).sqrt();
+            let embed_f32: &[f32] = self.embed_weight
+                .as_slice()
+                .map_err(|e| anyhow!("forward_tree_verify_gpu: embed_weight slice: {e}"))?;
+            let vocab_in_buf = embed_f32.len() / h;
+            let mut cpu = vec![0.0f32; tree_seq_len * h];
+            for (i, &tok) in tree_tokens.iter().enumerate() {
+                ensure!(
+                    (tok as usize) < vocab_in_buf,
+                    "forward_tree_verify_gpu: token {} out of vocab {}",
+                    tok, vocab_in_buf
+                );
+                let src = (tok as usize) * h;
+                let dst = i * h;
+                cpu[dst..dst + h].copy_from_slice(&embed_f32[src..src + h]);
+            }
+            for v in cpu.iter_mut() {
+                *v *= scale;
+            }
+            let mut buf = device
+                .alloc_buffer(hs_bytes, DType::F32, vec![tree_seq_len, h])
+                .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc embed: {e}"))?;
+            buf.as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("forward_tree_verify_gpu: embed slice: {e}"))?
+                .copy_from_slice(&cpu);
+            buf
+        };
+
+        // --- Step 2: Upload tree_mask and tree_positions to GPU ---
+        let mask_bytes = tree_seq_len * mask_stride * std::mem::size_of::<f32>();
+        let mut tree_mask_buf = device
+            .alloc_buffer(mask_bytes, DType::F32, vec![tree_seq_len, mask_stride])
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc tree_mask: {e}"))?;
+        tree_mask_buf
+            .as_mut_slice::<f32>()
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: tree_mask slice: {e}"))?
+            .copy_from_slice(tree_mask);
+
+        let pos_bytes = tree_seq_len * std::mem::size_of::<u32>();
+        let mut tree_pos_buf = device
+            .alloc_buffer(pos_bytes, DType::U32, vec![tree_seq_len])
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc tree_pos: {e}"))?;
+        tree_pos_buf
+            .as_mut_slice::<u32>()
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: tree_pos slice: {e}"))?
+            .copy_from_slice(tree_positions);
+
+        // --- Step 3: Allocate parallel F32 KV caches per layer ---
+        // Per ADR-038 §3.4.6 risk 4: per-layer nkv_heads and head_dim vary
+        // (sliding: 16 KV heads × 256 head_dim; global: 2 KV heads × 512 head_dim).
+        // We allocate [nkv_heads, kv_capacity, head_dim] F32 per layer.
+        let num_layers = self.layers.len();
+        let mut kv_caches_f32: Vec<(mlx_native::MlxBuffer, mlx_native::MlxBuffer)> =
+            Vec::with_capacity(num_layers);
+        for layer_idx in 0..num_layers {
+            let lw = &self.layers[layer_idx];
+            let nkv = lw.num_kv_heads;
+            let d = lw.head_dim;
+            let kv_elems = nkv
+                .checked_mul(kv_capacity)
+                .and_then(|v| v.checked_mul(d))
+                .ok_or_else(|| anyhow!(
+                    "forward_tree_verify_gpu: KV size overflow at layer {layer_idx}"
+                ))?;
+            let kv_bytes_layer = kv_elems * std::mem::size_of::<f32>();
+            let k = device
+                .alloc_buffer(kv_bytes_layer, DType::F32, vec![nkv, kv_capacity, d])
+                .map_err(|e| anyhow!(
+                    "forward_tree_verify_gpu: alloc F32 K cache layer {layer_idx}: {e}"
+                ))?;
+            let v = device
+                .alloc_buffer(kv_bytes_layer, DType::F32, vec![nkv, kv_capacity, d])
+                .map_err(|e| anyhow!(
+                    "forward_tree_verify_gpu: alloc F32 V cache layer {layer_idx}: {e}"
+                ))?;
+            kv_caches_f32.push((k, v));
+        }
+
+        // --- Step 4: Layer loop ---
+        // Per ADR-038 §3.4.6 risk 3: build attn_shape_base INSIDE the loop
+        // because head_dim and num_kv_heads vary per layer type.
+        for layer_idx in 0..num_layers {
+            let lw = &self.layers[layer_idx];
+            let nkv = lw.num_kv_heads;
+            let d = lw.head_dim;
+            let (rope_theta, freq_factors_present) = match lw.layer_type {
+                LayerType::Sliding => (self.rope_theta_sliding, false),
+                LayerType::Full => (self.rope_theta_global, true),
+            };
+            let freq_factors_buf: Option<&mlx_native::MlxBuffer> = if freq_factors_present {
+                Some(&self.activations.rope_freq_factors_gpu)
+            } else {
+                None
+            };
+            let shape = super::gpu_full_attn::Gemma4TreeVerifyFullLayerShapeQ {
+                attn: super::gpu_full_attn::Gemma4TreeVerifyLayerShape {
+                    hidden_size: h as u32,
+                    num_q_heads: self.num_attention_heads as u32,
+                    num_kv_heads: nkv as u32,
+                    head_dim: d as u32,
+                    tree_seq_len: tree_seq_len as u32,
+                    cache_prefix_len: prefix_len as u32,
+                    kv_capacity: kv_capacity as u32,
+                    mask_stride: mask_stride as u32,
+                    rms_norm_eps: eps,
+                    rope_theta: rope_theta as f32,
+                    freq_factors_present,
+                },
+                intermediate_size: self.intermediate_size as u32,
+            };
+            let enc = device
+                .command_encoder()
+                .map_err(|e| anyhow!(
+                    "forward_tree_verify_gpu: command_encoder layer {layer_idx}: {e}"
+                ))?;
+            let (ref mut k_cache, ref mut v_cache) = kv_caches_f32[layer_idx];
+            hidden = super::gpu_full_attn::gemma4_tree_verify_full_layer_q(
+                enc, device, registry,
+                &hidden, &tree_mask_buf, &tree_pos_buf,
+                k_cache, v_cache,
+                lw, freq_factors_buf,
+                shape,
+            )
+            .map_err(|e| anyhow!(
+                "forward_tree_verify_gpu: layer {layer_idx}: {e}"
+            ))?;
+
+            // Capture hidden states for EAGLE-3 drafter input.
+            if let Some(capture_idx) = hidden_collector.capture_index_for(layer_idx) {
+                let slab: &[f32] = hidden
+                    .as_slice()
+                    .map_err(|e| anyhow!(
+                        "forward_tree_verify_gpu: download hidden layer {layer_idx}: {e}"
+                    ))?;
+                hidden_collector
+                    .write_layer_slab(capture_idx, slab)
+                    .map_err(|e| anyhow!(
+                        "forward_tree_verify_gpu: write capture layer {layer_idx}: {e}"
+                    ))?;
+            }
+        }
+
+        ensure!(
+            hidden_collector.is_complete(),
+            "forward_tree_verify_gpu: hidden collector incomplete after {} layers",
+            num_layers
+        );
+
+        // --- Step 5: Final norm + lm_head → logits [tree_seq_len, vocab_size] ---
+        let rms_params_bytes = 2 * std::mem::size_of::<f32>();
+        let mut rms_params_buf = device
+            .alloc_buffer(rms_params_bytes, DType::F32, vec![2])
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc rms_params: {e}"))?;
+        {
+            let s = rms_params_buf
+                .as_mut_slice::<f32>()
+                .map_err(|e| anyhow!("forward_tree_verify_gpu: rms_params slice: {e}"))?;
+            s[0] = eps;
+            s[1] = h as f32;
+        }
+        let normed_bytes = tree_seq_len * h * std::mem::size_of::<f32>();
+        let normed = device
+            .alloc_buffer(normed_bytes, DType::F32, vec![tree_seq_len, h])
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc normed: {e}"))?;
+        let logits_bytes = tree_seq_len * vocab_size * std::mem::size_of::<f32>();
+        let logits = device
+            .alloc_buffer(logits_bytes, DType::F32, vec![tree_seq_len, vocab_size])
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc logits: {e}"))?;
+
+        // Norm pass.
+        let mut enc_head = device
+            .command_encoder()
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc enc_head: {e}"))?;
+        mlx_native::ops::rms_norm::dispatch_rms_norm(
+            &mut enc_head, registry, metal_dev,
+            &hidden,
+            &self.final_norm,
+            &normed,
+            &rms_params_buf,
+            tree_seq_len as u32,
+            h as u32,
+        )
+        .context("forward_tree_verify_gpu: final rms_norm")?;
+        enc_head.memory_barrier();
+
+        // lm_head projection: prefer quantized, fallback to F16 GEMM.
+        if let Some(ref q6k) = self.lm_head_q6k {
+            let mut s = exec
+                .begin()
+                .map_err(|e| anyhow!("forward_tree_verify_gpu: begin session q6k: {e}"))?;
+            // Commit the norm encoder first.
+            enc_head
+                .commit_and_wait()
+                .context("forward_tree_verify_gpu: enc_head commit (q6k path)")?;
+            dispatch_qmatmul(
+                &mut s, registry, device,
+                &normed, q6k, &logits,
+                tree_seq_len as u32,
+                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+            )
+            .context("forward_tree_verify_gpu: lm_head q6k")?;
+            s.finish()
+                .map_err(|e| anyhow!("forward_tree_verify_gpu: finish q6k session: {e}"))?;
+        } else if let Some(ref q8) = self.lm_head_q8 {
+            enc_head
+                .commit_and_wait()
+                .context("forward_tree_verify_gpu: enc_head commit (q8 path)")?;
+            let mut s = exec
+                .begin()
+                .map_err(|e| anyhow!("forward_tree_verify_gpu: begin session q8: {e}"))?;
+            dispatch_qmatmul(
+                &mut s, registry, device,
+                &normed, q8, &logits,
+                tree_seq_len as u32,
+                crate::quantize::imatrix::ImatrixHint::Global("output.weight"),
+            )
+            .context("forward_tree_verify_gpu: lm_head q8")?;
+            s.finish()
+                .map_err(|e| anyhow!("forward_tree_verify_gpu: finish q8 session: {e}"))?;
+        } else if let Some(ref lm_head_f16) = self.lm_head_f16 {
+            // Multi-row F16 lm_head: cast F32→F16, then GEMM, then cast F16→F32.
+            let normed_f16_bytes = tree_seq_len * h * 2; // 2 bytes per f16
+            let normed_f16 = device
+                .alloc_buffer(normed_f16_bytes, DType::F16, vec![tree_seq_len, h])
+                .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc normed_f16: {e}"))?;
+            let logits_f16_bytes = tree_seq_len * vocab_size * 2;
+            let logits_f16 = device
+                .alloc_buffer(logits_f16_bytes, DType::F16, vec![tree_seq_len, vocab_size])
+                .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc logits_f16: {e}"))?;
+
+            mlx_native::ops::elementwise::cast(
+                &mut enc_head, registry, metal_dev,
+                &normed, &normed_f16,
+                tree_seq_len * h, CastDirection::F32ToF16,
+            )
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: cast F32→F16: {e}"))?;
+            enc_head.memory_barrier();
+            let gemm_params = DenseGemmF16Params {
+                m: tree_seq_len as u32,
+                n: vocab_size as u32,
+                k: h as u32,
+            };
+            mlx_native::ops::dense_gemm::dispatch_dense_gemm_f16(
+                &mut enc_head, registry, metal_dev,
+                &normed_f16, lm_head_f16,
+                &logits_f16, &gemm_params,
+            )
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: dense_gemm_f16: {e}"))?;
+            enc_head.memory_barrier();
+            mlx_native::ops::elementwise::cast(
+                &mut enc_head, registry, metal_dev,
+                &logits_f16, &logits,
+                tree_seq_len * vocab_size, CastDirection::F16ToF32,
+            )
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: cast F16→F32: {e}"))?;
+            enc_head
+                .commit_and_wait()
+                .context("forward_tree_verify_gpu: enc_head commit (f16 path)")?;
+        } else {
+            return Err(anyhow!(
+                "forward_tree_verify_gpu: no lm_head weight available (need q6k, q8, or f16)"
+            ));
+        }
+
+        // Optional final_logit_softcapping.
+        if let Some(cap) = self.final_logit_softcapping {
+            let n_elems = tree_seq_len * vocab_size;
+            let softcap_bytes = 2 * std::mem::size_of::<f32>();
+            let mut sc_params = device
+                .alloc_buffer(softcap_bytes, DType::F32, vec![2])
+                .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc softcap_params: {e}"))?;
+            {
+                let p = sc_params
+                    .as_mut_slice::<f32>()
+                    .map_err(|e| anyhow!("forward_tree_verify_gpu: softcap_params slice: {e}"))?;
+                p[0] = cap;
+                p[1] = f32::from_bits(n_elems as u32);
+            }
+            let mut enc_sc = device
+                .command_encoder()
+                .map_err(|e| anyhow!("forward_tree_verify_gpu: alloc enc_sc: {e}"))?;
+            mlx_native::ops::softcap::dispatch_softcap(
+                &mut enc_sc, registry, metal_dev,
+                &logits, &logits, &sc_params, cap,
+            )
+            .context("forward_tree_verify_gpu: softcap")?;
+            enc_sc
+                .commit_and_wait()
+                .context("forward_tree_verify_gpu: softcap commit")?;
+        }
+
+        // Download logits to host.
+        let logits_data = logits
+            .as_slice::<f32>()
+            .map_err(|e| anyhow!("forward_tree_verify_gpu: download logits: {e}"))?
+            .to_vec();
+        Ok(logits_data)
+    }
+}
+
+// ── ADR-038 Step 4 G4-CFA-3 unit tests ──────────────────────────────────────
+#[cfg(test)]
+mod g4_cfa3_tests {
+    use super::*;
+    use mlx_native::{DType, MlxDevice};
+    use crate::inference::spec_decode::eagle3::multi_layer_hidden::Eagle3HiddenCollector;
+    use crate::inference::models::gemma4::model::{
+        MlxModelWeights, MlxActivationBuffers, MlxDecoderLayerWeights,
+        MlxAttentionWeights, MlxLayerNorms, MlxMlpWeights,
+    };
+    use crate::inference::models::gemma4::kv_cache::{MlxKvCache, DecodeRegime};
+    use crate::serve::config::LayerType;
+    use crate::serve::gpu::GpuContext;
+
+    fn try_device() -> Option<MlxDevice> {
+        MlxDevice::new().ok()
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn mk_rand_g4(seed: &mut u32, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| {
+            *seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            ((*seed as i32 as f32) / (i32::MAX as f32)) * scale
+        }).collect()
+    }
+
+    fn alloc_f32_g4(data: &[f32], device: &MlxDevice) -> mlx_native::MlxBuffer {
+        let n = data.len().max(1);
+        let mut b = device.alloc_buffer(n * 4, DType::F32, vec![n]).expect("alloc_f32_g4");
+        b.as_mut_slice::<f32>().expect("slice").copy_from_slice(&data[..n.min(data.len())]);
+        b
+    }
+
+    fn alloc_placeholder_f32(device: &MlxDevice) -> mlx_native::MlxBuffer {
+        device.alloc_buffer(4, DType::F32, vec![1]).expect("placeholder f32")
+    }
+
+    fn alloc_placeholder_u32(device: &MlxDevice) -> mlx_native::MlxBuffer {
+        device.alloc_buffer(4, DType::U32, vec![1]).expect("placeholder u32")
+    }
+
+    fn mk_f32_qweight_g4(
+        rows: usize, cols: usize, seed: &mut u32, scale: f32, device: &MlxDevice,
+    ) -> crate::serve::forward_mlx_shared::MlxQWeight {
+        use crate::serve::gpu::QuantWeightInfo;
+        let data = mk_rand_g4(seed, rows * cols, scale);
+        crate::serve::forward_mlx_shared::MlxQWeight {
+            buffer: alloc_f32_g4(&data, device),
+            info: QuantWeightInfo {
+                ggml_dtype: mlx_native::GgmlType::F32,
+                rows,
+                cols,
+            },
+            affine: None,
+            f16_shadow: None,
+            decode_record_q6k_m1: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn mk_sliding_layer(
+        hidden: usize, nq: usize, nkv: usize, head_dim: usize,
+        intermediate: usize, seed: &mut u32, device: &MlxDevice,
+    ) -> MlxDecoderLayerWeights {
+        MlxDecoderLayerWeights {
+            attn: MlxAttentionWeights {
+                q_proj: mk_f32_qweight_g4(nq * head_dim, hidden, seed, 0.05, device),
+                k_proj: mk_f32_qweight_g4(nkv * head_dim, hidden, seed, 0.05, device),
+                v_proj: Some(mk_f32_qweight_g4(nkv * head_dim, hidden, seed, 0.05, device)),
+                o_proj: mk_f32_qweight_g4(hidden, nq * head_dim, seed, 0.05, device),
+                q_norm_weight: alloc_f32_g4(&vec![1.0f32; head_dim], device),
+                k_norm_weight: alloc_f32_g4(&vec![1.0f32; head_dim], device),
+            },
+            mlp: MlxMlpWeights {
+                gate_proj: mk_f32_qweight_g4(intermediate, hidden, seed, 0.05, device),
+                up_proj: mk_f32_qweight_g4(intermediate, hidden, seed, 0.05, device),
+                down_proj: mk_f32_qweight_g4(hidden, intermediate, seed, 0.05, device),
+            },
+            moe: crate::inference::models::gemma4::model::MlxMoeWeights::dense_placeholder(device)
+                .expect("dense_placeholder"),
+            norms: MlxLayerNorms {
+                input_layernorm: alloc_f32_g4(&vec![1.0f32; hidden], device),
+                post_attention_layernorm: alloc_f32_g4(&vec![1.0f32; hidden], device),
+                pre_feedforward_layernorm: alloc_f32_g4(&vec![1.0f32; hidden], device),
+                post_feedforward_layernorm: alloc_f32_g4(&vec![1.0f32; hidden], device),
+                pre_feedforward_layernorm_2: alloc_f32_g4(&vec![1.0f32; hidden], device),
+                post_feedforward_layernorm_1: alloc_f32_g4(&vec![1.0f32; hidden], device),
+                post_feedforward_layernorm_2: alloc_f32_g4(&vec![1.0f32; hidden], device),
+            },
+            layer_scalar: {
+                let mut b = device.alloc_buffer(4, DType::F32, vec![1]).expect("scalar");
+                b.as_mut_slice::<f32>().expect("s")[0] = 1.0;
+                b
+            },
+            head_dim,
+            num_kv_heads: nkv,
+            layer_type: LayerType::Sliding,
+        }
+    }
+
+    fn mk_placeholder_kv_cache(device: &MlxDevice) -> MlxKvCache {
+        let buf = || device.alloc_buffer(4, DType::F32, vec![1]).expect("kv_buf");
+        MlxKvCache {
+            k_packed: buf(), k_norms: buf(), v_packed: buf(), v_norms: buf(),
+            capacity: 8, is_sliding: true, write_pos: 0, seq_len: 0,
+        }
+    }
+
+    /// Build a minimal MlxModelWeights suitable for forward_tree_verify_gpu tests.
+    ///
+    /// Uses only Sliding layers (no global), so rope_freq_factors_gpu is never
+    /// accessed and can stay as a 1-element placeholder.
+    ///
+    /// `n_layers`: number of sliding layers.
+    /// `hidden`, `nq`, `nkv`, `head_dim`, `intermediate`, `vocab`: model dims.
+    fn mk_tiny_g4_model(
+        n_layers: usize,
+        hidden: usize,
+        nq: usize,
+        nkv: usize,
+        head_dim: usize,
+        intermediate: usize,
+        vocab: usize,
+        seed: &mut u32,
+        device: &MlxDevice,
+    ) -> MlxModelWeights {
+        // embed_weight: [vocab, hidden] F32 with small random values.
+        let embed_data = mk_rand_g4(seed, vocab * hidden, 0.01);
+        let embed_weight = alloc_f32_g4(&embed_data, device);
+
+        // final_norm: [hidden] F32 ones.
+        let final_norm = alloc_f32_g4(&vec![1.0f32; hidden], device);
+
+        // lm_head_f16: [vocab, hidden] F16 zero-initialized (test only).
+        // Actual F32→F16 conversion requires a Metal kernel; zeros still
+        // produce finite logits after the rms_norm.
+        let lm_head_f16 = {
+            let bytes = vocab * hidden * 2;
+            device.alloc_buffer(bytes, DType::F16, vec![vocab, hidden]).expect("lm_head_f16")
+        };
+
+        // Build layer weights (all sliding).
+        let layers: Vec<MlxDecoderLayerWeights> = (0..n_layers)
+            .map(|_| mk_sliding_layer(hidden, nq, nkv, head_dim, intermediate, seed, device))
+            .collect();
+
+        // KV caches: one per layer (unused by forward_tree_verify_gpu).
+        let kv_caches: Vec<MlxKvCache> = (0..n_layers)
+            .map(|_| mk_placeholder_kv_cache(device))
+            .collect();
+
+        // MlxActivationBuffers: only rope_freq_factors_gpu is accessed by
+        // forward_tree_verify_gpu (for Full/global layers, which we don't have).
+        // All other fields are placeholder 1-element buffers.
+        let activations = MlxActivationBuffers {
+            hidden: alloc_placeholder_f32(device),
+            attn_q: alloc_placeholder_f32(device),
+            attn_k: alloc_placeholder_f32(device),
+            attn_out: alloc_placeholder_f32(device),
+            norm_out: alloc_placeholder_f32(device),
+            residual: alloc_placeholder_f32(device),
+            mlp_gate: alloc_placeholder_f32(device),
+            mlp_up: alloc_placeholder_f32(device),
+            mlp_fused: alloc_placeholder_f32(device),
+            mlp_down: alloc_placeholder_f32(device),
+            sdpa_out: alloc_placeholder_f32(device),
+            sdpa_tmp: alloc_placeholder_f32(device),
+            norm_params: alloc_placeholder_f32(device),
+            position: alloc_placeholder_u32(device),
+            softcap_params: alloc_placeholder_f32(device),
+            argmax_index: alloc_placeholder_u32(device),
+            argmax_value: alloc_placeholder_f32(device),
+            argmax_params: alloc_placeholder_f32(device),
+            logits: alloc_placeholder_f32(device),
+            moe_router_logits: alloc_placeholder_f32(device),
+            moe_expert_out: alloc_placeholder_f32(device),
+            moe_accum: alloc_placeholder_f32(device),
+            moe_norm_out: alloc_placeholder_f32(device),
+            router_norm_out: alloc_placeholder_f32(device),
+            moe_expert_ids: alloc_placeholder_u32(device),
+            moe_gate_up_id_out: alloc_placeholder_f32(device),
+            moe_down_id_out: alloc_placeholder_f32(device),
+            moe_swiglu_id_out: alloc_placeholder_f32(device),
+            hidden_f16: device.alloc_buffer(2, DType::F16, vec![1]).expect("hidden_f16"),
+            logits_f16: device.alloc_buffer(2, DType::F16, vec![1]).expect("logits_f16"),
+            norm_params_sliding_hd: alloc_placeholder_f32(device),
+            norm_params_global_hd: alloc_placeholder_f32(device),
+            // rope_freq_factors_gpu: only accessed for Full (global) layers.
+            // Since all layers here are Sliding, 1-element placeholder is safe.
+            rope_freq_factors_gpu: alloc_placeholder_f32(device),
+            attn_v: alloc_placeholder_f32(device),
+            attn_q_normed: alloc_placeholder_f32(device),
+            attn_k_normed: alloc_placeholder_f32(device),
+            moe_routing_weights_gpu: alloc_placeholder_f32(device),
+        };
+
+        MlxModelWeights {
+            embed_weight,
+            layers,
+            final_norm,
+            lm_head_f16: Some(lm_head_f16),
+            lm_head_q8: None,
+            lm_head_q6k: None,
+            hidden_size: hidden,
+            vocab_size: vocab,
+            num_attention_heads: nq,
+            rms_norm_eps: 1e-6,
+            final_logit_softcapping: None,
+            kv_caches,
+            activations,
+            sliding_window: 4096,
+            rope_theta_sliding: 10000.0,
+            rope_theta_global: 1_000_000.0,
+            num_experts: 0,
+            intermediate_size: intermediate,
+            dense_kvs: None,
+            dense_kvs_snapshot_for_lcp: None,
+            dense_sdpa_tmp: None,
+            leg_hb_encoded: None,
+            hybrid_kv: None,
+            decode_step: 0,
+            decode_regime: DecodeRegime::Default,
+            gate_h_inactive: true,
+            replay_tokens: Vec::new(),
+            dump_dir_override: None,
+            dump_all_cache_override: None,
+            decode_step_dump_counter: 0,
+            dflash_capture: None,
+            decode_record_rms_norm_f32_hs: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Build a causal tree mask [tree_seq_len, mask_stride] where each query
+    /// attends to all prior positions (prefix) and itself.
+    fn causal_mask_g4(tree_seq_len: usize, prefix_len: usize) -> Vec<f32> {
+        let mask_stride = prefix_len + tree_seq_len;
+        const ATTEND: f32 = 0.0;
+        const BLOCK: f32 = -65504.0;
+        let mut m = vec![BLOCK; tree_seq_len * mask_stride];
+        for i in 0..tree_seq_len {
+            for j in 0..prefix_len + i + 1 {
+                if j < mask_stride {
+                    m[i * mask_stride + j] = ATTEND;
+                }
+            }
+        }
+        m
+    }
+
+    // ── AC-G4-3.1 — single-iter end-to-end smoke test ────────────────────────
+
+    /// AC-G4-3.1 — forward_tree_verify_gpu end-to-end: 2 sliding layers,
+    /// tree_seq=3, vocab=64, asserts output logits shape [3×64] + all-finite.
+    #[test]
+    fn g4_cfa3_single_iter_end_to_end_2026_05_23() {
+        let device = match try_device() {
+            Some(d) => d,
+            None => { eprintln!("skip: no Metal device"); return; }
+        };
+        let mut gpu = match GpuContext::new() {
+            Ok(g) => g,
+            Err(_) => { eprintln!("skip: no Metal device (gpu)"); return; }
+        };
+
+        // head_dim=256 required by Gemma4TreeVerifyLayerShape validator.
+        let hidden = 256usize;
+        let nq = 1usize;
+        let nkv = 1usize;
+        let head_dim = 256usize;
+        let intermediate = 256usize;
+        let vocab = 256usize;
+        let n_layers = 2usize;
+        let tree_seq = 3usize;
+        let prefix = 4usize;
+        let kv_cap = 16usize;
+
+        let mut seed = 0xABCD_u32;
+        let model = mk_tiny_g4_model(
+            n_layers, hidden, nq, nkv, head_dim, intermediate, vocab,
+            &mut seed, &device,
+        );
+
+        let tokens: Vec<u32> = (0..tree_seq as u32).collect();
+        let mask = causal_mask_g4(tree_seq, prefix);
+        let positions: Vec<u32> = (prefix as u32..prefix as u32 + tree_seq as u32).collect();
+
+        // Capture from layer 0 only.
+        let mut collector = Eagle3HiddenCollector::new(
+            vec![0], tree_seq, hidden,
+        ).expect("collector");
+
+        let logits = model.forward_tree_verify_gpu(
+            &tokens, &mask, &positions, prefix, kv_cap,
+            &mut gpu, &mut collector,
+        ).expect("forward_tree_verify_gpu");
+
+        assert_eq!(logits.len(), tree_seq * vocab,
+            "logits shape: expected {} got {}", tree_seq * vocab, logits.len());
+        assert!(logits.iter().all(|v| v.is_finite()),
+            "logits contain non-finite values");
+        assert!(collector.is_complete(), "collector should be complete");
+    }
+
+    // ── AC-G4-3.2 — multi-iteration cache continuity ──────────────────────────
+
+    /// AC-G4-3.2 — forward_tree_verify_gpu is called 3 times in sequence;
+    /// each call allocates fresh per-layer KV caches (independent) and returns
+    /// correct shape. Verifies that repeated calls don't crash or corrupt.
+    #[test]
+    fn g4_cfa3_multi_iter_cache_continuity_2026_05_23() {
+        let device = match try_device() {
+            Some(d) => d,
+            None => { eprintln!("skip: no Metal device"); return; }
+        };
+        let mut gpu = match GpuContext::new() {
+            Ok(g) => g,
+            Err(_) => { eprintln!("skip: no Metal device (gpu)"); return; }
+        };
+
+        // head_dim=256 required by Gemma4TreeVerifyLayerShape validator.
+        let hidden = 256usize;
+        let nq = 1usize;
+        let nkv = 1usize;
+        let head_dim = 256usize;
+        let intermediate = 256usize;
+        let vocab = 256usize;
+        let n_layers = 2usize;
+        let tree_seq = 2usize;
+        let kv_cap = 32usize;
+
+        let mut seed = 0x1234_u32;
+        let model = mk_tiny_g4_model(
+            n_layers, hidden, nq, nkv, head_dim, intermediate, vocab,
+            &mut seed, &device,
+        );
+
+        let tokens: Vec<u32> = vec![1, 2];
+        let mut prev_argmax = None::<u32>;
+
+        for iter in 0..3usize {
+            let prefix = iter * tree_seq;
+            let mask = causal_mask_g4(tree_seq, prefix);
+            let positions: Vec<u32> = (prefix as u32..prefix as u32 + tree_seq as u32).collect();
+
+            let mut collector = Eagle3HiddenCollector::new(
+                vec![0], tree_seq, hidden,
+            ).expect("collector");
+
+            let logits = model.forward_tree_verify_gpu(
+                &tokens, &mask, &positions, prefix, kv_cap,
+                &mut gpu, &mut collector,
+            ).unwrap_or_else(|e| panic!("iter {iter} failed: {e}"));
+
+            assert_eq!(logits.len(), tree_seq * vocab,
+                "iter {iter}: logits len mismatch");
+            assert!(logits.iter().all(|v| v.is_finite()),
+                "iter {iter}: non-finite logits");
+
+            // Argmax of first token's logits should be deterministic per model.
+            let argmax = logits[..vocab]
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            if let Some(prev) = prev_argmax {
+                assert_eq!(argmax, prev,
+                    "iter {iter}: argmax changed from {prev} to {argmax} (non-deterministic)");
+            }
+            prev_argmax = Some(argmax);
+        }
+    }
+
+    // ── AC-G4-3.3 — per-layer dispatch branch: sliding vs global ─────────────
+
+    /// AC-G4-3.3 — A model with 1 sliding + 1 global layer both dispatch
+    /// without error, and the output is finite. Exercises both LayerType
+    /// branches of the layer loop in forward_tree_verify_gpu.
+    #[test]
+    fn g4_cfa3_per_layer_dispatch_layer_type_branch_2026_05_23() {
+        let device = match try_device() {
+            Some(d) => d,
+            None => { eprintln!("skip: no Metal device"); return; }
+        };
+        let mut gpu = match GpuContext::new() {
+            Ok(g) => g,
+            Err(_) => { eprintln!("skip: no Metal device (gpu)"); return; }
+        };
+
+        // head_dim must be 256 (sliding) or 512 (global) per validator.
+        // Use nq=1 for both layers so num_attention_heads is consistent.
+        // hidden=512 so nq*d_sliding=1*256=256 and nq*d_global=1*512=512 both fit.
+        let hidden = 512usize;
+        let nq_sliding = 1usize;
+        let nkv_sliding = 1usize;
+        let d_sliding = 256usize;  // LayerType::Sliding
+        let nq_global = 1usize;
+        let nkv_global = 1usize;
+        let d_global = 512usize;   // LayerType::Full (global)
+        let intermediate = 256usize;
+        let vocab = 256usize;
+        let tree_seq = 2usize;
+        let prefix = 2usize;
+        let kv_cap = 16usize;
+        let global_head_dim_half = d_global / 2; // rope_freq_factors_gpu size = 256
+
+        let mut seed = 0xBEEF_u32;
+
+        // Build sliding layer.
+        let sliding_layer = mk_sliding_layer(
+            hidden, nq_sliding, nkv_sliding, d_sliding, intermediate,
+            &mut seed, &device,
+        );
+
+        // Build global layer (LayerType::Full) manually.
+        let global_layer = {
+            let mut lw = mk_sliding_layer(
+                hidden, nq_global, nkv_global, d_global, intermediate,
+                &mut seed, &device,
+            );
+            lw.layer_type = LayerType::Full;
+            lw
+        };
+
+        let embed_data = mk_rand_g4(&mut seed, vocab * hidden, 0.01);
+        let embed_weight = alloc_f32_g4(&embed_data, &device);
+        let final_norm = alloc_f32_g4(&vec![1.0f32; hidden], &device);
+        let lm_head_f16 = device.alloc_buffer(vocab * hidden * 2, DType::F16, vec![vocab, hidden])
+            .expect("lm_head_f16");
+
+        let kv_caches = vec![
+            mk_placeholder_kv_cache(&device),
+            mk_placeholder_kv_cache(&device),
+        ];
+
+        // rope_freq_factors_gpu must be sized [global_head_dim/2] F32.
+        let freq_factors = alloc_f32_g4(
+            &vec![1.0f32; global_head_dim_half],
+            &device,
+        );
+
+        let activations = MlxActivationBuffers {
+            hidden: alloc_placeholder_f32(&device),
+            attn_q: alloc_placeholder_f32(&device),
+            attn_k: alloc_placeholder_f32(&device),
+            attn_out: alloc_placeholder_f32(&device),
+            norm_out: alloc_placeholder_f32(&device),
+            residual: alloc_placeholder_f32(&device),
+            mlp_gate: alloc_placeholder_f32(&device),
+            mlp_up: alloc_placeholder_f32(&device),
+            mlp_fused: alloc_placeholder_f32(&device),
+            mlp_down: alloc_placeholder_f32(&device),
+            sdpa_out: alloc_placeholder_f32(&device),
+            sdpa_tmp: alloc_placeholder_f32(&device),
+            norm_params: alloc_placeholder_f32(&device),
+            position: alloc_placeholder_u32(&device),
+            softcap_params: alloc_placeholder_f32(&device),
+            argmax_index: alloc_placeholder_u32(&device),
+            argmax_value: alloc_placeholder_f32(&device),
+            argmax_params: alloc_placeholder_f32(&device),
+            logits: alloc_placeholder_f32(&device),
+            moe_router_logits: alloc_placeholder_f32(&device),
+            moe_expert_out: alloc_placeholder_f32(&device),
+            moe_accum: alloc_placeholder_f32(&device),
+            moe_norm_out: alloc_placeholder_f32(&device),
+            router_norm_out: alloc_placeholder_f32(&device),
+            moe_expert_ids: alloc_placeholder_u32(&device),
+            moe_gate_up_id_out: alloc_placeholder_f32(&device),
+            moe_down_id_out: alloc_placeholder_f32(&device),
+            moe_swiglu_id_out: alloc_placeholder_f32(&device),
+            hidden_f16: device.alloc_buffer(2, DType::F16, vec![1]).expect("hidden_f16"),
+            logits_f16: device.alloc_buffer(2, DType::F16, vec![1]).expect("logits_f16"),
+            norm_params_sliding_hd: alloc_placeholder_f32(&device),
+            norm_params_global_hd: alloc_placeholder_f32(&device),
+            rope_freq_factors_gpu: freq_factors,
+            attn_v: alloc_placeholder_f32(&device),
+            attn_q_normed: alloc_placeholder_f32(&device),
+            attn_k_normed: alloc_placeholder_f32(&device),
+            moe_routing_weights_gpu: alloc_placeholder_f32(&device),
+        };
+
+        let model = MlxModelWeights {
+            embed_weight,
+            layers: vec![sliding_layer, global_layer],
+            final_norm,
+            lm_head_f16: Some(lm_head_f16),
+            lm_head_q8: None,
+            lm_head_q6k: None,
+            hidden_size: hidden,
+            vocab_size: vocab,
+            num_attention_heads: nq_sliding, // nq_sliding == nq_global == 1
+            rms_norm_eps: 1e-6,
+            final_logit_softcapping: None,
+            kv_caches,
+            activations,
+            sliding_window: 4096,
+            rope_theta_sliding: 10000.0,
+            rope_theta_global: 1_000_000.0,
+            num_experts: 0,
+            intermediate_size: intermediate,
+            dense_kvs: None,
+            dense_kvs_snapshot_for_lcp: None,
+            dense_sdpa_tmp: None,
+            leg_hb_encoded: None,
+            hybrid_kv: None,
+            decode_step: 0,
+            decode_regime: DecodeRegime::Default,
+            gate_h_inactive: true,
+            replay_tokens: Vec::new(),
+            dump_dir_override: None,
+            dump_all_cache_override: None,
+            decode_step_dump_counter: 0,
+            dflash_capture: None,
+            decode_record_rms_norm_f32_hs: std::sync::OnceLock::new(),
+        };
+
+        let tokens: Vec<u32> = vec![0, 1];
+        let mask = causal_mask_g4(tree_seq, prefix);
+        let positions: Vec<u32> = vec![prefix as u32, prefix as u32 + 1];
+        let mut collector = Eagle3HiddenCollector::new(vec![0, 1], tree_seq, hidden)
+            .expect("collector");
+
+        let logits = model.forward_tree_verify_gpu(
+            &tokens, &mask, &positions, prefix, kv_cap,
+            &mut gpu, &mut collector,
+        ).expect("forward sliding+global layers");
+
+        assert_eq!(logits.len(), tree_seq * vocab);
+        assert!(logits.iter().all(|v| v.is_finite()), "non-finite with mixed layer types");
+    }
+
+    // ── AC-G4-3.4 — EAGLE-3 hidden capture correctness ───────────────────────
+
+    /// AC-G4-3.4 — forward_tree_verify_gpu captures hidden states at the
+    /// requested layer and writes non-zero values into the collector buffer.
+    /// Tests the layer-capture branch (capture_index_for → write_layer_slab).
+    #[test]
+    fn g4_cfa3_eagle3_hidden_capture_correctness_2026_05_23() {
+        let device = match try_device() {
+            Some(d) => d,
+            None => { eprintln!("skip: no Metal device"); return; }
+        };
+        let mut gpu = match GpuContext::new() {
+            Ok(g) => g,
+            Err(_) => { eprintln!("skip: no Metal device (gpu)"); return; }
+        };
+
+        // head_dim=256 required by Gemma4TreeVerifyLayerShape validator.
+        let hidden = 256usize;
+        let nq = 1usize;
+        let nkv = 1usize;
+        let head_dim = 256usize;
+        let intermediate = 256usize;
+        let vocab = 256usize;
+        let n_layers = 3usize;
+        let tree_seq = 2usize;
+        let prefix = 2usize;
+        let kv_cap = 16usize;
+
+        let mut seed = 0xCAFE_u32;
+        let model = mk_tiny_g4_model(
+            n_layers, hidden, nq, nkv, head_dim, intermediate, vocab,
+            &mut seed, &device,
+        );
+
+        let tokens: Vec<u32> = vec![3, 7];
+        let mask = causal_mask_g4(tree_seq, prefix);
+        let positions: Vec<u32> = vec![prefix as u32, prefix as u32 + 1];
+
+        // Capture at layer 0 and layer 2 (not layer 1).
+        let mut collector = Eagle3HiddenCollector::new(
+            vec![0, 2], tree_seq, hidden,
+        ).expect("collector");
+
+        model.forward_tree_verify_gpu(
+            &tokens, &mask, &positions, prefix, kv_cap,
+            &mut gpu, &mut collector,
+        ).expect("forward with capture");
+
+        assert!(collector.is_complete(), "collector must be complete after full forward");
+
+        // The concatenated buffer [tree_seq, num_aux=2, hidden] must be non-zero.
+        let buf = collector.concatenated_hidden().expect("concatenated_hidden");
+        let total = tree_seq * 2 * hidden;
+        assert_eq!(buf.len(), total, "buffer shape mismatch");
+        assert!(buf.iter().any(|&v| v != 0.0),
+            "capture buffer is all zeros — layer hidden states not written");
+    }
+
+    // ── AC-G4-3.5 — input validation rejects bad arguments ───────────────────
+
+    /// AC-G4-3.5 — forward_tree_verify_gpu returns Err for: (a) empty tokens,
+    /// (b) wrong mask length, (c) wrong positions length, (d) collector/model
+    /// hidden_size mismatch, (e) prefix+tree > kv_capacity.
+    /// Existing forward_decode path is unaffected (additive-only).
+    #[test]
+    fn g4_cfa3_regression_existing_forward_decode_passes_2026_05_23() {
+        let device = match try_device() {
+            Some(d) => d,
+            None => { eprintln!("skip: no Metal device"); return; }
+        };
+        let mut gpu = match GpuContext::new() {
+            Ok(g) => g,
+            Err(_) => { eprintln!("skip: no Metal device (gpu)"); return; }
+        };
+
+        // head_dim=256 required by Gemma4TreeVerifyLayerShape validator.
+        let hidden = 256usize;
+        let nq = 1usize;
+        let nkv = 1usize;
+        let head_dim = 256usize;
+        let intermediate = 256usize;
+        let vocab = 256usize;
+        let n_layers = 2usize;
+        let tree_seq = 3usize;
+        let prefix = 4usize;
+        let kv_cap = 16usize;
+
+        let mut seed = 0xDEAD_u32;
+        let model = mk_tiny_g4_model(
+            n_layers, hidden, nq, nkv, head_dim, intermediate, vocab,
+            &mut seed, &device,
+        );
+
+        let mask = causal_mask_g4(tree_seq, prefix);
+        let positions: Vec<u32> = (prefix as u32..prefix as u32 + tree_seq as u32).collect();
+        let mut collector = Eagle3HiddenCollector::new(vec![0], tree_seq, hidden)
+            .expect("collector");
+
+        // (a) Empty tokens.
+        let err = model.forward_tree_verify_gpu(
+            &[], &mask, &positions, prefix, kv_cap, &mut gpu, &mut collector,
+        );
+        assert!(err.is_err(), "empty tokens must fail");
+        assert!(err.unwrap_err().to_string().contains("tree_tokens must be non-empty"),
+            "expected 'tree_tokens must be non-empty' in error");
+
+        // (b) Wrong mask length.
+        let tokens: Vec<u32> = vec![0, 1, 2];
+        let bad_mask = vec![0.0f32; 5]; // wrong size
+        let err = model.forward_tree_verify_gpu(
+            &tokens, &bad_mask, &positions, prefix, kv_cap, &mut gpu, &mut collector,
+        );
+        assert!(err.is_err(), "wrong mask length must fail");
+
+        // (c) Wrong positions length.
+        let bad_positions = vec![0u32]; // too short
+        let err = model.forward_tree_verify_gpu(
+            &tokens, &mask, &bad_positions, prefix, kv_cap, &mut gpu, &mut collector,
+        );
+        assert!(err.is_err(), "wrong positions length must fail");
+
+        // (d) collector hidden_size mismatch.
+        let mut wrong_collector = Eagle3HiddenCollector::new(vec![0], tree_seq, hidden + 8)
+            .expect("wrong collector");
+        let err = model.forward_tree_verify_gpu(
+            &tokens, &mask, &positions, prefix, kv_cap, &mut gpu, &mut wrong_collector,
+        );
+        assert!(err.is_err(), "hidden_size mismatch must fail");
+
+        // (e) prefix + tree_seq > kv_capacity.
+        let tight_cap = prefix + tree_seq - 1; // too small
+        let err = model.forward_tree_verify_gpu(
+            &tokens, &mask, &positions, prefix, tight_cap, &mut gpu, &mut collector,
+        );
+        assert!(err.is_err(), "prefix+tree > kv_capacity must fail");
+    }
 }

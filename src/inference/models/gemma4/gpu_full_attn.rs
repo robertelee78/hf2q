@@ -3276,6 +3276,7 @@ pub fn gemma4_tree_verify_full_layer_q(
 }
 
 /// Compute the divisor for kv_capacity from byte_len: `num_kv_heads * head_dim * sizeof(f32)`.
+#[allow(dead_code)]
 pub(super) fn nkv_capacity_divisor(num_kv_heads: usize, head_dim: usize) -> usize {
     num_kv_heads * head_dim * std::mem::size_of::<f32>()
 }
