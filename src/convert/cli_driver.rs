@@ -1631,6 +1631,34 @@ fn build_qwen35moe_full_ctx(config: &serde_json::Value) -> Option<Qwen35MoeFullC
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
     );
 
+    // Ergonomics: stock llama.cpp (current stable) lacks a qwen35 MTP
+    // loader — it expects all blocks to share the linear-attention slot
+    // layout, so the MTP block triggers `missing tensor 'blk.<N>.ssm_conv1d.weight'`
+    // on load. Without `HF2Q_QWEN35_DROP_MTP=1` the produced GGUF is
+    // unloadable by current llama.cpp / llama-cli / llama-perplexity.
+    // hf2q's own inference path DOES handle MTP, so the strip is only
+    // necessary for llama.cpp interop. Warn so operators discover this
+    // at convert time rather than at load time. See src/arch/smoke.rs:464-479.
+    if !drop_mtp {
+        // Inline lookup since `effective_text_config` is per-arch private
+        // (lives in qwen35moe_full.rs). Mirror its shape: prefer the nested
+        // `text_config` for multimodal `ConditionalGeneration`, else root.
+        let text_for_mtp_check = config.get("text_config").unwrap_or(config);
+        let n_mtp_raw = text_for_mtp_check
+            .get("mtp_num_hidden_layers")
+            .and_then(|v: &serde_json::Value| v.as_u64())
+            .unwrap_or(0u64);
+        if n_mtp_raw > 0 {
+            eprintln!(
+                "[hf2q convert] note: qwen35moe model has {n_mtp_raw} MTP block(s); \
+                 the resulting GGUF will NOT load in stock llama.cpp (current stable \
+                 lacks a qwen35 MTP loader). Set HF2Q_QWEN35_DROP_MTP=1 to strip \
+                 the MTP block(s) for llama.cpp interop (loses MTP inference, but \
+                 hf2q's own inference path handles MTP separately)."
+            );
+        }
+    }
+
     Some(Qwen35MoeFullCtx {
         num_hidden_layers,
         num_experts,
