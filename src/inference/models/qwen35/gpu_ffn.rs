@@ -1251,6 +1251,17 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
     // 2026-05-21 cont. 22: flipped default-ON per "best things default on"
     // mantra (ADR-028 iter-309 reframe #2). Opt-out via
     // `HF2Q_FUSED_GATE_UP_SILU=0` / `=false` / `=off`.
+    //
+    // 2026-05-23 ADR-033 §Pi Task #20 iter 10 FALSIFIED: hypothesized
+    // that mat-vec fused gate_up_silu would lose to mat-mat unfused at
+    // prefill (seq>>32) due to per-token weight re-reads. Bench on
+    // Q4_K_M dense Qwen3.6 27B at seq=536:
+    //   fused MV p50 ffn_dispatch: 22.27 ms
+    //   mat-mat   p50 ffn_dispatch: 23.09 ms (+3.7% SLOWER)
+    // Apple Silicon's large L2 (~32 MB on M5 Max) keeps weights warm
+    // across mv calls; the mv kernel's higher occupancy outweighs
+    // explicit mat-mat shmem tile reuse. Default-ON correctly stays
+    // at all seq lengths for this kernel.
     let fused_off = matches!(
         std::env::var("HF2Q_FUSED_GATE_UP_SILU").as_deref(),
         Ok("0") | Ok("false") | Ok("off"),
@@ -1280,7 +1291,8 @@ fn build_dense_ffn_layer_gpu_q_into_pooled(
         weights.ggml_type_gate_up,
         mlx_native::ops::quantized_matmul_ggml::GgmlType::Q6_K
     );
-    let fused_eligible = (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q5_k || fused_q6_k) && !fused_off;
+    let fused_eligible = (fused_q8_0 || fused_q4_k || fused_iq4_nl || fused_q5_k || fused_q6_k)
+        && !fused_off;
     if fused_eligible {
         let _w5b = super::wave5b8_profile::Section::start(
             super::wave5b8_profile::SectionKind::FfnPhaseAProj,
