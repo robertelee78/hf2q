@@ -1498,16 +1498,15 @@ mod g4_cfa5_redhatai_smoke {
             let tokenizer = tokenizers::Tokenizer::from_file(tk)
                 .unwrap_or_else(|e| panic!("[g4_cfa5 LayerB] load tokenizer {}: {e}", tk.display()));
             let text = "The capital city of France is".to_string();
-            let enc = tokenizer
-                .encode(text.as_str(), true)
-                .unwrap_or_else(|e| panic!("[g4_cfa5 LayerB] tokenizer encode: {e}"));
-            // ADR-038 CFA-5e ROOT CAUSE (2026-05-23): bundled tokenizer.json
-            // does NOT prepend BOS despite GGUF metadata setting
-            // add_bos_token=True bos_token_id=2. Without BOS, Gemma 4 produces
-            // degenerate output (240017 "額" saturated); with BOS prepended,
-            // hf2q produces coherent English. Match llama.cpp's tokenization.
-            let mut tokens: Vec<u32> = vec![2u32];
-            tokens.extend(enc.get_ids().iter().copied());
+            // ADR-038 G4-CFA-5e: route through the shared adapter that mirrors
+            // llama.cpp's `common_tokenize` (auto-prepends BOS when GGUF declares
+            // add_bos_token=true). Without it, the bundled tokenizer.json's
+            // legacy post_processor template silently drops BOS → 240017 "額"
+            // saturation. See src/core/tokenizer_adapter.rs.
+            let tokens = crate::core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf(
+                &gguf, &tokenizer, text.as_str(),
+            )
+            .unwrap_or_else(|e| panic!("[g4_cfa5 LayerB] tokenize_with_bos_eos: {e}"));
             (text, tokens)
         } else {
             // Without a real tokenizer, synthetic token IDs produce degenerate
@@ -1987,19 +1986,14 @@ mod g4_cfa5_redhatai_smoke {
         // N=10 hits mm (or F16 shadow).
         for &n in &[1usize, 2, 4, 6, 8, 10] {
             let text = "The capital city of France is";
-            let enc = tokenizer.encode(text, true).expect("encode");
-            // ADR-038 CFA-5e ROOT CAUSE DIAGNOSTIC 2026-05-23: GGUF metadata sets
-            // `tokenizer.ggml.add_bos_token=True` + `bos_token_id=2`. llama.cpp
-            // tokenizes "The capital city of France is" to 7 tokens with leading
-            // BOS=2; hf2q's bundled tokenizer.json (no post_processor BOS) emits
-            // 6 tokens WITHOUT BOS. Gemma models depend on BOS for coherent
-            // output — without it, hidden state at every position lacks the
-            // "start of context" cue → garbage logits → 240017 saturation.
-            // Prepend BOS manually to match llama.cpp's behavior.
-            let mut full_tokens: Vec<u32> = vec![2u32];
-            full_tokens.extend(enc.get_ids().iter().copied());
+            // ADR-038 G4-CFA-5e: route through shared adapter
+            // (auto-prepends BOS per GGUF add_bos_token=true).
+            let full_tokens = crate::core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf(
+                &gguf, &tokenizer, text,
+            )
+            .expect("tokenize_with_bos_eos");
             let tokens: Vec<u32> = full_tokens.iter().cycle().take(n).copied().collect();
-            eprintln!("[g4_cfa5e-m] N={n} tokens (with prepended BOS=2)={:?}", tokens);
+            eprintln!("[g4_cfa5e-m] N={n} tokens (helper)={:?}", tokens);
             let kv_capacity = 64;
             let mut kv_caches = weights
                 .alloc_tree_verify_kv_caches(&gpu.device().clone(), kv_capacity)
@@ -2083,15 +2077,13 @@ mod g4_cfa5_redhatai_smoke {
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .unwrap_or_else(|e| panic!("[g4_cfa5e] tokenizer: {e}"));
         let text = "The capital city of France is";
-        let enc = tokenizer.encode(text, true).expect("[g4_cfa5e] encode");
-        // ADR-038 CFA-5e ROOT CAUSE (2026-05-23): bundled tokenizer.json does
-        // not prepend BOS. GGUF metadata sets add_bos_token=True bos_token_id=2.
-        // Without BOS, hf2q produced 240017 "額" saturated; with BOS, hf2q
-        // produces coherent English ("The", " the"). Always prepend BOS to
-        // match llama.cpp's tokenization behavior.
-        let mut prompt_tokens: Vec<u32> = vec![2u32];
-        prompt_tokens.extend(enc.get_ids().iter().copied());
-        eprintln!("[g4_cfa5e] prompt={text:?} tokens (with prepended BOS)={prompt_tokens:?}");
+        // ADR-038 G4-CFA-5e: route through shared adapter
+        // (auto-prepends BOS per GGUF add_bos_token=true).
+        let prompt_tokens = crate::core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf(
+            &gguf, &tokenizer, text,
+        )
+        .expect("[g4_cfa5e] tokenize_with_bos_eos");
+        eprintln!("[g4_cfa5e] prompt={text:?} tokens (helper)={prompt_tokens:?}");
 
         // Production prefill (forward_prefill, NOT forward_tree_verify_gpu_with_cache).
         let max_decode_tokens = 1usize;

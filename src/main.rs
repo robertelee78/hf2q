@@ -162,6 +162,55 @@ fn run(cli: Cli) -> Result<(), AppError> {
         // exit-3 is the documented signal.
         Command::Cache(args) => serve::cmd_cache(args).map_err(AppError::Input),
         Command::Convert(args) => cmd_convert(args),
+        Command::Tokenizer(args) => cmd_tokenizer(args),
+    }
+}
+
+/// ADR-038 G4-CFA-5e — operator-facing tokenizer.json patching.
+fn cmd_tokenizer(args: cli::TokenizerArgs) -> Result<(), AppError> {
+    use cli::TokenizerAction;
+    match args.action {
+        TokenizerAction::FixBos { path, gguf, bos_id, bos_text } => {
+            // If a sibling GGUF is provided, read BOS metadata from it
+            // (matches the runtime adapter's resolution path).
+            let (resolved_id, resolved_text) = if let Some(gguf_path) = gguf {
+                let g = mlx_native::gguf::GgufFile::open(&gguf_path)
+                    .map_err(|e| AppError::Input(anyhow::anyhow!(
+                        "open GGUF {}: {e}", gguf_path.display()
+                    )))?;
+                let id = g.metadata_u32("tokenizer.ggml.bos_token_id")
+                    .ok_or_else(|| AppError::Input(anyhow::anyhow!(
+                        "GGUF {} has no tokenizer.ggml.bos_token_id metadata",
+                        gguf_path.display()
+                    )))?;
+                // The runtime adapter resolves BOS *text* via the
+                // tokenizer's vocab. Here we don't have the tokenizer
+                // loaded yet (we're about to patch its file), so fall
+                // back to the operator-supplied `--bos-text` default.
+                (id, bos_text)
+            } else {
+                (bos_id, bos_text)
+            };
+
+            let mutated = core::tokenizer_adapter::fix_tokenizer_json_bos(
+                &path, &resolved_text, resolved_id,
+            )
+            .map_err(|e| AppError::Input(anyhow::anyhow!(
+                "fix_tokenizer_json_bos {}: {e}", path.display()
+            )))?;
+            if mutated {
+                println!(
+                    "Patched {}: prepended BOS SpecialToken {:?} (id={}) to post_processor.single",
+                    path.display(), resolved_text, resolved_id,
+                );
+            } else {
+                println!(
+                    "No change to {}: post_processor.single already starts with BOS SpecialToken {:?}",
+                    path.display(), resolved_text,
+                );
+            }
+            Ok(())
+        }
     }
 }
 

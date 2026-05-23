@@ -54,4 +54,5 @@ pub mod kernel_parity;
 pub mod mlx_safetensors_loader;
 pub mod provenance;
 pub mod sha256;
+pub mod tokenizer_adapter;
 pub mod traits;

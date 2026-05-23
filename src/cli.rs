@@ -103,6 +103,53 @@ pub enum Command {
     /// `convert-v2` alias (the historical name retired 2026-05-19 via
     /// B4 rename).
     Convert(ConvertCliArgs),
+
+    /// Operate on bundled `tokenizer.json` files (ADR-038 G4-CFA-5e).
+    ///
+    /// Currently provides `fix-bos`, which patches a `tokenizer.json`'s
+    /// `post_processor.single` template + `special_tokens` map so that
+    /// `tokenizer.encode(text, add_special_tokens=true)` prepends BOS —
+    /// matching how most modern Gemma / Qwen tokenizers ship by default.
+    ///
+    /// The runtime adapter (`core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf`)
+    /// is the load-bearing fix for hf2q's own dispatch paths; this CLI
+    /// surface is a belt-and-suspenders option for operators who feed
+    /// hf2q's bundled `tokenizer.json` files to other tools.
+    Tokenizer(TokenizerArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct TokenizerArgs {
+    #[command(subcommand)]
+    pub action: TokenizerAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TokenizerAction {
+    /// Patch `<path>` in place so its `post_processor.single` template
+    /// prepends BOS. Idempotent: re-runs are no-ops. Reads BOS metadata
+    /// (token id + text) from a sibling GGUF when `--gguf <path>` is
+    /// given; otherwise the operator must supply `--bos-id` + `--bos-text`.
+    FixBos {
+        /// Path to the `tokenizer.json` file to patch.
+        #[arg(value_name = "TOKENIZER_JSON")]
+        path: PathBuf,
+
+        /// Optional sibling GGUF — when supplied, reads
+        /// `tokenizer.ggml.bos_token_id` and resolves the token text
+        /// via the same logic as the runtime adapter.
+        #[arg(long, value_name = "GGUF")]
+        gguf: Option<PathBuf>,
+
+        /// Override the BOS token id (when no `--gguf` is given).
+        /// Default `2` matches Gemma family.
+        #[arg(long, default_value_t = 2)]
+        bos_id: u32,
+
+        /// Override the BOS token text. Default `<bos>`.
+        #[arg(long, default_value = "<bos>")]
+        bos_text: String,
+    },
 }
 
 /// `hf2q convert <hf-dir> --quant <name> -o <out.gguf>` clap args.

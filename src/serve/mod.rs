@@ -675,13 +675,6 @@ fn render_jinja_template_with_specials(
     Ok(rendered)
 }
 
-fn gguf_bool(gguf: &mlx_native::gguf::GgufFile, key: &str) -> bool {
-    matches!(
-        gguf.metadata(key),
-        Some(mlx_native::gguf::MetadataValue::Bool(true))
-    )
-}
-
 fn resolve_token_id(
     gguf: &mlx_native::gguf::GgufFile,
     tokenizer: &tokenizers::Tokenizer,
@@ -734,45 +727,19 @@ fn resolve_token_text(
 /// Tokenize a rendered prompt with llama.cpp `common_tokenize(...,
 /// add_special=true, parse_special=true)` semantics.
 ///
-/// The Rust tokenizer call below intentionally keeps `add_special_tokens=false`
-/// because the GGUF-driven tokenizer is assembled from llama.cpp metadata, not
-/// HF `tokenizer.json`; we then apply GGUF add_bos/add_eos explicitly with the
-/// same token IDs llama.cpp would prepend/append.
+/// Thin shim around [`crate::core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf`]
+/// — the helper lives in `core/` so non-`serve/` callers (notably
+/// `inference/spec_decode/eagle3_orchestrator`) can reuse it without
+/// pulling `serve` as a dependency. Retained as a private name in
+/// this module to minimize churn at the existing call sites.
 fn tokenize_rendered_prompt_llama_style(
     gguf: &mlx_native::gguf::GgufFile,
     tokenizer: &tokenizers::Tokenizer,
     prompt_text: &str,
 ) -> Result<Vec<u32>> {
-    let encoding = tokenizer
-        .encode(prompt_text, false)
-        .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
-    let mut prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
-
-    if gguf_bool(gguf, "tokenizer.ggml.add_bos_token") {
-        if let Some(bos) = resolve_token_id(
-            gguf,
-            tokenizer,
-            "tokenizer.ggml.bos_token_id",
-        ) {
-            if prompt_tokens.first() != Some(&bos) {
-                prompt_tokens.insert(0, bos);
-            }
-        }
-    }
-
-    if gguf_bool(gguf, "tokenizer.ggml.add_eos_token") {
-        if let Some(eos) = resolve_token_id(
-            gguf,
-            tokenizer,
-            "tokenizer.ggml.eos_token_id",
-        ) {
-            if prompt_tokens.last() != Some(&eos) {
-                prompt_tokens.push(eos);
-            }
-        }
-    }
-
-    Ok(prompt_tokens)
+    crate::core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf(
+        gguf, tokenizer, prompt_text,
+    )
 }
 
 /// Run the `generate` subcommand.
@@ -1087,60 +1054,12 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         return Ok(());
     }
 
-    let mut prompt_tokens = tokenize_rendered_prompt_llama_style(&gguf, &tokenizer, &prompt_text)?;
-
-    // ADR-015 iter42 — Gemma forward_mlx prefill coherence fix.
-    //
-    // ROOT CAUSE: hf2q's `tokenizer.encode(text, add_special_tokens=false)` does
-    // not honour GGUF's `tokenizer.ggml.add_bos_token` flag.  llama.cpp's
-    // `common_tokenize` *does* honour it (see ggml-llama.cpp `common.cpp`
-    // → `llama_vocab::tokenize` with `add_special=true`); for Gemma4 it
-    // additionally force-overrides the flag to `true` regardless of metadata
-    // (`load: override 'tokenizer.ggml.add_bos_token' to 'true' for Gemma4`),
-    // because Gemma4 weight matrices were trained with `<bos>` always present
-    // at sequence start and produce gibberish without it (deterministic
-    // single-pattern repetition like `the, my name is the, my name is …`).
-    //
-    // The bug was hidden through iter41 because:
-    //   * The Gemma chat template's first directive is `{{ bos_token }}` —
-    //     when the default GGUF chat template is rendered, BOS already lands
-    //     in the prompt as literal `<bos>` and the tokenizer maps it to
-    //     `bos_token_id`.  Any default-CLI invocation (e.g. iter34's bench)
-    //     produced coherent output.
-    //   * iter41's `tests/coherence_smoke.rs` passes `--chat-template
-    //     "{% for message in messages %}{{ message.content }}{% endfor %}"`
-    //     to test raw-prompt coherence — this strips the GGUF chat template
-    //     and `bos_token` is never emitted.  Without BOS, Gemma decode
-    //     produces gibberish; the test correctly fails.
-    //
-    // FIX: mirror llama.cpp's `common_tokenize` semantics.  When the GGUF
-    // declares `tokenizer.ggml.add_bos_token=true` AND the first token of
-    // the rendered prompt is not already `bos_token_id`, prepend the BOS
-    // token.  This makes raw-prompt coherence_smoke produce the same token
-    // stream that llama-completion produced when capturing the goldens.
-    //
-    // Why qwen35 paths don't need this: cmd_generate_qwen35 (the Qwen3.5/3.6
-    // generate path) is structurally separate; this fix lives in the gemma
-    // forward_mlx path only.  Verified at HEAD that qwen35 fixtures produce
-    // coherent output without BOS — adding BOS for qwen35 would shift its
-    // golden token stream without coherence benefit.
-    let add_bos = matches!(
-        gguf.metadata("tokenizer.ggml.add_bos_token"),
-        Some(mlx_native::gguf::MetadataValue::Bool(true))
-    );
-    let bos_token_id = gguf.metadata_u32("tokenizer.ggml.bos_token_id");
-    if add_bos {
-        if let Some(bos) = bos_token_id {
-            let already_has_bos = prompt_tokens.first() == Some(&bos);
-            if !already_has_bos {
-                prompt_tokens.insert(0, bos);
-                tracing::info!(
-                    "Prepended BOS token {} (GGUF tokenizer.ggml.add_bos_token=true)",
-                    bos
-                );
-            }
-        }
-    }
+    // ADR-038 G4-CFA-5e + ADR-015 iter42: `tokenize_rendered_prompt_llama_style`
+    // delegates to `core::tokenizer_adapter::tokenize_with_bos_eos_from_gguf`,
+    // which already honors GGUF `tokenizer.ggml.add_bos_token` (and `add_eos_token`).
+    // The pre-2026-05-23 defense-in-depth duplicate BOS-prepend at this site
+    // is no longer needed.
+    let prompt_tokens = tokenize_rendered_prompt_llama_style(&gguf, &tokenizer, &prompt_text)?;
     // mmproj-on-generate (iter-2) — image pipeline.
     //
     // When `--image <path>` is set (and `--mmproj <path>` is set, validated
