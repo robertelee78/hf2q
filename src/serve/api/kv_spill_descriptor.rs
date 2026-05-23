@@ -212,7 +212,7 @@ impl KvSpillDescriptor {
     /// `ModelFingerprint` namespace key; see [`KvSpillProvenance`]
     /// for the External-fallback semantic.
     pub fn from_gemma_loaded_model(
-        weights: &crate::serve::forward_mlx::MlxModelWeights,
+        weights: &crate::inference::models::gemma4::MlxModelWeights,
         max_decode_tokens: usize,
         kv_dtype: KvDType,
         provenance: KvSpillProvenance,

@@ -312,9 +312,9 @@ pub fn build_qwen3vl_positions(
     }
     Ok(flat)
 }
-use super::forward_mlx::{
-    MlxModelWeights, DenseKvBuffers, HbKvBuffers, dispatch_qmatmul,
-    dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
+use crate::inference::models::gemma4::{MlxModelWeights, DenseKvBuffers, HbKvBuffers};
+use crate::serve::forward_mlx_shared::{
+    dispatch_qmatmul, dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
 };
 use super::config::LayerType;
 use super::gpu::GpuContext;
@@ -840,13 +840,13 @@ impl MlxModelWeights {
             if INVESTIGATION_ENV.hybrid_kv {
                 eprintln!("[ADR-028 Phase 10c] Allocating hybrid_kv ({} layers, F16 K + TQ-HB V {}-bit) [prefill]",
                     num_layers, tq_codebook_bits_prefill);
-                let mut hybrid_vec: Vec<crate::serve::forward_mlx::HybridKvBuffers> = Vec::with_capacity(num_layers);
+                let mut hybrid_vec: Vec<crate::inference::models::gemma4::HybridKvBuffers> = Vec::with_capacity(num_layers);
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let nkv = layer.num_kv_heads;
                     let hd = layer.head_dim;
                     let layer_is_ring = layer.layer_type == LayerType::Sliding;
                     let capacity = if layer_is_ring { sw } else { linear_capacity };
-                    hybrid_vec.push(crate::serve::forward_mlx::alloc_hybrid_kv_for_layer(
+                    hybrid_vec.push(crate::inference::models::gemma4::kv_cache::alloc_hybrid_kv_for_layer(
                         dev, layer_idx, nkv, hd, capacity, layer_is_ring)?);
                 }
                 self.hybrid_kv = Some(hybrid_vec);
@@ -1828,7 +1828,7 @@ impl MlxModelWeights {
                         &[&self.activations.norm_out, &q6k.buffer],
                         &[&self.activations.logits],
                     );
-                    super::forward_mlx::dispatch_qmatmul(
+                    crate::serve::forward_mlx_shared::dispatch_qmatmul(
                         &mut s, reg, dev,
                         &self.activations.norm_out,
                         q6k,
@@ -1841,7 +1841,7 @@ impl MlxModelWeights {
                         &[&self.activations.norm_out, &q8.buffer],
                         &[&self.activations.logits],
                     );
-                    super::forward_mlx::dispatch_qmatmul(
+                    crate::serve::forward_mlx_shared::dispatch_qmatmul(
                         &mut s, reg, dev,
                         &self.activations.norm_out,
                         q8,

@@ -80,9 +80,9 @@ pub struct MoeFfnWeightsQ {
     /// resident-but-unused; gpu_ffn dispatch sites gate on these
     /// `Option`s and route to `mlx_native::quantized_matmul_id_into`.
     /// Qwen35 splits gate + up (no fused gate_up like Gemma 4).
-    pub expert_gate_affine: Option<crate::serve::forward_mlx::MlxAffineMoeStack>,
-    pub expert_up_affine: Option<crate::serve::forward_mlx::MlxAffineMoeStack>,
-    pub expert_down_affine: Option<crate::serve::forward_mlx::MlxAffineMoeStack>,
+    pub expert_gate_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
+    pub expert_up_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
+    pub expert_down_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
 }
 
 // ============================================================================

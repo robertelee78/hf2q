@@ -4,7 +4,7 @@
 //! shared types available to both Gemma 4 and Qwen 3.5 paths without
 //! coupling either to the other's module tree.
 //!
-//! External callers continue to resolve `crate::serve::forward_mlx::X`
+//! External callers continue to resolve `crate::serve::forward_mlx_shared::X`
 //! via the `pub use` shim in `forward_mlx.rs`; remove that shim after
 //! ADR-038 Step 3 retires `forward_mlx.rs`.
 

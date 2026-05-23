@@ -90,14 +90,14 @@ pub trait DFlashTarget {
     ) -> Result<Vec<u32>>;
 }
 
-/// Blanket delegation impl for [`crate::serve::forward_mlx::MlxModelWeights`].
+/// Blanket delegation impl for [`crate::inference::models::gemma4::MlxModelWeights`].
 ///
 /// Trait methods share names with inherent methods. Within each `fn` body
 /// we call the inherent method via `MlxModelWeights::method(self, ...)`
 /// universal function call syntax to disambiguate from the trait
 /// (otherwise `self.method(...)` would resolve to the trait itself and
 /// recurse infinitely).
-impl DFlashTarget for crate::serve::forward_mlx::MlxModelWeights {
+impl DFlashTarget for crate::inference::models::gemma4::MlxModelWeights {
     fn install_dflash_capture(&mut self, session: DFlashCaptureSession) {
         Self::install_dflash_capture(self, session)
     }

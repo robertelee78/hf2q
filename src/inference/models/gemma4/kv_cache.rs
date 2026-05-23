@@ -275,7 +275,7 @@ pub(crate) fn alloc_hybrid_kv_for_layer(
 /// runs (W12 iter-108a blocker #3).
 ///
 /// Set on `MlxModelWeights` before each prefill+decode trajectory via
-/// [`crate::serve::forward_mlx::MlxModelWeights::set_decode_regime`].
+/// [`crate::inference::models::gemma4::MlxModelWeights::set_decode_regime`].
 /// Consulted at the SDPA-mode gate inside `forward_decode` (the
 /// `use_dense_sdpa` check); the four codebook-bits gates stay env-var-driven
 /// because the codebook width is consistent across both regimes.

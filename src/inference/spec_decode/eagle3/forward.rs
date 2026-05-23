@@ -1726,10 +1726,18 @@ pub fn dispatch_eagle3_drafter_forward(
     let embeds_normed = dispatch_eagle3_input_layernorm(
         &mut enc, registry, device, embeds_gpu, tensors, cfg, seq_len,
     )?;
-    // 3. hidden_normed (also = residual)
+    // 3. hidden_normed. When norm_before_residual=true (RedHatAI Gemma4
+    // checkpoint): residual = hidden_normed (the normed hidden). When false
+    // (Qwen default): residual = fc_out (pre-norm). See vLLM
+    // llama_eagle3.py:72-93 _norm_before_residual / _norm_after_residual.
     let hidden_normed = dispatch_eagle3_hidden_norm(
         &mut enc, registry, device, &fc_out, tensors, cfg, seq_len,
     )?;
+    let attn_residual_src: &MlxBuffer = if cfg.norm_before_residual {
+        &hidden_normed
+    } else {
+        &fc_out
+    };
     // 4. concat
     let concat = dispatch_eagle3_concat_2x_hidden(
         &mut enc, registry, device, &embeds_normed, &hidden_normed, cfg, seq_len,
@@ -1811,12 +1819,13 @@ pub fn dispatch_eagle3_drafter_forward(
         &q_perm, &k_perm, &v_perm, &mask_gpu,
         cfg, seq_len, kv_seq_len, kv_capacity, mask_stride, scale,
     )?;
-    // 12. O + residual.
+    // 12. O + residual. Uses attn_residual_src which is hidden_normed when
+    // norm_before_residual=true, or fc_out when norm_before_residual=false.
     let o_out = dispatch_eagle3_o_proj(
         &mut enc, registry, device, &attn_out, tensors, cfg, seq_len,
     )?;
     let attn_residual = dispatch_eagle3_residual_add(
-        &mut enc, registry, device, &o_out, &hidden_normed, cfg, seq_len,
+        &mut enc, registry, device, &o_out, attn_residual_src, cfg, seq_len,
     )?;
     // 13. post_attn_norm + MLP + residual.
     let post_attn_normed = dispatch_eagle3_post_attention_layernorm(
@@ -1973,6 +1982,13 @@ pub fn dispatch_eagle3_drafter_forward_with_kv_cache(
     let hidden_normed = dispatch_eagle3_hidden_norm(
         &mut enc1, registry, device, &fc_out, tensors, cfg, seq_len,
     )?;
+    // attn_residual_src: norm_before_residual=true → normed hidden;
+    // norm_before_residual=false → raw fc_out (Qwen default).
+    let attn_residual_src_kv: &MlxBuffer = if cfg.norm_before_residual {
+        &hidden_normed
+    } else {
+        &fc_out
+    };
     let concat = dispatch_eagle3_concat_2x_hidden(
         &mut enc1, registry, device, &embeds_normed, &hidden_normed, cfg, seq_len,
     )?;
@@ -2136,7 +2152,7 @@ pub fn dispatch_eagle3_drafter_forward_with_kv_cache(
         &mut enc2, registry, device, &attn_out, tensors, cfg, seq_len,
     )?;
     let attn_residual = dispatch_eagle3_residual_add(
-        &mut enc2, registry, device, &o_out, &hidden_normed, cfg, seq_len,
+        &mut enc2, registry, device, &o_out, attn_residual_src_kv, cfg, seq_len,
     )?;
     let post_attn_normed = dispatch_eagle3_post_attention_layernorm(
         &mut enc2, registry, device, &attn_residual, tensors, cfg, seq_len,
@@ -2433,6 +2449,7 @@ mod tests {
             has_own_embed_tokens: false,
             rope_theta: 1_000_000.0,
             rope_dim: 32, // matches head_dim in tiny_cfg
+            norm_before_residual: false,
         }
     }
 
@@ -3915,6 +3932,7 @@ mod tests {
             has_own_embed_tokens: false,
             rope_theta: 1_000_000.0,
             rope_dim: 128,
+            norm_before_residual: false,
         }
     }
 

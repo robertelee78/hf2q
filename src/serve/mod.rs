@@ -9,7 +9,7 @@ pub mod auto_pipeline;
 pub mod cache;
 pub mod config;
 pub mod encoder_worker_singleton;
-pub mod forward_mlx;
+// forward_mlx removed — gemma4 moved to inference::models::gemma4 (ADR-038 §3.3)
 pub mod forward_mlx_shared;
 pub mod layer_ctx;
 pub mod forward_prefill;
@@ -1350,7 +1350,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     }
 
     // Profiling support
-    let mut profiler = forward_mlx::ProfileAccumulator::new(2);
+    let mut profiler = crate::inference::models::gemma4::ProfileAccumulator::new(2);
     let kernel_profile_mode = INVESTIGATION_ENV.mlx_kernel_profile;
 
     // Prefill: true batched prefill with dense SDPA (ADR-009 Track 1).
@@ -1443,7 +1443,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
                 let decode_start = std::time::Instant::now();
                 let mut generated = 1usize;
-                let mut p: Option<forward_mlx::TokenProfile> = None;
+                let mut p: Option<crate::inference::models::gemma4::TokenProfile> = None;
                 for _ in 1..regime_cap {
                     if !args.ignore_eos && eos_token_ids.contains(&next_token) {
                         break;
@@ -1591,7 +1591,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     }
     let decode_start = std::time::Instant::now();
     let mut generated = 1usize;
-    let mut kernel_profiles: Vec<forward_mlx::KernelTypeProfile> = Vec::new();
+    let mut kernel_profiles: Vec<crate::inference::models::gemma4::KernelTypeProfile> = Vec::new();
     let kernel_profile_warmup = 2usize;
     let kernel_profile_measure = 3usize;
     for _ in 1..params.max_tokens {
@@ -1709,7 +1709,7 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
 
     // Print kernel-type profiling report if enabled
     if kernel_profile_mode && !kernel_profiles.is_empty() {
-        forward_mlx::MlxModelWeights::print_kernel_profile_report(&kernel_profiles);
+        crate::inference::models::gemma4::MlxModelWeights::print_kernel_profile_report(&kernel_profiles);
     }
 
     // `--benchmark` is handled by the 5-run loop earlier in this
@@ -5441,7 +5441,7 @@ fn cmd_parity_check(
     // cmd_parity has its own output contract — no progress line.
     let mut parity_progress = header::LoadProgress::new(false, 1, 0);
     let mut mlx_w =
-        forward_mlx::MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx, &mut parity_progress)?;
+        crate::inference::models::gemma4::MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut ctx, &mut parity_progress)?;
 
     let mut tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Tokenizer: {e}"))?;
@@ -5631,7 +5631,7 @@ fn cmd_parity_capture(
         // Re-create model weights (reset KV caches).
         // cmd_parity has its own output contract — no progress line.
         let mut parity_progress = header::LoadProgress::new(false, 1, 0);
-        let mut mlx_w_fresh = forward_mlx::MlxModelWeights::load_from_gguf(
+        let mut mlx_w_fresh = crate::inference::models::gemma4::MlxModelWeights::load_from_gguf(
             &gguf,
             &cfg,
             &mut ctx,

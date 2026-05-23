@@ -173,7 +173,7 @@ impl DtypeTag {
 }
 
 /// Per-layer dense K/V buffer pair plus shape metadata. Mirrors
-/// `crate::serve::forward_mlx::DenseKvBuffers` but lives here to keep
+/// `crate::inference::models::gemma4::DenseKvBuffers` but lives here to keep
 /// the hook independent of the engine's internal types — the C.1
 /// wire-up will adapt via `From<&DenseKvBuffers>`.
 ///

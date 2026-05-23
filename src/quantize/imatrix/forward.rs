@@ -18,7 +18,7 @@
 //!
 //! [`ImatrixCollector`] is the trait the in-tree driver installs via
 //! [`install_collector`]. The intercept point lives in
-//! [`crate::serve::forward_mlx::dispatch_qmatmul`] — when both a
+//! [`crate::serve::forward_mlx_shared::dispatch_qmatmul`] — when both a
 //! collector and a per-call name hint (set via [`with_collector`] or
 //! [`set_name_hint`]) are present, the dispatch site:
 //!
@@ -51,7 +51,7 @@ use super::error::ImatrixError;
 use crate::quantize::ggml_quants::ArchName;
 
 /// In-tree imatrix collector — installed by [`collect_imatrix`] (Stage
-/// 2) and consumed by [`crate::serve::forward_mlx::dispatch_qmatmul`].
+/// 2) and consumed by [`crate::serve::forward_mlx_shared::dispatch_qmatmul`].
 ///
 /// Convention: the caller (intercept site in `dispatch_qmatmul`) hands
 /// in the **F32 input row** (the activation that's about to be matmul'd
@@ -179,7 +179,7 @@ where
     body()
 }
 
-/// Intercept entry point — called by [`crate::serve::forward_mlx::dispatch_qmatmul`]
+/// Intercept entry point — called by [`crate::serve::forward_mlx_shared::dispatch_qmatmul`]
 /// at the top of the function. Returns immediately if no collector is
 /// installed (the production-default fast path).
 ///

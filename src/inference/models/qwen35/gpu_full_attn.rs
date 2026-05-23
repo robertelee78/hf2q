@@ -6189,6 +6189,7 @@ mod tests {
             has_own_embed_tokens: false,
             rope_theta: 1_000_000.0,
             rope_dim: 128,
+            norm_before_residual: false,
         }
     }
 

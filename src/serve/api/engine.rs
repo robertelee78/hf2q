@@ -41,7 +41,7 @@ use tokenizers::Tokenizer;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::serve::config::Gemma4Config;
-use crate::serve::forward_mlx::{MlxModelWeights, ProfileAccumulator};
+use crate::inference::models::gemma4::{MlxModelWeights, ProfileAccumulator};
 use crate::serve::forward_prefill::SoftTokenInjection;
 use crate::serve::gpu::GpuContext;
 use crate::serve::header;
@@ -1000,7 +1000,7 @@ enum Request {
     },
     /// **Phase B-tq.4** — TQ-packed K/V snapshot.  Worker thread
     /// reads `MlxModelWeights.kv_caches[layer]` via
-    /// [`crate::serve::forward_mlx::MlxModelWeights::tq_v2_snapshot_block`]
+    /// [`crate::inference::models::gemma4::MlxModelWeights::tq_v2_snapshot_block`]
     /// and returns `(k_payload, v_payload)` — two
     /// `tq_packed_v2` envelopes.  Mirror of [`Request::KvSnapshot`]
     /// for the TurboQuant-active KV path; Qwen35/Qwen3VL arms return
@@ -1017,7 +1017,7 @@ enum Request {
     /// **Phase B-tq.4** — TQ-packed K/V restore.  Worker thread
     /// writes `(k_payload, v_payload)` into
     /// `MlxModelWeights.kv_caches[layer]` via
-    /// [`crate::serve::forward_mlx::MlxModelWeights::tq_v2_restore_block`].
+    /// [`crate::inference::models::gemma4::MlxModelWeights::tq_v2_restore_block`].
     TqPackedKvRestore {
         layer_rank: usize,
         range: std::ops::Range<u32>,
@@ -1147,12 +1147,12 @@ pub struct GemmaLoadedModel {
     /// workers sharing one system prompt) and multi-turn chat (last
     /// 16 turns visible). Iter-3 may make this env-tunable via
     /// `HF2Q_KV_LCP_CAPACITY`. Iter-3 swaps the marker payload `()`
-    /// out for `crate::serve::forward_mlx::DenseKvBuffers`: the
+    /// out for `crate::inference::models::gemma4::DenseKvBuffers`: the
     /// registry now stores per-layer Arc clones of the actual
     /// post-prefill KV state, ready for in-place reuse on a
     /// partial-prefix hit when `HF2Q_KV_LCP_RESUME=1` (default OFF).
     pub lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry<
-        crate::serve::forward_mlx::DenseKvBuffers,
+        crate::inference::models::gemma4::DenseKvBuffers,
     >,
     /// ADR-017 Phase E.a iter-2 — handle to the AppState-owned
     /// `KvSpillCounters` so per-request LCP probes bump the same Arc
@@ -3896,7 +3896,7 @@ fn kv_restore_gemma(
                 .map_err(|e| {
                     anyhow::anyhow!("kv_restore: alloc V layer {li} failed: {e}")
                 })?;
-            all.push(crate::serve::forward_mlx::DenseKvBuffers {
+            all.push(crate::inference::models::gemma4::DenseKvBuffers {
                 k,
                 v,
                 capacity: s_cap,

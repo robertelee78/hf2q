@@ -182,7 +182,7 @@ impl Qwen35Model {
     /// to f32 via [`weight_loader::load_layer`].
     ///
     /// `progress` drives the default-mode in-place `\r`-overwrite progress
-    /// line on stderr (mirrors the Gemma path at [`crate::serve::forward_mlx::MlxModelWeights::load_from_gguf`]).
+    /// line on stderr (mirrors the Gemma path at [`crate::inference::models::gemma4::MlxModelWeights::load_from_gguf`]).
     /// It is a no-op when stderr isn't a TTY or verbosity > 0 (tracing
     /// debug events then cover per-layer detail). Pass a silent progress
     /// (`LoadProgress::new(false, 1, n_layers)`) from non-CLI call sites
@@ -407,7 +407,7 @@ impl Qwen35Model {
         path: &std::path::Path,
     ) -> anyhow::Result<usize> {
         use crate::core::mlx_safetensors_loader::MlxAffineLinear;
-        use crate::serve::forward_mlx::{
+        use crate::serve::forward_mlx_shared::{
             parse_dwq_moe_expert_role, parse_dwq_overlay_metadata, MlxAffineMoeStack, MoeBaseRole,
         };
         use anyhow::Context;

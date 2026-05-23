@@ -95,6 +95,14 @@ pub struct Eagle3DrafterConfig {
     /// (Qwen/Llama default). Partial-rotation models use a smaller
     /// value. Must be even (RoPE rotates pairs) and `<= head_dim`.
     pub rope_dim: usize,
+    /// When true, the residual stream passed into the attention O-projection
+    /// add is the NORMED hidden (`hidden_norm(fc_out)`). When false, the
+    /// residual is `fc_out` directly (pre-norm).
+    ///
+    /// Per `vllm-project/speculators/.../eagle3/model_definitions.py:72-85`:
+    /// RedHatAI Gemma 4 31B-it checkpoint sets `norm_before_residual=true`.
+    /// Qwen 3.6 checkpoints omit the key → default `false`.
+    pub norm_before_residual: bool,
 }
 
 impl Eagle3DrafterConfig {
@@ -261,8 +269,9 @@ pub(crate) mod tests {
             tie_lm_head: false,
             include_draft_id_mapping: true,
             has_own_embed_tokens: true,
-            rope_theta: 1_000_000.0, // Qwen 3.6 default
-            rope_dim: 128,           // full rotation (== head_dim above)
+            rope_theta: 1_000_000.0,
+            rope_dim: 128,
+            norm_before_residual: false,
         }
     }
 
@@ -315,5 +324,57 @@ pub(crate) mod tests {
         cfg.num_aux_hidden_states = 65;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("<= 64"), "got: {err}");
+    }
+
+    /// AC-G4-CFA-4.1 — norm_before_residual=false validates (Qwen default).
+    #[test]
+    fn g4_cfa4_norm_before_residual_false_validates_2026_05_22() {
+        let mut cfg = qwen35_default();
+        cfg.norm_before_residual = false;
+        cfg.validate().expect("norm_before_residual=false must validate");
+    }
+
+    /// AC-G4-CFA-4.2 — norm_before_residual=true validates (Gemma4/RedHatAI).
+    #[test]
+    fn g4_cfa4_norm_before_residual_true_validates_2026_05_22() {
+        let mut cfg = qwen35_default();
+        cfg.norm_before_residual = true;
+        cfg.validate().expect("norm_before_residual=true must validate");
+    }
+
+    /// AC-G4-CFA-4.3 — default_gemma4_eagle3_config shape matches RedHatAI schema.
+    ///
+    /// Per ADR-038 §3.4.2: hidden_size=5376, head_dim=256, num_q_heads=21, etc.
+    /// Tests the config values documented in the ADR without needing a real model.
+    #[test]
+    fn g4_cfa4_default_gemma4_eagle3_config_shape_2026_05_22() {
+        // RedHatAI checkpoint schema: hidden_size=5376, num_attention_heads=21
+        // (q_proj_out=8192/not shown), head_dim=256. Draft: 1-layer, vocab=32000.
+        // Drafter config derived from ADR-038 §3.4.2.
+        let cfg = Eagle3DrafterConfig {
+            hidden_size: 5376,
+            intermediate_size: 21504,
+            head_dim: 256,
+            num_q_heads: 21,    // 21 * 256 = 5376 = hidden_size ✓
+            num_kv_heads: 7,    // 21/7=3 (GQA ratio 3:1, divisible ✓)
+            vocab_size: 262144,
+            draft_vocab_size: 32000,
+            target_hidden_size: 5376,
+            num_aux_hidden_states: 3,
+            rms_norm_eps: 1e-6,
+            norm_before_fc: false,
+            fc_norm: false,
+            use_qk_norm: false,
+            attention_bias: false,
+            tie_lm_head: false,
+            include_draft_id_mapping: true,
+            has_own_embed_tokens: true,
+            rope_theta: 10000.0,
+            rope_dim: 256,
+            norm_before_residual: true,
+        };
+        cfg.validate().expect("Gemma4 RedHatAI config shape must validate");
+        assert_eq!(cfg.fc_input_size(), 5376 * 3, "fc_input_size = 3 aux * 5376");
+        assert_eq!(cfg.norm_before_residual, true);
     }
 }

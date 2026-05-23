@@ -248,7 +248,7 @@ pub fn dispatch_dflash_spec_decode_round_target_side<T: super::target::DFlashTar
 /// - `eos_token_ids`: stop conditions
 /// - `gpu`: shared MlxGpu context
 pub fn dispatch_dflash_one_round(
-    target: &mut crate::serve::forward_mlx::MlxModelWeights,
+    target: &mut crate::inference::models::gemma4::MlxModelWeights,
     drafter_tensors: &super::tensors::DFlashModelTensors,
     drafter_cache: &mut super::kv_cache::DFlashKvCache,
     drafter_cfg: &super::config::DFlashConfig,
@@ -366,7 +366,7 @@ pub fn dispatch_dflash_one_round(
 /// function runs ONE round and returns; the iter-53+ caller will
 /// loop until exhaustion.
 pub fn dispatch_dflash_generate_one_round_with_initial_capture(
-    target: &mut crate::serve::forward_mlx::MlxModelWeights,
+    target: &mut crate::inference::models::gemma4::MlxModelWeights,
     drafter_tensors: &super::tensors::DFlashModelTensors,
     drafter_cache: &mut super::kv_cache::DFlashKvCache,
     drafter_cfg: &super::config::DFlashConfig,
@@ -528,7 +528,7 @@ pub fn dispatch_dflash_generate_one_round_with_initial_capture(
 ///
 /// `Vec<u32>` = `[prompt_tokens..., generated...]`.
 pub fn dispatch_dflash_generate(
-    target: &mut crate::serve::forward_mlx::MlxModelWeights,
+    target: &mut crate::inference::models::gemma4::MlxModelWeights,
     drafter_tensors: &super::tensors::DFlashModelTensors,
     drafter_cache: &mut super::kv_cache::DFlashKvCache,
     drafter_cfg: &super::config::DFlashConfig,
@@ -1276,10 +1276,10 @@ mod tests {
         };
         use crate::serve::{
             config::Gemma4Config,
-            forward_mlx::MlxModelWeights,
             gpu::GpuContext,
             header::LoadProgress,
         };
+        use crate::inference::models::gemma4::MlxModelWeights;
         use std::path::PathBuf;
 
         // ---- Resolve paths ----
@@ -1400,7 +1400,7 @@ mod tests {
         // the next argmax.
         for step in 0..(max_new_tokens - 1) {
             let seq_pos = prompt_len + step;
-            let mut prof: Option<crate::serve::forward_mlx::TokenProfile> = None;
+            let mut prof: Option<crate::inference::models::gemma4::TokenProfile> = None;
             let next = target
                 .forward_decode(last_tok, seq_pos, &mut gpu, &mut prof)
                 .expect("baseline forward_decode");
@@ -1563,10 +1563,10 @@ mod tests {
         };
         use crate::serve::{
             config::Gemma4Config,
-            forward_mlx::MlxModelWeights,
             gpu::GpuContext,
             header::LoadProgress,
         };
+        use crate::inference::models::gemma4::MlxModelWeights;
         use std::path::PathBuf;
 
         let target_gguf = PathBuf::from(
@@ -1633,7 +1633,7 @@ mod tests {
         let mut baseline_new: Vec<u32> = vec![first_token_baseline];
         let mut last_tok = first_token_baseline;
         for step in 0..(max_new_tokens - 1) {
-            let mut prof: Option<crate::serve::forward_mlx::TokenProfile> = None;
+            let mut prof: Option<crate::inference::models::gemma4::TokenProfile> = None;
             let next = target
                 .forward_decode(last_tok, prompt_len + step, &mut gpu, &mut prof)
                 .expect("baseline forward_decode");

@@ -83,7 +83,7 @@ fn resolve_block_size() -> Result<u32> {
 /// - Returns `Err(_)` if the drafter cannot be loaded or
 ///   `dispatch_dflash_generate` fails.
 pub fn try_dispatch_dflash_spec_decode(
-    target: &mut crate::serve::forward_mlx::MlxModelWeights,
+    target: &mut crate::inference::models::gemma4::MlxModelWeights,
     prompt_tokens: &[u32],
     max_new_tokens: usize,
     eos_token_ids: &[u32],
@@ -692,7 +692,7 @@ fn resolve_ngram_max() -> Result<u32> {
 ///   with DFlash since both orchestrators use the same target verify
 ///   pipeline.
 pub fn try_dispatch_ngram_spec_decode(
-    target: &mut crate::serve::forward_mlx::MlxModelWeights,
+    target: &mut crate::inference::models::gemma4::MlxModelWeights,
     prompt_tokens: &[u32],
     max_new_tokens: usize,
     eos_token_ids: &[u32],

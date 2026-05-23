@@ -74,7 +74,7 @@ use mlx_native::ops::quantized_matmul_id_ggml::{
 use mlx_native::ops::silu_mul::dispatch_silu_mul;
 use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
-use crate::serve::forward_mlx::MlxAffineMoeStack;
+use crate::serve::forward_mlx_shared::MlxAffineMoeStack;
 
 /// ADR-020 AC#5 Iter C2.4 #4 — single-call dispatch wrapper that routes
 /// per-MoE-role expert matmuls between the legacy GGML pooled path
@@ -397,9 +397,9 @@ pub struct MoeFfnWeightsGpuQ {
     /// `expert_*_q` buffer above stays resident-but-unused; the
     /// `dispatch_moe_id_routed` helper at the top of this module
     /// gates on these `Option`s and routes per-role.
-    pub expert_gate_affine: Option<crate::serve::forward_mlx::MlxAffineMoeStack>,
-    pub expert_up_affine: Option<crate::serve::forward_mlx::MlxAffineMoeStack>,
-    pub expert_down_affine: Option<crate::serve::forward_mlx::MlxAffineMoeStack>,
+    pub expert_gate_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
+    pub expert_up_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
+    pub expert_down_affine: Option<crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
 }
 
 fn ggml_type_stride(t: GgmlType, rows: usize, cols: usize) -> Result<u64> {
@@ -494,9 +494,9 @@ impl MoeFfnWeightsGpuQ {
     /// is internally Arc-wrapped (no GPU copy).
     pub fn attach_affine_overlay(
         &mut self,
-        gate: Option<&crate::serve::forward_mlx::MlxAffineMoeStack>,
-        up: Option<&crate::serve::forward_mlx::MlxAffineMoeStack>,
-        down: Option<&crate::serve::forward_mlx::MlxAffineMoeStack>,
+        gate: Option<&crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
+        up: Option<&crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
+        down: Option<&crate::serve::forward_mlx_shared::MlxAffineMoeStack>,
     ) {
         self.expert_gate_affine = gate.cloned();
         self.expert_up_affine = up.cloned();

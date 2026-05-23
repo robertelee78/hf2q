@@ -85,7 +85,7 @@ use crate::inference::spec_decode::dflash::hidden_capture::{
 };
 use crate::inference::spec_decode::ngram_proposer::{propose as ngram_propose, NgramConfig};
 use crate::inference::spec_decode::verifier::accept_prefix_argmax;
-use crate::serve::forward_mlx::MlxModelWeights;
+use crate::inference::models::gemma4::MlxModelWeights;
 use crate::serve::gpu::GpuContext;
 
 /// Per-round accounting emitted when `HF2Q_SPEC_NGRAM_PROFILE=1`.

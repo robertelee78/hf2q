@@ -95,7 +95,7 @@ impl TqPackedSpillDescriptor {
     /// `KvSpillDescriptor.provenance`).  ADR-017 §F4 — drives the
     /// `ModelFingerprint` namespace key.
     pub fn from_gemma_loaded_model_tq(
-        weights: &crate::serve::forward_mlx::MlxModelWeights,
+        weights: &crate::inference::models::gemma4::MlxModelWeights,
         provenance: KvSpillProvenance,
     ) -> Option<Self> {
         let bits = read_tq_codebook_bits_env();

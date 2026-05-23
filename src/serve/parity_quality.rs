@@ -54,9 +54,8 @@ use std::time::SystemTime;
 
 use crate::cli;
 use crate::serve::config::Gemma4Config;
-use crate::serve::forward_mlx::{
-    cosine_pairwise_f32, DecodeRegime, MlxModelWeights,
-};
+use crate::inference::models::gemma4::{DecodeRegime, MlxModelWeights};
+use crate::serve::forward_mlx_shared::cosine_pairwise_f32;
 use crate::serve::gpu;
 use crate::serve::header;
 
