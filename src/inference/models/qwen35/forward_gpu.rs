@@ -5890,19 +5890,28 @@ impl Qwen35Model {
             let tree_pos_buf =
                 upload_tree_i32_pooled(device, tree_positions_flat, vec![tree_seq_len, 4])
                     .context("forward_tree_verify_gpu: upload tree_positions")?;
+            let attn_shape_base = super::gpu_full_attn::Qwen35TreeVerifyLayerShape {
+                hidden_size: cfg.hidden_size,
+                num_q_heads: cfg.num_attention_heads,
+                num_kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+                tree_seq_len: tree_seq_len as u32,
+                cache_prefix_len: prefix_len as u32,
+                kv_capacity: kv_cache.max_seq_len as u32,
+                mask_stride: mask_stride as u32,
+                rotary_dim: cfg.rotary_dim,
+                freq_base: cfg.rope_theta as f32,
+                mrope_section: cfg.mrope_section,
+                rms_norm_eps: cfg.rms_norm_eps,
+                attn_output_gate: cfg.attn_output_gate,
+            };
             for (layer_idx, layer_gpu) in cache.layer_weights.iter().enumerate() {
-                let (attn, ffn_q) = match layer_gpu {
-                    LayerWeightsGpu::FullAttn { attn, ffn } => {
-                        let FfnWeightsGpu::DenseQ(ffn_q) = ffn else {
-                            return Err(anyhow!(
-                                "forward_tree_verify_gpu: layer {layer_idx} FFN must be DenseQ"
-                            ));
-                        };
-                        (attn, ffn_q)
-                    }
+                let attn = match layer_gpu {
+                    LayerWeightsGpu::FullAttn { attn, .. } => attn,
                     LayerWeightsGpu::LinearAttn { .. } => {
                         return Err(anyhow!(
-                            "forward_tree_verify_gpu: layer {layer_idx} is LinearAttn; F3 supports full-attention DenseQ only"
+                            "forward_tree_verify_gpu: layer {layer_idx} is LinearAttn; \
+                             tree-verify supports full-attention layers only"
                         ));
                     }
                 };
@@ -5922,41 +5931,73 @@ impl Qwen35Model {
                 let v_cache = slot.v.as_mut().ok_or_else(|| {
                     anyhow!("forward_tree_verify_gpu: F32 V cache missing for layer {layer_idx}")
                 })?;
-                let shape = super::gpu_full_attn::Qwen35TreeVerifyFullLayerShapeQ {
-                    attn: super::gpu_full_attn::Qwen35TreeVerifyLayerShape {
-                        hidden_size: cfg.hidden_size,
-                        num_q_heads: cfg.num_attention_heads,
-                        num_kv_heads: cfg.num_key_value_heads,
-                        head_dim: cfg.head_dim,
-                        tree_seq_len: tree_seq_len as u32,
-                        cache_prefix_len: prefix_len as u32,
-                        kv_capacity: kv_cache.max_seq_len as u32,
-                        mask_stride: mask_stride as u32,
-                        rotary_dim: cfg.rotary_dim,
-                        freq_base: cfg.rope_theta as f32,
-                        mrope_section: cfg.mrope_section,
-                        rms_norm_eps: cfg.rms_norm_eps,
-                        attn_output_gate: cfg.attn_output_gate,
-                    },
-                    intermediate_size: ffn_q.intermediate_size,
-                };
                 let enc = device
                     .command_encoder()
                     .context("forward_tree_verify_gpu: command_encoder")?;
-                hidden = super::gpu_full_attn::qwen35_tree_verify_full_layer_q(
-                    enc,
-                    device,
-                    registry,
-                    &hidden,
-                    &tree_mask_buf,
-                    &tree_pos_buf,
-                    k_cache,
-                    v_cache,
-                    attn,
-                    ffn_q,
-                    shape,
-                )
-                .with_context(|| format!("forward_tree_verify_gpu: layer {layer_idx}"))?;
+                let ffn = match layer_gpu {
+                    LayerWeightsGpu::FullAttn { ffn, .. } => ffn,
+                    LayerWeightsGpu::LinearAttn { .. } => unreachable!(),
+                };
+                hidden = match ffn {
+                    FfnWeightsGpu::DenseQ(ffn_q) => {
+                        let shape = super::gpu_full_attn::Qwen35TreeVerifyFullLayerShapeQ {
+                            attn: attn_shape_base,
+                            intermediate_size: ffn_q.intermediate_size,
+                        };
+                        super::gpu_full_attn::qwen35_tree_verify_full_layer_q(
+                            enc,
+                            device,
+                            registry,
+                            &hidden,
+                            &tree_mask_buf,
+                            &tree_pos_buf,
+                            k_cache,
+                            v_cache,
+                            attn,
+                            ffn_q,
+                            shape,
+                        )
+                        .with_context(|| format!("forward_tree_verify_gpu: dense layer {layer_idx}"))?
+                    }
+                    FfnWeightsGpu::MoeQ(moe_q) => {
+                        let moe_cfg = cfg.moe.as_ref().ok_or_else(|| {
+                            anyhow!(
+                                "forward_tree_verify_gpu: layer {layer_idx} is MoeQ \
+                                 but model has no moe config"
+                            )
+                        })?;
+                        let shape = super::gpu_full_attn::Qwen35TreeVerifyFullLayerShapeQMoe {
+                            attn: attn_shape_base,
+                            moe: MoeFfnShape {
+                                hidden_size: cfg.hidden_size,
+                                num_experts: moe_cfg.num_experts,
+                                num_experts_per_tok: moe_cfg.num_experts_per_tok,
+                                moe_intermediate_size: moe_cfg.moe_intermediate_size,
+                                shared_intermediate_size: moe_cfg.shared_expert_intermediate_size,
+                            },
+                        };
+                        super::gpu_full_attn::qwen35_tree_verify_full_layer_q_moe(
+                            enc,
+                            device,
+                            registry,
+                            &hidden,
+                            &tree_mask_buf,
+                            &tree_pos_buf,
+                            k_cache,
+                            v_cache,
+                            attn,
+                            moe_q,
+                            shape,
+                        )
+                        .with_context(|| format!("forward_tree_verify_gpu: moe layer {layer_idx}"))?
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "forward_tree_verify_gpu: layer {layer_idx} has unsupported FFN variant \
+                             (expected DenseQ or MoeQ; F16/F32 variants not supported in tree-verify)"
+                        ));
+                    }
+                };
                 if let Some(capture_idx) = hidden_collector.capture_index_for(layer_idx) {
                     let slab = download_f32(&hidden).with_context(|| {
                         format!("forward_tree_verify_gpu: download capture layer {layer_idx}")

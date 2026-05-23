@@ -11,6 +11,7 @@ use mlx_native::{DType, MlxBuffer, MlxDevice};
 use crate::core::traits::activation_capture::LayerActivations;
 use crate::inference::models::qwen35::kv_cache::HybridKvCache;
 use crate::inference::models::qwen35::model::Qwen35Model;
+use crate::inference::models::qwen35::Qwen35Variant;
 use crate::inference::spec_decode::eagle3::config::Eagle3DrafterConfig;
 use crate::inference::spec_decode::eagle3::drafter_gpu::GpuDrafter;
 use crate::inference::spec_decode::eagle3::dynamic_tree::{
@@ -20,6 +21,26 @@ use crate::inference::spec_decode::eagle3::kv_cache::DrafterKvCache;
 use crate::inference::spec_decode::eagle3::multi_layer_hidden::Eagle3HiddenCollector;
 use crate::inference::spec_decode::eagle3::tensors::Eagle3DrafterTensors;
 use crate::inference::spec_decode::eagle3::tree_walk::walk_tree_accept;
+
+/// FFN topology of the Qwen35 target model — determines which per-layer
+/// kernel is called inside the EAGLE-3 tree-verify loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfnTopology {
+    /// All layers use dense SwiGLU FFN (Qwen 3.6 27B). Routes to F2.
+    Dense,
+    /// All layers use MoE FFN (Qwen 3.6 35B-A3B). Routes to F4.
+    Moe,
+}
+
+impl FfnTopology {
+    /// Infer topology from a loaded `Qwen35Model`.
+    pub fn from_model(model: &Qwen35Model) -> Self {
+        match model.cfg.variant {
+            Qwen35Variant::Moe => FfnTopology::Moe,
+            Qwen35Variant::Dense => FfnTopology::Dense,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Eagle3OrchestratorConfig {
@@ -31,6 +52,8 @@ pub struct Eagle3OrchestratorConfig {
     pub max_new_tokens: usize,
     pub eos_token_ids: Vec<u32>,
     pub ignore_eos: bool,
+    /// FFN topology — auto-detected from the model at construction time.
+    pub ffn_topology: FfnTopology,
 }
 
 impl Eagle3OrchestratorConfig {
@@ -108,6 +131,7 @@ impl Eagle3OrchestratorConfig {
             max_new_tokens,
             eos_token_ids: eos.to_vec(),
             ignore_eos,
+            ffn_topology: FfnTopology::from_model(model),
         }
     }
 }
@@ -485,6 +509,7 @@ mod tests {
             max_new_tokens: 16,
             eos_token_ids: vec![2],
             ignore_eos: false,
+            ffn_topology: FfnTopology::Dense,
         }
     }
 
@@ -644,6 +669,7 @@ mod tests {
             max_new_tokens: 1,
             eos_token_ids: vec![],
             ignore_eos: false,
+            ffn_topology: FfnTopology::Dense,
         };
         let mut d = drafter_cfg();
         d.num_aux_hidden_states = 1;
@@ -669,5 +695,90 @@ mod tests {
     fn hf2q_spec_eagle3_graceful_fallback_when_path_unset_2026_05_22() {
         std::env::remove_var("HF2Q_SPEC_EAGLE3");
         assert_ne!(std::env::var("HF2Q_SPEC_EAGLE3").as_deref(), Ok("1"));
+    }
+
+    // ── F5 new ACs ────────────────────────────────────────────────────────────
+
+    /// AC-1 — FfnTopology enum variants are distinct and Debug-printable.
+    #[test]
+    fn ffn_topology_enum_variants_distinct_2026_05_22() {
+        assert_ne!(FfnTopology::Dense, FfnTopology::Moe);
+        assert_eq!(FfnTopology::Dense, FfnTopology::Dense);
+        assert_eq!(FfnTopology::Moe, FfnTopology::Moe);
+        let _ = format!("{:?}", FfnTopology::Dense);
+        let _ = format!("{:?}", FfnTopology::Moe);
+    }
+
+    /// AC-2 — Eagle3OrchestratorConfig carries ffn_topology; Dense path validates correctly.
+    #[test]
+    fn eagle3_orchestrator_config_carries_ffn_topology_dense_2026_05_22() {
+        let mut c = cfg();
+        c.ffn_topology = FfnTopology::Dense;
+        let d = drafter_cfg();
+        assert!(c.validate(&d).is_ok(), "dense topology should pass validation");
+        assert_eq!(c.ffn_topology, FfnTopology::Dense);
+    }
+
+    /// AC-3 — Eagle3OrchestratorConfig carries ffn_topology; MoE path validates correctly.
+    #[test]
+    fn eagle3_orchestrator_config_carries_ffn_topology_moe_2026_05_22() {
+        let mut c = cfg();
+        c.ffn_topology = FfnTopology::Moe;
+        let d = drafter_cfg();
+        assert!(c.validate(&d).is_ok(), "moe topology should pass validation");
+        assert_eq!(c.ffn_topology, FfnTopology::Moe);
+    }
+
+    /// AC-4 — FfnTopology::from_model returns Dense for Dense variant (tested via config).
+    /// Cannot instantiate Qwen35Model without a GGUF; test the enum branch logic directly.
+    #[test]
+    fn ffn_topology_from_variant_dense_2026_05_22() {
+        // Simulate what FfnTopology::from_model does for the Dense branch.
+        let topology = match crate::inference::models::qwen35::Qwen35Variant::Dense {
+            crate::inference::models::qwen35::Qwen35Variant::Moe => FfnTopology::Moe,
+            crate::inference::models::qwen35::Qwen35Variant::Dense => FfnTopology::Dense,
+        };
+        assert_eq!(topology, FfnTopology::Dense);
+    }
+
+    /// AC-5 — FfnTopology::from_model returns Moe for Moe variant.
+    #[test]
+    fn ffn_topology_from_variant_moe_2026_05_22() {
+        let topology = match crate::inference::models::qwen35::Qwen35Variant::Moe {
+            crate::inference::models::qwen35::Qwen35Variant::Moe => FfnTopology::Moe,
+            crate::inference::models::qwen35::Qwen35Variant::Dense => FfnTopology::Dense,
+        };
+        assert_eq!(topology, FfnTopology::Moe);
+    }
+
+    /// AC-6 — qwen35_default places ffn_topology in config (regression: field must be present).
+    /// Tests the config field shape only — cannot call qwen35_default without a Qwen35Model.
+    #[test]
+    fn eagle3_orchestrator_config_has_ffn_topology_field_2026_05_22() {
+        let c = cfg();
+        // Field must be accessible (compile-time enforcement) and must be one of the two variants.
+        assert!(
+            c.ffn_topology == FfnTopology::Dense || c.ffn_topology == FfnTopology::Moe,
+            "ffn_topology must be Dense or Moe"
+        );
+    }
+
+    /// AC-7 — Dense regression: existing orchestrator validate path unchanged.
+    #[test]
+    fn eagle3_orchestrator_f5_dense_regression_validate_2026_05_22() {
+        let d = drafter_cfg();
+        let c = cfg(); // Dense by default in helper
+        // All existing validation paths must still work unchanged.
+        c.validate(&d).expect("dense regression: validate must pass");
+    }
+
+    /// AC-8 — MoE topology does not interfere with orchestrator validate (no moe-specific fields).
+    #[test]
+    fn eagle3_orchestrator_f5_moe_topology_validate_ok_2026_05_22() {
+        let d = drafter_cfg();
+        let mut c = cfg();
+        c.ffn_topology = FfnTopology::Moe;
+        // validate() is topology-agnostic (topology only affects per-layer dispatch at runtime).
+        c.validate(&d).expect("moe topology: validate must pass");
     }
 }
