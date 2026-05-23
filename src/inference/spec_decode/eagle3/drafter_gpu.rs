@@ -1579,4 +1579,103 @@ mod tests {
             "got: {err}"
         );
     }
+
+    /// AC-G4-4.2 — norm_before_residual=true vs false produces numerically
+    /// different top-1 logit sums on the same weights+inputs.
+    ///
+    /// The two branches diverge because:
+    /// - false (Qwen default): residual = fc_out (pre-norm hidden)
+    /// - true (RedHatAI Gemma4): residual = hidden_norm(fc_out)
+    /// Both branches use the same weights; the norm introduces a different
+    /// magnitude that changes the post-attention hidden state.
+    #[test]
+    fn g4_cfa4_drafter_norm_before_residual_true_vs_false_diverges_2026_05_23() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut registry_false = KernelRegistry::new();
+        let mut registry_true = KernelRegistry::new();
+
+        // Use a config with fc_norm=false so hidden_norm IS the only norm on
+        // the residual stream — making the two branches maximally distinct.
+        let mut cfg_false = cfg_for_drafter_test();
+        cfg_false.norm_before_residual = false;
+        let mut cfg_true = cfg_for_drafter_test();
+        cfg_true.norm_before_residual = true;
+
+        // Build synthetic weights. Both cfgs share the same manifest shape so
+        // we can use the same blob.
+        let manifest = expected_manifest(&cfg_false);
+        let blob = build_test_blob(&manifest);
+
+        let weights_false = Eagle3Weights::load(&blob, &cfg_false).expect("load false");
+        let tensors_false =
+            Eagle3DrafterTensors::upload(&device, &cfg_false, &weights_false).expect("upload false");
+
+        let weights_true = Eagle3Weights::load(&blob, &cfg_true).expect("load true");
+        let tensors_true =
+            Eagle3DrafterTensors::upload(&device, &cfg_true, &weights_true).expect("upload true");
+
+        // Target aux: deterministic non-zero content so norm changes the scale.
+        let mut target_aux_data = vec![0.0f32; cfg_false.fc_input_size()];
+        for (i, v) in target_aux_data.iter_mut().enumerate() {
+            *v = pseudo_random(0xDEAD_BEEF + i as u64) * 0.3;
+        }
+        let alloc_target_aux = |dev: &MlxDevice, data: &[f32]| -> MlxBuffer {
+            let mut buf = dev
+                .alloc_buffer(data.len() * 4, DType::F32, vec![1, data.len()])
+                .expect("alloc target_aux");
+            buf.as_mut_slice::<f32>().unwrap().copy_from_slice(data);
+            buf
+        };
+        let target_aux_false = alloc_target_aux(&device, &target_aux_data);
+        let target_aux_true = alloc_target_aux(&device, &target_aux_data);
+
+        // CPU embed table: non-trivial so embeddings differ.
+        let mut embed_table = vec![0.0f32; cfg_false.vocab_size * cfg_false.hidden_size];
+        for (i, v) in embed_table.iter_mut().enumerate() {
+            *v = pseudo_random(0xCAFE_BABE + i as u64) * 0.1;
+        }
+
+        let mut drafter_false = GpuDrafter::new(
+            &cfg_false, &tensors_false, &device, &mut registry_false,
+            &target_aux_false, &embed_table, 0,
+        )
+        .expect("construct false");
+        let mut drafter_true = GpuDrafter::new(
+            &cfg_true, &tensors_true, &device, &mut registry_true,
+            &target_aux_true, &embed_table, 0,
+        )
+        .expect("construct true");
+
+        let view = TreeContextView {
+            tokens: &[42_u32],
+            parents: &[None],
+        };
+        let cands_false = drafter_false
+            .predict_topk(view, 0, 3)
+            .expect("predict false");
+        let view2 = TreeContextView {
+            tokens: &[42_u32],
+            parents: &[None],
+        };
+        let cands_true = drafter_true
+            .predict_topk(view2, 0, 3)
+            .expect("predict true");
+
+        // Compute sum of top-1 log-probs to detect any numerical difference.
+        let lp_false = cands_false[0].log_prob;
+        let lp_true = cands_true[0].log_prob;
+        // Both paths produce finite outputs.
+        assert!(lp_false.is_finite(), "norm_before_residual=false log_prob not finite");
+        assert!(lp_true.is_finite(), "norm_before_residual=true log_prob not finite");
+        // The two branches must NOT produce bit-identical top-1 log-probs —
+        // if they do, the norm_before_residual knob is not wired.
+        assert_ne!(
+            lp_false.to_bits(),
+            lp_true.to_bits(),
+            "norm_before_residual=false and =true must diverge (got both = {lp_false})"
+        );
+    }
 }

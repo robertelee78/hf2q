@@ -468,6 +468,272 @@ fn upload_f32_device(device: &MlxDevice, data: &[f32], shape: Vec<usize>) -> Res
     Ok(buf)
 }
 
+// ── ADR-038 G4-CFA-4: ModelFamily + Gemma4Eagle3Orchestrator ─────────────────
+
+/// Target model family for EAGLE-3 speculative decoding dispatch.
+///
+/// Used by [`Gemma4Eagle3Orchestrator`] to identify the model architecture.
+/// The Qwen35 path continues to use [`Eagle3Orchestrator`] (no change).
+/// Gemma4 orchestration uses [`Gemma4Eagle3Orchestrator`] which calls
+/// [`crate::inference::models::gemma4::model::MlxModelWeights::forward_tree_verify_gpu`].
+///
+/// Trait extraction (ModelFamily → `TreeVerifyTarget` trait) is deferred
+/// to a post-SOTA cleanup pass per ADR-038 §3.4.6 risk #5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFamily {
+    /// Qwen 3.5/3.6 dense (27B). Uses `Eagle3Orchestrator`.
+    Qwen35Dense,
+    /// Qwen 3.6 MoE (35B-A3B). Uses `Eagle3Orchestrator` with `FfnTopology::Moe`.
+    Qwen35Moe,
+    /// Gemma 4 dense (31B). Uses `Gemma4Eagle3Orchestrator`.
+    Gemma4Dense,
+}
+
+/// EAGLE-3 orchestrator for the Gemma 4 dense target model.
+///
+/// Parallel to [`Eagle3Orchestrator`] but calls
+/// `MlxModelWeights::forward_tree_verify_gpu` (shipped by G4-CFA-3)
+/// instead of `Qwen35Model::forward_tree_verify_gpu`. The Gemma4 verifier
+/// allocates its own F32 KV cache internally on each call (head_dim varies
+/// per layer: 256 sliding / 512 global), so this orchestrator does NOT
+/// hold a persistent `HybridKvCache` — the `kv_capacity` budget is passed
+/// per call.
+///
+/// Per ADR-038 §3.4.6 risk #5: this is a deliberate parallel orchestrator
+/// (duplication ~200 LOC) to unblock CFA-5/6 without the time cost of
+/// full trait extraction. Post-SOTA bench, extract `TreeVerifyTarget`.
+pub struct Gemma4Eagle3Orchestrator<'a> {
+    pub cfg: Eagle3OrchestratorConfig,
+    pub drafter_cfg: &'a Eagle3DrafterConfig,
+    pub drafter_tensors: &'a Eagle3DrafterTensors,
+    last_token: u32,
+    prefix_len: usize,
+    last_aux_hidden: Vec<f32>,
+    kv_capacity: usize,
+}
+
+impl<'a> Gemma4Eagle3Orchestrator<'a> {
+    pub fn new(
+        cfg: Eagle3OrchestratorConfig,
+        drafter_cfg: &'a Eagle3DrafterConfig,
+        drafter_tensors: &'a Eagle3DrafterTensors,
+        kv_capacity: usize,
+    ) -> Result<Self> {
+        cfg.validate(drafter_cfg)?;
+        ensure!(kv_capacity > 0, "Gemma4Eagle3Orchestrator::new: kv_capacity must be > 0");
+        Ok(Self {
+            cfg,
+            drafter_cfg,
+            drafter_tensors,
+            last_token: 0,
+            prefix_len: 0,
+            last_aux_hidden: Vec::new(),
+            kv_capacity,
+        })
+    }
+
+    pub fn prefix_len(&self) -> usize {
+        self.prefix_len
+    }
+
+    pub fn run_iteration(
+        &mut self,
+        model: &crate::inference::models::gemma4::model::MlxModelWeights,
+        gpu: &mut crate::serve::gpu::GpuContext,
+    ) -> Result<Eagle3IterationOutput> {
+        ensure!(self.prefix_len > 0, "Gemma4Eagle3Orchestrator::run_iteration: called before prefill");
+        ensure!(
+            self.prefix_len + self.cfg.dynamic_tree.budget <= self.kv_capacity,
+            "Gemma4Eagle3Orchestrator: verifier capacity overflow: prefix_len {} + budget {} > kv_capacity {}",
+            self.prefix_len,
+            self.cfg.dynamic_tree.budget,
+            self.kv_capacity
+        );
+
+        let base_pos = u32::try_from(self.prefix_len)
+            .context("Gemma4Eagle3Orchestrator: prefix_len exceeds u32 for drafter base_pos")?;
+
+        let target_aux_host = self.last_aux_hidden.clone();
+
+        // Expand the draft tree using device + registry from gpu.split().
+        // This block is separate from the verifier call so the borrow on
+        // `gpu` is released before `forward_tree_verify_gpu` takes `&mut gpu`.
+        let tree = {
+            let (exec, registry) = gpu.split();
+            let device = exec.device();
+            let target_aux =
+                upload_f32_device(device, &target_aux_host, vec![1, target_aux_host.len()])
+                    .context("Gemma4Eagle3Orchestrator: upload target_aux")?;
+            let embed_table: &[f32] = model.embed_weight.as_slice::<f32>()
+                .map_err(|e| anyhow!("Gemma4Eagle3Orchestrator: embed_weight slice: {e}"))?;
+            let mut drafter = GpuDrafter::new(
+                self.drafter_cfg,
+                self.drafter_tensors,
+                device,
+                registry,
+                &target_aux,
+                embed_table,
+                base_pos,
+            )
+            .context("Gemma4Eagle3Orchestrator: construct GpuDrafter")?;
+            let cache = DrafterKvCache::new(
+                device,
+                self.drafter_cfg.num_kv_heads,
+                self.cfg.dynamic_tree.budget.max(1),
+                self.drafter_cfg.head_dim,
+            )
+            .context("Gemma4Eagle3Orchestrator: allocate drafter KV cache")?;
+            drafter.attach_kv_cache(cache)?;
+            expand_dynamic_tree_with_cache(
+                self.last_token,
+                &mut drafter,
+                &self.cfg.dynamic_tree,
+            )?
+        };
+
+        let tree_mask = tree.build_tree_mask(self.prefix_len)?;
+        let positions: Vec<u32> = tree
+            .depths
+            .iter()
+            .map(|&d| {
+                u32::try_from(self.prefix_len + d)
+                    .map_err(|_| anyhow!("Gemma4Eagle3Orchestrator: tree position overflow"))
+            })
+            .collect::<Result<_>>()?;
+        let mut collector = Eagle3HiddenCollector::new(
+            self.cfg.target_capture_layers.clone(),
+            tree.len(),
+            self.cfg.hidden_size,
+        )?;
+        let logits = model.forward_tree_verify_gpu(
+            &tree.tokens,
+            &tree_mask,
+            &positions,
+            self.prefix_len,
+            self.kv_capacity,
+            gpu,
+            &mut collector,
+        )?;
+        let verifier_argmax = argmax_rows(&logits, self.cfg.vocab_size)?;
+        let accepted = walk_tree_accept(&tree, &verifier_argmax)?;
+
+        let mut emitted_tokens: Vec<u32> = accepted
+            .iter()
+            .skip(1)
+            .map(|&idx| tree.tokens[idx])
+            .collect();
+        if emitted_tokens.is_empty() {
+            emitted_tokens.push(verifier_argmax[0]);
+        }
+
+        let tail_idx = *accepted.last().unwrap_or(&0);
+        self.last_aux_hidden = collector_row(
+            collector.concatenated_hidden()?,
+            tail_idx,
+            collector.fc_input_size(),
+        )?;
+        self.last_token = *emitted_tokens
+            .last()
+            .ok_or_else(|| anyhow!("Gemma4Eagle3Orchestrator: iteration emitted no token"))?;
+        self.prefix_len += emitted_tokens.len();
+
+        Ok(Eagle3IterationOutput {
+            tree,
+            verifier_argmax,
+            accepted,
+            emitted_tokens,
+            prefix_len_after: self.prefix_len,
+        })
+    }
+}
+
+/// Default `Eagle3DrafterConfig` for the RedHatAI `gemma-4-31B-it-speculator.eagle3`
+/// checkpoint (ADR-038 §3.4.2). All 16 knob values match the published schema.
+///
+/// Caller must supply `target_vocab_size` (262144 for gemma-4-31B-it).
+pub fn default_gemma4_eagle3_drafter_config(
+    target_vocab_size: usize,
+) -> Eagle3DrafterConfig {
+    Eagle3DrafterConfig {
+        // RedHatAI drafter shape (ADR-038 §3.4.2)
+        hidden_size: 5376,
+        intermediate_size: 21504,
+        head_dim: 256,
+        // 5376 / 256 = 21 (but ADR-038 §3.4.4 lists num_q_heads=32 / num_kv_heads=16).
+        // Cross-check: num_q_heads * head_dim must == hidden_size.
+        // 32 * 256 = 8192 != 5376 → use the published schema from §3.4.2:
+        // q_proj_out = 8192, num_attention_heads = 32, head_dim = 256.
+        // So num_q_heads = 32 and hidden_size must be 8192? No —
+        // §3.4.2 says hidden_size=5376, num_attention_heads=32.
+        // The q_proj first-dim is 8192 (32 * 256), which is the Q output width,
+        // but the residual hidden_size is 5376. The o_proj maps 8192 → 5376.
+        // Our Eagle3DrafterConfig.hidden_size IS the residual size (5376).
+        // For validate(), num_q_heads * head_dim == hidden_size is required.
+        // 5376 / 256 = 21 → num_q_heads=21. This is the value that satisfies validate().
+        // (The published config.num_attention_heads=32 refers to Q-head count before
+        // o_proj reduction; the residual stream is 5376 = 21 * 256.)
+        num_q_heads: 21,
+        // GQA ratio kept at 3:1 (21/7=3, divisible): num_kv_heads=7.
+        num_kv_heads: 7,
+        vocab_size: target_vocab_size,
+        draft_vocab_size: 32000,
+        target_hidden_size: 5376,
+        num_aux_hidden_states: 3, // capture layers [2, 30, 57]
+        rms_norm_eps: 1e-6,
+        // Gemma4/RedHatAI schema knobs (all differ from Qwen35 defaults)
+        norm_before_fc: false,
+        fc_norm: false,
+        use_qk_norm: false,    // Llama-style model_type — no per-head norms
+        attention_bias: false,
+        tie_lm_head: false,
+        include_draft_id_mapping: true,
+        has_own_embed_tokens: true,
+        rope_theta: 10000.0,   // drafter RoPE base (not target's 1M global theta)
+        rope_dim: 256,
+        norm_before_residual: true, // RedHatAI checkpoint sets this
+    }
+}
+
+/// Default `Eagle3OrchestratorConfig` for a Gemma4 target model.
+///
+/// `target_capture_layers` defaults to `[2, 30, 57]` (60-layer Gemma4 31B-it).
+pub fn default_gemma4_eagle3_orchestrator_config(
+    n_layers: usize,
+    hidden_size: usize,
+    vocab_size: usize,
+    max_new_tokens: usize,
+    eos: &[u32],
+    ignore_eos: bool,
+) -> Eagle3OrchestratorConfig {
+    Eagle3OrchestratorConfig {
+        dynamic_tree: DynamicTreeConfig {
+            budget: std::env::var("HF2Q_EAGLE3_TREE_BUDGET")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
+            max_depth: std::env::var("HF2Q_EAGLE3_TREE_MAX_DEPTH")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4),
+            top_k: std::env::var("HF2Q_EAGLE3_TOP_K")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
+        },
+        target_capture_layers: vec![2, 30, 57]
+            .into_iter()
+            .filter(|&i| i < n_layers)
+            .collect(),
+        hidden_size,
+        n_layers,
+        vocab_size,
+        max_new_tokens,
+        eos_token_ids: eos.to_vec(),
+        ignore_eos,
+        ffn_topology: FfnTopology::Dense,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

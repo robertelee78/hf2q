@@ -328,11 +328,15 @@ impl<'data> Eagle3Weights<'data> {
         let manifest = expected_manifest(cfg);
 
         // Apply vLLM EAGLE-3 name normalization: d2t → draft_id_to_target_id;
-        // t2d skipped. Build a name-resolver closure so the rest of
-        // the loader works in canonical name space.
+        // t2d skipped. verifier_lm_head.weight / verifier_norm.weight are in
+        // `_keys_to_ignore_on_save` per Speculators eagle3/core.py — skip them
+        // silently (ADR-038 §3.4.3, AC-G4-4.3).
         let resolve_name = |incoming: &str| -> Option<String> {
-            if incoming == "t2d" {
-                None // skipped per vLLM line 416
+            if incoming == "t2d"
+                || incoming == "verifier_lm_head.weight"
+                || incoming == "verifier_norm.weight"
+            {
+                None // skipped — not an error
             } else if incoming == "d2t" {
                 Some("draft_id_to_target_id".to_string())
             } else {
@@ -922,5 +926,31 @@ mod tests {
             matches!(err, Eagle3WeightsError::Dtype { ref name, .. } if name == "norm.weight"),
             "got: {err:?}"
         );
+    }
+
+    /// AC-G4-4.3 — verifier_lm_head.weight and verifier_norm.weight are silently
+    /// skipped (in `_keys_to_ignore_on_save` per Speculators eagle3/core.py).
+    /// Adding both to a synthetic blob must NOT trigger Extra errors.
+    #[test]
+    fn g4_cfa4_verifier_tensors_silently_skipped_2026_05_23() {
+        let cfg = qwen35_default();
+        let mut manifest = expected_manifest(&cfg);
+        // Inject both verifier tensors into the blob — they should be silently
+        // dropped by resolve_name returning None, not cause Eagle3WeightsError::Extra.
+        manifest.push(ExpectedTensor {
+            name: "verifier_lm_head.weight".to_string(),
+            shape: vec![cfg.vocab_size, cfg.hidden_size],
+            dtype: Dtype::BF16,
+        });
+        manifest.push(ExpectedTensor {
+            name: "verifier_norm.weight".to_string(),
+            shape: vec![cfg.hidden_size],
+            dtype: Dtype::BF16,
+        });
+        let blob = build_synthetic_safetensors(&manifest);
+        // Load with the canonical config (which does NOT include verifier tensors).
+        // Must succeed — verifier tensors skipped, not flagged as extra.
+        Eagle3Weights::load(&blob, &cfg)
+            .expect("verifier_lm_head.weight + verifier_norm.weight must be silently skipped");
     }
 }
