@@ -2004,23 +2004,24 @@ mod g4_cfa5_redhatai_smoke {
                     &mut gpu, &mut kv_caches, &mut collector,
                 )
                 .unwrap_or_else(|e| panic!("[g4_cfa5e-m] forward N={n}: {e}"));
-            // Argmax of LAST position (index n-1).
+            // Argmax of EVERY position (not just last) — if position 0
+            // produces a sensible token but positions ≥ 1 all produce 240017,
+            // the bug is RoPE/attention at positions ≥ 1.
             let vocab = weights.vocab_size;
-            let last_row = &logits[(n - 1) * vocab..n * vocab];
-            let (best_idx, best_val) = last_row
-                .iter()
-                .enumerate()
-                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
-                    if v > bv { (i, v) } else { (bi, bv) }
-                });
-            let decoded = tokenizer.decode(&[best_idx as u32], true).unwrap_or_else(|_| "?".to_string());
-            // Find top-3 logits
-            let mut top3: Vec<(usize, f32)> = last_row.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-            top3.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            eprintln!(
-                "[g4_cfa5e-m] N={n} argmax_idx={best_idx} val={best_val:.4} decoded={decoded:?} top3={:?}",
-                top3.iter().take(3).map(|(i, v)| (*i, *v)).collect::<Vec<_>>()
-            );
+            eprintln!("[g4_cfa5e-m] N={n} per-position argmax:");
+            for pos in 0..n {
+                let row = &logits[pos * vocab..(pos + 1) * vocab];
+                let (best_idx, best_val) = row
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                        if v > bv { (i, v) } else { (bi, bv) }
+                    });
+                let decoded = tokenizer.decode(&[best_idx as u32], true).unwrap_or_else(|_| "?".to_string());
+                eprintln!(
+                    "[g4_cfa5e-m]   pos={pos} argmax={best_idx} val={best_val:.3} decoded={decoded:?}"
+                );
+            }
         }
     }
 
