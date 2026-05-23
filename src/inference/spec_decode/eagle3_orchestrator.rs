@@ -792,6 +792,62 @@ impl<'a> Gemma4Eagle3Orchestrator<'a> {
             prefix_len_after: self.prefix_len,
         })
     }
+
+    /// Run prefill → loop `run_iteration` until `max_new_tokens` or EOS.
+    ///
+    /// Mirrors `Eagle3Orchestrator::generate()` (qwen35 variant at
+    /// `eagle3_orchestrator.rs:279`) adapted for the Gemma 4 separate-prefill
+    /// API. Streams decoded tokens to stdout via the optional tokenizer.
+    pub fn generate(
+        &mut self,
+        model: &crate::inference::models::gemma4::model::MlxModelWeights,
+        gpu: &mut crate::serve::gpu::GpuContext,
+        prompt_tokens: &[u32],
+        tokenizer: Option<&tokenizers::Tokenizer>,
+    ) -> Result<Vec<u32>> {
+        ensure!(
+            !prompt_tokens.is_empty(),
+            "Gemma4Eagle3Orchestrator::generate: prompt_tokens must be non-empty"
+        );
+        self.prefill(model, gpu, prompt_tokens)
+            .context("Gemma4Eagle3Orchestrator::generate: prefill")?;
+
+        // Emit the prefill-confirmed first token (`self.last_token`) so the
+        // caller's output stream contains every generated token including the
+        // one prefill argmax'd. Mirrors qwen35's `out.push(first)` semantics
+        // implicit in its run_iteration loop's emission of `verifier_argmax[0]`.
+        let mut out = Vec::with_capacity(self.cfg.max_new_tokens);
+        out.push(self.last_token);
+        if let Some(tokz) = tokenizer {
+            if let Ok(s) = tokz.decode(&[self.last_token], false) {
+                print!("{s}");
+            }
+        }
+        if !self.cfg.ignore_eos && self.cfg.eos_token_ids.contains(&self.last_token) {
+            return Ok(out);
+        }
+
+        while out.len() < self.cfg.max_new_tokens {
+            let iter = self
+                .run_iteration(model, gpu)
+                .context("Gemma4Eagle3Orchestrator::generate: run_iteration")?;
+            for tok in iter.emitted_tokens {
+                if out.len() >= self.cfg.max_new_tokens {
+                    break;
+                }
+                if let Some(tokz) = tokenizer {
+                    if let Ok(s) = tokz.decode(&[tok], false) {
+                        print!("{s}");
+                    }
+                }
+                out.push(tok);
+                if !self.cfg.ignore_eos && self.cfg.eos_token_ids.contains(&tok) {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Default `Eagle3DrafterConfig` for the RedHatAI `gemma-4-31B-it-speculator.eagle3`

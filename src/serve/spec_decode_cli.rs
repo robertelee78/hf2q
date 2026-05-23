@@ -637,6 +637,128 @@ fn resolve_qwen35_eagle3_drafter_path() -> Result<Option<std::path::PathBuf>> {
     }
 }
 
+/// Dispatch Gemma 4 EAGLE-3 tree-verify decoding when `HF2Q_SPEC_EAGLE3=1`
+/// is set. Missing drafter artifacts return `Ok(None)` so the caller falls
+/// through to the standard prefill + per-token decode path.
+///
+/// ## Env vars
+///
+/// - `HF2Q_SPEC_EAGLE3` (= "1") — opt-in.
+/// - `HF2Q_EAGLE3_DRAFTER_PATH` — drafter directory containing
+///   `model.safetensors`. Default fallback: the bundled RedHatAI drafter
+///   under `/Volumes/Extreme Pro/hf2q-models/RedHatAI-gemma-4-31B-it-speculator.eagle3/`
+///   (matches the path used by `g4_cfa5_redhatai_drafter_load_smoke_2026_05_23`).
+///
+/// ## Performance + coherence
+///
+/// At temp=0 (greedy), accept-walk produces tokens consistent with the
+/// verifier's tree-attention argmax. Per thoughtworks bench
+/// ([huggingface.co/blog/lujangusface/tw-eagle3-gemma4](https://huggingface.co/blog/lujangusface/tw-eagle3-gemma4)):
+/// 1.72× on MT-Bench, 1.48× on HumanEval, 1.05-1.14× on SWEBench using
+/// SGLang. hf2q-side acceptance depends on whether the drafter was
+/// trained for hf2q's serve regime — measure empirically before relying on
+/// the upstream numbers.
+pub fn try_dispatch_gemma4_eagle3_spec_decode(
+    target: &mut crate::inference::models::gemma4::MlxModelWeights,
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    eos_token_ids: &[u32],
+    ignore_eos: bool,
+    tokenizer: &tokenizers::Tokenizer,
+    gpu: &mut crate::serve::gpu::GpuContext,
+) -> Result<Option<()>> {
+    if std::env::var("HF2Q_SPEC_EAGLE3").as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    eprintln!(
+        "[HF2Q_SPEC_EAGLE3=1 gemma4] research-quality EAGLE-3 tree-verify path. \
+         Default production paths remain HF2Q_SPEC_DFLASH / standard decode."
+    );
+
+    let Some(drafter_dir) = resolve_qwen35_eagle3_drafter_path()? else {
+        eprintln!(
+            "HF2Q_SPEC_EAGLE3=1 but HF2Q_EAGLE3_DRAFTER_PATH is unset; falling back to standard decode."
+        );
+        return Ok(None);
+    };
+    if !drafter_dir.is_dir() {
+        eprintln!(
+            "HF2Q_SPEC_EAGLE3=1 but drafter dir {} does not exist; falling back to standard decode.",
+            drafter_dir.display()
+        );
+        return Ok(None);
+    }
+    let weights_path = drafter_dir.join("model.safetensors");
+    if !weights_path.exists() {
+        eprintln!(
+            "HF2Q_SPEC_EAGLE3=1 but drafter weights {} do not exist; falling back to standard decode.",
+            weights_path.display()
+        );
+        return Ok(None);
+    }
+
+    use crate::inference::spec_decode::eagle3::tensors::Eagle3DrafterTensors;
+    use crate::inference::spec_decode::eagle3::weights::Eagle3Weights;
+    use crate::inference::spec_decode::eagle3_orchestrator::{
+        default_gemma4_eagle3_drafter_config, default_gemma4_eagle3_orchestrator_config,
+        Gemma4Eagle3Orchestrator,
+    };
+
+    let t_load = std::time::Instant::now();
+    let drafter_cfg = default_gemma4_eagle3_drafter_config(target.vocab_size);
+    let weights_bytes = std::fs::read(&weights_path)
+        .with_context(|| format!("read EAGLE-3 drafter weights {}", weights_path.display()))?;
+    let weights = Eagle3Weights::load(&weights_bytes, &drafter_cfg)
+        .map_err(|e| anyhow::anyhow!("load EAGLE-3 drafter weights: {e}"))?;
+    let drafter_tensors = {
+        let (exec, _reg) = gpu.split();
+        Eagle3DrafterTensors::upload(exec.device(), &drafter_cfg, &weights)
+            .map_err(|e| anyhow::anyhow!("upload EAGLE-3 drafter tensors: {e}"))?
+    };
+    eprintln!(
+        "[HF2Q_SPEC_EAGLE3 gemma4] drafter loaded in {:.2}s ({} → {} GPU bytes)",
+        t_load.elapsed().as_secs_f64(),
+        weights_path.display(),
+        drafter_tensors.gpu_resident_bytes(),
+    );
+
+    let cfg = default_gemma4_eagle3_orchestrator_config(
+        target.layers.len(),
+        target.hidden_size,
+        target.vocab_size,
+        max_new_tokens.max(1),
+        eos_token_ids,
+        ignore_eos,
+    );
+
+    // kv_capacity bound: prompt + max_new_tokens + tree budget headroom +
+    // safety margin. Matches qwen35 pattern at spec_decode_cli.rs:617.
+    let kv_capacity = prompt_tokens
+        .len()
+        .checked_add(max_new_tokens)
+        .and_then(|v| v.checked_add(cfg.dynamic_tree.budget))
+        .and_then(|v| v.checked_add(32))
+        .ok_or_else(|| anyhow::anyhow!("EAGLE-3 kv_capacity overflow"))?
+        .max(512);
+
+    let mut orchestrator =
+        Gemma4Eagle3Orchestrator::new(cfg, &drafter_cfg, &drafter_tensors, kv_capacity)?;
+    let started = std::time::Instant::now();
+    let tokens = orchestrator
+        .generate(target, gpu, prompt_tokens, Some(tokenizer))
+        .context("Gemma4Eagle3Orchestrator::generate")?;
+    let elapsed = started.elapsed();
+    println!();
+    eprintln!(
+        "[HF2Q_SPEC_EAGLE3 gemma4] {} new tokens in {:.2}s ({:.1} tok/s)",
+        tokens.len(),
+        elapsed.as_secs_f64(),
+        tokens.len() as f64 / elapsed.as_secs_f64().max(1e-6),
+    );
+
+    Ok(Some(()))
+}
+
 /// Resolve `K` for the n-gram proposer.  Default = 3 per
 /// ADR-029 Phase 1 / vLLM literature (`k=3, max_ngram=3, min_ngram=1`).
 fn resolve_ngram_k() -> Result<u32> {

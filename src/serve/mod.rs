@@ -1227,6 +1227,30 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
         return Ok(());
     }
 
+    // ADR-038 G4-CFA-5e closure (2026-05-23) — HF2Q_SPEC_EAGLE3=1 opt-in path
+    // for Gemma 4. Mirrors the qwen35 path at spec_decode_cli.rs:553. Default
+    // OFF — falls through to standard prefill+decode when unset. When set,
+    // loads the published EAGLE-3 drafter (RedHatAI or thoughtworks),
+    // runs Gemma4Eagle3Orchestrator::generate (tree-verify spec decode),
+    // returns Ok(Some(())) on completion.
+    //
+    // Per thoughtworks bench (https://huggingface.co/blog/lujangusface/tw-eagle3-gemma4):
+    // 1.72× MT-Bench / 1.48× HumanEval / 1.05-1.14× SWEBench. Coherence vs
+    // base autoregressive: depends on drafter training distribution + temp=0
+    // greedy argmax sensitivity — measure empirically before relying on
+    // upstream numbers.
+    if let Some(()) = crate::serve::spec_decode_cli::try_dispatch_gemma4_eagle3_spec_decode(
+        &mut mlx_w,
+        &prompt_tokens,
+        args.max_tokens,
+        &eos_token_ids,
+        args.ignore_eos,
+        &tokenizer,
+        &mut ctx,
+    )? {
+        return Ok(());
+    }
+
     // ADR-030 iter-216 Plan B — HF2Q_SPEC_NGRAM=1 opt-in path.  Uses
     // pure-CPU n-gram proposer from ADR-029 Phase 1 instead of the
     // DFlash drafter.  Workload-specific accelerator: needs ~80%
