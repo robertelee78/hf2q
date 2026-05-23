@@ -1,7 +1,16 @@
 # ADR-038: Split `src/serve/forward_mlx.rs` monolith per-arch + Gemma 4 EAGLE-3 enablement
 
-- **Status**: Proposed
+- **Status**: 🚧 IN PROGRESS — Step 1 SHIPPED at hf2q `05a1d73a` (2026-05-22)
 - **Date**: 2026-05-22
+
+## Phase status
+
+| Step | Status | Commit | Notes |
+|---|---|---|---|
+| Step 1 — shared primitives | ✅ SHIPPED | hf2q `05a1d73a` | `src/serve/forward_mlx_shared.rs` 1764 LOC; `forward_mlx.rs` shrunk 10142 → 8409 (~1733 LOC extracted); `pub use` shim preserves `crate::serve::forward_mlx::X` paths — zero external consumer edits; all 17 inventoried items moved; 3 test modules relocated (`cosine_tests`, `dispatch_qmatmul_f32_router_test`, `ac5_iter_b_affine_qweight_roundtrip`); `dense_placeholder_tests` stayed; `#[inline(always)]` on `rms_norm_f32_hs_cached` preserved; cargo check clean, 3110 tests pass (same 3 pre-existing GPU hardware failures, not regressions). All AC-1.1 through AC-1.10 verified green. |
+| Step 2 — Gemma KV-cache extraction | ⏳ NEXT | — | Target: `src/inference/models/gemma4/kv_cache.rs` per §3.2 |
+| Step 3 — rename to gemma4/ tree | ⏳ TODO | — | The big move — atomic commit |
+| Step 4 — Gemma 4 EAGLE-3 enablement | ⏳ TODO | — | 6 G4-CFAs targeting ≥1.72× bench on M5 Max |
 - **Author**: claude-flow
 - **Supersedes**: nothing (ADR-013's per-arch commitment is honored — gemma4 was the lone holdout)
 - **Related**: ADR-008 (mlx-native sole backend), ADR-013 (qwen35 per-arch split + Chesterton's fence), ADR-017 (TQ-packed KV persist), ADR-022 (per-arch tokenizers), ADR-028 (Phase 10 hybrid KV), ADR-031 (parallel encode/decode forward), ADR-037 (EAGLE-3 tree decoding)
