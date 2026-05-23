@@ -144,6 +144,26 @@ pub enum ImatrixError {
         token_count: usize,
         n_ctx: u32,
     },
+
+    /// ADR-033 §P4b convert-time apply: an imatrix entry was found for
+    /// the tensor being quantized, but its recorded `n_per_row` doesn't
+    /// match the planned tensor's inner dim. Indicates the operator
+    /// passed a `--imatrix <file>` collected against a DIFFERENT model
+    /// (or different config) than the one being converted now. Per the
+    /// no-silent-fallback rule this is a hard error rather than a quiet
+    /// downgrade to the no-imatrix path — silently mis-calibrating a
+    /// tensor with the wrong importance vector is worse than no
+    /// calibration at all.
+    #[error(
+        "imatrix apply: tensor `{tensor}` n_per_row mismatch: \
+         imatrix recorded {imatrix_n_per_row}, model expects {model_n_per_row} — \
+         the imatrix was likely collected against a different model or config"
+    )]
+    ApplyShapeMismatch {
+        tensor: String,
+        imatrix_n_per_row: usize,
+        model_n_per_row: usize,
+    },
 }
 
 #[cfg(test)]

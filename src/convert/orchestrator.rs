@@ -79,6 +79,13 @@ pub enum OrchestratorError {
     /// [[feedback-no-loop-suppression-2026-05-17]]: hard error, never
     /// silent skip.
     StreamProtocol(String),
+
+    /// ADR-033 §P4b apply-time imatrix mismatch. Surfaces when the
+    /// attached imatrix has an entry for the tensor being quantized,
+    /// but the recorded `n_per_row` doesn't match the model's. Per
+    /// [[feedback-no-loop-suppression-2026-05-17]]: hard error rather
+    /// than a silent downgrade to the no-imatrix path.
+    Imatrix(crate::quantize::imatrix::ImatrixError),
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -88,6 +95,7 @@ impl std::fmt::Display for OrchestratorError {
             OrchestratorError::Apex(e) => write!(f, "convert/apex: {e}"),
             OrchestratorError::Writer(e) => write!(f, "convert/writer: {e}"),
             OrchestratorError::StreamProtocol(s) => write!(f, "convert/stream-protocol: {s}"),
+            OrchestratorError::Imatrix(e) => write!(f, "convert/imatrix: {e}"),
         }
     }
 }
@@ -99,7 +107,14 @@ impl std::error::Error for OrchestratorError {
             OrchestratorError::Apex(e) => Some(e),
             OrchestratorError::Writer(e) => Some(e),
             OrchestratorError::StreamProtocol(_) => None,
+            OrchestratorError::Imatrix(e) => Some(e),
         }
+    }
+}
+
+impl From<crate::quantize::imatrix::ImatrixError> for OrchestratorError {
+    fn from(e: crate::quantize::imatrix::ImatrixError) -> Self {
+        OrchestratorError::Imatrix(e)
     }
 }
 
@@ -519,6 +534,9 @@ impl ConvertOrchestrator {
             planned,
             next_idx: 0,
             imatrix,
+            coverage_quantized: 0,
+            coverage_with_imatrix: 0,
+            coverage_missing: Vec::new(),
         })
     }
 }
@@ -537,15 +555,33 @@ pub struct StreamingWriter<W: Write + Seek> {
     /// weighting at `quantizer.quantize`. Looked up per tensor by name in
     /// `tensor_imatrix`. None for non-i-tier convert runs.
     imatrix: Option<crate::quantize::imatrix::ImatrixData>,
+    /// ADR-033 §P4b coverage tracker — accumulated across `stream_tensor`
+    /// calls when an imatrix is attached. Emitted at `finalize` so the
+    /// operator can audit how completely the imatrix covered the
+    /// quantized tensors (a partial imatrix-collection run silently
+    /// quantizes some tensors without calibration; this surfaces that).
+    coverage_quantized: usize,
+    coverage_with_imatrix: usize,
+    coverage_missing: Vec<String>,
 }
 
 impl<W: Write + Seek> StreamingWriter<W> {
     /// ADR-033 §P4b — look up the per-tensor row-importance vector for
-    /// `tensor_name` from the attached imatrix, or return `None` if (a)
-    /// no imatrix is attached, (b) this tensor wasn't intercepted during
-    /// imatrix collection, or (c) the recorded `n_per_row` doesn't match
-    /// the planned tensor's inner dim (defensive — would indicate an
-    /// imatrix/model mismatch).
+    /// `tensor_name` from the attached imatrix.
+    ///
+    /// Returns:
+    /// - `Ok(Some(weights))` — imatrix has an entry for this tensor and
+    ///   shapes match; the slice is the per-tensor importance vector
+    ///   ready to feed `quantizer.quantize(..., Some(&weights))`.
+    /// - `Ok(None)` — either no imatrix attached, or the tensor wasn't
+    ///   intercepted during collection (legitimate gap; the quantizer
+    ///   runs without calibration for this tensor). The caller may log
+    ///   this as a coverage warning at finalize time.
+    /// - `Err(ImatrixError::ApplyShapeMismatch)` — imatrix has an entry
+    ///   for this tensor BUT the recorded `n_per_row` doesn't match the
+    ///   model's. Hard error per the no-silent-fallback rule — wrong
+    ///   imatrix file is worse than no imatrix because mis-calibration
+    ///   biases the quantization in the wrong direction.
     ///
     /// **Aggregation policy** (matches what most quantizers consume —
     /// `quantize_row_X(src, dst, n_per_row, imatrix)` reuses the same
@@ -562,28 +598,37 @@ impl<W: Write + Seek> StreamingWriter<W> {
     ///   `quantize_row_id` path but is the simplest correct first-cut for
     ///   the row-uniform quantize() signature; a future iter could thread
     ///   per-mat slices through if measurement justifies it.
-    fn tensor_imatrix(&self, tensor_name: &str, n_per_row: usize) -> Option<Vec<f32>> {
-        let data = self.imatrix.as_ref()?;
-        let acc = data.loaded.registry.get(tensor_name)?;
+    fn tensor_imatrix(
+        &self,
+        tensor_name: &str,
+        n_per_row: usize,
+    ) -> Result<Option<Vec<f32>>, crate::quantize::imatrix::ImatrixError> {
+        let Some(data) = self.imatrix.as_ref() else {
+            return Ok(None);
+        };
+        let Some(acc) = data.loaded.registry.get(tensor_name) else {
+            return Ok(None);
+        };
         if acc.n_per_row != n_per_row {
-            // Defensive: imatrix recorded a different inner dim than the
-            // planned tensor expects. Skip rather than emit silently-wrong
-            // calibration. Future P4b iter could surface this as a typed
-            // ImatrixError.
-            return None;
+            // Hard error — wrong imatrix file.
+            return Err(crate::quantize::imatrix::ImatrixError::ApplyShapeMismatch {
+                tensor: tensor_name.to_string(),
+                imatrix_n_per_row: acc.n_per_row,
+                model_n_per_row: n_per_row,
+            });
         }
         if acc.n_mat == 0 || acc.values.is_empty() {
-            return None;
+            return Ok(None);
         }
         if acc.n_mat == 1 {
             // Dense — `values` is already shaped [n_per_row].
-            return Some(acc.values[..n_per_row].to_vec());
+            return Ok(Some(acc.values[..n_per_row].to_vec()));
         }
         // MoE — `values` is laid out as `[n_per_row * n_mat]` per
         // `accumulator.rs:54-58` (mat_id-major). Aggregate per column.
         let total_counts: i64 = acc.counts.iter().copied().sum();
         if total_counts <= 0 {
-            return None;
+            return Ok(None);
         }
         let mut agg = vec![0.0_f32; n_per_row];
         for mat in 0..acc.n_mat {
@@ -596,7 +641,7 @@ impl<W: Write + Seek> StreamingWriter<W> {
         for v in agg.iter_mut() {
             *v *= inv_total;
         }
-        Some(agg)
+        Ok(Some(agg))
     }
 
     /// Number of tensors remaining to stream.
@@ -701,7 +746,18 @@ impl<W: Write + Seek> StreamingWriter<W> {
                 // tensors sum-across-experts and divide by total counts
                 // (one importance vector per tensor — the quantizer dispatch
                 // reuses the same pointer per row).
-                let imatrix_vec = self.tensor_imatrix(&p.name, p.n_per_row);
+                //
+                // Coverage tracking: a tensor that the policy routed to a
+                // quant variant (this `_` branch) BUT has no matching
+                // imatrix entry counts as a "missing-coverage" gap, logged
+                // at finalize so the operator can audit partial collections.
+                let imatrix_vec = self.tensor_imatrix(&p.name, p.n_per_row)?;
+                self.coverage_quantized += 1;
+                if imatrix_vec.is_some() {
+                    self.coverage_with_imatrix += 1;
+                } else if self.imatrix.is_some() {
+                    self.coverage_missing.push(p.name.clone());
+                }
                 quantizer.quantize(&f16_rt, p.n_per_row, imatrix_vec.as_deref())?
             }
         };
@@ -724,6 +780,40 @@ impl<W: Write + Seek> StreamingWriter<W> {
             )));
         }
         self.writer.finalize()?;
+
+        // ADR-033 §P4b coverage report — only emit when an imatrix was
+        // attached. Tells the operator how many quantized tensors actually
+        // received imatrix calibration. A 0% coverage indicates the
+        // imatrix file mapped to no quantized tensors (likely wrong file
+        // or wrong arch). Partial coverage is legitimate (e.g. dense
+        // tensors using Q6_K which are imatrix-insensitive), but the
+        // first 10 missing names are listed so the operator can spot
+        // unexpected gaps.
+        if self.imatrix.is_some() && self.coverage_quantized > 0 {
+            let pct = (self.coverage_with_imatrix as f64 / self.coverage_quantized as f64) * 100.0;
+            eprintln!(
+                "[hf2q imatrix coverage] {}/{} quantized tensors used imatrix calibration ({:.1}%)",
+                self.coverage_with_imatrix, self.coverage_quantized, pct
+            );
+            if !self.coverage_missing.is_empty() {
+                let preview_n = self.coverage_missing.len().min(10);
+                eprintln!(
+                    "[hf2q imatrix coverage] {} quantized tensor(s) had no matching imatrix entry; first {}:",
+                    self.coverage_missing.len(),
+                    preview_n
+                );
+                for name in self.coverage_missing.iter().take(preview_n) {
+                    eprintln!("[hf2q imatrix coverage]   - {name}");
+                }
+                if self.coverage_missing.len() > preview_n {
+                    eprintln!(
+                        "[hf2q imatrix coverage]   … and {} more",
+                        self.coverage_missing.len() - preview_n
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -1767,7 +1857,8 @@ mod tests {
 
         let got = sw
             .tensor_imatrix(tensor_name, n_per_row)
-            .expect("imatrix slice");
+            .expect("Result Ok")
+            .expect("imatrix slice present");
 
         assert_eq!(got.len(), n_per_row);
         for j in 0..n_per_row {
@@ -1821,7 +1912,8 @@ mod tests {
 
         let got = sw
             .tensor_imatrix(tensor_name, n_per_row)
-            .expect("imatrix slice");
+            .expect("Result Ok")
+            .expect("imatrix slice present");
 
         assert_eq!(got.len(), n_per_row);
         for j in 0..n_per_row {
@@ -1834,11 +1926,12 @@ mod tests {
         }
     }
 
-    /// Missing-tensor + wrong-n_per_row both yield `None` — defensive
-    /// fallbacks that prevent silently-wrong calibration when an
-    /// imatrix doesn't match the model being converted.
+    /// Missing-tensor returns `Ok(None)` (legitimate gap, recorded as a
+    /// coverage miss at finalize). Wrong-n_per_row returns `Err`
+    /// (hard error per the no-silent-fallback rule — mis-calibrating
+    /// with the wrong importance vector is worse than no calibration).
     #[test]
-    fn p4b_tensor_imatrix_missing_or_mismatched_returns_none() {
+    fn p4b_tensor_imatrix_missing_returns_none_mismatch_returns_err() {
         let imatrix = make_dense_imatrix("blk.0.attn_q.weight", 16, 7);
         let mut orch = ConvertOrchestrator::new(
             LlamaFtype::MostlyQ4_K_M,
@@ -1852,16 +1945,32 @@ mod tests {
             .begin_write(std::io::Cursor::new(&mut buf))
             .expect("begin_write");
 
-        // Wrong tensor name → None.
-        assert!(sw.tensor_imatrix("blk.99.attn_q.weight", 16).is_none());
-        // Right tensor, wrong n_per_row → None (n_per_row mismatch
-        // would otherwise produce silently-wrong calibration).
-        assert!(sw.tensor_imatrix("blk.0.attn_q.weight", 32).is_none());
-        // Sanity: right name + n_per_row returns Some.
-        assert!(sw.tensor_imatrix("blk.0.attn_q.weight", 16).is_some());
+        // Wrong tensor name → Ok(None) (legitimate gap).
+        let res = sw.tensor_imatrix("blk.99.attn_q.weight", 16);
+        assert!(matches!(res, Ok(None)));
+
+        // Right tensor, wrong n_per_row → Err(ApplyShapeMismatch). Hard fail
+        // — silently downgrading would mis-calibrate the quantizer.
+        let res = sw.tensor_imatrix("blk.0.attn_q.weight", 32);
+        match res {
+            Err(crate::quantize::imatrix::ImatrixError::ApplyShapeMismatch {
+                tensor,
+                imatrix_n_per_row,
+                model_n_per_row,
+            }) => {
+                assert_eq!(tensor, "blk.0.attn_q.weight");
+                assert_eq!(imatrix_n_per_row, 16);
+                assert_eq!(model_n_per_row, 32);
+            }
+            other => panic!("expected ApplyShapeMismatch, got {other:?}"),
+        }
+
+        // Sanity: right name + n_per_row returns Ok(Some(_)).
+        let res = sw.tensor_imatrix("blk.0.attn_q.weight", 16);
+        assert!(matches!(res, Ok(Some(_))));
     }
 
-    /// `with_imatrix(None)` (or omitted altogether) yields `None` for
+    /// `with_imatrix(None)` (or omitted altogether) yields `Ok(None)` for
     /// every lookup — proves the no-imatrix path is intact.
     #[test]
     fn p4b_no_imatrix_attached_returns_none_for_everything() {
@@ -1876,7 +1985,134 @@ mod tests {
             .begin_write(std::io::Cursor::new(&mut buf))
             .expect("begin_write");
 
-        assert!(sw.tensor_imatrix("blk.0.attn_q.weight", 16).is_none());
-        assert!(sw.tensor_imatrix("blk.0.ffn_down.weight", 256).is_none());
+        assert!(matches!(
+            sw.tensor_imatrix("blk.0.attn_q.weight", 16),
+            Ok(None)
+        ));
+        assert!(matches!(
+            sw.tensor_imatrix("blk.0.ffn_down.weight", 256),
+            Ok(None)
+        ));
+    }
+
+    /// End-to-end: a `stream_tensor` call on a tensor whose imatrix entry
+    /// has the wrong `n_per_row` propagates the typed `ImatrixError`
+    /// through `OrchestratorError::Imatrix` rather than silently
+    /// downgrading to a no-imatrix quantize. Matches the canonical
+    /// no-silent-fallback discipline from §P7.
+    #[test]
+    fn p4b_stream_tensor_propagates_apply_shape_mismatch() {
+        let model_n_per_row = 256usize;
+        let imatrix_n_per_row = 128usize; // intentionally wrong
+        let tensor_name = "blk.0.ffn_down.weight";
+
+        // Build an imatrix with the WRONG n_per_row.
+        let mut registry = crate::quantize::imatrix::AccumulatorRegistry::new();
+        let acc = registry
+            .register(tensor_name, imatrix_n_per_row, 1)
+            .expect("register");
+        acc.absorb_dense(&vec![1.0_f32; imatrix_n_per_row])
+            .expect("absorb");
+        let imatrix = crate::quantize::imatrix::ImatrixData {
+            loaded: crate::quantize::imatrix::LoadedImatrix {
+                source_path: "<bad>".into(),
+                datasets: vec!["test".into()],
+                chunk_count: 1,
+                chunk_size: 512,
+                registry,
+            },
+            provenance: crate::quantize::imatrix::ImatrixProvenance::Computed {
+                corpus_label: "test".into(),
+                n_ctx: 512,
+            },
+        };
+
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ4_K_M,
+            ArchName::Llama3,
+            default_hparams(),
+        )
+        .with_imatrix(Some(imatrix));
+        orch.plan_tensors(vec![PlanEntry {
+            name: tensor_name.into(),
+            shape: vec![model_n_per_row, 1],
+            source_dtype: SourceDtype::F32,
+            layer_index: Some(0),
+        }])
+        .expect("plan");
+
+        let mut buf = Vec::<u8>::new();
+        let mut sw = orch
+            .begin_write(std::io::Cursor::new(&mut buf))
+            .expect("begin_write");
+        let data: Vec<f32> = (0..model_n_per_row).map(|i| (i as f32) * 1e-3).collect();
+        let res = sw.stream_tensor(0, &data);
+        match res {
+            Err(OrchestratorError::Imatrix(
+                crate::quantize::imatrix::ImatrixError::ApplyShapeMismatch {
+                    tensor,
+                    imatrix_n_per_row: ipr,
+                    model_n_per_row: mpr,
+                },
+            )) => {
+                assert_eq!(tensor, tensor_name);
+                assert_eq!(ipr, imatrix_n_per_row);
+                assert_eq!(mpr, model_n_per_row);
+            }
+            other => panic!(
+                "expected OrchestratorError::Imatrix(ApplyShapeMismatch), got {other:?}"
+            ),
+        }
+    }
+
+    /// Coverage accounting: stream a tensor that IS in the imatrix and a
+    /// tensor that ISN'T, then check the missing-tensor list at finalize.
+    /// Validates that the operator-facing coverage report tracks the
+    /// expected counts.
+    #[test]
+    fn p4b_coverage_tracks_missing_tensors() {
+        let n_per_row = 256usize;
+        let covered = "blk.0.attn_q.weight";
+        let uncovered = "blk.0.ffn_down.weight";
+
+        let imatrix = make_dense_imatrix(covered, n_per_row, 123);
+
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ4_K_M,
+            ArchName::Llama3,
+            default_hparams(),
+        )
+        .with_imatrix(Some(imatrix));
+        orch.plan_tensors(vec![
+            PlanEntry {
+                name: covered.into(),
+                shape: vec![n_per_row, 1],
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(0),
+            },
+            PlanEntry {
+                name: uncovered.into(),
+                shape: vec![n_per_row, 1],
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(0),
+            },
+        ])
+        .expect("plan");
+
+        let mut buf = Vec::<u8>::new();
+        let mut sw = orch
+            .begin_write(std::io::Cursor::new(&mut buf))
+            .expect("begin_write");
+        let data: Vec<f32> = (0..n_per_row).map(|i| (i as f32) * 1e-3).collect();
+        sw.stream_tensor(0, &data).expect("stream covered");
+        sw.stream_tensor(1, &data).expect("stream uncovered");
+
+        // Coverage state should reflect: 2 total quantized, 1 with imatrix,
+        // 1 missing — `uncovered`.
+        assert_eq!(sw.coverage_quantized, 2);
+        assert_eq!(sw.coverage_with_imatrix, 1);
+        assert_eq!(sw.coverage_missing, vec![uncovered.to_string()]);
+
+        sw.finalize().expect("finalize");
     }
 }
