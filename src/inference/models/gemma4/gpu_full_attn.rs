@@ -3186,30 +3186,43 @@ pub fn gemma4_tree_verify_full_layer_q(
 
     enc2.memory_barrier();
 
-    let n_silu_elems = seq * m;
-    if n_silu_elems > (u32::MAX as usize) {
+    // ADR-038 G4-CFA-5e: Gemma 4 uses GELU activation (gelu_pytorch_tanh),
+    // NOT SiLU. Production `forward_decode` correctly uses `fused_gelu_mul`
+    // (gemma4/forward_gpu.rs:1659 and gemma4/gpu_full_attn.rs:1904);
+    // tree-verify originally used `silu_mul` which is the Qwen activation.
+    // Wrong activation produces finite-but-deterministically-wrong FFN
+    // output — exact signature of the CFA-5e degenerate "額" verifier
+    // bug. Mirror production's `fused_gelu_mul` raw-pipeline dispatch.
+    let n_act_elems = seq * m;
+    if n_act_elems > (u32::MAX as usize) {
         return Err(anyhow::anyhow!(
             "gemma4_tree_verify_full_layer_q: seq ({}) * intermediate ({}) exceeds u32::MAX",
             seq, m
         ));
     }
-    let n_silu = n_silu_elems as u32;
-    let activated_bytes = n_silu_elems * std::mem::size_of::<f32>();
+    let n_act = n_act_elems as u32;
+    let activated_bytes = n_act_elems * std::mem::size_of::<f32>();
     let activated_buf = device
         .alloc_buffer(activated_bytes, mlx_native::DType::F32, vec![seq, m])
         .map_err(|e| anyhow::anyhow!("gemma4_tree_verify_full_layer_q: alloc activated_buf: {e}"))?;
-    let mut silu_params_buf = device
-        .alloc_buffer(4, mlx_native::DType::U32, vec![1])
-        .map_err(|e| anyhow::anyhow!("gemma4_tree_verify_full_layer_q: alloc silu_params: {e}"))?;
-    silu_params_buf
-        .as_mut_slice::<u32>()
-        .map_err(|e| anyhow::anyhow!("gemma4_tree_verify_full_layer_q: silu_params slice: {e}"))?[0] = n_silu;
-    mlx_native::ops::silu_mul::dispatch_silu_mul(
-        &mut enc2, registry, device.metal_device(),
-        &gate_buf, &up_buf, &activated_buf,
-        &silu_params_buf, n_silu,
-    )
-    .context("gemma4_tree_verify_full_layer_q: step F silu_mul")?;
+    {
+        use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
+        let n_elements_bytes = n_act.to_ne_bytes();
+        let pipeline = registry
+            .get_pipeline("fused_gelu_mul", device.metal_device())
+            .map_err(|e| anyhow::anyhow!("gemma4_tree_verify_full_layer_q: get_pipeline fused_gelu_mul: {e}"))?;
+        encode_with_args(
+            &mut enc2, pipeline,
+            &[
+                (0, KernelArg::Buffer(&gate_buf)),
+                (1, KernelArg::Buffer(&up_buf)),
+                (2, KernelArg::Buffer(&activated_buf)),
+                (3, KernelArg::Bytes(&n_elements_bytes)),
+            ],
+            mlx_native::MTLSize::new(n_act as u64, 1, 1),
+            mlx_native::MTLSize::new(std::cmp::min(256, n_act as u64), 1, 1),
+        );
+    }
 
     enc2.memory_barrier();
 

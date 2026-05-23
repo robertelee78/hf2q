@@ -1905,6 +1905,8 @@ mod g4_cfa5_redhatai_smoke {
             "blk.0.attn_output.weight",
             "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight", "blk.0.ffn_down.weight",
             "blk.0.attn_norm.weight", "blk.0.ffn_norm.weight",
+            "blk.0.layer_output_scale.weight", "blk.5.layer_output_scale.weight",
+            "blk.0.post_attention_norm.weight", "blk.0.post_ffw_norm.weight",
             "output.weight", "token_embd.weight",
         ];
         for name in names {
@@ -1914,6 +1916,26 @@ mod g4_cfa5_redhatai_smoke {
                     name, info.ggml_type, info.shape
                 ),
                 None => eprintln!("[g4_cfa5d] {name}: NOT PRESENT"),
+            }
+        }
+        // Load layer_output_scale values to verify they're not 0 or tiny.
+        eprintln!("[g4_cfa5d] --- loading layer_output_scale values ---");
+        let gpu = match GpuContext::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[g4_cfa5d] no Metal: {e}");
+                return;
+            }
+        };
+        let dev = gpu.device().clone();
+        for layer_idx in [0usize, 1, 5, 10, 30, 59] {
+            let name = format!("blk.{layer_idx}.layer_output_scale.weight");
+            match gguf.load_tensor_f32(&name, &dev) {
+                Ok(buf) => {
+                    let s = buf.as_slice::<f32>().expect("as_slice");
+                    eprintln!("[g4_cfa5d] {name}: value={:?} (element_count={})", &s[..s.len().min(4)], s.len());
+                }
+                Err(e) => eprintln!("[g4_cfa5d] {name}: load failed: {e}"),
             }
         }
     }
