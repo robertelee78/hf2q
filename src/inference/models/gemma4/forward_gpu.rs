@@ -2177,6 +2177,38 @@ impl MlxModelWeights {
         // --- Step 3: Layer loop ---
         // Per ADR-038 §3.4.6 risk 3: build attn_shape_base INSIDE the loop
         // because head_dim and num_kv_heads vary per layer type.
+        //
+        // ADR-038 G4-CFA-5d diagnostic instrumentation (env-gated, zero cost
+        // when disabled): set HF2Q_G4_TREE_VERIFY_NAN_DEBUG=1 to bisect which
+        // layer first produces NaN/inf in the verifier forward pass. Dumps
+        // per-layer first-5 hidden values + finite-ness count.
+        let nan_debug = std::env::var("HF2Q_G4_TREE_VERIFY_NAN_DEBUG")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if nan_debug {
+            let h_slice: &[f32] = hidden
+                .as_slice()
+                .map_err(|e| anyhow!("nan_debug: download embed: {e}"))?;
+            let n_finite = h_slice.iter().filter(|x| x.is_finite()).count();
+            let n_nan = h_slice.iter().filter(|x| x.is_nan()).count();
+            let n_inf = h_slice.iter().filter(|x| x.is_infinite()).count();
+            eprintln!(
+                "[g4-nan-debug] post-embed: len={} finite={} nan={} inf={} first5={:?}",
+                h_slice.len(), n_finite, n_nan, n_inf, &h_slice[..5.min(h_slice.len())]
+            );
+            // Also dump first prompt token's first 10 embedding values for
+            // sanity check vs known-good model output. Real Gemma 4 31B
+            // embeddings should be roughly N(0, ~0.05) scaled by sqrt(5376).
+            let token_5_start = 5 * h.min(h_slice.len() / 6);  // 6th token (last for "The capital city of France is")
+            let token_5_end = token_5_start + 10;
+            if token_5_end <= h_slice.len() {
+                eprintln!(
+                    "[g4-nan-debug] embed[token5][0..10]={:?}",
+                    &h_slice[token_5_start..token_5_end]
+                );
+            }
+        }
         let num_layers = self.layers.len();
         for layer_idx in 0..num_layers {
             let lw = &self.layers[layer_idx];
@@ -2236,6 +2268,29 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow!(
                         "forward_tree_verify_gpu: write capture layer {layer_idx}: {e}"
                     ))?;
+            }
+
+            if nan_debug {
+                let h_slice: &[f32] = hidden
+                    .as_slice()
+                    .map_err(|e| anyhow!("nan_debug: download hidden layer {layer_idx}: {e}"))?;
+                let n_nan = h_slice.iter().filter(|x| x.is_nan()).count();
+                let n_inf = h_slice.iter().filter(|x| x.is_infinite()).count();
+                let n_finite = h_slice.len() - n_nan - n_inf;
+                // Only dump first time NaN/inf appears + every 5 layers + last layer
+                let should_print = n_nan + n_inf > 0
+                    || layer_idx % 5 == 0
+                    || layer_idx == num_layers - 1;
+                if should_print {
+                    let max_abs = h_slice.iter()
+                        .filter(|x| x.is_finite())
+                        .fold(0.0f32, |acc, x| acc.max(x.abs()));
+                    eprintln!(
+                        "[g4-nan-debug] post-layer-{layer_idx} ({:?}): finite={} nan={} inf={} max_abs={:.3e} first5={:?}",
+                        lw.layer_type, n_finite, n_nan, n_inf, max_abs,
+                        &h_slice[..5.min(h_slice.len())]
+                    );
+                }
             }
         }
 

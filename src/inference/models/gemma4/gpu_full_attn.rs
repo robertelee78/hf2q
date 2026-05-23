@@ -2837,28 +2837,32 @@ pub fn gemma4_tree_verify_attention_block(
 
     enc.memory_barrier();
 
-    let apply_proj = crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32;
+    // ADR-038 G4-CFA-5d: use the ggml_dtype-aware projection helper. The
+    // legacy `apply_linear_projection_f32` hardcodes Q4_0 (Qwen DWQ
+    // assumption), which corrupts every Q4_K/Q5_K/Q6_K projection on real
+    // Gemma 4 31B Q4_K_M GGUFs.
+    let apply_proj = crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_qweight;
 
     let q_flat = apply_proj(
         &mut enc, registry, device,
-        &input_normed, &layer_weights.attn.q_proj.buffer,
+        &input_normed, &layer_weights.attn.q_proj,
         shape.tree_seq_len, shape.hidden_size, (nq * d) as u32,
     )
     .context("gemma4_tree_verify_attention_block: step 2 Q proj")?;
     let k_flat = apply_proj(
         &mut enc, registry, device,
-        &input_normed, &layer_weights.attn.k_proj.buffer,
+        &input_normed, &layer_weights.attn.k_proj,
         shape.tree_seq_len, shape.hidden_size, (nkv * d) as u32,
     )
     .context("gemma4_tree_verify_attention_block: step 2 K proj")?;
     let v_flat = {
-        let v_proj_buf = match &layer_weights.attn.v_proj {
-            Some(vp) => &vp.buffer,
-            None => &layer_weights.attn.k_proj.buffer,
+        let v_proj_qw = match &layer_weights.attn.v_proj {
+            Some(vp) => vp,
+            None => &layer_weights.attn.k_proj,
         };
         apply_proj(
             &mut enc, registry, device,
-            &input_normed, v_proj_buf,
+            &input_normed, v_proj_qw,
             shape.tree_seq_len, shape.hidden_size, (nkv * d) as u32,
         )
         .context("gemma4_tree_verify_attention_block: step 2 V proj")?
@@ -3006,9 +3010,9 @@ pub fn gemma4_tree_verify_attention_block(
 
     enc2.memory_barrier();
 
-    let o_out = crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32(
+    let o_out = crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_qweight(
         &mut enc2, registry, device,
-        &attn_out, &layer_weights.attn.o_proj.buffer,
+        &attn_out, &layer_weights.attn.o_proj,
         shape.tree_seq_len, (nq * d) as u32, shape.hidden_size,
     )
     .context("gemma4_tree_verify_attention_block: step 7 O proj")?;
@@ -3157,22 +3161,23 @@ pub fn gemma4_tree_verify_full_layer_q(
 
     enc2.memory_barrier();
 
+    // ADR-038 G4-CFA-5d: ggml_dtype-aware projection (see attention block).
     let gate_buf = {
         let _out_bytes = seq * m * std::mem::size_of::<f32>();
-        let apply_proj = crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32;
+        let apply_proj = crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_qweight;
         apply_proj(
             &mut enc2, registry, device,
-            &pre_ff_normed, &layer_weights.mlp.gate_proj.buffer,
+            &pre_ff_normed, &layer_weights.mlp.gate_proj,
             shape.attn.tree_seq_len, shape.attn.hidden_size,
             shape.intermediate_size,
         )
         .context("gemma4_tree_verify_full_layer_q: gate_proj")?
     };
     let up_buf = {
-        let apply_proj = crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32;
+        let apply_proj = crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_qweight;
         apply_proj(
             &mut enc2, registry, device,
-            &pre_ff_normed, &layer_weights.mlp.up_proj.buffer,
+            &pre_ff_normed, &layer_weights.mlp.up_proj,
             shape.attn.tree_seq_len, shape.attn.hidden_size,
             shape.intermediate_size,
         )
@@ -3208,9 +3213,9 @@ pub fn gemma4_tree_verify_full_layer_q(
 
     enc2.memory_barrier();
 
-    let down_out = crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32(
+    let down_out = crate::inference::models::qwen35::gpu_full_attn::apply_linear_projection_f32_qweight(
         &mut enc2, registry, device,
-        &activated_buf, &layer_weights.mlp.down_proj.buffer,
+        &activated_buf, &layer_weights.mlp.down_proj,
         shape.attn.tree_seq_len, shape.intermediate_size,
         shape.attn.hidden_size,
     )

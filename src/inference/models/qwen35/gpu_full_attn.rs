@@ -921,6 +921,114 @@ pub fn apply_linear_projection_f32(
     Ok(dst)
 }
 
+/// Sister of `apply_linear_projection_f32` that reads the actual
+/// `ggml_dtype` from the loaded `MlxQWeight.info` instead of hardcoding
+/// `GgmlType::Q4_0` for `DType::U8` weights.
+///
+/// # Why this exists (ADR-038 G4-CFA-5d, 2026-05-23)
+///
+/// `apply_linear_projection_f32` hardcodes `Q4_0` because Qwen 3.5/3.6 DWQ
+/// quantization always lands as Q4_0. That assumption silently breaks for
+/// any GGUF that ships projections in another GGML quant — e.g. the dense
+/// Gemma 4 31B Q4_K_M GGUF (bartowski/unsloth) which loads Q/K/V/O as
+/// Q4_K / Q5_K / Q6_K respectively, plus FFN gate/up as Q4_K and FFN down
+/// as Q6_K. Treating Q4_K bytes as Q4_0 in `quantized_matmul_ggml` produces
+/// garbage values that the first transformer layer turns into all-NaN
+/// (block-format mismatch in dequantization).
+///
+/// Production `forward_decode` (`encode_one_layer` in `gemma4/gpu_full_attn.rs`)
+/// avoids the bug because it uses `dispatch_qmatmul` (session-based) which
+/// reads `qweight.info.ggml_dtype`. The tree-verify attention block was
+/// built on encoder-based dispatch (`apply_linear_projection_f32`), so this
+/// helper keeps that encoder lifecycle while wiring the correct ggml_dtype.
+///
+/// # Parity with `apply_linear_projection_f32`
+///
+/// Behavior is identical for `Q4_0` weights (Qwen path), `BF16`, and `F32` —
+/// the only material change is the U8 arm reading `qweight.info.ggml_dtype`.
+/// `qweight.affine` and `qweight.f16_shadow` are NOT consulted; the encoder
+/// path does not currently have F16-shadow integration. Future cleanup can
+/// converge with `dispatch_qmatmul` once tree-verify migrates to sessions.
+pub fn apply_linear_projection_f32_qweight(
+    encoder: &mut mlx_native::CommandEncoder,
+    registry: &mut KernelRegistry,
+    device: &MlxDevice,
+    input: &MlxBuffer,
+    qweight: &crate::serve::forward_mlx_shared::MlxQWeight,
+    seq_len: u32,
+    in_features: u32,
+    out_features: u32,
+) -> Result<MlxBuffer> {
+    debug_assert_eq!(input.dtype(), DType::F32,
+        "apply_linear_projection_f32_qweight: input must be F32; got {}",
+        input.dtype());
+
+    let out_bytes = (seq_len * out_features) as usize * 4;
+    let mut dst = device
+        .alloc_buffer(out_bytes, DType::F32, vec![seq_len as usize, out_features as usize])
+        .map_err(|e| anyhow!("alloc projection output: {e}"))?;
+
+    match qweight.buffer.dtype() {
+        DType::U8 => {
+            // Use the ACTUAL ggml_dtype from the loaded weight metadata —
+            // NOT a hardcoded Q4_0. This is the entire reason the helper
+            // exists.
+            let params = GgmlQuantizedMatmulParams {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                ggml_type: qweight.info.ggml_dtype,
+            };
+            quantized_matmul_ggml(encoder, registry, device, input, &qweight.buffer, &mut dst, &params)
+                .with_context(|| format!(
+                    "quantized_matmul_ggml ggml_type={:?}",
+                    qweight.info.ggml_dtype
+                ))?;
+        }
+        DType::BF16 => {
+            let params = DenseMmBf16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            if seq_len == 1 {
+                dense_gemv_bf16_f32(encoder, registry, device, &qweight.buffer, input, &mut dst, &params)
+                    .context("dense_gemv_bf16_f32 (M=1)")?;
+            } else {
+                dense_matmul_bf16_f32_tensor(encoder, registry, device, &qweight.buffer, input, &mut dst, &params)
+                    .context("dense_matmul_bf16_f32_tensor")?;
+            }
+        }
+        DType::F32 => {
+            let n_w = (out_features * in_features) as usize;
+            let weight_bf16 = super::decode_pool::pooled_alloc_buffer(
+                    device, n_w * 2, DType::BF16, vec![out_features as usize, in_features as usize])
+                .map_err(|e| anyhow!("alloc weight_bf16 (pooled): {e}"))?;
+            cast(encoder, registry, device.metal_device(), &qweight.buffer, &weight_bf16, n_w, CastDirection::F32ToBF16)
+                .context("cast weight F32→BF16")?;
+            encoder.memory_barrier();
+            let params = DenseMmBf16F32Params {
+                m: seq_len,
+                n: out_features,
+                k: in_features,
+                src0_batch: 1,
+                src1_batch: 1,
+            };
+            dense_matmul_bf16_f32_tensor(encoder, registry, device, &weight_bf16, input, &mut dst, &params)
+                .context("dense_matmul_bf16_f32_tensor (F32 legacy)")?;
+        }
+        other => {
+            return Err(anyhow!(
+                "apply_linear_projection_f32_qweight: unsupported weight dtype {:?}", other
+            ));
+        }
+    }
+
+    Ok(dst)
+}
+
 /// Like `apply_linear_projection_f32` but writes into a caller-supplied output
 /// buffer instead of allocating a new one.
 ///

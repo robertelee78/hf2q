@@ -501,7 +501,19 @@ impl<'a> Drafter for GpuDrafter<'a> {
         // tree expansion + KV cache + sampler operate in target's
         // vocabulary space.
         let candidates = if let Some(map) = &self.tensors.draft_id_to_target_id {
+            // ADR-038 G4-CFA-5d (2026-05-23): the d2t array (draft→target
+            // vocab remap) is NOT guaranteed injective. RedHatAI's published
+            // Gemma 4 31B drafter ships a 32K-draft → 262K-target d2t in
+            // which distinct draft slots can legitimately map to the same
+            // target token (verified empirically: draft positions producing
+            // target token 466 collide). Per EAGLE-3 paper semantics
+            // (vllm-project/speculators), the right behavior is to dedupe
+            // post-remap keeping the highest log_prob entry. Since
+            // raw_candidates is sorted descending by log_prob, the FIRST
+            // occurrence of each target token wins.
             let mut remapped = Vec::with_capacity(raw_candidates.len());
+            let mut seen: std::collections::HashSet<u32> =
+                std::collections::HashSet::with_capacity(raw_candidates.len());
             for c in raw_candidates {
                 let draft_idx = c.token as usize;
                 ensure!(
@@ -524,10 +536,12 @@ impl<'a> Drafter for GpuDrafter<'a> {
                         target_id
                     )
                 })?;
-                remapped.push(DraftCandidate {
-                    token: target_u32,
-                    log_prob: c.log_prob,
-                });
+                if seen.insert(target_u32) {
+                    remapped.push(DraftCandidate {
+                        token: target_u32,
+                        log_prob: c.log_prob,
+                    });
+                }
             }
             remapped
         } else {
