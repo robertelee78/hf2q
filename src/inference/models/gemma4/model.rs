@@ -66,6 +66,42 @@ fn alloc_one_f32_placeholder(
         .map_err(|e| anyhow::anyhow!("dense MoE placeholder alloc ({label}): {e}"))
 }
 
+/// G4-CFA-5b — load an OPTIONAL per-layer norm tensor, falling back to a
+/// 1-element F32 placeholder when the GGUF doesn't carry the tensor.
+///
+/// Dense Gemma 4 31B GGUFs (e.g. `google_gemma-4-31B-it-Q4_K_M.gguf` from
+/// bartowski / unsloth) carry only 4 FFN-related norms per block (`ffn_norm`,
+/// `post_ffw_norm`, `attn_q_norm`, `attn_k_norm`). The MoE variants
+/// (`pre_ffw_norm_2`, `post_ffw_norm_1`, `post_ffw_norm_2`) are present only
+/// in 26B-A4B MoE GGUFs because those tensors back the second parallel FFN
+/// branch + per-branch post-norms used by the MoE forward path
+/// (`gpu_full_attn.rs:1641-2374`).
+///
+/// The dense tree-verify path (`gemma4_tree_verify_full_layer_q` at
+/// `gpu_full_attn.rs:3099`) reads exactly 2 FFN norms — `pre_feedforward_layernorm`
+/// (step B) and `post_feedforward_layernorm` (step G) — never the `_1` / `_2`
+/// MoE-only siblings. Returning a 1-element placeholder for the absent norms
+/// keeps `MlxLayerNorms` uniform across dense + MoE GGUFs without a
+/// `Vec<Option<MlxBuffer>>` ripple change; an accidental dense-vs-MoE misroute
+/// would falsify the runtime MoE `stacked_*.is_some()` gate (same iter-227
+/// pattern as `MlxMoeWeights::dense_placeholder`).
+///
+/// Detection rule: deterministic, GGUF-metadata-only (never filename-based,
+/// per the iter-227 correctness pin) — `gguf.tensor_info(name).is_some()`.
+fn load_optional_norm_or_placeholder(
+    gguf: &mlx_native::gguf::GgufFile,
+    name: &str,
+    mlx_device: &mlx_native::MlxDevice,
+    label: &'static str,
+) -> Result<MlxBuffer> {
+    if gguf.tensor_info(name).is_some() {
+        gguf.load_tensor_f32(name, mlx_device)
+            .map_err(|e| anyhow::anyhow!("{label} ({name}): {e}"))
+    } else {
+        alloc_one_f32_placeholder(mlx_device, label)
+    }
+}
+
 // MlxAffineMoeStack moved to forward_mlx_shared.rs (ADR-038 Step 1).
 
 /// Per-expert MoE weights for one layer (quantized, GGML block format).
@@ -1147,7 +1183,28 @@ impl MlxModelWeights {
                     .map_err(|e| anyhow::anyhow!("layer {i} MoE placeholder alloc: {e}"))?
             };
 
-            // -- Norm weights (all F32) --
+            // -- Norm weights (F32) --
+            //
+            // G4-CFA-5b (2026-05-23): the 3 MoE-only FFN norms
+            // (`pre_ffw_norm_2`, `post_ffw_norm_1`, `post_ffw_norm_2`) are
+            // present in 26B-A4B MoE GGUFs but ABSENT in dense Gemma 4 31B
+            // GGUFs (bartowski / unsloth `google_gemma-4-31B-it-Q4_K_M.gguf`
+            // carries only 4 FFN-related norms: `attn_norm`, `ffn_norm`,
+            // `post_attention_norm`, `post_ffw_norm`, plus the always-present
+            // `attn_q_norm` / `attn_k_norm`). The dense tree-verify path
+            // (`gemma4_tree_verify_full_layer_q`, gpu_full_attn.rs:3099) reads
+            // only `pre_feedforward_layernorm` (step B) and
+            // `post_feedforward_layernorm` (step G) — never the `_1` / `_2`
+            // MoE-only siblings. Use `load_optional_norm_or_placeholder` to
+            // fall back to 1-element F32 placeholders when those tensors are
+            // absent (same `iter-227` placeholder-bundle pattern as
+            // `MlxMoeWeights::dense_placeholder`). The dense FFN path
+            // (`MlxMlpWeights`, loaded above unconditionally) and the MoE
+            // forward path (which reads the `_1` / `_2` norms) are mutually
+            // exclusive at runtime — `forward_decode` gates MoE on
+            // `stacked_*.is_some()` and `forward_tree_verify_gpu` is the
+            // dense-only entry point. A misroute would falsify the
+            // `stacked_*.is_some()` gate, not silently consume garbage.
             let norms = MlxLayerNorms {
                 input_layernorm: gguf.load_tensor_f32(
                     &format!("blk.{i}.attn_norm.weight"), mlx_device,
@@ -1161,15 +1218,24 @@ impl MlxModelWeights {
                 post_feedforward_layernorm: gguf.load_tensor_f32(
                     &format!("blk.{i}.post_ffw_norm.weight"), mlx_device,
                 ).map_err(|e| anyhow::anyhow!("layer {i} post_ffw_norm: {e}"))?,
-                pre_feedforward_layernorm_2: gguf.load_tensor_f32(
-                    &format!("blk.{i}.pre_ffw_norm_2.weight"), mlx_device,
-                ).map_err(|e| anyhow::anyhow!("layer {i} pre_ffw_norm_2: {e}"))?,
-                post_feedforward_layernorm_1: gguf.load_tensor_f32(
-                    &format!("blk.{i}.post_ffw_norm_1.weight"), mlx_device,
-                ).map_err(|e| anyhow::anyhow!("layer {i} post_ffw_norm_1: {e}"))?,
-                post_feedforward_layernorm_2: gguf.load_tensor_f32(
-                    &format!("blk.{i}.post_ffw_norm_2.weight"), mlx_device,
-                ).map_err(|e| anyhow::anyhow!("layer {i} post_ffw_norm_2: {e}"))?,
+                pre_feedforward_layernorm_2: load_optional_norm_or_placeholder(
+                    gguf,
+                    &format!("blk.{i}.pre_ffw_norm_2.weight"),
+                    mlx_device,
+                    "pre_ffw_norm_2",
+                )?,
+                post_feedforward_layernorm_1: load_optional_norm_or_placeholder(
+                    gguf,
+                    &format!("blk.{i}.post_ffw_norm_1.weight"),
+                    mlx_device,
+                    "post_ffw_norm_1",
+                )?,
+                post_feedforward_layernorm_2: load_optional_norm_or_placeholder(
+                    gguf,
+                    &format!("blk.{i}.post_ffw_norm_2.weight"),
+                    mlx_device,
+                    "post_ffw_norm_2",
+                )?,
             };
 
             // -- Layer scalar (F32) --
@@ -2085,16 +2151,33 @@ fn alloc_activation_buffers(
         argmax_value: alloc_f32(1, "argmax_value")?,
         argmax_params,
         logits: alloc_f32(vocab, "logits")?,
-        moe_router_logits: alloc_f32(num_experts, "moe_router_logits")?,
+        // G4-CFA-5b (2026-05-23): MoE activation buffers fall back to
+        // 1-element placeholders on dense GGUFs (num_experts == 0 ⇒
+        // alloc_buffer with 0 bytes errors with "Buffer byte length must
+        // be > 0"). These buffers are read EXCLUSIVELY by the MoE forward
+        // path; the dense `forward_tree_verify_gpu` entry never touches
+        // them. Same `iter-227` placeholder-bundle pattern as
+        // `MlxMoeWeights::dense_placeholder` + the optional norms above.
+        moe_router_logits: alloc_f32(num_experts.max(1), "moe_router_logits")?,
         moe_expert_out: alloc_f32(hs.max(max_kv_heads * max_hd), "moe_expert_out")?,
         moe_accum: alloc_f32(hs, "moe_accum")?,
         moe_norm_out: alloc_f32(hs, "moe_norm_out")?,
         router_norm_out: alloc_f32(hs, "router_norm_out")?,
-        // Fused _id dispatch buffers (sized for top_k = cfg.top_k_experts)
-        moe_expert_ids: alloc_u32(cfg.top_k_experts, "moe_expert_ids")?,
-        moe_gate_up_id_out: alloc_f32(cfg.top_k_experts * 2 * moe_interm, "moe_gate_up_id_out")?,
-        moe_down_id_out: alloc_f32(cfg.top_k_experts * hs, "moe_down_id_out")?,
-        moe_swiglu_id_out: alloc_f32(cfg.top_k_experts * moe_interm, "moe_swiglu_id_out")?,
+        // Fused _id dispatch buffers (sized for top_k = cfg.top_k_experts).
+        // G4-CFA-5b: clamp to ≥1 element for dense GGUFs (see above).
+        moe_expert_ids: alloc_u32(cfg.top_k_experts.max(1), "moe_expert_ids")?,
+        moe_gate_up_id_out: alloc_f32(
+            (cfg.top_k_experts * 2 * moe_interm).max(1),
+            "moe_gate_up_id_out",
+        )?,
+        moe_down_id_out: alloc_f32(
+            (cfg.top_k_experts * hs).max(1),
+            "moe_down_id_out",
+        )?,
+        moe_swiglu_id_out: alloc_f32(
+            (cfg.top_k_experts * moe_interm).max(1),
+            "moe_swiglu_id_out",
+        )?,
         hidden_f16: device.alloc_buffer(hs * 2, mlx_native::DType::F16, vec![1, hs])
             .map_err(|e| anyhow::anyhow!("alloc hidden_f16 ({hs} f16): {e}"))?,
         logits_f16: device.alloc_buffer(vocab * 2, mlx_native::DType::F16, vec![1, vocab])
@@ -2122,6 +2205,7 @@ fn alloc_activation_buffers(
         attn_v: alloc_f32(max_kv_heads * max_hd, "attn_v")?,
         attn_q_normed: alloc_f32(num_heads * max_hd, "attn_q_normed")?,
         attn_k_normed: alloc_f32(max_kv_heads * max_hd, "attn_k_normed")?,
-        moe_routing_weights_gpu: alloc_f32(cfg.top_k_experts, "moe_routing_weights_gpu")?,
+        // G4-CFA-5b: clamp to ≥1 element for dense GGUFs (top_k_experts==0).
+        moe_routing_weights_gpu: alloc_f32(cfg.top_k_experts.max(1), "moe_routing_weights_gpu")?,
     })
 }
