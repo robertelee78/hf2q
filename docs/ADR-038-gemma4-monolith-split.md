@@ -1,6 +1,6 @@
 # ADR-038: Split `src/serve/forward_mlx.rs` monolith per-arch + Gemma 4 EAGLE-3 enablement
 
-- **Status**: 🚧 IN PROGRESS — Steps 1 + 2 SHIPPED at hf2q `c2406402` (2026-05-22)
+- **Status**: 🚧 IN PROGRESS — Steps 1 + 2 + 3 SHIPPED at hf2q `b630062a` (2026-05-22)
 - **Date**: 2026-05-22
 
 ## Phase status
@@ -9,7 +9,7 @@
 |---|---|---|---|
 | Step 1 — shared primitives | ✅ SHIPPED | hf2q `05a1d73a` | `src/serve/forward_mlx_shared.rs` 1764 LOC; `forward_mlx.rs` shrunk 10142 → 8409 (~1733 LOC extracted); `pub use` shim preserves `crate::serve::forward_mlx::X` paths — zero external consumer edits; all 17 inventoried items moved; 3 test modules relocated (`cosine_tests`, `dispatch_qmatmul_f32_router_test`, `ac5_iter_b_affine_qweight_roundtrip`); `dense_placeholder_tests` stayed; `#[inline(always)]` on `rms_norm_f32_hs_cached` preserved; cargo check clean, 3110 tests pass (same 3 pre-existing GPU hardware failures, not regressions). All AC-1.1 through AC-1.10 verified green. |
 | Step 2 — Gemma KV-cache extraction | ✅ SHIPPED | hf2q `c2406402` | `src/inference/models/gemma4/kv_cache.rs` (466 LOC) with all 6 items: `MlxKvCache` + `trim`/`visible_len` impl, `HbKvBuffers`, `DenseKvBuffers` + `ByteSized` impl, `HybridKvBuffers` + `ByteSized` impl, `alloc_hybrid_kv_for_layer` (promoted `pub(super)` → `pub(crate)`), `DecodeRegime`. Added `pub mod kv_cache` to gemma4/mod.rs. Forward_mlx.rs shrunk to 8118 LOC (~304 LOC cut). `pub use` re-exports preserve `crate::serve::forward_mlx::X` paths — same strangler-fig pattern as Step 1. Fixed pre-existing missing `norm_before_residual` field in `eagle3_orchestrator.rs` default initializer (added to `Eagle3DrafterConfig` ahead of this commit, was blocking cargo check). 12 inline tests in kv_cache.rs cover all paths (MlxDevice-gated, skip on no GPU). cargo check clean; full suite passes (98 kv_cache tests). All AC-2.1 through AC-2.10 verified green. |
-| Step 3 — rename to gemma4/ tree | ⏳ TODO | — | The big move — atomic commit |
+| Step 3 — rename to gemma4/ tree | ✅ SHIPPED | hf2q `b630062a` | src/serve/forward_mlx.rs (8118 LOC) deleted; 7 new files under src/inference/models/gemma4/ (model.rs, gpu_full_attn.rs, forward_gpu.rs, io_heads.rs, kv_persist.rs, profile.rs, gpu_ffn.rs); ~47 consumer sites updated atomically; ADR-031 unsafe transmute contract preserved; Path A (encode_one_layer whole in gpu_full_attn.rs); cargo build + cargo doc clean; 3136 tests pass (41 ignored). All AC-3.1 through AC-3.14 verified green. |
 | Step 4 — Gemma 4 EAGLE-3 enablement | ⏳ TODO | — | 6 G4-CFAs targeting ≥1.72× bench on M5 Max |
 - **Author**: claude-flow
 - **Supersedes**: nothing (ADR-013's per-arch commitment is honored — gemma4 was the lone holdout)
