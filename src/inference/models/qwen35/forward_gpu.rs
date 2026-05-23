@@ -2247,6 +2247,71 @@ impl Qwen35Model {
                         .context("upload output_norm")?,
                     lm_head_q4,
                 };
+
+                // ADR-033 §Pi Task #20 iter 11 (2026-05-23) — prewarm hot
+                // Metal pipelines.  Moves first-call JIT/PSO-creation cost
+                // (~40ms × first FA layer + ~40ms × first FFN layer = ~80ms
+                // of the 221ms prefill at Qwen3.6 35B-A3B Q4_0 MoE pp553)
+                // out of the prefill hot path and into the model-load window
+                // where 3.3s is already being spent.
+                //
+                // Opt-out via HF2Q_PIPELINE_PREWARM=0 / false / off.
+                let prewarm_off = matches!(
+                    std::env::var("HF2Q_PIPELINE_PREWARM").as_deref(),
+                    Ok("0") | Ok("false") | Ok("off"),
+                );
+                if !prewarm_off {
+                    let prewarm_start = std::time::Instant::now();
+                    // Curated hot-path kernel list — ONLY kernels using
+                    // `registry.get_pipeline(...)` without function constants.
+                    //
+                    // CRITICAL: kernels that declare `[[function_constant(N)]]`
+                    // without a default REQUIRE specialization at pipeline
+                    // creation. Building them without constants triggers a
+                    // Metal `validateWithDevice:` assertion which ABORTS the
+                    // process (not recoverable via Rust Result). The list
+                    // below is verified by grep: each kernel name is reached
+                    // from a `registry.get_pipeline("name", ...)` call site,
+                    // NOT a `get_pipeline_with_constants` site.
+                    //
+                    // Trade-off: most of the heavy mm/mv/mm_id matmul cost
+                    // lives behind get_pipeline_with_constants (sizeable
+                    // function-constant fan-out for `simd_groups`, dst dim,
+                    // etc.), so this prewarm cannot eliminate that JIT.
+                    // What it CAN do is move the source-compile + PSO cost
+                    // for the simpler glue kernels (silu, norm, residual)
+                    // into the load window. End-to-end impact: bounded.
+                    let hot_kernels: &[&str] = &[
+                        // SiLU (FFN element-wise)
+                        "silu_mul_f32",
+                        // Fused head/norm/rope (Q/K projection + per-head
+                        // norm + IMROPE in one dispatch)
+                        "fused_head_norm_rope_f32",
+                        "fused_head_norm_rope_bf16",
+                        "fused_head_norm_rope_batch_bf16",
+                        // RMS-norm utility variants
+                        "rms_norm_f32_triple",
+                        "rms_norm_no_scale_bf16",
+                        // MoE routing softmax + topk (no constants)
+                        "moe_softmax_topk_f32",
+                        // MoE final weighted reduction (no constants)
+                        "moe_weighted_reduce_f32",
+                        // Fused residual + norm (no constants)
+                        "fused_residual_norm_bf16",
+                        // Linear-attention chunk helper (no constants)
+                        "compute_g_beta_f32",
+                    ];
+                    let warmed = registry.prewarm_pipelines(device.metal_device(), hot_kernels);
+                    if std::env::var("HF2Q_PIPELINE_PREWARM_LOG").as_deref() == Ok("1") {
+                        eprintln!(
+                            "[prewarm] warmed {} / {} kernels in {:.2}ms",
+                            warmed,
+                            hot_kernels.len(),
+                            prewarm_start.elapsed().as_secs_f64() * 1000.0,
+                        );
+                    }
+                }
+
                 *cache = Some(ForwardGpuCache {
                     model_ptr: self_ptr,
                     device,
