@@ -150,24 +150,29 @@ impl Eagle3DrafterConfig {
             self.num_kv_heads,
         );
         // Codex /cfa E3 Critical (2026-05-22): checked multiply
-        // before equality. Adversarial config (e.g. num_q_heads=
-        // usize::MAX / 2 + 1, head_dim=2) would wrap on raw multiply
-        // and accidentally satisfy `== hidden_size`.
-        let q_out = self.num_q_heads.checked_mul(self.head_dim).ok_or_else(|| {
+        // for `q_proj.weight` first-dim. Adversarial config (e.g.
+        // num_q_heads=usize::MAX / 2 + 1, head_dim=2) would wrap on
+        // raw multiply at manifest-build time.
+        //
+        // ADR-038 G4-CFA-5 (2026-05-23): RELAXED — `q_proj_out` is NOT
+        // required to equal `hidden_size`. Llama-style EAGLE-3 drafters
+        // (e.g. RedHatAI gemma-4-31B-it-speculator.eagle3) use
+        // `num_attention_heads=32`, `head_dim=256` → `q_proj_out=8192`
+        // while `hidden_size=5376`. The `o_proj` weight maps
+        // `[hidden_size, q_proj_out]` (= `[5376, 8192]`) — the kernel
+        // already supports independent dims (see
+        // `forward.rs::dispatch_eagle3_o_proj` line ~1435 passing
+        // `cfg.q_proj_out()` as input width and `cfg.hidden_size` as
+        // output width). The historical Qwen35 default happens to have
+        // `q_proj_out == hidden_size` but this is NOT a kernel
+        // requirement. The original invariant was over-tight.
+        let _q_out = self.num_q_heads.checked_mul(self.head_dim).ok_or_else(|| {
             anyhow!(
                 "num_q_heads * head_dim overflows usize (num_q_heads={}, head_dim={})",
                 self.num_q_heads,
                 self.head_dim
             )
         })?;
-        ensure!(
-            q_out == self.hidden_size,
-            "num_q_heads * head_dim ({} * {} = {}) must equal hidden_size ({})",
-            self.num_q_heads,
-            self.head_dim,
-            q_out,
-            self.hidden_size,
-        );
         // kv_proj_out() reuse — checked here once so the helper can
         // stay simple at call sites.
         let _kv_out = self.num_kv_heads.checked_mul(self.head_dim).ok_or_else(|| {
@@ -300,14 +305,26 @@ pub(crate) mod tests {
         assert!(err.contains("GQA invariant"), "got: {err}");
     }
 
+    /// ADR-038 G4-CFA-5 (2026-05-23): the `num_q_heads * head_dim ==
+    /// hidden_size` invariant from CFA-3 was over-tight for Llama-style
+    /// EAGLE-3 drafters (e.g. RedHatAI gemma-4-31B-it-speculator.eagle3
+    /// uses `num_q_heads=32, head_dim=256, hidden_size=5376` →
+    /// `q_proj_out=8192 != 5376`; the `o_proj` weight `[5376, 8192]`
+    /// reduces the projected Q-stream back to hidden_size). The kernel
+    /// itself supports independent `q_proj_out` and `hidden_size`
+    /// (`forward.rs::dispatch_eagle3_o_proj`); only `validate()` was
+    /// rejecting valid configs. This test now pins the RELAXED behavior:
+    /// a Llama-style shape (q_proj_out != hidden_size) MUST validate.
     #[test]
-    fn adr_037_e3b_heads_times_head_dim_must_equal_hidden_2026_05_22() {
+    fn adr_038_g4_cfa5_llama_style_q_proj_out_validates_2026_05_23() {
         let mut cfg = qwen35_default();
-        // GQA-divisible (32 % 8 == 0) but 32*128 = 4096 != 5120 — so
-        // the GQA check passes and the heads*head_dim check fires.
-        cfg.num_q_heads = 32;
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("must equal hidden_size"), "got: {err}");
+        // Llama-style: num_q_heads * head_dim != hidden_size. The
+        // RedHatAI Gemma 4 31B drafter is this shape. We pin
+        // GQA-divisible (32 % 8 == 0) so only the (formerly) tight
+        // `q_proj_out == hidden_size` check would fire.
+        cfg.num_q_heads = 32; // 32 * 128 = 4096 != hidden_size 5120
+        cfg.validate()
+            .expect("Llama-style q_proj_out != hidden_size must validate (ADR-038 G4-CFA-5)");
     }
 
     #[test]
@@ -344,19 +361,27 @@ pub(crate) mod tests {
 
     /// AC-G4-CFA-4.3 — default_gemma4_eagle3_config shape matches RedHatAI schema.
     ///
-    /// Per ADR-038 §3.4.2: hidden_size=5376, head_dim=256, num_q_heads=21, etc.
+    /// Per ADR-038 §3.4.2: hidden_size=5376, head_dim=256, num_q_heads=32, etc.
     /// Tests the config values documented in the ADR without needing a real model.
+    ///
+    /// ADR-038 G4-CFA-5 (2026-05-23): updated to the published Llama-style
+    /// shape (num_q_heads=32 / num_kv_heads=16 → q_proj_out=8192) after
+    /// relaxing the over-tight `q_proj_out == hidden_size` invariant in
+    /// `validate()`. Pre-fix this test used the work-around values 21/7
+    /// (which satisfied the tight invariant but would have mismatched the
+    /// real checkpoint's `q_proj=[8192, 10752]` shape at load time).
     #[test]
     fn g4_cfa4_default_gemma4_eagle3_config_shape_2026_05_22() {
-        // RedHatAI checkpoint schema: hidden_size=5376, num_attention_heads=21
-        // (q_proj_out=8192/not shown), head_dim=256. Draft: 1-layer, vocab=32000.
-        // Drafter config derived from ADR-038 §3.4.2.
+        // RedHatAI checkpoint schema (verified via safetensors header):
+        //   q_proj.weight = [8192, 10752]  → num_q_heads=32, head_dim=256
+        //   k_proj.weight = [4096, 10752]  → num_kv_heads=16, head_dim=256
+        //   o_proj.weight = [5376, 8192]   → hidden_size=5376
         let cfg = Eagle3DrafterConfig {
             hidden_size: 5376,
             intermediate_size: 21504,
             head_dim: 256,
-            num_q_heads: 21,    // 21 * 256 = 5376 = hidden_size ✓
-            num_kv_heads: 7,    // 21/7=3 (GQA ratio 3:1, divisible ✓)
+            num_q_heads: 32,    // 32 * 256 = 8192 = q_proj_out (Llama-style)
+            num_kv_heads: 16,   // 32/16=2 (GQA ratio 2:1, divisible ✓)
             vocab_size: 262144,
             draft_vocab_size: 32000,
             target_hidden_size: 5376,
@@ -376,5 +401,7 @@ pub(crate) mod tests {
         cfg.validate().expect("Gemma4 RedHatAI config shape must validate");
         assert_eq!(cfg.fc_input_size(), 5376 * 3, "fc_input_size = 3 aux * 5376");
         assert_eq!(cfg.norm_before_residual, true);
+        assert_eq!(cfg.q_proj_out(), 8192, "q_proj_out = num_q_heads(32) * head_dim(256)");
+        assert_eq!(cfg.kv_proj_out(), 4096, "kv_proj_out = num_kv_heads(16) * head_dim(256)");
     }
 }

@@ -900,8 +900,13 @@ mod tests {
         // Codex Major 3: load() must call cfg.validate() at entry.
         // Construct an invalid config and a (vacuously) tiny blob —
         // load should fail with Config(), not panic on later math.
+        //
+        // ADR-038 G4-CFA-5 (2026-05-23): the `num_q_heads * head_dim ==
+        // hidden_size` invariant was relaxed (Llama-style drafters
+        // legitimately violate it). Trigger a still-valid invariant:
+        // GQA divisibility (`num_q_heads % num_kv_heads == 0`).
         let mut cfg = qwen35_default();
-        cfg.num_q_heads = 32; // 32 * 128 = 4096 != 5120 → invariant violated
+        cfg.num_kv_heads = 7; // 40 % 7 != 0 → GQA invariant violated
         // Build SOME synthetic blob (empty manifest is fine since
         // validate fires first).
         let blob = build_synthetic_safetensors(&[]);

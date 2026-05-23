@@ -177,9 +177,22 @@ impl Gemma4Config {
         let rope_freq_base_swa = f32_required("gemma4.rope.freq_base_swa")? as f64;
         let sliding_window = u32_required("gemma4.attention.sliding_window")? as usize;
         let max_pos = u32_required("gemma4.context_length")? as usize;
-        let num_experts = u32_required("gemma4.expert_count")? as usize;
-        let top_k_experts = u32_required("gemma4.expert_used_count")? as usize;
-        let moe_inter = u32_required("gemma4.expert_feed_forward_length")? as usize;
+        // ADR-038 G4-CFA-5 (2026-05-23): MoE keys are OPTIONAL — dense Gemma 4
+        // variants (e.g. google/gemma-4-31B-it served from a stock GGUF that
+        // bartowski/unsloth publish) omit `gemma4.expert_count` /
+        // `expert_used_count` / `expert_feed_forward_length` entirely. The
+        // pre-fix `u32_required` calls would reject those configs at load time
+        // even though `Gemma4Config` already carries `num_experts=0` as the
+        // documented "dense" sentinel (the per-layer dispatch in
+        // `gemma4/forward_gpu.rs` branches on `num_experts > 0`, treating 0
+        // as the dense-SwiGLU path). Default the three knobs to 0 when absent
+        // — the existing MoE GGUFs continue to populate them explicitly.
+        let num_experts =
+            gguf.metadata_u32("gemma4.expert_count").unwrap_or(0) as usize;
+        let top_k_experts =
+            gguf.metadata_u32("gemma4.expert_used_count").unwrap_or(0) as usize;
+        let moe_inter =
+            gguf.metadata_u32("gemma4.expert_feed_forward_length").unwrap_or(0) as usize;
         let final_softcap = gguf
             .metadata_f32("gemma4.final_logit_softcapping")
             .map(|v| v as f64);
