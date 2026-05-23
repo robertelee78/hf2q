@@ -941,6 +941,17 @@ impl MlxModelWeights {
         let mut last_token = 0u32;
         let resume_k = restored_lcp.unwrap_or(0);
 
+        // ADR-038 G4-CFA-5f: dense Gemma 4 31B (num_experts==0) skips every
+        // MoE-specific dispatch in the per-layer body below — the
+        // post-FF-norm2 combine still reads `moe_accum`, so it must be
+        // zeroed once up front and never written. Cost: hs * 4 bytes wiped
+        // once per forward_prefill call; <1 µs on M-series unified memory.
+        if self.num_experts == 0 {
+            let buf = self.activations.moe_accum.as_mut_slice::<f32>()
+                .map_err(|e| anyhow::anyhow!("prefill dense moe_accum zero: {e}"))?;
+            buf.fill(0.0);
+        }
+
         for (tok_i, &tok) in prompt_tokens.iter().enumerate().skip(resume_k) {
             let seq_pos = tok_i;
 
@@ -1521,37 +1532,57 @@ impl MlxModelWeights {
                         &self.activations.moe_norm_out,
                         &self.activations.norm_params, 1, hs as u32,
                     ).map_err(|e| anyhow::anyhow!("prefill pre-FF2 L{layer_idx} T{tok_i}: {e}"))?;
-                    s.rms_norm(reg, metal_dev,
-                        &self.activations.residual,
-                        &self.layers[layer_idx].moe.router_combined_weight,
-                        &self.activations.router_norm_out,
-                        &self.activations.norm_params, 1, hs as u32,
-                    ).map_err(|e| anyhow::anyhow!("prefill router norm L{layer_idx} T{tok_i}: {e}"))?;
+                    // ADR-038 G4-CFA-5f: router norm/proj read MoE-only weights
+                    // that are 1-element placeholders on dense GGUFs. Skip both.
+                    if num_experts > 0 {
+                        s.rms_norm(reg, metal_dev,
+                            &self.activations.residual,
+                            &self.layers[layer_idx].moe.router_combined_weight,
+                            &self.activations.router_norm_out,
+                            &self.activations.norm_params, 1, hs as u32,
+                        ).map_err(|e| anyhow::anyhow!("prefill router norm L{layer_idx} T{tok_i}: {e}"))?;
+                    }
 
-                    // B9: gate + up + router [3 concurrent]
-                    s.barrier_between(
-                        &[&self.activations.norm_out, &self.activations.router_norm_out],
-                        &[&self.activations.mlp_gate, &self.activations.mlp_up,
-                          &self.activations.moe_router_logits],
-                    );
+                    // B9: gate + up + (router if MoE) [2 or 3 concurrent]
+                    if num_experts > 0 {
+                        s.barrier_between(
+                            &[&self.activations.norm_out, &self.activations.router_norm_out],
+                            &[&self.activations.mlp_gate, &self.activations.mlp_up,
+                              &self.activations.moe_router_logits],
+                        );
+                    } else {
+                        s.barrier_between(
+                            &[&self.activations.norm_out],
+                            &[&self.activations.mlp_gate, &self.activations.mlp_up],
+                        );
+                    }
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                         &self.layers[layer_idx].mlp.gate_proj, &mut self.activations.mlp_gate, 1,
                         crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_gate", layer: layer_idx })?;
                     dispatch_qmatmul(&mut s, reg, dev, &self.activations.norm_out,
                         &self.layers[layer_idx].mlp.up_proj, &mut self.activations.mlp_up, 1,
                         crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_up", layer: layer_idx })?;
-                    dispatch_qmatmul(&mut s, reg, dev, &self.activations.router_norm_out,
-                        &self.layers[layer_idx].moe.router_proj,
-                        &mut self.activations.moe_router_logits, 1,
-                        crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_gate_inp", layer: layer_idx })?;
+                    if num_experts > 0 {
+                        dispatch_qmatmul(&mut s, reg, dev, &self.activations.router_norm_out,
+                            &self.layers[layer_idx].moe.router_proj,
+                            &mut self.activations.moe_router_logits, 1,
+                            crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_gate_inp", layer: layer_idx })?;
+                    }
 
-                    // B10: gelu_mul + moe_routing [2 concurrent]
-                    s.barrier_between(
-                        &[&self.activations.mlp_gate, &self.activations.mlp_up,
-                          &self.activations.moe_router_logits],
-                        &[&self.activations.mlp_fused,
-                          &self.activations.moe_expert_ids, &self.activations.moe_routing_weights_gpu],
-                    );
+                    // B10: gelu_mul (+ moe_routing if MoE)
+                    if num_experts > 0 {
+                        s.barrier_between(
+                            &[&self.activations.mlp_gate, &self.activations.mlp_up,
+                              &self.activations.moe_router_logits],
+                            &[&self.activations.mlp_fused,
+                              &self.activations.moe_expert_ids, &self.activations.moe_routing_weights_gpu],
+                        );
+                    } else {
+                        s.barrier_between(
+                            &[&self.activations.mlp_gate, &self.activations.mlp_up],
+                            &[&self.activations.mlp_fused],
+                        );
+                    }
                     {
                         use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
                         let n_elements_bytes = (self.intermediate_size as u32).to_ne_bytes();
@@ -1569,19 +1600,22 @@ impl MlxModelWeights {
                                 std::cmp::min(256, self.intermediate_size as u64), 1, 1),
                         );
                     }
-                    mlx_native::ops::fused_norm_add::dispatch_fused_moe_routing_f32(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_router_logits,
-                        &self.activations.moe_expert_ids,
-                        &self.activations.moe_routing_weights_gpu,
-                        &self.layers[layer_idx].moe.per_expert_scale,
-                        num_experts as u32, top_k as u32,
-                    ).map_err(|e| anyhow::anyhow!("prefill MoE routing L{layer_idx} T{tok_i}: {e}"))?;
+                    if num_experts > 0 {
+                        mlx_native::ops::fused_norm_add::dispatch_fused_moe_routing_f32(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.moe_router_logits,
+                            &self.activations.moe_expert_ids,
+                            &self.activations.moe_routing_weights_gpu,
+                            &self.layers[layer_idx].moe.per_expert_scale,
+                            num_experts as u32, top_k as u32,
+                        ).map_err(|e| anyhow::anyhow!("prefill MoE routing L{layer_idx} T{tok_i}: {e}"))?;
+                    }
 
-                    // MoE expert dispatch (fused _id path)
+                    // MoE expert dispatch (fused _id path) — MoE only
                     let moe_int = self.layers[layer_idx].moe.moe_intermediate_size;
-                    if self.layers[layer_idx].moe.stacked_gate_up.is_none()
-                        || self.layers[layer_idx].moe.stacked_down.is_none()
+                    if num_experts > 0
+                        && (self.layers[layer_idx].moe.stacked_gate_up.is_none()
+                            || self.layers[layer_idx].moe.stacked_down.is_none())
                     {
                         anyhow::bail!("Prefill requires fused _id path (stacked weights) at L{layer_idx}");
                     }
@@ -1595,64 +1629,66 @@ impl MlxModelWeights {
                         &self.layers[layer_idx].mlp.down_proj, &mut self.activations.mlp_down, 1,
                         crate::quantize::imatrix::ImatrixHint::Layered { tag: "ffn_down", layer: layer_idx })?;
 
-                    let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
-                    s.barrier_between(
-                        &[&self.activations.moe_norm_out, &self.activations.moe_expert_ids,
-                          self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap()],
-                        &[&self.activations.moe_gate_up_id_out],
-                    );
-                    s.quantized_matmul_id_ggml(
-                        reg, dev,
-                        &self.activations.moe_norm_out,
-                        self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
-                        &self.activations.moe_expert_ids,
-                        &mut self.activations.moe_gate_up_id_out,
-                        &mlx_native::GgmlQuantizedMatmulIdParams {
-                            n_tokens: 1,
-                            top_k: top_k as u32,
-                            n: (2 * moe_int) as u32,
-                            k: hs as u32,
-                            n_experts: num_experts as u32,
-                            expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
-                            ggml_type: ggml_type_gu,
-                        },
-                    ).map_err(|e| anyhow::anyhow!("prefill gate_up_id L{layer_idx} T{tok_i}: {e}"))?;
+                    if num_experts > 0 {
+                        let ggml_type_gu = self.layers[layer_idx].moe.gate_up_ggml_dtype;
+                        s.barrier_between(
+                            &[&self.activations.moe_norm_out, &self.activations.moe_expert_ids,
+                              self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap()],
+                            &[&self.activations.moe_gate_up_id_out],
+                        );
+                        s.quantized_matmul_id_ggml(
+                            reg, dev,
+                            &self.activations.moe_norm_out,
+                            self.layers[layer_idx].moe.stacked_gate_up.as_ref().unwrap(),
+                            &self.activations.moe_expert_ids,
+                            &mut self.activations.moe_gate_up_id_out,
+                            &mlx_native::GgmlQuantizedMatmulIdParams {
+                                n_tokens: 1,
+                                top_k: top_k as u32,
+                                n: (2 * moe_int) as u32,
+                                k: hs as u32,
+                                n_experts: num_experts as u32,
+                                expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
+                                ggml_type: ggml_type_gu,
+                            },
+                        ).map_err(|e| anyhow::anyhow!("prefill gate_up_id L{layer_idx} T{tok_i}: {e}"))?;
 
-                    // B12: swiglu
-                    s.barrier_between(
-                        &[&self.activations.moe_gate_up_id_out],
-                        &[&self.activations.moe_swiglu_id_out],
-                    );
-                    mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_gate_up_id_out,
-                        &self.activations.moe_swiglu_id_out,
-                        moe_int, top_k,
-                    ).map_err(|e| anyhow::anyhow!("prefill swiglu L{layer_idx} T{tok_i}: {e}"))?;
+                        // B12: swiglu
+                        s.barrier_between(
+                            &[&self.activations.moe_gate_up_id_out],
+                            &[&self.activations.moe_swiglu_id_out],
+                        );
+                        mlx_native::ops::moe_dispatch::moe_swiglu_batch_encode(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.moe_gate_up_id_out,
+                            &self.activations.moe_swiglu_id_out,
+                            moe_int, top_k,
+                        ).map_err(|e| anyhow::anyhow!("prefill swiglu L{layer_idx} T{tok_i}: {e}"))?;
 
-                    // B13: down_id + post-FF norm1
-                    let ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
-                    s.barrier_between(
-                        &[&self.activations.moe_swiglu_id_out, &self.activations.moe_expert_ids,
-                          self.layers[layer_idx].moe.stacked_down.as_ref().unwrap()],
-                        &[&self.activations.moe_down_id_out],
-                    );
-                    s.quantized_matmul_id_ggml(
-                        reg, dev,
-                        &self.activations.moe_swiglu_id_out,
-                        self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
-                        &self.activations.moe_expert_ids,
-                        &mut self.activations.moe_down_id_out,
-                        &mlx_native::GgmlQuantizedMatmulIdParams {
-                            n_tokens: top_k as u32,
-                            top_k: 1,
-                            n: hs as u32,
-                            k: moe_int as u32,
-                            n_experts: num_experts as u32,
-                            expert_stride: self.layers[layer_idx].moe.down_expert_stride,
-                            ggml_type: ggml_type_dn,
-                        },
-                    ).map_err(|e| anyhow::anyhow!("prefill down_id L{layer_idx} T{tok_i}: {e}"))?;
+                        // B13: down_id
+                        let ggml_type_dn = self.layers[layer_idx].moe.down_ggml_dtype;
+                        s.barrier_between(
+                            &[&self.activations.moe_swiglu_id_out, &self.activations.moe_expert_ids,
+                              self.layers[layer_idx].moe.stacked_down.as_ref().unwrap()],
+                            &[&self.activations.moe_down_id_out],
+                        );
+                        s.quantized_matmul_id_ggml(
+                            reg, dev,
+                            &self.activations.moe_swiglu_id_out,
+                            self.layers[layer_idx].moe.stacked_down.as_ref().unwrap(),
+                            &self.activations.moe_expert_ids,
+                            &mut self.activations.moe_down_id_out,
+                            &mlx_native::GgmlQuantizedMatmulIdParams {
+                                n_tokens: top_k as u32,
+                                top_k: 1,
+                                n: hs as u32,
+                                k: moe_int as u32,
+                                n_experts: num_experts as u32,
+                                expert_stride: self.layers[layer_idx].moe.down_expert_stride,
+                                ggml_type: ggml_type_dn,
+                            },
+                        ).map_err(|e| anyhow::anyhow!("prefill down_id L{layer_idx} T{tok_i}: {e}"))?;
+                    }
 
                     s.barrier_between(
                         &[&self.activations.mlp_down],
@@ -1665,18 +1701,21 @@ impl MlxModelWeights {
                         &self.activations.norm_params, 1, hs as u32,
                     ).map_err(|e| anyhow::anyhow!("prefill post-FF1 L{layer_idx} T{tok_i}: {e}"))?;
 
-                    // B14: weighted_sum
-                    s.barrier_between(
-                        &[&self.activations.moe_down_id_out, &self.activations.moe_routing_weights_gpu],
-                        &[&self.activations.moe_accum],
-                    );
-                    mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
-                        s.encoder_mut(), reg, metal_dev,
-                        &self.activations.moe_down_id_out,
-                        &self.activations.moe_routing_weights_gpu,
-                        &self.activations.moe_accum,
-                        hs, top_k,
-                    ).map_err(|e| anyhow::anyhow!("prefill weighted_sum L{layer_idx} T{tok_i}: {e}"))?;
+                    // B14: weighted_sum — MoE only. On dense, moe_accum was
+                    // zeroed once before the per-token loop (G4-CFA-5f).
+                    if num_experts > 0 {
+                        s.barrier_between(
+                            &[&self.activations.moe_down_id_out, &self.activations.moe_routing_weights_gpu],
+                            &[&self.activations.moe_accum],
+                        );
+                        mlx_native::ops::moe_dispatch::moe_weighted_sum_encode(
+                            s.encoder_mut(), reg, metal_dev,
+                            &self.activations.moe_down_id_out,
+                            &self.activations.moe_routing_weights_gpu,
+                            &self.activations.moe_accum,
+                            hs, top_k,
+                        ).map_err(|e| anyhow::anyhow!("prefill weighted_sum L{layer_idx} T{tok_i}: {e}"))?;
+                    }
 
                     // Post-FF norm2 + combine
                     s.barrier_between(
