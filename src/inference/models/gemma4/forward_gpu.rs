@@ -2285,10 +2285,20 @@ impl MlxModelWeights {
                     let max_abs = h_slice.iter()
                         .filter(|x| x.is_finite())
                         .fold(0.0f32, |acc, x| acc.max(x.abs()));
+                    // ADR-038 CFA-5e: dump pos=0 AND pos=LAST so per-position
+                    // bisection is possible (prior version only showed pos=0
+                    // which is IDENTICAL across N for the same input token —
+                    // useless for finding where pos≥1 diverges).
+                    let pos0_first5: Vec<f32> = h_slice[..5.min(h_slice.len())].to_vec();
+                    let last_pos_start = h_slice.len().saturating_sub(h);
+                    let last_first5: Vec<f32> = h_slice[last_pos_start..last_pos_start + 5.min(h)].to_vec();
+                    let last_max_abs = h_slice[last_pos_start..].iter()
+                        .filter(|x| x.is_finite())
+                        .fold(0.0f32, |acc, x| acc.max(x.abs()));
                     eprintln!(
-                        "[g4-nan-debug] post-layer-{layer_idx} ({:?}): finite={} nan={} inf={} max_abs={:.3e} first5={:?}",
+                        "[g4-nan-debug] post-layer-{layer_idx} ({:?}): finite={} nan={} inf={} max_abs={:.3e} pos0_first5={:?} last_max_abs={:.3e} last_first5={:?}",
                         lw.layer_type, n_finite, n_nan, n_inf, max_abs,
-                        &h_slice[..5.min(h_slice.len())]
+                        pos0_first5, last_max_abs, last_first5,
                     );
                 }
             }
