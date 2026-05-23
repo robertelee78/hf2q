@@ -1940,6 +1940,90 @@ mod g4_cfa5_redhatai_smoke {
         }
     }
 
+    /// G4-CFA-5e step 2 diagnostic: run `forward_tree_verify_gpu_with_cache`
+    /// at varying tree_seq_len (m) values on the SAME prompt context to test
+    /// whether the lm_head's wrong-argmax (240017) is m-specific.
+    ///
+    /// Hypothesis: production `dispatch_qmatmul` at m=1 uses the pre-baked
+    /// Q6_K NR2 fast path (dispatch_qmatmul.rs:632-651) which is heavily
+    /// tested in production decode. At m=6 (prefill), it falls into the
+    /// regular mv kernel (m ≤ MM_ROUTING_THRESHOLD=8). If argmax differs
+    /// between m=1 and m=6, the bug is the regular mv kernel at m∈[2,8] for
+    /// Q6_K weights at vocab=262144 shape — production has never validated
+    /// this codepath because it never feeds m>1 to the same lm_head weight
+    /// (decode is always m=1, prefill is per-token loop also m=1).
+    #[test]
+    fn g4_cfa5e_lm_head_m_dependency_2026_05_23() {
+        let gguf_path = match resolve_path("HF2Q_GEMMA4_31B_GGUF", DEFAULT_GGUF) {
+            Some(p) => p,
+            None => { eprintln!("[g4_cfa5e-m SKIP] no GGUF"); return; }
+        };
+        let mut gpu = match GpuContext::new() {
+            Ok(g) => g,
+            Err(e) => { eprintln!("[g4_cfa5e-m SKIP] no Metal: {e}"); return; }
+        };
+        let gguf = mlx_native::gguf::GgufFile::open(&gguf_path)
+            .unwrap_or_else(|e| panic!("[g4_cfa5e-m] open: {e}"));
+        let cfg = Gemma4Config::from_gguf(&gguf)
+            .unwrap_or_else(|e| panic!("[g4_cfa5e-m] cfg: {e}"));
+        let mut progress = LoadProgress::new(false, 0, 0);
+        let weights = MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut gpu, &mut progress)
+            .unwrap_or_else(|e| panic!("[g4_cfa5e-m] load: {e}"));
+
+        let tokenizer_path = gguf_path.parent().unwrap().join("tokenizer.json");
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .unwrap_or_else(|e| panic!("[g4_cfa5e-m] tokenizer: {e}"));
+
+        // Run forward_tree_verify_gpu_with_cache at varying prefix_len = 0
+        // tree_seq_len = N (causal mask) and report argmax of last position.
+        // N=1 hits Q6_K NR2 m=1 fast path in lm_head; N=6 hits regular mv;
+        // N=10 hits mm (or F16 shadow).
+        for &n in &[1usize, 2, 4, 6, 8, 10] {
+            let text = "The capital city of France is";
+            let enc = tokenizer.encode(text, true).expect("encode");
+            let full_tokens: Vec<u32> = enc.get_ids().to_vec();
+            let tokens: Vec<u32> = full_tokens.iter().cycle().take(n).copied().collect();
+            let kv_capacity = 64;
+            let mut kv_caches = weights
+                .alloc_tree_verify_kv_caches(&gpu.device().clone(), kv_capacity)
+                .unwrap_or_else(|e| panic!("[g4_cfa5e-m] alloc kv: {e}"));
+            // Causal mask N×N: ATTENDED=0.0 for r >= c, MASKED=-65504.0 otherwise.
+            let mut mask = vec![-65504.0f32; n * n];
+            for r in 0..n {
+                for c in 0..=r {
+                    mask[r * n + c] = 0.0;
+                }
+            }
+            let positions: Vec<u32> = (0..n as u32).collect();
+            let mut collector = crate::inference::spec_decode::eagle3::multi_layer_hidden::Eagle3HiddenCollector::new(
+                vec![2usize, 30, 57], n, weights.hidden_size,
+            ).expect("collector");
+            let logits = weights
+                .forward_tree_verify_gpu_with_cache(
+                    &tokens, &mask, &positions, 0, kv_capacity,
+                    &mut gpu, &mut kv_caches, &mut collector,
+                )
+                .unwrap_or_else(|e| panic!("[g4_cfa5e-m] forward N={n}: {e}"));
+            // Argmax of LAST position (index n-1).
+            let vocab = weights.vocab_size;
+            let last_row = &logits[(n - 1) * vocab..n * vocab];
+            let (best_idx, best_val) = last_row
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                    if v > bv { (i, v) } else { (bi, bv) }
+                });
+            let decoded = tokenizer.decode(&[best_idx as u32], true).unwrap_or_else(|_| "?".to_string());
+            // Find top-3 logits
+            let mut top3: Vec<(usize, f32)> = last_row.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            top3.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!(
+                "[g4_cfa5e-m] N={n} argmax_idx={best_idx} val={best_val:.4} decoded={decoded:?} top3={:?}",
+                top3.iter().take(3).map(|(i, v)| (*i, *v)).collect::<Vec<_>>()
+            );
+        }
+    }
+
     /// G4-CFA-5e diagnostic: run production `forward_prefill` on the same
     /// dense Gemma 4 31B GGUF + same prompt as Layer B. If production
     /// returns a Paris-related token (not 240017 "額"), the kernel-level
