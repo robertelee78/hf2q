@@ -119,6 +119,18 @@ pub struct Qwen35MoeFullCtx {
     /// Detected from `config.json::architectures` at orchestrator
     /// init.
     pub multimodal_wrapping: bool,
+
+    /// Drop the MTP (Multi-Token-Prediction / NextN) block at
+    /// `blk.{num_hidden_layers}.*` from the emitted GGUF. Set via
+    /// the `HF2Q_QWEN35_DROP_MTP=1` env at convert time. Workaround
+    /// for stock llama.cpp which expects all blocks (including the
+    /// MTP block) to share the linear-attention slot layout and bails
+    /// with `missing tensor 'blk.{N}.ssm_conv1d.weight'` otherwise.
+    /// When set: (a) `mtp.*` source tensors map to `Drop`, (b)
+    /// `block_count` metadata omits the MTP block, (c)
+    /// `nextn_predict_layers` metadata is not emitted. Strips MTP
+    /// inference capability from the resulting file.
+    pub drop_mtp: bool,
 }
 
 impl Qwen35MoeFullCtx {
@@ -218,6 +230,11 @@ pub fn map_tensor_name(
 
     // ---- MTP family ---------------------------------------------------
     if let Some(rest) = canonical_ref.strip_prefix("mtp.") {
+        if ctx.drop_mtp {
+            // HF2Q_QWEN35_DROP_MTP=1: skip the MTP block entirely so
+            // stock llama.cpp can load the file. See `Qwen35MoeFullCtx::drop_mtp`.
+            return Some(MappedTensor::Drop);
+        }
         return map_mtp(rest, hf_shape, ctx);
     }
 
@@ -764,10 +781,15 @@ pub fn build_metadata(
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
         .expect("config missing num_hidden_layers") as u32;
-    let n_mtp = text
+    let n_mtp_raw = text
         .get("mtp_num_hidden_layers")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
+    // HF2Q_QWEN35_DROP_MTP=1 strips MTP block from emitted GGUF; reflect
+    // the strip in block_count + nextn_predict_layers metadata so stock
+    // llama.cpp's create_tensor loop terminates at num_hidden_layers and
+    // doesn't expect blk.{num_hidden_layers}.ssm_conv1d.weight.
+    let n_mtp = if ctx.drop_mtp { 0 } else { n_mtp_raw };
     let n_layers = n_layers_base + n_mtp;
     let n_head = text
         .get("num_attention_heads")
@@ -1028,6 +1050,7 @@ mod tests {
             linear_key_head_dim: 128,
             linear_value_head_dim: 128,
             multimodal_wrapping: true,
+            drop_mtp: false,
         }
     }
 

@@ -511,11 +511,14 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
                     data.tensor_pair_count()
                 );
             }
-            // Hold the imatrix data alive through the convert run; the P4b
-            // wiring (per-tensor row weighting) consumes it. For Phase A
-            // the policy layer's ABI accepts it via `new_with_imatrix`'s
-            // up-front gate only; per-tensor consumption is P4b's job.
-            let _ = imatrix_data; // kept for future wiring; drop at end of scope.
+            // ADR-033 §P4b wiring (SHIPPED 2026-05-22): the loaded imatrix
+            // is threaded through to `quantizer.quantize(..., Some(imatrix))`
+            // via the orchestrator's `with_imatrix` setter. Pre-P4b, this
+            // line read `let _ = imatrix_data;` (silently dropped), so
+            // apex-i-quality produced byte-identical output to apex-quality.
+            // See `[[project-adr033-p4b-unimplemented-2026-05-22]]` for the
+            // empirical SHA256 A/B that surfaced the gap.
+            let imatrix_for_orch = imatrix_data;
 
             // ADR-033 §9 — per-model APEX config override.
             //
@@ -544,7 +547,8 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
                 }
             }
             let ftype = approximate_for_apex(*tier);
-            let orch = ConvertOrchestrator::new_with_apex(ftype, arch, hparams, apex_policy);
+            let orch = ConvertOrchestrator::new_with_apex(ftype, arch, hparams, apex_policy)
+                .with_imatrix(imatrix_for_orch);
             (orch, ftype)
         }
         QuantSelector::ApexCustom(path) => {
@@ -1618,6 +1622,15 @@ fn build_qwen35moe_full_ctx(config: &serde_json::Value) -> Option<Qwen35MoeFullC
         })
         .unwrap_or(false);
 
+    // HF2Q_QWEN35_DROP_MTP=1 (or =true, case-insensitive) — convert-time
+    // workaround for stock llama.cpp's lack of a qwen35 MTP loader. Strips
+    // the MTP block from the emitted GGUF (loses MTP inference). See
+    // `Qwen35MoeFullCtx::drop_mtp`.
+    let drop_mtp = matches!(
+        std::env::var("HF2Q_QWEN35_DROP_MTP").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
+    );
+
     Some(Qwen35MoeFullCtx {
         num_hidden_layers,
         num_experts,
@@ -1628,6 +1641,7 @@ fn build_qwen35moe_full_ctx(config: &serde_json::Value) -> Option<Qwen35MoeFullC
         linear_key_head_dim,
         linear_value_head_dim,
         multimodal_wrapping,
+        drop_mtp,
     })
 }
 

@@ -177,6 +177,14 @@ pub struct ConvertOrchestrator {
     /// Populated by `plan_tensors`. Empty before planning, in plan order
     /// during/after planning. Drained slot-by-slot during streaming.
     planned: Vec<PlannedTensor>,
+    /// ADR-033 §P4b — per-tensor row-importance vectors used by the
+    /// imatrix-aware quantize codepath (Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS,
+    /// ...). `None` for runs without `--imatrix <file>` (or for non-I tiers
+    /// where the policy gate doesn't load one). The orchestrator threads
+    /// the per-tensor slice into `quantizer.quantize(..., Some(imatrix))`
+    /// at `StreamingWriter::stream_tensor`. Built once at convert init by
+    /// `with_imatrix`.
+    imatrix: Option<crate::quantize::imatrix::ImatrixData>,
 }
 
 impl ConvertOrchestrator {
@@ -194,6 +202,7 @@ impl ConvertOrchestrator {
             apex_policy: None,
             metadata: Vec::new(),
             planned: Vec::new(),
+            imatrix: None,
         }
     }
 
@@ -220,7 +229,25 @@ impl ConvertOrchestrator {
             apex_policy: Some(apex_policy),
             metadata: Vec::new(),
             planned: Vec::new(),
+            imatrix: None,
         }
+    }
+
+    /// ADR-033 §P4b — attach an imatrix to this convert run so the
+    /// streaming writer threads per-tensor row-importance vectors into
+    /// `quantizer.quantize(..., Some(imatrix))`. Idempotent setter — call
+    /// once at convert init before `plan_tensors`. `None` overrides any
+    /// previously-set imatrix back to the no-calibration path.
+    ///
+    /// Used by the convert dispatcher when `--imatrix <file>` resolves
+    /// (loaded `ImatrixData`) or when `--imatrix-corpus` computes one
+    /// in-tree. Without P4b's wiring (pre-2026-05-22), `--imatrix` was
+    /// silently dropped at `cli_driver.rs:518` — apex-i-quality produced
+    /// byte-identical output to apex-quality (SHA256 verified). See
+    /// `[[project-adr033-p4b-unimplemented-2026-05-22]]`.
+    pub fn with_imatrix(mut self, imatrix: Option<crate::quantize::imatrix::ImatrixData>) -> Self {
+        self.imatrix = imatrix;
+        self
     }
 
     /// Stage one GGUF metadata KV pair. Written in insertion order
@@ -466,6 +493,7 @@ impl ConvertOrchestrator {
         let Self {
             metadata,
             planned,
+            imatrix,
             ..
         } = self;
 
@@ -490,6 +518,7 @@ impl ConvertOrchestrator {
             writer: w,
             planned,
             next_idx: 0,
+            imatrix,
         })
     }
 }
@@ -504,9 +533,72 @@ pub struct StreamingWriter<W: Write + Seek> {
     writer: GgufWriter<W>,
     planned: Vec<PlannedTensor>,
     next_idx: usize,
+    /// ADR-033 §P4b — optional imatrix data for per-tensor row-importance
+    /// weighting at `quantizer.quantize`. Looked up per tensor by name in
+    /// `tensor_imatrix`. None for non-i-tier convert runs.
+    imatrix: Option<crate::quantize::imatrix::ImatrixData>,
 }
 
 impl<W: Write + Seek> StreamingWriter<W> {
+    /// ADR-033 §P4b — look up the per-tensor row-importance vector for
+    /// `tensor_name` from the attached imatrix, or return `None` if (a)
+    /// no imatrix is attached, (b) this tensor wasn't intercepted during
+    /// imatrix collection, or (c) the recorded `n_per_row` doesn't match
+    /// the planned tensor's inner dim (defensive — would indicate an
+    /// imatrix/model mismatch).
+    ///
+    /// **Aggregation policy** (matches what most quantizers consume —
+    /// `quantize_row_X(src, dst, n_per_row, imatrix)` reuses the same
+    /// `imatrix` pointer for every row of the tensor):
+    ///
+    /// - **Dense** (`n_mat == 1`): return `Accumulator.values[..n_per_row]`
+    ///   as-is. The accumulator stores sum-of-squared-activations per
+    ///   column; llama-quant.cpp passes these raw to the K-quant kernel,
+    ///   which then combines them with `sqrt(sigma2 + x_l²)` per-block.
+    /// - **MoE** (`n_mat > 1`, e.g. `ffn_*_exps` for Qwen MoE): sum
+    ///   per-column across all experts, divide by total token count, to
+    ///   produce a single n_per_row importance vector that's then reused
+    ///   per row. This loses per-expert specificity vs. llama.cpp's
+    ///   `quantize_row_id` path but is the simplest correct first-cut for
+    ///   the row-uniform quantize() signature; a future iter could thread
+    ///   per-mat slices through if measurement justifies it.
+    fn tensor_imatrix(&self, tensor_name: &str, n_per_row: usize) -> Option<Vec<f32>> {
+        let data = self.imatrix.as_ref()?;
+        let acc = data.loaded.registry.get(tensor_name)?;
+        if acc.n_per_row != n_per_row {
+            // Defensive: imatrix recorded a different inner dim than the
+            // planned tensor expects. Skip rather than emit silently-wrong
+            // calibration. Future P4b iter could surface this as a typed
+            // ImatrixError.
+            return None;
+        }
+        if acc.n_mat == 0 || acc.values.is_empty() {
+            return None;
+        }
+        if acc.n_mat == 1 {
+            // Dense — `values` is already shaped [n_per_row].
+            return Some(acc.values[..n_per_row].to_vec());
+        }
+        // MoE — `values` is laid out as `[n_per_row * n_mat]` per
+        // `accumulator.rs:54-58` (mat_id-major). Aggregate per column.
+        let total_counts: i64 = acc.counts.iter().copied().sum();
+        if total_counts <= 0 {
+            return None;
+        }
+        let mut agg = vec![0.0_f32; n_per_row];
+        for mat in 0..acc.n_mat {
+            let base = mat * n_per_row;
+            for j in 0..n_per_row {
+                agg[j] += acc.values[base + j];
+            }
+        }
+        let inv_total = 1.0_f32 / (total_counts as f32);
+        for v in agg.iter_mut() {
+            *v *= inv_total;
+        }
+        Some(agg)
+    }
+
     /// Number of tensors remaining to stream.
     pub fn tensors_remaining(&self) -> usize {
         self.planned.len() - self.next_idx
@@ -599,7 +691,18 @@ impl<W: Write + Seek> StreamingWriter<W> {
                 // characteristic needs a real profiler to localize, not
                 // blind hypothesis-testing — see ADR-033 perf section.
                 let f16_rt: Vec<f32> = data.iter().map(|&x| f16::from_f32(x).to_f32()).collect();
-                quantizer.quantize(&f16_rt, p.n_per_row, None)?
+                // ADR-033 §P4b — pass per-tensor row-importance to the
+                // imatrix-aware quantize codepath when the convert run has
+                // `--imatrix <file>` (or equivalent) attached. Pre-P4b, this
+                // call hardcoded `None` and apex-i-quality produced
+                // byte-identical output to apex-quality. The aggregation
+                // policy mirrors llama-quant.cpp's `imatrix_data->at(name)`
+                // semantics: dense tensors take values directly; MoE
+                // tensors sum-across-experts and divide by total counts
+                // (one importance vector per tensor — the quantizer dispatch
+                // reuses the same pointer per row).
+                let imatrix_vec = self.tensor_imatrix(&p.name, p.n_per_row);
+                quantizer.quantize(&f16_rt, p.n_per_row, imatrix_vec.as_deref())?
             }
         };
 
@@ -1354,5 +1457,426 @@ mod tests {
         let gguf = mlx_native::gguf::GgufFile::open(tmp.path()).expect("parse");
         assert_eq!(gguf.tensor_count(), 0);
         assert_eq!(gguf.metadata_count(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // ADR-033 §P4b regression tests
+    //
+    // These tests pin the invariant that the convert orchestrator
+    // actually applies attached `ImatrixData` to the quantizer dispatch.
+    // The bug discovered 2026-05-22 — apex-i-quality producing
+    // byte-identical output to apex-quality — would have been caught
+    // pre-ship if any test asserted that an `--imatrix`-driven convert
+    // byte-DIFFERS from a no-imatrix convert.
+    //
+    // The fix landed in this file (line 602 + `tensor_imatrix` helper)
+    // and in `cli_driver.rs` (line 518 region). See
+    // `[[project-adr033-p4b-shipped-2026-05-22]]`.
+    // ----------------------------------------------------------------
+
+    /// Build a synthetic `ImatrixData` for a single dense weight tensor.
+    /// Avoids GGUF round-trip — just constructs the in-memory shape that
+    /// `StreamingWriter::tensor_imatrix` expects.
+    fn make_dense_imatrix(
+        tensor_name: &str,
+        n_per_row: usize,
+        seed: u32,
+    ) -> crate::quantize::imatrix::ImatrixData {
+        let mut registry = crate::quantize::imatrix::AccumulatorRegistry::new();
+        let acc = registry
+            .register(tensor_name, n_per_row, 1)
+            .expect("register accumulator");
+        // Two absorbed rows so counts[0] = 2 — exercises the `total_counts`
+        // path even though dense aggregation is just pass-through.
+        let row1 = deterministic_data(n_per_row, seed);
+        let row2 = deterministic_data(n_per_row, seed.wrapping_add(1));
+        acc.absorb_dense(&row1).expect("absorb 1");
+        acc.absorb_dense(&row2).expect("absorb 2");
+
+        let loaded = crate::quantize::imatrix::LoadedImatrix {
+            source_path: "<synthetic>".into(),
+            datasets: vec!["test".into()],
+            chunk_count: 1,
+            chunk_size: 512,
+            registry,
+        };
+        crate::quantize::imatrix::ImatrixData {
+            loaded,
+            provenance: crate::quantize::imatrix::ImatrixProvenance::Computed {
+                corpus_label: "test".into(),
+                n_ctx: 512,
+            },
+        }
+    }
+
+    /// Build a synthetic MoE `ImatrixData` — accumulator with n_mat > 1.
+    /// Exercises `tensor_imatrix`'s MoE aggregation branch (sum-across-mats,
+    /// divide by total counts) instead of the dense pass-through.
+    fn make_moe_imatrix(
+        tensor_name: &str,
+        n_per_row: usize,
+        n_experts: usize,
+        seed: u32,
+    ) -> crate::quantize::imatrix::ImatrixData {
+        let mut registry = crate::quantize::imatrix::AccumulatorRegistry::new();
+        let acc = registry
+            .register(tensor_name, n_per_row, n_experts)
+            .expect("register MoE accumulator");
+        // Absorb one row per expert so counts[expert] = 1 for all experts.
+        for expert_id in 0..n_experts {
+            let row = deterministic_data(n_per_row, seed.wrapping_add(expert_id as u32));
+            acc.absorb_moe(expert_id, &row).expect("absorb moe");
+        }
+        let loaded = crate::quantize::imatrix::LoadedImatrix {
+            source_path: "<synthetic-moe>".into(),
+            datasets: vec!["test-moe".into()],
+            chunk_count: 1,
+            chunk_size: 512,
+            registry,
+        };
+        crate::quantize::imatrix::ImatrixData {
+            loaded,
+            provenance: crate::quantize::imatrix::ImatrixProvenance::Computed {
+                corpus_label: "test-moe".into(),
+                n_ctx: 512,
+            },
+        }
+    }
+
+    /// Direct quantizer A/B at Q4_K: same input, same n_per_row, two
+    /// `quantize()` calls differing only in whether imatrix is passed.
+    /// Establishes that the underlying quantizer kernel actually
+    /// produces different output bytes when imatrix is `Some` — i.e.
+    /// the imatrix-aware path exists and is observable.
+    ///
+    /// Pre-P4b the orchestrator's `stream_tensor` short-circuited this
+    /// distinction (always passed `None`), so this kernel-level
+    /// difference was never reachable at the convert-API level. With
+    /// P4b wired, the orchestrator threads the imatrix through to
+    /// `quantizer.quantize` — making the kernel-level diff visible
+    /// end-to-end.
+    ///
+    /// Uses realistic activation magnitudes (large positive sum-of-squares
+    /// values) to ensure the K-quant's `sqrt(sigma2 + x²) * qw` weighting
+    /// produces a different scale-selection vs. the no-imatrix path.
+    /// Small magnitudes can mask the difference because the weighting
+    /// degenerates toward uniform.
+    #[test]
+    fn p4b_q4_k_quantize_differs_with_vs_without_imatrix() {
+        use crate::quantize::ggml_quants::ggml_type::GgmlType;
+        use crate::quantize::ggml_quants::quantizer::quantizer_for;
+
+        // Q4_K's QK_K = 256 → use n_per_row = 256 (one super-block per row).
+        let n_per_row = 256usize;
+        // Weights mimicking realistic LLM activations: a mix of small
+        // and large magnitudes so the per-block scale search is non-trivial.
+        let weights: Vec<f32> = (0..n_per_row)
+            .map(|i| {
+                let phase = (i as f32) * 0.371;
+                phase.sin() * 0.1 + ((i as f32) * 1.7e-3).cos() * 0.05
+            })
+            .collect();
+        // Importance vector with strong variation across columns — a real
+        // imatrix's sum-of-squared-activations has heavy tails (some columns
+        // ≫ others), so the weighting `sqrt(sigma2 + x²) * qw` reorders
+        // the per-block scale optimum.
+        let imatrix: Vec<f32> = (0..n_per_row)
+            .map(|i| {
+                let bucket = i % 16;
+                match bucket {
+                    0 => 100.0,
+                    1..=3 => 10.0,
+                    _ => 1.0,
+                }
+            })
+            .collect();
+
+        let q4k = quantizer_for(GgmlType::Q4_K).expect("Q4_K quantizer");
+
+        let bytes_no_imatrix = q4k
+            .quantize(&weights, n_per_row, None)
+            .expect("quantize no-imatrix");
+        let bytes_with_imatrix = q4k
+            .quantize(&weights, n_per_row, Some(&imatrix))
+            .expect("quantize with-imatrix");
+
+        assert_eq!(
+            bytes_no_imatrix.len(),
+            bytes_with_imatrix.len(),
+            "Q4_K block size invariant"
+        );
+        assert_ne!(
+            bytes_no_imatrix, bytes_with_imatrix,
+            "ADR-033 §P4b smoke: Q4_K quantizer's imatrix-aware path \
+             must produce different output bytes when imatrix is Some(non-trivial-values). \
+             If this test fails, the K-quant kernel itself isn't honoring the imatrix \
+             argument (independent of orchestrator wiring)."
+        );
+    }
+
+    /// End-to-end regression: orchestrator's `stream_tensor` reaches the
+    /// quantizer with `Some(imatrix)` when one is attached via
+    /// `with_imatrix`. Constructs two convert runs over the SAME tensor
+    /// data + ftype, differing only in imatrix attachment, and verifies
+    /// the produced GGUF bytes differ.
+    ///
+    /// Pre-P4b (2026-05-22 vaporware) these were byte-identical because
+    /// `orchestrator.rs:602` hardcoded `imatrix=None`. Post-P4b they
+    /// MUST differ. If this test ever fails, P4b's wiring has regressed.
+    #[test]
+    fn p4b_orchestrator_threads_imatrix_through_to_quantizer() {
+        let n_per_row = 256usize;
+        let tensor_name = "blk.0.ffn_down.weight";
+
+        // Realistic activation magnitudes — see
+        // `p4b_q4_k_quantize_differs_with_vs_without_imatrix` for why.
+        let data: Vec<f32> = (0..n_per_row)
+            .map(|i| {
+                let phase = (i as f32) * 0.371;
+                phase.sin() * 0.1 + ((i as f32) * 1.7e-3).cos() * 0.05
+            })
+            .collect();
+
+        // Build an imatrix with heavy-tailed importance to force a
+        // non-trivial scale-selection diff at the K-quant layer. Direct
+        // construction (not via `make_dense_imatrix`) because we want
+        // imatrix values that are NOT just sum-of-squares of `data`.
+        let mut registry = crate::quantize::imatrix::AccumulatorRegistry::new();
+        let acc = registry.register(tensor_name, n_per_row, 1).expect("register");
+        // Inject a synthetic heavy-tailed activation pattern.
+        let synthetic_row: Vec<f32> = (0..n_per_row)
+            .map(|i| {
+                let bucket = i % 16;
+                match bucket {
+                    0 => 10.0,
+                    1..=3 => 3.16,
+                    _ => 1.0,
+                }
+            })
+            .collect();
+        acc.absorb_dense(&synthetic_row).expect("absorb");
+
+        let imatrix = crate::quantize::imatrix::ImatrixData {
+            loaded: crate::quantize::imatrix::LoadedImatrix {
+                source_path: "<synthetic>".into(),
+                datasets: vec!["test".into()],
+                chunk_count: 1,
+                chunk_size: 512,
+                registry,
+            },
+            provenance: crate::quantize::imatrix::ImatrixProvenance::Computed {
+                corpus_label: "test".into(),
+                n_ctx: 512,
+            },
+        };
+
+        let hparams = HParams {
+            n_expert: 0,
+            n_head: 32,
+            n_head_kv: 8,
+            n_layer: 32,
+            n_mtp_layers: 0,
+        };
+        let entries = || {
+            vec![PlanEntry {
+                name: tensor_name.into(),
+                shape: vec![n_per_row, 1],
+                source_dtype: SourceDtype::F32,
+                layer_index: Some(0),
+            }]
+        };
+
+        // ---- Convert A: no imatrix ----
+        let bytes_no_imatrix = {
+            let mut orch =
+                ConvertOrchestrator::new(LlamaFtype::MostlyQ4_K_M, ArchName::Llama3, hparams);
+            orch.plan_tensors(entries()).expect("plan A");
+            let mut buf = Vec::<u8>::new();
+            {
+                let mut sw = orch
+                    .begin_write(std::io::Cursor::new(&mut buf))
+                    .expect("begin_write A");
+                sw.stream_tensor(0, &data).expect("stream A");
+                sw.finalize().expect("finalize A");
+            }
+            buf
+        };
+
+        // ---- Convert B: same tensor + data, but with imatrix attached ----
+        let bytes_with_imatrix = {
+            let mut orch =
+                ConvertOrchestrator::new(LlamaFtype::MostlyQ4_K_M, ArchName::Llama3, hparams)
+                    .with_imatrix(Some(imatrix));
+            orch.plan_tensors(entries()).expect("plan B");
+            let mut buf = Vec::<u8>::new();
+            {
+                let mut sw = orch
+                    .begin_write(std::io::Cursor::new(&mut buf))
+                    .expect("begin_write B");
+                sw.stream_tensor(0, &data).expect("stream B");
+                sw.finalize().expect("finalize B");
+            }
+            buf
+        };
+
+        assert_eq!(
+            bytes_no_imatrix.len(),
+            bytes_with_imatrix.len(),
+            "P4b byte lengths should match (same ftype, same shape)"
+        );
+        assert_ne!(
+            bytes_no_imatrix, bytes_with_imatrix,
+            "ADR-033 §P4b regression: orchestrator produced byte-identical \
+             output with and without --imatrix attached. The imatrix is \
+             not reaching `quantizer.quantize(..., Some(imatrix))`. Check \
+             `orchestrator.rs:602` and `cli_driver.rs:518` region. \
+             Also verify the policy routed `blk.0.ffn_down.weight` to a \
+             K-quant type that consumes imatrix (Q4_K/Q5_K/Q6_K/IQ4_*)."
+        );
+    }
+
+    /// Pin the `tensor_imatrix` aggregation policy for dense tensors:
+    /// the result must equal the raw `Accumulator.values[..n_per_row]`
+    /// (sum-of-squared activations), since dense `n_mat == 1` and the
+    /// helper returns the slice directly.
+    #[test]
+    fn p4b_tensor_imatrix_dense_returns_raw_values() {
+        let n_per_row = 8usize;
+        let tensor_name = "blk.0.attn_q.weight";
+        let imatrix = make_dense_imatrix(tensor_name, n_per_row, 100);
+
+        // Expected: sum of squares of the two rows we absorbed.
+        let row1 = deterministic_data(n_per_row, 100);
+        let row2 = deterministic_data(n_per_row, 101);
+        let expected: Vec<f32> = (0..n_per_row)
+            .map(|j| row1[j] * row1[j] + row2[j] * row2[j])
+            .collect();
+
+        // Construct an empty StreamingWriter just to exercise the helper.
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ4_K_M,
+            ArchName::Llama3,
+            default_hparams(),
+        )
+        .with_imatrix(Some(imatrix));
+        orch.plan_tensors(Vec::new()).expect("plan empty");
+        let mut buf = Vec::<u8>::new();
+        let sw = orch
+            .begin_write(std::io::Cursor::new(&mut buf))
+            .expect("begin_write");
+
+        let got = sw
+            .tensor_imatrix(tensor_name, n_per_row)
+            .expect("imatrix slice");
+
+        assert_eq!(got.len(), n_per_row);
+        for j in 0..n_per_row {
+            assert!(
+                (got[j] - expected[j]).abs() < 1e-6,
+                "dense imatrix col {j}: got {} expected {}",
+                got[j],
+                expected[j]
+            );
+        }
+    }
+
+    /// Pin the `tensor_imatrix` aggregation policy for MoE tensors:
+    /// the result must equal `(sum over experts of values[expert*npr + j]) / total_counts`.
+    /// This is the row-uniform aggregate that quantize() consumes — losing
+    /// per-expert specificity vs. llama.cpp's quantize_row_id path, but
+    /// the first-cut correct behavior for the current quantize() signature.
+    #[test]
+    fn p4b_tensor_imatrix_moe_aggregates_across_experts() {
+        let n_per_row = 4usize;
+        let n_experts = 3usize;
+        let tensor_name = "blk.0.ffn_gate_exps.weight";
+        let imatrix = make_moe_imatrix(tensor_name, n_per_row, n_experts, 200);
+
+        // Reconstruct expected aggregate. Each expert absorbed exactly
+        // one row (`absorb_moe` increments counts[expert] by 1), so
+        // total_counts = n_experts, and per-column sum of squares.
+        let mut expected = vec![0.0_f32; n_per_row];
+        for expert_id in 0..n_experts {
+            let row = deterministic_data(n_per_row, 200u32.wrapping_add(expert_id as u32));
+            for j in 0..n_per_row {
+                expected[j] += row[j] * row[j];
+            }
+        }
+        let inv_total = 1.0_f32 / (n_experts as f32);
+        for v in expected.iter_mut() {
+            *v *= inv_total;
+        }
+
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ4_K_M,
+            ArchName::Llama3,
+            default_hparams(),
+        )
+        .with_imatrix(Some(imatrix));
+        orch.plan_tensors(Vec::new()).expect("plan empty");
+        let mut buf = Vec::<u8>::new();
+        let sw = orch
+            .begin_write(std::io::Cursor::new(&mut buf))
+            .expect("begin_write");
+
+        let got = sw
+            .tensor_imatrix(tensor_name, n_per_row)
+            .expect("imatrix slice");
+
+        assert_eq!(got.len(), n_per_row);
+        for j in 0..n_per_row {
+            assert!(
+                (got[j] - expected[j]).abs() < 1e-6,
+                "MoE imatrix col {j}: got {} expected {}",
+                got[j],
+                expected[j]
+            );
+        }
+    }
+
+    /// Missing-tensor + wrong-n_per_row both yield `None` — defensive
+    /// fallbacks that prevent silently-wrong calibration when an
+    /// imatrix doesn't match the model being converted.
+    #[test]
+    fn p4b_tensor_imatrix_missing_or_mismatched_returns_none() {
+        let imatrix = make_dense_imatrix("blk.0.attn_q.weight", 16, 7);
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ4_K_M,
+            ArchName::Llama3,
+            default_hparams(),
+        )
+        .with_imatrix(Some(imatrix));
+        orch.plan_tensors(Vec::new()).expect("plan empty");
+        let mut buf = Vec::<u8>::new();
+        let sw = orch
+            .begin_write(std::io::Cursor::new(&mut buf))
+            .expect("begin_write");
+
+        // Wrong tensor name → None.
+        assert!(sw.tensor_imatrix("blk.99.attn_q.weight", 16).is_none());
+        // Right tensor, wrong n_per_row → None (n_per_row mismatch
+        // would otherwise produce silently-wrong calibration).
+        assert!(sw.tensor_imatrix("blk.0.attn_q.weight", 32).is_none());
+        // Sanity: right name + n_per_row returns Some.
+        assert!(sw.tensor_imatrix("blk.0.attn_q.weight", 16).is_some());
+    }
+
+    /// `with_imatrix(None)` (or omitted altogether) yields `None` for
+    /// every lookup — proves the no-imatrix path is intact.
+    #[test]
+    fn p4b_no_imatrix_attached_returns_none_for_everything() {
+        let mut orch = ConvertOrchestrator::new(
+            LlamaFtype::MostlyQ4_K_M,
+            ArchName::Llama3,
+            default_hparams(),
+        );
+        orch.plan_tensors(Vec::new()).expect("plan empty");
+        let mut buf = Vec::<u8>::new();
+        let sw = orch
+            .begin_write(std::io::Cursor::new(&mut buf))
+            .expect("begin_write");
+
+        assert!(sw.tensor_imatrix("blk.0.attn_q.weight", 16).is_none());
+        assert!(sw.tensor_imatrix("blk.0.ffn_down.weight", 256).is_none());
     }
 }
