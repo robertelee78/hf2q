@@ -127,17 +127,18 @@ pub const CHUNK_THRESHOLD: u32 = 64;
 /// - `HF2Q_CHUNK_SCAN_PREFILL=1` is set (with `HF2Q_UNSAFE_EXPERIMENTS=1` ack), AND
 /// - `seq_len > CHUNK_THRESHOLD` (more than one full chunk past the boundary), AND
 /// - `seq_len % FIXED_BT == 0` (chunk pipeline requires `t % bt == 0`), AND
-/// - `d_k == 128` (chunk pipeline's MAX_K is a hard equality at iter 4 — see
-///   `mlx_native::ops::chunk_gated_delta_rule` doc).
+/// - `d_k ∈ {128, 256}` (chunk pipeline supports K=128 natively;
+///   ADR-033 §Pi Task #25 iter 19-22 added K=256 native variants
+///   `chunk_inter_state_bf16_k256` + `chunk_o_bf16_k256` to support
+///   Qwen3.6 head_dim=256).
 ///
 /// All four must hold; any single failure routes to the autoregressive path.
-/// The d_k=128 gate is an iter-4 limitation that future iters will lift via
-/// FLA's b_h1..b_h4 bank-split (see `chunk_gated_delta_rule.rs:113`).
 fn chunk_path_eligible(seq_len: u32, d_k: u32) -> bool {
     INVESTIGATION_ENV.chunk_scan_prefill
         && seq_len > CHUNK_THRESHOLD
         && seq_len % mlx_native::ops::chunk_gated_delta_rule::FIXED_BT == 0
-        && d_k == mlx_native::ops::chunk_gated_delta_rule::MAX_K
+        && (d_k == mlx_native::ops::chunk_gated_delta_rule::MAX_K // 128
+            || d_k == mlx_native::ops::chunk_gated_delta_rule_bank_split::BANK_SPLIT_K) // 256
 }
 
 // ================================================================
@@ -1338,21 +1339,43 @@ pub fn apply_gated_delta_net_chunk(
     // between autoregressive and chunk paths (flat `d_k * d_v * n_v_heads`
     // with d_k fastest), so `state_in` is passed through as `h0` directly
     // and `final_state` lands in our f32 output buffer.
-    dispatch_chunk_gated_delta_rule_fwd(
-        &mut enc,
-        registry,
-        device,
-        &q_bf16,
-        &k_bf16,
-        &v_bf16,
-        &g_log_decay,
-        beta_buf,
-        state_in,
-        &o_bf16,
-        final_state,
-        p,
-    )
-    .map_err(|e| anyhow!("dispatch_chunk_gated_delta_rule_fwd: {e}"))?;
+    //
+    // ADR-033 §Pi Task #25 iter 23 (2026-05-23): route K=256 to the
+    // native K=256 dispatch added by iters 19-22. K=128 continues
+    // through the original dispatch (unchanged path for Qwen3.5).
+    if p.k == mlx_native::ops::chunk_gated_delta_rule_bank_split::BANK_SPLIT_K {
+        mlx_native::ops::chunk_gated_delta_rule_bank_split::dispatch_chunk_gated_delta_rule_fwd_k256_bank_split(
+            &mut enc,
+            registry,
+            device,
+            &q_bf16,
+            &k_bf16,
+            &v_bf16,
+            &g_log_decay,
+            beta_buf,
+            state_in,
+            &o_bf16,
+            final_state,
+            p,
+        )
+        .map_err(|e| anyhow!("dispatch_chunk_gated_delta_rule_fwd_k256: {e}"))?;
+    } else {
+        dispatch_chunk_gated_delta_rule_fwd(
+            &mut enc,
+            registry,
+            device,
+            &q_bf16,
+            &k_bf16,
+            &v_bf16,
+            &g_log_decay,
+            beta_buf,
+            state_in,
+            &o_bf16,
+            final_state,
+            p,
+        )
+        .map_err(|e| anyhow!("dispatch_chunk_gated_delta_rule_fwd: {e}"))?;
+    }
 
     // Barrier: o_bf16 is written by chunk pipeline and read by the cast below.
     enc.memory_barrier();
@@ -1686,12 +1709,28 @@ pub fn apply_gated_delta_net_chunk_with_arena(
     // Stage C: chunk-pipeline orchestrator. final_state lands in the
     // caller-provided buffer (NOT the arena).
     //
-    // ADR-015 iter83: when `chunk_internal_arena` is `Some`, dispatch
-    // the `_with_arena` variant to lift 7 large + 5 small internal
-    // scratches to caller scope. Falls back to non-arena dispatch when
-    // `None` (back-compat with iter78 single-arena callers and the
-    // unit-test path).
-    if let Some(ci_arena) = chunk_internal_arena {
+    // ADR-033 §Pi Task #25 iter 23 (2026-05-23): K=256 routes through
+    // the new K=256 native dispatch. K=256 _with_arena variant deferred
+    // to a follow-up iter — for now K=256 callers fall through to the
+    // non-arena path (~270 MB of internal scratch allocated per call vs
+    // arena-amortized; acceptable for correctness-first wiring).
+    if p.k == mlx_native::ops::chunk_gated_delta_rule_bank_split::BANK_SPLIT_K {
+        mlx_native::ops::chunk_gated_delta_rule_bank_split::dispatch_chunk_gated_delta_rule_fwd_k256_bank_split(
+            &mut enc,
+            registry,
+            device,
+            &arena.q_bf16_buf,
+            &arena.k_bf16_buf,
+            &arena.v_bf16_buf,
+            &arena.g_log_decay_buf,
+            beta_buf,
+            state_in,
+            &arena.o_bf16_buf,
+            final_state,
+            p,
+        )
+        .map_err(|e| anyhow!("dispatch_chunk_gated_delta_rule_fwd_k256 (arena fallback): {e}"))?;
+    } else if let Some(ci_arena) = chunk_internal_arena {
         dispatch_chunk_gated_delta_rule_fwd_with_arena(
             &mut enc,
             registry,
