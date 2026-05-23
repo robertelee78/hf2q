@@ -58,7 +58,7 @@
 | E2 — EAGLE-3 drafter training | ⏳ TODO | — | Multi-week H100 compute |
 | E7 — 3-rep paired empirical validation | ⏳ TODO | — | Target: ≥1.3× on 2K natural + ≥1.5× on long code-gen (blocked on E2 trained weights) |
 | E8 — codex /cfa final + ADR-034 update + merge | ⏳ TODO | — | EAGLE-3 closure |
-| **E9 — HASS / Hydra drafter family (IN-SCOPE; not deferred)** | ⏳ TODO | — | Multiple parallel transformer drafters (3.5× published ceiling). Reuses Qwen35 tree-verify dispatcher + per-layer block from E6. New: parallel-drafter forward orchestration + HASS-specific training recipe + HF2Q_SPEC_DRAFTER={eagle3\|hass} serve flag. See §10. |
+| **E9 — HASS / Hydra drafter family (IN-SCOPE; not deferred)** | 📋 SCOPED → ADR-039 | hf2q `73cec4ee` | Dedicated ADR landed 2026-05-23: see [`docs/ADR-039-hass-hydra-speculative-decoding.md`](./ADR-039-hass-hydra-speculative-decoding.md) for full design (sequential Hydra heads + HASS feature/token consistency losses, joint training, reuse of ADR-037/038 verifier infrastructure, ~2200 Rust LOC inference + ~1500-3000 LOC training, 10-phase H1-H10 sequencing, 6 acceptance criteria). This ADR-037 row tracks dependency closure (E1-E8); empirical results land in ADR-039 H9-H10. |
 
 ## 0. The right thing first
 
