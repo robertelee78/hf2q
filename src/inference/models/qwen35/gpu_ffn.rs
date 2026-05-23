@@ -2756,48 +2756,117 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             expert_stride: weights.expert_up_stride,
             ..gate_params
         };
+
+        // ADR-033 §Pi Task #20 iter 6 — fused MoE gate+up+silu_mul mm_id path
+        // (Q6_K only, prefill only, gated via HF2Q_FUSED_MOE_GATE_UP_MM_ID=1).
+        //
+        // Replaces gate+up dispatches (Phase C) + silu_mul (Phase D) with a
+        // single fused dispatch. h_all_buf becomes the direct output; the
+        // gate_all_buf and up_all_buf scratch buffers are unused (alloc cost
+        // is paid regardless but the device round-trips through them are
+        // eliminated). Phase D silu_mul is skipped when active.
+        //
+        // Eligibility:
+        //   - ggml_type_gate_up == Q6_K (only variant shipped at iter 6)
+        //   - seq_len >= 32 (mm_id tile threshold; mv_id below this and fused
+        //     kernel is mm_id-only)
+        //   - no affine override (affine MoE bypasses pooled mm_id entirely)
+        //   - top_k ∈ {1, 8} (map0 instantiations available)
+        //
+        // Parity gate: tests/adr_033_pi_task20_fused_mm_id_q6_K_parity.rs
+        // (3/3 PASS at <2e-2 tolerance — see test for tolerance breakdown).
+        let fused_moe_mm_id_eligible = seq_len >= 32
+            && matches!(
+                weights.ggml_type_gate_up,
+                mlx_native::ops::quantized_matmul_ggml::GgmlType::Q6_K
+            )
+            && weights.expert_gate_affine.is_none()
+            && weights.expert_up_affine.is_none()
+            && (shape.num_experts_per_tok == 1 || shape.num_experts_per_tok == 8);
+        let fused_moe_mm_id_on = fused_moe_mm_id_eligible
+            && std::env::var("HF2Q_FUSED_MOE_GATE_UP_MM_ID").as_deref() == Ok("1");
+
         let y_s_buf = {
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseCGateUpSharedDown,
             );
-            dispatch_moe_id_routed(
-                enc,
-                registry,
-                device,
-                x,
-                &weights.expert_gate_q,
-                weights.expert_gate_affine.as_ref(),
-                &ids_buf,
-                &mut gate_all_buf,
-                &gate_params,
-                super::decode_pool::MmIdSlot::Gate,
-                ne32,
-                seq_len * shape.num_experts_per_tok,
-                "gate_all",
-                crate::quantize::imatrix::ImatrixHint::Layered {
-                    tag: "ffn_gate_exps",
-                    layer: layer_idx,
-                },
-            )?;
-            dispatch_moe_id_routed(
-                enc,
-                registry,
-                device,
-                x,
-                &weights.expert_up_q,
-                weights.expert_up_affine.as_ref(),
-                &ids_buf,
-                &mut up_all_buf,
-                &up_params,
-                super::decode_pool::MmIdSlot::Up,
-                ne32,
-                seq_len * shape.num_experts_per_tok,
-                "up_all",
-                crate::quantize::imatrix::ImatrixHint::Layered {
-                    tag: "ffn_up_exps",
-                    layer: layer_idx,
-                },
-            )?;
+            if fused_moe_mm_id_on {
+                // ADR-033 §Pi Task #20 iter 6 — fused single dispatch.
+                // imatrix intercept: skip — collection happens on
+                // unfused path; fused path is opt-in for perf-only
+                // serving (no imatrix capture mode interaction).
+                let fused_dispatch_params =
+                    mlx_native::ops::quantized_matmul_id_ggml::GgmlIdMmDispatchParams {
+                        n_tokens: seq_len,
+                        top_k: shape.num_experts_per_tok,
+                        n: m_moe32,
+                        k: h32,
+                        n_experts: ne32,
+                        expert_stride: weights.expert_gate_stride,
+                        ggml_type: weights.ggml_type_gate_up,
+                    };
+                super::decode_pool::with_id_mm_scratch(
+                    super::decode_pool::MmIdSlot::Gate,
+                    device,
+                    ne32,
+                    seq_len * shape.num_experts_per_tok,
+                    |scratch| {
+                        mlx_native::ops::quantized_matmul_id_ggml::dispatch_id_mm_fused_gate_up_silu_for_test(
+                            enc,
+                            registry,
+                            device,
+                            x,
+                            &weights.expert_gate_q,
+                            &weights.expert_up_q,
+                            &ids_buf,
+                            &scratch.htpe,
+                            &scratch.hids,
+                            &h_all_buf, // direct fused output — skip up_all
+                            &fused_dispatch_params,
+                        )
+                    },
+                )
+                .map_err(|e| anyhow!("fused gate_up_silu_mm_id Q6_K: {e}"))?;
+            } else {
+                dispatch_moe_id_routed(
+                    enc,
+                    registry,
+                    device,
+                    x,
+                    &weights.expert_gate_q,
+                    weights.expert_gate_affine.as_ref(),
+                    &ids_buf,
+                    &mut gate_all_buf,
+                    &gate_params,
+                    super::decode_pool::MmIdSlot::Gate,
+                    ne32,
+                    seq_len * shape.num_experts_per_tok,
+                    "gate_all",
+                    crate::quantize::imatrix::ImatrixHint::Layered {
+                        tag: "ffn_gate_exps",
+                        layer: layer_idx,
+                    },
+                )?;
+                dispatch_moe_id_routed(
+                    enc,
+                    registry,
+                    device,
+                    x,
+                    &weights.expert_up_q,
+                    weights.expert_up_affine.as_ref(),
+                    &ids_buf,
+                    &mut up_all_buf,
+                    &up_params,
+                    super::decode_pool::MmIdSlot::Up,
+                    ne32,
+                    seq_len * shape.num_experts_per_tok,
+                    "up_all",
+                    crate::quantize::imatrix::ImatrixHint::Layered {
+                        tag: "ffn_up_exps",
+                        layer: layer_idx,
+                    },
+                )?;
+            }
             // ADR-015 iter7b — pooled (q_into path; y_s_buf flows into
             // dispatch_moe_weighted_reduce, no CPU download).
             proj_pooled(
@@ -2838,17 +2907,21 @@ pub fn build_moe_ffn_layer_gpu_q_into(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseDSilu,
             );
-            dispatch_silu_mul(
-                enc,
-                registry,
-                device.metal_device(),
-                &gate_all_buf,
-                &up_all_buf,
-                &h_all_buf,
-                &silu_params_buf,
-                n_h_all,
-            )
-            .map_err(|e| anyhow!("silu_mul dispatch: {e}"))?;
+            if !fused_moe_mm_id_on {
+                dispatch_silu_mul(
+                    enc,
+                    registry,
+                    device.metal_device(),
+                    &gate_all_buf,
+                    &up_all_buf,
+                    &h_all_buf,
+                    &silu_params_buf,
+                    n_h_all,
+                )
+                .map_err(|e| anyhow!("silu_mul dispatch: {e}"))?;
+            }
+            // When fused_moe_mm_id_on: Phase D is a no-op — silu_mul
+            // was applied in-kernel during Phase C's fused dispatch.
         }
 
         // Barrier D→E: expert_down reads h_all.
@@ -3158,48 +3231,98 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             expert_stride: weights.expert_up_stride,
             ..gate_params
         };
+
+        // ADR-033 §Pi Task #20 iter 6 — fused MoE gate+up+silu_mul mm_id
+        // (Q6_K only, prefill arena variant). See bare-`_into` variant
+        // above for full rationale.
+        let fused_moe_mm_id_eligible_pf = seq_len >= 32
+            && matches!(
+                weights.ggml_type_gate_up,
+                mlx_native::ops::quantized_matmul_ggml::GgmlType::Q6_K
+            )
+            && weights.expert_gate_affine.is_none()
+            && weights.expert_up_affine.is_none()
+            && (shape.num_experts_per_tok == 1 || shape.num_experts_per_tok == 8);
+        let fused_moe_mm_id_on_pf = fused_moe_mm_id_eligible_pf
+            && std::env::var("HF2Q_FUSED_MOE_GATE_UP_MM_ID").as_deref() == Ok("1");
+
         let y_s_buf = {
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseCGateUpSharedDown,
             );
-            dispatch_moe_id_routed(
-                enc,
-                registry,
-                device,
-                x,
-                &weights.expert_gate_q,
-                weights.expert_gate_affine.as_ref(),
-                &arena.ids_buf,
-                &mut arena.gate_all_buf,
-                &gate_params,
-                super::decode_pool::MmIdSlot::Gate,
-                ne32,
-                seq_len * shape.num_experts_per_tok,
-                "gate_all_pf",
-                crate::quantize::imatrix::ImatrixHint::Layered {
-                    tag: "ffn_gate_exps",
-                    layer: layer_idx,
-                },
-            )?;
-            dispatch_moe_id_routed(
-                enc,
-                registry,
-                device,
-                x,
-                &weights.expert_up_q,
-                weights.expert_up_affine.as_ref(),
-                &arena.ids_buf,
-                &mut arena.up_all_buf,
-                &up_params,
-                super::decode_pool::MmIdSlot::Up,
-                ne32,
-                seq_len * shape.num_experts_per_tok,
-                "up_all_pf",
-                crate::quantize::imatrix::ImatrixHint::Layered {
-                    tag: "ffn_up_exps",
-                    layer: layer_idx,
-                },
-            )?;
+            if fused_moe_mm_id_on_pf {
+                let fused_dispatch_params =
+                    mlx_native::ops::quantized_matmul_id_ggml::GgmlIdMmDispatchParams {
+                        n_tokens: seq_len,
+                        top_k: shape.num_experts_per_tok,
+                        n: m_moe32,
+                        k: h32,
+                        n_experts: ne32,
+                        expert_stride: weights.expert_gate_stride,
+                        ggml_type: weights.ggml_type_gate_up,
+                    };
+                super::decode_pool::with_id_mm_scratch(
+                    super::decode_pool::MmIdSlot::Gate,
+                    device,
+                    ne32,
+                    seq_len * shape.num_experts_per_tok,
+                    |scratch| {
+                        mlx_native::ops::quantized_matmul_id_ggml::dispatch_id_mm_fused_gate_up_silu_for_test(
+                            enc,
+                            registry,
+                            device,
+                            x,
+                            &weights.expert_gate_q,
+                            &weights.expert_up_q,
+                            &arena.ids_buf,
+                            &scratch.htpe,
+                            &scratch.hids,
+                            &arena.h_all_buf, // direct fused output
+                            &fused_dispatch_params,
+                        )
+                    },
+                )
+                .map_err(|e| anyhow!("fused gate_up_silu_mm_id Q6_K (pf): {e}"))?;
+            } else {
+                dispatch_moe_id_routed(
+                    enc,
+                    registry,
+                    device,
+                    x,
+                    &weights.expert_gate_q,
+                    weights.expert_gate_affine.as_ref(),
+                    &arena.ids_buf,
+                    &mut arena.gate_all_buf,
+                    &gate_params,
+                    super::decode_pool::MmIdSlot::Gate,
+                    ne32,
+                    seq_len * shape.num_experts_per_tok,
+                    "gate_all_pf",
+                    crate::quantize::imatrix::ImatrixHint::Layered {
+                        tag: "ffn_gate_exps",
+                        layer: layer_idx,
+                    },
+                )?;
+                dispatch_moe_id_routed(
+                    enc,
+                    registry,
+                    device,
+                    x,
+                    &weights.expert_up_q,
+                    weights.expert_up_affine.as_ref(),
+                    &arena.ids_buf,
+                    &mut arena.up_all_buf,
+                    &up_params,
+                    super::decode_pool::MmIdSlot::Up,
+                    ne32,
+                    seq_len * shape.num_experts_per_tok,
+                    "up_all_pf",
+                    crate::quantize::imatrix::ImatrixHint::Layered {
+                        tag: "ffn_up_exps",
+                        layer: layer_idx,
+                    },
+                )?;
+            }
             proj_pooled(
                 enc,
                 registry,
@@ -3225,17 +3348,20 @@ pub fn build_moe_ffn_layer_gpu_q_into_with_arena(
             let _w5b = super::wave5b8_profile::Section::start(
                 super::wave5b8_profile::SectionKind::FfnPhaseDSilu,
             );
-            dispatch_silu_mul(
-                enc,
-                registry,
-                device.metal_device(),
-                &arena.gate_all_buf,
-                &arena.up_all_buf,
-                &arena.h_all_buf,
-                &arena.silu_params_buf,
-                n_h_all,
-            )
-            .map_err(|e| anyhow!("silu_mul dispatch: {e}"))?;
+            if !fused_moe_mm_id_on_pf {
+                dispatch_silu_mul(
+                    enc,
+                    registry,
+                    device.metal_device(),
+                    &arena.gate_all_buf,
+                    &arena.up_all_buf,
+                    &arena.h_all_buf,
+                    &arena.silu_params_buf,
+                    n_h_all,
+                )
+                .map_err(|e| anyhow!("silu_mul dispatch: {e}"))?;
+            }
+            // fused_moe_mm_id_on_pf: silu_mul applied in-kernel at Phase C.
         }
 
         // Barrier D→E.
