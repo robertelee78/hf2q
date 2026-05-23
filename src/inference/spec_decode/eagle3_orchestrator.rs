@@ -1917,4 +1917,116 @@ mod g4_cfa5_redhatai_smoke {
             }
         }
     }
+
+    /// G4-CFA-5e diagnostic: run production `forward_prefill` on the same
+    /// dense Gemma 4 31B GGUF + same prompt as Layer B. If production
+    /// returns a Paris-related token (not 240017 "額"), the kernel-level
+    /// quantized matmul WORKS on this model — the bug is tree-verify-
+    /// specific (encoder-vs-session lifecycle, ADR-029 F16 shadow
+    /// availability, dispatch_qmatmul-only init steps that
+    /// `apply_linear_projection_f32_qweight` bypasses, etc.). If
+    /// production ALSO returns 240017, the bug is more fundamental
+    /// (loader-wide, model setup, or kernel correctness regardless of
+    /// dispatch path).
+    ///
+    /// Cost: ~30s for model load + ~1-3s for prefill on 6 tokens.
+    #[test]
+    fn g4_cfa5e_forward_prefill_baseline_2026_05_23() {
+        let gguf_path = match resolve_path("HF2Q_GEMMA4_31B_GGUF", DEFAULT_GGUF) {
+            Some(p) => p,
+            None => {
+                eprintln!("[g4_cfa5e SKIP] no GGUF");
+                return;
+            }
+        };
+        let mut gpu = match GpuContext::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[g4_cfa5e SKIP] no Metal device: {e}");
+                return;
+            }
+        };
+        let gguf = mlx_native::gguf::GgufFile::open(&gguf_path)
+            .unwrap_or_else(|e| panic!("[g4_cfa5e] open: {e}"));
+        let cfg = Gemma4Config::from_gguf(&gguf)
+            .unwrap_or_else(|e| panic!("[g4_cfa5e] cfg: {e}"));
+        let mut progress = LoadProgress::new(false, 0, 0);
+        let mut weights = MlxModelWeights::load_from_gguf(&gguf, &cfg, &mut gpu, &mut progress)
+            .unwrap_or_else(|e| panic!("[g4_cfa5e] load: {e}"));
+
+        // Tokenize the exact same prompt Layer B uses.
+        let tokenizer_path = gguf_path.parent().unwrap().join("tokenizer.json");
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .unwrap_or_else(|e| panic!("[g4_cfa5e] tokenizer: {e}"));
+        let text = "The capital city of France is";
+        let enc = tokenizer.encode(text, true).expect("[g4_cfa5e] encode");
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        eprintln!("[g4_cfa5e] prompt={text:?} tokens={prompt_tokens:?}");
+
+        // Production prefill (forward_prefill, NOT forward_tree_verify_gpu_with_cache).
+        let max_decode_tokens = 1usize;
+        let t_prefill = std::time::Instant::now();
+        let last_token = match weights.forward_prefill(&prompt_tokens, max_decode_tokens, &mut gpu) {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = e.to_string();
+                // G4-CFA-5f gap surfaced 2026-05-23: production forward_prefill
+                // has NEVER been exercised on dense Gemma 4 31B — its MoE
+                // routing dispatch (`fused_moe_routing_f32`) is invoked
+                // unconditionally rather than gated on `num_experts > 0`,
+                // so dense (num_experts=0) trips on
+                // "fused_moe_routing_f32: num_experts and top_k must be > 0".
+                // Separate from CFA-5e (tree-verify correctness) but
+                // exposes the same underlying truth: hf2q's dense Gemma 4
+                // 31B end-to-end path is unblocked here for the FIRST time
+                // by ADR-038's CFA-5b/c/d, and prior assumptions about
+                // dense vs MoE in production code are surfacing.
+                if msg.contains("fused_moe_routing")
+                    || msg.contains("num_experts and top_k must be > 0")
+                {
+                    eprintln!(
+                        "[g4_cfa5e SKIP] production forward_prefill has a separate \
+                         dense-Gemma-4 MoE-gating gap (G4-CFA-5f): {msg}. \
+                         Cannot use forward_prefill as a baseline until that's fixed. \
+                         Test the kernel correctness directly via a focused unit test \
+                         using `apply_linear_projection_f32_qweight` on real Q6_K \
+                         weight vs CPU reference (see CFA-5e investigation strategy)."
+                    );
+                    return;
+                }
+                panic!("[g4_cfa5e] forward_prefill: {msg}");
+            }
+        };
+        eprintln!(
+            "[g4_cfa5e] forward_prefill {:.2}s → last_token={last_token}",
+            t_prefill.elapsed().as_secs_f64()
+        );
+
+        // Try to decode the token to readable text.
+        let decoded = tokenizer
+            .decode(&[last_token], true)
+            .unwrap_or_else(|e| format!("(decode failed: {e})"));
+        eprintln!("[g4_cfa5e] decoded last_token = {decoded:?}");
+
+        // Sanity: should NOT be the degenerate Layer B output (240017 "額").
+        // This is the load-bearing assertion for the CFA-5e diagnosis:
+        // - If forward_prefill returns 240017 too → bug is loader-wide or
+        //   kernel-wide (not tree-verify-specific).
+        // - If forward_prefill returns something else (e.g. Paris-related)
+        //   → bug is tree-verify-specific.
+        if last_token == 240017 {
+            eprintln!(
+                "[g4_cfa5e] forward_prefill ALSO returns 240017 — CFA-5e is NOT \
+                 tree-verify-specific; investigate loader / dispatch_qmatmul / \
+                 model setup."
+            );
+        } else {
+            eprintln!(
+                "[g4_cfa5e] forward_prefill returns {last_token} ({decoded:?}) ≠ 240017 \
+                 — production path WORKS on this model; CFA-5e is tree-verify-specific. \
+                 Investigate `forward_tree_verify_gpu_with_cache` vs `forward_decode` \
+                 differences (encoder vs session, F16 shadow, init steps)."
+            );
+        }
+    }
 }
