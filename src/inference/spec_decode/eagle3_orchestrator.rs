@@ -352,6 +352,7 @@ pub fn default_qwen35_eagle3_drafter_config(model: &Qwen35Model) -> Eagle3Drafte
         has_own_embed_tokens: true,
         rope_theta: model.cfg.rope_theta as f32,
         rope_dim: 128,
+        norm_before_residual: false,
     }
 }
 
@@ -492,6 +493,7 @@ mod tests {
             has_own_embed_tokens: true,
             rope_theta: 1_000_000.0,
             rope_dim: 128,
+            norm_before_residual: false,
         }
     }
 

@@ -4,4 +4,5 @@
 //! Future: dedicated Gemma4 forward graph if/when the
 //! `src/serve/forward_mlx.rs` monolith is split per-arch.
 
+pub mod kv_cache;
 pub mod tokenizer;
