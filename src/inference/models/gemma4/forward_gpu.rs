@@ -10,7 +10,7 @@
 //! Moved from `src/serve/forward_mlx.rs` by ADR-038 Step 3.
 
 use anyhow::Result;
-use mlx_native::{KernelRegistry, MlxBuffer, MlxDevice};
+use mlx_native::KernelRegistry;
 use mlx_native::ops::dense_gemm::DenseGemmF16Params;
 use mlx_native::ops::elementwise::CastDirection;
 use std::time::Instant;
@@ -22,7 +22,7 @@ use crate::serve::gpu::GpuContext;
 use crate::serve::layer_ctx::LayerCtx;
 use mlx_native::ops::flash_attn_vec_tq::FlashAttnVecTqParams;
 use crate::serve::forward_mlx_shared::{
-    dispatch_qmatmul, dispatch_rms_norm_unit_perhead, rms_norm_f32_hs_cached,
+    dispatch_qmatmul, dispatch_rms_norm_unit_perhead,
     RmsNormPerHeadArgs,
 };
 use crate::inference::models::gemma4::kv_cache::{

@@ -10,22 +10,17 @@ use anyhow::Result;
 use mlx_native::{
     KernelRegistry, MlxBuffer, MlxDevice,
 };
-use mlx_native::ops::dense_gemm::DenseGemmF16Params;
-use std::time::Instant;
 
-use crate::debug::{dumps, INVESTIGATION_ENV};
+use crate::debug::INVESTIGATION_ENV;
 use crate::serve::config::{Gemma4Config, LayerType};
 use crate::serve::gpu::{GpuContext, QuantWeightInfo};
 use crate::serve::forward_mlx_shared::{
-    load_gguf_qweight, populate_f16_shadow_if_enabled, rms_norm_f32_hs_cached,
-    dispatch_qmatmul, MlxQWeight, MlxAffineExtra, MlxAffineMoeStack, MoeBaseRole, DwqOverlayRole,
+    load_gguf_qweight, populate_f16_shadow_if_enabled, MlxQWeight, MlxAffineMoeStack, MoeBaseRole, DwqOverlayRole,
     parse_dwq_overlay_metadata, parse_dwq_overlay_role, parse_dwq_moe_expert_role,
 };
 use crate::inference::models::gemma4::kv_cache::{
     MlxKvCache, HbKvBuffers, DenseKvBuffers, HybridKvBuffers, DecodeRegime,
-    alloc_hybrid_kv_for_layer,
 };
-use super::profile::TokenProfile;
 
 // ---------------------------------------------------------------------------
 // Weight storage for the mlx-native forward path
