@@ -2300,13 +2300,73 @@ impl Qwen35Model {
                         "fused_residual_norm_bf16",
                         // Linear-attention chunk helper (no constants)
                         "compute_g_beta_f32",
+                        // ADR-033 §Pi Task #20 iter 13 — MoE matmul kernels.
+                        // Dispatched via plain get_pipeline at
+                        // quantized_matmul_id_ggml.rs:1385 (no function
+                        // constants). These are the BIGGEST cold-start
+                        // costs in MoE FFN prefill — each first call
+                        // takes ~40ms. Worth adding to prewarm.
+                        "kernel_mul_mm_id_q4_0_f32",
+                        "kernel_mul_mm_id_q4_0_tensor_f32",
+                        "kernel_mul_mm_id_q8_0_f32",
+                        "kernel_mul_mm_id_q8_0_tensor_f32",
+                        "kernel_mul_mm_id_q4_K_f32",
+                        "kernel_mul_mm_id_q4_K_tensor_f32",
+                        "kernel_mul_mm_id_q5_K_f32",
+                        "kernel_mul_mm_id_q5_K_tensor_f32",
+                        "kernel_mul_mm_id_q6_K_f32",
+                        "kernel_mul_mm_id_q6_K_tensor_f32",
+                        // mm_id map0 — preprocesses the routing table.
+                        // Dispatched plain at line 1330. Two top_k variants
+                        // for MoE (top_k=8 routed) + (top_k=1 down).
+                        "kernel_mul_mm_id_map0_ne20_1",
+                        "kernel_mul_mm_id_map0_ne20_8",
                     ];
                     let warmed = registry.prewarm_pipelines(device.metal_device(), hot_kernels);
+
+                    // ADR-033 §Pi Task #20 iter 12 (2026-05-23) — prewarm
+                    // flash_attn_prefill_bf16_d256 with the production
+                    // constants. The shader uses 5 bool function constants
+                    // (200=align_q, 201=align_k, 300=has_mask, 301=do_causal,
+                    // 303=has_blk). For Qwen3.5/3.6 prefill the static
+                    // settings are has_mask=false, do_causal=true, has_blk=false.
+                    // The (align_q, align_k) pair depends on seq_len padding
+                    // and is not known at load time, so prewarm both
+                    // combinations production may use.
+                    let fa_entries: &[(&str, &[(usize, bool)])] = &[
+                        (
+                            "flash_attn_prefill_bf16_d256",
+                            &[
+                                (200, false), // align_q=false (seq may be unaligned)
+                                (201, false), // align_k=false
+                                (300, false), // has_mask=false (do_causal handles it)
+                                (301, true),  // do_causal=true (prefill from 0)
+                                (303, false), // has_blk=false (no sliding-window blk in standard prefill)
+                            ],
+                        ),
+                        (
+                            "flash_attn_prefill_bf16_d256",
+                            &[
+                                (200, true), // align_q=true (seq aligned to NQ tile)
+                                (201, true),
+                                (300, false),
+                                (301, true),
+                                (303, false),
+                            ],
+                        ),
+                    ];
+                    let fa_warmed = registry.prewarm_pipelines_with_bool_constants(
+                        device.metal_device(),
+                        fa_entries,
+                    );
+
                     if std::env::var("HF2Q_PIPELINE_PREWARM_LOG").as_deref() == Ok("1") {
                         eprintln!(
-                            "[prewarm] warmed {} / {} kernels in {:.2}ms",
+                            "[prewarm] warmed {} / {} no-const kernels + {} / {} fa-prefill variants in {:.2}ms",
                             warmed,
                             hot_kernels.len(),
+                            fa_warmed,
+                            fa_entries.len(),
                             prewarm_start.elapsed().as_secs_f64() * 1000.0,
                         );
                     }
