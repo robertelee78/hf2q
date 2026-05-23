@@ -492,16 +492,33 @@ pub enum ModelFamily {
 /// EAGLE-3 orchestrator for the Gemma 4 dense target model.
 ///
 /// Parallel to [`Eagle3Orchestrator`] but calls
-/// `MlxModelWeights::forward_tree_verify_gpu` (shipped by G4-CFA-3)
-/// instead of `Qwen35Model::forward_tree_verify_gpu`. The Gemma4 verifier
-/// allocates its own F32 KV cache internally on each call (head_dim varies
-/// per layer: 256 sliding / 512 global), so this orchestrator does NOT
-/// hold a persistent `HybridKvCache` — the `kv_capacity` budget is passed
-/// per call.
+/// `MlxModelWeights::forward_tree_verify_gpu_with_cache` (shipped by
+/// G4-CFA-5c) instead of `Qwen35Model::forward_tree_verify_gpu`. The
+/// Gemma 4 verifier needs persistent per-layer F32 K/V across iterations
+/// (heterogeneous shape: sliding 16 KV heads × 256 head_dim, global
+/// 2 × 512), so this orchestrator owns the cache as `kv_caches_f32`,
+/// allocated lazily once in `prefill` and threaded `&mut` into
+/// `run_iteration`. Double-prefill is a hard `ensure!()` error.
 ///
 /// Per ADR-038 §3.4.6 risk #5: this is a deliberate parallel orchestrator
 /// (duplication ~200 LOC) to unblock CFA-5/6 without the time cost of
 /// full trait extraction. Post-SOTA bench, extract `TreeVerifyTarget`.
+///
+/// # INV-ORCH-LIFETIME (ADR-038 G4-CFA-5c codex review MED disposition)
+///
+/// `kv_caches_f32` owns `MlxBuffer` allocations bound to the
+/// `MlxDevice` that the caller's `GpuContext` exposes at `prefill`
+/// time. The Rust type system does NOT tie the orchestrator's lifetime
+/// to that device — callers MUST drop the orchestrator (or at minimum
+/// `mem::take` the cache) BEFORE dropping the `GpuContext` it was
+/// allocated against. Current call sites (Layer B smoke,
+/// `g4_cfa5_redhatai_end_to_end_smoke_2026_05_23`, and the planned
+/// CFA-6 bench harness) construct `gpu` before `orch` and drop in
+/// reverse stack order, which satisfies the contract by construction.
+/// Codex's 2026-05-23 review flagged this as a residual lifetime
+/// assumption; queen Phase 3 dispositioned it `document_now`, with
+/// hard RAII enforcement deferred to a future cleanup pass once a real
+/// drop-ordering incident materializes.
 pub struct Gemma4Eagle3Orchestrator<'a> {
     pub cfg: Eagle3OrchestratorConfig,
     pub drafter_cfg: &'a Eagle3DrafterConfig,

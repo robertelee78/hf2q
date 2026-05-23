@@ -1963,11 +1963,14 @@ impl MlxModelWeights {
     /// (sliding: 16 KV heads × 256 head_dim; global: 2 KV heads × 512 head_dim).
     /// The returned Vec has exactly `self.layers.len()` entries.
     ///
-    /// # Safety (ADR-031)
+    /// # Safety (ADR-031) + INV-ORCH-LIFETIME (ADR-038 G4-CFA-5c)
     ///
     /// The returned MlxBuffer values are independent device allocations with no
     /// parallel-encode entanglement. They must not outlive the MlxDevice they were
-    /// allocated against.
+    /// allocated against. When threaded through `Gemma4Eagle3Orchestrator` (the
+    /// production path), the orchestrator MUST be dropped before the
+    /// `GpuContext` that exposed this device — see the INV-ORCH-LIFETIME doc
+    /// block on `Gemma4Eagle3Orchestrator` (eagle3_orchestrator.rs).
     pub fn alloc_tree_verify_kv_caches(
         &self,
         device: &mlx_native::MlxDevice,
