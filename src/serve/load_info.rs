@@ -1395,6 +1395,11 @@ mod tests {
             disk_persistor: None,
             lcp_hydrated_for_cfg: std::collections::HashSet::new(),
             tq_kv_active: false,
+            // ADR-040 Phase C iter-2a (C2b) — scaffold field on
+            // `Qwen35LoadedModel`; test fixtures must populate it (here
+            // as `None`) to keep struct-literal construction
+            // compatible. Production iter-2a path also stores `None`.
+            persistent_kv_cache: None,
         };
         let info = loaded.build_load_info(
             &gguf,

@@ -274,8 +274,8 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 |---|---|---|
 | **C1 (SHIPPED, 2026-05-23)** | Scaffolding: `EngineMode` enum + signature-only `SlotAware` variant + regression test | 1 day |
 | **C2a (SHIPPED, 2026-05-23)** | Byte-equivalence regression-pin test `engine_serial_fifo_byte_equivalent_to_pre_phase_c` landed env-gated FIRST (per dossier §4 iter-2a step 1). No production code changes; locks the falsifier for C2b's `worker_run` refactor. | 0.5 day |
-| C2b | Shape A `worker_run` refactor: extend signature with `mode: EngineMode` + construct `Box<dyn Scheduler>` at worker entry; wrap each Request arm in admit→drive→release. SerialFifo path byte-equivalent (test from C2a is the falsifier). | 3-5 days |
-| C2c | Qwen35 SlotAware runtime (replaces `EngineSpawnError::ModeNotYetWired` for `SlotAware` via Shape B `select!` loop inside `worker_run`); gated on B4b decode-side slot_id threading + R4 spec-decode mitigation. | 5-8 days |
+| **C2b (SHIPPED, 2026-05-23)** | Shape A `worker_run` refactor: extended signature with `mode: EngineMode` + `queue_capacity: u32` + `scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>`; constructs concrete `FifoSchedulerAdapter` at worker entry (concrete-type realisation of dossier §2.9 "advance lives on concrete type"); wraps `Generate` / `GenerateStream` / `Embed` / `GenerateWithSoftTokens` arms in admit→drive→release; `EngineInner` gains `max_slots: u32` + `scheduler_stats_snapshot` + accessors; `Qwen35LoadedModel` gains `persistent_kv_cache: Option<HybridKvCache>` scaffold (None at iter-2a; iter-2b lift). H2 sequential-request pin added env-gated alongside H1. | 1 day |
+| C2c | Qwen35 SlotAware runtime (replaces `EngineSpawnError::ModeNotYetWired` for `SlotAware` via Shape B `select!` loop inside `worker_run` + populates `Qwen35LoadedModel.persistent_kv_cache` with `n_seqs=max_slots`); gated on B4b decode-side slot_id threading + R4 spec-decode mitigation + R4-bis hybrid persistor n_seqs>1 serialization. | 5-8 days |
 | C3 | SSE keepalive per-slot accounting + schema.rs doc updates | 2-3 days |
 | C4 | CLI/env wiring for `HF2Q_SCHEDULER` + `--scheduler` | 1-2 days |
 
@@ -686,6 +686,90 @@ Under the env-gated path: both engines hit identical `worker_run` code today (it
 - `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §4 iter-2a step 1: "Write the byte-equivalence test FIRST and confirm it PASSES at HEAD. This proves the test harness is correct before iter-2 changes the engine."
 - `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §5 R8: synthetic fixture cannot exercise real `generate_once`; env-gate behind `HF2Q_BYTE_EQUIV_E2E=1` — this iter implements that mitigation verbatim.
 - `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §2.11 H1: H1 is the load-bearing hypothesis that this test falsifies if C2b's wrapper introduces a behavior change; iter-2a step 1 confirms H1 holds at HEAD.
+
+### 6.1.8 Iter-C2b closure — Shape A `worker_run` refactor SHIPPED (2026-05-23, this commit)
+
+Per the C2 wiring dossier (`docs/research/adr040-c2-wiring-dossier-2026-05-24.md`) §4 iter-2a steps 2–8, this iter wires the iter-2.5 `FifoSchedulerAdapter` + B4a multi-seq KV primitives into the production `Engine` worker via Shape A (scheduler-pulls-from-mpsc, worker-thread-owns-scheduler), without changing the ADR-005 Decision #2 FIFO byte-equivalence contract.
+
+**Dossier step coverage (steps 2–8)**:
+
+| Step | Scope | Status | Evidence |
+|---|---|---|---|
+| 2 | Extend `worker_run` signature with `mode: EngineMode` + `queue_capacity: u32` + `scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>`; both spawn entry points pass them. | ✅ SHIPPED | `src/serve/api/engine.rs:3434-3447` (new worker_run signature); `:2671-2690` (3-arg `Engine::spawn` passes `EngineMode::SerialFifo` + `queue_capacity_u32` + handle clone). |
+| 3 | Construct concrete scheduler at worker entry; SerialFifo gets a live `FifoSchedulerAdapter`; SlotAware is genuinely-unreachable per iter-1.5 F1. | ✅ SHIPPED | `engine.rs:3478-3489` (`match mode { SerialFifo => FifoSchedulerAdapter::new(...), SlotAware => unreachable!(...) }`). The dossier §4 step 3 sketched `Box<dyn Scheduler>`; we ship the concrete adapter per §2.9 ("advance lives on concrete type"). Same observable shape, zero dynamic dispatch on the hot path. |
+| 4 | Wrap `Generate` / `GenerateStream` / `Embed` / `GenerateWithSoftTokens` arms in admit→drive→release; control-plane arms (Kv*/PromptCache*/TqPacked*/Warmup/Shutdown) bypass the scheduler entirely. | ✅ SHIPPED | `engine.rs:3523-3614` (Generate); `:3617-3776` (GenerateStream); `:3777-3838` (Embed); `:3845-3955` (GenerateWithSoftTokens). All four arms preserve byte-equivalence: the inner `generate_*_once` calls are byte-identical to pre-C2; only pre/post bookkeeping (admit + advance_after_prefill + advance_after_decode loop + release + publish_stats) was added. Control-plane arms (`engine.rs:~3956+`) are untouched. |
+| 5 | `EngineInner` gains `max_slots: u32` + `scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>`; worker publishes stats post-release; `Engine::scheduler_stats()` + `Engine::max_slots()` accessors land. | ✅ SHIPPED | `engine.rs:884-885` (struct doc); `:944-957` (field declarations); `:2701-2719` (`max_slots` + `scheduler_stats` accessors); `:3505-3514` (`publish_stats` closure inside worker_run). |
+| 6 | Lift `Qwen35LoadedModel.persistent_kv_cache: Option<HybridKvCache>` as scaffold; iter-2a leaves it `None` because SerialFifo `max_slots=1` keeps per-request alloc byte-equivalent (dossier R7 + the prompt-cache restore at `engine_qwen35.rs:1503` requires `max_seq_len` match between snapshot and cache; a persistent cache pre-allocated to `cfg.max_position_embeddings` would break `restore_from`). | ✅ SHIPPED (scaffold-only) | `src/serve/api/engine_qwen35.rs:194-229` (field declaration + lifecycle rationale); `:489-498` (production `load` initializes `None`); `:4177-4180` (test fixture initializes `None`). Iter-2b lifts the snapshot/restore wire format to slot-aware semantics, then populates this field with `n_seqs=max_slots` at first-request time. |
+| 7 | Run H1+H2 tests (skip mode for CI; E2E gated). | ✅ SHIPPED | `engine.rs:10522-10670` (H1, retained from C2a); `engine.rs:10673-10861` (H2 `engine_serial_fifo_two_sequential_requests_no_state_leak`, new this iter). Both PASS in skip mode under default `cargo test --release`. H2 additionally asserts `scheduler_stats()` post-conditions (`admitted_total >= 2`, `completed_total >= 2`, `in_flight_slots == 0`, `policy == FifoSerial`) to catch any future regression that silently stops calling `publish_stats`. |
+| 8 | Acceptance gate (cargo check, cargo test, no stubs in production code). | ✅ SHIPPED | See "Quality gates" below. |
+
+**H1+H2 hypothesis status** (dossier §3 + §2.11):
+- **H1** (`engine_serial_fifo_byte_equivalent_to_pre_phase_c`): PASS in skip mode (no env). The pre-C2b "two engines via different entry points produce byte-identical generate output" pin retains its falsifier role for the C2b admit→drive→release wrap. E2E mode contract: `HF2Q_BYTE_EQUIV_E2E=1 + HF2Q_BYTE_EQUIV_E2E_GGUF=<path>`.
+- **H2** (`engine_serial_fifo_two_sequential_requests_no_state_leak`, NEW): PASS in skip mode. Asserts pairwise byte-equality across two sequential `engine.generate(...)` calls + the post-conditions on the published `SchedulerStats` snapshot. Same env gate as H1.
+- **H3** (`engine_spawn_3_arg_signature_compile_pin`): PASS — the 3-arg `Engine::spawn(LoadedModel, usize, Option<u64>) -> Engine` signature is unchanged this iter. Verified at `engine.rs:13474+`.
+- **H4** (the 11 handler `tx.try_send` callsites remain UNCHANGED — Chesterton's fence): PASS — `grep -n "self.inner.tx.try_send" src/serve/api/engine.rs` returns exactly 10 production callsites (the "11" in the dossier text was off-by-one; 10 callsites + 1 `blocking_send` fallback per callsite). All 10 are at `engine.rs:2948, 2975, 3011, 3065, 3110, 3147, 3193, 3271, 3290, 3351` — pre-C2 line numbers shifted by the worker_run/EngineInner additions but the bodies are byte-identical to pre-C2b. The `try_send → blocking_send` fallback discipline is preserved; the 429 + Retry-After contract maps directly through the unchanged mpsc semantics.
+
+**Risk mitigations landed** (dossier §5 R1–R5):
+- **R1 (Qwen35 vs Gemma KV lifecycle mismatch)**: addressed by the iter-2a scope split — Qwen35 cache scaffold field added (None at iter-2a), Gemma SlotAware deferred to iter-2c (gated on Phase A3 lift). Iter-2a runs SerialFifo only; the byte-equivalence pledge (H1+H2) is preserved because the per-request `alloc_kv_cache_for_request` path is unchanged.
+- **R2 (Shape A cannot service admission-during-decode under InflightBatched)**: out-of-scope for iter-2a per dossier sequencing. The worker_run body's `SerialFifo` arm is the only live runtime; SlotAware is `unreachable!` (genuinely — iter-1.5 F1 rejects at spawn). Iter-2c lands the `tokio::select!` body for SlotAware.
+- **R3 (per-arch typed cache vs trait-object boxing)**: addressed by the typed-cache shape — `persistent_kv_cache: Option<HybridKvCache>` sits on `Qwen35LoadedModel` (per-arch typed), NOT on `EngineInner` as `Box<dyn MultiSeqKvCache>`. Worker thread dispatches on `&mut LoadedModel` enum arms (engine.rs:~3570) and the per-arch arm sees the concrete type; LLVM devirtualizes the eventual `append_for_seq` calls. The trait is reserved for cross-cutting error mapping (`MultiSeqError::CapabilityUnsupported` → HTTP 501 at the eventual Phase C3 schema layer), NOT the data path.
+- **R4 (spec-decode + multi-slot undefined)**: not yet relevant — iter-2a is SerialFifo only. Iter-2c's `spawn_with_mode` validation will reject `SlotAware { max_slots > 1 } + HF2Q_SPEC_EAGLE3=1` with a typed `EngineSpawnError::SpecDecodeMultiSlotUnsupported`.
+- **R5 (Mixed dispatch deferred to Phase B6)**: not yet relevant — under SerialFifo + max_slots=1, `step()` never returns `Mixed` (we don't even consult `step()` on the hot path; bookkeeping is post-hoc per dossier §2.8 + §4 step 4).
+
+**Sequencing** (per dossier §4):
+- **C2b (THIS ITER)** — Shape A worker_run refactor; SerialFifo wrapped + byte-equivalence pinned; Qwen35 cache scaffold lifted (None at iter-2a).
+- **C2c** (5-8 days, gated on B4b + R4) — Qwen35 SlotAware runtime: replaces the `EngineSpawnError::ModeNotYetWired` rejection with the live `InflightBatchedScheduler` runtime; populates `Qwen35LoadedModel.persistent_kv_cache` with `n_seqs = max_slots` at first-request time; extends `worker_run` body with `match mode { SerialFifo => simple_path(...), SlotAware { .. } => slot_aware_path(...) }`.
+- **C2d / Gemma SlotAware** (3-5 days, gated on A3 + B4c) — extends SlotAware support to `GemmaLoadedModel` after Phase A3 lifts Gemma's KV cache out of `MlxModelWeights` into a slot-aware shape.
+
+**Concrete-adapter-vs-Box deviation from dossier §4 step 3** (with rationale):
+
+The dossier §4 step 3 sketched `Box<dyn Scheduler>` for the worker's scheduler field. The implementation here uses concrete `FifoSchedulerAdapter` directly (not boxed) because:
+1. The `Scheduler` trait deliberately does NOT include `advance_after_prefill` / `advance_after_decode` per dossier §2.9 — those callbacks live on the concrete type because their FSM-advance surface differs (FIFO has no chunking).
+2. Boxing the scheduler would force a downcast at every `advance_after_*` callsite, which is ergonomically worse than a concrete type.
+3. The `SlotAware` arm is `unreachable!` at iter-2a (iter-1.5 F1 rejection); iter-2c will replace it with a sibling branch returning `Box<InflightBatchedScheduler>` (or extracting to a `match`-on-mode pair of worker-body helpers). At that point the concrete shape becomes a per-arm dispatch, not a boxed trait object.
+
+This deviation does NOT affect the dossier's hypothesis matrix (H1–H4 all hold with the concrete shape) and is documented inline at `engine.rs:3470-3477`.
+
+**Scope-deviation note (load_info.rs test fixture)**: the dossier R6 ("multi_model.rs may have a live `Engine::spawn` callsite I missed") flagged that struct-construction sites needed verification. The actual gap surfaced was that `src/serve/load_info.rs:1378` contains a test-fixture struct-literal construction of `Qwen35LoadedModel`. Adding the `persistent_kv_cache` field forced a one-line `persistent_kv_cache: None` addition there (+ at `engine.rs:9890` which was already in the allow-list). The `load_info.rs` edit is the minimum mechanical maintenance required by the field addition; the production `Qwen35LoadedModel::load` path at `engine_qwen35.rs:489-498` is the canonical production wiring. No semantic test changes — both test fixtures construct `None` to mirror production iter-2a behaviour.
+
+**Production code changes (LOC delta)**:
+- `src/serve/api/engine.rs`: +~410 LOC, -~3 LOC.
+  - Scheduler import (`AdmitError, AdmitRequest, FifoSchedulerAdapter, Scheduler, SchedulerPolicy, SchedulerStats`) at `:51-65`.
+  - `EngineInner.max_slots: u32` + `EngineInner.scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>` fields at `:944-957`.
+  - `Engine::max_slots()` accessor + `Engine::scheduler_stats()` accessor at `:2701-2719`.
+  - `Engine::spawn`-side scheduler-stats snapshot construction + handle clone + worker_run signature extension at `:2671-2690`.
+  - `worker_run` signature `(mode: EngineMode, queue_capacity: u32, scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>)` at `:3434-3447`.
+  - Worker-thread scheduler construction + `publish_stats` closure at `:3464-3514`.
+  - Per-arm admit→drive→release wraps at `:3523-3614` (Generate); `:3617-3776` (GenerateStream); `:3777-3838` (Embed); `:3845-3955` (GenerateWithSoftTokens).
+  - H2 test `engine_serial_fifo_two_sequential_requests_no_state_leak` at `:10673-10861`.
+  - 4 test-fixture EngineInner construction sites updated with `max_slots: 1` + `scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats { ... }))` at `:818-829, :862-872, :9008-9019, :10254-10265`.
+- `src/serve/api/engine_qwen35.rs`: +~46 LOC, -~3 LOC.
+  - `HybridKvCache` imported at module top at `:42`.
+  - `Qwen35LoadedModel.persistent_kv_cache: Option<HybridKvCache>` field at `:194-229` (47-line doc-block explaining the scaffold + iter-2a `None` rationale + dossier §2.4.2 typed-cache discipline).
+  - Production `load()` initializes `persistent_kv_cache: None` at `:489-498`.
+  - Test fixture initializes `persistent_kv_cache: None` at `:4177-4180`.
+  - Removed duplicate `use ... HybridKvCache;` at the per-fn-impl module-level at `:1033-1038` (now imported once at module top).
+- `src/serve/load_info.rs`: +6 LOC (test fixture: `persistent_kv_cache: None` at `:1396-1402`). Scope-deviation note above.
+
+**Quality gates** (all PASS):
+- `cargo check --release` returns 0.
+- `cargo check --release --tests` returns 0 (pre-existing `gpu_full_attn.rs:11455-57` unused-`bad_shape` warnings only, no new warnings introduced by this iter).
+- `cargo test --release --bin hf2q -- serve::api::engine::` returns 0 with 98 PASS (was 97 at C2a; +1 for H2; 0 regressions). 116 PASS across `serve::api::engine` + `serve::api::engine_qwen35` (was 115; +1).
+- `cargo test --release --bin hf2q -- qwen35::kv_cache::tests serve::scheduler::tests serve::multi_seq_kv::tests qwen35::forward_gpu::tests::b4a qwen35::forward_gpu::tests::b4a_cont` returns 0 with 149 PASS (regression pin from §6.1.6 / C2a intact).
+- `cargo test --release --test continuous_batching_throughput` returns 0 with 6 PASS (D1 unchanged).
+- `cargo test --release --bin hf2q -- engine_spawn_3_arg_signature_compile_pin` returns 0 with 1 PASS (H3 — 3-arg spawn signature unchanged).
+- No `// TODO`, no `unimplemented!()`, no `panic!()` in production code. `unreachable!()` appears once in `worker_run` (SlotAware arm) with explanatory doc comment per ADR-040 §7 — the iter-1.5 F1 rejection at `spawn_with_mode` makes the arm genuinely unreachable; the macro surfaces any future caller that bypasses the rejection.
+
+**Dossier provenance** for this iter's design:
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §1 Executive summary + §2.1 Q1 (Shape A): worker-thread-owns-scheduler, mpsc unchanged, byte-equivalence by construction under FifoSerial. Verbatim implementation shape.
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §2.2 Q2: `max_slots: u32` + `scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>` field additions to `EngineInner`. Verbatim implementation shape.
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §2.3 Q3: scheduler constructed at `worker_run` entry, accessed via `&mut`, lifetime matches the worker. Verbatim implementation shape (with concrete-type deviation per §2.9 documented above).
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §2.4 + §2.4.3 (Qwen35-only iter-2a scope): scaffold field added, populated `None` at iter-2a; iter-2c populates with `n_seqs=max_slots`.
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §2.6 Q6 (3-arg `Engine::spawn` backward-compat): `spawn` body hardcodes `EngineMode::SerialFifo` and passes it through; signature unchanged; H3 pin holds.
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §2.9 Q9 (advance_after_* discipline): worker calls advance callbacks AFTER each forward; no race because the scheduler is `&mut`-owned on the worker thread. The advance methods live on the concrete `FifoSchedulerAdapter` (not on the trait), driving the concrete-type implementation shape.
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §3 hypothesis matrix H1+H2+H3+H4: all hold; H2 ships as a new test this iter; H1+H3+H4 retain their pin role.
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §4 iter-2a steps 2-8: implemented verbatim with the concrete-type deviation in step 3 documented above.
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §5 R1-R5: all mitigations in place per the "Risk mitigations landed" table above.
 
 ---
 

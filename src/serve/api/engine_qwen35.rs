@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 
-use crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot;
+use crate::inference::models::qwen35::kv_cache::{HybridKvCache, HybridKvCacheSnapshot};
 use crate::inference::models::qwen35::model::Qwen35Model;
 use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape,
@@ -190,6 +190,42 @@ pub struct Qwen35LoadedModel {
     /// SDPA. Mantra-aligned (no-stub): the flag IS load-bearing for
     /// allocation; iter-13 makes it load-bearing for dispatch.
     pub tq_kv_active: bool,
+
+    /// **ADR-040 Phase C iter-2a (C2b) — persistent multi-seq KV cache
+    /// scaffold** (dossier
+    /// `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` R1 + §4
+    /// iter-2a step 6 + §2.4.3).
+    ///
+    /// Today Qwen35 allocates a fresh [`HybridKvCache`] per request inside
+    /// [`alloc_kv_cache_for_request`] (line ~1027). Iter-2a SerialFifo
+    /// (`max_slots = 1`) keeps that per-request alloc path: under
+    /// `n_seqs = 1` it is byte-equivalent to pre-C2 by construction, and
+    /// the prompt-cache restore at engine_qwen35.rs:1503 requires a
+    /// `max_seq_len` match between snapshot and cache (snapshots are
+    /// taken against the per-request `max_seq = (prompt_len + max_tokens
+    /// + 64).max(128).min(cfg.max_position_embeddings)`; a persistent
+    /// cache pre-allocated to a different `max_seq_len` would break the
+    /// `restore_from` byte-copy at kv_cache.rs:1898 + invalidate the
+    /// dossier R8 byte-equivalence pledge).
+    ///
+    /// Iter-2a therefore leaves this field as `None` at all times — the
+    /// field is structural scaffolding for iter-2b's `SlotAware`
+    /// runtime, which will populate it at first-request time with
+    /// `n_seqs = max_slots` AFTER lifting the snapshot/restore wire
+    /// format to slot-aware semantics (dossier R7 + R4-bis: ADR-017
+    /// Qwen35 hybrid persistor wire format supports `n_seqs > 1` at the
+    /// type level but has never serialized > 1; iter-2b/iter-2c lands
+    /// the per-slot snapshot codec required for multi-slot prompt-cache
+    /// hits).
+    ///
+    /// The presence of this field as `Option` (rather than as a direct
+    /// constructor argument) was selected per dossier §2.4.2: per-arch
+    /// typed cache (`HybridKvCache`) on the per-arch `LoadedModel`
+    /// variant, NOT a `Box<dyn MultiSeqKvCache>` on `EngineInner`. This
+    /// preserves type info on the decode hot path (LLVM can devirtualize
+    /// `HybridKvCache::append_for_seq` calls) and matches the existing
+    /// per-arch dispatch shape at engine.rs:~3380.
+    pub persistent_kv_cache: Option<HybridKvCache>,
 }
 
 impl Qwen35LoadedModel {
@@ -480,6 +516,14 @@ impl Qwen35LoadedModel {
             // wires the SDPA dispatch). Per-process flag, captured once
             // here so the env can't toggle mid-process.
             tq_kv_active: crate::serve::api::tq_packed_descriptor::is_tq_active_mode(),
+            // ADR-040 Phase C iter-2a (C2b) — persistent multi-seq KV
+            // cache scaffold. Always `None` at iter-2a (SerialFifo
+            // max_slots=1 keeps the per-request alloc path; see field
+            // doc for the byte-equivalence rationale + iter-2b lift
+            // sequencing). The first SlotAware-aware request in iter-2b
+            // populates this lazily via `HybridKvCache::new_with_options
+            // (... n_seqs = max_slots, ...)`.
+            persistent_kv_cache: None,
         };
 
         // ADR-027 Phase B iter-22 — surface the iter-23+ design constraint:
@@ -995,7 +1039,10 @@ fn is_greedy_eligible(params: &SamplingParams) -> bool {
 // dispatch differs.
 
 use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
-use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+// `HybridKvCache` is imported once at the module top (alongside
+// `HybridKvCacheSnapshot`) to keep the type visible at the
+// `Qwen35LoadedModel` field declaration (per ADR-040 C2b scaffold field
+// `persistent_kv_cache: Option<HybridKvCache>`).
 use crate::serve::sampler_pure::{self, SamplingParams as SamplerPureParams};
 use mlx_native::MlxDevice;
 
@@ -4125,6 +4172,9 @@ mod tests {
             disk_persistor: None,
             lcp_hydrated_for_cfg: std::collections::HashSet::new(),
             tq_kv_active,
+            // ADR-040 C2b scaffold — test fixture mirrors production
+            // construction shape; iter-2a always leaves this `None`.
+            persistent_kv_cache: None,
         }
     }
 

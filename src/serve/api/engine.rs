@@ -52,6 +52,19 @@ use crate::serve::load_info::{
 use crate::serve::sampler_pure::{
     self, SamplingParams as SamplerParams,
 };
+// ADR-040 Phase C iter-2a (C2b) — Scheduler wiring per Shape A
+// (dossier `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §2.1).
+// `FifoSchedulerAdapter` is the only concrete scheduler instantiated under
+// the SerialFifo arm; `SlotAware` is rejected at `spawn_with_mode`
+// (iter-1.5 F1) so the worker only ever sees a concrete FIFO. The
+// `Scheduler` trait import gives `stats()` its method-call surface (the
+// trait carries the public `stats(&self) -> SchedulerStats` signature
+// even though `advance_after_*` deliberately lives on the concrete type
+// per dossier §2.9).
+use crate::serve::scheduler::{
+    AdmitError, AdmitRequest, FifoSchedulerAdapter, Scheduler, SchedulerPolicy,
+    SchedulerStats,
+};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -803,6 +816,19 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
             kv_spill_descriptor: Some(descriptor_for_engine),
             tq_packed_descriptor: None,
             mode: EngineMode::SerialFifo,
+            // ADR-040 C2b scaffold for synthetic test fixtures —
+            // mirrors the production `Engine::spawn` shape; no live
+            // worker drives the scheduler so the snapshot is a sentinel
+            // FifoSerial-shape `SchedulerStats` with zero counters.
+            max_slots: 1,
+            scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
+                policy: SchedulerPolicy::FifoSerial,
+                in_flight_slots: 0,
+                queue_capacity: 8,
+                admitted_total: 0,
+                rejected_429_total: 0,
+                completed_total: 0,
+            })),
         }),
     }
 }
@@ -840,6 +866,17 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
             mode: EngineMode::SerialFifo,
+            // ADR-040 C2b scaffold for synthetic test fixtures —
+            // mirrors production shape with zero-counter sentinel.
+            max_slots: 1,
+            scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
+                policy: SchedulerPolicy::FifoSerial,
+                in_flight_slots: 0,
+                queue_capacity: 8,
+                admitted_total: 0,
+                rejected_429_total: 0,
+                completed_total: 0,
+            })),
         }),
     }
 }
@@ -936,6 +973,26 @@ struct EngineInner {
     /// `spawn_with_mode` is `SerialFifo`; `SlotAware` is rejected with
     /// [`EngineSpawnError::ModeNotYetWired`] at the API boundary.
     mode: EngineMode,
+
+    /// **ADR-040 Phase C iter-2a (C2b) — slot cap snapshot** (dossier
+    /// `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §2.2).
+    ///
+    /// Populated at spawn time from [`EngineMode`]:
+    /// - `SerialFifo` ⇒ `1` (ADR-005 Phase 2 single-in-flight contract).
+    /// - `SlotAware { max_slots }` ⇒ `max_slots` (gated at
+    ///   `spawn_with_mode` until iter-2b lifts the rejection).
+    ///
+    /// Read by future `/metrics` / `/v1/models` extensions (Phase C3).
+    /// Iter-2a only positions the field; the SlotAware runtime that
+    /// actually exercises `max_slots > 1` lands at iter-2b/2c.
+    max_slots: u32,
+    /// **ADR-040 Phase C iter-2a (C2b) — scheduler stats snapshot**
+    /// (dossier §2.2). The actual scheduler lives on the worker thread
+    /// (Shape A); after each `release` the worker writes a snapshot of
+    /// [`SchedulerStats`] here so handler-side `/metrics` reads pay only
+    /// a brief `Mutex` acquisition (no cross-thread scheduler access).
+    /// Phase C3 wires this into the Prometheus exposition.
+    scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
 }
 
 #[cfg(test)]
@@ -2562,11 +2619,43 @@ impl Engine {
             );
         }
 
+        // ADR-040 Phase C iter-2a (C2b) — the 3-arg `spawn` is the
+        // ADR-005 byte-equivalence entry point; the worker is spawned
+        // under `EngineMode::SerialFifo` with `max_slots = 1`. The
+        // `queue_capacity` value reaches `worker_run` so the
+        // `FifoSchedulerAdapter` constructed at thread entry mirrors the
+        // mpsc channel's `queue_capacity.max(1)` cap (dossier §2.3 + §4
+        // iter-2a step 3). The pre-seeded `SchedulerStats` mirrors what
+        // `FifoSchedulerAdapter::stats()` returns on a fresh adapter so
+        // a /metrics scrape between spawn and the first admit reports
+        // sensible defaults (zero counters, configured capacity).
+        let queue_capacity_u32 = queue_capacity.max(1) as u32;
+        let initial_mode = EngineMode::SerialFifo;
+        let initial_max_slots: u32 = 1;
+        let scheduler_stats_snapshot = Arc::new(Mutex::new(SchedulerStats {
+            policy: SchedulerPolicy::FifoSerial,
+            in_flight_slots: 0,
+            queue_capacity: queue_capacity_u32,
+            admitted_total: 0,
+            rejected_429_total: 0,
+            completed_total: 0,
+        }));
+        let worker_stats_handle = Arc::clone(&scheduler_stats_snapshot);
+
         // Move registration into the worker closure in addition to the handle.
         let worker_registration = registration.clone();
         let worker_handle = std::thread::Builder::new()
             .name("hf2q-engine".into())
-            .spawn(move || worker_run(loaded, rx, worker_registration))
+            .spawn(move || {
+                worker_run(
+                    loaded,
+                    rx,
+                    worker_registration,
+                    initial_mode,
+                    queue_capacity_u32,
+                    worker_stats_handle,
+                )
+            })
             .expect("spawn hf2q-engine thread");
 
         Engine {
@@ -2587,11 +2676,9 @@ impl Engine {
                 token_bytes: std::sync::OnceLock::new(),
                 kv_spill_descriptor,
                 tq_packed_descriptor,
-                // ADR-040 Phase C iter-1.5 — the 3-arg `spawn` constructor
-                // is the ADR-005 byte-equivalence entry point; it always
-                // produces a `SerialFifo` engine. Callers wanting
-                // `SlotAware` must go through `spawn_with_mode` (iter-2+).
-                mode: EngineMode::SerialFifo,
+                mode: initial_mode,
+                max_slots: initial_max_slots,
+                scheduler_stats_snapshot,
             }),
         }
     }
@@ -2680,6 +2767,35 @@ impl Engine {
     /// `EngineMode::default()`" was a Liskov-substitution violation).
     pub fn mode(&self) -> EngineMode {
         self.inner.mode
+    }
+
+    /// **ADR-040 Phase C iter-2a (C2b)** — slot cap snapshot.
+    ///
+    /// Always `1` under `EngineMode::SerialFifo` (the only mode that
+    /// survives validation at iter-2a); `max_slots` from `SlotAware`
+    /// once iter-2b lifts the [`EngineSpawnError::ModeNotYetWired`]
+    /// rejection.
+    pub fn max_slots(&self) -> u32 {
+        self.inner.max_slots
+    }
+
+    /// **ADR-040 Phase C iter-2a (C2b)** — most recent
+    /// [`SchedulerStats`] snapshot written by the worker thread.
+    ///
+    /// The worker writes a snapshot after each `release` (FIFO
+    /// completion); handlers read for `/metrics` (Phase C3 wiring).
+    /// On a freshly-spawned engine that has not yet processed any
+    /// requests, the snapshot mirrors the configured `queue_capacity`
+    /// with zero counters.
+    ///
+    /// Returns a cloned [`SchedulerStats`] — the lock is held only for
+    /// the duration of the clone (a 32-byte memcpy plus a discriminant).
+    pub fn scheduler_stats(&self) -> SchedulerStats {
+        self.inner
+            .scheduler_stats_snapshot
+            .lock()
+            .expect("ADR-040 C2b: scheduler_stats_snapshot mutex poisoned")
+            .clone()
     }
 
     /// Iter-215 Wedge-2: which `LoadedModel` variant the worker
@@ -3347,11 +3463,69 @@ fn worker_run(
     mut loaded: LoadedModel,
     mut rx: mpsc::Receiver<Request>,
     registration: Option<super::registry::ModelRegistration>,
+    mode: EngineMode,
+    queue_capacity: u32,
+    scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
 ) {
     tracing::info!(
         model = %loaded.model_id(),
+        ?mode,
+        queue_capacity,
         "hf2q-engine worker thread started"
     );
+
+    // ADR-040 Phase C iter-2a (C2b) — construct the scheduler at thread
+    // entry per dossier §2.3 + §4 iter-2a step 3. Under Shape A the
+    // scheduler is owned exclusively by the worker thread (no `Send +
+    // Sync` Arc<Mutex<...>> contention). The `SlotAware` arm is
+    // genuinely unreachable here because `Engine::spawn_with_mode`
+    // (iter-1.5 F1, engine.rs:2636-2667) rejects it with
+    // `EngineSpawnError::ModeNotYetWired` BEFORE the worker thread is
+    // spawned — the `unreachable!` macro is the defensive surface that
+    // surfaces any future caller that bypasses the spawn-time
+    // rejection. Per ADR-040 §7 the macro is permissible in
+    // genuinely-unreachable branches (matches existing codebase
+    // patterns); typed sentinel errors handle the operator-actionable
+    // surface, `unreachable!` handles the compile-time-impossible
+    // surface.
+    //
+    // Per dossier §2.9 / §2.8: the `Scheduler` trait surface
+    // (`policy`/`admit`/`step`/`release`/`stats`) deliberately does NOT
+    // include `advance_after_prefill` / `advance_after_decode` — those
+    // callbacks live on the concrete `FifoSchedulerAdapter` /
+    // `InflightBatchedScheduler` types because their FSM-advance
+    // surface differs (FIFO has no chunking). Under Shape A iter-2a
+    // we hold the concrete adapter directly (not boxed) so the
+    // advance callbacks are accessible without dynamic dispatch or
+    // downcasting. The dossier §4 iter-2a step 3 snippet wrote
+    // `Box<dyn Scheduler>` for narrative consistency; the concrete-
+    // adapter shape used here is the implementation realisation that
+    // honors §2.9's "advance lives on concrete type" pin.
+    let mut scheduler: FifoSchedulerAdapter = match mode {
+        EngineMode::SerialFifo => FifoSchedulerAdapter::new(queue_capacity),
+        EngineMode::SlotAware { .. } => unreachable!(
+            "ADR-040 Phase C iter-2a (C2b): EngineMode::SlotAware reached \
+             worker_run despite iter-1.5 F1 rejection at \
+             Engine::spawn_with_mode. The spawn-time `EngineSpawnError::\
+             ModeNotYetWired` guard at engine.rs:2663 is the load-bearing \
+             gate; if you reach this panic, a future caller bypassed that \
+             gate. Phase C iter-2b will replace this branch with the \
+             `InflightBatchedScheduler` runtime + a tokio::select! body."
+        ),
+    };
+
+    // Helper closure: push the current SchedulerStats snapshot to the
+    // shared mutex so /metrics readers see the most recent state. Called
+    // after every `release` (FIFO completion) per dossier §4 iter-2a
+    // step 5. Acquiring the lock costs ~tens of nanoseconds when
+    // uncontended; the worker is the sole writer + readers only contend
+    // briefly during a Prometheus scrape.
+    let publish_stats = |sched: &FifoSchedulerAdapter,
+                         snap: &Arc<Mutex<SchedulerStats>>| {
+        if let Ok(mut guard) = snap.lock() {
+            *guard = sched.stats();
+        }
+    };
 
     while let Some(req) = rx.blocking_recv() {
         match req {
@@ -3377,6 +3551,48 @@ fn worker_run(
                 params,
                 reply,
             } => {
+                // ADR-040 Phase C iter-2a (C2b) — Shape A admit→drive→
+                // release wrap (dossier §4 iter-2a step 4). Under
+                // SerialFifo `admit` is infallible on a fresh adapter
+                // (queue_capacity ≥ 1, no in-flight slot) so the
+                // QueueFull arm is defensive only — the mpsc channel's
+                // backpressure already 429-rejects upstream before
+                // reaching worker_run (the 11 handler `tx.try_send`
+                // sites at engine.rs:~2832+ map TrySendError::Full to
+                // anyhow_bail("queue_full") → HTTP 429). The wrap
+                // preserves byte-equivalence (H1/H2 falsifiers) because
+                // the inner `generate_*_once` call is unchanged; only
+                // pre/post bookkeeping calls were added.
+                let admit_req = AdmitRequest {
+                    prompt_tokens: prompt_tokens.len() as u32,
+                    max_tokens: params.max_tokens as u32,
+                };
+                let admitted = match scheduler.admit(admit_req) {
+                    Ok(slot) => slot,
+                    Err(AdmitError::QueueFull { .. }) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "ADR-040 C2b: scheduler admit returned QueueFull \
+                             in worker_run FifoSerial path (mpsc channel \
+                             should have backpressured upstream). \
+                             Programming bug — re-check Engine::generate \
+                             callsite + handler `tx.try_send` route."
+                        )));
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "ADR-040 C2b: scheduler admit failed: {:?}",
+                            e
+                        )));
+                        continue;
+                    }
+                };
+                let handle = admitted.handle.expect(
+                    "ADR-040 C2b: FifoSchedulerAdapter::admit returns \
+                     RequestSlot.handle == Some when the in-flight slot \
+                     is unoccupied (scheduler.rs:526+, iter-2.5 M2)",
+                );
+
                 let result = match &mut loaded {
                     LoadedModel::Gemma(g) => {
                         generate_once(g, &prompt_tokens, &params, registration.as_ref())
@@ -3404,6 +3620,24 @@ fn worker_run(
                         )
                     }
                 };
+
+                // ADR-040 C2b post-pattern (dossier §2.9 + §4 iter-2a step 4):
+                // bookkeep the synthetic prefill+decode cycle for
+                // SchedulerStats accuracy. `advance_after_decode` auto-
+                // releases when `tokens_produced >= max_tokens`
+                // (scheduler.rs:506-518); we issue a defensive `release`
+                // afterwards to cover the EOS / stop-string termination
+                // path. Stale-handle calls are silent no-ops per the
+                // iter-2.5 C1 generation-counter discipline.
+                scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+                if let Ok(ref gr) = result {
+                    for _ in 0..gr.completion_tokens {
+                        scheduler.advance_after_decode(handle);
+                    }
+                }
+                scheduler.release(handle);
+                publish_stats(&scheduler, &scheduler_stats_snapshot);
+
                 let _ = reply.send(result);
             }
             Request::GenerateStream {
@@ -3415,6 +3649,55 @@ fn worker_run(
                 deepstack,
                 positions_flat,
             } => {
+                // ADR-040 C2b admit→drive→release wrap (dossier §4
+                // iter-2a step 4). The streaming arm differs from
+                // Request::Generate in two ways relevant to scheduler
+                // bookkeeping: (a) there is no `reply: oneshot`, so a
+                // QueueFull admit failure is communicated via an Error
+                // event on the events channel; (b) the streaming
+                // function does not return the emitted-token count, so
+                // the post-pattern is `advance_after_prefill` + `release`
+                // (no per-token `advance_after_decode`). The missing
+                // per-token advances are bookkeeping-only — the
+                // FifoSchedulerAdapter's auto-release on
+                // `tokens_produced >= max_tokens` is moot at max_slots=1
+                // (the next request's admit clears the slot regardless),
+                // and `SchedulerStats` exports completed_total via
+                // `release`, not per-token counters. Byte-equivalence
+                // holds because the inner streaming call is unchanged.
+                let admit_req = AdmitRequest {
+                    prompt_tokens: prompt_tokens.len() as u32,
+                    max_tokens: params.max_tokens as u32,
+                };
+                let admitted = match scheduler.admit(admit_req) {
+                    Ok(slot) => slot,
+                    Err(AdmitError::QueueFull { .. }) => {
+                        let _ = events.blocking_send(
+                            super::sse::GenerationEvent::Error(
+                                "ADR-040 C2b: scheduler admit returned \
+                                 QueueFull for GenerateStream (mpsc \
+                                 backpressure should have rejected upstream)."
+                                    .to_string(),
+                            ),
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = events.blocking_send(
+                            super::sse::GenerationEvent::Error(format!(
+                                "ADR-040 C2b: scheduler admit failed for \
+                                 GenerateStream: {:?}",
+                                e
+                            )),
+                        );
+                        continue;
+                    }
+                };
+                let handle = admitted.handle.expect(
+                    "ADR-040 C2b: FifoSchedulerAdapter::admit returns Some \
+                     handle when in-flight slot is unoccupied",
+                );
+
                 // The streaming path sends every event (Delta / Done / Error)
                 // via `events`. Errors stay inside the function — the
                 // terminal event is always one of Done/Error, unless the
@@ -3513,11 +3796,60 @@ fn worker_run(
                         }
                     }
                 }
+
+                // ADR-040 C2b post-pattern — issue the prefill advance
+                // (the streaming function ran the prefill internally) +
+                // release. Per-token `advance_after_decode` is skipped
+                // because the streaming path does not return the emitted-
+                // token count to the worker; see the rationale comment at
+                // the admit site above. Stale-handle calls on the
+                // released handle are silent no-ops per iter-2.5 C1.
+                scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+                scheduler.release(handle);
+                publish_stats(&scheduler, &scheduler_stats_snapshot);
             }
             Request::Embed {
                 prompt_tokens,
                 reply,
             } => {
+                // ADR-040 C2b admit→release wrap (dossier §4 iter-2a
+                // step 4). Embed is a single prefill-only forward (no
+                // decode loop, no completion tokens), so the post-
+                // pattern is `advance_after_prefill` then immediate
+                // `release` — there are no `advance_after_decode` calls
+                // to issue. `max_tokens = 0` reflects the embed
+                // contract (no sampling budget) and is honoured by
+                // FifoSchedulerAdapter::build_in_flight (iter-2.5 M2:
+                // `tokens_produced >= max_tokens` triggers auto-release
+                // on the first decode advance — moot here because we
+                // never advance_after_decode for embed).
+                let admit_req = AdmitRequest {
+                    prompt_tokens: prompt_tokens.len() as u32,
+                    max_tokens: 0,
+                };
+                let admitted = match scheduler.admit(admit_req) {
+                    Ok(slot) => slot,
+                    Err(AdmitError::QueueFull { .. }) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "ADR-040 C2b: scheduler admit returned QueueFull \
+                             for Embed (mpsc backpressure should have rejected \
+                             upstream)."
+                        )));
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "ADR-040 C2b: scheduler admit failed for Embed: {:?}",
+                            e
+                        )));
+                        continue;
+                    }
+                };
+                let handle = admitted.handle.expect(
+                    "ADR-040 C2b: FifoSchedulerAdapter::admit returns Some \
+                     handle when in-flight slot is unoccupied",
+                );
+
                 // Single-shot pooled embedding (Last pooling).  The
                 // worker holds &mut LoadedModel, so prefill's mutation of
                 // self.activations + self.dense_kvs is fine here — it
@@ -3538,6 +3870,11 @@ fn worker_run(
                         crate::inference::models::qwen3vl_text::forward::qwen3vl_text_forward_pending_err()
                     }
                 };
+
+                scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+                scheduler.release(handle);
+                publish_stats(&scheduler, &scheduler_stats_snapshot);
+
                 let _ = reply.send(result);
             }
             Request::GenerateWithSoftTokens {
@@ -3548,6 +3885,39 @@ fn worker_run(
                 positions_flat,
                 reply,
             } => {
+                // ADR-040 C2b admit→drive→release wrap (dossier §4
+                // iter-2a step 4). Vision-aware generate shares the
+                // synthetic prefill+decode bookkeeping shape with
+                // Request::Generate (single prompt prefill, then
+                // tokens_produced decodes).
+                let admit_req = AdmitRequest {
+                    prompt_tokens: prompt_tokens.len() as u32,
+                    max_tokens: params.max_tokens as u32,
+                };
+                let admitted = match scheduler.admit(admit_req) {
+                    Ok(slot) => slot,
+                    Err(AdmitError::QueueFull { .. }) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "ADR-040 C2b: scheduler admit returned QueueFull \
+                             for GenerateWithSoftTokens (mpsc backpressure \
+                             should have rejected upstream)."
+                        )));
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "ADR-040 C2b: scheduler admit failed for \
+                             GenerateWithSoftTokens: {:?}",
+                            e
+                        )));
+                        continue;
+                    }
+                };
+                let handle = admitted.handle.expect(
+                    "ADR-040 C2b: FifoSchedulerAdapter::admit returns Some \
+                     handle when in-flight slot is unoccupied",
+                );
+
                 // Vision-aware generate (Phase 2c Task #17 / iter-98 +
                 // Wedge-4d). Build borrowed `SoftTokenInjection<'_>` /
                 // `DeepstackInjection<'_>` slices from the owned data we
@@ -3655,6 +4025,19 @@ fn worker_run(
                         )
                     }
                 };
+
+                // ADR-040 C2b post-pattern — same bookkeeping shape as
+                // Request::Generate; the inner `generate_*_with_soft_tokens*`
+                // body is unchanged so byte-equivalence holds.
+                scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+                if let Ok(ref gr) = result {
+                    for _ in 0..gr.completion_tokens {
+                        scheduler.advance_after_decode(handle);
+                    }
+                }
+                scheduler.release(handle);
+                publish_stats(&scheduler, &scheduler_stats_snapshot);
+
                 let _ = reply.send(result);
             }
             Request::KvSnapshot {
@@ -8624,6 +9007,16 @@ assistant:
                 kv_spill_descriptor: None,
             tq_packed_descriptor: None,
                 mode: EngineMode::SerialFifo,
+                // ADR-040 C2b scaffold for test-only engines.
+                max_slots: 1,
+                scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
+                    policy: SchedulerPolicy::FifoSerial,
+                    in_flight_slots: 0,
+                    queue_capacity: 8,
+                    admitted_total: 0,
+                    rejected_429_total: 0,
+                    completed_total: 0,
+                })),
             }),
         }
     }
@@ -9513,6 +9906,11 @@ assistant:
             disk_persistor: None,
             lcp_hydrated_for_cfg: std::collections::HashSet::new(),
             tq_kv_active: false,
+            // ADR-040 C2b scaffold (test fixture): the
+            // `persistent_kv_cache` lift on `Qwen35LoadedModel` is iter-2b
+            // scope; iter-2a always constructs it as `None` (per the
+            // production `Qwen35LoadedModel::load` site).
+            persistent_kv_cache: None,
         };
         let qwen = LoadedModel::Qwen35(qwen_loaded);
 
@@ -9837,6 +10235,16 @@ assistant:
                 kv_spill_descriptor: descriptor,
                 tq_packed_descriptor: None,
                 mode: EngineMode::SerialFifo,
+                // ADR-040 C2b scaffold for synthetic test fixtures.
+                max_slots: 1,
+                scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
+                    policy: SchedulerPolicy::FifoSerial,
+                    in_flight_slots: 0,
+                    queue_capacity: 8,
+                    admitted_total: 0,
+                    rejected_429_total: 0,
+                    completed_total: 0,
+                })),
             }),
         }
     }
@@ -10259,6 +10667,195 @@ assistant:
         // would leak GPU buffers across test cases).
         rt.block_on(engine_a.shutdown()).expect("engine_a shutdown");
         rt.block_on(engine_b.shutdown()).expect("engine_b shutdown");
+    }
+
+    // ---------------------------------------------------------------------------
+    // ADR-040 Phase C iter-2a (C2b) — H2 test: two sequential requests
+    // through the SerialFifo path must produce byte-identical results
+    // pair-for-pair (no inter-request state leak introduced by the
+    // admit→drive→release wrap landed at iter-2a in this commit).
+    //
+    // Source: dossier `docs/research/adr040-c2-wiring-dossier-2026-05-24.md`
+    // §2.11 H2 + §3 hypothesis matrix + §4 iter-2a step 7.
+    //
+    // Falsifies what claim: "Under EngineMode::SerialFifo, calling
+    // engine.generate(p1) followed by engine.generate(p2) produces
+    // results byte-identical to calling them in the same order pre-C2 —
+    // i.e. the wrapper does NOT introduce inter-request state leakage."
+    //
+    // Cost-to-falsify: 2 days per dossier H2 row (additional Qwen35
+    // persistent_kv_cache lifecycle correctness exercised). Iter-2a
+    // ships the test in skip mode (same env gate as H1); the live E2E
+    // mode requires HF2Q_BYTE_EQUIV_E2E=1 + HF2Q_BYTE_EQUIV_E2E_GGUF=<path>.
+    //
+    // Vacuous-test guard (same as H1): the test rejects an empty
+    // completion before any byte-equality assertion so a silent zero-
+    // output fixture cannot pass trivially.
+    //
+    // Stakes if FALSIFIES: the persistent_kv_cache lifecycle is
+    // incorrect — likely a missed scheduler.release / drop_seq between
+    // requests in the FifoSerial arm. The fix is localized.
+    // ---------------------------------------------------------------------------
+    #[test]
+    fn engine_serial_fifo_two_sequential_requests_no_state_leak() {
+        if byte_equiv_skip_unless_gated(
+            "engine_serial_fifo_two_sequential_requests_no_state_leak",
+        ) {
+            return;
+        }
+
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "ADR-040 C2b H2: {BYTE_EQUIV_E2E_ENV_GATE}=1 set without \
+                     {BYTE_EQUIV_E2E_GGUF_ENV}=<path>. The H2 sequential pin \
+                     needs a real GGUF on disk to drive two `generate` calls \
+                     through the SerialFifo worker."
+                )
+            });
+        assert!(
+            gguf_path.exists(),
+            "ADR-040 C2b H2: {BYTE_EQUIV_E2E_GGUF_ENV} points to a missing \
+             file: {}",
+            gguf_path.display()
+        );
+
+        // Single LoadedModel under the iter-1.5 F1 SerialFifo entry —
+        // the same worker thread services BOTH requests; the H2 contract
+        // is that request_2 produces byte-identical output to request_1
+        // (no state leaked through the persistent worker / scheduler).
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let loaded = LoadedModel::load(&load_opts).expect("LoadedModel::load (H2)");
+        let queue_capacity: usize = 4;
+        let kv_cache_budget_bytes: Option<u64> = None;
+
+        // Drive both requests through `spawn_with_mode(SerialFifo)` —
+        // the iter-2a C2b refactor's wrapping target. (3-arg `spawn`
+        // delegates to the same path per iter-1.5 F1; this entry point
+        // is the load-bearing surface for future SlotAware extension.)
+        let engine = Engine::spawn_with_mode(
+            loaded,
+            queue_capacity,
+            kv_cache_budget_bytes,
+            EngineMode::SerialFifo,
+        )
+        .expect(
+            "ADR-040 iter-1.5 F1: EngineMode::SerialFifo MUST succeed at \
+             spawn_with_mode (it delegates to 3-arg spawn)",
+        );
+
+        let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 16,
+            ..Default::default()
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread tokio runtime");
+
+        let result_1 = rt
+            .block_on(engine.generate(prompt_tokens.clone(), params.clone()))
+            .expect("engine.generate request 1 (H2)");
+        let result_2 = rt
+            .block_on(engine.generate(prompt_tokens, params))
+            .expect("engine.generate request 2 (H2)");
+
+        // Vacuous-test guard.
+        assert!(
+            !result_1.text.is_empty() || result_1.completion_tokens > 0,
+            "ADR-040 C2b H2 vacuous test: request 1 produced empty text \
+             AND zero completion_tokens (text={:?}, completion_tokens={}). \
+             Use a non-trivial prompt or a fixture with deterministic \
+             non-empty output.",
+            result_1.text,
+            result_1.completion_tokens,
+        );
+
+        // Pairwise field-by-field byte equality. Two sequential requests
+        // with the same prompt + greedy params MUST produce identical
+        // GenerationResults; any divergence indicates the wrapper or the
+        // future persistent_kv_cache lift leaked state between requests.
+        assert_eq!(
+            result_1.text, result_2.text,
+            "ADR-040 C2b H2 FALSIFIED: request 2 `text` differs from request 1 — \
+             inter-request state leaked through the SerialFifo wrap."
+        );
+        assert_eq!(
+            result_1.reasoning_text, result_2.reasoning_text,
+            "ADR-040 C2b H2 FALSIFIED: request 2 `reasoning_text` differs \
+             from request 1."
+        );
+        assert_eq!(
+            result_1.prompt_tokens, result_2.prompt_tokens,
+            "ADR-040 C2b H2 FALSIFIED: request 2 `prompt_tokens` counter \
+             differs from request 1."
+        );
+        assert_eq!(
+            result_1.completion_tokens, result_2.completion_tokens,
+            "ADR-040 C2b H2 FALSIFIED: request 2 `completion_tokens` counter \
+             differs from request 1."
+        );
+        assert_eq!(
+            result_1.reasoning_tokens, result_2.reasoning_tokens,
+            "ADR-040 C2b H2 FALSIFIED: request 2 `reasoning_tokens` differs \
+             from request 1."
+        );
+        assert_eq!(
+            result_1.cached_tokens, result_2.cached_tokens,
+            "ADR-040 C2b H2 FALSIFIED: request 2 `cached_tokens` differs \
+             from request 1."
+        );
+        assert_eq!(
+            result_1.finish_reason, result_2.finish_reason,
+            "ADR-040 C2b H2 FALSIFIED: request 2 `finish_reason` differs \
+             from request 1."
+        );
+        assert_eq!(
+            result_1.logprobs, result_2.logprobs,
+            "ADR-040 C2b H2 FALSIFIED: request 2 `logprobs` differs from \
+             request 1."
+        );
+
+        // ADR-040 C2b additional H2 surface: after both requests
+        // complete, the scheduler stats snapshot reflects both
+        // admit/release pairs. Catches a future regression where
+        // `publish_stats` stops being called after Generate.
+        let stats = engine.scheduler_stats();
+        assert_eq!(
+            stats.policy,
+            SchedulerPolicy::FifoSerial,
+            "ADR-040 C2b H2: scheduler_stats policy must report FifoSerial \
+             under SerialFifo mode."
+        );
+        assert!(
+            stats.admitted_total >= 2,
+            "ADR-040 C2b H2: scheduler_stats.admitted_total must reflect \
+             both Generate requests (got {}).",
+            stats.admitted_total
+        );
+        assert!(
+            stats.completed_total >= 2,
+            "ADR-040 C2b H2: scheduler_stats.completed_total must reflect \
+             both Generate releases (got {}).",
+            stats.completed_total
+        );
+        assert_eq!(
+            stats.in_flight_slots, 0,
+            "ADR-040 C2b H2: scheduler_stats.in_flight_slots must be 0 after \
+             both requests released."
+        );
+
+        rt.block_on(engine.shutdown()).expect("engine shutdown");
     }
 }
 
