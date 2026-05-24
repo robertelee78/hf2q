@@ -1,5 +1,5 @@
 //! Scheduler trait + FIFO adapter + InflightBatched FSM
-//! (ADR-040 Phase B iter-1 + iter-1.5 + iter-B3 + **iter-2.5**).
+//! (ADR-040 Phase B iter-1 + iter-1.5 + iter-B3 + iter-2.5 + **iter-C2.5**).
 //!
 //! This module is the **pure data primitive** that ADR-040 Phase C (iter-2)
 //! wires into `serve::api::engine::Engine`. It contains *no* engine load,
@@ -48,8 +48,18 @@
 //!     `Prefilling` entirely — a zero-token prompt has nothing to prefill).
 //!     Without this, `step()` would emit `Prefill { n_tokens: 0 }` and a
 //!     driver that treated zero-token prefill as no-work would deadlock.
-//!     A request admitted with `max_tokens == 0` auto-releases AT ADMIT
-//!     TIME (mirrors the same "no work to do" reasoning for the decode side).
+//!     A request admitted with `max_tokens == 0` is recognized at admit
+//!     time as zero-budget: the scheduler returns
+//!     `RequestSlot { handle: None, .. }` and bumps `completed_total`
+//!     without creating an in-flight slot. (cfa-iter-C2.5 M1: closes the
+//!     stuck-Decoding-slot risk Codex flagged — the prior implementation
+//!     was a documentation lie: the comment claimed "auto-releases at
+//!     admit time" but `initial_phase` still pushed a `Decoding{ tokens_
+//!     produced:0, max_tokens:0 }` slot into in_flight, and only the
+//!     Embed worker arm's explicit post-prefill `release` avoided the
+//!     leak. Now the scheduler enforces it structurally: a zero-budget
+//!     admit allocates no physical slot, and the caller observes
+//!     `handle.is_none()` and skips the drive loop.)
 //! - Pins the prefill chunk-size default at `DEFAULT_PREFILL_CHUNK_TOKENS
 //!   = 512` — matches llama.cpp's `-ub` (ubatch) default.
 //!
@@ -440,6 +450,14 @@ impl FifoSchedulerAdapter {
     /// Construct the in-flight slot for the given admit, using the current
     /// generation counter. Honours iter-2.5 M2: a `prompt_tokens == 0`
     /// request transitions directly to decoding (no prefill).
+    ///
+    /// Caller MUST have already short-circuited the iter-C2.5 M1
+    /// `max_tokens == 0` case (see `classify_admit`) — this constructor
+    /// always allocates a physical slot and assumes a non-zero decode
+    /// budget. Passing `max_tokens == 0` would build a `Decoding {
+    /// tokens_produced: 0, max_tokens: 0 }` slot that auto-releases on
+    /// the very first `advance_after_decode`, i.e. the stuck-state bug
+    /// the M1 short-circuit eliminates.
     fn build_in_flight(
         &self,
         request_id: RequestId,
@@ -480,12 +498,26 @@ impl FifoSchedulerAdapter {
 
     /// Promote the next queued request into the in-flight slot. Caller
     /// guarantees `self.in_flight.is_none()` (asserted in debug builds).
+    ///
+    /// iter-C2.5 M1: if the next queued request has `max_tokens == 0`,
+    /// it completes-at-promote (bump `completed_total`, do NOT allocate
+    /// a physical slot) and the loop continues to the NEXT queued
+    /// request. This mirrors the admit-time short-circuit so a future
+    /// caller that enqueues zero-budget work directly cannot leak a
+    /// stuck slot. Under normal use (`admit` short-circuits FIRST), the
+    /// branch is defensive.
     fn promote_one(&mut self) {
         debug_assert!(self.in_flight.is_none(), "promote_one called with in_flight occupied");
-        if let Some(q) = self.queue.pop_front() {
+        while let Some(q) = self.queue.pop_front() {
+            if classify_admit(q.prompt_tokens, q.max_tokens) == InitialAdmitOutcome::CompletedAtAdmit
+            {
+                self.completed_total = self.completed_total.saturating_add(1);
+                continue;
+            }
             self.in_flight = Some(self.build_in_flight(
                 q.request_id, q.admitted_at, q.prompt_tokens, q.max_tokens,
             ));
+            return;
         }
     }
 
@@ -536,6 +568,22 @@ impl Scheduler for FifoSchedulerAdapter {
         let request_id = self.next_request_id();
         let admitted_at = Instant::now();
         self.admitted_total = self.admitted_total.saturating_add(1);
+
+        // cfa-iter-C2.5 M1: zero-budget (`max_tokens == 0`) short-circuits.
+        // No physical slot allocated, no queue entry, no generation bump
+        // (no slot lifecycle to track). The caller observes
+        // `handle.is_none()` and skips the drive loop.
+        if classify_admit(req.prompt_tokens, req.max_tokens) == InitialAdmitOutcome::CompletedAtAdmit
+        {
+            self.completed_total = self.completed_total.saturating_add(1);
+            return Ok(RequestSlot {
+                request_id,
+                handle: None,
+                admitted_at,
+                prompt_tokens: req.prompt_tokens,
+                max_tokens: req.max_tokens,
+            });
+        }
 
         let public = if self.in_flight.is_none() {
             let slot = self.build_in_flight(
@@ -621,6 +669,45 @@ impl Scheduler for FifoSchedulerAdapter {
 enum SlotPhase {
     Prefilling { tokens_remaining: u32 },
     Decoding { tokens_produced: u32, max_tokens: u32 },
+}
+
+/// Outcome of evaluating a fresh admit request's prompt/budget shape.
+///
+/// (cfa-iter-C2.5 M1 fix.) `initial_admit_outcome` returns this so the
+/// admit body can dispatch:
+///
+/// - `PhaseToPrefilling`: normal admit — slot transitions through
+///   `SlotPhase::Prefilling` first.
+/// - `PhaseToDecoding`: `prompt_tokens == 0` admit (iter-2.5 M2) — slot
+///   skips prefill, transitions directly to `SlotPhase::Decoding`.
+/// - `CompletedAtAdmit`: `max_tokens == 0` admit — no decode budget.
+///   The scheduler does NOT allocate a physical slot; admit bumps
+///   `admitted_total` + `completed_total` and returns
+///   `RequestSlot { handle: None, .. }`. The caller observes
+///   `handle.is_none()` and skips the drive loop entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialAdmitOutcome {
+    PhaseToPrefilling,
+    PhaseToDecoding,
+    CompletedAtAdmit,
+}
+
+/// Shared admit-shape classifier used by both `FifoSchedulerAdapter` +
+/// `InflightBatchedScheduler` (cfa-iter-C2.5 M1). Pure function — no
+/// scheduler state touched — so the two adapters share one classifier
+/// without a cross-type method call indirection.
+///
+/// `max_tokens == 0` takes priority over `prompt_tokens == 0`: a
+/// request with no decode budget has nothing to do regardless of
+/// prompt length. See [`InitialAdmitOutcome`] variant docs.
+fn classify_admit(prompt_tokens: u32, max_tokens: u32) -> InitialAdmitOutcome {
+    if max_tokens == 0 {
+        return InitialAdmitOutcome::CompletedAtAdmit;
+    }
+    if prompt_tokens == 0 {
+        return InitialAdmitOutcome::PhaseToDecoding;
+    }
+    InitialAdmitOutcome::PhaseToPrefilling
 }
 
 /// In-flight slot bookkeeping.
@@ -714,15 +801,12 @@ impl InflightBatchedScheduler {
         self.slot_generations[idx]
     }
 
-    /// Compute the slot phase for an admit, honouring iter-2.5 M2
-    /// (`prompt_tokens == 0` skips prefill, transitions directly to
-    /// decoding).
-    fn initial_phase(prompt_tokens: u32, max_tokens: u32) -> SlotPhase {
-        if prompt_tokens == 0 {
-            SlotPhase::Decoding { tokens_produced: 0, max_tokens }
-        } else {
-            SlotPhase::Prefilling { tokens_remaining: prompt_tokens }
-        }
+    /// Compute the admit outcome for a request. Thin associated-fn
+    /// wrapper around the module-level [`classify_admit`] free function
+    /// — kept on the impl so call sites read symmetrically against the
+    /// FIFO + InflightBatched adapters.
+    fn initial_admit_outcome(prompt_tokens: u32, max_tokens: u32) -> InitialAdmitOutcome {
+        classify_admit(prompt_tokens, max_tokens)
     }
 
     /// Try to promote one queued request into `in_flight`. Returns the
@@ -731,24 +815,61 @@ impl InflightBatchedScheduler {
     /// iter-2.5 C2: queued requests no longer carry sentinel slot ids.
     /// The real handle (slot_id + generation) is freshly allocated here.
     /// iter-2.5 M2: zero-prompt requests promote directly to decoding.
+    /// iter-C2.5 M1: zero-budget (`max_tokens == 0`) queued requests
+    /// complete-at-promote without allocating a physical slot. This
+    /// path is reachable when admit was queued (in_flight was at cap)
+    /// for a zero-budget request — `admit` short-circuits zero-budget
+    /// FIRST so under normal use this branch is defensive, but the
+    /// invariant is enforced here too so future call sites cannot leak
+    /// a stuck slot by queuing zero-budget work directly.
     fn try_promote_one_queued(&mut self) -> Option<SlotHandle> {
         if (self.in_flight.len() as u32) >= self.max_slots {
             return None;
         }
-        let q = self.queue.pop_front()?;
-        let slot_id = self.alloc_slot_id();
-        let generation = self.slot_generations[slot_id.0 as usize];
-        let handle = SlotHandle { slot_id, generation };
-        let phase = Self::initial_phase(q.prompt_tokens, q.max_tokens);
-        self.in_flight.push(InflightSlot {
-            request_id: q.request_id,
-            handle,
-            admitted_at: q.admitted_at,
-            prompt_tokens: q.prompt_tokens,
-            max_tokens: q.max_tokens,
-            phase,
-        });
-        Some(handle)
+        // iter-C2.5 M1: skip past zero-budget queued entries (they
+        // complete-at-promote without consuming a physical slot) until
+        // we find a real promotion candidate or the queue is empty.
+        // Under normal use the admit-time short-circuit prevents zero-
+        // budget entries from ever entering the queue, so this loop is
+        // defensive; the test
+        // `inflight_promote_queued_with_max_tokens_0_does_not_leak`
+        // synthesizes the direct-push case to pin the invariant.
+        while let Some(q) = self.queue.pop_front() {
+            match classify_admit(q.prompt_tokens, q.max_tokens) {
+                InitialAdmitOutcome::CompletedAtAdmit => {
+                    self.completed_total = self.completed_total.saturating_add(1);
+                    continue;
+                }
+                outcome @ (InitialAdmitOutcome::PhaseToPrefilling
+                | InitialAdmitOutcome::PhaseToDecoding) => {
+                    let slot_id = self.alloc_slot_id();
+                    let generation = self.slot_generations[slot_id.0 as usize];
+                    let handle = SlotHandle { slot_id, generation };
+                    let phase = match outcome {
+                        InitialAdmitOutcome::PhaseToPrefilling => SlotPhase::Prefilling {
+                            tokens_remaining: q.prompt_tokens,
+                        },
+                        InitialAdmitOutcome::PhaseToDecoding => SlotPhase::Decoding {
+                            tokens_produced: 0,
+                            max_tokens: q.max_tokens,
+                        },
+                        InitialAdmitOutcome::CompletedAtAdmit => unreachable!(
+                            "inner match already discriminated CompletedAtAdmit"
+                        ),
+                    };
+                    self.in_flight.push(InflightSlot {
+                        request_id: q.request_id,
+                        handle,
+                        admitted_at: q.admitted_at,
+                        prompt_tokens: q.prompt_tokens,
+                        max_tokens: q.max_tokens,
+                        phase,
+                    });
+                    return Some(handle);
+                }
+            }
+        }
+        None
     }
 
     /// Find the index of the first Prefilling slot (insertion / FIFO order).
@@ -849,13 +970,40 @@ impl Scheduler for InflightBatchedScheduler {
         let admitted_at = Instant::now();
         self.admitted_total = self.admitted_total.saturating_add(1);
 
+        // cfa-iter-C2.5 M1: dispatch on admit outcome. CompletedAtAdmit
+        // (max_tokens == 0) short-circuits — no physical slot allocated,
+        // no queue entry, handle: None. Other outcomes follow the
+        // pre-existing in_flight-or-queue path.
+        let outcome = Self::initial_admit_outcome(req.prompt_tokens, req.max_tokens);
+        if matches!(outcome, InitialAdmitOutcome::CompletedAtAdmit) {
+            self.completed_total = self.completed_total.saturating_add(1);
+            return Ok(RequestSlot {
+                request_id,
+                handle: None,
+                admitted_at,
+                prompt_tokens: req.prompt_tokens,
+                max_tokens: req.max_tokens,
+            });
+        }
+
         let public = if in_flight < self.max_slots {
             // Admit directly to in_flight: allocate handle, set phase
             // (honouring iter-2.5 M2 for zero-prompt requests).
             let slot_id = self.alloc_slot_id();
             let generation = self.slot_generations[slot_id.0 as usize];
             let handle = SlotHandle { slot_id, generation };
-            let phase = Self::initial_phase(req.prompt_tokens, req.max_tokens);
+            let phase = match outcome {
+                InitialAdmitOutcome::PhaseToPrefilling => SlotPhase::Prefilling {
+                    tokens_remaining: req.prompt_tokens,
+                },
+                InitialAdmitOutcome::PhaseToDecoding => SlotPhase::Decoding {
+                    tokens_produced: 0,
+                    max_tokens: req.max_tokens,
+                },
+                InitialAdmitOutcome::CompletedAtAdmit => unreachable!(
+                    "CompletedAtAdmit already handled by the early-return above"
+                ),
+            };
             self.in_flight.push(InflightSlot {
                 request_id,
                 handle,
@@ -2007,6 +2155,171 @@ mod tests {
         s.advance_after_decode(a_h);
         s.advance_after_decode(a_h); // auto-release
         assert_eq!(s.stats().in_flight_slots, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // iter-C2.5 M1 — `max_tokens == 0` admit short-circuits with
+    // handle: None, does NOT leak an in-flight slot.
+    //
+    // Codex /cfa rev-1 finding M1: prior iter-2.5 inline comment claimed
+    // "max_tokens == 0 auto-releases at admit time" but `initial_phase`
+    // still pushed a `Decoding { tokens_produced: 0, max_tokens: 0 }`
+    // slot into `in_flight` — only the Embed worker arm's explicit post-
+    // prefill `release` avoided the stuck-slot bug, and that was
+    // accidental: any future SlotAware / generate path that observed a
+    // zero-budget admit as Decoding work would leak the slot.
+    //
+    // iter-C2.5 M1 fix (this iter):
+    // - `classify_admit` returns `CompletedAtAdmit` for `max_tokens == 0`
+    //   regardless of `prompt_tokens` (max_tokens takes priority — no
+    //   decode budget means nothing to do).
+    // - FIFO + Inflight `admit` short-circuit: bump `admitted_total` +
+    //   `completed_total`, return `RequestSlot { handle: None, .. }`,
+    //   NO slot allocated.
+    // - `try_promote_one_queued` (Inflight) + `promote_one` (FIFO) also
+    //   short-circuit zero-budget queued items so even a future caller
+    //   that bypasses the admit-time short-circuit cannot leak a slot.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fifo_admit_with_max_tokens_0_returns_handle_none() {
+        // cfa-iter-C2.5 M1: max_tokens=0 admit → handle: None, no slot
+        // allocated, completed_total bumped.
+        let mut s = FifoSchedulerAdapter::new(4);
+        let r = s.admit(req(8, 0)).expect("zero-budget admit must succeed");
+        assert!(r.handle.is_none(),
+            "max_tokens=0 admit must return handle: None (no slot allocated)");
+        assert_eq!(r.prompt_tokens, 8, "RequestSlot still echoes input prompt_tokens");
+        assert_eq!(r.max_tokens, 0, "RequestSlot still echoes input max_tokens");
+
+        let stats = s.stats();
+        assert_eq!(stats.admitted_total, 1, "admitted_total bumped");
+        assert_eq!(stats.completed_total, 1,
+            "completed_total bumped at admit time (zero-budget short-circuit)");
+        assert_eq!(stats.in_flight_slots, 0,
+            "no physical slot allocated for zero-budget admit");
+
+        // step() returns Idle — the would-have-been slot doesn't exist.
+        assert_eq!(s.step().unwrap(), SchedulerStep::Idle,
+            "no in-flight slot, no queued slot → Idle");
+
+        // A subsequent normal admit lands cleanly in the unoccupied slot.
+        let b = s.admit(req(3, 5)).expect("normal admit after zero-budget");
+        let b_h = handle_of(&b);
+        assert_eq!(b_h.slot_id, SlotId(0),
+            "next admit gets the never-allocated slot 0");
+        assert_eq!(b_h.generation, 0,
+            "no generation bump (no release happened — slot was never allocated)");
+    }
+
+    #[test]
+    fn inflight_admit_with_max_tokens_0_does_not_leak_slot() {
+        // cfa-iter-C2.5 M1: N admits with max_tokens=0 under max_slots=4
+        // → in_flight_slots stays at 0; completed_total bumps each time.
+        let mut s = InflightBatchedScheduler::new(8, 4);
+        for i in 0..16 {
+            let r = s.admit(req(3, 0)).expect("zero-budget admit must succeed");
+            assert!(r.handle.is_none(),
+                "iter {}: max_tokens=0 admit must return handle: None", i);
+        }
+        let stats = s.stats();
+        assert_eq!(stats.in_flight_slots, 0,
+            "16 zero-budget admits must leak ZERO in-flight slots (regression: \
+             prior iter-2.5 pushed Decoding{{0,0}} into in_flight)");
+        assert_eq!(stats.admitted_total, 16, "all 16 counted as admitted");
+        assert_eq!(stats.completed_total, 16,
+            "all 16 counted as completed-at-admit (no slot lifecycle)");
+        assert_eq!(stats.rejected_429_total, 0,
+            "no QueueFull — short-circuit happens after capacity check");
+
+        // step() returns Idle — no slots ever allocated.
+        assert_eq!(s.step().unwrap(), SchedulerStep::Idle);
+    }
+
+    #[test]
+    fn fifo_admit_prompt_tokens_0_max_tokens_0_no_leak() {
+        // cfa-iter-C2.5 M1: both zeros → CompletedAtAdmit (max_tokens
+        // takes priority over prompt_tokens). No slot allocated.
+        let mut s = FifoSchedulerAdapter::new(4);
+        let r = s.admit(req(0, 0)).expect("both-zeros admit must succeed");
+        assert!(r.handle.is_none(),
+            "prompt_tokens=0 AND max_tokens=0 → handle: None (max_tokens wins)");
+        let stats = s.stats();
+        assert_eq!(stats.admitted_total, 1);
+        assert_eq!(stats.completed_total, 1);
+        assert_eq!(stats.in_flight_slots, 0);
+
+        // Inflight side: same shape.
+        let mut s2 = InflightBatchedScheduler::new(4, 2);
+        let r2 = s2.admit(req(0, 0)).expect("both-zeros inflight admit ok");
+        assert!(r2.handle.is_none(),
+            "inflight prompt_tokens=0 AND max_tokens=0 → handle: None");
+        let stats2 = s2.stats();
+        assert_eq!(stats2.in_flight_slots, 0);
+        assert_eq!(stats2.completed_total, 1);
+    }
+
+    #[test]
+    fn inflight_promote_queued_with_max_tokens_0_does_not_leak() {
+        // cfa-iter-C2.5 M1 defensive-promote pin: a zero-budget request
+        // CANNOT enter the queue via the normal `admit` path (the admit-
+        // time short-circuit fires FIRST regardless of in_flight/queue
+        // occupancy). This test exercises the admit-time short-circuit
+        // under the same shape that previously would have queued.
+        //
+        // Setup: fill max_slots with normal admits so the next admit
+        // WOULD have been queued under the pre-M1 behaviour. Now the
+        // zero-budget admit still short-circuits → handle: None,
+        // in_flight unchanged, no queued entry.
+        let mut s = InflightBatchedScheduler::new(4, 2);
+        let _a = s.admit(req(5, 4)).expect("a normal admit, in_flight slot 0");
+        let _b = s.admit(req(7, 4)).expect("b normal admit, in_flight slot 1");
+        assert_eq!(s.stats().in_flight_slots, 2);
+        assert_eq!(s.queue.len(), 0);
+
+        // Now the would-be-queued admit is zero-budget; it short-circuits.
+        let c = s.admit(req(11, 0)).expect("c zero-budget admit ok");
+        assert!(c.handle.is_none(),
+            "zero-budget admit at in_flight-cap still short-circuits — not queued");
+        assert_eq!(s.queue.len(), 0,
+            "zero-budget request MUST NOT enter the queue (cfa-iter-C2.5 M1)");
+        assert_eq!(s.stats().in_flight_slots, 2, "in_flight unchanged");
+        assert_eq!(s.stats().completed_total, 1, "c counted as completed");
+
+        // Defensive layer: even if a future caller bypasses `admit` and
+        // pushes a zero-budget request directly into the queue, the
+        // `try_promote_one_queued` path also short-circuits. Synthesize
+        // a queued zero-budget entry and drive promotion via release →
+        // step.
+        s.queue.push_back(QueuedInflightRequest {
+            request_id: RequestId(99_999),
+            admitted_at: Instant::now(),
+            prompt_tokens: 5,
+            max_tokens: 0,
+        });
+        s.queue.push_back(QueuedInflightRequest {
+            request_id: RequestId(99_998),
+            admitted_at: Instant::now(),
+            prompt_tokens: 7,
+            max_tokens: 4, // normal — should be the one promoted
+        });
+        let completed_before = s.stats().completed_total;
+        let in_flight_before = s.stats().in_flight_slots;
+        // Drop one normal in_flight slot so promotion has room.
+        s.release(handle_of(&_a));
+        // step() should promote PAST the zero-budget queued entry to
+        // reach the normal one. Zero-budget queued entry completes-at-
+        // promote (bumps completed_total) but consumes no slot.
+        let _ = s.step().unwrap();
+        let stats = s.stats();
+        // a's release bumped completed_total by 1; zero-budget queued
+        // promote-skip bumped it by 1 more.
+        assert!(stats.completed_total >= completed_before + 2,
+            "release + zero-budget-queued-skip both bump completed_total \
+             (was {}, now {})", completed_before, stats.completed_total);
+        assert_eq!(stats.in_flight_slots, in_flight_before,
+            "in_flight unchanged: released a → promoted normal request \
+             past skipped zero-budget queued entry");
     }
 
     // -----------------------------------------------------------------------

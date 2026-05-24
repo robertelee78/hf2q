@@ -840,6 +840,93 @@ Per ADR-040 §6 Phase C row C4, this iter ships the operator-facing surface for 
 
 **Dossier provenance**: this iter implements the C4 row directly from §6 Phase C without a separate dossier — the work is purely operator-surface plumbing on top of the already-shipped iter-1.5 F1 `spawn_with_mode` API + iter-C2b `worker_run` refactor. The `parse_scheduler_config` helper mirrors `should_enable_kv_persist`'s pure-function/no-env-mutation discipline so unit tests run without `std::env::set_var` races.
 
+### 6.1.10 Iter-C2.5 closure — Codex /cfa rev-1 follow-ups on C2a/C2b (2026-05-23, this commit)
+
+Per Codex /cfa rev-1 verdict `request_changes` (severity=med) on iter-C2a (commit `01b9429b`) + iter-C2b (commit `886f229c`), this iter closes the 3 major findings + 1 mantra strengthening. Minor findings are flagged + deferred with rationale.
+
+| Finding | Source | Severity | Where | Fix |
+|---|---|---|---|---|
+| M1 | Codex /cfa | major | `src/serve/scheduler.rs` (admit comment vs admit body, plus 4 worker_run admit sites in `src/serve/api/engine.rs`) | `max_tokens == 0` admit short-circuits in the scheduler itself — returns `RequestSlot { handle: None, .. }`, bumps `admitted_total` + `completed_total` without allocating a physical slot. New module-private `fn classify_admit` + `enum InitialAdmitOutcome { PhaseToPrefilling, PhaseToDecoding, CompletedAtAdmit }`. All 4 `worker_run` arms updated to handle `handle.is_none()` (still call the inner `generate_*` body to preserve pre-C2 byte-equivalence; skip scheduler bookkeeping). `try_promote_one_queued` (Inflight) + `promote_one` (FIFO) also skip-past zero-budget queued items defensively. |
+| M2 | Codex /cfa | major | `src/serve/api/engine.rs` H1 + H2 silently skip in CI under default cargo test runs | **Approach B + C**: Approach A (default-on deterministic fixture lifting H1+H2 out of env-gating) is NOT feasible because `make_synthetic_engine_for_test` does not call `worker_run` (no scheduler bookkeeping); making it call worker_run would require either a real GGUF on every CI run (memory + GPU cost) or refactoring the synthetic worker to run worker_run against a fake LoadedModel (invasive — touches production code paths via LoadedModel enum). Instead: (B) document the operator-run release gate explicitly + (C) ship a synthetic-fixture-only consistency pin (`engine_scheduler_admit_release_consistency_under_synthetic_fixture`) that exercises the snapshot initialization path on `Engine::spawn` / `spawn_with_mode` even without a real model. |
+| M3 | Codex /cfa | major | `src/serve/api/engine.rs:10672-10858` H2 compared the SerialFifo engine to itself (one engine, two requests) | H2 rewritten: build TWO engines (`engine_a = Engine::spawn`, `engine_b = Engine::spawn_with_mode(SerialFifo)`), use DISTINCT prompts (p1 then p2 through both engines), assert pairwise byte-equality at r1 AND r2, plus same-prompt-twice intra-engine guard (a_r1 == a_r1_again, b_r1 == b_r1_again), plus `assert_ne!(a_r1, a_r2)` vacuous-test guard rejecting fixtures where p1 + p2 produce identical outputs. |
+| §7 mantra strengthening | Codex /cfa MED | minor | scheduler `// max_tokens == 0 auto-releases at admit time` comment was a documentation lie | Comment replaced with the structurally-true description; scheduler code matches the new comment (M1). |
+
+#### M2 Approach B — operator-run release gate
+
+H1 + H2 are env-gated regression pins for forward-path byte-equivalence. They cannot run on developer-laptop `cargo test` or hot-loop CI without a tiny GGUF on disk and (~minutes of) live GPU model load. The release gate for any commit that touches `worker_run` (or the `Scheduler` trait surface, or any `FifoSchedulerAdapter` / `InflightBatchedScheduler` admit/promote/release path) is:
+
+```
+HF2Q_BYTE_EQUIV_E2E=1 \
+HF2Q_BYTE_EQUIV_E2E_GGUF=/path/to/tiny.gguf \
+cargo test --release --bin hf2q -- \
+  engine_serial_fifo_byte_equivalent_to_pre_phase_c \
+  engine_serial_fifo_two_sequential_requests_no_state_leak
+```
+
+Expected output shape:
+
+```
+running 2 tests
+test serve::api::engine::tests::engine_serial_fifo_byte_equivalent_to_pre_phase_c ... ok
+test serve::api::engine::tests::engine_serial_fifo_two_sequential_requests_no_state_leak ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; <N> filtered out; ...
+```
+
+Operator MUST record this output in the commit message (or attach via PR description) when `worker_run` / scheduler-trait-surface changes ship. Reviewers reject commits that touch the wrap surface without this evidence. Reference: Codex /cfa iter-C2.5 M2.
+
+#### M2 Approach C — synthetic-fixture consistency pin
+
+New test `serve::api::engine::tests::engine_scheduler_admit_release_consistency_under_synthetic_fixture` runs default-on (no env gate). It pins an ORTHOGONAL property to H1/H2: that two independently-constructed synthetic engines produce SHAPE-equivalent `SchedulerStats` snapshots (same policy, same queue_capacity, zero counters) and honest `mode()` / `max_slots()` reports. Catches a future regression where the two spawn entry points seed `scheduler_stats_snapshot` differently OR break per-engine isolation by sharing mutable state.
+
+#### LOC delta per file
+
+| File | + | - | Net |
+|---|---:|---:|---:|
+| `src/serve/scheduler.rs` | +341 | -28 | +313 (4 new tests + classify_admit + InitialAdmitOutcome enum + admit short-circuits in both adapters + defensive try_promote loop in Inflight + promote_one loop in FIFO + updated doc-blocks; +185 of these are M1 test bodies) |
+| `src/serve/api/engine.rs` | +416 | -135 | +281 (H2 full rewrite for pairwise spawn-vs-spawn_with_mode + distinct prompts + same-prompt-twice guard + vacuous-test guard #2 + Approach C synthetic-fixture test + 4 worker_run arms updated for `handle.is_none()` path + `SlotHandle` import) |
+| `docs/ADR-040-continuous-batching-reopen.md` | +87 | 0 | +87 (this §6.1.10 closure block) |
+| **Total** | **+844** | **-163** | **+681** |
+
+#### Test count delta
+
+| Module | Pre-iter | Post-iter | Delta |
+|---|---:|---:|---:|
+| `serve::scheduler::tests` | 47 | 51 | +4 (M1 tests: `fifo_admit_with_max_tokens_0_returns_handle_none`, `inflight_admit_with_max_tokens_0_does_not_leak_slot`, `fifo_admit_prompt_tokens_0_max_tokens_0_no_leak`, `inflight_promote_queued_with_max_tokens_0_does_not_leak`) |
+| `serve::api::engine::tests` | 50 | 51 | +1 (Approach C: `engine_scheduler_admit_release_consistency_under_synthetic_fixture`); H1 + H2 retain skip-mode verdict + count |
+| Regression bundle (`qwen35::kv_cache::tests serve::scheduler::tests serve::multi_seq_kv::tests qwen35::forward_gpu::tests::b4a qwen35::forward_gpu::tests::b4a_cont serve::tests::c4`) | 159 | 163 | +4 (M1 tests propagate into the scheduler::tests count under the bundle) |
+
+#### M1 behaviour-change vs pre-C2 audit
+
+The M1 fix changes the SCHEDULER behaviour for `max_tokens == 0`: pre-iter, admit pushed a `Decoding { tokens_produced: 0, max_tokens: 0 }` slot into `in_flight`; post-iter, admit short-circuits with `handle: None` and bumps `completed_total`. The ENGINE behaviour is byte-equivalent to pre-C2:
+
+- `generate_once` applies `params.max_tokens.max(1)` (engine.rs:4909) — a max_tokens=0 request still runs one prefill forward + one decode token under pre-ADR-040. Post-M1, the inner `generate_*` body is still invoked unconditionally; only the wrapping `advance_after_prefill` + `release` calls are skipped when `handle.is_none()`. The `GenerationResult` returned to the caller is byte-identical.
+- Embed always passes `max_tokens: 0` (engine.rs:3855). Pre-M1: admit → handle=Some → forward_embed_last → advance_after_prefill → release. Post-M1: admit (short-circuits, bumps `completed_total`) → handle=None → forward_embed_last → (skip wrapping). The `EmbeddingResult` returned to the caller is byte-identical; `SchedulerStats` counters are equivalent (`admitted_total` + `completed_total` each end at +1 per request).
+- `SchedulerStats.in_flight_slots` reads 0 in both regimes after each request finishes (pre-M1 via `release`, post-M1 via never-allocated).
+
+H1 (byte-equivalence pin) under the operator-run gate verifies this empirically; no source-line in `worker_run`'s generation arms produces an observably-different `GenerationResult` for any input.
+
+#### Deferred Codex /cfa rev-1 minor findings (with rationale)
+
+| Finding | Defer-to iter | Rationale |
+|---|---|---|
+| Streaming per-token `advance_after_decode` | Phase C3 | The GenerateStream arm bookkeeps prefill + release but NOT per-token decode (the streaming function does not return the emitted-token count to the worker). Closing this requires reshaping `generate_*_stream_once` to thread a per-token callback or to return a cumulative token count — SSE territory, intentionally scoped to C3 per ADR-040 §6 Phase C. |
+| `unreachable!` in `worker_run` SlotAware branch | iter-2b | `EngineMode::SlotAware` is rejected at `spawn_with_mode` (iter-1.5 F1) so the branch is genuinely unreachable today. Iter-2b lifts the rejection AND replaces the `unreachable!` with the `InflightBatchedScheduler` runtime body. Removing the macro now would leave a noop branch with no failure-mode coverage — worse than the structured surface. ADR-040 §7 explicitly allows `unreachable!` in genuinely-unreachable branches. |
+
+#### Quality gates (all PASS)
+
+- `cargo check --release` returns 0.
+- `cargo check --release --tests` returns 0 (no new warnings; pre-existing `gpu_full_attn.rs:11455-57` unused-`bad_shape` only).
+- `cargo test --release --bin hf2q -- serve::scheduler::tests` returns 0 with **51 PASS / 0 FAIL** (47 pre + 4 M1 new).
+- `cargo test --release --bin hf2q -- serve::api::engine::tests` returns 0 with **51 PASS / 0 FAIL** (50 pre + 1 Approach C new; H1 + H2 retain skip-mode verdict).
+- `cargo test --release --bin hf2q -- engine_serial_fifo_byte_equivalent_to_pre_phase_c engine_serial_fifo_two_sequential_requests_no_state_leak` returns 0 with **2 PASS / 0 FAIL** (skip-mode verdict; live E2E mode requires operator-run gate per Approach B).
+- `cargo test --release --bin hf2q -- qwen35::kv_cache::tests serve::scheduler::tests serve::multi_seq_kv::tests qwen35::forward_gpu::tests::b4a qwen35::forward_gpu::tests::b4a_cont serve::tests::c4` returns 0 with **163 PASS / 0 FAIL** (regression bundle from §6.1.6 / C2a / C2b / C4 intact; +4 from M1 tests).
+- NO `// TODO`, NO `unimplemented!()`, NO new `panic!()` in production code. The pre-existing `unreachable!()` at engine.rs:3533 (C2b SlotAware guard) is intentionally retained per ADR-040 §7 + the deferred-minor rationale above.
+
+#### Dossier provenance
+
+Closes Codex /cfa rev-1 findings on `01b9429b` (iter-C2a) + `886f229c` (iter-C2b). No standalone dossier — this iter is bounded surface-area follow-up on the already-shipped C2a/C2b work; the Codex review at `/tmp/cfa-c2-review/codex-review-last.txt` enumerates the 3 majors + 4 minors that drove this scope.
+
 ---
 
 ## 7. Risks + mitigations
