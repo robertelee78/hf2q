@@ -1615,7 +1615,7 @@ NEITHER test calls `engine.try_admit_budget(...)` directly. The two `a5d_seam_on
 
 ---
 
-### 6.1.19 Iter-A3b iter-1 closure — Gemma 4 multi-seq lift for HybridKvBuffers + clamps for DenseKvBuffers/MlxKvCache (2026-05-24, this commit)
+### 6.1.19 Iter-A3b iter-1 closure — Gemma 4 multi-seq lift for HybridKvBuffers + clamps for DenseKvBuffers/MlxKvCache (2026-05-24, commit `15689b16`; iter-1.5 hygiene fix in follow-up commit per /cfa request_changes)
 
 **Scope** (per A2/A3 dossier §Gemma 4 KV variants + R3 + H10 falsification):
 
@@ -1675,7 +1675,7 @@ The A3b iter-1 sibling-struct ships the lift without touching the 3 production a
 - ✅ Every clamp returns a typed error with operator-grep'able context (capability label + deferral iter name).
 - ✅ Per-struct `CapabilityUnsupported` labels mention the deferred iter (`A3b iter-2` / `A3b iter-3`) + the struct name + the legacy-path identifier — same shape as A3a's `gemma4_hb_kv_fork_cross_slot_returns_capability_unsupported` pin.
 - ✅ Bounds-FIRST ordering preserved across all 18 new trait methods (per iter-1.5 cfa-finding-F5).
-- ✅ A5* arc closure (HEAD `17f06a26`) NOT touched — additive impl only; the 4 changed files at session start (engine.rs, load_info.rs, multi_seq_kv.rs, scheduler.rs + 2 tests) are not modified by this iter.
+- ✅ A5* arc closure (commit `17f06a26` — the last A5* commit) NOT touched — additive impl only; the A5* files (engine.rs, load_info.rs, multi_seq_kv.rs, scheduler.rs, handlers.rs, schema.rs, sse.rs + 2 tests) are not modified by this iter.
 
 **Verification**:
 

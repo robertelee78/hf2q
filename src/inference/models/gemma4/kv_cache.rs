@@ -147,9 +147,11 @@ pub struct HbKvBuffers {
 //     helper.  Mirrors A3a's HbKvBuffers pattern verbatim.  Production
 //     default since ADR-029 iter-13 (H10 falsification — see below).
 //   * DenseKvBuffers — TYPED CLAMP (slot_count() == 1; slot > 0 returns
-//     `LayoutNotSupported { SeparateSlots }`).  Full lift in iter-A3b-2.
-//   * MlxKvCache — TYPED CLAMP (same shape as DenseKvBuffers).  Full
-//     lift in iter-A3b-3.
+//     `MultiSeqError::SlotOutOfRange { max_slots, requested }`; in-bounds
+//     unsupported mutations return `CapabilityUnsupported { capability }`
+//     with an iter-A3b-2 grep label).  Full lift in iter-A3b-2.
+//   * MlxKvCache — TYPED CLAMP (same shape; capability label names
+//     iter-A3b-3 + "legacy 4-bit").  Full lift in iter-A3b-3.
 //
 // H10 STATUS: FALSIFIED at iter-A3a investigation.  `HF2Q_HYBRID_KV`
 // defaults ON per `src/debug/investigation_env.rs:878` since ADR-029
@@ -1102,11 +1104,14 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHybridKvBuffers {
 //   * Returns `slot_count() == 1` (single-seq by construction).
 //   * `seq_len(SlotId(0))` returns `Ok(internal_cursor as u32)`.
 //   * Any operation on `slot.0 > 0` returns
-//     `LayoutNotSupported { layout: SeparateSlots }` — same error
-//     shape A3a's NoopMultiSeqKvCache fixture uses for Paged-layout
-//     refusal at in-bounds slots; here the discriminant signals
-//     "this per-arch lift is staged; iter-A3b-2/3 ship the full N
-//     slot lift" rather than "this layout will never be supported".
+//     `MultiSeqError::SlotOutOfRange { max_slots: 1, requested }`
+//     (out-of-range discriminant, matching the canonical contract).
+//   * In-bounds mutating operations that are NOT yet implemented
+//     (append/drop/rollback at slot 0) return
+//     `MultiSeqError::CapabilityUnsupported { capability }` with an
+//     operator-grep'able label naming the deferred iter — so the
+//     discriminant distinguishes "bad slot index" from "staged
+//     capability" rather than collapsing both into one error.
 //
 // FULL LIFT scheduled for:
 //   * iter-A3b-2 — DenseKvBuffers full multi-seq (~150 LOC).
@@ -1165,9 +1170,9 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for DenseKvBuffers {
         // the real bump.  Returning Ok(()) here would let a
         // scheduler-side accountant proceed against an unaware
         // backing buffer; we honour the clamp by returning a
-        // typed `LayoutNotSupported` even at slot 0 — the
-        // SeparateSlots layout here means "single-seq SeparateSlots
-        // only" and append_for_seq has no internal state to bump.
+        // typed `CapabilityUnsupported` even at slot 0 — the label
+        // names iter-A3b-2 as the deferred-lift target, so the
+        // discriminant is distinct from a real out-of-range error.
         // Iter-A3b-2 replaces this with the real per-seq bump.
         Err(
             crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
@@ -2578,6 +2583,109 @@ mod tests {
                 s
             );
         }
+
+        // iter-A3b iter-1.5 (codex /cfa request_changes major): pin the
+        // EXACT total byte formula at n_seqs=4 — not just 4× scale.  This
+        // catches any regression where a per-buffer formula was 4× but the
+        // composition (K + V_packed + V_norms + optional xlen) was wrong.
+        //
+        // Formula (default path, HF2Q_FULL_F16_KV unset, HF2Q_DFLASH_XLEN_SDPA unset):
+        //   norms_per_pos = max(hd/256, 1)             = 1  (hd=256)
+        //   k_bytes       = n * nkv * cap * hd * 2     = 4 * 2 * 8 * 256 * 2 = 32768
+        //   v_packed_bytes= n * nkv * cap * hd * 1     = 4 * 2 * 8 * 256     = 16384
+        //   v_norms_bytes = n * nkv * cap * 1 * 4      = 4 * 2 * 8 * 1 * 4   = 256
+        //   xlen_bytes    = 0 (None)
+        //   TOTAL         = 49408 bytes
+        let expected_k_bytes = 4usize * nkv * cap * hd * 2;        // 32768
+        let expected_v_packed_bytes = 4usize * nkv * cap * hd;     // 16384
+        let expected_v_norms_bytes = 4usize * nkv * cap * 1 * 4;   // 256
+        let expected_total =
+            expected_k_bytes + expected_v_packed_bytes + expected_v_norms_bytes;
+        assert_eq!(
+            lifted.k.byte_len(),
+            expected_k_bytes,
+            "H11 EXACT FORMULA FALSIFIED: K F16 bytes ({}) != n*nkv*cap*hd*2 ({})",
+            lifted.k.byte_len(),
+            expected_k_bytes
+        );
+        assert_eq!(
+            lifted.v_packed.byte_len(),
+            expected_v_packed_bytes,
+            "H11 EXACT FORMULA FALSIFIED: V packed U8 bytes ({}) != n*nkv*cap*hd ({})",
+            lifted.v_packed.byte_len(),
+            expected_v_packed_bytes
+        );
+        assert_eq!(
+            lifted.v_norms.byte_len(),
+            expected_v_norms_bytes,
+            "H11 EXACT FORMULA FALSIFIED: V norms F32 bytes ({}) != n*nkv*cap*1*4 ({})",
+            lifted.v_norms.byte_len(),
+            expected_v_norms_bytes
+        );
+        let actual_total =
+            lifted.k.byte_len() + lifted.v_packed.byte_len() + lifted.v_norms.byte_len();
+        assert_eq!(
+            actual_total, expected_total,
+            "H11 EXACT FORMULA FALSIFIED: composition K+V_packed+V_norms = {} != {}",
+            actual_total, expected_total
+        );
+        // Concrete pin so any future refactor that changes per-buffer
+        // shape OR composition breaks this test rather than silently
+        // mis-allocating production memory.
+        assert_eq!(
+            actual_total, 49408,
+            "H11 EXACT FORMULA FALSIFIED at concrete value: expected 49408 bytes \
+             for n_seqs=4 nkv=2 cap=8 hd=256 default (no full-F16, no xlen), got {}",
+            actual_total
+        );
+        // xlen=None is the default path: confirm the optional fields are
+        // genuinely absent (the formula above assumed 0 xlen bytes).
+        assert!(
+            lifted.bf16_xlen_k.is_none() && lifted.bf16_xlen_v.is_none(),
+            "H11 EXACT FORMULA: xlen buffers must be None on default path"
+        );
+    }
+
+    /// **H11r** (iter-A3b iter-1.5) — realistic Gemma 4 sliding-attention
+    /// shape pin.  Codex /cfa on iter-1 flagged H11's cap=8 fixture as
+    /// non-representative.  This test uses canonical Gemma 4 27B sliding
+    /// shape (nkv=8, hd=256) with a moderate cap=512 (truncated from prod
+    /// 2048 to keep test alloc under 12 MB) and pins the EXACT total byte
+    /// count, proving the formula scales correctly at production-class
+    /// fan-outs not just the H11 tiny fixture.
+    #[test]
+    fn h11r_multi_seq_hybrid_kv_realistic_sliding_shape_byte_formula() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        std::env::remove_var("HF2Q_FULL_F16_KV");
+        std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
+        // Canonical Gemma 4 27B sliding shape: 8 KV heads × 256 head_dim.
+        // cap=512 keeps total alloc at ~10 MB (cap=2048 prod would be ~40 MB).
+        let nkv = 8usize;
+        let hd = 256usize;
+        let cap = 512usize;
+        let n_seqs = 4u32;
+        let lifted = alloc_multi_seq_hybrid_kv_for_layer(
+            &dev, 0, nkv, hd, cap, false, n_seqs,
+        )
+        .expect("H11r: realistic shape alloc");
+        let n = n_seqs as usize;
+        let expected_k = n * nkv * cap * hd * 2;        // 4*8*512*256*2 = 8_388_608
+        let expected_v = n * nkv * cap * hd;            // 4*8*512*256   = 4_194_304
+        let expected_norms = n * nkv * cap * 1 * 4;     // 4*8*512*1*4   = 65_536
+        let expected_total = expected_k + expected_v + expected_norms;
+        assert_eq!(lifted.k.byte_len(), expected_k, "H11r: K F16");
+        assert_eq!(lifted.v_packed.byte_len(), expected_v, "H11r: V packed U8");
+        assert_eq!(lifted.v_norms.byte_len(), expected_norms, "H11r: V norms F32");
+        let actual = lifted.k.byte_len()
+            + lifted.v_packed.byte_len()
+            + lifted.v_norms.byte_len();
+        assert_eq!(actual, expected_total, "H11r: composition");
+        assert_eq!(
+            actual, 12_648_448,
+            "H11r CONCRETE FALSIFIED: realistic Gemma 4 sliding shape n=4 nkv=8 \
+             hd=256 cap=512 should sum to 12_648_448 bytes (~12 MB); got {}",
+            actual
+        );
     }
 
     /// **H12** — `MultiSeqHybridKvBuffers` per-slot byte isolation:
