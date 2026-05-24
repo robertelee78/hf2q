@@ -958,6 +958,160 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
     }
 }
 
+/// **ADR-040 §6.1.18 iter-A5d (Critical #2, 3rd reaffirmation closure)** —
+/// synthetic `Engine` for the iter-A5d **streaming** handler-level test in
+/// `src/serve/api/handlers.rs`.
+///
+/// Carries a non-zero `per_slot_kv_budget_bytes` + `kv_bytes_per_token_cached`
+/// so that `Engine::try_admit_budget(prompt, max_tokens)` actually surfaces
+/// `EngineAdmitError::SlotBudgetExceeded`. The worker drains until shutdown
+/// — the streaming handler's pre-stream admit at `handlers.rs:1748` returns
+/// early on the over-budget error, so the worker is never reached.
+///
+/// Signature uses only public/`pub(crate)` types (`LoadedArch` + `Engine`)
+/// so the helper is callable from `handlers.rs` tests without leaking the
+/// private `Request` enum out of `engine.rs`.
+#[cfg(test)]
+pub(crate) fn make_synthetic_engine_over_budget(
+    arch: LoadedArch,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token_cached: u64,
+) -> Engine {
+    let (tx, mut rx) = mpsc::channel::<Request>(8);
+    let handle = std::thread::Builder::new()
+        .name("hf2q-engine-a5d-stream-test".into())
+        .spawn(move || {
+            // Drain-until-shutdown — streaming pre-admit short-circuits
+            // BEFORE any request reaches the worker (handlers.rs:1748);
+            // this worker exists only so `Engine::shutdown()` can join.
+            while let Some(req) = rx.blocking_recv() {
+                if matches!(req, Request::Shutdown) {
+                    break;
+                }
+            }
+        })
+        .expect("spawn a5d streaming-handler-test worker");
+
+    Engine {
+        inner: Arc::new(EngineInner {
+            tx,
+            worker_handle: Mutex::new(Some(handle)),
+            info: synthetic_load_info("a5d-over-budget-test-model"),
+            arch,
+            model_id: "a5d-over-budget-test-model".into(),
+            context_length: None,
+            quant_type: None,
+            hidden_size: 0,
+            vocab_size: 0,
+            eos_token_ids: vec![],
+            tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
+            chat_template: Arc::new(String::new()),
+            registration: None,
+            token_bytes: std::sync::OnceLock::new(),
+            kv_spill_descriptor: None,
+            tq_packed_descriptor: None,
+            mode: EngineMode::SerialFifo,
+            max_slots: 1,
+            per_slot_kv_budget_bytes,
+            kv_bytes_per_token_cached,
+            scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
+                policy: SchedulerPolicy::FifoSerial,
+                in_flight_slots: 0,
+                queue_capacity: 8,
+                admitted_total: 0,
+                rejected_429_total: 0,
+                completed_total: 0,
+            })),
+        }),
+    }
+}
+
+/// **ADR-040 §6.1.18 iter-A5d** — synthetic `Engine` for the iter-A5d
+/// **non-streaming** handler-level test in `src/serve/api/handlers.rs`.
+///
+/// The worker thread responds to a `Request::Generate` with a pre-canned
+/// `Err("slot_budget_exceeded: ...needed_bytes=N, budget_bytes=B...")`
+/// matching the EXACT format the production `worker_run` emits at
+/// `engine.rs:3834-3839`. The handler's string-match arm at
+/// `handlers.rs::chat_completions_with_prepared` (line ~447) then routes
+/// the error to `ApiError::slot_budget_exceeded(N, B).into_response()` —
+/// which is exactly what the test asserts.
+///
+/// `per_slot_kv_budget_bytes` + `kv_bytes_per_token_cached` are both set
+/// to 0 because the non-streaming path does NOT call `try_admit_budget`
+/// (only the streaming path does — handlers.rs:1748); the worker reply
+/// IS the path under test for non-streaming.
+///
+/// Signature uses only public/`pub(crate)` types (`LoadedArch` + `Engine`)
+/// so the helper is callable from `handlers.rs` tests without leaking
+/// the private `Request` enum out of `engine.rs`.
+#[cfg(test)]
+pub(crate) fn make_synthetic_engine_with_slot_budget_exceeded_worker(
+    arch: LoadedArch,
+    needed_bytes: u64,
+    budget_bytes: u64,
+) -> Engine {
+    let (tx, mut rx) = mpsc::channel::<Request>(8);
+    let handle = std::thread::Builder::new()
+        .name("hf2q-engine-a5d-nonstream-test".into())
+        .spawn(move || {
+            while let Some(req) = rx.blocking_recv() {
+                match req {
+                    Request::Shutdown => break,
+                    Request::Generate { reply, .. } => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "slot_budget_exceeded: ADR-040 §3.5 A5b — per-slot \
+                             KV budget exceeded (needed_bytes={}, budget_bytes={}). \
+                             Reduce max_tokens or use a shorter prompt.",
+                            needed_bytes,
+                            budget_bytes
+                        )));
+                    }
+                    _ => {
+                        // Drop other request kinds — the non-streaming
+                        // handler test only ever sends a Generate.
+                    }
+                }
+            }
+        })
+        .expect("spawn a5d non-streaming-handler-test worker");
+
+    Engine {
+        inner: Arc::new(EngineInner {
+            tx,
+            worker_handle: Mutex::new(Some(handle)),
+            info: synthetic_load_info("a5d-worker-error-test-model"),
+            arch,
+            model_id: "a5d-worker-error-test-model".into(),
+            context_length: None,
+            quant_type: None,
+            hidden_size: 0,
+            vocab_size: 0,
+            eos_token_ids: vec![],
+            tokenizer: Arc::new(Tokenizer::new(tokenizers::models::bpe::BPE::default())),
+            chat_template: Arc::new(String::new()),
+            registration: None,
+            token_bytes: std::sync::OnceLock::new(),
+            kv_spill_descriptor: None,
+            tq_packed_descriptor: None,
+            mode: EngineMode::SerialFifo,
+            max_slots: 1,
+            // Non-streaming path does NOT call try_admit_budget; the
+            // error comes from the worker reply (see comment above).
+            per_slot_kv_budget_bytes: 0,
+            kv_bytes_per_token_cached: 0,
+            scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
+                policy: SchedulerPolicy::FifoSerial,
+                in_flight_slots: 0,
+                queue_capacity: 8,
+                admitted_total: 0,
+                rejected_429_total: 0,
+                completed_total: 0,
+            })),
+        }),
+    }
+}
+
 struct EngineInner {
     tx: mpsc::Sender<Request>,
     /// Worker-thread join handle. Held in a `Mutex<Option<...>>` so
@@ -9572,52 +9726,55 @@ assistant:
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // cfa-iter-A5c CRITICAL #2 — handler-level 429 + Retry-After wire-shape
-    // tests with a synthetic Engine carrying non-zero per-slot KV budget.
+    // **DOWNGRADED to seam-only per iter-A5d (cfa-iter-A5c BLOCK closure)**
     //
-    // Codex review (iter-A5b BLOCK verdict) called out: "no real handler/
-    // integration test that drives a non-streaming chat request and a
-    // streaming chat request through the HTTP handler and asserts status
-    // 429 plus Retry-After before SSE body construction." A fully-end-to-
-    // end chat handler test would need a real GGUF + tokenizer + chat
-    // template + pool + the engine's `worker_run` to be loaded — not
-    // achievable without OOM-ing the test process (CLAUDE.md hard rule).
+    // Codex /cfa BLOCK verdicts on iter-A5b AND iter-A5c flagged these
+    // tests as "seam-level, NOT handler-level". They do NOT call
+    // `chat_completions` or `chat_completions_stream`; they synthesise the
+    // `Response` from `ApiError::slot_budget_exceeded(...).into_response()`
+    // after calling `engine.try_admit_budget(...)` directly. That proved
+    // the ApiError wire shape — but NOT handler routing, request
+    // extraction, PreparedChatContext wiring, or actual pre-SSE handler
+    // behaviour.
     //
-    // The tests below instead exercise the EXACT seam the streaming AND
-    // non-streaming chat handlers use at handlers.rs:1748-1766 and
-    // handlers.rs:447-449 respectively:
-    //   1. Build a synthetic Engine with non-zero per_slot_kv_budget_bytes
-    //      + kv_bytes_per_token_cached (mirrors `Engine::spawn` shape).
-    //   2. Call `engine.try_admit_budget(...)` — the SAME call the
-    //      streaming handler makes BEFORE constructing the SSE body.
-    //   3. Convert the result via `ApiError::slot_budget_exceeded` — the
-    //      SAME conversion both streaming + non-streaming handlers do.
-    //   4. Assert the resulting `Response` carries HTTP 429 +
-    //      `Retry-After: 1` (the production wire contract).
+    // Iter-A5d closes Critical #2 with REAL handler-level tests at
+    // `src/serve/api/handlers.rs::a5d_handler_429_tests`:
+    //   - `a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded`
+    //   - `a5d_chat_completions_non_streaming_handler_returns_429_when_worker_signals_slot_budget_exceeded`
     //
-    // The "before SSE body construction" property is structurally
-    // guaranteed by the handler code path: `try_admit_budget` returns
-    // BEFORE any `generate_stream_with_deepstack` call (handlers.rs:1748
-    // is above handlers.rs:1767 — and `into_response()` produces a
-    // unified JSON body, not an SSE frame). The test below proves the
-    // body shape; the structural ordering is pinned by the source
-    // grep-based docstring test `a5c_streaming_handler_admit_check_precedes_stream_call`
-    // below (parses the production handler source for the textual order).
+    // These invoke the EXACT production handler functions
+    // (`chat_completions_stream` and the iter-A5d-extracted
+    // `chat_completions_with_prepared`) with a synthetic over-budget
+    // `Engine` + a real `AppState` + a real `PreparedChatContext`.
+    // That is the load-bearing closure for Critical #2.
+    //
+    // The tests below are RETAINED as **supplemental** seam-only
+    // proofs of the ApiError wire shape (independent of handler
+    // routing) + the structural source-order pin. They were renamed
+    // `a5d_seam_only_*` per iter-A5d so the test-name prefix surfaces
+    // their actual scope. Operators reading test names see the truth:
+    //   - `a5d_seam_only_*` = ApiError + try_admit_budget seam shape
+    //   - `a5d_*_handler_returns_429_*` = production handler call
     // ─────────────────────────────────────────────────────────────────────
 
-    /// **CRITICAL #2 GOLDEN** — non-streaming wire-shape: a request that
-    /// would exceed the per-slot KV budget produces HTTP 429 +
-    /// `Retry-After: 1` JSON body with `code: "slot_budget_exceeded"`
-    /// embedding the actual `needed_bytes` + `budget_bytes` numbers.
+    /// **SEAM-ONLY (supplemental to `a5d_chat_completions_non_streaming_handler_returns_429_*`)**
+    /// — direct `engine.try_admit_budget(...)` + `ApiError::slot_budget_exceeded`
+    /// wire-shape proof. Does NOT invoke `chat_completions` or any handler.
     ///
-    /// Falsifier path (any one ⇒ wire contract broken):
+    /// Retained because it isolates the
+    /// `EngineAdmitError::SlotBudgetExceeded → ApiError::slot_budget_exceeded → 429+JSON`
+    /// chain without the handler routing in between, so a regression
+    /// in JUST the seam (without breaking the handler test) would
+    /// still surface here with a precise failure message.
+    ///
+    /// Falsifier path (any one ⇒ seam contract broken):
     /// 1. `try_admit_budget` returns Ok for an over-budget request.
     /// 2. The error variant doesn't carry both needed + budget.
     /// 3. `ApiError::slot_budget_exceeded` produces a non-429 status.
     /// 4. The response lacks `Retry-After: 1`.
     /// 5. The body JSON does not contain `"code":"slot_budget_exceeded"`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a5c_chat_completions_non_streaming_returns_429_retry_after_when_kv_budget_exceeded() {
+    async fn a5d_seam_only_try_admit_budget_to_api_error_429_wire_shape() {
         use axum::body::to_bytes;
         use axum::http::header;
         use axum::response::IntoResponse;
@@ -9682,20 +9839,18 @@ assistant:
     }
 
     /// **CRITICAL #2 GOLDEN** — streaming wire-shape: a streaming chat
-    /// request that would exceed the per-slot KV budget produces HTTP
-    /// 429 + `Retry-After: 1` BEFORE any SSE body construction (i.e.
-    /// the response Content-Type is `application/json`, NOT
-    /// `text/event-stream`).
+    /// **SEAM-ONLY (supplemental to `a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_*`)**
+    /// — direct `engine.try_admit_budget(...)` + `ApiError::slot_budget_exceeded`
+    /// wire-shape proof for the streaming-path response. Does NOT
+    /// invoke `chat_completions_stream` or any handler.
     ///
-    /// This is the load-bearing case codex flagged in iter-A5b: prior
-    /// to iter-A5b the streaming arm only matched `queue_full` on the
-    /// post-`Ok` error path, so a SlotBudgetExceeded reached the
-    /// operator as a half-rendered SSE error frame (HTTP 200 + mid-
-    /// stream `data: {"error":...}\n\n`). Iter-A5b added the pre-stream
-    /// `engine.try_admit_budget` call at handlers.rs:1748-1766; this
-    /// test pins that the call's output produces the right wire shape.
+    /// Retained because it isolates the `application/json` vs
+    /// `text/event-stream` Content-Type discriminator at the seam
+    /// (independent of handler routing). The true load-bearing
+    /// handler-level test lives at
+    /// `handlers.rs::a5d_handler_429_tests::a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a5c_chat_completions_streaming_returns_429_before_sse_body_when_kv_budget_exceeded() {
+    async fn a5d_seam_only_streaming_response_is_json_not_sse_when_over_budget() {
         use axum::http::header;
         use axum::response::IntoResponse;
         use super::super::schema::ApiError;
@@ -9754,20 +9909,21 @@ assistant:
         engine.shutdown().await.expect("shutdown");
     }
 
-    /// **CRITICAL #2 GOLDEN** — structural pin: the streaming handler at
+    /// **SOURCE-ORDER GREP (supplemental to handler-level tests)** —
+    /// structural pin: the streaming handler at
     /// `handlers.rs::chat_completions_stream` calls
     /// `engine.try_admit_budget` BEFORE it calls
-    /// `generate_stream_with_deepstack`. A future refactor that swaps
-    /// the order would silently regress the wire-level contract pinned
-    /// by the test above (handler would commit to opening an SSE body
-    /// then crash mid-stream).
+    /// `generate_stream_with_deepstack`.
     ///
-    /// This test parses the production source verbatim; if the function
-    /// body is rearranged so the admit call follows the stream call, the
-    /// `assert!(admit_pos < stream_pos, ...)` below fails with the
-    /// current byte offsets — operator-actionable failure message.
+    /// This test is purely supplemental: a refactor that swaps the order
+    /// would also break the real handler-level test
+    /// (`a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded`)
+    /// because Content-Type would become `text/event-stream`. The source
+    /// grep here gives an additional, faster-to-diagnose failure mode
+    /// (lints the source order BEFORE the handler test executes the
+    /// actual code), so it is retained per iter-A5d.
     #[test]
-    fn a5c_streaming_handler_admit_check_precedes_stream_call() {
+    fn a5d_seam_only_streaming_handler_admit_check_precedes_stream_call_source_grep() {
         let handlers_src = include_str!("handlers.rs");
         // Locate `async fn chat_completions_stream` — the streaming
         // handler — and slice from that fn header to the next top-level
@@ -9805,8 +9961,10 @@ assistant:
              offset {admit_pos} within chat_completions_stream body) MUST \
              precede `.generate_stream_with_deepstack` (byte offset \
              {stream_pos}); a refactor that reorders these would regress \
-             the pre-stream 429 contract pinned by \
-             `a5c_chat_completions_streaming_returns_429_before_sse_body_when_kv_budget_exceeded`"
+             the pre-stream 429 contract pinned by the iter-A5d \
+             handler-level test \
+             `a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded` \
+             in `src/serve/api/handlers.rs`."
         );
     }
 

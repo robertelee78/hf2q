@@ -1465,7 +1465,7 @@ Per the /cfa codex BLOCK verdict on iter-A5b (`/tmp/cfa-a5b-review/codex-review-
 | Finding | Severity | Pre-iter-A5c | iter-A5c fix |
 |---|---|---|---|
 | CRITICAL #1 — Gemma 4 `kv_bytes_per_token` is approximate, not exact | Critical | `GemmaLoadedModel::build_load_info` stored the SLIDING `(num_key_value_heads, head_dim)` pair (8 × 256 on canonical 27B); `LoadInfo::kv_bytes_per_token` flattened to `n_layers × 8 × 256 × 4 × 2 = 61_440 elements/token` for a 30-layer model — OVER-counting the exact `25 × 8 × 256 + 5 × 2 × 512 = 56_320 elements/token` by ~9%. Safe upper bound (false-rejects borderline; never under-counts), but not the operator-honest exact value ADR-040 §3.5 promises. | Add `LoadInfo::kv_bytes_per_token_override: Option<u64>` field. `GemmaLoadedModel::build_load_info` populates it with `gemma4_exact_kv_bytes_per_token(&self.config)` — the new helper that walks `cfg.layer_types` + `cfg.num_kv_heads_for_layer(i)` + `cfg.head_dim_for_layer(i)` per layer and sums the F32-equivalent K+V byte cost. `LoadInfo::kv_bytes_per_token` short-circuits to the override when present. Qwen35 path UNCHANGED (`Qwen35LoadedModel::build_load_info` sets `kv_bytes_per_token_override: None` — Qwen35 layers are homogeneous and the flat formula is already exact). NEW golden test `a5c_gemma4_exact_kv_bytes_per_token_matches_per_layer_sum` pins the canonical 27B math at `25 sliding × (8×256) + 5 full × (2×512) × 4 × 2 = 450_560 bytes/token`. |
-| CRITICAL #2 — No handler-level integration tests for 429+Retry-After | Critical | iter-A5b added `parse_slot_budget_exceeded` unit tests + the `Engine::try_admit_budget` pre-stream call at `handlers.rs:1748-1766`, but no test drove a request through the production handler call shape (non-streaming + streaming) and asserted HTTP 429 + `Retry-After: 1` BEFORE SSE body construction. | Add 3 handler-level wire-shape tests (synthetic Engine with non-zero `per_slot_kv_budget_bytes` + `kv_bytes_per_token_cached`): (a) `a5c_chat_completions_non_streaming_returns_429_retry_after_when_kv_budget_exceeded` — proves the non-streaming 429 + Retry-After: 1 + JSON body shape with `code: "slot_budget_exceeded"` + verbatim needed/budget numbers; (b) `a5c_chat_completions_streaming_returns_429_before_sse_body_when_kv_budget_exceeded` — proves the streaming response Content-Type is `application/json` (NOT `text/event-stream`), pinning that the response is constructed BEFORE the SSE body; (c) `a5c_streaming_handler_admit_check_precedes_stream_call` — parses `handlers.rs` source to assert `engine.try_admit_budget(` byte-offset is less than `.generate_stream_with_deepstack(` byte-offset within `chat_completions_stream`, structurally pinning the wire-ordering. Tests use `make_test_engine_with_worker_arch_and_budget` (the iter-A5b helper, no new fixture needed) — no real GGUF / model load, no OOM. |
+| CRITICAL #2 — No handler-level integration tests for 429+Retry-After | Critical | iter-A5b added `parse_slot_budget_exceeded` unit tests + the `Engine::try_admit_budget` pre-stream call at `handlers.rs:1748-1766`, but no test drove a request through the production handler call shape (non-streaming + streaming) and asserted HTTP 429 + `Retry-After: 1` BEFORE SSE body construction. | **(NOT CLOSED in iter-A5c — re-flagged by codex /cfa BLOCK on iter-A5c, closed in iter-A5d: see §6.1.18.)** Iter-A5c added 3 tests under `a5c_chat_completions_*` BUT codex correctly identified them as seam-level rather than handler-level — they called `engine.try_admit_budget(...)` + `ApiError::slot_budget_exceeded(...).into_response()` directly, not the actual `chat_completions` / `chat_completions_stream` production handler functions. The seam-level tests proved the `ApiError` wire shape + the structural source ordering but did NOT prove handler routing, `PreparedChatContext` wiring, or that the production handler actually short-circuits BEFORE SSE body construction. The honest closure of Critical #2 ships in iter-A5d (§6.1.18), which renames the iter-A5c tests to `a5d_seam_only_*` (retained as supplemental proofs) and adds two NEW handler-level tests that invoke the production handler functions directly. |
 | MAJOR #1 — ADR §6.1.12 still says `SchedulerPolicy::SlotAware` | Major | The §6.1.12 closure table's `ApiError::queue_full()` row said the post-C3 docstring names `SchedulerPolicy::SlotAware`. That variant has never existed (the real enum is `SchedulerPolicy::{FifoSerial, InflightBatched}`; `SlotAware { max_slots }` lives on the SEPARATE `EngineMode` enum). | Rewrite the §6.1.12 row to name **`SchedulerPolicy::InflightBatched`** AND **`EngineMode::SlotAware { max_slots }`** as distinct entities + cite the iter-A5b regression test `c3_schema_queue_full_docstring_names_scheduler_policy` that now PINS the distinction (rejects `SchedulerPolicy::SlotAware` if it reappears). |
 | MAJOR #3 — Mixed-layer fixture doesn't exercise production path | Major | `a3a_mixed_layer_alloc_full_sliding_byte_isolation` walked `[Full, Sliding, Full, Sliding]` through `alloc_hb_kv_for_layer` directly with a locally-computed `(is_ring, capacity)` pair — proving the allocator honoured its boolean argument, NOT that the production `LayerType → (is_ring, capacity)` mapping at `gemma4/model.rs:1247-1257` is correct. A future branch-swap in the production code would not surface. | Extract the `LayerType → (is_ring, capacity)` mapping into a PRODUCTION helper `layer_type_to_alloc_params` at `gemma4/kv_cache.rs`. Route the production allocator at `gemma4/model.rs:1247-1257` through the helper. Route the iter-A5b mixed-layer test through the helper as well. Add two NEW tests: (a) `a5c_layer_type_to_alloc_params_mapping_pinned` — explicit branch-swap falsifier asserting `Sliding → (true, sliding_window)` AND `Full → (false, max_position_embeddings)` AND cross-arm `cap_s != cap_f` so a swap would surface as a clear failure; (b) `a5c_production_gemma4_model_routes_through_layer_type_helper` — pins the production call site contract at canonical 27B `sliding_window=1024` + `max_position_embeddings=131_072`. |
 | NEW FINDING — ADR §6.1.16 doesn't cite `cd47e923` | New | §6.1.16 opened with "this commit" but never named `cd47e923`. Also overstated closure as exact production wire-through while immediately acknowledging the conservative upper bound + future per-arch refinement. | Cite `cd47e923` explicitly in §6.1.16 opening. Add an "Honest closure scope" paragraph naming the exact gap iter-A5c closes (per-arch Gemma 4 byte accounting) so the reader does not have to re-read the entire section to understand what iter-A5b shipped vs deferred. |
@@ -1534,6 +1534,82 @@ Per the /cfa codex BLOCK verdict on iter-A5b (`/tmp/cfa-a5b-review/codex-review-
 - **Phase E1 production cutover** — flip `SchedulerPolicy::InflightBatched` to default; gated on C2c + D3 AC-4 PASS on real hardware.
 
 **Dossier provenance**: No standalone dossier — A5c is closure-iter work on top of the codex BLOCK verdict on iter-A5b. The decision matrix + the over-vs-under count analysis are documented inline (above) per ADR-040 §7 mantra.
+
+### 6.1.18 Iter-A5d closure — codex /cfa BLOCK on iter-A5c: real handler-level tests + mantra-violation fix (2026-05-24, this commit)
+
+Per the /cfa codex BLOCK verdict on iter-A5c (`/tmp/cfa-a5c-review/codex-review-last.txt`), this iter ships the load-bearing closure for Critical #2 (3rd reaffirmation): **REAL handler-level integration tests that invoke the production `chat_completions_*` handler functions** with a synthetic over-budget Engine + a real `AppState` + a real `PreparedChatContext`. The iter-A5c "integration" tests at `engine.rs:9574-9811` were correctly identified by codex as seam-level (they called `engine.try_admit_budget` + `ApiError::slot_budget_exceeded(...).into_response()` directly, not the production handlers). Iter-A5d renames them to `a5d_seam_only_*` (retained as supplemental proofs of the ApiError wire shape) and adds two NEW handler-level tests in `src/serve/api/handlers.rs` that drive the actual production handler code path end-to-end.
+
+**Path chosen — Path A (direct handler function call)**:
+
+Path B (full `axum::Router::oneshot`) was considered but rejected: hf2q's production `chat_completions` requires a populated `HotSwapManager` pool entry to satisfy `prepare_chat_generation`'s engine resolver — which in turn requires a real GGUF + tokenizer + chat template, exactly the OOM path CLAUDE.md forbids. Path A (call the handler functions directly with synthetic state + prepared context) exercises the same production routing logic for the over-budget code path while staying within the OOM constraint. Path C (add another seam-level test) is what iter-A5b and iter-A5c shipped — codex has BLOCKed it twice, so iter-A5d does not do that.
+
+**Critical #2 closure** — two new handler-level tests:
+
+| Test | Production fn called | Falsifier proven |
+|---|---|---|
+| `a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded` | `chat_completions_stream(state, req, prepared)` — the actual streaming handler. | The handler's pre-stream admit at `handlers.rs:1748` actually fires for an over-budget request → returns `Response` with status 429 + `Retry-After: 1` + **`Content-Type: application/json`** (NOT `text/event-stream`). The Content-Type discriminator is the load-bearing wire-level proof that the handler short-circuited BEFORE constructing the SSE body — i.e. exactly the regression codex flagged in iter-A5. |
+| `a5d_chat_completions_non_streaming_handler_returns_429_when_worker_signals_slot_budget_exceeded` | `chat_completions_with_prepared(state, req, prepared)` — the iter-A5d-extracted non-streaming body of `chat_completions`. | The full chain `engine.generate(...).await → Err(slot_budget_exceeded:...) → handlers.rs:447 string-match → parse_slot_budget_exceeded → ApiError::slot_budget_exceeded(N, B).into_response()` round-trips intact: 429 + Retry-After: 1 + JSON body with `code: "slot_budget_exceeded"` + verbatim N/B numbers. |
+
+Both tests use new `pub(crate)` test scaffolding in `engine.rs` (`make_synthetic_engine_over_budget` for streaming + `make_synthetic_engine_with_slot_budget_exceeded_worker` for non-streaming) whose signatures expose only `LoadedArch` + `u64` so the helpers are callable from `handlers.rs` tests without leaking the private `Request` enum.
+
+**Mantra-violation closure** — §6.1.17 overclaim:
+
+iter-A5c's §6.1.17 said the iter-A5c tests were "handler-level wire-shape" + "CRITICAL #2 closure evidence". They were not — they were seam-level. The §6.1.17 row for Critical #2 is reworded in this commit to honestly describe iter-A5c's tests as seam-level (NOT handler-level) and to reference §6.1.18 as the actual closure. The previous iter-A5c-named tests in `engine.rs` are renamed `a5d_seam_only_*` with explicit doc comments pointing at the new handler-level tests as the load-bearing closure. The source-order grep test (`a5d_seam_only_streaming_handler_admit_check_precedes_stream_call_source_grep`) is retained because it gives a faster-to-diagnose failure mode than waiting for the handler test to surface a Content-Type regression.
+
+**Production code changes** (test-scaffolding-only per CLAUDE.md "test scaffolding allowed if needed"):
+
+1. **`src/serve/api/handlers.rs`** — extracted the non-streaming post-prepare body of `chat_completions` into a sibling `async fn chat_completions_with_prepared(state, req, prepared) -> Response`. The extraction is purely structural — `chat_completions` now forwards `(state, req, prepared)` after the `req.stream` dispatch; the extracted body is byte-equivalent to the pre-A5d inline body (same locals, same control flow, same response shape). This is the minimum surface change that lets a handler test drive the non-streaming production logic without requiring real pool resolution.
+2. **`src/serve/api/engine.rs`** — added two `#[cfg(test)] pub(crate)` helpers (`make_synthetic_engine_over_budget` + `make_synthetic_engine_with_slot_budget_exceeded_worker`) at file scope so the iter-A5d handler tests in `handlers.rs` can construct synthetic engines without referencing the private `Request` enum.
+
+**LOC delta per file** (relative to iter-A5c HEAD `66dc3d87`):
+
+| File | + | - | Net |
+|---|---:|---:|---:|
+| `src/serve/api/engine.rs` | +~155 | -~5 | +~150 (two `pub(crate)` test helpers `make_synthetic_engine_over_budget` ~70 LOC + `make_synthetic_engine_with_slot_budget_exceeded_worker` ~80 LOC; A5c test renames + doc-comment downgrades; source-order grep updated to cite the A5d handler-level test as the true falsifier) |
+| `src/serve/api/handlers.rs` | +~390 | -~3 | +~387 (extract `chat_completions_with_prepared` from `chat_completions` ~30 LOC ~byte-equivalent; new `a5d_handler_429_tests` module with `build_prepared_context` + `minimal_request` helpers + two handler-level tests ~360 LOC) |
+| `docs/ADR-040-continuous-batching-reopen.md` | +~50 | -~2 | +~48 (§6.1.17 Critical #2 row reworded for honesty + §6.1.18 NEW closure block) |
+| **Total** | **+~595** | **-~10** | **+~585** |
+
+**Test count delta**:
+
+| Module | Pre-iter | Post-iter | Delta |
+|---|---:|---:|---:|
+| `serve::api::engine::tests` (a5c → a5d_seam_only rename) | 3 (a5c_*) | 3 (a5d_seam_only_*) | 0 net — pure rename + doc downgrade |
+| `serve::api::handlers::a5d_handler_429_tests` (NEW) | 0 | **2** | **+2 handler-level tests** |
+| **Total a5d additions** | — | **+2** | **+2 NEW production-handler-level always-on tests** |
+
+**Quality gates (all PASS in skip mode — NO `cargo build --release` per CLAUDE.md "do not oom us")**:
+
+- `cargo check --release --tests` returns 0 (no new warnings; same 4 pre-existing pre-A5d warnings: `gpu_full_attn.rs:11455-57 bad_shape` unused-assignment + `forward_gpu.rs:2507 use super::*` unused-import).
+- `cargo test --release --test continuous_batching_throughput` returns 0 with **21 PASS / 0 FAIL** (preserved from iter-A5c — no regression).
+- `cargo test --release --bin hf2q -- a5d_ --test-threads=1` returns 0 with **5 PASS / 0 FAIL** (3 `a5d_seam_only_*` renames + 2 NEW `a5d_*_handler_returns_429_*` tests). Wall clock 0.08s; no model load.
+- `cargo test --release --bin hf2q -- a5b_ a5c_ --test-threads=1` returns 0 with **22 PASS / 0 FAIL** — iter-A5b's 14 + iter-A5c's 8 still green; nothing regressed (only the 3 `a5c_chat_completions_*` were renamed to `a5d_seam_only_*` — they were counted under iter-A5c's `+3 engine tests` but no longer match the `a5c_` prefix).
+- NO `// TODO`, NO `unimplemented!()`, NO `todo!()` in production code. ALL deferrals are typed.
+
+**Empirical handler-test traces** (from `cargo test` output captured 2026-05-24 at iter-A5d):
+
+```
+test serve::api::handlers::a5d_handler_429_tests::a5d_chat_completions_stream_handler_returns_429_application_json_not_sse_when_kv_budget_exceeded ... ok
+test serve::api::handlers::a5d_handler_429_tests::a5d_chat_completions_non_streaming_handler_returns_429_when_worker_signals_slot_budget_exceeded ... ok
+test serve::api::engine::tests::a5d_seam_only_streaming_handler_admit_check_precedes_stream_call_source_grep ... ok
+test serve::api::engine::tests::a5d_seam_only_streaming_response_is_json_not_sse_when_over_budget ... ok
+test serve::api::engine::tests::a5d_seam_only_try_admit_budget_to_api_error_429_wire_shape ... ok
+```
+
+Each handler-level test calls a production handler function directly:
+- streaming: `chat_completions_stream(state, req, prepared).await` (the `pub(crate)`-scoped streaming handler at `handlers.rs:1686`).
+- non-streaming: `chat_completions_with_prepared(state, req, prepared).await` (the iter-A5d-extracted body at `handlers.rs:403`).
+
+NEITHER test calls `engine.try_admit_budget(...)` directly. The two `a5d_seam_only_*` tests DO call the seam directly — that's their purpose as supplemental falsifiers.
+
+**Remaining followups (none are deferrals from this iter)**:
+
+- **C2c (Qwen35 SlotAware worker arm)** — per-layer dtype refinement (unchanged from §6.1.17).
+- **C2d (Gemma 4 SlotAware worker arm)** — per-layer dtype refinement parallel to C2c (unchanged from §6.1.17).
+- **Phase E1 production cutover** — flip `SchedulerPolicy::InflightBatched` to default (unchanged from §6.1.17).
+- **Optional codex cleanup (minor)** — make `gemma4_exact_kv_bytes_per_token` compute `nkv` + `hd` from `cfg.num_kv_heads_for_layer(i)` + `cfg.head_dim_for_layer(i)` in release code instead of just `debug_assert_eq`-ing them against a local `match LayerType`. Current behaviour is equivalent (both paths use the same mapping); accepted as a minor wording mismatch for now per codex's own classification.
+
+**Dossier provenance**: No standalone dossier — A5d is closure-iter work on the codex BLOCK verdict on iter-A5c. The path-selection rationale + the handler-vs-seam decomposition are documented inline (above).
 
 ---
 
