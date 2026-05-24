@@ -5058,6 +5058,40 @@ pub fn build_gated_attn_layer(
     // `slot_k_v_region_for_full_attn`.  See ADR-040 §6.1.5.
     slot_id: SlotId,
 ) -> Result<MlxBuffer> {
+    // ADR-040 Phase B4a-cont.1 M2 (cfa-finding-B4a-cont.1-M2): canonical
+    // TQ-active multi-slot gate.  The fused Stage-AB path (line ~5479)
+    // bypasses `apply_sdpa_with_kv_cache` entirely and calls
+    // `write_kv_with_optional_tq_encode` directly — so the canonical
+    // entry gate at `apply_sdpa_with_kv_cache:4371` does NOT fire for
+    // this path.  Defence-in-depth gates inside
+    // `write_kv_with_optional_tq_encode` + `dispatch_decode_sdpa_with_
+    // optional_tq` still surface slot-N TQ-active routing as a typed
+    // error, but only AFTER ops1-4 (4 projections + 2 per-head RMSNorm
+    // + 2 IMROPE dispatches) have been encoded into an uncommitted
+    // command encoder — wasteful and obscures the failure site.
+    //
+    // Pin the canonical gate HERE at the public entry, before any
+    // fused-stage eligibility predicate runs.  Routes TQ-active slot
+    // N>0 to a typed B4a-TQ error before any encoder work begins.
+    // Slot 0 with TQ-active remains byte-identical to pre-B4a-cont.
+    if slot_id.0 != 0 {
+        if let Some(slot_ref) = kv_cache_slot.as_deref() {
+            if slot_ref.tq.is_some() {
+                return Err(anyhow!(
+                    "build_gated_attn_layer: slot_id={} with slot.tq.is_some() \
+                     is not supported in Phase B4a-cont (the TQ encode + TQ \
+                     SDPA kernels are not yet slot-aware).  Requires the \
+                     Phase B4a-TQ slot-aware TQ kernel arc — defer per \
+                     ADR-040 §6.1.5 + §6.1.6 + dossier R5.  Slot 0 with \
+                     TQ-active remains supported.  Allocate the cache with \
+                     `tq_kv_active=false` for the multi-slot F32 path \
+                     (fully slot-aware in B4a-cont).",
+                    slot_id.0,
+                ));
+            }
+        }
+    }
+
     // Capture arena presence before moving fa_arena into the SDPA call below.
     // Used to decide the commit vs commit_labeled path for ops1-4 and ops6-7.
     //
@@ -6359,6 +6393,27 @@ pub fn apply_gated_attn_layer_decode_into(
 ) -> Result<MlxBuffer> {
     debug_assert_eq!(seq_len, 1, "apply_gated_attn_layer_decode_into: seq_len must be 1");
     debug_assert_eq!(head_dim % 32, 0, "apply_gated_attn_layer_decode_into: head_dim must be %32==0");
+
+    // ADR-040 Phase B4a-cont.1 M2 (cfa-finding-B4a-cont.1-M2): canonical
+    // TQ-active multi-slot gate at the decode-into entry.  Mirrors the
+    // gate at `build_gated_attn_layer` entry — prevents the ops1-4
+    // encoder work from running before the slot-N TQ-active error
+    // surfaces (defence-in-depth gates inside the two private TQ-aware
+    // dispatchers still fire, but only after ops1-4 are already encoded).
+    // Slot 0 with TQ-active remains byte-identical to pre-B4a-cont.
+    if slot_id.0 != 0 && slot.tq.is_some() {
+        return Err(anyhow!(
+            "apply_gated_attn_layer_decode_into: slot_id={} with \
+             slot.tq.is_some() is not supported in Phase B4a-cont (the \
+             TQ encode + TQ SDPA kernels are not yet slot-aware).  \
+             Requires the Phase B4a-TQ slot-aware TQ kernel arc — defer \
+             per ADR-040 §6.1.5 + §6.1.6 + dossier R5.  Slot 0 with \
+             TQ-active remains supported.  Allocate the cache with \
+             `tq_kv_active=false` for the multi-slot F32 path (fully \
+             slot-aware in B4a-cont).",
+            slot_id.0,
+        ));
+    }
 
     let q_total = n_heads * head_dim;
     let kv_total = n_kv_heads * head_dim;

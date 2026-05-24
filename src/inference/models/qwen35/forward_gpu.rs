@@ -1594,11 +1594,12 @@ impl Qwen35Model {
         // routes the per-layer cursor reads/writes to that slot's
         // `current_len[N]` entry; the GPU-side KV-buffer rebasing
         // (`slot.k`/`slot.v` byte offset = `N * n_kv_heads * max_seq_len *
-        // head_dim * 4`) lands in Phase B4a-cont alongside the kernel-
-        // dispatcher slot-offset plumbing (see §6.1.4 closure). Bounds
-        // checked at the public entry — out-of-range `slot_id` returns
-        // an error naming the slot + `kv_cache.n_seqs` per ADR-040 §7
-        // fail-loud mantra.
+        // head_dim * 4`) is implemented at B4a-cont (commit 1d3b13ef)
+        // for F32 full-attn paths via `MlxBuffer::slice_view` on the
+        // per-slot region; TQ-active multi-slot deferred to B4a-TQ
+        // (see ADR-040 §6.1.5 + §6.1.6 closure). Bounds checked at the
+        // public entry — out-of-range `slot_id` returns an error naming
+        // the slot + `kv_cache.n_seqs` per ADR-040 §7 fail-loud mantra.
         slot_id: SlotId,
     ) -> Result<Vec<f32>> {
         self.forward_gpu_impl(
@@ -8271,105 +8272,387 @@ mod tests {
         }
     }
 
-    /// ADR-040 Phase B4a-cont — cross-slot byte-identity isolation.
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-040 Phase B4a-cont.1 (2026-05-23) — M1 isolation test rigor.
+    //
+    // Codex /cfa review of B4a-cont (commit 1d3b13ef) flagged the
+    // previous `b4a_cont_forward_gpu_slot_isolation_byte_identity`
+    // test as non-load-bearing: it reset `current_len[0]` and re-ran
+    // prompt P into slot 0, which OVERWROTE any slot-1-write-that-
+    // landed-in-slot-0 with fresh slot-0 data before attention read
+    // it.  A broken implementation could therefore pass.
+    //
+    // B4a-cont.1 deletes that test and replaces it with TWO stronger
+    // pins:
+    //
+    //   (A) `b4a_cont_forward_gpu_slot_isolation_raw_kv_byte_snapshot`
+    //       — snapshots slot 0's raw K/V byte regions BEFORE the
+    //       slot-1 forward, then AFTER, and asserts they are
+    //       bit-for-bit identical.  Also asserts slot 1's region
+    //       DID change (vacuous-test guard).
+    //
+    //   (B) `b4a_cont_forward_gpu_same_prompt_in_slot_0_and_slot_1_
+    //        produces_byte_identical_logits` — positive correctness
+    //       pin: the same prompt fed to slot 0 and slot 1 on a fresh
+    //       cache must produce byte-identical logits AND byte-identical
+    //       per-slot K/V regions (after normalising for the slot byte
+    //       offset).
+    //
+    // Together these pin both the negative (no cross-slot leak) and
+    // positive (per-slot routing is functionally correct) halves of
+    // the slot-isolation contract.  See ADR-040 §6.1.6.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// ADR-040 Phase B4a-cont.1 — M1 raw K/V byte snapshot isolation pin.
     ///
-    /// The load-bearing isolation pin for B4a-cont: forward to slot
-    /// 0 with prompt P; snapshot slot 0's logits L0.  Forward a
-    /// DIFFERENT prompt Q to slot 1.  Reset slot 0's cursor + re-run
-    /// prompt P at slot 0 + assert logits are BYTE-IDENTICAL to L0.
+    /// Forward P → slot 0; snapshot every full-attn layer's slot-0 K and V
+    /// byte region.  Forward Q → slot 1; re-snapshot slot 0's K/V byte
+    /// region; assert bit-for-bit equality with the BEFORE snapshot.
+    /// Also snapshot slot 1's K region pre/post slot-1 forward and assert
+    /// it changed (vacuous-test guard: catches the case where slot 1's
+    /// forward did nothing — e.g. silent kernel-bind regression).
     ///
-    /// Proves that the slot-1 prefill did NOT contaminate slot 0's
-    /// K/V region.  If the kernel-dispatcher slot-offset routing
-    /// regresses (e.g. slice_view forgets the byte_offset, or the
-    /// kernel binds slot.k at offset 0 regardless of slice_view),
-    /// the slot-0 re-run will see slot-1's data leaked into its
-    /// K/V region and produce different logits — the byte-equality
-    /// assertion FALSIFIES.
+    /// Stronger than the deleted reset+rerun-logit test because the
+    /// raw byte snapshot of slot 0 is taken AFTER slot 1's forward but
+    /// BEFORE slot 0 is touched again — so any cross-slot write into
+    /// slot 0's region is observable directly, not just transitively
+    /// through downstream attention output.
     ///
     /// Falsifier:
-    /// * Any single-byte difference in slot 0's re-run logits ⇒
-    ///   slot-1's prefill wrote into slot 0's region (cross-slot
-    ///   isolation FALSIFIED).
-    /// * Length mismatch ⇒ a previous test's side effect or a
-    ///   fixture bug (logits len is fixed by vocab_size).
+    /// * Any byte difference in slot 0's K or V region between BEFORE
+    ///   and AFTER ⇒ slot 1's writes contaminated slot 0's region
+    ///   (cross-slot isolation FALSIFIED — slice_view byte_offset or
+    ///   KernelArg::Buffer offset routing regressed).
+    /// * Slot 1's K region unchanged pre/post slot-1 forward ⇒ the
+    ///   slot-1 forward did not actually write anything (vacuous test
+    ///   — a no-op kernel bind would also "preserve" slot 0).
     #[test]
-    fn b4a_cont_forward_gpu_slot_isolation_byte_identity() {
+    fn b4a_cont_forward_gpu_slot_isolation_raw_kv_byte_snapshot() {
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
-        // Two DIFFERENT prompts P and Q.  Choosing different token
-        // ids + different sequence lengths so any cross-slot leak
-        // produces measurably different logits.
+        // Two DIFFERENT prompts P and Q (different ids + different
+        // lengths so any slot-1 write that lands in slot 0 produces
+        // bit-different bytes from slot 0's own write).
         let prompt_p = vec![5u32, 10, 15, 20];
         let prompt_q = vec![7u32, 12, 18];
         let pos_p = positions_to_flat(&text_positions(prompt_p.len() as u32));
         let pos_q = positions_to_flat(&text_positions(prompt_q.len() as u32));
 
         let device = MlxDevice::new().expect("device");
+        let max_seq_len = 64u32;
         let n_seqs = 4u32;
-        let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs)
+        let mut kv = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs)
             .expect("kv n_seqs=4");
 
-        // (1) Forward prompt P to slot 0; snapshot logits L0_first.
-        let l0_first = m
-            .forward_gpu(&prompt_p, &pos_p, &mut kv, SlotId(0))
-            .expect("forward P → slot 0 (snapshot)");
+        // Layout: full-attn K/V at `[n_seqs, n_kv_heads, max_seq_len,
+        // head_dim]` per ADR-040 §6.1.3 M5 (shape[0]=n_seqs row-major).
+        // Slot N's K region starts at byte offset
+        // `N * n_kv_heads * max_seq_len * head_dim * 4` (F32).
+        let n_kv = cfg.num_key_value_heads as usize;
+        let hd = cfg.head_dim as usize;
+        let slot_region_elems = n_kv * (max_seq_len as usize) * hd;
+        let slot_region_bytes = slot_region_elems * 4;
+        let slot_0_offset = 0usize;
+        let slot_1_offset = slot_region_bytes; // slot 1 starts after slot 0
 
-        // (2) Forward prompt Q to slot 1.  This MUST NOT mutate
-        // slot 0's K/V region — proved by the byte-equality of
-        // re-running P at slot 0 below.
+        fn snapshot_slot_region(
+            buf: &MlxBuffer,
+            slot_byte_offset: usize,
+            slot_byte_len: usize,
+        ) -> Vec<u8> {
+            let all = buf.as_slice::<u8>().expect("as_slice u8");
+            assert!(
+                slot_byte_offset + slot_byte_len <= all.len(),
+                "snapshot_slot_region: OOB (offset={} len={} buf={})",
+                slot_byte_offset, slot_byte_len, all.len()
+            );
+            all[slot_byte_offset..slot_byte_offset + slot_byte_len].to_vec()
+        }
+
+        // (1) Forward prompt P to slot 0; snapshot slot 0's K/V bytes.
+        let _l0 = m
+            .forward_gpu(&prompt_p, &pos_p, &mut kv, SlotId(0))
+            .expect("forward P → slot 0");
+
+        let n_full_attn = kv.full_attn.len();
+        assert!(
+            n_full_attn >= 1,
+            "fixture sanity: tiny_dense_full_attn_cfg_4layer_for_b4a has ≥1 \
+             full-attn layer (got {})",
+            n_full_attn
+        );
+
+        let mut slot0_k_before: Vec<Vec<u8>> = Vec::with_capacity(n_full_attn);
+        let mut slot0_v_before: Vec<Vec<u8>> = Vec::with_capacity(n_full_attn);
+        let mut slot1_k_pre: Vec<Vec<u8>> = Vec::with_capacity(n_full_attn);
+        for slot in &kv.full_attn {
+            let kbuf = slot.k.as_ref().expect("slot.k Some (legacy F32 mode)");
+            let vbuf = slot.v.as_ref().expect("slot.v Some (legacy F32 mode)");
+            slot0_k_before.push(snapshot_slot_region(kbuf, slot_0_offset, slot_region_bytes));
+            slot0_v_before.push(snapshot_slot_region(vbuf, slot_0_offset, slot_region_bytes));
+            slot1_k_pre.push(snapshot_slot_region(kbuf, slot_1_offset, slot_region_bytes));
+        }
+
+        // (2) Forward prompt Q to slot 1.  This MUST NOT mutate slot
+        // 0's K/V region — pinned by the byte-equality assertion below.
         let _l1 = m
             .forward_gpu(&prompt_q, &pos_q, &mut kv, SlotId(1))
             .expect("forward Q → slot 1");
 
-        // (3) Reset slot 0's cursor to 0 (the re-run is a fresh
-        // prefill from offset 0, mirroring the original P forward).
-        // The K/V buffer at slot 0's byte region is freely
-        // overwritten by the kernel-side write — what matters is
-        // that step (2) did not touch slot 0's region before this
-        // reset, which the re-run's logit byte-equality with L0
-        // pins.
-        for slot in kv.full_attn.iter_mut() {
-            slot.current_len[0] = 0;
-        }
+        // (3) Snapshot slot 0 AFTER the slot-1 forward + slot 1 AFTER.
+        for (idx, slot) in kv.full_attn.iter().enumerate() {
+            let kbuf = slot.k.as_ref().expect("slot.k Some after forward");
+            let vbuf = slot.v.as_ref().expect("slot.v Some after forward");
+            let slot0_k_after = snapshot_slot_region(kbuf, slot_0_offset, slot_region_bytes);
+            let slot0_v_after = snapshot_slot_region(vbuf, slot_0_offset, slot_region_bytes);
+            let slot1_k_post = snapshot_slot_region(kbuf, slot_1_offset, slot_region_bytes);
 
-        // (4) Re-forward prompt P at slot 0.  Logits MUST be byte-
-        // identical to L0_first — proves slot 1's prefill did not
-        // contaminate slot 0's region.
-        let l0_second = m
-            .forward_gpu(&prompt_p, &pos_p, &mut kv, SlotId(0))
-            .expect("forward P → slot 0 (re-run after slot 1 prefill)");
+            // Negative pin: slot 0's K region must be UNCHANGED.
+            assert_eq!(
+                slot0_k_before[idx], slot0_k_after,
+                "B4a-cont.1 M1 FALSIFIED: full_attn[{idx}].k slot-0 region \
+                 changed during slot-1 forward — slot 1's write contaminated \
+                 slot 0's K region (slice_view byte_offset or \
+                 KernelArg::Buffer offset routing regressed).  Per-slot \
+                 isolation broken at offset {slot_0_offset} (slot 0 starts \
+                 at 0; slot 1 should write at offset {slot_1_offset})."
+            );
+            // Negative pin: slot 0's V region must be UNCHANGED.
+            assert_eq!(
+                slot0_v_before[idx], slot0_v_after,
+                "B4a-cont.1 M1 FALSIFIED: full_attn[{idx}].v slot-0 region \
+                 changed during slot-1 forward — slot 1's write contaminated \
+                 slot 0's V region (slice_view byte_offset or \
+                 KernelArg::Buffer offset routing regressed).  Per-slot \
+                 isolation broken at offset {slot_0_offset} (slot 0 starts \
+                 at 0; slot 1 should write at offset {slot_1_offset})."
+            );
+
+            // Vacuous-test guard: slot 1's K region MUST have changed
+            // (else the slot-1 forward did nothing — a no-op kernel
+            // bind would also "preserve" slot 0).
+            assert_ne!(
+                slot1_k_pre[idx], slot1_k_post,
+                "B4a-cont.1 M1 VACUOUS-TEST GUARD: full_attn[{idx}].k slot-1 \
+                 region unchanged after forward_gpu(SlotId(1)) — the slot-1 \
+                 forward did not actually write to slot 1's region (offset \
+                 {slot_1_offset}).  The slot-0 byte-equality assertion above \
+                 would also pass trivially in this case, so the negative pin \
+                 is vacuous.  Investigate slot 1's kernel binding."
+            );
+
+            // Cursor-side mirror: slot 0's cursor was advanced to
+            // prompt_p.len() by step (1) and MUST remain at that value
+            // (sibling-slot cursor isolation — the slot-1 forward MUST
+            // NOT touch slot 0's cursor).  Slot 1's cursor MUST have
+            // advanced to prompt_q.len() (the slot-1 forward DID write).
+            assert_eq!(
+                slot.current_len[0], prompt_p.len() as u32,
+                "B4a-cont.1 M1 cursor-side: full_attn[{idx}].current_len[0] \
+                 must remain at prompt_p.len()={} after slot-1-only forward \
+                 (sibling-slot cursor leaked into slot 1's forward) — got {}",
+                prompt_p.len(), slot.current_len[0]
+            );
+            assert_eq!(
+                slot.current_len[1], prompt_q.len() as u32,
+                "B4a-cont.1 M1 cursor-side: full_attn[{idx}].current_len[1] \
+                 must equal prompt_q.len()={} after slot-1 forward — got {}",
+                prompt_q.len(), slot.current_len[1]
+            );
+        }
+    }
+
+    /// ADR-040 Phase B4a-cont.1 — M1 positive correctness pin.
+    ///
+    /// Same prompt fed to slot 0 and slot 1 on a fresh cache must
+    /// produce byte-identical logits AND byte-identical per-slot K/V
+    /// regions (after normalising for the slot byte offset).  This
+    /// proves the per-slot routing is functionally correct, not just
+    /// non-leaking — i.e. slot 1's region is a faithful per-slot mirror
+    /// of slot 0's region for an identical input.
+    ///
+    /// Complements the raw-byte snapshot test above: the snapshot test
+    /// pins NEGATIVE (no cross-slot leak); this test pins POSITIVE
+    /// (per-slot computation is correct in isolation).
+    ///
+    /// Falsifier:
+    /// * Logit byte difference ⇒ slot 1's forward did not produce the
+    ///   same output as slot 0's for an identical input (per-slot
+    ///   determinism FALSIFIED).
+    /// * K/V byte difference between slot 0's region and slot 1's
+    ///   region (after offset normalisation) ⇒ kernel writes to slot
+    ///   N landed at a different per-token layout than slot 0's writes.
+    #[test]
+    fn b4a_cont_forward_gpu_same_prompt_in_slot_0_and_slot_1_produces_byte_identical_logits() {
+        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
+        let cfg = m.cfg.clone();
+        let tokens = vec![5u32, 10, 15, 20];
+        let positions = positions_to_flat(&text_positions(tokens.len() as u32));
+
+        let device = MlxDevice::new().expect("device");
+        let max_seq_len = 64u32;
+        let n_seqs = 4u32;
+        let mut kv = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs)
+            .expect("kv n_seqs=4");
+
+        // Slot 0 first, then slot 1 — each starts from cur_len=0 on
+        // its OWN slot (sibling slots are independent), so the slot-1
+        // forward sees an effectively-fresh slot regardless of slot
+        // 0's prior state.
+        let logits0 = m
+            .forward_gpu(&tokens, &positions, &mut kv, SlotId(0))
+            .expect("forward → slot 0");
+        let logits1 = m
+            .forward_gpu(&tokens, &positions, &mut kv, SlotId(1))
+            .expect("forward → slot 1");
 
         assert_eq!(
-            l0_first.len(), l0_second.len(),
-            "B4a-cont isolation sanity: logits length mismatch \
-             (first={}, second={}) — fixture bug?",
-            l0_first.len(), l0_second.len()
+            logits0.len(), logits1.len(),
+            "B4a-cont.1 M1 positive pin: logit length mismatch \
+             (slot 0={}, slot 1={}) — fixture bug?",
+            logits0.len(), logits1.len()
         );
 
-        // Compare F32 bits (catches single-ULP / sign-bit / denormal
-        // diffs) — same stricter-than-tolerance comparison as
-        // `b4a_forward_gpu_at_slot_0_n_seqs_4_byte_identical_to_n_seqs_1`.
-        let first_diff = l0_first
+        // Per-element bit comparison: catches single-ULP / sign-bit /
+        // denormal diffs (same stricter-than-tolerance comparison as
+        // `b4a_forward_gpu_at_slot_0_n_seqs_4_byte_identical_to_n_seqs_1`).
+        let first_diff = logits0
             .iter()
-            .zip(l0_second.iter())
+            .zip(logits1.iter())
             .enumerate()
             .find(|(_, (a, b))| a.to_bits() != b.to_bits());
         assert!(
             first_diff.is_none(),
-            "B4a-cont CROSS-SLOT ISOLATION FALSIFIED: slot 0's re-run \
-             logits differ from the original — slot 1's prefill leaked \
-             into slot 0's K/V region.  This means the slice_view + \
-             KernelArg::Buffer offset routing (encoder.rs:182-184) did \
-             NOT honour the per-slot byte_offset for slot 1's writes, \
-             so they overwrote slot 0's region.  First per-element \
-             diff: {}",
+            "B4a-cont.1 M1 POSITIVE PIN FALSIFIED: same prompt in slot 0 vs \
+             slot 1 produces differing logits — per-slot byte-identity \
+             contract broken.  First per-element diff: {}",
             first_diff
                 .map(|(i, (a, b))| format!(
-                    "logits[{i}] first={:.9} (bits {:#010x}) vs \
-                     second={:.9} (bits {:#010x})",
+                    "logits[{i}] slot 0={:.9} (bits {:#010x}) vs \
+                     slot 1={:.9} (bits {:#010x})",
                     a, a.to_bits(), b, b.to_bits()
                 ))
                 .unwrap_or_else(|| "<unreachable>".into())
+        );
+
+        // Per-slot K/V region must also be byte-equal after offset
+        // normalisation.  Catches kernels that write the right output
+        // (post-projection logits agree) but lay out K/V differently
+        // per slot — would silently corrupt resumed decode on slot N.
+        let n_kv = cfg.num_key_value_heads as usize;
+        let hd = cfg.head_dim as usize;
+        let slot_region_elems = n_kv * (max_seq_len as usize) * hd;
+        let slot_region_bytes = slot_region_elems * 4;
+        let slot_0_offset = 0usize;
+        let slot_1_offset = slot_region_bytes;
+
+        for (idx, slot) in kv.full_attn.iter().enumerate() {
+            let kbuf = slot.k.as_ref().expect("slot.k Some after forward");
+            let vbuf = slot.v.as_ref().expect("slot.v Some after forward");
+            let all_k = kbuf.as_slice::<u8>().expect("as_slice u8 (k)");
+            let all_v = vbuf.as_slice::<u8>().expect("as_slice u8 (v)");
+            let k0 = &all_k[slot_0_offset..slot_0_offset + slot_region_bytes];
+            let k1 = &all_k[slot_1_offset..slot_1_offset + slot_region_bytes];
+            let v0 = &all_v[slot_0_offset..slot_0_offset + slot_region_bytes];
+            let v1 = &all_v[slot_1_offset..slot_1_offset + slot_region_bytes];
+            assert_eq!(
+                k0, k1,
+                "B4a-cont.1 M1 positive pin: full_attn[{idx}].k slot 0 vs \
+                 slot 1 byte regions differ after identical-prompt forwards \
+                 — per-slot K layout is not a faithful mirror (slot 0 \
+                 offset={slot_0_offset}, slot 1 offset={slot_1_offset})."
+            );
+            assert_eq!(
+                v0, v1,
+                "B4a-cont.1 M1 positive pin: full_attn[{idx}].v slot 0 vs \
+                 slot 1 byte regions differ after identical-prompt forwards \
+                 — per-slot V layout is not a faithful mirror (slot 0 \
+                 offset={slot_0_offset}, slot 1 offset={slot_1_offset})."
+            );
+        }
+    }
+
+    /// ADR-040 Phase B4a-cont.1 — M2 canonical TQ-active multi-slot gate
+    /// at `build_gated_attn_layer` entry.
+    ///
+    /// Codex /cfa flagged the previous defence-in-depth gates inside
+    /// `write_kv_with_optional_tq_encode` + `dispatch_decode_sdpa_with_
+    /// optional_tq` as too-late: the fused Stage-AB path bypasses
+    /// `apply_sdpa_with_kv_cache`'s entry gate, so slot-N TQ-active
+    /// errors fire ONLY after ops1-4 (4 projections + 2 per-head
+    /// RMSNorm + 2 IMROPE dispatches) have already been encoded into
+    /// an uncommitted command encoder.
+    ///
+    /// M2 lifts the gate to `build_gated_attn_layer` entry (before
+    /// any encoder work).  This test pins that the error message
+    /// names `build_gated_attn_layer` (the canonical entry gate) +
+    /// names the slot id + cites Phase B4a-TQ.  Falsifier: error
+    /// message mentioning `write_kv_with_optional_tq_encode` or
+    /// `dispatch_decode_sdpa_with_optional_tq` instead of
+    /// `build_gated_attn_layer` ⇒ a deeper defence-in-depth gate
+    /// fired first (the canonical entry gate regressed or never
+    /// landed).
+    ///
+    /// Note on fixture: the B4a fixture uses head_dim=32 (a tiny
+    /// synthetic).  The TQ encode kernels normally require head_dim
+    /// ∈ {256, 512}, but `alloc_tq_full_attn_buffers` does NOT
+    /// validate head_dim, and the M2 gate fires on
+    /// `slot.tq.is_some() && slot_id.0 != 0` BEFORE any head_dim-
+    /// dependent kernel constraint — so the synthetic head_dim is
+    /// fine for pinning the gate placement.
+    #[test]
+    fn b4a_cont_1_tq_active_multi_slot_gated_at_build_gated_attn_layer_entry() {
+        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
+        let cfg = m.cfg.clone();
+        let tokens = vec![5u32, 10, 15, 20];
+        let positions = positions_to_flat(&text_positions(tokens.len() as u32));
+
+        let device = MlxDevice::new().expect("device");
+        let n_seqs = 4u32;
+        let mut kv = HybridKvCache::new_with_options(&cfg, &device, 64, n_seqs, true)
+            .expect("kv n_seqs=4 tq_kv_active=true");
+        // Sanity: TQ buffers were allocated on every full-attn slot.
+        for (i, slot) in kv.full_attn.iter().enumerate() {
+            assert!(
+                slot.tq.is_some(),
+                "M2 fixture sanity: full_attn[{i}].tq must be Some when \
+                 tq_kv_active=true"
+            );
+        }
+
+        // Forward to slot 1 — must error with the M2 canonical gate.
+        let err = m
+            .forward_gpu(&tokens, &positions, &mut kv, SlotId(1))
+            .expect_err(
+                "B4a-cont.1 M2: forward_gpu(SlotId(1)) with TQ-active KV \
+                 must error at the build_gated_attn_layer canonical entry \
+                 gate, not silently proceed to fused-stage-AB encode work."
+            );
+        let msg = format!("{err:#}");
+
+        // The canonical entry gate must name `build_gated_attn_layer`.
+        // If a defence-in-depth gate (write_kv_with_optional_tq_encode or
+        // dispatch_decode_sdpa_with_optional_tq) fires first, the M2 fix
+        // has regressed (canonical entry gate is no longer the actual
+        // entry for this path).
+        assert!(
+            msg.contains("build_gated_attn_layer"),
+            "B4a-cont.1 M2 FALSIFIED: expected canonical entry gate at \
+             build_gated_attn_layer, but got error message naming a \
+             deeper defence-in-depth gate.  Full message: {msg}"
+        );
+        // Names the slot id (operator can identify the offending slot).
+        assert!(
+            msg.contains("slot_id=1"),
+            "B4a-cont.1 M2: error message must name the requested slot id \
+             (slot_id=1).  Full message: {msg}"
+        );
+        // Cites the future-iter pin (B4a-TQ) per ADR-040 §7 fail-loud mantra.
+        assert!(
+            msg.contains("B4a-TQ"),
+            "B4a-cont.1 M2: error message must cite the deferred Phase \
+             B4a-TQ iter so operators know which kernel work unblocks \
+             multi-slot TQ.  Full message: {msg}"
         );
     }
 }

@@ -86,6 +86,7 @@ The 2.45x over-shoot is documented honestly per cfa-finding (Claude `major_findi
 | `src/serve/api/schema.rs` | doc-only Decision #2 update naming `SchedulerPolicy` | C iter-3 |
 | `src/inference/models/qwen35/forward_gpu.rs` | accept `slot_id: SlotId` on `forward_gpu` + `forward_gpu_with_hidden`; bounds-check; gate slot N > 0 behind B4a-cont | **B iter-4a (SHIPPED 2026-05-23)** |
 | `src/inference/models/qwen35/{forward_gpu.rs, gpu_full_attn.rs}` | thread `slot_id` into `build_gated_attn_layer` + `apply_gated_attn_layer_decode_into` + `apply_sdpa_with_kv_cache(_decode_into)` + the 2 private kernel-dispatch helpers (`write_kv_with_optional_tq_encode`, `dispatch_decode_sdpa_with_optional_tq`); per-slot K/V slice_view at the kernel-dispatch sites; flip slot > 0 from typed-error to real-route | **B iter-4a-cont (SHIPPED 2026-05-23)** |
+| `src/inference/models/qwen35/{forward_gpu.rs, gpu_full_attn.rs}` | Codex /cfa rev-1 follow-ups: M1 isolation-test rigor (raw K/V byte snapshot + positive same-prompt-in-slot-0-vs-slot-1 equivalence pin, deleting the reset+rerun-then-compare test that could pass under cross-slot leak); M2 canonical TQ-active multi-slot gate placement at `build_gated_attn_layer` + `apply_gated_attn_layer_decode_into` entry (before fused-stage-AB encoder work); minor stale-comment refresh at the `forward_gpu` entry | **B iter-4a-cont.1 (SHIPPED 2026-05-23)** |
 | `src/serve/forward_prefill.rs` | (Gemma 4 prefill) accept `slot_id` parameter; route writes to multi-seq KV (gated on Phase A3 Gemma 4 multi-seq KV impl) | B iter-4c |
 | `src/serve/forward_prefill_batched.rs` | same | B iter-4c |
 | `src/inference/models/qwen35/forward_gpu.rs` (decode) | thread `slot_id` through `forward_gpu_last_logits` / `forward_gpu_last_topk` / soft-token / deepstack variants | B iter-4b |
@@ -260,6 +261,7 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | B3 | InflightBatchedScheduler admit/step/release impl | 5-8 days |
 | **B4a (SHIPPED 2026-05-23)** | Qwen35 `forward_gpu` / `forward_gpu_with_hidden` public-surface `slot_id: SlotId` threading + bounds check + H2 GPU-content byte-identity at slot 0 + slot-isolation pin + typed B4a-cont error for slot N > 0 | **1 day landed** |
 | **B4a-cont (SHIPPED 2026-05-23)** | Qwen35 `build_gated_attn_layer` / `apply_sdpa_with_kv_cache` / KV-dispatcher slot-offset wiring; flip slot > 0 from typed-error to real-route (via `MlxBuffer::slice_view` on slot.k/slot.v) | **1 day landed** |
+| **B4a-cont.1 (SHIPPED 2026-05-23)** | Codex /cfa rev-1 addressed: M1 isolation-test rigor (delete reset+rerun-then-compare test + add raw K/V byte snapshot + positive same-prompt-equivalence pin); M2 canonical TQ-active multi-slot gate placement at `build_gated_attn_layer` + `apply_gated_attn_layer_decode_into` entry; minor stale-comment refresh at `forward_gpu.rs` entry | **1 day landed** |
 | B4b | Qwen35 decode-path slot threading (`forward_gpu_last_logits` / `forward_gpu_last_topk` / soft-token / deepstack) | 2-3 days |
 | B4c | Gemma 4 forward-path slot threading (`forward_prefill.rs` + `forward_prefill_batched.rs`) — gated on Phase A3 Gemma 4 multi-seq KV impl | 5-8 days |
 | B4d | Spec-decode slot threading (`forward_gpu_greedy` + dflash entry points) — gated on Phase A4 drafter KV multi-seq impl | 5-8 days |
@@ -562,6 +564,55 @@ In addition, the per-slot byte-offset slice_view is also applied at the legacy F
 - Phase B4b: thread `slot_id` through the 5 decode-side entry points + MTP's `forward_draft` path (currently hard-coded `SlotId(0)` at `mtp.rs:430`).
 - Phase B4c: Gemma 4's `forward_prefill.rs` after Phase A3 lands.
 - Phase B4d: spec-decode (`forward_gpu_greedy` + dflash variants) after Phase A4 lands.
+
+### 6.1.6 Iter-B4a-cont.1 closure — Codex /cfa rev-1 follow-ups (2026-05-23, this commit)
+
+Adversarial review of B4a (commit `23896c33`) + B4a-cont (commit `1d3b13ef`) by Codex returned `verdict=request_changes`, `severity=med`, with 2 major + 2 minor findings.  This iter addresses the 2 major + 1 of the 2 minor (the remaining minor — `MlxBuffer::slice_view` overflow hardening — is `mlx-native`'s concern, out of scope for hf2q-only edits per the brief).  Codex review evidence at `/tmp/cfa-b4a-cont-review/codex-review-last.txt`.
+
+| Finding | Severity | Reviewer | File | Fix |
+|---|---|---|---|---|
+| M1 | major | Codex | `src/inference/models/qwen35/forward_gpu.rs` (test) | The previous `b4a_cont_forward_gpu_slot_isolation_byte_identity` reset `current_len[0]` and re-ran prompt P into slot 0; the re-run OVERWROTE slot 0's K/V positions before attention read them, so a broken impl where slot-1 writes land in slot 0 could still pass.  Replaced with two stronger pins (see below). |
+| M2 | major | Codex | `src/inference/models/qwen35/gpu_full_attn.rs` (TQ-active gate) | `build_gated_attn_layer` has a fused Stage-AB path (line ~5479) that bypasses `apply_sdpa_with_kv_cache` and calls `write_kv_with_optional_tq_encode` directly.  The defence-in-depth gates inside the two private dispatchers fire AFTER ops1-4 (4 projections + 2 per-head RMSNorm + 2 IMROPE dispatches) are already encoded into an uncommitted command encoder — wasteful + obscures the failure site.  Lifted the canonical gate to `build_gated_attn_layer` + `apply_gated_attn_layer_decode_into` entry. |
+| Minor#1 | minor | Codex | `src/inference/models/qwen35/forward_gpu.rs:1595-1598` | Comment said "GPU-side KV-buffer rebasing lands in Phase B4a-cont".  After commit `1d3b13ef`, B4a-cont has landed.  Updated to reflect current state (rebasing implemented; TQ-active multi-slot deferred to B4a-TQ). |
+| Minor#2 | minor | Codex | `mlx-native/src/buffer.rs:93-99` (`slice_view`) | `byte_offset as usize + n_elements * dtype.size_of()` uses unchecked arithmetic; an extreme offset/length could wrap before the `end <= len` assertion.  **OUT OF SCOPE** for B4a-cont.1 (mlx-native concern, not hf2q's; brief constraint #7 forbids mlx-native edits).  Tracked as a future mlx-native iter. |
+
+**M1 — Test rigor fixes** (`src/inference/models/qwen35/forward_gpu.rs`):
+- DELETED: `b4a_cont_forward_gpu_slot_isolation_byte_identity` (the reset-and-rerun-then-compare-logits test).
+- ADDED: `b4a_cont_forward_gpu_slot_isolation_raw_kv_byte_snapshot` — snapshots slot 0's K/V byte regions BEFORE the slot-1 forward, snapshots them AFTER, asserts bit-for-bit equality.  Also snapshots slot 1's K region pre/post slot-1 forward and asserts it CHANGED (vacuous-test guard: a no-op kernel bind would also "preserve" slot 0).  Plus cursor-side mirror: slot 0's cursor stays at `prompt_p.len()` (NOT 0 — set by step 1); slot 1's cursor advances to `prompt_q.len()`.
+- ADDED: `b4a_cont_forward_gpu_same_prompt_in_slot_0_and_slot_1_produces_byte_identical_logits` — positive correctness pin.  Same prompt fed to slot 0 then slot 1 on a fresh cache must produce byte-identical logits AND byte-identical per-slot K/V regions (after normalising for the slot byte offset).  Catches kernels that get the projection output right but lay out K/V differently per slot.
+
+**M2 — Canonical gate placement** (`src/inference/models/qwen35/gpu_full_attn.rs`):
+- ADDED: TQ-active multi-slot gate at `build_gated_attn_layer` entry (~line 5060, before any fused-stage eligibility predicate).  Routes `slot_id.0 != 0 && slot.tq.is_some()` to a typed B4a-TQ error before any encoder work begins.
+- ADDED: same gate at `apply_gated_attn_layer_decode_into` entry (~line 6360, after the seq_len debug_asserts but before ops1-4).
+- KEPT: defence-in-depth gates inside `write_kv_with_optional_tq_encode` + `dispatch_decode_sdpa_with_optional_tq` (now strict followers; the canonical entry gate is the first to fire).
+- ADDED: `b4a_cont_1_tq_active_multi_slot_gated_at_build_gated_attn_layer_entry` test — builds a TQ-active `HybridKvCache` (`new_with_options(.., tq_kv_active=true)`) and asserts the error message names `build_gated_attn_layer` (proves the canonical entry gate fires first, NOT one of the deeper defence-in-depth gates).  Also asserts `slot_id=1` + cites `B4a-TQ` per ADR-040 §7 fail-loud mantra.
+
+**Minor#1 — Stale comment** (`src/inference/models/qwen35/forward_gpu.rs:1595-1598`):
+- Updated the `forward_gpu` doc-comment to reflect that GPU-side KV-buffer rebasing is implemented at B4a-cont (commit `1d3b13ef`) for F32 full-attn paths; TQ-active multi-slot is the only deferred case (B4a-TQ).
+
+**Test count delta**:
+- Baseline (B4a-cont landed): 147 PASS.
+- −1 deleted: `b4a_cont_forward_gpu_slot_isolation_byte_identity` (the weak reset+rerun-then-compare test).
+- +2 M1: `b4a_cont_forward_gpu_slot_isolation_raw_kv_byte_snapshot` + `b4a_cont_forward_gpu_same_prompt_in_slot_0_and_slot_1_produces_byte_identical_logits`.
+- +1 M2: `b4a_cont_1_tq_active_multi_slot_gated_at_build_gated_attn_layer_entry`.
+- Final: **149 PASS** (across `qwen35::kv_cache::tests`, `serve::scheduler::tests`, `serve::multi_seq_kv::tests`, `qwen35::forward_gpu::tests::b4a*`, `qwen35::forward_gpu::tests::b4a_cont*`).
+
+**LOC delta** (per-file, vs B4a-cont baseline):
+- `src/inference/models/qwen35/forward_gpu.rs`: +~280 LOC / -~100 LOC (deleted reset+rerun test ~100; 2 new M1 tests ~210; 1 new M2 test ~70; stale-comment refresh ~5).
+- `src/inference/models/qwen35/gpu_full_attn.rs`: +~40 LOC (2 canonical TQ-active multi-slot gates).
+- `docs/ADR-040-continuous-batching-reopen.md`: +~60 LOC (this §6.1.6 closure block + §2.2 row + §6 Phase B sequencing row).
+
+**Quality gates** (all PASS):
+- `cargo check --release` returns 0.
+- `cargo check --release --tests` returns 0.
+- `cargo test --release --bin hf2q -- qwen35::kv_cache::tests serve::scheduler::tests serve::multi_seq_kv::tests qwen35::forward_gpu::tests::b4a qwen35::forward_gpu::tests::b4a_cont` returns 0 with 149 PASS.
+- No `// TODO`, no `unimplemented!()`, no `panic!()` in production code.
+
+**Severity downgrade**: Codex /cfa rev-1 verdict was `request_changes / severity=med` (0 critical, 2 major, 2 minor).  This iter addresses 2 major + 1 minor; the remaining minor is out of scope (mlx-native edit boundary).  Expected next-rev verdict: `accept / severity=info` on the hf2q surface (the mlx-native minor remains tracked separately).
+
+**Future-iter pin pointers** (carried forward from §6.1.5):
+- Phase B4a-TQ: lift TQ encode + TQ SDPA kernels to slot-aware; once landed, remove the M2 canonical entry gates (the 2 new ones added in this iter at `build_gated_attn_layer` + `apply_gated_attn_layer_decode_into`) plus the defence-in-depth gates at `apply_sdpa_with_kv_cache` (~line 4371) + the two private dispatchers.
+- mlx-native: harden `MlxBuffer::slice_view` overflow handling per Codex minor#2 (`checked_mul` + `checked_add` + typed-error return).
 
 ---
 
