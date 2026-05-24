@@ -95,8 +95,16 @@
 //! - `drop_seq` resets `seq_len` to 0
 //! - `fork_seq(src, dst)` copies `src`'s `seq_len` to `dst` and leaves
 //!   `src` unchanged
-//! - `MultiSeqLayout::Paged` is reserved: constructor succeeds but
-//!   `append_for_seq` returns [`MultiSeqError::LayoutNotSupported`]
+//! - `MultiSeqLayout::Paged` is reserved: constructor succeeds; an
+//!   IN-BOUNDS `append_for_seq` / `drop_seq` / `fork_seq` returns
+//!   [`MultiSeqError::LayoutNotSupported`].  Per iter-1.5
+//!   cfa-finding-F5, an OUT-OF-BOUNDS slot under a Paged cache returns
+//!   [`MultiSeqError::SlotOutOfRange`] (bounds-first ordering — the
+//!   slot validity precondition is shared across all layouts and must
+//!   not be hidden behind a capability error).
+//! - [`SeqId::new`] rejects `u32::MAX` (per iter-1.5 cfa-finding-F7 —
+//!   the reserved sentinel value cannot be allocated and so cannot
+//!   collide with a scheduler-side `wrapping_add` counter).
 //! - [`SeqId`] / [`SlotId`] do NOT interconvert at the type level
 //!   (compile-time test via a doc-test snippet)
 //! - [`MultiSeqError`] `Debug` formatting names the slot id + relevant
@@ -118,12 +126,62 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SeqId(pub u32);
 
+/// Error returned by [`SeqId::new`] when the caller attempts to construct
+/// a `SeqId` from the reserved sentinel value `u32::MAX`.
+///
+/// Iter-1.5 cfa-finding-F7: previously the module exposed
+/// `SeqId::UNASSIGNED = SeqId(u32::MAX)` as a special-case sentinel that
+/// the Phase B iter-3 scheduler could use to mean "no sequence assigned
+/// yet".  The defect: any scheduler-side allocator that minted IDs with
+/// `wrapping_add` (the obvious cheap-monotonic-counter pattern) would
+/// eventually hand out `SeqId(u32::MAX)` to a real request and silently
+/// collide with the sentinel.  The fix: make `u32::MAX` UNALLOCATABLE by
+/// routing every construction through [`SeqId::new`], which rejects the
+/// reserved value at the type-system boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqIdOverflow;
+
+impl std::fmt::Display for SeqIdOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SeqId overflow: u32::MAX is reserved (cfa-finding-F7)")
+    }
+}
+
+impl std::error::Error for SeqIdOverflow {}
+
 impl SeqId {
-    /// Sentinel sequence ID used by Phase B iter-3's scheduler when an
-    /// admission slot has not yet been assigned a sequence.  Distinct
-    /// from `SeqId(0)` (which IS a valid sequence ID, assigned to the
-    /// first admitted request).
-    pub const UNASSIGNED: SeqId = SeqId(u32::MAX);
+    /// Construct a [`SeqId`], rejecting `u32::MAX` per cfa-finding-F7.
+    ///
+    /// `u32::MAX` is reserved as the [`SeqId::RESERVED`] constant so that
+    /// scheduler-side allocators (Phase B iter-3) can use it as a
+    /// can-never-collide sentinel value for "no sequence assigned yet".
+    /// Routing every construction through this validating constructor
+    /// guarantees the sentinel cannot be minted by a `wrapping_add`
+    /// counter that wraps around `u32::MAX` after enough admissions.
+    ///
+    /// Returns [`SeqIdOverflow`] when `v == u32::MAX`.  The raw
+    /// `pub struct SeqId(pub u32)` field is retained for the
+    /// compile-time-distinctness story in the module doc, but production
+    /// callers should always use this constructor; the field is treated
+    /// as `pub(crate)` in spirit (no external caller exists at
+    /// iter-1.5 — see ADR-040 §3 newtype discipline).
+    pub fn new(v: u32) -> Result<Self, SeqIdOverflow> {
+        if v == u32::MAX {
+            Err(SeqIdOverflow)
+        } else {
+            Ok(SeqId(v))
+        }
+    }
+
+    /// Reserved sentinel value (`u32::MAX`).  Cannot be allocated via
+    /// [`SeqId::new`]; scheduler-side allocators may use this constant
+    /// directly when they need a "no sequence assigned yet" marker.
+    ///
+    /// Exposed as a `u32` (not a `SeqId`) deliberately: the reserved
+    /// value is NOT a valid [`SeqId`].  Code that needs to compare a
+    /// candidate `SeqId` against the sentinel should compare the
+    /// `.0` field against `SeqId::RESERVED` directly.
+    pub const RESERVED: u32 = u32::MAX;
 }
 
 /// Physical slot opaque ID.
@@ -153,8 +211,11 @@ pub struct SlotId(pub u32);
 /// shows ≥30% memory waste under N=8 concurrent at production context
 /// lengths.  Iter-1 carries the variant so the trait + error types lock
 /// the eventual surface shape, but the [`NoopMultiSeqKvCache`] fixture
-/// refuses to append on Paged with [`MultiSeqError::LayoutNotSupported`]
-/// (the per-model impls in Phase A iter-2+ will do the same).
+/// refuses an IN-BOUNDS append on Paged with
+/// [`MultiSeqError::LayoutNotSupported`] (the per-model impls in Phase
+/// A iter-2+ will do the same).  An OUT-OF-BOUNDS slot under a Paged
+/// cache surfaces as [`MultiSeqError::SlotOutOfRange`] per iter-1.5
+/// cfa-finding-F5 (bounds-first ordering).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MultiSeqLayout {
     /// Per-slot independent allocation: shape `[..., max_seq_len,
@@ -301,6 +362,22 @@ pub trait MultiSeqKvCache {
     /// - [`MultiSeqError::LayoutNotSupported`] when the cache was
     ///   constructed with [`MultiSeqLayout::Paged`] (iter-1; future
     ///   PagedAttention ADR lifts this)
+    ///
+    /// # Validation order (Liskov contract — iter-1.5 cfa-finding-F5)
+    ///
+    /// Per-model impls MUST validate in this order:
+    /// 1. Slot bounds — return `SlotOutOfRange` if `slot.0 >= self.slot_count()`.
+    /// 2. Layout support — return `LayoutNotSupported` if `self.layout()` does not
+    ///    support this operation.
+    /// 3. Budget / OOM — return `SlotOom` if the operation would exceed per-slot budget.
+    ///
+    /// Bounds-first is the Liskov-compliant default because every layout shares the
+    /// same slot validity precondition.  Reversing the order (layout-first) hides
+    /// caller/scheduler bugs behind capability errors — an out-of-range `SlotId`
+    /// against a Paged cache would surface as `LayoutNotSupported` and obscure the
+    /// real scheduler defect.  The [`NoopMultiSeqKvCache`] fixture is the
+    /// byte-equivalence reference for this ordering; iter-2+ per-model impls
+    /// (HybridKvCache etc.) must match.
     fn append_for_seq(&mut self, slot: SlotId, n_tokens: u32) -> Result<(), MultiSeqError>;
 
     /// Drop `slot`'s sequence: reset `seq_len` to 0 and release any
@@ -310,6 +387,20 @@ pub trait MultiSeqKvCache {
     /// O(1).  Does NOT free the underlying GPU buffer (the buffer is
     /// engine-lifetime; the slot becomes available for the next
     /// admission immediately).
+    ///
+    /// # Validation order (Liskov contract — iter-1.5 cfa-finding-F5)
+    ///
+    /// Per-model impls MUST validate in this order:
+    /// 1. Slot bounds — return `SlotOutOfRange` if `slot.0 >= self.slot_count()`.
+    /// 2. Layout support — return `LayoutNotSupported` if `self.layout()` does not
+    ///    support this operation.
+    /// 3. Budget / OOM — `drop_seq` cannot `SlotOom` under any current layout
+    ///    (it is a pure release), but the per-model impl must keep the same
+    ///    ordering for code symmetry with [`MultiSeqKvCache::append_for_seq`].
+    ///
+    /// Bounds-first is the Liskov-compliant default because every layout shares the
+    /// same slot validity precondition.  See [`MultiSeqKvCache::append_for_seq`]
+    /// for the full rationale.
     fn drop_seq(&mut self, slot: SlotId) -> Result<(), MultiSeqError>;
 
     /// Copy `src`'s sequence state into `dst`.  After a successful
@@ -329,6 +420,39 @@ pub trait MultiSeqKvCache {
     ///   `SlotOom` on fork because it is a memcpy into pre-allocated
     ///   per-slot buffers).
     /// - [`MultiSeqError::LayoutNotSupported`] under Paged in iter-1.
+    ///
+    /// # Validation order (Liskov contract — iter-1.5 cfa-finding-F5)
+    ///
+    /// Per-model impls MUST validate in this order:
+    /// 1. Slot bounds — return `SlotOutOfRange` for `src` FIRST, then for
+    ///    `dst` (so a fully invalid `(src, dst)` pair surfaces `src` as the
+    ///    OOR victim deterministically).
+    /// 2. Layout support — return `LayoutNotSupported` if `self.layout()` does not
+    ///    support this operation.
+    /// 3. Budget / OOM — return `SlotOom` if the operation would exceed per-slot budget
+    ///    (SeparateSlots cannot trip this; Paged-and-future block-shared layouts can).
+    ///
+    /// Bounds-first is the Liskov-compliant default because every layout shares the
+    /// same slot validity precondition.  See [`MultiSeqKvCache::append_for_seq`]
+    /// for the full rationale.
+    ///
+    /// # Performance contract (cfa-finding-F9)
+    ///
+    /// - Under [`MultiSeqLayout::SeparateSlots`]: **O(seq_len)** — per-model impls
+    ///   memcpy `seq_len * (k_elem_size + v_elem_size)` bytes from src's
+    ///   buffer slot to dst's buffer slot.  Callers wiring this for prefix-share
+    ///   should expect MB-scale copies at production context lengths.
+    /// - Under [`MultiSeqLayout::Paged`]: **O(num_blocks)** — only the per-block
+    ///   pointer table is copied; block contents are shared via reference
+    ///   counting (future ADR for the Paged kernel port).
+    /// - Phase B iter-6's prefix-share path: under SeparateSlots, prefix-share
+    ///   is effectively single-seq prefix cache + fresh-slot allocation; the
+    ///   memcpy cost is unavoidable.  Paged unlocks zero-copy share.
+    ///
+    /// Distinct from the per-slot O(1) bound that `append_for_seq` and
+    /// `drop_seq` carry: `fork_seq` is a bulk-copy operation by construction
+    /// under the default SeparateSlots layout, and scheduler-side admission
+    /// decisions (Phase B iter-6) should budget accordingly.
     fn fork_seq(&mut self, src: SlotId, dst: SlotId) -> Result<(), MultiSeqError>;
 }
 
@@ -395,6 +519,9 @@ impl NoopMultiSeqKvCache {
     }
 
     /// Internal helper: refuse on the Paged layout per iter-1 contract.
+    /// Per iter-1.5 cfa-finding-F5, callers MUST invoke `check_slot`
+    /// BEFORE this helper so an out-of-range `SlotId` against a Paged
+    /// cache surfaces as `SlotOutOfRange`, not `LayoutNotSupported`.
     fn check_layout_supported(&self) -> Result<(), MultiSeqError> {
         match self.layout {
             MultiSeqLayout::SeparateSlots => Ok(()),
@@ -424,12 +551,13 @@ impl MultiSeqKvCache for NoopMultiSeqKvCache {
     }
 
     fn append_for_seq(&mut self, slot: SlotId, n_tokens: u32) -> Result<(), MultiSeqError> {
-        // Layout check FIRST so a Paged out-of-range append returns
-        // LayoutNotSupported (the more diagnostic error for an
-        // operator config drift) rather than SlotOutOfRange.  Per-model
-        // impls in iter-2+ follow the same ordering.
-        self.check_layout_supported()?;
+        // Bounds FIRST per iter-1.5 cfa-finding-F5 (Liskov-compliant
+        // default: every layout shares the same slot validity
+        // precondition; reversing the order would hide a scheduler bug
+        // behind a capability error).  Then layout support, then
+        // (future) per-slot budget.
         self.check_slot(slot)?;
+        self.check_layout_supported()?;
         // Saturating add so a pathological `n_tokens = u32::MAX` test
         // cannot panic in debug builds; production callers bound
         // `n_tokens` by the per-slot max_seq_len long before reaching
@@ -440,19 +568,22 @@ impl MultiSeqKvCache for NoopMultiSeqKvCache {
     }
 
     fn drop_seq(&mut self, slot: SlotId) -> Result<(), MultiSeqError> {
-        // Layout check FIRST per the append ordering.
-        self.check_layout_supported()?;
+        // Bounds FIRST per iter-1.5 cfa-finding-F5 — see
+        // `append_for_seq` for the full rationale.
         self.check_slot(slot)?;
+        self.check_layout_supported()?;
         self.slot_lens[slot.0 as usize] = 0;
         Ok(())
     }
 
     fn fork_seq(&mut self, src: SlotId, dst: SlotId) -> Result<(), MultiSeqError> {
-        self.check_layout_supported()?;
-        // Validate src first then dst — the trait docs pin this order
-        // so error reproduction is deterministic for tests.
+        // Bounds FIRST per iter-1.5 cfa-finding-F5: src then dst then
+        // layout.  Validating src first means a fully invalid
+        // `(src, dst)` pair surfaces `src` as the OOR victim
+        // deterministically, matching the trait doc contract.
         self.check_slot(src)?;
         self.check_slot(dst)?;
+        self.check_layout_supported()?;
         let src_len = self.slot_lens[src.0 as usize];
         self.slot_lens[dst.0 as usize] = src_len;
         Ok(())
@@ -622,35 +753,97 @@ mod tests {
     // ── reserved Paged layout ──────────────────────────────────────────
 
     #[test]
-    fn noop_cache_paged_layout_errors_on_append() {
+    fn noop_cache_paged_in_bounds_returns_layout_not_supported() {
         // Constructor still works (per iter-1 surface contract — see
         // NoopMultiSeqKvCache::new docs).
         let mut cache = NoopMultiSeqKvCache::new(4, MultiSeqLayout::Paged);
         assert_eq!(cache.slot_count(), 4);
         assert_eq!(cache.layout(), MultiSeqLayout::Paged);
-        // Append is refused with the diagnostic LayoutNotSupported.
+        // Per iter-1.5 cfa-finding-F5: a Paged cache with an IN-BOUNDS
+        // slot trips LayoutNotSupported (bounds check passes, layout
+        // check then refuses).  This is the diagnostic operator-config
+        // error for an operator who selected Paged before the future
+        // PagedAttention ADR shipped.
         let err = cache.append_for_seq(SlotId(0), 1).unwrap_err();
         assert_eq!(
             err,
             MultiSeqError::LayoutNotSupported {
                 layout: MultiSeqLayout::Paged
             },
-            "Paged append must trip LayoutNotSupported; got {err:?}"
+            "Paged in-bounds append must trip LayoutNotSupported; got {err:?}"
         );
-        // Drop + fork are also refused under Paged (same reservation).
+        // Drop + fork (in-bounds slots) are also refused under Paged.
         let err = cache.drop_seq(SlotId(0)).unwrap_err();
         assert_eq!(
             err,
             MultiSeqError::LayoutNotSupported {
                 layout: MultiSeqLayout::Paged
-            }
+            },
+            "Paged in-bounds drop must trip LayoutNotSupported; got {err:?}"
         );
         let err = cache.fork_seq(SlotId(0), SlotId(1)).unwrap_err();
         assert_eq!(
             err,
             MultiSeqError::LayoutNotSupported {
                 layout: MultiSeqLayout::Paged
-            }
+            },
+            "Paged in-bounds fork must trip LayoutNotSupported; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn noop_cache_paged_out_of_bounds_returns_slot_out_of_range() {
+        // Per iter-1.5 cfa-finding-F5: bounds-first means an OOR slot
+        // under a Paged cache surfaces as `SlotOutOfRange`, NOT
+        // `LayoutNotSupported`.  Reversing the order would hide a
+        // scheduler bug (handing out an OOR slot) behind an operator
+        // capability error.  This test is the load-bearing pin for the
+        // Liskov contract — per-model impls (HybridKvCache in iter-2+)
+        // must match this ordering.
+        let mut cache = NoopMultiSeqKvCache::new(2, MultiSeqLayout::Paged);
+
+        // append: OOR slot wins over Paged refusal.
+        let err = cache.append_for_seq(SlotId(7), 1).unwrap_err();
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(7),
+                max_slots: 2
+            },
+            "Paged + OOR append must trip SlotOutOfRange (bounds-first); got {err:?}"
+        );
+
+        // drop: OOR slot wins over Paged refusal.
+        let err = cache.drop_seq(SlotId(7)).unwrap_err();
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(7),
+                max_slots: 2
+            },
+            "Paged + OOR drop must trip SlotOutOfRange (bounds-first); got {err:?}"
+        );
+
+        // fork with OOR src: src OOR wins over Paged refusal.
+        let err = cache.fork_seq(SlotId(7), SlotId(0)).unwrap_err();
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(7),
+                max_slots: 2
+            },
+            "Paged + fork OOR src must trip SlotOutOfRange for src (bounds-first); got {err:?}"
+        );
+
+        // fork with valid src but OOR dst: dst OOR wins over Paged refusal.
+        let err = cache.fork_seq(SlotId(0), SlotId(9)).unwrap_err();
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(9),
+                max_slots: 2
+            },
+            "Paged + fork OOR dst must trip SlotOutOfRange for dst (bounds-first); got {err:?}"
         );
     }
 
@@ -665,16 +858,58 @@ mod tests {
         // companion runtime-side check that the newtypes carry the
         // value through without alteration.
         let s = SlotId(7);
-        let q = SeqId(7);
+        let q = SeqId::new(7).unwrap();
         assert_eq!(s.0, 7);
         assert_eq!(q.0, 7);
-        // SeqId::UNASSIGNED is distinct from SeqId(0).
-        assert_ne!(SeqId::UNASSIGNED, SeqId(0));
-        assert_eq!(SeqId::UNASSIGNED.0, u32::MAX);
         // The following line, if uncommented, MUST fail to compile:
         //     let _: SlotId = q;
         // The doc-test on `_ID_NEWTYPES_ARE_DISTINCT` automates that
         // proof under `cargo test --doc`.
+    }
+
+    // ── SeqId validating constructor (cfa-finding-F7) ──────────────────
+
+    #[test]
+    fn seq_id_new_rejects_u32_max() {
+        // The reserved sentinel `u32::MAX` must not be allocatable via
+        // the validating constructor — that is the entire point of the
+        // iter-1.5 F7 fix.  Any scheduler-side allocator that hits
+        // u32::MAX via wrapping_add must surface SeqIdOverflow here
+        // rather than silently colliding with the sentinel.
+        assert!(matches!(SeqId::new(u32::MAX), Err(SeqIdOverflow)));
+    }
+
+    #[test]
+    fn seq_id_new_accepts_zero_and_max_minus_one() {
+        // Boundary values: 0 is the first valid id; u32::MAX - 1 is the
+        // last valid id under the F7 contract.  Both must succeed and
+        // round-trip the wrapped value.
+        let zero = SeqId::new(0).expect("0 must be a valid SeqId");
+        assert_eq!(zero.0, 0);
+        let last = SeqId::new(u32::MAX - 1).expect("u32::MAX - 1 must be a valid SeqId");
+        assert_eq!(last.0, u32::MAX - 1);
+    }
+
+    #[test]
+    fn seq_id_reserved_constant_is_u32_max() {
+        // The sentinel value is `u32::MAX`, exposed as a `u32` (not a
+        // `SeqId`) because the reserved value is NOT a valid `SeqId`.
+        assert_eq!(SeqId::RESERVED, u32::MAX);
+    }
+
+    #[test]
+    fn seq_id_overflow_display_mentions_cfa_finding() {
+        // The Display message must name the iter-1.5 finding so
+        // operator-side log grep can map a 500 back to the F7 fix.
+        let s = format!("{}", SeqIdOverflow);
+        assert!(
+            s.contains("u32::MAX"),
+            "Display must name the reserved value: {s}"
+        );
+        assert!(
+            s.contains("cfa-finding-F7"),
+            "Display must reference the iter-1.5 finding: {s}"
+        );
     }
 
     // ── Debug formatting names slot id + context ────────────────────────

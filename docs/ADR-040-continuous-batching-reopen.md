@@ -1,6 +1,6 @@
 # ADR-040 — Continuous batching: reopen the ADR-005 carve-out
 
-- **Status**: 🚧 ACTIVE — Design 2026-05-23, **iter-1 SHIPPED 2026-05-23** (this commit). Multi-iter arc in progress under goal-mode directive. Reopens the [ADR-005 Decision #1 carve-out](ADR-005-inference-server.md) ("continuous batching pulled from ADR-005 — deferred to a future ADR; reopen trigger = real deployment scenario with ≥8 concurrent users on a single instance").
+- **Status**: 🚧 ACTIVE — Design 2026-05-23, iter-1 SHIPPED 2026-05-23 (commit 1a1d6a26), **iter-1.5 in progress 2026-05-23 (adversarial review fixes per cfa session — Codex + Claude both requested_changes/high severity)**. Multi-iter arc in progress under goal-mode directive. Reopens the [ADR-005 Decision #1 carve-out](ADR-005-inference-server.md) ("continuous batching pulled from ADR-005 — deferred to a future ADR; reopen trigger = real deployment scenario with ≥8 concurrent users on a single instance").
 - **Date**: 2026-05-23
 - **Supersedes**: nothing. Amends ADR-005 §"Concurrent-deployment scaling (deferred, future ADR)" (line 1097) and Resolved Question "Phase 2 scope refinement" Decision #1 (line 6652) by activating the deferred-ADR slot.
 - **Related**: ADR-005 (Phase 2 FIFO contract — Decision #2, Decision #19), ADR-007 (TurboQuant KV — single-seq scope), ADR-017 (persistent block prefix cache — single-seq, per-model spill), ADR-027 (Qwen35 TQ KV + persist — single-seq), ADR-013 (Qwen35 inference), ADR-034 (spec-decode end-to-end — intra-request batching only).
@@ -61,14 +61,17 @@ The ADR-005 reopen trigger ("≥8 concurrent users on a single instance, reporte
 
 ### 2.1 Files this ADR creates (Phase A/B/C/D iter-1 scaffolding)
 
-| Component | Path | LOC est. (iter-1 scaffold) |
-|---|---|---|
-| Multi-seq KV trait + types | `src/serve/multi_seq_kv.rs` | ~250 |
-| Scheduler trait + FIFO adapter | `src/serve/scheduler.rs` | ~400 |
-| `EngineMode` enum + slot-aware Engine extension | edits to `src/serve/api/engine.rs` | ~120 |
-| Continuous-batching throughput benchmark | `tests/continuous_batching_throughput.rs` | ~180 |
+| Component | Path | LOC est. (iter-1 scaffold) | LOC actual (post-iter-1.5) |
+|---|---|---|---|
+| Multi-seq KV trait + types | `src/serve/multi_seq_kv.rs` | ~250 | ~780 (+34 from F5/F7/F9 fixes) |
+| Scheduler trait + FIFO adapter | `src/serve/scheduler.rs` | ~400 | ~790 (+30 from F2/F3/F6 fixes; F2 gated behind cfg(test)) |
+| `EngineMode` enum + slot-aware Engine extension | edits to `src/serve/api/engine.rs` | ~120 | ~280 (+23 from F1 fix) |
+| Continuous-batching throughput benchmark | `tests/continuous_batching_throughput.rs` | ~180 | ~205 (+6 from F8 fix) |
 
-**Total iter-1 LOC**: ~950 (scaffolding-only — no production callsite activation).
+**Total iter-1 LOC actual**: ~2330 (vs ~950 estimate — 2.45x miss).
+**Total iter-1.5 LOC delta**: ~+90 (fix-only, no new functionality).
+
+The 2.45x over-shoot is documented honestly per cfa-finding (Claude `major_findings[8]`). Causes: (a) verbose docstrings + ADR-cross-reference comments per ADR-040 §7 mantra; (b) test coverage at 40 tests far exceeded the AC-level minimum; (c) goal-mode-directive expansion past the original "stub" scope into "real admit/release/stats semantics for FifoSchedulerAdapter + InflightBatched signature stub".
 
 ### 2.2 Files this ADR edits across the multi-iter arc (iter-2+)
 
@@ -148,6 +151,23 @@ The ADR-005 reopen trigger ("≥8 concurrent users on a single instance, reporte
 
 **Why**: ADR-005 Phase 2 has been in production since 2026-04. A scheduler refactor that breaks single-request behaviour would invalidate every benchmark and every customer integration. Phase C iter-1 ships a dedicated regression test `engine_serial_fifo_byte_equivalent_to_pre_phase_c`.
 
+#### 3.6.1 Amendment (iter-1.5, post-cfa-review)
+
+The original §3.6 byte-equivalence claim was overstated by iter-1's signature-only test (`engine_spawn_3_arg_signature_compile_pin`, formerly `engine_spawn_signature_unchanged_at_phase_c_iter_1`). Adversarial reviewers (Codex + Claude) correctly observed that a compile-time signature pin proves NOTHING about behaviour. The byte-equivalence claim is now phased:
+
+| Aspect | iter-1 pin | iter-1.5 pin | iter-2 promise |
+|---|---|---|---|
+| 3-arg `Engine::spawn` signature unchanged | compile-time gate | compile-time gate + renamed test | compile-time gate |
+| FifoSchedulerAdapter queue_capacity matches `Engine::spawn` `.max(1)` | NOT pinned | `fifo_queue_capacity_zero_normalizes_to_one` | live A/B vs Engine::spawn |
+| FifoSerial single-slot invariant (SlotId(0) reuse) | NOT pinned (allocated monotonic) | `fifo_serial_always_assigns_slot_id_0` | enforced |
+| Concurrent admit race matches mpsc arrival ordering | NOT pinned (sequential test only) | `fifo_concurrent_admits_under_mutex_match_429_boundary` | live thread-scope race vs real Engine |
+| FIFO ordering of dequeue | sequential-call pin (`fifo_admit_twice_*`) | sequential-call pin | live A/B vs Engine::spawn |
+| 2-step Prefill→Decode state machine vs Engine's atomic worker_run | NOT pinned (state machine differs) | documented as deliberate divergence (driver loop calls step() in tight loop) | resolved via Phase C iter-2 driver wrapping |
+| 429 + Retry-After handler boundary | not exercised | not exercised | live HTTP integration test |
+| SSE keepalive behavior | not exercised | not exercised | live HTTP integration test |
+
+Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equivalence proof — that proof lands at Phase C iter-2 when the scheduler is wired into `Engine::spawn` and a live A/B harness against pre-ADR-040 behaviour can run. iter-1.5 honestly downgrades the claim.
+
 ### 3.7 Reopen-trigger memo ordering
 
 **Decision**: The formal reopen-trigger memo (naming the customer or scenario that fires the ≥8-concurrent threshold) is NOT a prerequisite for Phases A/B/C/D iter-1 scaffolding or implementation iters. It IS a prerequisite for Phase E1 — the cutover that flips `SchedulerPolicy::InflightBatched` to default-on.
@@ -225,7 +245,7 @@ The ADR-005 reopen trigger ("≥8 concurrent users on a single instance, reporte
 
 | Iter | Scope | Estimated effort |
 |---|---|---|
-| **B1 (THIS ITER, 2026-05-23)** | Scaffolding: trait + FifoSchedulerAdapter + InflightBatchedScheduler stub | 1 day |
+| **B1 (THIS ITER, 2026-05-23)** | Scaffolding: trait + FifoSchedulerAdapter (real admit/step/release/stats) + InflightBatchedScheduler signature stub (post-iter-1.5: cfg(test)-gated) | 1 day landed |
 | B2 | FifoSchedulerAdapter byte-equivalence proof + regression pin | 2-3 days |
 | B3 | InflightBatchedScheduler admit/step/release impl | 5-8 days |
 | B4 | Forward-path slot-id threading (`forward_prefill.rs` + `forward_prefill_batched.rs`) | 5-8 days |
@@ -277,6 +297,45 @@ All four Phase iter-1 scaffolding tracks landed in parallel under goal-mode dire
 - `InflightBatchedScheduler::step` returns `Err(StepError::NotImplemented)` at iter-1 (pinned by `inflight_batched_step_returns_not_implemented_at_iter_1`; Phase B iter-3 replaces)
 - `SlotId` + `SeqId` are distinct types — compile-time + runtime test
 - `MultiSeqLayout::Paged` is reserved; append under it returns `LayoutNotSupported`
+
+### 6.1.1 Iter-1.5 closure — adversarial review findings + fixes (2026-05-23)
+
+Per goal-mode directive ("Spawn Swarm team (/cfa) with codex to check our work"), iter-1 commit 1a1d6a26 was reviewed by an adversarial /cfa session: an independent Codex reviewer (via `codex exec --json -s read-only`) + an independent Claude reviewer agent. Both returned **verdict=request_changes, severity=high** with substantively overlapping findings. Full reviews at `~/.claude/teams/cfa-adr040-iter1-review/shared/reviews/`.
+
+**Critical findings (both reviewers, must-fix before iter-2):**
+
+| # | Finding | Codex | Claude | Fix |
+|---|---|---|---|---|
+| F1 | `spawn_with_mode` silently discards `mode` parameter; `mode()` accessor lies (Liskov violation) | critical | critical | Store `mode` on `EngineInner`; `spawn_with_mode` returns `Result<Self, EngineSpawnError>` rejecting `SlotAware` with typed `ModeNotYetWired` error until iter-2. Delete `mode_accessor_returns_serial_fifo_at_iter_1` (codifies the lie); add `mode_accessor_echoes_requested_mode`. |
+| F2 | `InflightBatchedScheduler::step → Err(NotImplemented)` IS a stub disguised as typed contract | critical | critical (mantra violation) | Gate `InflightBatchedScheduler` + `StepError::NotImplemented` behind `#[cfg(test)]`. Delete the test that pins NotImplemented. |
+| F3 | `FifoSchedulerAdapter` NOT byte-equivalent (missing `.max(1)`, monotonic SlotIds, conflated queue+inflight, sequential test misses race) | major | critical | Apply `queue_capacity.max(1)`. FifoSerial always allocates `SlotId(0)` (drop `next_slot_id` field). Add concurrent-admit race test using `std::thread::scope`. |
+| F4 (partial) | Tests pin SIGNATURE not BEHAVIOUR; name `engine_spawn_signature_unchanged_at_phase_c_iter_1` overclaims | major | critical | Rename to `engine_spawn_3_arg_signature_compile_pin` + doc comment that calls out the limitation. Full behavioural pin moves to Phase C iter-2. |
+
+**Major findings:**
+
+| # | Finding | Fix |
+|---|---|---|
+| F5 | Layout-check-before-bounds-check is wrong default (Liskov violation; hides caller bugs as capability errors) | Swap to bounds-first in NoopMultiSeqKvCache + pin in trait doc with `# Validation order` block. |
+| F6 | `AdmitError::QueueFull.capacity` field misnamed (carries queue_capacity, not total admissible — misleads operators) | Rename to `queue_capacity` + add `total_admissible: u32` field. |
+| F7 | `SeqId::UNASSIGNED = SeqId(u32::MAX)` sentinel will collide with future allocators | Delete UNASSIGNED const. Add `SeqId::new(v) -> Result<Self, SeqIdOverflow>` validating constructor rejecting u32::MAX. |
+| F8 | `cb_throughput_n_1_2_4_8_fifo_vs_inflight` always passes (silent skip even when E2E gate is set) | When env gate is set, PANIC with clear "iter-2 pending" message so CI burns. |
+| F9 | `fork_seq` performance contract unclear; SeparateSlots impl will be O(seq_len) memcpy | Document explicit O(seq_len) on SeparateSlots in trait doc. |
+
+**Mantra violations explicitly named by reviewers (ADR-040 §7 "no fallback, no stub"):**
+- `let _ = mode;` discard in `spawn_with_mode` (engine.rs:2562) — fixed by F1.
+- `Err(StepError::NotImplemented)` (scheduler.rs:477) — fixed by F2.
+- `cb_throughput_n_1_2_4_8_fifo_vs_inflight` early-return stub (continuous_batching_throughput.rs:167) — fixed by F8.
+- `mode()` accessor lying about requested mode (engine.rs:2574) — fixed by F1.
+
+**Strengths the reviewers noted (preserved):**
+- SeqId / SlotId newtype discipline.
+- MultiSeqError variant shapes with right field-bearing.
+- ADR-005 carve-out + Decisions #1/#2/#19 cross-references.
+- Engine::spawn 3-arg signature unchanged.
+
+**Iter-1.5 LOC delta**: ~250 LOC across the 4 fix tracks. Final test count: 40 (iter-1) → ~48 (iter-1.5, after F1+F2+F3+F5+F7 add/delete adjustments).
+
+**Adversarial review reproducibility**: codex transcript at `/tmp/cfa-adr040-iter1-review/codex-review.jsonl`; Claude review at `~/.claude/teams/cfa-adr040-iter1-review/shared/reviews/claude-on-iter1.json`. Both can be re-run by re-issuing the cfa skill against any future iter commit.
 
 ---
 

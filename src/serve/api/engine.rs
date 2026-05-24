@@ -518,7 +518,7 @@ pub enum LoadedArch {
 /// activates in iter-2 once `crate::serve::scheduler::Scheduler` is
 /// wired through `Engine::spawn` and the per-model `MultiSeqKvCache`
 /// impls land (Phase A iter-2+).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineMode {
     /// ADR-005 Decision #2 + #19 production path. One mpsc channel, one
     /// worker thread, serialized FIFO dispatch. Iter-1 default.
@@ -538,6 +538,41 @@ impl Default for EngineMode {
     fn default() -> Self {
         Self::SerialFifo
     }
+}
+
+/// ADR-040 Phase C iter-1.5 — typed error returned by
+/// [`Engine::spawn_with_mode`] when the requested mode is not yet wired.
+///
+/// At iter-1 the `SlotAware` runtime is signature-only; rather than silently
+/// degrading to `SerialFifo` (a Liskov-substitution violation per the
+/// adversarial review of iter-1), the constructor now FAILS FAST with this
+/// error. Iter-2 lands the `Scheduler` + `MultiSeqKvCache` wiring and removes
+/// the rejection from `spawn_with_mode`.
+///
+/// Per ADR-040 §7 "no fallback, no stub (todo later) code": the prior
+/// `let _ = mode;` discard was a stub; this typed error is the honest
+/// surface until iter-2 ships.
+#[derive(Debug, thiserror::Error)]
+pub enum EngineSpawnError {
+    /// The requested [`EngineMode`] variant requires runtime support that
+    /// has not yet landed. Carries the iter that introduced the surface
+    /// (`iter_landed`, e.g. `"C1.5"`) and the iter that will implement
+    /// the runtime (`iter_required`, e.g. `"C2"`) so callers + tooling
+    /// get a precise diagnostic. The `Display` impl ALSO formats the
+    /// implementing iter as `iter-2` (stripping the phase prefix) so
+    /// callers + log greps can match on the iter number without
+    /// committing to the phase letter.
+    #[error(
+        "ADR-040 EngineMode::SlotAware not yet wired (Phase {iter_landed} landed; \
+         Phase {iter_required} implements; track as iter-2). \
+         Use SerialFifo, or wait for Phase {iter_required}."
+    )]
+    ModeNotYetWired {
+        /// The iter that introduced the API surface (e.g. `"C1.5"`).
+        iter_landed: &'static str,
+        /// The iter that will implement the runtime (e.g. `"C2"`).
+        iter_required: &'static str,
+    },
 }
 
 /// Iter-215 Wedge-2 test fixture — build a synthetic `Engine` with a
@@ -767,6 +802,7 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
             token_bytes: std::sync::OnceLock::new(),
             kv_spill_descriptor: Some(descriptor_for_engine),
             tq_packed_descriptor: None,
+            mode: EngineMode::SerialFifo,
         }),
     }
 }
@@ -803,6 +839,7 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
             token_bytes: std::sync::OnceLock::new(),
             kv_spill_descriptor: None,
             tq_packed_descriptor: None,
+            mode: EngineMode::SerialFifo,
         }),
     }
 }
@@ -882,6 +919,23 @@ struct EngineInner {
     /// layer pattern and caused `restore_block CodecErr` bails on
     /// `layer >= 1`).
     tq_packed_descriptor: Option<super::tq_packed_descriptor::TqPackedSpillDescriptor>,
+
+    /// **ADR-040 Phase C iter-1.5** — the scheduling mode this engine was
+    /// constructed under. Populated by [`Engine::spawn`] (always
+    /// [`EngineMode::SerialFifo`]) and by [`Engine::spawn_with_mode`]
+    /// (echoes the caller's requested mode after validation).
+    ///
+    /// Stored even when the runtime behaviour is still `SerialFifo` so
+    /// that [`Engine::mode`] does NOT lie about what was requested — the
+    /// Liskov-substitution honest version. Iter-1's "always return
+    /// `SerialFifo::default()`" was flagged as a critical violation by
+    /// both adversarial reviewers (Codex + Claude); iter-1.5 ships the
+    /// stored field + fail-fast rejection of unwired modes.
+    ///
+    /// At iter-1.5 the only mode that survives validation in
+    /// `spawn_with_mode` is `SerialFifo`; `SlotAware` is rejected with
+    /// [`EngineSpawnError::ModeNotYetWired`] at the API boundary.
+    mode: EngineMode,
 }
 
 #[cfg(test)]
@@ -2308,11 +2362,19 @@ impl LoadInfoBuilder for GemmaLoadedModel {
             resident_weight_bytes: None,
             kv_cache_budget_bytes,
             kv_spill_active,
-            // ADR-027 Phase B iter-17: Gemma's TQ-on state lives in
-            // the engine-level `tq_packed_descriptor` (different
-            // mechanism); always false at the per-load level here.
-            // Future iter may unify Gemma + qwen35 surfacing.
-            tq_kv_active: false,
+            // 2026-05-23: surface Gemma 4 TQ-active state on the load
+            // banner. On Gemma 4, TQ-default-on is the production path
+            // (ADR-007 Path C, closed 2026-04-24; followup ADR's Gate H
+            // failure on non-DWQ models was closed 2026-05-23 with
+            // cosine_mean 0.999843 on APEX). Inactive only when the
+            // operator forces dense via `HF2Q_USE_DENSE=1` or
+            // `HF2Q_LAYER_POLICY=dense_all`. Matches the per-family
+            // banner text in `load_info::emit_text`.
+            tq_kv_active: !crate::debug::investigation_env::INVESTIGATION_ENV.use_dense
+                && !matches!(
+                    crate::debug::investigation_env::INVESTIGATION_ENV.layer_policy.as_deref(),
+                    Some("dense_all")
+                ),
         }
     }
 }
@@ -2525,54 +2587,99 @@ impl Engine {
                 token_bytes: std::sync::OnceLock::new(),
                 kv_spill_descriptor,
                 tq_packed_descriptor,
+                // ADR-040 Phase C iter-1.5 — the 3-arg `spawn` constructor
+                // is the ADR-005 byte-equivalence entry point; it always
+                // produces a `SerialFifo` engine. Callers wanting
+                // `SlotAware` must go through `spawn_with_mode` (iter-2+).
+                mode: EngineMode::SerialFifo,
             }),
         }
     }
 
-    /// ADR-040 Phase C iter-1 — `spawn` with explicit mode selection.
+    /// ADR-040 Phase C iter-1.5 — `spawn` with explicit mode selection.
     ///
-    /// At this iter, `EngineMode::SlotAware` returns the same engine as
-    /// `SerialFifo` (signature-only). Phase C iter-2 will route through
-    /// `crate::serve::scheduler::Scheduler` when mode is `SlotAware`.
+    /// At iter-1.5, only [`EngineMode::SerialFifo`] survives validation —
+    /// it delegates to [`Engine::spawn`] and returns `Ok(...)`. The
+    /// [`EngineMode::SlotAware`] variant is rejected with
+    /// [`EngineSpawnError::ModeNotYetWired`] at the API boundary; Phase C
+    /// iter-2 will replace this rejection with the live `Scheduler` +
+    /// `MultiSeqKvCache` path.
     ///
     /// The existing [`Engine::spawn`] remains the production entry point and
     /// is byte-equivalent to calling
     /// `spawn_with_mode(loaded, queue_capacity, kv_cache_budget_bytes, EngineMode::SerialFifo)`.
     ///
-    /// # Why this exists at iter-1
+    /// # Why this is `Result` at iter-1.5
     ///
-    /// Per ADR-040 §3.6, the backward-compatibility contract pins every byte
-    /// of `Engine` behaviour under `SerialFifo` to pre-ADR-040 semantics. The
-    /// `spawn_with_mode` surface lets callers — once Phase C iter-2 lands —
-    /// switch policies at construction time without touching the existing
-    /// `spawn` signature, which is the regression boundary pinned by the
-    /// `engine_spawn_signature_unchanged_at_phase_c_iter_1` compile-time test.
+    /// Per ADR-040 §7 "no fallback, no stub (todo later) code", silently
+    /// discarding the requested mode (as iter-1 did with
+    /// `let _ = mode;`) is a Liskov-substitution violation: a caller
+    /// passing `SlotAware{max_slots:8}` and then reading `engine.mode()`
+    /// would get back `SerialFifo`. Both adversarial reviewers (Codex +
+    /// Claude) flagged this as CRITICAL in the iter-1.5 review. The
+    /// `Result` return + typed `EngineSpawnError` makes the iter-1 vs
+    /// iter-2 cliff visible at the type level: today you MUST handle the
+    /// `Err` arm, and iter-2 makes both arms `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineSpawnError::ModeNotYetWired`] when called with
+    /// [`EngineMode::SlotAware`] at iter-1.5. Iter-2 lands the
+    /// `Scheduler` runtime and the rejection is removed.
     pub fn spawn_with_mode(
         loaded: LoadedModel,
         queue_capacity: usize,
         kv_cache_budget_bytes: Option<u64>,
         mode: EngineMode,
-    ) -> Self {
-        // Phase C iter-1: both modes delegate to the existing spawn.
-        // Iter-2 forks the SlotAware path to use Scheduler + multi-seq KV.
-        // The discard here is the iter-1 byte-equivalence pin — by NOT
-        // branching on `mode`, this constructor is provably equivalent to
-        // the existing `spawn` for both variants today. Iter-2 replaces the
-        // discard with a match { SerialFifo => current path; SlotAware => Scheduler path }.
-        let _ = mode; // suppress unused; tracked for iter-2 wiring
-        Self::spawn(loaded, queue_capacity, kv_cache_budget_bytes)
+    ) -> std::result::Result<Self, EngineSpawnError> {
+        match mode {
+            EngineMode::SerialFifo => {
+                // Delegate to the byte-equivalence entry point and then
+                // overwrite the stored mode to echo the caller's request.
+                // (The 3-arg `spawn` already initializes mode to
+                // SerialFifo, so this is a no-op for this variant — but
+                // we go through the assignment for symmetry with iter-2's
+                // SlotAware path, which will store the requested
+                // max_slots on EngineInner.)
+                let mut engine = Self::spawn(loaded, queue_capacity, kv_cache_budget_bytes);
+                // Safe: this is the only `Arc` to the freshly-spawned
+                // `EngineInner` at this point — `spawn` has not handed
+                // out any clones yet. `get_mut` returns `Some(&mut ...)`
+                // for the SerialFifo arm and we set the mode field.
+                if let Some(inner) = Arc::get_mut(&mut engine.inner) {
+                    inner.mode = EngineMode::SerialFifo;
+                } else {
+                    // Defensive: spawn invariant says the Arc has refcount
+                    // 1 here. If a future refactor breaks that, this is
+                    // an unreachable branch — but better to assert than
+                    // silently drop the mode write.
+                    debug_assert!(
+                        false,
+                        "ADR-040 invariant: freshly-spawned Engine inner Arc must have refcount 1"
+                    );
+                }
+                Ok(engine)
+            }
+            EngineMode::SlotAware { .. } => Err(EngineSpawnError::ModeNotYetWired {
+                iter_landed: "C1.5",
+                iter_required: "C2",
+            }),
+        }
     }
 
-    /// ADR-040 Phase C iter-1 — read back the engine's mode.
+    /// ADR-040 Phase C iter-1.5 — read back the engine's mode.
     ///
-    /// Always returns [`EngineMode::SerialFifo`] at iter-1. The mode is not
-    /// yet stored on [`EngineInner`] — Phase C iter-2 adds the field once
-    /// `spawn_with_mode` begins forking behaviour on the variant. This
-    /// accessor exists at iter-1 so the public API surface is stable across
-    /// the iter-1 → iter-2 boundary: callers can already query the mode,
-    /// and the answer simply becomes non-trivial after iter-2.
+    /// Returns the [`EngineMode`] stored on [`EngineInner`] at spawn time
+    /// — for engines built via the 3-arg [`Engine::spawn`] this is always
+    /// [`EngineMode::SerialFifo`]; for engines built via
+    /// [`Engine::spawn_with_mode`] this echoes the validated requested
+    /// mode.
+    ///
+    /// Per ADR-040 §7 + the iter-1.5 adversarial review, this accessor
+    /// MUST NOT lie about the requested mode (iter-1's "always return
+    /// `EngineMode::default()`" was a Liskov-substitution violation).
     pub fn mode(&self) -> EngineMode {
-        EngineMode::default()
+        self.inner.mode
     }
 
     /// Iter-215 Wedge-2: which `LoadedModel` variant the worker
@@ -8516,6 +8623,7 @@ assistant:
                 token_bytes: std::sync::OnceLock::new(),
                 kv_spill_descriptor: None,
             tq_packed_descriptor: None,
+                mode: EngineMode::SerialFifo,
             }),
         }
     }
@@ -9728,6 +9836,7 @@ assistant:
                 token_bytes: std::sync::OnceLock::new(),
                 kv_spill_descriptor: descriptor,
                 tq_packed_descriptor: None,
+                mode: EngineMode::SerialFifo,
             }),
         }
     }
@@ -12891,27 +13000,29 @@ mod tool_call_stream_emitter_tests {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-040 Phase C iter-1 tests (2026-05-23)
+// ADR-040 Phase C iter-1.5 tests (2026-05-23) — Liskov fix for iter-1
 //
-// Scaffolding-only tests for the EngineMode enum + spawn_with_mode + mode()
-// accessor. These tests:
+// Tests for the EngineMode enum + spawn_with_mode (Result-returning) +
+// mode() accessor (echoes stored mode). These tests:
 //   1. Pin the public API surface (variant Debug names, Default impl,
-//      Copy + Clone bounds).
-//   2. Pin the byte-equivalence contract under §3.6 — the
-//      `engine_spawn_signature_unchanged_at_phase_c_iter_1` compile-time
-//      gate fails if the existing 3-arg `Engine::spawn` signature is ever
-//      modified by a future iter.
-//   3. Pin the iter-1 vs iter-2 contract — `mode_accessor_returns_serial_fifo_at_iter_1`
-//      documents that the accessor always returns `SerialFifo` at iter-1
-//      and will change behaviour when Phase C iter-2 adds the field to
-//      `EngineInner`.
+//      Copy + Clone + PartialEq + Eq bounds).
+//   2. Pin the iter-1.5 Liskov-honest contract — `mode()` returns the
+//      mode stored on `EngineInner`, not a hardcoded default.
+//   3. Pin the iter-1.5 fail-fast contract — `spawn_with_mode` rejects
+//      `SlotAware` with `EngineSpawnError::ModeNotYetWired` rather than
+//      silently degrading to SerialFifo (the iter-1 Liskov violation
+//      that both adversarial reviewers flagged as CRITICAL).
+//   4. Pin the 3-arg `Engine::spawn` signature at the compile-time level —
+//      it is the ADR-005 byte-equivalence entry point and may NOT be
+//      modified by future iters (iter-2 adds new constructors instead).
 //
-// Per ADR-040 §3.6 + AC-3: every byte of `Engine` behaviour under
-// `SerialFifo` is bit-equivalent to pre-ADR-040. These tests guard that
-// boundary at the type-system level — they do not exercise the worker
-// thread (the existing `tests` module at line ~7986 covers the runtime
-// FIFO behaviour and will be the regression target when iter-2 forks
-// the SlotAware path).
+// Per ADR-040 §3.6 + AC-3 + §7 ("no fallback, no stub"): every byte of
+// `Engine` behaviour under `SerialFifo` is bit-equivalent to pre-ADR-040
+// and unwired modes fail fast at the API boundary instead of degrading.
+// These tests guard the boundary at the type-system level — they do not
+// exercise the worker thread (existing `tests` module at line ~7986
+// covers the runtime FIFO behaviour and will be the regression target
+// when iter-2 forks the SlotAware path).
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod adr040_phase_c_iter1_engine_mode_tests {
@@ -12953,13 +13064,16 @@ mod adr040_phase_c_iter1_engine_mode_tests {
         assert_eq!(max_slots, 4);
     }
 
-    /// Compile-time gate — `EngineMode` MUST implement `Copy + Clone`. This
-    /// makes it trivially passable to `spawn_with_mode` by value without
-    /// move semantics surprises, and lets `mode()` return by value cheaply.
+    /// Compile-time gate — `EngineMode` MUST implement `Copy + Clone +
+    /// PartialEq + Eq`. Copy/Clone make it trivially passable to
+    /// `spawn_with_mode` by value; PartialEq/Eq let tests + callers use
+    /// `assert_eq!` against the mode without falling back to `matches!`.
+    /// (PartialEq/Eq added at iter-1.5 per Claude reviewer's
+    /// `minor_findings[2]` recommendation.)
     #[test]
-    fn engine_mode_is_copy_and_clone() {
-        fn assert_copy_clone<T: Copy + Clone>() {}
-        assert_copy_clone::<EngineMode>();
+    fn engine_mode_is_copy_clone_and_eq() {
+        fn assert_copy_clone_eq<T: Copy + Clone + PartialEq + Eq>() {}
+        assert_copy_clone_eq::<EngineMode>();
 
         // Runtime witness: actually exercise both impls.
         let a = EngineMode::SlotAware { max_slots: 8 };
@@ -12968,6 +13082,14 @@ mod adr040_phase_c_iter1_engine_mode_tests {
         assert!(matches!(a, EngineMode::SlotAware { max_slots: 8 }));
         assert!(matches!(b, EngineMode::SlotAware { max_slots: 8 }));
         assert!(matches!(c, EngineMode::SlotAware { max_slots: 8 }));
+
+        // Eq witness — same variant + same payload compares equal;
+        // different payload compares unequal; cross-variant compares
+        // unequal.
+        assert_eq!(a, EngineMode::SlotAware { max_slots: 8 });
+        assert_ne!(a, EngineMode::SlotAware { max_slots: 9 });
+        assert_ne!(a, EngineMode::SerialFifo);
+        assert_eq!(EngineMode::SerialFifo, EngineMode::default());
     }
 
     /// Pin: Debug names both variants verbatim. Diagnostics + log lines
@@ -12988,61 +13110,72 @@ mod adr040_phase_c_iter1_engine_mode_tests {
     }
 
     /// Compile-time gate — `Engine::spawn_with_mode` exists with the
-    /// expected signature. If a future iter renames the constructor, drops
-    /// the `EngineMode` parameter, or reorders args, this fails to compile.
+    /// iter-1.5 `Result`-returning signature. If a future iter renames
+    /// the constructor, drops the `EngineMode` parameter, reorders args,
+    /// or reverts to the iter-1 infallible signature, this fails to
+    /// compile. The Result type is what makes the iter-1 Liskov
+    /// violation impossible to silently reintroduce — callers MUST handle
+    /// the `Err` arm today.
     ///
     /// The function is NOT called (would require a real `LoadedModel` +
     /// GGUF on disk); the binding alone is the load-bearing assertion.
     #[test]
-    fn spawn_with_mode_serial_fifo_signature_exists() {
-        let _f: fn(LoadedModel, usize, Option<u64>, EngineMode) -> Engine =
-            Engine::spawn_with_mode;
+    fn spawn_with_mode_signature_returns_result() {
+        let _f: fn(
+            LoadedModel,
+            usize,
+            Option<u64>,
+            EngineMode,
+        ) -> std::result::Result<Engine, EngineSpawnError> = Engine::spawn_with_mode;
         // SlotAware variant constructible at this iter (signature-only).
         let _m: EngineMode = EngineMode::SlotAware { max_slots: 4 };
     }
 
-    /// Iter-1 vs iter-2 contract pin — `Engine::mode()` returns `SerialFifo`
-    /// today. Iter-2 will store the mode on `EngineInner` and return it
-    /// here; that change MUST update this test (which is the documented
-    /// signal to future implementers that the contract is changing).
+    /// ADR-040 iter-1.5 — `Engine::mode()` returns the mode stored on
+    /// `EngineInner`, not a hardcoded default. This is the Liskov-honest
+    /// version of the iter-1 accessor; iter-1's "always return
+    /// `EngineMode::default()`" was a Liskov-substitution violation
+    /// (Codex `critical_findings[0]` + Claude `critical_findings[1]`).
     ///
-    /// The accessor is exercised purely at the type level — synthesizing
-    /// a live `Engine` requires a real `LoadedModel` + GGUF on disk, which
-    /// would turn this into an integration test. The type binding is the
-    /// load-bearing assertion: if `mode()` is removed or its signature
-    /// changes, this fails to compile.
+    /// Compile-only proof: `mode()` returns `EngineMode`. Full
+    /// instantiation needs a real LoadedModel + GGUF on disk; verified
+    /// at compile time via type signature. An integration test at Phase
+    /// C iter-2 will exercise the SlotAware live-route end-to-end and
+    /// assert `engine.mode() == EngineMode::SlotAware { max_slots: N }`
+    /// after a successful spawn.
     #[test]
-    fn mode_accessor_returns_serial_fifo_at_iter_1() {
-        // Type-level pin — `mode()` is `fn(&Engine) -> EngineMode`.
-        let _accessor: fn(&Engine) -> EngineMode = Engine::mode;
-
-        // Behavioural pin: the iter-1 implementation returns
-        // `EngineMode::default()`, which §3.6 contracts to `SerialFifo`.
-        // This is a redundant runtime check that catches a regression where
-        // a future iter changes `mode()`'s implementation without updating
-        // the Default impl (or vice versa).
-        let returned = EngineMode::default();
-        assert!(
-            matches!(returned, EngineMode::SerialFifo),
-            "iter-1 contract: Engine::mode() returns EngineMode::default() \
-             which MUST be SerialFifo until Phase C iter-2 stores the mode \
-             on EngineInner. Got: {returned:?}."
-        );
+    fn mode_accessor_echoes_requested_mode() {
+        let _m: fn(&Engine) -> EngineMode = Engine::mode;
     }
 
-    /// LOAD-BEARING REGRESSION GUARD (§3.6 byte-equivalence) — compile-time
-    /// gate proving the existing 3-arg `Engine::spawn` signature is
-    /// UNCHANGED at Phase C iter-1.
-    ///
-    /// If a future iter accidentally:
-    ///   - Replaces `spawn` with a 4-arg constructor taking `EngineMode`.
-    ///   - Reorders the existing parameters.
-    ///   - Changes any parameter type (e.g. `Option<u64>` → `u64`).
-    /// this test fails to compile, breaking the build before the change
-    /// can land. Iter-2 is permitted to ADD new constructors but MUST NOT
-    /// modify this signature — that's what `spawn_with_mode` is for.
+    /// ADR-040 iter-1.5 fail-fast contract — `EngineSpawnError::
+    /// ModeNotYetWired`'s `Display` impl names both the variant
+    /// ("SlotAware") and the iter that lands the runtime ("iter-2").
+    /// This test exercises the error path without needing a live
+    /// `LoadedModel`; it is the pattern-matched analog of the
+    /// behavioural assertion Codex's `critical_findings[0]` requested.
     #[test]
-    fn engine_spawn_signature_unchanged_at_phase_c_iter_1() {
+    fn engine_spawn_error_mode_not_yet_wired_names_iters() {
+        let err = EngineSpawnError::ModeNotYetWired {
+            iter_landed: "C1.5",
+            iter_required: "C2",
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("SlotAware"), "msg: {}", msg);
+        assert!(msg.contains("iter-2"), "msg: {}", msg);
+    }
+
+    /// Signature-only pin: proves the existing 3-arg `Engine::spawn`
+    /// constructor signature has not changed since pre-ADR-040. This is
+    /// NOT a behaviour pin — the spawn body could be silently rewritten
+    /// without this test failing. Behavioural byte-equivalence is owned
+    /// by Phase C iter-2's live regression test (per ADR-040 §3.6
+    /// amended); F4 (renamed from
+    /// `engine_spawn_signature_unchanged_at_phase_c_iter_1` per Codex
+    /// `major_findings[3]` to make the signature-only nature of the
+    /// guard explicit in the test name).
+    #[test]
+    fn engine_spawn_3_arg_signature_compile_pin() {
         let _spawn: fn(LoadedModel, usize, Option<u64>) -> Engine = Engine::spawn;
     }
 }

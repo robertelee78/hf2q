@@ -20,6 +20,22 @@
 //! - `HF2Q_CB_THROUGHPUT_CONCURRENCY` — comma-separated list of N
 //!   values (default "1,2,4,8" per ADR-040 §5 AC-4).
 //!
+//! # Iter-1.5 contract change (cfa-finding-F8, 2026-05-23)
+//!
+//! Adversarial review (Codex `major_findings[4]` + Claude
+//! `major_findings[7]`) flagged that iter-1's
+//! `cb_throughput_n_1_2_4_8_fifo_vs_inflight` always passed: it
+//! early-returned with `eprintln!` even when `HF2Q_CB_THROUGHPUT_E2E=1`
+//! was set, producing a green test for a benchmark that does no
+//! measurement. Both reviewers called this a mantra violation
+//! ("no fallback, no stub (todo later) code").
+//!
+//! Iter-1.5 fix: the env-gated bench test PANICS with a clear,
+//! actionable "ADR-040 Phase D iter-2 implementation pending" message
+//! when `HF2Q_CB_THROUGHPUT_E2E=1` is set but the body is still a
+//! stub. Skip behaviour ONLY applies when the env gate is unset. CI
+//! burns the moment an operator opts in expecting real numbers.
+//!
 //! # Metric report shape
 //!
 //! Per (N, policy) cell:
@@ -154,19 +170,21 @@ fn render_report_two_cells_emits_two_data_rows() {
 
 #[test]
 fn cb_throughput_n_1_2_4_8_fifo_vs_inflight() {
-    // Phase D iter-1: env-gated stub. Iter-2 fills in the body once
-    // Phase A iter-2+ multi-seq KV impls + Phase B iter-3 InflightBatched
-    // step + Phase C iter-2 Engine slot-aware wiring all land.
+    // ADR-040 Phase D iter-1.5 — env-gated body PANICS when set so CI burns
+    // if an operator sets HF2Q_CB_THROUGHPUT_E2E=1 hoping to bench.
+    // Phase D iter-2 replaces the panic with the real measurement body.
+    // (cfa-finding-F8 — Codex + Claude both flagged the silent-pass stub at iter-1.)
     if std::env::var("HF2Q_CB_THROUGHPUT_E2E").as_deref() != Ok("1") {
         eprintln!("[cb-throughput] skipped (HF2Q_CB_THROUGHPUT_E2E != 1)");
         return;
     }
-    // Iter-1 contract: when the env gate is set but the upstream phases
-    // aren't ready yet, document-skip with a clear, actionable message
-    // rather than producing a misleading zero result.
-    eprintln!(
-        "[cb-throughput] ADR-040 Phase D iter-2 implementation pending; \
-         requires Phases A iter-2+, B iter-3+, C iter-2+ to land first."
+    panic!(
+        "ADR-040 Phase D iter-2 implementation pending. \
+         HF2Q_CB_THROUGHPUT_E2E=1 is set but the measurement body has not landed. \
+         Required prereqs: Phase A iter-2+ (per-model MultiSeqKvCache impls), \
+         Phase B iter-3 (InflightBatchedScheduler::step), \
+         Phase C iter-2 (Engine slot-aware wiring). \
+         Either implement the bench body or unset HF2Q_CB_THROUGHPUT_E2E."
     );
 }
 
