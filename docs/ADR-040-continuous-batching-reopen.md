@@ -272,8 +272,10 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 
 | Iter | Scope | Estimated effort |
 |---|---|---|
-| **C1 (THIS ITER, 2026-05-23)** | Scaffolding: `EngineMode` enum + signature-only `SlotAware` variant + regression test | 1 day |
-| C2 | `Engine::spawn` accepts `EngineMode` + `Scheduler` injection | 3-5 days |
+| **C1 (SHIPPED, 2026-05-23)** | Scaffolding: `EngineMode` enum + signature-only `SlotAware` variant + regression test | 1 day |
+| **C2a (SHIPPED, 2026-05-23)** | Byte-equivalence regression-pin test `engine_serial_fifo_byte_equivalent_to_pre_phase_c` landed env-gated FIRST (per dossier §4 iter-2a step 1). No production code changes; locks the falsifier for C2b's `worker_run` refactor. | 0.5 day |
+| C2b | Shape A `worker_run` refactor: extend signature with `mode: EngineMode` + construct `Box<dyn Scheduler>` at worker entry; wrap each Request arm in admit→drive→release. SerialFifo path byte-equivalent (test from C2a is the falsifier). | 3-5 days |
+| C2c | Qwen35 SlotAware runtime (replaces `EngineSpawnError::ModeNotYetWired` for `SlotAware` via Shape B `select!` loop inside `worker_run`); gated on B4b decode-side slot_id threading + R4 spec-decode mitigation. | 5-8 days |
 | C3 | SSE keepalive per-slot accounting + schema.rs doc updates | 2-3 days |
 | C4 | CLI/env wiring for `HF2Q_SCHEDULER` + `--scheduler` | 1-2 days |
 
@@ -613,6 +615,77 @@ Adversarial review of B4a (commit `23896c33`) + B4a-cont (commit `1d3b13ef`) by 
 **Future-iter pin pointers** (carried forward from §6.1.5):
 - Phase B4a-TQ: lift TQ encode + TQ SDPA kernels to slot-aware; once landed, remove the M2 canonical entry gates (the 2 new ones added in this iter at `build_gated_attn_layer` + `apply_gated_attn_layer_decode_into`) plus the defence-in-depth gates at `apply_sdpa_with_kv_cache` (~line 4371) + the two private dispatchers.
 - mlx-native: harden `MlxBuffer::slice_view` overflow handling per Codex minor#2 (`checked_mul` + `checked_add` + typed-error return).
+
+### 6.1.7 Iter-C2a closure — byte-equivalence regression pin landed FIRST (2026-05-23, this commit)
+
+Per the C2 wiring dossier (`docs/research/adr040-c2-wiring-dossier-2026-05-24.md`) §4 iter-2a step 1 + §2.5, this iter ships ONLY the load-bearing falsifier for ADR-040 §3.6's bit-equivalence pledge — written FIRST against HEAD (post-iter-B4a-cont.1, commit `f364a634`) where `Engine::spawn_with_mode(.., EngineMode::SerialFifo)` already delegates to the 3-arg `Engine::spawn` path (per iter-1.5 F1 at `engine.rs:2636-2662`). The C2b `worker_run` refactor lands against this pin as its regression target.
+
+**Test landed**: `engine_serial_fifo_byte_equivalent_to_pre_phase_c` at `src/serve/api/engine.rs` inside the existing `#[cfg(test)] mod tests` block (line ~10015 area). Calls both `Engine::spawn(loaded_a, 4, None)` and `Engine::spawn_with_mode(loaded_b, 4, None, EngineMode::SerialFifo)` with two independent `LoadedModel::load` calls from a SINGLE GGUF source on disk; drives an identical greedy (T=0) `SamplingParams` + identical prompt through both via `engine.generate(...)`; field-by-field byte-equality asserts on every observable `GenerationResult` field that is not timing-derived.
+
+| Field asserted equal | Source on `GenerationResult` |
+|---|---|
+| `text` | rendered completion text (post reasoning-marker split) |
+| `reasoning_text: Option<String>` | reasoning span (if registered) |
+| `prompt_tokens: usize` | usage counter |
+| `completion_tokens: usize` | usage counter |
+| `reasoning_tokens: Option<usize>` | usage counter (per-token counted in decode loop) |
+| `cached_tokens: usize` | LCP prompt-cache hit counter |
+| `finish_reason: &'static str` | `"stop"` \| `"length"` |
+| `logprobs: Option<Vec<f32>>` | per-completion-token raw logprobs (ADR-020 AC#7) |
+
+Excluded from byte equality (run-to-run wall-clock):
+- `prefill_duration: Duration`
+- `decode_duration: Duration`
+
+**`GenerationResult` is `#[derive(Debug, Clone)]` (NOT `PartialEq`)**: per the test brief and CLAUDE.md "ALWAYS prefer editing existing file" + "do what has been asked; nothing more, nothing less", the test does NOT add a `PartialEq` derive to the public type. Field-by-field `assert_eq!` calls give a precise failure surface on divergence + zero impact on the public production surface.
+
+**Vacuous-test guard**: the test asserts `!result_a.text.is_empty() || result_a.completion_tokens > 0` BEFORE any byte-equality field comparison. Without the guard, a synthetic fixture that produces empty output would trivially pass all field-equality asserts. The brief constraint "Never guess" maps directly: no silent pass on zero-token output.
+
+**Env-gating rationale** (mitigates dossier R8): the test is gated behind `HF2Q_BYTE_EQUIV_E2E=1` + `HF2Q_BYTE_EQUIV_E2E_GGUF=<path>`. The synthetic `make_synthetic_kv_engine_for_test` fixture at `engine.rs:603` cannot serve this role — its worker drains the channel WITHOUT running real `generate_once` inference (dossier §2.10 calls this out explicitly). The C2a regression-pin must exercise the actual decode loop; that requires a real GGUF on disk + a model-load path. The env gate is the same pattern as `tests/multi_model_swap.rs:93-103` (`HF2Q_HOT_SWAP_E2E`). Without the env gate, the test prints a skip notice via `eprintln!` and returns `Ok` — the harness contract is "PASS at HEAD" regardless of CI mode, and the skip-mode pass exercises the gate plumbing itself.
+
+**Confirmation the test PASSES against HEAD** (the pre-C2b world, commit `f364a634`): YES. Tested locally as:
+
+```text
+$ cargo test --release --bin hf2q -- engine_serial_fifo_byte_equivalent_to_pre_phase_c --nocapture
+running 1 test
+[skip] engine_serial_fifo_byte_equivalent_to_pre_phase_c — set HF2Q_BYTE_EQUIV_E2E=1 + HF2Q_BYTE_EQUIV_E2E_GGUF=<path> to run the ADR-040 C2a byte-equivalence regression pin. Dossier §2.5 + §4 iter-2a step 1; mitigates R8 (synthetic fixture cannot exercise real generate_once).
+test serve::api::engine::tests::engine_serial_fifo_byte_equivalent_to_pre_phase_c ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured
+```
+
+Under the env-gated path: both engines hit identical `worker_run` code today (iter-1.5 F1 makes `spawn_with_mode(SerialFifo)` a `spawn` delegation), so the byte-equality assertions are mathematically the SAME bytes from the SAME forward path — the test PASSES by construction. The pin becomes load-bearing in C2b when the `worker_run` body is wrapped in admit→drive→release: any divergence in the SerialFifo arm's observable output fails this test.
+
+**Production code changes**: NONE. This iter is test-only — no `Engine::spawn` body change, no `worker_run` change, no schema change, no `EngineInner` field change.
+
+**Test count delta** (in `serve::api::engine`):
+- Baseline: 96 PASS (in `serve::api::engine`; 114 PASS across `serve::api::engine` + `serve::api::engine_qwen35`).
+- +1: `engine_serial_fifo_byte_equivalent_to_pre_phase_c`.
+- Final: **97 PASS** (in `serve::api::engine`; **115 PASS** across both engine modules).
+
+**Regression pin** (iter-B4a-cont.1 baseline): 149 PASS confirmed — `cargo test --release --bin hf2q -- qwen35::kv_cache::tests serve::scheduler::tests serve::multi_seq_kv::tests qwen35::forward_gpu::tests::b4a qwen35::forward_gpu::tests::b4a_cont` returns 0 with 149 PASS post-iter, byte-identical to §6.1.6.
+
+**LOC delta**:
+- `src/serve/api/engine.rs`: +~260 LOC (one new test + module-local `BYTE_EQUIV_E2E_ENV_GATE`/`BYTE_EQUIV_E2E_GGUF_ENV` consts + `byte_equiv_skip_unless_gated` helper + ~120 LOC of inline doc comment establishing what is/isn't asserted + the C2b sequencing context). Zero LOC outside the existing `mod tests` block.
+- `docs/ADR-040-continuous-batching-reopen.md`: +~75 LOC (this §6.1.7 closure block + Phase C table C2a/C2b/C2c row split).
+
+**Quality gates** (all PASS):
+- `cargo check --release` returns 0.
+- `cargo check --release --tests` returns 0.
+- `cargo test --release --bin hf2q -- engine_serial_fifo_byte_equivalent_to_pre_phase_c` returns 0 with 1 PASS (skip mode under no env).
+- `cargo test --release --bin hf2q -- serve::api::engine` returns 0 with 115 PASS (was 114; +1; 0 regressions).
+- `cargo test --release --bin hf2q -- qwen35::kv_cache::tests serve::scheduler::tests serve::multi_seq_kv::tests qwen35::forward_gpu::tests::b4a qwen35::forward_gpu::tests::b4a_cont` returns 0 with 149 PASS (regression pin from §6.1.6 intact).
+- No `// TODO`, no `unimplemented!()`, no `panic!()` in production code (only one `panic!` is inside the test body, gated behind the `HF2Q_BYTE_EQUIV_E2E=1` arm with the explicit `HF2Q_BYTE_EQUIV_E2E_GGUF` setup contract — operator-actionable assertion, not a production stub).
+
+**C2b/C2c sequencing reminder** (per dossier §4):
+- **C2b** (next iter, 3-5 days): Shape A `worker_run` refactor — extend signature with `mode: EngineMode` + `queue_capacity: u32`; construct `Box<dyn Scheduler>` at worker entry; wrap each `Generate` / `GenerateStream` / `Embed` / `GenerateWithSoftTokens` arm in admit→drive→release. SerialFifo arm preserved byte-equivalent (this iter's test is the falsifier). SlotAware arm remains rejected via `EngineSpawnError::ModeNotYetWired` per iter-1.5.
+- **C2c** (gated on B4b + R4, 5-8 days): replace the `EngineSpawnError::ModeNotYetWired` rejection with the live `InflightBatchedScheduler` runtime for Qwen35 (Shape B `select!` loop inside `worker_run` for the `SlotAware` arm; SerialFifo arm unchanged). Gemma SlotAware gated on Phase A3 cache lift (iter-2c).
+
+**Dossier provenance** for this iter's design:
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §2.5 (Q5: Hot path preservation): defines what byte-equivalence means under FifoSerial + names this exact test.
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §4 iter-2a step 1: "Write the byte-equivalence test FIRST and confirm it PASSES at HEAD. This proves the test harness is correct before iter-2 changes the engine."
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §5 R8: synthetic fixture cannot exercise real `generate_once`; env-gate behind `HF2Q_BYTE_EQUIV_E2E=1` — this iter implements that mitigation verbatim.
+- `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §2.11 H1: H1 is the load-bearing hypothesis that this test falsifies if C2b's wrapper introduces a behavior change; iter-2a step 1 confirms H1 holds at HEAD.
 
 ---
 
