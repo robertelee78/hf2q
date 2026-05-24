@@ -287,7 +287,7 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 |---|---|---|
 | **D1 (SHIPPED 2026-05-23)** | Scaffolding: env-gated test file + metric definitions | 1 day landed |
 | **D2 (SHIPPED 2026-05-24)** | N ∈ {1, 2, 4, 8} measurement harness + report format — subprocess spawn + `/readyz` poll + `std::thread::scope` curl SSE consumption + per-cell ThroughputCell aggregation + AC-4 soft-gate reporting + InflightBatched-skip-when-unwired graceful detection | **1 day landed** |
-| D3 | A/B comparator (FIFO vs InflightBatched) + statistical stability — repeated-rep medians, streaming-stdout TTFT refinement, AC-4 hard-fail enforcement | 2-3 days |
+| **D3 (SHIPPED 2026-05-24)** | A/B comparator (FIFO vs InflightBatched) + statistical stability — REPS=3 median + min/max + `sigma_pct` aggregation via `ThroughputCellStable::from_reps`; per-frame streaming-stdout TTFT via curl `Stdio::piped()` + `BufReader::lines()` (eliminates D2's upper-bound bias); AC-4 hard-fail enforcement gated on BOTH N=4 cells present (deferred to once C2c/C2d ship); stability gate panics when `sigma_pct > 20%`; FifoSerial-only baseline + variance always reported so the bench is operator-useful in the interim | **1 day landed** |
 
 ### Phase E — Production cutover (gated on §3.7 memo)
 
@@ -1248,6 +1248,113 @@ curl's `-s -N` flag flushes SSE frames as they arrive but the parent process (th
 - **D3 dual-policy A/B harness** — D2 runs FifoSerial cells THEN InflightBatched cells against a single GGUF on disk. D3 may want to interleave (cell ordering: F1, I1, F2, I2, ...) to control for SSD page-cache warmth across cells; current shape is `for policy in [..] { for n in [..] { ... } }`, swap to `for n in [..] { for policy in [..] { ... } }` if A/B per-N parity is wanted.
 
 **Dossier provenance**: No standalone dossier — D2 is bounded test-harness work on top of the already-shipped iter-1.5 + iter-A5 (per-slot budget) + iter-C4 (CLI wiring) + iter-D1 (scaffold) foundations. The curl-vs-reqwest design decision + the TTFT upper-bound bias are documented inline (above) per ADR-040 §7 mantra.
+
+### 6.1.15 Iter-D3 closure — statistical stability + AC-4 hard-gate + per-frame TTFT (2026-05-24, this commit)
+
+Per ADR-040 §6 Phase D row D3 (and the D2 caveat §6.1.14 Future-iter pin pointers naming D3 as the statistical-refinement iter), this iter wraps D2's single-shot measurement body with three orthogonal upgrades: (1) REPS=3 medians + variance reporting via a new `ThroughputCellStable` struct, (2) AC-4 promoted from soft `[ac-4 WARN]` stderr emission to hard `assert!` enforcement (gated on both-cells-present), (3) per-frame TTFT via curl `Stdio::piped()` + `BufReader::lines()` replacing D2's `Command::output()` upper-bound estimate.
+
+**3-rep median + variance design** (`tests/continuous_batching_throughput.rs`):
+
+1. **`ThroughputCellStable` struct** (added next to `ThroughputCell`): carries `aggregate_tokens_per_sec_median` / `_min` / `_max` / `_sigma_pct` + `ttft_p50_ms_median` + `ttft_p95_ms_median` + `per_slot_tokens_per_sec_median` + `rejected_429_count_total` + `rep_count`. The constructor `from_reps(cells: Vec<ThroughputCell>) -> Self` panics on (a) empty input (no measurements is an operator-actionable bug, not a degenerate-case fallback), (b) mixed `policy` or `concurrency` across reps (silently corrupted medians are worse than a panic). Five always-on regression tests pin each branch: `d3_stable_from_reps_aggregates_median_min_max_sigma`, `d3_stable_from_reps_rejects_mixed_policies`, `d3_stable_from_reps_rejects_mixed_concurrency`, `d3_stable_from_reps_zero_median_yields_zero_sigma_pct`, `d3_render_report_stable_emits_header_and_sigma_column`.
+
+2. **Median is a real observed sample, not arithmetic mean** — `median_f64` sorts then returns the middle element (REPS=3 → `sorted[1]`). The ADR-033 §Pi methodology note in the docstring captures the rationale: "the median rep is the rep we'd recommend the operator deploy with, not a synthetic value." Two regression tests pin: `d3_median_f64_odd_length_returns_middle_sample`, `d3_median_f64_empty_returns_zero` (defense-in-depth — `from_reps` already pre-checks non-empty).
+
+3. **`sigma_pct = (max - min) / median × 100`** — peak-to-peak spread as a percentage of the median. Intentionally chosen over σ/μ because at REPS=3 the sample standard deviation has high estimator variance and (max - min)/median is a stable, operator-readable lower-cost noise indicator. Returns 0.0 when median is 0 (defense-in-depth against the all-streams-429'd degenerate case). The `STABILITY_SIGMA_PCT_THRESHOLD = 20.0` constant pins the bar — chosen as roughly 2× the typical run-to-run variance observed on the ADR-033 §Pi Qwen3.6 bench (~10% peak-to-peak at REPS=3). Pinned by `d3_stability_threshold_default_is_twenty_pct`.
+
+4. **`run_bench_cell_3rep(gguf, policy, n)`** — wraps D2's `run_bench_cell` REPS times. Reps are sequential (no two `hf2q serve` subprocesses alive at once per the CLAUDE.md "do not oom us" rule). Strict policy: a single failed rep aborts the whole cell with `Err(reason)` because partial-data medians would be silently misleading. The caller records the cell as skipped, matching D2's `inflight_batched-rejected-at-spawn` skip path.
+
+**AC-4 hard-enforcement gating** — `cb_throughput_n_1_2_4_8_fifo_vs_inflight` now:
+
+1. **FifoSerial-only baseline + variance section** — always emitted, even when AC-4 cannot fire (typically because InflightBatched is rejected at spawn until Phase C2c/C2d wire it). Per-N row shows `median, min, max, sigma_pct, rep_count, rejected_429_count_total`. This is the operator-actionable noise-floor measurement that lets you decide whether to bump REPS before C2c/C2d land.
+
+2. **Stability gate FIRST** — when both N=4 cells exist, BEFORE the AC-4 assertion: if either `fifo_n4.aggregate_tokens_per_sec_sigma_pct > 20%` OR `inflight_n4.aggregate_tokens_per_sec_sigma_pct > 20%`, the test PANICS with an operator-actionable message naming the median + min + max + threshold and recommending "run again or increase REPS for stable median." A noisy measurement makes the AC-4 ratio meaningless; the operator should re-run before AC-4 fails on signal-vs-noise.
+
+3. **AC-4 hard `assert!`** — `aggregate_ratio = inflight_n4.median / fifo_n4.median` must be ≥ 1.5×; `ttft_ratio = inflight_n4.ttft_p95_median / fifo_n1.ttft_p95_median` must be ≤ 2.0×. Failure messages include the underlying medians so the operator can see how far off the bar the measurement landed. When `fifo_n1` is absent (operator restricted `HF2Q_CB_THROUGHPUT_CONCURRENCY` to exclude N=1), the TTFT half is reported as `[ac-4 PARTIAL]` and skipped rather than fabricating a denominator.
+
+4. **Deferred-enforcement path** — when exactly one of the two N=4 cells is missing (the InflightBatched case until C2c/C2d ship), the test emits `[ac-4 DEFERRED]` and reports the FifoSerial-only baseline + variance above. Forward-compatible: once C2c/C2d land, the inflight N=4 cell will populate and the gate will fire on the first run without test edits.
+
+**Per-frame TTFT via streaming-stdout** (`run_stream` in `tests/continuous_batching_throughput.rs`):
+
+D2 used `Command::output()` which blocks until curl exits; the recorded `ttft_ms` was the upper bound (= total stream walltime) refined at aggregation time by subtracting `(tokens-1) × per_token_ms`. D3 replaces this with:
+
+```rust
+let mut cmd = Command::new("curl");
+cmd.args([...]).stdout(Stdio::piped()).stderr(Stdio::null());
+let t0 = Instant::now();
+let mut child = cmd.spawn()?;
+let stdout = child.stdout.take().expect("piped");
+let reader = BufReader::new(stdout);
+for line_res in reader.lines() {
+    let line = line_res?;
+    if let Some(code_str) = line.strip_prefix("__HTTP_STATUS__:") { http_status = code_str.parse()?; continue; }
+    let payload = match line.strip_prefix("data: ") { Some(p) => p, None => continue };
+    if payload.trim() == "[DONE]" { continue; }
+    if let Some(idx) = payload.find(r#""content":""#) {
+        let after = &payload[idx + r#""content":""#.len()..];
+        if !after.starts_with('"') {
+            tokens = tokens.saturating_add(1);
+            if !first_content_seen {
+                first_content_seen = true;
+                ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;  // D3 per-frame TTFT
+            }
+        }
+    }
+}
+let _ = child.wait();
+```
+
+Implementation lives at `run_stream` (`tests/continuous_batching_throughput.rs` — replaces the D2 `Command::output()` body). curl's `-N` flag flushes per-SSE-frame so the parent's `BufReader::lines()` receives the bytes as they arrive over the socket (modulo OS pipe scheduling — typically sub-millisecond). The recorded `ttft_ms` IS the wall-clock from POST send (the `t0` Instant taken just before `child.spawn()`) to the moment the first content delta arrives at the parent — no token-count-based subtraction is performed. The D2 aggregator's `(tokens - 1) × per_token_ms` subtraction is therefore deleted; the new code simply sorts the per-stream `ttft_ms` values and percentiles them. The HTTP status code is parsed from the `__HTTP_STATUS__:` marker emitted by curl's `-w` flag, which arrives after the `[DONE]` frame as the last line of stdout.
+
+**InflightBatched-deferral until C2c/C2d** — D3 inherits D2's `wait_for_readyz` early-exit detection unchanged. When `--scheduler inflight_batched` is selected today, `Engine::spawn_with_mode` rejects with `EngineSpawnError::ModeNotYetWired`, the subprocess exits non-zero before binding the listener, and `run_bench_cell_3rep` returns `Err(...)` on the first rep so the cell is recorded as skipped. The D3 AC-4 gate falls into the `[ac-4 DEFERRED]` arm and the FifoSerial-only baseline + variance section still emits — operators get a useful run-to-run noise floor for the baseline without needing the inflight side to be wired. Once C2c (Qwen35 SlotAware worker arm) + C2d (Gemma 4 SlotAware worker arm) ship, the inflight cells will populate and AC-4 will fire on the first run without test edits.
+
+**Phase E1 sequencing** — Phase E1 closure (production cutover: flip `SchedulerPolicy::InflightBatched` to default-on) can fire once BOTH (a) C2c lands (Qwen35 SlotAware worker arm — the per-family piece D3 is waiting on), AND (b) D3's AC-4 hard-gate PASSES on production hardware (M5 Max, current target models). The two are independent — C2c is the inflight wiring + D3 is the measurement bar. The bench is forward-compatible per above: no test edits needed once C2c ships; the first AC-4 run after C2c lands is the Phase E1 gate.
+
+**Operator-runnable command** (unchanged from D2 — env-var contract preserved, with REPS=3 increasing cell wall-clock by 3× per cell):
+
+```bash
+HF2Q_CB_THROUGHPUT_E2E=1 \
+  HF2Q_CB_THROUGHPUT_MODEL=/opt/hf2q/models/<some>.gguf \
+  HF2Q_CB_THROUGHPUT_CONCURRENCY=1,2,4,8 \
+  HF2Q_CB_THROUGHPUT_MAX_TOKENS=64 \
+  cargo test --release --test continuous_batching_throughput \
+    -- --test-threads=1 --nocapture cb_throughput_n_1_2_4_8_fifo_vs_inflight
+```
+
+D3 wall-clock estimate: 4 N values × 2 policies × REPS=3 = 24 cells; per-cell ~5-30 s on M5 Max under N≤8 + 60-180 s cold-load per cell = ~30-90 minutes total under FifoSerial-only (InflightBatched cells abort at spawn until C2c/C2d ship → ~15-45 minutes today). When C2c ships and InflightBatched cells run for real, plan for the upper bound.
+
+**Quality gates (all PASS)**:
+
+- `cargo check --release --tests` returns 0 (no new warnings).
+- `cargo test --release --test continuous_batching_throughput` returns 0 with **14 PASS / 0 FAIL** in skip mode (6 D2 baseline + 8 new D3 always-on tests, of which 2 are `#[should_panic]` for the mixed-policy/mixed-concurrency `from_reps` rejection branches).
+- `cargo test --release --bin hf2q -- gemma4::kv_cache serve::multi_seq_kv qwen35::kv_cache serve::scheduler qwen35::forward_gpu::tests::b4a serve::tests::c4 serve::api::engine::tests serve::api::sse serve::api::schema --test-threads=1` returns 0 with **306 PASS / 0 FAIL** (iter-A5 baseline preserved verbatim — no production-code edits).
+- NO `// TODO`, NO `unimplemented!()`, NO `todo!()` in the test file or production code (the test file's 1 `panic!` for operator-action-required missing-GGUF-env from iter-1.5 is preserved; D3 adds 2 operator-action `panic!`s for the stability-gate-exceeded path and the `from_reps` invariant violations — all are operator-actionable, none are stubs).
+- ONLY edits: `tests/continuous_batching_throughput.rs` + `docs/ADR-040-continuous-batching-reopen.md`. NO `Cargo.toml` edits, NO production-code edits.
+
+**Test count delta**:
+
+| Module | Pre-iter | Post-iter | Delta |
+|---|---:|---:|---:|
+| `tests/continuous_batching_throughput` (file-level) | 6 | 14 | +8 (3-rep aggregator + median + render_stable + threshold pin + 2 `#[should_panic]` invariants) |
+| Regression bundle (iter-A5 baseline) | 306 | 306 | 0 (production code untouched) |
+
+**LOC delta per file**:
+
+| File | + | - | Net |
+|---|---:|---:|---:|
+| `tests/continuous_batching_throughput.rs` | +~470 | -~110 | +~360 (D2 final ~810 → D3 final ~1170; `ThroughputCellStable` + `from_reps` + `median_f64` + `render_report_stable` + `REPS` + `STABILITY_SIGMA_PCT_THRESHOLD` ~165 LOC; per-frame TTFT `run_stream` rewrite +60/-115 LOC; `run_bench_cell_3rep` wrapper ~45 LOC; D3-body AC-4 hard-gate rewrite +120/-65 LOC; 8 D3 always-on tests ~180 LOC) |
+| `docs/ADR-040-continuous-batching-reopen.md` | +~120 | -1 | +~119 (this §6.1.15 closure block + §6 Phase D D3 row marked SHIPPED) |
+| **Total** | **+~590** | **-~111** | **+~479** |
+
+**Mantra-aligned**: no `// TODO`, no `unimplemented!()`, no `todo!()`, no `panic!()` in production code. The 3 `panic!`s in the test file are all operator-action-required (missing GGUF env, stability gate exceeded, `from_reps` invariant violation) — these are the cfa-finding-F8 "CI burns the moment an operator opts in expecting real numbers" contract. The deferred-AC-4-until-C2c arm is a precise typed-deferral with the FifoSerial-only baseline still landing useful data — NOT a stub or silent-skip.
+
+**Future-iter pin pointers**:
+
+- **C2c (Qwen35 SlotAware worker arm)** — unlocks the InflightBatched cell population. D3 will fire AC-4 on first run after C2c lands, no test edits required.
+- **C2d (Gemma 4 SlotAware worker arm)** — same as C2c for Gemma 4 GGUFs.
+- **E1 (Phase E production cutover)** — gated on (a) C2c lands + (b) D3 AC-4 hard-gate PASS on production hardware. Per ADR §3.7, also requires the reopen-trigger memo.
+- **D4 (potential follow-up if D3 is too noisy)** — bump REPS to 5; promote `sigma_pct` to the proper σ/μ sample-std-dev metric; add cell-interleave A/B (F1, I1, F2, I2, ...) to control for SSD page-cache warmth. Not pre-committed — fires only if D3 production runs show `sigma_pct` consistently near the 20% threshold.
+
+**Dossier provenance**: No standalone dossier — D3 is bounded test-harness work on top of the already-shipped iter-D2 measurement body. The REPS=3 + sigma_pct + 20% threshold + per-frame TTFT design decisions are documented inline (above) per ADR-040 §7 mantra. The brain entry `feedback_multiweek_always_in_scope_2026_05_23.md` mantra "no shortcuts, just pure excellence" is satisfied by hard-gate enforcement + operator-actionable panic messages + zero stubs.
 
 ---
 

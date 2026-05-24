@@ -5,12 +5,27 @@
 //! This test file is the env-gated harness for measuring aggregate
 //! tokens/sec across N concurrent SSE streams under each of the two
 //! `SchedulerPolicy` modes. Phase D iter-1 (D1) shipped the scaffolding
-//! + metric shapes + always-on smoke. Phase D iter-2 (D2, 2026-05-23,
-//! this commit) ships the **real measurement body**: subprocess spawn
-//! of `hf2q serve --model <gguf> --scheduler <policy> [--max-slots N]`,
+//! + metric shapes + always-on smoke. Phase D iter-2 (D2, 2026-05-23)
+//! shipped the **real measurement body**: subprocess spawn of
+//! `hf2q serve --model <gguf> --scheduler <policy> [--max-slots N]`,
 //! `/readyz` poll, N concurrent SSE streaming POSTs via `curl` driven
 //! by `std::thread::scope`, per-stream TTFT capture, aggregate
 //! tokens/sec, 429 incidence accounting, and AC-4 soft-gate reporting.
+//!
+//! Phase D iter-3 (D3, 2026-05-24, this commit) adds **statistical
+//! stability** on top of D2's single-shot body: each (policy, N) cell
+//! is run REPS=3 times, the median is reported alongside min/max and
+//! the relative spread `sigma_pct = (max - min) / median × 100`. The
+//! AC-4 soft-gate from D2 is promoted to a HARD ASSERTION gated on
+//! BOTH FifoSerial AND InflightBatched cells being present at N=4
+//! (the InflightBatched policy is rejected at spawn until Phase C2c +
+//! C2d land — until then D3 still passes through the FifoSerial-only
+//! baseline + its variance, deferring AC-4 enforcement). Per-cell
+//! TTFT is also refined from D2's upper-bound estimate to **per-frame
+//! streaming-stdout TTFT** — curl is spawned with `Stdio::piped()` and
+//! the parent reads stdout line-by-line via `BufReader::lines()`,
+//! timestamping the first `data:` content frame from a single
+//! `Instant::now()` taken just before `child.spawn()`.
 //!
 //! # Env gates
 //!
@@ -65,14 +80,22 @@
 //! measurement harness, the wiring lands separately. Once C2c/C2d
 //! ship, the inflight cells will populate without test edits.
 //!
-//! # AC-4 soft-gate (D2 reports; D3 enforces)
+//! # AC-4 hard-gate (D3, this iter)
 //!
 //! Per ADR-040 §5 AC-4: at N=4, `InflightBatched` aggregate tok/s must
 //! be ≥ 1.5× `FifoSerial` baseline AND TTFT p95 ≤ 2× single-stream
-//! TTFT. D2 REPORTS this ratio as `[ac-4 WARN]` when below 1.5×; D3
-//! (statistical stability + repeated-rep median) is the iter that
-//! flips this from a soft warning to a hard assertion. The rationale
-//! is recorded in `docs/ADR-040-continuous-batching-reopen.md` §6.1.14.
+//! TTFT. D2 reported this as `[ac-4 WARN]` only; D3 enforces it via
+//! `assert!` HARD-FAIL **when and only when** the N=4 cells exist for
+//! BOTH policies (today InflightBatched is rejected at spawn pending
+//! Phase C2c + C2d wiring per §6.1.13 Future-iter pin pointers, so D3
+//! reports the FifoSerial-only baseline + variance and defers AC-4
+//! enforcement). D3 also gates BEFORE the AC-4 assertion on a
+//! stability check: if either of the N=4 cells shows
+//! `aggregate_tokens_per_sec_sigma_pct > 20%` the test panics with an
+//! operator-actionable message ("run again or increase REPS") so a
+//! noisy single-iteration measurement cannot fail AC-4 spuriously.
+//! Rationale + rep-count justification documented in
+//! `docs/ADR-040-continuous-batching-reopen.md` §6.1.15.
 //!
 //! # Metric report shape
 //!
@@ -83,7 +106,7 @@
 //!   - per_slot_tokens_per_sec    (median across streams)
 //!   - rejected_429_count         (count of 429 responses during the window)
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -135,6 +158,146 @@ pub fn render_report(cells: &[ThroughputCell]) -> String {
     s
 }
 
+/// Phase D iter-3 (D3): per-(policy, N) cell aggregated across `REPS`
+/// repetitions. Median is the load-bearing summary statistic; min/max
+/// + relative spread `sigma_pct` drive the D3 stability gate.
+///
+/// `sigma_pct` is defined as `(max - min) / median × 100` — the
+/// peak-to-peak spread expressed as a percentage of the median. This
+/// is intentionally a more conservative dispersion measure than σ/μ
+/// (it is bounded above by REPS × σ/μ but bounded below by 0 only when
+/// all reps are identical), chosen because at REPS=3 the sample
+/// standard deviation has high estimator variance and (max - min)/med
+/// is a stable, operator-readable lower-cost noise indicator. The
+/// `STABILITY_SIGMA_PCT_THRESHOLD` constant pins the 20% bar; cells
+/// above it abort AC-4 enforcement with an operator-actionable panic.
+#[derive(Debug, Clone)]
+pub struct ThroughputCellStable {
+    pub policy: &'static str,
+    pub concurrency: u32,
+    pub rep_count: u32,
+    pub aggregate_tokens_per_sec_median: f64,
+    pub aggregate_tokens_per_sec_min: f64,
+    pub aggregate_tokens_per_sec_max: f64,
+    pub aggregate_tokens_per_sec_sigma_pct: f64,
+    pub ttft_p50_ms_median: f64,
+    pub ttft_p95_ms_median: f64,
+    pub per_slot_tokens_per_sec_median: f64,
+    pub rejected_429_count_total: u32,
+}
+
+impl ThroughputCellStable {
+    /// Phase D iter-3 (D3): construct a stable cell from a non-empty
+    /// vector of per-rep `ThroughputCell` measurements. Caller is
+    /// responsible for invoking `run_bench_cell` REPS times; this
+    /// constructor aggregates the medians + spread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cells` is empty (no measurements to aggregate is an
+    /// operator-actionable bug, not a degenerate-case fallback).
+    /// Panics if cells differ in `policy` or `concurrency` (mixing
+    /// reps from different cells would silently corrupt the medians).
+    pub fn from_reps(cells: Vec<ThroughputCell>) -> Self {
+        assert!(!cells.is_empty(), "ThroughputCellStable::from_reps requires ≥1 cell");
+        let policy = cells[0].policy;
+        let concurrency = cells[0].concurrency;
+        for c in &cells {
+            assert_eq!(c.policy, policy, "from_reps: mixed policies across reps");
+            assert_eq!(c.concurrency, concurrency, "from_reps: mixed concurrency across reps");
+        }
+        let rep_count = cells.len() as u32;
+        let aggregates: Vec<f64> = cells.iter().map(|c| c.aggregate_tokens_per_sec).collect();
+        let ttft_p50s: Vec<f64> = cells.iter().map(|c| c.ttft_p50_ms).collect();
+        let ttft_p95s: Vec<f64> = cells.iter().map(|c| c.ttft_p95_ms).collect();
+        let per_slots: Vec<f64> = cells.iter().map(|c| c.per_slot_tokens_per_sec).collect();
+        let rejected_total: u32 = cells.iter().map(|c| c.rejected_429_count).sum();
+
+        let agg_median = median_f64(&aggregates);
+        let agg_min = aggregates.iter().cloned().fold(f64::INFINITY, f64::min);
+        let agg_max = aggregates.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let sigma_pct = if agg_median > 0.0 {
+            (agg_max - agg_min) / agg_median * 100.0
+        } else {
+            0.0
+        };
+
+        ThroughputCellStable {
+            policy,
+            concurrency,
+            rep_count,
+            aggregate_tokens_per_sec_median: agg_median,
+            aggregate_tokens_per_sec_min: agg_min,
+            aggregate_tokens_per_sec_max: agg_max,
+            aggregate_tokens_per_sec_sigma_pct: sigma_pct,
+            ttft_p50_ms_median: median_f64(&ttft_p50s),
+            ttft_p95_ms_median: median_f64(&ttft_p95s),
+            per_slot_tokens_per_sec_median: median_f64(&per_slots),
+            rejected_429_count_total: rejected_total,
+        }
+    }
+}
+
+/// Median of an `f64` slice using sort-then-middle. For odd length:
+/// the middle element. For even length: the lower of the two middle
+/// elements (NOT the arithmetic mean — keeps the median a real
+/// observed sample, matching the ADR-033 §Pi methodology of "the
+/// median rep is the rep we'd recommend the operator deploy with",
+/// not a synthetic value). For empty input: returns 0.0 (the only
+/// caller is `ThroughputCellStable::from_reps` which already
+/// pre-checks non-empty; this is defense-in-depth).
+fn median_f64(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted[sorted.len() / 2]
+}
+
+/// Render a vector of D3 stable cells as a markdown table. Sigma_pct
+/// column added per the brief; min/max + rep_count make the dispersion
+/// visible alongside the median.
+pub fn render_report_stable(cells: &[ThroughputCellStable]) -> String {
+    let mut s = String::from(
+        "| policy | N | reps | agg tok/s median | agg min | agg max | sigma_pct | TTFT p50 | TTFT p95 | per-slot tok/s | 429s total |\n",
+    );
+    s.push_str("|--------|---|------|------------------|---------|---------|-----------|----------|----------|----------------|------------|\n");
+    for c in cells {
+        s.push_str(&format!(
+            "| {} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1}% | {:.1} | {:.1} | {:.1} | {} |\n",
+            c.policy,
+            c.concurrency,
+            c.rep_count,
+            c.aggregate_tokens_per_sec_median,
+            c.aggregate_tokens_per_sec_min,
+            c.aggregate_tokens_per_sec_max,
+            c.aggregate_tokens_per_sec_sigma_pct,
+            c.ttft_p50_ms_median,
+            c.ttft_p95_ms_median,
+            c.per_slot_tokens_per_sec_median,
+            c.rejected_429_count_total,
+        ));
+    }
+    s
+}
+
+/// D3 rep count per cell. 3 reps lets the median be a real sample
+/// (the middle of 3) at a wall-clock cost of 3× the D2 baseline per
+/// cell (~15-90s per cell × 3 = ~45-270s × N_concurrency_steps ×
+/// N_policies). The ADR-033 §Pi methodology lesson favored 3-rep
+/// medians as the minimum to discriminate signal from noise; D3
+/// matches that floor.
+pub const REPS: usize = 3;
+
+/// D3 stability gate: cells with `aggregate_tokens_per_sec_sigma_pct`
+/// above this value have their AC-4 ratio computation aborted (the
+/// test panics with an operator-actionable message asking for a
+/// re-run or higher REPS). 20% is the threshold the brief specifies;
+/// chosen to be roughly 2× the typical run-to-run variance observed
+/// on the ADR-033 §Pi Qwen3.6 bench (~10% peak-to-peak at REPS=3).
+pub const STABILITY_SIGMA_PCT_THRESHOLD: f64 = 20.0;
+
 fn hf2q_binary_path() -> PathBuf {
     if let Some(p) = std::env::var_os("CARGO_BIN_EXE_hf2q") {
         return PathBuf::from(p);
@@ -179,6 +342,203 @@ fn render_report_empty_returns_header_only() {
     let report = render_report(&[]);
     let lines: Vec<&str> = report.lines().collect();
     assert_eq!(lines.len(), 2, "header + separator only, got: {:?}", lines);
+}
+
+// ========================================================================
+// D3 always-on tests (statistical aggregator + report shape)
+// ========================================================================
+
+#[test]
+fn d3_median_f64_odd_length_returns_middle_sample() {
+    // The D3 median is a real observed sample (not arithmetic mean)
+    // per the ADR-033 §Pi methodology note in the median_f64 doc.
+    let v = vec![100.0, 50.0, 200.0];
+    assert_eq!(median_f64(&v), 100.0, "sorted=[50,100,200], middle=100");
+}
+
+#[test]
+fn d3_median_f64_empty_returns_zero() {
+    // Defense-in-depth: from_reps pre-checks non-empty, but the
+    // function itself returns 0 on empty rather than panicking so
+    // it stays composable.
+    assert_eq!(median_f64(&[]), 0.0);
+}
+
+#[test]
+fn d3_stable_from_reps_aggregates_median_min_max_sigma() {
+    let cells = vec![
+        ThroughputCell {
+            policy: "fifo_serial",
+            concurrency: 4,
+            aggregate_tokens_per_sec: 100.0,
+            ttft_p50_ms: 10.0,
+            ttft_p95_ms: 20.0,
+            per_slot_tokens_per_sec: 25.0,
+            rejected_429_count: 1,
+        },
+        ThroughputCell {
+            policy: "fifo_serial",
+            concurrency: 4,
+            aggregate_tokens_per_sec: 110.0,
+            ttft_p50_ms: 12.0,
+            ttft_p95_ms: 22.0,
+            per_slot_tokens_per_sec: 27.5,
+            rejected_429_count: 0,
+        },
+        ThroughputCell {
+            policy: "fifo_serial",
+            concurrency: 4,
+            aggregate_tokens_per_sec: 105.0,
+            ttft_p50_ms: 11.0,
+            ttft_p95_ms: 21.0,
+            per_slot_tokens_per_sec: 26.25,
+            rejected_429_count: 2,
+        },
+    ];
+    let stable = ThroughputCellStable::from_reps(cells);
+    assert_eq!(stable.policy, "fifo_serial");
+    assert_eq!(stable.concurrency, 4);
+    assert_eq!(stable.rep_count, 3);
+    assert!((stable.aggregate_tokens_per_sec_median - 105.0).abs() < 1e-9);
+    assert!((stable.aggregate_tokens_per_sec_min - 100.0).abs() < 1e-9);
+    assert!((stable.aggregate_tokens_per_sec_max - 110.0).abs() < 1e-9);
+    // sigma_pct = (110 - 100) / 105 * 100 ≈ 9.52
+    assert!(
+        (stable.aggregate_tokens_per_sec_sigma_pct - 9.523_809_523_8).abs() < 1e-6,
+        "sigma_pct={}",
+        stable.aggregate_tokens_per_sec_sigma_pct,
+    );
+    assert!((stable.ttft_p50_ms_median - 11.0).abs() < 1e-9);
+    assert!((stable.ttft_p95_ms_median - 21.0).abs() < 1e-9);
+    assert!((stable.per_slot_tokens_per_sec_median - 26.25).abs() < 1e-9);
+    assert_eq!(stable.rejected_429_count_total, 3);
+}
+
+#[test]
+#[should_panic(expected = "from_reps: mixed policies")]
+fn d3_stable_from_reps_rejects_mixed_policies() {
+    let cells = vec![
+        ThroughputCell {
+            policy: "fifo_serial",
+            concurrency: 4,
+            aggregate_tokens_per_sec: 100.0,
+            ttft_p50_ms: 10.0,
+            ttft_p95_ms: 20.0,
+            per_slot_tokens_per_sec: 25.0,
+            rejected_429_count: 0,
+        },
+        ThroughputCell {
+            policy: "inflight_batched",
+            concurrency: 4,
+            aggregate_tokens_per_sec: 200.0,
+            ttft_p50_ms: 10.0,
+            ttft_p95_ms: 20.0,
+            per_slot_tokens_per_sec: 50.0,
+            rejected_429_count: 0,
+        },
+    ];
+    let _ = ThroughputCellStable::from_reps(cells);
+}
+
+#[test]
+#[should_panic(expected = "from_reps: mixed concurrency")]
+fn d3_stable_from_reps_rejects_mixed_concurrency() {
+    let cells = vec![
+        ThroughputCell {
+            policy: "fifo_serial",
+            concurrency: 4,
+            aggregate_tokens_per_sec: 100.0,
+            ttft_p50_ms: 10.0,
+            ttft_p95_ms: 20.0,
+            per_slot_tokens_per_sec: 25.0,
+            rejected_429_count: 0,
+        },
+        ThroughputCell {
+            policy: "fifo_serial",
+            concurrency: 8,
+            aggregate_tokens_per_sec: 200.0,
+            ttft_p50_ms: 10.0,
+            ttft_p95_ms: 20.0,
+            per_slot_tokens_per_sec: 25.0,
+            rejected_429_count: 0,
+        },
+    ];
+    let _ = ThroughputCellStable::from_reps(cells);
+}
+
+#[test]
+fn d3_stable_from_reps_zero_median_yields_zero_sigma_pct() {
+    // Defensive: when all reps measure 0 tok/s (e.g. every stream
+    // 429'd) the median is 0 and sigma_pct would otherwise divide
+    // by zero. The from_reps impl returns 0.0 sigma_pct in this
+    // case to keep the stability gate well-defined.
+    let cells = vec![
+        ThroughputCell {
+            policy: "fifo_serial",
+            concurrency: 1,
+            aggregate_tokens_per_sec: 0.0,
+            ttft_p50_ms: 0.0,
+            ttft_p95_ms: 0.0,
+            per_slot_tokens_per_sec: 0.0,
+            rejected_429_count: 0,
+        },
+        ThroughputCell {
+            policy: "fifo_serial",
+            concurrency: 1,
+            aggregate_tokens_per_sec: 0.0,
+            ttft_p50_ms: 0.0,
+            ttft_p95_ms: 0.0,
+            per_slot_tokens_per_sec: 0.0,
+            rejected_429_count: 0,
+        },
+        ThroughputCell {
+            policy: "fifo_serial",
+            concurrency: 1,
+            aggregate_tokens_per_sec: 0.0,
+            ttft_p50_ms: 0.0,
+            ttft_p95_ms: 0.0,
+            per_slot_tokens_per_sec: 0.0,
+            rejected_429_count: 0,
+        },
+    ];
+    let stable = ThroughputCellStable::from_reps(cells);
+    assert_eq!(stable.aggregate_tokens_per_sec_sigma_pct, 0.0);
+}
+
+#[test]
+fn d3_render_report_stable_emits_header_and_sigma_column() {
+    let cells = vec![ThroughputCellStable {
+        policy: "fifo_serial",
+        concurrency: 4,
+        rep_count: 3,
+        aggregate_tokens_per_sec_median: 105.0,
+        aggregate_tokens_per_sec_min: 100.0,
+        aggregate_tokens_per_sec_max: 110.0,
+        aggregate_tokens_per_sec_sigma_pct: 9.52,
+        ttft_p50_ms_median: 11.0,
+        ttft_p95_ms_median: 21.0,
+        per_slot_tokens_per_sec_median: 26.25,
+        rejected_429_count_total: 3,
+    }];
+    let report = render_report_stable(&cells);
+    assert!(report.contains("sigma_pct"), "header missing sigma_pct: {report}");
+    assert!(report.contains("agg tok/s median"), "header missing median: {report}");
+    assert!(report.contains("| fifo_serial | 4 | 3 |"), "data row missing: {report}");
+    assert!(report.contains("9.5%"), "sigma_pct formatted row missing: {report}");
+}
+
+#[test]
+fn d3_stability_threshold_default_is_twenty_pct() {
+    // Pin the D3 stability gate threshold so a future iter that
+    // tightens or loosens it does so deliberately (and updates the
+    // ADR §6.1.15 closure block + this assertion together).
+    assert!(
+        (STABILITY_SIGMA_PCT_THRESHOLD - 20.0).abs() < 1e-9,
+        "STABILITY_SIGMA_PCT_THRESHOLD changed from 20.0 — update ADR §6.1.15 too",
+    );
+    // Pin REPS at 3 for the same reason: the ADR-033 §Pi median
+    // discriminator floor is 3 reps; any change should be deliberate.
+    assert_eq!(REPS, 3, "REPS changed from 3 — update ADR §6.1.15 too");
 }
 
 #[test]
@@ -372,6 +732,23 @@ struct StreamResult {
 /// out to `hf2q` (subprocess); one more `curl` per stream is the
 /// smaller blast-radius design vs. dragging tokio into the test
 /// thread pool.
+///
+/// # TTFT measurement (D3, this iter)
+///
+/// D2 used `Command::output()` which blocks until curl exits; the
+/// recorded TTFT was the upper bound (= total stream walltime) refined
+/// at aggregation time by subtracting `(tokens-1) × per_token_ms`.
+/// D3 replaces this with **per-frame streaming-stdout TTFT**: curl is
+/// spawned with `Stdio::piped()`, the parent reads the pipe via
+/// `BufReader::lines()`, and the moment the first `data:` frame with
+/// a non-empty `delta.content` arrives the parent captures
+/// `t0.elapsed()` directly. curl's `-N` flag flushes per-SSE-frame so
+/// the parent's BufReader receives the bytes as they arrive over the
+/// socket (modulo OS pipe scheduling — typically sub-millisecond).
+/// This eliminates the upper-bound bias that drove the D2 → D3
+/// caveat: D3's TTFT is the wall-clock from POST send (just before
+/// `child.spawn()`) to the first content frame's arrival at the
+/// parent, with no token-count-based subtraction.
 fn run_stream(port: u16, prompt: &str, max_tokens: u32, model: &str) -> StreamResult {
     let body = format!(
         r#"{{"model":"{}","messages":[{{"role":"user","content":"{}"}}],"max_tokens":{},"temperature":0.6,"stream":true}}"#,
@@ -380,74 +757,82 @@ fn run_stream(port: u16, prompt: &str, max_tokens: u32, model: &str) -> StreamRe
         max_tokens,
     );
 
-    let t0 = Instant::now();
-
     // -s: silent (no progress bar)
     // -N: no buffer (emit SSE frames as they arrive)
     // -w "\n__HTTP_STATUS__:%{http_code}\n": tail-marker for HTTP status code
     // --max-time: hard upper bound matching STREAM_BUDGET_SECS
-    let out = Command::new("curl")
-        .args([
-            "-s",
-            "-N",
-            "-X", "POST",
-            "-H", "Content-Type: application/json",
-            "--max-time", &STREAM_BUDGET_SECS.to_string(),
-            "-w", "\n__HTTP_STATUS__:%{http_code}\n",
-            "-d", &body,
-            &format!("http://127.0.0.1:{port}/v1/chat/completions"),
-        ])
-        .output();
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-s",
+        "-N",
+        "-X", "POST",
+        "-H", "Content-Type: application/json",
+        "--max-time", &STREAM_BUDGET_SECS.to_string(),
+        "-w", "\n__HTTP_STATUS__:%{http_code}\n",
+        "-d", &body,
+        &format!("http://127.0.0.1:{port}/v1/chat/completions"),
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
 
-    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-    let out = match out {
-        Ok(o) => o,
+    let t0 = Instant::now();
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(_) => {
             return StreamResult {
                 http_status: -1,
                 ttft_ms: 0.0,
                 tokens: 0,
-                total_ms,
+                total_ms: t0.elapsed().as_secs_f64() * 1000.0,
             };
         }
     };
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return StreamResult {
+                http_status: -1,
+                ttft_ms: 0.0,
+                tokens: 0,
+                total_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            };
+        }
+    };
 
-    // Parse the trailing __HTTP_STATUS__ marker.
-    let http_status = stdout
-        .lines()
-        .rev()
-        .find_map(|l| l.strip_prefix("__HTTP_STATUS__:").and_then(|c| c.parse::<i32>().ok()))
-        .unwrap_or(-1);
+    let reader = BufReader::new(stdout);
 
-    // Count `data: {...}` frames; count tokens as non-empty `delta.content`
-    // fragments; capture TTFT at the FIRST frame with a non-empty content
-    // delta. The body of `run_stream` is single-threaded inside this
-    // thread::scope worker, so the wall-clock from `t0` to the moment we
-    // observe the first content delta is the correct TTFT.
+    // Per-frame parse loop: scan curl's stdout line-by-line as it
+    // arrives. Capture TTFT (`Instant::now() - t0`) the first time
+    // we see a `data: {...}` frame with a non-empty `delta.content`.
+    // The substring scan for `"content":"` matches hf2q's
+    // OpenAI-compatible chat-stream wire format (see
+    // `src/serve/api/sse.rs`); we do NOT depend on `serde_json`
+    // because the bench has no need for full JSON validation and the
+    // substring search keeps `Cargo.toml` untouched per the brief.
     //
-    // curl's `-N --max-time` returns AFTER the stream closes — so TTFT is
-    // approximated as the elapsed time UNTIL the curl process exit
-    // (i.e. `total_ms` is the upper bound of TTFT). To get a tighter
-    // TTFT we'd need streaming-stdout consumption (curl piped to a Rust
-    // reader). For D2 the approximation suffices because (a) at
-    // `max_tokens=64` the stream completes quickly anyway, and (b)
-    // TTFT comparison ACROSS cells is what matters — the same upper-
-    // bound bias applies to every cell, so the relative AC-4 gate
-    // (treatment p95 ≤ 2× baseline) is unaffected. D3 refines TTFT
-    // capture via streaming stdout if the AC-4 TTFT bar tightens.
-    //
-    // Pragmatic TTFT estimate: if any content frames arrived, set TTFT
-    // to `total_ms` minus the time spent emitting all but the first
-    // token at the per-cell tokens/sec rate (computed at aggregation
-    // time, not here). Here we record `total_ms` as the TTFT upper
-    // bound; the aggregator subtracts `(tokens-1) / per_stream_rate`.
+    // The role frame (`"content":""`) is emitted first; we count
+    // only non-empty deltas as tokens. The trailing
+    // `__HTTP_STATUS__:<code>` marker is curl's `-w` output and is
+    // parsed at the end.
     let mut tokens: u32 = 0;
     let mut ttft_ms = 0.0_f64;
     let mut first_content_seen = false;
-    for line in stdout.lines() {
+    let mut http_status: i32 = -1;
+    for line_res in reader.lines() {
+        let line = match line_res {
+            Ok(l) => l,
+            // Read error mid-stream: capture what we have, status -1.
+            Err(_) => break,
+        };
+        if let Some(code_str) = line.strip_prefix("__HTTP_STATUS__:") {
+            if let Ok(code) = code_str.trim().parse::<i32>() {
+                http_status = code;
+            }
+            continue;
+        }
         let payload = match line.strip_prefix("data: ") {
             Some(p) => p,
             None => continue,
@@ -455,39 +840,34 @@ fn run_stream(port: u16, prompt: &str, max_tokens: u32, model: &str) -> StreamRe
         if payload.trim() == "[DONE]" {
             continue;
         }
-        // Best-effort JSON parsing: count any `"content":"<non-empty>"`
-        // delta as one token. The OpenAI-compatible chat-stream wire
-        // format emits one token per SSE frame for hf2q's per-token
-        // SSE writer (see `src/serve/api/sse.rs`). We do NOT depend on
-        // `serde_json` here — substring search is sufficient + keeps
-        // the test free of additional Cargo.toml deps.
         if let Some(idx) = payload.find(r#""content":""#) {
             let after = &payload[idx + r#""content":""#.len()..];
-            // The first character after `"content":"` is `"` (empty)
-            // for the role-frame and non-`"` for a real content delta.
-            // hf2q's SSE writer emits the role frame first (empty
-            // content), then per-token deltas; we count only the
-            // non-empty deltas as tokens.
+            // First char after the open quote: `"` = empty content
+            // (role frame); anything else = real content delta.
             if !after.starts_with('"') {
                 tokens = tokens.saturating_add(1);
                 if !first_content_seen {
                     first_content_seen = true;
-                    // Best-effort TTFT: time from POST send to NOW
-                    // (the moment curl returned + we got to this
-                    // line). curl's `-N` flushes per SSE frame but
-                    // does NOT timestamp them; the elapsed-since-t0
-                    // here is bounded above by `total_ms` and below
-                    // by 0. We record `total_ms` as the TTFT upper
-                    // bound at this point and let the aggregator
-                    // subtract `(tokens-1) × per-token-time` for a
-                    // sharper estimate; the cell-level p50/p95 are
-                    // computed AFTER the per-stream rates are known.
-                    ttft_ms = total_ms;
+                    // D3 per-frame TTFT: wall-clock from POST send
+                    // (the `t0` Instant taken just before
+                    // `child.spawn()`) to NOW (the moment we
+                    // observed the first content delta on the
+                    // parent-side BufReader). No token-count-based
+                    // subtraction is performed.
+                    ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 }
             }
         }
     }
-    let _ = first_content_seen; // retained for future TTFT refinement
+
+    // Reap the child to avoid zombie subprocesses; ignore the exit
+    // status because we've already captured `http_status` from the
+    // SSE stream's `-w` marker. If curl is still running for some
+    // reason (e.g. server hung after streaming), `wait()` blocks
+    // for the remainder of the `--max-time` budget which is bounded.
+    let _ = child.wait();
+
+    let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     StreamResult {
         http_status,
@@ -581,25 +961,16 @@ fn run_bench_cell(gguf: &str, policy: &'static str, n: u32) -> Result<Throughput
         per_stream_rates[per_stream_rates.len() / 2]
     };
 
-    // TTFT p50 + p95: refine the upper-bound `total_ms` recorded in
-    // `run_stream` by subtracting `(tokens - 1) / per_stream_rate` —
-    // the time spent emitting tokens AFTER the first. This is a
-    // best-effort estimate; D3 refines TTFT via streaming-stdout
-    // consumption (per the §6.1.14 closure block).
-    let mut ttft_estimates_ms: Vec<f64> = succeeded
-        .iter()
-        .map(|r| {
-            if r.tokens <= 1 {
-                r.ttft_ms
-            } else {
-                let per_token_ms = r.total_ms / (r.tokens as f64);
-                (r.ttft_ms - per_token_ms * (r.tokens as f64 - 1.0)).max(0.0)
-            }
-        })
-        .collect();
-    ttft_estimates_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let ttft_p50_ms = percentile(&ttft_estimates_ms, 0.50);
-    let ttft_p95_ms = percentile(&ttft_estimates_ms, 0.95);
+    // D3 per-frame TTFT: `run_stream` now records the wall-clock
+    // from POST send to first content delta directly via
+    // streaming-stdout consumption (BufReader::lines() on the
+    // child's piped stdout). No token-count-based subtraction is
+    // performed — the recorded `ttft_ms` IS the time-to-first-token
+    // measurement. The aggregator just sorts and percentiles.
+    let mut ttft_per_stream_ms: Vec<f64> = succeeded.iter().map(|r| r.ttft_ms).collect();
+    ttft_per_stream_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let ttft_p50_ms = percentile(&ttft_per_stream_ms, 0.50);
+    let ttft_p95_ms = percentile(&ttft_per_stream_ms, 0.95);
 
     let cell = ThroughputCell {
         policy,
@@ -612,6 +983,50 @@ fn run_bench_cell(gguf: &str, policy: &'static str, n: u32) -> Result<Throughput
     };
     eprintln!("[cb-throughput] cell DONE: {:?}", cell);
     Ok(cell)
+}
+
+/// Phase D iter-3 (D3): run `run_bench_cell` REPS times and aggregate
+/// into a `ThroughputCellStable`. Each rep is a full subprocess spawn
+/// + /readyz poll + N concurrent SSE streams + subprocess shutdown,
+/// matching the D2 cell shape. The reps are sequential — no two
+/// `hf2q serve` subprocesses are alive at once (CLAUDE.md "do not
+/// oom us" rule + the fact that `BenchServer::drop` is the only
+/// shutdown path).
+///
+/// Returns `Err(reason)` when ANY of the REPS reps fails to produce
+/// a cell. This is the strict policy: a single failed rep makes the
+/// median undefined (`assert!(!cells.is_empty())` in
+/// `ThroughputCellStable::from_reps` would fire on partial data
+/// anyway), so we surface the failure to the caller and let it
+/// record the cell as skipped — matching D2's
+/// `inflight_batched-rejected-at-spawn` skip path.
+fn run_bench_cell_3rep(
+    gguf: &str,
+    policy: &'static str,
+    n: u32,
+) -> Result<ThroughputCellStable, String> {
+    let mut cells = Vec::with_capacity(REPS);
+    for rep in 0..REPS {
+        eprintln!(
+            "[d3] cell policy={} N={} rep={}/{}",
+            policy,
+            n,
+            rep + 1,
+            REPS
+        );
+        let cell = run_bench_cell(gguf, policy, n).map_err(|e| {
+            format!(
+                "rep {}/{} failed for policy={} N={}: {}",
+                rep + 1,
+                REPS,
+                policy,
+                n,
+                e
+            )
+        })?;
+        cells.push(cell);
+    }
+    Ok(ThroughputCellStable::from_reps(cells))
 }
 
 fn percentile(sorted: &[f64], q: f64) -> f64 {
@@ -702,25 +1117,28 @@ fn cb_throughput_n_1_2_4_8_fifo_vs_inflight() {
         assert!(n > 0, "concurrency entries must be > 0, got {n}");
     }
 
-    let mut all_cells: Vec<ThroughputCell> = Vec::new();
+    // Phase D iter-3 (D3): each (policy, N) cell is run REPS=3 times
+    // via `run_bench_cell_3rep` which aggregates into a
+    // `ThroughputCellStable` (median + min/max + sigma_pct). Per-rep
+    // failures abort the whole cell — a partial-data median would be
+    // meaningless and silently misleading.
+    let mut all_cells: Vec<ThroughputCellStable> = Vec::new();
     let mut skipped: Vec<(String, u32, String)> = Vec::new();
 
     for &policy in &["fifo_serial", "inflight_batched"] {
         for &n in &concurrency {
-            match run_bench_cell(&gguf_path, policy, n) {
+            match run_bench_cell_3rep(&gguf_path, policy, n) {
                 Ok(cell) => all_cells.push(cell),
                 Err(e) => {
-                    eprintln!(
-                        "[cb-throughput] cell SKIPPED (policy={policy}, N={n}): {e}"
-                    );
+                    eprintln!("[cb-throughput] cell SKIPPED (policy={policy}, N={n}): {e}");
                     skipped.push((policy.to_string(), n, e));
                 }
             }
         }
     }
 
-    let report = render_report(&all_cells);
-    println!("\n=== ADR-040 §5 AC-4 throughput report (D2) ===\n{report}");
+    let report = render_report_stable(&all_cells);
+    println!("\n=== ADR-040 §5 AC-4 throughput report (D3, REPS={REPS}) ===\n{report}");
     if !skipped.is_empty() {
         println!("\nSkipped cells:");
         for (p, n, why) in &skipped {
@@ -734,49 +1152,136 @@ fn cb_throughput_n_1_2_4_8_fifo_vs_inflight() {
     // env-gated body must FAIL when it cannot measure anything.
     assert!(
         !all_cells.is_empty(),
-        "ADR-040 D2: no bench cells completed; all (policy, N) combinations failed. \
+        "ADR-040 D3: no bench cells completed; all (policy, N) combinations failed. \
          Check HF2Q_CB_THROUGHPUT_MODEL={gguf_path} + the skipped-cells list above."
     );
 
-    // AC-4 soft-gate per ADR-040 §5: when both fifo_serial AND
-    // inflight_batched cells exist at N=4, REPORT the aggregate
-    // tokens/sec ratio + TTFT p95 ratio. D2 reports; D3 enforces
-    // statistical stability + flips this to a hard assertion.
+    // FifoSerial-only baseline + variance reporting. D3 always emits
+    // a separate stability section for the FifoSerial rows EVEN WHEN
+    // the AC-4 gate cannot fire (InflightBatched is rejected at
+    // spawn until Phase C2c/C2d wire it). This gives operators the
+    // run-to-run noise floor for the baseline so they can decide
+    // whether to bump REPS before C2c/C2d land.
+    println!("\n=== D3 FifoSerial-only stability baseline ===");
+    let mut any_fifo = false;
+    for cell in all_cells.iter().filter(|c| c.policy == "fifo_serial") {
+        any_fifo = true;
+        println!(
+            "  N={}: median={:.1} tok/s, min={:.1}, max={:.1}, sigma_pct={:.1}% ({} reps, 429s total={})",
+            cell.concurrency,
+            cell.aggregate_tokens_per_sec_median,
+            cell.aggregate_tokens_per_sec_min,
+            cell.aggregate_tokens_per_sec_max,
+            cell.aggregate_tokens_per_sec_sigma_pct,
+            cell.rep_count,
+            cell.rejected_429_count_total,
+        );
+    }
+    if !any_fifo {
+        println!("  (no fifo_serial cells completed)");
+    }
+
+    // AC-4 HARD GATE per ADR-040 §5 (D3 promotion from D2 soft-warn):
+    // when N=4 cells exist for BOTH fifo_serial AND inflight_batched,
+    // assert aggregate ratio ≥ 1.5× AND TTFT p95 ratio ≤ 2.0×. Before
+    // the assertion, stability must be acceptable on BOTH cells
+    // (sigma_pct ≤ STABILITY_SIGMA_PCT_THRESHOLD).
+    //
+    // When InflightBatched is rejected at spawn (Phase C2c/C2d not
+    // yet wired), the inflight_n4 cell will be missing and we skip
+    // AC-4 enforcement — deferred to once C2c/C2d ship. D3 still
+    // reports the FifoSerial-only baseline + variance above so the
+    // bench is operator-useful in the interim.
     let fifo_n4 = all_cells
         .iter()
         .find(|c| c.policy == "fifo_serial" && c.concurrency == 4);
     let inflight_n4 = all_cells
         .iter()
         .find(|c| c.policy == "inflight_batched" && c.concurrency == 4);
-    if let (Some(f), Some(i)) = (fifo_n4, inflight_n4) {
-        let aggregate_ratio = i.aggregate_tokens_per_sec / f.aggregate_tokens_per_sec.max(1e-6);
-        let fifo_n1 = all_cells
-            .iter()
-            .find(|c| c.policy == "fifo_serial" && c.concurrency == 1);
-        let ttft_ratio = fifo_n1.map(|s| i.ttft_p95_ms / s.ttft_p95_ms.max(1e-6));
-        eprintln!(
-            "[ac-4] N=4 aggregate ratio = {:.2}x (gate = 1.5x); TTFT p95 ratio vs FIFO N=1 = {:?} (gate = 2.0x)",
-            aggregate_ratio, ttft_ratio
-        );
-        if aggregate_ratio < 1.5 {
-            eprintln!(
-                "[ac-4 WARN] aggregate ratio {aggregate_ratio:.2}x below 1.5x bar; \
-                 D3 statistical-stability enforcement will hard-fail this case."
+    let fifo_n1 = all_cells
+        .iter()
+        .find(|c| c.policy == "fifo_serial" && c.concurrency == 1);
+
+    match (fifo_n4, inflight_n4) {
+        (Some(f), Some(i)) => {
+            // Stability gate FIRST. A noisy measurement makes the
+            // AC-4 ratio meaningless; the operator should re-run or
+            // bump REPS before AC-4 fails on signal-vs-noise.
+            if f.aggregate_tokens_per_sec_sigma_pct > STABILITY_SIGMA_PCT_THRESHOLD {
+                panic!(
+                    "AC-4 BLOCKED: fifo_serial N=4 measurement variance {:.1}% > {:.1}% threshold; \
+                     run again or increase REPS for stable median (median={:.1}, min={:.1}, max={:.1})",
+                    f.aggregate_tokens_per_sec_sigma_pct,
+                    STABILITY_SIGMA_PCT_THRESHOLD,
+                    f.aggregate_tokens_per_sec_median,
+                    f.aggregate_tokens_per_sec_min,
+                    f.aggregate_tokens_per_sec_max,
+                );
+            }
+            if i.aggregate_tokens_per_sec_sigma_pct > STABILITY_SIGMA_PCT_THRESHOLD {
+                panic!(
+                    "AC-4 BLOCKED: inflight_batched N=4 measurement variance {:.1}% > {:.1}% threshold; \
+                     run again or increase REPS for stable median (median={:.1}, min={:.1}, max={:.1})",
+                    i.aggregate_tokens_per_sec_sigma_pct,
+                    STABILITY_SIGMA_PCT_THRESHOLD,
+                    i.aggregate_tokens_per_sec_median,
+                    i.aggregate_tokens_per_sec_min,
+                    i.aggregate_tokens_per_sec_max,
+                );
+            }
+
+            let aggregate_ratio = i.aggregate_tokens_per_sec_median
+                / f.aggregate_tokens_per_sec_median.max(1e-6);
+            assert!(
+                aggregate_ratio >= 1.5,
+                "AC-4 FAILED: aggregate ratio {:.2}× below 1.5× bar \
+                 (fifo_serial N=4 median = {:.1} tok/s; inflight_batched N=4 median = {:.1} tok/s)",
+                aggregate_ratio,
+                f.aggregate_tokens_per_sec_median,
+                i.aggregate_tokens_per_sec_median,
             );
-        }
-        if let Some(t) = ttft_ratio {
-            if t > 2.0 {
+
+            // TTFT ratio: inflight_batched N=4 p95 vs fifo_serial N=1 p95.
+            // If the FIFO N=1 baseline is missing (operator restricted
+            // HF2Q_CB_THROUGHPUT_CONCURRENCY to exclude N=1), report a
+            // diagnostic + skip the TTFT half of the AC-4 gate rather
+            // than fabricate a denominator.
+            if let Some(base) = fifo_n1 {
+                let ttft_ratio = i.ttft_p95_ms_median / base.ttft_p95_ms_median.max(1e-6);
+                assert!(
+                    ttft_ratio <= 2.0,
+                    "AC-4 FAILED: TTFT p95 ratio {:.2}× above 2.0× bar \
+                     (fifo_serial N=1 p95 median = {:.1} ms; inflight_batched N=4 p95 median = {:.1} ms)",
+                    ttft_ratio,
+                    base.ttft_p95_ms_median,
+                    i.ttft_p95_ms_median,
+                );
                 eprintln!(
-                    "[ac-4 WARN] TTFT p95 ratio {t:.2}x above 2.0x bar; \
-                     D3 will hard-fail this case."
+                    "[ac-4 PASS] aggregate ratio {:.2}× ≥ 1.5× ✓ ; TTFT p95 ratio {:.2}× ≤ 2.0× ✓",
+                    aggregate_ratio, ttft_ratio,
+                );
+            } else {
+                eprintln!(
+                    "[ac-4 PARTIAL] aggregate ratio {:.2}× ≥ 1.5× ✓ ; TTFT half skipped — \
+                     no fifo_serial N=1 cell present (set HF2Q_CB_THROUGHPUT_CONCURRENCY to include 1)",
+                    aggregate_ratio,
                 );
             }
         }
-    } else {
-        eprintln!(
-            "[ac-4] cannot evaluate gate — missing N=4 cell for one or both policies \
-             (typically inflight_batched is Phase C2c/C2d gated; D2 reports what it can)."
-        );
+        _ => {
+            // AC-4 enforcement deferred — exactly one of the two N=4
+            // cells is missing (typically inflight_batched, until
+            // Phase C2c/C2d ship). D3 reports the FifoSerial-only
+            // baseline + variance above; AC-4 will fire on the
+            // first run after C2c/C2d land without test edits.
+            eprintln!(
+                "[ac-4 DEFERRED] cannot evaluate gate — missing N=4 cell for one or both \
+                 policies. Typically inflight_batched is Phase C2c/C2d gated; D3 reports \
+                 the FifoSerial-only baseline + variance and defers AC-4 enforcement until \
+                 the inflight-side wiring lands. The bench is forward-compatible: no edits \
+                 needed once C2c/C2d ship."
+            );
+        }
     }
 }
 
