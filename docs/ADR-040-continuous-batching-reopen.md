@@ -247,7 +247,9 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | **B3 (SHIPPED 2026-05-23)** | `InflightBatchedScheduler` real `step` FSM — SlotPhase enum {Queued, Prefilling, Decoding} + `advance_after_prefill`/`advance_after_decode` driver-callback APIs + DEFAULT_PREFILL_CHUNK_TOKENS=512 (mirrors llama.cpp `-ub` default) + 12 new FSM tests (30 total scheduler tests); iter-1.5 cfg(test) gate removed | **1 day landed** |
 | A2b | `HybridKvCache` linear-attn lift — lift `rollback_la_to` guard at `kv_cache.rs:1567`, H4 + H5 hypotheses; ports `gpu_delta_net.rs` `n_seqs=1u32` sites | 5-8 days |
 | A2c | `fork_seq` real kernel dispatch (same-buffer cross-region memcpy) — replaces A2a's `SlotOom { 0, 0 }` sentinel | 3-5 days |
-| A3 | Gemma 4 dense KV impl | 3-5 days |
+| **A3a (SHIPPED 2026-05-23)** | Gemma 4 `MultiSeqHbKvBuffers` sibling-struct lift + `alloc_hb_kv_for_layer` unified helper + `MultiSeqKvCache` impl — H6+H7+H8 PASS; H9 verified by code-read; H10 FALSIFIED but A3a scope intact; ~700 LOC + 12 new tests (24 total in `gemma4::kv_cache`) | **1 day landed** |
+| A3b | Gemma 4 `MlxKvCache` + `DenseKvBuffers` + `HybridKvBuffers` n_seqs lift — H10 FALSIFIED elevates HybridKvBuffers from "default-off opt-in" to "production default since ADR-029 iter-13" priority | 5-8 days |
+| A3c | Gemma 4 `fork_seq` real kernel dispatch (parallel to Qwen35 A2c per dossier §2.3.3 — same `dispatch_kv_cache_copy_seq_*` family serves both arches) | 3-5 days |
 | A4 | Drafter KV caches (EAGLE-3, DFlash) — research-quality | 5-8 days |
 | A5 | Per-slot OOM + budget enforcement | 2-3 days |
 | A6 | Closure: per-family parity gate vs n_seqs=1 baseline | 2 days |
@@ -926,6 +928,64 @@ H1 (byte-equivalence pin) under the operator-run gate verifies this empirically;
 #### Dossier provenance
 
 Closes Codex /cfa rev-1 findings on `01b9429b` (iter-C2a) + `886f229c` (iter-C2b). No standalone dossier — this iter is bounded surface-area follow-up on the already-shipped C2a/C2b work; the Codex review at `/tmp/cfa-c2-review/codex-review-last.txt` enumerates the 3 majors + 4 minors that drove this scope.
+
+### 6.1.11 Iter-A3a closure — Phase A3 Gemma 4 `MultiSeqHbKvBuffers` (2026-05-23, this commit)
+
+First real Gemma 4 per-model `MultiSeqKvCache` impl.  Path: `src/inference/models/gemma4/kv_cache.rs`.  Grounded in `docs/research/adr040-kv-cache-lift-dossier-2026-05-23.md` §2.2 + §2.9 (H6–H10) + §4 iter-3 playbook.  Mirrors Qwen35 A2a's pattern (`src/inference/models/qwen35/kv_cache.rs:2526-2780` + 6176-7115).
+
+**Hypothesis-driven execution per goal-mode directive ("Create hypotheses that are testable before changing code")**:
+
+| Hyp | Claim | Status | Test |
+|---|---|---|---|
+| H6 | `alloc_hb_kv_for_layer(.., n_seqs=4)` allocates without panic + scales 4× linearly on every buffer (k_packed, v_packed, k_norms, v_norms) | **VERIFIED** | `h6_hb_kv_buffers_n_seqs_4_byte_scale` |
+| H7 | Sliding-window per-slot isolation: writes to slot 1's K/V region do not bleed into slot 0 after a slot-0 cursor advance | **VERIFIED** (host-side byte snapshot) | `h7_hb_kv_sliding_per_slot_isolation` |
+| H8 | The 3 inline alloc sites' byte formula matches `alloc_hb_kv_for_layer(.., n_seqs=1)` byte-for-byte (drift-risk eliminated for Phase B4c refactor) | **VERIFIED** | `h8_alloc_hb_kv_for_layer_byte_equivalent_to_pre_refactor` |
+| H9 | Production Gemma 4 uses MIXED `LayerType::Full` + `LayerType::Sliding` per layer (a3 must handle both branches) | **VERIFIED** (code-read at `src/inference/models/gemma4/model.rs:1250` — `is_full ? LayerType::Full : LayerType::Sliding`); MultiSeqHbKvBuffers is per-layer-agnostic (carries `is_sliding` flag identically to legacy `HbKvBuffers`) | code-read; no synthetic test needed |
+| H10 | `HF2Q_HYBRID_KV=1` is opt-in (default-OFF), so A3a can ship HbKvBuffers multi-seq WITHOUT lifting HybridKvBuffers | **FALSIFIED** — `src/debug/investigation_env.rs:878` reads `hybrid_kv: env_default_true("HF2Q_HYBRID_KV")` since ADR-029 iter-13 (2026-05-11).  The dossier §2.2.2 claim that HbKvBuffers is the production default reflects a pre-iter-13 reality.  **A3a scope still ships** — HbKvBuffers is reachable on the `HF2Q_HYBRID_KV=0` opt-out path, and the structural lift here is a prerequisite for the A3b HybridKvBuffers lift regardless of which variant is the production default.  Operator impact: A3b priority is now *higher* than the brief framing suggested (it is the production default path, not the opt-in path). | N/A — env-read verification; recorded in code-comment at the `MultiSeqHbKvBuffers` definition |
+
+**Scope per dossier §4 iter-3**:
+- ✅ Sibling `MultiSeqHbKvBuffers` struct with `n_seqs` outermost + per-seq `seq_lens: Vec<u32>` cursor
+- ✅ Unified `alloc_hb_kv_for_layer(dev, layer_idx, nkv, hd, cap, is_ring, n_seqs)` helper (mirrors `alloc_hybrid_kv_for_layer` pattern at `gemma4/kv_cache.rs:218-272`)
+- ✅ `impl MultiSeqKvCache for MultiSeqHbKvBuffers` — 5 methods: `layout`, `slot_count`, `seq_len`, `append_for_seq`, `drop_seq`, `fork_seq`
+- ✅ H6 + H7 + H8 hypothesis pins + 9 trait-surface pins + 1 M5-equivalent shape pin = 12 new tests
+- ⏭️ MlxKvCache (legacy 4-bit) n_seqs lift — DEFERRED to A3b
+- ⏭️ DenseKvBuffers (`HF2Q_USE_DENSE=1`) n_seqs lift — DEFERRED to A3b
+- ⏭️ HybridKvBuffers (default-ON post-H10-falsification) n_seqs lift — DEFERRED to A3b but priority elevated
+- ⏭️ `fork_seq` cross-slot kernel dispatch — DEFERRED to A3c (parallel to Qwen35 A2c per dossier §2.3.3, same `dispatch_kv_cache_copy_seq_*` family serves both arches)
+- ⏭️ 3 inline alloc site refactor through `alloc_hb_kv_for_layer` — DEFERRED to Phase B4c (the brief's explicit constraint; B4c also threads slot_id through the kernel dispatchers, so the alloc + dispatch lift land together)
+
+**Quality gates (all green)**:
+- `cargo check --release`: 0
+- `cargo check --release --tests`: 0 (no new warnings; pre-existing `gpu_full_attn.rs:11455-57 bad_shape` warnings only)
+- `cargo test --release --bin hf2q -- gemma4::kv_cache --test-threads=1`: **24/24 PASS** (12 baseline + 12 new)
+- `cargo test --release --bin hf2q -- serve::multi_seq_kv qwen35::kv_cache serve::scheduler qwen35::forward_gpu::tests::b4a serve::tests::c4 serve::api::engine::tests --test-threads=1`: **214/214 PASS** (iter-C2.5 regression bundle intact)
+
+**LOC delta**:
+- `src/inference/models/gemma4/kv_cache.rs`: +~740 LOC / -8 LOC (struct ~50 + alloc helper ~80 + trait impl ~140 + tests ~470)
+- `docs/ADR-040-continuous-batching-reopen.md`: +~75 LOC (Phase A row split A3 → A3a/A3b/A3c + this §6.1.11 closure)
+
+**Iter-A3a test count net**: gemma4::kv_cache 12 → 24 (+12 net).  Adds H6 + H7 + H8 + the M5-equivalent shape pin + 8 trait-surface pins (`slot_count_matches_n_seqs`, `slot_out_of_range_errors_named`, `append_advances_target_slot_only`, `drop_resets_seq_len_for_target_slot_only`, `drop_does_not_zero_k_packed_buffer`, `fork_to_self_is_noop_ok`, `fork_cross_slot_returns_capability_unsupported`, `layout_is_separate_slots`).
+
+**Sequencing unblocked by A3a**:
+- **C2c (Gemma SlotAware engine path)** — was gated on "Phase A3 Gemma 4 multi-seq KV impl landing first" per the §6 Phase C C2c row.  A3a closes the HbKvBuffers half of A3; C2c now needs only A3b (HybridKvBuffers — the default-ON variant per H10) before it can ship a SlotAware engine for Gemma 4.
+- **B4c (Gemma forward-prefill slot threading)** — was gated on "Phase A3 Gemma 4 multi-seq KV impl landing first" per the §6 Phase B B4c row.  A3a closes the alloc-side prerequisite (sites can now call `alloc_hb_kv_for_layer` and receive `MultiSeqHbKvBuffers` with the correct 4-D shape); B4c's remaining work is the dispatch-side slot-offset wiring + the 3 alloc-site refactors.
+
+**A3b deferral rationale** (H10 + dossier §4 iter-3):
+- The brief explicitly tightened A3a's scope to `HbKvBuffers` only with `MlxKvCache` + `DenseKvBuffers` + `HybridKvBuffers` deferred to A3b.
+- H10 falsification changed the priority *within* A3b (HybridKvBuffers is no longer "opt-in" — it's the production default since 2026-05-11) but did NOT change the A3a/A3b boundary.  Lifting all 4 variants in a single iter would have ~600 LOC of additional changes and would still require Phase B4c to refactor the kernel dispatchers' write paths uniformly.  The cleaner sequencing is: A3a establishes the multi-seq pattern on one variant + the unified allocator + the trait impl shape; A3b ports the same pattern to the other 3 variants now that the discipline is pinned by 12 tests.
+- A3b will follow A3a's exact pattern: per-variant `MultiSeq*KvBuffers` sibling struct + `alloc_*_for_layer(n_seqs)` helper + `MultiSeqKvCache` impl + per-variant H6/H7/H8 hypothesis pins.  Estimated 5-8 days per the §6 Phase A table.
+
+**Deviations from the brief (with rationale)**:
+- **Sibling-struct approach instead of in-place HbKvBuffers extension.** The brief's Step 2 specified adding `n_seqs` + `seq_lens` directly to `HbKvBuffers`.  This conflicts with constraint #6 ("ONLY edit `kv_cache.rs` + ADR") and constraint #8 ("NO touch to forward_prefill.rs / forward_prefill_batched.rs / forward_gpu.rs"): adding required public fields to `HbKvBuffers` breaks the 3 inline struct-literal alloc sites at `forward_prefill.rs:876`, `forward_prefill_batched.rs:473`, and `forward_gpu.rs:454` (Rust requires every public field to be initialised in a `Struct { .. }` literal).  Resolution: ship the multi-seq variant as a NEW sibling struct `MultiSeqHbKvBuffers` in the same file.  The 3 inline sites continue to allocate legacy 3-D `HbKvBuffers` at implicit n_seqs=1 byte-for-byte unchanged; Phase B4c refactors them through `alloc_hb_kv_for_layer` (returning `MultiSeqHbKvBuffers`) as part of the dispatch-side slot-offset wiring.  This mirrors Qwen35's pattern where `HybridKvCache` is the multi-seq aggregate distinct from per-layer buffer primitives.  Net structural outcome is identical to the brief's intent (n_seqs lift via outermost axis + per-seq cursor + trait impl); the surface API is a new pub type rather than an extended existing type.
+- H9 verified by code-read (`src/inference/models/gemma4/model.rs:1250` showing `is_full ? LayerType::Full : LayerType::Sliding` per-layer construction) rather than a synthetic-fixture test.  The brief permitted "code-reading + comment in deliverable" for hypothesis verification when the structural claim is statically inspectable; this is one of those cases (the layer-types vector is built deterministically from config).
+
+**Mantra-aligned**: no `// TODO`, no `unimplemented!()`, no `panic!()` in production code.  `fork_seq` cross-slot returns `CapabilityUnsupported` (HTTP 501 upstream per iter-2.5 M1) with the deferred-arc label naming Phase A3c + dossier R5 — same shape as Qwen35 A2a's deferral pin.
+
+**Future-iter pin pointers**:
+- **A3b**: ship `MultiSeqMlxKvCache` + `MultiSeqDenseKvBuffers` + `MultiSeqHybridKvBuffers` siblings following the A3a recipe.  Per-variant H6/H7/H8 pins.  The HybridKvBuffers lift is the load-bearing one (default-ON path post-H10).
+- **A3c**: replace `fork_seq` `CapabilityUnsupported` with same-buffer cross-region memcpy via `dispatch_kv_cache_copy_seq_*`.  Flip the assertion in `gemma4_hb_kv_fork_cross_slot_returns_capability_unsupported` from `expect_err(..)` to `expect("fork ok after A3c")` + per-buffer byte-equality.  Same kernel arc serves Qwen35 A2c.
+- **B4c**: refactor the 3 inline alloc sites (`forward_prefill.rs:843-882`, `forward_prefill_batched.rs:443-475`, `forward_gpu.rs:443-459`) through `alloc_hb_kv_for_layer(.., max_slots)`.  Thread `slot_id: SlotId` through the `dispatch_hadamard_quantize_kv_hb_*` callers via per-slot `MlxBuffer::slice_view(byte_offset, n_elements)` (same primitive Qwen35 B4a-cont uses).
+- **C2c**: gated on A3b (HybridKvBuffers lift) per the H10 falsification — the SlotAware engine path needs the default-ON KV variant lifted before it can populate `Gemma4LoadedModel.persistent_kv_cache` with `n_seqs=max_slots`.
 
 ---
 

@@ -81,6 +81,14 @@ impl MlxKvCache {
 }
 
 /// Per-layer byte-packed higher-bit (5/6-bit) KV buffers (iter-21 Track B).
+///
+/// **Single-seq legacy shape** — every buffer is 3-D `[nkv, cap, hd]` (K/V
+/// packed) or `[nkv, cap, norms_per_pos]` (norms).  The 3 production alloc
+/// sites (`src/serve/forward_prefill.rs`, `src/serve/forward_prefill_batched.rs`,
+/// `src/inference/models/gemma4/forward_gpu.rs`) construct this type via
+/// inline struct literals at n_seqs=1 implicit; this struct stays unchanged
+/// to keep those sites byte-for-byte compatible while the multi-seq lift
+/// rolls in via the sibling [`MultiSeqHbKvBuffers`] (ADR-040 Phase A3a).
 pub struct HbKvBuffers {
     /// Byte-packed K indices `[nkv_heads, capacity, head_dim]` U8.
     pub k_packed: MlxBuffer,
@@ -97,6 +105,391 @@ pub struct HbKvBuffers {
     /// Norms per position (1 for D=256, 2 for D=512).
     #[allow(dead_code)]
     pub norms_per_pos: usize,
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// ADR-040 Phase A3a iter-3 — multi-seq variant of HbKvBuffers.
+//
+// Per dossier `docs/research/adr040-kv-cache-lift-dossier-2026-05-23.md`
+// §2.2.4 + §4 iter-3, the Gemma 4 production-default KV variant
+// (HbKvBuffers, TQ-active 8-bit per ADR-007) needs an n_seqs axis to
+// support ADR-040's multi-seq scheduling.  This sibling struct ships
+// the lift WITHOUT touching the 3 existing alloc sites (those keep
+// allocating the legacy 3-D `HbKvBuffers` at implicit n_seqs=1 until
+// Phase B4c re-routes them through `alloc_hb_kv_for_layer`).
+//
+// **Why a sibling struct, not a struct extension** (deviation from
+// the dossier §4 iter-3 line 511 sketch):
+//   * The brief explicitly forbids touching `forward_prefill.rs`,
+//     `forward_prefill_batched.rs`, and `forward_gpu.rs` (constraint
+//     #8).  Adding required fields to `HbKvBuffers` would break the
+//     3 inline struct-literal alloc sites (Rust requires every public
+//     field to be initialised in a `Struct { .. }` literal).  The
+//     wrapper approach honours every brief constraint AND mirrors
+//     Qwen35's pattern where `HybridKvCache` is the multi-seq
+//     aggregate distinct from the per-layer buffer primitive.
+//   * Sequencing: Phase B4c will refactor the 3 alloc sites to
+//     emit `MultiSeqHbKvBuffers` via `alloc_hb_kv_for_layer`.  At
+//     that point `HbKvBuffers` becomes pure legacy and the sites
+//     simply produce the 4-D buffer through the unified helper.
+//
+// Scope (per dossier §4 iter-3):
+//   * HbKvBuffers analogue with n_seqs as the OUTERMOST axis on
+//     k_packed/v_packed (`[n_seqs, nkv, cap, hd]`) and k_norms/
+//     v_norms (`[n_seqs, nkv, cap, norms_per_pos]`).
+//   * Per-seq cursor `seq_lens: Vec<u32>` of length n_seqs.
+//   * MultiSeqKvCache impl mirroring the Qwen35 A2a pattern at
+//     `src/inference/models/qwen35/kv_cache.rs:2579-2780`.
+//
+// DEFERRED to A3b per dossier R3 + H10 outcome:
+//   * MlxKvCache n_seqs lift (legacy 4-bit path)
+//   * DenseKvBuffers n_seqs lift (HF2Q_USE_DENSE=1 path)
+//   * HybridKvBuffers n_seqs lift (HF2Q_HYBRID_KV path — the H10
+//     hypothesis was FALSIFIED: this env var is default-ON per
+//     `src/debug/investigation_env.rs:878`, so HybridKvBuffers is
+//     the actual production default since ADR-029 iter-13.  Lifting
+//     it stays in A3b regardless, but A3b is now *higher* priority
+//     than the brief framing suggested — the dossier §2.2.2 claim
+//     that HbKvBuffers is the production default reflects a
+//     pre-ADR-029-iter-13 reality.  Both variants need the lift
+//     before C2c can ship a SlotAware engine for Gemma 4.)
+//
+// DEFERRED to A3c per dossier R5 (mirrors Qwen35 A2c):
+//   * fork_seq cross-slot kernel dispatch (same-buffer cross-region
+//     memcpy via `dispatch_kv_cache_copy_seq_*` between slot byte
+//     offsets).  iter-A3a returns `CapabilityUnsupported` with a
+//     label naming the deferred A3c arc — same shape as Qwen35's
+//     iter-2.5 M1 closure.
+//
+// LayoutNotSupported is NEVER returned: MultiSeqHbKvBuffers only
+// supports SeparateSlots, and Paged is an alternate construction
+// that this type does not expose.  Bounds-first ordering per
+// iter-1.5 cfa-finding-F5 is preserved across all four methods.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Multi-seq variant of [`HbKvBuffers`] — ADR-040 Phase A3a.
+///
+/// Outermost axis on every buffer is `n_seqs`.  Buffer layouts:
+/// - K/V packed: `[n_seqs, nkv_heads, capacity, head_dim]` U8 (1 byte/elem)
+/// - K/V norms:  `[n_seqs, nkv_heads, capacity, norms_per_pos]` F32
+///
+/// Per-seq cursor [`seq_lens`](Self::seq_lens) is `Vec<u32>` of length
+/// `n_seqs` (parallel to Qwen35 `FullAttnKvSlot::current_len`).  A
+/// per-slot byte offset for kernel writes is
+/// `slot.0 * nkv * cap * hd` (packed) / `slot.0 * nkv * cap * norms_per_pos *
+/// 4` (norms) — Phase B4c will thread this through the 3 existing
+/// `dispatch_hadamard_quantize_kv_hb_*` callers via `MlxBuffer::slice_view`,
+/// the same primitive Qwen35 B4a-cont uses.
+///
+/// Per dossier H7 verification (production Gemma 4 has mixed
+/// `LayerType::Full` + `LayerType::Sliding` layers per
+/// `src/inference/models/gemma4/model.rs:1250`), `is_sliding` is
+/// recorded on this struct just like the legacy `HbKvBuffers`; the
+/// per-slot ring-wrap math stays within each slot's region by
+/// construction (n_seqs is outermost, so slot N's `capacity` window
+/// is contiguous and disjoint from slot M's).
+pub struct MultiSeqHbKvBuffers {
+    /// Number of physical slots — the outermost axis on every buffer.
+    /// Set at construction via [`alloc_hb_kv_for_layer`]; once set,
+    /// cannot change without reallocation.
+    pub n_seqs: u32,
+    /// Byte-packed K indices `[n_seqs, nkv_heads, capacity, head_dim]` U8.
+    pub k_packed: MlxBuffer,
+    /// K per-position norms `[n_seqs, nkv_heads, capacity, norms_per_pos]` F32.
+    pub k_norms: MlxBuffer,
+    /// Byte-packed V indices `[n_seqs, nkv_heads, capacity, head_dim]` U8.
+    pub v_packed: MlxBuffer,
+    /// V per-position norms `[n_seqs, nkv_heads, capacity, norms_per_pos]` F32.
+    pub v_norms: MlxBuffer,
+    /// Cache capacity in positions (same as the legacy [`HbKvBuffers`]).
+    pub capacity: usize,
+    /// True if ring-buffer (sliding) semantics.
+    pub is_sliding: bool,
+    /// Norms per position (1 for D=256, 2 for D=512).
+    #[allow(dead_code)]
+    pub norms_per_pos: usize,
+    /// Per-seq write cursor; `seq_lens[slot.0]` is the number of valid
+    /// positions stored in slot `slot.0`.  `len() == n_seqs as usize`
+    /// by construction (see [`alloc_hb_kv_for_layer`]).  Mirrors
+    /// Qwen35's `FullAttnKvSlot::current_len` discipline.
+    pub seq_lens: Vec<u32>,
+}
+
+/// ADR-040 Phase A3a iter-3 — unified [`MultiSeqHbKvBuffers`] allocator.
+///
+/// **Why this helper exists** (dossier H8):
+/// The 3 production HbKvBuffers alloc sites
+/// (`src/serve/forward_prefill.rs:843-882`,
+/// `src/serve/forward_prefill_batched.rs:443-475`,
+/// `src/inference/models/gemma4/forward_gpu.rs:443-459`) currently
+/// duplicate the per-layer buffer shape formula inline.  Phase B4c
+/// will refactor those 3 sites to call this helper; A3a ships the
+/// helper now so the multi-seq buffer-allocation pattern lands in
+/// a single place, eliminating drift risk per dossier H8.
+///
+/// Mirrors [`alloc_hybrid_kv_for_layer`] (same file, line 218) in
+/// signature shape; the extra `n_seqs` parameter is the lift this
+/// helper introduces.
+///
+/// At `n_seqs=1` the byte counts are identical to the 3 sites'
+/// inline allocs (`nkv * cap * hd` packed + `nkv * cap *
+/// norms_per_pos * 4` norms); the only observable shape difference
+/// is the leading dimension on every buffer (`[1, nkv, cap, hd]` vs
+/// `[nkv, cap, hd]`).  The H8 test pins this byte-equivalence.
+///
+/// # Errors
+///
+/// Returns `Err` for `n_seqs == 0`, `nkv == 0`, `hd == 0`, or
+/// `cap == 0` — buffer alloc would otherwise underflow the kernel's
+/// shape preconditions.  Mirrors `alloc_tq_full_attn_buffers`
+/// (Qwen35 `kv_cache.rs:2399-2408`) defensive pre-flight.
+pub fn alloc_hb_kv_for_layer(
+    dev: &MlxDevice,
+    layer_idx: usize,
+    nkv: usize,
+    hd: usize,
+    cap: usize,
+    is_ring: bool,
+    n_seqs: u32,
+) -> Result<MultiSeqHbKvBuffers> {
+    if n_seqs == 0 {
+        return Err(anyhow!(
+            "alloc_hb_kv_for_layer L{layer_idx}: n_seqs must be > 0"
+        ));
+    }
+    if nkv == 0 || hd == 0 || cap == 0 {
+        return Err(anyhow!(
+            "alloc_hb_kv_for_layer L{layer_idx}: nkv/hd/cap must be > 0 \
+             (got nkv={nkv}, hd={hd}, cap={cap})"
+        ));
+    }
+    let norms_per_pos = (hd / 256).max(1);
+    let n = n_seqs as usize;
+
+    // Packed: [n_seqs, nkv, cap, hd] U8 (1 byte/elem).  Outer n_seqs
+    // matches Qwen35 `alloc_tq_full_attn_buffers` convention
+    // (`kv_cache.rs:2421-2426`), keeping per-slot byte offsets
+    // contiguous and addressable as `slot.0 * (nkv*cap*hd)` for the
+    // kernel-dispatcher slot-offset work in Phase B4c.
+    let packed_bytes = n * nkv * cap * hd; // U8 → 1 byte/elem
+    let packed_shape = vec![n, nkv, cap, hd];
+
+    // Norms: [n_seqs, nkv, cap, norms_per_pos] F32.  norms_per_pos=1
+    // (D=256) collapses to an effective 3-D `[n, nkv, cap]` at the
+    // kernel level (consistent with the legacy 3-D `vec![nkv, cap]`
+    // form when n_seqs=1 + norms_per_pos=1); we keep the 4-D shape
+    // here so cfg-shape validation is unambiguous (every dim is
+    // explicit, matching the Qwen35 norms-shape pin at
+    // `kv_cache.rs:2437-2442`).
+    let norms_elems = n * nkv * cap * norms_per_pos;
+    let norms_bytes = norms_elems * std::mem::size_of::<f32>();
+    let norms_shape = vec![n, nkv, cap, norms_per_pos];
+
+    let mut k_packed = dev
+        .alloc_buffer(packed_bytes, DType::U8, packed_shape.clone())
+        .map_err(|e| anyhow!("hb_kv L{layer_idx} K packed: {e}"))?;
+    let mut k_norms = dev
+        .alloc_buffer(norms_bytes, DType::F32, norms_shape.clone())
+        .map_err(|e| anyhow!("hb_kv L{layer_idx} K norms: {e}"))?;
+    let mut v_packed = dev
+        .alloc_buffer(packed_bytes, DType::U8, packed_shape)
+        .map_err(|e| anyhow!("hb_kv L{layer_idx} V packed: {e}"))?;
+    let mut v_norms = dev
+        .alloc_buffer(norms_bytes, DType::F32, norms_shape)
+        .map_err(|e| anyhow!("hb_kv L{layer_idx} V norms: {e}"))?;
+
+    // Zero-init mirrors `alloc_tq_full_attn_buffers` discipline
+    // (Qwen35 `kv_cache.rs:2460-2471`): defend against StorageModeShared
+    // returning recycled non-zero memory (ADR-015 iter61a).
+    if let Ok(s) = k_packed.as_mut_slice::<u8>() {
+        s.fill(0);
+    }
+    if let Ok(s) = v_packed.as_mut_slice::<u8>() {
+        s.fill(0);
+    }
+    if let Ok(s) = k_norms.as_mut_slice::<f32>() {
+        s.fill(0.0);
+    }
+    if let Ok(s) = v_norms.as_mut_slice::<f32>() {
+        s.fill(0.0);
+    }
+
+    Ok(MultiSeqHbKvBuffers {
+        n_seqs,
+        k_packed,
+        k_norms,
+        v_packed,
+        v_norms,
+        capacity: cap,
+        is_sliding: is_ring,
+        norms_per_pos,
+        seq_lens: vec![0u32; n],
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// ADR-040 Phase A3a iter-3 — MultiSeqKvCache impl for MultiSeqHbKvBuffers.
+//
+// Mirrors the Qwen35 A2a impl at `src/inference/models/qwen35/kv_cache.rs:
+// 2579-2780` in structure (bounds-first per iter-1.5 cfa-finding-F5;
+// fork_seq returns `CapabilityUnsupported` per iter-2.5 M1) and in
+// invariants (per-slot cursor isolation; drop_seq does NOT zero the
+// underlying buffer bytes — Phase B4c will reuse the slot's region on
+// next admission; recurrent-content invariance is the per-slot
+// analogue of Qwen35 M4).
+//
+// Phase A3a scope: per-slot CURSOR bookkeeping only.  GPU buffer
+// content writes land via the 3 existing alloc sites' `dispatch_
+// hadamard_quantize_kv_hb_*` callers at Phase B4c; iter-A3a's trait
+// surface mutates `seq_lens[slot.0]` and validates bounds.  This
+// matches the dossier R2 mitigation: the per-cache trait owns the
+// cursor; the forward-path slot threading is a separate phase.
+// ──────────────────────────────────────────────────────────────────────────
+
+impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHbKvBuffers {
+    fn layout(&self) -> crate::serve::multi_seq_kv::MultiSeqLayout {
+        crate::serve::multi_seq_kv::MultiSeqLayout::SeparateSlots
+    }
+
+    fn slot_count(&self) -> u32 {
+        // `MultiSeqHbKvBuffers::n_seqs` is already `u32` (see struct
+        // definition above); no cast.
+        self.n_seqs
+    }
+
+    fn seq_len(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<u32, crate::serve::multi_seq_kv::MultiSeqError> {
+        // 1. Bounds FIRST (iter-1.5 cfa-finding-F5 ordering).
+        if slot.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // 2. Layout: SeparateSlots only — MultiSeqHbKvBuffers does
+        //    not expose Paged.
+        // 3. Return the per-seq cursor directly; `seq_lens.len() ==
+        //    n_seqs` by construction (alloc_hb_kv_for_layer).  Unlike
+        //    Qwen35's multi-layer canonical-from-`full_attn[0]` read,
+        //    this is a per-layer struct — there is exactly one cursor
+        //    per slot per buffer, no canonical-vs-per-layer
+        //    homogeneity concern, no debug_assert needed.
+        Ok(self.seq_lens[slot.0 as usize])
+    }
+
+    fn append_for_seq(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        n_tokens: u32,
+    ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
+        // 1. Bounds FIRST (iter-1.5 cfa-finding-F5).
+        if slot.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // 2. Layout: SeparateSlots only.
+        // 3. Budget: SeparateSlots cannot SlotOom on append (buffers
+        //    are pre-allocated at construction; cursor overflow is
+        //    bounded by `capacity` and protected by `saturating_add`).
+        //
+        // ADR-040 Phase A3a scope: bump the per-seq cursor.  The
+        // underlying k_packed / v_packed / norms bytes for slot
+        // `slot.0` are written by the kernel dispatcher at Phase B4c
+        // via `MlxBuffer::slice_view(byte_offset, n_elements)` (same
+        // primitive Qwen35 B4a-cont uses).
+        let cur = &mut self.seq_lens[slot.0 as usize];
+        *cur = cur.saturating_add(n_tokens);
+        Ok(())
+    }
+
+    fn drop_seq(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
+        // 1. Bounds FIRST.
+        if slot.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // 2. Layout: SeparateSlots only — no LayoutNotSupported.
+        // 3. Budget: drop is a pure release; SlotOom unreachable.
+        //
+        // ADR-040 Phase A3a scope: cursor-only reset.  The underlying
+        // K/V bytes are NOT zeroed; the next `append_for_seq` into
+        // this slot will overwrite them via the kernel dispatcher at
+        // Phase B4c.  This matches Qwen35 A2a's discipline (the
+        // `qwen35_hybrid_kv_drop_does_not_zero_recurrent_buffer_a2a`
+        // pin at `qwen35/kv_cache.rs:6949+` — recurrent-content
+        // invariance under drop_seq).
+        self.seq_lens[slot.0 as usize] = 0;
+        Ok(())
+    }
+
+    fn fork_seq(
+        &mut self,
+        src: crate::serve::multi_seq_kv::SlotId,
+        dst: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
+        // 1. Bounds — src FIRST per iter-1.5 cfa-finding-F5 (so a
+        //    fully invalid `(src, dst)` pair surfaces src as the OOR
+        //    victim deterministically; matches the trait doc + the
+        //    NoopMultiSeqKvCache fixture-parity contract).
+        if src.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot: src,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        if dst.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot: dst,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // 2. Layout: SeparateSlots only — no LayoutNotSupported.
+        // 3. Same-slot fork is a no-op per trait spec.
+        if src == dst {
+            return Ok(());
+        }
+        // ADR-040 Phase A3c deferred (parallel to Qwen35 A2c per
+        // dossier R5): cross-slot fork requires same-buffer
+        // cross-region memcpy via `dispatch_kv_cache_copy_seq_*`
+        // between slot byte offsets on the same underlying buffer.
+        // That kernel-pattern + its own unit-test arc are scheduled
+        // for A3c once the kernel arc lands on Qwen35 A2c (the same
+        // dispatcher works for both arches; one kernel call serves
+        // both per dossier §2.3.3).
+        //
+        // **Mantra-aligned (iter-2.5 M1)**: surfaces as
+        // `CapabilityUnsupported` (HTTP 501 upstream) — NOT
+        // `SlotOom { 0, 0 }` (HTTP 429), which would lie about the
+        // capacity freeing up.  When Phase A3c ships the real
+        // kernel dispatch, this branch flips to `Ok(())` + per-buffer
+        // byte-equality assertion (write-to-src → fork → read-from-dst
+        // = write-to-src-and-dst-directly), matching Qwen35 A2c's
+        // ceremony.
+        Err(
+            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: "fork_seq cross-slot copy (Gemma 4 MultiSeqHbKvBuffers; deferred to Phase A3c per ADR-040 §6 + dossier R5)",
+            },
+        )
+    }
 }
 
 /// Per-layer dense F32/F16 KV buffers for dense attention path (ADR-009).
@@ -462,5 +855,728 @@ mod tests {
         // D=512: norms_per_pos == 2.
         let buf512 = alloc_hybrid_kv_for_layer(&dev, 0, 2, 512, 4, false).unwrap();
         assert_eq!(buf512.norms_per_pos, 2);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // ADR-040 Phase A3a iter-3 — multi-seq lift hypotheses + trait impl
+    // tests.  See `docs/research/adr040-kv-cache-lift-dossier-2026-05-23.md`
+    // §2.9 for H6–H10 falsification statements.
+    //
+    // Order mirrors the dossier §4 iter-3 sequencing + the Qwen35 A2a
+    // test block layout at `src/inference/models/qwen35/kv_cache.rs:
+    // 6176-7115`:
+    //   H6 (allocator byte-scale + multi-seq via offset)  — must PASS
+    //                                                        before the
+    //                                                        `impl
+    //                                                        MultiSeqKvCache`
+    //                                                        block is
+    //                                                        trusted.
+    //   H7 (sliding-window per-slot isolation)            — pins ring-
+    //                                                        buffer
+    //                                                        independence.
+    //   H8 (alloc helper byte-equivalence vs inline)      — pins drift-
+    //                                                        risk
+    //                                                        elimination
+    //                                                        for B4c.
+    //   Trait-surface pins (slot_count, OOR, drop, fork-  — exercise
+    //     to-self, fork cross-slot deferral, append          methods
+    //     isolation, layout discriminant, append-only-       directly.
+    //     target, drop-content-invariance).
+    //   M5-equivalent shape pin                            — pins n_seqs
+    //                                                        axis position.
+    //
+    // H9 (mixed Gemma 4 layer_types) is a HYPOTHESIS-ONLY pin: production
+    // Gemma 4 has mixed `LayerType::Full` + `LayerType::Sliding` per
+    // `src/inference/models/gemma4/model.rs:1250`, but this struct lift
+    // is per-layer-agnostic (the struct stores `is_sliding` and the lift
+    // applies to both branches uniformly).  Verified by code-reading;
+    // no synthetic test fixture required.
+    //
+    // H10 status: FALSIFIED.  `HF2Q_HYBRID_KV` is default-ON since
+    // ADR-029 iter-13 per `src/debug/investigation_env.rs:878` (the
+    // dossier's pre-iter-13 assumption that the production default
+    // was HbKvBuffers is stale).  This raises A3b's priority but does
+    // NOT block A3a: HbKvBuffers is still reached on the
+    // `HF2Q_HYBRID_KV=0` opt-out path, and the multi-seq lift here
+    // is a structural prerequisite for the HybridKvBuffers lift in
+    // A3b regardless of which variant is the production default.
+    // See the §2.10 R3 mitigation in the dossier — the brief's
+    // "defer to A3b" framing stays intact.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Test-imports for the trait-surface pins.  Pulled into the test
+    /// module rather than the parent module so production code carries
+    /// no test-only imports.
+    use crate::serve::multi_seq_kv::{
+        MultiSeqError, MultiSeqKvCache as _, MultiSeqLayout, SlotId,
+    };
+
+    /// Dossier §2.9 H6 falsifier — extending `HbKvBuffers` (here as the
+    /// sibling [`MultiSeqHbKvBuffers`] per the brief-deviation rationale
+    /// documented at the struct definition) to carry `n_seqs` outermost
+    /// requires no kernel changes IF the kernel-side write address is
+    /// derivable from `(n_seqs, cache_capacity, write_pos)` via byte
+    /// arithmetic at the caller.
+    ///
+    /// This iter-3 H6 pin checks the **allocator side** of that claim:
+    /// the 4-D buffers at n_seqs=4 must have exactly 4× the bytes of
+    /// their n_seqs=1 counterparts (k_packed, v_packed, k_norms,
+    /// v_norms).  Per-slot byte offset = `slot.0 * (nkv*cap*hd)`
+    /// packed / `slot.0 * (nkv*cap*norms_per_pos*4)` norms — the
+    /// alloc multiplies by `n` in the helper.
+    ///
+    /// Phase B4c will verify the kernel-side half (write to slot 1
+    /// via byte-offset Q/K dispatch, read back slot 0 unchanged); A3a
+    /// owns the alloc-side byte-equivalence which is the falsifier
+    /// for the dossier H6 structural claim.
+    ///
+    /// Falsifier (any one ⇒ H6 broken):
+    /// 1. `alloc_hb_kv_for_layer(.., n_seqs=4)` panics or errors.
+    /// 2. K-packed at n_seqs=4 is NOT exactly 4× n_seqs=1 baseline.
+    /// 3. V-packed at n_seqs=4 is NOT exactly 4×.
+    /// 4. K-norms at n_seqs=4 is NOT exactly 4×.
+    /// 5. V-norms at n_seqs=4 is NOT exactly 4×.
+    /// 6. `seq_lens.len() != n_seqs`.
+    #[test]
+    fn h6_hb_kv_buffers_n_seqs_4_byte_scale() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        // Per dossier H6: shape choices identical to existing
+        // alloc_hybrid_kv_for_layer test fixtures (nkv=2, hd=256,
+        // cap=8) so the byte-count formula matches what production
+        // sees at the 3 inline alloc sites.
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 8usize;
+        let baseline = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, 1)
+            .expect("H6: alloc at n_seqs=1");
+        let lifted = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, 4)
+            .expect("H6: alloc at n_seqs=4");
+
+        // n_seqs field propagated.
+        assert_eq!(baseline.n_seqs, 1, "H6: baseline n_seqs=1");
+        assert_eq!(lifted.n_seqs, 4, "H6: lifted n_seqs=4");
+
+        // Falsifier 2: K-packed 4×.
+        assert_eq!(
+            lifted.k_packed.byte_len(),
+            baseline.k_packed.byte_len() * 4,
+            "H6 FALSIFIED: k_packed does not scale 4× ({} != {} * 4 = {})",
+            lifted.k_packed.byte_len(),
+            baseline.k_packed.byte_len(),
+            baseline.k_packed.byte_len() * 4
+        );
+        // Falsifier 3: V-packed 4×.
+        assert_eq!(
+            lifted.v_packed.byte_len(),
+            baseline.v_packed.byte_len() * 4,
+            "H6 FALSIFIED: v_packed does not scale 4× ({} != {} * 4 = {})",
+            lifted.v_packed.byte_len(),
+            baseline.v_packed.byte_len(),
+            baseline.v_packed.byte_len() * 4
+        );
+        // Falsifier 4: K-norms 4×.
+        assert_eq!(
+            lifted.k_norms.byte_len(),
+            baseline.k_norms.byte_len() * 4,
+            "H6 FALSIFIED: k_norms does not scale 4× ({} != {})",
+            lifted.k_norms.byte_len(),
+            baseline.k_norms.byte_len() * 4
+        );
+        // Falsifier 5: V-norms 4×.
+        assert_eq!(
+            lifted.v_norms.byte_len(),
+            baseline.v_norms.byte_len() * 4,
+            "H6 FALSIFIED: v_norms does not scale 4×"
+        );
+
+        // Falsifier 6: per-seq cursor vec length tracks n_seqs.
+        assert_eq!(baseline.seq_lens.len(), 1, "H6: baseline seq_lens.len()");
+        assert_eq!(lifted.seq_lens.len(), 4, "H6: lifted seq_lens.len()");
+        // All cursors start at 0.
+        assert!(
+            baseline.seq_lens.iter().all(|&x| x == 0),
+            "H6: baseline seq_lens initialized to 0"
+        );
+        assert!(
+            lifted.seq_lens.iter().all(|&x| x == 0),
+            "H6: lifted seq_lens initialized to 0"
+        );
+    }
+
+    /// Dossier §2.9 H7 falsifier — Gemma 4's sliding-window path
+    /// (is_sliding=true ring buffer) is per-slot isolated: a write to
+    /// slot 0's region must NOT touch slot 1's bytes.
+    ///
+    /// At Phase A3a the kernel-dispatcher slot-offset routing is not
+    /// yet wired (Phase B4c scope per the brief's NOTE under Step 3),
+    /// so this test verifies isolation at the **buffer-region level**
+    /// via direct host-side writes: write a deterministic pattern
+    /// into slot 1's K/V regions, advance slot 0's cursor (no buffer
+    /// mutation in A3a), assert slot 1's bytes are unchanged.
+    ///
+    /// This pins the structural precondition Phase B4c will rely on:
+    /// the per-slot byte-offset formula
+    /// `slot.0 * (nkv*cap*hd)` produces disjoint contiguous regions
+    /// for sliding AND linear caches identically (the `is_sliding`
+    /// flag only changes the kernel's wrap-on-write behaviour
+    /// WITHIN a slot, not the inter-slot byte offset).
+    ///
+    /// Falsifier: any byte change in slot 1's K/V region after the
+    /// slot-0 cursor advance ⇒ H7 broken; per-slot isolation
+    /// assumption invalid.
+    #[test]
+    fn h7_hb_kv_sliding_per_slot_isolation() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 4usize; // small ring for a sliding cache
+        // is_ring=true mirrors Gemma 4 LayerType::Sliding allocation
+        // (forward_prefill.rs:847-861 sliding-layer branch).
+        let mut cache = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, true, 2)
+            .expect("H7: alloc n_seqs=2 sliding");
+        assert!(cache.is_sliding, "H7: sliding flag propagated");
+        assert_eq!(cache.n_seqs, 2);
+
+        // Per-slot region size for K/V packed: nkv * cap * hd bytes (U8).
+        let slot_packed = nkv * cap * hd;
+        let total_packed = cache.k_packed.byte_len();
+        assert_eq!(
+            total_packed,
+            2 * slot_packed,
+            "H7 fixture sanity: total bytes = 2 * slot_packed"
+        );
+
+        // Write a deterministic non-zero pattern into slot 1's K and
+        // V packed regions (offsets [slot_packed .. 2*slot_packed)).
+        {
+            let k_slice = cache
+                .k_packed
+                .as_mut_slice::<u8>()
+                .expect("k_packed u8 mut");
+            for (i, b) in k_slice[slot_packed..2 * slot_packed].iter_mut().enumerate() {
+                // Pattern: position-dependent so a partial-zero bug
+                // (zero only first N bytes of slot 1) surfaces.
+                *b = ((i % 251) + 1) as u8;
+            }
+            // Slot 0 region intentionally left at the zero-init from
+            // alloc_hb_kv_for_layer — proves slot 0's region is
+            // untouched by the slot-1 write.
+        }
+        {
+            let v_slice = cache
+                .v_packed
+                .as_mut_slice::<u8>()
+                .expect("v_packed u8 mut");
+            for (i, b) in v_slice[slot_packed..2 * slot_packed].iter_mut().enumerate() {
+                *b = ((i % 253) + 1) as u8;
+            }
+        }
+
+        // Snapshot slot 1's bytes for later comparison.
+        let k_slot1_before: Vec<u8> = cache
+            .k_packed
+            .as_slice::<u8>()
+            .expect("k_packed u8")
+            [slot_packed..2 * slot_packed]
+            .to_vec();
+        let v_slot1_before: Vec<u8> = cache
+            .v_packed
+            .as_slice::<u8>()
+            .expect("v_packed u8")
+            [slot_packed..2 * slot_packed]
+            .to_vec();
+        // Sanity: slot 0 region is all-zero before the cursor advance.
+        let k_slot0_before: Vec<u8> = cache
+            .k_packed
+            .as_slice::<u8>()
+            .expect("k_packed u8")
+            [0..slot_packed]
+            .to_vec();
+        assert!(
+            k_slot0_before.iter().all(|&b| b == 0),
+            "H7 fixture sanity: slot 0 K region zero-init"
+        );
+
+        // A3a-scope cursor advance on slot 0.  Per the brief's NOTE
+        // under Step 3, kernel-dispatch slot-offset routing is B4c
+        // scope; A3a's trait surface only mutates `seq_lens[0]`.
+        cache
+            .append_for_seq(SlotId(0), 3)
+            .expect("H7: append slot 0 cursor");
+        assert_eq!(cache.seq_lens[0], 3, "H7: slot 0 cursor advanced");
+        assert_eq!(cache.seq_lens[1], 0, "H7: slot 1 cursor untouched");
+
+        // H7 falsifier: slot 1's K/V bytes must be byte-identical to
+        // the snapshot taken before the slot-0 cursor advance.
+        let k_slot1_after: Vec<u8> = cache
+            .k_packed
+            .as_slice::<u8>()
+            .expect("k_packed u8")
+            [slot_packed..2 * slot_packed]
+            .to_vec();
+        let v_slot1_after: Vec<u8> = cache
+            .v_packed
+            .as_slice::<u8>()
+            .expect("v_packed u8")
+            [slot_packed..2 * slot_packed]
+            .to_vec();
+        assert_eq!(
+            k_slot1_before, k_slot1_after,
+            "H7 FALSIFIED: slot 1's k_packed bytes changed after slot-0 \
+             cursor advance — per-slot isolation invariant broken"
+        );
+        assert_eq!(
+            v_slot1_before, v_slot1_after,
+            "H7 FALSIFIED: slot 1's v_packed bytes changed after slot-0 \
+             cursor advance"
+        );
+    }
+
+    /// Dossier §2.9 H8 falsifier — `alloc_hb_kv_for_layer(.., n_seqs=1)`
+    /// produces byte counts byte-equivalent to the 3 inline alloc sites
+    /// (`forward_prefill.rs:843-882`, `forward_prefill_batched.rs:443-475`,
+    /// `forward_gpu.rs:443-459`), eliminating drift risk for Phase B4c's
+    /// refactor.
+    ///
+    /// The 3 sites' formula is:
+    ///   k_packed_bytes = nkv * cap * hd       (U8 → 1 byte/elem)
+    ///   v_packed_bytes = same
+    ///   norms_bytes    = nkv * cap * norms_per_pos * 4 (F32)
+    ///   where norms_per_pos = (hd / 256).max(1)
+    ///
+    /// At n_seqs=1 the helper's formula multiplies by n=1, producing
+    /// identical byte counts.  Shape differs trivially (4-D
+    /// `[1, nkv, cap, hd]` vs 3-D `[nkv, cap, hd]`) — this is the
+    /// observable difference Phase B4c documents when wiring the
+    /// helper into the 3 sites.
+    ///
+    /// Falsifier: any byte-count mismatch ⇒ H8 broken; B4c refactor
+    /// would silently change buffer sizes.
+    #[test]
+    fn h8_alloc_hb_kv_for_layer_byte_equivalent_to_pre_refactor() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 8usize;
+        let norms_per_pos = (hd / 256).max(1);
+
+        // The 3 inline alloc sites' byte formula (verbatim from
+        // forward_prefill.rs:864-875).
+        let expected_packed_bytes = nkv * cap * hd; // U8
+        let expected_norms_bytes = nkv * cap * norms_per_pos * std::mem::size_of::<f32>();
+
+        let helper = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, 1)
+            .expect("H8: helper at n_seqs=1");
+
+        // K/V packed bytes match the inline formula.
+        assert_eq!(
+            helper.k_packed.byte_len(),
+            expected_packed_bytes,
+            "H8 FALSIFIED: k_packed bytes diverge from inline formula \
+             ({} != {})",
+            helper.k_packed.byte_len(),
+            expected_packed_bytes
+        );
+        assert_eq!(
+            helper.v_packed.byte_len(),
+            expected_packed_bytes,
+            "H8 FALSIFIED: v_packed bytes diverge from inline formula"
+        );
+
+        // K/V norms bytes match.
+        assert_eq!(
+            helper.k_norms.byte_len(),
+            expected_norms_bytes,
+            "H8 FALSIFIED: k_norms bytes diverge from inline formula \
+             ({} != {})",
+            helper.k_norms.byte_len(),
+            expected_norms_bytes
+        );
+        assert_eq!(
+            helper.v_norms.byte_len(),
+            expected_norms_bytes,
+            "H8 FALSIFIED: v_norms bytes diverge from inline formula"
+        );
+
+        // Shape difference is the documented observable: 4-D vs 3-D.
+        // Helper at n_seqs=1 yields `[1, nkv, cap, hd]`; the inline
+        // sites use `[nkv, cap, hd]`.  Phase B4c notes this in the
+        // refactor diff — the byte count is invariant, the shape rank
+        // changes from 3 to 4 with the leading 1.
+        assert_eq!(
+            helper.k_packed.shape(),
+            &[1, nkv, cap, hd],
+            "H8: helper k_packed shape includes leading n_seqs=1 axis"
+        );
+        // Also verify norms_per_pos branch matches.
+        assert_eq!(helper.norms_per_pos, norms_per_pos);
+        assert_eq!(helper.capacity, cap);
+    }
+
+    /// M5-equivalent shape proof for [`MultiSeqHbKvBuffers`] — pins
+    /// `n_seqs` as the OUTERMOST axis on every buffer (shape[0]).
+    /// Mirrors Qwen35 H1's M5 strengthening at `qwen35/kv_cache.rs:
+    /// 6345-6474`.
+    ///
+    /// Falsifier: any buffer where shape[0] != n_seqs ⇒ per-slot
+    /// byte-offset arithmetic at the caller (Phase B4c) would index
+    /// the wrong slot, silently corrupting the cache.  byte_len()
+    /// alone cannot catch this (n_seqs and another axis can swap
+    /// without changing the product).
+    #[test]
+    fn gemma4_hb_kv_n_seqs_outermost_axis() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let cache_1 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 1)
+            .expect("alloc n_seqs=1");
+        let cache_4 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
+            .expect("alloc n_seqs=4");
+
+        // All 4 buffers must be 4-D with n_seqs at shape[0].
+        for (name, b1, b4) in [
+            ("k_packed", &cache_1.k_packed, &cache_4.k_packed),
+            ("v_packed", &cache_1.v_packed, &cache_4.v_packed),
+            ("k_norms", &cache_1.k_norms, &cache_4.k_norms),
+            ("v_norms", &cache_1.v_norms, &cache_4.v_norms),
+        ] {
+            let s1 = b1.shape().to_vec();
+            let s4 = b4.shape().to_vec();
+            assert_eq!(
+                s1.len(),
+                4,
+                "M5: {name} (n_seqs=1) must be 4-D; got {:?}",
+                s1
+            );
+            assert_eq!(
+                s4.len(),
+                4,
+                "M5: {name} (n_seqs=4) must be 4-D; got {:?}",
+                s4
+            );
+            assert_eq!(
+                s1[0], 1,
+                "M5: {name} baseline shape[0] must be n_seqs=1; got {:?}",
+                s1
+            );
+            assert_eq!(
+                s4[0], 4,
+                "M5 FALSIFIED: {name} shape[0] must be n_seqs=4 \
+                 (n_seqs landed on wrong axis); got {:?}",
+                s4
+            );
+            // Non-n_seqs dims invariant — catches axis permutation.
+            assert_eq!(
+                &s4[1..],
+                &s1[1..],
+                "M5 FALSIFIED: {name} non-n_seqs dims diverge between \
+                 n_seqs=1 ({:?}) and n_seqs=4 ({:?})",
+                s1,
+                s4
+            );
+        }
+    }
+
+    /// Pin: `slot_count()` returns the constructor's `n_seqs` verbatim.
+    /// Falsifies any future refactor that introduces a u32→u64 cast or
+    /// silently caps the value.  Mirrors `qwen35_hybrid_kv_slot_count_
+    /// matches_n_seqs` (qwen35/kv_cache.rs:6669-6677).
+    #[test]
+    fn gemma4_hb_kv_slot_count_matches_n_seqs() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let c1 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 1)
+            .expect("alloc 1");
+        let c4 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
+            .expect("alloc 4");
+        assert_eq!(c1.slot_count(), 1);
+        assert_eq!(c4.slot_count(), 4);
+    }
+
+    /// Pin: `layout()` returns `SeparateSlots`.  MultiSeqHbKvBuffers
+    /// does not expose Paged — bounds-first ordering means this trip
+    /// is only observable through this getter.
+    #[test]
+    fn gemma4_hb_kv_layout_is_separate_slots() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
+            .expect("alloc");
+        assert_eq!(c.layout(), MultiSeqLayout::SeparateSlots);
+    }
+
+    /// Pin (iter-1.5 cfa-finding-F5): out-of-range `SlotId` surfaces as
+    /// `SlotOutOfRange { slot, max_slots }` with both fields populated
+    /// across every trait method — bounds-first ordering preserved.
+    /// Mirrors `qwen35_hybrid_kv_slot_out_of_range_errors_named`
+    /// (qwen35/kv_cache.rs:6695-6721).
+    #[test]
+    fn gemma4_hb_kv_slot_out_of_range_errors_named() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
+            .expect("alloc");
+
+        // seq_len OOR
+        let err = c.seq_len(SlotId(4)).expect_err("slot 4 OOR for n_seqs=4");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 }
+        );
+        let err = c.seq_len(SlotId(99)).expect_err("slot 99 OOR");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
+        );
+
+        // append_for_seq OOR
+        let err = c.append_for_seq(SlotId(4), 1).expect_err("append OOR");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 }
+        );
+
+        // drop_seq OOR
+        let err = c.drop_seq(SlotId(4)).expect_err("drop OOR");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 }
+        );
+
+        // fork_seq src OOR FIRST (deterministic per fixture-parity).
+        let err = c.fork_seq(SlotId(4), SlotId(5)).expect_err("fork: src OOR first");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 }
+        );
+        // fork_seq src valid, dst OOR.
+        let err = c.fork_seq(SlotId(0), SlotId(4)).expect_err("fork: dst OOR");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 }
+        );
+    }
+
+    /// Pin: `append_for_seq` advances ONLY the named slot's cursor.
+    /// Surface-level isolation evidence for H6's per-slot O(1) bound
+    /// (the per-buffer GPU write isolation lands in Phase B4c).
+    /// Mirrors `qwen35_hybrid_kv_append_advances_target_slot_only`
+    /// (qwen35/kv_cache.rs:6727-6745).
+    #[test]
+    fn gemma4_hb_kv_append_advances_target_slot_only() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
+            .expect("alloc");
+        // All slots start at 0.
+        for s in 0..4 {
+            assert_eq!(c.seq_len(SlotId(s)).expect("seq_len in range"), 0);
+        }
+        c.append_for_seq(SlotId(0), 5).expect("append slot 0");
+        c.append_for_seq(SlotId(2), 3).expect("append slot 2");
+        assert_eq!(c.seq_len(SlotId(0)).unwrap(), 5);
+        assert_eq!(c.seq_len(SlotId(1)).unwrap(), 0, "slot 1 untouched");
+        assert_eq!(c.seq_len(SlotId(2)).unwrap(), 3);
+        assert_eq!(c.seq_len(SlotId(3)).unwrap(), 0, "slot 3 untouched");
+    }
+
+    /// Pin: drop resets ONLY the target slot's cursor.  Other slots'
+    /// cursors AND the underlying K/V bytes are invariant.  The K/V
+    /// content half is the structural analogue of Qwen35 A2a's
+    /// recurrent-content M4 pin at `qwen35/kv_cache.rs:6949+` (drop
+    /// must not zero the buffer — Phase A3c's fork kernel will
+    /// re-use the slot's region on next admission).
+    #[test]
+    fn gemma4_hb_kv_drop_resets_seq_len_for_target_slot_only() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
+            .expect("alloc");
+        // Seed every slot.
+        c.append_for_seq(SlotId(0), 10).unwrap();
+        c.append_for_seq(SlotId(1), 20).unwrap();
+        c.append_for_seq(SlotId(2), 30).unwrap();
+        c.append_for_seq(SlotId(3), 40).unwrap();
+        // Drop slot 2.
+        c.drop_seq(SlotId(2)).expect("drop slot 2");
+        assert_eq!(c.seq_len(SlotId(0)).unwrap(), 10);
+        assert_eq!(c.seq_len(SlotId(1)).unwrap(), 20);
+        assert_eq!(c.seq_len(SlotId(2)).unwrap(), 0, "slot 2 reset");
+        assert_eq!(c.seq_len(SlotId(3)).unwrap(), 40);
+        // Direct cursor read (single buffer per layer; no canonical-
+        // vs-per-layer concern like Qwen35's full_attn-vec).
+        assert_eq!(c.seq_lens[2], 0, "underlying cursor wiped");
+        assert_eq!(c.seq_lens[0], 10, "untouched cursors preserved");
+    }
+
+    /// Iter-2.5 M4 analogue for Gemma 4: `drop_seq` must NOT mutate
+    /// the underlying K/V packed buffer bytes for the target slot
+    /// (or any other slot).  The reasoning mirrors Qwen35's recurrent-
+    /// content invariance: the trait surface owns cursor bookkeeping
+    /// only; buffer writes are kernel-dispatcher-owned at Phase B4c.
+    /// A future regression that zeros bytes inside `drop_seq` would
+    /// break the next admission's buffer-reuse correctness — pin it
+    /// here so it surfaces at the trait-surface boundary.
+    ///
+    /// Falsifier: any byte change in slot 0's K or V region after
+    /// `drop_seq(SlotId(0))` ⇒ Phase A3a has crossed into kernel-
+    /// dispatcher territory.
+    #[test]
+    fn gemma4_hb_kv_drop_does_not_zero_k_packed_buffer() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 4usize;
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, 2)
+            .expect("alloc n_seqs=2");
+
+        // Step 1: fill slot 0's K and V packed regions with a
+        // deterministic non-zero pattern via direct host write.
+        // StorageModeShared makes this a CPU mutation — no kernel
+        // dispatch needed, no download/upload helper.  Production
+        // write path lives in the kernel dispatcher; this test
+        // exercises the contract "drop_seq does NOT touch this
+        // buffer" via host-side byte snapshot.
+        let slot_packed = nkv * cap * hd;
+        {
+            let k = c.k_packed.as_mut_slice::<u8>().expect("k_packed u8 mut");
+            for (i, b) in k[..slot_packed].iter_mut().enumerate() {
+                // Distinct non-zero pattern from H7's slot-1 fill —
+                // makes test failures distinguishable from H7's
+                // fixture state under shared-binary debugging.
+                *b = (((i * 7) % 251) + 1) as u8;
+            }
+        }
+        {
+            let v = c.v_packed.as_mut_slice::<u8>().expect("v_packed u8 mut");
+            for (i, b) in v[..slot_packed].iter_mut().enumerate() {
+                *b = (((i * 11) % 253) + 1) as u8;
+            }
+        }
+
+        // Step 2: cursor bump on slot 0 (then snapshot bytes BEFORE
+        // drop_seq).
+        c.append_for_seq(SlotId(0), 2).expect("append slot 0");
+        let k_before: Vec<u8> = c
+            .k_packed
+            .as_slice::<u8>()
+            .expect("k_packed u8")
+            [..slot_packed]
+            .to_vec();
+        let v_before: Vec<u8> = c
+            .v_packed
+            .as_slice::<u8>()
+            .expect("v_packed u8")
+            [..slot_packed]
+            .to_vec();
+        // Fixture sanity: at least one byte is the deterministic
+        // pattern, not zero.  Defends against a future regression
+        // that breaks `as_mut_slice` for this buffer kind.
+        assert!(
+            k_before.iter().any(|&b| b != 0),
+            "M4-G fixture sanity: deterministic upload must produce \
+             non-zero bytes (else test is vacuous)"
+        );
+
+        // Step 3: call drop_seq(SlotId(0)).  Per Phase A3a contract,
+        // this MUST NOT touch the K/V packed bytes at all.
+        c.drop_seq(SlotId(0)).expect("drop slot 0");
+        assert_eq!(c.seq_lens[0], 0, "cursor reset");
+
+        // Step 4: snapshot again.
+        let k_after: Vec<u8> = c
+            .k_packed
+            .as_slice::<u8>()
+            .expect("k_packed u8 after")
+            [..slot_packed]
+            .to_vec();
+        let v_after: Vec<u8> = c
+            .v_packed
+            .as_slice::<u8>()
+            .expect("v_packed u8 after")
+            [..slot_packed]
+            .to_vec();
+
+        // Step 5: byte-by-byte equality.  Any mutation by drop_seq
+        // — including partial zero, partial overwrite, in-place
+        // swap — surfaces here.
+        assert_eq!(
+            k_before, k_after,
+            "M4-G FALSIFIED: drop_seq mutated k_packed contents for \
+             slot 0.  Per Phase A3a contract, drop_seq is cursor-only; \
+             buffer-content reset is kernel-dispatcher-owned at Phase \
+             B4c.  An in-place zero here would break the next \
+             admission's buffer-reuse correctness."
+        );
+        assert_eq!(
+            v_before, v_after,
+            "M4-G FALSIFIED: drop_seq mutated v_packed contents for slot 0."
+        );
+    }
+
+    /// Pin: `fork_seq(src, src)` is a successful no-op per trait spec.
+    /// Mirrors `qwen35_hybrid_kv_fork_to_self_is_noop_ok` (qwen35/
+    /// kv_cache.rs:7050-7063).
+    #[test]
+    fn gemma4_hb_kv_fork_to_self_is_noop_ok() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
+            .expect("alloc");
+        c.append_for_seq(SlotId(2), 9).unwrap();
+        // src == dst — no-op success.
+        c.fork_seq(SlotId(2), SlotId(2)).expect("fork self ok");
+        // Cursor unchanged.
+        assert_eq!(c.seq_len(SlotId(2)).unwrap(), 9);
+        // Other slots untouched.
+        assert_eq!(c.seq_len(SlotId(0)).unwrap(), 0);
+        assert_eq!(c.seq_len(SlotId(1)).unwrap(), 0);
+        assert_eq!(c.seq_len(SlotId(3)).unwrap(), 0);
+    }
+
+    /// Phase A3c deferral pin: cross-slot fork returns
+    /// `CapabilityUnsupported` with the capability label naming the
+    /// deferred kernel arc + dossier R5.  Mirrors Qwen35's iter-2.5
+    /// M1 closure pin at `qwen35/kv_cache.rs:7079-7113`.
+    ///
+    /// When Phase A3c ships the real kernel dispatch, this test
+    /// will fail loudly — signaling the deferral closure.  At that
+    /// iter, flip the assertion to `expect("fork ok after A3c")`
+    /// plus a per-buffer byte-equality check.
+    #[test]
+    fn gemma4_hb_kv_fork_cross_slot_returns_capability_unsupported() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
+            .expect("alloc");
+        c.append_for_seq(SlotId(0), 7).unwrap();
+        let err = c
+            .fork_seq(SlotId(0), SlotId(1))
+            .expect_err("cross-slot fork deferred to Phase A3c");
+        // Discriminant must be `CapabilityUnsupported` (mirrors
+        // Qwen35 iter-2.5 M1; NOT `SlotOom`).
+        match err {
+            MultiSeqError::CapabilityUnsupported { capability } => {
+                assert!(
+                    capability.contains("fork_seq cross-slot copy"),
+                    "capability label must name the deferred surface: \
+                     {capability}"
+                );
+                assert!(
+                    capability.contains("Phase A3c"),
+                    "capability label must name the Phase A3c deferral: \
+                     {capability}"
+                );
+                assert!(
+                    capability.contains("R5"),
+                    "capability label must name dossier R5 grounding: \
+                     {capability}"
+                );
+                // Per-arch identity — distinguishes Gemma 4 from the
+                // Qwen35 sibling at the log line.
+                assert!(
+                    capability.contains("Gemma 4"),
+                    "capability label must name the arch: {capability}"
+                );
+            }
+            other => panic!(
+                "Phase A3c deferral: expected CapabilityUnsupported (HTTP 501); \
+                 got {other:?} — the legacy `SlotOom {{ 0, 0 }}` sentinel \
+                 mantra-violation must NOT return here.  When Phase A3c ships \
+                 the real kernel, flip this match to `Ok(())` + per-buffer \
+                 byte-equality assertions (mirrors Qwen35 A2c ceremony)."
+            ),
+        }
     }
 }
