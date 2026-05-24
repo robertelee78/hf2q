@@ -1857,6 +1857,7 @@ fn maybe_run_qwen35_prefill_sweep(
 
     use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;
+    use crate::serve::multi_seq_kv::SlotId;
     use mlx_native::MlxDevice;
 
     fn top_n_indices(values: &[f32], n: usize) -> Vec<usize> {
@@ -1926,7 +1927,7 @@ fn maybe_run_qwen35_prefill_sweep(
                 let mut full_kv = HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1)
                     .context("qwen35 prefill sweep compare full HybridKvCache::new")?;
                 let full = model
-                    .forward_gpu(&prompt_tokens, &positions, &mut full_kv)
+                    .forward_gpu(&prompt_tokens, &positions, &mut full_kv, SlotId(0))
                     .context("qwen35 prefill sweep compare forward_gpu")?;
                 let mut last_kv = HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1)
                     .context("qwen35 prefill sweep compare last HybridKvCache::new")?;
@@ -1966,7 +1967,7 @@ fn maybe_run_qwen35_prefill_sweep(
                 last
             } else if full_logits {
                 model
-                    .forward_gpu(&prompt_tokens, &positions, &mut kv_cache)
+                    .forward_gpu(&prompt_tokens, &positions, &mut kv_cache, SlotId(0))
                     .context("qwen35 prefill sweep forward_gpu")?
             } else {
                 model

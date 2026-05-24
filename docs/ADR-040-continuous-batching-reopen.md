@@ -84,8 +84,15 @@ The 2.45x over-shoot is documented honestly per cfa-finding (Claude `major_findi
 | `src/serve/api/engine.rs` | replace mpsc-channel + single worker with scheduler-driven slot loop under `SchedulerPolicy::InflightBatched` | C iter-2 |
 | `src/serve/api/sse.rs` | per-slot keepalive accounting (no contract change) | C iter-3 |
 | `src/serve/api/schema.rs` | doc-only Decision #2 update naming `SchedulerPolicy` | C iter-3 |
-| `src/serve/forward_prefill.rs` | accept `slot_id` parameter; route writes to multi-seq KV | B iter-3 |
-| `src/serve/forward_prefill_batched.rs` | same | B iter-3 |
+| `src/inference/models/qwen35/forward_gpu.rs` | accept `slot_id: SlotId` on `forward_gpu` + `forward_gpu_with_hidden`; bounds-check; gate slot N > 0 behind B4a-cont | **B iter-4a (SHIPPED 2026-05-23)** |
+| `src/inference/models/qwen35/forward_gpu.rs` | thread `slot_id` into `build_gated_attn_layer` + KV-dispatcher slot-offset wiring; flip slot > 0 from typed-error to real-route | B iter-4a-cont |
+| `src/serve/forward_prefill.rs` | (Gemma 4 prefill) accept `slot_id` parameter; route writes to multi-seq KV (gated on Phase A3 Gemma 4 multi-seq KV impl) | B iter-4c |
+| `src/serve/forward_prefill_batched.rs` | same | B iter-4c |
+| `src/inference/models/qwen35/forward_gpu.rs` (decode) | thread `slot_id` through `forward_gpu_last_logits` / `forward_gpu_last_topk` / soft-token / deepstack variants | B iter-4b |
+| `src/inference/models/qwen35/{spec_decode.rs, forward_gpu.rs}` (dflash / greedy) | thread `slot_id` through `forward_gpu_greedy` + dflash spec-decode entry points | B iter-4d |
+| `src/serve/api/engine.rs` | replace mpsc-channel + single worker with scheduler-driven slot loop under `SchedulerPolicy::InflightBatched` | C iter-2 |
+| `src/serve/api/sse.rs` | per-slot keepalive accounting (no contract change) | C iter-3 |
+| `src/serve/api/schema.rs` | doc-only Decision #2 update naming `SchedulerPolicy` | C iter-3 |
 | `src/serve/mod.rs::cmd_serve` | thread `SchedulerPolicy` from CLI/env into `Engine::spawn` | C iter-2 |
 
 ### 2.3 mlx-native impact
@@ -251,7 +258,11 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | **B1 (THIS ITER, 2026-05-23)** | Scaffolding: trait + FifoSchedulerAdapter (real admit/step/release/stats) + InflightBatchedScheduler signature stub (post-iter-1.5: cfg(test)-gated) | 1 day landed |
 | B2 | FifoSchedulerAdapter byte-equivalence proof + regression pin | 2-3 days |
 | B3 | InflightBatchedScheduler admit/step/release impl | 5-8 days |
-| B4 | Forward-path slot-id threading (`forward_prefill.rs` + `forward_prefill_batched.rs`) | 5-8 days |
+| **B4a (SHIPPED 2026-05-23)** | Qwen35 `forward_gpu` / `forward_gpu_with_hidden` public-surface `slot_id: SlotId` threading + bounds check + H2 GPU-content byte-identity at slot 0 + slot-isolation pin + typed B4a-cont error for slot N > 0 | **1 day landed** |
+| B4a-cont | Qwen35 `build_gated_attn_layer` / `apply_sdpa_with_kv_cache` / KV-dispatcher slot-offset wiring; flip slot > 0 from typed-error to real-route (via `MlxBuffer::slice_view` on slot.k/slot.v) | 3-5 days |
+| B4b | Qwen35 decode-path slot threading (`forward_gpu_last_logits` / `forward_gpu_last_topk` / soft-token / deepstack) | 2-3 days |
+| B4c | Gemma 4 forward-path slot threading (`forward_prefill.rs` + `forward_prefill_batched.rs`) — gated on Phase A3 Gemma 4 multi-seq KV impl | 5-8 days |
+| B4d | Spec-decode slot threading (`forward_gpu_greedy` + dflash entry points) — gated on Phase A4 drafter KV multi-seq impl | 5-8 days |
 | B5 | Per-slot 429 + Retry-After contract preservation | 2-3 days |
 | B6 | Mixed prefill+decode `SchedulerStep::Mixed` handling | 3-5 days |
 
@@ -408,6 +419,61 @@ Per goal-mode directive ("Spawn Swarm team (/cfa) with codex to check our work")
 - Phase C iter-3 schema mapping: `serve/api/schema.rs` will route `MultiSeqError::CapabilityUnsupported` → HTTP 501 (parallel to `SlotOom` → 429 + Retry-After and `SlotOutOfRange` → 500 internal-defect).
 - Phase B iter-3 forward-path slot threading: `forward_prefill_gpu` per-slot offset wiring + the still-missing `forward_prefill_slot_0_byte_identical_at_n_seqs_4_vs_1` test that closes the H2 forward-path half.
 - Phase A2c: replace `fork_seq` `CapabilityUnsupported` with same-buffer cross-region memcpy via `dispatch_kv_cache_copy_seq_*`; flip the test assertion to `Ok(())` + per-buffer byte-equality.
+
+### 6.1.4 Iter-B4a closure — Qwen35 forward_gpu slot_id threading (2026-05-23, this commit)
+
+First real per-model **forward-path** slot threading.  Closes the H2 GPU-content side that iter-2.5 M3 promised to defer to "Phase B iter-3 wiring" (ADR-040 §6.1.2 caveat row + §6.1.3 Future-iter pin pointer).
+
+**ADR §2.2 amendment in this commit**: the original §2.2 row named `src/serve/forward_prefill.rs` as the B iter-3 target, but that file is Gemma 4's prefill path.  Qwen35's equivalent is `src/inference/models/qwen35/forward_gpu.rs`, and Qwen35 is the family with the iter-2a `MultiSeqKvCache` impl shipped.  The amended §2.2 splits B4 into four sub-iters by family + entry-point class:
+
+| Sub-iter | File / surface | Status |
+|---|---|---|
+| **B4a (this commit)** | Qwen35 `forward_gpu` + `forward_gpu_with_hidden` public surface — `slot_id: SlotId` threading, bounds check, slot-0-only GPU-content path with typed B4a-cont error for slot N > 0 | **SHIPPED** |
+| B4a-cont | Qwen35 internal helpers (`build_gated_attn_layer`, `apply_sdpa_with_kv_cache`, `write_kv_with_optional_tq_encode`, FA prefill / vec helpers) — KV-dispatcher slot-offset wiring via `MlxBuffer::slice_view`; flip slot N > 0 from typed-error to real-route | pending |
+| B4b | Qwen35 decode-side entry points — `forward_gpu_last_logits` / `forward_gpu_last_topk` / soft-token / deepstack — gated to slot 0 in B4a | pending |
+| B4c | Gemma 4 forward path (`src/serve/forward_prefill.rs` + `forward_prefill_batched.rs`) — gated on Phase A3 Gemma 4 multi-seq KV impl landing first | pending (gated on A3) |
+| B4d | Spec-decode entry points (`forward_gpu_greedy` + dflash) — gated on Phase A4 drafter KV multi-seq impl | pending (gated on A4) |
+
+**Scope per the B4a brief (TIGHTLY scoped)**:
+- ✅ Thread `slot_id: SlotId` through `Qwen35Model::forward_gpu` + `Qwen35Model::forward_gpu_with_hidden` (public surface)
+- ✅ Thread `slot_id` through `forward_gpu_impl` (private worker; receives slot_id from every caller)
+- ✅ Bounds-check `slot_id.0 < kv_cache.n_seqs` at top of `forward_gpu_impl` with fail-loud diagnostic naming both the slot and the configured n_seqs
+- ✅ All 9 internal callers of `forward_gpu_impl` updated to pass `SlotId(0)` (the B4b/B4c/B4d-scope decode + soft-token + deepstack + dflash variants are explicitly gated to slot 0 with inline comments naming the unblocking iter)
+- ✅ All external callers updated: 7 callsites in `src/inference/models/qwen35/spec_decode.rs`, 2 in `src/serve/mod.rs`, 5 in-file test sites
+- ✅ Slot N > 0 returns a typed error naming the missing GPU-side wiring (Phase B4a-cont) — fail-loud per ADR-040 §7 mantra, NOT a stub or fallback
+- ✅ H2 GPU-content side test: `b4a_forward_gpu_at_slot_0_n_seqs_4_byte_identical_to_n_seqs_1` (closes the M3 deferred promise — proves the n_seqs > 1 allocation doesn't disturb slot-0 forward outputs)
+- ✅ Slot-isolation pin: `b4a_forward_gpu_slot_0_does_not_touch_slot_1_kv_region` (snapshots slot 1's full K/V bytes before + after a slot-0 forward + asserts byte-equality across all full-attn layers; also pins `current_len[1] == 0` post-forward)
+- ✅ Bounds-check pin: `b4a_forward_gpu_slot_out_of_range_errors` (asserts error message names both slot and n_seqs; boundary at `slot == n_seqs`)
+- ✅ B4a-cont contract pin: `b4a_forward_gpu_slot_n_gt_zero_returns_b4a_cont_typed_error` (asserts error message names "Phase B4a-cont" so operators know which iter unblocks slot > 0)
+
+**Out of scope per the brief (deferred to later sub-iters)**:
+- ⏭️ Decode-side variants (`forward_gpu_last_logits` etc.) — Phase B4b
+- ⏭️ Linear-attn slot reads — Phase A2b (gated on `rollback_la_to` guard lift at kv_cache.rs:1567 per dossier R1)
+- ⏭️ Gemma 4 `forward_prefill.rs` — Phase B4c (gated on Phase A3)
+- ⏭️ `forward_gpu_greedy` / dflash / spec-decode variants — Phase B4d (gated on Phase A4 drafter multi-seq KV)
+- ⏭️ GPU-side KV-buffer slot-offset wiring (kernel-dispatcher slot-aware indexing) — Phase B4a-cont
+
+**Quality gates (all green)**:
+- `cargo check --release`: 0
+- `cargo test --release --bin hf2q -- qwen35::kv_cache::tests serve::scheduler::tests serve::multi_seq_kv::tests`: **142/142 PASS** (iter-2.5 regression preserved)
+- `cargo test --release --bin hf2q -- inference::models::qwen35::forward_gpu::tests`: **30/30 PASS** (includes all 4 new B4a tests)
+- `cargo test --release --bin hf2q -- inference::models::qwen35::spec_decode`: **5/5 PASS** (spec_decode callsites updated to pass SlotId(0))
+
+**LOC delta**:
+- `src/inference/models/qwen35/forward_gpu.rs`: +~390 LOC (signature threading: ~60; bounds check + B4a-cont typed error: ~50; B4a-cont fixture builder: ~80; 4 B4a tests: ~200)
+- `src/inference/models/qwen35/spec_decode.rs`: +1 LOC import, +7 callsite updates
+- `src/serve/mod.rs`: +1 LOC import, +2 callsite updates
+- `docs/ADR-040-continuous-batching-reopen.md`: +~50 LOC (§2.2 amendment + Phase B sequencing rows + this closure block)
+
+**Mantra-aligned**: no `// TODO`, no `unimplemented!()`, no `panic!()` in production code.  The slot > 0 typed error is a precise contract (operators see exactly which iter unblocks the path), NOT a stub.  Slot 0 at n_seqs > 1 is the byte-identical reference case — that's where the H2 promise lands, not in a deferred slot > 0 path.
+
+**Why slot > 0 is gated (not silently corrupting)**: today's GPU kernels (`dispatch_kv_cache_copy_seq_f32_dual`, `flash_attn_vec`, `apply_flash_attn_prefill_seq_major_*`) index into `slot.k`/`slot.v` using a 3-D `[n_kv_heads, max_seq_len, head_dim]` assumption — they write to byte offset 0 regardless of slot_id.  Silently accepting slot_id > 0 would route that write into slot 0 while the caller thought it was slot N, corrupting slot 0's K/V region.  Phase B4a-cont lands the kernel-dispatcher slot-offset parameter (via `MlxBuffer::slice_view(slot_byte_offset, slot_region_elems)` per slot) as a cohesive multi-helper change.
+
+**Future-iter pin pointers**:
+- Phase B4a-cont: replace the typed B4a-cont error with the real slot-offset routing.  Touch points: `build_gated_attn_layer` (slot.k/slot.v access at lines 4873, 4955, 5215, 5227, 5353, 5397 in `gpu_full_attn.rs`), `apply_sdpa_with_kv_cache` (line 4196), `write_kv_with_optional_tq_encode` (line 102), the FA prefill / vec dispatchers.  The test `b4a_forward_gpu_slot_n_gt_zero_returns_b4a_cont_typed_error` flips its assertion shape from `is_err()` to `is_ok()` + per-slot output assertions.
+- Phase B4b: thread `slot_id` through the 5 decode-side entry points (`forward_gpu_last_logits`, `forward_gpu_last_topk`, `forward_gpu_last_logits_with_soft_tokens`, `forward_gpu_last_logits_with_soft_tokens_and_deepstack`, `forward_embed_last`) by removing the hard-coded `SlotId(0)` in their `forward_gpu_impl` calls.
+- Phase B4c: per the §2.2 amendment in this commit, Gemma 4's `forward_prefill.rs` is the B4c target after Phase A3 Gemma 4 multi-seq KV lands.
+- Phase B4d: spec-decode `forward_gpu_with_hidden` + `forward_gpu_with_hidden_dflash` callsites in `spec_decode.rs` flip from hard-coded `SlotId(0)` to the scheduler-provided slot_id.
 
 ---
 

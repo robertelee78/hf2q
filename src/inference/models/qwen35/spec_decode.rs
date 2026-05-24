@@ -109,6 +109,11 @@ use super::gpu_full_attn::upload_f32;
 use super::io_heads::greedy_argmax_last_token;
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
+// ADR-040 Phase B4a (2026-05-23): spec-decode entry points are gated to
+// `SlotId(0)` for B4a; multi-slot spec-decode (drafter + verifier
+// per-slot KV) lands in Phase B4d alongside the EAGLE3/DFlash drafter
+// cache multi-seq lift (ADR-040 §6.1.4).
+use crate::serve::multi_seq_kv::SlotId;
 
 /// ADR-034 task #91 (2026-05-21) — Sampler configuration for stochastic
 /// (temp > 0) Metropolis-Hastings spec-decode acceptance.
@@ -328,7 +333,7 @@ impl<'a> SpecDecode<'a> {
         let prefill_start = Instant::now();
         let (prefill_logits, prefill_hidden) = self
             .verifier
-            .forward_gpu_with_hidden(prompt, &prefill_positions, &mut self.kv_cache)
+            .forward_gpu_with_hidden(prompt, &prefill_positions, &mut self.kv_cache, SlotId(0))
             .context("SpecDecode verifier prefill")?;
         self.stats.prefill_elapsed = prefill_start.elapsed();
         // forward_gpu_with_hidden returns the full [seq_len, H] residual; MTP
@@ -567,6 +572,7 @@ impl<'a> SpecDecode<'a> {
                         &verify_input,
                         &verify_positions,
                         &mut self.kv_cache,
+                        SlotId(0),
                     )
                     .with_context(|| {
                         format!("SpecDecode K={spec_k} batched verify pos {next_pos}")
@@ -957,7 +963,7 @@ impl<'a> SpecDecode<'a> {
                 let (logits_a, hidden_a) = self
                     .verifier
                     .forward_gpu_with_hidden(
-                        &[token_next], &pos_a, &mut self.kv_cache,
+                        &[token_next], &pos_a, &mut self.kv_cache, SlotId(0),
                     )
                     .with_context(|| {
                         format!("K1 TWO_CALLS_PROPER A pos {next_pos}")
@@ -986,7 +992,7 @@ impl<'a> SpecDecode<'a> {
                     let (logits_b, hidden_b) = self
                         .verifier
                         .forward_gpu_with_hidden(
-                            &[proposed], &pos_b, &mut self.kv_cache,
+                            &[proposed], &pos_b, &mut self.kv_cache, SlotId(0),
                         )
                         .with_context(|| {
                             format!("K1 TWO_CALLS_PROPER B pos {}", next_pos + 1)
@@ -1060,6 +1066,7 @@ impl<'a> SpecDecode<'a> {
                             &[token_next, proposed],
                             &verify_positions_2,
                             &mut self.kv_cache,
+                            SlotId(0),
                         )
                         .with_context(|| {
                             format!("SpecDecode K1 verifier step pos {next_pos}")
@@ -1222,7 +1229,7 @@ impl<'a> SpecDecode<'a> {
                 let (verify_logits, verify_hidden) = self
                     .verifier
                     .forward_gpu_with_hidden(
-                        &[token_next], &verify_positions, &mut self.kv_cache,
+                        &[token_next], &verify_positions, &mut self.kv_cache, SlotId(0),
                     )
                     .with_context(|| format!("SpecDecode verifier step pos {next_pos}"))?;
                 let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
@@ -1349,6 +1356,7 @@ impl<'a> SpecDecode<'a> {
                         &synth_tokens,
                         &synth_positions,
                         &mut self.kv_cache,
+                        SlotId(0),
                     )
                     .with_context(|| {
                         format!("VerifierN bench N={n}")
