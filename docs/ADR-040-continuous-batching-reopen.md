@@ -1535,9 +1535,9 @@ Per the /cfa codex BLOCK verdict on iter-A5b (`/tmp/cfa-a5b-review/codex-review-
 
 **Dossier provenance**: No standalone dossier — A5c is closure-iter work on top of the codex BLOCK verdict on iter-A5b. The decision matrix + the over-vs-under count analysis are documented inline (above) per ADR-040 §7 mantra.
 
-### 6.1.18 Iter-A5d closure — codex /cfa BLOCK on iter-A5c: real handler-level tests + mantra-violation fix (2026-05-24, this commit)
+### 6.1.18 Iter-A5d closure — codex /cfa BLOCK on iter-A5c: real handler-level tests + mantra-violation fix (2026-05-24, commit `acc9d574`)
 
-Per the /cfa codex BLOCK verdict on iter-A5c (`/tmp/cfa-a5c-review/codex-review-last.txt`), this iter ships the load-bearing closure for Critical #2 (3rd reaffirmation): **REAL handler-level integration tests that invoke the production `chat_completions_*` handler functions** with a synthetic over-budget Engine + a real `AppState` + a real `PreparedChatContext`. The iter-A5c "integration" tests at `engine.rs:9574-9811` were correctly identified by codex as seam-level (they called `engine.try_admit_budget` + `ApiError::slot_budget_exceeded(...).into_response()` directly, not the production handlers). Iter-A5d renames them to `a5d_seam_only_*` (retained as supplemental proofs of the ApiError wire shape) and adds two NEW handler-level tests in `src/serve/api/handlers.rs` that drive the actual production handler code path end-to-end.
+Per the /cfa codex BLOCK verdict on iter-A5c (`/tmp/cfa-a5c-review/codex-review-last.txt`), commit `acc9d574` ships the load-bearing closure for Critical #2 (3rd reaffirmation): **REAL handler-level integration tests that invoke the production `chat_completions_*` handler functions** with a synthetic over-budget Engine + a real `AppState` + a real `PreparedChatContext`. The iter-A5c "integration" tests at `engine.rs:9574-9811` were correctly identified by codex as seam-level (they called `engine.try_admit_budget` + `ApiError::slot_budget_exceeded(...).into_response()` directly, not the production handlers). Iter-A5d renames them to `a5d_seam_only_*` (retained as supplemental proofs of the ApiError wire shape) and adds two NEW handler-level tests in `src/serve/api/handlers.rs` that drive the actual production handler code path end-to-end.
 
 **Path chosen — Path A (direct handler function call)**:
 
@@ -1582,7 +1582,7 @@ iter-A5c's §6.1.17 said the iter-A5c tests were "handler-level wire-shape" + "C
 
 - `cargo check --release --tests` returns 0 (no new warnings; same 4 pre-existing pre-A5d warnings: `gpu_full_attn.rs:11455-57 bad_shape` unused-assignment + `forward_gpu.rs:2507 use super::*` unused-import).
 - `cargo test --release --test continuous_batching_throughput` returns 0 with **21 PASS / 0 FAIL** (preserved from iter-A5c — no regression).
-- `cargo test --release --bin hf2q -- a5d_ --test-threads=1` returns 0 with **5 PASS / 0 FAIL** (3 `a5d_seam_only_*` renames + 2 NEW `a5d_*_handler_returns_429_*` tests). Wall clock 0.08s; no model load.
+- `cargo test --release --bin hf2q -- serve::api::engine::tests::a5d_ serve::api::handlers::a5d_ --test-threads=1` returns 0 with **5 PASS / 0 FAIL** (3 `a5d_seam_only_*` renames + 2 NEW `a5d_*_handler_returns_429_*` tests). Wall clock 0.08s; no model load. (Note: the bare `a5d_` filter ALSO matches the unrelated `inference::spec_decode::eagle3_orchestrator::g4_cfa5_redhatai_smoke::g4_cfa5d_diagnose_layer0_weight_ggml_types_2026_05_23` test → 6 PASS, not 5; codex /cfa A5d review correctly flagged this as a minor doc nit, fixed in iter-A5e via the narrower module-scoped filter above.)
 - `cargo test --release --bin hf2q -- a5b_ a5c_ --test-threads=1` returns 0 with **22 PASS / 0 FAIL** — iter-A5b's 14 + iter-A5c's 8 still green; nothing regressed (only the 3 `a5c_chat_completions_*` were renamed to `a5d_seam_only_*` — they were counted under iter-A5c's `+3 engine tests` but no longer match the `a5c_` prefix).
 - NO `// TODO`, NO `unimplemented!()`, NO `todo!()` in production code. ALL deferrals are typed.
 
