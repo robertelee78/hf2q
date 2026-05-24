@@ -612,6 +612,50 @@ pub enum EngineSpawnError {
     },
 }
 
+/// **ADR-040 §3.5 iter-A5b** — pre-stream admit-time errors surfaced by
+/// [`Engine::try_admit_budget`].
+///
+/// The variant exists so the SSE handler can route per-slot KV-budget
+/// rejections to `ApiError::slot_budget_exceeded` (HTTP 429 +
+/// `Retry-After: 1`) BEFORE `generate_stream_with_deepstack` returns
+/// `Ok` and the handler commits to opening an SSE body — the codex
+/// review CRITICAL #2 finding (handlers.rs:1739-1748 only matched on
+/// the `queue_full` anyhow prefix; SlotBudgetExceeded for the
+/// streaming arm reached the operator as a half-rendered SSE error
+/// frame instead of a clean 429).
+///
+/// The non-streaming admit path inside `worker_run` continues to surface
+/// the typed [`crate::serve::scheduler::AdmitError::SlotBudgetExceeded`]
+/// inside the existing anyhow channel-error envelope; the worker error
+/// string carries the `"slot_budget_exceeded"` literal so the
+/// non-streaming handler arm can string-match parallel to
+/// `"queue_full"`. Pre-stream surfacing via this typed enum is the
+/// streaming-arm fix; defense-in-depth at the worker layer is preserved.
+#[derive(Debug, thiserror::Error)]
+pub enum EngineAdmitError {
+    /// The request's projected KV byte cost
+    /// (`(prompt_tokens + max_tokens) × kv_bytes_per_token`) exceeds the
+    /// per-slot KV budget configured at engine spawn time
+    /// (`kv_cache_budget_bytes / max_slots`). Maps to HTTP 429 +
+    /// `Retry-After: 1` upstream via
+    /// [`crate::serve::api::schema::ApiError::slot_budget_exceeded`].
+    ///
+    /// Distinct from
+    /// [`crate::serve::scheduler::AdmitError::QueueFull`] (transient
+    /// — capacity will free) because this is operator-actionable on
+    /// the REQUEST: reducing `max_tokens` or shortening the prompt is
+    /// the fix.
+    #[error(
+        "ADR-040 §3.5 A5: slot_budget_exceeded — needed_bytes={needed_bytes}, \
+         budget_bytes={budget_bytes}. Reduce max_tokens or use a shorter \
+         prompt; per-slot budget = kv_cache_budget_bytes / max_slots."
+    )]
+    SlotBudgetExceeded {
+        needed_bytes: u64,
+        budget_bytes: u64,
+    },
+}
+
 /// Iter-215 Wedge-2 test fixture — build a synthetic `Engine` with a
 /// no-op worker thread reporting the requested `LoadedArch`.  Used by
 /// router / handler tests in sibling modules to exercise the 501
@@ -845,6 +889,11 @@ pub(crate) fn make_synthetic_kv_engine_for_test(
             // worker drives the scheduler so the snapshot is a sentinel
             // FifoSerial-shape `SchedulerStats` with zero counters.
             max_slots: 1,
+            // ADR-040 §3.5 iter-A5b: synthetic fixtures default to 0
+            // (enforcement disabled — `synthetic_load_info` zeroes the
+            // arch facts so `kv_bytes_per_token` returns 0 anyway).
+            per_slot_kv_budget_bytes: 0,
+            kv_bytes_per_token_cached: 0,
             scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
                 policy: SchedulerPolicy::FifoSerial,
                 in_flight_slots: 0,
@@ -893,6 +942,10 @@ pub(crate) fn make_synthetic_engine_for_test(arch: LoadedArch) -> Engine {
             // ADR-040 C2b scaffold for synthetic test fixtures —
             // mirrors production shape with zero-counter sentinel.
             max_slots: 1,
+            // ADR-040 §3.5 iter-A5b: synthetic fixtures default to 0
+            // (enforcement disabled).
+            per_slot_kv_budget_bytes: 0,
+            kv_bytes_per_token_cached: 0,
             scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
                 policy: SchedulerPolicy::FifoSerial,
                 in_flight_slots: 0,
@@ -1010,6 +1063,27 @@ struct EngineInner {
     /// Iter-2a only positions the field; the SlotAware runtime that
     /// actually exercises `max_slots > 1` lands at iter-2b/2c.
     max_slots: u32,
+    /// **ADR-040 §3.5 iter-A5b** — per-slot KV byte budget. Computed
+    /// at spawn time as `kv_cache_budget_bytes / max_slots` (`0`
+    /// means enforcement disabled, preserving pre-A5
+    /// byte-equivalence). Read by [`Engine::try_admit_budget`] +
+    /// surfaced to the worker thread for the scheduler-side
+    /// `FifoSchedulerAdapter::new_with_kv_budget`/
+    /// `InflightBatchedScheduler::new_with_kv_budget` constructor.
+    ///
+    /// `0` semantics match
+    /// [`crate::serve::scheduler::FifoSchedulerAdapter::per_slot_kv_budget_bytes`]:
+    /// no enforcement at any admit path. Under SerialFifo this is
+    /// `kv_cache_budget_bytes.unwrap_or(0) / 1` so an operator who
+    /// does NOT pass `--kv-cache-budget-bytes` retains the pre-A5
+    /// "unbounded" semantics verbatim.
+    per_slot_kv_budget_bytes: u64,
+    /// **ADR-040 §3.5 iter-A5b** — cached per-token KV byte cost
+    /// (`LoadInfo::kv_bytes_per_token()` value captured at spawn).
+    /// `0` ⇒ unknown / synthetic-fixture loader; admit-side check
+    /// short-circuits to "do not enforce" (same opt-out as
+    /// `per_slot_kv_budget_bytes == 0`).
+    kv_bytes_per_token_cached: u64,
     /// **ADR-040 Phase C iter-2a (C2b) — scheduler stats snapshot**
     /// (dossier §2.2). The actual scheduler lives on the worker thread
     /// (Shape A); after each `release` the worker writes a snapshot of
@@ -2656,6 +2730,17 @@ impl Engine {
         let queue_capacity_u32 = queue_capacity.max(1) as u32;
         let initial_mode = EngineMode::SerialFifo;
         let initial_max_slots: u32 = 1;
+        // ADR-040 §3.5 iter-A5b — per-slot KV byte budget. Under
+        // SerialFifo `max_slots = 1` so `kv_cache_budget_bytes / 1`
+        // = `kv_cache_budget_bytes`; `None` ⇒ `0` ⇒ enforcement
+        // disabled (pre-A5 byte-equivalence preserved for operators
+        // who do not set `--kv-cache-budget-bytes`). The same field
+        // also flows to the worker thread so the scheduler-side
+        // FifoSchedulerAdapter::new_with_kv_budget enforces at admit.
+        let initial_per_slot_kv_budget_bytes: u64 = kv_cache_budget_bytes
+            .map(|b| b / u64::from(initial_max_slots.max(1)))
+            .unwrap_or(0);
+        let initial_kv_bytes_per_token_cached: u64 = info.kv_bytes_per_token();
         let scheduler_stats_snapshot = Arc::new(Mutex::new(SchedulerStats {
             policy: SchedulerPolicy::FifoSerial,
             in_flight_slots: 0,
@@ -2668,6 +2753,8 @@ impl Engine {
 
         // Move registration into the worker closure in addition to the handle.
         let worker_registration = registration.clone();
+        let worker_per_slot_budget = initial_per_slot_kv_budget_bytes;
+        let worker_kv_bytes_per_token = initial_kv_bytes_per_token_cached;
         let worker_handle = std::thread::Builder::new()
             .name("hf2q-engine".into())
             .spawn(move || {
@@ -2678,6 +2765,8 @@ impl Engine {
                     initial_mode,
                     queue_capacity_u32,
                     worker_stats_handle,
+                    worker_per_slot_budget,
+                    worker_kv_bytes_per_token,
                 )
             })
             .expect("spawn hf2q-engine thread");
@@ -2702,6 +2791,8 @@ impl Engine {
                 tq_packed_descriptor,
                 mode: initial_mode,
                 max_slots: initial_max_slots,
+                per_slot_kv_budget_bytes: initial_per_slot_kv_budget_bytes,
+                kv_bytes_per_token_cached: initial_kv_bytes_per_token_cached,
                 scheduler_stats_snapshot,
             }),
         }
@@ -2804,6 +2895,76 @@ impl Engine {
     /// rejection.
     pub fn max_slots(&self) -> u32 {
         self.inner.max_slots
+    }
+
+    /// **ADR-040 §3.5 iter-A5b** — per-slot KV byte budget configured
+    /// at spawn time (`kv_cache_budget_bytes / max_slots`).
+    ///
+    /// `0` means enforcement is disabled (operator did not set
+    /// `--kv-cache-budget-bytes`, or the synthetic-fixture
+    /// loader path). Exposed for handler-side pre-stream admit checks
+    /// + Prometheus exposition.
+    pub fn per_slot_kv_budget_bytes(&self) -> u64 {
+        self.inner.per_slot_kv_budget_bytes
+    }
+
+    /// **ADR-040 §3.5 iter-A5b** — pre-stream admit-time KV byte
+    /// budget check. Returns `Ok(())` when the request fits the
+    /// per-slot budget (or enforcement is disabled), or
+    /// [`EngineAdmitError::SlotBudgetExceeded`] when the projected
+    /// KV cost exceeds the per-slot budget configured at engine spawn.
+    ///
+    /// **Why pre-stream**: per codex review CRITICAL #2 (handlers.rs:
+    /// 1739-1748 originally string-matched `queue_full` only),
+    /// scheduler-side `SlotBudgetExceeded` rejection in the streaming
+    /// arm landed AFTER `Engine::generate_stream_with_deepstack`
+    /// returned `Ok`, meaning the handler had already committed to
+    /// opening an SSE body. Calling this method BEFORE handing the
+    /// request to `generate_stream_with_deepstack` lets the streaming
+    /// handler return a clean HTTP 429 + `Retry-After: 1` body
+    /// instead of a half-rendered SSE error frame.
+    ///
+    /// Defense-in-depth: the worker_run admit sites still surface
+    /// `slot_budget_exceeded`-prefixed anyhow errors for the
+    /// non-streaming path; the handler-side string-match converts
+    /// those to `ApiError::slot_budget_exceeded` parallel to
+    /// `queue_full`. Pre-stream check + worker-side check are
+    /// redundant by design — both surfaces map to the same wire-level
+    /// 429.
+    ///
+    /// Behaviour:
+    /// - `per_slot_kv_budget_bytes == 0` ⇒ `Ok(())` (enforcement
+    ///   disabled; preserves pre-A5 byte-equivalence for operators
+    ///   who did not set `--kv-cache-budget-bytes`).
+    /// - `kv_bytes_per_token == 0` ⇒ `Ok(())` (synthetic fixture /
+    ///   LoadInfo arch facts missing — treat as "do not enforce" to
+    ///   match the scheduler-side opt-out contract).
+    /// - Otherwise: compute
+    ///   `(prompt_tokens + max_tokens) × kv_bytes_per_token` and
+    ///   return `Err(SlotBudgetExceeded { .. })` if it exceeds the
+    ///   per-slot budget.
+    pub fn try_admit_budget(
+        &self,
+        prompt_tokens: u32,
+        max_tokens: u32,
+    ) -> std::result::Result<(), EngineAdmitError> {
+        let budget = self.inner.per_slot_kv_budget_bytes;
+        let per_token = self.inner.kv_bytes_per_token_cached;
+        if budget == 0 || per_token == 0 {
+            // Enforcement disabled — preserves pre-A5
+            // byte-equivalence verbatim.
+            return Ok(());
+        }
+        let needed = u64::from(prompt_tokens)
+            .saturating_add(u64::from(max_tokens))
+            .saturating_mul(per_token);
+        if needed > budget {
+            return Err(EngineAdmitError::SlotBudgetExceeded {
+                needed_bytes: needed,
+                budget_bytes: budget,
+            });
+        }
+        Ok(())
     }
 
     /// **ADR-040 Phase C iter-2a (C2b)** — most recent
@@ -3493,11 +3654,15 @@ fn worker_run(
     mode: EngineMode,
     queue_capacity: u32,
     scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
 ) {
     tracing::info!(
         model = %loaded.model_id(),
         ?mode,
         queue_capacity,
+        per_slot_kv_budget_bytes,
+        kv_bytes_per_token,
         "hf2q-engine worker thread started"
     );
 
@@ -3528,8 +3693,17 @@ fn worker_run(
     // `Box<dyn Scheduler>` for narrative consistency; the concrete-
     // adapter shape used here is the implementation realisation that
     // honors §2.9's "advance lives on concrete type" pin.
+    // ADR-040 §3.5 iter-A5b — scheduler-side per-slot KV budget
+    // wiring.  `per_slot_kv_budget_bytes == 0` means "enforcement
+    // disabled" (preserves pre-A5 byte-equivalence for operators who
+    // do not set `--kv-cache-budget-bytes`).  The wrap helper
+    // `new_with_kv_budget` accepts `0` and is byte-equivalent to
+    // `new(queue_capacity)` in that case (per scheduler.rs tests).
     let mut scheduler: FifoSchedulerAdapter = match mode {
-        EngineMode::SerialFifo => FifoSchedulerAdapter::new(queue_capacity),
+        EngineMode::SerialFifo => FifoSchedulerAdapter::new_with_kv_budget(
+            queue_capacity,
+            per_slot_kv_budget_bytes,
+        ),
         EngineMode::SlotAware { .. } => unreachable!(
             "ADR-040 Phase C iter-2a (C2b): EngineMode::SlotAware reached \
              worker_run despite iter-1.5 F1 rejection at \
@@ -3590,16 +3764,26 @@ fn worker_run(
                 // preserves byte-equivalence (H1/H2 falsifiers) because
                 // the inner `generate_*_once` call is unchanged; only
                 // pre/post bookkeeping calls were added.
-                // ADR-040 §3.5 iter-A5: `kv_bytes_needed: 0` opts out of
-                // per-slot KV-budget enforcement under FifoSerial — the
-                // single-slot serial path inherits Engine::spawn's pre-A5
-                // byte-equivalence contract.  Phase C2c/C2d will wire the
-                // real per-arch byte cost when the SlotAware worker arms
-                // land.
+                // ADR-040 §3.5 iter-A5b — compute the real per-request
+                // KV byte cost using the spawn-time-cached
+                // `kv_bytes_per_token` value (derived from LoadInfo per
+                // ADR-040 §3.5 iter-A5b). `0` means "do not enforce"
+                // (synthetic test fixtures / arch facts missing) and
+                // preserves pre-A5 byte-equivalence verbatim. Production
+                // values: (prompt_tokens + max_tokens) ×
+                // kv_bytes_per_token, saturating.
+                let needed_bytes_admit: u64 =
+                    if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
+                        0
+                    } else {
+                        u64::from(prompt_tokens.len() as u32)
+                            .saturating_add(u64::from(params.max_tokens as u32))
+                            .saturating_mul(kv_bytes_per_token)
+                    };
                 let admit_req = AdmitRequest {
                     prompt_tokens: prompt_tokens.len() as u32,
                     max_tokens: params.max_tokens as u32,
-                    kv_bytes_needed: 0,
+                    kv_bytes_needed: needed_bytes_admit,
                 };
                 let admitted = match scheduler.admit(admit_req) {
                     Ok(slot) => slot,
@@ -3613,21 +3797,20 @@ fn worker_run(
                         )));
                         continue;
                     }
-                    // ADR-040 §3.5 iter-A5 — SlotBudgetExceeded maps to a
-                    // typed `queue_full`-shape anyhow error so the handler
-                    // layer can surface 429 + Retry-After per Decision #19
-                    // (parallel to QueueFull). Today the FifoSerial worker
-                    // passes `kv_bytes_needed: 0` so this arm is genuinely
-                    // unreachable from production code, but the typed match
-                    // here pins the contract for the Phase C2c+ SlotAware
-                    // iters that will wire real per-arch byte costs.
+                    // ADR-040 §3.5 iter-A5b — SlotBudgetExceeded surfaces
+                    // a `slot_budget_exceeded`-prefixed anyhow error so
+                    // the handler layer string-matches parallel to
+                    // `queue_full` and emits HTTP 429 + Retry-After per
+                    // Decision #19 via ApiError::slot_budget_exceeded.
+                    // Iter-A5b wires real per-request kv_bytes_needed at
+                    // this admit site so the production path actually
+                    // exercises this arm under operator pressure (was
+                    // dead code under iter-A5's `kv_bytes_needed: 0`).
                     Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
                         let _ = reply.send(Err(anyhow::anyhow!(
-                            "ADR-040 §3.5 A5: scheduler admit rejected request — \
-                             per-slot KV budget exceeded (needed_bytes={}, \
-                             budget_bytes={}). Reduce max_tokens or use a \
-                             shorter prompt; this maps to HTTP 429 + Retry-After \
-                             upstream.",
+                            "slot_budget_exceeded: ADR-040 §3.5 A5b — per-slot \
+                             KV budget exceeded (needed_bytes={}, budget_bytes={}). \
+                             Reduce max_tokens or use a shorter prompt.",
                             needed_bytes, budget_bytes
                         )));
                         continue;
@@ -3724,13 +3907,30 @@ fn worker_run(
                 // and `SchedulerStats` exports completed_total via
                 // `release`, not per-token counters. Byte-equivalence
                 // holds because the inner streaming call is unchanged.
-                // ADR-040 §3.5 iter-A5: `kv_bytes_needed: 0` opts out of
-                // per-slot KV-budget enforcement (FifoSerial byte-equivalence
-                // contract); Phase C2c+ wires the per-arch byte cost.
+                // ADR-040 §3.5 iter-A5b — real per-request KV byte cost
+                // computed from the spawn-time-cached `kv_bytes_per_token`.
+                // Defense-in-depth at the worker layer: the
+                // `Engine::try_admit_budget` pre-stream call in the
+                // handler (handlers.rs::chat_completions_stream) has
+                // already 429'd over-budget requests BEFORE the SSE body
+                // is opened. This second-line check at the worker layer
+                // is reachable when the pre-stream check was skipped
+                // (non-streaming callers wiring through the same
+                // Request::GenerateStream variant in future); it's
+                // strictly defensive and never emits to an open SSE
+                // stream.
+                let needed_bytes_admit: u64 =
+                    if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
+                        0
+                    } else {
+                        u64::from(prompt_tokens.len() as u32)
+                            .saturating_add(u64::from(params.max_tokens as u32))
+                            .saturating_mul(kv_bytes_per_token)
+                    };
                 let admit_req = AdmitRequest {
                     prompt_tokens: prompt_tokens.len() as u32,
                     max_tokens: params.max_tokens as u32,
-                    kv_bytes_needed: 0,
+                    kv_bytes_needed: needed_bytes_admit,
                 };
                 let admitted = match scheduler.admit(admit_req) {
                     Ok(slot) => slot,
@@ -3745,15 +3945,18 @@ fn worker_run(
                         );
                         continue;
                     }
-                    // ADR-040 §3.5 iter-A5 — parallel to QueueFull, surfaces
-                    // a typed error event the SSE layer can map to 429.
+                    // ADR-040 §3.5 iter-A5b — surfaces a typed-prefix error
+                    // event the SSE layer maps to a clean stream
+                    // termination. Reachable only if the pre-stream
+                    // `Engine::try_admit_budget` check was bypassed — the
+                    // handler call sites all run it first now.
                     Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
                         let _ = events.blocking_send(
                             super::sse::GenerationEvent::Error(format!(
-                                "ADR-040 §3.5 A5: per-slot KV budget exceeded \
-                                 for GenerateStream (needed_bytes={}, \
-                                 budget_bytes={}). Reduce max_tokens or use a \
-                                 shorter prompt.",
+                                "slot_budget_exceeded: ADR-040 §3.5 A5b — \
+                                 per-slot KV budget exceeded for GenerateStream \
+                                 (needed_bytes={}, budget_bytes={}). Reduce \
+                                 max_tokens or use a shorter prompt.",
                                 needed_bytes, budget_bytes
                             )),
                         );
@@ -3912,19 +4115,24 @@ fn worker_run(
                 // forward still runs to produce the embedding result,
                 // but no `advance_after_prefill` / `release` is needed
                 // (the slot was never allocated).
-                // ADR-040 §3.5 iter-A5: Embed admit is canonically
-                // zero-budget (max_tokens=0 + kv_bytes_needed=0); under
-                // the per-slot budget check this admit is always accepted
-                // (the budget check uses `>`, so `kv_bytes_needed: 0 >
-                // any_budget` is false even under enforcement). Future
-                // arch-specific Embed cost wiring is at Phase C2c+ if
-                // needed; today Embed runs one prefill forward + no
-                // decode, so the prefill-only KV cost is sub-budget by
-                // construction for any reasonable per-slot budget.
+                // ADR-040 §3.5 iter-A5b — Embed prefill-only KV cost
+                // = `prompt_tokens × kv_bytes_per_token` (no decode
+                // budget). The per-slot budget check rejects oversized
+                // prompts at admit. `kv_bytes_per_token == 0` or
+                // `per_slot_kv_budget_bytes == 0` opts out (synthetic
+                // fixtures + operators who didn't set
+                // `--kv-cache-budget-bytes`).
+                let needed_bytes_admit: u64 =
+                    if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
+                        0
+                    } else {
+                        u64::from(prompt_tokens.len() as u32)
+                            .saturating_mul(kv_bytes_per_token)
+                    };
                 let admit_req = AdmitRequest {
                     prompt_tokens: prompt_tokens.len() as u32,
                     max_tokens: 0,
-                    kv_bytes_needed: 0,
+                    kv_bytes_needed: needed_bytes_admit,
                 };
                 let admitted = match scheduler.admit(admit_req) {
                     Ok(slot) => slot,
@@ -3936,14 +4144,14 @@ fn worker_run(
                         )));
                         continue;
                     }
-                    // ADR-040 §3.5 iter-A5 — defensive arm; Embed's
-                    // `kv_bytes_needed: 0` makes this branch genuinely
-                    // unreachable today, but the typed match pins the
-                    // contract for Phase C2c+ Embed wiring.
+                    // ADR-040 §3.5 iter-A5b — Embed over-budget surfaces
+                    // a typed-prefix error that the embeddings handler
+                    // string-matches to route to ApiError::slot_budget_exceeded
+                    // (HTTP 429 + Retry-After: 1) parallel to queue_full.
                     Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
                         let _ = reply.send(Err(anyhow::anyhow!(
-                            "ADR-040 §3.5 A5: scheduler rejected Embed — \
-                             per-slot KV budget exceeded (needed_bytes={}, \
+                            "slot_budget_exceeded: ADR-040 §3.5 A5b — Embed \
+                             prompt exceeds per-slot KV budget (needed_bytes={}, \
                              budget_bytes={}). Reduce prompt length.",
                             needed_bytes, budget_bytes
                         )));
@@ -4005,13 +4213,23 @@ fn worker_run(
                 // synthetic prefill+decode bookkeeping shape with
                 // Request::Generate (single prompt prefill, then
                 // tokens_produced decodes).
-                // ADR-040 §3.5 iter-A5: `kv_bytes_needed: 0` opts out of
-                // per-slot KV-budget enforcement (FifoSerial byte-equivalence
-                // contract); Phase C2c+ wires the per-arch byte cost.
+                // ADR-040 §3.5 iter-A5b — real per-request KV byte cost
+                // for the vision-aware generate path. Shares the same
+                // (prompt_tokens + max_tokens) × kv_bytes_per_token
+                // formula as the text-only Generate arm. `0` opts out
+                // (synthetic fixtures + unset --kv-cache-budget-bytes).
+                let needed_bytes_admit: u64 =
+                    if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
+                        0
+                    } else {
+                        u64::from(prompt_tokens.len() as u32)
+                            .saturating_add(u64::from(params.max_tokens as u32))
+                            .saturating_mul(kv_bytes_per_token)
+                    };
                 let admit_req = AdmitRequest {
                     prompt_tokens: prompt_tokens.len() as u32,
                     max_tokens: params.max_tokens as u32,
-                    kv_bytes_needed: 0,
+                    kv_bytes_needed: needed_bytes_admit,
                 };
                 let admitted = match scheduler.admit(admit_req) {
                     Ok(slot) => slot,
@@ -4023,12 +4241,12 @@ fn worker_run(
                         )));
                         continue;
                     }
-                    // ADR-040 §3.5 iter-A5 — defensive arm parallel to
-                    // QueueFull; today unreachable under FifoSerial
-                    // (`kv_bytes_needed: 0` opts out of enforcement).
+                    // ADR-040 §3.5 iter-A5b — typed-prefix error for
+                    // the handler-side 429 mapping (same shape as the
+                    // text-only Generate arm).
                     Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
                         let _ = reply.send(Err(anyhow::anyhow!(
-                            "ADR-040 §3.5 A5: scheduler rejected \
+                            "slot_budget_exceeded: ADR-040 §3.5 A5b — scheduler rejected \
                              GenerateWithSoftTokens — per-slot KV budget \
                              exceeded (needed_bytes={}, budget_bytes={}). \
                              Reduce max_tokens or use a shorter prompt.",
@@ -9122,6 +9340,27 @@ assistant:
     where
         F: FnOnce(mpsc::Receiver<Request>) + Send + 'static,
     {
+        make_test_engine_with_worker_arch_and_budget(arch, 0, 0, worker)
+    }
+
+    /// **ADR-040 §3.5 iter-A5b** — synthetic test engine constructor
+    /// with explicit per-slot KV budget + cached per-token bytes. Used
+    /// by the iter-A5b tests that exercise `Engine::try_admit_budget`
+    /// + the handler-side `slot_budget_exceeded` routing.
+    ///
+    /// Both `per_slot_kv_budget_bytes = 0` and `kv_bytes_per_token = 0`
+    /// preserve the pre-A5 byte-equivalence (enforcement disabled);
+    /// any non-zero value on BOTH fields exercises the typed
+    /// `EngineAdmitError::SlotBudgetExceeded` path.
+    fn make_test_engine_with_worker_arch_and_budget<F>(
+        arch: LoadedArch,
+        per_slot_kv_budget_bytes: u64,
+        kv_bytes_per_token_cached: u64,
+        worker: F,
+    ) -> Engine
+    where
+        F: FnOnce(mpsc::Receiver<Request>) + Send + 'static,
+    {
         let (tx, rx) = mpsc::channel::<Request>(8);
         let handle = std::thread::Builder::new()
             .name("hf2q-engine-test".into())
@@ -9149,6 +9388,8 @@ assistant:
                 mode: EngineMode::SerialFifo,
                 // ADR-040 C2b scaffold for test-only engines.
                 max_slots: 1,
+                per_slot_kv_budget_bytes,
+                kv_bytes_per_token_cached,
                 scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
                     policy: SchedulerPolicy::FifoSerial,
                     in_flight_slots: 0,
@@ -9189,6 +9430,121 @@ assistant:
             // production worker they have replies, but here we just drop
             // them — the senders never await a reply.
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // cfa-iter-A5b CRITICAL #1 — Engine::try_admit_budget pre-stream check
+    // tests. These prove the typed-error seam actually fires under a
+    // synthetic budget; the production hot path (worker_run) flows the
+    // same numbers in via `Engine::spawn`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a5b_try_admit_budget_returns_ok_under_zero_budget() {
+        // Both fields 0 ⇒ enforcement disabled ⇒ Ok regardless of
+        // prompt + max_tokens.
+        let engine = make_test_engine_with_worker_arch_and_budget(
+            LoadedArch::Gemma, 0, 0, drain_until_shutdown,
+        );
+        assert!(engine.try_admit_budget(0, 0).is_ok());
+        assert!(engine.try_admit_budget(u32::MAX, u32::MAX).is_ok(),
+            "u64::MAX-saturating needed_bytes still admits under zero budget");
+    }
+
+    #[test]
+    fn a5b_try_admit_budget_returns_ok_when_only_budget_set() {
+        // Budget set but kv_bytes_per_token = 0 (synthetic loader) ⇒
+        // Ok (cannot compute cost; treat as do-not-enforce per
+        // scheduler.rs `kv_bytes_needed: 0` opt-out).
+        let engine = make_test_engine_with_worker_arch_and_budget(
+            LoadedArch::Gemma, 1024 * 1024, 0, drain_until_shutdown,
+        );
+        assert!(engine.try_admit_budget(1000, 1000).is_ok());
+    }
+
+    #[test]
+    fn a5b_try_admit_budget_returns_ok_when_only_per_token_set() {
+        // Per-token set but budget = 0 ⇒ Ok (operator didn't pass
+        // --kv-cache-budget-bytes; preserves pre-A5 byte-equivalence).
+        let engine = make_test_engine_with_worker_arch_and_budget(
+            LoadedArch::Gemma, 0, 4096, drain_until_shutdown,
+        );
+        assert!(engine.try_admit_budget(1000, 1000).is_ok());
+    }
+
+    #[test]
+    fn a5b_try_admit_budget_returns_ok_under_budget() {
+        // 1 MiB budget, 256 bytes/token, 100 + 100 = 200 tokens ⇒
+        // 200 × 256 = 51_200 bytes ≤ 1_048_576 ⇒ Ok.
+        let engine = make_test_engine_with_worker_arch_and_budget(
+            LoadedArch::Gemma, 1024 * 1024, 256, drain_until_shutdown,
+        );
+        assert!(engine.try_admit_budget(100, 100).is_ok());
+    }
+
+    #[test]
+    fn a5b_try_admit_budget_returns_slot_budget_exceeded_when_over() {
+        // 1 MiB budget, 1024 bytes/token, 1000 + 1000 = 2000 tokens ⇒
+        // 2000 × 1024 = 2_048_000 > 1_048_576 ⇒ SlotBudgetExceeded.
+        let engine = make_test_engine_with_worker_arch_and_budget(
+            LoadedArch::Gemma, 1024 * 1024, 1024, drain_until_shutdown,
+        );
+        match engine.try_admit_budget(1000, 1000) {
+            Err(EngineAdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                assert_eq!(needed_bytes, 2000 * 1024,
+                    "needed_bytes = (prompt + max) × per_token");
+                assert_eq!(budget_bytes, 1024 * 1024,
+                    "budget_bytes echoes the configured per-slot budget");
+            }
+            Ok(()) => panic!("over-budget admit MUST surface SlotBudgetExceeded, got Ok"),
+        }
+    }
+
+    #[test]
+    fn a5b_try_admit_budget_at_budget_exactly_returns_ok() {
+        // Boundary: needed == budget is Ok (strict `>` in the check).
+        let engine = make_test_engine_with_worker_arch_and_budget(
+            LoadedArch::Gemma, 1024 * 1024, 1024, drain_until_shutdown,
+        );
+        // 1024 × 1024 = 1 MiB exactly.
+        assert!(engine.try_admit_budget(512, 512).is_ok(),
+            "at-budget admit (needed == budget) must succeed");
+    }
+
+    #[test]
+    fn a5b_per_slot_kv_budget_bytes_accessor_echoes_stored_value() {
+        // The accessor is the load-bearing surface for Prometheus
+        // exposition + future per-slot operator views; pin that it
+        // simply echoes EngineInner.per_slot_kv_budget_bytes.
+        let engine = make_test_engine_with_worker_arch_and_budget(
+            LoadedArch::Gemma, 4 * 1024 * 1024, 256, drain_until_shutdown,
+        );
+        assert_eq!(engine.per_slot_kv_budget_bytes(), 4 * 1024 * 1024);
+        let engine0 = make_test_engine_with_worker_arch_and_budget(
+            LoadedArch::Gemma, 0, 0, drain_until_shutdown,
+        );
+        assert_eq!(engine0.per_slot_kv_budget_bytes(), 0,
+            "0 means enforcement disabled");
+    }
+
+    #[test]
+    fn a5b_engine_admit_error_display_names_needed_and_budget() {
+        // The Display impl is what the operator sees in tracing logs +
+        // anyhow chains; pin that it names both fields verbatim AND
+        // cites ADR-040 §3.5.
+        let err = EngineAdmitError::SlotBudgetExceeded {
+            needed_bytes: 12_345_678,
+            budget_bytes: 4_096_000,
+        };
+        let display = format!("{err}");
+        assert!(display.contains("12345678"),
+            "Display names needed_bytes verbatim: {display}");
+        assert!(display.contains("4096000"),
+            "Display names budget_bytes verbatim: {display}");
+        assert!(display.contains("ADR-040"),
+            "Display cites ADR-040: {display}");
+        assert!(display.contains("max_tokens") || display.contains("prompt"),
+            "Display names the actionable remediation: {display}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10377,6 +10733,9 @@ assistant:
                 mode: EngineMode::SerialFifo,
                 // ADR-040 C2b scaffold for synthetic test fixtures.
                 max_slots: 1,
+                // ADR-040 §3.5 iter-A5b: synthetic fixtures opt out.
+                per_slot_kv_budget_bytes: 0,
+                kv_bytes_per_token_cached: 0,
                 scheduler_stats_snapshot: Arc::new(Mutex::new(SchedulerStats {
                     policy: SchedulerPolicy::FifoSerial,
                     in_flight_slots: 0,

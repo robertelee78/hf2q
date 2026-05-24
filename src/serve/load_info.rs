@@ -318,6 +318,88 @@ pub struct LoadInfo {
     pub tq_kv_active: bool,
 }
 
+impl LoadInfo {
+    /// **ADR-040 §3.5 iter-A5b** — operator-honest upper bound on
+    /// per-token KV bytes for this loaded model.
+    ///
+    /// The formula mirrors [`estimate_kv_tokens`] (used for the load
+    /// banner), generalised to the production
+    /// "K + V, F32-equivalent worst case" shape so the engine seam can
+    /// compute `kv_bytes_needed = (prompt_tokens + max_tokens) *
+    /// kv_bytes_per_token()` at admit time without needing per-arch
+    /// model state.
+    ///
+    /// Per-token cost (bytes):
+    ///
+    /// ```text
+    /// n_layers × n_kv_heads × head_dim × dtype_bytes × 2  (K and V)
+    /// ```
+    ///
+    /// where `dtype_bytes = 4` (F32) is the conservative upper bound
+    /// that matches the legacy [`estimate_kv_tokens`] formula. Real
+    /// production KV may live in F16 (`HF2Q_F16_KV`), packed U8 (TQ,
+    /// ADR-007), or hybrid Full/Sliding allocations (Gemma 4 sliding
+    /// layers cap at `sliding_window`, not `max_seq_len`) — every one
+    /// of those is at-most-equal to this F32-flat estimate. Using the
+    /// upper bound means [`AdmitError::SlotBudgetExceeded`] rejects
+    /// requests whose maximum possible KV would exceed the per-slot
+    /// budget — operator-honest false-reject of borderline cases,
+    /// never a false-accept that would surface as mid-decode OOM.
+    ///
+    /// Returns `0` when any of `n_layers`, `n_key_value_heads`, or
+    /// `head_dim` is zero (the synthetic-fixture / test-loader path);
+    /// callers MUST treat `0` as "do not enforce" (mirrors
+    /// [`crate::serve::scheduler::AdmitRequest::kv_bytes_needed`]'s
+    /// `0`-means-disabled semantics).
+    ///
+    /// # Why F32 not the actual KV dtype
+    ///
+    /// `LoadInfo` does not currently carry the per-layer KV dtype
+    /// (TQ + hybrid arches have heterogeneous dtypes per layer — see
+    /// `inference/models/gemma4/kv_cache.rs` `MlxKvCache` (TQ U8 +
+    /// F32 norms) vs `DenseKvBuffers` (F16 or F32 per `HF2Q_F16_KV`)).
+    /// Threading the per-layer dtype vector through the engine seam
+    /// would re-litigate the bytes-vs-tokens decision documented at
+    /// `serve/scheduler.rs` iter-A5 header. F32 is the largest dtype
+    /// reachable in production today; using it as the upper bound is
+    /// the simplest operator-honest choice that does not require
+    /// per-arch math at the engine seam.
+    pub fn kv_bytes_per_token(&self) -> u64 {
+        let n_layers = u64::from(self.n_layers);
+        let n_kv = u64::from(self.n_key_value_heads);
+        let hd = u64::from(self.head_dim);
+        if n_layers == 0 || n_kv == 0 || hd == 0 {
+            return 0;
+        }
+        // F32 (4 bytes) × 2 (K and V) — conservative upper bound.
+        n_layers
+            .saturating_mul(n_kv)
+            .saturating_mul(hd)
+            .saturating_mul(4)
+            .saturating_mul(2)
+    }
+
+    /// **ADR-040 §3.5 iter-A5b** — compute the KV byte cost a request
+    /// of `(prompt_tokens + max_tokens)` tokens would put on a single
+    /// physical KV slot. Returns `0` when [`Self::kv_bytes_per_token`]
+    /// is `0` (synthetic loader / missing arch facts) — caller treats
+    /// `0` as "do not enforce" per the scheduler's
+    /// `kv_bytes_needed: 0` opt-out contract.
+    ///
+    /// Saturating-arithmetic throughout — a u32×u32 multiply that
+    /// overflows surfaces as `u64::MAX`, which the per-slot budget
+    /// check trivially rejects (the operator-actionable failure mode
+    /// — caller is asking for absurd seq_len).
+    pub fn kv_bytes_for_request(&self, prompt_tokens: u32, max_tokens: u32) -> u64 {
+        let per_token = self.kv_bytes_per_token();
+        if per_token == 0 {
+            return 0;
+        }
+        let total_tokens = u64::from(prompt_tokens).saturating_add(u64::from(max_tokens));
+        total_tokens.saturating_mul(per_token)
+    }
+}
+
 /// Implemented by each loaded-model variant to produce the shared load
 /// snapshot from owned model state plus the still-open GGUF metadata.
 pub trait LoadInfoBuilder {
@@ -1606,5 +1688,77 @@ mod tests {
         for field in expected {
             assert!(names.contains(field), "missing tracing field {field}");
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADR-040 §3.5 iter-A5b — kv_bytes_per_token / kv_bytes_for_request
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn kv_bytes_per_token_qwen35moe_golden_matches_f32_kv_formula() {
+        let info = golden_qwen35moe_info();
+        // 64 layers × 4 kv heads × 128 head_dim × 4 (F32) × 2 (K+V)
+        // = 262_144 bytes per token = 256 KiB.
+        let expected: u64 = 64 * 4 * 128 * 4 * 2;
+        assert_eq!(
+            info.kv_bytes_per_token(),
+            expected,
+            "qwen35moe golden fixture: kv_bytes_per_token MUST be 256 KiB"
+        );
+        // Spot-check the for_request formula against a 4096-token total.
+        // (prompt=2048 + max_tokens=2048) × 256 KiB = 1 GiB.
+        let total_tokens: u64 = 2048 + 2048;
+        assert_eq!(
+            info.kv_bytes_for_request(2048, 2048),
+            total_tokens * expected,
+        );
+    }
+
+    #[test]
+    fn kv_bytes_per_token_zero_when_arch_facts_missing() {
+        let mut info = golden_qwen35moe_info();
+        info.n_layers = 0;
+        assert_eq!(info.kv_bytes_per_token(), 0,
+            "zero n_layers ⇒ 0 (synthetic loader / test fixture)");
+        let mut info = golden_qwen35moe_info();
+        info.n_key_value_heads = 0;
+        assert_eq!(info.kv_bytes_per_token(), 0,
+            "zero n_key_value_heads ⇒ 0");
+        let mut info = golden_qwen35moe_info();
+        info.head_dim = 0;
+        assert_eq!(info.kv_bytes_per_token(), 0,
+            "zero head_dim ⇒ 0");
+    }
+
+    #[test]
+    fn kv_bytes_for_request_returns_zero_when_per_token_is_zero() {
+        let mut info = golden_qwen35moe_info();
+        info.n_layers = 0;
+        // Even with huge token counts the result is 0 — caller treats
+        // as "do not enforce" per the scheduler opt-out contract.
+        assert_eq!(info.kv_bytes_for_request(u32::MAX, u32::MAX), 0);
+    }
+
+    #[test]
+    fn kv_bytes_for_request_overflow_saturates_at_u64_max() {
+        // n_layers=64 × kv=4 × hd=128 × 4 × 2 = 262_144 bytes/token.
+        // u64::MAX / 262_144 ≈ 7.04e13 tokens — well above u32::MAX
+        // total (~4.3e9). So u32::MAX prompt + u32::MAX max_tokens =
+        // ~8.6e9 tokens × 262_144 ≈ 2.25e15 bytes, which fits in u64.
+        // Manufacture an overflow by inflating n_layers to a value
+        // that makes the multiply saturate.
+        let mut info = golden_qwen35moe_info();
+        info.n_layers = u32::MAX;
+        info.n_key_value_heads = u32::MAX;
+        info.head_dim = u32::MAX;
+        // Per-token bytes saturates to u64::MAX under any reasonable
+        // token count.
+        let needed = info.kv_bytes_for_request(1, 1);
+        assert_eq!(
+            needed,
+            u64::MAX,
+            "saturating-mul must surface u64::MAX (caller's scheduler \
+             check rejects as SlotBudgetExceeded)"
+        );
     }
 }

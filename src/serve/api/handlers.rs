@@ -437,6 +437,17 @@ pub async fn chat_completions(
                 state.metrics.chat_completions_queue_full.fetch_add(1, Ordering::Relaxed);
                 return queue_full_with_rate_limit_headers(&state);
             }
+            // ADR-040 §3.5 iter-A5b — typed-prefix routing for the
+            // per-slot KV budget rejection. The worker_run admit arms
+            // wrap `AdmitError::SlotBudgetExceeded` in an anyhow error
+            // whose message starts with `slot_budget_exceeded:`; the
+            // handler maps it to HTTP 429 + Retry-After parallel to
+            // queue_full but with a distinct `slot_budget_exceeded`
+            // code for observability.
+            if msg.contains("slot_budget_exceeded") {
+                let (needed, budget) = parse_slot_budget_exceeded(&msg);
+                return ApiError::slot_budget_exceeded(needed, budget).into_response();
+            }
             // ADR-005 Phase 4 reopen iter-215 Wedge-2: Qwen3.5/3.6 SERVE-side
             // chat completion path returns the sentinel; map to HTTP 501 with
             // the operator-actionable body (names `hf2q generate` AND
@@ -1724,6 +1735,35 @@ async fn chat_completions_stream(
     // ServerMetrics so /metrics surfaces it.
     let cancellation_counter =
         Some(state.metrics.sse_cancellations_counter_arc());
+    // ADR-040 §3.5 iter-A5b — PRE-STREAM per-slot KV budget check.
+    // Per codex review CRITICAL #2 (handlers.rs:1739-1748 originally
+    // string-matched `queue_full` only AND streaming-arm admit
+    // happened AFTER generate_stream_with_deepstack returned Ok),
+    // the streaming path can't surface SlotBudgetExceeded as a clean
+    // 429 once the SSE body has started. Calling
+    // `Engine::try_admit_budget` BEFORE dispatching the stream-mpsc
+    // request gives us the typed-error seam to short-circuit to
+    // ApiError::slot_budget_exceeded with a wire-level shape
+    // identical to queue_full (429 + Retry-After: 1).
+    if let Err(e) = engine.try_admit_budget(
+        prepared.prompt_tokens.len() as u32,
+        prepared.params.max_tokens as u32,
+    ) {
+        match e {
+            engine::EngineAdmitError::SlotBudgetExceeded {
+                needed_bytes,
+                budget_bytes,
+            } => {
+                tracing::info!(
+                    needed_bytes,
+                    budget_bytes,
+                    "chat_completions_stream: ADR-040 §3.5 A5b pre-stream slot_budget_exceeded"
+                );
+                return ApiError::slot_budget_exceeded(needed_bytes, budget_bytes)
+                    .into_response();
+            }
+        }
+    }
     if let Err(e) = engine
         .generate_stream_with_deepstack(
             prepared.prompt_tokens,
@@ -1743,6 +1783,16 @@ async fn chat_completions_stream(
                 .chat_completions_queue_full
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return queue_full_with_rate_limit_headers(&state);
+        }
+        // ADR-040 §3.5 iter-A5b — defense-in-depth slot_budget_exceeded
+        // routing for the streaming arm (parallel to the non-streaming
+        // chat handler at line ~436). Today this branch is reached only
+        // if `engine.try_admit_budget` was bypassed (e.g. enforcement
+        // disabled at the engine level but enabled at the scheduler
+        // level — a configuration error). Mantra-aligned typed match.
+        if msg.contains("slot_budget_exceeded") {
+            let (needed, budget) = parse_slot_budget_exceeded(&msg);
+            return ApiError::slot_budget_exceeded(needed, budget).into_response();
         }
         tracing::error!(error = %msg, "chat_completions_stream enqueue failed");
         return ApiError::generation_error(msg).into_response();
@@ -5860,6 +5910,37 @@ mod grammar_kind_selection_tests {
 ///   - `Remaining` = 0 when we're returning 429 (queue is at capacity).
 ///   - `Reset`    = seconds until retry is likely to succeed (same as
 ///                  Retry-After — 1 second heuristic for queue-based backoff).
+/// **ADR-040 §3.5 iter-A5b** — string-extract the `needed_bytes` +
+/// `budget_bytes` numbers from a worker_run `slot_budget_exceeded`
+/// error message so the handler-side
+/// [`ApiError::slot_budget_exceeded`] can embed the same numbers in
+/// the wire-level 429 body.
+///
+/// The worker error format is pinned at engine.rs (4 admit sites
+/// under `worker_run`):
+///
+/// ```text
+/// slot_budget_exceeded: ADR-040 §3.5 A5b — ... \
+///   needed_bytes=<u64>, budget_bytes=<u64>...
+/// ```
+///
+/// Returns `(needed, budget)` on a match, `(0, 0)` if either field
+/// is absent or unparseable (defense-in-depth — the handler still
+/// returns a 429 with zero placeholders rather than misrouting to
+/// generation_error, but the operator-facing body loses the
+/// remediation numbers in that case).
+fn parse_slot_budget_exceeded(msg: &str) -> (u64, u64) {
+    fn extract_u64(msg: &str, key: &str) -> u64 {
+        // Find `key=` then parse contiguous digits.
+        let needle = format!("{key}=");
+        let Some(start) = msg.find(&needle) else { return 0 };
+        let after = &msg[start + needle.len()..];
+        let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+        after[..end].parse::<u64>().unwrap_or(0)
+    }
+    (extract_u64(msg, "needed_bytes"), extract_u64(msg, "budget_bytes"))
+}
+
 fn queue_full_with_rate_limit_headers(state: &AppState) -> Response {
     use axum::http::{header::HeaderName, HeaderValue};
     let err = ApiError::queue_full();
@@ -6308,6 +6389,29 @@ async fn chat_model_embeddings(
         // Dispatch through the engine's FIFO worker queue.  queue_full
         // maps to 429 + Retry-After in the same convention as chat
         // completions.
+        //
+        // ADR-040 §3.5 iter-A5b — embeddings get a PRE-DISPATCH
+        // budget check too: a multi-batch request would otherwise
+        // serialize through worker_run and hit
+        // `AdmitError::SlotBudgetExceeded` one entry at a time, each
+        // costing a worker channel round-trip. Pre-checking here
+        // short-circuits the whole batch before any subprocess work.
+        if let Err(e) = engine.try_admit_budget(prompt_tokens.len() as u32, 0) {
+            match e {
+                engine::EngineAdmitError::SlotBudgetExceeded {
+                    needed_bytes,
+                    budget_bytes,
+                } => {
+                    tracing::info!(
+                        needed_bytes,
+                        budget_bytes,
+                        "embeddings: ADR-040 §3.5 A5b pre-dispatch slot_budget_exceeded"
+                    );
+                    return ApiError::slot_budget_exceeded(needed_bytes, budget_bytes)
+                        .into_response();
+                }
+            }
+        }
         let embedding: Vec<f32> = match engine.embed(prompt_tokens).await {
             Ok(v) => v,
             Err(e) => {
@@ -6325,6 +6429,15 @@ async fn chat_model_embeddings(
                             }
                         })),
                     )
+                        .into_response();
+                }
+                // ADR-040 §3.5 iter-A5b — defense-in-depth
+                // slot_budget_exceeded routing for the embeddings
+                // arm; reaches this branch only if pre-dispatch was
+                // bypassed (configuration error).
+                if msg.contains("slot_budget_exceeded") {
+                    let (needed, budget) = parse_slot_budget_exceeded(&msg);
+                    return ApiError::slot_budget_exceeded(needed, budget)
                         .into_response();
                 }
                 // Iter-215 Wedge-2: Qwen3.5/3.6 embed sentinel → 501.
@@ -9534,5 +9647,62 @@ mod bos_probe_tests {
                 "duplicate fragment in BOS_PROBE_FRAGMENTS: {f}"
             );
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // cfa-iter-A5b CRITICAL #2 — parse_slot_budget_exceeded tests.
+    //
+    // These pin the worker → handler error-string contract. The worker
+    // emits `slot_budget_exceeded: ... needed_bytes=N, budget_bytes=M`;
+    // the handler must extract N + M so `ApiError::slot_budget_exceeded`
+    // can embed them in the operator-facing 429 body. A drift in either
+    // the worker format OR the parser would silently produce a 429 with
+    // zero placeholders, dropping the remediation diagnostic.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a5b_parse_slot_budget_exceeded_extracts_both_numbers() {
+        let msg = "slot_budget_exceeded: ADR-040 §3.5 A5b — per-slot KV \
+                   budget exceeded (needed_bytes=12345678, budget_bytes=4096000). \
+                   Reduce max_tokens or use a shorter prompt.";
+        assert_eq!(super::parse_slot_budget_exceeded(msg), (12_345_678, 4_096_000));
+    }
+
+    #[test]
+    fn a5b_parse_slot_budget_exceeded_no_match_returns_zeros() {
+        // String does not carry the markers ⇒ (0, 0). Defense-in-depth:
+        // the handler still routes to ApiError::slot_budget_exceeded
+        // (returning 429), but the body loses the remediation numbers.
+        let msg = "completely unrelated error string";
+        assert_eq!(super::parse_slot_budget_exceeded(msg), (0, 0));
+    }
+
+    #[test]
+    fn a5b_parse_slot_budget_exceeded_partial_match_returns_zero_for_missing() {
+        // Only needed_bytes present ⇒ (N, 0).
+        let msg = "slot_budget_exceeded: needed_bytes=999 (no budget here)";
+        assert_eq!(super::parse_slot_budget_exceeded(msg), (999, 0));
+        // Only budget_bytes present ⇒ (0, M).
+        let msg2 = "slot_budget_exceeded: budget_bytes=4096 (no needed)";
+        assert_eq!(super::parse_slot_budget_exceeded(msg2), (0, 4096));
+    }
+
+    #[test]
+    fn a5b_parse_slot_budget_exceeded_handles_u64_max() {
+        // Large numbers — verify the parser handles overflow-saturated
+        // u64 values without panicking.
+        let big = u64::MAX.to_string();
+        let msg = format!("slot_budget_exceeded: needed_bytes={big}, budget_bytes={big}");
+        assert_eq!(super::parse_slot_budget_exceeded(&msg), (u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn a5b_parse_slot_budget_exceeded_extracts_from_streaming_error_format() {
+        // The streaming worker emits a slightly different message
+        // (GenerationEvent::Error variant) — pin both:
+        let msg = "slot_budget_exceeded: ADR-040 §3.5 A5b — per-slot KV \
+                   budget exceeded for GenerateStream (needed_bytes=200, \
+                   budget_bytes=100). Reduce max_tokens or use a shorter prompt.";
+        assert_eq!(super::parse_slot_budget_exceeded(msg), (200, 100));
     }
 }

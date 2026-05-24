@@ -67,6 +67,29 @@
 //! a real measurement body, but the panic-on-missing-GGUF guard is
 //! kept so the failure mode is operator-actionable rather than silent.
 //!
+//! **cfa-iter-A5b MINOR #2 — opt-in contract clarification**: when
+//! `HF2Q_CB_THROUGHPUT_E2E=1` is set, ALL related env vars are HARD
+//! REQUIREMENTS (the gate's full opt-in surface):
+//!   - `HF2Q_CB_THROUGHPUT_MODEL` MUST be set — missing ⇒ PANIC,
+//!     not a graceful skip. The bench cannot fall back to a "default
+//!     GGUF" or silently skip because doing so would surface as a
+//!     PASS log without any measurement. The codex review surfaced
+//!     this as a perceived inconsistency vs the legacy `HF2Q_GGUF_PATH`
+//!     alias; this module DOES NOT honour `HF2Q_GGUF_PATH` —
+//!     `HF2Q_CB_THROUGHPUT_MODEL` is the bench-specific env required
+//!     for D3 measurements. The hard-fail contract is intentional per
+//!     cfa-finding-F8.
+//!   - `HF2Q_CB_THROUGHPUT_CONCURRENCY` IS optional and defaults to
+//!     `"1,2,4,8"`. If the operator restricts it (e.g. to `"4"`),
+//!     the AC-4 TTFT half cannot fire because the N=1 baseline is
+//!     missing — see `ac4_outcome::Misconfigured` (cfa-iter-A5b
+//!     MAJOR #2).
+//!   - `HF2Q_CB_THROUGHPUT_PROMPT`, `_MAX_TOKENS`, `_PORT_BASE` are
+//!     all optional with documented defaults.
+//!
+//! Skip only happens when `HF2Q_CB_THROUGHPUT_E2E` is UNSET. With the
+//! gate set, every required env is enforced.
+//!
 //! # InflightBatched-skip-when-unwired
 //!
 //! As of iter-A5 baseline, `--scheduler inflight_batched` is rejected
@@ -297,6 +320,91 @@ pub const REPS: usize = 3;
 /// chosen to be roughly 2× the typical run-to-run variance observed
 /// on the ADR-033 §Pi Qwen3.6 bench (~10% peak-to-peak at REPS=3).
 pub const STABILITY_SIGMA_PCT_THRESHOLD: f64 = 20.0;
+
+/// **cfa-iter-A5b MAJOR #2 fix** — typed outcome of the AC-4 gate.
+/// Extracted from the env-gated `cb_throughput_n_1_2_4_8_fifo_vs_inflight`
+/// body so the misconfiguration + deferral logic can be exercised by
+/// always-on unit tests (the env-gated body itself remains skip-by-
+/// default).
+///
+/// The codex MAJOR #2 finding was that `[ac-4 PARTIAL]` silently
+/// dropped the TTFT half of the AC-4 gate when an operator restricted
+/// `HF2Q_CB_THROUGHPUT_CONCURRENCY` to exclude N=1, even when BOTH
+/// N=4 cells were present. The `Misconfigured` variant pins that
+/// failure mode as a HARD ERROR (the env-gated body `panic!`s on it).
+#[derive(Debug, PartialEq)]
+pub enum Ac4Outcome {
+    /// AC-4 cannot fire — at least one of `fifo_serial N=4` or
+    /// `inflight_batched N=4` is absent (typically `inflight_batched`
+    /// until Phase C2c/C2d ship). The FifoSerial-only baseline +
+    /// variance section is still emitted; AC-4 will fire on the first
+    /// run after the missing side lands.
+    Deferred,
+    /// AC-4 is misconfigured — BOTH N=4 cells present BUT the
+    /// `fifo_serial N=1` baseline cell needed for the TTFT denominator
+    /// is missing. Operator should re-run with N=1 in the
+    /// concurrency list.
+    Misconfigured,
+    /// One of the N=4 cells has `sigma_pct >
+    /// STABILITY_SIGMA_PCT_THRESHOLD` — the median is too noisy for
+    /// AC-4 to be meaningful. Operator should re-run or bump REPS.
+    StabilityBlocked,
+    /// AC-4 fired and PASSED — aggregate ratio ≥ 1.5× and TTFT ratio
+    /// ≤ 2.0×. Carries the two ratios for diagnostic emission.
+    Passed { aggregate_ratio: f64, ttft_ratio: f64 },
+    /// AC-4 fired and FAILED — either aggregate ratio < 1.5× or TTFT
+    /// ratio > 2.0×. Carries both ratios + a phrase naming which half
+    /// failed so the env-gated body can panic with a precise message.
+    Failed {
+        aggregate_ratio: f64,
+        ttft_ratio: f64,
+        which: &'static str,
+    },
+}
+
+/// **cfa-iter-A5b MAJOR #2 fix** — pure AC-4 gate evaluation.
+///
+/// Inputs: the three cell slots
+/// (`fifo_serial N=4`, `inflight_batched N=4`, `fifo_serial N=1`). The
+/// env-gated body extracts these from `all_cells` via `Vec::iter().find`
+/// before calling this helper. Separating the policy from the I/O
+/// (subprocess spawn, stderr emission, panic body construction) makes
+/// the misconfiguration / deferral / stability paths testable
+/// in isolation under always-on unit tests.
+pub fn ac4_outcome(
+    fifo_n4: Option<&ThroughputCellStable>,
+    inflight_n4: Option<&ThroughputCellStable>,
+    fifo_n1: Option<&ThroughputCellStable>,
+) -> Ac4Outcome {
+    let (f, i) = match (fifo_n4, inflight_n4) {
+        (Some(f), Some(i)) => (f, i),
+        _ => return Ac4Outcome::Deferred,
+    };
+    if f.aggregate_tokens_per_sec_sigma_pct > STABILITY_SIGMA_PCT_THRESHOLD
+        || i.aggregate_tokens_per_sec_sigma_pct > STABILITY_SIGMA_PCT_THRESHOLD
+    {
+        return Ac4Outcome::StabilityBlocked;
+    }
+    // BOTH N=4 cells present + stable → N=1 baseline MUST be present.
+    // Pre-iter-A5b the absence here returned a soft `[ac-4 PARTIAL]`
+    // diagnostic and skipped the TTFT half of the gate; the codex
+    // MAJOR #2 finding was that this lets a TTFT regression pass
+    // silently. New behaviour: surface `Misconfigured` so the
+    // env-gated body panics.
+    let Some(base) = fifo_n1 else {
+        return Ac4Outcome::Misconfigured;
+    };
+    let aggregate_ratio = i.aggregate_tokens_per_sec_median
+        / f.aggregate_tokens_per_sec_median.max(1e-6);
+    let ttft_ratio = i.ttft_p95_ms_median / base.ttft_p95_ms_median.max(1e-6);
+    if aggregate_ratio < 1.5 {
+        return Ac4Outcome::Failed { aggregate_ratio, ttft_ratio, which: "aggregate" };
+    }
+    if ttft_ratio > 2.0 {
+        return Ac4Outcome::Failed { aggregate_ratio, ttft_ratio, which: "ttft" };
+    }
+    Ac4Outcome::Passed { aggregate_ratio, ttft_ratio }
+}
 
 fn hf2q_binary_path() -> PathBuf {
     if let Some(p) = std::env::var_os("CARGO_BIN_EXE_hf2q") {
@@ -539,6 +647,142 @@ fn d3_stability_threshold_default_is_twenty_pct() {
     // Pin REPS at 3 for the same reason: the ADR-033 §Pi median
     // discriminator floor is 3 reps; any change should be deliberate.
     assert_eq!(REPS, 3, "REPS changed from 3 — update ADR §6.1.15 too");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// cfa-iter-A5b MAJOR #2 — AC-4 gate outcome tests (always-on).
+//
+// These exercise the pure `ac4_outcome` helper extracted from the
+// env-gated body so the misconfiguration / deferral / stability /
+// failed / passed paths can be verified without spawning subprocesses.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Build a synthetic stable cell with the given policy, concurrency,
+/// aggregate median, sigma_pct, and TTFT p95 median. The other
+/// fields are zeroed — only the four used by `ac4_outcome` matter.
+fn stable_cell(
+    policy: &'static str,
+    concurrency: u32,
+    aggregate_median: f64,
+    sigma_pct: f64,
+    ttft_p95_median: f64,
+) -> ThroughputCellStable {
+    ThroughputCellStable {
+        policy,
+        concurrency,
+        rep_count: 3,
+        aggregate_tokens_per_sec_median: aggregate_median,
+        aggregate_tokens_per_sec_min: aggregate_median * 0.95,
+        aggregate_tokens_per_sec_max: aggregate_median * 1.05,
+        aggregate_tokens_per_sec_sigma_pct: sigma_pct,
+        ttft_p50_ms_median: ttft_p95_median * 0.5,
+        ttft_p95_ms_median: ttft_p95_median,
+        per_slot_tokens_per_sec_median: aggregate_median / f64::from(concurrency.max(1)),
+        rejected_429_count_total: 0,
+    }
+}
+
+#[test]
+fn ac4_outcome_missing_inflight_n4_returns_deferred() {
+    let f4 = stable_cell("fifo_serial", 4, 100.0, 5.0, 50.0);
+    let f1 = stable_cell("fifo_serial", 1, 50.0, 5.0, 50.0);
+    let out = ac4_outcome(Some(&f4), None, Some(&f1));
+    assert_eq!(out, Ac4Outcome::Deferred,
+        "Deferred when InflightBatched N=4 is absent (Phase C2c/C2d gated)");
+}
+
+#[test]
+fn ac4_outcome_missing_fifo_n4_returns_deferred() {
+    let i4 = stable_cell("inflight_batched", 4, 200.0, 5.0, 70.0);
+    let f1 = stable_cell("fifo_serial", 1, 50.0, 5.0, 50.0);
+    let out = ac4_outcome(None, Some(&i4), Some(&f1));
+    assert_eq!(out, Ac4Outcome::Deferred,
+        "Deferred when FifoSerial N=4 is absent");
+}
+
+#[test]
+fn ac4_outcome_both_n4_present_but_missing_n1_returns_misconfigured() {
+    // cfa-iter-A5b MAJOR #2: the load-bearing regression pin.
+    // Pre-fix this case returned `[ac-4 PARTIAL]` and silently
+    // skipped the TTFT half of the gate — a TTFT regression would
+    // pass. Post-fix: typed `Misconfigured` outcome → panic at the
+    // env-gated body.
+    let f4 = stable_cell("fifo_serial", 4, 100.0, 5.0, 50.0);
+    let i4 = stable_cell("inflight_batched", 4, 200.0, 5.0, 70.0);
+    let out = ac4_outcome(Some(&f4), Some(&i4), None);
+    assert_eq!(out, Ac4Outcome::Misconfigured,
+        "BOTH N=4 cells + missing N=1 baseline ⇒ Misconfigured (hard error, \
+         not silent skip — pre-iter-A5b [ac-4 PARTIAL] would have let a \
+         TTFT regression pass)");
+}
+
+#[test]
+fn ac4_outcome_stability_blocked_when_sigma_pct_above_threshold() {
+    // Either side over the 20% bar → StabilityBlocked.
+    let f4 = stable_cell("fifo_serial", 4, 100.0, 25.0, 50.0); // 25% > 20%
+    let i4 = stable_cell("inflight_batched", 4, 200.0, 5.0, 70.0);
+    let f1 = stable_cell("fifo_serial", 1, 50.0, 5.0, 50.0);
+    let out = ac4_outcome(Some(&f4), Some(&i4), Some(&f1));
+    assert_eq!(out, Ac4Outcome::StabilityBlocked,
+        "fifo_serial sigma_pct > threshold ⇒ StabilityBlocked");
+
+    let f4_ok = stable_cell("fifo_serial", 4, 100.0, 5.0, 50.0);
+    let i4_noisy = stable_cell("inflight_batched", 4, 200.0, 30.0, 70.0); // 30% > 20%
+    let out2 = ac4_outcome(Some(&f4_ok), Some(&i4_noisy), Some(&f1));
+    assert_eq!(out2, Ac4Outcome::StabilityBlocked,
+        "inflight_batched sigma_pct > threshold ⇒ StabilityBlocked");
+}
+
+#[test]
+fn ac4_outcome_passed_when_aggregate_above_1_5x_and_ttft_under_2x() {
+    // fifo N=4 = 100, inflight N=4 = 200 ⇒ aggregate ratio = 2.0× ≥ 1.5×
+    // fifo N=1 TTFT p95 = 50, inflight N=4 TTFT p95 = 70 ⇒ 1.4× ≤ 2.0×
+    let f4 = stable_cell("fifo_serial", 4, 100.0, 5.0, 50.0);
+    let i4 = stable_cell("inflight_batched", 4, 200.0, 5.0, 70.0);
+    let f1 = stable_cell("fifo_serial", 1, 50.0, 5.0, 50.0);
+    let out = ac4_outcome(Some(&f4), Some(&i4), Some(&f1));
+    match out {
+        Ac4Outcome::Passed { aggregate_ratio, ttft_ratio } => {
+            assert!((aggregate_ratio - 2.0).abs() < 1e-6);
+            assert!((ttft_ratio - 1.4).abs() < 1e-6);
+        }
+        other => panic!("expected Passed, got {other:?}"),
+    }
+}
+
+#[test]
+fn ac4_outcome_failed_aggregate_when_ratio_below_1_5x() {
+    // fifo N=4 = 100, inflight N=4 = 140 ⇒ 1.4× < 1.5× ⇒ Failed/aggregate.
+    let f4 = stable_cell("fifo_serial", 4, 100.0, 5.0, 50.0);
+    let i4 = stable_cell("inflight_batched", 4, 140.0, 5.0, 70.0);
+    let f1 = stable_cell("fifo_serial", 1, 50.0, 5.0, 50.0);
+    let out = ac4_outcome(Some(&f4), Some(&i4), Some(&f1));
+    match out {
+        Ac4Outcome::Failed { aggregate_ratio, which, .. } => {
+            assert!((aggregate_ratio - 1.4).abs() < 1e-6);
+            assert_eq!(which, "aggregate",
+                "aggregate ratio failure surfaces `which='aggregate'`");
+        }
+        other => panic!("expected Failed/aggregate, got {other:?}"),
+    }
+}
+
+#[test]
+fn ac4_outcome_failed_ttft_when_ratio_above_2x() {
+    // fifo N=4 = 100, inflight N=4 = 200 ⇒ aggregate 2.0× passes
+    // fifo N=1 TTFT p95 = 50, inflight N=4 TTFT p95 = 150 ⇒ 3.0× > 2.0×
+    let f4 = stable_cell("fifo_serial", 4, 100.0, 5.0, 50.0);
+    let i4 = stable_cell("inflight_batched", 4, 200.0, 5.0, 150.0);
+    let f1 = stable_cell("fifo_serial", 1, 50.0, 5.0, 50.0);
+    let out = ac4_outcome(Some(&f4), Some(&i4), Some(&f1));
+    match out {
+        Ac4Outcome::Failed { ttft_ratio, which, .. } => {
+            assert!((ttft_ratio - 3.0).abs() < 1e-6);
+            assert_eq!(which, "ttft",
+                "ttft ratio failure surfaces `which='ttft'`");
+        }
+        other => panic!("expected Failed/ttft, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1202,11 +1446,40 @@ fn cb_throughput_n_1_2_4_8_fifo_vs_inflight() {
         .iter()
         .find(|c| c.policy == "fifo_serial" && c.concurrency == 1);
 
-    match (fifo_n4, inflight_n4) {
-        (Some(f), Some(i)) => {
-            // Stability gate FIRST. A noisy measurement makes the
-            // AC-4 ratio meaningless; the operator should re-run or
-            // bump REPS before AC-4 fails on signal-vs-noise.
+    // cfa-iter-A5b MAJOR #2 fix: route through the pure `ac4_outcome`
+    // helper so the misconfiguration / deferral / stability arms can
+    // be unit-tested in isolation. The env-gated body translates the
+    // typed outcome into the existing wire-level shape (panics for
+    // hard-fail arms, stderr emission for soft-deferral, PASS log
+    // for the success arm).
+    match ac4_outcome(fifo_n4, inflight_n4, fifo_n1) {
+        Ac4Outcome::Deferred => {
+            eprintln!(
+                "[ac-4 DEFERRED] cannot evaluate gate — missing N=4 cell for one or both \
+                 policies. Typically inflight_batched is Phase C2c/C2d gated; D3 reports \
+                 the FifoSerial-only baseline + variance and defers AC-4 enforcement until \
+                 the inflight-side wiring lands. The bench is forward-compatible: no edits \
+                 needed once C2c/C2d ship."
+            );
+        }
+        Ac4Outcome::Misconfigured => {
+            let f = fifo_n4.expect("Misconfigured requires fifo_n4 present");
+            let i = inflight_n4.expect("Misconfigured requires inflight_n4 present");
+            panic!(
+                "[ac-4 MISCONFIGURED] BOTH N=4 cells present (fifo_serial \
+                 N=4 median = {:.1} tok/s; inflight_batched N=4 median = {:.1} tok/s) \
+                 BUT fifo_serial N=1 baseline cell is missing. The AC-4 TTFT half \
+                 compares inflight_batched N=4 p95 against fifo_serial N=1 p95; \
+                 skipping it would let a TTFT regression slip past the gate. \
+                 Re-run with HF2Q_CB_THROUGHPUT_CONCURRENCY including `1` (e.g. \
+                 `1,2,4,8` — the default).",
+                f.aggregate_tokens_per_sec_median,
+                i.aggregate_tokens_per_sec_median,
+            );
+        }
+        Ac4Outcome::StabilityBlocked => {
+            let f = fifo_n4.expect("StabilityBlocked requires fifo_n4 present");
+            let i = inflight_n4.expect("StabilityBlocked requires inflight_n4 present");
             if f.aggregate_tokens_per_sec_sigma_pct > STABILITY_SIGMA_PCT_THRESHOLD {
                 panic!(
                     "AC-4 BLOCKED: fifo_serial N=4 measurement variance {:.1}% > {:.1}% threshold; \
@@ -1218,68 +1491,41 @@ fn cb_throughput_n_1_2_4_8_fifo_vs_inflight() {
                     f.aggregate_tokens_per_sec_max,
                 );
             }
-            if i.aggregate_tokens_per_sec_sigma_pct > STABILITY_SIGMA_PCT_THRESHOLD {
-                panic!(
-                    "AC-4 BLOCKED: inflight_batched N=4 measurement variance {:.1}% > {:.1}% threshold; \
-                     run again or increase REPS for stable median (median={:.1}, min={:.1}, max={:.1})",
-                    i.aggregate_tokens_per_sec_sigma_pct,
-                    STABILITY_SIGMA_PCT_THRESHOLD,
-                    i.aggregate_tokens_per_sec_median,
-                    i.aggregate_tokens_per_sec_min,
-                    i.aggregate_tokens_per_sec_max,
-                );
-            }
-
-            let aggregate_ratio = i.aggregate_tokens_per_sec_median
-                / f.aggregate_tokens_per_sec_median.max(1e-6);
-            assert!(
-                aggregate_ratio >= 1.5,
-                "AC-4 FAILED: aggregate ratio {:.2}× below 1.5× bar \
-                 (fifo_serial N=4 median = {:.1} tok/s; inflight_batched N=4 median = {:.1} tok/s)",
-                aggregate_ratio,
-                f.aggregate_tokens_per_sec_median,
+            panic!(
+                "AC-4 BLOCKED: inflight_batched N=4 measurement variance {:.1}% > {:.1}% threshold; \
+                 run again or increase REPS for stable median (median={:.1}, min={:.1}, max={:.1})",
+                i.aggregate_tokens_per_sec_sigma_pct,
+                STABILITY_SIGMA_PCT_THRESHOLD,
                 i.aggregate_tokens_per_sec_median,
+                i.aggregate_tokens_per_sec_min,
+                i.aggregate_tokens_per_sec_max,
             );
-
-            // TTFT ratio: inflight_batched N=4 p95 vs fifo_serial N=1 p95.
-            // If the FIFO N=1 baseline is missing (operator restricted
-            // HF2Q_CB_THROUGHPUT_CONCURRENCY to exclude N=1), report a
-            // diagnostic + skip the TTFT half of the AC-4 gate rather
-            // than fabricate a denominator.
-            if let Some(base) = fifo_n1 {
-                let ttft_ratio = i.ttft_p95_ms_median / base.ttft_p95_ms_median.max(1e-6);
-                assert!(
-                    ttft_ratio <= 2.0,
-                    "AC-4 FAILED: TTFT p95 ratio {:.2}× above 2.0× bar \
-                     (fifo_serial N=1 p95 median = {:.1} ms; inflight_batched N=4 p95 median = {:.1} ms)",
-                    ttft_ratio,
-                    base.ttft_p95_ms_median,
-                    i.ttft_p95_ms_median,
-                );
-                eprintln!(
-                    "[ac-4 PASS] aggregate ratio {:.2}× ≥ 1.5× ✓ ; TTFT p95 ratio {:.2}× ≤ 2.0× ✓",
-                    aggregate_ratio, ttft_ratio,
-                );
-            } else {
-                eprintln!(
-                    "[ac-4 PARTIAL] aggregate ratio {:.2}× ≥ 1.5× ✓ ; TTFT half skipped — \
-                     no fifo_serial N=1 cell present (set HF2Q_CB_THROUGHPUT_CONCURRENCY to include 1)",
+        }
+        Ac4Outcome::Failed { aggregate_ratio, ttft_ratio, which } => {
+            let f = fifo_n4.expect("Failed requires fifo_n4 present");
+            let i = inflight_n4.expect("Failed requires inflight_n4 present");
+            if which == "aggregate" {
+                panic!(
+                    "AC-4 FAILED: aggregate ratio {:.2}× below 1.5× bar \
+                     (fifo_serial N=4 median = {:.1} tok/s; inflight_batched N=4 median = {:.1} tok/s)",
                     aggregate_ratio,
+                    f.aggregate_tokens_per_sec_median,
+                    i.aggregate_tokens_per_sec_median,
                 );
             }
+            let base = fifo_n1.expect("Failed/ttft requires fifo_n1 present");
+            panic!(
+                "AC-4 FAILED: TTFT p95 ratio {:.2}× above 2.0× bar \
+                 (fifo_serial N=1 p95 median = {:.1} ms; inflight_batched N=4 p95 median = {:.1} ms)",
+                ttft_ratio,
+                base.ttft_p95_ms_median,
+                i.ttft_p95_ms_median,
+            );
         }
-        _ => {
-            // AC-4 enforcement deferred — exactly one of the two N=4
-            // cells is missing (typically inflight_batched, until
-            // Phase C2c/C2d ship). D3 reports the FifoSerial-only
-            // baseline + variance above; AC-4 will fire on the
-            // first run after C2c/C2d land without test edits.
+        Ac4Outcome::Passed { aggregate_ratio, ttft_ratio } => {
             eprintln!(
-                "[ac-4 DEFERRED] cannot evaluate gate — missing N=4 cell for one or both \
-                 policies. Typically inflight_batched is Phase C2c/C2d gated; D3 reports \
-                 the FifoSerial-only baseline + variance and defers AC-4 enforcement until \
-                 the inflight-side wiring lands. The bench is forward-compatible: no edits \
-                 needed once C2c/C2d ship."
+                "[ac-4 PASS] aggregate ratio {:.2}× ≥ 1.5× ✓ ; TTFT p95 ratio {:.2}× ≤ 2.0× ✓",
+                aggregate_ratio, ttft_ratio,
             );
         }
     }

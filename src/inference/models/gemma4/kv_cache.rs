@@ -1579,4 +1579,137 @@ mod tests {
             ),
         }
     }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // cfa-iter-A5b MAJOR #3 — mixed Gemma 4 layer_types fixture (closes the
+    // H9 "verified by code-reading only" gap the codex review surfaced).
+    //
+    // Production Gemma 4 has heterogeneous `layer_types` (per
+    // `src/inference/models/gemma4/model.rs:1250` —
+    // `LayerType::{Full, Sliding}` interleaved). The pre-iter-A5b test
+    // bank exercised allocation only at uniformly Full or uniformly
+    // Sliding; this test walks a synthetic `[Full, Sliding, Full,
+    // Sliding]` config and asserts each layer's `MultiSeqHbKvBuffers`
+    // honours its layer-type's `is_sliding` flag. A future regression
+    // in the per-layer iteration / layer-type plumbing would surface
+    // here as a failed assertion rather than silent corruption.
+    //
+    // NOTE on "Null layers": the codex finding mentioned
+    // "Null layers" but `enum LayerType` (`src/serve/config.rs`) only
+    // has `Sliding` and `Full` variants — there is no Null/absent
+    // variant for Gemma 4. The closest "null" semantics in the
+    // codebase is `LoadedModel::Gemma4` MoE-only norm absence
+    // (handled at load time, not at KV-alloc time). The test
+    // therefore exercises the realistic [Full, Sliding] mixed-vector
+    // case + documents the Null-absence inline so a future code
+    // reader does not chase a non-existent enum variant.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// **cfa-iter-A5b MAJOR #3** — mixed Gemma 4 `layer_types` allocator
+    /// fixture. Walks `[Full, Sliding, Full, Sliding]` and verifies
+    /// each layer's buffer carries the right `is_sliding` flag, the
+    /// right capacity, and the right per-layer byte count.
+    ///
+    /// Falsifier (any one ⇒ mixed-layer allocator broken):
+    /// 1. The per-layer `alloc_hb_kv_for_layer` call panics or errors.
+    /// 2. A `Full` layer's allocated buffer reports `is_sliding == true`.
+    /// 3. A `Sliding` layer's allocated buffer reports `is_sliding == false`.
+    /// 4. A Sliding-layer capacity does not match `sliding_window`.
+    /// 5. A Full-layer capacity does not match `max_seq_len`.
+    /// 6. Per-layer seq_lens cursors are not zero-initialised.
+    /// 7. `n_seqs` propagated from the call site differs across layers.
+    #[test]
+    fn a3a_mixed_layer_alloc_full_sliding_byte_isolation() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        use crate::serve::config::LayerType;
+        // Synthetic 4-layer mixed config: alternating Full / Sliding,
+        // matching the production Gemma 4 27B-A4B pattern
+        // (`gemma4/model.rs:1250` — every Nth layer is Full).
+        let layer_types: Vec<LayerType> = vec![
+            LayerType::Full,
+            LayerType::Sliding,
+            LayerType::Full,
+            LayerType::Sliding,
+        ];
+        let n_seqs: u32 = 2;
+        let nkv: usize = 2;
+        let hd: usize = 256;
+        let max_seq_len: usize = 32;
+        let sliding_window: usize = 8;
+
+        for (layer_idx, lt) in layer_types.iter().enumerate() {
+            let is_ring = matches!(lt, LayerType::Sliding);
+            let cap = if is_ring { sliding_window } else { max_seq_len };
+            let buf = alloc_hb_kv_for_layer(&dev, layer_idx, nkv, hd, cap, is_ring, n_seqs)
+                .unwrap_or_else(|e| panic!(
+                    "L{layer_idx} ({lt:?}): alloc_hb_kv_for_layer must succeed; got {e}"
+                ));
+
+            // Falsifier 2/3 — is_sliding flag matches layer type.
+            assert_eq!(
+                buf.is_sliding, is_ring,
+                "L{layer_idx} ({lt:?}): is_sliding={} does NOT match \
+                 expected={is_ring} (layer-type plumbing broken)",
+                buf.is_sliding,
+            );
+
+            // Falsifier 4/5 — capacity matches layer-type-specific cap.
+            let cap_label = if is_ring { "sliding_window" } else { "max_seq_len" };
+            assert_eq!(
+                buf.capacity, cap,
+                "L{layer_idx} ({lt:?}): capacity={} does NOT match \
+                 expected={cap} ({cap_label})",
+                buf.capacity,
+            );
+
+            // Falsifier 6 — per-seq cursors zero-initialised.
+            assert_eq!(buf.seq_lens.len(), n_seqs as usize,
+                "L{layer_idx}: seq_lens.len() must equal n_seqs");
+            assert!(buf.seq_lens.iter().all(|&x| x == 0),
+                "L{layer_idx}: seq_lens must be zero-initialised");
+
+            // Falsifier 7 — n_seqs propagated.
+            assert_eq!(buf.n_seqs, n_seqs,
+                "L{layer_idx}: n_seqs must propagate from call site");
+
+            // Byte-count cross-check: Full layers cap=32 vs Sliding cap=8
+            // ⇒ Full byte count = 4× Sliding byte count for same n_seqs
+            // /nkv/hd. We don't assert the ratio inline (it differs per
+            // layer) but pin the per-layer byte count against the formula
+            // for sanity:
+            let expected_packed_bytes = (n_seqs as usize) * nkv * cap * hd;
+            assert_eq!(
+                buf.k_packed.byte_len(), expected_packed_bytes,
+                "L{layer_idx} ({lt:?}): k_packed byte_len mismatch",
+            );
+            assert_eq!(
+                buf.v_packed.byte_len(), expected_packed_bytes,
+                "L{layer_idx} ({lt:?}): v_packed byte_len mismatch",
+            );
+        }
+    }
+
+    /// **cfa-iter-A5b MAJOR #3** — Null-layer absence documentation
+    /// pin. `LayerType` has exactly two variants (`Sliding`, `Full`);
+    /// any future addition of a `Null`-like variant MUST land
+    /// alongside an extension of the mixed-layer test above so the
+    /// allocator's per-layer dispatch surface is exercised
+    /// exhaustively. This test pins the current variant set; the
+    /// `match` exhaustiveness check is the load-bearing assertion.
+    #[test]
+    fn a3a_layer_type_variants_are_full_and_sliding_only() {
+        use crate::serve::config::LayerType;
+        // Exhaustive match on every variant — if a Null / Absent
+        // variant lands without test coverage, this match will fail
+        // to compile and the operator MUST extend
+        // `a3a_mixed_layer_alloc_full_sliding_byte_isolation`.
+        fn name(lt: LayerType) -> &'static str {
+            match lt {
+                LayerType::Full => "Full",
+                LayerType::Sliding => "Sliding",
+            }
+        }
+        assert_eq!(name(LayerType::Full), "Full");
+        assert_eq!(name(LayerType::Sliding), "Sliding");
+    }
 }

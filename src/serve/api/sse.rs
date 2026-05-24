@@ -31,7 +31,18 @@
 //! boundary-marker state machine (lands with per-model registration). This
 //! file treats the classification as pre-computed and just encodes.
 //!
-//! # ADR-040 §6 Phase C C3 — per-slot keepalive accounting
+//! # ADR-040 §6 Phase C C3 — per-slot keepalive seam
+//!
+//! **cfa-iter-A5b MINOR #1 wording fix**: this section was previously
+//! titled "per-slot keepalive accounting", which overclaimed —
+//! `slot_id` is traced ONCE at stream construction, not per
+//! keepalive frame. The 15-second keepalive itself IS wired through
+//! axum's `KeepAlive` (see [`SSE_KEEPALIVE_INTERVAL_SECS`]); what
+//! C3 added is a typed SEAM ([`SseStreamOptions::slot_id`] +
+//! [`generation_events_to_sse_with_slot`]) so the Phase C2c+
+//! SlotAware runtime can attribute streams to the responsible
+//! physical slot via the construction-time trace event. Per-frame
+//! attribution is a future iter (not in scope for C3 / iter-A5b).
 //!
 //! Under `SchedulerPolicy::FifoSerial` (today's default, ADR-040 §3.2 +
 //! §3.6) `max_slots = 1` and there is at most one in-flight streaming
@@ -43,9 +54,11 @@
 //! `Sse` lives entirely inside the per-request future, so its 15s
 //! "last-emission" timer is already scoped to that single stream's state.
 //!
-//! Under `SchedulerPolicy::SlotAware { max_slots = N }` (Phase C2c future
-//! per ADR-040 §6 Phase C), the same per-request construction shape
-//! collapses to per-slot accounting because each concurrent slot is
+//! Under [`crate::serve::scheduler::SchedulerPolicy::InflightBatched`]
+//! (the real scheduler-policy enum variant; gated behind
+//! `EngineMode::SlotAware { max_slots = N }` at Phase C2c future per
+//! ADR-040 §6 Phase C), the same per-request construction shape
+//! preserves the per-slot association because each concurrent slot is
 //! serviced by its own handler future + its own
 //! `generation_events_to_sse` call + its own `KeepAlive` layer — the
 //! N streams share zero keepalive state. This module therefore needs NO
@@ -56,9 +69,9 @@
 //! the stream's per-slot association is *typed* at the boundary (rather
 //! than implicit-per-task) for diagnostics + future per-slot
 //! observability hooks. Under FifoSerial the field is `None` (legacy
-//! shape, byte-identical to pre-C3); under SlotAware the handler will
-//! populate it from the `SlotHandle` returned by `Scheduler::admit` so
-//! `/metrics` and tracing can attribute keepalive events to the
+//! shape, byte-identical to pre-C3); under InflightBatched the handler
+//! will populate it from the `SlotHandle` returned by `Scheduler::admit`
+//! so the construction-time trace event attributes the stream to the
 //! responsible physical slot. The keepalive INTERVAL + TEXT are
 //! unchanged (15s + `""`), satisfying ADR-040 §1.4's "continuous
 //! batching changes WHEN the request executes, not the request/response
@@ -456,19 +469,29 @@ pub const SSE_KEEPALIVE_TEXT: &str = "";
 /// an empty SSE comment (`:\n\n`) is sent if no chunks have been written for
 /// 15s. This prevents reverse-proxy and client idle-timeout disconnects.
 ///
-/// # ADR-040 §6 Phase C C3 — per-slot keepalive accounting
+/// # ADR-040 §6 Phase C C3 — per-slot keepalive seam
+///
+/// **cfa-iter-A5b MINOR #1 wording fix**: this section was previously
+/// titled "per-slot keepalive accounting", which overclaimed —
+/// `slot_id` is traced ONCE at stream construction, not per
+/// keepalive frame. The 15-second keepalive itself IS wired through
+/// axum's `KeepAlive`; what C3 added is a typed SEAM for future
+/// per-slot attribution (per-frame accounting is a future iter).
 ///
 /// The keepalive timer is implemented by axum's `KeepAlive`, whose
 /// "last-emission" clock lives entirely inside the returned `Sse<...>`
 /// future — i.e. per-`generation_events_to_sse`-call. Under
-/// `SchedulerPolicy::FifoSerial` (today, `max_slots=1`) there is at most
-/// one such call in flight per engine, so per-stream ≡ per-slot. Under
-/// `SchedulerPolicy::SlotAware { max_slots = N }` (Phase C2c future),
-/// N concurrent handler futures each invoke this function once, each
-/// gets its own `Sse<...>` + its own `KeepAlive` timer — per-stream
-/// remains ≡ per-slot. **No cross-stream state aggregation** is required
-/// to satisfy the "per-slot keepalive accounting" promise in ADR-040
-/// §6 Phase C row C3; the structural shape is correct by construction.
+/// [`crate::serve::scheduler::SchedulerPolicy::FifoSerial`] (today,
+/// `max_slots=1`) there is at most one such call in flight per engine,
+/// so per-stream ≡ per-slot. Under
+/// [`crate::serve::scheduler::SchedulerPolicy::InflightBatched`] (gated
+/// behind `EngineMode::SlotAware { max_slots = N }` at Phase C2c
+/// future), N concurrent handler futures each invoke this function
+/// once, each gets its own `Sse<...>` + its own `KeepAlive` timer —
+/// per-stream remains ≡ per-slot. **No cross-stream state aggregation**
+/// is required to satisfy the "per-slot keepalive seam" promise in
+/// ADR-040 §6 Phase C row C3; the structural shape is correct by
+/// construction.
 ///
 /// This entrypoint preserves the pre-C3 4-arg signature for the
 /// existing `handlers.rs` call sites — it delegates to
@@ -533,16 +556,21 @@ pub fn generation_events_to_sse_with_slot(
     slot_id: Option<u32>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     // ADR-040 C3: record the per-slot association at stream
-    // construction so /metrics + diagnostics can correlate keepalive
-    // frames with the responsible physical slot when SlotAware lands
+    // construction so /metrics + diagnostics can correlate the stream
+    // with the responsible physical slot when SlotAware lands
     // (C2c+).  Under FifoSerial slot_id is None and we emit no trace
     // — the hot path remains byte-identical to pre-C3.
+    //
+    // cfa-iter-A5b MINOR #1 wording fix: this trace fires ONCE at
+    // construction, not per keepalive frame; previous "per-slot
+    // accounting" wording overclaimed. Per-frame attribution is a
+    // future iter.
     if let Some(slot_id_value) = slot_id {
         tracing::trace!(
             request_id = %request_id,
             slot_id = slot_id_value,
             keepalive_interval_secs = SSE_KEEPALIVE_INTERVAL_SECS,
-            "sse stream constructed (ADR-040 C3 per-slot accounting)"
+            "sse stream constructed (ADR-040 C3 per-slot seam)"
         );
     }
     Sse::new(generation_events_stream(rx, request_id, model_name, created, opts)).keep_alive(
@@ -901,7 +929,9 @@ mod tests {
     }
 
     // ───────────────────────────────────────────────────────────────────
-    // ADR-040 §6 Phase C C3 — per-slot keepalive accounting tests
+    // ADR-040 §6 Phase C C3 — per-slot keepalive seam tests
+    // (cfa-iter-A5b MINOR #1 wording fix: "seam" not "accounting" —
+    // slot_id is traced once at construction, not per-keepalive-frame).
     // ───────────────────────────────────────────────────────────────────
     //
     // These pin the C3 structural shape: each `generation_events_to_sse`
@@ -917,7 +947,7 @@ mod tests {
     /// state. The output payloads for slot 0 vs slot 1 reflect only the
     /// events fed to each respective stream; the slot association is
     /// per-`Sse<...>`-instance, never cross-stream-aggregated. This is
-    /// the load-bearing pin for the "per-slot keepalive accounting"
+    /// the load-bearing pin for the "per-slot keepalive seam"
     /// contract under SlotAware (C2c+).
     #[tokio::test]
     async fn c3_sse_keepalive_per_slot_state_is_isolated() {
@@ -982,13 +1012,13 @@ mod tests {
         assert_eq!(
             content_a["choices"][0]["delta"]["content"], "alpha",
             "ADR-040 C3: slot 0 stream MUST surface only its own \
-             feed; per-slot keepalive accounting requires per-stream \
+             feed; per-slot keepalive seam requires per-stream \
              encoder state isolation"
         );
         assert_eq!(
             content_b["choices"][0]["delta"]["content"], "beta",
             "ADR-040 C3: slot 1 stream MUST surface only its own \
-             feed; per-slot keepalive accounting requires per-stream \
+             feed; per-slot keepalive seam requires per-stream \
              encoder state isolation"
         );
         // request_id is also per-stream — would catch a regression

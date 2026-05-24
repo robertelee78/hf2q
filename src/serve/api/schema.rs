@@ -117,13 +117,25 @@ impl ApiError {
     ///
     /// **ADR-040 Phase C C4** (SHIPPED 2026-05-23, cf. ADR-040 §6.1.9)
     /// added explicit `SchedulerPolicy` selection via the
-    /// `HF2Q_SCHEDULER` env / `--scheduler` CLI flag. The
-    /// per-policy semantics for this 429 are:
+    /// `HF2Q_SCHEDULER` env / `--scheduler` CLI flag. There are TWO
+    /// distinct enums at play (and the docstring + test below pin
+    /// both — cfa-iter-A5b MAJOR #1 fixed a pre-iter-A5b docstring
+    /// bug that referenced a nonexistent variant on the wrong enum;
+    /// the test below enforces the correct enum + variant pairing):
+    /// - [`crate::serve::scheduler::SchedulerPolicy`] = `{ FifoSerial,
+    ///   InflightBatched }` — the SCHEDULER POLICY enum, picks the
+    ///   admission FSM.
+    /// - [`crate::serve::api::engine::EngineMode`] = `{ SerialFifo,
+    ///   SlotAware { max_slots } }` — the ENGINE MODE enum, picks
+    ///   the worker_run runtime + per-model SlotAware seam.
+    ///
+    /// The per-policy semantics for this 429 are:
     /// - Under [`crate::serve::scheduler::SchedulerPolicy::FifoSerial`]
     ///   (default), `queue_full` fires at `queue_capacity` overflow per
     ///   Decision #19 — the legacy single-slot serial path.
-    /// - Under [`crate::serve::scheduler::SchedulerPolicy::SlotAware`]
-    ///   (Phase C2c+ future), `queue_full` will fire when
+    /// - Under [`crate::serve::scheduler::SchedulerPolicy::InflightBatched`]
+    ///   (gated behind [`crate::serve::api::engine::EngineMode::SlotAware { max_slots }`]
+    ///   at Phase C2c+ future), `queue_full` will fire when
     ///   `total_admissible` (= `queue_capacity` + `max_slots`) is
     ///   exhausted; admission carries a typed
     ///   [`crate::serve::scheduler::AdmitError::QueueFull`] with the
@@ -1910,11 +1922,39 @@ mod tests {
              selection sits alongside). Current doc block:\n{docblock}"
         );
         assert!(
-            docblock.contains("FifoSerial") && docblock.contains("SlotAware"),
-            "ADR-040 C3: the queue_full() docstring MUST name both \
-             SchedulerPolicy variants (FifoSerial under Decision #19 \
-             and SlotAware under Phase C2c+). Current doc \
+            docblock.contains("FifoSerial") && docblock.contains("InflightBatched"),
+            "ADR-040 C3 (iter-A5b MAJOR #1 fix): the queue_full() \
+             docstring MUST name BOTH real `SchedulerPolicy` variants \
+             — `FifoSerial` (default under Decision #19) and \
+             `InflightBatched` (the real Phase C2c+ scheduler-policy \
+             enum variant). The doc must NOT name a nonexistent \
+             `SchedulerPolicy::SlotAware` variant. Current doc \
              block:\n{docblock}"
+        );
+        // cfa-iter-A5b MAJOR #1 regression pin: the docstring MUST
+        // also name the SEPARATE `EngineMode::SlotAware` enum (engine
+        // mode + max_slots, distinct from the scheduler policy
+        // surface) so operators don't confuse the two enums.
+        assert!(
+            docblock.contains("EngineMode::SlotAware"),
+            "ADR-040 C3 (iter-A5b MAJOR #1 fix): the queue_full() \
+             docstring MUST name `EngineMode::SlotAware` as the \
+             engine-mode enum variant gating the InflightBatched \
+             runtime (distinct from the SchedulerPolicy variant). \
+             Current doc block:\n{docblock}"
+        );
+        // cfa-iter-A5b MAJOR #1 regression pin: assert the docstring
+        // does NOT erroneously refer to a `SchedulerPolicy::SlotAware`
+        // variant — there is no such variant; that string is the
+        // pre-iter-A5b vaporware the codex review surfaced.
+        assert!(
+            !docblock.contains("SchedulerPolicy::SlotAware"),
+            "ADR-040 C3 (iter-A5b MAJOR #1 fix): the queue_full() \
+             docstring MUST NOT reference `SchedulerPolicy::SlotAware` \
+             — that variant does not exist on the SchedulerPolicy enum \
+             (variants are `FifoSerial` + `InflightBatched`). \
+             SlotAware lives on the SEPARATE `EngineMode` enum. \
+             Current doc block:\n{docblock}"
         );
         assert!(
             docblock.contains("ADR-040"),
