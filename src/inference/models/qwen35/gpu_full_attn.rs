@@ -77,6 +77,43 @@ use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 use super::encoder_stage::LayerEncoder;
 use super::full_attn::FullAttnLayerWeights;
 use super::kv_cache::FullAttnKvSlot;
+// ADR-040 Phase B4a-cont (2026-05-23) — multi-seq slot identity routed
+// into the GPU-side KV-buffer dispatchers.  Per-slot byte offset is
+// derived from `SlotId.0 * (n_kv_heads * max_seq_len * head_dim *
+// size_of::<f32>())` and applied via `MlxBuffer::slice_view` (zero-
+// copy: clones the Metal buffer ARC handle + records the byte offset
+// for `setBuffer:offset:atIndex:`).  See ADR-040 §6.1.5.
+use crate::serve::multi_seq_kv::SlotId;
+
+// ──────────────────────────────────────────────────────────────────────
+// ADR-040 Phase B4a-cont (2026-05-23) — per-slot K/V buffer slicing.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Number of F32 elements per slot's K (or V) region in the
+/// full-attn KV cache.  Layout per `kv_cache.rs:2231-2236` is
+/// row-major `[n_seqs, n_kv_heads, max_seq_len, head_dim]` F32, so
+/// each slot occupies a contiguous `n_kv_heads * max_seq_len *
+/// head_dim` F32 block at byte offset `slot_id.0 * elems * 4`.
+///
+/// Returns the element count + byte offset for the slot.  Used by
+/// `slice_view` on `slot.k` / `slot.v` so the kernels see the
+/// per-slot sub-region instead of slot 0's region.
+#[inline]
+fn slot_k_v_region_for_full_attn(
+    slot_id: SlotId,
+    n_kv_heads: u32,
+    max_seq_len: u32,
+    head_dim: u32,
+) -> (u64, usize) {
+    let n_elements = (n_kv_heads as usize)
+        * (max_seq_len as usize)
+        * (head_dim as usize);
+    let byte_offset = (slot_id.0 as u64)
+        .checked_mul(n_elements as u64)
+        .and_then(|e| e.checked_mul(std::mem::size_of::<f32>() as u64))
+        .expect("slot K/V byte offset overflow (slot_id * n_kv * max_seq * head_dim * 4)");
+    (byte_offset, n_elements)
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // ADR-027 Phase B iter-15 — TQ-active KV write + decode SDPA helpers.
@@ -111,6 +148,15 @@ fn write_kv_with_optional_tq_encode(
     max_seq_len: u32,
     cur_len: u32,
     n_tokens: u32,
+    // ADR-040 Phase B4a-cont (2026-05-23): per-slot KV-buffer offset.
+    // For `SlotId(0)` the slice_view byte offset is 0 — byte-identical
+    // to pre-B4a-cont.  For `SlotId(N>0)` the dispatcher writes into
+    // slot N's region of the `[n_seqs, n_kv_heads, max_seq_len,
+    // head_dim]` F32 backing.  TQ-encode shadow path (slot.tq) remains
+    // single-slot today (kernels lack slot-aware indexing) — slot N>0
+    // with TQ-active is gated above this helper, see
+    // `apply_sdpa_with_kv_cache`.
+    slot_id: SlotId,
 ) -> Result<()> {
     // (1) F32 KV cache write — byte-identical to pre-iter-15 when
     // slot.k/v are Some.
@@ -123,10 +169,20 @@ fn write_kv_with_optional_tq_encode(
     // TQ-cache prefill resume helper) consumes — F32 backing is unused
     // and not allocated.
     if let (Some(dst_k), Some(dst_v)) = (slot.k.as_ref(), slot.v.as_ref()) {
+        // ADR-040 Phase B4a-cont: slice_view the per-slot K/V region.
+        // Zero-copy: clones the Metal buffer ARC handle, sets the new
+        // buffer's byte_offset to slot N's start, and KernelArg::Buffer
+        // routes that offset into `setBuffer:offset:atIndex:` (verified
+        // at encoder.rs:182-184).  For SlotId(0) the offset is 0 ⇒
+        // byte-identical to pre-B4a-cont.
+        let (byte_offset, n_elements) =
+            slot_k_v_region_for_full_attn(slot_id, n_kv_heads, max_seq_len, head_dim);
+        let dst_k_view = dst_k.slice_view(byte_offset, n_elements);
+        let dst_v_view = dst_v.slice_view(byte_offset, n_elements);
         dispatch_kv_cache_copy_seq_f32_dual(
             enc, registry, device.metal_device(),
             k_seq_major, v_seq_major,
-            dst_k, dst_v,
+            &dst_k_view, &dst_v_view,
             n_kv_heads, head_dim, max_seq_len,
             cur_len, n_tokens, 0,
         )
@@ -141,6 +197,24 @@ fn write_kv_with_optional_tq_encode(
     //       lines 1968-1981 where dispatch_sdpa_decode handles non-
     //       256/512 head_dims via F32). Note: production qwen35 head_dim
     //       is always 256 — non-256 here means a small-fixture test.
+    //
+    // ADR-040 Phase B4a-cont: TQ encode kernels
+    // (`dispatch_hadamard_quantize_kv_hb_seq`) do not yet accept a
+    // per-slot byte offset, so multi-slot TQ-active is deferred to a
+    // future iter (B4a-TQ).  `apply_sdpa_with_kv_cache` enforces this:
+    // slot N>0 with `slot.tq.is_some()` errors before reaching this
+    // helper.  The assert below pins that invariant in the helper for
+    // defence-in-depth.
+    if slot.tq.is_some() && slot_id.0 != 0 {
+        return Err(anyhow!(
+            "write_kv_with_optional_tq_encode: slot_id={} with slot.tq.is_some() \
+             is not supported in Phase B4a-cont (TQ encode kernels are not \
+             slot-aware).  Caller routing bug — `apply_sdpa_with_kv_cache` must \
+             gate TQ-active slot N>0 to a typed B4a-TQ error before reaching \
+             this dispatcher.  See ADR-040 §6.1.5.",
+            slot_id.0,
+        ));
+    }
     if slot.tq.is_some() && n_tokens > 0 && (head_dim == 256 || head_dim == 512) {
         // RAW barrier between F32 write and TQ encode source reads.
         // Both read k_seq_major/v_seq_major (independent of slot.k/v
@@ -202,8 +276,29 @@ fn dispatch_decode_sdpa_with_optional_tq(
     head_dim: u32,
     kv_seq_len: u32,
     max_seq_len: u32,
+    // ADR-040 Phase B4a-cont (2026-05-23): per-slot KV-buffer offset.
+    // For `SlotId(0)` the slice_view byte offset is 0 — byte-identical
+    // to pre-B4a-cont.  For `SlotId(N>0)` `flash_attn_vec` reads slot
+    // N's region of the `[n_seqs, n_kv_heads, max_seq_len, head_dim]`
+    // F32 backing.  TQ branch (slot.tq.is_some()) is single-slot
+    // today — gated by the caller (`apply_sdpa_with_kv_cache`).
+    slot_id: SlotId,
 ) -> Result<()> {
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    // ADR-040 Phase B4a-cont defence-in-depth: TQ-active multi-slot
+    // is not supported in this iter (kernels are not slot-aware).
+    if slot.tq.is_some() && slot_id.0 != 0 {
+        return Err(anyhow!(
+            "dispatch_decode_sdpa_with_optional_tq: slot_id={} with \
+             slot.tq.is_some() is not supported in Phase B4a-cont \
+             (TQ SDPA kernels are not slot-aware).  Caller routing bug \
+             — `apply_sdpa_with_kv_cache` must gate TQ-active slot N>0 \
+             to a typed B4a-TQ error before reaching this dispatcher. \
+             See ADR-040 §6.1.5.",
+            slot_id.0,
+        ));
+    }
 
     if slot.tq.is_some() && (head_dim == 256 || head_dim == 512) {
         // ── TQ decode chain ──
@@ -291,9 +386,16 @@ fn dispatch_decode_sdpa_with_optional_tq(
              (tq_kv_active=true ⇒ slot.tq=Some ⇒ TQ chain above runs).",
         );
         let vbuf = slot.v.as_ref().expect("flash_attn_vec F32: slot.v is None (see slot.k)");
+        // ADR-040 Phase B4a-cont: slice_view per-slot K/V region.
+        // Zero-copy ARC clone with byte_offset; SlotId(0) gives
+        // byte_offset=0 ⇒ byte-identical to pre-B4a-cont.
+        let (byte_offset, n_elements) =
+            slot_k_v_region_for_full_attn(slot_id, n_kv_heads, max_seq_len, head_dim);
+        let kbuf_view = kbuf.slice_view(byte_offset, n_elements);
+        let vbuf_view = vbuf.slice_view(byte_offset, n_elements);
         flash_attn_vec(
             enc, registry, device,
-            q_seq_major, kbuf, vbuf, out_buf, fa_tmp,
+            q_seq_major, &kbuf_view, &vbuf_view, out_buf, fa_tmp,
             &fa_params,
         )
         .context("flash_attn_vec (legacy F32 decode)")?;
@@ -1611,6 +1713,16 @@ pub fn apply_flash_attn_prefill_seq_major_into(
     head_dim: u32,
     arena: &mut crate::inference::models::qwen35::FaPrefillArena,
 ) -> Result<()> {
+    // ADR-040 Phase B4a-cont (2026-05-23): this dispatcher operates
+    // on FRESHLY-COMPUTED chunk K/V (the `k_seq_major` /
+    // `v_seq_major` inputs are projection outputs, NOT slot K/V) and
+    // writes into a CALLER-OWNED `out_seq` buffer (also unrelated to
+    // slot K/V).  No slot.k/slot.v slice_view is required here, so
+    // the public signature is unchanged from pre-B4a-cont (preserves
+    // every call site in `kv_cache.rs` / `mtp.rs` byte-for-byte).
+    // Per-slot routing for the slot K/V write happens above this
+    // dispatcher in `apply_sdpa_with_kv_cache` /
+    // `apply_sdpa_with_kv_cache_decode_into`.
     if head_dim != 256 {
         return Err(anyhow!(
             "apply_flash_attn_prefill_seq_major_into: head_dim must be 256 \
@@ -3592,6 +3704,11 @@ pub fn apply_flash_attn_prefill_seq_major(
     head_dim: u32,
     fa_arena: Option<&mut crate::inference::models::qwen35::FaPrefillArena>,
 ) -> Result<MlxBuffer> {
+    // ADR-040 Phase B4a-cont (2026-05-23): same contract as the
+    // `_into` sibling — this dispatcher works on FRESHLY-COMPUTED
+    // chunk K/V (no slot K/V access) + allocates `out_seq` per-call.
+    // No slot.k/slot.v slice_view required, so the public signature
+    // is unchanged from pre-B4a-cont.
     if head_dim != 256 {
         return Err(anyhow!(
             "apply_flash_attn_prefill_seq_major: head_dim must be 256 \
@@ -3923,6 +4040,16 @@ pub fn apply_flash_attn_prefill_seq_major_resume(
     n_kv_heads: u32,
     head_dim: u32,
 ) -> Result<MlxBuffer> {
+    // ADR-040 Phase B4a-cont (2026-05-23): the caller is responsible
+    // for passing a `slice_view`-derived `slot_k_head_major` /
+    // `slot_v_head_major` that already addresses the correct slot's
+    // K/V region (kernel-side `set_buffer` honours
+    // `MlxBuffer::byte_offset()` — see
+    // mlx-native/src/encoder.rs:182-184).  The public signature is
+    // unchanged from pre-B4a-cont — per-slot routing is encoded in
+    // the buffer's own byte_offset, not in a slot_id parameter.
+    // `apply_sdpa_with_kv_cache` does the slice_view above this
+    // dispatcher.
     if head_dim != 256 {
         return Err(anyhow!(
             "apply_flash_attn_prefill_seq_major_resume: head_dim must be 256 \
@@ -4200,6 +4327,18 @@ pub fn apply_sdpa_with_kv_cache(
     head_dim: u32,
     max_seq_len: u32,
     fa_arena: Option<&mut crate::inference::models::qwen35::FaPrefillArena>,
+    // ADR-040 Phase B4a-cont (2026-05-23): per-slot identity.  Routes
+    // (a) the per-slot cursor read (`slot.current_len[slot_id.0]`),
+    // (b) the per-slot K/V write byte-offset via slice_view in
+    //     `write_kv_with_optional_tq_encode`,
+    // (c) the per-slot K/V read byte-offset via slice_view in
+    //     `dispatch_decode_sdpa_with_optional_tq` + the resume path
+    //     (`apply_flash_attn_prefill_seq_major_resume`),
+    // (d) the per-slot cursor write (`slot.current_len[slot_id.0]`).
+    //
+    // TQ-active slot N>0 is gated below with a typed B4a-TQ error
+    // (TQ encode/SDPA kernels are not slot-aware in this iter).
+    slot_id: SlotId,
 ) -> Result<MlxBuffer> {
     let seq = seq_len as usize;
     let nh = n_heads as usize;
@@ -4209,7 +4348,41 @@ pub fn apply_sdpa_with_kv_cache(
     let _nkv = n_kv_heads as usize;
     let d = head_dim as usize;
     let max_sl = max_seq_len as usize;
-    let cur_len = slot.current_len[0] as usize;
+    // ADR-040 Phase B4a-cont: per-slot cursor read.  Bounds-checked at
+    // the public `forward_gpu` entry; assertion here for defence-in-
+    // depth (an out-of-range index would panic on the Vec indexer
+    // anyway, but a labelled assert gives the operator the slot id +
+    // configured length in the panic message).
+    assert!(
+        (slot_id.0 as usize) < slot.current_len.len(),
+        "apply_sdpa_with_kv_cache: slot_id={} out of range (slot.current_len.len()={}) \
+         — bounds check at forward_gpu entry regressed (ADR-040 §6.1.5)",
+        slot_id.0,
+        slot.current_len.len(),
+    );
+    // ADR-040 Phase B4a-cont — TQ-active multi-slot gate.  The TQ
+    // encode (`dispatch_hadamard_quantize_kv_hb_seq`) + TQ SDPA
+    // (`flash_attn_vec_tq_hb`) kernels do not yet accept a per-slot
+    // byte offset (their slot K/V buffers are bound at offset 0).
+    // Until those kernels are slot-aware (deferred B4a-TQ iter), TQ-
+    // active slot N>0 must error here rather than silently
+    // corrupting slot 0's TQ region.  Slot 0 with TQ-active remains
+    // byte-identical to pre-B4a-cont.
+    if slot.tq.is_some() && slot_id.0 != 0 {
+        return Err(anyhow!(
+            "apply_sdpa_with_kv_cache: slot_id={} with slot.tq.is_some() \
+             is not supported in Phase B4a-cont.  The TQ encode + TQ SDPA \
+             kernels (dispatch_hadamard_quantize_kv_hb_seq, \
+             flash_attn_vec_tq_hb) are not yet slot-aware (they bind \
+             slot.tq.k_packed / slot.tq.v_packed at byte offset 0).  \
+             Routing slot N>0 through this path would silently corrupt \
+             slot 0's TQ region.  Track in B4a-TQ; until then, allocate \
+             the cache with `tq_kv_active=false` (legacy F32 path is \
+             fully slot-aware in B4a-cont).",
+            slot_id.0,
+        ));
+    }
+    let cur_len = slot.current_len[slot_id.0 as usize] as usize;
 
     let kv_write_tokens = (seq).min(max_sl.saturating_sub(cur_len));
     let kv_seq_len = (cur_len + kv_write_tokens).min(max_sl) as u32;
@@ -4243,6 +4416,7 @@ pub fn apply_sdpa_with_kv_cache(
                 slot,
                 n_kv_heads, head_dim, max_seq_len,
                 cur_len as u32, kv_write_tokens as u32,
+                slot_id,
             ).context("kv_cache_copy kv-cache decode (iter-15 helper)")?;
             // Barrier: sdpa_decode reads slot.k/slot.v written above.
             enc.memory_barrier();
@@ -4290,6 +4464,7 @@ pub fn apply_sdpa_with_kv_cache(
                 q_seq_major, slot, &out_buf, &fa_tmp,
                 n_heads, n_kv_heads, head_dim,
                 kv_seq_len, max_seq_len,
+                slot_id,
             ).context("flash_attn_vec kv-cache (FA-layer decode iter-15)")?;
         } else {
             // iter-29 (sub-sub-iter 23c-α): F32 head_dim-fallback path,
@@ -4309,9 +4484,15 @@ pub fn apply_sdpa_with_kv_cache(
                  head_dim ∈ {256,512}; this fallback should never see slot.k=None).",
             );
             let vbuf = slot.v.as_ref().expect("dispatch_sdpa_decode F32: slot.v is None");
+            // ADR-040 Phase B4a-cont: slice_view per-slot K/V region
+            // for the F32 fallback decode path.
+            let (so_off, so_n) =
+                slot_k_v_region_for_full_attn(slot_id, n_kv_heads, max_seq_len, head_dim);
+            let kbuf_view = kbuf.slice_view(so_off, so_n);
+            let vbuf_view = vbuf.slice_view(so_off, so_n);
             dispatch_sdpa_decode(
                 &mut enc, registry, device,
-                q_seq_major, kbuf, vbuf, &out_buf,
+                q_seq_major, &kbuf_view, &vbuf_view, &out_buf,
                 n_heads, n_kv_heads, head_dim,
                 kv_seq_len, max_seq_len,
                 1.0 / (d as f32).sqrt(),
@@ -4365,6 +4546,7 @@ pub fn apply_sdpa_with_kv_cache(
                 slot,
                 n_kv_heads, head_dim, max_seq_len,
                 cur_len as u32, kv_write_tokens as u32,
+                slot_id,
             ).context("kv_cache_copy_seq_f32_dual prefill (iter-15 helper)")?;
             // commit_labeled (no host wait) — out_buf for the FA dispatch below
             // is a separate buffer; the new_path_eligible branch reads
@@ -4465,7 +4647,7 @@ pub fn apply_sdpa_with_kv_cache(
             )?;
             // --- Update current_len cursor (prefill path) ---
             let new_len = kv_seq_len;
-            slot.current_len[0] = new_len;
+            slot.current_len[slot_id.0 as usize] = new_len;
             return Ok(out_uploaded);
         }
 
@@ -4517,6 +4699,12 @@ pub fn apply_sdpa_with_kv_cache(
             let vbuf = slot.v.as_ref().expect(
                 "vec_small_path: slot.v.is_some() guard above passed",
             );
+            // ADR-040 Phase B4a-cont: slice_view per-slot K/V region
+            // for the vec_small_path (cur_len > 0, seq_len in [2, 8]).
+            let (so_off, so_n) =
+                slot_k_v_region_for_full_attn(slot_id, n_kv_heads, max_seq_len, head_dim);
+            let kbuf_view = kbuf.slice_view(so_off, so_n);
+            let vbuf_view = vbuf.slice_view(so_off, so_n);
 
             let seq = seq_len as usize;
             let nh = n_heads as usize;
@@ -4586,7 +4774,7 @@ pub fn apply_sdpa_with_kv_cache(
             };
             flash_attn_vec(
                 &mut enc, registry, device,
-                &q_hm, kbuf, vbuf, &out_buf, &tmp_buf,
+                &q_hm, &kbuf_view, &vbuf_view, &out_buf, &tmp_buf,
                 &params,
             )
             .context("vec_small_path: flash_attn_vec dispatch")?;
@@ -4594,7 +4782,7 @@ pub fn apply_sdpa_with_kv_cache(
                 .context("vec_small_path: commit")?;
 
             // Update current_len cursor.
-            slot.current_len[0] = kv_seq_len;
+            slot.current_len[slot_id.0 as usize] = kv_seq_len;
             return Ok(out_buf);
         }
 
@@ -4661,10 +4849,20 @@ pub fn apply_sdpa_with_kv_cache(
             let out_uploaded = if let (Some(kbuf), Some(vbuf)) =
                 (slot.k.as_ref(), slot.v.as_ref())
             {
+                // ADR-040 Phase B4a-cont: slice_view per-slot K/V
+                // region for the resume path.  The resume kernel reads
+                // K/V at `[n_kv_heads, kv_capacity, head_dim]` head-
+                // major stride per slot — slice_view rebases the
+                // buffer's byte_offset so kernel-side `set_buffer`
+                // sees slot N's region.
+                let (so_off, so_n) = slot_k_v_region_for_full_attn(
+                    slot_id, n_kv_heads, max_seq_len, head_dim);
+                let kbuf_view = kbuf.slice_view(so_off, so_n);
+                let vbuf_view = vbuf.slice_view(so_off, so_n);
                 apply_flash_attn_prefill_seq_major_resume(
                     device, registry,
                     q_seq_major,
-                    kbuf, vbuf,
+                    &kbuf_view, &vbuf_view,
                     seq_len,
                     cur_len as u32,
                     kv_seq_len,
@@ -4675,6 +4873,11 @@ pub fn apply_sdpa_with_kv_cache(
                 // TQ-only mode: route through dequant+resume helper.
                 // slot.tq must be Some (alloc invariant: tq_kv_active=true ⇒
                 // both `slot.k.is_none()` AND `slot.tq.is_some()`).
+                //
+                // ADR-040 Phase B4a-cont: TQ-active multi-slot is gated
+                // at the top of `apply_sdpa_with_kv_cache` (typed error
+                // when slot.tq.is_some() && slot_id != 0) — reaching
+                // this branch implies slot_id == 0 by construction.
                 apply_flash_attn_prefill_seq_major_resume_via_tq_cache(
                     device, registry,
                     slot, q_seq_major,
@@ -4686,7 +4889,7 @@ pub fn apply_sdpa_with_kv_cache(
                 )?
             };
             let new_len = kv_seq_len;
-            slot.current_len[0] = new_len;
+            slot.current_len[slot_id.0 as usize] = new_len;
             return Ok(out_uploaded);
         }
 
@@ -4733,7 +4936,13 @@ pub fn apply_sdpa_with_kv_cache(
                  fallback should only see legacy F32 fixtures with slot.k=Some).",
             );
             let vbuf = slot.v.as_ref().expect("sdpa F32 prefill: slot.v is None");
-            sdpa(&mut enc, registry, device, &q_gpu, kbuf, vbuf, &out_buf, &params, 1)
+            // ADR-040 Phase B4a-cont: slice_view per-slot K/V region
+            // for the legacy F32 SDPA fallback prefill path.
+            let (so_off, so_n) =
+                slot_k_v_region_for_full_attn(slot_id, n_kv_heads, max_seq_len, head_dim);
+            let kbuf_view = kbuf.slice_view(so_off, so_n);
+            let vbuf_view = vbuf.slice_view(so_off, so_n);
+            sdpa(&mut enc, registry, device, &q_gpu, &kbuf_view, &vbuf_view, &out_buf, &params, 1)
                 .context("sdpa with kv cache prefill")?;
             enc.commit_and_wait_labeled("layer.full_attn.sdpa_legacy_prefill").context("commit sdpa kv-cache prefill")?;
         }
@@ -4757,12 +4966,12 @@ pub fn apply_sdpa_with_kv_cache(
         };
         // --- Update current_len cursor (prefill path) ---
         let new_len = kv_seq_len;
-        slot.current_len[0] = new_len;
+        slot.current_len[slot_id.0 as usize] = new_len;
         return Ok(out_uploaded);
     }
 
     // --- Update current_len cursor (decode path) ---
-    slot.current_len[0] = kv_seq_len;
+    slot.current_len[slot_id.0 as usize] = kv_seq_len;
 
     // For seq=1 out_buf is [1, nh, 1, d] head-major == [nh, d] seq-major (same bytes).
     Ok(out_buf)
@@ -4841,6 +5050,13 @@ pub fn build_gated_attn_layer(
     // the borrow via `as_deref_mut()` so the session can be re-borrowed
     // for the next stage / next layer.
     mut layer_session: Option<&mut mlx_native::EncoderSession>,
+    // ADR-040 Phase B4a-cont (2026-05-23): per-slot identity threaded
+    // through every internal dispatcher that reads/writes slot K/V or
+    // the per-slot cursor.  `SlotId(0)` preserves byte-equivalence
+    // with pre-B4a-cont; `SlotId(N>0)` routes through slice_view on
+    // slot.k/slot.v at the byte offset returned by
+    // `slot_k_v_region_for_full_attn`.  See ADR-040 §6.1.5.
+    slot_id: SlotId,
 ) -> Result<MlxBuffer> {
     // Capture arena presence before moving fa_arena into the SDPA call below.
     // Used to decide the commit vs commit_labeled path for ops1-4 and ops6-7.
@@ -4868,9 +5084,23 @@ pub fn build_gated_attn_layer(
     // correctly takes the resume_path_eligible branch
     // (apply_flash_attn_prefill_seq_major_resume), kernel-validated at
     // qL=2 + kL=130 byte-correct.
+    // ADR-040 Phase B4a-cont: per-slot cursor read for the fused-
+    // stage gating predicate.  Slot 0 path is byte-identical; slot
+    // N>0 reads its own cursor (always 0 on fresh allocation, may
+    // be > 0 for resume / multi-turn).
+    let slot_idx = slot_id.0 as usize;
     let cur_len_for_arena = kv_cache_slot
         .as_deref()
-        .map(|s| s.current_len[0])
+        .map(|s| {
+            assert!(
+                slot_idx < s.current_len.len(),
+                "build_gated_attn_layer: slot_id={} out of range (slot.current_len.len()={}) \
+                 — bounds check at forward_gpu entry regressed (ADR-040 §6.1.5)",
+                slot_id.0,
+                s.current_len.len(),
+            );
+            s.current_len[slot_idx]
+        })
         .unwrap_or(0);
     let use_arena = fa_arena.is_some()
         && seq_len > 1
@@ -4952,7 +5182,11 @@ pub fn build_gated_attn_layer(
         && kv_cache_slot
             .as_deref()
             .map(|s| {
-                let cur = s.current_len[0];
+                // ADR-040 Phase B4a-cont: per-slot cursor read for the
+                // fused-stage-ab gating predicate.  Same bounds-check
+                // assertion as `cur_len_for_arena` above (slot_idx <
+                // s.current_len.len()) — see comment block above.
+                let cur = s.current_len[slot_idx];
                 // cur_len==0: existing fresh-prefill path.
                 // cur_len>0 + seq_len<16 + head_dim==256 + slot.k/v F32:
                 //   new vec-small path inside fused encoder.
@@ -5224,7 +5458,10 @@ pub fn build_gated_attn_layer(
             // inside fused encoder; see predicate at use_fused_stage_ab
             // above). Pre-task-#89 invariant `cur_len_u32 == 0` is now
             // a SUBSET of the eligibility condition, NOT the whole.
-            let cur_len_u32 = slot.current_len[0];
+            //
+            // ADR-040 Phase B4a-cont: per-slot cursor (slot_idx is
+            // bounds-checked above at `cur_len_for_arena`).
+            let cur_len_u32 = slot.current_len[slot_idx];
             let max_sl = max_seq_len as usize;
             let kv_write_tokens =
                 (seq_len as usize).min(max_sl.saturating_sub(cur_len_u32 as usize));
@@ -5245,6 +5482,7 @@ pub fn build_gated_attn_layer(
                     slot,
                     n_kv_heads, head_dim, max_seq_len,
                     cur_len_u32, kv_write_tokens as u32,
+                    slot_id,
                 ).context(
                     "kv_cache_copy_seq_f32_dual prefill (fused stage_ab iter-15)",
                 )?;
@@ -5356,6 +5594,12 @@ pub fn build_gated_attn_layer(
                     let vbuf = slot.v.as_ref().expect(
                         "vec-small in fused stage: slot.v.is_some() by predicate",
                     );
+                    // ADR-040 Phase B4a-cont: slice_view per-slot K/V
+                    // region for the vec-small-in-fused-stage path.
+                    let (so_off, so_n) = slot_k_v_region_for_full_attn(
+                        slot_id, n_kv_heads, max_seq_len, head_dim);
+                    let kbuf_view = kbuf.slice_view(so_off, so_n);
+                    let vbuf_view = vbuf.slice_view(so_off, so_n);
 
                     let vec_params = FlashAttnVecParams {
                         num_heads: n_heads,
@@ -5371,7 +5615,7 @@ pub fn build_gated_attn_layer(
                     };
                     flash_attn_vec(
                         enc.encoder(), registry, device,
-                        &q_hm, kbuf, vbuf, &out_seq, &tmp_buf,
+                        &q_hm, &kbuf_view, &vbuf_view, &out_seq, &tmp_buf,
                         &vec_params,
                     )
                     .context("vec-small in fused stage: flash_attn_vec dispatch")?;
@@ -5394,7 +5638,9 @@ pub fn build_gated_attn_layer(
             }
 
             // Update KV cursor (CPU-only counter; safe before GPU completes).
-            slot.current_len[0] = kv_seq_len;
+            //
+            // ADR-040 Phase B4a-cont: per-slot cursor write.
+            slot.current_len[slot_idx] = kv_seq_len;
 
             // ADR-019 Phase 2 iter89e2-G: defer the Stage-A terminal commit
             // by moving `enc` into the function-scope Option. The ops6-7
@@ -5728,6 +5974,7 @@ pub fn build_gated_attn_layer(
                 &q_rope, &k_rope, &v_flat,
                 slot, seq_len, n_heads, n_kv_heads, head_dim, max_seq_len,
                 fa_arena,
+                slot_id,
             )?,
             None => {
                 let mut enc = device.command_encoder().context("enc op5")?;
@@ -5951,6 +6198,12 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
     n_kv_heads: u32,
     head_dim: u32,
     max_seq_len: u32,
+    // ADR-040 Phase B4a-cont (2026-05-23): per-slot identity for the
+    // single-CB decode path.  Same contract as `apply_sdpa_with_kv_
+    // cache` — per-slot cursor + per-slot K/V slice_view in the two
+    // dispatchers below.  TQ-active multi-slot gated as in the
+    // multi-CB sibling.
+    slot_id: SlotId,
 ) -> Result<MlxBuffer> {
     debug_assert_eq!(seq_len, 1, "apply_sdpa_with_kv_cache_decode_into: seq_len must be 1");
     debug_assert_eq!(head_dim % 32, 0, "apply_sdpa_with_kv_cache_decode_into: head_dim must be %32==0");
@@ -5960,7 +6213,22 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
     let nkv = n_kv_heads as usize;
     let d = head_dim as usize;
     let max_sl = max_seq_len as usize;
-    let cur_len = slot.current_len[0] as usize;
+    assert!(
+        (slot_id.0 as usize) < slot.current_len.len(),
+        "apply_sdpa_with_kv_cache_decode_into: slot_id={} out of range (slot.current_len.len()={}) \
+         — bounds check at forward_gpu entry regressed (ADR-040 §6.1.5)",
+        slot_id.0,
+        slot.current_len.len(),
+    );
+    if slot.tq.is_some() && slot_id.0 != 0 {
+        return Err(anyhow!(
+            "apply_sdpa_with_kv_cache_decode_into: slot_id={} with slot.tq.is_some() \
+             is not supported in Phase B4a-cont (TQ kernels are not slot-aware).  \
+             See `apply_sdpa_with_kv_cache` for the canonical B4a-TQ deferral note.",
+            slot_id.0,
+        ));
+    }
+    let cur_len = slot.current_len[slot_id.0 as usize] as usize;
 
     let kv_write_tokens = (seq).min(max_sl.saturating_sub(cur_len));
     let kv_seq_len = (cur_len + kv_write_tokens).min(max_sl) as u32;
@@ -5980,6 +6248,7 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
             slot,
             n_kv_heads, head_dim, max_seq_len,
             cur_len as u32, kv_write_tokens as u32,
+            slot_id,
         ).context("kv_cache_copy kv-cache decode_into (iter-15 helper)")?;
         // Barrier: sdpa_decode reads slot.k/slot.v written above.  Same
         // RAW barrier position as the legacy gpu_full_attn.rs:1231.
@@ -6003,6 +6272,7 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
             q_seq_major, slot, &out_buf, &fa_tmp,
             n_heads, n_kv_heads, head_dim,
             kv_seq_len, max_seq_len,
+            slot_id,
         ).context("flash_attn_vec kv-cache decode_into (FA-layer decode iter-15)")?;
     } else {
         // iter-29 (sub-sub-iter 23c-α): F32 head_dim-fallback decode_into.
@@ -6015,9 +6285,14 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
              slot.k is None — iter-34 alloc/SDPA gating invariant regressed.",
         );
         let vbuf = slot.v.as_ref().expect("dispatch_sdpa_decode F32 decode_into: slot.v is None");
+        // ADR-040 Phase B4a-cont: slice_view per-slot K/V region.
+        let (so_off, so_n) =
+            slot_k_v_region_for_full_attn(slot_id, n_kv_heads, max_seq_len, head_dim);
+        let kbuf_view = kbuf.slice_view(so_off, so_n);
+        let vbuf_view = vbuf.slice_view(so_off, so_n);
         dispatch_sdpa_decode(
             enc, registry, device,
-            q_seq_major, kbuf, vbuf, &out_buf,
+            q_seq_major, &kbuf_view, &vbuf_view, &out_buf,
             n_heads, n_kv_heads, head_dim,
             kv_seq_len, max_seq_len,
             1.0 / (d as f32).sqrt(),
@@ -6026,7 +6301,7 @@ pub fn apply_sdpa_with_kv_cache_decode_into(
 
     // Update current_len cursor (CPU-only counter — safe to update before
     // GPU completes; next read happens on the next token after CB drain).
-    slot.current_len[0] = kv_seq_len;
+    slot.current_len[slot_id.0 as usize] = kv_seq_len;
 
     Ok(out_buf)
 }
@@ -6076,6 +6351,11 @@ pub fn apply_gated_attn_layer_decode_into(
     freq_base: f32,
     mrope_section: [u32; 4],
     rms_norm_eps: f32,
+    // ADR-040 Phase B4a-cont (2026-05-23): per-slot identity for the
+    // single-CB decode layer.  Threaded through to
+    // `apply_sdpa_with_kv_cache_decode_into` which performs the per-
+    // slot cursor + K/V slice_view routing.
+    slot_id: SlotId,
 ) -> Result<MlxBuffer> {
     debug_assert_eq!(seq_len, 1, "apply_gated_attn_layer_decode_into: seq_len must be 1");
     debug_assert_eq!(head_dim % 32, 0, "apply_gated_attn_layer_decode_into: head_dim must be %32==0");
@@ -6151,6 +6431,7 @@ pub fn apply_gated_attn_layer_decode_into(
         enc, device, registry,
         &q_rope, &k_rope, &v_flat,
         slot, seq_len, n_heads, n_kv_heads, head_dim, max_seq_len,
+        slot_id,
     )?;
 
     // INTER-STAGE BARRIER (NEW): sdpa_kv → ops6-7 (replaces the former
@@ -7018,6 +7299,10 @@ mod tests {
             None,
             // iter91: synthetic parity test — Plain CommandEncoder shape.
             None,
+            // ADR-040 Phase B4a-cont: synthetic test runs against the
+            // stateless SDPA path (kv_cache_slot=None) so slot identity
+            // is unused; pass SlotId(0) for surface conformance.
+            SlotId(0),
         )
         .expect("build_gated_attn_layer");
 
@@ -7910,6 +8195,7 @@ mod tests {
             None, // fa_proj_arena (LEGACY)
             None, // iter92: K-batch hold-vec — synthetic test
             None, // iter91: layer_session — synthetic parity test, Plain shape.
+            SlotId(0), // ADR-040 Phase B4a-cont: stateless test
         )
         .expect("legacy build_gated_attn_layer");
         // Sync barrier: `build_gated_attn_layer` internally uses
@@ -7960,6 +8246,7 @@ mod tests {
             Some(&mut fa_proj_arena),   // fa_proj_arena (NEW)
             None,                       // iter92: K-batch hold-vec — synthetic test
             None,                       // iter91: layer_session — Plain shape.
+            SlotId(0),                  // ADR-040 Phase B4a-cont: stateless test
         )
         .expect("arena build_gated_attn_layer");
         // Same sync rationale as the legacy-path barrier above.

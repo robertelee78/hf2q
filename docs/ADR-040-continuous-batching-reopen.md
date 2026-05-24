@@ -85,7 +85,7 @@ The 2.45x over-shoot is documented honestly per cfa-finding (Claude `major_findi
 | `src/serve/api/sse.rs` | per-slot keepalive accounting (no contract change) | C iter-3 |
 | `src/serve/api/schema.rs` | doc-only Decision #2 update naming `SchedulerPolicy` | C iter-3 |
 | `src/inference/models/qwen35/forward_gpu.rs` | accept `slot_id: SlotId` on `forward_gpu` + `forward_gpu_with_hidden`; bounds-check; gate slot N > 0 behind B4a-cont | **B iter-4a (SHIPPED 2026-05-23)** |
-| `src/inference/models/qwen35/forward_gpu.rs` | thread `slot_id` into `build_gated_attn_layer` + KV-dispatcher slot-offset wiring; flip slot > 0 from typed-error to real-route | B iter-4a-cont |
+| `src/inference/models/qwen35/{forward_gpu.rs, gpu_full_attn.rs}` | thread `slot_id` into `build_gated_attn_layer` + `apply_gated_attn_layer_decode_into` + `apply_sdpa_with_kv_cache(_decode_into)` + the 2 private kernel-dispatch helpers (`write_kv_with_optional_tq_encode`, `dispatch_decode_sdpa_with_optional_tq`); per-slot K/V slice_view at the kernel-dispatch sites; flip slot > 0 from typed-error to real-route | **B iter-4a-cont (SHIPPED 2026-05-23)** |
 | `src/serve/forward_prefill.rs` | (Gemma 4 prefill) accept `slot_id` parameter; route writes to multi-seq KV (gated on Phase A3 Gemma 4 multi-seq KV impl) | B iter-4c |
 | `src/serve/forward_prefill_batched.rs` | same | B iter-4c |
 | `src/inference/models/qwen35/forward_gpu.rs` (decode) | thread `slot_id` through `forward_gpu_last_logits` / `forward_gpu_last_topk` / soft-token / deepstack variants | B iter-4b |
@@ -259,7 +259,7 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | B2 | FifoSchedulerAdapter byte-equivalence proof + regression pin | 2-3 days |
 | B3 | InflightBatchedScheduler admit/step/release impl | 5-8 days |
 | **B4a (SHIPPED 2026-05-23)** | Qwen35 `forward_gpu` / `forward_gpu_with_hidden` public-surface `slot_id: SlotId` threading + bounds check + H2 GPU-content byte-identity at slot 0 + slot-isolation pin + typed B4a-cont error for slot N > 0 | **1 day landed** |
-| B4a-cont | Qwen35 `build_gated_attn_layer` / `apply_sdpa_with_kv_cache` / KV-dispatcher slot-offset wiring; flip slot > 0 from typed-error to real-route (via `MlxBuffer::slice_view` on slot.k/slot.v) | 3-5 days |
+| **B4a-cont (SHIPPED 2026-05-23)** | Qwen35 `build_gated_attn_layer` / `apply_sdpa_with_kv_cache` / KV-dispatcher slot-offset wiring; flip slot > 0 from typed-error to real-route (via `MlxBuffer::slice_view` on slot.k/slot.v) | **1 day landed** |
 | B4b | Qwen35 decode-path slot threading (`forward_gpu_last_logits` / `forward_gpu_last_topk` / soft-token / deepstack) | 2-3 days |
 | B4c | Gemma 4 forward-path slot threading (`forward_prefill.rs` + `forward_prefill_batched.rs`) — gated on Phase A3 Gemma 4 multi-seq KV impl | 5-8 days |
 | B4d | Spec-decode slot threading (`forward_gpu_greedy` + dflash entry points) — gated on Phase A4 drafter KV multi-seq impl | 5-8 days |
@@ -474,6 +474,94 @@ First real per-model **forward-path** slot threading.  Closes the H2 GPU-content
 - Phase B4b: thread `slot_id` through the 5 decode-side entry points (`forward_gpu_last_logits`, `forward_gpu_last_topk`, `forward_gpu_last_logits_with_soft_tokens`, `forward_gpu_last_logits_with_soft_tokens_and_deepstack`, `forward_embed_last`) by removing the hard-coded `SlotId(0)` in their `forward_gpu_impl` calls.
 - Phase B4c: per the §2.2 amendment in this commit, Gemma 4's `forward_prefill.rs` is the B4c target after Phase A3 Gemma 4 multi-seq KV lands.
 - Phase B4d: spec-decode `forward_gpu_with_hidden` + `forward_gpu_with_hidden_dflash` callsites in `spec_decode.rs` flip from hard-coded `SlotId(0)` to the scheduler-provided slot_id.
+
+### 6.1.5 Iter-B4a-cont closure — Qwen35 GPU-side slot-offset wiring (2026-05-23, this commit)
+
+Closes the iter-B4a typed-error gate.  Removes the `forward_gpu_impl` entry guard that rejected `slot_id.0 != 0`, and lifts the five kernel-dispatch sites in `src/inference/models/qwen35/gpu_full_attn.rs` to per-slot K/V byte offsets via `MlxBuffer::slice_view`.  Slot 0 remains byte-identical to pre-B4a-cont (slice byte_offset=0 is a no-op kernel-side); slot N>0 routes writes/reads into its per-slot region of the `[n_seqs, n_kv_heads, max_seq_len, head_dim]` F32 full-attn cache backing.
+
+**`MlxBuffer::slice_view` contract verification** (mlx-native@fed406d `src/buffer.rs:93-106` + `src/encoder.rs:182-184`):
+- **Zero-copy**: `slice_view` clones the underlying Metal `MTLBuffer` ARC handle (via `metal::Buffer::clone()`) and stores the new `byte_offset` on the returned `MlxBuffer`.  No data copy occurs; both buffers share the same physical allocation.
+- **Lifetime**: the returned `MlxBuffer` independently retains the metal buffer via ARC.  It can outlive the parent `MlxBuffer` without invalidating the underlying allocation (Metal's ObjC ARC keeps the buffer alive as long as ANY clone exists).
+- **Kernel binding**: `KernelArg::Buffer(buf)` propagates `buf.byte_offset()` into Metal's `setBuffer:offset:atIndex:` call (verified at `encoder.rs:182-184`).  The kernel sees only the slice region starting at the recorded byte offset.
+- **Dtype**: slice_view preserves the parent's dtype (`self.dtype`).  Shape is replaced with `vec![n_elements]` (1-D view) since the slice may not preserve the parent's multi-axis shape semantically.
+- **Bounds**: slice_view PANICS at construction time when `byte_offset + n_elements * dtype.size_of() > inner.length()`, providing fail-loud protection against off-by-one errors in the slot byte-offset formula.
+
+**Per-slot byte offset formula** (centralised in the private helper `slot_k_v_region_for_full_attn` at `gpu_full_attn.rs:101-119`):
+
+```rust
+n_elements = n_kv_heads * max_seq_len * head_dim
+byte_offset = slot_id.0 as u64 * n_elements * size_of::<f32>()
+```
+
+Matches the alloc shape at `kv_cache.rs:2231-2236`: `[n_seqs, n_kv_heads, max_seq_len, head_dim]` F32 row-major, slot N occupying the contiguous block at index `N` on the outer axis.  Overflow guarded by `checked_mul` + `expect` (fail-loud per ADR-040 §7 mantra).
+
+**Five kernel-dispatch sites lifted** (each call previously hardcoded the slot-0 region by passing `slot.k.as_ref().expect(..)` / `slot.v.as_ref().expect(..)` raw; now passes `kbuf.slice_view(byte_offset, n_elements)`):
+
+| Site | Function | Range | Slot K/V access mode |
+|---|---|---|---|
+| 1 | `write_kv_with_optional_tq_encode` | gpu_full_attn.rs `~131-220` | F32 write (`dispatch_kv_cache_copy_seq_f32_dual`) into `slot.k` + `slot.v` slice_view |
+| 2 | `dispatch_decode_sdpa_with_optional_tq` | gpu_full_attn.rs `~225-360` | F32 read (`flash_attn_vec`) from `slot.k` + `slot.v` slice_view (legacy fallback branch) |
+| 3 | `apply_flash_attn_prefill_seq_major_into` | gpu_full_attn.rs `~1700-1830` | NO slot K/V access (operates on fresh chunk K/V written to caller-owned `out_seq`); slot_id unused at this layer.  Public signature **unchanged** — preserves every call site in `kv_cache.rs` / `mtp.rs`. |
+| 4 | `apply_flash_attn_prefill_seq_major` | gpu_full_attn.rs `~3700-3960` | Same as `_into` — no slot K/V access; public signature unchanged. |
+| 5 | `apply_flash_attn_prefill_seq_major_resume` | gpu_full_attn.rs `~4045-4180` | Caller (`apply_sdpa_with_kv_cache`) does the slice_view on slot.k / slot.v BEFORE invoking; the function consumes the slot K/V buffer arguments directly.  Public signature unchanged. |
+
+In addition, the per-slot byte-offset slice_view is also applied at the legacy F32 SDPA fallback path inside `apply_sdpa_with_kv_cache` (lines `~4730` for the prefill `sdpa` call, `~4317` for `dispatch_sdpa_decode` decode-fallback, `~4520` for the `vec_small_path` decode at cur_len>0).
+
+**Parent dispatcher updates** (slot_id parameter ADDED — public surface change limited to in-crate callers):
+
+| Function | New parameter | Caller updates |
+|---|---|---|
+| `apply_sdpa_with_kv_cache` | `slot_id: SlotId` (13th positional arg) | `gpu_full_attn.rs::build_gated_attn_layer` callsite + `mtp.rs:416` (MTP draft slot, hard-coded `SlotId(0)` — single-seq MTP is B4b scope) |
+| `apply_sdpa_with_kv_cache_decode_into` | `slot_id: SlotId` (13th positional arg) | `gpu_full_attn.rs::apply_gated_attn_layer_decode_into` callsite |
+| `build_gated_attn_layer` | `slot_id: SlotId` (21st positional arg) | `forward_gpu.rs` 2 callsites (forward_gpu_impl + forward_gpu_greedy; the latter hard-codes `SlotId(0)` — B4d scope) + 2 test sites in `gpu_full_attn.rs::tests` |
+| `apply_gated_attn_layer_decode_into` | `slot_id: SlotId` (18th positional arg) | `forward_gpu.rs::forward_gpu_impl` single-CB decode site |
+
+**TQ-active multi-slot gate**: `apply_sdpa_with_kv_cache` and `apply_sdpa_with_kv_cache_decode_into` return a typed error when `slot.tq.is_some() && slot_id.0 != 0`.  The TQ encode (`dispatch_hadamard_quantize_kv_hb_seq`) and TQ SDPA (`flash_attn_vec_tq_hb`) kernels are NOT yet slot-aware (their slot.tq buffers are bound at offset 0); routing slot N>0 through them would silently corrupt slot 0's TQ region.  Defence-in-depth assertions in the two private TQ-aware helpers (`write_kv_with_optional_tq_encode`, `dispatch_decode_sdpa_with_optional_tq`) repeat the check so a future caller that bypasses `apply_sdpa_with_kv_cache` cannot accidentally engage the broken path.  Tracked separately as B4a-TQ; until that lands, slot 0 with TQ-active remains byte-identical to pre-B4a-cont.
+
+**B4a-cont entry-gate REMOVAL** (`forward_gpu.rs`):
+- DELETED: `forward_gpu_impl`'s `if slot_id.0 != 0 { Err("forward_gpu: slot_id=N requires the Phase B4a-cont GPU-side KV-buffer slot-offset plumbing ...") }` block (was at lines `~2566-2580` pre-edit; now replaced by an explanatory comment block).
+- The bounds check (`slot_id.0 >= kv_cache.n_seqs`) is PRESERVED — out-of-range slots remain a caller bug, not a capability error.
+
+**Per-slot cursor reads/writes**: `apply_sdpa_with_kv_cache`, `apply_sdpa_with_kv_cache_decode_into`, and `build_gated_attn_layer` now read/write `slot.current_len[slot_id.0]` (was hardcoded `[0]`).  Each entry asserts `slot_id.0 < slot.current_len.len()` for defence-in-depth (the public-entry bounds check already covers this; the assert protects against a future internal caller that bypasses `forward_gpu_impl`).
+
+**Tests** (`forward_gpu.rs::tests`):
+
+| Test | Status | File:line | Coverage |
+|---|---|---|---|
+| `b4a_forward_gpu_slot_n_gt_zero_returns_b4a_cont_typed_error` | **DELETED** | (was `~8193`) | Pinned the iter-B4a contract that B4a-cont removes. |
+| `b4a_cont_forward_gpu_slot_1_succeeds_end_to_end` | **NEW PASS** | `~8194` | Proves `forward_gpu(SlotId(1))` at `n_seqs=4` runs end-to-end + advances `current_len[1] == seq_len` while keeping sibling-slot cursors at 0. |
+| `b4a_cont_forward_gpu_slot_isolation_byte_identity` | **NEW PASS** | `~8284` | Load-bearing isolation pin: forward P→slot 0 (snapshot L0), forward Q→slot 1, reset slot 0 cursor, re-forward P→slot 0, assert byte-identical to L0.  Falsifies any cross-slot K/V leak. |
+| `b4a_forward_gpu_at_slot_0_n_seqs_4_byte_identical_to_n_seqs_1` | KEPT PASS | `~7924` | H2 byte-identity at slot 0 — `n_seqs=4` allocation must not disturb slot-0 forward outputs. |
+| `b4a_forward_gpu_slot_0_does_not_touch_slot_1_kv_region` | KEPT PASS | `~8008` | The inverse direction of the new isolation test: slot 0 forward must not touch slot 1's K/V byte region. |
+| `b4a_forward_gpu_slot_out_of_range_errors` | KEPT PASS | `~8126` | Public-entry bounds check (slot >= n_seqs errors with diagnostic naming both). |
+
+**Slot isolation byte-identity proof**: `b4a_cont_forward_gpu_slot_isolation_byte_identity` is the load-bearing pin.  Falsifier path: if `MlxBuffer::slice_view`'s byte_offset is dropped/ignored on the kernel-binding path (regression in `encoder.rs::KernelArg::Buffer`) OR if the per-slot byte-offset formula is wrong, slot 1's writes leak into slot 0's region — the re-run of prompt P at slot 0 then sees corrupted K/V data and produces different logits.  The byte-equality assertion FALSIFIES with a precise per-element diff.
+
+**Quality gates (all green)**:
+- `cargo check --release`: 0
+- `cargo test --release --bin hf2q -- qwen35::kv_cache serve::scheduler serve::multi_seq_kv`: **142/142 PASS** (iter-B4a regression preserved)
+- `cargo test --release --bin hf2q -- inference::models::qwen35::forward_gpu::tests::b4a`: **5/5 PASS** (3 KEPT + 2 NEW; 1 DELETED as per contract)
+- `cargo test --release --bin hf2q -- qwen35::forward_gpu --test-threads=1`: **31/31 PASS** single-threaded
+- `cargo test --release --bin hf2q -- qwen35::mtp --test-threads=1`: **9/9 PASS** (MTP slot_id pass-through validated)
+- `cargo test --release --bin hf2q -- qwen35::spec_decode --test-threads=1`: **5/5 PASS**
+
+**LOC delta**:
+- `src/inference/models/qwen35/gpu_full_attn.rs`: +~180 LOC (helper `slot_k_v_region_for_full_attn` ~30; 6 slice_view sites ~40; TQ-active multi-slot gate + 2 defence-in-depth asserts ~50; slot_id param threading on 4 dispatchers ~30; cursor read/write swaps + comments ~30)
+- `src/inference/models/qwen35/forward_gpu.rs`: +~200 LOC / -~80 LOC (B4a-cont gate REMOVED ~30 LOC; 3 caller updates ~12 LOC; 1 DELETED test ~50 LOC; 2 NEW tests ~210 LOC + module-level commentary)
+- `src/inference/models/qwen35/mtp.rs`: +8 LOC (single MTP callsite + comment naming the B4b deferral for multi-slot MTP)
+- `docs/ADR-040-continuous-batching-reopen.md`: +~140 LOC (§2.2 row + §6 Phase B sequencing row updates + this §6.1.5 closure block)
+
+**Deviations from the original brief, with rationale**:
+- The brief instructed adding `slot_id: SlotId` to all 5 dispatch functions including the 3 prefill helpers (`apply_flash_attn_prefill_seq_major`, `_into`, `_resume`).  After tracing the call graph, those 3 helpers either operate on FRESH chunk K/V (no slot.k/slot.v access in `_into` / wrapper) or accept caller-supplied slot K/V buffers (`_resume`).  In all three cases the per-slot routing is structurally encoded in (a) the absence of slot K/V access entirely, or (b) the caller-supplied buffer's own `byte_offset` (set via `slice_view` at the caller).  Adding `slot_id` to these 3 public functions would force ripple updates in `kv_cache.rs::tests` (3 callsites) — which the brief constraint #6 ("ONLY edit these 3 files") forbids.  The resolution: keep those 3 public signatures unchanged; do the slice_view at the `apply_sdpa_with_kv_cache` parent dispatcher BEFORE invoking the helper.  `apply_sdpa_with_kv_cache` itself does get the `slot_id` parameter — which forced one ripple update in `mtp.rs::416` (the only out-of-file caller).  Net: the brief intent is satisfied (slot N>0 successfully writes/reads at the correct K/V byte offset, end-to-end test PASS) with a smaller blast radius (1 cross-file callsite vs 5).
+- The brief instructed adding `slot_id: SlotId` parameters to `apply_flash_attn_prefill_seq_major_into` and `apply_flash_attn_prefill_seq_major`.  These have NO out-of-file callers (`kv_cache.rs` tests do call them but with the original signature) — so adding the param technically wouldn't break the file scope.  However, since neither function accesses slot K/V, the parameter would be `let _ = slot_id;` — dead weight that future maintainers would have to either remove or carry forward.  Following the YAGNI principle (don't add parameters until they have a use), I kept these two unchanged.  If a future iter (e.g. shared slot K/V mirror) needs per-slot routing in the prefill helpers, the param can be added at that time alongside its first real use.
+
+**Mantra-aligned**: no `// TODO`, no `unimplemented!()`, no `panic!()` in production code.  TQ-active multi-slot is the only deferred case — gated with a typed error naming the specific kernel work needed (B4a-TQ).  Slot 0 with TQ-active remains byte-identical to pre-B4a-cont; the TQ multi-slot deferral is a precise contract, not a stub.
+
+**Future-iter pin pointers**:
+- Phase B4a-TQ: lift `dispatch_hadamard_quantize_kv_hb_seq` (`mlx-native::ops::hadamard_quantize_kv`) and `flash_attn_vec_tq_hb` (`mlx-native::ops::flash_attn_vec_tq_hb`) to accept a per-slot byte offset on the `slot.tq.k_packed` / `slot.tq.v_packed` / `slot.tq.k_norms` / `slot.tq.v_norms` buffers (the alloc shape at `kv_cache.rs:2421-2426` is already `[n_seqs, n_kv_heads, max_seq_len, head_dim]` — kernel work is purely the `setBuffer:offset:` parameterization).  Once landed, remove the typed-error gates at `apply_sdpa_with_kv_cache` (lines `~4377` and `~6256`) and the two defence-in-depth asserts in the private helpers.
+- Phase B4b: thread `slot_id` through the 5 decode-side entry points + MTP's `forward_draft` path (currently hard-coded `SlotId(0)` at `mtp.rs:430`).
+- Phase B4c: Gemma 4's `forward_prefill.rs` after Phase A3 lands.
+- Phase B4d: spec-decode (`forward_gpu_greedy` + dflash variants) after Phase A4 lands.
 
 ---
 

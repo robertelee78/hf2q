@@ -426,6 +426,13 @@ impl MtpWeights {
             cfg.head_dim,
             kv_cache.max_seq_len,
             None,
+            // ADR-040 Phase B4a-cont (2026-05-23): MTP draft slot
+            // (`HybridKvCache::mtp_slot`) is single-seq today (one MTP
+            // draft per host request).  Multi-slot MTP draft routing
+            // is deferred to Phase B4b alongside the other decode-side
+            // entry-point lifts.  Hard-coded `SlotId(0)` matches the
+            // single-seq contract; B4b removes the hard-coding.
+            crate::serve::multi_seq_kv::SlotId(0),
         )
         .context("MTP SDPA")?;
 
