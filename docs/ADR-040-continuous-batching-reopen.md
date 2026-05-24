@@ -349,7 +349,8 @@ First real per-model `MultiSeqKvCache` impl. Path: `src/inference/models/qwen35/
 | Hyp | Claim | Status | Test |
 |---|---|---|---|
 | H1 | `HybridKvCache::new(.., n_seqs=4)` allocates without panic + scales 4× linearly | **VERIFIED** (run before any production code per dossier §4 step 1) | `h1_hybrid_kv_cache_alloc_n_seqs_4_byte_scale` |
-| H2 | Slot 0 cursor state is byte-identical between `n_seqs=1` and `n_seqs=4` | **VERIFIED** (cursor-level; GPU-content side ships in Phase B iter-3 forward-path wiring) | `qwen35_hybrid_kv_byte_identical_at_slot_0_n_seqs_4_vs_1` |
+| H2 | Slot 0 cursor state is byte-identical between `n_seqs=1` and `n_seqs=4` | **VERIFIED (cursor-only — forward-path byte-equivalence requires Phase B iter-3 wiring)** — see caveat row below | `qwen35_hybrid_kv_byte_identical_at_slot_0_n_seqs_4_vs_1` |
+| — | **Caveat (iter-2.5 M3 honest downgrade)**: AC-1 byte-equivalence at slot 0 is *partially* verified | iter-2a pinned cursor-level (`current_len[0]` identical across `n_seqs=1` vs `n_seqs=4`) but did NOT pin forward-path logits byte-identical (requires `forward_prefill_gpu` slot-0 trace, which is Phase B iter-3 scope). The dossier's H2 statement requires forward-path byte-identical logits; iter-2a closed only the cursor half. | (cursor half) `qwen35_hybrid_kv_byte_identical_at_slot_0_n_seqs_4_vs_1`; (forward half) Phase B iter-3 `forward_prefill_slot_0_byte_identical_at_n_seqs_4_vs_1` |
 | H3 | Per-slot `append_for_seq` is O(1) and isolated (writes to slot N do not corrupt slot M) | **VERIFIED** (cursor-level) | `qwen35_hybrid_kv_per_slot_isolation_n_seqs_4` |
 | H4 | `n_seqs` is outermost axis in linear-attn recurrent state (drop = contiguous-slice zero, no kernel) | **DEFERRED to A2b** | linear-attn lift is gated on the `rollback_la_to` guard at `kv_cache.rs:1567` |
 | H5 | `gpu_delta_net.rs` `n_seqs = 1u32` sites are soft hard-codes (pass `cache.n_seqs` to lift) | **DEFERRED to A2b** | only meaningful once linear-attn carve-out lifts |
@@ -361,7 +362,7 @@ First real per-model `MultiSeqKvCache` impl. Path: `src/inference/models/qwen35/
 - ✅ MTP slot lift (when `mtp_slot.is_some()`)
 - ⏭️ Linear-attn cursor lift — DEFERRED to A2b (per R1: `rollback_la_to` guard explicitly errors on `n_seqs > 1`)
 - ⏭️ KV-content side of byte-equivalence (Phase B iter-3 wires `forward_prefill.rs` slot-id threading)
-- ⏭️ `fork_seq` kernel-dispatch — Phase A2a returns `SlotOom { 0, 0 }` sentinel as the documented "kernel-dispatch not yet implemented" signal per cfa-finding-F2 (no NotImplemented stub); real impl in A2c
+- ⏭️ `fork_seq` kernel-dispatch — Phase A2a returned `SlotOom { 0, 0 }` sentinel as the documented "kernel-dispatch not yet implemented" signal per cfa-finding-F2; **iter-2.5 M1 closure: now returns `CapabilityUnsupported { capability }` (HTTP 501) instead — see §6.1.3**
 - ⏭️ `HF2Q_MAX_SLOTS` env wiring — ADR-040 §6 Phase C iter-4 scope
 - ⏭️ Persistor `n_seqs=4` round-trip — `qwen35_hybrid_persistor.rs` wire format already supports it (`:171-175`); test lands in A2 closure ceremony
 
@@ -375,6 +376,38 @@ First real per-model `MultiSeqKvCache` impl. Path: `src/inference/models/qwen35/
 **R1+R2 mitigations confirmed**:
 - R1 (linear-attn capture buffer): the `rollback_la_to` guard at `kv_cache.rs:1567` is untouched. Phase A2a never lifts `n_seqs > 1` into the linear-attn path.
 - R2 (forward-path slot threading is Phase B iter-3): Phase A2a's `append_for_seq` mutates only per-cache cursor state; forward-path slot_id threading lands separately per ADR-040 §2.2.
+
+### 6.1.3 Iter-2.5 closure — Phase A2 + Phase B adversarial review fixes (2026-05-23)
+
+Per goal-mode directive ("Spawn Swarm team (/cfa) with codex to check our work"), iter-2a commit `2ecb2dc6` (KV) + iter-2.5 prep commit `69d86ed8` (ADR/scheduler) were reviewed by an adversarial /cfa session: an independent Codex reviewer + an independent Claude reviewer agent. Reviews at `/tmp/cfa-iter2a-b3-review/codex-review-last.txt` and `~/.claude/teams/cfa-iter2a-b3-review/shared/reviews/claude-on-iter2a-b3.json`.
+
+**KV-cache fixes landed in this commit** (parallel scheduler/engine fixes documented separately by the inflight-batched reviewer agent — see C1/C2/C3/M2 row below for file pointers):
+
+| # | Finding | Reviewer(s) | Severity | File:line | Fix |
+|---|---|---|---|---|---|
+| M1 | `fork_seq` returned `SlotOom { 0, 0 }` sentinel — mantra violation (would map to HTTP 429 + Retry-After, lies about whether retry can succeed) | Codex + Claude | major | `src/inference/models/qwen35/kv_cache.rs:2731-2735` (was); `src/serve/multi_seq_kv.rs` (new variant) | Add `MultiSeqError::CapabilityUnsupported { capability: &'static str }` variant. Map to HTTP 501 in Phase C iter-3 schema. `fork_seq` returns it with a label naming the deferred Phase A2c kernel arc + dossier R5 grounding. Test renamed `qwen35_hybrid_kv_fork_cross_slot_returns_capability_unsupported_at_phase_a2a` + 2 trait-surface pins (`multi_seq_error_capability_unsupported_display_names_capability`, `multi_seq_error_capability_unsupported_distinct_from_slot_oom`). |
+| C4 | `seq_len()` reads `full_attn[0].current_len[slot]` as canonical with no defensive assert against per-layer cursor desync (silent lie on checkpoint replay / partial rollback / kernel error) | Claude | critical | `src/inference/models/qwen35/kv_cache.rs:2589-2614` | Add `debug_assert!` against per-layer desync (catches in dev/CI; release builds return canonical_0 — no panic, no Result shape change). Add `qwen35_hybrid_kv_seq_len_canonical_across_full_attn_layers` test pinning the production-side invariant. Trade-off documented inline: release-build assertion would panic on prod desync (worse than silent lie); if a future incident reveals desync, escalate to Result-return. |
+| M4 | `drop_does_not_zero_recurrent` test compared only `byte_len()` before/after — vacuous (any reasonable impl would pass even if it zero'd contents in place) | Codex + Claude | major | `src/inference/models/qwen35/kv_cache.rs:6511-6528` (was) | Strengthen: fill recurrent with deterministic non-zero F32 pattern via `MlxBuffer::as_mut_slice::<f32>()` (StorageModeShared, direct host write), snapshot bytes via `as_slice::<f32>().to_vec()`, call `drop_seq`, snapshot again, assert `before == after` byte-for-byte. Any in-place mutation surfaces. |
+| M5 | H1 `byte_len()` 4× check can't catch axis-order swap (n_seqs landing on wrong axis produces same byte count) | Codex + Claude | major | `src/inference/models/qwen35/kv_cache.rs:6229-6301` | Add shape-axis assertions to H1 using `MlxBuffer::shape()`. Per kv_cache.rs alloc sites: full-attn K/V at shape[0]=n_seqs (row-major, head_dim innermost); linear-attn recurrent at shape.last()=n_seqs (column-major-style, D_k innermost — comment at kv_cache.rs:2278). Both: non-n_seqs dims must be byte-equal between cache_1 and cache_4. |
+| H1-tq | H1 only exercised dense F32-only path (`new(..)`); no coverage of TQ-active production KV path | Claude | major | `src/inference/models/qwen35/kv_cache.rs` (new sibling test) | Add `h1_tq_active_hybrid_kv_cache_alloc_n_seqs_4_byte_scale` constructing via `new_with_options(.., tq_kv_active=true)`. Pins: F32 K/V dropped (iter-34 contract); TQ packed K/V + norms K/V all scale 4×; M5-style shape proof on TQ buffers (shape[0]=n_seqs per `alloc_tq_full_attn_buffers` line 2421+2437). |
+| M3 | ADR-040 §6.1.2 marked H2 "VERIFIED (cursor-level)" — overstated vs dossier's forward-path byte-identical logits requirement | Codex + Claude | major | `docs/ADR-040-continuous-batching-reopen.md` §6.1.2 | Downgrade H2 to "VERIFIED (cursor-only — forward-path byte-equivalence requires Phase B iter-3 wiring)" + add explicit caveat row stating iter-2a closed only the cursor half. |
+| C1/C2/C3/M2 | Scheduler-side findings (admission accounting, race conditions, FIFO byte-equivalence regressions) | Codex + Claude | mixed | `src/serve/scheduler.rs` + `src/serve/api/engine.rs` + `src/serve/load_info.rs` | **Owned by parallel iter-2.5 scheduler agent — see that agent's closure block.** File-level boundary: this commit only touches `multi_seq_kv.rs`, `qwen35/kv_cache.rs`, and this ADR doc. |
+
+**Mantra violations explicitly closed (ADR-040 §7 "no fallback, no stub, no `// TODO` in production"):**
+- `SlotOom { 0, 0 }` sentinel in `fork_seq` (qwen35/kv_cache.rs:2731-2735) — fixed by M1.
+- Implicit "trust me" cursor-canonical read in `seq_len()` (qwen35/kv_cache.rs:2613) — hardened by C4.
+- Test vacuity on `drop_does_not_zero_recurrent` — fixed by M4 (was technically a test defect, not a production-code mantra violation, but the brief class is the same: appears to pin a contract, actually pins nothing).
+
+**Iter-2.5 KV-side test count net**: qwen35::kv_cache 75 → 77 (+2 net: H1-tq + C4 pin; M4 + M5 strengthened in-place, M1 test renamed + assertion-shape updated). multi_seq_kv 16 → 18 (+2 net: CapabilityUnsupported display + discriminant-distinctness pins).
+
+**Quality gates (all green)**:
+- `cargo check --release`: 0
+- `cargo test --release --bin hf2q -- serve::multi_seq_kv qwen35::kv_cache`: all PASS
+
+**Future-iter pin pointers**:
+- Phase C iter-3 schema mapping: `serve/api/schema.rs` will route `MultiSeqError::CapabilityUnsupported` → HTTP 501 (parallel to `SlotOom` → 429 + Retry-After and `SlotOutOfRange` → 500 internal-defect).
+- Phase B iter-3 forward-path slot threading: `forward_prefill_gpu` per-slot offset wiring + the still-missing `forward_prefill_slot_0_byte_identical_at_n_seqs_4_vs_1` test that closes the H2 forward-path half.
+- Phase A2c: replace `fork_seq` `CapabilityUnsupported` with same-buffer cross-region memcpy via `dispatch_kv_cache_copy_seq_*`; flip the test assertion to `Ok(())` + per-buffer byte-equality.
 
 ---
 

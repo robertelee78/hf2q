@@ -2610,7 +2610,42 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         if self.full_attn.is_empty() {
             return Ok(0);
         }
-        Ok(self.full_attn[0].current_len[slot.0 as usize])
+        let canonical = self.full_attn[0].current_len[slot.0 as usize];
+
+        // iter-2.5 C4: defensive cursor-homogeneity check.  Production
+        // wiring MUST keep `current_len[slot.0]` identical across all
+        // `full_attn[i]` (and the MTP slot if present) because
+        // `append_for_seq` bumps them in lockstep.  A desync
+        // (checkpoint replay, partial rollback, kernel error) would
+        // silently lie via this accessor — debug builds fail-fast so
+        // the desync is caught in dev/CI; release builds trust the
+        // invariant and return the canonical_0 reading (consistent
+        // runtime behaviour, no panic, no Result-shape change).  If a
+        // future incident reveals desync in prod, escalate to a
+        // Result-return that includes the per-layer cursor vector.
+        debug_assert!(
+            self.full_attn
+                .iter()
+                .all(|s| s.current_len[slot.0 as usize] == canonical),
+            "HybridKvCache::seq_len({:?}): current_len desynchronized across \
+             full_attn layers; canonical=full_attn[0].current_len[{}]={} but \
+             at least one slot disagrees",
+            slot,
+            slot.0,
+            canonical
+        );
+        if let Some(ref mtp) = self.mtp_slot {
+            debug_assert!(
+                mtp.current_len[slot.0 as usize] == canonical,
+                "HybridKvCache::seq_len({:?}): mtp.current_len[{}] = {} \
+                 disagrees with full_attn canonical {}",
+                slot,
+                slot.0,
+                mtp.current_len[slot.0 as usize],
+                canonical
+            );
+        }
+        Ok(canonical)
     }
 
     fn append_for_seq(
@@ -2720,19 +2755,27 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         // same-buffer cross-region memcpy via
         // `dispatch_kv_cache_copy_seq_*` (dossier §2.10 R5).  That
         // kernel-pattern + its own unit-test arc are scheduled for
-        // Phase A2b once the linear-attn multi-seq carve-out lands.
-        // Per cfa-finding-F2 we do NOT add an `Err::NotImplemented`
-        // variant — sentinel-shaped `SlotOom { 0, 0 }` maps to the
-        // same Decision #19 429 + Retry-After upstream path while the
-        // real kernel-dispatch arc is in flight.  The pin in
-        // `qwen35_hybrid_kv_fork_cross_slot_returns_oom_at_phase_a2a`
-        // will fail loudly when the Phase A2b/A2c impl flips the
-        // discriminant, signaling the deferral closure.
-        Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOom {
-            slot: dst,
-            needed_bytes: 0,
-            budget_bytes: 0,
-        })
+        // Phase A2c once the linear-attn multi-seq carve-out lands.
+        //
+        // **iter-2.5 M1 (mantra-violation closure)**: the iter-2a impl
+        // returned `SlotOom { 0, 0 }` here as a sentinel for
+        // "kernel-dispatch not yet implemented", which would map to
+        // HTTP 429 + Retry-After upstream — a *misleading* envelope
+        // (caller thinks the capacity will free up; it won't).  Per
+        // the new `MultiSeqError::CapabilityUnsupported` variant
+        // (multi_seq_kv.rs), the deferral now surfaces honestly: the
+        // upstream Phase C iter-3 schema mapping will route this
+        // discriminant to HTTP 501 Not Implemented, which is the
+        // truthful operator-facing envelope while the real fork
+        // dispatch lands.  The pin in
+        // `qwen35_hybrid_kv_fork_cross_slot_returns_capability_unsupported_at_phase_a2a`
+        // will fail loudly when the Phase A2c impl flips the
+        // discriminant to `Ok(())`, signaling the deferral closure.
+        Err(
+            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: "fork_seq cross-slot copy (Qwen35 HybridKvCache; deferred to Phase A2c per ADR-040 §6 + dossier R5)",
+            },
+        )
     }
 }
 
@@ -6298,6 +6341,319 @@ mod tests {
             cache_4.full_attn[0].current_len.len(), 4,
             "H1: lifted current_len Vec length tracks n_seqs"
         );
+
+        // ── iter-2.5 M5: shape/stride proof ────────────────────────────
+        //
+        // byte_len() 4× scaling is necessary but NOT sufficient.  An
+        // axis-order swap (e.g. n_seqs↔n_kv_heads) would produce the
+        // identical byte count yet break per-slot indexing because
+        // the kernel walks the shape in a fixed order.  M5 adds
+        // shape-axis assertions so the test catches:
+        //   - n_seqs landing on the wrong axis position
+        //   - a non-n_seqs dim changing between n_seqs=1 and n_seqs=4
+        //   - dtype reinterpretation (caught implicitly via the
+        //     by-shape product check)
+        //
+        // **Layout conventions** (per kv_cache.rs alloc sites):
+        //   - Full-attn K/V (line 2231-2236): row-major shape vec
+        //     `[n_seqs, n_kv_heads, max_seq_len, head_dim]` — `n_seqs`
+        //     is at shape[0] (outermost in row-major; head_dim
+        //     innermost stride-1).
+        //   - Linear-attn recurrent (line 2284-2289):
+        //     column-major-style shape vec `[D_k, D_v, num_v_heads,
+        //     n_seqs]` — `n_seqs` is at shape.last() (outermost in
+        //     column-major; D_k innermost stride-1; comment at line
+        //     2278 confirms "d_k innermost").
+        //
+        // These two layouts pick different conventions because each
+        // matches its respective kernel's native traversal order;
+        // the M5 assertions hard-code the per-buffer convention
+        // rather than trying to pick a single "outermost" idea.
+
+        // Full-attn K: shape[0] must be n_seqs; other dims invariant.
+        let k_shape_1 = cache_1.full_attn[0].k.as_ref().unwrap().shape().to_vec();
+        let k_shape_4 = cache_4.full_attn[0].k.as_ref().unwrap().shape().to_vec();
+        assert_eq!(
+            k_shape_1.len(),
+            4,
+            "M5: full-attn K must be 4-D; got shape {:?}",
+            k_shape_1
+        );
+        assert_eq!(
+            k_shape_4.len(),
+            4,
+            "M5: full-attn K (n_seqs=4) must be 4-D; got shape {:?}",
+            k_shape_4
+        );
+        assert_eq!(
+            k_shape_1[0], 1,
+            "M5: baseline full-attn K shape[0] must be n_seqs=1; got {:?}",
+            k_shape_1
+        );
+        assert_eq!(
+            k_shape_4[0], 4,
+            "M5 FALSIFIED: full-attn K shape[0] must be n_seqs=4 \
+             (n_seqs landed on the wrong axis — kernel per-slot indexing \
+             will silently corrupt); got {:?}",
+            k_shape_4
+        );
+        // All non-n_seqs dims invariant between cache_1 and cache_4 —
+        // catches an axis-permutation where n_seqs is correctly
+        // outermost but, e.g., n_kv_heads and head_dim swap.
+        assert_eq!(
+            &k_shape_4[1..], &k_shape_1[1..],
+            "M5 FALSIFIED: non-n_seqs dims diverge between n_seqs=1 \
+             ({:?}) and n_seqs=4 ({:?}) — silent axis swap",
+            k_shape_1, k_shape_4
+        );
+
+        // Full-attn V: same convention as K.  Catches an asymmetric
+        // K-vs-V layout regression (e.g. K stays correct, V swaps).
+        let v_shape_1 = cache_1.full_attn[0].v.as_ref().unwrap().shape().to_vec();
+        let v_shape_4 = cache_4.full_attn[0].v.as_ref().unwrap().shape().to_vec();
+        assert_eq!(
+            v_shape_1[0], 1,
+            "M5: baseline full-attn V shape[0] must be n_seqs=1; got {:?}",
+            v_shape_1
+        );
+        assert_eq!(
+            v_shape_4[0], 4,
+            "M5 FALSIFIED: full-attn V shape[0] must be n_seqs=4; got {:?}",
+            v_shape_4
+        );
+        assert_eq!(
+            &v_shape_4[1..], &v_shape_1[1..],
+            "M5 FALSIFIED: V non-n_seqs dims diverge ({:?} vs {:?})",
+            v_shape_1, v_shape_4
+        );
+
+        // Linear-attn recurrent: shape.last() must be n_seqs;
+        // preceding dims invariant.  Convention differs from
+        // full-attn (see comment above).
+        if !cache_1.linear_attn.is_empty() {
+            let r_shape_1 = cache_1.linear_attn[0].recurrent.shape().to_vec();
+            let r_shape_4 = cache_4.linear_attn[0].recurrent.shape().to_vec();
+            assert_eq!(
+                r_shape_1.len(),
+                4,
+                "M5: linear-attn recurrent must be 4-D; got {:?}",
+                r_shape_1
+            );
+            assert_eq!(
+                r_shape_4.len(),
+                4,
+                "M5: linear-attn recurrent (n_seqs=4) must be 4-D; got {:?}",
+                r_shape_4
+            );
+            assert_eq!(
+                r_shape_1.last().copied(),
+                Some(1),
+                "M5: baseline linear-attn recurrent shape.last() must be \
+                 n_seqs=1; got {:?}",
+                r_shape_1
+            );
+            assert_eq!(
+                r_shape_4.last().copied(),
+                Some(4),
+                "M5 FALSIFIED: linear-attn recurrent shape.last() must be \
+                 n_seqs=4 (n_seqs landed on the wrong axis — kernel \
+                 per-slot indexing will silently corrupt); got {:?}",
+                r_shape_4
+            );
+            // Non-n_seqs dims invariant — catches an axis permutation
+            // among [D_k, D_v, num_v_heads].
+            let r_inner_1 = &r_shape_1[..r_shape_1.len() - 1];
+            let r_inner_4 = &r_shape_4[..r_shape_4.len() - 1];
+            assert_eq!(
+                r_inner_4, r_inner_1,
+                "M5 FALSIFIED: linear-attn recurrent non-n_seqs dims \
+                 diverge between n_seqs=1 ({:?}) and n_seqs=4 ({:?}) — \
+                 silent axis swap within [D_k, D_v, num_v_heads]",
+                r_shape_1, r_shape_4
+            );
+        }
+    }
+
+    /// iter-2.5 H1-tq pin — sibling to H1 that exercises the TQ-active
+    /// production KV path per dossier §2.1.7.  H1 uses
+    /// `HybridKvCache::new(..)` which is the legacy F32-only allocator
+    /// (`tq_kv_active=false`); a TQ-active build constructs via
+    /// `new_with_options(.., tq_kv_active=true)` which adds U8-packed
+    /// K/V + F32 norms buffers (`alloc_tq_full_attn_buffers` at
+    /// kv_cache.rs:2393) and DROPS the F32 K/V backing per
+    /// iter-34's 3.94× memory savings flip.
+    ///
+    /// Falsifiers (any one ⇒ iter-2.5 H1-tq broken):
+    /// 1. `HybridKvCache::new_with_options(.., n_seqs=4, true)` panics
+    ///    or errors at construction.
+    /// 2. `cache.tq_kv_active` is not propagated.
+    /// 3. TQ K/V packed buffers at `n_seqs=4` are NOT exactly 4× the
+    ///    `n_seqs=1` baseline.
+    /// 4. TQ K/V norms buffers at `n_seqs=4` are NOT exactly 4× the
+    ///    `n_seqs=1` baseline.
+    /// 5. `n_seqs` is NOT shape[0] on the TQ packed/norms buffers
+    ///    (axis-order swap — same M5-class regression as the F32
+    ///    path).
+    ///
+    /// **NOT a strict superset of H1** — H1 covers F32 buffers
+    /// (`slot.k.is_some()` and `slot.v.is_some()`) which are
+    /// dropped in TQ-active mode (iter-34); the two tests are
+    /// complementary halves of the n_seqs lift coverage matrix.
+    #[test]
+    fn h1_tq_active_hybrid_kv_cache_alloc_n_seqs_4_byte_scale() {
+        let device = MlxDevice::new().expect("cpu device for test");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let max_seq_len = 64u32;
+
+        let cache_1 =
+            HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true)
+                .expect("TQ-active alloc at n_seqs=1");
+        let cache_4 =
+            HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 4, true)
+                .expect("TQ-active alloc at n_seqs=4");
+
+        // Falsifier 2: tq_kv_active flag propagated.
+        assert!(
+            cache_1.tq_kv_active,
+            "H1-tq: tq_kv_active must be true after new_with_options(.., true)"
+        );
+        assert!(
+            cache_4.tq_kv_active,
+            "H1-tq: tq_kv_active must be true after new_with_options(.., true)"
+        );
+
+        // Falsifier 1: n_seqs propagated.
+        assert_eq!(cache_1.n_seqs, 1, "H1-tq: n_seqs=1 baseline");
+        assert_eq!(cache_4.n_seqs, 4, "H1-tq: n_seqs=4 lift");
+
+        // Falsifier (iter-34 contract): F32 K/V are DROPPED in
+        // TQ-active mode.  Without this assert a future regression
+        // that re-introduces shadow-mode F32 backing would silently
+        // double the memory; the byte-scale check below would still
+        // pass because both sides scale 4×.
+        if cache_1.full_attn.is_empty() {
+            eprintln!("H1-tq: cfg yields no full-attn layers; vacuous");
+            return;
+        }
+        assert!(
+            cache_4.full_attn[0].k.is_none(),
+            "H1-tq: TQ-active full-attn slot.k must be None (iter-34 \
+             dropped F32 backing for 3.94× savings)"
+        );
+        assert!(
+            cache_4.full_attn[0].v.is_none(),
+            "H1-tq: TQ-active full-attn slot.v must be None (iter-34)"
+        );
+        // TQ buffers MUST be present.
+        let tq_1 = cache_1.full_attn[0]
+            .tq
+            .as_ref()
+            .expect("H1-tq: tq present when tq_kv_active=true at n_seqs=1");
+        let tq_4 = cache_4.full_attn[0]
+            .tq
+            .as_ref()
+            .expect("H1-tq: tq present when tq_kv_active=true at n_seqs=4");
+
+        // Falsifier 3: TQ packed scales 4×.
+        let baseline_kp = tq_1.k_packed.byte_len();
+        let lifted_kp = tq_4.k_packed.byte_len();
+        assert_eq!(
+            lifted_kp,
+            baseline_kp * 4,
+            "H1-tq FALSIFIED: TQ K-packed does not scale 4× with n_seqs \
+             ({} != {} * 4 = {})",
+            lifted_kp,
+            baseline_kp,
+            baseline_kp * 4
+        );
+        let baseline_vp = tq_1.v_packed.byte_len();
+        let lifted_vp = tq_4.v_packed.byte_len();
+        assert_eq!(
+            lifted_vp,
+            baseline_vp * 4,
+            "H1-tq FALSIFIED: TQ V-packed does not scale 4× ({} != {})",
+            lifted_vp,
+            baseline_vp * 4
+        );
+
+        // Falsifier 4: TQ norms scales 4×.
+        let baseline_kn = tq_1.k_norms.byte_len();
+        let lifted_kn = tq_4.k_norms.byte_len();
+        assert_eq!(
+            lifted_kn,
+            baseline_kn * 4,
+            "H1-tq FALSIFIED: TQ K-norms does not scale 4× ({} != {})",
+            lifted_kn,
+            baseline_kn * 4
+        );
+        let baseline_vn = tq_1.v_norms.byte_len();
+        let lifted_vn = tq_4.v_norms.byte_len();
+        assert_eq!(
+            lifted_vn,
+            baseline_vn * 4,
+            "H1-tq FALSIFIED: TQ V-norms does not scale 4× ({} != {})",
+            lifted_vn,
+            baseline_vn * 4
+        );
+
+        // Falsifier 5: M5-style shape proof for TQ buffers.  Per
+        // `alloc_tq_full_attn_buffers` (kv_cache.rs:2421-2426 +
+        // 2437-2442) the convention is `[n_seqs, n_kv_heads,
+        // max_seq_len, head_dim]` and `[n_seqs, n_kv_heads,
+        // max_seq_len, norms_per_pos]` — n_seqs at shape[0].
+        let kp_shape_1 = tq_1.k_packed.shape().to_vec();
+        let kp_shape_4 = tq_4.k_packed.shape().to_vec();
+        assert_eq!(
+            kp_shape_1.len(),
+            4,
+            "H1-tq M5: TQ K-packed must be 4-D; got {:?}",
+            kp_shape_1
+        );
+        assert_eq!(
+            kp_shape_1[0], 1,
+            "H1-tq M5: baseline TQ K-packed shape[0] must be n_seqs=1; got {:?}",
+            kp_shape_1
+        );
+        assert_eq!(
+            kp_shape_4[0], 4,
+            "H1-tq M5 FALSIFIED: TQ K-packed shape[0] must be n_seqs=4; got {:?}",
+            kp_shape_4
+        );
+        assert_eq!(
+            &kp_shape_4[1..], &kp_shape_1[1..],
+            "H1-tq M5 FALSIFIED: TQ K-packed non-n_seqs dims diverge \
+             ({:?} vs {:?})",
+            kp_shape_1, kp_shape_4
+        );
+        // Same for K-norms.
+        let kn_shape_1 = tq_1.k_norms.shape().to_vec();
+        let kn_shape_4 = tq_4.k_norms.shape().to_vec();
+        assert_eq!(
+            kn_shape_1[0], 1,
+            "H1-tq M5: baseline TQ K-norms shape[0] must be n_seqs=1; got {:?}",
+            kn_shape_1
+        );
+        assert_eq!(
+            kn_shape_4[0], 4,
+            "H1-tq M5 FALSIFIED: TQ K-norms shape[0] must be n_seqs=4; got {:?}",
+            kn_shape_4
+        );
+        assert_eq!(
+            &kn_shape_4[1..], &kn_shape_1[1..],
+            "H1-tq M5 FALSIFIED: TQ K-norms non-n_seqs dims diverge"
+        );
+
+        // current_len cursor vec also scales with n_seqs (same as H1).
+        assert_eq!(
+            cache_1.full_attn[0].current_len.len(),
+            1,
+            "H1-tq: baseline current_len Vec length tracks n_seqs"
+        );
+        assert_eq!(
+            cache_4.full_attn[0].current_len.len(),
+            4,
+            "H1-tq: lifted current_len Vec length tracks n_seqs"
+        );
     }
 
     // Trait-surface tests use the local `MultiSeqKvCache` impl (above the
@@ -6463,6 +6819,77 @@ mod tests {
         }
     }
 
+    /// iter-2.5 C4 pin: `append_for_seq` keeps `current_len[slot.0]`
+    /// byte-identical across every `full_attn[i]` slot AND the MTP
+    /// slot (if present).  This is the production-wiring invariant
+    /// that `seq_len()`'s canonical-from-`full_attn[0]` read depends
+    /// on; the C4 fix added a `debug_assert!` against per-layer
+    /// desync, and this test pins the production-side invariant
+    /// (every layer's cursor is the same after a clean append).
+    ///
+    /// Falsifier: any `full_attn[i].current_len[slot]` that diverges
+    /// from `full_attn[0].current_len[slot]` after a sequence of
+    /// `append_for_seq(slot, _)` calls ⇒ the seq_len() canonical
+    /// assumption is unsafe and the iter-2.5 C4 debug_assert is
+    /// load-bearing for catching the regression.
+    #[test]
+    fn qwen35_hybrid_kv_seq_len_canonical_across_full_attn_layers() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+
+        // Append a non-trivial sequence to slot 1.  Use multiple
+        // bumps so a per-layer rounding/silent-truncation defect
+        // would surface as a divergence, not coincidentally match
+        // after one bump.
+        cache.append_for_seq(SlotId(1), 2).unwrap();
+        cache.append_for_seq(SlotId(1), 3).unwrap();
+        // Total slot-1 cursor should now be 5 on every full-attn
+        // layer.  The tiny cfg has 2 full-attn layers per
+        // `tiny_dense_cfg_4layer_for_multi_seq_tests()` so the
+        // assertion exercises >1 layer (not a vacuous single-layer
+        // case).
+        assert!(
+            cache.full_attn.len() >= 2,
+            "fixture sanity: tiny cfg yields ≥2 full-attn layers (got {})",
+            cache.full_attn.len()
+        );
+        let canonical = cache.full_attn[0].current_len[1];
+        assert_eq!(
+            canonical, 5,
+            "slot 1 canonical cursor must be 2+3=5 after the append sequence"
+        );
+        for (idx, slot) in cache.full_attn.iter().enumerate() {
+            assert_eq!(
+                slot.current_len[1], canonical,
+                "C4 FALSIFIED: full_attn[{idx}].current_len[1] = {} \
+                 diverges from canonical full_attn[0].current_len[1] = {}; \
+                 the iter-2.5 C4 debug_assert in seq_len() would trip in \
+                 debug builds — production wiring must keep cursors in \
+                 lockstep across all full-attn layers.",
+                slot.current_len[1], canonical
+            );
+        }
+
+        // Other slots must be untouched (per-slot isolation pin).
+        for slot_idx in [0u32, 2, 3] {
+            for (layer, full) in cache.full_attn.iter().enumerate() {
+                assert_eq!(
+                    full.current_len[slot_idx as usize], 0,
+                    "slot {slot_idx} on full_attn[{layer}] must remain 0 \
+                     after slot-1 appends (per-slot isolation invariant)"
+                );
+            }
+        }
+
+        // And seq_len() returns the canonical value (the cursor read
+        // is the load-bearing application of the invariant).
+        assert_eq!(
+            cache.seq_len(SlotId(1)).expect("seq_len 1 in range"),
+            canonical
+        );
+    }
+
     /// Pin: drop resets ONLY the target slot's cursor (across all
     /// full-attn slots + MTP if present).  Dossier §4 iter-2a step 2:
     /// recurrent state intentionally NOT zeroed in Phase A2a — pinned
@@ -6507,6 +6934,17 @@ mod tests {
     /// Falsifier: any byte change to `linear_attn[0].recurrent` after a
     /// `drop_seq` call ⇒ Phase A2a has crossed into the linear-attn
     /// carve-out's territory.
+    ///
+    /// **iter-2.5 M4 strengthening**: the iter-2a version only
+    /// compared `byte_len()` before/after, which proves NOTHING about
+    /// content invariance — allocation length staying constant is
+    /// vacuously true under any reasonable `drop_seq` impl, including
+    /// a buggy one that zeros the bytes in place.  This version
+    /// fills the recurrent buffer with a deterministic non-zero
+    /// pattern via direct `as_mut_slice::<f32>()` write, snapshots
+    /// the bytes, calls `drop_seq`, snapshots again, and asserts
+    /// byte-by-byte equality.  Any in-place mutation by `drop_seq`
+    /// surfaces here.
     #[test]
     fn qwen35_hybrid_kv_drop_does_not_zero_recurrent_buffer_a2a() {
         let device = MlxDevice::new().expect("device");
@@ -6515,15 +6953,94 @@ mod tests {
         if cache.linear_attn.is_empty() {
             // Defensive: tiny_cfg has linear_attn slots, but if a future
             // cfg drop changes this, skip rather than false-pass.
+            eprintln!(
+                "qwen35_hybrid_kv_drop_does_not_zero_recurrent_buffer_a2a: \
+                 cfg has no linear_attn; vacuous"
+            );
             return;
         }
-        let before = cache.linear_attn[0].recurrent.byte_len();
+
+        // Step 1: fill recurrent buffer of layer 0 with a deterministic
+        // non-zero pattern.  MlxBuffer is CPU-accessible on Apple
+        // Silicon (StorageModeShared) so `as_mut_slice::<f32>()` is
+        // a direct host write — no kernel dispatch needed, no
+        // download/upload helper.  Production write path lives in
+        // gpu_delta_net.rs; this test uses the host-side accessor
+        // because the contract under audit is "drop_seq does NOT
+        // touch this buffer", which is observable purely from a
+        // host-side byte snapshot.
+        let total_f32 = cache.linear_attn[0].recurrent.byte_len()
+            / std::mem::size_of::<f32>();
+        assert!(
+            total_f32 > 0,
+            "fixture sanity: recurrent buffer must have non-zero element count"
+        );
+        {
+            let slice = cache.linear_attn[0]
+                .recurrent
+                .as_mut_slice::<f32>()
+                .expect("recurrent is F32 + StorageModeShared (Apple Silicon)");
+            assert_eq!(slice.len(), total_f32, "as_mut_slice element count");
+            for (i, dst) in slice.iter_mut().enumerate() {
+                // Pattern: 0.42 * (i+1) keeps values non-zero and
+                // distinguishable across positions, so a partial-zero
+                // bug (e.g. "zero only the first N bytes for slot 0")
+                // surfaces as a position-dependent diff.
+                *dst = 0.42_f32 * (i as f32 + 1.0_f32);
+            }
+        }
+
+        // Step 2: snapshot the recurrent buffer bytes after the
+        // deterministic upload.  Clone the f32 slice into an owned
+        // Vec so the snapshot is detached from the live buffer.
+        let before: Vec<f32> = cache.linear_attn[0]
+            .recurrent
+            .as_slice::<f32>()
+            .expect("recurrent f32 view")
+            .to_vec();
+        assert_eq!(before.len(), total_f32);
+        // Confirm the upload itself worked — at least one element is
+        // the expected non-zero pattern.  Defends against a future
+        // refactor that silently breaks `as_mut_slice` for this
+        // buffer kind.
+        assert!(
+            before.iter().any(|&v| v != 0.0),
+            "M4 fixture sanity: deterministic upload must produce \
+             non-zero bytes (else the test is vacuous)"
+        );
+
+        // Step 3: call drop_seq(SlotId(0)).  Per Phase A2a contract
+        // (dossier §4 iter-2a step 2 + §2.10 R1) this MUST NOT touch
+        // recurrent contents at all.
         cache.drop_seq(SlotId(0)).expect("drop slot 0");
-        let after = cache.linear_attn[0].recurrent.byte_len();
+
+        // Step 4: snapshot again.
+        let after: Vec<f32> = cache.linear_attn[0]
+            .recurrent
+            .as_slice::<f32>()
+            .expect("recurrent f32 view (after)")
+            .to_vec();
+
+        // Step 5: full byte-by-byte (f32-by-f32) equality.  Any
+        // mutation by drop_seq — including partial zero, partial
+        // overwrite, in-place ping-pong swap — surfaces here.  The
+        // previous iter-2a assertion (byte_len equality) would
+        // false-pass on every single one of those bug patterns.
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "Phase A2a contract: recurrent buffer length must not change \
+             across drop_seq (was {}, now {})",
+            before.len(),
+            after.len()
+        );
         assert_eq!(
             before, after,
-            "Phase A2a contract: drop_seq must not touch recurrent buffer \
-             allocation (Phase A2b lifts the linear-attn carve-out)"
+            "Phase A2a contract (iter-2.5 M4): drop_seq mutated \
+             linear_attn[0].recurrent contents.  Per dossier R1, A2a \
+             does NOT touch linear-attn state; this test pins that \
+             contract via byte-for-byte content comparison, NOT the \
+             previous vacuous byte_len() check."
         );
     }
 
@@ -6546,39 +7063,53 @@ mod tests {
     }
 
     /// Phase A2a deferral pin (per dossier §2.10 R5): cross-slot fork
-    /// returns `SlotOom { needed_bytes: 0, budget_bytes: 0 }` as the
-    /// sentinel-shaped "kernel-dispatch path not yet implemented" signal
-    /// while the Phase A2b/A2c same-buffer cross-region memcpy arc lands.
+    /// returns `CapabilityUnsupported` with the capability label
+    /// naming the deferred kernel arc.  iter-2.5 M1 closure of the
+    /// previous mantra-violating `SlotOom { 0, 0 }` sentinel that
+    /// would have mapped to HTTP 429 + Retry-After upstream (wrong:
+    /// the capacity will not free up because the kernel does not
+    /// exist yet).
     ///
-    /// Per cfa-finding-F2 we do NOT add an `Err::NotImplemented`
-    /// discriminant; the sentinel bytes (both zero) make the deferral
-    /// detectable without coupling new code to the `MultiSeqError` enum.
-    ///
-    /// When Phase A2b/A2c ships the real kernel dispatch, this test
+    /// When Phase A2c ships the real kernel dispatch, this test
     /// will fail loudly — signaling the deferral closure.  At that
-    /// iter, flip the assertion to `expect("fork ok after A2b")` plus a
+    /// iter, flip the assertion to `expect("fork ok after A2c")` plus a
     /// per-buffer byte-equality check (write-to-src → fork → read-from-dst
     /// = write-to-src-and-dst-directly).
     #[test]
-    fn qwen35_hybrid_kv_fork_cross_slot_returns_oom_at_phase_a2a() {
+    fn qwen35_hybrid_kv_fork_cross_slot_returns_capability_unsupported_at_phase_a2a() {
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
         cache.append_for_seq(SlotId(0), 7).unwrap();
         let err = cache
             .fork_seq(SlotId(0), SlotId(1))
-            .expect_err("cross-slot fork deferred to Phase A2b/A2c");
-        assert_eq!(
-            err,
-            MultiSeqError::SlotOom {
-                slot: SlotId(1),
-                needed_bytes: 0,
-                budget_bytes: 0,
-            },
-            "Phase A2a sentinel deferral shape (dossier §2.10 R5 + \
-             cfa-finding-F2) must remain stable until the A2b/A2c kernel \
-             arc lands; flip this assertion when the real fork dispatch \
-             ships"
-        );
+            .expect_err("cross-slot fork deferred to Phase A2c");
+        // The discriminant must be `CapabilityUnsupported` (iter-2.5
+        // M1 — NOT `SlotOom`).  The capability label must reference
+        // the deferred Phase A2c arc + the dossier R5 grounding so an
+        // operator-side log line carries enough context to map a 501
+        // back to the deferred kernel.
+        match err {
+            MultiSeqError::CapabilityUnsupported { capability } => {
+                assert!(
+                    capability.contains("fork_seq cross-slot copy"),
+                    "capability label must name the deferred surface: {capability}"
+                );
+                assert!(
+                    capability.contains("Phase A2c"),
+                    "capability label must name the Phase A2c deferral: {capability}"
+                );
+                assert!(
+                    capability.contains("R5"),
+                    "capability label must name dossier R5 grounding: {capability}"
+                );
+            }
+            other => panic!(
+                "iter-2.5 M1: expected CapabilityUnsupported (HTTP 501); got {other:?} \
+                 — the legacy SlotOom {{ 0, 0 }} sentinel mantra-violation must NOT \
+                 return here.  When Phase A2c ships the real kernel, flip this \
+                 match to `Ok(())` + per-buffer byte-equality assertions."
+            ),
+        }
     }
 }

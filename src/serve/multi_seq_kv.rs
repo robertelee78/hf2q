@@ -279,6 +279,31 @@ pub enum MultiSeqError {
         /// The unsupported layout the caller selected.
         layout: MultiSeqLayout,
     },
+    /// Capability not yet implemented in this per-model impl. Maps to
+    /// HTTP 501 Not Implemented (NOT 429). Distinct from
+    /// [`Self::SlotOom`] (capacity exhausted) and
+    /// [`Self::LayoutNotSupported`] (layout misconfigured) —
+    /// `CapabilityUnsupported` signals "this trait method has no
+    /// implementation here yet" so an operator-facing 501 is the honest
+    /// upstream mapping (per ADR-040 §7 no-stub mantra, and iter-2.5
+    /// M1 closure of the `fork_seq` `SlotOom { 0, 0 }` sentinel
+    /// mantra-violation in `HybridKvCache::fork_seq`).
+    ///
+    /// **Future schema mapping**: Phase C iter-3 will map
+    /// `CapabilityUnsupported` → HTTP 501 in
+    /// `serve/api/schema.rs` (parallel to `SlotOom` → 429 +
+    /// Retry-After and `SlotOutOfRange` → 500 internal-defect).
+    /// This variant is additive — pre-iter-2.5 schema callers that
+    /// match exhaustively on [`MultiSeqError`] only need to add one
+    /// arm.
+    CapabilityUnsupported {
+        /// Human-readable capability label (e.g.
+        /// `"fork_seq cross-slot copy (Qwen35 HybridKvCache; deferred to
+        /// Phase A2c per ADR-040 §6 + dossier R5)"`).  Static-string
+        /// because the call site is always known at compile time — no
+        /// allocation in the error path.
+        capability: &'static str,
+    },
 }
 
 impl std::fmt::Display for MultiSeqError {
@@ -305,6 +330,10 @@ impl std::fmt::Display for MultiSeqError {
                 "multi-seq KV cache layout {layout:?} is not supported in this build \
                  (Phase A iter-1 ships SeparateSlots only; Paged is reserved for a \
                  future PagedAttention ADR per ADR-040 §3.1)"
+            ),
+            Self::CapabilityUnsupported { capability } => write!(
+                f,
+                "capability not yet implemented in this impl: {capability} (HTTP 501)"
             ),
         }
     }
@@ -362,6 +391,12 @@ pub trait MultiSeqKvCache {
     /// - [`MultiSeqError::LayoutNotSupported`] when the cache was
     ///   constructed with [`MultiSeqLayout::Paged`] (iter-1; future
     ///   PagedAttention ADR lifts this)
+    /// - [`MultiSeqError::CapabilityUnsupported`] when a per-model impl
+    ///   has not yet wired the underlying kernel/path (e.g. cross-slot
+    ///   memcpy).  Maps to HTTP 501 upstream.  Per ADR-040 §7 no-stub
+    ///   mantra (iter-2.5 M1), per-model impls MUST surface this
+    ///   discriminant — NEVER return a sentinel-shaped `SlotOom` or
+    ///   any other discriminant to signal "not implemented".
     ///
     /// # Validation order (Liskov contract — iter-1.5 cfa-finding-F5)
     ///
@@ -383,6 +418,11 @@ pub trait MultiSeqKvCache {
     /// Drop `slot`'s sequence: reset `seq_len` to 0 and release any
     /// per-slot resources back to the cache's free pool.  Returns
     /// [`MultiSeqError::SlotOutOfRange`] when `slot.0 >= slot_count()`.
+    /// Per-model impls MAY also return
+    /// [`MultiSeqError::CapabilityUnsupported`] when a deferred release
+    /// path (e.g. cross-slot recurrent zero requiring a kernel) is not
+    /// yet wired — that surfaces upstream as HTTP 501 per ADR-040 §7
+    /// no-stub mantra.
     ///
     /// O(1).  Does NOT free the underlying GPU buffer (the buffer is
     /// engine-lifetime; the slot becomes available for the next
@@ -418,8 +458,17 @@ pub trait MultiSeqKvCache {
     ///   accommodate the copy (only fires under PagedAttention or
     ///   future block-shared layouts; SeparateSlots iter-2 cannot
     ///   `SlotOom` on fork because it is a memcpy into pre-allocated
-    ///   per-slot buffers).
+    ///   per-slot buffers).  **Per ADR-040 §7 mantra + iter-2.5 M1:
+    ///   per-model impls MUST NOT return a sentinel-shaped
+    ///   `SlotOom { 0, 0 }` to mean "kernel-dispatch not yet
+    ///   implemented" — use [`MultiSeqError::CapabilityUnsupported`]
+    ///   for that signal (HTTP 501) so an upstream operator gets the
+    ///   honest "not implemented" envelope, not a misleading "out of
+    ///   capacity, retry later" envelope.**
     /// - [`MultiSeqError::LayoutNotSupported`] under Paged in iter-1.
+    /// - [`MultiSeqError::CapabilityUnsupported`] when the per-model
+    ///   impl has not yet wired the cross-slot kernel.  HTTP 501
+    ///   upstream.
     ///
     /// # Validation order (Liskov contract — iter-1.5 cfa-finding-F5)
     ///
@@ -958,6 +1007,82 @@ mod tests {
             s.contains("PagedAttention") || s.contains("future"),
             "Display must point to the future ADR: {s}"
         );
+    }
+
+    // ── CapabilityUnsupported (iter-2.5 M1) ────────────────────────────
+
+    #[test]
+    fn multi_seq_error_capability_unsupported_display_names_capability() {
+        // The Display message must carry the static-string capability
+        // label verbatim so an operator-side log can grep the exact
+        // deferred-kernel name back to the per-model impl.  Per the
+        // iter-2.5 M1 trait doc, this discriminant maps to HTTP 501
+        // upstream (NOT 429), so the message must say "HTTP 501" so a
+        // future log → schema review can verify the upstream mapping
+        // by reading log lines, not by re-running the schema test.
+        let e = MultiSeqError::CapabilityUnsupported {
+            capability: "fork_seq cross-slot copy (Qwen35 HybridKvCache)",
+        };
+        let s = format!("{e}");
+        assert!(
+            s.contains("fork_seq cross-slot copy"),
+            "Display must carry the capability label verbatim: {s}"
+        );
+        assert!(
+            s.contains("HTTP 501"),
+            "Display must name the HTTP 501 upstream mapping (iter-2.5 M1): {s}"
+        );
+        let d = format!("{e:?}");
+        assert!(
+            d.contains("CapabilityUnsupported"),
+            "Debug missing variant: {d}"
+        );
+        assert!(
+            d.contains("fork_seq cross-slot copy"),
+            "Debug missing capability label: {d}"
+        );
+    }
+
+    #[test]
+    fn multi_seq_error_capability_unsupported_distinct_from_slot_oom() {
+        // The iter-2.5 M1 fix turns on the distinction between
+        // CapabilityUnsupported (501) and SlotOom (429) at the error
+        // discriminant level.  Pin that a freshly constructed
+        // CapabilityUnsupported does NOT compare equal to ANY
+        // SlotOom shape — including the load-bearing legacy
+        // `SlotOom { 0, 0 }` sentinel that iter-2a had used as the
+        // mantra-violating "kernel-dispatch not yet implemented"
+        // signal.  A future schema mapping that conflates the two
+        // would silently downgrade a 501 to a 429.
+        let cap = MultiSeqError::CapabilityUnsupported {
+            capability: "anything",
+        };
+        let legacy_sentinel = MultiSeqError::SlotOom {
+            slot: SlotId(0),
+            needed_bytes: 0,
+            budget_bytes: 0,
+        };
+        let real_oom = MultiSeqError::SlotOom {
+            slot: SlotId(3),
+            needed_bytes: 1024,
+            budget_bytes: 256,
+        };
+        assert_ne!(
+            cap, legacy_sentinel,
+            "CapabilityUnsupported must be discriminant-distinct from \
+             the legacy SlotOom {{ 0, 0 }} sentinel iter-2a used \
+             (iter-2.5 M1 closes the mantra violation)"
+        );
+        assert_ne!(
+            cap, real_oom,
+            "CapabilityUnsupported must be discriminant-distinct from \
+             a real SlotOom — 501 vs 429 upstream"
+        );
+        // And it must compare equal to itself with the same label.
+        let cap_same = MultiSeqError::CapabilityUnsupported {
+            capability: "anything",
+        };
+        assert_eq!(cap, cap_same, "Eq round-trips for identical labels");
     }
 
     // ── trait object usability ─────────────────────────────────────────
