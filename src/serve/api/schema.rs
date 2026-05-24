@@ -105,8 +105,36 @@ impl ApiError {
         )
     }
 
-    /// Queue full (HTTP 429) — serialized FIFO queue at hard cap (Decision #19).
-    /// `Retry-After` is populated with a conservative 1-second suggestion.
+    /// Queue full (HTTP 429) — serialized FIFO queue at hard cap.
+    ///
+    /// **ADR-005 Phase 2 Decision #2** — serialized FIFO queue under
+    /// [`crate::serve::api::engine::EngineMode::SerialFifo`] (= the
+    /// [`crate::serve::scheduler::SchedulerPolicy::FifoSerial`] scheduler).
+    /// **ADR-005 Phase 2 Decision #19** — under FifoSerial (default at
+    /// engine spawn unless overridden by `HF2Q_SCHEDULER` or
+    /// `--scheduler`), `queue_full` fires when the bounded mpsc channel
+    /// (`Engine::spawn(queue_capacity)`) is at hard cap.
+    ///
+    /// **ADR-040 Phase C C4** (SHIPPED 2026-05-23, cf. ADR-040 §6.1.9)
+    /// added explicit `SchedulerPolicy` selection via the
+    /// `HF2Q_SCHEDULER` env / `--scheduler` CLI flag. The
+    /// per-policy semantics for this 429 are:
+    /// - Under [`crate::serve::scheduler::SchedulerPolicy::FifoSerial`]
+    ///   (default), `queue_full` fires at `queue_capacity` overflow per
+    ///   Decision #19 — the legacy single-slot serial path.
+    /// - Under [`crate::serve::scheduler::SchedulerPolicy::SlotAware`]
+    ///   (Phase C2c+ future), `queue_full` will fire when
+    ///   `total_admissible` (= `queue_capacity` + `max_slots`) is
+    ///   exhausted; admission carries a typed
+    ///   [`crate::serve::scheduler::AdmitError::QueueFull`] with the
+    ///   `queue_capacity` + `total_admissible` field pair (iter-1.5 F6).
+    ///   The HTTP-layer mapping (this method) is unchanged at the wire
+    ///   level — same status + same body shape + same Retry-After — so
+    ///   ADR-040 §1.4 "client-invisibility" is preserved.
+    ///
+    /// `Retry-After` is populated with a conservative 1-second
+    /// suggestion (Decision #19; preserved verbatim under both
+    /// policies).
     pub fn queue_full() -> Self {
         let mut e = Self::bare(
             StatusCode::TOO_MANY_REQUESTS,
@@ -210,12 +238,60 @@ impl ApiError {
     /// caller's request is well-formed; the SERVER's capability
     /// surface is the bottleneck — 501 is the correct HTTP class per
     /// RFC 7231 §6.6.2.
+    ///
+    /// **ADR-040 Phase C C3 mapping** (iter-2.5 M1 + iter-A3a closure):
+    /// [`crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported`]
+    /// is the canonical multi-seq KV cache "not yet implemented in
+    /// this per-model impl" sentinel (e.g. `fork_seq` cross-slot copy
+    /// under Phase A2c/A3c deferral). It is the upstream source of
+    /// HTTP 501 emitted via this method — distinct from
+    /// [`crate::serve::multi_seq_kv::MultiSeqError::SlotOom`] (429 +
+    /// Retry-After) and
+    /// [`crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange`]
+    /// (500 internal-defect). Helper [`Self::capability_unsupported`]
+    /// is the typed seam for that upstream mapping; per-handler error
+    /// converters call it directly so the operator-facing message
+    /// names the unsupported capability.
     pub fn not_implemented(message: impl Into<String>) -> Self {
         Self::bare(
             StatusCode::NOT_IMPLEMENTED,
             message,
             "server_error",
             Some("not_implemented"),
+            None,
+        )
+    }
+
+    /// **ADR-040 Phase C C3** (iter-2.5 M1 + iter-A3a closure):
+    /// HTTP 501 for the multi-seq KV cache
+    /// [`crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported`]
+    /// variant. Thin wrapper over [`Self::not_implemented`] that
+    /// embeds the unsupported-capability label so operator-facing
+    /// messages name exactly which trait method is the bottleneck
+    /// (e.g. `"fork_seq cross-slot copy"`).
+    ///
+    /// Distinct from [`Self::queue_full`] (429 — capacity exhausted,
+    /// transient) and [`Self::generation_error`] (500 — runtime
+    /// fault). 501 is the correct HTTP class per RFC 7231 §6.6.2:
+    /// the caller's request is well-formed; the SERVER's capability
+    /// surface (the per-model `MultiSeqKvCache` impl in this case)
+    /// is the bottleneck.
+    ///
+    /// The `code` field is `"capability_unsupported"` (distinct from
+    /// `"not_implemented"`) so observability + alerting can
+    /// differentiate "trait-method-not-yet-impled" from other 501
+    /// emitters (e.g. iter-215 Wedge-2 Qwen3.5/3.6 wedge); the wire
+    /// `status` + `error_type` are identical so OpenAI SDK clients
+    /// treat both the same.
+    pub fn capability_unsupported(capability: &str) -> Self {
+        Self::bare(
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "Capability not yet implemented: {capability} \
+                 (ADR-040 §6 Phase C C3 — MultiSeqKvCache::* unimplemented per-model)"
+            ),
+            "server_error",
+            Some("capability_unsupported"),
             None,
         )
     }
@@ -1729,5 +1805,143 @@ mod tests {
         assert_eq!(json["content"][0]["token"], "Hello");
         assert!((json["content"][0]["logprob"].as_f64().unwrap() - -0.5).abs() < 1e-6);
         assert_eq!(json["content"][0]["top_logprobs"][0]["token"], "Hi");
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // ADR-040 §6 Phase C C3 — Decision #2 docstring + CapabilityUnsupported
+    // → HTTP 501 mapping tests
+    // ───────────────────────────────────────────────────────────────────
+
+    /// **ADR-040 C3** — the `queue_full()` docstring now names
+    /// `SchedulerPolicy` (the C4 SHIPPED operator surface from
+    /// ADR-040 §6.1.9) alongside Decision #2. Pinning the docstring
+    /// content as a test catches future drift — a `pub fn queue_full`
+    /// without `SchedulerPolicy` in the surrounding doc-block is a
+    /// regression on the C3 documentation goal.
+    #[test]
+    fn c3_schema_queue_full_docstring_names_scheduler_policy() {
+        // We pin the docstring at compile-time via the source file —
+        // the std::env! var CARGO_MANIFEST_DIR + the known relative
+        // path is the load-bearing identity here. include_str! pulls
+        // the schema.rs source into this test binary as a string
+        // constant so the test is self-contained (no fs I/O at test
+        // time).
+        let source = include_str!("schema.rs");
+
+        // Find the queue_full doc block + body. The doc block is the
+        // run of `///` lines immediately preceding `pub fn queue_full`.
+        let queue_full_pos = source
+            .find("pub fn queue_full() -> Self")
+            .expect("source must contain `pub fn queue_full() -> Self`");
+
+        // Walk backwards collecting lines until we hit a non-`///` /
+        // non-blank line — that's the doc block.
+        let preamble = &source[..queue_full_pos];
+        let docblock_lines: Vec<&str> = preamble
+            .lines()
+            .rev()
+            .take_while(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("///") || trimmed.is_empty()
+            })
+            .collect();
+        let docblock = docblock_lines
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            docblock.contains("SchedulerPolicy"),
+            "ADR-040 C3: the queue_full() docstring MUST name \
+             `SchedulerPolicy` (per ADR-040 §6.1.9 C4 SHIPPED). \
+             Current doc block:\n{docblock}"
+        );
+        assert!(
+            docblock.contains("Decision #2"),
+            "ADR-040 C3: the queue_full() docstring MUST cite \
+             ADR-005 Decision #2 (the carve-out this scheduler \
+             selection sits alongside). Current doc block:\n{docblock}"
+        );
+        assert!(
+            docblock.contains("FifoSerial") && docblock.contains("SlotAware"),
+            "ADR-040 C3: the queue_full() docstring MUST name both \
+             SchedulerPolicy variants (FifoSerial under Decision #19 \
+             and SlotAware under Phase C2c+). Current doc \
+             block:\n{docblock}"
+        );
+        assert!(
+            docblock.contains("ADR-040"),
+            "ADR-040 C3: the queue_full() docstring MUST reference \
+             ADR-040 so operators searching for the scheduler-policy \
+             surface land on this method. Current doc block:\n{docblock}"
+        );
+    }
+
+    /// **ADR-040 C3** — the
+    /// [`crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported`]
+    /// variant maps to HTTP 501 Not Implemented via
+    /// [`ApiError::capability_unsupported`]. Pins both the status code
+    /// + the `code` field + the response shape (status code on the
+    /// rendered Response, not just on the struct).
+    #[test]
+    fn c3_schema_capability_unsupported_maps_to_501() {
+        let err = ApiError::capability_unsupported(
+            "fork_seq cross-slot copy (Qwen35 HybridKvCache; deferred to Phase A2c)",
+        );
+        // Struct-level assertions
+        assert_eq!(
+            err.status,
+            StatusCode::NOT_IMPLEMENTED,
+            "ADR-040 C3: MultiSeqError::CapabilityUnsupported MUST \
+             map to HTTP 501 Not Implemented (distinct from \
+             SlotOom→429 and SlotOutOfRange→500)"
+        );
+        assert_eq!(
+            err.error.error_type, "server_error",
+            "ADR-040 C3: error_type follows the iter-215 Wedge-2 \
+             `not_implemented` convention (server_error class)"
+        );
+        assert_eq!(
+            err.error.code.as_deref(),
+            Some("capability_unsupported"),
+            "ADR-040 C3: the `code` field MUST be \
+             `capability_unsupported` so observability + alerting \
+             can differentiate from other 501 emitters"
+        );
+        // Message MUST name the unsupported capability + cite ADR-040.
+        assert!(
+            err.error.message.contains("fork_seq cross-slot copy"),
+            "ADR-040 C3: the rendered message MUST name the \
+             unsupported capability so operators know which trait \
+             method is the bottleneck. Got: {}",
+            err.error.message
+        );
+        assert!(
+            err.error.message.contains("ADR-040"),
+            "ADR-040 C3: the rendered message MUST cite ADR-040 \
+             §6 Phase C C3 so the operator can find the canonical \
+             documentation. Got: {}",
+            err.error.message
+        );
+        // Wire-level Response assertion: this is the load-bearing
+        // contract for SDK clients.
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "ADR-040 C3: the rendered HTTP Response status MUST be \
+             501 Not Implemented (RFC 7231 §6.6.2 — caller's request \
+             is well-formed; the server's capability surface is the \
+             bottleneck)"
+        );
+        // 501 is NOT a transient error — Retry-After must NOT be set
+        // (unlike 429 queue_full which carries Retry-After: 1).
+        assert!(
+            response.headers().get("retry-after").is_none(),
+            "ADR-040 C3: 501 Not Implemented is NOT transient — the \
+             unsupported capability requires a future iter to ship; \
+             no Retry-After should be emitted (unlike 429 queue_full)"
+        );
     }
 }

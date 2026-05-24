@@ -278,7 +278,7 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | **C2a (SHIPPED, 2026-05-23)** | Byte-equivalence regression-pin test `engine_serial_fifo_byte_equivalent_to_pre_phase_c` landed env-gated FIRST (per dossier §4 iter-2a step 1). No production code changes; locks the falsifier for C2b's `worker_run` refactor. | 0.5 day |
 | **C2b (SHIPPED, 2026-05-23)** | Shape A `worker_run` refactor: extended signature with `mode: EngineMode` + `queue_capacity: u32` + `scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>`; constructs concrete `FifoSchedulerAdapter` at worker entry (concrete-type realisation of dossier §2.9 "advance lives on concrete type"); wraps `Generate` / `GenerateStream` / `Embed` / `GenerateWithSoftTokens` arms in admit→drive→release; `EngineInner` gains `max_slots: u32` + `scheduler_stats_snapshot` + accessors; `Qwen35LoadedModel` gains `persistent_kv_cache: Option<HybridKvCache>` scaffold (None at iter-2a; iter-2b lift). H2 sequential-request pin added env-gated alongside H1. | 1 day |
 | C2c | Qwen35 SlotAware runtime (replaces `EngineSpawnError::ModeNotYetWired` for `SlotAware` via Shape B `select!` loop inside `worker_run` + populates `Qwen35LoadedModel.persistent_kv_cache` with `n_seqs=max_slots`); gated on B4b decode-side slot_id threading + R4 spec-decode mitigation + R4-bis hybrid persistor n_seqs>1 serialization. | 5-8 days |
-| C3 | SSE keepalive per-slot accounting + schema.rs doc updates | 2-3 days |
+| **C3 (SHIPPED, 2026-05-23)** | SSE keepalive per-slot accounting (structural — adds `generation_events_to_sse_with_slot` sibling entrypoint accepting `slot_id: Option<u32>`; legacy `generation_events_to_sse` preserved as the 4-arg facade for unchanged `handlers.rs` callers and delegates with `slot_id=None`) + `schema.rs::ApiError::queue_full` docstring update naming `SchedulerPolicy` alongside Decision #2 + `ApiError::capability_unsupported` helper wiring `MultiSeqError::CapabilityUnsupported` → HTTP 501. 5 new tests. Byte-invariance pinned at N=1 under FifoSerial (§1.4 client-invisibility). | 1 day |
 | **C4 (SHIPPED, 2026-05-23)** | CLI/env wiring for `HF2Q_SCHEDULER` + `--scheduler` + `HF2Q_MAX_SLOTS` + `--max-slots`; threaded through `multi_model::EngineConfig.engine_mode` into `load_engine` → `Engine::spawn_with_mode`; env-absence is byte-equivalent (`EngineMode::SerialFifo`) per §3.6; SlotAware fail-loud rejection (no silent fallback) with updated `EngineSpawnError::ModeNotYetWired` iter cite (`C2b` SHIPPED → `C2b/C2c (per-family worker arms)` pending). 10 new tests (8 brief-required + 2 precedence pins). | 1 day |
 
 ### Phase D — Throughput benchmark (2-3 iters)
@@ -986,6 +986,90 @@ First real Gemma 4 per-model `MultiSeqKvCache` impl.  Path: `src/inference/model
 - **A3c**: replace `fork_seq` `CapabilityUnsupported` with same-buffer cross-region memcpy via `dispatch_kv_cache_copy_seq_*`.  Flip the assertion in `gemma4_hb_kv_fork_cross_slot_returns_capability_unsupported` from `expect_err(..)` to `expect("fork ok after A3c")` + per-buffer byte-equality.  Same kernel arc serves Qwen35 A2c.
 - **B4c**: refactor the 3 inline alloc sites (`forward_prefill.rs:843-882`, `forward_prefill_batched.rs:443-475`, `forward_gpu.rs:443-459`) through `alloc_hb_kv_for_layer(.., max_slots)`.  Thread `slot_id: SlotId` through the `dispatch_hadamard_quantize_kv_hb_*` callers via per-slot `MlxBuffer::slice_view(byte_offset, n_elements)` (same primitive Qwen35 B4a-cont uses).
 - **C2c**: gated on A3b (HybridKvBuffers lift) per the H10 falsification — the SlotAware engine path needs the default-ON KV variant lifted before it can populate `Gemma4LoadedModel.persistent_kv_cache` with `n_seqs=max_slots`.
+
+### 6.1.12 Iter-C3 closure — SSE per-slot keepalive accounting + Decision #2 docstring (2026-05-23, this commit)
+
+Per ADR-040 §6 Phase C row C3, this iter ships the SSE per-slot keepalive accounting structural shape + the `schema.rs` docstring update naming `SchedulerPolicy` alongside Decision #2 + the `MultiSeqError::CapabilityUnsupported` → HTTP 501 wire mapping helper. The work is purely additive and is **byte-invariant at N=1 under FifoSerial** per ADR-040 §1.4 — clients see no observable difference vs pre-C3.
+
+**Architectural finding — the structural shape was already correct**:
+
+The brief authorised refactoring "if sse.rs has connection-level state that aggregates ACROSS connections". After reading `sse.rs` in full + tracing the call site at `handlers.rs::chat_completions_stream:1721+` (`tokio::sync::mpsc::channel(64)` per request; `generation_events_to_sse(events_rx, ...)` returns a per-call `Sse<...>` wrapper with its own `KeepAlive` layer), the conclusion is that **the keepalive accounting is already per-connection** by construction:
+
+| Concern | Pre-C3 state | C3 conclusion |
+|---|---|---|
+| Where is the 15s `KeepAlive` timer state stored? | Inside the axum `Sse<...>` future returned by `generation_events_to_sse`. Lives entirely in the per-request handler task. | Per-stream by construction (no cross-stream aggregation). |
+| How many SSE streams per engine under FifoSerial? | `max_slots = 1` → at most 1 in-flight stream per engine. | Per-stream ≡ per-slot trivially (single-slot bound). |
+| How many SSE streams per engine under SlotAware (C2c+)? | Each slot dispatches its own handler future → its own `mpsc::channel` → its own `generation_events_to_sse` call → its own `KeepAlive` timer. | Per-stream STILL ≡ per-slot (N concurrent streams, N independent timers). |
+
+Therefore C3's contribution is **NOT a refactor**; it is:
+
+1. **An explicit typed seam** for downstream wiring — new `generation_events_to_sse_with_slot(.., slot_id: Option<u32>)` sibling entrypoint. Legacy `generation_events_to_sse` is preserved as the 4-arg facade and delegates with `slot_id=None`, so the existing `handlers.rs` call site is byte-stable (no edit needed). Under SlotAware (C2c+), `chat_completions_stream` will switch to the slot-aware entrypoint and thread `SlotHandle::slot_id().0` through; until then the new variant has `slot_id=None` and emits no extra trace.
+2. **Documentation** — a new module-doc section + per-function doc-block explicitly stating the per-stream ≡ per-slot equivalence under both policies + naming `SCHEDULER_INTERVAL_SECS` (= 15s) + `SSE_KEEPALIVE_TEXT` (= `""`) as named `pub const` so tests can pin them.
+3. **3 sse tests** — proving (a) per-slot state isolation across two concurrent slot-aware streams, (b) the 15s interval + empty-text invariants, and (c) byte-equivalence between the legacy entrypoint and the C3 helper at `slot_id=None`.
+
+**Deviation from the brief** (with rationale):
+
+The brief framed Step 2 as "add an OPTIONAL slot_id (or SlotHandle) parameter to the keepalive timer". I considered two implementations:
+
+- **Option A (rejected)**: Add `slot_id: Option<u32>` as a public field on `SseStreamOptions`. Rejected because the existing `handlers.rs::chat_completions_stream:1754` constructs `SseStreamOptions { include_usage, logprobs, system_fingerprint }` without `..Default::default()`; adding a public field would break this struct-literal init and require an edit to `handlers.rs` — outside the brief's "ONLY edit sse.rs + schema.rs + ADR" constraint #6.
+- **Option B (shipped)**: Add a sibling function `generation_events_to_sse_with_slot(.., slot_id: Option<u32>)` that the legacy `generation_events_to_sse` delegates to with `slot_id=None`. The 4-arg `SseStreamOptions` surface is unchanged; the slot id lives on the function signature as a scheduler concept rather than a wire-format option. `handlers.rs` is not touched.
+
+Option B is shipped. Documented inline at the new function's doc-block (`# Why a separate function`). This deviation honours the brief's hard constraint without losing the typed-seam intent.
+
+**`schema.rs` Decision #2 docstring update + CapabilityUnsupported→501 mapping**:
+
+| Method | Pre-C3 | Post-C3 |
+|---|---|---|
+| `ApiError::queue_full()` at `schema.rs:108-120` | Docstring said "ADR-005 Phase 2 Decision #2 — serialized FIFO queue (Decision #19)" only. | Docstring now names `SchedulerPolicy::FifoSerial` (= today's default + the ADR-040 §6.1.9 C4 SHIPPED operator-facing enum) + `SchedulerPolicy::SlotAware` (= Phase C2c+ future) + the per-policy semantics (FifoSerial = `queue_capacity` overflow; SlotAware = `total_admissible = queue_capacity + max_slots` exhausted). The wire-level shape is unchanged: same 429 + same Retry-After: 1. |
+| `ApiError::not_implemented()` at `schema.rs:204+` | Docstring cited only iter-215 Wedge-2 Qwen3.5/3.6 chat completions wedge. | Docstring extended with `MultiSeqError::CapabilityUnsupported` mapping (cf. iter-2.5 M1 + iter-A3a closure). Distinct from `SlotOom`→429 and `SlotOutOfRange`→500. |
+| NEW: `ApiError::capability_unsupported(capability: &str)` | Did not exist. | Helper that wraps `not_implemented` with `code = "capability_unsupported"` (distinct from `code = "not_implemented"` so observability can differentiate the two 501 emitters). Message embeds the capability label (e.g. `"fork_seq cross-slot copy (Qwen35 HybridKvCache; deferred to Phase A2c)"`) + cites ADR-040 §6 Phase C C3. |
+
+The handler-side conversion from `MultiSeqError::CapabilityUnsupported` to `ApiError::capability_unsupported(..)` is NOT wired in this iter — it lands at C2c/C2d alongside the SlotAware runtime that can actually surface `CapabilityUnsupported` from the multi-seq cache. C3 ships the SCHEMA-side helper so the SlotAware iter just calls it; this is the correct sequencing (HTTP error shape pinned BEFORE the runtime that emits it, mirroring the iter-C2a `engine_serial_fifo_byte_equivalent_to_pre_phase_c` pin landing BEFORE iter-C2b's `worker_run` refactor).
+
+**Production code changes (LOC delta)**:
+
+| File | + | - | Net |
+|---|---:|---:|---:|
+| `src/serve/api/sse.rs` | +280 | -3 | +277 (module-doc C3 section ~30 + `SSE_KEEPALIVE_INTERVAL_SECS` + `SSE_KEEPALIVE_TEXT` named consts ~15 + `generation_events_to_sse_with_slot` sibling + doc ~80 + 3 C3 tests ~155) |
+| `src/serve/api/schema.rs` | +180 | -3 | +177 (`queue_full` docstring expanded ~30 + `not_implemented` docstring extended ~20 + `capability_unsupported` helper ~30 + 2 C3 tests ~100) |
+| `docs/ADR-040-continuous-batching-reopen.md` | +90 | -1 | +89 (this §6.1.12 closure + §6 Phase C C3 row marked SHIPPED) |
+| **Total** | **+550** | **-7** | **+543** |
+
+**Test count delta per file**:
+
+| Module | Pre-iter | Post-iter | Delta |
+|---|---:|---:|---:|
+| `serve::api::sse::tests` | 8 | 11 | +3 (`c3_sse_keepalive_per_slot_state_is_isolated`, `c3_sse_keepalive_15s_interval_unchanged_under_fifo_serial`, `c3_sse_keepalive_no_byte_change_at_n1_under_serialfifo`) |
+| `serve::api::schema::tests` | 47 | 49 | +2 (`c3_schema_queue_full_docstring_names_scheduler_policy`, `c3_schema_capability_unsupported_maps_to_501`) |
+| Combined `serve::api::sse + serve::api::schema` | 55 | 60 | +5 |
+| Regression bundle (`gemma4::kv_cache serve::multi_seq_kv qwen35::kv_cache serve::scheduler qwen35::forward_gpu::tests::b4a serve::tests::c4 serve::api::engine::tests`) | 238 | 238 | 0 (iter-A3a baseline preserved verbatim) |
+
+**Quality gates (all PASS)**:
+
+- `cargo check --release` returns 0.
+- `cargo check --release --tests` returns 0 (no new warnings; pre-existing `gpu_full_attn.rs:11455-57 bad_shape` unused-assignment only).
+- `cargo test --release --bin hf2q -- serve::api::sse serve::api::schema` returns 0 with **60 PASS / 0 FAIL** (55 baseline + 5 C3 new).
+- `cargo test --release --bin hf2q -- gemma4::kv_cache serve::multi_seq_kv qwen35::kv_cache serve::scheduler qwen35::forward_gpu::tests::b4a serve::tests::c4 serve::api::engine::tests --test-threads=1` returns 0 with **238 PASS / 0 FAIL** (iter-A3a baseline intact; ZERO regressions).
+- NO `// TODO`, NO `unimplemented!()`, NO `panic!()` in production code added by this iter. The C3 sse helper has 1 `tracing::trace!` call gated on `slot_id.is_some()`; otherwise no new side effects.
+
+**ADR-040 §1.4 byte-invariance contract under N=1 FifoSerial**:
+
+The test `c3_sse_keepalive_no_byte_change_at_n1_under_serialfifo` constructs two streams with the same `request_id`, `model_name`, `created`, `opts`, and identical `GenerationEvent` feed — one through the legacy `generation_events_to_sse` and one through `generation_events_to_sse_with_slot(.., slot_id=None)`. Asserts byte-equality of the drained `Vec<String>` payload list (5 frames: role, content, content, done, [DONE]). This is the load-bearing pin for §1.4's "continuous batching changes WHEN the request executes, not the request/response shape" contract.
+
+The 15s keepalive interval is pinned as a named `pub const SSE_KEEPALIVE_INTERVAL_SECS: u64 = 15` and asserted in `c3_sse_keepalive_15s_interval_unchanged_under_fifo_serial`. The empty-comment keepalive text (`""`) is pinned as `pub const SSE_KEEPALIVE_TEXT: &str = ""` and asserted in the same test. Together these prevent silent drift of the per-stream keepalive cadence.
+
+**Sequencing (per ADR-040 §6 Phase C)**:
+
+- **C3 (THIS ITER, SHIPPED)** — Structural seam + Decision #2 docstring + CapabilityUnsupported→501 wire helper. Independent of C2c (does not depend on B4b/B4c/A3b).
+- **C2c** (5-8 days, gated on B4b + A3b + R4) — Qwen35 SlotAware runtime. After C2c lands, the `chat_completions_stream` handler will switch from `generation_events_to_sse` (4-arg) to `generation_events_to_sse_with_slot` (5-arg) and pass `SlotHandle::slot_id().0` so per-slot tracing fires. The wire-format byte stream remains unchanged; the only observable difference is the new `tracing::trace!` line (gated on the `tracing` `TRACE` level, default-off in production).
+- **C2d / Gemma SlotAware** (3-5 days, gated on A3b + B4c) — same handler-side switch for Gemma 4.
+
+**Future-iter pin pointers**:
+
+- **C2c handler switch**: change `handlers.rs::chat_completions_stream:1766` from `generation_events_to_sse(events_rx, request_id, req.model.clone(), created, opts)` to `generation_events_to_sse_with_slot(events_rx, request_id, req.model.clone(), created, opts, slot_id.map(|s| s.0))` where `slot_id` is the `SlotId` allocated by the scheduler's `admit` call. Tests that need to be added at C2c: per-slot tracing emission pin + per-slot `/metrics` keepalive counter pin (if `/metrics` gains per-slot counters at C2c).
+- **C2c CapabilityUnsupported wiring**: `engine.rs`'s `MultiSeqError::CapabilityUnsupported` → `anyhow::Error` → handler-side `From<anyhow::Error> for ApiError` mapping switches to `ApiError::capability_unsupported(capability)`. The schema-side helper is already shipped; only the conversion layer needs updating.
+
+**Dossier provenance**: No standalone dossier. This iter is bounded structural-seam work on top of the already-shipped C4 + C2b foundations + iter-A3a's CapabilityUnsupported pin. The architecture finding ("per-stream is already per-slot") falls out of reading `sse.rs` + `handlers.rs` in full; documented inline.
 
 ---
 

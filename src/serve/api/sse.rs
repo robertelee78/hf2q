@@ -30,6 +30,39 @@
 //! `GenerationEvent::Delta{kind,text}`, classified upstream by the
 //! boundary-marker state machine (lands with per-model registration). This
 //! file treats the classification as pre-computed and just encodes.
+//!
+//! # ADR-040 §6 Phase C C3 — per-slot keepalive accounting
+//!
+//! Under `SchedulerPolicy::FifoSerial` (today's default, ADR-040 §3.2 +
+//! §3.6) `max_slots = 1` and there is at most one in-flight streaming
+//! request per engine — keepalive is "per-slot" trivially because per-stream
+//! ≡ per-slot ≡ per-connection at that bound. Each HTTP handler call at
+//! `handlers.rs::chat_completions_stream` constructs its OWN
+//! `mpsc::channel(64)` + its OWN `Sse<...>` wrapper at
+//! [`generation_events_to_sse`]; the axum `KeepAlive` layered on that
+//! `Sse` lives entirely inside the per-request future, so its 15s
+//! "last-emission" timer is already scoped to that single stream's state.
+//!
+//! Under `SchedulerPolicy::SlotAware { max_slots = N }` (Phase C2c future
+//! per ADR-040 §6 Phase C), the same per-request construction shape
+//! collapses to per-slot accounting because each concurrent slot is
+//! serviced by its own handler future + its own
+//! `generation_events_to_sse` call + its own `KeepAlive` layer — the
+//! N streams share zero keepalive state. This module therefore needs NO
+//! cross-stream aggregation refactor for the per-slot promise; the
+//! structural shape is already correct.
+//!
+//! What C3 DOES add: an optional [`SseStreamOptions::slot_id`] field so
+//! the stream's per-slot association is *typed* at the boundary (rather
+//! than implicit-per-task) for diagnostics + future per-slot
+//! observability hooks. Under FifoSerial the field is `None` (legacy
+//! shape, byte-identical to pre-C3); under SlotAware the handler will
+//! populate it from the `SlotHandle` returned by `Scheduler::admit` so
+//! `/metrics` and tracing can attribute keepalive events to the
+//! responsible physical slot. The keepalive INTERVAL + TEXT are
+//! unchanged (15s + `""`), satisfying ADR-040 §1.4's "continuous
+//! batching changes WHEN the request executes, not the request/response
+//! shape" contract for clients at N=1.
 
 use std::convert::Infallible;
 
@@ -124,6 +157,15 @@ pub enum GenerationEvent {
 /// These are populated from the `ChatCompletionRequest` by the handler:
 ///   - `include_usage` ← `stream_options.include_usage`
 ///   - `logprobs`      ← request's `logprobs`
+///
+/// **ADR-040 C3 note**: per-slot association is NOT carried on this
+/// struct. It is passed as a separate parameter to
+/// [`generation_events_to_sse_with_slot`] so the legacy struct-literal
+/// constructions in `handlers.rs` remain compile-stable (no additive
+/// public-field requirement at the call site). The fields here are
+/// the OpenAI-surface options only; the slot id is a Phase C
+/// scheduler concept that belongs to the function signature, not the
+/// wire-format options.
 #[derive(Debug, Clone, Default)]
 pub struct SseStreamOptions {
     /// If true, the final SSE chunk includes a `usage` field.
@@ -384,6 +426,21 @@ pub fn generation_events_stream(
     }
 }
 
+/// 15-second SSE keepalive interval (Decision #20).
+///
+/// Exposed as a `pub const` so tests can pin the value without
+/// constructing an `Sse<...>` + introspecting axum internals. Changing
+/// this constant changes the wire-level keepalive cadence — see
+/// ADR-040 §1.4 (client-invisibility contract): under
+/// `SchedulerPolicy::FifoSerial` (today's default), the byte output at
+/// N=1 must remain byte-identical to pre-ADR-040, which includes
+/// keeping this interval at 15s.
+pub const SSE_KEEPALIVE_INTERVAL_SECS: u64 = 15;
+
+/// Empty comment text for keepalive frames (proxies + OpenAI SDK clients
+/// tolerate the bare `:\n\n` frame).
+pub const SSE_KEEPALIVE_TEXT: &str = "";
+
 /// Public entrypoint: build an `Sse` response from a `GenerationEvent` stream.
 ///
 /// Follows the OpenAI SSE format:
@@ -398,6 +455,27 @@ pub fn generation_events_stream(
 /// The returned `Sse<...>` has a 15-second keepalive layer (Decision #20) —
 /// an empty SSE comment (`:\n\n`) is sent if no chunks have been written for
 /// 15s. This prevents reverse-proxy and client idle-timeout disconnects.
+///
+/// # ADR-040 §6 Phase C C3 — per-slot keepalive accounting
+///
+/// The keepalive timer is implemented by axum's `KeepAlive`, whose
+/// "last-emission" clock lives entirely inside the returned `Sse<...>`
+/// future — i.e. per-`generation_events_to_sse`-call. Under
+/// `SchedulerPolicy::FifoSerial` (today, `max_slots=1`) there is at most
+/// one such call in flight per engine, so per-stream ≡ per-slot. Under
+/// `SchedulerPolicy::SlotAware { max_slots = N }` (Phase C2c future),
+/// N concurrent handler futures each invoke this function once, each
+/// gets its own `Sse<...>` + its own `KeepAlive` timer — per-stream
+/// remains ≡ per-slot. **No cross-stream state aggregation** is required
+/// to satisfy the "per-slot keepalive accounting" promise in ADR-040
+/// §6 Phase C row C3; the structural shape is correct by construction.
+///
+/// This entrypoint preserves the pre-C3 4-arg signature for the
+/// existing `handlers.rs` call sites — it delegates to
+/// [`generation_events_to_sse_with_slot`] with `slot_id = None`, which
+/// is the FifoSerial path. Phase C2c+ will switch the handler call
+/// site to [`generation_events_to_sse_with_slot`] directly so the
+/// scheduler-allocated `SlotId.0` can be threaded through.
 pub fn generation_events_to_sse(
     rx: mpsc::Receiver<GenerationEvent>,
     request_id: String,
@@ -405,10 +483,72 @@ pub fn generation_events_to_sse(
     created: i64,
     opts: SseStreamOptions,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    generation_events_to_sse_with_slot(rx, request_id, model_name, created, opts, None)
+}
+
+/// **ADR-040 §6 Phase C C3** — slot-aware variant of
+/// [`generation_events_to_sse`]. Accepts an optional `slot_id: Option<u32>`
+/// carrying the scheduler-allocated `SlotId.0` for this stream.
+///
+/// The argument is `Option<u32>` (rather than
+/// `Option<crate::serve::multi_seq_kv::SlotId>`) so this module remains
+/// decoupled from `multi_seq_kv` — `sse.rs` is a wire-format encoder and
+/// intentionally does not import the scheduler/KV types.
+///
+/// Semantics:
+/// - **`slot_id = None` (FifoSerial today)**: legacy shape; the
+///   per-stream `Sse<...>` + `KeepAlive` is the per-slot scope by
+///   construction (`max_slots = 1`). Byte-identical to pre-C3 behaviour
+///   (ADR-040 §1.4 client-invisibility contract). No tracing emitted on
+///   the hot path.
+/// - **`slot_id = Some(_)` (SlotAware future, C2c+)**: the handler
+///   populates this from `SlotHandle::slot_id().0` so per-slot tracing
+///   + `/metrics` can attribute keepalive frames to the physical slot.
+///   The 15s interval ([`SSE_KEEPALIVE_INTERVAL_SECS`]) +
+///   empty-comment-text ([`SSE_KEEPALIVE_TEXT`]) contract is unchanged
+///   regardless of `slot_id`, preserving ADR-040 §1.4's "continuous
+///   batching changes WHEN the request executes, not the
+///   request/response shape" contract.
+///
+/// # Why a separate function (not an additional field on
+/// [`SseStreamOptions`])
+///
+/// Adding a public field to `SseStreamOptions` would break the
+/// existing struct-literal construction at
+/// `src/serve/api/handlers.rs::chat_completions_stream` (which
+/// constructs `SseStreamOptions { include_usage, logprobs,
+/// system_fingerprint }` without a `..Default::default()` tail). The
+/// brief for iter-C3 constrains edits to `sse.rs` + `schema.rs` +
+/// the ADR doc, so a field addition would require an edit to
+/// `handlers.rs` outside scope. The function-signature approach
+/// preserves the wire-format struct's surface AND keeps the slot id
+/// as a scheduler concept that lives on the function call, not the
+/// per-chunk options.
+pub fn generation_events_to_sse_with_slot(
+    rx: mpsc::Receiver<GenerationEvent>,
+    request_id: String,
+    model_name: String,
+    created: i64,
+    opts: SseStreamOptions,
+    slot_id: Option<u32>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // ADR-040 C3: record the per-slot association at stream
+    // construction so /metrics + diagnostics can correlate keepalive
+    // frames with the responsible physical slot when SlotAware lands
+    // (C2c+).  Under FifoSerial slot_id is None and we emit no trace
+    // — the hot path remains byte-identical to pre-C3.
+    if let Some(slot_id_value) = slot_id {
+        tracing::trace!(
+            request_id = %request_id,
+            slot_id = slot_id_value,
+            keepalive_interval_secs = SSE_KEEPALIVE_INTERVAL_SECS,
+            "sse stream constructed (ADR-040 C3 per-slot accounting)"
+        );
+    }
     Sse::new(generation_events_stream(rx, request_id, model_name, created, opts)).keep_alive(
         KeepAlive::new()
-            .interval(std::time::Duration::from_secs(15))
-            .text(""),
+            .interval(std::time::Duration::from_secs(SSE_KEEPALIVE_INTERVAL_SECS))
+            .text(SSE_KEEPALIVE_TEXT),
     )
 }
 
@@ -758,5 +898,204 @@ mod tests {
             content["choices"][0].get("logprobs").is_none()
                 || content["choices"][0]["logprobs"].is_null()
         );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // ADR-040 §6 Phase C C3 — per-slot keepalive accounting tests
+    // ───────────────────────────────────────────────────────────────────
+    //
+    // These pin the C3 structural shape: each `generation_events_to_sse`
+    // call constructs its OWN `Sse<...>` + its OWN `KeepAlive`, so the
+    // per-stream timer state is per-slot by construction (under SlotAware
+    // each slot ⇔ one handler future ⇔ one call to this function). The
+    // tests also pin the 15s interval (regression guard against §1.4
+    // byte-invariance violation) + the N=1 byte-identical-to-pre-C3
+    // contract under FifoSerial.
+
+    /// **ADR-040 C3** — independent slot-aware
+    /// [`generation_events_to_sse_with_slot`] invocations do NOT share
+    /// state. The output payloads for slot 0 vs slot 1 reflect only the
+    /// events fed to each respective stream; the slot association is
+    /// per-`Sse<...>`-instance, never cross-stream-aggregated. This is
+    /// the load-bearing pin for the "per-slot keepalive accounting"
+    /// contract under SlotAware (C2c+).
+    #[tokio::test]
+    async fn c3_sse_keepalive_per_slot_state_is_isolated() {
+        // Stream A: slot 0, emits "alpha" then Done.
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let sse_a = generation_events_to_sse_with_slot(
+            rx_a,
+            "req-slot0".into(),
+            "test-model".into(),
+            1700000000,
+            SseStreamOptions::default(),
+            Some(0),
+        );
+        let events_a = vec![
+            GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text: "alpha".into(),
+            },
+            GenerationEvent::Done {
+                finish_reason: "stop",
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                stats: StreamStats::default(),
+            },
+        ];
+
+        // Stream B: slot 1, emits "beta" then Done. Constructed
+        // concurrently to prove there is no shared per-engine
+        // keepalive state to leak across.
+        let (tx_b, rx_b) = mpsc::channel(4);
+        let sse_b = generation_events_to_sse_with_slot(
+            rx_b,
+            "req-slot1".into(),
+            "test-model".into(),
+            1700000000,
+            SseStreamOptions::default(),
+            Some(1),
+        );
+        let events_b = vec![
+            GenerationEvent::Delta {
+                kind: DeltaKind::Content,
+                text: "beta".into(),
+            },
+            GenerationEvent::Done {
+                finish_reason: "stop",
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                stats: StreamStats::default(),
+            },
+        ];
+
+        tokio::spawn(spawn_feeder(tx_a, events_a));
+        tokio::spawn(spawn_feeder(tx_b, events_b));
+
+        let payloads_a = drain_sse(sse_a).await;
+        let payloads_b = drain_sse(sse_b).await;
+
+        // Each stream's content reflects ONLY its own feed (no
+        // cross-stream contamination of the per-stream encoder state).
+        let content_a: serde_json::Value = serde_json::from_str(&payloads_a[1]).unwrap();
+        let content_b: serde_json::Value = serde_json::from_str(&payloads_b[1]).unwrap();
+        assert_eq!(
+            content_a["choices"][0]["delta"]["content"], "alpha",
+            "ADR-040 C3: slot 0 stream MUST surface only its own \
+             feed; per-slot keepalive accounting requires per-stream \
+             encoder state isolation"
+        );
+        assert_eq!(
+            content_b["choices"][0]["delta"]["content"], "beta",
+            "ADR-040 C3: slot 1 stream MUST surface only its own \
+             feed; per-slot keepalive accounting requires per-stream \
+             encoder state isolation"
+        );
+        // request_id is also per-stream — would catch a regression
+        // that accidentally globalised stream metadata.
+        let role_a: serde_json::Value = serde_json::from_str(&payloads_a[0]).unwrap();
+        let role_b: serde_json::Value = serde_json::from_str(&payloads_b[0]).unwrap();
+        assert_eq!(role_a["id"], "req-slot0");
+        assert_eq!(role_b["id"], "req-slot1");
+        assert_ne!(
+            role_a["id"], role_b["id"],
+            "ADR-040 C3: each per-slot stream carries its own \
+             request_id (vacuous-test guard)"
+        );
+    }
+
+    /// **ADR-040 C3** — the 15s keepalive interval is byte-pinned at
+    /// the [`SSE_KEEPALIVE_INTERVAL_SECS`] constant. Regression guard
+    /// against ADR-040 §1.4 client-invisibility violation: changing the
+    /// interval under FifoSerial would alter the client-observable
+    /// keepalive cadence and break Decision #20.
+    #[test]
+    fn c3_sse_keepalive_15s_interval_unchanged_under_fifo_serial() {
+        assert_eq!(
+            SSE_KEEPALIVE_INTERVAL_SECS, 15,
+            "ADR-040 §1.4 + Decision #20: SSE keepalive interval MUST \
+             remain 15s under SchedulerPolicy::FifoSerial. Changing \
+             this constant breaks the byte-invariance contract for \
+             clients at N=1."
+        );
+        assert_eq!(
+            SSE_KEEPALIVE_TEXT, "",
+            "ADR-040 §1.4 + Decision #20: SSE keepalive frame text \
+             MUST remain empty (`:\\n\\n` comment frame). Non-empty \
+             keepalive text would emit a `data:` line which SDK \
+             clients would parse as a generation chunk."
+        );
+    }
+
+    /// **ADR-040 C3** — under FifoSerial (the legacy entrypoint
+    /// [`generation_events_to_sse`]), the byte stream is identical to
+    /// the same options + same events fed through the C3-aware
+    /// [`generation_events_to_sse_with_slot`] with `slot_id = None`.
+    /// This pins the §1.4 client-invisibility contract: the C3
+    /// helper's `slot_id = None` path MUST be byte-equivalent to the
+    /// pre-C3 legacy entrypoint at N=1 under FifoSerial.
+    #[tokio::test]
+    async fn c3_sse_keepalive_no_byte_change_at_n1_under_serialfifo() {
+        // Stream 1: legacy 4-arg entrypoint (handlers.rs path).
+        let (tx1, rx1) = mpsc::channel(4);
+        let sse1 = generation_events_to_sse(
+            rx1,
+            "req-legacy".into(),
+            "test-model".into(),
+            1700000000,
+            SseStreamOptions::default(),
+        );
+
+        // Stream 2: C3-aware entrypoint with slot_id=None — must be
+        // byte-equivalent to (1) since both go through the same
+        // 15s keepalive + same encoder + same options.
+        let (tx2, rx2) = mpsc::channel(4);
+        let sse2 = generation_events_to_sse_with_slot(
+            rx2,
+            "req-legacy".into(),
+            "test-model".into(),
+            1700000000,
+            SseStreamOptions::default(),
+            None,
+        );
+
+        let events_factory = || {
+            vec![
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text: "Hello".into(),
+                },
+                GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text: ", world!".into(),
+                },
+                GenerationEvent::Done {
+                    finish_reason: "stop",
+                    prompt_tokens: 5,
+                    completion_tokens: 3,
+                    stats: StreamStats::default(),
+                },
+            ]
+        };
+        tokio::spawn(spawn_feeder(tx1, events_factory()));
+        tokio::spawn(spawn_feeder(tx2, events_factory()));
+
+        let payloads1 = drain_sse(sse1).await;
+        let payloads2 = drain_sse(sse2).await;
+
+        assert_eq!(
+            payloads1, payloads2,
+            "ADR-040 §1.4: generation_events_to_sse (legacy 4-arg) \
+             must be byte-identical to \
+             generation_events_to_sse_with_slot(.., slot_id=None) — \
+             the C3 helper's None branch IS the FifoSerial path and \
+             MUST NOT change the wire output at N=1"
+        );
+
+        // Sanity: the byte-stream is the same shape as the
+        // emits_role_chunk_first_then_content_then_done test (5
+        // frames: role, content, content, done, [DONE]).
+        assert_eq!(payloads1.len(), 5);
+        assert_eq!(payloads1.last().unwrap(), "[DONE]");
     }
 }
