@@ -10012,6 +10012,254 @@ assistant:
             "payload shape mismatch must surface as Err"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // ADR-040 Phase C iter-2a — byte-equivalence regression pin
+    // (dossier §2.5 + §4 iter-2a step 1)
+    //
+    // Construct two engines on identical inputs — engine_a via the 3-arg
+    // pre-ADR-040 `Engine::spawn` entry point and engine_b via the
+    // iter-1.5 `Engine::spawn_with_mode(..., EngineMode::SerialFifo)`
+    // entry point — drive the same greedy prompt through both, and assert
+    // byte-equality on every observable `GenerationResult` field that is
+    // NOT timing-derived. ADR-040 §3.6's load-bearing pledge is that
+    // `FifoSerial` is bit-equivalent to pre-ADR-040; this test is the
+    // load-bearing falsifier for that pledge.
+    //
+    // ---------------------------------------------------------------------------
+    // Env-gating: HF2Q_BYTE_EQUIV_E2E=1 + HF2Q_BYTE_EQUIV_E2E_GGUF=<path>
+    //
+    // The existing `make_synthetic_kv_engine_for_test` fixture at
+    // engine.rs:603 spawns a synthetic worker that drains the channel
+    // WITHOUT running real `generate_once` inference (the dossier §2.10
+    // calls this out explicitly: "useful for the `EngineInner` lifecycle
+    // / handler-route tests but NOT for the byte-equivalence test which
+    // needs real `generate_once` execution"). The dossier R8 mitigation
+    // is therefore an env-gated real-GGUF path; when the env is absent
+    // the test prints a skip notice and passes trivially. Hot-loop CI
+    // and developer-laptop `cargo test` runs (no GGUF on disk, no env
+    // set) do not pay the load cost; the regression-pin runs under
+    // explicit operator invocation:
+    //
+    //   HF2Q_BYTE_EQUIV_E2E=1 \
+    //   HF2Q_BYTE_EQUIV_E2E_GGUF=/path/to/tiny.gguf \
+    //   cargo test --release --bin hf2q -- \
+    //     engine_serial_fifo_byte_equivalent_to_pre_phase_c
+    //
+    // Mirrors the env-gating pattern at tests/multi_model_swap.rs:93-103.
+    //
+    // ---------------------------------------------------------------------------
+    // What the test asserts (per ADR-040 §3.6 + §2.5 of the dossier):
+    //
+    //   - `text` (the rendered completion text)
+    //   - `prompt_tokens` (usage counter)
+    //   - `completion_tokens` (usage counter)
+    //   - `reasoning_tokens` (usage counter)
+    //   - `cached_tokens` (usage counter)
+    //   - `finish_reason` ("stop" | "length")
+    //   - `reasoning_text` (Option<String>)
+    //   - `logprobs` (Option<Vec<f32>>)
+    //
+    // What the test EXCLUDES (timing / non-determinism):
+    //
+    //   - `prefill_duration` / `decode_duration` (wall-clock, not
+    //     byte-comparable)
+    //
+    // `GenerationResult` is `#[derive(Debug, Clone)]` (not `PartialEq`);
+    // the test asserts field-by-field via `assert_eq!`, which keeps the
+    // pin readable on a divergence and avoids a derive change to the
+    // public production type.
+    //
+    // Vacuous-test guard: the test rejects an empty completion (`text`
+    // empty AND `completion_tokens == 0`) — without this, the
+    // byte-equality assertions are trivially true on a fixture that
+    // silently produces no output.
+    //
+    // ---------------------------------------------------------------------------
+    // Why this is the C2b regression-pin foundation:
+    //
+    // C2a (this iter) ships the test FIRST against HEAD, where
+    // `spawn_with_mode(SerialFifo)` already delegates to `spawn`
+    // (iter-1.5 F1 at engine.rs:2636-2662). The test PASSES today
+    // because both engines hit identical `worker_run` code. C2b refactors
+    // `worker_run` to thread a `Box<dyn Scheduler>` through the dispatch
+    // arms — and this test FALSIFIES on any wrapper that mutates the
+    // observable output (off-by-one in `advance_after_decode`, a token
+    // dropped because `step()` returned `Idle` prematurely, sampler RNG
+    // seed shift from inserting a tokio-runtime layer between
+    // `try_send` and the worker). Per dossier §2.5: "Catches: any
+    // worker-loop wrapper that mutates state."
+    // ---------------------------------------------------------------------------
+
+    const BYTE_EQUIV_E2E_ENV_GATE: &str = "HF2Q_BYTE_EQUIV_E2E";
+    const BYTE_EQUIV_E2E_GGUF_ENV: &str = "HF2Q_BYTE_EQUIV_E2E_GGUF";
+
+    /// Returns `true` if the test should skip (env not gated). When `true`
+    /// the caller has already emitted a skip notice via `eprintln!`.
+    fn byte_equiv_skip_unless_gated(test_name: &str) -> bool {
+        if std::env::var(BYTE_EQUIV_E2E_ENV_GATE).as_deref() == Ok("1") {
+            return false;
+        }
+        eprintln!(
+            "[skip] {test_name} — set {BYTE_EQUIV_E2E_ENV_GATE}=1 + \
+             {BYTE_EQUIV_E2E_GGUF_ENV}=<path> to run the ADR-040 C2a \
+             byte-equivalence regression pin. Dossier §2.5 + §4 iter-2a \
+             step 1; mitigates R8 (synthetic fixture cannot exercise \
+             real generate_once)."
+        );
+        true
+    }
+
+    #[test]
+    fn engine_serial_fifo_byte_equivalent_to_pre_phase_c() {
+        if byte_equiv_skip_unless_gated("engine_serial_fifo_byte_equivalent_to_pre_phase_c") {
+            return;
+        }
+
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "ADR-040 C2a: {BYTE_EQUIV_E2E_ENV_GATE}=1 set without \
+                     {BYTE_EQUIV_E2E_GGUF_ENV}=<path>. The byte-equivalence \
+                     pin needs a real GGUF on disk to run `generate_once` \
+                     against both spawn entry points; the synthetic fixture \
+                     cannot serve this role (dossier §2.10 + R8)."
+                )
+            });
+        assert!(
+            gguf_path.exists(),
+            "ADR-040 C2a: {BYTE_EQUIV_E2E_GGUF_ENV} points to a missing \
+             file: {}. Set it to a valid GGUF path.",
+            gguf_path.display()
+        );
+
+        // Build TWO independent `LoadedModel` instances from the SAME
+        // GGUF byte source. Two separate `LoadedModel::load` calls (not
+        // a `.clone()` — `LoadedModel` does not derive Clone, and the
+        // C2a contract is about whether the two SPAWN entry points
+        // produce byte-equivalent output on *equivalent* inputs, not
+        // whether one in-memory model can drive both engines).
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let loaded_a = LoadedModel::load(&load_opts).expect("LoadedModel::load (a)");
+        let loaded_b = LoadedModel::load(&load_opts).expect("LoadedModel::load (b)");
+
+        // Identical queue capacity + identical KV budget (None) for both
+        // engines. The two spawn entry points MUST converge on identical
+        // `worker_run` behaviour at HEAD per iter-1.5 F1 (engine.rs:2636-
+        // 2662 — `EngineMode::SerialFifo` delegates to 3-arg `spawn`).
+        let queue_capacity: usize = 4;
+        let kv_cache_budget_bytes: Option<u64> = None;
+
+        let engine_a = Engine::spawn(loaded_a, queue_capacity, kv_cache_budget_bytes);
+        let engine_b = Engine::spawn_with_mode(
+            loaded_b,
+            queue_capacity,
+            kv_cache_budget_bytes,
+            EngineMode::SerialFifo,
+        )
+        .expect(
+            "ADR-040 iter-1.5 F1: EngineMode::SerialFifo MUST succeed at \
+             spawn_with_mode (it delegates to 3-arg spawn)",
+        );
+
+        // Greedy prompt — temperature=0.0 is deterministic regardless of
+        // RNG seed (per SamplingParams docs at engine.rs:273-274
+        // "Greedy (T=0) decodes are deterministic regardless"). max_tokens
+        // small to keep the pin fast under E2E mode; large enough to
+        // catch a mid-decode wrapper bug.
+        let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: 16,
+            ..Default::default()
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread tokio runtime");
+
+        let result_a = rt
+            .block_on(engine_a.generate(prompt_tokens.clone(), params.clone()))
+            .expect("engine_a generate (3-arg spawn path)");
+        let result_b = rt
+            .block_on(engine_b.generate(prompt_tokens, params))
+            .expect("engine_b generate (spawn_with_mode SerialFifo path)");
+
+        // Vacuous-test guard: if the fixture silently produced no
+        // output, the byte-equality assertions below are trivially true
+        // on empty/zero values. Reject before any field comparison.
+        assert!(
+            !result_a.text.is_empty() || result_a.completion_tokens > 0,
+            "ADR-040 C2a vacuous test: engine_a produced empty text AND \
+             zero completion_tokens (text={:?}, completion_tokens={}) — \
+             the synthetic prompt did not exercise real decode; \
+             byte-equality below would pass trivially. Use a non-trivial \
+             prompt or a fixture with deterministic non-empty output.",
+            result_a.text,
+            result_a.completion_tokens,
+        );
+
+        // Field-by-field byte equality. GenerationResult is not
+        // PartialEq; field-wise asserts give a precise failure surface
+        // on divergence + avoid mutating the public derive set.
+        // Timing fields (prefill_duration, decode_duration) are
+        // intentionally excluded — wall-clock varies run-to-run.
+        assert_eq!(
+            result_a.text, result_b.text,
+            "ADR-040 C2a byte-equivalence FALSIFIED: FifoSerial `text` \
+             differs from pre-C2 path. spawn_with_mode(SerialFifo) MUST \
+             produce byte-identical decoded text to 3-arg spawn at HEAD."
+        );
+        assert_eq!(
+            result_a.reasoning_text, result_b.reasoning_text,
+            "ADR-040 C2a byte-equivalence FALSIFIED: FifoSerial \
+             `reasoning_text` differs from pre-C2 path."
+        );
+        assert_eq!(
+            result_a.prompt_tokens, result_b.prompt_tokens,
+            "ADR-040 C2a byte-equivalence FALSIFIED: FifoSerial \
+             `prompt_tokens` counter differs from pre-C2 path."
+        );
+        assert_eq!(
+            result_a.completion_tokens, result_b.completion_tokens,
+            "ADR-040 C2a byte-equivalence FALSIFIED: FifoSerial \
+             `completion_tokens` counter differs from pre-C2 path."
+        );
+        assert_eq!(
+            result_a.reasoning_tokens, result_b.reasoning_tokens,
+            "ADR-040 C2a byte-equivalence FALSIFIED: FifoSerial \
+             `reasoning_tokens` counter differs from pre-C2 path."
+        );
+        assert_eq!(
+            result_a.cached_tokens, result_b.cached_tokens,
+            "ADR-040 C2a byte-equivalence FALSIFIED: FifoSerial \
+             `cached_tokens` counter differs from pre-C2 path."
+        );
+        assert_eq!(
+            result_a.finish_reason, result_b.finish_reason,
+            "ADR-040 C2a byte-equivalence FALSIFIED: FifoSerial \
+             `finish_reason` differs from pre-C2 path."
+        );
+        assert_eq!(
+            result_a.logprobs, result_b.logprobs,
+            "ADR-040 C2a byte-equivalence FALSIFIED: FifoSerial \
+             `logprobs` vector differs from pre-C2 path."
+        );
+
+        // Drain the worker threads so the test exits cleanly (the
+        // worker_run thread holds the LoadedModel — leaving it running
+        // would leak GPU buffers across test cases).
+        rt.block_on(engine_a.shutdown()).expect("engine_a shutdown");
+        rt.block_on(engine_b.shutdown()).expect("engine_b shutdown");
+    }
 }
 
 // ---------------------------------------------------------------------------
