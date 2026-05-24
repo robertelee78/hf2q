@@ -147,6 +147,52 @@ impl ApiError {
         e
     }
 
+    /// **ADR-040 §3.5 iter-A5** — per-slot KV budget exceeded (HTTP 429
+    /// + `Retry-After: 1`).
+    ///
+    /// Fires when the scheduler's
+    /// [`crate::serve::scheduler::AdmitError::SlotBudgetExceeded`]
+    /// rejects an admit because the request's
+    /// `AdmitRequest::kv_bytes_needed` exceeds the per-slot KV byte
+    /// budget (`kv_cache_budget_bytes / max_slots`).  Distinct from
+    /// [`Self::queue_full`] (transient — capacity will free as
+    /// in-flight requests complete) because this is operator-actionable
+    /// on the REQUEST: a single request asks for more KV than any
+    /// single slot can hold; reducing `max_tokens` or shortening the
+    /// prompt is the fix.
+    ///
+    /// The wire-level shape mirrors `queue_full` (429 + Retry-After: 1)
+    /// per ADR-040 §3.5 ("per-slot OOM returns 429 to the admitting
+    /// handler — Decision #19 contract preserved") so SDK clients
+    /// treat both the same.  The `code` field is `"slot_budget_exceeded"`
+    /// (distinct from `"queue_full"`) so observability + alerting can
+    /// differentiate the two 429 emitters.
+    ///
+    /// The message embeds `needed_bytes` + `budget_bytes` from the
+    /// upstream `AdmitError::SlotBudgetExceeded` so the operator-facing
+    /// 429 names what was attempted vs what was permitted — same
+    /// pattern as `MultiSeqError::SlotOom`'s
+    /// `needed_bytes` / `budget_bytes` pair
+    /// (`src/serve/multi_seq_kv.rs:265`).
+    pub fn slot_budget_exceeded(needed_bytes: u64, budget_bytes: u64) -> Self {
+        let mut e = Self::bare(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "Per-slot KV cache budget exceeded for this request \
+                 (needed_bytes={}, budget_bytes={}). Reduce `max_tokens` \
+                 or send a shorter prompt; the per-slot KV budget is \
+                 derived from `kv_cache_budget_bytes / max_slots` \
+                 (ADR-040 §3.5).",
+                needed_bytes, budget_bytes
+            ),
+            "server_error",
+            Some("slot_budget_exceeded"),
+            None,
+        );
+        e.retry_after_seconds = Some(1);
+        e
+    }
+
     /// Server is still warming up (HTTP 503). Emitted before `/readyz` flips to
     /// 200 (Decision #15, #16). Includes `Retry-After: 1`.
     pub fn not_ready() -> Self {
@@ -1884,6 +1930,96 @@ mod tests {
     /// [`ApiError::capability_unsupported`]. Pins both the status code
     /// + the `code` field + the response shape (status code on the
     /// rendered Response, not just on the struct).
+    /// **ADR-040 §3.5 iter-A5** — the per-slot KV budget exceeded
+    /// helper maps to HTTP 429 + `Retry-After: 1`, mirrors the
+    /// `queue_full` wire shape, embeds the needed/budget byte pair in
+    /// the body, and surfaces a distinct `slot_budget_exceeded` code
+    /// for observability.
+    #[test]
+    fn c3_schema_slot_budget_exceeded_returns_429_with_retry_after() {
+        let needed = 5 * 1024 * 1024u64;
+        let budget = 4 * 1024 * 1024u64;
+        let err = ApiError::slot_budget_exceeded(needed, budget);
+
+        // Struct-level assertions.
+        assert_eq!(
+            err.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "ADR-040 §3.5 A5: SlotBudgetExceeded MUST map to HTTP 429 \
+             (per Decision #19, parallel to queue_full)"
+        );
+        assert_eq!(
+            err.error.error_type, "server_error",
+            "ADR-040 §3.5 A5: error_type follows queue_full convention \
+             (server_error class)"
+        );
+        assert_eq!(
+            err.error.code.as_deref(),
+            Some("slot_budget_exceeded"),
+            "ADR-040 §3.5 A5: code MUST be `slot_budget_exceeded` \
+             (distinct from queue_full so observability + alerting \
+             can differentiate the two 429 emitters)"
+        );
+        assert_eq!(
+            err.retry_after_seconds,
+            Some(1),
+            "ADR-040 §3.5 A5: Retry-After: 1 mirrors queue_full \
+             (Decision #19 wire-level contract preserved)"
+        );
+
+        // Message MUST name the actionable diagnostic (max_tokens or
+        // prompt) + cite ADR-040.
+        assert!(
+            err.error.message.contains(&needed.to_string()),
+            "ADR-040 §3.5 A5: message MUST embed needed_bytes verbatim. \
+             Got: {}",
+            err.error.message
+        );
+        assert!(
+            err.error.message.contains(&budget.to_string()),
+            "ADR-040 §3.5 A5: message MUST embed budget_bytes verbatim. \
+             Got: {}",
+            err.error.message
+        );
+        assert!(
+            err.error.message.contains("max_tokens"),
+            "ADR-040 §3.5 A5: message MUST cite max_tokens as a \
+             remediation lever so the operator knows what to change. \
+             Got: {}",
+            err.error.message
+        );
+        assert!(
+            err.error.message.contains("prompt"),
+            "ADR-040 §3.5 A5: message MUST cite the prompt-shortening \
+             remediation. Got: {}",
+            err.error.message
+        );
+        assert!(
+            err.error.message.contains("ADR-040"),
+            "ADR-040 §3.5 A5: message MUST cite ADR-040 §3.5 so \
+             operators can find the canonical documentation. Got: {}",
+            err.error.message
+        );
+
+        // Wire-level Response: this is the load-bearing contract for
+        // SDK clients (must be byte-shape-compatible with queue_full).
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "ADR-040 §3.5 A5: rendered Response status MUST be 429"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "ADR-040 §3.5 A5: rendered Response MUST carry \
+             Retry-After: 1 (Decision #19)"
+        );
+    }
+
     #[test]
     fn c3_schema_capability_unsupported_maps_to_501() {
         let err = ApiError::capability_unsupported(

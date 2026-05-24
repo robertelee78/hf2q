@@ -251,7 +251,7 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | A3b | Gemma 4 `MlxKvCache` + `DenseKvBuffers` + `HybridKvBuffers` n_seqs lift — H10 FALSIFIED elevates HybridKvBuffers from "default-off opt-in" to "production default since ADR-029 iter-13" priority | 5-8 days |
 | A3c | Gemma 4 `fork_seq` real kernel dispatch (parallel to Qwen35 A2c per dossier §2.3.3 — same `dispatch_kv_cache_copy_seq_*` family serves both arches) | 3-5 days |
 | A4 | Drafter KV caches (EAGLE-3, DFlash) — research-quality | 5-8 days |
-| A5 | Per-slot OOM + budget enforcement | 2-3 days |
+| **A5 (SHIPPED 2026-05-23)** | Per-slot OOM + budget enforcement — admit-time `SlotBudgetExceeded` mapped to HTTP 429 + Retry-After (Decision #19 contract preserved); bytes-direct interface (caller computes `kv_bytes_needed`); per-arch byte-cost wiring deferred to Phase C2c/C2d per §6.1.13 | **1 day landed** |
 | A6 | Closure: per-family parity gate vs n_seqs=1 baseline | 2 days |
 
 ### Phase B — Scheduler (4-6 iters)
@@ -1070,6 +1070,91 @@ The 15s keepalive interval is pinned as a named `pub const SSE_KEEPALIVE_INTERVA
 - **C2c CapabilityUnsupported wiring**: `engine.rs`'s `MultiSeqError::CapabilityUnsupported` → `anyhow::Error` → handler-side `From<anyhow::Error> for ApiError` mapping switches to `ApiError::capability_unsupported(capability)`. The schema-side helper is already shipped; only the conversion layer needs updating.
 
 **Dossier provenance**: No standalone dossier. This iter is bounded structural-seam work on top of the already-shipped C4 + C2b foundations + iter-A3a's CapabilityUnsupported pin. The architecture finding ("per-stream is already per-slot") falls out of reading `sse.rs` + `handlers.rs` in full; documented inline.
+
+### 6.1.13 Iter-A5 closure — per-slot OOM + budget enforcement (2026-05-23, this commit)
+
+Per ADR-040 §6 Phase A row A5, this iter ships the **admit-time** per-slot KV budget enforcement that §3.5 specifies. The work is purely additive and is **byte-equivalent to pre-A5** for every existing caller (today: every caller — Phase C2c+ wires the real per-arch byte cost).
+
+**Step 1 finding — where does the buffer-full check currently happen? (Nowhere.)**
+
+A2a (`Qwen35 HybridKvCache`, `src/inference/models/qwen35/kv_cache.rs:5919-6584`) and A3a (`Gemma 4 MultiSeqHbKvBuffers`, `src/inference/models/gemma4/kv_cache.rs`) both **pre-allocate** per-slot K/V buffers at `max_seq_len_per_slot` capacity at construction (`HybridKvCache::new` / `alloc_hb_kv_for_layer`). Per-token `append_for_seq` advances the cursor via `saturating_add(n_tokens)` into `seq_lens[slot.0]` and never checks against a buffer-full condition — the buffer cannot OOM at append time because it was sized for the full per-slot context window at construction.
+
+The right semantic per ADR §3.5 is therefore **admit-time** enforcement (option (a) from the brief): the operator-actionable surface is BEFORE the request starts running, where a typed 429 + Retry-After can be returned and the client can re-issue with a smaller `max_tokens` or shorter prompt. Option (b) — append-time defense-in-depth — is intentionally NOT shipped because the buffer-layer OOM cannot fire under the SeparateSlots layout that A2a + A3a use; shipping a defense-in-depth check that cannot fire would add dead code (mantra violation).
+
+**Step 4 finding — bytes-direct vs tokens-via-conversion (chosen: BYTES-DIRECT).**
+
+Two design alternatives:
+
+| Approach | Scheduler stores | Conversion lives | Rejected because |
+|---|---|---|---|
+| Tokens-via-conversion | `per_slot_budget_tokens: u32` | Inside scheduler (uses `kv_bytes_per_token` constant per arch) | (a) bakes per-arch math into the scheduler (a pure data primitive should stay arch-agnostic); (b) `kv_bytes_per_token` varies per layer for hybrid architectures (Gemma 4: full vs sliding; Qwen3.5: full vs linear-attn) so a single scalar would either under-count (false accepts) or wildly over-count (false rejects) — neither is operator-honest. |
+| **Bytes-direct (CHOSEN)** | `per_slot_kv_budget_bytes: u64` | At the per-arch SlotAware worker seam (Phase C2c/C2d) | Scheduler stays arch-agnostic; per-arch byte-cost computation uses the existing `KvSpillDescriptor` / per-layer `head_dim × n_kv × dtype_size × max_seq_len` math (`src/serve/kv_spill_descriptor.rs`). |
+
+The scheduler API gained one new field on `AdmitRequest` (`kv_bytes_needed: u64`) — caller computes; `0` opts out. Per-arch wiring lands at Phase C2c (Qwen35 SlotAware) and C2d (Gemma 4 SlotAware) when the SlotAware runtime needs it; until then every caller passes `0` and the byte-equivalence contract under FifoSerial (ADR-040 §3.6) is preserved.
+
+**Per-arch `kv_bytes_per_token` deferral**:
+- Qwen35: deferred to **Phase C2c** alongside the SlotAware runtime for HybridKvCache. The byte-cost computation reuses `HybridKvCache`'s already-known per-layer shape (`head_dim × n_kv × n_layers × max_seq_len × dtype_size`) — the scheduler does NOT need to learn arch shape, only to enforce the per-slot scalar bytes.
+- Gemma 4: deferred to **Phase C2d** alongside the Gemma 4 SlotAware runtime (gated on Phase A3b HybridKvBuffers lift per §6.1.11). Same shape — caller-computed byte cost from `KvSpillDescriptor`.
+
+**LOC delta per file**:
+
+| File | + | - | Net |
+|---|---:|---:|---:|
+| `src/serve/scheduler.rs` | +335 | -16 | +319 (header block expansion +75, `AdmitRequest::kv_bytes_needed` field + `Default` impl +35, `AdmitError::SlotBudgetExceeded` variant + Display arm +30, FIFO + Inflight `per_slot_kv_budget_bytes` field + `new_with_kv_budget` constructor + `per_slot_kv_budget_bytes()` accessor +60, admit-time enforcement +30, test helper `req_with_kv` +5, 7 new tests +200; the existing inline `AdmitRequest { .. }` literal sites in tests updated for the new field +0 net per site) |
+| `src/serve/api/engine.rs` | +96 | -8 | +88 (4 admit sites updated for `kv_bytes_needed: 0` + 4 new `SlotBudgetExceeded` match arms) |
+| `src/serve/api/schema.rs` | +149 | -1 | +148 (`ApiError::slot_budget_exceeded` helper +50 + 1 new test +95) |
+| `docs/ADR-040-continuous-batching-reopen.md` | +90 | -1 | +89 (this §6.1.13 closure + §6 Phase A A5 row marked SHIPPED) |
+| **Total** | **+670** | **-26** | **+644** |
+
+**Test count delta per file**:
+
+| Module | Pre-iter | Post-iter | Delta |
+|---|---:|---:|---:|
+| `serve::scheduler::tests` | 51 | 58 | +7 (`fifo_admit_below_per_slot_budget_succeeds`, `fifo_admit_above_per_slot_budget_errors_with_named_fields`, `fifo_per_slot_budget_zero_means_unbounded`, `inflight_admit_above_per_slot_budget_errors`, `admit_error_slot_budget_exceeded_display_names_needed_and_budget`, `inflight_per_slot_budget_independent_per_slot`, `admit_request_default_kv_bytes_needed_is_zero`) |
+| `serve::api::schema::tests` | 49 | 50 | +1 (`c3_schema_slot_budget_exceeded_returns_429_with_retry_after`) |
+| Combined `serve::scheduler + serve::api::schema` | 100 | 108 | +8 |
+| Regression bundle (`gemma4::kv_cache serve::multi_seq_kv qwen35::kv_cache serve::scheduler qwen35::forward_gpu::tests::b4a serve::tests::c4 serve::api::engine::tests serve::api::sse serve::api::schema`) | 298 | 306 | +8 (all 8 from the iter-A5 additions; ZERO regressions in iter-C3 + iter-A3a baselines) |
+
+**Quality gates (all PASS)**:
+
+- `cargo check --release` returns 0.
+- `cargo check --release --tests` returns 0 (no new warnings; pre-existing `gpu_full_attn.rs:11455-57 bad_shape` unused-assignment only).
+- `cargo test --release --bin hf2q -- serve::scheduler serve::api::schema` returns 0 with **108 PASS / 0 FAIL** (100 baseline + 8 A5 new).
+- `cargo test --release --bin hf2q -- gemma4::kv_cache serve::multi_seq_kv qwen35::kv_cache serve::scheduler qwen35::forward_gpu::tests::b4a serve::tests::c4 serve::api::engine::tests serve::api::sse serve::api::schema --test-threads=1` returns 0 with **306 PASS / 0 FAIL** (298 baseline + 8 A5 new; iter-C3 + iter-A3a baselines intact).
+- NO `// TODO`, NO `unimplemented!()`, NO new `panic!()` in production code. The 4 worker_run admit arms now have an explicit `SlotBudgetExceeded` match arm; the `Err(e)` catch-all remains for `AdmitError::SchedulerStopped` only.
+- ONLY edits: `src/serve/scheduler.rs` + `src/serve/api/engine.rs` + `src/serve/api/schema.rs` + `docs/ADR-040-continuous-batching-reopen.md`. NO `Cargo.toml` edits.
+
+**ADR-040 §3.5 wire-level contract under SlotBudgetExceeded**:
+
+| Layer | Pre-A5 | Post-A5 | Wire-level visibility |
+|---|---|---|---|
+| `Scheduler::admit` | Returns `Ok(RequestSlot)` for any kv-cost (no enforcement) | Returns `Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes })` when `per_slot_kv_budget_bytes > 0` AND `req.kv_bytes_needed > per_slot_kv_budget_bytes` | None (internal type) |
+| `worker_run` 4 admit arms | Match `QueueFull` + catch-all `Err(e)` | Match `QueueFull` + new `SlotBudgetExceeded` arm + catch-all `Err(e)` | None (internal channel error) |
+| `serve/api/schema.rs::ApiError::slot_budget_exceeded` | Did not exist | New helper — 429 + Retry-After: 1, code=`slot_budget_exceeded` | **HTTP 429** + `Retry-After: 1` + JSON body with `needed_bytes`/`budget_bytes` named in message |
+| Handler-side conversion | N/A (no SlotBudgetExceeded existed) | Phase C2c+ — `From<anyhow::Error> for ApiError` matches the iter-A5 worker_run error string prefix and routes to `slot_budget_exceeded(..)` | 429 wire-level shape preserves Decision #19 byte-equivalence with `queue_full` (same status + same Retry-After) |
+
+**`AdmitError::SlotBudgetExceeded` ordering decision**:
+
+The budget check fires BEFORE the `QueueFull` check in both `FifoSchedulerAdapter::admit` + `InflightBatchedScheduler::admit`. Rationale: a request whose `kv_bytes_needed > per_slot_kv_budget_bytes` cannot be served by any slot regardless of queue state. Rejecting before the queue check surfaces the operator-actionable per-request error (reduce `max_tokens` or shorten prompt) rather than the transient `queue_full` (capacity will free) — preventing the request from sitting in the queue only to be re-rejected on every promotion attempt. This ordering is pinned by `fifo_admit_above_per_slot_budget_errors_with_named_fields` (asserts the typed-error variant + that the admitted_total counter is NOT bumped).
+
+**Per-slot independence pin**:
+
+`inflight_per_slot_budget_independent_per_slot` admits 4 requests under `max_slots=4, per_slot_kv_budget_bytes=1 MiB` each requesting exactly 1 MiB. All 4 admit cleanly; ZERO 429s. The 5th admit AT-budget queues (in_flight cap reached) — NOT a budget rejection. An OVER-budget admit even with queue room IS rejected. This pin codifies the ADR-040 §3.5 contract: "per-slot budget = total / max_slots", independent per slot (NOT aggregate).
+
+**Pre-A5 byte-equivalence pin (iter-A5 inherits)**:
+
+`fifo_per_slot_budget_zero_means_unbounded` pins that the 1-arg `FifoSchedulerAdapter::new(queue_capacity)` constructor defaults `per_slot_kv_budget_bytes = 0`, which the admit body interprets as "enforcement disabled" — even an `AdmitRequest { kv_bytes_needed: u64::MAX, .. }` admits cleanly. This is the load-bearing pin for the FifoSerial byte-equivalence contract (ADR-040 §3.6): the existing `Engine::spawn` call path (which routes through `worker_run` → `FifoSchedulerAdapter::new(queue_capacity)`) is bit-equivalent to pre-A5.
+
+**Future-iter pin pointers**:
+
+- **C2c (Qwen35 SlotAware byte-cost wiring)**: at the Qwen35 SlotAware worker arm landing, replace `kv_bytes_needed: 0` with a `kv_bytes_for_qwen35(prompt_tokens, max_tokens, &qwen35_hybrid_cache_shape)` helper that computes `(prompt_tokens + max_tokens) × per_layer_bytes_per_token_sum`. Test: per-request byte-cost > per-slot-budget surfaces 429 via the schema helper.
+- **C2d (Gemma 4 SlotAware byte-cost wiring)**: same shape for Gemma 4 — uses `MultiSeqHbKvBuffers`'s per-layer shape + `KvSpillDescriptor`.
+- **Engine seam (`spawn_with_mode` SlotAware arm)**: when iter-C2c lifts the `EngineSpawnError::ModeNotYetWired` rejection, the SlotAware arm of `spawn_with_mode` constructs the scheduler via `InflightBatchedScheduler::new_with_kv_budget(queue_capacity, max_slots, kv_cache_budget_bytes.unwrap_or(0) / max_slots as u64)` — the per-slot division specified by ADR-040 §3.5. The `Option<u64>` default-`None` ⇒ unbounded (per-slot budget = 0) preserves byte-equivalence for operators who don't set `--kv-cache-budget-bytes`.
+- **Handler-side `From<anyhow::Error> for ApiError` routing**: the worker_run admit arms wrap `SlotBudgetExceeded` in an `anyhow::anyhow!("ADR-040 §3.5 A5: ... needed_bytes={} budget_bytes={}")` string today; the handler-side `ApiError` conversion matches this prefix and routes to `ApiError::slot_budget_exceeded(needed_bytes, budget_bytes)`. Alternative: replace the `anyhow!` with a typed error variant + impl conversion directly. The string-prefix approach mirrors the existing `queue_full` "queue_full" anyhow prefix at the C2b worker_run sites (engine.rs:3597+) — chosen for consistency with the existing pattern; refactor to typed conversion is deferred to C2c+ when the SlotAware runtime actually emits these errors in anger.
+
+**Mantra-aligned**: no `// TODO`, no `unimplemented!()`, no `panic!()` in production code. The `SlotBudgetExceeded` match arms in all 4 worker_run sites are full handlers (not stubs); the `kv_bytes_needed: 0` opt-out is explicit + documented as the byte-equivalence-preserving default (not a stub) — exactly mirroring how the iter-B3 `FifoSchedulerAdapter` shipped real `admit`/`step`/`release` semantics even though only `max_slots=1` was wired upstream. The byte-budget enforcement IS shipped end-to-end; the Phase C2c+ work is to compute the BYTE COST per request, not to add missing enforcement.
+
+**Dossier provenance**: No standalone dossier. This iter is bounded structural surface-area work on top of the already-shipped iter-1.5 + iter-B3 + iter-C2b + iter-A2a + iter-A3a foundations. The bytes-direct vs tokens-via-conversion decision is documented inline (above) per brief Step 4; the admit-time vs append-time semantic decision is documented inline per brief Step 1.
 
 ---
 

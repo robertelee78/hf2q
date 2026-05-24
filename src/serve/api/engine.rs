@@ -3590,9 +3590,16 @@ fn worker_run(
                 // preserves byte-equivalence (H1/H2 falsifiers) because
                 // the inner `generate_*_once` call is unchanged; only
                 // pre/post bookkeeping calls were added.
+                // ADR-040 §3.5 iter-A5: `kv_bytes_needed: 0` opts out of
+                // per-slot KV-budget enforcement under FifoSerial — the
+                // single-slot serial path inherits Engine::spawn's pre-A5
+                // byte-equivalence contract.  Phase C2c/C2d will wire the
+                // real per-arch byte cost when the SlotAware worker arms
+                // land.
                 let admit_req = AdmitRequest {
                     prompt_tokens: prompt_tokens.len() as u32,
                     max_tokens: params.max_tokens as u32,
+                    kv_bytes_needed: 0,
                 };
                 let admitted = match scheduler.admit(admit_req) {
                     Ok(slot) => slot,
@@ -3603,6 +3610,25 @@ fn worker_run(
                              should have backpressured upstream). \
                              Programming bug — re-check Engine::generate \
                              callsite + handler `tx.try_send` route."
+                        )));
+                        continue;
+                    }
+                    // ADR-040 §3.5 iter-A5 — SlotBudgetExceeded maps to a
+                    // typed `queue_full`-shape anyhow error so the handler
+                    // layer can surface 429 + Retry-After per Decision #19
+                    // (parallel to QueueFull). Today the FifoSerial worker
+                    // passes `kv_bytes_needed: 0` so this arm is genuinely
+                    // unreachable from production code, but the typed match
+                    // here pins the contract for the Phase C2c+ SlotAware
+                    // iters that will wire real per-arch byte costs.
+                    Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "ADR-040 §3.5 A5: scheduler admit rejected request — \
+                             per-slot KV budget exceeded (needed_bytes={}, \
+                             budget_bytes={}). Reduce max_tokens or use a \
+                             shorter prompt; this maps to HTTP 429 + Retry-After \
+                             upstream.",
+                            needed_bytes, budget_bytes
                         )));
                         continue;
                     }
@@ -3698,9 +3724,13 @@ fn worker_run(
                 // and `SchedulerStats` exports completed_total via
                 // `release`, not per-token counters. Byte-equivalence
                 // holds because the inner streaming call is unchanged.
+                // ADR-040 §3.5 iter-A5: `kv_bytes_needed: 0` opts out of
+                // per-slot KV-budget enforcement (FifoSerial byte-equivalence
+                // contract); Phase C2c+ wires the per-arch byte cost.
                 let admit_req = AdmitRequest {
                     prompt_tokens: prompt_tokens.len() as u32,
                     max_tokens: params.max_tokens as u32,
+                    kv_bytes_needed: 0,
                 };
                 let admitted = match scheduler.admit(admit_req) {
                     Ok(slot) => slot,
@@ -3712,6 +3742,20 @@ fn worker_run(
                                  backpressure should have rejected upstream)."
                                     .to_string(),
                             ),
+                        );
+                        continue;
+                    }
+                    // ADR-040 §3.5 iter-A5 — parallel to QueueFull, surfaces
+                    // a typed error event the SSE layer can map to 429.
+                    Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                        let _ = events.blocking_send(
+                            super::sse::GenerationEvent::Error(format!(
+                                "ADR-040 §3.5 A5: per-slot KV budget exceeded \
+                                 for GenerateStream (needed_bytes={}, \
+                                 budget_bytes={}). Reduce max_tokens or use a \
+                                 shorter prompt.",
+                                needed_bytes, budget_bytes
+                            )),
                         );
                         continue;
                     }
@@ -3868,9 +3912,19 @@ fn worker_run(
                 // forward still runs to produce the embedding result,
                 // but no `advance_after_prefill` / `release` is needed
                 // (the slot was never allocated).
+                // ADR-040 §3.5 iter-A5: Embed admit is canonically
+                // zero-budget (max_tokens=0 + kv_bytes_needed=0); under
+                // the per-slot budget check this admit is always accepted
+                // (the budget check uses `>`, so `kv_bytes_needed: 0 >
+                // any_budget` is false even under enforcement). Future
+                // arch-specific Embed cost wiring is at Phase C2c+ if
+                // needed; today Embed runs one prefill forward + no
+                // decode, so the prefill-only KV cost is sub-budget by
+                // construction for any reasonable per-slot budget.
                 let admit_req = AdmitRequest {
                     prompt_tokens: prompt_tokens.len() as u32,
                     max_tokens: 0,
+                    kv_bytes_needed: 0,
                 };
                 let admitted = match scheduler.admit(admit_req) {
                     Ok(slot) => slot,
@@ -3879,6 +3933,19 @@ fn worker_run(
                             "ADR-040 C2b: scheduler admit returned QueueFull \
                              for Embed (mpsc backpressure should have rejected \
                              upstream)."
+                        )));
+                        continue;
+                    }
+                    // ADR-040 §3.5 iter-A5 — defensive arm; Embed's
+                    // `kv_bytes_needed: 0` makes this branch genuinely
+                    // unreachable today, but the typed match pins the
+                    // contract for Phase C2c+ Embed wiring.
+                    Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "ADR-040 §3.5 A5: scheduler rejected Embed — \
+                             per-slot KV budget exceeded (needed_bytes={}, \
+                             budget_bytes={}). Reduce prompt length.",
+                            needed_bytes, budget_bytes
                         )));
                         continue;
                     }
@@ -3938,9 +4005,13 @@ fn worker_run(
                 // synthetic prefill+decode bookkeeping shape with
                 // Request::Generate (single prompt prefill, then
                 // tokens_produced decodes).
+                // ADR-040 §3.5 iter-A5: `kv_bytes_needed: 0` opts out of
+                // per-slot KV-budget enforcement (FifoSerial byte-equivalence
+                // contract); Phase C2c+ wires the per-arch byte cost.
                 let admit_req = AdmitRequest {
                     prompt_tokens: prompt_tokens.len() as u32,
                     max_tokens: params.max_tokens as u32,
+                    kv_bytes_needed: 0,
                 };
                 let admitted = match scheduler.admit(admit_req) {
                     Ok(slot) => slot,
@@ -3949,6 +4020,19 @@ fn worker_run(
                             "ADR-040 C2b: scheduler admit returned QueueFull \
                              for GenerateWithSoftTokens (mpsc backpressure \
                              should have rejected upstream)."
+                        )));
+                        continue;
+                    }
+                    // ADR-040 §3.5 iter-A5 — defensive arm parallel to
+                    // QueueFull; today unreachable under FifoSerial
+                    // (`kv_bytes_needed: 0` opts out of enforcement).
+                    Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "ADR-040 §3.5 A5: scheduler rejected \
+                             GenerateWithSoftTokens — per-slot KV budget \
+                             exceeded (needed_bytes={}, budget_bytes={}). \
+                             Reduce max_tokens or use a shorter prompt.",
+                            needed_bytes, budget_bytes
                         )));
                         continue;
                     }

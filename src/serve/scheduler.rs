@@ -1,5 +1,77 @@
 //! Scheduler trait + FIFO adapter + InflightBatched FSM
-//! (ADR-040 Phase B iter-1 + iter-1.5 + iter-B3 + iter-2.5 + **iter-C2.5**).
+//! (ADR-040 Phase B iter-1 + iter-1.5 + iter-B3 + iter-2.5 + iter-C2.5 +
+//! **iter-A5**).
+//!
+//! # iter-A5 (this commit) — per-slot OOM + budget enforcement
+//!
+//! ADR-040 §3.5 — "`kv_cache_budget_bytes` (existing field on
+//! `Engine::spawn`) divides equally across slots in SeparateSlots layout.
+//! Per-slot budget = `total / max_slots`. Per-slot OOM returns 429 to the
+//! admitting handler (Decision #19 contract preserved)."
+//!
+//! iter-A5 implements the **admit-time** half of this contract. The
+//! complementary append-time half (defense-in-depth at the per-model
+//! `MultiSeqKvCache::append_for_seq` site) is deliberately NOT shipped:
+//! today's per-model impls (Qwen35 `HybridKvCache`, Gemma 4
+//! `MultiSeqHbKvBuffers`) pre-allocate full `max_seq_len` K/V buffers per
+//! slot at `new` / `alloc_hb_kv_for_layer` time, so a per-token append
+//! cannot OOM at the buffer layer — the only place OOM can be
+//! operator-actionable is before the work starts, at admission.
+//!
+//! Concretely iter-A5 adds:
+//!
+//! - [`AdmitRequest::kv_bytes_needed`] — caller-computed byte cost the
+//!   request would put on the per-slot KV cache (typically
+//!   `(prompt_tokens + max_tokens) * kv_bytes_per_token`).  `0` means
+//!   "caller did not compute; do not enforce" — preserves byte-equivalence
+//!   for callers that have not yet wired the byte-cost computation
+//!   (today: every caller — Phase C2c will wire it).
+//! - [`FifoSchedulerAdapter::new_with_kv_budget`] +
+//!   [`InflightBatchedScheduler::new_with_kv_budget`] — opt-in
+//!   constructors that take the per-slot byte budget. The 0-budget
+//!   default reached via `new` (no env, no flag) preserves
+//!   byte-equivalence.
+//! - [`AdmitError::SlotBudgetExceeded`] — typed admit-time rejection
+//!   mapped to HTTP 429 + `Retry-After: 1` upstream (parallel to
+//!   `QueueFull`; ADR-040 §3.5 explicitly preserves the Decision #19
+//!   wire-level contract).
+//!
+//! **Why bytes, not tokens** (Step 4 design seam — see ADR-040 §6.1.13
+//! for the full closure block): the scheduler tracks BYTES directly,
+//! and callers compute `kv_bytes_needed` per-arch.  Two alternatives
+//! were considered:
+//!
+//! 1. Tokens-via-conversion: scheduler stores `per_slot_budget_tokens:
+//!    u32`; the worker converts `kv_cache_budget_bytes →
+//!    per_slot_budget_tokens` using a per-arch `kv_bytes_per_token`
+//!    constant at engine-spawn time.  Rejected because: (a) it bakes
+//!    per-arch math into the scheduler (a pure data primitive should
+//!    stay arch-agnostic — same reason `SlotId` and `RequestId` are not
+//!    arch-typed); (b) `kv_bytes_per_token` varies per layer for hybrid
+//!    architectures (Gemma 4: full vs sliding layers have different
+//!    head_dim × n_kv; Qwen3.5: full vs linear-attn layers diverge
+//!    further) so a single scalar would either under-count (false
+//!    accepts) or wildly over-count (false rejects) — neither is
+//!    operator-honest.
+//! 2. Bytes-direct (chosen): scheduler stores `per_slot_kv_budget_bytes:
+//!    u64`; caller passes `kv_bytes_needed: u64` on each `AdmitRequest`.
+//!    Caller (Phase C2c+ for per-arch SlotAware workers) computes the
+//!    byte cost using the per-arch `KvSpillDescriptor` / per-layer
+//!    `head_dim × n_kv × dtype_size × max_seq_len` math the existing
+//!    `kv_spill_descriptor.rs` already does.  Scheduler stays arch-
+//!    agnostic; the conversion lives at the per-arch seam where it
+//!    belongs.
+//!
+//! Per-arch `kv_bytes_per_token` wiring is **deferred to Phase C2c+**
+//! when the SlotAware runtime lands for each arch.  iter-A5 ships the
+//! scheduler-side enforcement + the typed error + the schema-side 429
+//! mapping; the actual per-arch byte-cost computation lands when the
+//! worker arm that needs it (Qwen35 SlotAware iter-C2c, Gemma 4
+//! SlotAware iter-C2d) wires `kv_bytes_needed` into the per-request
+//! `AdmitRequest`.  Until then, `kv_bytes_needed: 0` ⇒ enforcement
+//! disabled ⇒ byte-equivalent to pre-A5.
+//!
+//! (ADR-040 Phase B iter-1 + iter-1.5 + iter-B3 + iter-2.5 + iter-C2.5.)
 //!
 //! This module is the **pure data primitive** that ADR-040 Phase C (iter-2)
 //! wires into `serve::api::engine::Engine`. It contains *no* engine load,
@@ -228,6 +300,36 @@ pub struct AdmitRequest {
     pub prompt_tokens: u32,
     /// Maximum new tokens the request may emit.
     pub max_tokens: u32,
+    /// **ADR-040 §3.5 iter-A5** — caller-computed byte cost the request
+    /// would put on the per-slot KV cache, typically
+    /// `(prompt_tokens + max_tokens) * per_arch_kv_bytes_per_token`.
+    ///
+    /// Set to `0` to opt out of per-slot KV-budget enforcement (the
+    /// scheduler treats `0` as "caller did not compute; do not enforce").
+    /// Today every caller in `worker_run` passes `0` — byte-equivalence
+    /// with pre-A5 is preserved.  Phase C2c (Qwen35 SlotAware) and
+    /// C2d (Gemma 4 SlotAware) wire the real per-arch byte cost so
+    /// admission can fail-fast under aggregate budget pressure (per
+    /// ADR-040 §3.5: "per-slot OOM returns 429 to the admitting
+    /// handler").
+    ///
+    /// `0`-default also handles the per-iter back-compat surface for
+    /// pre-A5 callsites that still construct `AdmitRequest { prompt_tokens,
+    /// max_tokens }` literally — those callsites compile against the new
+    /// field only if they switch to functional update (`..Default::default()`)
+    /// or explicit `kv_bytes_needed: 0`; iter-A5's worker_run edits add
+    /// the explicit field at each of the 4 admit sites.
+    pub kv_bytes_needed: u64,
+}
+
+impl Default for AdmitRequest {
+    fn default() -> Self {
+        Self {
+            prompt_tokens: 0,
+            max_tokens: 0,
+            kv_bytes_needed: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +395,26 @@ pub enum AdmitError {
     },
     /// Scheduler is no longer accepting work (post-shutdown).
     SchedulerStopped,
+    /// **ADR-040 §3.5 iter-A5** — the request's caller-computed KV-byte
+    /// cost (`AdmitRequest::kv_bytes_needed`) exceeds the configured
+    /// per-slot budget (`per_slot_kv_budget_bytes`).  Maps to HTTP 429 +
+    /// `Retry-After: 1` upstream per Decision #19, parallel to
+    /// `QueueFull`.  Distinct from `QueueFull` so observability +
+    /// alerting can differentiate "too many concurrent requests"
+    /// (transient — capacity will free) from "this single request asks
+    /// for more KV than any single slot can hold" (operator-actionable
+    /// — reduce `max_tokens` or use a shorter prompt).
+    ///
+    /// The fields are populated so the operator-facing 429 body can
+    /// name what was attempted vs what was permitted — same shape as
+    /// `MultiSeqError::SlotOom`'s `needed_bytes` / `budget_bytes` pair
+    /// (`src/serve/multi_seq_kv.rs:265`).
+    SlotBudgetExceeded {
+        /// Bytes the admit attempt would need (from `AdmitRequest::kv_bytes_needed`).
+        needed_bytes: u64,
+        /// Per-slot KV budget configured on the scheduler.
+        budget_bytes: u64,
+    },
 }
 
 impl fmt::Display for AdmitError {
@@ -304,6 +426,12 @@ impl fmt::Display for AdmitError {
                 queue_capacity, total_admissible, in_flight,
             ),
             AdmitError::SchedulerStopped => write!(f, "scheduler stopped"),
+            AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes } => write!(
+                f,
+                "per-slot KV budget exceeded (needed_bytes={}, budget_bytes={}) \
+                 — ADR-040 §3.5: reduce max_tokens or request a smaller prompt",
+                needed_bytes, budget_bytes,
+            ),
         }
     }
 }
@@ -391,6 +519,13 @@ pub struct FifoSchedulerAdapter {
     admitted_total: u64,
     rejected_429_total: u64,
     completed_total: u64,
+    /// **ADR-040 §3.5 iter-A5** — per-slot KV budget in bytes.  `0`
+    /// disables enforcement (preserves byte-equivalence for pre-A5
+    /// callers).  When > 0, `admit` rejects requests whose
+    /// `AdmitRequest::kv_bytes_needed` exceeds this value with
+    /// [`AdmitError::SlotBudgetExceeded`] (HTTP 429 + Retry-After
+    /// upstream per Decision #19).
+    per_slot_kv_budget_bytes: u64,
 }
 
 /// Per-queued-request state for FIFO.
@@ -418,8 +553,19 @@ struct InFlightFifoSlot {
 }
 
 impl FifoSchedulerAdapter {
-    /// Build a FIFO scheduler with the given queue cap.
+    /// Build a FIFO scheduler with the given queue cap and no per-slot
+    /// KV budget enforcement (iter-A5: `per_slot_kv_budget_bytes = 0`
+    /// preserves byte-equivalence with pre-A5 callers).
     pub fn new(queue_capacity: u32) -> Self {
+        Self::new_with_kv_budget(queue_capacity, 0)
+    }
+
+    /// **ADR-040 §3.5 iter-A5** — build a FIFO scheduler with explicit
+    /// per-slot KV byte budget.  `0` disables enforcement (equivalent
+    /// to [`Self::new`]).  When > 0, `admit` rejects requests whose
+    /// `AdmitRequest::kv_bytes_needed` exceeds `per_slot_kv_budget_bytes`
+    /// with [`AdmitError::SlotBudgetExceeded`].
+    pub fn new_with_kv_budget(queue_capacity: u32, per_slot_kv_budget_bytes: u64) -> Self {
         let queue_capacity = queue_capacity.max(1);
         Self {
             queue_capacity,
@@ -430,7 +576,14 @@ impl FifoSchedulerAdapter {
             admitted_total: 0,
             rejected_429_total: 0,
             completed_total: 0,
+            per_slot_kv_budget_bytes,
         }
+    }
+
+    /// **ADR-040 §3.5 iter-A5** — read the configured per-slot KV
+    /// budget (bytes).  `0` means enforcement disabled.
+    pub fn per_slot_kv_budget_bytes(&self) -> u64 {
+        self.per_slot_kv_budget_bytes
     }
 
     fn in_flight_count(&self) -> u32 {
@@ -556,6 +709,22 @@ impl Scheduler for FifoSchedulerAdapter {
     }
 
     fn admit(&mut self, req: AdmitRequest) -> Result<RequestSlot, AdmitError> {
+        // ADR-040 §3.5 iter-A5 — per-slot KV budget check FIRST.  A
+        // request that cannot fit in any single slot's KV budget
+        // cannot be served regardless of queue state; rejecting before
+        // the queue check is operator-honest (the 429 names the per-
+        // request structural problem, not transient capacity).  Budget
+        // == 0 disables the check entirely (pre-A5 byte-equivalence).
+        if self.per_slot_kv_budget_bytes > 0
+            && req.kv_bytes_needed > self.per_slot_kv_budget_bytes
+        {
+            self.rejected_429_total = self.rejected_429_total.saturating_add(1);
+            return Err(AdmitError::SlotBudgetExceeded {
+                needed_bytes: req.kv_bytes_needed,
+                budget_bytes: self.per_slot_kv_budget_bytes,
+            });
+        }
+
         if self.queue.len() as u32 >= self.queue_capacity && self.in_flight.is_some() {
             self.rejected_429_total = self.rejected_429_total.saturating_add(1);
             return Err(AdmitError::QueueFull {
@@ -745,12 +914,49 @@ pub struct InflightBatchedScheduler {
     admitted_total: u64,
     rejected_429_total: u64,
     completed_total: u64,
+    /// **ADR-040 §3.5 iter-A5** — per-slot KV budget in bytes.  `0`
+    /// disables enforcement (preserves byte-equivalence for pre-A5
+    /// callers).  When > 0, `admit` rejects requests whose
+    /// `AdmitRequest::kv_bytes_needed` exceeds this value with
+    /// [`AdmitError::SlotBudgetExceeded`] (HTTP 429 + Retry-After
+    /// upstream per Decision #19).
+    ///
+    /// Per ADR-040 §3.5: "per-slot budget = total / max_slots" — the
+    /// engine spawn site is responsible for dividing the operator-
+    /// supplied `kv_cache_budget_bytes` by `max_slots` before handing
+    /// the per-slot value to this constructor.
+    per_slot_kv_budget_bytes: u64,
 }
 
 impl InflightBatchedScheduler {
     /// Build an InflightBatched scheduler with the given queue cap +
-    /// per-slot concurrency cap.
+    /// per-slot concurrency cap and no per-slot KV budget enforcement
+    /// (iter-A5: `per_slot_kv_budget_bytes = 0` preserves
+    /// byte-equivalence with pre-A5 callers).
     pub fn new(queue_capacity: u32, max_slots: u32) -> Self {
+        Self::new_with_kv_budget(queue_capacity, max_slots, 0)
+    }
+
+    /// **ADR-040 §3.5 iter-A5** — build an InflightBatched scheduler
+    /// with explicit per-slot KV byte budget.  `0` disables enforcement
+    /// (equivalent to [`Self::new`]).  When > 0, `admit` rejects
+    /// requests whose `AdmitRequest::kv_bytes_needed` exceeds
+    /// `per_slot_kv_budget_bytes` with [`AdmitError::SlotBudgetExceeded`].
+    ///
+    /// Per ADR-040 §3.5 ("per-slot budget = total / max_slots") the
+    /// caller — `Engine::spawn` / `spawn_with_mode` at the engine seam
+    /// — is responsible for performing the division.  This constructor
+    /// stores the value verbatim and enforces against it; it does NOT
+    /// re-divide by `max_slots`.  Independence per-slot is structural:
+    /// each admit checks against the same `per_slot_kv_budget_bytes`
+    /// scalar (not an aggregate), so N admits each at exactly the
+    /// per-slot budget all succeed (iter-A5 test
+    /// `inflight_per_slot_budget_independent_per_slot`).
+    pub fn new_with_kv_budget(
+        queue_capacity: u32,
+        max_slots: u32,
+        per_slot_kv_budget_bytes: u64,
+    ) -> Self {
         let queue_capacity = queue_capacity.max(1);
         let max_slots = max_slots.max(1);
         Self {
@@ -765,7 +971,14 @@ impl InflightBatchedScheduler {
             admitted_total: 0,
             rejected_429_total: 0,
             completed_total: 0,
+            per_slot_kv_budget_bytes,
         }
+    }
+
+    /// **ADR-040 §3.5 iter-A5** — read the configured per-slot KV
+    /// budget (bytes).  `0` means enforcement disabled.
+    pub fn per_slot_kv_budget_bytes(&self) -> u64 {
+        self.per_slot_kv_budget_bytes
     }
 
     /// Allocate a SlotId — prefer a recycled id, otherwise allocate fresh.
@@ -955,6 +1168,19 @@ impl Scheduler for InflightBatchedScheduler {
     }
 
     fn admit(&mut self, req: AdmitRequest) -> Result<RequestSlot, AdmitError> {
+        // ADR-040 §3.5 iter-A5 — per-slot KV budget check FIRST (same
+        // ordering as the FIFO adapter; see that admit body for the
+        // rationale).  Budget == 0 disables (pre-A5 byte-equivalence).
+        if self.per_slot_kv_budget_bytes > 0
+            && req.kv_bytes_needed > self.per_slot_kv_budget_bytes
+        {
+            self.rejected_429_total = self.rejected_429_total.saturating_add(1);
+            return Err(AdmitError::SlotBudgetExceeded {
+                needed_bytes: req.kv_bytes_needed,
+                budget_bytes: self.per_slot_kv_budget_bytes,
+            });
+        }
+
         let in_flight = self.in_flight.len() as u32;
         let queued = self.queue.len() as u32;
         if in_flight >= self.max_slots && queued >= self.queue_capacity {
@@ -1119,7 +1345,13 @@ mod tests {
     use super::*;
 
     fn req(prompt_tokens: u32, max_tokens: u32) -> AdmitRequest {
-        AdmitRequest { prompt_tokens, max_tokens }
+        AdmitRequest { prompt_tokens, max_tokens, kv_bytes_needed: 0 }
+    }
+
+    /// iter-A5 helper — admit request with explicit KV byte cost so
+    /// per-slot KV budget tests can pin the SlotBudgetExceeded path.
+    fn req_with_kv(prompt_tokens: u32, max_tokens: u32, kv_bytes_needed: u64) -> AdmitRequest {
+        AdmitRequest { prompt_tokens, max_tokens, kv_bytes_needed }
     }
 
     /// Helper to extract the handle from a RequestSlot, panicking with a
@@ -1300,7 +1532,7 @@ mod tests {
             let s = Arc::clone(&sched);
             handles.push(thread::spawn(move || {
                 let mut g = s.lock().unwrap();
-                g.admit(AdmitRequest { prompt_tokens: 1, max_tokens: 1 })
+                g.admit(AdmitRequest { prompt_tokens: 1, max_tokens: 1, kv_bytes_needed: 0 })
                     .map(|slot| (i, slot.request_id))
             }));
         }
@@ -1910,7 +2142,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let _ = {
                     let mut g = s.lock().unwrap();
-                    g.admit(AdmitRequest { prompt_tokens: 1, max_tokens: 4 })
+                    g.admit(AdmitRequest { prompt_tokens: 1, max_tokens: 4, kv_bytes_needed: 0 })
                         .expect("admit ok")
                 };
                 for _ in 0..5 {
@@ -2353,5 +2585,172 @@ mod tests {
         assert!(disp.contains("queue_capacity=7"));
         assert!(disp.contains("total_admissible=8"));
         assert!(disp.contains("in_flight=3"));
+    }
+
+    // -----------------------------------------------------------------------
+    // iter-A5 — per-slot OOM + budget enforcement (ADR-040 §3.5)
+    //
+    // The scheduler tracks the per-slot KV budget in BYTES; callers
+    // compute `AdmitRequest::kv_bytes_needed` per-arch (Phase C2c+
+    // wiring) and the scheduler enforces at admit time.  Budget == 0
+    // ⇒ enforcement disabled ⇒ byte-equivalent to pre-A5.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fifo_admit_below_per_slot_budget_succeeds() {
+        // Budget 1 MiB; admit asks for 512 KiB ⇒ accepted.
+        let mut s = FifoSchedulerAdapter::new_with_kv_budget(4, 1024 * 1024);
+        let r = s
+            .admit(req_with_kv(8, 16, 512 * 1024))
+            .expect("admit below budget must succeed");
+        assert!(r.handle.is_some(),
+            "below-budget admit lands in_flight with Some(handle)");
+        assert_eq!(s.stats().admitted_total, 1);
+        assert_eq!(s.stats().rejected_429_total, 0);
+        assert_eq!(s.per_slot_kv_budget_bytes(), 1024 * 1024);
+    }
+
+    #[test]
+    fn fifo_admit_above_per_slot_budget_errors_with_named_fields() {
+        // Budget 1 MiB; admit asks for 2 MiB ⇒ rejected.
+        let mut s = FifoSchedulerAdapter::new_with_kv_budget(4, 1024 * 1024);
+        let needed = 2 * 1024 * 1024;
+        match s.admit(req_with_kv(1024, 64, needed)) {
+            Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                assert_eq!(needed_bytes, needed,
+                    "error names the request's needed bytes");
+                assert_eq!(budget_bytes, 1024 * 1024,
+                    "error names the per-slot budget bytes");
+            }
+            other => panic!("expected SlotBudgetExceeded, got {:?}", other),
+        }
+        // Counters: rejected_429_total bumped; admitted_total NOT bumped
+        // (admit returned Err before the admitted-counter increment).
+        let stats = s.stats();
+        assert_eq!(stats.rejected_429_total, 1,
+            "SlotBudgetExceeded bumps rejected_429_total (maps to 429 upstream)");
+        assert_eq!(stats.admitted_total, 0);
+        assert_eq!(stats.in_flight_slots, 0,
+            "no physical slot allocated for over-budget admit");
+    }
+
+    #[test]
+    fn fifo_per_slot_budget_zero_means_unbounded() {
+        // Default constructor (no budget arg) ⇒ enforcement disabled.
+        // Even an astronomical kv_bytes_needed admits cleanly.
+        let mut s = FifoSchedulerAdapter::new(4);
+        assert_eq!(s.per_slot_kv_budget_bytes(), 0,
+            "new() defaults to per_slot_kv_budget_bytes = 0 (unbounded)");
+        let r = s
+            .admit(req_with_kv(1, 1, u64::MAX))
+            .expect("zero-budget scheduler must accept any kv_bytes_needed");
+        assert!(r.handle.is_some());
+        assert_eq!(s.stats().rejected_429_total, 0);
+        // Explicit `new_with_kv_budget(.., 0)` equivalent.
+        let mut s2 = FifoSchedulerAdapter::new_with_kv_budget(4, 0);
+        assert_eq!(s2.per_slot_kv_budget_bytes(), 0);
+        s2.admit(req_with_kv(1, 1, u64::MAX))
+            .expect("explicit 0-budget also unbounded");
+    }
+
+    #[test]
+    fn inflight_admit_above_per_slot_budget_errors() {
+        // Budget 4 MiB per slot; request asks for 5 MiB ⇒ rejected.
+        let mut s = InflightBatchedScheduler::new_with_kv_budget(8, 4, 4 * 1024 * 1024);
+        let needed = 5 * 1024 * 1024;
+        match s.admit(req_with_kv(2048, 128, needed)) {
+            Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                assert_eq!(needed_bytes, needed);
+                assert_eq!(budget_bytes, 4 * 1024 * 1024);
+            }
+            other => panic!("expected SlotBudgetExceeded, got {:?}", other),
+        }
+        assert_eq!(s.stats().rejected_429_total, 1);
+        assert_eq!(s.stats().admitted_total, 0);
+        assert_eq!(s.stats().in_flight_slots, 0,
+            "over-budget admit does not allocate a physical slot");
+    }
+
+    #[test]
+    fn admit_error_slot_budget_exceeded_display_names_needed_and_budget() {
+        let err = AdmitError::SlotBudgetExceeded {
+            needed_bytes: 12_345_678,
+            budget_bytes: 4_096_000,
+        };
+        let dbg = format!("{:?}", err);
+        assert!(dbg.contains("SlotBudgetExceeded"));
+        assert!(dbg.contains("needed_bytes"));
+        assert!(dbg.contains("budget_bytes"));
+        assert!(dbg.contains("12345678"));
+        assert!(dbg.contains("4096000"));
+
+        let disp = format!("{}", err);
+        assert!(disp.contains("needed_bytes=12345678"),
+            "Display names needed_bytes verbatim: {}", disp);
+        assert!(disp.contains("budget_bytes=4096000"),
+            "Display names budget_bytes verbatim: {}", disp);
+        // Operator-actionable message MUST cite ADR-040 §3.5 + name the
+        // remediation paths.
+        assert!(disp.contains("ADR-040"),
+            "Display cites ADR-040 §3.5: {}", disp);
+        assert!(disp.contains("max_tokens") || disp.contains("prompt"),
+            "Display names the actionable remediation: {}", disp);
+    }
+
+    #[test]
+    fn inflight_per_slot_budget_independent_per_slot() {
+        // ADR-040 §3.5: per-slot budget is independent per slot, NOT
+        // aggregate.  Build a scheduler with max_slots=4, budget=1 MiB
+        // per slot; admit 4 requests each asking for exactly 1 MiB.
+        // All 4 must admit (each at the per-slot budget; the budget
+        // does not sum across slots).
+        let per_slot = 1024 * 1024;
+        let mut s = InflightBatchedScheduler::new_with_kv_budget(8, 4, per_slot);
+        let mut admitted = Vec::new();
+        for i in 0..4 {
+            let r = s
+                .admit(req_with_kv(64, 16, per_slot))
+                .unwrap_or_else(|e| panic!("slot {} at-budget admit must succeed; got {:?}", i, e));
+            assert!(r.handle.is_some(),
+                "slot {}: at-budget admit lands in_flight", i);
+            admitted.push(r);
+        }
+        let stats = s.stats();
+        assert_eq!(stats.admitted_total, 4,
+            "all 4 at-budget admits counted; per-slot budget does not sum");
+        assert_eq!(stats.in_flight_slots, 4,
+            "all 4 physical slots occupied (max_slots=4)");
+        assert_eq!(stats.rejected_429_total, 0,
+            "ZERO 429s — each request fits its own per-slot budget");
+
+        // The 5th admit AT budget queues (in_flight cap reached, queue
+        // accepts) — still NOT a budget rejection because the request
+        // itself fits the per-slot budget.
+        let r5 = s
+            .admit(req_with_kv(64, 16, per_slot))
+            .expect("5th at-budget admit queues (not a budget violation)");
+        assert!(r5.handle.is_none(),
+            "5th admit is queued (in_flight at max_slots=4)");
+        assert_eq!(s.stats().rejected_429_total, 0,
+            "queueing is not a budget rejection");
+
+        // But an OVER-budget admit IS rejected even when queue has room.
+        match s.admit(req_with_kv(64, 16, per_slot + 1)) {
+            Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                assert_eq!(needed_bytes, per_slot + 1);
+                assert_eq!(budget_bytes, per_slot);
+            }
+            other => panic!("expected SlotBudgetExceeded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn admit_request_default_kv_bytes_needed_is_zero() {
+        // Back-compat surface: AdmitRequest::default() leaves
+        // kv_bytes_needed at 0 so enforcement is opt-in via the field.
+        let r = AdmitRequest::default();
+        assert_eq!(r.prompt_tokens, 0);
+        assert_eq!(r.max_tokens, 0);
+        assert_eq!(r.kv_bytes_needed, 0);
     }
 }
