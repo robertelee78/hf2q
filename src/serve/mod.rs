@@ -1932,7 +1932,7 @@ fn maybe_run_qwen35_prefill_sweep(
                 let mut last_kv = HybridKvCache::new(&model.cfg, &device, max_seq as u32, 1)
                     .context("qwen35 prefill sweep compare last HybridKvCache::new")?;
                 let last = model
-                    .forward_gpu_last_logits(&prompt_tokens, &positions, &mut last_kv)
+                    .forward_gpu_last_logits(&prompt_tokens, &positions, &mut last_kv, SlotId(0))
                     .context("qwen35 prefill sweep compare forward_gpu_last_logits")?;
                 let vocab = model.cfg.vocab_size as usize;
                 anyhow::ensure!(
@@ -1971,7 +1971,7 @@ fn maybe_run_qwen35_prefill_sweep(
                     .context("qwen35 prefill sweep forward_gpu")?
             } else {
                 model
-                    .forward_gpu_last_logits(&prompt_tokens, &positions, &mut kv_cache)
+                    .forward_gpu_last_logits(&prompt_tokens, &positions, &mut kv_cache, SlotId(0))
                     .context("qwen35 prefill sweep forward_gpu_last_logits")?
             };
             let elapsed = t0.elapsed();
@@ -2669,6 +2669,7 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     use crate::inference::models::qwen35::io_heads::greedy_argmax_last_token;
     use crate::inference::models::qwen35::kv_cache::HybridKvCache;
     use crate::serve::api::engine_qwen35::Qwen35LoadedModel;
+    use crate::serve::multi_seq_kv::SlotId;
     use mlx_native::MlxDevice;
     use std::io::Write;
 
@@ -3122,7 +3123,10 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
 
             let prefill_start = std::time::Instant::now();
             let prefill_logits = model
-                .forward_gpu_last_logits(&prompt_tokens, &prefill_positions, &mut kv_cache)
+                // ADR-040 Phase B4b (2026-05-24): CLI benchmark path is
+                // single-seq (kv_cache allocated at n_seqs=1); slot 0
+                // preserves pre-B4b behaviour.
+                .forward_gpu_last_logits(&prompt_tokens, &prefill_positions, &mut kv_cache, SlotId(0))
                 .context("Qwen35Model::forward_gpu_last_logits (benchmark prefill)")?;
             let prefill_elapsed = prefill_start.elapsed();
             let prefill_tps = if prefill_elapsed.as_secs_f64() > 0.0 {
@@ -3149,7 +3153,12 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                     |prev_token, pos, generated_tokens| -> Result<u32> {
                         let decode_positions = vec![pos; 4];
                         let mut logits = model
-                            .forward_gpu_last_logits(&[prev_token], &decode_positions, &mut kv_cache)
+                            .forward_gpu_last_logits(
+                                &[prev_token],
+                                &decode_positions,
+                                &mut kv_cache,
+                                SlotId(0),
+                            )
                             .with_context(|| {
                                 format!("forward_gpu_last_logits decode at pos {pos} (benchmark)")
                             })?;
@@ -3230,7 +3239,8 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
     }
     let prefill_start = std::time::Instant::now();
     let prefill_logits = model
-        .forward_gpu_last_logits(&prompt_tokens, &prefill_positions, &mut kv_cache)
+        // ADR-040 Phase B4b (2026-05-24): CLI single-seq prefill, slot 0.
+        .forward_gpu_last_logits(&prompt_tokens, &prefill_positions, &mut kv_cache, SlotId(0))
         .context("Qwen35Model::forward_gpu_last_logits (prefill)")?;
     let prefill_elapsed = prefill_start.elapsed();
     if profile_sync {
@@ -3363,7 +3373,12 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                 let _t_step = step_profile_enabled.then(std::time::Instant::now);
                 let _t_fwd = step_profile_enabled.then(std::time::Instant::now);
                 let mut logits = model
-                    .forward_gpu_last_logits(&[prev_token], &decode_positions, &mut kv_cache)
+                    .forward_gpu_last_logits(
+                        &[prev_token],
+                        &decode_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
                     .with_context(|| format!("forward_gpu_last_logits decode at pos {pos}"))?;
                 let fwd_us = _t_fwd.map(|t| t.elapsed().as_micros());
                 let _t_smp = step_profile_enabled.then(std::time::Instant::now);

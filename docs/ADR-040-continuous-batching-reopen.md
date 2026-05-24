@@ -89,7 +89,7 @@ The 2.45x over-shoot is documented honestly per cfa-finding (Claude `major_findi
 | `src/inference/models/qwen35/{forward_gpu.rs, gpu_full_attn.rs}` | Codex /cfa rev-1 follow-ups: M1 isolation-test rigor (raw K/V byte snapshot + positive same-prompt-in-slot-0-vs-slot-1 equivalence pin, deleting the reset+rerun-then-compare test that could pass under cross-slot leak); M2 canonical TQ-active multi-slot gate placement at `build_gated_attn_layer` + `apply_gated_attn_layer_decode_into` entry (before fused-stage-AB encoder work); minor stale-comment refresh at the `forward_gpu` entry | **B iter-4a-cont.1 (SHIPPED 2026-05-23)** |
 | `src/serve/forward_prefill.rs` | (Gemma 4 prefill) accept `slot_id` parameter; route writes to multi-seq KV (gated on Phase A3 Gemma 4 multi-seq KV impl) | B iter-4c |
 | `src/serve/forward_prefill_batched.rs` | same | B iter-4c |
-| `src/inference/models/qwen35/forward_gpu.rs` (decode) | thread `slot_id` through `forward_gpu_last_logits` / `forward_gpu_last_topk` / soft-token / deepstack variants | B iter-4b |
+| `src/inference/models/qwen35/forward_gpu.rs` (decode) | thread `slot_id` through `forward_gpu_last_logits` / `forward_gpu_last_topk` / `forward_gpu_last_logits_with_soft_tokens` / `forward_gpu_last_logits_with_soft_tokens_and_deepstack` / `forward_embed_last`; full lift (SlotId(N>0) routes through B4a-cont's F32 slot-offset wiring); all 25 production callsites in `serve/mod.rs` + `serve/api/engine_qwen35.rs` + `quantize/imatrix/forward.rs` updated to pass `SlotId(0)` | **B iter-4b (SHIPPED 2026-05-24)** |
 | `src/inference/models/qwen35/{spec_decode.rs, forward_gpu.rs}` (dflash / greedy) | thread `slot_id` through `forward_gpu_greedy` + dflash spec-decode entry points | B iter-4d |
 | `src/serve/api/engine.rs` | replace mpsc-channel + single worker with scheduler-driven slot loop under `SchedulerPolicy::InflightBatched` | C iter-2 |
 | `src/serve/api/sse.rs` | per-slot keepalive seam (construction-time slot association only; per-frame keepalive carries no slot metadata) | C iter-3 |
@@ -268,7 +268,7 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | **B4a (SHIPPED 2026-05-23)** | Qwen35 `forward_gpu` / `forward_gpu_with_hidden` public-surface `slot_id: SlotId` threading + bounds check + H2 GPU-content byte-identity at slot 0 + slot-isolation pin + typed B4a-cont error for slot N > 0 | **1 day landed** |
 | **B4a-cont (SHIPPED 2026-05-23)** | Qwen35 `build_gated_attn_layer` / `apply_sdpa_with_kv_cache` / KV-dispatcher slot-offset wiring; flip slot > 0 from typed-error to real-route (via `MlxBuffer::slice_view` on slot.k/slot.v) | **1 day landed** |
 | **B4a-cont.1 (SHIPPED 2026-05-23)** | Codex /cfa rev-1 addressed: M1 isolation-test rigor (delete reset+rerun-then-compare test + add raw K/V byte snapshot + positive same-prompt-equivalence pin); M2 canonical TQ-active multi-slot gate placement at `build_gated_attn_layer` + `apply_gated_attn_layer_decode_into` entry; minor stale-comment refresh at `forward_gpu.rs` entry | **1 day landed** |
-| B4b | Qwen35 decode-path slot threading (`forward_gpu_last_logits` / `forward_gpu_last_topk` / soft-token / deepstack) | 2-3 days |
+| **B4b (SHIPPED 2026-05-24)** | Qwen35 decode-path slot threading (`forward_gpu_last_logits` / `forward_gpu_last_topk` / `forward_gpu_last_logits_with_soft_tokens` / `forward_gpu_last_logits_with_soft_tokens_and_deepstack` / `forward_embed_last`); full lift (SlotId(N>0) end-to-end via B4a-cont's F32 slot-offset routing); 25 production callsites updated; H17–H20 + variant-coverage = 5 new tests (153 PASS). See §6.1.20. | **1 day landed** |
 | B4c | Gemma 4 forward-path slot threading (`forward_prefill.rs` + `forward_prefill_batched.rs`) — gated on Phase A3 Gemma 4 multi-seq KV impl | 5-8 days |
 | B4d | Spec-decode slot threading (`forward_gpu_greedy` + dflash entry points) — gated on Phase A4 drafter KV multi-seq impl | 5-8 days |
 | B5 | Per-slot 429 + Retry-After contract preservation | 2-3 days |
@@ -281,7 +281,7 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | **C1 (SHIPPED, 2026-05-23)** | Scaffolding: `EngineMode` enum + signature-only `SlotAware` variant + regression test | 1 day |
 | **C2a (SHIPPED, 2026-05-23)** | Byte-equivalence regression-pin test `engine_serial_fifo_byte_equivalent_to_pre_phase_c` landed env-gated FIRST (per dossier §4 iter-2a step 1). No production code changes; locks the falsifier for C2b's `worker_run` refactor. | 0.5 day |
 | **C2b (SHIPPED, 2026-05-23)** | Shape A `worker_run` refactor: extended signature with `mode: EngineMode` + `queue_capacity: u32` + `scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>`; constructs concrete `FifoSchedulerAdapter` at worker entry (concrete-type realisation of dossier §2.9 "advance lives on concrete type"); wraps `Generate` / `GenerateStream` / `Embed` / `GenerateWithSoftTokens` arms in admit→drive→release; `EngineInner` gains `max_slots: u32` + `scheduler_stats_snapshot` + accessors; `Qwen35LoadedModel` gains `persistent_kv_cache: Option<HybridKvCache>` scaffold (None at iter-2a; iter-2b lift). H2 sequential-request pin added env-gated alongside H1. | 1 day |
-| C2c | Qwen35 SlotAware runtime (replaces `EngineSpawnError::ModeNotYetWired` for `SlotAware` via Shape B `select!` loop inside `worker_run` + populates `Qwen35LoadedModel.persistent_kv_cache` with `n_seqs=max_slots`); gated on B4b decode-side slot_id threading + R4 spec-decode mitigation + R4-bis hybrid persistor n_seqs>1 serialization. | 5-8 days |
+| C2c | Qwen35 SlotAware runtime (replaces `EngineSpawnError::ModeNotYetWired` for `SlotAware` via Shape B `select!` loop inside `worker_run` + populates `Qwen35LoadedModel.persistent_kv_cache` with `n_seqs=max_slots`); B4b decode-side slot_id threading UNBLOCKED 2026-05-24 (§6.1.20). Remaining gates: R4 spec-decode mitigation + R4-bis hybrid persistor n_seqs>1 serialization. | 5-8 days |
 | **C3 (SHIPPED, 2026-05-23)** | SSE keepalive per-slot accounting (structural — adds `generation_events_to_sse_with_slot` sibling entrypoint accepting `slot_id: Option<u32>`; legacy `generation_events_to_sse` preserved as the 4-arg facade for unchanged `handlers.rs` callers and delegates with `slot_id=None`) + `schema.rs::ApiError::queue_full` docstring update naming `SchedulerPolicy` alongside Decision #2 + `ApiError::capability_unsupported` helper wiring `MultiSeqError::CapabilityUnsupported` → HTTP 501. 5 new tests. Byte-invariance pinned at N=1 under FifoSerial (§1.4 client-invisibility). | 1 day |
 | **C4 (SHIPPED, 2026-05-23)** | CLI/env wiring for `HF2Q_SCHEDULER` + `--scheduler` + `HF2Q_MAX_SLOTS` + `--max-slots`; threaded through `multi_model::EngineConfig.engine_mode` into `load_engine` → `Engine::spawn_with_mode`; env-absence is byte-equivalent (`EngineMode::SerialFifo`) per §3.6; SlotAware fail-loud rejection (no silent fallback) with updated `EngineSpawnError::ModeNotYetWired` iter cite (`C2b` SHIPPED → `C2b/C2c (per-family worker arms)` pending). 10 new tests (8 brief-required + 2 precedence pins). | 1 day |
 
@@ -1684,6 +1684,99 @@ The A3b iter-1 sibling-struct ships the lift without touching the 3 production a
 - `cargo test --release --test continuous_batching_throughput` — **21/21 PASS** (preserved).
 
 **Dossier provenance**: A2/A3 dossier §Gemma 4 KV variants table (§2.2.1) + §2.10 R3 risk register + H10 falsification recorded in §A3a closure note (§6.1.11).
+
+### 6.1.20 Iter-B4b closure — Qwen35 decode-path slot_id threading (2026-05-24, this commit)
+
+Closes the §2.2 amendment for `src/inference/models/qwen35/forward_gpu.rs (decode)` and the §6 Phase B B4b row.  Threads `slot_id: SlotId` through the 5 Qwen35 decode-side entry points so the SlotAware engine arm (Phase C2c, gated on this row) can dispatch decode steps to specific slots.
+
+Unlike B4a (prefill entry surface) which shipped signature-only and a typed B4a-cont follow-up for slot N>0 routing, B4b is a **FULL LIFT** in a single iter: the underlying `forward_gpu_impl` already accepts a `slot_id` parameter and routes per-slot K/V byte offsets to the F32 full-attn cache via `MlxBuffer::slice_view` (B4a-cont, §6.1.5), and the TQ-active multi-slot gate at `build_gated_attn_layer` / `apply_gated_attn_layer_decode_into` entry (B4a-cont.1, §6.1.6) is already in place.  B4b's work is precisely the public-surface signature lift + caller updates — no kernel changes, no new dispatch sites.
+
+**Five decode-side entries lifted** (each previously hard-coded `SlotId(0)` at the `forward_gpu_impl` callsite):
+
+| Entry | Signature change | OutputHeadMode | Production callers updated |
+|---|---|---|---|
+| `forward_gpu_last_logits` | +`slot_id: SlotId` (4th positional arg) | `Last` | 17 (imatrix calibration + serve/mod.rs + serve/api/engine_qwen35.rs) |
+| `forward_gpu_last_topk` | +`slot_id: SlotId` (6th positional arg) | `TopK { k }` | 0 production (defined for sampler_pure but no live wiring); test-only callers updated |
+| `forward_gpu_last_logits_with_soft_tokens` | +`slot_id: SlotId` (6th positional arg) | `Last` (with embed override) | 1 (engine_qwen35.rs generate-with-soft-tokens path) |
+| `forward_gpu_last_logits_with_soft_tokens_and_deepstack` | +`slot_id: SlotId` (7th positional arg) | `Last` (with embed override + deepstack residual add) | 2 (engine_qwen35.rs generate-with-soft-tokens-and-deepstack non-streaming + streaming) |
+| `forward_embed_last` | +`slot_id: SlotId` (4th positional arg) | `EmbedLast` (RMSNorm only + L2 norm) | 1 (engine_qwen35.rs Qwen35 chat-as-embedder path) |
+
+**Total production callsites updated**: 25 across `src/quantize/imatrix/forward.rs`, `src/serve/mod.rs`, `src/serve/api/engine_qwen35.rs` — every site passes `SlotId(0)` to preserve pre-B4b byte-identical behaviour.  Each callsite carries an inline comment naming the iter and the gating reason (single-seq engine path until C2c lifts the SlotAware runtime).
+
+**Why FULL lift and not signature-only + typed deferral (mirroring B4a's pre-cont pattern)**:
+- B4a's signature-only pattern was forced by the GPU-side K/V byte routing not yet being slot-aware — the typed B4a-cont error existed because routing slot N>0 through the kernel dispatchers would silently corrupt slot 0's K/V region.
+- B4b inherits B4a-cont's already-shipped F32 slot-offset routing (`MlxBuffer::slice_view` at the 5 kernel-dispatch sites in `gpu_full_attn.rs`).  The decode-side entries simply delegate to the same `forward_gpu_impl` body that `forward_gpu` (the prefill entry) uses.  Adding `slot_id` to the 5 wrappers is purely a signature lift — slot N>0 is END-TO-END FUNCTIONAL on the F32 full-attn path the moment the signature lift lands.
+- TQ-active multi-slot remains gated per the existing B4a-cont.1 canonical entry gates at `build_gated_attn_layer` + `apply_gated_attn_layer_decode_into` (unchanged) — slot N>0 with `slot.tq.is_some()` returns the same typed B4a-TQ error at the SAME entry point as the prefill path.  No new gates, no defence-in-depth duplication.
+
+**Hypothesis matrix** (H17–H20 + variant-coverage):
+
+| ID | Hypothesis | Test name | Result |
+|---|---|---|---|
+| H17 | `forward_gpu_last_logits(.., SlotId(0))` at `n_seqs=4` is byte-identical to `n_seqs=1` (mirrors B4a's H2 at the decode-entry surface) | `b4b_forward_gpu_last_logits_at_slot_0_n_seqs_4_byte_identical_to_n_seqs_1` | **PASS** |
+| H18 | `forward_gpu_last_logits(.., SlotId(1))` at `n_seqs=4` runs end-to-end without panic AND advances `current_len[1] == seq_len` while leaving sibling-slot cursors at 0 | `b4b_forward_gpu_last_logits_slot_1_succeeds_end_to_end` | **PASS** |
+| H19 | Slot isolation on the decode-entry path: forward P→slot 0 (snapshot K/V); forward Q→slot 1; slot 0's K/V bytes UNCHANGED + slot 1's K bytes CHANGED (vacuous-test guard) | `b4b_forward_gpu_last_logits_slot_isolation_raw_kv_byte_snapshot` | **PASS** |
+| H20 | Public-entry bounds check fires for out-of-range slot at the decode-entry path (proves slot_id propagates correctly into forward_gpu_impl's bounds check) | `b4b_forward_gpu_last_logits_slot_out_of_range_errors` | **PASS** |
+| variant coverage | Each of the 4 sibling entries (`forward_gpu_last_topk`, `forward_gpu_last_logits_with_soft_tokens`, `forward_gpu_last_logits_with_soft_tokens_and_deepstack`, `forward_embed_last`) accepts `SlotId(0)` AND `SlotId(1)` end-to-end + errors uniformly on out-of-range slot | `b4b_forward_gpu_all_decode_variants_accept_slot_n` | **PASS** |
+
+**Test count delta**:
+- Baseline (post-B4a-cont.1): 7 `b4a*` / `b4a_cont*` tests in `qwen35::forward_gpu::tests::b4*`.
+- +5 NEW: 4 H17/H18/H19/H20 + 1 variant-coverage = **12 PASS** under `cargo test --release --bin hf2q -- qwen35::forward_gpu::tests::b4 --test-threads=1`.
+- Full `qwen35::forward_gpu` suite: **38 PASS** (unchanged from baseline).
+- `qwen35::mtp`: **9 PASS** (preserved).
+- `qwen35::spec_decode`: **5 PASS** (preserved — spec_decode passes SlotId(0) explicitly into `forward_gpu_with_hidden`, which is a B4a-shipped surface untouched by B4b).
+- `qwen35::kv_cache` + `serve::scheduler` + `serve::multi_seq_kv` combined: **153 PASS** (4 new B4b tests across the combined harness; pre-existing 149 preserved).
+- `continuous_batching_throughput`: **21/21 PASS** (preserved — Phase D bench is engine-mode-gated and not affected by B4b's signature lift).
+
+**LOC delta** (per-file):
+
+| File | +LOC | -LOC | Net | Notes |
+|---|---|---|---|---|
+| `src/inference/models/qwen35/forward_gpu.rs` | +~440 | -~30 | +~410 | 5 entry signature lifts + 5 NEW tests (H17–H20 + variant coverage) + module-level B4b commentary block + test-site updates (~25 existing test callers gained SlotId(0)). |
+| `src/quantize/imatrix/forward.rs` | +~10 | -~1 | +~9 | 1 callsite + SlotId import + inline B4b comment. |
+| `src/serve/mod.rs` | +~30 | -~9 | +~21 | 6 callsites + SlotId import in `cmd_generate_qwen35` + inline B4b comments. |
+| `src/serve/api/engine_qwen35.rs` | +~80 | -~20 | +~60 | 17 callsites + SlotId import + inline B4b comments at engine seam. |
+| `docs/ADR-040-continuous-batching-reopen.md` | +~135 | -~2 | +~133 | §2.2 row updated to SHIPPED + §6 Phase B B4b row updated to SHIPPED + §6 Phase C C2c row updated to reflect B4b unblocked + this §6.1.20 closure block. |
+
+**Total**: +~695 LOC / -~62 LOC = +~633 LOC.
+
+**Decision matrix**:
+
+| Decode entry | B4b scope | Status |
+|---|---|---|
+| `forward_gpu_last_logits` | FULL LIFT | SHIPPED — slot_id end-to-end on F32 full-attn |
+| `forward_gpu_last_topk` | FULL LIFT | SHIPPED — slot_id end-to-end on F32 full-attn |
+| `forward_gpu_last_logits_with_soft_tokens` | FULL LIFT | SHIPPED — slot_id end-to-end on F32 full-attn (soft-tokens overrides are caller-owned MlxBuffer rows; no slot K/V interaction) |
+| `forward_gpu_last_logits_with_soft_tokens_and_deepstack` | FULL LIFT | SHIPPED — slot_id end-to-end on F32 full-attn (deepstack residual-add hits caller-owned `hidden` buffer; no slot K/V interaction) |
+| `forward_embed_last` | FULL LIFT | SHIPPED — slot_id end-to-end on F32 full-attn (OutputHeadMode::EmbedLast skips lm_head matmul; same KV write path as Last) |
+| `forward_gpu` (prefill) | B4a/B4a-cont scope (NOT B4b) | UNCHANGED — was already lifted in B4a + B4a-cont |
+| `forward_gpu_with_hidden` (MTP draft hidden) | B4a scope (NOT B4b) | UNCHANGED — was already lifted in B4a |
+| `forward_gpu_with_hidden_dflash` (DFlash spec-decode) | B4d scope (NOT B4b) | DEFERRED to B4d per ADR-040 §2.2 line 93 |
+| `forward_gpu_greedy` (greedy fast-path decode) | B4d scope (NOT B4b) | DEFERRED to B4d per ADR-040 §2.2 line 93 (greedy is a spec-decode entry point in the ADR's scope split; its single internal `apply_gated_attn_layer_decode_into` + `build_gated_attn_layer` callsites already pass SlotId(0) per B4a-cont annotations at forward_gpu.rs:5260 / 5579) |
+| `forward_gpu_with_capture` (DWQ activation capture) | calibration-tooling, single-stream by construction | UNCHANGED — still hard-codes SlotId(0) at forward_gpu_impl callsite (B4a-style annotation) |
+
+**Typed deferrals NAMED** (per ADR-040 §7 mantra "no fallback, no stub"):
+- **TQ-active multi-slot decode**: inherits the existing B4a-TQ typed gate at `build_gated_attn_layer` / `apply_gated_attn_layer_decode_into` entry — slot N>0 with `slot.tq.is_some()` returns a typed B4a-TQ error.  No new gate added in this iter (the existing canonical gates fire identically for decode-entry calls because both paths funnel through the same dispatchers).  Pinned by the existing `b4a_cont_1_tq_active_multi_slot_gated_at_build_gated_attn_layer_entry` test (KEPT PASS).
+- **Linear-attn multi-slot**: deferred to Phase A2b per the existing `rollback_la_to` guard at `kv_cache.rs:1567` (out-of-scope for any current B4* iter — multi-seq linear-attn is gated on the spec-decode + multi-seq combo per ADR-040 §4 OPEN question 5).  The B4b tests use a dense-full-attn fixture (`tiny_dense_full_attn_model_nonzero_for_b4a`) that the linear-attn guard never reaches.
+- **Spec-decode / DFlash decode-side slot_id**: deferred to **B4d** per the ADR §2.2 phase row.  `forward_gpu_with_hidden_dflash` and `forward_gpu_greedy` retain their B4a-shipped `SlotId(0)` hard-codes with explicit comments naming B4d as the unblocking iter.
+
+**Mantra-aligned**: no `// TODO`, no `unimplemented!()`, no `panic!()` in production code.  No new files added to repo root.  TQ-active multi-slot is the only deferred decode-path case — gated with a typed error naming the specific kernel work needed (B4a-TQ), inherited unchanged from B4a-cont.1.  Slot 0 across ALL 5 decode entries remains byte-identical to pre-B4b (pinned by H17 over `forward_gpu_last_logits` + variant-coverage smoke pin over the other 4).
+
+**Quality gates (all green)**:
+- `cargo check --release --tests` — clean (only pre-existing warnings unrelated to this iter).
+- `cargo test --release --bin hf2q -- qwen35::forward_gpu::tests::b4 --test-threads=1` — **12/12 PASS** (7 B4a/B4a-cont/B4a-cont.1 preserved + 5 NEW B4b).
+- `cargo test --release --bin hf2q -- qwen35::forward_gpu --test-threads=1` — **38/38 PASS**.
+- `cargo test --release --bin hf2q -- qwen35::mtp --test-threads=1` — **9/9 PASS**.
+- `cargo test --release --bin hf2q -- qwen35::spec_decode --test-threads=1` — **5/5 PASS** (B4d-deferred surface preserved).
+- `cargo test --release --bin hf2q -- qwen35::kv_cache::tests serve::scheduler::tests serve::multi_seq_kv::tests --test-threads=1` — **153/153 PASS**.
+- `cargo test --release --test continuous_batching_throughput` — **21/21 PASS** (Phase D bench preserved).
+
+**Dossier provenance**: A2/A3 dossier §1.3 ("Qwen35 partial n_seqs claim — production wiring uses n_seqs=1 today; structural shape supports >1") confirmed at the decode-entry surface; §3 Phase B4 sub-iter sequencing satisfies the B4a → B4a-cont → B4a-cont.1 → B4b sequence; §2.10 R5 (decode-side state contamination) addressed by H19's negative-pin + vacuous-test guard.
+
+**Future-iter pin pointers**:
+- **C2c** (gated on B4b + R4 spec-decode mitigation + R4-bis hybrid persistor n_seqs>1 serialization, 5-8 days): with B4b now landed, the Qwen35 worker arm has a fully-slot-aware decode surface to dispatch into.  Remaining gates are scheduler-side (R4) and persistor-side (R4-bis); B4b itself is no longer a blocker.
+- **B4a-TQ**: lift `dispatch_hadamard_quantize_kv_hb_seq` + `flash_attn_vec_tq_hb` to slot-aware.  Once landed, the canonical TQ-active multi-slot gates at `build_gated_attn_layer` / `apply_gated_attn_layer_decode_into` entry can be removed; B4b's tests continue to PASS unchanged (they use a dense-F32 fixture that never engages the TQ path).
+- **B4c**: Gemma 4 forward-prefill slot threading (gated on Phase A3b iter-2/iter-3 finishing the `DenseKvBuffers` + `MlxKvCache` full lifts per §6.1.19 closure).
+- **B4d**: spec-decode (`forward_gpu_with_hidden_dflash` + `forward_gpu_greedy`) slot threading (gated on Phase A4 drafter multi-seq KV).
 
 ---
 

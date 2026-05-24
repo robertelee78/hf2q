@@ -1621,11 +1621,26 @@ impl Qwen35Model {
     /// This preserves the generation/coherence surface for prefill sampling
     /// while avoiding materialization of `[seq_len, vocab]` logits.  Use this
     /// when callers only need the next-token distribution.
+    ///
+    /// # `slot_id` contract (ADR-040 Phase B4b, 2026-05-24)
+    ///
+    /// `SlotId(0)` reads/writes `current_len[0]` and is byte-identical to
+    /// the pre-ADR-040 single-seq path (pinned by H17).  `SlotId(N>0)` with
+    /// `N < kv_cache.n_seqs` routes per-layer cursor reads/writes AND
+    /// GPU-side K/V byte offsets to slot `N`'s region via the F32 full-attn
+    /// slot-offset wiring shipped in B4a-cont (§6.1.5).  Bounds-checked at
+    /// the public entry of `forward_gpu_impl`.
+    ///
+    /// TQ-active multi-slot is gated at `build_gated_attn_layer` /
+    /// `apply_gated_attn_layer_decode_into` entry per B4a-cont.1
+    /// (§6.1.6) — slot N>0 with `slot.tq.is_some()` returns a typed
+    /// B4a-TQ error.
     pub fn forward_gpu_last_logits(
         &self,
         tokens: &[u32],
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
+        slot_id: SlotId,
     ) -> Result<Vec<f32>> {
         self.forward_gpu_impl(
             tokens,
@@ -1637,11 +1652,7 @@ impl Qwen35Model {
             &[],
             None,
             None,
-            // ADR-040 Phase B4a (2026-05-23): `forward_gpu_last_logits`
-            // remains gated to slot 0; multi-slot routing for the
-            // sampling/decode-side entry points lands in Phase B4b
-            // (ADR-040 §6.1.4).
-            SlotId(0),
+            slot_id,
         )
     }
 
@@ -1672,12 +1683,17 @@ impl Qwen35Model {
     ///
     /// In addition to all errors from `forward_gpu_last_logits`:
     ///   * `top_k == 0` or `top_k > 128` (kernel `MAX_K`).
+    ///
+    /// # `slot_id` contract
+    ///
+    /// Same as [`Self::forward_gpu_last_logits`] (ADR-040 Phase B4b).
     pub fn forward_gpu_last_topk(
         &self,
         tokens: &[u32],
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
         top_k: u32,
+        slot_id: SlotId,
     ) -> Result<(Vec<u32>, Vec<f32>)> {
         if top_k == 0 || top_k > 128 {
             return Err(anyhow!(
@@ -1696,9 +1712,7 @@ impl Qwen35Model {
             &[],
             None,
             Some(&mut topk_slot),
-            // ADR-040 Phase B4a: top-K decode entry remains gated to
-            // slot 0 — B4b scope.
-            SlotId(0),
+            slot_id,
         )?;
         topk_slot.ok_or_else(|| {
             anyhow!(
@@ -1744,12 +1758,17 @@ impl Qwen35Model {
     ///   * Two `SoftTokenInjection` ranges overlap.
     ///   * `embeddings.byte_len()` is too small for
     ///     `range.len() × hidden_size × 4`.
+    ///
+    /// # `slot_id` contract
+    ///
+    /// Same as [`Self::forward_gpu_last_logits`] (ADR-040 Phase B4b).
     pub fn forward_gpu_last_logits_with_soft_tokens(
         &self,
         tokens: &[u32],
         positions_flat: &[i32],
         soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
         kv_cache: &mut HybridKvCache,
+        slot_id: SlotId,
     ) -> Result<Vec<f32>> {
         self.forward_gpu_impl(
             tokens,
@@ -1761,8 +1780,7 @@ impl Qwen35Model {
             soft_tokens,
             None,
             None,
-            // ADR-040 Phase B4a: soft-tokens path gated to slot 0 — B4b.
-            SlotId(0),
+            slot_id,
         )
     }
 
@@ -1804,6 +1822,15 @@ impl Qwen35Model {
     ///     `n_image_tokens * hidden * 4` (per-chunk shape mismatch).
     ///   * `deepstack.n_deepstack() > num_hidden_layers` (out-of-range
     ///     LM layer requested).
+    ///
+    /// # `slot_id` contract
+    ///
+    /// Same as [`Self::forward_gpu_last_logits`] (ADR-040 Phase B4b).
+    /// The deepstack vision augmentation path is per-slot like the rest
+    /// of the decode path — the deepstack residual-add and soft-token
+    /// override happen on caller-owned `MlxBuffer`s and do NOT touch the
+    /// per-slot K/V region, so they inherit `slot_id` from the wrapping
+    /// `forward_gpu_impl` call without additional kernel work.
     pub fn forward_gpu_last_logits_with_soft_tokens_and_deepstack(
         &self,
         tokens: &[u32],
@@ -1811,6 +1838,7 @@ impl Qwen35Model {
         soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
         deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
         kv_cache: &mut HybridKvCache,
+        slot_id: SlotId,
     ) -> Result<Vec<f32>> {
         self.forward_gpu_impl(
             tokens,
@@ -1822,10 +1850,7 @@ impl Qwen35Model {
             soft_tokens,
             deepstack,
             None,
-            // ADR-040 Phase B4a: deepstack vision path gated to slot 0 —
-            // multi-slot vision routing is out of scope for B4a (vision
-            // serving is single-stream today).
-            SlotId(0),
+            slot_id,
         )
     }
 
@@ -1853,11 +1878,21 @@ impl Qwen35Model {
     /// mismatch, GPU op failures.  Plus an internal `ensure!` if the
     /// downloaded F32 vector is shorter than `hidden_size` (impossible in
     /// correct operation; defensive assertion).
+    ///
+    /// # `slot_id` contract
+    ///
+    /// Same as [`Self::forward_gpu_last_logits`] (ADR-040 Phase B4b).
+    /// The embed-last path is functionally single-stream today (chat-as-
+    /// embedder, no concurrent batching) — but the signature accepts a
+    /// `slot_id` to be uniform with the rest of the decode-side surface
+    /// and to keep the public API homogeneous for future slot-aware
+    /// embedding workloads.
     pub fn forward_embed_last(
         &self,
         tokens: &[u32],
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
+        slot_id: SlotId,
     ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(anyhow!("forward_embed_last: empty tokens"));
@@ -1872,9 +1907,7 @@ impl Qwen35Model {
             &[],
             None,
             None,
-            // ADR-040 Phase B4a: embed-last path is single-stream by
-            // construction (chat-as-embedder) and stays at slot 0.
-            SlotId(0),
+            slot_id,
         )?;
         let h = self.cfg.hidden_size as usize;
         anyhow::ensure!(
@@ -6801,7 +6834,7 @@ mod tests {
         let mut kv = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv");
 
         let embed = m
-            .forward_embed_last(&tokens, &positions, &mut kv)
+            .forward_embed_last(&tokens, &positions, &mut kv, SlotId(0))
             .expect("forward_embed_last");
 
         assert_eq!(
@@ -6831,7 +6864,7 @@ mod tests {
         let m = Qwen35Model::empty_from_cfg(cfg.clone());
         let device = MlxDevice::new().expect("device");
         let mut kv = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv");
-        let result = m.forward_embed_last(&[], &[], &mut kv);
+        let result = m.forward_embed_last(&[], &[], &mut kv, SlotId(0));
         assert!(result.is_err(), "empty tokens should error");
     }
 
@@ -6895,7 +6928,7 @@ mod tests {
         // Text-only baseline.
         let mut kv_text = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv text");
         let text_logits = m
-            .forward_gpu_last_logits(&tokens, &positions, &mut kv_text)
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv_text, SlotId(0))
             .expect("text-only forward");
         assert_eq!(
             text_logits.len(),
@@ -6924,6 +6957,7 @@ mod tests {
                 &positions,
                 &injections,
                 &mut kv_soft,
+                SlotId(0),
             )
             .expect("soft-token forward");
 
@@ -6986,7 +7020,7 @@ mod tests {
         // Text-only baseline.
         let mut kv_text = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv text");
         let text_logits = m
-            .forward_gpu_last_logits(&tokens, &positions, &mut kv_text)
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv_text, SlotId(0))
             .expect("text-only forward");
 
         // Build an override that is BYTE-IDENTICAL to what embed_tokens
@@ -7027,6 +7061,7 @@ mod tests {
                 &positions,
                 &injections,
                 &mut kv_soft,
+                SlotId(0),
             )
             .expect("soft-token forward");
 
@@ -7086,6 +7121,7 @@ mod tests {
             &positions,
             &injections,
             &mut kv,
+            SlotId(0),
         );
         assert!(
             result.is_ok(),
@@ -7121,6 +7157,7 @@ mod tests {
             &positions,
             &bad_injections,
             &mut kv2,
+            SlotId(0),
         );
         assert!(
             bad_result.is_err(),
@@ -7191,12 +7228,14 @@ mod tests {
 
         let mut kv_a = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv a");
         let logits_a = m
-            .forward_gpu_last_logits_with_soft_tokens(&tokens, &positions, &[], &mut kv_a)
+            .forward_gpu_last_logits_with_soft_tokens(
+                &tokens, &positions, &[], &mut kv_a, SlotId(0),
+            )
             .expect("baseline forward");
         let mut kv_b = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv b");
         let logits_b = m
             .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                &tokens, &positions, &[], None, &mut kv_b,
+                &tokens, &positions, &[], None, &mut kv_b, SlotId(0),
             )
             .expect("deepstack=None forward");
         assert_eq!(
@@ -7243,6 +7282,7 @@ mod tests {
                 &[],
                 None,
                 &mut kv_a,
+                SlotId(0),
             )
             .expect("none forward");
         let mut kv_b = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv b");
@@ -7253,6 +7293,7 @@ mod tests {
                 &[],
                 Some(&empty_ds),
                 &mut kv_b,
+                SlotId(0),
             )
             .expect("zero-chunks forward");
         let max_diff = logits_a
@@ -7295,13 +7336,13 @@ mod tests {
         let mut kv_a = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv a");
         let logits_a = m
             .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                &tokens, &positions, &[], None, &mut kv_a,
+                &tokens, &positions, &[], None, &mut kv_a, SlotId(0),
             )
             .expect("baseline");
         let mut kv_b = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv b");
         let logits_b = m
             .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                &tokens, &positions, &[], Some(&ds), &mut kv_b,
+                &tokens, &positions, &[], Some(&ds), &mut kv_b, SlotId(0),
             )
             .expect("ds forward");
         let max_diff = logits_a
@@ -7379,13 +7420,13 @@ mod tests {
         let mut kv_a = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv a");
         let logits_one = m
             .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                &tokens, &positions, &[], Some(&ds_one), &mut kv_a,
+                &tokens, &positions, &[], Some(&ds_one), &mut kv_a, SlotId(0),
             )
             .expect("ds=one");
         let mut kv_b = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv b");
         let logits_all = m
             .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
-                &tokens, &positions, &[], Some(&ds_all), &mut kv_b,
+                &tokens, &positions, &[], Some(&ds_all), &mut kv_b, SlotId(0),
             )
             .expect("ds=all");
         let max_diff = logits_one
@@ -7433,6 +7474,7 @@ mod tests {
             &[],
             Some(&ds),
             &mut kv,
+            SlotId(0),
         );
         let err = result.expect_err("oob position must error");
         let msg = format!("{err:#}");
@@ -7470,6 +7512,7 @@ mod tests {
             &[],
             Some(&ds),
             &mut kv,
+            SlotId(0),
         );
         let err = result.expect_err("undersized chunk must error");
         let msg = format!("{err:#}");
@@ -7555,7 +7598,7 @@ mod tests {
             .expect("alloc kv_a");
         let positions_a = build_positions(0, n);
         let _logits_a = model
-            .forward_gpu_last_logits(&tokens, &positions_a, &mut kv_a)
+            .forward_gpu_last_logits(&tokens, &positions_a, &mut kv_a, SlotId(0))
             .expect("monolithic prefill");
         let snap_a = kv_a.snapshot(&device).expect("snap_a");
 
@@ -7564,11 +7607,11 @@ mod tests {
             .expect("alloc kv_b");
         let positions_b1 = build_positions(0, k);
         let _logits_b1 = model
-            .forward_gpu_last_logits(&tokens[..k], &positions_b1, &mut kv_b)
+            .forward_gpu_last_logits(&tokens[..k], &positions_b1, &mut kv_b, SlotId(0))
             .expect("chunked prefill chunk 1");
         let positions_b2 = build_positions(k, n - k);
         let _logits_b2 = model
-            .forward_gpu_last_logits(&tokens[k..], &positions_b2, &mut kv_b)
+            .forward_gpu_last_logits(&tokens[k..], &positions_b2, &mut kv_b, SlotId(0))
             .expect("chunked prefill chunk 2");
         let snap_b = kv_b.snapshot(&device).expect("snap_b");
 
@@ -7689,7 +7732,7 @@ mod tests {
             .expect("alloc kv_c");
         let positions_c = build_positions(0, k);
         let _logits_c = model
-            .forward_gpu_last_logits(&tokens[..k], &positions_c, &mut kv_c)
+            .forward_gpu_last_logits(&tokens[..k], &positions_c, &mut kv_c, SlotId(0))
             .expect("fresh K-only monolithic call");
         let snap_c = kv_c.snapshot(&device).expect("snap_c");
 
@@ -7698,7 +7741,7 @@ mod tests {
         let mut kv_d = HybridKvCache::new(&model.cfg, &device, max_seq_len, 1)
             .expect("alloc kv_d");
         let _logits_d = model
-            .forward_gpu_last_logits(&tokens[..k], &positions_c, &mut kv_d)
+            .forward_gpu_last_logits(&tokens[..k], &positions_c, &mut kv_d, SlotId(0))
             .expect("re-do chunked-call-1 in isolation");
         let snap_d = kv_d.snapshot(&device).expect("snap_d");
 
@@ -8653,6 +8696,535 @@ mod tests {
             "B4a-cont.1 M2: error message must cite the deferred Phase \
              B4a-TQ iter so operators know which kernel work unblocks \
              multi-slot TQ.  Full message: {msg}"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-040 Phase B4b (2026-05-24) — decode-path slot_id threading.
+    //
+    // B4b lifts the 5 decode-side entry points (`forward_gpu_last_logits`,
+    // `forward_gpu_last_topk`, `forward_gpu_last_logits_with_soft_tokens`,
+    // `forward_gpu_last_logits_with_soft_tokens_and_deepstack`,
+    // `forward_embed_last`) to take an explicit `slot_id: SlotId`
+    // parameter, propagated into `forward_gpu_impl` (which already
+    // carries the bounds check + per-slot dispatch wiring from B4a +
+    // B4a-cont).  All 5 entries previously hard-coded `SlotId(0)` at
+    // the `forward_gpu_impl` callsite.
+    //
+    // Test contract:
+    //   H17 — `forward_gpu_last_logits(.., SlotId(0))` is byte-identical
+    //         to itself at `n_seqs=4` vs `n_seqs=1` (mirrors B4a's H2 at
+    //         the decode entry-point surface).
+    //   H18 — `forward_gpu_last_logits(.., SlotId(1))` at `n_seqs=4` runs
+    //         end-to-end without panic AND advances `current_len[1]` by
+    //         tokens.len() while leaving sibling-slot cursors at 0.
+    //   H19 — Slot isolation on the decode-entry path: forward P → slot
+    //         0, snapshot slot 0; forward Q → slot 1; assert slot 0's
+    //         K/V byte region is unchanged.  Vacuous-test guard: slot
+    //         1's K region MUST have changed.
+    //   H20 — Public-entry bounds check fires for out-of-range slot
+    //         (mirrors `b4a_forward_gpu_slot_out_of_range_errors` at
+    //         the decode-entry).  Asserts diagnostic names slot + n_seqs.
+    //
+    // The B4a tests pin `forward_gpu` (the seq_len >= 1 prefill/training
+    // surface); B4b's tests pin `forward_gpu_last_logits` (the canonical
+    // sampling-mode decode entry).  Together they cover the full set of
+    // public Qwen35 forward entries that touch the multi-seq KV cache.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// ADR-040 Phase B4b — H17 byte-identity at slot 0.
+    ///
+    /// At `n_seqs=4` with `slot_id=SlotId(0)`, `forward_gpu_last_logits`
+    /// must produce logits byte-identical to the same call at
+    /// `n_seqs=1` — proves the n_seqs allocation does NOT disturb the
+    /// slot-0 decode-entry path's outputs.  Mirrors B4a's H2 contract
+    /// applied at the decode-entry surface.
+    ///
+    /// Falsifier: any per-element bit diff between the two `Vec<f32>`
+    /// logit outputs ⇒ the n_seqs > 1 allocation changes slot-0
+    /// behaviour at the decode entry, which would break the
+    /// "byte-equivalent at slot 0" contract that ADR-040 §3.6 pledged.
+    #[test]
+    fn b4b_forward_gpu_last_logits_at_slot_0_n_seqs_4_byte_identical_to_n_seqs_1() {
+        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
+        let cfg = m.cfg.clone();
+        let tokens = vec![5u32, 10, 15, 20];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+
+        let device = MlxDevice::new().expect("device");
+        let mut kv_1 = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv n_seqs=1");
+        let mut kv_4 = HybridKvCache::new(&cfg, &device, 64, 4).expect("kv n_seqs=4");
+
+        let logits_1 = m
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv_1, SlotId(0))
+            .expect("forward_gpu_last_logits n_seqs=1");
+        let logits_4 = m
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv_4, SlotId(0))
+            .expect("forward_gpu_last_logits n_seqs=4");
+
+        assert_eq!(
+            logits_1.len(), logits_4.len(),
+            "B4b H17 sanity: logits length mismatch (n_seqs=1: {}, n_seqs=4: {})",
+            logits_1.len(), logits_4.len()
+        );
+        // OutputHeadMode::Last returns only the last token's logits,
+        // so length should equal vocab_size — sanity check.
+        assert_eq!(
+            logits_1.len(), cfg.vocab_size as usize,
+            "B4b H17 sanity: forward_gpu_last_logits must return [vocab_size] \
+             logits (got len={}, expected vocab_size={})",
+            logits_1.len(), cfg.vocab_size,
+        );
+
+        // Per-element bit comparison: catches single-ULP / sign-bit /
+        // denormal diffs (same stricter-than-tolerance comparison as
+        // `b4a_forward_gpu_at_slot_0_n_seqs_4_byte_identical_to_n_seqs_1`).
+        let first_diff = logits_1
+            .iter()
+            .zip(logits_4.iter())
+            .enumerate()
+            .find(|(_, (a, b))| a.to_bits() != b.to_bits());
+        assert!(
+            first_diff.is_none(),
+            "B4b H17 FALSIFIED: forward_gpu_last_logits(slot 0) at n_seqs=4 \
+             produced byte-different logits vs n_seqs=1.  The n_seqs=4 \
+             allocation must NOT change slot-0 decode-entry outputs \
+             (ADR-040 §3.6 byte-equivalence at slot 0). First per-element \
+             diff: {}",
+            first_diff
+                .map(|(i, (a, b))| format!(
+                    "logits[{i}] n_seqs=1={:.9} (bits {:#010x}) vs \
+                     n_seqs=4={:.9} (bits {:#010x})",
+                    a, a.to_bits(), b, b.to_bits()
+                ))
+                .unwrap_or_else(|| "<unreachable>".into())
+        );
+    }
+
+    /// ADR-040 Phase B4b — H18 slot 1 end-to-end runs through decode entry.
+    ///
+    /// Proves that `forward_gpu_last_logits(.., SlotId(1))` at
+    /// `n_seqs=4` runs the full decode-entry path (RMSNorm →
+    /// projections → IMROPE → KV-write → SDPA → output-head Last)
+    /// without error AND advances `current_len[1]` (the per-slot
+    /// cursor) by `tokens.len()` — while leaving `current_len[0..]`
+    /// (sibling slot cursors) at their initial 0.
+    ///
+    /// Mirrors B4a-cont's `b4a_cont_forward_gpu_slot_1_succeeds_end_to_end`
+    /// applied at the decode-entry surface (OutputHeadMode::Last).
+    ///
+    /// Falsifier:
+    /// * `forward_gpu_last_logits` errors ⇒ slot 1 routing regressed
+    ///   at the decode entry (the B4b signature lift hard-codes
+    ///   nothing — `slot_id` must flow through to `forward_gpu_impl`).
+    /// * `current_len[1] != seq_len` ⇒ the per-slot cursor write
+    ///   landed on the wrong index.
+    /// * `current_len[0] != 0` ⇒ slot 0's cursor leaked into slot
+    ///   1's decode-entry path.
+    /// * `logits.len() != vocab_size` ⇒ OutputHeadMode::Last regressed.
+    #[test]
+    fn b4b_forward_gpu_last_logits_slot_1_succeeds_end_to_end() {
+        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
+        let cfg = m.cfg.clone();
+        let tokens = vec![5u32, 10, 15, 20];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+
+        let device = MlxDevice::new().expect("device");
+        let n_seqs = 4u32;
+        let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs)
+            .expect("kv n_seqs=4");
+
+        // Pre-sanity: all per-slot cursors must start at 0.
+        for s in 0..(n_seqs as usize) {
+            assert_eq!(
+                kv.full_attn[0].current_len[s], 0,
+                "fixture sanity: full_attn[0].current_len[{s}] must start at 0"
+            );
+        }
+
+        let logits = m
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv, SlotId(1))
+            .expect(
+                "B4b H18 SHIP GATE: forward_gpu_last_logits(SlotId(1)) must \
+                 succeed end-to-end via forward_gpu_impl's existing slot N>0 \
+                 routing (B4a-cont + B4b signature lift)."
+            );
+
+        // OutputHeadMode::Last returns one row of vocab_size logits.
+        assert_eq!(
+            logits.len(), cfg.vocab_size as usize,
+            "B4b H18 sanity: forward_gpu_last_logits must return [vocab_size] \
+             logits (got len={}, expected vocab_size={})",
+            logits.len(), cfg.vocab_size,
+        );
+
+        // Slot-1 cursor MUST have advanced by seq_len.  Slot-0/2/3
+        // cursors MUST remain at 0 (per-slot isolation on the cursor
+        // side — kernel-side isolation is pinned by H19 below).
+        for (layer_idx, slot) in kv.full_attn.iter().enumerate() {
+            assert_eq!(
+                slot.current_len[1], seq,
+                "B4b H18 FALSIFIED: full_attn[{layer_idx}].current_len[1] \
+                 must equal seq_len={seq} after forward_gpu_last_logits(SlotId(1)) — \
+                 got {}.  Cursor write may have routed to the wrong slot.",
+                slot.current_len[1]
+            );
+            for s in [0usize, 2, 3] {
+                assert_eq!(
+                    slot.current_len[s], 0,
+                    "B4b H18 FALSIFIED: full_attn[{layer_idx}].current_len[{s}] \
+                     must remain 0 after forward_gpu_last_logits(SlotId(1)) — \
+                     got {}.  Sibling-slot cursor leaked from the slot-1 \
+                     decode-entry forward.",
+                    slot.current_len[s]
+                );
+            }
+        }
+    }
+
+    /// ADR-040 Phase B4b — H19 raw K/V byte snapshot slot isolation
+    /// for the decode-entry path.
+    ///
+    /// Forward prompt P → slot 0 via `forward_gpu_last_logits`;
+    /// snapshot every full-attn layer's slot-0 K and V byte regions.
+    /// Forward prompt Q → slot 1 via `forward_gpu_last_logits`;
+    /// re-snapshot slot 0's K/V byte region; assert bit-for-bit
+    /// equality with the BEFORE snapshot.  Also snapshot slot 1's K
+    /// region pre/post slot-1 forward and assert it CHANGED
+    /// (vacuous-test guard).
+    ///
+    /// Mirrors B4a-cont.1's
+    /// `b4a_cont_forward_gpu_slot_isolation_raw_kv_byte_snapshot`
+    /// applied to the decode-entry surface.  Falsifies any cross-slot
+    /// K/V leak that would survive going through the B4b signature
+    /// lift specifically (a regression in the new `slot_id` parameter
+    /// propagation, vs the existing B4a-cont kernel-dispatcher wiring).
+    ///
+    /// Falsifier:
+    /// * Any byte diff in slot 0's K or V region between BEFORE and
+    ///   AFTER ⇒ the new decode-entry signature lift broke slot routing.
+    /// * Slot 1's K region unchanged pre/post slot-1 forward ⇒ the
+    ///   slot-1 decode-entry forward did not actually write anything
+    ///   (vacuous test — the slot-0 byte-equality above would pass
+    ///   trivially).
+    #[test]
+    fn b4b_forward_gpu_last_logits_slot_isolation_raw_kv_byte_snapshot() {
+        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
+        let cfg = m.cfg.clone();
+        // Two DIFFERENT prompts P and Q (different ids + different
+        // lengths so any slot-1 write that lands in slot 0 produces
+        // bit-different bytes from slot 0's own write).
+        let prompt_p = vec![5u32, 10, 15, 20];
+        let prompt_q = vec![7u32, 12, 18];
+        let pos_p = positions_to_flat(&text_positions(prompt_p.len() as u32));
+        let pos_q = positions_to_flat(&text_positions(prompt_q.len() as u32));
+
+        let device = MlxDevice::new().expect("device");
+        let max_seq_len = 64u32;
+        let n_seqs = 4u32;
+        let mut kv = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs)
+            .expect("kv n_seqs=4");
+
+        // Layout: full-attn K/V at `[n_seqs, n_kv_heads, max_seq_len,
+        // head_dim]` per ADR-040 §6.1.3 M5 (shape[0]=n_seqs row-major).
+        // Slot N's K region starts at byte offset
+        // `N * n_kv_heads * max_seq_len * head_dim * 4` (F32).
+        let n_kv = cfg.num_key_value_heads as usize;
+        let hd = cfg.head_dim as usize;
+        let slot_region_elems = n_kv * (max_seq_len as usize) * hd;
+        let slot_region_bytes = slot_region_elems * 4;
+        let slot_0_offset = 0usize;
+        let slot_1_offset = slot_region_bytes;
+
+        fn snapshot_slot_region(
+            buf: &MlxBuffer,
+            slot_byte_offset: usize,
+            slot_byte_len: usize,
+        ) -> Vec<u8> {
+            let all = buf.as_slice::<u8>().expect("as_slice u8");
+            assert!(
+                slot_byte_offset + slot_byte_len <= all.len(),
+                "snapshot_slot_region: OOB (offset={} len={} buf={})",
+                slot_byte_offset, slot_byte_len, all.len()
+            );
+            all[slot_byte_offset..slot_byte_offset + slot_byte_len].to_vec()
+        }
+
+        // (1) Forward prompt P to slot 0 via the decode entry;
+        // snapshot slot 0's K/V bytes + slot 1's K bytes.
+        let _l0 = m
+            .forward_gpu_last_logits(&prompt_p, &pos_p, &mut kv, SlotId(0))
+            .expect("forward_gpu_last_logits P → slot 0");
+
+        let n_full_attn = kv.full_attn.len();
+        assert!(
+            n_full_attn >= 1,
+            "fixture sanity: tiny_dense_full_attn_cfg_4layer_for_b4a has ≥1 \
+             full-attn layer (got {})",
+            n_full_attn
+        );
+
+        let mut slot0_k_before: Vec<Vec<u8>> = Vec::with_capacity(n_full_attn);
+        let mut slot0_v_before: Vec<Vec<u8>> = Vec::with_capacity(n_full_attn);
+        let mut slot1_k_pre: Vec<Vec<u8>> = Vec::with_capacity(n_full_attn);
+        for slot in &kv.full_attn {
+            let kbuf = slot.k.as_ref().expect("slot.k Some (legacy F32 mode)");
+            let vbuf = slot.v.as_ref().expect("slot.v Some (legacy F32 mode)");
+            slot0_k_before.push(snapshot_slot_region(kbuf, slot_0_offset, slot_region_bytes));
+            slot0_v_before.push(snapshot_slot_region(vbuf, slot_0_offset, slot_region_bytes));
+            slot1_k_pre.push(snapshot_slot_region(kbuf, slot_1_offset, slot_region_bytes));
+        }
+
+        // (2) Forward prompt Q to slot 1 via the decode entry.  This
+        // MUST NOT mutate slot 0's K/V region.
+        let _l1 = m
+            .forward_gpu_last_logits(&prompt_q, &pos_q, &mut kv, SlotId(1))
+            .expect("forward_gpu_last_logits Q → slot 1");
+
+        // (3) Snapshot slot 0 AFTER the slot-1 forward + slot 1 AFTER.
+        for (idx, slot) in kv.full_attn.iter().enumerate() {
+            let kbuf = slot.k.as_ref().expect("slot.k Some after forward");
+            let vbuf = slot.v.as_ref().expect("slot.v Some after forward");
+            let slot0_k_after = snapshot_slot_region(kbuf, slot_0_offset, slot_region_bytes);
+            let slot0_v_after = snapshot_slot_region(vbuf, slot_0_offset, slot_region_bytes);
+            let slot1_k_post = snapshot_slot_region(kbuf, slot_1_offset, slot_region_bytes);
+
+            // Negative pin: slot 0's K region must be UNCHANGED.
+            assert_eq!(
+                slot0_k_before[idx], slot0_k_after,
+                "B4b H19 FALSIFIED: full_attn[{idx}].k slot-0 region changed \
+                 during slot-1 forward via the decode-entry path — slot 1's \
+                 write contaminated slot 0's K region.  Per-slot isolation \
+                 broken at offset {slot_0_offset} (slot 0 starts at 0; slot \
+                 1 should write at offset {slot_1_offset}). The B4b signature \
+                 lift may have failed to propagate slot_id correctly through \
+                 forward_gpu_impl."
+            );
+            // Negative pin: slot 0's V region must be UNCHANGED.
+            assert_eq!(
+                slot0_v_before[idx], slot0_v_after,
+                "B4b H19 FALSIFIED: full_attn[{idx}].v slot-0 region changed \
+                 during slot-1 forward via the decode-entry path — slot 1's \
+                 write contaminated slot 0's V region.  Per-slot isolation \
+                 broken at offset {slot_0_offset} (slot 0 starts at 0; slot \
+                 1 should write at offset {slot_1_offset})."
+            );
+
+            // Vacuous-test guard: slot 1's K region MUST have changed
+            // (else the slot-1 forward did nothing and the slot-0
+            // byte-equality assertion above would pass trivially).
+            assert_ne!(
+                slot1_k_pre[idx], slot1_k_post,
+                "B4b H19 VACUOUS-TEST GUARD: full_attn[{idx}].k slot-1 \
+                 region unchanged after forward_gpu_last_logits(SlotId(1)) \
+                 — the slot-1 decode-entry forward did not actually write \
+                 to slot 1's region (offset {slot_1_offset}).  The slot-0 \
+                 byte-equality assertion above would also pass trivially \
+                 in this case, so the negative pin is vacuous.  Investigate \
+                 slot 1's kernel binding."
+            );
+
+            // Cursor-side mirror: slot 0's cursor stays at prompt_p.len()
+            // (NOT 0 — set by step 1); slot 1's cursor advances to
+            // prompt_q.len().
+            assert_eq!(
+                slot.current_len[0], prompt_p.len() as u32,
+                "B4b H19 cursor-side: full_attn[{idx}].current_len[0] must \
+                 remain at prompt_p.len()={} after slot-1-only forward — \
+                 got {}",
+                prompt_p.len(), slot.current_len[0]
+            );
+            assert_eq!(
+                slot.current_len[1], prompt_q.len() as u32,
+                "B4b H19 cursor-side: full_attn[{idx}].current_len[1] must \
+                 equal prompt_q.len()={} after slot-1 forward — got {}",
+                prompt_q.len(), slot.current_len[1]
+            );
+        }
+    }
+
+    /// ADR-040 Phase B4b — H20 public-entry bounds check for the
+    /// decode-entry path.
+    ///
+    /// Out-of-range `slot_id` (≥ `kv_cache.n_seqs`) must error at the
+    /// `forward_gpu_impl` bounds check (reached via the new B4b
+    /// `forward_gpu_last_logits` slot_id pass-through) with a clear
+    /// diagnostic naming both the requested slot and the configured
+    /// `n_seqs`.
+    ///
+    /// Falsifier: out-of-range slot accepted ⇒ the slot_id parameter
+    /// is being silently dropped in the B4b signature lift, OR the
+    /// bounds check at `forward_gpu_impl` entry regressed.
+    #[test]
+    fn b4b_forward_gpu_last_logits_slot_out_of_range_errors() {
+        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
+        let cfg = m.cfg.clone();
+        let tokens = vec![5u32, 10, 15, 20];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+
+        let device = MlxDevice::new().expect("device");
+        let n_seqs = 2u32;
+        let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("kv n_seqs=2");
+
+        // Slot 5 ≥ n_seqs=2 ⇒ out-of-range.
+        let err = m
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv, SlotId(5))
+            .expect_err("slot 5 must be out of range at n_seqs=2");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("slot_id=5"),
+            "B4b H20 bounds-check FALSIFIED: error message must name the \
+             requested slot (slot_id=5). The B4b signature lift may be \
+             dropping the slot_id parameter before forward_gpu_impl's \
+             bounds check fires. Got: {msg}"
+        );
+        assert!(
+            msg.contains("n_seqs=2"),
+            "B4b H20 bounds-check FALSIFIED: error message must name the \
+             configured n_seqs. Got: {msg}"
+        );
+
+        // Slot n_seqs (=2) is the first out-of-range slot (since
+        // valid slots are 0..n_seqs).  Boundary pin.
+        let err = m
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv, SlotId(n_seqs))
+            .expect_err("slot == n_seqs must be out of range");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(&format!("slot_id={n_seqs}")),
+            "B4b H20 boundary-check FALSIFIED: error must name slot_id={n_seqs}. Got: {msg}"
+        );
+    }
+
+    /// ADR-040 Phase B4b — variant coverage (forward_gpu_last_topk,
+    /// soft-tokens, deepstack, forward_embed_last).
+    ///
+    /// Compile-time gate that every B4b decode-entry variant accepts
+    /// `SlotId(0)` AND `SlotId(N>0)` end-to-end without panic.  Pins the
+    /// signature-and-routing lift across the 4 remaining entries
+    /// (last_topk, soft_tokens, soft_tokens+deepstack, embed_last).
+    ///
+    /// Each variant is a thin wrapper around `forward_gpu_impl` with a
+    /// distinct OutputHeadMode + side effect (TopK output, soft-tokens
+    /// override, deepstack residual add, L2 normalisation); H17/H18/H19
+    /// validate the underlying slot routing at the canonical
+    /// `forward_gpu_last_logits` entry.  This test adds a coverage net
+    /// across the 4 sibling entries: each must accept SlotId(1) end-to-
+    /// end and return a sensibly-shaped output, OR error with the same
+    /// bounds-check diagnostic shape (SlotId out-of-range).
+    ///
+    /// Falsifier:
+    /// * Any variant panics under SlotId(0) or SlotId(1) ⇒ signature
+    ///   lift regressed for that entry.
+    /// * Output shape unexpected for the variant ⇒ slot routing
+    ///   propagation broke the variant's output mode.
+    #[test]
+    fn b4b_forward_gpu_all_decode_variants_accept_slot_n() {
+        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
+        let cfg = m.cfg.clone();
+        let tokens = vec![5u32, 10, 15, 20];
+        let seq = tokens.len() as u32;
+        let positions = positions_to_flat(&text_positions(seq));
+
+        let device = MlxDevice::new().expect("device");
+        let n_seqs = 2u32;
+
+        // 1) forward_gpu_last_topk
+        {
+            let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("kv topk");
+            let (top_idx, top_val) = m
+                .forward_gpu_last_topk(&tokens, &positions, &mut kv, 8, SlotId(0))
+                .expect("forward_gpu_last_topk slot 0");
+            assert_eq!(top_idx.len(), 8, "B4b topk: idx len must be 8");
+            assert_eq!(top_val.len(), 8, "B4b topk: val len must be 8");
+
+            // Same call at slot 1 — fresh cache so cursor starts at 0.
+            let mut kv2 = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("kv topk slot1");
+            let (top_idx2, top_val2) = m
+                .forward_gpu_last_topk(&tokens, &positions, &mut kv2, 8, SlotId(1))
+                .expect("forward_gpu_last_topk slot 1");
+            assert_eq!(top_idx2.len(), 8, "B4b topk slot 1: idx len must be 8");
+            assert_eq!(top_val2.len(), 8, "B4b topk slot 1: val len must be 8");
+            assert_eq!(
+                kv2.full_attn[0].current_len[1], seq,
+                "B4b topk slot 1: cursor must advance"
+            );
+            assert_eq!(
+                kv2.full_attn[0].current_len[0], 0,
+                "B4b topk slot 1: slot 0 cursor must remain 0"
+            );
+        }
+
+        // 2) forward_gpu_last_logits_with_soft_tokens (no overrides ⇒
+        // byte-identical to forward_gpu_last_logits at slot 0).
+        {
+            let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("kv soft");
+            let logits = m
+                .forward_gpu_last_logits_with_soft_tokens(
+                    &tokens, &positions, &[], &mut kv, SlotId(1),
+                )
+                .expect("forward_gpu_last_logits_with_soft_tokens slot 1");
+            assert_eq!(logits.len(), cfg.vocab_size as usize);
+            assert_eq!(kv.full_attn[0].current_len[1], seq);
+        }
+
+        // 3) forward_gpu_last_logits_with_soft_tokens_and_deepstack
+        // (no soft_tokens + None deepstack ⇒ byte-identical to text-only).
+        {
+            let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("kv ds");
+            let logits = m
+                .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                    &tokens, &positions, &[], None, &mut kv, SlotId(1),
+                )
+                .expect("forward_gpu_last_logits_with_soft_tokens_and_deepstack slot 1");
+            assert_eq!(logits.len(), cfg.vocab_size as usize);
+            assert_eq!(kv.full_attn[0].current_len[1], seq);
+        }
+
+        // 4) forward_embed_last.
+        {
+            let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("kv embed");
+            let embed = m
+                .forward_embed_last(&tokens, &positions, &mut kv, SlotId(1))
+                .expect("forward_embed_last slot 1");
+            assert_eq!(
+                embed.len(),
+                cfg.hidden_size as usize,
+                "B4b embed slot 1: must return [hidden_size] vector"
+            );
+            assert_eq!(kv.full_attn[0].current_len[1], seq);
+        }
+
+        // 5) Bounds-check propagation across all 4 variants.
+        let mut kv_bounds = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("kv bounds");
+        let oor = SlotId(n_seqs); // first out-of-range slot
+
+        assert!(
+            m.forward_gpu_last_topk(&tokens, &positions, &mut kv_bounds, 4, oor).is_err(),
+            "B4b bounds: forward_gpu_last_topk must error on OOR slot"
+        );
+        assert!(
+            m.forward_gpu_last_logits_with_soft_tokens(
+                &tokens, &positions, &[], &mut kv_bounds, oor,
+            ).is_err(),
+            "B4b bounds: forward_gpu_last_logits_with_soft_tokens must error on OOR slot"
+        );
+        assert!(
+            m.forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                &tokens, &positions, &[], None, &mut kv_bounds, oor,
+            ).is_err(),
+            "B4b bounds: forward_gpu_last_logits_with_soft_tokens_and_deepstack \
+             must error on OOR slot"
+        );
+        assert!(
+            m.forward_embed_last(&tokens, &positions, &mut kv_bounds, oor).is_err(),
+            "B4b bounds: forward_embed_last must error on OOR slot"
         );
     }
 }

@@ -49,6 +49,7 @@ use std::path::PathBuf;
 use super::corpus::CorpusBytes;
 use super::error::ImatrixError;
 use crate::quantize::ggml_quants::ArchName;
+use crate::serve::multi_seq_kv::SlotId;
 
 /// In-tree imatrix collector — installed by [`collect_imatrix`] (Stage
 /// 2) and consumed by [`crate::serve::forward_mlx_shared::dispatch_qmatmul`].
@@ -716,8 +717,16 @@ pub fn compute_imatrix(
                     n_experts,
                 };
                 let result: anyhow::Result<Vec<f32>> = with_collector(collector, || {
-                    qwen.model
-                        .forward_gpu_last_logits(chunk.as_slice(), &positions, &mut kv_cache)
+                    // ADR-040 Phase B4b (2026-05-24): imatrix calibration is
+                    // single-seq tooling (allocates `HybridKvCache` with
+                    // `n_parallel=1` above). Pass `SlotId(0)` to match the
+                    // sole slot and preserve pre-B4b byte-identical behaviour.
+                    qwen.model.forward_gpu_last_logits(
+                        chunk.as_slice(),
+                        &positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
                 });
                 result.map_err(|e| ImatrixError::ForwardPassFailed {
                     chunk_index,

@@ -45,6 +45,10 @@ use crate::serve::load_info::{
     self, ArchFamily, ChatTemplateSource, LoadInfo, LoadInfoBuilder, MoeShape,
     TokenizerSource,
 };
+// ADR-040 Phase B4b (2026-05-24): every Qwen35 decode-side entry point
+// now takes `slot_id: SlotId`. Engine callers route SlotId(0) until C2c
+// wires the SlotAware scheduler runtime (per ADR-040 §6 Phase C C2c row).
+use crate::serve::multi_seq_kv::SlotId;
 use crate::core::provenance::{self, Provenance};
 
 use super::engine::{LoadOptions, SamplingParams};
@@ -1691,7 +1695,12 @@ pub fn generate_qwen35_once(
                 }
                 let logits = qwen
                     .model
-                    .forward_gpu_last_logits(chunk_tokens, &chunk_positions, &mut kv_cache)
+                    .forward_gpu_last_logits(
+                        chunk_tokens,
+                        &chunk_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
                     .with_context(|| {
                         format!(
                             "qwen35 chunked prefill: chunk {}/{} (k_start={}, k_end={}, seq_len={})",
@@ -1785,13 +1794,18 @@ pub fn generate_qwen35_once(
             );
             qwen
                 .model
-                .forward_gpu_last_logits(suffix_tokens, &suffix_positions, &mut kv_cache)
+                .forward_gpu_last_logits(
+                    suffix_tokens,
+                    &suffix_positions,
+                    &mut kv_cache,
+                    SlotId(0),
+                )
                 .context("Qwen35Model::forward_gpu_last_logits (LCP resume suffix)")?
         } else {
             let positions = prefill_positions_for(prompt_len);
             qwen
                 .model
-                .forward_gpu_last_logits(prompt_tokens, &positions, &mut kv_cache)
+                .forward_gpu_last_logits(prompt_tokens, &positions, &mut kv_cache, SlotId(0))
                 .context("Qwen35Model::forward_gpu_last_logits (prefill)")?
         };
         anyhow::ensure!(
@@ -1957,7 +1971,12 @@ pub fn generate_qwen35_once(
                 // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
                 let logits_full = qwen
                     .model
-                    .forward_gpu_last_logits(&[next_token], &decode_positions, &mut kv_cache)
+                    .forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
                     .with_context(|| format!("forward_gpu_last_logits decode step {step} (logprobs)"))?;
                 let mut logits = logits_full;
                 let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &generated_tokens);
@@ -1970,7 +1989,12 @@ pub fn generate_qwen35_once(
             } else {
                 let logits_full = qwen
                     .model
-                    .forward_gpu_last_logits(&[next_token], &decode_positions, &mut kv_cache)
+                    .forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
                     .with_context(|| format!("forward_gpu_last_logits decode step {step}"))?;
                 let mut logits = logits_full;
                 sample_logits_qwen35(&mut logits, params, &generated_tokens)
@@ -2127,6 +2151,7 @@ pub fn generate_qwen35_once_with_soft_tokens(
             &positions,
             soft_tokens,
             &mut kv_cache,
+            SlotId(0),
         )
         .context("Qwen35Model::forward_gpu_last_logits_with_soft_tokens (prefill)")?;
     anyhow::ensure!(
@@ -2187,7 +2212,12 @@ pub fn generate_qwen35_once_with_soft_tokens(
                 // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
                 let logits_full = qwen
                     .model
-                    .forward_gpu_last_logits(&[next_token], &decode_positions, &mut kv_cache)
+                    .forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
                     .with_context(|| {
                         format!("forward_gpu_last_logits decode step {step} (soft tokens, logprobs)")
                     })?;
@@ -2204,7 +2234,12 @@ pub fn generate_qwen35_once_with_soft_tokens(
             } else {
                 let logits_full = qwen
                     .model
-                    .forward_gpu_last_logits(&[next_token], &decode_positions, &mut kv_cache)
+                    .forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
                     .with_context(|| {
                         format!("forward_gpu_last_logits decode step {step} (soft tokens)")
                     })?;
@@ -2365,6 +2400,7 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
             soft_tokens,
             deepstack,
             &mut kv_cache,
+            SlotId(0),
         )
         .context(
             "Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack \
@@ -2455,7 +2491,12 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
                 // ADR-020 AC#7 — bypass greedy fast-path; need full logits.
                 let logits_full = qwen
                     .model
-                    .forward_gpu_last_logits(&[next_token], &decode_positions, &mut kv_cache)
+                    .forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
                     .with_context(|| {
                         format!("forward_gpu_last_logits decode step {step} (wedge-4d, logprobs)")
                     })?;
@@ -2472,7 +2513,12 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
             } else {
                 let logits_full = qwen
                     .model
-                    .forward_gpu_last_logits(&[next_token], &decode_positions, &mut kv_cache)
+                    .forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        &mut kv_cache,
+                        SlotId(0),
+                    )
                     .with_context(|| {
                         format!("forward_gpu_last_logits decode step {step} (wedge-4d)")
                     })?;
@@ -2917,6 +2963,7 @@ pub fn generate_stream_qwen35_once_extended(
                 soft_tokens,
                 deepstack,
                 &mut kv_cache,
+                SlotId(0),
             )
         } else if chunked_eligible {
             // Chunked prefill — mirrors non-streaming chunked block.
@@ -2948,6 +2995,7 @@ pub fn generate_stream_qwen35_once_extended(
                     chunk_tokens,
                     &chunk_positions,
                     &mut kv_cache,
+                    SlotId(0),
                 );
                 let logits = match res {
                     Ok(l) => l,
@@ -3021,12 +3069,14 @@ pub fn generate_stream_qwen35_once_extended(
                 suffix_tokens,
                 &suffix_positions,
                 &mut kv_cache,
+                SlotId(0),
             )
         } else {
             qwen.model.forward_gpu_last_logits(
                 prompt_tokens,
                 positions_slice,
                 &mut kv_cache,
+                SlotId(0),
             )
         };
         let prefill_logits = match prefill_logits_res {
@@ -3335,6 +3385,7 @@ pub fn generate_stream_qwen35_once_extended(
                     &[next_token],
                     &decode_positions,
                     &mut kv_cache,
+                    SlotId(0),
                 ) {
                     Ok(logits) => {
                         let mut tmp = logits;
@@ -3531,7 +3582,12 @@ pub fn embed_qwen35(qwen: &mut Qwen35LoadedModel, prompt_tokens: &[u32]) -> Resu
     let mut kv_cache = alloc_kv_cache_for_request(qwen, &device, prompt_tokens.len(), 0)?;
     let positions = prefill_positions_for(prompt_tokens.len());
     qwen.model
-        .forward_embed_last(prompt_tokens, &positions, &mut kv_cache)
+        // ADR-040 Phase B4b (2026-05-24): embed-last is single-stream
+        // chat-as-embedder; slot 0 preserves pre-B4b behaviour. The
+        // signature takes SlotId for uniformity with the rest of the
+        // decode-side surface — future slot-aware embedding workloads
+        // can pass SlotId(N) directly.
+        .forward_embed_last(prompt_tokens, &positions, &mut kv_cache, SlotId(0))
         .context("Qwen35Model::forward_embed_last")
 }
 
