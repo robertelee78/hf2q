@@ -555,15 +555,25 @@ pub fn print_banner<W: std::io::Write>(
     // string with the iter-34 memory-savings ratio so operators see
     // the realized 3.94× savings at load time without having to
     // consult the ADR.
-    writeln!(
-        w,
-        "{d}hf2q load: tq_kv = {}{r}",
-        if info.tq_kv_active {
-            "active (8-bit Lloyd-Max + D1 SRHT, ADR-027 Phase B; F32 K/V dropped at alloc — 3.94× per-slot KV savings)"
-        } else {
-            "inactive"
+    //
+    // 2026-05-23: extended to also surface Gemma 4's TQ-on state
+    // (ADR-007 Path C close). On Gemma 4, TQ is the production
+    // default (8-bit Lloyd-Max + D1 SRHT via `flash_attn_vec_tq_hb`
+    // / `flash_attn_vec_tq`); inactive only when the operator opts
+    // out via `HF2Q_USE_DENSE=1` or `HF2Q_LAYER_POLICY=dense_all`.
+    // The active-string text branches on `arch_family` so the
+    // Qwen35-specific "ADR-027 Phase B; 3.94×" callout doesn't leak
+    // onto the Gemma 4 banner.
+    let tq_kv_text: &str = if info.tq_kv_active {
+        match info.arch_family {
+            ArchFamily::Qwen35 => "active (8-bit Lloyd-Max + D1 SRHT, ADR-027 Phase B; F32 K/V dropped at alloc — 3.94× per-slot KV savings)",
+            ArchFamily::Gemma4 => "active (8-bit Lloyd-Max + D1 SRHT, ADR-007 Path C; production default; HF2Q_USE_DENSE=1 to opt out)",
+            _ => "active (8-bit Lloyd-Max + D1 SRHT)",
         }
-    )?;
+    } else {
+        "inactive"
+    };
+    writeln!(w, "{d}hf2q load: tq_kv = {}{r}", tq_kv_text)?;
     writeln!(
         w,
         "{d}hf2q load: ready in {:.2} s{r}",

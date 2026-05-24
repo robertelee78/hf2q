@@ -1,9 +1,11 @@
 # ADR-007 follow-up: TQ KV codec behavior on non-DWQ models — investigation findings
 
-**Status:** Investigation complete with measured data. Initial fix
-hypothesis was wrong. Updated root-cause understanding below.
+**Status:** **🎯 CLOSED 2026-05-23 at HEAD d990c817 — Gate H now passes on APEX (cosine_mean 0.999843 vs 0.999 floor; argmax_flip 0.0050 vs 0.015 floor; ppl_delta 0.0015 vs 0.02 floor). The 0.865 cosine_mean documented below is no longer reproducible.** Closure report at `docs/G-tq-shippable-on-non-dwq-goal-closure-2026-05-23.md`. The fix appears to live in the `03328ee5..9e64df5c` prefill-precision arc (NO_FA/FA_F16 defaults) or the `b630062a` Gemma 4 module extraction — both of which landed in the 577-commit window between this ADR (2026-05-16) and closure (2026-05-23). Sub-bullets:
+- The "softmax amplification" hypothesis was independently confirmed at the codec level (K cosine ≈ 0.996 at 4-bit vs Gate H sdpa_out 0.865 — `docs/A-kv-cosine-measurement-2026-05-23.md`), but the proposed FP32-score-promotion fix was falsified by Python simulation: the HB SDPA decode kernel already runs QK^T + softmax + V output in F32. Only Q is stored as half4 in shared memory, and F16-Q error on score is ~1000× smaller than codec-K error, so F32 Q promotion would not have closed the gap.
+- The bug closed via an upstream precision fix (probably in prefill), not a SDPA-side fix.
+- **Load banner fixed in the same session** — `src/serve/api/engine.rs:2360-2375` Gemma 4 path now reads `tq_kv_active` dynamically from `INVESTIGATION_ENV.use_dense` + `layer_policy`; `src/serve/load_info.rs:551-577` made the active string family-aware (Gemma 4 gets "ADR-007 Path C; production default; HF2Q_USE_DENSE=1 to opt out" instead of Qwen35's "ADR-027 Phase B" callout). 22/22 banner + load_info + tq_kv unit tests pass after the change.
 
-**Date:** 2026-05-16
+**Date:** 2026-05-16 (original); **2026-05-23 CLOSED** (Gate H envelope holds at HEAD).
 **Authors:** Robert (operator) + claude-flow (investigation)
 **Related:** ADR-007 (TurboQuant KV cache), commits `a035a2aa` (per-layer
 cosine diag), this session's `HF2Q_DEBUG_TQ_RMS` extended probe.
