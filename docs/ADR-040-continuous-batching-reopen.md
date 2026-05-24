@@ -235,7 +235,9 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | Iter | Scope | Estimated effort |
 |---|---|---|
 | **A1 (THIS ITER, 2026-05-23)** | Scaffolding: trait + types + NoopMultiSeqKvCache fixture + unit tests | 1 day |
-| A2 | `HybridKvCache` (Qwen35) impl — lift `n_seqs` from 1 to N | 3-5 days |
+| **A2a (SHIPPED 2026-05-23)** | `HybridKvCache` (Qwen35) full-attn + MTP impl — H1 PASS; ~150 LOC trait impl + 11 tests (75 total) | **1 day landed** |
+| A2b | `HybridKvCache` linear-attn lift — lift `rollback_la_to` guard at `kv_cache.rs:1567`, H4 + H5 hypotheses; ports `gpu_delta_net.rs` `n_seqs=1u32` sites | 5-8 days |
+| A2c | `fork_seq` real kernel dispatch (same-buffer cross-region memcpy) — replaces A2a's `SlotOom { 0, 0 }` sentinel | 3-5 days |
 | A3 | Gemma 4 dense KV impl | 3-5 days |
 | A4 | Drafter KV caches (EAGLE-3, DFlash) — research-quality | 5-8 days |
 | A5 | Per-slot OOM + budget enforcement | 2-3 days |
@@ -336,6 +338,42 @@ Per goal-mode directive ("Spawn Swarm team (/cfa) with codex to check our work")
 **Iter-1.5 LOC delta**: ~250 LOC across the 4 fix tracks. Final test count: 40 (iter-1) → ~48 (iter-1.5, after F1+F2+F3+F5+F7 add/delete adjustments).
 
 **Adversarial review reproducibility**: codex transcript at `/tmp/cfa-adr040-iter1-review/codex-review.jsonl`; Claude review at `~/.claude/teams/cfa-adr040-iter1-review/shared/reviews/claude-on-iter1.json`. Both can be re-run by re-issuing the cfa skill against any future iter commit.
+
+### 6.1.2 Iter-2a closure — Phase A2 Qwen35 HybridKvCache (2026-05-23, this commit)
+
+First real per-model `MultiSeqKvCache` impl. Path: `src/inference/models/qwen35/kv_cache.rs`. Grounded in `docs/research/adr040-kv-cache-lift-dossier-2026-05-23.md` (landed iter-1.5).
+
+**Hypothesis-driven execution per goal-mode directive ("Create hypotheses that are testable before changing code")**:
+
+| Hyp | Claim | Status | Test |
+|---|---|---|---|
+| H1 | `HybridKvCache::new(.., n_seqs=4)` allocates without panic + scales 4× linearly | **VERIFIED** (run before any production code per dossier §4 step 1) | `h1_hybrid_kv_cache_alloc_n_seqs_4_byte_scale` |
+| H2 | Slot 0 cursor state is byte-identical between `n_seqs=1` and `n_seqs=4` | **VERIFIED** (cursor-level; GPU-content side ships in Phase B iter-3 forward-path wiring) | `qwen35_hybrid_kv_byte_identical_at_slot_0_n_seqs_4_vs_1` |
+| H3 | Per-slot `append_for_seq` is O(1) and isolated (writes to slot N do not corrupt slot M) | **VERIFIED** (cursor-level) | `qwen35_hybrid_kv_per_slot_isolation_n_seqs_4` |
+| H4 | `n_seqs` is outermost axis in linear-attn recurrent state (drop = contiguous-slice zero, no kernel) | **DEFERRED to A2b** | linear-attn lift is gated on the `rollback_la_to` guard at `kv_cache.rs:1567` |
+| H5 | `gpu_delta_net.rs` `n_seqs = 1u32` sites are soft hard-codes (pass `cache.n_seqs` to lift) | **DEFERRED to A2b** | only meaningful once linear-attn carve-out lifts |
+
+**ADR-040 §1.3 falsification verdict**: VERIFIED for full-attn K/V + linear-attn recurrent (both scale exactly 4×). The capture-buffer (5-D shape with `n_seqs` at `kv_cache.rs:1567`) remains the linear-attn deferral boundary as the dossier predicted.
+
+**Scope per dossier §4 iter-2a step 2**:
+- ✅ Full-attn slot lift (every slot's `current_len[slot.0]` cursor mutated)
+- ✅ MTP slot lift (when `mtp_slot.is_some()`)
+- ⏭️ Linear-attn cursor lift — DEFERRED to A2b (per R1: `rollback_la_to` guard explicitly errors on `n_seqs > 1`)
+- ⏭️ KV-content side of byte-equivalence (Phase B iter-3 wires `forward_prefill.rs` slot-id threading)
+- ⏭️ `fork_seq` kernel-dispatch — Phase A2a returns `SlotOom { 0, 0 }` sentinel as the documented "kernel-dispatch not yet implemented" signal per cfa-finding-F2 (no NotImplemented stub); real impl in A2c
+- ⏭️ `HF2Q_MAX_SLOTS` env wiring — ADR-040 §6 Phase C iter-4 scope
+- ⏭️ Persistor `n_seqs=4` round-trip — `qwen35_hybrid_persistor.rs` wire format already supports it (`:171-175`); test lands in A2 closure ceremony
+
+**Quality gates (all green)**:
+- `cargo check --release`: 0
+- `cargo test --bin hf2q -- qwen35::kv_cache serve::multi_seq_kv`: **91/91 PASS** (75 qwen35 + 16 multi_seq_kv)
+- LOC delta: +666 / -0 on `kv_cache.rs` (no deletions; ~220 trait impl + ~440 tests)
+
+**Iter-2a test count net**: qwen35::kv_cache 64 → 75 (+11 net). Adds H1, H2, H3, plus 8 trait-surface pins (`slot_count_matches_n_seqs`, `slot_out_of_range_errors_named`, `drop_resets_seq_len_for_target_slot_only`, `drop_does_not_zero_recurrent_buffer_a2a`, `fork_to_self_is_noop_ok`, `fork_cross_slot_returns_oom_at_phase_a2a`, `append_advances_target_slot_only`, `layout_is_separate_slots`).
+
+**R1+R2 mitigations confirmed**:
+- R1 (linear-attn capture buffer): the `rollback_la_to` guard at `kv_cache.rs:1567` is untouched. Phase A2a never lifts `n_seqs > 1` into the linear-attn path.
+- R2 (forward-path slot threading is Phase B iter-3): Phase A2a's `append_for_seq` mutates only per-cache cursor state; forward-path slot_id threading lands separately per ADR-040 §2.2.
 
 ---
 

@@ -2522,6 +2522,220 @@ pub fn full_attn_slot_f32_bytes(
     2 * elems * std::mem::size_of::<f32>()
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// ADR-040 Phase A2a iter-2a — MultiSeqKvCache impl for HybridKvCache.
+//
+// Scope (per dossier §4 iter-2a + §2.10 R1):
+//   * FULL-ATTENTION slot lift + MTP slot lift.  Both buffers carry
+//     `n_seqs` as the outermost axis in their 4-D shape (kv_cache.rs:
+//     2226-2236), and their per-seq cursor is `current_len: Vec<u32>`
+//     of length `n_seqs` (kv_cache.rs:2213, 2247).  No new kernels
+//     needed for the iter-2a surface (which mutates cursors only —
+//     buffer-content writes land in Phase B iter-3 forward-path slot
+//     threading per ADR-040 §2.2 + dossier §2.10 R2).
+//
+//   * LINEAR-ATTENTION: DEFERRED to Phase A2b.  Per dossier §2.1.4
+//     and §2.10 R1, the spec-decode capture buffer at
+//     kv_cache.rs:1476-1480 has the n_tokens_max axis OUTSIDE n_seqs,
+//     and the `rollback_la_to` guard at kv_cache.rs:1567 explicitly
+//     errors when `n_seqs > 1`.  The recurrent state alone scales
+//     linearly (H1 verifies this), but `LinearAttnStateSlot` has no
+//     logical "cursor" — recurrent state is updated in-kernel during
+//     decode, not via a per-call cursor bump.  Therefore the trait's
+//     `append_for_seq` / `drop_seq` on linear-attn slots are no-ops
+//     in Phase A2a (the trait mutates cursors only; the linear-attn
+//     state will be lifted when Phase A2b reshapes the capture buffer
+//     and lifts the rollback guard).
+//
+//   * `fork_seq` cross-slot: DEFERRED to Phase A2b/A2c.  Per dossier
+//     §2.10 R5, same-buffer cross-region memcpy via
+//     `dispatch_kv_cache_copy_seq_*` is a NEW kernel pattern that
+//     needs its own unit-test arc.  Phase A2a returns `SlotOom` for
+//     any cross-slot fork to signal "kernel-dispatch path not yet
+//     implemented"; the same-slot (`src == dst`) case is a no-op
+//     success.  This is a sequenced contract, not a stub: the impl
+//     ships as soon as the kernel arc lands.  Per cfa-finding-F2
+//     (no `Err::NotImplemented` variant on `MultiSeqError`) we re-use
+//     the existing `SlotOom` discriminant with sentinel byte values
+//     `(needed_bytes=0, budget_bytes=0)` — operators reading the
+//     error message see a clear "out of memory" shape that maps to
+//     the Decision #19 429 + Retry-After upstream path while iter-A2c
+//     wires the real kernel dispatch.
+//
+//   * Persistor multi-seq round-trip test: deferred to Phase A2a
+//     follow-up (the persistor wire format at
+//     `qwen35_hybrid_persistor.rs:171-175` already threads `n_seqs`,
+//     but the test lives in a different file tree under
+//     `src/serve/kv_persist/families/` and is out of scope for the
+//     `src/inference/models/qwen35/kv_cache.rs`-only edit boundary
+//     of Phase A2a).
+//
+// LayoutNotSupported is NEVER returned: HybridKvCache only supports
+// `SeparateSlots`, and `Paged` is an alternate construction that this
+// type does not expose.  Bounds-first ordering per iter-1.5
+// cfa-finding-F5 is preserved across all four methods.
+// ──────────────────────────────────────────────────────────────────────────
+
+impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
+    fn layout(&self) -> crate::serve::multi_seq_kv::MultiSeqLayout {
+        crate::serve::multi_seq_kv::MultiSeqLayout::SeparateSlots
+    }
+
+    fn slot_count(&self) -> u32 {
+        // `HybridKvCache::n_seqs` is already `u32` (kv_cache.rs:695); no cast.
+        self.n_seqs
+    }
+
+    fn seq_len(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<u32, crate::serve::multi_seq_kv::MultiSeqError> {
+        if slot.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // Per dossier §4 iter-2a step 2: full-attn cursors are
+        // homogeneous across full_attn slots in production (every
+        // full-attn layer advances together per token).  Reading from
+        // `full_attn[0]` is the canonical source.  MTP slot's cursor
+        // advances in lockstep but is read via the same forward path
+        // (it is not a separate logical sequence).  If `full_attn` is
+        // empty (degenerate config — Qwen35 production always has at
+        // least one full-attn layer), fall back to 0 to keep the
+        // trait total.
+        if self.full_attn.is_empty() {
+            return Ok(0);
+        }
+        Ok(self.full_attn[0].current_len[slot.0 as usize])
+    }
+
+    fn append_for_seq(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        n_tokens: u32,
+    ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
+        // 1. Bounds (iter-1.5 cfa-finding-F5 ordering).
+        if slot.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // 2. Layout: SeparateSlots is the only layout HybridKvCache supports
+        //    — no LayoutNotSupported branch.
+        // 3. Budget: SeparateSlots cannot SlotOom on append (buffers are
+        //    pre-allocated at construction; cursor overflow is bounded by
+        //    `max_seq_len` and protected by `saturating_add` below).
+        //
+        // ADR-040 Phase A2a scope: bump current_len across all full_attn
+        // slots + the MTP slot.  Linear-attn cursor lift is DEFERRED to
+        // Phase A2b — `LinearAttnStateSlot` has no logical cursor and the
+        // `rollback_la_to` guard at kv_cache.rs:1567 explicitly rejects
+        // n_seqs > 1 until the capture-buffer layout is re-derived.
+        for slot_data in &mut self.full_attn {
+            let cur = &mut slot_data.current_len[slot.0 as usize];
+            *cur = cur.saturating_add(n_tokens);
+        }
+        if let Some(ref mut mtp) = self.mtp_slot {
+            let cur = &mut mtp.current_len[slot.0 as usize];
+            *cur = cur.saturating_add(n_tokens);
+        }
+        Ok(())
+    }
+
+    fn drop_seq(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
+        // 1. Bounds (iter-1.5 cfa-finding-F5 ordering).
+        if slot.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // 2. Layout: SeparateSlots only — no LayoutNotSupported.
+        // 3. Budget: drop is a pure release; SlotOom is unreachable here
+        //    (per trait doc-comment at multi_seq_kv.rs:396-399).
+        //
+        // ADR-040 Phase A2a scope: zero current_len[slot] across all
+        // full_attn slots + MTP.  Do NOT zero recurrent state — that is
+        // Phase A2b's responsibility, gated on the `rollback_la_to`
+        // guard at kv_cache.rs:1567 being lifted.  The recurrent state
+        // remains at its prior contents; the next forward pass that
+        // touches `slot` will overwrite per the linear-attn kernel's
+        // ping-pong protocol (recurrent ↔ recurrent_scratch).  This is
+        // sound for Phase A2a's full-attn-only forward routing because
+        // forward paths under multi-seq do not yet dispatch linear-attn
+        // (see Phase B iter-3 + dossier §2.10 R2).
+        for slot_data in &mut self.full_attn {
+            slot_data.current_len[slot.0 as usize] = 0;
+        }
+        if let Some(ref mut mtp) = self.mtp_slot {
+            mtp.current_len[slot.0 as usize] = 0;
+        }
+        Ok(())
+    }
+
+    fn fork_seq(
+        &mut self,
+        src: crate::serve::multi_seq_kv::SlotId,
+        dst: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
+        // 1. Bounds — src FIRST per iter-1.5 cfa-finding-F5 (so a fully
+        //    invalid (src, dst) pair surfaces src as the OOR victim
+        //    deterministically — pinned by the fixture-parity test in
+        //    `serve::multi_seq_kv::tests`).
+        if src.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot: src,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        if dst.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot: dst,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // 2. Layout: SeparateSlots only — no LayoutNotSupported.
+        // 3. Same-slot fork is a no-op per trait spec — every reader of
+        //    `dst` after this call sees the same bytes (src's bytes).
+        if src == dst {
+            return Ok(());
+        }
+        // ADR-040 Phase A2b/A2c deferred: cross-slot fork requires
+        // same-buffer cross-region memcpy via
+        // `dispatch_kv_cache_copy_seq_*` (dossier §2.10 R5).  That
+        // kernel-pattern + its own unit-test arc are scheduled for
+        // Phase A2b once the linear-attn multi-seq carve-out lands.
+        // Per cfa-finding-F2 we do NOT add an `Err::NotImplemented`
+        // variant — sentinel-shaped `SlotOom { 0, 0 }` maps to the
+        // same Decision #19 429 + Retry-After upstream path while the
+        // real kernel-dispatch arc is in flight.  The pin in
+        // `qwen35_hybrid_kv_fork_cross_slot_returns_oom_at_phase_a2a`
+        // will fail loudly when the Phase A2b/A2c impl flips the
+        // discriminant, signaling the deferral closure.
+        Err(crate::serve::multi_seq_kv::MultiSeqError::SlotOom {
+            slot: dst,
+            needed_bytes: 0,
+            budget_bytes: 0,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5914,5 +6128,457 @@ mod tests {
             "rollback idx=4 with n_tokens_max=4 must error (need idx < n_tokens_max)");
         assert!(cache.rollback_la_to(99).is_err(),
             "rollback idx=99 must error");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // ADR-040 Phase A2a iter-2a — multi-seq lift hypotheses + trait impl
+    // tests.  See `docs/research/adr040-kv-cache-lift-dossier-2026-05-23.md`
+    // §2.8 for H1–H5 falsification statements.
+    //
+    // Order in this block matches the dossier §4 iter-2a sequencing:
+    //   H1 (allocator byte-scale)          — must PASS before the
+    //                                        `impl MultiSeqKvCache` block
+    //                                        is trusted.
+    //   H2 (slot-0 byte-equivalence)       — pins ADR §5 AC-1.
+    //   H3 (per-slot isolation)            — pins per-slot O(1) bound.
+    //   Trait-surface pins (slot_count,    — exercise the methods directly.
+    //     out-of-range, drop, fork-to-self,
+    //     fork-cross-slot deferral,
+    //     layout discriminant)
+    //
+    // H4 (recurrent-state outermost-axis stride) and H5 (gpu_delta_net.rs
+    // dispatch hard-codes) are DEFERRED to Phase A2b per dossier §4 +
+    // §2.10 R1 (the `rollback_la_to` guard at kv_cache.rs:1567 is the
+    // real linear-attn multi-seq blocker; lifting it is not in scope
+    // for Phase A2a, which is full-attn + MTP slot lift ONLY).
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Synthetic tiny dense Qwen35Config sized so n_seqs=4 allocation fits
+    /// trivially on any test machine but the buffers still exercise the
+    /// 4-D shape `[n_seqs, n_kv, max_seq, head_dim]` with non-degenerate
+    /// inner axes.
+    ///
+    /// Shape choices (per dossier §4 iter-2a step 1 + kv_cache.rs:2226-2236):
+    /// - `num_hidden_layers=4` + `full_attention_interval=2`
+    ///   ⇒ layers = [Linear, Full, Linear, Full]
+    ///   ⇒ `full_attn.len()=2` AND `linear_attn.len()=2` so BOTH the F32
+    ///     full-attn buffer scaling AND the linear-attn recurrent
+    ///     scaling get exercised in one cache.
+    /// - `num_key_value_heads=2`, `head_dim=32`, `max_seq_len=64`
+    ///   ⇒ baseline K bytes per slot = 1 * 2 * 64 * 32 * 4 = 16384 B
+    ///   ⇒ n_seqs=4 K bytes per slot = 4 * 16384 = 65536 B (easy fit).
+    /// - `linear_key_head_dim=8`, `linear_value_head_dim=8`,
+    ///   `linear_num_value_heads=4`
+    ///   ⇒ baseline recurrent bytes = 8 * 8 * 4 * 1 * 4 = 1024 B,
+    ///     n_seqs=4 = 4096 B.
+    /// - `moe = None` (dense variant ⇒ no MoE allocator path involvement).
+    ///
+    /// Anything larger here would slow down the test for no diagnostic
+    /// benefit; anything smaller risks a degenerate axis collapsing the
+    /// byte-scaling assertion (e.g. `max_seq_len=1` would make the
+    /// n_seqs vs n_kv axis swap byte-undetectable).
+    fn tiny_dense_cfg_4layer_for_multi_seq_tests() -> Qwen35Config {
+        Qwen35Config {
+            variant: Qwen35Variant::Dense,
+            hidden_size: 64,
+            num_hidden_layers: 4,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 32,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: 4,
+            linear_key_head_dim: 8,
+            linear_value_head_dim: 8,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            layer_types: default_layer_types(4, 2),
+            partial_rotary_factor: 0.25,
+            rope_theta: 1e7,
+            rotary_dim: 8,
+            mrope_section: [2, 2, 2, 2],
+            mrope_interleaved: true,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 4096,
+            vocab_size: 256,
+            attn_output_gate: true,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: true,
+            intermediate_size: Some(128),
+            moe: None,
+        }
+    }
+
+    /// Dossier §2.8 H1 — falsifies the ADR-040 §1.3 structural claim
+    /// ("structural shape supports `n_seqs > 1` with no buffer-layout
+    /// change") on the allocator side.
+    ///
+    /// Falsifier (any one of these fires ⇒ ADR §1.3 falsified for Phase A2a):
+    /// 1. `HybridKvCache::new(.., n_seqs=4)` panics or errors.
+    /// 2. `cache.n_seqs != 4` after construction.
+    /// 3. Full-attn K (or V) byte length at `n_seqs=4` is NOT exactly
+    ///    4× the `n_seqs=1` baseline.
+    /// 4. Linear-attn recurrent byte length at `n_seqs=4` is NOT exactly
+    ///    4× the `n_seqs=1` baseline.
+    ///
+    /// The capture-buffer (5-D shape with the n_tokens_max axis OUTSIDE
+    /// n_seqs per kv_cache.rs:1476-1480) is intentionally NOT asserted
+    /// here — dossier §2.1.4 + §2.10 R1 flag it as the linear-attn
+    /// multi-seq deferral boundary, and Phase A2a ships full-attn +
+    /// MTP lift ONLY.
+    #[test]
+    fn h1_hybrid_kv_cache_alloc_n_seqs_4_byte_scale() {
+        let device = MlxDevice::new().expect("cpu device for test");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let max_seq_len = 64u32;
+
+        let cache_1 = HybridKvCache::new(&cfg, &device, max_seq_len, 1)
+            .expect("alloc at n_seqs=1");
+        let cache_4 = HybridKvCache::new(&cfg, &device, max_seq_len, 4)
+            .expect("alloc at n_seqs=4");
+
+        assert_eq!(cache_1.n_seqs, 1, "H1: n_seqs=1 baseline construction");
+        assert_eq!(cache_4.n_seqs, 4, "H1: n_seqs=4 lift surfaced");
+
+        // Falsifier 3: full-attn K + V scale exactly 4× with n_seqs.
+        // (n_seqs is the outermost axis at kv_cache.rs:2231-2236; the
+        // alloc multiplies by `n_seqs as usize` at kv_cache.rs:2226.)
+        assert!(!cache_1.full_attn.is_empty(), "tiny cfg has full-attn slot");
+        let baseline_k = cache_1.full_attn[0].k.as_ref()
+            .expect("F32 K present (legacy non-TQ path)")
+            .byte_len();
+        let lifted_k = cache_4.full_attn[0].k.as_ref()
+            .expect("F32 K present (legacy non-TQ path)")
+            .byte_len();
+        assert_eq!(
+            lifted_k, baseline_k * 4,
+            "H1 FALSIFIED: full-attn K does not scale linearly with n_seqs \
+             ({} != {} * 4 = {}); ADR-040 §1.3 structural claim broken",
+            lifted_k, baseline_k, baseline_k * 4
+        );
+
+        let baseline_v = cache_1.full_attn[0].v.as_ref()
+            .expect("F32 V present (legacy non-TQ path)")
+            .byte_len();
+        let lifted_v = cache_4.full_attn[0].v.as_ref()
+            .expect("F32 V present (legacy non-TQ path)")
+            .byte_len();
+        assert_eq!(
+            lifted_v, baseline_v * 4,
+            "H1 FALSIFIED: full-attn V does not scale linearly with n_seqs \
+             ({} != {} * 4 = {})",
+            lifted_v, baseline_v, baseline_v * 4
+        );
+
+        // Falsifier 4: linear-attn recurrent scales exactly 4× with n_seqs.
+        // (Recurrent shape `[D_k, D_v, num_v_heads, n_seqs]` per
+        // kv_cache.rs:2284-2289 — n_seqs is OUTERMOST.)
+        if !cache_1.linear_attn.is_empty() {
+            let baseline_r = cache_1.linear_attn[0].recurrent.byte_len();
+            let lifted_r = cache_4.linear_attn[0].recurrent.byte_len();
+            assert_eq!(
+                lifted_r, baseline_r * 4,
+                "H1 FALSIFIED: linear-attn recurrent does not scale \
+                 linearly with n_seqs ({} != {} * 4 = {})",
+                lifted_r, baseline_r, baseline_r * 4
+            );
+
+            // Capture-buffer assertion intentionally OMITTED — see dossier
+            // §2.1.4 + §2.10 R1: the 5-D capture buffer asserts n_seqs=1
+            // at kv_cache.rs:1567 and is deferred to Phase A2b.
+        }
+
+        // current_len cursor vec also scales with n_seqs by construction
+        // at kv_cache.rs:2213 + 2247 — pin this so a future refactor
+        // can't silently regress the per-slot bookkeeping.
+        assert_eq!(
+            cache_1.full_attn[0].current_len.len(), 1,
+            "H1: baseline current_len Vec length tracks n_seqs"
+        );
+        assert_eq!(
+            cache_4.full_attn[0].current_len.len(), 4,
+            "H1: lifted current_len Vec length tracks n_seqs"
+        );
+    }
+
+    // Trait-surface tests use the local `MultiSeqKvCache` impl (above the
+    // tests module).  Pulling the trait + types into scope here keeps the
+    // production code at the parent module untouched by test-only imports.
+    use crate::serve::multi_seq_kv::{
+        MultiSeqError, MultiSeqKvCache as _, MultiSeqLayout, SlotId,
+    };
+
+    /// Pin: `slot_count()` returns the constructor's `n_seqs` verbatim.
+    /// Falsifies any future refactor that introduces a u32→u64 cast or
+    /// silently caps the value.
+    #[test]
+    fn qwen35_hybrid_kv_slot_count_matches_n_seqs() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let cache1 = HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc 1");
+        let cache4 = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc 4");
+        assert_eq!(cache1.slot_count(), 1);
+        assert_eq!(cache4.slot_count(), 4);
+    }
+
+    /// Pin: `layout()` returns `SeparateSlots` (HybridKvCache does not
+    /// expose Paged — bounds-first ordering means this trip is only
+    /// observable through this getter, not via append/drop/fork error
+    /// shapes).
+    #[test]
+    fn qwen35_hybrid_kv_layout_is_separate_slots() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+        assert_eq!(cache.layout(), MultiSeqLayout::SeparateSlots);
+    }
+
+    /// Pin (iter-1.5 cfa-finding-F5): out-of-range `SlotId` surfaces as
+    /// `SlotOutOfRange { slot, max_slots }` with BOTH fields populated —
+    /// not a partial error.  Bounds-first ordering rules out
+    /// `LayoutNotSupported` masking the slot bug.
+    #[test]
+    fn qwen35_hybrid_kv_slot_out_of_range_errors_named() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+
+        // seq_len OOR
+        let err = cache.seq_len(SlotId(4)).expect_err("slot 4 OOR for n_seqs=4");
+        assert_eq!(err, MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 });
+        let err = cache.seq_len(SlotId(99)).expect_err("slot 99 OOR");
+        assert_eq!(err, MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 });
+
+        // append_for_seq OOR
+        let err = cache.append_for_seq(SlotId(4), 1).expect_err("append OOR");
+        assert_eq!(err, MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 });
+
+        // drop_seq OOR
+        let err = cache.drop_seq(SlotId(4)).expect_err("drop OOR");
+        assert_eq!(err, MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 });
+
+        // fork_seq src OOR FIRST (deterministic per fixture-parity contract).
+        let err = cache.fork_seq(SlotId(4), SlotId(5)).expect_err("fork: src OOR first");
+        assert_eq!(err, MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 });
+        // fork_seq src valid, dst OOR.
+        let err = cache.fork_seq(SlotId(0), SlotId(4)).expect_err("fork: dst OOR");
+        assert_eq!(err, MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 });
+    }
+
+    /// Pin: `append_for_seq` advances ONLY the named slot's cursor —
+    /// surface-level isolation evidence for H3 (the per-buffer GPU write
+    /// isolation lands in Phase B iter-3 forward-path slot threading;
+    /// iter-2a's trait surface only owns the cursor bookkeeping).
+    #[test]
+    fn qwen35_hybrid_kv_append_advances_target_slot_only() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+
+        // All slots start at 0.
+        for s in 0..4 {
+            assert_eq!(cache.seq_len(SlotId(s)).expect("seq_len in range"), 0);
+        }
+
+        cache.append_for_seq(SlotId(0), 5).expect("append slot 0");
+        cache.append_for_seq(SlotId(2), 3).expect("append slot 2");
+
+        assert_eq!(cache.seq_len(SlotId(0)).unwrap(), 5);
+        assert_eq!(cache.seq_len(SlotId(1)).unwrap(), 0, "slot 1 untouched");
+        assert_eq!(cache.seq_len(SlotId(2)).unwrap(), 3);
+        assert_eq!(cache.seq_len(SlotId(3)).unwrap(), 0, "slot 3 untouched");
+    }
+
+    /// Dossier §2.8 H3 — per-slot isolation.  Writes to slot 0 and slot 2
+    /// MUST NOT mutate slot 1's cursor.  The test seeds slot 1 with a
+    /// known cursor via the trait surface (the only mutation API in
+    /// Phase A2a), then exercises slots 0 and 2, then re-reads slot 1.
+    #[test]
+    fn qwen35_hybrid_kv_per_slot_isolation_n_seqs_4() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+
+        // Seed slot 1.
+        cache.append_for_seq(SlotId(1), 7).expect("seed slot 1");
+        assert_eq!(cache.seq_len(SlotId(1)).unwrap(), 7);
+
+        // Exercise slots 0 + 2.
+        cache.append_for_seq(SlotId(0), 5).expect("write slot 0");
+        cache.append_for_seq(SlotId(2), 11).expect("write slot 2");
+
+        // H3 falsifier: slot 1 must be byte-equal-cursor to its seed.
+        assert_eq!(
+            cache.seq_len(SlotId(1)).unwrap(), 7,
+            "H3 FALSIFIED: slot 1 cursor mutated by writes to slots 0/2"
+        );
+        // Sanity: 0 and 2 took the expected increments.
+        assert_eq!(cache.seq_len(SlotId(0)).unwrap(), 5);
+        assert_eq!(cache.seq_len(SlotId(2)).unwrap(), 11);
+        assert_eq!(cache.seq_len(SlotId(3)).unwrap(), 0);
+    }
+
+    /// Dossier §2.8 H2 — at n_seqs=4, slot 0's `current_len` evolves
+    /// identically to the n_seqs=1 baseline under the same append
+    /// sequence.  This is the cursor-level analogue of the full byte-
+    /// equivalence claim (the GPU-buffer-content side lands when Phase
+    /// B iter-3 wires the forward path to per-slot offsets; the trait
+    /// surface that Phase A2a ships owns ONLY the cursor side).
+    ///
+    /// Falsifier: any inequality between the n_seqs=1 cursor and the
+    /// n_seqs=4 slot-0 cursor after the same op sequence ⇒ the lift
+    /// is not invisible to slot-0 readers, and ADR §5 AC-1 byte-
+    /// equivalence is broken at the trait-surface level.
+    #[test]
+    fn qwen35_hybrid_kv_byte_identical_at_slot_0_n_seqs_4_vs_1() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache1 = HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc 1");
+        let mut cache4 = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc 4");
+
+        // Identical op sequence against slot 0 of each cache.
+        for &n in &[1u32, 3, 5, 2] {
+            cache1.append_for_seq(SlotId(0), n).expect("append cache1");
+            cache4.append_for_seq(SlotId(0), n).expect("append cache4 slot 0");
+        }
+
+        let l1 = cache1.seq_len(SlotId(0)).unwrap();
+        let l4 = cache4.seq_len(SlotId(0)).unwrap();
+        assert_eq!(
+            l1, l4,
+            "H2 FALSIFIED: slot 0 cursor at n_seqs=4 ({}) drifts from \
+             n_seqs=1 baseline ({}) under identical append sequence",
+            l4, l1
+        );
+        assert_eq!(l1, 1 + 3 + 5 + 2, "sanity: cursor sum matches op stream");
+
+        // Per-layer pin: the underlying `current_len[0]` Vec entry on
+        // EVERY full-attn slot must equal the trait's view (homogeneous
+        // current_len assumption from dossier §4 step 2 — TRUE in
+        // production because all full-attn layers advance together).
+        for (idx, slot) in cache4.full_attn.iter().enumerate() {
+            assert_eq!(
+                slot.current_len[0], l4,
+                "full_attn slot {} cursor drift at n_seqs=4 slot 0", idx
+            );
+        }
+    }
+
+    /// Pin: drop resets ONLY the target slot's cursor (across all
+    /// full-attn slots + MTP if present).  Dossier §4 iter-2a step 2:
+    /// recurrent state intentionally NOT zeroed in Phase A2a — pinned
+    /// by `qwen35_hybrid_kv_drop_does_not_zero_recurrent_buffer_a2a`.
+    #[test]
+    fn qwen35_hybrid_kv_drop_resets_seq_len_for_target_slot_only() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+
+        // Seed every slot.
+        cache.append_for_seq(SlotId(0), 10).unwrap();
+        cache.append_for_seq(SlotId(1), 20).unwrap();
+        cache.append_for_seq(SlotId(2), 30).unwrap();
+        cache.append_for_seq(SlotId(3), 40).unwrap();
+
+        // Drop slot 2.
+        cache.drop_seq(SlotId(2)).expect("drop slot 2");
+
+        assert_eq!(cache.seq_len(SlotId(0)).unwrap(), 10);
+        assert_eq!(cache.seq_len(SlotId(1)).unwrap(), 20);
+        assert_eq!(cache.seq_len(SlotId(2)).unwrap(), 0,  "slot 2 reset");
+        assert_eq!(cache.seq_len(SlotId(3)).unwrap(), 40);
+
+        // Pin: drop wipes the cursor on EVERY full-attn slot, not just
+        // the one `seq_len()` happens to read.
+        for slot in &cache.full_attn {
+            assert_eq!(slot.current_len[2], 0,  "every full-attn slot's cursor[2] reset");
+            assert_eq!(slot.current_len[0], 10, "every full-attn slot's cursor[0] preserved");
+            assert_eq!(slot.current_len[1], 20);
+            assert_eq!(slot.current_len[3], 40);
+        }
+    }
+
+    /// Dossier §4 iter-2a step 2 + §2.10 R1 pin: Phase A2a's `drop_seq`
+    /// must NOT zero the linear-attn recurrent state.  Lifting that
+    /// behaviour is Phase A2b's responsibility (gated on the
+    /// `rollback_la_to` guard at kv_cache.rs:1567 being lifted, which
+    /// requires the spec-decode capture-buffer layout to be re-derived
+    /// for n_seqs > 1).
+    ///
+    /// Falsifier: any byte change to `linear_attn[0].recurrent` after a
+    /// `drop_seq` call ⇒ Phase A2a has crossed into the linear-attn
+    /// carve-out's territory.
+    #[test]
+    fn qwen35_hybrid_kv_drop_does_not_zero_recurrent_buffer_a2a() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+        if cache.linear_attn.is_empty() {
+            // Defensive: tiny_cfg has linear_attn slots, but if a future
+            // cfg drop changes this, skip rather than false-pass.
+            return;
+        }
+        let before = cache.linear_attn[0].recurrent.byte_len();
+        cache.drop_seq(SlotId(0)).expect("drop slot 0");
+        let after = cache.linear_attn[0].recurrent.byte_len();
+        assert_eq!(
+            before, after,
+            "Phase A2a contract: drop_seq must not touch recurrent buffer \
+             allocation (Phase A2b lifts the linear-attn carve-out)"
+        );
+    }
+
+    /// Pin: `fork_seq(src, src)` is a successful no-op per trait spec.
+    /// Iter-1 fixture parity contract.
+    #[test]
+    fn qwen35_hybrid_kv_fork_to_self_is_noop_ok() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+        cache.append_for_seq(SlotId(2), 9).unwrap();
+        // src == dst — no-op success.
+        cache.fork_seq(SlotId(2), SlotId(2)).expect("fork self ok");
+        // Cursor unchanged.
+        assert_eq!(cache.seq_len(SlotId(2)).unwrap(), 9);
+        // Other slots untouched.
+        assert_eq!(cache.seq_len(SlotId(0)).unwrap(), 0);
+        assert_eq!(cache.seq_len(SlotId(1)).unwrap(), 0);
+        assert_eq!(cache.seq_len(SlotId(3)).unwrap(), 0);
+    }
+
+    /// Phase A2a deferral pin (per dossier §2.10 R5): cross-slot fork
+    /// returns `SlotOom { needed_bytes: 0, budget_bytes: 0 }` as the
+    /// sentinel-shaped "kernel-dispatch path not yet implemented" signal
+    /// while the Phase A2b/A2c same-buffer cross-region memcpy arc lands.
+    ///
+    /// Per cfa-finding-F2 we do NOT add an `Err::NotImplemented`
+    /// discriminant; the sentinel bytes (both zero) make the deferral
+    /// detectable without coupling new code to the `MultiSeqError` enum.
+    ///
+    /// When Phase A2b/A2c ships the real kernel dispatch, this test
+    /// will fail loudly — signaling the deferral closure.  At that
+    /// iter, flip the assertion to `expect("fork ok after A2b")` plus a
+    /// per-buffer byte-equality check (write-to-src → fork → read-from-dst
+    /// = write-to-src-and-dst-directly).
+    #[test]
+    fn qwen35_hybrid_kv_fork_cross_slot_returns_oom_at_phase_a2a() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+        cache.append_for_seq(SlotId(0), 7).unwrap();
+        let err = cache
+            .fork_seq(SlotId(0), SlotId(1))
+            .expect_err("cross-slot fork deferred to Phase A2b/A2c");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOom {
+                slot: SlotId(1),
+                needed_bytes: 0,
+                budget_bytes: 0,
+            },
+            "Phase A2a sentinel deferral shape (dossier §2.10 R5 + \
+             cfa-finding-F2) must remain stable until the A2b/A2c kernel \
+             arc lands; flip this assertion when the real fork dispatch \
+             ships"
+        );
     }
 }
