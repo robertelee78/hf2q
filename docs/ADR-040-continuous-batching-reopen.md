@@ -248,7 +248,9 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | A2b | `HybridKvCache` linear-attn lift — lift `rollback_la_to` guard at `kv_cache.rs:1567`, H4 + H5 hypotheses; ports `gpu_delta_net.rs` `n_seqs=1u32` sites | 5-8 days |
 | A2c | `fork_seq` real kernel dispatch (same-buffer cross-region memcpy) — replaces A2a's `SlotOom { 0, 0 }` sentinel | 3-5 days |
 | **A3a (SHIPPED 2026-05-23)** | Gemma 4 `MultiSeqHbKvBuffers` sibling-struct lift + `alloc_hb_kv_for_layer` unified helper + `MultiSeqKvCache` impl — H6+H7+H8 PASS; H9 verified by code-read; H10 FALSIFIED but A3a scope intact; ~700 LOC + 12 new tests (24 total in `gemma4::kv_cache`) | **1 day landed** |
-| A3b | Gemma 4 `MlxKvCache` + `DenseKvBuffers` + `HybridKvBuffers` n_seqs lift — H10 FALSIFIED elevates HybridKvBuffers from "default-off opt-in" to "production default since ADR-029 iter-13" priority | 5-8 days |
+| **A3b iter-1 (SHIPPED 2026-05-24)** | Gemma 4 `HybridKvBuffers` FULL multi-seq lift via sibling `MultiSeqHybridKvBuffers` + `alloc_multi_seq_hybrid_kv_for_layer` helper (production default since ADR-029 iter-13 per H10 falsification) + `MlxKvCache` + `DenseKvBuffers` TYPED CLAMPS (`slot_count() == 1`; slot > 0 → typed `SlotOutOfRange`; in-bounds → `CapabilityUnsupported` naming iter-A3b-2 / iter-A3b-3).  H10/H11/H12/H13/H14/H15/H16 PASS; 35/35 gemma4::kv_cache; 21/21 continuous_batching_throughput preserved.  See §6.1.19. | **1 day landed** |
+| A3b iter-2 | `DenseKvBuffers` full multi-seq lift (~150 LOC) — promotes the clamp from `slot_count() == 1` to N | 3-5 days |
+| A3b iter-3 | `MlxKvCache` full multi-seq lift (~80 LOC) — legacy 4-bit path | 2-3 days |
 | A3c | Gemma 4 `fork_seq` real kernel dispatch (parallel to Qwen35 A2c per dossier §2.3.3 — same `dispatch_kv_cache_copy_seq_*` family serves both arches) | 3-5 days |
 | A4 | Drafter KV caches (EAGLE-3, DFlash) — research-quality | 5-8 days |
 | **A5 (SHIPPED 2026-05-23, SUPERSEDED by A5b)** | Scheduler-side per-slot KV budget primitive — `AdmitError::SlotBudgetExceeded`, `ApiError::slot_budget_exceeded` schema helper, 4 worker_run match arms. End-to-end enforcement was VAPORWARE at iter-A5 per codex review; see A5b. | 1 day landed |
@@ -1610,6 +1612,78 @@ NEITHER test calls `engine.try_admit_budget(...)` directly. The two `a5d_seam_on
 - **Optional codex cleanup (minor)** — make `gemma4_exact_kv_bytes_per_token` compute `nkv` + `hd` from `cfg.num_kv_heads_for_layer(i)` + `cfg.head_dim_for_layer(i)` in release code instead of just `debug_assert_eq`-ing them against a local `match LayerType`. Current behaviour is equivalent (both paths use the same mapping); accepted as a minor wording mismatch for now per codex's own classification.
 
 **Dossier provenance**: No standalone dossier — A5d is closure-iter work on the codex BLOCK verdict on iter-A5c. The path-selection rationale + the handler-vs-seam decomposition are documented inline (above).
+
+---
+
+### 6.1.19 Iter-A3b iter-1 closure — Gemma 4 multi-seq lift for HybridKvBuffers + clamps for DenseKvBuffers/MlxKvCache (2026-05-24, this commit)
+
+**Scope** (per A2/A3 dossier §Gemma 4 KV variants + R3 + H10 falsification):
+
+Gemma 4 has four KV variants; A3a shipped `MultiSeqHbKvBuffers` (sibling for `HbKvBuffers`).  A3b iter-1 closes the remaining three under a graduated-lift strategy that respects the H10 falsification + the R3 R-register clamps mitigation:
+
+| Variant | Production reachability | A3b iter-1 treatment | LOC | Deferral |
+|---|---|---|---|---|
+| `HybridKvBuffers` | **PRODUCTION DEFAULT** since ADR-029 iter-13 (H10 falsified — `HF2Q_HYBRID_KV` default-ON per `investigation_env.rs:878`) | **FULL multi-seq lift** via new sibling struct `MultiSeqHybridKvBuffers` + `alloc_multi_seq_hybrid_kv_for_layer` helper (mirror A3a's pattern verbatim) | ~310 LOC (struct + alloc + 6 trait methods + ByteSized impl) | A3c — `fork_seq` cross-slot kernel dispatch (parallel to Qwen35 A2c per dossier R5) |
+| `DenseKvBuffers` | `HF2Q_USE_DENSE=1` (off-default; dev/debug path) | **TYPED CLAMP**: `slot_count() == 1`; `slot > 0` → `SlotOutOfRange { slot, max_slots: 1 }`; in-bounds append/drop → `CapabilityUnsupported { capability: "DenseKvBuffers::* (full multi-seq lift deferred to ADR-040 Phase A3b iter-2)" }` | ~75 LOC (6 trait methods) | **iter-A3b-2** — full multi-seq lift (~150 LOC) |
+| `MlxKvCache` | Legacy 4-bit path (off-default since ADR-007 default-on TQ 8-bit) | Same TYPED CLAMP shape as `DenseKvBuffers`; `seq_len(SlotId(0))` reports the legacy `self.seq_len as u32` cursor | ~80 LOC (6 trait methods) | **iter-A3b-3** — full multi-seq lift (~80 LOC) |
+
+**Decision matrix — why FULL vs CLAMP for each variant**:
+
+- **HybridKvBuffers gets FULL lift in iter-1** because the H10 falsification reclassifies it as the PRODUCTION DEFAULT (not a deferred opt-in path per the original dossier framing).  Shipping anything less than a full lift here would block C2c (Gemma 4 SlotAware engine arm) on a second iter purely for paperwork.  The sibling-struct pattern from A3a transfers verbatim — ~310 LOC, mirrors `MultiSeqHbKvBuffers` line-for-line.
+- **DenseKvBuffers + MlxKvCache get CLAMPS in iter-1** because both are NON-DEFAULT today; their lifts can ship in dedicated iters without blocking C2c (the SlotAware engine arm will route through `HybridKvBuffers` in production).  Clamps are typed (not vaporware) — every method returns a typed error that names the deferral iter so an operator who flips the env gate gets a grep'able log line, not a silent no-op or panic.  Per ADR-040 §7 "no fallback, no stub", `CapabilityUnsupported` is the iter-2.5 M1-blessed discriminant (HTTP 501 upstream — distinct from `SlotOom`'s HTTP 429).
+
+**Per-file LOC delta** (additive only — production paths UNCHANGED, no existing tests removed):
+
+| File | Pre-iter | Post-iter | Δ |
+|---|---:|---:|---:|
+| `src/inference/models/gemma4/kv_cache.rs` | 1850 | 2818 | +968 |
+
+The +968 LOC splits as: ~470 LOC structural impl (3 struct/trait impls + 1 allocator + 1 ByteSized impl + module-level deferral notes), ~485 LOC test bank (H10-H16 falsifiers + per-clamp regression pins), ~13 LOC ADR-cross-reference comments.
+
+**Test count delta**:
+
+| Test bank | Pre-iter | Post-iter | Δ |
+|---|---:|---:|---:|
+| `inference::models::gemma4::kv_cache` | 28 | 35 | +7 |
+| `tests/continuous_batching_throughput.rs` | 21 | 21 | 0 (preserved) |
+
+The +7 new tests are H10 (post-falsification pin), H11, H12, H13, H14, H15, H16 (see hypothesis register below).
+
+**Hypotheses pinned in this iter** (all PASS; all skip cleanly on no-MlxDevice CI hosts):
+
+- **H10 (post-falsification, defence-in-depth)** — `InvestigationEnv::from_env().hybrid_kv == true` when `HF2Q_HYBRID_KV` is unset.  Falsifier: any regression that flips the default to OFF (e.g. a `env_default_true` → `env_default_false` rename) trips here naming this iter's H10 footnote.
+- **H11 (HybridKvBuffers byte-scale)** — `alloc_multi_seq_hybrid_kv_for_layer(.., n_seqs=4)` produces buffers exactly 4× the n_seqs=1 baseline across K (F16), V packed (U8), V norms (F32); shape proves `n_seqs` is OUTERMOST on every buffer.
+- **H12 (HybridKvBuffers per-slot byte isolation)** — host-side writes to slot 0's K / V packed / V norms regions leave slot 1's bytes byte-identical.  The cursor advance via `append_for_seq(SlotId(0), 3)` produces zero buffer mutation (A3b iter-1 scope is cursor-only).
+- **H13 (HybridKvBuffers cursor independence)** — slot 0 advance + slot 2 advance leaves slots 1/3 cursors at 0; `drop_seq(SlotId(0))` resets slot 0 without touching slot 2.
+- **H14 (HybridKvBuffers optional xlen)** — `HF2Q_DFLASH_XLEN_SDPA=1` causes `bf16_xlen_k/_v` to be `Some(_)` with shape `[n_seqs, nkv, cap, hd]` BF16; unset causes both fields `None`.  U8 V packed + F32 v_norms coexist unchanged in both modes.
+- **H15 (DenseKvBuffers typed clamp)** — `slot_count() == 1`; `slot > 0` returns `SlotOutOfRange`; in-bounds append/drop return `CapabilityUnsupported` naming iter-A3b-2; self-fork at slot 0 is `Ok(())`.
+- **H16 (MlxKvCache typed clamp)** — same shape as H15; `seq_len(SlotId(0))` reports the legacy single-seq cursor; capability label names iter-A3b-3 + "legacy 4-bit".
+
+**Production allocation wiring** (deliberately deferred to C2c — same discipline A3a followed):
+
+The A3b iter-1 sibling-struct ships the lift without touching the 3 production allocation sites (`forward_prefill.rs`, `forward_prefill_batched.rs`, `gemma4/model.rs:1247-1257`) — those keep allocating the legacy 3-D `HybridKvBuffers` / `MlxKvCache` at implicit `n_seqs=1` until Phase B4c / C2c (Gemma 4 SlotAware worker arm) re-routes them through `alloc_multi_seq_hybrid_kv_for_layer`.  This honours brief constraint #8 ("existing single-seq Gemma 4 production path UNCHANGED — additive lift only") + matches A3a's discipline.
+
+**Typed deferrals named (no vaporware)**:
+
+- **iter-A3b-2** — `DenseKvBuffers` full multi-seq lift.  Scope: extend the struct with `n_seqs` + per-seq `seq_lens: Vec<u32>`, lift buffer shapes from `[nkv, cap, hd]` to `[n_seqs, nkv, cap, hd]`, wire `MultiSeqKvCache::{append,drop,seq_len}` against the per-seq cursor.  ~150 LOC est. per dossier §2.2.4.  Production site at `engine.rs:5025` (`request_kv_restore` handler) is the wiring target.
+- **iter-A3b-3** — `MlxKvCache` full multi-seq lift.  Scope: lift `k_packed`/`k_norms`/`v_packed`/`v_norms` shapes + replace `seq_len: usize` + `write_pos: usize` with `Vec<u32>` cursors.  ~80 LOC est. per dossier §2.2.4.  Legacy 4-bit path; production site at `gemma4/model.rs:1277-1290`.
+- **iter-A3c** — `fork_seq` cross-slot kernel dispatch for both `MultiSeqHbKvBuffers` (A3a) and `MultiSeqHybridKvBuffers` (this iter).  Single dispatcher serves both sibling structs per dossier §2.3.3.
+
+**Mantra-alignment audit**:
+
+- ✅ No new `// TODO`, `unimplemented!()`, `todo!()`, `FIXME`.
+- ✅ Every clamp returns a typed error with operator-grep'able context (capability label + deferral iter name).
+- ✅ Per-struct `CapabilityUnsupported` labels mention the deferred iter (`A3b iter-2` / `A3b iter-3`) + the struct name + the legacy-path identifier — same shape as A3a's `gemma4_hb_kv_fork_cross_slot_returns_capability_unsupported` pin.
+- ✅ Bounds-FIRST ordering preserved across all 18 new trait methods (per iter-1.5 cfa-finding-F5).
+- ✅ A5* arc closure (HEAD `17f06a26`) NOT touched — additive impl only; the 4 changed files at session start (engine.rs, load_info.rs, multi_seq_kv.rs, scheduler.rs + 2 tests) are not modified by this iter.
+
+**Verification**:
+
+- `cargo check --release --tests` — clean (only pre-existing dead-code warnings unrelated to this iter).
+- `cargo test --release --bin hf2q -- gemma4::kv_cache --test-threads=1` — **35/35 PASS** (28 pre-existing + 7 new A3b).
+- `cargo test --release --test continuous_batching_throughput` — **21/21 PASS** (preserved).
+
+**Dossier provenance**: A2/A3 dossier §Gemma 4 KV variants table (§2.2.1) + §2.10 R3 risk register + H10 falsification recorded in §A3a closure note (§6.1.11).
 
 ---
 
