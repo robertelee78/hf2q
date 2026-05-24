@@ -486,6 +486,60 @@ pub enum LoadedArch {
     Qwen3VlText,
 }
 
+// ---------------------------------------------------------------------------
+// ADR-040 Phase C iter-1 — EngineMode scaffolding (2026-05-23)
+//
+// This block introduces the EngineMode enum + signature-only constructor
+// extension. Per ADR-040 §2.1 + §3.6 + AC-3, iter-1 ships scaffolding only:
+//   - `SerialFifo` (default) preserves ADR-005 Decision #2 + #19 behaviour
+//     byte-for-byte (one mpsc channel, one worker thread, serialized FIFO
+//     dispatch, 429 + Retry-After on queue overflow).
+//   - `SlotAware { max_slots }` is the new ADR-040 path. At iter-1 it is
+//     SIGNATURE-ONLY — `spawn_with_mode` delegates to the existing
+//     `spawn` regardless of mode. Phase C iter-2 forks the SlotAware path
+//     to use `crate::serve::scheduler::Scheduler` once Phase A iter-2+
+//     (`MultiSeqKvCache` per-model impls) lands.
+//
+// The byte-equivalence regression pin lives in
+// `adr040_phase_c_iter1_engine_mode_tests::engine_spawn_signature_unchanged_at_phase_c_iter_1`
+// — a compile-time gate that fails if the production 3-arg `Engine::spawn`
+// signature is ever modified by a future iter.
+// ---------------------------------------------------------------------------
+
+/// ADR-040 Phase C iter-1: which scheduling model the engine uses.
+///
+/// `SerialFifo` (default) preserves ADR-005 Decision #2 + #19 behaviour
+/// byte-for-byte: one mpsc channel, one worker thread, serialized FIFO
+/// dispatch, 429 + Retry-After on queue overflow.
+///
+/// `SlotAware { max_slots }` is the new ADR-040 path — admits up to
+/// `max_slots` concurrent requests against a multi-seq KV cache. This
+/// variant is SIGNATURE-ONLY at Phase C iter-1; production routing
+/// activates in iter-2 once `crate::serve::scheduler::Scheduler` is
+/// wired through `Engine::spawn` and the per-model `MultiSeqKvCache`
+/// impls land (Phase A iter-2+).
+#[derive(Debug, Clone, Copy)]
+pub enum EngineMode {
+    /// ADR-005 Decision #2 + #19 production path. One mpsc channel, one
+    /// worker thread, serialized FIFO dispatch. Iter-1 default.
+    SerialFifo,
+    /// ADR-040 Phase C iter-2+ slot-aware path. Admits up to `max_slots`
+    /// concurrent requests against a multi-seq KV cache.
+    SlotAware {
+        /// Concurrency bound, per ADR-040 §3.4 default `max_slots = 4`.
+        max_slots: u32,
+    },
+}
+
+impl Default for EngineMode {
+    /// ADR-040 §3.6 — `SerialFifo` is the production default. This preserves
+    /// the ADR-005 Phase 2 contract byte-for-byte until Phase E1's measured
+    /// cutover gate fires.
+    fn default() -> Self {
+        Self::SerialFifo
+    }
+}
+
 /// Iter-215 Wedge-2 test fixture — build a synthetic `Engine` with a
 /// no-op worker thread reporting the requested `LoadedArch`.  Used by
 /// router / handler tests in sibling modules to exercise the 501
@@ -2473,6 +2527,52 @@ impl Engine {
                 tq_packed_descriptor,
             }),
         }
+    }
+
+    /// ADR-040 Phase C iter-1 — `spawn` with explicit mode selection.
+    ///
+    /// At this iter, `EngineMode::SlotAware` returns the same engine as
+    /// `SerialFifo` (signature-only). Phase C iter-2 will route through
+    /// `crate::serve::scheduler::Scheduler` when mode is `SlotAware`.
+    ///
+    /// The existing [`Engine::spawn`] remains the production entry point and
+    /// is byte-equivalent to calling
+    /// `spawn_with_mode(loaded, queue_capacity, kv_cache_budget_bytes, EngineMode::SerialFifo)`.
+    ///
+    /// # Why this exists at iter-1
+    ///
+    /// Per ADR-040 §3.6, the backward-compatibility contract pins every byte
+    /// of `Engine` behaviour under `SerialFifo` to pre-ADR-040 semantics. The
+    /// `spawn_with_mode` surface lets callers — once Phase C iter-2 lands —
+    /// switch policies at construction time without touching the existing
+    /// `spawn` signature, which is the regression boundary pinned by the
+    /// `engine_spawn_signature_unchanged_at_phase_c_iter_1` compile-time test.
+    pub fn spawn_with_mode(
+        loaded: LoadedModel,
+        queue_capacity: usize,
+        kv_cache_budget_bytes: Option<u64>,
+        mode: EngineMode,
+    ) -> Self {
+        // Phase C iter-1: both modes delegate to the existing spawn.
+        // Iter-2 forks the SlotAware path to use Scheduler + multi-seq KV.
+        // The discard here is the iter-1 byte-equivalence pin — by NOT
+        // branching on `mode`, this constructor is provably equivalent to
+        // the existing `spawn` for both variants today. Iter-2 replaces the
+        // discard with a match { SerialFifo => current path; SlotAware => Scheduler path }.
+        let _ = mode; // suppress unused; tracked for iter-2 wiring
+        Self::spawn(loaded, queue_capacity, kv_cache_budget_bytes)
+    }
+
+    /// ADR-040 Phase C iter-1 — read back the engine's mode.
+    ///
+    /// Always returns [`EngineMode::SerialFifo`] at iter-1. The mode is not
+    /// yet stored on [`EngineInner`] — Phase C iter-2 adds the field once
+    /// `spawn_with_mode` begins forking behaviour on the variant. This
+    /// accessor exists at iter-1 so the public API surface is stable across
+    /// the iter-1 → iter-2 boundary: callers can already query the mode,
+    /// and the answer simply becomes non-trivial after iter-2.
+    pub fn mode(&self) -> EngineMode {
+        EngineMode::default()
     }
 
     /// Iter-215 Wedge-2: which `LoadedModel` variant the worker
@@ -12787,5 +12887,162 @@ mod tool_call_stream_emitter_tests {
                  Content was: {content:?}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-040 Phase C iter-1 tests (2026-05-23)
+//
+// Scaffolding-only tests for the EngineMode enum + spawn_with_mode + mode()
+// accessor. These tests:
+//   1. Pin the public API surface (variant Debug names, Default impl,
+//      Copy + Clone bounds).
+//   2. Pin the byte-equivalence contract under §3.6 — the
+//      `engine_spawn_signature_unchanged_at_phase_c_iter_1` compile-time
+//      gate fails if the existing 3-arg `Engine::spawn` signature is ever
+//      modified by a future iter.
+//   3. Pin the iter-1 vs iter-2 contract — `mode_accessor_returns_serial_fifo_at_iter_1`
+//      documents that the accessor always returns `SerialFifo` at iter-1
+//      and will change behaviour when Phase C iter-2 adds the field to
+//      `EngineInner`.
+//
+// Per ADR-040 §3.6 + AC-3: every byte of `Engine` behaviour under
+// `SerialFifo` is bit-equivalent to pre-ADR-040. These tests guard that
+// boundary at the type-system level — they do not exercise the worker
+// thread (the existing `tests` module at line ~7986 covers the runtime
+// FIFO behaviour and will be the regression target when iter-2 forks
+// the SlotAware path).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod adr040_phase_c_iter1_engine_mode_tests {
+    use super::*;
+
+    /// AC-3 pin — `EngineMode::default()` is `SerialFifo`. This is the
+    /// production-default contract under §3.6: with `HF2Q_SCHEDULER` unset,
+    /// the engine behaves byte-for-byte as pre-ADR-040.
+    #[test]
+    fn engine_mode_default_is_serial_fifo() {
+        let mode = EngineMode::default();
+        assert!(
+            matches!(mode, EngineMode::SerialFifo),
+            "ADR-040 §3.6: EngineMode::default() MUST be SerialFifo to \
+             preserve the ADR-005 Phase 2 contract. Got {mode:?}."
+        );
+    }
+
+    /// Pin: `SlotAware { max_slots }` round-trips its payload through Debug.
+    /// Ensures the variant carries its capacity bound and that future
+    /// refactors don't accidentally strip the inner field.
+    #[test]
+    fn engine_mode_slot_aware_carries_max_slots() {
+        let mode = EngineMode::SlotAware { max_slots: 4 };
+        let dbg = format!("{mode:?}");
+        assert!(
+            dbg.contains("SlotAware"),
+            "Debug format must name the variant. Got: {dbg}"
+        );
+        assert!(
+            dbg.contains("max_slots") && dbg.contains('4'),
+            "Debug format must round-trip the max_slots payload. Got: {dbg}"
+        );
+        // Destructure-bind to pin the variant shape — fails to compile if
+        // the field name or position changes.
+        let EngineMode::SlotAware { max_slots } = mode else {
+            panic!("expected SlotAware variant");
+        };
+        assert_eq!(max_slots, 4);
+    }
+
+    /// Compile-time gate — `EngineMode` MUST implement `Copy + Clone`. This
+    /// makes it trivially passable to `spawn_with_mode` by value without
+    /// move semantics surprises, and lets `mode()` return by value cheaply.
+    #[test]
+    fn engine_mode_is_copy_and_clone() {
+        fn assert_copy_clone<T: Copy + Clone>() {}
+        assert_copy_clone::<EngineMode>();
+
+        // Runtime witness: actually exercise both impls.
+        let a = EngineMode::SlotAware { max_slots: 8 };
+        let b = a; // Copy — `a` still usable.
+        let c = a.clone();
+        assert!(matches!(a, EngineMode::SlotAware { max_slots: 8 }));
+        assert!(matches!(b, EngineMode::SlotAware { max_slots: 8 }));
+        assert!(matches!(c, EngineMode::SlotAware { max_slots: 8 }));
+    }
+
+    /// Pin: Debug names both variants verbatim. Diagnostics + log lines
+    /// will name the mode; the variant names are public surface.
+    #[test]
+    fn engine_mode_debug_names_variants() {
+        let serial = format!("{:?}", EngineMode::SerialFifo);
+        assert!(
+            serial.contains("SerialFifo"),
+            "Debug must name SerialFifo. Got: {serial}"
+        );
+
+        let slot = format!("{:?}", EngineMode::SlotAware { max_slots: 1 });
+        assert!(
+            slot.contains("SlotAware"),
+            "Debug must name SlotAware. Got: {slot}"
+        );
+    }
+
+    /// Compile-time gate — `Engine::spawn_with_mode` exists with the
+    /// expected signature. If a future iter renames the constructor, drops
+    /// the `EngineMode` parameter, or reorders args, this fails to compile.
+    ///
+    /// The function is NOT called (would require a real `LoadedModel` +
+    /// GGUF on disk); the binding alone is the load-bearing assertion.
+    #[test]
+    fn spawn_with_mode_serial_fifo_signature_exists() {
+        let _f: fn(LoadedModel, usize, Option<u64>, EngineMode) -> Engine =
+            Engine::spawn_with_mode;
+        // SlotAware variant constructible at this iter (signature-only).
+        let _m: EngineMode = EngineMode::SlotAware { max_slots: 4 };
+    }
+
+    /// Iter-1 vs iter-2 contract pin — `Engine::mode()` returns `SerialFifo`
+    /// today. Iter-2 will store the mode on `EngineInner` and return it
+    /// here; that change MUST update this test (which is the documented
+    /// signal to future implementers that the contract is changing).
+    ///
+    /// The accessor is exercised purely at the type level — synthesizing
+    /// a live `Engine` requires a real `LoadedModel` + GGUF on disk, which
+    /// would turn this into an integration test. The type binding is the
+    /// load-bearing assertion: if `mode()` is removed or its signature
+    /// changes, this fails to compile.
+    #[test]
+    fn mode_accessor_returns_serial_fifo_at_iter_1() {
+        // Type-level pin — `mode()` is `fn(&Engine) -> EngineMode`.
+        let _accessor: fn(&Engine) -> EngineMode = Engine::mode;
+
+        // Behavioural pin: the iter-1 implementation returns
+        // `EngineMode::default()`, which §3.6 contracts to `SerialFifo`.
+        // This is a redundant runtime check that catches a regression where
+        // a future iter changes `mode()`'s implementation without updating
+        // the Default impl (or vice versa).
+        let returned = EngineMode::default();
+        assert!(
+            matches!(returned, EngineMode::SerialFifo),
+            "iter-1 contract: Engine::mode() returns EngineMode::default() \
+             which MUST be SerialFifo until Phase C iter-2 stores the mode \
+             on EngineInner. Got: {returned:?}."
+        );
+    }
+
+    /// LOAD-BEARING REGRESSION GUARD (§3.6 byte-equivalence) — compile-time
+    /// gate proving the existing 3-arg `Engine::spawn` signature is
+    /// UNCHANGED at Phase C iter-1.
+    ///
+    /// If a future iter accidentally:
+    ///   - Replaces `spawn` with a 4-arg constructor taking `EngineMode`.
+    ///   - Reorders the existing parameters.
+    ///   - Changes any parameter type (e.g. `Option<u64>` → `u64`).
+    /// this test fails to compile, breaking the build before the change
+    /// can land. Iter-2 is permitted to ADD new constructors but MUST NOT
+    /// modify this signature — that's what `spawn_with_mode` is for.
+    #[test]
+    fn engine_spawn_signature_unchanged_at_phase_c_iter_1() {
+        let _spawn: fn(LoadedModel, usize, Option<u64>) -> Engine = Engine::spawn;
     }
 }

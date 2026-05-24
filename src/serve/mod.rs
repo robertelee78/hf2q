@@ -22,6 +22,15 @@ pub mod kv_persist;
 pub mod load_info;
 #[allow(dead_code)]
 pub mod multi_model;
+// ADR-040 Phase A iter-1 scaffolding — MultiSeqKvCache trait + types.
+// Production callsite activation gated on Phase A iter-2+ per-model impls.
+#[allow(dead_code)]
+pub mod multi_seq_kv;
+// ADR-040 Phase B iter-1 scaffolding — Scheduler trait + FifoSchedulerAdapter +
+// InflightBatchedScheduler signature stub. Production activation gated on
+// Phase B iter-3+ + Phase C iter-2 (Engine wiring).
+#[allow(dead_code)]
+pub mod scheduler;
 pub mod parity_quality;
 #[allow(dead_code)]
 #[allow(dead_code)]
