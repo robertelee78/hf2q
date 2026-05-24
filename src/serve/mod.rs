@@ -5925,6 +5925,7 @@ mod tests {
             kv_cache_budget_bytes: None,
             kv_spill_active: false,
             tq_kv_active: false,
+            kv_bytes_per_token_override: None,
         }
     }
 

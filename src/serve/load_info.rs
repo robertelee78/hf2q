@@ -316,6 +316,32 @@ pub struct LoadInfo {
     /// `tq_packed_descriptor` engine binding (different mechanism;
     /// future iter may unify).
     pub tq_kv_active: bool,
+
+    /// **ADR-040 §3.5 iter-A5c (cfa-A5b CRITICAL #1)** — exact per-token KV
+    /// byte cost when the architecture is heterogeneous in shape across
+    /// layers (e.g. Gemma 4: sliding layers use `num_key_value_heads ×
+    /// head_dim`, full-attention layers use `num_global_key_value_heads
+    /// × global_head_dim`).
+    ///
+    /// When `Some(n)`, [`Self::kv_bytes_per_token`] returns `n` verbatim
+    /// instead of the flattened `n_layers × n_kv_heads × head_dim × 4 × 2`
+    /// scalar formula. When `None`, the flattened formula is used (the
+    /// homogeneous-architecture path: Qwen3.5/3.6 keep one
+    /// `(n_kv_heads, head_dim)` shape across all layers).
+    ///
+    /// Builders populate this with `sum_over_layers(n_kv_heads_l ×
+    /// head_dim_l × dtype_bytes × 2)`, computed against the architecture
+    /// config's per-layer accessors (e.g. for Gemma 4 the configured
+    /// `config.layer_types` + `config.num_kv_heads_for_layer(i)` +
+    /// `config.head_dim_for_layer(i)` at `src/serve/config.rs:346-353`).
+    ///
+    /// Pre-iter-A5c, Gemma 4 flattened to the SLIDING shape (8×256) —
+    /// for canonical 30-layer Gemma 4 27B with 5 full-attn layers
+    /// (2×512) this OVER-counts by ~9% (61_440 vs exact 56_320 elements
+    /// per token) — safe upper bound (false-rejects borderline
+    /// requests) but not the operator-honest exact value the ADR
+    /// promises. iter-A5c closes this gap.
+    pub kv_bytes_per_token_override: Option<u64>,
 }
 
 impl LoadInfo {
@@ -364,7 +390,20 @@ impl LoadInfo {
     /// reachable in production today; using it as the upper bound is
     /// the simplest operator-honest choice that does not require
     /// per-arch math at the engine seam.
+    ///
+    /// # iter-A5c (cfa-A5b CRITICAL #1) — exact per-layer math
+    ///
+    /// For heterogeneous architectures (Gemma 4 sliding vs full layers
+    /// have DIFFERENT `(n_kv_heads, head_dim)` shapes), the loader
+    /// populates [`Self::kv_bytes_per_token_override`] with the EXACT
+    /// per-layer sum and that value short-circuits the scalar formula
+    /// below. Without the override we would over-count canonical Gemma
+    /// 4 27B by ~9% (flattened 30×8×256 vs exact 25×8×256 + 5×2×512)
+    /// — safe upper bound but not operator-honest exact.
     pub fn kv_bytes_per_token(&self) -> u64 {
+        if let Some(exact) = self.kv_bytes_per_token_override {
+            return exact;
+        }
         let n_layers = u64::from(self.n_layers);
         let n_kv = u64::from(self.n_key_value_heads);
         let hd = u64::from(self.head_dim);
@@ -398,6 +437,73 @@ impl LoadInfo {
         let total_tokens = u64::from(prompt_tokens).saturating_add(u64::from(max_tokens));
         total_tokens.saturating_mul(per_token)
     }
+}
+
+/// **ADR-040 §3.5 iter-A5c (cfa-A5b CRITICAL #1)** — exact per-token KV byte
+/// cost for a Gemma 4 config, summed across the heterogeneous per-layer
+/// `(num_kv_heads, head_dim)` shape.
+///
+/// Gemma 4 carries two distinct KV shapes:
+/// - **Sliding** layers: `num_key_value_heads × head_dim` (canonical
+///   27B: 8 × 256).
+/// - **Full**-attention layers: `num_global_key_value_heads ×
+///   global_head_dim` (canonical 27B: 2 × 512).
+///
+/// The flattened scalar formula at [`LoadInfo::kv_bytes_per_token`] uses
+/// only the sliding shape (the values stored on `LoadInfo` today via
+/// `GemmaLoadedModel::build_load_info`), over-counting canonical 30-layer
+/// Gemma 4 27B by ~9% (61_440 vs exact 56_320 elements per token). The
+/// over-count is a SAFE upper bound (false-rejects borderline requests,
+/// never under-counts → no false-accept that would surface as mid-decode
+/// OOM), but ADR-040 §3.5 promises the EXACT per-token cost so the engine
+/// seam admit-time check matches the actual KV allocation shape — that's
+/// what this helper computes from
+/// [`crate::serve::config::Gemma4Config::layer_types`] +
+/// `num_kv_heads_for_layer` + `head_dim_for_layer`.
+///
+/// The dtype used is F32 (4 bytes) for K and V — same conservative dtype
+/// upper bound as the flattened formula, mirroring the rationale at
+/// [`LoadInfo::kv_bytes_per_token`] (`LoadInfo` does not carry per-layer
+/// KV dtype; TQ-packed slots actually use U8 + F32 norms but the F32-
+/// equivalent worst case keeps the engine seam dtype-agnostic and never
+/// false-accepts on a TQ-on load that later drops to F32 for a
+/// non-TQ-eligible layer).
+///
+/// Saturating-arithmetic throughout — see
+/// [`LoadInfo::kv_bytes_for_request`] for the symmetric overflow story.
+pub fn gemma4_exact_kv_bytes_per_token(cfg: &crate::serve::config::Gemma4Config) -> u64 {
+    use crate::serve::config::LayerType;
+    let mut total: u64 = 0;
+    for (i, layer_type) in cfg.layer_types.iter().enumerate() {
+        // Defense-in-depth: the per-layer accessors derive from
+        // `layer_types[i]`, but pinning the branch here keeps the
+        // intent local to this helper.
+        let (nkv, hd) = match layer_type {
+            LayerType::Sliding => (
+                cfg.num_key_value_heads as u64,
+                cfg.head_dim as u64,
+            ),
+            LayerType::Full => (
+                cfg.num_global_key_value_heads as u64,
+                cfg.global_head_dim as u64,
+            ),
+        };
+        // Cross-check against the public per-layer accessors — if the
+        // per-layer accessor ever diverges from the (LayerType ⇒ shape)
+        // mapping above, the debug_assert! catches the drift before it
+        // can corrupt the budget calculation. In release builds the
+        // helper still uses the local mapping (the public accessor IS
+        // the same logic per `src/serve/config.rs:346-353`).
+        debug_assert_eq!(cfg.num_kv_heads_for_layer(i) as u64, nkv,
+            "L{i}: num_kv_heads_for_layer drift vs LayerType mapping");
+        debug_assert_eq!(cfg.head_dim_for_layer(i) as u64, hd,
+            "L{i}: head_dim_for_layer drift vs LayerType mapping");
+        // Per-layer per-token bytes: nkv × hd × 4 (F32) × 2 (K + V).
+        total = total.saturating_add(
+            nkv.saturating_mul(hd).saturating_mul(4).saturating_mul(2),
+        );
+    }
+    total
 }
 
 /// Implemented by each loaded-model variant to produce the shared load
@@ -1299,6 +1405,7 @@ mod tests {
             kv_cache_budget_bytes: Some(4 * 1024 * 1024 * 1024),
             kv_spill_active: false,
             tq_kv_active: false,
+            kv_bytes_per_token_override: None,
         };
 
         let cloned = info.clone();
@@ -1348,6 +1455,7 @@ mod tests {
             kv_cache_budget_bytes: Some(4 * 1024 * 1024 * 1024),
             kv_spill_active: false,
             tq_kv_active: false,
+            kv_bytes_per_token_override: None,
         }
     }
 
@@ -1585,6 +1693,7 @@ mod tests {
             kv_cache_budget_bytes: None,
             kv_spill_active: false,
             tq_kv_active: false,
+            kv_bytes_per_token_override: None,
         };
         assert_eq!(info.arch_family, ArchFamily::Gemma4);
         assert_eq!(info.quant_label, Some("Q6_K".to_string()));
@@ -1760,5 +1869,177 @@ mod tests {
             "saturating-mul must surface u64::MAX (caller's scheduler \
              check rejects as SlotBudgetExceeded)"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADR-040 §3.5 iter-A5c (cfa-A5b CRITICAL #1) — Gemma 4 exact per-layer
+    // KV byte cost: closes the over-count gap codex flagged in iter-A5b.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build a canonical Gemma 4 27B-shape `Gemma4Config`:
+    /// - 30 layers; `(i+1) % 6 == 0` → Full (5 of 30 layers: indices 5, 11,
+    ///   17, 23, 29). Pattern matches `from_config_json` default at
+    ///   `src/serve/config.rs:84-91`.
+    /// - Sliding: 8 KV heads × 256 head_dim.
+    /// - Full: 2 KV heads × 512 head_dim.
+    ///
+    /// These shapes mirror the canonical google/gemma-4-27b-it config —
+    /// per the comment at `src/serve/config.rs:130-145` referencing the
+    /// gguf-dump output of the bundled APEX GGUF.
+    fn canonical_gemma4_27b_config() -> crate::serve::config::Gemma4Config {
+        use crate::serve::config::{Gemma4Config, LayerType};
+        let layer_types: Vec<LayerType> = (0..30)
+            .map(|i| if (i + 1) % 6 == 0 { LayerType::Full } else { LayerType::Sliding })
+            .collect();
+        Gemma4Config {
+            vocab_size: 262_144,
+            hidden_size: 5376,
+            intermediate_size: 21_504,
+            moe_intermediate_size: 0,
+            num_hidden_layers: 30,
+            num_attention_heads: 16,
+            num_key_value_heads: 8,
+            num_global_key_value_heads: 2,
+            head_dim: 256,
+            global_head_dim: 512,
+            rms_norm_eps: 1e-6,
+            rope_theta_sliding: 10_000.0,
+            rope_theta_global: 1_000_000.0,
+            sliding_window: 1024,
+            max_position_embeddings: 131_072,
+            final_logit_softcapping: None,
+            attention_bias: false,
+            attention_k_eq_v: true,
+            tie_word_embeddings: true,
+            num_experts: 0,
+            top_k_experts: 0,
+            layer_types,
+        }
+    }
+
+    /// **CRITICAL #1 GOLDEN** — exact per-layer sum for canonical Gemma 4
+    /// 27B differs from the flattened scalar.
+    ///
+    /// Per-token elements (F32, K+V):
+    /// - 25 sliding layers × 8 KV heads × 256 head_dim × 4 (F32) × 2
+    ///   (K+V) = 409_600 bytes
+    /// - 5 full layers × 2 KV heads × 512 head_dim × 4 × 2 = 40_960 bytes
+    /// - Sum: 450_560 bytes per token.
+    ///
+    /// The flattened scalar (30 × 8 × 256 × 4 × 2 = 491_520 bytes/token)
+    /// OVER-counts by 40_960 bytes (~9%). The over-count is a safe upper
+    /// bound — it false-rejects borderline requests, never false-accepts —
+    /// but iter-A5c ships the exact value so the admit-time check matches
+    /// the actual KV allocation shape at `gemma4/model.rs:1247-1257`.
+    #[test]
+    fn a5c_gemma4_exact_kv_bytes_per_token_matches_per_layer_sum() {
+        let cfg = canonical_gemma4_27b_config();
+        let exact = super::gemma4_exact_kv_bytes_per_token(&cfg);
+        let expected_sliding: u64 = 25 * 8 * 256 * 4 * 2;
+        let expected_full: u64 = 5 * 2 * 512 * 4 * 2;
+        let expected: u64 = expected_sliding + expected_full;
+        assert_eq!(
+            exact, expected,
+            "Gemma 4 27B exact: 25 sliding (8×256) + 5 full (2×512) × 4 × 2 = {expected}",
+        );
+        assert_eq!(exact, 450_560,
+            "Gemma 4 27B canonical per-token bytes = 450 KiB-minus-1");
+    }
+
+    /// **CRITICAL #1 GOLDEN** — when `LoadInfo` carries the override, the
+    /// per-token getter returns the exact value, NOT the over-counted flat
+    /// scalar formula.
+    #[test]
+    fn a5c_load_info_kv_bytes_per_token_uses_override_when_present() {
+        let cfg = canonical_gemma4_27b_config();
+        let exact = super::gemma4_exact_kv_bytes_per_token(&cfg);
+        // Construct a LoadInfo mimicking `GemmaLoadedModel::build_load_info`
+        // shape: stores the SLIDING (n_kv_heads, head_dim) but the
+        // override holds the exact per-layer sum.
+        let info = LoadInfo {
+            model_id: "gemma-4-27b-it-canonical".to_string(),
+            arch_str: "gemma4".to_string(),
+            arch_family: ArchFamily::Gemma4,
+            model_path: PathBuf::from("/canonical/gemma4-27b.gguf"),
+            on_disk_bytes: 0,
+            backend_chip: "test-gpu".to_string(),
+            backend: "mlx-native",
+            n_layers: cfg.num_hidden_layers as u32,
+            hidden_size: cfg.hidden_size as u32,
+            vocab_size: cfg.vocab_size as u32,
+            n_attention_heads: cfg.num_attention_heads as u32,
+            n_key_value_heads: cfg.num_key_value_heads as u32,
+            head_dim: cfg.head_dim as u32,
+            sliding_window: Some(cfg.sliding_window as u32),
+            full_attention_interval: cfg.full_attention_interval(),
+            max_context_length: Some(cfg.max_position_embeddings as u32),
+            moe: None,
+            quant_label: None,
+            quant_bpw: None,
+            tokenizer_source: TokenizerSource::HfTokenizerJson {
+                path: PathBuf::from("/canonical/tokenizer.json"),
+            },
+            eos_token_ids: vec![1, 106],
+            bos_token_id: Some(2),
+            chat_template_source: ChatTemplateSource::GgufEmbedded,
+            provenance: Provenance::External,
+            vision_projector: None,
+            load_wall_clock: Duration::ZERO,
+            resident_weight_bytes: None,
+            kv_cache_budget_bytes: None,
+            kv_spill_active: false,
+            tq_kv_active: false,
+            kv_bytes_per_token_override: Some(exact),
+        };
+        // Override wins over the flattened formula.
+        assert_eq!(info.kv_bytes_per_token(), exact,
+            "kv_bytes_per_token MUST honour the override when present");
+        // Flat formula sanity-check — if the implementation accidentally
+        // ignored the override, this would be the answer it returned, and
+        // it differs from `exact` by exactly the (full - sliding) shape
+        // delta documented in `gemma4_exact_kv_bytes_per_token`.
+        let flat: u64 = 30 * 8 * 256 * 4 * 2;
+        assert_ne!(exact, flat,
+            "exact and flat MUST differ — otherwise the test could pass even \
+             if `kv_bytes_per_token` ignored the override");
+        assert_eq!(flat, 491_520, "canonical flat formula sanity");
+        // Falsifier: if the override were ignored, the getter would
+        // return the flat scalar, which is HIGHER than exact.
+        assert!(info.kv_bytes_per_token() < flat,
+            "exact override MUST be < flattened over-count (proves override \
+             is being honoured; not just a coincidence of identical values)");
+    }
+
+    /// **CRITICAL #1 GOLDEN** — falsifier for the flat path: when override
+    /// is `None`, the homogeneous-arch formula still runs (Qwen3.5/3.6
+    /// behaviour preserved verbatim).
+    #[test]
+    fn a5c_load_info_kv_bytes_per_token_falls_back_to_flat_when_no_override() {
+        let info = golden_qwen35moe_info();
+        assert!(info.kv_bytes_per_token_override.is_none(),
+            "Qwen35 golden fixture MUST NOT carry an override — Qwen35 layers \
+             are homogeneous and the flat formula is exact");
+        let flat: u64 = 64 * 4 * 128 * 4 * 2;
+        assert_eq!(info.kv_bytes_per_token(), flat,
+            "no override ⇒ flat formula path (homogeneous arch)");
+    }
+
+    /// **CRITICAL #1** — symmetric falsifier: a Gemma 4 fixture with the
+    /// override populated MUST return the exact value even when the flat
+    /// formula would return a different number. This guards against a
+    /// future regression where someone removes the override-honouring
+    /// branch in `kv_bytes_per_token`.
+    #[test]
+    fn a5c_load_info_override_distinct_from_flat_falsifies_regression() {
+        let cfg = canonical_gemma4_27b_config();
+        let exact = super::gemma4_exact_kv_bytes_per_token(&cfg);
+        // Synthesize an override-carrying info with a deliberately
+        // distinct exact value to prove the getter doesn't accidentally
+        // run the flat formula.
+        let mut info = golden_qwen35moe_info();
+        info.arch_family = ArchFamily::Gemma4;
+        info.kv_bytes_per_token_override = Some(exact);
+        assert_eq!(info.kv_bytes_per_token(), exact,
+            "override MUST short-circuit the flat formula");
     }
 }

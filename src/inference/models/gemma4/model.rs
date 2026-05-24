@@ -1250,11 +1250,21 @@ impl MlxModelWeights {
             let layer_type = if is_full { LayerType::Full } else { LayerType::Sliding };
 
             // -- KV cache allocation (identical to the old load_from_candle) --
-            let capacity = if is_full {
-                cfg.max_position_embeddings
-            } else {
-                cfg.sliding_window
-            };
+            // ADR-040 §3.5 iter-A5c (cfa-A5b MAJOR #3): route the
+            // per-layer-type → (is_ring, capacity) mapping through the
+            // extracted `layer_type_to_alloc_params` helper so the
+            // iter-A5c regression test can exercise the SAME mapping
+            // production runs. `is_ring` is not consumed by this allocator
+            // (this path constructs the legacy `MlxKvCache` with explicit
+            // `is_sliding: !is_full`), but capacity wiring matches the
+            // helper so a future branch-swap of Full/Sliding in the helper
+            // would also break this production alloc path.
+            let (_is_ring, capacity) = crate::inference::models::gemma4::kv_cache::
+                layer_type_to_alloc_params(
+                    layer_type,
+                    cfg.sliding_window,
+                    cfg.max_position_embeddings,
+                );
             // TurboQuant 4-bit nibble-packed indices + F32 norms (ADR-007 Phase 1.2).
             // D=256: 1 norm per position (norms_per_pos=1).
             // D=512: 2 per-block norms per position (norms_per_pos=2),

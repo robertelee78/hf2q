@@ -7532,6 +7532,7 @@ mod tests {
             kv_cache_budget_bytes: Some(4 * 1024 * 1024 * 1024),
             kv_spill_active: false,
             tq_kv_active: false,
+            kv_bytes_per_token_override: None,
         }
     }
 
@@ -7580,6 +7581,7 @@ mod tests {
             kv_cache_budget_bytes: None,
             kv_spill_active: true,
             tq_kv_active: false,
+            kv_bytes_per_token_override: None,
         }
     }
 

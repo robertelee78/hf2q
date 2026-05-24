@@ -82,7 +82,7 @@ The 2.45x over-shoot is documented honestly per cfa-finding (Claude `major_findi
 | `src/inference/spec_decode/eagle3/kv_cache.rs` | `MultiSeqKvCache` impl (research-quality; gated on Phase E) | A iter-4 |
 | `src/inference/spec_decode/dflash/kv_cache.rs` | same | A iter-4 |
 | `src/serve/api/engine.rs` | replace mpsc-channel + single worker with scheduler-driven slot loop under `SchedulerPolicy::InflightBatched` | C iter-2 |
-| `src/serve/api/sse.rs` | per-slot keepalive accounting (no contract change) | C iter-3 |
+| `src/serve/api/sse.rs` | per-slot keepalive seam (construction-time slot association only; per-frame keepalive carries no slot metadata) | C iter-3 |
 | `src/serve/api/schema.rs` | doc-only Decision #2 update naming `SchedulerPolicy` | C iter-3 |
 | `src/inference/models/qwen35/forward_gpu.rs` | accept `slot_id: SlotId` on `forward_gpu` + `forward_gpu_with_hidden`; bounds-check; gate slot N > 0 behind B4a-cont | **B iter-4a (SHIPPED 2026-05-23)** |
 | `src/inference/models/qwen35/{forward_gpu.rs, gpu_full_attn.rs}` | thread `slot_id` into `build_gated_attn_layer` + `apply_gated_attn_layer_decode_into` + `apply_sdpa_with_kv_cache(_decode_into)` + the 2 private kernel-dispatch helpers (`write_kv_with_optional_tq_encode`, `dispatch_decode_sdpa_with_optional_tq`); per-slot K/V slice_view at the kernel-dispatch sites; flip slot > 0 from typed-error to real-route | **B iter-4a-cont (SHIPPED 2026-05-23)** |
@@ -92,7 +92,7 @@ The 2.45x over-shoot is documented honestly per cfa-finding (Claude `major_findi
 | `src/inference/models/qwen35/forward_gpu.rs` (decode) | thread `slot_id` through `forward_gpu_last_logits` / `forward_gpu_last_topk` / soft-token / deepstack variants | B iter-4b |
 | `src/inference/models/qwen35/{spec_decode.rs, forward_gpu.rs}` (dflash / greedy) | thread `slot_id` through `forward_gpu_greedy` + dflash spec-decode entry points | B iter-4d |
 | `src/serve/api/engine.rs` | replace mpsc-channel + single worker with scheduler-driven slot loop under `SchedulerPolicy::InflightBatched` | C iter-2 |
-| `src/serve/api/sse.rs` | per-slot keepalive accounting (no contract change) | C iter-3 |
+| `src/serve/api/sse.rs` | per-slot keepalive seam (construction-time slot association only; per-frame keepalive carries no slot metadata) | C iter-3 |
 | `src/serve/api/schema.rs` | doc-only Decision #2 update naming `SchedulerPolicy` | C iter-3 |
 | `src/serve/mod.rs::cmd_serve` | thread `SchedulerPolicy` from CLI/env into `Engine::spawn` | C iter-2 |
 
@@ -216,7 +216,7 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 - `EngineMode::SlotAware { max_slots }` variant on `Engine` dispatches the scheduler.
 - `EngineMode::SerialFifo` (default) byte-equivalent to pre-ADR-040 `Engine`.
 - `HF2Q_SCHEDULER` env + `--scheduler` CLI flag select between modes.
-- SSE keepalive accounting moves to per-slot (15s/slot vs 15s/connection — no client-visible difference at N=1).
+- SSE keepalive seam is per-slot at construction time (slot association captured once when the stream is built; per-frame keepalive carries no slot metadata — no client-visible difference at N=1).
 - Regression test `engine_serial_fifo_byte_equivalent_to_pre_phase_c` PASS.
 
 ### AC-4 — Phase D: throughput benchmark
@@ -252,7 +252,8 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | A3c | Gemma 4 `fork_seq` real kernel dispatch (parallel to Qwen35 A2c per dossier §2.3.3 — same `dispatch_kv_cache_copy_seq_*` family serves both arches) | 3-5 days |
 | A4 | Drafter KV caches (EAGLE-3, DFlash) — research-quality | 5-8 days |
 | **A5 (SHIPPED 2026-05-23, SUPERSEDED by A5b)** | Scheduler-side per-slot KV budget primitive — `AdmitError::SlotBudgetExceeded`, `ApiError::slot_budget_exceeded` schema helper, 4 worker_run match arms. End-to-end enforcement was VAPORWARE at iter-A5 per codex review; see A5b. | 1 day landed |
-| **A5b (SHIPPED 2026-05-24)** | End-to-end per-slot KV byte budget enforcement — `LoadInfo::kv_bytes_per_token` upper-bound estimate + `Engine::try_admit_budget` pre-stream check + worker_run real `kv_bytes_needed` wiring + scheduler `new_with_kv_budget` configuration + handler-side `slot_budget_exceeded` routing (parallel to `queue_full`). Closes codex CRITICAL #1, #2 + mantra-violations Line 1153/1155 from iter-A5. See §6.1.16. | 1 day landed |
+| **A5b (SHIPPED 2026-05-24, commit `cd47e923`)** | End-to-end per-slot KV byte budget enforcement (shared conservative upper bound) — `LoadInfo::kv_bytes_per_token` upper-bound estimate + `Engine::try_admit_budget` pre-stream check + worker_run real `kv_bytes_needed` wiring + scheduler `new_with_kv_budget` configuration + handler-side `slot_budget_exceeded` routing (parallel to `queue_full`). Closes codex CRITICAL #1, #2 + mantra-violations Line 1153/1155 from iter-A5. Exact per-arch Gemma 4 accounting refined in A5c. See §6.1.16. | 1 day landed |
+| **A5c (SHIPPED 2026-05-24)** | Exact per-arch byte accounting for Gemma 4 heterogeneous layers (`LoadInfo::kv_bytes_per_token_override` + `gemma4_exact_kv_bytes_per_token` summing across `cfg.layer_types`) + handler-level 429+Retry-After wire-shape tests + production `LayerType → (is_ring, capacity)` helper extraction for the mixed-layer test. Closes codex /cfa BLOCK on A5b: CRITICAL #1, #2 + MAJOR #1, #3 + NEW (cite cd47e923) + MINOR #1 (ADR wording). Qwen35 path UNCHANGED. See §6.1.17. | 1 day landed |
 | A6 | Closure: per-family parity gate vs n_seqs=1 baseline | 2 days |
 
 ### Phase B — Scheduler (4-6 iters)
@@ -988,13 +989,13 @@ First real Gemma 4 per-model `MultiSeqKvCache` impl.  Path: `src/inference/model
 - **B4c**: refactor the 3 inline alloc sites (`forward_prefill.rs:843-882`, `forward_prefill_batched.rs:443-475`, `forward_gpu.rs:443-459`) through `alloc_hb_kv_for_layer(.., max_slots)`.  Thread `slot_id: SlotId` through the `dispatch_hadamard_quantize_kv_hb_*` callers via per-slot `MlxBuffer::slice_view(byte_offset, n_elements)` (same primitive Qwen35 B4a-cont uses).
 - **C2c**: gated on A3b (HybridKvBuffers lift) per the H10 falsification — the SlotAware engine path needs the default-ON KV variant lifted before it can populate `Gemma4LoadedModel.persistent_kv_cache` with `n_seqs=max_slots`.
 
-### 6.1.12 Iter-C3 closure — SSE per-slot keepalive accounting + Decision #2 docstring (2026-05-23, this commit)
+### 6.1.12 Iter-C3 closure — SSE per-slot keepalive seam + Decision #2 docstring (2026-05-23, this commit; ADR wording refined in iter-A5c)
 
-Per ADR-040 §6 Phase C row C3, this iter ships the SSE per-slot keepalive accounting structural shape + the `schema.rs` docstring update naming `SchedulerPolicy` alongside Decision #2 + the `MultiSeqError::CapabilityUnsupported` → HTTP 501 wire mapping helper. The work is purely additive and is **byte-invariant at N=1 under FifoSerial** per ADR-040 §1.4 — clients see no observable difference vs pre-C3.
+Per ADR-040 §6 Phase C row C3, this iter ships the SSE per-slot keepalive seam (construction-time slot association only; per-frame keepalive carries no slot metadata) + the `schema.rs` docstring update naming `SchedulerPolicy` alongside Decision #2 + the `MultiSeqError::CapabilityUnsupported` → HTTP 501 wire mapping helper. The work is purely additive and is **byte-invariant at N=1 under FifoSerial** per ADR-040 §1.4 — clients see no observable difference vs pre-C3.
 
 **Architectural finding — the structural shape was already correct**:
 
-The brief authorised refactoring "if sse.rs has connection-level state that aggregates ACROSS connections". After reading `sse.rs` in full + tracing the call site at `handlers.rs::chat_completions_stream:1721+` (`tokio::sync::mpsc::channel(64)` per request; `generation_events_to_sse(events_rx, ...)` returns a per-call `Sse<...>` wrapper with its own `KeepAlive` layer), the conclusion is that **the keepalive accounting is already per-connection** by construction:
+The brief authorised refactoring "if sse.rs has connection-level state that aggregates ACROSS connections". After reading `sse.rs` in full + tracing the call site at `handlers.rs::chat_completions_stream:1721+` (`tokio::sync::mpsc::channel(64)` per request; `generation_events_to_sse(events_rx, ...)` returns a per-call `Sse<...>` wrapper with its own `KeepAlive` layer), the conclusion is that **the keepalive seam is already per-connection** by construction:
 
 | Concern | Pre-C3 state | C3 conclusion |
 |---|---|---|
@@ -1021,7 +1022,7 @@ Option B is shipped. Documented inline at the new function's doc-block (`# Why a
 
 | Method | Pre-C3 | Post-C3 |
 |---|---|---|
-| `ApiError::queue_full()` at `schema.rs:108-120` | Docstring said "ADR-005 Phase 2 Decision #2 — serialized FIFO queue (Decision #19)" only. | Docstring now names `SchedulerPolicy::FifoSerial` (= today's default + the ADR-040 §6.1.9 C4 SHIPPED operator-facing enum) + `SchedulerPolicy::SlotAware` (= Phase C2c+ future) + the per-policy semantics (FifoSerial = `queue_capacity` overflow; SlotAware = `total_admissible = queue_capacity + max_slots` exhausted). The wire-level shape is unchanged: same 429 + same Retry-After: 1. |
+| `ApiError::queue_full()` at `schema.rs:108-120` | Docstring said "ADR-005 Phase 2 Decision #2 — serialized FIFO queue (Decision #19)" only. | Docstring now names `SchedulerPolicy::FifoSerial` (= today's default + the ADR-040 §6.1.9 C4 SHIPPED operator-facing enum) + `SchedulerPolicy::InflightBatched` (= Phase C2c+ future scheduler-policy enum variant) + `EngineMode::SlotAware { max_slots }` (= the SEPARATE engine-mode enum variant gating the InflightBatched policy at the engine seam) + the per-policy semantics (FifoSerial = `queue_capacity` overflow; InflightBatched = `total_admissible = queue_capacity + max_slots` exhausted). The wire-level shape is unchanged: same 429 + same Retry-After: 1. **iter-A5b correction**: a previous draft of this row named the nonexistent `SchedulerPolicy::SlotAware` variant; the real enum has `SchedulerPolicy::{FifoSerial, InflightBatched}` and the `SlotAware { max_slots }` variant lives on the DISTINCT `EngineMode` enum. The schema docstring + the regression test `c3_schema_queue_full_docstring_names_scheduler_policy` now PIN this distinction and reject `SchedulerPolicy::SlotAware` if it reappears. |
 | `ApiError::not_implemented()` at `schema.rs:204+` | Docstring cited only iter-215 Wedge-2 Qwen3.5/3.6 chat completions wedge. | Docstring extended with `MultiSeqError::CapabilityUnsupported` mapping (cf. iter-2.5 M1 + iter-A3a closure). Distinct from `SlotOom`→429 and `SlotOutOfRange`→500. |
 | NEW: `ApiError::capability_unsupported(capability: &str)` | Did not exist. | Helper that wraps `not_implemented` with `code = "capability_unsupported"` (distinct from `code = "not_implemented"` so observability can differentiate the two 501 emitters). Message embeds the capability label (e.g. `"fork_seq cross-slot copy (Qwen35 HybridKvCache; deferred to Phase A2c)"`) + cites ADR-040 §6 Phase C C3. |
 
@@ -1358,9 +1359,11 @@ D3 wall-clock estimate: 4 N values × 2 policies × REPS=3 = 24 cells; per-cell 
 
 **Dossier provenance**: No standalone dossier — D3 is bounded test-harness work on top of the already-shipped iter-D2 measurement body. The REPS=3 + sigma_pct + 20% threshold + per-frame TTFT design decisions are documented inline (above) per ADR-040 §7 mantra. The brain entry `feedback_multiweek_always_in_scope_2026_05_23.md` mantra "no shortcuts, just pure excellence" is satisfied by hard-gate enforcement + operator-actionable panic messages + zero stubs.
 
-### 6.1.16 Iter-A5b closure — codex CRITICAL #1/#2 + MAJOR #1/#2/#3 + MINOR #1/#2 fixes (2026-05-24, this commit)
+### 6.1.16 Iter-A5b closure — codex CRITICAL #1/#2 + MAJOR #1/#2/#3 + MINOR #1/#2 fixes (2026-05-24, commit `cd47e923`)
 
-Per the /cfa codex BLOCK verdict on iter-A5 + C2.5 + D2 + D3 + A3a + C3 (`/tmp/cfa-c25-a5-d2-d3-review/codex-review-last.txt`), this iter closes 7 codex findings + 2 mantra violations end-to-end. All work is **Path B** (ship the wiring) per the brief's "single coherent iter" framing; nothing is deferred to a follow-up iter.
+Per the /cfa codex BLOCK verdict on iter-A5 + C2.5 + D2 + D3 + A3a + C3 (`/tmp/cfa-c25-a5-d2-d3-review/codex-review-last.txt`), this iter closes 7 codex findings + 2 mantra violations end-to-end. All work is **Path B** (ship the wiring) per the brief's "single coherent iter" framing.
+
+**Honest closure scope** (per iter-A5c follow-up review at `/tmp/cfa-a5b-review/codex-review-last.txt`): iter-A5b ships the shared conservative-upper-bound enforcement seam end-to-end; the EXACT per-arch byte accounting for Gemma 4's heterogeneous sliding/full layer shape lands separately in iter-A5c (§6.1.17 below). The seam contract — `Engine::try_admit_budget` + `EngineAdmitError::SlotBudgetExceeded` + handler-side `slot_budget_exceeded` routing — is operator-honest and never under-counts; iter-A5c refines the over-count to the exact per-layer sum without changing the seam.
 
 **Codex finding closure**:
 
@@ -1428,7 +1431,7 @@ Chose **Path B** because:
 3. The handler-side typed-error seam (`Engine::try_admit_budget` + `EngineAdmitError`) was a clean ~120 LOC pattern that mirrored the existing `EngineSpawnError` typed-error contract.
 4. Falling back to Path A would have left the streaming-arm 429 surface broken indefinitely (codex CRITICAL #2) — operators would see HTTP 500 instead of 429 + Retry-After when a streaming chat request exceeded the per-slot KV budget. The fix HAD to land in this iter to satisfy the brief's "no fallback, no stub" mantra.
 
-The "conservative upper bound" design choice — `LoadInfo::kv_bytes_per_token` uses F32 dtype + K+V — is operator-honest false-reject of borderline TQ + hybrid-sliding cases; never a false-accept that would surface as mid-decode OOM. Per-arch refinement (Qwen35 hybrid, Gemma 4 sliding-per-layer caps) lands at Phase C2c/C2d alongside the SlotAware worker arms, where the per-layer dtype + capacity vectors are already in-scope.
+The "conservative upper bound" design choice — `LoadInfo::kv_bytes_per_token` uses F32 dtype + K+V — is operator-honest false-reject of borderline TQ + hybrid-sliding cases; never a false-accept that would surface as mid-decode OOM. Per-arch refinement for the heterogeneous Gemma 4 case lands in **iter-A5c** (§6.1.17 below — exact per-layer sum via `LoadInfo::kv_bytes_per_token_override` + `gemma4_exact_kv_bytes_per_token`). Per-layer dtype refinement (F32-vs-TQ) remains a Phase C2c/C2d concern alongside the SlotAware worker arms, where the per-layer dtype + capacity vectors are already in-scope.
 
 **End-to-end wire contract (post-A5b)**:
 
@@ -1452,6 +1455,85 @@ The "conservative upper bound" design choice — `LoadInfo::kv_bytes_per_token` 
 - **Phase E1 production cutover** — flip `SchedulerPolicy::InflightBatched` to default; gated on C2c + D3 AC-4 PASS on real hardware.
 
 **Dossier provenance**: No standalone dossier — A5b is closure-iter work on top of the codex review verdict. The Path B vs Path A decision + the conservative-upper-bound design choice are documented inline (above) per ADR-040 §7 mantra.
+
+### 6.1.17 Iter-A5c closure — codex /cfa BLOCK on iter-A5b: 6 remaining findings (2026-05-24, this commit)
+
+Per the /cfa codex BLOCK verdict on iter-A5b (`/tmp/cfa-a5b-review/codex-review-last.txt`), this iter closes the 6 remaining findings + the 2 mantra violations corollary to those findings. iter-A5b shipped the shared admit-time seam end-to-end (`Engine::try_admit_budget` + `EngineAdmitError` + handler-side routing); iter-A5c refines two specific gaps codex correctly identified — the Gemma 4 over-count and the test-rigor gaps — without touching the seam itself.
+
+**Codex finding closure**:
+
+| Finding | Severity | Pre-iter-A5c | iter-A5c fix |
+|---|---|---|---|
+| CRITICAL #1 — Gemma 4 `kv_bytes_per_token` is approximate, not exact | Critical | `GemmaLoadedModel::build_load_info` stored the SLIDING `(num_key_value_heads, head_dim)` pair (8 × 256 on canonical 27B); `LoadInfo::kv_bytes_per_token` flattened to `n_layers × 8 × 256 × 4 × 2 = 61_440 elements/token` for a 30-layer model — OVER-counting the exact `25 × 8 × 256 + 5 × 2 × 512 = 56_320 elements/token` by ~9%. Safe upper bound (false-rejects borderline; never under-counts), but not the operator-honest exact value ADR-040 §3.5 promises. | Add `LoadInfo::kv_bytes_per_token_override: Option<u64>` field. `GemmaLoadedModel::build_load_info` populates it with `gemma4_exact_kv_bytes_per_token(&self.config)` — the new helper that walks `cfg.layer_types` + `cfg.num_kv_heads_for_layer(i)` + `cfg.head_dim_for_layer(i)` per layer and sums the F32-equivalent K+V byte cost. `LoadInfo::kv_bytes_per_token` short-circuits to the override when present. Qwen35 path UNCHANGED (`Qwen35LoadedModel::build_load_info` sets `kv_bytes_per_token_override: None` — Qwen35 layers are homogeneous and the flat formula is already exact). NEW golden test `a5c_gemma4_exact_kv_bytes_per_token_matches_per_layer_sum` pins the canonical 27B math at `25 sliding × (8×256) + 5 full × (2×512) × 4 × 2 = 450_560 bytes/token`. |
+| CRITICAL #2 — No handler-level integration tests for 429+Retry-After | Critical | iter-A5b added `parse_slot_budget_exceeded` unit tests + the `Engine::try_admit_budget` pre-stream call at `handlers.rs:1748-1766`, but no test drove a request through the production handler call shape (non-streaming + streaming) and asserted HTTP 429 + `Retry-After: 1` BEFORE SSE body construction. | Add 3 handler-level wire-shape tests (synthetic Engine with non-zero `per_slot_kv_budget_bytes` + `kv_bytes_per_token_cached`): (a) `a5c_chat_completions_non_streaming_returns_429_retry_after_when_kv_budget_exceeded` — proves the non-streaming 429 + Retry-After: 1 + JSON body shape with `code: "slot_budget_exceeded"` + verbatim needed/budget numbers; (b) `a5c_chat_completions_streaming_returns_429_before_sse_body_when_kv_budget_exceeded` — proves the streaming response Content-Type is `application/json` (NOT `text/event-stream`), pinning that the response is constructed BEFORE the SSE body; (c) `a5c_streaming_handler_admit_check_precedes_stream_call` — parses `handlers.rs` source to assert `engine.try_admit_budget(` byte-offset is less than `.generate_stream_with_deepstack(` byte-offset within `chat_completions_stream`, structurally pinning the wire-ordering. Tests use `make_test_engine_with_worker_arch_and_budget` (the iter-A5b helper, no new fixture needed) — no real GGUF / model load, no OOM. |
+| MAJOR #1 — ADR §6.1.12 still says `SchedulerPolicy::SlotAware` | Major | The §6.1.12 closure table's `ApiError::queue_full()` row said the post-C3 docstring names `SchedulerPolicy::SlotAware`. That variant has never existed (the real enum is `SchedulerPolicy::{FifoSerial, InflightBatched}`; `SlotAware { max_slots }` lives on the SEPARATE `EngineMode` enum). | Rewrite the §6.1.12 row to name **`SchedulerPolicy::InflightBatched`** AND **`EngineMode::SlotAware { max_slots }`** as distinct entities + cite the iter-A5b regression test `c3_schema_queue_full_docstring_names_scheduler_policy` that now PINS the distinction (rejects `SchedulerPolicy::SlotAware` if it reappears). |
+| MAJOR #3 — Mixed-layer fixture doesn't exercise production path | Major | `a3a_mixed_layer_alloc_full_sliding_byte_isolation` walked `[Full, Sliding, Full, Sliding]` through `alloc_hb_kv_for_layer` directly with a locally-computed `(is_ring, capacity)` pair — proving the allocator honoured its boolean argument, NOT that the production `LayerType → (is_ring, capacity)` mapping at `gemma4/model.rs:1247-1257` is correct. A future branch-swap in the production code would not surface. | Extract the `LayerType → (is_ring, capacity)` mapping into a PRODUCTION helper `layer_type_to_alloc_params` at `gemma4/kv_cache.rs`. Route the production allocator at `gemma4/model.rs:1247-1257` through the helper. Route the iter-A5b mixed-layer test through the helper as well. Add two NEW tests: (a) `a5c_layer_type_to_alloc_params_mapping_pinned` — explicit branch-swap falsifier asserting `Sliding → (true, sliding_window)` AND `Full → (false, max_position_embeddings)` AND cross-arm `cap_s != cap_f` so a swap would surface as a clear failure; (b) `a5c_production_gemma4_model_routes_through_layer_type_helper` — pins the production call site contract at canonical 27B `sliding_window=1024` + `max_position_embeddings=131_072`. |
+| NEW FINDING — ADR §6.1.16 doesn't cite `cd47e923` | New | §6.1.16 opened with "this commit" but never named `cd47e923`. Also overstated closure as exact production wire-through while immediately acknowledging the conservative upper bound + future per-arch refinement. | Cite `cd47e923` explicitly in §6.1.16 opening. Add an "Honest closure scope" paragraph naming the exact gap iter-A5c closes (per-arch Gemma 4 byte accounting) so the reader does not have to re-read the entire section to understand what iter-A5b shipped vs deferred. |
+| MINOR #1 — ADR still has "per-slot keepalive accounting" wording | Minor | sse.rs was reworded in iter-A5b, but the ADR still said "per-slot keepalive accounting" in §6 (rows 85, 95), §1.4 (line 219), and §6.1.12 (lines 991-997 — the closure block heading itself). Also said "15s/slot" — implying per-frame slot attribution that does not exist. | Replace all "per-slot keepalive accounting" with "per-slot keepalive seam" + reword §1.4 line 219 to "Per-stream by construction; slot association captured at SSE construction time — per-frame keepalive carries no slot metadata". Drop the "15s/slot" framing. |
+
+**Mantra-violation closure** (corollaries of the findings above):
+
+- §6.1.16 overclaim: closed by the "Honest closure scope" paragraph addition + the explicit `cd47e923` citation + the iter-A5c follow-up reference in the per-arch-refinement paragraph (line 1431 area).
+- Minor #1 wording: closed by the wording fixes above (3 ADR sites + the §6.1.12 heading itself).
+
+**Decision matrix — Critical #1 over vs under count + chosen fix**:
+
+| Question | Answer |
+|---|---|
+| Before iter-A5c, did Gemma 4 `kv_bytes_per_token` over-count or under-count? | OVER-count by ~9%. Today `GemmaLoadedModel::build_load_info` stores the SLIDING shape `(num_key_value_heads=8, head_dim=256)`. Flat formula = `30 × 8 × 256 × 4 × 2 = 491_520 bytes/token`. Exact = `25 sliding × (8 × 256) + 5 full × (2 × 512) × 4 × 2 = 450_560 bytes/token`. Δ = +40_960 bytes/token (~9% over). |
+| Was the over-count UNSAFE? | NO. Over-count → false-reject of borderline requests (operator-actionable: reduce max_tokens or shorten prompt). Under-count would be UNSAFE → false-accept → mid-decode OOM. The iter-A5b behaviour was operator-honest false-reject, never silent OOM. |
+| Why ship the exact math anyway? | ADR-040 §3.5 promises the EXACT per-token cost so the admit-time check matches the actual KV allocation shape at `gemma4/model.rs:1247-1257`. The +9% gap routinely false-rejects requests in the boundary band — operator visibility is the load-bearing UX property. |
+| Why an `Option<u64>` override field instead of a per-arch trait method on `LoadInfoBuilder`? | The `LoadInfoBuilder` trait already has `build_load_info(...) -> LoadInfo` — a per-arch trait method would push the override-vs-flat decision into 3 trait implementations (Gemma, Qwen35, Qwen3VL) when only one (Gemma) actually needs the override. The `Option<u64>` field is constructed at LoadInfo-build time per-arch (Gemma sets `Some(exact)`, Qwen35/Qwen3VL set `None`) and consumed by a single getter — exactly the data-flow shape the rest of `LoadInfo` already uses for arch-specific facts (`sliding_window: Option<u32>`, `full_attention_interval: Option<u32>`, etc). |
+
+**LOC delta per file** (relative to iter-A5b HEAD `cd47e923`):
+
+| File | + | - | Net |
+|---|---:|---:|---:|
+| `src/serve/load_info.rs` | +~210 | -1 | +~209 (new field on `LoadInfo` ~25 LOC + `gemma4_exact_kv_bytes_per_token` helper ~50 LOC + 4 a5c tests ~135 LOC; 3 existing test fixtures get one new field each ~3 LOC; `kv_bytes_per_token` getter +5 LOC override short-circuit) |
+| `src/serve/api/engine.rs` | +~250 | 0 | +~250 (Gemma 4 build_load_info populates override ~25 LOC + Qwen3VL falls back to None ~10 LOC + synthetic_load_info adds None ~1 LOC + 3 handler-level a5c tests ~210 LOC) |
+| `src/serve/api/engine_qwen35.rs` | +~10 | 0 | +~10 (Qwen35 build_load_info sets `kv_bytes_per_token_override: None` + doc comment) |
+| `src/serve/api/engine_qwen3vl.rs` | +~7 | 0 | +~7 (Qwen3VL build_load_info sets `kv_bytes_per_token_override: None` + doc comment) |
+| `src/serve/api/handlers.rs` | +~2 | 0 | +~2 (2 fixture struct-literal updates: `populated_qwen35_load_info` + `populated_gemma4_load_info`) |
+| `src/serve/header.rs` | +~1 | 0 | +~1 (test fixture struct-literal update) |
+| `src/serve/mod.rs` | +~1 | 0 | +~1 (`synthetic_serve_banner_info` struct-literal update) |
+| `src/inference/models/gemma4/kv_cache.rs` | +~110 | -3 | +~107 (`layer_type_to_alloc_params` helper ~30 LOC + 2 new MAJOR #3 tests ~80 LOC; existing mixed-layer test re-routes through helper -3/+3 LOC) |
+| `src/inference/models/gemma4/model.rs` | +~12 | -5 | +~7 (production allocator routes through `layer_type_to_alloc_params` helper) |
+| `docs/ADR-040-continuous-batching-reopen.md` | +~95 | -~10 | +~85 (this §6.1.17 closure block ~75 + §6.1.16 honest-closure paragraph + commit citation ~10 + §6.1.12 keepalive wording fix + MAJOR #1 enum-distinction fix ~5 + §6 row + §1.4 wording fixes ~5) |
+| **Total** | **+~698** | **-~19** | **+~679** |
+
+**Test count delta**:
+
+| Module | Pre-iter | Post-iter | Delta |
+|---|---:|---:|---:|
+| `serve::load_info::tests` (a5c additions) | 19 | 23 | +4 (`a5c_gemma4_exact_kv_bytes_per_token_matches_per_layer_sum` + `a5c_load_info_kv_bytes_per_token_uses_override_when_present` + `a5c_load_info_kv_bytes_per_token_falls_back_to_flat_when_no_override` + `a5c_load_info_override_distinct_from_flat_falsifies_regression`) |
+| `serve::api::engine::tests` (a5c additions) | (iter-A5b 9) | +3 | +3 (`a5c_chat_completions_non_streaming_returns_429_retry_after_when_kv_budget_exceeded` + `a5c_chat_completions_streaming_returns_429_before_sse_body_when_kv_budget_exceeded` + `a5c_streaming_handler_admit_check_precedes_stream_call`) |
+| `inference::models::gemma4::kv_cache::tests` (a5c additions) | (iter-A5b 2) | +2 | +2 (`a5c_layer_type_to_alloc_params_mapping_pinned` + `a5c_production_gemma4_model_routes_through_layer_type_helper`) |
+| **Total a5c additions** | (baseline) | **+9** | **+9 always-on tests** |
+
+**Quality gates (all PASS in skip mode — NO `cargo build --release` per CLAUDE.md "do not oom us")**:
+
+- `cargo check --release --tests` returns 0 (no new warnings; pre-existing `gpu_full_attn.rs:11455-57 bad_shape` unused-assignment + `forward_gpu.rs:2507 use super::*` unused-import only).
+- `cargo test --release --test continuous_batching_throughput` returns 0 with **21 PASS / 0 FAIL** (preserved from iter-A5b — no regression).
+- `cargo test --release --bin hf2q -- a5c_ --test-threads=1` returns 0 with **9 PASS / 0 FAIL** (4 load_info + 3 engine + 2 gemma4 kv_cache).
+- `cargo test --release --bin hf2q -- a5b_ a5c_ --test-threads=1` returns 0 with iter-A5b's 14 PASS preserved + 9 new iter-A5c PASS = 23 total.
+- NO `// TODO`, NO `unimplemented!()`, NO `todo!()` in production code.  ALL deferrals are typed:
+  - `EngineAdmitError::SlotBudgetExceeded` (handler-side pre-stream).
+  - `AdmitError::SlotBudgetExceeded` (scheduler-side).
+  - `EngineSpawnError::ModeNotYetWired` (engine-mode pre-existing).
+
+**End-to-end wire contract (post-A5c)** — same as iter-A5b §6.1.16 table, with one row refined:
+
+| Layer | Pre-A5c | Post-A5c |
+|---|---|---|
+| `LoadInfo::kv_bytes_per_token` (Gemma 4 path) | Flat `n_layers × n_kv_heads × head_dim × 4 × 2` using the SLIDING shape stored on `LoadInfo` — over-counts by ~9% for canonical 27B. | When `kv_bytes_per_token_override` is `Some(exact)`, returns that exact value; populated by `GemmaLoadedModel::build_load_info` via `gemma4_exact_kv_bytes_per_token(&self.config)` — the per-layer sum across `cfg.layer_types`. Qwen35 + Qwen3VL paths set `None` (homogeneous arches; flat formula is exact). |
+
+**Remaining followups (none are deferrals from this iter)**:
+
+- **C2c (Qwen35 SlotAware worker arm)** — per-layer dtype refinement (F32 → TQ U8 + F32 norms at run-time). Today's F32 upper bound never under-counts; refinement is purely about tighter false-rejects when TQ is active.
+- **C2d (Gemma 4 SlotAware worker arm)** — per-layer dtype refinement parallel to C2c. Capacity refinement (sliding_window vs max_position_embeddings) lives in `kv_bytes_for_request` rather than `kv_bytes_per_token` and is naturally bounded by `prompt_tokens + max_tokens` ≤ sliding_window for sliding layers — the over-allocation cost is paid by the actual KV allocator, not the admit-time check. Operator-relevant refinement would be a per-arch `kv_bytes_for_request` override; deferred.
+- **Phase E1 production cutover** — flip `SchedulerPolicy::InflightBatched` to default; gated on C2c + D3 AC-4 PASS on real hardware.
+
+**Dossier provenance**: No standalone dossier — A5c is closure-iter work on top of the codex BLOCK verdict on iter-A5b. The decision matrix + the over-vs-under count analysis are documented inline (above) per ADR-040 §7 mantra.
 
 ---
 

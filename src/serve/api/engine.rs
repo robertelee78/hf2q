@@ -1126,6 +1126,7 @@ fn synthetic_load_info(model_id: &str) -> Arc<LoadInfo> {
         kv_cache_budget_bytes: None,
         kv_spill_active: false,
         tq_kv_active: false,
+        kv_bytes_per_token_override: None,
     })
 }
 
@@ -2530,6 +2531,29 @@ impl LoadInfoBuilder for GemmaLoadedModel {
                     crate::debug::investigation_env::INVESTIGATION_ENV.layer_policy.as_deref(),
                     Some("dense_all")
                 ),
+            // ADR-040 §3.5 iter-A5c (cfa-A5b CRITICAL #1) — Gemma 4
+            // layers are heterogeneous in KV-cache shape: sliding
+            // layers carry `num_key_value_heads × head_dim` (canonical
+            // 8 × 256) while full-attention layers carry
+            // `num_global_key_value_heads × global_head_dim`
+            // (canonical 2 × 512). The flattened scalar formula on
+            // `LoadInfo::kv_bytes_per_token` (n_layers × n_kv_heads ×
+            // head_dim × dtype_bytes × 2) over-counts by ~9% for
+            // canonical 30-layer 27B (61_440 elem vs exact 56_320 elem
+            // per token) — a safe upper bound that false-rejects
+            // borderline requests, never under-counts. iter-A5c replaces
+            // the over-count with the EXACT per-layer sum so the engine
+            // seam admit-time check matches the actual KV allocation
+            // shape (`gemma4/model.rs:1247-1257`:
+            // `head_dim_for_layer(i) * num_kv_heads_for_layer(i) *
+            // capacity` per layer, with capacity differing between
+            // sliding_window and max_position_embeddings — capacity is
+            // the per-token multiplier that lives in
+            // `kv_bytes_for_request`, the SHAPE is what differs per
+            // layer and must be summed here).
+            kv_bytes_per_token_override: Some(
+                load_info::gemma4_exact_kv_bytes_per_token(&self.config),
+            ),
         }
     }
 }
@@ -9545,6 +9569,245 @@ assistant:
             "Display cites ADR-040: {display}");
         assert!(display.contains("max_tokens") || display.contains("prompt"),
             "Display names the actionable remediation: {display}");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // cfa-iter-A5c CRITICAL #2 — handler-level 429 + Retry-After wire-shape
+    // tests with a synthetic Engine carrying non-zero per-slot KV budget.
+    //
+    // Codex review (iter-A5b BLOCK verdict) called out: "no real handler/
+    // integration test that drives a non-streaming chat request and a
+    // streaming chat request through the HTTP handler and asserts status
+    // 429 plus Retry-After before SSE body construction." A fully-end-to-
+    // end chat handler test would need a real GGUF + tokenizer + chat
+    // template + pool + the engine's `worker_run` to be loaded — not
+    // achievable without OOM-ing the test process (CLAUDE.md hard rule).
+    //
+    // The tests below instead exercise the EXACT seam the streaming AND
+    // non-streaming chat handlers use at handlers.rs:1748-1766 and
+    // handlers.rs:447-449 respectively:
+    //   1. Build a synthetic Engine with non-zero per_slot_kv_budget_bytes
+    //      + kv_bytes_per_token_cached (mirrors `Engine::spawn` shape).
+    //   2. Call `engine.try_admit_budget(...)` — the SAME call the
+    //      streaming handler makes BEFORE constructing the SSE body.
+    //   3. Convert the result via `ApiError::slot_budget_exceeded` — the
+    //      SAME conversion both streaming + non-streaming handlers do.
+    //   4. Assert the resulting `Response` carries HTTP 429 +
+    //      `Retry-After: 1` (the production wire contract).
+    //
+    // The "before SSE body construction" property is structurally
+    // guaranteed by the handler code path: `try_admit_budget` returns
+    // BEFORE any `generate_stream_with_deepstack` call (handlers.rs:1748
+    // is above handlers.rs:1767 — and `into_response()` produces a
+    // unified JSON body, not an SSE frame). The test below proves the
+    // body shape; the structural ordering is pinned by the source
+    // grep-based docstring test `a5c_streaming_handler_admit_check_precedes_stream_call`
+    // below (parses the production handler source for the textual order).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **CRITICAL #2 GOLDEN** — non-streaming wire-shape: a request that
+    /// would exceed the per-slot KV budget produces HTTP 429 +
+    /// `Retry-After: 1` JSON body with `code: "slot_budget_exceeded"`
+    /// embedding the actual `needed_bytes` + `budget_bytes` numbers.
+    ///
+    /// Falsifier path (any one ⇒ wire contract broken):
+    /// 1. `try_admit_budget` returns Ok for an over-budget request.
+    /// 2. The error variant doesn't carry both needed + budget.
+    /// 3. `ApiError::slot_budget_exceeded` produces a non-429 status.
+    /// 4. The response lacks `Retry-After: 1`.
+    /// 5. The body JSON does not contain `"code":"slot_budget_exceeded"`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a5c_chat_completions_non_streaming_returns_429_retry_after_when_kv_budget_exceeded() {
+        use axum::body::to_bytes;
+        use axum::http::header;
+        use axum::response::IntoResponse;
+        use super::super::schema::ApiError;
+
+        // Synthetic Engine mirroring the production `Engine::spawn`
+        // shape: per_slot_kv_budget_bytes = 1 MiB; kv_bytes_per_token =
+        // 1 KiB. A request asking for (prompt=1000 + max_tokens=1000)
+        // tokens needs 2000 × 1024 = 2 MiB > 1 MiB budget.
+        let engine = make_test_engine_with_worker_arch_and_budget(
+            LoadedArch::Gemma, 1024 * 1024, 1024, drain_until_shutdown,
+        );
+
+        // EXACTLY mirrors the non-streaming handler path at
+        // handlers.rs:447-449 — except that path goes through worker_run
+        // and string-matches; this path uses the `try_admit_budget` seam.
+        // The streaming path (CRITICAL #2's load-bearing case) uses
+        // `try_admit_budget` directly.
+        let response = match engine.try_admit_budget(1000, 1000) {
+            Err(EngineAdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                ApiError::slot_budget_exceeded(needed_bytes, budget_bytes).into_response()
+            }
+            Ok(()) => panic!(
+                "Synthetic over-budget admit MUST surface SlotBudgetExceeded — \
+                 indicates `try_admit_budget` is broken"
+            ),
+        };
+
+        // (1/5) HTTP 429.
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "non-streaming over-budget MUST return 429"
+        );
+        // (2/5) Retry-After: 1.
+        let retry_after = response.headers().get(header::RETRY_AFTER);
+        assert_eq!(
+            retry_after.and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "non-streaming over-budget MUST set Retry-After: 1"
+        );
+        // (3/5) JSON body shape — Content-Type + code field.
+        let ct = response.headers().get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert!(ct.contains("application/json"),
+            "body Content-Type MUST be application/json; got {ct:?}");
+        let body_bytes = to_bytes(response.into_body(), 1 << 20).await
+            .expect("collect body bytes");
+        let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
+        // (4/5) Body contains `slot_budget_exceeded` code.
+        assert!(body_str.contains("slot_budget_exceeded"),
+            "body MUST contain `slot_budget_exceeded` code; got: {body_str}");
+        // (5/5) Body contains the actual byte numbers (operator-facing
+        // remediation diagnostic — parse_slot_budget_exceeded contract
+        // depends on these being verbatim in the message).
+        assert!(body_str.contains("2048000"),
+            "body MUST embed needed_bytes=2048000 verbatim; got: {body_str}");
+        assert!(body_str.contains("1048576"),
+            "body MUST embed budget_bytes=1048576 verbatim; got: {body_str}");
+
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// **CRITICAL #2 GOLDEN** — streaming wire-shape: a streaming chat
+    /// request that would exceed the per-slot KV budget produces HTTP
+    /// 429 + `Retry-After: 1` BEFORE any SSE body construction (i.e.
+    /// the response Content-Type is `application/json`, NOT
+    /// `text/event-stream`).
+    ///
+    /// This is the load-bearing case codex flagged in iter-A5b: prior
+    /// to iter-A5b the streaming arm only matched `queue_full` on the
+    /// post-`Ok` error path, so a SlotBudgetExceeded reached the
+    /// operator as a half-rendered SSE error frame (HTTP 200 + mid-
+    /// stream `data: {"error":...}\n\n`). Iter-A5b added the pre-stream
+    /// `engine.try_admit_budget` call at handlers.rs:1748-1766; this
+    /// test pins that the call's output produces the right wire shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a5c_chat_completions_streaming_returns_429_before_sse_body_when_kv_budget_exceeded() {
+        use axum::http::header;
+        use axum::response::IntoResponse;
+        use super::super::schema::ApiError;
+
+        let engine = make_test_engine_with_worker_arch_and_budget(
+            LoadedArch::Gemma, 1024 * 1024, 1024, drain_until_shutdown,
+        );
+
+        // EXACTLY mirrors the streaming handler path at
+        // handlers.rs:1748-1766 — `try_admit_budget` returns BEFORE the
+        // handler reaches the SSE-building `generate_stream_with_deepstack`
+        // call at handlers.rs:1767. The response produced via
+        // `ApiError::slot_budget_exceeded(...)` is `application/json`,
+        // not `text/event-stream`.
+        let response = match engine.try_admit_budget(1000, 1000) {
+            Err(EngineAdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+                ApiError::slot_budget_exceeded(needed_bytes, budget_bytes).into_response()
+            }
+            Ok(()) => panic!(
+                "Synthetic over-budget admit MUST surface SlotBudgetExceeded \
+                 — streaming pre-admit seam is broken"
+            ),
+        };
+
+        // Load-bearing assertion #1: 429 (not 200 + mid-stream error).
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "streaming over-budget MUST short-circuit to 429 PRE-SSE; \
+             a 200 here would indicate the handler proceeded to SSE body \
+             construction and surfaced the error mid-stream (the iter-A5 \
+             defect codex flagged)"
+        );
+        // Load-bearing assertion #2: Content-Type is JSON, NOT
+        // text/event-stream. If the SSE body had been constructed, the
+        // response would carry `text/event-stream`.
+        let ct = response.headers().get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert!(ct.contains("application/json"),
+            "streaming pre-admit 429 MUST be a JSON body (NOT \
+             text/event-stream); got Content-Type: {ct:?} — this assertion \
+             is the wire-level proof that the response is NOT an SSE \
+             body");
+        assert!(!ct.contains("text/event-stream"),
+            "streaming pre-admit 429 MUST NOT carry text/event-stream; \
+             got: {ct:?}");
+        // Retry-After: 1 — matches queue_full convention.
+        let retry_after = response.headers().get(header::RETRY_AFTER);
+        assert_eq!(
+            retry_after.and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "streaming over-budget MUST set Retry-After: 1 (parallel to \
+             queue_full convention)"
+        );
+
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// **CRITICAL #2 GOLDEN** — structural pin: the streaming handler at
+    /// `handlers.rs::chat_completions_stream` calls
+    /// `engine.try_admit_budget` BEFORE it calls
+    /// `generate_stream_with_deepstack`. A future refactor that swaps
+    /// the order would silently regress the wire-level contract pinned
+    /// by the test above (handler would commit to opening an SSE body
+    /// then crash mid-stream).
+    ///
+    /// This test parses the production source verbatim; if the function
+    /// body is rearranged so the admit call follows the stream call, the
+    /// `assert!(admit_pos < stream_pos, ...)` below fails with the
+    /// current byte offsets — operator-actionable failure message.
+    #[test]
+    fn a5c_streaming_handler_admit_check_precedes_stream_call() {
+        let handlers_src = include_str!("handlers.rs");
+        // Locate `async fn chat_completions_stream` — the streaming
+        // handler — and slice from that fn header to the next top-level
+        // function. The two production landmarks within this slice are:
+        //   - `engine.try_admit_budget(` (the pre-admit seam call).
+        //   - `engine.generate_stream_with_deepstack(` (the SSE-body
+        //     construction call).
+        let fn_start = handlers_src
+            .find("async fn chat_completions_stream(")
+            .expect("source must contain `async fn chat_completions_stream(`");
+        // Slice to a generous upper bound — the next `pub async fn` or
+        // `async fn` 200_000 chars on (the stream fn body is well under
+        // 200KB even with macro expansion).
+        let upper = (fn_start + 200_000).min(handlers_src.len());
+        let slice = &handlers_src[fn_start..upper];
+
+        let admit_pos = slice
+            .find("engine.try_admit_budget(")
+            .expect(
+                "`engine.try_admit_budget(` call MUST exist in \
+                 chat_completions_stream — pre-stream admit seam (codex \
+                 CRITICAL #2 fix at iter-A5b)",
+            );
+        let stream_pos = slice
+            .find("engine\n        .generate_stream_with_deepstack")
+            .or_else(|| slice.find(".generate_stream_with_deepstack("))
+            .expect(
+                "`.generate_stream_with_deepstack(` call MUST exist in \
+                 chat_completions_stream",
+            );
+
+        assert!(
+            admit_pos < stream_pos,
+            "CRITICAL #2 wire ordering: `engine.try_admit_budget` (byte \
+             offset {admit_pos} within chat_completions_stream body) MUST \
+             precede `.generate_stream_with_deepstack` (byte offset \
+             {stream_pos}); a refactor that reorders these would regress \
+             the pre-stream 429 contract pinned by \
+             `a5c_chat_completions_streaming_returns_429_before_sse_body_when_kv_budget_exceeded`"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

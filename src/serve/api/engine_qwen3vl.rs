@@ -270,6 +270,12 @@ impl LoadInfoBuilder for Qwen3VlTextLoadedModel {
             // (text path forward landed iter-228b without TQ). Always
             // false until a future iter ports ADR-027 to qwen3vl_text.
             tq_kv_active: false,
+            // ADR-040 §3.5 iter-A5c (cfa-A5b CRITICAL #1) — Qwen3-VL
+            // text LM is plain dense GQA with a homogeneous
+            // `(num_key_value_heads, head_dim)` shape across all
+            // layers; the flattened scalar formula is EXACT for this
+            // arch. `None` means "no override".
+            kv_bytes_per_token_override: None,
         }
     }
 }

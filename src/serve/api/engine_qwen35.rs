@@ -818,6 +818,16 @@ impl LoadInfoBuilder for Qwen35LoadedModel {
             // `self.tq_kv_active` was sourced at engine load via
             // `is_tq_active_mode()` (iter-12).
             tq_kv_active: self.tq_kv_active,
+            // ADR-040 §3.5 iter-A5c (cfa-A5b CRITICAL #1) — Qwen3.5/3.6
+            // layers carry a single homogeneous `(num_key_value_heads,
+            // head_dim)` shape across all 64 layers (the only per-layer
+            // variability is the full-attn-interval that switches the
+            // KV-cache LAYOUT — linear vs full — but each layer's
+            // (n_kv_heads, head_dim) pair is constant). The flattened
+            // scalar formula at `LoadInfo::kv_bytes_per_token` is
+            // therefore EXACT for Qwen35; `None` means "no override —
+            // use the flat formula".
+            kv_bytes_per_token_override: None,
         }
     }
 }

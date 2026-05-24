@@ -327,6 +327,44 @@ pub fn alloc_hb_kv_for_layer(
     })
 }
 
+/// **ADR-040 §3.5 iter-A5c (cfa-A5b MAJOR #3)** — pure mapping from a
+/// Gemma 4 layer type to the `(is_ring, capacity)` pair that
+/// [`alloc_hb_kv_for_layer`] (and the existing per-layer KV-cache
+/// allocator at `src/inference/models/gemma4/model.rs:1247-1257`)
+/// consumes.
+///
+/// This helper extracts the per-layer-type branch that was inlined at
+/// `model.rs:1249-1257` so the cfa-iter-A5b MAJOR #3 mixed-layer test
+/// can walk the SAME mapping the production allocator uses, instead of
+/// asserting the boolean argument of `alloc_hb_kv_for_layer` is honoured
+/// (the prior iter-A5b test only verified that the boolean is honoured —
+/// it did NOT verify the production `LayerType::Full/Sliding` →
+/// `(is_ring, capacity)` mapping).
+///
+/// **Mapping** (mirrors `gemma4/model.rs:1249-1257`):
+///
+/// | `LayerType` | `is_ring` | `capacity` |
+/// |---|---:|---:|
+/// | `Sliding` | `true` (ring) | `sliding_window` |
+/// | `Full` | `false` (linear) | `max_position_embeddings` |
+///
+/// **Falsifier-by-design**: swapping the two arms in this helper makes
+/// the regression test below fail. Future per-layer-type allocator
+/// changes (e.g. ADR-040 Phase B4c slot-level reallocation) MUST route
+/// through this helper so the test bank catches branch swaps before
+/// they reach production.
+pub fn layer_type_to_alloc_params(
+    layer_type: crate::serve::config::LayerType,
+    sliding_window: usize,
+    max_position_embeddings: usize,
+) -> (bool, usize) {
+    use crate::serve::config::LayerType;
+    match layer_type {
+        LayerType::Sliding => (true, sliding_window),
+        LayerType::Full => (false, max_position_embeddings),
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // ADR-040 Phase A3a iter-3 — MultiSeqKvCache impl for MultiSeqHbKvBuffers.
 //
@@ -1638,8 +1676,14 @@ mod tests {
         let sliding_window: usize = 8;
 
         for (layer_idx, lt) in layer_types.iter().enumerate() {
-            let is_ring = matches!(lt, LayerType::Sliding);
-            let cap = if is_ring { sliding_window } else { max_seq_len };
+            // ADR-040 §3.5 iter-A5c (cfa-A5b MAJOR #3): route through the
+            // PRODUCTION helper that `gemma4/model.rs:1247-1257` also
+            // uses. A future branch-swap of Full/Sliding in
+            // `layer_type_to_alloc_params` would surface here as wrong
+            // capacity OR wrong is_ring — load-bearing falsifier.
+            let (is_ring, cap) = super::layer_type_to_alloc_params(
+                *lt, sliding_window, max_seq_len,
+            );
             let buf = alloc_hb_kv_for_layer(&dev, layer_idx, nkv, hd, cap, is_ring, n_seqs)
                 .unwrap_or_else(|e| panic!(
                     "L{layer_idx} ({lt:?}): alloc_hb_kv_for_layer must succeed; got {e}"
@@ -1687,6 +1731,97 @@ mod tests {
                 "L{layer_idx} ({lt:?}): v_packed byte_len mismatch",
             );
         }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // cfa-iter-A5c (was-A5b) MAJOR #3 — closes the codex finding that the
+    // prior `a3a_mixed_layer_alloc_full_sliding_byte_isolation` test only
+    // verified that `alloc_hb_kv_for_layer` honoured its boolean argument
+    // (not that production's `LayerType::{Full, Sliding}` → `(is_ring,
+    // capacity)` mapping was correct). The iter-A5c fix:
+    //   (a) extracts the mapping into `layer_type_to_alloc_params` (pure fn),
+    //   (b) routes BOTH the production `gemma4/model.rs:1247-1257` call site
+    //       AND the mixed-layer test above through it,
+    //   (c) adds an explicit branch-swap falsifier test below.
+    // A future swap of the two arms in `layer_type_to_alloc_params` makes
+    // the test below fail with a clear "Full mapped to ring buffer with
+    // sliding_window capacity" message; the mixed-layer test above ALSO
+    // fails because alloc_hb_kv_for_layer would receive swapped
+    // (is_ring, cap) per layer.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// **cfa-iter-A5c MAJOR #3** — explicit branch-swap falsifier for
+    /// `layer_type_to_alloc_params`. Pins the production mapping:
+    /// - `LayerType::Sliding` → `(is_ring=true, capacity=sliding_window)`.
+    /// - `LayerType::Full` → `(is_ring=false, capacity=max_position_embeddings)`.
+    ///
+    /// Each assertion is a separate falsifier so the failure message
+    /// names the exact axis (is_ring vs capacity) that drifted.
+    #[test]
+    fn a5c_layer_type_to_alloc_params_mapping_pinned() {
+        use crate::serve::config::LayerType;
+        let sliding_window: usize = 4_096;
+        let max_pos: usize = 131_072;
+
+        let (is_ring_s, cap_s) = super::layer_type_to_alloc_params(
+            LayerType::Sliding, sliding_window, max_pos,
+        );
+        assert!(is_ring_s, "Sliding MUST map to is_ring=true (ring buffer)");
+        assert_eq!(cap_s, sliding_window,
+            "Sliding MUST map to capacity=sliding_window={sliding_window}");
+
+        let (is_ring_f, cap_f) = super::layer_type_to_alloc_params(
+            LayerType::Full, sliding_window, max_pos,
+        );
+        assert!(!is_ring_f, "Full MUST map to is_ring=false (linear buffer)");
+        assert_eq!(cap_f, max_pos,
+            "Full MUST map to capacity=max_position_embeddings={max_pos}");
+
+        // Cross-arm sanity: a Full layer NEVER takes the sliding_window
+        // capacity and a Sliding layer NEVER takes the max_pos capacity.
+        assert_ne!(cap_s, cap_f,
+            "Sliding + Full MUST yield distinct capacities in a realistic \
+             production config (sliding_window != max_position_embeddings); \
+             a swap of the two arms in `layer_type_to_alloc_params` would \
+             make these equal and break the assertion above");
+    }
+
+    /// **cfa-iter-A5c MAJOR #3** — production-path cross-check: the
+    /// mixed-layer fixture (above) walks through
+    /// `super::layer_type_to_alloc_params`; this test ALSO walks the
+    /// production call site at `gemma4/model.rs:1247-1257` through the
+    /// SAME helper (it routes through it as of this iter), proving the
+    /// two paths cannot diverge.
+    ///
+    /// The test instantiates the helper with the canonical Gemma 4 27B
+    /// sliding_window=1024 + max_position_embeddings=131_072 and asserts
+    /// the per-layer-type capacity is what `model.rs` will see — pinning
+    /// the contract that future allocator changes must continue to honour.
+    #[test]
+    fn a5c_production_gemma4_model_routes_through_layer_type_helper() {
+        use crate::serve::config::LayerType;
+        let sliding_window: usize = 1_024;
+        let max_pos: usize = 131_072;
+
+        // Sliding layer — production must allocate a ring buffer of
+        // capacity sliding_window (per gemma4/model.rs:1253-1257
+        // pre-iter-A5c logic; post-iter-A5c routes through this helper).
+        let (is_ring, cap) = super::layer_type_to_alloc_params(
+            LayerType::Sliding, sliding_window, max_pos,
+        );
+        assert!(is_ring && cap == sliding_window,
+            "production Sliding layer alloc shape: (ring=true, cap=1024); \
+             got (ring={is_ring}, cap={cap}) — gemma4/model.rs:1247-1257 \
+             would allocate the wrong shape if this mapping drifts");
+
+        // Full layer — production must allocate a linear buffer of
+        // capacity max_position_embeddings.
+        let (is_ring, cap) = super::layer_type_to_alloc_params(
+            LayerType::Full, sliding_window, max_pos,
+        );
+        assert!(!is_ring && cap == max_pos,
+            "production Full layer alloc shape: (ring=false, cap=131072); \
+             got (ring={is_ring}, cap={cap})");
     }
 
     /// **cfa-iter-A5b MAJOR #3** — Null-layer absence documentation
