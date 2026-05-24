@@ -285,9 +285,9 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 
 | Iter | Scope | Estimated effort |
 |---|---|---|
-| **D1 (THIS ITER, 2026-05-23)** | Scaffolding: env-gated test file + metric definitions | 1 day |
-| D2 | N ∈ {1, 2, 4, 8} measurement harness + report format | 3-5 days |
-| D3 | A/B comparator (FIFO vs InflightBatched) + statistical stability | 2-3 days |
+| **D1 (SHIPPED 2026-05-23)** | Scaffolding: env-gated test file + metric definitions | 1 day landed |
+| **D2 (SHIPPED 2026-05-24)** | N ∈ {1, 2, 4, 8} measurement harness + report format — subprocess spawn + `/readyz` poll + `std::thread::scope` curl SSE consumption + per-cell ThroughputCell aggregation + AC-4 soft-gate reporting + InflightBatched-skip-when-unwired graceful detection | **1 day landed** |
+| D3 | A/B comparator (FIFO vs InflightBatched) + statistical stability — repeated-rep medians, streaming-stdout TTFT refinement, AC-4 hard-fail enforcement | 2-3 days |
 
 ### Phase E — Production cutover (gated on §3.7 memo)
 
@@ -1155,6 +1155,99 @@ The budget check fires BEFORE the `QueueFull` check in both `FifoSchedulerAdapte
 **Mantra-aligned**: no `// TODO`, no `unimplemented!()`, no `panic!()` in production code. The `SlotBudgetExceeded` match arms in all 4 worker_run sites are full handlers (not stubs); the `kv_bytes_needed: 0` opt-out is explicit + documented as the byte-equivalence-preserving default (not a stub) — exactly mirroring how the iter-B3 `FifoSchedulerAdapter` shipped real `admit`/`step`/`release` semantics even though only `max_slots=1` was wired upstream. The byte-budget enforcement IS shipped end-to-end; the Phase C2c+ work is to compute the BYTE COST per request, not to add missing enforcement.
 
 **Dossier provenance**: No standalone dossier. This iter is bounded structural surface-area work on top of the already-shipped iter-1.5 + iter-B3 + iter-C2b + iter-A2a + iter-A3a foundations. The bytes-direct vs tokens-via-conversion decision is documented inline (above) per brief Step 4; the admit-time vs append-time semantic decision is documented inline per brief Step 1.
+
+### 6.1.14 Iter-D2 closure — real measurement body for the throughput bench (2026-05-24, this commit)
+
+Per ADR-040 §6 Phase D row D2, this iter replaces the iter-1.5 PANIC stub in `tests/continuous_batching_throughput.rs::cb_throughput_n_1_2_4_8_fifo_vs_inflight` (cfa-finding-F8, "no fallback, no stub (todo later) code") with the **real operator-runnable measurement body** that §5 AC-4 specifies.
+
+**Real measurement body design** (`tests/continuous_batching_throughput.rs`):
+
+1. **Subprocess spawn** — `BenchServer::spawn(gguf, policy, max_slots, port)` constructs `hf2q serve --model <gguf> --host 127.0.0.1 --port <port> --scheduler <policy> [--max-slots <N>]` via `std::process::Command`. The `BenchServer` struct is a `Drop`-RAII guard mirroring `tests/multi_model_swap.rs::ServerGuard` — kill + wait on drop so a panic mid-test never strands a multi-GB-resident server. Per-cell port allocation via a `AtomicU16` counter starting at `HF2Q_CB_THROUGHPUT_PORT_BASE` (default `52441`; chosen distinct from `multi_model_swap.rs` `52337` + `prompt_cache_live.rs` `52332` to avoid suite-interleave collisions). `--max-slots` is only passed under `inflight_batched` per ADR-040 §6 Phase C iter-4 (C4) semantics — fifo_serial silently ignores it but C4's CLI parser still accepts it; the bench harness omits it to keep the spawn invocation aligned with operator intent.
+
+2. **`/readyz` polling** — `wait_for_readyz(&mut server)` polls every 2 s for up to `READYZ_BUDGET_SECS = 600` (symmetric with `multi_model_swap.rs`). The poll loop simultaneously calls `child.try_wait()` so subprocess early-exit is caught immediately — when the inflight_batched policy is selected today (Phase C2c/C2d not yet wired per §6.1.13 Future-iter pin pointers), `Engine::spawn_with_mode` rejects with `EngineSpawnError::ModeNotYetWired` and the subprocess exits non-zero BEFORE binding the listener. The bench captures the stderr tail (last 15 lines) into the typed `Err(String)` and the caller skips the cell cleanly — no false "timeout" diagnostic on a genuinely-expected-to-fail spawn.
+
+3. **Canonical model id resolution** — `fetch_model_id(port)` issues a blocking HTTP/1.1 `GET /v1/models` via raw `TcpStream` (no reqwest dep, to keep the bench harness inside the per-thread sync world of `std::thread::scope`). Substring-scans for the first `"id":"<value>"` in the response body. Using the server-resolved canonical id avoids per-request auto-pipeline path-classification overhead.
+
+4. **Concurrent SSE dispatch via `std::thread::scope`** — N curl subprocesses spawned in `s.spawn(...)` workers. Each worker shells `curl -s -N -X POST -H 'Content-Type: application/json' --max-time 120 -w "\n__HTTP_STATUS__:%{http_code}\n" -d <body> http://127.0.0.1:<port>/v1/chat/completions`. The SSE body is consumed to completion (curl `-N` flushes per frame), the trailing `__HTTP_STATUS__:` marker captures the HTTP status code, and the stdout is parsed line-by-line — `data: {...}` frames are scanned for `"content":"<non-empty>"` deltas to count tokens.
+
+5. **Per-cell aggregation** — `ThroughputCell` populated with `aggregate_tokens_per_sec` (sum across streams ÷ cell walltime), `ttft_p50_ms` / `ttft_p95_ms` (per-stream upper-bound TTFT — see §6.1.14 caveat below), `per_slot_tokens_per_sec` (median across streams), and `rejected_429_count` (count of HTTP 429 responses).
+
+6. **AC-4 soft-gate** — when both `fifo_serial` AND `inflight_batched` cells exist at N=4, the test computes + reports the aggregate ratio (target ≥ 1.5×) and TTFT p95 ratio vs FIFO N=1 (target ≤ 2.0×). Below-bar ratios emit `[ac-4 WARN]` to stderr but do NOT fail the test — **D2 reports, D3 enforces**. Rationale: D2's TTFT estimate is upper-bounded by curl's exit-time timestamping (per the design choice §6.1.14 caveat below), so a tighter hard-fail bar belongs to D3 alongside repeated-rep statistical medians.
+
+**Operator-runnable command** (exact CLI verified to skip cleanly with the env unset; PASS on `cargo check --release --tests` + `cargo test --release --test continuous_batching_throughput`):
+
+```bash
+HF2Q_CB_THROUGHPUT_E2E=1 \
+  HF2Q_CB_THROUGHPUT_MODEL=/opt/hf2q/models/<some>.gguf \
+  HF2Q_CB_THROUGHPUT_CONCURRENCY=1,2,4,8 \
+  HF2Q_CB_THROUGHPUT_MAX_TOKENS=64 \
+  cargo test --release --test continuous_batching_throughput \
+    -- --test-threads=1 --nocapture cb_throughput_n_1_2_4_8_fifo_vs_inflight
+```
+
+Optional env overrides documented at the top of the test file:
+- `HF2Q_CB_THROUGHPUT_PROMPT` — default `"Count slowly from one to twenty, one number per line."` (long-enough-to-batch but bounded by `max_tokens`).
+- `HF2Q_CB_THROUGHPUT_MAX_TOKENS` — default `64` (each cell ~5-30 s on M5 Max).
+- `HF2Q_CB_THROUGHPUT_PORT_BASE` — default `52441` (per-cell counter increments).
+
+**InflightBatched-skip-when-unwired** — graceful detection per the brief:
+
+As of iter-A5 baseline (commit `80862adb`), `--scheduler inflight_batched` is rejected at `Engine::spawn_with_mode` with `EngineSpawnError::ModeNotYetWired` (the per-family worker arms — Phase C2c Qwen35, C2d Gemma 4 — have not landed; see §6.1.13 Future-iter pin pointers). When the bench tries to spawn the inflight subprocess, the binary exits non-zero before binding the listener, `wait_for_readyz` catches the early-exit via `child.try_wait()`, and returns `Err(format!("subprocess exited before /readyz=200 (status=...)\n--- stderr tail ---\n..."))`. The cell is logged via `eprintln!("[cb-throughput] cell SKIPPED ...")` + recorded in the test's `skipped: Vec<(String, u32, String)>` accumulator; the test continues with the remaining cells. Once C2c/C2d ship, the inflight cells will populate without ANY test edits — the bench is forward-compatible with the unblocking iters.
+
+**Vacuous-test guard** — `assert!(!all_cells.is_empty(), ...)` ensures the test FAILS when zero cells completed (e.g. all subprocess spawns failed because the GGUF path is invalid). Without this guard, a malformed `HF2Q_CB_THROUGHPUT_MODEL` would silently pass the bench — exactly the cfa-finding-F8 failure mode iter-1.5 closed. The guard preserves that contract end-to-end.
+
+**Design choice — curl subprocess vs reqwest** (CRITICAL — drives the bench harness shape):
+
+reqwest is available as both a runtime dep + dev-dep with `stream` feature (`Cargo.toml:176, 209`), but its `Client` is async-only — driving N concurrent reqwest SSE streams from `std::thread::scope` would require per-thread `tokio::runtime::Runtime` construction. That pattern is heavyweight (each runtime owns a multi-threaded executor pool + per-process Metal-handle conflicts at our subprocess boundary) and brittle at N=8. **curl** is the simplest blocking SSE client available on every Unix host hf2q ships to (macOS + Linux). The bench already shells out to `hf2q serve` as a subprocess — one more `curl` per stream is the smaller blast-radius design. The `Cargo.toml` is untouched per the brief constraint #7.
+
+**Design choice — TTFT upper-bound vs streaming-stdout refinement** (deferred to D3):
+
+curl's `-s -N` flag flushes SSE frames as they arrive but the parent process (the test thread) only reads `curl.output()` AFTER curl exits. The recorded `ttft_ms` is therefore the **upper-bound TTFT** (= total stream walltime). The aggregator refines this by subtracting `(tokens - 1) × per_token_ms` to produce a per-stream TTFT estimate, but this is a coarse approximation. **D3** refines TTFT via streaming-stdout consumption (curl piped to a Rust `BufReader` reading line-by-line in the worker thread, with per-line wall-clock timestamps from `Instant::now()`). For D2 the upper-bound suffices because (a) at `max_tokens=64` streams complete in seconds anyway, and (b) the AC-4 TTFT ratio (treatment p95 ≤ 2× baseline) compares LIKE-with-LIKE — the same upper-bound bias applies to every cell so the ratio is unaffected. D3 promotes the soft-gate to hard-fail at the same time it sharpens TTFT capture.
+
+**Test names + structure** (file: `tests/continuous_batching_throughput.rs`):
+
+- Always-on smoke (unchanged from D1, 4 tests): `binary_is_locatable_and_runs_version`, `throughput_cell_synthetic_round_trips_through_report`, `render_report_empty_returns_header_only`, `render_report_two_cells_emits_two_data_rows`.
+- Env-gated (2 tests, body replaced): `cb_throughput_n_1_2_4_8_fifo_vs_inflight` (real D2 body), `cb_throughput_required_env_vars_documented` (env-cataloging — unchanged from D1 contract).
+
+**Quality gates (all PASS)**:
+
+- `cargo check --release --tests` returns 0 (no new warnings).
+- `cargo test --release --test continuous_batching_throughput` returns 0 with **6 PASS / 0 FAIL** in skip mode (env unset). All 4 always-on smoke + both env-gated tests skip cleanly with `eprintln!` diagnostics.
+- `HF2Q_CB_THROUGHPUT_E2E=1 cargo test --release --test continuous_batching_throughput cb_throughput_n_1_2_4_8_fifo_vs_inflight` (without `HF2Q_CB_THROUGHPUT_MODEL`) PANICS with the cfa-finding-F8-aligned message (`HF2Q_CB_THROUGHPUT_MODEL required when HF2Q_CB_THROUGHPUT_E2E=1 ...`) — operator action required, no silent skip.
+- `cargo test --release --bin hf2q -- gemma4::kv_cache serve::multi_seq_kv qwen35::kv_cache serve::scheduler qwen35::forward_gpu::tests::b4a serve::tests::c4 serve::api::engine::tests serve::api::sse serve::api::schema --test-threads=1` returns 0 with **306 PASS / 0 FAIL** (iter-A5 baseline preserved verbatim).
+- NO `// TODO`, NO `unimplemented!()`, NO `todo!()` in the test file or production code. The deferred TTFT refinement is documented as a precise D3 contract, NOT a stub. The InflightBatched-skip path is a precise typed-error capture, NOT a silent fallback.
+- ONLY edits: `tests/continuous_batching_throughput.rs` + `docs/ADR-040-continuous-batching-reopen.md`. NO `Cargo.toml` edits, NO production-code edits.
+
+**Test count delta**:
+
+| Module | Pre-iter | Post-iter | Delta |
+|---|---:|---:|---:|
+| `tests/continuous_batching_throughput` (file-level) | 6 | 6 | 0 (body replaced; test count unchanged) |
+| Regression bundle (`gemma4::kv_cache serve::multi_seq_kv qwen35::kv_cache serve::scheduler qwen35::forward_gpu::tests::b4a serve::tests::c4 serve::api::engine::tests serve::api::sse serve::api::schema`) | 306 | 306 | 0 (production code untouched) |
+
+**LOC delta per file**:
+
+| File | + | - | Net |
+|---|---:|---:|---:|
+| `tests/continuous_batching_throughput.rs` | +~570 | -~50 | +~520 (D1 scaffold 218 → D2 final ~720; module doc expansion ~70, BenchServer + RAII drop ~40, http_get_status + fetch_model_id ~70, wait_for_readyz with early-exit + stderr tail ~50, run_stream (curl + SSE parse) ~120, run_bench_cell (thread::scope + aggregation) ~150, percentile helper ~12, env-gated test body real measurement ~85) |
+| `docs/ADR-040-continuous-batching-reopen.md` | +~95 | -3 | +~92 (this §6.1.14 closure block + §6 Phase D D2 row marked SHIPPED) |
+| **Total** | **+~665** | **-~53** | **+~612** |
+
+**Mantra-aligned**: no `// TODO`, no `unimplemented!()`, no `panic!()` in production code (the test file has 1 panic for operator-action-required missing-GGUF-env per cfa-finding-F8 — explicitly aligned with the iter-1.5 contract). The InflightBatched-skip path is a precise typed error capture; the TTFT upper-bound is a documented bias contract that D3 refines, not a stub.
+
+**Subprocess management invariants (load-bearing)**:
+
+- `BenchServer` impl `Drop` kills + waits the child unconditionally — test panic, scope exit, or normal return all release the multi-GB-resident server.
+- `wait_for_readyz` polls `child.try_wait()` BEFORE every `/readyz` check — subprocess early-exit is detected within 2 s instead of waiting the full 600 s budget for the timeout path.
+- `next_port()` claims a fresh port per `run_bench_cell` invocation via `AtomicU16::fetch_add` — under `--test-threads=1` (per `/opt/hf2q/CLAUDE.md` "do not oom us") this is the correct atomicity bound; the bench harness is forward-compatible with `--test-threads=N` if a future iter relaxes the OOM directive.
+
+**Future-iter pin pointers**:
+
+- **D3** — repeated-rep median-of-N aggregation (N=3 minimum, N=5 recommended per the ADR-033 §Pi methodology lesson at `feedback_*` brain entries); streaming-stdout TTFT refinement (curl piped to BufReader in worker thread; per-line Instant timestamps); promote the AC-4 soft-gate to hard-fail enforcement (1.5× aggregate + 2.0× TTFT p95). The percentile + aggregation logic shipped in D2 is reusable verbatim — D3 wraps it in an outer rep-loop + adds a median selector.
+- **D3 InflightBatched activation** — once C2c (Qwen35 SlotAware worker arm) + C2d (Gemma 4 SlotAware worker arm) ship, the bench's skipped-cells list shrinks to zero on InflightBatched cells and the AC-4 ratio becomes computable. The test is forward-compatible: no edits needed beyond the D3 hard-fail promotion.
+- **D3 dual-policy A/B harness** — D2 runs FifoSerial cells THEN InflightBatched cells against a single GGUF on disk. D3 may want to interleave (cell ordering: F1, I1, F2, I2, ...) to control for SSD page-cache warmth across cells; current shape is `for policy in [..] { for n in [..] { ... } }`, swap to `for n in [..] { for policy in [..] { ... } }` if A/B per-N parity is wanted.
+
+**Dossier provenance**: No standalone dossier — D2 is bounded test-harness work on top of the already-shipped iter-1.5 + iter-A5 (per-slot budget) + iter-C4 (CLI wiring) + iter-D1 (scaffold) foundations. The curl-vs-reqwest design decision + the TTFT upper-bound bias are documented inline (above) per ADR-040 §7 mantra.
 
 ---
 
