@@ -236,6 +236,7 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 |---|---|---|
 | **A1 (THIS ITER, 2026-05-23)** | Scaffolding: trait + types + NoopMultiSeqKvCache fixture + unit tests | 1 day |
 | **A2a (SHIPPED 2026-05-23)** | `HybridKvCache` (Qwen35) full-attn + MTP impl — H1 PASS; ~150 LOC trait impl + 11 tests (75 total) | **1 day landed** |
+| **B3 (SHIPPED 2026-05-23)** | `InflightBatchedScheduler` real `step` FSM — SlotPhase enum {Queued, Prefilling, Decoding} + `advance_after_prefill`/`advance_after_decode` driver-callback APIs + DEFAULT_PREFILL_CHUNK_TOKENS=512 (mirrors llama.cpp `-ub` default) + 12 new FSM tests (30 total scheduler tests); iter-1.5 cfg(test) gate removed | **1 day landed** |
 | A2b | `HybridKvCache` linear-attn lift — lift `rollback_la_to` guard at `kv_cache.rs:1567`, H4 + H5 hypotheses; ports `gpu_delta_net.rs` `n_seqs=1u32` sites | 5-8 days |
 | A2c | `fork_seq` real kernel dispatch (same-buffer cross-region memcpy) — replaces A2a's `SlotOom { 0, 0 }` sentinel | 3-5 days |
 | A3 | Gemma 4 dense KV impl | 3-5 days |
