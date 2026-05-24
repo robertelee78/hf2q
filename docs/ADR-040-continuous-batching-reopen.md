@@ -277,7 +277,7 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | **C2b (SHIPPED, 2026-05-23)** | Shape A `worker_run` refactor: extended signature with `mode: EngineMode` + `queue_capacity: u32` + `scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>`; constructs concrete `FifoSchedulerAdapter` at worker entry (concrete-type realisation of dossier §2.9 "advance lives on concrete type"); wraps `Generate` / `GenerateStream` / `Embed` / `GenerateWithSoftTokens` arms in admit→drive→release; `EngineInner` gains `max_slots: u32` + `scheduler_stats_snapshot` + accessors; `Qwen35LoadedModel` gains `persistent_kv_cache: Option<HybridKvCache>` scaffold (None at iter-2a; iter-2b lift). H2 sequential-request pin added env-gated alongside H1. | 1 day |
 | C2c | Qwen35 SlotAware runtime (replaces `EngineSpawnError::ModeNotYetWired` for `SlotAware` via Shape B `select!` loop inside `worker_run` + populates `Qwen35LoadedModel.persistent_kv_cache` with `n_seqs=max_slots`); gated on B4b decode-side slot_id threading + R4 spec-decode mitigation + R4-bis hybrid persistor n_seqs>1 serialization. | 5-8 days |
 | C3 | SSE keepalive per-slot accounting + schema.rs doc updates | 2-3 days |
-| C4 | CLI/env wiring for `HF2Q_SCHEDULER` + `--scheduler` | 1-2 days |
+| **C4 (SHIPPED, 2026-05-23)** | CLI/env wiring for `HF2Q_SCHEDULER` + `--scheduler` + `HF2Q_MAX_SLOTS` + `--max-slots`; threaded through `multi_model::EngineConfig.engine_mode` into `load_engine` → `Engine::spawn_with_mode`; env-absence is byte-equivalent (`EngineMode::SerialFifo`) per §3.6; SlotAware fail-loud rejection (no silent fallback) with updated `EngineSpawnError::ModeNotYetWired` iter cite (`C2b` SHIPPED → `C2b/C2c (per-family worker arms)` pending). 10 new tests (8 brief-required + 2 precedence pins). | 1 day |
 
 ### Phase D — Throughput benchmark (2-3 iters)
 
@@ -770,6 +770,75 @@ This deviation does NOT affect the dossier's hypothesis matrix (H1–H4 all hold
 - `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §3 hypothesis matrix H1+H2+H3+H4: all hold; H2 ships as a new test this iter; H1+H3+H4 retain their pin role.
 - `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §4 iter-2a steps 2-8: implemented verbatim with the concrete-type deviation in step 3 documented above.
 - `docs/research/adr040-c2-wiring-dossier-2026-05-24.md` §5 R1-R5: all mitigations in place per the "Risk mitigations landed" table above.
+
+### 6.1.9 Iter-C4 closure — CLI/env wiring for SchedulerPolicy selection SHIPPED (2026-05-23, this commit)
+
+Per ADR-040 §6 Phase C row C4, this iter ships the operator-facing surface for selecting the engine's `SchedulerPolicy` at startup. The C4 wiring sits between the unchanged `Engine::spawn_with_mode` API (iter-1.5 F1) + the iter-C2b-shipped `worker_run` refactor: operator runs `hf2q serve --scheduler inflight_batched --max-slots 4` (or exports `HF2Q_SCHEDULER=inflight_batched HF2Q_MAX_SLOTS=4`), `cmd_serve` parses + validates + threads the resulting `EngineMode` through `EngineConfig.engine_mode` into `load_engine`, which now calls `spawn_with_mode` instead of the legacy 3-arg `spawn`.
+
+**Env-var contract pinned (per ADR-040 §3.6)**:
+
+| Env var | CLI flag | Default | Override semantics |
+|---|---|---|---|
+| `HF2Q_SCHEDULER` | `--scheduler {fifo_serial,inflight_batched}` | unset = `fifo_serial` = `EngineMode::SerialFifo` (byte-equivalent to pre-ADR-040) | CLI flag wins; env-var values are case-insensitive (`fifo_serial` ≡ `FIFO_SERIAL`); whitespace-only env values treated as unset (matches `should_enable_kv_persist` discipline); unknown values rejected loudly. |
+| `HF2Q_MAX_SLOTS` | `--max-slots <N>` | unset under `inflight_batched` = `4` per §3.4; IGNORED under `fifo_serial` (legacy 3-arg `Engine::spawn` is single-slot by definition) | CLI flag wins; `0` rejected loudly per iter-2.5 F3a `.max(1)` discipline (no silent coercion); non-`u32` env values rejected loudly; `u32::MAX` accepted by parser (downstream allocator decides). |
+
+**SlotAware rejection contract** (until iter-2b/2c land):
+- `--scheduler inflight_batched` (or `HF2Q_SCHEDULER=inflight_batched`) produces `EngineMode::SlotAware { max_slots: 4 }` from `parse_scheduler_config`.
+- `load_engine` calls `Engine::spawn_with_mode(..., SlotAware { .. })`, which returns `Err(EngineSpawnError::ModeNotYetWired { iter_landed: "C2b", iter_required: "C2b/C2c (per-family worker arms)" })`.
+- `load_engine` wraps this as `anyhow::Error` with the ADR-040 prefix; `cmd_serve` aborts startup with a non-zero exit code (fail-loud per ADR-040 §7 mantra — no silent fallback to `SerialFifo`).
+- The error's `Display` message names C2b SHIPPED + the iter-2b (Qwen35 worker arm) + iter-2c (Gemma 4 worker arm) follow-up dependencies so the operator knows exactly which downstream iter to wait for.
+
+**Production code changes (LOC delta)**:
+- `src/cli.rs`: +~50 LOC — `--scheduler` flag (`Option<SchedulerArg>`) + `--max-slots` flag (`Option<u32>`) on `ServeArgs` + new `pub enum SchedulerArg { FifoSerial, InflightBatched }` with `#[derive(clap::ValueEnum)]`.
+- `src/serve/multi_model.rs`: +~15 LOC — `EngineConfig.engine_mode: EngineMode` field + `Debug` impl line + doc-block explaining the §3.6 backward-compat contract.
+- `src/serve/mod.rs`: +~120 LOC — pure-function `parse_scheduler_config(scheduler_cli, scheduler_env, max_slots_cli, max_slots_env) -> Result<EngineMode, String>` + `pub(crate) const DEFAULT_MAX_SLOTS_UNDER_INFLIGHT: u32 = 4` + the `cmd_serve` env-read + `parse_scheduler_config` call + the `EngineConfig` builder thread-through. `load_engine` swapped `Engine::spawn` → `Engine::spawn_with_mode` with `anyhow!` wrapping the typed `EngineSpawnError`. 7 existing test-fixture `EngineConfig` constructions + 2 other module test fixtures (`loader_wrapper.rs` + `handlers.rs`) updated with `engine_mode: EngineMode::SerialFifo` (defaults-equivalent value to stay test-stable).
+- `src/serve/api/engine.rs`: +~25 LOC, -~15 LOC — `EngineSpawnError::ModeNotYetWired`'s `Display` template + doc-block updated to name C2b SHIPPED at 886f229c + iter-2b/2c per-family follow-ups; the rejection site at `spawn_with_mode` updated to pass `iter_landed: "C2b"` + `iter_required: "C2b/C2c (per-family worker arms)"`. No signature changes; H3 (`engine_spawn_3_arg_signature_compile_pin`) + H1 + H2 + `engine_spawn_error_mode_not_yet_wired_names_iters` all retain their PASS verdicts (the substring "iter-2" appears in the new template via "iter-2b" / "iter-2c").
+- `src/serve/api/handlers.rs`: +~12 LOC — request-time auto-pipeline `EngineConfig` builder gains `engine_mode: EngineMode::SerialFifo` with a doc-block explaining that C2c's SlotAware activation lifts this to read from a `state.engine_mode` field (deferred per the existing C2c sequencing).
+
+**New tests** (8 brief-required + 2 precedence pins = **10 total**):
+
+| Test | Pins |
+|---|---|
+| `c4_scheduler_env_unset_defaults_to_fifo_serial` | ADR-040 §3.6 — env-absence = byte-equivalent to pre-ADR-040. |
+| `c4_scheduler_env_fifo_serial_lowercase_matches` | Lowercase canonical form parses; SerialFifo round-trip. |
+| `c4_scheduler_env_inflight_batched_matches` | `inflight_batched` resolves to `SlotAware { max_slots: 4 }` (default). |
+| `c4_scheduler_env_case_insensitive` | `INFLIGHT_BATCHED` / `FiFo_SeRiAl` / whitespace-only all behave correctly. |
+| `c4_scheduler_env_unknown_value_errors` | Unknown env value rejected with named-supported diagnostic. |
+| `c4_max_slots_env_unset_defaults_to_4_under_inflight` | §3.4 default = 4; constant `DEFAULT_MAX_SLOTS_UNDER_INFLIGHT == 4`. |
+| `c4_max_slots_env_unset_defaults_to_1_under_fifo_serial` | `max_slots` is IGNORED on the SerialFifo path (legacy single-slot worker). |
+| `c4_max_slots_env_zero_normalizes_or_errors` | `--max-slots 0` + `HF2Q_MAX_SLOTS=0` + `HF2Q_MAX_SLOTS=not-a-number` all REJECTED loudly. |
+| `c4_scheduler_cli_wins_over_env` *(precedence pin)* | CLI flag wins over env (mirrors `--auth-token` semantics). |
+| `c4_max_slots_cli_wins_over_env` *(precedence pin)* | `--max-slots` wins over `HF2Q_MAX_SLOTS`. |
+
+**Sequencing** (per ADR-040 §6 Phase C):
+- **C4 (THIS ITER)** — Operator-facing CLI + env surface. SlotAware rejected loudly with iter-status cite.
+- **C2c** (5-8 days, gated on B4b + R4) — Qwen35 SlotAware runtime: lifts the `EngineSpawnError::ModeNotYetWired` rejection for `LoadedArch::Qwen35` engines + populates `Qwen35LoadedModel.persistent_kv_cache` with `n_seqs = max_slots`. After C2c lands, `hf2q serve --scheduler inflight_batched --max-slots 4` for a Qwen3.5/3.6 GGUF will start a slot-aware engine; the same flag against a Gemma 4 GGUF will continue to surface the rejection until C2d.
+- **C2d / Gemma SlotAware** (3-5 days, gated on A3 + B4c) — Same lift for `LoadedArch::Gemma`.
+- **C3** (2-3 days) — SSE keepalive per-slot accounting + schema doc updates. Independent of C4.
+
+**Quality gates** (all PASS):
+- `cargo check --release` returns 0.
+- `cargo check --release --tests` returns 0 (no new warnings; pre-existing `gpu_full_attn.rs:11455-57` unused-`bad_shape` only).
+- `cargo test --release --bin hf2q -- serve::tests::c4_` returns 0 with **10 PASS / 0 FAIL** (8 brief-required + 2 precedence).
+- `cargo test --release --bin hf2q -- engine_spawn_3_arg_signature_compile_pin` returns 0 with 1 PASS (H3 — 3-arg `Engine::spawn` signature unchanged; no callsite outside `spawn_with_mode` itself was added).
+- `cargo test --release --bin hf2q -- engine_serial_fifo_byte_equivalent_to_pre_phase_c engine_serial_fifo_two_sequential_requests_no_state_leak` returns 0 with 2 PASS (H1 + H2 retain skip-mode verdict; `load_engine` now routes through `spawn_with_mode(SerialFifo)` which delegates to `spawn` per iter-1.5 F1).
+- `cargo test --release --bin hf2q -- serve::tests serve::api::engine::adr040 serve::multi_model` returns 0 with 144 PASS (no regressions across the broader serve + multi_model suites).
+- No `// TODO`, no `unimplemented!()`, no `panic!()` introduced in production code. `parse_scheduler_config` returns `Result<EngineMode, String>` and propagates failures via `anyhow!` at the cmd_serve seam; the only `unreachable!()` near this code path is the pre-existing C2b worker_run guard at `engine.rs:3478` (out of C4 scope).
+
+**Backward-compat verification matrix**:
+
+| Operator state | Resolved `EngineMode` | Path |
+|---|---|---|
+| No flag, no env | `SerialFifo` | `spawn_with_mode(SerialFifo)` delegates to 3-arg `spawn` per iter-1.5 F1; byte-equivalent to pre-ADR-040. |
+| `--scheduler fifo_serial`, any env | `SerialFifo` | Same as above. |
+| `HF2Q_SCHEDULER=fifo_serial`, no flag | `SerialFifo` | Same as above. |
+| `HF2Q_SCHEDULER=foo` | n/a | Parser rejects; `cmd_serve` exits non-zero before binding listener. |
+| `--scheduler inflight_batched`, no `--max-slots`, no env | `SlotAware { max_slots: 4 }` | `spawn_with_mode` rejects with `ModeNotYetWired`; `cmd_serve` exits non-zero with ADR-040-prefixed message. |
+| `--scheduler inflight_batched --max-slots 8` | `SlotAware { max_slots: 8 }` | Same rejection; the parsed `max_slots` is just echoed in tracing for diagnostics. |
+| `--scheduler inflight_batched --max-slots 0` | n/a | Parser rejects with F3a-cited message; `cmd_serve` exits non-zero. |
+| `HF2Q_SCHEDULER=inflight_batched HF2Q_MAX_SLOTS=not-a-number` | n/a | Parser rejects with u32-named diagnostic; `cmd_serve` exits non-zero. |
+
+**Dossier provenance**: this iter implements the C4 row directly from §6 Phase C without a separate dossier — the work is purely operator-surface plumbing on top of the already-shipped iter-1.5 F1 `spawn_with_mode` API + iter-C2b `worker_run` refactor. The `parse_scheduler_config` helper mirrors `should_enable_kv_persist`'s pure-function/no-env-mutation discipline so unit tests run without `std::env::set_var` races.
 
 ---
 

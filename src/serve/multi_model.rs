@@ -140,6 +140,22 @@ pub struct EngineConfig {
     /// qwen35moe MoE-expert tensors skipped pending Iter C2).  Set by
     /// `cmd_serve` from `args.dwq_overlay`.
     pub dwq_overlay_path: Option<PathBuf>,
+
+    /// ADR-040 Phase C iter-4 (C4) — scheduler-policy selection for the
+    /// engine spawned from this config.
+    ///
+    /// `EngineMode::SerialFifo` (the [`Default`] impl) preserves the
+    /// ADR-005 Decision #2 + #19 contract byte-for-byte per ADR-040
+    /// §3.6. When `cmd_serve` parses `--scheduler inflight_batched` (or
+    /// `HF2Q_SCHEDULER=inflight_batched`), this becomes
+    /// `EngineMode::SlotAware { max_slots: N }` and `load_engine` calls
+    /// [`Engine::spawn_with_mode`] instead of [`Engine::spawn`]. The
+    /// downstream `Engine::spawn_with_mode` returns
+    /// [`EngineSpawnError::ModeNotYetWired`] until iter-2b/2c land the
+    /// per-family slot-aware worker arms — `load_engine` surfaces that
+    /// as an `anyhow::Error` and `cmd_serve` aborts startup with a
+    /// non-zero exit code (fail-loud per ADR-040 §7 mantra).
+    pub engine_mode: crate::serve::api::engine::EngineMode,
 }
 
 impl std::fmt::Debug for EngineConfig {
@@ -151,6 +167,10 @@ impl std::fmt::Debug for EngineConfig {
             .field("warmup_synchronously", &self.warmup_synchronously)
             .field("kv_metrics_sink_present", &self.kv_metrics_sink.is_some())
             .field("dwq_overlay_path", &self.dwq_overlay_path)
+            // ADR-040 Phase C iter-4 (C4) — surface the parsed
+            // scheduler-policy selection so operator log greps + test
+            // assertions see what mode the engine spawn will request.
+            .field("engine_mode", &self.engine_mode)
             .finish()
     }
 }

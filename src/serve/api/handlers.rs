@@ -222,6 +222,17 @@ async fn resolve_engine_for_request(
         // the request).  Only the cmd_serve startup pre-warm path
         // honors `--dwq-overlay`.
         dwq_overlay_path: None,
+        // ADR-040 Phase C iter-4 (C4) — request-time auto-pipeline
+        // inherits the same scheduler policy as the operator-selected
+        // startup. The state-level mode is recorded at startup; the
+        // auto-pipeline currently uses the SerialFifo default
+        // (byte-equivalent to pre-ADR-040). C2c's SlotAware activation
+        // lifts this when it ships — the auto-pipeline will read
+        // `state.engine_mode` instead of hardcoding here. Until then,
+        // the cmd_serve startup pre-warm is the load-bearing path for
+        // `--scheduler inflight_batched` and `EngineSpawnError::
+        // ModeNotYetWired` fires there if the operator requests it.
+        engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
     };
     let pool_arc = state.pool.clone();
     let pool_repo_blocking = pool_repo.clone();

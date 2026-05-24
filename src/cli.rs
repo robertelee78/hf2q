@@ -804,6 +804,48 @@ pub struct ServeArgs {
     /// but functionally inert.
     #[arg(long = "kv-persist", value_name = "PATH")]
     pub kv_persist_path: Option<PathBuf>,
+
+    /// ADR-040 Phase C iter-4 (C4) — scheduler-policy selection for the
+    /// in-process [`serve::api::engine::Engine`].
+    ///
+    /// `fifo_serial` (default) preserves the ADR-005 Decision #2 + #19
+    /// production contract byte-for-byte: one mpsc channel, one worker
+    /// thread, serialized FIFO dispatch, 429 + Retry-After on queue
+    /// overflow. This is the value the operator gets when the flag and
+    /// the `HF2Q_SCHEDULER` env var are BOTH unset (ADR-040 §3.6
+    /// backward-compat pledge).
+    ///
+    /// `inflight_batched` activates ADR-040's slot-aware path
+    /// ([`EngineMode::SlotAware`]). At iter-2a (C2b SHIPPED), this value
+    /// is REJECTED at spawn time with
+    /// [`EngineSpawnError::ModeNotYetWired`] — the SlotAware runtime
+    /// lands in iter-2b (Qwen35 worker arm) + iter-2c (Gemma 4). The CLI
+    /// surface ships now so operator scripts + the systemd unit file can
+    /// reference the flag name today; the engine will start refusing
+    /// `inflight_batched` until the per-family worker arms land.
+    ///
+    /// Also read from `HF2Q_SCHEDULER` if `--scheduler` is absent.
+    /// CLI flag wins on conflict (mirrors `--auth-token` semantics).
+    #[arg(long = "scheduler", value_name = "POLICY", value_enum)]
+    pub scheduler: Option<SchedulerArg>,
+
+    /// ADR-040 Phase C iter-4 (C4) — `max_slots` for
+    /// [`EngineMode::SlotAware`].
+    ///
+    /// Honored ONLY when `--scheduler inflight_batched` is selected; with
+    /// the default `fifo_serial` policy the engine's `max_slots` is
+    /// hard-pinned to `1` (one worker, one in-flight request). Default
+    /// `4` per ADR-040 §3.4 — half the reopen-trigger threshold of `8`
+    /// to ship the first ramp with headroom.
+    ///
+    /// `0` is rejected with a clear operator-facing error at parse time
+    /// (mirrors ADR-040 iter-2.5 F3a `.max(1)` discipline applied
+    /// upstream of the scheduler — refuse the misconfiguration loudly
+    /// rather than silently coerce). Range: `1..=u32::MAX`.
+    ///
+    /// Also read from `HF2Q_MAX_SLOTS` if `--max-slots` is absent.
+    #[arg(long = "max-slots", value_name = "N")]
+    pub max_slots: Option<u32>,
 }
 
 /// CLI-facing copy of `serve::api::schema::OverflowPolicy`. Kept local to
@@ -813,6 +855,27 @@ pub enum OverflowPolicyArg {
     Reject,
     TruncateLeft,
     Summarize,
+}
+
+/// ADR-040 Phase C iter-4 (C4) — CLI-facing scheduler-policy selector.
+///
+/// Mirrors the on-disk env-var values `fifo_serial` and `inflight_batched`
+/// — both are accepted case-insensitively by the env-var parser (per
+/// `serve::mod::parse_scheduler_config_from_env`). clap's `ValueEnum` is
+/// case-insensitive by default (`rename_all = "snake_case"` is the
+/// implicit default for snake-case Rust variant names), so the operator
+/// can type any of `fifo_serial`, `FIFO_SERIAL`, `inflight_batched`,
+/// `INFLIGHT_BATCHED` at the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SchedulerArg {
+    /// ADR-005 Decision #2 + #19 production path. One mpsc channel, one
+    /// worker thread, serialized FIFO dispatch. Default; byte-equivalent
+    /// to pre-ADR-040 (per ADR-040 §3.6).
+    FifoSerial,
+    /// ADR-040 Phase C iter-2+ slot-aware path. Rejected at spawn time
+    /// until iter-2b (Qwen35) + iter-2c (Gemma 4) land the per-family
+    /// worker arms.
+    InflightBatched,
 }
 
 #[derive(Subcommand, Debug)]

@@ -3676,7 +3676,34 @@ pub fn load_engine(path: &Path, config: &multi_model::EngineConfig) -> Result<ap
             }
         }
     }
-    let engine = api::engine::Engine::spawn(loaded, config.queue_capacity, None);
+    // ADR-040 Phase C iter-4 (C4) — route through `spawn_with_mode` so
+    // the operator-chosen `EngineMode` (parsed from `--scheduler` /
+    // `HF2Q_SCHEDULER` upstream in `cmd_serve`) reaches the worker
+    // thread. `EngineConfig::default()` carries `EngineMode::SerialFifo`,
+    // which `spawn_with_mode` delegates byte-for-byte to the legacy
+    // 3-arg `Engine::spawn` per iter-1.5 F1 (engine.rs:2723-2748) — so
+    // the env-absence path stays byte-equivalent per ADR-040 §3.6.
+    //
+    // SlotAware is rejected with `EngineSpawnError::ModeNotYetWired`
+    // until iter-2b (Qwen35 worker arm) + iter-2c (Gemma 4) land; we
+    // surface the typed error as an `anyhow::Error` carrying the
+    // ADR-040-prefixed Display string so `cmd_serve` can print it to
+    // stderr and exit non-zero (fail-loud per ADR-040 §7 mantra — no
+    // silent fallback to SerialFifo).
+    let engine = api::engine::Engine::spawn_with_mode(
+        loaded,
+        config.queue_capacity,
+        None,
+        config.engine_mode,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "ADR-040 Phase C iter-4 (C4): Engine::spawn_with_mode rejected the \
+             requested EngineMode: {e}. Either select `--scheduler fifo_serial` \
+             (the default; ADR-005 byte-equivalent path), or wait for the iter \
+             named in the error message to land."
+        )
+    })?;
     load_info::emit_tracing(engine.info());
 
     if config.warmup_synchronously {
@@ -3763,6 +3790,148 @@ pub(crate) fn maybe_print_serve_banner<W: std::io::Write>(
     Ok(())
 }
 
+/// ADR-040 Phase C iter-4 (C4) — central authority for resolving the
+/// operator's `--scheduler` / `--max-slots` CLI selection against the
+/// corresponding `HF2Q_SCHEDULER` / `HF2Q_MAX_SLOTS` env vars into a
+/// concrete [`api::engine::EngineMode`].
+///
+/// # Backward-compat contract (ADR-040 §3.6)
+///
+/// When BOTH `scheduler` arguments are `None` (CLI flag absent AND env
+/// var unset / empty), this function returns
+/// [`api::engine::EngineMode::SerialFifo`] — preserving the ADR-005
+/// Decision #2 + #19 production path byte-for-byte. The `max_slots`
+/// inputs are IGNORED on the SerialFifo path (the legacy
+/// 3-arg `Engine::spawn` is single-slot by definition; `max_slots` is
+/// a SlotAware-only concept).
+///
+/// # Precedence
+///
+/// - `scheduler_cli` (Some) overrides `scheduler_env` (mirrors the
+///   `--auth-token` / `HF2Q_AUTH_TOKEN` precedence cmd_serve already
+///   uses for other knobs).
+/// - `max_slots_cli` (Some) overrides `max_slots_env`.
+/// - Whitespace-only env values are treated as unset (mirrors
+///   `should_enable_kv_persist`'s `.trim()` discipline).
+///
+/// # Case-insensitivity (env path)
+///
+/// The env-var path parses `fifo_serial` / `inflight_batched` /
+/// `FIFO_SERIAL` / `INFLIGHT_BATCHED` interchangeably — operators
+/// occasionally export env vars in upper-case by convention. The CLI
+/// path uses clap's `ValueEnum`, which is case-insensitive by default
+/// for snake-case Rust variants.
+///
+/// # Validation
+///
+/// Returns `Err(String)` (operator-facing message) on:
+/// - Unknown scheduler value at the env-var layer (the CLI is gated by
+///   clap so this can only fire via env).
+/// - `max_slots == 0` (per ADR-040 iter-2.5 F3a `.max(1)` discipline,
+///   refused loudly rather than coerced).
+/// - `HF2Q_MAX_SLOTS` env value that doesn't parse as `u32`.
+///
+/// # Pure function (no env reads / no I/O)
+///
+/// The caller threads the parsed CLI flag + the env-var value in.
+/// This keeps the function unit-testable without `std::env::set_var`
+/// races (the existing `should_enable_kv_persist` follows the same
+/// pattern for the same reason).
+pub(crate) fn parse_scheduler_config(
+    scheduler_cli: Option<cli::SchedulerArg>,
+    scheduler_env: Option<&str>,
+    max_slots_cli: Option<u32>,
+    max_slots_env: Option<&str>,
+) -> std::result::Result<api::engine::EngineMode, String> {
+    use api::engine::EngineMode;
+
+    // ---- 1. Resolve scheduler choice ----
+    //
+    // CLI flag wins; env is the fallback. Whitespace-only env values
+    // are treated as unset (trim semantics match `should_enable_kv_persist`).
+    let scheduler_from_env: Option<cli::SchedulerArg> = match scheduler_env
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(raw) => {
+            let lower = raw.to_ascii_lowercase();
+            match lower.as_str() {
+                "fifo_serial" => Some(cli::SchedulerArg::FifoSerial),
+                "inflight_batched" => Some(cli::SchedulerArg::InflightBatched),
+                _ => {
+                    return Err(format!(
+                        "ADR-040 C4: HF2Q_SCHEDULER={raw:?} is not a recognized \
+                         scheduler policy. Supported values (case-insensitive): \
+                         `fifo_serial` (default; ADR-005 byte-equivalent path), \
+                         `inflight_batched` (ADR-040 slot-aware path, gated on \
+                         iter-2b/2c worker-arm landing). Unset the env var to \
+                         use the default."
+                    ));
+                }
+            }
+        }
+    };
+    let scheduler = scheduler_cli.or(scheduler_from_env);
+
+    // ---- 2. Resolve max_slots ----
+    //
+    // CLI flag wins; env is the fallback. `HF2Q_MAX_SLOTS=0` is
+    // refused loudly (per ADR-040 iter-2.5 F3a). Whitespace-only env
+    // values are treated as unset.
+    let max_slots_from_env: Option<u32> = match max_slots_env
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(raw) => match raw.parse::<u32>() {
+            Ok(parsed) => Some(parsed),
+            Err(err) => {
+                return Err(format!(
+                    "ADR-040 C4: HF2Q_MAX_SLOTS={raw:?} does not parse as a \
+                     non-negative u32: {err}. Supply a positive integer (default \
+                     {}), or unset the env var.",
+                    DEFAULT_MAX_SLOTS_UNDER_INFLIGHT
+                ));
+            }
+        },
+    };
+    let max_slots_requested = max_slots_cli.or(max_slots_from_env);
+    if let Some(0) = max_slots_requested {
+        return Err(format!(
+            "ADR-040 C4: --max-slots=0 / HF2Q_MAX_SLOTS=0 is rejected per \
+             ADR-040 iter-2.5 F3a (FifoSchedulerAdapter `.max(1)` discipline \
+             applied at the CLI layer instead of silently coerced). Either \
+             omit the flag (defaults to {} when `--scheduler inflight_batched` \
+             is selected; ignored otherwise), or supply a positive integer.",
+            DEFAULT_MAX_SLOTS_UNDER_INFLIGHT
+        ));
+    }
+
+    // ---- 3. Build the EngineMode ----
+    match scheduler {
+        // ADR-040 §3.6 backward-compat — env-absence is byte-equivalent
+        // to pre-ADR-040. `max_slots` (if any) is IGNORED on the
+        // SerialFifo path; the legacy 3-arg `Engine::spawn` is
+        // single-slot by definition.
+        None | Some(cli::SchedulerArg::FifoSerial) => Ok(EngineMode::SerialFifo),
+        Some(cli::SchedulerArg::InflightBatched) => {
+            let max_slots = max_slots_requested.unwrap_or(DEFAULT_MAX_SLOTS_UNDER_INFLIGHT);
+            // Defensive: parsed-zero already rejected above. The
+            // `.max(1)` here is a defense-in-depth pin for any future
+            // refactor that loses the zero-check above.
+            Ok(EngineMode::SlotAware {
+                max_slots: max_slots.max(1),
+            })
+        }
+    }
+}
+
+/// ADR-040 §3.4 — default `max_slots` under `EngineMode::SlotAware`.
+/// Half the reopen-trigger threshold of `8`, so the first ramp deploys
+/// with headroom.
+pub(crate) const DEFAULT_MAX_SLOTS_UNDER_INFLIGHT: u32 = 4;
+
 pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
     use api::schema::OverflowPolicy;
     use api::state::ServerConfig;
@@ -3784,6 +3953,36 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
         .cache_dir
         .clone()
         .or_else(api::state::default_cache_dir);
+
+    // ADR-040 Phase C iter-4 (C4) — resolve `--scheduler` + `--max-slots`
+    // against `HF2Q_SCHEDULER` + `HF2Q_MAX_SLOTS` into a concrete
+    // `EngineMode`. The pure-function parser at
+    // `parse_scheduler_config` is unit-tested without env mutation; this
+    // call site is the only `std::env::var` lookup for these two knobs.
+    //
+    // Per ADR-040 §3.6 backward-compat: with the flag absent AND the
+    // env unset/empty, this returns `EngineMode::SerialFifo` —
+    // byte-equivalent to pre-ADR-040. On a parse failure (bogus
+    // scheduler name, `max_slots=0`, non-u32 env), we propagate the
+    // operator-facing message via `anyhow!` so `cmd_serve` exits
+    // non-zero before binding the listener (fail-loud per §7 mantra).
+    let scheduler_env = std::env::var("HF2Q_SCHEDULER").ok();
+    let max_slots_env = std::env::var("HF2Q_MAX_SLOTS").ok();
+    let engine_mode = parse_scheduler_config(
+        args.scheduler,
+        scheduler_env.as_deref(),
+        args.max_slots,
+        max_slots_env.as_deref(),
+    )
+    .map_err(|msg| anyhow::anyhow!("{msg}"))?;
+    tracing::info!(
+        engine_mode = ?engine_mode,
+        scheduler_cli = ?args.scheduler,
+        scheduler_env = ?scheduler_env,
+        max_slots_cli = ?args.max_slots,
+        max_slots_env = ?max_slots_env,
+        "ADR-040 C4: resolved scheduler policy"
+    );
 
     let config = ServerConfig {
         host: args.host.clone(),
@@ -4311,6 +4510,12 @@ pub fn cmd_serve(args: cli::ServeArgs) -> Result<()> {
                 as std::sync::Arc<dyn crate::serve::kv_persist::metrics::KvCacheMetricsSink>),
             // ADR-020 AC#5 Iter D — propagate `--dwq-overlay` flag.
             dwq_overlay_path: args.dwq_overlay.clone(),
+            // ADR-040 Phase C iter-4 (C4) — propagate the parsed
+            // `EngineMode` so `load_engine` calls
+            // `Engine::spawn_with_mode` with the operator's chosen
+            // scheduler policy. Default `SerialFifo` keeps the
+            // ADR-005 byte-equivalence pledge when no flag/env is set.
+            engine_mode,
         };
         // ADR-017 C.1: arm the LoaderWrapper's pending_bind slot for
         // the about-to-fire load_or_get. Synchronous contract — see
@@ -5657,10 +5862,11 @@ mod tests {
     use super::{
         detect_greedy_repetition_loop, detect_greedy_repetition_loop_with_text,
         find_special_token_stop, maybe_print_serve_banner,
-        llama_cpp_special_token_id_for_model, render_jinja_template,
-        resolve_enable_thinking, run_decode_loop,
+        llama_cpp_special_token_id_for_model, parse_scheduler_config,
+        render_jinja_template, resolve_enable_thinking, run_decode_loop,
         should_enable_kv_persist, DecodeStopReason,
-        FALLBACK_GEMMA4_API_CHAT_TEMPLATE, FALLBACK_GEMMA4_CHAT_TEMPLATE,
+        DEFAULT_MAX_SLOTS_UNDER_INFLIGHT, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
+        FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
     use crate::core::chat_templates::QWEN3_CHATML;
     use crate::cli;
@@ -5921,6 +6127,9 @@ mod tests {
             warmup_synchronously: false,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
+            // ADR-040 Phase C iter-4 (C4) — test path stays on the
+            // SerialFifo default (the ADR-005 byte-equivalent route).
+            engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         // 0-tensor GGUF can't fully load, but the FAILURE shape proves
@@ -5956,6 +6165,9 @@ mod tests {
             warmup_synchronously: false,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
+            // ADR-040 Phase C iter-4 (C4) — test path stays on the
+            // SerialFifo default (the ADR-005 byte-equivalent route).
+            engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "0-tensor synthetic GGUF must fail load");
@@ -5994,6 +6206,9 @@ mod tests {
             warmup_synchronously: false,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
+            // ADR-040 Phase C iter-4 (C4) — test path stays on the
+            // SerialFifo default (the ADR-005 byte-equivalent route).
+            engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(
@@ -6034,6 +6249,9 @@ mod tests {
             warmup_synchronously: false,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
+            // ADR-040 Phase C iter-4 (C4) — test path stays on the
+            // SerialFifo default (the ADR-005 byte-equivalent route).
+            engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -6058,6 +6276,9 @@ mod tests {
             warmup_synchronously: false,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
+            // ADR-040 Phase C iter-4 (C4) — test path stays on the
+            // SerialFifo default (the ADR-005 byte-equivalent route).
+            engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err());
@@ -6084,6 +6305,9 @@ mod tests {
             warmup_synchronously: false,
             kv_metrics_sink: None,
             dwq_overlay_path: None,
+            // ADR-040 Phase C iter-4 (C4) — test path stays on the
+            // SerialFifo default (the ADR-005 byte-equivalent route).
+            engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
         };
         let result = super::load_engine(tmp.path(), &cfg);
         assert!(result.is_err(), "minimal GGUF must fail downstream load");
@@ -6122,7 +6346,10 @@ mod tests {
                 queue_capacity: 4,
                 warmup_synchronously: false,
                 kv_metrics_sink: None,
-            dwq_overlay_path: None,
+                dwq_overlay_path: None,
+                // ADR-040 Phase C iter-4 (C4) — test path stays on the
+                // SerialFifo default (the ADR-005 byte-equivalent route).
+                engine_mode: crate::serve::api::engine::EngineMode::SerialFifo,
             };
             let result = super::load_engine(tmp.path(), &cfg);
             assert!(
@@ -7272,6 +7499,250 @@ mod tests {
         assert_eq!(
             outcome.stop_reason,
             DecodeStopReason::SpecialTokenLeak("<|end|>")
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADR-040 Phase C iter-4 (C4) — CLI/env wiring for `HF2Q_SCHEDULER` +
+    // `--scheduler` / `HF2Q_MAX_SLOTS` + `--max-slots` (2026-05-23).
+    //
+    // These tests exercise the pure-function `parse_scheduler_config`
+    // helper that `cmd_serve` calls — no env mutation, no listener bind,
+    // no model load. The helper is the operator-facing contract surface:
+    // any future drift in defaults / precedence / validation falsifies
+    // here before the binary ships.
+    //
+    // Contract pinned (per ADR-040 §3.4 + §3.6):
+    //   - Env-absence (CLI + env both unset) → `EngineMode::SerialFifo`
+    //     (the ADR-005 byte-equivalent default).
+    //   - `fifo_serial` / `inflight_batched` parse case-insensitively
+    //     from the env-var layer.
+    //   - `max_slots` defaults to `DEFAULT_MAX_SLOTS_UNDER_INFLIGHT = 4`
+    //     under `inflight_batched`; ignored entirely under `fifo_serial`
+    //     (legacy single-slot worker).
+    //   - `max_slots == 0` (CLI or env) is REJECTED loudly with an
+    //     operator-actionable message (per ADR-040 iter-2.5 F3a
+    //     `.max(1)` discipline applied at the CLI layer instead of
+    //     silently coerced).
+    //   - Unknown scheduler value via env rejected with named-supported
+    //     diagnostic.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// ADR-040 §3.6 — backward-compat: with CLI + env both unset, the
+    /// resolved mode is `EngineMode::SerialFifo`. This is the
+    /// load-bearing pre-ADR-040 byte-equivalence pin at the CLI layer.
+    #[test]
+    fn c4_scheduler_env_unset_defaults_to_fifo_serial() {
+        let mode = parse_scheduler_config(None, None, None, None)
+            .expect("env-absence must yield SerialFifo, not an error");
+        assert_eq!(
+            mode,
+            crate::serve::api::engine::EngineMode::SerialFifo,
+            "ADR-040 §3.6: env-absence MUST be byte-equivalent to \
+             pre-ADR-040 (= EngineMode::SerialFifo). Got {mode:?}."
+        );
+    }
+
+    /// ADR-040 §3.6 — explicit `HF2Q_SCHEDULER=fifo_serial` matches the
+    /// default (lowercase canonical form).
+    #[test]
+    fn c4_scheduler_env_fifo_serial_lowercase_matches() {
+        let mode = parse_scheduler_config(None, Some("fifo_serial"), None, None)
+            .expect("HF2Q_SCHEDULER=fifo_serial must parse");
+        assert_eq!(mode, crate::serve::api::engine::EngineMode::SerialFifo);
+    }
+
+    /// `HF2Q_SCHEDULER=inflight_batched` resolves to
+    /// `EngineMode::SlotAware { max_slots: DEFAULT_MAX_SLOTS_UNDER_INFLIGHT }`
+    /// (the env-var layer accepts the same names clap exposes via
+    /// `--scheduler`, case-insensitive).
+    #[test]
+    fn c4_scheduler_env_inflight_batched_matches() {
+        let mode = parse_scheduler_config(None, Some("inflight_batched"), None, None)
+            .expect("HF2Q_SCHEDULER=inflight_batched must parse");
+        assert_eq!(
+            mode,
+            crate::serve::api::engine::EngineMode::SlotAware {
+                max_slots: DEFAULT_MAX_SLOTS_UNDER_INFLIGHT,
+            }
+        );
+    }
+
+    /// The env-var path is case-insensitive — operators occasionally
+    /// export env vars in upper-case by convention. Mirrors the
+    /// clap-`ValueEnum`-default case-insensitivity on the CLI side.
+    #[test]
+    fn c4_scheduler_env_case_insensitive() {
+        // Upper-case
+        let mode = parse_scheduler_config(None, Some("INFLIGHT_BATCHED"), None, None)
+            .expect("HF2Q_SCHEDULER=INFLIGHT_BATCHED must parse case-insensitively");
+        assert!(matches!(
+            mode,
+            crate::serve::api::engine::EngineMode::SlotAware { .. }
+        ));
+        // Mixed case
+        let mode = parse_scheduler_config(None, Some("FiFo_SeRiAl"), None, None)
+            .expect("HF2Q_SCHEDULER=FiFo_SeRiAl must parse case-insensitively");
+        assert_eq!(mode, crate::serve::api::engine::EngineMode::SerialFifo);
+        // Whitespace-only treated as unset → default SerialFifo
+        let mode = parse_scheduler_config(None, Some("   "), None, None)
+            .expect("HF2Q_SCHEDULER=`   ` must be treated as unset");
+        assert_eq!(mode, crate::serve::api::engine::EngineMode::SerialFifo);
+    }
+
+    /// Unknown values via the env-var path are REJECTED with a clear
+    /// operator-actionable message that names the supported set. The
+    /// CLI path is gated by clap's `ValueEnum` so this only fires from
+    /// env. Matches the "fail loudly, no silent fallback" stance ADR-040
+    /// §7 mantra demands.
+    #[test]
+    fn c4_scheduler_env_unknown_value_errors() {
+        let err = parse_scheduler_config(None, Some("foo"), None, None)
+            .expect_err("unknown HF2Q_SCHEDULER value must error");
+        assert!(err.contains("HF2Q_SCHEDULER"), "msg: {err}");
+        assert!(err.contains("foo"), "msg must echo bad value: {err}");
+        assert!(
+            err.contains("fifo_serial") && err.contains("inflight_batched"),
+            "msg must name supported values: {err}"
+        );
+    }
+
+    /// ADR-040 §3.4 — `max_slots` default = `4` under
+    /// `inflight_batched`. Operator deploys ramp 1 with headroom (half
+    /// the ≥8 reopen-trigger).
+    #[test]
+    fn c4_max_slots_env_unset_defaults_to_4_under_inflight() {
+        let mode = parse_scheduler_config(None, Some("inflight_batched"), None, None)
+            .expect("inflight_batched without HF2Q_MAX_SLOTS must default");
+        assert_eq!(
+            mode,
+            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 4 },
+            "ADR-040 §3.4: default max_slots under inflight_batched MUST be 4"
+        );
+        assert_eq!(
+            DEFAULT_MAX_SLOTS_UNDER_INFLIGHT, 4,
+            "ADR-040 §3.4: the named constant MUST hold the 4 default"
+        );
+    }
+
+    /// `max_slots` is IGNORED on the `fifo_serial` path (the legacy
+    /// 3-arg `Engine::spawn` is single-slot by definition; `max_slots`
+    /// is a SlotAware-only concept). Even if the operator supplies
+    /// `--max-slots 8 --scheduler fifo_serial`, the resolved mode is
+    /// `EngineMode::SerialFifo` with no `max_slots` field.
+    #[test]
+    fn c4_max_slots_env_unset_defaults_to_1_under_fifo_serial() {
+        // CLI says `--max-slots 8` but env+cli say SerialFifo → SerialFifo
+        // wins, max_slots is IGNORED.
+        let mode = parse_scheduler_config(
+            Some(cli::SchedulerArg::FifoSerial),
+            None,
+            Some(8),
+            None,
+        )
+        .expect("max_slots on fifo_serial must be ignored, not error");
+        assert_eq!(
+            mode,
+            crate::serve::api::engine::EngineMode::SerialFifo,
+            "ADR-040: under fifo_serial, max_slots is ignored — \
+             resolved mode MUST be SerialFifo (single-slot by definition). \
+             Got {mode:?}."
+        );
+
+        // Same conclusion when BOTH are unset (the default-default path).
+        let mode2 = parse_scheduler_config(None, None, None, None).expect("default ok");
+        assert_eq!(mode2, crate::serve::api::engine::EngineMode::SerialFifo);
+    }
+
+    /// ADR-040 iter-2.5 F3a discipline — `max_slots == 0` is REJECTED
+    /// at the CLI layer rather than silently coerced via `.max(1)`. The
+    /// fail-loud stance is the ADR-040 §7 mantra requirement; the
+    /// `.max(1)` defense-in-depth still lives in
+    /// `parse_scheduler_config`'s SlotAware arm in case a future
+    /// refactor loses this check.
+    #[test]
+    fn c4_max_slots_env_zero_normalizes_or_errors() {
+        // CLI-supplied --max-slots 0 → error
+        let err = parse_scheduler_config(
+            Some(cli::SchedulerArg::InflightBatched),
+            None,
+            Some(0),
+            None,
+        )
+        .expect_err("max_slots=0 must be rejected, not silently coerced");
+        assert!(err.contains("max-slots"), "msg: {err}");
+        assert!(err.contains('0'), "msg must echo the bad value: {err}");
+        assert!(
+            err.contains("F3a") || err.contains(".max(1)"),
+            "msg should cite the iter-2.5 F3a discipline: {err}"
+        );
+
+        // Env-supplied HF2Q_MAX_SLOTS=0 → error
+        let err = parse_scheduler_config(
+            None,
+            Some("inflight_batched"),
+            None,
+            Some("0"),
+        )
+        .expect_err("HF2Q_MAX_SLOTS=0 must be rejected, not silently coerced");
+        assert!(err.contains("max-slots"), "msg: {err}");
+
+        // Bonus: non-parseable env value also errors with named diag.
+        let err = parse_scheduler_config(None, None, None, Some("not-a-number"))
+            .expect_err("non-u32 HF2Q_MAX_SLOTS must error");
+        assert!(err.contains("HF2Q_MAX_SLOTS"), "msg: {err}");
+        assert!(err.contains("u32"), "msg must name u32: {err}");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Precedence + interaction pins — defense-in-depth around the
+    // CLI-wins-over-env contract. Not in the brief's required set, but
+    // they fall out of the same helper and pin behavior the operator
+    // would discover via surprise otherwise.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// CLI flag wins over env (mirrors `--auth-token` / `HF2Q_AUTH_TOKEN`
+    /// precedence cmd_serve already uses).
+    #[test]
+    fn c4_scheduler_cli_wins_over_env() {
+        // CLI says fifo_serial, env says inflight_batched → CLI wins.
+        let mode = parse_scheduler_config(
+            Some(cli::SchedulerArg::FifoSerial),
+            Some("inflight_batched"),
+            None,
+            None,
+        )
+        .expect("cli wins, must resolve to SerialFifo");
+        assert_eq!(mode, crate::serve::api::engine::EngineMode::SerialFifo);
+
+        // Reverse direction — CLI says inflight_batched, env says
+        // fifo_serial → CLI wins.
+        let mode = parse_scheduler_config(
+            Some(cli::SchedulerArg::InflightBatched),
+            Some("fifo_serial"),
+            Some(7),
+            None,
+        )
+        .expect("cli wins, must resolve to SlotAware{7}");
+        assert_eq!(
+            mode,
+            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 7 }
+        );
+    }
+
+    /// CLI `--max-slots` wins over `HF2Q_MAX_SLOTS`.
+    #[test]
+    fn c4_max_slots_cli_wins_over_env() {
+        let mode = parse_scheduler_config(
+            Some(cli::SchedulerArg::InflightBatched),
+            None,
+            Some(2),
+            Some("16"),
+        )
+        .expect("cli max_slots wins over env");
+        assert_eq!(
+            mode,
+            crate::serve::api::engine::EngineMode::SlotAware { max_slots: 2 }
         );
     }
 }

@@ -565,25 +565,49 @@ impl Default for EngineMode {
 /// Per ADR-040 §7 "no fallback, no stub (todo later) code": the prior
 /// `let _ = mode;` discard was a stub; this typed error is the honest
 /// surface until iter-2 ships.
+///
+/// # Iter-status (post-C2b)
+///
+/// As of C2b (commit `886f229c`, 2026-05-23) the `worker_run` refactor has
+/// shipped: the worker thread now constructs a `FifoSchedulerAdapter` at
+/// entry and wraps every dispatch arm in admit→drive→release. SerialFifo
+/// remains the only mode that survives spawn-time validation — SlotAware
+/// is still rejected here because:
+///   - **iter-2b (Qwen35 worker arm)** wires the slot-aware decode loop
+///     for the Qwen3.5/3.6 family on top of B4b's decode-side `slot_id`
+///     threading.
+///   - **iter-2c (Gemma 4 worker arm)** does the same for the Gemma 4
+///     family on top of B4c's `forward_prefill.rs` + `forward_prefill_
+///     batched.rs` slot-id threading.
+/// Until both per-family arms land, `--scheduler inflight_batched` /
+/// `HF2Q_SCHEDULER=inflight_batched` will surface this error via
+/// `load_engine`'s `anyhow::Error` wrapper and `cmd_serve` will exit
+/// non-zero before binding the listener (fail-loud per §7 mantra; no
+/// silent fallback to SerialFifo).
 #[derive(Debug, thiserror::Error)]
 pub enum EngineSpawnError {
     /// The requested [`EngineMode`] variant requires runtime support that
     /// has not yet landed. Carries the iter that introduced the surface
-    /// (`iter_landed`, e.g. `"C1.5"`) and the iter that will implement
-    /// the runtime (`iter_required`, e.g. `"C2"`) so callers + tooling
-    /// get a precise diagnostic. The `Display` impl ALSO formats the
-    /// implementing iter as `iter-2` (stripping the phase prefix) so
-    /// callers + log greps can match on the iter number without
-    /// committing to the phase letter.
+    /// (`iter_landed`, e.g. `"C2b"` for the worker-refactor commit) and
+    /// the iter that will implement the per-family runtime
+    /// (`iter_required`, e.g. `"C2b/C2c (per-family)"`) so callers +
+    /// tooling get a precise diagnostic. The `Display` impl names the
+    /// commit + the two per-family follow-up iters so operator log greps
+    /// can match on either the phase letter or the per-family iter name.
     #[error(
-        "ADR-040 EngineMode::SlotAware not yet wired (Phase {iter_landed} landed; \
-         Phase {iter_required} implements; track as iter-2). \
-         Use SerialFifo, or wait for Phase {iter_required}."
+        "ADR-040 EngineMode::SlotAware not yet wired (Phase {iter_landed} \
+         landed; Phase {iter_required} implements). C2b SHIPPED at 886f229c \
+         (worker_run + FifoSchedulerAdapter wiring); SlotAware runtime gated \
+         on iter-2b (Qwen35 worker arm, B4b decode-slot threading) + iter-2c \
+         (Gemma 4 worker arm, B4c prefill-slot threading). \
+         Use `--scheduler fifo_serial` (or unset `HF2Q_SCHEDULER`), or wait \
+         for Phase {iter_required}."
     )]
     ModeNotYetWired {
-        /// The iter that introduced the API surface (e.g. `"C1.5"`).
+        /// The iter that introduced the API surface (e.g. `"C2b"`).
         iter_landed: &'static str,
-        /// The iter that will implement the runtime (e.g. `"C2"`).
+        /// The iter that will implement the runtime (e.g.
+        /// `"C2b/C2c (per-family worker arms)"`).
         iter_required: &'static str,
     },
 }
@@ -2748,8 +2772,11 @@ impl Engine {
                 Ok(engine)
             }
             EngineMode::SlotAware { .. } => Err(EngineSpawnError::ModeNotYetWired {
-                iter_landed: "C1.5",
-                iter_required: "C2",
+                // Bumped from "C1.5"/"C2" at C2b ship (886f229c) per ADR-040
+                // §6.1.8: the worker_run refactor is live, but the per-family
+                // SlotAware arms remain in iter-2b (Qwen35) + iter-2c (Gemma 4).
+                iter_landed: "C2b",
+                iter_required: "C2b/C2c (per-family worker arms)",
             }),
         }
     }
