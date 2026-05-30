@@ -622,6 +622,19 @@ impl MultiSeqHbKvBuffers {
 }
 
 /// Per-layer dense F32/F16 KV buffers for dense attention path (ADR-009).
+///
+/// **Legacy single-seq variant.**  ADR-040 Phase A3b iter-2 shipped the
+/// multi-seq sibling [`MultiSeqDenseKvBuffers`] +
+/// [`alloc_multi_seq_dense_kv_for_layer`] for `HF2Q_USE_DENSE=1` paths
+/// that need `n_seqs > 1`.  This struct remains the legacy single-seq
+/// path used by the 3 inline production alloc sites
+/// (`forward_prefill.rs:705`, `forward_prefill_batched.rs:367`,
+/// `engine.rs:6836`) at implicit `n_seqs=1` byte-for-byte unchanged
+/// until Phase B4c re-routes those sites through
+/// `alloc_multi_seq_dense_kv_for_layer`.  The
+/// `impl MultiSeqKvCache for DenseKvBuffers` below is a TYPED CLAMP
+/// (`slot_count() == 1`; in-bounds slot 0 ops return
+/// `CapabilityUnsupported` pointing at the multi-seq sibling).
 pub struct DenseKvBuffers {
     pub k: MlxBuffer,
     pub v: MlxBuffer,
@@ -1239,12 +1252,395 @@ impl MultiSeqHybridKvBuffers {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// ADR-040 Phase A3b iter-2 — multi-seq variant of DenseKvBuffers.
+//
+// DenseKvBuffers is the DEV/DEBUG KV variant for Gemma 4 reachable via
+// `HF2Q_USE_DENSE=1` (off-default; the production-default path is
+// HybridKvBuffers since ADR-029 iter-13 per H10 falsification).  This
+// sibling struct mirrors A3b iter-1's `MultiSeqHybridKvBuffers` lift
+// verbatim, adding an outermost `n_seqs` axis to the K and V buffers
+// + a per-seq cursor — the same shape A3a's HbKvBuffers and A3b iter-1's
+// HybridKvBuffers use.
+//
+// Sibling-struct rationale (same as A3a / A3b iter-1):
+//   * The legacy `DenseKvBuffers` struct is used by 3 production
+//     alloc sites (`forward_prefill.rs:705`,
+//     `forward_prefill_batched.rs:367`, `engine.rs:6836`) at implicit
+//     `n_seqs=1` via struct-literal init.  Adding required fields
+//     would break those sites; sibling-struct keeps the legacy
+//     unchanged + adds the multi-seq shape additively.  Phase B4c
+//     re-routes the alloc sites through
+//     `alloc_multi_seq_dense_kv_for_layer` when the kernel-side
+//     slot-offset wiring lands.
+//
+// Scope (A3b iter-2):
+//   * Per-buffer n_seqs OUTERMOST: K `[n_seqs, nkv, cap, hd]`,
+//     V `[n_seqs, nkv, cap, hd]` — dtype is per-call (F32 default,
+//     F16 when `HF2Q_F16_KV=1`).
+//   * Per-seq cursor `seq_lens: Vec<u32>` of length n_seqs.
+//   * MultiSeqKvCache impl mirroring A3b iter-1's MultiSeqHybridKvBuffers
+//     (bounds-first per iter-1.5 cfa-finding-F5; fork cross-slot →
+//     CapabilityUnsupported A3c deferral).
+//   * `reset_for_slot` inherent method mirroring the A3a/A3b iter-1
+//     siblings for the iter-B4c-kernel iter-1 reset-on-entry/exit
+//     discipline.
+//
+// At n_seqs=1 the byte counts are byte-equivalent to the legacy
+// `DenseKvBuffers` per-layer K + V allocs (H148 hypothesis).  The
+// only observable shape difference is the leading `1` dimension on
+// every buffer.
+//
+// DEFERRED to A3c (parallel to Qwen35 A2c per dossier R5):
+//   * fork_seq cross-slot kernel dispatch.  iter-A3b-2 returns
+//     `CapabilityUnsupported` per iter-2.5 M1 mantra-compliance —
+//     same shape as A3a / A3b iter-1 / Qwen35.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Multi-seq variant of [`DenseKvBuffers`] — ADR-040 Phase A3b iter-2.
+///
+/// Outermost axis on every buffer is `n_seqs`.  Buffer layouts:
+/// - K: `[n_seqs, nkv_heads, capacity, head_dim]` of [`Self::dtype`]
+///   (F32 default, F16 when `HF2Q_F16_KV=1` was set at alloc-time).
+/// - V: `[n_seqs, nkv_heads, capacity, head_dim]` of [`Self::dtype`]
+///   (same dtype as K — ADR-017 Phase E.a iter-3.5a invariant).
+///
+/// Per-seq cursor [`seq_lens`](Self::seq_lens) is `Vec<u32>` of length
+/// `n_seqs` (parallel to A3b iter-1's `MultiSeqHybridKvBuffers::seq_lens`).
+/// A per-slot byte offset for kernel writes is
+/// `slot.0 * nkv * cap * hd * dtype.size_of()` (K) / `slot.0 * nkv *
+/// cap * hd * dtype.size_of()` (V) — Phase B4c will thread this
+/// through the `alloc_multi_seq_dense_kv_for_layer` callers via
+/// `MlxBuffer::slice_view`, same primitive Qwen35 B4a-cont uses.
+///
+/// `is_sliding` is recorded on this struct just like the legacy
+/// `DenseKvBuffers`; the per-slot ring-wrap math stays within each
+/// slot's region by construction (n_seqs is outermost, so slot N's
+/// `capacity` window is contiguous and disjoint from slot M's).
+pub struct MultiSeqDenseKvBuffers {
+    /// Number of physical slots — the outermost axis on every buffer.
+    /// Set at construction via [`alloc_multi_seq_dense_kv_for_layer`];
+    /// once set, cannot change without reallocation.
+    pub n_seqs: u32,
+    /// Dense K cache `[n_seqs, nkv_heads, capacity, head_dim]` of
+    /// [`Self::dtype`].
+    pub k: MlxBuffer,
+    /// Dense V cache `[n_seqs, nkv_heads, capacity, head_dim]` of
+    /// [`Self::dtype`] (same dtype as K per ADR-017 Phase E.a
+    /// iter-3.5a invariant).
+    pub v: MlxBuffer,
+    /// Cache capacity in positions (same as the legacy [`DenseKvBuffers`]).
+    pub capacity: usize,
+    /// True if ring-buffer (sliding) semantics.
+    pub is_sliding: bool,
+    /// KV element dtype.  Mirrors `DenseKvBuffers::dtype` (ADR-017
+    /// Phase E.a iter-3.5a invariant); same dtype applies to both K
+    /// and V (no mixed-dtype layout).
+    pub dtype: DType,
+    /// Per-seq write cursor; `seq_lens[slot.0]` is the number of valid
+    /// positions stored in slot `slot.0`.  `len() == n_seqs as usize`
+    /// by construction (see [`alloc_multi_seq_dense_kv_for_layer`]).
+    /// Mirrors A3b iter-1's `MultiSeqHybridKvBuffers::seq_lens` discipline.
+    pub seq_lens: Vec<u32>,
+}
+
+impl crate::serve::kv_persist::lcp_registry::ByteSized for MultiSeqDenseKvBuffers {
+    /// Exact byte count: K + V.  Used by the LcpRegistry byte budget
+    /// identically to `DenseKvBuffers::byte_len` — the lift to N slots
+    /// scales every buffer by N at alloc-time, so `byte_len()`
+    /// automatically reports the per-slot totals × N.
+    fn byte_len(&self) -> u64 {
+        (self.k.byte_len() + self.v.byte_len()) as u64
+    }
+}
+
+/// ADR-040 Phase A3b iter-2 — unified [`MultiSeqDenseKvBuffers`] allocator.
+///
+/// Mirrors A3b iter-1's [`alloc_multi_seq_hybrid_kv_for_layer`]
+/// (same file) in signature shape; the `dtype` parameter is the
+/// per-call invariant the legacy 3 production sites carry inline
+/// (`forward_prefill.rs:701-703` passes `kv_dtype` from
+/// `INVESTIGATION_ENV.f16_kv`).
+///
+/// At `n_seqs=1` the byte counts are byte-equivalent to the legacy
+/// inline-alloc sites' K + V allocs (H148 hypothesis); the only
+/// observable shape difference is the leading `1` dimension on every
+/// buffer.
+///
+/// # Errors
+///
+/// Returns `Err` for `n_seqs == 0`, `nkv == 0`, `hd == 0`, or
+/// `cap == 0` — buffer alloc would otherwise underflow the kernel's
+/// shape preconditions.  Mirrors A3a / A3b iter-1 pre-flight.
+pub fn alloc_multi_seq_dense_kv_for_layer(
+    dev: &MlxDevice,
+    layer_idx: usize,
+    nkv: usize,
+    hd: usize,
+    cap: usize,
+    is_ring: bool,
+    dtype: DType,
+    n_seqs: u32,
+) -> Result<MultiSeqDenseKvBuffers> {
+    if n_seqs == 0 {
+        return Err(anyhow!(
+            "alloc_multi_seq_dense_kv_for_layer L{layer_idx}: n_seqs must be > 0"
+        ));
+    }
+    if nkv == 0 || hd == 0 || cap == 0 {
+        return Err(anyhow!(
+            "alloc_multi_seq_dense_kv_for_layer L{layer_idx}: nkv/hd/cap must be \
+             > 0 (got nkv={nkv}, hd={hd}, cap={cap})"
+        ));
+    }
+    let n = n_seqs as usize;
+    let elem_bytes = dtype.size_of();
+
+    // Dense K: `[n_seqs, nkv, cap, hd]`.  n_seqs is OUTERMOST so
+    // per-slot byte offset = `slot.0 * (nkv*cap*hd*elem_bytes)` is a
+    // contiguous slab Phase B4c can address via `MlxBuffer::slice_view`.
+    let k_elems = n * nkv * cap * hd;
+    let k_bytes = k_elems * elem_bytes;
+    let k = dev
+        .alloc_buffer(k_bytes, dtype, vec![n, nkv, cap, hd])
+        .map_err(|e| anyhow!("multi-seq dense K L{layer_idx}: {e}"))?;
+
+    // Dense V: same shape + dtype as K (ADR-017 Phase E.a iter-3.5a
+    // invariant — both buffers in the legacy DenseKvBuffers share
+    // dtype).
+    let v_elems = n * nkv * cap * hd;
+    let v_bytes = v_elems * elem_bytes;
+    let v = dev
+        .alloc_buffer(v_bytes, dtype, vec![n, nkv, cap, hd])
+        .map_err(|e| anyhow!("multi-seq dense V L{layer_idx}: {e}"))?;
+
+    Ok(MultiSeqDenseKvBuffers {
+        n_seqs,
+        k,
+        v,
+        capacity: cap,
+        is_sliding: is_ring,
+        dtype,
+        seq_lens: vec![0u32; n],
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// ADR-040 Phase A3b iter-2 — MultiSeqKvCache impl for MultiSeqDenseKvBuffers.
+//
+// Mirrors A3b iter-1's MultiSeqHybridKvBuffers impl in structure
+// (bounds-first per iter-1.5 cfa-finding-F5; fork_seq returns
+// `CapabilityUnsupported` per iter-2.5 M1) and in invariants (per-slot
+// cursor isolation; drop_seq does NOT zero the underlying K/V buffer
+// bytes — Phase B4c reuses the slot's region on next admission).
+//
+// Phase A3b iter-2 scope: per-slot CURSOR bookkeeping only.  GPU
+// buffer content writes land via the `alloc_multi_seq_dense_kv_for_layer`
+// callers + the dense-attention dispatchers at Phase B4c.
+// ──────────────────────────────────────────────────────────────────────────
+
+impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqDenseKvBuffers {
+    fn layout(&self) -> crate::serve::multi_seq_kv::MultiSeqLayout {
+        crate::serve::multi_seq_kv::MultiSeqLayout::SeparateSlots
+    }
+
+    fn slot_count(&self) -> u32 {
+        // `MultiSeqDenseKvBuffers::n_seqs` is already `u32`; no cast.
+        self.n_seqs
+    }
+
+    fn seq_len(
+        &self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<u32, crate::serve::multi_seq_kv::MultiSeqError> {
+        // 1. Bounds FIRST (iter-1.5 cfa-finding-F5 ordering).
+        if slot.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // 2. Layout: SeparateSlots only — MultiSeqDenseKvBuffers
+        //    does not expose Paged.
+        // 3. Return the per-seq cursor directly; `seq_lens.len() ==
+        //    n_seqs` by construction (alloc_multi_seq_dense_kv_for_layer).
+        Ok(self.seq_lens[slot.0 as usize])
+    }
+
+    fn append_for_seq(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        n_tokens: u32,
+    ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
+        // 1. Bounds FIRST.
+        if slot.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // 2. Layout: SeparateSlots only.
+        // 3. Budget: SeparateSlots cannot SlotOom on append (buffers
+        //    pre-allocated; cursor protected by saturating_add).
+        //
+        // ADR-040 Phase A3b iter-2 scope: bump the per-seq cursor.
+        // The underlying K / V bytes for slot `slot.0` are written by
+        // the dense-attention kernel dispatcher at Phase B4c via
+        // `MlxBuffer::slice_view(...)`, identically to the A3b iter-1
+        // MultiSeqHybridKvBuffers pattern.
+        let cur = &mut self.seq_lens[slot.0 as usize];
+        *cur = cur.saturating_add(n_tokens);
+        Ok(())
+    }
+
+    fn drop_seq(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
+        // 1. Bounds FIRST.
+        if slot.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // 2. Layout: SeparateSlots only — no LayoutNotSupported.
+        // 3. Budget: drop is a pure release; SlotOom unreachable.
+        //
+        // Cursor-only reset.  The underlying K / V bytes are NOT
+        // zeroed; the next `append_for_seq` into this slot overwrites
+        // them via the dense-attention dispatcher at Phase B4c.
+        // Matches A3a / A3b iter-1 discipline (cursor-masked read).
+        self.seq_lens[slot.0 as usize] = 0;
+        Ok(())
+    }
+
+    fn fork_seq(
+        &mut self,
+        src: crate::serve::multi_seq_kv::SlotId,
+        dst: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
+        // 1. Bounds — src FIRST per iter-1.5 cfa-finding-F5.
+        if src.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot: src,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        if dst.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot: dst,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // 2. Layout: SeparateSlots only — no LayoutNotSupported.
+        // 3. Same-slot fork is a no-op per trait spec.
+        if src == dst {
+            return Ok(());
+        }
+        // ADR-040 Phase A3c deferred (parallel to A3a / A3b iter-1 /
+        // Qwen35 A2c per dossier R5): cross-slot fork requires
+        // same-buffer cross-region memcpy via
+        // `dispatch_kv_cache_copy_seq_*` between slot byte offsets.
+        // The kernel-pattern + its own unit-test arc are scheduled
+        // for A3c — one dispatcher serves all arches + all sibling
+        // structs per dossier §2.3.3.
+        //
+        // **Mantra-aligned (iter-2.5 M1)**: surfaces as
+        // `CapabilityUnsupported` (HTTP 501 upstream) — NOT
+        // `SlotOom { 0, 0 }` (HTTP 429), which would lie about
+        // capacity freeing up.
+        Err(
+            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                capability: "fork_seq cross-slot copy (Gemma 4 MultiSeqDenseKvBuffers; deferred to Phase A3c per ADR-040 §6 + dossier R5)",
+            },
+        )
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// ADR-040 iter-B4c-kernel iter-1 — per-slot reset primitive for
+// MultiSeqDenseKvBuffers (Gemma 4 dense variant; mirrors A3a/A3b iter-1
+// siblings).
+// ──────────────────────────────────────────────────────────────────────────
+
+impl MultiSeqDenseKvBuffers {
+    /// **ADR-040 iter-B4c-kernel iter-1** (shipped on this iter
+    /// A3b iter-2) — per-slot reset for the persistent multi-seq
+    /// `MultiSeqDenseKvBuffers` (Gemma 4 dense F32/F16 KV variant).
+    ///
+    /// Sibling of [`MultiSeqHbKvBuffers::reset_for_slot`] +
+    /// [`MultiSeqHybridKvBuffers::reset_for_slot`] for the
+    /// `HF2Q_USE_DENSE=1` codepath that engages `MultiSeqDenseKvBuffers`.
+    /// When the Gemma 4 SlotAware worker arms are wired through the
+    /// dense scaffold at Phase B4c, this primitive will be called at
+    /// request entry + exit so the persistent per-layer cache is
+    /// request-isolated within the slot.
+    ///
+    /// **Layout proof**:
+    /// - **seq_lens**: `Vec<u32>` of length `n_seqs`. Per-slot reset →
+    ///   set `seq_lens[slot_idx] = 0`; other slots untouched.  Same
+    ///   load-bearing cursor as the A3a / A3b iter-1 siblings.
+    /// - **k / v (dense `[n_seqs, nkv, capacity, head_dim]`)**: NOT
+    ///   zeroed — cursor-masked discipline; the next
+    ///   `append_for_seq`-then-kernel-write sequence overwrites the
+    ///   per-slot K/V region from the dense-attention dispatcher.
+    ///
+    /// # Errors
+    ///
+    /// - `slot.0 >= self.n_seqs` (bounds-first per A2b iter-1.5
+    ///   cfa-finding-F5 ordering).
+    ///
+    /// # Per-slot byte-equivalence pin
+    ///
+    /// At `slot = SlotId(0)` AND `n_seqs == 1` this is byte-equivalent
+    /// to setting `seq_lens[0] = 0` directly (the existing `drop_seq`
+    /// shape).  Sibling pin to the A3a / A3b iter-1 per-slot
+    /// byte-equivalence (see H150).
+    pub fn reset_for_slot(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
+        // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5.
+        if slot.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // Reset the per-slot cursor.  K / V bytes are NOT zeroed
+        // (cursor-masked read path — see layout proof above; matches
+        // `drop_seq` invariant).
+        self.seq_lens[slot.0 as usize] = 0;
+        Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // ADR-040 Phase A3b iter-1 — TYPED CLAMP impls for DenseKvBuffers + MlxKvCache.
 //
 // Both variants are NON-DEFAULT today:
 //   * DenseKvBuffers: reachable via `HF2Q_USE_DENSE=1` (off-default).
+//     The MULTI-SEQ SIBLING `MultiSeqDenseKvBuffers` SHIPPED in
+//     iter-A3b-2 (see §6.1.41 closure block in ADR-040) provides the
+//     full lift; the LEGACY `DenseKvBuffers` retains its typed clamp
+//     until Phase B4c re-routes the 3 production alloc sites
+//     (`forward_prefill.rs:705`, `forward_prefill_batched.rs:367`,
+//     `engine.rs:6836`) through `alloc_multi_seq_dense_kv_for_layer`.
 //   * MlxKvCache: legacy 4-bit nibble-packed path (off-default since
-//     ADR-007 default-on TQ 8-bit).
+//     ADR-007 default-on TQ 8-bit).  Iter-A3b-3 still typed-clamped
+//     (no multi-seq sibling shipped yet).
 //
 // Per dossier R3 mitigation, each clamp:
 //   * Returns `slot_count() == 1` (single-seq by construction).
@@ -1259,9 +1655,13 @@ impl MultiSeqHybridKvBuffers {
 //     discriminant distinguishes "bad slot index" from "staged
 //     capability" rather than collapsing both into one error.
 //
-// FULL LIFT scheduled for:
-//   * iter-A3b-2 — DenseKvBuffers full multi-seq (~150 LOC).
-//   * iter-A3b-3 — MlxKvCache full multi-seq (~80 LOC).
+// FULL LIFT status:
+//   * iter-A3b-2 — DenseKvBuffers full multi-seq via sibling
+//     `MultiSeqDenseKvBuffers` + `alloc_multi_seq_dense_kv_for_layer`
+//     SHIPPED on this iter; Phase B4c re-routes the 3 production
+//     alloc sites for kernel-side engagement.
+//   * iter-A3b-3 — MlxKvCache full multi-seq (~80 LOC) STILL DEFERRED
+//     (legacy 4-bit path; very low priority).
 //
 // The clamps are non-vaporware (production paths that flip the
 // env gate get an honest typed error pointing at the next iter)
@@ -1312,17 +1712,19 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for DenseKvBuffers {
                 },
             );
         }
-        // Single-seq clamp: external cursor.  Iter-A3b-2 wires
-        // the real bump.  Returning Ok(()) here would let a
-        // scheduler-side accountant proceed against an unaware
-        // backing buffer; we honour the clamp by returning a
-        // typed `CapabilityUnsupported` even at slot 0 — the label
-        // names iter-A3b-2 as the deferred-lift target, so the
-        // discriminant is distinct from a real out-of-range error.
-        // Iter-A3b-2 replaces this with the real per-seq bump.
+        // Single-seq clamp: external cursor.  Iter-A3b-2 SHIPPED
+        // the multi-seq sibling `MultiSeqDenseKvBuffers` +
+        // `alloc_multi_seq_dense_kv_for_layer`; this LEGACY struct
+        // retains the typed clamp because the 3 production alloc
+        // sites still emit `DenseKvBuffers` until Phase B4c re-routes
+        // them through the multi-seq allocator.  Returning Ok(())
+        // here would let a scheduler-side accountant proceed against
+        // an unaware backing buffer; we honour the clamp by returning
+        // a typed `CapabilityUnsupported` even at slot 0 — the label
+        // points to the multi-seq sibling as the production path.
         Err(
             crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                capability: "DenseKvBuffers::append_for_seq (full multi-seq lift deferred to ADR-040 Phase A3b iter-2)",
+                capability: "DenseKvBuffers::append_for_seq (legacy single-seq path; full multi-seq lift shipped in ADR-040 Phase A3b iter-2 — use MultiSeqDenseKvBuffers via alloc_multi_seq_dense_kv_for_layer)",
             },
         )
     }
@@ -1340,10 +1742,13 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for DenseKvBuffers {
             );
         }
         // Single-seq clamp: cursor lives outside this struct.
-        // Iter-A3b-2 wires the real reset.
+        // Iter-A3b-2 SHIPPED the multi-seq sibling
+        // `MultiSeqDenseKvBuffers` with the real cursor reset; the
+        // LEGACY struct retains the typed clamp until Phase B4c
+        // re-routes the 3 production alloc sites.
         Err(
             crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                capability: "DenseKvBuffers::drop_seq (full multi-seq lift deferred to ADR-040 Phase A3b iter-2)",
+                capability: "DenseKvBuffers::drop_seq (legacy single-seq path; full multi-seq lift shipped in ADR-040 Phase A3b iter-2 — use MultiSeqDenseKvBuffers via alloc_multi_seq_dense_kv_for_layer)",
             },
         )
     }
@@ -3403,5 +3808,610 @@ mod tests {
             err,
             crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange { .. }
         ));
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // ADR-040 Phase A3b iter-2 — MultiSeqDenseKvBuffers FULL LIFT
+    // hypothesis bank H144-H150.
+    //
+    // Mirrors A3b iter-1's H11-H14 + iter-1.5's H11r structure for the
+    // DenseKvBuffers variant.  The lift is additive (legacy DenseKvBuffers
+    // typed clamp stays — see H15 — until Phase B4c re-routes the 3
+    // production alloc sites; iter-A3b-3 MlxKvCache typed clamp also
+    // stays — see H16 — until iter-A3b-3 ships).
+    //
+    // Hypothesis register:
+    //   H144 — sibling struct + alloc helper exist; n_seqs/seq_lens
+    //          discipline matches A3b iter-1.
+    //   H145 — alloc helper pre-flight: n_seqs=0 / nkv=0 / hd=0 / cap=0
+    //          all return Err (no panic).
+    //   H146 — byte-scale: n_seqs=4 yields exactly 4× the n_seqs=1
+    //          baseline on K + V (both dtypes); EXACT concrete formula
+    //          pinned mirroring H11's iter-1.5 hygiene fix.
+    //   H147 — per-slot byte isolation: host-side writes to slot 0's
+    //          K/V regions leave slot 1's bytes byte-identical.
+    //   H148 — n_seqs=1 byte-equivalence: byte counts match the
+    //          legacy inline DenseKvBuffers per-layer alloc.
+    //   H149 — MultiSeqKvCache impl: slot_count() == n_seqs;
+    //          bounds-first SlotOutOfRange; cursor advances per slot;
+    //          fork cross-slot → CapabilityUnsupported naming A3c.
+    //   H150 — reset_for_slot inherent method: per-slot cursor reset
+    //          with K/V byte preservation (cursor-masked discipline)
+    //          and bounds-first typed OOR.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// **H144** — Sibling struct `MultiSeqDenseKvBuffers` exists with
+    /// `n_seqs` outermost discipline + per-seq cursor + correct dtype/
+    /// is_sliding propagation through [`alloc_multi_seq_dense_kv_for_layer`].
+    ///
+    /// Falsifier (any one ⇒ H144 broken):
+    /// 1. Struct missing or misnamed.
+    /// 2. n_seqs field absent / wrong type.
+    /// 3. seq_lens not Vec<u32> length n_seqs.
+    /// 4. dtype not propagated from alloc-time argument.
+    /// 5. is_sliding not propagated.
+    #[test]
+    fn h144_multi_seq_dense_kv_buffers_sibling_struct_exists() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 8usize;
+        let n_seqs = 3u32;
+
+        // F32 + linear path.
+        let buf_f32_lin = alloc_multi_seq_dense_kv_for_layer(
+            &dev, 0, nkv, hd, cap, /*is_ring=*/ false, DType::F32, n_seqs,
+        )
+        .expect("H144: alloc F32 linear");
+        assert_eq!(buf_f32_lin.n_seqs, n_seqs, "H144: n_seqs propagation");
+        assert_eq!(buf_f32_lin.dtype, DType::F32, "H144: dtype propagation F32");
+        assert!(!buf_f32_lin.is_sliding, "H144: is_sliding=false propagation");
+        assert_eq!(buf_f32_lin.capacity, cap, "H144: capacity propagation");
+        assert_eq!(
+            buf_f32_lin.seq_lens.len(),
+            n_seqs as usize,
+            "H144 FALSIFIED: seq_lens.len() must equal n_seqs"
+        );
+        assert!(
+            buf_f32_lin.seq_lens.iter().all(|&x| x == 0),
+            "H144 FALSIFIED: seq_lens zero-init"
+        );
+        // Shape: n_seqs OUTERMOST on K + V.
+        assert_eq!(
+            buf_f32_lin.k.shape(),
+            &[n_seqs as usize, nkv, cap, hd],
+            "H144 FALSIFIED: K shape n_seqs outermost"
+        );
+        assert_eq!(
+            buf_f32_lin.v.shape(),
+            &[n_seqs as usize, nkv, cap, hd],
+            "H144 FALSIFIED: V shape n_seqs outermost"
+        );
+
+        // F16 + sliding path (HF2Q_F16_KV codepath).
+        let buf_f16_ring = alloc_multi_seq_dense_kv_for_layer(
+            &dev, 7, nkv, hd, cap, /*is_ring=*/ true, DType::F16, n_seqs,
+        )
+        .expect("H144: alloc F16 sliding");
+        assert_eq!(buf_f16_ring.dtype, DType::F16, "H144: dtype propagation F16");
+        assert!(buf_f16_ring.is_sliding, "H144: is_sliding=true propagation");
+    }
+
+    /// **H145** — `alloc_multi_seq_dense_kv_for_layer` pre-flight:
+    /// `n_seqs == 0`, `nkv == 0`, `hd == 0`, `cap == 0` all return
+    /// `Err` (NOT panic).  Mirrors A3a / A3b iter-1 pre-flight.
+    #[test]
+    fn h145_alloc_multi_seq_dense_kv_for_layer_preflight_errors() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        // n_seqs = 0
+        assert!(
+            alloc_multi_seq_dense_kv_for_layer(
+                &dev, 0, 2, 256, 8, false, DType::F32, 0
+            )
+            .is_err(),
+            "H145 FALSIFIED: n_seqs=0 must error"
+        );
+        // nkv = 0
+        assert!(
+            alloc_multi_seq_dense_kv_for_layer(
+                &dev, 0, 0, 256, 8, false, DType::F32, 1
+            )
+            .is_err(),
+            "H145 FALSIFIED: nkv=0 must error"
+        );
+        // hd = 0
+        assert!(
+            alloc_multi_seq_dense_kv_for_layer(
+                &dev, 0, 2, 0, 8, false, DType::F32, 1
+            )
+            .is_err(),
+            "H145 FALSIFIED: hd=0 must error"
+        );
+        // cap = 0
+        assert!(
+            alloc_multi_seq_dense_kv_for_layer(
+                &dev, 0, 2, 256, 0, false, DType::F32, 1
+            )
+            .is_err(),
+            "H145 FALSIFIED: cap=0 must error"
+        );
+    }
+
+    /// **H146** — `alloc_multi_seq_dense_kv_for_layer(.., n_seqs=4)`
+    /// produces buffers byte-scaled exactly 4× the n_seqs=1 baseline
+    /// across K + V on BOTH F32 and F16 dtypes.  EXACT concrete formula
+    /// pinned (mirrors H11 iter-1.5 hygiene fix).
+    ///
+    /// Formula (dtype = F32, hd=256, nkv=2, cap=8):
+    ///   k_bytes = n * nkv * cap * hd * 4 = 4 * 2 * 8 * 256 * 4 = 65536
+    ///   v_bytes = n * nkv * cap * hd * 4 = 65536
+    ///   TOTAL   = 131072
+    /// Formula (dtype = F16, same shape):
+    ///   k_bytes = 65536 / 2 = 32768
+    ///   v_bytes = 32768
+    ///   TOTAL   = 65536
+    #[test]
+    fn h146_multi_seq_dense_kv_n_seqs_4_byte_scale_exact_formula() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 8usize;
+
+        // F32 path.
+        let f32_baseline = alloc_multi_seq_dense_kv_for_layer(
+            &dev, 0, nkv, hd, cap, false, DType::F32, 1
+        ).expect("H146: F32 alloc n_seqs=1");
+        let f32_lifted = alloc_multi_seq_dense_kv_for_layer(
+            &dev, 0, nkv, hd, cap, false, DType::F32, 4
+        ).expect("H146: F32 alloc n_seqs=4");
+        assert_eq!(f32_baseline.n_seqs, 1);
+        assert_eq!(f32_lifted.n_seqs, 4);
+        // 4× scaling on K + V.
+        assert_eq!(
+            f32_lifted.k.byte_len(),
+            f32_baseline.k.byte_len() * 4,
+            "H146 FALSIFIED: F32 K not 4× scale"
+        );
+        assert_eq!(
+            f32_lifted.v.byte_len(),
+            f32_baseline.v.byte_len() * 4,
+            "H146 FALSIFIED: F32 V not 4× scale"
+        );
+        // EXACT formula at n_seqs=4 (F32).
+        let expected_f32_k = 4usize * nkv * cap * hd * 4; // 65536
+        let expected_f32_v = expected_f32_k;
+        let expected_f32_total = expected_f32_k + expected_f32_v;
+        assert_eq!(
+            f32_lifted.k.byte_len(),
+            expected_f32_k,
+            "H146 EXACT FORMULA FALSIFIED: F32 K bytes != n*nkv*cap*hd*4"
+        );
+        assert_eq!(
+            f32_lifted.v.byte_len(),
+            expected_f32_v,
+            "H146 EXACT FORMULA FALSIFIED: F32 V bytes != n*nkv*cap*hd*4"
+        );
+        let actual_f32_total = f32_lifted.k.byte_len() + f32_lifted.v.byte_len();
+        assert_eq!(
+            actual_f32_total, expected_f32_total,
+            "H146 EXACT FORMULA FALSIFIED: F32 composition"
+        );
+        assert_eq!(
+            actual_f32_total, 131_072,
+            "H146 EXACT FORMULA FALSIFIED at concrete value: F32 expected 131072 \
+             bytes for n_seqs=4 nkv=2 cap=8 hd=256; got {}",
+            actual_f32_total
+        );
+
+        // F16 path (HF2Q_F16_KV codepath).
+        let f16_baseline = alloc_multi_seq_dense_kv_for_layer(
+            &dev, 0, nkv, hd, cap, false, DType::F16, 1
+        ).expect("H146: F16 alloc n_seqs=1");
+        let f16_lifted = alloc_multi_seq_dense_kv_for_layer(
+            &dev, 0, nkv, hd, cap, false, DType::F16, 4
+        ).expect("H146: F16 alloc n_seqs=4");
+        assert_eq!(
+            f16_lifted.k.byte_len(),
+            f16_baseline.k.byte_len() * 4,
+            "H146 FALSIFIED: F16 K not 4× scale"
+        );
+        assert_eq!(
+            f16_lifted.v.byte_len(),
+            f16_baseline.v.byte_len() * 4,
+            "H146 FALSIFIED: F16 V not 4× scale"
+        );
+        // EXACT formula (F16: 2 bytes/elem instead of 4).
+        let expected_f16_k = 4usize * nkv * cap * hd * 2; // 32768
+        let expected_f16_v = expected_f16_k;
+        let expected_f16_total = expected_f16_k + expected_f16_v;
+        assert_eq!(
+            f16_lifted.k.byte_len(),
+            expected_f16_k,
+            "H146 EXACT FORMULA FALSIFIED: F16 K bytes != n*nkv*cap*hd*2"
+        );
+        let actual_f16_total = f16_lifted.k.byte_len() + f16_lifted.v.byte_len();
+        assert_eq!(
+            actual_f16_total, expected_f16_total,
+            "H146 EXACT FORMULA FALSIFIED: F16 composition"
+        );
+        assert_eq!(
+            actual_f16_total, 65_536,
+            "H146 EXACT FORMULA FALSIFIED at concrete value: F16 expected 65536 \
+             bytes for n_seqs=4 nkv=2 cap=8 hd=256; got {}",
+            actual_f16_total
+        );
+
+        // Per-seq cursor vec length tracks n_seqs.
+        assert_eq!(f32_baseline.seq_lens.len(), 1);
+        assert_eq!(f32_lifted.seq_lens.len(), 4);
+        assert_eq!(f16_lifted.seq_lens.len(), 4);
+        assert!(f32_lifted.seq_lens.iter().all(|&x| x == 0));
+
+        // Shape pin: n_seqs OUTERMOST on every buffer.
+        for (name, b) in [("k", &f32_lifted.k), ("v", &f32_lifted.v)] {
+            let s = b.shape().to_vec();
+            assert_eq!(s.len(), 4, "H146 M5: {name} must be 4-D; got {:?}", s);
+            assert_eq!(
+                s[0], 4,
+                "H146 M5 FALSIFIED: {name} shape[0] must be n_seqs=4 (n_seqs \
+                 landed on wrong axis); got {:?}",
+                s
+            );
+        }
+    }
+
+    /// **H147** — `MultiSeqDenseKvBuffers` per-slot byte isolation:
+    /// host-side writes of a deterministic non-zero pattern into slot
+    /// 0's K + V regions leave slot 1's bytes byte-identical.  Mirrors
+    /// H12 for the dense F32 variant.
+    ///
+    /// Falsifier: any byte change in slot 1's K / V region after
+    /// writing to slot 0's region ⇒ H147 broken; the per-slot
+    /// byte-offset formula does not produce disjoint regions.
+    #[test]
+    fn h147_multi_seq_dense_kv_per_slot_byte_isolation() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 4usize;
+        let mut cache = alloc_multi_seq_dense_kv_for_layer(
+            &dev, 0, nkv, hd, cap, false, DType::F32, 2
+        ).expect("H147: alloc n_seqs=2");
+        assert_eq!(cache.n_seqs, 2);
+
+        // Per-slot region sizes (F32 = 4 bytes/elem):
+        //   K: slot bytes = nkv * cap * hd * 4
+        //   V: slot bytes = nkv * cap * hd * 4
+        let slot_k_bytes = nkv * cap * hd * 4;
+        let slot_v_bytes = nkv * cap * hd * 4;
+
+        // Sanity: total bytes match 2 * slot_bytes for each buffer.
+        assert_eq!(cache.k.byte_len(), 2 * slot_k_bytes, "H147: K total");
+        assert_eq!(cache.v.byte_len(), 2 * slot_v_bytes, "H147: V total");
+
+        // Write deterministic non-zero pattern into slot 0's K + V
+        // (interpret as u8 bytes for fixture simplicity; the kernel
+        // writes F32 but byte-level isolation is what we're pinning).
+        {
+            let k_slice = cache.k.as_mut_slice::<u8>().expect("K F32 as u8 mut");
+            for (i, b) in k_slice[..slot_k_bytes].iter_mut().enumerate() {
+                *b = (((i * 7) % 251) + 1) as u8;
+            }
+        }
+        {
+            let v_slice = cache.v.as_mut_slice::<u8>().expect("V F32 as u8 mut");
+            for (i, b) in v_slice[..slot_v_bytes].iter_mut().enumerate() {
+                *b = (((i * 11) % 253) + 1) as u8;
+            }
+        }
+
+        // Snapshot slot 1's regions.
+        let k_slot1_before: Vec<u8> = cache.k.as_slice::<u8>().expect("K read")
+            [slot_k_bytes..2 * slot_k_bytes]
+            .to_vec();
+        let v_slot1_before: Vec<u8> = cache.v.as_slice::<u8>().expect("V read")
+            [slot_v_bytes..2 * slot_v_bytes]
+            .to_vec();
+
+        // Sanity: slot 1 is zero-init.
+        assert!(
+            k_slot1_before.iter().all(|&b| b == 0),
+            "H147 fixture sanity: slot 1 K zero-init"
+        );
+        assert!(
+            v_slot1_before.iter().all(|&b| b == 0),
+            "H147 fixture sanity: slot 1 V zero-init"
+        );
+
+        // A3b iter-2 cursor advance on slot 0 (no buffer mutation).
+        cache.append_for_seq(SlotId(0), 3).expect("H147: append slot 0");
+        assert_eq!(cache.seq_lens[0], 3);
+        assert_eq!(cache.seq_lens[1], 0);
+
+        // H147 falsifier: slot 1's bytes must be byte-identical.
+        let k_slot1_after: Vec<u8> = cache.k.as_slice::<u8>().expect("K read 2")
+            [slot_k_bytes..2 * slot_k_bytes]
+            .to_vec();
+        let v_slot1_after: Vec<u8> = cache.v.as_slice::<u8>().expect("V read 2")
+            [slot_v_bytes..2 * slot_v_bytes]
+            .to_vec();
+
+        assert_eq!(
+            k_slot1_before, k_slot1_after,
+            "H147 FALSIFIED: slot 1 K bytes changed after slot-0 write"
+        );
+        assert_eq!(
+            v_slot1_before, v_slot1_after,
+            "H147 FALSIFIED: slot 1 V bytes changed after slot-0 write"
+        );
+    }
+
+    /// **H148** — n_seqs=1 byte-equivalence: allocating
+    /// `MultiSeqDenseKvBuffers` at `n_seqs=1` produces buffer byte
+    /// counts EQUAL to a legacy `DenseKvBuffers` per-layer K + V
+    /// allocation at the same `(nkv, cap, hd, dtype)` parameters.
+    ///
+    /// Pins the H148 hypothesis: the iter-A3b-2 sibling-struct lift is
+    /// byte-equivalent at n_seqs=1 to the 3 legacy production alloc
+    /// sites (`forward_prefill.rs:705`, `forward_prefill_batched.rs:367`,
+    /// `engine.rs:6836`) which each emit `DenseKvBuffers` with
+    /// `nkv*cap*hd*dtype.size_of()` bytes per buffer.  Phase B4c re-route
+    /// will be byte-safe by construction.
+    #[test]
+    fn h148_multi_seq_dense_kv_n_seqs_1_byte_equivalent_to_legacy() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 8usize;
+
+        for &dtype in &[DType::F32, DType::F16] {
+            let multi = alloc_multi_seq_dense_kv_for_layer(
+                &dev, 0, nkv, hd, cap, false, dtype, 1
+            ).expect("H148: alloc multi-seq n_seqs=1");
+
+            // Legacy per-layer formula (mirrors forward_prefill.rs:700-704):
+            //   n = nkv * capacity * hd
+            //   alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, cap, hd])
+            let legacy_bytes = nkv * cap * hd * dtype.size_of();
+
+            assert_eq!(
+                multi.k.byte_len(),
+                legacy_bytes,
+                "H148 FALSIFIED ({:?}): K bytes {} != legacy {}",
+                dtype, multi.k.byte_len(), legacy_bytes
+            );
+            assert_eq!(
+                multi.v.byte_len(),
+                legacy_bytes,
+                "H148 FALSIFIED ({:?}): V bytes {} != legacy {}",
+                dtype, multi.v.byte_len(), legacy_bytes
+            );
+
+            // Total parity vs legacy DenseKvBuffers (K + V).
+            let legacy_total = 2 * legacy_bytes;
+            use crate::serve::kv_persist::lcp_registry::ByteSized;
+            assert_eq!(
+                multi.byte_len(),
+                legacy_total as u64,
+                "H148 FALSIFIED ({:?}): total byte_len {} != legacy K+V {}",
+                dtype, multi.byte_len(), legacy_total
+            );
+        }
+    }
+
+    /// **H149** — `MultiSeqKvCache` impl for `MultiSeqDenseKvBuffers`:
+    /// `slot_count() == n_seqs` (NOT 1 — the multi-seq sibling is no
+    /// longer clamped); bounds-first SlotOutOfRange on the OOR path;
+    /// per-slot cursor advance + drop; fork same-slot Ok; fork cross-slot
+    /// → CapabilityUnsupported naming A3c.  Mirrors H11/H12/H13 +
+    /// gemma4_hb_kv_fork_cross_slot_returns_capability_unsupported.
+    #[test]
+    fn h149_multi_seq_dense_kv_multi_seq_kv_cache_impl() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let n_seqs = 4u32;
+        let mut cache = alloc_multi_seq_dense_kv_for_layer(
+            &dev, 0, 2, 256, 8, false, DType::F32, n_seqs
+        ).expect("H149: alloc n_seqs=4");
+
+        // 1. slot_count() == n_seqs (NOT the clamp's 1).
+        assert_eq!(
+            cache.slot_count(),
+            n_seqs,
+            "H149 FALSIFIED: slot_count must equal n_seqs={n_seqs}"
+        );
+        assert_eq!(cache.layout(), MultiSeqLayout::SeparateSlots);
+
+        // 2. All slots start at cursor 0.
+        for s in 0..n_seqs {
+            assert_eq!(
+                cache.seq_len(SlotId(s)).expect("seq_len in range"),
+                0,
+                "H149: slot {s} starts at cursor 0"
+            );
+        }
+
+        // 3. Bounds-first OOR on seq_len.
+        let err = cache.seq_len(SlotId(n_seqs)).expect_err("OOR n_seqs");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(n_seqs),
+                max_slots: n_seqs,
+            },
+            "H149 FALSIFIED: seq_len OOR shape; got {err:?}"
+        );
+
+        // 4. Per-slot cursor advance.
+        cache.append_for_seq(SlotId(0), 5).expect("append slot 0");
+        cache.append_for_seq(SlotId(2), 3).expect("append slot 2");
+        assert_eq!(cache.seq_len(SlotId(0)).unwrap(), 5);
+        assert_eq!(
+            cache.seq_len(SlotId(1)).unwrap(),
+            0,
+            "H149 FALSIFIED: slot 1 cursor touched by slot 0/2 append"
+        );
+        assert_eq!(cache.seq_len(SlotId(2)).unwrap(), 3);
+        assert_eq!(
+            cache.seq_len(SlotId(3)).unwrap(),
+            0,
+            "H149 FALSIFIED: slot 3 cursor touched by slot 0/2 append"
+        );
+
+        // 5. Bounds-first OOR on append.
+        let err = cache.append_for_seq(SlotId(n_seqs + 1), 1).expect_err("append OOR");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange {
+                slot: SlotId(n_seqs + 1),
+                max_slots: n_seqs,
+            }
+        );
+
+        // 6. drop_seq resets target cursor, leaves siblings.
+        cache.drop_seq(SlotId(0)).expect("drop slot 0");
+        assert_eq!(cache.seq_len(SlotId(0)).unwrap(), 0, "H149: slot 0 reset");
+        assert_eq!(
+            cache.seq_len(SlotId(2)).unwrap(),
+            3,
+            "H149 FALSIFIED: slot 2 preserved through slot 0 drop"
+        );
+
+        // 7. Bounds-first OOR on drop.
+        let err = cache.drop_seq(SlotId(99)).expect_err("drop OOR");
+        assert!(matches!(
+            err,
+            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
+        ));
+
+        // 8. fork_seq same slot is a no-op Ok.
+        cache.fork_seq(SlotId(1), SlotId(1)).expect("self-fork no-op");
+
+        // 9. Bounds-first OOR on fork (src then dst).
+        let err = cache.fork_seq(SlotId(99), SlotId(0)).expect_err("fork src OOR");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
+        );
+        let err = cache.fork_seq(SlotId(0), SlotId(99)).expect_err("fork dst OOR");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
+        );
+
+        // 10. fork cross-slot → CapabilityUnsupported naming A3c.
+        let err = cache.fork_seq(SlotId(0), SlotId(1)).expect_err("fork cross-slot");
+        match err {
+            MultiSeqError::CapabilityUnsupported { capability } => {
+                assert!(
+                    capability.contains("MultiSeqDenseKvBuffers"),
+                    "H149 FALSIFIED: fork label must name struct: {capability}"
+                );
+                assert!(
+                    capability.contains("A3c"),
+                    "H149 FALSIFIED: fork label must name A3c deferral: {capability}"
+                );
+            }
+            other => panic!("H149 FALSIFIED: expected CapabilityUnsupported; got {other:?}"),
+        }
+    }
+
+    /// **H150** — `MultiSeqDenseKvBuffers::reset_for_slot` inherent
+    /// method: per-slot cursor reset with K + V byte preservation
+    /// (cursor-masked discipline matching A3a / A3b iter-1 siblings);
+    /// bounds-first typed OOR; SlotId(0) at n_seqs=1 is byte-equivalent
+    /// case (must succeed).
+    ///
+    /// Mirrors `iter_b4c_kernel_iter1_multi_seq_hybrid_kv_reset_for_slot_*`
+    /// tests for the dense variant.
+    #[test]
+    fn h150_multi_seq_dense_kv_reset_for_slot_per_slot_isolation_and_bounds() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 4usize;
+        let n_seqs = 4u32;
+        let mut cache = alloc_multi_seq_dense_kv_for_layer(
+            &dev, 0, nkv, hd, cap, false, DType::F32, n_seqs
+        ).expect("alloc n_seqs=4");
+
+        // Seed every slot's cursor + K/V bytes with distinct patterns.
+        for s in 0..(n_seqs as usize) {
+            cache.seq_lens[s] = (s as u32) + 11;
+        }
+        let slot_k_bytes = nkv * cap * hd * 4; // F32
+        let slot_v_bytes = nkv * cap * hd * 4;
+        {
+            let k_slice = cache.k.as_mut_slice::<u8>().expect("k u8");
+            for s in 0..(n_seqs as usize) {
+                let start = s * slot_k_bytes;
+                for (i, b) in k_slice[start..start + slot_k_bytes].iter_mut().enumerate() {
+                    *b = (((s * 17 + i) % 251) + 1) as u8;
+                }
+            }
+        }
+        {
+            let v_slice = cache.v.as_mut_slice::<u8>().expect("v u8");
+            for s in 0..(n_seqs as usize) {
+                let start = s * slot_v_bytes;
+                for (i, b) in v_slice[start..start + slot_v_bytes].iter_mut().enumerate() {
+                    *b = (((s * 19 + i) % 253) + 1) as u8;
+                }
+            }
+        }
+        // Snapshot K/V for every slot before the reset.
+        let k_before: Vec<u8> = cache.k.as_slice::<u8>().expect("k read").to_vec();
+        let v_before: Vec<u8> = cache.v.as_slice::<u8>().expect("v read").to_vec();
+
+        // Reset slot 1.
+        cache
+            .reset_for_slot(SlotId(1))
+            .expect("reset_for_slot(1) on n_seqs=4");
+
+        // Slot 1's cursor must be 0; others untouched.
+        for s in 0..(n_seqs as usize) {
+            if s == 1 {
+                assert_eq!(
+                    cache.seq_lens[s], 0,
+                    "H150 FALSIFIED: slot 1 cursor must be 0 after reset_for_slot(1)"
+                );
+            } else {
+                assert_eq!(
+                    cache.seq_lens[s], (s as u32) + 11,
+                    "H150 FALSIFIED: slot {s} cursor must be untouched"
+                );
+            }
+        }
+
+        // K/V bytes of EVERY slot are byte-identical pre/post
+        // (cursor-masked discipline — no K/V byte zeroing on reset).
+        let k_after: Vec<u8> = cache.k.as_slice::<u8>().expect("k read 2").to_vec();
+        let v_after: Vec<u8> = cache.v.as_slice::<u8>().expect("v read 2").to_vec();
+        assert_eq!(
+            k_before, k_after,
+            "H150 FALSIFIED: reset_for_slot must NOT zero K bytes \
+             (cursor-masked discipline; matches drop_seq invariant)"
+        );
+        assert_eq!(
+            v_before, v_after,
+            "H150 FALSIFIED: reset_for_slot must NOT zero V bytes"
+        );
+
+        // Bounds-first OOR.
+        let err = cache.reset_for_slot(SlotId(99)).expect_err("slot 99 OOR");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 },
+            "H150 FALSIFIED: reset OOR shape; got {err:?}"
+        );
+
+        // SlotId(0) at n_seqs=1 byte-equivalence case (must succeed).
+        let mut cache1 = alloc_multi_seq_dense_kv_for_layer(
+            &dev, 0, 2, 256, 4, false, DType::F32, 1
+        ).expect("alloc n_seqs=1");
+        cache1.seq_lens[0] = 7;
+        cache1
+            .reset_for_slot(SlotId(0))
+            .expect("SlotId(0) at n_seqs=1 must succeed (byte-equivalence case)");
+        assert_eq!(cache1.seq_lens[0], 0);
     }
 }
