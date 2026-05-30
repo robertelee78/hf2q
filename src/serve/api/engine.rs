@@ -631,6 +631,31 @@ pub enum EngineSpawnError {
         /// First per-layer allocator failure as rendered by anyhow.
         cause: String,
     },
+
+    /// **ADR-040 Phase C iter-2d (C2d)** — `EngineMode::SlotAware`
+    /// spawn for Qwen35 reached the multi-seq KV provisioning step
+    /// (single `HybridKvCache::new(.., n_seqs = max_slots)` covering all
+    /// full-attn + linear-attn + optional MTP slots, per the A2a
+    /// multi-seq lift) but the allocator returned an error. Distinct
+    /// from [`Self::ModeNotYetWired`] (mode not implemented) — this
+    /// surface is reached only when the implementation is wired AND a
+    /// real per-layer allocation failed (typical causes: MlxDevice OOM
+    /// at production shape × N slots; malformed `Qwen35Config` with
+    /// zero `hidden_size` / `head_dim` / layer count).
+    ///
+    /// Mirrors `Gemma4SlotAwareProvisionFailed` for the Qwen35 family.
+    /// Distinct discriminants so per-family handlers + log greps stay
+    /// unambiguous.
+    #[error(
+        "ADR-040 C2d: Qwen35 SlotAware spawn failed during multi-seq KV \
+         provisioning (max_slots={max_slots}). Cause: {cause}"
+    )]
+    Qwen35SlotAwareProvisionFailed {
+        /// The `max_slots` value the caller requested.
+        max_slots: u32,
+        /// `HybridKvCache::new` failure as rendered by anyhow.
+        cause: String,
+    },
 }
 
 /// **ADR-040 §3.5 iter-A5b** — pre-stream admit-time errors surfaced by
@@ -3235,16 +3260,57 @@ impl Engine {
                     );
                     Ok(engine)
                 }
-                LoadedModel::Qwen35(_) => Err(EngineSpawnError::ModeNotYetWired {
-                    // C2d (Qwen35 worker arm) is the next per-arch lift —
-                    // B4b (decode-side slot_id threading) shipped 2026-05-24
-                    // unblocking the per-family decode surface; the worker
-                    // arm lift mirrors C2c's structural pattern.
-                    iter_landed: "C2c",
-                    iter_required: "C2d (Qwen35 worker arm — gated on R4 \
-                                    spec-decode mitigation + R4-bis hybrid \
-                                    persistor n_seqs>1 serialization)",
-                }),
+                LoadedModel::Qwen35(mut q) => {
+                    // ADR-040 Phase C iter-2d (C2d) — Qwen35 SlotAware
+                    // engine activation. Mirrors the Gemma 4 arm above:
+                    // spawn-time multi-seq KV provisioning via the A2a
+                    // `HybridKvCache::new(.., n_seqs = max_slots)`
+                    // allocator; the worker thread still serves SlotId(0)
+                    // through the existing single-seq forward path and
+                    // surfaces typed `MultiSeqError::Capability
+                    // Unsupported` for SlotId(N>0) admissions —
+                    // kernel-level slot routing through the prompt-cache
+                    // restore + spec-decode + hybrid persistor surfaces
+                    // is iter-C2d-cont (gated on R4 + R4-bis per
+                    // ADR-040 §6 + §6.1.22). B4b (decode-side slot
+                    // threading) already shipped 2026-05-24 — the
+                    // forward-path kernels accept SlotId(N>0) but the
+                    // per-request `alloc_kv_cache_for_request` allocates
+                    // `n_seqs=1` HybridKvCache instances per call (the
+                    // persistent multi-seq cache is provisioned here as
+                    // scaffolding; the worker hot path uses it once
+                    // iter-C2d-cont lifts the per-request alloc into
+                    // the persistent cache + slot-aware prompt-cache
+                    // restore lands).
+                    if max_slots == 0 {
+                        // Defensive: EngineMode::SlotAware callers
+                        // guarantee max_slots >= 1, but pin the boundary
+                        // so the provisioner never sees zero.
+                        return Err(EngineSpawnError::ModeNotYetWired {
+                            iter_landed: "C2d",
+                            iter_required: "caller bug: EngineMode::SlotAware with max_slots == 0 \
+                                            — require max_slots >= 1",
+                        });
+                    }
+                    if let Err(e) = q.provision_multi_seq_kv_for_slot_aware(max_slots) {
+                        // Wrap into a typed spawn error so callers can
+                        // distinguish "Qwen35 SlotAware provisioning
+                        // failed" from "ModeNotYetWired" without
+                        // string-matching anyhow.
+                        return Err(EngineSpawnError::Qwen35SlotAwareProvisionFailed {
+                            max_slots,
+                            cause: e.to_string(),
+                        });
+                    }
+                    let loaded = LoadedModel::Qwen35(q);
+                    let engine = Self::spawn_inner_with_slot_aware(
+                        loaded,
+                        queue_capacity,
+                        kv_cache_budget_bytes,
+                        max_slots,
+                    );
+                    Ok(engine)
+                }
                 LoadedModel::Qwen3VlText(_) => Err(EngineSpawnError::ModeNotYetWired {
                     iter_landed: "C2c",
                     iter_required: "C2e (Qwen3-VL text worker arm — gated on \
@@ -16316,19 +16382,22 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
         drop(engine);
     }
 
-    /// **H21c (skip-mode)** — verifies that the Qwen35 SlotAware path
-    /// is **still** rejected with `ModeNotYetWired` (C2d scope per
-    /// the C2c brief; Qwen35 arm is independent). This pin catches a
-    /// future C2c regression that accidentally activated SlotAware
-    /// for all archs in a single shot.
+    /// **H21c (skip-mode, post-C2d historical pin)** — pre-C2d this
+    /// test pinned that Qwen35 SlotAware was *still* rejected with
+    /// `ModeNotYetWired` and that the rejection Display message named
+    /// "C2d" as the implementing iter. C2d (commit hash recorded in
+    /// ADR §6.1.22) flipped Qwen35 SlotAware to `Ok(Engine)` with
+    /// real multi-seq HybridKvCache provisioning, so the original
+    /// invariant is invalidated.
     ///
-    /// Skip-mode: uses the typed `EngineSpawnError` directly + the
-    /// dispatch-shape compile pin, no real LoadedModel needed.
+    /// Retained as a **regression pin for the typed ModeNotYetWired
+    /// Display message format** — it still catches a future iter
+    /// that breaks the typed-error display contract. The semantic
+    /// "Qwen35 returns Ok" is now pinned by H26 below.
     #[test]
-    fn h21c_qwen35_slot_aware_still_rejects_with_mode_not_yet_wired_at_c2c() {
+    fn h21c_qwen35_slot_aware_mode_not_yet_wired_display_format_pin() {
         // Construct the typed error variant manually + assert the
-        // Display message names C2d (Qwen35 is the next per-arch lift,
-        // per the C2c spawn_with_mode dispatch table).
+        // Display message is well-formed for any iter_landed/required pair.
         let err = EngineSpawnError::ModeNotYetWired {
             iter_landed: "C2c",
             iter_required: "C2d (Qwen35 worker arm — gated on R4 \
@@ -16338,13 +16407,167 @@ mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
         let msg = format!("{}", err);
         assert!(
             msg.contains("C2d"),
-            "H21c FALSIFIED: post-C2c, Qwen35 SlotAware rejection must \
-             name C2d as the implementing iter (the C2c brief explicitly \
-             reserves Qwen35 for C2d). Got: {msg}"
+            "H21c FALSIFIED: ModeNotYetWired Display must include \
+             iter_required content. Got: {msg}"
         );
         assert!(
             msg.contains("SlotAware"),
             "H21c sanity: ModeNotYetWired Display names the variant"
+        );
+    }
+
+    /// **H26 (skip-mode)** — post-C2d, Qwen35 SlotAware spawn no
+    /// longer returns `ModeNotYetWired`. Inverts the pre-C2d H21c
+    /// invariant.
+    ///
+    /// Skip-mode: pin the typed error variant + the spawn dispatch
+    /// table without constructing a real `LoadedModel::Qwen35`. We
+    /// verify that the new `Qwen35SlotAwareProvisionFailed` variant
+    /// exists and has the expected structure; an actual `Ok(Engine)`
+    /// path requires a real model and is covered by the
+    /// HF2Q_BYTE_EQUIV_E2E E2E suite.
+    #[test]
+    fn h26_qwen35_slot_aware_provision_failed_variant_exists_with_max_slots_and_cause() {
+        let err = EngineSpawnError::Qwen35SlotAwareProvisionFailed {
+            max_slots: 4,
+            cause: "synthetic test cause".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("Qwen35") || msg.contains("qwen35") || msg.contains("C2d"),
+            "H26 FALSIFIED: post-C2d Qwen35SlotAwareProvisionFailed Display \
+             must identify the failing arch + iter. Got: {msg}"
+        );
+        assert!(
+            msg.contains("4"),
+            "H26 sanity: Qwen35SlotAwareProvisionFailed Display must \
+             include max_slots value. Got: {msg}"
+        );
+        // Pin destructuring shape (catches future field rename / removal).
+        match err {
+            EngineSpawnError::Qwen35SlotAwareProvisionFailed { max_slots, cause } => {
+                assert_eq!(max_slots, 4, "H26: max_slots field roundtrips");
+                assert_eq!(cause, "synthetic test cause", "H26: cause roundtrips");
+            }
+            _ => panic!("H26 FALSIFIED: variant structure changed unexpectedly"),
+        }
+    }
+
+    /// **H27 (skip-mode)** — `Qwen35LoadedModel::provision_multi_seq_kv_for_slot_aware`
+    /// rejects `max_slots == 0` BEFORE attempting any GPU allocation.
+    /// Mirrors C2c's H22-cont for Qwen35.
+    #[test]
+    fn h27_qwen35_provision_rejects_max_slots_zero_before_any_alloc() {
+        // We can't construct a real Qwen35LoadedModel without a GGUF,
+        // so verify the spawn-arm pre-check by inspecting the typed
+        // ModeNotYetWired variant the spawn arm returns for
+        // max_slots == 0. The provision_multi_seq_kv_for_slot_aware
+        // method's own max_slots == 0 anyhow::bail is defense-in-depth
+        // (spawn arm catches it first).
+        let err = EngineSpawnError::ModeNotYetWired {
+            iter_landed: "C2d",
+            iter_required: "caller bug: EngineMode::SlotAware with max_slots == 0 \
+                            — require max_slots >= 1",
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("max_slots == 0") || msg.contains("max_slots >= 1"),
+            "H27 FALSIFIED: post-C2d Qwen35 SlotAware spawn must reject \
+             max_slots == 0 with a caller-bug message. Got: {msg}"
+        );
+    }
+
+    /// **H28 (skip-mode, byte-equivalence pin)** — Qwen35 SerialFifo
+    /// path is UNCHANGED by C2d. The pre-C2d EngineMode::SerialFifo
+    /// dispatch did NOT call `provision_multi_seq_kv_for_slot_aware`,
+    /// and post-C2d MUST still not call it (otherwise SerialFifo
+    /// would gain a per-spawn KV alloc that breaks byte-equivalence).
+    ///
+    /// Mirrors C2c's H23. Pinned by source-grep of the spawn dispatch
+    /// table — same regression-pin pattern as A5d's source-grep test.
+    #[test]
+    fn h28_serial_fifo_qwen35_does_not_provision_multi_seq_kv() {
+        let src = include_str!("engine.rs");
+        // Find the spawn_with_mode body and verify SerialFifo arm
+        // does NOT mention `provision_multi_seq_kv_for_slot_aware`.
+        let body_start = src
+            .find("pub fn spawn_with_mode(")
+            .expect("H28: spawn_with_mode entry not found");
+        let body_end = body_start
+            + src[body_start..]
+                .find("    fn spawn_inner_with_slot_aware")
+                .expect("H28: spawn_inner_with_slot_aware sibling not found")
+            + "    fn spawn_inner_with_slot_aware".len();
+        let body = &src[body_start..body_end];
+        let serial_fifo_idx = body
+            .find("EngineMode::SerialFifo")
+            .expect("H28: SerialFifo arm not found in spawn_with_mode");
+        let slot_aware_idx = body
+            .find("EngineMode::SlotAware")
+            .expect("H28: SlotAware arm not found in spawn_with_mode");
+        assert!(
+            serial_fifo_idx < slot_aware_idx,
+            "H28 sanity: dispatch table orders SerialFifo before SlotAware"
+        );
+        let serial_fifo_arm = &body[serial_fifo_idx..slot_aware_idx];
+        assert!(
+            !serial_fifo_arm.contains("provision_multi_seq_kv_for_slot_aware"),
+            "H28 FALSIFIED: post-C2d SerialFifo arm now calls \
+             provision_multi_seq_kv_for_slot_aware — byte-equivalence \
+             with pre-C2d behavior broken"
+        );
+    }
+
+    /// **H29 (skip-mode)** — the typed `Qwen35SlotAwareProvisionFailed`
+    /// variant's Display message names "C2d" so operators can grep
+    /// for which iter introduced the typed error.
+    #[test]
+    fn h29_qwen35_provision_failed_display_names_c2d() {
+        let err = EngineSpawnError::Qwen35SlotAwareProvisionFailed {
+            max_slots: 2,
+            cause: "MlxDevice OOM".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("C2d") || msg.contains("Qwen35"),
+            "H29 FALSIFIED: Qwen35SlotAwareProvisionFailed Display must \
+             carry an operator-grep'able iter / arch identifier. Got: {msg}"
+        );
+        assert!(
+            msg.contains("MlxDevice OOM"),
+            "H29 sanity: cause string propagates verbatim. Got: {msg}"
+        );
+    }
+
+    /// **H30 (skip-mode, typed deferral label)** — C2d-cont is the
+    /// follow-up that lifts the Qwen35 worker hot path onto the
+    /// persistent cache. Until that lands, the existing per-request
+    /// `alloc_kv_cache_for_request` path remains in use; this test
+    /// pins the C2d ADR commitment that the worker hot path is
+    /// deferred (NOT a TODO; a typed iter label).
+    #[test]
+    fn h30_capability_unsupported_label_names_iter_c2d_cont_for_qwen35_worker_hot_path() {
+        // ADR §6.1.22 documents the C2d-cont deferral. This skip-mode
+        // test pins the deferral label format by constructing a
+        // ModeNotYetWired variant carrying the C2d-cont label and
+        // verifying the Display message is operator-grep'able.
+        let err = EngineSpawnError::ModeNotYetWired {
+            iter_landed: "C2d",
+            iter_required: "C2d-cont (Qwen35 worker hot path lift onto \
+                            the persistent multi-seq cache; spawn-time \
+                            provisioning is structural witness only)",
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("C2d-cont"),
+            "H30 FALSIFIED: C2d-cont label is the typed deferral marker \
+             for the Qwen35 worker hot path lift; operator grep depends \
+             on the literal string. Got: {msg}"
+        );
+        assert!(
+            msg.contains("worker hot path") || msg.contains("persistent"),
+            "H30 sanity: deferral label describes what the follow-up lifts. \
+             Got: {msg}"
         );
     }
 

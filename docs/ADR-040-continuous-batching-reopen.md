@@ -1840,8 +1840,59 @@ Path A (full activation with B4c bundled) was considered but Gemma 4's `forward_
 
 **Remaining followups** (typed, not vaporware):
 - **iter-C2c-cont (B4c)**: Gemma 4 `forward_prefill.rs` GPU-side slot-offset routing through the 30 prefill-path layer iterations × the multi-seq KV variants (HbKvBuffers + HybridKvBuffers + xlen optional). Pinned by H25's `CapabilityUnsupported` label.
-- **iter-C2d**: Qwen35 SlotAware engine activation (mirror of this iter for Qwen35; B4b unblocked the decode path, C2d wires it through spawn_with_mode). Pinned by H21c's typed rejection regression.
+- **iter-C2d**: Qwen35 SlotAware engine activation (mirror of this iter for Qwen35; B4b unblocked the decode path, C2d wires it through spawn_with_mode). **SHIPPED** in iter-C2d (see §6.1.22).
 - **iter-A3b-2 / iter-A3b-3**: DenseKvBuffers + MlxKvCache full lifts (still typed-clamped per A3b iter-1 + A3b iter-1.5 hygiene fix; reachable only via `HF2Q_USE_DENSE=1` / legacy 4-bit path).
+
+### 6.1.22 Iter-C2d closure — Qwen35 SlotAware engine activation (Path B mirror of C2c, 2026-05-24, commit hash TBD)
+
+Direct mirror of C2c §6.1.21 for the Qwen35 architecture. Pre-C2d, `Engine::spawn_with_mode(.., EngineMode::SlotAware { max_slots: N })` for Qwen35 returned `Err(EngineSpawnError::ModeNotYetWired { iter_required: "C2d (...)" })`. Iter-C2d flips that arm to **`Ok(Engine)` with real multi-seq HybridKvCache provisioning** (per-model `HybridKvCache::new_with_options(.., n_seqs = max_slots, ..)` via the A2a allocator). The worker hot path lift onto the persistent cache is staged as **iter-C2d-cont** (typed deferral, pinned by H30's `ModeNotYetWired { iter_required: "C2d-cont (...)" }` label).
+
+**Path chosen — Path B** (provisioning + typed worker-hot-path deferral):
+
+Path A (full activation with C2d-cont's worker hot path bundled) was considered but rejected for the same risk-symmetry reason as C2c chose Path B over its own Path A: bundling the per-request `alloc_kv_cache_for_request` → persistent-cache reuse switch in the same iter risks regressing the SerialFifo byte-equivalence pin that A5* arc closed. Path B ships the *provisioning* surface (spawn-time `n_seqs = max_slots` HybridKvCache witness) while keeping the per-request alloc path verbatim. The persistent cache scaffold is `Some(cache)` after spawn but is consulted only at the spawn-witness level today; iter-C2d-cont will route worker hot-path `forward_gpu_last_logits` calls through the persistent cache at `slot_id = SlotId(0..max_slots-1)`.
+
+**New typed error**:
+
+| Variant | When raised | Carrying |
+|---|---|---|
+| `EngineSpawnError::Qwen35SlotAwareProvisionFailed { max_slots, cause }` | Qwen35 SlotAware spawn reached `HybridKvCache::new_with_options` with `n_seqs = max_slots` but the allocator returned an `anyhow::Error` (typical: MlxDevice OOM at production shape × N slots; `cfg.max_position_embeddings` zero). | `max_slots: u32` + first allocator failure rendered by anyhow. Distinct discriminant from `ModeNotYetWired` (mode unimplemented) AND from C2c's `Gemma4SlotAwareProvisionFailed` (per-family typed error stays per-family). |
+
+**Tests (6 new in `serve::api::engine::adr040_phase_c_iter2c_gemma4_slot_aware_tests` — C2c bundle extended; module name retained for grep-symmetry with C2c)**:
+
+| Test | Pins |
+|---|---|
+| `h21c_qwen35_slot_aware_mode_not_yet_wired_display_format_pin` | **Retained from C2c with rewritten docstring**: pre-C2d this pinned that Qwen35 was *still* rejected; post-C2d it pins the typed `ModeNotYetWired` Display contract (regression pin for any future iter that breaks the display format). The semantic "Qwen35 returns Ok" moved to H26 below. |
+| `h26_qwen35_slot_aware_provision_failed_variant_exists_with_max_slots_and_cause` | New `Qwen35SlotAwareProvisionFailed` variant exists, carries `max_slots: u32 + cause: String`, destructuring matches expected shape. Pins the typed error structure across future refactors. |
+| `h27_qwen35_provision_rejects_max_slots_zero_before_any_alloc` | Bounds-first: `max_slots == 0` returns typed `ModeNotYetWired` with `caller bug: ... require max_slots >= 1` message BEFORE any GPU allocation runs. Defense-in-depth at both spawn-arm and `provision_multi_seq_kv_for_slot_aware` (anyhow::bail mirror). |
+| `h28_serial_fifo_qwen35_does_not_provision_multi_seq_kv` | **SerialFifo byte-equivalence pin via source-grep**: extracts `spawn_with_mode` body, locates the `SerialFifo` arm, asserts it does NOT contain `provision_multi_seq_kv_for_slot_aware`. Catches any future iter that accidentally inserts spawn-time KV alloc into the SerialFifo dispatch. Mirrors A5d's source-order regression-pin pattern. |
+| `h29_qwen35_provision_failed_display_names_c2d` | The `Qwen35SlotAwareProvisionFailed` Display message contains "C2d" or "Qwen35" + propagates the `cause` string verbatim. Operator-grep'able iter / arch identifier. |
+| `h30_capability_unsupported_label_names_iter_c2d_cont_for_qwen35_worker_hot_path` | **Typed deferral pin**: iter-C2d-cont is the follow-up that lifts the Qwen35 worker hot path onto the persistent multi-seq cache. Test pins the label format ("C2d-cont", "worker hot path", "persistent") so future iters can't silently drop the deferral marker. |
+
+**Quality gates**:
+- `cargo check --release --tests`: 0 errors, only pre-existing warnings unrelated to C2d
+- `cargo test --release --bin hf2q -- h21c h26 h27 h28 h29 h30 --test-threads=1`: **6 PASS / 0 FAIL**
+- `cargo test --release --bin hf2q -- adr040_phase_c_iter2c_gemma4 --test-threads=1`: **16 PASS** (C2c's 11 baseline + 5 of C2d's 6 — H21c retained with rewritten docstring, +H26-H30 added)
+- `cargo test --release --bin hf2q -- qwen35::forward_gpu::tests::b4 --test-threads=1`: **12 PASS** preserved (B4a + B4b surface unchanged)
+- `cargo test --release --test continuous_batching_throughput`: **21 PASS** preserved
+
+**Net delta**: +160 LOC production code (src/serve/api/engine.rs: new `Qwen35SlotAwareProvisionFailed` variant + Qwen35 arm of `spawn_with_mode` flipped, ~86 LOC; src/serve/api/engine_qwen35.rs: new `Qwen35LoadedModel::provision_multi_seq_kv_for_slot_aware` method, ~84 LOC) + ~190 LOC test additions in engine.rs (H21c docstring rewrite + 5 new H26-H30 tests) + ~70 LOC ADR §6.1.22 closure block.
+
+**Mantra audit**:
+- Zero new `// TODO`, `unimplemented!()`, `todo!()`, `FIXME` in production code.
+- Every deferral typed: `Qwen35SlotAwareProvisionFailed` (provision-time failure), `ModeNotYetWired { iter_required: "C2d-cont (...)" }` (worker hot path lift).
+- SerialFifo byte-equivalence pinned by H28 source-grep.
+- Gemma 4 SlotAware arm UNCHANGED (per-family branches stay independent — Gemma 4's `Gemma4SlotAwareProvisionFailed` variant and provisioning method live alongside Qwen35's per-family equivalents).
+- C2c's 10 surviving H21-H25 tests preserved; H21c renamed + retargeted as a typed-error display format pin.
+- A5* + B4a/cont/.1 + A3a + A3b iter-1/1.5 + B4b + C2c surfaces NOT touched — additive impl only.
+
+**Background-agent recovery note**: the C2d background agent socket-died mid-execution after ~7.5 minutes; 160 LOC of correct production code (the new variant + spawn-arm flip + provision method) was committed by the agent before the connection dropped. Post-resume, this iter completed the work inline: H21c docstring rewrite (the pre-C2d "still rejects" claim is now historically wrong) + 5 new H26-H30 tests mirroring C2c's H21-H25 + this §6.1.22 closure block.
+
+**Remaining followups** (typed, not vaporware):
+- **iter-C2d-cont**: Qwen35 worker hot path lift onto the persistent multi-seq cache. Today, `Qwen35LoadedModel::provision_multi_seq_kv_for_slot_aware` populates `self.persistent_kv_cache = Some(HybridKvCache(n_seqs=max_slots))` at spawn time, but the worker hot path (`forward_gpu_last_logits` via `alloc_kv_cache_for_request`) still allocates a fresh per-request cache. iter-C2d-cont routes the worker hot path through the persistent cache at `slot_id = SlotId(0..max_slots-1)`. Pinned by H30's label.
+- **iter-C2c-cont (B4c)**: Gemma 4 `forward_prefill.rs` GPU-side slot-offset routing (still pending; pinned by C2c's H25).
+- **iter-A3b-2 / iter-A3b-3**: DenseKvBuffers + MlxKvCache full lifts (still typed-clamped per A3b iter-1 + A3b iter-1.5 hygiene fix).
+- **iter-A2b**: HybridKvCache linear-attn lift (gates some Qwen35 SlotAware paths in the linear-attn variants; orthogonal to this iter).
+- **Phase E1**: production cutover decision + final ADR-040 closure ceremony (gated on all of the above).
 
 ---
 

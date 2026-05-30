@@ -751,6 +751,90 @@ impl Qwen35LoadedModel {
             "ADR-027 iter-6b.3: hydrate_lcp_registry_from_disk complete"
         );
     }
+
+    /// **ADR-040 Phase C iter-2d (C2d)** — provision the persistent
+    /// multi-seq KV scaffold via [`HybridKvCache::new_with_options`]
+    /// with `n_seqs = max_slots`.
+    ///
+    /// Called by [`crate::serve::api::engine::Engine::spawn_with_mode`]
+    /// when [`crate::serve::api::engine::EngineMode::SlotAware`] is
+    /// selected for a Qwen35 engine. Sets
+    /// [`Self::persistent_kv_cache`] to
+    /// `Some(HybridKvCache { n_seqs: max_slots, .. })` covering every
+    /// layer (full-attn + linear-attn + optional MTP slot) in a single
+    /// cache instance — mirrors the production
+    /// `alloc_kv_cache_for_request` path at `engine_qwen35.rs:1088`,
+    /// just with `n_seqs = max_slots` instead of `1` and
+    /// `max_seq_len = cfg.max_position_embeddings` (rather than the
+    /// per-request `prompt_len + max_tokens + 64` sizing — the
+    /// spawn-time scaffold is sized to the model's full context
+    /// window because the per-request prompt/decode lengths are not
+    /// known at spawn time).
+    ///
+    /// **Why a single `HybridKvCache` (not per-layer like Gemma 4)**:
+    /// Qwen35's `HybridKvCache` already owns the per-layer `LayerSlot`
+    /// table internally (full_attn / linear_attn / mtp_slot fields
+    /// indexed by per-layer rank). The A2a multi-seq lift threaded
+    /// `n_seqs` through that internal layout — there is no sibling
+    /// `MultiSeqHybridKvBuffers` type at the engine layer the way
+    /// Gemma 4 has `MultiSeqHbKvBuffers`. So Qwen35's C2d provisioning
+    /// is one allocator call vs Gemma 4's N (one per layer).
+    ///
+    /// **TQ-active path**: honours `self.tq_kv_active` so the multi-seq
+    /// scaffold matches the engine's tq_kv mode. The B4a-cont.1
+    /// `build_gated_attn_layer` canonical entry gate still rejects
+    /// `slot.tq.is_some() && slot_id.0 != 0` (typed
+    /// `B4a-TQ`-cited error) — provisioning the TQ buffers at
+    /// `n_seqs = max_slots` is structurally valid; the kernel-side
+    /// TQ multi-slot dispatch is iter-B4a-TQ scope.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first [`HybridKvCache::new_with_options`] error
+    /// (`anyhow::Error`); typical causes are zero `max_seq_len` /
+    /// zero `n_seqs` (caught earlier by the spawn arm's `max_slots == 0`
+    /// guard) or MlxDevice OOM at production shape × N slots.
+    pub fn provision_multi_seq_kv_for_slot_aware(
+        &mut self,
+        max_slots: u32,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        if max_slots == 0 {
+            anyhow::bail!(
+                "ADR-040 C2d: provision_multi_seq_kv_for_slot_aware called with \
+                 max_slots == 0; spawn_with_mode invariant is max_slots >= 1 \
+                 (EngineMode::SlotAware variant enforces this at the API \
+                 boundary — caller violated)"
+            );
+        }
+        let device = mlx_native::MlxDevice::new()
+            .context("ADR-040 C2d: MlxDevice::new for Qwen35 multi-seq KV provisioning")?;
+        // Size to full context window — spawn-time doesn't know
+        // per-request prompt/decode lengths. The per-request
+        // `alloc_kv_cache_for_request` path (used until iter-C2d-cont
+        // lifts the worker hot path onto the persistent cache)
+        // continues to size per-request via `prompt_len + max_tokens +
+        // 64`; the spawn-time scaffold is the structural witness that
+        // the A2a allocator works at `n_seqs = max_slots` for this
+        // model's shape.
+        let max_seq_len = self.model.cfg.max_position_embeddings;
+        let cache = HybridKvCache::new_with_options(
+            &self.model.cfg,
+            &device,
+            max_seq_len,
+            max_slots,
+            self.tq_kv_active,
+        )
+        .with_context(|| {
+            format!(
+                "ADR-040 C2d: HybridKvCache::new_with_options(max_seq_len={}, \
+                 n_seqs={}, tq_kv_active={}) for Qwen35 SlotAware provisioning",
+                max_seq_len, max_slots, self.tq_kv_active
+            )
+        })?;
+        self.persistent_kv_cache = Some(cache);
+        Ok(())
+    }
 }
 
 /// ADR-027 Phase A iter-6b.2 — derive the on-disk filename hex from a
