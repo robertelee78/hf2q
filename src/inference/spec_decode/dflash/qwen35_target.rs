@@ -322,6 +322,27 @@ impl<'a> DFlashTarget for Qwen35DFlashTarget<'a> {
             }
             argmaxes.push(best_idx);
         }
+        // ADR-040 §6.1.55 (iter-A4-cont-acceptance-telemetry, 2026-05-30) —
+        // DFlash verify-step emission seam.  The verifier-side
+        // dataflow here returns per-position argmaxes; the
+        // orchestrator above (rejection-sampler etc.) decides which
+        // are accepted.  We emit a structural shape record naming
+        // `slot_id` + `seq_len` as the drafted-token budget.
+        // `accepted_tokens` is reported as `seq_len` (the verify-side
+        // upper bound) — the orchestrator-side emission seam at
+        // EAGLE-3's `run_iteration` carries the precise
+        // walk-tree-accept count.  Both seams are structurally
+        // grep-able per H233d.  Production wiring lands at
+        // iter-A4-cont-acceptance-telemetry-prod (gated on
+        // `/metrics` schema extension per dossier §6 + §7).
+        crate::inference::spec_decode::emit_acceptance_metric(
+            crate::inference::spec_decode::SpecDecodeAcceptanceMetric::new(
+                self.slot_id,
+                seq_len as u32,
+                seq_len as u32,
+                0,
+            ),
+        );
         Ok(argmaxes)
     }
 }

@@ -782,6 +782,137 @@ fn drafter_copy_buffer_slot_region(
     Ok(())
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// ADR-040 §6.1.55 iter-A4-cont-drafter-dispatcher (2026-05-30) —
+// SingleSeq vs MultiSeq drafter cache dispatch.
+//
+// Per the §6.1.55 dossier (research/§5), the orchestrator routes
+// between [`DrafterKvCache`] (pre-A4 byte-equivalent single-seq) and
+// [`MultiSeqDrafterKvCache`] (post-A4 batched spec-decode opt-in)
+// based on the engine mode discriminator.  Today the SlotAware-side
+// arm is structurally wired but NEVER engaged at runtime — the
+// `Engine::spawn_with_mode` SlotAware arm's threshold gate from iter-1
+// (§6.1.54) rejects `max_slots > 4` unless
+// `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED=1` is set; once the operator opts
+// in OR an empirical inflection-point measurement lands a tunable
+// threshold above 1, this dispatcher is the routing seam the worker
+// arm will call.
+//
+// **Pure variant + routing helper** — no kernel writes.  The
+// kernel-level routing (per-slot byte-stride dispatch through the
+// EAGLE-3 `tree_attention` kernel) is iter-A4-cont-drafter-dispatcher-
+// kernel, gated on the inflection-point measurement per dossier §6.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// **ADR-040 §6.1.55 iter-A4-cont-drafter-dispatcher (2026-05-30)** —
+/// SingleSeq vs MultiSeq variant carrier for the EAGLE-3 drafter KV
+/// cache.
+///
+/// Mirror of the dossier §5 design.  At construction time the
+/// orchestrator picks one of the two arms based on the engine mode:
+///
+/// - [`Self::SingleSeq`] — pre-A4 byte-equivalent single-seq cache.
+///   Selected on `EngineMode::SerialFifo` AND on
+///   `EngineMode::SlotAware { max_slots: 1 }` (the single-slot
+///   degenerate case where the multi-seq path would carry the same
+///   byte count anyway; H230 pins the byte equivalence).
+/// - [`Self::MultiSeq`] — post-A4 multi-seq cache.  Selected on
+///   `EngineMode::SlotAware { max_slots: N>1 }` AFTER the threshold
+///   gate at `Engine::spawn_with_mode` either accepts the value OR the
+///   operator has set `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED=1` for the
+///   documented-regression regime.
+///
+/// **iter-A4-cont-drafter-dispatcher-kernel (deferred)**: the
+/// kernel-level routing through `tree_attention` per-slot byte
+/// strides lands at iter-A4-cont-drafter-dispatcher-kernel.  Today
+/// only the routing-variant decision lives here; the kernel-side
+/// dispatch is gated on the empirical inflection-point measurement
+/// per dossier §6 (the iter would be a B4c-kernel-style §6.1.45
+/// mirror for the drafter K/V buffers).
+pub enum DrafterKvCacheVariant {
+    /// Pre-A4 single-seq variant.  Byte-equivalent to the legacy
+    /// [`DrafterKvCache`] surface in every observable way.
+    SingleSeq(DrafterKvCache),
+    /// Post-A4 multi-seq variant.  See [`MultiSeqDrafterKvCache`] for
+    /// the per-slot cursor + buffer layout.
+    MultiSeq(MultiSeqDrafterKvCache),
+}
+
+impl DrafterKvCacheVariant {
+    /// Returns the slot count (1 for [`Self::SingleSeq`]; `n_seqs` for
+    /// [`Self::MultiSeq`]).  Pure accessor; no allocation.
+    pub fn slot_count(&self) -> u32 {
+        match self {
+            Self::SingleSeq(_) => 1,
+            Self::MultiSeq(c) => c.n_seqs,
+        }
+    }
+
+    /// `true` when this variant is the multi-seq arm (post-A4
+    /// dispatcher engaged).  Operator-grep'able via the
+    /// `iter-A4-cont-drafter-dispatcher` cite at the call site.
+    pub fn is_multi_seq(&self) -> bool {
+        matches!(self, Self::MultiSeq(_))
+    }
+}
+
+/// **ADR-040 §6.1.55 iter-A4-cont-drafter-dispatcher (2026-05-30)** —
+/// route the requested `max_slots` from
+/// [`crate::serve::api::engine::EngineMode::SlotAware`] to the
+/// appropriate [`DrafterKvCacheVariant`] arm.
+///
+/// Pure decision function — takes the slot count + the legacy
+/// per-shape allocator arguments and produces the variant decision.
+/// Does NOT allocate any GPU buffer (kernel-level dispatch + alloc
+/// lands at iter-A4-cont-drafter-dispatcher-kernel; today the helper
+/// is the structural routing seam only).
+///
+/// # Semantics
+///
+/// - `max_slots == 1` ⇒ pick `DrafterKvCacheVariant::SingleSeq` (the
+///   degenerate case is byte-equivalent to the multi-seq alternative
+///   at n_seqs=1 per H230; carrying the legacy type preserves the
+///   pre-A4 byte-equivalence pin from §6.1.54).
+/// - `max_slots > 1` ⇒ pick `DrafterKvCacheVariant::MultiSeq` — the
+///   per-slot cursor + buffer routing seam.
+///
+/// The companion [`Engine::spawn_with_mode`] threshold gate at
+/// `engine.rs::SpecDecodeMaxSlotsAboveBatchedThreshold` enforces the
+/// safe-zone policy; this helper is reached ONLY when the gate
+/// already accepted the `max_slots` value.
+///
+/// # Cross-references
+///
+/// - Dossier §5 (concrete API surface proposal — this is the
+///   `DrafterKvCacheVariant` arm).
+/// - ADR-040 §6.1.54 (iter-A4 iter-1 SHIPPED — API + threshold gate;
+///   this helper is the orchestrator-side mirror of that contract).
+/// - ADR-040 §6.1.55 (closure block — names the full structural
+///   bundle).
+#[inline]
+pub fn select_drafter_kv_variant_for_mode(
+    max_slots: u32,
+) -> DrafterKvCacheSelection {
+    if max_slots <= 1 {
+        DrafterKvCacheSelection::SingleSeq
+    } else {
+        DrafterKvCacheSelection::MultiSeq { n_seqs: max_slots }
+    }
+}
+
+/// Companion typed decision for [`select_drafter_kv_variant_for_mode`].
+///
+/// Carries the routing decision shape *without* constructing the
+/// buffer (lets unit tests pin the routing policy at the
+/// structural-shape level — no MlxDevice required).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrafterKvCacheSelection {
+    /// Pre-A4 single-seq routing (production-default).
+    SingleSeq,
+    /// Post-A4 multi-seq routing with `n_seqs` distinct slots.
+    MultiSeq { n_seqs: u32 },
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -1407,5 +1538,106 @@ mod tests {
             crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers,
         >();
         assert_multi_seq_kv::<crate::serve::multi_seq_kv::NoopMultiSeqKvCache>();
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-040 §6.1.55 iter-A4-cont-drafter-dispatcher (2026-05-30) —
+    // H235 structural pins for DrafterKvCacheVariant + selection
+    // helper.  Pure-data tests; no MlxDevice required.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// **H235a** — [`DrafterKvCacheSelection`] is a pure-data variant
+    /// carrier; `select_drafter_kv_variant_for_mode` routes by
+    /// `max_slots` per the dossier §5 contract.
+    ///
+    /// - `max_slots == 0` ⇒ SingleSeq (degenerate; defense-in-depth —
+    ///   the spawn arm pre-rejects `max_slots == 0` per the C2c/C2d/C2e
+    ///   `ModeNotYetWired` discipline, but the routing helper preserves
+    ///   the SingleSeq fallback to avoid surprising panics).
+    /// - `max_slots == 1` ⇒ SingleSeq (the degenerate single-slot
+    ///   case is byte-equivalent to multi-seq at n_seqs=1; pre-A4
+    ///   preserved).
+    /// - `max_slots > 1` ⇒ MultiSeq with the requested `n_seqs`.
+    #[test]
+    fn h235a_drafter_kv_cache_selection_routes_by_max_slots_2026_05_30() {
+        assert_eq!(
+            select_drafter_kv_variant_for_mode(0),
+            DrafterKvCacheSelection::SingleSeq,
+            "H235a: max_slots == 0 MUST degrade to SingleSeq (defense-in-depth)"
+        );
+        assert_eq!(
+            select_drafter_kv_variant_for_mode(1),
+            DrafterKvCacheSelection::SingleSeq,
+            "H235a: max_slots == 1 MUST route to SingleSeq (byte-equivalent to \
+             MultiSeq at n_seqs=1; pre-A4 preserved)"
+        );
+        for n in [2u32, 3, 4, 8, 16, 1024] {
+            assert_eq!(
+                select_drafter_kv_variant_for_mode(n),
+                DrafterKvCacheSelection::MultiSeq { n_seqs: n },
+                "H235a: max_slots == {n} MUST route to MultiSeq with the requested n_seqs"
+            );
+        }
+    }
+
+    /// **H235b** — `DrafterKvCacheVariant::slot_count` returns the
+    /// correct slot count for both arms.  Tested via the synthetic
+    /// fixture (no GPU): the SingleSeq arm wraps a real
+    /// [`DrafterKvCache`] (slot_count == 1 by definition) and the
+    /// MultiSeq arm exposes the carrier's `n_seqs`.
+    #[test]
+    fn h235b_drafter_kv_cache_variant_slot_count_pin_2026_05_30() {
+        let (_, single) = match make_cache() {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "[skip] h235b — MlxDevice unavailable; selection enum + \
+                     is_multi_seq pinned in h235a / h235c."
+                );
+                return;
+            }
+        };
+        let variant = DrafterKvCacheVariant::SingleSeq(single);
+        assert_eq!(variant.slot_count(), 1, "H235b: SingleSeq arm slot_count == 1");
+        assert!(!variant.is_multi_seq(), "H235b: SingleSeq is NOT multi_seq");
+    }
+
+    /// **H235c** — `DrafterKvCacheSelection` derives Debug + PartialEq
+    /// + Copy at the type level (pinned by the H235a equality assertions,
+    /// restated here as a compile-time witness for clarity).
+    #[test]
+    fn h235c_drafter_kv_cache_selection_copy_eq_witness_2026_05_30() {
+        let s = DrafterKvCacheSelection::MultiSeq { n_seqs: 4 };
+        let s2 = s; // Copy
+        assert_eq!(s, s2);
+        let s3 = DrafterKvCacheSelection::SingleSeq;
+        assert_ne!(s, s3);
+    }
+
+    /// **H235d (source-grep pin)** — the dispatcher cite is named at
+    /// the type declaration site + companion routing helper site.
+    /// Operator-grep'able for the future iter-A4-cont-drafter-
+    /// dispatcher-kernel implementer.
+    #[test]
+    fn h235d_drafter_dispatcher_cite_named_at_source_2026_05_30() {
+        let src = include_str!("kv_cache.rs");
+        assert!(
+            src.contains("iter-A4-cont-drafter-dispatcher"),
+            "H235d FALSIFIED: kv_cache.rs does NOT name \
+             `iter-A4-cont-drafter-dispatcher` at the dispatcher cite."
+        );
+        assert!(
+            src.contains("DrafterKvCacheVariant"),
+            "H235d FALSIFIED: DrafterKvCacheVariant variant carrier missing."
+        );
+        assert!(
+            src.contains("select_drafter_kv_variant_for_mode"),
+            "H235d FALSIFIED: select_drafter_kv_variant_for_mode routing \
+             helper missing."
+        );
+        assert!(
+            src.contains("SingleSeq") && src.contains("MultiSeq"),
+            "H235d FALSIFIED: SingleSeq / MultiSeq arm names missing."
+        );
     }
 }

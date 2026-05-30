@@ -1558,3 +1558,186 @@ fn cb_throughput_required_env_vars_documented() {
         assert!(n > 0, "N must be positive, got {}", n);
     }
 }
+
+// ============================================================================
+// ADR-040 §6.1.55 iter-A4-cont-inflection-bench (2026-05-30) —
+// acceptance-rate dimension on top of D3's throughput cell.
+//
+// Per dossier §6, this is the D3-style AC-4 throughput bench extended
+// to plot acceptance_rate × concurrent_count for hf2q's Qwen35/Qwen3.6
+// + EAGLE-3 drafter combos.  Structural scaffold lands today; the
+// env-gated measurement body runs ONLY when both
+// `HF2Q_CB_THROUGHPUT_E2E=1` AND `HF2Q_A4_INFLECTION_BENCH=1` are set.
+//
+// Skip-mode preserves the D3 contract: ALL existing throughput-cell
+// tests pass unchanged.  Cell carriers + report helpers are pure
+// data; no I/O at the type level.
+// ============================================================================
+
+/// **ADR-040 §6.1.55 iter-A4-cont-inflection-bench (2026-05-30)** —
+/// per-(concurrent, acceptance) cell for the acceptance-rate dimension
+/// extension to the D3 throughput bench.
+///
+/// Mirror of [`ThroughputCellStable`] in shape; carries the
+/// acceptance-rate axis alongside the existing aggregate throughput
+/// median.  Plotting `acceptance_rate` on the x-axis against
+/// `tokens_per_step` (decode-side throughput per verification step)
+/// lets the operator visually identify the spec-decode inflection
+/// point on hf2q's hardware (dossier §1.5 + §6).
+///
+/// **Skip-mode safety**: pure data; no allocations beyond the
+/// fields.  All-defaulted via [`Self::synthetic_for_smoke`] for the
+/// always-on scaffold-shape pin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AcceptanceCell {
+    /// N concurrent requests (matches the D3 ThroughputCell
+    /// `concurrency` field).
+    pub concurrent: u32,
+    /// Mean per-step acceptance rate measured at this concurrency.
+    /// `[0.0, 1.0]` (clamped by
+    /// [`crate::inference::spec_decode::SpecDecodeAcceptanceMetric::
+    /// acceptance_ratio`]).
+    pub acceptance_rate: f64,
+    /// Decode tokens per verification step.  At high acceptance this
+    /// approaches the tree budget; at low acceptance this drops to 1
+    /// (the verifier-side argmax always emits at least one token).
+    pub tokens_per_step: f64,
+}
+
+impl AcceptanceCell {
+    /// **ADR-040 §6.1.55 iter-A4-cont-inflection-bench (2026-05-30)** —
+    /// synthetic cell for the always-on scaffold-shape smoke test.
+    /// Mirrors [`ThroughputCell::synthetic_for_smoke`].
+    pub fn synthetic_for_smoke() -> Self {
+        AcceptanceCell {
+            concurrent: 1,
+            acceptance_rate: 0.0,
+            tokens_per_step: 0.0,
+        }
+    }
+}
+
+/// Render a vector of [`AcceptanceCell`] as a markdown table — the
+/// env-gated bench body calls this to emit the report alongside the
+/// D3 throughput report.
+pub fn render_acceptance_report(cells: &[AcceptanceCell]) -> String {
+    let mut s = String::from("| concurrent | acceptance_rate | tokens_per_step |\n");
+    s.push_str("|------------|-----------------|-----------------|\n");
+    for c in cells {
+        s.push_str(&format!(
+            "| {} | {:.3} | {:.2} |\n",
+            c.concurrent, c.acceptance_rate, c.tokens_per_step
+        ));
+    }
+    s
+}
+
+#[test]
+fn acceptance_cell_synthetic_round_trips_through_report() {
+    let cells = vec![AcceptanceCell::synthetic_for_smoke()];
+    let report = render_acceptance_report(&cells);
+    assert!(report.contains("| 1 |"), "acceptance report: {}", report);
+    assert!(report.contains("concurrent"), "header missing");
+    assert!(report.contains("|------------|"), "separator missing");
+}
+
+#[test]
+fn render_acceptance_report_empty_returns_header_only() {
+    let report = render_acceptance_report(&[]);
+    let lines: Vec<&str> = report.lines().collect();
+    assert_eq!(lines.len(), 2, "header + separator only, got: {:?}", lines);
+}
+
+/// **ADR-040 §6.1.55 iter-A4-cont-inflection-bench (2026-05-30)** —
+/// env-gated harness placeholder for the acceptance-rate dimension
+/// bench.
+///
+/// Today: structural scaffold.  Skip mode preserves the D3 contract.
+/// When `HF2Q_CB_THROUGHPUT_E2E=1` AND `HF2Q_A4_INFLECTION_BENCH=1`
+/// AND `HF2Q_CB_THROUGHPUT_MODEL=<gguf>` are ALL set, the body would
+/// run a real acceptance-rate measurement at the D3 concurrency
+/// sweep (1, 2, 4, 8) and plot `acceptance_rate` × `tokens_per_step`
+/// against `concurrent` to find the workload-specific inflection
+/// point.
+///
+/// **Why a placeholder**: the kernel-side dispatcher
+/// (iter-A4-cont-drafter-dispatcher-kernel) has not landed; running
+/// the measurement before the dispatcher would surface 0% acceptance
+/// at every concurrency (the drafter would never write past
+/// `SlotId(0)`).  Once the kernel dispatcher lands + the threshold
+/// gate is tuned by hf2q operator measurement, this body fills in.
+#[test]
+fn a4_inflection_bench_acceptance_dimension_scaffold() {
+    if std::env::var("HF2Q_CB_THROUGHPUT_E2E").as_deref() != Ok("1") {
+        eprintln!(
+            "[a4-inflection-bench] skipped — set HF2Q_CB_THROUGHPUT_E2E=1 \
+             AND HF2Q_A4_INFLECTION_BENCH=1 AND HF2Q_CB_THROUGHPUT_MODEL=<gguf> \
+             to engage the acceptance-rate dimension bench. Today this is a \
+             structural scaffold per ADR-040 §6.1.55 iter-A4-cont-inflection-bench."
+        );
+        return;
+    }
+    if std::env::var("HF2Q_A4_INFLECTION_BENCH").as_deref() != Ok("1") {
+        eprintln!(
+            "[a4-inflection-bench] skipped — HF2Q_CB_THROUGHPUT_E2E=1 set but \
+             HF2Q_A4_INFLECTION_BENCH != 1; respecting bench opt-in."
+        );
+        return;
+    }
+    // Structural-cell-shape proof under the env gate.  The real
+    // measurement body lands at iter-A4-cont-drafter-dispatcher-kernel
+    // once the per-slot kernel routing exists — see the docstring.
+    let cells: Vec<AcceptanceCell> = vec![AcceptanceCell::synthetic_for_smoke()];
+    let report = render_acceptance_report(&cells);
+    println!(
+        "\n=== ADR-040 §6.1.55 iter-A4-cont-inflection-bench (scaffold) ===\n{report}"
+    );
+}
+
+// ============================================================================
+// ADR-040 §6.1.55 iter-A4-cont-moe-validation (2026-05-30) —
+// operator-runnable env-gated harness for Qwen3.6-A3B MoE A/B at
+// N=1,2,4,8 concurrent.
+//
+// Per dossier §1.6 #3 the MoE-routing trap is a known production
+// hidden trap; this harness reserves the structural shape for the
+// operator-runnable A/B at the published-inflection threshold.
+//
+// Skip-mode: no-op (the env gate guards the body).  When
+// `HF2Q_A4_MOE_AB_VALIDATION_E2E=1` AND `HF2Q_CB_THROUGHPUT_MODEL` is
+// set, the test would run a real A/B comparing baseline-Qwen3.6 vs
+// batched-spec-decode-Qwen3.6 at the four concurrencies.
+// ============================================================================
+
+#[test]
+fn a4_moe_validation_qwen36_a3b_a_b_n_1_2_4_8() {
+    if std::env::var("HF2Q_A4_MOE_AB_VALIDATION_E2E").as_deref() != Ok("1") {
+        eprintln!(
+            "[a4-moe-validation] skipped — set HF2Q_A4_MOE_AB_VALIDATION_E2E=1 \
+             AND HF2Q_CB_THROUGHPUT_MODEL=<Qwen3.6-A3B-gguf> to engage the \
+             MoE A/B bench at N=1,2,4,8 concurrent. ADR-040 §6.1.55 \
+             iter-A4-cont-moe-validation harness."
+        );
+        return;
+    }
+    // Hard requirement once the gate is set (mirrors D3
+    // cfa-finding-F8 — silent skip under an explicit opt-in violates
+    // the operator contract).
+    let gguf_path = std::env::var("HF2Q_CB_THROUGHPUT_MODEL").expect(
+        "HF2Q_CB_THROUGHPUT_MODEL required when HF2Q_A4_MOE_AB_VALIDATION_E2E=1. \
+         Either set the env or unset HF2Q_A4_MOE_AB_VALIDATION_E2E — silent skip \
+         with the gate set violates the iter-1.5 cfa-finding-F8 contract.",
+    );
+    eprintln!(
+        "[a4-moe-validation] running A/B sweep against {gguf_path} \
+         at N=1,2,4,8 per ADR-040 §6.1.55 iter-A4-cont-moe-validation."
+    );
+    // Structural scaffold reserve: the real body lands at
+    // iter-A4-cont-drafter-dispatcher-kernel + the operator
+    // empirical-measurement runbook entry per dossier §7.  Today the
+    // body is a placeholder that pins the env-gate contract.
+    let concurrencies: Vec<u32> = vec![1, 2, 4, 8];
+    for &n in &concurrencies {
+        eprintln!("[a4-moe-validation] N={n}: deferred to iter-A4-cont-drafter-dispatcher-kernel");
+    }
+}

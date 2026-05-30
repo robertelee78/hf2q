@@ -194,6 +194,96 @@ impl Qwen3VlTextLoadedModel {
         self.slot_aware_max_slots = Some(max_slots);
         Ok(())
     }
+
+    /// **ADR-040 §6.1.55 iter-C2e-cont (2026-05-30)** — structural
+    /// worker hot path lift for the four SlotAware worker arms.
+    ///
+    /// Replaces the iter-C2e inline `anyhow::anyhow!("capability_
+    /// unsupported: ...")` synthesis at the four worker-arm clamps
+    /// with a real helper that:
+    ///
+    /// 1. **Take/restores the witness scalar** —
+    ///    `slot_aware_max_slots.take()` then writes the value back into
+    ///    the field via `.replace(...)` after the sentinel call.  This
+    ///    pins the C2e provisioning surface in the multi-seq lift call
+    ///    graph (operator-grep at the C2e-cont site sees both the
+    ///    provisioning-time witness write AND the worker-time
+    ///    take/restore).  Today the take/restore is a no-op
+    ///    structurally because the scalar is a `u32` not a real
+    ///    cache; once iter-228a lands a real persistent KV cache the
+    ///    take/restore becomes the real cache get-then-put discipline
+    ///    that Qwen35 + Gemma 4 worker arms already use
+    ///    (`q.persistent_kv_cache = Some(persistent)`).
+    /// 2. **Delegates to the iter-228a 501 sentinel verbatim** —
+    ///    [`crate::inference::models::qwen3vl_text::forward::
+    ///    qwen3vl_text_forward_pending_err`] is the upstream 501
+    ///    contract; the helper wraps it with the
+    ///    `capability_unsupported:` prefix + the arm-specific sublabel
+    ///    + the `SlotId(N)` cite that operator log greps depend on.
+    ///    Sentinel propagates verbatim through `?` at the caller (H240
+    ///    pins this).
+    ///
+    /// # Why the structural lift is "shippable now"
+    ///
+    /// Today the helper carries the witness take/restore over a
+    /// `Option<u32>` scalar — purely structural.  When iter-228a lands
+    /// past the 501 sentinel, the field flips to
+    /// `Option<Qwen3VlTextKvCache>` (or a per-layer
+    /// `Vec<MultiSeqQwen3VlKvBuffers>` depending on iter-228a's KV
+    /// shape; see `slot_aware_max_slots` field docstring + ADR-040
+    /// §6.1.52); the take/restore discipline established here is the
+    /// production worker-arm shape Qwen35 + Gemma 4 already use.
+    ///
+    /// # Cross-references
+    ///
+    /// - ADR-040 §6.1.52 — iter-C2e spawn-time activation closure.
+    /// - ADR-040 §6.1.55 — iter-C2e-cont structural lift closure
+    ///   (this method's home).
+    /// - `Qwen35Model::persistent_kv_cache` get-then-put pattern at
+    ///   `engine.rs` worker arms — the production take/restore shape
+    ///   this helper mirrors.
+    pub fn handle_qwen3vl_slot_aware_n_gt_0_sentinel<T>(
+        &mut self,
+        slot_id: crate::serve::multi_seq_kv::SlotId,
+        arm_sublabel: &str,
+    ) -> Result<T> {
+        // Witness take/restore — structural mirror of Qwen35 /
+        // Gemma 4 `persistent_kv_cache = Some(persistent);` discipline.
+        // Today the scalar is `Option<u32>`; iter-228a flips it to a
+        // real cache type.  Pre-A4 byte-equivalence pin H239 holds
+        // because SerialFifo NEVER calls this helper (the worker-arm
+        // clamp predicate `handle.slot_id != SlotId(0)` short-circuits
+        // at `SlotId(0)`).
+        let witness = self.slot_aware_max_slots.take();
+        // Delegate to the iter-228a 501 sentinel verbatim — the
+        // forward path returns the typed-deferred error that propagates
+        // through the worker arm + chat handler all the way to the
+        // HTTP 501 response.  This is the load-bearing sentinel-
+        // propagation step (H240).
+        let sentinel_result: Result<T> =
+            crate::inference::models::qwen3vl_text::forward::qwen3vl_text_forward_pending_err();
+        // Restore the witness regardless of sentinel outcome —
+        // keeps the spawn-time invariant intact for the next request.
+        // Mirrors the Qwen35 `q.persistent_kv_cache = Some(persistent);`
+        // unconditional post-pattern at engine.rs:5434+.
+        self.slot_aware_max_slots = witness;
+        // Wrap the sentinel error with the arm-specific
+        // capability_unsupported label.  Pre-existing iter-C2e label
+        // shape preserved verbatim per H220's operator-grep contract.
+        sentinel_result.map_err(|sentinel_err| {
+            anyhow!(
+                "capability_unsupported: ADR-040 \
+                 {arm_sublabel} (iter-C2e-cont per ADR-040 §6.1.55 — \
+                 structural worker hot path lift gated on iter-228a \
+                 Qwen3-VL forward path landing past the 501 sentinel; \
+                 worker hot path lift onto the persistent multi-seq \
+                 cache cannot land until the persistent cache itself \
+                 exists). SlotId({}) — sentinel propagated verbatim: \
+                 {sentinel_err}",
+                slot_id.0,
+            )
+        })
+    }
 }
 
 impl Qwen3VlTextLoadedModel {

@@ -256,6 +256,29 @@ impl<'a> Eagle3Orchestrator<'a> {
             emitted_tokens.push(verifier_argmax[0]);
         }
 
+        // ADR-040 §6.1.55 (iter-A4-cont-acceptance-telemetry, 2026-05-30) —
+        // emit per-step acceptance metric for the future empirical
+        // inflection-point measurement (dossier §1.5 + §6).  Skip-mode
+        // / no-telemetry: routes through the no-op
+        // [`crate::inference::spec_decode::emit_acceptance_metric`]
+        // seam.  Production wiring lands at
+        // iter-A4-cont-acceptance-telemetry-prod, gated on the
+        // `/metrics` schema extension per dossier §6 + §7.  Pre-A4
+        // single-seq path: `SlotId(0)` because the legacy
+        // [`Eagle3Orchestrator`] owns a single-seq KV cache (the
+        // multi-seq variant rides on a future drafter-dispatcher per
+        // iter-A4-cont-drafter-dispatcher).
+        let drafted_tokens = tree.len().saturating_sub(1) as u32;
+        let accepted_tokens = accepted.len().saturating_sub(1) as u32;
+        crate::inference::spec_decode::emit_acceptance_metric(
+            crate::inference::spec_decode::SpecDecodeAcceptanceMetric::new(
+                crate::serve::multi_seq_kv::SlotId(0),
+                accepted_tokens,
+                drafted_tokens,
+                0,
+            ),
+        );
+
         let tail_idx = *accepted.last().unwrap_or(&0);
         self.last_aux_hidden = collector_row(
             collector.concatenated_hidden()?,
@@ -772,6 +795,22 @@ impl<'a> Gemma4Eagle3Orchestrator<'a> {
         if emitted_tokens.is_empty() {
             emitted_tokens.push(verifier_argmax[0]);
         }
+
+        // ADR-040 §6.1.55 (iter-A4-cont-acceptance-telemetry, 2026-05-30) —
+        // Gemma 4 EAGLE-3 orchestrator emission mirror.  See the
+        // `Eagle3Orchestrator::run_iteration` companion comment + the
+        // dossier §1.5 + §6 for the no-op-today / production-deferred
+        // rationale.
+        let drafted_tokens = tree.len().saturating_sub(1) as u32;
+        let accepted_tokens = accepted.len().saturating_sub(1) as u32;
+        crate::inference::spec_decode::emit_acceptance_metric(
+            crate::inference::spec_decode::SpecDecodeAcceptanceMetric::new(
+                crate::serve::multi_seq_kv::SlotId(0),
+                accepted_tokens,
+                drafted_tokens,
+                0,
+            ),
+        );
 
         let tail_idx = *accepted.last().unwrap_or(&0);
         self.last_aux_hidden = collector_row(
