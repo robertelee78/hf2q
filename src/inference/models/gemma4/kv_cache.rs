@@ -536,6 +536,91 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHbKvBuffers {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// ADR-040 iter-B4c-kernel iter-1 — per-slot reset primitive for
+// MultiSeqHbKvBuffers (Gemma 4 mirror of Qwen35's
+// HybridKvCache::reset_for_slot per §6.1.27).
+// ──────────────────────────────────────────────────────────────────────────
+
+impl MultiSeqHbKvBuffers {
+    /// **ADR-040 iter-B4c-kernel iter-1** (2026-05-30) — per-slot
+    /// reset for the persistent multi-seq `MultiSeqHbKvBuffers` worker
+    /// hot path.
+    ///
+    /// Cross-architecture mirror of Qwen35
+    /// `HybridKvCache::reset_for_slot` (per §6.1.27 closure block).
+    /// Used by `engine::generate_gemma4_once_slot_aware` to clear a
+    /// slot's state at request entry + exit so the persistent per-layer
+    /// `MultiSeqHbKvBuffers` is request-isolated within the slot — the
+    /// next request to land on the same slot sees a zero-cursor cache.
+    ///
+    /// **Layout proof** (mirror of A2b §6.1.23 / iter-C2d-cont-kernel
+    /// iter-1 §6.1.27 reset_for_slot discipline):
+    /// - **seq_lens**: `Vec<u32>` of length `n_seqs`. Per-slot reset →
+    ///   set `seq_lens[slot_idx] = 0`; other slots untouched.  This is
+    ///   the load-bearing cursor that bounds the HB-packed K/V SDPA
+    ///   read path.
+    /// - **k_packed / v_packed (U8, `[n_seqs, nkv, capacity, head_dim]`
+    ///   row-major)**: per-slot region size = `nkv * capacity *
+    ///   head_dim` bytes.  **NOT zeroed** — same discipline as Qwen35
+    ///   full_attn: the HB-SDPA read path masks against
+    ///   `seq_lens[slot_idx]` (positions ≥ cursor are unreadable to
+    ///   the kernel).  Stale bytes beyond the cursor are structurally
+    ///   unreachable, matching the existing `drop_seq` invariant pinned
+    ///   by `gemma4_hb_kv_drop_does_not_zero_k_packed_buffer`.
+    /// - **k_norms / v_norms (F32, `[n_seqs, nkv, capacity,
+    ///   norms_per_pos]`)**: same cursor-masked discipline — NOT
+    ///   zeroed.  The norms read path is gated on the same
+    ///   `seq_lens[slot_idx]` cursor that gates packed.
+    ///
+    /// # Errors
+    ///
+    /// - `slot.0 >= self.n_seqs` (bounds-first per A2b iter-1.5
+    ///   cfa-finding-F5 ordering) — returns typed
+    ///   [`crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange`].
+    ///
+    /// # Per-slot byte-equivalence pin
+    ///
+    /// At `slot = SlotId(0)` AND `n_seqs == 1` this is byte-equivalent
+    /// to setting `seq_lens[0] = 0` directly (the existing `drop_seq`
+    /// shape).  H80 pins this in the test module.
+    ///
+    /// # Why distinct from `drop_seq`
+    ///
+    /// `drop_seq` is the `MultiSeqKvCache` trait method called by the
+    /// scheduler on per-slot release.  `reset_for_slot` is the
+    /// orchestrator-level entry point called at iter-B4c-kernel iter-1's
+    /// `generate_gemma4_once_slot_aware` entry + exit — the inherent
+    /// method gives the engine.rs orchestrator a named API that mirrors
+    /// Qwen35 iter-1's `HybridKvCache::reset_for_slot` 1:1 for
+    /// cross-architecture grep-symmetry, without depending on the
+    /// `MultiSeqKvCache` trait (which lives in a separate import
+    /// surface).  Bodies are structurally identical today; if iter-B4c-
+    /// kernel-iter-{2,3,4} ever lifts the K/V byte zeroing discipline
+    /// (e.g. to defend against a future kernel-write-past-cursor bug),
+    /// the two methods diverge — orchestrator-driven entry/exit
+    /// resets honour the lift, scheduler-driven `drop_seq` does not.
+    pub fn reset_for_slot(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
+        // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5.
+        if slot.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // Reset the per-slot cursor.  K/V packed + norms bytes are NOT
+        // zeroed (cursor-masked read path — see layout proof above;
+        // matches `drop_seq` invariant).
+        self.seq_lens[slot.0 as usize] = 0;
+        Ok(())
+    }
+}
+
 /// Per-layer dense F32/F16 KV buffers for dense attention path (ADR-009).
 pub struct DenseKvBuffers {
     pub k: MlxBuffer,
@@ -1089,6 +1174,67 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHybridKvBuffers {
                 capability: "fork_seq cross-slot copy (Gemma 4 MultiSeqHybridKvBuffers; deferred to Phase A3c per ADR-040 §6 + dossier R5)",
             },
         )
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// ADR-040 iter-B4c-kernel iter-1 — per-slot reset primitive for
+// MultiSeqHybridKvBuffers (Gemma 4 hybrid variant; mirrors A3a sibling).
+// ──────────────────────────────────────────────────────────────────────────
+
+impl MultiSeqHybridKvBuffers {
+    /// **ADR-040 iter-B4c-kernel iter-1** (2026-05-30) — per-slot
+    /// reset for the persistent multi-seq `MultiSeqHybridKvBuffers`
+    /// (Gemma 4 hybrid K-F16 + TQ-HB-V variant).
+    ///
+    /// Sibling of [`MultiSeqHbKvBuffers::reset_for_slot`] for the
+    /// `HF2Q_FULL_F16_KV=1` / `HF2Q_DFLASH_XLEN_SDPA=1` codepath that
+    /// engages `MultiSeqHybridKvBuffers`.  Used by
+    /// `engine::generate_gemma4_once_slot_aware` to clear a slot's
+    /// state at request entry + exit so the persistent per-layer
+    /// `MultiSeqHybridKvBuffers` is request-isolated within the slot.
+    ///
+    /// **Layout proof**:
+    /// - **seq_lens**: `Vec<u32>` of length `n_seqs`. Per-slot reset →
+    ///   set `seq_lens[slot_idx] = 0`; other slots untouched.  Same
+    ///   load-bearing cursor as the A3a sibling.
+    /// - **k (F16, `[n_seqs, nkv, capacity, head_dim]`)**: NOT zeroed
+    ///   — same cursor-masked discipline as A3a.
+    /// - **v_packed / v_norms**: NOT zeroed; cursor-masked.
+    /// - **bf16_xlen_k / bf16_xlen_v (optional BF16)**: NOT zeroed —
+    ///   the xlen verify path reads only up to `seq_lens[slot_idx]`
+    ///   positions per ADR-030 iter-96, matching the F16 K + packed V
+    ///   discipline.
+    ///
+    /// # Errors
+    ///
+    /// - `slot.0 >= self.n_seqs` (bounds-first per A2b iter-1.5
+    ///   cfa-finding-F5 ordering).
+    ///
+    /// # Per-slot byte-equivalence pin
+    ///
+    /// At `slot = SlotId(0)` AND `n_seqs == 1` this is byte-equivalent
+    /// to setting `seq_lens[0] = 0` directly (the existing `drop_seq`
+    /// shape).  Sibling pin to the A3a per-slot byte-equivalence.
+    pub fn reset_for_slot(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<(), crate::serve::multi_seq_kv::MultiSeqError> {
+        // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5.
+        if slot.0 >= self.n_seqs {
+            return Err(
+                crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange {
+                    slot,
+                    max_slots: self.n_seqs,
+                },
+            );
+        }
+        // Reset the per-slot cursor.  K (F16) / V (packed | F16) / V
+        // norms (F32 | dummy) / optional xlen bf16 K/V bytes are NOT
+        // zeroed (cursor-masked read path — see layout proof above;
+        // matches `drop_seq` invariant).
+        self.seq_lens[slot.0 as usize] = 0;
+        Ok(())
     }
 }
 
@@ -3110,5 +3256,152 @@ mod tests {
              comment at kv_cache.rs and re-examine whether HybridKvBuffers \
              remains the production-default variant for Gemma 4."
         );
+    }
+
+    /// **ADR-040 iter-B4c-kernel iter-1 — `MultiSeqHbKvBuffers::
+    /// reset_for_slot` per-slot cursor isolation (2026-05-30)**.
+    ///
+    /// Pin: `reset_for_slot(SlotId(s))` ONLY zeros `seq_lens[s]`;
+    /// other slots' cursors are untouched, AND the K/V packed + norms
+    /// bytes of EVERY slot (including slot s) are byte-identical to
+    /// pre-call (cursor-masked read discipline — see layout proof at
+    /// the method).
+    ///
+    /// Mirror of Qwen35
+    /// `iter_c2d_cont_kernel_iter1_reset_for_slot_per_slot_isolation`
+    /// (qwen35/kv_cache.rs:8113).
+    #[test]
+    fn iter_b4c_kernel_iter1_multi_seq_hb_kv_reset_for_slot_per_slot_isolation_2026_05_30() {
+        use crate::serve::multi_seq_kv::SlotId;
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 4usize;
+        let n_seqs: u32 = 4;
+        let mut cache = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, n_seqs)
+            .expect("alloc n_seqs=4");
+
+        // Seed every slot's cursor + K/V packed bytes with distinct
+        // non-zero patterns.
+        for s in 0..(n_seqs as usize) {
+            cache.seq_lens[s] = (s as u32) + 11;
+        }
+        let slot_packed = nkv * cap * hd;
+        {
+            let k_slice = cache.k_packed.as_mut_slice::<u8>().expect("k_packed u8");
+            for s in 0..(n_seqs as usize) {
+                let start = s * slot_packed;
+                for (i, b) in k_slice[start..start + slot_packed].iter_mut().enumerate() {
+                    *b = (((s * 17 + i) % 251) + 1) as u8;
+                }
+            }
+        }
+        {
+            let v_slice = cache.v_packed.as_mut_slice::<u8>().expect("v_packed u8");
+            for s in 0..(n_seqs as usize) {
+                let start = s * slot_packed;
+                for (i, b) in v_slice[start..start + slot_packed].iter_mut().enumerate() {
+                    *b = (((s * 19 + i) % 253) + 1) as u8;
+                }
+            }
+        }
+        // Snapshot K/V packed for every slot before the reset.
+        let k_before: Vec<u8> = cache.k_packed.as_slice::<u8>().expect("k_packed read")
+            .to_vec();
+        let v_before: Vec<u8> = cache.v_packed.as_slice::<u8>().expect("v_packed read")
+            .to_vec();
+
+        // Reset slot 1.
+        cache
+            .reset_for_slot(SlotId(1))
+            .expect("reset_for_slot(1) on n_seqs=4");
+
+        // Slot 1's cursor must be 0; others untouched.
+        for s in 0..(n_seqs as usize) {
+            if s == 1 {
+                assert_eq!(cache.seq_lens[s], 0,
+                    "iter-B4c-kernel iter-1: slot 1 cursor must be 0 after reset_for_slot(1)");
+            } else {
+                assert_eq!(cache.seq_lens[s], (s as u32) + 11,
+                    "iter-B4c-kernel iter-1: slot {s} cursor must be untouched");
+            }
+        }
+        // K/V packed bytes of EVERY slot are byte-identical pre/post
+        // (cursor-masked discipline — no K/V byte zeroing on reset).
+        let k_after: Vec<u8> = cache.k_packed.as_slice::<u8>().expect("k_packed read 2").to_vec();
+        let v_after: Vec<u8> = cache.v_packed.as_slice::<u8>().expect("v_packed read 2").to_vec();
+        assert_eq!(k_before, k_after,
+            "iter-B4c-kernel iter-1: reset_for_slot must NOT zero K packed bytes \
+             (cursor-masked discipline; matches drop_seq invariant)");
+        assert_eq!(v_before, v_after,
+            "iter-B4c-kernel iter-1: reset_for_slot must NOT zero V packed bytes");
+    }
+
+    /// **ADR-040 iter-B4c-kernel iter-1 — `MultiSeqHbKvBuffers::
+    /// reset_for_slot` bounds-first typed error (2026-05-30)**.
+    ///
+    /// Bounds-first per A2b iter-1.5 cfa-finding-F5: OOR slot returns
+    /// typed `MultiSeqError::SlotOutOfRange`.  SlotId(0) on n_seqs=1
+    /// is the byte-equivalence case — must succeed.
+    ///
+    /// Mirror of Qwen35
+    /// `iter_c2d_cont_kernel_iter1_reset_for_slot_bounds_typed`
+    /// (qwen35/kv_cache.rs:8270).
+    #[test]
+    fn iter_b4c_kernel_iter1_multi_seq_hb_kv_reset_for_slot_bounds_typed_2026_05_30() {
+        use crate::serve::multi_seq_kv::{MultiSeqError, SlotId};
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let mut cache = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 4, false, 4)
+            .expect("alloc n_seqs=4");
+        let err = cache.reset_for_slot(SlotId(4)).expect_err("slot 4 OOR");
+        assert_eq!(
+            err,
+            MultiSeqError::SlotOutOfRange { slot: SlotId(4), max_slots: 4 },
+            "iter-B4c-kernel iter-1: OOR must surface SlotOutOfRange"
+        );
+
+        // SlotId(0) on n_seqs=1 is the byte-equivalence case.
+        let mut cache1 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 4, false, 1)
+            .expect("alloc n_seqs=1");
+        cache1.seq_lens[0] = 7;
+        cache1
+            .reset_for_slot(SlotId(0))
+            .expect("SlotId(0) at n_seqs=1 must succeed");
+        assert_eq!(cache1.seq_lens[0], 0);
+    }
+
+    /// **ADR-040 iter-B4c-kernel iter-1 — `MultiSeqHybridKvBuffers::
+    /// reset_for_slot` per-slot cursor isolation (2026-05-30)**.
+    ///
+    /// Sibling pin for the hybrid (F16-K + TQ-HB-V) variant.
+    #[test]
+    fn iter_b4c_kernel_iter1_multi_seq_hybrid_kv_reset_for_slot_per_slot_isolation_2026_05_30() {
+        use crate::serve::multi_seq_kv::SlotId;
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        // Ensure xlen + F16 are env-unset so the legacy F16-K + U8-V
+        // shape is exercised; the reset_for_slot semantics are
+        // env-invariant but the alloc-time bytes differ.
+        std::env::remove_var("HF2Q_FULL_F16_KV");
+        std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
+        let mut cache = alloc_multi_seq_hybrid_kv_for_layer(&dev, 0, 2, 256, 4, false, 4)
+            .expect("alloc multi-seq hybrid n_seqs=4");
+        for s in 0..4 {
+            cache.seq_lens[s] = (s as u32) * 5 + 3;
+        }
+        cache
+            .reset_for_slot(SlotId(2))
+            .expect("reset_for_slot(2)");
+        assert_eq!(cache.seq_lens[0], 3);
+        assert_eq!(cache.seq_lens[1], 8);
+        assert_eq!(cache.seq_lens[2], 0,
+            "iter-B4c-kernel iter-1: slot 2 cursor must be 0 after reset");
+        assert_eq!(cache.seq_lens[3], 18);
+
+        // OOR.
+        let err = cache.reset_for_slot(SlotId(99)).expect_err("slot 99 OOR");
+        assert!(matches!(
+            err,
+            crate::serve::multi_seq_kv::MultiSeqError::SlotOutOfRange { .. }
+        ));
     }
 }
