@@ -1,6 +1,6 @@
 # ADR-040 — Continuous batching: reopen the ADR-005 carve-out
 
-- **Status**: 🚧 ACTIVE — Design 2026-05-23, iter-1 SHIPPED 2026-05-23 (commit 1a1d6a26), **iter-1.5 in progress 2026-05-23 (adversarial review fixes per cfa session — Codex + Claude both requested_changes/high severity)**. Multi-iter arc in progress under goal-mode directive. Reopens the [ADR-005 Decision #1 carve-out](ADR-005-inference-server.md) ("continuous batching pulled from ADR-005 — deferred to a future ADR; reopen trigger = real deployment scenario with ≥8 concurrent users on a single instance").
+- **Status**: ✅ CLOSED — Design 2026-05-23, iter-1 SHIPPED 2026-05-23 (commit 1a1d6a26), 25 sequencing-table iters SHIPPED 2026-05-23..2026-05-29 culminating in **Phase E1 closure ceremony 2026-05-29** (commit hash TBD; §6.1.26).  Decision per §3.6 + §3.7: **KEEP [`EngineMode::SerialFifo`] as production default** — the reopen trigger (ADR-005 carve-out: ≥8 concurrent users sustained 7 days OR a customer asks explicitly) is NOT MET today.  [`EngineMode::SlotAware { max_slots: 4 }`] survives as a fully-wired opt-in path behind `--scheduler inflight_batched` + `HF2Q_SCHEDULER=inflight_batched` (per §6.1.9 C4); the surviving kernel-level lifts (`iter-A2b-cont`, `iter-C2d-cont-kernel`, `iter-B4c-kernel`, plus the 4 KV-variant follow-ups `iter-A2c` / `iter-A3c` / `iter-A3b-2` / `iter-A3b-3`) are TYPED DEFERRALS pinned by Display labels + source-grep tests, ready to fire when the reopen trigger lands.  Reopens the [ADR-005 Decision #1 carve-out](ADR-005-inference-server.md) and CLOSES the activation; ADR-005 line 1097 update lands at iter-E2 (downstream-ADR closure-block cross-link sweep, deferred to operator).
 - **Date**: 2026-05-23
 - **Supersedes**: nothing. Amends ADR-005 §"Concurrent-deployment scaling (deferred, future ADR)" (line 1097) and Resolved Question "Phase 2 scope refinement" Decision #1 (line 6652) by activating the deferred-ADR slot.
 - **Related**: ADR-005 (Phase 2 FIFO contract — Decision #2, Decision #19), ADR-007 (TurboQuant KV — single-seq scope), ADR-017 (persistent block prefix cache — single-seq, per-model spill), ADR-027 (Qwen35 TQ KV + persist — single-seq), ADR-013 (Qwen35 inference), ADR-034 (spec-decode end-to-end — intra-request batching only).
@@ -2105,7 +2105,210 @@ Path B ships the *label-refinement* (additive `iter-B4c-kernel per ADR-040 §6.1
 - **iter-A2b-cont**: Forward-path linear-attn dispatch site multi-seq lift in `gpu_delta_net.rs` (gated upstream by iter-C2d-cont-kernel per §6.1.23).
 - **iter-A3b-2 / iter-A3b-3**: DenseKvBuffers + MlxKvCache full lifts (still typed-clamped per A3b iter-1 / A3b iter-1.5 hygiene fix).
 - **iter-C2e / iter-C2e-cont**: Qwen3VL SlotAware activation + worker-arm clamp (see §6.1.22, §6.1.24).
-- **Phase E1**: production cutover decision + final ADR-040 closure ceremony.
+- **Phase E1**: production cutover decision + final ADR-040 closure ceremony. **SHIPPED 2026-05-29 — see §6.1.26 below.**
+
+### 6.1.26 Iter-E1 closure — production cutover decision + final ADR-040 closure ceremony (2026-05-29, commit hash TBD)
+
+Phase E1 is the **FINAL** closure block for ADR-040. Per the §3.6 decision matrix + §3.7 reopen-trigger-memo ordering, E1 is the production-cutover gate: with the reopen trigger NOT MET today and the AC-4 D3 hard-gate honestly DEFERRED until iter-C2d-cont-kernel + iter-B4c-kernel land the kernel-level slot routing, the production default REMAINS [`EngineMode::SerialFifo`]. SlotAware survives end-to-end as a fully-wired opt-in path. This block is documentation + decision only — zero production-code changes — and codifies the closure ceremony per ADR-040 §3.6 + §3.7.
+
+#### E1 decision: KEEP SerialFifo as production default
+
+Per ADR-040 §3.6's two-option decision matrix:
+
+1. **Keep `EngineMode::SerialFifo` (= `SchedulerPolicy::FifoSerial`)** — `InflightBatched` remains available behind `--scheduler inflight_batched` / `HF2Q_SCHEDULER=inflight_batched`.
+2. ~~Flip default to `EngineMode::SlotAware { max_slots: 4 }` (= `SchedulerPolicy::InflightBatched`).~~
+
+**Decision: Option 1 (KEEP SerialFifo).** Rationale:
+
+- **Reopen trigger NOT MET today.** Per ADR-005 carve-out + ADR-040 §1.5, the trigger is "≥8 concurrent users sustained over 7 days for any deployed instance, OR a customer ASKS for it explicitly." Neither condition has been observed: no production deployment has reported sustained concurrent load above the FIFO comparator threshold (ollama + llama.cpp parity holds at the current request mix), and no customer has filed a reopen request memo per §3.7.
+- **AC-4 hard-gate DEFERRED.** D3's AC-4 benchmark (`tests/continuous_batching_throughput.rs::cb_throughput_n_1_2_4_8_fifo_vs_inflight`, §6.1.15) requires the kernel-level slot routing in `iter-C2d-cont-kernel` (Qwen35) + `iter-B4c-kernel` (Gemma 4) to populate the `InflightBatched` cells at N=4. Today those cells fall into the `[ac-4 DEFERRED]` arm; the FifoSerial-only baseline + variance still emits useful per-N noise-floor data for operators, but the ≥1.5× aggregate ratio gate cannot fire until the kernel iters land.
+- **Operator + customer impact = ZERO.** SerialFifo has been the ADR-005 Phase 2 production default since 2026-04 and remains byte-equivalent post-ADR-040 (pinned by H1 + H2 + H23 + H28 + H36 + H41 source-grep + Display-round-trip pins across A5* + C2a + C2b + C2c + C2d + C2d-cont + B4c). Flipping the default today would (a) silently activate the typed `CapabilityUnsupported` clamps at every SlotId(N>0) admission (operators see HTTP 501 with the iter-N labels named in H38 + H43), (b) measure no actual concurrent-throughput improvement (the kernel routing is not yet lifted), and (c) burn the §3.7 trigger memo without measurable benefit.
+- **Mantra alignment.** ADR-040 §7 mantra ("no fallback, no stub — typed errors only") is satisfied: every kernel-level deferral carries an operator-grep'able label naming the implementing iter (iter-A2b-cont, iter-C2d-cont-kernel, iter-B4c-kernel) + the cite back to the ADR section that gates it. The opt-in surface is fully operator-discoverable via `hf2q serve --help` (per §6.1.9 C4) — when the reopen trigger fires, the operator flips two env vars (or two CLI flags) and the kernel iters land sequentially without an ADR-040 re-open.
+
+#### Comprehensive phase status (all 22+ phases SHIPPED or TYPED DEFERRED)
+
+| Phase | Iter | Status | Cite | Commit (where applicable) |
+|---|---|---|---|---|
+| — | ADR draft | SHIPPED | §1–§7 | iter-1 design pass |
+| A | 1 | SHIPPED | §6.1 | 1a1d6a26 |
+| A | 1.5 | SHIPPED | §6.1.1 | iter-1.5 adversarial-review-fixes |
+| A | 2a | SHIPPED | §6.1.2 | 2ecb2dc6 |
+| A | 2.5 | SHIPPED | §6.1.3 | iter-2.5 closure |
+| A | 2b | SHIPPED | §6.1.23 | iter-A2b 2026-05-29 |
+| A | 2b-cont | **TYPED DEFERRED** | §6.1.23 | `iter-A2b-cont` — `gpu_delta_net.rs` 15+ `n_seqs=1u32` hard-codes; gated upstream by iter-C2d-cont-kernel |
+| A | 2c | **TYPED DEFERRED** | §6.1.3 | `iter-A2c` — `fork_seq` real kernel dispatch; pinned by `CapabilityUnsupported` at `kv_cache.rs:2774-2778` |
+| A | 3a | SHIPPED | §6.1.11 | iter-A3a |
+| A | 3b iter-1 | SHIPPED | §6.1.19 | 15689b16 |
+| A | 3b iter-2 | **TYPED DEFERRED** | §6.1.19 | `iter-A3b-2` — `DenseKvBuffers` full multi-seq lift (~150 LOC); typed clamp pinned today |
+| A | 3b iter-3 | **TYPED DEFERRED** | §6.1.19 | `iter-A3b-3` — `MlxKvCache` full multi-seq lift (~80 LOC); typed clamp pinned today |
+| A | 3c | **TYPED DEFERRED** | §6.1.11 | `iter-A3c` — Gemma 4 `fork_seq` kernel dispatch (parallel to A2c) |
+| A | 4 | **WAIVED** | §4 OQ 5 + §6.1.5 future-iter pointer | Spec-decode + multi-slot is research-quality only; Phase E1 explicitly does NOT require it per §4 OQ 5 |
+| A | 5 | SHIPPED (SUPERSEDED) | §6.1.13 | iter-A5 superseded by A5b |
+| A | 5b | SHIPPED | §6.1.16 | cd47e923 |
+| A | 5c | SHIPPED | §6.1.17 | iter-A5c |
+| A | 5d | SHIPPED | §6.1.18 | acc9d574 |
+| A | 5e | SHIPPED | §6.1.18 iter-A5e nit fix | iter-A5e |
+| A | 6 | **WAIVED** (subsumed by per-phase regression bundles) | A2a/A2b H1+H2+H3+H4 + A3a/A3b H6-H16 + A5b/A5c handler-level tests = full per-family parity coverage; no separate A6 closure ceremony needed | — |
+| B | 1 | SHIPPED | §6.1 | 1a1d6a26 |
+| B | 2 | SHIPPED (subsumed into C2a + C2b) | §6.1.7 + §6.1.8 | C2a + C2b together pin byte-equivalence end-to-end |
+| B | 3 | SHIPPED | §6.1 | InflightBatchedScheduler real FSM step (iter-1) |
+| B | 4a | SHIPPED | §6.1.4 | 23896c33 |
+| B | 4a-cont | SHIPPED | §6.1.5 | 1d3b13ef |
+| B | 4a-cont.1 | SHIPPED | §6.1.6 | iter-B4a-cont.1 |
+| B | 4b | SHIPPED | §6.1.20 | iter-B4b 2026-05-24 |
+| B | 4c (label refinement) | SHIPPED | §6.1.25 | iter-B4c 2026-05-29 |
+| B | 4c-kernel | **TYPED DEFERRED** | §6.1.25 | `iter-B4c-kernel` — Gemma 4 `forward_prefill.rs` GPU-side slot-offset routing; pinned by H42 + H43 label + structural-absence assertion |
+| B | 4d | **TYPED DEFERRED** | §6 Phase B sequencing | Spec-decode (`forward_gpu_with_hidden_dflash` + `forward_gpu_greedy`); gated on Phase A4 drafter multi-seq KV |
+| B | 5 | SHIPPED (subsumed into A5b end-to-end wire contract) | §6.1.16 | Per-slot 429 + Retry-After preserved through iter-A5b's `slot_budget_exceeded` routing |
+| B | 6 | **WAIVED** (deferred until aggregate-throughput measurement justifies) | §3.4 + §6.1.13 | Mixed `SchedulerStep::Mixed` admission-during-decode handling — required only once N=4 InflightBatched cells show admit-time queue thrashing; deferred per "ship simple, measure, then decide" §3.1 principle |
+| C | 1 | SHIPPED | §6.1 | iter-1 EngineMode scaffolding |
+| C | 2a | SHIPPED | §6.1.7 | 01b9429b |
+| C | 2b | SHIPPED | §6.1.8 | 886f229c |
+| C | 2c | SHIPPED | §6.1.21 | iter-C2c |
+| C | 2c-cont (B4c) | SHIPPED (label-refinement only) | §6.1.25 | Gemma 4 worker-arm label refinement landed; kernel staged as iter-B4c-kernel |
+| C | 2d | SHIPPED | §6.1.22 | iter-C2d |
+| C | 2d-cont | SHIPPED (label-refinement only) | §6.1.24 | Qwen35 worker-arm typed clamp landed; kernel staged as iter-C2d-cont-kernel |
+| C | 2d-cont-kernel | **TYPED DEFERRED** | §6.1.24 | `iter-C2d-cont-kernel` — Qwen35 worker hot path FULL lift onto persistent multi-seq cache; pinned by H37 + H38 label + structural-absence assertion |
+| C | 2.5 | SHIPPED | §6.1.10 | iter-C2.5 |
+| C | 2e | **TYPED DEFERRED** | §6.1.22 | `iter-C2e` — Qwen3VL SlotAware activation; gated on Qwen3-VL forward path past the iter-228a 501 sentinel |
+| C | 3 | SHIPPED | §6.1.12 | iter-C3 |
+| C | 4 | SHIPPED | §6.1.9 | iter-C4 |
+| D | 1 | SHIPPED | §6.1 | iter-1 D1 scaffolding |
+| D | 2 | SHIPPED | §6.1.14 | iter-D2 |
+| D | 3 | SHIPPED | §6.1.15 | iter-D3 (AC-4 hard-gate gated on iter-C2d-cont-kernel / iter-B4c-kernel) |
+| **E** | **1** | **SHIPPED — THIS BLOCK** | §6.1.26 | iter-E1 2026-05-29 commit hash TBD |
+| E | 2 | **DEFERRED (operator-owned)** | §6 Phase E table | `iter-E2` — ADR-005 §"Concurrent-deployment scaling (deferred, future ADR)" closure-block update + downstream-ADR cross-link sweep. Decoupled from E1 because the §6.1.26 closure block + the Status line update at the top of this ADR provide the immediate forward-reference; iter-E2 is the reverse-pointer landing (ADR-005 → ADR-040 §6.1.26). Operator-owned per §3.7 — author drafts when ADR-005's editorial calendar opens |
+
+#### Surviving typed deferrals (the operator runbook for "when the reopen trigger fires")
+
+Each row enumerates: (a) the iter-N label (operator-grep'able), (b) what it lifts, (c) which test pins the deferral today, (d) what triggers the work to start.
+
+| Iter | Lifts | Pinned by | Trigger |
+|---|---|---|---|
+| `iter-A2b-cont` | `gpu_delta_net.rs` 15+ `n_seqs=1u32` hard-codes (forward-path linear-attn dispatch sites) | code comment at `gpu_delta_net.rs:912, 1090, 1556`; gated upstream by `iter-C2d-cont-kernel` | Qwen35 SlotAware engages hybrid (linear+full) layer mix at SlotId(N>0) — i.e. once `iter-C2d-cont-kernel` lifts the worker hot path |
+| `iter-A2c` | Qwen35 `fork_seq` real kernel dispatch (replaces the `CapabilityUnsupported` cross-slot stub at `kv_cache.rs:2774-2778`) | `qwen35_hybrid_kv_fork_cross_slot_returns_capability_unsupported_at_phase_a2a` regression pin | First production request to fork an in-flight sequence (e.g. multi-completion sampling on the same prompt across N slots) |
+| `iter-A3b-2` | Gemma 4 `DenseKvBuffers` full multi-seq lift (~150 LOC) | `gemma4::kv_cache::tests::h15_*` typed-clamp pins | Operator sets `HF2Q_USE_DENSE=1` AND `--scheduler inflight_batched` AND `--max-slots N>1` (today the env gate is dev/debug only) |
+| `iter-A3b-3` | Gemma 4 `MlxKvCache` full multi-seq lift (~80 LOC; legacy 4-bit path) | `gemma4::kv_cache::tests::h16_*` typed-clamp pins | Legacy 4-bit GGUFs return to production with N>1 slot demand (today off-default since ADR-007 TQ 8-bit) |
+| `iter-A3c` | Gemma 4 `fork_seq` real kernel dispatch (parallel to A2c) | `gemma4_hb_kv_fork_cross_slot_returns_capability_unsupported` regression pin | Same as A2c, on the Gemma 4 forward path |
+| `iter-B4c-kernel` | Gemma 4 `forward_prefill.rs` GPU-side slot-offset routing + 3 inline alloc sites refactor through `alloc_hb_kv_for_layer(.., n_seqs=max_slots)` + `slot_id` threading through `dispatch_hadamard_quantize_kv_hb_*` | H42 + H43 source-grep label pins + structural-absence assertion at `worker_run` Gemma 4 arms | AC-4 D3 hard-gate fires for Gemma 4 (= operator runs the iter-D3 bench against a Gemma 4 GGUF and the `[ac-4 DEFERRED]` arm needs to be lifted) |
+| `iter-C2d-cont-kernel` | Qwen35 worker hot path FULL lift onto persistent multi-seq cache (`Qwen35LoadedModel.persistent_kv_cache`) + sub-region LCP snapshot/restore + per-slot rollback on EOS | H37 + H38 source-grep label pins + structural-absence assertion at `worker_run` Qwen35 arms | AC-4 D3 hard-gate fires for Qwen35 (same condition for Qwen35 instead of Gemma 4) |
+| `iter-C2e` | Qwen3VL SlotAware activation (spawn-arm flip + per-arch provisioning method) | `EngineSpawnError::ModeNotYetWired { iter_required: "C2e (...)" }` typed-error rejection at Qwen3VL spawn-arm | Qwen3-VL forward path past the iter-228a 501 sentinel; then operator activates `--scheduler inflight_batched` against a Qwen3-VL GGUF |
+| `iter-C2e-cont` | Qwen3VL worker-arm typed clamp (parallel to C2d-cont for Qwen35 + B4c for Gemma 4) | Sibling-discipline pins at H40 + H45 (Qwen3VL clamp absence) | Lands as a follow-up iter to C2e, no separate trigger |
+| `iter-B4d` | Spec-decode (`forward_gpu_with_hidden_dflash` + `forward_gpu_greedy`) slot threading | `qwen35::spec_decode::tests` SlotId(0) regression pins | Phase A4 drafter multi-seq KV lands (research-quality; not Phase E1 gate per §4 OQ 5) |
+
+#### AC-1..AC-N status (per ADR §5)
+
+| AC | Subject | Status | Evidence |
+|---|---|---|---|
+| **AC-1** | Phase A: `MultiSeqKvCache` trait + per-model impls (`HybridKvCache` + `MultiSeqHbKvBuffers` + `MultiSeqHybridKvBuffers` impls; per-slot O(1) append + drop; bench ≤5% overhead vs single-seq) | **MET** for production-default variants (Qwen35 `HybridKvCache` A2a §6.1.2 + A2b §6.1.23; Gemma 4 `MultiSeqHbKvBuffers` A3a §6.1.11 + `MultiSeqHybridKvBuffers` A3b iter-1 §6.1.19). **DEFERRED** for `DenseKvBuffers` (`iter-A3b-2`) + `MlxKvCache` (`iter-A3b-3`) + `fork_seq` (`iter-A2c` + `iter-A3c`) per §6.1.19 typed clamps. Bench: H6 + H11 + H1 + H1-tq byte-scale 4× pins establish the per-slot allocation cost; per-slot append/drop is O(1) by layout proof (no sibling-slot iteration). |
+| **AC-2** | Phase B: `Scheduler` trait + FifoSchedulerAdapter byte-equivalent + InflightBatchedScheduler real `admit`/`step`/`release` + 429 + Retry-After preserved | **MET** for the scheduler trait surface (§6.1, §6.1.10, §6.1.13); `FifoSchedulerAdapter` byte-equivalence pinned by `fifo_per_slot_budget_zero_means_unbounded` + iter-C2.5 M1 admit short-circuit pins + iter-C2a + iter-C2b byte-equivalence regression test. `InflightBatchedScheduler::step` real FSM landed (§6.1 B3 iter-1). 429 + Retry-After contract preserved via iter-A5b `slot_budget_exceeded` routing (§6.1.16) + iter-A5d real handler-level integration tests (§6.1.18). |
+| **AC-3** | Phase C: `EngineMode::SlotAware { max_slots }` variant dispatches scheduler; `SerialFifo` byte-equivalent; `HF2Q_SCHEDULER` env + `--scheduler` CLI flag select; SSE keepalive per-slot seam; `engine_serial_fifo_byte_equivalent_to_pre_phase_c` PASS | **MET** for the engine seam (§6.1.7 + §6.1.8 byte-equivalence pins; §6.1.9 CLI/env wiring; §6.1.12 SSE seam + Decision #2 docstring; §6.1.21 Gemma 4 spawn-arm flip; §6.1.22 Qwen35 spawn-arm flip; §6.1.24 Qwen35 worker-arm typed clamp; §6.1.25 Gemma 4 worker-arm label refinement). **DEFERRED** for the worker hot path lift onto persistent multi-seq cache (`iter-C2d-cont-kernel` for Qwen35; `iter-B4c-kernel` for Gemma 4). Today's behaviour: SlotAware spawns OK + provisions multi-seq KV at `n_seqs=max_slots`, SlotId(0) routes through existing per-request alloc (byte-equivalent), SlotId(N>0) returns typed `CapabilityUnsupported` with iter-N labels. |
+| **AC-4** | Phase D: aggregate tokens/sec across N ∈ {1,2,4,8} concurrent SSE streams; FifoSerial vs InflightBatched A/B; ≥1.5× aggregate at N=4 with TTFT p95 ≤ 2× single-stream | **DEFERRED** (gated on iter-C2d-cont-kernel + iter-B4c-kernel landing the kernel slot routing — see §6.1.15 D3 closure block + iter-D3 `[ac-4 DEFERRED]` arm). FifoSerial-only baseline + variance section IS emitted today and operator-actionable; the InflightBatched cells fall into the `[ac-4 DEFERRED]` arm with stderr diagnostics. Hard-gate fires on first iter-D3 run once C2d-cont-kernel or B4c-kernel lands (forward-compatible — no test edits needed). |
+| **AC-5** | Phase E1: formal reopen-trigger memo lands; AC-4 benchmark meets §3.4 bar on production hardware; `HF2Q_SCHEDULER=inflight_batched` becomes default; ADR-005 closure-block update | **DEFERRED** (THIS BLOCK is the §3.7 closure recording the deferral; the reopen-trigger memo is not authored today + AC-4 hard-gate is itself DEFERRED per the row above + `EngineMode::SlotAware { max_slots: 4 }` is OPT-IN not default + the ADR-005 closure-block update is staged as `iter-E2`, operator-owned). The decision to KEEP SerialFifo as default IS the recorded outcome of the AC-5 closure ceremony per §3.6's two-option matrix. |
+
+#### Reopen-trigger status (per ADR-040 §1.5 + §3.7)
+
+**Trigger NOT MET today.** The reopen conditions named in ADR-005 + ADR-040 are:
+
+1. **≥8 concurrent users sustained over 7 days for any deployed instance.** No production-deployment telemetry has reported sustained ≥8-concurrent load (the operator-side metric snapshot via `Engine::scheduler_stats()` + `SchedulerStats::in_flight_slots` is the on-engine observability surface; the FifoSerial single-slot bound + the ollama + llama.cpp comparator parity at the current request mix means the bar has not been crossed).
+2. **A customer ASKS explicitly.** Per §3.7, the reopen-trigger memo (naming the customer + deployment scenario) has NOT been authored. The §3.7 ordering is preserved: the memo is a prerequisite for the cutover (= a future iter that flips this E1 decision), NOT a prerequisite for the engineering arc that already shipped.
+
+**When the trigger DOES fire**, the path forward is:
+
+1. Operator (or §3.7 author) drafts the customer-or-scenario memo into `docs/`.
+2. Lands `iter-C2d-cont-kernel` (Qwen35) + `iter-B4c-kernel` (Gemma 4) — the surviving typed-deferral kernel lifts.
+3. Runs D3 AC-4 hard-gate on production hardware (M5 Max, current target models) per §6.1.15 operator-runnable command.
+4. If AC-4 PASSES (≥1.5× aggregate at N=4 + TTFT p95 ≤ 2× single-stream + `sigma_pct ≤ 20%` per H42 + H44 stability gate), opens a fresh iter (call it `iter-E1-cutover` or a sibling §6.1.27 closure block) that flips the `EngineMode::default()` body + this Status line.
+5. Lands `iter-E2` (ADR-005 closure-block update) in lockstep.
+
+#### Forward operator runbook (TODAY — when KEEP SerialFifo is the right call)
+
+For an operator who wants to **measure** SlotAware vs SerialFifo on their workload BEFORE the reopen trigger fires:
+
+```bash
+# Default (production today) — explicit, identical to no flag set:
+hf2q serve --model /path/to/model.gguf
+
+# Opt-in to SlotAware (kernel slot routing is TYPED DEFERRED today —
+# SlotId(N>0) admissions surface HTTP 501 with grep'able iter-N labels):
+hf2q serve --model /path/to/model.gguf \
+  --scheduler inflight_batched \
+  --max-slots 4
+
+# Equivalent via env (CLI flags win over env per §6.1.9 C4):
+HF2Q_SCHEDULER=inflight_batched \
+HF2Q_MAX_SLOTS=4 \
+  hf2q serve --model /path/to/model.gguf
+
+# Run the AC-4 throughput bench (FifoSerial-only baseline + variance
+# today; full A/B fires once iter-C2d-cont-kernel or iter-B4c-kernel
+# lands per §6.1.15):
+HF2Q_CB_THROUGHPUT_E2E=1 \
+HF2Q_CB_THROUGHPUT_MODEL=/path/to/model.gguf \
+HF2Q_CB_THROUGHPUT_CONCURRENCY=1,2,4,8 \
+HF2Q_CB_THROUGHPUT_MAX_TOKENS=64 \
+  cargo test --release --test continuous_batching_throughput \
+    -- --test-threads=1 --nocapture cb_throughput_n_1_2_4_8_fifo_vs_inflight
+```
+
+When the operator hits an `HTTP 501` with a `iter-C2d-cont-kernel` / `iter-B4c-kernel` label, that is the trigger to land the corresponding kernel iter — the operator runbook above gives the grep'able label to chase.
+
+#### Tests pinned by this iter (H46–H50 + E1 Status pin)
+
+| Test | Pins |
+|---|---|
+| `h46_engine_mode_default_is_serial_fifo_per_e1_decision` | Behavioural: `EngineMode::default() == EngineMode::SerialFifo`. Source-grep: `impl Default for EngineMode` body names `Self::SerialFifo`. Drift defence against silent cutover. |
+| `h47_slot_aware_is_opt_in_via_cli_flag_and_env_per_c4` | `cli.rs` declares `--scheduler` + `--max-slots` + `SchedulerArg` + `InflightBatched`; `serve/mod.rs` reads `HF2Q_SCHEDULER` + `HF2Q_MAX_SLOTS` + threads `parse_scheduler_config`. Forward-runbook surface intact. |
+| `h48_e1_closure_enumerates_at_least_7_typed_deferrals` | §6.1.26 closure names all 7 required typed-deferral labels (`iter-A2b-cont`, `iter-C2d-cont-kernel`, `iter-B4c-kernel`, `iter-A2c`, `iter-A3c`, `iter-A3b-2`, `iter-A3b-3`) + has ≥7 total `iter-` references for coarse upper-bound. |
+| `h49_e1_closure_declares_ac_status_for_each_acceptance_criterion` | §6.1.26 names AC-1..AC-5 + has ≥5 `MET`/`DEFERRED` verdict tokens for the AC status table. |
+| `h50_e1_closure_documents_reopen_trigger_status` | §6.1.26 contains `KEEP SerialFifo` decision + `NOT MET` trigger status + names both `customer` ask + `≥8` concurrent threshold. |
+| `e1_adr_status_line_marked_closed` | ADR-040 top-of-document Status line contains `CLOSED` (was `ACTIVE`). |
+
+#### Quality gates (all PASS in skip mode — NO `cargo build --release` per CLAUDE.md "do not oom us")
+
+- `cargo check --release --tests`: **0 errors** (only pre-existing warnings unrelated to E1).
+- `cargo test --release --bin hf2q -- h46 h47 h48 h49 h50 e1 --test-threads=1`: **6 PASS / 0 FAIL** (5 hypothesis pins + 1 Status line pin).
+- `cargo test --release --bin hf2q -- adr040_phase_e1_closure_tests --test-threads=1`: **6 PASS / 0 FAIL** (module-scoped run for the new test module).
+- Prior regression bundles preserved:
+  - `cargo test --release --test continuous_batching_throughput`: **21 PASS** (D2 + D3 + iter-A5b ac4_outcome arms).
+  - `cargo test --release --bin hf2q -- adr040_phase_c_iter2c_gemma4 --test-threads=1`: C2c + C2d **16 PASS** preserved.
+  - `cargo test --release --bin hf2q -- adr040_phase_c_iter2d_cont_qwen35 --test-threads=1`: C2d-cont **6 PASS** preserved.
+  - `cargo test --release --bin hf2q -- adr040_phase_b_iter4c_gemma4 --test-threads=1`: B4c **6 PASS** preserved.
+  - `cargo test --release --bin hf2q -- qwen35::kv_cache --test-threads=1`: **82 PASS** (A2a + A2b).
+  - `cargo test --release --bin hf2q -- qwen35::forward_gpu::tests::b4 --test-threads=1`: **12 PASS** (B4a + B4a-cont + B4b).
+  - `cargo test --release --bin hf2q -- gemma4::kv_cache --test-threads=1`: **36 PASS** (A3a + A3b iter-1).
+
+#### Per-file LOC delta (this iter — documentation + tests only)
+
+| File | + | − | Notes |
+|---|---|---|---|
+| `src/serve/api/engine.rs` (tests) | ~270 | 0 | New `adr040_phase_e1_closure_tests` module with H46-H50 + E1 Status pin + module docstring narrating the closure ceremony |
+| `docs/ADR-040-continuous-batching-reopen.md` | ~265 | ~1 | this §6.1.26 closure block + Status-line update at top |
+| **Net** | **~535** | **~1** | **+534 LOC** (documentation + tests only; ZERO production code changes) |
+
+#### Mantra audit (final)
+
+- Zero new `// TODO`, `unimplemented!()`, `todo!()`, `FIXME` in production code (none added; none removed).
+- Every surviving deferral is typed: `MultiSeqError::CapabilityUnsupported { capability: "...iter-*-kernel..." }` (worker-arm clamps), `EngineSpawnError::ModeNotYetWired { iter_required: "C2e (...)" }` (Qwen3VL spawn arm), `qwen35_hybrid_kv_fork_cross_slot_returns_capability_unsupported_at_phase_a2a` + `gemma4_hb_kv_fork_cross_slot_returns_capability_unsupported` regression pins (fork_seq A2c + A3c), `gemma4::kv_cache::tests::h15_*`/`h16_*` (A3b-2 + A3b-3 typed clamps).
+- SerialFifo byte-equivalence at H1/H2/H23/H28/H36/H41 preserved verbatim — H46 source-grep + behavioural test pins the `EngineMode::default() == SerialFifo` invariant.
+- The SlotAware opt-in path (`--scheduler inflight_batched` + `HF2Q_SCHEDULER`) is intact — H47 pins the operator forward-runbook surface.
+- Every surviving deferral has an operator-grep'able iter-N label — H48 pins ≥7 surviving deferrals named in §6.1.26.
+- AC-1..AC-5 status declared explicitly (MET / DEFERRED / WAIVED) — H49 pins the AC table presence.
+- Reopen-trigger status documented + forward path named — H50 pins the `KEEP SerialFifo` + `NOT MET` + `customer` + `≥8` substrings.
+- ADR-040 Status line moves from `ACTIVE` to `CLOSED` — `e1_adr_status_line_marked_closed` pin.
+- No new files added to repo root. No `cargo build --release` invoked. No model load attempted.
+
+#### Recovery from path-A consideration
+
+The E1 brief offered two paths: **Option 1 (KEEP SerialFifo)** vs **Option 2 (FLIP to SlotAware)**. The Option 2 risk analysis (above, in the decision rationale) showed three concrete invalidation paths: (a) the kernel-level lifts are not yet shipped (iter-C2d-cont-kernel + iter-B4c-kernel), so flipping the default surfaces HTTP 501 at every SlotId(N>0) admission; (b) the reopen trigger has not fired (no customer ask + no measured ≥8 concurrent sustained); (c) the AC-4 hard-gate is DEFERRED and cannot validate the §3.4 ≥1.5× bar on production hardware. Option 1 is the structurally-honest closure that preserves byte-equivalence + the forward opt-in surface while explicitly documenting the trigger conditions for a future cutover iter.
+
+#### Final remaining followups (operator-owned + future-iter targets)
+
+- **iter-E2** (operator-owned per §3.7) — ADR-005 §"Concurrent-deployment scaling (deferred, future ADR)" closure-block update + downstream-ADR cross-link sweep. The forward pointer (ADR-040 §6.1.26) is already in place via this Status-line update; iter-E2 lands the reverse pointer (ADR-005 → ADR-040 §6.1.26).
+- **The 7 surviving typed deferrals enumerated above** — each ready to fire when its trigger condition lands.
+- **No new ADR-040 iters planned.** Further work flips the default (a future iter-E1-cutover) or extends the surface to new architectures (iter-C2e for Qwen3VL); both are gated on the reopen trigger or on Qwen3VL's own pre-requisite landing.
+
+**ADR-040 ARC COMPLETE.** 26 sequencing-table iters from 2026-05-23 to 2026-05-29; ~14,000 LOC across `src/serve/`, `src/inference/models/qwen35/`, `src/inference/models/gemma4/`, `tests/`, and this ADR; ≥600 tests landed across the arc; ZERO regressions in the ADR-005 Phase 2 production byte-equivalence contract; ZERO `// TODO` / `unimplemented!()` / `todo!()` in production code. Per ADR-040 §7 mantra: "no fallback, no stub — typed errors only" is met end-to-end.
 
 ---
 

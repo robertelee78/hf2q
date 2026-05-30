@@ -17569,3 +17569,338 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// ADR-040 Phase E1 — production cutover decision + final ADR closure
+// ceremony (2026-05-29).
+//
+// E1 is the FINAL closure block for ADR-040. The reopen trigger per
+// ADR-040 §1.5 + §3.6 + §3.7 ("≥8 concurrent users sustained over 7
+// days for any deployed instance, OR a customer ASKS for it
+// explicitly") is NOT MET today. Per the decision matrix in §3.6, the
+// production default REMAINS [`EngineMode::SerialFifo`]; SlotAware
+// stays opt-in behind `--engine-mode=slot-aware` / `--scheduler
+// inflight_batched` + `HF2Q_SCHEDULER=inflight_batched`. The
+// kernel-level lifts (iter-A2b-cont, iter-C2d-cont-kernel,
+// iter-B4c-kernel) survive as TYPED DEFERRALS pinned by H38 + H43
+// label strings, ready to fire when the reopen trigger lands.
+//
+// H46–H50 are TDD source-grep pins over both `cli.rs` (for the
+// operator-facing default + opt-in surface) and the ADR text (for the
+// closure block's structural shape: ≥7 deferrals enumerated, AC
+// status declared, reopen trigger framed).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod adr040_phase_e1_closure_tests {
+    use super::*;
+
+    /// **H46 (skip-mode)** — `EngineMode::default()` is `SerialFifo`
+    /// (production default unchanged by Phase E1 closure).
+    ///
+    /// This pin is BOTH a behavioural assertion (the impl returns the
+    /// SerialFifo variant) AND a source-grep assertion (the
+    /// `impl Default for EngineMode` block names `Self::SerialFifo`
+    /// as the body). Drift in either form would mean the E1 decision
+    /// matrix in §3.6 was silently overridden — the reopen trigger is
+    /// not met today, so the cutover MUST NOT have fired.
+    #[test]
+    fn h46_engine_mode_default_is_serial_fifo_per_e1_decision() {
+        // Behavioural half: Default::default() returns SerialFifo.
+        let mode = EngineMode::default();
+        assert!(
+            matches!(mode, EngineMode::SerialFifo),
+            "H46 FALSIFIED: EngineMode::default() returned {mode:?} \
+             — Phase E1 §3.6 decision is KEEP SerialFifo until the \
+             reopen trigger (≥8 concurrent OR customer ask) fires. \
+             A non-SerialFifo default means the cutover landed without \
+             the gate."
+        );
+
+        // Source-grep half: the impl block names Self::SerialFifo.
+        // Drift defence — catches a future edit that flips the
+        // default via clever indirection (e.g. `Self::SlotAware {
+        // max_slots: 1 }` which happens to admit identical
+        // single-slot semantics but breaks ADR-040 §3.6 byte-equivalence
+        // expectations).
+        let src = include_str!("engine.rs");
+        let default_marker = "impl Default for EngineMode";
+        let idx = src
+            .find(default_marker)
+            .expect("H46: `impl Default for EngineMode` block not found");
+        // Restrict the window to a small region after the marker so
+        // we don't accidentally match a sibling `impl Default` that
+        // appears later in the file.
+        let window = &src[idx..idx + 600.min(src.len() - idx)];
+        assert!(
+            window.contains("Self::SerialFifo"),
+            "H46 FALSIFIED: `impl Default for EngineMode` no longer \
+             names `Self::SerialFifo` in its body. Phase E1 §3.6 \
+             decision pins this as the production default until the \
+             reopen trigger fires."
+        );
+    }
+
+    /// **H47 (skip-mode)** — SlotAware is opt-in via BOTH `--scheduler
+    /// inflight_batched` (CLI flag, per §6.1.9 C4) and
+    /// `HF2Q_SCHEDULER=inflight_batched` (env, per §6.1.9 C4).
+    /// Source-grep over `cli.rs` for the flag declaration + over
+    /// `serve/mod.rs` for the env wiring.
+    ///
+    /// This is the operator-facing forward runbook: when the reopen
+    /// trigger fires, the operator does NOT need a new release — the
+    /// opt-in surface is already there. Drift here would mean the
+    /// runbook is broken before the trigger lands.
+    #[test]
+    fn h47_slot_aware_is_opt_in_via_cli_flag_and_env_per_c4() {
+        // CLI flag — `cli.rs` declares the `--scheduler` flag with
+        // a `SchedulerArg` value enum + the `--max-slots` companion
+        // flag.
+        let cli_src = include_str!("../../cli.rs");
+        assert!(
+            cli_src.contains("--scheduler") || cli_src.contains("\"scheduler\""),
+            "H47 FALSIFIED: `cli.rs` no longer declares the \
+             `--scheduler` CLI flag. Operators have no opt-in path \
+             for SlotAware — Phase E1 forward runbook is broken."
+        );
+        assert!(
+            cli_src.contains("SchedulerArg"),
+            "H47 FALSIFIED: `cli.rs` no longer declares the \
+             `SchedulerArg` clap ValueEnum. The opt-in flag's value \
+             discipline is gone."
+        );
+        assert!(
+            cli_src.contains("--max-slots") || cli_src.contains("\"max-slots\""),
+            "H47 FALSIFIED: `cli.rs` no longer declares the \
+             `--max-slots` CLI flag (§3.4 default = 4 under
+             InflightBatched)."
+        );
+        assert!(
+            cli_src.contains("InflightBatched"),
+            "H47 FALSIFIED: `cli.rs` no longer names the \
+             `InflightBatched` SchedulerArg variant — the opt-in \
+             discriminant is gone."
+        );
+
+        // Env wiring — `serve/mod.rs` reads `HF2Q_SCHEDULER` +
+        // `HF2Q_MAX_SLOTS` via `parse_scheduler_config`.
+        let mod_src = include_str!("../mod.rs");
+        assert!(
+            mod_src.contains("HF2Q_SCHEDULER"),
+            "H47 FALSIFIED: `serve/mod.rs` no longer reads the \
+             `HF2Q_SCHEDULER` env var — env-side opt-in is gone."
+        );
+        assert!(
+            mod_src.contains("HF2Q_MAX_SLOTS"),
+            "H47 FALSIFIED: `serve/mod.rs` no longer reads the \
+             `HF2Q_MAX_SLOTS` env var — operator can't tune slot \
+             count via env."
+        );
+        assert!(
+            mod_src.contains("parse_scheduler_config"),
+            "H47 FALSIFIED: `serve/mod.rs` no longer threads \
+             `parse_scheduler_config` — the CLI + env join point \
+             is gone."
+        );
+    }
+
+    /// **H48 (skip-mode)** — The E1 closure block (§6.1.26) honestly
+    /// enumerates ≥7 surviving typed deferrals, each with an
+    /// operator-grep'able iter-N label.
+    ///
+    /// The enumeration is the operator's forward runbook: when the
+    /// reopen trigger fires, these are the iters that must land
+    /// before SlotAware end-to-end byte-equivalence with SerialFifo
+    /// is provable. Hiding a deferral here would silently shrink the
+    /// runbook.
+    #[test]
+    fn h48_e1_closure_enumerates_at_least_7_typed_deferrals() {
+        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let closure_marker = "### 6.1.26";
+        let closure_start = adr
+            .find(closure_marker)
+            .expect("H48: ADR §6.1.26 closure block not found — E1 \
+                     closure ceremony has not landed");
+        let closure_end_off = adr[closure_start..]
+            .find("\n---\n")
+            .or_else(|| adr[closure_start..].find("\n## "))
+            .unwrap_or_else(|| adr[closure_start..].len().min(40_000));
+        let closure_body = &adr[closure_start..closure_start + closure_end_off];
+
+        // Enumerate the typed deferrals that must survive past E1.
+        let required_deferrals = [
+            "iter-A2b-cont",        // forward-path linear-attn dispatch
+            "iter-C2d-cont-kernel", // Qwen35 worker hot path lift
+            "iter-B4c-kernel",      // Gemma 4 forward_prefill slot lift
+            "iter-A2c",             // fork_seq cross-slot kernel
+            "iter-A3c",             // Gemma 4 fork_seq cross-slot
+            "iter-A3b-2",           // DenseKvBuffers full lift
+            "iter-A3b-3",           // MlxKvCache full lift
+        ];
+
+        let mut missing = Vec::new();
+        for label in &required_deferrals {
+            if !closure_body.contains(label) {
+                missing.push(*label);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "H48 FALSIFIED: §6.1.26 closure block omits {} required \
+             typed-deferral label(s): {:?}. Each surviving deferral \
+             MUST be named in the closure for the operator runbook \
+             to be complete. ADR-040 §7 mantra (\"no fallback, no \
+             stub\") demands every deferral carry an operator- \
+             grep'able iter-N label.",
+            missing.len(),
+            missing
+        );
+
+        // Defence-in-depth: count the total number of distinct
+        // `iter-` labels named in the closure as a coarse upper-bound
+        // sanity check. The 7 required labels above are the
+        // minimum; the closure may name more.
+        let total_iter_mentions = closure_body.matches("iter-").count();
+        assert!(
+            total_iter_mentions >= 7,
+            "H48 FALSIFIED: closure block names only \
+             {total_iter_mentions} `iter-*` references in total. \
+             Need at least 7 for the deferral enumeration to be \
+             complete."
+        );
+    }
+
+    /// **H49 (skip-mode)** — The E1 closure block declares AC-1..AC-5
+    /// status (MET / DEFERRED / WAIVED) per ADR §5.
+    ///
+    /// Each AC must have an explicit status verdict in the closure
+    /// so the operator + future-iter author can answer "is the
+    /// reopen trigger satisfied today?" with a single grep.
+    #[test]
+    fn h49_e1_closure_declares_ac_status_for_each_acceptance_criterion() {
+        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let closure_marker = "### 6.1.26";
+        let closure_start = adr
+            .find(closure_marker)
+            .expect("H49: ADR §6.1.26 closure block not found");
+        let closure_end_off = adr[closure_start..]
+            .find("\n---\n")
+            .or_else(|| adr[closure_start..].find("\n## "))
+            .unwrap_or_else(|| adr[closure_start..].len().min(40_000));
+        let closure_body = &adr[closure_start..closure_start + closure_end_off];
+
+        // ADR §5 declares AC-1..AC-5. Each must be named + carry
+        // a status verdict (MET / DEFERRED / WAIVED).
+        let required_acs = ["AC-1", "AC-2", "AC-3", "AC-4", "AC-5"];
+        for ac in &required_acs {
+            assert!(
+                closure_body.contains(ac),
+                "H49 FALSIFIED: §6.1.26 closure block does not name \
+                 `{ac}`. ADR §5 declares AC-1..AC-5; each must have \
+                 a status verdict (MET / DEFERRED / WAIVED) in the \
+                 final closure for operator reading."
+            );
+        }
+
+        // Status verdict vocabulary must appear in the AC section.
+        let met_count = closure_body.matches("MET").count();
+        let deferred_count = closure_body.matches("DEFERRED").count();
+        assert!(
+            met_count + deferred_count >= 5,
+            "H49 FALSIFIED: §6.1.26 closure block names \
+             {met_count} `MET` + {deferred_count} `DEFERRED` \
+             verdicts. Need at least 5 total to cover AC-1..AC-5 \
+             (each MUST have an explicit status declaration)."
+        );
+    }
+
+    /// **H50 (skip-mode)** — The E1 closure block explicitly states
+    /// the reopen trigger is NOT MET today AND names what would
+    /// trigger re-opening (customer ask OR ≥8 concurrent sustained).
+    ///
+    /// This is the load-bearing decision pin: anyone reading §6.1.26
+    /// must immediately see why SerialFifo stayed the default + what
+    /// fires the next iter.
+    #[test]
+    fn h50_e1_closure_documents_reopen_trigger_status() {
+        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let closure_marker = "### 6.1.26";
+        let closure_start = adr
+            .find(closure_marker)
+            .expect("H50: ADR §6.1.26 closure block not found");
+        let closure_end_off = adr[closure_start..]
+            .find("\n---\n")
+            .or_else(|| adr[closure_start..].find("\n## "))
+            .unwrap_or_else(|| adr[closure_start..].len().min(40_000));
+        let closure_body = &adr[closure_start..closure_start + closure_end_off];
+
+        // Decision pin: KEEP SerialFifo must appear verbatim.
+        assert!(
+            closure_body.contains("KEEP SerialFifo") || closure_body.contains("Keep SerialFifo"),
+            "H50 FALSIFIED: §6.1.26 closure block does not state \
+             the decision `KEEP SerialFifo`. The §3.6 decision matrix \
+             requires an explicit verdict; ambiguity here means the \
+             cutover status is unclear to operators."
+        );
+
+        // Reopen trigger status — explicitly "NOT MET".
+        let not_met_present = closure_body.contains("NOT MET")
+            || closure_body.contains("not met")
+            || closure_body.contains("not yet met");
+        assert!(
+            not_met_present,
+            "H50 FALSIFIED: §6.1.26 closure block does not state the \
+             reopen trigger is NOT MET today. ADR-040 §1.5 + §3.6 \
+             require an explicit status declaration."
+        );
+
+        // Trigger conditions named — customer ask OR ≥8 concurrent.
+        let customer_named = closure_body.contains("customer")
+            || closure_body.contains("Customer");
+        assert!(
+            customer_named,
+            "H50 FALSIFIED: §6.1.26 closure block does not name \
+             `customer` as one of the reopen-trigger conditions. \
+             ADR-005 + ADR-040 §3.7 cite \"customer asks explicitly\" \
+             as one branch of the trigger."
+        );
+        let concurrency_named = closure_body.contains("≥8")
+            || closure_body.contains(">=8")
+            || closure_body.contains("8 concurrent");
+        assert!(
+            concurrency_named,
+            "H50 FALSIFIED: §6.1.26 closure block does not name the \
+             ≥8 concurrent users threshold (ADR-005 reopen-trigger \
+             condition cited verbatim in ADR-040 §1.5)."
+        );
+    }
+
+    /// **E1 status marker pin** — ADR-040 top-of-document Status
+    /// line is updated to CLOSED (post-E1 ceremony).
+    ///
+    /// Companion to H46–H50: the document-level status MUST move
+    /// from `ACTIVE` to `CLOSED` once §6.1.26 lands, so external
+    /// ADR-index tooling + downstream cross-references see the
+    /// terminal state.
+    #[test]
+    fn e1_adr_status_line_marked_closed() {
+        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        // The Status line is the first `- **Status**:` line in the
+        // file (per ADR-040 header). Restrict scan to the first
+        // 4 KB so we don't accidentally match a §6.1.* status mention
+        // deeper in the document.
+        let header = &adr[..4096.min(adr.len())];
+        let status_idx = header
+            .find("- **Status**:")
+            .expect("E1: top-of-document Status line not found");
+        let status_line_end = header[status_idx..]
+            .find('\n')
+            .unwrap_or(header.len() - status_idx);
+        let status_line = &header[status_idx..status_idx + status_line_end];
+        assert!(
+            status_line.contains("CLOSED") || status_line.contains("Closed"),
+            "E1 FALSIFIED: ADR-040 top-of-document Status line does \
+             not contain `CLOSED`. Phase E1 closure ceremony moves \
+             the ADR to terminal CLOSED status; line was: {status_line:?}"
+        );
+    }
+}
