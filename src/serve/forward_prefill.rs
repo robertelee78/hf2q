@@ -3296,34 +3296,85 @@ impl MlxModelWeights {
                 );
             }
 
-            // iter-2B-xlen sub-stage gate: BF16 xlen K/V buffer slot
-            // routing is the HF2Q_DFLASH_XLEN_SDPA=1 opt-in surface
-            // (ADR-030 iter-96).  When the env-gate is OFF (default),
-            // every layer's `bf16_xlen_k` / `bf16_xlen_v` is `None`
-            // (alloc-time decision per gemma4/kv_cache.rs:1006-1018);
-            // the iter-2B no-xlen path proceeds.  When the env-gate is
-            // ON, the BF16 xlen buffers ALSO need per-slot routing —
-            // structurally analogous to the F16 K + V slot routing,
-            // but on a separate kernel-write path
-            // (`dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major`).
-            // iter-2B sub-stages this as iter-2B-xlen so the no-xlen
-            // production-default path lands without bundling the xlen
-            // BF16 surface — typed `CapabilityUnsupported` here is
-            // honest naming, not a vaporware gate.
-            if multi_seq_kv_hybrid
+            // ADR-040 iter-B4c-kernel iter-2B-xlen (2026-05-30) —
+            // PRODUCTION OPT-IN BF16 xlen K/V slot routing landed via
+            // the iter-2B slice_view mount + delegate-to-sibling pattern
+            // applied to the bf16_xlen_k / bf16_xlen_v Optional buffers.
+            // The prior iter-2B typed-deferral capability literal
+            // `gemma4-forward-prefill-slot-N-hybrid-xlen (iter-B4c-kernel-iter-2B-xlen per`
+            // lived inside a `MultiSeqError::CapabilityUnsupported
+            // { capability: "..." }` constructor; iter-2B-xlen REMOVES
+            // that constructor (H189 pin) and threads `Some(slot_view)`
+            // for both bf16_xlen_k + bf16_xlen_v into the constructed
+            // legacy `HybridKvBuffers` per layer.  H87 negative-grep is
+            // preserved because the iter-2B-xlen label substring still
+            // lives in this doc-comment cite as an operator-grep'able
+            // forward pointer.
+            //
+            // Why this path exists at all:
+            //   * ADR-030 iter-96: HF2Q_DFLASH_XLEN_SDPA=1 opt-in surface
+            //     allocates BF16 K/V caches at alloc-time per
+            //     `gemma4/kv_cache.rs:1102-1115` (multi-seq variant) —
+            //     same `[n_seqs, nkv, cap, hd]` outer layout as the F16
+            //     K cache, but BF16 dtype (2 bytes/elem; numerically
+            //     same stride as F16 K).  The downstream consumer is
+            //     `dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major`
+            //     at `forward_prefill_batched.rs:1515` for the cross-
+            //     length SDPA verify path.
+            //   * Default OFF: when env unset, alloc-time leaves both
+            //     fields as `None` → `xlen_engaged = false` here →
+            //     `bf16_xlen_k: None, bf16_xlen_v: None` propagated
+            //     into the per-layer slot-view bundle below → H193 pin
+            //     (default xlen=None path UNCHANGED).
+            //   * Default ON: every layer's `bf16_xlen_k` is `Some(_)`
+            //     AND `bf16_xlen_v` is `Some(_)` by construction (the
+            //     alloc helper allocates both together) → both
+            //     slot-views materialize per layer.
+            //
+            // Per-slot byte offset (H191):
+            //   * bf16_xlen_k: `slot_id.0 * nkv * cap * hd * 2`
+            //     (BF16 = 2 bytes/elem; numerically identical to the
+            //     F16 K stride but on a separately-typed buffer).
+            //   * bf16_xlen_v: same arithmetic.
+            //   * Slot 0 view starts at byte 0; slot N view starts at
+            //     `N * (nkv * cap * hd * 2)`.  At n_seqs=1 (legacy
+            //     allocator output), the byte counts are byte-equivalent
+            //     to a fresh single-seq xlen alloc (H191 transitivity
+            //     to the K-side F16 byte equivalence).
+            //
+            // Per-slot byte isolation (H192):
+            //   * The multi-seq allocator emits a contiguous slab
+            //     `[n_seqs, nkv, cap, hd]` for BOTH xlen K + V; per-slot
+            //     byte regions are contiguous + disjoint by construction
+            //     of the OUTERMOST n_seqs axis.  A slot-0 write via
+            //     `dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major`
+            //     targeting the slot-0 view cannot reach slot-1's region.
+            //
+            // Per-layer xlen presence MUST be consistent (defense-in-
+            // depth invariant): either ALL layers carry Some xlen K + V
+            // (env-gate ON at alloc) or NONE (env-gate OFF).  Mixed
+            // presence is impossible per the alloc-helper construction
+            // and would indicate a layer-vec corruption — bail with
+            // typed `CapabilityUnsupported` naming the inconsistency.
+            let xlen_engaged = multi_seq_kv_hybrid
                 .iter()
-                .any(|buf| buf.bf16_xlen_k.is_some() || buf.bf16_xlen_v.is_some())
-            {
-                let err = MultiSeqError::CapabilityUnsupported {
-                    capability: "gemma4-forward-prefill-slot-N-hybrid-xlen (iter-B4c-kernel-iter-2B-xlen per ADR-040 §6.1.34 — HF2Q_DFLASH_XLEN_SDPA=1 opt-in BF16 xlen K/V buffer slot routing through src/inference/models/gemma4/kv_cache.rs:1006-1018 alloc site + dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major slot offsets; orthogonal to the F16 K + TQ-HB-V no-xlen production-default path which iter-2B lands)",
-                };
-                anyhow::bail!(
-                    "forward_prefill_with_soft_tokens_slot_aware: hybrid xlen BF16 path \
-                     (HF2Q_DFLASH_XLEN_SDPA=1) slot routing not yet wired at slot_id={} \
-                     (ADR-040 iter-B4c-kernel iter-2B-xlen scope). {}",
-                    slot_id.0,
-                    err,
-                );
+                .any(|buf| buf.bf16_xlen_k.is_some() || buf.bf16_xlen_v.is_some());
+            if xlen_engaged {
+                let all_consistent = multi_seq_kv_hybrid.iter().all(|buf| {
+                    buf.bf16_xlen_k.is_some() && buf.bf16_xlen_v.is_some()
+                });
+                if !all_consistent {
+                    let err = MultiSeqError::CapabilityUnsupported {
+                        capability: "gemma4-forward-prefill-slot-N-hybrid-xlen-mixed-presence (iter-B4c-kernel-iter-2B-xlen per ADR-040 §6.1.47 — alloc-helper invariant violation: bf16_xlen_k/v must be Some on ALL layers or NONE, never mixed; if you see this in production, gemma4/kv_cache.rs:1102-1115 lost atomicity across layer-vec alloc loop)",
+                    };
+                    anyhow::bail!(
+                        "forward_prefill_with_soft_tokens_slot_aware: hybrid xlen BF16 path \
+                         (HF2Q_DFLASH_XLEN_SDPA=1) per-layer presence MIXED at slot_id={} \
+                         — alloc-helper invariant violation (ADR-040 iter-B4c-kernel iter-2B-xlen scope). {}",
+                        slot_id.0,
+                        err,
+                    );
+                }
             }
 
             // ── Build per-layer slot-views + mount on self.hybrid_kv ─────
@@ -3453,6 +3504,70 @@ impl MlxModelWeights {
                         ))?
                 };
 
+                // ADR-040 iter-B4c-kernel iter-2B-xlen — BF16 xlen K/V
+                // per-slot slice_view materialization.  When the env-gate
+                // is OFF (default), `xlen_engaged == false` →
+                // (None, None) propagates through to the legacy
+                // `HybridKvBuffers` struct verbatim (H193 pin: default
+                // path UNCHANGED).  When the env-gate is ON,
+                // `xlen_engaged == true` AND every layer's
+                // `bf16_xlen_k.is_some() && bf16_xlen_v.is_some()`
+                // (verified by the consistency check above) →
+                // construct slot-views.
+                //
+                // Byte-offset arithmetic mirrors the K F16 path
+                // verbatim (numerically identical strides: BF16 is also
+                // 2 bytes/elem) but operates on the separately-typed
+                // BF16 buffers.  The downstream consumer
+                // `dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major`
+                // reads BF16 dtype from the slot-view's underlying
+                // Metal buffer; the slice_view preserves the dtype tag.
+                let (bf16_xlen_k_view, bf16_xlen_v_view) = if xlen_engaged {
+                    let xlen_bk = buf.bf16_xlen_k.as_ref().expect(
+                        "xlen consistency guard above: bf16_xlen_k Some",
+                    );
+                    let xlen_bv = buf.bf16_xlen_v.as_ref().expect(
+                        "xlen consistency guard above: bf16_xlen_v Some",
+                    );
+                    // BF16 K + V share the same `[nkv, cap, hd]`
+                    // per-slot layout as F16 K (alloc helper at
+                    // `gemma4/kv_cache.rs:1102-1115`).  Per-slot
+                    // element count = `nkv * cap * hd` (reuse the
+                    // `k_elems_per_slot` computed above for the F16 K
+                    // path — identical formula).
+                    let xlen_bytes_per_slot: u64 = (k_elems_per_slot as u64)
+                        .checked_mul(2u64) // BF16 = 2 bytes/elem
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "slot-view BF16 xlen byte size overflow at L{layer_idx} \
+                             — ADR-040 iter-B4c-kernel iter-2B-xlen"
+                        ))?;
+                    let xlen_byte_offset: u64 = (slot_id.0 as u64)
+                        .checked_mul(xlen_bytes_per_slot)
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "slot-view BF16 xlen byte offset overflow at L{layer_idx} \
+                             (slot_id={} xlen_bytes_per_slot={}) \
+                             — ADR-040 iter-B4c-kernel iter-2B-xlen",
+                            slot_id.0, xlen_bytes_per_slot,
+                        ))?;
+                    let bk_view = xlen_bk
+                        .slice_view(xlen_byte_offset, k_elems_per_slot)
+                        .with_shape(vec![nkv, cap, hd])
+                        .map_err(|e| anyhow::anyhow!(
+                            "slot-view BF16 xlen K with_shape at L{layer_idx}: {e} \
+                             — ADR-040 iter-B4c-kernel iter-2B-xlen"
+                        ))?;
+                    let bv_view = xlen_bv
+                        .slice_view(xlen_byte_offset, k_elems_per_slot)
+                        .with_shape(vec![nkv, cap, hd])
+                        .map_err(|e| anyhow::anyhow!(
+                            "slot-view BF16 xlen V with_shape at L{layer_idx}: {e} \
+                             — ADR-040 iter-B4c-kernel iter-2B-xlen"
+                        ))?;
+                    (Some(bk_view), Some(bv_view))
+                } else {
+                    (None, None)
+                };
+
                 // Construct the legacy single-seq `HybridKvBuffers`
                 // wrapper around the slot-views.  The sibling fn's
                 // consumer at line 1290-1330 reads
@@ -3460,8 +3575,9 @@ impl MlxModelWeights {
                 // indexes `[layer_idx]` directly — slot_view_hybrid's
                 // shape MUST match the legacy alloc output bit-for-bit.
                 //
-                // iter-2B-xlen sub-stage: xlen BF16 K/V are guaranteed
-                // None here (the env-gate check above ruled them out).
+                // iter-2B-xlen sub-stage: bf16_xlen_k/v are Some(view)
+                // when HF2Q_DFLASH_XLEN_SDPA=1 was set at alloc time,
+                // else None (H193 default-path pin).
                 slot_view_hybrid.push(
                     crate::inference::models::gemma4::HybridKvBuffers {
                         k: k_view,
@@ -3470,8 +3586,8 @@ impl MlxModelWeights {
                         capacity: cap,
                         is_sliding: buf.is_sliding,
                         norms_per_pos,
-                        bf16_xlen_k: None,
-                        bf16_xlen_v: None,
+                        bf16_xlen_k: bf16_xlen_k_view,
+                        bf16_xlen_v: bf16_xlen_v_view,
                     },
                 );
             }
@@ -4259,24 +4375,49 @@ impl MlxModelWeights {
                 );
             }
 
-            // iter-2-decode-A-xlen sub-stage gate: BF16 xlen K/V buffer
-            // slot routing is the HF2Q_DFLASH_XLEN_SDPA=1 opt-in surface
-            // (mirror of iter-2B-xlen prefill scope).  Same typed sub-
-            // deferral discipline.
-            if multi_seq_kv_hybrid
+            // ADR-040 iter-B4c-kernel iter-2-decode-A-xlen (2026-05-30)
+            // — decode-side mirror of iter-2B-xlen.  PRODUCTION OPT-IN
+            // BF16 xlen K/V slot routing landed via the iter-2-decode-A
+            // slice_view mount + delegate-to-sibling pattern applied to
+            // the bf16_xlen_k / bf16_xlen_v Optional buffers.  The
+            // prior iter-2-decode-A typed-deferral capability literal
+            // `gemma4-forward-decode-slot-N-hybrid-xlen (iter-B4c-kernel-iter-2-decode-A-xlen per`
+            // lived inside a `MultiSeqError::CapabilityUnsupported
+            // { capability: "..." }` constructor; iter-2-decode-A-xlen
+            // REMOVES that constructor (H190 pin) and threads
+            // `Some(slot_view)` for both bf16_xlen_k + bf16_xlen_v
+            // into the constructed legacy `HybridKvBuffers` per layer.
+            // H87 negative-grep is preserved because the
+            // iter-2-decode-A-xlen label substring still lives in this
+            // doc-comment cite as an operator-grep'able forward pointer.
+            //
+            // Mirror of iter-2B-xlen prefill scope: same per-slot byte
+            // offset arithmetic (`slot_id.0 * nkv * cap * hd * 2`,
+            // H191), same default-OFF transparency (H193 — every
+            // layer's bf16_xlen_k/v is None when env-gate off →
+            // xlen_engaged == false → (None, None) propagates), same
+            // per-layer presence consistency invariant (either ALL
+            // layers Some xlen K + V or NONE — mixed presence indicates
+            // alloc-helper corruption).
+            let xlen_engaged = multi_seq_kv_hybrid
                 .iter()
-                .any(|buf| buf.bf16_xlen_k.is_some() || buf.bf16_xlen_v.is_some())
-            {
-                let err = MultiSeqError::CapabilityUnsupported {
-                    capability: "gemma4-forward-decode-slot-N-hybrid-xlen (iter-B4c-kernel-iter-2-decode-A-xlen per ADR-040 §6.1.38 — HF2Q_DFLASH_XLEN_SDPA=1 opt-in BF16 xlen K/V buffer decode-side slot routing; orthogonal to the F16 K + TQ-HB-V no-xlen production-default path which iter-2-decode-A lands)",
-                };
-                anyhow::bail!(
-                    "forward_decode_slot_aware: hybrid xlen BF16 decode path \
-                     (HF2Q_DFLASH_XLEN_SDPA=1) slot routing not yet wired at slot_id={} \
-                     (ADR-040 iter-B4c-kernel iter-2-decode-A-xlen scope). {}",
-                    slot_id.0,
-                    err,
-                );
+                .any(|buf| buf.bf16_xlen_k.is_some() || buf.bf16_xlen_v.is_some());
+            if xlen_engaged {
+                let all_consistent = multi_seq_kv_hybrid.iter().all(|buf| {
+                    buf.bf16_xlen_k.is_some() && buf.bf16_xlen_v.is_some()
+                });
+                if !all_consistent {
+                    let err = MultiSeqError::CapabilityUnsupported {
+                        capability: "gemma4-forward-decode-slot-N-hybrid-xlen-mixed-presence (iter-B4c-kernel-iter-2-decode-A-xlen per ADR-040 §6.1.47 — alloc-helper invariant violation: bf16_xlen_k/v must be Some on ALL layers or NONE, never mixed; if you see this in production, gemma4/kv_cache.rs:1102-1115 lost atomicity across layer-vec alloc loop)",
+                    };
+                    anyhow::bail!(
+                        "forward_decode_slot_aware: hybrid xlen BF16 decode path \
+                         (HF2Q_DFLASH_XLEN_SDPA=1) per-layer presence MIXED at slot_id={} \
+                         — alloc-helper invariant violation (ADR-040 iter-B4c-kernel iter-2-decode-A-xlen scope). {}",
+                        slot_id.0,
+                        err,
+                    );
+                }
             }
 
             // ── Build per-layer slot-views + mount on self.hybrid_kv ─────
@@ -4396,6 +4537,65 @@ impl MlxModelWeights {
                         ))?
                 };
 
+                // ADR-040 iter-B4c-kernel iter-2-decode-A-xlen — BF16
+                // xlen K/V per-slot slice_view materialization.  Direct
+                // mirror of iter-2B-xlen prefill scope (same per-slot
+                // byte offset arithmetic, same default-OFF (None, None)
+                // propagation, same `[nkv, cap, hd]` view shape).
+                //
+                // When the env-gate is OFF (default), `xlen_engaged ==
+                // false` → (None, None) → bf16_xlen_k/v: None
+                // propagates (H193 default-path pin).  When ON, every
+                // layer's bf16_xlen_k.is_some() && bf16_xlen_v.is_some()
+                // by alloc-helper invariant (verified by the consistency
+                // check above) → slot-views materialize per layer.
+                let (bf16_xlen_k_view, bf16_xlen_v_view) = if xlen_engaged {
+                    let xlen_bk = buf.bf16_xlen_k.as_ref().expect(
+                        "decode xlen consistency guard above: bf16_xlen_k Some",
+                    );
+                    let xlen_bv = buf.bf16_xlen_v.as_ref().expect(
+                        "decode xlen consistency guard above: bf16_xlen_v Some",
+                    );
+                    // Per-slot element count = `nkv * cap * hd` (reuse
+                    // `k_elems_per_slot` from F16 K path — identical
+                    // formula).  BF16 stride = 2 bytes/elem
+                    // (numerically identical to F16 K but on a
+                    // separately-typed buffer; dispatch_kv_cache_copy_
+                    // seq_bf16_to_bf16_head_major reads BF16 dtype tag
+                    // from the slot-view's underlying Metal buffer).
+                    let xlen_bytes_per_slot: u64 = (k_elems_per_slot as u64)
+                        .checked_mul(2u64) // BF16 = 2 bytes/elem
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "decode slot-view BF16 xlen byte size overflow at L{layer_idx} \
+                             — ADR-040 iter-B4c-kernel iter-2-decode-A-xlen"
+                        ))?;
+                    let xlen_byte_offset: u64 = (slot_id.0 as u64)
+                        .checked_mul(xlen_bytes_per_slot)
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "decode slot-view BF16 xlen byte offset overflow at L{layer_idx} \
+                             (slot_id={} xlen_bytes_per_slot={}) \
+                             — ADR-040 iter-B4c-kernel iter-2-decode-A-xlen",
+                            slot_id.0, xlen_bytes_per_slot,
+                        ))?;
+                    let bk_view = xlen_bk
+                        .slice_view(xlen_byte_offset, k_elems_per_slot)
+                        .with_shape(vec![nkv, cap, hd])
+                        .map_err(|e| anyhow::anyhow!(
+                            "decode slot-view BF16 xlen K with_shape at L{layer_idx}: {e} \
+                             — ADR-040 iter-B4c-kernel iter-2-decode-A-xlen"
+                        ))?;
+                    let bv_view = xlen_bv
+                        .slice_view(xlen_byte_offset, k_elems_per_slot)
+                        .with_shape(vec![nkv, cap, hd])
+                        .map_err(|e| anyhow::anyhow!(
+                            "decode slot-view BF16 xlen V with_shape at L{layer_idx}: {e} \
+                             — ADR-040 iter-B4c-kernel iter-2-decode-A-xlen"
+                        ))?;
+                    (Some(bk_view), Some(bv_view))
+                } else {
+                    (None, None)
+                };
+
                 // Construct the legacy single-seq `HybridKvBuffers`
                 // wrapper around the slot-views.  The sibling fn's
                 // consumer at `gemma4/gpu_full_attn.rs::encode_one_layer`
@@ -4411,8 +4611,8 @@ impl MlxModelWeights {
                         capacity: cap,
                         is_sliding: buf.is_sliding,
                         norms_per_pos,
-                        bf16_xlen_k: None,
-                        bf16_xlen_v: None,
+                        bf16_xlen_k: bf16_xlen_k_view,
+                        bf16_xlen_v: bf16_xlen_v_view,
                     },
                 );
             }

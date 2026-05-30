@@ -28959,3 +28959,649 @@ mod adr040_phase_b_iter_b4c_kernel_iter2c_iter2d_iter2_decode_d_gemma4_tests {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// ADR-040 Phase B iter-B4c-kernel iter-2B-xlen + iter-2-decode-A-xlen
+// joint test module — Gemma 4 BF16 xlen K/V (HF2Q_DFLASH_XLEN_SDPA=1
+// opt-in surface, ADR-030 iter-96) slot routing JOINTLY landed for the
+// HybridKvBuffers production-default KV regime on BOTH the prefill +
+// decode sides via the iter-2B + iter-2-decode-A slice_view mount +
+// delegate-to-sibling pattern applied to the optional bf16_xlen_k /
+// bf16_xlen_v fields.
+//
+// Joint-iter framing per the iter-2C + iter-2D + iter-2-decode-D
+// precedent at §6.1.46: iter-2B-xlen + iter-2-decode-A-xlen share the
+// SAME structural template (per-layer slot-view construction at the
+// same byte-offset arithmetic — `slot_id.0 * nkv * cap * hd * 2`,
+// BF16 = 2 bytes/elem) applied at TWO model-fn entry points
+// (`forward_prefill_with_soft_tokens_slot_aware`'s hybrid branch +
+// `forward_decode_slot_aware`'s hybrid branch).  Joint shipping
+// minimizes cognitive load on operator review AND eliminates the
+// surface-area drift risk that would emerge if the prefill side
+// landed at iter-N while the decode side waited at iter-N+M.
+//
+// Path chosen — slice_view mount + delegate-to-sibling (Path A from
+// §6.1.34 + §6.1.38), additive variant:
+//
+//   * The iter-2B + iter-2-decode-A hybrid branches already mount
+//     per-layer `HybridKvBuffers` slot-views; iter-2B-xlen +
+//     iter-2-decode-A-xlen REPLACE the `bf16_xlen_k: None,
+//     bf16_xlen_v: None` literal in the `HybridKvBuffers {}`
+//     constructor with conditional `Some(slot_view) / None` based on
+//     `xlen_engaged: bool` derived from the persistent multi-seq
+//     scaffold's first-layer presence check.
+//   * The xlen typed-error gate at the iter-2B + iter-2-decode-A
+//     branch entries is REPLACED with a presence consistency check
+//     (every layer must have both bf16_xlen_k.is_some() AND
+//     bf16_xlen_v.is_some() OR every layer must have BOTH as None —
+//     mixed presence indicates alloc-helper corruption and bails
+//     with a typed `CapabilityUnsupported` naming the inconsistency).
+//   * No new fn signatures, no new GemmaLoadedModel fields, no new
+//     orchestrator threading — the persistent xlen K/V buffers are
+//     already inside the iter-A3b iter-1 `MultiSeqHybridKvBuffers`
+//     scaffold provisioned by iter-C2c-cont at §6.1.33; this iter
+//     simply consumes them on the slot-routing read path.
+//
+// Why this is structurally honest:
+//
+//   * Default OFF (`HF2Q_DFLASH_XLEN_SDPA` unset): every layer's
+//     bf16_xlen_k + bf16_xlen_v are `None` (alloc-time decision per
+//     `gemma4/kv_cache.rs:1102-1115`) → `xlen_engaged == false` →
+//     the conditional materialization produces `(None, None)` →
+//     `bf16_xlen_k: None, bf16_xlen_v: None` propagates verbatim
+//     into the legacy `HybridKvBuffers` struct.  PRE-iter-2B-xlen
+//     + iter-2-decode-A-xlen byte equivalence preserved (H193).
+//   * Default ON: every layer's bf16_xlen_k + bf16_xlen_v are Some(_)
+//     by the alloc helper's atomic alloc loop (either both alloc
+//     succeeded for every layer or none did) → `xlen_engaged == true`
+//     → slot-views materialize at the per-slot byte region of the
+//     persistent multi-seq scaffold → sibling fn's downstream xlen
+//     consumer (`dispatch_kv_cache_copy_seq_bf16_to_bf16_head_major`
+//     at `forward_prefill_batched.rs:1515`) sees the slot-view ARC
+//     handle just like the iter-2B F16 K + V slot-views.
+//   * SerialFifo byte-equivalence (H194) preserved by code-path
+//     disjointness: SerialFifo + SlotId(0) routes through
+//     `generate_once` / `generate_stream_once` direct calls to the
+//     unchanged siblings; the iter-1 worker-arm predicate
+//     `slot_id != SlotId(0)` short-circuits the slot-aware fns at
+//     entry.  iter-2B-xlen + iter-2-decode-A-xlen are observed only
+//     at SlotAware + SlotId(N>0).
+//
+// Production-code changes (NO NEW FN SIGNATURES — purely body-additive
+// to the iter-2B + iter-2-decode-A hybrid branches):
+//
+//   * `src/serve/forward_prefill.rs`:
+//     - iter-2B hybrid branch xlen typed-error gate (~16 LOC):
+//       REPLACED with `xlen_engaged: bool` derivation + presence
+//       consistency invariant check (defense-in-depth typed
+//       `CapabilityUnsupported` only on mixed-presence, which is
+//       impossible per alloc-helper construction).
+//     - iter-2B hybrid branch per-layer slot-view construction
+//       (~65 LOC): NEW conditional BF16 xlen K + V slot-view block
+//       computed inside the per-layer loop right before the
+//       `HybridKvBuffers {}` struct literal.
+//     - iter-2B hybrid branch struct literal (~2 LOC): the
+//       `bf16_xlen_k: None, bf16_xlen_v: None` literal REPLACED with
+//       `bf16_xlen_k: bf16_xlen_k_view, bf16_xlen_v: bf16_xlen_v_view`
+//       binding to the conditional materialization.
+//     - iter-2-decode-A hybrid branch: same 3 changes applied
+//       verbatim to the decode body (mirror of prefill).
+//
+// Tests (H189–H195):
+//
+//   H189 (skip-mode): forward_prefill_with_soft_tokens_slot_aware
+//                     iter-2B-xlen hybrid xlen branch typed-error
+//                     label REMOVED; positive pin on slot-view
+//                     materialization via `xlen_engaged` binding +
+//                     `bf16_xlen_k: bf16_xlen_k_view` non-None
+//                     propagation.
+//   H190 (skip-mode): forward_decode_slot_aware iter-2-decode-A-xlen
+//                     hybrid xlen branch typed-error label REMOVED;
+//                     positive pin on mirror of H189 applied to
+//                     decode body.
+//   H191 (skip-mode): per-slot byte offset arithmetic uses
+//                     `* 2u64 // BF16 = 2 bytes/elem` + references
+//                     `k_elems_per_slot` (reuses the F16 K stride
+//                     formula since BF16 K shape is identical).
+//                     Defends against accidentally using F32 stride
+//                     (`* 4u64`) or U8 stride (`* 1u64`) on the BF16
+//                     buffer.
+//   H192 (skip-mode): per-slot byte isolation — the `xlen_byte_offset`
+//                     binding uses `slot_id.0` as the multiplier on
+//                     `xlen_bytes_per_slot`.  Defends against a
+//                     hardcoded 0 byte offset that would cause every
+//                     slot to write to slot 0's xlen region.
+//   H193 (skip-mode): default OFF (HF2Q_DFLASH_XLEN_SDPA unset) path
+//                     UNCHANGED — `xlen_engaged` falls through to
+//                     `(None, None)` materialization when no layer
+//                     carries Some xlen buffers; the per-layer
+//                     `HybridKvBuffers {}` struct receives the
+//                     (None, None) literal verbatim equivalent to
+//                     pre-iter-2B-xlen + iter-2-decode-A-xlen state.
+//   H194 (skip-mode): SerialFifo + HF2Q_DFLASH_XLEN_SDPA=1 byte
+//                     equivalence preserved — sibling fn signatures
+//                     `forward_prefill_with_soft_tokens_resume` +
+//                     `forward_decode` UNCHANGED (no xlen-specific
+//                     params); code-path disjointness preserves H86
+//                     + H128 byte equivalence.
+//   H195 (skip-mode): production-default HybridKvBuffers non-xlen +
+//                     HB-encoded + dense F32 + legacy 4-bit surfaces
+//                     UNCHANGED (H188 transitivity); Qwen35 +
+//                     Qwen3VL UNCHANGED.  ADR-040 §6.1.47 closure
+//                     block exists.
+
+#[cfg(test)]
+mod adr040_phase_b_iter_b4c_kernel_iter2b_xlen_iter2_decode_a_xlen_gemma4_tests {
+    // Skip-mode source-grep tests; intentionally NO `use super::*;`.
+
+    /// **H189 (skip-mode)** — iter-2B-xlen hybrid xlen branch
+    /// typed-error REPLACED with real slot routing.
+    ///
+    /// The iter-2B typed-deferral capability literal
+    /// `gemma4-forward-prefill-slot-N-hybrid-xlen (iter-B4c-kernel-iter-2B-xlen per`
+    /// is REMOVED from the new fn body — iter-2B-xlen's slot routing
+    /// has REPLACED it.  Positive pin: `xlen_engaged` binding +
+    /// `bf16_xlen_k: bf16_xlen_k_view,` (non-None propagation through
+    /// the `HybridKvBuffers {}` constructor) BOTH present in the
+    /// prefill fn body.
+    ///
+    /// Note: the iter-2B-xlen label substring is preserved as a
+    /// doc-comment cite (the `iter-B4c-kernel-iter-2B-xlen per ADR-040 §6.1.47`
+    /// substring remains in the new fn body for H87 forward-pointer
+    /// discoverability); the load-bearing pin is that the
+    /// substring is NOT present inside a `MultiSeqError::
+    /// CapabilityUnsupported { capability: "...xlen..." }` constructor
+    /// call for the DEFAULT path — the typed error is GONE except
+    /// for the defense-in-depth mixed-presence invariant violation.
+    #[test]
+    fn h189_iter2b_xlen_hybrid_branch_typed_error_replaced_with_slot_routing() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H189: prefill slot-aware fn marker present (H84 asserts)");
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
+
+        // (a) The iter-2B-xlen typed-deferral capability literal — EXACT
+        // string a CapabilityUnsupported constructor would have used at
+        // iter-2B SHIP.  iter-2B-xlen REMOVES it from the default path.
+        let iter2b_xlen_typed_error_default =
+            "gemma4-forward-prefill-slot-N-hybrid-xlen (iter-B4c-kernel-iter-2B-xlen per ADR-040 §6.1.34";
+        assert!(
+            !fn_window.contains(iter2b_xlen_typed_error_default),
+            "H189 FALSIFIED: prefill fn body still contains the iter-2B \
+             xlen typed-error capability label `{iter2b_xlen_typed_error_default}` \
+             — iter-2B-xlen slot routing NOT landed; \
+             HF2Q_DFLASH_XLEN_SDPA=1 requests still surface \
+             CapabilityUnsupported at the hybrid xlen branch."
+        );
+
+        // (b) Positive pin: `xlen_engaged` binding present (the
+        // load-bearing predicate for the conditional materialization).
+        assert!(
+            fn_window.contains("let xlen_engaged ="),
+            "H189 FALSIFIED: prefill fn body does NOT contain the \
+             `let xlen_engaged =` binding — iter-2B-xlen slot routing \
+             primitive missing."
+        );
+
+        // (c) Positive pin: `bf16_xlen_k: bf16_xlen_k_view,` non-None
+        // propagation through the `HybridKvBuffers {}` constructor.
+        // PRE-iter-2B-xlen state had hardcoded `bf16_xlen_k: None,
+        // bf16_xlen_v: None,` literals.  iter-2B-xlen REPLACES them
+        // with the conditional materialization output.
+        assert!(
+            fn_window.contains("bf16_xlen_k: bf16_xlen_k_view,"),
+            "H189 FALSIFIED: prefill fn body does NOT contain the \
+             `bf16_xlen_k: bf16_xlen_k_view,` non-None struct-field \
+             binding — iter-2B-xlen propagation NOT wired into the \
+             `HybridKvBuffers {{}}` constructor."
+        );
+        assert!(
+            fn_window.contains("bf16_xlen_v: bf16_xlen_v_view,"),
+            "H189 FALSIFIED: prefill fn body does NOT contain the \
+             `bf16_xlen_v: bf16_xlen_v_view,` non-None struct-field \
+             binding — iter-2B-xlen V-side propagation NOT wired."
+        );
+
+        // (d) The iter-2B-xlen label substring IS preserved somewhere
+        // in the fn body as doc-comment cite (operator-grep'able
+        // forward pointer — required by H87 transitivity).
+        assert!(
+            fn_window.contains("iter-B4c-kernel-iter-2B-xlen per ADR-040 §6.1.47"),
+            "H189 FALSIFIED: prefill fn body does NOT contain the \
+             operator-grep'able iter-2B-xlen forward pointer \
+             `iter-B4c-kernel-iter-2B-xlen per ADR-040 §6.1.47`."
+        );
+    }
+
+    /// **H190 (skip-mode)** — iter-2-decode-A-xlen hybrid xlen
+    /// branch typed-error REPLACED with real slot routing.
+    ///
+    /// Mirror of H189 applied to `forward_decode_slot_aware`'s
+    /// hybrid branch.  Same 4 pins (typed-error removed, xlen_engaged
+    /// binding present, struct-field bindings present, doc-cite
+    /// preserved) but searched inside the decode fn body window.
+    #[test]
+    fn h190_iter2_decode_a_xlen_hybrid_branch_typed_error_replaced_with_slot_routing() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_decode_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H190: decode slot-aware fn marker present (H123 asserts)");
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
+
+        // (a) Decode-side iter-2-decode-A-xlen typed-deferral capability
+        // literal REMOVED from the default path.
+        let iter2_decode_xlen_typed_error_default =
+            "gemma4-forward-decode-slot-N-hybrid-xlen (iter-B4c-kernel-iter-2-decode-A-xlen per ADR-040 §6.1.38";
+        assert!(
+            !fn_window.contains(iter2_decode_xlen_typed_error_default),
+            "H190 FALSIFIED: decode fn body still contains the \
+             iter-2-decode-A-xlen typed-error capability label \
+             `{iter2_decode_xlen_typed_error_default}` — \
+             iter-2-decode-A-xlen slot routing NOT landed."
+        );
+
+        // (b) Positive pin: `xlen_engaged` binding present in decode body.
+        assert!(
+            fn_window.contains("let xlen_engaged ="),
+            "H190 FALSIFIED: decode fn body does NOT contain the \
+             `let xlen_engaged =` binding — iter-2-decode-A-xlen slot \
+             routing primitive missing on the decode side."
+        );
+
+        // (c) Positive pin: `bf16_xlen_k: bf16_xlen_k_view,` non-None
+        // propagation in the decode body's `HybridKvBuffers {}` struct.
+        assert!(
+            fn_window.contains("bf16_xlen_k: bf16_xlen_k_view,"),
+            "H190 FALSIFIED: decode fn body does NOT contain the \
+             `bf16_xlen_k: bf16_xlen_k_view,` non-None struct-field \
+             binding — iter-2-decode-A-xlen propagation NOT wired."
+        );
+        assert!(
+            fn_window.contains("bf16_xlen_v: bf16_xlen_v_view,"),
+            "H190 FALSIFIED: decode fn body does NOT contain the \
+             `bf16_xlen_v: bf16_xlen_v_view,` non-None struct-field \
+             binding — iter-2-decode-A-xlen V-side propagation NOT wired."
+        );
+
+        // (d) Decode-side iter-2-decode-A-xlen forward-pointer cite.
+        assert!(
+            fn_window.contains("iter-B4c-kernel-iter-2-decode-A-xlen per ADR-040 §6.1.47"),
+            "H190 FALSIFIED: decode fn body does NOT contain the \
+             operator-grep'able iter-2-decode-A-xlen forward pointer \
+             `iter-B4c-kernel-iter-2-decode-A-xlen per ADR-040 §6.1.47`."
+        );
+    }
+
+    /// **H191 (skip-mode)** — per-slot byte offset arithmetic uses
+    /// `* 2u64 // BF16 = 2 bytes/elem` AND references
+    /// `k_elems_per_slot` (the F16 K stride formula — BF16 K shape is
+    /// identical to F16 K so the elem-count formula reuses).
+    ///
+    /// Defends against:
+    ///   * Accidentally using `* 4u64` (F32 stride) on the BF16
+    ///     buffer (would compute 2x the true offset → slot N writes
+    ///     to slot 2N's region → cross-slot interference).
+    ///   * Accidentally using `* 1u64` (U8 stride) (would compute
+    ///     1/2x the true offset → silent corruption of mid-slot
+    ///     bytes).
+    ///   * Forgetting to multiply by slot_id.0 (would route every
+    ///     slot to slot 0's xlen region).
+    #[test]
+    fn h191_xlen_byte_offset_per_bf16_layout() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H191: prefill slot-aware fn marker present");
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
+
+        // (a) BF16 = 2 bytes/elem comment + literal multiplier present
+        // in the xlen byte computation.  Pin the exact comment substring
+        // so a regression to F32/U8 stride would falsify.
+        assert!(
+            fn_window.contains("checked_mul(2u64) // BF16 = 2 bytes/elem"),
+            "H191 FALSIFIED: prefill fn body does NOT contain the \
+             load-bearing `checked_mul(2u64) // BF16 = 2 bytes/elem` \
+             literal — iter-2B-xlen byte-offset arithmetic at risk \
+             of wrong-stride regression."
+        );
+
+        // (b) `xlen_bytes_per_slot` binding derived from
+        // `k_elems_per_slot` (the F16 K formula — BF16 reuses).
+        assert!(
+            fn_window.contains("let xlen_bytes_per_slot: u64 = (k_elems_per_slot as u64)"),
+            "H191 FALSIFIED: prefill fn body does NOT derive \
+             `xlen_bytes_per_slot` from `k_elems_per_slot` — BF16 \
+             stride reuses the F16 K elem count formula (identical \
+             `[nkv, cap, hd]` shape per the alloc helper); \
+             regression risk: future iter accidentally re-derives \
+             elem count with wrong shape factor."
+        );
+
+        // (c) Mirror checks for the decode body.
+        let decode_marker = "pub fn forward_decode_slot_aware(";
+        let decode_idx = src
+            .find(decode_marker)
+            .expect("H191: decode slot-aware fn marker present");
+        let decode_window = &src[decode_idx..(decode_idx + 80_000).min(src.len())];
+        assert!(
+            decode_window.contains("checked_mul(2u64) // BF16 = 2 bytes/elem"),
+            "H191 FALSIFIED: decode fn body does NOT contain the \
+             `checked_mul(2u64) // BF16 = 2 bytes/elem` literal — \
+             iter-2-decode-A-xlen byte-offset arithmetic at risk."
+        );
+        assert!(
+            decode_window.contains("let xlen_bytes_per_slot: u64 = (k_elems_per_slot as u64)"),
+            "H191 FALSIFIED: decode fn body does NOT derive \
+             `xlen_bytes_per_slot` from `k_elems_per_slot`."
+        );
+    }
+
+    /// **H192 (skip-mode)** — per-slot byte isolation: the
+    /// `xlen_byte_offset` binding uses `slot_id.0` as the multiplier
+    /// on `xlen_bytes_per_slot`, not a hardcoded 0.
+    ///
+    /// Defends against a defective copy-paste from the F16 K
+    /// computation that accidentally hardcodes `0u64.checked_mul(...)`
+    /// or omits the `slot_id.0` factor entirely — which would route
+    /// every SlotId(N>0) request's xlen K + V writes to slot 0's
+    /// byte region, causing silent cross-slot corruption.
+    ///
+    /// Slot 0's xlen byte offset is `0` by arithmetic (`0 * stride
+    /// == 0`); slot N's xlen byte offset is `N * stride`.  Per-slot
+    /// byte isolation is enforced at the slice_view layer (Metal
+    /// `setBuffer:offset:atIndex:` semantics route the byte offset
+    /// into kernel dispatch — same as the iter-2B F16 K + V slot
+    /// isolation).
+    #[test]
+    fn h192_per_slot_xlen_byte_isolation() {
+        let src = include_str!("../forward_prefill.rs");
+
+        // (a) Prefill side: `xlen_byte_offset` derivation uses
+        // `(slot_id.0 as u64).checked_mul(xlen_bytes_per_slot)` —
+        // pinned by the exact substring.
+        let prefill_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let prefill_idx = src
+            .find(prefill_marker)
+            .expect("H192: prefill slot-aware fn marker present");
+        let prefill_window = &src[prefill_idx..(prefill_idx + 80_000).min(src.len())];
+        assert!(
+            prefill_window.contains(
+                "let xlen_byte_offset: u64 = (slot_id.0 as u64)",
+            ),
+            "H192 FALSIFIED: prefill fn body does NOT contain the \
+             `let xlen_byte_offset: u64 = (slot_id.0 as u64)` binding \
+             — per-slot byte isolation at risk; SlotId(N>0) xlen \
+             writes would target slot 0's region if slot_id.0 is \
+             omitted from the byte-offset multiplication."
+        );
+        assert!(
+            prefill_window.contains(".checked_mul(xlen_bytes_per_slot)"),
+            "H192 FALSIFIED: prefill fn body does NOT chain \
+             `.checked_mul(xlen_bytes_per_slot)` on the slot_id.0 \
+             factor — byte-offset overflow guard at risk."
+        );
+
+        // (b) Decode side: same pins.
+        let decode_marker = "pub fn forward_decode_slot_aware(";
+        let decode_idx = src
+            .find(decode_marker)
+            .expect("H192: decode slot-aware fn marker present");
+        let decode_window = &src[decode_idx..(decode_idx + 80_000).min(src.len())];
+        assert!(
+            decode_window.contains(
+                "let xlen_byte_offset: u64 = (slot_id.0 as u64)",
+            ),
+            "H192 FALSIFIED: decode fn body does NOT contain the \
+             `let xlen_byte_offset: u64 = (slot_id.0 as u64)` binding \
+             — decode-side per-slot byte isolation at risk."
+        );
+    }
+
+    /// **H193 (skip-mode)** — default OFF (HF2Q_DFLASH_XLEN_SDPA
+    /// unset) path UNCHANGED.
+    ///
+    /// When `xlen_engaged == false`, the conditional materialization
+    /// produces `(None, None)` and the `HybridKvBuffers {}`
+    /// constructor receives `bf16_xlen_k: None, bf16_xlen_v: None`
+    /// equivalent to PRE-iter-2B-xlen + iter-2-decode-A-xlen
+    /// behavior.
+    ///
+    /// Pinned by source-grep on the `else` arm of the materialization
+    /// that produces `(None, None)`.  Defends against a regression
+    /// that accidentally allocates fresh xlen buffers per call on
+    /// the default-OFF path (which would 5-7x the per-call alloc
+    /// overhead + violate the alloc-time decision discipline).
+    #[test]
+    fn h193_default_xlen_off_path_unchanged() {
+        let src = include_str!("../forward_prefill.rs");
+
+        // (a) Prefill body: `else { (None, None) }` materialization
+        // present (the default-OFF fall-through).
+        let prefill_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let prefill_idx = src
+            .find(prefill_marker)
+            .expect("H193: prefill slot-aware fn marker present");
+        let prefill_window = &src[prefill_idx..(prefill_idx + 80_000).min(src.len())];
+
+        // Conservative grep: the `(None, None)` literal appears in the
+        // materialization's else arm — at least once on the prefill
+        // side AND at least once on the decode side.  Counting both:
+        // 2 occurrences across the whole fn-region (one per fn).
+        let prefill_none_none_count = prefill_window.matches("(None, None)").count();
+        assert!(
+            prefill_none_none_count >= 1,
+            "H193 FALSIFIED: prefill fn body does NOT contain at \
+             least one `(None, None)` materialization fall-through \
+             — default OFF path may now over-allocate xlen buffers."
+        );
+
+        // (b) Decode body: same.
+        let decode_marker = "pub fn forward_decode_slot_aware(";
+        let decode_idx = src
+            .find(decode_marker)
+            .expect("H193: decode slot-aware fn marker present");
+        let decode_window = &src[decode_idx..(decode_idx + 80_000).min(src.len())];
+        let decode_none_none_count = decode_window.matches("(None, None)").count();
+        assert!(
+            decode_none_none_count >= 1,
+            "H193 FALSIFIED: decode fn body does NOT contain at \
+             least one `(None, None)` materialization fall-through \
+             — default OFF path may now over-allocate xlen buffers \
+             on the decode side."
+        );
+
+        // (c) The `xlen_engaged` predicate is bound via `.any(...)`
+        // on the buffer fields — confirms the predicate detects
+        // alloc-time presence, not env-var reading.  Defends against
+        // a regression that reads `std::env::var("HF2Q_DFLASH_XLEN_SDPA")`
+        // at slot-routing time (which would diverge from the alloc-
+        // time decision per the LazyLock-cache discipline).
+        assert!(
+            prefill_window.contains(
+                ".any(|buf| buf.bf16_xlen_k.is_some() || buf.bf16_xlen_v.is_some())",
+            ),
+            "H193 FALSIFIED: prefill fn body does NOT derive \
+             `xlen_engaged` from buffer-field presence — risk of \
+             slot-routing-time env-var read diverging from alloc-time \
+             decision."
+        );
+    }
+
+    /// **H194 (skip-mode)** — SerialFifo + HF2Q_DFLASH_XLEN_SDPA=1
+    /// byte equivalence preserved at SlotId(0).
+    ///
+    /// Mirror of H86 + H102 + H128 byte-equivalence pin chain
+    /// extended to the xlen surface:
+    ///
+    ///   * Sibling fn `forward_prefill_with_soft_tokens_resume`
+    ///     signature UNCHANGED — no new xlen-specific params (the
+    ///     xlen buffers are consumed via `self.hybrid_kv` strong-
+    ///     ref, same as the F16 K + V).
+    ///   * Sibling fn `forward_decode` signature UNCHANGED.
+    ///   * The iter-2B-xlen + iter-2-decode-A-xlen routing materializes
+    ///     slot-views with byte offset 0 at SlotId(0); slice_view(0,
+    ///     n_elements) produces a view byte-identical to the original
+    ///     buffer.  Combined with code-path disjointness (iter-1
+    ///     worker-arm predicate gates this fn on SlotId(N>0)),
+    ///     SerialFifo never reaches this fn AT ALL — the byte
+    ///     equivalence pin is preserved by routing exclusion, not
+    ///     by routing identity.
+    #[test]
+    fn h194_serial_fifo_xlen_byte_equivalence_preserved() {
+        let src = include_str!("../forward_prefill.rs");
+
+        // (a) Sibling fn forward_prefill_with_soft_tokens_resume
+        // signature UNCHANGED (no slot_id / multi_seq_kv / xlen params
+        // — H86 transitivity to xlen).
+        let sibling_marker = "pub fn forward_prefill_with_soft_tokens_resume(";
+        let sibling_idx = src.find(sibling_marker).expect(
+            "H194: sibling fn forward_prefill_with_soft_tokens_resume present",
+        );
+        let sibling_sig =
+            &src[sibling_idx..(sibling_idx + 4_000).min(src.len())];
+        assert!(
+            !sibling_sig.contains("slot_id:"),
+            "H194 FALSIFIED: sibling `forward_prefill_with_soft_tokens_resume` \
+             signature contains `slot_id:` — H86 byte-equivalence pin \
+             broken at xlen layer."
+        );
+        assert!(
+            !sibling_sig.contains("multi_seq_kv"),
+            "H194 FALSIFIED: sibling fn signature contains \
+             `multi_seq_kv` — H86 byte-equivalence pin broken."
+        );
+        assert!(
+            !sibling_sig.contains("bf16_xlen"),
+            "H194 FALSIFIED: sibling fn signature contains \
+             `bf16_xlen` — iter-2B-xlen accidentally exposed an xlen \
+             parameter on the SerialFifo-routing sibling, breaking \
+             H86 byte-equivalence."
+        );
+
+        // (b) iter-2B-xlen materialization is INSIDE the slot-aware
+        // fn body (not in the sibling).  The iter-2B prefill mount
+        // assignment `self.hybrid_kv = Some(slot_view_hybrid);`
+        // STILL present (transitivity to H101).
+        assert!(
+            src.contains("self.hybrid_kv = Some(slot_view_hybrid)"),
+            "H194 FALSIFIED: iter-2B mount `self.hybrid_kv = \
+             Some(slot_view_hybrid)` REGRESSED — iter-2B-xlen \
+             accidentally broke H101."
+        );
+    }
+
+    /// **H195 (skip-mode)** — production-default non-xlen + HB-encoded
+    /// + dense F32 + legacy 4-bit surfaces UNCHANGED.
+    ///
+    /// Composite transitivity pin from H97 (iter-2B production-default
+    /// hybrid branch landed) + H174 (iter-2A-cont HB-encoded prefill)
+    /// + H175 (iter-2-decode-B HB-encoded decode) + H123
+    /// (forward_decode_slot_aware fn defined) + H181 (iter-2C 4-bit
+    /// prefill) + H182 (iter-2D dense F32 prefill).  Defends against
+    /// any iter-2B-xlen + iter-2-decode-A-xlen body insertion that
+    /// accidentally regresses one of those production surfaces.
+    ///
+    /// Also pins:
+    ///   * Qwen35 + Qwen3VL slot-aware orchestrators UNCHANGED.
+    ///   * ADR-040 §6.1.47 closure block exists (forward-pointer
+    ///     destination for the iter-2B-xlen + iter-2-decode-A-xlen
+    ///     joint deferral cites).
+    #[test]
+    fn h195_production_default_and_qwen35_qwen3vl_surfaces_unchanged() {
+        let pf_src = include_str!("../forward_prefill.rs");
+
+        // (a) iter-2B hybrid-branch typed-error label STILL REMOVED
+        // (H97 transitivity).
+        let iter2a_hybrid_typed_error =
+            "gemma4-forward-prefill-slot-N-hybrid (iter-B4c-kernel-iter-2B per";
+        assert!(
+            !pf_src.contains(iter2a_hybrid_typed_error),
+            "H195 FALSIFIED: iter-2A hybrid-branch typed-error label \
+             REGRESSED — iter-2B-xlen accidentally restored the iter-2A \
+             typed-error on the production-default hybrid branch."
+        );
+
+        // (b) iter-2B mount STILL present (H101 transitivity).
+        assert!(
+            pf_src.contains("self.hybrid_kv = Some(slot_view_hybrid)"),
+            "H195 FALSIFIED: iter-2B mount REGRESSED."
+        );
+
+        // (c) iter-2-decode-A fn STILL defined (H123 transitivity).
+        assert!(
+            pf_src.contains("pub fn forward_decode_slot_aware("),
+            "H195 FALSIFIED: `forward_decode_slot_aware` fn removed — \
+             H123 transitivity broken."
+        );
+
+        // (d) iter-2A-cont + iter-2-decode-B HB-encoded mount STILL
+        // present (H174 + H175 transitivity).
+        assert!(
+            pf_src.matches("self.leg_hb_encoded = Some(").count() >= 2,
+            "H195 FALSIFIED: `self.leg_hb_encoded = Some(` mount count \
+             < 2 (expected ≥2: one in prefill, one in decode).  \
+             iter-2A-cont (H174) or iter-2-decode-B (H175) regression."
+        );
+
+        // (e) iter-2C 4-bit (Vec-swap) mount STILL present
+        // (H181 + H183 transitivity).
+        assert!(
+            pf_src.matches("std::mem::replace(&mut self.kv_caches,").count() >= 2,
+            "H195 FALSIFIED: 4-bit `std::mem::replace(&mut self.kv_caches,` \
+             mount count < 2 (expected ≥2: prefill + decode) — \
+             iter-2C (H181) or iter-2-decode-D-4bit (H183) regression."
+        );
+
+        // (f) iter-2D dense F32 mount STILL present
+        // (H182 + H184 transitivity).
+        assert!(
+            pf_src.contains("self.dense_kvs = Some(slot_view_dense)"),
+            "H195 FALSIFIED: iter-2D dense F32 mount \
+             `self.dense_kvs = Some(slot_view_dense)` REGRESSED."
+        );
+
+        let src = include_str!("./engine.rs");
+        // (g) Qwen35 worker-arm slot-aware fns UNCHANGED.
+        for required in [
+            "generate_qwen35_once_slot_aware",
+            "generate_stream_qwen35_once_slot_aware",
+        ] {
+            assert!(
+                src.contains(required),
+                "H195 FALSIFIED: Qwen35 slot-aware surface `{required}` \
+                 removed — iter-2B-xlen accidentally touched Qwen35 \
+                 architecture."
+            );
+        }
+
+        // (h) Embed-arm fn body does NOT call forward_decode_slot_aware
+        // (mirror of H180 / H188).
+        let fn_marker = "fn embed_gemma4_slot_aware(";
+        let embed_idx = src.find(fn_marker).expect(
+            "H195: embed_gemma4_slot_aware not found"
+        );
+        let embed_window =
+            &src[embed_idx..(embed_idx + 10_000).min(src.len())];
+        assert!(
+            !embed_window.contains(".forward_decode_slot_aware("),
+            "H195 FALSIFIED: Embed-arm fn body calls \
+             `forward_decode_slot_aware`. The Embed-arm has NO decode \
+             loop — calling forward_decode_slot_aware would corrupt the \
+             L2-normalized embedding vector."
+        );
+
+        // (i) ADR-040 §6.1.47 closure block exists.
+        let adr =
+            include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.47"),
+            "H195 FALSIFIED: ADR-040 §6.1.47 closure block not found. \
+             iter-2B-xlen + iter-2-decode-A-xlen sub-deferral cites \
+             point at a non-existent destination."
+        );
+    }
+}
