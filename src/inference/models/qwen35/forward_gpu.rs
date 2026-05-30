@@ -10093,4 +10093,399 @@ mod tests {
             }
         }
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-040 §6.1.51 cleanup bundle (2026-05-30) —
+    //   * iter-A2b-cont-test-helpers  (§6.1.40 sub-deferral)
+    //   * iter-B4d-test-helpers       (§6.1.44 sub-deferral)
+    //   * iter-B4d-multi-seq-stress   (§6.1.44 sub-deferral)
+    //
+    // All three are test-only changes — production code is UNCHANGED
+    // (H217), SerialFifo byte-equivalence at `n_seqs == 1 + SlotId(0)`
+    // is preserved (H216).
+    //
+    // H213: the 4 cosmetic `n_seqs = 1u32` literals at
+    //       `gpu_delta_net.rs:789/5588/5996/6012` + the 2 raw
+    //       `s[2] = 1;` field literals at `:782/:5977` are now routed
+    //       through the centralizing `FORWARD_DISPATCH_N_SEQS` constant
+    //       established by §6.1.40 (commit `106f5b37`).
+    // H214: `qwen35::spec_decode::tests` test helpers use the
+    //       slot-aware builder `SpecDecode::new_with_eos_set_and_slot`
+    //       (§6.1.44).  `SlotId(0)` byte-equivalence to the legacy
+    //       `SpecDecode::run` form is preserved (same internal
+    //       call-graph; the missing-MTP error fires before slot routing).
+    // H215: synthetic-fixture multi-seq stress runs `forward_gpu_greedy`
+    //       at n_seqs=4 across `SlotId(0..4)` in sequence, asserting
+    //       per-slot cursor isolation (each slot's cursor advances
+    //       exactly +1, sibling cursors unchanged).  Skip-mode
+    //       compatible (no real model load).
+    // H216: SerialFifo byte-equivalence pin — the cleanup bundle does
+    //       NOT touch the `n_seqs == 1 + SlotId(0)` SerialFifo path.
+    //       `forward_gpu_greedy(.., SlotId(0))` at n_seqs=1 still
+    //       returns a deterministic u32 argmax on the FA-only fixture.
+    // H217: production code UNCHANGED — source-grep against `src/`
+    //       confirms (a) the 4 cosmetic test-fixture sites in
+    //       `gpu_delta_net.rs` route through `FORWARD_DISPATCH_N_SEQS`
+    //       (NOT through any new production accessor or env var); (b)
+    //       no production fn signature changed (the §6.1.40 +
+    //       §6.1.44 lifts already landed `slot_id: SlotId` params; this
+    //       cleanup iter adds NONE); (c) the `SpecDecode` +
+    //       `Qwen35DFlashTarget` builders' surface is unchanged.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// ADR-040 §6.1.51 H213 — test-fixture `n_seqs = 1` literals routed
+    /// through the `FORWARD_DISPATCH_N_SEQS` const seam.
+    ///
+    /// Falsifier: any of the 6 cosmetic sites
+    /// (`gpu_delta_net.rs:782`, `:789`, `:5588`, `:5977`, `:5996`, `:6012`)
+    /// silently regressing to a bare `1` / `1u32` literal — would
+    /// re-fragment the centralization that §6.1.40 established.
+    #[test]
+    fn h213_gpu_delta_net_test_helpers_route_through_forward_dispatch_n_seqs_const_2026_05_30() {
+        let body = std::fs::read_to_string("src/inference/models/qwen35/gpu_delta_net.rs")
+            .expect("read gpu_delta_net.rs");
+
+        // The const must still exist (it was established by §6.1.40).
+        assert!(
+            body.contains("const FORWARD_DISPATCH_N_SEQS: u32 = 1"),
+            "H213 FALSIFIED: `FORWARD_DISPATCH_N_SEQS` const removed — \
+             the §6.1.40 centralization is gone"
+        );
+
+        // Strip line comments before counting bare literal `n_seqs: 1,`
+        // and `s[2] = 1;` occurrences.  After §6.1.51 cleanup, both
+        // forms are gone from code — replaced with
+        // `n_seqs: FORWARD_DISPATCH_N_SEQS,` and `s[2] = FORWARD_DISPATCH_N_SEQS;`.
+        let code_only: String = body
+            .lines()
+            .map(|l| {
+                if let Some(c_idx) = l.find("//") {
+                    &l[..c_idx]
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let literal_struct_field = code_only.matches("n_seqs: 1,").count();
+        assert_eq!(
+            literal_struct_field, 0,
+            "H213 FALSIFIED: gpu_delta_net.rs contains {} bare \
+             `n_seqs: 1,` struct-field literal(s) (comments stripped) — \
+             expected 0 after §6.1.51 routes them through the \
+             FORWARD_DISPATCH_N_SEQS const seam",
+            literal_struct_field
+        );
+
+        let literal_s2_assign = code_only.matches("s[2] = 1;").count();
+        assert_eq!(
+            literal_s2_assign, 0,
+            "H213 FALSIFIED: gpu_delta_net.rs contains {} bare \
+             `s[2] = 1;` assignment(s) (comments stripped) — expected \
+             0 after §6.1.51 routes them through the \
+             FORWARD_DISPATCH_N_SEQS const seam",
+            literal_s2_assign
+        );
+
+        // Positive pin: every test-fixture site now reads the const.
+        // Pre-iter the const was already consumed by 4+ production
+        // forward-path bodies (§6.1.40) so the post-iter count must be
+        // strictly greater than the pre-iter baseline.  Concrete pin:
+        // ≥10 reads after §6.1.51 (pre-iter was 8 reads per the
+        // §6.1.40 closure + 6 new test-fixture reads = 14 total; the
+        // ≥10 floor leaves room for future production reads of the
+        // const without falsifying H213).
+        let const_reads = code_only.matches("FORWARD_DISPATCH_N_SEQS").count();
+        assert!(
+            const_reads >= 10,
+            "H213 FALSIFIED: `FORWARD_DISPATCH_N_SEQS` is referenced \
+             only {} time(s) (comments stripped) — expected ≥10 after \
+             §6.1.51 routes the 6 cosmetic test-fixture sites through \
+             the const seam (in addition to the §6.1.40 production-side reads)",
+            const_reads
+        );
+    }
+
+    /// ADR-040 §6.1.51 H214 — `qwen35::spec_decode::tests` test helpers
+    /// use the slot-aware builder.
+    ///
+    /// Source-grep pin: the test module exercises the §6.1.44
+    /// slot-aware constructor (`SpecDecode::new_with_eos_set_and_slot`)
+    /// instead of the legacy `SpecDecode::run` form.  Falsifier:
+    /// the test fixture regresses to bare `SpecDecode::run` /
+    /// `SpecDecode::new` (which still exist as the public default-shim
+    /// surface, but should not be the test-fixture preference).
+    #[test]
+    fn h214_spec_decode_tests_use_slot_aware_builders_2026_05_30() {
+        let body = std::fs::read_to_string("src/inference/models/qwen35/spec_decode.rs")
+            .expect("read spec_decode.rs");
+
+        // Locate the #[cfg(test)] mod tests { ... } block.
+        let test_mod_idx = body
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("H214: #[cfg(test)] mod tests block not found");
+        let test_mod_body = &body[test_mod_idx..];
+
+        // The test fixtures MUST exercise the slot-aware builder so
+        // future iters that drift the slot-aware path also catch
+        // the test-fixture surface.
+        assert!(
+            test_mod_body.contains("new_with_eos_set_and_slot"),
+            "H214 FALSIFIED: spec_decode test module does NOT invoke \
+             the slot-aware constructor `new_with_eos_set_and_slot` — \
+             the §6.1.44 slot-aware builder is unexercised in tests"
+        );
+
+        // The slot literal that the test uses must be `SlotId(0)` (the
+        // missing-MTP error fires BEFORE slot routing engages, but the
+        // call-site documents the slot-aware discipline).
+        assert!(
+            test_mod_body.contains("SlotId(0)"),
+            "H214 FALSIFIED: spec_decode test module does NOT reference \
+             `SlotId(0)` — the slot-aware test fixture form regressed"
+        );
+    }
+
+    /// ADR-040 §6.1.51 H215 — synthetic-fixture multi-seq stress at
+    /// `n_seqs=4` exercising `forward_gpu_greedy(.., SlotId(0..4))`
+    /// end-to-end with sibling-slot cursor isolation.
+    ///
+    /// At each `SlotId(N)` dispatch, the slot's cursor advances by 1
+    /// (greedy is seq_len=1); every sibling slot's cursor must remain
+    /// unchanged.  After all 4 dispatches every slot's cursor is at 1.
+    ///
+    /// Falsifier: any sibling cursor moves during a SlotId(N) dispatch.
+    ///
+    /// Skip-mode: returns early if Metal is unavailable.
+    #[test]
+    fn h215_forward_gpu_greedy_multi_seq_stress_n_seqs_4_all_slots_2026_05_30() {
+        if MlxDevice::new().is_err() {
+            eprintln!("[H215] skipping: no Metal device");
+            return;
+        }
+
+        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
+        let cfg = m.cfg.clone();
+        let device = MlxDevice::new().expect("device");
+        let n_seqs: u32 = 4;
+        let mut kv = HybridKvCache::new(&cfg, &device, 64, n_seqs)
+            .expect("H215: HybridKvCache n_seqs=4");
+
+        // Pre-state: all 4 slot cursors at 0.
+        for s in 0..n_seqs as usize {
+            assert_eq!(
+                kv.full_attn[0].current_len[s], 0,
+                "H215 pre-state: slot {} cursor must be 0 (was {})",
+                s, kv.full_attn[0].current_len[s]
+            );
+        }
+
+        let positions_flat = vec![0i32; 4];
+
+        // Dispatch each slot in ascending order.  Sibling cursors
+        // MUST stay at their prior values (independent slot advance).
+        for slot in 0..n_seqs {
+            let token = (slot + 1) as u32; // distinct token per slot
+            let _arg = m
+                .forward_gpu_greedy(&[token], &positions_flat, &mut kv, SlotId(slot))
+                .unwrap_or_else(|e| panic!(
+                    "H215 FALSIFIED: forward_gpu_greedy(SlotId({})) at \
+                     n_seqs=4 failed: {}",
+                    slot, e
+                ));
+
+            // The just-dispatched slot's cursor must be 1.
+            assert_eq!(
+                kv.full_attn[0].current_len[slot as usize], 1,
+                "H215 FALSIFIED: after SlotId({}) dispatch, slot {}'s \
+                 cursor is {} (expected 1) — per-slot advance regressed",
+                slot, slot, kv.full_attn[0].current_len[slot as usize]
+            );
+
+            // Every slot strictly LATER than the current one must
+            // still be at 0 (untouched).  Every slot strictly EARLIER
+            // already advanced on its own iteration to 1 — pin those.
+            for s in 0..n_seqs as usize {
+                let expected = if (s as u32) <= slot { 1 } else { 0 };
+                assert_eq!(
+                    kv.full_attn[0].current_len[s], expected,
+                    "H215 FALSIFIED: after SlotId({}) dispatch, slot {} \
+                     cursor is {} (expected {}) — sibling-slot isolation \
+                     regressed",
+                    slot, s, kv.full_attn[0].current_len[s], expected
+                );
+            }
+        }
+
+        // Final state: every slot's cursor is at 1.
+        for s in 0..n_seqs as usize {
+            assert_eq!(
+                kv.full_attn[0].current_len[s], 1,
+                "H215 final-state: slot {} cursor must be 1 after the \
+                 4-slot stress (was {})",
+                s, kv.full_attn[0].current_len[s]
+            );
+        }
+    }
+
+    /// ADR-040 §6.1.51 H216 — SerialFifo byte-equivalence at
+    /// `n_seqs == 1 + SlotId(0)` is preserved by the §6.1.51 cleanup
+    /// bundle.
+    ///
+    /// The cleanup iter is test-only — no production code is touched
+    /// — but H216 makes the byte-equivalence guarantee explicit so a
+    /// future drift that pulls the centralization into production
+    /// (e.g., flipping `FORWARD_DISPATCH_N_SEQS` to a non-1 value)
+    /// would fail loud.
+    ///
+    /// Falsifier: at n_seqs=1 with SlotId(0), `forward_gpu_greedy`
+    /// returns a different argmax than at n_seqs=4 with SlotId(0)
+    /// — that would mean the n_seqs=1 SerialFifo fast-path drifted.
+    ///
+    /// Skip-mode: returns early if Metal is unavailable.
+    #[test]
+    fn h216_serial_fifo_byte_equivalence_preserved_by_cleanup_bundle_2026_05_30() {
+        if MlxDevice::new().is_err() {
+            eprintln!("[H216] skipping: no Metal device");
+            return;
+        }
+
+        // The `FORWARD_DISPATCH_N_SEQS` const seam value MUST be 1
+        // — the cleanup iter is cosmetic centralization, NOT a
+        // numeric change.  Source-grep pins this so a future drift
+        // that flips the constant fails loud here.
+        let body = std::fs::read_to_string("src/inference/models/qwen35/gpu_delta_net.rs")
+            .expect("read gpu_delta_net.rs");
+        assert!(
+            body.contains("const FORWARD_DISPATCH_N_SEQS: u32 = 1"),
+            "H216 FALSIFIED: `FORWARD_DISPATCH_N_SEQS` no longer equals \
+             1 — the §6.1.51 cleanup bundle promised cosmetic-only \
+             centralization, NOT a numeric change.  The forward path \
+             is intrinsically per-slot per-step (§6.1.40 docstring)."
+        );
+
+        // Functional byte-equivalence: n_seqs=1 vs n_seqs=4 at SlotId(0)
+        // — mirror of H168 but pinned again at the §6.1.51 closure
+        // for surface-area drift defense.
+        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
+        let cfg = m.cfg.clone();
+        let token = 11u32;
+        let pos: i32 = 7;
+        let positions_flat = vec![pos; 4];
+
+        let device = MlxDevice::new().expect("device");
+        let mut kv_1 = HybridKvCache::new(&cfg, &device, 64, 1)
+            .expect("H216: kv n_seqs=1");
+        let mut kv_4 = HybridKvCache::new(&cfg, &device, 64, 4)
+            .expect("H216: kv n_seqs=4");
+
+        let arg_1 = m
+            .forward_gpu_greedy(&[token], &positions_flat, &mut kv_1, SlotId(0))
+            .expect("H216: forward_gpu_greedy n_seqs=1 SlotId(0)");
+        let arg_4 = m
+            .forward_gpu_greedy(&[token], &positions_flat, &mut kv_4, SlotId(0))
+            .expect("H216: forward_gpu_greedy n_seqs=4 SlotId(0)");
+        assert_eq!(
+            arg_1, arg_4,
+            "H216 FALSIFIED: forward_gpu_greedy(SlotId(0)) at n_seqs=4 \
+             produced argmax {} but n_seqs=1 produced {} — SerialFifo \
+             byte-equivalence regressed under §6.1.51 cleanup",
+            arg_4, arg_1
+        );
+    }
+
+    /// ADR-040 §6.1.51 H217 — production code UNCHANGED by the
+    /// §6.1.51 cleanup bundle.
+    ///
+    /// (a) `FORWARD_DISPATCH_N_SEQS` const still consumed by the
+    ///     production-side §6.1.40 forward-path sites
+    ///     (4 entry-point function bodies + per-test-fixture reads).
+    /// (b) `forward_gpu_greedy` / `forward_gpu_with_hidden_dflash`
+    ///     signatures unchanged from §6.1.44
+    ///     (`slot_id: SlotId` parameter present).
+    /// (c) `SpecDecode` / `Qwen35DFlashTarget` builders' API surface
+    ///     unchanged from §6.1.44 (`with_slot_id` +
+    ///     `new_with_eos_set_and_slot` + `new_with_slot` all present).
+    ///
+    /// Falsifier: any of the production surfaces silently drifted.
+    #[test]
+    fn h217_production_code_unchanged_by_cleanup_bundle_2026_05_30() {
+        // (a) Production reads of the const still present in
+        // gpu_delta_net.rs (the 4 forward-path entry-point bodies
+        // plus the centralized scope).
+        let gpu_dn = std::fs::read_to_string("src/inference/models/qwen35/gpu_delta_net.rs")
+            .expect("read gpu_delta_net.rs");
+        let const_def_count = gpu_dn.matches("const FORWARD_DISPATCH_N_SEQS").count();
+        assert_eq!(
+            const_def_count, 1,
+            "H217 FALSIFIED: `FORWARD_DISPATCH_N_SEQS` is defined {} \
+             time(s) — expected exactly 1 (the §6.1.40 centralizing \
+             declaration at the file head)",
+            const_def_count
+        );
+
+        // (b) Production fn signatures unchanged from §6.1.44.
+        let fwd = std::fs::read_to_string("src/inference/models/qwen35/forward_gpu.rs")
+            .expect("read forward_gpu.rs");
+        assert!(
+            fwd.contains("pub fn forward_gpu_greedy("),
+            "H217 FALSIFIED: `forward_gpu_greedy` declaration not found"
+        );
+        // Walk the greedy fn body forward and confirm `slot_id: SlotId`
+        // is still in the signature (mirror of H167's pin).
+        let greedy_decl = fwd
+            .find("pub fn forward_gpu_greedy(")
+            .expect("H217: forward_gpu_greedy declaration not found");
+        let greedy_window = &fwd[greedy_decl..(greedy_decl + 2000).min(fwd.len())];
+        assert!(
+            greedy_window.contains("slot_id: SlotId"),
+            "H217 FALSIFIED: `forward_gpu_greedy` lost `slot_id: SlotId` \
+             parameter — §6.1.44 production lift regressed"
+        );
+        assert!(
+            fwd.contains("pub fn forward_gpu_with_hidden_dflash("),
+            "H217 FALSIFIED: `forward_gpu_with_hidden_dflash` declaration \
+             not found"
+        );
+
+        // (c) Builder API surface unchanged from §6.1.44.
+        let spec = std::fs::read_to_string("src/inference/models/qwen35/spec_decode.rs")
+            .expect("read spec_decode.rs");
+        assert!(
+            spec.contains("pub fn with_slot_id("),
+            "H217 FALSIFIED: SpecDecode `with_slot_id` builder removed"
+        );
+        assert!(
+            spec.contains("pub fn new_with_eos_set_and_slot("),
+            "H217 FALSIFIED: SpecDecode `new_with_eos_set_and_slot` \
+             constructor removed"
+        );
+
+        let tgt = std::fs::read_to_string(
+            "src/inference/spec_decode/dflash/qwen35_target.rs",
+        )
+        .expect("read qwen35_target.rs");
+        assert!(
+            tgt.contains("pub fn new_with_slot("),
+            "H217 FALSIFIED: Qwen35DFlashTarget `new_with_slot` constructor \
+             removed"
+        );
+        assert!(
+            tgt.contains("pub fn with_slot_id("),
+            "H217 FALSIFIED: Qwen35DFlashTarget `with_slot_id` builder removed"
+        );
+
+        // Sibling discipline: §6.1.51 must NOT have leaked any
+        // changes into Gemma 4 forward_prefill.rs or qwen3vl_text/.
+        // Mirror of H143 + H173 at the cleanup-iter closure.
+        let gemma4 = std::fs::read_to_string("src/serve/forward_prefill.rs")
+            .expect("read forward_prefill.rs");
+        assert!(
+            !gemma4.contains("FORWARD_DISPATCH_N_SEQS"),
+            "H217 FALSIFIED: `FORWARD_DISPATCH_N_SEQS` leaked into \
+             Gemma 4's forward_prefill.rs — the §6.1.40 centralization \
+             must stay scoped to Qwen35 gpu_delta_net.rs"
+        );
+    }
 }

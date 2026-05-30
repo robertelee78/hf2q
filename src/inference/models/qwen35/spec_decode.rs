@@ -1657,7 +1657,21 @@ mod tests {
             moe: None,
         };
         let model = Qwen35Model::empty_from_cfg(cfg);
-        let err = SpecDecode::run(&model, &[1], 1).expect_err("missing MTP must fail");
+        // ADR-040 §6.1.51 (iter-B4d-test-helpers) — exercise the
+        // §6.1.44 slot-aware constructor so the test fixture follows
+        // the same builder discipline production callers use.  The
+        // missing-MTP `ensure!` fires inside `new_with_eos_set`
+        // BEFORE the slot routing engages, so `SlotId(0)` here is
+        // byte-equivalent to the legacy `SpecDecode::run(&model, ..)`
+        // form (no behaviour delta).
+        //
+        // `SpecDecode` does NOT impl `Debug` so `Result::expect_err`
+        // is unavailable; match on the Err arm directly.
+        let res = SpecDecode::new_with_eos_set_and_slot(&model, 128, vec![], SlotId(0));
+        let err = match res {
+            Ok(_) => panic!("missing MTP must fail (got Ok)"),
+            Err(e) => e,
+        };
         assert!(err.to_string().contains("requires MTP"));
     }
 }

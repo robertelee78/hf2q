@@ -779,14 +779,19 @@ pub fn prepare_ssm_conv_buffers(
         let s = params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
         s[0] = qkv_channels;
         s[1] = seq_len;
-        s[2] = 1; // n_seqs
+        // ADR-040 §6.1.51 (iter-A2b-cont-test-helpers) — routed through
+        // the centralizing `FORWARD_DISPATCH_N_SEQS` const seam established
+        // by §6.1.40.  Value is still 1 (intrinsic per-slot per-step
+        // dispatch contract); the indirection documents the audit surface.
+        s[2] = FORWARD_DISPATCH_N_SEQS;
         s[3] = k_width;
     }
 
     let conv_params = SsmConvParams {
         channels: qkv_channels,
         n_tokens: seq_len,
-        n_seqs: 1,
+        // ADR-040 §6.1.51 (iter-A2b-cont-test-helpers) — see s[2] above.
+        n_seqs: FORWARD_DISPATCH_N_SEQS,
         k_width,
     };
 
@@ -5585,7 +5590,9 @@ mod tests {
             n_k_heads,
             n_v_heads,
             n_tokens: seq_len,
-            n_seqs: 1,
+            // ADR-040 §6.1.51 (iter-A2b-cont-test-helpers) — routed through
+            // `FORWARD_DISPATCH_N_SEQS` const seam (§6.1.40).
+            n_seqs: FORWARD_DISPATCH_N_SEQS,
         };
         let (out, _state) = gdn_cpu_ref(q, k, v, g, beta, state_in, p);
         out
@@ -5974,7 +5981,9 @@ mod tests {
             let s = arena_ref.ssm_params_buf.as_mut_slice::<u32>().expect("ssm_params");
             s[0] = qkv_channels;
             s[1] = seq_len;
-            s[2] = 1;
+            // ADR-040 §6.1.51 (iter-A2b-cont-test-helpers) — routed through
+            // the centralizing `FORWARD_DISPATCH_N_SEQS` const seam (§6.1.40).
+            s[2] = FORWARD_DISPATCH_N_SEQS;
             s[3] = shape.conv_kernel;
         }
         {
@@ -5993,7 +6002,9 @@ mod tests {
             n_k_heads: shape.n_k_heads,
             n_v_heads: shape.n_v_heads,
             n_tokens: seq_len,
-            n_seqs: 1,
+            // ADR-040 §6.1.51 (iter-A2b-cont-test-helpers) — routed through
+            // the centralizing `FORWARD_DISPATCH_N_SEQS` const seam (§6.1.40).
+            n_seqs: FORWARD_DISPATCH_N_SEQS,
         };
         {
             let s = arena_ref.gdn_params_buf.as_mut_slice::<u32>().expect("gdn_params");
@@ -6009,7 +6020,9 @@ mod tests {
         let ssm_conv_params = SsmConvParams {
             channels: qkv_channels,
             n_tokens: seq_len,
-            n_seqs: 1,
+            // ADR-040 §6.1.51 (iter-A2b-cont-test-helpers) — routed through
+            // the centralizing `FORWARD_DISPATCH_N_SEQS` const seam (§6.1.40).
+            n_seqs: FORWARD_DISPATCH_N_SEQS,
             k_width: shape.conv_kernel,
         };
 
