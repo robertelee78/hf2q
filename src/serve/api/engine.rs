@@ -702,6 +702,41 @@ pub enum EngineSpawnError {
         /// failure as rendered by anyhow.
         cause: String,
     },
+
+    /// **ADR-040 Phase C iter-C2e (2026-05-30)** —
+    /// `EngineMode::SlotAware` spawn for Qwen3-VL reached the
+    /// witness provisioning step
+    /// ([`super::engine_qwen3vl::Qwen3VlTextLoadedModel::provision_multi_seq_kv_for_slot_aware`])
+    /// but the witness setter returned an error (only reachable today
+    /// when the caller passed `max_slots == 0` past the spawn-arm's
+    /// own pre-check — the spawn arm catches this first per the H218
+    /// + H220 invariants and surfaces
+    /// [`Self::ModeNotYetWired`] instead).
+    ///
+    /// Mirrors [`Self::Gemma4SlotAwareProvisionFailed`] +
+    /// [`Self::Qwen35SlotAwareProvisionFailed`] shape and gives
+    /// per-family discriminants for log greps + operator triage.
+    ///
+    /// **Forward-pointer (iter-C2e-cont, post iter-228a)**: once the
+    /// iter-228a 501 sentinel is replaced with a real Qwen3-VL
+    /// forward path landing a persistent KV cache, this variant will
+    /// become reachable via real `MlxDevice` OOM at production
+    /// shape × N slots (mirror of the Qwen35 OOM surface). For now
+    /// the variant exists so the typed surface stays symmetric with
+    /// Gemma 4 + Qwen35 — the C2e arm of `spawn_with_mode` calls the
+    /// witness provisioner under the same `if let Err(e) = ...`
+    /// pattern its siblings use.
+    #[error(
+        "ADR-040 C2e: Qwen3-VL SlotAware spawn failed during multi-seq KV \
+         provisioning (max_slots={max_slots}). Cause: {cause}"
+    )]
+    Qwen3VLSlotAwareProvisionFailed {
+        /// The `max_slots` value the caller requested.
+        max_slots: u32,
+        /// Witness provisioner failure (or post iter-C2e-cont: first
+        /// per-layer allocator failure) as rendered by anyhow.
+        cause: String,
+    },
 }
 
 /// **ADR-040 §3.5 iter-A5b** — pre-stream admit-time errors surfaced by
@@ -3651,13 +3686,70 @@ impl Engine {
                     );
                     Ok(engine)
                 }
-                LoadedModel::Qwen3VlText(_) => Err(EngineSpawnError::ModeNotYetWired {
-                    iter_landed: "C2c",
-                    iter_required: "C2e (Qwen3-VL text worker arm — gated on \
-                                    Qwen3-VL forward path landing past the \
-                                    iter-228a 501 sentinel; see \
-                                    `engine_qwen3vl.rs`)",
-                }),
+                LoadedModel::Qwen3VlText(mut v) => {
+                    // ADR-040 Phase C iter-C2e (2026-05-30) — Qwen3-VL
+                    // SlotAware engine activation. Direct mirror of
+                    // C2c §6.1.21 (Gemma 4) + C2d §6.1.22 (Qwen35) for
+                    // the Qwen3-VL text-LM family.  Pre-C2e this arm
+                    // returned `ModeNotYetWired { iter_required: "C2e
+                    // (...)"}`; iter-C2e flips it to `Ok(Engine)` via
+                    // Path B: spawn-time witness provisioning + worker
+                    // arms typed-clamped at SlotId(N>0).
+                    //
+                    // Path B (witness + typed worker-arm deferral)
+                    // chosen because Qwen3-VL today runs the iter-9b
+                    // naive O(N²) re-prefill loop in
+                    // `engine_qwen3vl::generate_qwen3vl_text_once`
+                    // with no persistent KV cache; the real per-step
+                    // KV cache is upstream-blocked on iter-228a (the
+                    // 501-sentinel arms of `worker_run` for streaming
+                    // / embed / vision-augmented requests).
+                    // Path A (full activation with worker hot-path
+                    // routing through a persistent cache) is gated on
+                    // iter-228a + iter-C2e-cont landing — those iters
+                    // ship the persistent KV scaffold + the four
+                    // worker-arm lift mirrors of C2d-cont-kernel
+                    // iter-{1,2,3,4} §6.1.27-6.1.30 for the Qwen3-VL
+                    // architecture.
+                    //
+                    // The four worker arms (Generate / GenerateStream /
+                    // Embed / GenerateWithSoftTokens) surface typed
+                    // `MultiSeqError::CapabilityUnsupported` at
+                    // SlotId(N>0) with an operator-grep'able label
+                    // naming `iter-C2e-cont per ADR-040 §6.1.52`
+                    // (post iter-228a worker-hot-path lift) AND
+                    // `iter-228a` (the upstream-blocker for the
+                    // persistent KV cache itself).
+                    if max_slots == 0 {
+                        // Defensive: EngineMode::SlotAware callers
+                        // guarantee max_slots >= 1, but pin the
+                        // boundary so the provisioner never sees zero.
+                        return Err(EngineSpawnError::ModeNotYetWired {
+                            iter_landed: "C2e",
+                            iter_required: "caller bug: EngineMode::SlotAware with max_slots == 0 \
+                                            — require max_slots >= 1",
+                        });
+                    }
+                    if let Err(e) = v.provision_multi_seq_kv_for_slot_aware(max_slots) {
+                        // Wrap into a typed spawn error so callers can
+                        // distinguish "Qwen3-VL SlotAware provisioning
+                        // failed" from "ModeNotYetWired" without
+                        // string-matching anyhow. Mirrors C2d's
+                        // Qwen35SlotAwareProvisionFailed shape.
+                        return Err(EngineSpawnError::Qwen3VLSlotAwareProvisionFailed {
+                            max_slots,
+                            cause: e.to_string(),
+                        });
+                    }
+                    let loaded = LoadedModel::Qwen3VlText(v);
+                    let engine = Self::spawn_inner_with_slot_aware(
+                        loaded,
+                        queue_capacity,
+                        kv_cache_budget_bytes,
+                        max_slots,
+                    );
+                    Ok(engine)
+                },
             },
         }
     }
@@ -5145,6 +5237,49 @@ fn worker_run(
                         let _ = reply.send(result);
                         continue;
                     }
+                    // ADR-040 Phase C iter-C2e (2026-05-30) — Qwen3-VL
+                    // SlotAware worker-arm typed clamp for the
+                    // Generate arm. Direct mirror of C2c §6.1.21
+                    // (Gemma 4) + C2d-cont §6.1.24 (Qwen35) clamps for
+                    // the Qwen3-VL text-LM family. The C2e spawn-arm
+                    // flip at line ~3654 lets the
+                    // `InflightBatchedScheduler` hand out
+                    // `SlotId(N>0)` for Qwen3-VL; until iter-228a
+                    // lands a real Qwen3-VL forward path past the
+                    // 501 sentinel, the worker hot path cannot route
+                    // SlotId(N>0) through a persistent KV cache —
+                    // there is no persistent cache yet (the iter-9b
+                    // naive O(N²) re-prefill loop has no shared
+                    // state).
+                    //
+                    // SerialFifo + SlotId(0): unchanged (H222
+                    // byte-equivalence pin) — the `slot_id !=
+                    // SlotId(0)` predicate short-circuits below the
+                    // clamp so the existing
+                    // `generate_qwen3vl_text_once` dispatch fires
+                    // verbatim. SlotAware + SlotId(0): also
+                    // unchanged (same predicate).
+                    //
+                    // The worker-arm lift onto the persistent multi-
+                    // seq cache lands at **iter-C2e-cont** (post
+                    // iter-228a) per ADR-040 §6.1.52.
+                    if matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0) {
+                        let slot_id = handle.slot_id;
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "capability_unsupported: ADR-040 \
+                             qwen3vl-generate-slot-N (iter-C2e-cont per \
+                             ADR-040 §6.1.52 — gated on iter-228a Qwen3-VL \
+                             forward path landing past the 501 sentinel; \
+                             worker hot path lift onto the persistent \
+                             multi-seq cache cannot land until the \
+                             persistent cache itself exists). SlotId({}) \
+                             at Generate arm.",
+                            slot_id.0,
+                        )));
+                        scheduler.release(handle);
+                        publish_stats(&scheduler, &scheduler_stats_snapshot);
+                        continue;
+                    }
                 }
 
                 // cfa-iter-C2.5 M1: zero-budget admit (`max_tokens == 0`)
@@ -5595,6 +5730,35 @@ fn worker_run(
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
                         continue;
                     }
+                    // ADR-040 Phase C iter-C2e (2026-05-30) — Qwen3-VL
+                    // SlotAware GenerateStream-arm typed clamp. Direct
+                    // mirror of the Generate-arm clamp above + C2c
+                    // §6.1.21 GenerateStream + C2d-cont §6.1.24
+                    // GenerateStream shape. Surfaces a typed
+                    // `capability_unsupported:`-prefixed Error event
+                    // onto the SSE channel (the handler maps to a
+                    // clean stream termination with a 501-style error
+                    // body). See Generate-arm clamp for the full
+                    // rationale + iter-228a upstream blocker cite.
+                    if matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0) {
+                        let slot_id = handle.slot_id;
+                        let _ = events.blocking_send(
+                            super::sse::GenerationEvent::Error(format!(
+                                "capability_unsupported: ADR-040 \
+                                 qwen3vl-generate-stream-slot-N (iter-C2e-cont \
+                                 per ADR-040 §6.1.52 — gated on iter-228a \
+                                 Qwen3-VL forward path landing past the 501 \
+                                 sentinel; worker hot path lift onto the \
+                                 persistent multi-seq cache cannot land until \
+                                 the persistent cache itself exists). \
+                                 SlotId({}) at GenerateStream arm.",
+                                slot_id.0,
+                            )),
+                        );
+                        scheduler.release(handle);
+                        publish_stats(&scheduler, &scheduler_stats_snapshot);
+                        continue;
+                    }
                 }
 
                 // cfa-iter-C2.5 M1: zero-budget admit (`max_tokens == 0`)
@@ -6012,6 +6176,30 @@ fn worker_run(
                         scheduler.release(handle);
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
                         let _ = reply.send(result);
+                        continue;
+                    }
+                    // ADR-040 Phase C iter-C2e (2026-05-30) — Qwen3-VL
+                    // SlotAware Embed-arm typed clamp. Direct mirror
+                    // of the Generate / GenerateStream Qwen3VL clamps
+                    // above + C2c §6.1.21 Embed + C2d-cont §6.1.24
+                    // Embed shape. See Generate-arm clamp for the
+                    // full rationale + iter-228a upstream blocker
+                    // cite.
+                    if matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0) {
+                        let slot_id = handle.slot_id;
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "capability_unsupported: ADR-040 \
+                             qwen3vl-embed-slot-N (iter-C2e-cont per \
+                             ADR-040 §6.1.52 — gated on iter-228a Qwen3-VL \
+                             forward path landing past the 501 sentinel; \
+                             worker hot path lift onto the persistent \
+                             multi-seq cache cannot land until the \
+                             persistent cache itself exists). SlotId({}) \
+                             at Embed arm.",
+                            slot_id.0,
+                        )));
+                        scheduler.release(handle);
+                        publish_stats(&scheduler, &scheduler_stats_snapshot);
                         continue;
                     }
                 }
@@ -6435,6 +6623,30 @@ fn worker_run(
                         scheduler.release(handle);
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
                         let _ = reply.send(result);
+                        continue;
+                    }
+                    // ADR-040 Phase C iter-C2e (2026-05-30) — Qwen3-VL
+                    // SlotAware GenerateWithSoftTokens-arm typed
+                    // clamp. Direct mirror of the Generate /
+                    // GenerateStream / Embed Qwen3VL clamps above + C2c
+                    // §6.1.21 SoftTokens + C2d-cont §6.1.24 SoftTokens
+                    // shape. See Generate-arm clamp for the full
+                    // rationale + iter-228a upstream blocker cite.
+                    if matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0) {
+                        let slot_id = handle.slot_id;
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "capability_unsupported: ADR-040 \
+                             qwen3vl-generate-with-soft-tokens-slot-N \
+                             (iter-C2e-cont per ADR-040 §6.1.52 — gated on \
+                             iter-228a Qwen3-VL forward path landing past \
+                             the 501 sentinel; worker hot path lift onto \
+                             the persistent multi-seq cache cannot land \
+                             until the persistent cache itself exists). \
+                             SlotId({}) at GenerateWithSoftTokens arm.",
+                            slot_id.0,
+                        )));
+                        scheduler.release(handle);
+                        publish_stats(&scheduler, &scheduler_stats_snapshot);
                         continue;
                     }
                 }
@@ -20736,17 +20948,25 @@ mod adr040_phase_c_iter2d_cont_qwen35_slot_aware_tests {
              §6.1.31 lift."
         );
 
-        // Qwen3VL has no clamp at C2d-cont — its SlotAware activation
-        // is deferred to a future iter (per §6.1.22 spawn arm:
-        // `LoadedModel::Qwen3VlText(_) => Err(EngineSpawnError::
-        // ModeNotYetWired { iter_required: "C2e (...)" })`. Verify no
-        // Qwen3VL clamp was accidentally added.
+        // ADR-040 iter-C2e (2026-05-30 §6.1.52) — Qwen3VL SlotAware
+        // spawn-arm SHIPPED.  The worker_run body now CONTAINS the
+        // `matches!(loaded, LoadedModel::Qwen3VlText(_))` clamp at
+        // SlotId(N>0) for each of the four arms (Generate /
+        // GenerateStream / Embed / GenerateWithSoftTokens) per
+        // §6.1.52. Sibling discipline pin: C2d-cont must not REMOVE
+        // the C2e Qwen3VL clamp (and must not have added it
+        // pre-C2e — the C2d-cont commit `f886f45f` predates C2e).
+        // Post-C2e source ordering: the C2e Qwen3VL Generate clamp
+        // sits BELOW the C2d Qwen35 Generate clamp in source order,
+        // mirroring the spawn_with_mode dispatch order
+        // (Gemma → Qwen35 → Qwen3VlText).
         assert!(
-            !body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_))"),
-            "H40 FALSIFIED: Qwen3VL clamp accidentally added to worker_run. \
-             Qwen3VL SlotAware activation is gated on iter-C2e (Qwen3-VL \
-             forward path past the iter-228a 501 sentinel); a clamp here \
-             would imply C2e wired without the spawn arm flip."
+            body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"),
+            "H40 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
+             clamp is MISSING from worker_run. iter-C2e SHIPPED 2026-05-30 \
+             flipping the Qwen3VL SlotAware spawn arm to `Ok(Engine)` AND \
+             adding the four worker-arm clamps (one per Request variant). \
+             C2d-cont must NOT regress the C2e Qwen3VL clamp."
         );
     }
 }
@@ -21081,13 +21301,16 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter1_qwen35_tests {
              iter-5 TERMINAL lift cite."
         );
 
-        // No Qwen3VL clamp accidentally added.
+        // ADR-040 iter-C2e (2026-05-30 §6.1.52) — Qwen3VL clamp
+        // SHIPPED post-iter-1 (C2d-cont-kernel iter-1 commit predates
+        // C2e). Sibling discipline pin: Qwen35 iter-1 must not REMOVE
+        // the C2e Qwen3VL clamp.
         assert!(
-            !body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"),
-            "H56 FALSIFIED: Qwen3VL clamp accidentally added to \
-             worker_run by iter-1. Qwen3VL SlotAware activation is \
-             gated on iter-C2e per §6.1.22; iter-1 must not add the \
-             Qwen3VL clamp without the spawn-arm flip."
+            body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"),
+            "H56 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
+             clamp missing from worker_run. iter-C2e SHIPPED 2026-05-30 \
+             adds the Qwen3VL clamp at the four worker arms; iter-1 must \
+             NOT regress the C2e clamp."
         );
     }
 
@@ -21507,15 +21730,17 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter2_qwen35_tests {
              iter-5 TERMINAL lift cite."
         );
 
-        // No Qwen3VL clamp accidentally added.
+        // ADR-040 iter-C2e (2026-05-30 §6.1.52) — Qwen3VL clamp
+        // SHIPPED post-iter-3.  Sibling discipline pin: Qwen35
+        // iter-3 must not REMOVE the C2e Qwen3VL clamp.
         assert!(
-            !body.contains(
+            body.contains(
                 "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
             ),
-            "H62 FALSIFIED: Qwen3VL clamp accidentally added to \
-             worker_run by iter-3. Qwen3VL SlotAware activation is \
-             gated on iter-C2e per §6.1.22; iter-3 must not add the \
-             Qwen3VL clamp without the spawn-arm flip."
+            "H62 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
+             clamp missing from worker_run.  iter-C2e SHIPPED 2026-05-30 \
+             adds the Qwen3VL clamp at the four worker arms; iter-3 must \
+             NOT regress the C2e clamp."
         );
 
         // Post-iter-3: the Embed clamp's `qwen35-forward-embed-last-
@@ -21998,15 +22223,17 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter3_qwen35_tests {
              iter-5 TERMINAL lift cite."
         );
 
-        // No Qwen3VL clamp accidentally added.
+        // ADR-040 iter-C2e (2026-05-30 §6.1.52) — Qwen3VL clamp
+        // SHIPPED post-iter-3. Sibling discipline pin: iter-3 must
+        // not REMOVE the C2e Qwen3VL clamp.
         assert!(
-            !body.contains(
+            body.contains(
                 "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
             ),
-            "H68 FALSIFIED: Qwen3VL clamp accidentally added to \
-             worker_run by iter-3. Qwen3VL SlotAware activation is \
-             gated on iter-C2e per §6.1.22; iter-3 must not add the \
-             Qwen3VL clamp without the spawn-arm flip."
+            "H68 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
+             clamp missing from worker_run. iter-C2e SHIPPED 2026-05-30 \
+             adds the Qwen3VL clamp at the four worker arms; iter-3 must \
+             NOT regress the C2e clamp."
         );
 
         // Post-iter-4 (REVISED 2026-05-30 §6.1.30): the
@@ -22635,15 +22862,17 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter4_qwen35_tests {
              iter-5 TERMINAL lift cite."
         );
 
-        // No Qwen3VL clamp accidentally added.
+        // ADR-040 iter-C2e (2026-05-30 §6.1.52) — Qwen3VL clamp
+        // SHIPPED post-iter-4. Sibling discipline pin: iter-4 must
+        // not REMOVE the C2e Qwen3VL clamp.
         assert!(
-            !body.contains(
+            body.contains(
                 "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
             ),
-            "H75 FALSIFIED: Qwen3VL clamp accidentally added to \
-             worker_run by iter-4. Qwen3VL SlotAware activation is \
-             gated on iter-C2e per §6.1.22; iter-4 must not add the \
-             Qwen3VL clamp without the spawn-arm flip."
+            "H75 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
+             clamp missing from worker_run. iter-C2e SHIPPED 2026-05-30 \
+             adds the Qwen3VL clamp at the four worker arms; iter-4 must \
+             NOT regress the C2e clamp."
         );
 
         // iter-1 Generate-arm lift fn must still be called.
@@ -23254,18 +23483,17 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
             );
         }
 
-        // Qwen3VL has no clamp at B4c — its SlotAware activation is
-        // deferred to a future iter (per §6.1.22 spawn arm:
-        // `LoadedModel::Qwen3VlText(_) => Err(EngineSpawnError::
-        // ModeNotYetWired { iter_required: "C2e (...)" })`. Verify no
-        // Qwen3VL clamp was accidentally added by B4c.
+        // ADR-040 iter-C2e (2026-05-30 §6.1.52) — Qwen3VL clamp
+        // SHIPPED post-B4c (B4c label-refinement commit predates
+        // C2e). Sibling discipline pin: B4c must not REMOVE the C2e
+        // Qwen3VL clamp.
         assert!(
-            !body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_))"),
-            "H45 FALSIFIED: Qwen3VL clamp accidentally added to \
-             worker_run by B4c. Qwen3VL SlotAware activation is gated \
-             on iter-C2e (Qwen3-VL forward path past the iter-228a \
-             501 sentinel); a clamp here would imply C2e wired without \
-             the spawn arm flip."
+            body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"),
+            "H45 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
+             clamp missing from worker_run. iter-C2e SHIPPED 2026-05-30 \
+             flipping the Qwen3VL SlotAware spawn arm to `Ok(Engine)` AND \
+             adding the four worker-arm clamps; B4c must NOT regress the \
+             C2e clamp."
         );
     }
 }
@@ -23980,14 +24208,17 @@ mod adr040_phase_b_iter_b4c_kernel_iter1_gemma4_tests {
             );
         }
 
-        // No Qwen3VL clamp accidentally added — Qwen3VL SlotAware
-        // activation is deferred to iter-C2e (per §6.1.22 spawn arm).
+        // ADR-040 iter-C2e (2026-05-30 §6.1.52) — Qwen3VL clamp
+        // SHIPPED post-Gemma 4 iter-1 (Gemma 4 iter-1 commit
+        // predates C2e). Sibling discipline pin: Gemma 4 iter-1 must
+        // not REMOVE the C2e Qwen3VL clamp.
         assert!(
-            !body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_))"),
-            "H82 FALSIFIED: Qwen3VL clamp accidentally added to \
-             worker_run by iter-1. Qwen3VL SlotAware activation is \
-             gated on iter-C2e; a clamp here would imply C2e wired \
-             without the spawn arm flip."
+            body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"),
+            "H82 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
+             clamp missing from worker_run. iter-C2e SHIPPED 2026-05-30 \
+             flipping the Qwen3VL SlotAware spawn arm to `Ok(Engine)` AND \
+             adding the four worker-arm clamps; Gemma 4 iter-1 must NOT \
+             regress the C2e clamp."
         );
 
         // ADR-040 iter-B4c-kernel iter-5 (§6.1.37 — TERMINAL Gemma 4
@@ -25035,18 +25266,22 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
                  surface segregation broken."
             );
         }
-        // Qwen3VL SlotAware spawn-arm: still typed-rejected with
-        // `ModeNotYetWired` — iter-C2c-cont does NOT accidentally
-        // activate Qwen3VL. The specific marker is the spawn-arm body
-        // that directly returns the `EngineSpawnError::ModeNotYetWired`
-        // (line ~3508) — distinct from the LoadedModel match arms in
-        // model_id / context_length / etc. accessors (lines 1765+).
-        let qwen3vl_spawn_marker = "LoadedModel::Qwen3VlText(_) => Err(EngineSpawnError::ModeNotYetWired";
+        // ADR-040 iter-C2e (2026-05-30 §6.1.52) — Qwen3VL SlotAware
+        // spawn-arm FLIPPED to `Ok(Engine)` via the witness-only
+        // provisioner (mirror of C2d for Qwen35). Sibling discipline
+        // pin (REVISED post-C2e): iter-C2c-cont (Gemma 4 hybrid
+        // scaffold) must not have FLIPPED the Qwen3VL arm itself —
+        // C2c-cont ships strictly inside the Gemma 4 spawn-arm body.
+        // The C2e flip is a SEPARATE iter that ships the Qwen3VL arm
+        // body containing `Qwen3VLSlotAwareProvisionFailed` + the
+        // `spawn_inner_with_slot_aware` delegate.
+        let qwen3vl_c2e_marker = "Qwen3VLSlotAwareProvisionFailed";
         assert!(
-            src.contains(qwen3vl_spawn_marker),
-            "H96 FALSIFIED: Qwen3VL SlotAware spawn arm no longer typed-\
-             rejects with `EngineSpawnError::ModeNotYetWired`. iter-C2c-cont \
-             must NOT touch the Qwen3VL surface (gated on iter-C2e per §6.1.22)."
+            src.contains(qwen3vl_c2e_marker),
+            "H96 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
+             SlotAware spawn arm no longer references the C2e typed-error \
+             variant `Qwen3VLSlotAwareProvisionFailed`. iter-C2c-cont must \
+             NOT regress the C2e Qwen3VL spawn-arm flip."
         );
     }
 
@@ -25894,15 +26129,17 @@ mod adr040_phase_b_iter_b4c_kernel_iter3_gemma4_tests {
              lift (§6.1.31)."
         );
 
-        // No Qwen3VL clamp accidentally added.
+        // ADR-040 iter-C2e (2026-05-30 §6.1.52) — Qwen3VL clamp
+        // SHIPPED post-Gemma 4 iter-3. Sibling discipline pin:
+        // Gemma 4 iter-3 must not REMOVE the C2e Qwen3VL clamp.
         assert!(
-            !body.contains(
+            body.contains(
                 "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
             ),
-            "H108 FALSIFIED: Qwen3VL clamp accidentally added to \
-             worker_run by iter-3. Qwen3VL SlotAware activation is \
-             gated on iter-C2e per §6.1.22; iter-3 must not add the \
-             Qwen3VL clamp without the spawn-arm flip."
+            "H108 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
+             clamp missing from worker_run. iter-C2e SHIPPED 2026-05-30 \
+             adds the Qwen3VL clamp at the four worker arms; Gemma 4 \
+             iter-3 must NOT regress the C2e clamp."
         );
 
         // Post-iter-4 (§6.1.36, 2026-05-30): the Embed-arm
@@ -26473,15 +26710,17 @@ mod adr040_phase_b_iter_b4c_kernel_iter4_gemma4_tests {
              GenerateStream-arm lift (§6.1.35)."
         );
 
-        // No Qwen3VL clamp accidentally added.
+        // ADR-040 iter-C2e (2026-05-30 §6.1.52) — Qwen3VL clamp
+        // SHIPPED post-Gemma 4 iter-4. Sibling discipline pin:
+        // Gemma 4 iter-4 must not REMOVE the C2e Qwen3VL clamp.
         assert!(
-            !body.contains(
+            body.contains(
                 "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
             ),
-            "H114 FALSIFIED: Qwen3VL clamp accidentally added to \
-             worker_run by iter-4.  Qwen3VL SlotAware activation is \
-             gated on iter-C2e per §6.1.22; iter-4 must not add the \
-             Qwen3VL clamp without the spawn-arm flip."
+            "H114 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
+             clamp missing from worker_run.  iter-C2e SHIPPED 2026-05-30 \
+             adds the Qwen3VL clamp at the four worker arms; Gemma 4 \
+             iter-4 must NOT regress the C2e clamp."
         );
 
         // ADR-040 iter-B4c-kernel iter-5 (§6.1.37 — TERMINAL Gemma 4
@@ -27095,15 +27334,17 @@ mod adr040_phase_b_iter_b4c_kernel_iter5_gemma4_tests {
              iter-5 must NOT regress iter-4's Embed-arm lift (§6.1.36)."
         );
 
-        // No Qwen3VL clamp accidentally added.
+        // ADR-040 iter-C2e (2026-05-30 §6.1.52) — Qwen3VL clamp
+        // SHIPPED post-Gemma 4 iter-5. Sibling discipline pin:
+        // Gemma 4 iter-5 must not REMOVE the C2e Qwen3VL clamp.
         assert!(
-            !body.contains(
+            body.contains(
                 "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
             ),
-            "H121 FALSIFIED: Qwen3VL clamp accidentally added to \
-             worker_run by iter-5.  Qwen3VL SlotAware activation is \
-             gated on iter-C2e per §6.1.22; iter-5 must not add the \
-             Qwen3VL clamp without the spawn-arm flip."
+            "H121 FALSIFIED (post-C2e revision per §6.1.52): Qwen3VL \
+             clamp missing from worker_run.  iter-C2e SHIPPED 2026-05-30 \
+             adds the Qwen3VL clamp at the four worker arms; Gemma 4 \
+             iter-5 must NOT regress the C2e clamp."
         );
     }
 
@@ -31197,6 +31438,416 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter_lcp_g_qwen35_iter_2d_lcp_gemma4_tes
                 "H212 FALSIFIED: §6.1.50 closure block does NOT name \
                  `{required_label}`.  The joint closure must enumerate \
                  all 3 iters."
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-040 Phase C iter-C2e (2026-05-30) — Qwen3-VL SlotAware engine
+// activation via Path B typed clamp.
+//
+// Direct mirror of C2c §6.1.21 (Gemma 4) + C2d §6.1.22 (Qwen35) for the
+// Qwen3-VL text-LM family.  Pre-C2e the `Engine::spawn_with_mode(..,
+// EngineMode::SlotAware { max_slots: N })` arm for Qwen3-VL returned
+// `Err(EngineSpawnError::ModeNotYetWired { iter_required: "C2e (...)" })`.
+// Iter-C2e flips that arm to `Ok(Engine)` via Path B:
+//
+//  1) Witness-only provisioning (no per-layer KV alloc): Qwen3-VL today
+//     runs the iter-9b naive O(N²) re-prefill loop with no persistent
+//     KV cache; the real cache is upstream-blocked on iter-228a (501
+//     sentinel).  Method `Qwen3VlTextLoadedModel::
+//     provision_multi_seq_kv_for_slot_aware(max_slots)` is a witness
+//     scalar setter.
+//  2) Four worker-arm typed clamps (Generate / GenerateStream / Embed /
+//     GenerateWithSoftTokens) surface `MultiSeqError::Capability
+//     Unsupported` at SlotId(N>0) with label naming `iter-C2e-cont per
+//     ADR-040 §6.1.52` (post iter-228a worker-hot-path lift) AND
+//     `iter-228a` (the upstream-blocker for the persistent KV cache
+//     itself).
+//
+// New typed-error variant:
+//
+//   EngineSpawnError::Qwen3VLSlotAwareProvisionFailed { max_slots, cause }
+//
+// (mirror of `Gemma4SlotAwareProvisionFailed` + `Qwen35SlotAwareProvision
+// Failed` shapes).
+//
+// Tests below pin H218-H223 per the iter-C2e spec.
+#[cfg(test)]
+mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
+    use super::*;
+
+    // ── Helper: snip worker_run body via the same shape used by C2d-cont /
+    // B4c-kernel test modules. ──
+    fn worker_run_body(src: &str) -> &str {
+        let body_start = src
+            .find("fn worker_run(")
+            .expect("C2e: worker_run entry not found");
+        let body_after = &src[body_start..];
+        let body_end_off = body_after
+            .find("\n// The worker thread for `LoadedModel::Qwen35` returns a sentinel error")
+            .or_else(|| body_after.find("\n/// Worker-thread entry point"))
+            .unwrap_or(body_after.len().min(200_000));
+        &body_after[..body_end_off]
+    }
+
+    /// **H218 (skip-mode)** — post-C2e, Qwen3VL SlotAware spawn arm
+    /// no longer returns `ModeNotYetWired`. Mirror of C2c H21 + C2d H26
+    /// for the Qwen3-VL family.
+    ///
+    /// Skip-mode source-grep: we can't construct a real
+    /// `LoadedModel::Qwen3VlText` without a GGUF, so we verify the
+    /// spawn arm body in source. The pre-C2e `LoadedModel::Qwen3VlText(_)
+    /// => Err(EngineSpawnError::ModeNotYetWired { iter_landed: "C2c", ...})`
+    /// is REPLACED by the new arm body that calls
+    /// `provision_multi_seq_kv_for_slot_aware` and returns
+    /// `Ok(spawn_inner_with_slot_aware(...))`.
+    #[test]
+    fn h218_qwen3vl_spawn_arm_no_longer_returns_mode_not_yet_wired() {
+        let src = include_str!("engine.rs");
+        // Slice the spawn_with_mode body so the negative pin doesn't
+        // accidentally match this test's OWN assert message
+        // (include_str! pulls the entire file including these
+        // assertions; the negative grep must be scoped to the actual
+        // spawn_with_mode body only).
+        let body_start = src
+            .find("pub fn spawn_with_mode(")
+            .expect("H218: spawn_with_mode entry not found");
+        let body_end = body_start
+            + src[body_start..]
+                .find("    fn spawn_inner_with_slot_aware")
+                .expect("H218: spawn_inner_with_slot_aware sibling not found");
+        let body = &src[body_start..body_end];
+        // Old pre-C2e marker must be GONE in the spawn_with_mode body.
+        assert!(
+            !body.contains("LoadedModel::Qwen3VlText(_) => Err(EngineSpawnError::ModeNotYetWired"),
+            "H218 FALSIFIED: pre-C2e Qwen3VL ModeNotYetWired arm body \
+             still present in spawn_with_mode body. iter-C2e must REPLACE \
+             the ModeNotYetWired return with the witness-provisioning \
+             arm body."
+        );
+        // New post-C2e arm body must be present (matches the C2d arm
+        // pattern: `LoadedModel::Qwen3VlText(mut v) => {`).
+        assert!(
+            body.contains("LoadedModel::Qwen3VlText(mut v) => {"),
+            "H218 FALSIFIED: post-C2e Qwen3VL SlotAware arm body marker \
+             `LoadedModel::Qwen3VlText(mut v) => {{` not found in \
+             spawn_with_mode body. The C2e spawn-arm flip must mirror \
+             C2d's `LoadedModel::Qwen35(mut q)` shape."
+        );
+        // The new arm must call the provisioner + delegate to the
+        // shared `spawn_inner_with_slot_aware` helper (mirror of C2c
+        // + C2d).
+        assert!(
+            body.contains("v.provision_multi_seq_kv_for_slot_aware(max_slots)"),
+            "H218 FALSIFIED: Qwen3VL spawn arm does NOT call \
+             `provision_multi_seq_kv_for_slot_aware`. The C2e arm must \
+             invoke the witness provisioner to mirror C2c+C2d shape."
+        );
+        assert!(
+            body.contains("LoadedModel::Qwen3VlText(v)"),
+            "H218 FALSIFIED: Qwen3VL spawn arm does not re-wrap the \
+             loaded model as `LoadedModel::Qwen3VlText(v)` for \
+             `spawn_inner_with_slot_aware`. C2e arm body shape broken."
+        );
+    }
+
+    /// **H219 (skip-mode)** — Qwen3VL multi-seq KV "scaffold" provisioned
+    /// at spawn is the witness scalar `slot_aware_max_slots: Option<u32>`
+    /// per the iter-228a-blocked KV regime (no real per-layer cache
+    /// yet; the persistent cache lands at iter-C2e-cont post iter-228a).
+    ///
+    /// Skip-mode source-grep on `engine_qwen3vl.rs`: the field is
+    /// declared on `Qwen3VlTextLoadedModel`, initialized to `None` in
+    /// `load`, and set to `Some(max_slots)` by
+    /// `provision_multi_seq_kv_for_slot_aware`.
+    #[test]
+    fn h219_qwen3vl_witness_scalar_provisioned_at_spawn() {
+        let src = include_str!("engine_qwen3vl.rs");
+        // Field declared.
+        assert!(
+            src.contains("pub slot_aware_max_slots: Option<u32>"),
+            "H219 FALSIFIED: `Qwen3VlTextLoadedModel.slot_aware_max_slots: \
+             Option<u32>` field missing. C2e witness-scalar provisioning \
+             requires this field per §6.1.52."
+        );
+        // Initialized to None in load.
+        assert!(
+            src.contains("slot_aware_max_slots: None,"),
+            "H219 FALSIFIED: `load()` does NOT initialize \
+             `slot_aware_max_slots: None`. The witness must default to \
+             None so SerialFifo dispatch leaves it untouched (H222 \
+             byte-equivalence pin)."
+        );
+        // Provision method exists + sets `Some(max_slots)`.
+        assert!(
+            src.contains("pub fn provision_multi_seq_kv_for_slot_aware"),
+            "H219 FALSIFIED: `provision_multi_seq_kv_for_slot_aware` \
+             method not declared on `Qwen3VlTextLoadedModel`. C2e \
+             spawn-arm flip requires this method."
+        );
+        assert!(
+            src.contains("self.slot_aware_max_slots = Some(max_slots);"),
+            "H219 FALSIFIED: provision method does NOT set \
+             `slot_aware_max_slots = Some(max_slots)`. Witness scalar \
+             contract broken."
+        );
+        // The max_slots == 0 defense-in-depth bail is present.
+        assert!(
+            src.contains("ADR-040 C2e: provision_multi_seq_kv_for_slot_aware called with"),
+            "H219 FALSIFIED: provision method does NOT contain the \
+             ADR-040 C2e max_slots==0 anyhow::bail defense-in-depth. \
+             Mirror of C2c/C2d provision-method invariants."
+        );
+    }
+
+    /// **H220 (skip-mode)** — each of the four worker arms (Generate /
+    /// GenerateStream / Embed / GenerateWithSoftTokens) carries the
+    /// Qwen3VL `slot_id != SlotId(0)` typed clamp.
+    ///
+    /// The clamp label must name `iter-C2e-cont per ADR-040 §6.1.52`
+    /// (the forward-pointer to the worker-hot-path lift) AND `iter-228a`
+    /// (the upstream-blocker for the persistent KV cache itself, per
+    /// §6.1.22's C2e cite). Operator-grep'able.
+    #[test]
+    fn h220_qwen3vl_worker_arms_typed_clamp_at_slot_n_gt_0() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+        // Four occurrences of the Qwen3VL clamp predicate (one per
+        // Request variant).
+        let clamp_predicate =
+            "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)";
+        let n_occurrences = body.matches(clamp_predicate).count();
+        assert!(
+            n_occurrences >= 4,
+            "H220 FALSIFIED: worker_run body contains {n_occurrences} \
+             Qwen3VL `slot_id != SlotId(0)` clamp predicates; expected \
+             at least 4 (one per Request variant: Generate, \
+             GenerateStream, Embed, GenerateWithSoftTokens)."
+        );
+        // The clamp label inside the typed-error message names both
+        // `iter-C2e-cont per ADR-040 §6.1.52` AND `iter-228a`.
+        assert!(
+            body.contains("iter-C2e-cont per ADR-040 §6.1.52"),
+            "H220 FALSIFIED: Qwen3VL clamp label does NOT contain \
+             `iter-C2e-cont per ADR-040 §6.1.52` — the forward-pointer \
+             to the worker-hot-path lift iter. Operator log greps + \
+             future-iter implementers depend on this literal cite."
+        );
+        assert!(
+            body.contains("iter-228a"),
+            "H220 FALSIFIED: Qwen3VL clamp label does NOT contain \
+             `iter-228a` — the upstream blocker for the Qwen3-VL \
+             forward path past the 501 sentinel. Operator triage needs \
+             this cite to disambiguate from the C2d-cont label shape."
+        );
+        // The four arm-specific sub-labels per the §6.1.52 closure
+        // discipline.
+        for sublabel in [
+            "qwen3vl-generate-slot-N",
+            "qwen3vl-generate-stream-slot-N",
+            "qwen3vl-embed-slot-N",
+            "qwen3vl-generate-with-soft-tokens-slot-N",
+        ] {
+            assert!(
+                body.contains(sublabel),
+                "H220 FALSIFIED: Qwen3VL clamp sublabel `{sublabel}` \
+                 missing from worker_run.  The four arm-specific cites \
+                 mirror C2c §6.1.21's `gemma4-*-slot-N` per-arm labels."
+            );
+        }
+    }
+
+    /// **H221 (sibling discipline)** — Qwen35 + Gemma 4 surfaces are
+    /// UNCHANGED by iter-C2e (only the Qwen3VL arm is modified).
+    ///
+    /// Source-grep across `engine.rs`:
+    /// - Both `Gemma4SlotAwareProvisionFailed` and
+    ///   `Qwen35SlotAwareProvisionFailed` typed-error variants still
+    ///   declared.
+    /// - C2c `LoadedModel::Gemma(mut g) => {` arm body still present.
+    /// - C2d `LoadedModel::Qwen35(mut q) => {` arm body still present.
+    /// - All four Gemma 4 worker-arm lifts still called via their
+    ///   slot-aware orchestrator fns (B4c-kernel iter-1/3/4/5).
+    /// - All four Qwen35 worker-arm lifts still called via their
+    ///   slot-aware orchestrator fns (C2d-cont-kernel iter-1/2/3/4).
+    #[test]
+    fn h221_qwen35_and_gemma4_surfaces_unchanged_by_c2e() {
+        let src = include_str!("engine.rs");
+        // Typed-error siblings still declared.
+        assert!(
+            src.contains("Gemma4SlotAwareProvisionFailed"),
+            "H221 FALSIFIED: `Gemma4SlotAwareProvisionFailed` removed \
+             by C2e. C2e must NOT touch the Gemma 4 typed-error surface."
+        );
+        assert!(
+            src.contains("Qwen35SlotAwareProvisionFailed"),
+            "H221 FALSIFIED: `Qwen35SlotAwareProvisionFailed` removed \
+             by C2e. C2e must NOT touch the Qwen35 typed-error surface."
+        );
+        assert!(
+            src.contains("Gemma4HybridSlotAwareProvisionFailed"),
+            "H221 FALSIFIED: `Gemma4HybridSlotAwareProvisionFailed` \
+             removed by C2e. C2e must NOT touch the iter-C2c-cont \
+             Gemma 4 hybrid-scaffold typed-error surface."
+        );
+        // C2c + C2d spawn-arm bodies still present.
+        assert!(
+            src.contains("LoadedModel::Gemma(mut g) => {"),
+            "H221 FALSIFIED: C2c Gemma 4 spawn-arm body marker missing."
+        );
+        assert!(
+            src.contains("LoadedModel::Qwen35(mut q) => {"),
+            "H221 FALSIFIED: C2d Qwen35 spawn-arm body marker missing."
+        );
+        // Gemma 4 worker-arm lift fns still called.
+        for lift_fn in [
+            "generate_gemma4_once_slot_aware(",
+            "generate_stream_gemma4_once_slot_aware(",
+            "embed_gemma4_slot_aware(",
+            "generate_gemma4_once_with_soft_tokens_slot_aware(",
+        ] {
+            assert!(
+                src.contains(lift_fn),
+                "H221 FALSIFIED: Gemma 4 lift fn `{lift_fn}` is NOT \
+                 called from worker_run. C2e must NOT regress any \
+                 Gemma 4 worker-arm lift (§6.1.31/35/36/37)."
+            );
+        }
+        // Qwen35 worker-arm lift fns still called.
+        for lift_fn in [
+            "super::engine_qwen35::generate_qwen35_once_slot_aware(",
+            "super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware(",
+            "super::engine_qwen35::embed_qwen35_slot_aware(",
+            "super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware(",
+        ] {
+            assert!(
+                src.contains(lift_fn),
+                "H221 FALSIFIED: Qwen35 lift fn `{lift_fn}` is NOT \
+                 called from worker_run. C2e must NOT regress any \
+                 Qwen35 worker-arm lift (§6.1.27/28/29/30)."
+            );
+        }
+    }
+
+    /// **H222 (SerialFifo byte-equivalence pin)** — Qwen3VL SerialFifo
+    /// path is UNCHANGED by C2e. The pre-C2e EngineMode::SerialFifo
+    /// dispatch did NOT call `provision_multi_seq_kv_for_slot_aware`,
+    /// and post-C2e MUST still not call it (otherwise SerialFifo would
+    /// gain a per-spawn witness write that breaks byte-equivalence).
+    /// Mirror of C2c's H23 + C2d's H28 source-grep regression-pin
+    /// pattern.
+    #[test]
+    fn h222_serial_fifo_qwen3vl_does_not_provision_multi_seq_kv() {
+        let src = include_str!("engine.rs");
+        let body_start = src
+            .find("pub fn spawn_with_mode(")
+            .expect("H222: spawn_with_mode entry not found");
+        let body_end = body_start
+            + src[body_start..]
+                .find("    fn spawn_inner_with_slot_aware")
+                .expect("H222: spawn_inner_with_slot_aware sibling not found")
+            + "    fn spawn_inner_with_slot_aware".len();
+        let body = &src[body_start..body_end];
+        let serial_fifo_idx = body
+            .find("EngineMode::SerialFifo")
+            .expect("H222: SerialFifo arm not found in spawn_with_mode");
+        let slot_aware_idx = body
+            .find("EngineMode::SlotAware")
+            .expect("H222: SlotAware arm not found in spawn_with_mode");
+        assert!(
+            serial_fifo_idx < slot_aware_idx,
+            "H222 sanity: dispatch table orders SerialFifo before SlotAware"
+        );
+        let serial_fifo_arm = &body[serial_fifo_idx..slot_aware_idx];
+        assert!(
+            !serial_fifo_arm.contains("provision_multi_seq_kv_for_slot_aware"),
+            "H222 FALSIFIED: post-C2e SerialFifo arm now calls \
+             provision_multi_seq_kv_for_slot_aware — byte-equivalence \
+             with pre-C2e behavior broken (the Qwen3VL provisioner is \
+             a witness-only setter today but on iter-228a will alloc \
+             real KV — SerialFifo must never engage either path)."
+        );
+        // Also: the iter-228a 501 sentinel routing in the four worker
+        // arms is preserved verbatim — the C2e clamp short-circuits
+        // BEFORE the sentinel dispatch at SlotId(N>0), but SlotId(0)
+        // still hits the existing sentinel routing for the
+        // non-Generate-arm cases (Embed / GenerateWithSoftTokens have
+        // soft-token guards). Pin via source-grep on the existing
+        // sentinel call site (engine.rs:~5697+ etc.).
+        assert!(
+            src.contains("qwen3vl_text_forward_pending_err"),
+            "H222 FALSIFIED: the iter-228a 501 sentinel routing \
+             (`qwen3vl_text_forward_pending_err`) is missing from \
+             engine.rs. C2e must NOT touch the iter-228a sentinel path."
+        );
+    }
+
+    /// **H223 (typed-error variant exists)** — the new
+    /// `EngineSpawnError::Qwen3VLSlotAwareProvisionFailed { max_slots,
+    /// cause }` variant exists with the expected shape (mirror of
+    /// `Gemma4SlotAwareProvisionFailed` + `Qwen35SlotAwareProvision
+    /// Failed`).
+    #[test]
+    fn h223_qwen3vl_slot_aware_provision_failed_variant_exists_with_max_slots_and_cause() {
+        let err = EngineSpawnError::Qwen3VLSlotAwareProvisionFailed {
+            max_slots: 4,
+            cause: "synthetic test cause".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("Qwen3-VL") || msg.contains("qwen3vl") || msg.contains("C2e"),
+            "H223 FALSIFIED: post-C2e Qwen3VLSlotAwareProvisionFailed \
+             Display must identify the failing arch + iter. Got: {msg}"
+        );
+        assert!(
+            msg.contains("4"),
+            "H223 sanity: Qwen3VLSlotAwareProvisionFailed Display must \
+             include max_slots value. Got: {msg}"
+        );
+        // Pin destructuring shape (catches future field rename / removal).
+        match err {
+            EngineSpawnError::Qwen3VLSlotAwareProvisionFailed { max_slots, cause } => {
+                assert_eq!(max_slots, 4, "H223: max_slots field roundtrips");
+                assert_eq!(cause, "synthetic test cause", "H223: cause roundtrips");
+            }
+            _ => panic!("H223 FALSIFIED: variant structure changed unexpectedly"),
+        }
+    }
+
+    /// **H223-cont (ADR §6.1.52 closure block pin)** — the C2e
+    /// closure block exists in ADR-040 and names the four arm-specific
+    /// cite labels + the iter-C2e-cont follow-up + the iter-228a
+    /// upstream-blocker.
+    #[test]
+    fn h223_cont_adr_section_6_1_52_closure_block_named() {
+        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.52"),
+            "H223-cont FALSIFIED: ADR-040 §6.1.52 closure block not \
+             found. iter-C2e SHIPPED must add the §6.1.52 closure block \
+             per the §6.1.N-per-iter discipline."
+        );
+        let section_idx = adr
+            .find("### 6.1.52")
+            .expect("H223-cont (a): §6.1.52 just asserted present");
+        let section_end_rel = adr[section_idx + 10..]
+            .find("\n### ")
+            .unwrap_or(adr.len() - section_idx - 10);
+        let section_window =
+            &adr[section_idx..(section_idx + 10 + section_end_rel).min(adr.len())];
+        for required_label in [
+            "iter-C2e",
+            "Qwen3-VL",
+            "iter-C2e-cont",
+            "iter-228a",
+        ] {
+            assert!(
+                section_window.contains(required_label),
+                "H223-cont FALSIFIED: §6.1.52 closure block does NOT \
+                 name `{required_label}`.  The C2e closure must \
+                 enumerate the iter + arch + follow-up + upstream-blocker."
             );
         }
     }

@@ -92,6 +92,108 @@ pub struct Qwen3VlTextLoadedModel {
     /// ADR-017 §F4 — GGUF provenance captured at load time. Stored for
     /// the common [`super::engine::LoadedModel::provenance`] surface.
     pub provenance: Provenance,
+    /// **ADR-040 Phase C iter-C2e (2026-05-30)** — structural witness
+    /// for `EngineMode::SlotAware { max_slots: N }` spawn-time
+    /// provisioning on the Qwen3-VL text-LM family.
+    ///
+    /// Provisioned at `spawn_with_mode(SlotAware { max_slots: N })`
+    /// time via
+    /// [`Self::provision_multi_seq_kv_for_slot_aware`] (called from
+    /// `Engine::spawn_with_mode` per §6.1.52).  `None` for
+    /// `EngineMode::SerialFifo` (byte-equivalence pin H222 holds —
+    /// SerialFifo dispatch never touches this field); `Some(max_slots)`
+    /// after SlotAware spawn.
+    ///
+    /// **Why a witness scalar, not a KV cache scaffold like Gemma 4 /
+    /// Qwen35**: Qwen3-VL text-LM today runs the iter-9b *naive O(N²)
+    /// re-prefill loop* in
+    /// [`generate_qwen3vl_text_once`] — no persistent KV cache is
+    /// allocated, every step re-prefills from position 0. The real
+    /// per-step KV cache is upstream-blocked on **iter-228a** (the 501
+    /// sentinel today; see ADR-005 Wedge-4 + this file's module
+    /// docstring). Until iter-228a lands a real forward path past the
+    /// 501 sentinel, the spawn-time provisioning surface is a
+    /// structural witness only — the scalar carries `max_slots` so
+    /// future iters + operator log greps + the H219 test bank can
+    /// pin the provisioning call without any device alloc.
+    ///
+    /// **iter-C2e-cont (post iter-228a)** — replaces this scalar with
+    /// a real `Option<Qwen3VlTextKvCache>` (or per-layer
+    /// `Vec<MultiSeqQwen3VlKvBuffers>` depending on the iter-228a
+    /// KV shape) and lifts the four worker arms onto the persistent
+    /// cache.  The four worker arms TODAY surface typed
+    /// `MultiSeqError::CapabilityUnsupported` at `SlotId(N>0)` per
+    /// `iter-C2e-cont per ADR-040 §6.1.52 — gated on iter-228a`
+    /// label, mirror of C2c+C2d-cont's worker-arm clamp shape.
+    pub slot_aware_max_slots: Option<u32>,
+}
+
+impl Qwen3VlTextLoadedModel {
+    /// **ADR-040 Phase C iter-C2e (2026-05-30)** — provision the
+    /// structural witness for
+    /// [`crate::serve::api::engine::EngineMode::SlotAware`] spawn-time
+    /// activation on Qwen3-VL.
+    ///
+    /// Called by
+    /// [`crate::serve::api::engine::Engine::spawn_with_mode`] when
+    /// `EngineMode::SlotAware { max_slots: N }` is selected for a
+    /// Qwen3-VL engine. Sets [`Self::slot_aware_max_slots`] to
+    /// `Some(max_slots)` — a witness scalar, NOT a KV cache scaffold
+    /// (cf. Gemma 4 `provision_multi_seq_kv_for_slot_aware` which
+    /// allocates per-layer `MultiSeqHbKvBuffers` via the A3a
+    /// allocator + Qwen35 `provision_multi_seq_kv_for_slot_aware`
+    /// which allocates `HybridKvCache::new_with_options(.., n_seqs =
+    /// max_slots, ..)`).
+    ///
+    /// **Why a witness, not a real KV cache** (load-bearing for the
+    /// C2e iter shape): Qwen3-VL text-LM today runs the iter-9b
+    /// naive O(N²) re-prefill loop with no persistent KV cache; every
+    /// generated token re-runs the full prefill from position 0
+    /// (see [`generate_qwen3vl_text_once`]). The real per-step KV
+    /// cache is upstream-blocked on **iter-228a** (the 501 sentinel —
+    /// see `Qwen3VlTextLoadedModel`'s module docstring + ADR-005
+    /// Wedge-4 + ADR-040 §6.1.22's C2e cite). The C2e iter's role is
+    /// to flip the spawn arm to `Ok(Engine)` so the
+    /// `InflightBatchedScheduler` can be wired end-to-end at the API
+    /// surface; the worker hot path on the persistent cache lands at
+    /// iter-C2e-cont (post iter-228a).
+    ///
+    /// **SerialFifo byte-equivalence pin (H222)**: this method is
+    /// NEVER called when `EngineMode::SerialFifo` is selected. The
+    /// `EngineMode::SerialFifo` arm in
+    /// `Engine::spawn_with_mode` does not invoke any
+    /// `provision_multi_seq_kv_for_slot_aware` method on any family;
+    /// the SerialFifo dispatch goes directly through the legacy
+    /// `Engine::spawn` body with `slot_aware_max_slots: None`
+    /// preserved verbatim from `Qwen3VlTextLoadedModel::load`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `anyhow::Error` if `max_slots == 0`. The spawn arm
+    /// has a parallel pre-check that returns
+    /// [`crate::serve::api::engine::EngineSpawnError::ModeNotYetWired`]
+    /// at the API boundary BEFORE this method runs, so this is
+    /// defense-in-depth.
+    pub fn provision_multi_seq_kv_for_slot_aware(
+        &mut self,
+        max_slots: u32,
+    ) -> Result<()> {
+        if max_slots == 0 {
+            anyhow::bail!(
+                "ADR-040 C2e: provision_multi_seq_kv_for_slot_aware called with \
+                 max_slots == 0; spawn_with_mode invariant is max_slots >= 1 \
+                 (EngineMode::SlotAware variant enforces this at the API \
+                 boundary — caller violated)"
+            );
+        }
+        // iter-C2e: witness-only provisioning (no device alloc).  See
+        // method docstring + ADR §6.1.52 for the "why a witness, not
+        // a real KV cache" rationale.  iter-C2e-cont (post iter-228a)
+        // replaces this with a real persistent-cache scaffold +
+        // worker-hot-path lift.
+        self.slot_aware_max_slots = Some(max_slots);
+        Ok(())
+    }
 }
 
 impl Qwen3VlTextLoadedModel {
@@ -217,6 +319,12 @@ impl Qwen3VlTextLoadedModel {
             quant_type,
             load_duration,
             provenance,
+            // ADR-040 Phase C iter-C2e (2026-05-30) — None until
+            // `spawn_with_mode(SlotAware { .. })` calls
+            // `provision_multi_seq_kv_for_slot_aware` per §6.1.52.
+            // SerialFifo dispatch leaves this `None` (H222
+            // byte-equivalence pin).
+            slot_aware_max_slots: None,
         })
     }
 }
