@@ -5034,6 +5034,64 @@ Path B ships the *witness-only* provisioning surface (a scalar `Option<u32>` set
 | `iter-228a` | All four worker-arm clamps in `engine.rs::worker_run` (same locations as above) + new `Qwen3VlTextLoadedModel.slot_aware_max_slots` field docstring + new provision-method docstring | Upstream-blocker cite. Reminds future iter-C2e-cont implementer to verify iter-228a has SHIPPED before attempting the persistent-cache lift. |
 | `Qwen3VLSlotAwareProvisionFailed` | `engine.rs::EngineSpawnError` enum + spawn-arm wrap + H223 test | Operator log grep handle for triage. |
 
+### 6.1.53 Iter-A4 dossier closure — drafter multi-seq KV deferred on EMPIRICAL inflection point, not on open API contract (2026-05-30, dossier commit hash recorded at commit time)
+
+Per the directive "Always use /ruflo-goals:deep-research when you're stuck" + the §3.7 reopen-trigger memo discipline, the Phase A4 drafter-side multi-seq KV deferral (originally framed as "research-quality" per §4 OQ 5) was deep-researched against 9 published sources spanning vLLM/P-EAGLE, TensorRT-LLM, SGLang, EAGLE-3, Hydra, Medusa, and 3 empirical-traps papers. Full dossier at [`docs/research/adr040-a4-drafter-multi-seq-dossier-2026-05-30.md`](research/adr040-a4-drafter-multi-seq-dossier-2026-05-30.md).
+
+**Headline finding**: the drafter-side KV API contract IS settled (vLLM/P-EAGLE `PADDING_SLOT_ID(-1)` per-slot pattern + EAGLE-3 per-node tree verification with attention masking). hf2q could ship this contract today following the established `MultiSeqHbKvBuffers` (A3a §6.1.11) + `HybridKvCache::new_with_options(.., n_parallel)` (A2a §6.1.2) + `fork_seq` (A2c+A3c §6.1.43) pattern.
+
+**HOWEVER** 3 independent published sources confirm speculative decoding **net-regresses above 4-8 concurrent requests** — exactly the threshold where ADR-040's §3.6/§3.7 reopen trigger fires:
+
+| Concurrent batch | Spec-decode net effect |
+|---|---|
+| 1 | +2.5× (memory-bandwidth-bound) |
+| 2-4 | Net positive |
+| 4-8 | **Transition zone** |
+| 8-16 | **Net regression** (verification overhead consumes gains) |
+| 16-32+ | Compute-bound; dead weight |
+
+Plus hf2q's primary production model is Qwen3.6-A3B (MoE), and MoE + spec-decode is a documented production trap across all 3 framework sources.
+
+**Decision**: A4 deferral STAYS, but basis upgraded from "research-quality" to **measured-tradeoff structural decision**. §4 OQ 5 reworded to reference this dossier explicitly.
+
+**§4 OQ 5 rewording**:
+
+> **OQ 5 (Phase A4 drafter multi-seq KV)**: DEFERRED per §6.1.53 A4 dossier ([docs/research/adr040-a4-drafter-multi-seq-dossier-2026-05-30.md](research/adr040-a4-drafter-multi-seq-dossier-2026-05-30.md)). The drafter-side KV API contract is settled (vLLM/P-EAGLE `PADDING_SLOT_ID(-1)` per-slot pattern), but empirical research (3 independent sources) shows speculative decoding **net-regresses above 4-8 concurrent requests** — the threshold where ADR-040's reopen trigger fires. A4 stays deferred until hf2q empirically measures its workload-specific inflection point (operator runbook §7 of dossier) OR a customer ask documents safe-zone concurrency.
+
+**A4 reopen conditions** (dossier §7 excerpt):
+1. hf2q operator empirically measures **p50 concurrency in 1-4 range** for sustained periods AND has spec-decode enabled
+2. Customer explicitly asks for batched spec-decode with documented workload characteristics in the safe zone
+3. EAGLE-4 or successor lands with published contract better-suited to >8 concurrent batches
+4. hf2q switches primary model away from MoE to dense architecture
+5. hf2q ships new KV-quantization scheme reducing verification overhead crossover
+
+**A4 stays deferred while**:
+- ADR-040's reopen trigger (≥8 concurrent users sustained 7 days) is the active threshold
+- hf2q has not measured per-workload inflection on its own hardware
+- MoE remains production-default architecture
+
+**hf2q's current spec-decode state** (verified during dossier work):
+- EAGLE-3 drafter for Qwen35 SHIPPED per ADR-037 §6.1.8 Phase E6 F3 (commit `fe2f9ecc`)
+- SlotAware target-side spec-decode end-to-end at SlotId(N>0) per iter-B4d §6.1.44 (commit `6be6a9b9`)
+- Single-seq drafter at SlotId(N>0) works today via dflash wrapper state
+- Multi-seq drafter KV (batched draft tree across slots) = what A4 would lift
+
+**ADR-040 architectural state post-§6.1.53**:
+
+| Phase | State |
+|---|---|
+| A — KV cache lifts | ✅ ALL TYPED DEFERRALS CLOSED |
+| B — forward path slot threading | ✅ ALL TYPED DEFERRALS CLOSED (cross-arch) |
+| C — engine/scheduler | ✅ ALL TYPED DEFERRALS CLOSED (3-arch coverage) |
+| D — benchmark | ✅ D2 + D3 SHIPPED (AC-4 hard-gate) |
+| E1 — closure ceremony | ✅ SHIPPED §6.1.26 commit `b928ffaf` |
+
+**Surviving typed deferrals after §6.1.53**:
+- `iter-C2e-cont` (Qwen3VL worker hot path lift) — gated on iter-228a 501 sentinel removal in a separate ADR
+- `iter-A4` (drafter multi-seq KV) — gated on empirical inflection-point measurement per this dossier
+
+**Both deferrals are gated on EXTERNAL signals** (separate ADR landing or empirical measurement), not on missing hf2q work. ADR-040 is functionally COMPLETE as of §6.1.53.
+
 ---
 
 ## 8. References
