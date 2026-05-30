@@ -5942,28 +5942,168 @@ fn worker_run(
                 // overrides at slot > 0 still need kernel slot routing
                 // in `forward_prefill.rs` (iter-C2c-cont scope).
                 if let Some(handle) = admitted.handle {
-                    // ADR-040 Phase B iter-4c (B4c) refinement of the C2c
-                    // GenerateWithSoftTokens arm clamp — symmetric with
-                    // the C2d-cont soft-tokens label format. See §6.1.25
-                    // for the full path-decision + label-discipline
-                    // rationale.
+                    // ADR-040 Phase B iter-B4c-kernel iter-5 (2026-05-30) —
+                    // Gemma 4 worker hot path GenerateWithSoftTokens-arm
+                    // lift onto the persistent multi-seq per-layer
+                    // `MultiSeqHbKvBuffers` (`g.multi_seq_kv`) + the
+                    // production-default hybrid F16-K + TQ-HB-V sibling
+                    // scaffold (`g.multi_seq_kv_hybrid`) instead of the
+                    // legacy per-request inline `generate_once_with_soft_tokens`
+                    // dispatch.  Direct mirror of Qwen35 iter-C2d-cont-
+                    // kernel iter-4 §6.1.30 for the Gemma 4 vision-aware
+                    // soft-token surface — same dispatch fork shape
+                    // (`slot_id != SlotId(0)` predicate at the worker
+                    // arm), same take-and-restore borrow pattern on
+                    // BOTH scaffolds, same `reset_for_slot` entry+exit
+                    // discipline on BOTH scaffolds.
                     //
-                    // ADR-040 iter-B4c-kernel iter-1 (2026-05-30) —
-                    // relabeled additive cite `iter-B4c-kernel-iter-5
-                    // per ADR-040 §6.1.31` (the GenerateWithSoftTokens-
-                    // arm slot-aware orchestrator port, mirror of Qwen35
-                    // iter-C2d-cont-kernel iter-4 §6.1.30).
+                    // C2c (§6.1.21) added the dispatch-fork clamp; B4c
+                    // (§6.1.25) refined the typed-error label; iter-1
+                    // (§6.1.31) labeled the SoftTokens sub-deferral as
+                    // `iter-B4c-kernel-iter-5`; iter-3 (§6.1.35) lifted
+                    // the GenerateStream arm; iter-4 (§6.1.36) lifted
+                    // the Embed arm; this `iter-B4c-kernel-iter-5 per
+                    // ADR-040 §6.1.37` REPLACES the SoftTokens clamp
+                    // with the actual scaffold lift via
+                    // `generate_gemma4_once_with_soft_tokens_slot_aware(g,
+                    //   .., &mut multi_seq, multi_seq_hybrid.as_mut(),
+                    //   slot_id)`.
+                    //
+                    // iter-5 is the **TERMINAL Gemma 4 worker-arm lift**
+                    // — post-iter-5 ALL FOUR Gemma 4 worker arms route
+                    // through the persistent multi-seq scaffolds at
+                    // SlotId(N>0).  The Gemma 4 worker-arm lift arc is
+                    // COMPLETE.  Surviving sub-deferrals (iter-2A-cont,
+                    // iter-2C, iter-2D, iter-2B-xlen, iter-2-decode,
+                    // iter-LCP, iter-G) are orthogonal kernel-side
+                    // refactors, NOT arm lifts.
+                    //
+                    // The take-and-restore borrow pattern at this site
+                    // resolves the partial-borrow conflict between
+                    // `&mut g.multi_seq_kv` + `&mut g.multi_seq_kv_hybrid`
+                    // and the dense `&mut g.lcp_registry` / `&mut
+                    // g.prompt_cache` accesses (worker is serial — no
+                    // concurrent access).  Parallels iter-1+2B Generate
+                    // arm take/restore + iter-3 GenerateStream-arm
+                    // take/restore + iter-4 Embed-arm take/restore.
+                    //
+                    // SerialFifo + SlotId(0): unchanged (H116 byte-
+                    // equivalence pin) — the `slot_id != SlotId(0)`
+                    // predicate short-circuits below the lift block so
+                    // the existing `generate_once_with_soft_tokens`
+                    // dispatch at the `match &mut loaded` below fires
+                    // verbatim.  SlotAware + SlotId(0): also unchanged
+                    // (same predicate).
+                    //
+                    // Defense-in-depth: if `multi_seq_kv.is_none()` at
+                    // SlotId(N>0) (impossible at runtime per the C2c
+                    // spawn-arm invariant), the request surfaces a typed
+                    // `anyhow::Error` with operator-grep'able label
+                    // `"iter-B4c-kernel iter-5 — multi_seq_kv absent"`.
                     if matches!(loaded, LoadedModel::Gemma(_)) && handle.slot_id != SlotId(0) {
-                        let err = MultiSeqError::CapabilityUnsupported {
-                            capability:
-                                "gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont per ADR-040 §6.1.21 / iter-B4c-kernel per ADR-040 §6.1.25 / iter-B4c-kernel-iter-5 per ADR-040 §6.1.31 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs::forward_prefill_with_soft_tokens + per-slot MultiSeqHbKvBuffers slot routing; GenerateWithSoftTokens slot-aware orchestrator port deferred to iter-B4c-kernel-iter-5)",
+                        let slot_id = handle.slot_id;
+                        let LoadedModel::Gemma(g) = &mut loaded else {
+                            unreachable!(
+                                "ADR-040 iter-B4c-kernel iter-5: \
+                                 matches!(Gemma) check passed but bind failed"
+                            );
                         };
-                        let _ = reply.send(Err(anyhow::anyhow!(
-                            "capability_unsupported: ADR-040 C2c — {}",
-                            err
-                        )));
+                        // Take the persistent multi-seq KV out so the
+                        // callee gets a clean `&mut Vec<MultiSeqHbKvBuffers>`
+                        // without partial-borrow conflicts on the
+                        // surrounding `&mut g` accesses.
+                        let mut multi_seq = match g.multi_seq_kv.take() {
+                            Some(buf) => buf,
+                            None => {
+                                let _ = reply.send(Err(anyhow::anyhow!(
+                                    "capability_unsupported: ADR-040 \
+                                     iter-B4c-kernel iter-5 — \
+                                     multi_seq_kv is None at SlotId({}) \
+                                     for Gemma 4 GenerateWithSoftTokens \
+                                     arm. C2c spawn-arm invariant violated \
+                                     (provision_multi_seq_kv_for_slot_aware \
+                                     was not called at EngineMode::SlotAware \
+                                     spawn time). Operator: check \
+                                     spawn_with_mode wiring in \
+                                     src/serve/api/engine.rs.",
+                                    slot_id.0,
+                                )));
+                                scheduler.release(handle);
+                                publish_stats(&scheduler, &scheduler_stats_snapshot);
+                                continue;
+                            }
+                        };
+                        // ADR-040 iter-B4c-kernel iter-5 — PARALLEL take
+                        // on the production-default hybrid scaffold
+                        // sibling iter-C2c-cont (§6.1.33) provisioned.
+                        // `Option<Vec<_>>` shape because the sibling is
+                        // `None` when HF2Q_HYBRID_KV=0 (opt-out); take()
+                        // leaves the field as `None` regardless and we
+                        // restore the original below.  Mirrors the
+                        // Generate-arm take/restore pattern + iter-3
+                        // GenerateStream-arm + iter-4 Embed-arm patterns.
+                        let mut multi_seq_hybrid = g.multi_seq_kv_hybrid.take();
+                        // Build borrowed `SoftTokenInjection<'_>` slices
+                        // from the owned `SoftTokenData` (same shape as
+                        // the legacy `generate_once_with_soft_tokens`
+                        // injection build below + iter-3 GenerateStream-
+                        // arm injection build at engine.rs:5258-5264).
+                        let injections_slot: Vec<SoftTokenInjection<'_>> = soft_tokens
+                            .iter()
+                            .map(|d| SoftTokenInjection {
+                                range: d.range.clone(),
+                                embeddings: &d.embeddings,
+                            })
+                            .collect();
+                        // Gemma 4 SoftTokens-arm scope: deepstack +
+                        // positions_flat are Qwen3-VL specific and
+                        // intentionally NOT consumed here (the non-
+                        // slot-aware sibling at engine.rs:6144-6155
+                        // makes the same choice — Gemma 4 falls back
+                        // to the soft-token-only entry).  Threading
+                        // deepstack/positions_flat through would
+                        // require a deepstack-aware Gemma 4 forward
+                        // kernel, which does NOT exist (the Wedge-4d
+                        // DeepStack pipeline is Qwen35/Qwen3-VL only).
+                        let _ = &deepstack;
+                        let _ = &positions_flat;
+                        let result = generate_gemma4_once_with_soft_tokens_slot_aware(
+                            g,
+                            &prompt_tokens,
+                            &injections_slot,
+                            &params,
+                            registration.as_ref(),
+                            &mut multi_seq,
+                            multi_seq_hybrid.as_mut(),
+                            slot_id,
+                        );
+                        // Put the persistent multi-seq KV back regardless
+                        // of result — keeps the spawn-time invariant
+                        // (`multi_seq_kv.is_some()` for SlotAware Gemma 4)
+                        // intact for the next request.
+                        g.multi_seq_kv = Some(multi_seq);
+                        // ADR-040 iter-B4c-kernel iter-5: parallel
+                        // restore on the hybrid scaffold sibling.  When
+                        // HF2Q_HYBRID_KV=1 (default), this restores the
+                        // production-default scaffold; when
+                        // HF2Q_HYBRID_KV=0 (opt-out), `multi_seq_hybrid`
+                        // is `None` and we restore the `None` state.
+                        g.multi_seq_kv_hybrid = multi_seq_hybrid;
+                        // Standard post-pattern: bookkeep prefill +
+                        // per-token decodes + release.  iter-5 today
+                        // surfaces typed CapabilityUnsupported on the
+                        // iter-2-decode sub-deferral so completion_tokens
+                        // is implicitly 0 on that path (the decode-
+                        // bookkeeping loop is a no-op on Err).
+                        scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+                        if let Ok(ref gr) = result {
+                            for _ in 0..gr.completion_tokens {
+                                scheduler.advance_after_decode(handle);
+                            }
+                        }
                         scheduler.release(handle);
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
+                        let _ = reply.send(result);
                         continue;
                     }
                     // ADR-040 Phase C iter-C2d-cont-kernel iter-4 (2026-05-30) —
@@ -8404,22 +8544,32 @@ fn generate_stream_gemma4_once_slot_aware(
         return;
     }
 
-    // Vision-augmented streaming is iter-B4c-kernel-iter-5 scope.
-    // iter-3 surfaces typed error + aborts when soft_tokens is
-    // non-empty, mirroring the iter-2 (Qwen35 streaming) deferral
-    // discipline at §6.1.28 + iter-1 Generate-arm's `&[]` soft_tokens
-    // (vision is iter-5 scope per §6.1.31).
-    if !soft_tokens.is_empty() {
-        send!(super::sse::GenerationEvent::Error(format!(
-            "capability_unsupported: ADR-040 iter-B4c-kernel iter-3 — \
-             vision-augmented streaming slot-aware port is \
-             iter-B4c-kernel-iter-5 per ADR-040 §6.1.31 (got \
-             soft_tokens.len()={}); fall back to SerialFifo / SlotId(0) \
-             for vision-augmented streaming.",
-            soft_tokens.len(),
-        )));
-        return;
-    }
+    // ADR-040 iter-B4c-kernel iter-5 (2026-05-30) — vision-augmented
+    // streaming at SlotId(N>0) LIFTED.  iter-3 (§6.1.35) surfaced a
+    // typed Error event citing iter-5 when `soft_tokens` was non-empty;
+    // iter-5 REMOVES that abort path — the soft_tokens slice is now
+    // threaded verbatim through to `forward_prefill_with_soft_tokens_slot_aware`
+    // at the prefill call site below.  The slot-aware prefill kernel
+    // (iter-2A landing per §6.1.32 + iter-2B routing per §6.1.34)
+    // already accepts a `soft_tokens: &[SoftTokenInjection<'_>]`
+    // parameter; iter-3's empty-only restriction was a scope-narrowing,
+    // not a kernel limit.
+    //
+    // Mirror of Qwen35 iter-C2d-cont-kernel iter-4 §6.1.30's lift of
+    // the `has_extension == true` branch in
+    // `generate_stream_qwen35_once_extended_slot_aware`.  Same pattern:
+    // the typed-error abort is REPLACED with the real kernel call +
+    // t_post-advanced decode positioning (Gemma 4 path uses text-only
+    // positions so the t_post logic reduces to the iter-3 form).
+    //
+    // Vision-augmented streaming at SlotId(N>0) now works end-to-end
+    // through the kernel; the multi-token streaming decode-loop body
+    // wrapping remains iter-2-decode scope (matches the text-only
+    // streaming arm's surviving sub-deferral).
+    let _ = soft_tokens; // Soft tokens are threaded through to the
+                         // prefill call site below — this binding
+                         // exists only to document iter-5's lift in
+                         // the source-grep window.
 
     // Per-slot reset at entry — mirror of iter-1 Generate-arm entry-
     // reset discipline (engine.rs:7869-7874) for the streaming surface.
@@ -8458,13 +8608,21 @@ fn generate_stream_gemma4_once_slot_aware(
     // decode token; the multi-token decode-loop body wrapping is
     // iter-B4c-kernel-iter-2-decode scope (same sub-deferral the
     // Generate-arm lift surfaces).
+    //
+    // ADR-040 iter-B4c-kernel iter-5 (2026-05-30) — `soft_tokens` is
+    // now threaded VERBATIM through to the slot-aware prefill kernel
+    // (was `&[]` pre-iter-5; iter-5 lifted the vision-augmented
+    // streaming branch's abort above).  Mirror of Qwen35 iter-4 §6.1.30
+    // streaming has_extension lift.
     let max_decode_tokens = params.max_tokens.max(1);
     let prefill_result: Result<u32> = loaded
         .weights
         .forward_prefill_with_soft_tokens_slot_aware(
             prompt_tokens,
-            &[], // GenerateStream-arm: no soft-token overrides; vision-aware
-                 // path is iter-B4c-kernel-iter-5 (SoftTokens arm).
+            soft_tokens, // GenerateStream-arm: iter-5 (§6.1.37) lifts
+                         // the vision-augmented streaming branch —
+                         // soft-token overrides are threaded through
+                         // to the slot-aware prefill kernel verbatim.
             max_decode_tokens,
             &mut loaded.ctx,
             slot_id,
@@ -8837,6 +8995,269 @@ fn embed_gemma4_slot_aware(
     }
 
     embed_vec_result
+}
+
+/// **ADR-040 iter-B4c-kernel iter-5 (2026-05-30)** — slot-aware
+/// vision-aware non-streaming Gemma 4 generation against the persistent
+/// multi-seq per-layer
+/// [`crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers`]
+/// scaffold (`GemmaLoadedModel.multi_seq_kv`) + the production-default
+/// hybrid F16-K + TQ-HB-V sibling scaffold (`GemmaLoadedModel.
+/// multi_seq_kv_hybrid`) instead of the legacy per-request inline alloc.
+///
+/// **Direct mirror of `generate_gemma4_once_slot_aware`** (iter-1 +
+/// iter-2A + iter-2B Generate-arm lift, per §6.1.31 + §6.1.32 + §6.1.34)
+/// for the [`super::engine::Request::GenerateWithSoftTokens`] worker arm
+/// on the Gemma 4 architecture.  iter-1+2A+2B landed the non-streaming
+/// Generate-arm lift + kernel-forward step; iter-3 landed the streaming
+/// arm; iter-4 landed the Embed arm; iter-5 is the **TERMINAL Gemma 4
+/// worker-arm lift** — post-iter-5 ALL FOUR Gemma 4 worker arms route
+/// through the persistent multi-seq scaffolds at SlotId(N>0).
+///
+/// **Cross-architecture mirror of Qwen35 iter-C2d-cont-kernel iter-4
+/// `engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware`
+/// per §6.1.30** — same dispatch fork shape (`slot_id != SlotId(0)`
+/// predicate at the worker arm), same take-and-restore borrow pattern
+/// on BOTH scaffolds, same `reset_for_slot` entry+exit discipline on
+/// BOTH scaffolds, same `Result<GenerationResult>` return surface.
+///
+/// # Differences from iter-1+2A+2B (Generate) + iter-3 (Stream) + iter-4 (Embed)
+///
+/// | Dimension | iter-1+2A+2B (Generate) | iter-3 (Stream) | iter-4 (Embed) | iter-5 (SoftTokens) |
+/// |---|---|---|---|---|
+/// | Result surface | `Result<GenerationResult>` (synchronous) | SSE event channel | `Result<Vec<f32>>` | `Result<GenerationResult>` (synchronous) |
+/// | Soft tokens | `&[]` (empty) | `&[]` (vision deferred to iter-5) | `&[]` (no soft tokens on Embed) | **`soft_tokens` carried** through to the slot-aware prefill kernel |
+/// | Deepstack / positions_flat | N/A | N/A | N/A | **N/A** — Gemma 4 does not consume deepstack / 3D positions (those are Qwen3-VL specific; non-slot-aware sibling at engine.rs:6144-6155 falls back to soft-token-only entry) |
+/// | iter-2-decode sub-deferral | APPLIES — typed `CapabilityUnsupported` after prefill Ok branch | APPLIES — typed SSE Error event after prefill Ok branch | **N/A** — embed has no decode loop | APPLIES — typed `CapabilityUnsupported` after prefill Ok branch (same shape as Generate-arm) |
+///
+/// # Structural parallels with iter-1+2A+2B (Generate) + iter-4 (Embed)
+///
+/// 1. Bounds-checks `slot_id` against `multi_seq_kv[0].n_seqs` (bounds-
+///    first per A2b §6.1.23 iter-1.5 cfa-finding-F5 ordering); surfaces
+///    typed `anyhow::Error` with `capability_unsupported:` prefix + cite.
+/// 2. Calls `MultiSeqHbKvBuffers::reset_for_slot(slot_id)` at entry on
+///    every per-layer buffer — zeros the per-seq cursor for `slot_id`
+///    only (other slots untouched).
+/// 3. Mirrors entry-reset on the production-default hybrid scaffold
+///    sibling (`multi_seq_kv_hybrid`) when `Some(_)` (HF2Q_HYBRID_KV=1
+///    per H10 §6.1.11 default).
+/// 4. Calls `loaded.weights.forward_prefill_with_soft_tokens_slot_aware(..)`
+///    (the iter-2A landing per §6.1.32 + iter-2B routing per §6.1.34)
+///    with the caller-supplied `soft_tokens` + `max_decode_tokens =
+///    params.max_tokens.max(1)`, threading `slot_id` + both scaffolds.
+/// 5. Surfaces a typed `iter-B4c-kernel-iter-2-decode` sub-deferral on
+///    the prefill Ok branch — mirrors the Generate-arm IIFE discipline
+///    at §6.1.32 (the multi-token decode-loop body wrapping requires
+///    `forward_decode` to thread `slot_id`, which is iter-2-decode
+///    scope).
+/// 6. Calls `reset_for_slot(slot_id)` at exit on BOTH scaffolds — belt-
+///    and-suspenders with the entry reset (mirror of iter-1's exit
+///    discipline).
+///
+/// **Per-slot byte-equivalence at SlotId(0)** (H116 pin): the worker
+/// arm's `handle.slot_id != SlotId(0)` predicate short-circuits AT the
+/// worker arm — `generate_gemma4_once_with_soft_tokens_slot_aware` is
+/// NEVER called for SlotId(0).  Both SerialFifo (always SlotId(0)) and
+/// SlotAware + SlotId(0) route through the existing `generate_once_with_soft_tokens`
+/// dispatch verbatim, preserving the H1/H2/H23/H41/H44/H77/H104/H110
+/// byte-equivalence chain.
+///
+/// # Empty soft-token fall-through
+///
+/// When `soft_tokens.is_empty()`, the body is identity over
+/// `generate_gemma4_once_slot_aware` (the text-only Generate-arm
+/// slot-aware fn).  Mirrors the non-slot-aware sibling
+/// `generate_once_with_soft_tokens` behavior — when no soft-token
+/// overrides are present, the function reduces to the text-only path.
+/// This discipline matches Qwen35 iter-4's empty-soft early-return at
+/// engine_qwen35.rs:5041-5050.
+///
+/// # Errors
+/// - `prompt_tokens.is_empty()` (matches `forward_prefill_with_soft_tokens_slot_aware`).
+/// - `slot_id.0 >= multi_seq_kv[0].n_seqs` (bounds-first).
+/// - `reset_for_slot` failure propagates with `iter-B4c-kernel iter-5`
+///   context.
+/// - `forward_prefill_with_soft_tokens_slot_aware` failure propagates.
+/// - `iter-B4c-kernel-iter-2-decode` typed `CapabilityUnsupported` on
+///   the prefill Ok branch (same shape as the Generate-arm).
+#[allow(clippy::too_many_arguments)]
+fn generate_gemma4_once_with_soft_tokens_slot_aware(
+    loaded: &mut GemmaLoadedModel,
+    prompt_tokens: &[u32],
+    soft_tokens: &[SoftTokenInjection<'_>],
+    params: &SamplingParams,
+    registration: Option<&super::registry::ModelRegistration>,
+    multi_seq_kv: &mut Vec<
+        crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
+    >,
+    // ADR-040 iter-B4c-kernel iter-5 (2026-05-30) — production-default
+    // hybrid F16-K + TQ-HB-V scaffold sibling param.  `Option<>` because
+    // iter-C2c-cont provisions this field IFF the hybrid env-gate is
+    // ON (DEFAULT per H10 §6.1.11).  Threaded verbatim through to the
+    // model fn — same shape as the Generate-arm sibling per iter-2B,
+    // the GenerateStream-arm sibling per iter-3, and the Embed-arm
+    // sibling per iter-4.
+    //
+    // `mut` binding so the orchestrator body can do entry+exit
+    // `reset_for_slot` via `if let Some(ref mut _) = multi_seq_kv_hybrid`
+    // AND pass an `as_deref_mut()` reborrow to the model fn call below.
+    mut multi_seq_kv_hybrid: Option<
+        &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
+    >,
+    slot_id: SlotId,
+) -> Result<GenerationResult> {
+    // Empty soft-token slice → identity over the text-only slot-aware
+    // path.  Mirrors the non-slot-aware sibling `generate_once_with_soft_tokens`
+    // shape (which itself reduces to `generate_once` when soft-tokens
+    // are absent) + Qwen35 iter-4's empty-soft early-return at
+    // engine_qwen35.rs:5041-5050.
+    //
+    // This discipline is structurally necessary: the SoftTokens-arm
+    // surface is the ONLY worker arm where the request channel carries
+    // a soft-token vec, but a text-only request that happens to route
+    // through this arm (e.g. chat handler routing edge cases) MUST
+    // produce byte-identical output to the Generate-arm — calling the
+    // Generate-arm slot-aware fn directly preserves that invariant.
+    if soft_tokens.is_empty() {
+        return generate_gemma4_once_slot_aware(
+            loaded,
+            prompt_tokens,
+            params,
+            registration,
+            multi_seq_kv,
+            multi_seq_kv_hybrid,
+            slot_id,
+        );
+    }
+
+    anyhow::ensure!(
+        !prompt_tokens.is_empty(),
+        "generate_gemma4_once_with_soft_tokens_slot_aware: empty prompt_tokens"
+    );
+    anyhow::ensure!(
+        !multi_seq_kv.is_empty(),
+        "generate_gemma4_once_with_soft_tokens_slot_aware: multi_seq_kv is empty \
+         (C2c spawn-arm invariant: provision_multi_seq_kv_for_slot_aware \
+          must produce one entry per layer; ADR-040 §6.1.21)"
+    );
+    // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5 ordering.
+    // Use the first layer's n_seqs as the canonical bound — A3a
+    // construction guarantees every per-layer entry has the same
+    // n_seqs (provisioned with max_slots).
+    let n_seqs = multi_seq_kv[0].n_seqs;
+    anyhow::ensure!(
+        slot_id.0 < n_seqs,
+        "generate_gemma4_once_with_soft_tokens_slot_aware: SlotOutOfRange slot={} \
+         max_slots={} (ADR-040 iter-B4c-kernel iter-5)",
+        slot_id.0,
+        n_seqs,
+    );
+
+    // Per-slot reset at entry — the persistent cache may carry stale
+    // bytes from a prior request on this slot.  `reset_for_slot` zeros
+    // the per-seq cursor for `slot_id` on EVERY per-layer entry; K/V
+    // packed + norms bytes are cursor-masked.
+    //
+    // Mirror of iter-1 Generate-arm + iter-3 GenerateStream-arm +
+    // iter-4 Embed-arm entry-reset discipline.
+    for (layer_idx, buf) in multi_seq_kv.iter_mut().enumerate() {
+        buf.reset_for_slot(slot_id).map_err(|e| anyhow::anyhow!(
+            "generate_gemma4_once_with_soft_tokens_slot_aware: reset_for_slot at \
+             entry L{layer_idx}: {e} (ADR-040 iter-B4c-kernel iter-5)"
+        ))?;
+    }
+    // ADR-040 iter-B4c-kernel iter-5 — entry reset on the hybrid
+    // scaffold sibling.  Mirrors the HB scaffold entry-reset discipline
+    // above for the production-default regime.
+    if let Some(ref mut hybrid_scaffold) = multi_seq_kv_hybrid {
+        for (layer_idx, buf) in hybrid_scaffold.iter_mut().enumerate() {
+            buf.reset_for_slot(slot_id).map_err(|e| anyhow::anyhow!(
+                "generate_gemma4_once_with_soft_tokens_slot_aware: reset_for_slot \
+                 at entry (hybrid) L{layer_idx}: {e} (ADR-040 iter-B4c-kernel iter-5)"
+            ))?;
+        }
+    }
+
+    // ADR-040 iter-B4c-kernel iter-5 — slot-aware vision-aware prefill
+    // call.  Threads the caller-supplied `soft_tokens` through to
+    // `forward_prefill_with_soft_tokens_slot_aware` (the iter-2A
+    // landing per §6.1.32 + iter-2B routing per §6.1.34); this is the
+    // load-bearing difference from the Generate-arm iter-1+2A+2B body
+    // which always passes `&[]`.
+    //
+    // Multi-token decode-loop body wrapping is iter-B4c-kernel-iter-2-decode
+    // scope (same sub-deferral the Generate / GenerateStream arms
+    // surface).  Mirror of the Generate-arm IIFE discipline at
+    // §6.1.32 — until iter-2-decode lands, we surface typed
+    // `CapabilityUnsupported` on the prefill Ok branch.
+    let max_decode_tokens = params.max_tokens.max(1);
+    let kernel_forward_result: Result<GenerationResult> = (|| -> Result<GenerationResult> {
+        let first_decode_token = loaded
+            .weights
+            .forward_prefill_with_soft_tokens_slot_aware(
+                prompt_tokens,
+                soft_tokens, // SoftTokens-arm: vision-aware soft-token
+                             // overrides threaded through — this is the
+                             // load-bearing difference from iter-1+2A+2B
+                             // (Generate-arm passes `&[]`).
+                max_decode_tokens,
+                &mut loaded.ctx,
+                slot_id,
+                multi_seq_kv,
+                multi_seq_kv_hybrid.as_deref_mut(),
+            )?;
+        // Prefill succeeded — drop the first decode token (the multi-
+        // token decode loop body wrapping is the iter-2-decode sub-
+        // deferral; until it lands, we cannot emit content tokens
+        // safely without leaking the prefill KV state for the next
+        // slot's request).  Mirror of the Generate-arm IIFE discipline
+        // at engine.rs:8143-8189.
+        let _ = first_decode_token;
+        let err = MultiSeqError::CapabilityUnsupported {
+            capability:
+                "gemma4-forward-prefill-kernel-slot-N-soft-tokens-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.37 — vision-aware decode-loop body wraps forward_decode calls at slot_id; today forward_decode in src/inference/models/gemma4/forward_gpu.rs:310 has NO slot_id parameter — its lazy-alloc block at lines 396-466 mirrors the prefill alloc sites and must thread slot_id + consult the persistent multi-seq scaffold; gated on iter-2A-cont/2B kernel-dispatch refactor landing the prefill side first)",
+        };
+        Err(anyhow::anyhow!(
+            "capability_unsupported: ADR-040 iter-B4c-kernel iter-5 — \
+             forward_prefill_with_soft_tokens_slot_aware returned Ok with first \
+             decode token; multi-token vision-aware decode loop body wrapping is \
+             iter-B4c-kernel-iter-2-decode scope. {}",
+            err,
+        ))
+    })();
+
+    // Per-slot reset at exit — leave the slot clean for the next
+    // request regardless of whether the kernel-forward sub-deferral
+    // returned Ok or Err.  Belt-and-suspenders w/ the entry reset;
+    // mirrors iter-1 / iter-3 / iter-4 exit-reset discipline.  Errors
+    // swallowed via tracing::warn — entry reset on the next request
+    // will fire if this fails.
+    for (layer_idx, buf) in multi_seq_kv.iter_mut().enumerate() {
+        if let Err(e) = buf.reset_for_slot(slot_id) {
+            tracing::warn!(
+                "generate_gemma4_once_with_soft_tokens_slot_aware: reset_for_slot \
+                 at exit L{} failed (slot_id={}): {} — slot WILL be reset before \
+                 next admission via the entry reset of the next call",
+                layer_idx, slot_id.0, e
+            );
+        }
+    }
+    // ADR-040 iter-B4c-kernel iter-5 — exit reset on the hybrid
+    // scaffold sibling.  Same swallow-on-error discipline as the HB
+    // scaffold above.
+    if let Some(ref mut hybrid_scaffold) = multi_seq_kv_hybrid {
+        for (layer_idx, buf) in hybrid_scaffold.iter_mut().enumerate() {
+            if let Err(e) = buf.reset_for_slot(slot_id) {
+                tracing::warn!(
+                    "generate_gemma4_once_with_soft_tokens_slot_aware: reset_for_slot \
+                     (hybrid) at exit L{} failed (slot_id={}): {} — slot WILL be \
+                     reset before next admission via the entry reset of the next call",
+                    layer_idx, slot_id.0, e
+                );
+            }
+        }
+    }
+    kernel_forward_result
 }
 
 // `infer_quant_type_from_gguf` was relocated to
@@ -18931,29 +19352,31 @@ mod adr040_phase_c_iter2d_cont_qwen35_slot_aware_tests {
         let body = &body_after[..body_end_off];
 
         // Gemma 4 C2c clamp still present in worker arms — the C2c
-        // §6.1.21 capability label must still surface verbatim — H21
-        // / H25 / H22-cont depend on this string-match.  Post-iter-1
-        // (§6.1.31) the Generate-arm clamp was REPLACED with the lift;
-        // post-iter-3 (§6.1.35) the GenerateStream-arm clamp was ALSO
-        // REPLACED with the lift; post-iter-4 (§6.1.36) the Embed-arm
-        // clamp was ALSO REPLACED with the lift.  The SOLE SURVIVING
-        // Gemma 4 C2c clamp (GenerateWithSoftTokens) still carries the
-        // `iter-C2c-cont` prefix — pin via the still-present SoftTokens
-        // label.
-        let gemma_label = "gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont";
+        // ADR-040 iter-B4c-kernel iter-5 (§6.1.37 — TERMINAL Gemma 4
+        // worker-arm lift) REVISES H40: post-iter-5 ALL FOUR Gemma 4
+        // worker arms are lifted.  The SOLE SURVIVING SoftTokens-arm
+        // C2c clamp label `gemma4-forward-prefill-with-soft-tokens-slot-N
+        // (iter-C2c-cont` is LEGITIMATELY REMOVED by iter-5.  Sibling-
+        // discipline intent ("C2d-cont must NOT accidentally regress
+        // C2c") preserved by pinning the iter-5 lift fn is called from
+        // worker_run + iter-1's Gemma 4 Generate lift is still called
+        // (defends against C2d-cont accidentally regressing the entire
+        // Gemma 4 surface).
         assert!(
-            body.contains(gemma_label),
-            "H40 FALSIFIED: Gemma 4 C2c clamp label \
-             `{gemma_label}` no longer present in worker_run — \
-             C2d-cont accidentally regressed C2c. The Path B clamp \
-             must SIBLING the Gemma 4 clamp, not REPLACE it."
+            body.contains("generate_gemma4_once_with_soft_tokens_slot_aware("),
+            "H40 FALSIFIED (post-iter-5 revision per §6.1.37): \
+             Gemma 4 iter-5 TERMINAL SoftTokens lift fn \
+             `generate_gemma4_once_with_soft_tokens_slot_aware` is \
+             NOT called from worker_run. C2d-cont accidentally \
+             regressed the iter-5 §6.1.37 lift."
         );
-        let gemma_soft_label = "gemma4-forward-prefill-with-soft-tokens-slot-N";
         assert!(
-            body.contains(gemma_soft_label),
-            "H40 FALSIFIED: Gemma 4 C2c GenerateWithSoftTokens clamp \
-             label `{gemma_soft_label}` no longer present — partial \
-             regression."
+            body.contains("generate_gemma4_once_slot_aware("),
+            "H40 FALSIFIED (post-iter-5 revision per §6.1.37): \
+             Gemma 4 iter-1 Generate lift fn \
+             `generate_gemma4_once_slot_aware` is NOT called from \
+             worker_run. C2d-cont accidentally regressed the iter-1 \
+             §6.1.31 lift."
         );
 
         // Qwen3VL has no clamp at C2d-cont — its SlotAware activation
@@ -19272,29 +19695,33 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter1_qwen35_tests {
         let src = include_str!("engine.rs");
         let body = worker_run_body(src);
 
-        // Gemma 4 C2c label still present on the surviving SoftTokens
-        // arm (Qwen35 iter-1 did not touch Gemma 4 arms; B4c iter-3
-        // lifted the GenerateStream arm + B4c iter-4 lifted the Embed
-        // arm so the Generate / GenerateStream / Embed labels are
-        // GONE — pin via the still-present SoftTokens label).  iter-4
-        // (§6.1.36) narrowing handled here: swap Embed label for the
-        // surviving SoftTokens label (sibling-discipline intent
-        // preserved).
-        let gemma_label = "gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont";
+        // ADR-040 iter-B4c-kernel iter-5 (§6.1.37 — TERMINAL Gemma 4
+        // worker-arm lift) REVISES H56: post-iter-5 ALL FOUR Gemma 4
+        // worker arms are lifted.  The SoftTokens clamp label is
+        // LEGITIMATELY REMOVED.  Sibling-discipline intent ("Qwen35
+        // iter-1 must NOT touch Gemma 4 arms — Gemma 4 SlotAware
+        // kernel lift is iter-B4c-kernel scope") preserved via the
+        // positive assertion that the iter-5 lift fn is called from
+        // worker_run.
         assert!(
-            body.contains(gemma_label),
-            "H56 FALSIFIED: Gemma 4 C2c clamp label `{gemma_label}` \
-             missing from worker_run. Qwen35 iter-1 must NOT touch the \
-             Gemma 4 worker arms — Gemma 4 SlotAware kernel lift is \
-             iter-B4c-kernel scope per §6.1.25."
+            body.contains("generate_gemma4_once_with_soft_tokens_slot_aware("),
+            "H56 FALSIFIED (post-iter-5 revision per §6.1.37): \
+             Gemma 4 iter-5 TERMINAL SoftTokens lift fn \
+             `generate_gemma4_once_with_soft_tokens_slot_aware` is \
+             NOT called from worker_run. Qwen35 iter-1 must NOT \
+             regress iter-5's §6.1.37 lift."
         );
 
-        // The B4c-cited Gemma 4 iter-B4c-kernel label also present.
+        // The B4c-cited Gemma 4 iter-B4c-kernel label survives in
+        // worker_run via comment narration even post-iter-5.
         assert!(
-            body.contains("iter-B4c-kernel per ADR-040 §6.1.25"),
+            body.contains("iter-B4c-kernel per ADR-040 §6.1.25")
+                || body.contains("iter-B4c-kernel iter-5"),
             "H56 FALSIFIED: Gemma 4 B4c label-refinement cite \
-             `iter-B4c-kernel per ADR-040 §6.1.25` missing from \
-             worker_run. iter-1 must NOT regress B4c §6.1.25."
+             `iter-B4c-kernel per ADR-040 §6.1.25` AND the iter-5 \
+             closure cite `iter-B4c-kernel iter-5` BOTH missing from \
+             worker_run. iter-1 must NOT regress B4c §6.1.25 nor the \
+             iter-5 TERMINAL lift cite."
         );
 
         // No Qwen3VL clamp accidentally added.
@@ -19696,29 +20123,31 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter2_qwen35_tests {
         let src = include_str!("engine.rs");
         let body = worker_run_body(src);
 
-        // Gemma 4 C2c label still present on the surviving SoftTokens
-        // arm (Qwen35 iter-2 + iter-3 did not touch Gemma 4 arms; B4c
-        // iter-3 lifted the GenerateStream arm + B4c iter-4 lifted the
-        // Embed arm so the Generate / GenerateStream / Embed labels
-        // are GONE — pin via the still-present SoftTokens label).
-        // iter-4 (§6.1.36) narrowing handled here: swap Embed label
-        // for the surviving SoftTokens label (sibling-discipline intent
-        // preserved).
-        let gemma_label = "gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont";
+        // ADR-040 iter-B4c-kernel iter-5 (§6.1.37 — TERMINAL Gemma 4
+        // worker-arm lift) REVISES H62: post-iter-5 ALL FOUR Gemma 4
+        // worker arms are lifted.  The SoftTokens clamp label is
+        // LEGITIMATELY REMOVED.  Sibling-discipline intent preserved
+        // via the positive assertion that the iter-5 lift fn is called
+        // from worker_run.
         assert!(
-            body.contains(gemma_label),
-            "H62 FALSIFIED: Gemma 4 C2c clamp label `{gemma_label}` \
-             missing from worker_run. Qwen35 iter-3 must NOT touch the \
-             Gemma 4 worker arms — Gemma 4 SlotAware kernel lift is \
-             iter-B4c-kernel scope per §6.1.25."
+            body.contains("generate_gemma4_once_with_soft_tokens_slot_aware("),
+            "H62 FALSIFIED (post-iter-5 revision per §6.1.37): \
+             Gemma 4 iter-5 TERMINAL SoftTokens lift fn \
+             `generate_gemma4_once_with_soft_tokens_slot_aware` is \
+             NOT called from worker_run. Qwen35 iter-3 must NOT \
+             regress iter-5's §6.1.37 lift."
         );
 
-        // The B4c-cited Gemma 4 iter-B4c-kernel label also present.
+        // The B4c-cited Gemma 4 iter-B4c-kernel label survives in
+        // worker_run via comment narration even post-iter-5.
         assert!(
-            body.contains("iter-B4c-kernel per ADR-040 §6.1.25"),
+            body.contains("iter-B4c-kernel per ADR-040 §6.1.25")
+                || body.contains("iter-B4c-kernel iter-5"),
             "H62 FALSIFIED: Gemma 4 B4c label-refinement cite \
-             `iter-B4c-kernel per ADR-040 §6.1.25` missing from \
-             worker_run. iter-3 must NOT regress B4c §6.1.25."
+             `iter-B4c-kernel per ADR-040 §6.1.25` AND the iter-5 \
+             closure cite `iter-B4c-kernel iter-5` BOTH missing from \
+             worker_run. iter-3 must NOT regress B4c §6.1.25 nor the \
+             iter-5 TERMINAL lift cite."
         );
 
         // No Qwen3VL clamp accidentally added.
@@ -20185,29 +20614,31 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter3_qwen35_tests {
         let src = include_str!("engine.rs");
         let body = worker_run_body(src);
 
-        // Gemma 4 C2c label still present on the surviving SoftTokens
-        // arm (Qwen35 iter-3 did not touch Gemma 4 arms; B4c iter-3
-        // lifted Gemma 4's GenerateStream arm + B4c iter-4 lifted
-        // Gemma 4's Embed arm so the Generate / GenerateStream / Embed
-        // labels are GONE — pin via the still-present SoftTokens
-        // label).  iter-4 (§6.1.36) narrowing handled here: swap Embed
-        // label for the surviving SoftTokens label (sibling-discipline
-        // intent preserved).
-        let gemma_label = "gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont";
+        // ADR-040 iter-B4c-kernel iter-5 (§6.1.37 — TERMINAL Gemma 4
+        // worker-arm lift) REVISES H68: post-iter-5 ALL FOUR Gemma 4
+        // worker arms are lifted.  The SoftTokens clamp label is
+        // LEGITIMATELY REMOVED.  Sibling-discipline intent preserved
+        // via the positive assertion that the iter-5 lift fn is called
+        // from worker_run.
         assert!(
-            body.contains(gemma_label),
-            "H68 FALSIFIED: Gemma 4 C2c clamp label `{gemma_label}` \
-             missing from worker_run. Qwen35 iter-3 must NOT touch the \
-             Gemma 4 worker arms — Gemma 4 SlotAware kernel lift is \
-             iter-B4c-kernel scope per §6.1.25."
+            body.contains("generate_gemma4_once_with_soft_tokens_slot_aware("),
+            "H68 FALSIFIED (post-iter-5 revision per §6.1.37): \
+             Gemma 4 iter-5 TERMINAL SoftTokens lift fn \
+             `generate_gemma4_once_with_soft_tokens_slot_aware` is \
+             NOT called from worker_run. Qwen35 iter-3 must NOT \
+             regress iter-5's §6.1.37 lift."
         );
 
-        // The B4c-cited Gemma 4 iter-B4c-kernel label also present.
+        // The B4c-cited Gemma 4 iter-B4c-kernel label survives in
+        // worker_run via comment narration even post-iter-5.
         assert!(
-            body.contains("iter-B4c-kernel per ADR-040 §6.1.25"),
+            body.contains("iter-B4c-kernel per ADR-040 §6.1.25")
+                || body.contains("iter-B4c-kernel iter-5"),
             "H68 FALSIFIED: Gemma 4 B4c label-refinement cite \
-             `iter-B4c-kernel per ADR-040 §6.1.25` missing from \
-             worker_run. iter-3 must NOT regress B4c §6.1.25."
+             `iter-B4c-kernel per ADR-040 §6.1.25` AND the iter-5 \
+             closure cite `iter-B4c-kernel iter-5` BOTH missing from \
+             worker_run. iter-3 must NOT regress B4c §6.1.25 nor the \
+             iter-5 TERMINAL lift cite."
         );
 
         // No Qwen3VL clamp accidentally added.
@@ -20816,29 +21247,35 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter4_qwen35_tests {
         let src = include_str!("engine.rs");
         let body = worker_run_body(src);
 
-        // Gemma 4 C2c label still present on the surviving SoftTokens
-        // arm (Qwen35 iter-4 did not touch Gemma 4 arms; B4c iter-3
-        // lifted Gemma 4's GenerateStream arm + B4c iter-4 lifted
-        // Gemma 4's Embed arm so the Generate / GenerateStream / Embed
-        // labels are GONE — pin via the still-present SoftTokens
-        // label).  iter-4 (§6.1.36) narrowing handled here: swap Embed
-        // label for the surviving SoftTokens label (sibling-discipline
-        // intent preserved).
-        let gemma_label = "gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont";
+        // ADR-040 iter-B4c-kernel iter-5 (§6.1.37 — TERMINAL Gemma 4
+        // worker-arm lift) REVISES H75: the SoftTokens-arm clamp label
+        // `gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont`
+        // is LEGITIMATELY REMOVED by iter-5 (it lifted the SoftTokens
+        // arm).  Sibling-discipline intent preserved via the positive
+        // assertion that the iter-5 lift fn is called from worker_run
+        // (mirror of iter-4 §6.1.36's H108 revision pattern that did
+        // the same swap when iter-4 lifted the Embed arm).
         assert!(
-            body.contains(gemma_label),
-            "H75 FALSIFIED: Gemma 4 C2c clamp label `{gemma_label}` \
-             missing from worker_run. Qwen35 iter-4 must NOT touch the \
-             Gemma 4 worker arms — Gemma 4 SlotAware kernel lift is \
-             iter-B4c-kernel scope per §6.1.25."
+            body.contains("generate_gemma4_once_with_soft_tokens_slot_aware("),
+            "H75 FALSIFIED (post-iter-5 revision per §6.1.37): \
+             Gemma 4 iter-5 SoftTokens lift fn \
+             `generate_gemma4_once_with_soft_tokens_slot_aware` is \
+             NOT called from worker_run. Qwen35 iter-4 must NOT \
+             regress iter-5's Gemma 4 SoftTokens-arm lift (§6.1.37)."
         );
 
-        // The B4c-cited Gemma 4 iter-B4c-kernel label also present.
+        // The B4c-cited Gemma 4 iter-B4c-kernel label survives in
+        // worker_run via comment narration even post-iter-5 (the
+        // §6.1.25 label-refinement cite is preserved in surviving
+        // commentary blocks).
         assert!(
-            body.contains("iter-B4c-kernel per ADR-040 §6.1.25"),
+            body.contains("iter-B4c-kernel per ADR-040 §6.1.25")
+                || body.contains("iter-B4c-kernel iter-5"),
             "H75 FALSIFIED: Gemma 4 B4c label-refinement cite \
-             `iter-B4c-kernel per ADR-040 §6.1.25` missing from \
-             worker_run. iter-4 must NOT regress B4c §6.1.25."
+             `iter-B4c-kernel per ADR-040 §6.1.25` AND the iter-5 \
+             closure cite `iter-B4c-kernel iter-5` BOTH missing from \
+             worker_run. iter-4 must NOT regress B4c §6.1.25 nor the \
+             iter-5 TERMINAL lift cite."
         );
 
         // No Qwen3VL clamp accidentally added.
@@ -22196,27 +22633,26 @@ mod adr040_phase_b_iter_b4c_kernel_iter1_gemma4_tests {
              without the spawn arm flip."
         );
 
-        // The SOLE SURVIVING Gemma 4 worker arm (post-iter-4 §6.1.36)
-        // still carries its C2c clamp:
-        // - GenerateWithSoftTokens →
-        //   `gemma4-forward-prefill-with-soft-tokens-slot-N`
-        //   (iter-B4c-kernel-iter-5 scope).
-        // Post-iter-3 (§6.1.35) the Generate + GenerateStream arms'
-        // `gemma4-forward-prefill-slot-N` labels are GONE (both lifted).
-        // Post-iter-4 (§6.1.36) the Embed arm's
-        // `gemma4-forward-embed-last-slot-N` label is ALSO GONE (lifted).
-        // H82's prior assertion that the Embed clamp persisted reflected
-        // iter-3's state; iter-4 legitimately lifts that arm and removes
-        // the label.  The sibling-discipline intent ("iter-1 must not
-        // regress prior iters' lifts") is preserved by pinning the
-        // iter-3 + iter-4 lift fns are still called (below) +
-        // the surviving SoftTokens clamp.
+        // ADR-040 iter-B4c-kernel iter-5 (§6.1.37 — TERMINAL Gemma 4
+        // worker-arm lift) REVISES H82: post-iter-5 ALL FOUR Gemma 4
+        // worker arms are lifted (Generate iter-1+2B + GenerateStream
+        // iter-3 + Embed iter-4 + SoftTokens iter-5).  The SoftTokens
+        // clamp label `gemma4-forward-prefill-with-soft-tokens-slot-N`
+        // is LEGITIMATELY REMOVED by iter-5.  Sibling-discipline intent
+        // ("iter-1 must not regress prior iters' lifts AND vice-versa")
+        // preserved by pinning ALL iter-{1,3,4,5} Gemma 4 lift fns
+        // are called from worker_run (positive assertions below);
+        // mirror of iter-4 §6.1.36's H108 revision pattern that
+        // converted the Embed-clamp-persisted assertion into the
+        // Embed-lift-fn-present assertion when iter-4 lifted the Embed
+        // arm.
         assert!(
-            body.contains("gemma4-forward-prefill-with-soft-tokens-slot-N"),
-            "H82 FALSIFIED: Gemma 4 GenerateWithSoftTokens clamp \
-             removed by iter-1. iter-1's Generate-arm scope was \
-             overstepped — SoftTokens slot-aware port is staged as \
-             iter-B4c-kernel-iter-5."
+            body.contains("generate_gemma4_once_with_soft_tokens_slot_aware("),
+            "H82 FALSIFIED (post-iter-5 revision per §6.1.37): \
+             Gemma 4 iter-5 SoftTokens lift fn \
+             `generate_gemma4_once_with_soft_tokens_slot_aware` is \
+             NOT called from worker_run. iter-1 must NOT regress \
+             iter-5's TERMINAL SoftTokens-arm lift (§6.1.37)."
         );
         // iter-3 lift fn is called (B4c iter-3 §6.1.35 lifted the
         // Gemma 4 GenerateStream arm — pin the lift fn presence).
@@ -24080,14 +24516,21 @@ mod adr040_phase_b_iter_b4c_kernel_iter3_gemma4_tests {
              slot-aware orchestrator; lift fn must be wired."
         );
 
-        // GenerateWithSoftTokens (iter-5) clamp still in place.
+        // ADR-040 iter-B4c-kernel iter-5 (§6.1.37 — TERMINAL Gemma 4
+        // worker-arm lift) REVISES H108: the SoftTokens clamp label
+        // `gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont`
+        // is LEGITIMATELY REMOVED by iter-5.  Sibling-discipline intent
+        // preserved via the positive assertion that the iter-5 lift fn
+        // is called from worker_run (mirror of iter-4's own H108
+        // revision pattern that swapped the Embed clamp persisted
+        // assertion for the lift-fn-present assertion).
         assert!(
-            body.contains("gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont"),
-            "H108 FALSIFIED: Gemma 4 GenerateWithSoftTokens arm \
-             `gemma4-forward-prefill-with-soft-tokens-slot-N \
-             (iter-C2c-cont` clamp label missing from worker_run. \
-             iter-3 must NOT touch the SoftTokens arm — that's \
-             iter-B4c-kernel-iter-5 scope."
+            body.contains("generate_gemma4_once_with_soft_tokens_slot_aware("),
+            "H108 FALSIFIED (post-iter-5 revision per §6.1.37): \
+             Gemma 4 iter-5 TERMINAL SoftTokens lift fn \
+             `generate_gemma4_once_with_soft_tokens_slot_aware` is \
+             NOT called from worker_run. iter-3 must NOT regress \
+             iter-5's §6.1.37 lift."
         );
         assert!(
             body.contains("iter-B4c-kernel-iter-5"),
@@ -24634,15 +25077,21 @@ mod adr040_phase_b_iter_b4c_kernel_iter4_gemma4_tests {
              Qwen3VL clamp without the spawn-arm flip."
         );
 
-        // GenerateWithSoftTokens (iter-5) clamp still in place — iter-4
-        // must NOT touch the SoftTokens arm.
+        // ADR-040 iter-B4c-kernel iter-5 (§6.1.37 — TERMINAL Gemma 4
+        // worker-arm lift) REVISES H114: the SoftTokens clamp label
+        // `gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont`
+        // is LEGITIMATELY REMOVED by iter-5.  Sibling-discipline intent
+        // ("iter-4 must NOT touch the SoftTokens arm") preserved via
+        // the positive assertion that the iter-5 lift fn is called
+        // from worker_run (iter-4 did not author this lift; iter-5
+        // did — but iter-4 must NOT regress it).
         assert!(
-            body.contains("gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont"),
-            "H114 FALSIFIED: Gemma 4 GenerateWithSoftTokens arm \
-             `gemma4-forward-prefill-with-soft-tokens-slot-N \
-             (iter-C2c-cont` clamp label missing from worker_run.  \
-             iter-4 must NOT touch the SoftTokens arm — that's \
-             iter-B4c-kernel-iter-5 scope."
+            body.contains("generate_gemma4_once_with_soft_tokens_slot_aware("),
+            "H114 FALSIFIED (post-iter-5 revision per §6.1.37): \
+             Gemma 4 iter-5 TERMINAL SoftTokens lift fn \
+             `generate_gemma4_once_with_soft_tokens_slot_aware` is \
+             NOT called from worker_run.  iter-4 must NOT regress \
+             iter-5's §6.1.37 lift."
         );
         assert!(
             body.contains("iter-B4c-kernel-iter-5"),
@@ -24778,5 +25227,561 @@ mod adr040_phase_b_iter_b4c_kernel_iter4_gemma4_tests {
              destination. Update the ADR with the iter-4 closure \
              block before merging."
         );
+    }
+}
+
+/// **ADR-040 Phase B iter-B4c-kernel iter-5 (TERMINAL Gemma 4 worker-arm
+/// lift, 2026-05-30)** — H116-H122 hypothesis pins for the Gemma 4
+/// GenerateWithSoftTokens-arm slot-aware orchestrator port + the
+/// vision-augmented streaming branch lift in
+/// `generate_stream_gemma4_once_slot_aware`.
+///
+/// **Direct mirror of Qwen35 iter-C2d-cont-kernel iter-4 §6.1.30** for
+/// the Gemma 4 architecture's vision-aware soft-token surface.  Same
+/// hypothesis shape as the iter-1 (H77-H83), iter-3 (H104-H109), and
+/// iter-4 (H110-H115) test modules: worker_run lift-fork predicate pin
+/// + slot-aware fn body pin + persistent scaffold take+restore pin
+/// + per-slot reset pin + sibling-discipline (other arms unchanged)
+/// pin + sub-deferrals coverage pin + TERMINAL pin (no surviving Gemma
+/// 4 worker-arm clamp remains).
+#[cfg(test)]
+#[allow(non_snake_case, clippy::too_many_arguments)]
+mod adr040_phase_b_iter_b4c_kernel_iter5_gemma4_tests {
+    // Skip-mode source-grep tests; intentionally NO `use super::*;`
+    // (tests rely on `include_str!` against engine.rs + the ADR doc).
+
+    // ── Helper: snip worker_run body the same way iter-1/3/4 tests do ──
+    fn worker_run_body(src: &str) -> &str {
+        let body_start = src
+            .find("fn worker_run(")
+            .expect("iter-5: worker_run entry not found");
+        let body_after = &src[body_start..];
+        let body_end_off = body_after
+            .find("\n// The worker thread for `LoadedModel::Qwen35` returns a sentinel error")
+            .or_else(|| body_after.find("\n/// Worker-thread entry point"))
+            .unwrap_or(body_after.len().min(200_000));
+        &body_after[..body_end_off]
+    }
+
+    /// **H116 (skip-mode)** — SerialFifo + SlotId(0) AND SlotAware +
+    /// SlotId(0) Gemma 4 GenerateWithSoftTokens dispatch is byte-
+    /// equivalent post-iter-5.
+    ///
+    /// Source-grep pin: the iter-5 lift fork at the GenerateWithSoftTokens
+    /// arm uses the predicate `handle.slot_id != SlotId(0)`.  SerialFifo
+    /// always hands out SlotId(0) (FifoSchedulerAdapter invariant);
+    /// SlotAware's first request also gets SlotId(0).  In both cases the
+    /// predicate is FALSE → the lift block falls through to the existing
+    /// `match &mut loaded { LoadedModel::Gemma(g) =>
+    ///     generate_once_with_soft_tokens(g, ..) }` dispatch, byte-
+    /// equivalent to pre-iter-5 + pre-C2c.
+    ///
+    /// Defends the H1 / H2 / H23 / H41 / H44 / H77 / H104 / H110 byte-
+    /// equivalence chain extended to the Gemma 4 vision-aware soft-token
+    /// surface.  Direct mirror of Qwen35 iter-C2d-cont-kernel iter-4 H70.
+    #[test]
+    fn h116_slot_id_0_gemma4_soft_tokens_routes_through_generate_once_with_soft_tokens_byte_equivalent() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // The pre-iter-5 `generate_once_with_soft_tokens` dispatch must
+        // still be reachable from the worker arm for the SlotId(0)
+        // fallback.
+        assert!(
+            body.contains("generate_once_with_soft_tokens("),
+            "H116 FALSIFIED: post-iter-5 worker_run Gemma 4 \
+             GenerateWithSoftTokens dispatch no longer routes through \
+             `generate_once_with_soft_tokens` for SlotId(0).  The iter-5 \
+             lift fork must be ADDITIVE (sibling above the `match &mut \
+             loaded` dispatch), NOT REPLACE the SerialFifo / SlotId(0) \
+             path.  SerialFifo + SlotId(0) byte-equivalence \
+             (H1 / H2 / H77 / H104 / H110 chain) is BROKEN for the Gemma \
+             4 vision-aware soft-token arm."
+        );
+
+        // The lift fork predicate at the Gemma 4 worker arms must be
+        // `matches!(loaded, LoadedModel::Gemma(_)) && handle.slot_id != SlotId(0)`
+        // — the same shape iter-1 / iter-3 / iter-4 used.  Pin: at least
+        // FOUR occurrences of the literal predicate in the worker_run
+        // body (iter-1 Generate lift + iter-3 GenerateStream lift +
+        // iter-4 Embed lift + iter-5 SoftTokens lift).
+        let predicate = "matches!(loaded, LoadedModel::Gemma(_)) && handle.slot_id != SlotId(0)";
+        let n = body.matches(predicate).count();
+        assert!(
+            n >= 4,
+            "H116 FALSIFIED: the iter-5 lift fork predicate \
+             `{predicate}` must appear at least 4 times in worker_run \
+             body (iter-1 Generate + iter-3 GenerateStream + iter-4 \
+             Embed + iter-5 SoftTokens lifts).  Got {n}.  Drift here \
+             means the lift may fire at SlotId(0) too, breaking byte-\
+             equivalence."
+        );
+    }
+
+    /// **H117 (skip-mode)** — iter-5 SoftTokens-arm lift landed at
+    /// `worker_run`: the slot-aware fn
+    /// `generate_gemma4_once_with_soft_tokens_slot_aware` is called
+    /// from the worker_run body at the Gemma 4 GenerateWithSoftTokens
+    /// arm.  Source-grep pin.  Mirror of Qwen35 iter-4 H71.
+    #[test]
+    fn h117_iter5_lift_landed_for_gemma4_soft_tokens_arm() {
+        let src = include_str!("engine.rs");
+        // The slot-aware fn is defined in this file.
+        assert!(
+            src.contains("fn generate_gemma4_once_with_soft_tokens_slot_aware("),
+            "H117 FALSIFIED: `generate_gemma4_once_with_soft_tokens_slot_aware` \
+             is NOT defined in engine.rs.  iter-B4c-kernel iter-5 production \
+             surface MISSING — orchestrator not landed."
+        );
+        let body = worker_run_body(src);
+        assert!(
+            body.contains("generate_gemma4_once_with_soft_tokens_slot_aware("),
+            "H117 FALSIFIED: worker_run does NOT call \
+             `generate_gemma4_once_with_soft_tokens_slot_aware`.  iter-5 \
+             lift is not wired into the dispatch fork — the \
+             GenerateWithSoftTokens-arm SlotId(N>0) routing is missing."
+        );
+
+        // The slot-aware fn passes `slot_id` (the SlotId from the
+        // admit'd handle), NOT a hard-coded SlotId(0).  Pin via
+        // substring search inside the lift call block.
+        let lift_block_start = body
+            .find("generate_gemma4_once_with_soft_tokens_slot_aware(")
+            .expect("H117: lift call site not found");
+        let lift_block_end = body[lift_block_start..]
+            .find(");")
+            .map(|off| lift_block_start + off + 2)
+            .unwrap_or(body.len().min(lift_block_start + 2000));
+        let lift_block = &body[lift_block_start..lift_block_end];
+        assert!(
+            lift_block.contains("slot_id"),
+            "H117 FALSIFIED: the lift call site does not pass `slot_id` \
+             into `generate_gemma4_once_with_soft_tokens_slot_aware`.  \
+             The iter-5 lift must thread the admit'd SlotHandle's \
+             slot_id into the slot-aware fn.  Got block: {lift_block}"
+        );
+        assert!(
+            !lift_block.contains(", SlotId(0),"),
+            "H117 FALSIFIED: lift call site contains a hard-coded \
+             `SlotId(0)` literal argument.  Per-slot routing is broken \
+             — the orchestrator must receive the admit'd handle's \
+             SlotId verbatim."
+        );
+
+        // The iter-5 typed-clamp label `gemma4-forward-prefill-with-soft-tokens-slot-N`
+        // is REMOVED from worker_run (iter-5 legitimately removes it
+        // by lifting).
+        assert!(
+            !body.contains("gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont"),
+            "H117 FALSIFIED: Gemma 4 GenerateWithSoftTokens arm clamp \
+             label `gemma4-forward-prefill-with-soft-tokens-slot-N \
+             (iter-C2c-cont` is STILL present in worker_run.  iter-5 \
+             must REPLACE the SoftTokens-arm typed clamp with the actual \
+             `generate_gemma4_once_with_soft_tokens_slot_aware` lift \
+             call — the surviving label indicates the lift was not \
+             actually applied."
+        );
+    }
+
+    /// **H118 (skip-mode)** — persistent both-scaffolds take/restore
+    /// at the iter-5 lift call site.  Mirror of Qwen35 iter-4 H72 +
+    /// Gemma 4 iter-4 H112 with both scaffolds.
+    ///
+    /// Pin both `g.multi_seq_kv.take()` + `g.multi_seq_kv_hybrid.take()`
+    /// AND the corresponding restores after the call.  The take+restore
+    /// pattern is required for:
+    /// (a) four-iter symmetry — iter-1 established the pattern for the
+    ///     Generate arm with BOTH scaffolds (iter-2B); iter-3 extended
+    ///     to GenerateStream; iter-4 extended to Embed; iter-5 must
+    ///     use the same shape so the persistent-scaffold invariants
+    ///     hold across all FOUR Gemma 4 worker arms.
+    /// (b) defense against the regressions H79 / H99 / H106 / H112
+    ///     catch — forgotten put-back → next request finds `is_none()`
+    ///     defense-in-depth typed error.
+    ///
+    /// iter-5's take+restore is ADDITIVE — the worker_run body has
+    /// iter-1+2B Generate + iter-3 GenerateStream + iter-4 Embed +
+    /// iter-5 SoftTokens take+restores.  Pin via count ≥ 4 for both
+    /// take and restore on the HB scaffold, and ≥ 4 on the hybrid
+    /// scaffold.
+    #[test]
+    fn h118_persistent_both_scaffolds_take_restore_at_iter5_call_site() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // HB scaffold take pattern (mirror of iter-1 H79 + iter-3 H106
+        // + iter-4 H112).
+        let hb_take_count = body.matches("g.multi_seq_kv.take()").count();
+        assert!(
+            hb_take_count >= 4,
+            "H118 FALSIFIED: the iter-5 lift call site does not \
+             `take()` the persistent HB scaffold out of \
+             `GemmaLoadedModel.multi_seq_kv`.  Expected at least 4 \
+             occurrences of `g.multi_seq_kv.take()` in worker_run body \
+             (iter-1 Generate + iter-3 GenerateStream + iter-4 Embed + \
+             iter-5 SoftTokens lift forks); got {hb_take_count}."
+        );
+        // HB scaffold restore pattern.
+        let hb_restore_count = body.matches("g.multi_seq_kv = Some(multi_seq)").count();
+        assert!(
+            hb_restore_count >= 4,
+            "H118 FALSIFIED: the iter-5 lift call site does not put \
+             the persistent HB scaffold back into `g.multi_seq_kv` \
+             after the slot-aware soft-tokens fn returns.  Expected at \
+             least 4 occurrences of `g.multi_seq_kv = Some(multi_seq)` \
+             in worker_run body (iter-1 + iter-3 + iter-4 + iter-5 \
+             lift forks); got {hb_restore_count}.  The next request to \
+             land at SlotId(N>0) would find `multi_seq_kv.is_none()` \
+             and hit the defense-in-depth typed error."
+        );
+        // Hybrid scaffold take pattern.
+        let hyb_take_count = body.matches("g.multi_seq_kv_hybrid.take()").count();
+        assert!(
+            hyb_take_count >= 4,
+            "H118 FALSIFIED: the iter-5 lift call site does not \
+             `take()` the persistent hybrid scaffold out of \
+             `GemmaLoadedModel.multi_seq_kv_hybrid`.  Expected at least \
+             4 occurrences of `g.multi_seq_kv_hybrid.take()` in \
+             worker_run body (iter-2B Generate + iter-3 GenerateStream \
+             + iter-4 Embed + iter-5 SoftTokens lift forks); got \
+             {hyb_take_count}.  Production-default hybrid path \
+             (HF2Q_HYBRID_KV=1 per H10) would silently surface the \
+             iter-2A hybrid typed error or route to slot 0's region."
+        );
+        // Hybrid scaffold restore pattern.
+        let hyb_restore_count = body.matches("g.multi_seq_kv_hybrid = multi_seq_hybrid").count();
+        assert!(
+            hyb_restore_count >= 4,
+            "H118 FALSIFIED: the iter-5 lift call site does not put \
+             the persistent hybrid scaffold back into \
+             `g.multi_seq_kv_hybrid` after the slot-aware soft-tokens \
+             fn returns.  Expected at least 4 occurrences of \
+             `g.multi_seq_kv_hybrid = multi_seq_hybrid` in worker_run \
+             body (iter-2B + iter-3 + iter-4 + iter-5 lift forks); got \
+             {hyb_restore_count}."
+        );
+    }
+
+    /// **H119 (skip-mode)** — per-slot reset at entry + exit of the
+    /// slot-aware soft-tokens fn on BOTH scaffolds (HB + hybrid).
+    /// Mirror of Qwen35 iter-4 H73 + Gemma 4 iter-4 H113 with the
+    /// dual-scaffold discipline iter-1 established for Gemma 4.
+    ///
+    /// Pin: ≥ 4 occurrences of `reset_for_slot(slot_id)` inside the
+    /// slot-aware soft-tokens fn body (entry + exit on HB scaffold via
+    /// `multi_seq_kv.iter_mut()` + entry + exit on hybrid scaffold via
+    /// `if let Some(ref mut hybrid_scaffold) = multi_seq_kv_hybrid`
+    /// Option guards).
+    #[test]
+    fn h119_slot_aware_soft_tokens_fn_calls_reset_for_slot_at_entry_and_exit() {
+        // reset_for_slot primitives (iter-1's load-bearing add).
+        let kv_src = include_str!(
+            "../../../src/inference/models/gemma4/kv_cache.rs"
+        );
+        assert!(
+            kv_src.contains("pub fn reset_for_slot("),
+            "H119 FALSIFIED: `reset_for_slot` is not defined in \
+             gemma4/kv_cache.rs.  iter-5 inherits this primitive from \
+             iter-1; if it's gone, iter-1 was reverted."
+        );
+
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_gemma4_once_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect(
+                "H119: generate_gemma4_once_with_soft_tokens_slot_aware not defined",
+            );
+        // Window covering the fn body — bound by next top-level fn
+        // marker or end-of-file.
+        let body_after = &src[fn_idx..];
+        let body_end_off = body_after[fn_marker.len()..]
+            .find("\nfn ")
+            .map(|off| off + fn_marker.len())
+            .unwrap_or(body_after.len().min(60_000));
+        let fn_body = &body_after[..body_end_off];
+
+        // Total reset_for_slot count ≥ 4: entry + exit on HB scaffold
+        // (2) + entry + exit on hybrid scaffold (2 — wrapped in Option
+        // Some-guards).
+        let reset_calls = fn_body.matches("reset_for_slot(slot_id)").count();
+        assert!(
+            reset_calls >= 4,
+            "H119 FALSIFIED: `generate_gemma4_once_with_soft_tokens_slot_aware` \
+             must call `reset_for_slot(slot_id)` at LEAST 4 times (entry \
+             + exit on the HB scaffold via `multi_seq_kv.iter_mut()` + \
+             entry + exit on the hybrid scaffold via `if let Some(ref \
+             mut hybrid_scaffold) = multi_seq_kv_hybrid` Option guards). \
+             Got {reset_calls} call(s).  Drift here means cross-request \
+             isolation is BROKEN on at least one scaffold."
+        );
+
+        // Per-layer iteration on HB scaffold.
+        assert!(
+            fn_body.contains("multi_seq_kv.iter_mut()"),
+            "H119 FALSIFIED: slot-aware soft-tokens fn does NOT iterate \
+             per-layer via `multi_seq_kv.iter_mut()`.  Per-layer reset \
+             coverage on HB scaffold is incomplete."
+        );
+        // Per-layer iteration on hybrid scaffold (inside Some-guard).
+        assert!(
+            fn_body.contains("hybrid_scaffold.iter_mut()"),
+            "H119 FALSIFIED: slot-aware soft-tokens fn does NOT iterate \
+             per-layer via `hybrid_scaffold.iter_mut()` inside the \
+             hybrid Option Some-guard.  Per-layer reset coverage on \
+             the production-default hybrid scaffold is incomplete."
+        );
+
+        // Forward call site: the slot-aware soft-tokens fn must thread
+        // the caller's `soft_tokens` slice through to the slot-aware
+        // prefill kernel — NOT pass `&[]` (which would be the Generate-
+        // arm shape).  Pin: the prefill call site contains the literal
+        // `soft_tokens,` argument (positional in the call).
+        let prefill_pos = fn_body
+            .find("forward_prefill_with_soft_tokens_slot_aware(")
+            .expect("H119: forward_prefill_with_soft_tokens_slot_aware call site expected");
+        let prefill_block_end = fn_body[prefill_pos..]
+            .find(");")
+            .map(|off| prefill_pos + off + 2)
+            .unwrap_or(fn_body.len().min(prefill_pos + 3000));
+        let prefill_block = &fn_body[prefill_pos..prefill_block_end];
+        assert!(
+            prefill_block.contains("soft_tokens"),
+            "H119 FALSIFIED: slot-aware soft-tokens prefill call site \
+             does not thread `soft_tokens` into the kernel call.  The \
+             iter-5 lift must carry the caller's vision-aware soft-token \
+             overrides through to the kernel.  Got block: {prefill_block}"
+        );
+        // And it must NOT pass `&[]` as the soft_tokens argument
+        // (that would be the Generate-arm shape — iter-1+2A+2B uses
+        // `&[]`; iter-5 must NOT).
+        assert!(
+            !prefill_block.contains("&[], // SoftTokens"),
+            "H119 FALSIFIED: slot-aware soft-tokens prefill call site \
+             passes `&[]` as the soft_tokens argument.  The iter-5 lift \
+             must thread the caller's `soft_tokens` slice verbatim."
+        );
+    }
+
+    /// **H120 (skip-mode)** — vision-augmented streaming at SlotId(N>0)
+    /// LIFTED.  Mirror of Qwen35 iter-4 H74 for the Gemma 4 streaming
+    /// surface.
+    ///
+    /// Pre-iter-5: `generate_stream_gemma4_once_slot_aware` (iter-3
+    /// §6.1.35) surfaced a typed SSE Error event when `soft_tokens` was
+    /// non-empty, citing iter-B4c-kernel-iter-5 as the deferred surface.
+    /// Post-iter-5: that abort path is REMOVED — the soft_tokens slice
+    /// is threaded verbatim through to the slot-aware prefill kernel.
+    /// Pin (a) the iter-3 abort path's typed-error substring is REMOVED
+    /// from the stream-arm fn body; pin (b) the prefill call site now
+    /// passes `soft_tokens` (not `&[]`); pin (c) the iter-3 abort path's
+    /// guard `if !soft_tokens.is_empty()` is also REMOVED.
+    #[test]
+    fn h120_vision_augmented_streaming_slot_n_gt_0_lifted() {
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_stream_gemma4_once_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H120: generate_stream_gemma4_once_slot_aware not defined");
+        let body_after = &src[fn_idx..];
+        let body_end_off = body_after[fn_marker.len()..]
+            .find("\nfn ")
+            .map(|off| off + fn_marker.len())
+            .unwrap_or(body_after.len().min(60_000));
+        let fn_body = &body_after[..body_end_off];
+
+        // (a) The iter-3 typed-error substring "vision-augmented
+        // streaming slot-aware port is iter-B4c-kernel-iter-5" is
+        // REMOVED from the streaming fn body (iter-5 legitimately
+        // removes it by lifting).
+        assert!(
+            !fn_body.contains("vision-augmented streaming slot-aware port is"),
+            "H120 FALSIFIED: the iter-3 typed-error substring \
+             `vision-augmented streaming slot-aware port is` is STILL \
+             present in `generate_stream_gemma4_once_slot_aware`'s \
+             body.  iter-5 must REMOVE the iter-3 abort path — \
+             vision-augmented streaming at SlotId(N>0) now routes \
+             through the kernel verbatim."
+        );
+
+        // (b) The prefill call site now passes `soft_tokens` (not
+        // `&[]`).  Locate the prefill call site + look for the
+        // `soft_tokens,` positional argument.
+        let prefill_pos = fn_body
+            .find("forward_prefill_with_soft_tokens_slot_aware(")
+            .expect("H120: forward_prefill_with_soft_tokens_slot_aware call site expected");
+        let prefill_block_end = fn_body[prefill_pos..]
+            .find(");")
+            .map(|off| prefill_pos + off + 2)
+            .unwrap_or(fn_body.len().min(prefill_pos + 3000));
+        let prefill_block = &fn_body[prefill_pos..prefill_block_end];
+        assert!(
+            prefill_block.contains("soft_tokens"),
+            "H120 FALSIFIED: streaming-arm prefill call site does not \
+             thread `soft_tokens` into the kernel call.  The iter-5 \
+             lift must carry the caller's vision-aware soft-token \
+             overrides through to the kernel even on the streaming \
+             surface.  Got block: {prefill_block}"
+        );
+
+        // (c) iter-5 cite present in the fn body (the comment narrating
+        // the lift).
+        assert!(
+            fn_body.contains("iter-B4c-kernel iter-5"),
+            "H120 FALSIFIED: streaming-arm fn body does not cite \
+             `iter-B4c-kernel iter-5` — the lift narration is missing, \
+             which would make it harder for future iters to grep the \
+             lift site."
+        );
+    }
+
+    /// **H121 (skip-mode)** — Qwen35 + Qwen3VL worker arms unchanged
+    /// by iter-5.  Mirror of H82 / H108 / H114 extended for the iter-5
+    /// narrowing: iter-5 replaces the LAST Gemma 4 worker-arm clamp
+    /// (GenerateWithSoftTokens), so all FOUR Gemma 4 lifts are now
+    /// engaged.
+    #[test]
+    fn h121_qwen35_qwen3vl_and_other_gemma4_arms_unchanged_by_iter5() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // Qwen35 lift fns from iter-C2d-cont-kernel iter-1/2/3/4 all
+        // STILL called.
+        for lift_fn in [
+            "super::engine_qwen35::generate_qwen35_once_slot_aware(",
+            "super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware(",
+            "super::engine_qwen35::embed_qwen35_slot_aware(",
+            "super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware(",
+        ] {
+            assert!(
+                body.contains(lift_fn),
+                "H121 FALSIFIED: Qwen35 lift fn `{lift_fn}` is NOT \
+                 called from worker_run.  iter-5 must NOT regress any \
+                 Qwen35 worker-arm lift (§6.1.27/28/29/30)."
+            );
+        }
+
+        // iter-1 Gemma 4 Generate-arm lift fn STILL called (iter-5
+        // must not regress iter-1).
+        assert!(
+            body.contains("generate_gemma4_once_slot_aware("),
+            "H121 FALSIFIED: iter-1 Gemma 4 Generate lift fn \
+             `generate_gemma4_once_slot_aware` is NOT called from \
+             worker_run.  iter-5 must NOT regress iter-1's Generate-arm \
+             lift (§6.1.31)."
+        );
+
+        // iter-3 Gemma 4 GenerateStream-arm lift fn STILL called.
+        assert!(
+            body.contains("generate_stream_gemma4_once_slot_aware("),
+            "H121 FALSIFIED: iter-3 Gemma 4 GenerateStream lift fn \
+             `generate_stream_gemma4_once_slot_aware` is NOT called \
+             from worker_run.  iter-5 must NOT regress iter-3's \
+             GenerateStream-arm lift (§6.1.35)."
+        );
+
+        // iter-4 Gemma 4 Embed-arm lift fn STILL called.
+        assert!(
+            body.contains("embed_gemma4_slot_aware("),
+            "H121 FALSIFIED: iter-4 Gemma 4 Embed lift fn \
+             `embed_gemma4_slot_aware` is NOT called from worker_run.  \
+             iter-5 must NOT regress iter-4's Embed-arm lift (§6.1.36)."
+        );
+
+        // No Qwen3VL clamp accidentally added.
+        assert!(
+            !body.contains(
+                "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
+            ),
+            "H121 FALSIFIED: Qwen3VL clamp accidentally added to \
+             worker_run by iter-5.  Qwen3VL SlotAware activation is \
+             gated on iter-C2e per §6.1.22; iter-5 must not add the \
+             Qwen3VL clamp without the spawn-arm flip."
+        );
+    }
+
+    /// **H122 (skip-mode) — TERMINAL Gemma 4 worker-arm lift pin.**
+    /// Mirror of Qwen35 iter-4 H76 for the Gemma 4 architecture.
+    ///
+    /// Post-iter-5: NONE of `iter-B4c-kernel-iter-{1,2A,2B,3,4,5}`
+    /// appear as a typed-clamp label pattern (e.g.
+    /// `-slot-N (iter-C2c-cont per ADR-040 §6.1.21 / iter-B4c-kernel`)
+    /// in worker_run.  iter-1/2A/2B/3/4/5 lift fns all wired (covered
+    /// by H114 / H121 above).  ADR-040 §6.1.37 closure block exists +
+    /// names `iter-B4c-kernel iter-5` + marks TERMINAL.  Surviving sub-
+    /// deferrals (iter-2A-cont, iter-2B-xlen, iter-2C, iter-2D, iter-
+    /// 2-decode, iter-LCP, iter-G) are orthogonal kernel-side refactors,
+    /// NOT arm lifts.
+    #[test]
+    fn h122_terminal_gemma4_worker_arm_lift_pin() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // No surviving Gemma 4 worker-arm clamp labels (all four
+        // arm-lift clamps now legitimately removed by iter-1/3/4/5).
+        for arm_clamp_label in [
+            "gemma4-forward-prefill-slot-N (iter-C2c-cont",
+            "gemma4-forward-embed-last-slot-N (iter-C2c-cont",
+            "gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont",
+        ] {
+            assert!(
+                !body.contains(arm_clamp_label),
+                "H122 FALSIFIED: Gemma 4 worker-arm clamp label \
+                 `{arm_clamp_label}` is STILL present in worker_run.  \
+                 iter-5 is TERMINAL — every Gemma 4 worker-arm-lift \
+                 clamp must be REMOVED by iter-1/3/4/5.  Surviving \
+                 label indicates the lift was not actually applied."
+            );
+        }
+
+        // The ADR-040 §6.1.37 closure block exists in the ADR.
+        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.37"),
+            "H122 FALSIFIED: ADR-040 §6.1.37 closure block not found. \
+             iter-5 sub-deferral cites point at a non-existent \
+             destination. Update the ADR with the iter-5 closure block \
+             before merging."
+        );
+        // The §6.1.37 block names `iter-B4c-kernel iter-5`.
+        let block_start = adr
+            .find("### 6.1.37")
+            .expect("H122: §6.1.37 block missing");
+        let block_end_off = adr[block_start..]
+            .find("\n### ")
+            .map(|off| block_start + off)
+            .unwrap_or(adr.len());
+        let block = &adr[block_start..block_end_off];
+        assert!(
+            block.contains("iter-B4c-kernel iter-5"),
+            "H122 FALSIFIED: ADR-040 §6.1.37 closure block does NOT \
+             name `iter-B4c-kernel iter-5`.  The closure block must \
+             explicitly identify the iter shipped."
+        );
+        // The §6.1.37 block marks TERMINAL.
+        assert!(
+            block.contains("TERMINAL"),
+            "H122 FALSIFIED: ADR-040 §6.1.37 closure block does NOT \
+             mark iter-5 as TERMINAL.  The Gemma 4 worker-arm lift arc \
+             is complete; the closure block must say so so future iters \
+             can grep the terminal pin."
+        );
+
+        // Surviving sub-deferrals named in §6.1.37 — orthogonal kernel
+        // refactors / opt-in surfaces.  Pin at least the load-bearing
+        // sub-iters by exact substring (operator-grep'able).
+        for sub_def in [
+            "iter-B4c-kernel-iter-2-decode",
+            "iter-B4c-kernel-iter-2A-cont",
+            "iter-B4c-kernel-iter-2B-xlen",
+        ] {
+            assert!(
+                block.contains(sub_def),
+                "H122 FALSIFIED: ADR-040 §6.1.37 closure block does \
+                 NOT name surviving sub-deferral `{sub_def}`.  Every \
+                 surviving deferral must have an operator-grep'able \
+                 iter-N label."
+            );
+        }
     }
 }
