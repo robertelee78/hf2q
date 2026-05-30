@@ -800,8 +800,18 @@ impl<'a> SpecDecode<'a> {
                     // iter would attend over a stale state ahead by
                     // `spec_k - accepted` steps. See task #86 root-cause
                     // memo for the "the the the..." attractor empirics.
+                    // ADR-040 Phase A2b (2026-05-29) — rollback_la_to now
+                    // takes an explicit slot. Spec-decode hot path is
+                    // single-seq today (`HybridKvCache::n_seqs == 1`), so
+                    // we route through SlotId(0). When iter-A2b-cont (or a
+                    // future iter) lifts the spec-decode loop to multi-seq,
+                    // this site will thread the active slot id from the
+                    // batched-verify dispatcher.
                     self.kv_cache
-                        .rollback_la_to(accepted as u32)
+                        .rollback_la_to(
+                            crate::serve::multi_seq_kv::SlotId(0),
+                            accepted as u32,
+                        )
                         .context("K=N partial-reject: rollback_la_to")?;
                 }
 

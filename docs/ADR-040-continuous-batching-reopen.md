@@ -245,7 +245,8 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | **A1 (THIS ITER, 2026-05-23)** | Scaffolding: trait + types + NoopMultiSeqKvCache fixture + unit tests | 1 day |
 | **A2a (SHIPPED 2026-05-23)** | `HybridKvCache` (Qwen35) full-attn + MTP impl — H1 PASS; ~150 LOC trait impl + 11 tests (75 total) | **1 day landed** |
 | **B3 (SHIPPED 2026-05-23)** | `InflightBatchedScheduler` real `step` FSM — SlotPhase enum {Queued, Prefilling, Decoding} + `advance_after_prefill`/`advance_after_decode` driver-callback APIs + DEFAULT_PREFILL_CHUNK_TOKENS=512 (mirrors llama.cpp `-ub` default) + 12 new FSM tests (30 total scheduler tests); iter-1.5 cfg(test) gate removed | **1 day landed** |
-| A2b | `HybridKvCache` linear-attn lift — lift `rollback_la_to` guard at `kv_cache.rs:1567`, H4 + H5 hypotheses; ports `gpu_delta_net.rs` `n_seqs=1u32` sites | 5-8 days |
+| **A2b (SHIPPED 2026-05-29)** | `HybridKvCache` linear-attn capture-buffer multi-seq lift — **rollback_la_to** lifted to per-slot `rollback_la_to(slot: SlotId, accepted_idx: u32)`; legacy `n_seqs > 1` guard at `kv_cache.rs:1567` REPLACED with real per-slot routing using layout-pinned slice math (recurrent col-major, capture col-major, conv_state col-major, conv_capture row-major); 5 new H31-H35 tests (82 PASS); forward-path linear-attn dispatch site lift (H5 `gpu_delta_net.rs` `n_seqs=1u32` hard-codes) DEFERRED to iter-A2b-cont (production callers — `spec_decode.rs:804`, `dflash/qwen35_target.rs:134` — operate at n_seqs=1, routed through SlotId(0)). See §6.1.23. | **1 day landed** |
+| A2b-cont | Forward-path linear-attn dispatch site multi-seq lift (`gpu_delta_net.rs` 15+ `n_seqs=1u32` hard-codes per dossier §2.1.5); enables Qwen35 SlotAware InflightBatched on hybrid (linear+full) layer mixes | 5-8 days |
 | A2c | `fork_seq` real kernel dispatch (same-buffer cross-region memcpy) — replaces A2a's `SlotOom { 0, 0 }` sentinel | 3-5 days |
 | **A3a (SHIPPED 2026-05-23)** | Gemma 4 `MultiSeqHbKvBuffers` sibling-struct lift + `alloc_hb_kv_for_layer` unified helper + `MultiSeqKvCache` impl — H6+H7+H8 PASS; H9 verified by code-read; H10 FALSIFIED but A3a scope intact; ~700 LOC + 12 new tests (24 total in `gemma4::kv_cache`) | **1 day landed** |
 | **A3b iter-1 (SHIPPED 2026-05-24)** | Gemma 4 `HybridKvBuffers` FULL multi-seq lift via sibling `MultiSeqHybridKvBuffers` + `alloc_multi_seq_hybrid_kv_for_layer` helper (production default since ADR-029 iter-13 per H10 falsification) + `MlxKvCache` + `DenseKvBuffers` TYPED CLAMPS (`slot_count() == 1`; slot > 0 → typed `SlotOutOfRange`; in-bounds → `CapabilityUnsupported` naming iter-A3b-2 / iter-A3b-3).  H10/H11/H12/H13/H14/H15/H16 PASS; 35/35 gemma4::kv_cache; 21/21 continuous_batching_throughput preserved.  See §6.1.19. | **1 day landed** |
@@ -1891,8 +1892,75 @@ Path A (full activation with C2d-cont's worker hot path bundled) was considered 
 - **iter-C2d-cont**: Qwen35 worker hot path lift onto the persistent multi-seq cache. Today, `Qwen35LoadedModel::provision_multi_seq_kv_for_slot_aware` populates `self.persistent_kv_cache = Some(HybridKvCache(n_seqs=max_slots))` at spawn time, but the worker hot path (`forward_gpu_last_logits` via `alloc_kv_cache_for_request`) still allocates a fresh per-request cache. iter-C2d-cont routes the worker hot path through the persistent cache at `slot_id = SlotId(0..max_slots-1)`. Pinned by H30's label.
 - **iter-C2c-cont (B4c)**: Gemma 4 `forward_prefill.rs` GPU-side slot-offset routing (still pending; pinned by C2c's H25).
 - **iter-A3b-2 / iter-A3b-3**: DenseKvBuffers + MlxKvCache full lifts (still typed-clamped per A3b iter-1 + A3b iter-1.5 hygiene fix).
-- **iter-A2b**: HybridKvCache linear-attn lift (gates some Qwen35 SlotAware paths in the linear-attn variants; orthogonal to this iter).
+- **iter-A2b**: HybridKvCache linear-attn lift (gates some Qwen35 SlotAware paths in the linear-attn variants; orthogonal to this iter). **SHIPPED** in iter-A2b (see §6.1.23).
 - **Phase E1**: production cutover decision + final ADR-040 closure ceremony (gated on all of the above).
+
+### 6.1.23 Iter-A2b closure — Qwen35 HybridKvCache linear-attn capture-buffer multi-seq lift (2026-05-29, commit hash TBD)
+
+Per the A2/A3 KV-cache dossier (`docs/research/adr040-kv-cache-lift-dossier-2026-05-23.md`) §1.3 partial-n_seqs claim + §2.1.4 capture-buffer falsification + §2.10 R1 linear-attn risk: Phase A2a (SHIPPED 2026-05-23) lifted the full-attn + MTP slot's `n_seqs` axis but explicitly DEFERRED the linear-attn capture buffer + the `rollback_la_to` guard at `kv_cache.rs:1567` (the legacy guard explicitly errored on `n_seqs > 1`). Iter-A2b lifts the deferral: `rollback_la_to` now takes an explicit `SlotId` and rolls back ONLY that slot's `recurrent` + `conv_state` regions using real per-seq slice math; other slots' bytes are byte-untouched. The mlx-native kernel `dispatch_gated_delta_net_decode_with_capture` ALREADY accepts `n_seqs > 1` with strict-equality buffer sizing (`/opt/mlx-native/src/ops/gated_delta_net_decode.rs:310-320` + `shaders/gated_delta_net_decode_capture.metal:37-46`), so the structural mismatch was Rust-side rollback math only — NOT a kernel constraint.
+
+**Path chosen — Path A (full rollback lift) with iter-A2b-cont forward-path deferral**:
+
+Path A was selected over Path B (provisioning + typed clamp) because the **capture buffer is already 5-D with `n_seqs` outermost** at `kv_cache.rs:1479` (allocator multiplies by `n_seqs` and the kernel sequence-stride formula matches). The bug was localized to the rollback's `state_elems = whole_recurrent` math — which coincidentally equals per-seq elems at `n_seqs == 1` but is wrong for `n_seqs > 1`. Fixing the rollback math was a self-contained ~150 LOC change against the single allocator + the 2 production callers (`spec_decode.rs:804`, `dflash/qwen35_target.rs:134` — both single-seq today, routed through `SlotId(0)`).
+
+The **forward-path** linear-attn dispatch (the H5 sites in `gpu_delta_net.rs` with `n_seqs = 1u32` hard-codes — 15+ per dossier §2.1.5) is DEFERRED to **iter-A2b-cont**. Those sites are not reachable from the multi-seq surface today (the Qwen35 worker hot path on InflightBatched is gated on iter-C2d-cont per §6.1.22 H30), so deferring forward-path threading is structurally safe.
+
+**Layout proofs (load-bearing for the slice math)**:
+
+| Buffer | Shape vec | Convention | Per-seq elems | Slot `s` offset |
+|---|---|---|---|---|
+| `recurrent` | `[D_k, D_v, n_v_heads, n_seqs]` | col-major (D_k stride-1) | `D_k * D_v * n_v_heads` | `s * per_seq_elems` |
+| `capture_states` | `[D_k, D_v, n_v_heads, n_tokens_max, n_seqs]` | col-major | `D_k * D_v * n_v_heads` | `s * (n_tokens_max * per_seq_elems) + t * per_seq_elems` |
+| `conv_state` | `[channels, K-1, n_seqs]` | col-major (channels stride-1) | `channels * (K-1)` | `s * per_seq_elems` |
+| `conv_capture_states` | `[n_seqs, n_tokens_max, K-1, channels]` | row-major (channels stride-1) | `(K-1) * channels` | `s * (n_tokens_max * per_seq_elems) + t * per_seq_elems` |
+
+The capture-buffer offset formula matches the mlx-native kernel exactly: `state_capture_seq_stride = n_tokens * state_capture_token_stride` where `state_capture_token_stride = n_v_heads * D_v * D_k` (`gated_delta_net_decode_capture.metal:37-46`).
+
+**Tests (5 new H31-H35 in `qwen35::kv_cache::tests`)**:
+
+| Test | Pins |
+|---|---|
+| `h31_la_capture_buffer_byte_scale_n_seqs_4_2026_05_29` | Recurrent capture + conv capture byte-len at `n_seqs=4` is exactly 4× the `n_seqs=1` baseline AND matches closed-form `n_seqs * n_tokens_max * per_seq_elems * 4` for both buffer kinds. |
+| `h32_la_capture_per_slot_write_isolation_2026_05_29` | Writing a non-zero F32 pattern into slot 0's per-seq capture region (stride `n_tokens_max * per_seq_elems`) leaves slots 1, 2, 3's regions byte-zero (initial-allocated state preserved). |
+| `h33_rollback_la_to_per_slot_isolation_2026_05_29` | Seeds distinguishable patterns into slot 0+1 capture (recurrent + conv) and slots 0..3 active `recurrent` + `conv_state`. Calls `rollback_la_to(SlotId(0), 2)`. Asserts: (a) slot 0's recurrent now matches capture[s=0, t=2] per the layout formula; (b) slots 1, 2, 3's recurrent AND conv_state are byte-identical to pre-rollback snapshots. |
+| `h34_rollback_la_to_n_seqs_1_byte_equivalence_2026_05_29` | **Regression pin**: at `n_seqs=1` the new per-slot path produces byte-identical `recurrent` + `conv_state` to the inline-reconstructed pre-A2b legacy whole-buffer math (slice-and-memcpy + the conv re-index loop). Guarantees the SerialFifo / spec-decode single-seq production path stays byte-equivalent through this iter. |
+| `h35_rollback_la_to_slot_out_of_range_typed_2026_05_29` | `rollback_la_to(SlotId(4), 0)` at `n_seqs=4` returns `Err` whose Display contains `"SlotOutOfRange"`, `"slot=4"`, `"max_slots=4"`, `"ADR-040 Phase A2b"`. Also: a cache WITHOUT `ensure_la_capture` at `slot=99` STILL surfaces `SlotOutOfRange` (bounds-first ordering per iter-1.5 cfa-finding-F5 — guard must fire BEFORE the `capture_states is None` check). |
+
+**Quality gates**:
+- `cargo check --release --bin hf2q`: 0 errors
+- `cargo check --release --bin hf2q --tests`: 0 errors, only pre-existing warnings unrelated to A2b
+- `cargo test --release --bin hf2q -- qwen35::kv_cache --test-threads=1`: **82 PASS / 0 FAIL** (77 pre-A2b baseline + 5 new H31-H35)
+- `cargo test --release --bin hf2q -- adr040_phase_c_iter2c_gemma4 --test-threads=1`: **16 PASS** preserved (C2c + C2d unchanged)
+- `cargo test --release --test continuous_batching_throughput`: **21 PASS** preserved (D3 statistical stability + AC-4 gate)
+- `cargo test --release --bin hf2q -- qwen35::forward_gpu::tests::b4 --test-threads=1`: **12 PASS** preserved (B4a + B4a-cont + B4b surface unchanged)
+- `cargo test --release --bin hf2q -- spec_decode --test-threads=1`: **316 PASS** (caller-side change at `spec_decode.rs:804` regression-pinned)
+
+**Per-file LOC delta**:
+
+| File | + | − | Notes |
+|---|---|---|---|
+| `src/inference/models/qwen35/kv_cache.rs` | ~720 | ~150 | rollback_la_to body rewrite (~150 LOC replace) + H31-H35 tests (~570 LOC) |
+| `src/inference/models/qwen35/spec_decode.rs` | ~10 | ~2 | single caller updated to pass `SlotId(0)` |
+| `src/inference/spec_decode/dflash/qwen35_target.rs` | ~7 | ~1 | dflash caller updated to pass `SlotId(0)` |
+| `docs/ADR-040-continuous-batching-reopen.md` | ~95 | ~1 | this §6.1.23 closure + §6 sequencing row update (A2b SHIPPED + A2b-cont added) |
+| **Net** | **~832** | **~154** | **+678 LOC** (within iter budget; under 1000-LOC ceiling) |
+
+**Mantra audit**:
+- Zero new `// TODO`, `unimplemented!()`, `todo!()`, `FIXME` in production code.
+- The deprecated `n_seqs > 1` guard at `kv_cache.rs:1567` is REPLACED with real per-slot routing (NOT removed-and-stubbed).
+- The single production-callsite signature change (`rollback_la_to(accepted_idx)` → `rollback_la_to(slot, accepted_idx)`) updates both production callers in lockstep with the impl in this iter.
+- iter-A2b-cont deferral is **structural** (forward-path linear-attn dispatch sites in `gpu_delta_net.rs` are not reachable from multi-seq today — gated upstream by iter-C2d-cont's worker hot-path lift); no new typed `CapabilityUnsupported` clamp added at the dispatch sites because the existing single-seq dispatch path is byte-equivalent at `n_seqs == 1` (the spec-decode hot path), pinned by H34.
+- Bounds-first ordering preserved at the new entry point (slot OOR before any `ensure_la_capture` check), pinned by H35.
+- A2a + B4a/cont/.1 + B4b + A3a + A3b iter-1/1.5 + A5* + C2c + C2d production surfaces NOT touched — additive impl + targeted rollback math fix only.
+- SerialFifo + single-seq spec-decode byte-equivalence at `n_seqs == 1` pinned by H34's inline-reconstructed legacy math comparison.
+
+**Remaining followups** (typed, not vaporware):
+- **iter-A2b-cont**: Forward-path linear-attn dispatch site multi-seq lift — `gpu_delta_net.rs`'s 15+ `n_seqs = 1u32` hard-codes per dossier §2.1.5 (`gpu_delta_net.rs:912, 1090, 1556` + similar). Requires threading `slot_id` through `dispatch_gated_delta_net_decode` / `dispatch_gated_delta_net` / `dispatch_ssm_conv` Rust callers (the underlying mlx-native kernels ALREADY accept `n_seqs > 1`). Gated upstream by iter-C2d-cont (Qwen35 worker hot-path lift onto the persistent multi-seq cache).
+- **iter-C2d-cont**: Qwen35 worker hot path lift onto the persistent multi-seq cache (pinned by §6.1.22 H30's label). Once C2d-cont lands, iter-A2b-cont becomes reachable from production.
+- **iter-A2c**: `fork_seq` real kernel dispatch — replaces the current `CapabilityUnsupported` cross-slot stub at `kv_cache.rs:2774-2778` (pinned by `qwen35_hybrid_kv_fork_cross_slot_returns_capability_unsupported_at_phase_a2a`).
+- **iter-A3b-2 / iter-A3b-3**: DenseKvBuffers + MlxKvCache full lifts.
+- **iter-C2c-cont (B4c)**: Gemma 4 `forward_prefill.rs` GPU-side slot-offset routing.
+- **Phase E1**: production cutover decision + final ADR-040 closure ceremony.
 
 ---
 

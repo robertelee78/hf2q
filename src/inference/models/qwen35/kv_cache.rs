@@ -1534,66 +1534,131 @@ impl HybridKvCache {
         Ok(())
     }
 
-    /// ADR-034 task #90 Step 2 (2026-05-21) — roll back every linear-
-    /// attention slot's `recurrent` (active) state to
-    /// `capture_states[..., accepted_idx, ...]`. Called on partial-reject
-    /// in K=N spec-decode.
+    /// ADR-034 task #90 Step 2 (2026-05-21) + ADR-040 Phase A2b (2026-05-29) —
+    /// roll back ONE sequence slot's linear-attention recurrent + conv state
+    /// to `capture_states[..., accepted_idx, ...]` for that slot. Called on
+    /// partial-reject in K=N spec-decode.
+    ///
+    /// **ADR-040 Phase A2b multi-seq lift (2026-05-29):**
+    /// Pre-A2b the signature was `rollback_la_to(accepted_idx: u32)` and the
+    /// rollback was inherently slot-blind (used `state_elems = whole_recurrent`
+    /// which only coincides with per-seq elems at `n_seqs == 1`). The new
+    /// signature takes an explicit `slot: SlotId` and rolls back ONLY that
+    /// slot's per-seq slice. Other slots' recurrent + conv_state buffers are
+    /// byte-untouched.
+    ///
+    /// **Layout — recurrent (col-major in shape vec)**:
+    /// - shape `[D_k, D_v, n_v_heads, n_seqs]` (kv_cache.rs:2284-2289)
+    /// - per-seq elems = `D_k * D_v * n_v_heads` (NOT `recurrent.element_count()`)
+    /// - slot `s` offset in `recurrent` = `s * per_seq_elems`
+    ///
+    /// **Layout — capture (col-major in shape vec)**:
+    /// - shape `[D_k, D_v, n_v_heads, n_tokens_max, n_seqs]` (kv_cache.rs:1479)
+    /// - matches mlx-native `dispatch_gated_delta_net_decode_with_capture`:
+    ///   `state_capture_seq_stride = n_tokens * (n_v_heads * D_v * D_k)`,
+    ///   `state_capture_token_stride = n_v_heads * D_v * D_k`
+    ///   (see `gated_delta_net_decode_capture.metal` lines 37-46)
+    /// - slot `s`, token `t` offset = `s * (n_tokens_max * per_seq_elems) +
+    ///   t * per_seq_elems`
+    ///
+    /// **Layout — conv_state (col-major in shape vec)**:
+    /// - shape `[channels, K-1, n_seqs]` (kv_cache.rs:2268)
+    /// - per-seq elems = `channels * (K-1)`
+    /// - slot `s` offset = `s * per_seq_elems`
+    ///
+    /// **Layout — conv_capture (row-major in shape vec)**:
+    /// - shape `[n_seqs, n_tokens_max, K-1, channels]` (kv_cache.rs:1493)
+    /// - per-seq-token elems = `(K-1) * channels`
+    /// - slot `s`, token `t` offset = `s * (n_tokens_max * per_seq_elems) +
+    ///   t * per_seq_elems`
     ///
     /// Pre-conditions:
     /// - [`Self::ensure_la_capture`] was called for this cache.
+    /// - `slot.0 < self.n_seqs`.
     /// - `accepted_idx < n_tokens_max` (the value passed to
     ///   `ensure_la_capture`).
     /// - The most-recent forward through these LA slots used
     ///   `dispatch_gated_delta_net_decode_with_capture` (i.e. wrote
     ///   per-position states into `capture_states`).
     ///
-    /// Post-condition: every `linear_attn[i].recurrent` contains
-    /// `capture_states[..., accepted_idx, ...]`. The `recurrent_scratch`
-    /// buffer is left untouched (it will be overwritten by the next
-    /// forward).
+    /// Post-condition: every `linear_attn[i].recurrent` and
+    /// `linear_attn[i].conv_state`'s slice for `slot` contains
+    /// `capture_states[..., accepted_idx, slot]` and
+    /// `conv_capture_states[slot, accepted_idx, ..., ...]` respectively.
+    /// All other slots' bytes are unchanged. The `recurrent_scratch` /
+    /// `conv_state_scratch` buffers are left untouched (overwritten by the
+    /// next forward).
     ///
     /// # Errors
-    /// Returns `Err` when any slot lacks `capture_states` (caller bug:
-    /// forgot to call `ensure_la_capture`).
-    pub fn rollback_la_to(&mut self, accepted_idx: u32) -> Result<()> {
-        // ADR-034 task #90 Step 2 (codex audit 2026-05-21) — the
-        // capture-buffer layout assumes n_seqs == 1 (production Qwen
-        // 3.5/3.6 case). For n_seqs > 1, the per-token slice math
-        // below would interleave incorrectly because the capture buffer
-        // is laid out with n_tokens_max as the slowest-varying axis
-        // before n_seqs, while the kernel writes assume sequence-major
-        // layout. Guard against the n_seqs > 1 case until the layout is
-        // explicitly designed for batched-seq rollback.
-        if self.n_seqs > 1 {
+    /// - `slot.0 >= self.n_seqs` (bounds-first per iter-1.5 cfa-finding-F5)
+    /// - Any slot lacks `capture_states` (caller bug: forgot
+    ///   `ensure_la_capture`)
+    /// - `accepted_idx >= n_tokens_max`
+    pub fn rollback_la_to(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        accepted_idx: u32,
+    ) -> Result<()> {
+        // ADR-040 Phase A2b (2026-05-29) — bounds-first per iter-1.5
+        // cfa-finding-F5 ordering. The legacy n_seqs > 1 guard at
+        // kv_cache.rs:1567 is REPLACED with a real per-slot routing
+        // path. Layout proof + slice math in the doc-comment above.
+        if slot.0 >= self.n_seqs {
             return Err(anyhow!(
-                "rollback_la_to: n_seqs > 1 not supported (capture buffer \
-                 layout assumes n_seqs=1; production Qwen 3.5/3.6 is \
-                 always n_seqs=1). Implement per-sequence slice math \
-                 before extending to batched-seq inference."
+                "rollback_la_to: SlotOutOfRange slot={} max_slots={} \
+                 (ADR-040 Phase A2b multi-seq lift; HybridKvCache constructed \
+                 with n_seqs={})",
+                slot.0,
+                self.n_seqs,
+                self.n_seqs,
             ));
         }
+        let slot_idx = slot.0 as usize;
+        let n_seqs = self.n_seqs as usize;
         // ADR-034 task #90 Step 4c (2026-05-21) — rollback also copies
         // the per-position conv state. Both buffers must be allocated
         // (ensure_la_capture allocates them in lockstep) for the
         // rollback to be consistent. Mismatch is a caller bug.
-        for (i, slot) in self.linear_attn.iter_mut().enumerate() {
-            let capture = slot.capture_states.as_ref().ok_or_else(|| {
+        for (i, slot_data) in self.linear_attn.iter_mut().enumerate() {
+            let capture = slot_data.capture_states.as_ref().ok_or_else(|| {
                 anyhow!(
                     "rollback_la_to: linear_attn[{}].capture_states is None — \
                      caller must call ensure_la_capture before rollback",
                     i
                 )
             })?;
-            let state_elems = slot.recurrent.element_count();
-            let capture_elems = capture.element_count();
-            if capture_elems % state_elems != 0 {
+            // ADR-040 Phase A2b — per-seq math (NOT whole-buffer):
+            //   recurrent_total_elems = per_seq_elems * n_seqs
+            //   capture_total_elems   = per_seq_elems * n_tokens_max * n_seqs
+            let recurrent_total = slot_data.recurrent.element_count();
+            let capture_total = capture.element_count();
+            if recurrent_total % n_seqs != 0 {
                 return Err(anyhow!(
-                    "rollback_la_to: linear_attn[{}].capture_states elements {} \
-                     not a multiple of recurrent elements {}",
-                    i, capture_elems, state_elems
+                    "rollback_la_to: linear_attn[{}].recurrent elements {} \
+                     not divisible by n_seqs {} (layout invariant broken)",
+                    i, recurrent_total, n_seqs
                 ));
             }
-            let n_tokens_max = capture_elems / state_elems;
+            let per_seq_elems = recurrent_total / n_seqs;
+            if per_seq_elems == 0 {
+                return Err(anyhow!(
+                    "rollback_la_to: linear_attn[{}] per_seq_elems == 0 \
+                     (degenerate cfg)",
+                    i
+                ));
+            }
+            if capture_total % (per_seq_elems * n_seqs) != 0 {
+                return Err(anyhow!(
+                    "rollback_la_to: linear_attn[{}].capture_states elements {} \
+                     not a multiple of per_seq_elems*n_seqs ({} * {} = {})",
+                    i,
+                    capture_total,
+                    per_seq_elems,
+                    n_seqs,
+                    per_seq_elems * n_seqs
+                ));
+            }
+            let n_tokens_max = capture_total / (per_seq_elems * n_seqs);
             if (accepted_idx as usize) >= n_tokens_max {
                 return Err(anyhow!(
                     "rollback_la_to: accepted_idx {} >= n_tokens_max {} \
@@ -1601,45 +1666,94 @@ impl HybridKvCache {
                     accepted_idx, n_tokens_max, i
                 ));
             }
-            // Copy capture[accepted_idx] → recurrent. Slice the capture
-            // buffer at the correct offset and copy state_elems f32s.
+            // Copy capture[slot, accepted_idx, ...] → recurrent[slot, ...]
+            // per the layout proof above.
             let capture_slice = capture.as_slice::<f32>().map_err(|e| {
                 anyhow!("rollback_la_to: linear_attn[{}].capture as_slice: {e}", i)
             })?;
-            let src_offset = (accepted_idx as usize) * state_elems;
-            let src = &capture_slice[src_offset..src_offset + state_elems];
-            let dst = slot.recurrent.as_mut_slice::<f32>().map_err(|e| {
+            let capture_seq_stride = n_tokens_max * per_seq_elems;
+            let src_offset = slot_idx * capture_seq_stride
+                + (accepted_idx as usize) * per_seq_elems;
+            let src_end = src_offset + per_seq_elems;
+            if src_end > capture_slice.len() {
+                return Err(anyhow!(
+                    "rollback_la_to: linear_attn[{}] capture src range [{}..{}) \
+                     exceeds buffer len {} (slot={} accepted_idx={} \
+                     n_tokens_max={} per_seq_elems={})",
+                    i, src_offset, src_end, capture_slice.len(),
+                    slot_idx, accepted_idx, n_tokens_max, per_seq_elems
+                ));
+            }
+            // Copy into a temporary so we can drop the immutable borrow
+            // before taking &mut on recurrent.
+            let src_owned: Vec<f32> =
+                capture_slice[src_offset..src_end].to_vec();
+            let dst = slot_data.recurrent.as_mut_slice::<f32>().map_err(|e| {
                 anyhow!(
                     "rollback_la_to: linear_attn[{}].recurrent as_mut_slice: {e}",
                     i
                 )
             })?;
-            dst.copy_from_slice(src);
+            let dst_offset = slot_idx * per_seq_elems;
+            let dst_end = dst_offset + per_seq_elems;
+            if dst_end > dst.len() {
+                return Err(anyhow!(
+                    "rollback_la_to: linear_attn[{}] recurrent dst range \
+                     [{}..{}) exceeds buffer len {} (slot={} per_seq_elems={})",
+                    i, dst_offset, dst_end, dst.len(), slot_idx, per_seq_elems
+                ));
+            }
+            dst[dst_offset..dst_end].copy_from_slice(&src_owned);
 
-            // ADR-034 task #90 Step 4c (2026-05-21) — also roll back the
-            // conv1d ring buffer. Layout: [n_seqs=1, n_tokens_max, K-1,
-            // channels]. accepted_idx selects the (s=0, t=accepted_idx)
-            // slice of size (K-1)*channels — but the active `conv_state`
-            // buffer has layout [n_seqs=1, channels, K-1] (channels-major
-            // with K-1 stride 1), so we need a re-indexed copy not a
-            // flat memcpy.
-            let conv_capture = slot.conv_capture_states.as_ref().ok_or_else(|| {
+            // ADR-034 task #90 Step 4c (2026-05-21) + ADR-040 Phase A2b
+            // (2026-05-29) — also roll back the conv1d ring buffer.
+            //
+            // Active conv_state layout: `[channels, K-1, n_seqs]` col-major
+            // ⇒ slot `s` offset in conv_state = s * (channels * K-1).
+            //
+            // Capture conv layout: `[n_seqs, n_tokens_max, K-1, channels]`
+            // row-major ⇒ slot `s`, token `t` offset in conv_capture =
+            // s * (n_tokens_max * K-1 * channels) + t * (K-1 * channels).
+            //
+            // Per-token slice in capture is `[K-1, channels]` (channels
+            // innermost). Active layout is `[channels, K-1]` (K-1
+            // innermost), so we re-index per (k_i, c) — same as legacy.
+            let conv_capture = slot_data.conv_capture_states.as_ref().ok_or_else(|| {
                 anyhow!(
                     "rollback_la_to: linear_attn[{}].conv_capture_states is None — \
                      ensure_la_capture must allocate both buffers in lockstep",
                     i
                 )
             })?;
-            let conv_state_elems = slot.conv_state.element_count();
-            let conv_capture_elems = conv_capture.element_count();
-            if conv_capture_elems % conv_state_elems != 0 {
+            let conv_state_total = slot_data.conv_state.element_count();
+            let conv_capture_total = conv_capture.element_count();
+            if conv_state_total % n_seqs != 0 {
                 return Err(anyhow!(
-                    "rollback_la_to: linear_attn[{}].conv_capture_states elems {} \
-                     not a multiple of conv_state elems {}",
-                    i, conv_capture_elems, conv_state_elems
+                    "rollback_la_to: linear_attn[{}].conv_state elements {} \
+                     not divisible by n_seqs {} (layout invariant broken)",
+                    i, conv_state_total, n_seqs
                 ));
             }
-            let conv_n_tokens_max = conv_capture_elems / conv_state_elems;
+            let conv_per_seq = conv_state_total / n_seqs;
+            if conv_per_seq == 0 {
+                return Err(anyhow!(
+                    "rollback_la_to: linear_attn[{}] conv_per_seq == 0",
+                    i
+                ));
+            }
+            if conv_capture_total % (conv_per_seq * n_seqs) != 0 {
+                return Err(anyhow!(
+                    "rollback_la_to: linear_attn[{}].conv_capture_states elems {} \
+                     not a multiple of conv_per_seq*n_seqs ({} * {} = {})",
+                    i,
+                    conv_capture_total,
+                    conv_per_seq,
+                    n_seqs,
+                    conv_per_seq * n_seqs
+                ));
+            }
+            let conv_n_tokens_max =
+                conv_capture_total / (conv_per_seq * n_seqs);
             if (accepted_idx as usize) >= conv_n_tokens_max {
                 return Err(anyhow!(
                     "rollback_la_to: accepted_idx {} >= conv n_tokens_max {} \
@@ -1647,23 +1761,34 @@ impl HybridKvCache {
                     accepted_idx, conv_n_tokens_max, i
                 ));
             }
-            // Extract per_t = (K-1) * channels from layout. With n_seqs=1
-            // each per-token slice is exactly conv_state_elems elements.
-            let conv_per_t = conv_state_elems;
-            let conv_src_offset = (accepted_idx as usize) * conv_per_t;
+            let conv_per_t = conv_per_seq;
             let conv_capture_slice = conv_capture.as_slice::<f32>().map_err(|e| {
                 anyhow!(
-                    "rollback_la_to: linear_attn[{}].conv_capture as_slice: {e}", i
+                    "rollback_la_to: linear_attn[{}].conv_capture as_slice: {e}",
+                    i
                 )
             })?;
-            let conv_src = &conv_capture_slice[conv_src_offset..conv_src_offset + conv_per_t];
+            let conv_capture_seq_stride = conv_n_tokens_max * conv_per_t;
+            let conv_src_offset = slot_idx * conv_capture_seq_stride
+                + (accepted_idx as usize) * conv_per_t;
+            let conv_src_end = conv_src_offset + conv_per_t;
+            if conv_src_end > conv_capture_slice.len() {
+                return Err(anyhow!(
+                    "rollback_la_to: linear_attn[{}] conv_capture src range \
+                     [{}..{}) exceeds buffer len {} (slot={} accepted_idx={} \
+                     conv_n_tokens_max={} conv_per_t={})",
+                    i, conv_src_offset, conv_src_end,
+                    conv_capture_slice.len(), slot_idx, accepted_idx,
+                    conv_n_tokens_max, conv_per_t
+                ));
+            }
+            let conv_src_owned: Vec<f32> =
+                conv_capture_slice[conv_src_offset..conv_src_end].to_vec();
 
             // Re-index from capture [K-1, channels] (channels innermost)
             // to active conv_state [channels, K-1] (K-1 innermost).
-            // Channels and K-1 are accessible via the shape of conv_state.
-            let conv_shape = slot.conv_state.shape().to_vec();
-            // conv_state shape per alloc_linear_attn_state_slots: [channels, K-1, n_seqs]
-            // For n_seqs=1 the trailing 1 may or may not be present; sniff length.
+            let conv_shape = slot_data.conv_state.shape().to_vec();
+            // conv_state shape per alloc_linear_attn_slot: [channels, K-1, n_seqs]
             if conv_shape.len() < 2 {
                 return Err(anyhow!(
                     "rollback_la_to: linear_attn[{}].conv_state shape too short: {:?}",
@@ -1679,11 +1804,24 @@ impl HybridKvCache {
                     i, channels, k_minus1, channels * k_minus1, conv_per_t
                 ));
             }
-            let conv_dst = slot.conv_state.as_mut_slice::<f32>().map_err(|e| {
+            let conv_dst = slot_data.conv_state.as_mut_slice::<f32>().map_err(|e| {
                 anyhow!(
                     "rollback_la_to: linear_attn[{}].conv_state as_mut_slice: {e}", i
                 )
             })?;
+            // Slot offset into conv_dst: per the col-major layout above.
+            let conv_dst_slot_offset = slot_idx * conv_per_seq;
+            let conv_dst_slot_end = conv_dst_slot_offset + conv_per_seq;
+            if conv_dst_slot_end > conv_dst.len() {
+                return Err(anyhow!(
+                    "rollback_la_to: linear_attn[{}] conv_state dst slot range \
+                     [{}..{}) exceeds buffer len {} (slot={} conv_per_seq={})",
+                    i, conv_dst_slot_offset, conv_dst_slot_end,
+                    conv_dst.len(), slot_idx, conv_per_seq
+                ));
+            }
+            let conv_dst_slot =
+                &mut conv_dst[conv_dst_slot_offset..conv_dst_slot_end];
             // Capture layout: capture[i, c] at offset i*channels + c
             // (channels innermost). conv_state layout: state[c, i] at
             // offset c*k_minus1 + i (k_minus1 innermost). Re-index:
@@ -1691,7 +1829,7 @@ impl HybridKvCache {
                 for c in 0..channels {
                     let src_idx = k_i * channels + c;
                     let dst_idx = c * k_minus1 + k_i;
-                    conv_dst[dst_idx] = conv_src[src_idx];
+                    conv_dst_slot[dst_idx] = conv_src_owned[src_idx];
                 }
             }
         }
@@ -6129,7 +6267,9 @@ mod tests {
             }
         }
 
-        cache.rollback_la_to(2).expect("rollback to idx=2");
+        cache
+            .rollback_la_to(crate::serve::multi_seq_kv::SlotId(0), 2)
+            .expect("rollback to idx=2");
 
         // LA[0].recurrent should now equal capture[2*state_elems..]
         let rec0 = cache.linear_attn[0].recurrent.as_slice::<f32>().expect("rec0");
@@ -6154,8 +6294,12 @@ mod tests {
         let cfg = moe_cfg_40layer();
         let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
         // Did NOT call ensure_la_capture.
-        assert!(cache.rollback_la_to(0).is_err(),
-            "rollback without ensure_la_capture must error");
+        assert!(
+            cache
+                .rollback_la_to(crate::serve::multi_seq_kv::SlotId(0), 0)
+                .is_err(),
+            "rollback without ensure_la_capture must error"
+        );
     }
 
     #[test]
@@ -6167,10 +6311,18 @@ mod tests {
         let cfg = moe_cfg_40layer();
         let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("cache");
         cache.ensure_la_capture(&cfg, &device, 4).expect("ensure");
-        assert!(cache.rollback_la_to(4).is_err(),
-            "rollback idx=4 with n_tokens_max=4 must error (need idx < n_tokens_max)");
-        assert!(cache.rollback_la_to(99).is_err(),
-            "rollback idx=99 must error");
+        assert!(
+            cache
+                .rollback_la_to(crate::serve::multi_seq_kv::SlotId(0), 4)
+                .is_err(),
+            "rollback idx=4 with n_tokens_max=4 must error (need idx < n_tokens_max)"
+        );
+        assert!(
+            cache
+                .rollback_la_to(crate::serve::multi_seq_kv::SlotId(0), 99)
+                .is_err(),
+            "rollback idx=99 must error"
+        );
     }
 
     // ───────────────────────────────────────────────────────────────────────
@@ -7111,5 +7263,652 @@ mod tests {
                  match to `Ok(())` + per-buffer byte-equality assertions."
             ),
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // ADR-040 Phase A2b iter-A2b — linear-attn capture-buffer multi-seq lift
+    // hypotheses H31-H35 (2026-05-29).
+    //
+    // A2a shipped the full-attn + MTP n_seqs lift (kv_cache.rs:2226-2247) and
+    // documented the linear-attn capture buffer + `rollback_la_to` guard at
+    // kv_cache.rs:1567 as the deferred sub-iter per dossier §1.3 / §2.1.4 /
+    // §2.10 R1.  Iter-A2b lifts the rollback math to per-slot routing using
+    // the real layout proofs:
+    //
+    //   - recurrent: `[D_k, D_v, n_v_heads, n_seqs]`  col-major
+    //                ⇒ slot s offset = s * (D_k * D_v * n_v_heads)
+    //
+    //   - capture:   `[D_k, D_v, n_v_heads, n_tokens_max, n_seqs]`  col-major
+    //                ⇒ slot s, token t offset = s * (n_tokens_max * D_k * D_v
+    //                  * n_v_heads) + t * (D_k * D_v * n_v_heads)
+    //                (matches mlx-native `gated_delta_net_decode_capture.metal`
+    //                 lines 37-46: state_capture_seq_stride = n_tokens *
+    //                 state_capture_token_stride)
+    //
+    //   - conv_state: `[channels, K-1, n_seqs]`  col-major
+    //                ⇒ slot s offset = s * (channels * (K-1))
+    //
+    //   - conv_capture: `[n_seqs, n_tokens_max, K-1, channels]`  row-major
+    //                ⇒ slot s, token t offset = s * (n_tokens_max * (K-1) *
+    //                  channels) + t * ((K-1) * channels)
+    //
+    // Forward-path linear-attn dispatch sites in `gpu_delta_net.rs` (the H5
+    // `n_seqs = 1u32` hard-codes) are intentionally NOT lifted in this iter
+    // — they live behind the existing serial dispatch path and are gated on
+    // iter-A2b-cont (parallel to Qwen35 B4a → B4a-cont split per dossier).
+    //
+    // Order in this block:
+    //   H31 — capture buffer 5-D byte-scale at n_seqs=4
+    //   H32 — per-slot capture isolation: write slot 0 → slot 1 untouched
+    //   H33 — per-slot rollback isolation: rollback slot 0 → slot 1 recurrent
+    //         + conv_state untouched
+    //   H34 — n_seqs=1 byte-equivalence: rollback math matches pre-A2b
+    //   H35 — slot out-of-range typed error names ADR-040 Phase A2b
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// H31 — linear-attn capture buffer byte-scale at n_seqs=4.
+    ///
+    /// Pins that `ensure_la_capture` allocates the recurrent capture
+    /// (`[D_k, D_v, n_v_heads, n_tokens_max, n_seqs]` F32) AND the conv
+    /// capture (`[n_seqs, n_tokens_max, K-1, channels]` F32) at the
+    /// expected byte size for `n_seqs=4`.
+    ///
+    /// Falsifier: byte-len at n_seqs=4 not exactly 4× the n_seqs=1 baseline,
+    /// OR closed-form formula `n_seqs * n_tokens_max * per_seq_elems * 4`
+    /// (recurrent) disagrees with the alloc'd byte_len.
+    ///
+    /// **Layout proof (ADR §6.1.23):**
+    /// - recurrent capture per_seq_elems = D_k * D_v * n_v_heads
+    /// - recurrent capture bytes = n_seqs * n_tokens_max * per_seq_elems * 4
+    /// - conv capture per_seq_elems = channels * (K-1)
+    /// - conv capture bytes = n_seqs * n_tokens_max * per_seq_elems * 4
+    #[test]
+    fn h31_la_capture_buffer_byte_scale_n_seqs_4_2026_05_29() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let max_seq_len = 64u32;
+        let n_tokens_max = 4u32;
+
+        let mut cache_1 = HybridKvCache::new(&cfg, &device, max_seq_len, 1)
+            .expect("alloc n_seqs=1");
+        cache_1
+            .ensure_la_capture(&cfg, &device, n_tokens_max)
+            .expect("ensure n_seqs=1");
+
+        let mut cache_4 = HybridKvCache::new(&cfg, &device, max_seq_len, 4)
+            .expect("alloc n_seqs=4");
+        cache_4
+            .ensure_la_capture(&cfg, &device, n_tokens_max)
+            .expect("ensure n_seqs=4");
+
+        assert!(
+            !cache_1.linear_attn.is_empty(),
+            "tiny cfg has linear-attn slot"
+        );
+
+        // Falsifier (1): recurrent capture byte-len scales 4×.
+        let baseline_cap = cache_1.linear_attn[0]
+            .capture_states
+            .as_ref()
+            .expect("ensure_la_capture allocated capture_states at n_seqs=1")
+            .byte_len();
+        let lifted_cap = cache_4.linear_attn[0]
+            .capture_states
+            .as_ref()
+            .expect("ensure_la_capture allocated capture_states at n_seqs=4")
+            .byte_len();
+        assert_eq!(
+            lifted_cap, baseline_cap * 4,
+            "H31 FALSIFIED: recurrent capture does not scale linearly with n_seqs \
+             ({} != {} * 4 = {})",
+            lifted_cap, baseline_cap, baseline_cap * 4
+        );
+
+        // Closed-form check: bytes = n_seqs * n_tokens_max * per_seq_elems * 4.
+        let per_seq_elems = (cfg.linear_key_head_dim as usize)
+            * (cfg.linear_value_head_dim as usize)
+            * (cfg.linear_num_value_heads as usize);
+        let expected_bytes_4 =
+            4 * (n_tokens_max as usize) * per_seq_elems * 4;
+        assert_eq!(
+            lifted_cap, expected_bytes_4,
+            "H31 closed-form: capture bytes at n_seqs=4 must equal \
+             4 * {n_tokens_max} * {per_seq_elems} * 4 = {expected_bytes_4}; \
+             got {lifted_cap}"
+        );
+
+        // Falsifier (2): conv_capture byte-len scales 4×.
+        let baseline_conv = cache_1.linear_attn[0]
+            .conv_capture_states
+            .as_ref()
+            .expect("ensure_la_capture allocated conv_capture at n_seqs=1")
+            .byte_len();
+        let lifted_conv = cache_4.linear_attn[0]
+            .conv_capture_states
+            .as_ref()
+            .expect("ensure_la_capture allocated conv_capture at n_seqs=4")
+            .byte_len();
+        assert_eq!(
+            lifted_conv, baseline_conv * 4,
+            "H31 FALSIFIED: conv_capture does not scale linearly with n_seqs \
+             ({} != {} * 4 = {})",
+            lifted_conv, baseline_conv, baseline_conv * 4
+        );
+
+        let conv_channels = conv_channels_for(&cfg) as usize;
+        let k_minus1 = (cfg.linear_conv_kernel_dim.saturating_sub(1)) as usize;
+        let conv_per_seq = conv_channels * k_minus1;
+        let expected_conv_bytes_4 =
+            4 * (n_tokens_max as usize) * conv_per_seq * 4;
+        assert_eq!(
+            lifted_conv, expected_conv_bytes_4,
+            "H31 closed-form: conv_capture bytes at n_seqs=4 must equal \
+             4 * {n_tokens_max} * {conv_per_seq} * 4 = {expected_conv_bytes_4}; \
+             got {lifted_conv}"
+        );
+    }
+
+    /// H32 — per-slot capture write isolation.
+    ///
+    /// Pins that writing a known F32 pattern into slot 0's per-seq region of
+    /// `capture_states` leaves slot 1's region byte-identical to its
+    /// initial-allocated state (zero-init via the allocator).
+    ///
+    /// Falsifier: any byte in slot 1's per-seq capture region changed after
+    /// writing only slot 0's region.
+    ///
+    /// Layout: slot s offset = `s * (n_tokens_max * per_seq_elems)`
+    /// per-element. Per-seq slice = `[slot_off .. slot_off +
+    /// n_tokens_max*per_seq_elems]`.
+    #[test]
+    fn h32_la_capture_per_slot_write_isolation_2026_05_29() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let n_tokens_max = 4u32;
+
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+        cache
+            .ensure_la_capture(&cfg, &device, n_tokens_max)
+            .expect("ensure");
+
+        let per_seq_elems = (cfg.linear_key_head_dim as usize)
+            * (cfg.linear_value_head_dim as usize)
+            * (cfg.linear_num_value_heads as usize);
+        let seq_stride = (n_tokens_max as usize) * per_seq_elems;
+
+        // Snapshot slot 1's capture region BEFORE writing slot 0.
+        let snapshot_slot1: Vec<f32> = {
+            let cap = cache.linear_attn[0]
+                .capture_states
+                .as_ref()
+                .expect("capture allocated");
+            let slice = cap.as_slice::<f32>().expect("capture as_slice");
+            assert_eq!(
+                slice.len(),
+                seq_stride * 4,
+                "capture total elems must equal seq_stride * n_seqs"
+            );
+            slice[seq_stride..2 * seq_stride].to_vec()
+        };
+
+        // Write a non-zero pattern into slot 0's per-seq region.
+        {
+            let cap = cache.linear_attn[0]
+                .capture_states
+                .as_mut()
+                .expect("capture mut");
+            let slice = cap.as_mut_slice::<f32>().expect("capture mut slice");
+            for (i, v) in slice[..seq_stride].iter_mut().enumerate() {
+                *v = (i + 1) as f32 * 7.0;
+            }
+        }
+
+        // Slot 1's per-seq region must be byte-identical to the snapshot.
+        let after_slot1: Vec<f32> = {
+            let cap = cache.linear_attn[0]
+                .capture_states
+                .as_ref()
+                .expect("capture re-borrow");
+            let slice = cap.as_slice::<f32>().expect("capture as_slice 2");
+            slice[seq_stride..2 * seq_stride].to_vec()
+        };
+        assert_eq!(
+            after_slot1, snapshot_slot1,
+            "H32 FALSIFIED: writing slot 0's capture region perturbed slot 1's region \
+             (capture write isolation broken — slot stride must be exactly {} elems)",
+            seq_stride
+        );
+
+        // Also verify slots 2 and 3 are byte-untouched.
+        let after_slot2: Vec<f32> = {
+            let cap = cache.linear_attn[0].capture_states.as_ref().unwrap();
+            let slice = cap.as_slice::<f32>().unwrap();
+            slice[2 * seq_stride..3 * seq_stride].to_vec()
+        };
+        assert!(
+            after_slot2.iter().all(|&v| v == 0.0),
+            "H32: slot 2's capture region must remain zero-init after slot 0 write"
+        );
+        let after_slot3: Vec<f32> = {
+            let cap = cache.linear_attn[0].capture_states.as_ref().unwrap();
+            let slice = cap.as_slice::<f32>().unwrap();
+            slice[3 * seq_stride..4 * seq_stride].to_vec()
+        };
+        assert!(
+            after_slot3.iter().all(|&v| v == 0.0),
+            "H32: slot 3's capture region must remain zero-init after slot 0 write"
+        );
+    }
+
+    /// H33 — per-slot `rollback_la_to` isolation.
+    ///
+    /// Writes distinct patterns into slot 0's and slot 1's capture regions
+    /// (recurrent + conv), seeds non-zero contents into BOTH slots' active
+    /// `recurrent` + `conv_state` buffers, then calls
+    /// `rollback_la_to(SlotId(0), 2)` and asserts:
+    ///   1. Slot 0's recurrent + conv_state regions now contain slot 0's
+    ///      capture-at-token-2 pattern.
+    ///   2. Slot 1's recurrent + conv_state regions are byte-untouched.
+    ///   3. Slots 2 and 3 (n_seqs=4) are also byte-untouched.
+    ///
+    /// Falsifier: any byte in slot 1's, slot 2's, or slot 3's recurrent or
+    /// conv_state region changed after rolling back ONLY slot 0.
+    #[test]
+    fn h33_rollback_la_to_per_slot_isolation_2026_05_29() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let n_tokens_max = 4u32;
+
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+        cache
+            .ensure_la_capture(&cfg, &device, n_tokens_max)
+            .expect("ensure");
+
+        let per_seq_elems = (cfg.linear_key_head_dim as usize)
+            * (cfg.linear_value_head_dim as usize)
+            * (cfg.linear_num_value_heads as usize);
+        let cap_seq_stride = (n_tokens_max as usize) * per_seq_elems;
+
+        let conv_channels = conv_channels_for(&cfg) as usize;
+        let k_minus1 = (cfg.linear_conv_kernel_dim.saturating_sub(1)) as usize;
+        let conv_per_seq = conv_channels * k_minus1;
+        let conv_cap_seq_stride = (n_tokens_max as usize) * conv_per_seq;
+
+        // Seed capture buffers (per-slot distinct patterns).
+        // Slot 0 token t element idx: value = 1000 + t*100 + idx
+        // Slot 1 token t element idx: value = 9000 + t*100 + idx
+        // Recurrent capture (col-major; slot stride = cap_seq_stride):
+        {
+            let cap = cache.linear_attn[0]
+                .capture_states
+                .as_mut()
+                .expect("cap mut");
+            let slice = cap.as_mut_slice::<f32>().expect("cap mut slice");
+            for t in 0..(n_tokens_max as usize) {
+                for idx in 0..per_seq_elems {
+                    let s0 =
+                        0 * cap_seq_stride + t * per_seq_elems + idx;
+                    slice[s0] = (1000 + t * 100 + idx) as f32;
+                    let s1 =
+                        1 * cap_seq_stride + t * per_seq_elems + idx;
+                    slice[s1] = (9000 + t * 100 + idx) as f32;
+                }
+            }
+        }
+        // Conv capture (row-major; slot stride = conv_cap_seq_stride):
+        {
+            let cap = cache.linear_attn[0]
+                .conv_capture_states
+                .as_mut()
+                .expect("conv cap mut");
+            let slice = cap.as_mut_slice::<f32>().expect("conv cap mut slice");
+            for t in 0..(n_tokens_max as usize) {
+                for idx in 0..conv_per_seq {
+                    let s0 = 0 * conv_cap_seq_stride
+                        + t * conv_per_seq + idx;
+                    slice[s0] = (2000 + t * 200 + idx) as f32;
+                    let s1 = 1 * conv_cap_seq_stride
+                        + t * conv_per_seq + idx;
+                    slice[s1] = (8000 + t * 200 + idx) as f32;
+                }
+            }
+        }
+
+        // Seed active recurrent + conv_state for slots 1, 2, 3 with
+        // distinguishable patterns so the post-rollback snapshot can prove
+        // they were untouched.
+        {
+            let rec = &mut cache.linear_attn[0].recurrent;
+            let s = rec.as_mut_slice::<f32>().expect("rec mut");
+            assert_eq!(s.len(), per_seq_elems * 4);
+            for slot in 0..4usize {
+                for i in 0..per_seq_elems {
+                    s[slot * per_seq_elems + i] =
+                        (5_000_000 + slot * 1000 + i) as f32;
+                }
+            }
+        }
+        {
+            let cs = &mut cache.linear_attn[0].conv_state;
+            let s = cs.as_mut_slice::<f32>().expect("conv_state mut");
+            assert_eq!(s.len(), conv_per_seq * 4);
+            for slot in 0..4usize {
+                for i in 0..conv_per_seq {
+                    s[slot * conv_per_seq + i] =
+                        (6_000_000 + slot * 2000 + i) as f32;
+                }
+            }
+        }
+
+        // Snapshot slots 1, 2, 3 BEFORE rollback.
+        let pre_rec_slot1: Vec<f32> = cache.linear_attn[0]
+            .recurrent
+            .as_slice::<f32>()
+            .unwrap()[per_seq_elems..2 * per_seq_elems]
+            .to_vec();
+        let pre_rec_slot2: Vec<f32> = cache.linear_attn[0]
+            .recurrent
+            .as_slice::<f32>()
+            .unwrap()[2 * per_seq_elems..3 * per_seq_elems]
+            .to_vec();
+        let pre_rec_slot3: Vec<f32> = cache.linear_attn[0]
+            .recurrent
+            .as_slice::<f32>()
+            .unwrap()[3 * per_seq_elems..4 * per_seq_elems]
+            .to_vec();
+        let pre_conv_slot1: Vec<f32> = cache.linear_attn[0]
+            .conv_state
+            .as_slice::<f32>()
+            .unwrap()[conv_per_seq..2 * conv_per_seq]
+            .to_vec();
+        let pre_conv_slot2: Vec<f32> = cache.linear_attn[0]
+            .conv_state
+            .as_slice::<f32>()
+            .unwrap()[2 * conv_per_seq..3 * conv_per_seq]
+            .to_vec();
+        let pre_conv_slot3: Vec<f32> = cache.linear_attn[0]
+            .conv_state
+            .as_slice::<f32>()
+            .unwrap()[3 * conv_per_seq..4 * conv_per_seq]
+            .to_vec();
+
+        // Rollback ONLY slot 0 to token index 2.
+        cache
+            .rollback_la_to(crate::serve::multi_seq_kv::SlotId(0), 2)
+            .expect("rollback slot 0 ok");
+
+        // Verify slot 0's recurrent now contains the capture[s=0, t=2] pattern.
+        let post_rec_slot0: Vec<f32> = cache.linear_attn[0]
+            .recurrent
+            .as_slice::<f32>()
+            .unwrap()[0..per_seq_elems]
+            .to_vec();
+        for (idx, &v) in post_rec_slot0.iter().enumerate() {
+            assert_eq!(
+                v,
+                (1000 + 2 * 100 + idx) as f32,
+                "H33: slot 0 recurrent[{idx}] after rollback to (slot=0, t=2)"
+            );
+        }
+
+        // Slot 1's, 2's, 3's recurrent must be byte-identical to pre-rollback.
+        let post_rec_slot1: Vec<f32> = cache.linear_attn[0]
+            .recurrent
+            .as_slice::<f32>()
+            .unwrap()[per_seq_elems..2 * per_seq_elems]
+            .to_vec();
+        assert_eq!(
+            post_rec_slot1, pre_rec_slot1,
+            "H33 FALSIFIED: slot 1 recurrent perturbed by rollback of slot 0"
+        );
+        let post_rec_slot2: Vec<f32> = cache.linear_attn[0]
+            .recurrent
+            .as_slice::<f32>()
+            .unwrap()[2 * per_seq_elems..3 * per_seq_elems]
+            .to_vec();
+        assert_eq!(
+            post_rec_slot2, pre_rec_slot2,
+            "H33 FALSIFIED: slot 2 recurrent perturbed by rollback of slot 0"
+        );
+        let post_rec_slot3: Vec<f32> = cache.linear_attn[0]
+            .recurrent
+            .as_slice::<f32>()
+            .unwrap()[3 * per_seq_elems..4 * per_seq_elems]
+            .to_vec();
+        assert_eq!(
+            post_rec_slot3, pre_rec_slot3,
+            "H33 FALSIFIED: slot 3 recurrent perturbed by rollback of slot 0"
+        );
+
+        // Slot 1's, 2's, 3's conv_state must be byte-identical too.
+        let post_conv_slot1: Vec<f32> = cache.linear_attn[0]
+            .conv_state
+            .as_slice::<f32>()
+            .unwrap()[conv_per_seq..2 * conv_per_seq]
+            .to_vec();
+        assert_eq!(
+            post_conv_slot1, pre_conv_slot1,
+            "H33 FALSIFIED: slot 1 conv_state perturbed by rollback of slot 0"
+        );
+        let post_conv_slot2: Vec<f32> = cache.linear_attn[0]
+            .conv_state
+            .as_slice::<f32>()
+            .unwrap()[2 * conv_per_seq..3 * conv_per_seq]
+            .to_vec();
+        assert_eq!(
+            post_conv_slot2, pre_conv_slot2,
+            "H33 FALSIFIED: slot 2 conv_state perturbed by rollback of slot 0"
+        );
+        let post_conv_slot3: Vec<f32> = cache.linear_attn[0]
+            .conv_state
+            .as_slice::<f32>()
+            .unwrap()[3 * conv_per_seq..4 * conv_per_seq]
+            .to_vec();
+        assert_eq!(
+            post_conv_slot3, pre_conv_slot3,
+            "H33 FALSIFIED: slot 3 conv_state perturbed by rollback of slot 0"
+        );
+    }
+
+    /// H34 — n_seqs=1 byte-equivalence (regression pin).
+    ///
+    /// Pins that at `n_seqs=1`, the new per-slot `rollback_la_to(SlotId(0),
+    /// accepted_idx)` produces a recurrent + conv_state byte-identical to
+    /// the pre-A2b legacy `rollback_la_to(accepted_idx)` (which used
+    /// `state_elems = recurrent.element_count()` — coincidentally equal to
+    /// per-seq elems at n_seqs=1).
+    ///
+    /// The legacy code path is reconstructed inline (whole-buffer
+    /// `state_elems` math + flat memcpy) on a second cache with the same
+    /// seed; the two `recurrent` + `conv_state` buffers must be
+    /// bit-exact.
+    #[test]
+    fn h34_rollback_la_to_n_seqs_1_byte_equivalence_2026_05_29() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let n_tokens_max = 4u32;
+
+        // Cache (a): exercise new per-slot rollback path.
+        let mut cache_a =
+            HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc a");
+        cache_a
+            .ensure_la_capture(&cfg, &device, n_tokens_max)
+            .expect("ensure a");
+
+        // Cache (b): identical seed, used as the "shadow" for legacy math.
+        let mut cache_b =
+            HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc b");
+        cache_b
+            .ensure_la_capture(&cfg, &device, n_tokens_max)
+            .expect("ensure b");
+
+        let per_seq_elems = (cfg.linear_key_head_dim as usize)
+            * (cfg.linear_value_head_dim as usize)
+            * (cfg.linear_num_value_heads as usize);
+        let conv_channels = conv_channels_for(&cfg) as usize;
+        let k_minus1 = (cfg.linear_conv_kernel_dim.saturating_sub(1)) as usize;
+        let conv_per_seq = conv_channels * k_minus1;
+
+        // Identical capture pattern for both caches.
+        let seed_capture =
+            |cache: &mut HybridKvCache| {
+                for la in cache.linear_attn.iter_mut() {
+                    let cap = la.capture_states.as_mut().unwrap();
+                    let s = cap.as_mut_slice::<f32>().unwrap();
+                    for t in 0..(n_tokens_max as usize) {
+                        for idx in 0..per_seq_elems {
+                            s[t * per_seq_elems + idx] =
+                                (t as f32) * 1000.0 + idx as f32 + 0.5;
+                        }
+                    }
+                    let conv_cap =
+                        la.conv_capture_states.as_mut().unwrap();
+                    let cs = conv_cap.as_mut_slice::<f32>().unwrap();
+                    for t in 0..(n_tokens_max as usize) {
+                        for idx in 0..conv_per_seq {
+                            cs[t * conv_per_seq + idx] =
+                                (t as f32) * 3000.0 + idx as f32 + 0.25;
+                        }
+                    }
+                }
+            };
+        seed_capture(&mut cache_a);
+        seed_capture(&mut cache_b);
+
+        // Cache (a): use the production per-slot rollback.
+        cache_a
+            .rollback_la_to(crate::serve::multi_seq_kv::SlotId(0), 2)
+            .expect("rollback a");
+
+        // Cache (b): simulate the pre-A2b legacy math (whole-buffer
+        // state_elems + flat memcpy + conv re-index loop) inline. At
+        // n_seqs=1 this is provably identical to per-seq math.
+        for slot_data in cache_b.linear_attn.iter_mut() {
+            let capture = slot_data.capture_states.as_ref().unwrap();
+            let state_elems = slot_data.recurrent.element_count();
+            // At n_seqs=1: state_elems == per_seq_elems.
+            assert_eq!(state_elems, per_seq_elems);
+            let cap_slice = capture.as_slice::<f32>().unwrap();
+            let src_offset = 2 * state_elems;
+            let src_owned: Vec<f32> =
+                cap_slice[src_offset..src_offset + state_elems].to_vec();
+            let dst =
+                slot_data.recurrent.as_mut_slice::<f32>().unwrap();
+            dst.copy_from_slice(&src_owned);
+
+            let conv_capture =
+                slot_data.conv_capture_states.as_ref().unwrap();
+            let conv_state_elems = slot_data.conv_state.element_count();
+            assert_eq!(conv_state_elems, conv_per_seq);
+            let conv_cap_slice =
+                conv_capture.as_slice::<f32>().unwrap();
+            let conv_src_offset = 2 * conv_state_elems;
+            let conv_src_owned: Vec<f32> = conv_cap_slice
+                [conv_src_offset..conv_src_offset + conv_state_elems]
+                .to_vec();
+            let conv_dst =
+                slot_data.conv_state.as_mut_slice::<f32>().unwrap();
+            for k_i in 0..k_minus1 {
+                for c in 0..conv_channels {
+                    let src_idx = k_i * conv_channels + c;
+                    let dst_idx = c * k_minus1 + k_i;
+                    conv_dst[dst_idx] = conv_src_owned[src_idx];
+                }
+            }
+        }
+
+        // Byte-equality of recurrent + conv_state across both caches.
+        for (la_a, la_b) in cache_a
+            .linear_attn
+            .iter()
+            .zip(cache_b.linear_attn.iter())
+        {
+            let ra = la_a.recurrent.as_slice::<f32>().unwrap();
+            let rb = la_b.recurrent.as_slice::<f32>().unwrap();
+            assert_eq!(
+                ra, rb,
+                "H34 FALSIFIED: recurrent bytes differ between A2b per-slot \
+                 path and legacy whole-buffer path at n_seqs=1"
+            );
+            let ca = la_a.conv_state.as_slice::<f32>().unwrap();
+            let cb = la_b.conv_state.as_slice::<f32>().unwrap();
+            assert_eq!(
+                ca, cb,
+                "H34 FALSIFIED: conv_state bytes differ between A2b per-slot \
+                 path and legacy whole-buffer path at n_seqs=1"
+            );
+        }
+    }
+
+    /// H35 — slot out-of-range typed error.
+    ///
+    /// Pins that `rollback_la_to(SlotId(99), 0)` returns `Err` whose Display
+    /// message names "SlotOutOfRange" and "ADR-040 Phase A2b" — bounds-first
+    /// per iter-1.5 cfa-finding-F5 ordering.
+    ///
+    /// Also pins that the error is raised BEFORE any
+    /// `ensure_la_capture` check: a fresh cache without ensure_la_capture
+    /// at slot=99 still surfaces SlotOutOfRange (not the
+    /// "capture_states is None" message).
+    #[test]
+    fn h35_rollback_la_to_slot_out_of_range_typed_2026_05_29() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+
+        let mut cache =
+            HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc n_seqs=4");
+        cache.ensure_la_capture(&cfg, &device, 4).expect("ensure");
+
+        // SlotId(4) is one past the valid range [0, 3].
+        let err = cache
+            .rollback_la_to(crate::serve::multi_seq_kv::SlotId(4), 0)
+            .expect_err("slot 4 OOR for n_seqs=4");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SlotOutOfRange"),
+            "H35: error message must contain 'SlotOutOfRange'; got: {msg}"
+        );
+        assert!(
+            msg.contains("slot=4"),
+            "H35: error message must surface slot id; got: {msg}"
+        );
+        assert!(
+            msg.contains("max_slots=4"),
+            "H35: error message must surface max_slots; got: {msg}"
+        );
+        assert!(
+            msg.contains("ADR-040 Phase A2b"),
+            "H35: error message must name the iter that introduced bounds; got: {msg}"
+        );
+
+        // SlotId(99) — same family.
+        let err = cache
+            .rollback_la_to(crate::serve::multi_seq_kv::SlotId(99), 0)
+            .expect_err("slot 99 OOR");
+        assert!(
+            format!("{err}").contains("SlotOutOfRange"),
+            "H35: SlotId(99) must also surface SlotOutOfRange"
+        );
+
+        // Bounds-first ordering: cache WITHOUT ensure_la_capture at slot=99
+        // still surfaces SlotOutOfRange (not the "capture_states is None"
+        // message). This pins cfa-finding-F5's "bounds before pre-condition"
+        // ordering against any future iter that re-orders the validation.
+        let mut cache_no_cap =
+            HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+        let err = cache_no_cap
+            .rollback_la_to(crate::serve::multi_seq_kv::SlotId(99), 0)
+            .expect_err("slot OOR before ensure_la_capture");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SlotOutOfRange"),
+            "H35: bounds-first — SlotOutOfRange must surface BEFORE \
+             capture_states None check; got: {msg}"
+        );
+        assert!(
+            !msg.contains("capture_states is None"),
+            "H35: bounds-first — capture_states-None message must NOT \
+             leak past the slot-OOR guard; got: {msg}"
+        );
     }
 }

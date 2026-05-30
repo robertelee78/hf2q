@@ -131,7 +131,15 @@ impl<'a> DFlashTarget for Qwen35DFlashTarget<'a> {
                         // propagating (the trait method is infallible by
                         // signature; orchestrator already preserved
                         // forward-pass correctness even without LA rollback).
-                        if let Err(e) = self.kv_cache.rollback_la_to(accepted_idx) {
+                        // ADR-040 Phase A2b (2026-05-29) — rollback_la_to
+                        // now requires a SlotId. DFlash target operates on
+                        // single-seq today (HybridKvCache.n_seqs == 1); pass
+                        // SlotId(0). Multi-seq lift of dflash dispatch is
+                        // gated on iter-A2b-cont per ADR §6 sequencing.
+                        if let Err(e) = self.kv_cache.rollback_la_to(
+                            crate::serve::multi_seq_kv::SlotId(0),
+                            accepted_idx,
+                        ) {
                             eprintln!(
                                 "[Qwen35DFlashTarget] rollback_la_to({}) failed: {} \
                                  — LA state may be stale by {} positions",
