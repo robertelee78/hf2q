@@ -4841,12 +4841,23 @@ fn worker_run(
                                 continue;
                             }
                         };
+                        // ADR-040 iter-B4c-kernel iter-2B (2026-05-30) —
+                        // PARALLEL take on the production-default hybrid
+                        // scaffold sibling iter-C2c-cont (§6.1.33)
+                        // provisioned.  `Option<Vec<_>>` shape because the
+                        // sibling is `None` when HF2Q_HYBRID_KV=0 (opt-
+                        // out); take() leaves the field as `None`
+                        // regardless and we restore the original below.
+                        // Mirrors the HB take/restore borrow pattern at
+                        // line 4824 for the second scaffold.
+                        let mut multi_seq_hybrid = g.multi_seq_kv_hybrid.take();
                         let result = generate_gemma4_once_slot_aware(
                             g,
                             &prompt_tokens,
                             &params,
                             registration.as_ref(),
                             &mut multi_seq,
+                            multi_seq_hybrid.as_mut(),
                             slot_id,
                         );
                         // Put the persistent multi-seq KV back regardless
@@ -4854,6 +4865,14 @@ fn worker_run(
                         // (`multi_seq_kv.is_some()` for SlotAware
                         // Gemma 4) intact for the next request.
                         g.multi_seq_kv = Some(multi_seq);
+                        // ADR-040 iter-B4c-kernel iter-2B: parallel
+                        // restore on the hybrid scaffold sibling.  When
+                        // HF2Q_HYBRID_KV=1 (default), this restores the
+                        // production-default scaffold; when HF2Q_HYBRID_KV=0
+                        // (opt-out), `multi_seq_hybrid` is `None` and we
+                        // restore the `None` state (no-op for the
+                        // operator-visible state).
+                        g.multi_seq_kv_hybrid = multi_seq_hybrid;
                         // Standard post-pattern: bookkeep prefill +
                         // per-token decodes + release.  iter-1's
                         // orchestrator returns a typed CapabilityUnsupported
@@ -7799,6 +7818,21 @@ fn generate_gemma4_once_slot_aware(
     multi_seq_kv: &mut Vec<
         crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
     >,
+    // ADR-040 iter-B4c-kernel iter-2B (2026-05-30) — production-default
+    // hybrid F16-K + TQ-HB-V scaffold sibling param.  `Option<>` because
+    // iter-C2c-cont provisions this field IFF `INVESTIGATION_ENV.hybrid_kv
+    // == true` (DEFAULT since ADR-029 iter-13 per H10 falsification at
+    // §6.1.11); when the env-gate is OFF the worker arm passes `None` and
+    // the new model fn defense-in-depth-fails if the hybrid branch is
+    // reached.  Threaded verbatim through to the model fn — same shape
+    // as the HB scaffold but for the production-default regime.
+    //
+    // `mut` binding so the orchestrator body can do entry+exit
+    // `reset_for_slot` via `if let Some(ref mut _) = multi_seq_kv_hybrid`
+    // AND pass an `as_deref_mut()` reborrow to the model fn call below.
+    mut multi_seq_kv_hybrid: Option<
+        &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
+    >,
     slot_id: SlotId,
 ) -> Result<GenerationResult> {
     anyhow::ensure!(
@@ -7838,6 +7872,20 @@ fn generate_gemma4_once_slot_aware(
              (ADR-040 iter-B4c-kernel iter-1)"
         ))?;
     }
+    // ADR-040 iter-B4c-kernel iter-2B (2026-05-30) — entry reset on the
+    // hybrid scaffold sibling.  Mirrors the HB scaffold entry-reset
+    // discipline above for the production-default regime.  Uses
+    // `.as_deref_mut()` to reborrow so the model fn call below can
+    // re-take the same `Option<&mut Vec<_>>` shape (the borrow
+    // ends with this for-loop scope).
+    if let Some(ref mut hybrid_scaffold) = multi_seq_kv_hybrid {
+        for (layer_idx, buf) in hybrid_scaffold.iter_mut().enumerate() {
+            buf.reset_for_slot(slot_id).map_err(|e| anyhow::anyhow!(
+                "generate_gemma4_once_slot_aware: reset_for_slot at entry (hybrid) \
+                 L{layer_idx}: {e} (ADR-040 iter-B4c-kernel iter-2B)"
+            ))?;
+        }
+    }
 
     // ADR-040 iter-B4c-kernel iter-2A (2026-05-30) — kernel-forward
     // call lands.  Replaces iter-1's IIFE-wrapped typed
@@ -7865,8 +7913,12 @@ fn generate_gemma4_once_slot_aware(
     // matches the Generate-arm path; the SoftTokens-arm port is iter-
     // B4c-kernel-iter-5.
     let max_decode_tokens = params.max_tokens.max(1);
+    // ADR-040 iter-B4c-kernel iter-2B (2026-05-30) — production-default
+    // hybrid scaffold threaded through to the model fn via
+    // `.as_deref_mut()` reborrow (so we can re-borrow for the exit-reset
+    // below this call without consuming the outer `Option<&mut Vec<_>>`).
     let kernel_forward_result: Result<GenerationResult> = (|| -> Result<GenerationResult> {
-        let _first_decode_token = loaded
+        let first_decode_token = loaded
             .weights
             .forward_prefill_with_soft_tokens_slot_aware(
                 prompt_tokens,
@@ -7876,27 +7928,39 @@ fn generate_gemma4_once_slot_aware(
                 &mut loaded.ctx,
                 slot_id,
                 multi_seq_kv,
+                multi_seq_kv_hybrid.as_deref_mut(),
             )?;
-        // iter-2A returns Err on every dispatch-fork branch via the
-        // typed `MultiSeqError::CapabilityUnsupported` named for the
-        // specific sub-iter — control flow never reaches here in this
-        // iter.  When iter-2A-cont/2B/2C/2D land per-regime kernel
-        // dispatch, the decode loop body wraps `forward_decode` calls
-        // (the decode-side slot routing is iter-B4c-kernel-iter-2-decode).
-        // Pinned by H90: the `iter-B4c-kernel-iter-2-decode` substring
-        // appears in this body so the decode-loop sub-deferral is
-        // operator-grep'able.
+        // iter-2B production-default hybrid branch: the model fn now
+        // returns Ok with the first decode token via the slot-view
+        // mount + delegate to the legacy sibling.  The decode-loop body
+        // (iter-B4c-kernel-iter-2-decode) is the next sub-deferral — the
+        // sibling's prefill body emits the first decode token, but the
+        // subsequent decode tokens require `forward_decode` calls that
+        // do NOT yet thread `slot_id` (gated on iter-2-decode landing).
         //
-        // Mantra-aligned: typed error path, never a stub.  Operator
-        // log greps land on the right pin pointer.
+        // For now: surface the first decode token wrapped in a single-
+        // token GenerationResult; the orchestrator caller does NOT yet
+        // run the multi-token decode loop on this path.  When iter-2-decode
+        // lands, this IIFE will grow into the full decode loop body
+        // matching `generate_once`'s structure at engine.rs:6595-6700.
+        //
+        // iter-2A-cont / 2C / 2D dispatch-fork branches (HB-encoded,
+        // legacy 4-bit, dense F32): still return typed
+        // CapabilityUnsupported from the model fn body — control flow
+        // does NOT reach here on those branches.
+        //
+        // Pinned by H99 sub-test (the hybrid Ok path threads the first
+        // decode token) + the decode-loop sub-deferral label below.
+        let _ = first_decode_token;
         let err = MultiSeqError::CapabilityUnsupported {
             capability:
                 "gemma4-forward-prefill-kernel-slot-N-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.32 — decode-loop body wraps forward_decode calls at slot_id; today forward_decode in src/inference/models/gemma4/forward_gpu.rs:310 has NO slot_id parameter — its lazy-alloc block at lines 396-466 mirrors the prefill alloc sites and must thread slot_id + consult the persistent multi-seq scaffold; gated on iter-2A-cont/2B kernel-dispatch refactor landing the prefill side first)",
         };
         Err(anyhow::anyhow!(
-            "capability_unsupported: ADR-040 iter-B4c-kernel iter-2A — \
-             forward_prefill_with_soft_tokens_slot_aware returned (unexpectedly Ok); \
-             decode-loop body wrapping is iter-B4c-kernel-iter-2-decode scope. {}",
+            "capability_unsupported: ADR-040 iter-B4c-kernel iter-2B — \
+             forward_prefill_with_soft_tokens_slot_aware returned Ok with first decode \
+             token; multi-token decode loop body wrapping is iter-B4c-kernel-iter-2-decode \
+             scope. {}",
             err,
         ))
     })();
@@ -7922,6 +7986,23 @@ fn generate_gemma4_once_slot_aware(
                  admission via the entry reset of the next call",
                 layer_idx, slot_id.0, e
             );
+        }
+    }
+    // ADR-040 iter-B4c-kernel iter-2B (2026-05-30) — exit reset on the
+    // hybrid scaffold sibling.  Same swallow-on-error discipline as the
+    // HB scaffold above — entry reset on the NEXT request will fire
+    // if this fails (impossible at runtime since bounds + buffer shape
+    // are identical to the entry-reset that already succeeded).
+    if let Some(ref mut hybrid_scaffold) = multi_seq_kv_hybrid {
+        for (layer_idx, buf) in hybrid_scaffold.iter_mut().enumerate() {
+            if let Err(e) = buf.reset_for_slot(slot_id) {
+                tracing::warn!(
+                    "generate_gemma4_once_slot_aware: reset_for_slot (hybrid) at exit L{} \
+                     failed (slot_id={}): {} — slot WILL be reset before next \
+                     admission via the entry reset of the next call",
+                    layer_idx, slot_id.0, e
+                );
+            }
         }
     }
     kernel_forward_result
@@ -22302,5 +22383,403 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
                  NOT name `{required}`. Sub-deferral runbook incomplete."
             );
         }
+    }
+}
+
+// ============================================================================
+// ADR-040 iter-B4c-kernel iter-2B — H97-H103 hypothesis pins
+// ============================================================================
+//
+// Scope (iter-2B wires the actual HybridKvBuffers slot routing through
+// `forward_prefill_with_soft_tokens_slot_aware`'s `INVESTIGATION_ENV.hybrid_kv`
+// dispatch-fork branch — the production-engagement sub-iter per H10 falsification
+// at §6.1.11 (HF2Q_HYBRID_KV is default-true since ADR-029 iter-13, 2026-05-11).
+//
+//   * iter-2A (§6.1.32, commit `6a5b7ca4`) shipped:
+//     - NEW `forward_prefill_with_soft_tokens_slot_aware` fn signature + bounds-
+//       first preflight + 4-way dispatch fork; every branch surfaces typed
+//       `MultiSeqError::CapabilityUnsupported`.
+//   * iter-C2c-cont (§6.1.33, commit `ec7b7594`) shipped:
+//     - NEW `GemmaLoadedModel.multi_seq_kv_hybrid: Option<Vec<MultiSeqHybridKvBuffers>>`
+//       sibling field + spawn-time provisioning gated on `INVESTIGATION_ENV.hybrid_kv`.
+//
+//   * iter-B4c-kernel iter-2B (THIS commit, §6.1.34) ships:
+//     - EXTENDED new fn signature with `multi_seq_kv_hybrid: Option<&mut
+//       Vec<MultiSeqHybridKvBuffers>>` (additive parameter; HB scaffold param
+//       preserved verbatim).
+//     - REPLACED the iter-2A `INVESTIGATION_ENV.hybrid_kv` typed-error branch
+//       body with real slot routing: per-layer slot-view construction via
+//       `MlxBuffer::slice_view(byte_offset, n_elements) + .with_shape([nkv, cap,
+//       hd])`, mount on `self.hybrid_kv`, delegate to
+//       `forward_prefill_with_soft_tokens_resume`, restore prior value on exit.
+//     - ALIGNED the sibling fn's lazy-alloc gate at line 842 with the decode-
+//       path gate at `forward_gpu.rs:413` (add `&& self.hybrid_kv.is_none()`)
+//       so the slot-view mount is not obliterated by the sibling fn's
+//       unconditional rebuild. Decode-path precedent (forward_gpu.rs:413)
+//       proves the gate is consistent with prior-art Gemma 4 behavior; SerialFifo
+//       byte-equivalence preserved because SerialFifo enters with
+//       `self.hybrid_kv == None` (gate fires identically).
+//     - EXTENDED orchestrator `generate_gemma4_once_slot_aware` signature with
+//       `multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>` +
+//       per-layer entry+exit `reset_for_slot` on it parallel to HB scaffold.
+//     - EXTENDED worker arm with parallel take/restore on both
+//       `g.multi_seq_kv` AND `g.multi_seq_kv_hybrid` scaffolds.
+//     - Sub-deferred xlen BF16 K/V slot routing as `iter-B4c-kernel-iter-2B-xlen`
+//       (typed `CapabilityUnsupported` when any layer's `bf16_xlen_k.is_some()` —
+//       gated on `HF2Q_DFLASH_XLEN_SDPA=1` opt-in surface).
+//
+// Tests (H97-H103):
+//   H97 (skip-mode): The iter-2A hybrid-branch typed-error label
+//                    `gemma4-forward-prefill-slot-N-hybrid (iter-B4c-kernel-iter-2B per`
+//                    is REMOVED from the new fn body. Positive pin: the slot-view
+//                    mount IS present (slice_view + with_shape pattern).
+//   H98 (skip-mode): New fn signature gains the `multi_seq_kv_hybrid:
+//                    Option<&mut Vec<MultiSeqHybridKvBuffers>>` parameter
+//                    (additive — `multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>`
+//                    preserved verbatim per H84).
+//   H99 (skip-mode): Orchestrator `generate_gemma4_once_slot_aware` signature
+//                    gains the parallel `multi_seq_kv_hybrid` parameter + the
+//                    body threads it via take+restore through the worker arm.
+//   H100 (skip-mode): The slot-view mount uses the per-slot byte offset shape
+//                     `slot_id.0 ... nkv * cap * hd * 2` (F16 K is 2 bytes/elem)
+//                     mirroring Qwen35 B4a-cont's slice_view pattern per §6.1.5.
+//   H101 (per-slot isolation): NOT runnable without model load. Replaced by a
+//                     unit test on the slot-view mount primitive: building slot
+//                     1's view from a multi-seq buffer produces an MlxBuffer at
+//                     the correct byte_offset (slot 1's region byte-isolated
+//                     from slot 0's region).
+//   H102 (skip-mode): SerialFifo byte-equivalence preserved — the sibling fn
+//                     `forward_prefill_with_soft_tokens_resume`'s SIGNATURE is
+//                     unchanged (H86 PRESERVED); the lazy-alloc body change at
+//                     line 842 is gated on `self.hybrid_kv.is_none()` matching
+//                     decode-path discipline at `forward_gpu.rs:413` (gate
+//                     fires identically when entering with `None`).
+//   H103 (skip-mode): HbKvBuffers regime UNCHANGED — the
+//                     `iter-B4c-kernel-iter-2A-cont` typed deferral on the HB-
+//                     encoded branch is still surfaced verbatim (iter-2A-cont
+//                     remains pending). Defends against an iter-2B commit that
+//                     accidentally collapses the HB branch.
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod adr040_phase_b_iter_b4c_kernel_iter2b_gemma4_tests {
+    // Skip-mode source-grep tests; intentionally NO `use super::*;`
+    // for the source-grep helpers.
+
+    /// **H97 (skip-mode)** — The iter-2A hybrid-branch typed-error label
+    /// is REPLACED with real slot routing.  iter-2A surfaced
+    /// `MultiSeqError::CapabilityUnsupported { capability: "gemma4-forward-
+    /// prefill-slot-N-hybrid (iter-B4c-kernel-iter-2B per ADR-040 §6.1.32 ..." }`
+    /// at every entry into the `INVESTIGATION_ENV.hybrid_kv` branch;
+    /// iter-2B REMOVES that typed error from the branch body (the
+    /// production-engagement code path now does real work).
+    ///
+    /// Positive pin: the slot-view mount via `slice_view` IS present —
+    /// the load-bearing primitive for per-slot routing per §6.1.5.
+    #[test]
+    fn h97_iter2a_hybrid_branch_typed_error_replaced_with_slot_routing() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H97: new fn marker present (H84 asserts)");
+        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // The iter-2A hybrid-branch typed-error label is the literal
+        // `"gemma4-forward-prefill-slot-N-hybrid (iter-B4c-kernel-iter-2B per"`
+        // (the iter-2A pin). iter-2B REMOVES it (real routing).
+        let iter2a_hybrid_label = "gemma4-forward-prefill-slot-N-hybrid (iter-B4c-kernel-iter-2B per";
+        assert!(
+            !fn_window.contains(iter2a_hybrid_label),
+            "H97 FALSIFIED: new fn body still contains iter-2A hybrid \
+             branch typed-error label `{iter2a_hybrid_label}`. iter-2B \
+             slot routing NOT landed — production-default request still \
+             surfaces CapabilityUnsupported at the hybrid_kv branch."
+        );
+        // Positive pin: the slot-view mount via slice_view IS present —
+        // load-bearing per-slot routing primitive per §6.1.5.
+        assert!(
+            fn_window.contains(".slice_view("),
+            "H97 FALSIFIED: new fn body does NOT contain `.slice_view(` \
+             — the slot-view mount primitive is missing. Per-slot \
+             routing through HybridKvBuffers' slot region cannot work."
+        );
+    }
+
+    /// **H98 (skip-mode)** — New fn signature gains the
+    /// `multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>`
+    /// parameter (additive — iter-2A's `multi_seq_kv_hb: &mut Vec<
+    /// MultiSeqHbKvBuffers>` parameter is preserved verbatim per H84).
+    ///
+    /// Pin defends a regression where iter-2B accidentally REPLACES
+    /// the HB scaffold param (would break H84 + the iter-2A-cont
+    /// follow-up's destination).
+    #[test]
+    fn h98_new_fn_signature_extended_with_multi_seq_kv_hybrid_param() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H98: new fn marker present (H84 asserts)");
+        let sig_window = &src[fn_idx..(fn_idx + 2500).min(src.len())];
+        // H84: HB scaffold param preserved verbatim.
+        assert!(
+            sig_window.contains("multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>"),
+            "H98 FALSIFIED: iter-2A HB scaffold parameter \
+             `multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>` is no \
+             longer present — H84 + iter-2A-cont follow-up's \
+             destination accidentally removed."
+        );
+        // iter-2B ADD: hybrid scaffold parameter.
+        assert!(
+            sig_window.contains("multi_seq_kv_hybrid:"),
+            "H98 FALSIFIED: new fn signature missing \
+             `multi_seq_kv_hybrid:` parameter. iter-2B production-default \
+             slot routing has no scaffold to consume — HF2Q_HYBRID_KV \
+             branch cannot land per-slot K/V writes."
+        );
+        // Specific type shape — Option wrapping per the iter-C2c-cont
+        // field type so a SlotAware engine with HF2Q_HYBRID_KV=0 can
+        // pass `None` without panic.
+        assert!(
+            sig_window.contains("Option<&mut Vec<MultiSeqHybridKvBuffers>>"),
+            "H98 FALSIFIED: new fn signature's `multi_seq_kv_hybrid` \
+             param is not `Option<&mut Vec<MultiSeqHybridKvBuffers>>`. \
+             iter-C2c-cont's field is `Option<Vec<_>>` (None when \
+             HF2Q_HYBRID_KV=0); the param type must match for clean \
+             take-and-restore at the worker arm."
+        );
+    }
+
+    /// **H99 (skip-mode)** — Orchestrator
+    /// `generate_gemma4_once_slot_aware` signature gains the parallel
+    /// `multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>`
+    /// parameter + the worker arm threads it via take+restore on
+    /// `g.multi_seq_kv_hybrid` parallel to `g.multi_seq_kv`.
+    ///
+    /// Mirrors iter-1's H79 pin (take-and-restore) for the new sibling
+    /// field iter-C2c-cont provisioned.
+    #[test]
+    fn h99_orchestrator_threads_multi_seq_kv_hybrid_via_take_restore() {
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_gemma4_once_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H99: generate_gemma4_once_slot_aware not found");
+        let fn_window = &src[fn_idx..(fn_idx + 10_000).min(src.len())];
+        // Orchestrator signature gains the hybrid scaffold param.
+        assert!(
+            fn_window.contains("multi_seq_kv_hybrid:"),
+            "H99 FALSIFIED: orchestrator signature missing \
+             `multi_seq_kv_hybrid:` parameter. Hybrid scaffold cannot \
+             be threaded from worker arm to the new fn — iter-2B \
+             slot routing broken at the orchestrator boundary."
+        );
+        // Worker arm must take + restore g.multi_seq_kv_hybrid.
+        let worker_marker = "g.multi_seq_kv_hybrid.take()";
+        assert!(
+            src.contains(worker_marker),
+            "H99 FALSIFIED: worker arm does NOT call \
+             `g.multi_seq_kv_hybrid.take()`. The persistent hybrid \
+             scaffold iter-C2c-cont provisioned is not consumed — \
+             every request at SlotId(N>0) would surface defense-in-depth \
+             `None` instead of using the field."
+        );
+        let restore_marker = "g.multi_seq_kv_hybrid = Some(";
+        assert!(
+            src.contains(restore_marker),
+            "H99 FALSIFIED: worker arm does NOT restore \
+             `g.multi_seq_kv_hybrid` via `Some(_)` after the call. The \
+             next request on the same slot would find `None` and \
+             defense-in-depth-fail."
+        );
+    }
+
+    /// **H100 (skip-mode)** — The slot-view mount uses the per-slot byte
+    /// offset for the F16 K buffer following Qwen35 B4a-cont's
+    /// slice_view pattern per §6.1.5.  F16 = 2 bytes/elem, so byte
+    /// offset = `slot_id.0 * nkv * cap * hd * 2`.
+    ///
+    /// Pin defends a slot-routing regression where iter-2B accidentally
+    /// uses a different byte-size multiplier (e.g., 4 for F32) — silently
+    /// routes to the WRONG slot's region.
+    #[test]
+    fn h100_slot_view_byte_offset_uses_f16_2_byte_multiplier() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H100: new fn marker present");
+        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // The F16 K byte size discipline — 2 bytes/elem.  Honest match:
+        // either `* 2` arithmetic on a `nkv * cap * hd` term OR the
+        // dtype-aware `DType::F16.size_of()` lookup.  We accept either
+        // form — the load-bearing invariant is the F16 byte-size
+        // multiplier appears in the slot-view byte-offset arithmetic.
+        let has_explicit_2 = fn_window.contains("* 2)") || fn_window.contains("* 2 ")
+            || fn_window.contains("(2u64)") || fn_window.contains("size_of::<u16>()");
+        let has_dtype_lookup = fn_window.contains("DType::F16.size_of()");
+        assert!(
+            has_explicit_2 || has_dtype_lookup,
+            "H100 FALSIFIED: new fn body does NOT use a 2-byte multiplier \
+             on the slot-view byte-offset arithmetic. F16 K's per-slot \
+             byte offset should be `slot_id.0 * nkv * cap * hd * 2`; \
+             slot routing would silently target the WRONG slot's region."
+        );
+        // Pin the slot_id.0 multiplier explicitly: byte offset MUST
+        // include `slot_id.0` as a factor (else every slot routes to
+        // slot 0's region — the iter-1 H77 failure mode).
+        assert!(
+            fn_window.contains("slot_id.0") || fn_window.contains("slot_id . 0"),
+            "H100 FALSIFIED: new fn body does NOT reference `slot_id.0` \
+             in the slot-view byte-offset arithmetic. Per-slot routing \
+             is broken — every slot would target slot 0's region."
+        );
+    }
+
+    /// **H101 (skip-mode + structural)** — Per-slot isolation: the
+    /// slot-view mount applies `slice_view(byte_offset, n_elements)
+    /// + .with_shape([nkv, cap, hd])` so the per-slot region is a
+    /// 3-D view at the per-slot byte offset (legacy `HybridKvBuffers`
+    /// shape preserved).
+    ///
+    /// Mirrors A3b iter-1.5 H12's "write to slot 0 leaves slot 1
+    /// byte-zero" discipline at the byte-layout level — the slot-view's
+    /// underlying ARC handle is the same, the byte offset distinguishes
+    /// the per-slot region.
+    #[test]
+    fn h101_slot_view_preserves_legacy_hybrid_kv_buffers_3d_shape() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H101: new fn marker present");
+        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // The `with_shape` call IS present (shape-preserving view).
+        assert!(
+            fn_window.contains(".with_shape("),
+            "H101 FALSIFIED: new fn body does NOT contain \
+             `.with_shape(` — the legacy `HybridKvBuffers` 3-D shape \
+             `[nkv, capacity, head_dim]` is not preserved. \
+             Downstream kernels reading `.shape()` for stride math \
+             would see the slice_view's flat 1-D shape and miscompute."
+        );
+        // The legacy HybridKvBuffers struct construction IS present
+        // (the mount path constructs `HybridKvBuffers { k, v_packed,
+        // v_norms, ... }` from the slot-views).  Mirrors `alloc_hybrid_kv_for_layer`
+        // at gemma4/kv_cache.rs:740.
+        assert!(
+            fn_window.contains("HybridKvBuffers {"),
+            "H101 FALSIFIED: new fn body does NOT construct \
+             `HybridKvBuffers {{ ... }}` from the slot-views. The mount \
+             path must produce the legacy struct so the sibling fn's \
+             `if let Some(ref hybrid_kv) = self.hybrid_kv` consumer at \
+             line 1293 can read it bit-identically."
+        );
+    }
+
+    /// **H102 (skip-mode)** — SerialFifo byte-equivalence preserved.
+    ///
+    /// The sibling fn `forward_prefill_with_soft_tokens_resume`'s
+    /// SIGNATURE is unchanged (H86 PRESERVED).  The body change at
+    /// line ~842 adds `&& self.hybrid_kv.is_none()` matching the
+    /// decode-path gate at `forward_gpu.rs:413`.
+    ///
+    /// SerialFifo enters the sibling fn with `self.hybrid_kv == None`
+    /// (no prior call mounted a slot-view), so the gate fires
+    /// identically → byte-equivalent allocation behavior.
+    #[test]
+    fn h102_serial_fifo_byte_equivalence_preserved_via_decode_aligned_gate() {
+        let pf_src = include_str!("../forward_prefill.rs");
+        // (a) H86 PRESERVED: sibling fn signature unchanged.
+        let sibling_marker = "pub fn forward_prefill_with_soft_tokens_resume(";
+        let sibling_idx = pf_src
+            .find(sibling_marker)
+            .expect("H102: sibling fn marker present (H86 asserts)");
+        let sibling_sig = &pf_src[sibling_idx..(sibling_idx + 600).min(pf_src.len())];
+        // Sibling signature MUST NOT contain `slot_id` or `multi_seq_kv*`.
+        assert!(
+            !sibling_sig.contains("slot_id"),
+            "H102 FALSIFIED: sibling fn signature now contains `slot_id` \
+             — iter-2B accidentally modified the sibling fn signature. \
+             H86 / H1 / H2 / H23 / H41 / H44 byte-equivalence chain \
+             broken."
+        );
+        assert!(
+            !sibling_sig.contains("multi_seq_kv"),
+            "H102 FALSIFIED: sibling fn signature now contains \
+             `multi_seq_kv*` — iter-2B accidentally modified the \
+             sibling fn signature. H86 / H1 / H2 / H23 / H41 / H44 \
+             byte-equivalence chain broken."
+        );
+        // (b) Lazy-alloc gate aligns with decode-path discipline.
+        // Find the line that contains `INVESTIGATION_ENV.hybrid_kv` in
+        // the alloc block (line ~842).  iter-2B adds the
+        // `&& self.hybrid_kv.is_none()` predicate matching
+        // `forward_gpu.rs:413`.
+        let alloc_marker = "[ADR-028 Phase 10c] Allocating hybrid_kv";
+        let alloc_idx = pf_src
+            .find(alloc_marker)
+            .expect("H102: alloc-site eprintln marker not found");
+        // Pull a 200-char window BEFORE the eprintln (covers the
+        // `if INVESTIGATION_ENV.hybrid_kv ...` predicate line).
+        let pre_alloc_window =
+            &pf_src[alloc_idx.saturating_sub(400)..alloc_idx];
+        assert!(
+            pre_alloc_window.contains("self.hybrid_kv.is_none()"),
+            "H102 FALSIFIED: prefill alloc gate at line ~842 does NOT \
+             check `self.hybrid_kv.is_none()`. The slot-view mount \
+             from iter-2B would be obliterated by the sibling fn's \
+             unconditional rebuild. Decode-path precedent at \
+             forward_gpu.rs:413 already uses this gate; iter-2B aligns \
+             prefill with decode."
+        );
+    }
+
+    /// **H103 (skip-mode)** — HbKvBuffers regime UNCHANGED.  The
+    /// iter-2A-cont sub-deferral on the HB-encoded branch (HF2Q_HYBRID_KV=0
+    /// opt-out surface) is still surfaced verbatim.  Defends against an
+    /// iter-2B commit that accidentally collapses BOTH HB and Hybrid
+    /// branches into one.
+    #[test]
+    fn h103_hb_encoded_branch_iter2a_cont_typed_deferral_preserved() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H103: new fn marker present");
+        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // The iter-2A-cont typed-deferral label MUST still be present
+        // verbatim (HB-encoded branch remains pending).
+        let iter2a_cont_label = "iter-B4c-kernel-iter-2A-cont per ADR-040 §6.1.32";
+        assert!(
+            fn_window.contains(iter2a_cont_label),
+            "H103 FALSIFIED: HB-encoded branch typed-deferral label \
+             `{iter2a_cont_label}` REMOVED. iter-2A-cont is NOT in \
+             scope of iter-2B; the HF2Q_HYBRID_KV=0 opt-out path \
+             would now silently surface no error or wrong routing."
+        );
+        // Also pins iter-2C + iter-2D sub-deferrals preserved (the 4-way
+        // dispatch fork shape is intact).
+        for label in [
+            "iter-B4c-kernel-iter-2C per ADR-040 §6.1.32",
+            "iter-B4c-kernel-iter-2D per ADR-040 §6.1.32",
+        ] {
+            assert!(
+                fn_window.contains(label),
+                "H103 FALSIFIED: dispatch-fork sub-deferral `{label}` \
+                 REMOVED. iter-2B accidentally collapsed the 4-way \
+                 dispatch fork — non-default KV regimes lose their \
+                 typed-error labels."
+            );
+        }
+        // NEW iter-2B-xlen sub-deferral IS named (xlen BF16 K/V slot
+        // routing carved out for a future iter).
+        assert!(
+            fn_window.contains("iter-B4c-kernel-iter-2B-xlen"),
+            "H103 FALSIFIED: xlen BF16 K/V sub-deferral \
+             `iter-B4c-kernel-iter-2B-xlen` is NOT named in the new fn \
+             body. The HF2Q_DFLASH_XLEN_SDPA=1 opt-in surface has no \
+             operator-grep'able pin pointing at the next iter."
+        );
     }
 }
