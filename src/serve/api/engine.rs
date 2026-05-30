@@ -4601,40 +4601,99 @@ fn worker_run(
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
                         continue;
                     }
-                    // ADR-040 Phase C iter-2d-cont (C2d-cont) — Qwen35
-                    // SlotAware typed deferral. C2d (§6.1.22) provisions
-                    // the persistent multi-seq HybridKvCache at spawn time
-                    // (`Qwen35LoadedModel::provision_multi_seq_kv_for_slot_aware`
-                    // populates `self.persistent_kv_cache = Some(cache)`),
-                    // but the worker hot path (`generate_qwen35_once` →
-                    // `alloc_kv_cache_for_request` → `forward_gpu_last_logits`)
-                    // still allocates a fresh per-request HybridKvCache at
-                    // `n_seqs=1` and dispatches at `SlotId(0)`. Routing
-                    // the worker hot path through the persistent cache +
-                    // threading `handle.slot_id` into the forward path
-                    // (which already accepts `slot_id: SlotId` post-B4b
-                    // per §6.1.20) is iter-C2d-cont-kernel scope. Until
-                    // that lands, SlotAware-admitted SlotId(N>0) for
-                    // Qwen35 surfaces typed
-                    // `MultiSeqError::CapabilityUnsupported` mapped to
-                    // HTTP 501 via the `capability_unsupported:` anyhow
-                    // prefix (handler layer string-matches per ADR-040
-                    // C3 wiring at schema.rs:344). SerialFifo + SlotId(0)
-                    // hit the existing single-seq forward path verbatim
-                    // (H36 byte-equivalence pin); SlotAware + SlotId(0)
-                    // also routes through the existing per-request alloc
-                    // path (H39 first-slot pin).
+                    // ADR-040 Phase C iter-C2d-cont-kernel iter-1 (2026-05-29) —
+                    // Qwen35 worker hot path FULL LIFT for the Generate arm
+                    // onto the persistent multi-seq HybridKvCache. C2d
+                    // (§6.1.22) provisions the cache at spawn time; C2d-cont
+                    // (§6.1.24) added the typed clamp; this iter REPLACES
+                    // the clamp with the actual routing: SlotId(N>0) for
+                    // Qwen35 routes through
+                    // `engine_qwen35::generate_qwen35_once_slot_aware` which
+                    // takes `&mut HybridKvCache` + `SlotId` and dispatches
+                    // `forward_gpu_last_logits(.., slot_id)` (B4b §6.1.20
+                    // signature). The persistent cache is `take()`-d out of
+                    // `Qwen35LoadedModel` for the duration of the call so
+                    // the partial-borrow conflict with `qwen.lcp_registry`
+                    // etc. is resolved cleanly (worker is serial — no
+                    // concurrent access).
+                    //
+                    // The other 3 worker arms (GenerateStream / Embed /
+                    // GenerateWithSoftTokens) still carry the C2d-cont
+                    // typed clamp with relabeled
+                    // `iter-C2d-cont-kernel-iter-{2,3,4}` deferral cites —
+                    // see §6.1.27 for the iter-1 → iter-{2,3,4} sequencing
+                    // decision.
+                    //
+                    // SerialFifo + SlotId(0): unchanged (H51 byte-equivalence
+                    // pin) — the slot_id != SlotId(0) predicate short-
+                    // circuits below the clamp so the existing per-request
+                    // alloc path at the `match &mut loaded` below fires
+                    // verbatim. SlotAware + SlotId(0): also unchanged (H52
+                    // first-slot pin) — same predicate.
+                    //
+                    // Defense-in-depth: if `persistent_kv_cache.is_none()`
+                    // at SlotId(N>0) (impossible at runtime per the C2d
+                    // spawn-arm invariant, but pinned by H55), the request
+                    // returns typed `anyhow::Error` with operator-grep'able
+                    // label "iter-C2d-cont-kernel — persistent cache absent".
                     if matches!(loaded, LoadedModel::Qwen35(_)) && handle.slot_id != SlotId(0) {
-                        let err = MultiSeqError::CapabilityUnsupported {
-                            capability:
-                                "qwen35-forward-gpu-last-logits-slot-N (iter-C2d-cont-kernel per ADR-040 §6.1.24 — gated on persistent_kv_cache worker hot path lift + slot_id threading through Qwen35Model::forward_gpu_last_logits in src/serve/api/engine_qwen35.rs)",
+                        let slot_id = handle.slot_id;
+                        let LoadedModel::Qwen35(q) = &mut loaded else {
+                            // Statically unreachable — the matches! above
+                            // confirmed Qwen35 — but Rust's borrow checker
+                            // needs the explicit Qwen35 binding.
+                            unreachable!(
+                                "ADR-040 iter-C2d-cont-kernel iter-1: \
+                                 matches!(Qwen35) check passed but bind failed"
+                            );
                         };
-                        let _ = reply.send(Err(anyhow::anyhow!(
-                            "capability_unsupported: ADR-040 C2d-cont — {}",
-                            err
-                        )));
+                        // Take the persistent cache out so callee gets a
+                        // clean `&mut HybridKvCache` without partial-borrow
+                        // conflicts on the surrounding `&mut q` accesses.
+                        let mut persistent = match q.persistent_kv_cache.take() {
+                            Some(cache) => cache,
+                            None => {
+                                let _ = reply.send(Err(anyhow::anyhow!(
+                                    "capability_unsupported: ADR-040 \
+                                     iter-C2d-cont-kernel iter-1 — \
+                                     persistent_kv_cache is None at SlotId({}) \
+                                     for Qwen35 Generate arm. C2d spawn-arm \
+                                     invariant violated (provision_multi_seq_\
+                                     kv_for_slot_aware was not called at \
+                                     EngineMode::SlotAware spawn time). \
+                                     Operator: check spawn_with_mode wiring \
+                                     in src/serve/api/engine.rs.",
+                                    slot_id.0,
+                                )));
+                                scheduler.release(handle);
+                                publish_stats(&scheduler, &scheduler_stats_snapshot);
+                                continue;
+                            }
+                        };
+                        let result = super::engine_qwen35::generate_qwen35_once_slot_aware(
+                            q,
+                            &prompt_tokens,
+                            &params,
+                            registration.as_ref(),
+                            &mut persistent,
+                            slot_id,
+                        );
+                        // Put the persistent cache back regardless of
+                        // result — keeps the spawn-time invariant
+                        // (`persistent_kv_cache.is_some()` for SlotAware
+                        // Qwen35) intact for the next request.
+                        q.persistent_kv_cache = Some(persistent);
+                        // Standard post-pattern: bookkeep prefill +
+                        // per-token decodes + release.
+                        scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+                        if let Ok(ref gr) = result {
+                            for _ in 0..gr.completion_tokens {
+                                scheduler.advance_after_decode(handle);
+                            }
+                        }
                         scheduler.release(handle);
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
+                        let _ = reply.send(result);
                         continue;
                     }
                 }
@@ -4830,7 +4889,7 @@ fn worker_run(
                     if matches!(loaded, LoadedModel::Qwen35(_)) && handle.slot_id != SlotId(0) {
                         let err = MultiSeqError::CapabilityUnsupported {
                             capability:
-                                "qwen35-forward-gpu-last-logits-slot-N (iter-C2d-cont-kernel per ADR-040 §6.1.24 — gated on persistent_kv_cache worker hot path lift + slot_id threading through Qwen35Model::forward_gpu_last_logits in src/serve/api/engine_qwen35.rs)",
+                                "qwen35-forward-gpu-last-logits-slot-N-stream (iter-C2d-cont-kernel-iter-2 per ADR-040 §6.1.27 — gated on slot-aware streaming-generation port of generate_stream_qwen35_once_extended through src/serve/api/engine_qwen35.rs; iter-C2d-cont-kernel iter-1 §6.1.24 lifted the non-streaming Generate arm)",
                         };
                         let _ = events.blocking_send(
                             super::sse::GenerationEvent::Error(format!(
@@ -5067,7 +5126,7 @@ fn worker_run(
                     if matches!(loaded, LoadedModel::Qwen35(_)) && handle.slot_id != SlotId(0) {
                         let err = MultiSeqError::CapabilityUnsupported {
                             capability:
-                                "qwen35-forward-embed-last-slot-N (iter-C2d-cont-kernel per ADR-040 §6.1.24 — gated on persistent_kv_cache worker hot path lift through src/serve/api/engine_qwen35.rs::embed_qwen35)",
+                                "qwen35-forward-embed-last-slot-N (iter-C2d-cont-kernel-iter-3 per ADR-040 §6.1.27 — gated on slot-aware embed port of embed_qwen35 through src/serve/api/engine_qwen35.rs; iter-C2d-cont-kernel iter-1 §6.1.24 lifted the non-streaming Generate arm)",
                         };
                         let _ = reply.send(Err(anyhow::anyhow!(
                             "capability_unsupported: ADR-040 C2d-cont — {}",
@@ -5212,7 +5271,7 @@ fn worker_run(
                     if matches!(loaded, LoadedModel::Qwen35(_)) && handle.slot_id != SlotId(0) {
                         let err = MultiSeqError::CapabilityUnsupported {
                             capability:
-                                "qwen35-forward-gpu-with-soft-tokens-slot-N (iter-C2d-cont-kernel per ADR-040 §6.1.24 — gated on persistent_kv_cache worker hot path lift through src/serve/api/engine_qwen35.rs::generate_qwen35_once_with_soft_tokens)",
+                                "qwen35-forward-gpu-with-soft-tokens-slot-N (iter-C2d-cont-kernel-iter-4 per ADR-040 §6.1.27 — gated on slot-aware soft-token port of generate_qwen35_once_with_soft_tokens through src/serve/api/engine_qwen35.rs; iter-C2d-cont-kernel iter-1 §6.1.24 lifted the non-streaming Generate arm)",
                         };
                         let _ = reply.send(Err(anyhow::anyhow!(
                             "capability_unsupported: ADR-040 C2d-cont — {}",
@@ -16933,10 +16992,17 @@ mod adr040_phase_c_iter2d_cont_qwen35_slot_aware_tests {
         );
     }
 
-    /// **H37 (skip-mode pin)** — under SlotAware admission with
-    /// SlotId(N>0) for Qwen35, the worker arm surfaces typed
-    /// `MultiSeqError::CapabilityUnsupported`. Type-level + Display
-    /// round-trip pin (Path B clamp shape; mirrors C2c H25).
+    /// **H37 (skip-mode pin, REVISED iter-C2d-cont-kernel iter-1 2026-05-29)** —
+    /// historical Display round-trip pin preserved for shape stability
+    /// (the label string was the C2d-cont §6.1.24 Path B clamp surface);
+    /// iter-C2d-cont-kernel iter-1 REPLACES the production Generate-arm
+    /// clamp with the actual lift via
+    /// `generate_qwen35_once_slot_aware` per §6.1.27. The OTHER 3 worker
+    /// arms (GenerateStream / Embed / GenerateWithSoftTokens) still
+    /// carry a relabeled clamp with `iter-C2d-cont-kernel-iter-{2,3,4}`
+    /// per ADR-040 §6.1.27 cites. See H51 + H52 for the iter-1 lift's
+    /// behavioural pins; this test preserves the original Display
+    /// round-trip for the label-format contract.
     #[test]
     fn h37_capability_unsupported_label_names_iter_c2d_cont_kernel_for_qwen35() {
         let err = MultiSeqError::CapabilityUnsupported {
@@ -16972,47 +17038,27 @@ mod adr040_phase_c_iter2d_cont_qwen35_slot_aware_tests {
         );
     }
 
-    /// **H38 (skip-mode, typed deferral label)** — pins that
-    /// (a) all four worker arms carry the Qwen35 clamp string for
-    ///     iter-C2d-cont-kernel,
-    /// (b) `worker_run` does NOT yet call `rollback_la_to` (deferral
-    ///     structural marker — when the persistent cache becomes
-    ///     load-bearing at iter-C2d-cont-kernel, rollback on EOS /
-    ///     max_tokens is the next pin to land).
+    /// **H38 (skip-mode, REVISED iter-C2d-cont-kernel iter-1 2026-05-29)** —
+    /// post-iter-1 coverage pin: the iter-C2d-cont-kernel-iter-{2,3,4}
+    /// relabeled clamps still appear in the 3 worker arms
+    /// (GenerateStream / Embed / GenerateWithSoftTokens) that DID NOT
+    /// land in iter-1 (Path B for the streaming + embed + soft-token
+    /// surfaces per §6.1.27). The Generate arm's clamp at iter-1 is
+    /// REPLACED by the actual lift via
+    /// `generate_qwen35_once_slot_aware`. Defends the deferral
+    /// discipline: each surviving deferral has an iter-N label naming
+    /// the implementing iter; the lifted Generate arm has the
+    /// structural marker pin via H51 (no clamp at Generate).
     ///
-    /// Defends the dual deferral discipline: the typed string surface
-    /// (operator-facing) + the source-grep structural pin (reviewer-
-    /// facing) move in lockstep.
+    /// Pin: `rollback_la_to` is still NOT called from `worker_run` —
+    /// the spec-decode capture-rollback path is iter-B4d scope per
+    /// §6.1.26 deferrals matrix. The iter-1 slot-aware Generate arm
+    /// uses `reset_for_slot(slot_id)` (the per-slot reset for the
+    /// non-spec-decode generate path), NOT `rollback_la_to` (which
+    /// requires `ensure_la_capture` only allocated in spec-decode).
     #[test]
     fn h38_typed_deferral_label_present_in_all_four_worker_arms_and_rollback_la_to_not_yet_called() {
         let src = include_str!("engine.rs");
-        // Count Qwen35 C2d-cont clamp occurrences. Each of the 4
-        // worker arms (Generate / GenerateStream / Embed /
-        // GenerateWithSoftTokens) should carry exactly one clamp
-        // surfacing the iter-C2d-cont-kernel deferral label.
-        let clamp_label = "iter-C2d-cont-kernel per ADR-040 §6.1.24";
-        let n = src.matches(clamp_label).count();
-        // The label appears in: 4 worker-arm clamps + this test
-        // module's structural pins (the label and a comment-form).
-        // Bound the assertion on the LOWER bound (at least 4 — the
-        // four worker-arm clamps) so reviewer-facing test text doesn't
-        // double-count.
-        assert!(
-            n >= 4,
-            "H38 FALSIFIED: expected at least 4 occurrences of the \
-             iter-C2d-cont-kernel label (one per worker arm: Generate, \
-             GenerateStream, Embed, GenerateWithSoftTokens). Got {n}. \
-             Drift here means the Path B clamp is missing from at least \
-             one of the four arms — partial coverage breaks the deferral \
-             discipline."
-        );
-
-        // Pin: `rollback_la_to` is NOT yet called from `worker_run`.
-        // When iter-C2d-cont-kernel lands the persistent-cache lift,
-        // the worker arm must call `rollback_la_to(slot_id, 0)` on
-        // EOS / max_tokens to reset the linear-attn capture buffer
-        // for that slot. Today this is structurally absent — pin so
-        // a future iter that adds rollback also removes this assertion.
         let body_start = src
             .find("fn worker_run(")
             .expect("H38: worker_run entry not found");
@@ -17022,10 +17068,55 @@ mod adr040_phase_c_iter2d_cont_qwen35_slot_aware_tests {
             .or_else(|| body_after.find("\n/// Worker-thread entry point"))
             .unwrap_or(body_after.len().min(200_000));
         let body = &body_after[..body_end_off];
+
+        // iter-1 (this iter): the original `iter-C2d-cont-kernel per
+        // ADR-040 §6.1.24` clamp label is REMOVED from production (the
+        // Generate arm landed the actual lift; the 3 remaining arms
+        // adopted iter-C2d-cont-kernel-iter-{2,3,4} per §6.1.27
+        // cites). Count substring `iter-C2d-cont-kernel-iter-` in the
+        // worker_run body — should be ≥3 (one per remaining clamp).
+        let kernel_iter_label = "iter-C2d-cont-kernel-iter-";
+        let n_kernel_iter = body.matches(kernel_iter_label).count();
+        assert!(
+            n_kernel_iter >= 3,
+            "H38 FALSIFIED: expected at least 3 occurrences of the \
+             post-iter-1 `iter-C2d-cont-kernel-iter-` label in worker_run \
+             body (one per remaining clamp: GenerateStream / Embed / \
+             GenerateWithSoftTokens). Got {n_kernel_iter}. Drift here \
+             means the iter-2/3/4 deferral coverage is incomplete."
+        );
+
+        // iter-1 lift witness: the worker_run body must contain a
+        // call to `generate_qwen35_once_slot_aware` (the new slot-aware
+        // Generate-arm routing). Source-grep pin.
+        assert!(
+            body.contains("generate_qwen35_once_slot_aware"),
+            "H38 FALSIFIED: worker_run does NOT call \
+             `generate_qwen35_once_slot_aware` — iter-C2d-cont-kernel \
+             iter-1 lift did not land in the Generate worker arm. \
+             Source-grep against the function name expected since the \
+             iter-1 worker-arm site routes through it at SlotId(N>0)."
+        );
+
+        // iter-1 also calls `reset_for_slot` via the slot-aware fn —
+        // pin the new per-slot reset primitive's presence.
+        let any_slot_aware_call = src.contains("generate_qwen35_once_slot_aware(");
+        assert!(
+            any_slot_aware_call,
+            "H38 FALSIFIED: iter-1 slot-aware fn call not found in source"
+        );
+
+        // `rollback_la_to` is still structurally ABSENT from worker_run.
+        // The iter-1 slot-aware path uses `reset_for_slot` for the
+        // non-spec-decode generate path; `rollback_la_to` is reserved
+        // for spec-decode capture-state rollback (iter-B4d scope per
+        // §6.1.26). When iter-B4d lands the spec-decode slot-aware
+        // path, this assertion's predicate must flip to a positive
+        // presence pin.
         assert!(
             !body.contains("rollback_la_to"),
             "H38 FALSIFIED: worker_run now calls `rollback_la_to` — \
-             this is the iter-C2d-cont-kernel rollback discipline \
+             this is the iter-B4d spec-decode rollback discipline \
              landing. Update H38 to pin the call shape + remove this \
              structural absence assertion."
         );
@@ -17128,6 +17219,401 @@ mod adr040_phase_c_iter2d_cont_qwen35_slot_aware_tests {
              forward path past the iter-228a 501 sentinel); a clamp here \
              would imply C2e wired without the spawn arm flip."
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-040 Phase C iter-C2d-cont-kernel iter-1 (2026-05-29) — Qwen35 worker
+// hot path Generate-arm lift onto the persistent multi-seq HybridKvCache.
+//
+// This module pins H51-H57 — the iter-1 lift assertions per ADR §6.1.27.
+// The C2d-cont Path B clamp (§6.1.24) at the Generate worker arm is
+// REPLACED with a real persistent-cache routing call to
+// `engine_qwen35::generate_qwen35_once_slot_aware`; the other 3 worker
+// arms (GenerateStream / Embed / GenerateWithSoftTokens) retain a
+// relabeled clamp with iter-C2d-cont-kernel-iter-{2,3,4} per §6.1.27
+// cites — those iters are the typed sub-deferrals iter-1 leaves in
+// place.
+//
+// Tests (all skip-mode per CLAUDE.md "no model load" + "no cargo build"):
+//   H51 — SerialFifo / SlotId(0) byte-equivalence preserved: the
+//         worker_run Qwen35 dispatch path under SerialFifo or
+//         SlotAware+SlotId(0) still routes through
+//         `generate_qwen35_once` (unchanged), NOT
+//         `generate_qwen35_once_slot_aware`. Pin via the `if matches!`
+//         predicate `&& handle.slot_id != SlotId(0)` source-grep —
+//         when this is FALSE, the lift fork doesn't fire and the
+//         existing per-request alloc path at the `match &mut loaded`
+//         block fires verbatim.
+//   H52 — SlotId(N>0) lift landed: worker_run contains a real call to
+//         `super::engine_qwen35::generate_qwen35_once_slot_aware(`
+//         under the Qwen35 Generate arm. Source-grep pin (mirror of
+//         H36's existing pre-iter-1 generate_qwen35_once pin).
+//   H53 — persistent-cache field-shape pin: the slot-aware fn's call
+//         site `take()`s the persistent cache from `Qwen35LoadedModel.
+//         persistent_kv_cache` (Option<HybridKvCache>) + restores it
+//         on the OK + Err paths. Source-grep pin on both the take and
+//         the put-back assignment.
+//   H54 — per-slot reset on completion: the slot-aware fn calls
+//         `reset_for_slot(slot_id)` at entry + exit so the persistent
+//         cache is request-isolated within the slot. Source-grep pin
+//         in engine_qwen35.rs on the function body. Note: this
+//         REPLACES the C2d-cont H38 deferral marker that said
+//         `rollback_la_to` would be called — the non-spec-decode
+//         generate path uses `reset_for_slot` (cursor + linear-attn
+//         zero) NOT `rollback_la_to` (which requires
+//         `ensure_la_capture` only used in spec-decode per
+//         `gpu_full_attn.rs:2705` runtime gate).
+//   H55 — typed error on missing persistent_kv_cache: when
+//         `persistent_kv_cache.is_none()` at SlotId(N>0) for Qwen35
+//         (impossible at runtime per C2d spawn-arm invariant, but
+//         defense-in-depth), the worker arm returns a typed
+//         `anyhow::Error` with `capability_unsupported:` prefix +
+//         operator-grep'able `iter-C2d-cont-kernel iter-1` label +
+//         `persistent_kv_cache is None` substring. Source-grep on the
+//         worker_run body.
+//   H56 — Gemma 4 + Qwen3VL worker arms unchanged by iter-1: mirror
+//         of C2d-cont H40 — no Gemma / Qwen3VL clamps modified, no
+//         Qwen3VL clamp accidentally added.
+//   H57 — historical C2d-cont H37/H38 markers updated honestly: the
+//         post-iter-1 source-grep on the original C2d-cont label
+//         `iter-C2d-cont-kernel per ADR-040 §6.1.24` in the worker_run
+//         body shows ZERO production occurrences (only in test
+//         modules); the relabeled iter-C2d-cont-kernel-iter-{2,3,4}
+//         labels per §6.1.27 take the role for the remaining 3 arms.
+//
+// LCP / chunked-prefill / spec-decode are EXPLICITLY out of iter-1 scope
+// (each is its own iter-N sub-deferral per §6.1.27 — see the deferrals
+// matrix in §6.1.27 for the iter-1 → iter-{2,3,4,LCP,G} sequencing).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod adr040_phase_c_iter_c2d_cont_kernel_iter1_qwen35_tests {
+    // No `use super::*;` — all tests are skip-mode source-grep against
+    // `include_str!` rather than calling any types in the parent module.
+
+    // ── Helper: snip worker_run body the same way C2d-cont tests do ──
+    fn worker_run_body(src: &str) -> &str {
+        let body_start = src
+            .find("fn worker_run(")
+            .expect("iter-1: worker_run entry not found");
+        let body_after = &src[body_start..];
+        let body_end_off = body_after
+            .find("\n// The worker thread for `LoadedModel::Qwen35` returns a sentinel error")
+            .or_else(|| body_after.find("\n/// Worker-thread entry point"))
+            .unwrap_or(body_after.len().min(200_000));
+        &body_after[..body_end_off]
+    }
+
+    /// **H51 (skip-mode)** — SerialFifo + SlotId(0) AND SlotAware +
+    /// SlotId(0) Qwen35 Generate dispatch is byte-equivalent post-iter-1.
+    ///
+    /// Source-grep pin: the iter-1 lift fork at the Generate arm uses
+    /// the predicate `handle.slot_id != SlotId(0)`. SerialFifo always
+    /// hands out SlotId(0) (FifoSchedulerAdapter invariant); SlotAware's
+    /// first request also gets SlotId(0). In both cases the predicate
+    /// is FALSE → the lift block falls through to the existing
+    /// `match &mut loaded { LoadedModel::Qwen35(q) => generate_qwen35_once(..) }`
+    /// dispatch, byte-equivalent to pre-iter-1 + pre-C2d-cont.
+    ///
+    /// Defends the H1 / H2 / H23 / H28 / H36 byte-equivalence chain
+    /// that A5* + C2a/C2b + C2d-cont preserved. Same logical contract
+    /// as H36 (pre-iter-1), now restated under the iter-1 lift fork.
+    #[test]
+    fn h51_slot_id_0_qwen35_routes_through_generate_qwen35_once_byte_equivalent() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // The pre-C2d-cont generate_qwen35_once dispatch must still be
+        // reachable from the worker arm (the fallback when the lift
+        // predicate is FALSE = SlotId(0)).
+        assert!(
+            body.contains("super::engine_qwen35::generate_qwen35_once("),
+            "H51 FALSIFIED: post-iter-1 worker_run Qwen35 Generate \
+             dispatch no longer routes through `generate_qwen35_once` \
+             for SlotId(0). The iter-1 lift fork must be ADDITIVE \
+             (sibling above the `match &mut loaded` dispatch), NOT \
+             REPLACE the SerialFifo / SlotId(0) path. SerialFifo + \
+             SlotId(0) byte-equivalence (H36 + H1 + H2) is BROKEN."
+        );
+
+        // The lift fork predicate is `slot_id != SlotId(0)` — pin via
+        // source-grep that the predicate guards the lift call. Drift
+        // here may indicate the predicate accidentally extended to
+        // SlotId(0) too.
+        assert!(
+            body.contains("matches!(loaded, LoadedModel::Qwen35(_)) && handle.slot_id != SlotId(0)"),
+            "H51 FALSIFIED: the iter-1 lift predicate at the Generate \
+             arm is no longer `slot_id != SlotId(0)`. Drift here means \
+             the lift may fire at SlotId(0) too, breaking byte-equivalence."
+        );
+    }
+
+    /// **H52 (skip-mode)** — iter-1 Generate-arm lift landed at
+    /// `worker_run`: the slot-aware fn `generate_qwen35_once_slot_aware`
+    /// is called from the worker_run body at the Qwen35 Generate arm.
+    /// Source-grep pin (mirror of H36's pre-iter-1 `generate_qwen35_once`
+    /// pin, now extended to also pin the new slot-aware entry).
+    #[test]
+    fn h52_iter1_lift_landed_for_qwen35_generate_arm() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // The iter-1 lift entry point is the new slot-aware fn.
+        // Source-grep pin: the worker_run body MUST call
+        // `super::engine_qwen35::generate_qwen35_once_slot_aware(`.
+        assert!(
+            body.contains("super::engine_qwen35::generate_qwen35_once_slot_aware("),
+            "H52 FALSIFIED: iter-1 lift fn \
+             `generate_qwen35_once_slot_aware` is NOT called from the \
+             worker_run body. The Generate-arm SlotId(N>0) routing is \
+             missing — iter-1 didn't actually land. Check the if-block \
+             at the Qwen35 Generate arm in src/serve/api/engine.rs::worker_run."
+        );
+
+        // The slot-aware fn passes `slot_id` (the SlotId from the
+        // admit'd handle), NOT a hard-coded SlotId(0). Pin the
+        // threading.
+        let lift_block_start = body
+            .find("super::engine_qwen35::generate_qwen35_once_slot_aware(")
+            .expect("H52: lift call site not found");
+        let lift_block_end = body[lift_block_start..]
+            .find(");")
+            .map(|off| lift_block_start + off + 2)
+            .unwrap_or(body.len().min(lift_block_start + 1000));
+        let lift_block = &body[lift_block_start..lift_block_end];
+        assert!(
+            lift_block.contains("slot_id"),
+            "H52 FALSIFIED: the lift call site does not pass `slot_id` \
+             into `generate_qwen35_once_slot_aware`. The iter-1 lift \
+             must thread the admit'd SlotHandle's slot_id into the \
+             slot-aware fn (B4b §6.1.20 signature). Got block: {lift_block}"
+        );
+    }
+
+    /// **H53 (skip-mode)** — persistent-cache `take()` + restore pattern
+    /// at the lift call site. Pin both the `q.persistent_kv_cache.take()`
+    /// extraction AND the `q.persistent_kv_cache = Some(persistent)`
+    /// restoration. This pin prevents two regressions:
+    /// (a) caller forgets to put the cache back → next request finds
+    ///     `persistent_kv_cache.is_none()` and hits the H55 typed-error
+    ///     defense-in-depth path;
+    /// (b) caller accidentally clones the cache instead of taking it →
+    ///     the persistent cache's per-slot state is not actually
+    ///     mutated, defeating cross-request isolation.
+    #[test]
+    fn h53_lift_call_site_takes_and_restores_persistent_kv_cache() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        assert!(
+            body.contains("q.persistent_kv_cache.take()"),
+            "H53 FALSIFIED: the iter-1 lift call site does not \
+             `take()` the persistent cache out of \
+             `Qwen35LoadedModel.persistent_kv_cache`. The take is \
+             required to resolve the partial-borrow conflict between \
+             `&mut q.persistent_kv_cache` and the dense `&mut q` \
+             accesses inside `generate_qwen35_once_slot_aware` (q. \
+             lcp_registry, q.prompt_cache, etc.)."
+        );
+
+        assert!(
+            body.contains("q.persistent_kv_cache = Some(persistent)"),
+            "H53 FALSIFIED: the iter-1 lift call site does not put \
+             the persistent cache back into `q.persistent_kv_cache` \
+             after the slot-aware fn returns. The next request to \
+             land at SlotId(N>0) would find `persistent_kv_cache. \
+             is_none()` and hit the H55 defense-in-depth typed error \
+             — defeats the persistent-cache invariant established by \
+             C2d (§6.1.22)."
+        );
+    }
+
+    /// **H54 (skip-mode)** — per-slot reset on completion via
+    /// `reset_for_slot(slot_id)` at entry + exit of the slot-aware fn.
+    /// Source-grep pin on `engine_qwen35.rs` for the body of
+    /// `generate_qwen35_once_slot_aware`. Note: this REPLACES the
+    /// C2d-cont H38 deferral marker that said `rollback_la_to` would
+    /// be called — the non-spec-decode generate path uses
+    /// `reset_for_slot` (per-slot cursor zero + per-slot linear-attn
+    /// zero), NOT `rollback_la_to` (which requires `ensure_la_capture`
+    /// only allocated in spec-decode per `gpu_full_attn.rs:2705`).
+    #[test]
+    fn h54_slot_aware_fn_calls_reset_for_slot_at_entry_and_exit() {
+        let src = include_str!("../../inference/models/qwen35/kv_cache.rs");
+        assert!(
+            src.contains("pub fn reset_for_slot("),
+            "H54 FALSIFIED: `HybridKvCache::reset_for_slot` is not \
+             defined in src/inference/models/qwen35/kv_cache.rs. \
+             iter-1 requires this new per-slot reset primitive."
+        );
+
+        let engine_q = include_str!("engine_qwen35.rs");
+        let fn_marker = "pub fn generate_qwen35_once_slot_aware(";
+        let fn_start = engine_q
+            .find(fn_marker)
+            .expect("H54: generate_qwen35_once_slot_aware not defined");
+        // Locate the fn body — bound by next `pub fn` or end-of-file.
+        let body_after = &engine_q[fn_start..];
+        let body_end_off = body_after[fn_marker.len()..]
+            .find("\npub fn ")
+            .map(|off| off + fn_marker.len())
+            .unwrap_or(body_after.len().min(50_000));
+        let fn_body = &body_after[..body_end_off];
+
+        let reset_calls = fn_body.matches("reset_for_slot(slot_id)").count();
+        assert!(
+            reset_calls >= 2,
+            "H54 FALSIFIED: `generate_qwen35_once_slot_aware` must \
+             call `kv_cache.reset_for_slot(slot_id)` at LEAST TWICE \
+             (once at entry, once at exit) for request isolation \
+             within the persistent cache slot. Got {reset_calls} \
+             call(s). Drift here means the persistent cache may carry \
+             stale bytes across requests on the same slot — corrupts \
+             cross-request linear-attn recurrent state."
+        );
+    }
+
+    /// **H55 (skip-mode)** — defense-in-depth typed error when
+    /// `persistent_kv_cache.is_none()` at SlotId(N>0) for Qwen35.
+    /// Source-grep pin on the worker_run body. The error message
+    /// MUST contain the `capability_unsupported:` prefix (handler
+    /// string-match for HTTP 501 mapping) + the `iter-C2d-cont-kernel
+    /// iter-1` operator-grep'able label + the `persistent_kv_cache is
+    /// None` description.
+    #[test]
+    fn h55_lift_handles_persistent_kv_cache_none_with_typed_error() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // Look at the q.persistent_kv_cache.take() match arm — when
+        // None, the lift must surface a typed error (not panic, not
+        // silently fall through).
+        assert!(
+            body.contains("persistent_kv_cache is None"),
+            "H55 FALSIFIED: the iter-1 lift call site does not \
+             surface a typed `capability_unsupported` error when \
+             `persistent_kv_cache.is_none()`. The defense-in-depth \
+             check is required: per C2d (§6.1.22), persistent_kv_cache \
+             is always Some(cache) under SlotAware Qwen35 spawn, but \
+             a future iter that breaks that invariant must surface a \
+             typed error (NOT panic) at this site."
+        );
+        assert!(
+            body.contains("capability_unsupported:") &&
+            body.contains("iter-C2d-cont-kernel iter-1"),
+            "H55 FALSIFIED: the None-branch typed error does not \
+             carry both `capability_unsupported:` (handler 501 \
+             string-prefix per ADR-040 C3 wiring at schema.rs:344) \
+             AND `iter-C2d-cont-kernel iter-1` (operator-grep'able \
+             label cite). Both required for the operator runbook."
+        );
+    }
+
+    /// **H56 (skip-mode)** — Gemma 4 + Qwen3VL worker arms unchanged
+    /// by iter-1. Mirror of C2d-cont H40.
+    #[test]
+    fn h56_gemma4_and_qwen3vl_worker_arms_unchanged_by_iter1() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // Gemma 4 C2c label still present (iter-1 did not touch
+        // Gemma 4 arms).
+        let gemma_label = "gemma4-forward-prefill-slot-N (iter-C2c-cont";
+        assert!(
+            body.contains(gemma_label),
+            "H56 FALSIFIED: Gemma 4 C2c clamp label `{gemma_label}` \
+             missing from worker_run. iter-1 must NOT touch the \
+             Gemma 4 worker arms — Gemma 4 SlotAware kernel lift is \
+             iter-B4c-kernel scope per §6.1.25."
+        );
+
+        // The B4c-cited Gemma 4 iter-B4c-kernel label also present.
+        assert!(
+            body.contains("iter-B4c-kernel per ADR-040 §6.1.25"),
+            "H56 FALSIFIED: Gemma 4 B4c label-refinement cite \
+             `iter-B4c-kernel per ADR-040 §6.1.25` missing from \
+             worker_run. iter-1 must NOT regress B4c §6.1.25."
+        );
+
+        // No Qwen3VL clamp accidentally added.
+        assert!(
+            !body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"),
+            "H56 FALSIFIED: Qwen3VL clamp accidentally added to \
+             worker_run by iter-1. Qwen3VL SlotAware activation is \
+             gated on iter-C2e per §6.1.22; iter-1 must not add the \
+             Qwen3VL clamp without the spawn-arm flip."
+        );
+    }
+
+    /// **H57 (skip-mode)** — iter-1 sub-deferrals coverage: the
+    /// `iter-C2d-cont-kernel-iter-` substring appears in the worker_run
+    /// body at LEAST 3 times (one per remaining clamp:
+    /// GenerateStream / Embed / GenerateWithSoftTokens). This pins the
+    /// iter-1 → iter-{2,3,4} sequencing per §6.1.27 — each remaining
+    /// arm carries a typed sub-deferral label naming its iter-N
+    /// implementer.
+    ///
+    /// Also pins the §6.1.27 ADR closure block exists.
+    #[test]
+    fn h57_iter1_sub_deferrals_named_for_remaining_three_arms() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        let kernel_iter_label = "iter-C2d-cont-kernel-iter-";
+        let n = body.matches(kernel_iter_label).count();
+        assert!(
+            n >= 3,
+            "H57 FALSIFIED: expected at least 3 occurrences of \
+             `iter-C2d-cont-kernel-iter-` in worker_run body (one per \
+             remaining Qwen35 clamp: GenerateStream + Embed + \
+             GenerateWithSoftTokens). Got {n}. Drift here means at \
+             least one of the iter-2/3/4 sub-deferrals lost its \
+             label — the §6.1.27 sequencing is broken."
+        );
+
+        // Each of the 3 iter-N labels must be specifically named.
+        for iter_label in ["iter-C2d-cont-kernel-iter-2", "iter-C2d-cont-kernel-iter-3", "iter-C2d-cont-kernel-iter-4"] {
+            assert!(
+                body.contains(iter_label),
+                "H57 FALSIFIED: iter-1 sub-deferral label `{iter_label}` \
+                 not present in worker_run body. Each remaining clamp \
+                 must name its specific iter-N implementer per §6.1.27."
+            );
+        }
+
+        // §6.1.27 closure block must exist in the ADR.
+        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.27"),
+            "H57 FALSIFIED: ADR §6.1.27 closure block missing. \
+             iter-1 must land the closure block in lockstep with the \
+             production code change (per ADR-040 §3.7 closure-discipline)."
+        );
+        // §6.1.27 must name `iter-C2d-cont-kernel iter-1` for the
+        // implemented scope.
+        let block_marker = "### 6.1.27";
+        let block_start = adr.find(block_marker).expect("§6.1.27 marker");
+        let block_end_off = adr[block_start..]
+            .find("\n### ")
+            .or_else(|| adr[block_start..].find("\n---\n"))
+            .or_else(|| adr[block_start..].find("\n## "))
+            .unwrap_or(adr[block_start..].len().min(20_000));
+        let block = &adr[block_start..block_start + block_end_off];
+        assert!(
+            block.contains("iter-C2d-cont-kernel iter-1"),
+            "H57 FALSIFIED: §6.1.27 closure block does not name \
+             `iter-C2d-cont-kernel iter-1` — operator-grep'able cite \
+             for the iter-1 scope landing."
+        );
+        for iter_label in ["iter-C2d-cont-kernel-iter-2", "iter-C2d-cont-kernel-iter-3", "iter-C2d-cont-kernel-iter-4"] {
+            assert!(
+                block.contains(iter_label),
+                "H57 FALSIFIED: §6.1.27 closure block does not name \
+                 sub-deferral `{iter_label}` — the §6.1.27 deferrals \
+                 matrix must enumerate every iter-N sub-deferral so \
+                 the operator runbook is complete."
+            );
+        }
     }
 }
 
@@ -17543,11 +18029,20 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
              clamp label `{qwen35_soft_label}` no longer present — \
              partial regression."
         );
-        // C2d-cont's iter-C2d-cont-kernel label is preserved (not
-        // accidentally rewritten by B4c to iter-B4c-kernel — Qwen35's
-        // structural follow-up iter is iter-C2d-cont-kernel, NOT B4c).
+        // C2d-cont's iter-C2d-cont-kernel label family is preserved
+        // (not accidentally rewritten by B4c to iter-B4c-kernel —
+        // Qwen35's structural follow-up iter is iter-C2d-cont-kernel,
+        // NOT B4c). Post-iter-1 (§6.1.27, 2026-05-29) the exact
+        // C2d-cont §6.1.24 substring was replaced with the relabeled
+        // iter-C2d-cont-kernel-iter-{2,3,4} cites per §6.1.27 in the
+        // 3 remaining clamps (the Generate-arm clamp was REMOVED
+        // entirely when iter-1 landed the actual lift). H45's
+        // sibling-discipline intent (Qwen35 labels not touched by B4c)
+        // is preserved by pinning the post-iter-1 substring family
+        // `iter-C2d-cont-kernel` (covers both `-iter-N` and the
+        // historical bare cite).
         assert!(
-            body.contains("iter-C2d-cont-kernel per ADR-040 §6.1.24"),
+            body.contains("iter-C2d-cont-kernel"),
             "H45 FALSIFIED: C2d-cont's iter-C2d-cont-kernel label \
              cite no longer present in worker_run. B4c must NOT \
              touch the Qwen35 clamp labels — Qwen35's follow-up iter \

@@ -2153,6 +2153,333 @@ pub fn generate_qwen35_once(
     })
 }
 
+/// **ADR-040 iter-C2d-cont-kernel iter-1 (2026-05-29)** — slot-aware
+/// chat-generation entry that routes the worker hot path through the
+/// persistent multi-seq `HybridKvCache` (`Qwen35LoadedModel.
+/// persistent_kv_cache`) instead of the per-request `alloc_kv_cache_
+/// for_request` allocation.
+///
+/// **Scope (iter-1 only — Generate arm)**. This is the minimal valid
+/// increment of `iter-C2d-cont-kernel` per the §6.1.27 closure block.
+/// Lifts ONLY the `Request::Generate` worker arm onto the persistent
+/// cache at `SlotId(N>0)` for Qwen35; the other 3 worker arms
+/// (`Request::GenerateStream`, `Request::Embed`,
+/// `Request::GenerateWithSoftTokens`) STILL carry the typed
+/// `MultiSeqError::CapabilityUnsupported` clamp from C2d-cont §6.1.24
+/// with a relabeled `iter-C2d-cont-kernel-iter-{2,3,4}` deferral cite.
+/// See §6.1.27 for the iter-1 → iter-{2,3,4} sequencing decision.
+///
+/// **Differences from `generate_qwen35_once`**:
+/// 1. Caller passes an explicit `&mut HybridKvCache` (the persistent
+///    cache, taken out of `Qwen35LoadedModel` at the worker-arm site)
+///    + an explicit `slot_id: SlotId`. No per-request alloc happens
+///    inside this fn.
+/// 2. Snapshot restore uses `restore_partial(snap, prefix.k)` instead of
+///    `restore_from(snap)`. The persistent cache is sized to
+///    `cfg.max_position_embeddings` while snapshots were taken at the
+///    per-request `prompt_len + max_tokens + 64` sizing — `restore_from`
+///    requires byte-equal `max_seq_len`, while `restore_partial` copies
+///    only the first `n_tokens` per-head positions and works across
+///    different sizes. This is the §6.1.27 prompt-cache invariant lift.
+/// 3. Entry + exit reset the slot's per-slot region via
+///    `kv_cache.reset_for_slot(slot_id)` so the persistent cache is
+///    request-isolated within the slot — the next request to land on
+///    this slot sees a zero-cursor full-attn cache + zero recurrent
+///    / conv state. Matches the fresh-alloc invariant the per-request
+///    path relied on for SlotAware SlotId(0) (H39 byte-equivalence pin).
+/// 4. Threads `slot_id` into every `forward_gpu_last_logits` call (the
+///    signature already accepts `SlotId` post-B4b §6.1.20). At
+///    `SlotId(0)` this is byte-equivalent to `generate_qwen35_once` by
+///    construction (forward_gpu_last_logits at SlotId(0) routes through
+///    the pre-A2b single-seq path verbatim).
+///
+/// **Per-slot byte-equivalence at SlotId(0)** (H51 pin):
+/// `generate_qwen35_once_slot_aware(.., kv=&mut persistent_cache,
+/// slot_id=SlotId(0))` produces the same `GenerationResult` as
+/// `generate_qwen35_once(..)` for any non-spec-decode greedy request
+/// when `persistent_cache.n_seqs == 1` AND `persistent_cache.max_seq_len
+/// >= prompt_len + max_tokens + 64`. Because (a) `reset_for_slot(0)` at
+/// entry zeros the cursors (matching the fresh-alloc state), (b)
+/// `forward_gpu_last_logits(.., SlotId(0))` is byte-equivalent to the
+/// pre-A2b path (B4a §6.1.4 pin), and (c) `restore_partial(snap, k)` at
+/// `k == snap.full_attn_current_len[0][0]` is byte-equivalent to
+/// `restore_from(snap)` per the kv_cache.rs:2143 docstring.
+///
+/// **Co-changes** (iter-1 deliberately minimal):
+/// - Per-slot LCP / mid-prefill checkpoint storage is DISABLED in
+///   slot-aware mode (the snapshot codec keys on the per-request
+///   `max_seq_len`; persistent-cache snapshots would carry different
+///   byte sizes and break the across-request LCP probe). The fast path
+///   on this site is the fresh-prefill path; LCP slot-aware codec is
+///   pinned as **iter-C2d-cont-kernel-iter-LCP** in §6.1.27.
+/// - Chunked-prefill is DISABLED in slot-aware mode (same snapshot-
+///   shape reason). Pinned as **iter-C2d-cont-kernel-iter-LCP** in
+///   §6.1.27.
+/// - DFlash / spec-decode capture-states are NOT engaged here (they
+///   require `ensure_la_capture` which is spec-decode-only); slot-aware
+///   spec-decode is **iter-B4d** per §6.1.26 deferrals matrix.
+///
+/// # Errors
+/// - `prompt_tokens.is_empty()` (matches `generate_qwen35_once`).
+/// - `slot_id.0 >= kv_cache.n_seqs` (via `reset_for_slot` bounds-first
+///   per A2b §6.1.23 iter-1.5 cfa-finding-F5).
+/// - Forward / sample failures propagate from `forward_gpu_last_logits`.
+pub fn generate_qwen35_once_slot_aware(
+    qwen: &mut Qwen35LoadedModel,
+    prompt_tokens: &[u32],
+    params: &SamplingParams,
+    registration: Option<&ModelRegistration>,
+    kv_cache: &mut HybridKvCache,
+    slot_id: SlotId,
+) -> Result<GenerationResult> {
+    anyhow::ensure!(
+        !prompt_tokens.is_empty(),
+        "generate_qwen35_once_slot_aware: empty prompt_tokens"
+    );
+    // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5 ordering.
+    anyhow::ensure!(
+        slot_id.0 < kv_cache.n_seqs,
+        "generate_qwen35_once_slot_aware: SlotOutOfRange slot={} max_slots={} \
+         (ADR-040 iter-C2d-cont-kernel iter-1)",
+        slot_id.0,
+        kv_cache.n_seqs,
+    );
+    let prompt_len = prompt_tokens.len();
+    let max_tokens = params.max_tokens.max(1);
+    // Verify the persistent cache has room for this request. Persistent
+    // cache is sized to `cfg.max_position_embeddings`; per-request need
+    // is `prompt_len + max_tokens + 64`.
+    let need_seq = prompt_len + max_tokens + 64;
+    if need_seq > kv_cache.max_seq_len as usize {
+        return Err(anyhow::anyhow!(
+            "generate_qwen35_once_slot_aware: per-request need_seq={} exceeds \
+             persistent cache max_seq_len={} (slot={} prompt_len={} max_tokens={}). \
+             ADR-040 iter-C2d-cont-kernel iter-1 sizes the persistent cache to \
+             cfg.max_position_embeddings; reduce max_tokens or use a shorter prompt.",
+            need_seq, kv_cache.max_seq_len, slot_id.0, prompt_len, max_tokens
+        ));
+    }
+
+    let is_greedy = is_greedy_eligible(params);
+    let want_logprobs = params.logprobs;
+    let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+        Some(Vec::with_capacity(max_tokens))
+    } else {
+        None
+    };
+
+    // Per-slot reset at entry — the persistent cache may carry stale
+    // bytes from a prior request on this slot. `reset_for_slot` zeros
+    // the per-seq cursors + linear-attn conv/recurrent slices for
+    // `slot_id` only (other slots untouched).
+    kv_cache
+        .reset_for_slot(slot_id)
+        .context("ADR-040 iter-C2d-cont-kernel iter-1: reset_for_slot at entry")?;
+
+    // ── Prompt-cache fast-path (slot-aware variant) ──────────────────
+    //
+    // Snapshot restore uses `restore_partial(snap, k)` instead of
+    // `restore_from(snap)`. The persistent cache's `max_seq_len`
+    // (= cfg.max_position_embeddings) differs from the snapshot
+    // producer's per-request `max_seq_len` — `restore_from` would
+    // ensure_byte_equal fail; `restore_partial` copies only the first
+    // `k` per-head positions and works across sizes.
+    let prompt_cache_hit = qwen
+        .prompt_cache
+        .try_match(prompt_tokens, params)
+        .is_some();
+
+    let prefill_start = Instant::now();
+    let next_token: u32;
+    if prompt_cache_hit {
+        let snap = qwen
+            .prompt_cache
+            .snapshot()
+            .expect("try_match returned Some implies snapshot Some");
+        // Use the full prompt length as the partial-restore boundary —
+        // the HybridPromptCache full-equality hit means the snapshot
+        // covers exactly `prompt_len` tokens.
+        kv_cache
+            .restore_partial(snap, prompt_len)
+            .context("ADR-040 iter-C2d-cont-kernel iter-1: prompt_cache restore_partial")?;
+        next_token = qwen.prompt_cache.first_decoded_token();
+        tracing::debug!(
+            "qwen35 slot-aware prompt_cache: HIT slot={} prompt_len={} prefill skipped",
+            slot_id.0, prompt_len
+        );
+    } else {
+        // Fresh monolithic prefill — chunked-prefill + LCP-resume are
+        // disabled in slot-aware mode (see fn docstring for the snapshot
+        // codec invariant rationale; tracked as
+        // iter-C2d-cont-kernel-iter-LCP in §6.1.27).
+        let positions = prefill_positions_for(prompt_len);
+        let prefill_logits = qwen
+            .model
+            .forward_gpu_last_logits(prompt_tokens, &positions, kv_cache, slot_id)
+            .context(
+                "Qwen35Model::forward_gpu_last_logits (slot-aware prefill)",
+            )?;
+        anyhow::ensure!(
+            prefill_logits.len() == qwen.vocab_size,
+            "qwen35 slot-aware prefill logits len {} != vocab_size {}",
+            prefill_logits.len(),
+            qwen.vocab_size
+        );
+        if is_greedy && !want_logprobs {
+            next_token = greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32);
+        } else {
+            let mut logits = prefill_logits;
+            if let Some(ref mut lps) = logprobs_vec {
+                let (tok, lp) = sample_logits_qwen35_with_logprob(
+                    &mut logits,
+                    params,
+                    &[],
+                );
+                lps.push(lp);
+                next_token = tok;
+            } else {
+                next_token = sample_logits_qwen35(&mut logits, params, &[]);
+            }
+        }
+    }
+    let prefill_duration = prefill_start.elapsed();
+
+    // ── Decode loop ───────────────────────────────────────────────────
+    let device = MlxDevice::new()
+        .map_err(|e| anyhow::anyhow!("MlxDevice::new (qwen35 slot-aware decode): {e}"))?;
+    let _ = &device; // sample_logits_qwen35 doesn't need the device handle
+    let decode_start = Instant::now();
+    let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    generated_tokens.push(next_token);
+    let mut decoded_text = qwen.tokenizer.decode(&[next_token], false).unwrap_or_default();
+    let stops = &params.stop_strings;
+    let mut finish_reason: &'static str = "length";
+    if qwen.eos_token_ids.contains(&next_token) {
+        // Strip the EOS token from the visible output: it shouldn't be
+        // surfaced to the user even though we count it.
+        generated_tokens.pop();
+        decoded_text.clear();
+        finish_reason = "stop";
+    } else if qwen35_hit_stop_string(&decoded_text, stops) {
+        qwen35_strip_trailing_stop(&mut decoded_text, stops);
+        finish_reason = "stop";
+    }
+
+    // Decode loop. Note: greedy + non-logprobs is a candidate for
+    // forward_gpu_greedy fast path, but iter-1 keeps the simpler
+    // forward_gpu_last_logits dispatch for minimal LOC delta; the
+    // greedy fast-path slot-aware port is iter-C2d-cont-kernel-iter-G.
+    let mut step = 1usize;
+    while step < max_tokens && finish_reason == "length" {
+        // Position for the just-emitted next_token (used in the NEXT
+        // forward as the decode-step input position).
+        let pos = prompt_len + step - 1;
+        let pos_i32 = pos as i32;
+        let positions: Vec<i32> = vec![pos_i32; 4];
+        let last_input = &generated_tokens[generated_tokens.len() - 1..];
+        let logits = qwen
+            .model
+            .forward_gpu_last_logits(last_input, &positions, kv_cache, slot_id)
+            .with_context(|| {
+                format!(
+                    "Qwen35Model::forward_gpu_last_logits (slot-aware decode step {step})"
+                )
+            })?;
+        anyhow::ensure!(
+            logits.len() == qwen.vocab_size,
+            "qwen35 slot-aware decode logits len {} != vocab_size {}",
+            logits.len(),
+            qwen.vocab_size
+        );
+        let tok = if is_greedy && !want_logprobs {
+            greedy_argmax_last_token(&logits, qwen.vocab_size as u32)
+        } else {
+            let mut logits = logits;
+            if let Some(ref mut lps) = logprobs_vec {
+                let (tok, lp) = sample_logits_qwen35_with_logprob(
+                    &mut logits,
+                    params,
+                    &generated_tokens,
+                );
+                lps.push(lp);
+                tok
+            } else {
+                sample_logits_qwen35(&mut logits, params, &generated_tokens)
+            }
+        };
+        if qwen.eos_token_ids.contains(&tok) {
+            finish_reason = "stop";
+            break;
+        }
+        generated_tokens.push(tok);
+        let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
+        decoded_text.push_str(&frag);
+        if qwen35_hit_stop_string(&decoded_text, stops) {
+            qwen35_strip_trailing_stop(&mut decoded_text, stops);
+            finish_reason = "stop";
+            break;
+        }
+        step += 1;
+    }
+    let decode_duration = decode_start.elapsed();
+
+    // Per-slot reset at exit — leave the slot clean for the next
+    // request to land on it. Belt-and-suspenders w/ the entry reset:
+    // ensures that even if a future iter adds a code path that
+    // bypasses the entry reset, the slot is always clean at handoff.
+    kv_cache
+        .reset_for_slot(slot_id)
+        .context("ADR-040 iter-C2d-cont-kernel iter-1: reset_for_slot at exit")?;
+
+    // Reasoning split — mirror of `generate_qwen35_once` (line 2111
+    // pre-iter-1). `split_full_output(reg, &text)` returns
+    // `(content: String, reasoning_text: Option<String>)`.
+    let (content_text, reasoning_text) = match registration {
+        Some(reg) if reg.has_reasoning() => {
+            super::registry::split_full_output(reg, &decoded_text)
+        }
+        _ => (decoded_text, None),
+    };
+    // Reasoning token count: same shape as generate_qwen35_once.
+    let reasoning_token_count = match registration {
+        Some(reg) if reg.has_reasoning() => {
+            let mut sp = ReasoningSplitter::from_registration(reg);
+            let mut count = 0usize;
+            for &tok in &generated_tokens {
+                let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
+                if let Some(splitter) = sp.as_mut() {
+                    let _ = splitter.feed(&frag);
+                    if splitter.in_reasoning() {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+        _ => 0,
+    };
+
+    Ok(GenerationResult {
+        text: content_text,
+        reasoning_text,
+        prompt_tokens: prompt_len,
+        completion_tokens: generated_tokens.len(),
+        reasoning_tokens: if reasoning_token_count > 0 {
+            Some(reasoning_token_count)
+        } else {
+            None
+        },
+        finish_reason,
+        prefill_duration,
+        decode_duration,
+        // Slot-aware mode disables LCP / chunked prefill (see fn
+        // docstring); cached_tokens reflects the full-prompt-cache
+        // hit only.
+        cached_tokens: if prompt_cache_hit { prompt_len } else { 0 },
+        logprobs: logprobs_vec,
+    })
+}
+
 /// ADR-005 Phase 4 Wedge-4a (2026-05-01): vision-aware non-streaming
 /// chat generation against a loaded Qwen3.5/3.6 model.  Replaces the
 /// `worker_run` 501 arm for `Request::GenerateWithSoftTokens` (the last

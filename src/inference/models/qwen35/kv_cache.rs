@@ -1836,6 +1836,189 @@ impl HybridKvCache {
         Ok(())
     }
 
+    /// **ADR-040 iter-C2d-cont-kernel iter-1 (2026-05-29)** — per-slot
+    /// reset for the persistent multi-seq `HybridKvCache` worker hot path.
+    ///
+    /// Counterpart to [`Self::reset`] (which zeros **every** slot) that
+    /// targets a SINGLE [`SlotId`]'s per-seq slice. Used by
+    /// `engine_qwen35::generate_qwen35_once_slot_aware` to clear a slot's
+    /// state at request entry + exit so the persistent cache is
+    /// request-isolated within the slot — the next request to land on
+    /// the same slot sees a zero-cursor full-attn cache + zero
+    /// recurrent/conv state.
+    ///
+    /// **Layout proof** (mirror of A2b §6.1.23 `rollback_la_to`):
+    /// - **full_attn.current_len**: `Vec<u32>` of length `n_seqs`. Per-slot
+    ///   reset → set `current_len[slot_idx] = 0`; other slots untouched.
+    /// - **full_attn.k / v (F32, when present)**: shape
+    ///   `[n_seqs, n_kv_heads, max_seq_len, head_dim]` row-major.
+    ///   Per-seq elems = `n_kv_heads * max_seq_len * head_dim`.
+    ///   Slot `s` offset = `s * per_seq_elems`. **NOT zeroed**: the SDPA
+    ///   read path masks against `current_len[slot_idx]`, so stale bytes
+    ///   beyond the cursor are unreadable — matches the existing
+    ///   per-request `alloc_kv_cache_for_request` path (the alloc is
+    ///   already zero-initialized at construction; reset cursor matches
+    ///   that fresh-alloc invariant for read masking).
+    /// - **full_attn.tq (when present)**: same `[n_seqs, n_kv_heads,
+    ///   max_seq_len, head_dim]` shape over k_packed / k_norms / v_packed /
+    ///   v_norms. Same logic as F32 K/V — NOT zeroed; cursor masks.
+    /// - **mtp_slot (when present)**: same layout as full_attn; reset
+    ///   `current_len[slot_idx] = 0`.
+    /// - **linear_attn.conv_state**: shape `[conv_channels, K-1, n_seqs]`
+    ///   col-major. Per-seq elems = `conv_channels * (K-1)`. Slot `s`
+    ///   offset = `s * per_seq_elems`. **MUST be zeroed**: the DeltaNet
+    ///   conv1d kernel reads the ring buffer unconditionally (no cursor
+    ///   mask), so stale bytes WOULD corrupt the next request.
+    /// - **linear_attn.conv_state_scratch**: ping-pong scratch.
+    ///   ALSO zeroed (the kernel swaps active/scratch; a stale scratch
+    ///   slot would flip into active and be read).
+    /// - **linear_attn.recurrent**: shape `[D_k, D_v, n_v_heads, n_seqs]`
+    ///   col-major. Per-seq elems = `D_k * D_v * n_v_heads`. Slot `s`
+    ///   offset = `s * per_seq_elems`. **MUST be zeroed**: recurrent
+    ///   state has no cursor; the next request's first delta-net step
+    ///   would read stale state and corrupt the run.
+    /// - **linear_attn.recurrent_scratch**: ping-pong scratch. ALSO
+    ///   zeroed (same reason as conv_state_scratch).
+    /// - **capture_states / conv_capture_states**: spec-decode-only;
+    ///   NOT zeroed by this fn (the spec-decode runner explicitly
+    ///   captures every step before reading, so stale bytes are
+    ///   structurally unreachable).
+    ///
+    /// # Errors
+    /// - `slot.0 >= self.n_seqs` (bounds-first per A2b iter-1.5
+    ///   cfa-finding-F5 ordering).
+    ///
+    /// # Per-slot byte-equivalence pin
+    ///
+    /// At `slot = SlotId(0)` AND `n_seqs == 1` this is byte-equivalent
+    /// to [`Self::reset`] (the for-loop iterates exactly one slot,
+    /// zeros exactly the same bytes). H53 pins this in the test
+    /// module via element-count + slice-offset assertions.
+    pub fn reset_for_slot(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+    ) -> Result<()> {
+        // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5.
+        if slot.0 >= self.n_seqs {
+            return Err(anyhow!(
+                "reset_for_slot: SlotOutOfRange slot={} max_slots={} \
+                 (ADR-040 iter-C2d-cont-kernel iter-1 multi-seq lift; \
+                 HybridKvCache constructed with n_seqs={})",
+                slot.0,
+                self.n_seqs,
+                self.n_seqs,
+            ));
+        }
+        let slot_idx = slot.0 as usize;
+        let n_seqs = self.n_seqs as usize;
+
+        // 1. full_attn slots — reset per-slot current_len cursor.
+        for fa in self.full_attn.iter_mut() {
+            if let Some(c) = fa.current_len.get_mut(slot_idx) {
+                *c = 0;
+            }
+        }
+        // 2. mtp_slot (optional) — reset per-slot current_len cursor.
+        if let Some(fa) = self.mtp_slot.as_mut() {
+            if let Some(c) = fa.current_len.get_mut(slot_idx) {
+                *c = 0;
+            }
+        }
+        // 3. linear_attn slots — zero per-slot conv_state +
+        // conv_state_scratch + recurrent + recurrent_scratch slices.
+        // Capture buffers (capture_states / conv_capture_states) are
+        // spec-decode-only and explicitly overwritten by the capture
+        // dispatch on every step; not zeroed here.
+        for (i, la) in self.linear_attn.iter_mut().enumerate() {
+            // conv_state — layout [conv_channels, K-1, n_seqs] col-major
+            //                     → per_seq_elems = conv_state.element_count() / n_seqs.
+            let total_conv = la.conv_state.element_count();
+            if total_conv % n_seqs != 0 {
+                return Err(anyhow!(
+                    "reset_for_slot: linear_attn[{}].conv_state elements {} \
+                     not divisible by n_seqs {} (layout invariant broken)",
+                    i, total_conv, n_seqs
+                ));
+            }
+            let per_seq_conv = total_conv / n_seqs;
+            // recurrent — layout [D_k, D_v, n_v_heads, n_seqs] col-major.
+            let total_rec = la.recurrent.element_count();
+            if total_rec % n_seqs != 0 {
+                return Err(anyhow!(
+                    "reset_for_slot: linear_attn[{}].recurrent elements {} \
+                     not divisible by n_seqs {} (layout invariant broken)",
+                    i, total_rec, n_seqs
+                ));
+            }
+            let per_seq_rec = total_rec / n_seqs;
+            // Pair scratch buffers — same shapes by construction.
+            let total_conv_scratch = la.conv_state_scratch.element_count();
+            let total_rec_scratch = la.recurrent_scratch.element_count();
+            if total_conv_scratch != total_conv {
+                return Err(anyhow!(
+                    "reset_for_slot: linear_attn[{}] conv_state_scratch elements \
+                     {} != conv_state elements {} (ping-pong shape broken)",
+                    i, total_conv_scratch, total_conv
+                ));
+            }
+            if total_rec_scratch != total_rec {
+                return Err(anyhow!(
+                    "reset_for_slot: linear_attn[{}] recurrent_scratch elements \
+                     {} != recurrent elements {} (ping-pong shape broken)",
+                    i, total_rec_scratch, total_rec
+                ));
+            }
+            // Zero per-slot slice in each of the 4 buffers.
+            {
+                let s = la.conv_state.as_mut_slice::<f32>().map_err(|e| {
+                    anyhow!("reset_for_slot: linear_attn[{}].conv_state as_mut_slice: {e}", i)
+                })?;
+                let start = slot_idx * per_seq_conv;
+                let end = start + per_seq_conv;
+                for v in &mut s[start..end] {
+                    *v = 0.0;
+                }
+            }
+            {
+                let s = la.conv_state_scratch.as_mut_slice::<f32>().map_err(|e| {
+                    anyhow!(
+                        "reset_for_slot: linear_attn[{}].conv_state_scratch as_mut_slice: {e}",
+                        i
+                    )
+                })?;
+                let start = slot_idx * per_seq_conv;
+                let end = start + per_seq_conv;
+                for v in &mut s[start..end] {
+                    *v = 0.0;
+                }
+            }
+            {
+                let s = la.recurrent.as_mut_slice::<f32>().map_err(|e| {
+                    anyhow!("reset_for_slot: linear_attn[{}].recurrent as_mut_slice: {e}", i)
+                })?;
+                let start = slot_idx * per_seq_rec;
+                let end = start + per_seq_rec;
+                for v in &mut s[start..end] {
+                    *v = 0.0;
+                }
+            }
+            {
+                let s = la.recurrent_scratch.as_mut_slice::<f32>().map_err(|e| {
+                    anyhow!(
+                        "reset_for_slot: linear_attn[{}].recurrent_scratch as_mut_slice: {e}",
+                        i
+                    )
+                })?;
+                let start = slot_idx * per_seq_rec;
+                let end = start + per_seq_rec;
+                for v in &mut s[start..end] {
+                    *v = 0.0;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         for slot in self.full_attn.iter_mut() {
             for c in slot.current_len.iter_mut() {
@@ -7910,5 +8093,211 @@ mod tests {
             "H35: bounds-first — capture_states-None message must NOT \
              leak past the slot-OOR guard; got: {msg}"
         );
+    }
+
+    /// **iter-C2d-cont-kernel iter-1 — reset_for_slot per-slot
+    /// isolation (2026-05-29)**.
+    ///
+    /// Pin: `reset_for_slot(SlotId(s))` ONLY zeros the slot-`s` region
+    /// in linear_attn conv_state + conv_state_scratch + recurrent +
+    /// recurrent_scratch (per-slot slice math at offset
+    /// `s * per_seq_elems`); other slots' bytes are byte-untouched.
+    /// And full_attn current_len[slot=s] = 0; other slots' cursors
+    /// untouched.
+    ///
+    /// Falsifier shape: seed every slot with distinct non-zero
+    /// patterns, call `reset_for_slot(SlotId(1))`, then assert
+    /// (a) slot 1's per-seq region is zero in all 4 LA buffers and
+    /// (b) slots 0, 2, 3 keep their seeded bytes verbatim.
+    #[test]
+    fn iter_c2d_cont_kernel_iter1_reset_for_slot_per_slot_isolation_2026_05_29() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let n_seqs: u32 = 4;
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("alloc");
+
+        let per_seq_rec = (cfg.linear_key_head_dim as usize)
+            * (cfg.linear_value_head_dim as usize)
+            * (cfg.linear_num_value_heads as usize);
+        let conv_channels = conv_channels_for(&cfg) as usize;
+        let k_minus1 = (cfg.linear_conv_kernel_dim.saturating_sub(1)) as usize;
+        let per_seq_conv = conv_channels * k_minus1;
+
+        // Seed every slot's per-seq region in every LA buffer with
+        // distinct patterns. Slot s, buffer kind k → base = s*1000 +
+        // k*100 + 1.0 — guarantees non-zero everywhere.
+        for la in cache.linear_attn.iter_mut() {
+            for (kind, total) in [
+                (0u32, la.conv_state.element_count()),
+                (1u32, la.conv_state_scratch.element_count()),
+            ] {
+                let buf = if kind == 0 {
+                    la.conv_state.as_mut_slice::<f32>().unwrap()
+                } else {
+                    la.conv_state_scratch.as_mut_slice::<f32>().unwrap()
+                };
+                assert_eq!(total, n_seqs as usize * per_seq_conv);
+                for s in 0..(n_seqs as usize) {
+                    let start = s * per_seq_conv;
+                    for idx in 0..per_seq_conv {
+                        buf[start + idx] = (s as f32) * 1000.0
+                            + (kind as f32) * 100.0
+                            + (idx as f32) * 0.001
+                            + 1.0;
+                    }
+                }
+            }
+            for (kind, total) in [
+                (2u32, la.recurrent.element_count()),
+                (3u32, la.recurrent_scratch.element_count()),
+            ] {
+                let buf = if kind == 2 {
+                    la.recurrent.as_mut_slice::<f32>().unwrap()
+                } else {
+                    la.recurrent_scratch.as_mut_slice::<f32>().unwrap()
+                };
+                assert_eq!(total, n_seqs as usize * per_seq_rec);
+                for s in 0..(n_seqs as usize) {
+                    let start = s * per_seq_rec;
+                    for idx in 0..per_seq_rec {
+                        buf[start + idx] = (s as f32) * 1000.0
+                            + (kind as f32) * 100.0
+                            + (idx as f32) * 0.001
+                            + 1.0;
+                    }
+                }
+            }
+        }
+        // Seed full_attn current_len cursors with distinct non-zero
+        // values per slot.
+        for fa in cache.full_attn.iter_mut() {
+            for s in 0..(n_seqs as usize) {
+                fa.current_len[s] = (s as u32) + 17;
+            }
+        }
+
+        // Call reset_for_slot(SlotId(1)).
+        cache
+            .reset_for_slot(crate::serve::multi_seq_kv::SlotId(1))
+            .expect("reset_for_slot(1)");
+
+        // Slot 1's per-seq region is zero in all 4 LA buffers;
+        // other slots untouched.
+        for la in cache.linear_attn.iter() {
+            for (kind, buf_slice) in [
+                (0u32, la.conv_state.as_slice::<f32>().unwrap()),
+                (1u32, la.conv_state_scratch.as_slice::<f32>().unwrap()),
+            ] {
+                for s in 0..(n_seqs as usize) {
+                    let start = s * per_seq_conv;
+                    for idx in 0..per_seq_conv {
+                        let v = buf_slice[start + idx];
+                        if s == 1 {
+                            assert!(
+                                v == 0.0,
+                                "iter-1: slot 1 conv buf kind={kind} idx={idx} \
+                                 must be 0 after reset_for_slot(1); got {v}"
+                            );
+                        } else {
+                            let expected = (s as f32) * 1000.0
+                                + (kind as f32) * 100.0
+                                + (idx as f32) * 0.001
+                                + 1.0;
+                            assert!(
+                                (v - expected).abs() < 1e-6,
+                                "iter-1: slot {s} conv buf kind={kind} idx={idx} \
+                                 must be untouched (={expected}); got {v}"
+                            );
+                        }
+                    }
+                }
+            }
+            for (kind, buf_slice) in [
+                (2u32, la.recurrent.as_slice::<f32>().unwrap()),
+                (3u32, la.recurrent_scratch.as_slice::<f32>().unwrap()),
+            ] {
+                for s in 0..(n_seqs as usize) {
+                    let start = s * per_seq_rec;
+                    for idx in 0..per_seq_rec {
+                        let v = buf_slice[start + idx];
+                        if s == 1 {
+                            assert!(
+                                v == 0.0,
+                                "iter-1: slot 1 rec buf kind={kind} idx={idx} \
+                                 must be 0 after reset_for_slot(1); got {v}"
+                            );
+                        } else {
+                            let expected = (s as f32) * 1000.0
+                                + (kind as f32) * 100.0
+                                + (idx as f32) * 0.001
+                                + 1.0;
+                            assert!(
+                                (v - expected).abs() < 1e-6,
+                                "iter-1: slot {s} rec buf kind={kind} idx={idx} \
+                                 must be untouched (={expected}); got {v}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Slot 1's full_attn cursor must be 0; others untouched.
+        for fa in cache.full_attn.iter() {
+            for s in 0..(n_seqs as usize) {
+                if s == 1 {
+                    assert_eq!(
+                        fa.current_len[s], 0,
+                        "iter-1: slot 1 current_len must be 0"
+                    );
+                } else {
+                    assert_eq!(
+                        fa.current_len[s],
+                        (s as u32) + 17,
+                        "iter-1: slot {s} current_len must be untouched"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **iter-C2d-cont-kernel iter-1 — reset_for_slot bounds-first
+    /// typed error (2026-05-29)**.
+    ///
+    /// Mirror of H35 for the new per-slot reset primitive. Pin:
+    /// `reset_for_slot(SlotId(s)) where s >= n_seqs` returns Err
+    /// with `SlotOutOfRange` + the iter cite in the message.
+    #[test]
+    fn iter_c2d_cont_kernel_iter1_reset_for_slot_bounds_typed_2026_05_29() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+
+        let err = cache
+            .reset_for_slot(crate::serve::multi_seq_kv::SlotId(4))
+            .expect_err("slot 4 OOR for n_seqs=4");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("SlotOutOfRange"),
+            "iter-1: error message must contain 'SlotOutOfRange'; got: {msg}"
+        );
+        assert!(
+            msg.contains("slot=4"),
+            "iter-1: error message must surface slot id; got: {msg}"
+        );
+        assert!(
+            msg.contains("max_slots=4"),
+            "iter-1: error message must surface max_slots; got: {msg}"
+        );
+        assert!(
+            msg.contains("iter-C2d-cont-kernel iter-1"),
+            "iter-1: error must name implementing iter; got: {msg}"
+        );
+
+        // SlotId(0) on a valid n_seqs=1 cache is the byte-equivalence
+        // case — must succeed (zero-elements zeroed but no error).
+        let mut cache1 = HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc n_seqs=1");
+        cache1
+            .reset_for_slot(crate::serve::multi_seq_kv::SlotId(0))
+            .expect("SlotId(0) at n_seqs=1 must succeed");
     }
 }
