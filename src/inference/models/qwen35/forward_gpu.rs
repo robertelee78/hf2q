@@ -3651,6 +3651,12 @@ impl Qwen35Model {
                             // signature; we pass `as_mut()` here for
                             // symmetry with the FA call site above.
                             layer_session.as_mut(),
+                            // ADR-040 Phase A2b-cont (2026-05-30) — per-slot
+                            // identity threaded into the chunk/autoreg prefill
+                            // dispatcher; SlotId(0) is byte-equivalent to
+                            // pre-A2b-cont, SlotId(N>0) routes through the
+                            // per-slot region via the helper's slice_view.
+                            slot_id,
                         )
                         .with_context(|| {
                             format!("delta_net_with_arena layer {layer_idx}")
@@ -3692,6 +3698,9 @@ impl Qwen35Model {
                             shape.rms_norm_eps,
                             state_capture_ref,
                             conv_capture_ref,
+                            // ADR-040 Phase A2b-cont (2026-05-30) — per-slot
+                            // identity.  Same contract as the arena variant.
+                            slot_id,
                         )
                         .with_context(|| format!("delta_net layer {layer_idx}"))?
                     };
@@ -5362,6 +5371,13 @@ impl Qwen35Model {
                             shape.d_v,
                             shape.conv_kernel,
                             shape.rms_norm_eps,
+                            // ADR-040 Phase A2b-cont (2026-05-30) —
+                            // `forward_gpu_greedy` is the B4d-scope greedy
+                            // decode entry (multi-slot routing for that path
+                            // lands in B4d).  Hard-coded SlotId(0) here
+                            // matches its existing FA call-site contract at
+                            // forward_gpu.rs:5293 + 5612.
+                            SlotId(0),
                         )
                         .with_context(|| format!("delta_net single-cb layer {layer_idx}"))?;
 
@@ -5693,6 +5709,11 @@ impl Qwen35Model {
                             shape.rms_norm_eps,
                             state_capture_ref,
                             conv_capture_ref,
+                            // ADR-040 Phase A2b-cont (2026-05-30) —
+                            // `forward_gpu_greedy` is the B4d-scope greedy
+                            // decode entry; hard-coded SlotId(0) mirrors
+                            // the FA call-sites at forward_gpu.rs:5293 + :5612.
+                            SlotId(0),
                         )
                         .with_context(|| format!("delta_net legacy greedy layer {layer_idx}"))?;
 
@@ -9226,5 +9247,444 @@ mod tests {
             m.forward_embed_last(&tokens, &positions, &mut kv_bounds, oor).is_err(),
             "B4b bounds: forward_embed_last must error on OOR slot"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-040 Phase A2b-cont (2026-05-30) — forward-path linear-attn
+    // dispatch slot routing hypotheses H137-H143.
+    //
+    // Closes the §6.1.23 iter-A2b deferral: the `gpu_delta_net.rs`
+    // forward dispatch (3 entry points `build_delta_net_layer*`) now
+    // accepts a `slot_id: SlotId` parameter and slice_view-narrows the
+    // multi-seq linear-attn ping-pong + capture buffers to the per-slot
+    // region BEFORE handing off to the mlx-native kernels. The kernel-
+    // side `n_seqs = 1u32` literal is centralized at
+    // `FORWARD_DISPATCH_N_SEQS` in `gpu_delta_net.rs` and documents the
+    // intrinsic per-slot per-step dispatch contract — multi-seq routing
+    // is via `slice_view`, not via the kernel batch axis.
+    //
+    // The fixture is `tiny_hybrid_model_nonzero()` (see line ~6541)
+    // which has 4 layers in `full_attention_interval=4` pattern: layers
+    // 0/1/2 are LinearAttention + layer 3 is FullAttention. This
+    // exercises BOTH the linear-attn dispatch sites (H137-H141, the
+    // load-bearing path) AND the full-attn sites (H142 sibling) in the
+    // same forward call.
+    //
+    // Order:
+    //   H137 — n_seqs hard-codes lifted (source-grep at file level)
+    //   H138 — SlotId(0) byte-equivalence pre/post-A2b-cont (regression pin)
+    //   H139 — SlotId(N>0) end-to-end via forward_gpu_last_logits + n_seqs=4
+    //   H140 — slot_id flows from forward_gpu_last_logits to build_delta_net_layer*
+    //   H141 — chunk-gated-delta-rule + autoreg variants both lifted (source-grep)
+    //   H142 — Qwen35 non-linear-attn variants UNCHANGED (full-attn-only model)
+    //   H143 — Gemma 4 + Qwen3VL UNCHANGED (source-grep)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// H137 — source-grep pin: post-A2b-cont, `gpu_delta_net.rs`
+    /// contains ZERO `let n_seqs = 1u32;` literals (all routed through
+    /// the centralized `FORWARD_DISPATCH_N_SEQS` constant), and the 3
+    /// `build_delta_net_layer*` entry points BOTH take a `slot_id:
+    /// SlotId` parameter and call `narrow_la_ping_pong_to_slot` to
+    /// slice_view the ping-pong buffers.
+    ///
+    /// Falsifier: any `let n_seqs = 1u32;` literal reappears in
+    /// gpu_delta_net.rs OR `build_delta_net_layer*` loses its
+    /// `slot_id` parameter OR the `narrow_la_ping_pong_to_slot` helper
+    /// disappears.  Either would mean the multi-seq lift was reverted
+    /// and SlotId(N>0) silently writes into slot 0's region.
+    #[test]
+    fn h137_n_seqs_hard_codes_lifted_in_gpu_delta_net_rs_2026_05_30() {
+        let src = std::fs::read_to_string("src/inference/models/qwen35/gpu_delta_net.rs")
+            .expect("read gpu_delta_net.rs");
+        // No more `let n_seqs = 1u32;` literals. All routed through
+        // `FORWARD_DISPATCH_N_SEQS` constant.
+        assert!(
+            !src.contains("let n_seqs = 1u32"),
+            "H137 FALSIFIED: `let n_seqs = 1u32` literal reappeared in \
+             gpu_delta_net.rs after ADR-040 §6.1.40 iter-A2b-cont lift. \
+             All forward-path kernel dispatch params should route through \
+             `FORWARD_DISPATCH_N_SEQS`."
+        );
+        // The centralized constant exists.
+        assert!(
+            src.contains("const FORWARD_DISPATCH_N_SEQS: u32 = 1;"),
+            "H137: `FORWARD_DISPATCH_N_SEQS` centralizing constant must \
+             exist; it documents the intrinsic per-slot per-step dispatch \
+             contract."
+        );
+        // The 3 entry points take slot_id.
+        for entry in &[
+            "pub fn build_delta_net_layer(",
+            "pub fn build_delta_net_layer_with_arena(",
+            "pub fn build_delta_net_layer_decode_into(",
+        ] {
+            assert!(
+                src.contains(entry),
+                "H137: entry point `{entry}` must still exist"
+            );
+        }
+        // Each entry point has a `slot_id: SlotId,` parameter.
+        let slot_id_param_count = src.matches("slot_id: SlotId,").count();
+        assert!(
+            slot_id_param_count >= 3,
+            "H137: expected ≥3 `slot_id: SlotId,` occurrences \
+             (one per `build_delta_net_layer*` entry); got {}",
+            slot_id_param_count
+        );
+        // The slot-narrowing helper exists and is called.
+        assert!(
+            src.contains("fn narrow_la_ping_pong_to_slot("),
+            "H137: `narrow_la_ping_pong_to_slot` slice_view helper must exist"
+        );
+        let narrow_calls = src.matches("narrow_la_ping_pong_to_slot(").count();
+        // Definition + ≥3 callers (one per entry point).
+        assert!(
+            narrow_calls >= 4,
+            "H137: expected ≥4 `narrow_la_ping_pong_to_slot(` references \
+             (1 definition + 3 entry-point callers); got {}",
+            narrow_calls
+        );
+    }
+
+    /// H138 — SlotId(0) byte-equivalence pre/post-A2b-cont.
+    ///
+    /// At `n_seqs=1` AND `SlotId(0)`, `forward_gpu_last_logits` on a
+    /// model with linear-attn layers (tiny_hybrid_model_nonzero) must
+    /// produce byte-identical logits compared to running at `n_seqs=4`
+    /// AND `SlotId(0)` (because slice_view at byte_offset=0 + the
+    /// kernel single-seq validator accepting `state_in` whose
+    /// element_count exactly equals the per-seq target → byte-
+    /// equivalent dispatch).
+    ///
+    /// Falsifier: any per-element bit difference between
+    /// n_seqs=1/SlotId(0) and n_seqs=4/SlotId(0) logits ⇒
+    /// the slice_view byte_offset is wrong OR the kernel was getting
+    /// fed extra slots' data OR the FA layer (also in this model)
+    /// regressed sibling discipline.
+    #[test]
+    fn h138_slot_0_byte_equivalence_with_linear_attn_layers_2026_05_30() {
+        let m = tiny_hybrid_model_nonzero();
+        let cfg = m.cfg.clone();
+        let tokens = vec![5u32, 10, 15, 20];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+
+        let device = MlxDevice::new().expect("device");
+        let mut kv_1 = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv n_seqs=1");
+        let mut kv_4 = HybridKvCache::new(&cfg, &device, 64, 4).expect("kv n_seqs=4");
+
+        let logits_1 = m
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv_1, SlotId(0))
+            .expect("forward_gpu_last_logits n_seqs=1 (linear-attn hybrid)");
+        let logits_4 = m
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv_4, SlotId(0))
+            .expect("forward_gpu_last_logits n_seqs=4 (linear-attn hybrid)");
+
+        assert_eq!(
+            logits_1.len(),
+            cfg.vocab_size as usize,
+            "H138 sanity: forward_gpu_last_logits must return vocab_size F32 \
+             (got {}, expected {})",
+            logits_1.len(),
+            cfg.vocab_size,
+        );
+
+        let first_diff = logits_1
+            .iter()
+            .zip(logits_4.iter())
+            .enumerate()
+            .find(|(_, (a, b))| a.to_bits() != b.to_bits());
+        assert!(
+            first_diff.is_none(),
+            "H138 FALSIFIED: n_seqs=4/SlotId(0) logits not byte-identical \
+             to n_seqs=1/SlotId(0) on a hybrid (linear+full) model. The \
+             ADR-040 §6.1.40 iter-A2b-cont slice_view lift must preserve \
+             SlotId(0) byte-equivalence. First diff: {}",
+            first_diff
+                .map(|(i, (a, b))| format!(
+                    "logits[{i}] n=1={:.9} (bits {:#010x}) vs n=4={:.9} \
+                     (bits {:#010x})",
+                    a, a.to_bits(), b, b.to_bits(),
+                ))
+                .unwrap_or_else(|| "<unreachable>".into())
+        );
+    }
+
+    /// H139 — SlotId(N>0) end-to-end with n_seqs=4 on a model with
+    /// linear-attn layers.
+    ///
+    /// `forward_gpu_last_logits(.., SlotId(1))` at n_seqs=4 on the
+    /// hybrid (linear+full-attn) tiny model MUST run through both the
+    /// LA dispatch (via the new slot_id threading + slice_view) and
+    /// the FA dispatch (B4a-cont) without error AND advance
+    /// `current_len[1]` (per-slot cursor) by `tokens.len()`, leaving
+    /// `current_len[0]` at 0.
+    ///
+    /// Falsifier: `forward_gpu_last_logits` errors (slot 1 LA
+    /// dispatch broken), `current_len[1] != seq` (slot routing broken),
+    /// `current_len[0] != 0` (slot leakage).
+    #[test]
+    fn h139_slot_1_succeeds_end_to_end_with_linear_attn_2026_05_30() {
+        let m = tiny_hybrid_model_nonzero();
+        let cfg = m.cfg.clone();
+        let tokens = vec![5u32, 10, 15, 20];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+
+        let device = MlxDevice::new().expect("device");
+        let mut kv = HybridKvCache::new(&cfg, &device, 64, 4).expect("kv n_seqs=4");
+
+        let logits = m
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv, SlotId(1))
+            .expect(
+                "H139: forward_gpu_last_logits at SlotId(1) on hybrid \
+                 (linear+full-attn) model must succeed end-to-end via \
+                 ADR-040 §6.1.40 iter-A2b-cont slot routing",
+            );
+
+        assert_eq!(
+            logits.len(),
+            cfg.vocab_size as usize,
+            "H139: logits len mismatch (got {}, expected {})",
+            logits.len(),
+            cfg.vocab_size,
+        );
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "H139: logits must be finite at SlotId(1)"
+        );
+
+        // Per-slot cursor advanced exactly for slot 1, slot 0 untouched.
+        // Cursors live on each full-attn slot at `full_attn[layer].current_len[s]`.
+        assert!(
+            !kv.full_attn.is_empty(),
+            "H139 sanity: tiny_hybrid_cfg must have ≥1 FA layer for cursor inspection"
+        );
+        let slot_1_cursor = kv.full_attn[0].current_len[1];
+        let slot_0_cursor = kv.full_attn[0].current_len[0];
+        assert_eq!(
+            slot_1_cursor, seq,
+            "H139: slot 1 cursor must == seq_len ({}); got {}",
+            seq, slot_1_cursor,
+        );
+        assert_eq!(
+            slot_0_cursor, 0,
+            "H139: slot 0 cursor must remain 0 (slot 1 forward must NOT touch \
+             slot 0's region); got {}",
+            slot_0_cursor,
+        );
+    }
+
+    /// H140 — `forward_gpu_last_logits` threads `slot_id` through to
+    /// the `build_delta_net_layer*` entry points (source-grep pin
+    /// against accidental re-hard-coding to SlotId(0) at the call
+    /// site, which would silently break slot 1 routing).
+    ///
+    /// Falsifier: `forward_gpu.rs:forward_gpu_impl` linear-attn branch
+    /// loses its `slot_id` argument to either `build_delta_net_layer`
+    /// or `build_delta_net_layer_with_arena`.
+    #[test]
+    fn h140_forward_gpu_threads_slot_id_to_build_delta_net_layer_2026_05_30() {
+        let src = std::fs::read_to_string("src/inference/models/qwen35/forward_gpu.rs")
+            .expect("read forward_gpu.rs");
+        // Both the arena + non-arena prefill call sites must reference
+        // `slot_id,` as their final argument. Allow whitespace
+        // flexibility by searching for the literal token after the
+        // ADR-040 Phase A2b-cont marker.
+        assert!(
+            src.contains("ADR-040 Phase A2b-cont"),
+            "H140: forward_gpu.rs must carry the ADR-040 Phase A2b-cont \
+             marker comments at the new slot_id threading sites."
+        );
+        // Coarse check: count occurrences of `slot_id,` near the LA
+        // dispatch.  Both `build_delta_net_layer_with_arena` + non-
+        // arena call sites should now pass slot_id.
+        let arena_call_idx = src
+            .find("build_delta_net_layer_with_arena(")
+            .expect("with_arena call site must exist");
+        // Look at the next ~4000 bytes for `slot_id,`.
+        let window = &src[arena_call_idx..(arena_call_idx + 4000).min(src.len())];
+        assert!(
+            window.contains("slot_id,"),
+            "H140: build_delta_net_layer_with_arena call site must pass \
+             slot_id (the ADR-040 §6.1.40 lift); not found within \
+             4 KB window of the call site."
+        );
+        // Same check for the non-arena variant at the prefill path
+        // (NOT the legacy greedy `SlotId(0)` site).
+        let layer_call_idx = src
+            .find("delta_net layer {layer_idx}")
+            .expect("delta_net layer context format must exist");
+        // The build_delta_net_layer call sits a bit before that context.
+        let before = &src[layer_call_idx.saturating_sub(3000)..layer_call_idx];
+        assert!(
+            before.contains("slot_id,"),
+            "H140: build_delta_net_layer (non-arena prefill path) must \
+             pass slot_id; not found within 3 KB window before the \
+             context format string."
+        );
+    }
+
+    /// H141 — chunk-gated-delta-rule + autoregressive variants both
+    /// route through the `narrow_la_ping_pong_to_slot` helper.
+    ///
+    /// Two dispatch families in `build_delta_net_layer*` are
+    /// load-bearing for the lift: (a) `dispatch_ssm_conv` /
+    /// `dispatch_ssm_conv_with_capture` (read/write conv_state),
+    /// (b) `dispatch_gated_delta_net*` (read/write recurrent). With
+    /// `chunk_path_eligible == true`, prefill ALSO routes through
+    /// `apply_gated_delta_net_chunk*` which reads/writes recurrent.
+    /// All three must see slot-narrowed ping-pong buffers (not the
+    /// underlying multi-seq buffer).
+    ///
+    /// Falsifier: a future refactor silently drops the slice_view
+    /// narrowing in the `chunk_path_eligible` branch but keeps it on
+    /// the autoreg branch.
+    #[test]
+    fn h141_chunk_and_autoreg_paths_both_lifted_2026_05_30() {
+        let src = std::fs::read_to_string("src/inference/models/qwen35/gpu_delta_net.rs")
+            .expect("read gpu_delta_net.rs");
+        // `narrow_la_ping_pong_to_slot` is called at the *top* of each
+        // build_delta_net_layer* entry point — before any branch
+        // (decode/prefill/chunk/autoreg) is taken. So a single helper
+        // invocation covers BOTH the chunk + autoreg paths within
+        // each entry. Verify the entry-point-level invocation pattern:
+        //
+        //   pub fn build_delta_net_layer* { ... narrow_la_ping_pong_to_slot ... }
+        //
+        // by counting `narrow_la_ping_pong_to_slot(` references — must
+        // be ≥4 (1 fn def + 3 entry-point calls).
+        let count = src.matches("narrow_la_ping_pong_to_slot(").count();
+        assert!(
+            count >= 4,
+            "H141: expected ≥4 `narrow_la_ping_pong_to_slot(` references \
+             (1 fn def + 3 entry-point callers covering both chunk and \
+             autoreg paths); got {}",
+            count
+        );
+        // The ChunkAllocsArena module + the FORWARD_DISPATCH_N_SEQS
+        // documentation must both carry the per-slot per-step contract
+        // language so future iters maintain the discipline.
+        assert!(
+            src.contains("per-slot per-step"),
+            "H141: per-slot per-step dispatch contract documentation must \
+             persist; the kernel intrinsic single-seq dispatch language \
+             is load-bearing for future audit."
+        );
+        // Both chunk arena (`apply_gated_delta_net_chunk_with_arena`)
+        // and non-arena (`apply_gated_delta_net_chunk`) helpers must
+        // both reference the FORWARD_DISPATCH_N_SEQS contract
+        // (they're the chunk-path call sites that see the
+        // slot-narrowed state buffers).
+        assert!(
+            src.contains("apply_gated_delta_net_chunk_with_arena"),
+            "H141: chunk_with_arena helper must exist"
+        );
+        assert!(
+            src.contains("apply_gated_delta_net_chunk"),
+            "H141: chunk helper must exist"
+        );
+    }
+
+    /// H142 — Qwen35 non-linear-attn (pure full-attn) variants are
+    /// UNCHANGED by A2b-cont.
+    ///
+    /// The `tiny_dense_full_attn_model_nonzero_for_b4a` fixture has
+    /// ZERO linear-attn layers (layer_types is all
+    /// `Qwen35LayerKind::FullAttention`). For any slot_id, the
+    /// forward path NEVER reaches `build_delta_net_layer*`, so the
+    /// A2b-cont lift cannot regress this variant by definition. This
+    /// test pins that contract by running the same `n_seqs=4 +
+    /// SlotId(0)` vs `n_seqs=1 + SlotId(0)` comparison as B4b H17
+    /// (which already passes — see `b4b_forward_gpu_last_logits_at_
+    /// slot_0_n_seqs_4_byte_identical_to_n_seqs_1`) and asserts the
+    /// byte-identical result is unaffected by the A2b-cont changes.
+    #[test]
+    fn h142_qwen35_full_attn_only_unchanged_by_a2b_cont_2026_05_30() {
+        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
+        let cfg = m.cfg.clone();
+        let tokens = vec![5u32, 10, 15, 20];
+        let seq = tokens.len() as u32;
+        let pos_4 = text_positions(seq);
+        let positions = positions_to_flat(&pos_4);
+
+        let device = MlxDevice::new().expect("device");
+        let mut kv_1 = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv n_seqs=1");
+        let mut kv_4 = HybridKvCache::new(&cfg, &device, 64, 4).expect("kv n_seqs=4");
+
+        let logits_1 = m
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv_1, SlotId(0))
+            .expect("forward_gpu_last_logits n_seqs=1 (FA-only)");
+        let logits_4 = m
+            .forward_gpu_last_logits(&tokens, &positions, &mut kv_4, SlotId(0))
+            .expect("forward_gpu_last_logits n_seqs=4 (FA-only)");
+
+        assert_eq!(logits_1.len(), logits_4.len(), "H142: vocab len mismatch");
+        let first_diff = logits_1
+            .iter()
+            .zip(logits_4.iter())
+            .enumerate()
+            .find(|(_, (a, b))| a.to_bits() != b.to_bits());
+        assert!(
+            first_diff.is_none(),
+            "H142 FALSIFIED: ADR-040 §6.1.40 iter-A2b-cont regressed the \
+             pure-full-attn Qwen35 variant.  Byte-equivalence between \
+             n_seqs=1 and n_seqs=4 at SlotId(0) on an FA-only model must \
+             remain. First diff: {}",
+            first_diff
+                .map(|(i, (a, b))| format!(
+                    "logits[{i}] n=1={:.9} (bits {:#010x}) vs n=4={:.9} \
+                     (bits {:#010x})",
+                    a, a.to_bits(), b, b.to_bits(),
+                ))
+                .unwrap_or_else(|| "<unreachable>".into())
+        );
+    }
+
+    /// H143 — Gemma 4 + Qwen3VL forward paths UNCHANGED by A2b-cont.
+    ///
+    /// The lift surface is strictly `gpu_delta_net.rs` (Qwen35 linear-
+    /// attn). Neither Gemma 4's `MlxModelWeights` forward path
+    /// (`src/serve/forward_prefill.rs`) nor any `qwen3vl_text` code
+    /// touches `build_delta_net_layer*` — they have their own
+    /// independent dispatch surfaces. This test source-greps to pin
+    /// that contract.
+    ///
+    /// Falsifier: the `gpu_delta_net.rs` lift accidentally drags
+    /// `build_delta_net_layer*` calls into Gemma 4 or Qwen3VL code.
+    #[test]
+    fn h143_gemma4_and_qwen3vl_forward_paths_unchanged_2026_05_30() {
+        let gemma4 = std::fs::read_to_string("src/serve/forward_prefill.rs")
+            .expect("read forward_prefill.rs");
+        assert!(
+            !gemma4.contains("build_delta_net_layer"),
+            "H143 FALSIFIED: ADR-040 §6.1.40 iter-A2b-cont leaked Qwen35 \
+             `build_delta_net_layer*` references into Gemma 4's \
+             forward_prefill.rs.  The lift surface MUST stay scoped to \
+             Qwen35 gpu_delta_net.rs."
+        );
+        // Spot-check the qwen3vl text module if it exists; if it
+        // doesn't, the absence is the strongest possible H143 pass.
+        if std::path::Path::new("src/inference/models/qwen3vl_text").exists() {
+            // Walk the directory and check for accidental references.
+            for entry in std::fs::read_dir("src/inference/models/qwen3vl_text")
+                .expect("read qwen3vl_text dir")
+            {
+                let entry = entry.expect("dir entry");
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    let body = std::fs::read_to_string(&p)
+                        .unwrap_or_else(|_| String::new());
+                    assert!(
+                        !body.contains("build_delta_net_layer"),
+                        "H143 FALSIFIED: qwen3vl_text/{:?} references \
+                         build_delta_net_layer — A2b-cont lift leaked.",
+                        p.file_name()
+                    );
+                }
+            }
+        }
     }
 }

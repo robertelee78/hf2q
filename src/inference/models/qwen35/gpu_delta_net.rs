@@ -105,6 +105,7 @@ use super::delta_net::DeltaNetLayerWeights;
 use super::encoder_stage::LayerEncoder;
 use super::gpu_full_attn::{download_f32, upload_f32, upload_f32_weight, upload_q4_0_from_f32};
 use crate::debug::INVESTIGATION_ENV;
+use crate::serve::multi_seq_kv::SlotId;
 
 /// Wave 5b iter 5 — chunk-pipeline prefill threshold.
 ///
@@ -139,6 +140,282 @@ fn chunk_path_eligible(seq_len: u32, d_k: u32) -> bool {
         && seq_len % mlx_native::ops::chunk_gated_delta_rule::FIXED_BT == 0
         && (d_k == mlx_native::ops::chunk_gated_delta_rule::MAX_K // 128
             || d_k == mlx_native::ops::chunk_gated_delta_rule_bank_split::BANK_SPLIT_K) // 256
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ADR-040 Phase A2b-cont — forward-path linear-attn dispatch slot routing
+// ──────────────────────────────────────────────────────────────────────
+//
+// Closes the iter-A2b §6.1.23 deferral block: the ~15 `n_seqs = 1u32`
+// hard-codes in this file represent an *intrinsic per-slot per-step*
+// dispatch contract — the forward path generates one slot's tokens at
+// a time, so the kernel is invoked with `n_seqs=1` PER CALL. What the
+// A2b-cont lift adds is a `slot_id: SlotId` parameter on the three
+// `build_delta_net_layer*` entry points so that the multi-seq
+// `LinearAttnStateSlot` buffers (`conv_state`, `conv_state_scratch`,
+// `recurrent`, `recurrent_scratch`, `capture_states`,
+// `conv_capture_states`) are `slice_view`-narrowed to the per-slot
+// region BEFORE being handed to the dispatch helpers (mlx-native).
+//
+// Layout proofs (verbatim from §6.1.23 / kv_cache.rs:7459-7475):
+//
+//   - recurrent / recurrent_scratch:
+//       `[D_k, D_v, n_v_heads, n_seqs]`  col-major
+//       per_seq_elems = D_k * D_v * n_v_heads
+//       slot s byte_offset = s * per_seq_elems * 4   (F32)
+//
+//   - conv_state / conv_state_scratch:
+//       `[channels, K-1, n_seqs]`  col-major
+//       per_seq_elems = channels * (K-1)
+//       slot s byte_offset = s * per_seq_elems * 4
+//
+//   - capture_states (recurrent capture, ADR-034 task #90 Step 3):
+//       `[D_k, D_v, n_v_heads, n_tokens_max, n_seqs]`  col-major
+//       per_seq_elems = D_k * D_v * n_v_heads * n_tokens_max
+//       slot s byte_offset = s * per_seq_elems * 4
+//
+//   - conv_capture_states (conv1d capture, Step 4c):
+//       `[n_seqs, n_tokens_max, K-1, channels]`  row-major (n_seqs OUTERMOST)
+//       per_seq_elems = n_tokens_max * (K-1) * channels
+//       slot s byte_offset = s * per_seq_elems * 4
+//
+// For `SlotId(0)` every byte_offset is 0 and every `slice_view` returns
+// a buffer whose element_count exactly equals the kernel's single-seq
+// validation target — so SlotId(0) is byte-equivalent to the pre-A2b-cont
+// hard-coded path (pinned by H138).
+//
+// The kernel-side `n_seqs = 1u32` parameter is left in place by design:
+// the hf2q forward path is per-slot per-step (multi-seq batched dispatch
+// would require a single SDPA cross-batch which the autoregressive
+// recurrence + chunk pipeline do not support cross-slot today). The
+// `n_seqs=1u32` literals in this file therefore document a kernel-
+// intrinsic single-seq dispatch contract, NOT a multi-seq capability
+// gap. The capability gap was at the *buffer view* level, and is closed
+// by the slot-region helpers below.
+
+/// Per-slot byte offset + element count for the linear-attn `recurrent`
+/// buffer of shape `[D_k, D_v, n_v_heads, n_seqs]` F32 (col-major).
+///
+/// Returns `(byte_offset, n_elements)` so the caller can:
+///
+/// ```ignore
+/// let slot_view = recurrent.slice_view(byte_offset, n_elements);
+/// ```
+///
+/// For `SlotId(0)` returns `(0, D_k * D_v * n_v_heads)` — a slice_view
+/// with byte_offset 0 is byte-equivalent to passing the underlying
+/// buffer directly when the kernel reads only single-seq sized state.
+#[inline]
+fn slot_recurrent_region(
+    slot_id: SlotId,
+    d_k: u32,
+    d_v: u32,
+    n_v_heads: u32,
+) -> (u64, usize) {
+    let n_elements = (d_k as usize) * (d_v as usize) * (n_v_heads as usize);
+    let byte_offset = (slot_id.0 as u64)
+        .checked_mul(n_elements as u64)
+        .and_then(|e| e.checked_mul(std::mem::size_of::<f32>() as u64))
+        .expect("slot recurrent byte offset overflow (slot * D_k * D_v * n_v_heads * 4)");
+    (byte_offset, n_elements)
+}
+
+/// Per-slot byte offset + element count for the linear-attn `conv_state`
+/// buffer of shape `[channels, K-1, n_seqs]` F32 (col-major).
+#[inline]
+fn slot_conv_state_region(
+    slot_id: SlotId,
+    conv_channels: u32,
+    k_minus_one: u32,
+) -> (u64, usize) {
+    let n_elements = (conv_channels as usize) * (k_minus_one as usize);
+    let byte_offset = (slot_id.0 as u64)
+        .checked_mul(n_elements as u64)
+        .and_then(|e| e.checked_mul(std::mem::size_of::<f32>() as u64))
+        .expect("slot conv_state byte offset overflow (slot * channels * (K-1) * 4)");
+    (byte_offset, n_elements)
+}
+
+/// Per-slot byte offset + element count for the linear-attn recurrent
+/// `capture_states` buffer of shape
+/// `[D_k, D_v, n_v_heads, n_tokens_max, n_seqs]` F32 (col-major;
+/// n_seqs OUTERMOST). Per-slot per_seq_elems = D_k * D_v * n_v_heads *
+/// n_tokens_max — matches the kernel-side `capture_required =
+/// n_tokens * state_elems` at `n_seqs=1` per
+/// `mlx-native/.../gated_delta_net_decode.rs:307-320` when
+/// `n_tokens_max >= seq_len`.
+///
+/// `n_tokens_max` MUST be derived from the buffer's actual allocation
+/// (capture_states.element_count() / (D_k * D_v * n_v_heads * n_seqs))
+/// rather than from a forward-path local — callers can pass it as the
+/// per-slot stride directly.
+#[inline]
+fn slot_capture_states_region(
+    slot_id: SlotId,
+    d_k: u32,
+    d_v: u32,
+    n_v_heads: u32,
+    n_tokens_max: u32,
+) -> (u64, usize) {
+    let per_seq_elems = (d_k as usize)
+        * (d_v as usize)
+        * (n_v_heads as usize)
+        * (n_tokens_max as usize);
+    let byte_offset = (slot_id.0 as u64)
+        .checked_mul(per_seq_elems as u64)
+        .and_then(|e| e.checked_mul(std::mem::size_of::<f32>() as u64))
+        .expect("slot capture_states byte offset overflow");
+    (byte_offset, per_seq_elems)
+}
+
+/// Per-slot byte offset + element count for the linear-attn conv
+/// `conv_capture_states` buffer of shape
+/// `[n_seqs, n_tokens_max, K-1, channels]` F32 (row-major;
+/// n_seqs OUTERMOST). Per-slot per_seq_elems = n_tokens_max * (K-1)
+/// * channels.
+#[inline]
+fn slot_conv_capture_region(
+    slot_id: SlotId,
+    conv_channels: u32,
+    k_minus_one: u32,
+    n_tokens_max: u32,
+) -> (u64, usize) {
+    let per_seq_elems = (n_tokens_max as usize)
+        * (k_minus_one as usize)
+        * (conv_channels as usize);
+    let byte_offset = (slot_id.0 as u64)
+        .checked_mul(per_seq_elems as u64)
+        .and_then(|e| e.checked_mul(std::mem::size_of::<f32>() as u64))
+        .expect("slot conv_capture byte offset overflow");
+    (byte_offset, per_seq_elems)
+}
+
+/// Convenience bundle: the four slot-narrowed ping-pong buffer views
+/// produced by [`narrow_la_ping_pong_to_slot`]. Each view is a
+/// zero-copy [`MlxBuffer`] clone with `byte_offset` set to the per-slot
+/// region's start; for `SlotId(0)` every view is byte-equivalent to
+/// the input buffer (offset == 0).
+///
+/// The `_capture_*` variants are produced separately by
+/// [`narrow_capture_states_to_slot`] / [`narrow_conv_capture_to_slot`]
+/// when the caller's K=N spec-decode arms are active.
+struct LaPingPongSlotView {
+    conv_state_in: MlxBuffer,
+    conv_state_out: MlxBuffer,
+    recurrent_in: MlxBuffer,
+    recurrent_out: MlxBuffer,
+}
+
+#[inline]
+fn narrow_la_ping_pong_to_slot(
+    conv_state_in: &MlxBuffer,
+    conv_state_out: &MlxBuffer,
+    recurrent_in: &MlxBuffer,
+    recurrent_out: &MlxBuffer,
+    slot_id: SlotId,
+    d_k: u32,
+    d_v: u32,
+    n_v_heads: u32,
+    conv_channels: u32,
+    k_minus_one: u32,
+) -> LaPingPongSlotView {
+    let (rec_off, rec_n) = slot_recurrent_region(slot_id, d_k, d_v, n_v_heads);
+    let (conv_off, conv_n) = slot_conv_state_region(slot_id, conv_channels, k_minus_one);
+    LaPingPongSlotView {
+        conv_state_in: conv_state_in.slice_view(conv_off, conv_n),
+        conv_state_out: conv_state_out.slice_view(conv_off, conv_n),
+        recurrent_in: recurrent_in.slice_view(rec_off, rec_n),
+        recurrent_out: recurrent_out.slice_view(rec_off, rec_n),
+    }
+}
+
+#[inline]
+fn narrow_capture_states_to_slot(
+    capture: &MlxBuffer,
+    slot_id: SlotId,
+    d_k: u32,
+    d_v: u32,
+    n_v_heads: u32,
+    n_seqs_alloc: u32,
+) -> MlxBuffer {
+    // Derive n_tokens_max from the buffer's actual element count so a
+    // forward-path mis-sizing surfaces inside the dispatcher's
+    // validator (capture_required >= seq_len * state_elems for
+    // n_seqs=1) rather than as a silent slot-zero write.
+    let state_elems = (d_k as usize) * (d_v as usize) * (n_v_heads as usize);
+    let total = capture.element_count();
+    let per_seq_elems = total / (n_seqs_alloc as usize).max(1);
+    debug_assert_eq!(
+        per_seq_elems * (n_seqs_alloc as usize),
+        total,
+        "capture_states total ({}) must divide evenly by n_seqs ({})",
+        total,
+        n_seqs_alloc,
+    );
+    let n_tokens_max = if state_elems == 0 {
+        0
+    } else {
+        per_seq_elems / state_elems
+    };
+    let (off, n) = slot_capture_states_region(
+        slot_id,
+        d_k,
+        d_v,
+        n_v_heads,
+        n_tokens_max as u32,
+    );
+    capture.slice_view(off, n)
+}
+
+#[inline]
+fn narrow_conv_capture_to_slot(
+    conv_capture: &MlxBuffer,
+    slot_id: SlotId,
+    conv_channels: u32,
+    k_minus_one: u32,
+    n_seqs_alloc: u32,
+) -> MlxBuffer {
+    let total = conv_capture.element_count();
+    let per_seq_elems = total / (n_seqs_alloc as usize).max(1);
+    debug_assert_eq!(
+        per_seq_elems * (n_seqs_alloc as usize),
+        total,
+        "conv_capture_states total ({}) must divide evenly by n_seqs ({})",
+        total,
+        n_seqs_alloc,
+    );
+    let per_token_elems = (conv_channels as usize) * (k_minus_one as usize);
+    let n_tokens_max = if per_token_elems == 0 {
+        0
+    } else {
+        per_seq_elems / per_token_elems
+    };
+    let (off, n) = slot_conv_capture_region(
+        slot_id,
+        conv_channels,
+        k_minus_one,
+        n_tokens_max as u32,
+    );
+    conv_capture.slice_view(off, n)
+}
+
+/// `n_seqs` field for the kernel-side `GatedDeltaNetParams` /
+/// `SsmConvParams` — fixed at 1 by design. See the long comment block
+/// at the top of "ADR-040 Phase A2b-cont — forward-path linear-attn
+/// dispatch slot routing" for the rationale: the hf2q forward path is
+/// per-slot per-step, and per-slot multi-seq routing is realized via
+/// `slice_view` on the cache buffers BEFORE dispatch (not via the
+/// kernel's batched `n_seqs` axis). Centralized here so the audit
+/// surface is small and grep-stable for future iters.
+const FORWARD_DISPATCH_N_SEQS: u32 = 1;
+
+/// Mirror of the per-layer `qkv_channels = 2 * n_k_heads * d_k +
+/// n_v_heads * d_v` formula used at every `build_delta_net_layer*`
+/// entry. Centralized so the A2b-cont slot-region helpers above can
+/// compute the conv_channels axis without duplicating the formula.
+#[inline]
+fn qkv_channels_for(n_k_heads: u32, n_v_heads: u32, d_k: u32, d_v: u32) -> u32 {
+    2 * n_k_heads * d_k + n_v_heads * d_v
 }
 
 // ================================================================
@@ -909,7 +1186,14 @@ pub fn apply_gated_delta_net(
     d_k: u32,
     d_v: u32,
 ) -> Result<(MlxBuffer, MlxBuffer)> {
-    let n_seqs = 1u32;
+    // ADR-040 §6.1.40 iter-A2b-cont: `apply_gated_delta_net` is the
+    // standalone test/helper variant that allocates its own state_out
+    // buffer at single-seq size. The forward path's per-slot routing
+    // happens in `build_delta_net_layer*` via slice_view BEFORE these
+    // helpers are reached; this helper is intrinsically single-seq
+    // per its allocation contract (no state_in/state_out shape
+    // proxy back to a multi-seq cache).
+    let n_seqs = FORWARD_DISPATCH_N_SEQS;
     // g_buf and beta_buf are already GPU buffers — no upload needed.
     // state_in is already a GPU buffer — no upload needed.
 
@@ -918,7 +1202,7 @@ pub fn apply_gated_delta_net(
     let output_buf = device
         .alloc_buffer(out_elems * 4, DType::F32, vec![out_elems])
         .map_err(|e| anyhow!("alloc gdn output: {e}"))?;
-    let state_elems = (d_k * d_v * n_v_heads) as usize; // n_seqs=1
+    let state_elems = (d_k * d_v * n_v_heads) as usize; // per ADR-040 §6.1.40 single-seq dispatch
     let state_out_buf = device
         .alloc_buffer(state_elems * 4, DType::F32, vec![state_elems])
         .map_err(|e| anyhow!("alloc gdn state_out: {e}"))?;
@@ -1087,7 +1371,12 @@ pub fn apply_gated_delta_net_chunk(
         ));
     }
 
-    let n_seqs = 1u32; // hf2q forward path is single-seq.
+    // ADR-040 §6.1.40 iter-A2b-cont: kernel-intrinsic per-slot per-step
+    // dispatch — `state_in` / `final_state` are already slot-narrowed
+    // by the caller (`build_delta_net_layer*`) via the
+    // `narrow_la_ping_pong_to_slot` helper. The chunk pipeline
+    // processes ONE slot per call by design.
+    let n_seqs = FORWARD_DISPATCH_N_SEQS;
 
     // Element counts.
     // Wave 5b.4: GQA-tiled expansion of q/k from Hg=n_k_heads to H=n_v_heads.
@@ -1553,7 +1842,10 @@ pub fn apply_gated_delta_net_chunk_with_arena(
         .validate_fits(seq_len, n_v_heads, d_k, d_v)
         .context("ChunkAllocsArena shape mismatch")?;
 
-    let n_seqs = 1u32; // hf2q forward path is single-seq.
+    // ADR-040 §6.1.40 iter-A2b-cont: kernel-intrinsic per-slot per-step
+    // dispatch — state_in / final_state are already slot-narrowed by
+    // the caller's `narrow_la_ping_pong_to_slot`.
+    let n_seqs = FORWARD_DISPATCH_N_SEQS;
     let q_elems_exp = (seq_len * n_v_heads * d_k) as usize;
     let v_elems = (seq_len * n_v_heads * d_v) as usize;
     let g_elems = (seq_len * n_v_heads) as usize;
@@ -1914,10 +2206,10 @@ pub fn build_delta_net_layer(
     registry: &mut KernelRegistry,
     x: &MlxBuffer,
     weights: &DeltaNetWeightsGpu,
-    conv_state_in: &MlxBuffer,  // [conv_channels, K-1] GPU ping-pong (read)
-    conv_state_out: &MlxBuffer, // [conv_channels, K-1] GPU ping-pong (write)
-    state_in: &MlxBuffer,       // current recurrent state (read-only)
-    state_out: &MlxBuffer,      // next recurrent state (write-only, must != state_in)
+    conv_state_in: &MlxBuffer,  // [conv_channels, K-1, n_seqs] GPU ping-pong (read)
+    conv_state_out: &MlxBuffer, // [conv_channels, K-1, n_seqs] GPU ping-pong (write)
+    state_in: &MlxBuffer,       // [D_k, D_v, n_v_heads, n_seqs] current recurrent state (read-only)
+    state_out: &MlxBuffer,      // [D_k, D_v, n_v_heads, n_seqs] next recurrent state (write-only, must != state_in)
     seq_len: u32,
     hidden_size: u32,
     n_k_heads: u32,
@@ -1935,7 +2227,90 @@ pub fn build_delta_net_layer(
     // Shape `[n_seqs, n_tokens_capacity, K-1, channels]` F32 per the
     // mlx-native `dispatch_ssm_conv_with_capture` kernel contract.
     conv_state_capture: Option<&MlxBuffer>,
+    // ADR-040 Phase A2b-cont (2026-05-30) — per-slot identity for the
+    // multi-seq linear-attn KV cache buffers. `SlotId(0)` is
+    // byte-equivalent to the pre-A2b-cont hard-coded `n_seqs=1u32`
+    // path (slice_view at byte_offset=0 is a no-op on the kernel side,
+    // and the dispatcher's element_count validation matches the
+    // single-seq sizing exactly when the underlying buffer was alloc'd
+    // at n_seqs=1).  `SlotId(N>0)` narrows the four ping-pong buffers
+    // + the two optional capture buffers to the per-slot region per
+    // §6.1.40 layout proofs. Pinned by H137-H143.
+    slot_id: SlotId,
 ) -> Result<MlxBuffer> {
+    // ADR-040 Phase A2b-cont — derive n_seqs_alloc from `state_in`'s
+    // element count + the per-seq recurrent size. Cheaper than a new
+    // parameter and self-consistent with the buffer the caller passed
+    // in. `state_in.element_count() / (D_k*D_v*n_v_heads)` == the
+    // allocation-time `n_seqs` for the LinearAttnStateSlot
+    // (kv_cache.rs:2599-2613); a division-with-remainder check below
+    // guards against caller-side shape drift.
+    let per_seq_rec_elems = (d_k as usize) * (d_v as usize) * (n_v_heads as usize);
+    let n_seqs_alloc: u32 = if per_seq_rec_elems == 0 {
+        1
+    } else {
+        let total = state_in.element_count();
+        if total % per_seq_rec_elems != 0 {
+            return Err(anyhow!(
+                "build_delta_net_layer: state_in element_count {} not divisible by \
+                 per-seq recurrent elems {} (D_k*D_v*n_v_heads={}). Shape drift \
+                 between caller and kernel-native layout — ADR-040 §6.1.40 lift",
+                total,
+                per_seq_rec_elems,
+                per_seq_rec_elems,
+            ));
+        }
+        (total / per_seq_rec_elems) as u32
+    };
+    if slot_id.0 >= n_seqs_alloc {
+        return Err(anyhow!(
+            "build_delta_net_layer: slot_id={} out of range (state_in n_seqs={}). \
+             ADR-040 Phase A2b-cont per-slot routing contract.",
+            slot_id.0,
+            n_seqs_alloc,
+        ));
+    }
+    // Narrow the 4 ping-pong buffers to the per-slot region. For
+    // `SlotId(0)` every slice_view is byte_offset=0 (byte-equivalent
+    // to pre-A2b-cont).
+    let la_view = narrow_la_ping_pong_to_slot(
+        conv_state_in,
+        conv_state_out,
+        state_in,
+        state_out,
+        slot_id,
+        d_k,
+        d_v,
+        n_v_heads,
+        /* conv_channels = */ qkv_channels_for(n_k_heads, n_v_heads, d_k, d_v),
+        /* k_minus_one = */ k_width - 1,
+    );
+    let conv_state_in = &la_view.conv_state_in;
+    let conv_state_out = &la_view.conv_state_out;
+    let state_in = &la_view.recurrent_in;
+    let state_out = &la_view.recurrent_out;
+    // Narrow capture buffers to the per-slot region when active.
+    let state_capture_view = state_capture.map(|b| {
+        narrow_capture_states_to_slot(
+            b,
+            slot_id,
+            d_k,
+            d_v,
+            n_v_heads,
+            n_seqs_alloc,
+        )
+    });
+    let conv_state_capture_view = conv_state_capture.map(|b| {
+        narrow_conv_capture_to_slot(
+            b,
+            slot_id,
+            /* conv_channels = */ qkv_channels_for(n_k_heads, n_v_heads, d_k, d_v),
+            /* k_minus_one = */ k_width - 1,
+            n_seqs_alloc,
+        )
+    });
+    let state_capture: Option<&MlxBuffer> = state_capture_view.as_ref();
+    let conv_state_capture: Option<&MlxBuffer> = conv_state_capture_view.as_ref();
     let qkv_channels = 2 * n_k_heads * d_k + n_v_heads * d_v;
     let z_channels = n_v_heads * d_v;
     let q_span = n_k_heads * d_k;
@@ -1961,11 +2336,16 @@ pub fn build_delta_net_layer(
     let g_n = (seq_len * n_v_heads) as usize;
     let rows_op8 = seq_len * n_v_heads;
     let gated_elems = (rows_op8 * d_v) as usize;
-    let n_seqs = 1u32;
+    // ADR-040 §6.1.40 iter-A2b-cont: kernel-intrinsic per-slot per-step
+    // dispatch — see `FORWARD_DISPATCH_N_SEQS` doc-comment.  Multi-seq
+    // routing for slot N>0 is realized by the `narrow_la_ping_pong_to_slot`
+    // + `narrow_capture_states_to_slot` + `narrow_conv_capture_to_slot`
+    // slice_views above this block, NOT by changing this kernel param.
+    let n_seqs = FORWARD_DISPATCH_N_SEQS;
     let out_elems = (n_v_heads * seq_len * d_v) as usize;
 
     // Pre-allocate ssm_conv output (qkv_conv) and params buffers.
-    // conv_state_in/conv_state_out are passed directly from the kv_cache
+    // conv_state_in/conv_state_out are slot-narrowed views from the kv_cache
     // (GPU ping-pong buffers in kernel-native layout) — no upload/download needed.
     //
     // ADR-012 §Optimize / Task #15: route every per-token scratch allocation
@@ -1983,10 +2363,16 @@ pub fn build_delta_net_layer(
     let mut ssm_params_buf = super::decode_pool::pooled_alloc_buffer(device, 4 * 4, DType::U32, vec![4])
         .map_err(|e| anyhow!("alloc ssm params: {e}"))?;
     {
+        // ADR-040 §6.1.40 per-slot per-step dispatch: ssm_params n_seqs = 1.
         let s = ssm_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
-        s[0] = qkv_channels; s[1] = seq_len; s[2] = 1; s[3] = k_width;
+        s[0] = qkv_channels; s[1] = seq_len; s[2] = FORWARD_DISPATCH_N_SEQS; s[3] = k_width;
     }
-    let ssm_conv_params = SsmConvParams { channels: qkv_channels, n_tokens: seq_len, n_seqs: 1, k_width };
+    let ssm_conv_params = SsmConvParams {
+        channels: qkv_channels,
+        n_tokens: seq_len,
+        n_seqs: FORWARD_DISPATCH_N_SEQS,
+        k_width,
+    };
     let q_scaled = super::decode_pool::pooled_alloc_buffer(device, n_q_elems * 4, DType::F32, vec![n_q_elems])
         .map_err(|e| anyhow!("alloc q_scaled: {e}"))?;
     let g_buf = super::decode_pool::pooled_alloc_buffer(device, g_n * 4, DType::F32, vec![g_n])
@@ -2672,6 +3058,13 @@ pub fn build_delta_net_layer_with_arena(
     // `fence_or_commit("layer.gdn.stage_a")` releases the borrow back to
     // the caller's `Option`.
     layer_session: Option<&mut mlx_native::EncoderSession>,
+    // ADR-040 Phase A2b-cont (2026-05-30) — per-slot identity. See the
+    // sister docstring at `build_delta_net_layer` (`gpu_delta_net.rs`
+    // around line 2205).  SlotId(0) is byte-equivalent to the
+    // pre-A2b-cont path (slice_view at offset 0 + element_count match);
+    // SlotId(N>0) routes through the per-slot region of the multi-seq
+    // LinearAttnStateSlot buffers.  Pinned by H137-H143.
+    slot_id: SlotId,
 ) -> Result<MlxBuffer> {
     debug_assert!(
         seq_len > 1,
@@ -2691,6 +3084,50 @@ pub fn build_delta_net_layer_with_arena(
     let q_span = n_k_heads * d_k;
     let k_span = n_k_heads * d_k;
 
+    // ADR-040 Phase A2b-cont — slot-narrow the four ping-pong buffers.
+    // Mirrors the sister narrowing at `build_delta_net_layer`. Caller's
+    // `state_in.element_count()` divides by `D_k*D_v*n_v_heads` to give
+    // `n_seqs_alloc`; out-of-range slot is a typed Err.
+    let per_seq_rec_elems = (d_k as usize) * (d_v as usize) * (n_v_heads as usize);
+    let n_seqs_alloc: u32 = if per_seq_rec_elems == 0 {
+        1
+    } else {
+        let total = state_in.element_count();
+        if total % per_seq_rec_elems != 0 {
+            return Err(anyhow!(
+                "build_delta_net_layer_with_arena: state_in element_count {} not \
+                 divisible by per-seq recurrent elems {}.  ADR-040 §6.1.40 lift.",
+                total,
+                per_seq_rec_elems,
+            ));
+        }
+        (total / per_seq_rec_elems) as u32
+    };
+    if slot_id.0 >= n_seqs_alloc {
+        return Err(anyhow!(
+            "build_delta_net_layer_with_arena: slot_id={} out of range \
+             (state_in n_seqs={}).  ADR-040 Phase A2b-cont per-slot routing contract.",
+            slot_id.0,
+            n_seqs_alloc,
+        ));
+    }
+    let la_view = narrow_la_ping_pong_to_slot(
+        conv_state_in,
+        conv_state_out,
+        state_in,
+        state_out,
+        slot_id,
+        d_k,
+        d_v,
+        n_v_heads,
+        qkv_channels,
+        k_width - 1,
+    );
+    let conv_state_in = &la_view.conv_state_in;
+    let conv_state_out = &la_view.conv_state_out;
+    let state_in = &la_view.recurrent_in;
+    let state_out = &la_view.recurrent_out;
+
     let _seq = seq_len as usize;
     let nv = n_v_heads as usize;
     let dk = d_k as usize;
@@ -2702,7 +3139,10 @@ pub fn build_delta_net_layer_with_arena(
     let n_q_elems = (seq_len * n_k_heads * d_k) as usize;
     let q_scale_val = 1.0_f32 / (dk as f32).sqrt();
     let rows_op8 = seq_len * n_v_heads;
-    let n_seqs = 1u32;
+    // ADR-040 §6.1.40 iter-A2b-cont: per-slot per-step dispatch — see
+    // `FORWARD_DISPATCH_N_SEQS` rationale.  Multi-seq routing is via
+    // the slice_view narrowing above this block.
+    let n_seqs = FORWARD_DISPATCH_N_SEQS;
 
     // Populate the small param buffers (caller-owned arena slots) once
     // per layer. Same value layout as the pooled originals.
@@ -2713,7 +3153,8 @@ pub fn build_delta_net_layer_with_arena(
             .map_err(|e| anyhow!("DnPrefillArena ssm_params: {e}"))?;
         s[0] = qkv_channels;
         s[1] = seq_len;
-        s[2] = 1;
+        // ADR-040 §6.1.40 per-slot per-step dispatch.
+        s[2] = FORWARD_DISPATCH_N_SEQS;
         s[3] = k_width;
     }
     {
@@ -2757,7 +3198,8 @@ pub fn build_delta_net_layer_with_arena(
     let ssm_conv_params = SsmConvParams {
         channels: qkv_channels,
         n_tokens: seq_len,
-        n_seqs: 1,
+        // ADR-040 §6.1.40 per-slot per-step dispatch contract.
+        n_seqs: FORWARD_DISPATCH_N_SEQS,
         k_width,
     };
 
@@ -3345,6 +3787,12 @@ pub fn build_delta_net_layer_decode_into(
     d_v: u32,
     k_width: u32,
     rms_norm_eps: f32,
+    // ADR-040 Phase A2b-cont (2026-05-30) — per-slot identity. Sister
+    // to `build_delta_net_layer` (no capture buffers here — decode_into
+    // is the legacy-greedy single-CB shape that doesn't engage K=N
+    // spec-decode rollback).  SlotId(0) is byte-equivalent to
+    // pre-A2b-cont. Pinned by H137-H143.
+    slot_id: SlotId,
 ) -> Result<MlxBuffer> {
     debug_assert_eq!(seq_len, 1, "build_delta_net_layer_decode_into: seq_len must be 1");
 
@@ -3360,12 +3808,54 @@ pub fn build_delta_net_layer_decode_into(
     let q_sp = q_span as usize;
     let k_sp = k_span as usize;
 
+    // ADR-040 Phase A2b-cont — slot-narrow the four ping-pong buffers.
+    let per_seq_rec_elems = (d_k as usize) * (d_v as usize) * (n_v_heads as usize);
+    let n_seqs_alloc: u32 = if per_seq_rec_elems == 0 {
+        1
+    } else {
+        let total = state_in.element_count();
+        if total % per_seq_rec_elems != 0 {
+            return Err(anyhow!(
+                "build_delta_net_layer_decode_into: state_in element_count {} not \
+                 divisible by per-seq recurrent elems {}.  ADR-040 §6.1.40 lift.",
+                total,
+                per_seq_rec_elems,
+            ));
+        }
+        (total / per_seq_rec_elems) as u32
+    };
+    if slot_id.0 >= n_seqs_alloc {
+        return Err(anyhow!(
+            "build_delta_net_layer_decode_into: slot_id={} out of range \
+             (state_in n_seqs={}).  ADR-040 Phase A2b-cont per-slot routing contract.",
+            slot_id.0,
+            n_seqs_alloc,
+        ));
+    }
+    let la_view = narrow_la_ping_pong_to_slot(
+        conv_state_in,
+        conv_state_out,
+        state_in,
+        state_out,
+        slot_id,
+        d_k,
+        d_v,
+        n_v_heads,
+        qkv_channels,
+        k_width - 1,
+    );
+    let conv_state_in = &la_view.conv_state_in;
+    let conv_state_out = &la_view.conv_state_out;
+    let state_in = &la_view.recurrent_in;
+    let state_out = &la_view.recurrent_out;
+
     let n_q_elems = (seq_len * n_k_heads * d_k) as usize;
     let q_scale_val = 1.0_f32 / (dk as f32).sqrt();
     let g_n = (seq_len * n_v_heads) as usize;
     let rows_op8 = seq_len * n_v_heads;
     let gated_elems = (rows_op8 * d_v) as usize;
-    let n_seqs = 1u32;
+    // ADR-040 §6.1.40 — kernel-intrinsic per-slot per-step dispatch.
+    let n_seqs = FORWARD_DISPATCH_N_SEQS;
     let out_elems = (n_v_heads * seq_len * d_v) as usize;
 
     // ---- Pool-allocated scratch buffers (same layout as legacy decode) ----
@@ -3380,13 +3870,14 @@ pub fn build_delta_net_layer_decode_into(
             device, 4 * 4, DType::U32, vec![4])
         .map_err(|e| anyhow!("alloc ssm params (decode_into): {e}"))?;
     {
+        // ADR-040 §6.1.40 per-slot per-step dispatch.
         let s = ssm_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
-        s[0] = qkv_channels; s[1] = seq_len; s[2] = 1; s[3] = k_width;
+        s[0] = qkv_channels; s[1] = seq_len; s[2] = FORWARD_DISPATCH_N_SEQS; s[3] = k_width;
     }
     let ssm_conv_params = SsmConvParams {
         channels: qkv_channels,
         n_tokens: seq_len,
-        n_seqs: 1,
+        n_seqs: FORWARD_DISPATCH_N_SEQS,
         k_width,
     };
     let q_scaled = super::decode_pool::pooled_alloc_buffer(
@@ -3698,6 +4189,7 @@ mod tests {
             shape.rms_norm_eps,
             None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
             None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
+            SlotId(0), // ADR-040 §6.1.40 A2b-cont — single-seq test (SlotId(0)).
         )
         .expect("build_delta_net_layer");
 
@@ -3857,6 +4349,7 @@ mod tests {
             shape.rms_norm_eps,
             None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
             None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
+            SlotId(0), // ADR-040 §6.1.40 A2b-cont — single-seq test (SlotId(0)).
         )
         .expect("build_delta_net_layer");
 
@@ -4017,6 +4510,7 @@ mod tests {
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
             None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
             None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
+            SlotId(0), // ADR-040 §6.1.40 A2b-cont
         ).expect("build_delta_net_layer seq=2");
         device.command_encoder().expect("sync").commit_and_wait().expect("wait");
         let gpu_out_b = download_f32(&gpu_out_b_buf).expect("download");
@@ -4181,6 +4675,7 @@ mod tests {
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
             None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
             None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
+            SlotId(0), // ADR-040 §6.1.40 A2b-cont
         ).expect("mono");
         flush(&device);
         let mono_out = download_f32(&mono_buf).expect("dl mono");
@@ -4204,6 +4699,7 @@ mod tests {
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
             None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
             None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
+            SlotId(0), // ADR-040 §6.1.40 A2b-cont
         ).expect("chunk t0");
         // Required: decode path commit() without wait — flush before reading.
         flush(&device);
@@ -4222,6 +4718,7 @@ mod tests {
             shape.d_k, shape.d_v, shape.conv_kernel, shape.rms_norm_eps,
             None, // ADR-034 task #90 Step 3 — recurrent capture (test: no capture)
             None, // ADR-034 task #90 Step 4c — conv capture (test: no capture)
+            SlotId(0), // ADR-040 §6.1.40 A2b-cont
         ).expect("chunk t1");
         flush(&device);
         let t1_out = download_f32(&t1_buf).expect("dl t1");
@@ -5430,6 +5927,7 @@ mod tests {
             // iter91: synthetic test exercises the per-stage Plain
             // CommandEncoder shape (env=0 equivalent) — pass None.
             None,
+            SlotId(0), // ADR-040 §6.1.40 A2b-cont — single-seq test (SlotId(0)).
         )
         .expect("production consolidated Stage-A path");
         // Flush before download (mirrors pattern at gpu_state_propagation_*).
