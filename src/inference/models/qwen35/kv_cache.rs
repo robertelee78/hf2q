@@ -3072,32 +3072,325 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
         if src == dst {
             return Ok(());
         }
-        // ADR-040 Phase A2b/A2c deferred: cross-slot fork requires
-        // same-buffer cross-region memcpy via
-        // `dispatch_kv_cache_copy_seq_*` (dossier §2.10 R5).  That
-        // kernel-pattern + its own unit-test arc are scheduled for
-        // Phase A2c once the linear-attn multi-seq carve-out lands.
+        // ──────────────────────────────────────────────────────────────
+        // ADR-040 Phase A2c (2026-05-30) — REAL cross-slot fork.
         //
-        // **iter-2.5 M1 (mantra-violation closure)**: the iter-2a impl
-        // returned `SlotOom { 0, 0 }` here as a sentinel for
-        // "kernel-dispatch not yet implemented", which would map to
-        // HTTP 429 + Retry-After upstream — a *misleading* envelope
-        // (caller thinks the capacity will free up; it won't).  Per
-        // the new `MultiSeqError::CapabilityUnsupported` variant
-        // (multi_seq_kv.rs), the deferral now surfaces honestly: the
-        // upstream Phase C iter-3 schema mapping will route this
-        // discriminant to HTTP 501 Not Implemented, which is the
-        // truthful operator-facing envelope while the real fork
-        // dispatch lands.  The pin in
-        // `qwen35_hybrid_kv_fork_cross_slot_returns_capability_unsupported_at_phase_a2a`
-        // will fail loudly when the Phase A2c impl flips the
-        // discriminant to `Ok(())`, signaling the deferral closure.
-        Err(
-            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                capability: "fork_seq cross-slot copy (Qwen35 HybridKvCache; deferred to Phase A2c per ADR-040 §6 + dossier R5)",
-            },
-        )
+        // Replaces the prior `CapabilityUnsupported` typed-deferral with
+        // same-buffer cross-region memcpy via slice `copy_within` on
+        // every per-slot byte region.  The per-slot byte-offset formulas
+        // here MIRROR the slice_view byte-offset formulas the forward
+        // path already uses for per-slot KV writes:
+        //
+        //   * Full-attn K / V (F32):
+        //       `[n_seqs, n_kv_heads, max_seq_len, head_dim]`, OUTERMOST
+        //       n_seqs ⇒ slot stride = `n_kv_heads * max_seq_len * head_dim * 4`
+        //       — same as `slot_k_v_region_for_full_attn` at
+        //       `gpu_full_attn.rs:102-116`.
+        //
+        //   * Full-attn TQ packed (U8) + TQ norms (F32):
+        //       packed `[n_seqs, n_kv_heads, max_seq_len, head_dim]`, norms
+        //       `[n_seqs, n_kv_heads, max_seq_len, norms_per_pos]`.  Stride
+        //       formulas match `alloc_tq_full_attn_buffers` at
+        //       `kv_cache.rs:2735-2763`.
+        //
+        //   * MTP slot: identical shape to full-attn slot per
+        //       `HybridKvCache::new_with_mtp` discipline (the MTP slot
+        //       block is appended at `layer_idx == num_hidden_layers`).
+        //
+        //   * Linear-attn recurrent / conv_state / recurrent_scratch /
+        //       conv_state_scratch: same per-slot layout proofs as
+        //       `gpu_delta_net.rs:160-181` per §6.1.40 iter-A2b-cont.
+        //
+        //   * Linear-attn capture_states + conv_capture_states (K=N
+        //       spec-decode): optional buffers, per-slot stride includes
+        //       n_tokens_max axis per `gpu_delta_net.rs:172-181`.
+        //
+        // Cursor copy: `current_len[dst] = current_len[src]` across every
+        // full_attn slot + MTP slot.  Linear-attn slots carry no cursor
+        // (recurrent state is in-buffer; the byte copy above handles it).
+        //
+        // PERFORMANCE: per-trait-doc `MultiSeqLayout::SeparateSlots` →
+        // O(seq_len) per-slot copy.  This is the production reality of
+        // prefix-share on SeparateSlots layouts — no zero-copy until the
+        // Paged layout kernel arc lands.
+        // ──────────────────────────────────────────────────────────────
+
+        let src_idx = src.0 as usize;
+        let dst_idx = dst.0 as usize;
+        let n_seqs = self.n_seqs as usize;
+
+        // (1) Full-attn slots (F32 K/V + optional TQ buffers + cursor).
+        for slot in self.full_attn.iter_mut() {
+            let cur_src = slot.current_len[src_idx];
+            // F32 K/V: copy slot region bytes when Some.
+            if let Some(ref mut k) = slot.k {
+                copy_buffer_slot_region(k, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: full-attn K copy failed ({e})"
+                            )),
+                        }
+                    })?;
+            }
+            if let Some(ref mut v) = slot.v {
+                copy_buffer_slot_region(v, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: full-attn V copy failed ({e})"
+                            )),
+                        }
+                    })?;
+            }
+            // TQ-active shadow buffers (packed U8 + norms F32).
+            if let Some(ref mut tq) = slot.tq {
+                copy_buffer_slot_region(&mut tq.k_packed, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: TQ K packed copy failed ({e})"
+                            )),
+                        }
+                    })?;
+                copy_buffer_slot_region(&mut tq.v_packed, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: TQ V packed copy failed ({e})"
+                            )),
+                        }
+                    })?;
+                copy_buffer_slot_region(&mut tq.k_norms, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: TQ K norms copy failed ({e})"
+                            )),
+                        }
+                    })?;
+                copy_buffer_slot_region(&mut tq.v_norms, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: TQ V norms copy failed ({e})"
+                            )),
+                        }
+                    })?;
+            }
+            // Cursor copy AFTER buffer copy.
+            slot.current_len[dst_idx] = cur_src;
+        }
+
+        // (2) MTP slot (same shape as full-attn; cursor + buffers).
+        if let Some(ref mut mtp) = self.mtp_slot {
+            let cur_src = mtp.current_len[src_idx];
+            if let Some(ref mut k) = mtp.k {
+                copy_buffer_slot_region(k, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: MTP K copy failed ({e})"
+                            )),
+                        }
+                    })?;
+            }
+            if let Some(ref mut v) = mtp.v {
+                copy_buffer_slot_region(v, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: MTP V copy failed ({e})"
+                            )),
+                        }
+                    })?;
+            }
+            if let Some(ref mut tq) = mtp.tq {
+                copy_buffer_slot_region(&mut tq.k_packed, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: MTP TQ K packed copy failed ({e})"
+                            )),
+                        }
+                    })?;
+                copy_buffer_slot_region(&mut tq.v_packed, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: MTP TQ V packed copy failed ({e})"
+                            )),
+                        }
+                    })?;
+                copy_buffer_slot_region(&mut tq.k_norms, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: MTP TQ K norms copy failed ({e})"
+                            )),
+                        }
+                    })?;
+                copy_buffer_slot_region(&mut tq.v_norms, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: MTP TQ V norms copy failed ({e})"
+                            )),
+                        }
+                    })?;
+            }
+            mtp.current_len[dst_idx] = cur_src;
+        }
+
+        // (3) Linear-attn slots: recurrent + conv_state + scratches +
+        // optional capture buffers.  Layout proofs at
+        // `gpu_delta_net.rs:160-181` (recurrent col-major n_seqs
+        // outermost; conv_state col-major n_seqs outermost; capture
+        // recurrent col-major n_seqs outermost; conv_capture row-major
+        // n_seqs outermost).  For copy_within purposes the AXIS ordering
+        // doesn't matter — only that n_seqs is the OUTERMOST axis so
+        // each slot's region is contiguous.  All four base buffers have
+        // n_seqs as outermost per `alloc_linear_attn_slot` at
+        // `kv_cache.rs:2575-2632`.
+        for slot in self.linear_attn.iter_mut() {
+            // recurrent + recurrent_scratch.
+            copy_buffer_slot_region(&mut slot.recurrent, src_idx, dst_idx, n_seqs)
+                .map_err(|e| {
+                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: leak_static_str(format!(
+                            "fork_seq: LA recurrent copy failed ({e})"
+                        )),
+                    }
+                })?;
+            copy_buffer_slot_region(
+                &mut slot.recurrent_scratch, src_idx, dst_idx, n_seqs,
+            )
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: leak_static_str(format!(
+                        "fork_seq: LA recurrent_scratch copy failed ({e})"
+                    )),
+                }
+            })?;
+            // conv_state + conv_state_scratch.
+            copy_buffer_slot_region(
+                &mut slot.conv_state, src_idx, dst_idx, n_seqs,
+            )
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: leak_static_str(format!(
+                        "fork_seq: LA conv_state copy failed ({e})"
+                    )),
+                }
+            })?;
+            copy_buffer_slot_region(
+                &mut slot.conv_state_scratch, src_idx, dst_idx, n_seqs,
+            )
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: leak_static_str(format!(
+                        "fork_seq: LA conv_state_scratch copy failed ({e})"
+                    )),
+                }
+            })?;
+            // Optional capture buffers (K=N spec-decode).  Same n_seqs
+            // outermost discipline.
+            if let Some(ref mut cap) = slot.capture_states {
+                copy_buffer_slot_region(cap, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: LA capture_states copy failed ({e})"
+                            )),
+                        }
+                    })?;
+            }
+            if let Some(ref mut ccap) = slot.conv_capture_states {
+                copy_buffer_slot_region(ccap, src_idx, dst_idx, n_seqs)
+                    .map_err(|e| {
+                        crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                            capability: leak_static_str(format!(
+                                "fork_seq: LA conv_capture_states copy failed ({e})"
+                            )),
+                        }
+                    })?;
+            }
+        }
+
+        Ok(())
     }
+}
+
+/// ADR-040 Phase A2c (2026-05-30) — leak a `String` into a `&'static
+/// str` for `MultiSeqError::CapabilityUnsupported` payloads constructed
+/// from runtime context.  The error payload is `&'static str` (per the
+/// iter-2.5 M1 surface); buffer-copy failures during fork are
+/// production defects (every buffer is pre-allocated at construction
+/// time, and `copy_within` only fails on out-of-bounds — which our
+/// per-slot byte-offset formulas preclude by construction at the
+/// MultiSeqKvCache impl level), so the leak is bounded.
+#[inline]
+fn leak_static_str(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// ADR-040 Phase A2c (2026-05-30) — same-buffer cross-region byte copy
+/// keyed by an explicit `n_seqs` (the n_seqs axis position in the shape
+/// vector varies across buffer types; per-slot byte stride is always
+/// `total_bytes / n_seqs` because n_seqs is the outermost-in-memory
+/// axis on every Qwen35 multi-seq buffer per the layout proofs at
+/// `kv_cache.rs:2546-2632` + `alloc_tq_full_attn_buffers:2737-2776`).
+///
+/// For full-attn F32 K/V (`[n_seqs, n_kv_heads, max_seq_len, head_dim]`,
+/// row-major n_seqs outermost) per-slot byte stride =
+/// `n_kv_heads * max_seq_len * head_dim * 4` — same formula
+/// `slot_k_v_region_for_full_attn` at `gpu_full_attn.rs:102-116` uses
+/// for forward-path slice_view.
+///
+/// For full-attn TQ packed/norms (`[n_seqs, n_kv_heads, max_seq_len,
+/// {head_dim,norms_per_pos}]`) per-slot byte stride =
+/// `n_kv_heads * max_seq_len * {head_dim,norms_per_pos} * elem_size`
+/// — `alloc_tq_full_attn_buffers:2737-2776`.
+///
+/// For linear-attn recurrent/conv_state (col-major col-major
+/// `[..., n_seqs]` — n_seqs is the LAST shape dim ⇒ outermost in
+/// memory) per-slot byte stride = `D_k * D_v * n_v_heads * 4`
+/// (recurrent) / `channels * (K-1) * 4` (conv_state) per
+/// `gpu_delta_net.rs:160-181`.
+///
+/// For linear-attn capture buffers (recurrent capture col-major n_seqs
+/// outermost; conv_capture row-major n_seqs outermost) per-slot byte
+/// stride collapses to `total_bytes / n_seqs` by the same outermost-
+/// in-memory invariant.
+fn copy_buffer_slot_region(
+    buf: &mut MlxBuffer,
+    src_idx: usize,
+    dst_idx: usize,
+    n_seqs: usize,
+) -> Result<()> {
+    anyhow::ensure!(n_seqs > 0, "fork_seq: n_seqs must be > 0");
+    let total_bytes = buf.byte_len();
+    anyhow::ensure!(
+        total_bytes % n_seqs == 0,
+        "fork_seq: total_bytes={} not divisible by n_seqs={}",
+        total_bytes,
+        n_seqs
+    );
+    let per_slot_bytes = total_bytes / n_seqs;
+    anyhow::ensure!(
+        src_idx < n_seqs && dst_idx < n_seqs,
+        "fork_seq: src/dst out of buffer range \
+         (src={src_idx}, dst={dst_idx}, n_seqs={n_seqs})"
+    );
+    if per_slot_bytes == 0 {
+        return Ok(());
+    }
+    let bytes = buf
+        .as_mut_slice::<u8>()
+        .map_err(|e| anyhow!("fork_seq: as_mut_slice<u8>: {e}"))?;
+    let src_off = src_idx * per_slot_bytes;
+    bytes.copy_within(src_off..src_off + per_slot_bytes, dst_idx * per_slot_bytes);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -7397,55 +7690,52 @@ mod tests {
         assert_eq!(cache.seq_len(SlotId(3)).unwrap(), 0);
     }
 
-    /// Phase A2a deferral pin (per dossier §2.10 R5): cross-slot fork
-    /// returns `CapabilityUnsupported` with the capability label
-    /// naming the deferred kernel arc.  iter-2.5 M1 closure of the
-    /// previous mantra-violating `SlotOom { 0, 0 }` sentinel that
-    /// would have mapped to HTTP 429 + Retry-After upstream (wrong:
-    /// the capacity will not free up because the kernel does not
-    /// exist yet).
+    /// **HISTORICAL** — Phase A2a / iter-2.5 M1 typed-clamp pin
+    /// (renamed from `qwen35_hybrid_kv_fork_cross_slot_returns_capability_unsupported_at_phase_a2a`
+    /// at iter-A2c per ADR-040 brief "rename to historical_ if they
+    /// were pinning the clamp shape").
     ///
-    /// When Phase A2c ships the real kernel dispatch, this test
-    /// will fail loudly — signaling the deferral closure.  At that
-    /// iter, flip the assertion to `expect("fork ok after A2c")` plus a
-    /// per-buffer byte-equality check (write-to-src → fork → read-from-dst
-    /// = write-to-src-and-dst-directly).
+    /// **Prior contract** (A2a → A2c): cross-slot fork returned
+    /// `CapabilityUnsupported` with a capability label naming the
+    /// deferred Phase A2c kernel arc + dossier R5.  This pinned the
+    /// typed-clamp envelope (HTTP 501) before the real same-buffer
+    /// cross-region memcpy landed.
+    ///
+    /// **Closure (iter-A2c, 2026-05-30)**: the real fork dispatch
+    /// shipped at `kv_cache.rs` `HybridKvCache::fork_seq`.  This
+    /// historical test ASSERTS the closure by pinning the NEW
+    /// contract: cross-slot fork must return `Ok(())` (the discriminant
+    /// flip from `Err(CapabilityUnsupported)` to `Ok(())` is the iter
+    /// closure signal per the prior comment "When Phase A2c ships the
+    /// real kernel dispatch, ... flip the assertion to `expect('fork
+    /// ok after A2c')`").  The full byte-equality + cursor-copy
+    /// pin lives at H158 + H163-H165.
     #[test]
-    fn qwen35_hybrid_kv_fork_cross_slot_returns_capability_unsupported_at_phase_a2a() {
+    fn historical_qwen35_hybrid_kv_fork_cross_slot_closure_at_phase_a2c() {
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
         cache.append_for_seq(SlotId(0), 7).unwrap();
-        let err = cache
+        // iter-A2c closure: fork now returns Ok(()) (was previously
+        // CapabilityUnsupported per iter-2.5 M1 typed-clamp).
+        cache
             .fork_seq(SlotId(0), SlotId(1))
-            .expect_err("cross-slot fork deferred to Phase A2c");
-        // The discriminant must be `CapabilityUnsupported` (iter-2.5
-        // M1 — NOT `SlotOom`).  The capability label must reference
-        // the deferred Phase A2c arc + the dossier R5 grounding so an
-        // operator-side log line carries enough context to map a 501
-        // back to the deferred kernel.
-        match err {
-            MultiSeqError::CapabilityUnsupported { capability } => {
-                assert!(
-                    capability.contains("fork_seq cross-slot copy"),
-                    "capability label must name the deferred surface: {capability}"
-                );
-                assert!(
-                    capability.contains("Phase A2c"),
-                    "capability label must name the Phase A2c deferral: {capability}"
-                );
-                assert!(
-                    capability.contains("R5"),
-                    "capability label must name dossier R5 grounding: {capability}"
-                );
-            }
-            other => panic!(
-                "iter-2.5 M1: expected CapabilityUnsupported (HTTP 501); got {other:?} \
-                 — the legacy SlotOom {{ 0, 0 }} sentinel mantra-violation must NOT \
-                 return here.  When Phase A2c ships the real kernel, flip this \
-                 match to `Ok(())` + per-buffer byte-equality assertions."
-            ),
-        }
+            .expect("iter-A2c closure: cross-slot fork must return Ok(()) — \
+                     was previously CapabilityUnsupported per A2a typed-clamp; \
+                     A2c (this iter) ships the real same-buffer cross-region memcpy");
+        // Cursor copy invariant: dst.seq_len == src.seq_len after fork
+        // (H165 sub-pin; fully exercised at H158/H165).
+        assert_eq!(
+            cache.seq_len(SlotId(1)).unwrap(),
+            7,
+            "iter-A2c closure: fork_seq must copy src's seq_len to dst"
+        );
+        // src unchanged (H163 sub-pin).
+        assert_eq!(
+            cache.seq_len(SlotId(0)).unwrap(),
+            7,
+            "iter-A2c closure: fork_seq must NOT modify src's seq_len"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -8299,5 +8589,330 @@ mod tests {
         cache1
             .reset_for_slot(crate::serve::multi_seq_kv::SlotId(0))
             .expect("SlotId(0) at n_seqs=1 must succeed");
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-040 Phase A2c + A3c (2026-05-30) — fork_seq REAL cross-slot
+    // copy hypothesis bank.  Pinning the iter-A2c (Qwen35) +
+    // iter-A3c (Gemma 4 — see gemma4/kv_cache.rs) joint dispatcher
+    // closure per dossier §2.3.3.
+    //
+    // Qwen35 scope (this file): H158 + H163-H166 — the HybridKvCache
+    // full-attn + linear-attn + MTP + capture-buffer end-to-end fork
+    // proof.  The Gemma 4 sibling-struct lifts H159-H162 land in
+    // gemma4/kv_cache.rs (one test per sibling struct).
+    // ──────────────────────────────────────────────────────────────────
+
+    /// **H158** — Qwen35 `HybridKvCache::fork_seq` cross-slot copy
+    /// returns `Ok(())` AND produces byte-identical full-attn K/V
+    /// regions between src and dst.  Replaces the A2a typed-clamp
+    /// `CapabilityUnsupported` envelope at `kv_cache.rs:3044-3099`.
+    ///
+    /// Falsifier (any one of these fires ⇒ H158 broken):
+    /// 1. `fork_seq(src, dst)` returns Err.
+    /// 2. dst's full-attn K bytes at slot region != src's K bytes.
+    /// 3. dst's full-attn V bytes at slot region != src's V bytes.
+    #[test]
+    fn h158_qwen35_hybrid_kv_fork_seq_cross_slot_copies_full_attn_bytes() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let max_seq_len = 64u32;
+        let mut cache = HybridKvCache::new(&cfg, &device, max_seq_len, 4)
+            .expect("alloc n_seqs=4");
+
+        // Seed slot 0's full-attn K/V bytes with deterministic
+        // non-zero patterns per layer.  Production write path is the
+        // forward-path kernel dispatcher; this test exercises the
+        // fork-copy contract via host-side byte writes.
+        let nkv = cfg.num_key_value_heads as usize;
+        let hd = cfg.head_dim as usize;
+        let cap = max_seq_len as usize;
+        let slot_elems = nkv * cap * hd;
+        let slot_bytes_f32 = slot_elems * std::mem::size_of::<f32>();
+
+        for (layer_idx, slot) in cache.full_attn.iter_mut().enumerate() {
+            if let Some(ref mut k) = slot.k {
+                let s = k.as_mut_slice::<u8>().expect("K u8");
+                for (i, b) in s[..slot_bytes_f32].iter_mut().enumerate() {
+                    *b = (((layer_idx * 13 + i) % 251) + 1) as u8;
+                }
+            }
+            if let Some(ref mut v) = slot.v {
+                let s = v.as_mut_slice::<u8>().expect("V u8");
+                for (i, b) in s[..slot_bytes_f32].iter_mut().enumerate() {
+                    *b = (((layer_idx * 19 + i) % 253) + 1) as u8;
+                }
+            }
+        }
+        // Bump slot 0's cursor + record src pre-fork bytes.
+        cache.append_for_seq(SlotId(0), 7).unwrap();
+
+        let src_k_per_layer: Vec<Vec<u8>> = cache
+            .full_attn
+            .iter()
+            .map(|s| {
+                s.k.as_ref()
+                    .map(|k| k.as_slice::<u8>().unwrap()[..slot_bytes_f32].to_vec())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let src_v_per_layer: Vec<Vec<u8>> = cache
+            .full_attn
+            .iter()
+            .map(|s| {
+                s.v.as_ref()
+                    .map(|v| v.as_slice::<u8>().unwrap()[..slot_bytes_f32].to_vec())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        // iter-A2c closure: fork must return Ok(()).
+        cache.fork_seq(SlotId(0), SlotId(1))
+            .expect("H158: fork_seq must succeed post-A2c");
+
+        // Per-layer byte-equality: dst slot 1's K/V bytes == src slot 0's.
+        for (layer_idx, slot) in cache.full_attn.iter().enumerate() {
+            if let Some(ref k) = slot.k {
+                let dst_bytes: Vec<u8> = k
+                    .as_slice::<u8>()
+                    .unwrap()[slot_bytes_f32..2 * slot_bytes_f32]
+                    .to_vec();
+                assert_eq!(
+                    dst_bytes,
+                    src_k_per_layer[layer_idx],
+                    "H158 FALSIFIED: full_attn[{layer_idx}] K bytes at dst slot 1 \
+                     do not match src slot 0 after fork"
+                );
+            }
+            if let Some(ref v) = slot.v {
+                let dst_bytes: Vec<u8> = v
+                    .as_slice::<u8>()
+                    .unwrap()[slot_bytes_f32..2 * slot_bytes_f32]
+                    .to_vec();
+                assert_eq!(
+                    dst_bytes,
+                    src_v_per_layer[layer_idx],
+                    "H158 FALSIFIED: full_attn[{layer_idx}] V bytes at dst slot 1 \
+                     do not match src slot 0 after fork"
+                );
+            }
+        }
+    }
+
+    /// **H163** — `HybridKvCache::fork_seq` does NOT modify the source
+    /// slot's bytes (copy not move).
+    ///
+    /// Falsifier: any per-layer K/V byte at slot 0's region differs
+    /// from the pre-fork snapshot.
+    #[test]
+    fn h163_qwen35_hybrid_kv_fork_seq_src_unchanged() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let max_seq_len = 64u32;
+        let mut cache = HybridKvCache::new(&cfg, &device, max_seq_len, 4)
+            .expect("alloc n_seqs=4");
+        let nkv = cfg.num_key_value_heads as usize;
+        let hd = cfg.head_dim as usize;
+        let cap = max_seq_len as usize;
+        let slot_bytes_f32 = nkv * cap * hd * std::mem::size_of::<f32>();
+        // Seed slot 0's K/V with non-zero data.
+        for (layer_idx, slot) in cache.full_attn.iter_mut().enumerate() {
+            if let Some(ref mut k) = slot.k {
+                let s = k.as_mut_slice::<u8>().expect("K u8");
+                for (i, b) in s[..slot_bytes_f32].iter_mut().enumerate() {
+                    *b = (((layer_idx * 23 + i) % 251) + 1) as u8;
+                }
+            }
+        }
+        cache.append_for_seq(SlotId(0), 9).unwrap();
+
+        // Snapshot SOURCE slot 0's bytes BEFORE the fork.
+        let src_before: Vec<Vec<u8>> = cache
+            .full_attn
+            .iter()
+            .map(|s| {
+                s.k.as_ref()
+                    .map(|k| k.as_slice::<u8>().unwrap()[..slot_bytes_f32].to_vec())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let src_cursor_before: Vec<u32> =
+            cache.full_attn.iter().map(|s| s.current_len[0]).collect();
+
+        cache.fork_seq(SlotId(0), SlotId(2))
+            .expect("H163: fork ok");
+
+        // src slot 0's bytes must be UNCHANGED.
+        for (layer_idx, slot) in cache.full_attn.iter().enumerate() {
+            if let Some(ref k) = slot.k {
+                let src_after: Vec<u8> =
+                    k.as_slice::<u8>().unwrap()[..slot_bytes_f32].to_vec();
+                assert_eq!(
+                    src_before[layer_idx], src_after,
+                    "H163 FALSIFIED: full_attn[{layer_idx}] src slot 0 K bytes \
+                     mutated by fork_seq"
+                );
+            }
+        }
+        // src slot 0's cursor must also be unchanged.
+        for (layer_idx, slot) in cache.full_attn.iter().enumerate() {
+            assert_eq!(
+                slot.current_len[0], src_cursor_before[layer_idx],
+                "H163 FALSIFIED: full_attn[{layer_idx}] src slot 0 cursor mutated \
+                 by fork_seq"
+            );
+        }
+    }
+
+    /// **H164** — `HybridKvCache::fork_seq`: dst slot bytes are
+    /// byte-identical to src slot bytes for EVERY buffer the cache
+    /// carries (full_attn K/V, MTP K/V if present, linear-attn
+    /// recurrent + conv_state, capture buffers if present).  Extends
+    /// H158 with the linear-attn surface.
+    #[test]
+    fn h164_qwen35_hybrid_kv_fork_seq_dst_matches_src_all_buffers() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let max_seq_len = 64u32;
+        let n_seqs = 4u32;
+        let mut cache = HybridKvCache::new(&cfg, &device, max_seq_len, n_seqs)
+            .expect("alloc");
+
+        // Seed linear-attn recurrent + conv_state bytes for slot 0
+        // (n_seqs is the LAST shape dim ⇒ outermost in memory; per-slot
+        // byte stride = total_bytes / n_seqs).
+        for (layer_idx, slot) in cache.linear_attn.iter_mut().enumerate() {
+            let total_rec = slot.recurrent.byte_len();
+            assert_eq!(total_rec % (n_seqs as usize), 0);
+            let per_slot_rec = total_rec / (n_seqs as usize);
+            let s = slot.recurrent.as_mut_slice::<u8>().expect("recurrent u8");
+            for (i, b) in s[..per_slot_rec].iter_mut().enumerate() {
+                *b = (((layer_idx * 29 + i) % 251) + 1) as u8;
+            }
+            let total_conv = slot.conv_state.byte_len();
+            assert_eq!(total_conv % (n_seqs as usize), 0);
+            let per_slot_conv = total_conv / (n_seqs as usize);
+            let s = slot.conv_state.as_mut_slice::<u8>().expect("conv_state u8");
+            for (i, b) in s[..per_slot_conv].iter_mut().enumerate() {
+                *b = (((layer_idx * 31 + i) % 253) + 1) as u8;
+            }
+        }
+        cache.append_for_seq(SlotId(0), 5).unwrap();
+
+        cache.fork_seq(SlotId(0), SlotId(3))
+            .expect("H164: fork ok");
+
+        // Per-layer dst slot 3 byte-equality on linear-attn buffers.
+        for (layer_idx, slot) in cache.linear_attn.iter().enumerate() {
+            let per_slot_rec = slot.recurrent.byte_len() / (n_seqs as usize);
+            let bytes = slot.recurrent.as_slice::<u8>().unwrap();
+            let src_off = 0;
+            let dst_off = 3 * per_slot_rec;
+            assert_eq!(
+                &bytes[src_off..src_off + per_slot_rec],
+                &bytes[dst_off..dst_off + per_slot_rec],
+                "H164 FALSIFIED: linear_attn[{layer_idx}] recurrent dst slot 3 \
+                 bytes do not match src slot 0"
+            );
+            let per_slot_conv = slot.conv_state.byte_len() / (n_seqs as usize);
+            let cbytes = slot.conv_state.as_slice::<u8>().unwrap();
+            let csrc_off = 0;
+            let cdst_off = 3 * per_slot_conv;
+            assert_eq!(
+                &cbytes[csrc_off..csrc_off + per_slot_conv],
+                &cbytes[cdst_off..cdst_off + per_slot_conv],
+                "H164 FALSIFIED: linear_attn[{layer_idx}] conv_state dst slot 3 \
+                 bytes do not match src slot 0"
+            );
+        }
+    }
+
+    /// **H165** — `HybridKvCache::fork_seq` copies cursor (per-layer
+    /// `current_len`) from src to dst.
+    #[test]
+    fn h165_qwen35_hybrid_kv_fork_seq_cursor_copied() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+        cache.append_for_seq(SlotId(0), 11).unwrap();
+        cache.append_for_seq(SlotId(2), 5).unwrap();
+        // Pre-fork: src cursor = 11, dst (slot 3) cursor = 0.
+        assert_eq!(cache.seq_len(SlotId(0)).unwrap(), 11);
+        assert_eq!(cache.seq_len(SlotId(3)).unwrap(), 0);
+        cache.fork_seq(SlotId(0), SlotId(3))
+            .expect("H165: fork ok");
+        // Post-fork: dst cursor must equal src cursor.
+        assert_eq!(
+            cache.seq_len(SlotId(3)).unwrap(),
+            11,
+            "H165 FALSIFIED: dst cursor != src cursor after fork"
+        );
+        // src cursor unchanged.
+        assert_eq!(
+            cache.seq_len(SlotId(0)).unwrap(),
+            11,
+            "H165 FALSIFIED: src cursor mutated by fork"
+        );
+        // Untouched sibling slot 2 unchanged.
+        assert_eq!(
+            cache.seq_len(SlotId(2)).unwrap(),
+            5,
+            "H165 FALSIFIED: untouched sibling slot 2 cursor mutated"
+        );
+    }
+
+    /// **H166** — `HybridKvCache::fork_seq` returns typed errors for
+    /// out-of-range src/dst (src checked first per iter-1.5
+    /// cfa-finding-F5).  Same-slot fork (src == dst) is a successful
+    /// no-op per trait spec.
+    #[test]
+    fn h166_qwen35_hybrid_kv_fork_seq_typed_errors() {
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
+
+        // (1) src OOR returns SlotOutOfRange (src reported FIRST per
+        // iter-1.5 cfa-finding-F5 deterministic ordering).
+        let err = cache
+            .fork_seq(SlotId(4), SlotId(0))
+            .expect_err("H166: src OOR");
+        match err {
+            MultiSeqError::SlotOutOfRange { slot, max_slots } => {
+                assert_eq!(slot.0, 4);
+                assert_eq!(max_slots, 4);
+            }
+            other => panic!("H166: expected SlotOutOfRange; got {other:?}"),
+        }
+
+        // (2) dst OOR returns SlotOutOfRange after src bounds-check pass.
+        let err = cache
+            .fork_seq(SlotId(0), SlotId(4))
+            .expect_err("H166: dst OOR");
+        match err {
+            MultiSeqError::SlotOutOfRange { slot, max_slots } => {
+                assert_eq!(slot.0, 4);
+                assert_eq!(max_slots, 4);
+            }
+            other => panic!("H166: expected SlotOutOfRange; got {other:?}"),
+        }
+
+        // (3) BOTH src and dst OOR — src is reported first
+        // (deterministic ordering).
+        let err = cache
+            .fork_seq(SlotId(7), SlotId(8))
+            .expect_err("H166: both OOR");
+        match err {
+            MultiSeqError::SlotOutOfRange { slot, max_slots } => {
+                assert_eq!(slot.0, 7, "H166: src reported first (not dst)");
+                assert_eq!(max_slots, 4);
+            }
+            other => panic!("H166: expected SlotOutOfRange; got {other:?}"),
+        }
+
+        // (4) Same-slot fork is a successful no-op per trait spec.
+        cache.append_for_seq(SlotId(2), 7).unwrap();
+        cache.fork_seq(SlotId(2), SlotId(2))
+            .expect("H166: same-slot fork must be a successful no-op");
+        assert_eq!(cache.seq_len(SlotId(2)).unwrap(), 7, "H166: same-slot fork preserves cursor");
     }
 }

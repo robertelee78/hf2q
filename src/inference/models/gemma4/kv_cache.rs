@@ -511,29 +511,113 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHbKvBuffers {
         if src == dst {
             return Ok(());
         }
-        // ADR-040 Phase A3c deferred (parallel to Qwen35 A2c per
-        // dossier R5): cross-slot fork requires same-buffer
-        // cross-region memcpy via `dispatch_kv_cache_copy_seq_*`
-        // between slot byte offsets on the same underlying buffer.
-        // That kernel-pattern + its own unit-test arc are scheduled
-        // for A3c once the kernel arc lands on Qwen35 A2c (the same
-        // dispatcher works for both arches; one kernel call serves
-        // both per dossier §2.3.3).
+        // ──────────────────────────────────────────────────────────────
+        // ADR-040 Phase A3c (2026-05-30) — REAL cross-slot fork.
         //
-        // **Mantra-aligned (iter-2.5 M1)**: surfaces as
-        // `CapabilityUnsupported` (HTTP 501 upstream) — NOT
-        // `SlotOom { 0, 0 }` (HTTP 429), which would lie about the
-        // capacity freeing up.  When Phase A3c ships the real
-        // kernel dispatch, this branch flips to `Ok(())` + per-buffer
-        // byte-equality assertion (write-to-src → fork → read-from-dst
-        // = write-to-src-and-dst-directly), matching Qwen35 A2c's
-        // ceremony.
-        Err(
-            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                capability: "fork_seq cross-slot copy (Gemma 4 MultiSeqHbKvBuffers; deferred to Phase A3c per ADR-040 §6 + dossier R5)",
-            },
-        )
+        // Replaces the prior `CapabilityUnsupported` typed-deferral
+        // with same-buffer cross-region memcpy on the four MultiSeq
+        // HB buffers (k_packed U8 / k_norms F32 / v_packed U8 /
+        // v_norms F32) per the layout proofs in
+        // `alloc_hb_kv_for_layer` at `kv_cache.rs:252-334` — n_seqs
+        // OUTERMOST on every buffer so per-slot byte stride =
+        // `total_bytes / n_seqs`.
+        //
+        // Cursor copy: `seq_lens[dst] = seq_lens[src]`.
+        //
+        // Parallel to Qwen35 A2c at `qwen35/kv_cache.rs:3044+`.
+        // ──────────────────────────────────────────────────────────────
+        let src_idx = src.0 as usize;
+        let dst_idx = dst.0 as usize;
+        let n_seqs = self.n_seqs as usize;
+        gemma4_copy_buffer_slot_region(&mut self.k_packed, src_idx, dst_idx, n_seqs)
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqHbKvBuffers k_packed copy failed ({e})"
+                    )),
+                }
+            })?;
+        gemma4_copy_buffer_slot_region(&mut self.k_norms, src_idx, dst_idx, n_seqs)
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqHbKvBuffers k_norms copy failed ({e})"
+                    )),
+                }
+            })?;
+        gemma4_copy_buffer_slot_region(&mut self.v_packed, src_idx, dst_idx, n_seqs)
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqHbKvBuffers v_packed copy failed ({e})"
+                    )),
+                }
+            })?;
+        gemma4_copy_buffer_slot_region(&mut self.v_norms, src_idx, dst_idx, n_seqs)
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqHbKvBuffers v_norms copy failed ({e})"
+                    )),
+                }
+            })?;
+        // Cursor copy AFTER buffer copy.
+        self.seq_lens[dst_idx] = self.seq_lens[src_idx];
+        Ok(())
     }
+}
+
+/// ADR-040 Phase A3c (2026-05-30) — leak a `String` into a `&'static
+/// str` for `MultiSeqError::CapabilityUnsupported` payloads
+/// constructed from runtime context.  Sibling of Qwen35 A2c's
+/// `leak_static_str` at `qwen35/kv_cache.rs`.
+#[inline]
+fn gemma4_leak_static_str(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// ADR-040 Phase A3c (2026-05-30) — same-buffer cross-region byte copy
+/// for a Gemma 4 multi-seq buffer at `[n_seqs, ...]` outermost.
+///
+/// Per-slot byte stride is `buf.byte_len() / n_seqs`.  Mirrors Qwen35
+/// A2c's `copy_buffer_slot_region` at `qwen35/kv_cache.rs:3382+`.
+/// Same n_seqs-outermost invariant holds for all four Gemma 4 multi-seq
+/// sibling structs (`MultiSeqHbKvBuffers` at line 197+,
+/// `MultiSeqHybridKvBuffers` at line 870+, `MultiSeqDenseKvBuffers` at
+/// line 1319+, `MultiSeqMlxKvCache` at line 1694+) — the alloc helpers
+/// `alloc_hb_kv_for_layer` / `alloc_multi_seq_hybrid_kv_for_layer` /
+/// `alloc_multi_seq_dense_kv_for_layer` / `alloc_multi_seq_mlx_kv_for_layer`
+/// all emit shape `[n, ...]` with n=`n_seqs` as the leading dim ⇒
+/// per-slot region is contiguous of size `total_bytes / n_seqs`.
+fn gemma4_copy_buffer_slot_region(
+    buf: &mut MlxBuffer,
+    src_idx: usize,
+    dst_idx: usize,
+    n_seqs: usize,
+) -> Result<()> {
+    anyhow::ensure!(n_seqs > 0, "fork_seq: n_seqs must be > 0");
+    let total_bytes = buf.byte_len();
+    anyhow::ensure!(
+        total_bytes % n_seqs == 0,
+        "fork_seq: total_bytes={} not divisible by n_seqs={}",
+        total_bytes,
+        n_seqs
+    );
+    let per_slot_bytes = total_bytes / n_seqs;
+    anyhow::ensure!(
+        src_idx < n_seqs && dst_idx < n_seqs,
+        "fork_seq: src/dst out of buffer range \
+         (src={src_idx}, dst={dst_idx}, n_seqs={n_seqs})"
+    );
+    if per_slot_bytes == 0 {
+        return Ok(());
+    }
+    let bytes = buf
+        .as_mut_slice::<u8>()
+        .map_err(|e| anyhow!("fork_seq: as_mut_slice<u8>: {e}"))?;
+    let src_off = src_idx * per_slot_bytes;
+    bytes.copy_within(src_off..src_off + per_slot_bytes, dst_idx * per_slot_bytes);
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1170,23 +1254,83 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqHybridKvBuffers {
         if src == dst {
             return Ok(());
         }
-        // ADR-040 Phase A3c deferred (parallel to A3a Gemma 4
-        // MultiSeqHbKvBuffers + Qwen35 A2c per dossier R5): cross-
-        // slot fork requires same-buffer cross-region memcpy via
-        // `dispatch_kv_cache_copy_seq_*` between slot byte offsets.
-        // The kernel-pattern + its own unit-test arc are scheduled
-        // for A3c — one dispatcher serves both arches + both
-        // sibling structs per dossier §2.3.3.
+        // ──────────────────────────────────────────────────────────────
+        // ADR-040 Phase A3c (2026-05-30) — REAL cross-slot fork.
         //
-        // **Mantra-aligned (iter-2.5 M1)**: surfaces as
-        // `CapabilityUnsupported` (HTTP 501 upstream) — NOT
-        // `SlotOom { 0, 0 }` (HTTP 429), which would lie about the
-        // capacity freeing up.
-        Err(
-            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                capability: "fork_seq cross-slot copy (Gemma 4 MultiSeqHybridKvBuffers; deferred to Phase A3c per ADR-040 §6 + dossier R5)",
-            },
-        )
+        // Replaces the prior `CapabilityUnsupported` typed-deferral
+        // with same-buffer cross-region memcpy on the K (F16) +
+        // V packed (U8|F16) + V norms (F32|dummy) + optional BF16
+        // xlen K/V buffers per `alloc_multi_seq_hybrid_kv_for_layer`
+        // at `kv_cache.rs:942+`.  n_seqs OUTERMOST on every buffer
+        // EXCEPT the dummy `v_norms_dummy` (4-byte total when
+        // `HF2Q_FULL_F16_KV=1`) — that buffer is shared across
+        // slots by construction (line 996-998) and is excluded
+        // from per-slot copy via the `total_bytes % n_seqs == 0`
+        // guard (when the dummy is in use total_bytes=4 and
+        // n_seqs ≥ 1; if n_seqs ∤ 4 the guard returns Err — but
+        // the dummy IS shared so we recognise the case explicitly
+        // by total_bytes < n_seqs and skip).  See helper docs.
+        //
+        // Cursor copy: `seq_lens[dst] = seq_lens[src]`.
+        // ──────────────────────────────────────────────────────────────
+        let src_idx = src.0 as usize;
+        let dst_idx = dst.0 as usize;
+        let n_seqs = self.n_seqs as usize;
+        gemma4_copy_buffer_slot_region(&mut self.k, src_idx, dst_idx, n_seqs)
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqHybridKvBuffers k copy failed ({e})"
+                    )),
+                }
+            })?;
+        gemma4_copy_buffer_slot_region(&mut self.v_packed, src_idx, dst_idx, n_seqs)
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqHybridKvBuffers v_packed copy failed ({e})"
+                    )),
+                }
+            })?;
+        // v_norms: skip if it's the 4-byte dummy (HF2Q_FULL_F16_KV=1
+        // path — alloc'd at `alloc_multi_seq_hybrid_kv_for_layer:996-998`
+        // with byte_len=4 shared across slots).  Detection: byte_len
+        // < n_seqs ⇒ structurally cannot be a per-slot buffer.
+        if self.v_norms.byte_len() >= n_seqs {
+            gemma4_copy_buffer_slot_region(&mut self.v_norms, src_idx, dst_idx, n_seqs)
+                .map_err(|e| {
+                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: gemma4_leak_static_str(format!(
+                            "fork_seq: MultiSeqHybridKvBuffers v_norms copy failed ({e})"
+                        )),
+                    }
+                })?;
+        }
+        // Optional BF16 xlen K/V (HF2Q_DFLASH_XLEN_SDPA=1 path).  Same
+        // n_seqs outermost layout per `alloc_multi_seq_hybrid_kv_for_layer:1019-1031`.
+        if let Some(ref mut bk) = self.bf16_xlen_k {
+            gemma4_copy_buffer_slot_region(bk, src_idx, dst_idx, n_seqs)
+                .map_err(|e| {
+                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: gemma4_leak_static_str(format!(
+                            "fork_seq: MultiSeqHybridKvBuffers bf16_xlen_k copy failed ({e})"
+                        )),
+                    }
+                })?;
+        }
+        if let Some(ref mut bv) = self.bf16_xlen_v {
+            gemma4_copy_buffer_slot_region(bv, src_idx, dst_idx, n_seqs)
+                .map_err(|e| {
+                    crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                        capability: gemma4_leak_static_str(format!(
+                            "fork_seq: MultiSeqHybridKvBuffers bf16_xlen_v copy failed ({e})"
+                        )),
+                    }
+                })?;
+        }
+        // Cursor copy AFTER buffer copy.
+        self.seq_lens[dst_idx] = self.seq_lens[src_idx];
+        Ok(())
     }
 }
 
@@ -1547,23 +1691,39 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqDenseKvBuffers {
         if src == dst {
             return Ok(());
         }
-        // ADR-040 Phase A3c deferred (parallel to A3a / A3b iter-1 /
-        // Qwen35 A2c per dossier R5): cross-slot fork requires
-        // same-buffer cross-region memcpy via
-        // `dispatch_kv_cache_copy_seq_*` between slot byte offsets.
-        // The kernel-pattern + its own unit-test arc are scheduled
-        // for A3c — one dispatcher serves all arches + all sibling
-        // structs per dossier §2.3.3.
+        // ──────────────────────────────────────────────────────────────
+        // ADR-040 Phase A3c (2026-05-30) — REAL cross-slot fork.
         //
-        // **Mantra-aligned (iter-2.5 M1)**: surfaces as
-        // `CapabilityUnsupported` (HTTP 501 upstream) — NOT
-        // `SlotOom { 0, 0 }` (HTTP 429), which would lie about
-        // capacity freeing up.
-        Err(
-            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                capability: "fork_seq cross-slot copy (Gemma 4 MultiSeqDenseKvBuffers; deferred to Phase A3c per ADR-040 §6 + dossier R5)",
-            },
-        )
+        // Replaces the prior `CapabilityUnsupported` typed-deferral
+        // with same-buffer cross-region memcpy on K + V per
+        // `alloc_multi_seq_dense_kv_for_layer` at `kv_cache.rs:1374+`.
+        // n_seqs OUTERMOST on both buffers ⇒ per-slot byte stride =
+        // `total_bytes / n_seqs`.
+        //
+        // Cursor copy: `seq_lens[dst] = seq_lens[src]`.
+        // ──────────────────────────────────────────────────────────────
+        let src_idx = src.0 as usize;
+        let dst_idx = dst.0 as usize;
+        let n_seqs = self.n_seqs as usize;
+        gemma4_copy_buffer_slot_region(&mut self.k, src_idx, dst_idx, n_seqs)
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqDenseKvBuffers k copy failed ({e})"
+                    )),
+                }
+            })?;
+        gemma4_copy_buffer_slot_region(&mut self.v, src_idx, dst_idx, n_seqs)
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqDenseKvBuffers v copy failed ({e})"
+                    )),
+                }
+            })?;
+        // Cursor copy AFTER buffer copy.
+        self.seq_lens[dst_idx] = self.seq_lens[src_idx];
+        Ok(())
     }
 }
 
@@ -1977,23 +2137,57 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for MultiSeqMlxKvCache {
         if src == dst {
             return Ok(());
         }
-        // ADR-040 Phase A3c deferred (parallel to A3a / A3b iter-{1,2}
-        // / Qwen35 A2c per dossier R5): cross-slot fork requires
-        // same-buffer cross-region memcpy via
-        // `dispatch_kv_cache_copy_seq_*` between slot byte offsets.
-        // The kernel-pattern + its own unit-test arc are scheduled
-        // for A3c — one dispatcher serves all arches + all sibling
-        // structs per dossier §2.3.3.
+        // ──────────────────────────────────────────────────────────────
+        // ADR-040 Phase A3c (2026-05-30) — REAL cross-slot fork.
         //
-        // **Mantra-aligned (iter-2.5 M1)**: surfaces as
-        // `CapabilityUnsupported` (HTTP 501 upstream) — NOT
-        // `SlotOom { 0, 0 }` (HTTP 429), which would lie about
-        // capacity freeing up.
-        Err(
-            crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
-                capability: "fork_seq cross-slot copy (Gemma 4 MultiSeqMlxKvCache; deferred to Phase A3c per ADR-040 §6 + dossier R5)",
-            },
-        )
+        // Replaces the prior `CapabilityUnsupported` typed-deferral
+        // with same-buffer cross-region memcpy on the four 4-bit-
+        // nibble-packed buffers (k_packed U8 / k_norms F32 /
+        // v_packed U8 / v_norms F32) per
+        // `alloc_multi_seq_mlx_kv_for_layer` at `kv_cache.rs:1771+`.
+        // n_seqs OUTERMOST on every buffer ⇒ per-slot byte stride =
+        // `total_bytes / n_seqs`.
+        //
+        // Cursor copy: `seq_lens[dst] = seq_lens[src]`.
+        // ──────────────────────────────────────────────────────────────
+        let src_idx = src.0 as usize;
+        let dst_idx = dst.0 as usize;
+        let n_seqs = self.n_seqs as usize;
+        gemma4_copy_buffer_slot_region(&mut self.k_packed, src_idx, dst_idx, n_seqs)
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqMlxKvCache k_packed copy failed ({e})"
+                    )),
+                }
+            })?;
+        gemma4_copy_buffer_slot_region(&mut self.k_norms, src_idx, dst_idx, n_seqs)
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqMlxKvCache k_norms copy failed ({e})"
+                    )),
+                }
+            })?;
+        gemma4_copy_buffer_slot_region(&mut self.v_packed, src_idx, dst_idx, n_seqs)
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqMlxKvCache v_packed copy failed ({e})"
+                    )),
+                }
+            })?;
+        gemma4_copy_buffer_slot_region(&mut self.v_norms, src_idx, dst_idx, n_seqs)
+            .map_err(|e| {
+                crate::serve::multi_seq_kv::MultiSeqError::CapabilityUnsupported {
+                    capability: gemma4_leak_static_str(format!(
+                        "fork_seq: MultiSeqMlxKvCache v_norms copy failed ({e})"
+                    )),
+                }
+            })?;
+        // Cursor copy AFTER buffer copy.
+        self.seq_lens[dst_idx] = self.seq_lens[src_idx];
+        Ok(())
     }
 }
 
@@ -3196,58 +3390,42 @@ mod tests {
         assert_eq!(c.seq_len(SlotId(3)).unwrap(), 0);
     }
 
-    /// Phase A3c deferral pin: cross-slot fork returns
-    /// `CapabilityUnsupported` with the capability label naming the
-    /// deferred kernel arc + dossier R5.  Mirrors Qwen35's iter-2.5
-    /// M1 closure pin at `qwen35/kv_cache.rs:7079-7113`.
+    /// **HISTORICAL** — Phase A3a / iter-2.5 M1 typed-clamp pin
+    /// (renamed from `gemma4_hb_kv_fork_cross_slot_returns_capability_unsupported`
+    /// at iter-A3c per ADR-040 brief "rename to historical_ if they
+    /// were pinning the clamp shape").
     ///
-    /// When Phase A3c ships the real kernel dispatch, this test
-    /// will fail loudly — signaling the deferral closure.  At that
-    /// iter, flip the assertion to `expect("fork ok after A3c")`
-    /// plus a per-buffer byte-equality check.
+    /// **Prior contract** (A3a → A3c): cross-slot fork returned
+    /// `CapabilityUnsupported` with a capability label naming the
+    /// deferred Phase A3c kernel arc + dossier R5.
+    ///
+    /// **Closure (iter-A3c, 2026-05-30)**: real cross-slot fork landed
+    /// on `MultiSeqHbKvBuffers::fork_seq` (same-buffer cross-region
+    /// memcpy on k_packed / k_norms / v_packed / v_norms + cursor
+    /// copy).  This historical test asserts the closure pin: cross-
+    /// slot fork must return `Ok(())`.  Full byte-equality +
+    /// cursor-copy pin lives at H159 + H163-H165.
     #[test]
-    fn gemma4_hb_kv_fork_cross_slot_returns_capability_unsupported() {
+    fn historical_gemma4_hb_kv_fork_cross_slot_closure_at_phase_a3c() {
         let dev = match skip_dev() { Some(d) => d, None => return };
         let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
             .expect("alloc");
         c.append_for_seq(SlotId(0), 7).unwrap();
-        let err = c
-            .fork_seq(SlotId(0), SlotId(1))
-            .expect_err("cross-slot fork deferred to Phase A3c");
-        // Discriminant must be `CapabilityUnsupported` (mirrors
-        // Qwen35 iter-2.5 M1; NOT `SlotOom`).
-        match err {
-            MultiSeqError::CapabilityUnsupported { capability } => {
-                assert!(
-                    capability.contains("fork_seq cross-slot copy"),
-                    "capability label must name the deferred surface: \
-                     {capability}"
-                );
-                assert!(
-                    capability.contains("Phase A3c"),
-                    "capability label must name the Phase A3c deferral: \
-                     {capability}"
-                );
-                assert!(
-                    capability.contains("R5"),
-                    "capability label must name dossier R5 grounding: \
-                     {capability}"
-                );
-                // Per-arch identity — distinguishes Gemma 4 from the
-                // Qwen35 sibling at the log line.
-                assert!(
-                    capability.contains("Gemma 4"),
-                    "capability label must name the arch: {capability}"
-                );
-            }
-            other => panic!(
-                "Phase A3c deferral: expected CapabilityUnsupported (HTTP 501); \
-                 got {other:?} — the legacy `SlotOom {{ 0, 0 }}` sentinel \
-                 mantra-violation must NOT return here.  When Phase A3c ships \
-                 the real kernel, flip this match to `Ok(())` + per-buffer \
-                 byte-equality assertions (mirrors Qwen35 A2c ceremony)."
-            ),
-        }
+        // iter-A3c closure: fork now returns Ok(()).
+        c.fork_seq(SlotId(0), SlotId(1))
+            .expect("iter-A3c closure: cross-slot fork must return Ok(()) — \
+                     was previously CapabilityUnsupported per A3a typed-clamp");
+        // Cursor copy invariant (sub-pin for H165).
+        assert_eq!(
+            c.seq_len(SlotId(1)).unwrap(),
+            7,
+            "iter-A3c closure: fork_seq must copy src's seq_len to dst"
+        );
+        assert_eq!(
+            c.seq_len(SlotId(0)).unwrap(),
+            7,
+            "iter-A3c closure: fork_seq must NOT modify src's seq_len (sub-pin for H163)"
+        );
     }
 
     // ───────────────────────────────────────────────────────────────────────
@@ -4753,21 +4931,30 @@ mod tests {
             MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
         );
 
-        // 10. fork cross-slot → CapabilityUnsupported naming A3c.
-        let err = cache.fork_seq(SlotId(0), SlotId(1)).expect_err("fork cross-slot");
-        match err {
-            MultiSeqError::CapabilityUnsupported { capability } => {
-                assert!(
-                    capability.contains("MultiSeqDenseKvBuffers"),
-                    "H149 FALSIFIED: fork label must name struct: {capability}"
-                );
-                assert!(
-                    capability.contains("A3c"),
-                    "H149 FALSIFIED: fork label must name A3c deferral: {capability}"
-                );
-            }
-            other => panic!("H149 FALSIFIED: expected CapabilityUnsupported; got {other:?}"),
-        }
+        // 10. fork cross-slot → Ok(()) post-iter-A3c (was previously
+        // CapabilityUnsupported naming A3c per A3b iter-2 typed-clamp).
+        // Seed slot 0's cursor + slot 2's cursor for the post-fork copy
+        // assertion (slot 2 untouched).
+        cache.append_for_seq(SlotId(0), 5).expect("re-seed slot 0 for fork");
+        let slot0_before = cache.seq_len(SlotId(0)).unwrap();
+        let slot2_before = cache.seq_len(SlotId(2)).unwrap();
+        cache.fork_seq(SlotId(0), SlotId(1))
+            .expect("iter-A3c closure: cross-slot fork must return Ok(())");
+        assert_eq!(
+            cache.seq_len(SlotId(1)).unwrap(),
+            slot0_before,
+            "H149 closure: fork must copy src's seq_len to dst"
+        );
+        assert_eq!(
+            cache.seq_len(SlotId(0)).unwrap(),
+            slot0_before,
+            "H149 closure: fork must NOT mutate src's seq_len"
+        );
+        assert_eq!(
+            cache.seq_len(SlotId(2)).unwrap(),
+            slot2_before,
+            "H149 closure: fork must NOT mutate non-src non-dst slots"
+        );
     }
 
     /// **H150** — `MultiSeqDenseKvBuffers::reset_for_slot` inherent
@@ -5470,22 +5657,28 @@ mod tests {
             MultiSeqError::SlotOutOfRange { slot: SlotId(99), max_slots: 4 }
         );
 
-        // 10. fork cross-slot → CapabilityUnsupported naming A3c +
-        // the struct.
-        let err = cache.fork_seq(SlotId(0), SlotId(1)).expect_err("fork cross-slot");
-        match err {
-            MultiSeqError::CapabilityUnsupported { capability } => {
-                assert!(
-                    capability.contains("MultiSeqMlxKvCache"),
-                    "H156 FALSIFIED: fork label must name struct: {capability}"
-                );
-                assert!(
-                    capability.contains("A3c"),
-                    "H156 FALSIFIED: fork label must name A3c deferral: {capability}"
-                );
-            }
-            other => panic!("H156 FALSIFIED: expected CapabilityUnsupported; got {other:?}"),
-        }
+        // 10. fork cross-slot → Ok(()) post-iter-A3c (was previously
+        // CapabilityUnsupported naming A3c per A3b iter-3 typed-clamp).
+        cache.append_for_seq(SlotId(0), 5).expect("re-seed slot 0 for fork");
+        let slot0_before = cache.seq_len(SlotId(0)).unwrap();
+        let slot2_before = cache.seq_len(SlotId(2)).unwrap();
+        cache.fork_seq(SlotId(0), SlotId(1))
+            .expect("iter-A3c closure: cross-slot fork must return Ok(())");
+        assert_eq!(
+            cache.seq_len(SlotId(1)).unwrap(),
+            slot0_before,
+            "H156 closure: fork must copy src's seq_len to dst"
+        );
+        assert_eq!(
+            cache.seq_len(SlotId(0)).unwrap(),
+            slot0_before,
+            "H156 closure: fork must NOT mutate src's seq_len"
+        );
+        assert_eq!(
+            cache.seq_len(SlotId(2)).unwrap(),
+            slot2_before,
+            "H156 closure: fork must NOT mutate non-src non-dst slots"
+        );
     }
 
     /// **H157** — `MultiSeqMlxKvCache::reset_for_slot` inherent
@@ -5609,5 +5802,305 @@ mod tests {
             .reset_for_slot(SlotId(0))
             .expect("SlotId(0) at n_seqs=1 must succeed (byte-equivalence case)");
         assert_eq!(cache1.seq_lens[0], 0);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-040 Phase A3c (2026-05-30) — fork_seq REAL cross-slot copy
+    // for the four Gemma 4 multi-seq sibling structs.  H159-H162 pin
+    // the iter-A3c closure (per-sibling) — one dispatcher closes the
+    // typed-clamp on all four structs per dossier §2.3.3.
+    //
+    // Qwen35 sibling H158 + H163-H166 land in qwen35/kv_cache.rs (the
+    // architecture-level full-attn + linear-attn + MTP fork proof).
+    // ──────────────────────────────────────────────────────────────────
+
+    /// **H159** — Gemma 4 `MultiSeqHbKvBuffers::fork_seq` cross-slot
+    /// copy returns `Ok(())` AND produces byte-identical k_packed /
+    /// k_norms / v_packed / v_norms regions between src and dst.
+    /// Also asserts the cursor copy + src invariance (H163-H165 sub-pins
+    /// at the per-sibling-struct level).
+    #[test]
+    fn h159_multi_seq_hb_kv_fork_seq_cross_slot_copies_all_buffers() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 8usize;
+        let n_seqs = 4u32;
+        let mut c = alloc_hb_kv_for_layer(&dev, 0, nkv, hd, cap, false, n_seqs)
+            .expect("alloc n_seqs=4");
+
+        // Per-slot byte sizes (4-D, n_seqs outermost):
+        //   k_packed/v_packed: nkv * cap * hd  (U8 = 1 byte/elem)
+        //   k_norms/v_norms:   nkv * cap * 1 * 4 (F32, norms_per_pos=1)
+        let slot_kp = nkv * cap * hd;
+        let slot_vp = nkv * cap * hd;
+        let slot_kn = nkv * cap * 1 * 4;
+        let slot_vn = nkv * cap * 1 * 4;
+
+        // Seed slot 0 with deterministic non-zero patterns.
+        {
+            let s = c.k_packed.as_mut_slice::<u8>().expect("kp u8");
+            for (i, b) in s[..slot_kp].iter_mut().enumerate() {
+                *b = (((i * 7) % 251) + 1) as u8;
+            }
+        }
+        {
+            let s = c.v_packed.as_mut_slice::<u8>().expect("vp u8");
+            for (i, b) in s[..slot_vp].iter_mut().enumerate() {
+                *b = (((i * 11) % 253) + 1) as u8;
+            }
+        }
+        {
+            let s = c.k_norms.as_mut_slice::<u8>().expect("kn u8");
+            for (i, b) in s[..slot_kn].iter_mut().enumerate() {
+                *b = (((i * 13) % 251) + 1) as u8;
+            }
+        }
+        {
+            let s = c.v_norms.as_mut_slice::<u8>().expect("vn u8");
+            for (i, b) in s[..slot_vn].iter_mut().enumerate() {
+                *b = (((i * 17) % 251) + 1) as u8;
+            }
+        }
+        c.append_for_seq(SlotId(0), 5).unwrap();
+
+        // Snapshot src bytes pre-fork.
+        let src_kp = c.k_packed.as_slice::<u8>().unwrap()[..slot_kp].to_vec();
+        let src_vp = c.v_packed.as_slice::<u8>().unwrap()[..slot_vp].to_vec();
+        let src_kn = c.k_norms.as_slice::<u8>().unwrap()[..slot_kn].to_vec();
+        let src_vn = c.v_norms.as_slice::<u8>().unwrap()[..slot_vn].to_vec();
+
+        // iter-A3c closure: fork returns Ok(()).
+        c.fork_seq(SlotId(0), SlotId(2))
+            .expect("H159: fork must succeed post-A3c");
+
+        // dst (slot 2) bytes byte-identical to src (slot 0).
+        let dst_kp = c.k_packed.as_slice::<u8>().unwrap()[2 * slot_kp..3 * slot_kp].to_vec();
+        let dst_vp = c.v_packed.as_slice::<u8>().unwrap()[2 * slot_vp..3 * slot_vp].to_vec();
+        let dst_kn = c.k_norms.as_slice::<u8>().unwrap()[2 * slot_kn..3 * slot_kn].to_vec();
+        let dst_vn = c.v_norms.as_slice::<u8>().unwrap()[2 * slot_vn..3 * slot_vn].to_vec();
+        assert_eq!(src_kp, dst_kp, "H159 FALSIFIED: k_packed dst != src");
+        assert_eq!(src_vp, dst_vp, "H159 FALSIFIED: v_packed dst != src");
+        assert_eq!(src_kn, dst_kn, "H159 FALSIFIED: k_norms dst != src");
+        assert_eq!(src_vn, dst_vn, "H159 FALSIFIED: v_norms dst != src");
+
+        // Cursor copy.
+        assert_eq!(c.seq_len(SlotId(2)).unwrap(), 5, "H159: cursor copied");
+        // src cursor unchanged.
+        assert_eq!(c.seq_len(SlotId(0)).unwrap(), 5, "H159: src cursor unchanged");
+        // src bytes unchanged.
+        let src_kp_after = c.k_packed.as_slice::<u8>().unwrap()[..slot_kp].to_vec();
+        assert_eq!(src_kp, src_kp_after, "H159 FALSIFIED: src k_packed mutated");
+    }
+
+    /// **H160** — Gemma 4 `MultiSeqHybridKvBuffers::fork_seq` cross-
+    /// slot copy returns `Ok(())` AND produces byte-identical K (F16)
+    /// + V packed (U8 default) + V norms (F32) regions between src
+    /// and dst (production-default per H10).
+    #[test]
+    fn h160_multi_seq_hybrid_kv_fork_seq_cross_slot_copies_all_buffers() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 8usize;
+        let n_seqs = 4u32;
+        let mut c = alloc_multi_seq_hybrid_kv_for_layer(
+            &dev, 0, nkv, hd, cap, false, n_seqs
+        ).expect("alloc n_seqs=4");
+
+        // Per-slot byte sizes (4-D, n_seqs outermost):
+        //   k F16:          nkv * cap * hd * 2
+        //   v_packed U8:    nkv * cap * hd
+        //   v_norms F32:    nkv * cap * 1 * 4
+        let slot_k_bytes = nkv * cap * hd * 2;
+        let slot_vp_bytes = nkv * cap * hd;
+        let slot_vn_bytes = nkv * cap * 1 * 4;
+
+        // Seed slot 1 with deterministic non-zero patterns.
+        {
+            let s = c.k.as_mut_slice::<u8>().expect("k u8");
+            let start = 1 * slot_k_bytes;
+            for (i, b) in s[start..start + slot_k_bytes].iter_mut().enumerate() {
+                *b = (((i * 23) % 251) + 1) as u8;
+            }
+        }
+        {
+            let s = c.v_packed.as_mut_slice::<u8>().expect("vp u8");
+            let start = 1 * slot_vp_bytes;
+            for (i, b) in s[start..start + slot_vp_bytes].iter_mut().enumerate() {
+                *b = (((i * 29) % 253) + 1) as u8;
+            }
+        }
+        {
+            let s = c.v_norms.as_mut_slice::<u8>().expect("vn u8");
+            let start = 1 * slot_vn_bytes;
+            for (i, b) in s[start..start + slot_vn_bytes].iter_mut().enumerate() {
+                *b = (((i * 31) % 251) + 1) as u8;
+            }
+        }
+        c.append_for_seq(SlotId(1), 9).unwrap();
+
+        let src_k = c.k.as_slice::<u8>().unwrap()
+            [slot_k_bytes..2 * slot_k_bytes]
+            .to_vec();
+        let src_vp = c.v_packed.as_slice::<u8>().unwrap()
+            [slot_vp_bytes..2 * slot_vp_bytes]
+            .to_vec();
+        let src_vn = c.v_norms.as_slice::<u8>().unwrap()
+            [slot_vn_bytes..2 * slot_vn_bytes]
+            .to_vec();
+
+        c.fork_seq(SlotId(1), SlotId(3))
+            .expect("H160: fork must succeed post-A3c");
+
+        // dst (slot 3).
+        let dst_k = c.k.as_slice::<u8>().unwrap()
+            [3 * slot_k_bytes..4 * slot_k_bytes].to_vec();
+        let dst_vp = c.v_packed.as_slice::<u8>().unwrap()
+            [3 * slot_vp_bytes..4 * slot_vp_bytes].to_vec();
+        let dst_vn = c.v_norms.as_slice::<u8>().unwrap()
+            [3 * slot_vn_bytes..4 * slot_vn_bytes].to_vec();
+        assert_eq!(src_k, dst_k, "H160 FALSIFIED: k dst != src");
+        assert_eq!(src_vp, dst_vp, "H160 FALSIFIED: v_packed dst != src");
+        assert_eq!(src_vn, dst_vn, "H160 FALSIFIED: v_norms dst != src");
+
+        // Cursor + src invariance.
+        assert_eq!(c.seq_len(SlotId(3)).unwrap(), 9, "H160: cursor copied");
+        assert_eq!(c.seq_len(SlotId(1)).unwrap(), 9, "H160: src cursor unchanged");
+        let src_k_after = c.k.as_slice::<u8>().unwrap()
+            [slot_k_bytes..2 * slot_k_bytes].to_vec();
+        assert_eq!(src_k, src_k_after, "H160 FALSIFIED: src k mutated");
+    }
+
+    /// **H161** — Gemma 4 `MultiSeqDenseKvBuffers::fork_seq` cross-
+    /// slot copy returns `Ok(())` AND produces byte-identical K + V
+    /// (F32 default) regions between src and dst.
+    #[test]
+    fn h161_multi_seq_dense_kv_fork_seq_cross_slot_copies_all_buffers() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 4usize;
+        let n_seqs = 4u32;
+        let mut c = alloc_multi_seq_dense_kv_for_layer(
+            &dev, 0, nkv, hd, cap, false, DType::F32, n_seqs
+        ).expect("alloc n_seqs=4");
+
+        // Per-slot byte sizes (F32 = 4 bytes/elem):
+        let slot_k_bytes = nkv * cap * hd * 4;
+        let slot_v_bytes = nkv * cap * hd * 4;
+
+        // Seed slot 2 with deterministic non-zero patterns.
+        {
+            let s = c.k.as_mut_slice::<u8>().expect("k u8");
+            let start = 2 * slot_k_bytes;
+            for (i, b) in s[start..start + slot_k_bytes].iter_mut().enumerate() {
+                *b = (((i * 37) % 251) + 1) as u8;
+            }
+        }
+        {
+            let s = c.v.as_mut_slice::<u8>().expect("v u8");
+            let start = 2 * slot_v_bytes;
+            for (i, b) in s[start..start + slot_v_bytes].iter_mut().enumerate() {
+                *b = (((i * 41) % 253) + 1) as u8;
+            }
+        }
+        c.append_for_seq(SlotId(2), 3).unwrap();
+
+        let src_k = c.k.as_slice::<u8>().unwrap()
+            [2 * slot_k_bytes..3 * slot_k_bytes].to_vec();
+        let src_v = c.v.as_slice::<u8>().unwrap()
+            [2 * slot_v_bytes..3 * slot_v_bytes].to_vec();
+
+        c.fork_seq(SlotId(2), SlotId(0))
+            .expect("H161: fork must succeed post-A3c");
+
+        let dst_k = c.k.as_slice::<u8>().unwrap()[..slot_k_bytes].to_vec();
+        let dst_v = c.v.as_slice::<u8>().unwrap()[..slot_v_bytes].to_vec();
+        assert_eq!(src_k, dst_k, "H161 FALSIFIED: k dst != src");
+        assert_eq!(src_v, dst_v, "H161 FALSIFIED: v dst != src");
+
+        assert_eq!(c.seq_len(SlotId(0)).unwrap(), 3, "H161: cursor copied");
+        assert_eq!(c.seq_len(SlotId(2)).unwrap(), 3, "H161: src cursor unchanged");
+        let src_k_after = c.k.as_slice::<u8>().unwrap()
+            [2 * slot_k_bytes..3 * slot_k_bytes].to_vec();
+        assert_eq!(src_k, src_k_after, "H161 FALSIFIED: src k mutated");
+    }
+
+    /// **H162** — Gemma 4 `MultiSeqMlxKvCache::fork_seq` cross-slot
+    /// copy returns `Ok(())` AND produces byte-identical k_packed /
+    /// k_norms / v_packed / v_norms regions (4-bit nibble-packed
+    /// layout per ADR-007).
+    #[test]
+    fn h162_multi_seq_mlx_kv_fork_seq_cross_slot_copies_all_buffers() {
+        let dev = match skip_dev() { Some(d) => d, None => return };
+        let nkv = 2usize;
+        let hd = 256usize;
+        let cap = 4usize;
+        let n_seqs = 4u32;
+        let mut c = alloc_multi_seq_mlx_kv_for_layer(
+            &dev, 0, nkv, hd, cap, false, 1, n_seqs
+        ).expect("alloc n_seqs=4");
+
+        // Per-slot byte sizes (4-D, n_seqs outermost):
+        //   k_packed/v_packed: nkv * cap * (hd/2)  (U8 = 1 byte/elem)
+        //   k_norms/v_norms:   nkv * cap * 1 * 4   (F32, norms_per_pos=1)
+        let slot_kp = nkv * cap * (hd / 2);
+        let slot_vp = nkv * cap * (hd / 2);
+        let slot_kn = nkv * cap * 1 * 4;
+        let slot_vn = nkv * cap * 1 * 4;
+
+        // Seed slot 0 with deterministic non-zero patterns.
+        {
+            let s = c.k_packed.as_mut_slice::<u8>().expect("kp u8");
+            for (i, b) in s[..slot_kp].iter_mut().enumerate() {
+                *b = (((i * 43) % 251) + 1) as u8;
+            }
+        }
+        {
+            let s = c.v_packed.as_mut_slice::<u8>().expect("vp u8");
+            for (i, b) in s[..slot_vp].iter_mut().enumerate() {
+                *b = (((i * 47) % 253) + 1) as u8;
+            }
+        }
+        {
+            let s = c.k_norms.as_mut_slice::<u8>().expect("kn u8");
+            for (i, b) in s[..slot_kn].iter_mut().enumerate() {
+                *b = (((i * 53) % 251) + 1) as u8;
+            }
+        }
+        {
+            let s = c.v_norms.as_mut_slice::<u8>().expect("vn u8");
+            for (i, b) in s[..slot_vn].iter_mut().enumerate() {
+                *b = (((i * 59) % 251) + 1) as u8;
+            }
+        }
+        c.append_for_seq(SlotId(0), 4).unwrap();
+
+        let src_kp = c.k_packed.as_slice::<u8>().unwrap()[..slot_kp].to_vec();
+        let src_vp = c.v_packed.as_slice::<u8>().unwrap()[..slot_vp].to_vec();
+        let src_kn = c.k_norms.as_slice::<u8>().unwrap()[..slot_kn].to_vec();
+        let src_vn = c.v_norms.as_slice::<u8>().unwrap()[..slot_vn].to_vec();
+
+        c.fork_seq(SlotId(0), SlotId(3))
+            .expect("H162: fork must succeed post-A3c");
+
+        let dst_kp = c.k_packed.as_slice::<u8>().unwrap()
+            [3 * slot_kp..4 * slot_kp].to_vec();
+        let dst_vp = c.v_packed.as_slice::<u8>().unwrap()
+            [3 * slot_vp..4 * slot_vp].to_vec();
+        let dst_kn = c.k_norms.as_slice::<u8>().unwrap()
+            [3 * slot_kn..4 * slot_kn].to_vec();
+        let dst_vn = c.v_norms.as_slice::<u8>().unwrap()
+            [3 * slot_vn..4 * slot_vn].to_vec();
+        assert_eq!(src_kp, dst_kp, "H162 FALSIFIED: k_packed dst != src");
+        assert_eq!(src_vp, dst_vp, "H162 FALSIFIED: v_packed dst != src");
+        assert_eq!(src_kn, dst_kn, "H162 FALSIFIED: k_norms dst != src");
+        assert_eq!(src_vn, dst_vn, "H162 FALSIFIED: v_norms dst != src");
+
+        assert_eq!(c.seq_len(SlotId(3)).unwrap(), 4, "H162: cursor copied");
+        assert_eq!(c.seq_len(SlotId(0)).unwrap(), 4, "H162: src cursor unchanged");
+        let src_kp_after = c.k_packed.as_slice::<u8>().unwrap()[..slot_kp].to_vec();
+        assert_eq!(src_kp, src_kp_after, "H162 FALSIFIED: src k_packed mutated");
     }
 }
