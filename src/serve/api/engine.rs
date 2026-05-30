@@ -5434,25 +5434,148 @@ fn worker_run(
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
                         continue;
                     }
-                    // ADR-040 Phase C iter-2d-cont (C2d-cont) — Qwen35
-                    // SlotAware typed deferral for the vision-aware /
-                    // soft-token Generate arm. Mirrors the text-only
-                    // Generate guard. Soft-token overrides at slot > 0
-                    // still need persistent_kv_cache routing in
-                    // `generate_qwen35_once_with_soft_tokens` +
-                    // `generate_qwen35_once_with_soft_tokens_and_deepstack`
-                    // (iter-C2d-cont-kernel scope).
+                    // ADR-040 Phase C iter-C2d-cont-kernel iter-4 (2026-05-30) —
+                    // Qwen35 worker hot path GenerateWithSoftTokens-arm lift
+                    // onto the persistent multi-seq `HybridKvCache`. Direct
+                    // mirror of iter-1 (§6.1.27 Generate arm) + iter-2
+                    // (§6.1.28 GenerateStream arm) + iter-3 (§6.1.29 Embed
+                    // arm) for the vision-aware soft-token surface. C2d
+                    // (§6.1.22) provisions the cache at spawn time; C2d-cont
+                    // (§6.1.24) added the typed clamp; iter-1/2/3 lifted
+                    // Generate / GenerateStream / Embed; this
+                    // `iter-C2d-cont-kernel-iter-4 per ADR-040 §6.1.30`
+                    // REPLACES the GenerateWithSoftTokens clamp with the
+                    // actual lift via
+                    // `engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware`
+                    // (soft-tokens-only) or
+                    // `engine_qwen35::generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware`
+                    // (deepstack / 3D positions). Both fns take `&mut
+                    // HybridKvCache` + `SlotId` and dispatch the
+                    // `forward_gpu_last_logits_with_soft_tokens*` family
+                    // (B4b §6.1.20 signature). The persistent cache is
+                    // `take()`-d out of `Qwen35LoadedModel` for the
+                    // duration of the call so the partial-borrow conflict
+                    // with `qwen.lcp_registry` etc. is resolved cleanly
+                    // (worker is serial — no concurrent access).
+                    //
+                    // iter-4 is the TERMINAL Qwen35 worker-arm lift —
+                    // post-iter-4 ALL FOUR Qwen35 worker arms (Generate +
+                    // GenerateStream + Embed + GenerateWithSoftTokens)
+                    // route through the persistent multi-seq cache at
+                    // SlotId(N>0). The remaining sub-deferrals
+                    // (iter-LCP for slot-aware LCP / chunked-prefill
+                    // codec; iter-G for slot-aware
+                    // `forward_gpu_greedy` fast-path) are orthogonal
+                    // optimizations, not arm lifts.
+                    //
+                    // SerialFifo + SlotId(0): unchanged (H70 byte-
+                    // equivalence pin) — the `slot_id != SlotId(0)`
+                    // predicate short-circuits below the lift block so
+                    // the existing per-request alloc path at the
+                    // `match &mut loaded` below fires verbatim.
+                    // SlotAware + SlotId(0): also unchanged (same
+                    // predicate).
+                    //
+                    // Defense-in-depth: if `persistent_kv_cache.is_none()`
+                    // at SlotId(N>0) (impossible at runtime per the C2d
+                    // spawn-arm invariant), the request surfaces a typed
+                    // `anyhow::Error` with operator-grep'able label
+                    // "iter-C2d-cont-kernel iter-4 — persistent cache
+                    // absent".
                     if matches!(loaded, LoadedModel::Qwen35(_)) && handle.slot_id != SlotId(0) {
-                        let err = MultiSeqError::CapabilityUnsupported {
-                            capability:
-                                "qwen35-forward-gpu-with-soft-tokens-slot-N (iter-C2d-cont-kernel-iter-4 per ADR-040 §6.1.27 — gated on slot-aware soft-token port of generate_qwen35_once_with_soft_tokens through src/serve/api/engine_qwen35.rs; iter-C2d-cont-kernel iter-1 §6.1.24 lifted the non-streaming Generate arm)",
+                        let slot_id = handle.slot_id;
+                        let LoadedModel::Qwen35(q) = &mut loaded else {
+                            unreachable!(
+                                "ADR-040 iter-C2d-cont-kernel iter-4: \
+                                 matches!(Qwen35) check passed but bind failed"
+                            );
                         };
-                        let _ = reply.send(Err(anyhow::anyhow!(
-                            "capability_unsupported: ADR-040 C2d-cont — {}",
-                            err
-                        )));
+                        // Take the persistent cache out so callee gets a
+                        // clean `&mut HybridKvCache` without partial-borrow
+                        // conflicts on the surrounding `&mut q` accesses.
+                        let mut persistent = match q.persistent_kv_cache.take() {
+                            Some(cache) => cache,
+                            None => {
+                                let _ = reply.send(Err(anyhow::anyhow!(
+                                    "capability_unsupported: ADR-040 \
+                                     iter-C2d-cont-kernel iter-4 — \
+                                     persistent_kv_cache is None at SlotId({}) \
+                                     for Qwen35 GenerateWithSoftTokens arm. \
+                                     C2d spawn-arm invariant violated \
+                                     (provision_multi_seq_kv_for_slot_aware \
+                                     was not called at EngineMode::SlotAware \
+                                     spawn time). Operator: check \
+                                     spawn_with_mode wiring in \
+                                     src/serve/api/engine.rs.",
+                                    slot_id.0,
+                                )));
+                                scheduler.release(handle);
+                                publish_stats(&scheduler, &scheduler_stats_snapshot);
+                                continue;
+                            }
+                        };
+                        // Build borrowed injections for the slot-aware
+                        // fn signature mirror (same shape as iter-2's
+                        // GenerateStream-arm lift fork).
+                        let injections_slot: Vec<SoftTokenInjection<'_>> = soft_tokens
+                            .iter()
+                            .map(|d| SoftTokenInjection {
+                                range: d.range.clone(),
+                                embeddings: &d.embeddings,
+                            })
+                            .collect();
+                        let ds_borrow_slot: Option<
+                            crate::serve::forward_prefill::DeepstackInjection<'_>,
+                        > = deepstack.as_ref().map(|d| {
+                            crate::serve::forward_prefill::DeepstackInjection {
+                                image_token_positions: d.image_token_positions.clone(),
+                                chunks: d.chunks.iter().collect(),
+                            }
+                        });
+                        // Dispatch: deepstack / positions present →
+                        // deepstack-aware slot-aware fn; else soft-tokens-
+                        // only slot-aware fn. Mirrors the non-slot-aware
+                        // arm's dispatch shape at engine.rs:5511 below.
+                        let result = if ds_borrow_slot.is_some() || positions_flat.is_some() {
+                            super::engine_qwen35::generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
+                                q,
+                                &prompt_tokens,
+                                &injections_slot,
+                                ds_borrow_slot.as_ref(),
+                                positions_flat.as_deref(),
+                                &params,
+                                registration.as_ref(),
+                                &mut persistent,
+                                slot_id,
+                            )
+                        } else {
+                            super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware(
+                                q,
+                                &prompt_tokens,
+                                &injections_slot,
+                                &params,
+                                registration.as_ref(),
+                                &mut persistent,
+                                slot_id,
+                            )
+                        };
+                        // Put the persistent cache back regardless of
+                        // result — keeps the spawn-time invariant
+                        // (`persistent_kv_cache.is_some()` for SlotAware
+                        // Qwen35) intact for the next request.
+                        q.persistent_kv_cache = Some(persistent);
+                        // Standard post-pattern: bookkeep prefill +
+                        // per-token decodes + release. Mirror of iter-1
+                        // Generate-arm post-pattern.
+                        scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+                        if let Ok(ref gr) = result {
+                            for _ in 0..gr.completion_tokens {
+                                scheduler.advance_after_decode(handle);
+                            }
+                        }
                         scheduler.release(handle);
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
+                        let _ = reply.send(result);
                         continue;
                     }
                 }
@@ -18147,22 +18270,19 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter2_qwen35_tests {
         // slot-N` label is REMOVED (the actual lift landed via
         // `embed_qwen35_slot_aware`). H62's prior assertion that the
         // Embed clamp persisted reflected iter-2's state; iter-3
-        // legitimately lifts that arm and removes the label. The
-        // surviving discipline pin is now on the iter-4 (SoftTokens)
-        // clamp — the SOLE remaining clamp in the Qwen35 worker_run
-        // surface post-iter-3.
-
-        // GenerateWithSoftTokens clamp (iter-4) still in place — iter-3
-        // must not lift the soft-tokens arm (that's iter-4 scope).
-        assert!(
-            body.contains(
-                "qwen35-forward-gpu-with-soft-tokens-slot-N (iter-C2d-cont-kernel-iter-4"
-            ),
-            "H62 FALSIFIED: Qwen35 GenerateWithSoftTokens arm \
-             iter-C2d-cont-kernel-iter-4 clamp label missing from \
-             worker_run. iter-3 must NOT touch the soft-tokens arm — \
-             that's iter-4 scope per §6.1.29."
-        );
+        // legitimately lifts that arm and removes the label.
+        //
+        // Post-iter-4 (REVISED 2026-05-30 §6.1.30): the
+        // GenerateWithSoftTokens clamp's `qwen35-forward-gpu-with-soft-
+        // tokens-slot-N (iter-C2d-cont-kernel-iter-4` label is also
+        // REMOVED (iter-4 lifted the soft-token arm via
+        // `generate_qwen35_once_with_soft_tokens_slot_aware` +
+        // `generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware`).
+        // H62's prior assertion that the SoftTokens clamp persisted
+        // reflected iter-3's state; iter-4 legitimately lifts that arm
+        // and removes the label. The sibling-discipline intent ("iter-N
+        // did not regress prior iters' lifts") is preserved by pinning
+        // the iter-1/iter-2/iter-3/iter-4 lift fns below.
 
         // iter-1 Generate-arm lift fn must still be called (iter-3 must
         // not regress iter-1's Generate lift).
@@ -18184,6 +18304,20 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter2_qwen35_tests {
              `generate_stream_qwen35_once_extended_slot_aware` is NOT \
              called from worker_run. iter-3 must NOT regress iter-2's \
              GenerateStream arm lift (§6.1.28)."
+        );
+
+        // iter-4 GenerateWithSoftTokens-arm lift fn must be called
+        // (post-iter-4 §6.1.30: the SoftTokens clamp is replaced by the
+        // actual lift; H62 REVISED to pin the iter-4 lift fn is wired
+        // into worker_run alongside iter-1/2/3).
+        assert!(
+            body.contains(
+                "super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware("
+            ),
+            "H62 FALSIFIED: iter-4 lift fn \
+             `generate_qwen35_once_with_soft_tokens_slot_aware` is NOT \
+             called from worker_run. iter-4 must land the SoftTokens \
+             arm lift (§6.1.30)."
         );
     }
 
@@ -18615,39 +18749,60 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter3_qwen35_tests {
              Qwen3VL clamp without the spawn-arm flip."
         );
 
-        // GenerateWithSoftTokens clamp (iter-4) still in place —
-        // iter-3 must not lift the soft-tokens arm (that's iter-4
-        // scope).
-        assert!(
-            body.contains(
-                "qwen35-forward-gpu-with-soft-tokens-slot-N (iter-C2d-cont-kernel-iter-4"
-            ),
-            "H68 FALSIFIED: Qwen35 GenerateWithSoftTokens arm \
-             iter-C2d-cont-kernel-iter-4 clamp label missing from \
-             worker_run. iter-3 must NOT touch the soft-tokens arm — \
-             that's iter-4 scope per §6.1.29."
-        );
+        // Post-iter-4 (REVISED 2026-05-30 §6.1.30): the
+        // GenerateWithSoftTokens clamp's `qwen35-forward-gpu-with-soft-
+        // tokens-slot-N (iter-C2d-cont-kernel-iter-4` label is REMOVED
+        // (iter-4 lifted the soft-token arm via
+        // `generate_qwen35_once_with_soft_tokens_slot_aware`). H68's
+        // prior assertion that the clamp persisted reflected iter-3's
+        // state; iter-4 legitimately lifts that arm and removes the
+        // label. The sibling-discipline intent ("iter-N did not regress
+        // prior iters' lifts") is preserved by pinning iter-1/2/3/4
+        // lift fns are all called.
 
-        // iter-1 Generate-arm lift fn must still be called (iter-3
+        // iter-1 Generate-arm lift fn must still be called (iter-4
         // must not regress iter-1's Generate lift).
         assert!(
             body.contains("super::engine_qwen35::generate_qwen35_once_slot_aware("),
             "H68 FALSIFIED: iter-1 lift fn \
              `generate_qwen35_once_slot_aware` is NOT called from \
-             worker_run. iter-3 must NOT regress iter-1's Generate \
+             worker_run. iter-4 must NOT regress iter-1's Generate \
              arm lift (§6.1.27)."
         );
 
         // iter-2 GenerateStream-arm lift fn must still be called
-        // (iter-3 must not regress iter-2's GenerateStream lift).
+        // (iter-4 must not regress iter-2's GenerateStream lift).
         assert!(
             body.contains(
                 "super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware("
             ),
             "H68 FALSIFIED: iter-2 lift fn \
              `generate_stream_qwen35_once_extended_slot_aware` is NOT \
-             called from worker_run. iter-3 must NOT regress iter-2's \
+             called from worker_run. iter-4 must NOT regress iter-2's \
              GenerateStream arm lift (§6.1.28)."
+        );
+
+        // iter-3 Embed-arm lift fn must still be called (iter-4 must
+        // not regress iter-3's Embed lift).
+        assert!(
+            body.contains("super::engine_qwen35::embed_qwen35_slot_aware("),
+            "H68 FALSIFIED: iter-3 lift fn `embed_qwen35_slot_aware` \
+             is NOT called from worker_run. iter-4 must NOT regress \
+             iter-3's Embed arm lift (§6.1.29)."
+        );
+
+        // iter-4 GenerateWithSoftTokens-arm lift fn must be called
+        // (post-iter-4 §6.1.30: the SoftTokens clamp is replaced by the
+        // actual lift; H68 REVISED to pin the iter-4 lift fn is wired
+        // into worker_run alongside iter-1/2/3).
+        assert!(
+            body.contains(
+                "super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware("
+            ),
+            "H68 FALSIFIED: iter-4 lift fn \
+             `generate_qwen35_once_with_soft_tokens_slot_aware` is NOT \
+             called from worker_run. iter-4 must land the SoftTokens \
+             arm lift (§6.1.30)."
         );
     }
 
@@ -18730,6 +18885,648 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter3_qwen35_tests {
              on the way out (mirrors iter-1 / iter-2 exit-reset \
              discipline). Inverting the order breaks per-slot \
              isolation for the next request."
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-040 Phase C iter-C2d-cont-kernel iter-4 (2026-05-30) — Qwen35 worker
+// hot path **GenerateWithSoftTokens-arm** + **vision-augmented streaming**
+// lift onto the persistent multi-seq `HybridKvCache`. TERMINAL lift in
+// the Qwen35 worker-arm arc — direct mirror of iter-1 (§6.1.27 Generate
+// arm) + iter-2 (§6.1.28 GenerateStream arm) + iter-3 (§6.1.29 Embed arm)
+// for the vision-aware soft-token surface.
+//
+// This module pins H70-H76 — the iter-4 lift assertions per ADR §6.1.30.
+// The C2d-cont Path B clamp (§6.1.24) at the GenerateWithSoftTokens worker
+// arm is REPLACED with a real persistent-cache routing call to either
+// `engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware` (soft-
+// tokens-only sub-shape) or
+// `engine_qwen35::generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware`
+// (deepstack / 3D-positions sub-shape). The iter-2 streaming fn's
+// `has_extension == true` typed-error branch is ALSO replaced with the
+// real vision-augmented prefill path via
+// `forward_gpu_last_logits_with_soft_tokens_and_deepstack(.., slot_id)`.
+//
+// Post-iter-4 ALL FOUR Qwen35 worker arms (Generate / GenerateStream /
+// Embed / GenerateWithSoftTokens) route through the persistent multi-seq
+// cache at SlotId(N>0). The remaining sub-deferrals (iter-LCP +
+// iter-G) are orthogonal optimizations, NOT arm lifts. Gemma 4
+// (iter-B4c-kernel) + Qwen3VL arms unchanged.
+//
+// Tests (all skip-mode per CLAUDE.md "no model load" + "no cargo build"):
+//   H70 — SerialFifo / SlotId(0) SoftTokens byte-equivalence preserved:
+//         the worker_run Qwen35 GenerateWithSoftTokens dispatch path
+//         under SerialFifo or SlotAware+SlotId(0) still routes through
+//         the existing `generate_qwen35_once_with_soft_tokens` /
+//         `generate_qwen35_once_with_soft_tokens_and_deepstack` dispatch
+//         (unchanged), NOT the slot-aware siblings. Pin via the `if
+//         matches!` predicate `&& handle.slot_id != SlotId(0)` source-
+//         grep — when this is FALSE, the lift fork doesn't fire and the
+//         existing non-slot-aware path at the `match &mut loaded` block
+//         fires verbatim. Mirror of H51 / H58 / H64.
+//   H71 — iter-4 lift landed at SoftTokens arm: the worker_run body
+//         contains real calls to
+//         `super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware(`
+//         AND
+//         `super::engine_qwen35::generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(`
+//         under the Qwen35 GenerateWithSoftTokens arm. Source-grep pin
+//         (mirror of H52 / H59 / H65). ALSO pins that the iter-4 clamp
+//         label `qwen35-forward-gpu-with-soft-tokens-slot-N (iter-C2d-
+//         cont-kernel-iter-4` is REMOVED from worker_run (replaced by
+//         the lift).
+//   H72 — persistent-cache `take()` + restore pattern at the iter-4
+//         lift call site (mirror of H53 / H60 / H66). Pin via count ≥ 4
+//         for both `q.persistent_kv_cache.take()` and
+//         `q.persistent_kv_cache = Some(persistent)` (iter-1 Generate +
+//         iter-2 GenerateStream + iter-3 Embed + iter-4 SoftTokens lift
+//         forks).
+//   H73 — per-slot reset at entry + exit of BOTH slot-aware soft-token
+//         fns (mirror of H54 / H61 / H67). Source-grep pin in
+//         engine_qwen35.rs on the bodies of
+//         `generate_qwen35_once_with_soft_tokens_slot_aware` AND
+//         `generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware`
+//         for ≥ 2 occurrences each of `reset_for_slot(slot_id)`.
+//   H74 — vision-augmented streaming SlotId(N>0) path lifted: the
+//         iter-2 `has_extension` typed-error branch in
+//         `generate_stream_qwen35_once_extended_slot_aware` is REPLACED
+//         with a real call to
+//         `forward_gpu_last_logits_with_soft_tokens_and_deepstack(..,
+//         slot_id)`. Source-grep pins on engine_qwen35.rs: (a) the
+//         iter-2 typed-error event "vision-augmented streaming slot-
+//         aware port is iter-C2d-cont-kernel-iter-4" is REMOVED from
+//         the streaming fn body; (b) the streaming fn body now calls
+//         `forward_gpu_last_logits_with_soft_tokens_and_deepstack(`;
+//         (c) the streaming fn body has a `t_post` computation for
+//         post-prefill decode positioning (mirror of the non-streaming
+//         deepstack sibling at engine_qwen35.rs:3537).
+//   H75 — Gemma 4 + Qwen3VL worker arms unchanged by iter-4: the
+//         Gemma 4 C2c/B4c clamp labels are still present; no Qwen3VL
+//         clamp accidentally added. iter-1/2/3 lift fns must still be
+//         called (iter-4 must not regress any prior lift).
+//   H76 — TERMINAL Qwen35 worker-arm sub-deferral pin: NONE of the
+//         literal substrings `iter-C2d-cont-kernel-iter-1` /
+//         `iter-C2d-cont-kernel-iter-2` / `iter-C2d-cont-kernel-iter-3`
+//         / `iter-C2d-cont-kernel-iter-4` appear as a typed-clamp
+//         label predicate in worker_run (i.e. NONE appear inside a
+//         `MultiSeqError::CapabilityUnsupported { capability: "..." }`
+//         block). Surviving sub-deferrals are iter-LCP + iter-G only
+//         (orthogonal optimizations, not arm lifts). Historical
+//         comments enumerating the iter-N labels ARE allowed (and
+//         expected); the pin is on the absence of a CapabilityUnsupported
+//         clamp body wrapping these labels. ADR §6.1.30 closure block
+//         must exist and name iter-4 SHIPPED.
+//
+// LCP / chunked-prefill / spec-decode are EXPLICITLY out of iter-4
+// scope (LCP/chunked are disabled in slot-aware mode per §6.1.27
+// iter-LCP; spec-decode is iter-B4d per §6.1.26).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod adr040_phase_c_iter_c2d_cont_kernel_iter4_qwen35_tests {
+    // No `use super::*;` — all tests are skip-mode source-grep against
+    // `include_str!` rather than calling any types in the parent module.
+
+    // ── Helper: snip worker_run body the same way iter-1/2/3 tests do ──
+    fn worker_run_body(src: &str) -> &str {
+        let body_start = src
+            .find("fn worker_run(")
+            .expect("iter-4: worker_run entry not found");
+        let body_after = &src[body_start..];
+        let body_end_off = body_after
+            .find("\n// The worker thread for `LoadedModel::Qwen35` returns a sentinel error")
+            .or_else(|| body_after.find("\n/// Worker-thread entry point"))
+            .unwrap_or(body_after.len().min(200_000));
+        &body_after[..body_end_off]
+    }
+
+    /// **H70 (skip-mode)** — SerialFifo + SlotId(0) AND SlotAware +
+    /// SlotId(0) Qwen35 GenerateWithSoftTokens dispatch is byte-
+    /// equivalent post-iter-4.
+    ///
+    /// Source-grep pin: the iter-4 lift fork at the SoftTokens arm uses
+    /// the predicate `handle.slot_id != SlotId(0)`. SerialFifo always
+    /// hands out SlotId(0) (FifoSchedulerAdapter invariant); SlotAware's
+    /// first request also gets SlotId(0). In both cases the predicate
+    /// is FALSE → the lift block falls through to the existing
+    /// `match &mut loaded { LoadedModel::Qwen35(q) =>
+    ///     generate_qwen35_once_with_soft_tokens{,_and_deepstack}(..) }`
+    /// dispatch, byte-equivalent to pre-iter-4 + pre-C2d-cont.
+    ///
+    /// Defends the H1 / H2 / H23 / H28 / H36 / H51 / H58 / H64 byte-
+    /// equivalence chain that A5* + C2a/C2b + C2d-cont + iter-1 + iter-2
+    /// + iter-3 preserved. Direct mirror of H51 / H58 / H64 for the
+    /// SoftTokens arm.
+    #[test]
+    fn h70_slot_id_0_qwen35_soft_tokens_routes_through_existing_dispatch_byte_equivalent() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // The pre-iter-4 generate_qwen35_once_with_soft_tokens dispatch
+        // must still be reachable from the worker arm (the fallback
+        // when the lift predicate is FALSE = SlotId(0)). Pin via
+        // substring presence of the soft-tokens-only entry call.
+        assert!(
+            body.contains("super::engine_qwen35::generate_qwen35_once_with_soft_tokens("),
+            "H70 FALSIFIED: post-iter-4 worker_run Qwen35 \
+             GenerateWithSoftTokens dispatch no longer routes through \
+             `generate_qwen35_once_with_soft_tokens` for SlotId(0). The \
+             iter-4 lift fork must be ADDITIVE (sibling above the \
+             `match &mut loaded` dispatch), NOT REPLACE the SerialFifo \
+             / SlotId(0) path. SerialFifo + SlotId(0) byte-equivalence \
+             (H1 / H2 / H51 / H58 / H64 chain) is BROKEN for the \
+             SoftTokens arm."
+        );
+
+        // The deepstack-aware non-slot-aware dispatch must also still
+        // be reachable for the deepstack sub-shape at SlotId(0).
+        assert!(
+            body.contains(
+                "super::engine_qwen35::generate_qwen35_once_with_soft_tokens_and_deepstack("
+            ),
+            "H70 FALSIFIED: post-iter-4 worker_run Qwen35 \
+             GenerateWithSoftTokens deepstack dispatch no longer routes \
+             through `generate_qwen35_once_with_soft_tokens_and_deepstack` \
+             for SlotId(0). The iter-4 lift fork must be ADDITIVE for \
+             the deepstack sub-shape too."
+        );
+
+        // The lift fork predicate at the SoftTokens arm must be
+        // `matches!(loaded, LoadedModel::Qwen35(_)) && handle.slot_id != SlotId(0)`
+        // — the same shape iter-1 / iter-2 / iter-3 used. Pin: at least
+        // FOUR occurrences of the literal predicate in the worker_run
+        // body (one in each of Generate / GenerateStream / Embed /
+        // SoftTokens arm forks).
+        let predicate_count = body
+            .matches("matches!(loaded, LoadedModel::Qwen35(_)) && handle.slot_id != SlotId(0)")
+            .count();
+        assert!(
+            predicate_count >= 4,
+            "H70 FALSIFIED: the iter-4 lift fork predicate \
+             `matches!(loaded, LoadedModel::Qwen35(_)) && handle.slot_id != SlotId(0)` \
+             must appear at least FOUR TIMES in worker_run body (one \
+             for each of iter-1 Generate, iter-2 GenerateStream, iter-3 \
+             Embed, iter-4 SoftTokens). Got {predicate_count}. Drift \
+             here means the lift may fire at SlotId(0) too, breaking \
+             byte-equivalence."
+        );
+    }
+
+    /// **H71 (skip-mode)** — iter-4 SoftTokens-arm lift landed at
+    /// `worker_run`: BOTH slot-aware fns (soft-tokens-only +
+    /// deepstack-aware) are called from the worker_run body at the
+    /// Qwen35 GenerateWithSoftTokens arm. Source-grep pin (mirror of
+    /// H52 / H59 / H65 lift-witness pin) PLUS pin that the iter-4
+    /// clamp label is REMOVED.
+    #[test]
+    fn h71_iter4_lift_landed_for_qwen35_soft_tokens_arm() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // (a) The iter-4 soft-tokens-only lift entry point.
+        assert!(
+            body.contains(
+                "super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware("
+            ),
+            "H71 FALSIFIED: iter-4 lift fn \
+             `generate_qwen35_once_with_soft_tokens_slot_aware` is NOT \
+             called from the worker_run body. The SoftTokens-arm \
+             SlotId(N>0) routing (soft-tokens-only sub-shape) is \
+             missing — iter-4 didn't actually land. Check the if-block \
+             at the Qwen35 GenerateWithSoftTokens arm in \
+             src/serve/api/engine.rs::worker_run."
+        );
+
+        // (b) The iter-4 deepstack-aware lift entry point.
+        assert!(
+            body.contains(
+                "super::engine_qwen35::generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware("
+            ),
+            "H71 FALSIFIED: iter-4 lift fn \
+             `generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware` \
+             is NOT called from the worker_run body. The SoftTokens-arm \
+             SlotId(N>0) routing (deepstack / 3D-positions sub-shape) \
+             is missing — iter-4 didn't land the deepstack variant."
+        );
+
+        // (c) The iter-4 typed-clamp label is REMOVED. The PRE-iter-4
+        // clamp had the literal substring
+        // `qwen35-forward-gpu-with-soft-tokens-slot-N (iter-C2d-cont-
+        // kernel-iter-4 per ADR-040 §6.1.27`. Iter-4 replaces that
+        // clamp with the real lift; the substring must no longer
+        // appear in a typed-error capability_unsupported context. Use
+        // the conservative pin: the literal clamp label string is
+        // ABSENT from the worker_run body.
+        assert!(
+            !body.contains(
+                "qwen35-forward-gpu-with-soft-tokens-slot-N (iter-C2d-cont-kernel-iter-4"
+            ),
+            "H71 FALSIFIED: the pre-iter-4 SoftTokens clamp label \
+             `qwen35-forward-gpu-with-soft-tokens-slot-N (iter-C2d-cont-\
+             kernel-iter-4` still appears in worker_run. iter-4 must \
+             REPLACE this clamp with the real lift; if the substring \
+             remains, the lift was added alongside the clamp instead \
+             of replacing it."
+        );
+
+        // (d) The lift call site passes `slot_id` (the SlotId from the
+        // admit'd handle), NOT a hard-coded SlotId(0). Pin via
+        // substring search inside both lift call blocks.
+        let lift_soft_start = body
+            .find("super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware(")
+            .expect("H71: soft-tokens-only lift call site not found");
+        let lift_soft_end = body[lift_soft_start..]
+            .find(");")
+            .map(|off| lift_soft_start + off + 2)
+            .unwrap_or(body.len().min(lift_soft_start + 2000));
+        let lift_soft_block = &body[lift_soft_start..lift_soft_end];
+        assert!(
+            lift_soft_block.contains("slot_id"),
+            "H71 FALSIFIED: the soft-tokens-only lift call site does \
+             not pass `slot_id` into \
+             `generate_qwen35_once_with_soft_tokens_slot_aware`. The \
+             iter-4 lift must thread the admit'd SlotHandle's slot_id \
+             into the slot-aware fn. Got block: {lift_soft_block}"
+        );
+    }
+
+    /// **H72 (skip-mode)** — persistent-cache `take()` + restore pattern
+    /// at the iter-4 lift call site (mirror of H53 / H60 / H66). Pin
+    /// both the `q.persistent_kv_cache.take()` extraction AND the
+    /// `q.persistent_kv_cache = Some(persistent)` restoration. The
+    /// take+restore pattern is required for:
+    /// (a) four-iter symmetry — iter-1 + iter-2 + iter-3 already
+    ///     established this pattern; iter-4 must use the same shape so
+    ///     the persistent-cache invariant holds across ALL Generate +
+    ///     GenerateStream + Embed + SoftTokens requests at any slot.
+    /// (b) defense against the same two regressions H53 / H60 / H66
+    ///     catch — forgotten put-back; clone-instead-of-take.
+    ///
+    /// iter-4's take+restore is ADDITIVE — the worker_run body now has
+    /// FOUR take+restore forks (one per worker arm).
+    /// Pin via count ≥ 4 for both take and restore.
+    #[test]
+    fn h72_lift_call_site_takes_and_restores_persistent_kv_cache() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        let take_count = body.matches("q.persistent_kv_cache.take()").count();
+        assert!(
+            take_count >= 4,
+            "H72 FALSIFIED: the iter-4 lift call site does not \
+             `take()` the persistent cache out of \
+             `Qwen35LoadedModel.persistent_kv_cache`. Expected at \
+             least 4 occurrences of `q.persistent_kv_cache.take()` in \
+             worker_run body (one each for iter-1 Generate + iter-2 \
+             GenerateStream + iter-3 Embed + iter-4 SoftTokens lift \
+             forks); got {take_count}. The take is required to resolve \
+             the partial-borrow conflict between \
+             `&mut q.persistent_kv_cache` and the dense `&mut q` \
+             accesses inside the slot-aware soft-token fns."
+        );
+
+        let restore_count = body
+            .matches("q.persistent_kv_cache = Some(persistent)")
+            .count();
+        assert!(
+            restore_count >= 4,
+            "H72 FALSIFIED: the iter-4 lift call site does not put \
+             the persistent cache back into `q.persistent_kv_cache` \
+             after the slot-aware soft-token fn returns. Expected at \
+             least 4 occurrences of \
+             `q.persistent_kv_cache = Some(persistent)` in worker_run \
+             body (one each for iter-1 + iter-2 + iter-3 + iter-4 lift \
+             forks); got {restore_count}. The next request to land at \
+             SlotId(N>0) would find `persistent_kv_cache.is_none()` \
+             and hit the defense-in-depth typed error — defeats the \
+             persistent-cache invariant established by C2d (§6.1.22) + \
+             iter-1 (§6.1.27) + iter-2 (§6.1.28) + iter-3 (§6.1.29)."
+        );
+    }
+
+    /// **H73 (skip-mode)** — per-slot reset at entry + exit of BOTH
+    /// slot-aware soft-token fns via `reset_for_slot(slot_id)` (mirror
+    /// of H54 / H61 / H67). Source-grep pin on `engine_qwen35.rs` for
+    /// the bodies of `generate_qwen35_once_with_soft_tokens_slot_aware`
+    /// AND `generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware`.
+    #[test]
+    fn h73_slot_aware_soft_tokens_fns_call_reset_for_slot_at_entry_and_exit() {
+        // reset_for_slot primitive must still be defined (iter-1 added it).
+        let src = include_str!("../../inference/models/qwen35/kv_cache.rs");
+        assert!(
+            src.contains("pub fn reset_for_slot("),
+            "H73 FALSIFIED: `HybridKvCache::reset_for_slot` is not \
+             defined in src/inference/models/qwen35/kv_cache.rs. \
+             iter-4 inherits this primitive from iter-1; if it's \
+             gone, iter-1 was reverted."
+        );
+
+        let engine_q = include_str!("engine_qwen35.rs");
+
+        // (a) soft-tokens-only fn body has ≥ 2 reset_for_slot calls.
+        for fn_marker in [
+            "pub fn generate_qwen35_once_with_soft_tokens_slot_aware(",
+            "pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(",
+        ] {
+            let fn_start = engine_q
+                .find(fn_marker)
+                .unwrap_or_else(|| panic!("H73: {fn_marker} not defined"));
+            // Locate the fn body — bound by next `pub fn` or end-of-file.
+            let body_after = &engine_q[fn_start..];
+            let body_end_off = body_after[fn_marker.len()..]
+                .find("\npub fn ")
+                .map(|off| off + fn_marker.len())
+                .unwrap_or(body_after.len().min(60_000));
+            let fn_body = &body_after[..body_end_off];
+
+            let reset_calls = fn_body.matches("reset_for_slot(slot_id)").count();
+            assert!(
+                reset_calls >= 2,
+                "H73 FALSIFIED: `{fn_marker}` must call \
+                 `kv_cache.reset_for_slot(slot_id)` at LEAST TWICE \
+                 (once at entry, once at exit) for request isolation \
+                 within the persistent cache slot. Got {reset_calls} \
+                 call(s). Drift here means the persistent cache may \
+                 carry stale bytes across soft-token requests on the \
+                 same slot — corrupts cross-request linear-attn \
+                 recurrent state."
+            );
+        }
+    }
+
+    /// **H74 (skip-mode)** — vision-augmented streaming SlotId(N>0)
+    /// path lifted: the iter-2 `has_extension` typed-error branch in
+    /// `generate_stream_qwen35_once_extended_slot_aware` is REPLACED
+    /// with a real call to the soft-tokens-and-deepstack forward.
+    /// Source-grep pins on engine_qwen35.rs:
+    /// (a) the iter-2 typed-error event "vision-augmented streaming
+    ///     slot-aware port is iter-C2d-cont-kernel-iter-4" is REMOVED
+    ///     from the streaming fn body;
+    /// (b) the streaming fn body now calls
+    ///     `forward_gpu_last_logits_with_soft_tokens_and_deepstack(`;
+    /// (c) the streaming fn body has a `t_post` computation for
+    ///     post-prefill decode positioning.
+    #[test]
+    fn h74_vision_augmented_streaming_slot_aware_path_lifted() {
+        let engine_q = include_str!("engine_qwen35.rs");
+        let fn_marker = "pub fn generate_stream_qwen35_once_extended_slot_aware(";
+        let fn_start = engine_q
+            .find(fn_marker)
+            .expect("H74: generate_stream_qwen35_once_extended_slot_aware not defined");
+        let body_after = &engine_q[fn_start..];
+        let body_end_off = body_after[fn_marker.len()..]
+            .find("\npub fn ")
+            .map(|off| off + fn_marker.len())
+            .unwrap_or(body_after.len().min(100_000));
+        let fn_body = &body_after[..body_end_off];
+
+        // (a) The iter-2 typed-error event for has_extension is REMOVED.
+        // The pre-iter-4 fn body emitted a typed
+        // `capability_unsupported:` error with the substring
+        // "vision-augmented streaming slot-aware port is
+        // iter-C2d-cont-kernel-iter-4". After iter-4 lands, this
+        // substring must NOT appear inside the fn body (the typed-error
+        // emit is REPLACED by the actual lift).
+        assert!(
+            !fn_body.contains(
+                "vision-augmented streaming slot-aware port is \
+                 iter-C2d-cont-kernel-iter-4"
+            ),
+            "H74 FALSIFIED: the iter-2 typed-error event \
+             `vision-augmented streaming slot-aware port is \
+             iter-C2d-cont-kernel-iter-4` still appears in the body of \
+             `generate_stream_qwen35_once_extended_slot_aware`. iter-4 \
+             must REPLACE this typed-error event with the actual \
+             vision-augmented prefill call; if the substring remains, \
+             the lift was added alongside the clamp instead of \
+             replacing it."
+        );
+
+        // (b) The streaming fn body now calls the soft-tokens-and-
+        // deepstack forward (the lifted vision-augmented prefill).
+        assert!(
+            fn_body
+                .contains("forward_gpu_last_logits_with_soft_tokens_and_deepstack("),
+            "H74 FALSIFIED: \
+             `generate_stream_qwen35_once_extended_slot_aware` body \
+             does not call \
+             `forward_gpu_last_logits_with_soft_tokens_and_deepstack(`. \
+             The iter-4 vision-augmented streaming lift must route \
+             `has_extension == true` through this forward (mirror of \
+             non-slot-aware sibling at engine_qwen35.rs:4061)."
+        );
+
+        // (c) The streaming fn body has a `t_post` computation for
+        // post-prefill decode positioning. Mirror of the non-slot-aware
+        // sibling at engine_qwen35.rs:4270. The variable name `t_post`
+        // is load-bearing — it carries the global temporal counter
+        // advance for the vision-augmented path.
+        assert!(
+            fn_body.contains("let t_post: i32"),
+            "H74 FALSIFIED: \
+             `generate_stream_qwen35_once_extended_slot_aware` body \
+             does not declare a `t_post: i32` local. The iter-4 \
+             vision-augmented streaming lift must compute the post-\
+             prefill global temporal counter (= `max(positions_flat \
+             axis 0) + 1` when supplied; else `prompt_len as i32`) and \
+             use it as the decode-step position base. Without t_post, \
+             vision-augmented decode steps would use the text-only \
+             `prompt_len + step - 1` advance — wrong for image-tail \
+             prompts where global temporal != prompt_len."
+        );
+    }
+
+    /// **H75 (skip-mode)** — Gemma 4 + Qwen3VL worker arms unchanged
+    /// by iter-4. Direct mirror of H56 / H62 / H68 extended for the
+    /// iter-4 lift. Also pins that iter-1/2/3 lift fns are still
+    /// called (iter-4 must not regress any prior lift).
+    #[test]
+    fn h75_gemma4_and_qwen3vl_worker_arms_unchanged_by_iter4() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // Gemma 4 C2c label still present.
+        let gemma_label = "gemma4-forward-prefill-slot-N (iter-C2c-cont";
+        assert!(
+            body.contains(gemma_label),
+            "H75 FALSIFIED: Gemma 4 C2c clamp label `{gemma_label}` \
+             missing from worker_run. iter-4 must NOT touch the \
+             Gemma 4 worker arms — Gemma 4 SlotAware kernel lift is \
+             iter-B4c-kernel scope per §6.1.25."
+        );
+
+        // The B4c-cited Gemma 4 iter-B4c-kernel label also present.
+        assert!(
+            body.contains("iter-B4c-kernel per ADR-040 §6.1.25"),
+            "H75 FALSIFIED: Gemma 4 B4c label-refinement cite \
+             `iter-B4c-kernel per ADR-040 §6.1.25` missing from \
+             worker_run. iter-4 must NOT regress B4c §6.1.25."
+        );
+
+        // No Qwen3VL clamp accidentally added.
+        assert!(
+            !body.contains(
+                "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
+            ),
+            "H75 FALSIFIED: Qwen3VL clamp accidentally added to \
+             worker_run by iter-4. Qwen3VL SlotAware activation is \
+             gated on iter-C2e per §6.1.22; iter-4 must not add the \
+             Qwen3VL clamp without the spawn-arm flip."
+        );
+
+        // iter-1 Generate-arm lift fn must still be called.
+        assert!(
+            body.contains("super::engine_qwen35::generate_qwen35_once_slot_aware("),
+            "H75 FALSIFIED: iter-1 lift fn \
+             `generate_qwen35_once_slot_aware` is NOT called from \
+             worker_run. iter-4 must NOT regress iter-1's Generate \
+             arm lift (§6.1.27)."
+        );
+
+        // iter-2 GenerateStream-arm lift fn must still be called.
+        assert!(
+            body.contains(
+                "super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware("
+            ),
+            "H75 FALSIFIED: iter-2 lift fn \
+             `generate_stream_qwen35_once_extended_slot_aware` is NOT \
+             called from worker_run. iter-4 must NOT regress iter-2's \
+             GenerateStream arm lift (§6.1.28)."
+        );
+
+        // iter-3 Embed-arm lift fn must still be called.
+        assert!(
+            body.contains("super::engine_qwen35::embed_qwen35_slot_aware("),
+            "H75 FALSIFIED: iter-3 lift fn `embed_qwen35_slot_aware` \
+             is NOT called from worker_run. iter-4 must NOT regress \
+             iter-3's Embed arm lift (§6.1.29)."
+        );
+    }
+
+    /// **H76 (skip-mode)** — TERMINAL Qwen35 worker-arm sub-deferral
+    /// pin: NONE of the literal substrings
+    /// `iter-C2d-cont-kernel-iter-1` / `iter-C2d-cont-kernel-iter-2` /
+    /// `iter-C2d-cont-kernel-iter-3` / `iter-C2d-cont-kernel-iter-4`
+    /// appear as a typed-clamp label predicate in worker_run (i.e. NONE
+    /// appear inside a `MultiSeqError::CapabilityUnsupported { capability:
+    /// "..." }` block). Surviving sub-deferrals are iter-LCP + iter-G
+    /// only (orthogonal optimizations, not arm lifts).
+    ///
+    /// Historical comments enumerating iter-N labels are allowed (and
+    /// expected per the iter-1 §6.1.27 sequencing record); the pin is
+    /// on the absence of a CapabilityUnsupported clamp body wrapping
+    /// these iter-N labels.
+    ///
+    /// ALSO pins that ADR §6.1.30 closure block exists + names
+    /// `iter-C2d-cont-kernel iter-4` as the SHIPPED scope.
+    #[test]
+    fn h76_terminal_qwen35_worker_arm_sub_deferrals_pin() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // (a) Walk the worker_run body looking for
+        // `MultiSeqError::CapabilityUnsupported { capability:` blocks
+        // wrapping any of the four arm-lift iter-N labels. If any
+        // remain, the lift didn't actually land at the worker arm.
+        //
+        // Note: the Gemma 4 + B4c clamps wrap `iter-C2c-cont` and
+        // `iter-B4c-kernel` labels, which are LEGITIMATE surviving
+        // sub-deferrals (Gemma 4 arm lifts are gated on B4c-kernel per
+        // §6.1.25). The pin is specifically on the Qwen35 iter-N
+        // labels (iter-C2d-cont-kernel-iter-1/2/3/4).
+        for iter_label in [
+            "iter-C2d-cont-kernel-iter-1",
+            "iter-C2d-cont-kernel-iter-2",
+            "iter-C2d-cont-kernel-iter-3",
+            "iter-C2d-cont-kernel-iter-4",
+        ] {
+            // For each iter-N label, walk every occurrence in
+            // worker_run body and verify NONE of them lies within a
+            // CapabilityUnsupported clamp block (i.e. between
+            // `capability:` and the closing `,` of the same block).
+            // The conservative pin: if the substring appears INSIDE a
+            // quoted string literal that is the `capability:` value of
+            // a `MultiSeqError::CapabilityUnsupported { ... }` block,
+            // it's a clamp; comments are fine. The simplest reliable
+            // proxy: scan for the *clamp-shaped* surrounding text —
+            // `capability:\n... "..iter-N..."`. Per H51-H68 pattern:
+            // the clamp string contains `qwen35-forward-...` /
+            // `qwen35-stream-...` / `qwen35-embed-...` /
+            // `qwen35-forward-gpu-with-soft-tokens-...` PREFIX before
+            // the iter-N cite. Pin: for each iter-N label, the prefix
+            // family `"qwen35-` followed by anything followed by
+            // `(iter-C2d-cont-kernel-iter-N` must NOT appear in the
+            // body. This is the exact pre-iter-{1,2,3,4} clamp shape.
+            let clamp_shape = format!("(iter-C2d-cont-kernel-iter-{}", iter_label.trim_end_matches(|c: char| c.is_ascii_digit() || c == '-').len().to_string());
+            // Simpler & more reliable: the four pre-iter clamp shapes
+            // all had a `qwen35-...-slot-N (iter-C2d-cont-kernel-iter-N`
+            // structure. Pin the conservative "no `qwen35-...-slot-N`
+            // string immediately followed by `(iter-C2d-cont-kernel-
+            // iter-N`" pattern by checking the worker_run body
+            // explicitly.
+            let _ = clamp_shape;
+            let pre_iter_clamp_substr =
+                format!("-slot-N ({iter_label}");
+            assert!(
+                !body.contains(&pre_iter_clamp_substr),
+                "H76 FALSIFIED: the worker_run body still contains the \
+                 pre-iter-{n} typed-clamp pattern `-slot-N \
+                 ({iter_label}`. Post-iter-4 ALL FOUR Qwen35 worker \
+                 arms must route through the persistent multi-seq \
+                 cache at SlotId(N>0); no Qwen35 worker arm should \
+                 surface a `MultiSeqError::CapabilityUnsupported` \
+                 clamp citing these iter-N labels.",
+                n = iter_label.chars().last().unwrap_or('?'),
+            );
+        }
+
+        // (b) Sanity: the lift fns for all four arms are wired into
+        // worker_run (defensive — also covered by H75, but H76 makes
+        // the terminal-coverage pin self-contained).
+        for lift_fn in [
+            "super::engine_qwen35::generate_qwen35_once_slot_aware(",
+            "super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware(",
+            "super::engine_qwen35::embed_qwen35_slot_aware(",
+            "super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware(",
+        ] {
+            assert!(
+                body.contains(lift_fn),
+                "H76 FALSIFIED: the iter-1/2/3/4 lift fn `{lift_fn}` \
+                 is NOT called from worker_run. The terminal pin \
+                 requires all four arm lifts wired."
+            );
+        }
+
+        // (c) ADR §6.1.30 closure block must exist + name iter-4.
+        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.30"),
+            "H76 FALSIFIED: ADR §6.1.30 closure block missing. iter-4 \
+             must land the closure block in lockstep with the \
+             production code change (per ADR-040 §3.7 closure-\
+             discipline)."
+        );
+        let block_marker = "### 6.1.30";
+        let block_start = adr.find(block_marker).expect("§6.1.30 marker");
+        let block_end_off = adr[block_start..]
+            .find("\n### ")
+            .or_else(|| adr[block_start..].find("\n---\n"))
+            .or_else(|| adr[block_start..].find("\n## "))
+            .unwrap_or(adr[block_start..].len().min(40_000));
+        let block = &adr[block_start..block_start + block_end_off];
+        assert!(
+            block.contains("iter-C2d-cont-kernel iter-4"),
+            "H76 FALSIFIED: §6.1.30 closure block does not name \
+             `iter-C2d-cont-kernel iter-4` — operator-grep'able cite \
+             for the iter-4 scope landing."
+        );
+        // The §6.1.30 block must mark this as the TERMINAL Qwen35
+        // worker-arm lift (the load-bearing closure-scope pin).
+        assert!(
+            block.to_ascii_lowercase().contains("terminal"),
+            "H76 FALSIFIED: §6.1.30 closure block does not mark iter-4 \
+             as the TERMINAL Qwen35 worker-arm lift. The closure must \
+             record that post-iter-4 ALL FOUR Qwen35 worker arms route \
+             through the persistent multi-seq cache at SlotId(N>0)."
         );
     }
 }
@@ -19113,12 +19910,18 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
     /// `generate_stream_qwen35_once_extended_slot_aware`).
     /// **Post-iter-3 (§6.1.29, 2026-05-30)** the Embed arm's
     /// `qwen35-forward-embed-last-slot-N` clamp label was ALSO REMOVED
-    /// (the actual lift landed via `embed_qwen35_slot_aware`). Three of
-    /// the four original C2d-cont labels are now gone — the SOLE
-    /// surviving label is `qwen35-forward-gpu-with-soft-tokens-slot-N`
-    /// (iter-4). H45's sibling-discipline intent (Qwen35 labels not
-    /// touched by B4c) is preserved by pinning the surviving label +
-    /// the `iter-C2d-cont-kernel` cite family.
+    /// (the actual lift landed via `embed_qwen35_slot_aware`).
+    /// **Post-iter-4 (§6.1.30, 2026-05-30)** the GenerateWithSoftTokens
+    /// arm's `qwen35-forward-gpu-with-soft-tokens-slot-N` clamp label
+    /// was ALSO REMOVED (the actual lift landed via
+    /// `generate_qwen35_once_with_soft_tokens_slot_aware` +
+    /// `generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware`).
+    /// All four original C2d-cont labels are now gone — the Qwen35
+    /// worker-arm lift arc is COMPLETE. H45's sibling-discipline intent
+    /// (Qwen35 labels not touched by B4c) is preserved by pinning the
+    /// `iter-C2d-cont-kernel` cite family (historical comments) +
+    /// pinning iter-1/2/3/4 lift fns are all called (no B4c regression
+    /// of Qwen35 lifts).
     ///
     /// Mirrors C2d-cont H40's sibling-discipline pin in reverse:
     /// where H40 pinned "Gemma 4 + Qwen3VL unchanged by C2d-cont",
@@ -19136,33 +19939,23 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
             .unwrap_or(body_after.len().min(200_000));
         let body = &body_after[..body_end_off];
 
-        // Post-iter-3 surviving Qwen35 clamp. The Generate arm's
-        // C2d-cont label was removed by iter-1 (§6.1.27), the
-        // GenerateStream arm's label was removed by iter-2 (§6.1.28),
-        // and the Embed arm's label was removed by iter-3 (§6.1.29);
-        // ONLY the GenerateWithSoftTokens label persists with its
-        // iter-4 sub-deferral cite.
-        let qwen35_soft_label = "qwen35-forward-gpu-with-soft-tokens-slot-N";
-        assert!(
-            body.contains(qwen35_soft_label),
-            "H45 FALSIFIED: C2d-cont Qwen35 GenerateWithSoftTokens \
-             clamp label `{qwen35_soft_label}` no longer present — \
-             B4c accidentally regressed the Qwen35 iter-4 \
-             sub-deferral clamp."
-        );
+        // Post-iter-4: NO Qwen35 worker-arm clamp labels remain. The
+        // sibling-discipline intent ("Qwen35 not touched by B4c") is
+        // preserved by pinning the surviving `iter-C2d-cont-kernel`
+        // cite family in historical comments AND that all four
+        // iter-1/2/3/4 lift fns are wired into worker_run (B4c didn't
+        // accidentally remove any Qwen35 lift). The post-iter-3 H45
+        // assertion that `qwen35-forward-gpu-with-soft-tokens-slot-N`
+        // persisted reflected iter-3's state; iter-4 legitimately
+        // removes that label too.
+
         // C2d-cont's iter-C2d-cont-kernel label family is preserved
         // (not accidentally rewritten by B4c to iter-B4c-kernel —
         // Qwen35's structural follow-up iter is iter-C2d-cont-kernel,
-        // NOT B4c). Post-iter-1 (§6.1.27) + post-iter-2 (§6.1.28)
-        // the exact C2d-cont §6.1.24 substring was replaced with
-        // the relabeled iter-C2d-cont-kernel-iter-{3,4} cites per
-        // §6.1.27 + §6.1.28 in the 2 remaining clamps (Generate +
-        // GenerateStream lifts removed those arms' clamps entirely
-        // when iter-1 + iter-2 landed the actual lifts). H45's
-        // sibling-discipline intent (Qwen35 labels not touched by
-        // B4c) is preserved by pinning the post-iter-2 substring
-        // family `iter-C2d-cont-kernel` (covers both `-iter-N` and
-        // the historical bare cite).
+        // NOT B4c). Even post-iter-4 the historical comments at the
+        // Generate / GenerateStream / Embed / SoftTokens lift forks
+        // still reference iter-C2d-cont-kernel via the §6.1.27/28/29/30
+        // cite chain.
         assert!(
             body.contains("iter-C2d-cont-kernel"),
             "H45 FALSIFIED: C2d-cont's iter-C2d-cont-kernel label \
@@ -19170,6 +19963,23 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
              touch the Qwen35 clamp labels — Qwen35's follow-up iter \
              is iter-C2d-cont-kernel, not iter-B4c-kernel."
         );
+
+        // iter-1/2/3/4 lift fns are all called (B4c must not regress
+        // any of these — the sibling-discipline intent extended to the
+        // post-iter-4 state).
+        for lift_fn in [
+            "super::engine_qwen35::generate_qwen35_once_slot_aware(",
+            "super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware(",
+            "super::engine_qwen35::embed_qwen35_slot_aware(",
+            "super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware(",
+        ] {
+            assert!(
+                body.contains(lift_fn),
+                "H45 FALSIFIED: iter-1/2/3/4 lift fn `{lift_fn}` is \
+                 NOT called from worker_run. B4c must NOT regress any \
+                 Qwen35 worker-arm lift (§6.1.27/28/29/30)."
+            );
+        }
 
         // Qwen3VL has no clamp at B4c — its SlotAware activation is
         // deferred to a future iter (per §6.1.22 spawn arm:

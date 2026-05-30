@@ -2619,25 +2619,32 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
         return;
     }
 
-    // Vision-augmented streaming is iter-C2d-cont-kernel-iter-4 scope.
-    // iter-2 surfaces typed error + aborts when any extension is
-    // present, mirroring the iter-4 deferral discipline established by
-    // iter-1's punt on the non-streaming soft-token entry.
+    // ADR-040 iter-C2d-cont-kernel iter-4 (2026-05-30): vision-augmented
+    // streaming slot-aware path. iter-2 originally surfaced a typed
+    // capability_unsupported error event here; iter-4 LIFTS the branch
+    // — `has_extension == true` routes through
+    // `forward_gpu_last_logits_with_soft_tokens_and_deepstack(.., slot_id)`
+    // for prefill + a t_post-advanced decode loop (mirror of the
+    // non-streaming `generate_qwen35_once_with_soft_tokens_and_deepstack`
+    // shape, lifted via `*_slot_aware`). Empty soft + None deepstack +
+    // None positions ⇒ text-only path unchanged.
     let has_extension =
         !soft_tokens.is_empty() || deepstack.is_some() || positions_flat.is_some();
-    if has_extension {
-        send!(GenerationEvent::Error(format!(
-            "capability_unsupported: ADR-040 iter-C2d-cont-kernel iter-2 — \
-             vision-augmented streaming slot-aware port is \
-             iter-C2d-cont-kernel-iter-4 per ADR-040 §6.1.28 (got \
-             soft_tokens.len()={}, deepstack.is_some()={}, \
-             positions_flat.is_some()={}); fall back to SerialFifo / \
-             SlotId(0) for vision-augmented streaming.",
-            soft_tokens.len(),
-            deepstack.is_some(),
-            positions_flat.is_some(),
-        )));
-        return;
+
+    // Validate `positions_flat` length up-front so we fail loud BEFORE
+    // any GPU work — mirrors the non-streaming sibling at
+    // `generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware`
+    // and the non-slot-aware `generate_stream_qwen35_once_extended`.
+    if let Some(p) = positions_flat {
+        if p.len() != 4 * prompt_tokens.len() {
+            send!(GenerationEvent::Error(format!(
+                "qwen35 stream slot-aware (iter-4): positions_flat.len() = {} \
+                 != 4 * prompt_len = {}",
+                p.len(),
+                4 * prompt_tokens.len()
+            )));
+            return;
+        }
     }
 
     let prompt_len = prompt_tokens.len();
@@ -2688,10 +2695,19 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
     // (= cfg.max_position_embeddings) differs from the snapshot
     // producer's per-request `max_seq_len`. Mirror of iter-1's
     // prompt-cache HIT branch.
-    let prompt_cache_hit = qwen
-        .prompt_cache
-        .try_match(prompt_tokens, params)
-        .is_some();
+    //
+    // ADR-040 iter-C2d-cont-kernel iter-4: BYPASS prompt-cache on the
+    // vision-augmented path (has_extension == true). Cache key is
+    // `prompt_tokens` only and would falsely hit on a vision-augmented
+    // request with the same placeholder ids but different image content.
+    // Mirrors non-slot-aware `generate_stream_qwen35_once_extended` at
+    // engine_qwen35.rs:3870 ("Prompt-cache fast-path is BYPASSED
+    // whenever any extension is present").
+    let prompt_cache_hit = !has_extension
+        && qwen
+            .prompt_cache
+            .try_match(prompt_tokens, params)
+            .is_some();
 
     let prefill_start = Instant::now();
     let mut next_token: u32;
@@ -2718,13 +2734,40 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
         // DISABLED in slot-aware mode (see fn docstring for the
         // snapshot codec invariant rationale; tracked as
         // iter-C2d-cont-kernel-iter-LCP in §6.1.28).
-        let positions = prefill_positions_for(prompt_len);
-        let prefill_logits_res = qwen.model.forward_gpu_last_logits(
-            prompt_tokens,
-            &positions,
-            kv_cache,
-            slot_id,
-        );
+        //
+        // ADR-040 iter-C2d-cont-kernel iter-4: when has_extension is
+        // true, prefill goes through
+        // `forward_gpu_last_logits_with_soft_tokens_and_deepstack(..,
+        // slot_id)` with caller-supplied 3D positions when present;
+        // otherwise text-only `forward_gpu_last_logits(.., slot_id)`
+        // with synthesized text-style positions. Mirror of
+        // non-slot-aware `generate_stream_qwen35_once_extended`'s
+        // `if has_extension { ... } else { ... }` branch (engine_qwen35.rs:4061).
+        let positions_owned: Vec<i32>;
+        let positions_slice: &[i32] = match positions_flat {
+            Some(p) => p,
+            None => {
+                positions_owned = prefill_positions_for(prompt_len);
+                &positions_owned
+            }
+        };
+        let prefill_logits_res: Result<Vec<f32>> = if has_extension {
+            qwen.model.forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+                prompt_tokens,
+                positions_slice,
+                soft_tokens,
+                deepstack,
+                kv_cache,
+                slot_id,
+            )
+        } else {
+            qwen.model.forward_gpu_last_logits(
+                prompt_tokens,
+                positions_slice,
+                kv_cache,
+                slot_id,
+            )
+        };
         let prefill_logits = match prefill_logits_res {
             Ok(l) => l,
             Err(e) => {
@@ -2757,6 +2800,29 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
         // Cross-mode snapshot sharing is iter-C2d-cont-kernel-iter-LCP.
     }
     let prefill_duration = prefill_start.elapsed();
+
+    // ADR-040 iter-C2d-cont-kernel iter-4: post-prefill text decode
+    // positions advance from the global temporal counter (which
+    // advances by max(n_x, n_y) per image during prefill, NOT by
+    // n_image_tokens, per peer `mtmd.cpp:1354-1357`). When
+    // `positions_flat` is supplied, compute `t_post = max(axis-0
+    // positions) + 1`; when None, fall back to the legacy
+    // `prompt_len` text-style advance. Mirror of non-slot-aware
+    // sibling at engine_qwen35.rs:4270 and the non-streaming
+    // `generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware`.
+    let t_post: i32 = match positions_flat {
+        Some(p) => {
+            let mut max_t = 0i32;
+            for i in 0..prompt_len {
+                let v = p[i]; // axis 0 = t
+                if v > max_t {
+                    max_t = v;
+                }
+            }
+            max_t.saturating_add(1)
+        }
+        None => prompt_len as i32,
+    };
 
     // ── Splitter wiring (Reasoning + ToolCall) ────────────────────
     // Mirror of generate_stream_qwen35_once_extended's splitter chain.
@@ -2940,13 +3006,14 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
 
     if !is_eos_first {
         for step in 1..max_tokens {
-            // Slot-aware mode disables the vision t_post advance —
-            // text-only path: position is `prompt_len + step - 1`
-            // (byte-identical to the legacy text-only stream's
-            // `(prompt_len + step - 1)` advance per the
-            // generate_stream_qwen35_once_extended Wedge-4e
-            // text-only fallback branch).
-            let pos = (prompt_len + step - 1) as i32;
+            // ADR-040 iter-C2d-cont-kernel iter-4: decode position uses
+            // the t_post advance computed above so the vision-augmented
+            // path correctly resumes from the post-prefill global
+            // temporal counter. For the text-only path
+            // (has_extension == false AND positions_flat is None),
+            // `t_post = prompt_len as i32`, making `pos = prompt_len +
+            // step - 1` — byte-identical to iter-2's text-only advance.
+            let pos = t_post + (step as i32 - 1);
             if pos as u32 >= kv_cache.max_seq_len {
                 break;
             }
@@ -4872,6 +4939,714 @@ pub fn embed_qwen35_slot_aware(
             "ADR-040 iter-C2d-cont-kernel iter-3: reset_for_slot at exit",
         ),
     }
+}
+
+/// ADR-040 Phase C iter-C2d-cont-kernel iter-4 (2026-05-30): slot-aware
+/// vision-aware non-streaming Qwen35 generation against the
+/// **persistent multi-seq `HybridKvCache`**
+/// (`Qwen35LoadedModel.persistent_kv_cache`) instead of a per-request
+/// fresh `alloc_kv_cache_for_request` allocation.
+///
+/// **Direct mirror of `generate_qwen35_once_slot_aware`** (iter-1) and
+/// `embed_qwen35_slot_aware` (iter-3) for the
+/// [`super::engine::Request::GenerateWithSoftTokens`] worker arm with
+/// `deepstack.is_none() && positions_flat.is_none()` (the
+/// soft-tokens-only sub-shape). iter-1 landed Generate; iter-2 landed
+/// streaming; iter-3 landed Embed; iter-4 lands the SoftTokens arm onto
+/// the same persistent cache + per-slot reset + bounds-checked entry
+/// shape. The deepstack + 3D-positions sibling is
+/// [`generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware`]
+/// (Wedge-4d-equivalent for the slot-aware path).
+///
+/// # Structural parallels with iter-1 / iter-2 / iter-3
+///
+/// 1. Bounds-checks `slot_id` against `kv_cache.n_seqs` (bounds-first
+///    per A2b §6.1.23 iter-1.5 cfa-finding-F5 ordering); typed
+///    `anyhow::Error` on slot OOR with `iter-C2d-cont-kernel iter-4` cite.
+/// 2. Verifies `prompt_len + max_tokens + 64 <= kv_cache.max_seq_len`
+///    (persistent cache is sized to `cfg.max_position_embeddings`;
+///    per-request need must fit).
+/// 3. Calls `kv_cache.reset_for_slot(slot_id)` at entry — zeros the
+///    per-seq full-attn cursor + per-seq linear-attn conv/recurrent
+///    slices for `slot_id` only (other slots untouched). Mirror of
+///    iter-1 / iter-2 / iter-3 primitives.
+/// 4. Threads `slot_id` into every forward call (prefill goes through
+///    `forward_gpu_last_logits_with_soft_tokens(.., slot_id)`; decode
+///    steps use `forward_gpu_last_logits(.., slot_id)` — soft-token
+///    overrides only apply during prefill, mirroring the non-slot-aware
+///    sibling).
+/// 5. Calls `kv_cache.reset_for_slot(slot_id)` at exit — belt-and-
+///    suspenders with the entry reset (mirror of iter-1 / iter-2 / iter-3
+///    exit discipline).
+///
+/// **Per-slot byte-equivalence at SlotId(0)** (H70 pin):
+/// `generate_qwen35_once_with_soft_tokens_slot_aware(.., kv=&mut
+/// persistent_cache, slot_id=SlotId(0))` produces the same
+/// `GenerationResult` as `generate_qwen35_once_with_soft_tokens(..)` for
+/// any vision-aware request when `persistent_cache.n_seqs == 1` AND
+/// `persistent_cache.max_seq_len >= prompt_len + max_tokens + 64`. The
+/// proof is identical to iter-1's H51 / iter-2's H58 / iter-3's H64:
+/// `reset_for_slot(0)` matches the fresh-alloc state,
+/// `forward_gpu_last_logits_with_soft_tokens(.., SlotId(0))` is byte-
+/// equivalent to the pre-A2b path (B4a §6.1.4 pin), and the sampling /
+/// decode loop is structurally identical to the non-slot-aware sibling.
+///
+/// # SoftTokens-specific simplifications vs iter-1
+///
+/// - **No prompt-cache HIT fast-path**: the SoftTokens path bypasses
+///   prompt cache (the cache key is `prompt_tokens` only and would
+///   falsely hit on a vision-augmented request with the same
+///   placeholder ids but different image content). Mirrors the
+///   non-slot-aware `generate_qwen35_once_with_soft_tokens` rationale
+///   (engine_qwen35.rs:3245 "Prompt-cache is intentionally NOT
+///   consulted on the vision path"). The H70 byte-equivalence pin
+///   depends on this discipline matching.
+///
+/// # Co-changes (iter-4 deliberately minimal — exact mirror of iter-1)
+///
+/// - Per-slot LCP / mid-prefill checkpoint storage is DISABLED in
+///   slot-aware mode (the snapshot codec keys on the per-request
+///   `max_seq_len`; persistent-cache snapshots would carry different
+///   byte sizes and break the across-request LCP probe). Pinned as
+///   **iter-C2d-cont-kernel-iter-LCP** in §6.1.30.
+/// - Chunked-prefill is DISABLED in slot-aware mode (same snapshot-
+///   shape reason). Pinned as **iter-C2d-cont-kernel-iter-LCP** in
+///   §6.1.30.
+/// - DFlash / spec-decode capture-states are NOT engaged here (they
+///   require `ensure_la_capture` which is spec-decode-only); slot-aware
+///   spec-decode is **iter-B4d** per §6.1.26 deferrals matrix.
+///
+/// # Errors
+/// - `soft_tokens.is_empty()` → identity over `generate_qwen35_once_slot_aware`
+///   (mirrors the non-slot-aware `generate_qwen35_once_with_soft_tokens`
+///   text-only fallback at engine_qwen35.rs:3216).
+/// - `prompt_tokens.is_empty()` (matches `generate_qwen35_once_with_soft_tokens`).
+/// - `slot_id.0 >= kv_cache.n_seqs` (bounds-first; typed
+///   `anyhow::Error` with `iter-C2d-cont-kernel iter-4` cite).
+/// - `prompt_len + max_tokens + 64 > kv_cache.max_seq_len` (typed error).
+/// - Forward / sample failures propagate from
+///   `forward_gpu_last_logits_with_soft_tokens` / `forward_gpu_last_logits`.
+pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
+    qwen: &mut Qwen35LoadedModel,
+    prompt_tokens: &[u32],
+    soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+    params: &SamplingParams,
+    registration: Option<&ModelRegistration>,
+    kv_cache: &mut HybridKvCache,
+    slot_id: SlotId,
+) -> Result<GenerationResult> {
+    // Empty slice → identity over the text-only slot-aware path.
+    // Mirrors the non-slot-aware fallback at engine_qwen35.rs:3216
+    // (`generate_qwen35_once_with_soft_tokens` empty-soft check).
+    if soft_tokens.is_empty() {
+        return generate_qwen35_once_slot_aware(
+            qwen,
+            prompt_tokens,
+            params,
+            registration,
+            kv_cache,
+            slot_id,
+        );
+    }
+
+    anyhow::ensure!(
+        !prompt_tokens.is_empty(),
+        "generate_qwen35_once_with_soft_tokens_slot_aware: empty prompt_tokens"
+    );
+    // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5 ordering.
+    anyhow::ensure!(
+        slot_id.0 < kv_cache.n_seqs,
+        "generate_qwen35_once_with_soft_tokens_slot_aware: SlotOutOfRange slot={} \
+         max_slots={} (ADR-040 iter-C2d-cont-kernel iter-4)",
+        slot_id.0,
+        kv_cache.n_seqs,
+    );
+    let prompt_len = prompt_tokens.len();
+    let max_tokens = params.max_tokens.max(1);
+    // Verify the persistent cache has room for this request. Persistent
+    // cache is sized to `cfg.max_position_embeddings`; per-request need
+    // is `prompt_len + max_tokens + 64`. Same shape as iter-1.
+    let need_seq = prompt_len + max_tokens + 64;
+    if need_seq > kv_cache.max_seq_len as usize {
+        return Err(anyhow::anyhow!(
+            "generate_qwen35_once_with_soft_tokens_slot_aware: per-request \
+             need_seq={} exceeds persistent cache max_seq_len={} (slot={} \
+             prompt_len={} max_tokens={}). ADR-040 iter-C2d-cont-kernel iter-4 \
+             sizes the persistent cache to cfg.max_position_embeddings; reduce \
+             max_tokens or use a shorter prompt.",
+            need_seq, kv_cache.max_seq_len, slot_id.0, prompt_len, max_tokens
+        ));
+    }
+
+    let is_greedy = is_greedy_eligible(params);
+    let want_logprobs = params.logprobs;
+    let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+        Some(Vec::with_capacity(max_tokens))
+    } else {
+        None
+    };
+
+    // Per-slot reset at entry — mirror of iter-1 H54 / iter-2 H61 /
+    // iter-3 H67 pattern.
+    kv_cache
+        .reset_for_slot(slot_id)
+        .context("ADR-040 iter-C2d-cont-kernel iter-4: reset_for_slot at entry")?;
+
+    // Prompt-cache is intentionally NOT consulted on the vision path
+    // (mirrors non-slot-aware `generate_qwen35_once_with_soft_tokens`
+    // at engine_qwen35.rs:3245). Cache-key safety: a vision-augmented
+    // request with the same placeholder ids but different image content
+    // would falsely hit a cached text-only result.
+    let prefill_start = Instant::now();
+    let positions = prefill_positions_for(prompt_len);
+    let prefill_logits = qwen
+        .model
+        .forward_gpu_last_logits_with_soft_tokens(
+            prompt_tokens,
+            &positions,
+            soft_tokens,
+            kv_cache,
+            slot_id,
+        )
+        .context(
+            "Qwen35Model::forward_gpu_last_logits_with_soft_tokens \
+             (slot-aware prefill, ADR-040 iter-C2d-cont-kernel iter-4)",
+        )?;
+    anyhow::ensure!(
+        prefill_logits.len() == qwen.vocab_size,
+        "qwen35 slot-aware soft-tokens prefill logits len {} != vocab_size {}",
+        prefill_logits.len(),
+        qwen.vocab_size
+    );
+    let mut next_token: u32 = if want_logprobs {
+        let mut logits = prefill_logits.clone();
+        let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
+        if let Some(v) = logprobs_vec.as_mut() {
+            v.push(lp);
+        }
+        tok
+    } else if is_greedy {
+        greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32)
+    } else {
+        let mut logits = prefill_logits.clone();
+        sample_logits_qwen35(&mut logits, params, &[])
+    };
+    let prefill_duration = prefill_start.elapsed();
+
+    // Decode loop — identical structure to iter-1's
+    // `generate_qwen35_once_slot_aware`. Decode positions are
+    // post-prompt by construction (>= prompt_len) and so cannot lie
+    // within any soft-token range, so the decode path deliberately
+    // uses the soft-token-FREE forward methods (mirror of
+    // non-slot-aware `generate_qwen35_once_with_soft_tokens` at
+    // engine_qwen35.rs:3279).
+    let decode_start = Instant::now();
+    let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    generated_tokens.push(next_token);
+
+    let first_fragment = qwen
+        .tokenizer
+        .decode(&[next_token], false)
+        .unwrap_or_default();
+    let mut decoded_text = first_fragment.clone();
+
+    let mut finish_reason: &'static str = "length";
+
+    if qwen.eos_token_ids.contains(&next_token) {
+        finish_reason = "stop";
+    } else if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
+        finish_reason = "stop";
+        qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+    } else {
+        for step in 1..max_tokens {
+            let pos = (prompt_len + step - 1) as i32;
+            if pos as u32 >= kv_cache.max_seq_len {
+                tracing::warn!(
+                    pos,
+                    max_seq = kv_cache.max_seq_len,
+                    "qwen35 slot-aware decode (soft tokens): hit kv-cache bound; \
+                     stopping with finish=length",
+                );
+                break;
+            }
+            let decode_positions = vec![pos; 4];
+
+            next_token = if want_logprobs {
+                let logits_full = qwen
+                    .model
+                    .forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        kv_cache,
+                        slot_id,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "forward_gpu_last_logits slot-aware decode step {step} \
+                             (soft tokens, logprobs)"
+                        )
+                    })?;
+                let mut logits = logits_full;
+                let (tok, lp) = sample_logits_qwen35_with_logprob(
+                    &mut logits,
+                    params,
+                    &generated_tokens,
+                );
+                if let Some(v) = logprobs_vec.as_mut() {
+                    v.push(lp);
+                }
+                tok
+            } else if is_greedy {
+                // iter-4 uses `forward_gpu_last_logits(.., slot_id)` for
+                // greedy too — same shape as iter-1's decode loop
+                // (greedy fast-path slot-aware port is
+                // iter-C2d-cont-kernel-iter-G per §6.1.30; the
+                // non-slot-aware sibling calls `forward_gpu_greedy` but
+                // that fn does not yet thread `slot_id`).
+                let logits_full = qwen
+                    .model
+                    .forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        kv_cache,
+                        slot_id,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "forward_gpu_last_logits slot-aware decode step {step} \
+                             (soft tokens, greedy)"
+                        )
+                    })?;
+                greedy_argmax_last_token(&logits_full, qwen.vocab_size as u32)
+            } else {
+                let logits_full = qwen
+                    .model
+                    .forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        kv_cache,
+                        slot_id,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "forward_gpu_last_logits slot-aware decode step {step} \
+                             (soft tokens)"
+                        )
+                    })?;
+                let mut logits = logits_full;
+                sample_logits_qwen35(&mut logits, params, &generated_tokens)
+            };
+
+            if qwen.eos_token_ids.contains(&next_token) {
+                finish_reason = "stop";
+                break;
+            }
+            generated_tokens.push(next_token);
+            let fragment = qwen
+                .tokenizer
+                .decode(&[next_token], false)
+                .unwrap_or_default();
+            decoded_text.push_str(&fragment);
+            if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
+                finish_reason = "stop";
+                qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                break;
+            }
+        }
+    }
+    let decode_duration = decode_start.elapsed();
+
+    // Per-slot reset at exit — leave the slot clean for the next
+    // request. Mirrors iter-1 / iter-2 / iter-3 exit discipline (H72 +
+    // H73 pins).
+    kv_cache
+        .reset_for_slot(slot_id)
+        .context("ADR-040 iter-C2d-cont-kernel iter-4: reset_for_slot at exit")?;
+
+    // Reasoning split — mirror of generate_qwen35_once_with_soft_tokens.
+    let (content, reasoning_text) = match registration {
+        Some(reg) if reg.has_reasoning() => {
+            super::registry::split_full_output(reg, &decoded_text)
+        }
+        _ => (decoded_text, None),
+    };
+
+    let reasoning_token_count = match registration {
+        Some(reg) if reg.has_reasoning() => {
+            let mut sp = ReasoningSplitter::from_registration(reg);
+            let mut count = 0usize;
+            for &tok in &generated_tokens {
+                let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
+                if let Some(splitter) = sp.as_mut() {
+                    let _ = splitter.feed(&frag);
+                    if splitter.in_reasoning() {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+        _ => 0,
+    };
+
+    Ok(GenerationResult {
+        text: content,
+        reasoning_text,
+        prompt_tokens: prompt_len,
+        completion_tokens: generated_tokens.len(),
+        reasoning_tokens: if reasoning_token_count > 0 {
+            Some(reasoning_token_count)
+        } else {
+            None
+        },
+        finish_reason,
+        prefill_duration,
+        decode_duration,
+        // No prompt-cache fast-path on the soft-tokens path; cached
+        // tokens count is always 0 for vision-augmented requests
+        // (mirrors non-slot-aware sibling at engine_qwen35.rs:3410).
+        cached_tokens: 0,
+        logprobs: logprobs_vec,
+    })
+}
+
+/// ADR-040 Phase C iter-C2d-cont-kernel iter-4 (2026-05-30): slot-aware
+/// vision-aware non-streaming Qwen35 generation with the full DeepStack
+/// injection pipeline against the **persistent multi-seq `HybridKvCache`**.
+///
+/// **Direct mirror of `generate_qwen35_once_with_soft_tokens_and_deepstack`**
+/// (Wedge-4d) lifted onto the persistent cache + per-slot reset shape
+/// established by iter-1 / iter-2 / iter-3. Sibling of
+/// [`generate_qwen35_once_with_soft_tokens_slot_aware`] for the
+/// `deepstack.is_some() || positions_flat.is_some()` sub-shape.
+///
+/// # Structural parallels with iter-1 / iter-3
+///
+/// Identical to `generate_qwen35_once_with_soft_tokens_slot_aware` except:
+///   * Prefill goes through `forward_gpu_last_logits_with_soft_tokens_and_deepstack`
+///     so per-LM-layer DeepStack chunks are added to the residual stream
+///     at the image-token positions during prefill (per peer
+///     `qwen3vl.cpp:96-100`).
+///   * The 3D-mRoPE position buffer (`positions_flat: [4 * prompt_len]`)
+///     is supplied by the chat handler via
+///     `crate::serve::forward_prefill::build_qwen3vl_positions`, NOT
+///     synthesized via `prefill_positions_for`. This carries the
+///     `[t, y, x, 0]` axis assignment that the IMROPE kernel consumes
+///     for image-patch tokens.
+///   * Decode steps after prefill use text-only `[t,t,t,t]` positions
+///     starting from the post-prefill global temporal counter (which
+///     advances by `max(n_x, n_y)` per image, NOT by `n_image_tokens`,
+///     per peer `mtmd.cpp:1354-1357`).
+///
+/// When both `deepstack` and `positions_flat` are `None`, behaviour is
+/// identical to `generate_qwen35_once_with_soft_tokens_slot_aware` —
+/// which itself falls through to `generate_qwen35_once_slot_aware` when
+/// `soft_tokens` is also empty.
+///
+/// # Errors
+///
+/// Same shape as `generate_qwen35_once_with_soft_tokens_slot_aware`,
+/// plus the non-slot-aware DeepStack-specific error class
+/// (`positions_flat.len() != 4 * prompt_len`).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
+    qwen: &mut Qwen35LoadedModel,
+    prompt_tokens: &[u32],
+    soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+    deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
+    positions_flat: Option<&[i32]>,
+    params: &SamplingParams,
+    registration: Option<&ModelRegistration>,
+    kv_cache: &mut HybridKvCache,
+    slot_id: SlotId,
+) -> Result<GenerationResult> {
+    // Empty soft + no deepstack + no positions → identity over text-only
+    // slot-aware path. Mirrors non-slot-aware sibling at
+    // engine_qwen35.rs:3447.
+    if soft_tokens.is_empty() && deepstack.is_none() && positions_flat.is_none() {
+        return generate_qwen35_once_slot_aware(
+            qwen,
+            prompt_tokens,
+            params,
+            registration,
+            kv_cache,
+            slot_id,
+        );
+    }
+
+    anyhow::ensure!(
+        !prompt_tokens.is_empty(),
+        "generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware: \
+         empty prompt_tokens"
+    );
+    // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5 ordering.
+    anyhow::ensure!(
+        slot_id.0 < kv_cache.n_seqs,
+        "generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware: \
+         SlotOutOfRange slot={} max_slots={} (ADR-040 iter-C2d-cont-kernel iter-4)",
+        slot_id.0,
+        kv_cache.n_seqs,
+    );
+    let prompt_len = prompt_tokens.len();
+    let max_tokens = params.max_tokens.max(1);
+    let need_seq = prompt_len + max_tokens + 64;
+    if need_seq > kv_cache.max_seq_len as usize {
+        return Err(anyhow::anyhow!(
+            "generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware: \
+             per-request need_seq={} exceeds persistent cache max_seq_len={} \
+             (slot={} prompt_len={} max_tokens={}). ADR-040 iter-C2d-cont-\
+             kernel iter-4 sizes the persistent cache to \
+             cfg.max_position_embeddings; reduce max_tokens or use a shorter \
+             prompt.",
+            need_seq, kv_cache.max_seq_len, slot_id.0, prompt_len, max_tokens
+        ));
+    }
+
+    let is_greedy = is_greedy_eligible(params);
+    let want_logprobs = params.logprobs;
+    let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+        Some(Vec::with_capacity(max_tokens))
+    } else {
+        None
+    };
+
+    // Per-slot reset at entry — mirror of iter-1 H54.
+    kv_cache
+        .reset_for_slot(slot_id)
+        .context("ADR-040 iter-C2d-cont-kernel iter-4: reset_for_slot at entry (deepstack)")?;
+
+    let prefill_start = Instant::now();
+    // Use supplied 3D positions if provided; otherwise fall back to
+    // text-style `[t,t,t,t]` positions (mirror of non-slot-aware
+    // sibling at engine_qwen35.rs:3480).
+    let positions_owned: Vec<i32>;
+    let positions: &[i32] = match positions_flat {
+        Some(p) => {
+            anyhow::ensure!(
+                p.len() == 4 * prompt_len,
+                "generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware: \
+                 positions_flat.len() = {} != 4 * prompt_len = {}",
+                p.len(),
+                4 * prompt_len
+            );
+            p
+        }
+        None => {
+            positions_owned = prefill_positions_for(prompt_len);
+            &positions_owned
+        }
+    };
+
+    let prefill_logits = qwen
+        .model
+        .forward_gpu_last_logits_with_soft_tokens_and_deepstack(
+            prompt_tokens,
+            positions,
+            soft_tokens,
+            deepstack,
+            kv_cache,
+            slot_id,
+        )
+        .context(
+            "Qwen35Model::forward_gpu_last_logits_with_soft_tokens_and_deepstack \
+             (slot-aware prefill, ADR-040 iter-C2d-cont-kernel iter-4)",
+        )?;
+    anyhow::ensure!(
+        prefill_logits.len() == qwen.vocab_size,
+        "qwen35 slot-aware deepstack prefill logits len {} != vocab_size {}",
+        prefill_logits.len(),
+        qwen.vocab_size
+    );
+    let mut next_token: u32 = if want_logprobs {
+        let mut logits = prefill_logits.clone();
+        let (tok, lp) = sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
+        if let Some(v) = logprobs_vec.as_mut() {
+            v.push(lp);
+        }
+        tok
+    } else if is_greedy {
+        greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32)
+    } else {
+        let mut logits = prefill_logits.clone();
+        sample_logits_qwen35(&mut logits, params, &[])
+    };
+    let prefill_duration = prefill_start.elapsed();
+
+    // Decode loop — for the post-prefill text steps, the global
+    // temporal position has advanced by image-aware amounts. Compute
+    // the post-prefill temporal `t_post` from the LAST text token's
+    // axis-0 position +1 (mirror of non-slot-aware sibling at
+    // engine_qwen35.rs:3537).
+    let t_post: i32 = match positions_flat {
+        Some(p) => {
+            let mut max_t = 0i32;
+            for i in 0..prompt_len {
+                let v = p[i]; // axis 0 = t
+                if v > max_t {
+                    max_t = v;
+                }
+            }
+            max_t.saturating_add(1)
+        }
+        None => prompt_len as i32,
+    };
+
+    let decode_start = Instant::now();
+    let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    generated_tokens.push(next_token);
+
+    let first_fragment = qwen
+        .tokenizer
+        .decode(&[next_token], false)
+        .unwrap_or_default();
+    let mut decoded_text = first_fragment.clone();
+
+    let mut finish_reason: &'static str = "length";
+
+    if qwen.eos_token_ids.contains(&next_token) {
+        finish_reason = "stop";
+    } else if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
+        finish_reason = "stop";
+        qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+    } else {
+        for step in 1..max_tokens {
+            let pos = t_post + (step as i32 - 1);
+            if pos as u32 >= kv_cache.max_seq_len {
+                tracing::warn!(
+                    pos,
+                    max_seq = kv_cache.max_seq_len,
+                    "qwen35 slot-aware decode (deepstack): hit kv-cache bound; \
+                     stopping with finish=length",
+                );
+                break;
+            }
+            let decode_positions = vec![pos; 4];
+
+            next_token = if want_logprobs {
+                let logits_full = qwen
+                    .model
+                    .forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        kv_cache,
+                        slot_id,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "forward_gpu_last_logits slot-aware decode step {step} \
+                             (deepstack, logprobs)"
+                        )
+                    })?;
+                let mut logits = logits_full;
+                let (tok, lp) = sample_logits_qwen35_with_logprob(
+                    &mut logits,
+                    params,
+                    &generated_tokens,
+                );
+                if let Some(v) = logprobs_vec.as_mut() {
+                    v.push(lp);
+                }
+                tok
+            } else if is_greedy {
+                let logits_full = qwen
+                    .model
+                    .forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        kv_cache,
+                        slot_id,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "forward_gpu_last_logits slot-aware decode step {step} \
+                             (deepstack, greedy)"
+                        )
+                    })?;
+                greedy_argmax_last_token(&logits_full, qwen.vocab_size as u32)
+            } else {
+                let logits_full = qwen
+                    .model
+                    .forward_gpu_last_logits(
+                        &[next_token],
+                        &decode_positions,
+                        kv_cache,
+                        slot_id,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "forward_gpu_last_logits slot-aware decode step {step} \
+                             (deepstack)"
+                        )
+                    })?;
+                let mut logits = logits_full;
+                sample_logits_qwen35(&mut logits, params, &generated_tokens)
+            };
+
+            if qwen.eos_token_ids.contains(&next_token) {
+                finish_reason = "stop";
+                break;
+            }
+            generated_tokens.push(next_token);
+            let fragment = qwen
+                .tokenizer
+                .decode(&[next_token], false)
+                .unwrap_or_default();
+            decoded_text.push_str(&fragment);
+            if qwen35_hit_stop_string(&decoded_text, &params.stop_strings) {
+                finish_reason = "stop";
+                qwen35_strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+                break;
+            }
+        }
+    }
+    let decode_duration = decode_start.elapsed();
+
+    // Per-slot reset at exit — mirror of iter-1/2/3 exit discipline.
+    kv_cache
+        .reset_for_slot(slot_id)
+        .context("ADR-040 iter-C2d-cont-kernel iter-4: reset_for_slot at exit (deepstack)")?;
+
+    let (content, reasoning_text) = match registration {
+        Some(reg) if reg.has_reasoning() => {
+            super::registry::split_full_output(reg, &decoded_text)
+        }
+        _ => (decoded_text, None),
+    };
+
+    let reasoning_token_count = match registration {
+        Some(reg) if reg.has_reasoning() => {
+            let mut sp = ReasoningSplitter::from_registration(reg);
+            let mut count = 0usize;
+            for &tok in &generated_tokens {
+                let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
+                if let Some(splitter) = sp.as_mut() {
+                    let _ = splitter.feed(&frag);
+                    if splitter.in_reasoning() {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+        _ => 0,
+    };
+
+    Ok(GenerationResult {
+        text: content,
+        reasoning_text,
+        prompt_tokens: prompt_len,
+        completion_tokens: generated_tokens.len(),
+        reasoning_tokens: if reasoning_token_count > 0 {
+            Some(reasoning_token_count)
+        } else {
+            None
+        },
+        finish_reason,
+        prefill_duration,
+        decode_duration,
+        cached_tokens: 0,
+        logprobs: logprobs_vec,
+    })
 }
 
 /// Default tool-call policy for the Wedge-3 streaming arm.
