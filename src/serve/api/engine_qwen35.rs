@@ -4693,6 +4693,187 @@ pub fn embed_qwen35(qwen: &mut Qwen35LoadedModel, prompt_tokens: &[u32]) -> Resu
         .context("Qwen35Model::forward_embed_last")
 }
 
+/// **ADR-040 iter-C2d-cont-kernel iter-3 (2026-05-30)** — slot-aware
+/// chat-as-embedder entry that routes the Qwen35 worker hot path's
+/// **Embed** dispatch through the persistent multi-seq `HybridKvCache`
+/// (`Qwen35LoadedModel.persistent_kv_cache`) instead of a per-request
+/// fresh `alloc_kv_cache_for_request` allocation.
+///
+/// **Direct mirror of `generate_qwen35_once_slot_aware`** (iter-1) and
+/// `generate_stream_qwen35_once_extended_slot_aware` (iter-2) for the
+/// [`super::engine::Request::Embed`] worker arm. iter-1 landed the
+/// non-streaming Generate-arm lift; iter-2 landed the streaming-arm
+/// lift; iter-3 lands the embed-arm lift onto the same persistent cache
+/// + per-slot reset + bounds-checked entry shape.
+///
+/// **Why this is the smallest of the iter-{1,2,3,4} ports** (no decode
+/// loop, no SSE channel, no soft-token injections): the embed surface
+/// runs exactly one `forward_embed_last` call against the slot, returns
+/// the L2-normalized hidden vector, and exits. The prompt-cache HIT
+/// fast-path is intentionally NOT consulted here — same shape as
+/// non-slot-aware `embed_qwen35` (prompt cache savings are dominated by
+/// the no-decode shape; the embed forward is a single pass).
+///
+/// # Structural parallels with iter-1 / iter-2
+///
+/// 1. Bounds-checks `slot_id` against `kv_cache.n_seqs` (bounds-first
+///    per A2b §6.1.23 iter-1.5 cfa-finding-F5 ordering); typed
+///    `anyhow::Error` on slot OOR with operator-grep'able cite.
+/// 2. Verifies `prompt_len + 64 <= kv_cache.max_seq_len` (no
+///    `max_tokens` term — embed has no decode budget; persistent cache
+///    is sized to `cfg.max_position_embeddings`).
+/// 3. Calls `kv_cache.reset_for_slot(slot_id)` at entry — zeros the
+///    per-seq full-attn cursor + per-seq linear-attn conv/recurrent
+///    slices for `slot_id` only (other slots untouched). This is the
+///    iter-1 primitive, reused verbatim.
+/// 4. Calls `forward_embed_last(prompt_tokens, &positions, kv_cache,
+///    slot_id)` — already accepts `SlotId` post-B4b §6.1.20.
+/// 5. Calls `kv_cache.reset_for_slot(slot_id)` at exit — belt-and-
+///    suspenders with the entry reset (mirror of iter-1 / iter-2 exit
+///    discipline). The embed path has NO intermediate paths that could
+///    bypass the entry reset, but the exit reset preserves the
+///    cross-iter exit-discipline pattern so the slot is always clean
+///    at handoff for the next request to land at this slot.
+///
+/// **Per-slot byte-equivalence at SlotId(0)** (H64 pin):
+/// `embed_qwen35_slot_aware(.., kv=&mut persistent_cache, slot_id=
+/// SlotId(0))` produces the same `Vec<f32>` as `embed_qwen35(..)` for
+/// any request when `persistent_cache.n_seqs == 1` AND
+/// `persistent_cache.max_seq_len >= prompt_len + 64`. The proof is the
+/// same shape as iter-1's H51 pin + iter-2's H58 pin: `reset_for_slot(0)`
+/// matches the fresh-alloc state, `forward_embed_last(.., SlotId(0))`
+/// is byte-equivalent to the pre-A2b path (B4a §6.1.4 pin), the
+/// L2-normalization is identical, and the embed vector shape is
+/// `cfg.hidden_size`-pinned (independent of cache shape).
+///
+/// # Embed-specific simplifications vs iter-1/iter-2
+///
+/// - **No decode loop**: the embed surface is exactly one
+///   `forward_embed_last` call (vs iter-1's prefill + decode loop and
+///   iter-2's streaming decode loop). No `next_token` sampling, no
+///   stop-string handling, no `eos_token_ids` check, no `step` loop.
+/// - **No prompt-cache HIT fast-path**: the embed surface runs a single
+///   forward and discards the cache; HIT savings are dominated by the
+///   no-decode shape. Identical to non-slot-aware `embed_qwen35`.
+/// - **No SSE channel** / no `events.blocking_send` / no
+///   `cancellation_counter`: the embed result is a single `Vec<f32>`
+///   returned via the worker arm's `oneshot::Sender` (same as iter-1's
+///   Generate surface).
+/// - **No vision-aware extension surface**: the Embed `Request` variant
+///   does not carry `soft_tokens` / `deepstack` / `positions_flat`, so
+///   the `has_extension` typed-error path that iter-2 added is N/A
+///   here.
+/// - **Need check uses `prompt_len + 64`** (not `prompt_len + max_tokens
+///   + 64`): embed has no decode budget; the `+64` margin matches the
+///   `alloc_kv_cache_for_request(qwen, &device, prompt_tokens.len(),
+///   0)` shape (the `0` max_tokens at line 4684 implies a `+64` slack
+///   in the per-request alloc helper's sizing logic).
+///
+/// # Co-changes (iter-3 deliberately minimal — exact mirror of iter-1)
+///
+/// - Per-slot LCP / mid-prefill checkpoint storage is DISABLED in
+///   slot-aware mode (the snapshot codec keys on the per-request
+///   `max_seq_len`; persistent-cache snapshots would carry different
+///   byte sizes and break the across-request LCP probe). The embed
+///   path doesn't engage LCP anyway (no decode loop = no place to
+///   checkpoint). Pinned as **iter-C2d-cont-kernel-iter-LCP** in
+///   §6.1.29.
+/// - Vision-augmented embeddings (Qwen3-VL chat-as-embedder with image
+///   inputs) are NOT exposed via the Embed `Request` variant in
+///   `engine.rs` — the Embed handler only accepts `prompt_tokens` (no
+///   `soft_tokens` / `deepstack` / `positions_flat`). If a future iter
+///   adds vision-augmented embedding, it would extend the `Request::
+///   Embed` variant + this fn signature in lockstep; iter-3 does not
+///   anticipate that shape.
+///
+/// # Errors
+/// - `prompt_tokens.is_empty()` (matches `embed_qwen35`).
+/// - `slot_id.0 >= kv_cache.n_seqs` (bounds-first; surfaces typed
+///   `anyhow::Error` with `capability_unsupported:` prefix +
+///   `iter-C2d-cont-kernel iter-3` cite).
+/// - `prompt_len + 64 > kv_cache.max_seq_len` (typed error with same
+///   prefix shape).
+/// - `reset_for_slot` failure propagates with `iter-C2d-cont-kernel
+///   iter-3` context.
+/// - `forward_embed_last` failure propagates with the usual context.
+pub fn embed_qwen35_slot_aware(
+    qwen: &mut Qwen35LoadedModel,
+    prompt_tokens: &[u32],
+    kv_cache: &mut HybridKvCache,
+    slot_id: SlotId,
+) -> Result<Vec<f32>> {
+    anyhow::ensure!(
+        !prompt_tokens.is_empty(),
+        "embed_qwen35_slot_aware: empty prompt_tokens"
+    );
+    // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5 ordering.
+    anyhow::ensure!(
+        slot_id.0 < kv_cache.n_seqs,
+        "embed_qwen35_slot_aware: SlotOutOfRange slot={} max_slots={} \
+         (ADR-040 iter-C2d-cont-kernel iter-3)",
+        slot_id.0,
+        kv_cache.n_seqs,
+    );
+    let prompt_len = prompt_tokens.len();
+    // Verify the persistent cache has room for this embed request.
+    // Embed has no decode budget; the `+ 64` slack matches the
+    // `alloc_kv_cache_for_request(qwen, &device, prompt_len, 0)` shape
+    // used by the non-slot-aware `embed_qwen35` path.
+    let need_seq = prompt_len + 64;
+    if need_seq > kv_cache.max_seq_len as usize {
+        return Err(anyhow::anyhow!(
+            "embed_qwen35_slot_aware: per-request need_seq={} exceeds \
+             persistent cache max_seq_len={} (slot={} prompt_len={}). \
+             ADR-040 iter-C2d-cont-kernel iter-3 sizes the persistent \
+             cache to cfg.max_position_embeddings; use a shorter prompt.",
+            need_seq, kv_cache.max_seq_len, slot_id.0, prompt_len
+        ));
+    }
+
+    // Per-slot reset at entry — the persistent cache may carry stale
+    // bytes from a prior request on this slot. `reset_for_slot` zeros
+    // the per-seq cursors + linear-attn conv/recurrent slices for
+    // `slot_id` only (other slots untouched). Mirror of iter-1 H54 +
+    // iter-2 H61 pattern.
+    kv_cache
+        .reset_for_slot(slot_id)
+        .context("ADR-040 iter-C2d-cont-kernel iter-3: reset_for_slot at entry")?;
+
+    // Single forward pass — no decode loop, no prompt-cache HIT
+    // fast-path (mirrors `embed_qwen35` non-slot-aware shape).
+    let positions = prefill_positions_for(prompt_len);
+    let embed_result = qwen
+        .model
+        .forward_embed_last(prompt_tokens, &positions, kv_cache, slot_id)
+        .context(
+            "Qwen35Model::forward_embed_last (ADR-040 iter-C2d-cont-kernel iter-3 slot-aware)",
+        );
+
+    // Per-slot reset at exit — leave the slot clean for the next
+    // request to land on it. Belt-and-suspenders w/ the entry reset:
+    // ensures that even if a future iter adds a code path between
+    // entry-reset and exit-reset that mutates per-slot state, the slot
+    // is always clean at handoff. Mirrors iter-1 + iter-2 exit
+    // discipline; runs regardless of the embed result so a forward
+    // failure doesn't leave the slot dirty for the next request.
+    let reset_exit_res = kv_cache.reset_for_slot(slot_id);
+
+    // Surface the embed result first (the load-bearing return); only
+    // override with the reset-exit error if the embed itself succeeded
+    // (otherwise the embed error is more diagnostic). The reset-exit
+    // call is a per-slot zero — failures here are typed
+    // `SlotOutOfRange` which the bounds check at entry already ruled
+    // out, so reaching this branch implies a structural bug worth
+    // surfacing.
+    match (embed_result, reset_exit_res) {
+        (Ok(vec), Ok(())) => Ok(vec),
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => Err(e).context(
+            "ADR-040 iter-C2d-cont-kernel iter-3: reset_for_slot at exit",
+        ),
+    }
+}
+
 /// Default tool-call policy for the Wedge-3 streaming arm.
 ///
 /// Wedge-3 ships `tool_choice=auto` semantics from the Qwen35 worker
