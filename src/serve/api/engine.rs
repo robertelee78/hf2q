@@ -656,6 +656,42 @@ pub enum EngineSpawnError {
         /// `HybridKvCache::new` failure as rendered by anyhow.
         cause: String,
     },
+
+    /// **ADR-040 Phase C iter-C2c-cont** — `EngineMode::SlotAware`
+    /// spawn for Gemma 4 reached the SIBLING `MultiSeqHybridKvBuffers`
+    /// scaffold provisioning step (the PRODUCTION-DEFAULT KV path per
+    /// H10 falsification at §6.1.11 — `HF2Q_HYBRID_KV` is default-true
+    /// since ADR-029 iter-13, 2026-05-11) but the per-layer
+    /// `alloc_multi_seq_hybrid_kv_for_layer` allocator returned an error.
+    /// Distinct from [`Self::Gemma4SlotAwareProvisionFailed`] (which
+    /// names the HbKvBuffers HB-encoded opt-out scaffold) so operator
+    /// log greps + per-handler routing stay unambiguous about WHICH KV
+    /// regime's allocator failed.
+    ///
+    /// Reached only when `INVESTIGATION_ENV.hybrid_kv == true` (which is
+    /// the default since 2026-05-11 — the falsified opt-in assumption).
+    /// Typical causes: MlxDevice OOM at production shape × N slots
+    /// (F16-K + TQ-HB-V doubles the per-slot byte footprint vs HB-only);
+    /// `HF2Q_FULL_F16_KV=1` further inflates V to full F16; xlen mode
+    /// (`HF2Q_DFLASH_XLEN_SDPA=1`) adds two more BF16 buffers per slot.
+    ///
+    /// Mirrors `Gemma4SlotAwareProvisionFailed` shape; ships alongside
+    /// it so the spawn-time provisioning surface emits ONE typed error
+    /// per failing KV regime + the operator can grep on the variant
+    /// discriminant.
+    #[error(
+        "ADR-040 iter-C2c-cont: Gemma 4 SlotAware spawn failed during \
+         MultiSeqHybridKvBuffers (production-default per HF2Q_HYBRID_KV=1; \
+         H10 falsification §6.1.11) provisioning (max_slots={max_slots}). \
+         Cause: {cause}"
+    )]
+    Gemma4HybridSlotAwareProvisionFailed {
+        /// The `max_slots` value the caller requested.
+        max_slots: u32,
+        /// First per-layer `alloc_multi_seq_hybrid_kv_for_layer`
+        /// failure as rendered by anyhow.
+        cause: String,
+    },
 }
 
 /// **ADR-040 §3.5 iter-A5b** — pre-stream admit-time errors surfaced by
@@ -1673,6 +1709,51 @@ pub struct GemmaLoadedModel {
     /// kernel slot routing.
     pub multi_seq_kv: Option<
         Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
+    >,
+
+    /// **ADR-040 Phase C iter-C2c-cont (2026-05-30)** — sibling multi-
+    /// seq KV scaffold for the PRODUCTION-DEFAULT hybrid F16-K + TQ-HB-V
+    /// (or full F16) KV path.
+    ///
+    /// Provisioned at `spawn_with_mode(SlotAware { max_slots: N })` time
+    /// using the A3b `alloc_multi_seq_hybrid_kv_for_layer` per-layer
+    /// allocator with `n_seqs = max_slots`. Coexists with
+    /// [`Self::multi_seq_kv`] (the HbKvBuffers HB-encoded opt-out
+    /// scaffold C2c §6.1.21 provisions verbatim) — both can be `Some(_)`
+    /// after a SlotAware spawn under default env (where
+    /// `INVESTIGATION_ENV.hybrid_kv == true` per H10 falsification at
+    /// §6.1.11 / ADR-029 iter-13).
+    ///
+    /// **Why both coexist (H91 hypothesis)**: the per-request KV regime
+    /// is selected INSIDE the model fn body via
+    /// [`crate::debug::INVESTIGATION_ENV.hybrid_kv`] read at call time
+    /// (see `forward_prefill_with_soft_tokens_slot_aware`'s dispatch
+    /// fork at `src/serve/forward_prefill.rs:2562`). Operators can flip
+    /// the env at process start; both scaffolds must be available so
+    /// the dispatch fork hands the appropriate one to the kernel. A
+    /// unified enum wrapping would force a spawn-time regime
+    /// commitment, breaking iter-2A's per-call selection contract.
+    ///
+    /// **Provisioning gate (H92 hypothesis)**:
+    /// - `HF2Q_HYBRID_KV=1` (DEFAULT since ADR-029 iter-13): this field
+    ///   is `Some(_)` after SlotAware spawn.
+    /// - `HF2Q_HYBRID_KV=0` (opt-out): this field stays `None` (the HB-
+    ///   encoded fallback is provisioned via [`Self::multi_seq_kv`]).
+    /// - [`EngineMode::SerialFifo`]: this field stays `None` (preserves
+    ///   pre-ADR-040 byte-equivalence — H95 pin).
+    ///
+    /// **Iter-C2c-cont (Path A) scope**: the parallel provisioning
+    /// surface is the COMPLETE scope of this iter — the per-request
+    /// forward path (`forward_prefill_with_soft_tokens_slot_aware`'s
+    /// `INVESTIGATION_ENV.hybrid_kv` dispatch-fork branch at line 2562)
+    /// still surfaces typed `MultiSeqError::CapabilityUnsupported` named
+    /// `iter-B4c-kernel-iter-2B per ADR-040 §6.1.32`.
+    /// iter-B4c-kernel-iter-2B will refactor that branch to consume
+    /// THIS field via `MlxBuffer::slice_view` at the F16-K
+    /// `slot_id.0 * nkv * cap * hd * 2`-byte offset (mirror of the
+    /// HB-encoded iter-2A-cont scheme).
+    pub multi_seq_kv_hybrid: Option<
+        Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
     >,
 }
 
@@ -2698,17 +2779,33 @@ impl GemmaLoadedModel {
             // legacy `weights.kv_caches` (MlxKvCache, single-seq) remains
             // the live KV state for byte-equivalence (H23 pin).
             multi_seq_kv: None,
+            // ADR-040 Phase C iter-C2c-cont (2026-05-30): None until
+            // `spawn_with_mode(SlotAware { .. })` provisions the sibling
+            // hybrid scaffold via `alloc_multi_seq_hybrid_kv_for_layer`
+            // (the production-default KV regime per H10 falsification at
+            // §6.1.11). SerialFifo path NEVER populates this field —
+            // legacy `weights.kv_caches` remains live for byte-
+            // equivalence (H95 pin — sibling to H23).
+            multi_seq_kv_hybrid: None,
         })
     }
 
-    /// **ADR-040 Phase C iter-2c (C2c)** — provision per-layer multi-seq
-    /// KV scaffolds via the A3a `alloc_hb_kv_for_layer` allocator with
-    /// `n_seqs = max_slots`.
+    /// **ADR-040 Phase C iter-2c (C2c) + iter-C2c-cont** — provision
+    /// per-layer multi-seq KV scaffolds via the A3a
+    /// `alloc_hb_kv_for_layer` allocator AND (per iter-C2c-cont) the
+    /// sibling A3b `alloc_multi_seq_hybrid_kv_for_layer` allocator,
+    /// both with `n_seqs = max_slots`.
     ///
     /// Called by [`Engine::spawn_with_mode`] when
     /// [`EngineMode::SlotAware`] is selected for a Gemma 4 engine. Sets
     /// [`Self::multi_seq_kv`] to `Some(Vec<MultiSeqHbKvBuffers>)`
-    /// (`len() == weights.layers.len()`).
+    /// (`len() == weights.layers.len()`) UNCONDITIONALLY (C2c semantic
+    /// preserved verbatim per H94 — the HB-encoded scaffold is the
+    /// opt-out path's KV variant and the iter-2A dispatch fork still
+    /// consumes it). Iter-C2c-cont ADDITIVE behaviour: sets
+    /// [`Self::multi_seq_kv_hybrid`] to `Some(Vec<MultiSeqHybridKvBuffers>)`
+    /// IFF `INVESTIGATION_ENV.hybrid_kv == true` (PRODUCTION DEFAULT
+    /// since ADR-029 iter-13 per H10 falsification at §6.1.11).
     ///
     /// **Per-layer params** (mirrors the production allocator at
     /// `gemma4/model.rs:1247-1301`):
@@ -2720,24 +2817,42 @@ impl GemmaLoadedModel {
     /// - `is_ring` ← `!config.is_full_attention(i)` (matches the
     ///   `is_sliding: !is_full` field on legacy `MlxKvCache`)
     ///
-    /// **Why HB variant only** (per the iter-C2c docstring on
-    /// [`Self::multi_seq_kv`]): production default is the HB
-    /// (TQ-packed) path; the A3b hybrid variant requires
-    /// `HF2Q_FULL_F16_KV=1` and is iter-C2c-cont scope when paired with
-    /// the kernel slot routing.
+    /// Both scaffolds share these per-layer dimensions — the parallel
+    /// provisioning loops use IDENTICAL `(nkv, hd, capacity, is_ring)`
+    /// quadruples so a future iter-2B kernel-dispatch refactor can
+    /// safely consume the HYBRID slice at the same `slot_id.0 * nkv *
+    /// capacity * hd * 2`-byte offset the iter-2A-cont HB-encoded path
+    /// uses (modulo F16 element-size scaling for the K buffer).
+    ///
+    /// **Why BOTH variants** (iter-C2c-cont H91 hypothesis): per-request
+    /// KV regime is selected INSIDE the model fn via
+    /// [`crate::debug::INVESTIGATION_ENV.hybrid_kv`] at call time (see
+    /// `forward_prefill_with_soft_tokens_slot_aware`'s dispatch fork
+    /// at `src/serve/forward_prefill.rs:2562`). Both scaffolds must
+    /// coexist so the dispatch fork hands the appropriate one to the
+    /// kernel without spawn-time regime commitment. The HB scaffold is
+    /// ALWAYS provisioned because (a) the field already exists in
+    /// `GemmaLoadedModel` per C2c §6.1.21 and the H22 / H78 / H85 pins
+    /// require its presence; (b) HF2Q_HYBRID_KV=0 operator override
+    /// must still hit a populated scaffold (HB-encoded opt-out fallback).
     ///
     /// # Errors
     ///
-    /// Returns the first per-layer allocator error verbatim
-    /// (`anyhow::Error` from `alloc_hb_kv_for_layer`). `max_slots == 0`
-    /// is caught at the allocator's pre-flight (`n_seqs == 0` → typed
-    /// error per A3a's invariants).
+    /// Returns the first per-layer HB allocator error verbatim
+    /// (`anyhow::Error` from `alloc_hb_kv_for_layer`) per C2c. If the
+    /// HB phase succeeds AND `INVESTIGATION_ENV.hybrid_kv` is true,
+    /// returns the first per-layer HYBRID allocator error verbatim
+    /// (`anyhow::Error` from `alloc_multi_seq_hybrid_kv_for_layer`).
+    /// `max_slots == 0` is caught at the allocator's pre-flight
+    /// (`n_seqs == 0` → typed error per A3a/A3b's invariants) AND at
+    /// this fn's entry (defense-in-depth diagnostic).
     pub fn provision_multi_seq_kv_for_slot_aware(
         &mut self,
         max_slots: u32,
     ) -> Result<()> {
         use crate::inference::models::gemma4::kv_cache::{
-            alloc_hb_kv_for_layer, layer_type_to_alloc_params,
+            alloc_hb_kv_for_layer, alloc_multi_seq_hybrid_kv_for_layer,
+            layer_type_to_alloc_params,
         };
         use crate::serve::config::LayerType;
 
@@ -2751,6 +2866,13 @@ impl GemmaLoadedModel {
         }
         let dev = self.ctx.device();
         let num_layers = self.weights.layers.len();
+
+        // ── Phase 1: HB-encoded scaffold (C2c §6.1.21 — UNCHANGED) ───
+        //
+        // Always provisioned per H94: the opt-out (HF2Q_HYBRID_KV=0)
+        // dispatch-fork branch in `forward_prefill_with_soft_tokens_
+        // slot_aware` (iter-2A) routes through this scaffold; iter-2A-
+        // cont kernel-dispatch refactor consumes this field directly.
         let mut multi_seq: Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers> =
             Vec::with_capacity(num_layers);
         for i in 0..num_layers {
@@ -2774,6 +2896,51 @@ impl GemmaLoadedModel {
             multi_seq.push(buf);
         }
         self.multi_seq_kv = Some(multi_seq);
+
+        // ── Phase 2: Hybrid F16-K + TQ-HB-V scaffold (iter-C2c-cont) ──
+        //
+        // Provisioned IFF the production-default KV regime is engaged.
+        // `INVESTIGATION_ENV.hybrid_kv` is a LazyLock read once at
+        // process start; matches the env-read discipline at the iter-2A
+        // dispatch fork in `forward_prefill.rs:2562` and the legacy
+        // alloc site at `forward_prefill.rs:842`. If the env is opted
+        // out, we leave `multi_seq_kv_hybrid = None` (H92 negative-arm
+        // pin) — the HB-encoded scaffold above is the only live one.
+        if crate::debug::INVESTIGATION_ENV.hybrid_kv {
+            let mut multi_seq_hybrid: Vec<
+                crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers,
+            > = Vec::with_capacity(num_layers);
+            for i in 0..num_layers {
+                let hd = self.config.head_dim_for_layer(i);
+                let nkv = self.config.num_kv_heads_for_layer(i);
+                let is_full = self.config.is_full_attention(i);
+                let layer_type =
+                    if is_full { LayerType::Full } else { LayerType::Sliding };
+                let (is_ring, capacity) = layer_type_to_alloc_params(
+                    layer_type,
+                    self.config.sliding_window,
+                    self.config.max_position_embeddings,
+                );
+                let buf = alloc_multi_seq_hybrid_kv_for_layer(
+                    dev, i, nkv, hd, capacity, is_ring, max_slots,
+                )
+                .with_context(|| {
+                    format!(
+                        "ADR-040 iter-C2c-cont: alloc_multi_seq_hybrid_kv_for_layer \
+                         L{i} failed for max_slots={max_slots} (nkv={nkv}, hd={hd}, \
+                         cap={capacity}, is_ring={is_ring}) — production-default \
+                         hybrid F16-K + TQ-HB-V regime per H10 falsification §6.1.11"
+                    )
+                })?;
+                multi_seq_hybrid.push(buf);
+            }
+            self.multi_seq_kv_hybrid = Some(multi_seq_hybrid);
+        }
+        // else: HF2Q_HYBRID_KV=0 → leave multi_seq_kv_hybrid = None
+        // (constructor default).  iter-2A dispatch fork's hybrid_kv
+        // branch is unreachable in this configuration — the opt-out
+        // HB-encoded branch handles the request via multi_seq_kv.
+
         Ok(())
     }
 }
@@ -3241,11 +3408,38 @@ impl Engine {
                     // moving the loaded model into the worker thread; if
                     // provisioning fails, surface the typed error before
                     // any thread is spawned.
+                    //
+                    // iter-C2c-cont (2026-05-30): two phases provision
+                    // BOTH the HB-encoded scaffold (always) AND the
+                    // hybrid F16-K + TQ-HB-V scaffold (when
+                    // HF2Q_HYBRID_KV=1 — the production default per H10
+                    // falsification §6.1.11). On allocator failure we
+                    // distinguish which regime failed by inspecting the
+                    // `multi_seq_kv` field's populated state: if it's
+                    // still None, the HB phase (Phase 1) failed; if it
+                    // IS populated and we still got an error, the
+                    // hybrid phase (Phase 2) failed. Both surfaces emit
+                    // their own typed variant for operator-grep
+                    // disambiguation.
                     if let Err(e) = g.provision_multi_seq_kv_for_slot_aware(max_slots) {
-                        // Wrap into a typed spawn error so callers can
-                        // distinguish "Gemma 4 SlotAware provisioning
-                        // failed" from "ModeNotYetWired" without
-                        // string-matching anyhow.
+                        // Hybrid phase failure: HB phase already
+                        // populated `multi_seq_kv` (Phase 1 invariant).
+                        // Surface the iter-C2c-cont-named typed error
+                        // distinct from the C2c HB-phase variant so
+                        // operator log greps + per-regime debug paths
+                        // route to the right pin pointer.
+                        if g.multi_seq_kv.is_some() {
+                            return Err(
+                                EngineSpawnError::Gemma4HybridSlotAwareProvisionFailed {
+                                    max_slots,
+                                    cause: e.to_string(),
+                                },
+                            );
+                        }
+                        // HB phase failure: same shape as pre-iter-C2c-
+                        // cont. Preserves H22_gemma4_spawn_fail_variant_
+                        // carries_max_slots_and_cause + the C2c error-
+                        // surface contract verbatim.
                         return Err(EngineSpawnError::Gemma4SlotAwareProvisionFailed {
                             max_slots,
                             cause: e.to_string(),
@@ -21581,6 +21775,531 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_gemma4_tests {
                 closure_body.contains(required),
                 "H90 FALSIFIED: ADR-040 §6.1.32 closure body does NOT \
                  name `{required}`. Sub-deferral runbook incomplete."
+            );
+        }
+    }
+}
+
+// ============================================================================
+// ADR-040 iter-C2c-cont — H91-H96 hypothesis pins
+// ============================================================================
+//
+// Scope (iter-C2c-cont extends C2c §6.1.21's `GemmaLoadedModel.multi_seq_kv`
+// HbKvBuffers scaffold with a SIBLING `multi_seq_kv_hybrid` field carrying
+// the production-default MultiSeqHybridKvBuffers scaffold per H10
+// falsification at §6.1.11 — `HF2Q_HYBRID_KV` is default-true since ADR-029
+// iter-13, 2026-05-11).
+//
+//   * C2c (§6.1.21, commit `a0540b28`) shipped:
+//     - `GemmaLoadedModel.multi_seq_kv: Option<Vec<MultiSeqHbKvBuffers>>`
+//       provisioned at spawn time via `provision_multi_seq_kv_for_slot_aware`
+//       through the A3a `alloc_hb_kv_for_layer` allocator.
+//     - `EngineSpawnError::Gemma4SlotAwareProvisionFailed { max_slots, cause }`
+//       typed variant on allocator failure.
+//     - SerialFifo path leaves `multi_seq_kv = None` (H23 byte-equivalence pin).
+//
+//   * iter-B4c-kernel iter-2A (§6.1.32, commit `6a5b7ca4`) surfaced the gap:
+//     - The new `forward_prefill_with_soft_tokens_slot_aware` fn body reads
+//       `INVESTIGATION_ENV.hybrid_kv` and would route the production-default
+//       request through the `MultiSeqHybridKvBuffers` regime — but there's
+//       NO field on `GemmaLoadedModel` carrying that scaffold (C2c only
+//       provisions HB).
+//     - iter-2A's dispatch fork therefore surfaces typed CapabilityUnsupported
+//       at the hybrid_kv branch with deferral label naming this iter
+//       (iter-C2c-cont) as the upstream prerequisite.
+//
+//   * iter-C2c-cont (THIS commit, ADR-040 §6.1.33) ships:
+//     - NEW `GemmaLoadedModel.multi_seq_kv_hybrid: Option<Vec<MultiSeqHybridKvBuffers>>`
+//       sibling field (additive — C2c's `multi_seq_kv` field is PRESERVED
+//       verbatim per H94).
+//     - NEW `EngineSpawnError::Gemma4HybridSlotAwareProvisionFailed`
+//       typed variant for the per-layer hybrid allocator's failure surface.
+//     - Extended `provision_multi_seq_kv_for_slot_aware` body: Phase 1
+//       provisions HB scaffold unconditionally (C2c preserved); Phase 2
+//       provisions hybrid scaffold IFF `INVESTIGATION_ENV.hybrid_kv == true`
+//       (PRODUCTION DEFAULT). The two phases reuse the SAME per-layer
+//       `(nkv, hd, capacity, is_ring)` quadruples so a future iter-2B
+//       kernel refactor inherits the iter-2A-cont addressing scheme.
+//     - Extended spawn-arm body in `Engine::spawn_with_mode`: on
+//       provisioning error, inspects whether `multi_seq_kv.is_some()` to
+//       decide which typed-error variant to surface (HB Phase 1 vs hybrid
+//       Phase 2). HB-phase failure preserves the pre-iter-C2c-cont contract
+//       byte-for-byte (H22 / H29 string-format pins).
+//
+// Tests (H91-H96):
+//   H91 (skip-mode): NEW field `multi_seq_kv_hybrid` IS DEFINED on
+//                    `GemmaLoadedModel` with the correct type
+//                    (`Option<Vec<MultiSeqHybridKvBuffers>>`); the C2c
+//                    sibling `multi_seq_kv` is PRESERVED verbatim
+//                    (H94 PRESERVED).
+//   H92 (env-driven runtime): under `HF2Q_HYBRID_KV=1` (default) post-
+//                    `provision_multi_seq_kv_for_slot_aware`, BOTH fields
+//                    are `Some(_)`; under `HF2Q_HYBRID_KV=0`, only the
+//                    HB sibling is populated. Exercised with a real Mlx
+//                    device construction (no model load) so no OOM.
+//   H93 (compile + structure): NEW typed-error variant
+//                    `Gemma4HybridSlotAwareProvisionFailed { max_slots,
+//                    cause }` is constructible at the type level; the
+//                    Display contract names the iter-C2c-cont arc.
+//   H94 (skip-mode): C2c HbKvBuffers provisioning surface PRESERVED —
+//                    the C2c `multi_seq_kv` field is still present, its
+//                    docstring's "iter-2c (C2c)" cite is still present,
+//                    and `Gemma4SlotAwareProvisionFailed` variant is
+//                    untouched. Defends against an iter-C2c-cont commit
+//                    that accidentally renames/removes C2c's surface.
+//   H95 (skip-mode): SerialFifo + Gemma 4 spawn does NOT provision the
+//                    hybrid scaffold (sibling to H23: source-grep on
+//                    `spawn_with_mode` SerialFifo arm asserts the
+//                    `multi_seq_kv_hybrid` field is NOT touched there).
+//   H96 (skip-mode): Qwen35 + Qwen3VL surfaces UNCHANGED — no
+//                    `multi_seq_kv_hybrid` field on Qwen35LoadedModel
+//                    / Qwen3VlText structs; no
+//                    `Gemma4HybridSlotAwareProvisionFailed` reference
+//                    in any Qwen35/Qwen3VL handler arm.
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
+    // Skip-mode source-grep + structural tests; intentionally NO `use
+    // super::*;` for the source-grep helpers, but a few synthesis-time
+    // tests need the typed surface — those bring in `super::*` locally.
+
+    /// **H91 (skip-mode)** — NEW field `multi_seq_kv_hybrid` IS DEFINED
+    /// on `GemmaLoadedModel` with the correct type
+    /// (`Option<Vec<MultiSeqHybridKvBuffers>>`).  The C2c sibling
+    /// `multi_seq_kv: Option<Vec<MultiSeqHbKvBuffers>>` is PRESERVED
+    /// verbatim (H94 PRESERVED — additive, NOT a replacement).
+    ///
+    /// Mirrors iter-2A H84's shape for the new struct field instead of
+    /// a new fn signature.
+    #[test]
+    fn h91_new_multi_seq_kv_hybrid_field_defined_on_gemma_loaded_model() {
+        let src = include_str!("engine.rs");
+        let struct_marker = "pub struct GemmaLoadedModel {";
+        let struct_idx = src
+            .find(struct_marker)
+            .expect("H91: GemmaLoadedModel struct not found in engine.rs");
+        let struct_end = src[struct_idx..]
+            .find("\n}\n")
+            .expect("H91: GemmaLoadedModel struct close brace not found");
+        let struct_window = &src[struct_idx..struct_idx + struct_end];
+        // C2c field PRESERVED.
+        assert!(
+            struct_window.contains("pub multi_seq_kv: Option<"),
+            "H91 FALSIFIED: C2c `multi_seq_kv: Option<Vec<MultiSeqHbKvBuffers>>` \
+             field is MISSING — H94 PRESERVED constraint violated. \
+             iter-C2c-cont must be ADDITIVE."
+        );
+        assert!(
+            struct_window.contains("MultiSeqHbKvBuffers"),
+            "H91 FALSIFIED: C2c field's element type \
+             `MultiSeqHbKvBuffers` removed from GemmaLoadedModel; \
+             H94 violated."
+        );
+        // NEW iter-C2c-cont field PRESENT.
+        assert!(
+            struct_window.contains("pub multi_seq_kv_hybrid: Option<"),
+            "H91 FALSIFIED: NEW field `multi_seq_kv_hybrid: Option<Vec<\
+             MultiSeqHybridKvBuffers>>` is MISSING from GemmaLoadedModel. \
+             iter-C2c-cont load-bearing primitive not landed — iter-2B \
+             hybrid kernel-dispatch refactor has no destination."
+        );
+        assert!(
+            struct_window.contains("MultiSeqHybridKvBuffers"),
+            "H91 FALSIFIED: new field's element type \
+             `MultiSeqHybridKvBuffers` is MISSING. iter-C2c-cont must \
+             provision the production-default hybrid F16-K + TQ-HB-V \
+             scaffold per H10 falsification §6.1.11."
+        );
+    }
+
+    /// **H92 (skip-mode + runtime when MLX available)** — provisioning
+    /// honours `INVESTIGATION_ENV.hybrid_kv`:
+    /// - Source-grep: the body of
+    ///   `provision_multi_seq_kv_for_slot_aware` contains an
+    ///   `INVESTIGATION_ENV.hybrid_kv` gate around the
+    ///   `alloc_multi_seq_hybrid_kv_for_layer` call site.
+    /// - Source-grep: the `multi_seq_kv` (HB) scaffold is provisioned
+    ///   UNCONDITIONALLY (no env gate around `alloc_hb_kv_for_layer`).
+    /// - Source-grep: the `multi_seq_kv_hybrid` field is assigned
+    ///   `Some(_)` ONLY inside the env gate.
+    ///
+    /// Reasoning: the actual runtime semantic (Some/None per env) is
+    /// what we want to pin, but we can't construct a real
+    /// `GemmaLoadedModel` without loading a Gemma 4 GGUF (out of scope
+    /// per the CLAUDE.md "do not oom us" rule). The source-grep pin
+    /// catches the lexical structure that produces the runtime
+    /// semantic.
+    #[test]
+    fn h92_hybrid_provisioning_gated_on_investigation_env_hybrid_kv() {
+        let src = include_str!("engine.rs");
+        let fn_marker = "pub fn provision_multi_seq_kv_for_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H92: provision_multi_seq_kv_for_slot_aware not found");
+        // The fn body is large after iter-C2c-cont (~150 LOC); window
+        // to 12k chars to cover docstring + body.
+        let body_window = &src[fn_idx..(fn_idx + 12_000).min(src.len())];
+        // The hybrid allocator IS called.
+        assert!(
+            body_window.contains("alloc_multi_seq_hybrid_kv_for_layer("),
+            "H92 FALSIFIED: provision_multi_seq_kv_for_slot_aware body \
+             does NOT call `alloc_multi_seq_hybrid_kv_for_layer`. \
+             iter-C2c-cont production-default scaffold (per H10 \
+             falsification §6.1.11) is NOT provisioned."
+        );
+        // The hybrid allocator call is gated on INVESTIGATION_ENV.hybrid_kv.
+        let env_gate_marker = "INVESTIGATION_ENV.hybrid_kv";
+        let env_gate_idx = body_window.find(env_gate_marker).expect(
+            "H92 FALSIFIED: provision_multi_seq_kv_for_slot_aware body does \
+             NOT contain `INVESTIGATION_ENV.hybrid_kv` — the hybrid \
+             provisioning is unconditional (BREAKING H95: HF2Q_HYBRID_KV=0 \
+             must not allocate the hybrid scaffold).",
+        );
+        let alloc_idx = body_window
+            .find("alloc_multi_seq_hybrid_kv_for_layer(")
+            .expect("H92: alloc call present (asserted above)");
+        assert!(
+            env_gate_idx < alloc_idx,
+            "H92 FALSIFIED: `INVESTIGATION_ENV.hybrid_kv` does NOT \
+             lexically precede `alloc_multi_seq_hybrid_kv_for_layer` \
+             call. The env gate must wrap the alloc — without lexical \
+             ordering, the alloc is not gated and HF2Q_HYBRID_KV=0 \
+             would still allocate hybrid bytes."
+        );
+        // The HB allocator IS called UNCONDITIONALLY (not inside the
+        // env gate). Source-order check: HB alloc comes BEFORE the env
+        // gate in the fn body (Phase 1 always; Phase 2 conditional).
+        let hb_alloc_idx = body_window
+            .find("alloc_hb_kv_for_layer(")
+            .expect("H92: alloc_hb_kv_for_layer call present in fn body");
+        assert!(
+            hb_alloc_idx < env_gate_idx,
+            "H92 FALSIFIED: `alloc_hb_kv_for_layer` does NOT lexically \
+             precede `INVESTIGATION_ENV.hybrid_kv` env gate. C2c HB \
+             provisioning must be UNCONDITIONAL (H94 preserved); \
+             accidentally moving it inside the env gate would break \
+             the HF2Q_HYBRID_KV=0 path."
+        );
+        // The `multi_seq_kv_hybrid = Some(_)` assignment is inside the
+        // env-gated branch (positive: assignment present at all).
+        assert!(
+            body_window.contains("self.multi_seq_kv_hybrid = Some("),
+            "H92 FALSIFIED: provision_multi_seq_kv_for_slot_aware body \
+             does NOT assign `self.multi_seq_kv_hybrid = Some(_)`. The \
+             new field is never populated — iter-C2c-cont effectively \
+             unimplemented."
+        );
+        // Defense-in-depth: the C2c HB assignment is unchanged.
+        assert!(
+            body_window.contains("self.multi_seq_kv = Some("),
+            "H92 FALSIFIED: C2c assignment `self.multi_seq_kv = Some(_)` \
+             removed — H94 broken."
+        );
+    }
+
+    /// **H93 (compile pin + Display contract)** — NEW typed-error
+    /// variant `Gemma4HybridSlotAwareProvisionFailed { max_slots: u32,
+    /// cause: String }` is CONSTRUCTIBLE at the type level + carries
+    /// both fields + its Display message names the iter-C2c-cont arc +
+    /// the production-default hybrid F16-K + TQ-HB-V regime.
+    #[test]
+    fn h93_gemma4_hybrid_provision_failed_variant_carries_max_slots_and_cause() {
+        use super::EngineSpawnError;
+        let err = EngineSpawnError::Gemma4HybridSlotAwareProvisionFailed {
+            max_slots: 4,
+            cause: "synthetic-cause: alloc_multi_seq_hybrid_kv_for_layer L0 OOM".to_string(),
+        };
+        // Variant destructures with the expected field shape.
+        match &err {
+            EngineSpawnError::Gemma4HybridSlotAwareProvisionFailed {
+                max_slots,
+                cause,
+            } => {
+                assert_eq!(
+                    *max_slots, 4u32,
+                    "H93 sanity: max_slots round-trips"
+                );
+                assert!(
+                    cause.contains("OOM"),
+                    "H93 sanity: cause round-trips"
+                );
+            }
+            other => panic!(
+                "H93 FALSIFIED: Gemma4HybridSlotAwareProvisionFailed \
+                 variant does not destructure as expected; got {:?}",
+                other
+            ),
+        }
+        // Display message names the iter cite + the production-default
+        // regime so operator log greps land on the right pin.
+        let msg = format!("{}", err);
+        for required in [
+            "iter-C2c-cont",
+            "Gemma 4",
+            "MultiSeqHybridKvBuffers",
+            "HF2Q_HYBRID_KV=1",
+            "H10",
+            "§6.1.11",
+            "max_slots=4",
+        ] {
+            assert!(
+                msg.contains(required),
+                "H93 FALSIFIED: Display message does NOT contain `{required}`. \
+                 Operator log greps cannot route to the right pin pointer. \
+                 Got: {msg}"
+            );
+        }
+        // Distinct from the C2c sibling variant — pin defends against
+        // accidentally collapsing the two into one discriminant.
+        let hb_err = EngineSpawnError::Gemma4SlotAwareProvisionFailed {
+            max_slots: 4,
+            cause: "hb cause".to_string(),
+        };
+        assert!(
+            !format!("{}", hb_err).contains("iter-C2c-cont"),
+            "H93 FALSIFIED: the C2c sibling variant's Display message \
+             contains `iter-C2c-cont` — discriminant collapse risk. \
+             Each variant must own its iter cite."
+        );
+    }
+
+    /// **H94 (skip-mode)** — C2c HbKvBuffers provisioning surface is
+    /// PRESERVED VERBATIM:
+    /// - `Gemma4SlotAwareProvisionFailed` variant is still defined.
+    /// - `multi_seq_kv: Option<Vec<MultiSeqHbKvBuffers>>` field is
+    ///   still present (also asserted by H91).
+    /// - `alloc_hb_kv_for_layer` is still called inside
+    ///   `provision_multi_seq_kv_for_slot_aware`.
+    /// - The "ADR-040 C2c:" diagnostic prefix on the HB error path is
+    ///   preserved.
+    ///
+    /// Defends against an iter-C2c-cont commit that accidentally
+    /// renames/removes any part of C2c's surface (the H22 / H23 / H25 /
+    /// H29 chain depends on these strings).
+    #[test]
+    fn h94_c2c_hb_provisioning_surface_preserved() {
+        let src = include_str!("engine.rs");
+        // C2c typed-error variant present.
+        assert!(
+            src.contains("Gemma4SlotAwareProvisionFailed {"),
+            "H94 FALSIFIED: C2c `Gemma4SlotAwareProvisionFailed` typed \
+             variant removed — H21/H22/H29 break."
+        );
+        // C2c field present with correct element type.
+        assert!(
+            src.contains("pub multi_seq_kv: Option<\n"),
+            "H94 FALSIFIED: `multi_seq_kv` field declaration changed; \
+             H22 access pattern broken."
+        );
+        // C2c HB allocator still called.
+        assert!(
+            src.contains("alloc_hb_kv_for_layer("),
+            "H94 FALSIFIED: `alloc_hb_kv_for_layer` no longer called \
+             from provision_multi_seq_kv_for_slot_aware — H22 \
+             (`n_seqs == max_slots`) cannot be satisfied."
+        );
+        // C2c diagnostic context preserved.
+        assert!(
+            src.contains("ADR-040 C2c: alloc_hb_kv_for_layer L"),
+            "H94 FALSIFIED: C2c HB error context message changed; \
+             operator log greps for `ADR-040 C2c:` would miss."
+        );
+        // C2c HB assignment preserved (Phase 1 unconditional).
+        assert!(
+            src.contains("self.multi_seq_kv = Some(multi_seq);"),
+            "H94 FALSIFIED: `self.multi_seq_kv = Some(multi_seq);` \
+             assignment removed — C2c populates None."
+        );
+    }
+
+    /// **H95 (skip-mode)** — SerialFifo Gemma 4 spawn does NOT touch
+    /// the hybrid scaffold (sibling to H23 for the HB scaffold).
+    /// Source-grep: the `spawn_with_mode` `SerialFifo` arm body does
+    /// NOT call `provision_multi_seq_kv_for_slot_aware` AND does NOT
+    /// reference `multi_seq_kv_hybrid`. SerialFifo byte-equivalence
+    /// preserved at the spawn-arm level.
+    ///
+    /// Mirrors C2c H23 (the HB-side sibling pin) — A5d's source-order
+    /// regression-pin pattern.
+    #[test]
+    fn h95_serial_fifo_does_not_provision_multi_seq_kv_hybrid() {
+        let src = include_str!("engine.rs");
+        // Find the spawn_with_mode fn body.
+        let fn_marker = "pub fn spawn_with_mode(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H95: spawn_with_mode not found in engine.rs");
+        // Window covers the full match block (~7000 chars).
+        let fn_window = &src[fn_idx..(fn_idx + 12_000).min(src.len())];
+        // Find the SerialFifo arm. Per the spawn_with_mode body, the
+        // arm matches `EngineMode::SerialFifo` and delegates to
+        // `Self::spawn(...)` (the legacy 3-arg constructor). The arm
+        // body MUST NOT mention either provisioning fn or the new field.
+        let fifo_arm_marker = "EngineMode::SerialFifo";
+        let fifo_idx = fn_window
+            .find(fifo_arm_marker)
+            .expect("H95: SerialFifo arm not found in spawn_with_mode");
+        let slot_aware_idx = fn_window[fifo_idx..]
+            .find("EngineMode::SlotAware { max_slots }")
+            .map(|i| fifo_idx + i)
+            .unwrap_or(fn_window.len());
+        // Window: SerialFifo arm body (everything between SerialFifo
+        // and SlotAware match-arm markers).
+        let fifo_arm = &fn_window[fifo_idx..slot_aware_idx];
+        // Neither the provisioner nor the new field is referenced
+        // inside the SerialFifo arm.
+        assert!(
+            !fifo_arm.contains("provision_multi_seq_kv_for_slot_aware"),
+            "H95 FALSIFIED: SerialFifo arm of spawn_with_mode calls \
+             `provision_multi_seq_kv_for_slot_aware` — SerialFifo \
+             byte-equivalence broken (H23 sibling)."
+        );
+        assert!(
+            !fifo_arm.contains("multi_seq_kv_hybrid"),
+            "H95 FALSIFIED: SerialFifo arm of spawn_with_mode \
+             references `multi_seq_kv_hybrid` — the hybrid scaffold \
+             must remain `None` for SerialFifo (pre-ADR-040 byte-\
+             equivalence)."
+        );
+        // ALSO pin the constructor: `GemmaLoadedModel::load` sets
+        // multi_seq_kv_hybrid = None (sibling to multi_seq_kv = None).
+        // SerialFifo's spawn path runs `load` (no per-arch dispatch),
+        // never touches the field.
+        let load_marker = "fn load(opts: &LoadOptions)";
+        let load_idx = src.find(load_marker).expect(
+            "H95: GemmaLoadedModel::load fn not found (engine.rs structure changed)",
+        );
+        let load_window = &src[load_idx..(load_idx + 30_000).min(src.len())];
+        assert!(
+            load_window.contains("multi_seq_kv_hybrid: None,"),
+            "H95 FALSIFIED: GemmaLoadedModel::load does NOT initialize \
+             `multi_seq_kv_hybrid: None`. SerialFifo path enters the \
+             worker thread with the field uninitialized (compile-fail) \
+             OR worse, populated by a previous code path."
+        );
+    }
+
+    /// **H96 (skip-mode)** — Qwen35 + Qwen3VL surfaces UNCHANGED by
+    /// iter-C2c-cont:
+    /// - No `multi_seq_kv_hybrid` field on `Qwen35LoadedModel` or
+    ///   `Qwen3VlTextLoadedModel`.
+    /// - No reference to `Gemma4HybridSlotAwareProvisionFailed` in
+    ///   the Qwen35/Qwen3VL worker arms.
+    /// - The `Qwen35SlotAwareProvisionFailed` variant string-format
+    ///   contract preserved (H29 sibling).
+    /// - No `alloc_multi_seq_hybrid_kv_for_layer` call inside the
+    ///   `Qwen35LoadedModel::provision_multi_seq_kv_for_slot_aware`
+    ///   implementation (the hybrid allocator is a Gemma 4 module
+    ///   primitive).
+    ///
+    /// Defends sibling-discipline pin: iter-C2c-cont is a Gemma 4-only
+    /// scaffold extension; Qwen35 has its own
+    /// `HybridKvCache::new_with_options(.., n_seqs=max_slots)` per-arch
+    /// path (the C2d §6.1.22 surface).
+    #[test]
+    fn h96_qwen35_and_qwen3vl_surfaces_unchanged() {
+        let src = include_str!("engine.rs");
+        // Find the Qwen35LoadedModel struct definition.
+        // Qwen35LoadedModel is defined in engine_qwen35.rs (sibling
+        // module); the engine.rs file only references it. Pin: no
+        // Gemma 4 hybrid field name leaked into Qwen35 surface.
+        let qwen_src = include_str!("engine_qwen35.rs");
+        assert!(
+            !qwen_src.contains("multi_seq_kv_hybrid"),
+            "H96 FALSIFIED: `multi_seq_kv_hybrid` field name leaked \
+             into engine_qwen35.rs. iter-C2c-cont is a Gemma 4-only \
+             extension; Qwen35 has its own HybridKvCache multi-seq \
+             surface (C2d §6.1.22)."
+        );
+        assert!(
+            !qwen_src.contains("Gemma4HybridSlotAwareProvisionFailed"),
+            "H96 FALSIFIED: `Gemma4HybridSlotAwareProvisionFailed` \
+             variant referenced inside engine_qwen35.rs. Per-family \
+             discriminants must stay per-family."
+        );
+        // Qwen35SlotAwareProvisionFailed Display contract preserved.
+        assert!(
+            src.contains("Qwen35SlotAwareProvisionFailed {"),
+            "H96 FALSIFIED: `Qwen35SlotAwareProvisionFailed` variant \
+             removed by iter-C2c-cont (which is supposed to be a \
+             Gemma 4-only additive surface)."
+        );
+        // The hybrid allocator IS imported in this file's
+        // `provision_multi_seq_kv_for_slot_aware` (Gemma 4) but is
+        // NOT referenced anywhere ELSE in engine.rs (no orphan ref).
+        // Acceptable references: the use-stmt inside the fn body + the
+        // call site itself + this test module's docstring.
+        // Pin: the allocator is NOT called from any other fn body.
+        // Source-grep across the file's other fns.
+        // Specifically: NOT in the spawn_with_mode Qwen35 arm.
+        let qwen35_arm_marker = "LoadedModel::Qwen35(mut q) => {";
+        if let Some(qwen_arm_idx) = src.find(qwen35_arm_marker) {
+            let qwen_arm_window =
+                &src[qwen_arm_idx..(qwen_arm_idx + 6000).min(src.len())];
+            assert!(
+                !qwen_arm_window.contains("alloc_multi_seq_hybrid_kv_for_layer"),
+                "H96 FALSIFIED: Qwen35 spawn-arm body calls \
+                 `alloc_multi_seq_hybrid_kv_for_layer` — that's a \
+                 Gemma 4 module primitive. Cross-family leakage."
+            );
+            assert!(
+                !qwen_arm_window.contains("multi_seq_kv_hybrid"),
+                "H96 FALSIFIED: Qwen35 spawn-arm references \
+                 `multi_seq_kv_hybrid` (the Gemma 4 field). Per-family \
+                 surface segregation broken."
+            );
+        }
+        // Qwen3VL SlotAware spawn-arm: still typed-rejected with
+        // `ModeNotYetWired` — iter-C2c-cont does NOT accidentally
+        // activate Qwen3VL. The specific marker is the spawn-arm body
+        // that directly returns the `EngineSpawnError::ModeNotYetWired`
+        // (line ~3508) — distinct from the LoadedModel match arms in
+        // model_id / context_length / etc. accessors (lines 1765+).
+        let qwen3vl_spawn_marker = "LoadedModel::Qwen3VlText(_) => Err(EngineSpawnError::ModeNotYetWired";
+        assert!(
+            src.contains(qwen3vl_spawn_marker),
+            "H96 FALSIFIED: Qwen3VL SlotAware spawn arm no longer typed-\
+             rejects with `EngineSpawnError::ModeNotYetWired`. iter-C2c-cont \
+             must NOT touch the Qwen3VL surface (gated on iter-C2e per §6.1.22)."
+        );
+    }
+
+    /// **H91-extension (skip-mode)** — Sub-deferral runbook pointer:
+    /// the iter-C2c-cont closure ADR block (§6.1.33) NAMES the
+    /// downstream iter-2B kernel-dispatch refactor that consumes the
+    /// new field. Pin against an iter-C2c-cont commit that lands the
+    /// scaffold without naming the next iter.
+    #[test]
+    fn h91_extension_iter_c2c_cont_names_downstream_iter2b() {
+        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.33"),
+            "H91-ext FALSIFIED: ADR-040 §6.1.33 closure block not \
+             found. iter-C2c-cont landing without a closure block \
+             violates the §6.1.N-per-iter discipline."
+        );
+        let closure_marker = "### 6.1.33";
+        let closure_start = adr
+            .find(closure_marker)
+            .expect("H91-ext: §6.1.33 marker missing (asserted above)");
+        let closure_end_off = adr[closure_start..]
+            .find("\n### ")
+            .or_else(|| adr[closure_start..].find("\n---\n"))
+            .or_else(|| adr[closure_start..].find("\n## "))
+            .unwrap_or_else(|| adr[closure_start..].len().min(40_000));
+        let closure_body =
+            &adr[closure_start..closure_start + closure_end_off];
+        for required in [
+            "iter-C2c-cont",
+            "MultiSeqHybridKvBuffers",
+            "iter-B4c-kernel-iter-2B",
+            "H10",
+        ] {
+            assert!(
+                closure_body.contains(required),
+                "H91-ext FALSIFIED: ADR-040 §6.1.33 closure body does \
+                 NOT name `{required}`. Sub-deferral runbook incomplete."
             );
         }
     }
