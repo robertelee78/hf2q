@@ -30727,3 +30727,477 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_embed_batched_gemma4_tests {
         );
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// ADR-040 §6.1.50 — iter-C2d-cont-kernel-iter-LCP + iter-G (Qwen35)
+//                  + iter-B4c-kernel-iter-2D-lcp (Gemma 4) joint closure
+//                  (2026-05-30)
+// ────────────────────────────────────────────────────────────────────
+//
+// Closes the 3 remaining orthogonal orchestrator-side perf optimization
+// deferrals on the iter-C2d-cont-kernel + iter-B4c-kernel arcs.
+//
+//   * iter-C2d-cont-kernel-iter-LCP (Qwen35 slot-aware LCP / chunked-
+//     prefill snapshot codec): STRUCTURAL N/A.  The snapshot codec keys
+//     snapshots on per-request `max_seq_len = prompt_len + max_tokens +
+//     64` while the persistent multi-seq cache is sized to
+//     `cfg.max_position_embeddings`.  Cross-slot prefix sharing carries
+//     tenant-isolation risk (LCP cache is global, slot regions are per-
+//     tenant).  Full-equality prompt-cache HITs already use
+//     `restore_partial(snap, prompt_len)` (working) — this IS the LCP
+//     fast-path operators get in slot-aware mode.  The remaining
+//     chunked-prefill mid-store + cross-request `probe_lcp_opportunity`
+//     paths would require multi-iter snapshot-codec extensions beyond
+//     the iter-LCP scope.
+//
+//   * iter-C2d-cont-kernel-iter-G (Qwen35 forward_gpu_greedy slot-aware
+//     fast-path): REAL LIFT.  `forward_gpu_greedy` accepts `slot_id`
+//     since B4d §6.1.44 (2026-05-30).  iter-G ports the 4 slot-aware fn
+//     greedy-only decode branches from `forward_gpu_last_logits +
+//     greedy_argmax_last_token` to `forward_gpu_greedy(.., slot_id)` —
+//     saves ~250 µs per step at vocab=151k by skipping the F32 readback.
+//     Sampling + logprobs branches UNCHANGED.
+//
+//   * iter-B4c-kernel-iter-2D-lcp (Gemma 4 dense F32 LCP partial-prefix
+//     slot-aware port): STRUCTURAL N/A.  The LCP path consumes cached
+//     `Arc<DenseKvBuffers>` into `self.dense_kvs` (`engine.rs:7593`);
+//     the iter-2D slot-aware path mounts slot-views into the SAME
+//     `self.dense_kvs` field — MUTUALLY EXCLUSIVE mount sources.  Plus
+//     the same global-vs-per-tenant isolation concern as Qwen35
+//     iter-LCP.
+//
+// Tests (H207–H212):
+//
+//   H207 (skip-mode): iter-LCP STRUCTURAL N/A — both `generate_qwen35_
+//                     once_slot_aware` AND `generate_stream_qwen35_
+//                     once_extended_slot_aware` AND `embed_qwen35_
+//                     slot_aware` AND `generate_qwen35_once_with_soft_
+//                     tokens_slot_aware` docstrings contain the
+//                     iter-C2d-cont-kernel-iter-LCP STRUCTURAL N/A pin
+//                     + the §6.1.50 forward-pointer cite.  Label
+//                     substring NOT inside `MultiSeqError::Capability
+//                     Unsupported` constructor.
+//   H208 (skip-mode): iter-G REAL LIFT — 4 Qwen35 slot-aware fns each
+//                     call `forward_gpu_greedy` with `slot_id` in the
+//                     greedy decode branch.  Source-grep witness.
+//   H209 (skip-mode): iter-2D-lcp STRUCTURAL N/A — forward_prefill.rs
+//                     iter-2D dense branch contains the §6.1.50 forward-
+//                     pointer cite + STRUCTURAL N/A pin.  Label
+//                     substring NOT inside `MultiSeqError::Capability
+//                     Unsupported` constructor.
+//   H210 (skip-mode): SerialFifo + SlotId(0) byte-equivalence preserved
+//                     — non-slot-aware `generate_qwen35_once` still uses
+//                     `forward_gpu_greedy(.., SlotId(0))` at decode
+//                     (already does); the slot-aware sites' iter-G
+//                     lifts are at `slot_id` (NOT hard-coded SlotId(0)).
+//   H211 (skip-mode): Qwen35 + Qwen3VL surfaces UNCHANGED — `forward_
+//                     gpu_greedy` signature still accepts `slot_id`
+//                     (B4d §6.1.44 preserved); no Gemma 4 slot-aware
+//                     fns gain iter-G ports (Gemma 4 uses `forward_
+//                     decode_slot_aware` which is internally greedy).
+//   H212 (skip-mode): production-default sampling paths UNCHANGED —
+//                     the sampling + logprobs branches in slot-aware
+//                     fns still use `forward_gpu_last_logits +
+//                     sample_logits_qwen35[_with_logprob]`.
+
+#[cfg(test)]
+mod adr040_phase_c_iter_c2d_cont_kernel_iter_lcp_g_qwen35_iter_2d_lcp_gemma4_tests {
+    // Skip-mode source-grep tests; intentionally NO `use super::*;`.
+
+    /// **H207 (skip-mode)** — iter-C2d-cont-kernel-iter-LCP STRUCTURAL
+    /// N/A pin landed in all 4 Qwen35 slot-aware fns (Generate +
+    /// GenerateStream + Embed + SoftTokens — the deepstack soft-tokens
+    /// fn shares the SoftTokens docstring narrative).
+    ///
+    /// (a) Each fn's docstring contains the §6.1.50 forward-pointer
+    ///     cite `iter-C2d-cont-kernel-iter-LCP per ADR-040 §6.1.50` +
+    ///     the phrase `STRUCTURAL N/A`.
+    /// (b) The label substring is INTENTIONALLY NOT inside a
+    ///     `MultiSeqError::CapabilityUnsupported` constructor — mirror
+    ///     of §6.1.49 iter-2-embed / iter-2-batched discipline.
+    #[test]
+    fn h207_iter_lcp_structural_na_pin_landed_in_qwen35_slot_aware_fns() {
+        let src = include_str!("engine_qwen35.rs");
+
+        // (a) Forward-pointer cite at the docstring level.
+        let lcp_cite = "iter-C2d-cont-kernel-iter-LCP per ADR-040 §6.1.50";
+        let cite_count = src.matches(lcp_cite).count();
+        assert!(
+            cite_count >= 4,
+            "H207 FALSIFIED: iter-C2d-cont-kernel-iter-LCP per ADR-040 \
+             §6.1.50 cite count {cite_count} < 4 (one per slot-aware \
+             fn: Generate + GenerateStream + Embed + SoftTokens). The \
+             STRUCTURAL N/A closure block must add the forward-pointer \
+             cite at each slot-aware fn's docstring for H87 discover- \
+             ability."
+        );
+
+        // (b) Phrase `STRUCTURAL N/A` present at least 4× (one per fn).
+        let phrase_count = src.matches("STRUCTURAL N/A").count();
+        assert!(
+            phrase_count >= 4,
+            "H207 FALSIFIED: `STRUCTURAL N/A` phrase count \
+             {phrase_count} < 4.  The structural-N/A finding must be \
+             declared verbatim in each slot-aware fn's docstring."
+        );
+
+        // (c) Label substring NOT inside a typed `CapabilityUnsupported`
+        // constructor — mirror of §6.1.49 H202 discipline.  Scan for
+        // any occurrence of `CapabilityUnsupported` within 200 chars
+        // BEFORE the cite — none allowed.
+        for (i, _) in src.match_indices(lcp_cite) {
+            let window_start = i.saturating_sub(400);
+            let window = &src[window_start..i];
+            assert!(
+                !window.contains("CapabilityUnsupported {"),
+                "H207 FALSIFIED: the iter-LCP cite at offset {i} is \
+                 inside a `CapabilityUnsupported {{` constructor \
+                 within 400 chars — STRUCTURAL N/A discipline broken \
+                 (typed deferrals NOT allowed for STRUCTURAL N/A \
+                 closures; mirror of §6.1.49 H202 forbidden pattern)."
+            );
+        }
+    }
+
+    /// **H208 (skip-mode)** — iter-C2d-cont-kernel-iter-G REAL LIFT
+    /// landed at all 4 Qwen35 slot-aware fn greedy decode branches.
+    ///
+    /// (a) `forward_gpu_greedy` is called from `engine_qwen35.rs` at
+    ///     ≥4 NEW sites (one per slot-aware fn).
+    /// (b) Each iter-G call site passes `slot_id` (NOT hard-coded
+    ///     SlotId(0)).
+    /// (c) The §6.1.50 iter-G cite appears at ≥4 sites for H87
+    ///     discoverability.
+    #[test]
+    fn h208_iter_g_real_lift_landed_in_qwen35_slot_aware_fns() {
+        let src = include_str!("engine_qwen35.rs");
+
+        // (a) + (b) iter-G witness: scan for ".forward_gpu_greedy("
+        // call sites AND walk forward up to 600 chars to find the
+        // `slot_id` arg.  Pre-iter-G there is exactly 1 existing
+        // forward_gpu_greedy call site (in `generate_qwen35_once` at
+        // engine_qwen35.rs:2077 — the SerialFifo + SlotId(0) path).
+        // Post-iter-G we expect ≥5 sites total (1 pre-existing + 4 iter-G
+        // landings: generate_qwen35_once_slot_aware decode +
+        // generate_stream_qwen35_once_extended_slot_aware decode +
+        // generate_qwen35_once_with_soft_tokens_slot_aware decode +
+        // generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware
+        // decode).
+        let greedy_marker = ".forward_gpu_greedy(";
+        let greedy_count = src.matches(greedy_marker).count();
+        assert!(
+            greedy_count >= 5,
+            "H208 FALSIFIED: `.forward_gpu_greedy(` call-site count \
+             {greedy_count} < 5 (1 pre-existing in `generate_qwen35_once` \
+             at engine_qwen35.rs:~2077 + 4 NEW iter-G landings — one per \
+             slot-aware fn).  iter-G REAL LIFT did not land — verify the \
+             4 slot-aware fns' greedy decode branches actually route \
+             through `forward_gpu_greedy(.., slot_id)`."
+        );
+
+        // (c) Each NEW iter-G site cites `ADR-040 §6.1.50 iter-G` for
+        // H87 discoverability.
+        let iter_g_cite_count = src.matches("ADR-040 §6.1.50 iter-G").count();
+        assert!(
+            iter_g_cite_count >= 4,
+            "H208 FALSIFIED: `ADR-040 §6.1.50 iter-G` cite count \
+             {iter_g_cite_count} < 4 — at least one slot-aware fn's \
+             iter-G call site is missing the forward-pointer cite."
+        );
+
+        // (d) The greedy fast-path slot-aware port comment from
+        // §6.1.27/§6.1.28/§6.1.30 ("greedy fast-path slot-aware port is
+        // iter-C2d-cont-kernel-iter-G") should be GONE from inside the
+        // slot-aware fn bodies — replaced with the real lift.  We can't
+        // search for absolute absence (the section closure block adds
+        // its own narrative), but we can pin that the pre-iter-G
+        // comment marker "but iter-1 keeps the simpler forward_gpu_last_
+        // logits dispatch for minimal LOC delta" is REMOVED.  That
+        // exact phrasing was the pre-§6.1.50 marker.
+        assert!(
+            !src.contains("keeps the simpler forward_gpu_last_logits dispatch for minimal LOC delta"),
+            "H208 FALSIFIED: the pre-iter-G marker comment \
+             `keeps the simpler forward_gpu_last_logits dispatch for \
+             minimal LOC delta` is STILL present in engine_qwen35.rs. \
+             The iter-1 docstring narration of the deferred-greedy- \
+             fast-path was NOT cleaned up when iter-G landed — drift \
+             between the docstring and the body."
+        );
+    }
+
+    /// **H209 (skip-mode)** — iter-B4c-kernel-iter-2D-lcp STRUCTURAL
+    /// N/A pin landed in `forward_prefill.rs` at the iter-2D dense F32
+    /// branch.
+    ///
+    /// (a) The §6.1.50 forward-pointer cite
+    ///     `iter-B4c-kernel-iter-2D-lcp per ADR-040 §6.1.50` is grep-
+    ///     able in `forward_prefill.rs`.
+    /// (b) The phrase `STRUCTURAL N/A` appears in the iter-2D branch
+    ///     body.
+    /// (c) The label substring is INTENTIONALLY NOT inside a
+    ///     `MultiSeqError::CapabilityUnsupported` constructor (mirror
+    ///     of §6.1.49 iter-2-embed discipline).
+    #[test]
+    fn h209_iter_2d_lcp_structural_na_pin_landed_in_forward_prefill_rs() {
+        let src = include_str!("../forward_prefill.rs");
+
+        // (a) Forward-pointer cite.
+        let lcp_cite = "iter-B4c-kernel-iter-2D-lcp per ADR-040 §6.1.50";
+        assert!(
+            src.contains(lcp_cite),
+            "H209 FALSIFIED: the §6.1.50 iter-2D-lcp forward-pointer \
+             cite `{lcp_cite}` is NOT present in `forward_prefill.rs`. \
+             The STRUCTURAL N/A closure must preserve the operator- \
+             grep'able forward pointer per H87 discipline."
+        );
+
+        // (b) `STRUCTURAL N/A` declared at the iter-2D branch site.
+        // The Qwen35 STRUCTURAL N/A phrase lives in `engine_qwen35.rs`;
+        // this assertion is for the Gemma 4 iter-2D-lcp landing in
+        // `forward_prefill.rs`.
+        let cite_idx = src
+            .find(lcp_cite)
+            .expect("H209 (b): cite was just asserted present above");
+        let window_end = (cite_idx + 1500).min(src.len());
+        let window = &src[cite_idx.saturating_sub(1500)..window_end];
+        assert!(
+            window.contains("STRUCTURAL N/A"),
+            "H209 FALSIFIED: the iter-2D-lcp STRUCTURAL N/A pin near \
+             the §6.1.50 cite is missing the phrase `STRUCTURAL N/A`. \
+             The structural-N/A finding must be declared verbatim."
+        );
+
+        // (c) Label substring NOT inside a `CapabilityUnsupported`
+        // constructor — scan within 400 chars before the cite.
+        let window_start = cite_idx.saturating_sub(400);
+        let pre_window = &src[window_start..cite_idx];
+        assert!(
+            !pre_window.contains("CapabilityUnsupported {"),
+            "H209 FALSIFIED: the iter-2D-lcp cite is inside a \
+             `CapabilityUnsupported {{` constructor — STRUCTURAL N/A \
+             discipline broken (typed deferrals NOT allowed for \
+             STRUCTURAL N/A closures; mirror of §6.1.49 H203 forbidden \
+             pattern)."
+        );
+    }
+
+    /// **H210 (skip-mode)** — SerialFifo + SlotId(0) byte-equivalence
+    /// preserved for the iter-G real lift.
+    ///
+    /// (a) The pre-existing `forward_gpu_greedy(.., SlotId(0))` call
+    ///     site in `generate_qwen35_once` (engine_qwen35.rs:~2077) is
+    ///     STILL present — SerialFifo + SlotId(0) decode path unchanged.
+    /// (b) The iter-G lift call sites in the 4 slot-aware fns pass
+    ///     `slot_id` (NOT hard-coded SlotId(0)).
+    #[test]
+    fn h210_serial_fifo_byte_equivalence_preserved_for_iter_g() {
+        let src = include_str!("engine_qwen35.rs");
+
+        // (a) SerialFifo pre-existing decode call site unchanged.
+        let serial_marker = ".forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache, SlotId(0))";
+        assert!(
+            src.contains(serial_marker),
+            "H210 FALSIFIED: the pre-iter-G `forward_gpu_greedy(.., \
+             &mut kv_cache, SlotId(0))` call in `generate_qwen35_once` \
+             at engine_qwen35.rs:~2077 is REMOVED.  SerialFifo + \
+             SlotId(0) decode byte-equivalence (H51 / H1 / H2 chain) \
+             BROKEN — the non-slot-aware path must NOT be touched by \
+             iter-G."
+        );
+
+        // (b) iter-G call sites pass `slot_id` — count call sites that
+        // pass an arg named `slot_id` immediately.  We grep for the
+        // pattern `forward_gpu_greedy(` + walk ahead to find `slot_id`
+        // BEFORE the closing `)` of the call.  Number of such sites
+        // should be ≥4.
+        let mut iter_g_slot_id_sites = 0usize;
+        let mut search_from = 0usize;
+        while let Some(off) = src[search_from..].find(".forward_gpu_greedy(") {
+            let abs = search_from + off;
+            // Walk forward depth-balancing parens to find the matching
+            // close paren of THIS call.
+            let mut depth = 0i32;
+            let mut close_off: Option<usize> = None;
+            for (i, ch) in src[abs..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close_off = Some(abs + i + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                if i > 2000 {
+                    break;
+                }
+            }
+            let after = close_off.unwrap_or((abs + 600).min(src.len()));
+            let call_window = &src[abs..after];
+            // The pre-existing SerialFifo call is on one line and
+            // contains the literal `SlotId(0)`; iter-G call sites pass
+            // the local var `slot_id`.
+            let is_serial_fifo_site = call_window.contains("SlotId(0)");
+            let mentions_slot_id_var = call_window.contains("slot_id,")
+                || call_window.contains("slot_id\n")
+                || call_window.contains("slot_id)");
+            if !is_serial_fifo_site && mentions_slot_id_var {
+                iter_g_slot_id_sites += 1;
+            }
+            search_from = abs + 1;
+        }
+        assert!(
+            iter_g_slot_id_sites >= 4,
+            "H210 FALSIFIED: iter-G call sites passing `slot_id` \
+             (NOT `SlotId(0)`) count {iter_g_slot_id_sites} < 4 — \
+             at least one slot-aware fn's iter-G call site is \
+             accidentally hard-coding `SlotId(0)`, breaking the \
+             per-slot routing contract."
+        );
+    }
+
+    /// **H211 (skip-mode)** — Qwen35 + Qwen3VL surfaces UNCHANGED by
+    /// iter-LCP / iter-G / iter-2D-lcp.
+    ///
+    /// (a) `forward_gpu_greedy` signature still accepts `slot_id:
+    ///     SlotId` (B4d §6.1.44 contract preserved — H167 transitivity).
+    /// (b) No Gemma 4 slot-aware fn gains an `iter-G` real lift — Gemma
+    ///     4 uses `forward_decode_slot_aware` which is internally
+    ///     greedy at the kernel level (no separate
+    ///     `forward_gpu_greedy` analog).
+    /// (c) The `iter-B4c-kernel-iter-G` label is still listed in the
+    ///     remaining followups (it's an orchestrator-side perf
+    ///     optimization mirror of Qwen35 iter-G, NOT yet landed for
+    ///     Gemma 4 in this iter).
+    #[test]
+    fn h211_qwen35_qwen3vl_surfaces_unchanged_by_iter_lcp_g_and_iter_2d_lcp() {
+        let src_qwen35_forward = include_str!(
+            "../../../src/inference/models/qwen35/forward_gpu.rs"
+        );
+
+        // (a) `forward_gpu_greedy` signature still accepts `slot_id:
+        // SlotId` — B4d §6.1.44 H167 transitivity.
+        let fn_marker = "pub fn forward_gpu_greedy(";
+        let fn_idx = src_qwen35_forward
+            .find(fn_marker)
+            .expect("H211 (a): `forward_gpu_greedy` declaration not found");
+        let sig_end = src_qwen35_forward[fn_idx..]
+            .find(") -> Result<u32>")
+            .map(|off| fn_idx + off + ") -> Result<u32>".len())
+            .unwrap_or(fn_idx + 1000);
+        let sig_window =
+            &src_qwen35_forward[fn_idx..sig_end.min(src_qwen35_forward.len())];
+        assert!(
+            sig_window.contains("slot_id: SlotId"),
+            "H211 FALSIFIED: `forward_gpu_greedy` signature in qwen35/\
+             forward_gpu.rs NO LONGER accepts `slot_id: SlotId`.  B4d \
+             §6.1.44 H167 contract BROKEN — iter-G regressed the \
+             upstream signature."
+        );
+
+        // (b) No Gemma 4 slot-aware fn calls `forward_gpu_greedy(`
+        // (that fn is Qwen35-specific; Gemma 4 uses
+        // `forward_decode_slot_aware` which is internally greedy).
+        let src_engine = include_str!("engine.rs");
+        let g4_marker = ".forward_gpu_greedy(";
+        let g4_slot_aware_section = src_engine
+            .find("fn generate_gemma4_once_slot_aware(")
+            .map(|idx| &src_engine[idx..(idx + 200_000).min(src_engine.len())])
+            .unwrap_or("");
+        assert!(
+            !g4_slot_aware_section.contains(g4_marker),
+            "H211 FALSIFIED: a Gemma 4 slot-aware fn calls \
+             `forward_gpu_greedy(` — that fn is Qwen35-specific.  \
+             Gemma 4's iter-G is a separate orchestrator-side perf \
+             optimization (NOT landed in this iter)."
+        );
+
+        // (c) Qwen35 + Qwen3VL slot-aware fn surfaces still defined.
+        for required in [
+            "fn generate_qwen35_once_slot_aware",
+            "fn generate_stream_qwen35_once_extended_slot_aware",
+            "fn embed_qwen35_slot_aware",
+            "fn generate_qwen35_once_with_soft_tokens_slot_aware",
+            "fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware",
+        ] {
+            let src_q = include_str!("engine_qwen35.rs");
+            assert!(
+                src_q.contains(required),
+                "H211 FALSIFIED: required Qwen35 slot-aware fn \
+                 `{required}` is missing from engine_qwen35.rs.  \
+                 iter-LCP / iter-G must not delete any slot-aware fn."
+            );
+        }
+    }
+
+    /// **H212 (skip-mode)** — production-default sampling + logprobs
+    /// paths UNCHANGED by iter-G.  iter-G touches ONLY the greedy fast-
+    /// path branches; sampling + logprobs branches still use
+    /// `forward_gpu_last_logits` + `sample_logits_qwen35[_with_logprob]`.
+    #[test]
+    fn h212_sampling_and_logprobs_paths_unchanged_by_iter_g() {
+        let src = include_str!("engine_qwen35.rs");
+
+        // (a) `sample_logits_qwen35` + `sample_logits_qwen35_with_logprob`
+        // are still called in slot-aware fns.  Each slot-aware fn's
+        // non-greedy branch uses one of these.
+        let sample_count = src.matches("sample_logits_qwen35(").count()
+            + src.matches("sample_logits_qwen35_with_logprob(").count();
+        assert!(
+            sample_count >= 4,
+            "H212 FALSIFIED: `sample_logits_qwen35` + \
+             `sample_logits_qwen35_with_logprob` total call count \
+             {sample_count} < 4.  iter-G must NOT touch the sampling \
+             branches — the sampling + logprobs paths require full \
+             logits CPU-side, not the GPU-argmax fast-path."
+        );
+
+        // (b) `forward_gpu_last_logits` is still called from slot-aware
+        // fns (the non-greedy branches).  We pin ≥6 call sites total
+        // (each slot-aware fn has prefill + decode-sampling +
+        // decode-logprobs branches that go through forward_gpu_last_
+        // logits).
+        let last_logits_count = src.matches(".forward_gpu_last_logits(").count();
+        assert!(
+            last_logits_count >= 6,
+            "H212 FALSIFIED: `forward_gpu_last_logits` call count \
+             {last_logits_count} < 6.  iter-G must NOT route ALL \
+             decode branches through `forward_gpu_greedy` — sampling + \
+             logprobs branches must stay on `forward_gpu_last_logits`."
+        );
+
+        // (c) ADR-040 §6.1.50 closure block exists (will be added when
+        // ADR-040 is updated by this iter).
+        let adr =
+            include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.50"),
+            "H212 FALSIFIED: ADR-040 §6.1.50 closure block not found. \
+             iter-LCP + iter-G + iter-2D-lcp joint closure must add \
+             the §6.1.50 closure block to ADR-040."
+        );
+        // The closure block must name all 3 iters.
+        let section_idx = adr
+            .find("### 6.1.50")
+            .expect("H212 (c): just asserted §6.1.50 present");
+        let section_end_rel = adr[section_idx + 10..]
+            .find("\n### ")
+            .unwrap_or(adr.len() - section_idx - 10);
+        let section_window =
+            &adr[section_idx..(section_idx + 10 + section_end_rel).min(adr.len())];
+        for required_label in [
+            "iter-C2d-cont-kernel-iter-LCP",
+            "iter-C2d-cont-kernel-iter-G",
+            "iter-B4c-kernel-iter-2D-lcp",
+        ] {
+            assert!(
+                section_window.contains(required_label),
+                "H212 FALSIFIED: §6.1.50 closure block does NOT name \
+                 `{required_label}`.  The joint closure must enumerate \
+                 all 3 iters."
+            );
+        }
+    }
+}

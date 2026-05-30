@@ -2213,23 +2213,46 @@ pub fn generate_qwen35_once(
 ///
 /// **Co-changes** (iter-1 deliberately minimal):
 /// - Per-slot LCP / mid-prefill checkpoint storage is DISABLED in
-///   slot-aware mode (the snapshot codec keys on the per-request
-///   `max_seq_len`; persistent-cache snapshots would carry different
-///   byte sizes and break the across-request LCP probe). The fast path
-///   on this site is the fresh-prefill path; LCP slot-aware codec is
-///   pinned as **iter-C2d-cont-kernel-iter-LCP** in §6.1.27.
+///   slot-aware mode.  ADR-040 §6.1.50 (2026-05-30) closes
+///   **iter-C2d-cont-kernel-iter-LCP per ADR-040 §6.1.50** as
+///   **STRUCTURAL N/A**: the snapshot codec keys snapshots on per-
+///   request `max_seq_len = prompt_len + max_tokens + 64` while the
+///   persistent multi-seq cache is sized to
+///   `cfg.max_position_embeddings`; cross-slot prefix sharing also
+///   carries tenant-isolation risk (LCP cache is global, slot regions
+///   are per-tenant).  The full-prompt-cache HIT fast-path already uses
+///   `restore_partial` (working at line ~2308); the chunked-prefill
+///   mid-store + cross-request `lcp_registry.probe_lcp_opportunity`
+///   paths would require either (a) per-slot LcpRegistry plus a slot
+///   discriminator in the persisted snapshot format, or (b) a tenant-
+///   aware cross-slot probe — both multi-iter snapshot-codec extensions
+///   beyond the iter-LCP scope.  The structural-N/A pin documents the
+///   call-graph reality: slot-aware mode's existing prompt-cache HIT
+///   path (full-equality) IS the LCP fast-path operators get; the
+///   remaining LCP feature (partial-prefix probe across requests) is
+///   structurally incompatible with per-slot byte regions today.
 /// - Chunked-prefill is DISABLED in slot-aware mode (same snapshot-
-///   shape reason). Pinned as **iter-C2d-cont-kernel-iter-LCP** in
-///   §6.1.27.
+///   shape reason).  Same STRUCTURAL N/A pin per §6.1.50.
 /// - DFlash / spec-decode capture-states are NOT engaged here (they
 ///   require `ensure_la_capture` which is spec-decode-only); slot-aware
 ///   spec-decode is **iter-B4d** per §6.1.26 deferrals matrix.
+/// - ADR-040 §6.1.50 (2026-05-30) lands
+///   **iter-C2d-cont-kernel-iter-G per ADR-040 §6.1.50** REAL LIFT: the
+///   greedy decode branch (T=0, no logprobs, no grammar) now routes
+///   through `forward_gpu_greedy(.., slot_id)` instead of
+///   `forward_gpu_last_logits + greedy_argmax_last_token`.  Saves the
+///   per-step vocab-size F32 download (~250 µs at vocab=151k) by
+///   returning the argmax token directly from the GPU.  Sampling +
+///   logprobs branches UNCHANGED (still use `forward_gpu_last_logits`
+///   for CPU-side sampler / logprob computation).
 ///
 /// # Errors
 /// - `prompt_tokens.is_empty()` (matches `generate_qwen35_once`).
 /// - `slot_id.0 >= kv_cache.n_seqs` (via `reset_for_slot` bounds-first
 ///   per A2b §6.1.23 iter-1.5 cfa-finding-F5).
-/// - Forward / sample failures propagate from `forward_gpu_last_logits`.
+/// - Forward / sample failures propagate from `forward_gpu_last_logits`
+///   (sampling branch) or `forward_gpu_greedy` (greedy fast-path branch
+///   per ADR-040 §6.1.50 iter-G).
 pub fn generate_qwen35_once_slot_aware(
     qwen: &mut Qwen35LoadedModel,
     prompt_tokens: &[u32],
@@ -2315,9 +2338,10 @@ pub fn generate_qwen35_once_slot_aware(
         );
     } else {
         // Fresh monolithic prefill — chunked-prefill + LCP-resume are
-        // disabled in slot-aware mode (see fn docstring for the snapshot
-        // codec invariant rationale; tracked as
-        // iter-C2d-cont-kernel-iter-LCP in §6.1.27).
+        // STRUCTURAL N/A in slot-aware mode (see fn docstring for the
+        // snapshot codec invariant rationale; the iter-LCP STRUCTURAL
+        // N/A closure landed at iter-C2d-cont-kernel-iter-LCP per
+        // ADR-040 §6.1.50).
         let positions = prefill_positions_for(prompt_len);
         let prefill_logits = qwen
             .model
@@ -2371,10 +2395,17 @@ pub fn generate_qwen35_once_slot_aware(
         finish_reason = "stop";
     }
 
-    // Decode loop. Note: greedy + non-logprobs is a candidate for
-    // forward_gpu_greedy fast path, but iter-1 keeps the simpler
-    // forward_gpu_last_logits dispatch for minimal LOC delta; the
-    // greedy fast-path slot-aware port is iter-C2d-cont-kernel-iter-G.
+    // Decode loop.
+    //
+    // ADR-040 §6.1.50 (2026-05-30) iter-C2d-cont-kernel-iter-G REAL LIFT:
+    // the greedy fast-path (`is_greedy && !want_logprobs`) now routes
+    // through `forward_gpu_greedy(.., slot_id)` instead of
+    // `forward_gpu_last_logits + greedy_argmax_last_token`.  The GPU-side
+    // argmax returns a `u32` directly, eliminating the per-step vocab-
+    // size F32 download (saves ~250 µs at vocab=151k Qwen3.6 35B-A3B).
+    // The sampling + logprobs branches still go through
+    // `forward_gpu_last_logits` because they need the full logits buffer
+    // CPU-side for `sample_logits_qwen35` / `sample_logits_qwen35_with_logprob`.
     let mut step = 1usize;
     while step < max_tokens && finish_reason == "length" {
         // Position for the just-emitted next_token (used in the NEXT
@@ -2383,23 +2414,32 @@ pub fn generate_qwen35_once_slot_aware(
         let pos_i32 = pos as i32;
         let positions: Vec<i32> = vec![pos_i32; 4];
         let last_input = &generated_tokens[generated_tokens.len() - 1..];
-        let logits = qwen
-            .model
-            .forward_gpu_last_logits(last_input, &positions, kv_cache, slot_id)
-            .with_context(|| {
-                format!(
-                    "Qwen35Model::forward_gpu_last_logits (slot-aware decode step {step})"
-                )
-            })?;
-        anyhow::ensure!(
-            logits.len() == qwen.vocab_size,
-            "qwen35 slot-aware decode logits len {} != vocab_size {}",
-            logits.len(),
-            qwen.vocab_size
-        );
         let tok = if is_greedy && !want_logprobs {
-            greedy_argmax_last_token(&logits, qwen.vocab_size as u32)
+            // ADR-040 §6.1.50 iter-G fast path: `forward_gpu_greedy`
+            // accepts `slot_id` since B4d §6.1.44 (2026-05-30).
+            qwen.model
+                .forward_gpu_greedy(last_input, &positions, kv_cache, slot_id)
+                .with_context(|| {
+                    format!(
+                        "Qwen35Model::forward_gpu_greedy (slot-aware decode step {step}; \
+                         ADR-040 §6.1.50 iter-G)"
+                    )
+                })?
         } else {
+            let logits = qwen
+                .model
+                .forward_gpu_last_logits(last_input, &positions, kv_cache, slot_id)
+                .with_context(|| {
+                    format!(
+                        "Qwen35Model::forward_gpu_last_logits (slot-aware decode step {step})"
+                    )
+                })?;
+            anyhow::ensure!(
+                logits.len() == qwen.vocab_size,
+                "qwen35 slot-aware decode logits len {} != vocab_size {}",
+                logits.len(),
+                qwen.vocab_size
+            );
             let mut logits = logits;
             if let Some(ref mut lps) = logprobs_vec {
                 let (tok, lp) = sample_logits_qwen35_with_logprob(
@@ -2545,17 +2585,25 @@ pub fn generate_qwen35_once_slot_aware(
 /// # Co-changes (iter-2 deliberately minimal — exact mirror of iter-1)
 ///
 /// - Per-slot LCP / mid-prefill checkpoint storage is DISABLED in
-///   slot-aware mode (the snapshot codec keys on the per-request
-///   `max_seq_len`; persistent-cache snapshots would carry different
-///   byte sizes and break the across-request LCP probe). The fast path
-///   on this site is the fresh-prefill path; LCP slot-aware codec is
-///   pinned as **iter-C2d-cont-kernel-iter-LCP** in §6.1.28.
+///   slot-aware mode.  ADR-040 §6.1.50 (2026-05-30) closes
+///   **iter-C2d-cont-kernel-iter-LCP per ADR-040 §6.1.50** as
+///   **STRUCTURAL N/A** (same finding as iter-1's docstring — the
+///   snapshot codec keys on per-request `max_seq_len` + cross-slot
+///   tenant-isolation; full-equality prompt-cache HIT path already uses
+///   `restore_partial`).  The structural-N/A pin documents the call-
+///   graph reality.
 /// - Chunked-prefill is DISABLED in slot-aware mode (same snapshot-
-///   shape reason). Pinned as **iter-C2d-cont-kernel-iter-LCP** in
-///   §6.1.28.
+///   shape reason).  Same STRUCTURAL N/A pin per §6.1.50.
 /// - Vision-augmented streaming (soft_tokens / deepstack /
 ///   positions_flat any non-empty) returns a typed error event citing
 ///   **iter-C2d-cont-kernel-iter-4** as the implementing iter.
+/// - ADR-040 §6.1.50 (2026-05-30) lands
+///   **iter-C2d-cont-kernel-iter-G per ADR-040 §6.1.50** REAL LIFT for
+///   the streaming decode greedy fast-path: when `is_greedy` is true,
+///   the decode step now routes through `forward_gpu_greedy(.., slot_id)`
+///   instead of `forward_gpu_last_logits + greedy_argmax_last_token`.
+///   Same per-step savings as iter-1 (~250 µs at vocab=151k).  Non-
+///   greedy + cancellation paths UNCHANGED.
 ///
 /// # SSE event ordering (H63 pin)
 ///
@@ -2737,9 +2785,10 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
         );
     } else {
         // Fresh monolithic prefill — chunked-prefill + LCP-resume are
-        // DISABLED in slot-aware mode (see fn docstring for the
-        // snapshot codec invariant rationale; tracked as
-        // iter-C2d-cont-kernel-iter-LCP in §6.1.28).
+        // STRUCTURAL N/A in slot-aware mode (see fn docstring for the
+        // snapshot codec invariant rationale; iter-LCP STRUCTURAL N/A
+        // closure landed at iter-C2d-cont-kernel-iter-LCP per ADR-040
+        // §6.1.50).
         //
         // ADR-040 iter-C2d-cont-kernel iter-4: when has_extension is
         // true, prefill goes through
@@ -2803,7 +2852,8 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
         // mode: the persistent cache's snapshot would carry the
         // cfg.max_position_embeddings shape, which differs from
         // per-request snapshots the SerialFifo / SlotId(0) path stores.
-        // Cross-mode snapshot sharing is iter-C2d-cont-kernel-iter-LCP.
+        // Cross-mode snapshot sharing is iter-C2d-cont-kernel-iter-LCP
+        // STRUCTURAL N/A per ADR-040 §6.1.50.
     }
     let prefill_duration = prefill_start.elapsed();
 
@@ -3024,32 +3074,48 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
                 break;
             }
             let decode_positions = vec![pos; 4];
-            // iter-2 uses `forward_gpu_last_logits(.., slot_id)` for both
-            // greedy + sampling modes — same shape as iter-1's decode
-            // loop (greedy fast-path slot-aware port is
-            // iter-C2d-cont-kernel-iter-G per §6.1.28).
-            let dec_result = match qwen.model.forward_gpu_last_logits(
-                &[next_token],
-                &decode_positions,
-                kv_cache,
-                slot_id,
-            ) {
-                Ok(logits) => {
-                    if logits.len() != qwen.vocab_size {
-                        Err(anyhow::anyhow!(
-                            "qwen35 stream slot-aware decode logits len {} \
-                             != vocab_size {}",
-                            logits.len(),
-                            qwen.vocab_size,
-                        ))
-                    } else if is_greedy {
-                        Ok(greedy_argmax_last_token(&logits, qwen.vocab_size as u32))
-                    } else {
-                        let mut tmp = logits;
-                        Ok(sample_logits_qwen35(&mut tmp, params, &[next_token]))
+            // ADR-040 §6.1.50 (2026-05-30) iter-C2d-cont-kernel-iter-G
+            // REAL LIFT for streaming: greedy fast-path now routes through
+            // `forward_gpu_greedy(.., slot_id)` (saves the per-step vocab-
+            // size F32 download, ~250 µs at vocab=151k Qwen3.6 35B-A3B).
+            // Sampling branch still uses `forward_gpu_last_logits` because
+            // it needs the full logits CPU-side for `sample_logits_qwen35`.
+            let dec_result: Result<u32, anyhow::Error> = if is_greedy {
+                qwen.model
+                    .forward_gpu_greedy(
+                        &[next_token],
+                        &decode_positions,
+                        kv_cache,
+                        slot_id,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "qwen35 stream slot-aware forward_gpu_greedy (ADR-040 \
+                             §6.1.50 iter-G) step {step}: {e}"
+                        )
+                    })
+            } else {
+                match qwen.model.forward_gpu_last_logits(
+                    &[next_token],
+                    &decode_positions,
+                    kv_cache,
+                    slot_id,
+                ) {
+                    Ok(logits) => {
+                        if logits.len() != qwen.vocab_size {
+                            Err(anyhow::anyhow!(
+                                "qwen35 stream slot-aware decode logits len {} \
+                                 != vocab_size {}",
+                                logits.len(),
+                                qwen.vocab_size,
+                            ))
+                        } else {
+                            let mut tmp = logits;
+                            Ok(sample_logits_qwen35(&mut tmp, params, &[next_token]))
+                        }
                     }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             };
             next_token = match dec_result {
                 Ok(t) => t,
@@ -4851,12 +4917,19 @@ pub fn embed_qwen35(qwen: &mut Qwen35LoadedModel, prompt_tokens: &[u32]) -> Resu
 /// # Co-changes (iter-3 deliberately minimal — exact mirror of iter-1)
 ///
 /// - Per-slot LCP / mid-prefill checkpoint storage is DISABLED in
-///   slot-aware mode (the snapshot codec keys on the per-request
-///   `max_seq_len`; persistent-cache snapshots would carry different
-///   byte sizes and break the across-request LCP probe). The embed
-///   path doesn't engage LCP anyway (no decode loop = no place to
-///   checkpoint). Pinned as **iter-C2d-cont-kernel-iter-LCP** in
-///   §6.1.29.
+///   slot-aware mode.  ADR-040 §6.1.50 (2026-05-30) closes
+///   **iter-C2d-cont-kernel-iter-LCP per ADR-040 §6.1.50** as
+///   **STRUCTURAL N/A** for the embed surface specifically: the embed
+///   path has NO decode loop (single forward → L2-norm → return), so
+///   there's no place to checkpoint mid-decode and no cross-request
+///   prefix-sharing surface to probe.  Inherits the structural-N/A
+///   finding from iter-1's docstring at engine_qwen35.rs:~2215 (snapshot
+///   codec keyed on per-request `max_seq_len` + cross-slot tenant-
+///   isolation).
+/// - ADR-040 §6.1.50 iter-G is also N/A here: the embed path has no
+///   decode loop, so there's no per-step `forward_gpu_greedy` candidate
+///   to lift (the single `forward_embed_last(.., slot_id)` call already
+///   returns the L2-norm vector directly without a vocab-size readback).
 /// - Vision-augmented embeddings (Qwen3-VL chat-as-embedder with image
 ///   inputs) are NOT exposed via the Embed `Request` variant in
 ///   `engine.rs` — the Embed handler only accepts `prompt_tokens` (no
@@ -5017,16 +5090,25 @@ pub fn embed_qwen35_slot_aware(
 /// # Co-changes (iter-4 deliberately minimal — exact mirror of iter-1)
 ///
 /// - Per-slot LCP / mid-prefill checkpoint storage is DISABLED in
-///   slot-aware mode (the snapshot codec keys on the per-request
-///   `max_seq_len`; persistent-cache snapshots would carry different
-///   byte sizes and break the across-request LCP probe). Pinned as
-///   **iter-C2d-cont-kernel-iter-LCP** in §6.1.30.
+///   slot-aware mode.  ADR-040 §6.1.50 (2026-05-30) closes
+///   **iter-C2d-cont-kernel-iter-LCP per ADR-040 §6.1.50** as
+///   **STRUCTURAL N/A** (same finding as iter-1: snapshot codec keyed
+///   on per-request `max_seq_len` + cross-slot tenant-isolation; the
+///   soft-tokens path has no prompt-cache HIT in either slot-aware or
+///   non-slot-aware mode per `engine_qwen35.rs:3410` discipline).
 /// - Chunked-prefill is DISABLED in slot-aware mode (same snapshot-
-///   shape reason). Pinned as **iter-C2d-cont-kernel-iter-LCP** in
-///   §6.1.30.
+///   shape reason).  Same STRUCTURAL N/A pin per §6.1.50.
 /// - DFlash / spec-decode capture-states are NOT engaged here (they
 ///   require `ensure_la_capture` which is spec-decode-only); slot-aware
 ///   spec-decode is **iter-B4d** per §6.1.26 deferrals matrix.
+/// - ADR-040 §6.1.50 (2026-05-30) lands
+///   **iter-C2d-cont-kernel-iter-G per ADR-040 §6.1.50** REAL LIFT for
+///   the soft-tokens-only AND deepstack sub-shape decode greedy fast-
+///   paths: greedy branch now routes through
+///   `forward_gpu_greedy(.., slot_id)` (decode positions are post-prompt
+///   by construction so the soft-token-FREE greedy path is structurally
+///   correct; mirror of `generate_qwen35_once_with_soft_tokens` decode
+///   discipline at engine_qwen35.rs:3279).
 ///
 /// # Errors
 /// - `soft_tokens.is_empty()` → identity over `generate_qwen35_once_slot_aware`
@@ -5209,15 +5291,16 @@ pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
                 }
                 tok
             } else if is_greedy {
-                // iter-4 uses `forward_gpu_last_logits(.., slot_id)` for
-                // greedy too — same shape as iter-1's decode loop
-                // (greedy fast-path slot-aware port is
-                // iter-C2d-cont-kernel-iter-G per §6.1.30; the
-                // non-slot-aware sibling calls `forward_gpu_greedy` but
-                // that fn does not yet thread `slot_id`).
-                let logits_full = qwen
-                    .model
-                    .forward_gpu_last_logits(
+                // ADR-040 §6.1.50 (2026-05-30) iter-C2d-cont-kernel-iter-G
+                // REAL LIFT: greedy fast-path routes through
+                // `forward_gpu_greedy(.., slot_id)`.  `forward_gpu_greedy`
+                // accepts `slot_id` since B4d §6.1.44 (2026-05-30) — the
+                // pre-§6.1.50 docstring claim "that fn does not yet thread
+                // slot_id" was outdated.  Decode positions are post-prompt
+                // by construction (>= prompt_len), so the soft-token-FREE
+                // greedy path is structurally correct here.
+                qwen.model
+                    .forward_gpu_greedy(
                         &[next_token],
                         &decode_positions,
                         kv_cache,
@@ -5225,11 +5308,10 @@ pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
                     )
                     .with_context(|| {
                         format!(
-                            "forward_gpu_last_logits slot-aware decode step {step} \
-                             (soft tokens, greedy)"
+                            "forward_gpu_greedy slot-aware decode step {step} \
+                             (soft tokens; ADR-040 §6.1.50 iter-G)"
                         )
-                    })?;
-                greedy_argmax_last_token(&logits_full, qwen.vocab_size as u32)
+                    })?
             } else {
                 let logits_full = qwen
                     .model
@@ -5560,9 +5642,13 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
                 }
                 tok
             } else if is_greedy {
-                let logits_full = qwen
-                    .model
-                    .forward_gpu_last_logits(
+                // ADR-040 §6.1.50 (2026-05-30) iter-C2d-cont-kernel-iter-G
+                // REAL LIFT (deepstack sub-shape): decode positions are
+                // post-prompt by construction so the soft-token-FREE
+                // greedy fast-path applies.  Mirror of soft-tokens variant
+                // above + iter-1's `generate_qwen35_once_slot_aware`.
+                qwen.model
+                    .forward_gpu_greedy(
                         &[next_token],
                         &decode_positions,
                         kv_cache,
@@ -5570,11 +5656,10 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
                     )
                     .with_context(|| {
                         format!(
-                            "forward_gpu_last_logits slot-aware decode step {step} \
-                             (deepstack, greedy)"
+                            "forward_gpu_greedy slot-aware decode step {step} \
+                             (deepstack; ADR-040 §6.1.50 iter-G)"
                         )
-                    })?;
-                greedy_argmax_last_token(&logits_full, qwen.vocab_size as u32)
+                    })?
             } else {
                 let logits_full = qwen
                     .model

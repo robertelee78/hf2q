@@ -2959,10 +2959,30 @@ impl MlxModelWeights {
             // target the per-slot byte region of the persistent multi-
             // seq scaffold.
             //
-            // `restored_lcp = None`: LCP partial-prefix resume slot-aware
-            // port is iter-2D-lcp scope (orthogonal sub-deferral; the
-            // restored_lcp=Some(_) path consumes a SerialFifo-saved
-            // cache, not the multi-seq scaffold).
+            // `restored_lcp = None`: ADR-040 §6.1.50 (2026-05-30) closes
+            // **iter-B4c-kernel-iter-2D-lcp per ADR-040 §6.1.50** as
+            // **STRUCTURAL N/A** — the LCP partial-prefix resume path
+            // consumes cached `Arc<DenseKvBuffers>` clones into
+            // `self.dense_kvs` (see `engine.rs:7593` install + sibling
+            // consume-gate at `forward_prefill.rs:709-768`), while the
+            // slot-aware iter-2D path mounts slot-views into the SAME
+            // `self.dense_kvs` field.  These are MUTUALLY EXCLUSIVE
+            // mount sources — only one can populate `self.dense_kvs` at
+            // a time.  Additionally, the LCP registry is a global
+            // cache; cross-slot prefix sharing carries tenant-isolation
+            // risk (slot regions are per-tenant by SlotAware
+            // construction).  The structural-N/A pin documents that
+            // slot-aware mode's existing prompt-cache HIT via the
+            // SerialFifo path's restore_partial mechanism IS the LCP
+            // fast-path that operators get under iter-2D today; the
+            // remaining cross-request prefix probe is structurally
+            // incompatible with per-slot byte regions.  Forward-pointer
+            // discoverability per H87 discipline: the substring
+            // `iter-B4c-kernel-iter-2D-lcp per ADR-040 §6.1.50` is
+            // grep-able here (NOT inside a typed
+            // `MultiSeqError::CapabilityUnsupported` constructor — the
+            // STRUCTURAL N/A closure mirrors §6.1.49 iter-2-embed /
+            // iter-2-batched discipline).
             let result = self.forward_prefill_with_soft_tokens_resume(
                 prompt_tokens,
                 soft_tokens,
