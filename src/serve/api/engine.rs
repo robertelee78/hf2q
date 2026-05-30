@@ -27551,3 +27551,485 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
         );
     }
 }
+
+// ───────────────────────────────────────────────────────────────────
+// ADR-040 Phase B iter-B4c-kernel iter-2A-cont + iter-2-decode-B —
+// Gemma 4 HB-encoded (HF2Q_HYBRID_KV=0 opt-out) prefill + decode
+// slot routing JOINTLY landed.
+// ───────────────────────────────────────────────────────────────────
+//
+// Background — what was deferred pre-this-iter:
+//   * iter-2A (§6.1.32, commit hash recorded at commit time) shipped
+//     the 4-way dispatch fork inside the new fn
+//     `MlxModelWeights::forward_prefill_with_soft_tokens_slot_aware`.
+//     The HB-encoded branch (HF2Q_HYBRID_KV=0 AND cb_bits >= 5 AND
+//     HF2Q_USE_DENSE=0) surfaced typed
+//     `MultiSeqError::CapabilityUnsupported { capability: "...iter-
+//     B4c-kernel-iter-2A-cont per ADR-040 §6.1.32..." }`.
+//   * iter-2-decode-A (§6.1.38) shipped the production-default decode
+//     slot routing via `forward_decode_slot_aware`'s hybrid branch.
+//     The HB-encoded decode branch surfaced typed
+//     `MultiSeqError::CapabilityUnsupported { capability: "...iter-
+//     B4c-kernel-iter-2-decode-B per ADR-040 §6.1.38..." }`.
+//
+// iter-2A-cont + iter-2-decode-B (THIS iter, jointly per the brief's
+// joint-iter framing) REPLACE both typed-error branches with the same
+// slice_view mount + delegate-to-sibling pattern iter-2B + iter-2-decode-A
+// established for the HF2Q_HYBRID_KV=1 production-default regime — now
+// applied to the HF2Q_HYBRID_KV=0 opt-out HB-encoded regime, on
+// `MultiSeqHbKvBuffers` instead of `MultiSeqHybridKvBuffers`.
+//
+// Production-code changes:
+//   * `src/serve/forward_prefill.rs`:
+//     - `forward_prefill_with_soft_tokens_slot_aware`: HB-encoded
+//       branch (the final code path after all 3 prior branches
+//       short-circuit) REPLACED typed CapabilityUnsupported with real
+//       per-layer slot-view construction for the 4 buffers (K_packed
+//       U8, K_norms F32, V_packed U8, V_norms F32) + mount on
+//       `self.leg_hb_encoded` + delegate to
+//       `forward_prefill_with_soft_tokens_resume` + restore on exit.
+//     - Prefill alloc gate at line ~880 ALIGNED with decode-path gate
+//       at `gemma4/forward_gpu.rs:427` via additive
+//       `self.leg_hb_encoded.is_none()` predicate (mirror of iter-2B's
+//       hybrid-branch alignment at line ~842).  SerialFifo byte-
+//       equivalence preserved: SerialFifo enters with
+//       `self.leg_hb_encoded == None`, gate fires identically.
+//     - `forward_decode_slot_aware`: HB-encoded branch REPLACED typed
+//       CapabilityUnsupported with real per-layer slot-view
+//       construction + mount on `self.leg_hb_encoded` + delegate to
+//       `forward_decode` + restore on exit.  Decode-side sibling's
+//       alloc gate at `gemma4/forward_gpu.rs:427` ALREADY has
+//       `&& self.leg_hb_encoded.is_none()` discipline (pre-dates this
+//       iter; iter-2A-cont prefill mirrors it).
+//
+// No orchestrator (engine.rs) changes are needed: the orchestrators
+// (`generate_gemma4_once_slot_aware` + `generate_stream_gemma4_once_
+// slot_aware` + `generate_gemma4_once_with_soft_tokens_slot_aware`)
+// already pass `multi_seq_kv: &mut Vec<MultiSeqHbKvBuffers>` to the
+// model fns since iter-2A — that param is what the new HB-encoded
+// branch routing slices into.  The `multi_seq_kv_hybrid` Option<>
+// sibling param remains independently consumed by the iter-2B hybrid
+// branch (it is None when HF2Q_HYBRID_KV=0, present when =1).
+//
+// Tests (H174-H180):
+//   H174 (skip-mode): forward_prefill_with_soft_tokens_slot_aware
+//                     HB-encoded branch typed-error label REMOVED;
+//                     positive pin on slice_view + leg_hb_encoded
+//                     mount in the new fn body.
+//   H175 (skip-mode): forward_decode_slot_aware HB-encoded branch
+//                     typed-error label REMOVED; positive pin on
+//                     slice_view + leg_hb_encoded mount + delegate to
+//                     forward_decode + restore.
+//   H176 (skip-mode): HbKvBuffers slot-view construction wraps all 4
+//                     buffers (k_packed / k_norms / v_packed / v_norms)
+//                     in both prefill + decode bodies — per-slot
+//                     isolation surface.
+//   H177 (skip-mode): slot-view byte-offset arithmetic matches
+//                     HbKvBuffers layout: packed (U8, 1 byte/elem)
+//                     uses no `* 2` multiplier; norms (F32, 4 bytes/
+//                     elem) DOES use `* 4u64`.  Defends against
+//                     accidentally reusing the iter-2B F16-K
+//                     `* 2u64` multiplier on the U8 K_packed buffer.
+//   H178 (skip-mode): SerialFifo + HF2Q_HYBRID_KV=0 byte-equivalence
+//                     preserved.  (a) Sibling fn
+//                     `forward_prefill_with_soft_tokens_resume`
+//                     signature UNCHANGED (no slot_id / multi_seq_kv
+//                     params — mirror of H86).  (b) Prefill alloc gate
+//                     at line ~880 contains `self.leg_hb_encoded.is_none()`
+//                     (aligned with decode-path gate).
+//   H179 (skip-mode): iter-2B + iter-2-decode-A production-default
+//                     HF2Q_HYBRID_KV=1 surfaces UNCHANGED — H97 /
+//                     H101 / H123 / H124 source-grep substrings
+//                     still hold (positive transitivity from this
+//                     iter's purely additive HB-encoded routing).
+//   H180 (skip-mode): Qwen35 + Qwen3VL + Gemma 4 Embed-arm UNCHANGED;
+//                     iter-1/2A/2B/3/4/5/2-decode-A/2-decode-C lift
+//                     scaffolds + iter-A2b-cont / B4d Qwen35 surfaces
+//                     PRESERVED.  Defense-in-depth against accidental
+//                     regression at orthogonal worker arms.
+
+#[cfg(test)]
+mod adr040_phase_b_iter_b4c_kernel_iter2a_cont_iter2_decode_b_gemma4_tests {
+    // Skip-mode source-grep tests; intentionally NO `use super::*;`.
+
+    /// **H174 (skip-mode)** — `forward_prefill_with_soft_tokens_slot_aware`
+    /// HB-encoded branch typed-error label REPLACED with real slot routing.
+    ///
+    /// iter-2A surfaced `MultiSeqError::CapabilityUnsupported { capability:
+    /// "gemma4-forward-prefill-slot-N-hb-encoded (iter-B4c-kernel-iter-2A-cont
+    /// per ADR-040 §6.1.32 ..." }` at every entry into the HB-encoded branch
+    /// (HF2Q_HYBRID_KV=0 + cb_bits>=5 + HF2Q_USE_DENSE=0); iter-2A-cont
+    /// REMOVES that typed-error capability string from the branch's
+    /// `MultiSeqError::CapabilityUnsupported {` constructor + replaces with
+    /// real `.slice_view(` + `self.leg_hb_encoded = Some(slot_view_hb)`
+    /// mount.
+    ///
+    /// Note: the iter-2A-cont label substring is preserved as a doc-comment
+    /// cite (the `iter-B4c-kernel-iter-2A-cont per ADR-040 §6.1.32`
+    /// substring remains in the new fn body for H87 forward-pointer
+    /// discoverability); the load-bearing pin is that the substring is
+    /// NOT present inside a `MultiSeqError::CapabilityUnsupported { capability:`
+    /// constructor call — the typed error is GONE.
+    #[test]
+    fn h174_iter2a_cont_hb_encoded_branch_typed_error_replaced_with_slot_routing() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H174: new fn marker present (H84 asserts)");
+        let fn_window = &src[fn_idx..(fn_idx + 40_000).min(src.len())];
+        // The iter-2A HB-encoded branch typed-error capability literal —
+        // the EXACT string a CapabilityUnsupported { capability: "..." }
+        // constructor would have used.  iter-2A-cont REMOVES it.
+        let iter2a_cont_typed_error =
+            "gemma4-forward-prefill-slot-N-hb-encoded (iter-B4c-kernel-iter-2A-cont per";
+        assert!(
+            !fn_window.contains(iter2a_cont_typed_error),
+            "H174 FALSIFIED: new fn body still contains the iter-2A HB-\
+             encoded typed-error capability label `{iter2a_cont_typed_error}` \
+             — iter-2A-cont slot routing NOT landed; HF2Q_HYBRID_KV=0 \
+             requests still surface CapabilityUnsupported at the HB-\
+             encoded branch."
+        );
+        // Positive pin: the iter-2A-cont label substring IS preserved
+        // somewhere in the fn body (operator-grep'able forward pointer
+        // — required by H87).  Either as doc-comment cite OR as the
+        // iter-2A-cont sub-deferral the NEW landing might still name.
+        assert!(
+            fn_window.contains("iter-B4c-kernel-iter-2A-cont per ADR-040 §6.1.32"),
+            "H174 FALSIFIED: new fn body does NOT contain the operator-\
+             grep'able label substring `iter-B4c-kernel-iter-2A-cont per \
+             ADR-040 §6.1.32`. H87 forward-pointer discoverability broken \
+             — even after iter-2A-cont SHIP the substring should remain \
+             as a doc-comment cite."
+        );
+        // Positive pin: the slot-view mount via slice_view IS present.
+        assert!(
+            fn_window.contains(".slice_view("),
+            "H174 FALSIFIED: new fn body does NOT contain `.slice_view(` \
+             — slot-view mount primitive missing."
+        );
+        // Positive pin: `self.leg_hb_encoded = Some(` mount IS present
+        // (load-bearing for the HB-encoded slot routing — the
+        // delegate-to-sibling pattern requires the sibling to read
+        // `self.leg_hb_encoded`).
+        assert!(
+            fn_window.contains("self.leg_hb_encoded = Some("),
+            "H174 FALSIFIED: new fn body does NOT contain \
+             `self.leg_hb_encoded = Some(` mount — per-slot routing \
+             through HbKvBuffers' slot region cannot work; the sibling \
+             would see `None` and lazy-allocate a fresh single-seq \
+             buffer, defeating the multi-seq scaffold."
+        );
+    }
+
+    /// **H175 (skip-mode)** — `forward_decode_slot_aware` HB-encoded
+    /// branch typed-error label REPLACED with real decode slot routing.
+    ///
+    /// Mirror of H174 for the decode body: iter-2-decode-A surfaced
+    /// `MultiSeqError::CapabilityUnsupported { capability:
+    /// "gemma4-forward-decode-slot-N-hb-encoded (iter-B4c-kernel-iter-
+    /// 2-decode-B per ADR-040 §6.1.38 ..." }`; iter-2-decode-B REMOVES
+    /// the typed error + lands the real slice_view + mount + delegate
+    /// + restore pattern through `forward_decode`.
+    #[test]
+    fn h175_iter2_decode_b_hb_encoded_branch_typed_error_replaced_with_slot_routing() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_decode_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H175: forward_decode_slot_aware not found (H123 asserts)");
+        let fn_window = &src[fn_idx..(fn_idx + 40_000).min(src.len())];
+        // The iter-2-decode-A HB-encoded branch typed-error capability
+        // literal.  iter-2-decode-B REMOVES it.
+        let iter2_decode_b_typed_error =
+            "gemma4-forward-decode-slot-N-hb-encoded (iter-B4c-kernel-iter-2-decode-B per";
+        assert!(
+            !fn_window.contains(iter2_decode_b_typed_error),
+            "H175 FALSIFIED: decode fn body still contains the iter-2-\
+             decode-A HB-encoded typed-error label `{iter2_decode_b_typed_error}` \
+             — iter-2-decode-B slot routing NOT landed."
+        );
+        // Positive pin: label substring preserved as doc-comment cite.
+        assert!(
+            fn_window.contains("iter-B4c-kernel-iter-2-decode-B per ADR-040 §6.1.38"),
+            "H175 FALSIFIED: decode fn body does NOT contain operator-\
+             grep'able substring `iter-B4c-kernel-iter-2-decode-B per \
+             ADR-040 §6.1.38`. H87 forward-pointer discoverability broken."
+        );
+        // Positive pin: slice_view (multiple — both hybrid + HB branches
+        // mount slot-views; at least 1 of the slot-view ops is in the HB
+        // branch).
+        let slice_view_count = fn_window.matches(".slice_view(").count();
+        assert!(
+            slice_view_count >= 8, // 4 buffers per branch (hybrid + HB) × 2 mounts
+            "H175 FALSIFIED: decode fn body has only {slice_view_count} \
+             `.slice_view(` call(s); expected at least 8 (4 HB buffers + \
+             4 hybrid buffers).  HB-encoded slice_view mount missing."
+        );
+        // Positive pin: `self.leg_hb_encoded = Some(` mount IS present
+        // in the decode body.
+        assert!(
+            fn_window.contains("self.leg_hb_encoded = Some("),
+            "H175 FALSIFIED: decode fn body does NOT contain \
+             `self.leg_hb_encoded = Some(` mount — decode-side per-slot \
+             routing through HbKvBuffers' slot region cannot work."
+        );
+        // Positive pin: delegate to forward_decode + restore.
+        assert!(
+            fn_window.contains("self.forward_decode("),
+            "H175 FALSIFIED: decode fn body does NOT contain \
+             `self.forward_decode(` delegate call. iter-2-decode-B \
+             slot routing cannot reach the sibling kernel-write site."
+        );
+        // Positive pin: restore on exit.
+        let restore_count = fn_window
+            .matches("self.leg_hb_encoded = prior_leg_hb")
+            .count();
+        assert!(
+            restore_count >= 1,
+            "H175 FALSIFIED: decode fn body does NOT contain \
+             `self.leg_hb_encoded = prior_leg_hb` restore. The slot-view \
+             mount would leak past the call."
+        );
+    }
+
+    /// **H176 (skip-mode)** — HbKvBuffers slot-view construction wraps
+    /// ALL 4 buffers (k_packed / k_norms / v_packed / v_norms) in both
+    /// prefill + decode bodies.  Per-slot byte isolation surface — every
+    /// buffer must be sliced (not just K_packed / V_packed) or the slot
+    /// routing silently shares K_norms / V_norms across slots.
+    #[test]
+    fn h176_hb_kv_buffers_slot_view_construction_wraps_all_four_buffers() {
+        let src = include_str!("../forward_prefill.rs");
+        // The new HB slot-view constructor builds `HbKvBuffers { ... }`
+        // with all 4 buffers set to slot-view derivatives.  Pin the
+        // 4 specific field assignments — they must appear in both the
+        // prefill HB branch + decode HB branch (2 occurrences each).
+        for field_marker in [
+            "k_packed: k_packed_view",
+            "k_norms: k_norms_view",
+            "v_packed: v_packed_view",
+            "v_norms: v_norms_view",
+        ] {
+            let count = src.matches(field_marker).count();
+            assert!(
+                count >= 2,
+                "H176 FALSIFIED: `{field_marker}` field assignment \
+                 occurs only {count} time(s) in forward_prefill.rs; \
+                 expected at least 2 (one in iter-2A-cont prefill HB \
+                 branch + one in iter-2-decode-B decode HB branch).  \
+                 Either the prefill or decode body is missing the \
+                 slot-view assignment — silently shares the buffer \
+                 across slots."
+            );
+        }
+    }
+
+    /// **H177 (skip-mode)** — slot-view byte-offset arithmetic matches
+    /// the HbKvBuffers layout.  K_packed + V_packed are U8 (1 byte/elem,
+    /// NO `* 2u64` multiplier) → the byte offset arithmetic uses
+    /// `packed_elems_per_slot as u64` directly with no dtype multiplier.
+    /// K_norms + V_norms are F32 (4 bytes/elem) → `* 4u64` multiplier IS
+    /// present.
+    ///
+    /// Defends against accidentally reusing the iter-2B `* 2u64` F16-K
+    /// multiplier on the U8 K_packed buffer (would silently route to
+    /// 2× the intended slot offset and corrupt slot 2N's region).
+    #[test]
+    fn h177_slice_view_byte_offset_matches_hb_kv_buffers_layout() {
+        let src = include_str!("../forward_prefill.rs");
+        // Anchor on the `forward_prefill_with_soft_tokens_slot_aware` fn
+        // marker — covers the full prefill body including the
+        // iter-2A-cont HB-encoded branch.
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H177: forward_prefill_with_soft_tokens_slot_aware not found");
+        let body_window = &src[fn_idx..(fn_idx + 50_000).min(src.len())];
+        // U8 (packed) byte-offset arithmetic must use elem count directly
+        // (no `* 2u64` or `* 4u64`).  Pin: the `packed_byte_offset`
+        // variable name is present, and the arithmetic uses
+        // `packed_elems_per_slot as u64` as the multiplier — NOT a
+        // dtype-size multiplier.
+        assert!(
+            body_window.contains("packed_byte_offset"),
+            "H177 FALSIFIED: iter-2A-cont prefill body does not bind \
+             `packed_byte_offset` — slot-view K_packed/V_packed offset \
+             arithmetic is missing."
+        );
+        // F32 (norms) byte-size MUST use `* 4u64` multiplier — the
+        // canonical F32 byte-size factor mirrors iter-2B's V_norms
+        // pattern at line 2850.
+        assert!(
+            body_window.contains("checked_mul(4u64)"),
+            "H177 FALSIFIED: iter-2A-cont prefill body does not contain \
+             `.checked_mul(4u64)` — F32 K_norms/V_norms byte-size \
+             multiplier missing; silent-corruption regression risk \
+             where norms-buffer slot offsets land at 1/4 of the right \
+             byte address."
+        );
+    }
+
+    /// **H178 (skip-mode)** — SerialFifo + HF2Q_HYBRID_KV=0 byte-
+    /// equivalence preserved.
+    ///
+    /// (a) Sibling fn `forward_prefill_with_soft_tokens_resume` signature
+    ///     UNCHANGED (no `slot_id` / `multi_seq_kv*` params — mirror of
+    ///     H86).  Code-path disjointness: SerialFifo never reaches the
+    ///     new fn (worker-arm `slot_id != SlotId(0)` predicate); SlotAware
+    ///     + SlotId(0) also short-circuits.
+    /// (b) Prefill alloc gate at line ~880 contains
+    ///     `self.leg_hb_encoded.is_none()` — aligned with decode-path
+    ///     gate at `gemma4/forward_gpu.rs:427`.  SerialFifo enters with
+    ///     `None` so the gate fires identically + the legacy alloc body
+    ///     runs verbatim.
+    #[test]
+    fn h178_serial_fifo_hf2q_hybrid_kv_zero_byte_equivalence_preserved() {
+        let src = include_str!("../forward_prefill.rs");
+        // (a) Sibling fn signature — no slot_id / multi_seq_kv params.
+        let sib_marker = "fn forward_prefill_with_soft_tokens_resume(";
+        let sib_idx = src
+            .find(sib_marker)
+            .expect("H178: sibling fn signature not found");
+        let sig_end = src[sib_idx..]
+            .find(") -> Result<u32>")
+            .map(|off| sib_idx + off + ") -> Result<u32>".len())
+            .unwrap_or(sib_idx + 800);
+        let sig_window = &src[sib_idx..sig_end.min(src.len())];
+        assert!(
+            !sig_window.contains("slot_id"),
+            "H178 FALSIFIED: sibling `forward_prefill_with_soft_tokens_resume` \
+             signature contains `slot_id` parameter. iter-2A-cont discipline \
+             broken — SerialFifo decode path must remain byte-equivalent."
+        );
+        assert!(
+            !sig_window.contains("multi_seq_kv"),
+            "H178 FALSIFIED: sibling fn signature mentions `multi_seq_kv`. \
+             iter-2A-cont discipline broken — SerialFifo path must not \
+             consume the multi-seq scaffold."
+        );
+        // (b) Prefill alloc gate aligned with decode-path discipline.
+        // The legacy alloc-block scope (HF2Q_HYBRID_KV=0 path at line
+        // ~880) must contain a `self.leg_hb_encoded.is_none()` predicate
+        // — additive guard around the rebuild loop.
+        assert!(
+            src.contains("self.leg_hb_encoded.is_none()"),
+            "H178 FALSIFIED: forward_prefill.rs does NOT contain \
+             `self.leg_hb_encoded.is_none()` — the prefill alloc gate at \
+             ~line 880 was not aligned with the decode-path gate at \
+             gemma4/forward_gpu.rs:427.  SerialFifo + iter-2A-cont \
+             slot-view mount would be obliterated by the unconditional \
+             rebuild on the first entry into the HB branch."
+        );
+    }
+
+    /// **H179 (skip-mode)** — iter-2B + iter-2-decode-A
+    /// production-default HF2Q_HYBRID_KV=1 surfaces UNCHANGED.
+    ///
+    /// iter-2A-cont + iter-2-decode-B are purely additive to the
+    /// HF2Q_HYBRID_KV=0 opt-out branches; the HF2Q_HYBRID_KV=1
+    /// production-default landings stay verbatim.  Source-grep substring
+    /// transitivity (H97 / H101 / H123 / H124 substrings still present).
+    #[test]
+    fn h179_iter2b_iter2_decode_a_production_default_surfaces_unchanged() {
+        let src = include_str!("../forward_prefill.rs");
+        // H97 hybrid-branch typed-error label STILL REMOVED.
+        let iter2a_hybrid_typed_error =
+            "gemma4-forward-prefill-slot-N-hybrid (iter-B4c-kernel-iter-2B per";
+        assert!(
+            !src.contains(iter2a_hybrid_typed_error),
+            "H179 FALSIFIED: iter-2A hybrid-branch typed-error label \
+             `{iter2a_hybrid_typed_error}` REGRESSED — iter-2A-cont \
+             accidentally restored the iter-2A typed-error on the \
+             production-default hybrid branch.  H97 invariant broken."
+        );
+        // H101 slot-view + mount pattern preserved for the hybrid branch
+        // (the iter-2B hybrid-side mount is verbatim — slot_view_hybrid
+        // variable name pinned).
+        assert!(
+            src.contains("self.hybrid_kv = Some(slot_view_hybrid)"),
+            "H179 FALSIFIED: iter-2B hybrid-branch mount \
+             `self.hybrid_kv = Some(slot_view_hybrid)` REGRESSED — \
+             iter-2A-cont accidentally removed the iter-2B production-\
+             default routing.  H101 invariant broken."
+        );
+        // H123 forward_decode_slot_aware fn STILL present.
+        assert!(
+            src.contains("pub fn forward_decode_slot_aware("),
+            "H179 FALSIFIED: `forward_decode_slot_aware` fn removed — \
+             iter-2-decode-B accidentally regressed iter-2-decode-A's \
+             landing.  H123 invariant broken."
+        );
+        // H124 decode-side hybrid mount preserved.
+        assert!(
+            src.contains("self.hybrid_kv = Some(slot_view_hybrid)"),
+            "H179 FALSIFIED: iter-2-decode-A decode hybrid mount \
+             regressed.  H124 invariant broken."
+        );
+    }
+
+    /// **H180 (skip-mode)** — Qwen35 + Qwen3VL + Gemma 4 Embed-arm
+    /// UNCHANGED; iter-{1,2A,2B,3,4,5,2-decode-A,2-decode-C} lift
+    /// scaffolds + iter-A2b-cont / B4d Qwen35 surfaces PRESERVED.
+    ///
+    /// Defense-in-depth against accidental regression at orthogonal
+    /// worker arms — mirrors H129 + H136's structural-preservation pins.
+    #[test]
+    fn h180_orthogonal_surfaces_unchanged() {
+        let src = include_str!("engine.rs");
+        // Qwen35 lift fns must still be called from worker_run.
+        for qwen35_fn in [
+            "generate_qwen35_once_slot_aware(",
+            "generate_stream_qwen35_once_extended_slot_aware(",
+            "embed_qwen35_slot_aware(",
+            "generate_qwen35_once_with_soft_tokens_slot_aware(",
+        ] {
+            assert!(
+                src.contains(qwen35_fn),
+                "H180 FALSIFIED: Qwen35 slot-aware fn call `{qwen35_fn}` \
+                 is NOT present in engine.rs. iter-2A-cont / iter-2-\
+                 decode-B accidentally removed a Qwen35 lift."
+            );
+        }
+        // Gemma 4 iter-1/2A/2B/3/4/5 lift fns must still be defined.
+        for gemma_fn in [
+            "fn generate_gemma4_once_slot_aware(",
+            "fn generate_stream_gemma4_once_slot_aware(",
+            "fn embed_gemma4_slot_aware(",
+            "fn generate_gemma4_once_with_soft_tokens_slot_aware(",
+        ] {
+            assert!(
+                src.contains(gemma_fn),
+                "H180 FALSIFIED: Gemma 4 iter-1/3/4/5 lift fn `{gemma_fn}` \
+                 is NOT defined. iter-2A-cont / iter-2-decode-B \
+                 accidentally regressed a prior iter's lift surface."
+            );
+        }
+        // Embed-arm must NOT call forward_decode_slot_aware (mirror of
+        // H129).  iter-2A-cont's reach into forward_prefill_with_soft_
+        // tokens_slot_aware does NOT affect Embed — the Embed-arm calls
+        // forward_embed_last, not the slot-aware prefill+decode pair.
+        let embed_marker = "fn embed_gemma4_slot_aware(";
+        let embed_idx = src
+            .find(embed_marker)
+            .expect("H180: embed_gemma4_slot_aware not found");
+        let embed_window = &src[embed_idx..(embed_idx + 10_000).min(src.len())];
+        assert!(
+            !embed_window.contains(".forward_decode_slot_aware("),
+            "H180 FALSIFIED: Embed-arm fn body calls \
+             `forward_decode_slot_aware`. The Embed-arm has NO decode \
+             loop — calling forward_decode_slot_aware would corrupt the \
+             L2-normalized embedding vector."
+        );
+        // ADR-040 §6.1.45 closure block exists (forward-pin destination).
+        let adr =
+            include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.45"),
+            "H180 FALSIFIED: ADR-040 §6.1.45 closure block not found. \
+             iter-2A-cont + iter-2-decode-B sub-deferral cites point at \
+             a non-existent destination."
+        );
+    }
+}

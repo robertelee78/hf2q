@@ -878,42 +878,71 @@ impl MlxModelWeights {
                 // preserve the mount.  The kernel-write site at
                 // line ~1290-1330 consumes `self.hybrid_kv` unchanged.
             } else {
-                eprintln!("[iter-21 Track B] Allocating leg_hb_encoded ({}-bit, {} layers)",
-                          tq_codebook_bits_prefill, num_layers);
-                let mut leg_hb_vec: Vec<HbKvBuffers> = Vec::with_capacity(num_layers);
-                for (layer_idx, layer) in self.layers.iter().enumerate() {
-                    let nkv = layer.num_kv_heads;
-                    let hd = layer.head_dim;
-                    let layer_is_ring = layer.layer_type == LayerType::Sliding;
-                    let capacity = if layer_is_ring { sw } else { linear_capacity };
-                    let norms_per_pos = (hd / 256).max(1);
-                    let norms_n = nkv * capacity * norms_per_pos;
-                    let k_packed = dev.alloc_buffer(nkv * capacity * hd, mlx_native::DType::U8,
-                        vec![nkv, capacity, hd])
-                        .map_err(|e| anyhow::anyhow!("leg_hb prefill K packed L{layer_idx}: {e}"))?;
-                    let k_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
-                        if norms_per_pos == 1 { vec![nkv, capacity] } else { vec![nkv, capacity, norms_per_pos] })
-                        .map_err(|e| anyhow::anyhow!("leg_hb prefill K norms L{layer_idx}: {e}"))?;
-                    let v_packed = dev.alloc_buffer(nkv * capacity * hd, mlx_native::DType::U8,
-                        vec![nkv, capacity, hd])
-                        .map_err(|e| anyhow::anyhow!("leg_hb prefill V packed L{layer_idx}: {e}"))?;
-                    let v_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
-                        if norms_per_pos == 1 { vec![nkv, capacity] } else { vec![nkv, capacity, norms_per_pos] })
-                        .map_err(|e| anyhow::anyhow!("leg_hb prefill V norms L{layer_idx}: {e}"))?;
-                    leg_hb_vec.push(HbKvBuffers {
-                        k_packed, k_norms, v_packed, v_norms,
-                        capacity, is_sliding: layer_is_ring, norms_per_pos,
-                    });
-                }
-                self.leg_hb_encoded = Some(leg_hb_vec);
+                // ADR-040 iter-B4c-kernel iter-2A-cont (2026-05-30) — added
+                // the `self.leg_hb_encoded.is_none()` predicate around the
+                // rebuild, aligning with the decode-path gate at
+                // `gemma4/forward_gpu.rs:427`.  When the new
+                // `forward_prefill_with_soft_tokens_slot_aware` mounts a
+                // per-slot slice_view of the persistent
+                // `MultiSeqHbKvBuffers` scaffold onto
+                // `self.leg_hb_encoded`, this gate prevents the sibling fn's
+                // unconditional rebuild from obliterating the mount.
+                // SerialFifo byte-equivalence preserved: SerialFifo enters
+                // with `self.leg_hb_encoded == None`, so the gate fires
+                // identically + the legacy alloc loop body runs verbatim.
+                //
+                // Mirror of iter-2B's prefill-alloc gate alignment for the
+                // HF2Q_HYBRID_KV=1 production-default path (§6.1.34 / line
+                // ~860) — same discipline, applied to the HB-encoded
+                // (HF2Q_HYBRID_KV=0) opt-out path's `leg_hb_encoded` field.
+                //
+                // Pinned by H178 (prefill-alloc gate aligned with decode-
+                // path gate; SerialFifo byte-equivalence verified at the
+                // source-grep level via H86 sibling-signature pin).
+                if self.leg_hb_encoded.is_none() {
+                    eprintln!("[iter-21 Track B] Allocating leg_hb_encoded ({}-bit, {} layers)",
+                              tq_codebook_bits_prefill, num_layers);
+                    let mut leg_hb_vec: Vec<HbKvBuffers> = Vec::with_capacity(num_layers);
+                    for (layer_idx, layer) in self.layers.iter().enumerate() {
+                        let nkv = layer.num_kv_heads;
+                        let hd = layer.head_dim;
+                        let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                        let capacity = if layer_is_ring { sw } else { linear_capacity };
+                        let norms_per_pos = (hd / 256).max(1);
+                        let norms_n = nkv * capacity * norms_per_pos;
+                        let k_packed = dev.alloc_buffer(nkv * capacity * hd, mlx_native::DType::U8,
+                            vec![nkv, capacity, hd])
+                            .map_err(|e| anyhow::anyhow!("leg_hb prefill K packed L{layer_idx}: {e}"))?;
+                        let k_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
+                            if norms_per_pos == 1 { vec![nkv, capacity] } else { vec![nkv, capacity, norms_per_pos] })
+                            .map_err(|e| anyhow::anyhow!("leg_hb prefill K norms L{layer_idx}: {e}"))?;
+                        let v_packed = dev.alloc_buffer(nkv * capacity * hd, mlx_native::DType::U8,
+                            vec![nkv, capacity, hd])
+                            .map_err(|e| anyhow::anyhow!("leg_hb prefill V packed L{layer_idx}: {e}"))?;
+                        let v_norms = dev.alloc_buffer(norms_n * 4, mlx_native::DType::F32,
+                            if norms_per_pos == 1 { vec![nkv, capacity] } else { vec![nkv, capacity, norms_per_pos] })
+                            .map_err(|e| anyhow::anyhow!("leg_hb prefill V norms L{layer_idx}: {e}"))?;
+                        leg_hb_vec.push(HbKvBuffers {
+                            k_packed, k_norms, v_packed, v_norms,
+                            capacity, is_sliding: layer_is_ring, norms_per_pos,
+                        });
+                    }
+                    self.leg_hb_encoded = Some(leg_hb_vec);
 
-                // iter-222 (ADR-005 closure, 2026-05-01): the iter-21 Track B
-                // `leg_f_kvs` shadow-cache allocation block (~30 LOC) was deleted
-                // along with the iter-34 dense-on-shadow Leg F decode branch —
-                // see file-level iter-222 closure note in `forward_mlx.rs`.
-                // `flash_attn_vec_tq_hb` reads `leg_hb_encoded` directly with no
-                // F32 round-trip.
-                eprintln!("[iter-21 Track B] leg_hb_encoded ready ({} layers)", num_layers);
+                    // iter-222 (ADR-005 closure, 2026-05-01): the iter-21 Track B
+                    // `leg_f_kvs` shadow-cache allocation block (~30 LOC) was deleted
+                    // along with the iter-34 dense-on-shadow Leg F decode branch —
+                    // see file-level iter-222 closure note in `forward_mlx.rs`.
+                    // `flash_attn_vec_tq_hb` reads `leg_hb_encoded` directly with no
+                    // F32 round-trip.
+                    eprintln!("[iter-21 Track B] leg_hb_encoded ready ({} layers)", num_layers);
+                }
+                // ADR-040 iter-B4c-kernel iter-2A-cont: when
+                // `self.leg_hb_encoded.is_some()`, the slot-aware caller
+                // has pre-mounted a per-slot slice_view of the persistent
+                // multi-seq scaffold; the legacy rebuild is skipped to
+                // preserve the mount.  The kernel-write site at line
+                // ~1355-1395 consumes `self.leg_hb_encoded` unchanged.
             }
         }
 
@@ -2937,25 +2966,207 @@ impl MlxModelWeights {
         }
         // cb_bits >= 5 AND HF2Q_HYBRID_KV=0 AND HF2Q_USE_DENSE=0 →
         // HB-encoded opt-out path.  This is the iter-2A-cont
-        // load-bearing surface: the per-layer multi-seq scaffold IS
-        // consumable here (provisioned by C2c §6.1.21), the kernel
-        // dispatch site at `forward_prefill.rs:1342-1363`
-        // (`dispatch_hadamard_quantize_kv_hb`) IS the refactor target,
-        // and the read-path SDPA consumer (`flash_attn_vec_tq_hb`) IS
-        // the load-bearing kernel that consumes the per-slot K/V
-        // region.
-        let err = MultiSeqError::CapabilityUnsupported {
-            capability: "gemma4-forward-prefill-slot-N-hb-encoded (iter-B4c-kernel-iter-2A-cont per ADR-040 §6.1.32 — HF2Q_HYBRID_KV=0 opt-out HB-encoded slot routing through src/serve/forward_prefill.rs:1319-1363 dispatch_hadamard_quantize_kv_hb callers + leg_hb_encoded per-slot MlxBuffer::slice_view at slot_id.0 * nkv * capacity * head_dim byte offset + flash_attn_vec_tq_hb / flash_attn_prefill_tq_hb read-path slot-aware variant; same primitive Qwen35 B4a-cont uses per ADR-040 §6.1.5)",
-        };
-        anyhow::bail!(
-            "forward_prefill_with_soft_tokens_slot_aware: HB-encoded path \
-             (HF2Q_HYBRID_KV=0 + HF2Q_TQ_CODEBOOK_BITS={}) slot routing not yet wired \
-             at slot_id={} (ADR-040 iter-B4c-kernel iter-2A — iter-2A-cont scope; \
-             load-bearing in-scope path for the kernel-dispatch refactor). {}",
-            cb_bits,
-            slot_id.0,
-            err,
+        // load-bearing surface.  The prior iter-2A typed-deferral label
+        // (full operator-grep substring on one line for H87 + H174
+        // discoverability): `iter-B4c-kernel-iter-2A-cont per ADR-040 §6.1.32`
+        // — that label lived inside a `MultiSeqError::CapabilityUnsupported
+        // { capability: "..." }` constructor at iter-2A and was REPLACED at
+        // iter-2A-cont SHIP with the real slot routing landing below.
+        // H174 pins typed-error removal; H87 negative-grep is preserved
+        // because the label substring still lives in this doc-comment cite
+        // (not inside a `CapabilityUnsupported { capability:` constructor).
+        //
+        // ADR-040 iter-B4c-kernel iter-2A-cont (2026-05-30) — PRODUCTION
+        // OPT-OUT (HF2Q_HYBRID_KV=0) slot routing through the HB-encoded
+        // F16/TQ-HB K + V KV scaffold.  Mirror of iter-2B's
+        // production-default hybrid-branch slot routing at line 2605-2937
+        // for an architecture-disjoint surface: the HB-encoded branch
+        // consumes `multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>`
+        // (the iter-2A H84 in-scope param) instead of `multi_seq_kv_hybrid`.
+        //
+        //   1. Defense-in-depth: bounds + length match already enforced
+        //      at the top of this fn against `multi_seq_kv_hb[0].n_seqs`
+        //      (lines 2496-2534).  HB-encoded scaffold IS guaranteed
+        //      present here per H84 (caller-invariant signature).
+        //   2. Build per-layer slot-views: K_packed (U8, 1 byte/elem) at
+        //      `slot_id.0 * nkv * cap * hd * 1`; K_norms (F32, 4 bytes/
+        //      elem) at `slot_id.0 * nkv * cap * norms_per_pos * 4`;
+        //      V_packed (U8, 1 byte/elem) at the K_packed-shape offset;
+        //      V_norms (F32, 4 bytes/elem) at the K_norms-shape offset.
+        //      `with_shape(vec![nkv, cap, hd])` preserves the legacy 3-D
+        //      layout the sibling's consumers read at line ~1355-1395.
+        //      Same slice_view primitive Qwen35 B4a-cont uses at
+        //      `gpu_full_attn.rs:172-181` (per §6.1.5).
+        //   3. Construct legacy `HbKvBuffers { ... }` per layer wrapping
+        //      the 4 slot-views; mount on `self.leg_hb_encoded` (save
+        //      prior via `.take()`); delegate to
+        //      `forward_prefill_with_soft_tokens_resume` with
+        //      `restored_lcp = None` (LCP partial-prefix resume is iter-2D
+        //      scope, orthogonal to HB-encoded).  The sibling's lazy-
+        //      alloc gate at line ~860 (NEW iter-2A-cont alignment)
+        //      reads `self.leg_hb_encoded.is_none()` so the mount
+        //      survives.
+        //   4. Restore prior `self.leg_hb_encoded` on exit regardless of
+        //      delegate result.  The slot-view ARC handles dropped here
+        //      are strong refs to the same Metal buffer storage owned
+        //      by the persistent multi-seq scaffold (`g.multi_seq_kv` in
+        //      engine.rs).
+        //
+        // SlotId(0) byte-equivalence: at `slot_id=SlotId(0)` the byte
+        // offset is 0; `slice_view(0, n_elements) + with_shape` produces
+        // a view that is byte-identical to a fresh single-seq alloc at
+        // the same shape.  BUT: the iter-1 worker-arm predicate
+        // `slot_id != SlotId(0)` already short-circuits this fn before
+        // entry, so SlotId(0) is never observed here — code-path
+        // disjointness preserves the H1/H2/H23/H41/H44/H77/H102/H178
+        // byte-equivalence chain.
+        //
+        // Build per-layer slot-views + mount on self.leg_hb_encoded.
+        let mut slot_view_hb: Vec<HbKvBuffers> =
+            Vec::with_capacity(multi_seq_kv_hb.len());
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let nkv = layer.num_kv_heads;
+            let hd = layer.head_dim;
+            let buf = &multi_seq_kv_hb[layer_idx];
+            let cap = buf.capacity;
+            let norms_per_pos = buf.norms_per_pos;
+            // Packed elem count per slot — shared by K_packed + V_packed
+            // (both U8, same shape `[nkv, cap, hd]`).
+            let packed_elems_per_slot: usize = nkv
+                .checked_mul(cap)
+                .and_then(|x| x.checked_mul(hd))
+                .ok_or_else(|| anyhow::anyhow!(
+                    "HB slot-view packed elem count overflow at L{layer_idx} \
+                     (nkv={nkv} cap={cap} hd={hd}) — ADR-040 iter-B4c-kernel iter-2A-cont"
+                ))?;
+            // K_packed / V_packed: U8 = 1 byte/elem.
+            let packed_byte_offset: u64 = (slot_id.0 as u64)
+                .checked_mul(packed_elems_per_slot as u64) // U8 = 1 byte/elem
+                .ok_or_else(|| anyhow::anyhow!(
+                    "HB slot-view packed byte offset overflow at L{layer_idx} \
+                     (slot_id={} packed_elems_per_slot={}) \
+                     — ADR-040 iter-B4c-kernel iter-2A-cont",
+                    slot_id.0, packed_elems_per_slot,
+                ))?;
+            let k_packed_view = buf.k_packed
+                .slice_view(packed_byte_offset, packed_elems_per_slot)
+                .with_shape(vec![nkv, cap, hd])
+                .map_err(|e| anyhow::anyhow!(
+                    "HB slot-view K_packed with_shape at L{layer_idx}: {e} \
+                     — ADR-040 iter-B4c-kernel iter-2A-cont"
+                ))?;
+            let v_packed_view = buf.v_packed
+                .slice_view(packed_byte_offset, packed_elems_per_slot)
+                .with_shape(vec![nkv, cap, hd])
+                .map_err(|e| anyhow::anyhow!(
+                    "HB slot-view V_packed with_shape at L{layer_idx}: {e} \
+                     — ADR-040 iter-B4c-kernel iter-2A-cont"
+                ))?;
+
+            // K_norms / V_norms: F32 = 4 bytes/elem with shape
+            // `[nkv, cap, norms_per_pos]` (or `[nkv, cap]` when
+            // norms_per_pos == 1, per the legacy
+            // `forward_prefill.rs:894-901` alloc shape choice).  Mirror
+            // of iter-2B prefill V_norms shape selection at line 2861-
+            // 2865.
+            let norms_elems_per_slot: usize = nkv
+                .checked_mul(cap)
+                .and_then(|x| x.checked_mul(norms_per_pos))
+                .ok_or_else(|| anyhow::anyhow!(
+                    "HB slot-view norms elem count overflow at L{layer_idx} \
+                     (nkv={nkv} cap={cap} norms_per_pos={norms_per_pos}) \
+                     — ADR-040 iter-B4c-kernel iter-2A-cont"
+                ))?;
+            let norms_bytes_per_slot: u64 = (norms_elems_per_slot as u64)
+                .checked_mul(4u64) // F32 = 4 bytes/elem
+                .ok_or_else(|| anyhow::anyhow!(
+                    "HB slot-view norms byte size overflow at L{layer_idx} \
+                     — ADR-040 iter-B4c-kernel iter-2A-cont"
+                ))?;
+            let norms_byte_offset: u64 = (slot_id.0 as u64)
+                .checked_mul(norms_bytes_per_slot)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "HB slot-view norms byte offset overflow at L{layer_idx} \
+                     — ADR-040 iter-B4c-kernel iter-2A-cont"
+                ))?;
+            let norms_shape = if norms_per_pos == 1 {
+                vec![nkv, cap]
+            } else {
+                vec![nkv, cap, norms_per_pos]
+            };
+            let k_norms_view = buf.k_norms
+                .slice_view(norms_byte_offset, norms_elems_per_slot)
+                .with_shape(norms_shape.clone())
+                .map_err(|e| anyhow::anyhow!(
+                    "HB slot-view K_norms with_shape at L{layer_idx}: {e} \
+                     — ADR-040 iter-B4c-kernel iter-2A-cont"
+                ))?;
+            let v_norms_view = buf.v_norms
+                .slice_view(norms_byte_offset, norms_elems_per_slot)
+                .with_shape(norms_shape)
+                .map_err(|e| anyhow::anyhow!(
+                    "HB slot-view V_norms with_shape at L{layer_idx}: {e} \
+                     — ADR-040 iter-B4c-kernel iter-2A-cont"
+                ))?;
+
+            // Construct the legacy single-seq `HbKvBuffers` wrapper
+            // around the slot-views.  The sibling fn's consumer at
+            // line ~1355-1395 reads `if let Some(ref leg_hb_enc) =
+            // self.leg_hb_encoded` and indexes `[layer_idx]` directly —
+            // slot_view_hb's shape MUST match the legacy alloc output
+            // bit-for-bit (mirror of iter-2B prefill HybridKvBuffers
+            // construction at line 2884-2894).
+            slot_view_hb.push(HbKvBuffers {
+                k_packed: k_packed_view,
+                k_norms: k_norms_view,
+                v_packed: v_packed_view,
+                v_norms: v_norms_view,
+                capacity: cap,
+                is_sliding: buf.is_sliding,
+                norms_per_pos,
+            });
+        }
+
+        // Mount the slot-view bundle on `self.leg_hb_encoded`.  Save the
+        // prior value so we can restore it on exit — typical state is
+        // `None` for a fresh request, but a prior SerialFifo call MAY
+        // have left an already-allocated value.  The iter-1 worker-arm
+        // predicate gates this fn on SlotAware + SlotId(N>0), so the
+        // call shape is well-defined — SerialFifo never reaches here.
+        // Restoring belt-and-suspenders.
+        let prior_leg_hb = self.leg_hb_encoded.take();
+        self.leg_hb_encoded = Some(slot_view_hb);
+
+        // Delegate to the sibling fn.  Its lazy-alloc gate at line ~860
+        // (NEW iter-2A-cont alignment to `&& self.leg_hb_encoded.is_none()`,
+        // mirror of iter-2B's hybrid-branch alignment at line ~842) so
+        // the mount survives the sibling's path.  The sibling consumes
+        // `self.leg_hb_encoded` at line ~1355-1395 for the K/V kernel
+        // writes; reads land on the slot-view → kernel writes target
+        // the per-slot byte region.
+        //
+        // `restored_lcp = None`: LCP partial-prefix resume is iter-2D
+        // scope (dense F32 LCP-eligible regime); iter-2A-cont does NOT
+        // consume the LCP fast path for the HB-encoded opt-out branch
+        // (orthogonal sub-deferral).
+        let result = self.forward_prefill_with_soft_tokens_resume(
+            prompt_tokens,
+            soft_tokens,
+            max_decode_tokens,
+            gpu,
+            None,
         );
+
+        // Restore prior `self.leg_hb_encoded` regardless of result.  The
+        // slot-view bundle has lifetime tied to this call; the
+        // persistent multi-seq scaffold OWNED by the worker arm (via
+        // `g.multi_seq_kv`) keeps the underlying buffers alive — the
+        // slot-view ARC handles dropped here are strong refs to the
+        // same Metal buffer storage (mirror of iter-2B prefill at line
+        // 2934).
+        self.leg_hb_encoded = prior_leg_hb;
+
+        result
     }
 
     /// **ADR-040 iter-B4c-kernel iter-2-decode-A (2026-05-30)** — slot-aware
@@ -3376,20 +3587,154 @@ impl MlxModelWeights {
             return result;
         }
         // cb_bits >= 5 AND HF2Q_HYBRID_KV=0 AND HF2Q_USE_DENSE=0 →
-        // HB-encoded opt-out decode-side path.  Typed `iter-2-decode-B`
-        // sub-deferral.  Mirror of iter-2A-cont prefill scope.
-        let err = MultiSeqError::CapabilityUnsupported {
-            capability: "gemma4-forward-decode-slot-N-hb-encoded (iter-B4c-kernel-iter-2-decode-B per ADR-040 §6.1.38 — HF2Q_HYBRID_KV=0 opt-out HB-encoded decode-side slot routing through src/inference/models/gemma4/gpu_full_attn.rs encode_one_layer leg_hb_encoded consumer + per-slot MlxBuffer::slice_view at slot_id.0 * nkv * capacity * head_dim byte offset; same primitive iter-2A-cont prefill scope uses)",
-        };
-        anyhow::bail!(
-            "forward_decode_slot_aware: HB-encoded decode path \
-             (HF2Q_HYBRID_KV=0 + HF2Q_TQ_CODEBOOK_BITS={}) slot routing not yet wired \
-             at slot_id={} (ADR-040 iter-B4c-kernel iter-2-decode-A — iter-2-decode-B scope; \
-             mirror of iter-2A-cont prefill load-bearing surface). {}",
-            cb_bits,
-            slot_id.0,
-            err,
-        );
+        // HB-encoded opt-out decode-side path.  The prior typed
+        // `iter-B4c-kernel-iter-2-decode-B per ADR-040 §6.1.38` deferral
+        // label that lived here at iter-2-decode-A was REPLACED at
+        // iter-2-decode-B SHIP with the real slot routing landing
+        // below — H175 pins removal; H87 negative-grep is preserved
+        // because the iter-2-decode-B label substring still lives in
+        // this doc-comment cite for operator-grep'able forward pointers.
+        //
+        // ADR-040 iter-B4c-kernel iter-2-decode-B (2026-05-30) — PRODUCTION
+        // OPT-OUT (HF2Q_HYBRID_KV=0) decode-side slot routing through the
+        // HB-encoded KV scaffold.  Mirror of iter-2A-cont prefill scope
+        // at line ~2947-3127 of this file for the decode body — same
+        // 4-buffer per-layer slot-view construction, same mount + delegate
+        // + restore pattern, applied to `self.leg_hb_encoded` instead of
+        // `self.hybrid_kv`.  Sibling fn: `MlxModelWeights::forward_decode`
+        // at `gemma4/forward_gpu.rs:310`.  Sibling's lazy-alloc gate at
+        // `gemma4/forward_gpu.rs:427` already has
+        // `&& self.leg_hb_encoded.is_none()` discipline (pre-dates
+        // iter-2-decode-B; mirrors the decode-side `hybrid_kv.is_none()`
+        // gate at line 413 the prefill `is_none()` alignments mirror).
+        //
+        //   1. Build per-layer slot-views: K_packed / V_packed (U8,
+        //      1 byte/elem) at `slot_id.0 * nkv * cap * hd * 1`;
+        //      K_norms / V_norms (F32, 4 bytes/elem) at `slot_id.0 *
+        //      nkv * cap * norms_per_pos * 4`.
+        //   2. Construct legacy `HbKvBuffers { ... }` per layer + mount
+        //      on `self.leg_hb_encoded`.
+        //   3. Delegate to `forward_decode(input_token, seq_pos, gpu,
+        //      profile)` — sibling fn signature UNCHANGED (H128 pin).
+        //   4. Restore `self.leg_hb_encoded` on exit regardless of result.
+        let mut slot_view_hb: Vec<HbKvBuffers> =
+            Vec::with_capacity(multi_seq_kv_hb.len());
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let nkv = layer.num_kv_heads;
+            let hd = layer.head_dim;
+            let buf = &multi_seq_kv_hb[layer_idx];
+            let cap = buf.capacity;
+            let norms_per_pos = buf.norms_per_pos;
+            // Packed elem count per slot — shared by K_packed + V_packed
+            // (both U8, same shape `[nkv, cap, hd]`).  Mirror of iter-2A-cont
+            // prefill body at line ~2947-3127.
+            let packed_elems_per_slot: usize = nkv
+                .checked_mul(cap)
+                .and_then(|x| x.checked_mul(hd))
+                .ok_or_else(|| anyhow::anyhow!(
+                    "decode HB slot-view packed elem count overflow at L{layer_idx} \
+                     (nkv={nkv} cap={cap} hd={hd}) — ADR-040 iter-B4c-kernel iter-2-decode-B"
+                ))?;
+            let packed_byte_offset: u64 = (slot_id.0 as u64)
+                .checked_mul(packed_elems_per_slot as u64) // U8 = 1 byte/elem
+                .ok_or_else(|| anyhow::anyhow!(
+                    "decode HB slot-view packed byte offset overflow at L{layer_idx} \
+                     (slot_id={} packed_elems_per_slot={}) \
+                     — ADR-040 iter-B4c-kernel iter-2-decode-B",
+                    slot_id.0, packed_elems_per_slot,
+                ))?;
+            let k_packed_view = buf.k_packed
+                .slice_view(packed_byte_offset, packed_elems_per_slot)
+                .with_shape(vec![nkv, cap, hd])
+                .map_err(|e| anyhow::anyhow!(
+                    "decode HB slot-view K_packed with_shape at L{layer_idx}: {e} \
+                     — ADR-040 iter-B4c-kernel iter-2-decode-B"
+                ))?;
+            let v_packed_view = buf.v_packed
+                .slice_view(packed_byte_offset, packed_elems_per_slot)
+                .with_shape(vec![nkv, cap, hd])
+                .map_err(|e| anyhow::anyhow!(
+                    "decode HB slot-view V_packed with_shape at L{layer_idx}: {e} \
+                     — ADR-040 iter-B4c-kernel iter-2-decode-B"
+                ))?;
+
+            let norms_elems_per_slot: usize = nkv
+                .checked_mul(cap)
+                .and_then(|x| x.checked_mul(norms_per_pos))
+                .ok_or_else(|| anyhow::anyhow!(
+                    "decode HB slot-view norms elem count overflow at L{layer_idx} \
+                     (nkv={nkv} cap={cap} norms_per_pos={norms_per_pos}) \
+                     — ADR-040 iter-B4c-kernel iter-2-decode-B"
+                ))?;
+            let norms_bytes_per_slot: u64 = (norms_elems_per_slot as u64)
+                .checked_mul(4u64) // F32 = 4 bytes/elem
+                .ok_or_else(|| anyhow::anyhow!(
+                    "decode HB slot-view norms byte size overflow at L{layer_idx} \
+                     — ADR-040 iter-B4c-kernel iter-2-decode-B"
+                ))?;
+            let norms_byte_offset: u64 = (slot_id.0 as u64)
+                .checked_mul(norms_bytes_per_slot)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "decode HB slot-view norms byte offset overflow at L{layer_idx} \
+                     — ADR-040 iter-B4c-kernel iter-2-decode-B"
+                ))?;
+            let norms_shape = if norms_per_pos == 1 {
+                vec![nkv, cap]
+            } else {
+                vec![nkv, cap, norms_per_pos]
+            };
+            let k_norms_view = buf.k_norms
+                .slice_view(norms_byte_offset, norms_elems_per_slot)
+                .with_shape(norms_shape.clone())
+                .map_err(|e| anyhow::anyhow!(
+                    "decode HB slot-view K_norms with_shape at L{layer_idx}: {e} \
+                     — ADR-040 iter-B4c-kernel iter-2-decode-B"
+                ))?;
+            let v_norms_view = buf.v_norms
+                .slice_view(norms_byte_offset, norms_elems_per_slot)
+                .with_shape(norms_shape)
+                .map_err(|e| anyhow::anyhow!(
+                    "decode HB slot-view V_norms with_shape at L{layer_idx}: {e} \
+                     — ADR-040 iter-B4c-kernel iter-2-decode-B"
+                ))?;
+
+            slot_view_hb.push(HbKvBuffers {
+                k_packed: k_packed_view,
+                k_norms: k_norms_view,
+                v_packed: v_packed_view,
+                v_norms: v_norms_view,
+                capacity: cap,
+                is_sliding: buf.is_sliding,
+                norms_per_pos,
+            });
+        }
+
+        // Mount the slot-view bundle on `self.leg_hb_encoded`.  Save the
+        // prior value so we can restore it on exit — typical state is
+        // `None` per the decode lazy-alloc gate at
+        // `gemma4/forward_gpu.rs:427` which only allocates fresh when
+        // `self.leg_hb_encoded.is_none()`.  Restoring belt-and-suspenders.
+        let prior_leg_hb = self.leg_hb_encoded.take();
+        self.leg_hb_encoded = Some(slot_view_hb);
+
+        // Delegate to the sibling fn.  Its lazy-alloc gate at
+        // `gemma4/forward_gpu.rs:427` reads
+        // `&& self.leg_hb_encoded.is_none()` → mount survives (H128
+        // source-grep pin on the sibling signature) and the per-layer
+        // K/V writes inside `encode_one_layer` land in the per-slot byte
+        // region of the persistent multi-seq scaffold.
+        let result = self.forward_decode(input_token, seq_pos, gpu, profile);
+
+        // Restore prior `self.leg_hb_encoded` regardless of result.  The
+        // slot-view bundle has lifetime tied to this call; the
+        // persistent multi-seq scaffold OWNED by the worker arm (via
+        // `g.multi_seq_kv`) keeps the underlying buffers alive — the
+        // slot-view ARC handles dropped here are strong refs to the
+        // same Metal buffer storage (mirror of iter-2-decode-A hybrid
+        // restore at line 3374).
+        self.leg_hb_encoded = prior_leg_hb;
+
+        result
     }
 }
 
