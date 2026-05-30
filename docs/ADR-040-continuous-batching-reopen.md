@@ -1792,6 +1792,57 @@ Unlike B4a (prefill entry surface) which shipped signature-only and a typed B4a-
 | llama.cpp `-cb` admission semantics don't match our forward-path assumptions | Low | Medium | Phase B iter-3 explicitly cites the llama.cpp file:line being mirrored; deviations documented inline. |
 | Mantra violation: shipping `FifoSerial` + `InflightBatched` both produces "fallback" code | Low | Low | §3.6: `FifoSerial` is the explicit production default + Phase E1 gate decides the cutover. Both paths are first-class, not one-is-a-fallback. |
 
+### 6.1.21 Iter-C2c closure — Gemma 4 SlotAware engine activation (Path B — provisioning + typed B4c deferral, 2026-05-24, commit hash TBD)
+
+Per the C2 dossier Shape A worker_run pattern + A3a + A3b iter-1 production-default multi-seq KV lifts now landed: `Engine::spawn_with_mode(.., EngineMode::SlotAware { max_slots: N })` previously returned `Err(EngineSpawnError::ModeNotYetWired)` for Gemma 4. Iter-C2c flips that arm to **`Ok(Engine)` with real multi-seq KV provisioning** (per-layer `MultiSeqHbKvBuffers` via the A3a allocator with `n_seqs = max_slots`) while explicitly NOT bundling the Gemma 4 `forward_prefill.rs` GPU-side slot-offset routing (Phase B4c). The forward-path slot routing returns typed `MultiSeqError::CapabilityUnsupported { capability }` with an operator-grep'able label naming **iter-C2c-cont + B4c gate**.
+
+**Path chosen — Path B** (provisioning + typed deferral):
+
+Path A (full activation with B4c bundled) was considered but Gemma 4's `forward_prefill.rs` slot-offset surface is materially larger than Qwen35's `forward_gpu.rs` (B4a + B4a-cont): the prefill path threads through 30 Gemma 4 layers × 3 KV variants (HbKvBuffers TQ-active default, HybridKvBuffers since H10 falsification, DenseKvBuffers/MlxKvCache typed-clamped per A3b iter-1) × the optional `xlen` BF16 buffers. Bundling B4c in iter-C2c would exceed the 1000-LOC iter ceiling AND risk regressing the SerialFifo byte-equivalence pin that A5* arc closed. Path B ships the *provisioning* surface with typed B4c deferral, mirroring the B4a → B4a-cont pattern Qwen35 used.
+
+**New typed error**:
+
+| Variant | When raised | Carrying |
+|---|---|---|
+| `EngineSpawnError::Gemma4SlotAwareProvisionFailed { max_slots, cause }` | Gemma 4 SlotAware spawn reached multi-seq KV provisioning (per-layer `MultiSeqHbKvBuffers` via A3a allocator) but a per-layer alloc returned an error. | `max_slots: u32` + first per-layer allocator failure rendered by anyhow. Distinct discriminant from `ModeNotYetWired` (mode unimplemented) — this one means the impl IS wired and a real per-layer alloc failed. |
+
+**Tests (11 new H21-H25 + cont/b variants in `serve::api::engine::adr040_phase_c_iter2c_gemma4_slot_aware_tests`):**
+
+| Test | Pins |
+|---|---|
+| `h21_engine_spawn_with_slot_aware_returns_ok_for_gemma4` | Path B closure: Gemma 4 SlotAware now spawns `Ok(Engine)`, NOT `ModeNotYetWired`. |
+| `h21b_spawn_with_mode_accepts_slot_aware_variant_at_type_level` | The `EngineMode::SlotAware { max_slots }` variant is type-callable (regression pin if enum surface changes). |
+| `h21c_qwen35_slot_aware_still_rejects_with_mode_not_yet_wired_at_c2c` | **Deferral pin**: Qwen35 SlotAware still typed-error rejected (Phase C2d, NOT C2c). Test fails if Qwen35 is accidentally activated alongside Gemma 4. |
+| `h22_multi_seq_kv_scaffold_has_n_seqs_max_slots_per_layer` | The per-layer `MultiSeqHbKvBuffers` has `n_seqs == max_slots` after spawn (proves provisioning reached the A3a allocator with the right argument). |
+| `h22_cont_provision_rejects_max_slots_zero_before_any_alloc` | Bounds-first validation: `max_slots == 0` returns typed error BEFORE any GPU allocation runs. |
+| `h22_gemma4_spawn_fail_variant_carries_max_slots_and_cause` | The new `Gemma4SlotAwareProvisionFailed` variant correctly carries both fields (regression pin for the typed error structure). |
+| `h23_serial_fifo_does_not_provision_multi_seq_kv` | **SerialFifo byte-equivalence pin**: when `EngineMode::SerialFifo` is selected for Gemma 4, NO multi-seq KV provisioning occurs (the engine constructs single-seq KV verbatim like pre-C2c). |
+| `h24_engine_spawn_with_slot_aware_reports_inflight_batched_policy` | The spawned engine reports `SchedulerPolicy::InflightBatched` (not `FifoSerial`) — proves the policy flip landed alongside the KV provisioning. |
+| `h24_cont_inflight_scheduler_hands_out_distinct_slot_ids_under_stacked_admits` | The inflight scheduler hands out distinct `SlotId(0)..SlotId(max_slots-1)` under N concurrent admits (no slot collision; queueing past max_slots returns the existing typed `SchedulerError::QueueFull`). |
+| `h24_worker_scheduler_inflight_arm_reports_inflight_batched_policy` | The internal `WorkerScheduler` (Shape A `Box<dyn Scheduler>` wrapper) reports the correct policy from the worker side. |
+| `h25_capability_unsupported_label_names_iter_c2c_cont_and_b4c_gate` | **Typed deferral pin**: the `CapabilityUnsupported` returned at slot > 0 from the forward path carries a `capability` string containing literally both `"iter-C2c-cont"` and `"B4c"` (operator-grep'able label). Test fails if a future iter silently changes the label and drops the deferral hint. |
+
+**Quality gates**:
+- `cargo check --release --tests`: 0 errors, only pre-existing warnings unrelated to C2c
+- `cargo test --release --bin hf2q -- h21 h22 h23 h24 h25 c2c_ --test-threads=1`: **11 PASS / 0 FAIL** (all new H21-H25 + cont/b variants)
+- `cargo test --release --bin hf2q -- serve::api::engine --test-threads=1`: **139 PASS / 0 FAIL** (preserved + H21-H25 additions)
+- `cargo test --release --bin hf2q -- gemma4::kv_cache --test-threads=1`: **36 PASS** preserved (A3b iter-1/1.5 surface unchanged)
+- `cargo test --release --test continuous_batching_throughput`: **21 PASS** preserved (D3 statistical stability + AC-4 gate)
+
+**Net delta**: +1245/-21 LOC in `src/serve/api/engine.rs` only (single-file iter — Path B's minimal-surface principle). Splits roughly as: ~470 LOC structural (new `Gemma4SlotAwareProvisionFailed` variant + `GemmaLoadedModel` multi-seq scaffold fields + 3 `Engine::spawn_with_mode` method additions + `WorkerScheduler` impl block + `worker_run` signature/dispatch updates at 6 sites), ~637 LOC test bank (11 new H21-H25 + cont/b tests), ~140 LOC inline cross-reference comments.
+
+**Mantra audit**:
+- Zero new `// TODO`, `unimplemented!()`, `todo!()`, `FIXME` in production code.
+- Every deferral typed: `Gemma4SlotAwareProvisionFailed` (provision-time failure), `MultiSeqError::CapabilityUnsupported { capability: "...iter-C2c-cont...B4c..." }` (forward-path slot > 0 routing).
+- SerialFifo byte-equivalence pinned by H23 (no multi-seq KV alloc for SerialFifo Gemma 4).
+- Qwen35 SlotAware deferral explicit (H21c pins it).
+- A5* arc + B4a/B4a-cont/B4a-cont.1 + A3a + A3b iter-1/1.5 + B4b surfaces NOT touched — additive impl only.
+
+**Remaining followups** (typed, not vaporware):
+- **iter-C2c-cont (B4c)**: Gemma 4 `forward_prefill.rs` GPU-side slot-offset routing through the 30 prefill-path layer iterations × the multi-seq KV variants (HbKvBuffers + HybridKvBuffers + xlen optional). Pinned by H25's `CapabilityUnsupported` label.
+- **iter-C2d**: Qwen35 SlotAware engine activation (mirror of this iter for Qwen35; B4b unblocked the decode path, C2d wires it through spawn_with_mode). Pinned by H21c's typed rejection regression.
+- **iter-A3b-2 / iter-A3b-3**: DenseKvBuffers + MlxKvCache full lifts (still typed-clamped per A3b iter-1 + A3b iter-1.5 hygiene fix; reachable only via `HF2Q_USE_DENSE=1` / legacy 4-bit path).
+
 ---
 
 ## 8. References

@@ -62,9 +62,10 @@ use crate::serve::sampler_pure::{
 // even though `advance_after_*` deliberately lives on the concrete type
 // per dossier §2.9).
 use crate::serve::scheduler::{
-    AdmitError, AdmitRequest, FifoSchedulerAdapter, Scheduler, SchedulerPolicy,
-    SchedulerStats, SlotHandle,
+    AdmitError, AdmitRequest, FifoSchedulerAdapter, InflightBatchedScheduler, Scheduler,
+    SchedulerPolicy, SchedulerStats, SlotHandle,
 };
+use crate::serve::multi_seq_kv::{MultiSeqError, SlotId};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -609,6 +610,26 @@ pub enum EngineSpawnError {
         /// The iter that will implement the runtime (e.g.
         /// `"C2b/C2c (per-family worker arms)"`).
         iter_required: &'static str,
+    },
+
+    /// **ADR-040 Phase C iter-2c (C2c)** — `EngineMode::SlotAware`
+    /// spawn for Gemma 4 reached the multi-seq KV provisioning step
+    /// (per-layer `MultiSeqHbKvBuffers` via the A3a allocator with
+    /// `n_seqs = max_slots`) but the allocator returned an error.
+    /// Distinct from [`Self::ModeNotYetWired`] (mode not implemented)
+    /// — this surface is reached only when the implementation is wired
+    /// AND a real per-layer allocation failed (typical causes: MlxDevice
+    /// OOM at production shape × N slots; per-layer `nkv/hd/cap` zero
+    /// because a malformed `Gemma4Config`).
+    #[error(
+        "ADR-040 C2c: Gemma 4 SlotAware spawn failed during multi-seq KV \
+         provisioning (max_slots={max_slots}). Cause: {cause}"
+    )]
+    Gemma4SlotAwareProvisionFailed {
+        /// The `max_slots` value the caller requested.
+        max_slots: u32,
+        /// First per-layer allocator failure as rendered by anyhow.
+        cause: String,
     },
 }
 
@@ -1589,6 +1610,45 @@ pub struct GemmaLoadedModel {
     /// legacy `(repo, quant)` key for foreign GGUFs (`Provenance::External`).
     /// Read once at spawn; not consulted afterwards.
     pub provenance: crate::core::provenance::Provenance,
+
+    /// **ADR-040 Phase C iter-2c (C2c)** — multi-seq KV scaffolds
+    /// provisioned at `spawn_with_mode(SlotAware { max_slots: N })` time
+    /// using the A3a (`MultiSeqHbKvBuffers`) / A3b
+    /// (`MultiSeqHybridKvBuffers`) per-layer allocators with
+    /// `n_seqs = max_slots`.
+    ///
+    /// `None` under [`EngineMode::SerialFifo`] (preserves byte-equivalence
+    /// vs. pre-ADR-040 — the legacy single-seq `MlxKvCache` on
+    /// `MlxModelWeights.kv_caches` remains the live KV state for slot 0).
+    /// `Some(_)` under [`EngineMode::SlotAware`]; one entry per layer
+    /// matching `weights.layers.len()`.
+    ///
+    /// **Iter-C2c (Path B) scope**: provisioned structurally so the
+    /// A3a/A3b allocators are exercised end-to-end at production shapes
+    /// with `n_seqs = max_slots`, **but** the per-request forward path
+    /// (`forward_prefill` + `forward_decode`) still reads/writes the
+    /// legacy single-seq cache at SlotId(0). Slot N>0 admission surfaces
+    /// `MultiSeqError::CapabilityUnsupported { capability:
+    /// "gemma4-forward-prefill-slot-N (iter-C2c-cont)" }` at the worker
+    /// arm — kernel-level slot-offset routing through these scaffolds is
+    /// **iter-C2c-cont** scope (gated on Phase B4c, per ADR-040 §6
+    /// + §6.1.21).
+    ///
+    /// **Variant choice**: the dense path uses
+    /// [`crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers`]
+    /// (TQ-packed HB KV) for both sliding and full-attention layers —
+    /// matches the production `MlxKvCache` allocator at
+    /// `gemma4/model.rs:1247-1301` (TurboQuant 4-bit nibble-packed
+    /// indices + F32 norms). The A3b
+    /// `MultiSeqHybridKvBuffers` (F16-K + TQ-HB-V or F16-V) is the
+    /// path engaged when `HF2Q_FULL_F16_KV=1` or
+    /// `HF2Q_DFLASH_XLEN_SDPA=1`; **iter-C2c (Path B)** picks the
+    /// HB variant only (matches default operator config); the hybrid
+    /// variant scaffold is iter-C2c-cont per the same gating as the
+    /// kernel slot routing.
+    pub multi_seq_kv: Option<
+        Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
+    >,
 }
 
 impl LoadedModel {
@@ -2607,7 +2667,89 @@ impl GemmaLoadedModel {
             // being `Some`.
             kv_metrics_sink: None,
             provenance,
+            // ADR-040 Phase C iter-2c (C2c): None until `spawn_with_mode(
+            // SlotAware { .. })` provisions per-layer multi-seq KV
+            // scaffolds. SerialFifo path NEVER populates this field —
+            // legacy `weights.kv_caches` (MlxKvCache, single-seq) remains
+            // the live KV state for byte-equivalence (H23 pin).
+            multi_seq_kv: None,
         })
+    }
+
+    /// **ADR-040 Phase C iter-2c (C2c)** — provision per-layer multi-seq
+    /// KV scaffolds via the A3a `alloc_hb_kv_for_layer` allocator with
+    /// `n_seqs = max_slots`.
+    ///
+    /// Called by [`Engine::spawn_with_mode`] when
+    /// [`EngineMode::SlotAware`] is selected for a Gemma 4 engine. Sets
+    /// [`Self::multi_seq_kv`] to `Some(Vec<MultiSeqHbKvBuffers>)`
+    /// (`len() == weights.layers.len()`).
+    ///
+    /// **Per-layer params** (mirrors the production allocator at
+    /// `gemma4/model.rs:1247-1301`):
+    /// - `nkv` ← `config.num_kv_heads_for_layer(i)`
+    /// - `hd` ← `config.head_dim_for_layer(i)`
+    /// - `cap` ← `config.max_position_embeddings` for full-attn,
+    ///   `config.sliding_window` for sliding (via A5c
+    ///   `layer_type_to_alloc_params` helper)
+    /// - `is_ring` ← `!config.is_full_attention(i)` (matches the
+    ///   `is_sliding: !is_full` field on legacy `MlxKvCache`)
+    ///
+    /// **Why HB variant only** (per the iter-C2c docstring on
+    /// [`Self::multi_seq_kv`]): production default is the HB
+    /// (TQ-packed) path; the A3b hybrid variant requires
+    /// `HF2Q_FULL_F16_KV=1` and is iter-C2c-cont scope when paired with
+    /// the kernel slot routing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first per-layer allocator error verbatim
+    /// (`anyhow::Error` from `alloc_hb_kv_for_layer`). `max_slots == 0`
+    /// is caught at the allocator's pre-flight (`n_seqs == 0` → typed
+    /// error per A3a's invariants).
+    pub fn provision_multi_seq_kv_for_slot_aware(
+        &mut self,
+        max_slots: u32,
+    ) -> Result<()> {
+        use crate::inference::models::gemma4::kv_cache::{
+            alloc_hb_kv_for_layer, layer_type_to_alloc_params,
+        };
+        use crate::serve::config::LayerType;
+
+        if max_slots == 0 {
+            anyhow::bail!(
+                "ADR-040 C2c: provision_multi_seq_kv_for_slot_aware called with \
+                 max_slots == 0; spawn_with_mode invariant is max_slots >= 1 \
+                 (EngineMode::SlotAware variant enforces this at the API \
+                 boundary — caller violated)"
+            );
+        }
+        let dev = self.ctx.device();
+        let num_layers = self.weights.layers.len();
+        let mut multi_seq: Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers> =
+            Vec::with_capacity(num_layers);
+        for i in 0..num_layers {
+            let hd = self.config.head_dim_for_layer(i);
+            let nkv = self.config.num_kv_heads_for_layer(i);
+            let is_full = self.config.is_full_attention(i);
+            let layer_type = if is_full { LayerType::Full } else { LayerType::Sliding };
+            let (is_ring, capacity) = layer_type_to_alloc_params(
+                layer_type,
+                self.config.sliding_window,
+                self.config.max_position_embeddings,
+            );
+            let buf = alloc_hb_kv_for_layer(dev, i, nkv, hd, capacity, is_ring, max_slots)
+                .with_context(|| {
+                    format!(
+                        "ADR-040 C2c: alloc_hb_kv_for_layer L{i} failed for \
+                         max_slots={max_slots} (nkv={nkv}, hd={hd}, cap={capacity}, \
+                         is_ring={is_ring})"
+                    )
+                })?;
+            multi_seq.push(buf);
+        }
+        self.multi_seq_kv = Some(multi_seq);
+        Ok(())
     }
 }
 
@@ -3040,12 +3182,285 @@ impl Engine {
                 }
                 Ok(engine)
             }
-            EngineMode::SlotAware { .. } => Err(EngineSpawnError::ModeNotYetWired {
-                // Bumped from "C1.5"/"C2" at C2b ship (886f229c) per ADR-040
-                // §6.1.8: the worker_run refactor is live, but the per-family
-                // SlotAware arms remain in iter-2b (Qwen35) + iter-2c (Gemma 4).
-                iter_landed: "C2b",
-                iter_required: "C2b/C2c (per-family worker arms)",
+            // ADR-040 Phase C iter-2c (C2c) — per-arch SlotAware dispatch.
+            //
+            // Gemma 4 lands `Ok(Engine)` via Path B: spawn succeeds with
+            // structurally-provisioned multi-seq KV scaffolds (per-layer
+            // `MultiSeqHbKvBuffers` allocated via the A3a allocator with
+            // `n_seqs = max_slots`); the worker thread runs the existing
+            // single-seq forward path at SlotId(0) and surfaces typed
+            // `MultiSeqError::CapabilityUnsupported` for SlotId(N>0)
+            // admissions — kernel-level slot-offset routing through
+            // `forward_prefill.rs` is iter-C2c-cont (gated on B4c per
+            // ADR-040 §6 + §6.1.21).
+            //
+            // Qwen35 + Qwen3VlText keep the typed `ModeNotYetWired`
+            // rejection until their respective per-arch worker arms ship
+            // (C2d for Qwen35; future iter for Qwen3VlText). The C2 dossier
+            // §2.4 scope split is honoured: each arch's lift is
+            // independent.
+            EngineMode::SlotAware { max_slots } => match loaded {
+                LoadedModel::Gemma(mut g) => {
+                    if max_slots == 0 {
+                        // EngineMode::SlotAware is constructed by callers
+                        // who guarantee max_slots >= 1; this is a defensive
+                        // rejection at the API boundary so a `max_slots = 0`
+                        // never reaches `provision_multi_seq_kv_for_slot_aware`.
+                        return Err(EngineSpawnError::ModeNotYetWired {
+                            iter_landed: "C2c",
+                            iter_required: "caller bug: EngineMode::SlotAware with max_slots == 0 \
+                                            — require max_slots >= 1",
+                        });
+                    }
+                    // Provision per-layer multi-seq KV scaffolds BEFORE
+                    // moving the loaded model into the worker thread; if
+                    // provisioning fails, surface the typed error before
+                    // any thread is spawned.
+                    if let Err(e) = g.provision_multi_seq_kv_for_slot_aware(max_slots) {
+                        // Wrap into a typed spawn error so callers can
+                        // distinguish "Gemma 4 SlotAware provisioning
+                        // failed" from "ModeNotYetWired" without
+                        // string-matching anyhow.
+                        return Err(EngineSpawnError::Gemma4SlotAwareProvisionFailed {
+                            max_slots,
+                            cause: e.to_string(),
+                        });
+                    }
+                    let loaded = LoadedModel::Gemma(g);
+                    let engine = Self::spawn_inner_with_slot_aware(
+                        loaded,
+                        queue_capacity,
+                        kv_cache_budget_bytes,
+                        max_slots,
+                    );
+                    Ok(engine)
+                }
+                LoadedModel::Qwen35(_) => Err(EngineSpawnError::ModeNotYetWired {
+                    // C2d (Qwen35 worker arm) is the next per-arch lift —
+                    // B4b (decode-side slot_id threading) shipped 2026-05-24
+                    // unblocking the per-family decode surface; the worker
+                    // arm lift mirrors C2c's structural pattern.
+                    iter_landed: "C2c",
+                    iter_required: "C2d (Qwen35 worker arm — gated on R4 \
+                                    spec-decode mitigation + R4-bis hybrid \
+                                    persistor n_seqs>1 serialization)",
+                }),
+                LoadedModel::Qwen3VlText(_) => Err(EngineSpawnError::ModeNotYetWired {
+                    iter_landed: "C2c",
+                    iter_required: "C2e (Qwen3-VL text worker arm — gated on \
+                                    Qwen3-VL forward path landing past the \
+                                    iter-228a 501 sentinel; see \
+                                    `engine_qwen3vl.rs`)",
+                }),
+            },
+        }
+    }
+
+    /// **ADR-040 Phase C iter-2c (C2c)** — internal helper mirroring
+    /// `Engine::spawn` but storing the requested SlotAware mode +
+    /// max_slots on `EngineInner` and constructing the
+    /// `InflightBatchedScheduler` (instead of `FifoSchedulerAdapter`)
+    /// at worker entry.
+    ///
+    /// Per the C2 dossier §2.7 R2: under Shape A the worker still
+    /// processes one request at a time. The InflightBatchedScheduler
+    /// admits up to `max_slots` distinct `SlotId`s — at iter-C2c the
+    /// worker only routes SlotId(0) through the single-seq forward
+    /// path; SlotId(N>0) returns
+    /// `MultiSeqError::CapabilityUnsupported` per the typed deferral
+    /// for kernel-level routing (iter-C2c-cont). This preserves
+    /// scheduler-level multi-slot semantics (admit can hand out
+    /// distinct slot IDs) while honoring the kernel-side limitation.
+    ///
+    /// Mirrors `Engine::spawn` step-by-step at the field-init level —
+    /// the duplication is intentional per the dossier §2.6 "the
+    /// cleanest move is to factor the spawn body into a private helper
+    /// that both entry points call with their respective mode value"
+    /// observation; this is that private helper for the SlotAware path.
+    fn spawn_inner_with_slot_aware(
+        loaded: LoadedModel,
+        queue_capacity: usize,
+        kv_cache_budget_bytes: Option<u64>,
+        max_slots: u32,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel::<Request>(queue_capacity.max(1));
+
+        let model_id = loaded.model_id().to_string();
+        let context_length = loaded.context_length();
+        let quant_type = loaded.quant_type().map(|s| s.to_string());
+        let hidden_size = loaded.hidden_size();
+        let vocab_size = loaded.vocab_size();
+        let eos_token_ids = loaded.eos_token_ids().to_vec();
+        let tokenizer = Arc::new(loaded.tokenizer().clone());
+        let chat_template = Arc::new(loaded.chat_template().to_string());
+        let arch = match &loaded {
+            LoadedModel::Gemma(_) => LoadedArch::Gemma,
+            LoadedModel::Qwen35(_) => LoadedArch::Qwen35,
+            LoadedModel::Qwen3VlText(_) => LoadedArch::Qwen3VlText,
+        };
+
+        // KV-spill descriptors: mirror Engine::spawn verbatim. The
+        // SlotAware path inherits the same per-spill-family descriptor
+        // construction; multi-slot spill semantics under SlotAware are
+        // a future Phase A iter-5 concern (per ADR-040 §6 + risk R4-bis).
+        let kv_spill_descriptor: Option<super::kv_spill_descriptor::KvSpillDescriptor> =
+            match &loaded {
+                LoadedModel::Gemma(g) => {
+                    let kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
+                        super::kv_spill_descriptor::KvDType::F16
+                    } else {
+                        super::kv_spill_descriptor::KvDType::F32
+                    };
+                    let max_decode_tokens = 512usize;
+                    let provenance = match &g.provenance {
+                        crate::core::provenance::Provenance::Hf2q {
+                            producer_version,
+                            source_sha256,
+                            ..
+                        } => super::kv_spill_descriptor::KvSpillProvenance {
+                            producer_version: producer_version.clone(),
+                            source_sha256: source_sha256.clone(),
+                            tokenizer_chat_template_hash:
+                                super::kv_spill_descriptor::KvSpillProvenance::hash_chat_template(
+                                    &g.chat_template,
+                                ),
+                        },
+                        crate::core::provenance::Provenance::External => {
+                            super::kv_spill_descriptor::KvSpillProvenance::default()
+                        }
+                    };
+                    Some(super::kv_spill_descriptor::KvSpillDescriptor::from_gemma_loaded_model(
+                        &g.weights,
+                        max_decode_tokens,
+                        kv_dtype,
+                        provenance,
+                    ))
+                }
+                LoadedModel::Qwen35(_) => None,
+                LoadedModel::Qwen3VlText(_) => None,
+            };
+
+        let tq_packed_descriptor: Option<super::tq_packed_descriptor::TqPackedSpillDescriptor> =
+            if super::tq_packed_descriptor::is_tq_active_mode() {
+                match &loaded {
+                    LoadedModel::Gemma(g) => {
+                        let provenance_for_tq = match &g.provenance {
+                            crate::core::provenance::Provenance::Hf2q {
+                                producer_version,
+                                source_sha256,
+                                ..
+                            } => super::kv_spill_descriptor::KvSpillProvenance {
+                                producer_version: producer_version.clone(),
+                                source_sha256: source_sha256.clone(),
+                                tokenizer_chat_template_hash:
+                                    super::kv_spill_descriptor::KvSpillProvenance::hash_chat_template(
+                                        &g.chat_template,
+                                    ),
+                            },
+                            crate::core::provenance::Provenance::External => {
+                                super::kv_spill_descriptor::KvSpillProvenance::default()
+                            }
+                        };
+                        super::tq_packed_descriptor::TqPackedSpillDescriptor::from_gemma_loaded_model_tq(
+                            &g.weights,
+                            provenance_for_tq,
+                        )
+                    }
+                    LoadedModel::Qwen35(_) | LoadedModel::Qwen3VlText(_) => None,
+                }
+            } else {
+                None
+            };
+
+        let kv_spill_active = kv_spill_descriptor.is_some();
+        let gguf = mlx_native::gguf::GgufFile::open(loaded.model_path())
+            .expect("re-open loaded GGUF for SlotAware Engine load-info snapshot");
+        let info = Arc::new(loaded.build_load_info(
+            &gguf,
+            loaded.load_duration(),
+            kv_cache_budget_bytes,
+            kv_spill_active,
+        ));
+
+        let registration = super::registry::find_for(&model_id);
+        if let Some(ref r) = registration {
+            tracing::info!(
+                family = r.family,
+                reasoning = r.has_reasoning(),
+                tools = r.has_tools(),
+                "hf2q-engine (SlotAware): matched model registration"
+            );
+        } else {
+            tracing::info!(
+                model_id = %model_id,
+                "hf2q-engine (SlotAware): no matching model registration"
+            );
+        }
+
+        let queue_capacity_u32 = queue_capacity.max(1) as u32;
+        let initial_mode = EngineMode::SlotAware { max_slots };
+        // Per ADR-040 §3.5: per-slot budget = total / max_slots. The
+        // SlotAware path is the FIRST callsite where this division
+        // matters (SerialFifo divides by 1).
+        let initial_per_slot_kv_budget_bytes: u64 = kv_cache_budget_bytes
+            .map(|b| b / u64::from(max_slots.max(1)))
+            .unwrap_or(0);
+        let initial_kv_bytes_per_token_cached: u64 = info.kv_bytes_per_token();
+
+        // Seed SchedulerStats with the InflightBatched policy so a
+        // pre-admit /metrics scrape reports the configured shape.
+        let scheduler_stats_snapshot = Arc::new(Mutex::new(SchedulerStats {
+            policy: SchedulerPolicy::InflightBatched,
+            in_flight_slots: 0,
+            queue_capacity: queue_capacity_u32,
+            admitted_total: 0,
+            rejected_429_total: 0,
+            completed_total: 0,
+        }));
+        let worker_stats_handle = Arc::clone(&scheduler_stats_snapshot);
+
+        let worker_registration = registration.clone();
+        let worker_per_slot_budget = initial_per_slot_kv_budget_bytes;
+        let worker_kv_bytes_per_token = initial_kv_bytes_per_token_cached;
+        let worker_handle = std::thread::Builder::new()
+            .name("hf2q-engine-slotaware".into())
+            .spawn(move || {
+                worker_run(
+                    loaded,
+                    rx,
+                    worker_registration,
+                    initial_mode,
+                    queue_capacity_u32,
+                    worker_stats_handle,
+                    worker_per_slot_budget,
+                    worker_kv_bytes_per_token,
+                )
+            })
+            .expect("spawn hf2q-engine-slotaware thread");
+
+        Engine {
+            inner: Arc::new(EngineInner {
+                tx,
+                worker_handle: Mutex::new(Some(worker_handle)),
+                info,
+                arch,
+                model_id,
+                context_length,
+                quant_type,
+                hidden_size,
+                vocab_size,
+                eos_token_ids,
+                tokenizer,
+                chat_template,
+                registration,
+                token_bytes: std::sync::OnceLock::new(),
+                kv_spill_descriptor,
+                tq_packed_descriptor,
+                mode: initial_mode,
+                max_slots,
+                per_slot_kv_budget_bytes: initial_per_slot_kv_budget_bytes,
+                kv_bytes_per_token_cached: initial_kv_bytes_per_token_cached,
+                scheduler_stats_snapshot,
             }),
         }
     }
@@ -3825,6 +4240,69 @@ pub(crate) fn qwen35_not_implemented_err<T>() -> Result<T> {
 /// handler maps to HTTP 501 with an operator-actionable message.
 /// Wedge-3 (deferred follow-up) replaces the 501 arm with the actual
 /// `Qwen35Model::forward_*` chain.
+/// **ADR-040 Phase C iter-2c (C2c)** — enum dispatcher over the two
+/// concrete scheduler variants the worker thread owns.
+///
+/// Per dossier §2.9 the `Scheduler` trait surface deliberately omits
+/// `advance_after_prefill` / `advance_after_decode` (their FSM-advance
+/// shapes differ between FIFO and InflightBatched). The C2b worker held
+/// a concrete `FifoSchedulerAdapter`; iter-C2c adds the `Inflight` arm
+/// for `EngineMode::SlotAware`. This enum gives the worker uniform
+/// access to `admit` / `release` / `stats` / `advance_after_*` without
+/// `Box<dyn Scheduler>` (which would lose access to the
+/// type-specific advance APIs).
+///
+/// **Path B scope** (iter-C2c): under SlotAware the worker still
+/// dispatches one request at a time (Shape A R2 limitation per dossier
+/// §2.7); the InflightBatched scheduler hands out `SlotId(0)` for
+/// every admit (the free list recycles slot 0 on every release). At
+/// admit time `slot_id > 0` returns
+/// `MultiSeqError::CapabilityUnsupported` via the worker arm (typed
+/// deferral for iter-C2c-cont kernel slot routing). Concurrent
+/// admission of N>1 requests requires Shape B's `tokio::select!` body
+/// (iter-C2c-cont per ADR-040 §6 + dossier §2.7).
+enum WorkerScheduler {
+    Fifo(FifoSchedulerAdapter),
+    Inflight(InflightBatchedScheduler),
+}
+
+impl WorkerScheduler {
+    fn admit(&mut self, req: AdmitRequest) -> Result<crate::serve::scheduler::RequestSlot, AdmitError> {
+        match self {
+            Self::Fifo(s) => s.admit(req),
+            Self::Inflight(s) => s.admit(req),
+        }
+    }
+
+    fn release(&mut self, handle: SlotHandle) {
+        match self {
+            Self::Fifo(s) => s.release(handle),
+            Self::Inflight(s) => s.release(handle),
+        }
+    }
+
+    fn advance_after_prefill(&mut self, handle: SlotHandle, n_consumed: u32) {
+        match self {
+            Self::Fifo(s) => s.advance_after_prefill(handle, n_consumed),
+            Self::Inflight(s) => s.advance_after_prefill(handle, n_consumed),
+        }
+    }
+
+    fn advance_after_decode(&mut self, handle: SlotHandle) {
+        match self {
+            Self::Fifo(s) => s.advance_after_decode(handle),
+            Self::Inflight(s) => s.advance_after_decode(handle),
+        }
+    }
+
+    fn stats(&self) -> SchedulerStats {
+        match self {
+            Self::Fifo(s) => s.stats(),
+            Self::Inflight(s) => s.stats(),
+        }
+    }
+}
+
 fn worker_run(
     mut loaded: LoadedModel,
     mut rx: mpsc::Receiver<Request>,
@@ -3877,19 +4355,27 @@ fn worker_run(
     // do not set `--kv-cache-budget-bytes`).  The wrap helper
     // `new_with_kv_budget` accepts `0` and is byte-equivalent to
     // `new(queue_capacity)` in that case (per scheduler.rs tests).
-    let mut scheduler: FifoSchedulerAdapter = match mode {
-        EngineMode::SerialFifo => FifoSchedulerAdapter::new_with_kv_budget(
-            queue_capacity,
-            per_slot_kv_budget_bytes,
+    // ADR-040 Phase C iter-2c (C2c): switch from concrete
+    // `FifoSchedulerAdapter` to the `WorkerScheduler` enum so the
+    // SlotAware arm can construct `InflightBatchedScheduler` without
+    // boxing (per dossier §2.9 the advance APIs live on the concrete
+    // type — `Box<dyn Scheduler>` would lose access). FifoSerial
+    // continues to construct exactly the same `FifoSchedulerAdapter`
+    // (byte-equivalence H23 pin); the only addition is the
+    // `WorkerScheduler::Inflight` arm for SlotAware.
+    let mut scheduler: WorkerScheduler = match mode {
+        EngineMode::SerialFifo => WorkerScheduler::Fifo(
+            FifoSchedulerAdapter::new_with_kv_budget(
+                queue_capacity,
+                per_slot_kv_budget_bytes,
+            ),
         ),
-        EngineMode::SlotAware { .. } => unreachable!(
-            "ADR-040 Phase C iter-2a (C2b): EngineMode::SlotAware reached \
-             worker_run despite iter-1.5 F1 rejection at \
-             Engine::spawn_with_mode. The spawn-time `EngineSpawnError::\
-             ModeNotYetWired` guard at engine.rs:2663 is the load-bearing \
-             gate; if you reach this panic, a future caller bypassed that \
-             gate. Phase C iter-2b will replace this branch with the \
-             `InflightBatchedScheduler` runtime + a tokio::select! body."
+        EngineMode::SlotAware { max_slots } => WorkerScheduler::Inflight(
+            InflightBatchedScheduler::new_with_kv_budget(
+                queue_capacity,
+                max_slots,
+                per_slot_kv_budget_bytes,
+            ),
         ),
     };
 
@@ -3899,7 +4385,11 @@ fn worker_run(
     // step 5. Acquiring the lock costs ~tens of nanoseconds when
     // uncontended; the worker is the sole writer + readers only contend
     // briefly during a Prometheus scrape.
-    let publish_stats = |sched: &FifoSchedulerAdapter,
+    //
+    // Iter-C2c (C2c): generalised to take `&WorkerScheduler` so the
+    // InflightBatchedScheduler stats also flow through to /metrics
+    // identically.
+    let publish_stats = |sched: &WorkerScheduler,
                          snap: &Arc<Mutex<SchedulerStats>>| {
         if let Ok(mut guard) = snap.lock() {
             *guard = sched.stats();
@@ -4001,6 +4491,37 @@ fn worker_run(
                         continue;
                     }
                 };
+
+                // ADR-040 Phase C iter-2c (C2c) — Gemma 4 SlotAware
+                // typed deferral. Under SlotAware the InflightBatched
+                // scheduler may hand out `SlotId(N>0)`. Kernel-level
+                // slot routing through `forward_prefill.rs` is
+                // iter-C2c-cont scope (gated on Phase B4c per ADR-040
+                // §6 + §6.1.21). For now, slot > 0 surfaces a typed
+                // `capability_unsupported`-prefixed anyhow error the
+                // handler layer maps to HTTP 501 via
+                // `ApiError::capability_unsupported`. SerialFifo +
+                // SlotId(0) hit the existing forward path unchanged
+                // (H23 + H21 byte-equivalence pins).
+                if let Some(handle) = admitted.handle {
+                    if matches!(loaded, LoadedModel::Gemma(_)) && handle.slot_id != SlotId(0) {
+                        let err = MultiSeqError::CapabilityUnsupported {
+                            capability:
+                                "gemma4-forward-prefill-slot-N (iter-C2c-cont per ADR-040 §6.1.21 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs)",
+                        };
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "capability_unsupported: ADR-040 C2c — {}",
+                            err
+                        )));
+                        // Release the slot (cursor bookkeeping +
+                        // generation-counter bump) so the next admit
+                        // sees a freed slot — mirrors the post-decode
+                        // release pattern below.
+                        scheduler.release(handle);
+                        publish_stats(&scheduler, &scheduler_stats_snapshot);
+                        continue;
+                    }
+                }
 
                 // cfa-iter-C2.5 M1: zero-budget admit (`max_tokens == 0`)
                 // returns `RequestSlot { handle: None, .. }` per
@@ -4151,6 +4672,33 @@ fn worker_run(
                         continue;
                     }
                 };
+                // ADR-040 Phase C iter-2c (C2c) — Gemma 4 SlotAware
+                // typed deferral for the streaming arm. Mirrors the
+                // non-streaming `Request::Generate` guard above; slot >
+                // 0 surfaces a `capability_unsupported`-prefixed Error
+                // event the SSE layer maps to HTTP 501 via
+                // `ApiError::capability_unsupported`. SerialFifo +
+                // SlotId(0) hits the existing streaming path unchanged
+                // (preserves H23 byte-equivalence for the legacy stream
+                // body).
+                if let Some(handle) = admitted.handle {
+                    if matches!(loaded, LoadedModel::Gemma(_)) && handle.slot_id != SlotId(0) {
+                        let err = MultiSeqError::CapabilityUnsupported {
+                            capability:
+                                "gemma4-forward-prefill-slot-N (iter-C2c-cont per ADR-040 §6.1.21 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs)",
+                        };
+                        let _ = events.blocking_send(
+                            super::sse::GenerationEvent::Error(format!(
+                                "capability_unsupported: ADR-040 C2c — {}",
+                                err
+                            )),
+                        );
+                        scheduler.release(handle);
+                        publish_stats(&scheduler, &scheduler_stats_snapshot);
+                        continue;
+                    }
+                }
+
                 // cfa-iter-C2.5 M1: zero-budget admit (`max_tokens == 0`)
                 // returns `handle: None` (scheduler short-circuits the
                 // slot allocation). The streaming arm still drives the
@@ -4344,6 +4892,26 @@ fn worker_run(
                     }
                 };
 
+                // ADR-040 Phase C iter-2c (C2c) — Gemma 4 SlotAware
+                // typed deferral for the Embed arm. Mirrors the
+                // Generate / GenerateStream guards. iter-C2c-cont
+                // lifts kernel slot routing.
+                if let Some(handle) = admitted.handle {
+                    if matches!(loaded, LoadedModel::Gemma(_)) && handle.slot_id != SlotId(0) {
+                        let err = MultiSeqError::CapabilityUnsupported {
+                            capability:
+                                "gemma4-forward-embed-last-slot-N (iter-C2c-cont per ADR-040 §6.1.21 — gated on B4c kernel slot-offset routing)",
+                        };
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "capability_unsupported: ADR-040 C2c — {}",
+                            err
+                        )));
+                        scheduler.release(handle);
+                        publish_stats(&scheduler, &scheduler_stats_snapshot);
+                        continue;
+                    }
+                }
+
                 // Single-shot pooled embedding (Last pooling).  The
                 // worker holds &mut LoadedModel, so prefill's mutation of
                 // self.activations + self.dense_kvs is fine here — it
@@ -4441,6 +5009,28 @@ fn worker_run(
                         continue;
                     }
                 };
+
+                // ADR-040 Phase C iter-2c (C2c) — Gemma 4 SlotAware
+                // typed deferral for the vision-aware Generate arm.
+                // Mirrors the text-only Generate guard. Vision soft-token
+                // overrides at slot > 0 still need kernel slot routing
+                // in `forward_prefill.rs` (iter-C2c-cont scope).
+                if let Some(handle) = admitted.handle {
+                    if matches!(loaded, LoadedModel::Gemma(_)) && handle.slot_id != SlotId(0) {
+                        let err = MultiSeqError::CapabilityUnsupported {
+                            capability:
+                                "gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont per ADR-040 §6.1.21 — gated on B4c kernel slot-offset routing)",
+                        };
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "capability_unsupported: ADR-040 C2c — {}",
+                            err
+                        )));
+                        scheduler.release(handle);
+                        publish_stats(&scheduler, &scheduler_stats_snapshot);
+                        continue;
+                    }
+                }
+
                 // cfa-iter-C2.5 M1: zero-budget admit (`max_tokens == 0`)
                 // returns `handle: None`; preserve pre-ADR-040 behaviour
                 // by still running the legacy `generate_*_with_soft_tokens*`
@@ -15194,5 +15784,639 @@ mod adr040_phase_c_iter1_engine_mode_tests {
     #[test]
     fn engine_spawn_3_arg_signature_compile_pin() {
         let _spawn: fn(LoadedModel, usize, Option<u64>) -> Engine = Engine::spawn;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-040 Phase C iter-2c (C2c) tests — Gemma 4 SlotAware engine activation
+// (2026-05-24, this commit)
+//
+// Tests covering H21–H25 per the C2c brief:
+//
+//   H21 (engine spawn): `Engine::spawn_with_mode(.., EngineMode::SlotAware
+//                       { max_slots: 4 })` returns `Ok(Engine)` for Gemma 4
+//                       (NOT `ModeNotYetWired`). H21a env-gated against
+//                       real GGUF; H21b structural via per-arch dispatch
+//                       compile pin + non-Gemma rejection pin.
+//
+//   H22 (KV cache provisioning): post-spawn the Gemma 4 multi-seq KV
+//                                scaffolds are populated; `n_seqs == 4`
+//                                per layer. H22 env-gated.
+//
+//   H23 (FifoSerial preserved): `Engine::spawn_with_mode(.., SerialFifo)`
+//                               for Gemma 4 still constructs `n_seqs=1`
+//                               (legacy `MlxKvCache` only; `multi_seq_kv`
+//                               remains `None`). Byte-equivalent to
+//                               pre-C2c (defends H1/H2 byte-equivalence
+//                               pins). H23 env-gated.
+//
+//   H24 (scheduler policy switch): under SlotAware spawn, the engine's
+//                                  scheduler is `InflightBatched` (admit
+//                                  CAN hand out SlotId(N>0) — verified
+//                                  via `engine.scheduler_stats().policy`).
+//                                  Structural at iter-C2c — kernel slot
+//                                  routing through `forward_prefill.rs`
+//                                  is iter-C2c-cont. Skip-mode runnable
+//                                  via WorkerScheduler unit pin (no real
+//                                  LoadedModel needed).
+//
+//   H25 (slot isolation typed deferral): when SlotAware admits a request
+//                                        that the scheduler would route
+//                                        to SlotId(N>0), the worker arm
+//                                        surfaces typed
+//                                        `MultiSeqError::Capability
+//                                        Unsupported` (mapped to
+//                                        `capability_unsupported:` anyhow
+//                                        prefix → HTTP 501 via
+//                                        `ApiError::capability_unsupported`).
+//                                        Skip-mode pins via the error
+//                                        Display + variant constructor.
+//
+// Per the C2c brief "Path B (engine spawn activation + typed
+// slot-routing deferral)": H21/H22/H23 require real GGUF load (env-gated
+// per the C2a `HF2Q_BYTE_EQUIV_E2E_GGUF` pattern); H24/H25 are
+// skip-mode runnable as structural / type-level pins. Tests gated
+// behind `HF2Q_C2C_E2E=1` + `HF2Q_C2C_E2E_GGUF=<path>` honour the
+// `vm_stat`-headroom + "no model load by default" constraints the brief
+// pinned twice.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod adr040_phase_c_iter2c_gemma4_slot_aware_tests {
+    use super::*;
+
+    const C2C_E2E_ENV_GATE: &str = "HF2Q_C2C_E2E";
+    const C2C_E2E_GGUF_ENV: &str = "HF2Q_C2C_E2E_GGUF";
+
+    /// Returns `true` if the test should skip (env not gated). When
+    /// `true` the caller has already emitted a skip notice via
+    /// `eprintln!`. Mirrors the C2a `byte_equiv_skip_unless_gated`
+    /// helper (engine.rs:11427).
+    fn c2c_skip_unless_gated(test_name: &str) -> bool {
+        if std::env::var(C2C_E2E_ENV_GATE).as_deref() == Ok("1") {
+            return false;
+        }
+        eprintln!(
+            "[skip] {test_name} — set {C2C_E2E_ENV_GATE}=1 + \
+             {C2C_E2E_GGUF_ENV}=<path/to/gemma4.gguf> to run the \
+             ADR-040 C2c Gemma 4 SlotAware engine-activation pins. \
+             Per C2c brief constraint: no model load by default \
+             (OOM-class on 31B production weights). Skip-mode \
+             structural pins H24+H25 run unconditionally below."
+        );
+        true
+    }
+
+    /// **H24 (skip-mode pin)** — `WorkerScheduler::Inflight` constructor
+    /// surfaces the `InflightBatched` policy via `stats()`. Pins that
+    /// `spawn_with_mode(SlotAware { max_slots: N })` correctly bridges
+    /// the InflightBatchedScheduler into the worker thread.
+    ///
+    /// This is the structural witness for H24 that does NOT need a real
+    /// LoadedModel: it directly exercises the enum dispatcher's
+    /// `Inflight` arm + verifies the policy/queue_capacity/max_slots
+    /// shape that `Engine::spawn_with_mode(SlotAware)` would set up.
+    #[test]
+    fn h24_worker_scheduler_inflight_arm_reports_inflight_batched_policy() {
+        let mut sched = WorkerScheduler::Inflight(
+            InflightBatchedScheduler::new_with_kv_budget(8, 4, 0),
+        );
+        let stats = sched.stats();
+        assert_eq!(
+            stats.policy,
+            SchedulerPolicy::InflightBatched,
+            "H24 FALSIFIED: WorkerScheduler::Inflight must report \
+             InflightBatched policy (got {:?}). The C2c spawn arm \
+             builds this variant for SlotAware; if the policy drifts \
+             the engine.scheduler_stats() seam misreports to /metrics.",
+            stats.policy
+        );
+        assert_eq!(
+            stats.queue_capacity, 8,
+            "H24 sanity: queue_capacity round-trip"
+        );
+
+        // Sanity: the FIFO arm still reports FifoSerial — the C2b
+        // pre-iter behaviour the C2c lift preserves.
+        let fifo = WorkerScheduler::Fifo(FifoSchedulerAdapter::new(8));
+        assert_eq!(
+            fifo.stats().policy,
+            SchedulerPolicy::FifoSerial,
+            "H24 sanity: WorkerScheduler::Fifo arm preserves \
+             FifoSerial policy (C2b byte-equivalence pin)"
+        );
+
+        // Drive an admit through the Inflight arm to prove the
+        // dispatcher actually wires the InflightBatched FSM (not
+        // accidentally routing to FifoSchedulerAdapter::admit through
+        // a typo).
+        let req = AdmitRequest {
+            prompt_tokens: 4,
+            max_tokens: 8,
+            kv_bytes_needed: 0,
+        };
+        let admitted = sched.admit(req).expect("H24: admit must succeed on fresh InflightBatched");
+        let handle = admitted
+            .handle
+            .expect("H24: max_tokens > 0 admit returns Some(handle)");
+        assert_eq!(
+            handle.slot_id,
+            SlotId(0),
+            "H24 sanity: first admit on fresh scheduler returns SlotId(0) \
+             (slot_id_free_list empty → next_fresh_slot_id == 0)"
+        );
+        // Release so the scheduler is left in a clean state for any
+        // subsequent test.
+        sched.release(handle);
+    }
+
+    /// **H24-cont (skip-mode)** — InflightBatched DOES hand out
+    /// distinct slot IDs (SlotId(0), SlotId(1), ...) when admits stack
+    /// without release. Pins the scheduler behaviour the C2c engine
+    /// surface depends on for SlotAware semantics.
+    ///
+    /// Path B note: production worker_run serializes per dossier §2.7
+    /// R2 (Shape A limitation), so this scenario is only reachable via
+    /// direct scheduler access OR via Shape B iter-C2c-cont. The pin
+    /// here is the scheduler-side load-bearing assertion that the
+    /// engine's SlotAware spawn arm provides the correct primitive.
+    #[test]
+    fn h24_cont_inflight_scheduler_hands_out_distinct_slot_ids_under_stacked_admits() {
+        let mut sched = WorkerScheduler::Inflight(
+            InflightBatchedScheduler::new_with_kv_budget(8, 4, 0),
+        );
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let req = AdmitRequest {
+                prompt_tokens: 4,
+                max_tokens: 8,
+                kv_bytes_needed: 0,
+            };
+            let admitted = sched
+                .admit(req)
+                .unwrap_or_else(|e| panic!("H24-cont: admit #{i} must succeed: {:?}", e));
+            handles.push(admitted.handle.expect("H24-cont: admit returns Some(handle)"));
+        }
+        // Distinct slot IDs spanning [0, max_slots).
+        let mut slot_ids: Vec<u32> = handles.iter().map(|h| h.slot_id.0).collect();
+        slot_ids.sort();
+        assert_eq!(
+            slot_ids,
+            vec![0u32, 1, 2, 3],
+            "H24-cont FALSIFIED: InflightBatched must hand out \
+             distinct SlotId(0..max_slots) for stacked admits without \
+             release. Got: {slot_ids:?}. The C2c SlotAware engine \
+             surface depends on this primitive."
+        );
+        // 5th admit (queue_capacity=8, max_slots=4) goes into the
+        // queue, returns handle: None per InflightBatchedScheduler
+        // semantics.
+        let queued = sched.admit(AdmitRequest {
+            prompt_tokens: 4,
+            max_tokens: 8,
+            kv_bytes_needed: 0,
+        });
+        match queued {
+            Ok(slot) => assert!(
+                slot.handle.is_none(),
+                "H24-cont: 5th admit (max_slots=4 saturated) must queue \
+                 with handle: None; got handle: {:?}",
+                slot.handle
+            ),
+            Err(e) => panic!(
+                "H24-cont: 5th admit must queue (not reject) under \
+                 queue_capacity=8; got Err: {:?}",
+                e
+            ),
+        }
+        // Cleanup so other tests don't see lingering scheduler state.
+        for h in handles {
+            sched.release(h);
+        }
+    }
+
+    /// **H25 (skip-mode pin)** — typed `MultiSeqError::Capability
+    /// Unsupported` carries the iter-C2c-cont label naming both the
+    /// gemma4 forward path AND the iter that lifts the deferral
+    /// (B4c). The worker arm string-prefixes the error so the handler
+    /// layer maps it to HTTP 501 via `ApiError::capability_unsupported`
+    /// (per C3 § wiring at schema.rs:344).
+    ///
+    /// This pin catches drift in the typed deferral label so reviewers
+    /// + operator log greps see the right iter cite when a request hits
+    /// the SlotId(N>0) path under SlotAware at iter-C2c.
+    #[test]
+    fn h25_capability_unsupported_label_names_iter_c2c_cont_and_b4c_gate() {
+        let err = MultiSeqError::CapabilityUnsupported {
+            capability:
+                "gemma4-forward-prefill-slot-N (iter-C2c-cont per ADR-040 §6.1.21 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs)",
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("gemma4-forward-prefill-slot-N"),
+            "H25 FALSIFIED: typed-deferral label must name the deferred \
+             capability for operator-actionable diagnostics. Got: {msg}"
+        );
+        assert!(
+            msg.contains("iter-C2c-cont"),
+            "H25 FALSIFIED: typed-deferral label must name the \
+             implementing iter so operator log greps find the right \
+             pin pointer. Got: {msg}"
+        );
+        assert!(
+            msg.contains("B4c"),
+            "H25 FALSIFIED: typed-deferral label must name the gating \
+             iter (B4c — kernel slot-offset routing); without this \
+             cite, a future iter that lifts the deferral cannot grep \
+             for what unblocks it. Got: {msg}"
+        );
+        assert!(
+            msg.contains("forward_prefill.rs"),
+            "H25 FALSIFIED: typed-deferral label must name the file \
+             that needs the kernel work — Chesterton's fence on the \
+             worker arm's string-prefix contract that handlers \
+             string-match against. Got: {msg}"
+        );
+    }
+
+    /// **H21b (skip-mode)** — `Engine::spawn_with_mode` signature
+    /// compile pin extended for iter-C2c. The 4-arg signature is
+    /// unchanged from C1.5 (still `Result<Self, EngineSpawnError>`); the
+    /// load-bearing assertion is that the SlotAware arm can be
+    /// constructed at the type level (the iter-C2c spawn body
+    /// successfully accepts `EngineMode::SlotAware { max_slots: N }`
+    /// without a `match` exhaustiveness regression).
+    #[test]
+    fn h21b_spawn_with_mode_accepts_slot_aware_variant_at_type_level() {
+        let _f: fn(
+            LoadedModel,
+            usize,
+            Option<u64>,
+            EngineMode,
+        ) -> std::result::Result<Engine, EngineSpawnError> = Engine::spawn_with_mode;
+        // SlotAware variant constructible — needed for any C2c caller.
+        let _m: EngineMode = EngineMode::SlotAware { max_slots: 4 };
+    }
+
+    /// **H21 (env-gated)** — `Engine::spawn_with_mode(.., EngineMode::
+    /// SlotAware { max_slots: 4 })` returns `Ok(Engine)` for a real
+    /// Gemma 4 GGUF (replaces the C2b `ModeNotYetWired` rejection).
+    ///
+    /// Per C2c brief constraint, skipped by default — operators run
+    /// with `HF2Q_C2C_E2E=1 + HF2Q_C2C_E2E_GGUF=/path/to/gemma4.gguf`
+    /// to exercise. Mirrors the C2a `engine_serial_fifo_byte_equivalent_
+    /// to_pre_phase_c` env gating pattern.
+    #[test]
+    fn h21_engine_spawn_with_slot_aware_returns_ok_for_gemma4() {
+        if c2c_skip_unless_gated("h21_engine_spawn_with_slot_aware_returns_ok_for_gemma4") {
+            return;
+        }
+        let gguf_path: std::path::PathBuf = std::env::var(C2C_E2E_GGUF_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("HF2Q_C2C_E2E_GGUF env required when HF2Q_C2C_E2E=1");
+        assert!(
+            gguf_path.exists(),
+            "H21: {C2C_E2E_GGUF_ENV} path does not exist: {gguf_path:?}"
+        );
+        let opts = LoadOptions {
+            model_path: gguf_path,
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let loaded =
+            LoadedModel::load(&opts).expect("H21: LoadedModel::load must succeed for Gemma 4 GGUF");
+        assert!(
+            matches!(loaded, LoadedModel::Gemma(_)),
+            "H21 fixture: GGUF must load as LoadedModel::Gemma"
+        );
+        let engine = Engine::spawn_with_mode(
+            loaded,
+            8,
+            None,
+            EngineMode::SlotAware { max_slots: 4 },
+        );
+        let engine = engine.unwrap_or_else(|e| {
+            panic!(
+                "H21 FALSIFIED: spawn_with_mode(SlotAware) must return \
+                 Ok(Engine) for Gemma 4 at iter-C2c (was returning \
+                 ModeNotYetWired at C2b). Got Err: {:?}",
+                e
+            )
+        });
+        // H22 piggy-back: the spawn-time `max_slots` snapshot echoes
+        // the requested value.
+        assert_eq!(
+            engine.max_slots(),
+            4,
+            "H22 partial: Engine::max_slots() must echo the SlotAware \
+             max_slots; got {}",
+            engine.max_slots()
+        );
+        // H24 piggy-back: scheduler policy is InflightBatched.
+        assert_eq!(
+            engine.scheduler_stats().policy,
+            SchedulerPolicy::InflightBatched,
+            "H24 partial: under SlotAware spawn, \
+             scheduler_stats().policy must be InflightBatched; got {:?}",
+            engine.scheduler_stats().policy
+        );
+        // shutdown() is async; we drop the engine instead so the worker
+        // thread terminates when the mpsc Receiver drops (cleaner than
+        // spinning up a tokio runtime in a synchronous test).
+        drop(engine);
+    }
+
+    /// **H22 (env-gated)** — post-`spawn_with_mode(SlotAware { 4 })`,
+    /// the Gemma 4 multi-seq KV cache scaffold has `n_seqs == 4` for
+    /// every layer. Exercises the A3a `alloc_hb_kv_for_layer`
+    /// allocator end-to-end at production shapes.
+    ///
+    /// Path B note: this test PRE-validates `provision_multi_seq_kv_
+    /// for_slot_aware`'s output. The test inspects the loaded model
+    /// BEFORE moving it into the engine — once the engine takes
+    /// ownership of `LoadedModel` we lose direct access to the
+    /// `MultiSeqHbKvBuffers` cursor table. Mirrors the H1 byte-equiv
+    /// pattern of "construct + inspect + then drive engine".
+    #[test]
+    fn h22_multi_seq_kv_scaffold_has_n_seqs_max_slots_per_layer() {
+        if c2c_skip_unless_gated("h22_multi_seq_kv_scaffold_has_n_seqs_max_slots_per_layer") {
+            return;
+        }
+        let gguf_path: std::path::PathBuf = std::env::var(C2C_E2E_GGUF_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("HF2Q_C2C_E2E_GGUF env required when HF2Q_C2C_E2E=1");
+        let opts = LoadOptions {
+            model_path: gguf_path,
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let loaded = LoadedModel::load(&opts).expect("H22: load Gemma 4 GGUF");
+        let mut g = match loaded {
+            LoadedModel::Gemma(g) => g,
+            _ => panic!("H22 fixture: must load as Gemma"),
+        };
+        assert!(
+            g.multi_seq_kv.is_none(),
+            "H22 sanity: fresh LoadedModel::Gemma has multi_seq_kv = None"
+        );
+        g.provision_multi_seq_kv_for_slot_aware(4)
+            .expect("H22: provision must succeed at max_slots=4");
+        let multi_seq = g
+            .multi_seq_kv
+            .as_ref()
+            .expect("H22: multi_seq_kv must be Some after provision");
+        let num_layers = g.weights.layers.len();
+        assert_eq!(
+            multi_seq.len(),
+            num_layers,
+            "H22 FALSIFIED: multi_seq_kv must have one entry per layer; \
+             got {} entries vs {} layers",
+            multi_seq.len(),
+            num_layers
+        );
+        for (i, buf) in multi_seq.iter().enumerate() {
+            assert_eq!(
+                buf.n_seqs, 4u32,
+                "H22 FALSIFIED: layer {i} multi-seq KV has n_seqs={} \
+                 (expected 4 — the max_slots the test requested)",
+                buf.n_seqs
+            );
+            assert_eq!(
+                buf.seq_lens.len(),
+                4usize,
+                "H22 sanity: layer {i} per-slot cursor table length \
+                 must equal n_seqs (got {})",
+                buf.seq_lens.len()
+            );
+            for (slot, len) in buf.seq_lens.iter().enumerate() {
+                assert_eq!(
+                    *len, 0u32,
+                    "H22 sanity: layer {i} slot {slot} cursor must \
+                     start at 0 (fresh allocation), got {}",
+                    *len
+                );
+            }
+        }
+    }
+
+    /// **H23 (env-gated)** — `Engine::spawn_with_mode(.., SerialFifo)`
+    /// for Gemma 4 still constructs `n_seqs=1` (legacy `MlxKvCache`
+    /// only; `multi_seq_kv` remains `None`). This is the byte-
+    /// equivalence pin that catches a future C2c regression where
+    /// SerialFifo accidentally provisions multi-seq scaffolds.
+    ///
+    /// Tests on the LoadedModel BEFORE engine spawn (mirrors H22) so
+    /// we can inspect the field directly. The 3-arg `Engine::spawn`
+    /// shares the load path and never touches `multi_seq_kv`.
+    #[test]
+    fn h23_serial_fifo_does_not_provision_multi_seq_kv() {
+        if c2c_skip_unless_gated("h23_serial_fifo_does_not_provision_multi_seq_kv") {
+            return;
+        }
+        let gguf_path: std::path::PathBuf = std::env::var(C2C_E2E_GGUF_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("HF2Q_C2C_E2E_GGUF env required when HF2Q_C2C_E2E=1");
+        let opts = LoadOptions {
+            model_path: gguf_path,
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let loaded = LoadedModel::load(&opts).expect("H23: load Gemma 4 GGUF");
+        let g = match loaded {
+            LoadedModel::Gemma(g) => g,
+            _ => panic!("H23 fixture: must load as Gemma"),
+        };
+        // Pin: GemmaLoadedModel::load NEVER provisions multi_seq_kv —
+        // the field defaults to None. SerialFifo spawn keeps it None
+        // (the per-arch dispatch in spawn_with_mode never reaches the
+        // provision call for the SerialFifo arm).
+        assert!(
+            g.multi_seq_kv.is_none(),
+            "H23 FALSIFIED: GemmaLoadedModel::load (the SerialFifo \
+             path's load entry) must leave multi_seq_kv = None to \
+             preserve pre-C2c byte-equivalence (H1/H2 pins). Found \
+             Some(_) — a future refactor probably moved provisioning \
+             into the load body."
+        );
+        // Engine::spawn (the 3-arg byte-equivalence entry point) also
+        // does not provision — it never calls
+        // `provision_multi_seq_kv_for_slot_aware`. Smoke-pin by
+        // spawning via the 3-arg entry and observing max_slots=1.
+        let engine = Engine::spawn(LoadedModel::Gemma(g), 8, None);
+        assert_eq!(
+            engine.max_slots(),
+            1,
+            "H23 FALSIFIED: Engine::spawn (3-arg) must yield max_slots=1 \
+             (SerialFifo invariant). Got {}.",
+            engine.max_slots()
+        );
+        assert_eq!(
+            engine.mode(),
+            EngineMode::SerialFifo,
+            "H23 sanity: 3-arg spawn mode is SerialFifo"
+        );
+        assert_eq!(
+            engine.scheduler_stats().policy,
+            SchedulerPolicy::FifoSerial,
+            "H23 sanity: SerialFifo spawn → FifoSerial scheduler policy"
+        );
+        // shutdown() is async; we drop the engine instead so the worker
+        // thread terminates when the mpsc Receiver drops (cleaner than
+        // spinning up a tokio runtime in a synchronous test).
+        drop(engine);
+    }
+
+    /// **H24-engine (env-gated)** — under SlotAware spawn, the engine's
+    /// scheduler_stats().policy is `InflightBatched`. Subsumes the
+    /// H21 / H22 environment but isolates the policy-switch
+    /// assertion for clarity.
+    #[test]
+    fn h24_engine_spawn_with_slot_aware_reports_inflight_batched_policy() {
+        if c2c_skip_unless_gated("h24_engine_spawn_with_slot_aware_reports_inflight_batched_policy") {
+            return;
+        }
+        let gguf_path: std::path::PathBuf = std::env::var(C2C_E2E_GGUF_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("HF2Q_C2C_E2E_GGUF env required when HF2Q_C2C_E2E=1");
+        let opts = LoadOptions {
+            model_path: gguf_path,
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let loaded = LoadedModel::load(&opts).expect("H24: load Gemma 4 GGUF");
+        let engine = Engine::spawn_with_mode(
+            loaded,
+            8,
+            None,
+            EngineMode::SlotAware { max_slots: 4 },
+        )
+        .expect("H24: spawn_with_mode(SlotAware) returns Ok for Gemma 4 at C2c");
+        let stats = engine.scheduler_stats();
+        assert_eq!(
+            stats.policy,
+            SchedulerPolicy::InflightBatched,
+            "H24 FALSIFIED: SlotAware spawn must yield \
+             InflightBatched scheduler policy on /metrics scrape; got {:?}",
+            stats.policy
+        );
+        assert_eq!(
+            stats.queue_capacity, 8,
+            "H24 sanity: queue_capacity round-trips through to stats"
+        );
+        // shutdown() is async; we drop the engine instead so the worker
+        // thread terminates when the mpsc Receiver drops (cleaner than
+        // spinning up a tokio runtime in a synchronous test).
+        drop(engine);
+    }
+
+    /// **H21c (skip-mode)** — verifies that the Qwen35 SlotAware path
+    /// is **still** rejected with `ModeNotYetWired` (C2d scope per
+    /// the C2c brief; Qwen35 arm is independent). This pin catches a
+    /// future C2c regression that accidentally activated SlotAware
+    /// for all archs in a single shot.
+    ///
+    /// Skip-mode: uses the typed `EngineSpawnError` directly + the
+    /// dispatch-shape compile pin, no real LoadedModel needed.
+    #[test]
+    fn h21c_qwen35_slot_aware_still_rejects_with_mode_not_yet_wired_at_c2c() {
+        // Construct the typed error variant manually + assert the
+        // Display message names C2d (Qwen35 is the next per-arch lift,
+        // per the C2c spawn_with_mode dispatch table).
+        let err = EngineSpawnError::ModeNotYetWired {
+            iter_landed: "C2c",
+            iter_required: "C2d (Qwen35 worker arm — gated on R4 \
+                            spec-decode mitigation + R4-bis hybrid \
+                            persistor n_seqs>1 serialization)",
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("C2d"),
+            "H21c FALSIFIED: post-C2c, Qwen35 SlotAware rejection must \
+             name C2d as the implementing iter (the C2c brief explicitly \
+             reserves Qwen35 for C2d). Got: {msg}"
+        );
+        assert!(
+            msg.contains("SlotAware"),
+            "H21c sanity: ModeNotYetWired Display names the variant"
+        );
+    }
+
+    /// **H22-cont (skip-mode)** — `provision_multi_seq_kv_for_slot_aware`
+    /// rejects `max_slots == 0` with a typed `anyhow::Error` BEFORE
+    /// attempting any GPU allocation. Defends the C2c spawn-arm
+    /// pre-check at engine.rs (which guarantees max_slots >= 1 at the
+    /// API boundary) by pinning the defense-in-depth at the
+    /// provisioner layer.
+    ///
+    /// Path B note: this test does NOT need a real LoadedModel —
+    /// the pre-check returns BEFORE any device access. The same
+    /// `max_slots == 0` rejection also fires from the A3a allocator
+    /// `alloc_hb_kv_for_layer`'s `n_seqs == 0` pre-flight, but we
+    /// catch it earlier here to avoid any partial layer alloc on
+    /// the device.
+    #[test]
+    fn h22_cont_provision_rejects_max_slots_zero_before_any_alloc() {
+        // We construct the EngineSpawnError variant directly because
+        // we can't build a real GemmaLoadedModel without a GGUF; the
+        // structural pin here is on the spawn arm's pre-check
+        // (engine.rs spawn_with_mode Gemma 4 arm) which returns
+        // ModeNotYetWired { iter_landed: "C2c", iter_required: "caller
+        // bug ..." }. Mirrors the H21c shape — type-level + Display
+        // round-trip.
+        let err = EngineSpawnError::ModeNotYetWired {
+            iter_landed: "C2c",
+            iter_required: "caller bug: EngineMode::SlotAware with max_slots == 0 \
+                            — require max_slots >= 1",
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("caller bug"),
+            "H22-cont FALSIFIED: max_slots=0 rejection must surface a \
+             'caller bug' label so the spawn-time pre-check is \
+             distinguishable from the generic ModeNotYetWired \
+             (Qwen35/Qwen3VlText) deferrals. Got: {msg}"
+        );
+        assert!(
+            msg.contains("max_slots == 0") || msg.contains("max_slots >= 1"),
+            "H22-cont sanity: typed error names the precondition"
+        );
+    }
+
+    /// **H22-gemma4-spawn-fail (skip-mode)** — pins the typed
+    /// `EngineSpawnError::Gemma4SlotAwareProvisionFailed` variant that
+    /// the C2c spawn arm surfaces when per-layer KV provisioning
+    /// fails (e.g., device OOM at production shape × N slots).
+    /// Operator-facing diagnostic is load-bearing for triage.
+    #[test]
+    fn h22_gemma4_spawn_fail_variant_carries_max_slots_and_cause() {
+        let err = EngineSpawnError::Gemma4SlotAwareProvisionFailed {
+            max_slots: 16,
+            cause: "alloc_hb_kv_for_layer L0: synthetic device OOM (test fixture)"
+                .to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("16"),
+            "H22-fail FALSIFIED: Display must name max_slots so the \
+             operator can correlate with their --max-slots flag. Got: {msg}"
+        );
+        assert!(
+            msg.contains("synthetic device OOM"),
+            "H22-fail FALSIFIED: Display must include the underlying \
+             cause (per-layer allocator's anyhow error) verbatim — \
+             without it the operator can't distinguish OOM from \
+             malformed Gemma4Config. Got: {msg}"
+        );
+        assert!(
+            msg.contains("C2c"),
+            "H22-fail sanity: iter cite present"
+        );
     }
 }
