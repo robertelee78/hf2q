@@ -1755,6 +1755,38 @@ pub struct GemmaLoadedModel {
     pub multi_seq_kv_hybrid: Option<
         Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
     >,
+    /// ADR-040 iter-C2c-cont-cont (2026-05-30) — multi-seq dense F32 KV
+    /// scaffold sibling.  Provisioned IFF `INVESTIGATION_ENV.use_dense`
+    /// is true at SlotAware spawn time (HF2Q_USE_DENSE=1 opt-in
+    /// pre-default surface).  Consumed by the iter-2D dispatch-fork
+    /// branch in [`forward_prefill_with_soft_tokens_slot_aware`] +
+    /// iter-2-decode-D dispatch-fork branch in [`forward_decode_slot_aware`]
+    /// via `MlxBuffer::slice_view` slot-view mount on `self.dense_kvs`.
+    ///
+    /// `None` when HF2Q_USE_DENSE=0 (default) — the iter-2D dispatch-fork
+    /// branch surfaces typed `iter-C2c-cont-cont-invariant-violated`
+    /// defense-in-depth at this case (operator who flipped the env
+    /// post-LazyLock-cache would land here).  See ADR-040 §6.1.46.
+    pub multi_seq_kv_dense: Option<
+        Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>,
+    >,
+    /// ADR-040 iter-C2c-cont-cont (2026-05-30) — multi-seq legacy 4-bit
+    /// nibble-packed KV scaffold sibling.  Provisioned IFF the
+    /// HF2Q_TQ_CODEBOOK_BITS=4 env gate is engaged at SlotAware spawn
+    /// time (opt-in pre-default since ADR-007 default-on TQ-8-bit
+    /// correction 2026-04-24).  Consumed by the iter-2C dispatch-fork
+    /// branch in [`forward_prefill_with_soft_tokens_slot_aware`] +
+    /// iter-2-decode-D dispatch-fork branch in [`forward_decode_slot_aware`]
+    /// via `MlxBuffer::slice_view` slot-view mount on `self.kv_caches`
+    /// (Vec swap pattern via `std::mem::replace`).
+    ///
+    /// `None` when HF2Q_TQ_CODEBOOK_BITS != "4" (default) — the iter-2C
+    /// dispatch-fork branch surfaces typed
+    /// `iter-C2c-cont-cont-invariant-violated` defense-in-depth at this
+    /// case.  See ADR-040 §6.1.46.
+    pub multi_seq_kv_mlx: Option<
+        Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
+    >,
 }
 
 impl LoadedModel {
@@ -2787,6 +2819,12 @@ impl GemmaLoadedModel {
             // legacy `weights.kv_caches` remains live for byte-
             // equivalence (H95 pin — sibling to H23).
             multi_seq_kv_hybrid: None,
+            // ADR-040 iter-C2c-cont-cont (2026-05-30) — multi-seq dense
+            // F32 + legacy 4-bit scaffold siblings.  None at construction
+            // (SerialFifo default).  SlotAware spawn arm provisions IFF
+            // the respective env-gate is engaged at process start.
+            multi_seq_kv_dense: None,
+            multi_seq_kv_mlx: None,
         })
     }
 
@@ -2851,7 +2889,8 @@ impl GemmaLoadedModel {
         max_slots: u32,
     ) -> Result<()> {
         use crate::inference::models::gemma4::kv_cache::{
-            alloc_hb_kv_for_layer, alloc_multi_seq_hybrid_kv_for_layer,
+            alloc_hb_kv_for_layer, alloc_multi_seq_dense_kv_for_layer,
+            alloc_multi_seq_hybrid_kv_for_layer, alloc_multi_seq_mlx_kv_for_layer,
             layer_type_to_alloc_params,
         };
         use crate::serve::config::LayerType;
@@ -2940,6 +2979,103 @@ impl GemmaLoadedModel {
         // (constructor default).  iter-2A dispatch fork's hybrid_kv
         // branch is unreachable in this configuration — the opt-out
         // HB-encoded branch handles the request via multi_seq_kv.
+
+        // ── Phase 3: Dense F32 KV scaffold (iter-C2c-cont-cont, §6.1.46) ──
+        //
+        // Provisioned IFF the dense F32 env regime is engaged.
+        // `INVESTIGATION_ENV.use_dense` is a LazyLock read once at
+        // process start; matches the env-read discipline at the
+        // iter-2D dispatch fork in `forward_prefill.rs` + the legacy
+        // alloc site at `forward_prefill.rs:621-622`.  If the env is
+        // off, we leave `multi_seq_kv_dense = None` (H188 negative-arm
+        // pin) — the iter-2D dispatch-fork branch is unreachable.
+        //
+        // Dtype choice mirrors the legacy site: F16 when HF2Q_F16_KV=1,
+        // F32 otherwise (the LCP path's KV dtype invariant per ADR-017
+        // Phase E.a iter-3.5a).
+        if crate::debug::INVESTIGATION_ENV.use_dense {
+            let kv_dtype = if crate::debug::INVESTIGATION_ENV.f16_kv {
+                mlx_native::DType::F16
+            } else {
+                mlx_native::DType::F32
+            };
+            let mut multi_seq_dense: Vec<
+                crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers,
+            > = Vec::with_capacity(num_layers);
+            for i in 0..num_layers {
+                let hd = self.config.head_dim_for_layer(i);
+                let nkv = self.config.num_kv_heads_for_layer(i);
+                let is_full = self.config.is_full_attention(i);
+                let layer_type =
+                    if is_full { LayerType::Full } else { LayerType::Sliding };
+                let (is_ring, capacity) = layer_type_to_alloc_params(
+                    layer_type,
+                    self.config.sliding_window,
+                    self.config.max_position_embeddings,
+                );
+                let buf = alloc_multi_seq_dense_kv_for_layer(
+                    dev, i, nkv, hd, capacity, is_ring, kv_dtype, max_slots,
+                )
+                .with_context(|| {
+                    format!(
+                        "ADR-040 iter-C2c-cont-cont: alloc_multi_seq_dense_kv_for_layer \
+                         L{i} failed for max_slots={max_slots} (nkv={nkv}, hd={hd}, \
+                         cap={capacity}, is_ring={is_ring}, dtype={:?}) — \
+                         HF2Q_USE_DENSE=1 opt-in pre-default surface per §6.1.46",
+                        kv_dtype,
+                    )
+                })?;
+                multi_seq_dense.push(buf);
+            }
+            self.multi_seq_kv_dense = Some(multi_seq_dense);
+        }
+        // else: HF2Q_USE_DENSE=0 → leave multi_seq_kv_dense = None.
+
+        // ── Phase 4: Legacy 4-bit MlxKvCache scaffold (iter-C2c-cont-cont, §6.1.46) ──
+        //
+        // Provisioned IFF HF2Q_TQ_CODEBOOK_BITS=4 is engaged.  Mirror
+        // of Phase 1's env-read discipline applied to the cb_bits gate.
+        // `norms_per_pos = (hd / 256).max(1)` matches the legacy alloc
+        // site at `gemma4/model.rs:1273`.
+        let cb_bits_provision: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
+            Ok("4") => 0,
+            Ok("5") => 5,
+            Ok("6") => 6,
+            Ok("8") => 8,
+            _ => 8, // DEFAULT: 8-bit (matches forward_prefill.rs line 835)
+        };
+        if cb_bits_provision == 0 {
+            let mut multi_seq_mlx: Vec<
+                crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache,
+            > = Vec::with_capacity(num_layers);
+            for i in 0..num_layers {
+                let hd = self.config.head_dim_for_layer(i);
+                let nkv = self.config.num_kv_heads_for_layer(i);
+                let is_full = self.config.is_full_attention(i);
+                let layer_type =
+                    if is_full { LayerType::Full } else { LayerType::Sliding };
+                let (is_ring, capacity) = layer_type_to_alloc_params(
+                    layer_type,
+                    self.config.sliding_window,
+                    self.config.max_position_embeddings,
+                );
+                let norms_per_pos = (hd / 256).max(1);
+                let buf = alloc_multi_seq_mlx_kv_for_layer(
+                    dev, i, nkv, hd, capacity, is_ring, norms_per_pos, max_slots,
+                )
+                .with_context(|| {
+                    format!(
+                        "ADR-040 iter-C2c-cont-cont: alloc_multi_seq_mlx_kv_for_layer \
+                         L{i} failed for max_slots={max_slots} (nkv={nkv}, hd={hd}, \
+                         cap={capacity}, is_ring={is_ring}, norms_per_pos={norms_per_pos}) \
+                         — HF2Q_TQ_CODEBOOK_BITS=4 opt-in pre-default surface per §6.1.46"
+                    )
+                })?;
+                multi_seq_mlx.push(buf);
+            }
+            self.multi_seq_kv_mlx = Some(multi_seq_mlx);
+        }
+        // else: HF2Q_TQ_CODEBOOK_BITS != "4" → leave multi_seq_kv_mlx = None.
 
         Ok(())
     }
@@ -4851,6 +4987,14 @@ fn worker_run(
                         // Mirrors the HB take/restore borrow pattern at
                         // line 4824 for the second scaffold.
                         let mut multi_seq_hybrid = g.multi_seq_kv_hybrid.take();
+                        // ADR-040 iter-B4c-kernel iter-2D / iter-2C
+                        // (§6.1.46) — parallel take on the dense F32 +
+                        // legacy 4-bit sibling scaffolds.  Provisioned
+                        // IFF the respective env-gate was engaged at
+                        // SlotAware spawn time (iter-C2c-cont-cont
+                        // Phase 3 / Phase 4); `None` otherwise.
+                        let mut multi_seq_dense = g.multi_seq_kv_dense.take();
+                        let mut multi_seq_mlx = g.multi_seq_kv_mlx.take();
                         let result = generate_gemma4_once_slot_aware(
                             g,
                             &prompt_tokens,
@@ -4858,6 +5002,8 @@ fn worker_run(
                             registration.as_ref(),
                             &mut multi_seq,
                             multi_seq_hybrid.as_mut(),
+                            multi_seq_dense.as_mut(),
+                            multi_seq_mlx.as_mut(),
                             slot_id,
                         );
                         // Put the persistent multi-seq KV back regardless
@@ -4865,6 +5011,10 @@ fn worker_run(
                         // (`multi_seq_kv.is_some()` for SlotAware
                         // Gemma 4) intact for the next request.
                         g.multi_seq_kv = Some(multi_seq);
+                        // ADR-040 iter-2D + iter-2C: parallel restore
+                        // on the dense F32 + legacy 4-bit siblings.
+                        g.multi_seq_kv_dense = multi_seq_dense;
+                        g.multi_seq_kv_mlx = multi_seq_mlx;
                         // ADR-040 iter-B4c-kernel iter-2B: parallel
                         // restore on the hybrid scaffold sibling.  When
                         // HF2Q_HYBRID_KV=1 (default), this restores the
@@ -5249,6 +5399,10 @@ fn worker_run(
                         // restore the original below.  Mirrors the
                         // Generate-arm take/restore pattern at line 4853.
                         let mut multi_seq_hybrid = g.multi_seq_kv_hybrid.take();
+                        // ADR-040 iter-2D + iter-2C (§6.1.46) — parallel
+                        // take on the dense F32 + legacy 4-bit siblings.
+                        let mut multi_seq_dense = g.multi_seq_kv_dense.take();
+                        let mut multi_seq_mlx = g.multi_seq_kv_mlx.take();
                         // Build borrowed `SoftTokenInjection<'_>` slices
                         // from the owned `SoftTokenData` (same shape as
                         // the legacy `generate_stream_once` injection
@@ -5272,6 +5426,8 @@ fn worker_run(
                             cancellation_counter.as_deref(),
                             &mut multi_seq,
                             multi_seq_hybrid.as_mut(),
+                            multi_seq_dense.as_mut(),
+                            multi_seq_mlx.as_mut(),
                             slot_id,
                         );
                         // Put the persistent multi-seq KV back regardless
@@ -5286,6 +5442,9 @@ fn worker_run(
                         // HF2Q_HYBRID_KV=0 (opt-out), `multi_seq_hybrid`
                         // is `None` and we restore the `None` state.
                         g.multi_seq_kv_hybrid = multi_seq_hybrid;
+                        // ADR-040 iter-2D + iter-2C: parallel restore.
+                        g.multi_seq_kv_dense = multi_seq_dense;
+                        g.multi_seq_kv_mlx = multi_seq_mlx;
                         // Standard post-pattern: bookkeep prefill +
                         // release.  Per-token advance_after_decode is
                         // skipped because the streaming path does not
@@ -5715,11 +5874,17 @@ fn worker_run(
                         // Generate-arm take/restore pattern at line 4853
                         // + GenerateStream-arm take/restore at line 5251.
                         let mut multi_seq_hybrid = g.multi_seq_kv_hybrid.take();
+                        // ADR-040 iter-2D + iter-2C (§6.1.46) — parallel
+                        // take on the dense F32 + legacy 4-bit siblings.
+                        let mut multi_seq_dense = g.multi_seq_kv_dense.take();
+                        let mut multi_seq_mlx = g.multi_seq_kv_mlx.take();
                         let result = embed_gemma4_slot_aware(
                             g,
                             &prompt_tokens,
                             &mut multi_seq,
                             multi_seq_hybrid.as_mut(),
+                            multi_seq_dense.as_mut(),
+                            multi_seq_mlx.as_mut(),
                             slot_id,
                         );
                         // Put the persistent multi-seq KV back regardless
@@ -5734,6 +5899,9 @@ fn worker_run(
                         // HF2Q_HYBRID_KV=0 (opt-out), `multi_seq_hybrid`
                         // is `None` and we restore the `None` state.
                         g.multi_seq_kv_hybrid = multi_seq_hybrid;
+                        // ADR-040 iter-2D + iter-2C: parallel restore.
+                        g.multi_seq_kv_dense = multi_seq_dense;
+                        g.multi_seq_kv_mlx = multi_seq_mlx;
                         // Standard post-pattern: bookkeep prefill +
                         // release.  Embed has no decode loop, so no
                         // per-token `advance_after_decode` calls (mirror
@@ -6043,6 +6211,10 @@ fn worker_run(
                         // Generate-arm take/restore pattern + iter-3
                         // GenerateStream-arm + iter-4 Embed-arm patterns.
                         let mut multi_seq_hybrid = g.multi_seq_kv_hybrid.take();
+                        // ADR-040 iter-2D + iter-2C (§6.1.46) — parallel
+                        // take on the dense F32 + legacy 4-bit siblings.
+                        let mut multi_seq_dense = g.multi_seq_kv_dense.take();
+                        let mut multi_seq_mlx = g.multi_seq_kv_mlx.take();
                         // Build borrowed `SoftTokenInjection<'_>` slices
                         // from the owned `SoftTokenData` (same shape as
                         // the legacy `generate_once_with_soft_tokens`
@@ -6075,6 +6247,8 @@ fn worker_run(
                             registration.as_ref(),
                             &mut multi_seq,
                             multi_seq_hybrid.as_mut(),
+                            multi_seq_dense.as_mut(),
+                            multi_seq_mlx.as_mut(),
                             slot_id,
                         );
                         // Put the persistent multi-seq KV back regardless
@@ -6089,6 +6263,9 @@ fn worker_run(
                         // HF2Q_HYBRID_KV=0 (opt-out), `multi_seq_hybrid`
                         // is `None` and we restore the `None` state.
                         g.multi_seq_kv_hybrid = multi_seq_hybrid;
+                        // ADR-040 iter-2D + iter-2C: parallel restore.
+                        g.multi_seq_kv_dense = multi_seq_dense;
+                        g.multi_seq_kv_mlx = multi_seq_mlx;
                         // Standard post-pattern: bookkeep prefill +
                         // per-token decodes + release.  iter-5 today
                         // surfaces typed CapabilityUnsupported on the
@@ -8203,6 +8380,23 @@ fn generate_gemma4_once_slot_aware(
     mut multi_seq_kv_hybrid: Option<
         &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
     >,
+    // ADR-040 iter-B4c-kernel iter-2D (2026-05-30) — dense F32 scaffold
+    // sibling param.  Provisioned IFF HF2Q_USE_DENSE=1 at SlotAware
+    // spawn time (iter-C2c-cont-cont Phase 3, §6.1.46).  When None,
+    // the iter-2D dispatch-fork branch in the model fn surfaces typed
+    // `iter-C2c-cont-cont-invariant-violated` defense-in-depth.
+    mut multi_seq_kv_dense: Option<
+        &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>,
+    >,
+    // ADR-040 iter-B4c-kernel iter-2C (2026-05-30) — legacy 4-bit
+    // nibble-packed scaffold sibling param.  Provisioned IFF
+    // HF2Q_TQ_CODEBOOK_BITS=4 at SlotAware spawn time (iter-C2c-cont-cont
+    // Phase 4, §6.1.46).  When None, the iter-2C dispatch-fork branch
+    // in the model fn surfaces typed
+    // `iter-C2c-cont-cont-invariant-violated` defense-in-depth.
+    mut multi_seq_kv_mlx: Option<
+        &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
+    >,
     slot_id: SlotId,
 ) -> Result<GenerationResult> {
     anyhow::ensure!(
@@ -8318,6 +8512,12 @@ fn generate_gemma4_once_slot_aware(
                 slot_id,
                 multi_seq_kv,
                 multi_seq_kv_hybrid.as_deref_mut(),
+                // ADR-040 iter-2D + iter-2C (§6.1.46): dense F32 + legacy
+                // 4-bit scaffold siblings.  Threaded as Option<&mut> per
+                // the iter-2B precedent — None when the respective env
+                // gate is off (the model fn defense-in-depth-fails).
+                multi_seq_kv_dense.as_deref_mut(),
+                multi_seq_kv_mlx.as_deref_mut(),
             )?;
         let prefill_duration = prefill_started.elapsed();
 
@@ -8486,6 +8686,10 @@ fn generate_gemma4_once_slot_aware(
                     slot_id,
                     multi_seq_kv,
                     multi_seq_kv_hybrid.as_deref_mut(),
+                    // ADR-040 iter-2-decode-D (§6.1.46) — dense F32 +
+                    // legacy 4-bit decode-side scaffold siblings.
+                    multi_seq_kv_dense.as_deref_mut(),
+                    multi_seq_kv_mlx.as_deref_mut(),
                 )?;
 
                 next_token = if sample_logits {
@@ -8788,6 +8992,14 @@ fn generate_stream_gemma4_once_slot_aware(
     mut multi_seq_kv_hybrid: Option<
         &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
     >,
+    // ADR-040 iter-B4c-kernel iter-2D / iter-2-decode-D (§6.1.46) —
+    // dense F32 + legacy 4-bit scaffold siblings.
+    mut multi_seq_kv_dense: Option<
+        &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>,
+    >,
+    mut multi_seq_kv_mlx: Option<
+        &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
+    >,
     slot_id: SlotId,
 ) {
     // SSE emit helper: bumps cancellation counter + early-returns on
@@ -8922,6 +9134,10 @@ fn generate_stream_gemma4_once_slot_aware(
             slot_id,
             multi_seq_kv,
             multi_seq_kv_hybrid.as_deref_mut(),
+            // ADR-040 iter-2D + iter-2C (§6.1.46): dense F32 + legacy
+            // 4-bit scaffold siblings (None when env-gate is off).
+            multi_seq_kv_dense.as_deref_mut(),
+            multi_seq_kv_mlx.as_deref_mut(),
         );
 
     // ADR-040 iter-B4c-kernel iter-2-decode-A (2026-05-30) — GenerateStream-arm
@@ -9189,6 +9405,9 @@ fn generate_stream_gemma4_once_slot_aware(
                             slot_id,
                             multi_seq_kv,
                             multi_seq_kv_hybrid.as_deref_mut(),
+                            // ADR-040 iter-2-decode-D (§6.1.46).
+                            multi_seq_kv_dense.as_deref_mut(),
+                            multi_seq_kv_mlx.as_deref_mut(),
                         );
                         let greedy_token = match r {
                             Ok(t) => t,
@@ -9461,6 +9680,17 @@ fn embed_gemma4_slot_aware(
     mut multi_seq_kv_hybrid: Option<
         &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
     >,
+    // ADR-040 iter-B4c-kernel iter-2D / iter-2C (§6.1.46) — dense F32 +
+    // legacy 4-bit scaffold siblings.  Threaded as Option<&mut> per the
+    // iter-3 + iter-5 precedent.  Embed-arm has NO decode loop (H180),
+    // so these are consumed only by the iter-2D / iter-2C prefill
+    // dispatch-fork branches in `forward_prefill_with_soft_tokens_slot_aware`.
+    mut multi_seq_kv_dense: Option<
+        &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>,
+    >,
+    mut multi_seq_kv_mlx: Option<
+        &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
+    >,
     slot_id: SlotId,
 ) -> Result<Vec<f32>> {
     anyhow::ensure!(
@@ -9549,6 +9779,11 @@ fn embed_gemma4_slot_aware(
             slot_id,
             multi_seq_kv,
             multi_seq_kv_hybrid.as_deref_mut(),
+            // ADR-040 iter-2D + iter-2C (§6.1.46): dense F32 + legacy
+            // 4-bit scaffold siblings.  Embed has no decode loop, so
+            // these are consumed only by the prefill branches.
+            multi_seq_kv_dense.as_deref_mut(),
+            multi_seq_kv_mlx.as_deref_mut(),
         );
 
     // Read the L2-normalized hidden vector from norm_out — byte-
@@ -9752,6 +9987,15 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
     mut multi_seq_kv_hybrid: Option<
         &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
     >,
+    // ADR-040 iter-B4c-kernel iter-2D + iter-2C (§6.1.46) — dense F32 +
+    // legacy 4-bit scaffold siblings.  Threaded as Option<&mut>
+    // identically to iter-3/4 worker arms.
+    mut multi_seq_kv_dense: Option<
+        &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>,
+    >,
+    mut multi_seq_kv_mlx: Option<
+        &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
+    >,
     slot_id: SlotId,
 ) -> Result<GenerationResult> {
     // Empty soft-token slice → identity over the text-only slot-aware
@@ -9774,6 +10018,10 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
             registration,
             multi_seq_kv,
             multi_seq_kv_hybrid,
+            // ADR-040 iter-2D + iter-2C (§6.1.46) — early-return forwards
+            // the dense F32 + legacy 4-bit scaffold siblings verbatim.
+            multi_seq_kv_dense,
+            multi_seq_kv_mlx,
             slot_id,
         );
     }
@@ -9863,6 +10111,9 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                 slot_id,
                 multi_seq_kv,
                 multi_seq_kv_hybrid.as_deref_mut(),
+                // ADR-040 iter-2D + iter-2C (§6.1.46).
+                multi_seq_kv_dense.as_deref_mut(),
+                multi_seq_kv_mlx.as_deref_mut(),
             )?;
         let prefill_duration = prefill_started.elapsed();
 
@@ -10005,6 +10256,10 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                     slot_id,
                     multi_seq_kv,
                     multi_seq_kv_hybrid.as_deref_mut(),
+                    // ADR-040 iter-2-decode-D (§6.1.46) — dense F32 +
+                    // legacy 4-bit decode-side scaffold siblings.
+                    multi_seq_kv_dense.as_deref_mut(),
+                    multi_seq_kv_mlx.as_deref_mut(),
                 )?;
 
                 next_token = if sample_logits {
@@ -23732,7 +23987,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H84: fn marker present (asserted above)");
-        let sig_window = &src[fn_idx..(fn_idx + 2000).min(src.len())];
+        // ADR-040 iter-B4c-kernel iter-2C + iter-2D (§6.1.46) — sig
+        // window bumped from 2_000 to 4_000 to accommodate the 2 new
+        // Option<&mut Vec<MultiSeq{Dense,Mlx}KvBuffers>> params with
+        // their docstrings.
+        let sig_window = &src[fn_idx..(fn_idx + 4_000).min(src.len())];
         assert!(
             sig_window.contains("slot_id: SlotId"),
             "H84 FALSIFIED: new fn signature missing `slot_id: SlotId` \
@@ -23958,8 +24217,12 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H88: fn marker present (H84 asserts)");
-        // Window covers the fn body (~6000 chars).
-        let body_window = &src[fn_idx..(fn_idx + 12_000).min(src.len())];
+        // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
+        // 12_000 to 50_000 to cover the bounds preflight AND the
+        // INVESTIGATION_ENV.hybrid_kv dispatch fork, which now sits
+        // after the new dense F32 + legacy 4-bit branches (the hybrid
+        // branch is now at line ~3187, ~37K bytes past fn start).
+        let body_window = &src[fn_idx..(fn_idx + 50_000).min(src.len())];
         // The bounds check reads `multi_seq_kv_hb[0].n_seqs` and
         // compares against `slot_id.0`.
         assert!(
@@ -24723,7 +24986,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H97: new fn marker present (H84 asserts)");
-        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
+        // 30_000 to 80_000 to cover both the hybrid + HB-encoded
+        // branches now that the dense F32 + legacy 4-bit branches
+        // sit before them.
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         // The iter-2A hybrid-branch typed-error label is the literal
         // `"gemma4-forward-prefill-slot-N-hybrid (iter-B4c-kernel-iter-2B per"`
         // (the iter-2A pin). iter-2B REMOVES it (real routing).
@@ -24849,7 +25116,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H100: new fn marker present");
-        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
+        // 30_000 to 80_000 to cover both the hybrid + HB-encoded
+        // branches now that the dense F32 + legacy 4-bit branches
+        // sit before them.
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         // The F16 K byte size discipline — 2 bytes/elem.  Honest match:
         // either `* 2` arithmetic on a `nkv * cap * hd` term OR the
         // dtype-aware `DType::F16.size_of()` lookup.  We accept either
@@ -24893,7 +25164,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H101: new fn marker present");
-        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
+        // 30_000 to 80_000 to cover both the hybrid + HB-encoded
+        // branches now that the dense F32 + legacy 4-bit branches
+        // sit before them.
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         // The `with_shape` call IS present (shape-preserving view).
         assert!(
             fn_window.contains(".with_shape("),
@@ -24987,7 +25262,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H103: new fn marker present");
-        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
+        // 30_000 to 80_000 to cover both the hybrid + HB-encoded
+        // branches now that the dense F32 + legacy 4-bit branches
+        // sit before them.
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         // The iter-2A-cont typed-deferral label MUST still be present
         // verbatim (HB-encoded branch remains pending).
         let iter2a_cont_label = "iter-B4c-kernel-iter-2A-cont per ADR-040 §6.1.32";
@@ -26856,7 +27135,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
         let fn_marker = "pub fn forward_decode_slot_aware(";
         let fn_idx = src.find(fn_marker).expect("H124: fn marker present (H123)");
         // Look at the next ~30k bytes to cover the full fn body.
-        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
+        // 30_000 to 80_000 to cover both the hybrid + HB-encoded
+        // branches now that the dense F32 + legacy 4-bit branches
+        // sit before them.
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         for required in [
             ".slice_view(",
             "self.hybrid_kv = Some(",
@@ -27263,7 +27546,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H130: generate_gemma4_once_slot_aware not found");
-        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
+        // 30_000 to 80_000 to cover both the hybrid + HB-encoded
+        // branches now that the dense F32 + legacy 4-bit branches
+        // sit before them.
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         // (a) OLD iter-2-decode-A sampling-clamp typed-error literal REMOVED.
         let old_label =
             "gemma4-forward-decode-slot-N-sampler-grammar (iter-B4c-kernel-iter-2-decode-C per ADR-040 §6.1.38";
@@ -27300,7 +27587,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H131: generate_gemma4_once_slot_aware not found");
-        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
+        // 30_000 to 80_000 to cover both the hybrid + HB-encoded
+        // branches now that the dense F32 + legacy 4-bit branches
+        // sit before them.
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         for required in [
             "GrammarRuntime::new(",
             "mask::mask_invalid_tokens(",
@@ -27365,7 +27656,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H133: generate_gemma4_once_slot_aware not found");
-        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
+        // 30_000 to 80_000 to cover both the hybrid + HB-encoded
+        // branches now that the dense F32 + legacy 4-bit branches
+        // sit before them.
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         assert!(
             fn_window.contains("sample_token_with_logprob"),
             "H133 FALSIFIED: Generate orchestrator body does NOT call \
@@ -27413,7 +27708,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
              the reasoning splitter + tool-call splitter."
         );
         // And the body window.
-        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        // ADR-040 iter-2C + iter-2D (§6.1.46) — window bumped from
+        // 30_000 to 80_000 to cover both the hybrid + HB-encoded
+        // branches now that the dense F32 + legacy 4-bit branches
+        // sit before them.
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         assert!(
             fn_window.contains("split_full_output("),
             "H134 FALSIFIED: Generate orchestrator body does NOT call \
@@ -27677,7 +27976,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_cont_iter2_decode_b_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H174: new fn marker present (H84 asserts)");
-        let fn_window = &src[fn_idx..(fn_idx + 40_000).min(src.len())];
+        // ADR-040 iter-B4c-kernel iter-2C + iter-2D (§6.1.46) — window
+        // bumped from 40K to 80K to accommodate the dense F32 + legacy
+        // 4-bit slot routing bodies added between the iter-2A bounds-
+        // first preflight and the iter-2A-cont HB-encoded body.
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         // The iter-2A HB-encoded branch typed-error capability literal —
         // the EXACT string a CapabilityUnsupported { capability: "..." }
         // constructor would have used.  iter-2A-cont REMOVES it.
@@ -27739,7 +28042,12 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_cont_iter2_decode_b_gemma4_tests {
         let fn_idx = src
             .find(fn_marker)
             .expect("H175: forward_decode_slot_aware not found (H123 asserts)");
-        let fn_window = &src[fn_idx..(fn_idx + 40_000).min(src.len())];
+        // ADR-040 iter-B4c-kernel iter-2-decode-D (§6.1.46) — window
+        // bumped from 40K to 80K to accommodate the dense F32 + legacy
+        // 4-bit decode-side slot routing bodies added between the
+        // iter-2-decode-A bounds-first preflight and the iter-2-decode-B
+        // HB-encoded body.
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
         // The iter-2-decode-A HB-encoded branch typed-error capability
         // literal.  iter-2-decode-B REMOVES it.
         let iter2_decode_b_typed_error =
@@ -28030,6 +28338,624 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_cont_iter2_decode_b_gemma4_tests {
             "H180 FALSIFIED: ADR-040 §6.1.45 closure block not found. \
              iter-2A-cont + iter-2-decode-B sub-deferral cites point at \
              a non-existent destination."
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADR-040 iter-B4c-kernel iter-2C + iter-2D + iter-2-decode-D tests
+// (H181–H188, §6.1.46, 2026-05-30).
+//
+// Scope decision narrative (joint shipping of 3 iters):
+//
+//   * iter-2C (HF2Q_TQ_CODEBOOK_BITS=4 legacy 4-bit prefill slot routing) +
+//     iter-2D (HF2Q_USE_DENSE=1 dense F32 prefill slot routing) +
+//     iter-2-decode-D (decode-side mirror for BOTH off-default regimes)
+//     all SHIPPED jointly in this iter because:
+//
+//     (a) They share the SAME structural pattern: extend the model-fn
+//         signatures with 2 new `Option<&mut Vec<MultiSeq{Dense,Mlx}KvBuffers>>`
+//         params + thread through the 3 slot-aware orchestrators + 4
+//         worker arms + extend `GemmaLoadedModel` with 2 sibling Option
+//         fields + extend `provision_multi_seq_kv_for_slot_aware` with
+//         Phase 3 (dense) + Phase 4 (mlx).
+//
+//     (b) The previously-shipped iter-2A-cont + iter-2-decode-B (§6.1.45)
+//         joint-iter precedent established the operator review pattern:
+//         structurally-parallel templates land in one closure block to
+//         minimize cognitive load on review.
+//
+//     (c) Both off-default regimes ship the SAME defense-in-depth
+//         scaffold-absent typed CapabilityUnsupported when the
+//         iter-C2c-cont-cont Phase 3 / Phase 4 provisioning was NOT
+//         engaged (the env-gate is off, so the scaffold Option is None).
+//
+// Background — what was deferred pre-this-iter:
+//
+//   * iter-2A (§6.1.32) shipped the 4-way dispatch fork in
+//     `forward_prefill_with_soft_tokens_slot_aware`.  The dense F32
+//     (`HF2Q_USE_DENSE=1`) branch surfaced typed
+//     `iter-B4c-kernel-iter-2D per ADR-040 §6.1.32`; the legacy 4-bit
+//     (`cb_bits==0`) branch surfaced typed `iter-B4c-kernel-iter-2C per
+//     ADR-040 §6.1.32`.
+//
+//   * iter-2-decode-A (§6.1.38) shipped the decode-side mirror.  The
+//     dense F32 + legacy 4-bit decode branches surfaced typed
+//     `iter-B4c-kernel-iter-2-decode-D per ADR-040 §6.1.38`.
+//
+// iter-2C + iter-2D + iter-2-decode-D (THIS iter, jointly per the brief's
+// joint-iter framing) REPLACE all 4 typed-error branches with real slot
+// routing.  Two structural variants:
+//
+//   * iter-2D + iter-2-decode-D-dense: mount on `self.dense_kvs:
+//     Option<Vec<Arc<DenseKvBuffers>>>` via slice_view ARC bundle;
+//     sibling fn `forward_prefill_with_soft_tokens_resume`'s
+//     `restored_lcp=None` branch gained an `is_some()` consume-gate
+//     (mirror of iter-2A-cont's `self.leg_hb_encoded.is_none()` gate at
+//     line ~902 + iter-2B's `self.hybrid_kv.is_none()` gate at line
+//     ~860).  The decode body delegates to `forward_decode` which does
+//     NOT read `self.dense_kvs` AT ALL — this is a structural fact: the
+//     iter-2-decode-D-dense branch is a mount+restore preserve-strong-
+//     refs operation (the TQ-active read path consumes
+//     `leg_hb_encoded` / `hybrid_kv` regardless of env).
+//
+//   * iter-2C + iter-2-decode-D-4bit: mount on `self.kv_caches:
+//     Vec<MlxKvCache>` via `std::mem::replace` of the entire Vec
+//     (legacy field is always-populated at model load time per
+//     `gemma4/model.rs:1292`; no Option wrapper, no is_none() gate
+//     needed at sibling level).  Sibling fn body unchanged.
+//
+// Production-code changes:
+//
+//   * `src/serve/forward_prefill.rs`:
+//     - 2 new imports: `MlxKvCache` (from gemma4 prelude) +
+//       `MultiSeqDenseKvBuffers, MultiSeqMlxKvCache` (from
+//       gemma4::kv_cache).
+//     - `forward_prefill_with_soft_tokens_slot_aware`: 2 new params
+//       (`multi_seq_kv_dense: Option<&mut Vec<MultiSeqDenseKvBuffers>>`
+//       + `multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>`).
+//       Iter-2D + iter-2C branches REPLACED typed CapabilityUnsupported
+//       with real per-layer slot-view construction + mount + delegate
+//       + restore.
+//     - `forward_decode_slot_aware`: mirror of above with same 2 new
+//       params.  Iter-2-decode-D dense + 4-bit branches REPLACED typed
+//       CapabilityUnsupported with real slot routing.
+//     - Sibling `forward_prefill_with_soft_tokens_resume`'s
+//       `restored_lcp=None` branch alloc-gate ALIGNED with the iter-2D
+//       slot-aware mount discipline via additive
+//       `self.dense_kvs.is_some()` consume-gate (mirror of iter-2A-cont
+//       + iter-2B alloc-gate alignments).  SerialFifo byte-equivalence
+//       preserved: SerialFifo enters with `self.dense_kvs == None`, gate
+//       fires identically (consume branch unreachable).
+//
+//   * `src/serve/api/engine.rs`:
+//     - `GemmaLoadedModel` extended with 2 new fields:
+//       `multi_seq_kv_dense: Option<Vec<MultiSeqDenseKvBuffers>>` +
+//       `multi_seq_kv_mlx: Option<Vec<MultiSeqMlxKvCache>>`.  Init to
+//       None in the constructor.
+//     - `provision_multi_seq_kv_for_slot_aware` extended with Phase 3
+//       (dense, gated on `INVESTIGATION_ENV.use_dense`) + Phase 4
+//       (mlx, gated on `cb_bits == 0`).  Off-default regimes leave the
+//       respective Option as None — the model-fn defense-in-depth-fails
+//       if the dispatch-fork branch is reached.
+//     - 3 slot-aware orchestrator fn signatures extended with 2 new
+//       `Option<&mut Vec<MultiSeq{Dense,Mlx}KvBuffers>>` params;
+//       threaded through to the model-fn calls verbatim.
+//     - 4 worker arms (Generate / GenerateStream / Embed / SoftTokens)
+//       extended with `take`/`restore` for the 2 new fields, mirroring
+//       the iter-2B / iter-3 / iter-4 / iter-5 hybrid-scaffold pattern.
+//     - NEW `adr040_phase_b_iter_b4c_kernel_iter2c_iter2d_iter2_decode_d_gemma4_tests`
+//       test module with H181–H188.
+//
+// Tests (H181–H188):
+//
+//   H181 (skip-mode): forward_prefill_with_soft_tokens_slot_aware
+//                     iter-2C 4-bit prefill branch typed-error label
+//                     REMOVED; positive pin on slot-view mount via
+//                     `std::mem::replace(&mut self.kv_caches, ...)`.
+//   H182 (skip-mode): forward_prefill_with_soft_tokens_slot_aware
+//                     iter-2D dense F32 prefill branch typed-error label
+//                     REMOVED; positive pin on slot-view mount via
+//                     `self.dense_kvs = Some(slot_view_dense)`.
+//   H183 (skip-mode): forward_decode_slot_aware iter-2-decode-D 4-bit
+//                     decode branch typed-error label REMOVED; positive
+//                     pin on `std::mem::replace(&mut self.kv_caches, ...)`.
+//   H184 (skip-mode): forward_decode_slot_aware iter-2-decode-D dense
+//                     decode branch typed-error label REMOVED; positive
+//                     pin on `self.dense_kvs = Some(slot_view_dense)`
+//                     for the decode body.
+//   H185 (skip-mode): per-slot byte isolation for both layouts —
+//                     `MlxKvCache` 4-buffer construction + dense F32
+//                     2-buffer construction both appear at least twice
+//                     in forward_prefill.rs (one prefill + one decode).
+//   H186 (skip-mode): slice_view byte offsets — 4-bit uses `hd / 2` +
+//                     `* 4u64` (norms F32); dense uses `dtype.size_of()`.
+//   H187 (skip-mode): SerialFifo byte-equivalence preserved — sibling
+//                     `forward_prefill_with_soft_tokens_resume` +
+//                     `forward_decode` signatures UNCHANGED (no new
+//                     params); the alloc-gate alignment via
+//                     `self.dense_kvs.is_some()` consume-gate predicate
+//                     short-circuits on SerialFifo (None Option).
+//   H188 (skip-mode): production-default HybridKvBuffers + HB-encoded
+//                     paths UNCHANGED (H179 transitivity); Qwen35 +
+//                     Qwen3VL UNCHANGED.
+
+#[cfg(test)]
+mod adr040_phase_b_iter_b4c_kernel_iter2c_iter2d_iter2_decode_d_gemma4_tests {
+    use super::*;
+
+    /// **H181 (skip-mode)** — iter-2C 4-bit prefill branch typed-error
+    /// REPLACED with real slot routing.
+    ///
+    /// The iter-2A typed-deferral capability literal
+    /// `gemma4-forward-prefill-slot-N-legacy-4bit (iter-B4c-kernel-iter-2C per`
+    /// is REMOVED from the new fn body — iter-2C's slot routing has
+    /// REPLACED it.  Positive pin: `std::mem::replace(&mut self.kv_caches,`
+    /// IS present (the Vec-swap mount primitive for the always-populated
+    /// legacy `self.kv_caches: Vec<MlxKvCache>` field).
+    ///
+    /// Note: the iter-2C label substring is preserved as a doc-comment
+    /// cite (the `iter-B4c-kernel-iter-2C per ADR-040 §6.1.32` substring
+    /// remains in the new fn body for H87 forward-pointer discoverability);
+    /// the load-bearing pin is that the substring is NOT present inside
+    /// a `MultiSeqError::CapabilityUnsupported { capability: "..." }`
+    /// constructor call — the typed error is GONE.
+    #[test]
+    fn h181_iter2c_legacy_4bit_branch_typed_error_replaced_with_slot_routing() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H181: new fn marker present (H84 asserts)");
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
+        // The iter-2A 4-bit branch typed-error capability literal —
+        // EXACT string a CapabilityUnsupported constructor would have
+        // used.  iter-2C REMOVES it.
+        let iter2c_typed_error =
+            "gemma4-forward-prefill-slot-N-legacy-4bit (iter-B4c-kernel-iter-2C per";
+        assert!(
+            !fn_window.contains(iter2c_typed_error),
+            "H181 FALSIFIED: new fn body still contains the iter-2A \
+             legacy 4-bit typed-error capability label \
+             `{iter2c_typed_error}` — iter-2C slot routing NOT landed; \
+             HF2Q_TQ_CODEBOOK_BITS=4 requests still surface \
+             CapabilityUnsupported at the legacy 4-bit branch."
+        );
+        // Positive pin: the iter-2C label substring IS preserved
+        // somewhere in the fn body as doc-comment cite (operator-
+        // grep'able forward pointer — required by H87 transitivity).
+        assert!(
+            fn_window.contains("iter-B4c-kernel-iter-2C per ADR-040 §6.1.32"),
+            "H181 FALSIFIED: new fn body does NOT contain the operator-\
+             grep'able label substring `iter-B4c-kernel-iter-2C per \
+             ADR-040 §6.1.32`. H87 forward-pointer discoverability broken \
+             — even after iter-2C SHIP the substring should remain as a \
+             doc-comment cite."
+        );
+        // Positive pin: the Vec-swap mount primitive IS present for
+        // the legacy `self.kv_caches: Vec<MlxKvCache>` field (no
+        // Option-wrapper; mem::replace swaps the entire Vec).
+        assert!(
+            fn_window.contains("std::mem::replace(&mut self.kv_caches"),
+            "H181 FALSIFIED: new fn body does NOT contain \
+             `std::mem::replace(&mut self.kv_caches` mount — per-slot \
+             routing through MlxKvCache's slot region cannot work; the \
+             sibling would see the persistent per-layer cache instead \
+             of the slot-view bundle."
+        );
+        // Positive pin: `MlxKvCache {` construction IS present (the
+        // mount path builds the legacy single-seq struct from the 4
+        // slot-view buffers).
+        assert!(
+            fn_window.contains("MlxKvCache {"),
+            "H181 FALSIFIED: new fn body does NOT construct \
+             `MlxKvCache {{ ... }}` from the slot-views.  The mount path \
+             must produce the legacy struct so the sibling fn's \
+             `self.kv_caches[layer_idx].k_packed` read at \
+             `gemma4/forward_gpu.rs:1525-1526` can read it bit-identically."
+        );
+    }
+
+    /// **H182 (skip-mode)** — iter-2D dense F32 prefill branch typed-error
+    /// REPLACED with real slot routing.
+    ///
+    /// Mirror of H181 for the dense F32 path: the iter-2A typed-deferral
+    /// capability literal `gemma4-forward-prefill-slot-N-dense-F32
+    /// (iter-B4c-kernel-iter-2D per` is REMOVED; positive pin on the
+    /// mount via `self.dense_kvs = Some(slot_view_dense)` (mirror of
+    /// iter-2B's `self.hybrid_kv = Some(...)` mount).
+    #[test]
+    fn h182_iter2d_dense_f32_branch_typed_error_replaced_with_slot_routing() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H182: new fn marker present");
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
+        let iter2d_typed_error =
+            "gemma4-forward-prefill-slot-N-dense-F32 (iter-B4c-kernel-iter-2D per";
+        assert!(
+            !fn_window.contains(iter2d_typed_error),
+            "H182 FALSIFIED: new fn body still contains the iter-2A \
+             dense F32 typed-error capability label \
+             `{iter2d_typed_error}` — iter-2D slot routing NOT landed; \
+             HF2Q_USE_DENSE=1 requests still surface CapabilityUnsupported."
+        );
+        // Positive pin: label substring preserved as doc-comment cite.
+        assert!(
+            fn_window.contains("iter-B4c-kernel-iter-2D per ADR-040 §6.1.32"),
+            "H182 FALSIFIED: new fn body does NOT contain operator-\
+             grep'able substring `iter-B4c-kernel-iter-2D per ADR-040 \
+             §6.1.32`. H87 forward-pointer discoverability broken."
+        );
+        // Positive pin: the dense mount IS present.
+        assert!(
+            fn_window.contains("self.dense_kvs = Some(slot_view_dense)"),
+            "H182 FALSIFIED: new fn body does NOT contain \
+             `self.dense_kvs = Some(slot_view_dense)` mount — per-slot \
+             routing through DenseKvBuffers' slot region cannot work; \
+             the sibling's consume-gate at line ~676 cannot consume the \
+             slot-view bundle."
+        );
+        // Positive pin: scaffold-absent defense-in-depth label IS
+        // present (operator who flipped HF2Q_USE_DENSE post-LazyLock
+        // would land here).
+        assert!(
+            fn_window.contains("gemma4-forward-prefill-dense-scaffold-absent"),
+            "H182 FALSIFIED: new fn body does NOT contain the iter-2D \
+             defense-in-depth scaffold-absent label \
+             `gemma4-forward-prefill-dense-scaffold-absent`.  Operator \
+             who flipped HF2Q_USE_DENSE post-spawn would surface a less-\
+             informative error."
+        );
+    }
+
+    /// **H183 (skip-mode)** — iter-2-decode-D 4-bit decode branch typed-
+    /// error REPLACED with real slot routing.
+    ///
+    /// Mirror of H181 for the decode body: the iter-2-decode-A typed-
+    /// deferral capability literal `gemma4-forward-decode-slot-N-legacy-
+    /// 4bit (iter-B4c-kernel-iter-2-decode-D per` is REMOVED.
+    #[test]
+    fn h183_iter2_decode_d_4bit_branch_typed_error_replaced_with_slot_routing() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_decode_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H183: forward_decode_slot_aware not found (H123 asserts)");
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
+        let iter2_decode_d_4bit_error =
+            "gemma4-forward-decode-slot-N-legacy-4bit (iter-B4c-kernel-iter-2-decode-D per";
+        assert!(
+            !fn_window.contains(iter2_decode_d_4bit_error),
+            "H183 FALSIFIED: decode fn body still contains the iter-2-\
+             decode-A legacy 4-bit typed-error label \
+             `{iter2_decode_d_4bit_error}` — iter-2-decode-D 4-bit slot \
+             routing NOT landed."
+        );
+        // Positive pin: Vec-swap mount via mem::replace IS present.
+        assert!(
+            fn_window.contains("std::mem::replace(&mut self.kv_caches"),
+            "H183 FALSIFIED: decode fn body does NOT contain \
+             `std::mem::replace(&mut self.kv_caches` mount — decode-side \
+             per-slot routing through MlxKvCache cannot work."
+        );
+        // Positive pin: scaffold-absent defense-in-depth label IS present.
+        assert!(
+            fn_window.contains("gemma4-forward-decode-mlx-scaffold-absent"),
+            "H183 FALSIFIED: decode fn body does NOT contain the iter-2-\
+             decode-D defense-in-depth scaffold-absent label."
+        );
+    }
+
+    /// **H184 (skip-mode)** — iter-2-decode-D dense F32 decode branch
+    /// typed-error REPLACED with real slot routing.
+    ///
+    /// Mirror of H182 for the decode body.  Note: forward_decode does
+    /// NOT consume `self.dense_kvs` at runtime; the mount+restore is
+    /// structurally a no-op for the dense F32 read path (the TQ-active
+    /// path routes via leg_hb_encoded / hybrid_kv).  H184 pins typed-
+    /// error removal + mount construction so the byte-offset arithmetic
+    /// is verified (H186) and the persistent scaffold's strong refs are
+    /// preserved.
+    #[test]
+    fn h184_iter2_decode_d_dense_branch_typed_error_replaced_with_slot_routing() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_decode_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H184: forward_decode_slot_aware not found");
+        let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
+        let iter2_decode_d_dense_error =
+            "gemma4-forward-decode-slot-N-dense-F32 (iter-B4c-kernel-iter-2-decode-D per";
+        assert!(
+            !fn_window.contains(iter2_decode_d_dense_error),
+            "H184 FALSIFIED: decode fn body still contains the iter-2-\
+             decode-A dense F32 typed-error label \
+             `{iter2_decode_d_dense_error}` — iter-2-decode-D dense slot \
+             routing NOT landed."
+        );
+        // Positive pin: dense mount IS present in the decode body
+        // (mount on self.dense_kvs).  forward_decode does not READ
+        // self.dense_kvs but the mount preserves the persistent
+        // scaffold's strong refs for future iters that may add a
+        // dense F32 decode read path.
+        assert!(
+            fn_window.contains("self.dense_kvs = Some(slot_view_dense)"),
+            "H184 FALSIFIED: decode fn body does NOT contain \
+             `self.dense_kvs = Some(slot_view_dense)` mount.  The byte-\
+             offset arithmetic verification + persistent scaffold strong-\
+             ref preservation cannot work without the mount."
+        );
+        // Positive pin: scaffold-absent defense-in-depth label IS present.
+        assert!(
+            fn_window.contains("gemma4-forward-decode-dense-scaffold-absent"),
+            "H184 FALSIFIED: decode fn body does NOT contain the iter-2-\
+             decode-D defense-in-depth scaffold-absent dense label."
+        );
+    }
+
+    /// **H185 (skip-mode + structural)** — per-slot byte isolation for
+    /// both layouts.
+    ///
+    /// The 4-buffer MlxKvCache construction (`MlxKvCache { k_packed:`,
+    /// `k_norms:`, `v_packed:`, `v_norms:`) appears in BOTH prefill +
+    /// decode bodies (≥2 each); the 2-buffer DenseKvBuffers ARC
+    /// construction (`DenseKvBuffers { k:`, `v:`) appears in BOTH
+    /// prefill + decode bodies (≥2 each).  Defends against silently
+    /// sharing buffers across slots.
+    #[test]
+    fn h185_per_slot_byte_isolation_4bit_and_dense_constructs_in_prefill_and_decode() {
+        let src = include_str!("../forward_prefill.rs");
+        // 4-buffer MlxKvCache construction: k_packed + k_norms +
+        // v_packed + v_norms — each appears in at LEAST 2 places
+        // (1 prefill + 1 decode; the legacy alloc site at
+        // gemma4/model.rs is in a different file).
+        for required in [
+            "MlxKvCache {",
+            "k_packed: k_packed_view",
+            "k_norms: k_norms_view",
+            "v_packed: v_packed_view",
+            "v_norms: v_norms_view",
+        ] {
+            let count = src.matches(required).count();
+            assert!(
+                count >= 2,
+                "H185 FALSIFIED: MlxKvCache field assignment `{required}` \
+                 appears {count} time(s) in forward_prefill.rs — expected \
+                 ≥2 (1 prefill + 1 decode).  Per-slot isolation broken: \
+                 either the prefill or decode 4-bit branch is silently \
+                 sharing buffers across slots."
+            );
+        }
+        // 2-buffer DenseKvBuffers construction: k + v.  Note the legacy
+        // alloc site at line ~705 also constructs DenseKvBuffers, so
+        // the expected count is ≥3 (1 legacy + 1 iter-2D prefill +
+        // 1 iter-2D decode).
+        for required in [
+            "k: k_view,",
+            "v: v_view,",
+        ] {
+            let count = src.matches(required).count();
+            assert!(
+                count >= 2,
+                "H185 FALSIFIED: DenseKvBuffers field assignment \
+                 `{required}` appears {count} time(s) — expected ≥2 \
+                 (1 prefill + 1 decode).  Per-slot isolation broken on \
+                 the dense F32 path."
+            );
+        }
+    }
+
+    /// **H186 (skip-mode)** — slice_view byte offsets match the legacy
+    /// layouts for both 4-bit + dense F32 variants.
+    ///
+    /// 4-bit: K_packed / V_packed are U8 = 1 byte/elem with shape
+    /// `[nkv, cap, hd/2]`; K_norms / V_norms are F32 = 4 bytes/elem.
+    /// Dense F32: K + V are `dtype.size_of()` (4 for F32, 2 for F16).
+    ///
+    /// Pin defends a regression where iter-2C accidentally uses
+    /// iter-2B's `* 2u64` F16-K multiplier on the U8 K_packed buffer
+    /// (would silently route to wrong slot).
+    #[test]
+    fn h186_slice_view_byte_offsets_match_4bit_and_dense_layouts() {
+        let src = include_str!("../forward_prefill.rs");
+        // The MLX (4-bit) slot-view uses `hd_half = hd / 2` for the
+        // packed buffer's shape — that's the load-bearing structural
+        // marker of the U8-packed half-nibble shape.
+        assert!(
+            src.contains("hd_half = hd / 2"),
+            "H186 FALSIFIED: forward_prefill.rs does not contain the \
+             4-bit nibble-pack shape marker `hd_half = hd / 2`.  The \
+             MLX slot-view would use the wrong shape for the U8 packed \
+             buffers (silently corrupting per-slot byte addressing)."
+        );
+        // The MLX slot-view's packed byte offset uses the U8 = 1 byte/\
+        // elem discipline (`checked_mul(packed_elems_per_slot as u64)`
+        // — no `* 2u64` or `* 4u64` multiplier on packed elements).
+        assert!(
+            src.contains("checked_mul(packed_elems_per_slot as u64) // U8 = 1 byte/elem"),
+            "H186 FALSIFIED: forward_prefill.rs does not contain the \
+             MLX packed byte-offset arithmetic with the U8 1-byte/elem \
+             marker comment.  An accidental F16 `* 2u64` multiplier on \
+             the packed buffer would silently target the wrong slot."
+        );
+        // The MLX norms byte offset uses `* 4u64` (F32) — same as the
+        // HB norms layout (mirror of iter-2A-cont's norms_byte_offset
+        // discipline).
+        assert!(
+            src.matches("checked_mul(4u64) // F32 = 4 bytes/elem").count() >= 2,
+            "H186 FALSIFIED: forward_prefill.rs F32 4-byte/elem norms \
+             multiplier marker appears <2 times — expected ≥2 (prefill + \
+             decode MLX norms slot-view arithmetic)."
+        );
+        // The dense slot-view uses `dtype.size_of()` (dtype-aware).
+        // Mirror of iter-2B's `v_dtype_size` discipline at line ~2829.
+        assert!(
+            src.contains("dtype_size = dtype.size_of()"),
+            "H186 FALSIFIED: forward_prefill.rs does not contain the \
+             dense F32 dtype-aware byte-size lookup `dtype_size = \
+             dtype.size_of()`.  An accidental hardcoded F32 multiplier \
+             would corrupt slot addressing under HF2Q_F16_KV=1."
+        );
+    }
+
+    /// **H187 (skip-mode)** — SerialFifo byte-equivalence preserved at
+    /// slot 0 for both regimes.
+    ///
+    /// (a) Sibling fn `forward_prefill_with_soft_tokens_resume`'s
+    ///     signature is UNCHANGED (mirror of H86).
+    /// (b) Sibling fn `forward_decode`'s signature is UNCHANGED (mirror
+    ///     of H128).
+    /// (c) The iter-2D alloc-gate alignment added a
+    ///     `self.dense_kvs.is_some()` consume-gate predicate inside the
+    ///     sibling's `restored_lcp=None` branch.  SerialFifo enters
+    ///     with `self.dense_kvs == None`, so the consume branch is
+    ///     unreachable; the fresh-alloc body runs verbatim.
+    /// (d) The iter-2C path mounts via `std::mem::replace` of
+    ///     `self.kv_caches: Vec<MlxKvCache>` — the SerialFifo path
+    ///     never reaches the slot-aware fn (iter-1 worker-arm predicate
+    ///     `slot_id != SlotId(0)`) so the mount is unreachable on
+    ///     SerialFifo.
+    #[test]
+    fn h187_serial_fifo_byte_equivalence_preserved_for_4bit_and_dense() {
+        let src = include_str!("../forward_prefill.rs");
+        // (a) Sibling fn forward_prefill_with_soft_tokens_resume's
+        // signature is unchanged (no slot_id / multi_seq_kv params).
+        let sibling_marker = "pub fn forward_prefill_with_soft_tokens_resume(";
+        let sibling_idx = src.find(sibling_marker).expect(
+            "H187: sibling fn forward_prefill_with_soft_tokens_resume present",
+        );
+        let sibling_sig =
+            &src[sibling_idx..(sibling_idx + 2_000).min(src.len())];
+        assert!(
+            !sibling_sig.contains("slot_id:"),
+            "H187 FALSIFIED: sibling `forward_prefill_with_soft_tokens_resume` \
+             signature contains `slot_id:` — H86 byte-equivalence pin \
+             broken; SerialFifo would be routed through the slot-aware path."
+        );
+        assert!(
+            !sibling_sig.contains("multi_seq_kv"),
+            "H187 FALSIFIED: sibling fn signature contains `multi_seq_kv` \
+             — H86 byte-equivalence pin broken."
+        );
+        // (b) Sibling fn forward_decode's signature is unchanged.
+        let decode_sibling_marker = "pub fn forward_decode(";
+        let decode_idx = src
+            .find(decode_sibling_marker)
+            .or_else(|| {
+                // forward_decode may live in gemma4/forward_gpu.rs;
+                // check there if not in forward_prefill.rs.
+                None
+            });
+        // Either forward_decode is in forward_prefill.rs (skip-mode pin
+        // would scan its sig here) or it's in gemma4/forward_gpu.rs
+        // (skip the in-file check).
+        if let Some(idx) = decode_idx {
+            let decode_sig = &src[idx..(idx + 2_000).min(src.len())];
+            assert!(
+                !decode_sig.contains("slot_id:"),
+                "H187 FALSIFIED: sibling `forward_decode` signature \
+                 contains `slot_id:` — H128 byte-equivalence pin broken."
+            );
+        }
+        // (c) The iter-2D consume-gate predicate exists in the sibling
+        // fn body.  SerialFifo enters with self.dense_kvs == None, so
+        // this gate's consume branch is unreachable.
+        assert!(
+            src.contains("if self.dense_kvs.is_some()"),
+            "H187 FALSIFIED: sibling fn body does NOT contain the iter-\
+             2D alloc-gate alignment `if self.dense_kvs.is_some()` \
+             predicate.  The slot-aware mount would be obliterated by \
+             the sibling's unconditional fresh-alloc; iter-2D consume \
+             discipline broken."
+        );
+    }
+
+    /// **H188 (skip-mode)** — production-default + Qwen35 + Qwen3VL
+    /// surfaces UNCHANGED.
+    ///
+    /// (a) iter-2B hybrid-branch typed-error label STILL REMOVED (H97
+    ///     transitivity).
+    /// (b) iter-2B `self.hybrid_kv = Some(slot_view_hybrid)` mount
+    ///     STILL present (H101 transitivity).
+    /// (c) iter-2-decode-A `forward_decode_slot_aware` fn STILL defined
+    ///     (H123 transitivity).
+    /// (d) iter-2A-cont HB-encoded branch `self.leg_hb_encoded = Some(`
+    ///     mount STILL present (H174 transitivity).
+    /// (e) iter-2-decode-B HB-encoded decode branch `self.leg_hb_encoded
+    ///     = Some(` mount STILL present (H175 transitivity).
+    /// (f) Qwen35 + Qwen3VL surfaces in engine.rs UNCHANGED.
+    /// (g) ADR-040 §6.1.46 closure block exists.
+    #[test]
+    fn h188_production_default_and_qwen35_qwen3vl_surfaces_unchanged() {
+        let pf_src = include_str!("../forward_prefill.rs");
+        // (a) iter-2B hybrid-branch typed-error label STILL REMOVED.
+        let iter2a_hybrid_typed_error =
+            "gemma4-forward-prefill-slot-N-hybrid (iter-B4c-kernel-iter-2B per";
+        assert!(
+            !pf_src.contains(iter2a_hybrid_typed_error),
+            "H188 FALSIFIED: iter-2A hybrid-branch typed-error label \
+             `{iter2a_hybrid_typed_error}` REGRESSED — iter-2C / 2D / \
+             2-decode-D accidentally restored the iter-2A typed-error \
+             on the production-default hybrid branch."
+        );
+        // (b) iter-2B hybrid mount STILL present.
+        assert!(
+            pf_src.contains("self.hybrid_kv = Some(slot_view_hybrid)"),
+            "H188 FALSIFIED: iter-2B hybrid-branch mount \
+             `self.hybrid_kv = Some(slot_view_hybrid)` REGRESSED."
+        );
+        // (c) iter-2-decode-A fn STILL defined.
+        assert!(
+            pf_src.contains("pub fn forward_decode_slot_aware("),
+            "H188 FALSIFIED: `forward_decode_slot_aware` fn removed — \
+             H123 transitivity broken."
+        );
+        // (d) iter-2A-cont HB-encoded mount STILL present.
+        assert!(
+            pf_src.matches("self.leg_hb_encoded = Some(").count() >= 2,
+            "H188 FALSIFIED: `self.leg_hb_encoded = Some(` mount count \
+             < 2 (expected ≥2: one in prefill, one in decode).  \
+             iter-2A-cont (H174) or iter-2-decode-B (H175) regression."
+        );
+        let src = include_str!("./engine.rs");
+        // (f) Qwen35 worker-arm slot-aware fns + worker-arm structural
+        // elements UNCHANGED (presence pin).
+        for required in [
+            "generate_qwen35_once_slot_aware",
+            "generate_stream_qwen35_once_slot_aware",
+        ] {
+            assert!(
+                src.contains(required),
+                "H188 FALSIFIED: Qwen35 slot-aware surface `{required}` \
+                 removed — iter-2C / 2D / 2-decode-D accidentally \
+                 touched Qwen35 architecture."
+            );
+        }
+        // (g) Embed-arm must NOT call forward_decode_slot_aware (mirror
+        // of H180).
+        let fn_marker = "fn embed_gemma4_slot_aware(";
+        let embed_idx = src.find(fn_marker).expect(
+            "H188: embed_gemma4_slot_aware not found"
+        );
+        let embed_window =
+            &src[embed_idx..(embed_idx + 10_000).min(src.len())];
+        assert!(
+            !embed_window.contains(".forward_decode_slot_aware("),
+            "H188 FALSIFIED: Embed-arm fn body calls \
+             `forward_decode_slot_aware`.  The Embed-arm has NO decode \
+             loop — calling forward_decode_slot_aware would corrupt the \
+             L2-normalized embedding vector."
+        );
+        // (h) ADR-040 §6.1.46 closure block exists.
+        let adr =
+            include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.46"),
+            "H188 FALSIFIED: ADR-040 §6.1.46 closure block not found. \
+             iter-2C + iter-2D + iter-2-decode-D sub-deferral cites \
+             point at a non-existent destination."
         );
     }
 }

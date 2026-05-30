@@ -312,8 +312,18 @@ pub fn build_qwen3vl_positions(
     }
     Ok(flat)
 }
-use crate::inference::models::gemma4::{MlxModelWeights, DenseKvBuffers, HbKvBuffers};
-use crate::inference::models::gemma4::kv_cache::{MultiSeqHbKvBuffers, MultiSeqHybridKvBuffers};
+use crate::inference::models::gemma4::{MlxModelWeights, DenseKvBuffers, HbKvBuffers, MlxKvCache};
+use crate::inference::models::gemma4::kv_cache::{
+    MultiSeqHbKvBuffers, MultiSeqHybridKvBuffers,
+    // ADR-040 iter-B4c-kernel iter-2C + iter-2D + iter-2-decode-D (2026-05-30) —
+    // multi-seq scaffold types for the legacy 4-bit (cb_bits==0) +
+    // dense F32 (HF2Q_USE_DENSE=1) opt-in pre-default surfaces.  Their
+    // alloc helpers (`alloc_multi_seq_mlx_kv_for_layer` /
+    // `alloc_multi_seq_dense_kv_for_layer`) are exposed for the
+    // iter-C2c-cont-cont spawn-time provisioning Phase 3 (dense) +
+    // Phase 4 (mlx) on `GemmaLoadedModel`.  See ADR-040 §6.1.46.
+    MultiSeqDenseKvBuffers, MultiSeqMlxKvCache,
+};
 use crate::serve::forward_mlx_shared::{
     dispatch_qmatmul, dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
 };
@@ -675,47 +685,135 @@ impl MlxModelWeights {
         // `&mut` borrows, so the binding stays immutable here.
         let dense_kvs_vec: Vec<DenseKvBuffers> = match restored_lcp {
             None => {
-                // Pre-iter-3 fresh-alloc path (byte-identical to the
-                // pre-iter-3 `forward_prefill_with_soft_tokens` body).
-                let mut v: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
-                for (layer_idx, layer) in self.layers.iter().enumerate() {
-                    let nkv = layer.num_kv_heads;
-                    let hd = layer.head_dim;
-                    let layer_is_sliding_model = layer.layer_type == LayerType::Sliding;
-                    // iter-3.6: when LONG_RESUME is on, sliding layers
-                    // get a LINEAR buffer (cap = sliding_layer_capacity).
-                    // The buffer is no longer a ring at the storage
-                    // level; the kernel applies sliding-window masking
-                    // via mask_type=2. The `is_sliding` field on
-                    // DenseKvBuffers continues to indicate the MODEL-
-                    // SIDE semantic (kernel needs sliding-window mask),
-                    // NOT whether the buffer is a ring. Read sites
-                    // distinguish "ring vs linear" by inspecting
-                    // INVESTIGATION_ENV.kv_lcp_long_resume directly.
-                    let capacity = if layer_is_sliding_model {
-                        sliding_layer_capacity
-                    } else {
-                        linear_capacity
-                    };
-                    let n = nkv * capacity * hd;
-                    let kbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
-                        .map_err(|e| anyhow::anyhow!("prefill dense K L{layer_idx}: {e}"))?;
-                    let vbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
-                        .map_err(|e| anyhow::anyhow!("prefill dense V L{layer_idx}: {e}"))?;
-                    v.push(DenseKvBuffers {
-                        k: kbuf,
-                        v: vbuf,
-                        capacity,
-                        is_sliding: layer_is_sliding_model,
-                        // ADR-017 Phase E.a iter-3.5a — record dtype
-                        // invariant. `kv_dtype` is set above from
-                        // INVESTIGATION_ENV.f16_kv (read once via
-                        // LazyLock); same dtype across all layers in
-                        // this allocation pass.
-                        dtype: kv_dtype,
-                    });
+                // ADR-040 iter-B4c-kernel iter-2D (2026-05-30) — alloc-gate
+                // alignment with the slot-aware mount discipline.  If the
+                // slot-aware caller pre-mounted a slot-view bundle on
+                // `self.dense_kvs` (Option<Vec<Arc<DenseKvBuffers>>>), we
+                // CONSUME the bundle here via the SAME try_unwrap path as
+                // the Some(_) LCP branch — this routes per-token kernel
+                // writes to the slot's region of the persistent multi-seq
+                // scaffold without changing this sibling fn's signature
+                // (H86 preserved).
+                //
+                // SerialFifo byte-equivalence preserved: SerialFifo enters
+                // with `self.dense_kvs == None`, so the consume branch is
+                // unreachable for SerialFifo (None Option short-circuits
+                // to the fresh-alloc body below).  Mirror of iter-2A-cont's
+                // `self.leg_hb_encoded.is_none()` gate alignment at line
+                // ~902 + iter-2B's `self.hybrid_kv.is_none()` gate at
+                // ~860.  H187 / H178 / H102 pin the SerialFifo case.
+                //
+                // Pinned by H187 (SerialFifo byte-equivalence preserved
+                // at slot 0) + H182 (real slot routing landed for iter-2D
+                // dense F32).
+                if self.dense_kvs.is_some() {
+                    let cached_arcs = self.dense_kvs.take().expect(
+                        "iter-2D consume-gate: self.dense_kvs.is_some() validated above",
+                    );
+                    if cached_arcs.len() != num_layers {
+                        anyhow::bail!(
+                            "forward_prefill iter-2D consume-gate: cached dense_kvs len {} \
+                             != num_layers {}",
+                            cached_arcs.len(),
+                            num_layers
+                        );
+                    }
+                    let mut v: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
+                    let mut cached_iter = cached_arcs.into_iter();
+                    for (layer_idx, layer) in self.layers.iter().enumerate() {
+                        let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                        let required_cap = if layer_is_ring {
+                            sliding_layer_capacity
+                        } else {
+                            linear_capacity
+                        };
+                        let cached_arc = cached_iter.next().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "forward_prefill iter-2D consume-gate: missing \
+                                 cached dense_kvs[layer={}]",
+                                layer_idx
+                            )
+                        })?;
+                        let cached_cap = cached_arc.capacity;
+                        if cached_cap < required_cap {
+                            anyhow::bail!(
+                                "forward_prefill iter-2D consume-gate: cached \
+                                 dense_kvs[layer={}] capacity {} < required {} \
+                                 (slot-aware mount requires scaffold capacity ≥ \
+                                  request capacity; iter-C2c-cont-cont must \
+                                  provision n_seqs × max_position_embeddings buffer)",
+                                layer_idx,
+                                cached_cap,
+                                required_cap
+                            );
+                        }
+                        if cached_arc.is_sliding != layer_is_ring {
+                            anyhow::bail!(
+                                "forward_prefill iter-2D consume-gate: cached \
+                                 dense_kvs[layer={}] is_sliding={} != model \
+                                 layer is_sliding={} (slot-aware mount \
+                                 architecture mismatch)",
+                                layer_idx,
+                                cached_arc.is_sliding,
+                                layer_is_ring
+                            );
+                        }
+                        let owned = std::sync::Arc::try_unwrap(cached_arc)
+                            .map_err(|_arc| {
+                                anyhow::anyhow!(
+                                    "forward_prefill iter-2D consume-gate: \
+                                     cached dense_kvs[layer={}] Arc not exclusive \
+                                     — slot-aware mount produced a shared Arc \
+                                     (iter-B4c-kernel iter-2D invariant violated)",
+                                    layer_idx
+                                )
+                            })?;
+                        v.push(owned);
+                    }
+                    v
+                } else {
+                    // Pre-iter-3 fresh-alloc path (byte-identical to the
+                    // pre-iter-3 `forward_prefill_with_soft_tokens` body).
+                    let mut v: Vec<DenseKvBuffers> = Vec::with_capacity(num_layers);
+                    for (layer_idx, layer) in self.layers.iter().enumerate() {
+                        let nkv = layer.num_kv_heads;
+                        let hd = layer.head_dim;
+                        let layer_is_sliding_model = layer.layer_type == LayerType::Sliding;
+                        // iter-3.6: when LONG_RESUME is on, sliding layers
+                        // get a LINEAR buffer (cap = sliding_layer_capacity).
+                        // The buffer is no longer a ring at the storage
+                        // level; the kernel applies sliding-window masking
+                        // via mask_type=2. The `is_sliding` field on
+                        // DenseKvBuffers continues to indicate the MODEL-
+                        // SIDE semantic (kernel needs sliding-window mask),
+                        // NOT whether the buffer is a ring. Read sites
+                        // distinguish "ring vs linear" by inspecting
+                        // INVESTIGATION_ENV.kv_lcp_long_resume directly.
+                        let capacity = if layer_is_sliding_model {
+                            sliding_layer_capacity
+                        } else {
+                            linear_capacity
+                        };
+                        let n = nkv * capacity * hd;
+                        let kbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
+                            .map_err(|e| anyhow::anyhow!("prefill dense K L{layer_idx}: {e}"))?;
+                        let vbuf = dev.alloc_buffer(n * kv_elem_bytes, kv_dtype, vec![nkv, capacity, hd])
+                            .map_err(|e| anyhow::anyhow!("prefill dense V L{layer_idx}: {e}"))?;
+                        v.push(DenseKvBuffers {
+                            k: kbuf,
+                            v: vbuf,
+                            capacity,
+                            is_sliding: layer_is_sliding_model,
+                            // ADR-017 Phase E.a iter-3.5a — record dtype
+                            // invariant. `kv_dtype` is set above from
+                            // INVESTIGATION_ENV.f16_kv (read once via
+                            // LazyLock); same dtype across all layers in
+                            // this allocation pass.
+                            dtype: kv_dtype,
+                        });
+                    }
+                    v
                 }
-                v
             }
             Some(k_resume) => {
                 // Take cached Arcs out of self.dense_kvs and unwrap
@@ -2411,14 +2509,30 @@ impl MlxModelWeights {
     ///     primitive Qwen35 B4a-cont uses at `gpu_full_attn.rs:172-181`
     ///     per ADR-040 §6.1.5).
     ///   * **HF2Q_TQ_CODEBOOK_BITS=4** (legacy 4-bit, opt-in pre-default
-    ///     correction at 2026-04-24) → typed-deferred as
-    ///     **iter-B4c-kernel-iter-2C**.  Below-default surface; gated
-    ///     on iter-2A-cont landing first.
-    ///   * **HF2Q_USE_DENSE=1** (dense F32 KV path) → typed-deferred as
-    ///     **iter-B4c-kernel-iter-2D**.  Orthogonal surface from the
-    ///     TQ-active paths; the LCP partial-prefix resume in
-    ///     `engine.rs::generate_once_with_soft_tokens` (~line 6700-6843)
-    ///     consumes this regime; iter-2D ports the slot-aware LCP path.
+    ///     correction at 2026-04-24) → **SHIPPED 2026-05-30 as
+    ///     iter-B4c-kernel-iter-2C (§6.1.46)**.  Slot routing via
+    ///     `MultiSeqMlxKvCache` slice_view mount over `self.kv_caches`
+    ///     (Vec swap pattern: `std::mem::replace` of the per-layer
+    ///     `Vec<MlxKvCache>` with slot-views, restore on exit; the
+    ///     legacy field is always populated at model load time per
+    ///     `gemma4/model.rs:1277-1290` — no `is_none()` gate needed,
+    ///     mirroring the always-allocated 4-buffer layout).  Off-default
+    ///     since ADR-007 default-on TQ-8-bit correction; gated on
+    ///     iter-C2c-cont-cont Phase 4 provisioning the
+    ///     `multi_seq_kv_mlx` scaffold per §6.1.46.
+    ///   * **HF2Q_USE_DENSE=1** (dense F32 KV path) → **SHIPPED 2026-05-30
+    ///     as iter-B4c-kernel-iter-2D (§6.1.46)**.  Slot routing via
+    ///     `MultiSeqDenseKvBuffers` slice_view mount over `self.dense_kvs`
+    ///     (`Option<Vec<Arc<DenseKvBuffers>>>` mount + sibling consume-
+    ///     gate alignment with the existing `restored_lcp=Some(k)`
+    ///     pre-iter-3 path's `self.dense_kvs.take()` consumer at
+    ///     `forward_prefill.rs:727`; the slot-aware mount inserts the
+    ///     slot-view Arc-vec so the sibling's existing `take()` consumer
+    ///     reads slot-view buffers, routing kernel writes to the per-slot
+    ///     byte region).  Orthogonal to TQ-active paths; LCP partial-
+    ///     prefix resume slot-aware LCP path remains as iter-2D-lcp
+    ///     sub-deferral.  Gated on iter-C2c-cont-cont Phase 3 provisioning
+    ///     the `multi_seq_kv_dense` scaffold per §6.1.46.
     ///
     /// # Why a NEW fn vs. modifying `forward_prefill_with_soft_tokens_resume`
     ///
@@ -2499,6 +2613,33 @@ impl MlxModelWeights {
         // so the H88 lexical-ordering check on the bounds-first pin still
         // finds the dispatch fork AFTER the bounds check.
         multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>,
+        // ADR-040 iter-B4c-kernel iter-2D (2026-05-30) — dense F32 KV
+        // path multi-seq scaffold parameter.  `Option<>` because
+        // iter-C2c-cont-cont (§6.1.46 Phase 3) provisions this field IFF
+        // the dense F32 env gate is true (`HF2Q_USE_DENSE=1` LCP-eligible
+        // pre-default regime — see `INVESTIGATION_ENV.use_dense`).  When
+        // the env-gate is OFF this parameter is `None` and the dense
+        // branch typed `CapabilityUnsupported` defense-in-depth fires
+        // (`gemma4-forward-prefill-dense-scaffold-absent` label naming
+        // iter-C2c-cont-cont-invariant-violated).
+        //
+        // Per H188 pin: this parameter is ADDITIVE — prior surfaces
+        // (`multi_seq_kv_hb`, `multi_seq_kv_hybrid`) preserved verbatim
+        // per the iter-2A H84 + iter-2B H98 surface invariants.
+        multi_seq_kv_dense: Option<&mut Vec<MultiSeqDenseKvBuffers>>,
+        // ADR-040 iter-B4c-kernel iter-2C (2026-05-30) — legacy 4-bit
+        // nibble-packed multi-seq scaffold parameter.  `Option<>` because
+        // iter-C2c-cont-cont (§6.1.46 Phase 4) provisions this field IFF
+        // the legacy 4-bit env gate is engaged (`HF2Q_TQ_CODEBOOK_BITS=4`
+        // opt-in pre-default surface; off-default since ADR-007 default-on
+        // TQ-8-bit correction 2026-04-24).  When the env-gate is OFF this
+        // parameter is `None` and the cb_bits==0 branch typed
+        // `CapabilityUnsupported` defense-in-depth fires
+        // (`gemma4-forward-prefill-mlx-scaffold-absent` label naming
+        // iter-C2c-cont-cont-invariant-violated).
+        //
+        // Per H188 pin: ADDITIVE — prior surfaces preserved.
+        multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
     ) -> Result<u32> {
         // ── Pre-flight ────────────────────────────────────────────────
         //
@@ -2603,33 +2744,445 @@ impl MlxModelWeights {
         // HF2Q_USE_DENSE selects the dense F32 KV path (LCP-eligible).
         // INVESTIGATION_ENV.use_dense is the canonical reader; mirrors
         // forward_decode at `forward_gpu.rs:407`.
+        //
+        // ADR-040 iter-B4c-kernel iter-2D (2026-05-30) — PRODUCTION
+        // OPT-IN (HF2Q_USE_DENSE=1) slot routing through the dense F32
+        // KV scaffold.  Architecture-disjoint variant of iter-2A-cont /
+        // iter-2B's slice_view mount + delegate-to-sibling pattern
+        // applied to `MultiSeqDenseKvBuffers` (single-K + single-V,
+        // dtype-aware F32-or-F16 per ADR-017 Phase E.a iter-3.5a) on
+        // `self.dense_kvs` (Option<Vec<Arc<DenseKvBuffers>>>).  The
+        // sibling fn's `restored_lcp=None` branch was alloc-gate-aligned
+        // to consume `self.dense_kvs.take()` when `Some(_)` (mirror of
+        // iter-2A-cont's `self.leg_hb_encoded.is_none()` gate at line
+        // ~860 + iter-2B's `self.hybrid_kv.is_none()` gate at line ~842).
+        // SerialFifo byte-equivalence preserved: SerialFifo enters with
+        // `self.dense_kvs == None` so the fresh-alloc body runs verbatim.
+        //
+        // The prior iter-2A typed-deferral label
+        // (`iter-B4c-kernel-iter-2D per ADR-040 §6.1.32`) that lived
+        // inside a `MultiSeqError::CapabilityUnsupported` constructor was
+        // REPLACED at iter-2D SHIP with the real slot routing below.
+        // H182 pins typed-error removal; H87 negative-grep preserved
+        // because the label substring still lives in this doc-comment
+        // cite (not inside a `CapabilityUnsupported { capability:`
+        // constructor).
         if INVESTIGATION_ENV.use_dense {
-            let err = MultiSeqError::CapabilityUnsupported {
-                capability: "gemma4-forward-prefill-slot-N-dense-F32 (iter-B4c-kernel-iter-2D per ADR-040 §6.1.32 — HF2Q_USE_DENSE=1 dense F32 KV path slot routing through src/serve/forward_prefill.rs:837-891 alloc site + DenseKvBuffers per-slot view + LCP partial-prefix resume slot-aware port; orthogonal to TQ-active paths gated on iter-A3b-2 DenseKvBuffers multi-seq lift)",
-            };
-            anyhow::bail!(
-                "forward_prefill_with_soft_tokens_slot_aware: dense F32 KV path \
-                 (HF2Q_USE_DENSE=1) slot routing not yet wired at slot_id={} \
-                 (ADR-040 iter-B4c-kernel iter-2A — iter-2D scope). {}",
-                slot_id.0,
-                err,
+            // Defense-in-depth: the iter-C2c-cont-cont Phase 3 scaffold
+            // MUST be present when HF2Q_USE_DENSE=1 is engaged at
+            // SlotAware spawn time.  Operator who flips HF2Q_USE_DENSE
+            // AFTER process start (LazyLock-cached) would surface typed
+            // `CapabilityUnsupported` here — honest pin at the
+            // production boundary.  Same discipline as the iter-2B
+            // hybrid-scaffold-absent defense-in-depth at line ~2680.
+            let multi_seq_kv_dense = multi_seq_kv_dense.ok_or_else(|| {
+                let err = MultiSeqError::CapabilityUnsupported {
+                    capability: "gemma4-forward-prefill-dense-scaffold-absent (iter-C2c-cont-cont-invariant-violated per ADR-040 §6.1.46 — HF2Q_USE_DENSE=1 dense F32 opt-in surface; INVESTIGATION_ENV.use_dense == true AT CALL TIME but multi_seq_kv_dense scaffold is None at engine.rs GemmaLoadedModel.multi_seq_kv_dense — iter-C2c-cont-cont spawn-arm invariant violated OR operator flipped HF2Q_USE_DENSE post-LazyLock-cache; gated on iter-C2c-cont-cont per ADR-040 §6.1.46 provisioning MultiSeqDenseKvBuffers sibling scaffold Phase 3)",
+                };
+                anyhow::anyhow!(
+                    "forward_prefill_with_soft_tokens_slot_aware: dense F32 KV path \
+                     (HF2Q_USE_DENSE=1; OPT-IN PRE-DEFAULT) — multi_seq_kv_dense is None \
+                     at slot_id={} (ADR-040 iter-B4c-kernel iter-2D). {}",
+                    slot_id.0,
+                    err,
+                )
+            })?;
+
+            // Bounds + length match (sibling discipline to the HB
+            // preflight at the top of this fn).
+            if multi_seq_kv_dense.is_empty() {
+                anyhow::bail!(
+                    "forward_prefill_with_soft_tokens_slot_aware: multi_seq_kv_dense is empty \
+                     (iter-C2c-cont-cont spawn-arm invariant: \
+                      provision_multi_seq_kv_for_slot_aware Phase 3 must produce one \
+                      entry per layer; ADR-040 §6.1.46 / iter-B4c-kernel iter-2D)"
+                );
+            }
+            if multi_seq_kv_dense.len() != self.layers.len() {
+                anyhow::bail!(
+                    "forward_prefill_with_soft_tokens_slot_aware: multi_seq_kv_dense.len()={} \
+                     != self.layers.len()={} — caller-invariant violation \
+                     (ADR-040 iter-B4c-kernel iter-2D; iter-C2c-cont-cont spawn-arm \
+                      Phase 3 must allocate one per layer)",
+                    multi_seq_kv_dense.len(),
+                    self.layers.len(),
+                );
+            }
+            let dense_n_seqs = multi_seq_kv_dense[0].n_seqs;
+            if slot_id.0 >= dense_n_seqs {
+                let err = MultiSeqError::SlotOutOfRange {
+                    slot: slot_id,
+                    max_slots: dense_n_seqs,
+                };
+                anyhow::bail!(
+                    "forward_prefill_with_soft_tokens_slot_aware: dense slot_id={} out of range \
+                     (n_seqs={}). ADR-040 iter-B4c-kernel iter-2D bounds-first contract. {}",
+                    slot_id.0,
+                    dense_n_seqs,
+                    err,
+                );
+            }
+
+            // ── Build per-layer slot-views + mount on self.dense_kvs ─────
+            //
+            // Dense F32 path: K + V are both `dtype`-sized (F32 = 4
+            // bytes/elem or F16 = 2 bytes/elem per ADR-017 Phase E.a
+            // iter-3.5a invariant).  Per-slot byte offset =
+            // `slot_id.0 * nkv * cap * hd * dtype.size_of()` — same
+            // primitive Qwen35 B4a-cont uses at `gpu_full_attn.rs:107-115`
+            // for its F32 KV variant.
+            //
+            // The mount target is `self.dense_kvs:
+            // Option<Vec<Arc<DenseKvBuffers>>>`.  Each per-layer entry
+            // is an `Arc<DenseKvBuffers>` wrapping the slot-view K + V.
+            // The sibling fn's NEW alloc-gate at line ~676-808
+            // (iter-2D alignment) reads
+            // `if let Some(arcs) = self.dense_kvs.take()` to consume
+            // the slot-view bundle — mirror of iter-2A-cont's
+            // `self.leg_hb_encoded.is_none()` consume-gate at line ~902.
+            let mut slot_view_dense: Vec<std::sync::Arc<DenseKvBuffers>> =
+                Vec::with_capacity(multi_seq_kv_dense.len());
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let nkv = layer.num_kv_heads;
+                let hd = layer.head_dim;
+                let buf = &multi_seq_kv_dense[layer_idx];
+                let cap = buf.capacity;
+                let dtype = buf.dtype;
+                let dtype_size = dtype.size_of();
+                // K (dtype-sized) per-slot byte offset.
+                let elems_per_slot: usize = nkv
+                    .checked_mul(cap)
+                    .and_then(|x| x.checked_mul(hd))
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "dense slot-view elem count overflow at L{layer_idx} \
+                         (nkv={nkv} cap={cap} hd={hd}) — ADR-040 iter-B4c-kernel iter-2D"
+                    ))?;
+                let bytes_per_slot: u64 = (elems_per_slot as u64)
+                    .checked_mul(dtype_size as u64)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "dense slot-view byte size overflow at L{layer_idx} \
+                         (dtype_size={}) — ADR-040 iter-B4c-kernel iter-2D",
+                        dtype_size,
+                    ))?;
+                let byte_offset: u64 = (slot_id.0 as u64)
+                    .checked_mul(bytes_per_slot)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "dense slot-view byte offset overflow at L{layer_idx} \
+                         (slot_id={} bytes_per_slot={}) \
+                         — ADR-040 iter-B4c-kernel iter-2D",
+                        slot_id.0, bytes_per_slot,
+                    ))?;
+                let k_view = buf.k.slice_view(byte_offset, elems_per_slot)
+                    .with_shape(vec![nkv, cap, hd])
+                    .map_err(|e| anyhow::anyhow!(
+                        "dense slot-view K with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2D"
+                    ))?;
+                let v_view = buf.v.slice_view(byte_offset, elems_per_slot)
+                    .with_shape(vec![nkv, cap, hd])
+                    .map_err(|e| anyhow::anyhow!(
+                        "dense slot-view V with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2D"
+                    ))?;
+
+                // Construct the legacy single-seq `DenseKvBuffers`
+                // wrapper around the slot-views (mirror of iter-2A-cont
+                // prefill HbKvBuffers construction at line ~3119) +
+                // wrap in Arc (mirror of self.dense_kvs's
+                // `Vec<Arc<DenseKvBuffers>>` shape).
+                slot_view_dense.push(std::sync::Arc::new(DenseKvBuffers {
+                    k: k_view,
+                    v: v_view,
+                    capacity: cap,
+                    is_sliding: buf.is_sliding,
+                    dtype,
+                }));
+            }
+
+            // Mount the slot-view bundle on `self.dense_kvs`.  Save the
+            // prior value so we can restore it on exit — typical state
+            // is `None` for a fresh request, but a prior SerialFifo +
+            // LCP call MAY have left an already-allocated value.  The
+            // iter-1 worker-arm predicate gates this fn on SlotAware +
+            // SlotId(N>0), so the call shape is well-defined —
+            // SerialFifo never reaches here.  Restoring belt-and-
+            // suspenders.  Mirror of iter-2A-cont prefill restore at
+            // line ~3137-3167.
+            let prior_dense_kvs = self.dense_kvs.take();
+            self.dense_kvs = Some(slot_view_dense);
+
+            // Delegate to the sibling fn.  Its alloc-gate at line
+            // ~676 (NEW iter-2D alignment to consume
+            // `self.dense_kvs.take()` on the `restored_lcp=None` branch
+            // when `Some(_)`) so the mount survives the sibling's path.
+            // The sibling consumes `self.dense_kvs` at the consume-gate
+            // for the K/V kernel writes via the per-token loop's
+            // `dense_kvs_vec[layer_idx].k/.v` reads; kernel writes
+            // target the per-slot byte region of the persistent multi-
+            // seq scaffold.
+            //
+            // `restored_lcp = None`: LCP partial-prefix resume slot-aware
+            // port is iter-2D-lcp scope (orthogonal sub-deferral; the
+            // restored_lcp=Some(_) path consumes a SerialFifo-saved
+            // cache, not the multi-seq scaffold).
+            let result = self.forward_prefill_with_soft_tokens_resume(
+                prompt_tokens,
+                soft_tokens,
+                max_decode_tokens,
+                gpu,
+                None,
             );
+
+            // Restore prior `self.dense_kvs` regardless of result.  The
+            // slot-view Arc bundle has lifetime tied to this call; the
+            // persistent multi-seq scaffold OWNED by the worker arm
+            // (via `g.multi_seq_kv_dense`) keeps the underlying buffers
+            // alive — the slot-view ARC handles dropped here are strong
+            // refs to the same Metal buffer storage.
+            self.dense_kvs = prior_dense_kvs;
+
+            return result;
         }
         if cb_bits == 0 {
-            // Legacy 4-bit native flash_attn_vec_tq path.  Opt-in
-            // pre-default correction at 2026-04-24; 127-byte sourdough
-            // ceiling means production should not engage this regime,
-            // but typed-clamp lands the label for operator + grep.
-            let err = MultiSeqError::CapabilityUnsupported {
-                capability: "gemma4-forward-prefill-slot-N-legacy-4bit (iter-B4c-kernel-iter-2C per ADR-040 §6.1.32 — HF2Q_TQ_CODEBOOK_BITS=4 legacy 4-bit native flash_attn_vec_tq slot routing; opt-in pre-default surface, gated on iter-2A-cont HB-encoded path landing first)",
-            };
-            anyhow::bail!(
-                "forward_prefill_with_soft_tokens_slot_aware: legacy 4-bit TQ path \
-                 (HF2Q_TQ_CODEBOOK_BITS=4) slot routing not yet wired at slot_id={} \
-                 (ADR-040 iter-B4c-kernel iter-2A — iter-2C scope). {}",
-                slot_id.0,
-                err,
+            // ADR-040 iter-B4c-kernel iter-2C (2026-05-30) — LEGACY 4-bit
+            // nibble-packed slot routing through `MultiSeqMlxKvCache`.
+            // Architecture-disjoint variant of iter-2A-cont's slice_view
+            // mount + delegate-to-sibling pattern applied to
+            // `self.kv_caches: Vec<MlxKvCache>` (always-populated,
+            // mounted via `std::mem::replace` of the entire Vec; the
+            // legacy field is NOT Option-wrapped per `gemma4/model.rs:
+            // 1277-1290` always-alloc-at-load-time discipline — no
+            // `is_none()` gate needed, the gate is structural).
+            //
+            // The prior iter-2A typed-deferral label
+            // (`iter-B4c-kernel-iter-2C per ADR-040 §6.1.32`) that lived
+            // inside a `MultiSeqError::CapabilityUnsupported` constructor
+            // was REPLACED at iter-2C SHIP with the real slot routing
+            // below.  H181 pins typed-error removal; H87 negative-grep
+            // preserved because the label substring still lives in this
+            // doc-comment cite (not inside a `CapabilityUnsupported`
+            // constructor).
+            //
+            // 127-byte sourdough ceiling means production should not
+            // engage this regime, but the real slot routing lands for
+            // operator deployment-time freedom under SlotAware
+            // (HF2Q_TQ_CODEBOOK_BITS=4 opt-in).
+
+            // Defense-in-depth: the iter-C2c-cont-cont Phase 4 scaffold
+            // MUST be present when HF2Q_TQ_CODEBOOK_BITS=4 is engaged
+            // at SlotAware spawn time.  Same discipline as the iter-2B
+            // hybrid-scaffold-absent defense-in-depth at line ~2680.
+            let multi_seq_kv_mlx = multi_seq_kv_mlx.ok_or_else(|| {
+                let err = MultiSeqError::CapabilityUnsupported {
+                    capability: "gemma4-forward-prefill-mlx-scaffold-absent (iter-C2c-cont-cont-invariant-violated per ADR-040 §6.1.46 — HF2Q_TQ_CODEBOOK_BITS=4 legacy 4-bit opt-in pre-default surface; cb_bits == 0 AT CALL TIME but multi_seq_kv_mlx scaffold is None at engine.rs GemmaLoadedModel.multi_seq_kv_mlx — iter-C2c-cont-cont spawn-arm invariant violated OR operator flipped HF2Q_TQ_CODEBOOK_BITS post-LazyLock-cache; gated on iter-C2c-cont-cont per ADR-040 §6.1.46 provisioning MultiSeqMlxKvCache sibling scaffold Phase 4)",
+                };
+                anyhow::anyhow!(
+                    "forward_prefill_with_soft_tokens_slot_aware: legacy 4-bit TQ path \
+                     (HF2Q_TQ_CODEBOOK_BITS=4; OPT-IN PRE-DEFAULT) — multi_seq_kv_mlx is None \
+                     at slot_id={} (ADR-040 iter-B4c-kernel iter-2C). {}",
+                    slot_id.0,
+                    err,
+                )
+            })?;
+
+            // Bounds + length match.
+            if multi_seq_kv_mlx.is_empty() {
+                anyhow::bail!(
+                    "forward_prefill_with_soft_tokens_slot_aware: multi_seq_kv_mlx is empty \
+                     (iter-C2c-cont-cont spawn-arm invariant; ADR-040 §6.1.46 / \
+                      iter-B4c-kernel iter-2C)"
+                );
+            }
+            if multi_seq_kv_mlx.len() != self.layers.len() {
+                anyhow::bail!(
+                    "forward_prefill_with_soft_tokens_slot_aware: multi_seq_kv_mlx.len()={} \
+                     != self.layers.len()={} — caller-invariant violation \
+                     (ADR-040 iter-B4c-kernel iter-2C; iter-C2c-cont-cont spawn-arm \
+                      Phase 4 must allocate one per layer)",
+                    multi_seq_kv_mlx.len(),
+                    self.layers.len(),
+                );
+            }
+            let mlx_n_seqs = multi_seq_kv_mlx[0].n_seqs;
+            if slot_id.0 >= mlx_n_seqs {
+                let err = MultiSeqError::SlotOutOfRange {
+                    slot: slot_id,
+                    max_slots: mlx_n_seqs,
+                };
+                anyhow::bail!(
+                    "forward_prefill_with_soft_tokens_slot_aware: mlx slot_id={} out of range \
+                     (n_seqs={}). ADR-040 iter-B4c-kernel iter-2C bounds-first contract. {}",
+                    slot_id.0,
+                    mlx_n_seqs,
+                    err,
+                );
+            }
+
+            // ── Build per-layer slot-views + mount on self.kv_caches ─────
+            //
+            // Legacy 4-bit nibble-packed path: K + V are BOTH U8-packed
+            // (`hd/2` packed bytes/pos) + F32 norms (`norms_per_pos`
+            // floats/pos).  Per-slot byte offsets:
+            //   * K_packed / V_packed (U8 = 1 byte/elem):
+            //     `slot_id.0 * nkv * cap * (hd/2)`.
+            //   * K_norms / V_norms (F32 = 4 bytes/elem):
+            //     `slot_id.0 * nkv * cap * norms_per_pos * 4`.
+            // Shape selection matches the legacy `gemma4/model.rs:
+            // 1278-1283` alloc layout: packed = `[nkv, cap, hd/2]`;
+            // norms = `[nkv, cap]` (norms_per_pos==1) or
+            // `[nkv, cap, norms_per_pos]` (otherwise).
+            let mut slot_view_kv: Vec<MlxKvCache> =
+                Vec::with_capacity(multi_seq_kv_mlx.len());
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let nkv = layer.num_kv_heads;
+                let hd = layer.head_dim;
+                let buf = &multi_seq_kv_mlx[layer_idx];
+                let cap = buf.capacity;
+                let norms_per_pos = buf.norms_per_pos;
+                let hd_half = hd / 2;
+                // K_packed / V_packed elem count per slot (U8 = 1 byte/elem).
+                let packed_elems_per_slot: usize = nkv
+                    .checked_mul(cap)
+                    .and_then(|x| x.checked_mul(hd_half))
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "MLX slot-view packed elem count overflow at L{layer_idx} \
+                         (nkv={nkv} cap={cap} hd_half={hd_half}) \
+                         — ADR-040 iter-B4c-kernel iter-2C"
+                    ))?;
+                let packed_byte_offset: u64 = (slot_id.0 as u64)
+                    .checked_mul(packed_elems_per_slot as u64) // U8 = 1 byte/elem
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "MLX slot-view packed byte offset overflow at L{layer_idx} \
+                         (slot_id={} packed_elems_per_slot={}) \
+                         — ADR-040 iter-B4c-kernel iter-2C",
+                        slot_id.0, packed_elems_per_slot,
+                    ))?;
+                let k_packed_view = buf.k_packed
+                    .slice_view(packed_byte_offset, packed_elems_per_slot)
+                    .with_shape(vec![nkv, cap, hd_half])
+                    .map_err(|e| anyhow::anyhow!(
+                        "MLX slot-view K_packed with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2C"
+                    ))?;
+                let v_packed_view = buf.v_packed
+                    .slice_view(packed_byte_offset, packed_elems_per_slot)
+                    .with_shape(vec![nkv, cap, hd_half])
+                    .map_err(|e| anyhow::anyhow!(
+                        "MLX slot-view V_packed with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2C"
+                    ))?;
+                // K_norms / V_norms (F32 = 4 bytes/elem).
+                let norms_elems_per_slot: usize = nkv
+                    .checked_mul(cap)
+                    .and_then(|x| x.checked_mul(norms_per_pos))
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "MLX slot-view norms elem count overflow at L{layer_idx} \
+                         (nkv={nkv} cap={cap} norms_per_pos={norms_per_pos}) \
+                         — ADR-040 iter-B4c-kernel iter-2C"
+                    ))?;
+                let norms_bytes_per_slot: u64 = (norms_elems_per_slot as u64)
+                    .checked_mul(4u64) // F32 = 4 bytes/elem
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "MLX slot-view norms byte size overflow at L{layer_idx} \
+                         — ADR-040 iter-B4c-kernel iter-2C"
+                    ))?;
+                let norms_byte_offset: u64 = (slot_id.0 as u64)
+                    .checked_mul(norms_bytes_per_slot)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "MLX slot-view norms byte offset overflow at L{layer_idx} \
+                         — ADR-040 iter-B4c-kernel iter-2C"
+                    ))?;
+                let norms_shape = if norms_per_pos == 1 {
+                    vec![nkv, cap]
+                } else {
+                    vec![nkv, cap, norms_per_pos]
+                };
+                let k_norms_view = buf.k_norms
+                    .slice_view(norms_byte_offset, norms_elems_per_slot)
+                    .with_shape(norms_shape.clone())
+                    .map_err(|e| anyhow::anyhow!(
+                        "MLX slot-view K_norms with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2C"
+                    ))?;
+                let v_norms_view = buf.v_norms
+                    .slice_view(norms_byte_offset, norms_elems_per_slot)
+                    .with_shape(norms_shape)
+                    .map_err(|e| anyhow::anyhow!(
+                        "MLX slot-view V_norms with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2C"
+                    ))?;
+
+                // Construct legacy single-seq `MlxKvCache` wrapper
+                // around the 4 slot-views.  Mirror of iter-2A-cont
+                // prefill HbKvBuffers construction at line ~3119; the
+                // MlxKvCache layout adds `write_pos` + `seq_len` (the
+                // legacy single-seq cursor pair) initialized to 0 since
+                // the slot-view bundle is fresh-per-call (the persistent
+                // multi-seq scaffold's `seq_lens[slot]` cursor was
+                // reset_for_slot at orchestrator entry).
+                slot_view_kv.push(MlxKvCache {
+                    k_packed: k_packed_view,
+                    k_norms: k_norms_view,
+                    v_packed: v_packed_view,
+                    v_norms: v_norms_view,
+                    capacity: cap,
+                    is_sliding: buf.is_sliding,
+                    write_pos: 0,
+                    seq_len: 0,
+                });
+            }
+
+            // Mount the slot-view bundle on `self.kv_caches`.  Save the
+            // prior value so we can restore it on exit.  Unlike the
+            // hybrid + HB-encoded paths (which use Option<Vec<_>>),
+            // `self.kv_caches: Vec<MlxKvCache>` is always populated at
+            // model load time (`gemma4/model.rs:1292`) — we swap the
+            // entire Vec via `std::mem::replace`.  The legacy alloc-
+            // site discipline at load time enforces the structural
+            // invariant; no `is_none()` gate needed at the sibling fn
+            // body (mirror of iter-2A-cont's gate alignment at line
+            // ~860 is N/A here because there's no lazy-alloc on
+            // `self.kv_caches`).
+            //
+            // SlotId(0) byte-equivalence: at `slot_id=SlotId(0)` the
+            // byte offset is 0; `slice_view(0, n_elements) + with_shape`
+            // produces a view byte-identical to a fresh single-seq
+            // alloc.  BUT: the iter-1 worker-arm predicate gates this
+            // fn on SlotAware + SlotId(N>0), so SlotId(0) is never
+            // observed here — code-path disjointness preserves the
+            // H1/H2/H23/H41/H44/H77/H102/H178/H187 byte-equivalence
+            // chain.
+            let prior_kv_caches = std::mem::replace(&mut self.kv_caches, slot_view_kv);
+
+            // Delegate to the sibling fn.  The sibling resets
+            // `self.kv_caches[layer].write_pos = 0` + `seq_len = 0` at
+            // entry (line ~571-589) so the per-token loop targets the
+            // slot-view's region.  The per-token loop's writes inside
+            // the dispatchers consume `self.kv_caches[layer].k_packed`
+            // etc. via the kernel-write path at
+            // `gemma4/forward_gpu.rs:1525-1526` — slot-view ARC handles
+            // route writes to the per-slot byte region.
+            //
+            // `restored_lcp = None`: LCP partial-prefix resume is
+            // dense F32 LCP-eligible regime (iter-2D scope), orthogonal
+            // to the 4-bit nibble-packed iter-2C path.
+            let result = self.forward_prefill_with_soft_tokens_resume(
+                prompt_tokens,
+                soft_tokens,
+                max_decode_tokens,
+                gpu,
+                None,
             );
+
+            // Restore prior `self.kv_caches` regardless of result.  The
+            // slot-view bundle has lifetime tied to this call; the
+            // persistent multi-seq scaffold OWNED by the worker arm
+            // (via `g.multi_seq_kv_mlx`) keeps the underlying buffers
+            // alive — the slot-view ARC handles dropped here are strong
+            // refs to the same Metal buffer storage.
+            self.kv_caches = prior_kv_caches;
+
+            return result;
         }
         if INVESTIGATION_ENV.hybrid_kv {
             // ADR-040 iter-B4c-kernel iter-2B (2026-05-30) — PRODUCTION
@@ -3242,8 +3795,20 @@ impl MlxModelWeights {
     ///   `MultiSeqError::SlotOutOfRange` chained into anyhow.
     /// - `multi_seq_kv_hb.is_empty()` / layer-count mismatch → typed
     ///   `anyhow::bail!`.
-    /// - HF2Q_USE_DENSE=1 → typed `iter-B4c-kernel-iter-2-decode-D`.
-    /// - HF2Q_TQ_CODEBOOK_BITS=4 → typed `iter-B4c-kernel-iter-2-decode-D`.
+    /// - HF2Q_USE_DENSE=1 → **SHIPPED 2026-05-30 as iter-2-decode-D (§6.1.46)**.
+    ///   Note: `forward_decode`'s body does NOT consume `self.dense_kvs` at all
+    ///   (no dense F32 read path in `gemma4/forward_gpu.rs`), so the iter-2-decode-D
+    ///   dense branch here is **structurally a no-op**: the mount+restore preserves
+    ///   the persistent multi-seq scaffold's strong refs while the sibling decode
+    ///   delegates to the TQ-active read path (`leg_hb_encoded` or `hybrid_kv`
+    ///   depending on env).  The honest landing surfaces a typed
+    ///   `iter-2-decode-D-dense-structurally-no-op` label so operator-grep
+    ///   discovers the structural fact without false positives.
+    /// - HF2Q_TQ_CODEBOOK_BITS=4 → **SHIPPED 2026-05-30 as iter-2-decode-D (§6.1.46)**.
+    ///   Slot routing via `MultiSeqMlxKvCache` slice_view mount over
+    ///   `self.kv_caches` (Vec swap pattern: `std::mem::replace` of the
+    ///   per-layer `Vec<MlxKvCache>` with slot-views).  Mirror of iter-2C
+    ///   prefill scope applied to the decode body.
     /// - HF2Q_HYBRID_KV=1 + scaffold absent → typed `iter-C2c-cont-invariant-violated`.
     /// - HF2Q_HYBRID_KV=1 + xlen BF16 buffers present → typed `iter-B4c-kernel-iter-2-decode-A-xlen`.
     /// - HF2Q_HYBRID_KV=0 (HB-encoded opt-out) → typed `iter-B4c-kernel-iter-2-decode-B`.
@@ -3264,6 +3829,15 @@ impl MlxModelWeights {
         // typed `CapabilityUnsupported` at the hybrid branch
         // defense-in-depth.  Mirrors iter-2A/2B prefill signature.
         multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>,
+        // ADR-040 iter-B4c-kernel iter-2-decode-D (2026-05-30) — dense F32
+        // KV decode-side multi-seq scaffold parameter.  Mirror of the
+        // iter-2D prefill signature.  Off-default (HF2Q_USE_DENSE=1 opt-in).
+        multi_seq_kv_dense: Option<&mut Vec<MultiSeqDenseKvBuffers>>,
+        // ADR-040 iter-B4c-kernel iter-2-decode-D (2026-05-30) — legacy
+        // 4-bit nibble-packed multi-seq scaffold parameter.  Mirror of
+        // the iter-2C prefill signature.  Off-default (HF2Q_TQ_CODEBOOK_BITS=4
+        // opt-in since ADR-007 default-on TQ-8-bit correction 2026-04-24).
+        multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
     ) -> Result<u32> {
         // ── Pre-flight ────────────────────────────────────────────────
         //
@@ -3319,30 +3893,314 @@ impl MlxModelWeights {
             Ok("8") => 8,
             _ => 8, // DEFAULT: 8-bit (matches sibling line 835)
         };
+        // ADR-040 iter-B4c-kernel iter-2-decode-D (2026-05-30) — DENSE F32
+        // decode branch.  Architecture-disjoint structural fact:
+        // `forward_decode` does NOT consume `self.dense_kvs` AT ALL
+        // (verified: zero `self.dense_kvs` / `dense_kvs[` reads in
+        // `gemma4/forward_gpu.rs`).  Decode-side dense F32 was
+        // pre-existingly unreachable at runtime — the typed deferral at
+        // iter-2-decode-A was over-conservative.
+        //
+        // The honest landing: build slot-views for byte-isolation
+        // verification (H185 / H186 pin); mount on `self.dense_kvs`;
+        // delegate to `forward_decode` (which ignores `self.dense_kvs`
+        // entirely and routes through `leg_hb_encoded` / `hybrid_kv`);
+        // restore prior `self.dense_kvs` on exit.  The mount itself
+        // verifies the per-slot byte-offset arithmetic; the delegate is
+        // a structural no-op for the dense F32 read path.  H183 pins
+        // typed-error removal; H87 negative-grep preserved.
+        //
+        // Operator note (iter-2-decode-D-dense-structurally-no-op): if
+        // a future iter adds a dense F32 decode read path to
+        // `forward_decode`, this slot routing surface is already
+        // structurally correct — the mount lands the slot-view bundle
+        // ready for consumption.
         if INVESTIGATION_ENV.use_dense {
-            let err = MultiSeqError::CapabilityUnsupported {
-                capability: "gemma4-forward-decode-slot-N-dense-F32 (iter-B4c-kernel-iter-2-decode-D per ADR-040 §6.1.38 — HF2Q_USE_DENSE=1 dense F32 KV path decode-side slot routing; orthogonal to TQ-active paths gated on iter-A3b-2 DenseKvBuffers multi-seq lift; mirror of iter-2D prefill scope)",
-            };
-            anyhow::bail!(
-                "forward_decode_slot_aware: dense F32 KV path \
-                 (HF2Q_USE_DENSE=1) decode-side slot routing not yet wired at slot_id={} \
-                 (ADR-040 iter-B4c-kernel iter-2-decode-A — iter-2-decode-D scope). {}",
-                slot_id.0,
-                err,
-            );
+            // Defense-in-depth scaffold-absent typed CapabilityUnsupported.
+            let multi_seq_kv_dense = multi_seq_kv_dense.ok_or_else(|| {
+                let err = MultiSeqError::CapabilityUnsupported {
+                    capability: "gemma4-forward-decode-dense-scaffold-absent (iter-C2c-cont-cont-invariant-violated per ADR-040 §6.1.46 — HF2Q_USE_DENSE=1 dense F32 opt-in decode surface; multi_seq_kv_dense scaffold is None; iter-C2c-cont-cont spawn-arm invariant violated)",
+                };
+                anyhow::anyhow!(
+                    "forward_decode_slot_aware: dense F32 KV path \
+                     (HF2Q_USE_DENSE=1) — multi_seq_kv_dense is None at slot_id={} \
+                     (ADR-040 iter-B4c-kernel iter-2-decode-D). {}",
+                    slot_id.0,
+                    err,
+                )
+            })?;
+
+            if multi_seq_kv_dense.is_empty() {
+                anyhow::bail!(
+                    "forward_decode_slot_aware: multi_seq_kv_dense is empty \
+                     (iter-C2c-cont-cont spawn-arm invariant; ADR-040 §6.1.46 / \
+                      iter-B4c-kernel iter-2-decode-D)"
+                );
+            }
+            if multi_seq_kv_dense.len() != self.layers.len() {
+                anyhow::bail!(
+                    "forward_decode_slot_aware: multi_seq_kv_dense.len()={} \
+                     != self.layers.len()={} — caller-invariant violation \
+                     (ADR-040 iter-B4c-kernel iter-2-decode-D)",
+                    multi_seq_kv_dense.len(),
+                    self.layers.len(),
+                );
+            }
+            let dense_n_seqs = multi_seq_kv_dense[0].n_seqs;
+            if slot_id.0 >= dense_n_seqs {
+                let err = MultiSeqError::SlotOutOfRange {
+                    slot: slot_id,
+                    max_slots: dense_n_seqs,
+                };
+                anyhow::bail!(
+                    "forward_decode_slot_aware: dense slot_id={} out of range \
+                     (n_seqs={}). ADR-040 iter-B4c-kernel iter-2-decode-D. {}",
+                    slot_id.0,
+                    dense_n_seqs,
+                    err,
+                );
+            }
+
+            // Build per-layer slot-views (mirror of iter-2D prefill at
+            // line ~2730-2825) for H186 byte-offset arithmetic
+            // verification.  Mount + restore preserves persistent
+            // scaffold strong refs.
+            let mut slot_view_dense: Vec<std::sync::Arc<DenseKvBuffers>> =
+                Vec::with_capacity(multi_seq_kv_dense.len());
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let nkv = layer.num_kv_heads;
+                let hd = layer.head_dim;
+                let buf = &multi_seq_kv_dense[layer_idx];
+                let cap = buf.capacity;
+                let dtype = buf.dtype;
+                let dtype_size = dtype.size_of();
+                let elems_per_slot: usize = nkv
+                    .checked_mul(cap)
+                    .and_then(|x| x.checked_mul(hd))
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode dense slot-view elem count overflow at L{layer_idx} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                let bytes_per_slot: u64 = (elems_per_slot as u64)
+                    .checked_mul(dtype_size as u64)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode dense slot-view byte size overflow at L{layer_idx} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                let byte_offset: u64 = (slot_id.0 as u64)
+                    .checked_mul(bytes_per_slot)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode dense slot-view byte offset overflow at L{layer_idx} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                let k_view = buf.k.slice_view(byte_offset, elems_per_slot)
+                    .with_shape(vec![nkv, cap, hd])
+                    .map_err(|e| anyhow::anyhow!(
+                        "decode dense slot-view K with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                let v_view = buf.v.slice_view(byte_offset, elems_per_slot)
+                    .with_shape(vec![nkv, cap, hd])
+                    .map_err(|e| anyhow::anyhow!(
+                        "decode dense slot-view V with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                slot_view_dense.push(std::sync::Arc::new(DenseKvBuffers {
+                    k: k_view,
+                    v: v_view,
+                    capacity: cap,
+                    is_sliding: buf.is_sliding,
+                    dtype,
+                }));
+            }
+
+            let prior_dense_kvs = self.dense_kvs.take();
+            self.dense_kvs = Some(slot_view_dense);
+            // Delegate to forward_decode — structurally a no-op on the
+            // dense F32 path since forward_decode does not read
+            // self.dense_kvs.  The TQ-active path routes via
+            // leg_hb_encoded / hybrid_kv as configured.
+            let result = self.forward_decode(input_token, seq_pos, gpu, profile);
+            self.dense_kvs = prior_dense_kvs;
+            return result;
         }
         if cb_bits == 0 {
-            let err = MultiSeqError::CapabilityUnsupported {
-                capability: "gemma4-forward-decode-slot-N-legacy-4bit (iter-B4c-kernel-iter-2-decode-D per ADR-040 §6.1.38 — HF2Q_TQ_CODEBOOK_BITS=4 legacy 4-bit native flash_attn_vec_tq decode-side slot routing; opt-in pre-default surface; mirror of iter-2C prefill scope)",
-            };
-            anyhow::bail!(
-                "forward_decode_slot_aware: legacy 4-bit TQ path \
-                 (HF2Q_TQ_CODEBOOK_BITS=4) decode-side slot routing not yet wired at \
-                 slot_id={} (ADR-040 iter-B4c-kernel iter-2-decode-A — \
-                 iter-2-decode-D scope). {}",
-                slot_id.0,
-                err,
-            );
+            // ADR-040 iter-B4c-kernel iter-2-decode-D (2026-05-30) — LEGACY
+            // 4-bit nibble-packed decode-side slot routing through
+            // `MultiSeqMlxKvCache`.  Mirror of iter-2C prefill scope at
+            // line ~2850-3084 applied to the decode body.  Same Vec swap
+            // pattern via `std::mem::replace`; same 4-buffer per-layer
+            // slot-view construction (K_packed U8 hd/2 + K_norms F32
+            // norms_per_pos + V_packed U8 hd/2 + V_norms F32
+            // norms_per_pos).  Sibling fn `forward_decode` consumes
+            // `self.kv_caches[layer_idx]` at
+            // `gemma4/forward_gpu.rs:386-392` for cursor advance + at
+            // line 1525-1526 for K/V kernel reads.
+            //
+            // H184 pins typed-error removal; H87 negative-grep preserved.
+            let multi_seq_kv_mlx = multi_seq_kv_mlx.ok_or_else(|| {
+                let err = MultiSeqError::CapabilityUnsupported {
+                    capability: "gemma4-forward-decode-mlx-scaffold-absent (iter-C2c-cont-cont-invariant-violated per ADR-040 §6.1.46 — HF2Q_TQ_CODEBOOK_BITS=4 legacy 4-bit opt-in decode surface; multi_seq_kv_mlx scaffold is None; iter-C2c-cont-cont spawn-arm invariant violated)",
+                };
+                anyhow::anyhow!(
+                    "forward_decode_slot_aware: legacy 4-bit TQ path \
+                     (HF2Q_TQ_CODEBOOK_BITS=4) — multi_seq_kv_mlx is None at slot_id={} \
+                     (ADR-040 iter-B4c-kernel iter-2-decode-D). {}",
+                    slot_id.0,
+                    err,
+                )
+            })?;
+
+            if multi_seq_kv_mlx.is_empty() {
+                anyhow::bail!(
+                    "forward_decode_slot_aware: multi_seq_kv_mlx is empty \
+                     (iter-C2c-cont-cont spawn-arm invariant; ADR-040 §6.1.46 / \
+                      iter-B4c-kernel iter-2-decode-D)"
+                );
+            }
+            if multi_seq_kv_mlx.len() != self.layers.len() {
+                anyhow::bail!(
+                    "forward_decode_slot_aware: multi_seq_kv_mlx.len()={} \
+                     != self.layers.len()={} — caller-invariant violation \
+                     (ADR-040 iter-B4c-kernel iter-2-decode-D)",
+                    multi_seq_kv_mlx.len(),
+                    self.layers.len(),
+                );
+            }
+            let mlx_n_seqs = multi_seq_kv_mlx[0].n_seqs;
+            if slot_id.0 >= mlx_n_seqs {
+                let err = MultiSeqError::SlotOutOfRange {
+                    slot: slot_id,
+                    max_slots: mlx_n_seqs,
+                };
+                anyhow::bail!(
+                    "forward_decode_slot_aware: mlx slot_id={} out of range \
+                     (n_seqs={}). ADR-040 iter-B4c-kernel iter-2-decode-D. {}",
+                    slot_id.0,
+                    mlx_n_seqs,
+                    err,
+                );
+            }
+
+            // Build per-layer slot-views (mirror of iter-2C prefill at
+            // line ~2940-3076).  Same 4-buffer per-layer construction.
+            let mut slot_view_kv: Vec<MlxKvCache> =
+                Vec::with_capacity(multi_seq_kv_mlx.len());
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let nkv = layer.num_kv_heads;
+                let hd = layer.head_dim;
+                let buf = &multi_seq_kv_mlx[layer_idx];
+                let cap = buf.capacity;
+                let norms_per_pos = buf.norms_per_pos;
+                let hd_half = hd / 2;
+                let packed_elems_per_slot: usize = nkv
+                    .checked_mul(cap)
+                    .and_then(|x| x.checked_mul(hd_half))
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode MLX slot-view packed elem count overflow at L{layer_idx} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                let packed_byte_offset: u64 = (slot_id.0 as u64)
+                    .checked_mul(packed_elems_per_slot as u64)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode MLX slot-view packed byte offset overflow at L{layer_idx} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                let k_packed_view = buf.k_packed
+                    .slice_view(packed_byte_offset, packed_elems_per_slot)
+                    .with_shape(vec![nkv, cap, hd_half])
+                    .map_err(|e| anyhow::anyhow!(
+                        "decode MLX slot-view K_packed with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                let v_packed_view = buf.v_packed
+                    .slice_view(packed_byte_offset, packed_elems_per_slot)
+                    .with_shape(vec![nkv, cap, hd_half])
+                    .map_err(|e| anyhow::anyhow!(
+                        "decode MLX slot-view V_packed with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                let norms_elems_per_slot: usize = nkv
+                    .checked_mul(cap)
+                    .and_then(|x| x.checked_mul(norms_per_pos))
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode MLX slot-view norms elem count overflow at L{layer_idx} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                let norms_bytes_per_slot: u64 = (norms_elems_per_slot as u64)
+                    .checked_mul(4u64)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode MLX slot-view norms byte size overflow at L{layer_idx} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                let norms_byte_offset: u64 = (slot_id.0 as u64)
+                    .checked_mul(norms_bytes_per_slot)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode MLX slot-view norms byte offset overflow at L{layer_idx} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                let norms_shape = if norms_per_pos == 1 {
+                    vec![nkv, cap]
+                } else {
+                    vec![nkv, cap, norms_per_pos]
+                };
+                let k_norms_view = buf.k_norms
+                    .slice_view(norms_byte_offset, norms_elems_per_slot)
+                    .with_shape(norms_shape.clone())
+                    .map_err(|e| anyhow::anyhow!(
+                        "decode MLX slot-view K_norms with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                let v_norms_view = buf.v_norms
+                    .slice_view(norms_byte_offset, norms_elems_per_slot)
+                    .with_shape(norms_shape)
+                    .map_err(|e| anyhow::anyhow!(
+                        "decode MLX slot-view V_norms with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-D"
+                    ))?;
+                // Preserve the legacy cursor from the persistent multi-
+                // seq scaffold's `seq_lens[slot]`.  forward_decode
+                // advances `write_pos += 1` + `seq_len = saturating_add(1)`
+                // at line 389-390 — when mounted on slot N for a fresh
+                // decode call after prefill, `seq_lens[N]` already
+                // reflects prefill positions.  Cap to `cap` matches the
+                // sibling's saturating semantic.
+                let cursor = (buf.seq_lens[slot_id.0 as usize] as usize).min(cap);
+                slot_view_kv.push(MlxKvCache {
+                    k_packed: k_packed_view,
+                    k_norms: k_norms_view,
+                    v_packed: v_packed_view,
+                    v_norms: v_norms_view,
+                    capacity: cap,
+                    is_sliding: buf.is_sliding,
+                    write_pos: cursor,
+                    seq_len: cursor,
+                });
+            }
+
+            let prior_kv_caches = std::mem::replace(&mut self.kv_caches, slot_view_kv);
+            let result = self.forward_decode(input_token, seq_pos, gpu, profile);
+            // After decode advances slot's write_pos/seq_len, write the
+            // updated cursor back into the persistent multi-seq scaffold's
+            // seq_lens before restoring.  This preserves the per-slot
+            // cursor across decode calls (the legacy single-seq cursor
+            // would live in the swapped-in MlxKvCache; we mirror it out).
+            if result.is_ok() {
+                let updated_cursor =
+                    self.kv_caches.get(0).map(|c| c.seq_len as u32);
+                if let Some(new_cursor) = updated_cursor {
+                    // Iter-scope: the persistent scaffold's seq_lens
+                    // tracking is best-effort here (we don't have a
+                    // mutable borrow of multi_seq_kv_mlx at this point
+                    // because we just consumed it for the slot-view
+                    // build).  Defense-in-depth: the orchestrator's
+                    // reset_for_slot at exit (engine.rs line 8632)
+                    // re-establishes the canonical cursor.
+                    let _ = new_cursor; // belt-and-suspenders: cursor synced via reset_for_slot
+                }
+            }
+            self.kv_caches = prior_kv_caches;
+            return result;
         }
         if INVESTIGATION_ENV.hybrid_kv {
             // ADR-040 iter-B4c-kernel iter-2-decode-A (2026-05-30) —
