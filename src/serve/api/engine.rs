@@ -65,7 +65,17 @@ use crate::serve::scheduler::{
     AdmitError, AdmitRequest, FifoSchedulerAdapter, InflightBatchedScheduler, Scheduler,
     SchedulerPolicy, SchedulerStats, SlotHandle,
 };
-use crate::serve::multi_seq_kv::{MultiSeqError, SlotId};
+use crate::serve::multi_seq_kv::SlotId;
+// ADR-040 iter-2-decode-C-stream-tool-call (§6.1.48) — `MultiSeqError`
+// import is now ONLY used inside `#[cfg(test)]` modules (the slot-aware
+// streaming fn's last typed-error `CapabilityUnsupported` constructor
+// in the production binary was REPLACED with the real Wave 3 W-B3
+// `ToolCallStreamEmitter` plumbing this iter).  Gate the import behind
+// `#[cfg(test)]` to keep `cargo build --release` lint-clean while
+// preserving the test-module `super::MultiSeqError::CapabilityUnsupported
+// { capability: "..." }` constructors that pin the typed-deferral labels.
+#[cfg(test)]
+use crate::serve::multi_seq_kv::MultiSeqError;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -9150,38 +9160,44 @@ fn generate_stream_gemma4_once_slot_aware(
     // probe — those are SerialFifo-only optimizations not engaged at
     // SlotId(N>0) per the iter-LCP scope).
     //
-    // Sub-deferral (typed CapabilityUnsupported via SSE Error event):
-    // **streaming tool-call body emission** via Wave 3 W-B3
-    // `ToolCallStreamEmitter` (~200 LOC of stateful incremental JSON
-    // parsing).  Requests engaging a `ToolCallSplitter` are deferred
-    // to **iter-B4c-kernel-iter-2-decode-C-stream-tool-call**
-    // (§6.1.39).  Pure sampling / grammar / stop_strings / logprobs /
-    // reasoning-text streaming at SlotId(N>0) is in scope.
+    // ADR-040 iter-B4c-kernel iter-2-decode-C-stream-tool-call SHIPPED
+    // 2026-05-30 (§6.1.48) — the iter-2-decode-C surviving sub-deferral
+    // (streaming tool-call body emission via Wave 3 W-B3
+    // `ToolCallStreamEmitter`) is LIFTED.  The slot-aware streaming
+    // body now threads the same `tool_splitter` + `tool_call_body`
+    // accumulator + `tool_call_emitter` Option + `tool_call_index` +
+    // `saw_tool_call` per-stream state as `generate_stream_once` at
+    // engine.rs:12140-12317.  When a `ToolCallSplitter` is registered
+    // for the model AND a tool-call body grammar is requested
+    // (`grammar_kind ∈ {ToolCallBodyAuto, ToolCallBodyRequired}`), the
+    // streaming arm now drives `ToolCallStreamEmitter::advance` per
+    // ToolCallText fragment + `finalize` per ToolCallClose, matching
+    // the non-slot-aware shape verbatim.  The iter-2-decode-C typed-
+    // error surface (`stream_tool_call_engaged` short-circuit at the
+    // `Ok(first_decode_token)` arm of `match prefill_result`) is
+    // REMOVED — every prefill-Ok branch now runs the unified tool-
+    // call-aware decode loop.  The `iter-2-decode-C-stream-tool-call
+    // per ADR-040 §6.1.39` label substring is preserved as a doc-
+    // comment cite for H87 forward-pointer discoverability (operator-
+    // grep'able), but the typed `MultiSeqError::CapabilityUnsupported
+    // { capability: "...stream-tool-call..." }` constructor + the
+    // associated SSE Error event are GONE — replaced by the real
+    // incremental tool-call argument streaming path.
+    //
+    // iter-2-decode-C-stream-tool-call per ADR-040 §6.1.39 — sub-deferral
+    // CLOSED at §6.1.48 (this iter).  Substring preserved as a doc-
+    // comment cite so `grep "iter-2-decode-C-stream-tool-call per"`
+    // still discovers the historical scope-narrowing decision in the
+    // source tree.
     match prefill_result {
         Ok(first_decode_token) => {
-            // Streaming tool-call body emission is iter-2-decode-C-
-            // stream-tool-call scope.  When the registration carries
-            // a ToolCallSplitter, emit a typed Error event naming the
-            // sub-deferral; otherwise, run the full streaming
-            // sampler/grammar/stop-strings/logprobs/reasoning surface.
-            let stream_tool_call_engaged = registration
-                .and_then(super::registry::ToolCallSplitter::from_registration)
-                .is_some()
-                && (params.grammar_kind == GrammarKind::ToolCallBodyAuto
-                    || params.grammar_kind == GrammarKind::ToolCallBodyRequired);
-            if stream_tool_call_engaged {
-                let err = MultiSeqError::CapabilityUnsupported {
-                    capability:
-                        "gemma4-forward-decode-stream-slot-N-tool-call-body (iter-B4c-kernel-iter-2-decode-C-stream-tool-call per ADR-040 §6.1.39 — streaming tool-call body emission via Wave 3 W-B3 ToolCallStreamEmitter; ~200 LOC incremental JSON-arguments parser is out of iter-2-decode-C scope)",
-                };
-                send!(super::sse::GenerationEvent::Error(format!(
-                    "capability_unsupported: ADR-040 iter-B4c-kernel iter-2-decode-C — \
-                     streaming tool-call body at SlotId(N>0) requested \
-                     (grammar_kind={:?}) but ToolCallStreamEmitter port is \
-                     iter-2-decode-C-stream-tool-call scope. {}",
-                    params.grammar_kind, err,
-                )));
-            } else {
+            // iter-2-decode-C-stream-tool-call per ADR-040 §6.1.39 —
+            // historical doc-cite for H87 forward-pointer discoverability.
+            // The typed-error `MultiSeqError::CapabilityUnsupported`
+            // surface that pre-iter-2-decode-C-stream-tool-call landed
+            // at this branch entry is REMOVED; the unified body below
+            // runs the real Wave 3 W-B3 `ToolCallStreamEmitter` path.
+
                 // ── Sampler / grammar / logprobs config (mirror of
                 // generate_stream_once at engine.rs:11453+).
                 let sample_logits = params.temperature > 0.0
@@ -9245,50 +9261,200 @@ fn generate_stream_gemma4_once_slot_aware(
                 let mut reason_splitter = registration
                     .and_then(super::registry::ReasoningSplitter::from_registration);
 
+                // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48 —
+                // tool-call splitter classifies the post-reasoning
+                // Content stream into in/out-of-tool-call spans
+                // (mirror of generate_stream_once at engine.rs:12140-
+                // 12152).  Composition: reasoning splitter first; any
+                // Content-classified fragment then flows into the
+                // tool-call splitter via `route_content`.  When the
+                // model has no tool-call markers registered, the
+                // splitter is `None` and every fragment routes
+                // verbatim through `Delta { kind: Content, .. }`
+                // (byte-equivalent to the pre-iter-2-decode-C-stream-
+                // tool-call shape).
+                let mut tool_splitter = registration
+                    .and_then(super::registry::ToolCallSplitter::from_registration);
+                let mut tool_call_body: String = String::new();
+                let mut tool_call_index: usize = 0;
+                let mut saw_tool_call: bool = false;
+                let mut tool_call_emitter: Option<ToolCallStreamEmitter> = None;
+                let tool_call_policy = params.tool_call_policy;
+
+                // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48 —
+                // EventSink wrapper for ToolCallStreamEmitter::{advance,
+                // finalize}, which take `&EventSink<'_>` instead of the
+                // raw `&Sender`.  The slot-aware fn has no streaming-
+                // origin capture (no PromptCache store on slot-aware
+                // path — that's iter-LCP scope per §6.1.39), so we use
+                // the passive `EventSink::new` constructor.  The
+                // wrapper forwards every blocking_send call verbatim
+                // to the underlying sender.
+                let event_sink = EventSink::new(events);
+
                 let want_logprobs = params.logprobs;
                 let want_log_per_token = want_logprobs;
 
-                // Closure: classify a fragment + emit Delta events into
-                // the correct DeltaKind slot.  Returns Err if SSE send
-                // failed (signals stream cancellation).
+                // Closure: classify a fragment + emit Delta events
+                // through the reasoning splitter → tool-call splitter
+                // pipeline.  Returns Err if SSE send failed (signals
+                // stream cancellation).
                 //
                 // We can't return early from a closure to the outer fn,
                 // so the closure produces `Result<(), ()>` and the
                 // caller checks + breaks the loop.
+                //
+                // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48
+                // — closure signature widened from the iter-2-decode-C
+                // shape `(events, splitter, fragment)` to
+                // `(events_sink, splitter, tool_splitter, body,
+                // tc_index, saw_tc, emitter, grammar_runtime,
+                // fragment, reg)` to thread the per-call tool-call
+                // streaming state through.  Mirror of
+                // `generate_stream_once::emit_fragment` at engine.rs:
+                // 12323-12382 + `route_content` at 12210-12317.
                 let emit_fragment =
-                    |events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+                    |event_sink: &EventSink<'_>,
                      splitter: &mut Option<super::registry::ReasoningSplitter>,
-                     fragment: &str|
+                     tool_splitter: &mut Option<super::registry::ToolCallSplitter>,
+                     body: &mut String,
+                     tc_index: &mut usize,
+                     saw_tc: &mut bool,
+                     emitter: &mut Option<ToolCallStreamEmitter>,
+                     grammar_runtime: &mut Option<super::grammar::GrammarRuntime>,
+                     fragment: &str,
+                     reg: Option<&super::registry::ModelRegistration>|
                      -> Result<(), ()> {
+                        // Inner helper: route a Content-classified text
+                        // run through the ToolCallSplitter (when
+                        // present) or emit as a Content Delta event
+                        // verbatim.  Mirror of
+                        // generate_stream_once::route_content shape.
+                        let route_content =
+                            |tool_splitter: &mut Option<super::registry::ToolCallSplitter>,
+                             body: &mut String,
+                             tc_index: &mut usize,
+                             saw_tc: &mut bool,
+                             emitter: &mut Option<ToolCallStreamEmitter>,
+                             grammar_runtime: &mut Option<super::grammar::GrammarRuntime>,
+                             text: &str,
+                             reg: Option<&super::registry::ModelRegistration>|
+                             -> Result<(), ()> {
+                                if text.is_empty() {
+                                    return Ok(());
+                                }
+                                let Some(tcs) = tool_splitter.as_mut() else {
+                                    // No tool markers registered — original behavior.
+                                    if event_sink
+                                        .blocking_send(super::sse::GenerationEvent::Delta {
+                                            kind: super::sse::DeltaKind::Content,
+                                            text: text.to_string(),
+                                        })
+                                        .is_err()
+                                    {
+                                        return Err(());
+                                    }
+                                    return Ok(());
+                                };
+                                for ev in tcs.feed(text) {
+                                    match ev {
+                                        super::registry::ToolCallEvent::Content(t) => {
+                                            if !t.is_empty()
+                                                && event_sink
+                                                    .blocking_send(super::sse::GenerationEvent::Delta {
+                                                        kind: super::sse::DeltaKind::Content,
+                                                        text: t,
+                                                    })
+                                                    .is_err()
+                                            {
+                                                return Err(());
+                                            }
+                                        }
+                                        super::registry::ToolCallEvent::ToolCallOpen => {
+                                            body.clear();
+                                            // Wave 3 W-B3 incremental:
+                                            // fresh emitter for THIS call.
+                                            *emitter = Some(ToolCallStreamEmitter::new(
+                                                reg.map(|r| r.family),
+                                                *tc_index,
+                                            ));
+                                            // Wave 2.6 W-α5 Q2: arm grammar trigger.
+                                            if let Some(rt) = grammar_runtime.as_mut() {
+                                                rt.trigger();
+                                            }
+                                        }
+                                        super::registry::ToolCallEvent::ToolCallText(t) => {
+                                            body.push_str(&t);
+                                            if let Some(em) = emitter.as_mut() {
+                                                em.advance(body, event_sink)?;
+                                            }
+                                        }
+                                        super::registry::ToolCallEvent::ToolCallClose => {
+                                            let body_dump = std::mem::take(body);
+                                            let mut em = emitter.take().unwrap_or_else(|| {
+                                                ToolCallStreamEmitter::new(
+                                                    reg.map(|r| r.family),
+                                                    *tc_index,
+                                                )
+                                            });
+                                            em.finalize(
+                                                body_dump,
+                                                reg,
+                                                tool_call_policy,
+                                                tc_index,
+                                                saw_tc,
+                                                event_sink,
+                                            )?;
+                                        }
+                                    }
+                                }
+                                Ok(())
+                            };
+
+                        if fragment.is_empty() {
+                            return Ok(());
+                        }
                         if let Some(sp) = splitter.as_mut() {
                             for (slot, frag) in sp.feed(fragment) {
-                                let kind = match slot {
-                                    super::registry::SplitSlot::Content => {
-                                        super::sse::DeltaKind::Content
-                                    }
+                                match slot {
                                     super::registry::SplitSlot::Reasoning => {
-                                        super::sse::DeltaKind::Reasoning
+                                        if !frag.is_empty()
+                                            && event_sink
+                                                .blocking_send(super::sse::GenerationEvent::Delta {
+                                                    kind: super::sse::DeltaKind::Reasoning,
+                                                    text: frag,
+                                                })
+                                                .is_err()
+                                        {
+                                            return Err(());
+                                        }
                                     }
-                                };
-                                if !frag.is_empty() && events
-                                    .blocking_send(super::sse::GenerationEvent::Delta {
-                                        kind,
-                                        text: frag,
-                                    })
-                                    .is_err()
-                                {
-                                    return Err(());
+                                    super::registry::SplitSlot::Content => {
+                                        route_content(
+                                            tool_splitter,
+                                            body,
+                                            tc_index,
+                                            saw_tc,
+                                            emitter,
+                                            grammar_runtime,
+                                            &frag,
+                                            reg,
+                                        )?;
+                                    }
                                 }
                             }
-                        } else if !fragment.is_empty()
-                            && events
-                                .blocking_send(super::sse::GenerationEvent::Delta {
-                                    kind: super::sse::DeltaKind::Content,
-                                    text: fragment.to_string(),
-                                })
-                                .is_err()
-                        {
-                            return Err(());
+                        } else {
+                            // No reasoning splitter — route everything as Content.
+                            route_content(
+                                tool_splitter,
+                                body,
+                                tc_index,
+                                saw_tc,
+                                emitter,
+                                grammar_runtime,
+                                fragment,
+                                reg,
+                            )?;
                         }
                         Ok(())
                     };
@@ -9374,8 +9540,19 @@ fn generate_stream_gemma4_once_slot_aware(
                     .decode(&[next_token], false)
                     .unwrap_or_default();
                 decoded_running.push_str(&first_fragment);
-                if emit_fragment(events, &mut reason_splitter, &first_fragment)
-                    .is_err()
+                if emit_fragment(
+                    &event_sink,
+                    &mut reason_splitter,
+                    &mut tool_splitter,
+                    &mut tool_call_body,
+                    &mut tool_call_index,
+                    &mut saw_tool_call,
+                    &mut tool_call_emitter,
+                    &mut grammar_runtime,
+                    &first_fragment,
+                    registration,
+                )
+                .is_err()
                 {
                     tracing::info!("SSE stream dropped by client; aborting gemma4 slot-aware decode");
                     if let Some(c) = cancellation_counter {
@@ -9485,7 +9662,19 @@ fn generate_stream_gemma4_once_slot_aware(
                             .decode(&[next_token], false)
                             .unwrap_or_default();
                         decoded_running.push_str(&fragment);
-                        if emit_fragment(events, &mut reason_splitter, &fragment).is_err()
+                        if emit_fragment(
+                            &event_sink,
+                            &mut reason_splitter,
+                            &mut tool_splitter,
+                            &mut tool_call_body,
+                            &mut tool_call_index,
+                            &mut saw_tool_call,
+                            &mut tool_call_emitter,
+                            &mut grammar_runtime,
+                            &fragment,
+                            registration,
+                        )
+                        .is_err()
                         {
                             tracing::info!("SSE stream dropped by client; aborting gemma4 slot-aware decode");
                             if let Some(c) = cancellation_counter {
@@ -9508,6 +9697,19 @@ fn generate_stream_gemma4_once_slot_aware(
                         }
                     }
                 }
+                // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48
+                // — finish_reason override: per OpenAI tool-calls spec,
+                // when ANY tool-call closed during the stream
+                // (`saw_tool_call` latched true by ToolCallStreamEmitter
+                // ::finalize / emit_streaming_tool_call_close), the
+                // terminal finish_reason is `"tool_calls"` regardless
+                // of whether the grammar exhausted (which would
+                // otherwise read as `"stop"`) or the decode loop hit
+                // max_tokens (`"length"`).  Mirror of
+                // generate_stream_once at engine.rs:12754+ shape.
+                if saw_tool_call {
+                    finish_reason = "tool_calls";
+                }
                 if let Some(e) = decode_err {
                     send!(super::sse::GenerationEvent::Error(format!(
                         "gemma4 stream slot-aware decode failed: {e:#}",
@@ -9520,7 +9722,6 @@ fn generate_stream_gemma4_once_slot_aware(
                         stats: super::sse::StreamStats::default(),
                     });
                 }
-            }
         }
         Err(e) => {
             send!(super::sse::GenerationEvent::Error(format!(
@@ -29603,5 +29804,440 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_xlen_iter2_decode_a_xlen_gemma4_tests 
              iter-2B-xlen + iter-2-decode-A-xlen sub-deferral cites \
              point at a non-existent destination."
         );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ADR-040 Phase B iter-B4c-kernel iter-2-decode-C-stream-tool-call
+// (Gemma 4 GenerateStream-arm slot-aware streaming tool-call body
+// emission via Wave 3 W-B3 ToolCallStreamEmitter) — 2026-05-30
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Closes the surviving iter-2-decode-C sub-deferral pinned at §6.1.39:
+// **streaming tool-call body emission**.  The slot-aware streaming
+// orchestrator `generate_stream_gemma4_once_slot_aware` previously
+// entry-checked a `stream_tool_call_engaged` predicate and surfaced
+// a typed `MultiSeqError::CapabilityUnsupported` SSE Error event
+// when a `ToolCallSplitter` was registered for the model AND
+// `grammar_kind ∈ {ToolCallBodyAuto, ToolCallBodyRequired}`.  This
+// iter REPLACES that short-circuit with the real Wave 3 W-B3
+// `ToolCallStreamEmitter` plumbing: per-fragment `advance(body,
+// events)` + per-call `finalize(body, reg, policy, tc_index, saw_tc,
+// events)`, mirror of `generate_stream_once`'s `route_content`
+// closure at engine.rs:12210-12317.
+//
+// Tests (H196–H201):
+//
+//   H196 (skip-mode): GenerateStream-arm typed-error literal for the
+//                     `stream_tool_call_engaged` short-circuit REMOVED
+//                     from the fn body.  Positive pin: the body now
+//                     constructs `ToolCallStreamEmitter::new(reg.map(
+//                     |r| r.family), *tc_index)` at ToolCallOpen, and
+//                     calls `em.advance(body, event_sink)` on
+//                     ToolCallText + `em.finalize(...)` on
+//                     ToolCallClose — verbatim mirror of the non-slot-
+//                     aware `route_content` shape.
+//   H197 (skip-mode): per-fragment incremental JSON streaming wired.
+//                     Source-grep confirms `em.advance(body,` AND
+//                     `em.finalize(` BOTH appear inside the slot-aware
+//                     fn body (NOT just in the non-slot-aware sibling
+//                     at engine.rs:12278-12312).
+//   H198 (skip-mode): SerialFifo + SlotId(0) byte-equivalence
+//                     preserved via H135 transitivity — the sibling
+//                     `forward_decode` signature in gemma4/forward_gpu
+//                     .rs is STILL unchanged (no slot_id /
+//                     multi_seq_kv params); iter-2-decode-A's
+//                     `forward_decode_slot_aware` signature is STILL
+//                     unchanged; code-path disjointness at the
+//                     worker-arm `slot_id != SlotId(0)` predicate
+//                     short-circuits the slot-aware orchestrator for
+//                     SerialFifo + SlotId(0) routes.
+//   H199 (skip-mode): Qwen35 iter-2 GenerateStream-arm slot-aware
+//                     streaming tool-call surface UNCHANGED.  The
+//                     Qwen35 fn `generate_stream_qwen35_once_extended_
+//                     slot_aware` body is NOT touched.  The Qwen35
+//                     architecture's tool-call streaming was already
+//                     handled at iter-C2d-cont-kernel iter-2 §6.1.28
+//                     via a different surface area; iter-2-decode-C-
+//                     stream-tool-call does NOT regress it.
+//   H200 (skip-mode): SSE event ordering pin.  The Gemma 4 streaming
+//                     fn body, after iter-2-decode-C-stream-tool-call,
+//                     emits a terminal `Done { finish_reason, .. }`
+//                     event at the end of every successful decode
+//                     path; the `finish_reason` is overridden to
+//                     `"tool_calls"` when `saw_tool_call` latched true
+//                     during the decode loop (matches the OpenAI
+//                     tool-calls finish_reason spec).  No new SSE
+//                     terminal Error event is added on the happy path
+//                     (the iter-2-decode-C-stream-tool-call typed-
+//                     error abort is REMOVED).
+//   H201 (skip-mode): orthogonal surfaces UNCHANGED.  Embed-arm fn
+//                     body does NOT call `forward_decode_slot_aware`
+//                     (H136 transitivity).  Qwen3VL forward paths
+//                     UNCHANGED.  Surviving sub-deferral label
+//                     `iter-B4c-kernel-iter-2-decode-C-stream-tool-
+//                     call per ADR-040 §6.1.39` is STILL grep-able
+//                     in engine.rs as a doc-comment cite (the label
+//                     substring is preserved per H87 forward-pointer
+//                     discoverability discipline).  ADR-040 §6.1.48
+//                     closure block exists (forward-pointer dest).
+
+#[cfg(test)]
+mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_stream_tool_call_gemma4_tests {
+    // Skip-mode source-grep tests; intentionally NO `use super::*;`.
+
+    /// **H196 (skip-mode)** — iter-2-decode-C-stream-tool-call typed-
+    /// error short-circuit REPLACED with real Wave 3 W-B3
+    /// `ToolCallStreamEmitter` plumbing.
+    ///
+    /// (a) The iter-2-decode-C typed-deferral capability literal
+    ///     `gemma4-forward-decode-stream-slot-N-tool-call-body
+    ///     (iter-B4c-kernel-iter-2-decode-C-stream-tool-call per
+    ///     ADR-040 §6.1.39 — streaming tool-call body emission via
+    ///     Wave 3 W-B3 ToolCallStreamEmitter` is REMOVED from the
+    ///     slot-aware streaming fn body — the typed `MultiSeqError::
+    ///     CapabilityUnsupported` constructor that pre-iter-2-decode-
+    ///     C-stream-tool-call branched on `stream_tool_call_engaged`
+    ///     is GONE.
+    /// (b) Positive pin: `ToolCallStreamEmitter::new(` appears in the
+    ///     slot-aware streaming fn body (per-call emitter
+    ///     construction at ToolCallOpen).
+    /// (c) Positive pin: `tool_call_policy = params.tool_call_policy`
+    ///     binding present (the policy passthrough to `finalize`'s
+    ///     fallback dispatch).
+    ///
+    /// Note: the iter-2-decode-C-stream-tool-call label substring is
+    /// PRESERVED somewhere in the fn body as a doc-comment cite (H87
+    /// forward-pointer discoverability — see H201).  H196 only pins
+    /// the typed-error constructor + its specific capability literal
+    /// (which carries the load-bearing "is out of iter-2-decode-C
+    /// scope" phrasing) are GONE.
+    #[test]
+    fn h196_stream_tool_call_typed_error_replaced_with_real_emitter() {
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_stream_gemma4_once_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H196: generate_stream_gemma4_once_slot_aware not found");
+        // Window covers the prefill-Ok branch + entire decode loop +
+        // terminal Done emission.  Body grew to ~33k bytes post-
+        // iter-2-decode-C-stream-tool-call (~3k delta for inner
+        // route_content closure + tool-call state vars).
+        let fn_window = &src[fn_idx..(fn_idx + 60_000).min(src.len())];
+
+        // (a) The exact iter-2-decode-C typed-error capability literal
+        // — its presence INSIDE a `MultiSeqError::CapabilityUnsupported
+        // { capability: ... }` constructor was the load-bearing typed
+        // deferral for the streaming tool-call body.  iter-2-decode-C-
+        // stream-tool-call REMOVES that constructor + capability
+        // literal pairing.
+        let iter2_decode_c_tc_capability =
+            "gemma4-forward-decode-stream-slot-N-tool-call-body (iter-B4c-kernel-iter-2-decode-C-stream-tool-call per ADR-040 §6.1.39 — streaming tool-call body emission";
+        assert!(
+            !fn_window.contains(iter2_decode_c_tc_capability),
+            "H196 FALSIFIED: slot-aware streaming fn body still \
+             contains the iter-2-decode-C-stream-tool-call typed-error \
+             capability literal `{iter2_decode_c_tc_capability}` — \
+             ToolCallStreamEmitter plumbing NOT landed; streaming \
+             tool-call requests at SlotId(N>0) still surface a typed \
+             CapabilityUnsupported SSE Error event."
+        );
+
+        // (b) Positive pin: per-call emitter construction at
+        // ToolCallOpen.  The body MUST construct a fresh
+        // ToolCallStreamEmitter per call, mirror of the non-slot-aware
+        // route_content at engine.rs:12257.
+        assert!(
+            fn_window.contains("ToolCallStreamEmitter::new("),
+            "H196 FALSIFIED: slot-aware streaming fn body does NOT \
+             construct `ToolCallStreamEmitter::new(...)` — Wave 3 \
+             W-B3 incremental tool-call streaming NOT wired."
+        );
+
+        // (c) Positive pin: tool_call_policy passthrough.  The closure
+        // must capture `tool_call_policy = params.tool_call_policy` so
+        // ToolCallStreamEmitter::finalize's fallback (close-buffered)
+        // dispatch enforces the Constrained-vs-Auto loud-error policy.
+        assert!(
+            fn_window.contains("let tool_call_policy = params.tool_call_policy"),
+            "H196 FALSIFIED: slot-aware streaming fn body does NOT \
+             bind `tool_call_policy = params.tool_call_policy` — \
+             ToolCallStreamEmitter::finalize cannot enforce the \
+             Constrained-vs-Auto policy branch on parse failure."
+        );
+    }
+
+    /// **H197 (skip-mode)** — per-fragment incremental JSON streaming
+    /// wired via `em.advance(...)` + `em.finalize(...)` inside the
+    /// slot-aware streaming fn body.
+    ///
+    /// (a) `em.advance(body, event_sink)` present — drives the
+    ///     incremental name + kv-pair emission on each ToolCallText
+    ///     fragment.
+    /// (b) `em.finalize(` present — emits the closing `}` + any tail
+    ///     kvs at ToolCallClose.
+    /// (c) `saw_tool_call` latch present — the finish_reason override
+    ///     to `"tool_calls"` requires this latch be readable at end-of-
+    ///     decode.
+    #[test]
+    fn h197_per_fragment_incremental_streaming_wired_in_slot_aware_fn() {
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_stream_gemma4_once_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H197: generate_stream_gemma4_once_slot_aware not found");
+        let fn_window = &src[fn_idx..(fn_idx + 60_000).min(src.len())];
+
+        // (a) advance call on the per-call emitter, INSIDE the slot-
+        // aware fn body — not just in the non-slot-aware sibling.
+        assert!(
+            fn_window.contains("em.advance(body, event_sink)"),
+            "H197 FALSIFIED: slot-aware streaming fn body does NOT \
+             call `em.advance(body, event_sink)` — Wave 3 W-B3 \
+             per-fragment incremental tool-call argument streaming \
+             NOT wired in the slot-aware path."
+        );
+
+        // (b) finalize call on the per-call emitter at ToolCallClose.
+        assert!(
+            fn_window.contains("em.finalize("),
+            "H197 FALSIFIED: slot-aware streaming fn body does NOT \
+             call `em.finalize(...)` — Wave 3 W-B3 finalize-on-close \
+             dispatch NOT wired."
+        );
+
+        // (c) saw_tool_call latch present (drives finish_reason
+        // override per OpenAI tool-calls spec).
+        assert!(
+            fn_window.contains("saw_tool_call"),
+            "H197 FALSIFIED: slot-aware streaming fn body does NOT \
+             reference `saw_tool_call` — finish_reason override to \
+             `\"tool_calls\"` at end-of-decode NOT wired (OpenAI \
+             spec violation)."
+        );
+
+        // (d) finish_reason override to `\"tool_calls\"` when
+        // saw_tool_call latches.  Pin the EXACT shape so a regression
+        // to the iter-2-decode-C-only `\"stop\"`/`\"length\"`-only
+        // finish path falsifies.
+        assert!(
+            fn_window.contains("finish_reason = \"tool_calls\""),
+            "H197 FALSIFIED: slot-aware streaming fn body does NOT \
+             override `finish_reason = \"tool_calls\"` on the \
+             saw_tool_call latch — OpenAI tool-calls finish_reason \
+             contract broken at SlotId(N>0)."
+        );
+    }
+
+    /// **H198 (skip-mode)** — SerialFifo + SlotId(0) byte-equivalence
+    /// preserved via H135 transitivity.  iter-2-decode-C-stream-tool-
+    /// call touches ONLY the orchestrator body — sibling fn signatures
+    /// in `gemma4/forward_gpu.rs` (forward_decode) AND in
+    /// `serve/forward_prefill.rs` (forward_decode_slot_aware) are
+    /// UNCHANGED (additive-zero).
+    #[test]
+    fn h198_serial_fifo_sibling_forward_decode_signature_unchanged() {
+        // (a) Sibling forward_decode signature unchanged (mirror of
+        // H135).
+        let src = include_str!(
+            "../../inference/models/gemma4/forward_gpu.rs"
+        );
+        let sibling_marker = "pub fn forward_decode(";
+        let sib_idx = src
+            .find(sibling_marker)
+            .expect("H198: sibling forward_decode signature missing");
+        let sig_end = src[sib_idx..]
+            .find(") -> Result<u32>")
+            .map(|off| sib_idx + off + ") -> Result<u32>".len())
+            .unwrap_or(sib_idx + 600);
+        let sig_window = &src[sib_idx..sig_end.min(src.len())];
+        assert!(
+            !sig_window.contains("slot_id"),
+            "H198 FALSIFIED: sibling `forward_decode` signature \
+             contains `slot_id`. iter-2-decode-C-stream-tool-call \
+             discipline broken — sibling fn signature MUST remain \
+             unchanged."
+        );
+        assert!(
+            !sig_window.contains("multi_seq_kv"),
+            "H198 FALSIFIED: sibling `forward_decode` signature \
+             mentions `multi_seq_kv`. iter-2-decode-C-stream-tool-call \
+             discipline broken — SerialFifo decode path MUST NOT \
+             consume the multi-seq scaffold."
+        );
+
+        // (b) iter-2-decode-A's forward_decode_slot_aware signature
+        // STILL present (iter-2-decode-C-stream-tool-call is additive
+        // to the orchestrator body, not to the model fn).
+        let pf_src = include_str!("../forward_prefill.rs");
+        assert!(
+            pf_src.contains("pub fn forward_decode_slot_aware("),
+            "H198 FALSIFIED: iter-2-decode-A's `forward_decode_slot_\
+             aware` signature is missing from forward_prefill.rs. \
+             iter-2-decode-C-stream-tool-call accidentally removed \
+             the load-bearing primitive."
+        );
+    }
+
+    /// **H199 (skip-mode)** — Qwen35 + Qwen3VL UNCHANGED.  The Qwen35
+    /// streaming slot-aware fn `generate_stream_qwen35_once_extended_
+    /// slot_aware` body is NOT touched.
+    #[test]
+    fn h199_qwen35_and_qwen3vl_surfaces_unchanged() {
+        let src = include_str!("engine.rs");
+        // Qwen35 slot-aware fns STILL defined (mirror of H136).
+        for required in [
+            "generate_qwen35_once_slot_aware(",
+            "generate_stream_qwen35_once_extended_slot_aware(",
+            "embed_qwen35_slot_aware(",
+            "generate_qwen35_once_with_soft_tokens_slot_aware(",
+        ] {
+            assert!(
+                src.contains(required),
+                "H199 FALSIFIED: Qwen35 slot-aware fn `{required}` \
+                 is NOT present — iter-2-decode-C-stream-tool-call \
+                 accidentally regressed a Qwen35 lift."
+            );
+        }
+
+        // Qwen35 source files NOT touched by this iter — pin via
+        // gpu_delta_net.rs surface (A2b-cont landing).  The token
+        // `iter-2-decode-C-stream-tool-call` MUST NOT appear in the
+        // Qwen35 architecture source (iter-2-decode-C-stream-tool-
+        // call is a Gemma-only label).
+        let qwen35_src =
+            include_str!("../../inference/models/qwen35/gpu_delta_net.rs");
+        assert!(
+            !qwen35_src.contains("iter-2-decode-C-stream-tool-call"),
+            "H199 FALSIFIED: Qwen35 gpu_delta_net.rs mentions \
+             `iter-2-decode-C-stream-tool-call`. The iter scope is \
+             Gemma 4 GenerateStream-arm only — Qwen35 architecture \
+             accidentally touched."
+        );
+    }
+
+    /// **H200 (skip-mode)** — SSE event ordering pin.  The slot-aware
+    /// streaming fn body emits a terminal `Done { finish_reason, ..
+    /// }` event at end-of-decode AND the `finish_reason` is
+    /// overridden to `"tool_calls"` when saw_tool_call latched.
+    /// Defends against:
+    ///   * Accidentally emitting a terminal SSE Error event on the
+    ///     happy path (the iter-2-decode-C typed-error abort is
+    ///     REMOVED).
+    ///   * Forgetting to override finish_reason (would surface as
+    ///     `"stop"` or `"length"` instead of `"tool_calls"` — OpenAI
+    ///     spec violation).
+    #[test]
+    fn h200_sse_event_ordering_no_regression() {
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_stream_gemma4_once_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H200: generate_stream_gemma4_once_slot_aware not found");
+        let fn_window = &src[fn_idx..(fn_idx + 60_000).min(src.len())];
+
+        // (a) Terminal Done event present (the body must end every
+        // successful decode path with a Done event).
+        assert!(
+            fn_window.contains("GenerationEvent::Done {"),
+            "H200 FALSIFIED: slot-aware streaming fn body does NOT \
+             emit a terminal `GenerationEvent::Done {{ .. }}` event \
+             — SSE stream termination broken."
+        );
+
+        // (b) No NEW typed-error SSE Error path for the streaming
+        // tool-call sub-deferral.  Pin the EXACT phrase that was
+        // load-bearing for the iter-2-decode-C surviving sub-deferral
+        // surface — its presence in a `send!(...Error(...))` call
+        // would mean the typed-error abort was reinstated.
+        assert!(
+            !fn_window.contains(
+                "streaming tool-call body at SlotId(N>0) requested"
+            ),
+            "H200 FALSIFIED: slot-aware streaming fn body still \
+             contains the iter-2-decode-C surviving sub-deferral SSE \
+             Error event phrase `streaming tool-call body at \
+             SlotId(N>0) requested` — typed-error abort \
+             reinstated."
+        );
+
+        // (c) finish_reason override present (H197 (d) transitivity).
+        assert!(
+            fn_window.contains("if saw_tool_call {")
+                && fn_window
+                    .contains("finish_reason = \"tool_calls\""),
+            "H200 FALSIFIED: slot-aware streaming fn body lacks the \
+             `if saw_tool_call {{ finish_reason = \"tool_calls\"; }}` \
+             override — OpenAI tool-calls finish_reason contract \
+             broken."
+        );
+    }
+
+    /// **H201 (skip-mode)** — Orthogonal surfaces UNCHANGED.  Embed-
+    /// arm body still does NOT call forward_decode_slot_aware (H136 /
+    /// H180 / H188 / H195 transitivity).  Qwen3VL UNCHANGED.  Sub-
+    /// deferral label `iter-B4c-kernel-iter-2-decode-C-stream-tool-
+    /// call per ADR-040 §6.1.39` is STILL grep-able in engine.rs as
+    /// a doc-comment cite (H87 forward-pointer discoverability).
+    /// ADR-040 §6.1.48 closure block exists in the ADR.
+    #[test]
+    fn h201_orthogonal_surfaces_unchanged_and_sub_deferral_doc_cite_preserved() {
+        let src = include_str!("engine.rs");
+
+        // (a) Embed-arm body still does NOT call forward_decode_slot_
+        // aware (mirror of H180 / H188 / H195).
+        let embed_marker = "fn embed_gemma4_slot_aware(";
+        let embed_idx = src.find(embed_marker).expect(
+            "H201: embed_gemma4_slot_aware not found"
+        );
+        let embed_window =
+            &src[embed_idx..(embed_idx + 10_000).min(src.len())];
+        assert!(
+            !embed_window.contains(".forward_decode_slot_aware("),
+            "H201 FALSIFIED: Embed-arm fn body calls \
+             `forward_decode_slot_aware`. The Embed-arm has NO \
+             decode loop — calling forward_decode_slot_aware would \
+             corrupt the L2-normalized embedding vector."
+        );
+
+        // (b) Surviving sub-deferral label STILL present in engine.rs
+        // as doc-cite (H87 forward-pointer discoverability — required
+        // even after the typed-error is removed, so operators can
+        // grep for the historical scope-narrowing decision).
+        let stream_tc_label =
+            "iter-B4c-kernel-iter-2-decode-C-stream-tool-call per ADR-040 §6.1.39";
+        assert!(
+            src.contains(stream_tc_label),
+            "H201 FALSIFIED: surviving sub-deferral label \
+             `{stream_tc_label}` is NOT present in engine.rs. \
+             iter-2-decode-C-stream-tool-call closure must preserve \
+             the operator-grep'able forward pointer per H87 \
+             discipline."
+        );
+
+        // (c) ADR-040 §6.1.48 closure block exists (the new closure
+        // block landing this iter).
+        let adr =
+            include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.48"),
+            "H201 FALSIFIED: ADR-040 §6.1.48 closure block not \
+             found. iter-2-decode-C-stream-tool-call sub-deferral \
+             cites point at a non-existent destination."
+        );
+
+        // (d) Qwen35 + Qwen3VL slot-aware surfaces UNCHANGED (mirror
+        // of H136 / H199).
+        for required in [
+            "generate_qwen35_once_slot_aware",
+            "generate_stream_qwen35_once_slot_aware",
+        ] {
+            assert!(
+                src.contains(required),
+                "H201 FALSIFIED: Qwen35 slot-aware surface \
+                 `{required}` removed — iter-2-decode-C-stream-tool-\
+                 call accidentally touched Qwen35 architecture."
+            );
+        }
     }
 }
