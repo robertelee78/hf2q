@@ -7598,9 +7598,9 @@ fn generate_once_with_soft_tokens(
 /// - `iter-B4c-kernel-iter-2` typed `CapabilityUnsupported` on the
 ///   kernel-forward step (the load-bearing pin until iter-2 lands).
 fn generate_gemma4_once_slot_aware(
-    _loaded: &mut GemmaLoadedModel,
+    loaded: &mut GemmaLoadedModel,
     prompt_tokens: &[u32],
-    _params: &SamplingParams,
+    params: &SamplingParams,
     _registration: Option<&super::registry::ModelRegistration>,
     multi_seq_kv: &mut Vec<
         crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
@@ -7645,37 +7645,64 @@ fn generate_gemma4_once_slot_aware(
         ))?;
     }
 
-    // Defensive: ensure exit-reset fires even on the kernel-forward
-    // sub-deferral path below.  The early `?` on the kernel-forward
-    // CapabilityUnsupported below would skip a post-call exit reset;
-    // we record completion state in a flag + run the exit reset
-    // unconditionally via a scope guard pattern (manual scope here
-    // because anyhow::Result early-return interacts cleanly with the
-    // `for` loop below).
+    // ADR-040 iter-B4c-kernel iter-2A (2026-05-30) — kernel-forward
+    // call lands.  Replaces iter-1's IIFE-wrapped typed
+    // `CapabilityUnsupported` at the orchestrator boundary with a real
+    // call into the load-bearing
+    // `MlxModelWeights::forward_prefill_with_soft_tokens_slot_aware`
+    // primitive (defined in `src/serve/forward_prefill.rs`).
+    //
+    // iter-2A advances the typed-deferral by ONE call-graph hop: the
+    // model fn signature now ACCEPTS `slot_id: SlotId` + `&mut Vec<
+    // MultiSeqHbKvBuffers>`, with a bounds-first pre-flight + per-
+    // regime dispatch fork.  Each of the 4 production KV regimes
+    // (hybrid F16-K + TQ-HB-V; HB-encoded; legacy 4-bit; dense F32)
+    // surfaces its own named iter-2{A-cont,B,C,D} typed sub-deferral
+    // — iter-2A-cont is the in-scope kernel-dispatch refactor (HB-
+    // encoded path); iter-2B is the production-default (HF2Q_HYBRID_KV
+    // =1 since ADR-029 iter-13 per H10 falsification at §6.1.11); iter-
+    // 2C is the legacy 4-bit opt-in surface; iter-2D is the dense F32
+    // LCP-eligible regime.
+    //
+    // Defense-in-depth: the call site reads `max_decode_tokens` from
+    // `params.max_tokens.max(1)` (mirrors `generate_once` at line 6653)
+    // so the per-layer KV alloc-sizing in the body inherits the same
+    // capacity discipline as the SerialFifo path.  `&[]` soft_tokens
+    // matches the Generate-arm path; the SoftTokens-arm port is iter-
+    // B4c-kernel-iter-5.
+    let max_decode_tokens = params.max_tokens.max(1);
     let kernel_forward_result: Result<GenerationResult> = (|| -> Result<GenerationResult> {
-        // **iter-B4c-kernel-iter-2 typed sub-deferral**: the
-        // kernel-side forward step itself.  Today the kernel forward
-        // path (`forward_prefill_with_soft_tokens` / its callees) has
-        // no `slot_id` parameter — see the §6.1.31 closure body's
-        // investigation findings.  Surfacing the typed
-        // `CapabilityUnsupported` here keeps the iter-1 scope honest:
-        // the orchestrator + reset_for_slot primitives are landed
-        // (load-bearing for the iter-{2,3,4,5} mirror ports), the
-        // kernel work is named as iter-2.
+        let _first_decode_token = loaded
+            .weights
+            .forward_prefill_with_soft_tokens_slot_aware(
+                prompt_tokens,
+                &[], // Generate-arm: no soft-token overrides; vision-aware
+                     // path is iter-B4c-kernel-iter-5 (SoftTokens arm).
+                max_decode_tokens,
+                &mut loaded.ctx,
+                slot_id,
+                multi_seq_kv,
+            )?;
+        // iter-2A returns Err on every dispatch-fork branch via the
+        // typed `MultiSeqError::CapabilityUnsupported` named for the
+        // specific sub-iter — control flow never reaches here in this
+        // iter.  When iter-2A-cont/2B/2C/2D land per-regime kernel
+        // dispatch, the decode loop body wraps `forward_decode` calls
+        // (the decode-side slot routing is iter-B4c-kernel-iter-2-decode).
+        // Pinned by H90: the `iter-B4c-kernel-iter-2-decode` substring
+        // appears in this body so the decode-loop sub-deferral is
+        // operator-grep'able.
         //
-        // Mantra-aligned (iter-2.5 M1): typed error, NOT a stub.
-        // Operator-grep'able: `iter-B4c-kernel-iter-2` substring +
-        // file pointer + `slot_id=N` value.
+        // Mantra-aligned: typed error path, never a stub.  Operator
+        // log greps land on the right pin pointer.
         let err = MultiSeqError::CapabilityUnsupported {
             capability:
-                "gemma4-forward-prefill-kernel-slot-N (iter-B4c-kernel-iter-2 per ADR-040 §6.1.31 — kernel slot-offset routing through src/serve/forward_prefill.rs:843-882 + forward_prefill_batched.rs:443-475 + forward_gpu.rs:443-459 + dispatch_hadamard_quantize_kv_hb_* slot offsets; same primitive Qwen35 B4a-cont uses per §6.1.20)",
+                "gemma4-forward-prefill-kernel-slot-N-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.32 — decode-loop body wraps forward_decode calls at slot_id; today forward_decode in src/inference/models/gemma4/forward_gpu.rs:310 has NO slot_id parameter — its lazy-alloc block at lines 396-466 mirrors the prefill alloc sites and must thread slot_id + consult the persistent multi-seq scaffold; gated on iter-2A-cont/2B kernel-dispatch refactor landing the prefill side first)",
         };
         Err(anyhow::anyhow!(
-            "capability_unsupported: ADR-040 iter-B4c-kernel iter-1 — \
-             reset_for_slot landed at slot_id={} across {} layers; the \
-             kernel-forward step is staged as iter-B4c-kernel-iter-2. {}",
-            slot_id.0,
-            multi_seq_kv.len(),
+            "capability_unsupported: ADR-040 iter-B4c-kernel iter-2A — \
+             forward_prefill_with_soft_tokens_slot_aware returned (unexpectedly Ok); \
+             decode-loop body wrapping is iter-B4c-kernel-iter-2-decode scope. {}",
             err,
         ))
     })();
@@ -21121,6 +21148,438 @@ mod adr040_phase_b_iter_b4c_kernel_iter1_gemma4_tests {
             assert!(
                 closure_body.contains(required),
                 "H83 FALSIFIED: ADR-040 §6.1.31 closure body does NOT \
+                 name `{required}`. Sub-deferral runbook incomplete."
+            );
+        }
+    }
+}
+
+// ============================================================================
+// ADR-040 iter-B4c-kernel iter-2A — H84-H90 hypothesis pins
+// ============================================================================
+//
+// Scope (iter-2A advances iter-1 by ONE call-graph hop):
+//
+//   * iter-1 (§6.1.31, commit `bac4c385`) shipped:
+//     - `MultiSeqHbKvBuffers::reset_for_slot(slot)` + sibling
+//       `MultiSeqHybridKvBuffers::reset_for_slot(slot)` primitives.
+//     - `generate_gemma4_once_slot_aware` orchestrator scaffold —
+//       bounds-checks slot_id + entry+exit reset_for_slot + typed-
+//       deferred kernel-forward step as `iter-B4c-kernel-iter-2`.
+//     - `worker_run` Gemma 4 Generate-arm lift fork (take + restore
+//       borrow on `g.multi_seq_kv`).
+//
+//   * iter-2A (THIS commit, ADR-040 §6.1.32) ships:
+//     - NEW `MlxModelWeights::forward_prefill_with_soft_tokens_slot_aware`
+//       on `src/serve/forward_prefill.rs` — the load-bearing primitive
+//       the iter-1 orchestrator's IIFE-wrapped typed-deferral now CALLS
+//       (instead of surfacing the typed error at the orchestrator
+//       boundary).
+//     - Bounds-first pre-flight in the new fn (slot_id < n_seqs;
+//       multi_seq_kv_hb.len() == self.layers.len(); empty prompt
+//       guard).
+//     - Dispatch fork on the 4 production KV regimes (hybrid F16-K +
+//       TQ-HB-V; HB-encoded; legacy 4-bit; dense F32) — each branch
+//       surfaces its own typed `MultiSeqError::CapabilityUnsupported`
+//       with the named sub-iter (iter-B4c-kernel-iter-{2A-cont,2B,2C,2D}).
+//     - Orchestrator update: replaces the iter-1 IIFE-wrapped typed
+//       error with a real call into the new fn, propagating its typed
+//       errors verbatim + naming the iter-2-decode sub-deferral on the
+//       hypothetical Ok branch (never reached in iter-2A).
+//
+// Tests (H84-H90):
+//   H84 (skip-mode): NEW fn `forward_prefill_with_soft_tokens_slot_aware`
+//                    is DEFINED on MlxModelWeights with the correct
+//                    signature (slot_id + multi_seq_kv_hb params).
+//   H85 (skip-mode): Orchestrator `generate_gemma4_once_slot_aware`
+//                    CALLS the new fn (one call-graph hop advance vs
+//                    iter-1's IIFE typed error at orchestrator
+//                    boundary).
+//   H86 (skip-mode): SerialFifo + SlotId(0) byte-equivalence preserved
+//                    — `forward_prefill_with_soft_tokens_resume` is
+//                    NEVER called with `slot_id` (signature unchanged;
+//                    existing call sites untouched).  Defends H1/H2/
+//                    H23/H41/H44 byte-equivalence chain.
+//   H87 (skip-mode): iter-2A typed sub-deferrals all NAMED (2A-cont,
+//                    2B, 2C, 2D, 2-decode).
+//   H88 (skip-mode): Bounds-first pre-flight (slot_id.0 < n_seqs) lands
+//                    in the new fn body — A2b §6.1.23 iter-1.5
+//                    cfa-finding-F5 ordering preserved.
+//   H89 (skip-mode): Layer-count match pre-flight
+//                    (multi_seq_kv_hb.len() == self.layers.len()) lands.
+//   H90 (skip-mode): Orchestrator's iter-1 IIFE typed error
+//                    `"gemma4-forward-prefill-kernel-slot-N
+//                    (iter-B4c-kernel-iter-2 ..."` is REPLACED with the
+//                    new fn call.  iter-1's typed error label REMOVED
+//                    from the orchestrator body (would be a structural
+//                    regression — the iter-1 deferral has been resolved).
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod adr040_phase_b_iter_b4c_kernel_iter2a_gemma4_tests {
+    // Skip-mode source-grep tests; intentionally NO `use super::*;`
+    // (tests rely on `include_str!` against engine.rs + forward_prefill.rs
+    // + the ADR doc).
+
+    /// **H84 (skip-mode)** — NEW
+    /// `forward_prefill_with_soft_tokens_slot_aware` fn IS defined on
+    /// `MlxModelWeights` in `src/serve/forward_prefill.rs` with the
+    /// correct signature: `slot_id: SlotId` + `multi_seq_kv_hb: &mut
+    /// Vec<MultiSeqHbKvBuffers>` parameters.
+    ///
+    /// Mirrors iter-1 H78's lift-witness shape for the model-fn level.
+    #[test]
+    fn h84_new_slot_aware_prefill_fn_landed_on_mlx_model_weights() {
+        let src = include_str!("../forward_prefill.rs");
+        assert!(
+            src.contains("pub fn forward_prefill_with_soft_tokens_slot_aware("),
+            "H84 FALSIFIED: `forward_prefill_with_soft_tokens_slot_aware` \
+             is NOT defined as a pub fn in forward_prefill.rs. iter-2A \
+             load-bearing primitive missing."
+        );
+        // Signature shape: takes `slot_id: SlotId` AND
+        // `multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>`.
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H84: fn marker present (asserted above)");
+        let sig_window = &src[fn_idx..(fn_idx + 2000).min(src.len())];
+        assert!(
+            sig_window.contains("slot_id: SlotId"),
+            "H84 FALSIFIED: new fn signature missing `slot_id: SlotId` \
+             parameter. Per-slot routing is broken — the fn cannot \
+             receive the admit'd handle's SlotId."
+        );
+        assert!(
+            sig_window.contains("multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>"),
+            "H84 FALSIFIED: new fn signature missing `multi_seq_kv_hb: \
+             &mut Vec<MultiSeqHbKvBuffers>` parameter. The persistent \
+             multi-seq scaffold C2c §6.1.21 provisioned cannot be \
+             consumed without this — iter-2A-cont kernel-dispatch \
+             refactor has no destination."
+        );
+        // Returns Result<u32> (first decode token) — same shape as
+        // the sibling forward_prefill_with_soft_tokens_resume.
+        assert!(
+            sig_window.contains(") -> Result<u32>"),
+            "H84 FALSIFIED: new fn return type is not `Result<u32>`. \
+             Sibling discipline broken — first-decode-token shape must \
+             match `forward_prefill_with_soft_tokens_resume` so the \
+             orchestrator decode-loop body (iter-2-decode) can wire \
+             through verbatim."
+        );
+    }
+
+    /// **H85 (skip-mode)** — Orchestrator
+    /// `generate_gemma4_once_slot_aware` CALLS the new fn.  One
+    /// call-graph hop advance vs iter-1: iter-1 IIFE-wrapped a typed
+    /// `CapabilityUnsupported` at the orchestrator boundary; iter-2A
+    /// replaces that with a real call into the model fn, which itself
+    /// produces the typed deferral at the per-regime dispatch fork.
+    ///
+    /// Pin defends the regression where iter-2A accidentally
+    /// regresses to iter-1 behaviour (typed error at orchestrator
+    /// boundary instead of inside the new fn).
+    #[test]
+    fn h85_orchestrator_calls_new_slot_aware_prefill_fn() {
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_gemma4_once_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H85: generate_gemma4_once_slot_aware not found");
+        let fn_window = &src[fn_idx..(fn_idx + 10_000).min(src.len())];
+        // The new fn call site MUST be present.
+        assert!(
+            fn_window.contains(".forward_prefill_with_soft_tokens_slot_aware("),
+            "H85 FALSIFIED: orchestrator does NOT call \
+             `forward_prefill_with_soft_tokens_slot_aware`. iter-2A's \
+             one-hop call-graph advance is not landed — orchestrator \
+             would surface CapabilityUnsupported at its boundary \
+             (iter-1 behaviour)."
+        );
+        // The call site MUST pass `slot_id` (the orchestrator's param)
+        // — not a hard-coded SlotId(0) literal.
+        let call_marker = ".forward_prefill_with_soft_tokens_slot_aware(";
+        let call_idx = fn_window
+            .find(call_marker)
+            .expect("H85: call_marker present (asserted above)");
+        let call_window = &fn_window[call_idx..(call_idx + 800).min(fn_window.len())];
+        assert!(
+            call_window.contains("slot_id"),
+            "H85 FALSIFIED: orchestrator call site does NOT pass \
+             `slot_id`. Per-slot routing broken — the new fn must \
+             receive the orchestrator's SlotId."
+        );
+        // Hardness: the orchestrator must NOT pass a literal SlotId(0)
+        // — that would silently route every slot through slot 0's
+        // region of the multi-seq scaffold.
+        assert!(
+            !call_window.contains(", SlotId(0),"),
+            "H85 FALSIFIED: orchestrator call site contains a literal \
+             `SlotId(0)` argument. Per-slot routing is broken."
+        );
+        // The call site must pass `multi_seq_kv` (the orchestrator's
+        // &mut Vec<MultiSeqHbKvBuffers> param).
+        assert!(
+            call_window.contains("multi_seq_kv"),
+            "H85 FALSIFIED: orchestrator call site does NOT pass \
+             `multi_seq_kv`. The persistent multi-seq scaffold cannot \
+             be consumed by the new fn — iter-2A-cont kernel-dispatch \
+             refactor has nothing to slice into."
+        );
+    }
+
+    /// **H86 (skip-mode)** — SerialFifo + SlotId(0) byte-equivalence
+    /// preserved.  The sibling fn
+    /// `forward_prefill_with_soft_tokens_resume` is NEVER called with
+    /// `slot_id` (its signature MUST remain unchanged; existing call
+    /// sites at engine.rs:6463 + 7043 + 9769 untouched).
+    ///
+    /// Pin defends H1/H2/H23/H41/H44 byte-equivalence chain at the
+    /// model-fn signature level: any modification to the sibling fn's
+    /// signature would force every caller to be re-audited for byte-
+    /// equivalence regression — instead, iter-2A enforces code-path
+    /// disjointness via a NEW sibling.
+    #[test]
+    fn h86_serial_fifo_sibling_fn_signature_unchanged() {
+        let src = include_str!("../forward_prefill.rs");
+        // The sibling fn `forward_prefill_with_soft_tokens_resume` has
+        // exactly its pre-iter-2A signature (5 args: prompt_tokens,
+        // soft_tokens, max_decode_tokens, gpu, restored_lcp).
+        let sibling_marker = "pub fn forward_prefill_with_soft_tokens_resume(";
+        let sib_idx = src
+            .find(sibling_marker)
+            .expect("H86: sibling fn signature missing");
+        let sib_window = &src[sib_idx..(sib_idx + 1000).min(src.len())];
+        assert!(
+            !sib_window.contains("slot_id"),
+            "H86 FALSIFIED: `forward_prefill_with_soft_tokens_resume` \
+             signature contains `slot_id` parameter. iter-2A discipline \
+             broken — the sibling fn MUST remain byte-equivalent for \
+             SerialFifo + SlotId(0).  iter-2A's primitive is a NEW \
+             sibling fn (`forward_prefill_with_soft_tokens_slot_aware`); \
+             the existing sibling MUST NOT be touched."
+        );
+        assert!(
+            !sib_window.contains("multi_seq_kv"),
+            "H86 FALSIFIED: `forward_prefill_with_soft_tokens_resume` \
+             signature mentions `multi_seq_kv`. iter-2A discipline \
+             broken — SerialFifo path MUST NOT consume the multi-seq \
+             scaffold."
+        );
+        // The 3 production call sites in engine.rs MUST still call
+        // `forward_prefill_with_soft_tokens_resume` (NOT the new slot-
+        // aware variant), preserving byte-equivalence for the
+        // non-slot-aware paths.
+        let engine_src = include_str!("engine.rs");
+        let n_resume_calls = engine_src
+            .matches(".forward_prefill_with_soft_tokens_resume(")
+            .count();
+        assert!(
+            n_resume_calls >= 2,
+            "H86 FALSIFIED: pre-iter-2A engine.rs had ≥2 call sites \
+             of `forward_prefill_with_soft_tokens_resume` (at \
+             generate_once + LCP fast paths). Post-iter-2A count is \
+             {n_resume_calls} — call sites silently rerouted, byte- \
+             equivalence chain compromised."
+        );
+    }
+
+    /// **H87 (skip-mode)** — iter-2A typed sub-deferrals are all
+    /// NAMED with operator-grep'able iter-N labels for each remaining
+    /// sub-iter:
+    /// - `iter-B4c-kernel-iter-2A-cont`: HB-encoded prefill slot
+    ///   routing (the in-scope kernel-dispatch refactor surface).
+    /// - `iter-B4c-kernel-iter-2B`: HybridKvBuffers slot routing
+    ///   (HF2Q_HYBRID_KV=1 production-default per H10 falsification).
+    /// - `iter-B4c-kernel-iter-2C`: legacy 4-bit path
+    ///   (HF2Q_TQ_CODEBOOK_BITS=4 opt-in surface).
+    /// - `iter-B4c-kernel-iter-2D`: dense F32 path (HF2Q_USE_DENSE=1
+    ///   LCP-eligible regime).
+    /// - `iter-B4c-kernel-iter-2-decode`: decode-loop body wrapping
+    ///   `forward_decode` (orchestrator-side hypothetical-Ok branch).
+    ///
+    /// Drift here means a sub-deferral lost its operator-grep'able
+    /// label.
+    ///
+    /// Mirrors iter-1 H83's discipline for the iter-2 sub-iters.
+    #[test]
+    fn h87_iter2a_sub_deferrals_named_for_remaining_iters() {
+        let pf_src = include_str!("../forward_prefill.rs");
+        let engine_src = include_str!("engine.rs");
+        let combined = format!("{pf_src}\n{engine_src}");
+        for label in [
+            // 4 dispatch-fork branches inside the new fn body.
+            "iter-B4c-kernel-iter-2A-cont per ADR-040 §6.1.32", // HB-encoded
+            "iter-B4c-kernel-iter-2B per ADR-040 §6.1.32",      // HybridKvBuffers
+            "iter-B4c-kernel-iter-2C per ADR-040 §6.1.32",      // legacy 4-bit
+            "iter-B4c-kernel-iter-2D per ADR-040 §6.1.32",      // dense F32
+            // Decode-loop sub-deferral inside the orchestrator.
+            "iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.32",
+        ] {
+            assert!(
+                combined.contains(label),
+                "H87 FALSIFIED: sub-deferral label `{label}` is NOT \
+                 present in forward_prefill.rs or engine.rs. iter-2A's \
+                 typed-deferral discipline broken — operator log greps \
+                 cannot land on the right pin pointer."
+            );
+        }
+    }
+
+    /// **H88 (skip-mode)** — Bounds-first pre-flight per A2b §6.1.23
+    /// iter-1.5 cfa-finding-F5 ordering preserved.  The new fn checks
+    /// `slot_id.0 < multi_seq_kv_hb[0].n_seqs` (or equivalent) BEFORE
+    /// any other body-level work begins — mirrors the Qwen35 B4a
+    /// contract at `forward_gpu.rs:2569-2586`.
+    ///
+    /// Pin defends silent-corruption regressions where a stale slot_id
+    /// (from a stale handle) would index past the scaffold's n_seqs
+    /// and silently corrupt slot N's K/V region.
+    #[test]
+    fn h88_new_fn_bounds_first_preflight_lands() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H88: fn marker present (H84 asserts)");
+        // Window covers the fn body (~6000 chars).
+        let body_window = &src[fn_idx..(fn_idx + 12_000).min(src.len())];
+        // The bounds check reads `multi_seq_kv_hb[0].n_seqs` and
+        // compares against `slot_id.0`.
+        assert!(
+            body_window.contains("n_seqs = multi_seq_kv_hb[0].n_seqs"),
+            "H88 FALSIFIED: new fn does not bind n_seqs from \
+             `multi_seq_kv_hb[0].n_seqs`. Bounds-first preflight cannot \
+             use the canonical n_seqs source."
+        );
+        assert!(
+            body_window.contains("slot_id.0 >= n_seqs"),
+            "H88 FALSIFIED: new fn does not check `slot_id.0 >= n_seqs` \
+             — bounds-first preflight is broken. A stale slot_id could \
+             silently corrupt the wrong slot's K/V region."
+        );
+        // Per A2b iter-1.5 ordering: bounds check fires BEFORE any
+        // kernel-dispatch work.  We approximate via lexical ordering:
+        // the bounds check string appears BEFORE the dispatch fork
+        // (the `INVESTIGATION_ENV.hybrid_kv` branch).
+        let bounds_pos = body_window
+            .find("slot_id.0 >= n_seqs")
+            .expect("H88: bounds check present (asserted above)");
+        let dispatch_pos = body_window.find("INVESTIGATION_ENV.hybrid_kv").expect(
+            "H88: dispatch fork present (must be lexically AFTER bounds check)",
+        );
+        assert!(
+            bounds_pos < dispatch_pos,
+            "H88 FALSIFIED: bounds-first ordering violated — the \
+             dispatch fork at `INVESTIGATION_ENV.hybrid_kv` appears \
+             BEFORE the bounds check at `slot_id.0 >= n_seqs`. A2b \
+             §6.1.23 iter-1.5 cfa-finding-F5 ordering broken."
+        );
+    }
+
+    /// **H89 (skip-mode)** — Layer-count match pre-flight lands.  The
+    /// new fn asserts `multi_seq_kv_hb.len() == self.layers.len()` as
+    /// the caller-invariant defense-in-depth check.  C2c spawn-arm
+    /// produces exactly one entry per layer per the provisioning loop
+    /// at `engine.rs::provision_multi_seq_kv_for_slot_aware`; a desync
+    /// would silently route the scaffold's per-layer K/V buffers to
+    /// the wrong layer.
+    #[test]
+    fn h89_new_fn_layer_count_match_preflight_lands() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_prefill_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H89: fn marker present (H84 asserts)");
+        let body_window = &src[fn_idx..(fn_idx + 12_000).min(src.len())];
+        assert!(
+            body_window.contains("multi_seq_kv_hb.len() != self.layers.len()"),
+            "H89 FALSIFIED: new fn does not check \
+             `multi_seq_kv_hb.len() != self.layers.len()`. A C2c \
+             spawn-arm desync (e.g. layer-count mismatch from a partial \
+             provisioning) would silently route layer-N's K/V to \
+             layer-M's buffer."
+        );
+        // ALSO pins the empty-scaffold defense (defense-in-depth — the
+        // orchestrator at §6.1.31 also checks this; the new fn re-
+        // checks so a future iter-2A-cont edit that lifts the
+        // orchestrator's check doesn't accidentally remove BOTH
+        // surfaces).
+        assert!(
+            body_window.contains("multi_seq_kv_hb.is_empty()"),
+            "H89 FALSIFIED: new fn does not check \
+             `multi_seq_kv_hb.is_empty()` defense-in-depth."
+        );
+    }
+
+    /// **H90 (skip-mode)** — Orchestrator's iter-1 IIFE typed error
+    /// `"gemma4-forward-prefill-kernel-slot-N (iter-B4c-kernel-iter-2 ..."`
+    /// is REPLACED with the new fn call.  iter-1's typed-error label
+    /// no longer appears at the orchestrator boundary — the typed
+    /// error now surfaces from INSIDE the new fn (at the per-regime
+    /// dispatch fork), one call-graph hop further down.
+    ///
+    /// This is the load-bearing structural-advance pin: iter-2A's
+    /// scope is precisely "advance the typed-deferral by one
+    /// call-graph hop"; H90 checks the advance landed.
+    #[test]
+    fn h90_orchestrator_iter1_typed_error_replaced_with_new_fn_call() {
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_gemma4_once_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H90: generate_gemma4_once_slot_aware not found");
+        let fn_window = &src[fn_idx..(fn_idx + 10_000).min(src.len())];
+        // The iter-1 IIFE-wrapped typed-error label is the literal
+        // `"gemma4-forward-prefill-kernel-slot-N (iter-B4c-kernel-iter-2 "`
+        // (note the trailing space distinguishes it from
+        // `iter-B4c-kernel-iter-2A-cont` / `iter-2-decode` / etc).
+        let iter1_label = "gemma4-forward-prefill-kernel-slot-N (iter-B4c-kernel-iter-2 per";
+        assert!(
+            !fn_window.contains(iter1_label),
+            "H90 FALSIFIED: orchestrator body still contains iter-1's \
+             typed-error label `{iter1_label}`. iter-2A's call-graph \
+             advance is NOT landed — typed error still surfaces at \
+             orchestrator boundary instead of from inside the new \
+             model fn."
+        );
+        // Positive pin: the new fn call IS present in the orchestrator
+        // body (H85 also checks this; H90 re-asserts to bind the
+        // two-part discipline: REMOVE iter-1 label AND ADD new fn call).
+        assert!(
+            fn_window.contains(".forward_prefill_with_soft_tokens_slot_aware("),
+            "H90 FALSIFIED: orchestrator does NOT call the new fn. \
+             Structural advance broken — orchestrator still in iter-1 \
+             behaviour."
+        );
+        // ALSO pins that the §6.1.32 ADR block exists.
+        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.32"),
+            "H90 FALSIFIED: ADR-040 §6.1.32 closure block not found. \
+             iter-2A's sub-deferral cites point at a non-existent \
+             destination."
+        );
+        let closure_marker = "### 6.1.32";
+        let closure_start = adr
+            .find(closure_marker)
+            .expect("H90: §6.1.32 marker missing (asserted above)");
+        let closure_end_off = adr[closure_start..]
+            .find("\n### ")
+            .unwrap_or_else(|| adr[closure_start..].len().min(40_000));
+        let closure_body = &adr[closure_start..closure_start + closure_end_off];
+        for required in [
+            "iter-B4c-kernel iter-2A",
+            "iter-B4c-kernel-iter-2A-cont",
+            "iter-B4c-kernel-iter-2B",
+            "iter-B4c-kernel-iter-2C",
+            "iter-B4c-kernel-iter-2D",
+            "iter-B4c-kernel-iter-2-decode",
+        ] {
+            assert!(
+                closure_body.contains(required),
+                "H90 FALSIFIED: ADR-040 §6.1.32 closure body does NOT \
                  name `{required}`. Sub-deferral runbook incomplete."
             );
         }

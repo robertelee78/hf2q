@@ -313,9 +313,11 @@ pub fn build_qwen3vl_positions(
     Ok(flat)
 }
 use crate::inference::models::gemma4::{MlxModelWeights, DenseKvBuffers, HbKvBuffers};
+use crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers;
 use crate::serve::forward_mlx_shared::{
     dispatch_qmatmul, dispatch_rms_norm_unit_perhead, RmsNormPerHeadArgs,
 };
+use crate::serve::multi_seq_kv::{MultiSeqError, SlotId};
 use super::config::LayerType;
 use super::gpu::GpuContext;
 
@@ -2302,6 +2304,303 @@ impl MlxModelWeights {
             *v /= denom;
         }
         Ok(out)
+    }
+
+    /// **ADR-040 iter-B4c-kernel iter-2A** (2026-05-30) — slot-aware
+    /// prefill entry point on `MlxModelWeights`.  Cross-architecture
+    /// mirror of Qwen35 `Qwen35Model::forward_gpu_last_logits(.., slot_id)`
+    /// per ADR-040 §6.1.4 (B4a) / §6.1.5 (B4a-cont) / §6.1.20 (B4b).
+    ///
+    /// This is the **load-bearing primitive** the iter-1 orchestrator
+    /// scaffold at `engine::generate_gemma4_once_slot_aware` (§6.1.31)
+    /// types as `iter-B4c-kernel-iter-2`: an explicit `slot_id`
+    /// parameter on the Gemma 4 forward path so the kernel-side K/V
+    /// writes (via `dispatch_hadamard_quantize_kv_hb_*` at
+    /// `forward_prefill.rs:1319-1363`) can route through the per-slot
+    /// region of the persistent `MultiSeqHbKvBuffers` scaffold
+    /// (provisioned by C2c §6.1.21 at spawn time).
+    ///
+    /// # iter-2A scope (this commit)
+    ///
+    /// iter-2A lands the **fn signature + pre-flight + dispatch fork**
+    /// that the iter-2{A-cont,B,C,D} sub-deferrals will fill out.
+    /// Specifically:
+    ///
+    /// - **Bounds-first** per A2b §6.1.23 iter-1.5 cfa-finding-F5
+    ///   ordering: `slot_id.0 < multi_seq_kv_hb[0].n_seqs` (else fail
+    ///   loud with a diagnostic naming the slot + the n_seqs at
+    ///   construction).
+    /// - **Layer-count match**: `multi_seq_kv_hb.len() == self.layers.len()`
+    ///   (caller invariant; defense-in-depth fail-fast).
+    /// - **Empty prompt guard**: mirrors the sibling
+    ///   `forward_prefill_with_soft_tokens_resume`'s precondition.
+    /// - **Dispatch fork** on the 4 production KV-regime branches
+    ///   (matches the existing forward-path branching at
+    ///   `forward_prefill.rs:837-891` and `forward_decode` at
+    ///   `forward_gpu.rs:407-466`):
+    ///   * **HF2Q_HYBRID_KV=1** (production default per H10
+    ///     falsification, ADR-040 §6.1.11) → `HybridKvBuffers` slot
+    ///     routing typed-deferred as **iter-B4c-kernel-iter-2B**.
+    ///     Per `engine.rs::GemmaLoadedModel::multi_seq_kv` docstring
+    ///     (the field comment), the C2c spawn-arm provisions ONLY the
+    ///     `MultiSeqHbKvBuffers` scaffold today; the `MultiSeqHybrid
+    ///     KvBuffers` sibling scaffold is staged for iter-C2c-cont
+    ///     gated on this iter-2B kernel work landing.
+    ///   * **HF2Q_HYBRID_KV=0 + HF2Q_TQ_CODEBOOK_BITS>=5** (HB-encoded
+    ///     opt-out path) → HB slot routing typed-deferred as
+    ///     **iter-B4c-kernel-iter-2A-cont**.  This is the in-scope
+    ///     scaffold-consuming path: the per-layer
+    ///     `&mut multi_seq_kv_hb[layer_idx]` IS the load-bearing
+    ///     argument the iter-2A-cont kernel-dispatch refactor will
+    ///     thread through `dispatch_hadamard_quantize_kv_hb_*` callers
+    ///     via `MlxBuffer::slice_view(byte_offset, n_elements)` (same
+    ///     primitive Qwen35 B4a-cont uses at `gpu_full_attn.rs:172-181`
+    ///     per ADR-040 §6.1.5).
+    ///   * **HF2Q_TQ_CODEBOOK_BITS=4** (legacy 4-bit, opt-in pre-default
+    ///     correction at 2026-04-24) → typed-deferred as
+    ///     **iter-B4c-kernel-iter-2C**.  Below-default surface; gated
+    ///     on iter-2A-cont landing first.
+    ///   * **HF2Q_USE_DENSE=1** (dense F32 KV path) → typed-deferred as
+    ///     **iter-B4c-kernel-iter-2D**.  Orthogonal surface from the
+    ///     TQ-active paths; the LCP partial-prefix resume in
+    ///     `engine.rs::generate_once_with_soft_tokens` (~line 6700-6843)
+    ///     consumes this regime; iter-2D ports the slot-aware LCP path.
+    ///
+    /// # Why a NEW fn vs. modifying `forward_prefill_with_soft_tokens_resume`
+    ///
+    /// Per the ADR-040 H1/H2/H23/H41 byte-equivalence pin chain (A5*/
+    /// C2a/C2b/C2c/B4c), `forward_prefill_with_soft_tokens_resume` MUST
+    /// remain byte-identical for SerialFifo + SlotId(0) AND SlotAware +
+    /// SlotId(0).  A signature change there would force every call site
+    /// (warmup, generate, embed_last, generate_stream_once, LCP resume,
+    /// soft-token + deepstack variants) to thread `Option<SlotId>` +
+    /// `Option<&mut Vec<MultiSeqHbKvBuffers>>` through; the pin contract
+    /// would survive at `None`/`SlotId(0)` BUT the surface-area drift
+    /// would risk silent regressions on every modification.
+    ///
+    /// The structurally-honest answer (this fn): SerialFifo + SlotId(0)
+    /// path remains UNCHANGED at the worker arm's existing
+    /// `generate_once` dispatch (which routes through the unchanged
+    /// `forward_prefill_with_soft_tokens_resume`).  SlotAware + SlotId(N>0)
+    /// routes through THIS new fn — a fork at the worker-arm boundary
+    /// (already in place via iter-1's
+    /// `engine::generate_gemma4_once_slot_aware` orchestrator) routes
+    /// the SlotId(N>0) request here.  iter-2{A-cont,B,C,D} ports the
+    /// kernel-dispatch refactor INSIDE THIS NEW FN ONLY — never inside
+    /// the existing sibling, preserving byte-equivalence by code-path
+    /// disjointness.
+    ///
+    /// # Returns
+    ///
+    /// Same shape as `forward_prefill_with_soft_tokens_resume`: the
+    /// first decode token (greedy argmax of last-row logits).  Decode
+    /// loop iteration follows via existing `forward_decode` calls (the
+    /// decode-side slot routing is typed-deferred as
+    /// **iter-B4c-kernel-iter-2-decode**).
+    ///
+    /// # Errors
+    ///
+    /// - `prompt_tokens.is_empty()` (mirrors sibling).
+    /// - `multi_seq_kv_hb.is_empty()` (caller invariant: C2c provisioning
+    ///   produces one entry per layer; defense-in-depth fail-fast).
+    /// - `multi_seq_kv_hb.len() != self.layers.len()` (caller invariant
+    ///   violation).
+    /// - `slot_id.0 >= multi_seq_kv_hb[0].n_seqs` (typed
+    ///   `MultiSeqError::SlotOutOfRange` wrapped in `anyhow::Error`).
+    /// - iter-B4c-kernel-iter-2{A-cont,B,C,D} typed
+    ///   `MultiSeqError::CapabilityUnsupported` on the dispatch-fork
+    ///   branches above — each names the specific sub-iter surface.
+    ///
+    /// # Cross-architecture mirror
+    ///
+    /// Mirrors `Qwen35Model::forward_gpu_last_logits(.., slot_id)` at
+    /// `src/inference/models/qwen35/forward_gpu.rs:2564` + the B4a
+    /// bounds-first contract at `forward_gpu.rs:2569-2586` (typed
+    /// SlotOutOfRange diagnostic naming `slot_id` + `kv_cache.n_seqs`).
+    /// The Qwen35 surface accepted `slot_id` since B4a §6.1.4 (2026-05-23);
+    /// this fn is Gemma 4's analogue, landed at iter-B4c-kernel iter-2A
+    /// per §6.1.31's investigation findings (the Gemma 4 forward path
+    /// had NO slot_id parameter anywhere pre-iter-2).
+    pub fn forward_prefill_with_soft_tokens_slot_aware(
+        &mut self,
+        prompt_tokens: &[u32],
+        soft_tokens: &[SoftTokenInjection<'_>],
+        max_decode_tokens: usize,
+        gpu: &mut GpuContext,
+        slot_id: SlotId,
+        multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>,
+    ) -> Result<u32> {
+        // ── Pre-flight ────────────────────────────────────────────────
+        //
+        // Bounds-first per ADR-040 A2b §6.1.23 iter-1.5 cfa-finding-F5
+        // ordering.  Mirrors the contract at
+        // `qwen35/forward_gpu.rs:2569-2586` (B4a bounds-first pin).
+        //
+        // Empty prompt: same precondition as the sibling
+        // `forward_prefill_with_soft_tokens_resume` at line 458.  We
+        // duplicate the check here so the diagnostic names this fn
+        // (operator log greps land on the right pin pointer).
+        if prompt_tokens.is_empty() {
+            anyhow::bail!(
+                "forward_prefill_with_soft_tokens_slot_aware: empty prompt \
+                 (ADR-040 iter-B4c-kernel iter-2A)"
+            );
+        }
+        // Caller-invariant: C2c spawn-arm `provision_multi_seq_kv_for_slot_aware`
+        // produces exactly `self.weights.layers.len()` entries.  The
+        // orchestrator at `engine::generate_gemma4_once_slot_aware`
+        // gates on `multi_seq_kv.is_empty()`; we re-assert here for
+        // defense-in-depth.  Diagnostic names this fn + the spawn-time
+        // provisioning entry so an operator can trace either way.
+        if multi_seq_kv_hb.is_empty() {
+            anyhow::bail!(
+                "forward_prefill_with_soft_tokens_slot_aware: multi_seq_kv_hb is empty \
+                 (C2c spawn-arm invariant: provision_multi_seq_kv_for_slot_aware \
+                  must produce one entry per layer; ADR-040 §6.1.21 / iter-B4c-kernel iter-2A)"
+            );
+        }
+        if multi_seq_kv_hb.len() != self.layers.len() {
+            anyhow::bail!(
+                "forward_prefill_with_soft_tokens_slot_aware: multi_seq_kv_hb.len()={} \
+                 != self.layers.len()={} — caller-invariant violation \
+                 (ADR-040 iter-B4c-kernel iter-2A; C2c spawn-arm \
+                 provision_multi_seq_kv_for_slot_aware must allocate one per layer)",
+                multi_seq_kv_hb.len(),
+                self.layers.len(),
+            );
+        }
+        // Per-slot bounds.  Use the FIRST layer's n_seqs as canonical:
+        // A3a's `alloc_hb_kv_for_layer` enforces uniform `n_seqs` across
+        // layers per the C2c provisioning loop, so checking layer 0 is
+        // sufficient (cross-layer desync would itself be a separate
+        // invariant violation worth surfacing if/when observed).
+        let n_seqs = multi_seq_kv_hb[0].n_seqs;
+        if slot_id.0 >= n_seqs {
+            // Surface the typed MultiSeqError variant inside an anyhow
+            // chain so the worker arm's logging hooks see both the
+            // structured variant + the diagnostic context.
+            let err = MultiSeqError::SlotOutOfRange { slot: slot_id, max_slots: n_seqs };
+            anyhow::bail!(
+                "forward_prefill_with_soft_tokens_slot_aware: slot_id={} out of range \
+                 (n_seqs={}). ADR-040 iter-B4c-kernel iter-2A bounds-first contract — \
+                 re-allocate the persistent multi-seq scaffold with a larger n_seqs \
+                 (provision_multi_seq_kv_for_slot_aware was called with max_slots={}). {}",
+                slot_id.0,
+                n_seqs,
+                n_seqs,
+                err,
+            );
+        }
+
+        // ── Dispatch fork ─────────────────────────────────────────────
+        //
+        // Mirror the 4 production KV-regime branches at the existing
+        // alloc site (`forward_prefill.rs:837-891`).  Each branch lands
+        // a typed sub-deferral naming the specific kernel-dispatch
+        // refactor remaining.  Reading the env vars here (instead of
+        // capturing at construction) matches the sibling fn's
+        // discipline — INVESTIGATION_ENV is a LazyLock parsed once at
+        // process start, identical to its read site at line 832.
+        //
+        // Variable-shadow load-bearing: `_use_soft_tokens` /
+        // `_max_decode_tokens` / `_gpu` are intentionally bound so
+        // iter-2A-cont's kernel-dispatch refactor inherits the same
+        // parameter shape (no signature change required between iter-2A
+        // and iter-2A-cont — the body grows from typed-clamp to real
+        // dispatch).  `_multi_seq_kv_hb` is the per-layer per-slot
+        // backing the iter-2A-cont kernel writes will consume via
+        // `MlxBuffer::slice_view`.
+        let _use_soft_tokens = soft_tokens;
+        let _max_decode_tokens = max_decode_tokens;
+        let _gpu = gpu;
+        let _multi_seq_kv_hb = multi_seq_kv_hb;
+
+        // The 4 production KV-regime branches.  Order matches the
+        // alloc-site precedence at line 832-891 (HF2Q_HYBRID_KV first,
+        // then TQ codebook bits, then default).  Each branch's typed
+        // CapabilityUnsupported names the specific sub-iter so operator
+        // log greps + future-iter implementer can route to the right
+        // pin pointer.
+        let cb_bits: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
+            Ok("4") => 0,
+            Ok("5") => 5,
+            Ok("6") => 6,
+            Ok("8") => 8,
+            _ => 8, // DEFAULT: 8-bit (matches sibling line 835)
+        };
+        // HF2Q_USE_DENSE selects the dense F32 KV path (LCP-eligible).
+        // INVESTIGATION_ENV.use_dense is the canonical reader; mirrors
+        // forward_decode at `forward_gpu.rs:407`.
+        if INVESTIGATION_ENV.use_dense {
+            let err = MultiSeqError::CapabilityUnsupported {
+                capability: "gemma4-forward-prefill-slot-N-dense-F32 (iter-B4c-kernel-iter-2D per ADR-040 §6.1.32 — HF2Q_USE_DENSE=1 dense F32 KV path slot routing through src/serve/forward_prefill.rs:837-891 alloc site + DenseKvBuffers per-slot view + LCP partial-prefix resume slot-aware port; orthogonal to TQ-active paths gated on iter-A3b-2 DenseKvBuffers multi-seq lift)",
+            };
+            anyhow::bail!(
+                "forward_prefill_with_soft_tokens_slot_aware: dense F32 KV path \
+                 (HF2Q_USE_DENSE=1) slot routing not yet wired at slot_id={} \
+                 (ADR-040 iter-B4c-kernel iter-2A — iter-2D scope). {}",
+                slot_id.0,
+                err,
+            );
+        }
+        if cb_bits == 0 {
+            // Legacy 4-bit native flash_attn_vec_tq path.  Opt-in
+            // pre-default correction at 2026-04-24; 127-byte sourdough
+            // ceiling means production should not engage this regime,
+            // but typed-clamp lands the label for operator + grep.
+            let err = MultiSeqError::CapabilityUnsupported {
+                capability: "gemma4-forward-prefill-slot-N-legacy-4bit (iter-B4c-kernel-iter-2C per ADR-040 §6.1.32 — HF2Q_TQ_CODEBOOK_BITS=4 legacy 4-bit native flash_attn_vec_tq slot routing; opt-in pre-default surface, gated on iter-2A-cont HB-encoded path landing first)",
+            };
+            anyhow::bail!(
+                "forward_prefill_with_soft_tokens_slot_aware: legacy 4-bit TQ path \
+                 (HF2Q_TQ_CODEBOOK_BITS=4) slot routing not yet wired at slot_id={} \
+                 (ADR-040 iter-B4c-kernel iter-2A — iter-2C scope). {}",
+                slot_id.0,
+                err,
+            );
+        }
+        if INVESTIGATION_ENV.hybrid_kv {
+            // PRODUCTION DEFAULT post-ADR-029 iter-13.  H10 was
+            // FALSIFIED at ADR-040 §6.1.11 — `HF2Q_HYBRID_KV` is
+            // default-true since 2026-05-11.  The HybridKvBuffers slot
+            // routing requires `MultiSeqHybridKvBuffers` provisioning
+            // at C2c spawn time (the sibling scaffold to `multi_seq_kv`
+            // on `GemmaLoadedModel`) — staged at iter-C2c-cont gated on
+            // this iter-2B kernel work landing.
+            let err = MultiSeqError::CapabilityUnsupported {
+                capability: "gemma4-forward-prefill-slot-N-hybrid (iter-B4c-kernel-iter-2B per ADR-040 §6.1.32 — HF2Q_HYBRID_KV=1 production-default slot routing through src/serve/forward_prefill.rs:843-891 hybrid_kv alloc site + MultiSeqHybridKvBuffers per-slot view + dispatch_kv_cache_copy_batch_f32_to_f16 slot offsets; gated upstream on iter-C2c-cont provisioning MultiSeqHybridKvBuffers sibling scaffold on GemmaLoadedModel)",
+            };
+            anyhow::bail!(
+                "forward_prefill_with_soft_tokens_slot_aware: hybrid F16-K + TQ-HB-V path \
+                 (HF2Q_HYBRID_KV=1; PRODUCTION DEFAULT) slot routing not yet wired at \
+                 slot_id={} (ADR-040 iter-B4c-kernel iter-2A — iter-2B scope; production \
+                 cutover gated on this branch landing + iter-C2c-cont provisioning the \
+                 MultiSeqHybridKvBuffers sibling scaffold). {}",
+                slot_id.0,
+                err,
+            );
+        }
+        // cb_bits >= 5 AND HF2Q_HYBRID_KV=0 AND HF2Q_USE_DENSE=0 →
+        // HB-encoded opt-out path.  This is the iter-2A-cont
+        // load-bearing surface: the per-layer multi-seq scaffold IS
+        // consumable here (provisioned by C2c §6.1.21), the kernel
+        // dispatch site at `forward_prefill.rs:1342-1363`
+        // (`dispatch_hadamard_quantize_kv_hb`) IS the refactor target,
+        // and the read-path SDPA consumer (`flash_attn_vec_tq_hb`) IS
+        // the load-bearing kernel that consumes the per-slot K/V
+        // region.
+        let err = MultiSeqError::CapabilityUnsupported {
+            capability: "gemma4-forward-prefill-slot-N-hb-encoded (iter-B4c-kernel-iter-2A-cont per ADR-040 §6.1.32 — HF2Q_HYBRID_KV=0 opt-out HB-encoded slot routing through src/serve/forward_prefill.rs:1319-1363 dispatch_hadamard_quantize_kv_hb callers + leg_hb_encoded per-slot MlxBuffer::slice_view at slot_id.0 * nkv * capacity * head_dim byte offset + flash_attn_vec_tq_hb / flash_attn_prefill_tq_hb read-path slot-aware variant; same primitive Qwen35 B4a-cont uses per ADR-040 §6.1.5)",
+        };
+        anyhow::bail!(
+            "forward_prefill_with_soft_tokens_slot_aware: HB-encoded path \
+             (HF2Q_HYBRID_KV=0 + HF2Q_TQ_CODEBOOK_BITS={}) slot routing not yet wired \
+             at slot_id={} (ADR-040 iter-B4c-kernel iter-2A — iter-2A-cont scope; \
+             load-bearing in-scope path for the kernel-dispatch refactor). {}",
+            cb_bits,
+            slot_id.0,
+            err,
+        );
     }
 }
 
