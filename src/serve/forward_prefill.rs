@@ -2395,6 +2395,44 @@ impl MlxModelWeights {
     /// # Returns
     ///
     /// L2-normalized embedding vector of length `self.hidden_size`.
+    ///
+    /// # ADR-040 iter-B4c-kernel iter-2-embed structural-N/A closure (2026-05-30, §6.1.49)
+    ///
+    /// Pre-iter-2-embed pin (§6.1.32 followups list, line 2938): "`forward_embed_last`
+    /// slot-aware port (~60 LOC; single-call wrapper around
+    /// `forward_prefill(.., max_decode_tokens=0, ..)`).  Same shape as iter-2-decode but
+    /// no decode loop.  Pinned in the iter-B4c-kernel-iter-4 (Embed worker-arm) deferral
+    /// cite at iter-1's §6.1.31 closure."
+    ///
+    /// **Investigation finding (iter-2-embed)** — the Embed-arm SlotId(N>0) surface is
+    /// ALREADY fully covered by iter-B4c-kernel iter-4 (§6.1.36) at the **orchestrator
+    /// layer**, not the model-fn layer.  The orchestrator `embed_gemma4_slot_aware` at
+    /// `src/serve/api/engine.rs:9865` calls
+    /// `forward_prefill_with_soft_tokens_slot_aware(.., max_decode_tokens=0, ..)`
+    /// (the iter-2A landing per §6.1.32 + iter-2B routing per §6.1.34) — NOT
+    /// `forward_embed_last`.  The worker-arm dispatch fork at `engine.rs:5845` routes
+    /// `slot_id != SlotId(0)` into `embed_gemma4_slot_aware`; only SerialFifo + SlotId(0)
+    /// reaches the legacy `g.weights.forward_embed_last(&prompt_tokens, &mut g.ctx)`
+    /// dispatch at `engine.rs:6026`.
+    ///
+    /// **Structural N/A verdict**: a hypothetical `forward_embed_last_slot_aware` would be
+    /// DEAD CODE — it has no caller.  Adding one would violate H188 + H201 transitivity
+    /// (Embed-arm body does NOT call `forward_decode_slot_aware` because Embed has no
+    /// decode loop; same code-path disjointness rules out adding a slot-aware embed
+    /// signature here).  iter-2-embed is therefore CLOSED as structural-N/A: the
+    /// SlotId(N>0) Embed surface is shipped, but the closure point is the orchestrator
+    /// at `embed_gemma4_slot_aware` (§6.1.36), NOT this fn.
+    ///
+    /// **Forward-pointer discoverability** (H87 discipline):
+    /// `iter-B4c-kernel-iter-2-embed per ADR-040 §6.1.49` substring is preserved here as
+    /// a doc-comment cite so `grep "iter-2-embed per"` discovers the closure block.
+    /// The label substring is INTENTIONALLY NOT inside a `MultiSeqError::CapabilityUnsupported`
+    /// constructor — the iter-2-embed surface has no typed deferral to surface (the
+    /// SlotId(N>0) routing is the orchestrator's responsibility).
+    ///
+    /// SerialFifo + SlotId(0) byte-equivalence (H1/H2/H23/H41/H44/H77/H102/H128/H135/H198)
+    /// preserved trivially: this fn's signature + body UNCHANGED by iter-2-embed; only the
+    /// docstring grows.
     pub fn forward_embed_last(
         &mut self,
         prompt_tokens: &[u32],

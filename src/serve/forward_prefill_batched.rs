@@ -192,6 +192,52 @@ impl MlxModelWeights {
     /// Internally this threads through `pf_positions[i] = start_pos + i`
     /// and `kv_caches[i].write_pos = start_pos + seq_len`. At
     /// `start_pos=0` both reduce to the original semantics.
+    ///
+    /// # ADR-040 iter-B4c-kernel iter-2-batched structural-N/A closure (2026-05-30, §6.1.49)
+    ///
+    /// Pre-iter-2-batched pin (§6.1.32 followups list, line 2939):
+    /// "`forward_prefill_batched` slot-aware port — orthogonal to per-request scope
+    /// (the batched variant is gated on the `HF2Q_SERVE_BATCHED` env, off-by-default)."
+    ///
+    /// **Investigation finding (iter-2-batched)** — `forward_prefill_batched` is
+    /// gated on the `HF2Q_SERVE_BATCHED_PREFILL` env var (read at `engine.rs:7792`
+    /// and `:12666`) AND is ONLY called from the non-slot-aware `generate_once` and
+    /// `generate_stream_once` paths (`engine.rs:7802` + `:12676`).  Per the iter-1
+    /// worker-arm dispatch fork predicate `handle.slot_id != SlotId(0)`, SerialFifo +
+    /// SlotAware-at-SlotId(0) routes through `generate_once` / `generate_stream_once`
+    /// direct (the `forward_prefill_batched` engagement surface), while SlotAware +
+    /// SlotId(N>0) routes through the slot-aware orchestrators
+    /// (`generate_gemma4_once_slot_aware` + `generate_stream_gemma4_once_slot_aware`
+    /// + `embed_gemma4_slot_aware` + `generate_gemma4_once_with_soft_tokens_slot_aware`)
+    /// which ALL call `forward_prefill_with_soft_tokens_slot_aware` (the iter-2A
+    /// landing per §6.1.32 + iter-2B routing per §6.1.34) — NEVER
+    /// `forward_prefill_batched`.
+    ///
+    /// **Structural N/A verdict**: a hypothetical `forward_prefill_batched_slot_aware`
+    /// would be DEAD CODE — it has no caller.  The slot-aware orchestrators do not
+    /// engage the `HF2Q_SERVE_BATCHED_PREFILL` env gate; the batched variant exists
+    /// purely as a perf optimization for the SerialFifo path (iter-344 default-on,
+    /// iter-343 verified coherent at pp3813 on gemma4-ara-2pass-APEX-Q5_K_M) and is
+    /// orthogonal to per-request slot routing.
+    ///
+    /// In production-engagement terms: a SlotAware Gemma 4 deployment serving N
+    /// concurrent requests at SlotId(0..max_slots) would route each request through
+    /// the slot-aware path with `forward_prefill_with_soft_tokens_slot_aware` (the
+    /// iter-2A/2B production-default hybrid F16-K + TQ-HB-V kernel path), NOT
+    /// `forward_prefill_batched`.  The batched variant's ~20-47× speedup is realized
+    /// only at the SerialFifo + SlotId(0) entry point, which by code-path disjointness
+    /// is byte-equivalent to pre-ADR-040 (H1/H2/H23/H41/H44/H77/H102/H128/H135/H198).
+    ///
+    /// **Forward-pointer discoverability** (H87 discipline):
+    /// `iter-B4c-kernel-iter-2-batched per ADR-040 §6.1.49` substring is preserved here
+    /// as a doc-comment cite so `grep "iter-2-batched per"` discovers the closure block.
+    /// The label substring is INTENTIONALLY NOT inside a `MultiSeqError::CapabilityUnsupported`
+    /// constructor — the iter-2-batched surface has no typed deferral to surface (the
+    /// SlotId(N>0) routing is the orchestrator's responsibility via the slot-aware
+    /// orchestrators that bypass `forward_prefill_batched` entirely).
+    ///
+    /// SerialFifo + SlotId(0) byte-equivalence preserved trivially: this fn's signature
+    /// + body UNCHANGED by iter-2-batched; only the docstring grows.
     pub fn forward_prefill_batched(
         &mut self,
         prompt_tokens: &[u32],

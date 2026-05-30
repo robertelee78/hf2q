@@ -30241,3 +30241,489 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_stream_tool_call_gemma4_tests 
         }
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// ADR-040 Phase B iter-B4c-kernel iter-2-embed + iter-2-batched
+// (Gemma 4 orthogonal forward paths slot-aware structural-N/A closures) —
+// 2026-05-30
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Closes the two remaining iter-2-* sub-deferrals from §6.1.32's followups
+// list (lines 2938-2939 of the ADR):
+//
+//   - **iter-B4c-kernel-iter-2-embed**: `forward_embed_last` slot-aware
+//     port.  CLOSED as STRUCTURAL N/A — the Embed-arm SlotId(N>0) surface
+//     is shipped via the orchestrator `embed_gemma4_slot_aware` (iter-4
+//     §6.1.36), which calls `forward_prefill_with_soft_tokens_slot_aware`
+//     (the iter-2A landing per §6.1.32 + iter-2B routing per §6.1.34) —
+//     NOT `forward_embed_last`.  The worker-arm dispatch fork at
+//     `engine.rs:5845` routes `slot_id != SlotId(0)` into
+//     `embed_gemma4_slot_aware`; only SerialFifo + SlotId(0) reaches the
+//     legacy `g.weights.forward_embed_last(&prompt_tokens, &mut g.ctx)`
+//     dispatch at `engine.rs:6026`.  A hypothetical
+//     `forward_embed_last_slot_aware` would be DEAD CODE — no caller.
+//
+//   - **iter-B4c-kernel-iter-2-batched**: `forward_prefill_batched`
+//     slot-aware port.  CLOSED as STRUCTURAL N/A — the batched variant is
+//     gated on `HF2Q_SERVE_BATCHED_PREFILL` and ONLY called from
+//     `generate_once` + `generate_stream_once` (the SerialFifo + SlotId(0)
+//     paths at `engine.rs:7802` + `:12676`).  All four slot-aware
+//     orchestrators (`generate_gemma4_once_slot_aware`,
+//     `generate_stream_gemma4_once_slot_aware`, `embed_gemma4_slot_aware`,
+//     `generate_gemma4_once_with_soft_tokens_slot_aware`) call
+//     `forward_prefill_with_soft_tokens_slot_aware` exclusively.  A
+//     hypothetical `forward_prefill_batched_slot_aware` would be DEAD
+//     CODE — no caller.
+//
+// Both closures are structurally-honest typed pins: the load-bearing
+// `iter-B4c-kernel-iter-2-{embed,batched} per ADR-040 §6.1.49` substrings
+// are preserved as doc-comment cites in `src/serve/forward_prefill.rs`
+// (forward_embed_last) and `src/serve/forward_prefill_batched.rs`
+// (forward_prefill_batched) so `grep "iter-2-embed per"` and `grep
+// "iter-2-batched per"` discover the closure block.  The label substrings
+// are INTENTIONALLY NOT inside `MultiSeqError::CapabilityUnsupported`
+// constructors — the SlotId(N>0) routing is the orchestrator's
+// responsibility at the call-graph layer above these fns, not these fns
+// themselves.
+//
+// Tests (H202–H206):
+//
+//   H202 (skip-mode): iter-2-embed structural-N/A pin landed.  The
+//                     `forward_embed_last` fn signature in
+//                     forward_prefill.rs is UNCHANGED (no `slot_id` /
+//                     `multi_seq_kv*` params).  The §6.1.49 forward-
+//                     pointer doc cite is grep-able.
+//   H203 (skip-mode): iter-2-batched structural-N/A pin landed.  The
+//                     `forward_prefill_batched` fn signature in
+//                     forward_prefill_batched.rs is UNCHANGED (no
+//                     `slot_id` / `multi_seq_kv*` params).  The §6.1.49
+//                     forward-pointer doc cite is grep-able.
+//   H204 (skip-mode): per-slot byte isolation discipline preserved for
+//                     the orthogonal surfaces.  The slot-aware
+//                     orchestrators do NOT call `forward_embed_last` or
+//                     `forward_prefill_batched` — they route through
+//                     `forward_prefill_with_soft_tokens_slot_aware`
+//                     exclusively (H188 / H195 transitivity).
+//   H205 (skip-mode): SerialFifo byte-equivalence preserved.  Both
+//                     `forward_embed_last` AND `forward_prefill_batched`
+//                     STILL appear in their non-slot-aware engine.rs
+//                     call sites (engine.rs:6026 + :7802 + :12676).
+//   H206 (skip-mode): production-default surfaces UNCHANGED.  Qwen35 +
+//                     Qwen3VL orthogonal-fn surfaces unchanged (no
+//                     Qwen35-specific iter-2-embed / iter-2-batched
+//                     mention).  ADR-040 §6.1.49 closure block exists.
+
+#[cfg(test)]
+mod adr040_phase_b_iter_b4c_kernel_iter2_embed_batched_gemma4_tests {
+    // Skip-mode source-grep tests; intentionally NO `use super::*;`.
+
+    /// **H202 (skip-mode)** — iter-2-embed structural-N/A pin landed.
+    ///
+    /// (a) `forward_embed_last` fn signature in forward_prefill.rs is
+    ///     UNCHANGED: no `slot_id` / `multi_seq_kv*` params (mirror of
+    ///     H86 sibling-signature-unchanged discipline applied to the
+    ///     orthogonal embed surface).
+    /// (b) Doc-comment cite `iter-B4c-kernel iter-2-embed structural-N/A
+    ///     closure (2026-05-30, §6.1.49)` is grep-able in
+    ///     forward_prefill.rs (H87 forward-pointer discoverability).
+    /// (c) The label substring `iter-B4c-kernel-iter-2-embed per
+    ///     ADR-040 §6.1.49` is INTENTIONALLY NOT inside a
+    ///     `MultiSeqError::CapabilityUnsupported` constructor — the
+    ///     iter-2-embed surface has no typed deferral (the SlotId(N>0)
+    ///     Embed routing is the orchestrator `embed_gemma4_slot_aware`
+    ///     responsibility, NOT this fn's).
+    #[test]
+    fn h202_iter_2_embed_structural_na_pin_landed_in_forward_prefill_rs() {
+        let src = include_str!("../forward_prefill.rs");
+
+        // (a) Sibling fn signature unchanged: locate `pub fn forward_embed_last(`
+        // + extract the signature window up to `-> Result<Vec<f32>>` + assert
+        // no slot_id / multi_seq_kv tokens appear.
+        let fn_marker = "pub fn forward_embed_last(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H202: forward_embed_last signature not found");
+        let sig_end = src[fn_idx..]
+            .find("-> Result<Vec<f32>>")
+            .map(|off| fn_idx + off + "-> Result<Vec<f32>>".len())
+            .unwrap_or(fn_idx + 400);
+        let sig_window = &src[fn_idx..sig_end.min(src.len())];
+        assert!(
+            !sig_window.contains("slot_id"),
+            "H202 FALSIFIED: `forward_embed_last` signature contains \
+             `slot_id`. iter-2-embed structural-N/A discipline broken \
+             — this fn MUST remain non-slot-aware; SlotId(N>0) Embed \
+             routing is the orchestrator `embed_gemma4_slot_aware`'s \
+             responsibility per §6.1.36."
+        );
+        assert!(
+            !sig_window.contains("multi_seq_kv"),
+            "H202 FALSIFIED: `forward_embed_last` signature mentions \
+             `multi_seq_kv`. iter-2-embed structural-N/A discipline \
+             broken — this fn MUST NOT consume the multi-seq scaffold; \
+             that's the orchestrator's job."
+        );
+
+        // (b) Forward-pointer doc cite grep-able (H87 discipline).
+        let closure_cite =
+            "iter-B4c-kernel iter-2-embed structural-N/A closure (2026-05-30, §6.1.49)";
+        assert!(
+            src.contains(closure_cite),
+            "H202 FALSIFIED: forward_prefill.rs is missing the iter-2-embed \
+             closure cite `{closure_cite}`.  The structural-N/A finding is \
+             not discoverable to a future implementer who greps for \
+             `iter-2-embed per` — H87 discipline violated."
+        );
+        let short_label = "iter-B4c-kernel-iter-2-embed per ADR-040 §6.1.49";
+        assert!(
+            src.contains(short_label),
+            "H202 FALSIFIED: forward_prefill.rs is missing the short \
+             forward-pointer label `{short_label}`.  `grep \"iter-2-embed \
+             per\"` would not discover the closure block."
+        );
+
+        // (c) The label substring is NOT inside a typed CapabilityUnsupported
+        // constructor — pin the absence of the negative pattern.  iter-2-embed
+        // has no typed deferral; the only `iter-2-embed per` appearances are
+        // doc-comment cites.
+        assert!(
+            !src.contains(
+                "CapabilityUnsupported { capability: \"gemma4-forward-embed-last-slot-N (iter-B4c-kernel-iter-2-embed"
+            ),
+            "H202 FALSIFIED: forward_prefill.rs contains a typed \
+             `MultiSeqError::CapabilityUnsupported` for the iter-2-embed \
+             surface.  iter-2-embed is structural-N/A — there is no \
+             typed deferral to surface; the SlotId(N>0) Embed routing is \
+             `embed_gemma4_slot_aware` (§6.1.36) at the orchestrator \
+             layer above this fn."
+        );
+    }
+
+    /// **H203 (skip-mode)** — iter-2-batched structural-N/A pin landed.
+    ///
+    /// (a) `forward_prefill_batched` fn signature in
+    ///     forward_prefill_batched.rs is UNCHANGED: no `slot_id` /
+    ///     `multi_seq_kv*` params.
+    /// (b) Doc-comment cite `iter-B4c-kernel iter-2-batched
+    ///     structural-N/A closure (2026-05-30, §6.1.49)` is grep-able
+    ///     (H87 forward-pointer discoverability).
+    /// (c) The label substring `iter-B4c-kernel-iter-2-batched per
+    ///     ADR-040 §6.1.49` is INTENTIONALLY NOT inside a
+    ///     `MultiSeqError::CapabilityUnsupported` constructor.
+    #[test]
+    fn h203_iter_2_batched_structural_na_pin_landed_in_forward_prefill_batched_rs() {
+        let src = include_str!("../forward_prefill_batched.rs");
+
+        // (a) Sibling fn signature unchanged.
+        let fn_marker = "pub fn forward_prefill_batched(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H203: forward_prefill_batched signature not found");
+        let sig_end = src[fn_idx..]
+            .find("-> Result<u32>")
+            .map(|off| fn_idx + off + "-> Result<u32>".len())
+            .unwrap_or(fn_idx + 600);
+        let sig_window = &src[fn_idx..sig_end.min(src.len())];
+        assert!(
+            !sig_window.contains("slot_id"),
+            "H203 FALSIFIED: `forward_prefill_batched` signature contains \
+             `slot_id`. iter-2-batched structural-N/A discipline broken — \
+             this fn MUST remain non-slot-aware; the batched variant is \
+             orthogonal to per-request slot routing (HF2Q_SERVE_BATCHED_\
+             PREFILL gate; SerialFifo + SlotId(0) only)."
+        );
+        assert!(
+            !sig_window.contains("multi_seq_kv"),
+            "H203 FALSIFIED: `forward_prefill_batched` signature mentions \
+             `multi_seq_kv`. iter-2-batched structural-N/A discipline \
+             broken — this fn MUST NOT consume the multi-seq scaffold."
+        );
+
+        // (b) Forward-pointer doc cite grep-able (H87 discipline).
+        let closure_cite =
+            "iter-B4c-kernel iter-2-batched structural-N/A closure (2026-05-30, §6.1.49)";
+        assert!(
+            src.contains(closure_cite),
+            "H203 FALSIFIED: forward_prefill_batched.rs is missing the \
+             iter-2-batched closure cite `{closure_cite}`.  H87 discipline \
+             violated."
+        );
+        let short_label =
+            "iter-B4c-kernel-iter-2-batched per ADR-040 §6.1.49";
+        assert!(
+            src.contains(short_label),
+            "H203 FALSIFIED: forward_prefill_batched.rs is missing the \
+             short forward-pointer label `{short_label}`.  `grep \"iter-\
+             2-batched per\"` would not discover the closure block."
+        );
+
+        // (c) No typed CapabilityUnsupported for the iter-2-batched surface.
+        assert!(
+            !src.contains(
+                "CapabilityUnsupported { capability: \"gemma4-forward-prefill-batched-slot-N (iter-B4c-kernel-iter-2-batched"
+            ),
+            "H203 FALSIFIED: forward_prefill_batched.rs contains a typed \
+             `MultiSeqError::CapabilityUnsupported` for the iter-2-batched \
+             surface.  iter-2-batched is structural-N/A — the slot-aware \
+             orchestrators bypass this fn entirely (they call \
+             `forward_prefill_with_soft_tokens_slot_aware`)."
+        );
+    }
+
+    /// **H204 (skip-mode)** — per-slot byte isolation discipline
+    /// preserved for the orthogonal surfaces.
+    ///
+    /// (a) None of the 4 Gemma 4 slot-aware orchestrators
+    ///     (`generate_gemma4_once_slot_aware`,
+    ///     `generate_stream_gemma4_once_slot_aware`,
+    ///     `embed_gemma4_slot_aware`,
+    ///     `generate_gemma4_once_with_soft_tokens_slot_aware`) call
+    ///     `forward_embed_last` (mirror of H188 / H201 transitivity).
+    /// (b) None of the 4 slot-aware orchestrators call
+    ///     `forward_prefill_batched`.
+    ///
+    /// Note: this test must scan ONLY executable code lines (not doc
+    /// comments) — the slot-aware orchestrators carry copious doc-cites
+    /// mentioning `g.weights.forward_embed_last(&prompt_tokens, &mut
+    /// g.ctx)` as the legacy SerialFifo dispatch they SHORT-CIRCUIT
+    /// (see embed_gemma4_slot_aware docstring at engine.rs:9838).  The
+    /// test strips `///` doc-comment lines + `//` regular-comment lines
+    /// before checking for the bypass pattern, so the H87 forward-
+    /// pointer discoverability discipline is preserved.
+    #[test]
+    fn h204_slot_aware_orchestrators_bypass_orthogonal_fns() {
+        let src = include_str!("engine.rs");
+
+        for orchestrator_marker in [
+            "fn generate_gemma4_once_slot_aware(",
+            "fn generate_stream_gemma4_once_slot_aware(",
+            "fn embed_gemma4_slot_aware(",
+            "fn generate_gemma4_once_with_soft_tokens_slot_aware(",
+        ] {
+            let orch_idx = src.find(orchestrator_marker).unwrap_or_else(|| {
+                panic!("H204: slot-aware orchestrator `{orchestrator_marker}` not found");
+            });
+            // Find the orchestrator body's end by brace-matching from
+            // the opening `{` after the marker.  Falls back to a 75 KB
+            // window if the brace-match fails (defense-in-depth — should
+            // never engage at runtime per the well-formed source tree).
+            let body_start = src[orch_idx..]
+                .find('{')
+                .map(|off| orch_idx + off + 1)
+                .unwrap_or(orch_idx);
+            let body_end = {
+                let bytes = src.as_bytes();
+                let mut depth: i32 = 1;
+                let mut i = body_start;
+                while i < bytes.len() && depth > 0 {
+                    match bytes[i] {
+                        b'{' => depth += 1,
+                        b'}' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if depth == 0 { i } else { (orch_idx + 75_000).min(src.len()) }
+            };
+            let orch_window = &src[orch_idx..body_end.min(src.len())];
+
+            // Strip doc-comment + regular-comment lines so the source-grep
+            // checks only executable code.  H87 forward-pointer
+            // discoverability discipline is preserved (the cites in
+            // docstrings still appear in the raw source via the H202 / H203
+            // grep paths).
+            let code_only: String = orch_window
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with("///")
+                        && !trimmed.starts_with("//!")
+                        && !trimmed.starts_with("//")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // (a) MUST NOT call forward_embed_last on `.weights.` (which
+            // would mean it's bypassing embed_gemma4_slot_aware's
+            // forward_prefill_with_soft_tokens_slot_aware routing).
+            assert!(
+                !code_only.contains(".weights.forward_embed_last("),
+                "H204 FALSIFIED: orchestrator `{orchestrator_marker}` calls \
+                 `.weights.forward_embed_last(...)` — bypassing the \
+                 slot-aware routing through \
+                 `forward_prefill_with_soft_tokens_slot_aware`.  \
+                 iter-2-embed structural-N/A discipline broken; the \
+                 SlotId(N>0) embed path MUST route through \
+                 `embed_gemma4_slot_aware` per §6.1.36 (which calls \
+                 `forward_prefill_with_soft_tokens_slot_aware`, NOT \
+                 `forward_embed_last`)."
+            );
+
+            // (b) MUST NOT call forward_prefill_batched on `.weights.`.
+            assert!(
+                !code_only.contains(".forward_prefill_batched("),
+                "H204 FALSIFIED: orchestrator `{orchestrator_marker}` \
+                 calls `.forward_prefill_batched(...)` — bypassing the \
+                 slot-aware routing through \
+                 `forward_prefill_with_soft_tokens_slot_aware`.  \
+                 iter-2-batched structural-N/A discipline broken; the \
+                 batched variant is orthogonal to per-request slot \
+                 routing (SerialFifo / SlotId(0) only)."
+            );
+        }
+    }
+
+    /// **H205 (skip-mode)** — SerialFifo byte-equivalence preserved.
+    ///
+    /// Both `forward_embed_last` AND `forward_prefill_batched` STILL
+    /// appear in their non-slot-aware engine.rs call sites — the
+    /// SerialFifo / SlotId(0) production paths are untouched.
+    ///
+    /// (a) `g.weights.forward_embed_last(&prompt_tokens, &mut g.ctx)`
+    ///     call site at engine.rs:6026 STILL present (the legacy
+    ///     SerialFifo + SlotId(0) Embed dispatch — the `slot_id !=
+    ///     SlotId(0)` predicate at engine.rs:5845 short-circuits this
+    ///     for SlotAware + SlotId(N>0) only).
+    /// (b) `.forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut
+    ///     loaded.ctx)` call site at engine.rs:7802 + :12676 STILL
+    ///     present (the SerialFifo + SlotId(0) generate_once +
+    ///     generate_stream_once dispatch — the slot-aware orchestrators
+    ///     bypass these entirely).
+    #[test]
+    fn h205_serial_fifo_call_sites_preserved() {
+        let src = include_str!("engine.rs");
+
+        // (a) Legacy Embed dispatch preserved (the SerialFifo + SlotId(0)
+        // production code path).
+        assert!(
+            src.contains("g.weights.forward_embed_last(&prompt_tokens, &mut g.ctx)"),
+            "H205 FALSIFIED: engine.rs no longer contains the legacy \
+             SerialFifo + SlotId(0) Embed dispatch \
+             `g.weights.forward_embed_last(&prompt_tokens, &mut g.ctx)`. \
+             iter-2-embed accidentally regressed the non-slot-aware path."
+        );
+
+        // (b) Batched prefill dispatch preserved (both generate_once and
+        // generate_stream_once should still contain a forward_prefill_batched
+        // call).  At least 2 call sites are required (generate_once
+        // engine.rs:7802 + generate_stream_once engine.rs:12676).
+        let batched_call_count = src.matches(".forward_prefill_batched(").count();
+        assert!(
+            batched_call_count >= 2,
+            "H205 FALSIFIED: engine.rs has only {batched_call_count} \
+             call site(s) of `.forward_prefill_batched(` — expected ≥2 \
+             (generate_once + generate_stream_once).  iter-2-batched \
+             accidentally regressed the SerialFifo + SlotId(0) batched \
+             prefill dispatch."
+        );
+    }
+
+    /// **H206 (skip-mode)** — production-default surfaces UNCHANGED +
+    /// §6.1.49 closure block exists.
+    ///
+    /// (a) Qwen35 + Qwen3VL orthogonal-fn surfaces unchanged — the Qwen35
+    ///     architecture source files do NOT mention the Gemma-specific
+    ///     iter-2-embed / iter-2-batched labels (these are Gemma 4 only
+    ///     sub-deferrals on the iter-B4c-kernel arc).
+    /// (b) Qwen35 slot-aware fn surface UNCHANGED (mirror of H199 / H201
+    ///     transitivity).
+    /// (c) ADR-040 §6.1.49 closure block exists (the new closure block
+    ///     landing this iter — forward-pointer destination required for
+    ///     the H202 + H203 short-label cites).
+    /// (d) Surviving sub-deferral labels `iter-2-embed` + `iter-2-batched`
+    ///     in the ADR are MARKED SHIPPED (the §6.1.32 followups list +
+    ///     all subsequent closure blocks that historically said
+    ///     "(UNCHANGED from §6.1.32)" should now point at §6.1.49 for
+    ///     the SHIPPED status).
+    #[test]
+    fn h206_production_default_surfaces_unchanged_and_adr_closure_landed() {
+        let engine_src = include_str!("engine.rs");
+
+        // (a) Qwen35 architecture sources do NOT mention iter-2-embed /
+        // iter-2-batched (these are Gemma 4 only labels on the
+        // iter-B4c-kernel arc — iter-C2d-cont-kernel is the Qwen35 arc).
+        let qwen35_forward_gpu =
+            include_str!("../../inference/models/qwen35/forward_gpu.rs");
+        assert!(
+            !qwen35_forward_gpu.contains("iter-2-embed per ADR-040"),
+            "H206 FALSIFIED: Qwen35 forward_gpu.rs mentions \
+             `iter-2-embed per ADR-040`. The iter-2-embed scope is \
+             Gemma 4 only — Qwen35 architecture accidentally touched."
+        );
+        assert!(
+            !qwen35_forward_gpu.contains("iter-2-batched per ADR-040"),
+            "H206 FALSIFIED: Qwen35 forward_gpu.rs mentions \
+             `iter-2-batched per ADR-040`. The iter-2-batched scope is \
+             Gemma 4 only — Qwen35 architecture accidentally touched."
+        );
+
+        // (b) Qwen35 slot-aware fn surface STILL defined (mirror of
+        // H199 / H201).
+        for required in [
+            "generate_qwen35_once_slot_aware(",
+            "embed_qwen35_slot_aware(",
+        ] {
+            assert!(
+                engine_src.contains(required),
+                "H206 FALSIFIED: Qwen35 slot-aware fn `{required}` is \
+                 NOT present — iter-2-embed + iter-2-batched \
+                 accidentally regressed a Qwen35 lift."
+            );
+        }
+
+        // (c) ADR-040 §6.1.49 closure block exists.
+        let adr =
+            include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.49"),
+            "H206 FALSIFIED: ADR-040 §6.1.49 closure block not found. \
+             iter-2-embed + iter-2-batched sub-deferral cites point at \
+             a non-existent destination; H202 + H203 short-label cites \
+             would dangle."
+        );
+
+        // (d) iter-2-embed + iter-2-batched substrings still grep-able
+        // in ADR (forward-pointer discoverability — must remain even
+        // after SHIPPED).
+        assert!(
+            adr.contains("iter-2-embed"),
+            "H206 FALSIFIED: ADR-040 no longer mentions `iter-2-embed`. \
+             Historical scope-narrowing decision lost."
+        );
+        assert!(
+            adr.contains("iter-2-batched"),
+            "H206 FALSIFIED: ADR-040 no longer mentions \
+             `iter-2-batched`. Historical scope-narrowing decision lost."
+        );
+
+        // (e) §6.1.49 closure block names BOTH iter-2-embed AND
+        // iter-2-batched as SHIPPED structural-N/A — pin both
+        // substrings INSIDE the §6.1.49 block to defend against a
+        // partial-rename regression.
+        let section_idx = adr
+            .find("### 6.1.49")
+            .expect("H206 (e): ADR-040 §6.1.49 closure block missing");
+        // Section bounded by the next `### 6.1.` or end-of-file.
+        let section_end_rel = adr[section_idx + 10..]
+            .find("\n### ")
+            .unwrap_or(adr.len() - section_idx - 10);
+        let section_window =
+            &adr[section_idx..(section_idx + 10 + section_end_rel).min(adr.len())];
+        assert!(
+            section_window.contains("iter-2-embed"),
+            "H206 FALSIFIED: §6.1.49 closure block does NOT name \
+             `iter-2-embed` — the closure is incomplete."
+        );
+        assert!(
+            section_window.contains("iter-2-batched"),
+            "H206 FALSIFIED: §6.1.49 closure block does NOT name \
+             `iter-2-batched` — the closure is incomplete."
+        );
+        assert!(
+            section_window.contains("structural"),
+            "H206 FALSIFIED: §6.1.49 closure block does NOT contain \
+             the word `structural` — the structural-N/A finding is \
+             not declared."
+        );
+    }
+}
