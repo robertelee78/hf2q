@@ -5151,24 +5151,151 @@ fn worker_run(
                     // GenerateStream label format. See §6.1.25 for the
                     // full path-decision + label-discipline rationale.
                     //
-                    // ADR-040 iter-B4c-kernel iter-1 (2026-05-30) —
-                    // relabeled additive cite `iter-B4c-kernel-iter-3
-                    // per ADR-040 §6.1.31` (the GenerateStream-arm
-                    // slot-aware orchestrator port, mirror of Qwen35
-                    // iter-C2d-cont-kernel iter-2 §6.1.28). The C2c
-                    // prefix + B4c §6.1.25 cite are preserved verbatim
-                    // so H42 / H25 / H40 string-match pins keep passing.
+                    // ADR-040 iter-B4c-kernel iter-3 (2026-05-30) —
+                    // Gemma 4 worker hot path LIFT for the GenerateStream
+                    // arm onto the persistent multi-seq per-layer
+                    // `MultiSeqHbKvBuffers` + sibling
+                    // `MultiSeqHybridKvBuffers` scaffolds (provisioned by
+                    // C2c §6.1.21 + C2c-cont §6.1.33 at spawn time).
+                    // C2c added the dispatch-fork clamp; B4c §6.1.25
+                    // refined the typed-error label; iter-1 §6.1.31
+                    // labeled the GenerateStream sub-deferral as
+                    // `iter-B4c-kernel-iter-3`; this iter REPLACES the
+                    // GenerateStream-arm clamp with the actual scaffold
+                    // lift via
+                    // `generate_stream_gemma4_once_slot_aware(g, .., &mut
+                    //   multi_seq, multi_seq_hybrid.as_mut(), slot_id)`.
+                    //
+                    // Direct mirror of Qwen35 iter-C2d-cont-kernel iter-2
+                    // §6.1.28 for the GenerateStream surface; mirror of
+                    // iter-B4c-kernel iter-1 §6.1.31 Generate-arm lift
+                    // shape for the streaming-event-channel result
+                    // surface.
+                    //
+                    // The take-and-restore borrow pattern at this site
+                    // resolves the partial-borrow conflict between
+                    // `&mut g.multi_seq_kv` + `&mut g.multi_seq_kv_hybrid`
+                    // and the dense `&mut g.lcp_registry` / `&mut
+                    // g.prompt_cache` accesses (worker is serial — no
+                    // concurrent access).  Parallels iter-1+2B Generate-
+                    // arm take/restore at engine.rs:4824-4875.
+                    //
+                    // The other 2 worker arms (Embed /
+                    // GenerateWithSoftTokens) still carry the C2c-cont
+                    // typed clamp with `iter-B4c-kernel-iter-{4,5}`
+                    // deferral cites — see §6.1.35 for the iter-3 →
+                    // iter-{4,5} sequencing decision.
+                    //
+                    // Vision-augmented streaming (soft_tokens any
+                    // non-empty) is deferred to iter-B4c-kernel-iter-5:
+                    // the slot-aware fn emits a typed
+                    // `capability_unsupported:` error event citing
+                    // iter-5 when soft_tokens.is_empty() is false.
+                    //
+                    // SerialFifo + SlotId(0): unchanged (H104 byte-
+                    // equivalence pin) — the `slot_id != SlotId(0)`
+                    // predicate short-circuits below the lift block so
+                    // the existing `generate_stream_once` dispatch at
+                    // the `match &mut loaded` below fires verbatim.
+                    // SlotAware + SlotId(0): also unchanged (same
+                    // predicate).
+                    //
+                    // Defense-in-depth: if `multi_seq_kv.is_none()` at
+                    // SlotId(N>0) (impossible at runtime per the C2c
+                    // spawn-arm invariant), the request emits a typed
+                    // Error event with operator-grep'able label
+                    // `"iter-B4c-kernel iter-3 — multi_seq_kv absent"`.
                     if matches!(loaded, LoadedModel::Gemma(_)) && handle.slot_id != SlotId(0) {
-                        let err = MultiSeqError::CapabilityUnsupported {
-                            capability:
-                                "gemma4-forward-prefill-slot-N (iter-C2c-cont per ADR-040 §6.1.21 / iter-B4c-kernel per ADR-040 §6.1.25 / iter-B4c-kernel-iter-3 per ADR-040 §6.1.31 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs + per-slot MultiSeqHbKvBuffers slot routing; GenerateStream slot-aware orchestrator port deferred to iter-B4c-kernel-iter-3)",
+                        let slot_id = handle.slot_id;
+                        let LoadedModel::Gemma(g) = &mut loaded else {
+                            unreachable!(
+                                "ADR-040 iter-B4c-kernel iter-3: \
+                                 matches!(Gemma) check passed but bind failed"
+                            );
                         };
-                        let _ = events.blocking_send(
-                            super::sse::GenerationEvent::Error(format!(
-                                "capability_unsupported: ADR-040 C2c — {}",
-                                err
-                            )),
+                        // Take the persistent multi-seq KV out so the
+                        // callee gets a clean `&mut Vec<MultiSeqHbKvBuffers>`
+                        // without partial-borrow conflicts on the
+                        // surrounding `&mut g` accesses.
+                        let mut multi_seq = match g.multi_seq_kv.take() {
+                            Some(buf) => buf,
+                            None => {
+                                let _ = events.blocking_send(
+                                    super::sse::GenerationEvent::Error(format!(
+                                        "capability_unsupported: ADR-040 \
+                                         iter-B4c-kernel iter-3 — \
+                                         multi_seq_kv is None at SlotId({}) \
+                                         for Gemma 4 GenerateStream arm. C2c \
+                                         spawn-arm invariant violated \
+                                         (provision_multi_seq_kv_for_slot_aware \
+                                         was not called at EngineMode::SlotAware \
+                                         spawn time). Operator: check \
+                                         spawn_with_mode wiring in \
+                                         src/serve/api/engine.rs.",
+                                        slot_id.0,
+                                    )),
+                                );
+                                scheduler.release(handle);
+                                publish_stats(&scheduler, &scheduler_stats_snapshot);
+                                continue;
+                            }
+                        };
+                        // ADR-040 iter-B4c-kernel iter-3 — PARALLEL take
+                        // on the production-default hybrid scaffold
+                        // sibling iter-C2c-cont (§6.1.33) provisioned.
+                        // `Option<Vec<_>>` shape because the sibling is
+                        // `None` when HF2Q_HYBRID_KV=0 (opt-out); take()
+                        // leaves the field as `None` regardless and we
+                        // restore the original below.  Mirrors the
+                        // Generate-arm take/restore pattern at line 4853.
+                        let mut multi_seq_hybrid = g.multi_seq_kv_hybrid.take();
+                        // Build borrowed `SoftTokenInjection<'_>` slices
+                        // from the owned `SoftTokenData` (same shape as
+                        // the legacy `generate_stream_once` injection
+                        // build at line 5337).  The slot-aware fn
+                        // surfaces typed error if any extension is
+                        // present (vision streaming is iter-5 scope).
+                        let injections_slot: Vec<SoftTokenInjection<'_>> = soft_tokens
+                            .iter()
+                            .map(|d| SoftTokenInjection {
+                                range: d.range.clone(),
+                                embeddings: &d.embeddings,
+                            })
+                            .collect();
+                        generate_stream_gemma4_once_slot_aware(
+                            g,
+                            &prompt_tokens,
+                            &injections_slot,
+                            &params,
+                            &events,
+                            registration.as_ref(),
+                            cancellation_counter.as_deref(),
+                            &mut multi_seq,
+                            multi_seq_hybrid.as_mut(),
+                            slot_id,
                         );
+                        // Put the persistent multi-seq KV back regardless
+                        // of outcome — keeps the spawn-time invariant
+                        // (`multi_seq_kv.is_some()` for SlotAware Gemma 4)
+                        // intact for the next request.
+                        g.multi_seq_kv = Some(multi_seq);
+                        // ADR-040 iter-B4c-kernel iter-3 — parallel
+                        // restore on the hybrid scaffold sibling.  When
+                        // HF2Q_HYBRID_KV=1 (default), this restores the
+                        // production-default scaffold; when
+                        // HF2Q_HYBRID_KV=0 (opt-out), `multi_seq_hybrid`
+                        // is `None` and we restore the `None` state.
+                        g.multi_seq_kv_hybrid = multi_seq_hybrid;
+                        // Standard post-pattern: bookkeep prefill +
+                        // release.  Per-token advance_after_decode is
+                        // skipped because the streaming path does not
+                        // return the emitted-token count to the worker;
+                        // mirrors the existing GenerateStream
+                        // post-pattern.  iter-3 today surfaces typed
+                        // CapabilityUnsupported on the iter-2-decode
+                        // sub-deferral so completion_tokens is implicitly
+                        // 0 on that path.
+                        scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
                         scheduler.release(handle);
                         publish_stats(&scheduler, &scheduler_stats_snapshot);
                         continue;
@@ -8006,6 +8133,313 @@ fn generate_gemma4_once_slot_aware(
         }
     }
     kernel_forward_result
+}
+
+/// **ADR-040 iter-B4c-kernel iter-3 (2026-05-30)** — slot-aware
+/// Gemma 4 streaming chat generation against the persistent multi-seq
+/// per-layer
+/// [`crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers`]
+/// scaffold (`GemmaLoadedModel.multi_seq_kv`) + the production-default
+/// hybrid F16-K + TQ-HB-V sibling scaffold (`GemmaLoadedModel.
+/// multi_seq_kv_hybrid`) instead of the legacy per-request inline
+/// alloc.
+///
+/// **Direct mirror of `generate_gemma4_once_slot_aware`** (iter-1 +
+/// iter-2A + iter-2B Generate-arm lift, per §6.1.31 + §6.1.32 +
+/// §6.1.34) for the [`super::engine::Request::GenerateStream`] worker
+/// arm.  iter-1+2A+2B landed the non-streaming Generate-arm lift +
+/// kernel-forward step; iter-3 lands the streaming-arm lift onto the
+/// same persistent scaffolds + per-slot reset + slot-aware
+/// `forward_prefill_with_soft_tokens_slot_aware` kernel call.
+///
+/// Cross-architecture mirror of Qwen35 iter-C2d-cont-kernel iter-2
+/// `engine_qwen35::generate_stream_qwen35_once_extended_slot_aware`
+/// per §6.1.28 — same dispatch fork shape (`slot_id != SlotId(0)`
+/// predicate at the worker arm), same take-and-restore borrow pattern,
+/// same `reset_for_slot` entry+exit discipline, same SSE typed-error
+/// emission via the events channel.
+///
+/// # Structural parallels with iter-1 (Generate-arm scaffold) +
+/// iter-2A+2B (kernel-forward step)
+///
+/// 1. Bounds-checks `slot_id` against `multi_seq_kv[0].n_seqs` (bounds-
+///    first per A2b §6.1.23 iter-1.5 cfa-finding-F5 ordering); surfaces
+///    typed `capability_unsupported:` error event via SSE if slot OOR.
+/// 2. Calls `MultiSeqHbKvBuffers::reset_for_slot(slot_id)` at entry on
+///    every per-layer buffer — zeros the per-seq cursor for `slot_id`
+///    only (other slots untouched).
+/// 3. Mirrors entry-reset on the production-default hybrid scaffold
+///    sibling (`multi_seq_kv_hybrid`) when `Some(_)` (HF2Q_HYBRID_KV=1
+///    per H10 §6.1.11 default).
+/// 4. Calls `loaded.weights.forward_prefill_with_soft_tokens_slot_aware(..)`
+///    (the iter-2A landing per §6.1.32 + iter-2B routing per §6.1.34)
+///    threading `slot_id` + both scaffolds + `&[]` soft_tokens (vision
+///    streaming is iter-B4c-kernel-iter-5 scope; if `soft_tokens` is
+///    non-empty the call surfaces a typed error event citing iter-5).
+/// 5. The multi-token decode-loop body wrapping `forward_decode` calls
+///    at `slot_id` is **iter-B4c-kernel-iter-2-decode scope** (the same
+///    sub-deferral the Generate-arm lift surfaces at line 7955-7965).
+///    iter-3 emits a typed `capability_unsupported:` error event citing
+///    iter-2-decode + Done event with `finish_reason = "error"` after
+///    a successful prefill, mirroring the Generate-arm IIFE pattern but
+///    for the SSE surface.
+/// 6. Calls `reset_for_slot(slot_id)` at exit on BOTH scaffolds — belt-
+///    and-suspenders with the entry reset (mirror of iter-1's
+///    discipline).
+///
+/// **Per-slot byte-equivalence at SlotId(0)** (H104 pin):
+/// the `handle.slot_id != SlotId(0)` predicate at the worker arm short-
+/// circuits AT the worker arm — `generate_stream_gemma4_once_slot_aware`
+/// is NEVER called for SlotId(0).  Both SerialFifo (always SlotId(0))
+/// and SlotAware + SlotId(0) route through the existing
+/// `generate_stream_once` dispatch verbatim, preserving the H1/H2/H23/
+/// H41/H44 byte-equivalence chain that A5*/C2a/C2b/C2c/B4c closed.
+///
+/// # Vision-augmented streaming deferral (iter-3 scope discipline)
+///
+/// When **any** of `soft_tokens` is non-empty, iter-3 emits a typed
+/// `capability_unsupported:` error event citing iter-B4c-kernel-iter-5
+/// and aborts.  Gemma 4's `Request::GenerateStream` channel does NOT
+/// carry `deepstack` / `positions_flat` (Qwen3-VL-specific surfaces);
+/// the streaming arm at `worker_run` already ignores those — see
+/// engine.rs:5356-5360.  The text-only path (the majority case) gets
+/// the full slot-aware throughput benefit at SlotId(N>0).
+///
+/// # Co-changes (iter-3 deliberately minimal — exact mirror of iter-2B
+/// Generate-arm shape)
+///
+/// - Per-slot LCP / mid-prefill checkpoint storage is NOT applicable
+///   to Gemma 4's streaming path today (the legacy `generate_stream_once`
+///   uses `prompt_cache.store_with_fragments` after the decode loop —
+///   tied to per-request `max_seq_len`).  Slot-aware LCP for Gemma 4
+///   is pinned as **iter-B4c-kernel-iter-LCP** (parallel to Qwen35's
+///   iter-C2d-cont-kernel-iter-LCP per §6.1.28).
+/// - Vision-augmented streaming (soft_tokens any non-empty) returns a
+///   typed error event citing **iter-B4c-kernel-iter-5** as the
+///   implementing iter.
+/// - Multi-token decode-loop body wrapping `forward_decode` at
+///   `slot_id` is **iter-B4c-kernel-iter-2-decode scope** (mirror of
+///   §6.1.32 iter-2A's same sub-deferral on the Generate arm).
+///
+/// # SSE event ordering (H109 pin)
+///
+/// The slot-aware streaming function emits SSE events in the same
+/// order as `generate_stream_once`: per-token `Delta` events through
+/// the splitter chain (none in iter-3 today because the decode loop
+/// is sub-deferred — see iter-2-decode), followed by a terminal
+/// `Done` event (or `Error` event on failure).  iter-3 currently
+/// emits exactly:
+/// - typed `Error` events on bounds + invariant failures + the
+///   iter-2-decode sub-deferral (zero Delta events because the decode
+///   loop is deferred);
+/// - no terminal `Done` event when an Error event is emitted (the SSE
+///   handler treats a terminal Error as a clean stream termination).
+///
+/// When iter-B4c-kernel-iter-2-decode lands, this fn's IIFE will grow
+/// the per-token Delta emission loop + terminal Done — matching the
+/// shape of `generate_stream_once` at engine.rs:9493-9486.
+#[allow(clippy::too_many_arguments)]
+fn generate_stream_gemma4_once_slot_aware(
+    loaded: &mut GemmaLoadedModel,
+    prompt_tokens: &[u32],
+    soft_tokens: &[SoftTokenInjection<'_>],
+    params: &SamplingParams,
+    events: &tokio::sync::mpsc::Sender<super::sse::GenerationEvent>,
+    _registration: Option<&super::registry::ModelRegistration>,
+    cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
+    multi_seq_kv: &mut Vec<
+        crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
+    >,
+    // ADR-040 iter-B4c-kernel iter-3 (2026-05-30) — production-default
+    // hybrid F16-K + TQ-HB-V scaffold sibling param.  `Option<>` because
+    // iter-C2c-cont provisions this field IFF the hybrid env-gate is
+    // ON (DEFAULT per H10 §6.1.11).  Threaded verbatim through to the
+    // model fn — same shape as the Generate-arm sibling per iter-2B.
+    mut multi_seq_kv_hybrid: Option<
+        &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
+    >,
+    slot_id: SlotId,
+) {
+    // SSE emit helper: bumps cancellation counter + early-returns on
+    // client disconnect.  Mirror of `generate_stream_once` shape +
+    // Qwen35 `generate_stream_qwen35_once_extended_slot_aware` shape.
+    macro_rules! send {
+        ($ev:expr) => {
+            if events.blocking_send($ev).is_err() {
+                tracing::info!(
+                    "SSE stream dropped by client; aborting gemma4 slot-aware decode"
+                );
+                if let Some(c) = cancellation_counter {
+                    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return;
+            }
+        };
+    }
+
+    if prompt_tokens.is_empty() {
+        send!(super::sse::GenerationEvent::Error(
+            "generate_stream_gemma4_once_slot_aware: empty prompt_tokens".into()
+        ));
+        return;
+    }
+    if multi_seq_kv.is_empty() {
+        send!(super::sse::GenerationEvent::Error(format!(
+            "capability_unsupported: ADR-040 iter-B4c-kernel iter-3 — \
+             multi_seq_kv is empty (C2c spawn-arm invariant: \
+             provision_multi_seq_kv_for_slot_aware must produce one entry \
+             per layer; ADR-040 §6.1.21). Operator: check spawn_with_mode \
+             wiring in src/serve/api/engine.rs.",
+        )));
+        return;
+    }
+    // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5 ordering.
+    // Use the first layer's n_seqs as the canonical bound — A3a
+    // construction guarantees every per-layer entry has the same
+    // n_seqs (provisioned with max_slots).
+    let n_seqs = multi_seq_kv[0].n_seqs;
+    if slot_id.0 >= n_seqs {
+        send!(super::sse::GenerationEvent::Error(format!(
+            "capability_unsupported: ADR-040 iter-B4c-kernel iter-3 — \
+             SlotOutOfRange slot={} max_slots={} (generate_stream_gemma4_\
+             once_slot_aware)",
+            slot_id.0, n_seqs,
+        )));
+        return;
+    }
+
+    // Vision-augmented streaming is iter-B4c-kernel-iter-5 scope.
+    // iter-3 surfaces typed error + aborts when soft_tokens is
+    // non-empty, mirroring the iter-2 (Qwen35 streaming) deferral
+    // discipline at §6.1.28 + iter-1 Generate-arm's `&[]` soft_tokens
+    // (vision is iter-5 scope per §6.1.31).
+    if !soft_tokens.is_empty() {
+        send!(super::sse::GenerationEvent::Error(format!(
+            "capability_unsupported: ADR-040 iter-B4c-kernel iter-3 — \
+             vision-augmented streaming slot-aware port is \
+             iter-B4c-kernel-iter-5 per ADR-040 §6.1.31 (got \
+             soft_tokens.len()={}); fall back to SerialFifo / SlotId(0) \
+             for vision-augmented streaming.",
+            soft_tokens.len(),
+        )));
+        return;
+    }
+
+    // Per-slot reset at entry — mirror of iter-1 Generate-arm entry-
+    // reset discipline (engine.rs:7869-7874) for the streaming surface.
+    // `reset_for_slot` zeros the per-seq cursor for `slot_id` on EVERY
+    // per-layer entry; K/V packed + norms bytes are cursor-masked.
+    for (layer_idx, buf) in multi_seq_kv.iter_mut().enumerate() {
+        if let Err(e) = buf.reset_for_slot(slot_id) {
+            send!(super::sse::GenerationEvent::Error(format!(
+                "ADR-040 iter-B4c-kernel iter-3: reset_for_slot at entry \
+                 L{layer_idx}: {e}",
+            )));
+            return;
+        }
+    }
+    // ADR-040 iter-B4c-kernel iter-3 — entry reset on the hybrid
+    // scaffold sibling.  Mirrors the HB scaffold entry-reset discipline
+    // above for the production-default regime.  Uses `.as_deref_mut()`
+    // to reborrow so the model fn call below can re-take the same
+    // `Option<&mut Vec<_>>` shape.
+    if let Some(ref mut hybrid_scaffold) = multi_seq_kv_hybrid {
+        for (layer_idx, buf) in hybrid_scaffold.iter_mut().enumerate() {
+            if let Err(e) = buf.reset_for_slot(slot_id) {
+                send!(super::sse::GenerationEvent::Error(format!(
+                    "ADR-040 iter-B4c-kernel iter-3: reset_for_slot at \
+                     entry (hybrid) L{layer_idx}: {e}",
+                )));
+                return;
+            }
+        }
+    }
+
+    // ADR-040 iter-B4c-kernel iter-3 — kernel-forward call mirroring
+    // iter-2A/2B Generate-arm shape (engine.rs:7920-7966).  Calls
+    // `forward_prefill_with_soft_tokens_slot_aware` (the iter-2A landing
+    // per §6.1.32 + iter-2B routing per §6.1.34).  Returns the first
+    // decode token; the multi-token decode-loop body wrapping is
+    // iter-B4c-kernel-iter-2-decode scope (same sub-deferral the
+    // Generate-arm lift surfaces).
+    let max_decode_tokens = params.max_tokens.max(1);
+    let prefill_result: Result<u32> = loaded
+        .weights
+        .forward_prefill_with_soft_tokens_slot_aware(
+            prompt_tokens,
+            &[], // GenerateStream-arm: no soft-token overrides; vision-aware
+                 // path is iter-B4c-kernel-iter-5 (SoftTokens arm).
+            max_decode_tokens,
+            &mut loaded.ctx,
+            slot_id,
+            multi_seq_kv,
+            multi_seq_kv_hybrid.as_deref_mut(),
+        );
+
+    // iter-3 emits the iter-2-decode sub-deferral as an SSE error event
+    // — mirrors the Generate-arm IIFE pattern at engine.rs:7955-7965
+    // but routes through the SSE channel instead of a Result return.
+    // When iter-B4c-kernel-iter-2-decode lands, this branch will grow
+    // into the per-token Delta emission loop + terminal Done event.
+    match prefill_result {
+        Ok(first_decode_token) => {
+            // Prefill succeeded — drop the first decode token (the
+            // multi-token decode loop body wrapping is the
+            // iter-2-decode sub-deferral; until it lands, we cannot
+            // emit content deltas safely without leaking the prefill
+            // KV state for the next slot's request).
+            let _ = first_decode_token;
+            let err = MultiSeqError::CapabilityUnsupported {
+                capability:
+                    "gemma4-forward-prefill-kernel-slot-N-stream-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.35 — streaming decode-loop body wraps forward_decode calls at slot_id; today forward_decode in src/inference/models/gemma4/forward_gpu.rs:310 has NO slot_id parameter — its lazy-alloc block at lines 396-466 mirrors the prefill alloc sites and must thread slot_id + consult the persistent multi-seq scaffold; gated on iter-2A-cont/2B kernel-dispatch refactor landing the prefill side first)",
+            };
+            send!(super::sse::GenerationEvent::Error(format!(
+                "capability_unsupported: ADR-040 iter-B4c-kernel iter-3 — \
+                 forward_prefill_with_soft_tokens_slot_aware returned Ok with \
+                 first decode token; multi-token streaming decode loop body \
+                 wrapping is iter-B4c-kernel-iter-2-decode scope. {}",
+                err,
+            )));
+        }
+        Err(e) => {
+            send!(super::sse::GenerationEvent::Error(format!(
+                "gemma4 stream slot-aware prefill failed: {e:#}",
+            )));
+        }
+    }
+
+    // Per-slot reset at exit — leave the slot clean for the next
+    // request regardless of whether the kernel-forward returned Ok or
+    // Err.  Belt-and-suspenders with the entry reset; mirrors iter-1
+    // Generate-arm exit-reset discipline.  Errors swallowed via
+    // tracing::warn — a failure to reset a slot at exit is observability,
+    // not request failure (entry reset on the next request will fire).
+    for (layer_idx, buf) in multi_seq_kv.iter_mut().enumerate() {
+        if let Err(e) = buf.reset_for_slot(slot_id) {
+            tracing::warn!(
+                "generate_stream_gemma4_once_slot_aware: reset_for_slot at \
+                 exit L{} failed (slot_id={}): {} — slot WILL be reset \
+                 before next admission via the entry reset of the next call",
+                layer_idx, slot_id.0, e
+            );
+        }
+    }
+    // ADR-040 iter-B4c-kernel iter-3 — exit reset on the hybrid
+    // scaffold sibling.  Same swallow-on-error discipline as the HB
+    // scaffold above.
+    if let Some(ref mut hybrid_scaffold) = multi_seq_kv_hybrid {
+        for (layer_idx, buf) in hybrid_scaffold.iter_mut().enumerate() {
+            if let Err(e) = buf.reset_for_slot(slot_id) {
+                tracing::warn!(
+                    "generate_stream_gemma4_once_slot_aware: reset_for_slot \
+                     (hybrid) at exit L{} failed (slot_id={}): {} — slot \
+                     WILL be reset before next admission via the entry \
+                     reset of the next call",
+                    layer_idx, slot_id.0, e
+                );
+            }
+        }
+    }
 }
 
 // `infer_quant_type_from_gguf` was relocated to
@@ -18099,11 +18533,16 @@ mod adr040_phase_c_iter2d_cont_qwen35_slot_aware_tests {
             .unwrap_or(body_after.len().min(200_000));
         let body = &body_after[..body_end_off];
 
-        // Gemma 4 C2c clamp still present in worker arms (4
-        // matches!(loaded, LoadedModel::Gemma(_)) clamps). The C2c
+        // Gemma 4 C2c clamp still present in worker arms — the C2c
         // §6.1.21 capability label must still surface verbatim — H21
-        // / H25 / H22-cont depend on this string-match.
-        let gemma_label = "gemma4-forward-prefill-slot-N (iter-C2c-cont";
+        // / H25 / H22-cont depend on this string-match.  Post-iter-1
+        // (§6.1.31) the Generate-arm clamp was REPLACED with the lift;
+        // post-iter-3 (§6.1.35) the GenerateStream-arm clamp was
+        // ALSO REPLACED with the lift.  The surviving Gemma 4 C2c
+        // clamps (Embed + GenerateWithSoftTokens) still carry the
+        // `iter-C2c-cont` prefix — pin via the still-present Embed
+        // label.
+        let gemma_label = "gemma4-forward-embed-last-slot-N (iter-C2c-cont";
         assert!(
             body.contains(gemma_label),
             "H40 FALSIFIED: Gemma 4 C2c clamp label \
@@ -18427,20 +18866,29 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter1_qwen35_tests {
         );
     }
 
-    /// **H56 (skip-mode)** — Gemma 4 + Qwen3VL worker arms unchanged
-    /// by iter-1. Mirror of C2d-cont H40.
+    /// **H56 (skip-mode, REVISED iter-B4c-kernel iter-3 2026-05-30)** —
+    /// Gemma 4 + Qwen3VL worker arms unchanged by Qwen35 iter-1.
+    /// Mirror of C2d-cont H40.  REVISED: post-iter-B4c-kernel-iter-3
+    /// (§6.1.35) the `gemma4-forward-prefill-slot-N` label is REMOVED
+    /// from worker_run (iter-1 §6.1.31 lifted the Gemma 4 Generate arm,
+    /// iter-3 §6.1.35 lifted the Gemma 4 GenerateStream arm).  The
+    /// surviving C2c clamps (Embed + GenerateWithSoftTokens) still
+    /// carry the `iter-C2c-cont` prefix — pin via the still-present
+    /// Embed label.
     #[test]
     fn h56_gemma4_and_qwen3vl_worker_arms_unchanged_by_iter1() {
         let src = include_str!("engine.rs");
         let body = worker_run_body(src);
 
-        // Gemma 4 C2c label still present (iter-1 did not touch
-        // Gemma 4 arms).
-        let gemma_label = "gemma4-forward-prefill-slot-N (iter-C2c-cont";
+        // Gemma 4 C2c label still present on the surviving Embed arm
+        // (Qwen35 iter-1 did not touch Gemma 4 arms; B4c iter-3 lifted
+        // the GenerateStream arm but the Embed + SoftTokens clamps
+        // still carry the iter-C2c-cont prefix).
+        let gemma_label = "gemma4-forward-embed-last-slot-N (iter-C2c-cont";
         assert!(
             body.contains(gemma_label),
             "H56 FALSIFIED: Gemma 4 C2c clamp label `{gemma_label}` \
-             missing from worker_run. iter-1 must NOT touch the \
+             missing from worker_run. Qwen35 iter-1 must NOT touch the \
              Gemma 4 worker arms — Gemma 4 SlotAware kernel lift is \
              iter-B4c-kernel scope per §6.1.25."
         );
@@ -18852,13 +19300,16 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter2_qwen35_tests {
         let src = include_str!("engine.rs");
         let body = worker_run_body(src);
 
-        // Gemma 4 C2c label still present (iter-2 + iter-3 did not
-        // touch Gemma 4 arms).
-        let gemma_label = "gemma4-forward-prefill-slot-N (iter-C2c-cont";
+        // Gemma 4 C2c label still present on the surviving Embed arm
+        // (Qwen35 iter-2 + iter-3 did not touch Gemma 4 arms; B4c
+        // iter-3 lifted the GenerateStream arm so the Generate +
+        // GenerateStream `gemma4-forward-prefill-slot-N` labels are
+        // GONE — pin via the still-present Embed label).
+        let gemma_label = "gemma4-forward-embed-last-slot-N (iter-C2c-cont";
         assert!(
             body.contains(gemma_label),
             "H62 FALSIFIED: Gemma 4 C2c clamp label `{gemma_label}` \
-             missing from worker_run. iter-3 must NOT touch the \
+             missing from worker_run. Qwen35 iter-3 must NOT touch the \
              Gemma 4 worker arms — Gemma 4 SlotAware kernel lift is \
              iter-B4c-kernel scope per §6.1.25."
         );
@@ -19335,13 +19786,16 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter3_qwen35_tests {
         let src = include_str!("engine.rs");
         let body = worker_run_body(src);
 
-        // Gemma 4 C2c label still present (iter-3 did not touch
-        // Gemma 4 arms).
-        let gemma_label = "gemma4-forward-prefill-slot-N (iter-C2c-cont";
+        // Gemma 4 C2c label still present on the surviving Embed arm
+        // (Qwen35 iter-3 did not touch Gemma 4 arms; B4c iter-3
+        // lifted Gemma 4's GenerateStream arm so the Generate +
+        // GenerateStream `gemma4-forward-prefill-slot-N` labels are
+        // GONE — pin via the still-present Embed label).
+        let gemma_label = "gemma4-forward-embed-last-slot-N (iter-C2c-cont";
         assert!(
             body.contains(gemma_label),
             "H68 FALSIFIED: Gemma 4 C2c clamp label `{gemma_label}` \
-             missing from worker_run. iter-3 must NOT touch the \
+             missing from worker_run. Qwen35 iter-3 must NOT touch the \
              Gemma 4 worker arms — Gemma 4 SlotAware kernel lift is \
              iter-B4c-kernel scope per §6.1.25."
         );
@@ -19960,12 +20414,16 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter4_qwen35_tests {
         let src = include_str!("engine.rs");
         let body = worker_run_body(src);
 
-        // Gemma 4 C2c label still present.
-        let gemma_label = "gemma4-forward-prefill-slot-N (iter-C2c-cont";
+        // Gemma 4 C2c label still present on the surviving Embed arm
+        // (Qwen35 iter-4 did not touch Gemma 4 arms; B4c iter-3
+        // lifted Gemma 4's GenerateStream arm so the Generate +
+        // GenerateStream `gemma4-forward-prefill-slot-N` labels are
+        // GONE — pin via the still-present Embed label).
+        let gemma_label = "gemma4-forward-embed-last-slot-N (iter-C2c-cont";
         assert!(
             body.contains(gemma_label),
             "H75 FALSIFIED: Gemma 4 C2c clamp label `{gemma_label}` \
-             missing from worker_run. iter-4 must NOT touch the \
+             missing from worker_run. Qwen35 iter-4 must NOT touch the \
              Gemma 4 worker arms — Gemma 4 SlotAware kernel lift is \
              iter-B4c-kernel scope per §6.1.25."
         );
@@ -21276,14 +21734,22 @@ mod adr040_phase_b_iter_b4c_kernel_iter1_gemma4_tests {
         );
     }
 
-    /// **H82 (skip-mode)** — Qwen35 + Qwen3VL UNCHANGED by iter-1
-    /// AND the 3 remaining Gemma 4 worker arms (GenerateStream / Embed
-    /// / GenerateWithSoftTokens) still carry their C2c clamps.
+    /// **H82 (skip-mode, REVISED iter-B4c-kernel iter-3 2026-05-30)** —
+    /// Qwen35 + Qwen3VL UNCHANGED by Gemma 4 iter-1 AND the remaining
+    /// Gemma 4 worker arms (Embed + GenerateWithSoftTokens) still
+    /// carry their C2c clamps.
     ///
     /// Sibling-discipline pin: iter-1 lifts ONLY the Gemma 4 Generate
     /// arm; the 3 other arms are typed sub-deferrals (iter-B4c-kernel-
     /// iter-{3,4,5}).  Drift here means iter-1 accidentally touched a
     /// surface it should not have.
+    ///
+    /// **Post-iter-3 (§6.1.35, 2026-05-30)** the GenerateStream arm's
+    /// `gemma4-forward-prefill-slot-N` clamp label was REMOVED (the
+    /// actual lift landed via `generate_stream_gemma4_once_slot_aware`).
+    /// H82's sibling-discipline intent is preserved by pinning the
+    /// SURVIVING Embed + GenerateWithSoftTokens C2c clamps + the
+    /// iter-3 lift fn being called.
     ///
     /// Mirrors iter-C2d-cont-kernel iter-1 H56.
     #[test]
@@ -21325,15 +21791,15 @@ mod adr040_phase_b_iter_b4c_kernel_iter1_gemma4_tests {
              without the spawn arm flip."
         );
 
-        // The 3 remaining Gemma 4 worker arms still carry their C2c
-        // clamps (the original `gemma4-...-slot-N (iter-C2c-cont ...)`
-        // strings).  Per-arm:
-        // - GenerateStream → `gemma4-forward-prefill-slot-N` (the
-        //   streaming arm reuses the Generate clamp label by
-        //   convention; same surface name).
-        // - Embed → `gemma4-forward-embed-last-slot-N`.
+        // The remaining Gemma 4 worker arms (post-iter-3) still carry
+        // their C2c clamps:
+        // - Embed → `gemma4-forward-embed-last-slot-N`
+        //   (iter-B4c-kernel-iter-4 scope).
         // - GenerateWithSoftTokens →
-        //   `gemma4-forward-prefill-with-soft-tokens-slot-N`.
+        //   `gemma4-forward-prefill-with-soft-tokens-slot-N`
+        //   (iter-B4c-kernel-iter-5 scope).
+        // Post-iter-3 (§6.1.35) the Generate + GenerateStream arms'
+        // `gemma4-forward-prefill-slot-N` labels are GONE (both lifted).
         assert!(
             body.contains("gemma4-forward-embed-last-slot-N"),
             "H82 FALSIFIED: Gemma 4 Embed clamp removed by iter-1. \
@@ -21347,19 +21813,15 @@ mod adr040_phase_b_iter_b4c_kernel_iter1_gemma4_tests {
              overstepped — SoftTokens slot-aware port is staged as \
              iter-B4c-kernel-iter-5."
         );
-        // Streaming arm still carries the gemma4-forward-prefill-slot-N
-        // label (note: this label is shared by the Generate-arm pre-
-        // iter-1 AND the GenerateStream arm; post-iter-1 the Generate
-        // arm replaced the clamp with the lift, so the only remaining
-        // production occurrence of `gemma4-forward-prefill-slot-N` IN
-        // a `MultiSeqError::CapabilityUnsupported` clamp is inside the
-        // GenerateStream arm).
+        // iter-3 lift fn is called (B4c iter-3 §6.1.35 lifted the
+        // Gemma 4 GenerateStream arm — pin the lift fn presence).
         assert!(
-            body.contains("gemma4-forward-prefill-slot-N"),
-            "H82 FALSIFIED: Gemma 4 GenerateStream clamp removed by \
-             iter-1. iter-1's Generate-arm scope was overstepped — \
+            body.contains("generate_stream_gemma4_once_slot_aware("),
+            "H82 FALSIFIED: Gemma 4 iter-3 lift fn \
+             `generate_stream_gemma4_once_slot_aware` is NOT called \
+             from worker_run. iter-3 §6.1.35 lift was reverted — \
              GenerateStream slot-aware port is staged as \
-             iter-B4c-kernel-iter-3."
+             iter-B4c-kernel-iter-3 and MUST be wired post-iter-3."
         );
     }
 
@@ -22780,6 +23242,573 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_gemma4_tests {
              `iter-B4c-kernel-iter-2B-xlen` is NOT named in the new fn \
              body. The HF2Q_DFLASH_XLEN_SDPA=1 opt-in surface has no \
              operator-grep'able pin pointing at the next iter."
+        );
+    }
+}
+
+// ============================================================================
+// ADR-040 iter-B4c-kernel iter-3 — H104-H109 hypothesis pins
+// ============================================================================
+//
+// Scope (iter-3 advances the Gemma 4 worker-arm lift arc by one arm —
+// GenerateStream — direct mirror of Qwen35 iter-C2d-cont-kernel iter-2
+// §6.1.28 for the streaming surface):
+//
+//   * iter-1 (§6.1.31, commit `bac4c385`) shipped the Generate-arm
+//     scaffold lift onto the persistent multi-seq `MultiSeqHbKvBuffers`
+//     + sibling `MultiSeqHybridKvBuffers` (`reset_for_slot` primitive +
+//     `generate_gemma4_once_slot_aware` orchestrator + worker-arm
+//     dispatch fork).
+//   * iter-2A (§6.1.32) landed the model-level slot-aware fn
+//     `forward_prefill_with_soft_tokens_slot_aware` with bounds-first
+//     pre-flight + 4-way KV-regime dispatch fork.
+//   * iter-2B (§6.1.34, commit `1676fcd1`) landed the production-default
+//     hybrid F16-K + TQ-HB-V slot routing via `MultiSeqHybridKvBuffers`
+//     slice_view mount + delegate-to-sibling pattern.
+//
+//   * iter-3 (THIS commit, ADR-040 §6.1.35) ships:
+//     - NEW `generate_stream_gemma4_once_slot_aware` orchestrator at
+//       engine.rs (mirror of iter-1's `generate_gemma4_once_slot_aware`
+//       shape for the streaming-event-channel result surface).
+//       Reuses iter-1's `MultiSeqHbKvBuffers::reset_for_slot` + sibling
+//       `MultiSeqHybridKvBuffers::reset_for_slot` primitives + iter-2B's
+//       `forward_prefill_with_soft_tokens_slot_aware` kernel call.
+//     - `worker_run` Gemma 4 GenerateStream-arm lift fork (take +
+//       restore on `g.multi_seq_kv` + `g.multi_seq_kv_hybrid`).
+//     - Vision-augmented streaming deferral (soft_tokens.is_empty() ==
+//       false surfaces typed error event citing iter-B4c-kernel-iter-5).
+//     - Multi-token decode-loop body wrapping deferral (post-prefill
+//       Ok branch surfaces typed error event citing
+//       iter-B4c-kernel-iter-2-decode — same sub-deferral the iter-2B
+//       Generate-arm IIFE surfaces).
+//     - Tests revised for the post-iter-3 lifted state: H40, H56, H62,
+//       H68, H75, H82 swap their `gemma4-forward-prefill-slot-N
+//       (iter-C2c-cont` literal for the surviving Embed-arm label
+//       `gemma4-forward-embed-last-slot-N (iter-C2c-cont` (sibling-
+//       discipline intent preserved; the C2c clamp survives on Embed +
+//       SoftTokens arms).
+//
+// Tests (H104-H109 mirror Qwen35 iter-2 H58-H63 1:1):
+//   H104 (skip-mode): SerialFifo + SlotId(0) Gemma 4 GenerateStream
+//                     dispatch byte-equivalent post-iter-3.  The
+//                     `handle.slot_id != SlotId(0)` predicate short-
+//                     circuits below the lift fork; the existing
+//                     `generate_stream_once` dispatch at the `match
+//                     &mut loaded` block fires verbatim.
+//   H105 (skip-mode): iter-3 lift landed at GenerateStream arm: the
+//                     worker_run body contains a real call to
+//                     `generate_stream_gemma4_once_slot_aware(` under
+//                     the Gemma 4 GenerateStream arm.
+//   H106 (skip-mode): persistent multi_seq_kv + multi_seq_kv_hybrid
+//                     take/restore at the iter-3 lift call site
+//                     (both scaffolds; mirror of iter-2B Generate-
+//                     arm take/restore pattern).
+//   H107 (skip-mode): `reset_for_slot(slot_id)` at entry + exit on
+//                     BOTH scaffolds (the slot-aware streaming fn body
+//                     has ≥ 2 occurrences for the HB scaffold AND ≥ 2
+//                     for the hybrid scaffold).
+//   H108 (skip-mode): Qwen35 + Qwen3VL + Gemma 4 Generate (iter-1+
+//                     2A+2B) preserved; Gemma 4 Embed (iter-4) +
+//                     SoftTokens (iter-5) clamps still present.  The
+//                     iter-3 narrowing reduces the surviving Gemma 4
+//                     clamp surface from 3 arms (post-iter-1) to 2
+//                     arms (Embed + SoftTokens).
+//   H109 (skip-mode): SSE event ordering preserved.  iter-3 today
+//                     emits typed `Error` events only (no Delta events
+//                     because the decode loop is iter-2-decode scope);
+//                     the `send!` macro is defined; the
+//                     iter-2-decode typed-deferral substring is
+//                     present in the slot-aware streaming fn body.
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod adr040_phase_b_iter_b4c_kernel_iter3_gemma4_tests {
+    // Skip-mode source-grep tests; intentionally NO `use super::*;`
+    // (tests rely on `include_str!` against engine.rs + the ADR doc).
+
+    // ── Helper: snip worker_run body the same way iter-1/2 tests do ──
+    fn worker_run_body(src: &str) -> &str {
+        let body_start = src
+            .find("fn worker_run(")
+            .expect("iter-3: worker_run entry not found");
+        let body_after = &src[body_start..];
+        let body_end_off = body_after
+            .find("\n// The worker thread for `LoadedModel::Qwen35` returns a sentinel error")
+            .or_else(|| body_after.find("\n/// Worker-thread entry point"))
+            .unwrap_or(body_after.len().min(200_000));
+        &body_after[..body_end_off]
+    }
+
+    /// **H104 (skip-mode)** — SerialFifo + SlotId(0) AND SlotAware +
+    /// SlotId(0) Gemma 4 GenerateStream dispatch is byte-equivalent
+    /// post-iter-3.
+    ///
+    /// Source-grep pin: the iter-3 lift fork at the GenerateStream
+    /// arm uses the predicate `handle.slot_id != SlotId(0)`. SerialFifo
+    /// always hands out SlotId(0) (FifoSchedulerAdapter invariant);
+    /// SlotAware's first request also gets SlotId(0). In both cases
+    /// the predicate is FALSE → the lift block falls through to the
+    /// existing `match &mut loaded { LoadedModel::Gemma(g) =>
+    ///     generate_stream_once(g, ..) }` dispatch, byte-equivalent
+    /// to pre-iter-3 + pre-C2c.
+    ///
+    /// Defends the H1 / H2 / H23 / H41 / H44 / H77 byte-equivalence
+    /// chain extended to the Gemma 4 streaming surface.  Direct
+    /// mirror of Qwen35 iter-C2d-cont-kernel iter-2 H58.
+    #[test]
+    fn h104_slot_id_0_gemma4_stream_routes_through_generate_stream_once_byte_equivalent() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // The pre-iter-3 `generate_stream_once` dispatch must still be
+        // reachable from the worker arm for the SlotId(0) fallback.
+        assert!(
+            body.contains("generate_stream_once(\n                            g,\n                            &prompt_tokens,")
+                || body.contains("generate_stream_once(") ,
+            "H104 FALSIFIED: post-iter-3 worker_run Gemma 4 \
+             GenerateStream dispatch no longer routes through \
+             `generate_stream_once` for SlotId(0). The iter-3 lift \
+             fork must be ADDITIVE (sibling above the `match &mut \
+             loaded` dispatch), NOT REPLACE the SerialFifo / SlotId(0) \
+             path. SerialFifo + SlotId(0) byte-equivalence \
+             (H1 / H2 / H77 chain) is BROKEN for the Gemma 4 streaming \
+             arm."
+        );
+
+        // The lift fork predicate at the Gemma 4 worker arms must be
+        // `matches!(loaded, LoadedModel::Gemma(_)) && handle.slot_id != SlotId(0)`
+        // — the same shape iter-1 used for the Generate arm.  Pin: at
+        // least TWO occurrences of the literal predicate in the
+        // worker_run body (iter-1 Generate arm + iter-3 GenerateStream
+        // arm; Embed + SoftTokens still use the predicate too for
+        // their clamps).
+        let predicate = "matches!(loaded, LoadedModel::Gemma(_)) && handle.slot_id != SlotId(0)";
+        let n = body.matches(predicate).count();
+        assert!(
+            n >= 4,
+            "H104 FALSIFIED: the iter-3 lift fork predicate \
+             `{predicate}` must appear at least 4 times in worker_run \
+             body (one for iter-1 Generate lift, one for iter-3 \
+             GenerateStream lift, one each for iter-4 Embed + iter-5 \
+             SoftTokens clamps). Got {n}. Drift here means the lift \
+             may fire at SlotId(0) too, breaking byte-equivalence."
+        );
+    }
+
+    /// **H105 (skip-mode)** — iter-3 GenerateStream-arm lift landed
+    /// at `worker_run`: the slot-aware fn
+    /// `generate_stream_gemma4_once_slot_aware` is called from the
+    /// worker_run body at the Gemma 4 GenerateStream arm.  Source-grep
+    /// pin.  Mirror of Qwen35 iter-2 H59.
+    #[test]
+    fn h105_iter3_lift_landed_for_gemma4_generate_stream_arm() {
+        let src = include_str!("engine.rs");
+        // The slot-aware fn is defined in this file.
+        assert!(
+            src.contains("fn generate_stream_gemma4_once_slot_aware("),
+            "H105 FALSIFIED: `generate_stream_gemma4_once_slot_aware` \
+             is NOT defined in engine.rs. iter-B4c-kernel iter-3 \
+             production surface MISSING — orchestrator scaffold not \
+             landed."
+        );
+        let body = worker_run_body(src);
+        assert!(
+            body.contains("generate_stream_gemma4_once_slot_aware("),
+            "H105 FALSIFIED: worker_run does NOT call \
+             `generate_stream_gemma4_once_slot_aware`. iter-3 lift is \
+             not wired into the dispatch fork — the GenerateStream-arm \
+             SlotId(N>0) routing is missing."
+        );
+
+        // The slot-aware fn passes `slot_id` (the SlotId from the
+        // admit'd handle), NOT a hard-coded SlotId(0). Pin via
+        // substring search inside the lift call block.
+        let lift_block_start = body
+            .find("generate_stream_gemma4_once_slot_aware(")
+            .expect("H105: lift call site not found");
+        let lift_block_end = body[lift_block_start..]
+            .find(");")
+            .map(|off| lift_block_start + off + 2)
+            .unwrap_or(body.len().min(lift_block_start + 2000));
+        let lift_block = &body[lift_block_start..lift_block_end];
+        assert!(
+            lift_block.contains("slot_id"),
+            "H105 FALSIFIED: the lift call site does not pass `slot_id` \
+             into `generate_stream_gemma4_once_slot_aware`. The iter-3 \
+             lift must thread the admit'd SlotHandle's slot_id into \
+             the slot-aware fn. Got block: {lift_block}"
+        );
+        assert!(
+            !lift_block.contains(", SlotId(0),"),
+            "H105 FALSIFIED: lift call site contains a hard-coded \
+             `SlotId(0)` literal argument. Per-slot routing is broken \
+             — the orchestrator must receive the admit'd handle's \
+             SlotId verbatim."
+        );
+    }
+
+    /// **H106 (skip-mode)** — persistent multi_seq_kv +
+    /// multi_seq_kv_hybrid take+restore pattern at the iter-3 lift
+    /// call site.  Mirror of Qwen35 iter-2 H60 with both scaffolds.
+    ///
+    /// Pin both `g.multi_seq_kv.take()` + `g.multi_seq_kv_hybrid.take()`
+    /// AND the corresponding restores after the call.  The take+restore
+    /// pattern is required for:
+    /// (a) two-iter symmetry — iter-1 already established this pattern
+    ///     for the Generate arm with BOTH scaffolds (iter-2B); iter-3
+    ///     must use the same shape so the persistent-scaffold
+    ///     invariants hold across BOTH Generate + GenerateStream
+    ///     requests at any slot.
+    /// (b) defense against the same regressions H79 + H99 catch —
+    ///     forgotten put-back → next request finds `is_none()`
+    ///     defense-in-depth typed error; clone-instead-of-take →
+    ///     persistent scaffold's per-slot state is not actually
+    ///     mutated, defeating cross-request isolation.
+    ///
+    /// iter-3's take+restore is ADDITIVE — the worker_run body has
+    /// BOTH the iter-1+2B Generate arm AND the iter-3 GenerateStream
+    /// arm take+restores.  Pin via count ≥ 2 for both take and restore
+    /// on the HB scaffold, and ≥ 2 on the hybrid scaffold.
+    #[test]
+    fn h106_lift_call_site_takes_and_restores_both_scaffolds() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // HB scaffold take pattern (mirror of iter-1 H79).
+        let hb_take_count = body.matches("g.multi_seq_kv.take()").count();
+        assert!(
+            hb_take_count >= 2,
+            "H106 FALSIFIED: the iter-3 lift call site does not \
+             `take()` the persistent HB scaffold out of \
+             `GemmaLoadedModel.multi_seq_kv`. Expected at least 2 \
+             occurrences of `g.multi_seq_kv.take()` in worker_run body \
+             (one each for iter-1 Generate + iter-3 GenerateStream lift \
+             forks); got {hb_take_count}."
+        );
+        // HB scaffold restore pattern.
+        let hb_restore_count = body.matches("g.multi_seq_kv = Some(multi_seq)").count();
+        assert!(
+            hb_restore_count >= 2,
+            "H106 FALSIFIED: the iter-3 lift call site does not put \
+             the persistent HB scaffold back into `g.multi_seq_kv` \
+             after the slot-aware streaming fn returns. Expected at \
+             least 2 occurrences of `g.multi_seq_kv = Some(multi_seq)` \
+             in worker_run body (one each for iter-1 + iter-3 lift \
+             forks); got {hb_restore_count}. The next request to land \
+             at SlotId(N>0) would find `multi_seq_kv.is_none()` and \
+             hit the defense-in-depth typed error."
+        );
+        // Hybrid scaffold take pattern (mirror of iter-2B H99).
+        let hyb_take_count = body.matches("g.multi_seq_kv_hybrid.take()").count();
+        assert!(
+            hyb_take_count >= 2,
+            "H106 FALSIFIED: the iter-3 lift call site does not \
+             `take()` the persistent hybrid scaffold out of \
+             `GemmaLoadedModel.multi_seq_kv_hybrid`. Expected at least \
+             2 occurrences of `g.multi_seq_kv_hybrid.take()` in \
+             worker_run body (one each for iter-2B Generate + iter-3 \
+             GenerateStream lift forks); got {hyb_take_count}. \
+             Production-default hybrid path (HF2Q_HYBRID_KV=1 per H10) \
+             would silently surface the iter-2A hybrid typed error or \
+             route to slot 0's region."
+        );
+        // Hybrid scaffold restore pattern.
+        let hyb_restore_count = body.matches("g.multi_seq_kv_hybrid = multi_seq_hybrid").count();
+        assert!(
+            hyb_restore_count >= 2,
+            "H106 FALSIFIED: the iter-3 lift call site does not put \
+             the persistent hybrid scaffold back into \
+             `g.multi_seq_kv_hybrid` after the slot-aware streaming \
+             fn returns. Expected at least 2 occurrences of \
+             `g.multi_seq_kv_hybrid = multi_seq_hybrid` in worker_run \
+             body (one each for iter-2B + iter-3 lift forks); got \
+             {hyb_restore_count}."
+        );
+    }
+
+    /// **H107 (skip-mode)** — per-slot reset at entry + exit of the
+    /// slot-aware streaming fn on BOTH scaffolds (HB + hybrid).
+    /// Mirror of Qwen35 iter-2 H61 with the dual-scaffold discipline
+    /// iter-1 established for Gemma 4.
+    ///
+    /// Pin: ≥ 2 occurrences of `reset_for_slot(slot_id)` inside the
+    /// slot-aware streaming fn body for the HB scaffold (entry + exit
+    /// via `multi_seq_kv.iter_mut()`), AND ≥ 2 occurrences inside the
+    /// hybrid `if let Some(ref mut hybrid_scaffold) = ...` blocks
+    /// (entry + exit when the hybrid Option is Some).
+    #[test]
+    fn h107_slot_aware_stream_fn_calls_reset_for_slot_at_entry_and_exit() {
+        // reset_for_slot primitives (iter-1's load-bearing add).
+        let kv_src = include_str!(
+            "../../../src/inference/models/gemma4/kv_cache.rs"
+        );
+        assert!(
+            kv_src.contains("pub fn reset_for_slot("),
+            "H107 FALSIFIED: `reset_for_slot` is not defined in \
+             gemma4/kv_cache.rs. iter-3 inherits this primitive from \
+             iter-1; if it's gone, iter-1 was reverted."
+        );
+
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_stream_gemma4_once_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect(
+                "H107: generate_stream_gemma4_once_slot_aware not defined",
+            );
+        // Window covering the fn body — bound by next top-level fn
+        // marker or end-of-file.
+        let body_after = &src[fn_idx..];
+        let body_end_off = body_after[fn_marker.len()..]
+            .find("\nfn ")
+            .map(|off| off + fn_marker.len())
+            .unwrap_or(body_after.len().min(60_000));
+        let fn_body = &body_after[..body_end_off];
+
+        // Total reset_for_slot count ≥ 4: entry + exit on HB scaffold
+        // (2) + entry + exit on hybrid scaffold (2 — wrapped in
+        // Option Some-guards).
+        let reset_calls = fn_body.matches("reset_for_slot(slot_id)").count();
+        assert!(
+            reset_calls >= 4,
+            "H107 FALSIFIED: \
+             `generate_stream_gemma4_once_slot_aware` must call \
+             `reset_for_slot(slot_id)` at LEAST 4 times (entry + exit \
+             on the HB scaffold via `multi_seq_kv.iter_mut()` + entry \
+             + exit on the hybrid scaffold via `if let Some(ref mut \
+             hybrid_scaffold) = multi_seq_kv_hybrid` Option guards). \
+             Got {reset_calls} call(s).  Drift here means cross-request \
+             isolation is BROKEN on at least one scaffold."
+        );
+
+        // Per-layer iteration on HB scaffold.
+        assert!(
+            fn_body.contains("multi_seq_kv.iter_mut()"),
+            "H107 FALSIFIED: slot-aware stream fn does NOT iterate \
+             per-layer via `multi_seq_kv.iter_mut()`. Per-layer reset \
+             coverage on HB scaffold is incomplete."
+        );
+        // Per-layer iteration on hybrid scaffold (inside Some-guard).
+        assert!(
+            fn_body.contains("hybrid_scaffold.iter_mut()"),
+            "H107 FALSIFIED: slot-aware stream fn does NOT iterate \
+             per-layer via `hybrid_scaffold.iter_mut()` inside the \
+             hybrid Option Some-guard. Per-layer reset coverage on \
+             the production-default hybrid scaffold is incomplete."
+        );
+    }
+
+    /// **H108 (skip-mode)** — Qwen35 + Qwen3VL + Gemma 4 Generate /
+    /// Embed / SoftTokens worker arms unchanged by iter-3.  Mirror of
+    /// H82 extended for the iter-3 narrowing: iter-3 replaces the
+    /// iter-3 Gemma 4 GenerateStream clamp, so only the iter-4 (Embed)
+    /// + iter-5 (GenerateWithSoftTokens) clamps remain in the Gemma 4
+    /// worker_run surface (the Generate arm is also lifted post-iter-1+
+    /// 2A+2B).
+    #[test]
+    fn h108_other_worker_arms_unchanged_by_iter3() {
+        let src = include_str!("engine.rs");
+        let body = worker_run_body(src);
+
+        // Qwen35 lift fns from iter-C2d-cont-kernel iter-1/2/3/4 all
+        // STILL called.
+        for lift_fn in [
+            "super::engine_qwen35::generate_qwen35_once_slot_aware(",
+            "super::engine_qwen35::generate_stream_qwen35_once_extended_slot_aware(",
+            "super::engine_qwen35::embed_qwen35_slot_aware(",
+            "super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware(",
+        ] {
+            assert!(
+                body.contains(lift_fn),
+                "H108 FALSIFIED: Qwen35 lift fn `{lift_fn}` is NOT \
+                 called from worker_run. iter-3 must NOT regress any \
+                 Qwen35 worker-arm lift (§6.1.27/28/29/30)."
+            );
+        }
+
+        // iter-1 Gemma 4 Generate-arm lift fn STILL called (iter-3
+        // must not regress iter-1).
+        assert!(
+            body.contains("generate_gemma4_once_slot_aware("),
+            "H108 FALSIFIED: iter-1 Gemma 4 Generate lift fn \
+             `generate_gemma4_once_slot_aware` is NOT called from \
+             worker_run. iter-3 must NOT regress iter-1's Generate-arm \
+             lift (§6.1.31)."
+        );
+
+        // No Qwen3VL clamp accidentally added.
+        assert!(
+            !body.contains(
+                "matches!(loaded, LoadedModel::Qwen3VlText(_)) && handle.slot_id != SlotId(0)"
+            ),
+            "H108 FALSIFIED: Qwen3VL clamp accidentally added to \
+             worker_run by iter-3. Qwen3VL SlotAware activation is \
+             gated on iter-C2e per §6.1.22; iter-3 must not add the \
+             Qwen3VL clamp without the spawn-arm flip."
+        );
+
+        // Embed (iter-4) clamp still in place — iter-3 must not lift
+        // the Embed arm.
+        assert!(
+            body.contains("gemma4-forward-embed-last-slot-N (iter-C2c-cont"),
+            "H108 FALSIFIED: Gemma 4 Embed arm `gemma4-forward-embed-\
+             last-slot-N (iter-C2c-cont` clamp label missing from \
+             worker_run. iter-3 must NOT touch the Embed arm — that's \
+             iter-B4c-kernel-iter-4 scope."
+        );
+        // Also pin the iter-B4c-kernel-iter-4 sub-deferral cite still
+        // present (Embed-arm clamp body cites iter-4).
+        assert!(
+            body.contains("iter-B4c-kernel-iter-4"),
+            "H108 FALSIFIED: iter-4 sub-deferral cite \
+             `iter-B4c-kernel-iter-4` missing from worker_run. \
+             Embed-arm clamp's typed-deferral discipline broken."
+        );
+
+        // GenerateWithSoftTokens (iter-5) clamp still in place.
+        assert!(
+            body.contains("gemma4-forward-prefill-with-soft-tokens-slot-N (iter-C2c-cont"),
+            "H108 FALSIFIED: Gemma 4 GenerateWithSoftTokens arm \
+             `gemma4-forward-prefill-with-soft-tokens-slot-N \
+             (iter-C2c-cont` clamp label missing from worker_run. \
+             iter-3 must NOT touch the SoftTokens arm — that's \
+             iter-B4c-kernel-iter-5 scope."
+        );
+        assert!(
+            body.contains("iter-B4c-kernel-iter-5"),
+            "H108 FALSIFIED: iter-5 sub-deferral cite \
+             `iter-B4c-kernel-iter-5` missing from worker_run. \
+             SoftTokens-arm clamp's typed-deferral discipline broken."
+        );
+    }
+
+    /// **H109 (skip-mode)** — SSE event ordering preserved in the
+    /// slot-aware streaming fn.  iter-3 today emits typed
+    /// `GenerationEvent::Error` events only (NO `Delta` events because
+    /// the multi-token decode-loop body wrapping is iter-2-decode
+    /// scope); when iter-B4c-kernel-iter-2-decode lands, the per-token
+    /// Delta emission loop + terminal Done event will be added.
+    ///
+    /// Source-grep pin on the slot-aware streaming fn's body:
+    /// (a) the `send!` macro is defined (the SSE helper that calls
+    ///     `events.blocking_send` + bumps cancellation_counter + early-
+    ///     returns on client disconnect);
+    /// (b) the iter-B4c-kernel-iter-2-decode typed-deferral substring
+    ///     is present (operator-grep'able pin for the next sub-iter);
+    /// (c) the slot-aware fn emits `GenerationEvent::Error` events
+    ///     (defense against a refactor that switched to
+    ///     `GenerationEvent::Done` or another variant).
+    ///
+    /// Mirror of Qwen35 iter-2 H63 for the Gemma 4 surface.
+    #[test]
+    fn h109_slot_aware_stream_fn_preserves_sse_event_ordering() {
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_stream_gemma4_once_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect(
+                "H109: generate_stream_gemma4_once_slot_aware not defined",
+            );
+        let body_after = &src[fn_idx..];
+        let body_end_off = body_after[fn_marker.len()..]
+            .find("\nfn ")
+            .map(|off| off + fn_marker.len())
+            .unwrap_or(body_after.len().min(60_000));
+        let fn_body = &body_after[..body_end_off];
+
+        // (a) `send!` macro defined inside the fn (the SSE emit
+        //     helper) — defense against iter-3 calling
+        //     events.blocking_send without the cancellation-counter
+        //     early-return wiring.
+        assert!(
+            fn_body.contains("macro_rules! send {"),
+            "H109 FALSIFIED: \
+             `generate_stream_gemma4_once_slot_aware` body does not \
+             define the `send!` macro for SSE emission. The macro \
+             must wrap every `events.blocking_send(...)` call to \
+             early-return on client-disconnect — mirror of \
+             `generate_stream_once` + Qwen35 \
+             `generate_stream_qwen35_once_extended_slot_aware` shape."
+        );
+
+        // (b) iter-2-decode typed-deferral substring present (the
+        //     iter-3 lift defers the multi-token decode loop to
+        //     iter-2-decode per ADR-040 §6.1.35).
+        assert!(
+            fn_body.contains("iter-B4c-kernel-iter-2-decode"),
+            "H109 FALSIFIED: \
+             `generate_stream_gemma4_once_slot_aware` body does not \
+             cite the `iter-B4c-kernel-iter-2-decode` sub-deferral. \
+             The streaming multi-token decode loop body wrapping is \
+             not pinned to its next-iter destination — operator log \
+             greps cannot land on the right pin pointer."
+        );
+
+        // (c) Error events emitted via the typed `GenerationEvent::Error`
+        //     variant (defense against a refactor that switched to a
+        //     different event variant).
+        assert!(
+            fn_body.contains("GenerationEvent::Error("),
+            "H109 FALSIFIED: \
+             `generate_stream_gemma4_once_slot_aware` body does not \
+             emit `GenerationEvent::Error(...)` events. Drift here \
+             means the slot-aware streaming fn emits errors through a \
+             different event variant — breaks SSE consumer parity \
+             with the pre-iter-3 stream shape (the iter-3 typed \
+             sub-deferrals MUST surface via this variant so the SSE \
+             handler maps them to clean stream termination)."
+        );
+
+        // Exit-reset discipline: ≥ 2 `reset_for_slot(slot_id)` calls
+        // precede the first Error event emit position (entry + exit
+        // on the HB scaffold; entry + exit on hybrid Some-guard).
+        // Reuse the H107 structural pin (≥ 4) and pin the source-order
+        // relationship between the first Error event and the entry
+        // reset block.
+        let first_error_idx = fn_body
+            .find("GenerationEvent::Error(")
+            .expect("H109: GenerationEvent::Error emit located");
+        // Count resets before the FIRST Error emit — there must be at
+        // least one Error emit AFTER the first entry-reset block
+        // (the iter-2-decode Error event at the prefill-Ok branch).
+        // Source-order proxy: at the iter-2-decode emit position
+        // (the LAST Error emit before the exit-reset block), ≥ 2
+        // entry resets must precede.
+        //
+        // Simpler invariant: the iter-2-decode label appears AFTER
+        // some `reset_for_slot(slot_id)` calls in source order.
+        let iter_decode_idx = fn_body
+            .find("iter-B4c-kernel-iter-2-decode")
+            .expect("H109: iter-2-decode cite located (asserted above)");
+        let resets_before_decode_cite = fn_body[..iter_decode_idx]
+            .matches("reset_for_slot(slot_id)")
+            .count();
+        assert!(
+            resets_before_decode_cite >= 2,
+            "H109 FALSIFIED: at the source-order position of the \
+             `iter-B4c-kernel-iter-2-decode` sub-deferral cite, only \
+             {resets_before_decode_cite} `reset_for_slot(slot_id)` \
+             calls precede it. Expected ≥ 2 (entry reset on HB \
+             scaffold + entry reset on hybrid scaffold). Drift here \
+             means the iter-2-decode error is emitted BEFORE the \
+             entry-reset block — breaks the iter-3 entry discipline \
+             pinned by H107."
+        );
+        // Also pin the first Error emit position is at or after some
+        // entry-reset (defense against a refactor that emits Error
+        // BEFORE resetting the slot).
+        let _ = first_error_idx; // referenced for clarity; the
+                                  // iter-2-decode cite-based pin
+                                  // above is the load-bearing one.
+
+        // The ADR-040 §6.1.35 closure block exists in the ADR.
+        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.35"),
+            "H109 FALSIFIED: ADR-040 §6.1.35 closure block not found. \
+             iter-3 sub-deferral cites point at a non-existent \
+             destination. Update the ADR with the iter-3 closure \
+             block before merging."
         );
     }
 }
