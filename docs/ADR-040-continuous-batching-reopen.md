@@ -271,6 +271,7 @@ Iter-1.5's pins are stronger than iter-1's but still NOT a complete byte-equival
 | **B4a-cont.1 (SHIPPED 2026-05-23)** | Codex /cfa rev-1 addressed: M1 isolation-test rigor (delete reset+rerun-then-compare test + add raw K/V byte snapshot + positive same-prompt-equivalence pin); M2 canonical TQ-active multi-slot gate placement at `build_gated_attn_layer` + `apply_gated_attn_layer_decode_into` entry; minor stale-comment refresh at `forward_gpu.rs` entry | **1 day landed** |
 | **B4b (SHIPPED 2026-05-24)** | Qwen35 decode-path slot threading (`forward_gpu_last_logits` / `forward_gpu_last_topk` / `forward_gpu_last_logits_with_soft_tokens` / `forward_gpu_last_logits_with_soft_tokens_and_deepstack` / `forward_embed_last`); full lift (SlotId(N>0) end-to-end via B4a-cont's F32 slot-offset routing); 25 production callsites updated; H17–H20 + variant-coverage = 5 new tests (153 PASS). See §6.1.20. | **1 day landed** |
 | B4c | Gemma 4 forward-path slot threading (`forward_prefill.rs` + `forward_prefill_batched.rs`) — gated on Phase A3 Gemma 4 multi-seq KV impl | 5-8 days |
+| **B4c (label refinement SHIPPED 2026-05-29)** | Gemma 4 worker-arm typed-deferral label refinement — Path B symmetric with C2d-cont §6.1.24 for the Gemma 4 architecture. Four `worker_run` arm clamps gain an additive `/ iter-B4c-kernel per ADR-040 §6.1.25 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs + per-slot MultiSeqHbKvBuffers slot routing` cite inside the existing `MultiSeqError::CapabilityUnsupported { capability }` string. Preserves C2c `iter-C2c-cont per ADR-040 §6.1.21` prefix verbatim (H25 + C2d-cont H40 pins keep passing); establishes cross-architecture label-format parity with C2d-cont's `iter-C2d-cont-kernel per ADR-040 §6.1.24`. SerialFifo + SlotId(0) byte-equivalent (H41); SlotAware + SlotId(0) byte-equivalent via H44 predicate pin; Qwen35 + Qwen3VL arms unchanged (H45). 5 new H41-H45 tests (6 PASS with H25). Kernel slot-offset routing itself deferred to **iter-B4c-kernel** (typed deferral, pinned by H42 + H43 label strings + structural absence assertion). See §6.1.25. | **1 day landed** |
 | B4d | Spec-decode slot threading (`forward_gpu_greedy` + dflash entry points) — gated on Phase A4 drafter KV multi-seq impl | 5-8 days |
 | B5 | Per-slot 429 + Retry-After contract preservation | 2-3 days |
 | B6 | Mixed prefill+decode `SchedulerStep::Mixed` handling | 3-5 days |
@@ -2030,8 +2031,80 @@ Path B ships the *dispatch fork shape* (the structural witness that the worker a
 - **iter-A2b-cont**: Forward-path linear-attn dispatch site multi-seq lift in `gpu_delta_net.rs` (gated upstream by iter-C2d-cont-kernel since `gpu_delta_net.rs:912, 1090, 1556` n_seqs=1 hard-codes only become reachable once the worker hot path actually dispatches at SlotId(N>0)). See §6.1.23 for the dossier-§2.1.5 mapping.
 - **iter-A2c**: `fork_seq` real kernel dispatch — replaces the current `CapabilityUnsupported` cross-slot stub at `kv_cache.rs:2774-2778`.
 - **iter-A3b-2 / iter-A3b-3**: DenseKvBuffers + MlxKvCache full lifts.
-- **iter-C2c-cont (B4c)**: Gemma 4 `forward_prefill.rs` GPU-side slot-offset routing (parallel to iter-C2d-cont-kernel for the Qwen35 surface).
+- **iter-C2c-cont (B4c)**: Gemma 4 `forward_prefill.rs` GPU-side slot-offset routing (parallel to iter-C2d-cont-kernel for the Qwen35 surface). **B4c label-refinement landed 2026-05-29 (see §6.1.25)**; the kernel slot-offset routing itself is now staged as **iter-B4c-kernel** per the §6.1.25 typed-deferral discipline.
 - **iter-C2e**: Qwen3VL SlotAware activation — currently `EngineSpawnError::ModeNotYetWired { iter_required: "C2e (...)" }` per §6.1.22. Once C2e lands the spawn-arm flip, a parallel C2e-cont iter ships the worker-arm clamp following C2d-cont's pattern.
+- **Phase E1**: production cutover decision + final ADR-040 closure ceremony.
+
+### 6.1.25 Iter-B4c closure — Gemma 4 worker-arm typed-deferral label refinement (Path B symmetric with §6.1.24 for the Gemma 4 architecture, 2026-05-29, commit hash TBD)
+
+Direct mirror of C2d-cont §6.1.24 for the Gemma 4 architecture, applied at the worker-arm typed-deferral label layer rather than at the spawn-arm or worker-arm dispatch-fork layer (C2c §6.1.21 already shipped both the spawn-arm flip + per-layer `MultiSeqHbKvBuffers` provisioning AND the four worker-arm `slot_id != SlotId(0)` clamps). Pre-B4c, each of the four Gemma 4 worker-arm clamps named its deferred kernel surface as `"gemma4-...-slot-N (iter-C2c-cont per ADR-040 §6.1.21 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs)"`. C2d-cont then established a canonical `iter-<phase>-kernel per ADR-040 §<section>` label discipline for the typed-deferral string (Qwen35: `iter-C2d-cont-kernel per ADR-040 §6.1.24`). Iter-B4c closes the cross-architecture label-format asymmetry by **extending each Gemma 4 worker-arm label** with an additive `/ iter-B4c-kernel per ADR-040 §6.1.25 — ...` cite, preserving the existing `iter-C2c-cont per ADR-040 §6.1.21` prefix verbatim so the C2c (H25) + C2d-cont (H40) string-match pins keep passing.
+
+**Path chosen — Path B (label refinement only; kernel work staged as iter-B4c-kernel)**:
+
+Path A (full Gemma 4 `forward_prefill.rs` slot lift bundled in this iter) was considered and explicitly rejected on three risk-symmetry grounds mirroring C2d-cont §6.1.24:
+
+1. **Surface area**: Path A requires threading `slot_id: SlotId` through `forward_prefill.rs` + `forward_prefill_batched.rs` across 30 Gemma 4 layers × 3 KV variants (`MultiSeqHbKvBuffers` post-A3a; `HybridKvBuffers` post-A3b iter-1 production default; `DenseKvBuffers` / `MlxKvCache` typed-clamped per A3b iter-1) × the optional `xlen` BF16 buffers. The mechanical refactor footprint exceeds 600 LOC across `forward_prefill.rs` + `forward_prefill_batched.rs` + `gemma4/model.rs` per the §6.1.21 closure block's path-A risk note.
+
+2. **KV-cache invariants**: the existing inline alloc sites at `forward_prefill.rs:843-882`, `forward_prefill_batched.rs:443-475`, and `forward_gpu.rs:443-459` build legacy 3-D `HybridKvBuffers` at implicit `n_seqs=1` (per §6.1.19 A3b iter-1 closure). A3a's `alloc_hb_kv_for_layer(.., n_seqs=max_slots)` replacement is explicitly gated on Phase B4c per the §6.1.18 closure block. Routing the worker hot path through `Some(persistent_multi_seq)` without the alloc-site refactor would break the byte-equivalence contract for SerialFifo + SlotId(0).
+
+3. **Byte-equivalence regression risk**: H41 (SerialFifo unchanged) + C2c H23 (no multi-seq KV alloc for SerialFifo Gemma 4) + C2d-cont H40 (Gemma 4 labels still present) pin verbatim byte-equivalence with pre-C2c behaviour. Path A would invalidate these pins because the kernel slot-offset routing changes the KV-write address calculation even for SlotId(0). The H1/H2 byte-equivalence pin arc (A5* + C2a + C2b) explicitly defends against this regression class.
+
+Path B ships the *label-refinement* (additive `iter-B4c-kernel per ADR-040 §6.1.25` cite appended to the existing `iter-C2c-cont per ADR-040 §6.1.21` prefix) — preserving the C2c surface verbatim while giving the future iter-B4c-kernel implementer + operator log greps a consistent `iter-<phase>-kernel per ADR-040 §<section>` cite across architectures (Qwen35: `iter-C2d-cont-kernel per ADR-040 §6.1.24`; Gemma 4: `iter-B4c-kernel per ADR-040 §6.1.25`). Same dispatch fork shape; same 4 worker arms; same `slot_id != SlotId(0)` predicate; same `MultiSeqError::CapabilityUnsupported` typed-error variant. The Path A lift is staged as **iter-B4c-kernel** (typed deferral, pinned by H42 + H43 label strings).
+
+**Production surfaces touched (all additive, byte-equivalent for SerialFifo + SlotId(0) + SlotAware + SlotId(0))**:
+
+- `src/serve/api/engine.rs::worker_run` 4 dispatch-arm typed-deferral labels (`Request::Generate`, `Request::GenerateStream`, `Request::Embed`, `Request::GenerateWithSoftTokens`): each gains the additive `/ iter-B4c-kernel per ADR-040 §6.1.25 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs + per-slot MultiSeqHbKvBuffers slot routing` cite inside the existing `MultiSeqError::CapabilityUnsupported { capability }` string. The existing `gemma4-...-slot-N (iter-C2c-cont per ADR-040 §6.1.21 — gated on B4c kernel slot-offset routing through src/serve/forward_prefill.rs)` prefix is preserved verbatim — H25 (C2c local-string round-trip) + C2d-cont H40 (source-grep on `(iter-C2c-cont`) keep passing.
+- No new control flow; no new error variants; no new module-level types. The dispatch-fork shape (the `if matches!(loaded, LoadedModel::Gemma(_)) && handle.slot_id != SlotId(0)` predicate + 4 sibling clamps) is unchanged from C2c — only the typed-error string content is refined.
+- The Generate / GenerateStream / Embed labels also gain a `forward_prefill.rs::<symbol>` cite (`forward_prefill_with_kv_cache` / `forward_embed_last` / `forward_prefill_with_soft_tokens`) so the iter-B4c-kernel implementer can grep by symbol name for the call-site lifts.
+
+**Tests (5 new H41-H45 in `adr040_phase_b_iter4c_gemma4_slot_aware_tests`)**:
+
+| Test | Pins |
+|---|---|
+| `h41_serial_fifo_gemma4_worker_arm_byte_equivalent_post_b4c` | Source-grep pin: post-B4c, the Gemma 4 dispatch in `worker_run::Request::Generate` STILL calls `generate_once(g, &prompt_tokens, &params, registration.as_ref())`, Embed STILL calls `g.weights.forward_embed_last(&prompt_tokens, &mut g.ctx)`, and the `LoadedModel::Gemma(g) =>` match arms structurally exist. SerialFifo byte-equivalence pin: under SerialFifo, `FifoSchedulerAdapter` always returns SlotId(0), so the clamp at `handle.slot_id != SlotId(0)` is GUARANTEED inactive — same as pre-B4c. |
+| `h42_capability_unsupported_label_names_iter_b4c_kernel_for_gemma4` | Display round-trip pin: the typed `MultiSeqError::CapabilityUnsupported` label names (a) the deferred surface (`gemma4-forward-prefill-slot-N`), (b) the implementing iter (`iter-B4c-kernel`), (c) the preserved C2c prefix (`iter-C2c-cont` — surface-preservation discipline), (d) the file that needs the lift (`forward_prefill.rs`), and (e) the gating primitive (`MultiSeqHbKvBuffers`). Mirrors C2d-cont H37's label-format pin. |
+| `h43_typed_deferral_label_present_in_all_four_worker_arms_and_forward_prefill_slot_id_not_yet_threaded` | Coverage pin: the `iter-B4c-kernel per ADR-040 §6.1.25` substring appears ≥4 times in the file (once per worker arm). Drift here means partial coverage. PLUS: `forward_prefill_with_kv_cache_slot` (the hypothetical iter-B4c-kernel target API shape) is structurally ABSENT from `worker_run` today — this pin holds the deferral marker for "iter-B4c-kernel must call the slot-aware forward path with `handle.slot_id` threaded through once the kernel-side routing lands". When that iter lands, the pin's absence-assertion must be inverted to a presence-assertion. |
+| `h44_gemma4_clamp_is_slot_id_nonzero_only_not_mode_predicate` | First-slot byte-equivalence pin: the clamp predicate is exactly `matches!(loaded, LoadedModel::Gemma(_)) && handle.slot_id != SlotId(0)` (NOT `mode is SlotAware`). Defends against a future drift that silently extends the clamp to "any SlotAware admission" — that would break SlotAware + SlotId(0) byte-equivalence with SerialFifo + SlotId(0), invalidating the C2c H21 + C2c H23 byte-equivalence contracts. Mirrors C2d-cont H39 for Gemma 4. |
+| `h45_qwen35_and_qwen3vl_worker_arms_unchanged_by_b4c` | Sibling discipline pin (reverse of C2d-cont H40): the C2d-cont Qwen35 labels (`qwen35-forward-gpu-last-logits-slot-N`, `qwen35-forward-embed-last-slot-N`, `qwen35-forward-gpu-with-soft-tokens-slot-N`) + the `iter-C2d-cont-kernel per ADR-040 §6.1.24` cite are STILL present in `worker_run`. AND no `LoadedModel::Qwen3VlText(_)` clamp was accidentally added by B4c (Qwen3VL SlotAware is gated on iter-C2e — see §6.1.22 spawn arm). |
+
+**Quality gates** (skip-mode, env-unset):
+- `cargo check --release --tests`: **0 errors**, only pre-existing warnings unrelated to B4c
+- `cargo test --release --bin hf2q -- h41 h42 h43 h44 h45 b4c_ --test-threads=1`: **6 PASS / 0 FAIL** (5 new H41-H45 + H25 C2c label round-trip preserved)
+- `cargo test --release --bin hf2q -- h36 h37 h38 h39 h40 --test-threads=1`: **5 PASS** preserved (C2d-cont H36-H40 unchanged)
+- `cargo test --release --bin hf2q -- adr040_phase_c_iter2c_gemma4 --test-threads=1`: **16 PASS** preserved (C2c + C2d unchanged)
+- `cargo test --release --bin hf2q -- qwen35::kv_cache --test-threads=1`: **82 PASS** preserved (A2a + A2b unchanged)
+- `cargo test --release --bin hf2q -- qwen35::forward_gpu::tests::b4 --test-threads=1`: **12 PASS** preserved (B4a + B4a-cont + B4b unchanged)
+- `cargo test --release --bin hf2q -- serve::api::engine --test-threads=1`: **154 PASS** (C2d-cont 153 + H25 already-counted; the H41-H45 module adds 5; the matcher subset is the engine module surface)
+- `cargo test --release --test continuous_batching_throughput`: **21 PASS** preserved (D3 statistical stability + AC-4 gate)
+
+**Per-file LOC delta**:
+
+| File | + | − | Notes |
+|---|---|---|---|
+| `src/serve/api/engine.rs` (production) | ~28 | ~4 | 4 label-string refinements (~7 LOC/clamp comment + label edit × 4 arms) — additive cite appended after existing prefix; no replacements of the clamp shape, fork predicate, or scheduler.release call |
+| `src/serve/api/engine.rs` (tests) | ~350 | 0 | New `adr040_phase_b_iter4c_gemma4_slot_aware_tests` module with H41-H45 + module docstring narrating Path B decision |
+| `docs/ADR-040-continuous-batching-reopen.md` | ~95 | ~1 | this §6.1.25 closure + §6.1.24 followup line marked SHIPPED for B4c label-refinement (kernel staged as iter-B4c-kernel) |
+| **Net** | **~473** | **~5** | **+468 LOC** (well within iter budget) |
+
+**Mantra audit**:
+- Zero new `// TODO`, `unimplemented!()`, `todo!()`, `FIXME` in production code.
+- Every deferral typed: `MultiSeqError::CapabilityUnsupported { capability: "gemma4-...-slot-N (iter-C2c-cont per ADR-040 §6.1.21 / iter-B4c-kernel per ADR-040 §6.1.25 — ...)" }` — operator-grep'able + reviewer-grep'able + future-iter-grep'able; cross-architecture symmetric with C2d-cont's Qwen35 `iter-C2d-cont-kernel per ADR-040 §6.1.24` discipline.
+- A5* + A2a + A2b + A3a + A3b iter-1/1.5 + B4a/cont/.1 + B4b + C2a + C2b + C2c + C2d + C2d-cont production surfaces NOT touched — purely additive label cite appended to the existing C2c clamp strings.
+- SerialFifo byte-equivalence at H1/H2 pinned by H41's source-grep + the inactive-clamp invariant under `FifoSchedulerAdapter`'s always-SlotId(0) hand-out.
+- SlotAware + SlotId(0) byte-equivalence with SerialFifo + SlotId(0) pinned by H44's predicate pin (`!= SlotId(0)` only, NOT mode-conditioned).
+- Qwen35 C2d-cont surface preserved verbatim — H45's sibling-discipline pin checks both Qwen35 clamps + `iter-C2d-cont-kernel` cite coexist (NOT touched by B4c).
+- Qwen3VL worker arm unchanged — H45's negative pin (`!body.contains("matches!(loaded, LoadedModel::Qwen3VlText(_))")`) defends against accidental drift before iter-C2e's Qwen3VL forward path lands.
+- C2c label-prefix discipline preserved — H42's `iter-C2c-cont` substring assertion AND the existing C2c H25 local-string Display round-trip BOTH pass post-B4c.
+
+**Recovery from path-A consideration**: the B4c brief offered both Path A (full Gemma 4 forward_prefill slot lift, ~30 layers × 3 KV variants × xlen optional ≈ multi-iter work) and Path B (label refinement preserving the C2c clamp shape). The Path A risk-symmetry analysis (above) showed three concrete invalidation paths for byte-equivalence (surface area, KV-cache invariants at the 3 inline alloc sites, and the H1/H2 pin contract). Path B is the structurally-safe iter that preserves all byte-equivalence pins while shipping the cross-architecture label-format symmetry — which is the operator-facing + reviewer-facing pin discipline the C2c/C2d-cont sequence requires before iter-B4c-kernel can land the actual kernel slot-offset routing.
+
+**Remaining followups** (typed, not vaporware):
+
+- **iter-B4c-kernel**: Gemma 4 worker hot path FULL lift onto the per-layer `MultiSeqHbKvBuffers` (provisioned by C2c at spawn time per §6.1.21). Today, the worker arm clamps SlotId(N>0) with typed `CapabilityUnsupported`; iter-B4c-kernel routes SlotId(N>0) through the persistent multi-seq KV by (a) refactoring the 3 inline alloc sites at `forward_prefill.rs:843-882`, `forward_prefill_batched.rs:443-475`, `forward_gpu.rs:443-459` through `alloc_hb_kv_for_layer(.., n_seqs=max_slots)` (returning `MultiSeqHbKvBuffers`); (b) threading `slot_id: SlotId` through `forward_prefill_with_kv_cache` / `forward_embed_last` / `forward_prefill_with_soft_tokens`; (c) wiring per-slot `MlxBuffer::slice_view(byte_offset, n_elements)` at the `dispatch_hadamard_quantize_kv_hb_*` callers (same primitive Qwen35 B4a-cont uses per §6.1.20). Pinned by H42 + H43 label strings + H43 structural-absence assertion. Parallel to iter-C2d-cont-kernel for the Qwen35 surface; both unblock Phase E1 production cutover for their respective architectures.
+- **iter-C2d-cont-kernel**: Qwen35 worker hot path FULL lift (parallel to iter-B4c-kernel for the Qwen35 surface). See §6.1.24.
+- **iter-A2b-cont**: Forward-path linear-attn dispatch site multi-seq lift in `gpu_delta_net.rs` (gated upstream by iter-C2d-cont-kernel per §6.1.23).
+- **iter-A3b-2 / iter-A3b-3**: DenseKvBuffers + MlxKvCache full lifts (still typed-clamped per A3b iter-1 / A3b iter-1.5 hygiene fix).
+- **iter-C2e / iter-C2e-cont**: Qwen3VL SlotAware activation + worker-arm clamp (see §6.1.22, §6.1.24).
 - **Phase E1**: production cutover decision + final ADR-040 closure ceremony.
 
 ---
