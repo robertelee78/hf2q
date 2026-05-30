@@ -852,12 +852,19 @@ impl BenchServer {
     fn spawn(gguf: &str, policy: &str, max_slots: u32, port: u16) -> std::io::Result<Self> {
         let bin = hf2q_binary_path();
         let mut cmd = Command::new(bin);
+        // CLI accepts hyphenated form (`fifo-serial` / `inflight-batched`)
+        // per clap's kebab-case auto-derivation; bench cell `policy`
+        // strings use underscore form. Convert here at the subprocess
+        // boundary so report / assertion code keeps the underscore form
+        // unchanged. ADR-040 §6.1.55 D3-AC-4 real-hardware bench
+        // (commit hash recorded at commit time).
+        let policy_cli = policy.replace('_', "-");
         cmd.args([
             "serve",
             "--model", gguf,
             "--host", "127.0.0.1",
             "--port", &port.to_string(),
-            "--scheduler", policy,
+            "--scheduler", &policy_cli,
         ]);
         // `--max-slots` is only honored under inflight_batched per ADR-040
         // §6 Phase C iter-4 (C4); pass it for both policies — fifo_serial

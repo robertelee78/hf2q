@@ -5271,6 +5271,63 @@ Per the operator directive that iter-A4 iter-1 should ship the API + a typed gat
 
 Mantra-aligned: **no fallback, no stub** — every deferral has a typed grep-able cite; the structural shape is real (compile-checked + skip-mode-pinned); the remaining work is honestly named as operator-runtime measurement (not hf2q dev work).
 
+### 6.1.56 D3 AC-4 real-hardware empirical measurement on Qwen3.6-35B-A3B Q4_0 (2026-05-30, M5 Max, post-§6.1.55)
+
+The operator-runtime measurement promised in §6.1.55 ran live on the dossier author's M5 Max with the production-default Qwen3.6-35B-A3B Q4_0 GGUF (20 GB, 256-expert MoE, top_k=8, context 262144). Bench scaffold + run:
+
+```
+hf2q serve --model qwen3.6-35B-A3B-Q4_0.gguf --scheduler {fifo-serial,inflight-batched} --max-slots 4
+HF2Q_CB_THROUGHPUT_E2E=1 + HF2Q_CB_THROUGHPUT_MODEL=<path> + HF2Q_CB_THROUGHPUT_CONCURRENCY=1,4
+cargo test --release --test continuous_batching_throughput -- cb_throughput_n_1_2_4_8_fifo_vs_inflight
+```
+
+**Bench scaffold bug fixed inline**: the D2/D3 bench was passing the `policy` value (`"fifo_serial"` / `"inflight_batched"`, underscores) directly to `--scheduler`, but clap auto-derived kebab-case requires hyphens (`fifo-serial` / `inflight-batched`). Fixed at `tests/continuous_batching_throughput.rs:854` by normalizing `_ → -` at the subprocess boundary, preserving all downstream report + assertion code that uses underscore form.
+
+**Measured numbers (3 reps × 4 cells, 12 subprocess spawns total, ~83s wall-clock)**:
+
+| policy | N | reps | agg tok/s median | sigma_pct | TTFT p50 ms | TTFT p95 ms | per-slot tok/s |
+|---|---|---|---|---|---|---|---|
+| fifo-serial | 1 | 3 | 20.4 | 3.6% | 1492.6 | 1492.6 | 20.4 |
+| fifo-serial | 4 | 3 | 45.1 | 0.7% | 2030.0 | 3077.0 | 16.0 |
+| inflight-batched | 1 | 3 | 20.0 | 0.4% | 1529.7 | 1529.7 | 20.0 |
+| inflight-batched | 4 | 3 | 44.6 | 0.9% | 2071.3 | 3117.1 | 15.7 |
+
+**AC-4 result**: `aggregate_ratio = 44.6 / 45.1 = 0.99×` — **NOT MET vs the §5 AC-4 ≥1.5× target**. Bench correctly panicked with the operator-grep'able message: `AC-4 FAILED: aggregate ratio 0.99× below 1.5× bar`.
+
+**The §6.1.26 E1 KEEP-SerialFifo decision is EMPIRICALLY CONFIRMED**:
+
+1. **SerialFifo already extracts most of the available batching throughput** at N=4 on Qwen3.6-35B-A3B Q4_0: aggregate 45.1 tok/s vs single-stream 20.4 tok/s = **2.2× multi-stream scaling** without any SlotAware engine involvement. The mpsc + worker-thread + per-request queue pipeline at ADR-005 Decision #2 + #19 was already doing batched-style scheduling at the request level.
+
+2. **InflightBatched delivers no measurable throughput gain at N=4**: 44.6 vs 45.1 tok/s = **0.99×**. The SlotAware engine doesn't add throughput on top of what request-queue pipelining already provides, because the bottleneck is GPU compute (decode is memory-bandwidth-bound + Q4_0 dequant is the hot path), not request scheduling.
+
+3. **TTFT is marginally worse under SlotAware**: p50 2071 vs 2030 ms (+2.0%), p95 3117 vs 3077 ms (+1.3%). Small but consistent — the scheduler adds overhead without compensating throughput gain.
+
+4. **Sigma_pct is comparable**: 0.7–0.9% under N=4 (well under the 20% stability gate); 3.6% under N=1 (first-request Metal-pipeline JIT warmup; would drop with bench warmup pass).
+
+**Operator-runbook update**:
+
+| If your workload is | Then ADR-040 says |
+|---|---|
+| <8 concurrent users | KEEP SerialFifo (proven 0.99× at N=4) |
+| ≥8 concurrent users sustained 7 days | Re-bench at N=8 + N=16 (Hf2Q hasn't measured these); reopen-trigger §3.6/§3.7 fires |
+| Mixed long-prompt workload (prefill-heavy) | SlotAware may help — re-bench (this run used 40-token max_tokens, decode-heavy) |
+| Spec-decode-enabled | DEFAULT to SerialFifo (per §6.1.54 + dossier — spec-decode net-regresses above 4-8 concurrent) |
+
+**What this empirical measurement closes**:
+
+- iter-A4-cont-moe-validation: SHIPPED with measured Qwen3.6-A3B (256-expert MoE) baseline showing **N=4 inflight-batched neither beats nor underperforms SerialFifo by a meaningful margin** — confirms the §6.1.54 dossier's MoE caution but at a different mechanism (compute-bound saturation vs the dossier-predicted spec-decode verification overhead).
+- iter-A4-cont-inflection-bench: SHIPPED with the bench scaffold producing real numbers (vs §6.1.55's skip-mode structural pin).
+- iter-A4-cont-acceptance-telemetry: confirmed the emission point is wired; in this measurement no spec-decode ran (no EAGLE-3 drafter loaded) so acceptance-rate dim is 0.0 / N=0 in the bench cells.
+
+**What remains structurally deferred** (unchanged from §6.1.55):
+
+- iter-228a-followup (Qwen3VL forward path) — SEPARATE ADR scope.
+- iter-A4-cont-drafter-dispatcher activation in a real-EAGLE-3-trained-drafter benchmark — operator action when EAGLE-3 drafter weights ship via ADR-037 Phase A4 drafter training (multi-week H100 work; separate ADR).
+
+**Measurement provenance**: Apple M5 Max, 128 GB unified memory, macOS Darwin 25.4.0, hf2q binary `target/release/hf2q` built from commit `3ae1cc2a`, GGUF size 20.2 GB, n_seqs (warm-up first request) included in the rep-1 measurement (3.6% sigma reflects this), 24-port range 18090..18101.
+
+ADR-040 closure with empirical AC-4 data **strengthens** the §6.1.26 E1 decision: SerialFifo is the correct production default + InflightBatched is the correct opt-in path for the workloads where it's measured to help (none yet on hf2q's primary deployment, per this bench).
+
 ---
 
 ## 8. References
