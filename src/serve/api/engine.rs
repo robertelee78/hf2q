@@ -8280,7 +8280,20 @@ fn generate_gemma4_once_slot_aware(
     // hybrid scaffold threaded through to the model fn via
     // `.as_deref_mut()` reborrow (so we can re-borrow for the exit-reset
     // below this call without consuming the outer `Option<&mut Vec<_>>`).
+    // ADR-040 iter-B4c-kernel iter-2-decode-A (2026-05-30) — Generate-arm
+    // decode-loop body lands.  iter-2B's prefill returns the first decode
+    // token via `forward_prefill_with_soft_tokens_slot_aware`; iter-2-decode-A
+    // calls `forward_decode_slot_aware` per token in a greedy fast-path loop
+    // until EOS or `max_tokens`.
+    //
+    // Sub-deferrals: full sampler/grammar/tool-call/stop-strings/logprobs/
+    // reasoning-text surface is **iter-B4c-kernel-iter-2-decode-C** scope.
+    // iter-2-decode-A surfaces typed `CapabilityUnsupported` when sampling
+    // is requested (T != 0, top_p < 1, grammar set, etc.).  The greedy
+    // fast-path is the production-engagement load-bearing primitive that
+    // unblocks chat-completion + embedding workloads at SlotId(N>0).
     let kernel_forward_result: Result<GenerationResult> = (|| -> Result<GenerationResult> {
+        let prefill_started = Instant::now();
         let first_decode_token = loaded
             .weights
             .forward_prefill_with_soft_tokens_slot_aware(
@@ -8293,39 +8306,116 @@ fn generate_gemma4_once_slot_aware(
                 multi_seq_kv,
                 multi_seq_kv_hybrid.as_deref_mut(),
             )?;
-        // iter-2B production-default hybrid branch: the model fn now
-        // returns Ok with the first decode token via the slot-view
-        // mount + delegate to the legacy sibling.  The decode-loop body
-        // (iter-B4c-kernel-iter-2-decode) is the next sub-deferral — the
-        // sibling's prefill body emits the first decode token, but the
-        // subsequent decode tokens require `forward_decode` calls that
-        // do NOT yet thread `slot_id` (gated on iter-2-decode landing).
-        //
-        // For now: surface the first decode token wrapped in a single-
-        // token GenerationResult; the orchestrator caller does NOT yet
-        // run the multi-token decode loop on this path.  When iter-2-decode
-        // lands, this IIFE will grow into the full decode loop body
-        // matching `generate_once`'s structure at engine.rs:6595-6700.
-        //
-        // iter-2A-cont / 2C / 2D dispatch-fork branches (HB-encoded,
-        // legacy 4-bit, dense F32): still return typed
-        // CapabilityUnsupported from the model fn body — control flow
-        // does NOT reach here on those branches.
-        //
-        // Pinned by H99 sub-test (the hybrid Ok path threads the first
-        // decode token) + the decode-loop sub-deferral label below.
-        let _ = first_decode_token;
-        let err = MultiSeqError::CapabilityUnsupported {
-            capability:
-                "gemma4-forward-prefill-kernel-slot-N-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.32 — decode-loop body wraps forward_decode calls at slot_id; today forward_decode in src/inference/models/gemma4/forward_gpu.rs:310 has NO slot_id parameter — its lazy-alloc block at lines 396-466 mirrors the prefill alloc sites and must thread slot_id + consult the persistent multi-seq scaffold; gated on iter-2A-cont/2B kernel-dispatch refactor landing the prefill side first)",
+        let prefill_duration = prefill_started.elapsed();
+
+        // iter-2-decode-C sampling sub-deferral: route any non-greedy
+        // request to a typed CapabilityUnsupported.  Greedy fast-path
+        // = T=0 (no sampling) AND no grammar AND no tool-call constraints.
+        // Mirror of the dispatch-fork discipline iter-2A/2B established.
+        let sample_logits = params.temperature > 0.0;
+        if sample_logits
+            || params.grammar.is_some()
+            || !params.stop_strings.is_empty()
+            || params.logprobs
+        {
+            let err = MultiSeqError::CapabilityUnsupported {
+                capability: "gemma4-forward-decode-slot-N-sampler-grammar (iter-B4c-kernel-iter-2-decode-C per ADR-040 §6.1.38 — full sampler/grammar/tool-call/stop-strings/logprobs/reasoning-text surface decode-side slot routing; orthogonal to the greedy fast-path which iter-2-decode-A lands)",
+            };
+            anyhow::bail!(
+                "generate_gemma4_once_slot_aware: non-greedy decode requested \
+                 (T={} grammar={} stop_strings={} logprobs={}) but slot-aware \
+                 sampler/grammar/tool-call/stop-strings/logprobs/reasoning-text \
+                 surface is iter-B4c-kernel-iter-2-decode-C scope at slot_id={}. {}",
+                params.temperature,
+                params.grammar.is_some(),
+                params.stop_strings.len(),
+                params.logprobs,
+                slot_id.0,
+                err,
+            );
+        }
+
+        // Greedy decode loop.  Mirror of the `generate_once` shape at
+        // engine.rs:7734-7800 stripped to T=0 greedy fast-path only.
+        // iter-2-decode-C lands the full surface (sampler / grammar /
+        // tool-call / stop-strings / logprobs / reasoning markers).
+        let decode_started = Instant::now();
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_decode_tokens);
+        let mut decoded_text = String::new();
+        let mut finish_reason: &'static str = "length";
+        let mut next_token = first_decode_token;
+
+        // Decode the first emitted token into text BEFORE the EOS check
+        // so the response includes the prefill-emitted token bytes.
+        let first_fragment = loaded
+            .tokenizer
+            .decode(&[next_token], false)
+            .unwrap_or_default();
+        decoded_text.push_str(&first_fragment);
+
+        if loaded.eos_token_ids.contains(&next_token) {
+            finish_reason = "stop";
+        } else {
+            generated_tokens.push(next_token);
+            // Continue decoding from token index 1 through max_decode_tokens.
+            // Position offset: prompt_len + (generated_tokens.len() - 1).
+            // Same offset arithmetic as `generate_once`'s loop at line 7735.
+            for _ in 1..max_decode_tokens {
+                let pos = prompt_tokens.len() + generated_tokens.len() - 1;
+                let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+                let greedy_token = loaded
+                    .weights
+                    .forward_decode_slot_aware(
+                        next_token,
+                        pos,
+                        &mut loaded.ctx,
+                        &mut p,
+                        slot_id,
+                        multi_seq_kv,
+                        multi_seq_kv_hybrid.as_deref_mut(),
+                    )?;
+                next_token = greedy_token;
+                if loaded.eos_token_ids.contains(&next_token) {
+                    finish_reason = "stop";
+                    break;
+                }
+                generated_tokens.push(next_token);
+                let fragment = loaded
+                    .tokenizer
+                    .decode(&[next_token], false)
+                    .unwrap_or_default();
+                decoded_text.push_str(&fragment);
+            }
+        }
+        let decode_duration = decode_started.elapsed();
+
+        // Build the GenerationResult with the greedy-fast-path-only surface.
+        // reasoning_text + reasoning_tokens + logprobs are iter-2-decode-C
+        // scope (those surfaces require the marker splitter + sampler
+        // logprob hooks which the iter-2-decode-A sampling-clamp at the
+        // top of this IIFE explicitly defers).  cached_tokens = 0 because
+        // the slot-aware path explicitly disables LCP / chunked-prefill /
+        // prompt-cache (iter-LCP scope).
+        let completion_tokens = if finish_reason == "stop" {
+            generated_tokens.len()
+        } else {
+            // length-stop: the last in-loop greedy_token was pushed but
+            // never decoded, so the generated_tokens count IS the
+            // completion-tokens count.
+            generated_tokens.len()
         };
-        Err(anyhow::anyhow!(
-            "capability_unsupported: ADR-040 iter-B4c-kernel iter-2B — \
-             forward_prefill_with_soft_tokens_slot_aware returned Ok with first decode \
-             token; multi-token decode loop body wrapping is iter-B4c-kernel-iter-2-decode \
-             scope. {}",
-            err,
-        ))
+        Ok(GenerationResult {
+            text: decoded_text,
+            reasoning_text: None,
+            prompt_tokens: prompt_tokens.len(),
+            completion_tokens,
+            reasoning_tokens: None,
+            finish_reason,
+            prefill_duration,
+            decode_duration,
+            cached_tokens: 0,
+            logprobs: None,
+        })
     })();
 
     // Per-slot reset at exit — leave the slot clean for the next
@@ -8630,30 +8720,125 @@ fn generate_stream_gemma4_once_slot_aware(
             multi_seq_kv_hybrid.as_deref_mut(),
         );
 
-    // iter-3 emits the iter-2-decode sub-deferral as an SSE error event
-    // — mirrors the Generate-arm IIFE pattern at engine.rs:7955-7965
-    // but routes through the SSE channel instead of a Result return.
-    // When iter-B4c-kernel-iter-2-decode lands, this branch will grow
-    // into the per-token Delta emission loop + terminal Done event.
+    // ADR-040 iter-B4c-kernel iter-2-decode-A (2026-05-30) — GenerateStream-arm
+    // decode-loop body lands.  Mirror of the Generate-arm Greedy fast-path
+    // landing at line 8283-8400 but routed through the SSE event channel.
+    //
+    // Sub-deferrals (same as Generate-arm): full sampler/grammar/tool-call/
+    // stop-strings/logprobs/reasoning-text surface is iter-B4c-kernel-iter-
+    // 2-decode-C scope.  Sampling-clamp surfaces typed
+    // CapabilityUnsupported via SSE Error event when requested.
     match prefill_result {
         Ok(first_decode_token) => {
-            // Prefill succeeded — drop the first decode token (the
-            // multi-token decode loop body wrapping is the
-            // iter-2-decode sub-deferral; until it lands, we cannot
-            // emit content deltas safely without leaking the prefill
-            // KV state for the next slot's request).
-            let _ = first_decode_token;
-            let err = MultiSeqError::CapabilityUnsupported {
-                capability:
-                    "gemma4-forward-prefill-kernel-slot-N-stream-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.35 — streaming decode-loop body wraps forward_decode calls at slot_id; today forward_decode in src/inference/models/gemma4/forward_gpu.rs:310 has NO slot_id parameter — its lazy-alloc block at lines 396-466 mirrors the prefill alloc sites and must thread slot_id + consult the persistent multi-seq scaffold; gated on iter-2A-cont/2B kernel-dispatch refactor landing the prefill side first)",
-            };
-            send!(super::sse::GenerationEvent::Error(format!(
-                "capability_unsupported: ADR-040 iter-B4c-kernel iter-3 — \
-                 forward_prefill_with_soft_tokens_slot_aware returned Ok with \
-                 first decode token; multi-token streaming decode loop body \
-                 wrapping is iter-B4c-kernel-iter-2-decode scope. {}",
-                err,
-            )));
+            // iter-2-decode-C sampling sub-deferral: route any non-greedy
+            // request to a typed error event.  Same predicate as the
+            // Generate-arm sampling-clamp at engine.rs:8329 (mirror).
+            let sample_logits = params.temperature > 0.0;
+            if sample_logits
+                || params.grammar.is_some()
+                || !params.stop_strings.is_empty()
+                || params.logprobs
+            {
+                let err = MultiSeqError::CapabilityUnsupported {
+                    capability:
+                        "gemma4-forward-decode-stream-slot-N-sampler-grammar (iter-B4c-kernel-iter-2-decode-C per ADR-040 §6.1.38 — streaming full sampler/grammar/tool-call/stop-strings/logprobs/reasoning-text surface decode-side slot routing; orthogonal to the greedy fast-path which iter-2-decode-A lands)",
+                };
+                send!(super::sse::GenerationEvent::Error(format!(
+                    "capability_unsupported: ADR-040 iter-B4c-kernel iter-2-decode-A — \
+                     non-greedy streaming decode requested (T={} grammar={} \
+                     stop_strings={} logprobs={}) but slot-aware sampling \
+                     surface is iter-B4c-kernel-iter-2-decode-C scope. {}",
+                    params.temperature,
+                    params.grammar.is_some(),
+                    params.stop_strings.len(),
+                    params.logprobs,
+                    err,
+                )));
+            } else {
+                // Greedy fast-path streaming decode loop.  Per-token Delta
+                // emission + EOS handling + terminal Done event.  Mirror
+                // of the `generate_stream_once` shape at engine.rs:~9493
+                // stripped to T=0 greedy fast-path only.
+                let mut next_token = first_decode_token;
+                let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_decode_tokens);
+                let mut completion_token_count: usize = 0;
+                let mut finish_reason: &'static str = "length";
+
+                // Emit the prefill-emitted token's text as the first
+                // Content Delta.  Reasoning-content / marker-splitter
+                // routing is iter-2-decode-C scope (the sampling-clamp
+                // above already rejects requests that engage them via
+                // `params.grammar.is_some()`).
+                let first_fragment = loaded
+                    .tokenizer
+                    .decode(&[next_token], false)
+                    .unwrap_or_default();
+                if !first_fragment.is_empty() {
+                    send!(super::sse::GenerationEvent::Delta {
+                        kind: super::sse::DeltaKind::Content,
+                        text: first_fragment,
+                    });
+                }
+                completion_token_count += 1;
+
+                let mut decode_err: Option<anyhow::Error> = None;
+                if loaded.eos_token_ids.contains(&next_token) {
+                    finish_reason = "stop";
+                } else {
+                    generated_tokens.push(next_token);
+                    for _ in 1..max_decode_tokens {
+                        let pos = prompt_tokens.len() + generated_tokens.len() - 1;
+                        let mut p: Option<
+                            crate::inference::models::gemma4::profile::TokenProfile,
+                        > = None;
+                        let r = loaded.weights.forward_decode_slot_aware(
+                            next_token,
+                            pos,
+                            &mut loaded.ctx,
+                            &mut p,
+                            slot_id,
+                            multi_seq_kv,
+                            multi_seq_kv_hybrid.as_deref_mut(),
+                        );
+                        let greedy_token = match r {
+                            Ok(t) => t,
+                            Err(e) => {
+                                decode_err = Some(e);
+                                break;
+                            }
+                        };
+                        next_token = greedy_token;
+                        if loaded.eos_token_ids.contains(&next_token) {
+                            finish_reason = "stop";
+                            break;
+                        }
+                        generated_tokens.push(next_token);
+                        let fragment = loaded
+                            .tokenizer
+                            .decode(&[next_token], false)
+                            .unwrap_or_default();
+                        if !fragment.is_empty() {
+                            send!(super::sse::GenerationEvent::Delta {
+                                kind: super::sse::DeltaKind::Content,
+                                text: fragment,
+                            });
+                        }
+                        completion_token_count += 1;
+                    }
+                }
+                if let Some(e) = decode_err {
+                    send!(super::sse::GenerationEvent::Error(format!(
+                        "gemma4 stream slot-aware decode failed: {e:#}",
+                    )));
+                } else {
+                    send!(super::sse::GenerationEvent::Done {
+                        finish_reason,
+                        prompt_tokens: prompt_tokens.len(),
+                        completion_tokens: completion_token_count,
+                        stats: super::sse::StreamStats::default(),
+                    });
+                }
+            }
         }
         Err(e) => {
             send!(super::sse::GenerationEvent::Error(format!(
@@ -9191,7 +9376,14 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
     // §6.1.32 — until iter-2-decode lands, we surface typed
     // `CapabilityUnsupported` on the prefill Ok branch.
     let max_decode_tokens = params.max_tokens.max(1);
+    // ADR-040 iter-B4c-kernel iter-2-decode-A (2026-05-30) — SoftTokens-arm
+    // (vision-aware) decode-loop body lands.  Mirror of the Generate-arm
+    // landing at engine.rs:8283-8400 with the vision-aware soft-token
+    // overrides threaded through verbatim to the prefill call.  The
+    // post-prefill decode loop is identical to Generate-arm: greedy
+    // fast-path only, with iter-2-decode-C sampling-clamp at the top.
     let kernel_forward_result: Result<GenerationResult> = (|| -> Result<GenerationResult> {
+        let prefill_started = Instant::now();
         let first_decode_token = loaded
             .weights
             .forward_prefill_with_soft_tokens_slot_aware(
@@ -9206,24 +9398,95 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                 multi_seq_kv,
                 multi_seq_kv_hybrid.as_deref_mut(),
             )?;
-        // Prefill succeeded — drop the first decode token (the multi-
-        // token decode loop body wrapping is the iter-2-decode sub-
-        // deferral; until it lands, we cannot emit content tokens
-        // safely without leaking the prefill KV state for the next
-        // slot's request).  Mirror of the Generate-arm IIFE discipline
-        // at engine.rs:8143-8189.
-        let _ = first_decode_token;
-        let err = MultiSeqError::CapabilityUnsupported {
-            capability:
-                "gemma4-forward-prefill-kernel-slot-N-soft-tokens-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.37 — vision-aware decode-loop body wraps forward_decode calls at slot_id; today forward_decode in src/inference/models/gemma4/forward_gpu.rs:310 has NO slot_id parameter — its lazy-alloc block at lines 396-466 mirrors the prefill alloc sites and must thread slot_id + consult the persistent multi-seq scaffold; gated on iter-2A-cont/2B kernel-dispatch refactor landing the prefill side first)",
-        };
-        Err(anyhow::anyhow!(
-            "capability_unsupported: ADR-040 iter-B4c-kernel iter-5 — \
-             forward_prefill_with_soft_tokens_slot_aware returned Ok with first \
-             decode token; multi-token vision-aware decode loop body wrapping is \
-             iter-B4c-kernel-iter-2-decode scope. {}",
-            err,
-        ))
+        let prefill_duration = prefill_started.elapsed();
+
+        // iter-2-decode-C sampling sub-deferral: route any non-greedy
+        // request to a typed CapabilityUnsupported (mirror of Generate-arm).
+        let sample_logits = params.temperature > 0.0;
+        if sample_logits
+            || params.grammar.is_some()
+            || !params.stop_strings.is_empty()
+            || params.logprobs
+        {
+            let err = MultiSeqError::CapabilityUnsupported {
+                capability: "gemma4-forward-decode-soft-tokens-slot-N-sampler-grammar (iter-B4c-kernel-iter-2-decode-C per ADR-040 §6.1.38 — vision-aware full sampler/grammar/tool-call/stop-strings/logprobs/reasoning-text surface decode-side slot routing; orthogonal to the greedy fast-path which iter-2-decode-A lands)",
+            };
+            anyhow::bail!(
+                "generate_gemma4_once_with_soft_tokens_slot_aware: non-greedy \
+                 vision-aware decode requested (T={} grammar={} stop_strings={} \
+                 logprobs={}) but slot-aware sampler/grammar/tool-call/stop-strings/\
+                 logprobs/reasoning-text surface is iter-B4c-kernel-iter-2-decode-C \
+                 scope at slot_id={}. {}",
+                params.temperature,
+                params.grammar.is_some(),
+                params.stop_strings.len(),
+                params.logprobs,
+                slot_id.0,
+                err,
+            );
+        }
+
+        // Greedy decode loop (mirror of Generate-arm at engine.rs:8350-8400).
+        // Identical body — the SoftTokens-arm difference is fully consumed
+        // by the prefill call's `soft_tokens` parameter; the decode body
+        // is vanilla per-token forward_decode.
+        let decode_started = Instant::now();
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_decode_tokens);
+        let mut decoded_text = String::new();
+        let mut finish_reason: &'static str = "length";
+        let mut next_token = first_decode_token;
+
+        let first_fragment = loaded
+            .tokenizer
+            .decode(&[next_token], false)
+            .unwrap_or_default();
+        decoded_text.push_str(&first_fragment);
+
+        if loaded.eos_token_ids.contains(&next_token) {
+            finish_reason = "stop";
+        } else {
+            generated_tokens.push(next_token);
+            for _ in 1..max_decode_tokens {
+                let pos = prompt_tokens.len() + generated_tokens.len() - 1;
+                let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+                let greedy_token = loaded
+                    .weights
+                    .forward_decode_slot_aware(
+                        next_token,
+                        pos,
+                        &mut loaded.ctx,
+                        &mut p,
+                        slot_id,
+                        multi_seq_kv,
+                        multi_seq_kv_hybrid.as_deref_mut(),
+                    )?;
+                next_token = greedy_token;
+                if loaded.eos_token_ids.contains(&next_token) {
+                    finish_reason = "stop";
+                    break;
+                }
+                generated_tokens.push(next_token);
+                let fragment = loaded
+                    .tokenizer
+                    .decode(&[next_token], false)
+                    .unwrap_or_default();
+                decoded_text.push_str(&fragment);
+            }
+        }
+        let decode_duration = decode_started.elapsed();
+
+        Ok(GenerationResult {
+            text: decoded_text,
+            reasoning_text: None,
+            prompt_tokens: prompt_tokens.len(),
+            completion_tokens: generated_tokens.len(),
+            reasoning_tokens: None,
+            finish_reason,
+            prefill_duration,
+            decode_duration,
+            cached_tokens: 0,
+            logprobs: None,
+        })
     })();
 
     // Per-slot reset at exit — leave the slot clean for the next
@@ -22973,9 +23236,23 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_gemma4_tests {
         );
     }
 
-    /// **H87 (skip-mode)** — iter-2A typed sub-deferrals are all
-    /// NAMED with operator-grep'able iter-N labels for each remaining
-    /// sub-iter:
+    /// **H87 (skip-mode; REVISED 2026-05-30 §6.1.38)** — iter-2A typed
+    /// sub-deferrals are all NAMED with operator-grep'able iter-N labels
+    /// for each remaining sub-iter.  Mirror of iter-1 H83's discipline.
+    ///
+    /// **REVISION POST-iter-2-decode-A (§6.1.38)**: the literal
+    /// `iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.32` was REMOVED
+    /// from the orchestrator IIFE — iter-2-decode-A landed real decode-
+    /// loop bodies in all 3 orchestrators (Generate / GenerateStream /
+    /// SoftTokens) replacing the iter-2-decode IIFE typed-error returns.
+    /// The orchestrator decode-loop body now carries an
+    /// `iter-B4c-kernel-iter-2-decode-C per ADR-040 §6.1.38` cite (the
+    /// surviving sub-deferral: full sampler/grammar/tool-call/stop-strings
+    /// /logprobs/reasoning-text surface).  Sibling-discipline intent
+    /// preserved by swapping the literal — H87 still pins that EVERY
+    /// 4-way dispatch-fork branch on the prefill side AND a surviving
+    /// decode-side sub-deferral are NAMED.
+    ///
     /// - `iter-B4c-kernel-iter-2A-cont`: HB-encoded prefill slot
     ///   routing (the in-scope kernel-dispatch refactor surface).
     /// - `iter-B4c-kernel-iter-2B`: HybridKvBuffers slot routing
@@ -22984,13 +23261,12 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_gemma4_tests {
     ///   (HF2Q_TQ_CODEBOOK_BITS=4 opt-in surface).
     /// - `iter-B4c-kernel-iter-2D`: dense F32 path (HF2Q_USE_DENSE=1
     ///   LCP-eligible regime).
-    /// - `iter-B4c-kernel-iter-2-decode`: decode-loop body wrapping
-    ///   `forward_decode` (orchestrator-side hypothetical-Ok branch).
+    /// - `iter-B4c-kernel-iter-2-decode-C`: orchestrator-side sampling/
+    ///   grammar/tool-call/stop-strings/logprobs/reasoning-text surface
+    ///   (REPLACED the iter-2-decode label when iter-2-decode-A landed).
     ///
     /// Drift here means a sub-deferral lost its operator-grep'able
     /// label.
-    ///
-    /// Mirrors iter-1 H83's discipline for the iter-2 sub-iters.
     #[test]
     fn h87_iter2a_sub_deferrals_named_for_remaining_iters() {
         let pf_src = include_str!("../forward_prefill.rs");
@@ -23002,8 +23278,11 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_gemma4_tests {
             "iter-B4c-kernel-iter-2B per ADR-040 §6.1.32",      // HybridKvBuffers
             "iter-B4c-kernel-iter-2C per ADR-040 §6.1.32",      // legacy 4-bit
             "iter-B4c-kernel-iter-2D per ADR-040 §6.1.32",      // dense F32
-            // Decode-loop sub-deferral inside the orchestrator.
-            "iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.32",
+            // Decode-loop sub-deferral inside the orchestrator —
+            // REVISED post-iter-2-decode-A: iter-2-decode-C is the
+            // surviving sub-deferral (orchestrator-side sampling/grammar
+            // /tool-call/stop-strings/logprobs/reasoning-text surface).
+            "iter-B4c-kernel-iter-2-decode-C per ADR-040 §6.1.38",
         ] {
             assert!(
                 combined.contains(label),
@@ -25783,5 +26062,419 @@ mod adr040_phase_b_iter_b4c_kernel_iter5_gemma4_tests {
                  iter-N label."
             );
         }
+    }
+}
+
+// ============================================================================
+// ADR-040 iter-B4c-kernel iter-2-decode-A — H123-H129 hypothesis pins
+// ============================================================================
+//
+// Scope (iter-2-decode-A 2026-05-30 — Gemma 4 multi-token decode-loop body
+// wrapping forward_decode at slot_id):
+//
+// Pre-iter-2-decode-A, the 3 Gemma 4 slot-aware orchestrators
+// (generate_gemma4_once_slot_aware / generate_stream_gemma4_once_slot_aware
+// / generate_gemma4_once_with_soft_tokens_slot_aware) each surfaced a typed
+// `MultiSeqError::CapabilityUnsupported { capability: "...iter-B4c-kernel-
+// iter-2-decode per ADR-040 §6.1.{32,35,37}..." }` after the iter-2B
+// prefill returned its first decode token — the multi-token decode-loop
+// body wrapping `forward_decode` at slot_id was the named sub-deferral.
+//
+// iter-2-decode-A SHIPS:
+//   * NEW `MlxModelWeights::forward_decode_slot_aware` in
+//     `src/serve/forward_prefill.rs` (~430 LOC body) — mirror of
+//     `forward_prefill_with_soft_tokens_slot_aware`'s slot-view mount +
+//     delegate-to-sibling pattern applied to the decode body.  Bounds-
+//     first preflight + 4-way KV-regime dispatch fork (HF2Q_USE_DENSE /
+//     cb_bits==0 / HF2Q_HYBRID_KV / HB-encoded default).  Production-
+//     default hybrid F16-K + TQ-HB-V branch ships REAL slot routing via
+//     slice_view mount on `self.hybrid_kv` → delegate to the unchanged
+//     sibling `forward_decode` at `gemma4/forward_gpu.rs:310` → restore
+//     on exit.
+//   * REPLACED Generate-arm IIFE typed-error body in
+//     `generate_gemma4_once_slot_aware` with a real greedy decode loop
+//     calling `forward_decode_slot_aware` per token.  EOS / max_tokens
+//     handling + tokenizer fragment accumulation matching the
+//     `generate_once` greedy fast-path shape at engine.rs:7728-7800.
+//     iter-2-decode-C sampling-clamp at the loop entry: any request
+//     with T>0 / grammar / stop_strings / logprobs surfaces typed
+//     CapabilityUnsupported naming iter-2-decode-C.
+//   * REPLACED GenerateStream-arm IIFE typed-error body in
+//     `generate_stream_gemma4_once_slot_aware` with a real per-token
+//     Delta-emission decode loop + terminal Done event.  Mirror of the
+//     Generate-arm landing but routed through the SSE channel.
+//   * REPLACED SoftTokens-arm IIFE typed-error body in
+//     `generate_gemma4_once_with_soft_tokens_slot_aware` with the same
+//     greedy decode loop (the SoftTokens vs Generate difference is fully
+//     consumed by the prefill call's soft_tokens param; the decode body
+//     is identical to Generate-arm).
+//
+// Sub-deferrals (typed CapabilityUnsupported labels):
+//   * iter-B4c-kernel-iter-2-decode-B: HB-encoded HF2Q_HYBRID_KV=0 opt-out
+//     decode-side slot routing (mirror of iter-2A-cont prefill scope).
+//     Surfaced from the new fn body's HB-encoded branch.
+//   * iter-B4c-kernel-iter-2-decode-C: orchestrator-side full sampler /
+//     grammar / tool-call / stop-strings / logprobs / reasoning-text
+//     surface.  Surfaced from the 3 orchestrator decode-loop heads.
+//   * iter-B4c-kernel-iter-2-decode-D: dense F32 (HF2Q_USE_DENSE=1) +
+//     legacy 4-bit (HF2Q_TQ_CODEBOOK_BITS=4) decode-side slot routing.
+//     Surfaced from the new fn body's dense / legacy branches.
+//   * iter-B4c-kernel-iter-2-decode-A-xlen: BF16 xlen K/V decode-side
+//     slot routing (HF2Q_DFLASH_XLEN_SDPA=1 opt-in).
+//
+// Tests (H123-H129):
+//   H123 (skip-mode): forward_decode_slot_aware signature lands with
+//                     slot_id: SlotId + multi_seq_kv_hb + multi_seq_kv_hybrid
+//                     params; sibling forward_decode signature UNCHANGED.
+//   H124 (skip-mode): new fn body uses slice_view + mount on self.hybrid_kv
+//                     + delegate to forward_decode + restore — mirror of
+//                     iter-2B prefill pattern.
+//   H125 (skip-mode): Generate orchestrator IIFE typed-error body REPLACED
+//                     with real decode loop calling forward_decode_slot_aware.
+//   H126 (skip-mode): GenerateStream orchestrator IIFE typed-error body
+//                     REPLACED with real Delta-emission decode loop +
+//                     terminal Done event.
+//   H127 (skip-mode): SoftTokens orchestrator IIFE typed-error body
+//                     REPLACED with real decode loop.
+//   H128 (skip-mode): SerialFifo byte-equivalence preserved — the sibling
+//                     forward_decode signature contains NO slot_id /
+//                     multi_seq_kv params.  Code-path disjointness via
+//                     the worker-arm SlotId(0) predicate.
+//   H129 (skip-mode): Qwen35 + Qwen3VL + Embed-arm (iter-4) UNCHANGED;
+//                     iter-1/2A/2B/3/5 lift scaffolds PRESERVED.
+
+#[cfg(test)]
+mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
+    // Skip-mode source-grep tests; intentionally NO `use super::*;`.
+
+    /// **H123 (skip-mode)** — New fn `forward_decode_slot_aware` IS defined
+    /// on `MlxModelWeights` in `src/serve/forward_prefill.rs` with the
+    /// `slot_id: SlotId` + `multi_seq_kv_hb` + `multi_seq_kv_hybrid` params.
+    /// Returns `Result<u32>` matching the sibling fn's return shape.
+    ///
+    /// Pin defends regression to the iter-5 IIFE pattern where the
+    /// orchestrator's hypothetical-Ok branch returned typed
+    /// `CapabilityUnsupported` instead of calling a real model-fn.
+    #[test]
+    fn h123_new_fn_forward_decode_slot_aware_landed() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_decode_slot_aware(";
+        let fn_idx = src.find(fn_marker).expect(
+            "H123 FALSIFIED: `forward_decode_slot_aware` is NOT defined in \
+             src/serve/forward_prefill.rs. iter-2-decode-A's load-bearing \
+             model-fn primitive is missing — orchestrator decode loops have \
+             nothing to call.",
+        );
+        let sig_window = &src[fn_idx..(fn_idx + 2500).min(src.len())];
+        // Required params (mirror of iter-2A/2B prefill signature).
+        for required in [
+            "input_token: u32",
+            "seq_pos: usize",
+            "gpu: &mut GpuContext",
+            "slot_id: SlotId",
+            "multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>",
+            "multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>",
+        ] {
+            assert!(
+                sig_window.contains(required),
+                "H123 FALSIFIED: new fn signature missing `{required}`. \
+                 iter-2-decode-A's load-bearing param surface broken."
+            );
+        }
+        // Return type: Result<u32> (matches sibling forward_decode).
+        assert!(
+            sig_window.contains(") -> Result<u32>"),
+            "H123 FALSIFIED: new fn does NOT return `Result<u32>`. \
+             Decode-loop callers expect the on-GPU greedy argmax."
+        );
+    }
+
+    /// **H124 (skip-mode)** — New fn body uses the iter-2B slice_view
+    /// mount + delegate-to-sibling pattern for the HYBRID branch
+    /// (production-default per H10 falsification at §6.1.11).
+    ///
+    /// Required structural elements:
+    ///   * `.slice_view(` — per-slot view primitive (Qwen35 B4a-cont mirror).
+    ///   * `self.hybrid_kv = Some(slot_view_hybrid)` — mount.
+    ///   * `self.forward_decode(` — delegate to the unchanged sibling.
+    ///   * `self.hybrid_kv = prior_hybrid_kv` — restore on exit.
+    ///
+    /// Pin defends regression where iter-2-decode-A accidentally drops one
+    /// of the 4 load-bearing structural elements (mount without restore,
+    /// delegate without mount, etc.).
+    #[test]
+    fn h124_new_fn_slice_view_mount_delegate_pattern() {
+        let src = include_str!("../forward_prefill.rs");
+        let fn_marker = "pub fn forward_decode_slot_aware(";
+        let fn_idx = src.find(fn_marker).expect("H124: fn marker present (H123)");
+        // Look at the next ~30k bytes to cover the full fn body.
+        let fn_window = &src[fn_idx..(fn_idx + 30_000).min(src.len())];
+        for required in [
+            ".slice_view(",
+            "self.hybrid_kv = Some(",
+            "self.forward_decode(",
+            "self.hybrid_kv = prior_hybrid_kv",
+        ] {
+            assert!(
+                fn_window.contains(required),
+                "H124 FALSIFIED: new fn body missing structural element \
+                 `{required}`. iter-2-decode-A's slot-view mount + delegate \
+                 + restore pattern broken — per-slot routing through the \
+                 persistent multi-seq scaffold cannot work."
+            );
+        }
+    }
+
+    /// **H125 (skip-mode)** — Generate orchestrator IIFE typed-error body
+    /// REPLACED with a real decode loop calling forward_decode_slot_aware.
+    ///
+    /// (a) The OLD iter-2-decode label (`gemma4-forward-prefill-kernel-slot-N-
+    ///     decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.32`)
+    ///     is REMOVED from the Generate orchestrator body.
+    /// (b) The new fn call (`forward_decode_slot_aware(`) IS present at
+    ///     least once in the Generate orchestrator body.
+    /// (c) The orchestrator threads `slot_id` (not a hardcoded SlotId(0))
+    ///     into the new fn call.
+    #[test]
+    fn h125_generate_orchestrator_decode_loop_wired() {
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_gemma4_once_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H125: generate_gemma4_once_slot_aware not found");
+        // Cover the full fn body — generously sized window.
+        let fn_window = &src[fn_idx..(fn_idx + 20_000).min(src.len())];
+        // (a) OLD iter-2-decode literal REMOVED.
+        let old_label =
+            "gemma4-forward-prefill-kernel-slot-N-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.32";
+        assert!(
+            !fn_window.contains(old_label),
+            "H125 FALSIFIED: Generate orchestrator body still contains the \
+             iter-2-decode IIFE typed-error label `{old_label}`. iter-2-decode-A \
+             did not actually wire the decode loop — orchestrator still \
+             returns CapabilityUnsupported after the prefill Ok."
+        );
+        // (b) New fn call present.
+        assert!(
+            fn_window.contains(".forward_decode_slot_aware("),
+            "H125 FALSIFIED: Generate orchestrator body does NOT call \
+             `forward_decode_slot_aware`. iter-2-decode-A decode loop \
+             is missing — orchestrator cannot emit content tokens."
+        );
+        // (c) slot_id threaded through (not a hardcoded SlotId(0)).
+        let call_idx = fn_window.find(".forward_decode_slot_aware(").expect(
+            "H125: call marker present (asserted above)",
+        );
+        let call_window = &fn_window[call_idx..(call_idx + 800).min(fn_window.len())];
+        assert!(
+            call_window.contains("slot_id"),
+            "H125 FALSIFIED: Generate orchestrator call site does NOT pass \
+             `slot_id`.  Per-slot decode routing broken."
+        );
+        assert!(
+            !call_window.contains(", SlotId(0),"),
+            "H125 FALSIFIED: Generate orchestrator call site contains a \
+             literal `SlotId(0)` argument.  Per-slot decode routing broken."
+        );
+    }
+
+    /// **H126 (skip-mode)** — GenerateStream orchestrator IIFE typed-error
+    /// body REPLACED with a real Delta-emission decode loop + Done event.
+    ///
+    /// (a) The OLD iter-2-decode stream label (`gemma4-forward-prefill-
+    ///     kernel-slot-N-stream-decode-loop (iter-B4c-kernel-iter-2-decode
+    ///     per ADR-040 §6.1.35`) is REMOVED from the stream orchestrator.
+    /// (b) The new fn call (`forward_decode_slot_aware(`) IS present.
+    /// (c) The stream emits Delta events (the per-token content fragments)
+    ///     AND a terminal Done event.
+    #[test]
+    fn h126_generate_stream_orchestrator_decode_loop_wired() {
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_stream_gemma4_once_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H126: generate_stream_gemma4_once_slot_aware not found");
+        // Generous body window — streaming fn is larger than the sync arm.
+        let fn_window = &src[fn_idx..(fn_idx + 25_000).min(src.len())];
+        // (a) OLD streaming iter-2-decode literal REMOVED.
+        let old_label =
+            "gemma4-forward-prefill-kernel-slot-N-stream-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.35";
+        assert!(
+            !fn_window.contains(old_label),
+            "H126 FALSIFIED: GenerateStream orchestrator body still contains \
+             the iter-2-decode stream IIFE typed-error label `{old_label}`. \
+             iter-2-decode-A did not actually wire the stream decode loop."
+        );
+        // (b) New fn call present.
+        assert!(
+            fn_window.contains(".forward_decode_slot_aware("),
+            "H126 FALSIFIED: GenerateStream orchestrator body does NOT call \
+             `forward_decode_slot_aware`. iter-2-decode-A stream decode loop \
+             is missing."
+        );
+        // (c) Delta event emit + Done event emit present in the body.
+        assert!(
+            fn_window.contains("GenerationEvent::Delta {"),
+            "H126 FALSIFIED: GenerateStream orchestrator body does NOT emit \
+             `GenerationEvent::Delta {{` events.  The per-token Content delta \
+             emission for the SSE stream is missing — clients would receive \
+             no decoded content."
+        );
+        assert!(
+            fn_window.contains("GenerationEvent::Done {"),
+            "H126 FALSIFIED: GenerateStream orchestrator body does NOT emit \
+             a terminal `GenerationEvent::Done {{` event.  SSE stream cannot \
+             terminate cleanly — clients hang."
+        );
+    }
+
+    /// **H127 (skip-mode)** — SoftTokens orchestrator IIFE typed-error body
+    /// REPLACED with a real decode loop calling forward_decode_slot_aware.
+    ///
+    /// Mirror of H125 for the SoftTokens-arm.  The SoftTokens-arm difference
+    /// is fully consumed by the prefill call's `soft_tokens` parameter; the
+    /// decode body should be identical to Generate-arm.
+    #[test]
+    fn h127_soft_tokens_orchestrator_decode_loop_wired() {
+        let src = include_str!("engine.rs");
+        let fn_marker = "fn generate_gemma4_once_with_soft_tokens_slot_aware(";
+        let fn_idx = src
+            .find(fn_marker)
+            .expect("H127: generate_gemma4_once_with_soft_tokens_slot_aware not found");
+        let fn_window = &src[fn_idx..(fn_idx + 20_000).min(src.len())];
+        // (a) OLD iter-2-decode soft-tokens literal REMOVED.
+        let old_label =
+            "gemma4-forward-prefill-kernel-slot-N-soft-tokens-decode-loop (iter-B4c-kernel-iter-2-decode per ADR-040 §6.1.37";
+        assert!(
+            !fn_window.contains(old_label),
+            "H127 FALSIFIED: SoftTokens orchestrator body still contains the \
+             iter-2-decode soft-tokens IIFE typed-error label `{old_label}`. \
+             iter-2-decode-A did not actually wire the SoftTokens decode loop."
+        );
+        // (b) New fn call present.
+        assert!(
+            fn_window.contains(".forward_decode_slot_aware("),
+            "H127 FALSIFIED: SoftTokens orchestrator body does NOT call \
+             `forward_decode_slot_aware`. iter-2-decode-A SoftTokens decode \
+             loop is missing — vision-aware chat completion cannot emit \
+             content tokens at SlotId(N>0)."
+        );
+        // (c) slot_id threaded through.
+        let call_idx = fn_window.find(".forward_decode_slot_aware(").expect(
+            "H127: call marker present (asserted above)",
+        );
+        let call_window = &fn_window[call_idx..(call_idx + 800).min(fn_window.len())];
+        assert!(
+            call_window.contains("slot_id"),
+            "H127 FALSIFIED: SoftTokens orchestrator call site does NOT pass \
+             `slot_id`.  Per-slot decode routing broken."
+        );
+    }
+
+    /// **H128 (skip-mode)** — SerialFifo + SlotId(0) byte-equivalence
+    /// preserved at the sibling-fn signature level.  The sibling
+    /// `forward_decode` in `gemma4/forward_gpu.rs:310` MUST NOT contain
+    /// `slot_id` or `multi_seq_kv*` in its signature.
+    ///
+    /// Pin defends H1/H2/H23/H41/H44/H77/H102 byte-equivalence chain at
+    /// the decode-side model-fn signature level — code-path disjointness
+    /// is the load-bearing invariant.
+    #[test]
+    fn h128_serial_fifo_sibling_forward_decode_signature_unchanged() {
+        let src = include_str!(
+            "../../inference/models/gemma4/forward_gpu.rs"
+        );
+        let sibling_marker = "pub fn forward_decode(";
+        let sib_idx = src
+            .find(sibling_marker)
+            .expect("H128: sibling forward_decode signature missing");
+        // Look at the signature only (NOT the body — body may legitimately
+        // reference slot_id via doc-comments narrating iter-2-decode-A).
+        let sig_end = src[sib_idx..]
+            .find(") -> Result<u32>")
+            .map(|off| sib_idx + off + ") -> Result<u32>".len())
+            .unwrap_or(sib_idx + 600);
+        let sig_window = &src[sib_idx..sig_end.min(src.len())];
+        assert!(
+            !sig_window.contains("slot_id"),
+            "H128 FALSIFIED: sibling `forward_decode` signature contains \
+             `slot_id` parameter. iter-2-decode-A discipline broken — the \
+             sibling fn MUST remain byte-equivalent for SerialFifo + \
+             SlotId(0).  iter-2-decode-A's primitive is a NEW sibling fn \
+             (`forward_decode_slot_aware` in forward_prefill.rs); the \
+             existing sibling MUST NOT be touched."
+        );
+        assert!(
+            !sig_window.contains("multi_seq_kv"),
+            "H128 FALSIFIED: sibling `forward_decode` signature mentions \
+             `multi_seq_kv`. iter-2-decode-A discipline broken — SerialFifo \
+             decode path MUST NOT consume the multi-seq scaffold."
+        );
+    }
+
+    /// **H129 (skip-mode)** — Qwen35 + Qwen3VL + Embed-arm UNCHANGED.
+    /// The iter-1/2A/2B/3/5 lift scaffolds (Generate / GenerateStream /
+    /// SoftTokens orchestrators) are PRESERVED — iter-2-decode-A is
+    /// PURELY ADDITIVE to those scaffolds (the decode-loop wiring lands
+    /// inside the same orchestrator bodies the prior iters established).
+    #[test]
+    fn h129_orthogonal_surfaces_unchanged() {
+        let src = include_str!("engine.rs");
+        // The Qwen35 lift fns must still be called from worker_run.
+        for qwen35_fn in [
+            "generate_qwen35_once_slot_aware(",
+            "generate_stream_qwen35_once_extended_slot_aware(",
+            "embed_qwen35_slot_aware(",
+            "generate_qwen35_once_with_soft_tokens_slot_aware(",
+        ] {
+            assert!(
+                src.contains(qwen35_fn),
+                "H129 FALSIFIED: Qwen35 slot-aware fn call `{qwen35_fn}` is \
+                 NOT present in engine.rs. iter-2-decode-A accidentally \
+                 removed a Qwen35 lift — the Qwen35 worker-arm arc (TERMINAL \
+                 post-iter-C2d-cont-kernel-iter-4 §6.1.30) is COMPLETE and \
+                 MUST NOT be regressed."
+            );
+        }
+        // The Gemma 4 iter-1/2A/2B/3/4/5 lift fns must still be defined +
+        // called.  iter-2-decode-A is additive INSIDE these fns; the fn
+        // definitions + worker_run call sites MUST be preserved.
+        for gemma_fn in [
+            "fn generate_gemma4_once_slot_aware(",
+            "fn generate_stream_gemma4_once_slot_aware(",
+            "fn embed_gemma4_slot_aware(",
+            "fn generate_gemma4_once_with_soft_tokens_slot_aware(",
+        ] {
+            assert!(
+                src.contains(gemma_fn),
+                "H129 FALSIFIED: Gemma 4 iter-1/3/4/5 lift fn `{gemma_fn}` is \
+                 NOT defined. iter-2-decode-A accidentally regressed a prior \
+                 iter's lift surface — every Gemma 4 worker-arm arc fn MUST \
+                 be preserved."
+            );
+        }
+        // The Embed-arm has NO decode loop (iter-4 §6.1.36 closure: "no
+        // decode loop, so the iter-B4c-kernel-iter-2-decode sub-deferral
+        // does NOT apply").  Defense-in-depth: the Embed-arm fn body must
+        // NOT call forward_decode_slot_aware (decode loop would corrupt
+        // the L2-normalized embedding vector by overwriting norm_out).
+        let embed_marker = "fn embed_gemma4_slot_aware(";
+        let embed_idx = src.find(embed_marker).expect("H129: embed_gemma4_slot_aware not found");
+        let embed_window = &src[embed_idx..(embed_idx + 10_000).min(src.len())];
+        assert!(
+            !embed_window.contains(".forward_decode_slot_aware("),
+            "H129 FALSIFIED: Embed-arm fn body calls \
+             `forward_decode_slot_aware`. The Embed-arm has NO decode loop \
+             — calling forward_decode_slot_aware would corrupt the \
+             L2-normalized embedding vector at norm_out."
+        );
+        // ADR-040 §6.1.38 closure block exists (forward-pin destination).
+        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        assert!(
+            adr.contains("### 6.1.38"),
+            "H129 FALSIFIED: ADR-040 §6.1.38 closure block not found. \
+             iter-2-decode-A's sub-deferral cites point at a non-existent \
+             destination."
+        );
     }
 }

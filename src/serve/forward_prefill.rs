@@ -2957,6 +2957,440 @@ impl MlxModelWeights {
             err,
         );
     }
+
+    /// **ADR-040 iter-B4c-kernel iter-2-decode-A (2026-05-30)** — slot-aware
+    /// Gemma 4 single-token decode wrapping
+    /// [`MlxModelWeights::forward_decode`] with the iter-2B production-default
+    /// hybrid F16-K + TQ-HB-V slice_view mount + delegate-to-sibling pattern
+    /// applied to the decode body.  Production-engagement load-bearing
+    /// primitive that unblocks the multi-token decode-loop bodies in the
+    /// `generate_gemma4_once_slot_aware` (iter-1/2A/2B) +
+    /// `generate_stream_gemma4_once_slot_aware` (iter-3) +
+    /// `generate_gemma4_once_with_soft_tokens_slot_aware` (iter-5)
+    /// orchestrators at engine.rs.
+    ///
+    /// Pre-iter-2-decode-A, each of those 3 orchestrators surfaced a typed
+    /// `MultiSeqError::CapabilityUnsupported { capability: "...iter-B4c-kernel-
+    /// iter-2-decode..." }` after the iter-2B prefill returned its first
+    /// decode token — the multi-token loop body wrapping `forward_decode`
+    /// at `slot_id` was the named sub-deferral.  iter-2-decode-A REPLACES
+    /// those 3 typed-error IIFE bodies with real per-token decode loops
+    /// calling this fn.
+    ///
+    /// # Structural parallels with iter-2B prefill
+    ///
+    /// Mirror of `forward_prefill_with_soft_tokens_slot_aware`'s hybrid
+    /// branch at line 2605-2937 of this file (the slice_view mount +
+    /// delegate-to-sibling pattern), with two adaptations:
+    ///
+    /// 1. Delegates to the sibling [`MlxModelWeights::forward_decode`] in
+    ///    `src/inference/models/gemma4/forward_gpu.rs:310` instead of the
+    ///    prefill sibling.  The decode body's K/V write site at
+    ///    `gemma4/gpu_full_attn.rs::encode_one_layer` reads `self.hybrid_kv`
+    ///    exactly like the prefill body's `forward_prefill.rs:1290-1330`
+    ///    read site — the slot-view mount routes both prefill+decode writes
+    ///    to the per-slot byte region bit-identically.
+    /// 2. The decode lazy-alloc gate at `forward_gpu.rs:413` already had
+    ///    the `&& self.hybrid_kv.is_none()` discipline (iter-2B aligned the
+    ///    prefill alloc gate at line 842 TO match this decode-path gate).
+    ///    Iter-2-decode-A's mount therefore survives `forward_decode`'s
+    ///    body unchanged.
+    /// 3. Returns the on-GPU greedy argmax (`u32`) directly — matches the
+    ///    sibling fn's return shape.  Sampling / grammar / tool-call /
+    ///    stop-string / logprobs / reasoning-text surface is
+    ///    **iter-B4c-kernel-iter-2-decode-C** scope (orchestrator-side
+    ///    typed sub-deferral).
+    ///
+    /// # Bounds-first preflight (A2b §6.1.23 cfa-finding-F5)
+    ///
+    /// Mirrors the iter-2A bounds-first contract at line 2474-2534:
+    ///   * `multi_seq_kv_hb` not-empty + len matches `self.layers.len()`.
+    ///   * `slot_id.0 < multi_seq_kv_hb[0].n_seqs`.
+    ///
+    /// # 4-way dispatch fork (mirror of iter-2A/2B prefill)
+    ///
+    /// Mirror of the prefill 4-way fork at line 2567-2937 with the SAME
+    /// 4 production KV regimes:
+    ///   1. `HF2Q_USE_DENSE=1` (dense F32) → typed `iter-2-decode-D` sub-deferral.
+    ///   2. `HF2Q_TQ_CODEBOOK_BITS=4` (legacy 4-bit) → typed `iter-2-decode-D` sub-deferral.
+    ///   3. `INVESTIGATION_ENV.hybrid_kv` (HF2Q_HYBRID_KV=1, PRODUCTION DEFAULT) → real slot routing landed here.
+    ///   4. HB-encoded opt-out → typed `iter-2-decode-B` sub-deferral.
+    ///
+    /// # SlotId(0) byte-equivalence
+    ///
+    /// Per the iter-1 worker-arm predicate `handle.slot_id != SlotId(0)`,
+    /// SerialFifo + SlotAware-at-SlotId(0) never reach this fn — they
+    /// route through `forward_decode` direct.  Only SlotAware + SlotId(N>0)
+    /// engages iter-2-decode-A.  Code-path disjointness preserves the H1/
+    /// H2/H23/H41/H44/H77/H102 byte-equivalence chain at the model-fn
+    /// signature level: `forward_decode`'s signature is UNCHANGED
+    /// (defended by H128 source-grep pin).
+    ///
+    /// # Errors
+    /// - `slot_id.0 >= multi_seq_kv_hb[0].n_seqs` → typed
+    ///   `MultiSeqError::SlotOutOfRange` chained into anyhow.
+    /// - `multi_seq_kv_hb.is_empty()` / layer-count mismatch → typed
+    ///   `anyhow::bail!`.
+    /// - HF2Q_USE_DENSE=1 → typed `iter-B4c-kernel-iter-2-decode-D`.
+    /// - HF2Q_TQ_CODEBOOK_BITS=4 → typed `iter-B4c-kernel-iter-2-decode-D`.
+    /// - HF2Q_HYBRID_KV=1 + scaffold absent → typed `iter-C2c-cont-invariant-violated`.
+    /// - HF2Q_HYBRID_KV=1 + xlen BF16 buffers present → typed `iter-B4c-kernel-iter-2-decode-A-xlen`.
+    /// - HF2Q_HYBRID_KV=0 (HB-encoded opt-out) → typed `iter-B4c-kernel-iter-2-decode-B`.
+    pub fn forward_decode_slot_aware(
+        &mut self,
+        input_token: u32,
+        seq_pos: usize,
+        gpu: &mut GpuContext,
+        profile: &mut Option<crate::inference::models::gemma4::profile::TokenProfile>,
+        slot_id: SlotId,
+        multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>,
+        // ADR-040 iter-B4c-kernel iter-2-decode-A (2026-05-30) — production-
+        // default hybrid F16-K + TQ-HB-V scaffold parameter.  `Option<>`
+        // because iter-C2c-cont (§6.1.33) provisions this field IFF the
+        // production-default hybrid env gate is true (DEFAULT since
+        // ADR-029 iter-13 per H10 falsification at §6.1.11); when the
+        // env-gate is OFF this parameter is `None` and this fn surfaces
+        // typed `CapabilityUnsupported` at the hybrid branch
+        // defense-in-depth.  Mirrors iter-2A/2B prefill signature.
+        multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>,
+    ) -> Result<u32> {
+        // ── Pre-flight ────────────────────────────────────────────────
+        //
+        // Bounds-first per ADR-040 A2b §6.1.23 iter-1.5 cfa-finding-F5
+        // ordering.  Mirrors the iter-2A prefill contract at line 2474-2534.
+        // Diagnostic names this fn so operator log greps land here.
+        if multi_seq_kv_hb.is_empty() {
+            anyhow::bail!(
+                "forward_decode_slot_aware: multi_seq_kv_hb is empty \
+                 (C2c spawn-arm invariant: provision_multi_seq_kv_for_slot_aware \
+                  must produce one entry per layer; ADR-040 §6.1.21 / \
+                  iter-B4c-kernel iter-2-decode-A)"
+            );
+        }
+        if multi_seq_kv_hb.len() != self.layers.len() {
+            anyhow::bail!(
+                "forward_decode_slot_aware: multi_seq_kv_hb.len()={} \
+                 != self.layers.len()={} — caller-invariant violation \
+                 (ADR-040 iter-B4c-kernel iter-2-decode-A; C2c spawn-arm \
+                 provision_multi_seq_kv_for_slot_aware must allocate one per layer)",
+                multi_seq_kv_hb.len(),
+                self.layers.len(),
+            );
+        }
+        let n_seqs = multi_seq_kv_hb[0].n_seqs;
+        if slot_id.0 >= n_seqs {
+            let err = MultiSeqError::SlotOutOfRange { slot: slot_id, max_slots: n_seqs };
+            anyhow::bail!(
+                "forward_decode_slot_aware: slot_id={} out of range \
+                 (n_seqs={}). ADR-040 iter-B4c-kernel iter-2-decode-A bounds-first contract. {}",
+                slot_id.0,
+                n_seqs,
+                err,
+            );
+        }
+
+        // `multi_seq_kv_hb` (HB-encoded scaffold) is preserved verbatim per
+        // iter-2A H84 — the iter-2-decode-B sub-deferral will consume it on
+        // the HB-encoded branch via `MlxBuffer::slice_view`.
+        let _ = &multi_seq_kv_hb;
+
+        // ── Dispatch fork ─────────────────────────────────────────────
+        //
+        // Mirror of iter-2A/2B prefill fork at line 2536-2937.  Same 4
+        // production KV-regime branches in the same precedence order
+        // (HF2Q_USE_DENSE → cb_bits==0 → HF2Q_HYBRID_KV → default HB-encoded).
+        // Each branch's typed `CapabilityUnsupported` names the specific
+        // iter-2-decode-{B,C,D} sub-iter (one sub-iter per regime).
+        let cb_bits: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
+            Ok("4") => 0,
+            Ok("5") => 5,
+            Ok("6") => 6,
+            Ok("8") => 8,
+            _ => 8, // DEFAULT: 8-bit (matches sibling line 835)
+        };
+        if INVESTIGATION_ENV.use_dense {
+            let err = MultiSeqError::CapabilityUnsupported {
+                capability: "gemma4-forward-decode-slot-N-dense-F32 (iter-B4c-kernel-iter-2-decode-D per ADR-040 §6.1.38 — HF2Q_USE_DENSE=1 dense F32 KV path decode-side slot routing; orthogonal to TQ-active paths gated on iter-A3b-2 DenseKvBuffers multi-seq lift; mirror of iter-2D prefill scope)",
+            };
+            anyhow::bail!(
+                "forward_decode_slot_aware: dense F32 KV path \
+                 (HF2Q_USE_DENSE=1) decode-side slot routing not yet wired at slot_id={} \
+                 (ADR-040 iter-B4c-kernel iter-2-decode-A — iter-2-decode-D scope). {}",
+                slot_id.0,
+                err,
+            );
+        }
+        if cb_bits == 0 {
+            let err = MultiSeqError::CapabilityUnsupported {
+                capability: "gemma4-forward-decode-slot-N-legacy-4bit (iter-B4c-kernel-iter-2-decode-D per ADR-040 §6.1.38 — HF2Q_TQ_CODEBOOK_BITS=4 legacy 4-bit native flash_attn_vec_tq decode-side slot routing; opt-in pre-default surface; mirror of iter-2C prefill scope)",
+            };
+            anyhow::bail!(
+                "forward_decode_slot_aware: legacy 4-bit TQ path \
+                 (HF2Q_TQ_CODEBOOK_BITS=4) decode-side slot routing not yet wired at \
+                 slot_id={} (ADR-040 iter-B4c-kernel iter-2-decode-A — \
+                 iter-2-decode-D scope). {}",
+                slot_id.0,
+                err,
+            );
+        }
+        if INVESTIGATION_ENV.hybrid_kv {
+            // ADR-040 iter-B4c-kernel iter-2-decode-A (2026-05-30) —
+            // PRODUCTION DEFAULT slot routing through the hybrid F16-K +
+            // TQ-HB-V KV scaffold.  The hybrid branch is the production-
+            // engagement surface: every SlotAware + SlotId(N>0) decode
+            // call under the default env config lands here.  Mirror of
+            // iter-2B prefill at line 2605-2937 for the decode body.
+            let multi_seq_kv_hybrid = multi_seq_kv_hybrid.ok_or_else(|| {
+                // Defense-in-depth typed error — operator-grep'able via
+                // the `iter-C2c-cont-invariant-violated` label.  Same
+                // discipline as the iter-2B prefill defense-in-depth at
+                // line 2660-2680.
+                let err = MultiSeqError::CapabilityUnsupported {
+                    capability: "gemma4-forward-decode-hybrid-scaffold-absent (iter-C2c-cont-invariant-violated per ADR-040 §6.1.38 — HF2Q_HYBRID_KV=1 production-default; INVESTIGATION_ENV.hybrid_kv == true AT CALL TIME but multi_seq_kv_hybrid scaffold is None at engine.rs GemmaLoadedModel.multi_seq_kv_hybrid — iter-C2c-cont spawn-arm invariant violated OR operator flipped HF2Q_HYBRID_KV post-LazyLock-cache; gated on iter-C2c-cont per ADR-040 §6.1.33 provisioning MultiSeqHybridKvBuffers sibling scaffold)",
+                };
+                anyhow::anyhow!(
+                    "forward_decode_slot_aware: hybrid F16-K + TQ-HB-V decode path \
+                     (HF2Q_HYBRID_KV=1; PRODUCTION DEFAULT) — multi_seq_kv_hybrid is None \
+                     at slot_id={} (ADR-040 iter-B4c-kernel iter-2-decode-A). {}",
+                    slot_id.0,
+                    err,
+                )
+            })?;
+
+            // Bounds + length match (sibling discipline to the HB
+            // preflight at the top of this fn).
+            if multi_seq_kv_hybrid.is_empty() {
+                anyhow::bail!(
+                    "forward_decode_slot_aware: multi_seq_kv_hybrid is empty \
+                     (iter-C2c-cont spawn-arm invariant; ADR-040 §6.1.33 / \
+                      iter-B4c-kernel iter-2-decode-A)"
+                );
+            }
+            if multi_seq_kv_hybrid.len() != self.layers.len() {
+                anyhow::bail!(
+                    "forward_decode_slot_aware: multi_seq_kv_hybrid.len()={} \
+                     != self.layers.len()={} — caller-invariant violation \
+                     (ADR-040 iter-B4c-kernel iter-2-decode-A)",
+                    multi_seq_kv_hybrid.len(),
+                    self.layers.len(),
+                );
+            }
+            let hybrid_n_seqs = multi_seq_kv_hybrid[0].n_seqs;
+            if slot_id.0 >= hybrid_n_seqs {
+                let err = MultiSeqError::SlotOutOfRange {
+                    slot: slot_id,
+                    max_slots: hybrid_n_seqs,
+                };
+                anyhow::bail!(
+                    "forward_decode_slot_aware: hybrid slot_id={} out of range \
+                     (n_seqs={}). ADR-040 iter-B4c-kernel iter-2-decode-A. {}",
+                    slot_id.0,
+                    hybrid_n_seqs,
+                    err,
+                );
+            }
+
+            // iter-2-decode-A-xlen sub-stage gate: BF16 xlen K/V buffer
+            // slot routing is the HF2Q_DFLASH_XLEN_SDPA=1 opt-in surface
+            // (mirror of iter-2B-xlen prefill scope).  Same typed sub-
+            // deferral discipline.
+            if multi_seq_kv_hybrid
+                .iter()
+                .any(|buf| buf.bf16_xlen_k.is_some() || buf.bf16_xlen_v.is_some())
+            {
+                let err = MultiSeqError::CapabilityUnsupported {
+                    capability: "gemma4-forward-decode-slot-N-hybrid-xlen (iter-B4c-kernel-iter-2-decode-A-xlen per ADR-040 §6.1.38 — HF2Q_DFLASH_XLEN_SDPA=1 opt-in BF16 xlen K/V buffer decode-side slot routing; orthogonal to the F16 K + TQ-HB-V no-xlen production-default path which iter-2-decode-A lands)",
+                };
+                anyhow::bail!(
+                    "forward_decode_slot_aware: hybrid xlen BF16 decode path \
+                     (HF2Q_DFLASH_XLEN_SDPA=1) slot routing not yet wired at slot_id={} \
+                     (ADR-040 iter-B4c-kernel iter-2-decode-A-xlen scope). {}",
+                    slot_id.0,
+                    err,
+                );
+            }
+
+            // ── Build per-layer slot-views + mount on self.hybrid_kv ─────
+            //
+            // Mirror of iter-2B prefill slot-view build at line 2747-2895.
+            // Same byte-offset arithmetic + dtype-aware V-buffer + F32 V-norms
+            // dummy detection.  Constructs a fresh single-seq `HybridKvBuffers`
+            // wrapper around the per-slot slice_view of the persistent multi-
+            // seq scaffold's buffers.  The slot-view ARC handles keep the
+            // underlying Metal storage alive for the call duration.
+            let mut slot_view_hybrid: Vec<
+                crate::inference::models::gemma4::HybridKvBuffers,
+            > = Vec::with_capacity(multi_seq_kv_hybrid.len());
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let nkv = layer.num_kv_heads;
+                let hd = layer.head_dim;
+                let buf = &multi_seq_kv_hybrid[layer_idx];
+                let cap = buf.capacity;
+                // K (F16, 2 bytes/elem) per-slot byte offset.
+                let k_elems_per_slot: usize = nkv
+                    .checked_mul(cap)
+                    .and_then(|x| x.checked_mul(hd))
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode slot-view K elem count overflow at L{layer_idx} \
+                         (nkv={nkv} cap={cap} hd={hd}) — ADR-040 iter-B4c-kernel iter-2-decode-A"
+                    ))?;
+                let k_bytes_per_slot: u64 = (k_elems_per_slot as u64)
+                    .checked_mul(2u64) // F16 = 2 bytes/elem
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode slot-view K byte size overflow at L{layer_idx} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-A"
+                    ))?;
+                let k_byte_offset: u64 = (slot_id.0 as u64)
+                    .checked_mul(k_bytes_per_slot)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode slot-view K byte offset overflow at L{layer_idx} \
+                         (slot_id={} k_bytes_per_slot={}) — ADR-040 iter-B4c-kernel iter-2-decode-A",
+                        slot_id.0, k_bytes_per_slot,
+                    ))?;
+                let k_view = buf.k.slice_view(k_byte_offset, k_elems_per_slot)
+                    .with_shape(vec![nkv, cap, hd])
+                    .map_err(|e| anyhow::anyhow!(
+                        "decode slot-view K with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-A"
+                    ))?;
+
+                // V: dtype-aware.  U8 (TQ-packed) → 1 byte/elem;
+                // F16 → 2 bytes/elem.  `.dtype().size_of()` is the
+                // canonical reader (mirror of iter-2B prefill).
+                let v_dtype_size = buf.v_packed.dtype().size_of();
+                let v_bytes_per_slot: u64 = (k_elems_per_slot as u64)
+                    .checked_mul(v_dtype_size as u64)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode slot-view V byte size overflow at L{layer_idx} \
+                         (v_dtype_size={}) — ADR-040 iter-B4c-kernel iter-2-decode-A",
+                        v_dtype_size,
+                    ))?;
+                let v_byte_offset: u64 = (slot_id.0 as u64)
+                    .checked_mul(v_bytes_per_slot)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "decode slot-view V byte offset overflow at L{layer_idx} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-A"
+                    ))?;
+                let v_view = buf.v_packed.slice_view(v_byte_offset, k_elems_per_slot)
+                    .with_shape(vec![nkv, cap, hd])
+                    .map_err(|e| anyhow::anyhow!(
+                        "decode slot-view V with_shape at L{layer_idx}: {e} \
+                         — ADR-040 iter-B4c-kernel iter-2-decode-A"
+                    ))?;
+
+                // V_norms: F32 (4 bytes/elem) with shape
+                // `[nkv, cap, norms_per_pos]` per the multi-seq
+                // allocator's layout — OR a 4-byte F32 dummy buffer
+                // (1 element, shared across slots, no per-slot offset)
+                // when HF2Q_FULL_F16_KV=1 was set at alloc time.  The
+                // dummy case is detected by `byte_len() == 4` (mirror
+                // of iter-2B prefill at line 2829).
+                let norms_per_pos = buf.norms_per_pos;
+                let v_norms_is_dummy = buf.v_norms.byte_len() == 4;
+                let v_norms_view = if v_norms_is_dummy {
+                    buf.v_norms.slice_view(0, 1)
+                        .with_shape(vec![1])
+                        .map_err(|e| anyhow::anyhow!(
+                            "decode slot-view V_norms (dummy) with_shape at L{layer_idx}: {e} \
+                             — ADR-040 iter-B4c-kernel iter-2-decode-A"
+                        ))?
+                } else {
+                    let norms_elems_per_slot: usize = nkv
+                        .checked_mul(cap)
+                        .and_then(|x| x.checked_mul(norms_per_pos))
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "decode slot-view V_norms elem count overflow at L{layer_idx} \
+                             — ADR-040 iter-B4c-kernel iter-2-decode-A"
+                        ))?;
+                    let norms_bytes_per_slot: u64 = (norms_elems_per_slot as u64)
+                        .checked_mul(4u64) // F32 = 4 bytes/elem
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "decode slot-view V_norms byte size overflow at L{layer_idx} \
+                             — ADR-040 iter-B4c-kernel iter-2-decode-A"
+                        ))?;
+                    let norms_byte_offset: u64 = (slot_id.0 as u64)
+                        .checked_mul(norms_bytes_per_slot)
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "decode slot-view V_norms byte offset overflow at L{layer_idx} \
+                             — ADR-040 iter-B4c-kernel iter-2-decode-A"
+                        ))?;
+                    let v_norms_shape = if norms_per_pos == 1 {
+                        vec![nkv, cap]
+                    } else {
+                        vec![nkv, cap, norms_per_pos]
+                    };
+                    buf.v_norms.slice_view(norms_byte_offset, norms_elems_per_slot)
+                        .with_shape(v_norms_shape)
+                        .map_err(|e| anyhow::anyhow!(
+                            "decode slot-view V_norms with_shape at L{layer_idx}: {e} \
+                             — ADR-040 iter-B4c-kernel iter-2-decode-A"
+                        ))?
+                };
+
+                // Construct the legacy single-seq `HybridKvBuffers`
+                // wrapper around the slot-views.  The sibling fn's
+                // consumer at `gemma4/gpu_full_attn.rs::encode_one_layer`
+                // line ~417 reads `if let Some(ref hybrid_kv) = self.hybrid_kv`
+                // and indexes `[layer_idx]` directly — slot_view_hybrid's
+                // shape MUST match the legacy alloc output bit-for-bit
+                // (mirror of iter-2B prefill).
+                slot_view_hybrid.push(
+                    crate::inference::models::gemma4::HybridKvBuffers {
+                        k: k_view,
+                        v_packed: v_view,
+                        v_norms: v_norms_view,
+                        capacity: cap,
+                        is_sliding: buf.is_sliding,
+                        norms_per_pos,
+                        bf16_xlen_k: None,
+                        bf16_xlen_v: None,
+                    },
+                );
+            }
+
+            // Mount the slot-view bundle on `self.hybrid_kv`.  Save the
+            // prior value so we can restore it on exit — typical state
+            // is `None` per the decode lazy-alloc gate at
+            // `gemma4/forward_gpu.rs:413` which only allocates fresh
+            // when `self.hybrid_kv.is_none()`.  Restoring belt-and-
+            // suspenders.  Mirror of iter-2B prefill at line 2906-2907.
+            let prior_hybrid_kv = self.hybrid_kv.take();
+            self.hybrid_kv = Some(slot_view_hybrid);
+
+            // Delegate to the sibling fn.  Its lazy-alloc gate at
+            // `forward_gpu.rs:413` reads `self.hybrid_kv.is_none()` →
+            // mount survives (H128 source-grep pin) and the per-layer
+            // K/V writes inside `encode_one_layer` land in the per-slot
+            // byte region of the persistent multi-seq scaffold.
+            let result = self.forward_decode(input_token, seq_pos, gpu, profile);
+
+            // Restore prior `self.hybrid_kv` regardless of result.  The
+            // slot-view bundle has lifetime tied to this call; the
+            // persistent multi-seq scaffold OWNED by the worker arm
+            // (via `g.multi_seq_kv_hybrid`) keeps the underlying buffers
+            // alive — the slot-view ARC handles dropped here are
+            // strong refs to the same Metal buffer storage.  Mirror of
+            // iter-2B prefill at line 2934.
+            self.hybrid_kv = prior_hybrid_kv;
+
+            return result;
+        }
+        // cb_bits >= 5 AND HF2Q_HYBRID_KV=0 AND HF2Q_USE_DENSE=0 →
+        // HB-encoded opt-out decode-side path.  Typed `iter-2-decode-B`
+        // sub-deferral.  Mirror of iter-2A-cont prefill scope.
+        let err = MultiSeqError::CapabilityUnsupported {
+            capability: "gemma4-forward-decode-slot-N-hb-encoded (iter-B4c-kernel-iter-2-decode-B per ADR-040 §6.1.38 — HF2Q_HYBRID_KV=0 opt-out HB-encoded decode-side slot routing through src/inference/models/gemma4/gpu_full_attn.rs encode_one_layer leg_hb_encoded consumer + per-slot MlxBuffer::slice_view at slot_id.0 * nkv * capacity * head_dim byte offset; same primitive iter-2A-cont prefill scope uses)",
+        };
+        anyhow::bail!(
+            "forward_decode_slot_aware: HB-encoded decode path \
+             (HF2Q_HYBRID_KV=0 + HF2Q_TQ_CODEBOOK_BITS={}) slot routing not yet wired \
+             at slot_id={} (ADR-040 iter-B4c-kernel iter-2-decode-A — iter-2-decode-B scope; \
+             mirror of iter-2A-cont prefill load-bearing surface). {}",
+            cb_bits,
+            slot_id.0,
+            err,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
