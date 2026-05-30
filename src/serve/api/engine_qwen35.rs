@@ -2480,6 +2480,697 @@ pub fn generate_qwen35_once_slot_aware(
     })
 }
 
+/// ADR-040 Phase C iter-C2d-cont-kernel iter-2 (2026-05-30): slot-aware
+/// streaming Qwen35 chat generation against the **persistent multi-seq
+/// `HybridKvCache`** (`Qwen35LoadedModel.persistent_kv_cache`) instead
+/// of a per-request fresh alloc.
+///
+/// **Direct mirror of `generate_qwen35_once_slot_aware`** (iter-1) for
+/// the [`super::engine::Request::GenerateStream`] worker arm. iter-1
+/// landed the non-streaming Generate-arm lift; iter-2 lands the
+/// streaming-arm lift onto the same persistent cache + per-slot reset
+/// + `restore_partial`-based prompt-cache HIT scaffolding.
+///
+/// # Structural parallels with iter-1
+///
+/// 1. Bounds-checks `slot_id` against `kv_cache.n_seqs` (bounds-first
+///    per A2b §6.1.23 iter-1.5 cfa-finding-F5 ordering); surfaces typed
+///    error via the SSE `events` channel if slot OOR.
+/// 2. Verifies `prompt_len + max_tokens + 64 <= kv_cache.max_seq_len`
+///    (persistent cache is sized to `cfg.max_position_embeddings`;
+///    per-request need must fit).
+/// 3. Calls `kv_cache.reset_for_slot(slot_id)` at entry — zeros the
+///    per-seq full-attn cursor + per-seq linear-attn conv/recurrent
+///    slices for `slot_id` only (other slots untouched).
+/// 4. Prompt-cache fast-path uses `restore_partial(snap, prompt_len)`
+///    instead of `restore_from(snap)` — the persistent cache's
+///    `max_seq_len` differs from the snapshot producer's per-request
+///    `max_seq_len`, breaking `restore_from`'s byte-equal precondition.
+/// 5. Threads `slot_id` into every `forward_gpu_last_logits` call (the
+///    signature already accepts `SlotId` post-B4b §6.1.20).
+/// 6. Calls `kv_cache.reset_for_slot(slot_id)` at exit — belt-and-
+///    suspenders with the entry reset (mirror of iter-1).
+///
+/// **Per-slot byte-equivalence at SlotId(0)** (H58 pin):
+/// `generate_stream_qwen35_once_extended_slot_aware(.., kv=&mut
+/// persistent_cache, slot_id=SlotId(0))` produces the same SSE event
+/// stream as `generate_stream_qwen35_once_extended(..)` for any
+/// text-only request when `persistent_cache.n_seqs == 1` AND
+/// `persistent_cache.max_seq_len >= prompt_len + max_tokens + 64`. The
+/// proof is identical to iter-1's H51 pin: `reset_for_slot(0)` matches
+/// the fresh-alloc state, `forward_gpu_last_logits(.., SlotId(0))` is
+/// byte-equivalent to the pre-A2b path (B4a §6.1.4 pin), and
+/// `restore_partial(snap, k)` at `k == snap.full_attn_current_len[0][0]`
+/// is byte-equivalent to `restore_from(snap)` per the kv_cache.rs:2143
+/// docstring.
+///
+/// # Vision-augmented streaming deferral (iter-2 scope discipline)
+///
+/// When **any** of `soft_tokens` / `deepstack` / `positions_flat` is
+/// non-empty / `Some(...)`, iter-2 emits a typed `capability_unsupported:`
+/// error event and aborts. Vision-augmented streaming via the persistent
+/// multi-seq cache is **iter-C2d-cont-kernel-iter-4 scope** — the same
+/// iter that ports the non-streaming
+/// `generate_qwen35_once_with_soft_tokens_and_deepstack` (the API
+/// surfaces add injection-bytes-keyed cache invalidation discipline
+/// that touches more than the streaming wrapper). The H59 + H63 pins
+/// validate the typed-error path for any-extension requests.
+///
+/// # Co-changes (iter-2 deliberately minimal — exact mirror of iter-1)
+///
+/// - Per-slot LCP / mid-prefill checkpoint storage is DISABLED in
+///   slot-aware mode (the snapshot codec keys on the per-request
+///   `max_seq_len`; persistent-cache snapshots would carry different
+///   byte sizes and break the across-request LCP probe). The fast path
+///   on this site is the fresh-prefill path; LCP slot-aware codec is
+///   pinned as **iter-C2d-cont-kernel-iter-LCP** in §6.1.28.
+/// - Chunked-prefill is DISABLED in slot-aware mode (same snapshot-
+///   shape reason). Pinned as **iter-C2d-cont-kernel-iter-LCP** in
+///   §6.1.28.
+/// - Vision-augmented streaming (soft_tokens / deepstack /
+///   positions_flat any non-empty) returns a typed error event citing
+///   **iter-C2d-cont-kernel-iter-4** as the implementing iter.
+///
+/// # SSE event ordering (H63 pin)
+///
+/// The slot-aware streaming function emits the same SSE event order as
+/// `generate_stream_qwen35_once_extended`: per-token `Delta` events
+/// routed through the `ReasoningSplitter` + `ToolCallSplitter` chain,
+/// followed by a terminal `Done` event (or `Error` event on failure).
+/// The splitter-chain wiring is structurally identical — iter-2 does
+/// not alter the splitter shape, only the prefill / decode KV substrate.
+///
+/// # Errors emitted on the SSE channel
+/// - `slot_id.0 >= kv_cache.n_seqs` → `Error("capability_unsupported:
+///   ADR-040 iter-C2d-cont-kernel iter-2 — SlotOutOfRange ...")`.
+/// - `need_seq > kv_cache.max_seq_len` → `Error("capability_unsupported:
+///   ADR-040 iter-C2d-cont-kernel iter-2 — per-request need_seq ...")`.
+/// - `has_extension == true` → `Error("capability_unsupported:
+///   ADR-040 iter-C2d-cont-kernel iter-2 — vision-augmented streaming
+///   slot-aware port is iter-C2d-cont-kernel-iter-4 ...")`.
+/// - Any `reset_for_slot` failure → `Error("ADR-040 iter-C2d-cont-kernel
+///   iter-2 — reset_for_slot ...")`.
+/// - Any `restore_partial` failure → `Error("ADR-040 iter-C2d-cont-kernel
+///   iter-2 — prompt_cache restore_partial ...")`.
+/// - Forward / sample failures propagate from `forward_gpu_last_logits`.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_stream_qwen35_once_extended_slot_aware(
+    qwen: &mut Qwen35LoadedModel,
+    prompt_tokens: &[u32],
+    soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+    deepstack: Option<&crate::serve::forward_prefill::DeepstackInjection<'_>>,
+    positions_flat: Option<&[i32]>,
+    params: &SamplingParams,
+    events: &tokio::sync::mpsc::Sender<GenerationEvent>,
+    registration: Option<&ModelRegistration>,
+    cancellation_counter: Option<&std::sync::atomic::AtomicU64>,
+    kv_cache: &mut HybridKvCache,
+    slot_id: SlotId,
+) {
+    macro_rules! send {
+        ($ev:expr) => {
+            if events.blocking_send($ev).is_err() {
+                tracing::info!(
+                    "SSE stream dropped by client; aborting qwen35 slot-aware decode"
+                );
+                if let Some(c) = cancellation_counter {
+                    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return;
+            }
+        };
+    }
+
+    if prompt_tokens.is_empty() {
+        send!(GenerationEvent::Error(
+            "generate_stream_qwen35_once_extended_slot_aware: empty prompt_tokens"
+                .into()
+        ));
+        return;
+    }
+    // Bounds-first per A2b §6.1.23 iter-1.5 cfa-finding-F5 ordering.
+    if slot_id.0 >= kv_cache.n_seqs {
+        send!(GenerationEvent::Error(format!(
+            "capability_unsupported: ADR-040 iter-C2d-cont-kernel iter-2 — \
+             SlotOutOfRange slot={} max_slots={} (generate_stream_qwen35_\
+             once_extended_slot_aware)",
+            slot_id.0, kv_cache.n_seqs,
+        )));
+        return;
+    }
+
+    // Vision-augmented streaming is iter-C2d-cont-kernel-iter-4 scope.
+    // iter-2 surfaces typed error + aborts when any extension is
+    // present, mirroring the iter-4 deferral discipline established by
+    // iter-1's punt on the non-streaming soft-token entry.
+    let has_extension =
+        !soft_tokens.is_empty() || deepstack.is_some() || positions_flat.is_some();
+    if has_extension {
+        send!(GenerationEvent::Error(format!(
+            "capability_unsupported: ADR-040 iter-C2d-cont-kernel iter-2 — \
+             vision-augmented streaming slot-aware port is \
+             iter-C2d-cont-kernel-iter-4 per ADR-040 §6.1.28 (got \
+             soft_tokens.len()={}, deepstack.is_some()={}, \
+             positions_flat.is_some()={}); fall back to SerialFifo / \
+             SlotId(0) for vision-augmented streaming.",
+            soft_tokens.len(),
+            deepstack.is_some(),
+            positions_flat.is_some(),
+        )));
+        return;
+    }
+
+    let prompt_len = prompt_tokens.len();
+    let max_tokens = params.max_tokens.max(1);
+    let need_seq = prompt_len + max_tokens + 64;
+    if need_seq > kv_cache.max_seq_len as usize {
+        send!(GenerationEvent::Error(format!(
+            "capability_unsupported: ADR-040 iter-C2d-cont-kernel iter-2 — \
+             per-request need_seq={} exceeds persistent cache \
+             max_seq_len={} (slot={} prompt_len={} max_tokens={}). \
+             Persistent cache is sized to cfg.max_position_embeddings; \
+             reduce max_tokens or use a shorter prompt.",
+            need_seq, kv_cache.max_seq_len, slot_id.0, prompt_len, max_tokens
+        )));
+        return;
+    }
+
+    let is_greedy = is_greedy_eligible(params);
+
+    let device = match MlxDevice::new() {
+        Ok(d) => d,
+        Err(e) => {
+            send!(GenerationEvent::Error(format!(
+                "qwen35 stream slot-aware: MlxDevice::new failed: {e}"
+            )));
+            return;
+        }
+    };
+    let _ = &device; // sampling helpers don't need the device handle
+
+    // Per-slot reset at entry — persistent cache may carry stale bytes
+    // from a prior request on this slot.
+    if let Err(e) = kv_cache.reset_for_slot(slot_id) {
+        send!(GenerationEvent::Error(format!(
+            "ADR-040 iter-C2d-cont-kernel iter-2: reset_for_slot at entry \
+             failed: {e:#}"
+        )));
+        return;
+    }
+
+    let pre_dispatches = mlx_native::dispatch_count();
+    let pre_syncs = mlx_native::sync_count();
+
+    // ── Prompt-cache fast-path (slot-aware variant) ──────────────────
+    //
+    // Snapshot restore uses `restore_partial(snap, k)` instead of
+    // `restore_from(snap)` — the persistent cache's `max_seq_len`
+    // (= cfg.max_position_embeddings) differs from the snapshot
+    // producer's per-request `max_seq_len`. Mirror of iter-1's
+    // prompt-cache HIT branch.
+    let prompt_cache_hit = qwen
+        .prompt_cache
+        .try_match(prompt_tokens, params)
+        .is_some();
+
+    let prefill_start = Instant::now();
+    let mut next_token: u32;
+    if prompt_cache_hit {
+        let snap = qwen
+            .prompt_cache
+            .snapshot()
+            .expect("try_match Some implies snapshot Some");
+        if let Err(e) = kv_cache.restore_partial(snap, prompt_len) {
+            send!(GenerationEvent::Error(format!(
+                "ADR-040 iter-C2d-cont-kernel iter-2: prompt_cache \
+                 restore_partial failed: {e:#}"
+            )));
+            return;
+        }
+        next_token = qwen.prompt_cache.first_decoded_token();
+        tracing::debug!(
+            "qwen35 stream slot-aware prompt_cache: HIT slot={} prompt_len={} \
+             prefill skipped",
+            slot_id.0, prompt_len
+        );
+    } else {
+        // Fresh monolithic prefill — chunked-prefill + LCP-resume are
+        // DISABLED in slot-aware mode (see fn docstring for the
+        // snapshot codec invariant rationale; tracked as
+        // iter-C2d-cont-kernel-iter-LCP in §6.1.28).
+        let positions = prefill_positions_for(prompt_len);
+        let prefill_logits_res = qwen.model.forward_gpu_last_logits(
+            prompt_tokens,
+            &positions,
+            kv_cache,
+            slot_id,
+        );
+        let prefill_logits = match prefill_logits_res {
+            Ok(l) => l,
+            Err(e) => {
+                send!(GenerationEvent::Error(format!(
+                    "qwen35 stream slot-aware prefill failed: {e:#}"
+                )));
+                return;
+            }
+        };
+        if prefill_logits.len() != qwen.vocab_size {
+            send!(GenerationEvent::Error(format!(
+                "qwen35 stream slot-aware prefill logits len {} != \
+                 vocab_size {}",
+                prefill_logits.len(),
+                qwen.vocab_size,
+            )));
+            return;
+        }
+        if is_greedy {
+            next_token =
+                greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32);
+        } else {
+            let mut logits = prefill_logits;
+            next_token = sample_logits_qwen35(&mut logits, params, &[]);
+        }
+        // Prompt-cache snapshot is intentionally NOT taken in slot-aware
+        // mode: the persistent cache's snapshot would carry the
+        // cfg.max_position_embeddings shape, which differs from
+        // per-request snapshots the SerialFifo / SlotId(0) path stores.
+        // Cross-mode snapshot sharing is iter-C2d-cont-kernel-iter-LCP.
+    }
+    let prefill_duration = prefill_start.elapsed();
+
+    // ── Splitter wiring (Reasoning + ToolCall) ────────────────────
+    // Mirror of generate_stream_qwen35_once_extended's splitter chain.
+    let mut reasoning_splitter = registration.and_then(ReasoningSplitter::from_registration);
+    let mut tool_splitter = registration.and_then(ToolCallSplitter::from_registration);
+    let mut tool_call_body: String = String::new();
+    let mut tool_call_index: usize = 0;
+    let mut saw_tool_call: bool = false;
+
+    // Inner closure-like helper: route a Content-classified text run
+    // through the tool-call splitter. Mirror of route_content_qwen35
+    // in generate_stream_qwen35_once_extended. Returns `false` on
+    // client disconnect.
+    fn route_content_qwen35_slot_aware(
+        tool_splitter: &mut Option<ToolCallSplitter>,
+        body: &mut String,
+        tc_index: &mut usize,
+        saw_tc: &mut bool,
+        registration: Option<&ModelRegistration>,
+        events: &tokio::sync::mpsc::Sender<GenerationEvent>,
+        text: &str,
+    ) -> bool {
+        if text.is_empty() {
+            return true;
+        }
+        let Some(tcs) = tool_splitter.as_mut() else {
+            return events
+                .blocking_send(GenerationEvent::Delta {
+                    kind: DeltaKind::Content,
+                    text: text.to_string(),
+                })
+                .is_ok();
+        };
+        for ev in tcs.feed(text) {
+            match ev {
+                ToolCallEvent::Content(t) => {
+                    if !t.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Content,
+                                text: t,
+                            })
+                            .is_err()
+                    {
+                        return false;
+                    }
+                }
+                ToolCallEvent::ToolCallOpen => {
+                    body.clear();
+                }
+                ToolCallEvent::ToolCallText(t) => {
+                    body.push_str(&t);
+                }
+                ToolCallEvent::ToolCallClose => {
+                    let parsed = registration
+                        .and_then(|r| super::registry::parse_tool_call_body(r, body));
+                    let body_dump = std::mem::take(body);
+                    let sink = super::engine::EventSink::new(events);
+                    if super::engine::emit_streaming_tool_call_close(
+                        parsed,
+                        body_dump,
+                        params_tool_call_policy_for_qwen35_stream(),
+                        tc_index,
+                        saw_tc,
+                        &sink,
+                    )
+                    .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn emit_fragment_qwen35_slot_aware(
+        reasoning_splitter: &mut Option<ReasoningSplitter>,
+        tool_splitter: &mut Option<ToolCallSplitter>,
+        body: &mut String,
+        tc_index: &mut usize,
+        saw_tc: &mut bool,
+        registration: Option<&ModelRegistration>,
+        events: &tokio::sync::mpsc::Sender<GenerationEvent>,
+        fragment: &str,
+    ) -> bool {
+        if fragment.is_empty() {
+            return true;
+        }
+        if let Some(rs) = reasoning_splitter.as_mut() {
+            for (slot, text) in rs.feed(fragment) {
+                match slot {
+                    SplitSlot::Reasoning => {
+                        if !text.is_empty()
+                            && events
+                                .blocking_send(GenerationEvent::Delta {
+                                    kind: DeltaKind::Reasoning,
+                                    text,
+                                })
+                                .is_err()
+                        {
+                            return false;
+                        }
+                    }
+                    SplitSlot::Content => {
+                        if !route_content_qwen35_slot_aware(
+                            tool_splitter,
+                            body,
+                            tc_index,
+                            saw_tc,
+                            registration,
+                            events,
+                            &text,
+                        ) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        } else {
+            route_content_qwen35_slot_aware(
+                tool_splitter,
+                body,
+                tc_index,
+                saw_tc,
+                registration,
+                events,
+                fragment,
+            )
+        }
+    }
+
+    // ── Decode loop ────────────────────────────────────────────────
+    let decode_start = Instant::now();
+    let mut completion_tokens = 0usize;
+    let mut accumulated_text = String::new();
+    let mut reasoning_token_count = 0usize;
+    let mut finish_reason: &'static str = "length";
+
+    let first_text = qwen
+        .tokenizer
+        .decode(&[next_token], false)
+        .unwrap_or_default();
+    let mut is_eos_first = qwen.eos_token_ids.contains(&next_token);
+    if !is_eos_first && !first_text.is_empty() {
+        accumulated_text.push_str(&first_text);
+        if !emit_fragment_qwen35_slot_aware(
+            &mut reasoning_splitter,
+            &mut tool_splitter,
+            &mut tool_call_body,
+            &mut tool_call_index,
+            &mut saw_tool_call,
+            registration,
+            events,
+            &first_text,
+        ) {
+            if let Some(c) = cancellation_counter {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Per-slot reset at exit on cancellation path too — keep
+            // the slot clean for the next request to land on it.
+            let _ = kv_cache.reset_for_slot(slot_id);
+            return;
+        }
+    }
+    completion_tokens += 1;
+    if reasoning_splitter
+        .as_ref()
+        .map(|s| s.in_reasoning())
+        .unwrap_or(false)
+    {
+        reasoning_token_count += 1;
+    }
+    if is_eos_first {
+        finish_reason = "stop";
+    } else if qwen35_hit_stop_string(&accumulated_text, &params.stop_strings) {
+        finish_reason = "stop";
+        is_eos_first = true;
+    }
+
+    if !is_eos_first {
+        for step in 1..max_tokens {
+            // Slot-aware mode disables the vision t_post advance —
+            // text-only path: position is `prompt_len + step - 1`
+            // (byte-identical to the legacy text-only stream's
+            // `(prompt_len + step - 1)` advance per the
+            // generate_stream_qwen35_once_extended Wedge-4e
+            // text-only fallback branch).
+            let pos = (prompt_len + step - 1) as i32;
+            if pos as u32 >= kv_cache.max_seq_len {
+                break;
+            }
+            let decode_positions = vec![pos; 4];
+            // iter-2 uses `forward_gpu_last_logits(.., slot_id)` for both
+            // greedy + sampling modes — same shape as iter-1's decode
+            // loop (greedy fast-path slot-aware port is
+            // iter-C2d-cont-kernel-iter-G per §6.1.28).
+            let dec_result = match qwen.model.forward_gpu_last_logits(
+                &[next_token],
+                &decode_positions,
+                kv_cache,
+                slot_id,
+            ) {
+                Ok(logits) => {
+                    if logits.len() != qwen.vocab_size {
+                        Err(anyhow::anyhow!(
+                            "qwen35 stream slot-aware decode logits len {} \
+                             != vocab_size {}",
+                            logits.len(),
+                            qwen.vocab_size,
+                        ))
+                    } else if is_greedy {
+                        Ok(greedy_argmax_last_token(&logits, qwen.vocab_size as u32))
+                    } else {
+                        let mut tmp = logits;
+                        Ok(sample_logits_qwen35(&mut tmp, params, &[next_token]))
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            next_token = match dec_result {
+                Ok(t) => t,
+                Err(e) => {
+                    send!(GenerationEvent::Error(format!(
+                        "qwen35 stream slot-aware decode step {step} failed: {e:#}"
+                    )));
+                    // Per-slot reset on error path too.
+                    let _ = kv_cache.reset_for_slot(slot_id);
+                    return;
+                }
+            };
+            if qwen.eos_token_ids.contains(&next_token) {
+                finish_reason = "stop";
+                break;
+            }
+            completion_tokens += 1;
+            let fragment = qwen
+                .tokenizer
+                .decode(&[next_token], false)
+                .unwrap_or_default();
+            accumulated_text.push_str(&fragment);
+            if !emit_fragment_qwen35_slot_aware(
+                &mut reasoning_splitter,
+                &mut tool_splitter,
+                &mut tool_call_body,
+                &mut tool_call_index,
+                &mut saw_tool_call,
+                registration,
+                events,
+                &fragment,
+            ) {
+                if let Some(c) = cancellation_counter {
+                    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let _ = kv_cache.reset_for_slot(slot_id);
+                return;
+            }
+            if reasoning_splitter
+                .as_ref()
+                .map(|s| s.in_reasoning())
+                .unwrap_or(false)
+            {
+                reasoning_token_count += 1;
+            }
+            if qwen35_hit_stop_string(&accumulated_text, &params.stop_strings) {
+                finish_reason = "stop";
+                break;
+            }
+        }
+    }
+
+    // ── Drain splitter tails ───────────────────────────────────────
+    // Mirror of generate_stream_qwen35_once_extended's tail drain.
+    if let Some(rs) = reasoning_splitter.as_mut() {
+        if let Some((slot, tail)) = rs.finish() {
+            match slot {
+                SplitSlot::Reasoning => {
+                    if !tail.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Reasoning,
+                                text: tail,
+                            })
+                            .is_err()
+                    {
+                        if let Some(c) = cancellation_counter {
+                            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let _ = kv_cache.reset_for_slot(slot_id);
+                        return;
+                    }
+                }
+                SplitSlot::Content => {
+                    if !route_content_qwen35_slot_aware(
+                        &mut tool_splitter,
+                        &mut tool_call_body,
+                        &mut tool_call_index,
+                        &mut saw_tool_call,
+                        registration,
+                        events,
+                        &tail,
+                    ) {
+                        if let Some(c) = cancellation_counter {
+                            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let _ = kv_cache.reset_for_slot(slot_id);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tcs) = tool_splitter.as_mut() {
+        if let Some(ev) = tcs.finish() {
+            match ev {
+                ToolCallEvent::Content(t) => {
+                    if !t.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Content,
+                                text: t,
+                            })
+                            .is_err()
+                    {
+                        if let Some(c) = cancellation_counter {
+                            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let _ = kv_cache.reset_for_slot(slot_id);
+                        return;
+                    }
+                }
+                ToolCallEvent::ToolCallText(t) => {
+                    let prefix = registration.and_then(|r| r.tool_open).unwrap_or("");
+                    let fallback = format!("{prefix}{t}");
+                    if !fallback.is_empty()
+                        && events
+                            .blocking_send(GenerationEvent::Delta {
+                                kind: DeltaKind::Content,
+                                text: fallback,
+                            })
+                            .is_err()
+                    {
+                        if let Some(c) = cancellation_counter {
+                            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let _ = kv_cache.reset_for_slot(slot_id);
+                        return;
+                    }
+                }
+                ToolCallEvent::ToolCallOpen | ToolCallEvent::ToolCallClose => {
+                    // unreachable — finish() never emits Open/Close.
+                }
+            }
+        }
+    }
+
+    if saw_tool_call {
+        finish_reason = "tool_calls";
+    }
+
+    let decode_duration = decode_start.elapsed();
+
+    // Per-slot reset at exit — leave the slot clean for the next
+    // request to land on it. Belt-and-suspenders with the entry reset;
+    // mirrors iter-1's exit-reset discipline (H54).
+    if let Err(e) = kv_cache.reset_for_slot(slot_id) {
+        // Reset failure at exit is unusual — log + surface as terminal
+        // Error event (still followed by no `Done`; the SSE handler
+        // treats a terminal Error as a clean stream termination).
+        send!(GenerationEvent::Error(format!(
+            "ADR-040 iter-C2d-cont-kernel iter-2: reset_for_slot at exit \
+             failed: {e:#}"
+        )));
+        return;
+    }
+
+    let stats = StreamStats {
+        prefill_time_secs: Some(prefill_duration.as_secs_f64()),
+        decode_time_secs: Some(decode_duration.as_secs_f64()),
+        total_time_secs: Some((prefill_duration + decode_duration).as_secs_f64()),
+        time_to_first_token_ms: Some(prefill_duration.as_secs_f64() * 1000.0),
+        prefill_tokens_per_sec: Some(if prefill_duration.as_secs_f64() > 0.0 {
+            prompt_len as f64 / prefill_duration.as_secs_f64()
+        } else {
+            0.0
+        }),
+        decode_tokens_per_sec: Some(if decode_duration.as_secs_f64() > 0.0 {
+            completion_tokens as f64 / decode_duration.as_secs_f64()
+        } else {
+            0.0
+        }),
+        gpu_sync_count: Some(mlx_native::sync_count().saturating_sub(pre_syncs)),
+        gpu_dispatch_count: Some(
+            mlx_native::dispatch_count().saturating_sub(pre_dispatches),
+        ),
+        // Slot-aware mode reports prompt-cache HIT only (LCP/chunked
+        // are disabled in slot-aware mode per the iter-LCP deferral).
+        cached_prompt_tokens: if prompt_cache_hit { Some(prompt_len) } else { None },
+        reasoning_tokens: if reasoning_token_count > 0 {
+            Some(reasoning_token_count)
+        } else {
+            None
+        },
+    };
+
+    send!(GenerationEvent::Done {
+        finish_reason,
+        prompt_tokens: prompt_len,
+        completion_tokens,
+        stats,
+    });
+}
+
 /// ADR-005 Phase 4 Wedge-4a (2026-05-01): vision-aware non-streaming
 /// chat generation against a loaded Qwen3.5/3.6 model.  Replaces the
 /// `worker_run` 501 arm for `Request::GenerateWithSoftTokens` (the last
