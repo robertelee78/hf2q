@@ -109,10 +109,17 @@ use super::gpu_full_attn::upload_f32;
 use super::io_heads::greedy_argmax_last_token;
 use super::kv_cache::HybridKvCache;
 use super::model::Qwen35Model;
-// ADR-040 Phase B4a (2026-05-23): spec-decode entry points are gated to
-// `SlotId(0)` for B4a; multi-slot spec-decode (drafter + verifier
-// per-slot KV) lands in Phase B4d alongside the EAGLE3/DFlash drafter
-// cache multi-seq lift (ADR-040 §6.1.4).
+// ADR-040 Phase B4d (2026-05-30): spec-decode entry points now accept
+// a `slot_id: SlotId` (was hard-coded SlotId(0) per B4a / B4d
+// deferral).  `SlotId(0)` preserves pre-B4d single-seq byte-identical
+// behaviour; `SlotId(N>0)` rebases per-layer K/V writes through the
+// B4a-cont `slice_view` discipline at
+// `gpu_full_attn.rs::slot_k_v_region_for_full_attn`.  The active slot
+// rides on the `SpecDecode` struct (set via `*_with_slot` constructors)
+// and is forwarded into every internal `forward_gpu_with_hidden` call
+// plus the per-slot K=N partial-reject rollback at
+// `truncate_full_attn_to_for_slot` + `truncate_mtp_to_for_slot` +
+// `rollback_la_to(slot, ..)`.
 use crate::serve::multi_seq_kv::SlotId;
 
 /// ADR-034 task #91 (2026-05-21) — Sampler configuration for stochastic
@@ -195,6 +202,14 @@ pub struct SpecDecode<'a> {
     /// ADR-034 task #91 (2026-05-21) — see [`SpecSampler`]. Default
     /// is `greedy()` for byte-identical behavior with pre-#91 code.
     sampler: SpecSampler,
+    /// ADR-040 Phase B4d (2026-05-30) — active multi-seq slot for
+    /// this spec-decode run.  `SlotId(0)` (the default via
+    /// [`Self::new`] / [`Self::new_with_eos_set`]) is byte-identical
+    /// to the pre-B4d single-seq path; `SlotId(N>0)` (via
+    /// [`Self::new_with_slot`] / [`Self::with_slot_id`]) rebases
+    /// every internal `forward_gpu_with_hidden` call + the K=N
+    /// partial-reject rollback to slot N's per-layer K/V region.
+    slot_id: SlotId,
 }
 
 impl<'a> SpecDecode<'a> {
@@ -237,6 +252,12 @@ impl<'a> SpecDecode<'a> {
             eos_token_ids,
             stats: SpecDecodeStats::default(),
             sampler: SpecSampler::greedy(),
+            // ADR-040 Phase B4d (2026-05-30) — default to SlotId(0) so
+            // existing single-seq callers (production today via
+            // serve/mod.rs + engine_qwen35.rs) preserve byte-identical
+            // behaviour with pre-B4d.  Multi-seq callers route through
+            // `Self::with_slot_id` / `Self::new_with_slot_*`.
+            slot_id: SlotId(0),
         })
     }
 
@@ -246,6 +267,32 @@ impl<'a> SpecDecode<'a> {
     pub fn with_sampler(mut self, sampler: SpecSampler) -> Self {
         self.sampler = sampler;
         self
+    }
+
+    /// ADR-040 Phase B4d (2026-05-30) — builder-style slot installer.
+    /// Default after [`Self::new_with_eos_set`] is `SlotId(0)`
+    /// (byte-identical to pre-B4d).  `SlotId(N>0)` routes all
+    /// internal `forward_gpu_with_hidden` calls + the K=N
+    /// partial-reject rollback through slot N's per-layer K/V
+    /// region.  Bounds-checked at the `forward_gpu_impl` entry
+    /// (inherited from B4a) — out-of-range slots fail loud BEFORE
+    /// any GPU dispatch.
+    pub fn with_slot_id(mut self, slot_id: SlotId) -> Self {
+        self.slot_id = slot_id;
+        self
+    }
+
+    /// ADR-040 Phase B4d (2026-05-30) — multi-seq aware constructor
+    /// mirroring [`Self::new_with_eos_set`] + threading `slot_id`.
+    /// `SlotId(0)` is byte-identical to [`Self::new_with_eos_set`].
+    pub fn new_with_eos_set_and_slot(
+        verifier: &'a Qwen35Model,
+        max_seq_len: u32,
+        eos_token_ids: Vec<u32>,
+        slot_id: SlotId,
+    ) -> Result<Self> {
+        Ok(Self::new_with_eos_set(verifier, max_seq_len, eos_token_ids)?
+            .with_slot_id(slot_id))
     }
 
     /// ADR-034 task #91 (2026-05-21) — multi-EOS constructor with sampler.
@@ -331,9 +378,13 @@ impl<'a> SpecDecode<'a> {
 
         let prefill_positions = positions_for_range(0, prompt.len());
         let prefill_start = Instant::now();
+        // ADR-040 Phase B4d (2026-05-30) — route the prefill forward
+        // through the active `self.slot_id` (was hard-coded SlotId(0)
+        // per the B4a / B4d deferral block at the file header).
+        let slot_id = self.slot_id;
         let (prefill_logits, prefill_hidden) = self
             .verifier
-            .forward_gpu_with_hidden(prompt, &prefill_positions, &mut self.kv_cache, SlotId(0))
+            .forward_gpu_with_hidden(prompt, &prefill_positions, &mut self.kv_cache, slot_id)
             .context("SpecDecode verifier prefill")?;
         self.stats.prefill_elapsed = prefill_start.elapsed();
         // forward_gpu_with_hidden returns the full [seq_len, H] residual; MTP
@@ -457,17 +508,23 @@ impl<'a> SpecDecode<'a> {
                 // exercised during prefill). The K=N path advances each by a
                 // KNOWN amount (spec_k+1 entries for verifier batched verify,
                 // spec_k+1 for MTP chained draft + catch-up).
+                // ADR-040 Phase B4d (2026-05-30) — read the per-slot
+                // cursor (was `current_len[0]` hard-codes).  Bounds-safe
+                // via `.get(idx).copied().unwrap_or(0)` — at
+                // `n_seqs == 1 + SlotId(0)` this is byte-identical to
+                // the pre-B4d `current_len[0]` read.
+                let slot_idx = slot_id.0 as usize;
                 let prior_full_attn_len: u32 = self
                     .kv_cache
                     .full_attn
                     .first()
-                    .map(|s| s.current_len[0])
+                    .and_then(|s| s.current_len.get(slot_idx).copied())
                     .unwrap_or(0);
                 let prior_mtp_len: u32 = self
                     .kv_cache
                     .mtp_slot
                     .as_ref()
-                    .map(|s| s.current_len[0])
+                    .and_then(|s| s.current_len.get(slot_idx).copied())
                     .unwrap_or(0);
 
                 // Chain `spec_k + 1` MTP forward steps:
@@ -572,7 +629,10 @@ impl<'a> SpecDecode<'a> {
                         &verify_input,
                         &verify_positions,
                         &mut self.kv_cache,
-                        SlotId(0),
+                        // ADR-040 Phase B4d (2026-05-30) — route the
+                        // K=N batched verify through `self.slot_id`
+                        // (was hard-coded SlotId(0) per B4d deferral).
+                        slot_id,
                     )
                     .with_context(|| {
                         format!("SpecDecode K={spec_k} batched verify pos {next_pos}")
@@ -779,12 +839,25 @@ impl<'a> SpecDecode<'a> {
                     // because verifier and MTP have different base
                     // offsets (verifier starts at prompt_len, MTP at 0).
                     let valid_count = (accepted as u32) + 1;
-                    self.kv_cache.truncate_full_attn_to(
-                        prior_full_attn_len + valid_count,
-                    );
-                    self.kv_cache.truncate_mtp_to(
-                        prior_mtp_len + valid_count,
-                    );
+                    // ADR-040 Phase B4d (2026-05-30) — per-slot
+                    // truncate (was the all-slots variant which
+                    // touched sibling slots' cursors).  SlotId(0) at
+                    // n_seqs==1 is byte-identical.  `truncate_*_for_slot`
+                    // bounds-checks `slot_id.0 < n_seqs` and returns
+                    // Err on OOR; the .context() turns that into the
+                    // existing error-propagation path.
+                    self.kv_cache
+                        .truncate_full_attn_to_for_slot(
+                            slot_id,
+                            prior_full_attn_len + valid_count,
+                        )
+                        .context("K=N partial-reject: truncate_full_attn_to_for_slot")?;
+                    self.kv_cache
+                        .truncate_mtp_to_for_slot(
+                            slot_id,
+                            prior_mtp_len + valid_count,
+                        )
+                        .context("K=N partial-reject: truncate_mtp_to_for_slot")?;
                     // ADR-034 task #90 Step 4 (2026-05-21) — roll back the
                     // DeltaNet recurrent state via the per-position capture
                     // buffer. accepted_idx = `accepted` (the LA state AFTER
@@ -800,16 +873,14 @@ impl<'a> SpecDecode<'a> {
                     // iter would attend over a stale state ahead by
                     // `spec_k - accepted` steps. See task #86 root-cause
                     // memo for the "the the the..." attractor empirics.
-                    // ADR-040 Phase A2b (2026-05-29) — rollback_la_to now
-                    // takes an explicit slot. Spec-decode hot path is
-                    // single-seq today (`HybridKvCache::n_seqs == 1`), so
-                    // we route through SlotId(0). When iter-A2b-cont (or a
-                    // future iter) lifts the spec-decode loop to multi-seq,
-                    // this site will thread the active slot id from the
-                    // batched-verify dispatcher.
+                    // ADR-040 Phase B4d (2026-05-30) — route the K=N
+                    // partial-reject LA rollback through `self.slot_id`
+                    // (was hard-coded SlotId(0) per A2b's deferral
+                    // note above).  SlotId(0) at n_seqs==1 is
+                    // byte-identical to pre-B4d.
                     self.kv_cache
                         .rollback_la_to(
-                            crate::serve::multi_seq_kv::SlotId(0),
+                            slot_id,
                             accepted as u32,
                         )
                         .context("K=N partial-reject: rollback_la_to")?;
@@ -973,7 +1044,10 @@ impl<'a> SpecDecode<'a> {
                 let (logits_a, hidden_a) = self
                     .verifier
                     .forward_gpu_with_hidden(
-                        &[token_next], &pos_a, &mut self.kv_cache, SlotId(0),
+                        // ADR-040 Phase B4d (2026-05-30) — route
+                        // through `self.slot_id` (was hard-coded
+                        // SlotId(0) per B4d deferral).
+                        &[token_next], &pos_a, &mut self.kv_cache, slot_id,
                     )
                     .with_context(|| {
                         format!("K1 TWO_CALLS_PROPER A pos {next_pos}")
@@ -1002,7 +1076,10 @@ impl<'a> SpecDecode<'a> {
                     let (logits_b, hidden_b) = self
                         .verifier
                         .forward_gpu_with_hidden(
-                            &[proposed], &pos_b, &mut self.kv_cache, SlotId(0),
+                            // ADR-040 Phase B4d (2026-05-30) — route
+                            // through `self.slot_id` (was hard-coded
+                            // SlotId(0) per B4d deferral).
+                            &[proposed], &pos_b, &mut self.kv_cache, slot_id,
                         )
                         .with_context(|| {
                             format!("K1 TWO_CALLS_PROPER B pos {}", next_pos + 1)
@@ -1076,7 +1153,10 @@ impl<'a> SpecDecode<'a> {
                             &[token_next, proposed],
                             &verify_positions_2,
                             &mut self.kv_cache,
-                            SlotId(0),
+                            // ADR-040 Phase B4d (2026-05-30) — route
+                            // through `self.slot_id` (was hard-coded
+                            // SlotId(0) per B4d deferral).
+                            slot_id,
                         )
                         .with_context(|| {
                             format!("SpecDecode K1 verifier step pos {next_pos}")
@@ -1239,7 +1319,10 @@ impl<'a> SpecDecode<'a> {
                 let (verify_logits, verify_hidden) = self
                     .verifier
                     .forward_gpu_with_hidden(
-                        &[token_next], &verify_positions, &mut self.kv_cache, SlotId(0),
+                        // ADR-040 Phase B4d (2026-05-30) — route
+                        // through `self.slot_id` (was hard-coded
+                        // SlotId(0) per B4d deferral).
+                        &[token_next], &verify_positions, &mut self.kv_cache, slot_id,
                     )
                     .with_context(|| format!("SpecDecode verifier step pos {next_pos}"))?;
                 let v_ms = verify_t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
@@ -1366,7 +1449,10 @@ impl<'a> SpecDecode<'a> {
                         &synth_tokens,
                         &synth_positions,
                         &mut self.kv_cache,
-                        SlotId(0),
+                        // ADR-040 Phase B4d (2026-05-30) — bench path
+                        // routes through `self.slot_id` (was
+                        // hard-coded SlotId(0) per B4d deferral).
+                        slot_id,
                     )
                     .with_context(|| {
                         format!("VerifierN bench N={n}")

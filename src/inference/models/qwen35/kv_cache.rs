@@ -1441,6 +1441,110 @@ impl HybridKvCache {
         }
     }
 
+    /// ADR-040 Phase B4d (2026-05-30) — per-slot variant of
+    /// [`Self::truncate_full_attn_to`].  Decrements only
+    /// `current_len[slot.0]` on every full-attn slot; sibling slots'
+    /// cursors are byte-untouched.  Bounds-first per A2b iter-1.5
+    /// cfa-finding-F5: returns `Err` BEFORE any cursor mutation if
+    /// `slot.0 >= n_seqs` (read from the canonical
+    /// `current_len.len()` shape on the first full-attn slot — same
+    /// invariant `seq_len(slot)` enforces).
+    ///
+    /// **Use case (ADR-040 Phase B4d spec-decode at SlotId(N>0))**:
+    /// the K=N partial-reject path in [`super::spec_decode::SpecDecode::run_prompt`]
+    /// rolls back the active slot's `current_len[slot.0]` after a
+    /// batched verify wrote `spec_k + 1` positions but only
+    /// `accepted + 1` were valid.  Sibling slots in other in-flight
+    /// requests under the SlotAware scheduler (Phase C2c/C2d) must
+    /// not have their cursors touched by this rollback.
+    ///
+    /// # Errors
+    /// - `slot.0 >= n_seqs` (where `n_seqs` is the configured n_seqs
+    ///   axis on the cache): returns `Err` with a clear "ADR-040
+    ///   Phase B4d per-slot truncate contract" diagnostic.
+    pub fn truncate_full_attn_to_for_slot(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        new_len: u32,
+    ) -> Result<()> {
+        // Bounds-FIRST per A2b iter-1.5 cfa-finding-F5.  The canonical
+        // `n_seqs` for the cursor axis is the length of
+        // `current_len` on the first full-attn slot.  An empty
+        // `full_attn` Vec also fails (the spec-decode path requires
+        // at least one full-attn slot via the prefill contract).
+        let n_seqs = self
+            .full_attn
+            .first()
+            .map(|s| s.current_len.len() as u32)
+            .ok_or_else(|| {
+                anyhow!(
+                    "HybridKvCache::truncate_full_attn_to_for_slot({:?}, new_len={}): \
+                     ADR-040 Phase B4d per-slot truncate contract — empty full_attn slot vec",
+                    slot,
+                    new_len,
+                )
+            })?;
+        if slot.0 >= n_seqs {
+            return Err(anyhow!(
+                "HybridKvCache::truncate_full_attn_to_for_slot({:?}, new_len={}): \
+                 ADR-040 Phase B4d per-slot truncate contract — slot {} >= n_seqs {}",
+                slot,
+                new_len,
+                slot.0,
+                n_seqs,
+            ));
+        }
+        for slot_data in self.full_attn.iter_mut() {
+            // Defensive shape guard: if a sibling layer disagrees with
+            // the canonical n_seqs it's a multi-layer invariant
+            // violation; treat as the bounds-check above already
+            // would have caught.
+            if let Some(cur) = slot_data.current_len.get_mut(slot.0 as usize) {
+                if *cur > new_len {
+                    *cur = new_len;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// ADR-040 Phase B4d (2026-05-30) — per-slot variant of
+    /// [`Self::truncate_mtp_to`].  Decrements only the MTP slot's
+    /// `current_len[slot.0]`; sibling slots' MTP cursors are
+    /// byte-untouched.  Bounds-first per A2b iter-1.5 cfa-finding-F5.
+    /// No-op if `self.mtp_slot.is_none()` (the model lacks MTP).
+    ///
+    /// # Errors
+    /// - `slot.0 >= n_seqs` on the MTP slot's `current_len` axis:
+    ///   returns `Err` with a clear "ADR-040 Phase B4d per-slot
+    ///   truncate contract" diagnostic.
+    pub fn truncate_mtp_to_for_slot(
+        &mut self,
+        slot: crate::serve::multi_seq_kv::SlotId,
+        new_len: u32,
+    ) -> Result<()> {
+        let Some(mtp) = self.mtp_slot.as_mut() else {
+            return Ok(());
+        };
+        let n_seqs = mtp.current_len.len() as u32;
+        if slot.0 >= n_seqs {
+            return Err(anyhow!(
+                "HybridKvCache::truncate_mtp_to_for_slot({:?}, new_len={}): \
+                 ADR-040 Phase B4d per-slot truncate contract — slot {} >= n_seqs {}",
+                slot,
+                new_len,
+                slot.0,
+                n_seqs,
+            ));
+        }
+        if let Some(cur) = mtp.current_len.get_mut(slot.0 as usize) {
+            if *cur > new_len {
+                *cur = new_len;
+            }
+        }
+        Ok(())
+    }
+
     /// ADR-034 task #90 Step 2 (2026-05-21) — lazily allocate the
     /// per-position capture buffer on every linear-attention slot for
     /// K=N speculative decoding. Idempotent: re-calling with the SAME

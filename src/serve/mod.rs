@@ -3181,7 +3181,14 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                     |prev_token, pos, _generated_tokens| -> Result<u32> {
                         let decode_positions = vec![pos; 4];
                         model
-                            .forward_gpu_greedy(&[prev_token], &decode_positions, &mut kv_cache)
+                            // ADR-040 Phase B4d (2026-05-30) —
+                            // forward_gpu_greedy now accepts a SlotId
+                            // (was hard-coded SlotId(0) per B4d
+                            // deferral). Production cmd_generate path
+                            // is single-seq today (FifoSerial /
+                            // SerialFifo); SlotId(0) is byte-identical
+                            // to pre-B4d.
+                            .forward_gpu_greedy(&[prev_token], &decode_positions, &mut kv_cache, SlotId(0))
                             .with_context(|| {
                                 format!("forward_gpu_greedy decode at pos {pos} (benchmark)")
                             })
@@ -3432,7 +3439,9 @@ fn cmd_generate_qwen35(args: cli::GenerateArgs, gguf: mlx_native::gguf::GgufFile
                 // forward_gpu_greedy: GPU argmax → 4-byte download (vs 600KB full logits).
                 // Eliminates ~5ms/token vocabulary download for greedy decode.
                 let next = model
-                    .forward_gpu_greedy(&[prev_token], &decode_positions, &mut kv_cache)
+                    // ADR-040 Phase B4d (2026-05-30) — see sibling at
+                    // serve/mod.rs:3184 for the SlotId contract.
+                    .forward_gpu_greedy(&[prev_token], &decode_positions, &mut kv_cache, SlotId(0))
                     .with_context(|| format!("forward_gpu_greedy decode at pos {pos}"))?;
                 if let Some(t) = _t_step {
                     eprintln!(

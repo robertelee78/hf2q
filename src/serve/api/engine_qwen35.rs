@@ -2068,7 +2068,13 @@ pub fn generate_qwen35_once(
                 tok
             } else if is_greedy {
                 qwen.model
-                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
+                    // ADR-040 Phase B4d (2026-05-30) — forward_gpu_greedy
+                    // now accepts SlotId.  Single-seq engine path:
+                    // SlotId(0) is byte-identical to pre-B4d. C2c/C2d
+                    // SlotAware activation has its own slot-aware
+                    // sibling (forward_gpu_last_logits(.., slot_id))
+                    // — see engine_qwen35.rs:5204 for the routing.
+                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache, SlotId(0))
                     .with_context(|| format!("forward_gpu_greedy decode step {step}"))?
             } else {
                 let logits_full = qwen
@@ -3396,7 +3402,9 @@ pub fn generate_qwen35_once_with_soft_tokens(
                 tok
             } else if is_greedy {
                 qwen.model
-                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
+                    // ADR-040 Phase B4d (2026-05-30) — see sibling at
+                    // engine_qwen35.rs:2071 for the SlotId contract.
+                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache, SlotId(0))
                     .with_context(|| {
                         format!("forward_gpu_greedy decode step {step} (soft tokens)")
                     })?
@@ -3675,7 +3683,9 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
                 tok
             } else if is_greedy {
                 qwen.model
-                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
+                    // ADR-040 Phase B4d (2026-05-30) — see sibling at
+                    // engine_qwen35.rs:2071 for the SlotId contract.
+                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache, SlotId(0))
                     .with_context(|| {
                         format!("forward_gpu_greedy decode step {step} (wedge-4d)")
                     })?
@@ -4548,7 +4558,9 @@ pub fn generate_stream_qwen35_once_extended(
             let decode_positions = vec![pos; 4];
             let dec_result = if is_greedy {
                 qwen.model
-                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache)
+                    // ADR-040 Phase B4d (2026-05-30) — see sibling at
+                    // engine_qwen35.rs:2071 for the SlotId contract.
+                    .forward_gpu_greedy(&[next_token], &decode_positions, &mut kv_cache, SlotId(0))
             } else {
                 match qwen.model.forward_gpu_last_logits(
                     &[next_token],

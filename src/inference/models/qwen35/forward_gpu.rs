@@ -1999,18 +1999,24 @@ impl Qwen35Model {
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
         dflash_capture: Option<&mut crate::inference::spec_decode::dflash::hidden_capture::DFlashCaptureSession>,
+        // ADR-040 Phase B4d (2026-05-30, this iter): dflash variant
+        // now accepts `slot_id` (was hard-coded SlotId(0) per B4a /
+        // B4d deferral).  `SlotId(0)` is byte-identical to pre-B4d
+        // (delegates to `forward_gpu_with_hidden` / `forward_gpu_impl`
+        // at slot 0); `SlotId(N>0)` rebases through the B4a-cont
+        // slice_view discipline.  Bounds-checked at `forward_gpu_impl`
+        // entry per B4a's `slot_id.0 < n_seqs` contract.
+        slot_id: SlotId,
     ) -> Result<(Vec<f32>, MlxBuffer)> {
         let Some(session) = dflash_capture else {
-            // ADR-040 Phase B4a (2026-05-23): dflash variant is gated to
-            // SlotId(0) for B4a; multi-slot routing for the dflash drafter
-            // capture path lands in Phase B4d alongside the rest of the
-            // spec-decode entry points (per the ADR-040 §2.2 phase table
-            // entry for `spec_decode/dflash/kv_cache.rs`).
+            // ADR-040 Phase B4d (2026-05-30): dflash variant now
+            // routes `slot_id` verbatim through the dflash-None
+            // fallthrough (was hard-coded SlotId(0) per B4a deferral).
             return self.forward_gpu_with_hidden(
                 tokens,
                 positions_flat,
                 kv_cache,
-                SlotId(0),
+                slot_id,
             );
         };
         // Validate session layout matches this forward call before
@@ -2067,9 +2073,10 @@ impl Qwen35Model {
             &[],
             None,
             None,
-            // ADR-040 Phase B4a: dflash gated to slot 0 for B4a — see
-            // the dflash-None fallthrough above for the rationale.
-            SlotId(0),
+            // ADR-040 Phase B4d (2026-05-30): dflash variant now
+            // routes `slot_id` verbatim through the capture path
+            // (was hard-coded SlotId(0) per B4a deferral).
+            slot_id,
         )?;
         let hidden = hidden_out.ok_or_else(|| {
             anyhow!("forward_gpu_with_hidden_dflash: hidden buffer was not captured")
@@ -4794,11 +4801,30 @@ impl Qwen35Model {
     /// `apply_output_head_gpu_greedy` (GPU argmax → downloads 4 bytes).
     ///
     /// Only valid for `tokens.len() == 1` (single-step decode, temperature=0).
+    /// ADR-040 Phase B4d (2026-05-30) — greedy decode entry with
+    /// `slot_id: SlotId` threaded through to the per-layer FA + DN
+    /// dispatch sites.  `SlotId(0)` preserves pre-B4d single-seq
+    /// byte-identical behaviour (H168); `SlotId(N>0)` with
+    /// `N < kv_cache.n_seqs` routes the per-layer K/V writes through
+    /// slot N's region via the same `slice_view` discipline B4b
+    /// established at the prefill decode-entry surface.
+    ///
+    /// Bounds-first per A2b iter-1.5 cfa-finding-F5: the four
+    /// internal `apply_gated_attn_layer_decode_into` + `build_gated_attn_layer`
+    /// + `build_delta_net_layer_decode_into` + `build_delta_net_layer`
+    /// callsites receive `slot_id` verbatim; the kernel-dispatcher
+    /// bounds check inherited from B4a-cont fires BEFORE any GPU
+    /// allocation runs.
     pub fn forward_gpu_greedy(
         &self,
         tokens: &[u32],
         positions_flat: &[i32],
         kv_cache: &mut HybridKvCache,
+        // ADR-040 Phase B4d (2026-05-30) — see B4b §6.1.20 for the
+        // `slot_id` contract on the decode-entry surface; the
+        // greedy-fast-path siblings (FA at :5293 + :5612 + DN at
+        // :5380 + :5716) now receive `slot_id` verbatim.
+        slot_id: SlotId,
     ) -> Result<u32> {
         debug_assert_eq!(
             tokens.len(),
@@ -5292,14 +5318,16 @@ impl Qwen35Model {
                             shape.rope_theta,
                             shape.mrope_section,
                             shape.rms_norm_eps,
-                            // ADR-040 Phase B4a-cont: per-slot id
-                            // for the single-CB decode-path FA layer.
-                            // `forward_gpu_greedy` is the B4d-scope
-                            // greedy decode entry (multi-slot routing
-                            // for that path lands in Phase B4d); hard-
-                            // coded SlotId(0) here matches the
-                            // existing single-slot greedy contract.
-                            SlotId(0),
+                            // ADR-040 Phase B4d (2026-05-30, this iter)
+                            // — greedy decode-entry FA dispatch now
+                            // routes through `slot_id` (was hard-coded
+                            // SlotId(0) per B4a-cont/B4b deferral).
+                            // `SlotId(0)` is byte-identical to pre-B4d
+                            // (pinned by H168); `SlotId(N>0)` rebases
+                            // the per-layer K/V slot via the
+                            // B4a-cont's `slice_view` discipline at
+                            // `gpu_full_attn.rs::slot_k_v_region_for_full_attn`.
+                            slot_id,
                         )
                         .with_context(|| format!("full_attn single-cb layer {layer_idx}"))?
                     }
@@ -5371,13 +5399,17 @@ impl Qwen35Model {
                             shape.d_v,
                             shape.conv_kernel,
                             shape.rms_norm_eps,
-                            // ADR-040 Phase A2b-cont (2026-05-30) —
-                            // `forward_gpu_greedy` is the B4d-scope greedy
-                            // decode entry (multi-slot routing for that path
-                            // lands in B4d).  Hard-coded SlotId(0) here
-                            // matches its existing FA call-site contract at
-                            // forward_gpu.rs:5293 + 5612.
-                            SlotId(0),
+                            // ADR-040 Phase B4d (2026-05-30, this iter)
+                            // — greedy decode-entry DN dispatch now
+                            // routes through `slot_id` (was hard-coded
+                            // SlotId(0) per A2b-cont/B4d deferral).
+                            // `SlotId(0)` is byte-identical to pre-B4d
+                            // via A2b-cont's `narrow_la_ping_pong_to_slot`
+                            // helper (zero-copy `slice_view` at
+                            // offset 0 for slot 0); `SlotId(N>0)`
+                            // rebases the recurrent + conv_state
+                            // regions to slot N's per-slot byte offset.
+                            slot_id,
                         )
                         .with_context(|| format!("delta_net single-cb layer {layer_idx}"))?;
 
@@ -5620,12 +5652,13 @@ impl Qwen35Model {
                             // Plain CommandEncoder shape — byte-identical to
                             // pre-iter91 behavior.
                             None,
-                            // ADR-040 Phase B4a-cont: forward_gpu_greedy is
-                            // a B4d-scope decode entry (multi-slot routing
-                            // for the greedy fast path lands in B4d).
-                            // Hard-coded SlotId(0) here matches B4a's
-                            // existing forward_gpu_greedy contract.
-                            SlotId(0),
+                            // ADR-040 Phase B4d (2026-05-30, this iter)
+                            // — greedy legacy-FA dispatch now routes
+                            // through `slot_id` (was hard-coded
+                            // SlotId(0) per B4a-cont/B4d deferral).
+                            // Same `slice_view` discipline as the
+                            // single-CB FA path at :5302.
+                            slot_id,
                         )
                         .with_context(|| format!("full_attn legacy greedy layer {layer_idx}"))?
                     }
@@ -5709,11 +5742,14 @@ impl Qwen35Model {
                             shape.rms_norm_eps,
                             state_capture_ref,
                             conv_capture_ref,
-                            // ADR-040 Phase A2b-cont (2026-05-30) —
-                            // `forward_gpu_greedy` is the B4d-scope greedy
-                            // decode entry; hard-coded SlotId(0) mirrors
-                            // the FA call-sites at forward_gpu.rs:5293 + :5612.
-                            SlotId(0),
+                            // ADR-040 Phase B4d (2026-05-30, this iter)
+                            // — greedy legacy-DN dispatch now routes
+                            // through `slot_id` (was hard-coded
+                            // SlotId(0) per A2b-cont/B4d deferral).
+                            // Same `narrow_la_ping_pong_to_slot`
+                            // discipline as the single-CB DN path at
+                            // :5380.
+                            slot_id,
                         )
                         .with_context(|| format!("delta_net legacy greedy layer {layer_idx}"))?;
 
@@ -9654,6 +9690,376 @@ mod tests {
     ///
     /// Falsifier: the `gpu_delta_net.rs` lift accidentally drags
     /// `build_delta_net_layer*` calls into Gemma 4 or Qwen3VL code.
+    // ──────────────────────────────────────────────────────────────────
+    // ADR-040 Phase B4d (2026-05-30) — spec-decode slot_id threading.
+    //
+    // Lifts the typed deferrals stamped at §6.1.20 (B4b) +
+    // §6.1.40 (A2b-cont sub-deferral "iter-A2b-cont-forward-gpu-greedy"):
+    //   * `forward_gpu_greedy(.., slot_id: SlotId)` (NEW signature)
+    //   * `forward_gpu_with_hidden_dflash(.., slot_id: SlotId)` (NEW)
+    //   * `SpecDecode::with_slot_id` / `new_with_eos_set_and_slot`
+    //   * `Qwen35DFlashTarget::new_with_slot` + `with_slot_id`
+    //   * `HybridKvCache::truncate_full_attn_to_for_slot` / `truncate_mtp_to_for_slot`
+    //
+    // H167: source-grep — production-side `forward_gpu_greedy` body now
+    //       routes `slot_id` to all 4 internal dispatch sites
+    //       (FA decode/legacy + DN decode/legacy).
+    // H168: functional — `forward_gpu_greedy(.., SlotId(0))` at `n_seqs=4`
+    //       is BIT-IDENTICAL to the same call at `n_seqs=1` on the
+    //       FA-only fixture (SerialFifo byte-equivalence pin).
+    // H169: functional — `forward_gpu_greedy(.., SlotId(1))` at `n_seqs=4`
+    //       runs end-to-end without panic; advances slot 1's cursor;
+    //       sibling slot 0's cursor stays at 0.
+    // H170: source-grep — `SpecDecode` struct carries a `slot_id` field
+    //       and the public `with_slot_id` builder exists.
+    // H171: source-grep — `Qwen35DFlashTarget` carries a `slot_id` field
+    //       and `new_with_slot` constructor exists.
+    // H172: source-grep — `Qwen35DFlashTarget::forward_decode_verify_batched`
+    //       routes `self.slot_id` into `forward_gpu_with_hidden_dflash`;
+    //       `rollback_kv` routes `self.slot_id` into `truncate_*_for_slot`
+    //       + `rollback_la_to`.
+    // H173: sibling discipline — Gemma 4 + Qwen3VL forward paths
+    //       untouched by B4d (source-grep against forward_prefill.rs +
+    //       qwen3vl_text/).
+    // ──────────────────────────────────────────────────────────────────
+
+    /// ADR-040 Phase B4d H167 — `forward_gpu_greedy` body source-grep.
+    ///
+    /// Pin the 4 internal dispatch sites (FA decode + DN decode + FA
+    /// legacy + DN legacy) now route through `slot_id` (not
+    /// `SlotId(0)` hard-codes).  Falsifier: any of the 4 sites
+    /// silently regressing to `SlotId(0)`.
+    #[test]
+    fn h167_forward_gpu_greedy_threads_slot_id_to_all_4_internal_sites_2026_05_30() {
+        let body = std::fs::read_to_string("src/inference/models/qwen35/forward_gpu.rs")
+            .expect("read forward_gpu.rs");
+        // Locate the `pub fn forward_gpu_greedy(` declaration + walk
+        // forward to the function end.  We approximate by grabbing
+        // ~60K chars starting at the declaration — covers the full
+        // FA + DN dispatch bodies + their epilogue (function is
+        // ~1300 lines).
+        let decl_idx = body
+            .find("pub fn forward_gpu_greedy(")
+            .expect("H167: forward_gpu_greedy declaration not found");
+        let body_window = &body[decl_idx..];
+        let end_window = (body_window.len()).min(70_000);
+        let window = &body_window[..end_window];
+
+        // The new signature MUST carry `slot_id: SlotId` as a param.
+        assert!(
+            window.contains("slot_id: SlotId"),
+            "H167 FALSIFIED: forward_gpu_greedy missing `slot_id: SlotId` \
+             parameter — B4d signature lift regressed"
+        );
+        // Strip line comments so doc/comment text mentioning
+        // `SlotId(0)` (which is plentiful and intentional) doesn't
+        // count.  Then count bare `SlotId(0)` on remaining code lines.
+        let code_only: String = window
+            .lines()
+            .map(|l| {
+                // Remove `//`-style trailing comments.
+                if let Some(c_idx) = l.find("//") {
+                    &l[..c_idx]
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let slot_id_zero_count = code_only.matches("SlotId(0)").count();
+        assert_eq!(
+            slot_id_zero_count, 0,
+            "H167 FALSIFIED: forward_gpu_greedy body contains {} \
+             code-side `SlotId(0)` literal(s) (comments stripped).  The 4 \
+             internal dispatch sites (FA at :5293 + :5612, DN at :5380 + \
+             :5716) MUST route through `slot_id`, not the literal.",
+            slot_id_zero_count
+        );
+        // Spot-check that the threaded literal `slot_id,` appears at
+        // ≥4 dispatch-site routings.  Doc comments mention `slot_id`
+        // (no trailing comma) so the comma constraint isolates the
+        // call-site positional-arg occurrences.
+        let threaded = code_only.matches("slot_id,").count();
+        assert!(
+            threaded >= 4,
+            "H167 FALSIFIED: `slot_id,` appears only {} time(s) in \
+             forward_gpu_greedy code body — expected ≥4 dispatch-site \
+             routings (FA decode + DN decode + FA legacy + DN legacy)",
+            threaded
+        );
+    }
+
+    /// ADR-040 Phase B4d H168 — `forward_gpu_greedy(.., SlotId(0))`
+    /// byte-equivalence at `n_seqs=4` vs `n_seqs=1`.
+    ///
+    /// SerialFifo byte-equivalence pin: the existing
+    /// SerialFifo single-seq path runs at `n_seqs == 1` today.  After
+    /// B4d, the same call at `n_seqs == 4` with `SlotId(0)` must
+    /// produce a BIT-IDENTICAL argmax (single u32) — proves the
+    /// `n_seqs > 1` allocation does not disturb the slot-0 greedy
+    /// fast-path output.
+    ///
+    /// Falsifier: any difference in the returned `u32` ⇒ the n_seqs
+    /// > 1 allocation regressed the slot-0 path.
+    #[test]
+    fn h168_forward_gpu_greedy_slot_0_byte_equivalent_at_n_seqs_4_vs_1_2026_05_30() {
+        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
+        let cfg = m.cfg.clone();
+        // forward_gpu_greedy requires seq_len == 1.
+        let token = 7u32;
+        let pos: i32 = 5;
+        let positions_flat = vec![pos; 4];
+
+        let device = MlxDevice::new().expect("device");
+        let mut kv_1 = HybridKvCache::new(&cfg, &device, 64, 1).expect("kv n_seqs=1");
+        let mut kv_4 = HybridKvCache::new(&cfg, &device, 64, 4).expect("kv n_seqs=4");
+
+        let arg_1 = m
+            .forward_gpu_greedy(&[token], &positions_flat, &mut kv_1, SlotId(0))
+            .expect("forward_gpu_greedy n_seqs=1 slot 0");
+        let arg_4 = m
+            .forward_gpu_greedy(&[token], &positions_flat, &mut kv_4, SlotId(0))
+            .expect("forward_gpu_greedy n_seqs=4 slot 0");
+        assert_eq!(
+            arg_1, arg_4,
+            "H168 FALSIFIED: forward_gpu_greedy(SlotId(0)) at n_seqs=4 produced \
+             argmax {} but n_seqs=1 produced {} — SerialFifo byte-equivalence \
+             regressed",
+            arg_4, arg_1
+        );
+    }
+
+    /// ADR-040 Phase B4d H169 — `forward_gpu_greedy(.., SlotId(1))`
+    /// end-to-end at `n_seqs=4`.
+    ///
+    /// Multi-seq spec-decode pin: the SlotId(1) greedy fast-path
+    /// must run without panic, advance slot 1's cursor by 1, and
+    /// LEAVE slot 0's cursor at 0 (sibling isolation preserved per
+    /// the B4a-cont `slice_view` discipline).
+    ///
+    /// Falsifier: runtime panic OR slot 0's cursor moves OR slot 1's
+    /// cursor fails to advance.
+    #[test]
+    fn h169_forward_gpu_greedy_slot_1_succeeds_end_to_end_at_n_seqs_4_2026_05_30() {
+        let m = tiny_dense_full_attn_model_nonzero_for_b4a();
+        let cfg = m.cfg.clone();
+        let token = 3u32;
+        let pos: i32 = 0;
+        let positions_flat = vec![pos; 4];
+
+        let device = MlxDevice::new().expect("device");
+        let mut kv = HybridKvCache::new(&cfg, &device, 64, 4).expect("kv n_seqs=4");
+
+        // Pre-state: all cursors at 0.
+        assert_eq!(kv.full_attn[0].current_len[0], 0, "pre: slot 0 cursor 0");
+        assert_eq!(kv.full_attn[0].current_len[1], 0, "pre: slot 1 cursor 0");
+
+        let _arg = m
+            .forward_gpu_greedy(&[token], &positions_flat, &mut kv, SlotId(1))
+            .expect("H169: forward_gpu_greedy SlotId(1) must succeed");
+
+        // Slot 1's cursor advanced by 1 (greedy is seq_len=1).
+        assert_eq!(
+            kv.full_attn[0].current_len[1], 1,
+            "H169 FALSIFIED: slot 1's cursor did NOT advance to 1 after \
+             forward_gpu_greedy(SlotId(1)); got {}",
+            kv.full_attn[0].current_len[1]
+        );
+        // Slot 0's cursor UNCHANGED.
+        assert_eq!(
+            kv.full_attn[0].current_len[0], 0,
+            "H169 FALSIFIED: slot 0's cursor moved to {} after a SlotId(1) \
+             forward — sibling-slot isolation regressed",
+            kv.full_attn[0].current_len[0]
+        );
+    }
+
+    /// ADR-040 Phase B4d H170 — `SpecDecode` carries `slot_id` field
+    /// + `with_slot_id` builder + `new_with_eos_set_and_slot`.
+    ///
+    /// Source-grep pin so future iters can't silently drop the
+    /// multi-seq surface.  Falsifier: any of `slot_id`,
+    /// `with_slot_id`, or `new_with_eos_set_and_slot` missing.
+    #[test]
+    fn h170_spec_decode_carries_slot_id_field_and_builders_2026_05_30() {
+        let body = std::fs::read_to_string("src/inference/models/qwen35/spec_decode.rs")
+            .expect("read spec_decode.rs");
+        assert!(
+            body.contains("slot_id: SlotId,"),
+            "H170 FALSIFIED: SpecDecode struct missing `slot_id: SlotId,` field"
+        );
+        assert!(
+            body.contains("pub fn with_slot_id("),
+            "H170 FALSIFIED: SpecDecode missing `pub fn with_slot_id(` builder"
+        );
+        assert!(
+            body.contains("pub fn new_with_eos_set_and_slot("),
+            "H170 FALSIFIED: SpecDecode missing `pub fn new_with_eos_set_and_slot(` ctor"
+        );
+        // The prefill + verify forward calls now route `slot_id` (was
+        // SlotId(0) hard-codes).  Pin: ≥3 `slot_id,` occurrences
+        // inside run_prompt (prefill + K=N batched verify + K=1 verify
+        // + K=0 verify + K1_TWO_CALLS A/B + bench).
+        let run_prompt_idx = body
+            .find("pub fn run_prompt(")
+            .expect("H170: run_prompt declaration not found");
+        let window = &body[run_prompt_idx..];
+        let threaded = window.matches("slot_id,").count();
+        assert!(
+            threaded >= 6,
+            "H170 FALSIFIED: run_prompt routes `slot_id,` only {} time(s) — \
+             expected ≥6 (prefill + K=N verify + K=1 batched A/B + K=0 verify \
+             + bench).  Some site silently regressed to SlotId(0).",
+            threaded
+        );
+    }
+
+    /// ADR-040 Phase B4d H171 — `Qwen35DFlashTarget` carries
+    /// `slot_id` field + `new_with_slot` constructor.
+    ///
+    /// Source-grep pin.  Falsifier: either missing.
+    #[test]
+    fn h171_qwen35_dflash_target_carries_slot_id_field_and_ctor_2026_05_30() {
+        let body = std::fs::read_to_string("src/inference/spec_decode/dflash/qwen35_target.rs")
+            .expect("read qwen35_target.rs");
+        assert!(
+            body.contains("pub slot_id: SlotId,"),
+            "H171 FALSIFIED: Qwen35DFlashTarget struct missing `pub slot_id: SlotId,` field"
+        );
+        assert!(
+            body.contains("pub fn new_with_slot("),
+            "H171 FALSIFIED: Qwen35DFlashTarget missing `pub fn new_with_slot(` ctor"
+        );
+        assert!(
+            body.contains("pub fn with_slot_id("),
+            "H171 FALSIFIED: Qwen35DFlashTarget missing `pub fn with_slot_id(` builder"
+        );
+    }
+
+    /// ADR-040 Phase B4d H172 — `Qwen35DFlashTarget` body routes
+    /// `self.slot_id` into `forward_gpu_with_hidden_dflash` +
+    /// `truncate_*_for_slot` + `rollback_la_to`.
+    ///
+    /// Source-grep pin.  Falsifier: any of the 4 sites regressing
+    /// to a bare `SlotId(0)` hard-code.
+    #[test]
+    fn h172_qwen35_dflash_target_routes_slot_id_in_methods_2026_05_30() {
+        let body = std::fs::read_to_string("src/inference/spec_decode/dflash/qwen35_target.rs")
+            .expect("read qwen35_target.rs");
+        assert!(
+            body.contains("self.slot_id"),
+            "H172 FALSIFIED: Qwen35DFlashTarget body never reads `self.slot_id` — \
+             trait method bodies regressed"
+        );
+        assert!(
+            body.contains("truncate_full_attn_to_for_slot"),
+            "H172 FALSIFIED: rollback_kv missing `truncate_full_attn_to_for_slot` \
+             call — per-slot rollback regressed to the all-slots variant"
+        );
+        assert!(
+            body.contains("truncate_mtp_to_for_slot"),
+            "H172 FALSIFIED: rollback_kv missing `truncate_mtp_to_for_slot` call"
+        );
+        // Strip line comments before counting bare `SlotId(0)` refs.
+        // Doc comments mention SlotId(0) extensively (intentional —
+        // the field is a slot identifier and SlotId(0) is the
+        // single-seq default).  Only code-side references count.
+        let code_only: String = body
+            .lines()
+            .map(|l| {
+                if let Some(c_idx) = l.find("//") {
+                    &l[..c_idx]
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let zeros = code_only.matches("SlotId(0)").count();
+        // Exactly 1 expected: `Self::new_with_slot(model, kv_cache,
+        // SlotId(0))` inside `Self::new` (the default-to-SlotId(0)
+        // shim that preserves the pre-B4d construction surface).
+        assert_eq!(
+            zeros, 1,
+            "H172 FALSIFIED: Qwen35DFlashTarget code body contains {} bare \
+             `SlotId(0)` references (comments stripped) — expected exactly 1 \
+             (the `Self::new` delegation to `Self::new_with_slot(.., SlotId(0))`).",
+            zeros
+        );
+    }
+
+    /// ADR-040 Phase B4d H173 — Gemma 4 + Qwen3VL forward paths
+    /// UNCHANGED by the spec-decode slot threading.
+    ///
+    /// The B4d lift surface is strictly the Qwen35 spec-decode +
+    /// `forward_gpu_greedy` + `forward_gpu_with_hidden_dflash` +
+    /// `Qwen35DFlashTarget` siblings.  Gemma 4's `forward_prefill.rs`
+    /// + the Gemma 4 `MlxModelWeights::DFlashTarget` impl + any
+    /// `qwen3vl_text/` forward code must remain untouched.
+    ///
+    /// Falsifier: any Gemma 4 or Qwen3VL source contains a reference
+    /// to `forward_gpu_greedy`, `forward_gpu_with_hidden_dflash`, or
+    /// `Qwen35DFlashTarget::new_with_slot`.
+    #[test]
+    fn h173_gemma4_and_qwen3vl_unchanged_by_b4d_2026_05_30() {
+        // Gemma 4 forward path body source-grep — must not reference
+        // the Qwen35-scoped B4d symbols.
+        let gemma4 = std::fs::read_to_string("src/serve/forward_prefill.rs")
+            .expect("read forward_prefill.rs");
+        assert!(
+            !gemma4.contains("forward_gpu_greedy"),
+            "H173 FALSIFIED: ADR-040 Phase B4d leaked `forward_gpu_greedy` \
+             references into Gemma 4's forward_prefill.rs"
+        );
+        assert!(
+            !gemma4.contains("forward_gpu_with_hidden_dflash"),
+            "H173 FALSIFIED: ADR-040 Phase B4d leaked \
+             `forward_gpu_with_hidden_dflash` references into Gemma 4's \
+             forward_prefill.rs"
+        );
+
+        // Gemma 4 dflash target uses the SHARED DFlashTarget trait
+        // impl on MlxModelWeights (target.rs) which we left UNTOUCHED
+        // by design.  The shared `target.rs` source-grep below
+        // confirms the trait signature stayed the same shape (no
+        // slot_id added).
+        let shared_target = std::fs::read_to_string("src/inference/spec_decode/dflash/target.rs")
+            .expect("read target.rs");
+        assert!(
+            !shared_target.contains("slot_id: SlotId"),
+            "H173 FALSIFIED: shared `DFlashTarget` trait gained a \
+             `slot_id: SlotId` parameter — B4d must NOT touch the shared \
+             trait signature (would break Gemma 4 + sibling discipline)"
+        );
+
+        // Qwen3VL spot-check (the dir may not exist — absence is the
+        // strongest H173 pass).
+        if std::path::Path::new("src/inference/models/qwen3vl_text").exists() {
+            for entry in std::fs::read_dir("src/inference/models/qwen3vl_text")
+                .expect("read qwen3vl_text dir")
+            {
+                let entry = entry.expect("dir entry");
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    let body = std::fs::read_to_string(&p)
+                        .unwrap_or_else(|_| String::new());
+                    assert!(
+                        !body.contains("forward_gpu_greedy"),
+                        "H173 FALSIFIED: qwen3vl_text/{:?} references \
+                         forward_gpu_greedy — B4d leaked",
+                        p.file_name()
+                    );
+                    assert!(
+                        !body.contains("forward_gpu_with_hidden_dflash"),
+                        "H173 FALSIFIED: qwen3vl_text/{:?} references \
+                         forward_gpu_with_hidden_dflash — B4d leaked",
+                        p.file_name()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn h143_gemma4_and_qwen3vl_forward_paths_unchanged_2026_05_30() {
         let gemma4 = std::fs::read_to_string("src/serve/forward_prefill.rs")
