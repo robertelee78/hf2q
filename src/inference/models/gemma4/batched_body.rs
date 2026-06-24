@@ -194,6 +194,11 @@ fn dispatch_dense_rowident(
     layer_idx: usize,
 ) -> Result<()> {
     use mlx_native::GgmlType;
+    // Measured (ADR-040 M4, 2026-06-24): for F32/F16 weights at decode N≤8 the
+    // per-row m=1 matvec loop is FASTER than the m=N tile path (151.6 vs 138.5
+    // tok/s @ N=4) — the 8×8 SIMD tile wastes most rows at small m, while the
+    // m=1 matvec is bandwidth-optimal. So the byte-identical per-row loop is also
+    // the throughput-optimal choice; no batched F16/F32 matvec kernel is needed.
     let batched_rowident = !matches!(weight.info.ggml_dtype, GgmlType::F32 | GgmlType::F16)
         && (n as u32) <= mlx_native::ops::quantized_matmul_ggml::MM_ROUTING_THRESHOLD;
     if batched_rowident {

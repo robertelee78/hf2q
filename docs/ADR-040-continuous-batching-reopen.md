@@ -220,7 +220,20 @@ Methodical build per the mantra: each milestone states a **testable hypothesis**
 | hf2q batched body (S2/S3) | — | **~150 tok/s** (1.47× over per-slot) |
 | llama.cpp `llama-server -np 4` | 89 tok/s | **~200 tok/s** |
 
-llama.cpp setup = `/opt/gemma4/serve.sh` (`-fa auto -ctk q8_0 -ctv q8_0`, llama.cpp b9360). The S2/S3 batched body closes the gap from **0.51× → 0.75×** of llama.cpp's N=4 throughput; llama.cpp remains ~1.33× faster than our batched body. Caveat: KV configs differ (llama q8_0 K/V vs our hybrid F16-K + TQ-HB-V); both flash-attention, greedy, same weights/hardware. Remaining gap is the M4 target: our per-slot attention flashes are barrier-serialized on the shared `sdpa_tmp` (no true concurrency yet), and llama.cpp's `-np` continuous batching scales 89→200 (2.24×) where ours scales less. Probe: `slot_aware_n4_batched_body_throughput_probe` (ours) + `llama-server` driven by 4 concurrent `/completion` requests.
+llama.cpp setup = `/opt/gemma4/serve.sh` (`-fa auto -ctk q8_0 -ctv q8_0`, llama.cpp b9360). The S2/S3 batched body closes the gap from **0.51× → 0.75×** of llama.cpp's N=4 throughput; llama.cpp remains ~1.33× faster than our batched body. Caveat: KV configs differ (llama q8_0 K/V vs our hybrid F16-K + TQ-HB-V); both flash-attention, greedy, same weights/hardware. Probe: `slot_aware_n4_batched_body_throughput_probe` (ours, `HF2Q_BENCH_N` streams) + `llama-server` driven by N concurrent `/completion` requests.
+
+**M4 INVESTIGATION (2026-06-24) — the gap is batching-amortization SCALING, not per-token kernel speed. Two hypotheses tested + REFUTED, one root cause localized.** Scaling curve (batched body, same GGUF/hardware) vs llama.cpp:
+
+| N (concurrent) | hf2q batched | per-stream | llama.cpp | per-stream |
+|----------------|--------------|------------|-----------|------------|
+| 1 | **89.5 tok/s** | 89.5 | **89 tok/s** | 89 |
+| 2 | 127.4 | 63.7 | — | — |
+| 4 | 151.7 | 37.9 | ~200 | ~50 |
+
+**At N=1 we are DEAD EVEN with llama.cpp (89.5 vs 89)** — our per-token decode kernels are competitive. The entire gap opens from N=2 on: our per-stream throughput degrades 89→38 (2.4× contention) where llama.cpp's degrades 89→50 (1.78×). So the lever is *amortization across concurrent slots*, not kernel speed.
+- **REFUTED H-M4a (attention barriers are the bottleneck):** phase-split the per-slot attention into 3 phases (encode-all → flash-all → undo-all) so per-slot flashes address disjoint ranges and overlap under `MTLDispatchTypeConcurrent` (~3 barriers/layer vs 3N). Byte-identical (n1+n4 green) but **throughput-neutral at N=4 (149 vs 151)** → attention is not the bottleneck. Reverted (no measured benefit; mantra).
+- **REFUTED H-M4b (per-row m=1 F32/F16 loops are slow):** forcing the m=N tile path for the F32 router + F16 ffn_down is SLOWER (138.5 vs 151.6 tok/s) — the 8×8 SIMD tile wastes rows at small m; the m=1 matvec is bandwidth-optimal. Kept the per-row loop (also throughput-optimal).
+- **Localized root cause — amortization:** the dominant MoE experts batch `n_tokens=N` but, at decode, 4 diverse tokens route to mostly-distinct experts ⇒ little cross-slot weight reuse (inherent to MoE, llama.cpp shares it); the F16 ffn_down (~15 MB) is re-read N× by the per-row m=1 loop (no weight amortization, ~2-3 ms/tick at N=4); the quantized dense `mul_mv` only partially amortizes via L2. **M4 implementation (next, mlx-native kernel work):** a batched F16/F32 mat-VEC (weight read once, N output rows, per-row bit-identical — distinct from the lane-wasting tile) to amortize ffn_down ⇒ est. ~166 tok/s; investigate MoE `_id` cross-slot expert dedup. M5 cutover stays gated on this + a default-on decision.
 
 **(Original M1 plan, for reference)** F1 (batched worker loop) + F2 (batched forward), correctness-first.
 - **Current state (verified, Chesterton's fence):** `worker_run` (`src/serve/api/engine.rs:5012`) builds a `WorkerScheduler` (`:5072`) then drains the queue with `while let Some(req) = rx.blocking_recv()` (`:5105`) — one full request at a time, even in `SlotAware`. The `InflightBatchedScheduler` exists but its batched `step()` (`scheduler.rs:348`/`:1266`) is never driven.

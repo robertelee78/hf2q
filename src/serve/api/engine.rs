@@ -19682,8 +19682,17 @@ assistant:
             kv_persist_dir: None,
         };
         const BENCH_TOKENS: usize = 128;
-        let prompts: Vec<Vec<u32>> =
-            vec![vec![1, 2, 3], vec![4, 5, 6, 7], vec![8, 9], vec![10, 11, 12, 13, 14]];
+        // HF2Q_BENCH_N = number of concurrent streams (default 4, max 8) — lets
+        // us measure single-stream (N=1) vs batched scaling.
+        // max_slots is capped at 4 for SlotAware batched decode (ADR-040
+        // §6.1.53 SpecDecodeMaxSlotsAboveBatchedThreshold), so N≤4.
+        let n_streams: usize = std::env::var("HF2Q_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+            .clamp(1, 4);
+        let base = [vec![1u32, 2, 3], vec![4, 5, 6, 7], vec![8, 9], vec![10, 11, 12, 13, 14]];
+        let prompts: Vec<Vec<u32>> = (0..n_streams).map(|i| base[i].clone()).collect();
         let params = SamplingParams {
             temperature: 0.0,
             max_tokens: BENCH_TOKENS,
@@ -19691,9 +19700,11 @@ assistant:
         };
         let batched_on = std::env::var("HF2Q_BATCHED_BODY").as_deref() == Ok("1");
         let loaded = LoadedModel::load(&load_opts).expect("load");
-        let engine =
-            Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 })
-                .expect("spawn SlotAware{max_slots:4}");
+        let engine = Engine::spawn_with_mode(
+            loaded, 16, None,
+            EngineMode::SlotAware { max_slots: n_streams as u32 },
+        )
+        .expect("spawn SlotAware");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -19724,8 +19735,9 @@ assistant:
         let total_tokens: usize = results.iter().map(|r| r.completion_tokens).sum();
         let tok_s = total_tokens as f64 / elapsed.as_secs_f64();
         eprintln!(
-            "[THROUGHPUT] batched_body={} N=4 concurrent: {} tokens in {:.3}s = {:.1} tok/s aggregate",
-            batched_on, total_tokens, elapsed.as_secs_f64(), tok_s,
+            "[THROUGHPUT] batched_body={} N={} concurrent: {} tokens in {:.3}s = {:.1} tok/s aggregate ({:.1}/stream)",
+            batched_on, n_streams, total_tokens, elapsed.as_secs_f64(), tok_s,
+            tok_s / n_streams as f64,
         );
         rt.block_on(engine.shutdown()).expect("shutdown");
     }
