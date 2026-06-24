@@ -757,7 +757,7 @@ pub enum EngineSpawnError {
     ///
     /// This typed error is the operator-facing guardrail: spawn fails
     /// LOUDLY (not silently degrades) when an operator selects
-    /// `max_slots > HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` (default 4)
+    /// `max_slots > HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` (default 8)
     /// without explicitly opting in via
     /// `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED=1`.
     ///
@@ -823,8 +823,26 @@ pub enum EngineSpawnError {
 /// ADR-040 Phase A4 iter-1 (2026-05-30) — default for
 /// `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` per the §6.1.53 + §6.1.54
 /// dossier §1.5 + §3 finding (spec-decode net-positive ceiling is 4-8
-/// concurrent; conservative default is the safe-zone edge).
-pub const ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS: u32 = 4;
+/// concurrent).
+///
+/// Raised 4 → 8 (2026-06-24, Phase F operator request "support up to 8
+/// concurrent slots × 32k context each"). Justification — this gate is
+/// arch-uniform over ALL `SlotAware` spawns, but it was sized for the
+/// spec-decode regression case, which is NOT wired on this path (the A4
+/// drafter is API-scaffold only per §6.1.55-F5 — no drafter cache is
+/// constructed, so the verification-overhead regression cannot occur).
+/// The path that IS wired — continuous/inflight batching via the
+/// `[N,hidden]` batched body — is empirically validated at N=8:
+/// byte-identical to serial (`slot_aware_n4` + full byte-equiv suite),
+/// coherence-proven e2e, 202 tok/s aggregate. 8 is the UPPER edge of the
+/// dossier's own 4-8 safe zone (not beyond it). KV-memory is bounded and
+/// fits with ~100 GB headroom on the 128 GB M5 Max: gemma4-ara 8 slots ×
+/// 32k = ~4.2 GB (25 sliding layers cap at the 1024 window; only the 5
+/// global layers hold full 32k — 528 MB/slot). When the spec-decode
+/// drafter ships, its own regression analysis re-introduces any tighter
+/// per-feature gate it needs; this default stays the continuous-batching
+/// ceiling the operator asked for.
+pub const ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS: u32 = 8;
 
 /// ADR-040 Phase A4 iter-1 (2026-05-30) — load-bearing dossier citation
 /// for the [`EngineSpawnError::SpecDecodeMaxSlotsAboveBatchedThreshold`]
@@ -3727,7 +3745,11 @@ impl Engine {
                 // oversized-slots threshold gate.  Per §6.1.53 + §6.1.54
                 // dossier (3 independent published sources), speculative
                 // decoding net-regresses above 4-8 concurrent requests.
-                // Default threshold is 4 (the safe-zone edge); operators
+                // Default threshold is 8 (raised from 4, 2026-06-24, Phase F
+                // "support up to 8" — spec-decode drafter is not yet wired so
+                // this gates only the empirically-validated N=8 continuous
+                // batching; see ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS
+                // doc for the full memory + parity justification); operators
                 // can tune via `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` after
                 // empirical inflection-point measurement on their own
                 // hardware.  `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED=1` is the
@@ -23697,18 +23719,25 @@ mod adr040_phase_a4_iter1_spec_decode_threshold_gate_tests {
     /// **H229 (env-reader default)** — when
     /// `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` is unset, the threshold
     /// defaults to `ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS`
-    /// (= 4 per the dossier §1.5 + §3 published inflection-point).
+    /// (= 8 since 2026-06-24 Phase F "support up to 8"; the upper edge of
+    /// the dossier §1.5 + §3 4-8 safe zone — the spec-decode drafter is
+    /// not yet wired, so this gates only the empirically-validated N=8
+    /// continuous batching; see the constant's doc for the full memory +
+    /// parity justification).
     #[test]
-    fn h229_env_reader_default_is_4_when_unset() {
+    fn h229_env_reader_default_is_8_when_unset() {
         let threshold = read_spec_decode_max_batched_slots(|_| None);
         assert_eq!(
             threshold, ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS,
-            "H229: env unset MUST return the dossier-cited default 4 \
-             (spec-decode net-positive safe-zone ceiling)"
+            "H229: env unset MUST return the operator-requested default 8 \
+             (upper edge of the dossier 4-8 safe zone; N=8 continuous \
+             batching is byte-identical + coherence-proven + memory-validated)"
         );
         assert_eq!(
-            threshold, 4,
-            "H229: default constant MUST be 4 per dossier §1.5 + §3"
+            threshold, 8,
+            "H229: default constant MUST be 8 per Phase F operator request \
+             (support up to 8 concurrent slots × 32k); spec-decode drafter \
+             unwired so the dossier's spec-decode regression cannot occur"
         );
     }
 
