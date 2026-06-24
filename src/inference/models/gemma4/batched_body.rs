@@ -35,7 +35,7 @@ use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
 use super::kv_cache::MultiSeqHybridKvBuffers;
 use super::model::{MlxActivationBuffers, MlxModelWeights};
 use crate::serve::gpu::GpuContext;
-use crate::serve::registry::SlotId;
+use crate::serve::multi_seq_kv::SlotId;
 
 /// `[N,...]` mirror of the production decode activation scratch. Each buffer is
 /// sized `N × (the scalar buffer's element count)` — read straight from the

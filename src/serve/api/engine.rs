@@ -6296,40 +6296,93 @@ fn decode_batch_gemma4(
     // Pass 1 — capture bodies. `captured` holds (handle, slot_idx, state, reply)
     // for each slot whose body ran; `hidden_rows` is their final hidden states
     // concatenated row-major `[n, hidden_size]`.
+    // ADR-040 S2/S3: opt-in [N,hidden] batched body (HF2Q_BATCHED_BODY=1 +
+    // hybrid KV). DEFAULT (flag off) = the proven per-slot capture path below
+    // (zero regression to S1). When on, ONE forward_decode_body_batched replaces
+    // the N per-slot bodies; gated by slot_aware_n1/n4 (re-run by me) before any
+    // default flip.
+    let use_batched_body = std::env::var("HF2Q_BATCHED_BODY").as_deref() == Ok("1")
+        && guard.hybrid.is_some();
     let mut captured = Vec::new();
     let mut hidden_rows: Vec<f32> = Vec::new();
-    for &handle in handles {
-        let slot_idx = handle.slot_id.0 as usize;
-        let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
-            continue;
+    if use_batched_body {
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut sids: Vec<SlotId> = Vec::new();
+        let mut positions: Vec<usize> = Vec::new();
+        for &handle in handles {
+            let slot_idx = handle.slot_id.0 as usize;
+            let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
+                continue;
+            };
+            let (state, reply, installed) = slot;
+            if installed != handle {
+                slots[slot_idx] = Some((state, reply, installed));
+                continue;
+            }
+            positions.push(state.prompt_len + state.generated_tokens.len() - 1);
+            tokens.push(state.next_token);
+            sids.push(handle.slot_id);
+            captured.push((handle, slot_idx, state, reply));
+        }
+        if captured.is_empty() {
+            return;
+        }
+        let body_res = {
+            let hybrid = guard.hybrid.as_mut().unwrap();
+            let lm = &mut *guard.model;
+            lm.weights
+                .forward_decode_body_batched(&tokens, &sids, &positions, hybrid, &mut lm.ctx)
         };
-        let (mut state, reply, installed) = slot;
-        if installed != handle {
-            // Stale handle for this physical slot: put it back untouched.
-            slots[slot_idx] = Some((state, reply, installed));
-            continue;
-        }
-        match state.decode_tick_capture(
-            guard.model,
-            &mut guard.kv,
-            guard.hybrid.as_mut(),
-            guard.dense.as_mut(),
-            guard.mlx.as_mut(),
-        ) {
-            Ok(hidden) => {
-                hidden_rows.extend_from_slice(&hidden);
-                captured.push((handle, slot_idx, state, reply));
-            }
+        match body_res {
+            Ok(h) => hidden_rows = h,
             Err(e) => {
-                // Body forward error: evict this slot with a typed error.
-                reset_gemma4_slot(guard, handle.slot_id);
-                scheduler.release(handle);
-                slot_fire_done(reply, Err(e), false);
+                let msg = format!("{e}");
+                for (handle, _slot_idx, _state, reply) in captured.drain(..) {
+                    reset_gemma4_slot(guard, handle.slot_id);
+                    scheduler.release(handle);
+                    slot_fire_done(
+                        reply,
+                        Err(anyhow::anyhow!("forward_decode_body_batched: {msg}")),
+                        false,
+                    );
+                }
+                return;
             }
         }
-    }
-    if captured.is_empty() {
-        return;
+    } else {
+        for &handle in handles {
+            let slot_idx = handle.slot_id.0 as usize;
+            let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
+                continue;
+            };
+            let (mut state, reply, installed) = slot;
+            if installed != handle {
+                // Stale handle for this physical slot: put it back untouched.
+                slots[slot_idx] = Some((state, reply, installed));
+                continue;
+            }
+            match state.decode_tick_capture(
+                guard.model,
+                &mut guard.kv,
+                guard.hybrid.as_mut(),
+                guard.dense.as_mut(),
+                guard.mlx.as_mut(),
+            ) {
+                Ok(hidden) => {
+                    hidden_rows.extend_from_slice(&hidden);
+                    captured.push((handle, slot_idx, state, reply));
+                }
+                Err(e) => {
+                    // Body forward error: evict this slot with a typed error.
+                    reset_gemma4_slot(guard, handle.slot_id);
+                    scheduler.release(handle);
+                    slot_fire_done(reply, Err(e), false);
+                }
+            }
+        }
+        if captured.is_empty() {
+            return;
+        }
     }
     let n = captured.len();
 
