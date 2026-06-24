@@ -757,7 +757,8 @@ pub enum EngineSpawnError {
     ///
     /// This typed error is the operator-facing guardrail: spawn fails
     /// LOUDLY (not silently degrades) when an operator selects
-    /// `max_slots > HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` (default 8)
+    /// `max_slots > HF2Q_MAX_BATCHED_SLOTS` (continuous-batching ceiling,
+    /// default 8; legacy `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` still honoured)
     /// without explicitly opting in via
     /// `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED=1`.
     ///
@@ -823,26 +824,36 @@ pub enum EngineSpawnError {
 /// ADR-040 Phase A4 iter-1 (2026-05-30) — default for
 /// `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` per the §6.1.53 + §6.1.54
 /// dossier §1.5 + §3 finding (spec-decode net-positive ceiling is 4-8
-/// concurrent).
+/// concurrent; conservative default is the safe-zone *lower* edge).
 ///
-/// Raised 4 → 8 (2026-06-24, Phase F operator request "support up to 8
-/// concurrent slots × 32k context each"). Justification — this gate is
-/// arch-uniform over ALL `SlotAware` spawns, but it was sized for the
-/// spec-decode regression case, which is NOT wired on this path (the A4
-/// drafter is API-scaffold only per §6.1.55-F5 — no drafter cache is
-/// constructed, so the verification-overhead regression cannot occur).
-/// The path that IS wired — continuous/inflight batching via the
-/// `[N,hidden]` batched body — is empirically validated at N=8:
-/// byte-identical to serial (`slot_aware_n4` + full byte-equiv suite),
-/// coherence-proven e2e, 202 tok/s aggregate. 8 is the UPPER edge of the
-/// dossier's own 4-8 safe zone (not beyond it). KV-memory is bounded and
-/// fits with ~100 GB headroom on the 128 GB M5 Max: gemma4-ara 8 slots ×
-/// 32k = ~4.2 GB (25 sliding layers cap at the 1024 window; only the 5
-/// global layers hold full 32k — 528 MB/slot). When the spec-decode
-/// drafter ships, its own regression analysis re-introduces any tighter
-/// per-feature gate it needs; this default stays the continuous-batching
-/// ceiling the operator asked for.
-pub const ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS: u32 = 8;
+/// **FAIL-CLOSED, deliberately stays 4 (do NOT relax to 8).** This is the
+/// gate for the SPEC-DECODE drafter path — when that drafter ships, its
+/// verification overhead net-regresses above 4 concurrent (dossier). The
+/// continuous-batching capacity ceiling is the SEPARATE
+/// [`ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS`] (= 8); the two were
+/// decoupled 2026-06-24 (Phase F, codex milestone review of `b671dfe0`
+/// SHIP-WITH-FIXES item (c)) so a future drafter implementer cannot
+/// inherit the relaxed continuous-batching default for the actual
+/// spec-decode path. `adr040_phase_f_gate_decoupling_pin` enforces the
+/// separation at compile/test time.
+pub const ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS: u32 = 4;
+
+/// ADR-040 Phase F (2026-06-24) — default for `HF2Q_MAX_BATCHED_SLOTS`,
+/// the capacity ceiling for the WIRED continuous/inflight-batching
+/// `SlotAware` path (operator request "support up to 8 concurrent slots ×
+/// 32k context each").
+///
+/// 8 is the UPPER edge of the dossier's 4-8 safe zone and is empirically
+/// validated for continuous batching (NOT spec-decode): byte-identical to
+/// serial (`slot_aware_n4` + full byte-equiv suite), coherence-proven e2e,
+/// 202 tok/s aggregate. KV-memory is bounded — gemma4-ara 8 slots × 32k =
+/// ~4.2 GB (25 sliding layers cap at the 1024 window; only the 5 global
+/// layers hold full 32k — 528 MB/slot), ~100 GB headroom on the 128 GB
+/// M5 Max. This is the gate the live `SlotAware` spawn checks; the
+/// spec-decode drafter (unwired, API-scaffold only per §6.1.55-F5) must
+/// gate on [`ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS`] (= 4) when
+/// it lands — NOT this constant.
+pub const ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS: u32 = 8;
 
 /// ADR-040 Phase A4 iter-1 (2026-05-30) — load-bearing dossier citation
 /// for the [`EngineSpawnError::SpecDecodeMaxSlotsAboveBatchedThreshold`]
@@ -889,6 +900,59 @@ where
         },
         None => ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS,
     }
+}
+
+/// ADR-040 Phase F (2026-06-24) — read the continuous/inflight-batching
+/// `SlotAware` capacity ceiling: prefer `HF2Q_MAX_BATCHED_SLOTS`, default
+/// [`ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS`] (= 8).
+///
+/// This is the gate the live `SlotAware` spawn checks — DISTINCT from the
+/// spec-decode drafter gate (codex `b671dfe0` review item (c): keep the
+/// two fail-closed-separate so the future drafter can't inherit 8).  For
+/// operator back-compat, when `HF2Q_MAX_BATCHED_SLOTS` is unset but the
+/// legacy `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` is set, the legacy value is
+/// honoured with a deprecation `warn!` (it used to drive this gate before
+/// the decoupling).  Malformed/zero env falls back to the default.  Pure
+/// function — closure-injected env for deterministic tests.
+pub fn read_continuous_batching_max_slots<F>(env_read: F) -> u32
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let parse = |s: String, var: &str| -> u32 {
+        match s.trim().parse::<u32>() {
+            Ok(0) => {
+                tracing::warn!(
+                    target: "adr040.f",
+                    "{var}={s:?} parsed to 0 — ignoring (would block all \
+                     SlotAware spawns); using default {default}",
+                    default = ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS
+                );
+                ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS
+            }
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    target: "adr040.f",
+                    "{var}={s:?} unparseable as u32; using default {default}",
+                    default = ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS
+                );
+                ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS
+            }
+        }
+    };
+    if let Some(s) = env_read("HF2Q_MAX_BATCHED_SLOTS") {
+        return parse(s, "HF2Q_MAX_BATCHED_SLOTS");
+    }
+    if let Some(s) = env_read("HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS") {
+        tracing::warn!(
+            target: "adr040.f",
+            "HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS is DEPRECATED for the \
+             continuous-batching gate — use HF2Q_MAX_BATCHED_SLOTS. \
+             Honouring legacy value for back-compat."
+        );
+        return parse(s, "HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS (deprecated)");
+    }
+    ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS
 }
 
 /// ADR-040 Phase A4 iter-1 (2026-05-30) — read
@@ -3741,28 +3805,29 @@ impl Engine {
             // §2.4 scope split is honoured: each arch's lift is
             // independent.
             EngineMode::SlotAware { max_slots } => {
-                // ADR-040 Phase A4 iter-1 (2026-05-30) — spec-decode
-                // oversized-slots threshold gate.  Per §6.1.53 + §6.1.54
-                // dossier (3 independent published sources), speculative
-                // decoding net-regresses above 4-8 concurrent requests.
-                // Default threshold is 8 (raised from 4, 2026-06-24, Phase F
-                // "support up to 8" — spec-decode drafter is not yet wired so
-                // this gates only the empirically-validated N=8 continuous
-                // batching; see ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS
-                // doc for the full memory + parity justification); operators
-                // can tune via `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` after
-                // empirical inflection-point measurement on their own
-                // hardware.  `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED=1` is the
-                // explicit opt-in for documented regression — silent
-                // capping would be a Liskov-substitution violation per
-                // ADR-040 §7 no-fallback mantra (H229 pins this).
+                // ADR-040 Phase F (2026-06-24) — continuous-batching
+                // capacity gate.  Default 8 (`HF2Q_MAX_BATCHED_SLOTS`,
+                // `ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS`) — the
+                // upper edge of the §6.1.53/54 dossier's 4-8 safe zone,
+                // empirically validated for the WIRED continuous-batching
+                // path (byte-identical + coherence-proven at N=8; KV-mem
+                // bounded ~4.2 GB @ 8×32k).  This is DECOUPLED from the
+                // spec-decode drafter gate
+                // (`ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS`, still
+                // 4, fail-closed) per codex's `b671dfe0` review item (c):
+                // the unwired drafter (§6.1.55-F5 API-scaffold) MUST NOT
+                // inherit the relaxed continuous default when it lands.
+                // `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED=1` is the explicit
+                // opt-in past the ceiling — silent capping would be a
+                // Liskov-substitution violation per ADR-040 §7 no-fallback
+                // mantra (H229 pins this).
                 //
                 // Gate sits BEFORE per-arch dispatch so the policy is
                 // arch-uniform: Gemma 4 / Qwen35 / Qwen3VL all surface
                 // the SAME typed error at the SAME `max_slots`
                 // threshold, regardless of which per-arch provisioner
                 // would have run.
-                let threshold = read_spec_decode_max_batched_slots(|name| {
+                let threshold = read_continuous_batching_max_slots(|name| {
                     std::env::var(name).ok()
                 });
                 let allow_oversized = read_spec_decode_allow_oversized(|name| {
@@ -23716,28 +23781,87 @@ mod adr040_phase_c_iter1_engine_mode_tests {
 mod adr040_phase_a4_iter1_spec_decode_threshold_gate_tests {
     use super::*;
 
-    /// **H229 (env-reader default)** — when
-    /// `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` is unset, the threshold
-    /// defaults to `ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS`
-    /// (= 8 since 2026-06-24 Phase F "support up to 8"; the upper edge of
-    /// the dossier §1.5 + §3 4-8 safe zone — the spec-decode drafter is
-    /// not yet wired, so this gates only the empirically-validated N=8
-    /// continuous batching; see the constant's doc for the full memory +
-    /// parity justification).
+    /// **H229 (spec-decode env-reader default)** — when
+    /// `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` is unset, the spec-decode
+    /// drafter gate defaults to
+    /// `ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS` (= 4, the
+    /// conservative dossier §1.5 + §3 lower edge).  This default stays 4
+    /// FAIL-CLOSED — the continuous-batching ceiling (8) is the SEPARATE
+    /// `ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS`
+    /// (`adr040_phase_f_gate_decoupling_pin`).
     #[test]
-    fn h229_env_reader_default_is_8_when_unset() {
+    fn h229_env_reader_default_is_4_when_unset() {
         let threshold = read_spec_decode_max_batched_slots(|_| None);
         assert_eq!(
             threshold, ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS,
-            "H229: env unset MUST return the operator-requested default 8 \
-             (upper edge of the dossier 4-8 safe zone; N=8 continuous \
-             batching is byte-identical + coherence-proven + memory-validated)"
+            "H229: env unset MUST return the dossier-cited spec-decode default 4"
         );
         assert_eq!(
-            threshold, 8,
-            "H229: default constant MUST be 8 per Phase F operator request \
-             (support up to 8 concurrent slots × 32k); spec-decode drafter \
-             unwired so the dossier's spec-decode regression cannot occur"
+            threshold, 4,
+            "H229: spec-decode default MUST stay 4 (fail-closed) — the future \
+             drafter regresses above 4; continuous batching uses the separate \
+             ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS=8"
+        );
+    }
+
+    /// **Phase F gate decoupling pin** (codex `b671dfe0` review item (c)) —
+    /// the spec-decode drafter gate and the continuous-batching capacity
+    /// gate are SEPARATE constants with DIFFERENT defaults, so a future
+    /// drafter implementer cannot inherit the relaxed continuous default
+    /// for the actual spec-decode path.  If a refactor ever re-merges them
+    /// (makes both equal), this fails LOUDLY.
+    #[test]
+    fn adr040_phase_f_gate_decoupling_pin() {
+        assert_eq!(
+            ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS, 4,
+            "spec-decode drafter gate MUST stay 4 (fail-closed; dossier regression > 4)"
+        );
+        assert_eq!(
+            ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS, 8,
+            "continuous-batching ceiling MUST be 8 (operator request, N=8 proven)"
+        );
+        assert_ne!(
+            ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS,
+            ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS,
+            "the two gates MUST remain decoupled — re-merging them re-opens the \
+             codex-flagged fail-open footgun (drafter inheriting the relaxed 8)"
+        );
+    }
+
+    /// **Phase F continuous-batching reader** — default 8, `HF2Q_MAX_BATCHED_SLOTS`
+    /// preferred, legacy `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` honoured as a
+    /// deprecated back-compat fallback.
+    #[test]
+    fn adr040_phase_f_continuous_batching_reader_default_and_precedence() {
+        // Unset → default 8.
+        assert_eq!(read_continuous_batching_max_slots(|_| None), 8);
+        // Primary env wins.
+        assert_eq!(
+            read_continuous_batching_max_slots(|n| (n == "HF2Q_MAX_BATCHED_SLOTS")
+                .then(|| "6".to_string())),
+            6
+        );
+        // Legacy env honoured as fallback when primary unset (back-compat).
+        assert_eq!(
+            read_continuous_batching_max_slots(|n| (n
+                == "HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS")
+                .then(|| "5".to_string())),
+            5
+        );
+        // Primary takes precedence over legacy when BOTH set.
+        assert_eq!(
+            read_continuous_batching_max_slots(|n| match n {
+                "HF2Q_MAX_BATCHED_SLOTS" => Some("8".to_string()),
+                "HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS" => Some("2".to_string()),
+                _ => None,
+            }),
+            8
+        );
+        // Zero/malformed trap to default.
+        assert_eq!(
+            read_continuous_batching_max_slots(|n| (n == "HF2Q_MAX_BATCHED_SLOTS")
+                .then(|| "0".to_string())),
+            8
         );
     }
 
