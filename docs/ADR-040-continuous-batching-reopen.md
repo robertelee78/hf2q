@@ -212,6 +212,16 @@ Methodical build per the mantra: each milestone states a **testable hypothesis**
 
 **M2.2 THROUGHPUT WIN MEASURED (2026-06-24) — the reopen's original 0.85× regression is now a 1.47× speedup.** `slot_aware_n4_batched_body_throughput_probe` (gated `HF2Q_BATCHED_BENCH=1`), 4 concurrent SlotAware generates × 128 tokens on the real gemma4-ara Q5_K_M, warm (3 runs each, stable): per-slot path **~102.3 tok/s** aggregate vs batched body **~150.4 tok/s** = **1.47× aggregate decode throughput**. The win is the MoE experts batching `n_tokens=N` (the dominant 1.76 ms/token cost amortizes across slots via `quantized_matmul_id_ggml`) plus the quantized dense projections at m=N (`mul_mv` L2-amortized); the F32 router + F16 ffn_down loop m=1 for byte-identity (minority cost). This is the empirical proof that the `[N,hidden]` batched forward — NOT the F3 dense-GEMM (m≥8) framing — is the primary throughput lever (consistent with the §0.12 F3 microbench correction). **Next:** M4 (per-slot `sdpa_tmp` for true attention concurrency + higher-N scaling, incl. m>8 dense routing) + M5 (default-on cutover decision + peer benchmark vs llama.cpp/mlx-lm).
 
+**M5 PEER BENCHMARK (2026-06-24) — vs llama.cpp on the SAME gemma4-ara Q5_K_M GGUF, M5 Max, N=4 concurrent × 128 greedy tokens, warm, wall-clock aggregate:**
+
+| Engine | N=1 single-stream | N=4 aggregate |
+|--------|-------------------|---------------|
+| hf2q per-slot (default) | — | **~102 tok/s** |
+| hf2q batched body (S2/S3) | — | **~150 tok/s** (1.47× over per-slot) |
+| llama.cpp `llama-server -np 4` | 89 tok/s | **~200 tok/s** |
+
+llama.cpp setup = `/opt/gemma4/serve.sh` (`-fa auto -ctk q8_0 -ctv q8_0`, llama.cpp b9360). The S2/S3 batched body closes the gap from **0.51× → 0.75×** of llama.cpp's N=4 throughput; llama.cpp remains ~1.33× faster than our batched body. Caveat: KV configs differ (llama q8_0 K/V vs our hybrid F16-K + TQ-HB-V); both flash-attention, greedy, same weights/hardware. Remaining gap is the M4 target: our per-slot attention flashes are barrier-serialized on the shared `sdpa_tmp` (no true concurrency yet), and llama.cpp's `-np` continuous batching scales 89→200 (2.24×) where ours scales less. Probe: `slot_aware_n4_batched_body_throughput_probe` (ours) + `llama-server` driven by 4 concurrent `/completion` requests.
+
 **(Original M1 plan, for reference)** F1 (batched worker loop) + F2 (batched forward), correctness-first.
 - **Current state (verified, Chesterton's fence):** `worker_run` (`src/serve/api/engine.rs:5012`) builds a `WorkerScheduler` (`:5072`) then drains the queue with `while let Some(req) = rx.blocking_recv()` (`:5105`) — one full request at a time, even in `SlotAware`. The `InflightBatchedScheduler` exists but its batched `step()` (`scheduler.rs:348`/`:1266`) is never driven.
 - **Hypothesis H-M1 (testable):** *If `worker_run` admits up to N concurrent `Generate` requests and drives them through one batched forward per decode step — each slot carrying independent sampler/grammar/stop/logprob state, attention handled per-slot during bring-up — then (a) each slot's token stream is **bit-identical** to the current serial path for the same prompt+params, and (b) at N=1 the path is **byte-equivalent** to today's `SerialFifo`.*
