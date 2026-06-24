@@ -207,6 +207,10 @@ fn dispatch_dense_rowident(
             ImatrixHint::Layered { tag, layer: layer_idx },
         )
     } else {
+        // Measured (ADR-040 M4): amortizing the F16/F32 weight read across rows
+        // (dispatch row 0 only) was throughput-NEUTRAL (152.3 vs 151.8 @ N=4) —
+        // these reads are L2/latency-bound, not bandwidth-bound, so a batched
+        // F16/F32 mat-VEC kernel would NOT help. The per-row m=1 loop stays.
         for i in 0..n {
             let in_i = input.slice_view(row_off(in_stride, i), in_stride);
             let out_i = output.slice_view(row_off(out_stride, i), out_stride);
