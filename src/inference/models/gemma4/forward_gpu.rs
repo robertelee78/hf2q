@@ -306,13 +306,52 @@ impl MlxModelWeights {
         (Some(returned_worker_reg), Ok(()))
     }
 
-    /// Returns: the next token ID (greedy decode)
+    /// Returns: the next token ID (greedy decode). Full path: body + head +
+    /// finalize. Thin wrapper over [`Self::forward_decode_impl`] with
+    /// `capture_hidden=false` — byte-identical to the historical `forward_decode`.
     pub fn forward_decode(
         &mut self,
         input_token: u32,
         seq_pos: usize,
         gpu: &mut GpuContext,
         profile: &mut Option<TokenProfile>,
+    ) -> Result<u32> {
+        self.forward_decode_impl(input_token, seq_pos, gpu, profile, false)
+    }
+
+    /// ADR-040 S1c — body-capture decode for batched lm_head. Runs the SAME body
+    /// (embed + layer loop) as [`Self::forward_decode`], leaving the final hidden
+    /// state (pre-final-norm) in `self.activations.hidden`, then returns WITHOUT
+    /// running the per-slot head (final-norm + lm_head + softcap + argmax +
+    /// rerank). The SlotAware worker gathers each slot's captured hidden, runs
+    /// ONE [`Self::lm_head_batched`] across all slots, and finalizes per row —
+    /// amortizing the 605 MB lm_head weight read. Read the captured hidden with
+    /// `self.activations.hidden.as_slice::<f32>()` immediately after this returns
+    /// (it is GPU-synced). KV bookkeeping is identical to a full decode (the KV
+    /// write happens in the body), so a captured step advances state exactly like
+    /// a normal decode step.
+    pub fn forward_decode_capture_hidden(
+        &mut self,
+        input_token: u32,
+        seq_pos: usize,
+        gpu: &mut GpuContext,
+        profile: &mut Option<TokenProfile>,
+    ) -> Result<()> {
+        self.forward_decode_impl(input_token, seq_pos, gpu, profile, true)
+            .map(|_| ())
+    }
+
+    /// Core decode. `capture_hidden=false` ⇒ full path returning the greedy
+    /// token (historical behavior, byte-equivalence-pinned). `capture_hidden=true`
+    /// ⇒ stop after the body, leaving the final hidden in `self.activations.hidden`
+    /// and returning a dummy `0` (ignored by the capture wrapper).
+    fn forward_decode_impl(
+        &mut self,
+        input_token: u32,
+        seq_pos: usize,
+        gpu: &mut GpuContext,
+        profile: &mut Option<TokenProfile>,
+        capture_hidden: bool,
     ) -> Result<u32> {
         let token_start = Instant::now();
         let hs = self.hidden_size;
@@ -788,6 +827,17 @@ impl MlxModelWeights {
                 s.dump_group_stats();
             }
 
+            // ADR-040 S1c: body-capture early exit. The final hidden state
+            // (pre-final-norm) is now in `self.activations.hidden`. Finish the
+            // body session to make it host-visible and skip the per-slot head;
+            // the batched head runs once for all slots. `capture_hidden=false`
+            // (the historical path) falls straight through to the head below.
+            if capture_hidden {
+                s.finish()
+                    .map_err(|e| anyhow::anyhow!("body-capture session finish: {e}"))?;
+                return Ok(());
+            }
+
             // --- 3. Final norm + lm_head + softcap + argmax (all GPU) ---
 
             // GPU final RMS norm: hidden → norm_out
@@ -959,6 +1009,13 @@ impl MlxModelWeights {
         // encode_parallel_layers_chunked for the parallel symmetry: there
         // we wait unconditionally, here we restore unconditionally.
         parallel_block_result?;
+
+        // ADR-040 S1c: in body-capture mode the head was skipped inside the IIFE
+        // above; the final hidden is live in `self.activations.hidden`. Return a
+        // dummy token (ignored by `forward_decode_capture_hidden`).
+        if capture_hidden {
+            return Ok(0);
+        }
 
         let session_us = session_start.elapsed().as_secs_f64() * 1e6;
 
