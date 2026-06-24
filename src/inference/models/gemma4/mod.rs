@@ -22,6 +22,7 @@ pub mod kv_cache;
 pub mod gpu_full_attn;
 pub mod gpu_ffn;
 pub mod forward_gpu;
+pub mod batched_head;
 pub mod io_heads;
 pub mod kv_persist;
 pub mod profile;
