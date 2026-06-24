@@ -31432,7 +31432,10 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
         for required in [
             ".slice_view(",
             "self.hybrid_kv = Some(",
-            "self.forward_decode(",
+            // ADR-040 S1c-2: the delegate is now the capture-parameterized
+            // `forward_decode_impl` (forward_decode_slot_aware{,_capture_hidden}
+            // are thin wrappers passing capture_hidden=false/true).
+            "self.forward_decode_impl(",
             "self.hybrid_kv = prior_hybrid_kv",
         ] {
             assert!(
@@ -32372,11 +32375,14 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_cont_iter2_decode_b_gemma4_tests {
              `self.leg_hb_encoded = Some(` mount — decode-side per-slot \
              routing through HbKvBuffers' slot region cannot work."
         );
-        // Positive pin: delegate to forward_decode + restore.
+        // Positive pin: delegate to the sibling decode kernel + restore.
+        // ADR-040 S1c-2: delegate renamed to the capture-parameterized
+        // `forward_decode_impl` (forward_decode_slot_aware is now a thin
+        // capture_hidden=false wrapper).
         assert!(
-            fn_window.contains("self.forward_decode("),
+            fn_window.contains("self.forward_decode_impl("),
             "H175 FALSIFIED: decode fn body does NOT contain \
-             `self.forward_decode(` delegate call. iter-2-decode-B \
+             `self.forward_decode_impl(` delegate call. iter-2-decode-B \
              slot routing cannot reach the sibling kernel-write site."
         );
         // Positive pin: restore on exit.

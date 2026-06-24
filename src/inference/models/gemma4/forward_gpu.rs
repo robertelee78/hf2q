@@ -345,7 +345,7 @@ impl MlxModelWeights {
     /// token (historical behavior, byte-equivalence-pinned). `capture_hidden=true`
     /// ⇒ stop after the body, leaving the final hidden in `self.activations.hidden`
     /// and returning a dummy `0` (ignored by the capture wrapper).
-    fn forward_decode_impl(
+    pub(crate) fn forward_decode_impl(
         &mut self,
         input_token: u32,
         seq_pos: usize,

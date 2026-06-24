@@ -4060,7 +4060,57 @@ impl MlxModelWeights {
     /// - HF2Q_HYBRID_KV=1 + scaffold absent → typed `iter-C2c-cont-invariant-violated`.
     /// - HF2Q_HYBRID_KV=1 + xlen BF16 buffers present → typed `iter-B4c-kernel-iter-2-decode-A-xlen`.
     /// - HF2Q_HYBRID_KV=0 (HB-encoded opt-out) → typed `iter-B4c-kernel-iter-2-decode-B`.
+    /// ADR-040 — public slot-aware decode (full path: body + head, returns the
+    /// greedy/sampled token). Thin wrapper over the capture-parameterized
+    /// [`Self::forward_decode_slot_aware_impl`] with `capture_hidden=false`,
+    /// byte-identical to the historical `forward_decode_slot_aware`. The
+    /// grep-pinned `pub fn forward_decode_slot_aware(` primitive (H123) is here.
     pub fn forward_decode_slot_aware(
+        &mut self,
+        input_token: u32,
+        seq_pos: usize,
+        gpu: &mut GpuContext,
+        profile: &mut Option<crate::inference::models::gemma4::profile::TokenProfile>,
+        slot_id: SlotId,
+        multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>,
+        multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>,
+        multi_seq_kv_dense: Option<&mut Vec<MultiSeqDenseKvBuffers>>,
+        multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
+    ) -> Result<u32> {
+        self.forward_decode_slot_aware_impl(
+            input_token, seq_pos, gpu, profile, slot_id,
+            multi_seq_kv_hb, multi_seq_kv_hybrid, multi_seq_kv_dense, multi_seq_kv_mlx,
+            false,
+        )
+    }
+
+    /// ADR-040 S1c-2 — slot-aware BODY-CAPTURE decode: mounts the slot KV and
+    /// runs the body only, leaving the final hidden in `self.activations.hidden`
+    /// (read it immediately via `self.activations.hidden.as_slice::<f32>()`) and
+    /// skipping the per-slot head. Used by `decode_batch_gemma4` to gather N
+    /// slots' hidden for one batched `lm_head`. Same slot-KV isolation as the
+    /// full path (identical mount/cursor/restore); only the head is deferred.
+    pub fn forward_decode_slot_aware_capture_hidden(
+        &mut self,
+        input_token: u32,
+        seq_pos: usize,
+        gpu: &mut GpuContext,
+        profile: &mut Option<crate::inference::models::gemma4::profile::TokenProfile>,
+        slot_id: SlotId,
+        multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>,
+        multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>,
+        multi_seq_kv_dense: Option<&mut Vec<MultiSeqDenseKvBuffers>>,
+        multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
+    ) -> Result<()> {
+        self.forward_decode_slot_aware_impl(
+            input_token, seq_pos, gpu, profile, slot_id,
+            multi_seq_kv_hb, multi_seq_kv_hybrid, multi_seq_kv_dense, multi_seq_kv_mlx,
+            true,
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn forward_decode_slot_aware_impl(
         &mut self,
         input_token: u32,
         seq_pos: usize,
@@ -4086,6 +4136,11 @@ impl MlxModelWeights {
         // the iter-2C prefill signature.  Off-default (HF2Q_TQ_CODEBOOK_BITS=4
         // opt-in since ADR-007 default-on TQ-8-bit correction 2026-04-24).
         multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
+        // ADR-040 S1c-2: when true, each regime mounts its slot KV then runs
+        // the BODY-ONLY decode (`forward_decode_impl(.., capture_hidden=true)`),
+        // leaving the final hidden in `self.activations.hidden` and skipping the
+        // per-slot head; the SlotAware worker batches the head across slots.
+        capture_hidden: bool,
     ) -> Result<u32> {
         // ── Pre-flight ────────────────────────────────────────────────
         //
@@ -4269,7 +4324,7 @@ impl MlxModelWeights {
             // cursor for attention bookkeeping; re-derive from per-slot seq_pos
             // so interleaved slots don't collide, restore after.
             let prior_cursors = self.set_per_slot_kv_cursor(seq_pos);
-            let result = self.forward_decode(input_token, seq_pos, gpu, profile);
+            let result = self.forward_decode_impl(input_token, seq_pos, gpu, profile, capture_hidden);
             self.restore_kv_cursor(&prior_cursors);
             self.dense_kvs = prior_dense_kvs;
             return result;
@@ -4439,7 +4494,7 @@ impl MlxModelWeights {
             }
 
             let prior_kv_caches = std::mem::replace(&mut self.kv_caches, slot_view_kv);
-            let result = self.forward_decode(input_token, seq_pos, gpu, profile);
+            let result = self.forward_decode_impl(input_token, seq_pos, gpu, profile, capture_hidden);
             // After decode advances slot's write_pos/seq_len, write the
             // updated cursor back into the persistent multi-seq scaffold's
             // seq_lens before restoring.  This preserves the per-slot
@@ -4782,7 +4837,7 @@ impl MlxModelWeights {
             // mount survives (H128 source-grep pin) and the per-layer
             // K/V writes inside `encode_one_layer` land in the per-slot
             // byte region of the persistent multi-seq scaffold.
-            let result = self.forward_decode(input_token, seq_pos, gpu, profile);
+            let result = self.forward_decode_impl(input_token, seq_pos, gpu, profile, capture_hidden);
 
             self.restore_kv_cursor(&prior_cursors);
 
