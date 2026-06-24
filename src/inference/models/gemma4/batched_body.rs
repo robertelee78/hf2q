@@ -34,6 +34,7 @@ use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
 
 use super::kv_cache::MultiSeqHybridKvBuffers;
 use super::model::{MlxActivationBuffers, MlxModelWeights};
+use crate::serve::gpu::GpuContext;
 use crate::serve::registry::SlotId;
 
 /// `[N,...]` mirror of the production decode activation scratch. Each buffer is
@@ -671,10 +672,102 @@ impl MlxModelWeights {
         )
         .map_err(|e| anyhow::anyhow!("batched end-of-layer L{layer_idx}: {e}"))?;
 
-        // Layer complete EXCEPT the attention crux (runtime-parity-traced next):
-        // bufs.hidden now holds this layer's output for all N slots. The
-        // not-yet-built attention means sdpa_out is stale ⇒ numerically WIP until
-        // the crux lands; structure + all batchable ops are in place + compile.
+        // Layer complete: bufs.hidden holds this layer's output for all N slots.
         Ok(())
+    }
+
+    /// ADR-040 S2/S3 — the `[N,hidden]` batched decode BODY: embed-gather N
+    /// tokens → run the layer loop in `[N,hidden]` (per-slot attention against
+    /// each slot's `multi_seq_kv_hybrid` region) → return each slot's final
+    /// hidden row `[n, hidden]` (pre-final-norm — the same value scalar
+    /// `forward_decode_capture_hidden` leaves in `self.activations.hidden`). The
+    /// SlotAware worker feeds those rows to the proven batched head + finalize.
+    ///
+    /// `tokens[i]` / `slot_ids[i]` / `seq_positions[i]` describe slot `i`'s
+    /// current decode step. Production hybrid-TQ path only (errors otherwise via
+    /// the layer encode). WIP — gated by `slot_aware_n1` (N=1 bit-identical to
+    /// scalar body) then `slot_aware_n4`; not wired until those pass.
+    #[allow(dead_code)]
+    pub(crate) fn forward_decode_body_batched(
+        &self,
+        tokens: &[u32],
+        slot_ids: &[SlotId],
+        seq_positions: &[usize],
+        multi_seq_kv_hybrid: &mut [MultiSeqHybridKvBuffers],
+        gpu: &mut GpuContext,
+    ) -> Result<Vec<f32>> {
+        let n = tokens.len();
+        let hs = self.hidden_size;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        // tq params — read identically to the scalar (forward_gpu.rs:517/560).
+        let tq_scale_factor_d512: f32 = match std::env::var("HF2Q_SCALE_FORMULA").as_deref() {
+            Ok("sqrt256") => 16.0,
+            Ok("sqrt512") => 512.0_f32.sqrt(),
+            _ => 1.0,
+        };
+        let tq_codebook_bits: u32 = match std::env::var("HF2Q_TQ_CODEBOOK_BITS").as_deref() {
+            Ok("4") => 0,
+            Ok("5") => 5,
+            Ok("6") => 6,
+            _ => 8,
+        };
+
+        let (exec, reg) = gpu.split();
+        let dev = exec.device();
+        let metal_dev = dev.metal_device();
+
+        let bufs = BatchedDecodeBuffers::new(dev, &self.activations, n)?;
+        let h_stride = bufs.hidden_stride();
+
+        // Positions buffer [N] u32 for per-slot RoPE.
+        let mut positions_buf = dev
+            .alloc_buffer(n * 4, DType::U32, vec![n])
+            .map_err(|e| anyhow::anyhow!("body_batched positions alloc: {e}"))?;
+        {
+            let p: &mut [u32] = positions_buf
+                .as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("body_batched positions write: {e}"))?;
+            for (i, &sp) in seq_positions.iter().enumerate() {
+                p[i] = sp as u32;
+            }
+        }
+
+        let mut s = exec
+            .begin()
+            .map_err(|e| anyhow::anyhow!("body_batched session begin: {e}"))?;
+
+        // Embed-gather (PER-SLOT): token i -> bufs.hidden row i, scaled sqrt(hs).
+        let scale = (hs as f32).sqrt();
+        for i in 0..n {
+            let h_i = bufs.hidden.slice_view(row_off(h_stride, i), h_stride);
+            mlx_native::ops::elementwise::embedding_gather_scale_f32(
+                s.encoder_mut(), reg, metal_dev,
+                &self.embed_weight, &h_i, tokens[i], hs, scale,
+            )
+            .map_err(|e| anyhow::anyhow!("body_batched embed slot{i}: {e}"))?;
+        }
+
+        // Layer loop in [N,hidden].
+        let num_layers = self.layers.len();
+        for layer_idx in 0..num_layers {
+            self.encode_one_layer_batched(
+                layer_idx, &bufs, n, &positions_buf,
+                slot_ids, seq_positions, multi_seq_kv_hybrid,
+                tq_scale_factor_d512, tq_codebook_bits,
+                &mut s, exec, reg,
+            )?;
+        }
+
+        s.finish()
+            .map_err(|e| anyhow::anyhow!("body_batched session finish: {e}"))?;
+
+        // Final hidden rows [n, hidden] (pre-final-norm).
+        let out: &[f32] = bufs
+            .hidden
+            .as_slice()
+            .map_err(|e| anyhow::anyhow!("body_batched read hidden: {e}"))?;
+        Ok(out[..n * hs].to_vec())
     }
 }
