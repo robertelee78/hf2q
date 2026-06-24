@@ -19765,6 +19765,100 @@ assistant:
         rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
     }
 
+    /// ADR-040 Phase F `iter-F-n8parity` (2026-06-24, queen-led audit Worker B
+    /// gap-closure) — the N=**8** analogue of `slot_aware_n4_per_slot_parity_vs_serial`.
+    /// Phase F raised the live continuous-batching default to N=8
+    /// (`ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS`), but the parity bar
+    /// above hard-codes `max_slots: 4`, leaving the shipped default's coherence
+    /// *extrapolated* from the exact `MM_ROUTING_THRESHOLD(=8)` dispatch boundary
+    /// rather than *proven*. This drives 8 distinct prompts concurrently through
+    /// one `SlotAware { max_slots: 8 }` engine and asserts each slot is
+    /// byte-identical to its independent serial slot-aware reference — closing
+    /// the audit's "no N=8 byte-parity test" gap. Run through the batched body
+    /// with `HF2Q_BATCHED_BODY=1` (+`_KVENC`/`_ATTNPRE`) to prove the S2/S3 path
+    /// at the default width; gated by the shared E2E GGUF env like its N=4 peer.
+    #[test]
+    fn slot_aware_n8_per_slot_parity_vs_serial() {
+        if byte_equiv_skip_unless_gated("slot_aware_n8_per_slot_parity_vs_serial") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+
+        // Eight distinct greedy prompts (the N=4 set + four more distinct ones).
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![1, 2, 3],
+            vec![4, 5, 6, 7],
+            vec![8, 9],
+            vec![10, 11, 12, 13, 14],
+            vec![15, 16],
+            vec![17, 18, 19, 20],
+            vec![21, 22, 23],
+            vec![24, 25, 26, 27, 28],
+        ];
+        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+
+        // Serial slot-aware references (AC4-correct bar; one model per prompt).
+        let serial_refs: Vec<GenerationResult> = prompts
+            .iter()
+            .map(|p| gemma4_serial_slot_aware_ref(&load_opts, p, &params))
+            .collect();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .expect("rt");
+
+        // Vacuous-test guard: probe both ends of the slot range so neither the
+        // low nor the high slots can silently collapse to identical output.
+        assert_ne!(
+            serial_refs[0].text, serial_refs[1].text,
+            "vacuous: prompts 0 and 1 produced identical serial output"
+        );
+        assert_ne!(
+            serial_refs[6].text, serial_refs[7].text,
+            "vacuous: prompts 6 and 7 produced identical serial output"
+        );
+
+        // Concurrent SlotAware run at the SHIPPED default width (max_slots: 8).
+        let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
+        let engine_slot =
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 8 })
+                .expect("spawn SlotAware{max_slots:8}");
+        let slot_results: Vec<GenerationResult> = rt.block_on(async {
+            let mut handles = Vec::new();
+            for p in prompts.iter().cloned() {
+                let eng = engine_slot.clone();
+                let pr = params.clone();
+                handles.push(tokio::spawn(async move {
+                    eng.generate(p, pr).await.expect("slot generate")
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.expect("join"));
+            }
+            out
+        });
+        for (i, (slot, serial)) in slot_results.iter().zip(serial_refs.iter()).enumerate() {
+            assert_genresult_byte_equal(
+                slot,
+                serial,
+                &format!("ADR-040 iter-F-n8parity — SlotAware N=8 slot {i} vs its serial ref"),
+            );
+        }
+        rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+    }
+
     /// ADR-040 M2.2 — INFORMATIONAL throughput probe for the `[N,hidden]`
     /// batched decode body (S2/S3). Drives 4 concurrent SlotAware generates of
     /// `BENCH_TOKENS` tokens and prints aggregate decode tok/s. Read the env
