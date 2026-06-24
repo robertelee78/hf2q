@@ -845,11 +845,31 @@ pub const ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS: u32 = 4;
 ///
 /// 8 is the UPPER edge of the dossier's 4-8 safe zone and is empirically
 /// validated for continuous batching (NOT spec-decode): byte-identical to
-/// serial (`slot_aware_n4` + full byte-equiv suite), coherence-proven e2e,
-/// 202 tok/s aggregate. KV-memory is bounded — gemma4-ara 8 slots × 32k =
-/// ~4.2 GB (25 sliding layers cap at the 1024 window; only the 5 global
-/// layers hold full 32k — 528 MB/slot), ~100 GB headroom on the 128 GB
-/// M5 Max. This is the gate the live `SlotAware` spawn checks; the
+/// serial (`slot_aware_n1`/`slot_aware_n4` re-run through the batched body
+/// with `HF2Q_BATCHED_BODY=1`, 2026-06-24 — see ADR §0.13 queen-led audit),
+/// coherence-proven e2e, 202 tok/s aggregate.
+///
+/// KV-memory accounting — CORRECTED 2026-06-24 per queen-led audit Worker C
+/// (the prior "~4.2 GB / ~100 GB headroom" figure was wrong by ~10×):
+/// the 25 sliding layers DO cap at the 1024 ring window (cheap), but the 5
+/// global/full-attention layers allocate at `max_position_embeddings`
+/// (262144) — NOT the operator's 32k request — via
+/// `layer_type_to_alloc_params(Full) = (false, max_position_embeddings)`
+/// (`kv_cache.rs:370`; long-standing pre-Phase-F design, falsifier-pinned).
+/// So at N=8 the global layers alone hold ~32 GB (8 slots × 5 layers ×
+/// nkv=2 × hd=512 × cap=262144 × [2 B F16-K + 1 B TQ-HB-V]); the full
+/// multi-seq hybrid scaffold is ~34 GB, and up to ~45 GB with the Phase-1
+/// HB scaffold co-resident. Total at N=8 ≈ 16.4 GB weights + ~45 GB KV ≈
+/// 62 GB → fits the 128 GB M5 Max with ~66 GB headroom.
+///
+/// OPERATIONAL CAVEAT: this N=8 default is memory-validated for 128 GB
+/// ONLY. On a ≤64 GB machine, N=8 `SlotAware` will exhaust unified memory
+/// at spawn — it fails CLOSED with an `alloc_*_kv_for_layer` context error
+/// (a clean `Result`, not UB / corruption), but operators there MUST set
+/// `HF2Q_MAX_BATCHED_SLOTS` lower. Capping the global layers at the
+/// operator ctx (making "8×32k" literal — ~4 GB global instead of ~32 GB)
+/// is the tracked follow-up `iter-F-kvcap` (ADR §0.13). This is the gate
+/// the live `SlotAware` spawn checks; the
 /// spec-decode drafter (unwired, API-scaffold only per §6.1.55-F5) must
 /// gate on [`ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS`] (= 4) when
 /// it lands — NOT this constant.
