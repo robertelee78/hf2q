@@ -407,11 +407,15 @@ impl MlxModelWeights {
             )
             .map_err(|e| anyhow::anyhow!("batched flash_attn_vec_hybrid L{layer_idx} s{i}: {e}"))?;
             // FWHT-undo (V was FWHT-rotated pre-quant ⇒ SDPA out in FWHT domain).
-            mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
-                session.encoder_mut(), reg, metal_dev,
-                &sdpa_i, nh as u32, hd as u32,
-            )
-            .map_err(|e| anyhow::anyhow!("batched FWHT-undo L{layer_idx} s{i}: {e}"))?;
+            // ADR-040 S2/S3 debug toggle: HF2Q_BATCHED_NO_UNDO=1 skips it to
+            // isolate the FWHT-undo coherence vs the N=1 divergence.
+            if std::env::var("HF2Q_BATCHED_NO_UNDO").as_deref() != Ok("1") {
+                mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+                    session.encoder_mut(), reg, metal_dev,
+                    &sdpa_i, nh as u32, hd as u32,
+                )
+                .map_err(|e| anyhow::anyhow!("batched FWHT-undo L{layer_idx} s{i}: {e}"))?;
+            }
         }
         //
         // NB: the ops below read `bufs.sdpa_out`, which the (not-yet-built)
