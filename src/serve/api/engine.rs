@@ -19658,6 +19658,78 @@ assistant:
         rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
     }
 
+    /// ADR-040 M2.2 — INFORMATIONAL throughput probe for the `[N,hidden]`
+    /// batched decode body (S2/S3). Drives 4 concurrent SlotAware generates of
+    /// `BENCH_TOKENS` tokens and prints aggregate decode tok/s. Read the env
+    /// `HF2Q_BATCHED_BODY` the harness was launched with and run it BOTH ways to
+    /// compare. Gated by HF2Q_BATCHED_BENCH=1 (+ the shared E2E GGUF gate); not
+    /// an assertion — the parity bar is owned by `slot_aware_n4`.
+    #[test]
+    fn slot_aware_n4_batched_body_throughput_probe() {
+        if std::env::var("HF2Q_BATCHED_BENCH").as_deref() != Ok("1") {
+            eprintln!("[skip] slot_aware_n4_batched_body_throughput_probe — set HF2Q_BATCHED_BENCH=1 + HF2Q_BYTE_EQUIV_E2E_GGUF to run");
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path,
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        const BENCH_TOKENS: usize = 128;
+        let prompts: Vec<Vec<u32>> =
+            vec![vec![1, 2, 3], vec![4, 5, 6, 7], vec![8, 9], vec![10, 11, 12, 13, 14]];
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: BENCH_TOKENS,
+            ..Default::default()
+        };
+        let batched_on = std::env::var("HF2Q_BATCHED_BODY").as_deref() == Ok("1");
+        let loaded = LoadedModel::load(&load_opts).expect("load");
+        let engine =
+            Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 4 })
+                .expect("spawn SlotAware{max_slots:4}");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("rt");
+        // Warm-up generate (model load / pipeline bake) — not timed.
+        let _ = rt.block_on(engine.clone().generate(
+            prompts[0].clone(),
+            SamplingParams { temperature: 0.0, max_tokens: 8, ..Default::default() },
+        ));
+        let t0 = std::time::Instant::now();
+        let results: Vec<GenerationResult> = rt.block_on(async {
+            let mut handles = Vec::new();
+            for p in prompts.iter().cloned() {
+                let eng = engine.clone();
+                let pr = params.clone();
+                handles.push(tokio::spawn(async move {
+                    eng.generate(p, pr).await.expect("generate")
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.expect("join"));
+            }
+            out
+        });
+        let elapsed = t0.elapsed();
+        let total_tokens: usize = results.iter().map(|r| r.completion_tokens).sum();
+        let tok_s = total_tokens as f64 / elapsed.as_secs_f64();
+        eprintln!(
+            "[THROUGHPUT] batched_body={} N=4 concurrent: {} tokens in {:.3}s = {:.1} tok/s aggregate",
+            batched_on, total_tokens, elapsed.as_secs_f64(), tok_s,
+        );
+        rt.block_on(engine.shutdown()).expect("shutdown");
+    }
+
     /// F1 AC3 — staggered max_tokens: short slots finish early and are
     /// evicted without perturbing peers; each slot's output still matches
     /// its serial reference at its own max_tokens. Exercises mid-batch
