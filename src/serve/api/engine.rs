@@ -19683,15 +19683,15 @@ assistant:
         };
         const BENCH_TOKENS: usize = 128;
         // HF2Q_BENCH_N = number of concurrent streams (default 4, max 8) — lets
-        // us measure single-stream (N=1) vs batched scaling.
-        // max_slots is capped at 4 for SlotAware batched decode (ADR-040
-        // §6.1.53 SpecDecodeMaxSlotsAboveBatchedThreshold), so N≤4.
+        // us measure single-stream (N=1) vs batched scaling. For N>4 set
+        // HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS=N to clear the A4 threshold gate.
         let n_streams: usize = std::env::var("HF2Q_BENCH_N")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4)
-            .clamp(1, 4);
-        let base = [vec![1u32, 2, 3], vec![4, 5, 6, 7], vec![8, 9], vec![10, 11, 12, 13, 14]];
+            .clamp(1, 8);
+        let base = [vec![1u32, 2, 3], vec![4, 5, 6, 7], vec![8, 9], vec![10, 11, 12, 13, 14],
+                    vec![15, 16, 17], vec![18, 19, 20, 21], vec![22, 23], vec![24, 25, 26, 27, 28]];
         let prompts: Vec<Vec<u32>> = (0..n_streams).map(|i| base[i].clone()).collect();
         let params = SamplingParams {
             temperature: 0.0,

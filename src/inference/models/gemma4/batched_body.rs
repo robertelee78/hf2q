@@ -338,10 +338,38 @@ impl MlxModelWeights {
         } else {
             self.rope_theta_global
         };
+        // ADR-040 M4 — HF2Q_BATCHED_ATTNPRE: fuse the per-slot Q/K norm+RoPE,
+        // V-norm, and FWHT-undo loops into single grid-dim-N dispatches (the
+        // kernels already index a flat array of heads/rows: base=head_id*dim,
+        // pos=positions[head_id/n_heads] — widening the grid to N*heads /
+        // rows=N*nkv processes all N queries query-major ⇒ per-row BIT-IDENTICAL
+        // to the per-slot loops; N=1 reduces to the single dispatch).
+        let attnpre = std::env::var("HF2Q_BATCHED_ATTNPRE").as_deref() == Ok("1");
         session.barrier_between(
             &[&bufs.attn_q, &bufs.attn_k],
             &[&bufs.attn_q_normed, &bufs.attn_k_normed],
         );
+        if attnpre {
+            // ONE batched Q + ONE batched K norm+RoPE over all N queries (grid
+            // N*nh / N*nkv; full positions_buf [N] — kernel reads each query's
+            // pos via seq_idx=head_id/n_heads). Buffers are tight [N, heads*hd].
+            mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32_batched(
+                session.encoder_mut(), reg, metal_dev,
+                &bufs.attn_q, &bufs.attn_q_normed,
+                Some(&self.layers[layer_idx].attn.q_norm_weight),
+                positions_buf, ff_gpu,
+                n as u32, nh as u32, hd as u32, half_rope, eps, theta,
+            )
+            .map_err(|e| anyhow::anyhow!("batched-attnpre Q norm+RoPE L{layer_idx}: {e}"))?;
+            mlx_native::ops::fused_head_norm_rope::dispatch_fused_head_norm_rope_f32_batched(
+                session.encoder_mut(), reg, metal_dev,
+                &bufs.attn_k, &bufs.attn_k_normed,
+                Some(&self.layers[layer_idx].attn.k_norm_weight),
+                positions_buf, ff_gpu,
+                n as u32, nkv as u32, hd as u32, half_rope, eps, theta,
+            )
+            .map_err(|e| anyhow::anyhow!("batched-attnpre K norm+RoPE L{layer_idx}: {e}"))?;
+        } else {
         for i in 0..n {
             let pos_i = positions_buf.slice_view((i * 4) as u64, 1);
             let q_in = bufs.attn_q.slice_view(row_off(q_stride, i), q_stride);
@@ -365,6 +393,7 @@ impl MlxModelWeights {
             )
             .map_err(|e| anyhow::anyhow!("batched K norm+RoPE L{layer_idx} slot{i}: {e}"))?;
         }
+        }
 
         // -- V norm (PER-SLOT row-views) — mirrors scalar gpu_full_attn.rs:183-221.
         // v_is_k (V tied to K, full-attn k_eq_v layers): norm attn_k -> attn_v.
@@ -377,8 +406,26 @@ impl MlxModelWeights {
             &self.activations.norm_params_global_hd
         };
         let v_normed_stride = nkv * hd; // actual per-layer dim (see q/k/v_stride note)
-        if v_is_k {
-            session.barrier_between(&[&bufs.attn_k], &[&bufs.attn_v]);
+        // ATTNPRE: ONE V-norm over all N queries (rows = N*nkv; kernel base =
+        // row*hd over the tight [N, nkv*hd] buffer ⇒ query-major, bit-identical).
+        let (v_in_buf, v_out_buf) = if v_is_k {
+            (&bufs.attn_k, &bufs.attn_v)
+        } else {
+            (&bufs.attn_v, &bufs.attn_v_normed)
+        };
+        session.barrier_between(&[v_in_buf], &[v_out_buf]);
+        if attnpre {
+            dispatch_rms_norm_unit_perhead(
+                session.encoder_mut(), reg, metal_dev,
+                &RmsNormPerHeadArgs {
+                    input: v_in_buf,
+                    output: v_out_buf,
+                    params_buf: hd_norm_params,
+                    rows: (n * nkv) as u32,
+                    dim: hd as u32,
+                },
+            )?;
+        } else if v_is_k {
             for i in 0..n {
                 let vk_in = bufs.attn_k.slice_view(row_off(k_stride, i), k_stride);
                 let v_out = bufs.attn_v.slice_view(row_off(v_stride, i), v_stride);
@@ -394,7 +441,6 @@ impl MlxModelWeights {
                 )?;
             }
         } else {
-            session.barrier_between(&[&bufs.attn_v], &[&bufs.attn_v_normed]);
             for i in 0..n {
                 let vv_in = bufs.attn_v.slice_view(row_off(v_stride, i), v_stride);
                 let v_out = bufs.attn_v_normed.slice_view(row_off(v_normed_stride, i), v_normed_stride);
@@ -449,7 +495,34 @@ impl MlxModelWeights {
             let buf = gbuf;
             let cap = gcap;
             let is_ring = gring;
-            // PHASE 1 — per-slot KV-encode (F16-K + FWHT-V), unchanged math.
+            // PHASE 1 — KV-encode (F16-K + FWHT-V). HF2Q_BATCHED_KVENC=1 fuses
+            // the N per-slot dispatches into 2 grid-dim-N dispatches (one F16-K,
+            // one FWHT-V over all N queries) — bit-identical (per-query slot/pos
+            // addressing in-kernel). Falls back per-slot for the dummy-vnorms
+            // (FULL_F16_KV) case. ADR-040 M4.
+            let v_src_buf: &MlxBuffer = if v_is_k { &bufs.attn_v } else { &bufs.attn_v_normed };
+            let vnorms_dummy = buf.v_norms.byte_len() == 4;
+            let use_batched_kvenc =
+                std::env::var("HF2Q_BATCHED_KVENC").as_deref() == Ok("1") && !vnorms_dummy;
+            if use_batched_kvenc {
+                // ONE barrier: norm-rope/V-norm wrote attn_k_normed / v_src;
+                // declare them as reads for the 2 batched encode dispatches.
+                session.barrier_between(
+                    &[&bufs.attn_k_normed, v_src_buf],
+                    &[&buf.k, &buf.v_packed, &buf.v_norms],
+                );
+                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16_batched(
+                    session.encoder_mut(), reg, metal_dev,
+                    &bufs.attn_k_normed, &buf.k, slot_id_buf, positions_buf,
+                    n as u32, nkv as u32, hd as u32, cap as u32, is_ring,
+                ).map_err(|e| anyhow::anyhow!("bf F16-K batched L{layer_idx}: {e}"))?;
+                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_batched(
+                    session.encoder_mut(), reg, metal_dev,
+                    v_src_buf, &buf.v_packed, &buf.v_norms, slot_id_buf, positions_buf,
+                    n as u32, nkv as u32, hd as u32, cap as u32, is_ring,
+                    tq_scale_factor_d512, tq_codebook_bits,
+                ).map_err(|e| anyhow::anyhow!("bf FWHT-V batched L{layer_idx}: {e}"))?;
+            } else {
             for i in 0..n {
                 let slot = slot_ids[i].0 as u64;
                 let seq_pos_i = seq_positions[i];
@@ -461,7 +534,7 @@ impl MlxModelWeights {
                 let v_view = buf.v_packed.slice_view(slot * (k_elems as u64) * v_dtype_size, k_elems)
                     .with_shape(vec![nkv, cap, hd]).map_err(|e| anyhow::anyhow!("bf V L{layer_idx} s{i}: {e}"))?;
                 let norms_per_pos = buf.norms_per_pos;
-                let v_norms_view = if buf.v_norms.byte_len() == 4 {
+                let v_norms_view = if vnorms_dummy {
                     buf.v_norms.slice_view(0, 1).with_shape(vec![1]).map_err(|e| anyhow::anyhow!("bf Vn dummy: {e}"))?
                 } else {
                     let ne = nkv * cap * norms_per_pos;
@@ -469,7 +542,6 @@ impl MlxModelWeights {
                     buf.v_norms.slice_view(slot * (ne as u64) * 4, ne).with_shape(shp).map_err(|e| anyhow::anyhow!("bf Vn: {e}"))?
                 };
                 let kn_i = bufs.attn_k_normed.slice_view(row_off(k_norm_stride, i), k_norm_stride);
-                let v_src_buf: &MlxBuffer = if v_is_k { &bufs.attn_v } else { &bufs.attn_v_normed };
                 let v_i = if v_is_k {
                     bufs.attn_v.slice_view(row_off(v_stride, i), v_stride)
                 } else {
@@ -483,6 +555,7 @@ impl MlxModelWeights {
                     session.encoder_mut(), reg, metal_dev, &v_i, &v_view, &v_norms_view,
                     nkv as u32, hd as u32, cap as u32, cache_pos, is_ring, tq_scale_factor_d512, tq_codebook_bits,
                 ).map_err(|e| anyhow::anyhow!("bf FWHT-V L{layer_idx} s{i}: {e}"))?;
+            }
             }
             // PHASE 2 — ONE batched flash over all N queries (per-query KV via
             // slot_id_buf + positions_buf, derived in-kernel).
@@ -504,13 +577,23 @@ impl MlxModelWeights {
                 &bufs.attn_q_normed, &buf.k, &buf.v_packed, &buf.v_norms,
                 &bufs.sdpa_out, &bufs.sdpa_tmp, slot_id_buf, positions_buf, &p_hyb,
             ).map_err(|e| anyhow::anyhow!("batched flash L{layer_idx}: {e}"))?;
-            // PHASE 3 — per-slot FWHT-undo.
-            for i in 0..n {
-                let sdpa_i = bufs.sdpa_out.slice_view(row_off(sdpa_stride, i), sdpa_stride);
-                session.barrier_between(&[&bufs.sdpa_out], &[&bufs.sdpa_out]);
+            // PHASE 3 — FWHT-undo. ATTNPRE: ONE batched undo over all N queries
+            // (num_heads=N*nh; kernel base=head_idx*hd over tight [N, nh*hd] ⇒
+            // bit-identical). Else per-slot.
+            session.barrier_between(&[&bufs.sdpa_out], &[&bufs.sdpa_out]);
+            if attnpre {
                 mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
-                    session.encoder_mut(), reg, metal_dev, &sdpa_i, nh as u32, hd as u32,
-                ).map_err(|e| anyhow::anyhow!("bf undo L{layer_idx} s{i}: {e}"))?;
+                    session.encoder_mut(), reg, metal_dev,
+                    &bufs.sdpa_out, (n as u32) * nh as u32, hd as u32,
+                ).map_err(|e| anyhow::anyhow!("bf batched undo L{layer_idx}: {e}"))?;
+            } else {
+                for i in 0..n {
+                    let sdpa_i = bufs.sdpa_out.slice_view(row_off(sdpa_stride, i), sdpa_stride);
+                    session.barrier_between(&[&bufs.sdpa_out], &[&bufs.sdpa_out]);
+                    mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+                        session.encoder_mut(), reg, metal_dev, &sdpa_i, nh as u32, hd as u32,
+                    ).map_err(|e| anyhow::anyhow!("bf undo L{layer_idx} s{i}: {e}"))?;
+                }
             }
         } else {
         for i in 0..n {
@@ -754,7 +837,14 @@ impl MlxModelWeights {
                 mlx_native::MTLSize::new(std::cmp::min(256, total as u64), 1, 1),
             );
         }
-        // Per-slot routing: router_logits[i] -> expert_ids[i*top_k], weights.
+        // MoE routing stays PER-SLOT: the existing prefill
+        // `fused_moe_routing_batch_f32` kernel is NOT byte-identical to the
+        // decode single-token `fused_moe_routing_f32` (different softmax/top-k
+        // reduction — diverges at n=1 even with V3 off; ADR-040 M4 fork finding).
+        // And the weighted-sum batched-seq kernel IS byte-identical but
+        // throughput-NEUTRAL (the dispatch was never a cost) — so neither MoE
+        // per-slot loop is a worthwhile fusion lever; the 202→243 residual is
+        // elsewhere (batched-op efficiency). Both kept per-slot.
         let rl_stride = elems(&bufs.moe_router_logits) / n; // num_experts
         let ids_stride = elems(&bufs.moe_expert_ids) / n; // top_k
         for i in 0..n {
@@ -871,6 +961,8 @@ impl MlxModelWeights {
             &[&bufs.moe_down_id_out, &bufs.moe_routing_weights_gpu],
             &[&bufs.moe_accum],
         );
+        // weighted-sum kept PER-SLOT (the batched-seq kernel is byte-identical
+        // but throughput-neutral — the dispatch was never a cost; M4 fork finding).
         for i in 0..n {
             let din_i = bufs.moe_down_id_out.slice_view(row_off(down_stride, i), down_stride);
             let w_i = bufs.moe_routing_weights_gpu.slice_view(row_off(w_stride, i), w_stride);
