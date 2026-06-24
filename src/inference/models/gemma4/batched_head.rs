@@ -27,6 +27,16 @@ use crate::serve::gpu::GpuContext;
 
 use super::model::MlxModelWeights;
 
+/// Output of [`MlxModelWeights::lm_head_batched`]: row-major per-slot logits and
+/// the post-final-norm hidden rows (the exact-F32 rerank operand that
+/// [`MlxModelWeights::finalize_token_from_logits`] needs).
+pub struct BatchedHeadOut {
+    /// `[n, vocab_size]` post-softcap logits.
+    pub logits: Vec<f32>,
+    /// `[n, hidden_size]` post-final-norm hidden (the `hidden·embed` operand).
+    pub normed: Vec<f32>,
+}
+
 impl MlxModelWeights {
     /// ADR-040 S1b — shared per-row finalize: Q8/Q6_K coarse-logit → exact-F32
     /// argmax rerank. Pure CPU. Extracted verbatim from the scalar
@@ -116,11 +126,11 @@ impl MlxModelWeights {
         hidden_rows: &[f32],
         n: usize,
         gpu: &mut GpuContext,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<BatchedHeadOut> {
         let hs = self.hidden_size;
         let vocab = self.vocab_size;
         if n == 0 {
-            return Ok(Vec::new());
+            return Ok(BatchedHeadOut { logits: Vec::new(), normed: Vec::new() });
         }
         if hidden_rows.len() != n * hs {
             anyhow::bail!(
@@ -201,9 +211,14 @@ impl MlxModelWeights {
         s.finish()
             .map_err(|e| anyhow::anyhow!("lm_head_batched session finish: {e}"))?;
 
-        let out: &[f32] = logits_b
-            .as_slice()
-            .map_err(|e| anyhow::anyhow!("lm_head_batched read logits_b: {e}"))?;
-        Ok(out.to_vec())
+        let logits: Vec<f32> = logits_b
+            .as_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("lm_head_batched read logits_b: {e}"))?
+            .to_vec();
+        let normed: Vec<f32> = normed_b
+            .as_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("lm_head_batched read normed_b: {e}"))?
+            .to_vec();
+        Ok(BatchedHeadOut { logits, normed })
     }
 }

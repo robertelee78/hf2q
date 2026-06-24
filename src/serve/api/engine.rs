@@ -5419,10 +5419,33 @@ impl Gemma4DecodeState {
             multi_seq_kv_mlx.as_deref_mut(),
         )?;
 
+        // ADR-040 S1c-2: the post-forward half (sample/grammar/stop/accumulate)
+        // is `decode_tick_finalize`, shared with the batched-head path. Read the
+        // slot's logits only when sampling (greedy reuses `greedy_token`).
+        let logits: Vec<f32> = if self.sampler_params.is_some() {
+            loaded.weights.logits_view()?.to_vec()
+        } else {
+            Vec::new()
+        };
+        self.decode_tick_finalize(loaded, greedy_token, &logits)
+    }
+
+    /// ADR-040 S1c-2 — post-forward half of [`Self::decode_tick`]: token
+    /// selection (greedy → `greedy_token`; sampler → `logits_row` + grammar mask)
+    /// then EOS / stop-string / grammar-dead / max_tokens bookkeeping. Shared by
+    /// the full per-slot path (logits from `logits_view`) and the batched-head
+    /// path in `decode_batch_gemma4` (logits from `lm_head_batched`, greedy from
+    /// `finalize_token_from_logits`). Bit-identical token selection either way.
+    fn decode_tick_finalize(
+        &mut self,
+        loaded: &mut GemmaLoadedModel,
+        greedy_token: u32,
+        logits_row: &[f32],
+    ) -> Result<TickOutcome> {
         let token_bytes_ref: Option<&[Vec<u8>]> =
             self.token_bytes.as_deref().map(|v| &v[..]);
         self.next_token = if let Some(sp) = self.sampler_params.as_ref() {
-            let mut logits: Vec<f32> = loaded.weights.logits_view()?.to_vec();
+            let mut logits: Vec<f32> = logits_row.to_vec();
             if !self.logit_bias.is_empty() {
                 let v = logits.len();
                 for (&id, &bias) in &self.logit_bias {
@@ -5521,6 +5544,55 @@ impl Gemma4DecodeState {
         // bound so finish_reason stays "length".
         let finished = self.generated_tokens.len() >= self.max_decode_tokens;
         Ok(TickOutcome { fragment, is_reasoning, finished })
+    }
+
+    /// ADR-040 S1c-2 — body-capture half of [`Self::decode_tick`]: runs the
+    /// slot-aware BODY-ONLY decode (same slot-KV isolation as the full path) and
+    /// returns this slot's final hidden row `[hidden_size]` (from
+    /// `self.activations.hidden`). `decode_batch_gemma4` gathers N slots' rows,
+    /// runs ONE `lm_head_batched`, then completes each tick via
+    /// [`Self::decode_tick_finalize`]. The hidden must be read here, before the
+    /// next slot's capture overwrites the shared `self.activations.hidden`.
+    fn decode_tick_capture(
+        &mut self,
+        loaded: &mut GemmaLoadedModel,
+        multi_seq_kv: &mut Vec<
+            crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
+        >,
+        mut multi_seq_kv_hybrid: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
+        >,
+        mut multi_seq_kv_dense: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>,
+        >,
+        mut multi_seq_kv_mlx: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
+        >,
+    ) -> Result<Vec<f32>> {
+        let pos = self.prompt_len + self.generated_tokens.len() - 1;
+        let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+        loaded.weights.forward_decode_slot_aware_capture_hidden(
+            self.next_token,
+            pos,
+            &mut loaded.ctx,
+            &mut p,
+            self.slot_id,
+            multi_seq_kv,
+            multi_seq_kv_hybrid.as_deref_mut(),
+            multi_seq_kv_dense.as_deref_mut(),
+            multi_seq_kv_mlx.as_deref_mut(),
+        )?;
+        let hs = loaded.weights.hidden_size;
+        let hidden: Vec<f32> = loaded
+            .weights
+            .activations
+            .hidden
+            .as_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("decode_tick_capture read hidden: {e}"))?
+            .get(..hs)
+            .ok_or_else(|| anyhow::anyhow!("decode_tick_capture: hidden buffer < hidden_size"))?
+            .to_vec();
+        Ok(hidden)
     }
 
     /// Assemble the `GenerationResult` at end-of-decode — mirror of serial
@@ -6196,11 +6268,38 @@ fn decode_batch_gemma4(
     registration: Option<&super::registry::ModelRegistration>,
     handles: &[SlotHandle],
 ) {
+    // First-max argmax (matches dispatch_argmax_f32's `>` tie-break). Only the
+    // VALUE (== logits max) feeds the rerank threshold; the index is a cosmetic
+    // seed that finalize_token_from_logits never lets affect the result (the max
+    // is always within delta of itself ⇒ always a rerank candidate).
+    fn argmax_f32(xs: &[f32]) -> (u32, f32) {
+        let mut bi = 0usize;
+        let mut bv = f32::NEG_INFINITY;
+        for (i, &v) in xs.iter().enumerate() {
+            if v > bv {
+                bv = v;
+                bi = i;
+            }
+        }
+        (bi as u32, bv)
+    }
+
+    // ADR-040 S1c-2 — TWO-PASS batched-head tick. Pass 1 runs each live slot's
+    // BODY only and gathers its final hidden row; ONE `lm_head_batched` then
+    // amortizes the 605 MB lm_head weight read across all slots; Pass 2
+    // finalizes each slot from its logits row. Per-slot output is bit-identical
+    // to the prior per-slot full decode (H-S1-rowparity + shared
+    // finalize_token_from_logits + decode_tick_finalize).
+    let hs = guard.model.weights.hidden_size;
+    let vocab = guard.model.weights.vocab_size;
+
+    // Pass 1 — capture bodies. `captured` holds (handle, slot_idx, state, reply)
+    // for each slot whose body ran; `hidden_rows` is their final hidden states
+    // concatenated row-major `[n, hidden_size]`.
+    let mut captured = Vec::new();
+    let mut hidden_rows: Vec<f32> = Vec::new();
     for &handle in handles {
         let slot_idx = handle.slot_id.0 as usize;
-        // Take the slot out for the duration of the tick (re-inserted below
-        // if it keeps generating). Skips empty/evicted slots and
-        // generation-stale handles.
         let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
             continue;
         };
@@ -6210,17 +6309,72 @@ fn decode_batch_gemma4(
             slots[slot_idx] = Some((state, reply, installed));
             continue;
         }
-
-        let tick = match state.decode_tick(
+        match state.decode_tick_capture(
             guard.model,
             &mut guard.kv,
             guard.hybrid.as_mut(),
             guard.dense.as_mut(),
             guard.mlx.as_mut(),
         ) {
+            Ok(hidden) => {
+                hidden_rows.extend_from_slice(&hidden);
+                captured.push((handle, slot_idx, state, reply));
+            }
+            Err(e) => {
+                // Body forward error: evict this slot with a typed error.
+                reset_gemma4_slot(guard, handle.slot_id);
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(e), false);
+            }
+        }
+    }
+    if captured.is_empty() {
+        return;
+    }
+    let n = captured.len();
+
+    // Batched head: ONE final-norm + lm_head(m=N) + softcap for all slots.
+    let head = match guard
+        .model
+        .weights
+        .lm_head_batched(&hidden_rows, n, &mut guard.model.ctx)
+    {
+        Ok(h) => h,
+        Err(e) => {
+            // Head failure is fatal for this tick's slots (no tokens producible);
+            // evict each. anyhow::Error isn't Clone, so carry the message.
+            let msg = format!("{e}");
+            for (handle, _slot_idx, _state, reply) in captured {
+                reset_gemma4_slot(guard, handle.slot_id);
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(anyhow::anyhow!("lm_head_batched: {msg}")), false);
+            }
+            return;
+        }
+    };
+
+    // Pass 2 — finalize each slot from its logits row.
+    for (i, (handle, slot_idx, mut state, reply)) in captured.into_iter().enumerate() {
+        let logits_row = &head.logits[i * vocab..(i + 1) * vocab];
+        let normed_row = &head.normed[i * hs..(i + 1) * hs];
+        // Greedy token: the GPU-argmax index is irrelevant to the rerank and the
+        // top1 VALUE (== CPU max) is bit-identical, so a CPU argmax reproduces
+        // the scalar head's greedy token exactly.
+        let (top1_idx, top1_val) = argmax_f32(logits_row);
+        let greedy_token = match guard.model.weights.finalize_token_from_logits(
+            logits_row, normed_row, top1_idx, top1_val,
+        ) {
             Ok(t) => t,
             Err(e) => {
-                // Forward error mid-decode: evict with a typed error.
+                reset_gemma4_slot(guard, handle.slot_id);
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(e), false);
+                continue;
+            }
+        };
+        let tick = match state.decode_tick_finalize(guard.model, greedy_token, logits_row) {
+            Ok(t) => t,
+            Err(e) => {
                 reset_gemma4_slot(guard, handle.slot_id);
                 scheduler.release(handle);
                 slot_fire_done(reply, Err(e), false);
