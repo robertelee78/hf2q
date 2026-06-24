@@ -301,8 +301,28 @@ fn sanitize_repo_for_cache_dir(repo: &str) -> String {
     repo.replace('/', "__")
 }
 
-/// B1 — shell out to `huggingface-cli download <repo> --local-dir <cache>`
-/// and return the cache directory on success.
+/// Pick the HuggingFace download CLI binary to invoke.
+///
+/// The legacy `huggingface-cli` is now a deprecated shim that exits 1 and
+/// tells the operator to use `hf` instead, so we prefer `hf` whenever it is
+/// on PATH and only fall back to `huggingface-cli` for older environments
+/// that predate the rename. Returns a `&'static str` binary name.
+fn resolve_hf_cli() -> &'static str {
+    let hf_available = std::process::Command::new("hf")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if hf_available {
+        "hf"
+    } else {
+        "huggingface-cli"
+    }
+}
+
+/// B1 — shell out to `hf download <repo> --local-dir <cache>` (falling back
+/// to the legacy `huggingface-cli`) and return the cache directory on success.
 ///
 /// `<cache>` = `~/.cache/hf2q/repos/<sanitize_repo_for_cache_dir(repo)>/`.
 /// The directory is created if missing; existing partial downloads are
@@ -331,12 +351,18 @@ fn download_repo_via_hf_cli(repo: &str) -> Result<PathBuf, crate::convert::Conve
         stderr: format!("failed to create cache dir `{}`: {e}", cache_dir.display()),
     })?;
 
+    // Prefer the modern `hf` CLI; the legacy `huggingface-cli` is a
+    // deprecated stub that now exits non-zero. Both accept the same
+    // `download <repo> --local-dir <dir>` interface, so fall back to the
+    // old name only if `hf` is not on PATH.
+    let hf_cli = resolve_hf_cli();
+
     eprintln!(
-        "[hf2q convert --repo] downloading {repo} → {} via huggingface-cli",
+        "[hf2q convert --repo] downloading {repo} → {} via {hf_cli}",
         cache_dir.display()
     );
 
-    let output = std::process::Command::new("huggingface-cli")
+    let output = std::process::Command::new(hf_cli)
         .arg("download")
         .arg(repo)
         .arg("--local-dir")
@@ -350,8 +376,8 @@ fn download_repo_via_hf_cli(repo: &str) -> Result<PathBuf, crate::convert::Conve
                 repo: repo.to_string(),
                 exit_code: None,
                 stderr: format!(
-                    "failed to spawn `huggingface-cli`: {e} \
-                     (is huggingface-cli on PATH? `pip install -U huggingface_hub[cli]`)"
+                    "failed to spawn `{hf_cli}`: {e} \
+                     (is the HuggingFace CLI on PATH? `pip install -U huggingface_hub[cli]`)"
                 ),
             });
         }
