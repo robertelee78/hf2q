@@ -20,6 +20,7 @@
 use anyhow::Result;
 use mlx_native::DType;
 
+use crate::debug::INVESTIGATION_ENV;
 use crate::quantize::imatrix::ImatrixHint;
 use crate::serve::forward_mlx_shared::dispatch_qmatmul;
 use crate::serve::gpu::GpuContext;
@@ -27,6 +28,82 @@ use crate::serve::gpu::GpuContext;
 use super::model::MlxModelWeights;
 
 impl MlxModelWeights {
+    /// ADR-040 S1b — shared per-row finalize: Q8/Q6_K coarse-logit → exact-F32
+    /// argmax rerank. Pure CPU. Extracted verbatim from the scalar
+    /// `forward_decode` tail (forward_gpu.rs:1008–1077) so the scalar and
+    /// batched-lm_head paths produce BIT-IDENTICAL tokens by construction.
+    ///
+    /// Inputs are per-row slices so either path can supply its own buffers:
+    /// - `logits_row`: post-softcap logits `[vocab_size]`.
+    /// - `normed_row`: post-final-norm hidden `[hidden_size]` (the `hidden·embed`
+    ///   rerank operand — scalar passes `norm_out`, batched passes its `normed_b`
+    ///   row).
+    /// - `gpu_top1` / `top1_val`: the GPU-argmax index+value over `logits_row`
+    ///   (both paths run the SAME `dispatch_argmax_f32` kernel, so these match).
+    ///
+    /// When rerank is inactive (F16 head, or `HF2Q_LMHEAD_RERANK=0`) returns
+    /// `gpu_top1` unchanged — identical to the scalar `else` arm.
+    pub(crate) fn finalize_token_from_logits(
+        &self,
+        logits_row: &[f32],
+        normed_row: &[f32],
+        gpu_top1: u32,
+        top1_val: f32,
+    ) -> Result<u32> {
+        let vocab_size = self.vocab_size;
+        let hs = self.hidden_size;
+        let rerank_active = (self.lm_head_q8.is_some() || self.lm_head_q6k.is_some())
+            && !INVESTIGATION_ENV.lmhead_rerank_disabled;
+        if !rerank_active {
+            return Ok(gpu_top1);
+        }
+        // Headroom for Q8 noise (≈5e-3); delta=0.5 keeps the candidate set small
+        // while guaranteeing the true winner is included. Verbatim from scalar.
+        let delta: f32 = 0.5;
+        let threshold = top1_val - delta;
+
+        let embed_f32: &[f32] = self
+            .embed_weight
+            .as_slice()
+            .map_err(|e| anyhow::anyhow!("finalize rerank embed read: {e}"))?;
+
+        let mut candidates: Vec<u32> = Vec::with_capacity(64);
+        for (i, &v) in logits_row[..vocab_size].iter().enumerate() {
+            if v >= threshold {
+                candidates.push(i as u32);
+            }
+        }
+        for sp in [0u32, 1, 2, 105, 106] {
+            if (sp as usize) < vocab_size {
+                candidates.push(sp);
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        // Exact F32 rerank via hidden · embed_row. Softcap is monotonic so
+        // skipping it doesn't change argmax order. F64 accumulator for precision.
+        let mut best_tok: u32 = gpu_top1;
+        let mut best_logit: f32 = f32::NEG_INFINITY;
+        for &tok in &candidates {
+            let row_off = (tok as usize) * hs;
+            if row_off + hs > embed_f32.len() {
+                continue;
+            }
+            let row = &embed_f32[row_off..row_off + hs];
+            let mut acc: f64 = 0.0;
+            for i in 0..hs {
+                acc += (normed_row[i] as f64) * (row[i] as f64);
+            }
+            let l = acc as f32;
+            if l > best_logit {
+                best_logit = l;
+                best_tok = tok;
+            }
+        }
+        Ok(best_tok)
+    }
+
     /// Batched final-norm + lm_head (`m=N`) + softcap over `n` gathered hidden
     /// rows. `hidden_rows` is the row-major `[n, hidden_size]` F32 final hidden
     /// state (one row per slot, captured before final-norm — i.e. the value at
