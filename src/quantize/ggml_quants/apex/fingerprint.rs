@@ -208,58 +208,67 @@ fn manifest() -> &'static [ApexConfigRef] {
 /// from the task: "if a mudler_config path in the manifest doesn't
 /// exist on disk, ApexPolicy must hard-error".
 ///
-/// Adding a new family at vendor time: append the path here AND in
-/// `data/apex-references/manifest.json`. The compile will fail if a
-/// referenced path doesn't exist, which is the strongest possible
-/// form of the hard-error.
+/// NOTE: the first tuple element is a stable *provenance identifier*
+/// (it records that the config originated from `mudler/apex-quant`
+/// @ the SHA pinned in `data/apex-references/MUDLER_SHA.txt`), NOT a
+/// live filesystem path — `load_mudler_config` matches it as an opaque
+/// key against the manifest. The actual bytes are vendored under
+/// `data/apex-references/configs/` and baked in via `include_str!`
+/// below; the full upstream submodule is no longer checked out.
+///
+/// Adding a new family at vendor time: copy its `.txt` into
+/// `data/apex-references/configs/`, append the (id, include_str!) pair
+/// here AND a matching entry in `data/apex-references/manifest.json`.
+/// The compile will fail if a referenced file doesn't exist, which is
+/// the strongest possible form of the hard-error.
 pub const VENDOR_CONFIGS: &[(&str, &str)] = &[
     (
         "vendor/apex-quant/configs/gemma4_26b_quality.txt",
-        include_str!("../../../../vendor/apex-quant/configs/gemma4_26b_quality.txt"),
+        include_str!("../../../../data/apex-references/configs/gemma4_26b_quality.txt"),
     ),
     (
         "vendor/apex-quant/configs/gemma4_26b_balanced.txt",
-        include_str!("../../../../vendor/apex-quant/configs/gemma4_26b_balanced.txt"),
+        include_str!("../../../../data/apex-references/configs/gemma4_26b_balanced.txt"),
     ),
     (
         "vendor/apex-quant/configs/gemma4_26b_compact.txt",
-        include_str!("../../../../vendor/apex-quant/configs/gemma4_26b_compact.txt"),
+        include_str!("../../../../data/apex-references/configs/gemma4_26b_compact.txt"),
     ),
     (
         "vendor/apex-quant/configs/gemma4_26b_mini.txt",
-        include_str!("../../../../vendor/apex-quant/configs/gemma4_26b_mini.txt"),
+        include_str!("../../../../data/apex-references/configs/gemma4_26b_mini.txt"),
     ),
     (
         "vendor/apex-quant/configs/qwen35a3b_quality.txt",
-        include_str!("../../../../vendor/apex-quant/configs/qwen35a3b_quality.txt"),
+        include_str!("../../../../data/apex-references/configs/qwen35a3b_quality.txt"),
     ),
     (
         "vendor/apex-quant/configs/qwen35a3b_balanced.txt",
-        include_str!("../../../../vendor/apex-quant/configs/qwen35a3b_balanced.txt"),
+        include_str!("../../../../data/apex-references/configs/qwen35a3b_balanced.txt"),
     ),
     (
         "vendor/apex-quant/configs/qwen35a3b_compact.txt",
-        include_str!("../../../../vendor/apex-quant/configs/qwen35a3b_compact.txt"),
+        include_str!("../../../../data/apex-references/configs/qwen35a3b_compact.txt"),
     ),
     (
         "vendor/apex-quant/configs/qwen35a3b_mini.txt",
-        include_str!("../../../../vendor/apex-quant/configs/qwen35a3b_mini.txt"),
+        include_str!("../../../../data/apex-references/configs/qwen35a3b_mini.txt"),
     ),
     (
         "vendor/apex-quant/configs/carnice_qwen36_mtp_quality.txt",
-        include_str!("../../../../vendor/apex-quant/configs/carnice_qwen36_mtp_quality.txt"),
+        include_str!("../../../../data/apex-references/configs/carnice_qwen36_mtp_quality.txt"),
     ),
     (
         "vendor/apex-quant/configs/carnice_qwen36_mtp_balanced.txt",
-        include_str!("../../../../vendor/apex-quant/configs/carnice_qwen36_mtp_balanced.txt"),
+        include_str!("../../../../data/apex-references/configs/carnice_qwen36_mtp_balanced.txt"),
     ),
     (
         "vendor/apex-quant/configs/carnice_qwen36_mtp_compact.txt",
-        include_str!("../../../../vendor/apex-quant/configs/carnice_qwen36_mtp_compact.txt"),
+        include_str!("../../../../data/apex-references/configs/carnice_qwen36_mtp_compact.txt"),
     ),
     (
         "vendor/apex-quant/configs/carnice_qwen36_mtp_mini.txt",
-        include_str!("../../../../vendor/apex-quant/configs/carnice_qwen36_mtp_mini.txt"),
+        include_str!("../../../../data/apex-references/configs/carnice_qwen36_mtp_mini.txt"),
     ),
 ];
 
