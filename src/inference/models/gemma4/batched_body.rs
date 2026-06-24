@@ -100,6 +100,11 @@ pub struct BatchedDecodeBuffers {
     /// alias `norm_out` here (an untracked weighted_sum write into a buffer the
     /// conflict tracker last saw read by B9 produced stale post-FF-norm2 input).
     pub moe_accum: MlxBuffer,
+    /// `[N, tmp]` per-query flash reduce scratch for the M4 BATCHED flash
+    /// (`HF2Q_BATCHED_FLASH=1`) — sized `N ×` the scalar `sdpa_tmp` so all N
+    /// queries' NWG partials + S/M land in disjoint regions. Unused by the
+    /// default per-slot flash.
+    pub sdpa_tmp: MlxBuffer,
 }
 
 /// Element count of an F32/U32 buffer (4 bytes/element).
@@ -149,6 +154,7 @@ impl BatchedDecodeBuffers {
             moe_swiglu_id_out: f32n(&acts.moe_swiglu_id_out, "moe_swiglu_id_out")?,
             moe_down_id_out: f32n(&acts.moe_down_id_out, "moe_down_id_out")?,
             moe_accum: f32n(&acts.moe_accum, "moe_accum")?,
+            sdpa_tmp: f32n(&acts.sdpa_tmp, "sdpa_tmp")?,
         })
     }
 
@@ -245,6 +251,7 @@ impl MlxModelWeights {
         bufs: &BatchedDecodeBuffers,
         n: usize,
         positions_buf: &MlxBuffer,
+        slot_id_buf: &MlxBuffer,
         slot_ids: &[SlotId],
         seq_positions: &[usize],
         multi_seq_kv_hybrid: &mut [MultiSeqHybridKvBuffers],
@@ -416,6 +423,96 @@ impl MlxModelWeights {
         let q_norm_stride = nh * hd; // actual per-layer dim (see q/k/v_stride note)
         let k_norm_stride = nkv * hd;
         let sdpa_stride = nh * hd;
+        // ADR-040 M4 — OPT-IN batched multi-seq flash (HF2Q_BATCHED_FLASH=1):
+        // replace the N per-slot flash dispatches with ONE batched flash over all
+        // N queries (GPU occupancy). KV-encode + FWHT-undo stay per-slot. Gated
+        // to slots sharing the same (nwg, nsg) bucket so the per-query math is
+        // bit-identical to the per-slot flash (proven by slot_aware_n1/n4).
+        let gbuf = &multi_seq_kv_hybrid[layer_idx];
+        let gcap = gbuf.capacity;
+        let gring = gbuf.is_sliding;
+        let ksl_of = |i: usize| -> u32 {
+            let sp = seq_positions[i];
+            if gring { ((sp + 1).min(gcap)) as u32 } else { (sp + 1) as u32 }
+        };
+        let nwg_bucket = |k: u32| if k > 512 { 32u32 } else { 16u32 };
+        let max_ksl = (0..n).map(ksl_of).max().unwrap_or(1);
+        let nsg_max = mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(max_ksl);
+        let same_bucket = (0..n).all(|i| {
+            let k = ksl_of(i);
+            nwg_bucket(k) == nwg_bucket(max_ksl)
+                && mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(k) == nsg_max
+        });
+        let use_batched_flash =
+            std::env::var("HF2Q_BATCHED_FLASH").as_deref() == Ok("1") && same_bucket;
+        if use_batched_flash {
+            let buf = gbuf;
+            let cap = gcap;
+            let is_ring = gring;
+            // PHASE 1 — per-slot KV-encode (F16-K + FWHT-V), unchanged math.
+            for i in 0..n {
+                let slot = slot_ids[i].0 as u64;
+                let seq_pos_i = seq_positions[i];
+                let cache_pos: u32 = if is_ring { (seq_pos_i % cap) as u32 } else { seq_pos_i as u32 };
+                let k_elems = nkv * cap * hd;
+                let v_dtype_size = buf.v_packed.dtype().size_of() as u64;
+                let k_view = buf.k.slice_view(slot * (k_elems as u64) * 2, k_elems)
+                    .with_shape(vec![nkv, cap, hd]).map_err(|e| anyhow::anyhow!("bf K L{layer_idx} s{i}: {e}"))?;
+                let v_view = buf.v_packed.slice_view(slot * (k_elems as u64) * v_dtype_size, k_elems)
+                    .with_shape(vec![nkv, cap, hd]).map_err(|e| anyhow::anyhow!("bf V L{layer_idx} s{i}: {e}"))?;
+                let norms_per_pos = buf.norms_per_pos;
+                let v_norms_view = if buf.v_norms.byte_len() == 4 {
+                    buf.v_norms.slice_view(0, 1).with_shape(vec![1]).map_err(|e| anyhow::anyhow!("bf Vn dummy: {e}"))?
+                } else {
+                    let ne = nkv * cap * norms_per_pos;
+                    let shp = if norms_per_pos == 1 { vec![nkv, cap] } else { vec![nkv, cap, norms_per_pos] };
+                    buf.v_norms.slice_view(slot * (ne as u64) * 4, ne).with_shape(shp).map_err(|e| anyhow::anyhow!("bf Vn: {e}"))?
+                };
+                let kn_i = bufs.attn_k_normed.slice_view(row_off(k_norm_stride, i), k_norm_stride);
+                let v_src_buf: &MlxBuffer = if v_is_k { &bufs.attn_v } else { &bufs.attn_v_normed };
+                let v_i = if v_is_k {
+                    bufs.attn_v.slice_view(row_off(v_stride, i), v_stride)
+                } else {
+                    bufs.attn_v_normed.slice_view(row_off(v_normed_stride, i), v_normed_stride)
+                };
+                session.barrier_between(&[&kn_i, v_src_buf], &[&buf.k, &buf.v_packed, &buf.v_norms]);
+                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_batch_f32_to_f16(
+                    session.encoder_mut(), reg, metal_dev, &kn_i, &k_view, nkv as u32, hd as u32, cap as u32, cache_pos,
+                ).map_err(|e| anyhow::anyhow!("bf F16-K L{layer_idx} s{i}: {e}"))?;
+                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                    session.encoder_mut(), reg, metal_dev, &v_i, &v_view, &v_norms_view,
+                    nkv as u32, hd as u32, cap as u32, cache_pos, is_ring, tq_scale_factor_d512, tq_codebook_bits,
+                ).map_err(|e| anyhow::anyhow!("bf FWHT-V L{layer_idx} s{i}: {e}"))?;
+            }
+            // PHASE 2 — ONE batched flash over all N queries (per-query KV via
+            // slot_id_buf + positions_buf, derived in-kernel).
+            let p_hyb = mlx_native::ops::flash_attn_vec_hybrid::FlashAttnVecTqHbParams {
+                num_heads: nh as u32, num_kv_heads: nkv as u32, head_dim: hd as u32,
+                kv_seq_len: max_ksl, kv_capacity: cap as u32, scale: 1.0,
+                mask_type: if is_sliding { 2 } else { 1 },
+                sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                softcap: 0.0, ring_start: 0,
+                scale_factor_d512: tq_scale_factor_d512, codebook_bits: tq_codebook_bits,
+                fuse_fwht_pre: 0, nsg: nsg_max,
+            };
+            session.barrier_between(
+                &[&bufs.attn_q_normed, &buf.k, &buf.v_packed, &buf.v_norms, &bufs.sdpa_tmp],
+                &[&bufs.sdpa_out, &bufs.sdpa_tmp],
+            );
+            mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid_batched(
+                session.encoder_mut(), reg, dev, n as u32,
+                &bufs.attn_q_normed, &buf.k, &buf.v_packed, &buf.v_norms,
+                &bufs.sdpa_out, &bufs.sdpa_tmp, slot_id_buf, positions_buf, &p_hyb,
+            ).map_err(|e| anyhow::anyhow!("batched flash L{layer_idx}: {e}"))?;
+            // PHASE 3 — per-slot FWHT-undo.
+            for i in 0..n {
+                let sdpa_i = bufs.sdpa_out.slice_view(row_off(sdpa_stride, i), sdpa_stride);
+                session.barrier_between(&[&bufs.sdpa_out], &[&bufs.sdpa_out]);
+                mlx_native::ops::fwht_standalone::dispatch_fwht_sign_undo_f32(
+                    session.encoder_mut(), reg, metal_dev, &sdpa_i, nh as u32, hd as u32,
+                ).map_err(|e| anyhow::anyhow!("bf undo L{layer_idx} s{i}: {e}"))?;
+            }
+        } else {
         for i in 0..n {
             let slot = slot_ids[i].0 as u64;
             let seq_pos_i = seq_positions[i];
@@ -549,6 +646,7 @@ impl MlxModelWeights {
                 &sdpa_i, nh as u32, hd as u32,
             )
             .map_err(|e| anyhow::anyhow!("batched FWHT-undo L{layer_idx} s{i}: {e}"))?;
+        }
         }
 
         let num_experts = self.num_experts;
@@ -900,6 +998,19 @@ impl MlxModelWeights {
                 p[i] = sp as u32;
             }
         }
+        // Physical slot-id buffer [N] u32 — constant across layers; feeds the M4
+        // batched flash kernel (it derives each query's KV base offset).
+        let mut slot_id_buf = dev
+            .alloc_buffer(n * 4, DType::U32, vec![n])
+            .map_err(|e| anyhow::anyhow!("body_batched slot_id alloc: {e}"))?;
+        {
+            let s: &mut [u32] = slot_id_buf
+                .as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("body_batched slot_id write: {e}"))?;
+            for (i, sid) in slot_ids.iter().enumerate() {
+                s[i] = sid.0;
+            }
+        }
 
         let mut s = exec
             .begin()
@@ -927,7 +1038,7 @@ impl MlxModelWeights {
         let num_layers = self.layers.len();
         for layer_idx in 0..num_layers {
             self.encode_one_layer_batched(
-                layer_idx, &bufs, n, &positions_buf,
+                layer_idx, &bufs, n, &positions_buf, &slot_id_buf,
                 slot_ids, seq_positions, multi_seq_kv_hybrid,
                 tq_scale_factor_d512, tq_codebook_bits,
                 &mut s, exec, reg,
