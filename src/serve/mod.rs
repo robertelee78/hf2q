@@ -1311,18 +1311,18 @@ pub fn cmd_generate(args: cli::GenerateArgs) -> Result<()> {
     // ADR-009 Phase 3A: HF2Q_BATCHED_PREFILL=1 uses the new batched prefill
     // path (matches llama.cpp default).
     //
-    // Iter-85 status (2026-05-09): the original "per-token remains default
-    // until parity is validated" comment is now narrower in scope. Batched
-    // prefill at short-to-medium prompt scale (≤80 tokens) IS byte-
+    // ADR-028 iter-344 status: batched prefill is now the DEFAULT-ON path
+    // and is DECOUPLED from the `HF2Q_UNSAFE_EXPERIMENTS` ack (iter-343
+    // falsifier-passes: 5/5 short + 1000-tok + 4K long-context coherent).
+    // Batched prefill at short-to-medium prompt scale (≤80 tokens) is byte-
     // identical to per-token per iter-65/74 (strict byte-equality of
     // decoded outputs), iter-79 (4.3× TTFT speedup with first decode
     // token id=8409 byte-identical), and protected by the iter-76 lock
     // chain (`scripts/adr010_iter64_iter68_full_lock.sh`). The remaining
-    // gate-required deferral is for LONG-SEQUENCE sliding_wrap fixtures
-    // where ADR-010's L6 MoE router top-K threshold sensitivity manifests
-    // (operator-signed deferral 2026-04-16). Default-flip for short
-    // prompts is operator-gated; the unsafe-ack remains required across
-    // all prompt sizes to preserve a single uniform decision boundary.
+    // item is the LONG-SEQUENCE sliding_wrap byte-parity *coherence*
+    // deferral (ADR-010 L6 MoE router top-K sensitivity, operator-signed
+    // 2026-04-16) — not a runtime error. Opt out to per-token for parity
+    // diagnostics via `HF2Q_BATCHED_PREFILL=0`.
     let use_batched = INVESTIGATION_ENV.batched_prefill;
 
     // ADR-005 1bNEW.0 — `--benchmark` runs `BENCH_NUM_RUNS` in-process

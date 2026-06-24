@@ -53,6 +53,13 @@ pub struct InvestigationEnv {
     // was set AND `HF2Q_UNSAFE_EXPERIMENTS=1` was also set. If the user
     // set an ack-required toggle without the ack, the field is `false`
     // and `activate()` prints a REFUSED line.
+    //
+    // EXCEPTION — `batched_prefill`: promoted to default-ON and DECOUPLED
+    // from the ack at ADR-028 iter-344 (it is an *opt-out* knob, not
+    // ack-required). It is physically grouped here for struct-layout
+    // stability only; its effective value == its raw value and it has no
+    // REFUSED branch. See its field doc below and shipping-contract.md
+    // Category 1/2.
     // ========================================================================
     /// `HF2Q_F16_KV=1` — allocate dense KV cache as F16. Halves KV
     /// read bandwidth at attention.
@@ -106,9 +113,10 @@ pub struct InvestigationEnv {
     /// 3130 tok/s pp512); batched gives ~34× speedup at pp4096 (2366
     /// tok/s = 0.80× peer) with coherence intact at every tested length
     /// up to pp3813 (4× sliding_window) per iter-343.  Operator iter-76
-    /// signed off on the L6 MoE sliding_wrap deferral (still ack-able
-    /// via opt-out).  Opt out via `HF2Q_BATCHED_PREFILL=0` / `=false` /
-    /// `=off`.  Decoupled from `HF2Q_UNSAFE_EXPERIMENTS` ack (iter-344).
+    /// signed off on the L6 MoE sliding_wrap deferral (a *coherence*
+    /// deferral per ADR-010, not a runtime error).  Default-ON and
+    /// decoupled from the `HF2Q_UNSAFE_EXPERIMENTS` ack (iter-344); opt
+    /// out via `HF2Q_BATCHED_PREFILL=0` / `=false` / `=off`.
     pub batched_prefill: bool,
 
     /// `HF2Q_SKIP_TQ_ENCODE=1` — skip TQ encode for timing bisection.
@@ -1070,12 +1078,10 @@ impl InvestigationEnv {
                  Path E+G recommended instead",
             ));
         }
-        if self.batched_prefill {
-            active_unsafe.push((
-                "HF2Q_BATCHED_PREFILL=1",
-                "experimental; errors when seq_len > sliding_window",
-            ));
-        }
+        // ADR-028 iter-344: BATCHED_PREFILL is the default-ON, ack-decoupled
+        // prefill path — NOT an unsafe knob. iter-487 moved its only
+        // noteworthy state (the slower per-token opt-out) to `active_safe`
+        // below; the default-on path needs no banner line.
         if self.skip_tq_encode {
             active_unsafe.push((
                 "HF2Q_SKIP_TQ_ENCODE=1",
@@ -1110,12 +1116,9 @@ impl InvestigationEnv {
                 "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
             ));
         }
-        if self.raw.batched_prefill && !self.batched_prefill {
-            refused.push((
-                "HF2Q_BATCHED_PREFILL=1",
-                "ack required: also set HF2Q_UNSAFE_EXPERIMENTS=1",
-            ));
-        }
+        // iter-487: no batched_prefill `refused` branch — it is ack-decoupled
+        // (ADR-028 iter-344), so `raw.batched_prefill && !self.batched_prefill`
+        // was unreachable (effective == raw). Removed as dead code.
         if self.raw.skip_tq_encode && !self.skip_tq_encode {
             refused.push((
                 "HF2Q_SKIP_TQ_ENCODE=1",
@@ -1153,6 +1156,18 @@ impl InvestigationEnv {
             active_safe.push((
                 "HF2Q_LMHEAD_COMPARE=1",
                 "inert today (not wired into live decode)",
+            ));
+        }
+        // iter-487: per-token opt-out is the noteworthy state, not the
+        // default-on batched path. Fires only when the operator reverted
+        // via =0/false/off (effective false ⇒ explicitly disabled, since
+        // the var is `env_default_true`).
+        if !self.batched_prefill {
+            active_safe.push((
+                "HF2Q_BATCHED_PREFILL=0",
+                "per-token prefill (opt-out); 14-45× slower than peer, \
+                 parity-diagnostics only — batched is the default since \
+                 ADR-028 iter-344",
             ));
         }
 

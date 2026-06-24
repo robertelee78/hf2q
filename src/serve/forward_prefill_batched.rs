@@ -18,7 +18,9 @@
 //!   n_tokens = seq_len*top_k, then moe_weighted_sum_seq
 //! - End-of-layer: batched fused_norm_add_scalar with rows = seq_len
 //!
-//! Gated by `HF2Q_BATCHED_PREFILL=1`.
+//! Default prefill path since ADR-028 iter-344 (default-ON, decoupled from
+//! the `HF2Q_UNSAFE_EXPERIMENTS` ack). Opt out to per-token via
+//! `HF2Q_BATCHED_PREFILL=0` for parity diagnostics.
 
 use anyhow::Result;
 use mlx_native::{DType, MlxBuffer};

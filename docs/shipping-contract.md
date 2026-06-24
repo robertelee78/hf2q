@@ -15,7 +15,10 @@ relocated without notice** — it is not part of the supported surface.
 What the default release binary does with **no environment variables
 set**, on the proven model class (Gemma-4 26B DWQ GGUF):
 
-- Per-token `forward_prefill` (not batched).
+- Batched `forward_prefill_batched` (default-on since ADR-028
+  iter-344; per-token `forward_prefill` was 14-45× slower than peer).
+  Opt out to per-token via `HF2Q_BATCHED_PREFILL=0` for parity
+  diagnostics — see Category 2.
 - Dense **F32** KV cache.
 - Default decode (single-buffer or dual-buffer internal tuning; not
   user-configurable).
@@ -45,6 +48,7 @@ not remove or silently change them without an ADR.
 | Var | Values | Purpose |
 |---|---|---|
 | `HF2Q_LMHEAD_Q8` | `1`, `0`, unset | Force Q8 on, force F16, or auto-select. Escape hatch for models the auto heuristic classifies incorrectly. |
+| `HF2Q_BATCHED_PREFILL` | `0`/`false`/`off`, unset | Opt out of the default batched prefill path (Category 1) back to per-token `forward_prefill`. For parity diagnostics only — per-token is 14-45× slower than peer. Default-on since ADR-028 iter-344; decoupled from the `HF2Q_UNSAFE_EXPERIMENTS` ack at that iter. The remaining `sliding_wrap` long-sequence byte-parity gap is the operator-signed deferral (2026-04-16; see ADR-010), a coherence deferral — not a runtime error. |
 | `HF2Q_STREAMING_PHASE3` | `1`, unset | ADR-014 P7 iter-3 production wire-up. Routes all 4 Phase 3 quantize dispatch arms (K-quant codec direct / ImatrixAdaptive / StaticQuantizer / DwqK) and Phase 4.5 quality measurement through the streaming `LazyTensorMap` pipeline (`quantize_via_streaming_borrowed` + `measure_quality_streaming_lazy`). Output is byte-identical to the eager path — every wired arm has a per-arm byte-identity gate. Currently a TEST INTEGRATION channel, not a memory win (wedge clones bytes ~2× peak briefly); actual memory savings land when iter-3 wholesale surgery removes the upstream `materialize_all()` bridge. Default OFF; default behavior unchanged. |
 
 ---
@@ -72,7 +76,6 @@ operator-facing; loaded through `src/debug/investigation_env.rs`
 | Var | Notes |
 |---|---|
 | `HF2Q_F16_KV` | Known-worse KV cache representation; separate bug vs F32 path. |
-| `HF2Q_BATCHED_PREFILL` | Experimental; errors when `seq_len > sliding_window`. |
 | `HF2Q_SKIP_TQ_ENCODE` | Bisection scaffolding; produces garbage output. |
 | `HF2Q_SKIP_TQ_SDPA` | Bisection scaffolding; produces garbage output. |
 
@@ -334,9 +337,12 @@ These are deliberately not part of any category:
 
 - `docs/operator-env-vars.md` — per-variable effects and defaults.
 - `docs/ADR-009-reference-parity-and-coherence-recovery.md` — why
-  F32-KV and per-token prefill are the defaults.
+  F32-KV is the default, and the original per-token prefill baseline
+  (since superseded as the default by ADR-028 iter-344).
 - `docs/ADR-010-exact-batched-kernel-parity.md` — why batched-prefill
-  parity is deferred.
+  is now the default and why its `sliding_wrap` byte-parity is deferred.
+- `docs/ADR-028-peer-parity-coherence-and-speed.md` — iter-344
+  default-flip of batched prefill and ack-decoupling.
 - `docs/ADR-012-qwen35moe-conversion.md` — qwen35/qwen35moe convert spec.
 - `docs/ADR-014-streaming-convert-pipeline.md` — streaming pipeline +
   Decision-15 peer-parity gate matrix (the source of truth for the

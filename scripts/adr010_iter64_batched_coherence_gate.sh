@@ -93,7 +93,9 @@ fi
 echo "  ✓ per-token reference OK"
 echo
 
-echo "[2/5] Batched prefill (gated HF2Q_BATCHED_PREFILL=1 + UNSAFE)"
+# Batched prefill is default-ON and ack-decoupled since ADR-028 iter-344;
+# the env flags below are explicit-but-redundant (pinned for gate determinism).
+echo "[2/5] Batched prefill (HF2Q_BATCHED_PREFILL=1, pinned explicitly)"
 BATCHED_OUT=$(HF2Q_BATCHED_PREFILL=1 HF2Q_UNSAFE_EXPERIMENTS=1 \
     timeout 120 "$HF2Q" generate --model "$MODEL" --prompt-file "$PROMPT_FILE" --max-tokens 8 2>&1)
 BATCHED_DECODED=$(echo "$BATCHED_OUT" | extract_decoded)

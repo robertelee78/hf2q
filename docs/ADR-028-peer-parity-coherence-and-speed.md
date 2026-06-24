@@ -25637,3 +25637,58 @@ methodology:
 - `/opt/hf2q/docs/ADR-028-peer-parity-coherence-and-speed.md`: this section.
 
 No code changes.
+
+---
+
+## iter-487 — §iter-344 SURFACE RECONCILIATION (documentation-drift closure, NOT a behavior change)
+
+`HF2Q_BATCHED_PREFILL` has been the **default-ON, ack-decoupled** prefill path
+since §iter-344. The *code* obeyed that decision, but several **describing
+surfaces** still presented it as an experimental, ack-required, "errors when
+`seq_len > sliding_window`" investigation knob — so a **default** run printed a
+false `UNSAFE (ack-required, activated)` banner line. This iter reconciles those
+surfaces to the already-landed iter-344 behavior. **No forward-pass, no gate,
+no decode-output change** — the touched code is stderr-banner classification,
+one dead branch, and doc comments.
+
+### Surfaces corrected (live)
+
+| # | Surface | Was | Now |
+|---|---|---|---|
+| D1 | `src/debug/investigation_env.rs` banner (`active_unsafe` push) | `HF2Q_BATCHED_PREFILL=1` in the UNSAFE bucket with "errors when seq_len > sliding_window" — fired on **every default run** | Removed from `active_unsafe`; a warn-only **opt-out** note (`HF2Q_BATCHED_PREFILL=0`) now fires only when the operator reverts to the slower per-token path |
+| D2 | `src/debug/investigation_env.rs` `refused` branch | `raw.batched_prefill && !self.batched_prefill` — unreachable since effective == raw post-iter-344 (`x && !x`) | Deleted (dead code) |
+| D3 | `src/serve/mod.rs` prefill comment | "the unsafe-ack remains required across all prompt sizes" | Reworded to iter-344 reality (default-on, ack-decoupled; sliding_wrap byte-parity deferred per ADR-010) |
+| D4 | `docs/shipping-contract.md` | Category 4 ack-required; Category 1 claimed per-token default | Category 1 = batched default; Category 2 = opt-out knob; removed from Category 4 |
+| D5 | `src/debug/investigation_env.rs:108-111` doc | "(still ack-able via opt-out)" — an opt-out is not an ack | Reworded |
+| D6 | `src/serve/forward_prefill_batched.rs:21` module doc | "Gated by `HF2Q_BATCHED_PREFILL=1`." | "Default prefill path since ADR-028 iter-344; opt out via `=0`." |
+| D7 | `scripts/adr010_iter64_batched_coherence_gate.sh:96` comment | "(gated HF2Q_BATCHED_PREFILL=1 + UNSAFE)" | Dropped the "+ UNSAFE" wording (explicit env-setting left intact — redundant but harmless) |
+
+Cross-link: `docs/ADR-010-…md:~212` carries a superseded-by-iter-344 pointer
+for the sliding_wrap byte-parity deferral framing.
+
+### Ground truth (re-verified, codex-reviewed plan)
+
+There is **no `seq_len > sliding_window` hard-error path** in
+`forward_prefill_batched.rs` (sliding layers use a ring buffer of capacity
+`sw`; the `bail!`s at 250/1546/1975/2344/2663/3322/3718/3753 are empty-prompt
+and unsupported-dispatch guards). The "errors when seq_len > sliding_window"
+banner text was therefore false; the real residual is a *coherence* deferral on
+`sliding_wrap` fixtures (ADR-010), operator-signed 2026-04-16.
+
+### Explicitly NOT touched
+
+Dated forensic notes and append-only iter history that were correct
+as-of-their-date are left intact to preserve provenance (e.g.
+`docs/tq-c0b-localize-2026-04-21.md`, `docs/EXP-3-…-2026-05-16.md`,
+ADR-007 historical verdicts, this ADR's earlier iter entries, archived bench
+logs). They describe the pre-iter-344 world correctly for their date.
+
+### Files modified
+
+- `src/debug/investigation_env.rs` (D1, D2, D5)
+- `src/serve/mod.rs` (D3)
+- `src/serve/forward_prefill_batched.rs` (D6)
+- `scripts/adr010_iter64_batched_coherence_gate.sh` (D7)
+- `docs/shipping-contract.md` (D4)
+- `docs/ADR-010-exact-batched-kernel-parity.md` (superseded pointer)
+- `docs/ADR-028-peer-parity-coherence-and-speed.md`: this section
