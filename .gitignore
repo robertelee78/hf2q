@@ -73,4 +73,6 @@ tests/fixtures/vision/last_e2e_report.json
 
 # ADR-033 P6: temporary byte-cmp output (large quantized GGUFs)
 /tmp/
-models
+# NOTE: top-level GGUF dir is covered by `/models/` (line 4, anchored). A bare
+# `models` here previously over-matched `src/inference/models/` (the module
+# tree), silently ignoring new source files — removed (ADR-040 S1a).
