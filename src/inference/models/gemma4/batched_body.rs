@@ -901,8 +901,17 @@ impl MlxModelWeights {
             expert_stride: self.layers[layer_idx].moe.gate_up_expert_stride,
             ggml_type: self.layers[layer_idx].moe.gate_up_ggml_dtype,
         };
+        // ADR-040 Phase F `iter-F-moe-mvid`: force the per-token `mv_id` route
+        // (byte-identical to the serial slot-aware ref). At the batched decode
+        // width the down projection's `n_tokens = N*top_k` crosses the `mm_id`
+        // grouped-kernel threshold (>32, i.e. N≥5) whose reduction order is NOT
+        // bit-identical to serial — `slot_aware_n8_per_slot_parity_vs_serial`
+        // diverged on the routed entry point and is byte-identical on this one.
+        // `mm_id` is a prefill optimization + a measured regression at N≤8, so
+        // there is no decode-width cost. gate_up is mv at N≤4 anyway; pinning it
+        // keeps the whole MoE byte-identical for any future N.
         session
-            .quantized_matmul_id_ggml(
+            .quantized_matmul_id_ggml_mv(
                 reg, dev, &bufs.moe_norm_out, stacked_gate_up,
                 &bufs.moe_expert_ids, &bufs.moe_gate_up_id_out, &gu_params,
             )
@@ -931,8 +940,10 @@ impl MlxModelWeights {
             expert_stride: self.layers[layer_idx].moe.down_expert_stride,
             ggml_type: self.layers[layer_idx].moe.down_ggml_dtype,
         };
+        // ADR-040 Phase F `iter-F-moe-mvid`: per-token `mv_id` (byte-identical).
+        // This is THE divergence site at N≥5 (`n_tokens = N*top_k > 32`).
         session
-            .quantized_matmul_id_ggml(
+            .quantized_matmul_id_ggml_mv(
                 reg, dev, &bufs.moe_swiglu_id_out, stacked_down,
                 &bufs.moe_expert_ids, &bufs.moe_down_id_out, &dn_params,
             )
