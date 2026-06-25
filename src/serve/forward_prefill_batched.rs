@@ -368,6 +368,18 @@ impl MlxModelWeights {
             Ok("0") | Ok("false") | Ok("off")
         );
 
+        // ADR-040 §0.19 FIX: the F16 D=512 FA prefill kernel is NON-DETERMINISTIC
+        // on multi-chunk prefill (greedy run1 != run2 on prompts > 64 tokens at a
+        // global layer — root-caused by per-layer synced-checksum bisection to the
+        // first global/D=512 layer), and the BF16 D=512 FA path has a known
+        // enumeration-coherence bug (see HF2Q_FA_F16 note above). BOTH D=512 FA
+        // paths are defective. Route the 5 global (D=512) layers through the
+        // deterministic + coherent tensor-mm (NO_FA) path by DEFAULT; the 25
+        // sliding (D=256) layers stay on fast FA (deterministic, capped K=1024).
+        // This is the iter-82 H62 routing made default-on. Opt back into the
+        // (broken) F16-D512 FA path for kernel-fix A/B via HF2Q_GLOBAL_FA=1.
+        let force_global_nofa = std::env::var("HF2Q_GLOBAL_FA").as_deref() != Ok("1");
+
         // Wave P4.17 — super-flag: per-op isolation for bucket attribution.
         // When on, every dispatch is bracketed by s.finish()/s = exec.begin()
         // pairs so its wall-clock is measured; the individual bucket atomics
@@ -648,16 +660,20 @@ impl MlxModelWeights {
         // set.  pf_kq is the dominant footprint at seq_len=2455:
         //   nh × seq × seq × 4 = 16 × 2455² × 4 ≈ 386 MB.
         // Q / V-transposed / attn-out are each ~40-80 MB.
-        let pf_q_perm_f32: Option<MlxBuffer> = if use_no_fa {
+        // ADR-040 §0.19: allocate the NO_FA tensor-mm buffers when EITHER the
+        // global env flag is set OR globals are force-routed through NO_FA
+        // (default, to dodge the broken D=512 FA kernels).
+        let need_nofa_bufs = use_no_fa || force_global_nofa;
+        let pf_q_perm_f32: Option<MlxBuffer> = if need_nofa_bufs {
             Some(alloc_f32(nh * seq_len * max_hd, "pf_q_perm_f32")?)
         } else { None };
-        let mut pf_kq: Option<MlxBuffer> = if use_no_fa {
+        let mut pf_kq: Option<MlxBuffer> = if need_nofa_bufs {
             Some(alloc_f32(nh * seq_len * seq_len, "pf_kq")?)
         } else { None };
-        let pf_v_perm_t: Option<MlxBuffer> = if use_no_fa {
+        let pf_v_perm_t: Option<MlxBuffer> = if need_nofa_bufs {
             Some(alloc_bf16(max_nkv * max_hd * seq_len, "pf_v_perm_t")?)
         } else { None };
-        let mut pf_attn_f32: Option<MlxBuffer> = if use_no_fa {
+        let mut pf_attn_f32: Option<MlxBuffer> = if need_nofa_bufs {
             Some(alloc_f32(nh * seq_len * max_hd, "pf_attn_f32")?)
         } else { None };
         // Wave P4.10 — pf_sdpa_out_bf16 (the intermediate bf16 buffer
@@ -1320,7 +1336,7 @@ impl MlxModelWeights {
                 // (iter-81 measurement).  Keeping FA_SW for sliding +
                 // routing global through NO_FA saves ~52 ms wall at pp8333
                 // per model.
-                let route_through_nofa = use_no_fa && !is_sliding;
+                let route_through_nofa = (use_no_fa || force_global_nofa) && !is_sliding;
                 if route_through_nofa {
                     // ---- HF2Q_NO_FA path: tensor-mm attention ----
                     //
