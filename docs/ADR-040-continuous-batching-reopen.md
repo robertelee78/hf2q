@@ -469,6 +469,22 @@ Caveats: (a) different KV quant (hf2q F16-K/TQ-HB-V 8-bit vs llama q8_0/q8_0) �
 
 **Next levers (in measured-priority order):** (i) close the ~16% serve-layer overhead (hf2q `serve` path); (ii) reduce remaining per-slot loops in the batched MoE/attention; (iii) only THEN evaluate a q8-K decode path (a coherence-affecting kernel change, and N=1 parity says it is not the dominant lever). All gated behind fixing the batched-body determinism residual first (operator: "fix determinism first").
 
+#### 0.17 The throughput gap is PREFILL, not decode (2026-06-25, streaming-decomposed) — CORRECTS §0.15
+
+The §0.15 "aggregate decode tok/s" numbers conflated prefill + decode (they divided total tokens by wall-clock, which on short 200-tok gens is prefill-dominated). A **streaming benchmark that separates TTFT (prefill) from pure inter-token decode rate** (median of N reps, same idle machine, same GGUF/prompt) shows a completely different decomposition:
+
+| | hf2q decode | llama decode | hf2q prefill (TTFT) | llama prefill |
+|---:|---:|---:|---:|---:|
+| N=1 | **84–92 tok/s** | 83.9 tok/s | 335 ms | 156 ms |
+| N=8 | **177–207 tok/s agg** | 198 tok/s agg | **2438 ms** | 322 ms |
+
+- **DECODE IS AT PARITY** — hf2q ≥ llama at N=1, ≈ llama at N=8 (within run-to-run noise). The batched `[N,hidden]` decode body (now default) is competitive. The §0.15 "batching-kernel efficiency ~18%" lever was a **measurement artifact** of prefill bleeding into the decode number.
+- **PREFILL IS THE ENTIRE GAP.** Two sub-causes, both measured:
+  1. **No multi-sequence prefill** — the worker ADMIT loop (`engine.rs:5993`) calls `admit_gemma4_slot` → `prefill_seed` **once per request, sequentially**. `forward_prefill_batched.rs` batches *within* one sequence (per-layer, not per-token) but there is NO cross-slot prefill. 8 arriving requests ⇒ 8 sequential prefills ≈ 8 × ~300 ms = ~2.4 s, vs llama's single batched multi-seq prefill (322 ms). This is the **7.6× N=8 prefill gap**.
+  2. **Single-seq prefill ~2× slower per-token** — N=1 prefill 335 ms vs llama 156 ms for the same short prompt (~90 vs ~190 prompt tok/s). Independent of (1); helps every prefill.
+
+**Revised lever priority (measure-driven):** (i) **multi-sequence batched prefill** — prefill all pending requests in ONE forward pass with per-sequence causal masking, writing to N slots' KV (the llama unified-batch model; the single biggest lever at concurrency); (ii) single-seq prefill per-token speed (~2×); (iii) serve-layer overhead. The decode path is NOT a priority — it is already at parity. Tracked as `iter-G-prefill-batching`.
+
 ---
 
 ## 1. Why (the problem)
