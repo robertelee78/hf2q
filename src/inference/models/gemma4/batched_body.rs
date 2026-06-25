@@ -344,7 +344,9 @@ impl MlxModelWeights {
         // pos=positions[head_id/n_heads] — widening the grid to N*heads /
         // rows=N*nkv processes all N queries query-major ⇒ per-row BIT-IDENTICAL
         // to the per-slot loops; N=1 reduces to the single dispatch).
-        let attnpre = std::env::var("HF2Q_BATCHED_ATTNPRE").as_deref() == Ok("1");
+        // ADR-040 iter-F-batched-default: DEFAULT-ON (opt out HF2Q_BATCHED_ATTNPRE=0);
+        // per-row bit-identical to the per-slot loop (proven by n4/n8 parity).
+        let attnpre = std::env::var("HF2Q_BATCHED_ATTNPRE").as_deref() != Ok("0");
         session.barrier_between(
             &[&bufs.attn_q, &bufs.attn_k],
             &[&bufs.attn_q_normed, &bufs.attn_k_normed],
@@ -489,8 +491,12 @@ impl MlxModelWeights {
             nwg_bucket(k) == nwg_bucket(max_ksl)
                 && mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(k) == nsg_max
         });
+        // ADR-040 iter-F-batched-default: DEFAULT-ON (opt out HF2Q_BATCHED_FLASH=0),
+        // gated to same-(nwg,nsg)-bucket slots so the per-query math is bit-identical
+        // to the per-slot flash; mixed-bucket (e.g. staggered) slots fall back to the
+        // per-slot loop below.
         let use_batched_flash =
-            std::env::var("HF2Q_BATCHED_FLASH").as_deref() == Ok("1") && same_bucket;
+            std::env::var("HF2Q_BATCHED_FLASH").as_deref() != Ok("0") && same_bucket;
         // ROWDIFF probe (HF2Q_DECODE_TRACE): layer 0 only — dump per-slot
         // seq_positions / ksl / cache_pos so we can tell whether staggered slot-0
         // divergence is BOOKKEEPING (positions differ) or KV-CONTENT (identical).

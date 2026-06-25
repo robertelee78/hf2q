@@ -426,6 +426,20 @@ Op-level bisection (`HF2Q_DECODE_TRACE` host-side row-diff of `hidden_rows` / `h
 - `io_heads.rs` `per_position_argmax_from_hidden_batched_impl` (used by dflash/ngram multi-position verify) had the **same defect** (batched `[n,vocab]` logits softcapped with shared `params[1]=vocab` → only position 0). **FIXED** the same way (per-call `[cap, n*vocab]` params). Mostly benign for pure argmax (softcap is monotonic) but a real correctness bug if those logits are consumed beyond argmax.
 - **Remaining (publish-gated):** mlx-native `dispatch_softcap` is a footgun — it already computes `n = input.element_count()` for the grid but trusts the caller's `params[1]` for the kernel bound. Harden it to derive `n_elements` from the buffer (or build params internally from the `cap` arg it already receives) so callers can't pass a stale single-row count. Deferred to the next mlx-native publish (hf2q pins `mlx-native = "0.9.3"` from crates.io).
 
+#### 0.16-BATCHED-DEFAULT — `iter-F-batched-default` SHIPPED (2026-06-25)
+
+With the §0.16 softcap root-cause fixed, the batched `[N,hidden]` decode body + its sub-features are now the **production default** (opt out with `HF2Q_BATCHED_BODY=0` / `HF2Q_BATCHED_ATTNPRE=0` / `HF2Q_BATCHED_FLASH=0`). The gates flipped from `== Ok("1")` to `!= Ok("0")` at `engine.rs` (`use_batched_body`) and `batched_body.rs` (`attnpre`, `use_batched_flash`). The original non-determinism that blocked this was NEVER the batched body — it was the lm_head softcap covering only row 0 (§0.16-RESOLVED), which affected the per-slot path too.
+
+**Validation (the bar = feature working correctly over LONG real generations, not 5-token byte-equality):**
+- n1/n4/n8 byte-equiv parity with NO env (the new default → batched path): **byte-identical to serial**.
+- `staggered_eviction` under the new default: **0 fails** (was ~13%).
+- **E2E long-generation coherence over HTTP (serve.sh config, max_slots=8, greedy):**
+  - 8 concurrent SAME-prompt × 800 tok: every slot **byte-identical** to the single serial reference, text fully coherent start-to-finish (no repetition/garbage). Per-slot path AND batched path both pass; their references are identical.
+  - 8 concurrent **DISTINCT** prompts × 600 tok (catches cross-slot contamination that same-prompt masks): every slot **byte-identical to its own serial reference** — zero cross-slot leakage over the full generation.
+- **Throughput (8 concurrent distinct, 600 tok, same machine):** batched body **31.5 s** for 4800 tok = **152.6 tok/s aggregate** vs serial 56.5 s (≈**1.8×**); at 8× same-prompt 800-tok the batched body was **47.5 s vs the per-slot loop's 68.3 s (≈1.44×)**. Coherence AND speed.
+
+The per-slot loop stays available via the opt-out (A/B + byte-equiv baseline). Next: re-run the llama.cpp head-to-head (§0.15) under the new default to re-measure the gap.
+
 #### 0.15 hf2q vs llama.cpp head-to-head (2026-06-24) — MEASURED clean (idle, sequential, same GGUF/prompt/N, HTTP, 200-tok gens)
 
 Operator-requested. Both via OpenAI HTTP API, gemma4-ara Q5_K_M, M5 Max, one engine at a time on an idle system. **Aggregate decode tok/s:**

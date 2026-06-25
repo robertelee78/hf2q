@@ -6445,16 +6445,18 @@ fn decode_batch_gemma4(
     // Phase F (2026-06-24) — a default AUTO-ENABLE at handles.len()>=2 was
     // attempted and REVERTED: although the batched body is byte-identical to
     // serial at N=1/4/8 (slot_aware_n1/n4/n8) AND ~1.94× faster at N=8 (198.8
-    // vs 102.7 tok/s, §0.13), `slot_aware_staggered_eviction_no_peer_perturbation`
-    // is NON-DETERMINISTIC under auto-enable (~1/5 runs diverge). The normal
-    // continuous-batching case (requests finishing at staggered ticks + a slot
-    // refilled mid-batch via a Mixed prefill step) makes a slot's output depend
-    // on its async batch-mates — unacceptable for a temperature=0 default.
-    // Root-cause + fix is tracked as `iter-F-batched-default` (§0.13); the
-    // per-slot loop (deterministic across ALL scenarios incl. staggered) stays
-    // the default until then. The batched body remains available + proven via
-    // the opt-in flag (used by the benchmark/byte-equiv harness).
-    let use_batched_body = std::env::var("HF2Q_BATCHED_BODY").as_deref() == Ok("1")
+    // ADR-040 `iter-F-batched-default` (2026-06-25) — DEFAULT-ON (opt out with
+    // HF2Q_BATCHED_BODY=0). The prior non-determinism that blocked this flip was
+    // root-caused in §0.16-RESOLVED: it was NOT the batched body — it was the
+    // batched lm_head softcap covering only row 0 (softcap_params[1]=vocab, not
+    // n*vocab), which affected BOTH decode paths. With that fixed, the batched
+    // body is byte-identical to the serial slot-aware reference and to the
+    // per-slot loop: validated by n1/n4/n8 parity, `staggered_eviction` 0/60, and
+    // E2E long-generation coherence (8 concurrent distinct prompts × 600 tok over
+    // HTTP, each byte-identical to its own serial ref, no cross-slot contamination
+    // — at ~1.8× the serial aggregate throughput). The per-slot loop remains
+    // available via the opt-out for A/B + as the byte-equiv-harness baseline.
+    let use_batched_body = std::env::var("HF2Q_BATCHED_BODY").as_deref() != Ok("0")
         && guard.hybrid.is_some();
     let mut captured = Vec::new();
     let mut hidden_rows: Vec<f32> = Vec::new();
