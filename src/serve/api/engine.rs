@@ -6403,11 +6403,21 @@ fn decode_batch_gemma4(
     // Pass 1 — capture bodies. `captured` holds (handle, slot_idx, state, reply)
     // for each slot whose body ran; `hidden_rows` is their final hidden states
     // concatenated row-major `[n, hidden_size]`.
-    // ADR-040 S2/S3: opt-in [N,hidden] batched body (HF2Q_BATCHED_BODY=1 +
-    // hybrid KV). DEFAULT (flag off) = the proven per-slot capture path below
-    // (zero regression to S1). When on, ONE forward_decode_body_batched replaces
-    // the N per-slot bodies; gated by slot_aware_n1/n4 (re-run by me) before any
-    // default flip.
+    // ADR-040 S2/S3: OPT-IN [N,hidden] batched body (HF2Q_BATCHED_BODY=1 +
+    // hybrid KV). DEFAULT (flag off) = the proven per-slot capture path below.
+    //
+    // Phase F (2026-06-24) — a default AUTO-ENABLE at handles.len()>=2 was
+    // attempted and REVERTED: although the batched body is byte-identical to
+    // serial at N=1/4/8 (slot_aware_n1/n4/n8) AND ~1.94× faster at N=8 (198.8
+    // vs 102.7 tok/s, §0.13), `slot_aware_staggered_eviction_no_peer_perturbation`
+    // is NON-DETERMINISTIC under auto-enable (~1/5 runs diverge). The normal
+    // continuous-batching case (requests finishing at staggered ticks + a slot
+    // refilled mid-batch via a Mixed prefill step) makes a slot's output depend
+    // on its async batch-mates — unacceptable for a temperature=0 default.
+    // Root-cause + fix is tracked as `iter-F-batched-default` (§0.13); the
+    // per-slot loop (deterministic across ALL scenarios incl. staggered) stays
+    // the default until then. The batched body remains available + proven via
+    // the opt-in flag (used by the benchmark/byte-equiv harness).
     let use_batched_body = std::env::var("HF2Q_BATCHED_BODY").as_deref() == Ok("1")
         && guard.hybrid.is_some();
     let mut captured = Vec::new();

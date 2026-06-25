@@ -347,6 +347,32 @@ Added `slot_aware_n8_per_slot_parity_vs_serial` (the N=8 analogue of the N=4 par
 **Remaining tracked follow-up (does not block the shipped default):**
 - **`iter-F-flashtmp`** — switch the default per-slot flash to the N×-sized `bufs.sdpa_tmp` so the N attention dispatches run GPU-concurrent instead of WAW-serialized (a throughput lever; current serialized path is correct).
 
+### 0.14 Production-scale validation campaign (2026-06-24) — measured throughput, e2e serve proof, and a NEWLY-CHARACTERIZED pre-existing prefill non-determinism
+
+Driven by the "Tests==green is not the bar; the feature actually working correctly proven via testing is the bar" mandate. Three findings, all measured/falsified, not asserted:
+
+**1. Measured throughput (probe `slot_aware_n4_batched_body_throughput_probe`, real GGUF, post `iter-F-moe-mvid`+`iter-F-kvcap`):**
+
+| path | N=1 | N=4 | N=8 |
+|---|---|---|---|
+| DEFAULT (per-slot F1 loop) | 97.9 | 103.2 | 102.7 tok/s aggregate |
+| batched body (no flash) | 91.8 | 151.5 | 170.3 |
+| batched body + FLASH (full S2/S3) | 91.6 | 170.9 | **198.8** |
+
+The **production default scheduler path is essentially FLAT** (97.9→102.7 — the time-sliced per-slot loop never amortizes). Only the **batched body** scales: **1.94× the default at N=8** (198.8 vs 102.7), 1.66× at N=4; FLASH adds ~17% at N=8 (so `iter-F-flashtmp`'s batched flash is worth it — and is byte-identical, see below). N=1 is 6% slower batched (fixed setup overhead doesn't amortize). This confirms the §0.1 thesis empirically: the win requires the fused `[N,hidden]` body, which is **opt-in, not the default** — so the throughput goal is NOT yet delivered in production.
+
+**2. Full batched path (BODY+FLASH+KVENC+ATTNPRE) is byte-identical at N=1/4/8** (`slot_aware_n1`/`n4`/`n8`, 5/5) — so the single-dispatch batched flash (`iter-F-flashtmp` mechanism, via the already-allocated N×-sized `bufs.sdpa_tmp`) is correct, just off by default.
+
+**3. Attempted AUTO-ENABLE (batched body default when `handles.len()≥2`) → REVERTED.** Although byte-identical in the controlled n4/n8 tests, the **`slot_aware_staggered_eviction_no_peer_perturbation`** test (the NORMAL continuous-batching case: requests finishing at staggered ticks + a slot refilled mid-batch) is **NON-DETERMINISTIC** (~1/5 runs flip a token). CRITICAL: it flakes on the **per-slot DEFAULT path too** (fails ~1/5 even after the revert), so this is **pre-existing, NOT introduced by the batched body.** Hypothesis-first root-cause, **falsifier-confirmed**: forcing non-batched prefill (`HF2Q_SERVE_BATCHED_PREFILL=0`) makes it **5/5 deterministic**. ⇒ the source is the **batched-prefill** path (`forward_prefill_batched`, default-on): the async scheduler co-batches concurrently-arriving prefills non-deterministically, and the batched prefill's reduction order is not batch-invariant, so it flips low-confidence greedy tokens on **near-flat synthetic distributions**. Exact mechanism (shared-`self.*` scratch race under concurrent prefill vs. kernel batch-invariance) is under investigation (`iter-F-prefill-determinism`).
+
+**4. End-to-end serve validation (real `hf2q serve`, `--scheduler inflight-batched --max-slots 4`, real prompts, temp=0):** 4 CONCURRENT distinct prompts → `Paris` / `4` / `Red` / `east.` — all coherent, correct, clean `stop`. The feature genuinely works at production scale with real concurrent traffic; the staggered non-determinism does NOT manifest on real (confident-distribution) prompts, consistent with the §0.12 benign-prefill-delta finding.
+
+**Decision (operator, 2026-06-24): FIX PREFILL-DETERMINISM FIRST, then flip the batched body to default.** The per-slot loop (deterministic across ALL scenarios) stays the default until `iter-F-prefill-determinism` lands; then the batched body (1.94×, byte-identical) becomes the default for the inflight-batched gemma4 hybrid path. `serve.sh` updated (max_slots default 4→8 — safe at ~22 GB after `iter-F-kvcap`; the stale ">4 rejected" comment corrected).
+
+**Active/added follow-ups:**
+- **`iter-F-prefill-determinism`** (ACTIVE, operator-prioritized) — make the continuous-batching prefill deterministic regardless of async co-batching (so temp=0 output never depends on concurrent traffic), THEN flip the batched body to default. Falsifier-confirmed source = `forward_prefill_batched`.
+- **`iter-F-batched-default`** — flip the batched body to the production default (1.94×); gated on `iter-F-prefill-determinism`.
+
 ---
 
 ## 1. Why (the problem)
