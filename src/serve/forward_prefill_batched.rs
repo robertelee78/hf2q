@@ -1062,6 +1062,23 @@ impl MlxModelWeights {
                 }
             }
 
+            // ADR-040 §0.19 diag: per-layer residual FNV checksum (gated) to
+            // bisect the long-prompt FA non-determinism — run the same prompt
+            // twice in one server, diff [FA_CKSUM] lines, find the first
+            // divergent layer (sliding=D256 vs global=D512). pf_hidden here holds
+            // the PREVIOUS layer's output (synced at layer entry).
+            if std::env::var("HF2Q_FA_LAYER_CKSUM").as_deref() == Ok("1") {
+                if let Ok(h) = pf_hidden.as_slice::<f32>() {
+                    let mut acc: u64 = 1469598103934665603;
+                    for &x in h.iter() {
+                        acc = (acc ^ (x.to_bits() as u64)).wrapping_mul(1099511628211);
+                    }
+                    eprintln!(
+                        "[FA_CKSUM] pre_layer L{layer_idx:02} sliding={is_sliding} hidden_fnv={acc:016x}"
+                    );
+                }
+            }
+
             let ff_gpu = if is_sliding { None }
                 else { Some(&self.activations.rope_freq_factors_gpu) };
             let theta = if is_sliding { self.rope_theta_sliding }
