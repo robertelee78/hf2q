@@ -3708,14 +3708,17 @@ impl MlxModelWeights {
             // (route this slot-aware prefill to `forward_prefill_batched` on the
             // mounted slot-view) was tried with TWO fixes and REVERTED both — it is
             // NON-DETERMINISTIC even single-stream (same prompt, alone, sequential:
-            // run1 ≠ run2). Refuted hypotheses (tested): (1) stale slot-region KV —
-            // REFUTED, zeroing the entire mounted K/V/norms region did NOT fix it;
-            // (2) concurrency — REFUTED, it diverges with a single request.
-            // `forward_prefill_batched` ITSELF is deterministic (SerialFifo
-            // run1==run2 verified), so the divergence is specific to its slot-aware
-            // invocation (some uninitialized/divergent internal state not addressed
-            // by KV zeroing — capacity-derived strides over the 32768-cap slot-view
-            // vs SerialFifo's request-sized fresh alloc are the leading suspect).
+            // run1 ≠ run2). Refuted hypotheses (ALL tested, codex tag-team):
+            // (1) stale slot-region KV — REFUTED, zeroing the entire mounted
+            // K/V/norms region did NOT fix it; (2) concurrency — REFUTED, diverges
+            // with a single request; (3) async per-layer command-buffer race —
+            // REFUTED, HF2Q_SYNC_PER_LAYER=1 (forced per-layer GPU wait) did NOT fix
+            // it. `forward_prefill_batched` ITSELF is deterministic (SerialFifo
+            // run1==run2 verified), so the divergence is a COMPUTATIONAL
+            // non-determinism specific to its slot-aware invocation — remaining
+            // suspect: a LOCAL activation/SDPA scratch buffer sized by the KV
+            // `capacity` (32768 slot-view vs SerialFifo's request-sized alloc) that
+            // is read partially-uninitialized (run-to-run garbage).
             // Proper iter-G is a PURPOSE-BUILT slot-aware batched prefill (batch the
             // per-token loop in this fn with per-slot reset + causal masking, NOT a
             // mount of the single-seq batched fn), gated on a determinism +
