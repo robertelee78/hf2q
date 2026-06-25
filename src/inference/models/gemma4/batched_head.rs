@@ -166,12 +166,35 @@ impl MlxModelWeights {
             .alloc_buffer(n * vocab * 4, DType::F32, vec![n * vocab])
             .map_err(|e| anyhow::anyhow!("lm_head_batched alloc logits_b: {e}"))?;
 
+        // ADR-040 §0.16 (2026-06-25) — per-call softcap params with n_elements =
+        // n*vocab. ROOT CAUSE of the batched-determinism residual: the shared
+        // `self.activations.softcap_params` carries `params[1] = vocab` (the
+        // single-row count, init at model.rs:1441), and the softcap kernel
+        // (shaders/softcap.metal) early-returns `if id >= params[1]`. In the
+        // batched head the logits buffer is `n*vocab`, so ONLY row 0 (id < vocab)
+        // got softcapped — rows ≥1 kept their RAW (larger) logits. Row 0 == the
+        // serial reference; rows ≥1 diverged, which surfaced as the ~13%
+        // staggered-eviction flake (a request landing in a slot ≥1 whose
+        // un-softcapped logits flipped a near-tie argmax). Affected BOTH decode
+        // paths (per-slot and batched-body both call this with n=N). Fix: a
+        // per-call `[cap, n*vocab]` params buffer so every row is softcapped.
+        let mut softcap_params_b = dev
+            .alloc_buffer(8, DType::F32, vec![2])
+            .map_err(|e| anyhow::anyhow!("lm_head_batched alloc softcap params: {e}"))?;
+        if let Some(cap) = self.final_logit_softcapping {
+            let p: &mut [f32] = softcap_params_b
+                .as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("lm_head_batched softcap params slice: {e}"))?;
+            p[0] = cap;
+            p[1] = f32::from_bits((n * vocab) as u32);
+        }
+
         let mut s = exec
             .begin()
             .map_err(|e| anyhow::anyhow!("lm_head_batched session begin: {e}"))?;
 
         // Batched final RMS norm: [n,hidden] -> [n,hidden]. norm_params ([eps,dim])
-        // is per-element and identical for every row, so it is reused as-is.
+        // is per-element and identical for every row.
         s.barrier_between(&[&hidden_b, &self.final_norm], &[&normed_b]);
         s.rms_norm(
             reg, metal_dev,
@@ -194,20 +217,18 @@ impl MlxModelWeights {
             ImatrixHint::Global("output.weight"),
         )?;
 
-        // Softcap (elementwise; applied per logit, so the flat [n*vocab] view is
-        // correct for all rows) when configured.
+        // Softcap all n*vocab logits (per-call params count above).
         if let Some(cap) = self.final_logit_softcapping {
             s.barrier_between(&[&logits_b], &[&logits_b]);
             mlx_native::ops::softcap::dispatch_softcap(
                 s.encoder_mut(), reg, metal_dev,
                 &logits_b,
                 &logits_b,
-                &self.activations.softcap_params,
+                &softcap_params_b,
                 cap,
             )
             .map_err(|e| anyhow::anyhow!("lm_head_batched softcap: {e}"))?;
         }
-
         s.finish()
             .map_err(|e| anyhow::anyhow!("lm_head_batched session finish: {e}"))?;
 
