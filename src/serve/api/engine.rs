@@ -5326,10 +5326,11 @@ impl Gemma4DecodeState {
         let prefill_duration = prefill_started.elapsed();
         if std::env::var("HF2Q_PREFILL_TIMING").is_ok() {
             eprintln!(
-                "[PREFILL_TIMING] slot {} — {} prompt tokens in {:.1} ms ({:.1} prompt tok/s)",
+                "[PREFILL_TIMING] slot {} — {} prompt tokens in {:.1} ms ({:.1} prompt tok/s) first_token={}",
                 slot_id.0, prompt_tokens.len(),
                 prefill_duration.as_secs_f64() * 1000.0,
                 prompt_tokens.len() as f64 / prefill_duration.as_secs_f64(),
+                first_decode_token,
             );
         }
 

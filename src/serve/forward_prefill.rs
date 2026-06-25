@@ -3715,10 +3715,18 @@ impl MlxModelWeights {
             // REFUTED, HF2Q_SYNC_PER_LAYER=1 (forced per-layer GPU wait) did NOT fix
             // it. `forward_prefill_batched` ITSELF is deterministic (SerialFifo
             // run1==run2 verified), so the divergence is a COMPUTATIONAL
-            // non-determinism specific to its slot-aware invocation — remaining
-            // suspect: a LOCAL activation/SDPA scratch buffer sized by the KV
-            // `capacity` (32768 slot-view vs SerialFifo's request-sized alloc) that
-            // is read partially-uninitialized (run-to-run garbage).
+            // non-determinism specific to its slot-aware invocation. PRECISELY
+            // characterized (op-level diagnostic): the prefill FIRST TOKEN is
+            // DETERMINISTIC (run1==run2, e.g. first_token=236776) and the first
+            // ~17 decoded tokens match — so the prefill forward/attention is fine;
+            // the divergence is in the TQ-HB KV-CACHE WRITE, which is subtly
+            // non-deterministic ONLY at the slot-view `cache_capacity`=32768
+            // (deterministic at SerialFifo's request-sized cap; all other dispatch
+            // params identical). The decode reads the non-det cached V and flips
+            // near-tie argmaxes ~token 18+ (bistable). Fix is a `cache_capacity`-
+            // dependent uninitialized/divergent read in the mlx-native
+            // `hadamard_quantize_kv` (TQ-HB V-quant) kernel — needs GPU kernel
+            // debugging, and is PUBLISH-GATED (hf2q pins mlx-native 0.9.3).
             // Proper iter-G is a PURPOSE-BUILT slot-aware batched prefill (batch the
             // per-token loop in this fn with per-slot reset + causal masking, NOT a
             // mount of the single-seq batched fn), gated on a determinism +
