@@ -406,7 +406,8 @@ impl MlxModelWeights {
             soft_tokens,
             max_decode_tokens,
             gpu,
-            None, // restored_lcp = None → wholesale reset, fresh dense_kvs
+            None,  // restored_lcp = None → wholesale reset, fresh dense_kvs
+            false, // slot_aware = false → legacy/SerialFifo byte-equivalent
         )
     }
 
@@ -464,6 +465,17 @@ impl MlxModelWeights {
         max_decode_tokens: usize,
         gpu: &mut GpuContext,
         restored_lcp: Option<usize>,
+        // ADR-040 STEP-1b (2026-06-24) — prefill-side cross-slot leak gate.
+        // When `true`, the slot-aware caller has mounted a per-slot slot-view
+        // bundle on `self.dense_kvs` and OWNS the restore.  The unconditional
+        // `self.dense_kvs = Some(..)` + `dense_kvs_snapshot_for_lcp` +
+        // `dense_sdpa_tmp` write-backs at the tail of this fn would otherwise
+        // overwrite that mount with a FRESH shared allocation and leak it
+        // (plus the snapshot/sdpa_tmp) across slots.  `slot_aware=true` SKIPS
+        // those three `self.*` writes; the caller restores `self.dense_kvs`
+        // from the saved prior.  SerialFifo / legacy callers pass `false` →
+        // BYTE-EQUIVALENT (writes happen exactly as before).
+        slot_aware: bool,
     ) -> Result<u32> {
         let seq_len = prompt_tokens.len();
         if seq_len == 0 {
@@ -2339,15 +2351,32 @@ impl MlxModelWeights {
                 }
                 None
             };
-        self.dense_kvs_snapshot_for_lcp = snapshot_for_lcp;
+        // ADR-040 STEP-1b (2026-06-24) — gate the three persistent `self.*`
+        // write-backs on `!slot_aware`.  In slot-aware mode the caller
+        // (`forward_*_slot_aware`) mounted a per-slot slot-view bundle on
+        // `self.dense_kvs` (consumed into `dense_kvs_vec` at the iter-2D
+        // consume-gate above) and OWNS the restore on exit; re-`Some(..)`-ing
+        // a FRESH shared `dense_kvs` here — plus `dense_kvs_snapshot_for_lcp`
+        // + `dense_sdpa_tmp` — would leak shared state across slots.  For the
+        // SerialFifo / legacy path (`slot_aware=false`) these run verbatim →
+        // byte-equivalent.  `dense_kvs_vec` / `sdpa_tmp` / `snapshot_for_lcp`
+        // simply drop at scope end in slot-aware mode (the slot-view buffers
+        // they wrap are kept alive by the persistent multi-seq scaffold).
+        if !slot_aware {
+            self.dense_kvs_snapshot_for_lcp = snapshot_for_lcp;
 
-        self.dense_kvs = Some(
-            dense_kvs_vec
-                .into_iter()
-                .map(std::sync::Arc::new)
-                .collect(),
-        );
-        self.dense_sdpa_tmp = Some(sdpa_tmp);
+            self.dense_kvs = Some(
+                dense_kvs_vec
+                    .into_iter()
+                    .map(std::sync::Arc::new)
+                    .collect(),
+            );
+            self.dense_sdpa_tmp = Some(sdpa_tmp);
+        } else {
+            drop(snapshot_for_lcp);
+            drop(dense_kvs_vec);
+            drop(sdpa_tmp);
+        }
 
         // iter-222 (2026-05-01): legacy iter-20/iter-21 Track A note about
         // `leg_f_kvs` placement was deleted along with the field — see
@@ -2989,6 +3018,7 @@ impl MlxModelWeights {
                 max_decode_tokens,
                 gpu,
                 None,
+                true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
             );
 
             // Restore prior `self.dense_kvs` regardless of result.  The
@@ -3230,6 +3260,7 @@ impl MlxModelWeights {
                 max_decode_tokens,
                 gpu,
                 None,
+                true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
             );
 
             // Restore prior `self.kv_caches` regardless of result.  The
@@ -3673,12 +3704,42 @@ impl MlxModelWeights {
             // iter-2D scope (dense F32 LCP-eligible regime); iter-2B
             // does NOT consume the LCP fast path for the hybrid
             // production-default branch (orthogonal sub-deferral).
+            // ADR-040 `iter-G-prefill-batched` NOTE (2026-06-25): the mount-trick
+            // (route this slot-aware prefill to `forward_prefill_batched` on the
+            // mounted slot-view) was tried with TWO fixes and REVERTED both — it is
+            // NON-DETERMINISTIC even single-stream (same prompt, alone, sequential:
+            // run1 ≠ run2). Refuted hypotheses (ALL tested, codex tag-team):
+            // (1) stale slot-region KV — REFUTED, zeroing the entire mounted
+            // K/V/norms region did NOT fix it; (2) concurrency — REFUTED, diverges
+            // with a single request; (3) async per-layer command-buffer race —
+            // REFUTED, HF2Q_SYNC_PER_LAYER=1 (forced per-layer GPU wait) did NOT fix
+            // it. `forward_prefill_batched` ITSELF is deterministic (SerialFifo
+            // run1==run2 verified), so the divergence is a COMPUTATIONAL
+            // non-determinism specific to its slot-aware invocation. PRECISELY
+            // characterized (op-level diagnostic): the prefill FIRST TOKEN is
+            // DETERMINISTIC (run1==run2, e.g. first_token=236776) and the first
+            // ~17 decoded tokens match — so the prefill forward/attention is fine;
+            // the divergence is in the TQ-HB KV-CACHE WRITE, which is subtly
+            // non-deterministic ONLY at the slot-view `cache_capacity`=32768
+            // (deterministic at SerialFifo's request-sized cap; all other dispatch
+            // params identical). The decode reads the non-det cached V and flips
+            // near-tie argmaxes ~token 18+ (bistable). Fix is a `cache_capacity`-
+            // dependent uninitialized/divergent read in the mlx-native
+            // `hadamard_quantize_kv` (TQ-HB V-quant) kernel — needs GPU kernel
+            // debugging, and is PUBLISH-GATED (hf2q pins mlx-native 0.9.3).
+            // Proper iter-G is a PURPOSE-BUILT slot-aware batched prefill (batch the
+            // per-token loop in this fn with per-slot reset + causal masking, NOT a
+            // mount of the single-seq batched fn), gated on a determinism +
+            // byte/coherence parity test. The short-prompt N=8 benchmark gap is
+            // separately LATENCY-bound (per-layer dispatch ≈8ms×30, token count
+            // irrelevant) → its lever is CROSS-SLOT batched prefill. See §0.17.
             let result = self.forward_prefill_with_soft_tokens_resume(
                 prompt_tokens,
                 soft_tokens,
                 max_decode_tokens,
                 gpu,
                 None,
+                true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
             );
 
             // Restore prior `self.hybrid_kv` regardless of result.  The
@@ -3882,6 +3943,7 @@ impl MlxModelWeights {
             max_decode_tokens,
             gpu,
             None,
+            true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
         );
 
         // Restore prior `self.leg_hb_encoded` regardless of result.  The
@@ -3894,6 +3956,47 @@ impl MlxModelWeights {
         self.leg_hb_encoded = prior_leg_hb;
 
         result
+    }
+
+    /// ADR-040 STEP-1b — set the per-layer KV cursor on `self.kv_caches`
+    /// to the per-slot-correct value for decode position `seq_pos`, returning
+    /// the prior `(write_pos, seq_len)` per layer so the caller can restore
+    /// them. The delegated `forward_decode` reads+increments these counters
+    /// for the per-token attention bookkeeping (forward_gpu.rs:387-394); they
+    /// are SHARED model state, so under N>1 concurrent slots they MUST be
+    /// re-derived from the per-slot `seq_pos` each tick (qwen35's stateless
+    /// pattern) rather than carrying a shared running counter that collides
+    /// across interleaved slots.
+    ///
+    /// Byte-equivalence: for a single sequence at decode `seq_pos`, the
+    /// SerialFifo cursor entering `forward_decode` is exactly
+    /// `write_pos = seq_pos`, `seq_len = min(seq_pos, capacity)` (prefill
+    /// wrote `prompt_len` → write_pos=prompt_len; each prior decode +1 →
+    /// write_pos=seq_pos). `forward_decode` then increments, so kv_info sees
+    /// `write_pos=seq_pos`, `seq_len=min(seq_pos+1, cap)` — identical to the
+    /// single-seq path. SerialFifo never calls this (slot-aware-only).
+    fn set_per_slot_kv_cursor(&mut self, seq_pos: usize) -> Vec<(usize, usize)> {
+        let priors: Vec<(usize, usize)> = self
+            .kv_caches
+            .iter()
+            .map(|c| (c.write_pos, c.seq_len))
+            .collect();
+        for c in self.kv_caches.iter_mut() {
+            c.write_pos = seq_pos;
+            c.seq_len = seq_pos.min(c.capacity);
+        }
+        priors
+    }
+
+    /// Restore the per-layer KV cursors saved by `set_per_slot_kv_cursor`, so
+    /// the shared `self.kv_caches` counters carry NO per-request state out of
+    /// the slot-aware decode call (the slot's cursor is re-derived from
+    /// `seq_pos` next tick).
+    fn restore_kv_cursor(&mut self, priors: &[(usize, usize)]) {
+        for (c, (wp, sl)) in self.kv_caches.iter_mut().zip(priors.iter()) {
+            c.write_pos = *wp;
+            c.seq_len = *sl;
+        }
     }
 
     /// **ADR-040 iter-B4c-kernel iter-2-decode-A (2026-05-30)** — slot-aware
@@ -3986,7 +4089,57 @@ impl MlxModelWeights {
     /// - HF2Q_HYBRID_KV=1 + scaffold absent → typed `iter-C2c-cont-invariant-violated`.
     /// - HF2Q_HYBRID_KV=1 + xlen BF16 buffers present → typed `iter-B4c-kernel-iter-2-decode-A-xlen`.
     /// - HF2Q_HYBRID_KV=0 (HB-encoded opt-out) → typed `iter-B4c-kernel-iter-2-decode-B`.
+    /// ADR-040 — public slot-aware decode (full path: body + head, returns the
+    /// greedy/sampled token). Thin wrapper over the capture-parameterized
+    /// [`Self::forward_decode_slot_aware_impl`] with `capture_hidden=false`,
+    /// byte-identical to the historical `forward_decode_slot_aware`. The
+    /// grep-pinned `pub fn forward_decode_slot_aware(` primitive (H123) is here.
     pub fn forward_decode_slot_aware(
+        &mut self,
+        input_token: u32,
+        seq_pos: usize,
+        gpu: &mut GpuContext,
+        profile: &mut Option<crate::inference::models::gemma4::profile::TokenProfile>,
+        slot_id: SlotId,
+        multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>,
+        multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>,
+        multi_seq_kv_dense: Option<&mut Vec<MultiSeqDenseKvBuffers>>,
+        multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
+    ) -> Result<u32> {
+        self.forward_decode_slot_aware_impl(
+            input_token, seq_pos, gpu, profile, slot_id,
+            multi_seq_kv_hb, multi_seq_kv_hybrid, multi_seq_kv_dense, multi_seq_kv_mlx,
+            false,
+        )
+    }
+
+    /// ADR-040 S1c-2 — slot-aware BODY-CAPTURE decode: mounts the slot KV and
+    /// runs the body only, leaving the final hidden in `self.activations.hidden`
+    /// (read it immediately via `self.activations.hidden.as_slice::<f32>()`) and
+    /// skipping the per-slot head. Used by `decode_batch_gemma4` to gather N
+    /// slots' hidden for one batched `lm_head`. Same slot-KV isolation as the
+    /// full path (identical mount/cursor/restore); only the head is deferred.
+    pub fn forward_decode_slot_aware_capture_hidden(
+        &mut self,
+        input_token: u32,
+        seq_pos: usize,
+        gpu: &mut GpuContext,
+        profile: &mut Option<crate::inference::models::gemma4::profile::TokenProfile>,
+        slot_id: SlotId,
+        multi_seq_kv_hb: &mut Vec<MultiSeqHbKvBuffers>,
+        multi_seq_kv_hybrid: Option<&mut Vec<MultiSeqHybridKvBuffers>>,
+        multi_seq_kv_dense: Option<&mut Vec<MultiSeqDenseKvBuffers>>,
+        multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
+    ) -> Result<()> {
+        self.forward_decode_slot_aware_impl(
+            input_token, seq_pos, gpu, profile, slot_id,
+            multi_seq_kv_hb, multi_seq_kv_hybrid, multi_seq_kv_dense, multi_seq_kv_mlx,
+            true,
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn forward_decode_slot_aware_impl(
         &mut self,
         input_token: u32,
         seq_pos: usize,
@@ -4012,6 +4165,11 @@ impl MlxModelWeights {
         // the iter-2C prefill signature.  Off-default (HF2Q_TQ_CODEBOOK_BITS=4
         // opt-in since ADR-007 default-on TQ-8-bit correction 2026-04-24).
         multi_seq_kv_mlx: Option<&mut Vec<MultiSeqMlxKvCache>>,
+        // ADR-040 S1c-2: when true, each regime mounts its slot KV then runs
+        // the BODY-ONLY decode (`forward_decode_impl(.., capture_hidden=true)`),
+        // leaving the final hidden in `self.activations.hidden` and skipping the
+        // per-slot head; the SlotAware worker batches the head across slots.
+        capture_hidden: bool,
     ) -> Result<u32> {
         // ── Pre-flight ────────────────────────────────────────────────
         //
@@ -4190,11 +4348,13 @@ impl MlxModelWeights {
 
             let prior_dense_kvs = self.dense_kvs.take();
             self.dense_kvs = Some(slot_view_dense);
-            // Delegate to forward_decode — structurally a no-op on the
-            // dense F32 path since forward_decode does not read
-            // self.dense_kvs.  The TQ-active path routes via
-            // leg_hb_encoded / hybrid_kv as configured.
-            let result = self.forward_decode(input_token, seq_pos, gpu, profile);
+            // ADR-040 STEP-1b — per-slot KV cursor (see set_per_slot_kv_cursor
+            // doc). forward_decode reads+increments the shared self.kv_caches
+            // cursor for attention bookkeeping; re-derive from per-slot seq_pos
+            // so interleaved slots don't collide, restore after.
+            let prior_cursors = self.set_per_slot_kv_cursor(seq_pos);
+            let result = self.forward_decode_impl(input_token, seq_pos, gpu, profile, capture_hidden);
+            self.restore_kv_cursor(&prior_cursors);
             self.dense_kvs = prior_dense_kvs;
             return result;
         }
@@ -4332,14 +4492,24 @@ impl MlxModelWeights {
                         "decode MLX slot-view V_norms with_shape at L{layer_idx}: {e} \
                          — ADR-040 iter-B4c-kernel iter-2-decode-D"
                     ))?;
-                // Preserve the legacy cursor from the persistent multi-
-                // seq scaffold's `seq_lens[slot]`.  forward_decode
-                // advances `write_pos += 1` + `seq_len = saturating_add(1)`
-                // at line 389-390 — when mounted on slot N for a fresh
-                // decode call after prefill, `seq_lens[N]` already
-                // reflects prefill positions.  Cap to `cap` matches the
-                // sibling's saturating semantic.
-                let cursor = (buf.seq_lens[slot_id.0 as usize] as usize).min(cap);
+                // ADR-040 STEP-1b (2026-06-24) — PER-SLOT KV CURSOR (4-bit
+                // branch).  The persistent scaffold's `seq_lens[slot]` is
+                // NEVER advanced (only reset → always 0), so the legacy
+                // `seq_lens[slot]` source produced a stale cursor.  Source
+                // the cursor from the per-slot `seq_pos` ARGUMENT instead
+                // (authoritative per-slot position computed by the F1
+                // worker).  Pre-increment values: write_pos=seq_pos,
+                // seq_len=min(seq_pos, cap) — the sibling's +1 then yields
+                // the single-seq kv_info write_pos=seq_pos,
+                // seq_len=min(seq_pos+1, cap).  The wholesale
+                // `std::mem::replace` of self.kv_caches (+ restore of
+                // prior_kv_caches below) keeps SerialFifo byte-exact.
+                // codex M1 review fix (2026-06-24): `write_pos` MUST stay the
+                // LOGICAL `seq_pos` (uncapped). `forward_decode` applies
+                // `write_pos % capacity` for sliding layers; capping write_pos
+                // to `cap` would make sliding layers write to slot 0 repeatedly
+                // once `seq_pos > cap` (post-wrap). Only `seq_len` is capped.
+                // Mirrors `set_per_slot_kv_cursor` used by the hybrid/HB branches.
                 slot_view_kv.push(MlxKvCache {
                     k_packed: k_packed_view,
                     k_norms: k_norms_view,
@@ -4347,13 +4517,13 @@ impl MlxModelWeights {
                     v_norms: v_norms_view,
                     capacity: cap,
                     is_sliding: buf.is_sliding,
-                    write_pos: cursor,
-                    seq_len: cursor,
+                    write_pos: seq_pos,
+                    seq_len: seq_pos.min(cap),
                 });
             }
 
             let prior_kv_caches = std::mem::replace(&mut self.kv_caches, slot_view_kv);
-            let result = self.forward_decode(input_token, seq_pos, gpu, profile);
+            let result = self.forward_decode_impl(input_token, seq_pos, gpu, profile, capture_hidden);
             // After decode advances slot's write_pos/seq_len, write the
             // updated cursor back into the persistent multi-seq scaffold's
             // seq_lens before restoring.  This preserves the per-slot
@@ -4684,12 +4854,21 @@ impl MlxModelWeights {
             let prior_hybrid_kv = self.hybrid_kv.take();
             self.hybrid_kv = Some(slot_view_hybrid);
 
+            // ADR-040 STEP-1b — per-slot KV cursor (see set_per_slot_kv_cursor
+            // doc). The delegated forward_decode reads the shared
+            // self.kv_caches cursor; re-derive it from the per-slot seq_pos so
+            // interleaved slots do not collide. Restore after → no per-request
+            // state persists on self.kv_caches. SerialFifo never reaches here.
+            let prior_cursors = self.set_per_slot_kv_cursor(seq_pos);
+
             // Delegate to the sibling fn.  Its lazy-alloc gate at
             // `forward_gpu.rs:413` reads `self.hybrid_kv.is_none()` →
             // mount survives (H128 source-grep pin) and the per-layer
             // K/V writes inside `encode_one_layer` land in the per-slot
             // byte region of the persistent multi-seq scaffold.
-            let result = self.forward_decode(input_token, seq_pos, gpu, profile);
+            let result = self.forward_decode_impl(input_token, seq_pos, gpu, profile, capture_hidden);
+
+            self.restore_kv_cursor(&prior_cursors);
 
             // Restore prior `self.hybrid_kv` regardless of result.  The
             // slot-view bundle has lifetime tied to this call; the
@@ -4833,6 +5012,18 @@ impl MlxModelWeights {
         let prior_leg_hb = self.leg_hb_encoded.take();
         self.leg_hb_encoded = Some(slot_view_hb);
 
+        // ADR-040 STEP-1b (2026-06-24) — PER-SLOT KV CURSOR (HB-encoded
+        // branch).  Same fix as the hybrid branch above: source the
+        // attention cursor from the per-slot `seq_pos` ARGUMENT rather than
+        // the SHARED `self.kv_caches[L].{write_pos, seq_len}` counters that
+        // `forward_decode` reads+increments (forward_gpu.rs:387-394).  Under
+        // N>1 interleave the shared counters carry the OTHER slot's value →
+        // cross-slot attention-range corruption.  Set write_pos=seq_pos,
+        // seq_len=min(seq_pos, cap) (the sibling's +1 then yields the
+        // single-seq kv_info write_pos=seq_pos, seq_len=min(seq_pos+1, cap)),
+        // save+restore so SerialFifo (never reaches here) stays byte-exact.
+        let prior_cursors = self.set_per_slot_kv_cursor(seq_pos);
+
         // Delegate to the sibling fn.  Its lazy-alloc gate at
         // `gemma4/forward_gpu.rs:427` reads
         // `&& self.leg_hb_encoded.is_none()` → mount survives (H128
@@ -4840,6 +5031,8 @@ impl MlxModelWeights {
         // K/V writes inside `encode_one_layer` land in the per-slot byte
         // region of the persistent multi-seq scaffold.
         let result = self.forward_decode(input_token, seq_pos, gpu, profile);
+
+        self.restore_kv_cursor(&prior_cursors);
 
         // Restore prior `self.leg_hb_encoded` regardless of result.  The
         // slot-view bundle has lifetime tied to this call; the

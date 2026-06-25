@@ -63,7 +63,7 @@ use crate::serve::sampler_pure::{
 // per dossier §2.9).
 use crate::serve::scheduler::{
     AdmitError, AdmitRequest, FifoSchedulerAdapter, InflightBatchedScheduler, Scheduler,
-    SchedulerPolicy, SchedulerStats, SlotHandle,
+    SchedulerPolicy, SchedulerStats, SchedulerStep, SlotHandle, StepError,
 };
 use crate::serve::multi_seq_kv::SlotId;
 // ADR-040 iter-2-decode-C-stream-tool-call (§6.1.48) — `MultiSeqError`
@@ -757,7 +757,8 @@ pub enum EngineSpawnError {
     ///
     /// This typed error is the operator-facing guardrail: spawn fails
     /// LOUDLY (not silently degrades) when an operator selects
-    /// `max_slots > HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` (default 4)
+    /// `max_slots > HF2Q_MAX_BATCHED_SLOTS` (continuous-batching ceiling,
+    /// default 8; legacy `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` still honoured)
     /// without explicitly opting in via
     /// `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED=1`.
     ///
@@ -823,8 +824,52 @@ pub enum EngineSpawnError {
 /// ADR-040 Phase A4 iter-1 (2026-05-30) — default for
 /// `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` per the §6.1.53 + §6.1.54
 /// dossier §1.5 + §3 finding (spec-decode net-positive ceiling is 4-8
-/// concurrent; conservative default is the safe-zone edge).
+/// concurrent; conservative default is the safe-zone *lower* edge).
+///
+/// **FAIL-CLOSED, deliberately stays 4 (do NOT relax to 8).** This is the
+/// gate for the SPEC-DECODE drafter path — when that drafter ships, its
+/// verification overhead net-regresses above 4 concurrent (dossier). The
+/// continuous-batching capacity ceiling is the SEPARATE
+/// [`ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS`] (= 8); the two were
+/// decoupled 2026-06-24 (Phase F, codex milestone review of `b671dfe0`
+/// SHIP-WITH-FIXES item (c)) so a future drafter implementer cannot
+/// inherit the relaxed continuous-batching default for the actual
+/// spec-decode path. `adr040_phase_f_gate_decoupling_pin` enforces the
+/// separation at compile/test time.
 pub const ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS: u32 = 4;
+
+/// ADR-040 Phase F (2026-06-24) — default for `HF2Q_MAX_BATCHED_SLOTS`,
+/// the capacity ceiling for the WIRED continuous/inflight-batching
+/// `SlotAware` path (operator request "support up to 8 concurrent slots ×
+/// 32k context each").
+///
+/// 8 is the UPPER edge of the dossier's 4-8 safe zone and is empirically
+/// validated for continuous batching (NOT spec-decode): byte-identical to
+/// serial (`slot_aware_n1`/`slot_aware_n4` re-run through the batched body
+/// with `HF2Q_BATCHED_BODY=1`, 2026-06-24 — see ADR §0.13 queen-led audit),
+/// coherence-proven e2e, 202 tok/s aggregate.
+///
+/// KV-memory accounting (ADR-040 `iter-F-kvcap`, 2026-06-24): the multi-seq
+/// `SlotAware` scaffold splits the full-attention context budget across slots
+/// — each of `max_slots` slots gets `max_position_embeddings / max_slots` of
+/// global-layer context (the llama.cpp `-c`÷`-np` convention) via
+/// `layer_type_to_alloc_params_per_slot` (`kv_cache.rs`). The 25 sliding
+/// layers stay at the 1024 ring window (per-slot-independent). So the total
+/// full-attention KV is ≈ ONE full-context sequence regardless of N (constant,
+/// not linear): at N=8 each slot holds 262144/8 = 32k of global context →
+/// global layers ~4 GB total (8 × 5 × nkv=2 × hd=512 × cap=32768 ×
+/// [2 B F16-K + 1 B TQ-HB-V]); the whole multi-seq KV is ~5-6 GB, and "8×32k"
+/// is now literal. Total at N=8 ≈ 16.4 GB weights + ~6 GB KV ≈ 22 GB → fits
+/// the 128 GB M5 Max with vast headroom, and now also fits a 64 GB machine.
+/// (Pre-`iter-F-kvcap` each slot eagerly held the full 262k → ~45 GB at N=8,
+/// the ~10×-too-large figure Worker C caught.) `max_slots=1` is identity
+/// (max/1 = max) so SerialFifo / single-seq is unchanged. Over-budget spawns
+/// still fail CLOSED with an `alloc_*_kv_for_layer` `Result` error (not UB).
+/// This is the gate the live `SlotAware` spawn checks; the
+/// spec-decode drafter (unwired, API-scaffold only per §6.1.55-F5) must
+/// gate on [`ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS`] (= 4) when
+/// it lands — NOT this constant.
+pub const ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS: u32 = 8;
 
 /// ADR-040 Phase A4 iter-1 (2026-05-30) — load-bearing dossier citation
 /// for the [`EngineSpawnError::SpecDecodeMaxSlotsAboveBatchedThreshold`]
@@ -871,6 +916,59 @@ where
         },
         None => ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS,
     }
+}
+
+/// ADR-040 Phase F (2026-06-24) — read the continuous/inflight-batching
+/// `SlotAware` capacity ceiling: prefer `HF2Q_MAX_BATCHED_SLOTS`, default
+/// [`ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS`] (= 8).
+///
+/// This is the gate the live `SlotAware` spawn checks — DISTINCT from the
+/// spec-decode drafter gate (codex `b671dfe0` review item (c): keep the
+/// two fail-closed-separate so the future drafter can't inherit 8).  For
+/// operator back-compat, when `HF2Q_MAX_BATCHED_SLOTS` is unset but the
+/// legacy `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` is set, the legacy value is
+/// honoured with a deprecation `warn!` (it used to drive this gate before
+/// the decoupling).  Malformed/zero env falls back to the default.  Pure
+/// function — closure-injected env for deterministic tests.
+pub fn read_continuous_batching_max_slots<F>(env_read: F) -> u32
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let parse = |s: String, var: &str| -> u32 {
+        match s.trim().parse::<u32>() {
+            Ok(0) => {
+                tracing::warn!(
+                    target: "adr040.f",
+                    "{var}={s:?} parsed to 0 — ignoring (would block all \
+                     SlotAware spawns); using default {default}",
+                    default = ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS
+                );
+                ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS
+            }
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    target: "adr040.f",
+                    "{var}={s:?} unparseable as u32; using default {default}",
+                    default = ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS
+                );
+                ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS
+            }
+        }
+    };
+    if let Some(s) = env_read("HF2Q_MAX_BATCHED_SLOTS") {
+        return parse(s, "HF2Q_MAX_BATCHED_SLOTS");
+    }
+    if let Some(s) = env_read("HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS") {
+        tracing::warn!(
+            target: "adr040.f",
+            "HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS is DEPRECATED for the \
+             continuous-batching gate — use HF2Q_MAX_BATCHED_SLOTS. \
+             Honouring legacy value for back-compat."
+        );
+        return parse(s, "HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS (deprecated)");
+    }
+    ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS
 }
 
 /// ADR-040 Phase A4 iter-1 (2026-05-30) — read
@@ -3086,7 +3184,7 @@ impl GemmaLoadedModel {
         use crate::inference::models::gemma4::kv_cache::{
             alloc_hb_kv_for_layer, alloc_multi_seq_dense_kv_for_layer,
             alloc_multi_seq_hybrid_kv_for_layer, alloc_multi_seq_mlx_kv_for_layer,
-            layer_type_to_alloc_params,
+            layer_type_to_alloc_params_per_slot,
         };
         use crate::serve::config::LayerType;
 
@@ -3114,10 +3212,11 @@ impl GemmaLoadedModel {
             let nkv = self.config.num_kv_heads_for_layer(i);
             let is_full = self.config.is_full_attention(i);
             let layer_type = if is_full { LayerType::Full } else { LayerType::Sliding };
-            let (is_ring, capacity) = layer_type_to_alloc_params(
+            let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
                 layer_type,
                 self.config.sliding_window,
                 self.config.max_position_embeddings,
+                max_slots as usize,
             );
             let buf = alloc_hb_kv_for_layer(dev, i, nkv, hd, capacity, is_ring, max_slots)
                 .with_context(|| {
@@ -3150,10 +3249,11 @@ impl GemmaLoadedModel {
                 let is_full = self.config.is_full_attention(i);
                 let layer_type =
                     if is_full { LayerType::Full } else { LayerType::Sliding };
-                let (is_ring, capacity) = layer_type_to_alloc_params(
+                let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
                     layer_type,
                     self.config.sliding_window,
                     self.config.max_position_embeddings,
+                    max_slots as usize,
                 );
                 let buf = alloc_multi_seq_hybrid_kv_for_layer(
                     dev, i, nkv, hd, capacity, is_ring, max_slots,
@@ -3203,10 +3303,11 @@ impl GemmaLoadedModel {
                 let is_full = self.config.is_full_attention(i);
                 let layer_type =
                     if is_full { LayerType::Full } else { LayerType::Sliding };
-                let (is_ring, capacity) = layer_type_to_alloc_params(
+                let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
                     layer_type,
                     self.config.sliding_window,
                     self.config.max_position_embeddings,
+                    max_slots as usize,
                 );
                 let buf = alloc_multi_seq_dense_kv_for_layer(
                     dev, i, nkv, hd, capacity, is_ring, kv_dtype, max_slots,
@@ -3249,10 +3350,11 @@ impl GemmaLoadedModel {
                 let is_full = self.config.is_full_attention(i);
                 let layer_type =
                     if is_full { LayerType::Full } else { LayerType::Sliding };
-                let (is_ring, capacity) = layer_type_to_alloc_params(
+                let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
                     layer_type,
                     self.config.sliding_window,
                     self.config.max_position_embeddings,
+                    max_slots as usize,
                 );
                 let norms_per_pos = (hd / 256).max(1);
                 let buf = alloc_multi_seq_mlx_kv_for_layer(
@@ -3723,24 +3825,29 @@ impl Engine {
             // §2.4 scope split is honoured: each arch's lift is
             // independent.
             EngineMode::SlotAware { max_slots } => {
-                // ADR-040 Phase A4 iter-1 (2026-05-30) — spec-decode
-                // oversized-slots threshold gate.  Per §6.1.53 + §6.1.54
-                // dossier (3 independent published sources), speculative
-                // decoding net-regresses above 4-8 concurrent requests.
-                // Default threshold is 4 (the safe-zone edge); operators
-                // can tune via `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` after
-                // empirical inflection-point measurement on their own
-                // hardware.  `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED=1` is the
-                // explicit opt-in for documented regression — silent
-                // capping would be a Liskov-substitution violation per
-                // ADR-040 §7 no-fallback mantra (H229 pins this).
+                // ADR-040 Phase F (2026-06-24) — continuous-batching
+                // capacity gate.  Default 8 (`HF2Q_MAX_BATCHED_SLOTS`,
+                // `ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS`) — the
+                // upper edge of the §6.1.53/54 dossier's 4-8 safe zone,
+                // empirically validated for the WIRED continuous-batching
+                // path (byte-identical + coherence-proven at N=8; KV-mem
+                // bounded ~4.2 GB @ 8×32k).  This is DECOUPLED from the
+                // spec-decode drafter gate
+                // (`ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS`, still
+                // 4, fail-closed) per codex's `b671dfe0` review item (c):
+                // the unwired drafter (§6.1.55-F5 API-scaffold) MUST NOT
+                // inherit the relaxed continuous default when it lands.
+                // `HF2Q_SPEC_DECODE_ALLOW_OVERSIZED=1` is the explicit
+                // opt-in past the ceiling — silent capping would be a
+                // Liskov-substitution violation per ADR-040 §7 no-fallback
+                // mantra (H229 pins this).
                 //
                 // Gate sits BEFORE per-arch dispatch so the policy is
                 // arch-uniform: Gemma 4 / Qwen35 / Qwen3VL all surface
                 // the SAME typed error at the SAME `max_slots`
                 // threshold, regardless of which per-arch provisioner
                 // would have run.
-                let threshold = read_spec_decode_max_batched_slots(|name| {
+                let threshold = read_continuous_batching_max_slots(|name| {
                     std::env::var(name).ok()
                 });
                 let allow_oversized = read_spec_decode_allow_oversized(|name| {
@@ -5001,10 +5108,2146 @@ impl WorkerScheduler {
         }
     }
 
+    /// ADR-040 Phase F M1 (F1) — drive the scheduler one tick.
+    ///
+    /// This is the FIRST callsite of `Scheduler::step()` in the worker:
+    /// the Phase A–E scaffold built `InflightBatchedScheduler::step`
+    /// (scheduler.rs:1266) correctly — promote one queued slot, pick the
+    /// oldest `Prefilling` slot (FIFO), gather every `Decoding` handle —
+    /// but nothing ever called it (the SerialFifo drain at the
+    /// `blocking_recv` loop ran each request's whole generate loop
+    /// inline). `worker_run_slot_aware` calls this every tick to obtain
+    /// the next `SchedulerStep` (Idle / Prefill / Decode / Mixed). The
+    /// FIFO arm delegates to the trait `step()` too so the enum stays a
+    /// faithful pass-through; SerialFifo never reaches this method
+    /// because it runs the legacy inline drain.
+    fn step(&mut self) -> Result<SchedulerStep, StepError> {
+        match self {
+            Self::Fifo(s) => Scheduler::step(s),
+            Self::Inflight(s) => Scheduler::step(s),
+        }
+    }
+
     fn stats(&self) -> SchedulerStats {
         match self {
             Self::Fifo(s) => s.stats(),
             Self::Inflight(s) => s.stats(),
+        }
+    }
+}
+
+// ===========================================================================
+// ADR-040 Phase F M1 (F1) — scheduler-driven, admit-while-decoding worker
+// loop for `EngineMode::SlotAware`.
+//
+// The Phase A–E scaffold built the multi-seq KV substrate, the
+// `InflightBatchedScheduler` (with a correct batched `step()`), and the
+// per-arch slot-aware generate functions — but never DROVE the scheduler:
+// the worker drained one request at a time via `rx.blocking_recv()`,
+// running each request's whole generate loop inline (the 0.85× regression
+// root cause, §0.2). F1 replaces that, for SlotAware only, with a loop
+// that ADMITs up to `max_slots` concurrent requests and STEPs the
+// scheduler each tick, decoding every active slot per tick.
+//
+// STEP 1 (this iter) keeps the forward per-slot: `decode tick` loops the
+// handles and calls the EXISTING per-slot `forward_decode_slot_aware` /
+// `forward_gpu_*` once per handle (still time-sliced — no speedup, by
+// design). STEP 2 (F2) swaps that inner loop for one true `[N, hidden]`
+// batched forward. The seam is `decode_tick_*` below: F2 changes only how
+// the N handles' logits are produced, not the loop/eviction/reply
+// machinery here.
+//
+// Per-arch decode state + tick logic lives BESIDE each arch's serial
+// reference (gemma4 here in engine.rs; qwen35 in engine_qwen35.rs) so each
+// stays auditable against its `generate_*_once_slot_aware` reference. They
+// are deliberately NOT unified: the two arches compute reasoning-token
+// counts differently (gemma4 inline during decode; qwen35 post-hoc) and
+// handle first-token EOS differently (qwen35 pops + clears; gemma4 does
+// not) — unifying would silently change one arch's output.
+// ===========================================================================
+
+/// Where a slot's output goes: a unary oneshot (`Request::Generate`) or a
+/// streaming SSE channel (`Request::GenerateStream`).
+enum SlotReply {
+    /// `Request::Generate` — accumulate the full result, fire once at end.
+    Unary(oneshot::Sender<Result<GenerationResult>>),
+    /// `Request::GenerateStream` — emit a `GenerationEvent::Delta` per
+    /// token, a terminal `Done`/`Error` at end. `cancel` is bumped on
+    /// client disconnect (mirrors the per-arch streaming serial refs).
+    Stream {
+        events: mpsc::Sender<super::sse::GenerationEvent>,
+        cancel: Option<Arc<std::sync::atomic::AtomicU64>>,
+    },
+}
+
+/// What one per-arch `decode_tick_*` produced for one slot this tick.
+///
+/// The arch tick advances exactly one decode token (running the existing
+/// per-slot forward + the arch's sample/grammar/stop/EOS tail) and reports
+/// the freshly-decoded fragment plus whether the slot is now finished. The
+/// shared loop owns reply routing (unary accumulate vs stream `Delta`
+/// emit) and, on finish, calls the arch's `finish()` to assemble the
+/// arch-divergent `GenerationResult`. Keeping assembly in the arch
+/// preserves per-arch reasoning-token counting + `cached_tokens` exactly.
+struct TickOutcome {
+    /// Freshly-decoded text fragment for this token (empty when the
+    /// terminating token is suppressed, e.g. EOS or a stripped stop
+    /// string). Streamed as a `Delta` for stream slots.
+    fragment: String,
+    /// True when the fragment falls inside a reasoning span (streaming
+    /// `DeltaKind::Reasoning`). Always false for arches/requests without
+    /// reasoning markers.
+    is_reasoning: bool,
+    /// True once this slot has stopped generating (EOS / max_tokens /
+    /// stop-string / grammar-dead). The loop then assembles + fires the
+    /// reply and evicts the slot.
+    finished: bool,
+}
+
+// ---------------------------------------------------------------------------
+// gemma4 per-slot decode state + tick (F1 seam; mirrors
+// `generate_gemma4_once_slot_aware` engine.rs:8835 exactly).
+// ---------------------------------------------------------------------------
+
+/// Hoisted per-slot decode state for a Gemma 4 SlotAware request — the
+/// locals that live in the frame of `generate_gemma4_once_slot_aware`'s
+/// decode loop, lifted so N slots can interleave across ticks. Field
+/// semantics + ordering mirror that function's loop body verbatim so a
+/// single slot (N=1) is byte-identical to the serial reference.
+struct Gemma4DecodeState {
+    slot_id: SlotId,
+    prompt_len: usize,
+    max_decode_tokens: usize,
+    /// `Some` ⇒ slow sampling path (any non-greedy field set); `None` ⇒
+    /// greedy fast-path (reuse the forward's on-GPU argmax).
+    sampler_params: Option<sampler_pure::SamplingParams>,
+    grammar_runtime: Option<super::grammar::GrammarRuntime>,
+    /// Shared handle to `params.token_bytes` (the serial ref borrows via
+    /// `as_deref()`; the hoist holds the cheap `Arc` clone for the slot's
+    /// lifetime). `None` ⇒ no grammar byte-masking.
+    token_bytes: Option<Arc<Vec<Vec<u8>>>>,
+    tc_splitter: Option<super::registry::ToolCallSplitter>,
+    reasoning_splitter: Option<super::registry::ReasoningSplitter>,
+    reasoning_enabled: bool,
+    reasoning_token_count: usize,
+    want_logprobs: bool,
+    logprobs_acc: Option<Vec<f32>>,
+    logit_bias: std::collections::HashMap<u32, f32>,
+    stop_strings: Vec<String>,
+    /// The token to feed into the NEXT decode forward.
+    next_token: u32,
+    generated_tokens: Vec<u32>,
+    decoded_text: String,
+    finish_reason: &'static str,
+    prefill_duration: Duration,
+    decode_started: Instant,
+}
+
+impl Gemma4DecodeState {
+    /// Run prefill for one Gemma 4 slot and seed the decode state — mirror
+    /// of `generate_gemma4_once_slot_aware` engine.rs:8961-9156 (prefill +
+    /// sampler/grammar/logprob config + first-token derivation + first
+    /// fragment + early-EOS/stop check). On entry the caller has already
+    /// done the per-slot KV reset (loop owns reset discipline). Returns the
+    /// seeded state; if the first (prefill-emitted) token already
+    /// terminates the request, `finish_reason != "length"` and
+    /// `generated_tokens` is set accordingly so the loop fires the reply
+    /// immediately without a decode tick.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_seed(
+        loaded: &mut GemmaLoadedModel,
+        prompt_tokens: &[u32],
+        // Soft-token embedding overrides (multimodal vision path). The
+        // `Request::Generate` path passes `&[]` (identity over the
+        // text-only prefill); the `Request::GenerateWithSoftTokens` path
+        // passes the request's injections — this is the ONLY difference
+        // between the two seeds (the underlying primitive already takes
+        // soft_tokens), so they share this one fn.
+        soft_tokens: &[crate::serve::forward_prefill::SoftTokenInjection<'_>],
+        params: &SamplingParams,
+        registration: Option<&super::registry::ModelRegistration>,
+        slot_id: SlotId,
+        multi_seq_kv: &mut Vec<
+            crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
+        >,
+        mut multi_seq_kv_hybrid: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
+        >,
+        mut multi_seq_kv_dense: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>,
+        >,
+        mut multi_seq_kv_mlx: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
+        >,
+    ) -> Result<Self> {
+        let max_decode_tokens = params.max_tokens.max(1);
+
+        // Per-slot reset at ENTRY — mirror of the serial ref
+        // `generate_gemma4_once_slot_aware` (engine.rs:10386-10412). The
+        // persistent multi-seq KV may carry stale bytes from a prior
+        // request on this slot OR from spawn-time provisioning (the FIRST
+        // request to a slot has had no prior exit-reset). Resetting here is
+        // load-bearing for N=1 byte-equivalence: without it the first
+        // prefill reads provisioned garbage and diverges from SerialFifo.
+        // Resets HB + hybrid (production-default regime); dense/mlx are
+        // off-default and their forward paths defense-in-depth on absence.
+        for (layer_idx, buf) in multi_seq_kv.iter_mut().enumerate() {
+            buf.reset_for_slot(slot_id).map_err(|e| {
+                anyhow::anyhow!(
+                    "Gemma4DecodeState::prefill_seed: reset_for_slot at entry L{layer_idx}: {e}"
+                )
+            })?;
+        }
+        if let Some(hybrid) = multi_seq_kv_hybrid.as_deref_mut() {
+            for (layer_idx, buf) in hybrid.iter_mut().enumerate() {
+                buf.reset_for_slot(slot_id).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Gemma4DecodeState::prefill_seed: reset_for_slot at entry (hybrid) \
+                         L{layer_idx}: {e}"
+                    )
+                })?;
+            }
+        }
+
+        let prefill_started = Instant::now();
+        let first_decode_token = loaded
+            .weights
+            .forward_prefill_with_soft_tokens_slot_aware(
+                prompt_tokens,
+                soft_tokens,
+                max_decode_tokens,
+                &mut loaded.ctx,
+                slot_id,
+                multi_seq_kv,
+                multi_seq_kv_hybrid.as_deref_mut(),
+                multi_seq_kv_dense.as_deref_mut(),
+                multi_seq_kv_mlx.as_deref_mut(),
+            )?;
+        let prefill_duration = prefill_started.elapsed();
+        if std::env::var("HF2Q_PREFILL_TIMING").is_ok() {
+            eprintln!(
+                "[PREFILL_TIMING] slot {} — {} prompt tokens in {:.1} ms ({:.1} prompt tok/s) first_token={}",
+                slot_id.0, prompt_tokens.len(),
+                prefill_duration.as_secs_f64() * 1000.0,
+                prompt_tokens.len() as f64 / prefill_duration.as_secs_f64(),
+                first_decode_token,
+            );
+        }
+
+        // Sampler / grammar / logprobs config — mirror of serial ref
+        // engine.rs:9014-9067.
+        let sample_logits = params.temperature > 0.0
+            || params.top_k > 0
+            || params.top_p < 1.0
+            || params.repetition_penalty != 1.0
+            || !params.logit_bias.is_empty()
+            || params.grammar.is_some()
+            || params.logprobs;
+        let sampler_params = if sample_logits {
+            Some(sampler_pure::SamplingParams {
+                temperature: params.temperature as f64,
+                top_p: params.top_p as f64,
+                top_k: params.top_k,
+                min_p: 0.0,
+                repetition_penalty: params.repetition_penalty as f64,
+                max_tokens: params.max_tokens,
+            })
+        } else {
+            None
+        };
+        let mut grammar_runtime: Option<super::grammar::GrammarRuntime> =
+            match params.grammar.as_ref() {
+                Some(g) => {
+                    let start_rule_id = g
+                        .rule_id("root")
+                        .ok_or_else(|| anyhow::anyhow!("grammar has no root rule"))?;
+                    let mut rt = super::grammar::GrammarRuntime::new(g.clone(), start_rule_id)
+                        .ok_or_else(|| anyhow::anyhow!("grammar runtime init failed"))?;
+                    if matches!(params.grammar_kind, GrammarKind::ToolCallBodyAuto) {
+                        rt.set_awaiting_trigger(true);
+                    }
+                    Some(rt)
+                }
+                None => None,
+            };
+        let token_bytes: Option<Arc<Vec<Vec<u8>>>> = params.token_bytes.clone();
+        let mut tc_splitter: Option<super::registry::ToolCallSplitter> =
+            registration.and_then(super::registry::ToolCallSplitter::from_registration);
+        let want_logprobs = params.logprobs;
+        let mut logprobs_acc: Option<Vec<f32>> = if want_logprobs {
+            Some(Vec::with_capacity(params.max_tokens))
+        } else {
+            None
+        };
+
+        // First decode token — mirror of serial ref engine.rs:9074-9108.
+        let token_bytes_ref: Option<&[Vec<u8>]> =
+            token_bytes.as_deref().map(|v| &v[..]);
+        let mut next_token = if sample_logits {
+            let sp = sampler_params.as_ref().expect("sample_logits gate");
+            let mut logits: Vec<f32> = loaded.weights.logits_view()?.to_vec();
+            if !params.logit_bias.is_empty() {
+                let v = logits.len();
+                for (&id, &bias) in &params.logit_bias {
+                    let idx = id as usize;
+                    if idx < v {
+                        logits[idx] += bias;
+                    }
+                }
+            }
+            if let (Some(rt), Some(tb)) = (grammar_runtime.as_ref(), token_bytes_ref) {
+                super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+            }
+            let (tok, lp_opt) = if want_logprobs {
+                let (t, lp) = sampler_pure::sample_token_with_logprob(&mut logits, sp, &[]);
+                (t, Some(lp))
+            } else {
+                (sampler_pure::sample_token(&mut logits, sp, &[]), None)
+            };
+            if let (Some(acc), Some(lp_val)) = (logprobs_acc.as_mut(), lp_opt) {
+                acc.push(lp_val);
+            }
+            if let (Some(rt), Some(tb)) = (grammar_runtime.as_mut(), token_bytes_ref) {
+                let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+                if !bytes.is_empty() {
+                    rt.accept_bytes(bytes);
+                }
+            }
+            tok
+        } else {
+            first_decode_token
+        };
+
+        let mut reasoning_splitter = registration
+            .filter(|r| r.has_reasoning())
+            .and_then(super::registry::ReasoningSplitter::from_registration);
+        let reasoning_enabled = reasoning_splitter.is_some();
+        let mut reasoning_token_count: usize = 0;
+
+        let decode_started = Instant::now();
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_decode_tokens);
+        let mut decoded_text = String::new();
+
+        // First emitted token → text BEFORE EOS check (serial ref 9123-9145).
+        let first_fragment = loaded
+            .tokenizer
+            .decode(&[next_token], false)
+            .unwrap_or_default();
+        decoded_text.push_str(&first_fragment);
+        if let Some(sp) = reasoning_splitter.as_mut() {
+            let _ = sp.feed(&first_fragment);
+            if sp.in_reasoning() {
+                reasoning_token_count += 1;
+            }
+        }
+        if let Some(tcs) = tc_splitter.as_mut() {
+            let events = tcs.feed(&first_fragment);
+            if let Some(rt) = grammar_runtime.as_mut() {
+                if events
+                    .iter()
+                    .any(|e| matches!(e, super::registry::ToolCallEvent::ToolCallOpen))
+                {
+                    rt.trigger();
+                }
+            }
+        }
+
+        let mut finish_reason: &'static str = "length";
+        // Early EOS / stop on the prefill-emitted first token (serial ref
+        // 9151-9157). NOTE gemma4 does NOT pop the first token on EOS (it
+        // simply does not push it); divergent from qwen35 which pops+clears.
+        if loaded.eos_token_ids.contains(&next_token) {
+            finish_reason = "stop";
+        } else if hit_stop_string(&decoded_text, &params.stop_strings) {
+            finish_reason = "stop";
+            strip_trailing_stop(&mut decoded_text, &params.stop_strings);
+        } else {
+            generated_tokens.push(next_token);
+        }
+        // `next_token` stays as the first token; the first decode tick feeds
+        // it (pos = prompt_len + generated_tokens.len() - 1, serial ref 9159).
+        let _ = &mut next_token;
+
+        Ok(Gemma4DecodeState {
+            slot_id,
+            prompt_len: prompt_tokens.len(),
+            max_decode_tokens,
+            sampler_params,
+            grammar_runtime,
+            token_bytes,
+            tc_splitter,
+            reasoning_splitter,
+            reasoning_enabled,
+            reasoning_token_count,
+            want_logprobs,
+            logprobs_acc,
+            logit_bias: params.logit_bias.clone(),
+            stop_strings: params.stop_strings.clone(),
+            next_token,
+            generated_tokens,
+            decoded_text,
+            finish_reason,
+            prefill_duration,
+            decode_started,
+        })
+    }
+
+    /// Whether the slot already terminated during prefill-seed (first token
+    /// was EOS/stop), so the loop should skip decode ticks and finish now.
+    fn finished_at_seed(&self) -> bool {
+        self.finish_reason != "length"
+    }
+
+    /// Advance this slot by exactly one decode token — mirror of the serial
+    /// ref's per-token loop body engine.rs:9158-9270 for ONE iteration.
+    /// STEP 1: calls the existing per-slot `forward_decode_slot_aware`.
+    /// STEP 2 (F2) replaces the caller's per-handle loop with one batched
+    /// forward; this body's sample/grammar/stop/EOS tail is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_tick(
+        &mut self,
+        loaded: &mut GemmaLoadedModel,
+        multi_seq_kv: &mut Vec<
+            crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
+        >,
+        mut multi_seq_kv_hybrid: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
+        >,
+        mut multi_seq_kv_dense: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>,
+        >,
+        mut multi_seq_kv_mlx: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
+        >,
+    ) -> Result<TickOutcome> {
+        // KV write cursor for the token being fed (serial ref 9159).
+        let pos = self.prompt_len + self.generated_tokens.len() - 1;
+        let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+        let greedy_token = loaded.weights.forward_decode_slot_aware(
+            self.next_token,
+            pos,
+            &mut loaded.ctx,
+            &mut p,
+            self.slot_id,
+            multi_seq_kv,
+            multi_seq_kv_hybrid.as_deref_mut(),
+            multi_seq_kv_dense.as_deref_mut(),
+            multi_seq_kv_mlx.as_deref_mut(),
+        )?;
+
+        // ADR-040 S1c-2: the post-forward half (sample/grammar/stop/accumulate)
+        // is `decode_tick_finalize`, shared with the batched-head path. Read the
+        // slot's logits only when sampling (greedy reuses `greedy_token`).
+        let logits: Vec<f32> = if self.sampler_params.is_some() {
+            loaded.weights.logits_view()?.to_vec()
+        } else {
+            Vec::new()
+        };
+        self.decode_tick_finalize(loaded, greedy_token, &logits)
+    }
+
+    /// ADR-040 S1c-2 — post-forward half of [`Self::decode_tick`]: token
+    /// selection (greedy → `greedy_token`; sampler → `logits_row` + grammar mask)
+    /// then EOS / stop-string / grammar-dead / max_tokens bookkeeping. Shared by
+    /// the full per-slot path (logits from `logits_view`) and the batched-head
+    /// path in `decode_batch_gemma4` (logits from `lm_head_batched`, greedy from
+    /// `finalize_token_from_logits`). Bit-identical token selection either way.
+    fn decode_tick_finalize(
+        &mut self,
+        loaded: &mut GemmaLoadedModel,
+        greedy_token: u32,
+        logits_row: &[f32],
+    ) -> Result<TickOutcome> {
+        let token_bytes_ref: Option<&[Vec<u8>]> =
+            self.token_bytes.as_deref().map(|v| &v[..]);
+        self.next_token = if let Some(sp) = self.sampler_params.as_ref() {
+            let mut logits: Vec<f32> = logits_row.to_vec();
+            if !self.logit_bias.is_empty() {
+                let v = logits.len();
+                for (&id, &bias) in &self.logit_bias {
+                    let idx = id as usize;
+                    if idx < v {
+                        logits[idx] += bias;
+                    }
+                }
+            }
+            if let (Some(rt), Some(tb)) = (self.grammar_runtime.as_ref(), token_bytes_ref) {
+                super::grammar::mask::mask_invalid_tokens(rt, tb, &mut logits);
+            }
+            let (tok, lp_opt) = if self.want_logprobs {
+                let (t, lp) = sampler_pure::sample_token_with_logprob(
+                    &mut logits,
+                    sp,
+                    &self.generated_tokens,
+                );
+                (t, Some(lp))
+            } else {
+                (
+                    sampler_pure::sample_token(&mut logits, sp, &self.generated_tokens),
+                    None,
+                )
+            };
+            if let (Some(acc), Some(lp_val)) = (self.logprobs_acc.as_mut(), lp_opt) {
+                acc.push(lp_val);
+            }
+            if let (Some(rt), Some(tb)) = (self.grammar_runtime.as_mut(), token_bytes_ref) {
+                let bytes = tb.get(tok as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+                if !bytes.is_empty() {
+                    rt.accept_bytes(bytes);
+                }
+            }
+            tok
+        } else {
+            greedy_token
+        };
+
+        // EOS before push/decode (serial ref 9228-9231): suppress the token.
+        if loaded.eos_token_ids.contains(&self.next_token) {
+            self.finish_reason = "stop";
+            return Ok(TickOutcome { fragment: String::new(), is_reasoning: false, finished: true });
+        }
+        self.generated_tokens.push(self.next_token);
+        let fragment = loaded
+            .tokenizer
+            .decode(&[self.next_token], false)
+            .unwrap_or_default();
+        self.decoded_text.push_str(&fragment);
+        let mut is_reasoning = false;
+        if let Some(sp) = self.reasoning_splitter.as_mut() {
+            let _ = sp.feed(&fragment);
+            if sp.in_reasoning() {
+                self.reasoning_token_count += 1;
+                is_reasoning = true;
+            }
+        }
+        if let Some(tcs) = self.tc_splitter.as_mut() {
+            let events = tcs.feed(&fragment);
+            if let Some(rt) = self.grammar_runtime.as_mut() {
+                if events
+                    .iter()
+                    .any(|e| matches!(e, super::registry::ToolCallEvent::ToolCallOpen))
+                {
+                    rt.trigger();
+                }
+            }
+        }
+        // stop-string (serial ref 9254-9258): the matched suffix is stripped
+        // from decoded_text; the just-emitted fragment is still surfaced (the
+        // serial ref pushes it before the stop check, identical here).
+        if hit_stop_string(&self.decoded_text, &self.stop_strings) {
+            self.finish_reason = "stop";
+            strip_trailing_stop(&mut self.decoded_text, &self.stop_strings);
+            return Ok(TickOutcome { fragment, is_reasoning, finished: true });
+        }
+        // grammar-dead (serial ref 9262-9270): pop the offending token + re-
+        // decode the surviving prefix. The popped token was already emitted
+        // as a fragment to a stream client (matches serial ref: the serial
+        // ref also fed it to splitters before this check; streaming serial
+        // ref behavior is the reference).
+        if self.grammar_runtime.as_ref().is_some_and(|rt| rt.is_dead()) {
+            self.finish_reason = "stop";
+            self.generated_tokens.pop();
+            self.decoded_text = loaded
+                .tokenizer
+                .decode(&self.generated_tokens, false)
+                .unwrap_or_default();
+            return Ok(TickOutcome { fragment, is_reasoning, finished: true });
+        }
+        // max_tokens: the scheduler auto-releases at max_tokens, but the
+        // generate loop bound is `1..max_decode_tokens` (serial ref 9158).
+        // generated_tokens started at 1 (the prefill token); we have emitted
+        // `generated_tokens.len()` tokens total. Finish when we reach the
+        // bound so finish_reason stays "length".
+        let finished = self.generated_tokens.len() >= self.max_decode_tokens;
+        Ok(TickOutcome { fragment, is_reasoning, finished })
+    }
+
+    /// ADR-040 S1c-2 — body-capture half of [`Self::decode_tick`]: runs the
+    /// slot-aware BODY-ONLY decode (same slot-KV isolation as the full path) and
+    /// returns this slot's final hidden row `[hidden_size]` (from
+    /// `self.activations.hidden`). `decode_batch_gemma4` gathers N slots' rows,
+    /// runs ONE `lm_head_batched`, then completes each tick via
+    /// [`Self::decode_tick_finalize`]. The hidden must be read here, before the
+    /// next slot's capture overwrites the shared `self.activations.hidden`.
+    fn decode_tick_capture(
+        &mut self,
+        loaded: &mut GemmaLoadedModel,
+        multi_seq_kv: &mut Vec<
+            crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers,
+        >,
+        mut multi_seq_kv_hybrid: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>,
+        >,
+        mut multi_seq_kv_dense: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>,
+        >,
+        mut multi_seq_kv_mlx: Option<
+            &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>,
+        >,
+    ) -> Result<Vec<f32>> {
+        let pos = self.prompt_len + self.generated_tokens.len() - 1;
+        let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+        loaded.weights.forward_decode_slot_aware_capture_hidden(
+            self.next_token,
+            pos,
+            &mut loaded.ctx,
+            &mut p,
+            self.slot_id,
+            multi_seq_kv,
+            multi_seq_kv_hybrid.as_deref_mut(),
+            multi_seq_kv_dense.as_deref_mut(),
+            multi_seq_kv_mlx.as_deref_mut(),
+        )?;
+        let hs = loaded.weights.hidden_size;
+        let hidden: Vec<f32> = loaded
+            .weights
+            .activations
+            .hidden
+            .as_slice::<f32>()
+            .map_err(|e| anyhow::anyhow!("decode_tick_capture read hidden: {e}"))?
+            .get(..hs)
+            .ok_or_else(|| anyhow::anyhow!("decode_tick_capture: hidden buffer < hidden_size"))?
+            .to_vec();
+        Ok(hidden)
+    }
+
+    /// Assemble the `GenerationResult` at end-of-decode — mirror of serial
+    /// ref engine.rs:9277-9299.
+    fn finish(self, registration: Option<&super::registry::ModelRegistration>) -> GenerationResult {
+        let (content, reasoning_text) = match registration {
+            Some(reg) if reg.has_reasoning() => {
+                super::registry::split_full_output(reg, &self.decoded_text)
+            }
+            _ => (self.decoded_text, None),
+        };
+        let decode_duration = self.decode_started.elapsed();
+        GenerationResult {
+            text: content,
+            reasoning_text,
+            prompt_tokens: self.prompt_len,
+            completion_tokens: self.generated_tokens.len(),
+            reasoning_tokens: if self.reasoning_enabled && self.reasoning_token_count > 0 {
+                Some(self.reasoning_token_count)
+            } else {
+                None
+            },
+            finish_reason: self.finish_reason,
+            prefill_duration: self.prefill_duration,
+            decode_duration,
+            cached_tokens: 0,
+            logprobs: self.logprobs_acc,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The SlotAware worker loop (F1).
+// ---------------------------------------------------------------------------
+
+/// ADR-040 Phase F M1 (F1) — the scheduler-driven, admit-while-decoding
+/// worker loop for `EngineMode::SlotAware`. Dispatches on the loaded arch
+/// (one model per worker) into a per-arch loop that takes the persistent
+/// multi-seq KV out of the model ONCE, runs the admit/step/decode/evict
+/// cycle, and restores the KV on every exit path via a scope guard.
+#[allow(clippy::too_many_arguments)]
+fn worker_run_slot_aware(
+    loaded: LoadedModel,
+    rx: mpsc::Receiver<Request>,
+    registration: Option<super::registry::ModelRegistration>,
+    max_slots: u32,
+    queue_capacity: u32,
+    scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+) {
+    let scheduler = InflightBatchedScheduler::new_with_kv_budget(
+        queue_capacity,
+        max_slots,
+        per_slot_kv_budget_bytes,
+    );
+    match loaded {
+        LoadedModel::Gemma(g) => run_slot_aware_gemma4(
+            g,
+            rx,
+            registration,
+            scheduler,
+            scheduler_stats_snapshot,
+            per_slot_kv_budget_bytes,
+            kv_bytes_per_token,
+        ),
+        LoadedModel::Qwen35(q) => run_slot_aware_qwen35(
+            q,
+            rx,
+            registration,
+            scheduler,
+            scheduler_stats_snapshot,
+            per_slot_kv_budget_bytes,
+            kv_bytes_per_token,
+        ),
+        // Qwen3-VL text-LM has no slot-aware decode path in M1 scope
+        // (ADR-040 §0.5 targets are gemma4 + qwen35moe). Preserve the
+        // existing SlotId(N>0) → HTTP 501 behavior: every Generate /
+        // GenerateStream is answered with the same typed
+        // `capability_unsupported` surface the SerialFifo arm emits at
+        // SlotId(N>0), so the operator-facing contract is unchanged.
+        LoadedModel::Qwen3VlText(_) => {
+            run_slot_aware_qwen3vl_unsupported(rx);
+        }
+    }
+}
+
+/// Per-token reply routing shared by both arches: a unary slot accumulates;
+/// a stream slot emits a `Delta`. Returns `true` if a stream client has
+/// disconnected (the loop then evicts the slot + bumps the cancel counter).
+fn slot_emit_token(reply: &SlotReply, tick: &TickOutcome) -> bool {
+    match reply {
+        SlotReply::Unary(_) => false,
+        SlotReply::Stream { events, cancel } => {
+            if tick.fragment.is_empty() {
+                return false;
+            }
+            let kind = if tick.is_reasoning {
+                super::sse::DeltaKind::Reasoning
+            } else {
+                super::sse::DeltaKind::Content
+            };
+            if events
+                .blocking_send(super::sse::GenerationEvent::Delta { kind, text: tick.fragment.clone() })
+                .is_err()
+            {
+                tracing::info!("SSE stream dropped by client; evicting slot mid-decode");
+                if let Some(c) = cancel {
+                    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return true;
+            }
+            false
+        }
+    }
+}
+
+/// Fire a slot's terminal reply: unary sends the assembled
+/// `GenerationResult` over its oneshot; stream sends a `Done` event (unless
+/// the client already dropped). `gr` carries the final counts/finish_reason.
+fn slot_fire_done(reply: SlotReply, gr: Result<GenerationResult>, client_dropped: bool) {
+    match reply {
+        SlotReply::Unary(tx) => {
+            let _ = tx.send(gr);
+        }
+        SlotReply::Stream { events, .. } => {
+            if client_dropped {
+                return;
+            }
+            match gr {
+                Ok(r) => {
+                    let _ = events.blocking_send(super::sse::GenerationEvent::Done {
+                        finish_reason: r.finish_reason,
+                        prompt_tokens: r.prompt_tokens,
+                        completion_tokens: r.completion_tokens,
+                        stats: super::sse::StreamStats::default(),
+                    });
+                }
+                Err(e) => {
+                    let _ = events
+                        .blocking_send(super::sse::GenerationEvent::Error(format!("{e:#}")));
+                }
+            }
+        }
+    }
+}
+
+/// Drain loop for the Qwen3-VL text arch under SlotAware: it has no
+/// slot-aware decode path in M1, so every generate request gets the same
+/// typed 501 surface the SerialFifo path emits at SlotId(N>0). No KV is
+/// taken out (the Qwen3-VL multi-seq scaffold is untouched).
+fn run_slot_aware_qwen3vl_unsupported(mut rx: mpsc::Receiver<Request>) {
+    while let Some(req) = rx.blocking_recv() {
+        match req {
+            Request::Generate { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL text-LM \
+                     has no SlotAware batched-decode path (M1 targets are gemma4 + \
+                     qwen35moe per ADR-040 §0.5). Use --scheduler serial-fifo for \
+                     this model."
+                )));
+            }
+            Request::GenerateStream { events, .. } => {
+                let _ = events.blocking_send(super::sse::GenerationEvent::Error(
+                    "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL text-LM \
+                     has no SlotAware batched-decode path (M1 targets are gemma4 + \
+                     qwen35moe per ADR-040 §0.5). Use --scheduler serial-fifo for \
+                     this model."
+                        .to_string(),
+                ));
+            }
+            Request::Warmup { reply } => {
+                let _ = reply.send(Ok(()));
+            }
+            Request::Embed { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL Embed \
+                     under SlotAware not wired; use serial-fifo."
+                )));
+            }
+            Request::GenerateWithSoftTokens { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "capability_unsupported: ADR-040 Phase F M1 — Qwen3-VL \
+                     GenerateWithSoftTokens under SlotAware not wired; use serial-fifo."
+                )));
+            }
+            Request::Shutdown => break,
+            // Snapshot/restore worker requests are SerialFifo-only control
+            // messages; under SlotAware they are not issued. Ignore.
+            _ => {}
+        }
+    }
+}
+
+/// Scope guard that holds the Gemma 4 persistent multi-seq KV taken out of
+/// the model for the lifetime of the SlotAware loop and restores it on
+/// EVERY exit path (normal return, `?`-error, panic unwind) via `Drop`
+/// (ADR-040 Phase F M1 lead requirement — NOT per-request take/restore, no
+/// `Rc<RefCell>`). The model field stays `None` only while the loop runs;
+/// the worker is the sole, serial owner so there is no concurrent access.
+struct Gemma4KvGuard<'a> {
+    model: &'a mut GemmaLoadedModel,
+    kv: Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
+    hybrid: Option<Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>>,
+    dense: Option<Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>>,
+    mlx: Option<Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>>,
+}
+
+impl<'a> Gemma4KvGuard<'a> {
+    /// Take the persistent multi-seq KV (+ Option siblings) out of the
+    /// model. Errors if the primary `multi_seq_kv` is absent (the C2c
+    /// spawn-arm invariant guarantees it is `Some` for SlotAware Gemma 4).
+    fn take(model: &'a mut GemmaLoadedModel) -> Result<Self> {
+        let kv = model.multi_seq_kv.take().ok_or_else(|| {
+            anyhow::anyhow!(
+                "capability_unsupported: ADR-040 Phase F M1 — multi_seq_kv is None \
+                 for Gemma 4 SlotAware loop entry. C2c spawn-arm invariant violated \
+                 (provision_multi_seq_kv_for_slot_aware not called at SlotAware spawn)."
+            )
+        })?;
+        let hybrid = model.multi_seq_kv_hybrid.take();
+        let dense = model.multi_seq_kv_dense.take();
+        let mlx = model.multi_seq_kv_mlx.take();
+        Ok(Self { model, kv, hybrid, dense, mlx })
+    }
+}
+
+impl Drop for Gemma4KvGuard<'_> {
+    fn drop(&mut self) {
+        // Restore the taken buffers so the model's spawn-time invariant
+        // (`multi_seq_kv.is_some()` for SlotAware Gemma 4) holds for any
+        // future use of `loaded`. `std::mem::take` leaves empty/None in the
+        // guard fields; the model fields are overwritten wholesale.
+        self.model.multi_seq_kv = Some(std::mem::take(&mut self.kv));
+        self.model.multi_seq_kv_hybrid = self.hybrid.take();
+        self.model.multi_seq_kv_dense = self.dense.take();
+        self.model.multi_seq_kv_mlx = self.mlx.take();
+    }
+}
+
+/// Type alias for one installed Gemma 4 slot: its decode state, where its
+/// output goes, and its scheduler handle (for `advance_after_decode` /
+/// `release`).
+type Gemma4Slot = (Gemma4DecodeState, SlotReply, SlotHandle);
+
+/// ADR-040 Phase F M1 (F1) — Gemma 4 SlotAware admit-while-decoding loop.
+///
+/// One worker thread, up to `max_slots` concurrent requests. Each tick:
+/// ADMIT new requests into free slots (running their prefill now), STEP the
+/// scheduler, then DECODE every active slot once (STEP 1: per-slot forward
+/// in a loop — no batched forward yet). A slot that finishes (EOS /
+/// max_tokens / stop / grammar-dead / client-drop) fires its reply and is
+/// evicted mid-batch without stalling peers; the freed slot refills on the
+/// next admit. N=1 is byte-identical to `generate_gemma4_once_slot_aware`.
+#[allow(clippy::too_many_arguments)]
+fn run_slot_aware_gemma4(
+    mut model: GemmaLoadedModel,
+    mut rx: mpsc::Receiver<Request>,
+    registration: Option<super::registry::ModelRegistration>,
+    mut scheduler: InflightBatchedScheduler,
+    scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+) {
+    let mut guard = match Gemma4KvGuard::take(&mut model) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!("Gemma4 SlotAware loop cannot start: {e:#}");
+            // Drain with a typed error so callers do not hang.
+            drain_with_startup_error(rx, "Gemma 4 multi_seq_kv absent at SlotAware entry");
+            return;
+        }
+    };
+    let n_slots = guard.kv.first().map(|b| b.n_seqs).unwrap_or(0) as usize;
+    let mut slots: Vec<Option<Gemma4Slot>> = (0..n_slots).map(|_| None).collect();
+
+    let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
+        if let Ok(mut g) = snap.lock() {
+            *g = sched.stats();
+        }
+    };
+
+    // A request pulled off `rx` that still needs admitting (set when the
+    // loop parked on Idle and blocked for one request).
+    let mut pending: Option<Request> = None;
+
+    'worker: loop {
+        // ── ADMIT ────────────────────────────────────────────────────
+        // Fill free slots without blocking. The first iteration may carry
+        // a `pending` request that unparked us.
+        loop {
+            let free = slots.iter().position(|s| s.is_none());
+            let Some(free_idx) = free else { break };
+            let _ = free_idx;
+            let req = match pending.take() {
+                Some(r) => r,
+                None => match rx.try_recv() {
+                    Ok(r) => r,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
+                },
+            };
+            match req {
+                Request::Generate { prompt_tokens, params, reply } => {
+                    admit_gemma4_slot(
+                        &mut guard,
+                        &mut scheduler,
+                        &mut slots,
+                        registration.as_ref(),
+                        &scheduler_stats_snapshot,
+                        per_slot_kv_budget_bytes,
+                        kv_bytes_per_token,
+                        prompt_tokens,
+                        Vec::new(),
+                        params,
+                        SlotReply::Unary(reply),
+                    );
+                    publish(&scheduler, &scheduler_stats_snapshot);
+                }
+                Request::GenerateStream {
+                    prompt_tokens,
+                    params,
+                    events,
+                    cancellation_counter,
+                    ..
+                } => {
+                    admit_gemma4_slot(
+                        &mut guard,
+                        &mut scheduler,
+                        &mut slots,
+                        registration.as_ref(),
+                        &scheduler_stats_snapshot,
+                        per_slot_kv_budget_bytes,
+                        kv_bytes_per_token,
+                        prompt_tokens,
+                        Vec::new(),
+                        params,
+                        SlotReply::Stream { events, cancel: cancellation_counter },
+                    );
+                    publish(&scheduler, &scheduler_stats_snapshot);
+                }
+                // GenerateWithSoftTokens (multimodal vision generation) IS
+                // served at SlotId>0 by the legacy inflight arm today
+                // (generate_gemma4_once_with_soft_tokens_slot_aware,
+                // engine.rs:8231), so 501-ing it would be a regression. It
+                // is a generation → it joins the batched decode loop exactly
+                // like Generate, the only difference being the soft-token
+                // injections threaded into the prefill seed. (deepstack /
+                // positions_flat are Qwen3-VL-only; Gemma 4 ignores them,
+                // matching the legacy arm at engine.rs:8219-8229.)
+                Request::GenerateWithSoftTokens {
+                    prompt_tokens,
+                    soft_tokens,
+                    params,
+                    reply,
+                    ..
+                } => {
+                    admit_gemma4_slot(
+                        &mut guard,
+                        &mut scheduler,
+                        &mut slots,
+                        registration.as_ref(),
+                        &scheduler_stats_snapshot,
+                        per_slot_kv_budget_bytes,
+                        kv_bytes_per_token,
+                        prompt_tokens,
+                        soft_tokens,
+                        params,
+                        SlotReply::Unary(reply),
+                    );
+                    publish(&scheduler, &scheduler_stats_snapshot);
+                }
+                Request::Warmup { reply } => {
+                    let _ = reply.send(warmup_once(&mut guard.model));
+                }
+                Request::Shutdown => {
+                    tracing::info!("Gemma4 SlotAware worker received Shutdown; exiting");
+                    break 'worker;
+                }
+                // Embed (pooled last-token embedding) IS served at SlotId>0
+                // by the legacy inflight arm today (embed_gemma4_slot_aware,
+                // engine.rs:7839), so 501-ing it would be a regression. It is
+                // a one-shot (no decode loop) → run it inline in the admit
+                // path (like Warmup): reserve a slot, run the slot-aware
+                // embed, release.
+                Request::Embed { prompt_tokens, reply } => {
+                    embed_gemma4_inline(
+                        &mut guard,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        per_slot_kv_budget_bytes,
+                        kv_bytes_per_token,
+                        prompt_tokens,
+                        reply,
+                    );
+                    publish(&scheduler, &scheduler_stats_snapshot);
+                }
+                _ => {}
+            }
+        }
+
+        // ── STEP ─────────────────────────────────────────────────────
+        let step = match scheduler.step() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Gemma4 SlotAware scheduler.step() failed: {e:?}");
+                break 'worker;
+            }
+        };
+        match step {
+            SchedulerStep::Idle => {
+                // No work. Park until a request arrives, then re-loop to
+                // admit it. Disconnect ends the worker.
+                match rx.blocking_recv() {
+                    Some(r) => pending = Some(r),
+                    None => break 'worker,
+                }
+            }
+            SchedulerStep::Prefill { .. } => {
+                // Prefill is run eagerly at admit time (prefill_seed), so the
+                // scheduler's Prefilling phase is advanced immediately there.
+                // Reaching here means a slot is still Prefilling in the
+                // scheduler's view but has no pending forward work — advance
+                // is handled in admit. Nothing to do this tick.
+            }
+            SchedulerStep::Decode { handles } => {
+                decode_batch_gemma4(
+                    &mut guard,
+                    &mut scheduler,
+                    &mut slots,
+                    registration.as_ref(),
+                    &handles,
+                );
+                publish(&scheduler, &scheduler_stats_snapshot);
+            }
+            SchedulerStep::Mixed { decode_handles, .. } => {
+                // Prefill already ran at admit; the just-admitted slot is
+                // Prefilling and excluded from `decode_handles`
+                // (collect_decoding_handles skips Prefilling). Decode the
+                // rest this tick.
+                decode_batch_gemma4(
+                    &mut guard,
+                    &mut scheduler,
+                    &mut slots,
+                    registration.as_ref(),
+                    &decode_handles,
+                );
+                publish(&scheduler, &scheduler_stats_snapshot);
+            }
+        }
+    }
+
+    // Guard drops here → KV restored into `model` on every exit path.
+    drop(guard);
+    tracing::info!("Gemma4 SlotAware worker thread exited");
+}
+
+/// Admit one Gemma 4 request: reserve a scheduler slot, run prefill now
+/// (`Gemma4DecodeState::prefill_seed`), and either fire immediately (first
+/// token already terminal) or install the slot for decode ticks.
+#[allow(clippy::too_many_arguments)]
+fn admit_gemma4_slot(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Gemma4Slot>],
+    registration: Option<&super::registry::ModelRegistration>,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+    prompt_tokens: Vec<u32>,
+    // Owned soft-token injections (empty for plain Generate/GenerateStream;
+    // the request's vision embeddings for GenerateWithSoftTokens). Borrowed
+    // into `SoftTokenInjection` slices for the prefill below.
+    soft_token_data: Vec<SoftTokenData>,
+    params: SamplingParams,
+    reply: SlotReply,
+) {
+    // Build borrowed injection slices from the owned data — same shape as
+    // the legacy SoftTokens arm (engine.rs:8212-8218). Empty ⇒ identity
+    // over the text-only prefill (Generate path).
+    let soft_tokens: Vec<crate::serve::forward_prefill::SoftTokenInjection<'_>> = soft_token_data
+        .iter()
+        .map(|d| crate::serve::forward_prefill::SoftTokenInjection {
+            range: d.range.clone(),
+            embeddings: &d.embeddings,
+        })
+        .collect();
+    let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
+        0
+    } else {
+        u64::from(prompt_tokens.len() as u32)
+            .saturating_add(u64::from(params.max_tokens as u32))
+            .saturating_mul(kv_bytes_per_token)
+    };
+    let admit_req = AdmitRequest {
+        prompt_tokens: prompt_tokens.len() as u32,
+        max_tokens: params.max_tokens as u32,
+        kv_bytes_needed: needed_bytes,
+    };
+    let admitted = match scheduler.admit(admit_req) {
+        Ok(slot) => slot,
+        Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+            let gr = Err(anyhow::anyhow!(
+                "slot_budget_exceeded: ADR-040 Phase F M1 — per-slot KV budget exceeded \
+                 (needed_bytes={needed_bytes}, budget_bytes={budget_bytes}). Reduce \
+                 max_tokens or use a shorter prompt."
+            ));
+            slot_fire_done(reply, gr, false);
+            return;
+        }
+        Err(e) => {
+            let gr = Err(anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {e:?}"));
+            slot_fire_done(reply, gr, false);
+            return;
+        }
+    };
+    let Some(handle) = admitted.handle else {
+        // `handle: None` == the scheduler's CompletedAtAdmit outcome
+        // (`max_tokens == 0`): no physical slot allocated, no scheduler
+        // bookkeeping. Mirror the SerialFifo arm's fallback EXACTLY
+        // (engine.rs `else` of `if let Some(handle) = admitted.handle`):
+        // run the legacy NON-slot-aware generate (which applies
+        // `max_tokens.max(1)` → one decode token) and fire. With soft
+        // tokens present, the soft-token sibling is used. Preserves
+        // byte-equivalence for the degenerate `max_tokens == 0` request.
+        let gr = if soft_tokens.is_empty() {
+            generate_once(guard.model, &prompt_tokens, &params, registration)
+        } else {
+            generate_once_with_soft_tokens(
+                guard.model,
+                &prompt_tokens,
+                &soft_tokens,
+                &params,
+                registration,
+            )
+        };
+        slot_fire_done(reply, gr, false);
+        return;
+    };
+
+    // Restore the per-prefill self-mount fresh state (None) before this
+    // slot's prefill, so a prior slot's leftover slice-view does not poison
+    // this slot's consume-gate (forward_prefill.rs:699/2344; precedent at
+    // forward_embed_last :2459). Load-bearing for N>1 concurrency.
+    clear_gemma4_self_mounts(guard.model);
+
+    let seed = Gemma4DecodeState::prefill_seed(
+        guard.model,
+        &prompt_tokens,
+        &soft_tokens,
+        &params,
+        registration,
+        handle.slot_id,
+        &mut guard.kv,
+        guard.hybrid.as_mut(),
+        guard.dense.as_mut(),
+        guard.mlx.as_mut(),
+    );
+    let state = match seed {
+        Ok(s) => s,
+        Err(e) => {
+            // Prefill failed: reset the slot's KV, release, fire error.
+            reset_gemma4_slot(guard, handle.slot_id);
+            scheduler.release(handle);
+            if let Ok(mut g) = scheduler_stats_snapshot.lock() {
+                *g = scheduler.stats();
+            }
+            slot_fire_done(reply, Err(e), false);
+            return;
+        }
+    };
+
+    // ADR-040 Phase F `iter-F-prefill-determinism` (2026-06-24) — clear the
+    // per-prefill self-mounts AGAIN, now AFTER prefill_seed, to enforce the
+    // postcondition "the SlotAware worker leaves `self.{dense,hybrid,leg_hb}_kv`
+    // == None between requests". The slot-aware prefill mounts a per-slot
+    // slice-view on these shared fields and (in the current forward) restores
+    // the PRIOR value on exit; the per-slot decode uses a save-mount-RESTORE
+    // scope-guard. When a NEW request is admitted mid-stream (the prefilled K/V
+    // already lands durably in the per-slot `multi_seq_kv_hybrid` scaffold, so
+    // this is data-lossless), any prefill-origin mount that survives on `self.*`
+    // gets RESTORED by the next in-flight slot's decode and then poisons the
+    // following prefill's `if self.hybrid_kv.is_none()` write-back gate
+    // (forward_prefill.rs:970) — corrupting the earliest in-flight request
+    // (root-caused via `slot_aware_staggered_eviction`: ~17% gross corruption of
+    // the first slot, codex-confirmed). Mirrors the pre-prefill clear above.
+    clear_gemma4_self_mounts(guard.model);
+
+    // Prefill consumed the whole prompt in one shot → advance the
+    // scheduler's Prefilling phase to Decoding immediately.
+    scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+
+    if state.finished_at_seed() {
+        // First (prefill-emitted) token already terminated. Emit the decoded
+        // first-token text (stream) then fire the terminal reply; no decode
+        // tick. For gemma4, on first-token EOS the token is NOT pushed but
+        // its text WAS appended (serial ref 9151-9155 only strips on stop-
+        // string); emit whatever decoded_text holds.
+        let seed_tick = TickOutcome {
+            fragment: state.decoded_text.clone(),
+            is_reasoning: false,
+            finished: true,
+        };
+        let dropped = slot_emit_token(&reply, &seed_tick);
+        scheduler.advance_after_decode(handle);
+        reset_gemma4_slot(guard, handle.slot_id);
+        scheduler.release(handle);
+        let gr = Ok(state.finish(registration));
+        slot_fire_done(reply, gr, dropped);
+        return;
+    }
+
+    let slot_idx = handle.slot_id.0 as usize;
+    slots[slot_idx] = Some((state, reply, handle));
+}
+
+/// One-shot Gemma 4 pooled-embedding request under SlotAware (`Request::Embed`).
+/// Embed has no decode loop, so it runs inline in the admit path (like
+/// Warmup): reserve a scheduler slot for its KV, run the slot-aware embed at
+/// that slot_id, then advance+release. Mirrors the legacy inflight Embed arm
+/// (engine.rs:7839) — keeping the served-today capability, not 501-ing it.
+#[allow(clippy::too_many_arguments)]
+fn embed_gemma4_inline(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+    prompt_tokens: Vec<u32>,
+    reply: oneshot::Sender<Result<Vec<f32>>>,
+) {
+    // Embed has no decode budget; size the KV admit as prompt-only.
+    let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
+        0
+    } else {
+        u64::from(prompt_tokens.len() as u32).saturating_mul(kv_bytes_per_token)
+    };
+    let admit_req = AdmitRequest {
+        prompt_tokens: prompt_tokens.len() as u32,
+        max_tokens: 1, // ≥1 so the scheduler allocates a physical slot
+                       // (max_tokens==0 → CompletedAtAdmit/no handle).
+        kv_bytes_needed: needed_bytes,
+    };
+    let admitted = match scheduler.admit(admit_req) {
+        Ok(slot) => slot,
+        Err(e) => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "ADR-040 Phase F M1 Embed admit failed: {e:?}"
+            )));
+            return;
+        }
+    };
+    let Some(handle) = admitted.handle else {
+        // No physical slot (shouldn't happen at max_tokens=1 with a free
+        // slot). Fall back to the legacy single-seq embed at SlotId(0).
+        let r = guard
+            .model
+            .weights
+            .forward_embed_last(&prompt_tokens, &mut guard.model.ctx);
+        let _ = reply.send(r);
+        return;
+    };
+    clear_gemma4_self_mounts(guard.model);
+    let result = embed_gemma4_slot_aware(
+        guard.model,
+        &prompt_tokens,
+        &mut guard.kv,
+        guard.hybrid.as_mut(),
+        guard.dense.as_mut(),
+        guard.mlx.as_mut(),
+        handle.slot_id,
+    );
+    scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+    reset_gemma4_slot(guard, handle.slot_id);
+    scheduler.release(handle);
+    if let Ok(mut g) = scheduler_stats_snapshot.lock() {
+        *g = scheduler.stats();
+    }
+    let _ = reply.send(result);
+}
+
+/// Decode every active Gemma 4 slot in `handles` once (STEP 1: per-slot
+/// forward in a loop). A slot that finishes this tick fires its reply and
+/// is evicted; peers are untouched.
+fn decode_batch_gemma4(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Gemma4Slot>],
+    registration: Option<&super::registry::ModelRegistration>,
+    handles: &[SlotHandle],
+) {
+    // First-max argmax (matches dispatch_argmax_f32's `>` tie-break). Only the
+    // VALUE (== logits max) feeds the rerank threshold; the index is a cosmetic
+    // seed that finalize_token_from_logits never lets affect the result (the max
+    // is always within delta of itself ⇒ always a rerank candidate).
+    fn argmax_f32(xs: &[f32]) -> (u32, f32) {
+        let mut bi = 0usize;
+        let mut bv = f32::NEG_INFINITY;
+        for (i, &v) in xs.iter().enumerate() {
+            if v > bv {
+                bv = v;
+                bi = i;
+            }
+        }
+        (bi as u32, bv)
+    }
+
+    // ADR-040 S1c-2 — TWO-PASS batched-head tick. Pass 1 runs each live slot's
+    // BODY only and gathers its final hidden row; ONE `lm_head_batched` then
+    // amortizes the 605 MB lm_head weight read across all slots; Pass 2
+    // finalizes each slot from its logits row. Per-slot output is bit-identical
+    // to the prior per-slot full decode (H-S1-rowparity + shared
+    // finalize_token_from_logits + decode_tick_finalize).
+    let hs = guard.model.weights.hidden_size;
+    let vocab = guard.model.weights.vocab_size;
+
+    // ADR-040 Phase F `iter-F-prefill-determinism` (2026-06-24) — clear the
+    // per-prefill self-mounts at the TOP of every decode tick. The slot-aware
+    // decode uses a save-mount-RESTORE scope-guard on `self.{dense,hybrid,
+    // leg_hb}_kv`; if a prefill-origin mount has crept onto these fields by any
+    // path, each decode RESTORES it after its own forward, propagating the stale
+    // mount across ticks until it poisons a later prefill's `is_none()` write-
+    // back gate (forward_prefill.rs:970). The clear-after-prefill (admit) above
+    // removed the admit-boundary entry (~13%→~3% on `slot_aware_staggered_
+    // eviction`); this top-of-tick clear closes the residual cross-tick
+    // propagation so the prior the scope-guard saves/restores is always None
+    // (the clean-n4/n8 invariant). Data-lossless: per-slot K/V lives in the
+    // persistent multi-seq scaffolds; decode re-mounts a fresh slice-view.
+    clear_gemma4_self_mounts(guard.model);
+
+    // ADR-040 iter-F-batched-determinism — env-gated per-tick trace
+    // (HF2Q_DECODE_TRACE=1) to make the staggered batched non-determinism
+    // observable: logs each tick's batch composition (N, per-slot pos+token)
+    // and each slot's output token. Off by default (zero cost in production).
+    let trace = std::env::var("HF2Q_DECODE_TRACE").is_ok();
+
+    // Pass 1 — capture bodies. `captured` holds (handle, slot_idx, state, reply)
+    // for each slot whose body ran; `hidden_rows` is their final hidden states
+    // concatenated row-major `[n, hidden_size]`.
+    // ADR-040 S2/S3: OPT-IN [N,hidden] batched body (HF2Q_BATCHED_BODY=1 +
+    // hybrid KV). DEFAULT (flag off) = the proven per-slot capture path below.
+    //
+    // Phase F (2026-06-24) — a default AUTO-ENABLE at handles.len()>=2 was
+    // attempted and REVERTED: although the batched body is byte-identical to
+    // serial at N=1/4/8 (slot_aware_n1/n4/n8) AND ~1.94× faster at N=8 (198.8
+    // ADR-040 `iter-F-batched-default` (2026-06-25) — DEFAULT-ON (opt out with
+    // HF2Q_BATCHED_BODY=0). The prior non-determinism that blocked this flip was
+    // root-caused in §0.16-RESOLVED: it was NOT the batched body — it was the
+    // batched lm_head softcap covering only row 0 (softcap_params[1]=vocab, not
+    // n*vocab), which affected BOTH decode paths. With that fixed, the batched
+    // body is byte-identical to the serial slot-aware reference and to the
+    // per-slot loop: validated by n1/n4/n8 parity, `staggered_eviction` 0/60, and
+    // E2E long-generation coherence (8 concurrent distinct prompts × 600 tok over
+    // HTTP, each byte-identical to its own serial ref, no cross-slot contamination
+    // — at ~1.8× the serial aggregate throughput). The per-slot loop remains
+    // available via the opt-out for A/B + as the byte-equiv-harness baseline.
+    let use_batched_body = std::env::var("HF2Q_BATCHED_BODY").as_deref() != Ok("0")
+        && guard.hybrid.is_some();
+    let mut captured = Vec::new();
+    let mut hidden_rows: Vec<f32> = Vec::new();
+    if use_batched_body {
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut sids: Vec<SlotId> = Vec::new();
+        let mut positions: Vec<usize> = Vec::new();
+        for &handle in handles {
+            let slot_idx = handle.slot_id.0 as usize;
+            let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
+                continue;
+            };
+            let (state, reply, installed) = slot;
+            if installed != handle {
+                slots[slot_idx] = Some((state, reply, installed));
+                continue;
+            }
+            positions.push(state.prompt_len + state.generated_tokens.len() - 1);
+            tokens.push(state.next_token);
+            sids.push(handle.slot_id);
+            captured.push((handle, slot_idx, state, reply));
+        }
+        if captured.is_empty() {
+            return;
+        }
+        if trace {
+            let comp: Vec<String> = sids.iter().zip(positions.iter()).zip(tokens.iter())
+                .map(|((s, p), t)| format!("s{}@{}:in{}", s.0, p, t)).collect();
+            eprintln!("[DECTRACE] BATCHED N={} [{}]", sids.len(), comp.join(" "));
+        }
+        let body_res = {
+            let hybrid = guard.hybrid.as_mut().unwrap();
+            let lm = &mut *guard.model;
+            lm.weights
+                .forward_decode_body_batched(&tokens, &sids, &positions, hybrid, &mut lm.ctx)
+        };
+        match body_res {
+            Ok(h) => hidden_rows = h,
+            Err(e) => {
+                let msg = format!("{e}");
+                for (handle, _slot_idx, _state, reply) in captured.drain(..) {
+                    reset_gemma4_slot(guard, handle.slot_id);
+                    scheduler.release(handle);
+                    slot_fire_done(
+                        reply,
+                        Err(anyhow::anyhow!("forward_decode_body_batched: {msg}")),
+                        false,
+                    );
+                }
+                return;
+            }
+        }
+    } else {
+        for &handle in handles {
+            let slot_idx = handle.slot_id.0 as usize;
+            let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
+                continue;
+            };
+            let (mut state, reply, installed) = slot;
+            if installed != handle {
+                // Stale handle for this physical slot: put it back untouched.
+                slots[slot_idx] = Some((state, reply, installed));
+                continue;
+            }
+            match state.decode_tick_capture(
+                guard.model,
+                &mut guard.kv,
+                guard.hybrid.as_mut(),
+                guard.dense.as_mut(),
+                guard.mlx.as_mut(),
+            ) {
+                Ok(hidden) => {
+                    hidden_rows.extend_from_slice(&hidden);
+                    captured.push((handle, slot_idx, state, reply));
+                }
+                Err(e) => {
+                    // Body forward error: evict this slot with a typed error.
+                    reset_gemma4_slot(guard, handle.slot_id);
+                    scheduler.release(handle);
+                    slot_fire_done(reply, Err(e), false);
+                }
+            }
+        }
+        if captured.is_empty() {
+            return;
+        }
+    }
+    let n = captured.len();
+
+    // Batched head: ONE final-norm + lm_head(m=N) + softcap for all slots.
+    let head = match guard
+        .model
+        .weights
+        .lm_head_batched(&hidden_rows, n, &mut guard.model.ctx)
+    {
+        Ok(h) => h,
+        Err(e) => {
+            // Head failure is fatal for this tick's slots (no tokens producible);
+            // evict each. anyhow::Error isn't Clone, so carry the message.
+            let msg = format!("{e}");
+            for (handle, _slot_idx, _state, reply) in captured {
+                reset_gemma4_slot(guard, handle.slot_id);
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(anyhow::anyhow!("lm_head_batched: {msg}")), false);
+            }
+            return;
+        }
+    };
+
+    // Pass 2 — finalize each slot from its logits row.
+    for (i, (handle, slot_idx, mut state, reply)) in captured.into_iter().enumerate() {
+        let logits_row = &head.logits[i * vocab..(i + 1) * vocab];
+        let normed_row = &head.normed[i * hs..(i + 1) * hs];
+        // Greedy token: the GPU-argmax index is irrelevant to the rerank and the
+        // top1 VALUE (== CPU max) is bit-identical, so a CPU argmax reproduces
+        // the scalar head's greedy token exactly.
+        let (top1_idx, top1_val) = argmax_f32(logits_row);
+        let greedy_token = match guard.model.weights.finalize_token_from_logits(
+            logits_row, normed_row, top1_idx, top1_val,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                reset_gemma4_slot(guard, handle.slot_id);
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(e), false);
+                continue;
+            }
+        };
+        if trace {
+            eprintln!("[DECTRACE]   out s{} top1_val={:.4} -> tok{}",
+                handle.slot_id.0, top1_val, greedy_token);
+        }
+        let tick = match state.decode_tick_finalize(guard.model, greedy_token, logits_row) {
+            Ok(t) => t,
+            Err(e) => {
+                reset_gemma4_slot(guard, handle.slot_id);
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(e), false);
+                continue;
+            }
+        };
+
+        let client_dropped = slot_emit_token(&reply, &tick);
+        scheduler.advance_after_decode(handle);
+
+        if tick.finished || client_dropped {
+            reset_gemma4_slot(guard, handle.slot_id);
+            scheduler.release(handle);
+            let gr = Ok(state.finish(registration));
+            slot_fire_done(reply, gr, client_dropped);
+        } else {
+            // Still generating: re-seat the slot for the next tick.
+            slots[slot_idx] = Some((state, reply, handle));
+        }
+    }
+}
+
+/// Per-slot KV exit reset for Gemma 4 (mirror of the serial ref's exit
+/// reset). Swallows errors (logged) — a failed reset is observability-only
+/// because the next admission's entry reset re-cleans the slot.
+/// Clear the gemma4 forward's per-prefill self-mounted KV scratch
+/// (`self.dense_kvs` / `self.hybrid_kv` / `self.leg_hb_encoded`) back to the
+/// `None` fresh state the slot-aware prefill consume-gate expects on entry
+/// (forward_prefill.rs:699 "SerialFifo enters with self.dense_kvs == None").
+///
+/// The slot-aware prefill mounts a per-slot slice-VIEW into these shared
+/// `MlxModelWeights` fields and leaves them `Some` at the end (the legacy
+/// single-seq write-back, forward_prefill.rs:2344/3663/3865). Under F1's
+/// N>1 interleave, slot A's leftover view poisons slot B's prefill: B's
+/// consume-gate sees A's view with A's capacity and bails
+/// (`capacity X < required Y`). The actual per-slot KV is safe in the
+/// per-slot `multi_seq_kv*` scaffold (the views aliased it), so dropping
+/// these Options loses nothing. This MIRRORS the codebase's own precedent
+/// in `forward_embed_last` (forward_prefill.rs:2459-2461), which clears the
+/// same fields before re-entering prefill precisely to avoid the
+/// "first allocation's capacity poisons every subsequent call" fault.
+///
+/// hf2q-side, worker-owned, no forward-path change: it restores a
+/// documented precondition between slots, it does not alter the forward.
+fn clear_gemma4_self_mounts(g: &mut GemmaLoadedModel) {
+    g.weights.dense_kvs = None;
+    g.weights.hybrid_kv = None;
+    g.weights.leg_hb_encoded = None;
+}
+
+fn reset_gemma4_slot(guard: &mut Gemma4KvGuard<'_>, slot_id: SlotId) {
+    for (layer_idx, buf) in guard.kv.iter_mut().enumerate() {
+        if let Err(e) = buf.reset_for_slot(slot_id) {
+            tracing::warn!(
+                "Gemma4 SlotAware exit reset L{layer_idx} slot={} failed: {e}",
+                slot_id.0
+            );
+        }
+    }
+    if let Some(hybrid) = guard.hybrid.as_mut() {
+        for (layer_idx, buf) in hybrid.iter_mut().enumerate() {
+            if let Err(e) = buf.reset_for_slot(slot_id) {
+                tracing::warn!(
+                    "Gemma4 SlotAware exit reset (hybrid) L{layer_idx} slot={} failed: {e}",
+                    slot_id.0
+                );
+            }
+        }
+    }
+}
+
+/// Answer every pending request with a typed startup error so callers do
+/// not hang when a SlotAware loop cannot start (e.g. KV scaffold absent).
+fn drain_with_startup_error(mut rx: mpsc::Receiver<Request>, why: &str) {
+    while let Some(req) = rx.blocking_recv() {
+        match req {
+            Request::Generate { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "capability_unsupported: ADR-040 Phase F M1 SlotAware loop \
+                     could not start: {why}"
+                )));
+            }
+            Request::GenerateStream { events, .. } => {
+                let _ = events.blocking_send(super::sse::GenerationEvent::Error(format!(
+                    "capability_unsupported: ADR-040 Phase F M1 SlotAware loop \
+                     could not start: {why}"
+                )));
+            }
+            Request::Warmup { reply } => {
+                let _ = reply.send(Ok(()));
+            }
+            Request::Embed { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "capability_unsupported: ADR-040 Phase F M1 SlotAware loop \
+                     could not start: {why}"
+                )));
+            }
+            Request::GenerateWithSoftTokens { reply, .. } => {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "capability_unsupported: ADR-040 Phase F M1 SlotAware loop \
+                     could not start: {why}"
+                )));
+            }
+            Request::Shutdown => break,
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Qwen35 SlotAware loop (F1). Lives here (not engine_qwen35.rs) because the
+// loop drives the engine-private `Request` enum + scheduler + shared reply
+// helpers; the per-arch decode SEAM (`Qwen35DecodeState`) lives beside its
+// serial reference in engine_qwen35.rs.
+// ---------------------------------------------------------------------------
+
+/// Scope guard holding the Qwen35 persistent `HybridKvCache` taken out of
+/// the model for the SlotAware loop lifetime; restores on every exit path
+/// via `Drop` (ADR-040 Phase F M1 lead requirement). Unlike Gemma 4's
+/// per-layer `Vec`, Qwen35 owns a single `HybridKvCache` with an `n_seqs`
+/// slot dimension.
+struct Qwen35KvGuard<'a> {
+    model: &'a mut super::engine_qwen35::Qwen35LoadedModel,
+    /// `Some` for the loop lifetime; `Drop` `take()`s it back into the
+    /// model. Stored as `Option` because `HybridKvCache` is move-only (no
+    /// `Default`) so there is no placeholder to `mem::take` against.
+    kv: Option<crate::inference::models::qwen35::kv_cache::HybridKvCache>,
+}
+
+impl<'a> Qwen35KvGuard<'a> {
+    fn take(model: &'a mut super::engine_qwen35::Qwen35LoadedModel) -> Result<Self> {
+        let kv = model.persistent_kv_cache.take().ok_or_else(|| {
+            anyhow::anyhow!(
+                "capability_unsupported: ADR-040 Phase F M1 — persistent_kv_cache is None \
+                 for Qwen35 SlotAware loop entry. C2d spawn-arm invariant violated."
+            )
+        })?;
+        Ok(Self { model, kv: Some(kv) })
+    }
+}
+
+impl Drop for Qwen35KvGuard<'_> {
+    fn drop(&mut self) {
+        self.model.persistent_kv_cache = self.kv.take();
+    }
+}
+
+type Qwen35Slot = (super::engine_qwen35::Qwen35DecodeState, SlotReply, SlotHandle);
+
+/// ADR-040 Phase F M1 (F1) — Qwen35 SlotAware admit-while-decoding loop.
+/// Same shape as `run_slot_aware_gemma4`; single shared `HybridKvCache`.
+#[allow(clippy::too_many_arguments)]
+fn run_slot_aware_qwen35(
+    mut model: super::engine_qwen35::Qwen35LoadedModel,
+    mut rx: mpsc::Receiver<Request>,
+    registration: Option<super::registry::ModelRegistration>,
+    mut scheduler: InflightBatchedScheduler,
+    scheduler_stats_snapshot: Arc<Mutex<SchedulerStats>>,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+) {
+    let mut guard = match Qwen35KvGuard::take(&mut model) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!("Qwen35 SlotAware loop cannot start: {e:#}");
+            drain_with_startup_error(rx, "Qwen35 persistent_kv_cache absent at SlotAware entry");
+            return;
+        }
+    };
+    let n_slots = guard.kv.as_ref().expect("kv Some at entry").n_seqs as usize;
+    let mut slots: Vec<Option<Qwen35Slot>> = (0..n_slots).map(|_| None).collect();
+
+    let publish = |sched: &InflightBatchedScheduler, snap: &Arc<Mutex<SchedulerStats>>| {
+        if let Ok(mut g) = snap.lock() {
+            *g = sched.stats();
+        }
+    };
+    let mut pending: Option<Request> = None;
+
+    'worker: loop {
+        // ── ADMIT ────────────────────────────────────────────────────
+        loop {
+            let Some(_free) = slots.iter().position(|s| s.is_none()) else { break };
+            let req = match pending.take() {
+                Some(r) => r,
+                None => match rx.try_recv() {
+                    Ok(r) => r,
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
+                },
+            };
+            match req {
+                Request::Generate { prompt_tokens, params, reply } => {
+                    admit_qwen35_slot(
+                        &mut guard,
+                        &mut scheduler,
+                        &mut slots,
+                        registration.as_ref(),
+                        &scheduler_stats_snapshot,
+                        per_slot_kv_budget_bytes,
+                        kv_bytes_per_token,
+                        prompt_tokens,
+                        params,
+                        SlotReply::Unary(reply),
+                    );
+                    publish(&scheduler, &scheduler_stats_snapshot);
+                }
+                Request::GenerateStream {
+                    prompt_tokens,
+                    params,
+                    events,
+                    cancellation_counter,
+                    ..
+                } => {
+                    admit_qwen35_slot(
+                        &mut guard,
+                        &mut scheduler,
+                        &mut slots,
+                        registration.as_ref(),
+                        &scheduler_stats_snapshot,
+                        per_slot_kv_budget_bytes,
+                        kv_bytes_per_token,
+                        prompt_tokens,
+                        params,
+                        SlotReply::Stream { events, cancel: cancellation_counter },
+                    );
+                    publish(&scheduler, &scheduler_stats_snapshot);
+                }
+                Request::Warmup { reply } => {
+                    // Qwen35 warmup is a no-op (mirror of the SerialFifo arm).
+                    let _ = reply.send(Ok(()));
+                }
+                Request::Shutdown => {
+                    tracing::info!("Qwen35 SlotAware worker received Shutdown; exiting");
+                    break 'worker;
+                }
+                // Embed IS served at SlotId>0 by the legacy inflight arm
+                // today (embed_qwen35_slot_aware, engine_qwen35.rs:5288) →
+                // 501 would regress. One-shot, run inline in admit.
+                Request::Embed { prompt_tokens, reply } => {
+                    embed_qwen35_inline(
+                        &mut guard,
+                        &mut scheduler,
+                        &scheduler_stats_snapshot,
+                        per_slot_kv_budget_bytes,
+                        kv_bytes_per_token,
+                        prompt_tokens,
+                        reply,
+                    );
+                    publish(&scheduler, &scheduler_stats_snapshot);
+                }
+                // GenerateWithSoftTokens IS served at SlotId>0 today
+                // (generate_qwen35_once_with_soft_tokens[_and_deepstack]_slot_aware,
+                // engine_qwen35.rs:5460/5783) → 501 would regress. The
+                // qwen35 soft-token forward path carries deepstack +
+                // 3D-mRoPE positions (Wedge-4) with a distinct forward
+                // primitive, so — unlike the gemma4 shared-prefill path —
+                // it runs inline in admit via the existing slot-aware
+                // soft-token generator (which does its own full decode),
+                // reusing the same primitive the legacy arm called. This
+                // preserves the capability exactly; STEP-2/F2 can fold it
+                // into the batched loop once the soft-token decode primitive
+                // is threaded through the per-slot scaffold.
+                Request::GenerateWithSoftTokens {
+                    prompt_tokens,
+                    soft_tokens,
+                    params,
+                    deepstack,
+                    positions_flat,
+                    reply,
+                } => {
+                    generate_qwen35_soft_tokens_inline(
+                        &mut guard,
+                        &mut scheduler,
+                        registration.as_ref(),
+                        &scheduler_stats_snapshot,
+                        per_slot_kv_budget_bytes,
+                        kv_bytes_per_token,
+                        prompt_tokens,
+                        soft_tokens,
+                        deepstack,
+                        positions_flat,
+                        params,
+                        reply,
+                    );
+                    publish(&scheduler, &scheduler_stats_snapshot);
+                }
+                _ => {}
+            }
+        }
+
+        // ── STEP ─────────────────────────────────────────────────────
+        let step = match scheduler.step() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Qwen35 SlotAware scheduler.step() failed: {e:?}");
+                break 'worker;
+            }
+        };
+        match step {
+            SchedulerStep::Idle => match rx.blocking_recv() {
+                Some(r) => pending = Some(r),
+                None => break 'worker,
+            },
+            SchedulerStep::Prefill { .. } => {}
+            SchedulerStep::Decode { handles } => {
+                decode_batch_qwen35(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &handles);
+                publish(&scheduler, &scheduler_stats_snapshot);
+            }
+            SchedulerStep::Mixed { decode_handles, .. } => {
+                decode_batch_qwen35(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &decode_handles);
+                publish(&scheduler, &scheduler_stats_snapshot);
+            }
+        }
+    }
+
+    drop(guard);
+    tracing::info!("Qwen35 SlotAware worker thread exited");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_qwen35_slot(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Qwen35Slot>],
+    registration: Option<&super::registry::ModelRegistration>,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+    prompt_tokens: Vec<u32>,
+    params: SamplingParams,
+    reply: SlotReply,
+) {
+    let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
+        0
+    } else {
+        u64::from(prompt_tokens.len() as u32)
+            .saturating_add(u64::from(params.max_tokens as u32))
+            .saturating_mul(kv_bytes_per_token)
+    };
+    let admit_req = AdmitRequest {
+        prompt_tokens: prompt_tokens.len() as u32,
+        max_tokens: params.max_tokens as u32,
+        kv_bytes_needed: needed_bytes,
+    };
+    let admitted = match scheduler.admit(admit_req) {
+        Ok(slot) => slot,
+        Err(AdmitError::SlotBudgetExceeded { needed_bytes, budget_bytes }) => {
+            slot_fire_done(
+                reply,
+                Err(anyhow::anyhow!(
+                    "slot_budget_exceeded: ADR-040 Phase F M1 — per-slot KV budget \
+                     exceeded (needed_bytes={needed_bytes}, budget_bytes={budget_bytes})."
+                )),
+                false,
+            );
+            return;
+        }
+        Err(e) => {
+            slot_fire_done(reply, Err(anyhow::anyhow!("ADR-040 Phase F M1 admit failed: {e:?}")), false);
+            return;
+        }
+    };
+    let Some(handle) = admitted.handle else {
+        // CompletedAtAdmit (`max_tokens == 0`): mirror the SerialFifo arm's
+        // fallback — run the legacy non-slot-aware `generate_qwen35_once`
+        // and fire, no scheduler bookkeeping (byte-equivalence).
+        let gr = super::engine_qwen35::generate_qwen35_once(
+            guard.model,
+            &prompt_tokens,
+            &params,
+            registration,
+        );
+        slot_fire_done(reply, gr, false);
+        return;
+    };
+
+    let seed = super::engine_qwen35::Qwen35DecodeState::prefill_seed(
+        guard.model,
+        &prompt_tokens,
+        &params,
+        guard.kv.as_mut().expect("kv Some during loop"),
+        handle.slot_id,
+    );
+    let state = match seed {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = guard.kv.as_mut().expect("kv Some during loop").reset_for_slot(handle.slot_id);
+            scheduler.release(handle);
+            if let Ok(mut g) = scheduler_stats_snapshot.lock() {
+                *g = scheduler.stats();
+            }
+            slot_fire_done(reply, Err(e), false);
+            return;
+        }
+    };
+
+    scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+
+    if state.finished_at_seed() {
+        // Stream: emit the seed text. finish() owns the assembled result.
+        let tick = TickOutcome {
+            fragment: state.seed_fragment(),
+            is_reasoning: false,
+            finished: true,
+        };
+        let dropped = slot_emit_token(&reply, &tick);
+        scheduler.advance_after_decode(handle);
+        let _ = guard.kv.as_mut().expect("kv Some during loop").reset_for_slot(handle.slot_id);
+        scheduler.release(handle);
+        let gr = Ok(state.finish(guard.model, registration));
+        slot_fire_done(reply, gr, dropped);
+        return;
+    }
+
+    let slot_idx = handle.slot_id.0 as usize;
+    slots[slot_idx] = Some((state, reply, handle));
+}
+
+/// One-shot Qwen35 pooled-embedding (`Request::Embed`) under SlotAware —
+/// inline in admit (no decode loop), mirroring the legacy inflight arm
+/// (embed_qwen35_slot_aware, engine_qwen35.rs:5288). Keeps the served-today
+/// capability rather than 501-ing it.
+fn embed_qwen35_inline(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+    prompt_tokens: Vec<u32>,
+    reply: oneshot::Sender<Result<Vec<f32>>>,
+) {
+    let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
+        0
+    } else {
+        u64::from(prompt_tokens.len() as u32).saturating_mul(kv_bytes_per_token)
+    };
+    let admit_req = AdmitRequest {
+        prompt_tokens: prompt_tokens.len() as u32,
+        max_tokens: 1,
+        kv_bytes_needed: needed_bytes,
+    };
+    let admitted = match scheduler.admit(admit_req) {
+        Ok(slot) => slot,
+        Err(e) => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "ADR-040 Phase F M1 Qwen35 Embed admit failed: {e:?}"
+            )));
+            return;
+        }
+    };
+    let Some(handle) = admitted.handle else {
+        let _ = reply.send(Err(anyhow::anyhow!(
+            "ADR-040 Phase F M1 — Qwen35 Embed got no physical slot (capacity \
+             mismatch)."
+        )));
+        return;
+    };
+    let result = super::engine_qwen35::embed_qwen35_slot_aware(
+        guard.model,
+        &prompt_tokens,
+        guard.kv.as_mut().expect("kv Some during loop"),
+        handle.slot_id,
+    );
+    scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+    let _ = guard
+        .kv
+        .as_mut()
+        .expect("kv Some during loop")
+        .reset_for_slot(handle.slot_id);
+    scheduler.release(handle);
+    if let Ok(mut g) = scheduler_stats_snapshot.lock() {
+        *g = scheduler.stats();
+    }
+    let _ = reply.send(result);
+}
+
+/// Qwen35 `Request::GenerateWithSoftTokens` under SlotAware — run inline in
+/// admit via the existing slot-aware soft-token generator (which carries
+/// deepstack + 3D-mRoPE positions and does its own full decode). Reuses the
+/// SAME primitive the legacy inflight arm called (engine.rs:8548/8560), so
+/// it preserves the served-today capability exactly; folding it into the
+/// batched decode loop is STEP-2/F2 work (the soft-token decode primitive
+/// must be threaded through the per-slot scaffold first).
+#[allow(clippy::too_many_arguments)]
+fn generate_qwen35_soft_tokens_inline(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    registration: Option<&super::registry::ModelRegistration>,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+    prompt_tokens: Vec<u32>,
+    soft_tokens: Vec<SoftTokenData>,
+    deepstack: Option<DeepstackData>,
+    positions_flat: Option<Vec<i32>>,
+    params: SamplingParams,
+    reply: oneshot::Sender<Result<GenerationResult>>,
+) {
+    let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
+        0
+    } else {
+        u64::from(prompt_tokens.len() as u32)
+            .saturating_add(u64::from(params.max_tokens as u32))
+            .saturating_mul(kv_bytes_per_token)
+    };
+    let admit_req = AdmitRequest {
+        prompt_tokens: prompt_tokens.len() as u32,
+        max_tokens: params.max_tokens as u32,
+        kv_bytes_needed: needed_bytes,
+    };
+    let admitted = match scheduler.admit(admit_req) {
+        Ok(slot) => slot,
+        Err(e) => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "ADR-040 Phase F M1 Qwen35 SoftTokens admit failed: {e:?}"
+            )));
+            return;
+        }
+    };
+    // Build borrowed injections + deepstack from owned data (mirror of the
+    // legacy arm engine.rs:8530-8542).
+    let injections: Vec<crate::serve::forward_prefill::SoftTokenInjection<'_>> = soft_tokens
+        .iter()
+        .map(|d| crate::serve::forward_prefill::SoftTokenInjection {
+            range: d.range.clone(),
+            embeddings: &d.embeddings,
+        })
+        .collect();
+    let ds_borrow: Option<crate::serve::forward_prefill::DeepstackInjection<'_>> =
+        deepstack.as_ref().map(|d| crate::serve::forward_prefill::DeepstackInjection {
+            image_token_positions: d.image_token_positions.clone(),
+            chunks: d.chunks.iter().collect(),
+        });
+    let Some(handle) = admitted.handle else {
+        // max_tokens==0 CompletedAtAdmit: no slot. Fall back to the legacy
+        // non-slot-aware soft-token generator at SlotId(0).
+        let result = if ds_borrow.is_some() || positions_flat.is_some() {
+            super::engine_qwen35::generate_qwen35_once_with_soft_tokens_and_deepstack(
+                guard.model,
+                &prompt_tokens,
+                &injections,
+                ds_borrow.as_ref(),
+                positions_flat.as_deref(),
+                &params,
+                registration,
+            )
+        } else {
+            super::engine_qwen35::generate_qwen35_once_with_soft_tokens(
+                guard.model,
+                &prompt_tokens,
+                &injections,
+                &params,
+                registration,
+            )
+        };
+        let _ = reply.send(result);
+        return;
+    };
+    let kv = guard.kv.as_mut().expect("kv Some during loop");
+    let result = if ds_borrow.is_some() || positions_flat.is_some() {
+        super::engine_qwen35::generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
+            guard.model,
+            &prompt_tokens,
+            &injections,
+            ds_borrow.as_ref(),
+            positions_flat.as_deref(),
+            &params,
+            registration,
+            kv,
+            handle.slot_id,
+        )
+    } else {
+        super::engine_qwen35::generate_qwen35_once_with_soft_tokens_slot_aware(
+            guard.model,
+            &prompt_tokens,
+            &injections,
+            &params,
+            registration,
+            kv,
+            handle.slot_id,
+        )
+    };
+    scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+    if let Ok(ref gr) = result {
+        for _ in 0..gr.completion_tokens {
+            scheduler.advance_after_decode(handle);
+        }
+    }
+    let _ = guard
+        .kv
+        .as_mut()
+        .expect("kv Some during loop")
+        .reset_for_slot(handle.slot_id);
+    scheduler.release(handle);
+    if let Ok(mut g) = scheduler_stats_snapshot.lock() {
+        *g = scheduler.stats();
+    }
+    let _ = reply.send(result);
+}
+
+fn decode_batch_qwen35(
+    guard: &mut Qwen35KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Qwen35Slot>],
+    registration: Option<&super::registry::ModelRegistration>,
+    handles: &[SlotHandle],
+) {
+    for &handle in handles {
+        let slot_idx = handle.slot_id.0 as usize;
+        let Some(slot) = slots.get_mut(slot_idx).and_then(Option::take) else {
+            continue;
+        };
+        let (mut state, reply, installed) = slot;
+        if installed != handle {
+            slots[slot_idx] = Some((state, reply, installed));
+            continue;
+        }
+
+        let qtick = match state.decode_tick(
+            guard.model,
+            guard.kv.as_mut().expect("kv Some during loop"),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = guard.kv.as_mut().expect("kv Some during loop").reset_for_slot(handle.slot_id);
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(e), false);
+                continue;
+            }
+        };
+        let tick = TickOutcome {
+            fragment: qtick.fragment,
+            is_reasoning: qtick.is_reasoning,
+            finished: qtick.finished,
+        };
+
+        let client_dropped = slot_emit_token(&reply, &tick);
+        scheduler.advance_after_decode(handle);
+
+        if tick.finished || client_dropped {
+            let _ = guard.kv.as_mut().expect("kv Some during loop").reset_for_slot(handle.slot_id);
+            scheduler.release(handle);
+            let gr = Ok(state.finish(guard.model, registration));
+            slot_fire_done(reply, gr, client_dropped);
+        } else {
+            slots[slot_idx] = Some((state, reply, handle));
         }
     }
 }
@@ -5027,6 +7270,33 @@ fn worker_run(
         kv_bytes_per_token,
         "hf2q-engine worker thread started"
     );
+
+    // ADR-040 Phase F M1 (F1) — SlotAware now runs a SEPARATE
+    // scheduler-driven, admit-while-decoding worker loop
+    // (`worker_run_slot_aware`) that drives `scheduler.step()` and
+    // interleaves up to `max_slots` concurrent requests across decode
+    // ticks. Dispatching here — BEFORE the SerialFifo scheduler is even
+    // constructed — keeps the legacy `blocking_recv` drain below
+    // byte-identical for SerialFifo (the production default): zero edits
+    // to that body, so `engine_serial_fifo_byte_equivalent_to_pre_phase_c`
+    // holds by construction. The inlined SlotId(N>0) arms further down in
+    // the SerialFifo body become dead for SerialFifo (it only ever sees
+    // SlotId(0) from the FIFO adapter); they are retained as-is for the
+    // SerialFifo path's existing source-introspection pins and removed as
+    // M1-completion hygiene, not here.
+    if let EngineMode::SlotAware { max_slots } = mode {
+        worker_run_slot_aware(
+            loaded,
+            rx,
+            registration,
+            max_slots,
+            queue_capacity,
+            scheduler_stats_snapshot,
+            per_slot_kv_budget_bytes,
+            kv_bytes_per_token,
+        );
+        return;
+    }
 
     // ADR-040 Phase C iter-2a (C2b) — construct the scheduler at thread
     // entry per dossier §2.3 + §4 iter-2a step 3. Under Shape A the
@@ -8281,6 +10551,7 @@ fn generate_once_with_soft_tokens(
                 max_tokens,
                 &mut loaded.ctx,
                 resume_lcp,
+                false, // slot_aware=false (ADR-040 STEP-1b): legacy byte-equivalent
             )?
     };
     let prefill_duration = prefill_start.elapsed();
@@ -13155,6 +15426,7 @@ fn generate_stream_once(
                 max_tokens,
                 &mut loaded.ctx,
                 resume_lcp,
+                false, // slot_aware=false (ADR-040 STEP-1b): legacy byte-equivalent
             )
     };
     let prefill_duration = prefill_start.elapsed();
@@ -16423,6 +18695,1745 @@ assistant:
         // would leak GPU buffers across test cases).
         rt.block_on(engine_a.shutdown()).expect("engine_a shutdown");
         rt.block_on(engine_b.shutdown()).expect("engine_b shutdown");
+    }
+
+    // =======================================================================
+    // ADR-040 Phase F M1 (F1) — SlotAware batched-worker-loop proof pins.
+    //
+    // These reuse the byte-equiv env gate (HF2Q_BYTE_EQUIV_E2E=1 +
+    // HF2Q_BYTE_EQUIV_E2E_GGUF=<path>) — they need a real GGUF because the
+    // proof is about real per-slot KV + sampling, which the synthetic
+    // fixture cannot exercise. They are the H-M1 falsifiers from §0.12:
+    // any slot diverging from its serial reference, or N=1 regressing,
+    // fails the milestone.
+    // =======================================================================
+
+    /// Compare two `GenerationResult`s field-by-field (excluding wall-clock
+    /// timing). `ctx` names the comparison for the failure surface.
+    fn assert_genresult_byte_equal(
+        a: &GenerationResult,
+        b: &GenerationResult,
+        ctx: &str,
+    ) {
+        assert_eq!(a.text, b.text, "{ctx}: `text` diverged");
+        assert_eq!(a.reasoning_text, b.reasoning_text, "{ctx}: `reasoning_text` diverged");
+        assert_eq!(a.prompt_tokens, b.prompt_tokens, "{ctx}: `prompt_tokens` diverged");
+        assert_eq!(a.completion_tokens, b.completion_tokens, "{ctx}: `completion_tokens` diverged");
+        assert_eq!(a.reasoning_tokens, b.reasoning_tokens, "{ctx}: `reasoning_tokens` diverged");
+        assert_eq!(a.cached_tokens, b.cached_tokens, "{ctx}: `cached_tokens` diverged");
+        assert_eq!(a.finish_reason, b.finish_reason, "{ctx}: `finish_reason` diverged");
+        assert_eq!(a.logprobs, b.logprobs, "{ctx}: `logprobs` diverged");
+    }
+
+    /// Compute the SERIAL slot-aware reference for one gemma4 prompt: load a
+    /// fresh model, provision the multi-seq KV at n_seqs=1, and run the
+    /// existing `generate_gemma4_once_slot_aware` inline at SlotId(0). This
+    /// is the AC4-correct bar for F1's batched path (SAME forward path as
+    /// the SlotAware loop), decoupled from the pre-existing legacy
+    /// `generate_once`-vs-slot-aware-forward delta pinned by h77. Each call
+    /// uses its own model so references are independent.
+    fn gemma4_serial_slot_aware_ref(
+        load_opts: &LoadOptions,
+        prompt: &[u32],
+        params: &SamplingParams,
+    ) -> GenerationResult {
+        gemma4_serial_slot_aware_ref_at(load_opts, prompt, params, 1, SlotId(0))
+    }
+
+    /// Run the serial slot-aware generate at a SPECIFIC slot_id with a
+    /// SPECIFIC n_seqs provisioning — a single request, no concurrency. Pins
+    /// per-slot KV byte-offset indexing in ISOLATION.
+    fn gemma4_serial_slot_aware_ref_at(
+        load_opts: &LoadOptions,
+        prompt: &[u32],
+        params: &SamplingParams,
+        n_seqs: u32,
+        slot_id: SlotId,
+    ) -> GenerationResult {
+        let mut loaded = LoadedModel::load(load_opts).expect("load ref model");
+        let LoadedModel::Gemma(g) = &mut loaded else {
+            panic!("gemma4_serial_slot_aware_ref: expected a Gemma GGUF")
+        };
+        g.provision_multi_seq_kv_for_slot_aware(n_seqs)
+            .expect("provision multi-seq KV");
+        let mut kv = g.multi_seq_kv.take().expect("multi_seq_kv provisioned");
+        let mut hybrid = g.multi_seq_kv_hybrid.take();
+        let mut dense = g.multi_seq_kv_dense.take();
+        let mut mlx = g.multi_seq_kv_mlx.take();
+        let r = generate_gemma4_once_slot_aware(
+            g,
+            prompt,
+            params,
+            None,
+            &mut kv,
+            hybrid.as_mut(),
+            dense.as_mut(),
+            mlx.as_mut(),
+            slot_id,
+        )
+        .expect("serial slot-aware ref");
+        g.multi_seq_kv = Some(kv);
+        g.multi_seq_kv_hybrid = hybrid;
+        g.multi_seq_kv_dense = dense;
+        g.multi_seq_kv_mlx = mlx;
+        r
+    }
+
+    /// ADR-040 §0.12 STEP 1b GUARDRAIL (golden-output pin) — the gemma4
+    /// stateless-forward refactor moves per-request KV cursor state from
+    /// shared self.kv_caches into the per-slot scaffold; it must change
+    /// STORAGE LOCATION, NOT NUMERICS. This pin asserts the serial
+    /// slot-aware path (generate_gemma4_once_slot_aware) produces the SAME
+    /// text on a fixed prompt set at T=0 after the refactor as before
+    /// (captured pre-refactor 2026-06-24). If this RED's after the
+    /// refactor, the refactor changed numerics — a regression, stop.
+    ///
+    /// Golden values captured pre-refactor on the serve.sh gemma4 Q5_K_M
+    /// (hybrid TQ-8 default). Greedy (T=0) → deterministic.
+    #[test]
+    fn slot_aware_serial_golden_output_pin() {
+        if byte_equiv_skip_unless_gated("slot_aware_serial_golden_output_pin") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        // Fixed prompt set (the same prompts the N=4 parity + interleave
+        // tests use, so golden ↔ parity are directly comparable).
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![1u32, 2, 3, 4, 5],
+            vec![10u32, 11, 12, 13],
+            vec![8u32, 9],
+            vec![2u32, 4, 6, 8],
+        ];
+        let params = SamplingParams { temperature: 0.0, max_tokens: 16, ..Default::default() };
+        let mut golden: Vec<String> = Vec::new();
+        for p in &prompts {
+            let r = gemma4_serial_slot_aware_ref(&load_opts, p, &params);
+            golden.push(r.text.clone());
+            eprintln!(
+                "[golden] prompt={:?} completion_tokens={} text={:?}",
+                p, r.completion_tokens, r.text
+            );
+        }
+        // GOLDEN_OUTPUT: filled in from the eprintln on the pre-refactor
+        // capture run, then this block asserts. Until populated (capture
+        // run), the eprintln above is the capture; the assert below is the
+        // post-refactor regression guard.
+        // Captured pre-refactor 2026-06-24 (gemma4 Q5_K_M, hybrid TQ-8, T=0).
+        const GOLDEN_OUTPUT: &[&str] = &[
+            "</i></p>\n<p>\n<style>\n/* Global Styles",
+            "텐츠텐츠텐츠텐츠텐츠를앞의의를를를를를맞는",
+            "________________________________________________________________________________________________________________________________________________________________",
+            "\\|_{**}**\n\n---\n\n## 1. Introduction\nThe purpose of",
+        ];
+        for (i, (got, want)) in golden.iter().zip(GOLDEN_OUTPUT.iter()).enumerate() {
+            assert_eq!(
+                got, want,
+                "ADR-040 STEP 1b golden pin FALSIFIED at prompt {i}: serial \
+                 slot-aware output changed across the stateless refactor \
+                 (numerics regressed, not just storage location)."
+            );
+        }
+    }
+
+    /// ADR-040 §0.12 B2 AUDIT — per-slot KV byte-offset isolation, NO
+    /// concurrency. Same prompt as a SINGLE request at SlotId(0)/(1)/(3)
+    /// (n_seqs=4) must all == the SlotId(0)/n_seqs=1 ref. A slot k>0
+    /// divergence ⇒ per-slot view byte-offset bug (KV-layout, not
+    /// concurrency). All-match ⇒ per-slot indexing correct; N>1 divergence
+    /// is purely interleave/shared-state.
+    #[test]
+    fn slot_aware_per_slot_kv_offset_isolation() {
+        if byte_equiv_skip_unless_gated("slot_aware_per_slot_kv_offset_isolation") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
+        let params = SamplingParams { temperature: 0.0, max_tokens: 12, ..Default::default() };
+
+        let r_ref = gemma4_serial_slot_aware_ref_at(&load_opts, &prompt, &params, 1, SlotId(0));
+        for k in [0u32, 1, 3] {
+            let r_k = gemma4_serial_slot_aware_ref_at(&load_opts, &prompt, &params, 4, SlotId(k));
+            assert_genresult_byte_equal(
+                &r_k,
+                &r_ref,
+                &format!("ADR-040 B2 — single-request SlotId({k})/n_seqs=4 vs SlotId(0)/n_seqs=1"),
+            );
+        }
+    }
+
+    /// ADR-040 §0.12 B2 AUDIT — deterministic INTERLEAVE reproduction (no
+    /// tokio, no scheduler). Mimics the F1 loop's order on ONE model with
+    /// n_seqs=2: prefill slot0, prefill slot1, then alternate decode
+    /// slot0/slot1 for several steps. Captures each slot's greedy token
+    /// stream and compares to that slot's ATOMIC serial reference (prefill+
+    /// full-decode with no interleave). If a slot's interleaved stream
+    /// diverges from its atomic stream, the leak is shared self.* state
+    /// corrupted by the OTHER slot's interleaved forward (the residual B2
+    /// bug). Pinpoints exactly which step diverges. Runs through the raw
+    /// forward primitives so it's deterministic + debuggable.
+    #[test]
+    fn slot_aware_interleave_two_slots_vs_atomic() {
+        if byte_equiv_skip_unless_gated("slot_aware_interleave_two_slots_vs_atomic") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        // Two DISTINCT prompts so cross-slot contamination is visible.
+        let p0: Vec<u32> = vec![1u32, 2, 3, 4, 5];
+        let p1: Vec<u32> = vec![10u32, 11, 12, 13];
+        let n_dec = 10usize;
+
+        // Atomic per-slot reference token streams (no interleave).
+        let atomic_stream = |prompt: &[u32]| -> Vec<u32> {
+            let mut m = LoadedModel::load(&load_opts).expect("load atomic");
+            let LoadedModel::Gemma(g) = &mut m else { panic!("Gemma") };
+            g.provision_multi_seq_kv_for_slot_aware(1).expect("prov");
+            let mut kv = g.multi_seq_kv.take().unwrap();
+            let mut hyb = g.multi_seq_kv_hybrid.take();
+            let mut den = g.multi_seq_kv_dense.take();
+            let mut mlx = g.multi_seq_kv_mlx.take();
+            let mut toks = Vec::new();
+            let first = g
+                .weights
+                .forward_prefill_with_soft_tokens_slot_aware(
+                    prompt, &[], n_dec, &mut g.ctx, SlotId(0),
+                    &mut kv, hyb.as_mut(), den.as_mut(), mlx.as_mut(),
+                )
+                .expect("atomic prefill");
+            toks.push(first);
+            let mut feed = first;
+            for step in 1..n_dec {
+                let pos = prompt.len() + step - 1;
+                let mut pr: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+                let t = g
+                    .weights
+                    .forward_decode_slot_aware(
+                        feed, pos, &mut g.ctx, &mut pr, SlotId(0),
+                        &mut kv, hyb.as_mut(), den.as_mut(), mlx.as_mut(),
+                    )
+                    .expect("atomic decode");
+                toks.push(t);
+                feed = t;
+            }
+            toks
+        };
+        let ref0 = atomic_stream(&p0);
+        let ref1 = atomic_stream(&p1);
+        assert_ne!(ref0, ref1, "vacuous: distinct prompts gave same stream");
+
+        // Interleaved run on ONE model, n_seqs=2, slot0=p0 slot1=p1.
+        let mut m = LoadedModel::load(&load_opts).expect("load interleave");
+        let LoadedModel::Gemma(g) = &mut m else { panic!("Gemma") };
+        g.provision_multi_seq_kv_for_slot_aware(2).expect("prov2");
+        let mut kv = g.multi_seq_kv.take().unwrap();
+        let mut hyb = g.multi_seq_kv_hybrid.take();
+        let mut den = g.multi_seq_kv_dense.take();
+        let mut mlx = g.multi_seq_kv_mlx.take();
+        // Mimic clear_gemma4_self_mounts before each prefill.
+        let clear = |g: &mut GemmaLoadedModel| {
+            g.weights.dense_kvs = None;
+            g.weights.hybrid_kv = None;
+            g.weights.leg_hb_encoded = None;
+        };
+        clear(g);
+        let f0 = g.weights.forward_prefill_with_soft_tokens_slot_aware(
+            &p0, &[], n_dec, &mut g.ctx, SlotId(0),
+            &mut kv, hyb.as_mut(), den.as_mut(), mlx.as_mut(),
+        ).expect("il prefill0");
+        clear(g);
+        let f1 = g.weights.forward_prefill_with_soft_tokens_slot_aware(
+            &p1, &[], n_dec, &mut g.ctx, SlotId(1),
+            &mut kv, hyb.as_mut(), den.as_mut(), mlx.as_mut(),
+        ).expect("il prefill1");
+        let mut s0 = vec![f0];
+        let mut s1 = vec![f1];
+        let (mut feed0, mut feed1) = (f0, f1);
+        for step in 1..n_dec {
+            let pos0 = p0.len() + step - 1;
+            let mut pr0: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+            let t0 = g.weights.forward_decode_slot_aware(
+                feed0, pos0, &mut g.ctx, &mut pr0, SlotId(0),
+                &mut kv, hyb.as_mut(), den.as_mut(), mlx.as_mut(),
+            ).expect("il decode0");
+            s0.push(t0);
+            feed0 = t0;
+            let pos1 = p1.len() + step - 1;
+            let mut pr1: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+            let t1 = g.weights.forward_decode_slot_aware(
+                feed1, pos1, &mut g.ctx, &mut pr1, SlotId(1),
+                &mut kv, hyb.as_mut(), den.as_mut(), mlx.as_mut(),
+            ).expect("il decode1");
+            s1.push(t1);
+            feed1 = t1;
+        }
+        g.multi_seq_kv = Some(kv);
+        g.multi_seq_kv_hybrid = hyb;
+        g.multi_seq_kv_dense = den;
+        g.multi_seq_kv_mlx = mlx;
+
+        let first_diff = |a: &[u32], b: &[u32]| -> Option<usize> {
+            a.iter().zip(b.iter()).position(|(x, y)| x != y)
+        };
+        eprintln!(
+            "[B2-interleave] slot0 interleaved-vs-atomic first_diff={:?} (atomic={:?} il={:?})",
+            first_diff(&s0, &ref0), ref0, s0
+        );
+        eprintln!(
+            "[B2-interleave] slot1 interleaved-vs-atomic first_diff={:?} (atomic={:?} il={:?})",
+            first_diff(&s1, &ref1), ref1, s1
+        );
+        assert_eq!(s0, ref0, "ADR-040 B2 — slot0 interleaved stream diverged from atomic");
+        assert_eq!(s1, ref1, "ADR-040 B2 — slot1 interleaved stream diverged from atomic");
+    }
+
+    /// F1 AC4 (ADR-040 §0.12, ruling (b) 2026-06-24) — SlotAware at N=1 is
+    /// byte-identical to the SERIAL SLOT-AWARE reference
+    /// (`generate_gemma4_once_slot_aware`), i.e. the SAME forward path.
+    ///
+    /// This is F1's correctness bar: F1 changes the ORCHESTRATION (a
+    /// scheduler-driven, admit-while-decoding loop) over the slot-aware
+    /// forward, so the honest pin is that the loop drives that forward
+    /// faithfully — byte-identical to running the serial slot-aware fn
+    /// inline at N=1. It is NOT compared to SerialFifo: gemma4 SerialFifo
+    /// routes SlotId(0) through the LEGACY `generate_once` forward (test
+    /// h77), which differs from the slot-aware forward by a pre-existing
+    /// numeric delta (under separate investigation per §0.12). Special-
+    /// casing N=1 to legacy to force SerialFifo-equivalence was REJECTED
+    /// (ruling (a)) — it would hide that the batched path runs entirely on
+    /// the slot-aware forward.
+    ///
+    /// Falsifies any wrapper the scheduler-driven loop introduces that
+    /// mutates the N=1 observable result (dropped token, decode-bound
+    /// off-by-one, sampler-state shift, reasoning-count drift).
+    #[test]
+    fn slot_aware_n1_byte_equivalent_to_serial_slot_aware() {
+        if byte_equiv_skip_unless_gated("slot_aware_n1_byte_equivalent_to_serial_slot_aware") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
+        let params = SamplingParams { temperature: 0.0, max_tokens: 16, ..Default::default() };
+
+        // Reference: the serial slot-aware fn inline (same forward path).
+        let r_ref = gemma4_serial_slot_aware_ref(&load_opts, &prompt_tokens, &params);
+
+        // F1 loop at N=1.
+        let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
+        let engine_slot = Engine::spawn_with_mode(
+            loaded_slot,
+            4,
+            None,
+            EngineMode::SlotAware { max_slots: 1 },
+        )
+        .expect("spawn SlotAware{max_slots:1}");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let r_slot = rt
+            .block_on(engine_slot.generate(prompt_tokens, params))
+            .expect("slot generate");
+
+        assert!(
+            !r_ref.text.is_empty() || r_ref.completion_tokens > 0,
+            "vacuous: ref produced no output"
+        );
+        assert_genresult_byte_equal(
+            &r_slot,
+            &r_ref,
+            "ADR-040 F1 AC4 (b) — SlotAware N=1 loop vs serial slot-aware ref",
+        );
+
+        rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+    }
+
+    /// DIAGNOSTIC (ADR-040 F1 blocker triage) — is my F1 loop a FAITHFUL
+    /// driver of the slot-aware forward? Compares SlotAware{1} (my loop)
+    /// against the EXISTING serial reference `generate_gemma4_once_slot_aware`
+    /// (same forward path, run inline). If these match, the N=1-vs-SerialFifo
+    /// divergence is purely the legacy-vs-slot-aware forward delta (h77),
+    /// not a bug in my loop. Gemma 4 only.
+    #[test]
+    fn slot_aware_n1_matches_serial_slot_aware_ref() {
+        if byte_equiv_skip_unless_gated("slot_aware_n1_matches_serial_slot_aware_ref") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
+        let params = SamplingParams { temperature: 0.0, max_tokens: 16, ..Default::default() };
+
+        // (1) My F1 loop via SlotAware{1}.
+        let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
+        let engine_slot =
+            Engine::spawn_with_mode(loaded_slot, 4, None, EngineMode::SlotAware { max_slots: 1 })
+                .expect("spawn SlotAware{1}");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("rt");
+        let r_loop = rt
+            .block_on(engine_slot.generate(prompt_tokens.clone(), params.clone()))
+            .expect("loop generate");
+        rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+
+        // (2) The existing serial slot-aware ref, run inline at SlotId(0) on
+        // a freshly-provisioned multi-seq KV.
+        let mut loaded_ref = LoadedModel::load(&load_opts).expect("load ref");
+        let LoadedModel::Gemma(g) = &mut loaded_ref else { panic!("expected Gemma GGUF") };
+        // Provision the slot-aware multi-seq KV the way SlotAware spawn does.
+        g.provision_multi_seq_kv_for_slot_aware(1)
+            .expect("provision multi-seq KV n_seqs=1");
+        let mut kv = g.multi_seq_kv.take().expect("multi_seq_kv provisioned");
+        let mut hybrid = g.multi_seq_kv_hybrid.take();
+        let mut dense = g.multi_seq_kv_dense.take();
+        let mut mlx = g.multi_seq_kv_mlx.take();
+        let r_ref = generate_gemma4_once_slot_aware(
+            g,
+            &prompt_tokens,
+            &params,
+            None,
+            &mut kv,
+            hybrid.as_mut(),
+            dense.as_mut(),
+            mlx.as_mut(),
+            SlotId(0),
+        )
+        .expect("serial slot-aware ref");
+        g.multi_seq_kv = Some(kv);
+        g.multi_seq_kv_hybrid = hybrid;
+        g.multi_seq_kv_dense = dense;
+        g.multi_seq_kv_mlx = mlx;
+
+        assert_genresult_byte_equal(
+            &r_loop,
+            &r_ref,
+            "ADR-040 F1 DIAGNOSTIC — SlotAware{1} loop vs serial generate_gemma4_once_slot_aware",
+        );
+    }
+
+    // =====================================================================
+    // ADR-040 Phase F M1 BLOCKING INVESTIGATION — logit-level characterization
+    // of the LEGACY (`generate_once` → forward_prefill_batched +
+    // forward_decode) vs SLOT-AWARE (`forward_prefill_with_soft_tokens_
+    // slot_aware` + forward_decode_slot_aware) greedy forward delta that h77
+    // pinned but never root-caused.
+    //
+    // This test runs the SAME greedy prompt through BOTH forward paths,
+    // capturing the raw `logits_view()` vector at EVERY decode position, then
+    // quantifies:
+    //   • max abs logit diff per position (and global max),
+    //   • mean abs logit diff per position,
+    //   • the FIRST decode position where the greedy argmax flips,
+    //   • for any flip: the top-2 logit gap on BOTH paths at that position
+    //     (near-tie ⇒ benign quant-noise flip; confident ⇒ structural bug).
+    //
+    // Both paths read the SAME `loaded.weights.activations.logits` buffer via
+    // `logits_view()`, so we run them on TWO independent model instances and
+    // snapshot the logits into owned Vecs immediately after each forward call
+    // (before the next call overwrites the buffer). Greedy only (T=0) so the
+    // token stream is deterministic on each path and the per-position compare
+    // is apples-to-apples (we feed each path ITS OWN argmax forward, and also
+    // record a "teacher-forced" compare driving BOTH paths with the LEGACY
+    // token stream so a position-N logit delta is not confounded by a
+    // position<N token divergence).
+    //
+    // Gated identically to the sibling E2E tests: HF2Q_BYTE_EQUIV_E2E=1 +
+    // HF2Q_BYTE_EQUIV_E2E_GGUF=<path>. Run under the production-default
+    // regime (HF2Q_TQ_CODEBOOK_BITS=8, HF2Q_HYBRID_KV unset=default-on).
+    //
+    // This is a DIAGNOSTIC test: it does not assert a tight bound (the whole
+    // point is to MEASURE the delta). It asserts only sanity invariants
+    // (non-empty logits, equal vocab) and PRINTS the full quantitative table
+    // to stderr for the ADR note. A loose upper-bound assert guards against a
+    // catastrophic regression (max logit delta > 5.0 would indicate a real
+    // bug, not quant noise).
+    // =====================================================================
+
+    /// Snapshot helper: argmax + top-2 gap of a logits slice.
+    fn argmax_and_top2_gap(logits: &[f32]) -> (u32, f32, f32) {
+        // Returns (argmax_id, max_logit, gap_to_second).
+        let mut best_i = 0usize;
+        let mut best_v = f32::NEG_INFINITY;
+        let mut second_v = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_v {
+                second_v = best_v;
+                best_v = v;
+                best_i = i;
+            } else if v > second_v {
+                second_v = v;
+            }
+        }
+        (best_i as u32, best_v, best_v - second_v)
+    }
+
+    /// Capture per-position logits for the LEGACY path (mirrors
+    /// `generate_once` greedy fast-path: forward_prefill_batched then
+    /// forward_decode loop). Drives the path with `driver_tokens` if Some
+    /// (teacher-forced), else with its own greedy argmax. Returns
+    /// (greedy_token_stream, per_position_logits) where position 0 is the
+    /// prefill output (logits over the last prompt token) and position k is
+    /// the logits AFTER feeding generated token k-1 via forward_decode.
+    fn capture_legacy_logits(
+        g: &mut GemmaLoadedModel,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        driver_tokens: Option<&[u32]>,
+    ) -> (Vec<u32>, Vec<Vec<f32>>) {
+        let mut logits_per_pos: Vec<Vec<f32>> = Vec::with_capacity(max_tokens);
+        let mut greedy_stream: Vec<u32> = Vec::with_capacity(max_tokens);
+
+        // Prefill (mirror generate_once default: forward_prefill_batched).
+        let prefill_argmax = g
+            .weights
+            .forward_prefill_batched(prompt_tokens, max_tokens, 0, &mut g.ctx)
+            .expect("legacy forward_prefill_batched");
+        let l0 = g.weights.logits_view().expect("legacy prefill logits").to_vec();
+        let (am0, _, _) = argmax_and_top2_gap(&l0);
+        assert_eq!(am0, prefill_argmax, "legacy: logits argmax != kernel prefill argmax");
+        logits_per_pos.push(l0);
+        greedy_stream.push(prefill_argmax);
+
+        // Token fed at decode step i is driver_tokens[i] if teacher-forced,
+        // else our own greedy stream.
+        let mut next_token = driver_tokens.map(|d| d[0]).unwrap_or(prefill_argmax);
+        for step in 1..max_tokens {
+            let pos = prompt_tokens.len() + step - 1;
+            let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+            let greedy = g
+                .weights
+                .forward_decode(next_token, pos, &mut g.ctx, &mut p)
+                .expect("legacy forward_decode");
+            let lk = g.weights.logits_view().expect("legacy decode logits").to_vec();
+            let (amk, _, _) = argmax_and_top2_gap(&lk);
+            assert_eq!(amk, greedy, "legacy: decode logits argmax != kernel greedy");
+            logits_per_pos.push(lk);
+            greedy_stream.push(greedy);
+            next_token = match driver_tokens {
+                Some(d) => d[step],
+                None => greedy,
+            };
+        }
+        (greedy_stream, logits_per_pos)
+    }
+
+    /// Capture per-position logits for the SLOT-AWARE path (mirrors
+    /// `generate_gemma4_once_slot_aware` greedy fast-path:
+    /// forward_prefill_with_soft_tokens_slot_aware then
+    /// forward_decode_slot_aware loop) at SlotId(0). Same driver semantics
+    /// as `capture_legacy_logits`.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_slot_aware_logits(
+        g: &mut GemmaLoadedModel,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        driver_tokens: Option<&[u32]>,
+        kv: &mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHbKvBuffers>,
+        mut hybrid: Option<&mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers>>,
+        mut dense: Option<&mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqDenseKvBuffers>>,
+        mut mlx: Option<&mut Vec<crate::inference::models::gemma4::kv_cache::MultiSeqMlxKvCache>>,
+    ) -> (Vec<u32>, Vec<Vec<f32>>) {
+        let slot = SlotId(0);
+        // Entry reset on every per-layer buffer (mirror the orchestrator).
+        for buf in kv.iter_mut() {
+            buf.reset_for_slot(slot).expect("slot-aware entry reset hb");
+        }
+        if let Some(ref mut h) = hybrid {
+            for buf in h.iter_mut() {
+                buf.reset_for_slot(slot).expect("slot-aware entry reset hybrid");
+            }
+        }
+
+        let mut logits_per_pos: Vec<Vec<f32>> = Vec::with_capacity(max_tokens);
+        let mut greedy_stream: Vec<u32> = Vec::with_capacity(max_tokens);
+
+        let prefill_argmax = g
+            .weights
+            .forward_prefill_with_soft_tokens_slot_aware(
+                prompt_tokens,
+                &[],
+                max_tokens,
+                &mut g.ctx,
+                slot,
+                kv,
+                hybrid.as_deref_mut(),
+                dense.as_deref_mut(),
+                mlx.as_deref_mut(),
+            )
+            .expect("slot-aware prefill");
+        let l0 = g.weights.logits_view().expect("slot-aware prefill logits").to_vec();
+        let (am0, _, _) = argmax_and_top2_gap(&l0);
+        assert_eq!(am0, prefill_argmax, "slot-aware: logits argmax != kernel prefill argmax");
+        logits_per_pos.push(l0);
+        greedy_stream.push(prefill_argmax);
+
+        let mut next_token = driver_tokens.map(|d| d[0]).unwrap_or(prefill_argmax);
+        for step in 1..max_tokens {
+            let pos = prompt_tokens.len() + step - 1;
+            let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+            let greedy = g
+                .weights
+                .forward_decode_slot_aware(
+                    next_token,
+                    pos,
+                    &mut g.ctx,
+                    &mut p,
+                    slot,
+                    kv,
+                    hybrid.as_deref_mut(),
+                    dense.as_deref_mut(),
+                    mlx.as_deref_mut(),
+                )
+                .expect("slot-aware forward_decode");
+            let lk = g.weights.logits_view().expect("slot-aware decode logits").to_vec();
+            let (amk, _, _) = argmax_and_top2_gap(&lk);
+            assert_eq!(amk, greedy, "slot-aware: decode logits argmax != kernel greedy");
+            logits_per_pos.push(lk);
+            greedy_stream.push(greedy);
+            next_token = match driver_tokens {
+                Some(d) => d[step],
+                None => greedy,
+            };
+        }
+        (greedy_stream, logits_per_pos)
+    }
+
+    #[test]
+    fn adr040_f_m1_legacy_vs_slot_aware_logit_characterization() {
+        if byte_equiv_skip_unless_gated(
+            "adr040_f_m1_legacy_vs_slot_aware_logit_characterization",
+        ) {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let prompt_tokens: Vec<u32> = vec![1u32, 2, 3, 4, 5];
+        let max_tokens = 16usize;
+
+        eprintln!("\n==== ADR-040 F M1 logit characterization ====");
+        eprintln!(
+            "regime: HF2Q_TQ_CODEBOOK_BITS={:?} HF2Q_HYBRID_KV={:?} HF2Q_USE_DENSE={:?}",
+            std::env::var("HF2Q_TQ_CODEBOOK_BITS").ok(),
+            std::env::var("HF2Q_HYBRID_KV").ok(),
+            std::env::var("HF2Q_USE_DENSE").ok(),
+        );
+
+        // ── PASS 1: each path drives its OWN greedy argmax (real generation) ──
+        let (legacy_stream, legacy_logits) = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load legacy");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma GGUF") };
+            capture_legacy_logits(g, &prompt_tokens, max_tokens, None)
+        };
+        let (slot_stream, slot_logits) = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load slot");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma GGUF") };
+            g.provision_multi_seq_kv_for_slot_aware(1).expect("provision multi-seq KV");
+            let mut kv = g.multi_seq_kv.take().expect("kv");
+            let mut hybrid = g.multi_seq_kv_hybrid.take();
+            let mut dense = g.multi_seq_kv_dense.take();
+            let mut mlx = g.multi_seq_kv_mlx.take();
+            let r = capture_slot_aware_logits(
+                g, &prompt_tokens, max_tokens, None,
+                &mut kv, hybrid.as_mut(), dense.as_mut(), mlx.as_mut(),
+            );
+            g.multi_seq_kv = Some(kv);
+            g.multi_seq_kv_hybrid = hybrid;
+            g.multi_seq_kv_dense = dense;
+            g.multi_seq_kv_mlx = mlx;
+            r
+        };
+
+        let vocab = legacy_logits[0].len();
+        assert_eq!(vocab, slot_logits[0].len(), "vocab size mismatch between paths");
+        assert!(vocab > 0, "empty logits");
+        assert_eq!(legacy_logits.len(), max_tokens);
+        assert_eq!(slot_logits.len(), max_tokens);
+
+        eprintln!("\n-- PASS 1: self-driven greedy streams --");
+        eprintln!("legacy stream:    {:?}", legacy_stream);
+        eprintln!("slot-aware stream:{:?}", slot_stream);
+        let mut first_stream_div: Option<usize> = None;
+        for i in 0..max_tokens {
+            if legacy_stream[i] != slot_stream[i] {
+                first_stream_div = Some(i);
+                break;
+            }
+        }
+        eprintln!("first greedy-stream divergence position: {:?}", first_stream_div);
+
+        // ── PASS 2: TEACHER-FORCED on the legacy token stream so a
+        // position-N logit delta is NOT confounded by an earlier token
+        // divergence feeding a different KV history into the two paths.
+        // Both paths consume `legacy_stream` as input; we then compare
+        // logits position-by-position over identical input histories. THIS
+        // is the load-bearing measurement for root-cause. ──
+        let (_, legacy_tf) = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load legacy tf");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma GGUF") };
+            capture_legacy_logits(g, &prompt_tokens, max_tokens, Some(&legacy_stream))
+        };
+        let (_, slot_tf) = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load slot tf");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma GGUF") };
+            g.provision_multi_seq_kv_for_slot_aware(1).expect("provision multi-seq KV tf");
+            let mut kv = g.multi_seq_kv.take().expect("kv tf");
+            let mut hybrid = g.multi_seq_kv_hybrid.take();
+            let mut dense = g.multi_seq_kv_dense.take();
+            let mut mlx = g.multi_seq_kv_mlx.take();
+            let r = capture_slot_aware_logits(
+                g, &prompt_tokens, max_tokens, Some(&legacy_stream),
+                &mut kv, hybrid.as_mut(), dense.as_mut(), mlx.as_mut(),
+            );
+            g.multi_seq_kv = Some(kv);
+            g.multi_seq_kv_hybrid = hybrid;
+            g.multi_seq_kv_dense = dense;
+            g.multi_seq_kv_mlx = mlx;
+            r
+        };
+
+        eprintln!(
+            "\n-- PASS 2: TEACHER-FORCED (both paths fed legacy stream) --\n\
+             pos | max_abs_diff | mean_abs_diff | L_argmax(gap) | S_argmax(gap) | flip?"
+        );
+        let mut global_max_diff = 0.0f32;
+        let mut global_max_diff_pos = 0usize;
+        let mut first_argmax_flip: Option<usize> = None;
+        let mut flip_details: Vec<(usize, f32, f32)> = Vec::new();
+        let mut sum_mean_over_pos = 0.0f64;
+        for pos in 0..max_tokens {
+            let a = &legacy_tf[pos];
+            let b = &slot_tf[pos];
+            let mut max_abs = 0.0f32;
+            let mut sum_abs = 0.0f64;
+            for j in 0..vocab {
+                let d = (a[j] - b[j]).abs();
+                if d > max_abs {
+                    max_abs = d;
+                }
+                sum_abs += d as f64;
+            }
+            let mean_abs = (sum_abs / vocab as f64) as f32;
+            sum_mean_over_pos += mean_abs as f64;
+            if max_abs > global_max_diff {
+                global_max_diff = max_abs;
+                global_max_diff_pos = pos;
+            }
+            let (la, _lv, lgap) = argmax_and_top2_gap(a);
+            let (sa, _sv, sgap) = argmax_and_top2_gap(b);
+            let flip = la != sa;
+            if flip && first_argmax_flip.is_none() {
+                first_argmax_flip = Some(pos);
+            }
+            if flip {
+                flip_details.push((pos, lgap, sgap));
+            }
+            eprintln!(
+                "{:3} | {:12.6} | {:13.8} | {:6}({:8.5}) | {:6}({:8.5}) | {}",
+                pos, max_abs, mean_abs, la, lgap, sa, sgap, if flip { "FLIP" } else { "" }
+            );
+        }
+        let mean_mean = sum_mean_over_pos / max_tokens as f64;
+        eprintln!(
+            "\nGLOBAL: max_abs_logit_diff={:.6} @pos {} | avg(mean_abs_diff/pos)={:.8}",
+            global_max_diff, global_max_diff_pos, mean_mean
+        );
+        eprintln!("first teacher-forced argmax flip: {:?}", first_argmax_flip);
+        eprintln!("all flips (pos, legacy_top2_gap, slot_top2_gap): {:?}", flip_details);
+
+        // Characterize: are flips on near-ties (benign) or confident (bug)?
+        for (pos, lgap, sgap) in &flip_details {
+            let near_tie = *lgap < global_max_diff.max(1e-3) || *sgap < global_max_diff.max(1e-3);
+            eprintln!(
+                "  flip @pos {}: legacy_gap={:.6} slot_gap={:.6} -> {}",
+                pos, lgap, sgap,
+                if near_tie {
+                    "NEAR-TIE (gap <= logit-noise => benign finite-precision flip)"
+                } else {
+                    "CONFIDENT (gap >> logit-noise => STRUCTURAL — investigate!)"
+                }
+            );
+        }
+        if global_max_diff >= 5.0 {
+            eprintln!(
+                "*** VERDICT SIGNAL: max abs logit diff {:.4} >= 5.0 at PREFILL/early \
+                 positions — this is NOT plausible 8-bit-codebook V-quant rounding \
+                 noise. The slot-aware forward is computing a STRUCTURALLY different \
+                 result, not merely a finite-precision variant. See the \
+                 adr040_f_m1_prefill_disambiguation companion test for the \
+                 batched-vs-nonbatched-vs-slot isolation. ***",
+                global_max_diff
+            );
+        }
+        eprintln!("==== end ADR-040 F M1 characterization ====\n");
+
+        // Sanity invariant: logits must be finite + non-degenerate. We do
+        // NOT assert a tight bound here — this is a measurement test whose
+        // job is to MEASURE the delta. The companion disambiguation test
+        // pins the root-cause axis.
+        assert!(global_max_diff.is_finite(), "ADR-040 F M1: non-finite logit delta");
+    }
+
+    /// ADR-040 Phase F M1 — PREFILL-ONLY disambiguation. The
+    /// characterization test above shows a ~20-logit delta at decode
+    /// position 0 (the PREFILL output, before ANY KV-quantized decode
+    /// round-trip), which rules out TQ-V-quant decode noise as the cause.
+    /// This test isolates the prefill delta across the THREE prefill kernels
+    /// the two generate paths actually use:
+    ///   (A) legacy DEFAULT: `forward_prefill_batched`            (generate_once)
+    ///   (B) legacy non-batched: `forward_prefill_with_soft_tokens_resume`
+    ///   (C) slot-aware: `forward_prefill_with_soft_tokens_slot_aware`
+    ///       (which internally DELEGATES to (B) after mounting per-slot KV
+    ///        views — see forward_prefill.rs:3676)
+    ///
+    /// Greedy prefill argmax + full logits captured for each. We then report
+    /// max abs logit diff for A-vs-B (batched-vs-nonbatched axis) and
+    /// B-vs-C (slot-view-mount axis). This pinpoints whether the delta lives
+    /// in the batched/non-batched prefill split (a pre-existing axis,
+    /// orthogonal to slot-awareness) or in the slot-aware KV-view mount
+    /// itself.
+    #[test]
+    fn adr040_f_m1_prefill_disambiguation() {
+        if byte_equiv_skip_unless_gated("adr040_f_m1_prefill_disambiguation") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
+        let max_tokens = 16usize;
+
+        // (A) legacy batched prefill.
+        let (a_argmax, a_logits) = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load A");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("Gemma") };
+            let am = g.weights.forward_prefill_batched(&prompt, max_tokens, 0, &mut g.ctx)
+                .expect("A prefill_batched");
+            (am, g.weights.logits_view().expect("A logits").to_vec())
+        };
+        // (B) legacy non-batched resume prefill.
+        let (b_argmax, b_logits) = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load B");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("Gemma") };
+            let am = g.weights.forward_prefill_with_soft_tokens_resume(
+                &prompt, &[], max_tokens, &mut g.ctx, None, false,
+            ).expect("B prefill_resume");
+            (am, g.weights.logits_view().expect("B logits").to_vec())
+        };
+        // (C) slot-aware prefill.
+        let (c_argmax, c_logits) = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load C");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("Gemma") };
+            g.provision_multi_seq_kv_for_slot_aware(1).expect("provision");
+            let mut kv = g.multi_seq_kv.take().expect("kv");
+            let mut hybrid = g.multi_seq_kv_hybrid.take();
+            let mut dense = g.multi_seq_kv_dense.take();
+            let mut mlx = g.multi_seq_kv_mlx.take();
+            for buf in kv.iter_mut() {
+                buf.reset_for_slot(SlotId(0)).expect("reset hb");
+            }
+            if let Some(ref mut h) = hybrid {
+                for buf in h.iter_mut() {
+                    buf.reset_for_slot(SlotId(0)).expect("reset hybrid");
+                }
+            }
+            let am = g.weights.forward_prefill_with_soft_tokens_slot_aware(
+                &prompt, &[], max_tokens, &mut g.ctx, SlotId(0),
+                &mut kv, hybrid.as_mut(), dense.as_mut(), mlx.as_mut(),
+            ).expect("C prefill_slot_aware");
+            let lg = g.weights.logits_view().expect("C logits").to_vec();
+            g.multi_seq_kv = Some(kv);
+            g.multi_seq_kv_hybrid = hybrid;
+            g.multi_seq_kv_dense = dense;
+            g.multi_seq_kv_mlx = mlx;
+            (am, lg)
+        };
+
+        let vocab = a_logits.len();
+        assert_eq!(vocab, b_logits.len());
+        assert_eq!(vocab, c_logits.len());
+        let max_abs = |x: &[f32], y: &[f32]| -> f32 {
+            x.iter().zip(y.iter()).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max)
+        };
+        let ab = max_abs(&a_logits, &b_logits);
+        let bc = max_abs(&b_logits, &c_logits);
+        let ac = max_abs(&a_logits, &c_logits);
+        eprintln!("\n==== ADR-040 F M1 PREFILL disambiguation ====");
+        eprintln!("prompt={:?} vocab={}", prompt, vocab);
+        eprintln!(
+            "(A) legacy batched      prefill argmax = {}",
+            a_argmax
+        );
+        eprintln!(
+            "(B) legacy non-batched  prefill argmax = {}",
+            b_argmax
+        );
+        eprintln!(
+            "(C) slot-aware          prefill argmax = {}",
+            c_argmax
+        );
+        eprintln!("max|A-B| (batched vs non-batched)        = {:.6}", ab);
+        eprintln!("max|B-C| (non-batched vs slot-aware MOUNT)= {:.6}", bc);
+        eprintln!("max|A-C| (legacy-default vs slot-aware)   = {:.6}", ac);
+        eprintln!(
+            "INTERPRETATION: if max|B-C| ~ 0 then slot-aware prefill == legacy \
+             non-batched prefill (delta lives in the batched/non-batched axis, \
+             which is ORTHOGONAL to slot-awareness). If max|B-C| is large, the \
+             slot-view KV mount itself perturbs the prefill."
+        );
+        eprintln!("==== end PREFILL disambiguation ====\n");
+        assert!(ab.is_finite() && bc.is_finite() && ac.is_finite());
+
+        // ── FULL-DECODE B-vs-C: confirm slot-aware tracks legacy NON-BATCHED
+        // through the entire greedy decode (not just prefill). Teacher-force
+        // BOTH on the legacy NON-BATCHED greedy stream so the input history
+        // is identical, then compare logits at every position. If max|B-C|
+        // stays ~0 across decode, the slot-aware forward is byte-faithful to
+        // the legacy non-batched forward — the only delta vs the SerialFifo
+        // DEFAULT is the batched-vs-non-batched prefill axis pinned above. ──
+        let (b_stream, _) = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load Bstream");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("Gemma") };
+            // Drive legacy NON-BATCHED greedy: prefill_resume then forward_decode.
+            let mut stream = Vec::with_capacity(max_tokens);
+            let am = g.weights.forward_prefill_with_soft_tokens_resume(
+                &prompt, &[], max_tokens, &mut g.ctx, None, false,
+            ).expect("Bstream prefill");
+            stream.push(am);
+            let mut nt = am;
+            for step in 1..max_tokens {
+                let pos = prompt.len() + step - 1;
+                let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+                let g_tok = g.weights.forward_decode(nt, pos, &mut g.ctx, &mut p)
+                    .expect("Bstream decode");
+                stream.push(g_tok);
+                nt = g_tok;
+            }
+            (stream, ())
+        };
+        // B-path teacher-forced logits.
+        let b_tf = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load Btf");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("Gemma") };
+            capture_legacy_logits_nonbatched(g, &prompt, max_tokens, &b_stream)
+        };
+        // C-path (slot-aware) teacher-forced logits.
+        let c_tf = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load Ctf");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("Gemma") };
+            g.provision_multi_seq_kv_for_slot_aware(1).expect("provision Ctf");
+            let mut kv = g.multi_seq_kv.take().expect("kv");
+            let mut hybrid = g.multi_seq_kv_hybrid.take();
+            let mut dense = g.multi_seq_kv_dense.take();
+            let mut mlx = g.multi_seq_kv_mlx.take();
+            let (_, lg) = capture_slot_aware_logits(
+                g, &prompt, max_tokens, Some(&b_stream),
+                &mut kv, hybrid.as_mut(), dense.as_mut(), mlx.as_mut(),
+            );
+            g.multi_seq_kv = Some(kv);
+            g.multi_seq_kv_hybrid = hybrid;
+            g.multi_seq_kv_dense = dense;
+            g.multi_seq_kv_mlx = mlx;
+            lg
+        };
+        let mut decode_max = 0.0f32;
+        let mut decode_max_pos = 0usize;
+        for pos in 0..max_tokens {
+            let d = max_abs(&b_tf[pos], &c_tf[pos]);
+            if d > decode_max {
+                decode_max = d;
+                decode_max_pos = pos;
+            }
+        }
+        eprintln!("==== ADR-040 F M1 FULL-DECODE B(non-batched legacy) vs C(slot-aware) ====");
+        eprintln!("legacy non-batched greedy stream: {:?}", b_stream);
+        eprintln!(
+            "max|B-C| over ALL {} decode positions (teacher-forced) = {:.8} @pos {}",
+            max_tokens, decode_max, decode_max_pos
+        );
+        eprintln!(
+            "INTERPRETATION: ~0 ⇒ slot-aware forward is byte-faithful to the legacy \
+             NON-BATCHED forward end-to-end; the h77 SerialFifo delta is SOLELY the \
+             batched-vs-non-batched prefill axis (orthogonal to slot-awareness). The \
+             TQ-HB-V 8-bit KV quant introduces NO observable decode delta vs the \
+             legacy hybrid KV (both use the SAME hybrid F16-K + TQ-HB-V cache)."
+        );
+        eprintln!("==== end FULL-DECODE B-vs-C ====\n");
+        assert!(decode_max.is_finite());
+    }
+
+    /// Helper: capture legacy NON-BATCHED prefill+decode logits, teacher-forced.
+    fn capture_legacy_logits_nonbatched(
+        g: &mut GemmaLoadedModel,
+        prompt_tokens: &[u32],
+        max_tokens: usize,
+        driver_tokens: &[u32],
+    ) -> Vec<Vec<f32>> {
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(max_tokens);
+        let _am = g.weights.forward_prefill_with_soft_tokens_resume(
+            prompt_tokens, &[], max_tokens, &mut g.ctx, None, false,
+        ).expect("nb prefill");
+        out.push(g.weights.logits_view().expect("nb prefill logits").to_vec());
+        let mut nt = driver_tokens[0];
+        for step in 1..max_tokens {
+            let pos = prompt_tokens.len() + step - 1;
+            let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+            let _g = g.weights.forward_decode(nt, pos, &mut g.ctx, &mut p)
+                .expect("nb decode");
+            out.push(g.weights.logits_view().expect("nb decode logits").to_vec());
+            nt = driver_tokens[step];
+        }
+        out
+    }
+
+    /// F1 AC1+AC2 — N concurrent distinct prompts through SlotAware each
+    /// match their own SerialFifo reference (per-slot independence + no
+    /// cross-slot leakage). Drives 4 distinct prompts concurrently on a
+    /// multi-thread runtime through one `SlotAware { max_slots: 4 }` engine,
+    /// then computes the serial reference for each prompt and asserts
+    /// per-prompt byte equality. A `assert_ne` guard rejects a fixture
+    /// where the distinct prompts collapse to identical output (which would
+    /// make the cross-slot isolation assertions vacuous).
+    #[test]
+    fn slot_aware_n4_per_slot_parity_vs_serial() {
+        if byte_equiv_skip_unless_gated("slot_aware_n4_per_slot_parity_vs_serial") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+
+        // Four distinct greedy prompts.
+        let prompts: Vec<Vec<u32>> =
+            vec![vec![1, 2, 3], vec![4, 5, 6, 7], vec![8, 9], vec![10, 11, 12, 13, 14]];
+        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+
+        // Serial slot-aware references (SAME forward path as the SlotAware
+        // loop) — the AC4-correct bar, decoupled from the legacy-forward
+        // delta (h77). One independent model per prompt.
+        let serial_refs: Vec<GenerationResult> = prompts
+            .iter()
+            .map(|p| gemma4_serial_slot_aware_ref(&load_opts, p, &params))
+            .collect();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("rt");
+
+        // Vacuous-test guard: distinct prompts must not collapse to the
+        // same output, else cross-slot isolation is untested.
+        assert_ne!(
+            serial_refs[0].text, serial_refs[1].text,
+            "vacuous: prompts 0 and 1 produced identical serial output"
+        );
+
+        // Concurrent SlotAware run: clone the engine handle per prompt and
+        // drive all generates concurrently on the multi-thread runtime.
+        let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
+        let engine_slot =
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 4 })
+                .expect("spawn SlotAware{max_slots:4}");
+        let slot_results: Vec<GenerationResult> = rt.block_on(async {
+            let mut handles = Vec::new();
+            for p in prompts.iter().cloned() {
+                let eng = engine_slot.clone();
+                let pr = params.clone();
+                handles.push(tokio::spawn(async move {
+                    eng.generate(p, pr).await.expect("slot generate")
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.expect("join"));
+            }
+            out
+        });
+        for (i, (slot, serial)) in slot_results.iter().zip(serial_refs.iter()).enumerate() {
+            assert_genresult_byte_equal(
+                slot,
+                serial,
+                &format!("ADR-040 F1 AC1/AC2 — SlotAware N=4 slot {i} vs its serial ref"),
+            );
+        }
+        rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+    }
+
+    /// ADR-040 §0.16 `iter-F-batched-determinism-residual` FALSIFIER (2026-06-25).
+    /// Bisects the trigger of the batched-body staggered flake. `n4_per_slot_parity`
+    /// uses DISTINCT prompts (compares each slot only to its OWN serial ref → blind
+    /// to slot-0-vs-slot-N divergence). This test uses an IDENTICAL prompt in all
+    /// slots so any slot-index flavor split shows as a non-prefix of the single
+    /// serial ref. Modes via env (batched body must be forced on, else no-op):
+    ///   * default (MS=0, EVICT=0): simultaneous N=4, equal budget — **PASSES**.
+    ///   * HF2Q_FALSIFIER_STAGGER_MS=40: staggered admission, equal budget — **PASSES** (3/3+).
+    ///   * HF2Q_FALSIFIER_EVICT=1: slot 0 short→freed→5th reuses it, uniform long
+    ///     budget for peers — **PASSES** (7/7).
+    /// EXCLUSIONS PROVEN (2026-06-25): the residual is NOT same-prompt-alone, NOT
+    /// staggered-admission-alone, NOT varying-N-by-join, NOT a single clean
+    /// uniform-budget eviction. The live `staggered_eviction` test (which DOES fail
+    /// ~13%) differs only by DISTINCT per-slot budgets [5/50/200/10] → eviction
+    /// CHURN (multiple slots finishing+recycling at different ticks). That churn,
+    /// not any single ingredient here, is the remaining trigger — consistent with
+    /// codex H1 (stale batched-decode state inherited across the reset/reuse path).
+    /// Kept as a regression guard for the same-prompt batched-body parity that
+    /// `n4_per_slot_parity` cannot cover.
+    #[test]
+    fn slot_aware_n4_batched_body_same_prompt_parity_vs_serial() {
+        if byte_equiv_skip_unless_gated("slot_aware_n4_batched_body_same_prompt_parity_vs_serial") {
+            return;
+        }
+        if std::env::var("HF2Q_BATCHED_BODY").as_deref() != Ok("1") {
+            eprintln!(
+                "[skip] slot_aware_n4_batched_body_same_prompt_parity_vs_serial — \
+                 set HF2Q_BATCHED_BODY=1 (+ HF2Q_BATCHED_ATTNPRE=1 HF2Q_BATCHED_FLASH=1) to run"
+            );
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+
+        // IDENTICAL prompt in all four slots. Serial ref at the LONGEST budget so
+        // every slot's greedy output is a prefix of it.
+        let prompt: Vec<u32> = vec![2, 4, 6, 8];
+        let ref_params =
+            SamplingParams { temperature: 0.0, max_tokens: 40, ..Default::default() };
+        let serial = gemma4_serial_slot_aware_ref(&load_opts, &prompt, &ref_params);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("rt");
+        let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
+        let engine_slot =
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 4 })
+                .expect("spawn SlotAware{max_slots:4}");
+        // STAGGER admission: HF2Q_FALSIFIER_STAGGER_MS>0 inserts an increasing
+        // pre-generate delay per slot so each prefills SEPARATELY (slot 0 solo,
+        // then slot 1, …) — reproducing the eviction test's staggered prefill
+        // WITHOUT eviction/varying-budget. If the simultaneous run (MS=0) passes
+        // but the staggered run fails, the trigger is admission timing / prefill
+        // ordering (codex H1: prior solo-prefill leaves stale batched-decode state).
+        let stagger_ms: u64 = std::env::var("HF2Q_FALSIFIER_STAGGER_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        // EVICTION mode: give slot 0 a SHORT budget so it finishes and frees its
+        // slot mid-stream; a 5th same-prompt request is then admitted into the
+        // recycled slot while the long slots keep decoding. This is the ONLY
+        // differentiator left vs the (passing) simultaneous/staggered runs above.
+        let evict = std::env::var("HF2Q_FALSIFIER_EVICT").as_deref() == Ok("1");
+        let long = 40usize;
+        let budgets: Vec<usize> = if evict { vec![4, long, long, long] } else { vec![24; 4] };
+        let slot_results: Vec<GenerationResult> = rt.block_on(async {
+            let mut handles = Vec::new();
+            for (slot_i, &b) in budgets.iter().enumerate() {
+                let eng = engine_slot.clone();
+                let p = prompt.clone();
+                let pr = SamplingParams { temperature: 0.0, max_tokens: b, ..Default::default() };
+                let si = slot_i as u64;
+                handles.push(tokio::spawn(async move {
+                    if stagger_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(si * stagger_ms)).await;
+                    }
+                    eng.generate(p, pr).await.expect("slot generate")
+                }));
+            }
+            // 5th request reuses the slot freed by the short budget-4 slot.
+            if evict {
+                let eng = engine_slot.clone();
+                let p = prompt.clone();
+                let pr = SamplingParams { temperature: 0.0, max_tokens: long, ..Default::default() };
+                handles.push(tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    eng.generate(p, pr).await.expect("slot5 generate")
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.expect("join"));
+            }
+            out
+        });
+        // Greedy + same prompt ⇒ every slot's text MUST be a prefix of the serial
+        // ref (each just stops at its own budget). Any divergence = the residual.
+        for (i, slot) in slot_results.iter().enumerate() {
+            assert!(
+                serial.text.starts_with(&slot.text),
+                "ADR-040 §0.16 — batched-body N=4 SAME-prompt (stagger_ms={stagger_ms} evict={evict}) \
+                 slot {i} text is NOT a prefix of the serial ref (FAIL ⇒ this admission pattern is the trigger)\n  slot:   {:?}\n  serial: {:?}",
+                slot.text, serial.text,
+            );
+        }
+        rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+    }
+
+    /// ADR-040 Phase F `iter-F-n8parity` (2026-06-24, queen-led audit Worker B
+    /// gap-closure) — the N=**8** analogue of `slot_aware_n4_per_slot_parity_vs_serial`.
+    /// Phase F raised the live continuous-batching default to N=8
+    /// (`ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS`), but the parity bar
+    /// above hard-codes `max_slots: 4`, leaving the shipped default's coherence
+    /// *extrapolated* from the exact `MM_ROUTING_THRESHOLD(=8)` dispatch boundary
+    /// rather than *proven*. This drives 8 distinct prompts concurrently through
+    /// one `SlotAware { max_slots: 8 }` engine and asserts each slot is
+    /// byte-identical to its independent serial slot-aware reference — closing
+    /// the audit's "no N=8 byte-parity test" gap. Run through the batched body
+    /// with `HF2Q_BATCHED_BODY=1` (+`_KVENC`/`_ATTNPRE`) to prove the S2/S3 path
+    /// at the default width; gated by the shared E2E GGUF env like its N=4 peer.
+    #[test]
+    fn slot_aware_n8_per_slot_parity_vs_serial() {
+        if byte_equiv_skip_unless_gated("slot_aware_n8_per_slot_parity_vs_serial") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+
+        // Eight distinct greedy prompts (the N=4 set + four more distinct ones).
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![1, 2, 3],
+            vec![4, 5, 6, 7],
+            vec![8, 9],
+            vec![10, 11, 12, 13, 14],
+            vec![15, 16],
+            vec![17, 18, 19, 20],
+            vec![21, 22, 23],
+            vec![24, 25, 26, 27, 28],
+        ];
+        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+
+        // Serial slot-aware references (AC4-correct bar; one model per prompt).
+        let serial_refs: Vec<GenerationResult> = prompts
+            .iter()
+            .map(|p| gemma4_serial_slot_aware_ref(&load_opts, p, &params))
+            .collect();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .expect("rt");
+
+        // Vacuous-test guard: probe both ends of the slot range so neither the
+        // low nor the high slots can silently collapse to identical output.
+        assert_ne!(
+            serial_refs[0].text, serial_refs[1].text,
+            "vacuous: prompts 0 and 1 produced identical serial output"
+        );
+        assert_ne!(
+            serial_refs[6].text, serial_refs[7].text,
+            "vacuous: prompts 6 and 7 produced identical serial output"
+        );
+
+        // Concurrent SlotAware run at the SHIPPED default width (max_slots: 8).
+        let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
+        let engine_slot =
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 8 })
+                .expect("spawn SlotAware{max_slots:8}");
+        let slot_results: Vec<GenerationResult> = rt.block_on(async {
+            let mut handles = Vec::new();
+            for p in prompts.iter().cloned() {
+                let eng = engine_slot.clone();
+                let pr = params.clone();
+                handles.push(tokio::spawn(async move {
+                    eng.generate(p, pr).await.expect("slot generate")
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.expect("join"));
+            }
+            out
+        });
+        for (i, (slot, serial)) in slot_results.iter().zip(serial_refs.iter()).enumerate() {
+            assert_genresult_byte_equal(
+                slot,
+                serial,
+                &format!("ADR-040 iter-F-n8parity — SlotAware N=8 slot {i} vs its serial ref"),
+            );
+        }
+        rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+    }
+
+    /// ADR-040 M2.2 — INFORMATIONAL throughput probe for the `[N,hidden]`
+    /// batched decode body (S2/S3). Drives 4 concurrent SlotAware generates of
+    /// `BENCH_TOKENS` tokens and prints aggregate decode tok/s. Read the env
+    /// `HF2Q_BATCHED_BODY` the harness was launched with and run it BOTH ways to
+    /// compare. Gated by HF2Q_BATCHED_BENCH=1 (+ the shared E2E GGUF gate); not
+    /// an assertion — the parity bar is owned by `slot_aware_n4`.
+    #[test]
+    fn slot_aware_n4_batched_body_throughput_probe() {
+        if std::env::var("HF2Q_BATCHED_BENCH").as_deref() != Ok("1") {
+            eprintln!("[skip] slot_aware_n4_batched_body_throughput_probe — set HF2Q_BATCHED_BENCH=1 + HF2Q_BYTE_EQUIV_E2E_GGUF to run");
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path,
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        const BENCH_TOKENS: usize = 128;
+        // HF2Q_BENCH_N = number of concurrent streams (default 4, max 8) — lets
+        // us measure single-stream (N=1) vs batched scaling. For N>4 set
+        // HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS=N to clear the A4 threshold gate.
+        let n_streams: usize = std::env::var("HF2Q_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+            .clamp(1, 8);
+        let base = [vec![1u32, 2, 3], vec![4, 5, 6, 7], vec![8, 9], vec![10, 11, 12, 13, 14],
+                    vec![15, 16, 17], vec![18, 19, 20, 21], vec![22, 23], vec![24, 25, 26, 27, 28]];
+        let prompts: Vec<Vec<u32>> = (0..n_streams).map(|i| base[i].clone()).collect();
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens: BENCH_TOKENS,
+            ..Default::default()
+        };
+        let batched_on = std::env::var("HF2Q_BATCHED_BODY").as_deref() == Ok("1");
+        let loaded = LoadedModel::load(&load_opts).expect("load");
+        let engine = Engine::spawn_with_mode(
+            loaded, 16, None,
+            EngineMode::SlotAware { max_slots: n_streams as u32 },
+        )
+        .expect("spawn SlotAware");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("rt");
+        // Warm-up generate (model load / pipeline bake) — not timed.
+        let _ = rt.block_on(engine.clone().generate(
+            prompts[0].clone(),
+            SamplingParams { temperature: 0.0, max_tokens: 8, ..Default::default() },
+        ));
+        let t0 = std::time::Instant::now();
+        let results: Vec<GenerationResult> = rt.block_on(async {
+            let mut handles = Vec::new();
+            for p in prompts.iter().cloned() {
+                let eng = engine.clone();
+                let pr = params.clone();
+                handles.push(tokio::spawn(async move {
+                    eng.generate(p, pr).await.expect("generate")
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.expect("join"));
+            }
+            out
+        });
+        let elapsed = t0.elapsed();
+        let total_tokens: usize = results.iter().map(|r| r.completion_tokens).sum();
+        let tok_s = total_tokens as f64 / elapsed.as_secs_f64();
+        eprintln!(
+            "[THROUGHPUT] batched_body={} N={} concurrent: {} tokens in {:.3}s = {:.1} tok/s aggregate ({:.1}/stream)",
+            batched_on, n_streams, total_tokens, elapsed.as_secs_f64(), tok_s,
+            tok_s / n_streams as f64,
+        );
+        rt.block_on(engine.shutdown()).expect("shutdown");
+    }
+
+    /// F1 AC3 — staggered max_tokens: short slots finish early and are
+    /// evicted without perturbing peers; each slot's output still matches
+    /// its serial reference at its own max_tokens. Exercises mid-batch
+    /// eviction + slot refill.
+    #[test]
+    fn slot_aware_staggered_eviction_no_peer_perturbation() {
+        if byte_equiv_skip_unless_gated("slot_aware_staggered_eviction_no_peer_perturbation") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+
+        // Same prompt, divergent max_tokens (5 / 50 / 200) so slots finish
+        // at staggered ticks; a 5th prompt is admitted to reuse a freed slot.
+        let prompt: Vec<u32> = vec![2, 4, 6, 8];
+        let budgets = [5usize, 50, 200];
+
+        // Serial slot-aware reference per (prompt, max_tokens) — SAME
+        // forward path as the SlotAware loop (AC4-correct bar).
+        let serial_refs: Vec<GenerationResult> = budgets
+            .iter()
+            .map(|&mt| {
+                let pr = SamplingParams { temperature: 0.0, max_tokens: mt, ..Default::default() };
+                gemma4_serial_slot_aware_ref(&load_opts, &prompt, &pr)
+            })
+            .collect();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("rt");
+
+        let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
+        let engine_slot =
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 4 })
+                .expect("spawn SlotAware{max_slots:4}");
+        let slot_results: Vec<GenerationResult> = rt.block_on(async {
+            let mut handles = Vec::new();
+            for &mt in budgets.iter() {
+                let eng = engine_slot.clone();
+                let p = prompt.clone();
+                let pr = SamplingParams { temperature: 0.0, max_tokens: mt, ..Default::default() };
+                handles.push(tokio::spawn(async move { eng.generate(p, pr).await.expect("slot") }));
+            }
+            // A 5th request that should reuse the slot freed by the
+            // max_tokens=5 completion.
+            {
+                let eng = engine_slot.clone();
+                let p = prompt.clone();
+                let pr = SamplingParams { temperature: 0.0, max_tokens: 10, ..Default::default() };
+                handles.push(tokio::spawn(async move { eng.generate(p, pr).await.expect("slot5") }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.expect("join"));
+            }
+            out
+        });
+
+        // The three staggered slots each match their serial reference at
+        // their own max_tokens (peers were not perturbed by early eviction).
+        for (i, &mt) in budgets.iter().enumerate() {
+            assert_genresult_byte_equal(
+                &slot_results[i],
+                &serial_refs[i],
+                &format!("ADR-040 F1 AC3 — staggered slot max_tokens={mt} vs serial ref"),
+            );
+        }
+        rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+    }
+
+    /// ADR-040 §0.12 BLOCKING investigation — characterize the legacy
+    /// `generate_once` vs slot-aware forward divergence at the LOGIT level
+    /// (not just argmax). Runs the SAME prompt's prefill through both paths
+    /// and compares the first-token logits vector: max abs diff, mean abs
+    /// diff, whether the greedy argmax flips, and (if it flips) the logit
+    /// gap at the flip (near-tie ⇒ benign quant noise; large gap ⇒ bug).
+    /// Prints the numbers (run with --nocapture). This isolates the
+    /// prefill+KV-representation delta (legacy single-seq F16/F32 KV vs the
+    /// slot-aware hybrid TQ-quantized V) from any decode-loop differences.
+    #[test]
+    fn forward_divergence_legacy_vs_slot_aware_logit_delta() {
+        if byte_equiv_skip_unless_gated("forward_divergence_legacy_vs_slot_aware_logit_delta") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let prompt: Vec<u32> = vec![1u32, 2, 3, 4, 5];
+        let max_decode = 1usize; // first-token prefill logits only
+
+        // LEGACY prefill logits.
+        let mut legacy = LoadedModel::load(&load_opts).expect("load legacy");
+        let LoadedModel::Gemma(lg) = &mut legacy else { panic!("expected Gemma") };
+        let _legacy_tok = lg
+            .weights
+            .forward_prefill(&prompt, max_decode, &mut lg.ctx)
+            .expect("legacy forward_prefill");
+        let legacy_logits: Vec<f32> = lg.weights.logits_view().expect("legacy logits").to_vec();
+
+        // SLOT-AWARE prefill logits (production-default hybrid regime).
+        let mut slot = LoadedModel::load(&load_opts).expect("load slot");
+        let LoadedModel::Gemma(sg) = &mut slot else { panic!("expected Gemma") };
+        sg.provision_multi_seq_kv_for_slot_aware(1).expect("provision n_seqs=1");
+        let mut kv = sg.multi_seq_kv.take().expect("multi_seq_kv");
+        let mut hybrid = sg.multi_seq_kv_hybrid.take();
+        let mut dense = sg.multi_seq_kv_dense.take();
+        let mut mlx = sg.multi_seq_kv_mlx.take();
+        let _slot_tok = sg
+            .weights
+            .forward_prefill_with_soft_tokens_slot_aware(
+                &prompt,
+                &[],
+                max_decode,
+                &mut sg.ctx,
+                SlotId(0),
+                &mut kv,
+                hybrid.as_mut(),
+                dense.as_mut(),
+                mlx.as_mut(),
+            )
+            .expect("slot-aware prefill");
+        let slot_logits: Vec<f32> = sg.weights.logits_view().expect("slot logits").to_vec();
+        sg.multi_seq_kv = Some(kv);
+        sg.multi_seq_kv_hybrid = hybrid;
+        sg.multi_seq_kv_dense = dense;
+        sg.multi_seq_kv_mlx = mlx;
+
+        assert_eq!(
+            legacy_logits.len(),
+            slot_logits.len(),
+            "logit vocab size mismatch — structural, not a numeric delta"
+        );
+
+        // Quantify the delta.
+        let mut max_abs = 0.0f32;
+        let mut sum_abs = 0.0f64;
+        for (a, b) in legacy_logits.iter().zip(slot_logits.iter()) {
+            let d = (a - b).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+            sum_abs += d as f64;
+        }
+        let mean_abs = sum_abs / legacy_logits.len() as f64;
+        let argmax = |v: &[f32]| -> usize {
+            v.iter()
+                .enumerate()
+                .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        let legacy_arg = argmax(&legacy_logits);
+        let slot_arg = argmax(&slot_logits);
+        let flipped = legacy_arg != slot_arg;
+        // Logit gap at the legacy argmax: how close was the runner-up? A
+        // small gap means the argmax sits on a near-tie (a tiny perturbation
+        // flips it — benign). A large gap that still flips ⇒ structural bug.
+        let mut legacy_top2 = legacy_logits.clone();
+        legacy_top2.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        let legacy_gap = legacy_top2[0] - legacy_top2[1];
+
+        eprintln!(
+            "[fwd-divergence PREFILL] vocab={} max_abs_logit_diff={:.6} mean_abs_logit_diff={:.6} \
+             legacy_argmax={} slot_argmax={} argmax_flipped={} legacy_top1_minus_top2={:.6} \
+             max_abs_as_frac_of_gap={:.4}",
+            legacy_logits.len(),
+            max_abs,
+            mean_abs,
+            legacy_arg,
+            slot_arg,
+            flipped,
+            legacy_gap,
+            if legacy_gap > 0.0 { max_abs / legacy_gap } else { f32::INFINITY },
+        );
+        assert!(legacy_logits.iter().all(|x| x.is_finite()), "legacy logits non-finite");
+        assert!(slot_logits.iter().all(|x| x.is_finite()), "slot logits non-finite");
+
+        // ── DECODE-STEP comparison ───────────────────────────────────────
+        // The prefill logits matched exactly above ⇒ any divergence emerges
+        // during DECODE (KV readback). Drive BOTH paths greedily in LOCKSTEP
+        // feeding the SAME token each step (legacy's argmax) so we compare
+        // logits at the SAME position with the SAME input — isolating the
+        // forward/KV-readback delta from input drift. Report, per decode
+        // position: max abs logit diff, whether argmax agrees, and the
+        // legacy top1-top2 gap (to judge near-tie).
+        let mut legacy_re = LoadedModel::load(&load_opts).expect("reload legacy");
+        let LoadedModel::Gemma(lg2) = &mut legacy_re else { panic!("expected Gemma") };
+        let mut slot_re = LoadedModel::load(&load_opts).expect("reload slot");
+        let LoadedModel::Gemma(sg2) = &mut slot_re else { panic!("expected Gemma") };
+        sg2.provision_multi_seq_kv_for_slot_aware(1).expect("provision n_seqs=1");
+        let mut kv2 = sg2.multi_seq_kv.take().expect("kv2");
+        let mut hyb2 = sg2.multi_seq_kv_hybrid.take();
+        let mut den2 = sg2.multi_seq_kv_dense.take();
+        let mut mlx2 = sg2.multi_seq_kv_mlx.take();
+        let n_decode = 12usize;
+        let l_first = lg2.weights.forward_prefill(&prompt, n_decode, &mut lg2.ctx).expect("lp");
+        let s_first = sg2
+            .weights
+            .forward_prefill_with_soft_tokens_slot_aware(
+                &prompt, &[], n_decode, &mut sg2.ctx, SlotId(0),
+                &mut kv2, hyb2.as_mut(), den2.as_mut(), mlx2.as_mut(),
+            )
+            .expect("sp");
+        assert_eq!(l_first, s_first, "first token already differs (contradicts prefill match)");
+        let mut feed = l_first;
+        let mut first_argmax_flip: Option<usize> = None;
+        for step in 1..n_decode {
+            let pos = prompt.len() + step - 1;
+            let mut p: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+            let l_tok = lg2.weights.forward_decode(feed, pos, &mut lg2.ctx, &mut p).expect("ld");
+            let l_log: Vec<f32> = lg2.weights.logits_view().expect("ll").to_vec();
+            let mut p2: Option<crate::inference::models::gemma4::profile::TokenProfile> = None;
+            let s_tok = sg2
+                .weights
+                .forward_decode_slot_aware(
+                    feed, pos, &mut sg2.ctx, &mut p2, SlotId(0),
+                    &mut kv2, hyb2.as_mut(), den2.as_mut(), mlx2.as_mut(),
+                )
+                .expect("sd");
+            let s_log: Vec<f32> = sg2.weights.logits_view().expect("sl").to_vec();
+            let mut mx = 0.0f32;
+            for (a, b) in l_log.iter().zip(s_log.iter()) {
+                let d = (a - b).abs();
+                if d > mx { mx = d; }
+            }
+            let mut t2 = l_log.clone();
+            t2.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            let gap = t2[0] - t2[1];
+            let flip = l_tok != s_tok;
+            if flip && first_argmax_flip.is_none() {
+                first_argmax_flip = Some(step);
+            }
+            eprintln!(
+                "[fwd-divergence DECODE step={step} pos={pos}] max_abs_logit_diff={mx:.6} \
+                 legacy_tok={l_tok} slot_tok={s_tok} flip={flip} legacy_gap={gap:.6} \
+                 frac_of_gap={:.4}",
+                if gap > 0.0 { mx / gap } else { f32::INFINITY }
+            );
+            feed = l_tok; // lockstep on legacy's stream
+        }
+        eprintln!(
+            "[fwd-divergence SUMMARY] prefill_logits_identical={} first_decode_argmax_flip_step={:?}",
+            max_abs == 0.0, first_argmax_flip
+        );
+        // LOAD-BEARING PIN (ADR-040 §0.12 verdict): the slot-aware forward
+        // is NUMERICALLY IDENTICAL to the legacy NON-batched forward at
+        // n_seqs=1 — same prefill logits, same per-step decode argmax. The
+        // legacy-vs-slot-aware divergence seen end-to-end is NOT a forward
+        // bug; it is the batched-vs-non-batched PREFILL delta (generate_once
+        // defaults to forward_prefill_batched). If this assertion ever
+        // fails, the slot-aware forward has genuinely diverged from the
+        // model's reference math — a real bug, stop and investigate.
+        assert!(
+            max_abs == 0.0 && first_argmax_flip.is_none(),
+            "ADR-040 §0.12: slot-aware forward diverged from the legacy \
+             non-batched forward (prefill max_abs={max_abs}, first_flip={:?}) \
+             — this is a forward-correctness regression, NOT the benign \
+             batched-prefill delta.",
+            first_argmax_flip
+        );
+        sg2.multi_seq_kv = Some(kv2);
+        sg2.multi_seq_kv_hybrid = hyb2;
+        sg2.multi_seq_kv_dense = den2;
+        sg2.multi_seq_kv_mlx = mlx2;
+
+        // ── FULL-GENERATE wrapper comparison ─────────────────────────────
+        // The forwards are identical (above). So if generate_once (legacy
+        // full fn) differs from the slot-aware full fn, the divergence is in
+        // the GENERATE-LOOP WRAPPER (greedy fast-path token capture, prompt-
+        // cache, sampling, first-token handling), NOT the forward.
+        let params = SamplingParams { temperature: 0.0, max_tokens: 16, ..Default::default() };
+        let mut legacy_gen = LoadedModel::load(&load_opts).expect("load legacy gen");
+        let LoadedModel::Gemma(lg3) = &mut legacy_gen else { panic!("expected Gemma") };
+        let r_legacy = generate_once(lg3, &prompt, &params, None).expect("generate_once");
+        let r_slot_ref = gemma4_serial_slot_aware_ref(&load_opts, &prompt, &params);
+        eprintln!(
+            "[fwd-divergence WRAPPER] generate_once vs serial_slot_aware: text_match={} \
+             legacy_completion_tokens={} slot_completion_tokens={} legacy_finish={} slot_finish={}",
+            r_legacy.text == r_slot_ref.text,
+            r_legacy.completion_tokens,
+            r_slot_ref.completion_tokens,
+            r_legacy.finish_reason,
+            r_slot_ref.finish_reason,
+        );
+        if r_legacy.text != r_slot_ref.text {
+            eprintln!("[fwd-divergence WRAPPER] legacy_text={:?}", r_legacy.text);
+            eprintln!("[fwd-divergence WRAPPER]   slot_text={:?}", r_slot_ref.text);
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -20069,21 +24080,87 @@ mod adr040_phase_c_iter1_engine_mode_tests {
 mod adr040_phase_a4_iter1_spec_decode_threshold_gate_tests {
     use super::*;
 
-    /// **H229 (env-reader default)** — when
-    /// `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` is unset, the threshold
-    /// defaults to `ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS`
-    /// (= 4 per the dossier §1.5 + §3 published inflection-point).
+    /// **H229 (spec-decode env-reader default)** — when
+    /// `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` is unset, the spec-decode
+    /// drafter gate defaults to
+    /// `ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS` (= 4, the
+    /// conservative dossier §1.5 + §3 lower edge).  This default stays 4
+    /// FAIL-CLOSED — the continuous-batching ceiling (8) is the SEPARATE
+    /// `ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS`
+    /// (`adr040_phase_f_gate_decoupling_pin`).
     #[test]
     fn h229_env_reader_default_is_4_when_unset() {
         let threshold = read_spec_decode_max_batched_slots(|_| None);
         assert_eq!(
             threshold, ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS,
-            "H229: env unset MUST return the dossier-cited default 4 \
-             (spec-decode net-positive safe-zone ceiling)"
+            "H229: env unset MUST return the dossier-cited spec-decode default 4"
         );
         assert_eq!(
             threshold, 4,
-            "H229: default constant MUST be 4 per dossier §1.5 + §3"
+            "H229: spec-decode default MUST stay 4 (fail-closed) — the future \
+             drafter regresses above 4; continuous batching uses the separate \
+             ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS=8"
+        );
+    }
+
+    /// **Phase F gate decoupling pin** (codex `b671dfe0` review item (c)) —
+    /// the spec-decode drafter gate and the continuous-batching capacity
+    /// gate are SEPARATE constants with DIFFERENT defaults, so a future
+    /// drafter implementer cannot inherit the relaxed continuous default
+    /// for the actual spec-decode path.  If a refactor ever re-merges them
+    /// (makes both equal), this fails LOUDLY.
+    #[test]
+    fn adr040_phase_f_gate_decoupling_pin() {
+        assert_eq!(
+            ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS, 4,
+            "spec-decode drafter gate MUST stay 4 (fail-closed; dossier regression > 4)"
+        );
+        assert_eq!(
+            ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS, 8,
+            "continuous-batching ceiling MUST be 8 (operator request, N=8 proven)"
+        );
+        assert_ne!(
+            ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS,
+            ADR040_F_DEFAULT_CONTINUOUS_BATCHING_MAX_SLOTS,
+            "the two gates MUST remain decoupled — re-merging them re-opens the \
+             codex-flagged fail-open footgun (drafter inheriting the relaxed 8)"
+        );
+    }
+
+    /// **Phase F continuous-batching reader** — default 8, `HF2Q_MAX_BATCHED_SLOTS`
+    /// preferred, legacy `HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS` honoured as a
+    /// deprecated back-compat fallback.
+    #[test]
+    fn adr040_phase_f_continuous_batching_reader_default_and_precedence() {
+        // Unset → default 8.
+        assert_eq!(read_continuous_batching_max_slots(|_| None), 8);
+        // Primary env wins.
+        assert_eq!(
+            read_continuous_batching_max_slots(|n| (n == "HF2Q_MAX_BATCHED_SLOTS")
+                .then(|| "6".to_string())),
+            6
+        );
+        // Legacy env honoured as fallback when primary unset (back-compat).
+        assert_eq!(
+            read_continuous_batching_max_slots(|n| (n
+                == "HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS")
+                .then(|| "5".to_string())),
+            5
+        );
+        // Primary takes precedence over legacy when BOTH set.
+        assert_eq!(
+            read_continuous_batching_max_slots(|n| match n {
+                "HF2Q_MAX_BATCHED_SLOTS" => Some("8".to_string()),
+                "HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS" => Some("2".to_string()),
+                _ => None,
+            }),
+            8
+        );
+        // Zero/malformed trap to default.
+        assert_eq!(
+            read_continuous_batching_max_slots(|n| (n == "HF2Q_MAX_BATCHED_SLOTS")
+                .then(|| "0".to_string())),
+            8
         );
     }
 
@@ -24309,15 +28386,19 @@ mod adr040_phase_e1_closure_tests {
         );
     }
 
-    /// **E1 status marker pin** — ADR-040 top-of-document Status
-    /// line is updated to CLOSED (post-E1 ceremony).
+    /// **Status marker pin** — ADR-040 top-of-document Status line.
     ///
-    /// Companion to H46–H50: the document-level status MUST move
-    /// from `ACTIVE` to `CLOSED` once §6.1.26 lands, so external
-    /// ADR-index tooling + downstream cross-references see the
-    /// terminal state.
+    /// History: the Phase E1 closure ceremony (§6.1.26) marked the ADR
+    /// `CLOSED`. That closure was REOPENED on 2026-06-24 (Phase F) when
+    /// an empirical bench falsified the implicit "continuous batching
+    /// works" claim — the load-bearing throughput goal was never met
+    /// (0.85× regression; see §0). The honest top-of-document status is
+    /// now `REOPENED`, so external ADR-index tooling + downstream
+    /// cross-references see the live state, NOT a false terminal state.
+    /// This pin guards against the status silently reverting to a
+    /// premature CLOSED while the Phase F work is in flight.
     #[test]
-    fn e1_adr_status_line_marked_closed() {
+    fn adr040_status_line_marked_reopened() {
         let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
         // The Status line is the first `- **Status**:` line in the
         // file (per ADR-040 header). Restrict scan to the first
@@ -24326,16 +28407,18 @@ mod adr040_phase_e1_closure_tests {
         let header = &adr[..4096.min(adr.len())];
         let status_idx = header
             .find("- **Status**:")
-            .expect("E1: top-of-document Status line not found");
+            .expect("status: top-of-document Status line not found");
         let status_line_end = header[status_idx..]
             .find('\n')
             .unwrap_or(header.len() - status_idx);
         let status_line = &header[status_idx..status_idx + status_line_end];
         assert!(
-            status_line.contains("CLOSED") || status_line.contains("Closed"),
-            "E1 FALSIFIED: ADR-040 top-of-document Status line does \
-             not contain `CLOSED`. Phase E1 closure ceremony moves \
-             the ADR to terminal CLOSED status; line was: {status_line:?}"
+            status_line.contains("REOPENED") || status_line.contains("Reopened"),
+            "FALSIFIED: ADR-040 top-of-document Status line does not \
+             contain `REOPENED`. Phase F reopened the ADR-005 carve-out \
+             because the throughput goal was unmet (§0); the status must \
+             not silently revert to CLOSED while Phase F is active; \
+             line was: {status_line:?}"
         );
     }
 }
@@ -28092,7 +32175,10 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
         for required in [
             ".slice_view(",
             "self.hybrid_kv = Some(",
-            "self.forward_decode(",
+            // ADR-040 S1c-2: the delegate is now the capture-parameterized
+            // `forward_decode_impl` (forward_decode_slot_aware{,_capture_hidden}
+            // are thin wrappers passing capture_hidden=false/true).
+            "self.forward_decode_impl(",
             "self.hybrid_kv = prior_hybrid_kv",
         ] {
             assert!(
@@ -29032,11 +33118,14 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_cont_iter2_decode_b_gemma4_tests {
              `self.leg_hb_encoded = Some(` mount — decode-side per-slot \
              routing through HbKvBuffers' slot region cannot work."
         );
-        // Positive pin: delegate to forward_decode + restore.
+        // Positive pin: delegate to the sibling decode kernel + restore.
+        // ADR-040 S1c-2: delegate renamed to the capture-parameterized
+        // `forward_decode_impl` (forward_decode_slot_aware is now a thin
+        // capture_hidden=false wrapper).
         assert!(
-            fn_window.contains("self.forward_decode("),
+            fn_window.contains("self.forward_decode_impl("),
             "H175 FALSIFIED: decode fn body does NOT contain \
-             `self.forward_decode(` delegate call. iter-2-decode-B \
+             `self.forward_decode_impl(` delegate call. iter-2-decode-B \
              slot routing cannot reach the sibling kernel-write site."
         );
         // Positive pin: restore on exit.
@@ -32664,3 +36753,5 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
         );
     }
 }
+
+

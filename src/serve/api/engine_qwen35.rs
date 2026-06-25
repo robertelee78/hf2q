@@ -2526,6 +2526,353 @@ pub fn generate_qwen35_once_slot_aware(
     })
 }
 
+// ===========================================================================
+// ADR-040 Phase F M1 (F1) — Qwen35 per-slot decode state + tick.
+//
+// Beside the serial reference `generate_qwen35_once_slot_aware` (above) so
+// the two stay auditable side-by-side. Hoists that function's decode-loop
+// locals so the SlotAware worker (`super::engine::worker_run_slot_aware`)
+// can interleave N slots across ticks. DELIBERATELY simpler than the
+// Gemma 4 tail: Qwen35 has no grammar runtime / token-bytes / live
+// reasoning splitter / tool-call splitter in the loop, computes
+// `reasoning_tokens` POST-HOC at end-of-decode, and POPS+clears on a
+// first-token EOS — all preserved exactly here.
+//
+// STEP 1: `decode_tick` calls the existing per-slot `forward_gpu_greedy` /
+// `forward_gpu_last_logits` once per handle (the caller loops handles).
+// STEP 2 (F2) replaces that with one batched forward; this tail is
+// unchanged.
+// ===========================================================================
+
+/// One decoded token's surface from `Qwen35DecodeState::decode_tick`,
+/// mirroring `super::engine::TickOutcome` (kept local because that type is
+/// private to the engine module). The engine loop maps this 1:1.
+pub(crate) struct Qwen35TickOutcome {
+    pub fragment: String,
+    /// Qwen35 has no streaming reasoning-span classification in the decode
+    /// loop (reasoning split is post-hoc), so this is always false; carried
+    /// for shape-parity with the engine's `TickOutcome`.
+    pub is_reasoning: bool,
+    pub finished: bool,
+}
+
+/// Hoisted per-slot decode state for a Qwen35 SlotAware request — the
+/// locals from `generate_qwen35_once_slot_aware`'s decode loop
+/// (engine_qwen35.rs:2292-2470), lifted for N-slot interleave. Field
+/// semantics mirror that function so N=1 is byte-identical to the serial
+/// reference.
+pub(crate) struct Qwen35DecodeState {
+    slot_id: SlotId,
+    prompt_len: usize,
+    max_tokens: usize,
+    is_greedy: bool,
+    want_logprobs: bool,
+    logprobs_vec: Option<Vec<f32>>,
+    prompt_cache_hit: bool,
+    /// Cloned request sampling params — the qwen35 sampling helpers
+    /// (`sample_logits_qwen35*`) read temperature/top_p/top_k/rep-penalty/
+    /// max_tokens off this each tick (serial ref passes the live `params`).
+    params: SamplingParams,
+    /// The token to feed into the NEXT decode forward.
+    next_token: u32,
+    generated_tokens: Vec<u32>,
+    decoded_text: String,
+    stop_strings: Vec<String>,
+    finish_reason: &'static str,
+    /// Decode-step counter, mirrors the serial ref `step` (starts at 1).
+    step: usize,
+    prefill_duration: Duration,
+    decode_start: Instant,
+}
+
+impl Qwen35DecodeState {
+    /// Run prefill for one Qwen35 slot and seed the decode state — mirror
+    /// of `generate_qwen35_once_slot_aware` engine_qwen35.rs:2264-2396
+    /// (bounds + need-seq guard + entry reset + prompt-cache-or-prefill +
+    /// first-token derivation + first-token EOS/stop check). The caller
+    /// owns no separate reset (entry reset is done here, matching the
+    /// serial ref). If the first token already terminates, `finish_reason
+    /// != "length"` so the loop fires the reply with no decode tick.
+    pub(crate) fn prefill_seed(
+        qwen: &mut Qwen35LoadedModel,
+        prompt_tokens: &[u32],
+        params: &SamplingParams,
+        kv_cache: &mut HybridKvCache,
+        slot_id: SlotId,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !prompt_tokens.is_empty(),
+            "Qwen35DecodeState::prefill_seed: empty prompt_tokens"
+        );
+        anyhow::ensure!(
+            slot_id.0 < kv_cache.n_seqs,
+            "Qwen35DecodeState::prefill_seed: SlotOutOfRange slot={} max_slots={} \
+             (ADR-040 Phase F M1)",
+            slot_id.0,
+            kv_cache.n_seqs,
+        );
+        let prompt_len = prompt_tokens.len();
+        let max_tokens = params.max_tokens.max(1);
+        let need_seq = prompt_len + max_tokens + 64;
+        if need_seq > kv_cache.max_seq_len as usize {
+            return Err(anyhow::anyhow!(
+                "Qwen35DecodeState::prefill_seed: per-request need_seq={} exceeds \
+                 persistent cache max_seq_len={} (slot={} prompt_len={} max_tokens={}). \
+                 ADR-040 Phase F M1; reduce max_tokens or use a shorter prompt.",
+                need_seq, kv_cache.max_seq_len, slot_id.0, prompt_len, max_tokens
+            ));
+        }
+
+        let is_greedy = is_greedy_eligible(params);
+        let want_logprobs = params.logprobs;
+        let mut logprobs_vec: Option<Vec<f32>> = if want_logprobs {
+            Some(Vec::with_capacity(max_tokens))
+        } else {
+            None
+        };
+
+        kv_cache
+            .reset_for_slot(slot_id)
+            .context("ADR-040 Phase F M1: Qwen35 reset_for_slot at entry")?;
+
+        // codex M1 review fix (2026-06-24): cross-request prompt-cache RESUME is
+        // NOT slot-isolated under SlotAware. `restore_partial(snap, prompt_len)`
+        // writes BROAD shared state — it sets every `current_len` entry and copies
+        // the full linear-attn state buffers (kv_cache.rs:2504/2547) with no
+        // destination SlotId — so a cache hit on one slot would corrupt peer
+        // slots' KV. Disable the hit on the slot-aware path → always do a fresh
+        // per-slot prefill (correct). Per-slot / refcounted prompt caching under
+        // continuous batching is a separate M5 optimization (mirrors the gemma4
+        // LCP write-back skip). SerialFifo serves qwen35 via the legacy
+        // generate_qwen35_once path (its own prompt-cache), unaffected.
+        let prompt_cache_hit = false;
+        let prefill_start = Instant::now();
+        let next_token: u32;
+        if prompt_cache_hit {
+            let snap = qwen
+                .prompt_cache
+                .snapshot()
+                .expect("try_match returned Some implies snapshot Some");
+            kv_cache
+                .restore_partial(snap, prompt_len)
+                .context("ADR-040 Phase F M1: Qwen35 prompt_cache restore_partial")?;
+            next_token = qwen.prompt_cache.first_decoded_token();
+        } else {
+            let positions = prefill_positions_for(prompt_len);
+            let prefill_logits = qwen
+                .model
+                .forward_gpu_last_logits(prompt_tokens, &positions, kv_cache, slot_id)
+                .context("Qwen35Model::forward_gpu_last_logits (slot-aware prefill)")?;
+            anyhow::ensure!(
+                prefill_logits.len() == qwen.vocab_size,
+                "qwen35 slot-aware prefill logits len {} != vocab_size {}",
+                prefill_logits.len(),
+                qwen.vocab_size
+            );
+            if is_greedy && !want_logprobs {
+                next_token = greedy_argmax_last_token(&prefill_logits, qwen.vocab_size as u32);
+            } else {
+                let mut logits = prefill_logits;
+                if let Some(ref mut lps) = logprobs_vec {
+                    let (tok, lp) =
+                        sample_logits_qwen35_with_logprob(&mut logits, params, &[]);
+                    lps.push(lp);
+                    next_token = tok;
+                } else {
+                    next_token = sample_logits_qwen35(&mut logits, params, &[]);
+                }
+            }
+        }
+        let prefill_duration = prefill_start.elapsed();
+
+        let decode_start = Instant::now();
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+        generated_tokens.push(next_token);
+        let mut decoded_text = qwen.tokenizer.decode(&[next_token], false).unwrap_or_default();
+        let stops = params.stop_strings.clone();
+        let mut finish_reason: &'static str = "length";
+        // First-token EOS: qwen35 POPS + clears (divergent from gemma4,
+        // which does not pop). Serial ref 2387-2396.
+        if qwen.eos_token_ids.contains(&next_token) {
+            generated_tokens.pop();
+            decoded_text.clear();
+            finish_reason = "stop";
+        } else if qwen35_hit_stop_string(&decoded_text, &stops) {
+            qwen35_strip_trailing_stop(&mut decoded_text, &stops);
+            finish_reason = "stop";
+        }
+
+        Ok(Qwen35DecodeState {
+            slot_id,
+            prompt_len,
+            max_tokens,
+            is_greedy,
+            want_logprobs,
+            logprobs_vec,
+            prompt_cache_hit,
+            params: params.clone(),
+            next_token,
+            generated_tokens,
+            decoded_text,
+            stop_strings: stops,
+            finish_reason,
+            step: 1,
+            prefill_duration,
+            decode_start,
+        })
+    }
+
+    /// Whether the slot already terminated during prefill-seed.
+    pub(crate) fn finished_at_seed(&self) -> bool {
+        self.finish_reason != "length"
+    }
+
+    /// The decoded first-token text to stream when the slot finishes at
+    /// seed. On first-token EOS this is empty (the serial ref pops + clears
+    /// decoded_text); on a stop-string hit it is the stop-stripped prefix.
+    pub(crate) fn seed_fragment(&self) -> String {
+        self.decoded_text.clone()
+    }
+
+    /// Advance this slot by exactly one decode token — mirror of the serial
+    /// ref's `while` body engine_qwen35.rs:2410-2468 for ONE iteration.
+    pub(crate) fn decode_tick(
+        &mut self,
+        qwen: &mut Qwen35LoadedModel,
+        kv_cache: &mut HybridKvCache,
+    ) -> Result<Qwen35TickOutcome> {
+        // Loop bound mirror: serial ref `while step < max_tokens &&
+        // finish_reason == "length"`. The caller only ticks live slots, so
+        // entry here implies finish_reason == "length"; enforce the step
+        // bound so a slot at the bound finishes with finish_reason "length".
+        if self.step >= self.max_tokens {
+            return Ok(Qwen35TickOutcome {
+                fragment: String::new(),
+                is_reasoning: false,
+                finished: true,
+            });
+        }
+        let pos = self.prompt_len + self.step - 1;
+        let pos_i32 = pos as i32;
+        let positions: Vec<i32> = vec![pos_i32; 4];
+        let last_input = &self.generated_tokens[self.generated_tokens.len() - 1..];
+        let tok = if self.is_greedy && !self.want_logprobs {
+            qwen
+                .model
+                .forward_gpu_greedy(last_input, &positions, kv_cache, self.slot_id)
+                .with_context(|| {
+                    format!(
+                        "Qwen35Model::forward_gpu_greedy (slot-aware decode step {}; \
+                         ADR-040 Phase F M1)",
+                        self.step
+                    )
+                })?
+        } else {
+            let logits = qwen
+                .model
+                .forward_gpu_last_logits(last_input, &positions, kv_cache, self.slot_id)
+                .with_context(|| {
+                    format!(
+                        "Qwen35Model::forward_gpu_last_logits (slot-aware decode step {})",
+                        self.step
+                    )
+                })?;
+            anyhow::ensure!(
+                logits.len() == qwen.vocab_size,
+                "qwen35 slot-aware decode logits len {} != vocab_size {}",
+                logits.len(),
+                qwen.vocab_size
+            );
+            let mut logits = logits;
+            if let Some(ref mut lps) = self.logprobs_vec {
+                let (tok, lp) =
+                    sample_logits_qwen35_with_logprob(&mut logits, &self.params, &self.generated_tokens);
+                lps.push(lp);
+                tok
+            } else {
+                sample_logits_qwen35(&mut logits, &self.params, &self.generated_tokens)
+            }
+        };
+        if qwen.eos_token_ids.contains(&tok) {
+            self.finish_reason = "stop";
+            return Ok(Qwen35TickOutcome {
+                fragment: String::new(),
+                is_reasoning: false,
+                finished: true,
+            });
+        }
+        self.generated_tokens.push(tok);
+        let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
+        self.decoded_text.push_str(&frag);
+        if qwen35_hit_stop_string(&self.decoded_text, &self.stop_strings) {
+            qwen35_strip_trailing_stop(&mut self.decoded_text, &self.stop_strings);
+            self.finish_reason = "stop";
+            return Ok(Qwen35TickOutcome { fragment: frag, is_reasoning: false, finished: true });
+        }
+        self.step += 1;
+        let finished = self.step >= self.max_tokens;
+        Ok(Qwen35TickOutcome { fragment: frag, is_reasoning: false, finished })
+    }
+
+    /// Per-slot KV exit reset — caller invokes once after the slot finishes
+    /// (mirror of serial ref exit reset 2476-2478).
+    pub(crate) fn reset_at_exit(&self, kv_cache: &mut HybridKvCache) -> Result<()> {
+        kv_cache
+            .reset_for_slot(self.slot_id)
+            .context("ADR-040 Phase F M1: Qwen35 reset_for_slot at exit")
+    }
+
+    /// Assemble the `GenerationResult` — mirror of serial ref 2483-2526,
+    /// including the POST-HOC reasoning-token recompute (re-feed all
+    /// generated tokens through a fresh splitter) that diverges from gemma4.
+    pub(crate) fn finish(
+        self,
+        qwen: &Qwen35LoadedModel,
+        registration: Option<&ModelRegistration>,
+    ) -> GenerationResult {
+        let (content_text, reasoning_text) = match registration {
+            Some(reg) if reg.has_reasoning() => {
+                super::registry::split_full_output(reg, &self.decoded_text)
+            }
+            _ => (self.decoded_text.clone(), None),
+        };
+        let reasoning_token_count = match registration {
+            Some(reg) if reg.has_reasoning() => {
+                let mut sp = ReasoningSplitter::from_registration(reg);
+                let mut count = 0usize;
+                for &tok in &self.generated_tokens {
+                    let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
+                    if let Some(splitter) = sp.as_mut() {
+                        let _ = splitter.feed(&frag);
+                        if splitter.in_reasoning() {
+                            count += 1;
+                        }
+                    }
+                }
+                count
+            }
+            _ => 0,
+        };
+        let decode_duration = self.decode_start.elapsed();
+        GenerationResult {
+            text: content_text,
+            reasoning_text,
+            prompt_tokens: self.prompt_len,
+            completion_tokens: self.generated_tokens.len(),
+            reasoning_tokens: if reasoning_token_count > 0 {
+                Some(reasoning_token_count)
+            } else {
+                None
+            },
+            finish_reason: self.finish_reason,
+            prefill_duration: self.prefill_duration,
+            decode_duration,
+            cached_tokens: if self.prompt_cache_hit { self.prompt_len } else { 0 },
+            logprobs: self.logprobs_vec,
+        }
+    }
+}
+
 /// ADR-040 Phase C iter-C2d-cont-kernel iter-2 (2026-05-30): slot-aware
 /// streaming Qwen35 chat generation against the **persistent multi-seq
 /// `HybridKvCache`** (`Qwen35LoadedModel.persistent_kv_cache`) instead

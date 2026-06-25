@@ -306,13 +306,52 @@ impl MlxModelWeights {
         (Some(returned_worker_reg), Ok(()))
     }
 
-    /// Returns: the next token ID (greedy decode)
+    /// Returns: the next token ID (greedy decode). Full path: body + head +
+    /// finalize. Thin wrapper over [`Self::forward_decode_impl`] with
+    /// `capture_hidden=false` — byte-identical to the historical `forward_decode`.
     pub fn forward_decode(
         &mut self,
         input_token: u32,
         seq_pos: usize,
         gpu: &mut GpuContext,
         profile: &mut Option<TokenProfile>,
+    ) -> Result<u32> {
+        self.forward_decode_impl(input_token, seq_pos, gpu, profile, false)
+    }
+
+    /// ADR-040 S1c — body-capture decode for batched lm_head. Runs the SAME body
+    /// (embed + layer loop) as [`Self::forward_decode`], leaving the final hidden
+    /// state (pre-final-norm) in `self.activations.hidden`, then returns WITHOUT
+    /// running the per-slot head (final-norm + lm_head + softcap + argmax +
+    /// rerank). The SlotAware worker gathers each slot's captured hidden, runs
+    /// ONE [`Self::lm_head_batched`] across all slots, and finalizes per row —
+    /// amortizing the 605 MB lm_head weight read. Read the captured hidden with
+    /// `self.activations.hidden.as_slice::<f32>()` immediately after this returns
+    /// (it is GPU-synced). KV bookkeeping is identical to a full decode (the KV
+    /// write happens in the body), so a captured step advances state exactly like
+    /// a normal decode step.
+    pub fn forward_decode_capture_hidden(
+        &mut self,
+        input_token: u32,
+        seq_pos: usize,
+        gpu: &mut GpuContext,
+        profile: &mut Option<TokenProfile>,
+    ) -> Result<()> {
+        self.forward_decode_impl(input_token, seq_pos, gpu, profile, true)
+            .map(|_| ())
+    }
+
+    /// Core decode. `capture_hidden=false` ⇒ full path returning the greedy
+    /// token (historical behavior, byte-equivalence-pinned). `capture_hidden=true`
+    /// ⇒ stop after the body, leaving the final hidden in `self.activations.hidden`
+    /// and returning a dummy `0` (ignored by the capture wrapper).
+    pub(crate) fn forward_decode_impl(
+        &mut self,
+        input_token: u32,
+        seq_pos: usize,
+        gpu: &mut GpuContext,
+        profile: &mut Option<TokenProfile>,
+        capture_hidden: bool,
     ) -> Result<u32> {
         let token_start = Instant::now();
         let hs = self.hidden_size;
@@ -788,6 +827,17 @@ impl MlxModelWeights {
                 s.dump_group_stats();
             }
 
+            // ADR-040 S1c: body-capture early exit. The final hidden state
+            // (pre-final-norm) is now in `self.activations.hidden`. Finish the
+            // body session to make it host-visible and skip the per-slot head;
+            // the batched head runs once for all slots. `capture_hidden=false`
+            // (the historical path) falls straight through to the head below.
+            if capture_hidden {
+                s.finish()
+                    .map_err(|e| anyhow::anyhow!("body-capture session finish: {e}"))?;
+                return Ok(());
+            }
+
             // --- 3. Final norm + lm_head + softcap + argmax (all GPU) ---
 
             // GPU final RMS norm: hidden → norm_out
@@ -960,6 +1010,13 @@ impl MlxModelWeights {
         // we wait unconditionally, here we restore unconditionally.
         parallel_block_result?;
 
+        // ADR-040 S1c: in body-capture mode the head was skipped inside the IIFE
+        // above; the final hidden is live in `self.activations.hidden`. Return a
+        // dummy token (ignored by `forward_decode_capture_hidden`).
+        if capture_hidden {
+            return Ok(0);
+        }
+
         let session_us = session_start.elapsed().as_secs_f64() * 1e6;
 
         // --- ADR-009 Phase 3A: dump post-lm_head logits at boundary position ---
@@ -1007,73 +1064,25 @@ impl MlxModelWeights {
         // mode).  Rerank fires for any quantized lm_head path.
         let rerank_active = (self.lm_head_q8.is_some() || self.lm_head_q6k.is_some())
             && !INVESTIGATION_ENV.lmhead_rerank_disabled;
-        let token_id: u32 = if rerank_active {
-            // CPU candidate selection via threshold scan over the full Q8
-            // logits. GPU top-K was explored but a single-threadgroup
-            // top-K on vocab=262144 serializes phase 2 onto one thread
-            // and costs ~5 ms/token — worse than the ~40 μs CPU scan.
-            //
-            // Algorithm: read the Q8 top-1 value (from the GPU argmax
-            // output), then collect all tokens with logit ≥ top1 - delta,
-            // plus specials. Delta is chosen larger than the observed
-            // Q8 noise envelope (~5e-3) so the true winner is always in
-            // the set.
-            let top1_q8_val: f32 = {
-                let v: &[f32] = self.activations.argmax_value.as_slice()
-                    .map_err(|e| anyhow::anyhow!("argmax_value read: {e}"))?;
-                v[0]
-            };
-            // Headroom for Q8 noise. Empirical Q8 noise envelope is ~5e-3
-            // per logit, so delta=0.5 is a comfortable ~100× margin. The
-            // candidate set remains small (~10–100 tokens typically) because
-            // real top-K distributions fall off quickly below the winner.
-            let delta: f32 = 0.5;
-            let threshold = top1_q8_val - delta;
-
+        // ADR-040 S1b: the argmax→rerank→token logic is extracted to the shared
+        // `finalize_token_from_logits` (batched_head.rs) so the scalar and
+        // batched-lm_head decode paths produce BIT-IDENTICAL tokens by
+        // construction. `top1_val` is read unconditionally now (a harmless extra
+        // buffer read when rerank is inactive); `norm_out` is the post-final-norm
+        // hidden used as the exact-F32 rerank operand. This block is byte-for-byte
+        // equivalent to the prior inline rerank — pinned by the slot_aware_* +
+        // engine_serial_fifo_* byte-equivalence suite.
+        let top1_val: f32 = {
+            let v: &[f32] = self.activations.argmax_value.as_slice()
+                .map_err(|e| anyhow::anyhow!("argmax_value read: {e}"))?;
+            v[0]
+        };
+        let token_id: u32 = {
             let logits: &[f32] = self.activations.logits.as_slice()
-                .map_err(|e| anyhow::anyhow!("rerank logits read: {e}"))?;
-            let hidden: &[f32] = self.activations.norm_out.as_slice()
-                .map_err(|e| anyhow::anyhow!("rerank norm_out read: {e}"))?;
-            let embed_f32: &[f32] = self.embed_weight.as_slice()
-                .map_err(|e| anyhow::anyhow!("rerank embed read: {e}"))?;
-
-            let mut candidates: Vec<u32> = Vec::with_capacity(64);
-            for (i, &v) in logits[..vocab_size].iter().enumerate() {
-                if v >= threshold {
-                    candidates.push(i as u32);
-                }
-            }
-            // Specials always included.
-            for sp in [0u32, 1, 2, 105, 106] {
-                if (sp as usize) < vocab_size {
-                    candidates.push(sp);
-                }
-            }
-            candidates.sort_unstable();
-            candidates.dedup();
-
-            // Exact F32 rerank via hidden · embed_row. Softcap is monotonic
-            // so skipping it doesn't change argmax order. F64 accumulator
-            // for precision; the set is tiny so cost is negligible.
-            let mut best_tok: u32 = gpu_top1;
-            let mut best_logit: f32 = f32::NEG_INFINITY;
-            for &tok in &candidates {
-                let row_off = (tok as usize) * hs;
-                if row_off + hs > embed_f32.len() { continue; }
-                let row = &embed_f32[row_off..row_off + hs];
-                let mut acc: f64 = 0.0;
-                for i in 0..hs {
-                    acc += (hidden[i] as f64) * (row[i] as f64);
-                }
-                let l = acc as f32;
-                if l > best_logit {
-                    best_logit = l;
-                    best_tok = tok;
-                }
-            }
-            best_tok
-        } else {
-            gpu_top1
+                .map_err(|e| anyhow::anyhow!("finalize logits read: {e}"))?;
+            let normed: &[f32] = self.activations.norm_out.as_slice()
+                .map_err(|e| anyhow::anyhow!("finalize norm_out read: {e}"))?;
+            self.finalize_token_from_logits(logits, normed, gpu_top1, top1_val)?
         };
 
         // Diagnostic: when <pad> (id 0) still wins AFTER rerank (or when
