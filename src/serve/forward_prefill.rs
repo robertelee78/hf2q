@@ -3733,6 +3733,16 @@ impl MlxModelWeights {
             // byte/coherence parity test. The short-prompt N=8 benchmark gap is
             // separately LATENCY-bound (per-layer dispatch ≈8ms×30, token count
             // irrelevant) → its lever is CROSS-SLOT batched prefill. See §0.17.
+            // ADR-040 iter-G (2026-06-25): the batched mount of `forward_prefill_batched`
+            // onto the slot-view was investigated (gated HF2Q_PREFILL_SLOT_BATCHED) and
+            // proven DETERMINISTIC + byte-identical to production SerialFifo on SHORT
+            // prompts (N=1 + 8-concurrent) — overturning the prior "kernel non-det"
+            // revert. BUT it inherits a NEWLY-FOUND production bug: `forward_prefill_batched`
+            // is NON-DETERMINISTIC on LONG prompts (~398 tok) because the
+            // `flash_attn_prefill` FA kernel is non-deterministic at multi-tile seq_len
+            // (SerialFifo default reproduces it; per-token + HF2Q_NO_FA are deterministic).
+            // The mount is therefore NOT re-applied until the FA kernel is fixed (ADR §0.18).
+            // The N=8 short-prompt lever needs a purpose-built MULTI-SEQ prefill regardless.
             let result = self.forward_prefill_with_soft_tokens_resume(
                 prompt_tokens,
                 soft_tokens,

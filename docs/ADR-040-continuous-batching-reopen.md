@@ -523,6 +523,20 @@ Phase F merged to `main` (PR #2). iter-G continues on `adr-040-iter-g-prefill`. 
 
 **Decision (mantra-aligned): stop autopsying the abandoned mount-trick; build the purpose-built path with a decisive correctness gate.** The shipped per-token→decode path is deterministic; if the purpose-built batched prefill writes **byte-identical slot KV** to the per-token reference, decode is identically deterministic and the mount-trick's ghost is irrelevant. **Build order:** M1 = single-seq slot-aware batched prefill, gated on (a) byte-parity of written slot KV vs per-token reference, (b) run-to-run determinism, (c) first-token parity. M2 = extend to multi-seq cross-slot + admit-loop batching, gated on the §0.16 8-distinct-prompt coherence harness + N=8 TTFT vs llama. Default stays per-token until each M-gate is green.
 
+#### 0.19 PRODUCTION BUG FOUND: `flash_attn_prefill` is non-deterministic on long prompts (2026-06-25)
+
+While validating the iter-G mount (gated `HF2Q_PREFILL_SLOT_BATCHED`) the disciplined ladder — hypothesis → isolated spike → code trace → codex pressure-test → E2E test — uncovered a bug **bigger than iter-G: the default production prefill is non-deterministic on long prompts.**
+
+**E2E ladder (greedy, temperature=0, gemma4-ara Q5_K_M, real HTTP server):**
+1. Short prompt (~60 tok in / 300 out): mount is **deterministic (run1==run2)** AND **byte-identical to production SerialFifo** at N=1 AND across **8 concurrent distinct prompts** — overturning the prior "kernel non-determinism" revert (which was measured against the wrong reference and on too-short prompts).
+2. **Long prompt (398 tok in):** the mount is **NON-deterministic (run1≠run2)**. Crucially, **SerialFifo (the production default, `HF2Q_SERVE_BATCHED_PREFILL` on) is ALSO non-deterministic on the same long input** — so this is a **production bug, not a mount/slot/capacity issue.**
+3. **Bisection (each step a single clean A/B):**
+   - Per-token prefill (`HF2Q_SERVE_BATCHED_PREFILL=0`) on the long input: **DETERMINISTIC** → the bug is in `forward_prefill_batched` (PREFILL), not decode.
+   - `HF2Q_NO_FA=1` (batched prefill via tensor-mm, no flash-attn) on the long input: **DETERMINISTIC** → the bug is in the **`flash_attn_prefill` FA kernel** (mlx-native), not matmul/MoE/norm.
+   - mlx-native shader scan: **no atomic-float ops** in inference prefill kernels → the mechanism is an **uninitialized read / order-dependent reduction**, exposed only at **multi-tile `seq_len`** (deterministic single-tile at ~60 tok; non-det at 398).
+
+**Significance:** greedy (temperature=0) decoding of any sufficiently long prompt on the **default** server is non-deterministic run-to-run — a direct violation of the "as coherent as llama.cpp" bar. The per-token prefill path is the deterministic fallback. **Prime suspect:** the Wave-2E tile-skip pre-pass (`flash_attn_prefill.metal` reads `blk_row[kb]`, a host-built per-tile classification byte) reading uninitialized classification → non-deterministic tile-skip; or partial-tile padding. Next: codex-pinpoint the exact non-deterministic read, fix in mlx-native (validatable via local path-dep before any publish), re-validate the full ladder. This fix is **load-bearing for iter-G M2** (which reuses the batched FA compute) AND a standalone production coherence fix. The iter-G mount stays un-applied until the FA kernel is deterministic. Determinism spike `tests/iter_g_hb_seq_determinism_spike.rs` (KV-write exonerated) remains valid.
+
 ---
 
 ## 1. Why (the problem)
