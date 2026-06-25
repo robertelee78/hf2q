@@ -438,7 +438,17 @@ With the §0.16 softcap root-cause fixed, the batched `[N,hidden]` decode body +
   - 8 concurrent **DISTINCT** prompts × 600 tok (catches cross-slot contamination that same-prompt masks): every slot **byte-identical to its own serial reference** — zero cross-slot leakage over the full generation.
 - **Throughput (8 concurrent distinct, 600 tok, same machine):** batched body **31.5 s** for 4800 tok = **152.6 tok/s aggregate** vs serial 56.5 s (≈**1.8×**); at 8× same-prompt 800-tok the batched body was **47.5 s vs the per-slot loop's 68.3 s (≈1.44×)**. Coherence AND speed.
 
-The per-slot loop stays available via the opt-out (A/B + byte-equiv baseline). Next: re-run the llama.cpp head-to-head (§0.15) under the new default to re-measure the gap.
+The per-slot loop stays available via the opt-out (A/B + byte-equiv baseline).
+
+**Re-measured llama head-to-head under the new default (2026-06-25, fresh clean same-session, one engine at a time, idle, 200-tok gens, same prompt, aggregate tok/s):**
+
+| N | hf2q (new default, batched) | llama.cpp `-np 8` | gap |
+|---:|---:|---:|---|
+| 1 | 74.6 | 88.4 | llama +18% |
+| 4 | 146.3 | 218.4 | llama +49% |
+| 8 | 163.0 | 266.8 | llama +64% |
+
+hf2q's absolute numbers match §0.15's batched-body column (now shipping correctly + by default); llama measured ~13% faster than §0.15 this session, so the **gap is real and if anything wider** than the §0.15 snapshot. The softcap fix was a *correctness* fix, not a throughput one — closing the speed gap is the next milestone (single-run N=1 is noisy; the N=1 gap reappearing vs §0.15's "~even" warrants a careful re-measure). **Coherence is now MET (byte-identical to serial over 600–800-tok concurrent generations, no cross-slot contamination); SPEED is the open gap.** Levers unchanged from §0.15: serve-layer overhead (~16%), batching-kernel efficiency (remaining per-slot loops in batched MoE/attention), and a fresh look at single-stream N=1.
 
 #### 0.15 hf2q vs llama.cpp head-to-head (2026-06-24) — MEASURED clean (idle, sequential, same GGUF/prompt/N, HTTP, 200-tok gens)
 
