@@ -6272,6 +6272,22 @@ fn admit_gemma4_slot(
         }
     };
 
+    // ADR-040 Phase F `iter-F-prefill-determinism` (2026-06-24) — clear the
+    // per-prefill self-mounts AGAIN, now AFTER prefill_seed, to enforce the
+    // postcondition "the SlotAware worker leaves `self.{dense,hybrid,leg_hb}_kv`
+    // == None between requests". The slot-aware prefill mounts a per-slot
+    // slice-view on these shared fields and (in the current forward) restores
+    // the PRIOR value on exit; the per-slot decode uses a save-mount-RESTORE
+    // scope-guard. When a NEW request is admitted mid-stream (the prefilled K/V
+    // already lands durably in the per-slot `multi_seq_kv_hybrid` scaffold, so
+    // this is data-lossless), any prefill-origin mount that survives on `self.*`
+    // gets RESTORED by the next in-flight slot's decode and then poisons the
+    // following prefill's `if self.hybrid_kv.is_none()` write-back gate
+    // (forward_prefill.rs:970) — corrupting the earliest in-flight request
+    // (root-caused via `slot_aware_staggered_eviction`: ~17% gross corruption of
+    // the first slot, codex-confirmed). Mirrors the pre-prefill clear above.
+    clear_gemma4_self_mounts(guard.model);
+
     // Prefill consumed the whole prompt in one shot → advance the
     // scheduler's Prefilling phase to Decoding immediately.
     scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
@@ -6399,6 +6415,20 @@ fn decode_batch_gemma4(
     // finalize_token_from_logits + decode_tick_finalize).
     let hs = guard.model.weights.hidden_size;
     let vocab = guard.model.weights.vocab_size;
+
+    // ADR-040 Phase F `iter-F-prefill-determinism` (2026-06-24) — clear the
+    // per-prefill self-mounts at the TOP of every decode tick. The slot-aware
+    // decode uses a save-mount-RESTORE scope-guard on `self.{dense,hybrid,
+    // leg_hb}_kv`; if a prefill-origin mount has crept onto these fields by any
+    // path, each decode RESTORES it after its own forward, propagating the stale
+    // mount across ticks until it poisons a later prefill's `is_none()` write-
+    // back gate (forward_prefill.rs:970). The clear-after-prefill (admit) above
+    // removed the admit-boundary entry (~13%→~3% on `slot_aware_staggered_
+    // eviction`); this top-of-tick clear closes the residual cross-tick
+    // propagation so the prior the scope-guard saves/restores is always None
+    // (the clean-n4/n8 invariant). Data-lossless: per-slot K/V lives in the
+    // persistent multi-seq scaffolds; decode re-mounts a fresh slice-view.
+    clear_gemma4_self_mounts(guard.model);
 
     // Pass 1 — capture bodies. `captured` holds (handle, slot_idx, state, reply)
     // for each slot whose body ran; `hidden_rows` is their final hidden states
