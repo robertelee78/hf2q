@@ -371,6 +371,47 @@ pub fn layer_type_to_alloc_params(
     }
 }
 
+/// ADR-040 Phase F `iter-F-kvcap` — per-slot (continuous-batching) variant of
+/// [`layer_type_to_alloc_params`].
+///
+/// The multi-seq (`SlotAware`) KV scaffold allocates a `max_slots × capacity`
+/// buffer per layer, so the **full-attention** layers' per-slot `capacity`
+/// must be the per-slot context budget, not the model's whole
+/// `max_position_embeddings`. This mirrors the llama.cpp `-c` (total context)
+/// ÷ `-np` (parallel slots) convention: each of `max_slots` slots gets
+/// `max_position_embeddings / max_slots` of full-attention context, so the
+/// total full-attention KV is ≈ one full-context sequence regardless of
+/// `max_slots` (constant, not linear in N) and the operator request "N slots ×
+/// (max/N) ctx" is literal.
+///
+/// **Sliding layers are unchanged** — they are ring buffers capped at
+/// `sliding_window` (already per-slot-independent and small); dividing them
+/// would corrupt the ring-window semantics.
+///
+/// **`max_slots == 1` is identity** — `max/1 == max`, so the single-slot
+/// multi-seq path and (by construction) the single-seq `SerialFifo` path that
+/// routes through [`layer_type_to_alloc_params`] keep the full context: this
+/// change is a no-op for N=1 and only splits the budget when N>1.
+///
+/// Full-attention layers are linear (`is_ring=false`), so `capacity` is only
+/// the buffer/stride size — never part of the attention arithmetic (which sums
+/// over positions `0..seq_len`). Shrinking it therefore changes only how much
+/// context a slot can hold, not the values computed for a sequence that fits;
+/// this is what keeps the slot-aware decode byte-identical to a serial
+/// reference whose full-attention buffer is sized differently.
+pub fn layer_type_to_alloc_params_per_slot(
+    layer_type: crate::serve::config::LayerType,
+    sliding_window: usize,
+    max_position_embeddings: usize,
+    max_slots: usize,
+) -> (bool, usize) {
+    use crate::serve::config::LayerType;
+    match layer_type {
+        LayerType::Sliding => (true, sliding_window),
+        LayerType::Full => (false, max_position_embeddings.div_ceil(max_slots.max(1))),
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // ADR-040 Phase A3a iter-3 — MultiSeqKvCache impl for MultiSeqHbKvBuffers.
 //
@@ -3632,6 +3673,67 @@ mod tests {
         assert!(!is_ring && cap == max_pos,
             "production Full layer alloc shape: (ring=false, cap=131072); \
              got (ring={is_ring}, cap={cap})");
+    }
+
+    /// ADR-040 Phase F `iter-F-kvcap` — falsifier for the per-slot allocator
+    /// helper [`super::layer_type_to_alloc_params_per_slot`]. Pins the
+    /// continuous-batching mapping (llama.cpp `-c`÷`-np` convention):
+    /// - `Sliding` → `(ring=true, sliding_window)` — UNCHANGED vs single-seq
+    ///   (ring window is per-slot-independent; must NOT be divided).
+    /// - `Full` → `(ring=false, max_position_embeddings / max_slots)` — the
+    ///   per-slot full-attention budget.
+    /// Also pins the two load-bearing invariants: (a) `max_slots == 1` is
+    /// identity with the single-seq helper (no N=1/SerialFifo regression), and
+    /// (b) total full-attention KV is constant in `max_slots` (`N × max/N ≈
+    /// max`), which is the whole point of the cap.
+    #[test]
+    fn iter_f_kvcap_per_slot_alloc_params_mapping_pinned() {
+        use crate::serve::config::LayerType;
+        let sliding_window: usize = 1_024;
+        let max_pos: usize = 262_144;
+
+        // Sliding is per-slot-independent: identical for any max_slots.
+        for &n in &[1usize, 2, 4, 8] {
+            let (is_ring, cap) = super::layer_type_to_alloc_params_per_slot(
+                LayerType::Sliding, sliding_window, max_pos, n,
+            );
+            assert!(is_ring, "Sliding MUST stay a ring buffer (max_slots={n})");
+            assert_eq!(cap, sliding_window,
+                "Sliding capacity MUST stay sliding_window regardless of \
+                 max_slots — dividing the ring window would corrupt its \
+                 semantics (max_slots={n})");
+        }
+
+        // Full splits the budget: max/N per slot (llama.cpp -c ÷ -np).
+        let (is_ring_f8, cap_f8) = super::layer_type_to_alloc_params_per_slot(
+            LayerType::Full, sliding_window, max_pos, 8,
+        );
+        assert!(!is_ring_f8, "Full MUST stay linear (is_ring=false)");
+        assert_eq!(cap_f8, max_pos / 8,
+            "Full per-slot capacity at max_slots=8 MUST be max_position_\
+             embeddings/8 = {} (the literal '8×32k')", max_pos / 8);
+
+        // (a) max_slots == 1 is identity with the single-seq helper.
+        let (_, cap_single) = super::layer_type_to_alloc_params(
+            LayerType::Full, sliding_window, max_pos,
+        );
+        let (_, cap_n1) = super::layer_type_to_alloc_params_per_slot(
+            LayerType::Full, sliding_window, max_pos, 1,
+        );
+        assert_eq!(cap_n1, cap_single,
+            "max_slots=1 MUST be identity with the single-seq helper \
+             (no N=1 / SerialFifo regression): got {cap_n1} vs {cap_single}");
+
+        // (b) total full-attention KV is constant in max_slots (N × max/N ≈ max).
+        for &n in &[1usize, 2, 4, 8] {
+            let (_, per_slot) = super::layer_type_to_alloc_params_per_slot(
+                LayerType::Full, sliding_window, max_pos, n,
+            );
+            let total = per_slot * n;
+            assert!(total >= max_pos && total < max_pos + n,
+                "total Full KV (per_slot {per_slot} × {n} slots = {total}) MUST \
+                 stay ≈ one full context ({max_pos}), not grow linearly in N");
+        }
     }
 
     /// **cfa-iter-A5b MAJOR #3** — Null-layer absence documentation

@@ -849,27 +849,23 @@ pub const ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS: u32 = 4;
 /// with `HF2Q_BATCHED_BODY=1`, 2026-06-24 — see ADR §0.13 queen-led audit),
 /// coherence-proven e2e, 202 tok/s aggregate.
 ///
-/// KV-memory accounting — CORRECTED 2026-06-24 per queen-led audit Worker C
-/// (the prior "~4.2 GB / ~100 GB headroom" figure was wrong by ~10×):
-/// the 25 sliding layers DO cap at the 1024 ring window (cheap), but the 5
-/// global/full-attention layers allocate at `max_position_embeddings`
-/// (262144) — NOT the operator's 32k request — via
-/// `layer_type_to_alloc_params(Full) = (false, max_position_embeddings)`
-/// (`kv_cache.rs:370`; long-standing pre-Phase-F design, falsifier-pinned).
-/// So at N=8 the global layers alone hold ~32 GB (8 slots × 5 layers ×
-/// nkv=2 × hd=512 × cap=262144 × [2 B F16-K + 1 B TQ-HB-V]); the full
-/// multi-seq hybrid scaffold is ~34 GB, and up to ~45 GB with the Phase-1
-/// HB scaffold co-resident. Total at N=8 ≈ 16.4 GB weights + ~45 GB KV ≈
-/// 62 GB → fits the 128 GB M5 Max with ~66 GB headroom.
-///
-/// OPERATIONAL CAVEAT: this N=8 default is memory-validated for 128 GB
-/// ONLY. On a ≤64 GB machine, N=8 `SlotAware` will exhaust unified memory
-/// at spawn — it fails CLOSED with an `alloc_*_kv_for_layer` context error
-/// (a clean `Result`, not UB / corruption), but operators there MUST set
-/// `HF2Q_MAX_BATCHED_SLOTS` lower. Capping the global layers at the
-/// operator ctx (making "8×32k" literal — ~4 GB global instead of ~32 GB)
-/// is the tracked follow-up `iter-F-kvcap` (ADR §0.13). This is the gate
-/// the live `SlotAware` spawn checks; the
+/// KV-memory accounting (ADR-040 `iter-F-kvcap`, 2026-06-24): the multi-seq
+/// `SlotAware` scaffold splits the full-attention context budget across slots
+/// — each of `max_slots` slots gets `max_position_embeddings / max_slots` of
+/// global-layer context (the llama.cpp `-c`÷`-np` convention) via
+/// `layer_type_to_alloc_params_per_slot` (`kv_cache.rs`). The 25 sliding
+/// layers stay at the 1024 ring window (per-slot-independent). So the total
+/// full-attention KV is ≈ ONE full-context sequence regardless of N (constant,
+/// not linear): at N=8 each slot holds 262144/8 = 32k of global context →
+/// global layers ~4 GB total (8 × 5 × nkv=2 × hd=512 × cap=32768 ×
+/// [2 B F16-K + 1 B TQ-HB-V]); the whole multi-seq KV is ~5-6 GB, and "8×32k"
+/// is now literal. Total at N=8 ≈ 16.4 GB weights + ~6 GB KV ≈ 22 GB → fits
+/// the 128 GB M5 Max with vast headroom, and now also fits a 64 GB machine.
+/// (Pre-`iter-F-kvcap` each slot eagerly held the full 262k → ~45 GB at N=8,
+/// the ~10×-too-large figure Worker C caught.) `max_slots=1` is identity
+/// (max/1 = max) so SerialFifo / single-seq is unchanged. Over-budget spawns
+/// still fail CLOSED with an `alloc_*_kv_for_layer` `Result` error (not UB).
+/// This is the gate the live `SlotAware` spawn checks; the
 /// spec-decode drafter (unwired, API-scaffold only per §6.1.55-F5) must
 /// gate on [`ADR040_A4_DEFAULT_SPEC_DECODE_MAX_BATCHED_SLOTS`] (= 4) when
 /// it lands — NOT this constant.
@@ -3188,7 +3184,7 @@ impl GemmaLoadedModel {
         use crate::inference::models::gemma4::kv_cache::{
             alloc_hb_kv_for_layer, alloc_multi_seq_dense_kv_for_layer,
             alloc_multi_seq_hybrid_kv_for_layer, alloc_multi_seq_mlx_kv_for_layer,
-            layer_type_to_alloc_params,
+            layer_type_to_alloc_params_per_slot,
         };
         use crate::serve::config::LayerType;
 
@@ -3216,10 +3212,11 @@ impl GemmaLoadedModel {
             let nkv = self.config.num_kv_heads_for_layer(i);
             let is_full = self.config.is_full_attention(i);
             let layer_type = if is_full { LayerType::Full } else { LayerType::Sliding };
-            let (is_ring, capacity) = layer_type_to_alloc_params(
+            let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
                 layer_type,
                 self.config.sliding_window,
                 self.config.max_position_embeddings,
+                max_slots as usize,
             );
             let buf = alloc_hb_kv_for_layer(dev, i, nkv, hd, capacity, is_ring, max_slots)
                 .with_context(|| {
@@ -3252,10 +3249,11 @@ impl GemmaLoadedModel {
                 let is_full = self.config.is_full_attention(i);
                 let layer_type =
                     if is_full { LayerType::Full } else { LayerType::Sliding };
-                let (is_ring, capacity) = layer_type_to_alloc_params(
+                let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
                     layer_type,
                     self.config.sliding_window,
                     self.config.max_position_embeddings,
+                    max_slots as usize,
                 );
                 let buf = alloc_multi_seq_hybrid_kv_for_layer(
                     dev, i, nkv, hd, capacity, is_ring, max_slots,
@@ -3305,10 +3303,11 @@ impl GemmaLoadedModel {
                 let is_full = self.config.is_full_attention(i);
                 let layer_type =
                     if is_full { LayerType::Full } else { LayerType::Sliding };
-                let (is_ring, capacity) = layer_type_to_alloc_params(
+                let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
                     layer_type,
                     self.config.sliding_window,
                     self.config.max_position_embeddings,
+                    max_slots as usize,
                 );
                 let buf = alloc_multi_seq_dense_kv_for_layer(
                     dev, i, nkv, hd, capacity, is_ring, kv_dtype, max_slots,
@@ -3351,10 +3350,11 @@ impl GemmaLoadedModel {
                 let is_full = self.config.is_full_attention(i);
                 let layer_type =
                     if is_full { LayerType::Full } else { LayerType::Sliding };
-                let (is_ring, capacity) = layer_type_to_alloc_params(
+                let (is_ring, capacity) = layer_type_to_alloc_params_per_slot(
                     layer_type,
                     self.config.sliding_window,
                     self.config.max_position_embeddings,
+                    max_slots as usize,
                 );
                 let norms_per_pos = (hd / 256).max(1);
                 let buf = alloc_multi_seq_mlx_kv_for_layer(
