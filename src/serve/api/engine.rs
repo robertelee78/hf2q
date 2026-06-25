@@ -19820,6 +19820,125 @@ assistant:
         rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
     }
 
+    /// ADR-040 §0.16 `iter-F-batched-determinism-residual` FALSIFIER (2026-06-25).
+    /// Bisects the trigger of the batched-body staggered flake. `n4_per_slot_parity`
+    /// uses DISTINCT prompts (compares each slot only to its OWN serial ref → blind
+    /// to slot-0-vs-slot-N divergence). This test uses an IDENTICAL prompt in all
+    /// slots so any slot-index flavor split shows as a non-prefix of the single
+    /// serial ref. Modes via env (batched body must be forced on, else no-op):
+    ///   * default (MS=0, EVICT=0): simultaneous N=4, equal budget — **PASSES**.
+    ///   * HF2Q_FALSIFIER_STAGGER_MS=40: staggered admission, equal budget — **PASSES** (3/3+).
+    ///   * HF2Q_FALSIFIER_EVICT=1: slot 0 short→freed→5th reuses it, uniform long
+    ///     budget for peers — **PASSES** (7/7).
+    /// EXCLUSIONS PROVEN (2026-06-25): the residual is NOT same-prompt-alone, NOT
+    /// staggered-admission-alone, NOT varying-N-by-join, NOT a single clean
+    /// uniform-budget eviction. The live `staggered_eviction` test (which DOES fail
+    /// ~13%) differs only by DISTINCT per-slot budgets [5/50/200/10] → eviction
+    /// CHURN (multiple slots finishing+recycling at different ticks). That churn,
+    /// not any single ingredient here, is the remaining trigger — consistent with
+    /// codex H1 (stale batched-decode state inherited across the reset/reuse path).
+    /// Kept as a regression guard for the same-prompt batched-body parity that
+    /// `n4_per_slot_parity` cannot cover.
+    #[test]
+    fn slot_aware_n4_batched_body_same_prompt_parity_vs_serial() {
+        if byte_equiv_skip_unless_gated("slot_aware_n4_batched_body_same_prompt_parity_vs_serial") {
+            return;
+        }
+        if std::env::var("HF2Q_BATCHED_BODY").as_deref() != Ok("1") {
+            eprintln!(
+                "[skip] slot_aware_n4_batched_body_same_prompt_parity_vs_serial — \
+                 set HF2Q_BATCHED_BODY=1 (+ HF2Q_BATCHED_ATTNPRE=1 HF2Q_BATCHED_FLASH=1) to run"
+            );
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+
+        // IDENTICAL prompt in all four slots. Serial ref at the LONGEST budget so
+        // every slot's greedy output is a prefix of it.
+        let prompt: Vec<u32> = vec![2, 4, 6, 8];
+        let ref_params =
+            SamplingParams { temperature: 0.0, max_tokens: 40, ..Default::default() };
+        let serial = gemma4_serial_slot_aware_ref(&load_opts, &prompt, &ref_params);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("rt");
+        let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
+        let engine_slot =
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 4 })
+                .expect("spawn SlotAware{max_slots:4}");
+        // STAGGER admission: HF2Q_FALSIFIER_STAGGER_MS>0 inserts an increasing
+        // pre-generate delay per slot so each prefills SEPARATELY (slot 0 solo,
+        // then slot 1, …) — reproducing the eviction test's staggered prefill
+        // WITHOUT eviction/varying-budget. If the simultaneous run (MS=0) passes
+        // but the staggered run fails, the trigger is admission timing / prefill
+        // ordering (codex H1: prior solo-prefill leaves stale batched-decode state).
+        let stagger_ms: u64 = std::env::var("HF2Q_FALSIFIER_STAGGER_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        // EVICTION mode: give slot 0 a SHORT budget so it finishes and frees its
+        // slot mid-stream; a 5th same-prompt request is then admitted into the
+        // recycled slot while the long slots keep decoding. This is the ONLY
+        // differentiator left vs the (passing) simultaneous/staggered runs above.
+        let evict = std::env::var("HF2Q_FALSIFIER_EVICT").as_deref() == Ok("1");
+        let long = 40usize;
+        let budgets: Vec<usize> = if evict { vec![4, long, long, long] } else { vec![24; 4] };
+        let slot_results: Vec<GenerationResult> = rt.block_on(async {
+            let mut handles = Vec::new();
+            for (slot_i, &b) in budgets.iter().enumerate() {
+                let eng = engine_slot.clone();
+                let p = prompt.clone();
+                let pr = SamplingParams { temperature: 0.0, max_tokens: b, ..Default::default() };
+                let si = slot_i as u64;
+                handles.push(tokio::spawn(async move {
+                    if stagger_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(si * stagger_ms)).await;
+                    }
+                    eng.generate(p, pr).await.expect("slot generate")
+                }));
+            }
+            // 5th request reuses the slot freed by the short budget-4 slot.
+            if evict {
+                let eng = engine_slot.clone();
+                let p = prompt.clone();
+                let pr = SamplingParams { temperature: 0.0, max_tokens: long, ..Default::default() };
+                handles.push(tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    eng.generate(p, pr).await.expect("slot5 generate")
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.expect("join"));
+            }
+            out
+        });
+        // Greedy + same prompt ⇒ every slot's text MUST be a prefix of the serial
+        // ref (each just stops at its own budget). Any divergence = the residual.
+        for (i, slot) in slot_results.iter().enumerate() {
+            assert!(
+                serial.text.starts_with(&slot.text),
+                "ADR-040 §0.16 — batched-body N=4 SAME-prompt (stagger_ms={stagger_ms} evict={evict}) \
+                 slot {i} text is NOT a prefix of the serial ref (FAIL ⇒ this admission pattern is the trigger)\n  slot:   {:?}\n  serial: {:?}",
+                slot.text, serial.text,
+            );
+        }
+        rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+    }
+
     /// ADR-040 Phase F `iter-F-n8parity` (2026-06-24, queen-led audit Worker B
     /// gap-closure) — the N=**8** analogue of `slot_aware_n4_per_slot_parity_vs_serial`.
     /// Phase F raised the live continuous-batching default to N=8
