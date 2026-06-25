@@ -596,6 +596,18 @@ impl MlxModelWeights {
                 }
             }
         } else {
+        // ADR-040 Phase F `iter-F-flashtmp` / `iter-F-batched-determinism-residual`
+        // (2026-06-25) — per-slot reduce scratch. The N×-sized `bufs.sdpa_tmp`
+        // (per-call, owned) replaces the shared `self.activations.sdpa_tmp` so
+        // each slot's flash reduces in its OWN disjoint region. The prior shared
+        // tmp relied on a WAW barrier for isolation, which held for a single
+        // stable body call (n4/n8 pass) but NOT under staggered continuous
+        // batching (changing N + mid-window admission/refill touch the same
+        // global activation scratch) — root cause of the ~2.5% batched-only
+        // staggered non-determinism (codex-confirmed; bisected: still flakes at
+        // FLASH=0/KVENC=0/ATTNPRE=0 because staggered slots fail `same_bucket`
+        // and fall back HERE even with FLASH=1).
+        let tmp_stride = elems(&bufs.sdpa_tmp) / n;
         for i in 0..n {
             let slot = slot_ids[i].0 as u64;
             let seq_pos_i = seq_positions[i];
@@ -641,6 +653,9 @@ impl MlxModelWeights {
                 bufs.attn_v_normed.slice_view(row_off(v_normed_stride, i), v_normed_stride)
             };
             let sdpa_i = bufs.sdpa_out.slice_view(row_off(sdpa_stride, i), sdpa_stride);
+            // Per-slot reduce scratch (iter-F-flashtmp) — disjoint region of the
+            // N×-sized batched tmp; replaces the shared self.activations.sdpa_tmp.
+            let tmp_i = bufs.sdpa_tmp.slice_view(row_off(tmp_stride, i), tmp_stride);
 
             // BARRIER (mirror scalar gpu_full_attn.rs:423): the Q/K norm+RoPE
             // and V-norm dispatches above wrote attn_{q,k}_normed / v_src via
@@ -686,15 +701,17 @@ impl MlxModelWeights {
             // (untracked encoder dispatches; registered as writes by the
             // barrier above). Flash reads attn_q_normed + the KV cache and
             // writes sdpa_out — declare the RAW so the encode lands first.
-            // `sdpa_tmp` is SHARED reduce scratch across every per-slot flash;
-            // declaring it read+write makes consecutive slots' flashes WAW-
-            // serialize on it (without this the N>1 flashes collide on the
-            // shared tmp → garbage at N>1 while N=1 passes). Per-slot tmp for
-            // true concurrency is an M4 optimization.
+            // `tmp_i` is this slot's OWN disjoint reduce-scratch region of the
+            // N×-sized `bufs.sdpa_tmp` (iter-F-flashtmp). Each per-slot flash now
+            // reduces in isolation — no shared-scratch collision, so this is also
+            // genuinely per-slot-concurrent (the WAW barrier on the old shared
+            // `self.activations.sdpa_tmp` is no longer the isolation mechanism).
+            // The RAW barrier below still orders the KV-encode writes before the
+            // flash reads.
             session.barrier_between(
                 &[&bufs.attn_q_normed, &buf.k, &buf.v_packed, &buf.v_norms,
-                  &self.activations.sdpa_tmp],
-                &[&bufs.sdpa_out, &self.activations.sdpa_tmp],
+                  &tmp_i],
+                &[&bufs.sdpa_out, &tmp_i],
             );
             let p_hyb = mlx_native::ops::flash_attn_vec_hybrid::FlashAttnVecTqHbParams {
                 num_heads: nh as u32,
@@ -715,7 +732,7 @@ impl MlxModelWeights {
             mlx_native::ops::flash_attn_vec_hybrid::flash_attn_vec_hybrid(
                 session.encoder_mut(), reg, dev,
                 &q_i, &k_view, &v_view, &v_norms_view,
-                &sdpa_i, &self.activations.sdpa_tmp, &p_hyb,
+                &sdpa_i, &tmp_i, &p_hyb,
             )
             .map_err(|e| anyhow::anyhow!("batched flash_attn_vec_hybrid L{layer_idx} s{i}: {e}"))?;
             // FWHT-undo (V was FWHT-rotated pre-quant ⇒ SDPA out in FWHT domain;
