@@ -3704,22 +3704,24 @@ impl MlxModelWeights {
             // iter-2D scope (dense F32 LCP-eligible regime); iter-2B
             // does NOT consume the LCP fast path for the hybrid
             // production-default branch (orthogonal sub-deferral).
-            // ADR-040 `iter-G-prefill-batched` NOTE (2026-06-25): a mount-trick
-            // attempt (route this slot-aware prefill to `forward_prefill_batched`
-            // on the mounted slot-view) was tried and REVERTED — it is
-            // NON-DETERMINISTIC (same prompt, alone, sequential: run1 ≠ run2),
-            // because `forward_prefill_batched` is a single-seq function that does
-            // NOT honor the per-slot scaffold's cursor/reset masking discipline
-            // (the persistent slot region retains stale KV from prior requests;
-            // the per-token path below masks reads via the per-slot `seq_lens`
-            // cursor, the batched path does not). `forward_prefill_batched` ITSELF
-            // is deterministic (SerialFifo run1==run2 verified). Proper iter-G is a
-            // PURPOSE-BUILT slot-aware batched prefill (batch the per-token loop in
-            // `forward_prefill_with_soft_tokens_resume` with correct per-slot
-            // reset + causal masking), gated on a byte/coherence parity test. NOTE
-            // the short-prompt N=8 benchmark gap is LATENCY-bound (per-layer
-            // kernel-launch/sync ≈8ms×30 layers, token count irrelevant) → its
-            // lever is CROSS-SLOT batched prefill, not token-batching. See §0.17.
+            // ADR-040 `iter-G-prefill-batched` NOTE (2026-06-25): the mount-trick
+            // (route this slot-aware prefill to `forward_prefill_batched` on the
+            // mounted slot-view) was tried with TWO fixes and REVERTED both — it is
+            // NON-DETERMINISTIC even single-stream (same prompt, alone, sequential:
+            // run1 ≠ run2). Refuted hypotheses (tested): (1) stale slot-region KV —
+            // REFUTED, zeroing the entire mounted K/V/norms region did NOT fix it;
+            // (2) concurrency — REFUTED, it diverges with a single request.
+            // `forward_prefill_batched` ITSELF is deterministic (SerialFifo
+            // run1==run2 verified), so the divergence is specific to its slot-aware
+            // invocation (some uninitialized/divergent internal state not addressed
+            // by KV zeroing — capacity-derived strides over the 32768-cap slot-view
+            // vs SerialFifo's request-sized fresh alloc are the leading suspect).
+            // Proper iter-G is a PURPOSE-BUILT slot-aware batched prefill (batch the
+            // per-token loop in this fn with per-slot reset + causal masking, NOT a
+            // mount of the single-seq batched fn), gated on a determinism +
+            // byte/coherence parity test. The short-prompt N=8 benchmark gap is
+            // separately LATENCY-bound (per-layer dispatch ≈8ms×30, token count
+            // irrelevant) → its lever is CROSS-SLOT batched prefill. See §0.17.
             let result = self.forward_prefill_with_soft_tokens_resume(
                 prompt_tokens,
                 soft_tokens,
