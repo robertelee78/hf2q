@@ -3704,14 +3704,58 @@ impl MlxModelWeights {
             // iter-2D scope (dense F32 LCP-eligible regime); iter-2B
             // does NOT consume the LCP fast path for the hybrid
             // production-default branch (orthogonal sub-deferral).
-            let result = self.forward_prefill_with_soft_tokens_resume(
-                prompt_tokens,
-                soft_tokens,
-                max_decode_tokens,
-                gpu,
-                None,
-                true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
-            );
+            // ADR-040 `iter-G-prefill-batched` (2026-06-25) — OPT-IN, **EXPERIMENTAL
+            // / WIP — NOT concurrency-safe yet, default-OFF.** Routing the
+            // slot-aware prefill to `forward_prefill_batched` gives a measured
+            // ~18× single-seq prefill speedup on LONG prompts (902-tok: 94→1727
+            // prompt tok/s) and produces coherent output single-stream — BUT
+            // `forward_prefill_batched` was written for single-sequence SerialFifo
+            // use and uses shared `self.*` scratch (e.g. `self.kv_caches` /
+            // `self.activations`) that is NOT per-slot-isolated, so under
+            // concurrent slot admission it is NON-DETERMINISTIC: the E2E coherence
+            // harness (8 distinct prompts vs own serial refs) DIVERGES at word
+            // level with this flag on, while the per-token resume path below is
+            // 0-divergence. Blocker before shipping: isolate forward_prefill_batched's
+            // scratch for the slot-aware path (the iter-F-flashtmp pattern applied
+            // to prefill). NOTE this is also NOT the lever for the short-prompt
+            // N=8 benchmark gap — that prefill is LATENCY-bound (per-layer
+            // kernel-launch/sync overhead ≈8ms×30 layers, token count irrelevant),
+            // so the concurrency win there is CROSS-SLOT batched prefill, not
+            // token-batching. See §0.17. The per-token resume below is
+            // ~10.6 ms/token (≈ one decode step PER token) — §0.17 measured the
+            // serve prefill at ~94 prompt tok/s vs llama ~185, which IS the
+            // hf2q↔llama throughput gap (decode is already at parity). The
+            // batched-per-layer path (`forward_prefill_batched`) processes the
+            // whole prompt in one `m=seq_len` pass per layer (≈7× faster) and
+            // already writes the SAME production hybrid F16-K + TQ-HB-V format,
+            // so it writes directly into the mounted slot-view `self.hybrid_kv`.
+            // No realloc fires: the slot-view capacity = scaffold per-slot cap
+            // (max_pos/max_slots, iter-F-kvcap) ≥ any request's linear_capacity.
+            // `forward_prefill_batched` also writes `self.{dense_kvs,
+            // dense_sdpa_tmp}` (its dense-path handoff) — save+restore them so
+            // the hybrid slot-aware contract (hybrid_kv is the only live mount;
+            // caller restores) is preserved. Soft-token (vision) prefills stay on
+            // the per-token resume path (forward_prefill_batched has no soft-token
+            // surface). Default-OFF until byte/coherence parity is proven.
+            let use_batched_slot_prefill = soft_tokens.is_empty()
+                && std::env::var("HF2Q_PREFILL_SLOT_BATCHED").as_deref() == Ok("1");
+            let result = if use_batched_slot_prefill {
+                let prior_dense_kvs = self.dense_kvs.take();
+                let prior_dense_sdpa_tmp = self.dense_sdpa_tmp.take();
+                let r = self.forward_prefill_batched(prompt_tokens, max_decode_tokens, 0, gpu);
+                self.dense_kvs = prior_dense_kvs;
+                self.dense_sdpa_tmp = prior_dense_sdpa_tmp;
+                r
+            } else {
+                self.forward_prefill_with_soft_tokens_resume(
+                    prompt_tokens,
+                    soft_tokens,
+                    max_decode_tokens,
+                    gpu,
+                    None,
+                    true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
+                )
+            };
 
             // Restore prior `self.hybrid_kv` regardless of result.  The
             // slot-view bundle has lifetime tied to this call; the
