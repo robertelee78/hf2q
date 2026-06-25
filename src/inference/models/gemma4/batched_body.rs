@@ -491,6 +491,22 @@ impl MlxModelWeights {
         });
         let use_batched_flash =
             std::env::var("HF2Q_BATCHED_FLASH").as_deref() == Ok("1") && same_bucket;
+        // ROWDIFF probe (HF2Q_DECODE_TRACE): layer 0 only — dump per-slot
+        // seq_positions / ksl / cache_pos so we can tell whether staggered slot-0
+        // divergence is BOOKKEEPING (positions differ) or KV-CONTENT (identical).
+        if layer_idx == 0 && std::env::var("HF2Q_DECODE_TRACE").is_ok() {
+            let dump: Vec<String> = (0..n)
+                .map(|i| {
+                    let sp = seq_positions[i];
+                    let cp = if gring { (sp % gcap) as u32 } else { sp as u32 };
+                    format!("s{}:sp{} ksl{} cp{}", slot_ids[i].0, sp, ksl_of(i), cp)
+                })
+                .collect();
+            eprintln!(
+                "[ROWDIFF] L0 N={} max_ksl={} same_bucket={} bflash={} [{}]",
+                n, max_ksl, same_bucket, use_batched_flash, dump.join(" ")
+            );
+        }
         if use_batched_flash {
             let buf = gbuf;
             let cap = gcap;

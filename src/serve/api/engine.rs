@@ -6430,6 +6430,12 @@ fn decode_batch_gemma4(
     // persistent multi-seq scaffolds; decode re-mounts a fresh slice-view.
     clear_gemma4_self_mounts(guard.model);
 
+    // ADR-040 iter-F-batched-determinism — env-gated per-tick trace
+    // (HF2Q_DECODE_TRACE=1) to make the staggered batched non-determinism
+    // observable: logs each tick's batch composition (N, per-slot pos+token)
+    // and each slot's output token. Off by default (zero cost in production).
+    let trace = std::env::var("HF2Q_DECODE_TRACE").is_ok();
+
     // Pass 1 — capture bodies. `captured` holds (handle, slot_idx, state, reply)
     // for each slot whose body ran; `hidden_rows` is their final hidden states
     // concatenated row-major `[n, hidden_size]`.
@@ -6473,6 +6479,11 @@ fn decode_batch_gemma4(
         }
         if captured.is_empty() {
             return;
+        }
+        if trace {
+            let comp: Vec<String> = sids.iter().zip(positions.iter()).zip(tokens.iter())
+                .map(|((s, p), t)| format!("s{}@{}:in{}", s.0, p, t)).collect();
+            eprintln!("[DECTRACE] BATCHED N={} [{}]", sids.len(), comp.join(" "));
         }
         let body_res = {
             let hybrid = guard.hybrid.as_mut().unwrap();
@@ -6572,6 +6583,10 @@ fn decode_batch_gemma4(
                 continue;
             }
         };
+        if trace {
+            eprintln!("[DECTRACE]   out s{} top1_val={:.4} -> tok{}",
+                handle.slot_id.0, top1_val, greedy_token);
+        }
         let tick = match state.decode_tick_finalize(guard.model, greedy_token, logits_row) {
             Ok(t) => t,
             Err(e) => {
