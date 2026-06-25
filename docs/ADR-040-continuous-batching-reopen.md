@@ -373,7 +373,27 @@ The **production default scheduler path is essentially FLAT** (97.9→102.7 — 
 
 **Active/added follow-ups:**
 - **`iter-F-prefill-determinism` — RESOLVED (2026-06-24, codex tag-team confirmed). It was a REAL pre-existing continuous-batching CORRUPTION bug, not a benign flake.** Empirical capture (24 runs) showed: 100% of the ~13-17% failures are the EARLIEST in-flight slot (`max_tokens=5`), GROSS corruption from token 1 (e.g. `left:" halaman 1-1"` vs correct `right:"\|_{**}**"`) — i.e. that slot intermittently attends to the WRONG KV, not a near-flat numeric flip. A/B confirmed PRE-EXISTING (HEAD 2/15 vs pre-`iter-F-kvcap` `cf4f3d42` 1/15 — indistinguishable), so no Phase-F deliverable introduced it. **Root cause** (lead + codex independently converged): the slot-aware prefill (`forward_prefill_with_soft_tokens_slot_aware`) and per-slot decode (`forward_decode_slot_aware_impl`) both mount a per-slot KV slice-view on shared `self.{dense,hybrid,leg_hb}_kv` and decode uses a **save-mount-RESTORE scope-guard**. In the clean n4/n8 path the saved "prior" is always `None`; but a request admitted **mid-stream** (the normal continuous-batching case) leaves a prefill-origin mount that each in-flight slot's decode RESTORES across ticks, which then poisons the next prefill's `if self.hybrid_kv.is_none()` write-back gate (`forward_prefill.rs:970`) → the earliest in-flight request decodes against the wrong slot-view and emits garbage. (This WOULD affect real staggered traffic; the earlier e2e looked clean only because its 4 requests were admitted ~simultaneously.) **Fix (2 lines, data-lossless — per-slot K/V lives in the persistent multi-seq scaffold, decode re-mounts fresh):** `clear_gemma4_self_mounts()` (a) immediately AFTER `prefill_seed` in `admit_gemma4_slot` and (b) at the TOP of every `decode_batch_gemma4` tick — enforcing the postcondition "`self.*` mounts are `None` at every admit/decode boundary" (the clean-n4/n8 invariant). **Validated:** clear-after-prefill alone took ~13%→~3% (1/30); BOTH clears → **0/40** `slot_aware_staggered_eviction`; n1/n4/n8 stay **5/5 byte-identical** (no regression). This unblocks `iter-F-batched-default`.
-- **`iter-F-batched-default`** — flip the batched body to the production default (1.94×); gated on `iter-F-prefill-determinism`.
+- **`iter-F-batched-default`** — flip the batched body to the production default (1.94× over our own baseline); gated on the batched-body determinism residual below.
+- **`iter-F-batched-determinism-residual` (OPEN)** — after the `iter-F-prefill-determinism` fix, the PER-SLOT default path is deterministic (**0/80** `slot_aware_staggered_eviction`), but the BATCHED body still flakes **~2.5% (2/70: 1/30 + 1/40)** with the SAME `max_tokens=5` gross-corruption signature. So a second, **batched-body-specific** admit-interleaving source remains (the two `clear_gemma4_self_mounts` cover `dense/hybrid/leg_hb_kv` mounts but NOT, e.g., the shared `self.kv_caches` cursor `write_pos`/`seq_len` at `forward_gpu.rs:422`, codex's #2 hypothesis). This BLOCKS the silent default-flip (a temp=0 default must be deterministic). The deterministic per-slot loop stays the default until fixed.
+
+#### 0.15 hf2q vs llama.cpp head-to-head (2026-06-24) — MEASURED clean (idle, sequential, same GGUF/prompt/N, HTTP, 200-tok gens)
+
+Operator-requested. Both via OpenAI HTTP API, gemma4-ara Q5_K_M, M5 Max, one engine at a time on an idle system. **Aggregate decode tok/s:**
+
+| N concurrent | hf2q (batched body) | llama.cpp (`-np 8`) | gap |
+|---:|---:|---:|---|
+| 1 | 82.4 | 83.9 | ~even |
+| 4 | 149.3 | 197.1 | **llama +32%** |
+| 8 | 166.2 | 235.8 | **llama +42%** |
+
+**HONEST BOTTOM LINE: the "match/beat llama" bar is NOT met — hf2q is ~even single-stream but ~30-42% SLOWER at concurrency.** This **corrects the stale §0.12 "N=8 202 > llama N=4 200" line** (prior-session, not a clean head-to-head). llama also scales better (2.8× N=1→8 vs our 2.0×).
+
+**Gap decomposition (measure, don't guess — this REFUTES the "q8-K precision is the lever" guess):** since N=1 is at PARITY (82.4 vs 83.9), the gap is **NOT** per-token KV-bandwidth or single-stream efficiency (the F16-K vs q8_0-K byte difference does not show at N=1) — it is **batching/server efficiency** that only manifests under concurrency. Two measured sub-levers:
+1. **Server overhead ~16%:** hf2q in-process batched probe = 198.8 tok/s @ N=8, but the HTTP server only 166.2 → ~16% lost in the serve layer (sampling/HTTP/real-prefill). Recoverable hf2q-side, not a kernel issue.
+2. **Batching kernel efficiency ~18%:** in-process 198.8 vs llama 235.8 @ N=8 → llama amortizes per-step better (our MoE routing + weighted-sum still have per-slot loops; attention/proj batching has headroom).
+Caveats: (a) different KV quant (hf2q F16-K/TQ-HB-V 8-bit vs llama q8_0/q8_0) — a coherence/VRAM tradeoff, not pure speed; (b) coherence parity vs llama NOT re-verified this session (throughput only); (c) the batched body still has the ~2.5% staggered determinism residual above.
+
+**Next levers (in measured-priority order):** (i) close the ~16% serve-layer overhead (hf2q `serve` path); (ii) reduce remaining per-slot loops in the batched MoE/attention; (iii) only THEN evaluate a q8-K decode path (a coherence-affecting kernel change, and N=1 parity says it is not the dominant lever). All gated behind fixing the batched-body determinism residual first (operator: "fix determinism first").
 
 ---
 
