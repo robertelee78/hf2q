@@ -410,8 +410,26 @@ impl MlxModelWeights {
         }
 
         // (c) ONE softcap on the full n*vocab logits (element-wise).
-        //     dispatch_softcap is element-wise so it works on any size.
+        //     ADR-040 §0.16: the softcap kernel early-returns `if id >= params[1]`,
+        //     and the shared `self.activations.softcap_params` carries
+        //     `params[1] = vocab_size` (single-row count). For this batched
+        //     [n, vocab] buffer that would softcap ONLY position 0 and leave
+        //     positions ≥1 RAW (the same defect fixed in lm_head_batched). Use a
+        //     per-call params buffer with the full `n * vocab` element count.
         if let Some(cap) = self.final_logit_softcapping {
+            let total = n
+                .checked_mul(vocab_size as usize)
+                .expect("per_position softcap: n*vocab overflow");
+            let mut softcap_params_b = dev
+                .alloc_buffer(8, mlx_native::DType::F32, vec![2])
+                .map_err(|e| anyhow::anyhow!("batched arg softcap params alloc: {e}"))?;
+            {
+                let p: &mut [f32] = softcap_params_b
+                    .as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("batched arg softcap params slice: {e}"))?;
+                p[0] = cap;
+                p[1] = f32::from_bits(total as u32);
+            }
             s.barrier_between(
                 &[&logits_batched],
                 &[&logits_batched],
@@ -422,7 +440,7 @@ impl MlxModelWeights {
                 metal_dev,
                 &logits_batched,
                 &logits_batched,
-                &self.activations.softcap_params,
+                &softcap_params_b,
                 cap,
             )
             .map_err(|e| anyhow::anyhow!("batched arg softcap: {e}"))?;

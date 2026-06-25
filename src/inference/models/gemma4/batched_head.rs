@@ -185,8 +185,9 @@ impl MlxModelWeights {
             let p: &mut [f32] = softcap_params_b
                 .as_mut_slice()
                 .map_err(|e| anyhow::anyhow!("lm_head_batched softcap params slice: {e}"))?;
+            let total = n.checked_mul(vocab).expect("lm_head softcap: n*vocab overflow");
             p[0] = cap;
-            p[1] = f32::from_bits((n * vocab) as u32);
+            p[1] = f32::from_bits(total as u32);
         }
 
         let mut s = exec

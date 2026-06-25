@@ -421,7 +421,10 @@ Op-level bisection (`HF2Q_DECODE_TRACE` host-side row-diff of `hidden_rows` / `h
 
 **Fix (hf2q-side, `gemma4/batched_head.rs`):** allocate a per-call softcap params buffer `[cap, n*vocab]` and pass it to `dispatch_softcap` so every row is softcapped. The mlx-native kernel is correct (it honors `params[1]`); the caller passed the single-row count. **Validated:** the same-prompt N=4 falsifier now shows `head.logits` row-diff = 0.0 with all rows == the softcapped serial value; n1/n4/n8 parity stay byte-identical. Staggered-eviction flake re-run results recorded inline.
 
-**Follow-up (tracked):** other `dispatch_softcap` call sites that may pass `m>1` with the shared single-row params — `forward_gpu.rs:934/1940`, `io_heads.rs:204/425` — should be audited for the same `n_elements` mismatch (prefill typically only consumes the last token's logits, so likely benign, but verify).
+**Follow-up (codex-reviewed):**
+- Prefill / single-row head paths (`forward_prefill.rs:2067`, `forward_prefill_batched.rs:3321`, `forward_gpu.rs:1940`) dispatch lm_head with `m=1` → `params[1]=vocab` is correct there. The tree-verify path already allocates its own `n_elems = tree_seq_len*vocab`. **Not affected.**
+- `io_heads.rs` `per_position_argmax_from_hidden_batched_impl` (used by dflash/ngram multi-position verify) had the **same defect** (batched `[n,vocab]` logits softcapped with shared `params[1]=vocab` → only position 0). **FIXED** the same way (per-call `[cap, n*vocab]` params). Mostly benign for pure argmax (softcap is monotonic) but a real correctness bug if those logits are consumed beyond argmax.
+- **Remaining (publish-gated):** mlx-native `dispatch_softcap` is a footgun — it already computes `n = input.element_count()` for the grid but trusts the caller's `params[1]` for the kernel bound. Harden it to derive `n_elements` from the buffer (or build params internally from the `cap` arg it already receives) so callers can't pass a stale single-row count. Deferred to the next mlx-native publish (hf2q pins `mlx-native = "0.9.3"` from crates.io).
 
 #### 0.15 hf2q vs llama.cpp head-to-head (2026-06-24) — MEASURED clean (idle, sequential, same GGUF/prompt/N, HTTP, 200-tok gens)
 
