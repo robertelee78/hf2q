@@ -3746,8 +3746,15 @@ impl MlxModelWeights {
             // dense_sdpa_tmp}` (forward_prefill_batched's dense handoff) to preserve the
             // hybrid slot-aware contract. Soft-token (vision) prefills stay on per-token.
             // The N=8 SHORT-prompt lever still needs a purpose-built MULTI-SEQ prefill.
+            // iter-G(b) DEFAULT-ON (2026-06-25): validated byte-identical to
+            // production SerialFifo across short/long × single/8-concurrent, and
+            // deterministic, with the §0.19 FA fix in place. Gives ~18× long-prompt
+            // slot-aware prefill (batched-per-layer vs per-token). Opt out via
+            // HF2Q_PREFILL_SLOT_BATCHED=0. Soft-token (vision) prefills auto-fall-back
+            // to the per-token resume path (forward_prefill_batched has no soft-token
+            // surface) via the soft_tokens.is_empty() guard.
             let use_batched_slot_prefill = soft_tokens.is_empty()
-                && std::env::var("HF2Q_PREFILL_SLOT_BATCHED").as_deref() == Ok("1");
+                && std::env::var("HF2Q_PREFILL_SLOT_BATCHED").as_deref() != Ok("0");
             let result = if use_batched_slot_prefill {
                 let prior_dense_kvs = self.dense_kvs.take();
                 let prior_dense_sdpa_tmp = self.dense_sdpa_tmp.take();
