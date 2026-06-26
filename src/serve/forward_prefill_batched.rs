@@ -1218,28 +1218,33 @@ impl MlxModelWeights {
             // pins the FIRST layer where the offset breaks isolation.
             if std::env::var("HF2Q_CKSUM_PERSEQ").as_deref() == Ok("1") {
                 if let Ok(h) = pf_hidden.as_slice::<f32>() {
-                    let fnv = |range: std::ops::Range<usize>| -> u64 {
+                    // FNV (exact identity) + sum-of-squares (magnitude, to tell a
+                    // benign FP wobble from real leakage).
+                    let stats = |range: std::ops::Range<usize>| -> (u64, f64) {
                         let start = (range.start * hs).min(h.len());
                         let end = (range.end * hs).min(h.len());
                         let mut acc: u64 = 1469598103934665603;
+                        let mut ss: f64 = 0.0;
                         for &x in &h[start..end] {
                             acc = (acc ^ (x.to_bits() as u64)).wrapping_mul(1099511628211);
+                            ss += (x as f64) * (x as f64);
                         }
-                        acc
+                        (acc, ss)
                     };
                     if let Some(ref ms) = self.multi_seq_prefill {
                         for (si, (&off, &l)) in
                             ms.seq_offsets.iter().zip(ms.seq_lens.iter()).enumerate()
                         {
+                            let (fnv, ss) = stats(off..off + l);
                             eprintln!(
-                                "[ROWCK multi.s{si}] L{layer_idx:02} sliding={is_sliding} rows[{off}..{}] fnv={:016x}",
-                                off + l, fnv(off..off + l)
+                                "[ROWCK multi.s{si}] L{layer_idx:02} sliding={is_sliding} rows[{off}..{}] fnv={fnv:016x} ss={ss:.6e}",
+                                off + l
                             );
                         }
                     } else {
+                        let (fnv, ss) = stats(0..seq_len);
                         eprintln!(
-                            "[ROWCK single] L{layer_idx:02} sliding={is_sliding} rows[0..{seq_len}] fnv={:016x}",
-                            fnv(0..seq_len)
+                            "[ROWCK single] L{layer_idx:02} sliding={is_sliding} rows[0..{seq_len}] fnv={fnv:016x} ss={ss:.6e}"
                         );
                     }
                 }
