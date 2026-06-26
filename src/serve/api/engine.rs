@@ -20090,8 +20090,10 @@ assistant:
         // fixing the D512 FA kernel (converges task #19). Set HF2Q_ITERGA_N8=1
         // for the 8-prompt isolation matrix. See ADR-040 §0.20.
         let prompts: Vec<Vec<u32>> = if std::env::var("HF2Q_ITERGA_N8").as_deref() == Ok("1") {
+            // 64-token prompts → each seq starts at a 64-multiple offset =
+            // D512 chunk(C=64)-aligned, so post-blk-fix F16 FA isolates byte-exact.
             (0..8u32)
-                .map(|i| (0..70u32).map(|j| 1 + (i.wrapping_mul(131).wrapping_add(j.wrapping_mul(7)) % 4000)).collect())
+                .map(|i| (0..64u32).map(|j| 1 + (i.wrapping_mul(131).wrapping_add(j.wrapping_mul(7)) % 4000)).collect())
                 .collect()
         } else {
             vec![(0..70u32).map(|j| 1 + (j.wrapping_mul(7) % 4000)).collect()]

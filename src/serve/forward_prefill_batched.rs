@@ -386,8 +386,16 @@ impl MlxModelWeights {
         // K = seq_len >= 32 (it errors below that). Sliding (D=256) layers always
         // stay on fast capped FA. Opt out (re-enable F16-D512 FA everywhere, for
         // kernel-fix A/B) via HF2Q_GLOBAL_FA=1.
-        let force_global_nofa =
-            std::env::var("HF2Q_GLOBAL_FA").as_deref() != Ok("1") && seq_len > 64;
+        // ADR-040 iter-G(a): the MULTI-SEQ path always uses F16 FA for the
+        // global D=512 layers — tensor-mm CANNOT be byte-identical to per-seq
+        // attention (it sums over masked cross-seq columns → near-tie argmax
+        // flips), whereas the (blk-fixed, §0.19/cb9806c) F16 D512 FA SKIPS
+        // masked tiles and isolates byte-exact. Single-seq keeps the §0.19
+        // tensor-mm routing for >64 (conservative until §0.19 determinism is
+        // re-validated end-to-end for single long prompts).
+        let force_global_nofa = std::env::var("HF2Q_GLOBAL_FA").as_deref() != Ok("1")
+            && seq_len > 64
+            && self.multi_seq_prefill.is_none();
 
         // Wave P4.17 — super-flag: per-op isolation for bucket attribution.
         // When on, every dispatch is bracketed by s.finish()/s = exec.begin()
