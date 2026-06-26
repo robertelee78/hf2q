@@ -581,6 +581,17 @@ The N=8 SHORT-prompt prefill gap (hf2q 2438ms = 8 sequential prefills vs llama 3
   - **iter-G(a) COMPLETE (admit-loop delta 5 shipped, 2026-06-25, hf2q HEAD 1aaa14ca).** The SlotAware admit loop now batches greedy text requests into ONE multi-seq prefill (`admit_gemma4_slots_batched`), gated `HF2Q_CROSS_SLOT_ADMIT=1` (opt-in) + capability (hybrid regime / scaffold present / no xlen); default OFF → admit phase BYTE-UNCHANGED. `Gemma4DecodeState::prefill_seed` was split → `from_first_token` (state construction) so the batched path reuses the identical sampler/grammar/tool-call/reasoning/EOS logic. Greedy-only (multi-seq returns per-seq argmax, not logits; codex-flagged); sampling/soft-tokens/max_tokens==0 stay on single admit. codex APPROVE-WITH-CHANGES, both applied (from_first_token takes prefill_duration; capability-gate before reserving). **VALIDATED:** `slot_aware_n8_per_slot_parity_vs_serial` + `slot_aware_staggered_eviction` GREEN (default path + refactor byte-unchanged); `iter_g_a_batched_admit_e2e_and_ttft` → 8 concurrent greedy requests all complete, batched admit fired (all 8 in ONE forward), **TTFT 8-concurrent max_tokens=1 = batched-ON 183 ms vs sequential-OFF 564 ms = 3.09× speedup**. iter-G(a) = forward (block-diagonal mask + blk-fix + BF16) + admit loop + E2E + measured TTFT win — DONE. Remaining ADR-040 follow-up: §0.19 F16-FA determinism crack (task #19, non-blocking speed lever); flip `HF2Q_CROSS_SLOT_ADMIT` default-on after a soak (user's ship call); mlx-native 0.9.4 release + repin before main-merge.
   - Diagnostics: `HF2Q_ITERGA_N8=1` (8-prompt matrix), `HF2Q_CKSUM_PERSEQ=1`+`HF2Q_SYNC_PER_LAYER=1`, `iter_g_a_bisect_offset`, mlx-native `iter_g_a_f16_block_diagonal_isolation_repro` / `iter_g_a_f16_d512_gqa_block_diagonal_isolation`.
 
+#### 0.21 F6 PEER BENCHMARK vs llama.cpp — the "as fast or faster than llama.cpp" receipt (2026-06-25)
+
+Head-to-head on the SAME model (`gemma4-ara-2pass-APEX-Q5_K_M.gguf`, which llama.cpp loads with no arch error), SAME M5 Max, one engine at a time, clean/idle. llama.cpp = `llama-batched-bench -npp 32 -ntg 128 -npl 1,8 -ngl 99`; hf2q = `HF2Q_CROSS_SLOT_ADMIT=1` prefill + `slot_aware_n4_batched_body_throughput_probe HF2Q_BENCH_N=8` decode.
+
+| N=8 metric | hf2q | llama.cpp | llama advantage |
+|---|---|---|---|
+| **Prefill** | 2285 t/s (107 ms / 244 tok) | 2628 t/s (97 ms / 256 tok) | **1.15×** |
+| **Decode** | 197.5 t/s (1024 tok / 5.19 s) | 290.8 t/s (1024 tok / 3.52 s) | **1.47×** |
+
+**VERDICT: hf2q is NOT yet "as fast or faster than llama.cpp."** iter-G(a) brought N=8 prefill from ~8× behind (8 sequential prefills) to **within 15%** — competitive. But **decode is ~47% behind**, the dominant remaining gap. **CRITICAL:** hf2q uses a SMALLER KV cache (hybrid F16-K + 8-bit-V) than llama (F16) yet decodes SLOWER → the decode gap is **NOT memory-bandwidth** (this REFUTES the §0.13 / 2026-06-24 "decode is BW-saturated, no win left" conclusion) → it is almost certainly **DISPATCH-OVERHEAD bound** (gemma4 is MoE-128: per-token expert routing + ~120 rms_norm dispatches + hybrid-KV dequant = many small GPU launches; llama.cpp fuses far more per token). **NEXT MAJOR MILESTONE (reopens decode optimization): reduce the per-token GPU dispatch count / fuse decode kernels in mlx-native to close the 1.47× decode gap.** This is the work that earns the core goal. iter-G(a) (prefill) is done and competitive; decode is the open lever.
+
 ---
 
 ## 1. Why (the problem)
