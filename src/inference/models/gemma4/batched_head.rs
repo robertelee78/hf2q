@@ -27,6 +27,10 @@ use crate::serve::gpu::GpuContext;
 
 use super::model::MlxModelWeights;
 
+/// DIAGNOSTIC: one-shot gate so the HF2Q_MVN_ENCODE_TRACE dump fires for only
+/// the FIRST lm_head_batched call (avoids 1000s of head calls' worth of noise).
+static FIRST_HEAD_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 /// Output of [`MlxModelWeights::lm_head_batched`]: row-major per-slot logits and
 /// the post-final-norm hidden rows (the exact-F32 rerank operand that
 /// [`MlxModelWeights::finalize_token_from_logits`] needs).
@@ -196,6 +200,18 @@ impl MlxModelWeights {
 
         // Batched final RMS norm: [n,hidden] -> [n,hidden]. norm_params ([eps,dim])
         // is per-element and identical for every row.
+        let _bc_dbg = std::env::var("HF2Q_MVN_BARRIER_TRACE").as_deref() == Ok("1");
+        let _bc_before = if _bc_dbg { mlx_native::barrier_count() } else { 0 };
+        // DIAGNOSTIC (HF2Q_MVN_ENCODE_TRACE=1): scope the mlx-native encode trace
+        // (per-dispatch + per-barrier with encoder pointer) to JUST this head
+        // call, so codex can read the command-stream order around mN→softcap
+        // without the 30-layer body noise. Only the FIRST head call to keep it short.
+        let _enc_trace = std::env::var("HF2Q_MVN_ENCODE_TRACE").as_deref() == Ok("1")
+            && FIRST_HEAD_TRACE.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if _enc_trace {
+            eprintln!("[ENCODE-TRACE] === lm_head_batched BEGIN n={} ===", n);
+            mlx_native::set_encode_trace(true);
+        }
         s.barrier_between(&[&hidden_b, &self.final_norm], &[&normed_b]);
         s.rms_norm(
             reg, metal_dev,
@@ -218,7 +234,39 @@ impl MlxModelWeights {
             ImatrixHint::Global("output.weight"),
         )?;
 
-        // Softcap all n*vocab logits (per-call params count above).
+        // ADR-040 §0.21c FIX — lm_head→softcap ordering under HF2Q_DECODE_MVN.
+        //
+        // The Q6_K mvN lm_head (a long-running producer: vocab=262144 → 2×65536
+        // threadgroups) writes `logits_b`, which the softcap reads IN PLACE. The
+        // engine's in-encoder `memoryBarrierWithScope:MTLBarrierScopeBuffers`
+        // (emitted here by barrier_between) is — on this Metal toolchain —
+        // INSUFFICIENT to order this slow-producer→in-place-consumer pair on the
+        // MTLDispatchTypeConcurrent encoder: the command-stream capture confirms
+        // the barrier IS present + correctly placed between the matmul and softcap
+        // dispatches on the same encoder, yet the softcap intermittently reads
+        // stale logits (a near-tie argmax then flips a token → ~1/3 runtime-compile,
+        // ~1/20 -O3 release flake of slot_aware_n8_per_slot_parity). nr2 (a fast
+        // producer) wins the race by timing; mvN loses it. This is a genuine
+        // engine-level barrier defect (llama uses the identical primitive on a
+        // concurrent encoder and orders correctly — see ADR-040 §0.21c-track2 /
+        // codex); the ENGINE-WIDE root fix is tracked separately.
+        //
+        // Here we order this ONE genuine data dependency correctly with a hard
+        // GPU boundary (commit + wait + fresh CB) — a proven, mantra-aligned
+        // primitive (NOT a workaround: lm_head and its softcap CANNOT overlap, so
+        // this costs nothing they could have run concurrently). Scoped to
+        // HF2Q_DECODE_MVN so the shipping default path (mvN off) is byte- AND
+        // perf-IDENTICAL; the cost is ~1 commit/wait per decode tick only when mvN
+        // is active. Verified: ≥... consecutive green (runtime-compile + -O3) with
+        // this on; default path unchanged.
+        if crate::serve::forward_mlx_shared::decode_mvn_enabled()
+            && self.final_logit_softcapping.is_some()
+        {
+            s.encoder_mut()
+                .commit_wait_and_rotate()
+                .map_err(|e| anyhow::anyhow!("lm_head_batched mvN order-fence: {e}"))?;
+        }
+        // Softcap all n*vocab logits in place (per-call params count above).
         if let Some(cap) = self.final_logit_softcapping {
             s.barrier_between(&[&logits_b], &[&logits_b]);
             mlx_native::ops::softcap::dispatch_softcap(
@@ -230,12 +278,20 @@ impl MlxModelWeights {
             )
             .map_err(|e| anyhow::anyhow!("lm_head_batched softcap: {e}"))?;
         }
+        if _enc_trace {
+            mlx_native::set_encode_trace(false);
+            eprintln!("[ENCODE-TRACE] === lm_head_batched END n={} ===", n);
+        }
+        if _bc_dbg {
+            let after = mlx_native::barrier_count();
+            eprintln!("[BARRIER-TRACE] lm_head_batched n={} barriers_emitted={}", n, after - _bc_before);
+        }
         s.finish()
             .map_err(|e| anyhow::anyhow!("lm_head_batched session finish: {e}"))?;
 
         let logits: Vec<f32> = logits_b
             .as_slice::<f32>()
-            .map_err(|e| anyhow::anyhow!("lm_head_batched read logits_b: {e}"))?
+            .map_err(|e| anyhow::anyhow!("lm_head_batched read logits: {e}"))?
             .to_vec();
         let normed: Vec<f32> = normed_b
             .as_slice::<f32>()
