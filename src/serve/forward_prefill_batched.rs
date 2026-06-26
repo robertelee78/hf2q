@@ -369,16 +369,20 @@ impl MlxModelWeights {
         );
 
         // ADR-040 §0.19 FIX: the F16 D=512 FA prefill kernel is NON-DETERMINISTIC
-        // on multi-chunk prefill (greedy run1 != run2 on prompts > 64 tokens at a
-        // global layer — root-caused by per-layer synced-checksum bisection to the
-        // first global/D=512 layer), and the BF16 D=512 FA path has a known
-        // enumeration-coherence bug (see HF2Q_FA_F16 note above). BOTH D=512 FA
-        // paths are defective. Route the 5 global (D=512) layers through the
-        // deterministic + coherent tensor-mm (NO_FA) path by DEFAULT; the 25
-        // sliding (D=256) layers stay on fast FA (deterministic, capped K=1024).
-        // This is the iter-82 H62 routing made default-on. Opt back into the
-        // (broken) F16-D512 FA path for kernel-fix A/B via HF2Q_GLOBAL_FA=1.
-        let force_global_nofa = std::env::var("HF2Q_GLOBAL_FA").as_deref() != Ok("1");
+        // ONLY on MULTI-CHUNK prefill — the D=512 KV chunk is C=64, so seq_len <= 64
+        // is a single chunk and F16 FA is DETERMINISTIC there; seq_len > 64 spans
+        // multiple chunks and is non-deterministic (root-caused by per-layer
+        // synced-checksum bisection to the first global/D=512 layer). The BF16 D=512
+        // FA path has a separate known enumeration-coherence bug. So for LONG prompts
+        // (> 64 tok) both D=512 FA paths are unusable; route those global layers
+        // through the deterministic + coherent tensor-mm (NO_FA) path (iter-82 H62
+        // routing, made default-on). For SHORT prompts (<= 64 tok) keep F16 FA: it is
+        // deterministic single-chunk AND the tensor-mm scores@V matmul requires
+        // K = seq_len >= 32 (it errors below that). Sliding (D=256) layers always
+        // stay on fast capped FA. Opt out (re-enable F16-D512 FA everywhere, for
+        // kernel-fix A/B) via HF2Q_GLOBAL_FA=1.
+        let force_global_nofa =
+            std::env::var("HF2Q_GLOBAL_FA").as_deref() != Ok("1") && seq_len > 64;
 
         // Wave P4.17 — super-flag: per-op isolation for bucket attribution.
         // When on, every dispatch is bracketed by s.finish()/s = exec.begin()
