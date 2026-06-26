@@ -337,17 +337,6 @@ pub(crate) fn populate_f16_shadow_if_enabled(
 
 /// ADR-022 P1.9 — APEX-format Gemma4 GGUFs preserve `ffn_gate_inp.weight`
 /// (router projection) as F32 for accuracy. mlx-native's
-/// Whether the bit-identical Q6_K mvN decode lever is enabled
-/// (`HF2Q_DECODE_MVN=1`, matching the mlx-native routing gate). Cached: the env
-/// is read once. Used by `lm_head_batched` to scope the lm_head→softcap
-/// order-fence (ADR-040 §0.21c) to the mvN path only, leaving the shipping
-/// default (mvN off) byte- AND perf-identical.
-pub fn decode_mvn_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("HF2Q_DECODE_MVN").as_deref() == Ok("1"))
-}
-
 /// `quantized_matmul_ggml` correctly refuses F32 because the GGML block
 /// kernels require block-format input; this wrapper routes F32 to the
 /// dense F32 matmul kernel that mlx-native already ships.

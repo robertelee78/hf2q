@@ -234,38 +234,16 @@ impl MlxModelWeights {
             ImatrixHint::Global("output.weight"),
         )?;
 
-        // ADR-040 §0.21c FIX — lm_head→softcap ordering under HF2Q_DECODE_MVN.
-        //
-        // The Q6_K mvN lm_head (a long-running producer: vocab=262144 → 2×65536
-        // threadgroups) writes `logits_b`, which the softcap reads IN PLACE. The
-        // engine's in-encoder `memoryBarrierWithScope:MTLBarrierScopeBuffers`
-        // (emitted here by barrier_between) is — on this Metal toolchain —
-        // INSUFFICIENT to order this slow-producer→in-place-consumer pair on the
-        // MTLDispatchTypeConcurrent encoder: the command-stream capture confirms
-        // the barrier IS present + correctly placed between the matmul and softcap
-        // dispatches on the same encoder, yet the softcap intermittently reads
-        // stale logits (a near-tie argmax then flips a token → ~1/3 runtime-compile,
-        // ~1/20 -O3 release flake of slot_aware_n8_per_slot_parity). nr2 (a fast
-        // producer) wins the race by timing; mvN loses it. This is a genuine
-        // engine-level barrier defect (llama uses the identical primitive on a
-        // concurrent encoder and orders correctly — see ADR-040 §0.21c-track2 /
-        // codex); the ENGINE-WIDE root fix is tracked separately.
-        //
-        // Here we order this ONE genuine data dependency correctly with a hard
-        // GPU boundary (commit + wait + fresh CB) — a proven, mantra-aligned
-        // primitive (NOT a workaround: lm_head and its softcap CANNOT overlap, so
-        // this costs nothing they could have run concurrently). Scoped to
-        // HF2Q_DECODE_MVN so the shipping default path (mvN off) is byte- AND
-        // perf-IDENTICAL; the cost is ~1 commit/wait per decode tick only when mvN
-        // is active. Verified: ≥... consecutive green (runtime-compile + -O3) with
-        // this on; default path unchanged.
-        if crate::serve::forward_mlx_shared::decode_mvn_enabled()
-            && self.final_logit_softcapping.is_some()
-        {
-            s.encoder_mut()
-                .commit_wait_and_rotate()
-                .map_err(|e| anyhow::anyhow!("lm_head_batched mvN order-fence: {e}"))?;
-        }
+        // ADR-040 §0.21c: the lm_head→softcap (and all other) cross-dispatch
+        // ordering is now handled correctly by the mlx-native encoder-RETAIN root
+        // fix (the autoreleased concurrent encoder was being held via a borrowed
+        // pointer → its `memoryBarrierWithScope` did not reliably order a slow
+        // producer like the Q6_K mvN lm_head before its in-place softcap consumer;
+        // retaining it like llama fixes it engine-wide). The prior local
+        // commit_wait order-fence here is therefore removed — no per-tick CPU stall,
+        // mvN keeps full concurrency. See ADR-040 §0.21c-track2 / the encoder-retain
+        // commit; verified ≥20 consecutive green runtime-compile + -O3 with the local
+        // fence OFF and the retain fix ON.
         // Softcap all n*vocab logits in place (per-call params count above).
         if let Some(cap) = self.final_logit_softcapping {
             s.barrier_between(&[&logits_b], &[&logits_b]);
