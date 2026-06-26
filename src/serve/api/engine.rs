@@ -20775,6 +20775,10 @@ assistant:
             prompts[0].clone(),
             SamplingParams { temperature: 0.0, max_tokens: 8, ..Default::default() },
         ));
+        // ADR-040 §0.21 decode-gap profiling: snapshot process-global GPU
+        // dispatch + sync counters around the timed decode (HF2Q_DISP_PROFILE=1).
+        let disp0 = mlx_native::dispatch_count();
+        let sync0 = mlx_native::sync_count();
         let t0 = std::time::Instant::now();
         let results: Vec<GenerationResult> = rt.block_on(async {
             let mut handles = Vec::new();
@@ -20799,6 +20803,21 @@ assistant:
             batched_on, n_streams, total_tokens, elapsed.as_secs_f64(), tok_s,
             tok_s / n_streams as f64,
         );
+        if std::env::var("HF2Q_DISP_PROFILE").as_deref() == Ok("1") {
+            let d = mlx_native::dispatch_count().saturating_sub(disp0);
+            let s = mlx_native::sync_count().saturating_sub(sync0);
+            // total_tokens ≈ n_streams * BENCH_TOKENS; decode steps ≈ BENCH_TOKENS
+            // (8 tokens/step). Report per-token and per-decode-step.
+            let steps = (total_tokens / n_streams).max(1) as u64;
+            eprintln!(
+                "[DISP_PROFILE] dispatches={d} syncs={s} | per-token: {:.1} disp, {:.2} sync | per-step(N={n_streams}): {:.0} disp, {:.1} sync | {:.1} us/disp wall",
+                d as f64 / total_tokens as f64,
+                s as f64 / total_tokens as f64,
+                d as f64 / steps as f64,
+                s as f64 / steps as f64,
+                elapsed.as_micros() as f64 / d as f64,
+            );
+        }
         rt.block_on(engine.shutdown()).expect("shutdown");
     }
 
