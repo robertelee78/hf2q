@@ -20075,17 +20075,27 @@ assistant:
         // positions, N-row head, per-slot KV scatter) at offset 0 — which is
         // offset-invariance-aligned, so it matches the single-seq reference.
         //
-        // NOTE: N>1 isolation is NOT yet byte-identical — there is a residual
-        // offset-mod-4 alignment bug in the D512/D256 attention's consumption of
-        // the block-diagonal mask: a sequence whose START offset is ≡ 2 (mod 4)
-        // diverges from its single-seq reference while offset ≡ 0 matches (the
-        // even/odd-seq pattern). The GPU mask buffer itself is verified correct
-        // (mlx-native `iter_g_a_gpu_block_diagonal_mask_values`); the bug is a
-        // SIMD/float4 offset-invariance violation in the attention kernels, the
-        // next iter-G(a) milestone. See ADR-040 §0.20.
-        let prompts: Vec<Vec<u32>> = vec![
-            (0..70u32).map(|j| 1 + (j.wrapping_mul(7) % 4000)).collect(),
-        ];
+        // NOTE: N>1 isolation is NOT yet byte-identical — the orchestration
+        // (GPU mask, positions, KV, head) is CORRECT (N=1 exact; N=8 BF16
+        // tensor-mm = 7/8 byte-exact), but the ATTENTION KERNELS' handling of
+        // block-diagonal masks blocks full byte-identity:
+        //   - F16 FA (D256+D512): sequence-offset-NON-invariant with block-diag
+        //     masks (fork-bisected; same family as task #19);
+        //   - BF16 D512 FA: §0.19 enumeration-coherence bug (worse isolation);
+        //   - tensor-mm globals: closest (7/8), residual = FP-accumulation over
+        //     MASKED columns (matmul sums all T cols → near-tie argmax flips vs
+        //     the per-seq single-seq sum — fundamental to matmul attention).
+        // True byte-identity needs a D512 FA kernel that SKIPS masked tiles AND
+        // is offset-invariant (only FA skips masked tiles; matmul can't) — i.e.
+        // fixing the D512 FA kernel (converges task #19). Set HF2Q_ITERGA_N8=1
+        // for the 8-prompt isolation matrix. See ADR-040 §0.20.
+        let prompts: Vec<Vec<u32>> = if std::env::var("HF2Q_ITERGA_N8").as_deref() == Ok("1") {
+            (0..8u32)
+                .map(|i| (0..70u32).map(|j| 1 + (i.wrapping_mul(131).wrapping_add(j.wrapping_mul(7)) % 4000)).collect())
+                .collect()
+        } else {
+            vec![(0..70u32).map(|j| 1 + (j.wrapping_mul(7) % 4000)).collect()]
+        };
         let n = prompts.len();
         let max_decode = 24usize;
 
