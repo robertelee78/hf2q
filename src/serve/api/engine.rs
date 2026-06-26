@@ -5334,6 +5334,31 @@ impl Gemma4DecodeState {
             );
         }
 
+        // State construction extracted to `from_first_token` (shared with the
+        // iter-G(a) batched admit path, which supplies the multi-seq first token).
+        Self::from_first_token(
+            loaded, prompt_tokens, params, registration, slot_id,
+            first_decode_token, prefill_duration,
+        )
+    }
+
+    /// ADR-040 iter-G(a) — build the Gemma4DecodeState from an already-computed
+    /// prefill first token. Extracted from `prefill_seed` so the cross-slot
+    /// batched-admit path (one multi-seq forward → N first tokens) reuses the
+    /// identical sampler/grammar/tool-call/reasoning/EOS construction. GREEDY
+    /// only is batched (sample_logits==false), so `logits_view()` (read here only
+    /// under `if sample_logits`) is never touched for batched callers.
+    #[allow(clippy::too_many_arguments)]
+    fn from_first_token(
+        loaded: &mut GemmaLoadedModel,
+        prompt_tokens: &[u32],
+        params: &SamplingParams,
+        registration: Option<&super::registry::ModelRegistration>,
+        slot_id: SlotId,
+        first_decode_token: u32,
+        prefill_duration: std::time::Duration,
+    ) -> Result<Self> {
+        let max_decode_tokens = params.max_tokens.max(1);
         // Sampler / grammar / logprobs config — mirror of serial ref
         // engine.rs:9014-9067.
         let sample_logits = params.temperature > 0.0
@@ -5995,118 +6020,196 @@ fn run_slot_aware_gemma4(
     // loop parked on Idle and blocked for one request).
     let mut pending: Option<Request> = None;
 
+    // ADR-040 iter-G(a) — cross-slot BATCHED admit gate. When on, the admit
+    // phase collects greedy text requests for free slots and prefills them in
+    // ONE multi-seq forward (the TTFT lever). Opt-in (HF2Q_CROSS_SLOT_ADMIT=1)
+    // + capability-gated (hybrid-KV regime, scaffold present, no BF16-xlen
+    // verify cache). When off OR unsupported, the admit phase is BYTE-UNCHANGED
+    // (the original one-request-per-slot loop). Stable across the worker's life.
+    let cross_slot_admit = std::env::var("HF2Q_CROSS_SLOT_ADMIT").as_deref() == Ok("1")
+        && guard.hybrid.is_some()
+        && crate::debug::INVESTIGATION_ENV.hybrid_kv
+        && std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() != Ok("1");
+
     'worker: loop {
         // ── ADMIT ────────────────────────────────────────────────────
         // Fill free slots without blocking. The first iteration may carry
         // a `pending` request that unparked us.
-        loop {
-            let free = slots.iter().position(|s| s.is_none());
-            let Some(free_idx) = free else { break };
-            let _ = free_idx;
-            let req = match pending.take() {
-                Some(r) => r,
-                None => match rx.try_recv() {
-                    Ok(r) => r,
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
-                },
-            };
-            match req {
-                Request::Generate { prompt_tokens, params, reply } => {
-                    admit_gemma4_slot(
-                        &mut guard,
-                        &mut scheduler,
-                        &mut slots,
-                        registration.as_ref(),
-                        &scheduler_stats_snapshot,
-                        per_slot_kv_budget_bytes,
-                        kv_bytes_per_token,
-                        prompt_tokens,
-                        Vec::new(),
-                        params,
-                        SlotReply::Unary(reply),
-                    );
-                    publish(&scheduler, &scheduler_stats_snapshot);
+        if cross_slot_admit {
+            // ADR-040 iter-G(a) — BATCHED admit. Drain requests for the free
+            // slots, peel greedy text into ONE multi-seq prefill; dispatch
+            // everything else (sampling / soft-tokens / warmup / embed) via the
+            // single path, exactly as the default loop does.
+            loop {
+                let n_free = slots.iter().filter(|s| s.is_none()).count();
+                if n_free == 0 { break; }
+                let mut reqs: Vec<Request> = Vec::with_capacity(n_free);
+                while reqs.len() < n_free {
+                    let req = match pending.take() {
+                        Some(r) => r,
+                        None => match rx.try_recv() {
+                            Ok(r) => r,
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
+                        },
+                    };
+                    reqs.push(req);
                 }
-                Request::GenerateStream {
-                    prompt_tokens,
-                    params,
-                    events,
-                    cancellation_counter,
-                    ..
-                } => {
-                    admit_gemma4_slot(
-                        &mut guard,
-                        &mut scheduler,
-                        &mut slots,
-                        registration.as_ref(),
-                        &scheduler_stats_snapshot,
-                        per_slot_kv_budget_bytes,
-                        kv_bytes_per_token,
-                        prompt_tokens,
-                        Vec::new(),
-                        params,
-                        SlotReply::Stream { events, cancel: cancellation_counter },
-                    );
-                    publish(&scheduler, &scheduler_stats_snapshot);
+                if reqs.is_empty() { break; }
+                let mut batch: Vec<(Vec<u32>, SamplingParams, SlotReply)> = Vec::new();
+                for req in reqs {
+                    match req {
+                        Request::Generate { prompt_tokens, params, reply }
+                            if params_is_greedy(&params) && params.max_tokens > 0 =>
+                        {
+                            batch.push((prompt_tokens, params, SlotReply::Unary(reply)));
+                        }
+                        Request::GenerateStream { prompt_tokens, params, events, cancellation_counter, .. }
+                            if params_is_greedy(&params) && params.max_tokens > 0 =>
+                        {
+                            batch.push((prompt_tokens, params, SlotReply::Stream { events, cancel: cancellation_counter }));
+                        }
+                        Request::Generate { prompt_tokens, params, reply } => {
+                            admit_gemma4_slot(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &scheduler_stats_snapshot, per_slot_kv_budget_bytes, kv_bytes_per_token, prompt_tokens, Vec::new(), params, SlotReply::Unary(reply));
+                            publish(&scheduler, &scheduler_stats_snapshot);
+                        }
+                        Request::GenerateStream { prompt_tokens, params, events, cancellation_counter, .. } => {
+                            admit_gemma4_slot(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &scheduler_stats_snapshot, per_slot_kv_budget_bytes, kv_bytes_per_token, prompt_tokens, Vec::new(), params, SlotReply::Stream { events, cancel: cancellation_counter });
+                            publish(&scheduler, &scheduler_stats_snapshot);
+                        }
+                        Request::GenerateWithSoftTokens { prompt_tokens, soft_tokens, params, reply, .. } => {
+                            admit_gemma4_slot(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &scheduler_stats_snapshot, per_slot_kv_budget_bytes, kv_bytes_per_token, prompt_tokens, soft_tokens, params, SlotReply::Unary(reply));
+                            publish(&scheduler, &scheduler_stats_snapshot);
+                        }
+                        Request::Warmup { reply } => { let _ = reply.send(warmup_once(&mut guard.model)); }
+                        Request::Shutdown => { tracing::info!("Gemma4 SlotAware worker received Shutdown; exiting"); break 'worker; }
+                        Request::Embed { prompt_tokens, reply } => {
+                            embed_gemma4_inline(&mut guard, &mut scheduler, &scheduler_stats_snapshot, per_slot_kv_budget_bytes, kv_bytes_per_token, prompt_tokens, reply);
+                            publish(&scheduler, &scheduler_stats_snapshot);
+                        }
+                        _ => {}
+                    }
                 }
-                // GenerateWithSoftTokens (multimodal vision generation) IS
-                // served at SlotId>0 by the legacy inflight arm today
-                // (generate_gemma4_once_with_soft_tokens_slot_aware,
-                // engine.rs:8231), so 501-ing it would be a regression. It
-                // is a generation → it joins the batched decode loop exactly
-                // like Generate, the only difference being the soft-token
-                // injections threaded into the prefill seed. (deepstack /
-                // positions_flat are Qwen3-VL-only; Gemma 4 ignores them,
-                // matching the legacy arm at engine.rs:8219-8229.)
-                Request::GenerateWithSoftTokens {
-                    prompt_tokens,
-                    soft_tokens,
-                    params,
-                    reply,
-                    ..
-                } => {
-                    admit_gemma4_slot(
-                        &mut guard,
-                        &mut scheduler,
-                        &mut slots,
-                        registration.as_ref(),
-                        &scheduler_stats_snapshot,
-                        per_slot_kv_budget_bytes,
-                        kv_bytes_per_token,
+                if batch.len() >= 2 {
+                    admit_gemma4_slots_batched(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &scheduler_stats_snapshot, per_slot_kv_budget_bytes, kv_bytes_per_token, batch);
+                    publish(&scheduler, &scheduler_stats_snapshot);
+                } else {
+                    for (prompt_tokens, params, reply) in batch {
+                        admit_gemma4_slot(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &scheduler_stats_snapshot, per_slot_kv_budget_bytes, kv_bytes_per_token, prompt_tokens, Vec::new(), params, reply);
+                        publish(&scheduler, &scheduler_stats_snapshot);
+                    }
+                }
+            }
+        } else {
+            loop {
+                let free = slots.iter().position(|s| s.is_none());
+                let Some(free_idx) = free else { break };
+                let _ = free_idx;
+                let req = match pending.take() {
+                    Some(r) => r,
+                    None => match rx.try_recv() {
+                        Ok(r) => r,
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => break 'worker,
+                    },
+                };
+                match req {
+                    Request::Generate { prompt_tokens, params, reply } => {
+                        admit_gemma4_slot(
+                            &mut guard,
+                            &mut scheduler,
+                            &mut slots,
+                            registration.as_ref(),
+                            &scheduler_stats_snapshot,
+                            per_slot_kv_budget_bytes,
+                            kv_bytes_per_token,
+                            prompt_tokens,
+                            Vec::new(),
+                            params,
+                            SlotReply::Unary(reply),
+                        );
+                        publish(&scheduler, &scheduler_stats_snapshot);
+                    }
+                    Request::GenerateStream {
+                        prompt_tokens,
+                        params,
+                        events,
+                        cancellation_counter,
+                        ..
+                    } => {
+                        admit_gemma4_slot(
+                            &mut guard,
+                            &mut scheduler,
+                            &mut slots,
+                            registration.as_ref(),
+                            &scheduler_stats_snapshot,
+                            per_slot_kv_budget_bytes,
+                            kv_bytes_per_token,
+                            prompt_tokens,
+                            Vec::new(),
+                            params,
+                            SlotReply::Stream { events, cancel: cancellation_counter },
+                        );
+                        publish(&scheduler, &scheduler_stats_snapshot);
+                    }
+                    // GenerateWithSoftTokens (multimodal vision generation) IS
+                    // served at SlotId>0 by the legacy inflight arm today
+                    // (generate_gemma4_once_with_soft_tokens_slot_aware,
+                    // engine.rs:8231), so 501-ing it would be a regression. It
+                    // is a generation → it joins the batched decode loop exactly
+                    // like Generate, the only difference being the soft-token
+                    // injections threaded into the prefill seed. (deepstack /
+                    // positions_flat are Qwen3-VL-only; Gemma 4 ignores them,
+                    // matching the legacy arm at engine.rs:8219-8229.)
+                    Request::GenerateWithSoftTokens {
                         prompt_tokens,
                         soft_tokens,
                         params,
-                        SlotReply::Unary(reply),
-                    );
-                    publish(&scheduler, &scheduler_stats_snapshot);
-                }
-                Request::Warmup { reply } => {
-                    let _ = reply.send(warmup_once(&mut guard.model));
-                }
-                Request::Shutdown => {
-                    tracing::info!("Gemma4 SlotAware worker received Shutdown; exiting");
-                    break 'worker;
-                }
-                // Embed (pooled last-token embedding) IS served at SlotId>0
-                // by the legacy inflight arm today (embed_gemma4_slot_aware,
-                // engine.rs:7839), so 501-ing it would be a regression. It is
-                // a one-shot (no decode loop) → run it inline in the admit
-                // path (like Warmup): reserve a slot, run the slot-aware
-                // embed, release.
-                Request::Embed { prompt_tokens, reply } => {
-                    embed_gemma4_inline(
-                        &mut guard,
-                        &mut scheduler,
-                        &scheduler_stats_snapshot,
-                        per_slot_kv_budget_bytes,
-                        kv_bytes_per_token,
-                        prompt_tokens,
                         reply,
-                    );
-                    publish(&scheduler, &scheduler_stats_snapshot);
+                        ..
+                    } => {
+                        admit_gemma4_slot(
+                            &mut guard,
+                            &mut scheduler,
+                            &mut slots,
+                            registration.as_ref(),
+                            &scheduler_stats_snapshot,
+                            per_slot_kv_budget_bytes,
+                            kv_bytes_per_token,
+                            prompt_tokens,
+                            soft_tokens,
+                            params,
+                            SlotReply::Unary(reply),
+                        );
+                        publish(&scheduler, &scheduler_stats_snapshot);
+                    }
+                    Request::Warmup { reply } => {
+                        let _ = reply.send(warmup_once(&mut guard.model));
+                    }
+                    Request::Shutdown => {
+                        tracing::info!("Gemma4 SlotAware worker received Shutdown; exiting");
+                        break 'worker;
+                    }
+                    // Embed (pooled last-token embedding) IS served at SlotId>0
+                    // by the legacy inflight arm today (embed_gemma4_slot_aware,
+                    // engine.rs:7839), so 501-ing it would be a regression. It is
+                    // a one-shot (no decode loop) → run it inline in the admit
+                    // path (like Warmup): reserve a slot, run the slot-aware
+                    // embed, release.
+                    Request::Embed { prompt_tokens, reply } => {
+                        embed_gemma4_inline(
+                            &mut guard,
+                            &mut scheduler,
+                            &scheduler_stats_snapshot,
+                            per_slot_kv_budget_bytes,
+                            kv_bytes_per_token,
+                            prompt_tokens,
+                            reply,
+                        );
+                        publish(&scheduler, &scheduler_stats_snapshot);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -6323,6 +6426,186 @@ fn admit_gemma4_slot(
 
     let slot_idx = handle.slot_id.0 as usize;
     slots[slot_idx] = Some((state, reply, handle));
+}
+
+/// ADR-040 iter-G(a) — is this request GREEDY (`sample_logits == false`)? Only
+/// greedy text requests are cross-slot batchable: the multi-seq forward returns
+/// per-seq ARGMAX first tokens (not per-seq logits), and `from_first_token`
+/// reads `logits_view()` ONLY under `sample_logits`. Mirror of the predicate in
+/// `prefill_seed`/`from_first_token`.
+fn params_is_greedy(p: &SamplingParams) -> bool {
+    !(p.temperature > 0.0
+        || p.top_k > 0
+        || p.top_p < 1.0
+        || p.repetition_penalty != 1.0
+        || !p.logit_bias.is_empty()
+        || p.grammar.is_some()
+        || p.logprobs)
+}
+
+/// ADR-040 iter-G(a) — cross-slot BATCHED admit. Prefills N greedy text requests
+/// in ONE multi-seq forward (`forward_prefill_batched_multi_seq`) instead of N
+/// sequential single-seq prefills — the short-prompt N-concurrent TTFT lever.
+/// Caller guarantees every request is greedy text with `max_tokens > 0` and the
+/// hybrid-KV multi-seq regime is supported (capability-gated). All-or-nothing on
+/// the forward; per-request admit failures fall back to the single path.
+///
+/// `ITER_GA_BATCHED_ADMIT_COUNT` counts forwards with N>=2 (E2E test signal).
+pub(crate) static ITER_GA_BATCHED_ADMIT_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[allow(clippy::too_many_arguments)]
+fn admit_gemma4_slots_batched(
+    guard: &mut Gemma4KvGuard<'_>,
+    scheduler: &mut InflightBatchedScheduler,
+    slots: &mut [Option<Gemma4Slot>],
+    registration: Option<&super::registry::ModelRegistration>,
+    scheduler_stats_snapshot: &Arc<Mutex<SchedulerStats>>,
+    per_slot_kv_budget_bytes: u64,
+    kv_bytes_per_token: u64,
+    requests: Vec<(Vec<u32>, SamplingParams, SlotReply)>,
+) {
+    // 1. Reserve a physical slot for each request.
+    let mut admitted: Vec<(SlotHandle, Vec<u32>, SamplingParams, SlotReply)> =
+        Vec::with_capacity(requests.len());
+    for (prompt_tokens, params, reply) in requests {
+        let needed_bytes: u64 = if kv_bytes_per_token == 0 || per_slot_kv_budget_bytes == 0 {
+            0
+        } else {
+            u64::from(prompt_tokens.len() as u32)
+                .saturating_add(u64::from(params.max_tokens as u32))
+                .saturating_mul(kv_bytes_per_token)
+        };
+        let admit_req = AdmitRequest {
+            prompt_tokens: prompt_tokens.len() as u32,
+            max_tokens: params.max_tokens as u32,
+            kv_bytes_needed: needed_bytes,
+        };
+        match scheduler.admit(admit_req) {
+            Ok(a) => match a.handle {
+                Some(h) => admitted.push((h, prompt_tokens, params, reply)),
+                // handle:None == queued/completed-at-admit. We only batch when
+                // slots are free + max_tokens>0, so this is not expected; serve
+                // via the legacy non-slot path rather than drop the request.
+                None => {
+                    let gr = generate_once(guard.model, &prompt_tokens, &params, registration);
+                    slot_fire_done(reply, gr, false);
+                }
+            },
+            Err(e) => slot_fire_done(
+                reply,
+                Err(anyhow::anyhow!("ADR-040 iter-G(a) batched admit failed: {e:?}")),
+                false,
+            ),
+        }
+    }
+    if let Ok(mut g) = scheduler_stats_snapshot.lock() {
+        *g = scheduler.stats();
+    }
+
+    // Fewer than 2 survived → the batched forward isn't worthwhile; route the
+    // survivor(s) through the validated single path (release the reservation
+    // first; admit_gemma4_slot re-admits).
+    if admitted.len() < 2 {
+        for (handle, prompt_tokens, params, reply) in admitted {
+            scheduler.release(handle);
+            admit_gemma4_slot(
+                guard, scheduler, slots, registration, scheduler_stats_snapshot,
+                per_slot_kv_budget_bytes, kv_bytes_per_token, prompt_tokens, Vec::new(), params, reply,
+            );
+        }
+        return;
+    }
+
+    // 2. Per-slot entry reset (kv + hybrid) + clear self-mounts (mirror
+    //    prefill_seed's entry reset + the iter-F-prefill-determinism pre-clear).
+    for (handle, _, _, _) in &admitted {
+        reset_gemma4_slot(guard, handle.slot_id);
+    }
+    clear_gemma4_self_mounts(guard.model);
+
+    ITER_GA_BATCHED_ADMIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // 3. ONE multi-seq forward → N first tokens (writes each slot's KV scatter).
+    let seqs: Vec<(Vec<u32>, SlotId)> =
+        admitted.iter().map(|(h, p, _, _)| (p.clone(), h.slot_id)).collect();
+    let max_decode = admitted
+        .iter()
+        .map(|(_, _, params, _)| params.max_tokens.max(1))
+        .max()
+        .unwrap_or(1);
+    let prefill_started = Instant::now();
+    let scaffold = guard
+        .hybrid
+        .as_deref()
+        .expect("iter-G(a): hybrid scaffold present (capability-gated by caller)");
+    let forward = guard.model.weights.forward_prefill_batched_multi_seq(
+        &seqs, scaffold, max_decode, &mut guard.model.ctx,
+    );
+    let prefill_duration = prefill_started.elapsed();
+    clear_gemma4_self_mounts(guard.model);
+
+    let tokens = match forward {
+        Ok(t) => t,
+        Err(e) => {
+            // All-or-nothing: reset + release + error every reserved slot.
+            let msg = format!("ADR-040 iter-G(a) multi-seq prefill failed: {e}");
+            for (handle, _, _, reply) in admitted {
+                reset_gemma4_slot(guard, handle.slot_id);
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(anyhow::anyhow!("{msg}")), false);
+            }
+            if let Ok(mut g) = scheduler_stats_snapshot.lock() {
+                *g = scheduler.stats();
+            }
+            return;
+        }
+    };
+    if std::env::var("HF2Q_PREFILL_TIMING").is_ok() {
+        eprintln!(
+            "[PREFILL_TIMING] BATCHED {} seqs in {:.1} ms (one multi-seq forward, iter-G(a))",
+            seqs.len(),
+            prefill_duration.as_secs_f64() * 1000.0,
+        );
+    }
+
+    // 4. Install each slot — identical tail to admit_gemma4_slot.
+    for ((handle, prompt_tokens, params, reply), first_token) in
+        admitted.into_iter().zip(tokens.into_iter())
+    {
+        let state = match Gemma4DecodeState::from_first_token(
+            guard.model, &prompt_tokens, &params, registration, handle.slot_id,
+            first_token, prefill_duration,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                reset_gemma4_slot(guard, handle.slot_id);
+                scheduler.release(handle);
+                slot_fire_done(reply, Err(e), false);
+                continue;
+            }
+        };
+        scheduler.advance_after_prefill(handle, prompt_tokens.len() as u32);
+        if state.finished_at_seed() {
+            let seed_tick = TickOutcome {
+                fragment: state.decoded_text.clone(),
+                is_reasoning: false,
+                finished: true,
+            };
+            let dropped = slot_emit_token(&reply, &seed_tick);
+            scheduler.advance_after_decode(handle);
+            reset_gemma4_slot(guard, handle.slot_id);
+            scheduler.release(handle);
+            let gr = Ok(state.finish(registration));
+            slot_fire_done(reply, gr, dropped);
+            continue;
+        }
+        let slot_idx = handle.slot_id.0 as usize;
+        slots[slot_idx] = Some((state, reply, handle));
+    }
+    if let Ok(mut g) = scheduler_stats_snapshot.lock() {
+        *g = scheduler.stats();
+    }
 }
 
 /// One-shot Gemma 4 pooled-embedding request under SlotAware (`Request::Embed`).
@@ -20267,6 +20550,96 @@ assistant:
             "[iter-G(a) BF16] benign batched-vs-serial FP gap: {benign}/{n} near-tie flips \
              (accepted per ADR §B1/AC4=(b); determinism + no-leakage are the bar)"
         );
+    }
+
+    /// ADR-040 iter-G(a) — E2E batched-admit + N=8 TTFT. Drives the FULL
+    /// production path: 8 concurrent greedy Generate requests through the
+    /// SlotAware engine with HF2Q_CROSS_SLOT_ADMIT=1 → the admit loop batches
+    /// them into ONE multi-seq prefill. Asserts (1) all 8 complete with output,
+    /// (2) the batched path actually fired (ITER_GA_BATCHED_ADMIT_COUNT>0). Then
+    /// measures wall-time for 8 concurrent max_tokens=1 requests with batching
+    /// ON vs OFF — the prefill TTFT lever (§0.17). Greedy + BF16 multi-seq.
+    #[test]
+    fn iter_g_a_batched_admit_e2e_and_ttft() {
+        if byte_equiv_skip_unless_gated("iter_g_a_batched_admit_e2e_and_ttft") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from).expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path, tokenizer_path: None, config_path: None,
+            dwq_overlay_path: None, kv_persist_dir: None,
+        };
+        let prompts: Vec<Vec<u32>> = (0..8u32)
+            .map(|i| (0..(20 + i * 3)).map(|j| 1 + (i.wrapping_mul(131).wrapping_add(j.wrapping_mul(7)) % 4000)).collect())
+            .collect();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8).enable_all().build().expect("rt");
+
+        // multi-seq forces BF16 regardless; set it so single-seq peers match.
+        std::env::set_var("HF2Q_FA_F16", "0");
+
+        // ── E2E: batched admit ON, 8 concurrent greedy generates ──────────
+        std::env::set_var("HF2Q_CROSS_SLOT_ADMIT", "1");
+        ITER_GA_BATCHED_ADMIT_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+        let loaded = LoadedModel::load(&load_opts).expect("load e2e");
+        let engine = Engine::spawn_with_mode(loaded, 16, None, EngineMode::SlotAware { max_slots: 8 })
+            .expect("spawn SlotAware");
+        let results: Vec<GenerationResult> = rt.block_on(async {
+            let mut handles = Vec::new();
+            for p in prompts.iter().cloned() {
+                let eng = engine.clone();
+                let pr = params.clone();
+                handles.push(tokio::spawn(async move { eng.generate(p, pr).await.expect("generate") }));
+            }
+            let mut out = Vec::new();
+            for h in handles { out.push(h.await.expect("join")); }
+            out
+        });
+        for (i, r) in results.iter().enumerate() {
+            assert!(!r.text.is_empty(), "iter-G(a) E2E: seq {i} produced empty output");
+            assert!(r.completion_tokens > 0, "iter-G(a) E2E: seq {i} no tokens");
+        }
+        let batched = ITER_GA_BATCHED_ADMIT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(batched > 0, "iter-G(a) E2E: batched admit NEVER fired (count=0) — the multi-seq prefill path was not exercised");
+        eprintln!("[iter-G(a) E2E] 8/8 complete; batched-admit forwards fired = {batched}");
+        rt.block_on(engine.shutdown()).expect("shutdown e2e");
+
+        // ── TTFT A/B: 8 concurrent max_tokens=1, batched ON vs OFF ────────
+        let ttft_params = SamplingParams { temperature: 0.0, max_tokens: 1, ..Default::default() };
+        let measure = |on: bool| -> f64 {
+            if on { std::env::set_var("HF2Q_CROSS_SLOT_ADMIT", "1"); }
+            else { std::env::remove_var("HF2Q_CROSS_SLOT_ADMIT"); }
+            let loaded = LoadedModel::load(&load_opts).expect("load ttft");
+            let engine = Engine::spawn_with_mode(loaded, 16, None, EngineMode::SlotAware { max_slots: 8 })
+                .expect("spawn ttft");
+            // warm-up (pipeline bake) — not timed.
+            let _ = rt.block_on(engine.clone().generate(prompts[0].clone(), ttft_params.clone()));
+            let t0 = std::time::Instant::now();
+            let _: Vec<GenerationResult> = rt.block_on(async {
+                let mut handles = Vec::new();
+                for p in prompts.iter().cloned() {
+                    let eng = engine.clone();
+                    let pr = ttft_params.clone();
+                    handles.push(tokio::spawn(async move { eng.generate(p, pr).await.expect("gen") }));
+                }
+                let mut out = Vec::new();
+                for h in handles { out.push(h.await.expect("join")); }
+                out
+            });
+            let dt = t0.elapsed().as_secs_f64() * 1000.0;
+            rt.block_on(engine.shutdown()).expect("shutdown ttft");
+            dt
+        };
+        let t_on = measure(true);
+        let t_off = measure(false);
+        eprintln!(
+            "[iter-G(a) TTFT] 8 concurrent (max_tokens=1): batched-ON {t_on:.0} ms vs sequential-OFF {t_off:.0} ms — speedup {:.2}x",
+            t_off / t_on.max(0.001),
+        );
+        std::env::remove_var("HF2Q_CROSS_SLOT_ADMIT");
     }
 
     /// ADR-040 iter-G(a) DIAGNOSTIC — bisect the offset-mod-4 isolation bug.
