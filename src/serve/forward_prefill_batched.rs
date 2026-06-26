@@ -1078,6 +1078,24 @@ impl MlxModelWeights {
             if sync_setup {
                 s.finish()
                     .map_err(|e| anyhow::anyhow!("batched setup finish: {e}"))?;
+                if std::env::var("HF2Q_DUMP_SLIDING_MASK").as_deref() == Ok("1") {
+                    if let Some(ref ms) = self.multi_seq_prefill {
+                        let t = seq_len;
+                        if let Ok(sm) = sliding_mask.as_slice::<half::bf16>() {
+                            // A-query rows are seq0 [0,L0); B-key cols are seq1.
+                            let l0 = ms.seq_lens[0];
+                            let o1 = ms.seq_offsets[1];
+                            let qa = 5.min(l0.saturating_sub(1));
+                            let kb = o1 + 1; // a seq1 (B) key column
+                            let ka = 3.min(l0.saturating_sub(1)); // a seq0 (A) key (causal)
+                            eprintln!(
+                                "[SMDUMP] T={t} L0={l0} o1={o1} | mask[A_q{qa},B_k{kb}]=0x{:04x} (want FF80) | mask[A_q{qa},A_k{ka}]=0x{:04x} (want 0000) | mask[A_q{qa},A_k{}]=0x{:04x}",
+                                sm[qa*t+kb].to_bits(), sm[qa*t+ka].to_bits(),
+                                qa+1, sm[qa*t+qa+1].to_bits(), // future A key → want FF80
+                            );
+                        }
+                    }
+                }
             } else {
                 let _committed = s.commit();
                 drop(_committed);

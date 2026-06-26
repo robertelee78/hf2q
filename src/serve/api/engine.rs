@@ -20192,7 +20192,17 @@ assistant:
         let prompt_b: Vec<u32> = (0..blen as u32).map(|j| 1 + j.wrapping_mul(7) % 4000).collect();
         let max_decode = 24usize;
 
-        eprintln!("[BISECT] === single-seq forward of prompt B (offset 0, len {blen}) ===");
+        eprintln!("[BISECT] ===SINGLEA=== single-seq forward of prompt A (offset 0, len {alen})");
+        let single_a_tok = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load singleA");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma") };
+            g.weights
+                .forward_prefill_batched(&prompt_a, max_decode, 0, &mut g.ctx)
+                .expect("singleA forward")
+        };
+        eprintln!("[BISECT] singleA first_token={single_a_tok}");
+
+        eprintln!("[BISECT] ===SINGLEB=== single-seq forward of prompt B (offset 0, len {blen})");
         let single_tok = {
             let mut loaded = LoadedModel::load(&load_opts).expect("load single");
             let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma") };
@@ -20218,9 +20228,10 @@ assistant:
             toks
         };
         eprintln!(
-            "[BISECT] multi tokens={multi_toks:?} (seq1=B); single B={single_tok}; \
-             seq1 {} single",
-            if multi_toks.get(1) == Some(&single_tok) { "==" } else { "!=" }
+            "[BISECT] multi tokens={multi_toks:?}; singleA={single_a_tok} seq0(A) {}; \
+             singleB={single_tok} seq1(B) {}",
+            if multi_toks.first() == Some(&single_a_tok) { "==" } else { "!=" },
+            if multi_toks.get(1) == Some(&single_tok) { "==" } else { "!=" },
         );
     }
 
