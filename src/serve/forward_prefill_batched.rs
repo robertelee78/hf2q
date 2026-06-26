@@ -751,6 +751,28 @@ impl MlxModelWeights {
                 }
             }
         }
+        // ADR-040 iter-G(a) — per-token sequence-id buffer for the GPU
+        // block-diagonal mask kernel. In multi-seq mode, `pf_seq_id[i]` is the
+        // sequence index of token `i`; together with `pf_positions` (= per-seq
+        // local position, set above) it lets the GPU build the block-diagonal
+        // mask. These are kernel ARGUMENTS (host-written, GPU-read — coherent,
+        // like pf_positions for RoPE); the produced mask is GPU-WRITTEN so its
+        // downstream consumers (F16 cast / blk / FA) read a GPU buffer. None in
+        // single-seq mode (the GPU single-seq mask builder runs instead).
+        let pf_seq_id: Option<MlxBuffer> = if let Some(ref ms) = self.multi_seq_prefill {
+            let mut buf = alloc_u32(seq_len, "pf_seq_id")?;
+            {
+                let sid: &mut [u32] = buf.as_mut_slice()
+                    .map_err(|e| anyhow::anyhow!("pf_seq_id write: {e}"))?;
+                let mut g = 0usize;
+                for (s, &l) in ms.seq_lens.iter().enumerate() {
+                    for _ in 0..l { sid[g] = s as u32; g += 1; }
+                }
+            }
+            Some(buf)
+        } else {
+            None
+        };
         let mut pf_token_ids = alloc_u32(seq_len, "pf_token_ids")?;
         {
             let t: &mut [u32] = pf_token_ids.as_mut_slice()
@@ -795,7 +817,7 @@ impl MlxModelWeights {
         let blk_global: MlxBuffer;
         {
             use mlx_native::ops::flash_attn_prefill_mask::{
-                build_sdpa_mask_bf16, SdpaMaskParams,
+                build_block_diagonal_sdpa_mask_bf16, build_sdpa_mask_bf16, SdpaMaskParams,
             };
             use mlx_native::ops::flash_attn_prefill_blk::{
                 alloc_blk_buffer, dispatch_flash_attn_prefill_blk, BlkParams,
@@ -893,25 +915,21 @@ impl MlxModelWeights {
             let t0_mask_sw = if profile_buckets_on {
                 Some(std::time::Instant::now())
             } else { None };
-            sliding_mask = if let Some(ref ms) = self.multi_seq_prefill {
+            sliding_mask = if let Some(ref sid) = pf_seq_id {
                 // ADR-040 iter-G(a) delta 2 — block-diagonal causal SLIDING
-                // mask. Host-built instead of the GPU single-seq builder:
-                // query qi attends key kj iff same-seq AND per-seq-causal AND
-                // within the sliding window; else -inf (cross-seq isolation).
-                // Sentinels (0xFF80 / 0x0000) match build_sdpa_mask_bf16 on the
-                // diagonal blocks, so each seq's block is byte-identical to its
-                // standalone single-seq mask. The downstream F16 cast + blk
-                // tile-skip pre-pass read this buffer UNCHANGED.
-                let mvec = build_block_diagonal_mask_bf16(
-                    &ms.seq_lens, Some(self.sliding_window),
-                );
-                let mut mbuf = dev.alloc_buffer(
-                    seq_len * seq_len * 2, DType::BF16, vec![seq_len, seq_len],
-                ).map_err(|e| anyhow::anyhow!("alloc multi-seq sliding_mask: {e}"))?;
-                mbuf.as_mut_slice::<half::bf16>()
-                    .map_err(|e| anyhow::anyhow!("multi-seq sliding_mask host write: {e}"))?
-                    .copy_from_slice(&mvec);
-                mbuf
+                // mask, GPU-BUILT from the per-token seq-id + per-seq local
+                // positions (pf_positions). Query qi attends key kj iff same-seq
+                // AND per-seq-causal AND within the sliding window; else -inf
+                // (cross-seq isolation). Sentinels (0xFF80 / 0x0000) match
+                // build_sdpa_mask_bf16 on each seq's diagonal block. The mask is
+                // GPU-PRODUCED (not host-written) so the F16 cast / blk / FA read
+                // a GPU buffer — a CPU-written final mask buffer is NOT reliably
+                // read by those consumers.
+                build_block_diagonal_sdpa_mask_bf16(
+                    dev, reg, s.encoder_mut(),
+                    sid, &pf_positions,
+                    seq_len as u32, Some(self.sliding_window as u32), true,
+                ).map_err(|e| anyhow::anyhow!("build multi-seq sliding_mask: {e}"))?
             } else {
                 build_sdpa_mask_bf16(
                     dev, reg, s.encoder_mut(),
@@ -949,20 +967,17 @@ impl MlxModelWeights {
             let t0_mask_gl = if profile_buckets_on {
                 Some(std::time::Instant::now())
             } else { None };
-            global_mask = if let Some(ref ms) = self.multi_seq_prefill {
+            global_mask = if let Some(ref sid) = pf_seq_id {
                 // ADR-040 iter-G(a) delta 2 — block-diagonal causal GLOBAL mask
-                // (no sliding window). Same host-build as the sliding mask but
-                // full per-seq causal. Off-diagonal blocks -inf isolate the N
-                // sequences across the 5 global D=512 layers (which route
-                // through tensor-mm per §0.19 — also a host-mask consumer).
-                let mvec = build_block_diagonal_mask_bf16(&ms.seq_lens, None);
-                let mut mbuf = dev.alloc_buffer(
-                    seq_len * seq_len * 2, DType::BF16, vec![seq_len, seq_len],
-                ).map_err(|e| anyhow::anyhow!("alloc multi-seq global_mask: {e}"))?;
-                mbuf.as_mut_slice::<half::bf16>()
-                    .map_err(|e| anyhow::anyhow!("multi-seq global_mask host write: {e}"))?
-                    .copy_from_slice(&mvec);
-                mbuf
+                // (no sliding window), GPU-built. Full per-seq causal; off-
+                // diagonal blocks -inf isolate the N sequences across the 5
+                // global D=512 layers (F16 FA for T<=64, tensor-mm for T>64 per
+                // §0.19 — both consume this GPU-produced buffer).
+                build_block_diagonal_sdpa_mask_bf16(
+                    dev, reg, s.encoder_mut(),
+                    sid, &pf_positions,
+                    seq_len as u32, None, true,
+                ).map_err(|e| anyhow::anyhow!("build multi-seq global_mask: {e}"))?
             } else {
                 build_sdpa_mask_bf16(
                     dev, reg, s.encoder_mut(),
@@ -4155,6 +4170,13 @@ impl MlxModelWeights {
 /// The caller MUST pair this with per-sequence RoPE position reset
 /// (`pf_positions = [0..L0, 0..L1, ...]`) and `do_causal=false` at the kernel
 /// (the additive mask owns causality).
+///
+/// HOST reference only: the production multi-seq path builds this mask ON THE
+/// GPU via `mlx_native::ops::flash_attn_prefill_mask::build_block_diagonal_sdpa_mask_bf16`
+/// (the CPU-written final mask buffer is not reliably read by the FA/cast/blk
+/// consumers — the producing kernel must be on the GPU). This fn retains its
+/// unit tests as the byte-level reference for the kernel's predicate.
+#[cfg(test)]
 pub(crate) fn build_block_diagonal_mask_bf16(
     seq_lens: &[usize],
     sliding_window: Option<usize>,
