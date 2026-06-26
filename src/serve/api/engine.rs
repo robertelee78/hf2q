@@ -6673,6 +6673,13 @@ fn embed_gemma4_inline(
     let _ = reply.send(result);
 }
 
+/// ADR-040 §0.21 decode-category split — per-phase GPU-busy ns accumulators
+/// (body = embed+30 layers; lm_head = final-norm+lm_head(m=N)+softcap). Populated
+/// from `gpu_busy_ns()` deltas when `HF2Q_GPU_BUSY=1`; zero otherwise (the deltas
+/// are 0 when the accumulator is off). Read+printed by the throughput probe.
+static DECODE_BODY_GPU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DECODE_LMHEAD_GPU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Decode every active Gemma 4 slot in `handles` once (STEP 1: per-slot
 /// forward in a loop). A slot that finishes this tick fires its reply and
 /// is evicted; peers are untouched.
@@ -6779,12 +6786,17 @@ fn decode_batch_gemma4(
                 .map(|((s, p), t)| format!("s{}@{}:in{}", s.0, p, t)).collect();
             eprintln!("[DECTRACE] BATCHED N={} [{}]", sids.len(), comp.join(" "));
         }
+        let _catsplit_g0 = std::time::Instant::now();
         let body_res = {
             let hybrid = guard.hybrid.as_mut().unwrap();
             let lm = &mut *guard.model;
             lm.weights
                 .forward_decode_body_batched(&tokens, &sids, &positions, hybrid, &mut lm.ctx)
         };
+        DECODE_BODY_GPU_NS.fetch_add(
+            _catsplit_g0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         match body_res {
             Ok(h) => hidden_rows = h,
             Err(e) => {
@@ -6839,6 +6851,7 @@ fn decode_batch_gemma4(
     let n = captured.len();
 
     // Batched head: ONE final-norm + lm_head(m=N) + softcap for all slots.
+    let _catsplit_h0 = std::time::Instant::now();
     let head = match guard
         .model
         .weights
@@ -6857,6 +6870,11 @@ fn decode_batch_gemma4(
             return;
         }
     };
+
+    DECODE_LMHEAD_GPU_NS.fetch_add(
+        _catsplit_h0.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Pass 2 — finalize each slot from its logits row.
     for (i, (handle, slot_idx, mut state, reply)) in captured.into_iter().enumerate() {
@@ -20829,6 +20847,20 @@ assistant:
                     gpu_busy as f64 / 1e6 / steps as f64,
                     wall_ns as f64 / 1e6 / steps as f64,
                     if pct < 70.0 { "CPU-ENCODE/LAUNCH BOUND (hypothesis CONFIRMED)" } else { "GPU-WORK BOUND (CPU-encode refuted)" },
+                );
+            }
+            // ADR-040 §0.21 decode-CATEGORY split — body (embed+30 layers) vs
+            // lm_head (final-norm + lm_head(m=N) + softcap), wall-clock of each
+            // call (both block on GPU read-back). Localizes the GPU-work-bound step.
+            let body_ns = DECODE_BODY_GPU_NS.load(std::sync::atomic::Ordering::Relaxed);
+            let lmh_ns = DECODE_LMHEAD_GPU_NS.load(std::sync::atomic::Ordering::Relaxed);
+            if body_ns + lmh_ns > 0 {
+                let sum = (body_ns + lmh_ns).max(1);
+                eprintln!(
+                    "[DECODE_CATSPLIT] body(embed+layers) {:.2}ms/step ({:.0}%) | lm_head {:.2}ms/step ({:.0}%) | sum {:.2}ms/step",
+                    body_ns as f64 / 1e6 / steps as f64, 100.0 * body_ns as f64 / sum as f64,
+                    lmh_ns as f64 / 1e6 / steps as f64, 100.0 * lmh_ns as f64 / sum as f64,
+                    sum as f64 / 1e6 / steps as f64,
                 );
             }
         }
