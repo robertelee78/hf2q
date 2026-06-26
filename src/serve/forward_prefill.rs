@@ -3733,24 +3733,38 @@ impl MlxModelWeights {
             // byte/coherence parity test. The short-prompt N=8 benchmark gap is
             // separately LATENCY-bound (per-layer dispatch ≈8ms×30, token count
             // irrelevant) → its lever is CROSS-SLOT batched prefill. See §0.17.
-            // ADR-040 iter-G (2026-06-25): the batched mount of `forward_prefill_batched`
-            // onto the slot-view was investigated (gated HF2Q_PREFILL_SLOT_BATCHED) and
-            // proven DETERMINISTIC + byte-identical to production SerialFifo on SHORT
-            // prompts (N=1 + 8-concurrent) — overturning the prior "kernel non-det"
-            // revert. BUT it inherits a NEWLY-FOUND production bug: `forward_prefill_batched`
-            // is NON-DETERMINISTIC on LONG prompts (~398 tok) because the
-            // `flash_attn_prefill` FA kernel is non-deterministic at multi-tile seq_len
-            // (SerialFifo default reproduces it; per-token + HF2Q_NO_FA are deterministic).
-            // The mount is therefore NOT re-applied until the FA kernel is fixed (ADR §0.18).
-            // The N=8 short-prompt lever needs a purpose-built MULTI-SEQ prefill regardless.
-            let result = self.forward_prefill_with_soft_tokens_resume(
-                prompt_tokens,
-                soft_tokens,
-                max_decode_tokens,
-                gpu,
-                None,
-                true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
-            );
+            // ADR-040 iter-G(b) (2026-06-25): the older NOTE block above is SUPERSEDED.
+            // The mount's long-prompt non-determinism was NOT the TQ-HB V-quant kernel
+            // (the isolated determinism spike exonerated it) — it was the F16 D=512 FA
+            // prefill kernel (ADR §0.19), now FIXED by routing global D=512 layers
+            // through the deterministic tensor-mm path. So `forward_prefill_batched` is
+            // now deterministic on long prompts, and this mount (route the slot-aware
+            // prefill to it on the mounted slot-view) is deterministic + byte-identical
+            // to production SerialFifo (short prompts validated pre-fix; long prompts
+            // post-fix). Gated DEFAULT-OFF (`HF2Q_PREFILL_SLOT_BATCHED=1`) pending the
+            // long-prompt parity+determinism gate; saves/restores `self.{dense_kvs,
+            // dense_sdpa_tmp}` (forward_prefill_batched's dense handoff) to preserve the
+            // hybrid slot-aware contract. Soft-token (vision) prefills stay on per-token.
+            // The N=8 SHORT-prompt lever still needs a purpose-built MULTI-SEQ prefill.
+            let use_batched_slot_prefill = soft_tokens.is_empty()
+                && std::env::var("HF2Q_PREFILL_SLOT_BATCHED").as_deref() == Ok("1");
+            let result = if use_batched_slot_prefill {
+                let prior_dense_kvs = self.dense_kvs.take();
+                let prior_dense_sdpa_tmp = self.dense_sdpa_tmp.take();
+                let r = self.forward_prefill_batched(prompt_tokens, max_decode_tokens, 0, gpu);
+                self.dense_kvs = prior_dense_kvs;
+                self.dense_sdpa_tmp = prior_dense_sdpa_tmp;
+                r
+            } else {
+                self.forward_prefill_with_soft_tokens_resume(
+                    prompt_tokens,
+                    soft_tokens,
+                    max_decode_tokens,
+                    gpu,
+                    None,
+                    true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
+                )
+            };
 
             // Restore prior `self.hybrid_kv` regardless of result.  The
             // slot-view bundle has lifetime tied to this call; the
