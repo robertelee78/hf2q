@@ -3821,3 +3821,128 @@ impl MlxModelWeights {
         Ok(argmaxes)
     }
 }
+
+/// ADR-040 iter-G(a): build a BLOCK-DIAGONAL causal additive mask for N
+/// concatenated sequences — the cross-slot batched-prefill isolation mechanism.
+/// The mlx-native spike `iter_g_a_block_diagonal_mask_isolates_sequences` proves
+/// this mask isolates concatenated sequences BYTE-EXACTLY in one FA pass.
+///
+/// Returns a flat `[T, T]` row-major `bf16` buffer (`T = sum(seq_lens)`), using
+/// the EXACT sentinels `build_sdpa_mask_bf16` / `flash_attn_prefill_mask.metal`
+/// emit (so the host-built mask is byte-identical to the single-seq kernel mask
+/// on the diagonal blocks): masked = `bf16::NEG_INFINITY` (0xFF80), attended =
+/// `bf16(0.0)`. For query token `qi` (global) and key token `kj` (global), with
+/// per-sequence LOCAL positions `qp`/`kp`: attended iff same sequence AND
+/// `kp <= qp` (causal) AND (sliding: `qp - kp < window`); else masked.
+///
+/// The caller MUST pair this with per-sequence RoPE position reset
+/// (`pf_positions = [0..L0, 0..L1, ...]`) and `do_causal=false` at the kernel
+/// (the additive mask owns causality).
+pub(crate) fn build_block_diagonal_mask_bf16(
+    seq_lens: &[usize],
+    sliding_window: Option<usize>,
+) -> Vec<half::bf16> {
+    use half::bf16;
+    let masked = bf16::NEG_INFINITY; // 0xFF80 — matches flash_attn_prefill_mask.metal:120
+    let attended = bf16::from_f32(0.0); // 0x0000
+    let t: usize = seq_lens.iter().sum();
+
+    // Per global token index → (sequence index, local position).
+    let mut owner: Vec<(usize, usize)> = Vec::with_capacity(t);
+    for (s, &l) in seq_lens.iter().enumerate() {
+        for p in 0..l {
+            owner.push((s, p));
+        }
+    }
+
+    let mut mask = vec![masked; t * t];
+    for qi in 0..t {
+        let (qs, qp) = owner[qi];
+        let row = qi * t;
+        for kj in 0..t {
+            let (ks, kp) = owner[kj];
+            let attended_here = qs == ks
+                && kp <= qp
+                && match sliding_window {
+                    Some(w) => qp - kp < w,
+                    None => true,
+                };
+            if attended_here {
+                mask[row + kj] = attended;
+            }
+        }
+    }
+    mask
+}
+
+#[cfg(test)]
+mod block_diagonal_mask_tests {
+    use super::build_block_diagonal_mask_bf16;
+    use half::bf16;
+
+    fn bits(x: bf16) -> u16 {
+        x.to_bits()
+    }
+
+    /// Global (full-causal) block-diagonal mask for two sequences L=[3,2]:
+    /// diagonal blocks are single-seq causal; off-diagonal is all -inf.
+    #[test]
+    fn block_diagonal_global_two_seqs() {
+        let m = build_block_diagonal_mask_bf16(&[3, 2], None);
+        let t = 5;
+        let neg = bits(bf16::NEG_INFINITY);
+        let zero = bits(bf16::from_f32(0.0));
+        // seq0 = tokens 0..3, seq1 = tokens 3..5
+        // exact sentinel bit-patterns (byte-identical to the kernel mask)
+        for qi in 0..t {
+            for kj in 0..t {
+                let v = bits(m[qi * t + kj]);
+                let same_seq = (qi < 3) == (kj < 3);
+                let (qp, kp) = (
+                    if qi < 3 { qi } else { qi - 3 },
+                    if kj < 3 { kj } else { kj - 3 },
+                );
+                let attended = same_seq && kp <= qp;
+                let expect = if attended { zero } else { neg };
+                assert_eq!(
+                    v, expect,
+                    "mask[{qi},{kj}] same_seq={same_seq} qp={qp} kp={kp}: got 0x{v:04x} want 0x{expect:04x}"
+                );
+            }
+        }
+    }
+
+    /// Sliding-window variant: a key outside the per-seq window is masked even
+    /// when same-seq and causal.
+    #[test]
+    fn block_diagonal_sliding_window() {
+        // one sequence of length 5, window=2 → token q attends only kp in (q-2, q].
+        let m = build_block_diagonal_mask_bf16(&[5], Some(2));
+        let t = 5;
+        let neg = bits(bf16::NEG_INFINITY);
+        let zero = bits(bf16::from_f32(0.0));
+        for q in 0..t {
+            for k in 0..t {
+                let v = bits(m[q * t + k]);
+                let attended = k <= q && (q - k) < 2;
+                assert_eq!(v, if attended { zero } else { neg }, "sliding mask[{q},{k}]");
+            }
+        }
+    }
+
+    /// Cross-sequence isolation: no query attends a key in a different sequence,
+    /// even when the cross-seq key is at a lower GLOBAL position (the adversarial
+    /// case the mlx-native isolation spike covers).
+    #[test]
+    fn block_diagonal_cross_seq_isolation() {
+        let m = build_block_diagonal_mask_bf16(&[4, 4], None);
+        let t = 8;
+        let neg = bits(bf16::NEG_INFINITY);
+        // seq1 query (global 4..8) vs seq0 key (global 0..4): all masked.
+        for q in 4..8 {
+            for k in 0..4 {
+                assert_eq!(bits(m[q * t + k]), neg, "cross-seq mask[{q},{k}] must be -inf");
+            }
+        }
+    }
+}
