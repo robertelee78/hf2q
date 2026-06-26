@@ -30,7 +30,12 @@ use std::time::Instant;
 
 use crate::debug::INVESTIGATION_ENV;
 use super::config::LayerType;
-use crate::inference::models::gemma4::{DenseKvBuffers, HbKvBuffers, MlxModelWeights};
+use crate::inference::models::gemma4::{
+    DenseKvBuffers, HbKvBuffers, HybridKvBuffers, MlxModelWeights,
+};
+use crate::inference::models::gemma4::kv_cache::MultiSeqHybridKvBuffers;
+use crate::inference::models::gemma4::model::MultiSeqPrefillState;
+use crate::serve::multi_seq_kv::SlotId;
 use crate::serve::forward_mlx_shared::{
     dispatch_qmatmul, dispatch_rms_norm_unit_perhead_dual_perm,
 };
@@ -3960,6 +3965,177 @@ impl MlxModelWeights {
         }
 
         Ok(argmaxes)
+    }
+
+    /// ADR-040 iter-G(a) — build a single-seq `HybridKvBuffers` slot-view
+    /// bundle into the per-layer `multi_seq_kv_hybrid` scaffold at `slot_id`.
+    ///
+    /// Each returned `HybridKvBuffers` is a `slice_view` over the scaffold's
+    /// `[n_seqs, nkv, cap, hd]` buffers at this slot's byte offset, sharing the
+    /// underlying Metal buffer — so a kernel write through the view lands in the
+    /// slot's region. This is the SAME byte-offset arithmetic the iter-G(b)
+    /// mount uses (`forward_prefill.rs:3487-3682`), extracted so the multi-seq
+    /// wrapper can build N slot-views (one per concatenated sequence). The
+    /// BF16-xlen verify cache (opt-in `HF2Q_DFLASH_XLEN_SDPA`) is NOT supported
+    /// here — the wrapper bails when it is engaged — so `bf16_xlen_{k,v}=None`.
+    pub(crate) fn build_slot_view_hybrid(
+        &self,
+        scaffold: &[MultiSeqHybridKvBuffers],
+        slot_id: SlotId,
+    ) -> Result<Vec<HybridKvBuffers>> {
+        let mut views: Vec<HybridKvBuffers> = Vec::with_capacity(scaffold.len());
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let nkv = layer.num_kv_heads;
+            let hd = layer.head_dim;
+            let buf = &scaffold[layer_idx];
+            let cap = buf.capacity;
+            let elems_per_slot: usize = nkv
+                .checked_mul(cap)
+                .and_then(|x| x.checked_mul(hd))
+                .ok_or_else(|| anyhow::anyhow!(
+                    "slot-view elem count overflow L{layer_idx} (nkv={nkv} cap={cap} hd={hd})"
+                ))?;
+            // K: F16, 2 bytes/elem.
+            let k_byte_offset = (slot_id.0 as u64)
+                .checked_mul((elems_per_slot as u64) * 2)
+                .ok_or_else(|| anyhow::anyhow!("slot-view K offset overflow L{layer_idx}"))?;
+            let k_view = buf.k.slice_view(k_byte_offset, elems_per_slot)
+                .with_shape(vec![nkv, cap, hd])
+                .map_err(|e| anyhow::anyhow!("slot-view K with_shape L{layer_idx}: {e}"))?;
+            // V: dtype-aware (U8 TQ-packed = 1 byte, or F16 = 2 bytes).
+            let v_dtype_size = buf.v_packed.dtype().size_of();
+            let v_byte_offset = (slot_id.0 as u64)
+                .checked_mul((elems_per_slot as u64) * v_dtype_size as u64)
+                .ok_or_else(|| anyhow::anyhow!("slot-view V offset overflow L{layer_idx}"))?;
+            let v_view = buf.v_packed.slice_view(v_byte_offset, elems_per_slot)
+                .with_shape(vec![nkv, cap, hd])
+                .map_err(|e| anyhow::anyhow!("slot-view V with_shape L{layer_idx}: {e}"))?;
+            // V_norms: F32 [nkv, cap, norms_per_pos] OR a 4-byte shared dummy
+            // (HF2Q_FULL_F16_KV=1). Mirrors forward_prefill.rs:3550-3594.
+            let norms_per_pos = buf.norms_per_pos;
+            let v_norms_view = if buf.v_norms.byte_len() == 4 {
+                buf.v_norms.slice_view(0, 1).with_shape(vec![1])
+                    .map_err(|e| anyhow::anyhow!("slot-view V_norms dummy L{layer_idx}: {e}"))?
+            } else {
+                let norms_elems: usize = nkv
+                    .checked_mul(cap)
+                    .and_then(|x| x.checked_mul(norms_per_pos))
+                    .ok_or_else(|| anyhow::anyhow!("slot-view V_norms elems overflow L{layer_idx}"))?;
+                let norms_byte_offset = (slot_id.0 as u64)
+                    .checked_mul((norms_elems as u64) * 4)
+                    .ok_or_else(|| anyhow::anyhow!("slot-view V_norms offset overflow L{layer_idx}"))?;
+                let shape = if norms_per_pos == 1 { vec![nkv, cap] } else { vec![nkv, cap, norms_per_pos] };
+                buf.v_norms.slice_view(norms_byte_offset, norms_elems).with_shape(shape)
+                    .map_err(|e| anyhow::anyhow!("slot-view V_norms L{layer_idx}: {e}"))?
+            };
+            views.push(HybridKvBuffers {
+                k: k_view,
+                v_packed: v_view,
+                v_norms: v_norms_view,
+                capacity: cap,
+                is_sliding: buf.is_sliding,
+                norms_per_pos,
+                bf16_xlen_k: None,
+                bf16_xlen_v: None,
+            });
+        }
+        Ok(views)
+    }
+
+    /// ADR-040 iter-G(a) — cross-slot batched prefill ENTRY POINT.
+    ///
+    /// Prefills N prompts in ONE forward pass (paying the per-layer dispatch
+    /// launch overhead ONCE — the short-prompt N=8 TTFT lever, §0.17) with
+    /// per-seq isolation enforced entirely by the block-diagonal mask. Each
+    /// seq's KV is scattered into its own slot region; returns each seq's first
+    /// decoded (greedy) token in input order.
+    ///
+    /// Hybrid-KV regime only (the production default). Caller must ensure: the
+    /// hybrid scaffold is provisioned with `n_seqs >= seqs.len()`, every
+    /// `slot_id < n_seqs`, and `seqs` is non-empty. Bails (so the caller falls
+    /// back to serial admission) if the BF16-xlen verify cache is engaged or
+    /// the model is not in the hybrid-KV regime.
+    pub fn forward_prefill_batched_multi_seq(
+        &mut self,
+        seqs: &[(Vec<u32>, SlotId)],
+        scaffold: &[MultiSeqHybridKvBuffers],
+        max_decode_tokens: usize,
+        gpu: &mut GpuContext,
+    ) -> Result<Vec<u32>> {
+        if seqs.is_empty() {
+            anyhow::bail!("forward_prefill_batched_multi_seq: empty seqs");
+        }
+        if !INVESTIGATION_ENV.hybrid_kv {
+            anyhow::bail!(
+                "forward_prefill_batched_multi_seq: only the hybrid-KV regime is \
+                 supported (HF2Q_HYBRID_KV=1, production default) — caller must \
+                 admit serially in other regimes"
+            );
+        }
+        if std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() == Ok("1") {
+            anyhow::bail!(
+                "forward_prefill_batched_multi_seq: BF16-xlen verify cache \
+                 (HF2Q_DFLASH_XLEN_SDPA) is not supported in multi-seq prefill"
+            );
+        }
+        if scaffold.len() != self.layers.len() {
+            anyhow::bail!(
+                "forward_prefill_batched_multi_seq: scaffold layers {} != model layers {}",
+                scaffold.len(), self.layers.len()
+            );
+        }
+
+        // Concatenate prompts into one T-token stream; record per-seq lengths +
+        // exclusive-prefix-sum offsets.
+        let mut concat: Vec<u32> = Vec::new();
+        let mut seq_lens: Vec<usize> = Vec::with_capacity(seqs.len());
+        let mut seq_offsets: Vec<usize> = Vec::with_capacity(seqs.len());
+        for (toks, _slot) in seqs {
+            if toks.is_empty() {
+                anyhow::bail!("forward_prefill_batched_multi_seq: empty prompt in batch");
+            }
+            seq_offsets.push(concat.len());
+            seq_lens.push(toks.len());
+            concat.extend_from_slice(toks);
+        }
+
+        // Build N per-seq slot-view bundles into the shared scaffold.
+        let mut slot_views_hybrid: Vec<Vec<HybridKvBuffers>> = Vec::with_capacity(seqs.len());
+        for (_, slot_id) in seqs {
+            slot_views_hybrid.push(self.build_slot_view_hybrid(scaffold, *slot_id)?);
+        }
+
+        // Install the descriptor; the four deltas in forward_prefill_batched
+        // read it. Save/restore the dense handoff fields exactly as the
+        // iter-G(b) mount does (forward_prefill_batched overwrites them).
+        self.multi_seq_prefill = Some(MultiSeqPrefillState {
+            seq_lens,
+            seq_offsets,
+            slot_views_hybrid,
+            out_first_tokens: Vec::new(),
+        });
+        let prior_dense_kvs = self.dense_kvs.take();
+        let prior_dense_sdpa_tmp = self.dense_sdpa_tmp.take();
+
+        let forward_res = self.forward_prefill_batched(&concat, max_decode_tokens, 0, gpu);
+
+        self.dense_kvs = prior_dense_kvs;
+        self.dense_sdpa_tmp = prior_dense_sdpa_tmp;
+        let state = self.multi_seq_prefill.take();
+
+        // Surface a forward error AFTER restoring state (no poisoned self).
+        forward_res?;
+
+        let tokens = state
+            .map(|s| s.out_first_tokens)
+            .unwrap_or_default();
+        if tokens.len() != seqs.len() {
+            anyhow::bail!(
+                "forward_prefill_batched_multi_seq: head produced {} tokens for {} seqs",
+                tokens.len(), seqs.len()
+            );
+        }
+        Ok(tokens)
     }
 }
 
