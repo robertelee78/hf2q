@@ -20793,6 +20793,9 @@ assistant:
             prompts[0].clone(),
             SamplingParams { temperature: 0.0, max_tokens: 8, ..Default::default() },
         ));
+        // ADR-040 iter-G: reset the per-category GPU-busy buckets AFTER warm-up
+        // (HF2Q_DECODE_CATSPLIT=1) so the table reflects only the timed decode.
+        crate::inference::models::gemma4::batched_body::catsplit::reset();
         // ADR-040 §0.21 decode-gap profiling: snapshot process-global GPU
         // dispatch + sync counters around the timed decode (HF2Q_DISP_PROFILE=1).
         let disp0 = mlx_native::dispatch_count();
@@ -20822,6 +20825,46 @@ assistant:
             batched_on, n_streams, total_tokens, elapsed.as_secs_f64(), tok_s,
             tok_s / n_streams as f64,
         );
+        // ADR-040 iter-G per-category GPU-busy split (HF2Q_DECODE_CATSPLIT=1).
+        // The body session was committed at each category boundary; each bucket
+        // holds the summed GPU `GPUEndTime-GPUStartTime` of that category's CBs.
+        // Reported as GPU-ms PER EMITTED TOKEN (sum of category ns / total tokens)
+        // and as % of the category-sum. NOTE: the split serializes CBs production
+        // runs as one pipelined CB, so the SUM here OVERSTATES the real GPU-busy
+        // step (no inter-CB overlap) — compare the [THROUGHPUT] line with CATSPLIT
+        // on vs off for the perturbation, and read this table as a RELATIVE
+        // ranking. lm_head is measured by the [DECODE_CATSPLIT] body/head line
+        // under HF2Q_DISP_PROFILE.
+        if *crate::inference::models::gemma4::batched_body::catsplit::ENABLED {
+            let snap = crate::inference::models::gemma4::batched_body::catsplit::snapshot();
+            let denom = total_tokens.max(1) as f64;
+            let mut rows: Vec<(&str, u64, u64)> = snap
+                .into_iter()
+                .filter(|(_, ns, _)| *ns > 0)
+                .collect();
+            let sum_ns: u64 = rows.iter().map(|(_, ns, _)| *ns).sum::<u64>().max(1);
+            rows.sort_by(|a, b| b.1.cmp(&a.1));
+            eprintln!(
+                "[CATSPLIT] N={n_streams} per-category GPU-busy (GPUStartTime/GPUEndTime), ranked, ms/token over {} emitted tokens; SUM overstates real step (CB serialization):",
+                total_tokens,
+            );
+            eprintln!("[CATSPLIT]   {:<40} {:>10} {:>8} {:>10}", "category", "ms/token", "% step", "cbs/token");
+            for (name, ns, cbs) in &rows {
+                eprintln!(
+                    "[CATSPLIT]   {:<40} {:>10.4} {:>7.1}% {:>10.1}",
+                    name,
+                    *ns as f64 / 1e6 / denom,
+                    100.0 * *ns as f64 / sum_ns as f64,
+                    *cbs as f64 / denom,
+                );
+            }
+            eprintln!(
+                "[CATSPLIT]   {:<40} {:>10.4} {:>7.1}% (category-sum; CB-serialized, > real overlapped step)",
+                "TOTAL",
+                sum_ns as f64 / 1e6 / denom,
+                100.0,
+            );
+        }
         if std::env::var("HF2Q_DISP_PROFILE").as_deref() == Ok("1") {
             let d = mlx_native::dispatch_count().saturating_sub(disp0);
             let s = mlx_native::sync_count().saturating_sub(sync0);

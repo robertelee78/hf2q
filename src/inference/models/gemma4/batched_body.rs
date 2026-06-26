@@ -171,6 +171,130 @@ fn row_off(stride: usize, i: usize) -> u64 {
     (i * stride * 4) as u64
 }
 
+/// ADR-040 iter-G decode-category split (`HF2Q_DECODE_CATSPLIT=1`).
+///
+/// MEASUREMENT-ONLY. When the env gate is OFF (the default), `cat_split` is a
+/// no-op — the batched body runs in ONE session committed at `s.finish()`,
+/// BYTE-UNCHANGED from HEAD. When ON, the body session is committed at each
+/// category boundary via `finish_with_gpu_time()` (the real
+/// `GPUEndTime-GPUStartTime` interval — no inserted CPU-busy-wait pollutes the
+/// measurement, only the extra commits serialize what was one async CB) and the
+/// GPU-busy ns is accumulated into the per-category bucket below; a fresh
+/// session is then begun. The probe reads + reports these buckets per token.
+///
+/// The split serializes CBs that production runs as one pipelined CB, so the
+/// SUM of buckets OVERSTATES the real GPU-busy step (no inter-CB overlap). The
+/// probe therefore also reports total throughput with CATSPLIT on vs off so the
+/// overhead is visible and the split is trusted as a RELATIVE ranking, not an
+/// absolute step time.
+pub(crate) mod catsplit {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Category index. Order = report order; `LEN` sizes the bucket arrays.
+    #[derive(Clone, Copy)]
+    pub enum Cat {
+        Embed = 0,
+        RmsNorm = 1,
+        DenseQ = 2,
+        DenseK = 3,
+        DenseV = 4,
+        DenseO = 5,
+        AttnPre = 6,
+        AttnFlash = 7,
+        DenseFfn = 8,
+        MoeGateUp = 9,
+        MoeDown = 10,
+        MoeOther = 11,
+    }
+    pub const LEN: usize = 12;
+    pub const NAMES: [&str; LEN] = [
+        "embed", "rms_norm", "dense_q_proj", "dense_k_proj", "dense_v_proj",
+        "dense_o_proj", "attn_pre(qkv_norm_rope+vnorm+fwht)", "attention(kv_enc+flash)",
+        "dense_ffn(gate+up+down+router)", "moe_gate_up(mv_id)", "moe_down(mv_id)",
+        "moe_other(swiglu+routing+wsum+endlayer)",
+    ];
+
+    // One ns accumulator + one CB-count accumulator per category.
+    macro_rules! buckets {
+        ($($name:ident),*) => {
+            $(static $name: [AtomicU64; LEN] = [
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+            ];)*
+        };
+    }
+    buckets!(NS, CBS);
+
+    pub static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("HF2Q_DECODE_CATSPLIT").as_deref() == Ok("1"));
+
+    /// Add `ns` GPU-busy time (and one CB) to category `c`.
+    #[inline]
+    pub fn add(c: Cat, ns: u64) {
+        NS[c as usize].fetch_add(ns, Ordering::Relaxed);
+        CBS[c as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot `(name, total_ns, cb_count)` for every category, report order.
+    pub fn snapshot() -> Vec<(&'static str, u64, u64)> {
+        (0..LEN)
+            .map(|i| {
+                (
+                    NAMES[i],
+                    NS[i].load(Ordering::Relaxed),
+                    CBS[i].load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
+    /// Reset all buckets (called once before the timed decode).
+    pub fn reset() {
+        for i in 0..LEN {
+            NS[i].store(0, Ordering::Relaxed);
+            CBS[i].store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// ADR-040 iter-G category boundary (`HF2Q_DECODE_CATSPLIT=1`).
+///
+/// When the gate is ON: finish the current session with `finish_with_gpu_time`
+/// (real GPU `GPUEndTime-GPUStartTime`), attribute that GPU-busy interval to the
+/// category of the work JUST encoded into it (`c`), and replace `*session` with
+/// a fresh one so the NEXT category's dispatches land in a clean CB.
+///
+/// When the gate is OFF: NO-OP. `*session` is untouched, so the body keeps its
+/// single async session — byte-for-byte the production path.
+///
+/// `c` labels the work that was encoded SINCE the previous boundary (or session
+/// begin). Place a call AFTER each category's last dispatch.
+#[inline]
+fn cat_boundary<'a>(
+    session: &mut GraphSession<'a>,
+    exec: &'a GraphExecutor,
+    c: catsplit::Cat,
+) -> Result<()> {
+    if !*catsplit::ENABLED {
+        return Ok(());
+    }
+    // Replace the live session with a fresh one; finish the old one and read its
+    // GPU-busy interval. `exec.begin()` is the same call the body uses to open
+    // its session — buffers are owned by `bufs`/the model, not the session, so
+    // they persist across the boundary. Each finish is a full GPU sync, so all
+    // prior writes are complete + host-visible before the next category begins.
+    let fresh = exec
+        .begin()
+        .map_err(|e| anyhow::anyhow!("catsplit re-begin: {e}"))?;
+    let old = std::mem::replace(session, fresh);
+    let ns = old
+        .finish_with_gpu_time()
+        .map_err(|e| anyhow::anyhow!("catsplit finish: {e}"))?;
+    catsplit::add(c, ns);
+    Ok(())
+}
+
 /// Dense `input[N,in_dim] · weightᵀ → output[N,out_dim]`, BYTE-IDENTICAL to N
 /// serial m=1 decode matmuls.
 ///
@@ -245,7 +369,7 @@ impl MlxModelWeights {
     /// Proven byte-identical to N serial slot-aware decodes by `slot_aware_n1`
     /// (N=1) and `slot_aware_n4` (N=4 concurrent per-slot parity) at the
     /// production default. Opt-in via `HF2Q_BATCHED_BODY=1`.
-    pub(crate) fn encode_one_layer_batched(
+    pub(crate) fn encode_one_layer_batched<'a>(
         &self,
         layer_idx: usize,
         bufs: &BatchedDecodeBuffers,
@@ -257,8 +381,8 @@ impl MlxModelWeights {
         multi_seq_kv_hybrid: &mut [MultiSeqHybridKvBuffers],
         tq_scale_factor_d512: f32,
         tq_codebook_bits: u32,
-        session: &mut GraphSession<'_>,
-        exec: &GraphExecutor,
+        session: &mut GraphSession<'a>,
+        exec: &'a GraphExecutor,
         reg: &mut KernelRegistry,
     ) -> Result<()> {
         let dev = exec.device();
@@ -299,6 +423,7 @@ impl MlxModelWeights {
                 hs as u32,
             )
             .map_err(|e| anyhow::anyhow!("batched pre-attn norm L{layer_idx}: {e}"))?;
+        cat_boundary(session, exec, catsplit::Cat::RmsNorm)?;
 
         // -- QKV projections (BATCHED m=N): all read norm_out, write disjoint --
         session.barrier_between(
@@ -310,11 +435,13 @@ impl MlxModelWeights {
             &self.layers[layer_idx].attn.q_proj, &bufs.attn_q, n,
             hs, q_stride, "attn_q", layer_idx,
         )?;
+        cat_boundary(session, exec, catsplit::Cat::DenseQ)?;
         dispatch_dense_rowident(
             session, reg, dev, &bufs.norm_out,
             &self.layers[layer_idx].attn.k_proj, &bufs.attn_k, n,
             hs, k_stride, "attn_k", layer_idx,
         )?;
+        cat_boundary(session, exec, catsplit::Cat::DenseK)?;
         let v_is_k = self.layers[layer_idx].attn.v_proj.is_none();
         if !v_is_k {
             dispatch_dense_rowident(
@@ -322,6 +449,7 @@ impl MlxModelWeights {
                 self.layers[layer_idx].attn.v_proj.as_ref().unwrap(), &bufs.attn_v, n,
                 hs, v_stride, "attn_v", layer_idx,
             )?;
+            cat_boundary(session, exec, catsplit::Cat::DenseV)?;
         }
 
         // -- Per-head RMS norm + RoPE on Q and K (PER-SLOT row-views) --
@@ -458,6 +586,8 @@ impl MlxModelWeights {
                 )?;
             }
         }
+        // catsplit: Q/K head-norm+RoPE + V-norm (the pre-attention head ops).
+        cat_boundary(session, exec, catsplit::Cat::AttnPre)?;
 
         // -- ATTENTION (PER-SLOT): hybrid KV-encode (F16-K copy + FWHT-V quant)
         // -> flash_attn_vec_hybrid -> fwht_sign_undo, each against this slot's
@@ -771,6 +901,10 @@ impl MlxModelWeights {
         }
         }
 
+        // catsplit: hybrid KV-encode (F16-K + FWHT-V quant) + flash attention +
+        // FWHT-undo (the whole per-slot/batched attention block above).
+        cat_boundary(session, exec, catsplit::Cat::AttnFlash)?;
+
         let num_experts = self.num_experts;
         let top_k = self.layers[layer_idx].moe.top_k;
         let moe_int = self.layers[layer_idx].moe.moe_intermediate_size;
@@ -786,6 +920,7 @@ impl MlxModelWeights {
             &self.layers[layer_idx].attn.o_proj, &bufs.attn_out, n,
             sdpa_stride, hs, "attn_output", layer_idx,
         )?;
+        cat_boundary(session, exec, catsplit::Cat::DenseO)?;
 
         // -- Fused post-attn norm + residual add (BATCHED rows=N): residual =
         // norm(attn_out, post_attn_w) + hidden. Default (non-split) path. --
@@ -831,6 +966,8 @@ impl MlxModelWeights {
                 &bufs.router_norm_out, &self.activations.norm_params, nu, hs as u32,
             )
             .map_err(|e| anyhow::anyhow!("batched router norm L{layer_idx}: {e}"))?;
+        // catsplit: post-attn norm+add + pre-FF norm1/norm2 + router norm.
+        cat_boundary(session, exec, catsplit::Cat::RmsNorm)?;
 
         // -- B9: dense gate + dense up + router logits (BATCHED m=N) --
         session.barrier_between(
@@ -853,6 +990,8 @@ impl MlxModelWeights {
             &self.layers[layer_idx].moe.router_proj, &bufs.moe_router_logits, n,
             hs, num_experts, "ffn_gate_inp", layer_idx,
         )?;
+        // catsplit: dense MLP gate + up + router projection.
+        cat_boundary(session, exec, catsplit::Cat::DenseFfn)?;
 
         // -- B10: fused_gelu_mul (BATCHED, elementwise over N*intermediate) +
         // fused_moe_routing (PER-SLOT: each token's router logits -> top_k) --
@@ -900,6 +1039,8 @@ impl MlxModelWeights {
             )
             .map_err(|e| anyhow::anyhow!("batched MoE routing L{layer_idx} slot{i}: {e}"))?;
         }
+        // catsplit: fused_gelu_mul (dense SwiGLU) + per-slot MoE routing/top-k.
+        cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
 
         // -- B11: dense down: mlp_fused -> mlp_down. down_proj is F16
         // (intermediate=2112 not 256-aligned) → per-row m=1 (tile path not
@@ -913,6 +1054,8 @@ impl MlxModelWeights {
             &self.layers[layer_idx].mlp.down_proj, &bufs.mlp_down, n,
             interm, hs, "ffn_down", layer_idx,
         )?;
+        // catsplit: dense MLP down projection.
+        cat_boundary(session, exec, catsplit::Cat::DenseFfn)?;
 
         // -- MoE gate_up_id (BATCHED n_tokens=N — H-S2-tokenparity) --
         let stacked_gate_up = self
@@ -955,6 +1098,8 @@ impl MlxModelWeights {
                 &bufs.moe_expert_ids, &bufs.moe_gate_up_id_out, &gu_params,
             )
             .map_err(|e| anyhow::anyhow!("batched gate_up _id L{layer_idx}: {e}"))?;
+        // catsplit: MoE gate_up `_id` (per-token mv_id) — the big expert read.
+        cat_boundary(session, exec, catsplit::Cat::MoeGateUp)?;
 
         // -- swiglu (BATCHED over N*top_k expert rows) --
         session.barrier_between(&[&bufs.moe_gate_up_id_out], &[&bufs.moe_swiglu_id_out]);
@@ -964,6 +1109,8 @@ impl MlxModelWeights {
             moe_int, top_k * n,
         )
         .map_err(|e| anyhow::anyhow!("batched swiglu L{layer_idx}: {e}"))?;
+        // catsplit: MoE expert SwiGLU activation.
+        cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
 
         // -- down_id (BATCHED n_tokens=N*top_k) --
         session.barrier_between(
@@ -987,6 +1134,8 @@ impl MlxModelWeights {
                 &bufs.moe_expert_ids, &bufs.moe_down_id_out, &dn_params,
             )
             .map_err(|e| anyhow::anyhow!("batched down _id L{layer_idx}: {e}"))?;
+        // catsplit: MoE down `_id` (per-token mv_id) — the second big expert read.
+        cat_boundary(session, exec, catsplit::Cat::MoeDown)?;
 
         // -- post-FF norm 1 (BATCHED rows=N): mlp_down -> attn_out --
         session.barrier_between(&[&bufs.mlp_down], &[&bufs.attn_out]);
@@ -997,6 +1146,8 @@ impl MlxModelWeights {
                 &bufs.attn_out, &self.activations.norm_params, nu, hs as u32,
             )
             .map_err(|e| anyhow::anyhow!("batched post-FF norm1 L{layer_idx}: {e}"))?;
+        // catsplit: post-FF norm1.
+        cat_boundary(session, exec, catsplit::Cat::RmsNorm)?;
 
         // -- weighted_sum (PER-SLOT: each token's top_k experts -> its accum row)
         // into the DEDICATED moe_accum buffer (mirrors scalar moe_accum). The
@@ -1023,6 +1174,8 @@ impl MlxModelWeights {
             )
             .map_err(|e| anyhow::anyhow!("batched weighted_sum L{layer_idx} slot{i}: {e}"))?;
         }
+        // catsplit: MoE per-slot weighted_sum (top_k expert combine).
+        cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
 
         // -- post-FF norm2 + combine + end-of-layer (BATCHED rows=N) --
         // Mirror the scalar's branch (gpu_full_attn.rs:2191/2253) on
@@ -1078,6 +1231,8 @@ impl MlxModelWeights {
             )
             .map_err(|e| anyhow::anyhow!("batched end-of-layer L{layer_idx}: {e}"))?;
         }
+        // catsplit: post-FF norm2 + end-of-layer norm+scale (fused or unfused).
+        cat_boundary(session, exec, catsplit::Cat::RmsNorm)?;
 
         // Layer complete: bufs.hidden holds this layer's output for all N slots.
         Ok(())
@@ -1175,6 +1330,12 @@ impl MlxModelWeights {
         // see `hidden` as a prior write to emit the RAW barrier. Without this
         // the pre-attn norm can race the (untracked) embed dispatches.
         s.track_dispatch(&[&self.embed_weight], &[&bufs.hidden]);
+        // catsplit: embedding gather (per-slot). Boundary commits the embed CB and
+        // re-begins so the layer loop's categories start in a clean session. The
+        // commit is a full GPU sync, so layer-0's pre-attn RAW vs `hidden` is
+        // satisfied by completion (the fresh session's tracker re-declares it on
+        // its first `barrier_between`).
+        cat_boundary(&mut s, exec, catsplit::Cat::Embed)?;
 
         // Layer loop in [N,hidden].
         let num_layers = self.layers.len();
