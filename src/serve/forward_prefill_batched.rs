@@ -368,10 +368,21 @@ impl MlxModelWeights {
         // comparison only.  BF16-Q is the known-buggy path on enumeration
         // prompts at D=512; the opt-out exists for kernel-bisection work,
         // not production use.
-        let use_fa_f16 = !matches!(
-            std::env::var("HF2Q_FA_F16").as_deref(),
-            Ok("0") | Ok("false") | Ok("off")
-        );
+        // ADR-040 iter-G(a): the MULTI-SEQ (cross-slot) prefill runs on BF16 FA.
+        // The F16 FA prefill kernels are non-deterministic in the live 30-layer
+        // model on block-diagonal (cross-seq) masks at non-chunk-aligned offsets
+        // (the uncracked §0.19 root: deterministic in isolation, flakes under
+        // buffer-reuse/async CBs). BF16 FA isolates byte-exact AND deterministically.
+        // Per codex's gate this is provisional until the N=8 adversarial
+        // determinism matrix passes; single-seq keeps F16 (unchanged). The
+        // batched-vs-serial numeric drift is the already-accepted benign gap
+        // (ADR §B1 / AC4=(b)) — the contract is same-mode determinism + no
+        // cross-sequence contamination, NOT cross-mode byte-identity.
+        let use_fa_f16 = self.multi_seq_prefill.is_none()
+            && !matches!(
+                std::env::var("HF2Q_FA_F16").as_deref(),
+                Ok("0") | Ok("false") | Ok("off")
+            );
 
         // ADR-040 §0.19 FIX: the F16 D=512 FA prefill kernel is NON-DETERMINISTIC
         // ONLY on MULTI-CHUNK prefill — the D=512 KV chunk is C=64, so seq_len <= 64

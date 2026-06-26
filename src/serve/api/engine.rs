@@ -20163,6 +20163,100 @@ assistant:
         eprintln!("[iter-G(a)] first-token isolation PASS: {n} seqs, tokens={ms_tokens:?}");
     }
 
+    /// ADR-040 iter-G(a) — BF16 cross-slot prefill DETERMINISM + ISOLATION gate
+    /// (codex's hard gate before committing to the BF16 batched path). Multi-seq
+    /// prefill runs on BF16 FA (the F16 FA prefill kernels are the uncracked
+    /// §0.19 heisenbug on block-diagonal masks). Demands, under the real
+    /// allocator/buffer-reuse (K repeated in-process runs):
+    ///   1. DETERMINISM — K runs of the identical N=8 varied-length batch produce
+    ///      BYTE-IDENTICAL first tokens (run-to-run; the user-facing requirement).
+    ///   2. ISOLATION — each seq matches its single-seq BF16 reference.
+    ///   3. NO CONTAMINATION — a sequence held constant while its batch-mates are
+    ///      replaced produces the same token (cross-seq independence).
+    /// Run with HF2Q_FA_F16=0 so the single-seq refs are BF16 too (multi-seq
+    /// forces BF16 regardless). FAIL ON ANY FLAKE — one divergence means BF16 is
+    /// only a lower-probability manifestation, not a fix. HF2Q_ITERGA_KRUNS sets K.
+    #[test]
+    fn iter_g_a_bf16_determinism_isolation_gate() {
+        if byte_equiv_skip_unless_gated("iter_g_a_bf16_determinism_isolation_gate") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path,
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let lens = [26u32, 40, 13, 55, 70, 19, 33, 48];
+        let mk = |i: u32, l: u32| -> Vec<u32> {
+            (0..l).map(|j| 1 + (i.wrapping_mul(131).wrapping_add(j.wrapping_mul(7)) % 4000)).collect()
+        };
+        let prompts: Vec<Vec<u32>> = (0..8u32).map(|i| mk(i, lens[i as usize])).collect();
+        let n = prompts.len();
+        let max_decode = 24usize;
+        let k_runs: usize = std::env::var("HF2Q_ITERGA_KRUNS").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(20);
+
+        let mut loaded = LoadedModel::load(&load_opts).expect("load");
+        let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma GGUF") };
+        g.provision_multi_seq_kv_for_slot_aware(n as u32).expect("provision multi-seq KV");
+
+        let run_batch = |g: &mut GemmaLoadedModel, batch: &[Vec<u32>]| -> Vec<u32> {
+            let seqs: Vec<(Vec<u32>, SlotId)> = batch.iter().enumerate()
+                .map(|(i, p)| (p.clone(), SlotId(i as u32))).collect();
+            let scaffold = g.multi_seq_kv_hybrid.take().expect("hybrid scaffold");
+            let toks = g.weights
+                .forward_prefill_batched_multi_seq(&seqs, &scaffold, max_decode, &mut g.ctx)
+                .expect("multi-seq prefill");
+            g.multi_seq_kv_hybrid = Some(scaffold);
+            toks
+        };
+
+        // 1. DETERMINISM — k_runs repeated identical batches.
+        let mut runs: Vec<Vec<u32>> = Vec::with_capacity(k_runs);
+        for _ in 0..k_runs { runs.push(run_batch(g, &prompts)); }
+        for k in 1..k_runs {
+            assert_eq!(
+                runs[k], runs[0],
+                "DETERMINISM FAIL @run {k}: BF16 multi-seq is NOT a fix (heisenbug survives)\n run0={:?}\n run{k}={:?}",
+                runs[0], runs[k]
+            );
+        }
+        eprintln!("[iter-G(a) BF16] DETERMINISM {k_runs}/{k_runs} byte-identical: {:?}", runs[0]);
+
+        // 2. ISOLATION — each seq == its single-seq BF16 reference.
+        let mut refs: Vec<u32> = Vec::with_capacity(n);
+        for p in &prompts {
+            refs.push(g.weights.forward_prefill_batched(p, max_decode, 0, &mut g.ctx).expect("ref"));
+        }
+        let mut iso_fail = 0;
+        for i in 0..n {
+            if runs[0][i] != refs[i] {
+                iso_fail += 1;
+                eprintln!("[iso] seq {i} multi={} single={} MISMATCH", runs[0][i], refs[i]);
+            }
+        }
+        assert_eq!(iso_fail, 0, "ISOLATION FAIL: {iso_fail}/{n} seqs != single-seq BF16 ref");
+        eprintln!("[iter-G(a) BF16] ISOLATION {n}/{n} match single-seq BF16 refs");
+
+        // 3. NO CONTAMINATION — hold seq 0 constant, replace mates; seq0 unchanged.
+        let mut batch_b: Vec<Vec<u32>> = Vec::with_capacity(n);
+        batch_b.push(prompts[0].clone());
+        for i in 1..n as u32 { batch_b.push(mk(i + 900, lens[(n as u32 - i) as usize])); }
+        let run_b = run_batch(g, &batch_b);
+        assert_eq!(
+            run_b[0], runs[0][0],
+            "CONTAMINATION: seq 0 changed ({} -> {}) when batch-mates changed",
+            runs[0][0], run_b[0]
+        );
+        eprintln!("[iter-G(a) BF16] NO-CONTAMINATION: seq0 stable across distinct batches");
+    }
+
     /// ADR-040 iter-G(a) DIAGNOSTIC — bisect the offset-mod-4 isolation bug.
     /// Runs a single-seq forward of prompt B (offset 0), then a multi-seq
     /// forward of [A, B] where A's length puts B at offset ≡2 mod 4. With
