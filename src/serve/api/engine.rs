@@ -20779,6 +20779,7 @@ assistant:
         // dispatch + sync counters around the timed decode (HF2Q_DISP_PROFILE=1).
         let disp0 = mlx_native::dispatch_count();
         let sync0 = mlx_native::sync_count();
+        let gpu0 = mlx_native::gpu_busy_ns(); // ADR-040 §0.21 — needs HF2Q_GPU_BUSY=1
         let t0 = std::time::Instant::now();
         let results: Vec<GenerationResult> = rt.block_on(async {
             let mut handles = Vec::new();
@@ -20817,6 +20818,19 @@ assistant:
                 s as f64 / steps as f64,
                 elapsed.as_micros() as f64 / d as f64,
             );
+            // ADR-040 §0.21 DECISIVE TEST — GPU-busy vs wall-clock (needs HF2Q_GPU_BUSY=1).
+            let gpu_busy = mlx_native::gpu_busy_ns().saturating_sub(gpu0);
+            if gpu_busy > 0 {
+                let wall_ns = elapsed.as_nanos() as u64;
+                let pct = 100.0 * gpu_busy as f64 / wall_ns as f64;
+                eprintln!(
+                    "[GPU_BUSY] gpu_busy={:.3}s wall={:.3}s → GPU-busy = {:.1}% of wall-clock | per-step(N={n_streams}): gpu {:.2}ms vs wall {:.2}ms → {}",
+                    gpu_busy as f64 / 1e9, elapsed.as_secs_f64(), pct,
+                    gpu_busy as f64 / 1e6 / steps as f64,
+                    wall_ns as f64 / 1e6 / steps as f64,
+                    if pct < 70.0 { "CPU-ENCODE/LAUNCH BOUND (hypothesis CONFIRMED)" } else { "GPU-WORK BOUND (CPU-encode refuted)" },
+                );
+            }
         }
         rt.block_on(engine.shutdown()).expect("shutdown");
     }
