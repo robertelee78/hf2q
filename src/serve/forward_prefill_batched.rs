@@ -1173,6 +1173,40 @@ impl MlxModelWeights {
                     );
                 }
             }
+            // ADR-040 iter-G(a) offset-mod-4 bisection: per-layer FNV of each
+            // sequence's row range. In multi-seq mode prints one line per seq
+            // (tag "multi.sN", rows [O_i, O_i+L_i)); in single-seq mode prints
+            // the whole prompt (tag "single", rows [0, seq_len)). Comparing a
+            // single-seq forward of prompt B against multi-seq seq-B per layer
+            // pins the FIRST layer where the offset breaks isolation.
+            if std::env::var("HF2Q_CKSUM_PERSEQ").as_deref() == Ok("1") {
+                if let Ok(h) = pf_hidden.as_slice::<f32>() {
+                    let fnv = |range: std::ops::Range<usize>| -> u64 {
+                        let start = (range.start * hs).min(h.len());
+                        let end = (range.end * hs).min(h.len());
+                        let mut acc: u64 = 1469598103934665603;
+                        for &x in &h[start..end] {
+                            acc = (acc ^ (x.to_bits() as u64)).wrapping_mul(1099511628211);
+                        }
+                        acc
+                    };
+                    if let Some(ref ms) = self.multi_seq_prefill {
+                        for (si, (&off, &l)) in
+                            ms.seq_offsets.iter().zip(ms.seq_lens.iter()).enumerate()
+                        {
+                            eprintln!(
+                                "[ROWCK multi.s{si}] L{layer_idx:02} sliding={is_sliding} rows[{off}..{}] fnv={:016x}",
+                                off + l, fnv(off..off + l)
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "[ROWCK single] L{layer_idx:02} sliding={is_sliding} rows[0..{seq_len}] fnv={:016x}",
+                            fnv(0..seq_len)
+                        );
+                    }
+                }
+            }
 
             let ff_gpu = if is_sliding { None }
                 else { Some(&self.activations.rope_freq_factors_gpu) };

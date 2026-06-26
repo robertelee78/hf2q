@@ -20151,6 +20151,67 @@ assistant:
         eprintln!("[iter-G(a)] first-token isolation PASS: {n} seqs, tokens={ms_tokens:?}");
     }
 
+    /// ADR-040 iter-G(a) DIAGNOSTIC — bisect the offset-mod-4 isolation bug.
+    /// Runs a single-seq forward of prompt B (offset 0), then a multi-seq
+    /// forward of [A, B] where A's length puts B at offset ≡2 mod 4. With
+    /// HF2Q_CKSUM_PERSEQ=1 every layer prints a per-seq pf_hidden FNV — compare
+    /// `[ROWCK single L..]` against `[ROWCK multi.s1 L..]` to find the FIRST
+    /// divergent layer (sliding=D256 vs global=D512). Diagnostic only.
+    #[test]
+    fn iter_g_a_bisect_offset() {
+        if byte_equiv_skip_unless_gated("iter_g_a_bisect_offset") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        let load_opts = LoadOptions {
+            model_path: gguf_path,
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        // A len configurable via HF2Q_BISECT_ALEN (default 2 → B offset 2 ≡2 mod4).
+        // B len via HF2Q_BISECT_BLEN (default 10). Use larger to hit tensor-mm (>64).
+        let alen: usize = std::env::var("HF2Q_BISECT_ALEN").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        let blen: usize = std::env::var("HF2Q_BISECT_BLEN").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let prompt_a: Vec<u32> = (0..alen as u32).map(|j| 100 + j).collect();
+        let prompt_b: Vec<u32> = (0..blen as u32).map(|j| 1 + j.wrapping_mul(7) % 4000).collect();
+        let max_decode = 24usize;
+
+        eprintln!("[BISECT] === single-seq forward of prompt B (offset 0, len {blen}) ===");
+        let single_tok = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load single");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma") };
+            g.weights
+                .forward_prefill_batched(&prompt_b, max_decode, 0, &mut g.ctx)
+                .expect("single forward")
+        };
+        eprintln!("[BISECT] single B first_token={single_tok}");
+
+        eprintln!("[BISECT] === multi-seq forward of [A(len {alen}), B(len {blen})] — B at offset {alen} ===");
+        let multi_toks = {
+            let mut loaded = LoadedModel::load(&load_opts).expect("load multi");
+            let LoadedModel::Gemma(g) = &mut loaded else { panic!("expected Gemma") };
+            g.provision_multi_seq_kv_for_slot_aware(2).expect("provision");
+            let scaffold = g.multi_seq_kv_hybrid.take().expect("scaffold");
+            let seqs: Vec<(Vec<u32>, SlotId)> =
+                vec![(prompt_a.clone(), SlotId(0)), (prompt_b.clone(), SlotId(1))];
+            let toks = g
+                .weights
+                .forward_prefill_batched_multi_seq(&seqs, &scaffold, max_decode, &mut g.ctx)
+                .expect("multi forward");
+            g.multi_seq_kv_hybrid = Some(scaffold);
+            toks
+        };
+        eprintln!(
+            "[BISECT] multi tokens={multi_toks:?} (seq1=B); single B={single_tok}; \
+             seq1 {} single",
+            if multi_toks.get(1) == Some(&single_tok) { "==" } else { "!=" }
+        );
+    }
+
     /// ADR-040 M2.2 — INFORMATIONAL throughput probe for the `[N,hidden]`
     /// batched decode body (S2/S3). Drives 4 concurrent SlotAware generates of
     /// `BENCH_TOKENS` tokens and prints aggregate decode tok/s. Read the env
