@@ -601,6 +601,47 @@ pub struct MlxModelWeights {
     /// same record since the bake key is `(dtype, rows, dim)` which is
     /// identical across them.  Total memory: 1 OnceLock × ~150 B.
     pub decode_record_rms_norm_f32_hs: std::sync::OnceLock<Option<mlx_native::DispatchRecord>>,
+
+    /// ADR-040 iter-G(a) — cross-slot batched prefill descriptor. When
+    /// `Some`, `forward_prefill_batched` runs in MULTI-SEQ mode: N prompts are
+    /// concatenated into one T-token stream (`T = Σ seq_lens`, passed as
+    /// `prompt_tokens`/`seq_len`) and processed in ONE forward pass with
+    /// per-seq isolation. Four deltas gate on `.is_some()`:
+    ///   1. positions — per-seq RoPE reset `[0..L0, 0..L1, …]` (not `0..T`),
+    ///   2. mask — host-built block-diagonal causal mask
+    ///      ([`super::super::super::serve::forward_prefill_batched::build_block_diagonal_mask_bf16`])
+    ///      replaces the single-seq GPU `build_sdpa_mask_bf16`,
+    ///   3. KV write — each seq's `[O_i, L_i)` slice of the T-stream K/V is
+    ///      scattered into its own slot via `slot_views_hybrid[i]`,
+    ///   4. head — gather each seq's last row → N first tokens → `out_first_tokens`.
+    /// `None` (default) preserves BYTE-IDENTICAL single-seq behavior. Set and
+    /// consumed by the `forward_prefill_batched_multi_seq` wrapper; never
+    /// persists across calls. Hybrid-KV regime only (the production default);
+    /// other regimes admit serially. Gated behind `HF2Q_PREFILL_CROSS_SLOT=1`.
+    pub multi_seq_prefill: Option<MultiSeqPrefillState>,
+}
+
+/// ADR-040 iter-G(a) — per-call descriptor for cross-slot batched prefill.
+/// Built and installed on `MlxModelWeights::multi_seq_prefill` by the
+/// `forward_prefill_batched_multi_seq` wrapper, read by the four gated deltas
+/// inside `forward_prefill_batched`, then taken back out for `out_first_tokens`.
+pub struct MultiSeqPrefillState {
+    /// Per-seq prompt lengths `L_i`. `Σ seq_lens == seq_len` (the T-token
+    /// stream length passed to `forward_prefill_batched`).
+    pub seq_lens: Vec<usize>,
+    /// Per-seq start offset `O_i` into the concatenated T-token stream
+    /// (exclusive prefix-sum of `seq_lens`; `O_0 == 0`).
+    pub seq_offsets: Vec<usize>,
+    /// Per-seq × per-layer hybrid-KV slot-views. Outer index = sequence,
+    /// inner index = layer. Each `HybridKvBuffers` is a `slice_view` bundle
+    /// sharing the `multi_seq_kv_hybrid` scaffold's Metal buffers at that
+    /// seq's `slot_id` byte offset — so a kernel write through the view lands
+    /// in the slot's scaffold region. Built by the wrapper via
+    /// `build_slot_view_hybrid` (the iter-G(b) slot-view primitive, per-seq).
+    pub slot_views_hybrid: Vec<Vec<HybridKvBuffers>>,
+    /// Filled by the head delta: each seq's first decoded (greedy argmax)
+    /// token. Length `== seq_lens.len()` on return. Empty until the head runs.
+    pub out_first_tokens: Vec<u32>,
 }
 // ADR-031 Phase B foundation — compile-time Send+Sync assertion.
 //
@@ -1428,6 +1469,10 @@ impl MlxModelWeights {
             // ADR-029 iter-175 Step 1f — lazy-baked per-(F32, 1, hs) rms_norm
             // record.  Shared across all hs-norm call sites in decode.
             decode_record_rms_norm_f32_hs: std::sync::OnceLock::new(),
+            // ADR-040 iter-G(a) — multi-seq cross-slot prefill descriptor not
+            // installed by default. The forward_prefill_batched_multi_seq
+            // wrapper sets it per-call; None preserves byte-identical single-seq.
+            multi_seq_prefill: None,
         });
 
         // Pre-initialize constant param buffers so we never write them

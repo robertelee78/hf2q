@@ -724,8 +724,26 @@ impl MlxModelWeights {
             // ADR-028 iter-137 Path A Phase 2 GPU step 2/7 — append-mode positions.
             // start_pos=0 (production default callers): identical to pre-iter-137.
             // start_pos>0 (future verify_batched callers): append at offset.
-            for (i, slot) in p[..seq_len].iter_mut().enumerate() {
-                *slot = (start_pos + i) as u32;
+            if let Some(ref ms) = self.multi_seq_prefill {
+                // ADR-040 iter-G(a) delta 1 — per-seq RoPE position RESET. The
+                // T-token stream is N concatenated prompts; each seq's RoPE
+                // positions must restart at `start_pos` (= 0 for our caller),
+                // NOT run monotonically 0..T. Token at global index O_i+local
+                // gets position start_pos+local. Combined with the block-
+                // diagonal mask (delta 2), this isolates the N sequences so
+                // each prefills exactly as it would alone.
+                let mut g = 0usize;
+                for &l in &ms.seq_lens {
+                    for local in 0..l {
+                        p[g] = (start_pos + local) as u32;
+                        g += 1;
+                    }
+                }
+                debug_assert_eq!(g, seq_len, "multi-seq positions: Σ seq_lens != seq_len");
+            } else {
+                for (i, slot) in p[..seq_len].iter_mut().enumerate() {
+                    *slot = (start_pos + i) as u32;
+                }
             }
         }
         let mut pf_token_ids = alloc_u32(seq_len, "pf_token_ids")?;
@@ -870,16 +888,37 @@ impl MlxModelWeights {
             let t0_mask_sw = if profile_buckets_on {
                 Some(std::time::Instant::now())
             } else { None };
-            sliding_mask = build_sdpa_mask_bf16(
-                dev, reg, s.encoder_mut(),
-                &SdpaMaskParams {
-                    seq_len_q: seq_len as u32,
-                    seq_len_k: seq_len as u32,
-                    window_size: Some(self.sliding_window as u32),
-                    causal: true,
-                    q_abs_offset: 0,
-                },
-            ).map_err(|e| anyhow::anyhow!("build sliding_mask: {e}"))?;
+            sliding_mask = if let Some(ref ms) = self.multi_seq_prefill {
+                // ADR-040 iter-G(a) delta 2 — block-diagonal causal SLIDING
+                // mask. Host-built instead of the GPU single-seq builder:
+                // query qi attends key kj iff same-seq AND per-seq-causal AND
+                // within the sliding window; else -inf (cross-seq isolation).
+                // Sentinels (0xFF80 / 0x0000) match build_sdpa_mask_bf16 on the
+                // diagonal blocks, so each seq's block is byte-identical to its
+                // standalone single-seq mask. The downstream F16 cast + blk
+                // tile-skip pre-pass read this buffer UNCHANGED.
+                let mvec = build_block_diagonal_mask_bf16(
+                    &ms.seq_lens, Some(self.sliding_window),
+                );
+                let mut mbuf = dev.alloc_buffer(
+                    seq_len * seq_len * 2, DType::BF16, vec![seq_len, seq_len],
+                ).map_err(|e| anyhow::anyhow!("alloc multi-seq sliding_mask: {e}"))?;
+                mbuf.as_mut_slice::<half::bf16>()
+                    .map_err(|e| anyhow::anyhow!("multi-seq sliding_mask host write: {e}"))?
+                    .copy_from_slice(&mvec);
+                mbuf
+            } else {
+                build_sdpa_mask_bf16(
+                    dev, reg, s.encoder_mut(),
+                    &SdpaMaskParams {
+                        seq_len_q: seq_len as u32,
+                        seq_len_k: seq_len as u32,
+                        window_size: Some(self.sliding_window as u32),
+                        causal: true,
+                        q_abs_offset: 0,
+                    },
+                ).map_err(|e| anyhow::anyhow!("build sliding_mask: {e}"))?
+            };
             // HF2Q_FA_F16=1: cast the BF16 sliding mask to F16 once, reused
             // across all 25 sliding D=256 layers' F16 FA dispatches.
             // Must be rank-2 [seq_len, seq_len] so the FA dispatcher's
@@ -905,16 +944,32 @@ impl MlxModelWeights {
             let t0_mask_gl = if profile_buckets_on {
                 Some(std::time::Instant::now())
             } else { None };
-            global_mask = build_sdpa_mask_bf16(
-                dev, reg, s.encoder_mut(),
-                &SdpaMaskParams {
-                    seq_len_q: seq_len as u32,
-                    seq_len_k: seq_len as u32,
-                    window_size: None,
-                    causal: true,
-                    q_abs_offset: 0,
-                },
-            ).map_err(|e| anyhow::anyhow!("build global_mask: {e}"))?;
+            global_mask = if let Some(ref ms) = self.multi_seq_prefill {
+                // ADR-040 iter-G(a) delta 2 — block-diagonal causal GLOBAL mask
+                // (no sliding window). Same host-build as the sliding mask but
+                // full per-seq causal. Off-diagonal blocks -inf isolate the N
+                // sequences across the 5 global D=512 layers (which route
+                // through tensor-mm per §0.19 — also a host-mask consumer).
+                let mvec = build_block_diagonal_mask_bf16(&ms.seq_lens, None);
+                let mut mbuf = dev.alloc_buffer(
+                    seq_len * seq_len * 2, DType::BF16, vec![seq_len, seq_len],
+                ).map_err(|e| anyhow::anyhow!("alloc multi-seq global_mask: {e}"))?;
+                mbuf.as_mut_slice::<half::bf16>()
+                    .map_err(|e| anyhow::anyhow!("multi-seq global_mask host write: {e}"))?
+                    .copy_from_slice(&mvec);
+                mbuf
+            } else {
+                build_sdpa_mask_bf16(
+                    dev, reg, s.encoder_mut(),
+                    &SdpaMaskParams {
+                        seq_len_q: seq_len as u32,
+                        seq_len_k: seq_len as u32,
+                        window_size: None,
+                        causal: true,
+                        q_abs_offset: 0,
+                    },
+                ).map_err(|e| anyhow::anyhow!("build global_mask: {e}"))?
+            };
             // HF2Q_FA_F16=1: cast the BF16 global mask to F16 once, reused
             // across all 5 global D=512 layers' F16 FA dispatches.
             // Must be rank-2 [seq_len, seq_len] so the FA dispatcher's
@@ -2448,7 +2503,64 @@ impl MlxModelWeights {
                         // ADR-028 Phase 10c (iter-348): hybrid F16-K + TQ-HB-V
                         // batched-prefill encode path. F32 K → F16 K (sequence
                         // copy) + V-only TQ-HB sequence encode.
-                        if let Some(ref hybrid_kv) = self.hybrid_kv {
+                        if let Some(ref ms) = self.multi_seq_prefill {
+                            // ADR-040 iter-G(a) delta 3 — per-seq KV SCATTER.
+                            // The single-seq write copies the whole [0,T) stream
+                            // into ONE mounted slot region. Here the T-stream is
+                            // N concatenated prompts, so each seq's [O_i, L_i)
+                            // slice must land in ITS OWN slot region. We loop the
+                            // EXACT same kernels (F16 K copy + TQ-HB V quant) the
+                            // single-seq path uses, with src_tok_offset=O_i (read
+                            // seq i from the T-stream), dst_seq_pos_start=0 (write
+                            // to position 0 of slot i), n_copy=L_i. Destination is
+                            // the slot-view bundle the wrapper built per-seq
+                            // (slice_views sharing the multi_seq_kv_hybrid
+                            // scaffold's Metal buffers → the write lands in the
+                            // slot's scaffold region). Byte-identical to running
+                            // each prompt through the single-seq write alone.
+                            for (si, sv_layers) in ms.slot_views_hybrid.iter().enumerate() {
+                                let dst = &sv_layers[layer_idx];
+                                let hb_cap = dst.capacity as u32;
+                                let hb_is_ring = dst.is_sliding;
+                                let o_i = ms.seq_offsets[si] as u32;
+                                let l_i = ms.seq_lens[si] as u32;
+                                s.barrier_between(
+                                    &[&pf_k_normed, &pf_v_normed],
+                                    &[&dst.k, &dst.v_packed, &dst.v_norms],
+                                );
+                                mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                                    s.encoder_mut(), reg, metal_dev,
+                                    &pf_k_normed,
+                                    &dst.k,
+                                    nkv as u32, hd as u32,
+                                    hb_cap, /*dst_seq_pos_start*/ 0, l_i, /*src_tok_offset*/ o_i,
+                                ).map_err(|e| anyhow::anyhow!("multi-seq hybrid F16 K L{layer_idx} seq{si}: {e}"))?;
+                                if dst.v_packed.dtype() == mlx_native::DType::F16 {
+                                    mlx_native::ops::kv_cache_copy::dispatch_kv_cache_copy_seq_f32_to_f16(
+                                        s.encoder_mut(), reg, metal_dev,
+                                        &pf_v_normed,
+                                        &dst.v_packed,
+                                        nkv as u32, hd as u32,
+                                        hb_cap, 0, l_i, o_i,
+                                    ).map_err(|e| anyhow::anyhow!("multi-seq hybrid F16 V L{layer_idx} seq{si}: {e}"))?;
+                                } else {
+                                    mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_seq(
+                                        s.encoder_mut(), reg, metal_dev,
+                                        &pf_v_normed,
+                                        &dst.v_packed,
+                                        &dst.v_norms,
+                                        nkv as u32, hd as u32,
+                                        hb_cap, 0, l_i, o_i,
+                                        hb_is_ring, tq_scale_factor_d512, tq_codebook_bits_prefill,
+                                    ).map_err(|e| anyhow::anyhow!("multi-seq hybrid V FWHT quant L{layer_idx} seq{si}: {e}"))?;
+                                }
+                                // NOTE: the BF16 xlen post-SDPA cache (HF2Q_DFLASH_XLEN_SDPA,
+                                // opt-in) is NOT populated in multi-seq mode — the wrapper
+                                // bails when xlen is engaged, and the slot-views carry
+                                // bf16_xlen_{k,v}=None. The production-default target regime
+                                // does not use the xlen cache.
+                            }
+                        } else if let Some(ref hybrid_kv) = self.hybrid_kv {
                             let hb_cap = hybrid_kv[layer_idx].capacity as u32;
                             let hb_is_ring = hybrid_kv[layer_idx].is_sliding;
                             s.barrier_between(
@@ -3272,8 +3384,26 @@ impl MlxModelWeights {
         // -------------------------------------------------------------------
         // FINAL: last-row → final_norm → lm_head → softcap → argmax
         // -------------------------------------------------------------------
-        let first_token: u32;
-        {
+        // ADR-040 iter-G(a) delta 4 — N-row head. In multi-seq mode the
+        // T-token stream holds N prompts; emit ONE first-token per seq by
+        // running the EXISTING m=1 head on each seq's LAST row (O_i+L_i-1).
+        // Looping the m=1 head (vs a batched m=N lm_head) keeps each seq's
+        // argmax BYTE-IDENTICAL to its single-seq prefill and sidesteps the
+        // batched-lm_head softcap row-coverage subtlety. The 30-layer body
+        // already ran ONCE (the iter-G(a) win); N tiny head passes are
+        // negligible. Single-seq (None) → exactly one row (seq_len-1), unchanged.
+        let head_rows: Vec<usize> = match &self.multi_seq_prefill {
+            Some(ms) => ms
+                .seq_offsets
+                .iter()
+                .zip(ms.seq_lens.iter())
+                .map(|(&o, &l)| o + l - 1)
+                .collect(),
+            None => vec![seq_len - 1],
+        };
+        let mut ms_tokens: Vec<u32> = Vec::with_capacity(head_rows.len());
+        let mut first_token: u32 = 0;
+        for &head_row in head_rows.iter() {
             let mut s = exec.begin()
                 .map_err(|e| anyhow::anyhow!("batched head session: {e}"))?;
 
@@ -3289,7 +3419,7 @@ impl MlxModelWeights {
                 s.encoder_mut(), reg, metal_dev,
                 &pf_hidden,
                 &self.activations.hidden,
-                (seq_len - 1) * hs,
+                head_row * hs,
                 0,
                 hs,
             ).map_err(|e| anyhow::anyhow!("batched last-row copy: {e}"))?;
@@ -3406,11 +3536,22 @@ impl MlxModelWeights {
             s.finish()
                 .map_err(|e| anyhow::anyhow!("batched head finish: {e}"))?;
 
-            first_token = {
+            let tok = {
                 let idx: &[u32] = self.activations.argmax_index.as_slice()
                     .map_err(|e| anyhow::anyhow!("argmax read: {e}"))?;
                 idx[0]
             };
+            // first_token (the fn's return) is seq 0's token — single-seq
+            // callers read it; multi-seq callers read out_first_tokens.
+            if ms_tokens.is_empty() {
+                first_token = tok;
+            }
+            ms_tokens.push(tok);
+        }
+        // iter-G(a): hand the per-seq first tokens back to the wrapper. No-op
+        // in single-seq mode (multi_seq_prefill is None).
+        if let Some(ms) = self.multi_seq_prefill.as_mut() {
+            ms.out_first_tokens = ms_tokens;
         }
 
         let elapsed = prefill_start.elapsed();

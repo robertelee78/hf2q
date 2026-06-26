@@ -2739,6 +2739,7 @@ mod g4_cfa3_tests {
             decode_step_dump_counter: 0,
             dflash_capture: None,
             decode_record_rms_norm_f32_hs: std::sync::OnceLock::new(),
+            multi_seq_prefill: None,
         }
     }
 
@@ -3024,6 +3025,7 @@ mod g4_cfa3_tests {
             decode_step_dump_counter: 0,
             dflash_capture: None,
             decode_record_rms_norm_f32_hs: std::sync::OnceLock::new(),
+            multi_seq_prefill: None,
         };
 
         let tokens: Vec<u32> = vec![0, 1];
