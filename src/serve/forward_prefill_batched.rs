@@ -2012,6 +2012,24 @@ impl MlxModelWeights {
                                 },
                             ).map_err(|e| anyhow::anyhow!("xlen sliding BF16 SDPA L{layer_idx}: {e}"))?;
                         } else {
+                            // ADR-040 §0.19: checksum the F16 cache K/V the FA
+                            // actually reads (head-0 written region [0..seq*hd]).
+                            // STABLE while FA-out diverges ⇒ FA D256 COMPUTE is
+                            // the root; DIVERGED ⇒ KV-cache write (kv_cache_copy).
+                            if std::env::var("HF2Q_S019_CKSUM").is_ok() {
+                                if let Ok(s2) = exec.begin() { let _ = s2.finish(); }
+                                let n = (seq_len * hd as usize).min(1 << 22);
+                                if let Ok(kk) = layer_kv.k.as_slice::<half::f16>() {
+                                    let mut c: u64 = 0xcbf29ce484222325;
+                                    for &b in kk[..n.min(kk.len())].iter() { c ^= b.to_bits() as u64; c = c.wrapping_mul(0x100000001b3); }
+                                    eprintln!("S019_FAK L{layer_idx:02} cks={c:016x}");
+                                }
+                                if let Ok(vv) = layer_kv.v_packed.as_slice::<half::f16>() {
+                                    let mut c: u64 = 0xcbf29ce484222325;
+                                    for &b in vv[..n.min(vv.len())].iter() { c ^= b.to_bits() as u64; c = c.wrapping_mul(0x100000001b3); }
+                                    eprintln!("S019_FAV L{layer_idx:02} cks={c:016x}");
+                                }
+                            }
                             s.barrier_between(&[q_f16, &layer_kv.k, &layer_kv.v_packed], &[out_f16]);
                             mlx_native::ops::flash_attn_prefill::
                                 dispatch_flash_attn_prefill_f16_d256_resume(
@@ -2130,6 +2148,26 @@ impl MlxModelWeights {
                             seq_len, nkv, hd,
                         ).map_err(|e| anyhow::anyhow!("FA_F16 V permute+cast L{layer_idx}: {e}"))?;
 
+                        // ADR-040 §0.19: checksum the ACTUAL FA inputs (F16
+                        // casts + mask + blk tile-classification). Any DIVERGED
+                        // ⇒ upstream cast/blk-build races; all STABLE while
+                        // out_f16 diverges ⇒ FA D256 kernel COMPUTE is the root.
+                        if std::env::var("HF2Q_S019_CKSUM").is_ok() {
+                            if let Ok(s2) = exec.begin() { let _ = s2.finish(); }
+                            macro_rules! ck16 { ($b:expr,$n:expr) => {
+                                if let Ok(s) = $b.as_slice::<half::f16>() {
+                                    let mut c: u64 = 0xcbf29ce484222325;
+                                    for &x in s.iter() { c ^= x.to_bits() as u64; c = c.wrapping_mul(0x100000001b3); }
+                                    eprintln!("S019_{} L{layer_idx:02} cks={c:016x}", $n);
+                                }
+                            }}
+                            ck16!(q_f16, "FAQ16"); ck16!(k_f16, "FAK16"); ck16!(v_f16, "FAV16"); ck16!(mask_f16, "FAMASK");
+                            if let Ok(s) = blk_sliding.as_slice::<u8>() {
+                                let mut c: u64 = 0xcbf29ce484222325;
+                                for &x in s.iter() { c ^= x as u64; c = c.wrapping_mul(0x100000001b3); }
+                                eprintln!("S019_FABLK L{layer_idx:02} cks={c:016x}");
+                            }
+                        }
                         s.barrier_between(
                             &[q_f16, k_f16, v_f16, mask_f16, &blk_sliding],
                             &[out_f16],
