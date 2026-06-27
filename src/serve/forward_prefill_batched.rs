@@ -2188,13 +2188,25 @@ impl MlxModelWeights {
                                 eprintln!("S019_FABLK L{layer_idx:02} cks={c:016x}");
                             }
                         }
-                        // ADR-040 §0.19 FIX-TEST (HF2Q_S019_REMASK=1): re-cast the
-                        // mask from the bf16 source right before the FA reads it.
-                        // sliding_mask_f16 is built ONCE before the loop and gets
-                        // corrupted by an untracked aliasing writer during the
-                        // prefill (per-op checksum bisection); refreshing it here
-                        // — after any prior corruptor has run — restores it.
-                        if std::env::var("HF2Q_S019_REMASK").is_ok() {
+                        // ADR-040 §0.19 FIX (default-on; opt-out HF2Q_S019_NO_REMASK):
+                        // rebuild the F16 sliding mask IN THIS LAYER'S SESSION right
+                        // before the FA reads it, from the intact bf16 source. Root
+                        // cause (per-op checksum bisection + tracker analysis):
+                        // sliding_mask_f16 is built ONCE in the SETUP session and
+                        // reused cross-session by every sliding layer's FA; under
+                        // GPU contention an untracked aliasing writer corrupts its
+                        // full 131072-byte memory (mask byte-stable AT BUILD, DIVERGES
+                        // AT FA-read; sync/ordering can't fix it — verified). The
+                        // per-session range tracker cannot bridge the setup→layer
+                        // cross-session hazard, so the architecturally-correct fix is
+                        // to recompute the mask in the consuming session (cast is
+                        // ~one [seq,seq] f16 op/sliding-layer, <1% of prefill). This
+                        // re-cast + the FA barrier_between below are in ONE session,
+                        // so the range tracker DOES order them. Restores per-op SDPA
+                        // determinism (12/12). NOTE: closes the PREFILL §0.19; the
+                        // N=8 decode-side residual (batched_body reused buffers) is
+                        // the same class, fixed separately.
+                        if std::env::var("HF2Q_S019_NO_REMASK").is_err() {
                             s.barrier_between(&[&sliding_mask], &[mask_f16]);
                             mlx_native::ops::elementwise::cast(
                                 s.encoder_mut(), reg, metal_dev,
@@ -2487,6 +2499,18 @@ impl MlxModelWeights {
                             seq_len, nkv, hd,
                         ).map_err(|e| anyhow::anyhow!("FA_F16 global V permute+cast L{layer_idx}: {e}"))?;
 
+                        // ADR-040 §0.19 FIX (default-on; opt-out HF2Q_S019_NO_REMASK):
+                        // global_mask_f16 is the same cross-session-reused-mask hazard
+                        // as the sliding mask — rebuild it in-session from the bf16
+                        // source before the D512 FA reads it.
+                        if std::env::var("HF2Q_S019_NO_REMASK").is_err() {
+                            s.barrier_between(&[&global_mask], &[mask_f16]);
+                            mlx_native::ops::elementwise::cast(
+                                s.encoder_mut(), reg, metal_dev,
+                                &global_mask, mask_f16, (seq_len * seq_len) as usize,
+                                mlx_native::ops::elementwise::CastDirection::BF16ToF16,
+                            ).map_err(|e| anyhow::anyhow!("§0.19 remask global L{layer_idx}: {e}"))?;
+                        }
                         s.barrier_between(
                             &[q_f16, k_f16, v_f16, mask_f16, &blk_global],
                             &[out_f16],
