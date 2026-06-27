@@ -20388,11 +20388,19 @@ assistant:
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(32);
+        // Number of concurrent sequences (default 8 = the shipped batch width).
+        // Set HF2Q_S019_NSEQ=1 to isolate single-stream decode (apples-to-apples
+        // with the llama-completion single-seq determinism control).
+        let nseq: u32 = std::env::var("HF2Q_S019_NSEQ")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| (1..=8).contains(&n))
+            .unwrap_or(8);
 
-        // Eight DISTINCT long prompts, each `prompt_len` tokens from a disjoint
+        // `nseq` DISTINCT long prompts, each `prompt_len` tokens from a disjoint
         // token-id band (well within gemma's ~256k vocab; distinct ⇒ distinct
         // output for the vacuous guard).
-        let prompts: Vec<Vec<u32>> = (0..8u32)
+        let prompts: Vec<Vec<u32>> = (0..nseq)
             .map(|s| {
                 let base = 100u32 + s * (prompt_len as u32 + 8);
                 (0..prompt_len as u32).map(|t| base + t).collect()
@@ -20434,11 +20442,13 @@ assistant:
         };
 
         let ref_run = run_batch(&engine_slot);
-        // Vacuous guard: distinct prompts must give distinct output.
-        assert_ne!(
-            ref_run[0], ref_run[1],
-            "vacuous: slots 0 and 1 produced identical output"
-        );
+        // Vacuous guard: distinct prompts must give distinct output (≥2 seqs).
+        if ref_run.len() >= 2 {
+            assert_ne!(
+                ref_run[0], ref_run[1],
+                "vacuous: slots 0 and 1 produced identical output"
+            );
+        }
 
         let mut flakes = 0usize;
         for r in 1..repeats {
