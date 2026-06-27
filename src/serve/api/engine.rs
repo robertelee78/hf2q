@@ -20345,6 +20345,127 @@ assistant:
         rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
     }
 
+    /// ADR-040 §0.19 — HIGH-RATE long-prompt determinism REPRO. Runs the
+    /// concurrent N=8 SlotAware batch `repeats` times over LONG prompts (each
+    /// > 512 KV ⇒ split-K `nwg=32`, max tmp+reduce contention — vs the
+    /// short-prompt nwg=16 parity test) and asserts every repeat is byte-equal
+    /// to repeat 0, per slot. Self-consistency (no serial ref): directly
+    /// measures the §0.19 batched-FA non-determinism and AMPLIFIES it via
+    /// nwg=32 to beat the batch-to-batch variance that made the short-prompt
+    /// ×30 diagnostic inconclusive. Simultaneous admission ⇒ all slots share
+    /// the `same_bucket` PATH A batched split-K flash (the suspect path).
+    /// Env: HF2Q_S019_PROMPT_LEN (600), HF2Q_S019_REPEATS (8),
+    /// HF2Q_S019_MAXTOK (32). Set HF2Q_HYBRID_NWG=1 to force split-K OFF —
+    /// THE DISCRIMINATOR: nwg=1 clean + default flakes ⇒ split-K tmp+reduce is
+    /// §0.19's root; both flake ⇒ split-K exonerated, root is upstream
+    /// (prefill FA / KV cache). Prints `§0.19 REPRO: F/T mismatches`.
+    #[test]
+    fn slot_aware_n8_long_prompt_s019_determinism_repro() {
+        if byte_equiv_skip_unless_gated("slot_aware_n8_long_prompt_s019_determinism_repro") {
+            return;
+        }
+        let gguf_path: PathBuf = std::env::var(BYTE_EQUIV_E2E_GGUF_ENV)
+            .map(PathBuf::from)
+            .expect("HF2Q_BYTE_EQUIV_E2E_GGUF set");
+        assert!(gguf_path.exists(), "GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path.clone(),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+
+        let prompt_len: usize = std::env::var("HF2Q_S019_PROMPT_LEN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600);
+        let repeats: usize = std::env::var("HF2Q_S019_REPEATS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let max_tokens: usize = std::env::var("HF2Q_S019_MAXTOK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
+
+        // Eight DISTINCT long prompts, each `prompt_len` tokens from a disjoint
+        // token-id band (well within gemma's ~256k vocab; distinct ⇒ distinct
+        // output for the vacuous guard).
+        let prompts: Vec<Vec<u32>> = (0..8u32)
+            .map(|s| {
+                let base = 100u32 + s * (prompt_len as u32 + 8);
+                (0..prompt_len as u32).map(|t| base + t).collect()
+            })
+            .collect();
+        let params = SamplingParams {
+            temperature: 0.0,
+            max_tokens,
+            ..Default::default()
+        };
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .expect("rt");
+
+        let loaded_slot = LoadedModel::load(&load_opts).expect("load slot");
+        let engine_slot =
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 8 })
+                .expect("spawn SlotAware{max_slots:8}");
+
+        let run_batch = |eng: &Engine| -> Vec<String> {
+            rt.block_on(async {
+                let mut handles = Vec::new();
+                for p in prompts.iter().cloned() {
+                    let e = eng.clone();
+                    let pr = params.clone();
+                    handles.push(tokio::spawn(async move {
+                        e.generate(p, pr).await.expect("slot generate")
+                    }));
+                }
+                let mut out = Vec::new();
+                for h in handles {
+                    out.push(h.await.expect("join").text);
+                }
+                out
+            })
+        };
+
+        let ref_run = run_batch(&engine_slot);
+        // Vacuous guard: distinct prompts must give distinct output.
+        assert_ne!(
+            ref_run[0], ref_run[1],
+            "vacuous: slots 0 and 1 produced identical output"
+        );
+
+        let mut flakes = 0usize;
+        for r in 1..repeats {
+            let run = run_batch(&engine_slot);
+            for (i, (cur, base)) in run.iter().zip(ref_run.iter()).enumerate() {
+                if cur != base {
+                    flakes += 1;
+                    let n = cur.len().min(base.len());
+                    let div = (0..n).find(|&k| cur.as_bytes()[k] != base.as_bytes()[k]);
+                    eprintln!(
+                        "§0.19 FLAKE repeat {r} slot {i}: first-divergent byte {:?} (len {} vs ref {})",
+                        div,
+                        cur.len(),
+                        base.len()
+                    );
+                }
+            }
+        }
+        let total = (repeats - 1) * 8;
+        eprintln!(
+            "§0.19 REPRO: {flakes}/{total} per-(repeat,slot) mismatches | repeats={repeats} prompt_len={prompt_len} max_tokens={max_tokens} HYBRID_NWG={}",
+            std::env::var("HF2Q_HYBRID_NWG").unwrap_or_else(|_| "default".into())
+        );
+        rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
+        assert_eq!(flakes, 0, "§0.19 non-determinism: {flakes}/{total} mismatches");
+    }
+
     /// ADR-040 iter-G(a) — cross-slot batched-prefill FORWARD isolation gate.
     /// Concatenates N distinct prompts into ONE forward pass via
     /// `forward_prefill_batched_multi_seq` and asserts each seq's FIRST decode
