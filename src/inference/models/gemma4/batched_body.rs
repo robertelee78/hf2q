@@ -1346,6 +1346,33 @@ impl MlxModelWeights {
                 tq_scale_factor_d512, tq_codebook_bits,
                 &mut s, exec, reg,
             )?;
+            // ADR-040 §0.19 decode bisection (HF2Q_S019_CKSUM=1): checksum the
+            // batched residual after each layer. finish()+restart commits this
+            // layer's work so the host read is valid. Under the 2x-contention
+            // gate (MAXTOK>1), the FIRST diverging layer = the cross-step/within-
+            // step corrupted decode buffer's manifestation.
+            if std::env::var("HF2Q_S019_CKSUM").is_ok() {
+                s.finish().map_err(|e| anyhow::anyhow!("s019 dec finish L{layer_idx}: {e}"))?;
+                if let Ok(h) = bufs.hidden.as_slice::<f32>() {
+                    let mut c: u64 = 0xcbf29ce484222325;
+                    for &x in h[..(n * hs).min(h.len())].iter() {
+                        c ^= x.to_bits() as u64;
+                        c = c.wrapping_mul(0x100000001b3);
+                    }
+                    eprintln!("S019_DECHID L{layer_idx:02} cks={c:016x}");
+                }
+                if let Ok(p) = positions_buf.as_slice::<u32>() {
+                    let mut c: u64 = 0xcbf29ce484222325;
+                    for &x in p.iter() { c ^= x as u64; c = c.wrapping_mul(0x100000001b3); }
+                    eprintln!("S019_DECPOS L{layer_idx:02} cks={c:016x}");
+                }
+                if let Ok(sb) = slot_id_buf.as_slice::<u32>() {
+                    let mut c: u64 = 0xcbf29ce484222325;
+                    for &x in sb.iter() { c ^= x as u64; c = c.wrapping_mul(0x100000001b3); }
+                    eprintln!("S019_DECSLOT L{layer_idx:02} cks={c:016x}");
+                }
+                s = exec.begin().map_err(|e| anyhow::anyhow!("s019 dec restart L{layer_idx}: {e}"))?;
+            }
         }
 
         s.finish()
