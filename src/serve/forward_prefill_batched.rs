@@ -2188,6 +2188,20 @@ impl MlxModelWeights {
                                 eprintln!("S019_FABLK L{layer_idx:02} cks={c:016x}");
                             }
                         }
+                        // ADR-040 §0.19 FIX-TEST (HF2Q_S019_REMASK=1): re-cast the
+                        // mask from the bf16 source right before the FA reads it.
+                        // sliding_mask_f16 is built ONCE before the loop and gets
+                        // corrupted by an untracked aliasing writer during the
+                        // prefill (per-op checksum bisection); refreshing it here
+                        // — after any prior corruptor has run — restores it.
+                        if std::env::var("HF2Q_S019_REMASK").is_ok() {
+                            s.barrier_between(&[&sliding_mask], &[mask_f16]);
+                            mlx_native::ops::elementwise::cast(
+                                s.encoder_mut(), reg, metal_dev,
+                                &sliding_mask, mask_f16, (seq_len * seq_len) as usize,
+                                mlx_native::ops::elementwise::CastDirection::BF16ToF16,
+                            ).map_err(|e| anyhow::anyhow!("§0.19 remask L{layer_idx}: {e}"))?;
+                        }
                         s.barrier_between(
                             &[q_f16, k_f16, v_f16, mask_f16, &blk_sliding],
                             &[out_f16],
