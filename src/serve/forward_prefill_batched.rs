@@ -1165,6 +1165,28 @@ impl MlxModelWeights {
             let top_k = layer.moe.top_k;
             let moe_int = layer.moe.moe_intermediate_size;
 
+            // ADR-040 §0.19 localization (HF2Q_S019_CKSUM=1): FNV-1a checksum of
+            // the residual stream ENTERING this layer (= prev layer's output).
+            // An empty session finish() commits+waits → on the in-order command
+            // queue this DRAINS all prior async layer work so the host read is
+            // post-write (loop-top reads are otherwise stale: prefill is async).
+            // Run under the 2x-contention repro: the FIRST layer whose checksum
+            // diverges repeat-to-repeat is the racing op.
+            if std::env::var("HF2Q_S019_CKSUM").is_ok() {
+                if let Ok(s) = exec.begin() {
+                    let _ = s.finish();
+                }
+                if let Ok(h) = pf_hidden.as_slice() {
+                    let h: &[f32] = h;
+                    let mut cks: u64 = 0xcbf29ce484222325;
+                    for &x in h.iter() {
+                        cks ^= x.to_bits() as u64;
+                        cks = cks.wrapping_mul(0x100000001b3);
+                    }
+                    eprintln!("S019_CKSUM L{layer_idx:02} cks={cks:016x} n={}", h.len());
+                }
+            }
+
             // ADR-010 early dump: capture layer INPUT (= previous layer's output)
             // before any modification. pf_hidden at end of layer holds the NEXT
             // layer's input, so we must grab it here, at start of target layer.
@@ -1335,6 +1357,23 @@ impl MlxModelWeights {
                     }
                 }
 
+                // ADR-040 §0.19 sub-localization: checksum post-input-norm.
+                // STABLE here + diverged at layer output ⇒ race is in
+                // attn/QKV/RoPE/FWHT/KV-write/MoE, NOT the input RMSNorm.
+                if std::env::var("HF2Q_S019_CKSUM").is_ok() {
+                    s.finish().map_err(|e| anyhow::anyhow!("s019 norm finish L{layer_idx}: {e}"))?;
+                    if let Ok(nrm) = pf_norm_out.as_slice() {
+                        let nrm: &[f32] = nrm;
+                        let mut cks: u64 = 0xcbf29ce484222325;
+                        for &x in nrm.iter() {
+                            cks ^= x.to_bits() as u64;
+                            cks = cks.wrapping_mul(0x100000001b3);
+                        }
+                        eprintln!("S019_NORM L{layer_idx:02} cks={cks:016x}");
+                    }
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("s019 norm restart L{layer_idx}: {e}"))?;
+                }
+
                 // 2. QKV projections (m = seq_len) — concurrent
                 s.barrier_between(
                     &[&pf_norm_out],
@@ -1460,6 +1499,38 @@ impl MlxModelWeights {
                 )?;
                 if let Some(t0) = t0_head_norm_rope {
                     bucket_finish!(s, exec, t0, &PROFILE_B_HEAD_NORM_ROPE_NS, &PROFILE_B_HEAD_NORM_ROPE_COUNT, 3, "head_norm_rope");
+                }
+
+                // ADR-040 §0.19 sub-localization: checksum Q after head-norm+RoPE
+                // (fused_head_norm_rope output). DIVERGED ⇒ the race is in
+                // fused_head_norm_rope (head-RMSNorm threadgroup reduction / RoPE
+                // / FWHT). STABLE while attn-out diverges ⇒ KV-write or SDPA/o_proj.
+                if std::env::var("HF2Q_S019_CKSUM").is_ok() {
+                    if let Ok(s2) = exec.begin() { let _ = s2.finish(); }
+                    if let Ok(q) = pf_q_perm.as_slice::<half::bf16>() {
+                        let mut cks: u64 = 0xcbf29ce484222325;
+                        for &b in q.iter() {
+                            cks ^= b.to_bits() as u64;
+                            cks = cks.wrapping_mul(0x100000001b3);
+                        }
+                        eprintln!("S019_Q L{layer_idx:02} cks={cks:016x}");
+                    }
+                    if let Ok(k) = pf_k_perm.as_slice::<half::bf16>() {
+                        let mut cks: u64 = 0xcbf29ce484222325;
+                        for &b in k.iter() {
+                            cks ^= b.to_bits() as u64;
+                            cks = cks.wrapping_mul(0x100000001b3);
+                        }
+                        eprintln!("S019_K L{layer_idx:02} cks={cks:016x}");
+                    }
+                    if let Ok(v) = pf_v_perm.as_slice::<half::bf16>() {
+                        let mut cks: u64 = 0xcbf29ce484222325;
+                        for &b in v.iter() {
+                            cks ^= b.to_bits() as u64;
+                            cks = cks.wrapping_mul(0x100000001b3);
+                        }
+                        eprintln!("S019_V L{layer_idx:02} cks={cks:016x}");
+                    }
                 }
 
                 // 6. Flash-attention tiled prefill (ADR-011 Phase 2 Wave 4):
@@ -1905,6 +1976,22 @@ impl MlxModelWeights {
                         if use_bf16_xlen {
                             let bf16_k = layer_kv.bf16_xlen_k.as_ref().unwrap();
                             let bf16_v = layer_kv.bf16_xlen_v.as_ref().unwrap();
+                            // ADR-040 §0.19: checksum the ACTUAL FA inputs (cache
+                            // K/V). STABLE while SDPA-out diverges ⇒ FA COMPUTE
+                            // kernel is the root; DIVERGED ⇒ cache write/cast.
+                            if std::env::var("HF2Q_S019_CKSUM").is_ok() {
+                                if let Ok(s2) = exec.begin() { let _ = s2.finish(); }
+                                if let Ok(bk) = bf16_k.as_slice::<half::bf16>() {
+                                    let mut c: u64 = 0xcbf29ce484222325;
+                                    for &b in bk.iter() { c ^= b.to_bits() as u64; c = c.wrapping_mul(0x100000001b3); }
+                                    eprintln!("S019_CACHEK L{layer_idx:02} cks={c:016x}");
+                                }
+                                if let Ok(bv) = bf16_v.as_slice::<half::bf16>() {
+                                    let mut c: u64 = 0xcbf29ce484222325;
+                                    for &b in bv.iter() { c ^= b.to_bits() as u64; c = c.wrapping_mul(0x100000001b3); }
+                                    eprintln!("S019_CACHEV L{layer_idx:02} cks={c:016x}");
+                                }
+                            }
                             s.barrier_between(&[&pf_q_perm, bf16_k, bf16_v], &[&pf_sdpa_out_perm]);
                             mlx_native::ops::flash_attn_prefill::
                                 dispatch_flash_attn_prefill_bf16_d256_resume(
@@ -2494,6 +2581,41 @@ impl MlxModelWeights {
                 }
                 if let Some(t0) = o_t0 {
                     bucket_finish!(s, exec, t0, &PROFILE_O_MM_NS, &PROFILE_O_MM_COUNT, 1, "O_mm");
+                }
+
+                // ADR-040 §0.19 sub-localization: checksum the ATTENTION block
+                // output (post o_proj, pre-residual). DIVERGED ⇒ race is in
+                // attention (QKV/RoPE/FWHT/KV-write/SDPA/o_proj). STABLE while
+                // layer output diverges ⇒ race is in the MoE/FFN block.
+                if std::env::var("HF2Q_S019_CKSUM").is_ok() {
+                    s.finish().map_err(|e| anyhow::anyhow!("s019 attn finish L{layer_idx}: {e}"))?;
+                    if let Ok(ao) = pf_attn_out.as_slice() {
+                        let ao: &[f32] = ao;
+                        let mut cks: u64 = 0xcbf29ce484222325;
+                        for &x in ao.iter() {
+                            cks ^= x.to_bits() as u64;
+                            cks = cks.wrapping_mul(0x100000001b3);
+                        }
+                        eprintln!("S019_ATTN L{layer_idx:02} cks={cks:016x}");
+                    }
+                    if let Ok(so) = pf_sdpa_out.as_slice::<f32>() {
+                        let mut cks: u64 = 0xcbf29ce484222325;
+                        for &x in so.iter() {
+                            cks ^= x.to_bits() as u64;
+                            cks = cks.wrapping_mul(0x100000001b3);
+                        }
+                        eprintln!("S019_SDPA L{layer_idx:02} cks={cks:016x}");
+                    }
+                    // FA path: o_proj actually reads pf_sdpa_out_perm (bf16).
+                    if let Ok(sp) = pf_sdpa_out_perm.as_slice::<half::bf16>() {
+                        let mut cks: u64 = 0xcbf29ce484222325;
+                        for &x in sp.iter() {
+                            cks ^= x.to_bits() as u64;
+                            cks = cks.wrapping_mul(0x100000001b3);
+                        }
+                        eprintln!("S019_SDPAPERM L{layer_idx:02} cks={cks:016x}");
+                    }
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("s019 attn restart L{layer_idx}: {e}"))?;
                 }
 
                 // 9. Post-attn fused norm + residual add (rows = seq_len)
