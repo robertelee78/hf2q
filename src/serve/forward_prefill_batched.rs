@@ -982,6 +982,26 @@ impl MlxModelWeights {
                 bucket_finish!(s, exec, t0, &PROFILE_B_MASK_SW_NS, &PROFILE_B_MASK_SW_COUNT, 1, "mask_sw");
             }
 
+            // ADR-040 §0.19: checksum the mask RIGHT AFTER build. STABLE here
+            // across repeats but DIVERGED at the FA-read (S019_FAMASK) ⇒ the
+            // mask buffer is corrupted/aliased between build and use (lifetime
+            // bug). DIVERGED here ⇒ the mask BUILD itself races.
+            if std::env::var("HF2Q_S019_CKSUM").is_ok() {
+                if let Ok(s2) = exec.begin() { let _ = s2.finish(); }
+                if let Ok(sl) = sliding_mask.as_slice::<half::bf16>() {
+                    let mut c: u64 = 0xcbf29ce484222325;
+                    for &x in sl.iter() { c ^= x.to_bits() as u64; c = c.wrapping_mul(0x100000001b3); }
+                    eprintln!("S019_MASKBUILD_BF16 cks={c:016x} n={}", sl.len());
+                }
+                if let Some(ref mf) = sliding_mask_f16 {
+                    if let Ok(sl) = mf.as_slice::<half::f16>() {
+                        let mut c: u64 = 0xcbf29ce484222325;
+                        for &x in sl.iter() { c ^= x.to_bits() as u64; c = c.wrapping_mul(0x100000001b3); }
+                        eprintln!("S019_MASKBUILD_F16 cks={c:016x} n={}", sl.len());
+                    }
+                }
+            }
+
             // 3. Global causal mask — reused across all 5 global layers.
             let t0_mask_gl = if profile_buckets_on {
                 Some(std::time::Instant::now())
