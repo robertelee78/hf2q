@@ -224,26 +224,35 @@ pub(crate) mod catsplit {
             ];)*
         };
     }
-    buckets!(NS, CBS);
+    buckets!(NS, CBS, DISP);
+
+    /// Running dispatch_count() at the last boundary, for per-category deltas.
+    static LAST_DISP: AtomicU64 = AtomicU64::new(0);
 
     pub static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var("HF2Q_DECODE_CATSPLIT").as_deref() == Ok("1"));
 
-    /// Add `ns` GPU-busy time (and one CB) to category `c`.
+    /// Add `ns` GPU-busy time (and one CB) to category `c`, plus the
+    /// dispatch_count() delta since the previous boundary (the dispatches just
+    /// encoded into the category `c` command buffer).
     #[inline]
     pub fn add(c: Cat, ns: u64) {
         NS[c as usize].fetch_add(ns, Ordering::Relaxed);
         CBS[c as usize].fetch_add(1, Ordering::Relaxed);
+        let cur = mlx_native::dispatch_count();
+        let last = LAST_DISP.swap(cur, Ordering::Relaxed);
+        DISP[c as usize].fetch_add(cur.saturating_sub(last), Ordering::Relaxed);
     }
 
-    /// Snapshot `(name, total_ns, cb_count)` for every category, report order.
-    pub fn snapshot() -> Vec<(&'static str, u64, u64)> {
+    /// Snapshot `(name, total_ns, cb_count, dispatch_count)` per category.
+    pub fn snapshot() -> Vec<(&'static str, u64, u64, u64)> {
         (0..LEN)
             .map(|i| {
                 (
                     NAMES[i],
                     NS[i].load(Ordering::Relaxed),
                     CBS[i].load(Ordering::Relaxed),
+                    DISP[i].load(Ordering::Relaxed),
                 )
             })
             .collect()
@@ -254,7 +263,9 @@ pub(crate) mod catsplit {
         for i in 0..LEN {
             NS[i].store(0, Ordering::Relaxed);
             CBS[i].store(0, Ordering::Relaxed);
+            DISP[i].store(0, Ordering::Relaxed);
         }
+        LAST_DISP.store(mlx_native::dispatch_count(), Ordering::Relaxed);
     }
 }
 

@@ -21089,23 +21089,28 @@ assistant:
         if *crate::inference::models::gemma4::batched_body::catsplit::ENABLED {
             let snap = crate::inference::models::gemma4::batched_body::catsplit::snapshot();
             let denom = total_tokens.max(1) as f64;
-            let mut rows: Vec<(&str, u64, u64)> = snap
+            let mut rows: Vec<(&str, u64, u64, u64)> = snap
                 .into_iter()
-                .filter(|(_, ns, _)| *ns > 0)
+                .filter(|(_, ns, _, disp)| *ns > 0 || *disp > 0)
                 .collect();
-            let sum_ns: u64 = rows.iter().map(|(_, ns, _)| *ns).sum::<u64>().max(1);
-            rows.sort_by(|a, b| b.1.cmp(&a.1));
+            let sum_ns: u64 = rows.iter().map(|(_, ns, _, _)| *ns).sum::<u64>().max(1);
+            let sum_disp: u64 = rows.iter().map(|(_, _, _, d)| *d).sum::<u64>();
+            // steps = tokens-per-stream (the batched decode step count).
+            let cs_steps = (total_tokens / n_streams.max(1)).max(1);
+            // Rank by dispatch count (the fusion target) — the encode-time lever.
+            rows.sort_by(|a, b| b.3.cmp(&a.3));
             eprintln!(
-                "[CATSPLIT] N={n_streams} per-category GPU-busy (GPUStartTime/GPUEndTime), ranked, ms/token over {} emitted tokens; SUM overstates real step (CB serialization):",
-                total_tokens,
+                "[CATSPLIT] N={n_streams} per-category GPU-busy + DISPATCH COUNT, ranked by dispatches/step, over {} emitted tokens; total {:.1} disp/step:",
+                total_tokens, sum_disp as f64 / cs_steps as f64,
             );
-            eprintln!("[CATSPLIT]   {:<40} {:>10} {:>8} {:>10}", "category", "ms/token", "% step", "cbs/token");
-            for (name, ns, cbs) in &rows {
+            eprintln!("[CATSPLIT]   {:<40} {:>10} {:>8} {:>10} {:>10}", "category", "ms/token", "% step", "disp/step", "cbs/token");
+            for (name, ns, cbs, disp) in &rows {
                 eprintln!(
-                    "[CATSPLIT]   {:<40} {:>10.4} {:>7.1}% {:>10.1}",
+                    "[CATSPLIT]   {:<40} {:>10.4} {:>7.1}% {:>10.1} {:>10.1}",
                     name,
                     *ns as f64 / 1e6 / denom,
                     100.0 * *ns as f64 / sum_ns as f64,
+                    *disp as f64 / cs_steps as f64,
                     *cbs as f64 / denom,
                 );
             }
