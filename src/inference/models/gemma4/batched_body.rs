@@ -1237,8 +1237,30 @@ impl MlxModelWeights {
             &[&bufs.moe_down_id_out, &bufs.moe_routing_weights_gpu],
             &[&bufs.moe_accum],
         );
-        // weighted-sum kept PER-SLOT (the batched-seq kernel is byte-identical
-        // but throughput-neutral — the dispatch was never a cost; M4 fork finding).
+        // ADR-040 §24 iter-J — DISPATCH FUSION. The per-slot weighted_sum loop
+        // (8 dispatches/layer = ~210/step) was kept per-slot on the stale M4
+        // "dispatch was never a cost" finding; the §24 catsplit dispatch-count
+        // localization showed moe_other (this + routing) is 536 disp/step (31%
+        // of all dispatches, 1.9% of GPU time) — the dominant encode-time cost.
+        // The batched-seq kernel computes the SAME per-token top_k·weight sum
+        // (buffers are already [N,top_k,hs]/[N,top_k]/[N,hs] contiguous), so it
+        // is byte-identical (gate: slot_aware_n8_per_slot_parity_vs_serial).
+        // DEFAULT-ON (opt out HF2Q_BATCHED_WSUM=0). Parity-gate-proven
+        // byte-identical (slot_aware_n8). NOTE: this −209 dispatch/step
+        // reduction is THROUGHPUT-NEUTRAL (measured ~noise) — it refuted the
+        // "encode is dispatch-count-bound" hypothesis (−12% dispatches → ~0 wall;
+        // these small kernels encode cheaply). Kept as the cleaner batched form +
+        // a strict dispatch reduction, not for a throughput claim.
+        let batched_wsum = std::env::var("HF2Q_BATCHED_WSUM").as_deref() != Ok("0");
+        if batched_wsum {
+            let _ = (down_stride, w_stride, acc_stride);
+            mlx_native::ops::moe_dispatch::moe_weighted_sum_seq_encode(
+                session.encoder_mut(), reg, metal_dev,
+                &bufs.moe_down_id_out, &bufs.moe_routing_weights_gpu, &bufs.moe_accum,
+                hs, top_k, n,
+            )
+            .map_err(|e| anyhow::anyhow!("batched-seq weighted_sum L{layer_idx}: {e}"))?;
+        } else {
         for i in 0..n {
             let din_i = bufs.moe_down_id_out.slice_view(row_off(down_stride, i), down_stride);
             let w_i = bufs.moe_routing_weights_gpu.slice_view(row_off(w_stride, i), w_stride);
@@ -1248,6 +1270,7 @@ impl MlxModelWeights {
                 &din_i, &w_i, &acc_i, hs, top_k,
             )
             .map_err(|e| anyhow::anyhow!("batched weighted_sum L{layer_idx} slot{i}: {e}"))?;
+        }
         }
         // catsplit: MoE per-slot weighted_sum (top_k expert combine).
         cat_boundary(session, exec, catsplit::Cat::MoeOther)?;
