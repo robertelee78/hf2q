@@ -48,3 +48,26 @@ MoE-down are not mvN-covered — mvN is Q6_K-only).
 
 **Not viable:** parallel-encode "encode step k+1 while GPU runs step k" — blocked by the
 autoregressive dependency (token k+1 unknown until step-k logits are sampled). Confirmed by codex.
+
+## Update: intra-step CB pipelining BUILT + MEASURED — hypothesis refuted
+
+Implemented the codex-blessed first lever: gated single-threaded intra-step command-buffer
+pipelining (`HF2Q_DECODE_CB_CHUNKS=K`, batched_body.rs) — split the 30-layer decode loop into
+K command buffers, async-`commit()` each in order (GPU runs chunk c while CPU encodes chunk
+c+1), only the last waits. Cross-CB ordering = same-queue commit order (no fences). **Parity
+GREEN** (`slot_aware_n8_per_slot_parity_vs_serial` byte-identical at K=3; default serial path
+also re-verified green).
+
+**Measured (N=8, gemma4 Q5_K_M): only +1.5–2.7%** (K=3–10, near the run-to-run noise floor) —
+**NOT the ~20% predicted.** This **refutes** the "7.5ms/step recoverable CPU-encode" model: if
+the wall-vs-GPU-busy gap were serialized decode-body encode, chunking would have recovered most
+of it. It did not. So the 21% is dominated by **per-token engine overhead** (host
+sampling/argmax, admission/scheduling) and the process-global gpu_busy spanning prefill+lm_head
+— not the decode-body encode. Kept **gated, default OFF** as a small byte-exact lever + a
+documented negative result.
+
+**Revised gap attribution:** the remaining 1.27× (228 vs 291) is NOT decode-body encode. Next
+investigation targets: (a) per-token host overhead (sampling, the scheduler/admission loop) vs
+llama's; (b) residual GPU work (extend mvN to Q5_K dense + Q8_0 MoE-down — the ~5% still
+reloading per-row). Record-reuse (cheaper per-dispatch encode) would also only help the
+encode fraction, which this experiment shows is small — deprioritized.

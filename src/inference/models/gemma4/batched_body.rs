@@ -1341,44 +1341,106 @@ impl MlxModelWeights {
 
         // Layer loop in [N,hidden].
         let num_layers = self.layers.len();
-        for layer_idx in 0..num_layers {
-            self.encode_one_layer_batched(
-                layer_idx, &bufs, n, &positions_buf, &slot_id_buf,
-                slot_ids, seq_positions, multi_seq_kv_hybrid,
-                tq_scale_factor_d512, tq_codebook_bits,
-                &mut s, exec, reg,
-            )?;
-            // ADR-040 §0.19 decode bisection (HF2Q_S019_CKSUM=1): checksum the
-            // batched residual after each layer. finish()+restart commits this
-            // layer's work so the host read is valid. Under the 2x-contention
-            // gate (MAXTOK>1), the FIRST diverging layer = the cross-step/within-
-            // step corrupted decode buffer's manifestation.
-            if std::env::var("HF2Q_S019_CKSUM").is_ok() {
-                s.finish().map_err(|e| anyhow::anyhow!("s019 dec finish L{layer_idx}: {e}"))?;
-                if let Ok(h) = bufs.hidden.as_slice::<f32>() {
-                    let mut c: u64 = 0xcbf29ce484222325;
-                    for &x in h[..(n * hs).min(h.len())].iter() {
-                        c ^= x.to_bits() as u64;
-                        c = c.wrapping_mul(0x100000001b3);
-                    }
-                    eprintln!("S019_DECHID L{layer_idx:02} cks={c:016x}");
-                }
-                if let Ok(p) = positions_buf.as_slice::<u32>() {
-                    let mut c: u64 = 0xcbf29ce484222325;
-                    for &x in p.iter() { c ^= x as u64; c = c.wrapping_mul(0x100000001b3); }
-                    eprintln!("S019_DECPOS L{layer_idx:02} cks={c:016x}");
-                }
-                if let Ok(sb) = slot_id_buf.as_slice::<u32>() {
-                    let mut c: u64 = 0xcbf29ce484222325;
-                    for &x in sb.iter() { c ^= x as u64; c = c.wrapping_mul(0x100000001b3); }
-                    eprintln!("S019_DECSLOT L{layer_idx:02} cks={c:016x}");
-                }
-                s = exec.begin().map_err(|e| anyhow::anyhow!("s019 dec restart L{layer_idx}: {e}"))?;
-            }
-        }
+        let cksum_on = std::env::var("HF2Q_S019_CKSUM").is_ok();
 
-        s.finish()
-            .map_err(|e| anyhow::anyhow!("body_batched session finish: {e}"))?;
+        // ADR-040 §21 — intra-step command-buffer pipelining (HF2Q_DECODE_CB_CHUNKS=K,
+        // default OFF=1). Splits the per-step layer loop into K command buffers,
+        // ASYNC-committing each in order so the GPU executes chunk c while the CPU
+        // ENCODES chunk c+1 (llama.cpp ggml-metal's n_cb pattern, single-threaded so
+        // NO cross-thread aliasing). Cross-CB ordering is the same-queue COMMIT order
+        // (no MTLFence/Event needed — codex-reviewed): chunk c's CB fully executes
+        // before chunk c+1's reads its output. BYTE-IDENTICAL by construction (same
+        // dispatches, same order, just split across CBs) — VALIDATED:
+        // slot_aware_n8_per_slot_parity_vs_serial GREEN at K=3. Each chunk's first
+        // `encode_one_layer_batched` opens with a `barrier_between` so every CB starts
+        // with a clean intra-CB conflict tracker. Disabled when the per-layer
+        // cksum/catsplit debug paths own the session lifetime.
+        //
+        // MEASURED (2026-06-27, N=8 gemma4 Q5_K_M): only +1.5–2.7% (K=3–10, near the
+        // run-to-run noise floor) — so the per-step wall-vs-GPU-busy gap is NOT
+        // serialized decode-body CPU-encode (this would have recovered most of it);
+        // it is dominated by per-token ENGINE overhead (host sampling/argmax,
+        // admission/scheduling) + lm_head, not the body encode. Kept gated/opt-in as
+        // a small byte-exact lever + a documented negative result; default OFF.
+        let cb_chunks: usize = std::env::var("HF2Q_DECODE_CB_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&k| k >= 2 && !cksum_on && !*catsplit::ENABLED)
+            .map(|k| k.min(num_layers.max(1)))
+            .unwrap_or(1);
+
+        if cb_chunks >= 2 {
+            // Async-committed chunks; only the LAST chunk waits (same-queue order ⇒
+            // its completion implies all prior CBs completed). Hold committed
+            // encoders alive until the final wait.
+            let mut committed: Vec<mlx_native::CommandEncoder> = Vec::with_capacity(cb_chunks);
+            let per = num_layers.div_ceil(cb_chunks);
+            let mut layer_idx = 0usize;
+            while layer_idx < num_layers {
+                let chunk_end = (layer_idx + per).min(num_layers);
+                while layer_idx < chunk_end {
+                    self.encode_one_layer_batched(
+                        layer_idx, &bufs, n, &positions_buf, &slot_id_buf,
+                        slot_ids, seq_positions, multi_seq_kv_hybrid,
+                        tq_scale_factor_d512, tq_codebook_bits,
+                        &mut s, exec, reg,
+                    )?;
+                    layer_idx += 1;
+                }
+                if layer_idx >= num_layers {
+                    s.finish()
+                        .map_err(|e| anyhow::anyhow!("body_batched chunked final finish: {e}"))?;
+                    break;
+                } else {
+                    let fresh = exec
+                        .begin()
+                        .map_err(|e| anyhow::anyhow!("body_batched chunk re-begin: {e}"))?;
+                    let old = std::mem::replace(&mut s, fresh);
+                    committed.push(old.commit());
+                }
+            }
+            // Final chunk waited; same-queue order ⇒ all earlier CBs done. Release.
+            drop(committed);
+        } else {
+            for layer_idx in 0..num_layers {
+                self.encode_one_layer_batched(
+                    layer_idx, &bufs, n, &positions_buf, &slot_id_buf,
+                    slot_ids, seq_positions, multi_seq_kv_hybrid,
+                    tq_scale_factor_d512, tq_codebook_bits,
+                    &mut s, exec, reg,
+                )?;
+                // ADR-040 §0.19 decode bisection (HF2Q_S019_CKSUM=1): checksum the
+                // batched residual after each layer. finish()+restart commits this
+                // layer's work so the host read is valid. Under the 2x-contention
+                // gate (MAXTOK>1), the FIRST diverging layer = the cross-step/within-
+                // step corrupted decode buffer's manifestation.
+                if cksum_on {
+                    s.finish().map_err(|e| anyhow::anyhow!("s019 dec finish L{layer_idx}: {e}"))?;
+                    if let Ok(h) = bufs.hidden.as_slice::<f32>() {
+                        let mut c: u64 = 0xcbf29ce484222325;
+                        for &x in h[..(n * hs).min(h.len())].iter() {
+                            c ^= x.to_bits() as u64;
+                            c = c.wrapping_mul(0x100000001b3);
+                        }
+                        eprintln!("S019_DECHID L{layer_idx:02} cks={c:016x}");
+                    }
+                    if let Ok(p) = positions_buf.as_slice::<u32>() {
+                        let mut c: u64 = 0xcbf29ce484222325;
+                        for &x in p.iter() { c ^= x as u64; c = c.wrapping_mul(0x100000001b3); }
+                        eprintln!("S019_DECPOS L{layer_idx:02} cks={c:016x}");
+                    }
+                    if let Ok(sb) = slot_id_buf.as_slice::<u32>() {
+                        let mut c: u64 = 0xcbf29ce484222325;
+                        for &x in sb.iter() { c ^= x as u64; c = c.wrapping_mul(0x100000001b3); }
+                        eprintln!("S019_DECSLOT L{layer_idx:02} cks={c:016x}");
+                    }
+                    s = exec.begin().map_err(|e| anyhow::anyhow!("s019 dec restart L{layer_idx}: {e}"))?;
+                }
+            }
+
+            s.finish()
+                .map_err(|e| anyhow::anyhow!("body_batched session finish: {e}"))?;
+        }
 
         // Final hidden rows [n, hidden] (pre-final-norm).
         let out: &[f32] = bufs
