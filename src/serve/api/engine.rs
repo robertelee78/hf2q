@@ -6214,6 +6214,7 @@ fn run_slot_aware_gemma4(
         }
 
         // ── STEP ─────────────────────────────────────────────────────
+        let _hp_sched = std::time::Instant::now();
         let step = match scheduler.step() {
             Ok(s) => s,
             Err(e) => {
@@ -6221,6 +6222,10 @@ fn run_slot_aware_gemma4(
                 break 'worker;
             }
         };
+        crate::inference::models::gemma4::batched_body::host_phases::add(
+            crate::inference::models::gemma4::batched_body::host_phases::Phase::SchedStep,
+            _hp_sched.elapsed().as_nanos() as u64,
+        );
         match step {
             SchedulerStep::Idle => {
                 // No work. Park until a request arrives, then re-loop to
@@ -6245,7 +6250,12 @@ fn run_slot_aware_gemma4(
                     registration.as_ref(),
                     &handles,
                 );
+                let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
+                crate::inference::models::gemma4::batched_body::host_phases::add(
+                    crate::inference::models::gemma4::batched_body::host_phases::Phase::Publish,
+                    _hp_pub.elapsed().as_nanos() as u64,
+                );
             }
             SchedulerStep::Mixed { decode_handles, .. } => {
                 // Prefill already ran at admit; the just-admitted slot is
@@ -6259,7 +6269,12 @@ fn run_slot_aware_gemma4(
                     registration.as_ref(),
                     &decode_handles,
                 );
+                let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
+                crate::inference::models::gemma4::batched_body::host_phases::add(
+                    crate::inference::models::gemma4::batched_body::host_phases::Phase::Publish,
+                    _hp_pub.elapsed().as_nanos() as u64,
+                );
             }
         }
     }
@@ -6727,6 +6742,7 @@ fn decode_batch_gemma4(
     // propagation so the prior the scope-guard saves/restores is always None
     // (the clean-n4/n8 invariant). Data-lossless: per-slot K/V lives in the
     // persistent multi-seq scaffolds; decode re-mounts a fresh slice-view.
+    let _hp_gather = std::time::Instant::now();
     clear_gemma4_self_mounts(guard.model);
 
     // ADR-040 iter-F-batched-determinism — env-gated per-tick trace
@@ -6786,6 +6802,10 @@ fn decode_batch_gemma4(
                 .map(|((s, p), t)| format!("s{}@{}:in{}", s.0, p, t)).collect();
             eprintln!("[DECTRACE] BATCHED N={} [{}]", sids.len(), comp.join(" "));
         }
+        crate::inference::models::gemma4::batched_body::host_phases::add(
+            crate::inference::models::gemma4::batched_body::host_phases::Phase::GatherMisc,
+            _hp_gather.elapsed().as_nanos() as u64,
+        );
         let _catsplit_g0 = std::time::Instant::now();
         let body_res = {
             let hybrid = guard.hybrid.as_mut().unwrap();
@@ -6877,6 +6897,7 @@ fn decode_batch_gemma4(
     );
 
     // Pass 2 — finalize each slot from its logits row.
+    let _hp_sample = std::time::Instant::now();
     for (i, (handle, slot_idx, mut state, reply)) in captured.into_iter().enumerate() {
         let logits_row = &head.logits[i * vocab..(i + 1) * vocab];
         let normed_row = &head.normed[i * hs..(i + 1) * hs];
@@ -6922,6 +6943,10 @@ fn decode_batch_gemma4(
             slots[slot_idx] = Some((state, reply, handle));
         }
     }
+    crate::inference::models::gemma4::batched_body::host_phases::add(
+        crate::inference::models::gemma4::batched_body::host_phases::Phase::SampleLoop,
+        _hp_sample.elapsed().as_nanos() as u64,
+    );
 }
 
 /// Per-slot KV exit reset for Gemma 4 (mirror of the serial ref's exit
@@ -7209,11 +7234,21 @@ fn run_slot_aware_qwen35(
             SchedulerStep::Prefill { .. } => {}
             SchedulerStep::Decode { handles } => {
                 decode_batch_qwen35(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &handles);
+                let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
+                crate::inference::models::gemma4::batched_body::host_phases::add(
+                    crate::inference::models::gemma4::batched_body::host_phases::Phase::Publish,
+                    _hp_pub.elapsed().as_nanos() as u64,
+                );
             }
             SchedulerStep::Mixed { decode_handles, .. } => {
                 decode_batch_qwen35(&mut guard, &mut scheduler, &mut slots, registration.as_ref(), &decode_handles);
+                let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
+                crate::inference::models::gemma4::batched_body::host_phases::add(
+                    crate::inference::models::gemma4::batched_body::host_phases::Phase::Publish,
+                    _hp_pub.elapsed().as_nanos() as u64,
+                );
             }
         }
     }
@@ -20927,6 +20962,8 @@ assistant:
         // ADR-040 iter-G: reset the per-category GPU-busy buckets AFTER warm-up
         // (HF2Q_DECODE_CATSPLIT=1) so the table reflects only the timed decode.
         crate::inference::models::gemma4::batched_body::catsplit::reset();
+        // ADR-040 §22 host-phase timing reset (HF2Q_HOST_PHASES=1).
+        crate::inference::models::gemma4::batched_body::host_phases::reset();
         // ADR-040 §0.21 decode-gap profiling: snapshot process-global GPU
         // dispatch + sync counters around the timed decode (HF2Q_DISP_PROFILE=1).
         let disp0 = mlx_native::dispatch_count();
@@ -21036,6 +21073,22 @@ assistant:
                     lmh_ns as f64 / 1e6 / steps as f64, 100.0 * lmh_ns as f64 / sum as f64,
                     sum as f64 / 1e6 / steps as f64,
                 );
+            }
+            // ADR-040 §22 — host-phase breakdown of the wall-vs-GPU-busy gap
+            // (HF2Q_HOST_PHASES=1). Shows where the ~8.3ms/step GPU-idle goes.
+            let hp = crate::inference::models::gemma4::batched_body::host_phases::snapshot();
+            if hp.iter().any(|(_, ns)| *ns > 0) {
+                let total: u64 = hp.iter().map(|(_, ns)| *ns).sum();
+                eprintln!("[HOST_PHASES] (HF2Q_HOST_PHASES) per-step host wall, {steps} steps:");
+                for (name, ns) in &hp {
+                    eprintln!(
+                        "[HOST_PHASES]   {:<32} {:6.3} ms/step ({:4.1}%)",
+                        name, *ns as f64 / 1e6 / steps as f64,
+                        100.0 * *ns as f64 / total.max(1) as f64,
+                    );
+                }
+                eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step (sum of measured host phases)",
+                    "TOTAL", total as f64 / 1e6 / steps as f64);
             }
         }
         rt.block_on(engine.shutdown()).expect("shutdown");

@@ -258,6 +258,61 @@ pub(crate) mod catsplit {
     }
 }
 
+/// ADR-040 §22 host-phase timing (`HF2Q_HOST_PHASES=1`).
+///
+/// Wall-clock `Instant` accumulators for the NON-GPU per-step host phases that
+/// fill the ~8.3ms/step GPU-idle window (wall 35.9 − GPU-busy 27.6). The
+/// existing catsplit/GPU_BUSY timers only see GPU exec time; these capture where
+/// the host blocks/works between the two per-step `commit_and_wait` syncs:
+/// the two GPU waits, the two host readbacks (`to_vec`), the Pass-2 sample loop,
+/// and the pre-forward gather/mount-clear. OFF by default (zero overhead).
+pub(crate) mod host_phases {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Clone, Copy)]
+    pub enum Phase {
+        BodyWait = 0,      // commit_and_wait on the 30-layer body (host idle on GPU)
+        BodyReadback = 1,  // hidden [N,hidden] GPU->host to_vec
+        LmheadWait = 2,    // commit_and_wait on lm_head (host idle on GPU)
+        LmheadReadback = 3, // logits+normed [N,vocab] GPU->host to_vec
+        SampleLoop = 4,    // Pass-2 host: 8x argmax + finalize + detok + scheduler
+        GatherMisc = 5,    // pre-forward mount-clear + per-slot token/pos gather
+        SchedStep = 6,     // scheduler.step() (worker loop, outside decode_batch)
+        Publish = 7,       // publish(scheduler stats) mutex (worker loop)
+    }
+    pub const LEN: usize = 8;
+    pub const NAMES: [&str; LEN] = [
+        "body_wait(sync)", "body_readback(hidden)", "lmhead_wait(sync)",
+        "lmhead_readback(logits)", "sample_loop(argmax+detok+sched)", "gather+mount_clear",
+        "scheduler.step()", "publish(stats)",
+    ];
+
+    static NS: [AtomicU64; LEN] = [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    ];
+
+    pub static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("HF2Q_HOST_PHASES").as_deref() == Ok("1"));
+
+    #[inline]
+    pub fn add(p: Phase, ns: u64) {
+        if *ENABLED {
+            NS[p as usize].fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    pub fn snapshot() -> Vec<(&'static str, u64)> {
+        (0..LEN).map(|i| (NAMES[i], NS[i].load(Ordering::Relaxed))).collect()
+    }
+
+    pub fn reset() {
+        for i in 0..LEN {
+            NS[i].store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// ADR-040 iter-G category boundary (`HF2Q_DECODE_CATSPLIT=1`).
 ///
 /// When the gate is ON: finish the current session with `finish_with_gpu_time`
@@ -1438,15 +1493,20 @@ impl MlxModelWeights {
                 }
             }
 
+            let _hp = std::time::Instant::now();
             s.finish()
                 .map_err(|e| anyhow::anyhow!("body_batched session finish: {e}"))?;
+            host_phases::add(host_phases::Phase::BodyWait, _hp.elapsed().as_nanos() as u64);
         }
 
         // Final hidden rows [n, hidden] (pre-final-norm).
+        let _hp = std::time::Instant::now();
         let out: &[f32] = bufs
             .hidden
             .as_slice()
             .map_err(|e| anyhow::anyhow!("body_batched read hidden: {e}"))?;
-        Ok(out[..n * hs].to_vec())
+        let v = out[..n * hs].to_vec();
+        host_phases::add(host_phases::Phase::BodyReadback, _hp.elapsed().as_nanos() as u64);
+        Ok(v)
     }
 }

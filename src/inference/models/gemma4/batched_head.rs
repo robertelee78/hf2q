@@ -264,9 +264,13 @@ impl MlxModelWeights {
             let after = mlx_native::barrier_count();
             eprintln!("[BARRIER-TRACE] lm_head_batched n={} barriers_emitted={}", n, after - _bc_before);
         }
+        use crate::inference::models::gemma4::batched_body::host_phases;
+        let _hp = std::time::Instant::now();
         s.finish()
             .map_err(|e| anyhow::anyhow!("lm_head_batched session finish: {e}"))?;
+        host_phases::add(host_phases::Phase::LmheadWait, _hp.elapsed().as_nanos() as u64);
 
+        let _hp = std::time::Instant::now();
         let logits: Vec<f32> = logits_b
             .as_slice::<f32>()
             .map_err(|e| anyhow::anyhow!("lm_head_batched read logits: {e}"))?
@@ -275,6 +279,7 @@ impl MlxModelWeights {
             .as_slice::<f32>()
             .map_err(|e| anyhow::anyhow!("lm_head_batched read normed_b: {e}"))?
             .to_vec();
+        host_phases::add(host_phases::Phase::LmheadReadback, _hp.elapsed().as_nanos() as u64);
         Ok(BatchedHeadOut { logits, normed })
     }
 }
