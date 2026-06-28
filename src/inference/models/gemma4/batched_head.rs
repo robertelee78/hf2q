@@ -18,7 +18,8 @@
 //! mantra). The shared per-row finalize (argmax + Q6_K rerank) lands in S1b.
 
 use anyhow::Result;
-use mlx_native::DType;
+use mlx_native::graph::GraphSession;
+use mlx_native::{DType, KernelRegistry, MlxBuffer, MlxDevice};
 
 use crate::debug::INVESTIGATION_ENV;
 use crate::quantize::imatrix::ImatrixHint;
@@ -281,5 +282,98 @@ impl MlxModelWeights {
             .to_vec();
         host_phases::add(host_phases::Phase::LmheadReadback, _hp.elapsed().as_nanos() as u64);
         Ok(BatchedHeadOut { logits, normed })
+    }
+
+    /// ADR-040 §25 iter-L — encode the lm_head (final RMS-norm + Q6_K matmul +
+    /// softcap) into an EXISTING session `s`, reading `hidden_buf` (the on-GPU
+    /// `[n,hidden]` body output) DIRECTLY — no host round-trip and NO separate
+    /// session/commit. BYTE-IDENTICAL to [`Self::lm_head_batched`]'s encode (same
+    /// dispatches, order, and per-call `[cap, n*vocab]` softcap params — see the
+    /// §0.16 root-cause note there). Does NOT finish/readback: the caller appends
+    /// this as the final chunk of the body's CB pipeline, then does the single
+    /// `commit_and_wait` and reads the returned `(logits_b, normed_b)`. The third
+    /// returned buffer (`softcap_params_b`) is handed back so it outlives the GPU
+    /// read (kept alive until the caller's finish). Q6_K head only.
+    pub(crate) fn encode_lm_head_into(
+        &self,
+        s: &mut GraphSession,
+        hidden_buf: &MlxBuffer,
+        n: usize,
+        dev: &MlxDevice,
+        reg: &mut KernelRegistry,
+    ) -> Result<(MlxBuffer, MlxBuffer, MlxBuffer)> {
+        let hs = self.hidden_size;
+        let vocab = self.vocab_size;
+        let metal_dev = dev.metal_device();
+        let q6k = self.lm_head_q6k.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("encode_lm_head_into requires a Q6_K lm_head (production decode path)")
+        })?;
+
+        let normed_b = dev
+            .alloc_buffer(n * hs * 4, DType::F32, vec![n * hs])
+            .map_err(|e| anyhow::anyhow!("encode_lm_head_into alloc normed_b: {e}"))?;
+        let logits_b = dev
+            .alloc_buffer(n * vocab * 4, DType::F32, vec![n * vocab])
+            .map_err(|e| anyhow::anyhow!("encode_lm_head_into alloc logits_b: {e}"))?;
+        // Per-call softcap params with n_elements = n*vocab (§0.16 root cause —
+        // the shared self.activations.softcap_params carries vocab, softcapping
+        // ONLY row 0). MUST be per-call here too.
+        let mut softcap_params_b = dev
+            .alloc_buffer(8, DType::F32, vec![2])
+            .map_err(|e| anyhow::anyhow!("encode_lm_head_into alloc softcap params: {e}"))?;
+        if let Some(cap) = self.final_logit_softcapping {
+            let p: &mut [f32] = softcap_params_b
+                .as_mut_slice()
+                .map_err(|e| anyhow::anyhow!("encode_lm_head_into softcap params slice: {e}"))?;
+            let total = n
+                .checked_mul(vocab)
+                .expect("encode_lm_head_into softcap: n*vocab overflow");
+            p[0] = cap;
+            p[1] = f32::from_bits(total as u32);
+        }
+
+        // RAW: the body's final layer wrote `hidden_buf` into the SAME session's
+        // tracker, so this barrier_between (reads hidden_buf) emits the memory
+        // barrier that orders the body-hidden-write before the final norm.
+        s.barrier_between(&[hidden_buf, &self.final_norm], &[&normed_b]);
+        s.rms_norm(
+            reg,
+            metal_dev,
+            hidden_buf,
+            &self.final_norm,
+            &normed_b,
+            &self.activations.norm_params,
+            n as u32,
+            hs as u32,
+        )
+        .map_err(|e| anyhow::anyhow!("encode_lm_head_into final norm: {e}"))?;
+
+        s.barrier_between(&[&normed_b, &q6k.buffer], &[&logits_b]);
+        dispatch_qmatmul(
+            s,
+            reg,
+            dev,
+            &normed_b,
+            q6k,
+            &logits_b,
+            n as u32,
+            ImatrixHint::Global("output.weight"),
+        )?;
+
+        if let Some(cap) = self.final_logit_softcapping {
+            s.barrier_between(&[&logits_b], &[&logits_b]);
+            mlx_native::ops::softcap::dispatch_softcap(
+                s.encoder_mut(),
+                reg,
+                metal_dev,
+                &logits_b,
+                &logits_b,
+                &softcap_params_b,
+                cap,
+            )
+            .map_err(|e| anyhow::anyhow!("encode_lm_head_into softcap: {e}"))?;
+        }
+
+        Ok((logits_b, normed_b, softcap_params_b))
     }
 }

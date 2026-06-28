@@ -6795,6 +6795,12 @@ fn decode_batch_gemma4(
         && guard.hybrid.is_some();
     let mut captured = Vec::new();
     let mut hidden_rows: Vec<f32> = Vec::new();
+    // ADR-040 §25 iter-L — when HF2Q_FUSE_LMHEAD=1, the batched body encodes the
+    // lm_head as the final CB-pipeline chunk and returns its output here (and an
+    // empty hidden_rows); the head computation below uses this instead of a
+    // separate lm_head_batched call (one commit_and_wait instead of two).
+    let mut fused_head_out: Option<crate::inference::models::gemma4::batched_head::BatchedHeadOut> =
+        None;
     if use_batched_body {
         let mut tokens: Vec<u32> = Vec::new();
         let mut sids: Vec<SlotId> = Vec::new();
@@ -6831,7 +6837,9 @@ fn decode_batch_gemma4(
             let hybrid = guard.hybrid.as_mut().unwrap();
             let lm = &mut *guard.model;
             lm.weights
-                .forward_decode_body_batched(&tokens, &sids, &positions, hybrid, &mut lm.ctx)
+                .forward_decode_body_batched(
+                    &tokens, &sids, &positions, hybrid, &mut fused_head_out, &mut lm.ctx,
+                )
         };
         DECODE_BODY_GPU_NS.fetch_add(
             _catsplit_g0.elapsed().as_nanos() as u64,
@@ -6891,23 +6899,30 @@ fn decode_batch_gemma4(
     let n = captured.len();
 
     // Batched head: ONE final-norm + lm_head(m=N) + softcap for all slots.
+    // §25 iter-L: when HF2Q_FUSE_LMHEAD=1, the body already encoded the head into
+    // its CB pipeline and produced `fused_head_out` (its GPU time folds into
+    // DECODE_BODY_GPU_NS, so DECODE_LMHEAD_GPU_NS reads ~0 on the fused path).
     let _catsplit_h0 = std::time::Instant::now();
-    let head = match guard
-        .model
-        .weights
-        .lm_head_batched(&hidden_rows, n, &mut guard.model.ctx)
-    {
-        Ok(h) => h,
-        Err(e) => {
-            // Head failure is fatal for this tick's slots (no tokens producible);
-            // evict each. anyhow::Error isn't Clone, so carry the message.
-            let msg = format!("{e}");
-            for (handle, _slot_idx, _state, reply) in captured {
-                reset_gemma4_slot(guard, handle.slot_id);
-                scheduler.release(handle);
-                slot_fire_done(reply, Err(anyhow::anyhow!("lm_head_batched: {msg}")), false);
+    let head = if let Some(h) = fused_head_out.take() {
+        h
+    } else {
+        match guard
+            .model
+            .weights
+            .lm_head_batched(&hidden_rows, n, &mut guard.model.ctx)
+        {
+            Ok(h) => h,
+            Err(e) => {
+                // Head failure is fatal for this tick's slots (no tokens
+                // producible); evict each. anyhow::Error isn't Clone, carry msg.
+                let msg = format!("{e}");
+                for (handle, _slot_idx, _state, reply) in captured {
+                    reset_gemma4_slot(guard, handle.slot_id);
+                    scheduler.release(handle);
+                    slot_fire_done(reply, Err(anyhow::anyhow!("lm_head_batched: {msg}")), false);
+                }
+                return;
             }
-            return;
         }
     };
 

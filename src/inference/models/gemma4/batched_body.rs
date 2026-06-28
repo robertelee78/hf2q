@@ -33,6 +33,7 @@ use crate::serve::forward_mlx_shared::{
 };
 use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
 
+use super::batched_head::BatchedHeadOut;
 use super::kv_cache::MultiSeqHybridKvBuffers;
 use super::model::{MlxActivationBuffers, MlxModelWeights};
 use crate::serve::gpu::GpuContext;
@@ -1354,6 +1355,11 @@ impl MlxModelWeights {
         slot_ids: &[SlotId],
         seq_positions: &[usize],
         multi_seq_kv_hybrid: &mut [MultiSeqHybridKvBuffers],
+        // ADR-040 §25 iter-L — when HF2Q_FUSE_LMHEAD=1 (chunked path only), the
+        // lm_head is encoded as the final pipeline chunk and its output is written
+        // here (the body then returns an EMPTY Vec; the caller uses `head_out`).
+        // When the fuse is off, this stays None and the body returns hidden.
+        head_out: &mut Option<BatchedHeadOut>,
         gpu: &mut GpuContext,
     ) -> Result<Vec<f32>> {
         let n = tokens.len();
@@ -1475,11 +1481,24 @@ impl MlxModelWeights {
             1
         };
 
+        // ADR-040 §25 iter-L — fuse lm_head into the body's CB pipeline (one
+        // commit_and_wait instead of two; lm_head encode overlaps the body GPU).
+        // DEFAULT-ON (opt out HF2Q_FUSE_LMHEAD=0); chunked path only, Q6_K head, not under the
+        // cksum/catsplit debug paths (they own session lifetime, already excluded
+        // from cb_chunks>=2 above — re-asserted here for clarity).
+        let fuse_lmhead = cb_chunks >= 2
+            && std::env::var("HF2Q_FUSE_LMHEAD").as_deref() != Ok("0")
+            && self.lm_head_q6k.is_some()
+            && !cksum_on
+            && !*catsplit::ENABLED;
+
         if cb_chunks >= 2 {
             // Async-committed chunks; only the LAST chunk waits (same-queue order ⇒
             // its completion implies all prior CBs completed). Hold committed
             // encoders alive until the final wait.
             let mut committed: Vec<mlx_native::CommandEncoder> = Vec::with_capacity(cb_chunks);
+            // §25 iter-L: fused lm_head output buffers (read after the final wait).
+            let mut fused_head: Option<(MlxBuffer, MlxBuffer, MlxBuffer)> = None;
             let per = num_layers.div_ceil(cb_chunks);
             let mut layer_idx = 0usize;
             while layer_idx < num_layers {
@@ -1494,6 +1513,16 @@ impl MlxModelWeights {
                     layer_idx += 1;
                 }
                 if layer_idx >= num_layers {
+                    // §25 iter-L: append lm_head (final-norm + Q6_K matmul + softcap)
+                    // into THIS session as the final pipeline chunk, reading
+                    // bufs.hidden directly (the last layer wrote it into this same
+                    // session's tracker, so the first head barrier orders it). One
+                    // commit_and_wait covers body + head.
+                    if fuse_lmhead {
+                        fused_head = Some(self.encode_lm_head_into(
+                            &mut s, &bufs.hidden, n, dev, reg,
+                        )?);
+                    }
                     s.finish()
                         .map_err(|e| anyhow::anyhow!("body_batched chunked final finish: {e}"))?;
                     break;
@@ -1513,6 +1542,26 @@ impl MlxModelWeights {
                 enc.accumulate_gpu_busy();
             }
             drop(committed);
+
+            // §25 iter-L: fused head — read logits/normed after the single wait and
+            // hand them back via head_out; the body returns an empty hidden Vec.
+            if let Some((logits_b, normed_b, _softcap_params_b)) = fused_head {
+                let _hp = std::time::Instant::now();
+                let logits: Vec<f32> = logits_b
+                    .as_slice::<f32>()
+                    .map_err(|e| anyhow::anyhow!("fused lm_head read logits: {e}"))?
+                    .to_vec();
+                let normed: Vec<f32> = normed_b
+                    .as_slice::<f32>()
+                    .map_err(|e| anyhow::anyhow!("fused lm_head read normed: {e}"))?
+                    .to_vec();
+                host_phases::add(
+                    host_phases::Phase::LmheadReadback,
+                    _hp.elapsed().as_nanos() as u64,
+                );
+                *head_out = Some(BatchedHeadOut { logits, normed });
+                return Ok(Vec::new());
+            }
         } else {
             for layer_idx in 0..num_layers {
                 self.encode_one_layer_batched(
