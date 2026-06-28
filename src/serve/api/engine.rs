@@ -21047,6 +21047,8 @@ assistant:
         crate::inference::models::gemma4::batched_body::catsplit::reset();
         // ADR-040 §22 host-phase timing reset (HF2Q_HOST_PHASES=1).
         crate::inference::models::gemma4::batched_body::host_phases::reset();
+        // ADR-040 §25 barrier-tracking timing reset (HF2Q_BARRIER_NS=1).
+        mlx_native::barrier_ns_reset();
         // ADR-040 §0.21 decode-gap profiling: snapshot process-global GPU
         // dispatch + sync counters around the timed decode (HF2Q_DISP_PROFILE=1).
         let disp0 = mlx_native::dispatch_count();
@@ -21181,6 +21183,12 @@ assistant:
                 }
                 eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step (sum of leaf phases)",
                     "TOTAL", total as f64 / 1e6 / steps as f64);
+                // §25: how much of the serial encode is barrier conflict-tracking.
+                let bns = mlx_native::barrier_ns();
+                if bns > 0 {
+                    eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step (barrier_between conflict-tracking; HF2Q_BARRIER_NS)",
+                        "of which barrier-track", bns as f64 / 1e6 / steps as f64);
+                }
             }
         }
         rt.block_on(engine.shutdown()).expect("shutdown");
