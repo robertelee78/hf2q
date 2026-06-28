@@ -647,15 +647,17 @@ impl MlxModelWeights {
             let buf = gbuf;
             let cap = gcap;
             let is_ring = gring;
-            // PHASE 1 — KV-encode (F16-K + FWHT-V). HF2Q_BATCHED_KVENC=1 fuses
-            // the N per-slot dispatches into 2 grid-dim-N dispatches (one F16-K,
-            // one FWHT-V over all N queries) — bit-identical (per-query slot/pos
-            // addressing in-kernel). Falls back per-slot for the dummy-vnorms
-            // (FULL_F16_KV) case. ADR-040 M4.
+            // PHASE 1 — KV-encode (F16-K + FWHT-V). Fuses the N per-slot
+            // dispatches into 2 grid-dim-N dispatches (one F16-K, one FWHT-V over
+            // all N queries) — bit-identical (per-query slot/pos addressing
+            // in-kernel). Falls back per-slot for the dummy-vnorms (FULL_F16_KV)
+            // case. ADR-040 M4. DEFAULT-ON (2026-06-27): measured +3.5% N=8 decode
+            // throughput + −19% dispatches/step (2147→1731); byte-parity GREEN
+            // (slot_aware_n8_per_slot_parity_vs_serial). Opt out: HF2Q_BATCHED_KVENC=0.
             let v_src_buf: &MlxBuffer = if v_is_k { &bufs.attn_v } else { &bufs.attn_v_normed };
             let vnorms_dummy = buf.v_norms.byte_len() == 4;
             let use_batched_kvenc =
-                std::env::var("HF2Q_BATCHED_KVENC").as_deref() == Ok("1") && !vnorms_dummy;
+                std::env::var("HF2Q_BATCHED_KVENC").as_deref() != Ok("0") && !vnorms_dummy;
             if use_batched_kvenc {
                 // ONE barrier: norm-rope/V-norm wrote attn_k_normed / v_src;
                 // declare them as reads for the 2 batched encode dispatches.
