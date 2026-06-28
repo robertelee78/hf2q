@@ -21026,8 +21026,14 @@ assistant:
             EngineMode::SlotAware { max_slots: n_streams as u32 },
         )
         .expect("spawn SlotAware");
+        // ADR-040 iter-I contention probe: vary the probe's tokio worker count
+        // (HF2Q_BENCH_TOKIO_THREADS, default 4) to test whether the ~2.45ms/step
+        // worker-loop time is core-contention between the model worker thread and
+        // the async runtime.
+        let tokio_threads: usize = std::env::var("HF2Q_BENCH_TOKIO_THREADS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(4).max(1);
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            .worker_threads(tokio_threads)
             .enable_all()
             .build()
             .expect("rt");

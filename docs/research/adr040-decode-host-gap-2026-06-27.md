@@ -95,3 +95,37 @@ chunks (encode overlap, runtime contention) need the risky async-pipeline refact
 for ~250-260 t/s. Coherence parity (the harder goal) is already met. DECISION: low-risk H3+H4
 bundle vs risky async-pipeline vs accept-current. The instrumentation (HF2Q_HOST_PHASES) is the
 durable artifact for whichever path.
+
+## CORRECTION (2026-06-27) — the 2.45ms was a benchmark artifact, not a per-step cost
+
+Two things resolved after building the finer timers + iter-I:
+
+1. **H4 (argmax) DONE — iter-I, +1.1%.** The scalar first-max loop (`v > bv`, loop-carried dep)
+   over the 8×256K vocab was 1.5ms/step. Replaced with `argmax_f32_first_max` (max-reduction +
+   first-equal scan, both auto-vectorize). BYTE-IDENTICAL (unit test + real-model
+   `slot_aware_n8_per_slot_parity_vs_serial` green). argmax+finalize 1.5→~1.0ms; 229.5→232 t/s.
+   (Candidate-scan vectorization gave 0 gain → reverted.)
+
+2. **The "2.45ms/step worker-loop misc" is NOT runtime contention and NOT a per-step cost.**
+   - tokio-thread A/B (`HF2Q_BENCH_TOKIO_THREADS` 1/2/4/8): throughput FLAT 231-233 t/s,
+     worker_iter FLAT ~34.4ms. → async-runtime contention REFUTED.
+   - `worker_iter − decode_batch ≈ 2.4ms` is constant. It is the benchmark's **8 prefills
+     (admit, eager) amortized over 128 decode tokens** (8 × ~30ms / 128 ≈ 1.9ms/step) — a STARTUP
+     artifact that → 0 in long generation. NOT a per-step decode cost.
+
+**Corrected per-step budget — `decode_batch_TOTAL` = 31.9ms is the TRUE per-step decode:**
+GPU-busy 27.6 + encode 1.9 + sync 1.3 + argmax ~1.0 + readback 0.15 = 32.0 ✓ (fully accounted).
+So the genuine gap to llama (27.5ms/step) is **~4.4ms/step of real host overhead**, NOT 7ms:
+- **encode ~1.9ms** — CPU recording ~1731 dispatches/step (GPU idle). Lever: DISPATCH FUSION
+  (fewer/bigger kernels, the KVENC pattern extended). This is the most llama-like lever — llama
+  issues far fewer dispatches/token. Also reduces per-dispatch GPU launch overhead.
+- **sync ~1.3ms** — two `commit_and_wait` (body, lm_head). Lever: fuse body+lm_head into ONE
+  session/sync (H3, ~0.6ms, byte-identity-preserving).
+- **argmax ~1.0ms** — residual after iter-I (the finalize rerank candidate dots). Lever: trim
+  the rerank work.
+- readback 0.15ms — unified memory, ~free.
+
+**Reframed target:** drive `decode_batch_TOTAL` 31.9 → ~27.6ms (= GPU-busy) → ~llama. The real
+levers are dispatch fusion (encode + GPU launch overhead) and sync fusion — both byte-identity-
+targetable, NO async-pipeline refactor needed, NO runtime/language excuse. Same silicon, fewer
+dispatches + fewer syncs = llama parity.
