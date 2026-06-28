@@ -62,3 +62,36 @@ H1 is the highest payoff-to-risk: it attacks the largest GPU-idle host chunk (bo
 ~3.4ms) with no kernel/quant changes, just reordering the worker loop to launch-then-bookkeep.
 The realistic ceiling of H1+H3+H4 is ~wall 30-31ms → ~260-270 t/s (vs llama 291). H2 (encode
 overlap) is needed to fully close it but is the riskiest.
+
+## UPDATE — H1 codex-REJECTED + finer localization (2026-06-27)
+
+**codex REJECTed H1 as a worker-loop reorder.** Blockers: (Q5) deferring
+`scheduler.advance_after_decode`/release past the next `scheduler.step()` violates the
+scheduler's state contract (scheduler.rs:355-361) — stale `in_flight` → delayed auto-release,
+delayed promotion, stale handles in the next batch. (Q4) detok/splitters are NOT purely
+observational — the tool-call splitter triggers grammar runtime (engine.rs:5648-5656) that masks
+the NEXT logits (5599-5600); EOS returns BEFORE pushing the token (5629-5634). (Q7) body/lm_head
+are `commit_and_wait` (synchronous) — H1 is not a reorder, it needs a real async submit/wait split
+(the risky refactor). The SAFE deferrable subset (text assembly + publish only, keeping
+advance/release/EOS inline before step()) recovers only ~0.5ms.
+
+**Finer localization (decode_batch_TOTAL + worker_iter_TOTAL timers):** per step wall 35.97ms,
+decode_batch 33.52ms, worker_iter 35.97ms → **2.45ms/step is OUTSIDE decode_batch** in the worker
+loop, and it is NOT scheduler.step/publish/admit (all ≈0). This is **async-runtime / thread-
+scheduling contention** — the dedicated model-worker thread competing with the probe's 4-thread
+tokio runtime + 8 concurrent generate() tasks for cores. llama.cpp has NO async runtime (one tight
+C++ loop) → it does not pay this. May be partly benchmark-specific (the probe's runtime config).
+
+**Final gap decomposition (per step, GPU-idle host work ≈ 7-8ms):**
+- worker-outside-decode 2.45ms — runtime/thread contention (hard; environmental; llama avoids by design)
+- body+lmhead ENCODE ~1.9ms — GPU-idle CPU dispatch recording; needs async submit/wait split (risky)
+- sample_loop ~1.5-2.5ms — 8× full-vocab(256K) argmax + detok; argmax is on the critical path (SIMD/GPU = H4, low risk)
+- sync overhead ~1.3ms — 2 commit_and_wait beyond GPU exec; fuse body+lmhead to 1 sync (H3, ~0.6ms, low risk)
+- readbacks ~0.15ms — unified memory, ~free
+
+**Revised conclusion:** no single big lever. The LOW-RISK bundle is **H3 (fuse body+lm_head to one
+sync, ~0.6ms) + H4 (SIMD/GPU argmax, ~0.8ms)** ≈ 1.4ms → ~235 t/s, byte-identity-safe. The bigger
+chunks (encode overlap, runtime contention) need the risky async-pipeline refactor + runtime tuning
+for ~250-260 t/s. Coherence parity (the harder goal) is already met. DECISION: low-risk H3+H4
+bundle vs risky async-pipeline vs accept-current. The instrumentation (HF2Q_HOST_PHASES) is the
+durable artifact for whichever path.

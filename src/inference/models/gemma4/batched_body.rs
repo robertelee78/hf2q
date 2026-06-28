@@ -279,17 +279,21 @@ pub(crate) mod host_phases {
         GatherMisc = 5,    // pre-forward mount-clear + per-slot token/pos gather
         SchedStep = 6,     // scheduler.step() (worker loop, outside decode_batch)
         Publish = 7,       // publish(scheduler stats) mutex (worker loop)
+        DecodeBatchTotal = 8, // whole decode_batch_gemma4 call (setup+gather+body+head+sample)
+        WorkerIter = 9,    // whole worker-loop iteration (admit+sched.step+decode+publish)
     }
-    pub const LEN: usize = 8;
+    pub const LEN: usize = 10;
     pub const NAMES: [&str; LEN] = [
         "body_wait(sync)", "body_readback(hidden)", "lmhead_wait(sync)",
         "lmhead_readback(logits)", "sample_loop(argmax+detok+sched)", "gather+mount_clear",
         "scheduler.step()", "publish(stats)",
+        "decode_batch_TOTAL", "worker_iter_TOTAL",
     ];
 
     static NS: [AtomicU64; LEN] = [
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0),
     ];
 
     pub static ENABLED: std::sync::LazyLock<bool> =

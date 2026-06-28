@@ -6032,6 +6032,7 @@ fn run_slot_aware_gemma4(
         && std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() != Ok("1");
 
     'worker: loop {
+        let _hp_iter = std::time::Instant::now();
         // ── ADMIT ────────────────────────────────────────────────────
         // Fill free slots without blocking. The first iteration may carry
         // a `pending` request that unparked us.
@@ -6243,12 +6244,17 @@ fn run_slot_aware_gemma4(
                 // is handled in admit. Nothing to do this tick.
             }
             SchedulerStep::Decode { handles } => {
+                let _hp_db = std::time::Instant::now();
                 decode_batch_gemma4(
                     &mut guard,
                     &mut scheduler,
                     &mut slots,
                     registration.as_ref(),
                     &handles,
+                );
+                crate::inference::models::gemma4::batched_body::host_phases::add(
+                    crate::inference::models::gemma4::batched_body::host_phases::Phase::DecodeBatchTotal,
+                    _hp_db.elapsed().as_nanos() as u64,
                 );
                 let _hp_pub = std::time::Instant::now();
                 publish(&scheduler, &scheduler_stats_snapshot);
@@ -6277,6 +6283,10 @@ fn run_slot_aware_gemma4(
                 );
             }
         }
+        crate::inference::models::gemma4::batched_body::host_phases::add(
+            crate::inference::models::gemma4::batched_body::host_phases::Phase::WorkerIter,
+            _hp_iter.elapsed().as_nanos() as u64,
+        );
     }
 
     // Guard drops here → KV restored into `model` on every exit path.
@@ -21078,16 +21088,20 @@ assistant:
             // (HF2Q_HOST_PHASES=1). Shows where the ~8.3ms/step GPU-idle goes.
             let hp = crate::inference::models::gemma4::batched_body::host_phases::snapshot();
             if hp.iter().any(|(_, ns)| *ns > 0) {
-                let total: u64 = hp.iter().map(|(_, ns)| *ns).sum();
+                // The last two rows (decode_batch_TOTAL, worker_iter_TOTAL) are
+                // reference totals, NOT leaf phases — exclude from the % denom.
+                let leaf = hp.len().saturating_sub(2);
+                let total: u64 = hp.iter().take(leaf).map(|(_, ns)| *ns).sum();
                 eprintln!("[HOST_PHASES] (HF2Q_HOST_PHASES) per-step host wall, {steps} steps:");
-                for (name, ns) in &hp {
+                for (i, (name, ns)) in hp.iter().enumerate() {
+                    let tag = if i >= leaf { " [ref]" } else { "" };
                     eprintln!(
-                        "[HOST_PHASES]   {:<32} {:6.3} ms/step ({:4.1}%)",
+                        "[HOST_PHASES]   {:<32} {:6.3} ms/step ({:4.1}%){}",
                         name, *ns as f64 / 1e6 / steps as f64,
-                        100.0 * *ns as f64 / total.max(1) as f64,
+                        100.0 * *ns as f64 / total.max(1) as f64, tag,
                     );
                 }
-                eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step (sum of measured host phases)",
+                eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step (sum of leaf phases)",
                     "TOTAL", total as f64 / 1e6 / steps as f64);
             }
         }
