@@ -1452,18 +1452,28 @@ impl MlxModelWeights {
         // with a clean intra-CB conflict tracker. Disabled when the per-layer
         // cksum/catsplit debug paths own the session lifetime.
         //
-        // MEASURED (2026-06-27, N=8 gemma4 Q5_K_M): only +1.5–2.7% (K=3–10, near the
-        // run-to-run noise floor) — so the per-step wall-vs-GPU-busy gap is NOT
-        // serialized decode-body CPU-encode (this would have recovered most of it);
-        // it is dominated by per-token ENGINE overhead (host sampling/argmax,
-        // admission/scheduling) + lm_head, not the body encode. Kept gated/opt-in as
-        // a small byte-exact lever + a documented negative result; default OFF.
-        let cb_chunks: usize = std::env::var("HF2Q_DECODE_CB_CHUNKS")
+        // ADR-040 §25 iter-K — DEFAULT-ON at K=4 (opt out HF2Q_DECODE_CB_CHUNKS=0/1).
+        // RE-MEASURED 2026-06-28 (N=8 gemma4-ara Q5_K_M, post iter-I/iter-J): K=4 =
+        // +2.5–3.1% (233→240 t/s), K=6/10 ≈ +3%. The earlier "+1.5–2.7%, marginal,
+        // default-OFF" verdict was too pessimistic (and the baseline moved up). This
+        // recovers the serial-encode-overlap part of the host gap: §25 localized the
+        // ~1.66ms/step encode as raw Metal arg-encoding (NOT barriers, 0.22ms), and
+        // overlapping it behind GPU exec via incremental async commit is the byte-
+        // identical mechanism (record-reuse can't — it still pays the Metal calls;
+        // codex-confirmed). BYTE-IDENTICAL VALIDATED at K=4: slot_aware_n8_per_slot
+        // _parity_vs_serial GREEN + slot_aware_staggered_eviction_no_peer_perturbation
+        // GREEN (continuous-batching mid-window admission). Cross-CB ordering = same-
+        // queue commit order (no fences). Disabled under cksum/catsplit debug (they
+        // own the session lifetime).
+        let cb_chunks_req: usize = std::env::var("HF2Q_DECODE_CB_CHUNKS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&k| k >= 2 && !cksum_on && !*catsplit::ENABLED)
-            .map(|k| k.min(num_layers.max(1)))
-            .unwrap_or(1);
+            .unwrap_or(4);
+        let cb_chunks: usize = if cb_chunks_req >= 2 && !cksum_on && !*catsplit::ENABLED {
+            cb_chunks_req.min(num_layers.max(1))
+        } else {
+            1
+        };
 
         if cb_chunks >= 2 {
             // Async-committed chunks; only the LAST chunk waits (same-queue order ⇒
