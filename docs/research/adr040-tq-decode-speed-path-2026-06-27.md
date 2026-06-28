@@ -159,3 +159,33 @@ sign table, set GGUF `fwht_folded` flag; (2) runtime: gate ALL undo sites on !fo
 validate on a real converted model — N=8 coherence (0/120 single-process), slot_aware parity,
 PPL vs current, decode tok/s. Add quant only after the F32 path is green (done). v_proj
 sliding-only fold (kills the write rotation too) deferred as a follow-on.
+
+## PAYOFF SPIKE — REFUTED: the fold yields ~0% decode speedup (2026-06-27)
+
+Before building the multi-file conversion+gating plumbing, measured the UPPER-BOUND decode payoff
+of the fold by gating the runtime FWHT-undo dispatches behind `HF2Q_TQ_SKIP_UNDO=1` (output
+incoherent — TIMING ONLY) and running the N=8 throughput probe (gemma4 Ara Q5_K_M, M5 Max,
+HF2Q_BENCH_N=8) interleaved, undo-on vs undo-removed:
+
+| undo | tok/s (3 trials) | GPU-busy ms/step |
+|---|---|---|
+| ON  (skip=0) | 223.3, 222.8 | 27.56, 27.65 |
+| OFF (skip=1) | 223.8, 221.6 | 27.62, 27.70 |
+
+**Removing the undo dispatch + sdpa_out round-trip = ZERO measurable speedup** (Δ within
+run-to-run noise; skip=1 fractionally SLOWER in one pair). The undo is a negligible fraction of
+the GPU-WORK-BOUND 27.6ms/step. ⇒ The QuaRot o_proj fold, though mathematically CORRECT
+(F32-shadow spike passed) and SOTA-standard, is **NOT a decode-speed lever for our short-context
+N=8**. Building the conversion+gating plumbing would be effort for no measurable gain — MANTRA
+call: don't build it. (The v_proj write-rotation fold removes an even smaller in-kernel cost →
+refuted by extension.)
+
+**This CONFIRMS the deep-research reframe empirically:** TQ's decode cost is NOT the avoidable
+Hadamard machinery; at short context 4-bit-V is inherently ~net-neutral (the ~7k crossover).
+The decode is GPU-WORK BOUND at 27.6ms/step ≈ llama's ENTIRE step (27.5ms); the residual gap to
+llama (223 vs 291 t/s) is the **wall-vs-GPU-busy delta** (35.9ms wall vs 27.6ms GPU = 77%
+utilization → ~23%/8.3ms per-step is NON-GPU host/scheduling/sync, NOT decode-body GPU work).
+That host-overlap gap (task #21) — not TQ — is the real "as fast as llama.cpp" lever.
+
+**DECISION:** iter-H-TQ-fold CLOSED as a speed lever (correct but no payoff). The F32-shadow
+spike + this refutation are the durable artifacts. Re-target the 23% wall-vs-GPU host gap.
