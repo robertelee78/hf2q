@@ -279,21 +279,24 @@ pub(crate) mod host_phases {
         GatherMisc = 5,    // pre-forward mount-clear + per-slot token/pos gather
         SchedStep = 6,     // scheduler.step() (worker loop, outside decode_batch)
         Publish = 7,       // publish(scheduler stats) mutex (worker loop)
-        DecodeBatchTotal = 8, // whole decode_batch_gemma4 call (setup+gather+body+head+sample)
-        WorkerIter = 9,    // whole worker-loop iteration (admit+sched.step+decode+publish)
+        ArgmaxFinalize = 8, // 8x argmax_f32 + finalize_token_from_logits (critical path)
+        DecodeTick = 9,    // 8x decode_tick_finalize (detok + EOS + stop + emit + sched-advance)
+        DecodeBatchTotal = 10, // whole decode_batch_gemma4 call (setup+gather+body+head+sample)
+        WorkerIter = 11,   // whole worker-loop iteration (admit+sched.step+decode+publish)
     }
-    pub const LEN: usize = 10;
+    pub const LEN: usize = 12;
     pub const NAMES: [&str; LEN] = [
         "body_wait(sync)", "body_readback(hidden)", "lmhead_wait(sync)",
         "lmhead_readback(logits)", "sample_loop(argmax+detok+sched)", "gather+mount_clear",
         "scheduler.step()", "publish(stats)",
+        "  argmax+finalize", "  decode_tick(detok+sched)",
         "decode_batch_TOTAL", "worker_iter_TOTAL",
     ];
 
     static NS: [AtomicU64; LEN] = [
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     ];
 
     pub static ENABLED: std::sync::LazyLock<bool> =

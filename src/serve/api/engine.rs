@@ -6705,6 +6705,21 @@ fn embed_gemma4_inline(
 static DECODE_BODY_GPU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DECODE_LMHEAD_GPU_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// ADR-040 iter-I — vectorizable first-max argmax over a logits row, BYTE-IDENTICAL
+/// to the scalar `v > bv` first-max loop (`argmax_f32_first_max_ref`): returns the
+/// FIRST index of the maximum value and that value. Split into a max-reduction
+/// then a first-equal scan; both auto-vectorize, unlike the loop-carried scalar
+/// form (the N=8 decode critical path ran this 8× over a 256K vocab = 1.5ms/step
+/// with the GPU idle). Edge parity with the scalar loop:
+///   - NaN: skipped (Rust `f32::max` drops NaN; `v == maxv` is false for NaN).
+///   - all -inf / all NaN / empty: returns (0, -inf) — index 0, value NEG_INFINITY.
+#[inline]
+fn argmax_f32_first_max(xs: &[f32]) -> (u32, f32) {
+    let maxv = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let bi = xs.iter().position(|&v| v == maxv).unwrap_or(0);
+    (bi as u32, maxv)
+}
+
 /// Decode every active Gemma 4 slot in `handles` once (STEP 1: per-slot
 /// forward in a loop). A slot that finishes this tick fires its reply and
 /// is evicted; peers are untouched.
@@ -6719,16 +6734,11 @@ fn decode_batch_gemma4(
     // VALUE (== logits max) feeds the rerank threshold; the index is a cosmetic
     // seed that finalize_token_from_logits never lets affect the result (the max
     // is always within delta of itself ⇒ always a rerank candidate).
+    // ADR-040 iter-I — vectorizable argmax (byte-identical to the scalar
+    // first-max `v > bv` loop, but the two passes auto-vectorize where the
+    // loop-carried-dependency scalar loop did not). See `argmax_f32_first_max`.
     fn argmax_f32(xs: &[f32]) -> (u32, f32) {
-        let mut bi = 0usize;
-        let mut bv = f32::NEG_INFINITY;
-        for (i, &v) in xs.iter().enumerate() {
-            if v > bv {
-                bv = v;
-                bi = i;
-            }
-        }
-        (bi as u32, bv)
+        argmax_f32_first_max(xs)
     }
 
     // ADR-040 S1c-2 — TWO-PASS batched-head tick. Pass 1 runs each live slot's
@@ -6914,6 +6924,7 @@ fn decode_batch_gemma4(
         // Greedy token: the GPU-argmax index is irrelevant to the rerank and the
         // top1 VALUE (== CPU max) is bit-identical, so a CPU argmax reproduces
         // the scalar head's greedy token exactly.
+        let _hp_am = std::time::Instant::now();
         let (top1_idx, top1_val) = argmax_f32(logits_row);
         let greedy_token = match guard.model.weights.finalize_token_from_logits(
             logits_row, normed_row, top1_idx, top1_val,
@@ -6926,10 +6937,15 @@ fn decode_batch_gemma4(
                 continue;
             }
         };
+        crate::inference::models::gemma4::batched_body::host_phases::add(
+            crate::inference::models::gemma4::batched_body::host_phases::Phase::ArgmaxFinalize,
+            _hp_am.elapsed().as_nanos() as u64,
+        );
         if trace {
             eprintln!("[DECTRACE]   out s{} top1_val={:.4} -> tok{}",
                 handle.slot_id.0, top1_val, greedy_token);
         }
+        let _hp_dt = std::time::Instant::now();
         let tick = match state.decode_tick_finalize(guard.model, greedy_token, logits_row) {
             Ok(t) => t,
             Err(e) => {
@@ -6939,6 +6955,10 @@ fn decode_batch_gemma4(
                 continue;
             }
         };
+        crate::inference::models::gemma4::batched_body::host_phases::add(
+            crate::inference::models::gemma4::batched_body::host_phases::Phase::DecodeTick,
+            _hp_dt.elapsed().as_nanos() as u64,
+        );
 
         let client_dropped = slot_emit_token(&reply, &tick);
         scheduler.advance_after_decode(handle);
@@ -20910,6 +20930,53 @@ assistant:
             if multi_toks.first() == Some(&single_a_tok) { "==" } else { "!=" },
             if multi_toks.get(1) == Some(&single_tok) { "==" } else { "!=" },
         );
+    }
+
+    /// ADR-040 iter-I — the vectorizable `argmax_f32_first_max` must be
+    /// BYTE-IDENTICAL to the original scalar first-max `v > bv` loop on every
+    /// input shape (random, ties, -inf, NaN, empty, single). This is the
+    /// byte-identity gate for replacing the decode-critical-path argmax.
+    #[test]
+    fn argmax_f32_first_max_matches_scalar_ref() {
+        // The exact original scalar reference (pre-iter-I).
+        fn scalar_ref(xs: &[f32]) -> (u32, f32) {
+            let mut bi = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &v) in xs.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            (bi as u32, bv)
+        }
+        let mut cases: Vec<Vec<f32>> = Vec::new();
+        // Deterministic pseudo-random rows of vocab-like length, plus edges.
+        let mut s: u64 = 0x1234_5678_9abc_def0;
+        for len in [0usize, 1, 2, 7, 256, 1024, 262144] {
+            let mut row = Vec::with_capacity(len);
+            for _ in 0..len {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                row.push(((s >> 33) as f32) / (u32::MAX as f32) - 0.5);
+            }
+            cases.push(row);
+        }
+        // Tie cases: first-max must win.
+        cases.push(vec![1.0, 2.0, 2.0, 2.0, 1.0]); // max 2.0 first at idx 1
+        cases.push(vec![5.0, 5.0, 5.0]);           // all equal -> idx 0
+        cases.push(vec![f32::NEG_INFINITY; 4]);    // all -inf -> (0, -inf)
+        cases.push(vec![-1.0, f32::NAN, -2.0, -0.5]); // NaN skipped -> idx 3 (-0.5)
+        cases.push(vec![f32::NAN, f32::NAN]);      // all NaN -> (0, -inf)
+        cases.push(vec![0.0, -0.0, 0.0]);          // +0/-0: 0.0 not > 0.0 -> idx 0
+        for (ci, c) in cases.iter().enumerate() {
+            let r = scalar_ref(c);
+            let g = argmax_f32_first_max(c);
+            assert_eq!(
+                r, g,
+                "argmax mismatch case {ci} (len {}): scalar {r:?} vs fast {g:?}",
+                c.len()
+            );
+        }
     }
 
     /// ADR-040 M2.2 — INFORMATIONAL throughput probe for the `[N,hidden]`
