@@ -1505,7 +1505,13 @@ impl MlxModelWeights {
                     committed.push(old.commit());
                 }
             }
-            // Final chunk waited; same-queue order ⇒ all earlier CBs done. Release.
+            // Final chunk waited; same-queue order ⇒ all earlier CBs done.
+            // §25: fold the async-committed chunks' GPU-busy into the accumulator
+            // (HF2Q_GPU_BUSY) — they bypass commit_and_wait's GPU-time hook, so
+            // without this the profiler undercounts GPU-busy on the pipelined path.
+            for enc in &committed {
+                enc.accumulate_gpu_busy();
+            }
             drop(committed);
         } else {
             for layer_idx in 0..num_layers {
