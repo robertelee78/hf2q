@@ -21064,6 +21064,8 @@ assistant:
         crate::inference::models::gemma4::batched_body::host_phases::reset();
         // ADR-040 §25 barrier-tracking timing reset (HF2Q_BARRIER_NS=1).
         mlx_native::barrier_ns_reset();
+        // ADR-040 §26 rerank profiling reset (HF2Q_RERANK_PROFILE=1).
+        crate::inference::models::gemma4::batched_head::rerank_profile_reset();
         // ADR-040 §0.21 decode-gap profiling: snapshot process-global GPU
         // dispatch + sync counters around the timed decode (HF2Q_DISP_PROFILE=1).
         let disp0 = mlx_native::dispatch_count();
@@ -21203,6 +21205,15 @@ assistant:
                 if bns > 0 {
                     eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step (barrier_between conflict-tracking; HF2Q_BARRIER_NS)",
                         "of which barrier-track", bns as f64 / 1e6 / steps as f64);
+                }
+                // §26: split finalize's cost — rerank F64 dots (Metal-no-F64, stuck
+                // on host) vs the rest (argmax+candidate-scan, GPU-movable F32).
+                let (rr_ns, rr_cand, rr_calls) =
+                    crate::inference::models::gemma4::batched_head::rerank_profile();
+                if rr_calls > 0 {
+                    eprintln!("[HOST_PHASES]   {:<32} {:6.3} ms/step | {:.1} candidates/slot avg ({} calls); HF2Q_RERANK_PROFILE",
+                        "of which rerank-F64-dots", rr_ns as f64 / 1e6 / steps as f64,
+                        rr_cand as f64 / rr_calls as f64, rr_calls);
                 }
             }
         }

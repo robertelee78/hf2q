@@ -32,6 +32,22 @@ use super::model::MlxModelWeights;
 /// the FIRST lm_head_batched call (avoids 1000s of head calls' worth of noise).
 static FIRST_HEAD_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+// ADR-040 §26 — gated rerank profiling (HF2Q_RERANK_PROFILE=1).
+static RERANK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RERANK_CAND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RERANK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RERANK_PROFILE_ON: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("HF2Q_RERANK_PROFILE").as_deref() == Ok("1"));
+/// (total_rerank_ns, total_candidates, calls) since last reset.
+pub fn rerank_profile() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (RERANK_NS.load(Relaxed), RERANK_CAND.load(Relaxed), RERANK_CALLS.load(Relaxed))
+}
+pub fn rerank_profile_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    RERANK_NS.store(0, Relaxed); RERANK_CAND.store(0, Relaxed); RERANK_CALLS.store(0, Relaxed);
+}
+
 /// Output of [`MlxModelWeights::lm_head_batched`]: row-major per-slot logits and
 /// the post-final-norm hidden rows (the exact-F32 rerank operand that
 /// [`MlxModelWeights::finalize_token_from_logits`] needs).
@@ -96,6 +112,11 @@ impl MlxModelWeights {
         candidates.sort_unstable();
         candidates.dedup();
 
+        // ADR-040 §26 — gated profiling (HF2Q_RERANK_PROFILE=1): is finalize's cost
+        // the candidate full-vocab scan (movable to GPU, F32) or the F64 rerank dots
+        // (Metal-no-F64, stuck on host)? Counts candidates + times the rerank loop.
+        let _rr_prof = *RERANK_PROFILE_ON;
+        let _rr_t = if _rr_prof { Some(std::time::Instant::now()) } else { None };
         // Exact F32 rerank via hidden · embed_row. Softcap is monotonic so
         // skipping it doesn't change argmax order. F64 accumulator for precision.
         let mut best_tok: u32 = gpu_top1;
@@ -115,6 +136,11 @@ impl MlxModelWeights {
                 best_logit = l;
                 best_tok = tok;
             }
+        }
+        if let Some(t) = _rr_t {
+            RERANK_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            RERANK_CAND.fetch_add(candidates.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            RERANK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(best_tok)
     }
