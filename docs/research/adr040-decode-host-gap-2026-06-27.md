@@ -129,3 +129,57 @@ So the genuine gap to llama (27.5ms/step) is **~4.4ms/step of real host overhead
 levers are dispatch fusion (encode + GPU launch overhead) and sync fusion — both byte-identity-
 targetable, NO async-pipeline refactor needed, NO runtime/language excuse. Same silicon, fewer
 dispatches + fewer syncs = llama parity.
+
+## CAMPAIGN CLOSURE — iters J→O shipped/refuted, decode at the practical floor (2026-06-28)
+
+Five shipped wins + the refutations that bounded the search. All byte-identical
+(`slot_aware_n8_per_slot_parity_vs_serial` green). **229.5 → 255 t/s; 1.27× → 1.14× vs llama (291).**
+
+| iter | lever | result |
+|------|-------|--------|
+| iter-I | vectorized host argmax+rerank full-vocab scan | +1.1% SHIPPED |
+| iter-J | batch MoE weighted_sum (−210 dispatch/step) | byte-id dispatch reduction SHIPPED |
+| iter-K | default-on intra-step CB pipelining K=4 (encode-overlap) | +2.5–3.1% SHIPPED |
+| iter-L | fuse lm_head into body CB pipeline (one commit_and_wait) | +2.1% SHIPPED |
+| iter-M | GPU-side argmax+candidate-collect (kills ~0.92ms host scan; F64 rerank stays on host) | +4.9% SHIPPED |
+| iter-N | drop 8MB logits readback on greedy path | REFUTED — `decode_tick_finalize` needs full logits for sampling/logprobs; correctness wall |
+| iter-O | asymmetric CB chunking (small chunk-0 → earlier first commit) | REFUTED — see below |
+
+### Post-iter-M budget — GPU-busy now ≈ llama
+`decode_batch` 29.14ms = GPU-busy **27.65** + host **1.49**. Our GPU work (incl MoE) now matches
+llama's entire step (27.48ms). The whole remaining gap is 1.49ms fragmented host: sync wait +
+inter-CB bubbles ~0.6, exposed chunk-0 encode ~0.4, barrier-tracking 0.23, logits readback 0.15,
+GPU-sample readback 0.09.
+
+### iter-O REFUTED (kata: hypothesis→codex→spike→measure→kill)
+Hypothesis: a SMALL first CB chunk lets the GPU begin after fewer encoded layers, shrinking the
+exposed chunk-0 encode (~0.4ms) on the autoregressive critical path; byte-identical (split points
+change only CB boundaries, not kernels/order/compute). codex: APPROVE-WITH-CHANGES — physically
+sound on Metal (commands invisible until `commit()`; smaller chunk-0 → earlier first commit), but
+**bounded upside ~0.1–0.3ms (~1%)**; sweep at FIXED CB count to isolate "earlier first commit"
+from "more boundaries."
+
+Spike (`HF2Q_DECODE_CB_FIRST` knob, K=4 fixed, gemma4-ara Q5_K_M, N=8):
+- Sequential sweep: between-rep variance (~5%, thermal) **dwarfed** any between-config signal; rep1
+  and rep2 ranked the configs in OPPOSITE order → pure noise.
+- Paired interleave (uniform vs first=2): first=2 ≥ uniform 6/6 pairs, mean ~+1% — looked real.
+- **Warmed round-robin (the decider):** thermally-stable round = uniform 253.4 / first1 255.1 /
+  first2 253.1 / first3 255.1 / first4 254.0 — ALL within 1%, indistinguishable. The +1% paired
+  result **did not replicate**. This is the §0.19 trap (never conclude from one noisy batch).
+
+**Verdict: REFUTED.** The exposed chunk-0 encode (~0.25ms) is below the ~1–5% thermal noise floor;
+reshaping CB boundaries does not produce a robust wall improvement. Per codex's own ship criterion
+("ship only if wall improves with unchanged GPU-busy") and the kata KILL criterion, NOT shipped.
+Code reverted; tree clean at iter-M (255 t/s).
+
+### Strategic consequence — the parallel-encode refactor is also closed
+The big remaining structural lever (single-encoder async/parallel-encode, codex-flagged
+`GraphSession` rework) has its ENTIRE payoff in the same exposed-encode (~0.4ms). iter-O just
+empirically proved that ~0.4ms sits below the measurement noise floor and is not recoverable on the
+autoregressive critical path. Therefore the parallel-encode refactor's ceiling is below what we can
+resolve — **not worth the major build.** The remaining 1.49ms host is the irreducible autoregressive
+sync wait plus sub-noise fragments, none individually shippable.
+
+**Decode campaign conclusion:** 255 t/s / 1.14×, full coherence parity, GPU-busy = llama. The
+structural levers are exhausted; further host recovery is below the noise floor. This is the
+practical decode floor for the current architecture on M5 Max.
