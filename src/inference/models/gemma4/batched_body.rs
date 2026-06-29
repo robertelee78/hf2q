@@ -1498,7 +1498,10 @@ impl MlxModelWeights {
             // encoders alive until the final wait.
             let mut committed: Vec<mlx_native::CommandEncoder> = Vec::with_capacity(cb_chunks);
             // §25 iter-L: fused lm_head output buffers (read after the final wait).
-            let mut fused_head: Option<(MlxBuffer, MlxBuffer, MlxBuffer)> = None;
+            let mut fused_head: Option<(
+                MlxBuffer, MlxBuffer, MlxBuffer,
+                Option<super::batched_head::GpuSampleBuffers>,
+            )> = None;
             let per = num_layers.div_ceil(cb_chunks);
             let mut layer_idx = 0usize;
             while layer_idx < num_layers {
@@ -1545,7 +1548,7 @@ impl MlxModelWeights {
 
             // §25 iter-L: fused head — read logits/normed after the single wait and
             // hand them back via head_out; the body returns an empty hidden Vec.
-            if let Some((logits_b, normed_b, _softcap_params_b)) = fused_head {
+            if let Some((logits_b, normed_b, _softcap_params_b, gpu_sample_bufs)) = fused_head {
                 let _hp = std::time::Instant::now();
                 let logits: Vec<f32> = logits_b
                     .as_slice::<f32>()
@@ -1555,11 +1558,29 @@ impl MlxModelWeights {
                     .as_slice::<f32>()
                     .map_err(|e| anyhow::anyhow!("fused lm_head read normed: {e}"))?
                     .to_vec();
+                // §26 iter-M: read back the small GPU-sample buffers (top1 +
+                // threshold candidates), if produced.
+                let gpu_sample = match gpu_sample_bufs {
+                    Some(b) => Some(super::batched_head::GpuSampleOut {
+                        top1_idx: b.top1_idx.as_slice::<u32>()
+                            .map_err(|e| anyhow::anyhow!("gpu_sample read top1_idx: {e}"))?.to_vec(),
+                        top1_val: b.top1_val.as_slice::<f32>()
+                            .map_err(|e| anyhow::anyhow!("gpu_sample read top1_val: {e}"))?.to_vec(),
+                        cand_count: b.cand_count.as_slice::<u32>()
+                            .map_err(|e| anyhow::anyhow!("gpu_sample read cand_count: {e}"))?.to_vec(),
+                        overflow: b.overflow.as_slice::<u32>()
+                            .map_err(|e| anyhow::anyhow!("gpu_sample read overflow: {e}"))?.to_vec(),
+                        cand_ids: b.cand_ids.as_slice::<u32>()
+                            .map_err(|e| anyhow::anyhow!("gpu_sample read cand_ids: {e}"))?.to_vec(),
+                        cap: b.cap,
+                    }),
+                    None => None,
+                };
                 host_phases::add(
                     host_phases::Phase::LmheadReadback,
                     _hp.elapsed().as_nanos() as u64,
                 );
-                *head_out = Some(BatchedHeadOut { logits, normed });
+                *head_out = Some(BatchedHeadOut { logits, normed, gpu_sample });
                 return Ok(Vec::new());
             }
         } else {

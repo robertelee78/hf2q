@@ -6940,10 +6940,26 @@ fn decode_batch_gemma4(
         // top1 VALUE (== CPU max) is bit-identical, so a CPU argmax reproduces
         // the scalar head's greedy token exactly.
         let _hp_am = std::time::Instant::now();
-        let (top1_idx, top1_val) = argmax_f32(logits_row);
-        let greedy_token = match guard.model.weights.finalize_token_from_logits(
-            logits_row, normed_row, top1_idx, top1_val,
-        ) {
+        // ADR-040 §26 iter-M: use GPU-side argmax+candidate set (drops the ~0.92ms
+        // host full-vocab scan) when available + not overflowed; the cheap F64
+        // rerank still runs on host. BYTE-IDENTICAL: GPU candidate set == host
+        // threshold scan, both feed the same rerank tail. Host fallback on
+        // overflow (rare) or HF2Q_GPU_SAMPLE off.
+        let gpu_s = head.gpu_sample.as_ref().filter(|gs| {
+            gs.overflow[i] == 0 && (gs.cand_count[i] as usize) <= gs.cap
+        });
+        let top1_val: f32;
+        let greedy_result = if let Some(gs) = gpu_s {
+            top1_val = gs.top1_val[i];
+            let cnt = (gs.cand_count[i] as usize).min(gs.cap);
+            let cands = &gs.cand_ids[i * gs.cap..i * gs.cap + cnt];
+            guard.model.weights.finalize_token_from_gpu_candidates(cands, normed_row, gs.top1_idx[i])
+        } else {
+            let (ti, tv) = argmax_f32(logits_row);
+            top1_val = tv;
+            guard.model.weights.finalize_token_from_logits(logits_row, normed_row, ti, tv)
+        };
+        let greedy_token = match greedy_result {
             Ok(t) => t,
             Err(e) => {
                 reset_gemma4_slot(guard, handle.slot_id);
