@@ -6094,6 +6094,20 @@ Per the §6.1.55 deferral table (revised in this section) — nothing changes st
 
 ---
 
+## 7.LCP — Long-context prefill GPU fault: int32 dst-offset overflow (2026-06-30, RESOLVED)
+
+**Milestone.** N=8 long-context serving (the real repo-to-cve workload: gemma-4-ara at concurrency 8, ~32k/slot) hard-faulted the GPU above ~13k context. Root-caused and fixed under the kata (hypothesis → codex → spike → measure → ship, gated on byte-parity).
+
+**Discovery arc (what it was NOT).** A K-quant initiative (wire full-TQ K+V into the N=8 batched path) was probed and **killed** (NO-GO): decode regressed 132 vs 192 t/s because no *batched* `flash_attn_vec_tq_hb` kernel exists (per-slot loop = ~32 dispatch/layer vs hybrid ~3), and its memory win lands on the fixed ~5GB decode KV scaffold, not the long-context driver. Realistic re-bench then settled the scoreboard: hf2q-hybrid = **159 t/s @8k×8 vs llama 178 (0.89×)** — competitive, not winning. But the verify surfaced the real blocker: hf2q **faults at 16k×8**, which we had mis-filed as "OOM" (the F16-shadow test-probe blowup masked it). Two false root causes were **refuted by measurement** before any fix: (a) not a memory/working-set limit (114GB free at fault); (b) not a "GPU watchdog timeout"; (c) **not** a Metal threadgroup over-allocation — the `flash_attn_prefill_f16_d256` "58368 B > 32768" assertion was a **Metal shader-validation-layer artifact** (real `staticThreadgroupMemoryLength` = 29184 B; validation doubles it). Logic that killed (c): the threadgroup alloc is tile-sized / context-independent, so it cannot explain a context-dependent threshold.
+
+**Root cause.** The NO-FA global-layer QK^T matmul `hf2q_dense_mm_bf16_f32_tensor` (V1/default, `mlx-native/src/shaders/dense_mm_bf16_tensor.metal`) computed its **destination** element offset in **signed int32**: `r0 + r1*ne0 + im*ne1*ne0` (`:245`, `:259`). It writes `pf_kq[nh=16, seq, seq]`; the per-head plane term `im*seq²` overflows 2³¹ once seq>~12.8k (im=13, seq=13312 → 2.30e9 > 2.147e9) → negative-wrapped pointer → wild OOB GPU write. This corrupts output at N=1 (first-token argmax→0) and triggers a hard GPU command-buffer fault/reset at N≥3 (the wild write lands on a concurrent slot's live page; the observed `InnocentVictim`/`SubmissionsIgnored` codes are reset collateral, not the originator). Confirmed by a zero-build spike: `HF2Q_GLOBAL_FA=1` (which bypasses this kernel via the O(seq) FA path) makes N=8 @16k pass clean. Src-side offsets already used u64; V2 kernel (`:415`) was already correct.
+
+**Fix** (mlx-native `8b16039`, codex-reviewed): widen the V1 dst offset to `uint64_t`, promoting each factor *before* the multiply (mirroring the src u64 strides and V2). Pure address arithmetic; byte-identical for all in-range cases. **Validated** (guarded, validation OFF, APEX Q5_K_M): `slot_aware_n8_per_slot_parity_vs_serial` byte-identical; 16k×8 ×3 → 3/3 clean (was 3/3 fault); N=1@16k first token real (was corruption); 2k×8 no regression.
+
+**Next wall (separate milestone).** The NO-FA path's `pf_kq[nh,seq,seq]` is **O(seq²) F32** (~17GB@16k; guard-kills 16k→20k at N=8) → 32k/slot is not reachable on this path for memory reasons (not a fault — the GPU is now healthy there). To reach the full target, route global D=512 long-context layers through the **O(seq) FA path** (whose §0.19 determinism caveat is a non-issue for the single-process deployment).
+
+---
+
 ## 8. References
 
 ### vLLM
