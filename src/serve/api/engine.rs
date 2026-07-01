@@ -21033,7 +21033,9 @@ assistant:
             dwq_overlay_path: None,
             kv_persist_dir: None,
         };
-        const BENCH_TOKENS: usize = 128;
+        // HF2Q_BENCH_TOKENS = decode length per stream (default 128).
+        let bench_tokens: usize = std::env::var("HF2Q_BENCH_TOKENS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(128);
         // HF2Q_BENCH_N = number of concurrent streams (default 4, max 8) — lets
         // us measure single-stream (N=1) vs batched scaling. For N>4 set
         // HF2Q_SPEC_DECODE_MAX_BATCHED_SLOTS=N to clear the A4 threshold gate.
@@ -21044,10 +21046,22 @@ assistant:
             .clamp(1, 8);
         let base = [vec![1u32, 2, 3], vec![4, 5, 6, 7], vec![8, 9], vec![10, 11, 12, 13, 14],
                     vec![15, 16, 17], vec![18, 19, 20, 21], vec![22, 23], vec![24, 25, 26, 27, 28]];
-        let prompts: Vec<Vec<u32>> = (0..n_streams).map(|i| base[i].clone()).collect();
+        // HF2Q_BENCH_PROMPT_LEN: pad each stream's prompt to N tokens (long-context
+        // throughput at realistic 8k/32k-per-slot). Distinct per-stream token band
+        // (well within gemma's 262k vocab) so prompts stay non-degenerate.
+        let bench_prompt_len: usize = std::env::var("HF2Q_BENCH_PROMPT_LEN")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let prompts: Vec<Vec<u32>> = (0..n_streams).map(|i| {
+            if bench_prompt_len > 0 {
+                let band = 1000u32 + (i as u32) * 30000u32;
+                (0..bench_prompt_len).map(|t| band + (t as u32 % 25000)).collect()
+            } else {
+                base[i].clone()
+            }
+        }).collect();
         let params = SamplingParams {
             temperature: 0.0,
-            max_tokens: BENCH_TOKENS,
+            max_tokens: bench_tokens,
             ..Default::default()
         };
         let batched_on = std::env::var("HF2Q_BATCHED_BODY").as_deref() == Ok("1");
@@ -21073,6 +21087,69 @@ assistant:
             prompts[0].clone(),
             SamplingParams { temperature: 0.0, max_tokens: 8, ..Default::default() },
         ));
+        // ADR-040 §7.S019 determinism-ladder instrument (documented protocol).
+        // HF2Q_BENCH_REPEAT=R → run R back-to-back single-process rounds,
+        // print a per-run per-stream output fingerprint, then return early
+        // (skips the throughput section). Single-process on purpose: process
+        // relaunch reloads the ~20GB model per sample AND the readback drain
+        // masks the very races this ladder exists to expose (§7.S019).
+        // Default = sequential streams (isolates per-stream determinism);
+        // HF2Q_BENCH_CONC=1 → each round runs all HF2Q_BENCH_N streams
+        // CONCURRENTLY through the live admission path (slot-aware batched
+        // prefill + batched decode) — the N>1 concurrency ladder.
+        // HF2Q_BENCH_SETTLE_MS=T → sleep T ms between rounds.
+        if let Ok(rv) = std::env::var("HF2Q_BENCH_REPEAT") {
+            let repeat: usize = rv.parse().unwrap_or(1);
+            let settle_ms: u64 = std::env::var("HF2Q_BENCH_SETTLE_MS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let concurrent = std::env::var("HF2Q_BENCH_CONC").as_deref() == Ok("1");
+            let fnv1a64 = |text: &str| -> u64 {
+                let mut h: u64 = 0xcbf29ce484222325;
+                for b in text.as_bytes() {
+                    h ^= *b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                h
+            };
+            for run in 0..repeat {
+                if concurrent {
+                    let results: Vec<GenerationResult> = rt.block_on(async {
+                        let mut handles = Vec::new();
+                        for p in prompts.iter().cloned() {
+                            let eng = engine.clone();
+                            let pr = params.clone();
+                            handles.push(tokio::spawn(async move {
+                                eng.generate(p, pr).await.expect("generate")
+                            }));
+                        }
+                        let mut out = Vec::new();
+                        for h in handles {
+                            out.push(h.await.expect("join"));
+                        }
+                        out
+                    });
+                    for (si, r) in results.iter().enumerate() {
+                        eprintln!(
+                            "[REPEAT_FPRINT] run={run} stream={si} conc=1 comp_tokens={} text_bytes={} fnv1a64={:016x}",
+                            r.completion_tokens, r.text.len(), fnv1a64(&r.text),
+                        );
+                    }
+                } else {
+                    for (si, p) in prompts.iter().cloned().enumerate() {
+                        let r = rt.block_on(engine.clone().generate(p, params.clone()))
+                            .expect("generate");
+                        eprintln!(
+                            "[REPEAT_FPRINT] run={run} stream={si} conc=0 comp_tokens={} text_bytes={} fnv1a64={:016x} text={:?}",
+                            r.completion_tokens, r.text.len(), fnv1a64(&r.text), r.text,
+                        );
+                    }
+                }
+                if settle_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(settle_ms));
+                }
+            }
+            return;
+        }
         // ADR-040 iter-G: reset the per-category GPU-busy buckets AFTER warm-up
         // (HF2Q_DECODE_CATSPLIT=1) so the table reflects only the timed decode.
         crate::inference::models::gemma4::batched_body::catsplit::reset();
@@ -21104,6 +21181,24 @@ assistant:
             out
         });
         let elapsed = t0.elapsed();
+        // ADR-040 §7.S019: per-stream output fingerprint for the timed round
+        // (HF2Q_DUMP_FPRINT=1) — completion token count + FNV-1a-64 hash of
+        // the decoded text (a 1:1 function of the output token-id sequence
+        // for a fixed tokenizer). Lets us count DISTINCT output sequences
+        // across runs.
+        if std::env::var("HF2Q_DUMP_FPRINT").is_ok() {
+            for (i, r) in results.iter().enumerate() {
+                let mut h: u64 = 0xcbf29ce484222325;
+                for b in r.text.as_bytes() {
+                    h ^= *b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                eprintln!(
+                    "[FPRINT] stream={i} comp_tokens={} text_bytes={} fnv1a64={:016x}",
+                    r.completion_tokens, r.text.len(), h,
+                );
+            }
+        }
         let total_tokens: usize = results.iter().map(|r| r.completion_tokens).sum();
         let tok_s = total_tokens as f64 / elapsed.as_secs_f64();
         eprintln!(

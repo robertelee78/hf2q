@@ -1057,6 +1057,8 @@ All four Phase iter-1 scaffolding tracks landed in parallel under goal-mode dire
 
 **Validated** (gemma4-ara APEX Q5_K_M, guarded, single process, greedy): 8k 10–12/20 (16/16 @128tok) → **1/20 (1/30 @128tok×30)**; first decode token `108` (wrong) → `4427` = the value the independent `mv_id` reference produces ⇒ it was **also a correctness bug**, now correct; 6k/16k deterministic; no GPU faults; `slot_aware_n8` + `n4` `per_slot_parity_vs_serial` byte-identity gates **GREEN**.
 
+**Instrument (committed 2026-07-01).** The determinism-ladder probe this milestone used now lives permanently in `slot_aware_n4_batched_body_throughput_probe` (`engine.rs`), all env-gated with zero default-path impact: `HF2Q_BENCH_REPEAT=R` (R single-process rounds, per-round FNV-1a-64 output fingerprint, early-return), `HF2Q_BENCH_CONC=1` (each round runs `HF2Q_BENCH_N` streams concurrently through the live admission path — the N>1 concurrency ladder), `HF2Q_BENCH_TOKENS`/`HF2Q_BENCH_PROMPT_LEN` (decode length / synthetic long-prompt padding for realistic-context ladders), `HF2Q_DUMP_FPRINT=1` (per-stream fingerprints on the timed throughput round), `HF2Q_BENCH_SETTLE_MS` (inter-round settle). The full-TQ K-quant probe wiring from the killed §7.LCP K-quant initiative (`HF2Q_BATCHED_FULL_TQ`) was NOT committed — reverted per the NO-GO; its numbers are preserved in §7.LCP.
+
 ---
 ## 8. References
 
