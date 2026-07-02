@@ -95,20 +95,24 @@ pub struct LinearAttnStateSlot {
     ///
     /// Layout matches the ssm_conv kernel's expected `state[i, c, s]` at offset
     /// `s * (K-1) * channels + c * (K-1) + i`, i.e. channels-major with K-1 stride 1.
-    /// Ping-pong semantics: `conv_state` is the active (read) buffer.
-    /// `conv_state_scratch` is the inactive (write) buffer.  After each decode
-    /// step the caller swaps via [`LinearAttnStateSlot::swap_conv_state`].
+    /// Ping-pong semantics (ADR-040 M-QWEN, PER-SLOT): which physical
+    /// buffer is "current" vs "scratch" for a given slot is decided by
+    /// that slot's [`Self::pp_flipped`] parity — read via
+    /// [`LinearAttnStateSlot::conv_bufs_for_slot`], flip after a slot's
+    /// step via [`LinearAttnStateSlot::swap_for_slot`]. Never assume this
+    /// named field is current for any particular slot.
     pub conv_state: MlxBuffer,
     /// DeltaNet conv1d ring buffer (scratch, write target for ssm_conv kernel).
     /// Same shape as `conv_state`.  Swapped after each decode step.
     pub conv_state_scratch: MlxBuffer,
     /// DeltaNet recurrent state (current): `[D_k, D_v, num_v_heads, n_seqs]` f32.
     ///
-    /// Ping-pong semantics: `recurrent` is the active (read) state buffer.
-    /// `recurrent_scratch` is the inactive (write) buffer.  After each
-    /// decode step the caller swaps the two handles via
-    /// [`LinearAttnStateSlot::swap_recurrent`], turning last step's output
-    /// into this step's input — zero copies, zero allocations.
+    /// Ping-pong semantics (ADR-040 M-QWEN, PER-SLOT): current/scratch
+    /// roles per slot are decided by [`Self::pp_flipped`] — read via
+    /// [`LinearAttnStateSlot::recurrent_bufs_for_slot`], flip via
+    /// [`LinearAttnStateSlot::swap_for_slot`] (zero copies, zero
+    /// allocations, and — unlike the pre-M-QWEN whole-buffer swap —
+    /// zero effect on other slots).
     pub recurrent: MlxBuffer,
     /// DeltaNet recurrent state (scratch, write target for GDN kernel).
     /// Same shape as `recurrent`.  Swapped with `recurrent` each decode step.
@@ -132,7 +136,8 @@ pub struct LinearAttnStateSlot {
     /// `dispatch_gated_delta_net_decode_with_capture`, which writes
     /// per-position state into `capture_states` each token. On partial-
     /// reject of K drafts, the runner copies
-    /// `capture_states[..., accepted_idx, ...]` → `recurrent` via
+    /// `capture_states[..., accepted_idx, ...]` → the slot's CURRENT
+    /// recurrent buffer (parity-aware, ADR-040 M-QWEN) via
     /// [`HybridKvCache::rollback_la_to`].
     ///
     /// Memory cost (Qwen 3.5/3.6 D_k=D_v=128, n_v_heads=8, n_seqs=1,
@@ -156,8 +161,9 @@ pub struct LinearAttnStateSlot {
     /// called. The K=N spec runner routes `build_delta_net_layer`
     /// through the capture variant, which writes per-position conv state.
     /// On partial-reject of K drafts, the runner copies
-    /// `conv_capture_states[..., accepted_idx, ...]` → `conv_state`
-    /// (active) via [`HybridKvCache::rollback_la_to`] — paired with the
+    /// `conv_capture_states[..., accepted_idx, ...]` → the slot's CURRENT
+    /// conv buffer (parity-aware, ADR-040 M-QWEN) via
+    /// [`HybridKvCache::rollback_la_to`] — paired with the
     /// recurrent capture rollback to fully restore DeltaNet state.
     ///
     /// Memory cost (Qwen 3.5/3.6 conv_channels=8192, K-1=3, n_seqs=1,
