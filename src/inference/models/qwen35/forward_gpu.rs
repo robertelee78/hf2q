@@ -3595,12 +3595,12 @@ impl Qwen35Model {
                         &MlxBuffer,
                     ) = if linear_slot_idx != usize::MAX {
                         let slot = &kv_cache.linear_attn[linear_slot_idx];
-                        (
-                            &slot.conv_state,
-                            &slot.conv_state_scratch,
-                            &slot.recurrent,
-                            &slot.recurrent_scratch,
-                        )
+                        // ADR-040 M-QWEN: parity-aware per-slot (current,
+                        // scratch) selection — the named fields are NOT
+                        // necessarily "current" for this slot.
+                        let (conv_cur, conv_scr) = slot.conv_bufs_for_slot(slot_id);
+                        let (rec_cur, rec_scr) = slot.recurrent_bufs_for_slot(slot_id);
+                        (conv_cur, conv_scr, rec_cur, rec_scr)
                     } else {
                         // Fallback: allocate throwaway scratch buffers.
                         let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
@@ -3715,8 +3715,11 @@ impl Qwen35Model {
                     // --- Swap conv + recurrent ping-pong (O(1) pointer swap, zero copy) ---
                     if linear_slot_idx != usize::MAX {
                         let slot = &mut kv_cache.linear_attn[linear_slot_idx];
-                        slot.swap_conv_state();
-                        slot.swap_recurrent();
+                        // ADR-040 M-QWEN: per-slot parity flip (was a whole-buffer swap
+
+                        // that corrupted every OTHER active slot at N>=2 concurrent).
+
+                        slot.swap_for_slot(slot_id);
                     }
 
                     out
@@ -5357,12 +5360,13 @@ impl Qwen35Model {
                             &MlxBuffer,
                         ) = if linear_slot_idx != usize::MAX {
                             let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            (
-                                &slot.conv_state,
-                                &slot.conv_state_scratch,
-                                &slot.recurrent,
-                                &slot.recurrent_scratch,
-                            )
+                            // ADR-040 M-QWEN: parity-aware per-slot
+                            // (current, scratch) selection — the named
+                            // fields are NOT necessarily "current" for
+                            // this slot.
+                            let (conv_cur, conv_scr) = slot.conv_bufs_for_slot(slot_id);
+                            let (rec_cur, rec_scr) = slot.recurrent_bufs_for_slot(slot_id);
+                            (conv_cur, conv_scr, rec_cur, rec_scr)
                         } else {
                             let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
                             let zero_rec_cpu = vec![0.0f32; rec_size];
@@ -5415,8 +5419,11 @@ impl Qwen35Model {
 
                         if linear_slot_idx != usize::MAX {
                             let slot = &mut kv_cache.linear_attn[linear_slot_idx];
-                            slot.swap_conv_state();
-                            slot.swap_recurrent();
+                            // ADR-040 M-QWEN: per-slot parity flip (was a whole-buffer swap
+
+                            // that corrupted every OTHER active slot at N>=2 concurrent).
+
+                            slot.swap_for_slot(slot_id);
                         }
                         out
                     }
@@ -5688,12 +5695,13 @@ impl Qwen35Model {
                             &MlxBuffer,
                         ) = if linear_slot_idx != usize::MAX {
                             let slot = &kv_cache.linear_attn[linear_slot_idx];
-                            (
-                                &slot.conv_state,
-                                &slot.conv_state_scratch,
-                                &slot.recurrent,
-                                &slot.recurrent_scratch,
-                            )
+                            // ADR-040 M-QWEN: parity-aware per-slot
+                            // (current, scratch) selection — the named
+                            // fields are NOT necessarily "current" for
+                            // this slot.
+                            let (conv_cur, conv_scr) = slot.conv_bufs_for_slot(slot_id);
+                            let (rec_cur, rec_scr) = slot.recurrent_bufs_for_slot(slot_id);
+                            (conv_cur, conv_scr, rec_cur, rec_scr)
                         } else {
                             let zero_conv_cpu = vec![0.0f32; km1 * qkv_channels];
                             let zero_rec_cpu = vec![0.0f32; rec_size];
@@ -5755,8 +5763,11 @@ impl Qwen35Model {
 
                         if linear_slot_idx != usize::MAX {
                             let slot = &mut kv_cache.linear_attn[linear_slot_idx];
-                            slot.swap_conv_state();
-                            slot.swap_recurrent();
+                            // ADR-040 M-QWEN: per-slot parity flip (was a whole-buffer swap
+
+                            // that corrupted every OTHER active slot at N>=2 concurrent).
+
+                            slot.swap_for_slot(slot_id);
                         }
                         out
                     }

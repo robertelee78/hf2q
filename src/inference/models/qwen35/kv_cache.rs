@@ -164,6 +164,25 @@ pub struct LinearAttnStateSlot {
     /// n_tokens_max=4): 384 KB per LA layer. ~12 MB total per forward
     /// across 30+ LA layers.
     pub conv_capture_states: Option<MlxBuffer>,
+    /// ADR-040 M-QWEN (2026-07-01) — PER-SLOT ping-pong parity.
+    ///
+    /// `pp_flipped[slot] == false` ⇒ that slot's CURRENT state lives in the
+    /// `conv_state`/`recurrent` fields and its WRITE target is the
+    /// `*_scratch` fields; `true` ⇒ roles reversed. One bit per slot
+    /// because conv + recurrent always swap together (all swap sites).
+    ///
+    /// WHY: the buffers hold ALL `n_seqs` slots' state (`[.., n_seqs]`),
+    /// but a decode tick writes only the ticking slot's region — the old
+    /// whole-buffer `std::mem::swap` after one slot's tick flipped the
+    /// read/write roles under every OTHER active slot, so their next tick
+    /// read stale state. Invisible at N=1 (serial + engine-N=1 pins byte-
+    /// exact); corrupted output at N≥2 concurrent (M-QWEN N=8 gate,
+    /// 2026-07-01). Access the buffers via
+    /// [`LinearAttnStateSlot::conv_bufs_for_slot`] /
+    /// [`LinearAttnStateSlot::recurrent_bufs_for_slot`] and swap via
+    /// [`LinearAttnStateSlot::swap_for_slot`]; never assume the named
+    /// field is "current" for a given slot.
+    pub pp_flipped: Vec<bool>,
 }
 
 impl FullAttnKvSlot {
@@ -665,20 +684,67 @@ pub struct Qwen35TqSdpaParams {
 }
 
 impl LinearAttnStateSlot {
-    /// Swap the active and scratch conv state buffers (O(1) pointer swap).
-    /// Call this after every decode step to make the just-written scratch the
-    /// new current conv state.
+    /// ADR-040 M-QWEN — (current, scratch) conv-state buffers FOR ONE SLOT,
+    /// honoring that slot's ping-pong parity. "current" is the read buffer
+    /// for the slot's next forward; "scratch" is its write target. Callers
+    /// narrow to the slot region downstream (`narrow_la_ping_pong_to_slot`);
+    /// the parity only decides which physical buffer plays which role for
+    /// THIS slot.
     #[inline]
-    pub fn swap_conv_state(&mut self) {
-        std::mem::swap(&mut self.conv_state, &mut self.conv_state_scratch);
+    pub fn conv_bufs_for_slot(&self, slot: crate::serve::scheduler::SlotId) -> (&MlxBuffer, &MlxBuffer) {
+        if self.pp_flipped[slot.0 as usize] {
+            (&self.conv_state_scratch, &self.conv_state)
+        } else {
+            (&self.conv_state, &self.conv_state_scratch)
+        }
     }
 
-    /// Swap the active and scratch recurrent state buffers (O(1) pointer swap).
-    /// Call this after every decode step to make the just-written scratch the
-    /// new current state.
+    /// ADR-040 M-QWEN — (current, scratch) recurrent-state buffers for one
+    /// slot, honoring that slot's ping-pong parity (see
+    /// [`Self::conv_bufs_for_slot`]).
     #[inline]
-    pub fn swap_recurrent(&mut self) {
-        std::mem::swap(&mut self.recurrent, &mut self.recurrent_scratch);
+    pub fn recurrent_bufs_for_slot(&self, slot: crate::serve::scheduler::SlotId) -> (&MlxBuffer, &MlxBuffer) {
+        if self.pp_flipped[slot.0 as usize] {
+            (&self.recurrent_scratch, &self.recurrent)
+        } else {
+            (&self.recurrent, &self.recurrent_scratch)
+        }
+    }
+
+    /// ADR-040 M-QWEN — mutable CURRENT conv-state buffer for one slot
+    /// (parity-aware). For writers that must land in the slot's live
+    /// state (e.g. spec-decode rollback), never the named field directly.
+    #[inline]
+    pub fn conv_current_mut(&mut self, slot: crate::serve::scheduler::SlotId) -> &mut MlxBuffer {
+        if self.pp_flipped[slot.0 as usize] {
+            &mut self.conv_state_scratch
+        } else {
+            &mut self.conv_state
+        }
+    }
+
+    /// ADR-040 M-QWEN — mutable CURRENT recurrent-state buffer for one
+    /// slot (parity-aware). See [`Self::conv_current_mut`].
+    #[inline]
+    pub fn recurrent_current_mut(&mut self, slot: crate::serve::scheduler::SlotId) -> &mut MlxBuffer {
+        if self.pp_flipped[slot.0 as usize] {
+            &mut self.recurrent_scratch
+        } else {
+            &mut self.recurrent
+        }
+    }
+
+    /// ADR-040 M-QWEN — flip ONE slot's ping-pong parity after its decode/
+    /// prefill step wrote new state into that slot's scratch. O(1) bit
+    /// flip; the physical buffers never move, so other slots' read/write
+    /// roles are untouched (the whole-buffer `std::mem::swap` this
+    /// replaces corrupted every other active slot at N≥2 concurrent —
+    /// M-QWEN root cause, 2026-07-01). Covers BOTH conv and recurrent
+    /// (they always swap together).
+    #[inline]
+    pub fn swap_for_slot(&mut self, slot: crate::serve::scheduler::SlotId) {
+        let i = slot.0 as usize;
+        self.pp_flipped[i] = !self.pp_flipped[i];
     }
 }
 
@@ -1324,6 +1390,10 @@ impl HybridKvCache {
                     *v = 0.0;
                 }
             }
+            // ADR-040 M-QWEN: all buffers zeroed -> parity canonical.
+            for f in slot.pp_flipped.iter_mut() {
+                *f = false;
+            }
         }
     }
 
@@ -1792,7 +1862,9 @@ impl HybridKvCache {
             // before taking &mut on recurrent.
             let src_owned: Vec<f32> =
                 capture_slice[src_offset..src_end].to_vec();
-            let dst = slot_data.recurrent.as_mut_slice::<f32>().map_err(|e| {
+            // ADR-040 M-QWEN: rollback must land in the slot's CURRENT
+            // recurrent buffer (parity-aware), not the named field.
+            let dst = slot_data.recurrent_current_mut(slot).as_mut_slice::<f32>().map_err(|e| {
                 anyhow!(
                     "rollback_la_to: linear_attn[{}].recurrent as_mut_slice: {e}",
                     i
@@ -1908,7 +1980,8 @@ impl HybridKvCache {
                     i, channels, k_minus1, channels * k_minus1, conv_per_t
                 ));
             }
-            let conv_dst = slot_data.conv_state.as_mut_slice::<f32>().map_err(|e| {
+            // ADR-040 M-QWEN: parity-aware CURRENT conv buffer (see above).
+            let conv_dst = slot_data.conv_current_mut(slot).as_mut_slice::<f32>().map_err(|e| {
                 anyhow!(
                     "rollback_la_to: linear_attn[{}].conv_state as_mut_slice: {e}", i
                 )
@@ -2119,6 +2192,9 @@ impl HybridKvCache {
                     *v = 0.0;
                 }
             }
+            // ADR-040 M-QWEN: both ping-pong buffers are zeroed for this
+            // slot → parity back to canonical (named fields = current).
+            la.pp_flipped[slot_idx] = false;
         }
         Ok(())
     }
@@ -2156,6 +2232,10 @@ impl HybridKvCache {
                 for v in s.iter_mut() {
                     *v = 0.0;
                 }
+            }
+            // ADR-040 M-QWEN: all buffers zeroed -> parity canonical.
+            for f in slot.pp_flipped.iter_mut() {
+                *f = false;
             }
         }
     }
@@ -2282,13 +2362,57 @@ impl HybridKvCache {
         };
         let mut linear_conv = Vec::with_capacity(self.linear_attn.len());
         let mut linear_recurrent = Vec::with_capacity(self.linear_attn.len());
+        // ADR-040 M-QWEN: snapshots are PARITY-CANONICAL — each slot's
+        // region is taken from whichever physical buffer is CURRENT for
+        // that slot (per-slot ping-pong parity), assembled into one
+        // canonical buffer. Keeps the on-disk/codec format unchanged
+        // (restore_from writes named fields + resets parity to false).
+        // Both layouts are slot-major (slot region = total/n_seqs,
+        // offset slot*per_seq — same math as rollback_la_to).
+        let canonicalize = |named: &MlxBuffer,
+                            scratch: &MlxBuffer,
+                            pp: &[bool],
+                            what: &str|
+         -> Result<MlxBuffer> {
+            let mut out = deep_copy_buffer(device, named)
+                .with_context(|| format!("snapshot {what}"))?;
+            if pp.iter().any(|&f| f) {
+                let s = scratch
+                    .as_slice::<f32>()
+                    .with_context(|| format!("snapshot {what} scratch as_slice"))?;
+                let d = out
+                    .as_mut_slice::<f32>()
+                    .with_context(|| format!("snapshot {what} out as_mut_slice"))?;
+                let n = pp.len();
+                anyhow::ensure!(
+                    n > 0 && d.len() % n == 0,
+                    "snapshot {what}: elements {} not divisible by n_seqs {}",
+                    d.len(),
+                    n
+                );
+                let per = d.len() / n;
+                for (i, &flipped) in pp.iter().enumerate() {
+                    if flipped {
+                        d[i * per..(i + 1) * per]
+                            .copy_from_slice(&s[i * per..(i + 1) * per]);
+                    }
+                }
+            }
+            Ok(out)
+        };
         for slot in &self.linear_attn {
-            linear_conv.push(
-                deep_copy_buffer(device, &slot.conv_state).context("snapshot conv_state")?,
-            );
-            linear_recurrent.push(
-                deep_copy_buffer(device, &slot.recurrent).context("snapshot recurrent")?,
-            );
+            linear_conv.push(canonicalize(
+                &slot.conv_state,
+                &slot.conv_state_scratch,
+                &slot.pp_flipped,
+                "conv_state",
+            )?);
+            linear_recurrent.push(canonicalize(
+                &slot.recurrent,
+                &slot.recurrent_scratch,
+                &slot.pp_flipped,
+                "recurrent",
+            )?);
         }
         Ok(HybridKvCacheSnapshot {
             full_attn_k,
@@ -2423,6 +2547,12 @@ impl HybridKvCache {
         {
             copy_buffer_bytes(conv_snap, &mut slot.conv_state).context("restore conv_state")?;
             copy_buffer_bytes(rec_snap, &mut slot.recurrent).context("restore recurrent")?;
+            // ADR-040 M-QWEN: snapshots are parity-canonical (current
+            // state assembled into the named fields), so restoring makes
+            // the named fields current for EVERY slot.
+            for f in slot.pp_flipped.iter_mut() {
+                *f = false;
+            }
         }
         Ok(())
     }
@@ -2548,6 +2678,11 @@ impl HybridKvCache {
                 .context("restore_partial conv_state")?;
             copy_buffer_bytes(rec_snap, &mut slot.recurrent)
                 .context("restore_partial recurrent")?;
+            // ADR-040 M-QWEN: snapshot is parity-canonical → named fields
+            // become current for every slot after restore.
+            for f in slot.pp_flipped.iter_mut() {
+                *f = false;
+            }
         }
         Ok(())
     }
@@ -2733,6 +2868,9 @@ fn alloc_linear_attn_slot(
         // Both lazy-allocate via `HybridKvCache::ensure_la_capture`.
         capture_states: None,
         conv_capture_states: None,
+        // ADR-040 M-QWEN — per-slot ping-pong parity, all canonical
+        // (false = named fields are current) at alloc.
+        pp_flipped: vec![false; n_seqs as usize],
     })
 }
 
@@ -3419,6 +3557,10 @@ impl crate::serve::multi_seq_kv::MultiSeqKvCache for HybridKvCache {
                         }
                     })?;
             }
+            // ADR-040 M-QWEN: BOTH physical buffers' src regions were
+            // copied to dst, so dst's (current, scratch) roles must match
+            // src's — carry the ping-pong parity across the fork.
+            slot.pp_flipped[dst_idx] = slot.pp_flipped[src_idx];
         }
 
         Ok(())
@@ -9018,5 +9160,151 @@ mod tests {
         cache.fork_seq(SlotId(2), SlotId(2))
             .expect("H166: same-slot fork must be a successful no-op");
         assert_eq!(cache.seq_len(SlotId(2)).unwrap(), 7, "H166: same-slot fork preserves cursor");
+    }
+
+    /// ADR-040 M-QWEN (2026-07-01) — per-slot ping-pong parity semantics.
+    ///
+    /// The N≥2 concurrent divergence root cause was the whole-buffer
+    /// `std::mem::swap` of `LinearAttnStateSlot` conv/recurrent ping-pong
+    /// buffers: one slot's post-tick swap flipped read/write roles under
+    /// every OTHER active slot. This pins the replacement semantics:
+    /// (1) `swap_for_slot` flips ONE slot's roles and leaves the others'
+    ///     current-state reads untouched;
+    /// (2) `snapshot()` is parity-canonical (each slot's region taken from
+    ///     its CURRENT buffer);
+    /// (3) `fork_seq` carries parity src→dst so dst-current == src-current;
+    /// (4) `reset_for_slot` returns the slot to canonical parity;
+    /// (5) `rollback_la_to` under flipped parity lands in the slot's
+    ///     CURRENT (scratch-named) buffer.
+    #[test]
+    fn la_ping_pong_per_slot_parity_semantics_2026_07_01() {
+        let Ok(device) = MlxDevice::new() else {
+            eprintln!("[skip] la_ping_pong_per_slot_parity_semantics — no Metal device");
+            return;
+        };
+        let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        let n_seqs = 4u32;
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, n_seqs).expect("alloc n_seqs=4");
+        assert!(!cache.linear_attn.is_empty(), "cfg must have linear layers");
+
+        // Sentinel-fill layer 0's four buffers: current-slot-region s = 100+s,
+        // scratch-slot-region s = 200+s (conv), 300+s / 400+s (recurrent).
+        {
+            let la = &mut cache.linear_attn[0];
+            let n = n_seqs as usize;
+            let fill = |buf: &mut MlxBuffer, base: f32| {
+                let s = buf.as_mut_slice::<f32>().expect("as_mut_slice");
+                let per = s.len() / n;
+                for i in 0..n {
+                    for v in &mut s[i * per..(i + 1) * per] {
+                        *v = base + i as f32;
+                    }
+                }
+            };
+            fill(&mut la.conv_state, 100.0);
+            fill(&mut la.conv_state_scratch, 200.0);
+            fill(&mut la.recurrent, 300.0);
+            fill(&mut la.recurrent_scratch, 400.0);
+        }
+        let read_slot0th = |buf: &MlxBuffer, slot: usize, n: usize| -> f32 {
+            let s = buf.as_slice::<f32>().expect("as_slice");
+            let per = s.len() / n;
+            s[slot * per]
+        };
+
+        // (1) Flip slot 1 only.
+        cache.linear_attn[0].swap_for_slot(SlotId(1));
+        {
+            let la = &cache.linear_attn[0];
+            let n = n_seqs as usize;
+            // Slot 1's CURRENT is now the scratch-named buffer.
+            let (c1, s1) = la.conv_bufs_for_slot(SlotId(1));
+            assert_eq!(read_slot0th(c1, 1, n), 201.0, "slot1 conv current = scratch region");
+            assert_eq!(read_slot0th(s1, 1, n), 101.0, "slot1 conv scratch = named region");
+            let (r1, _) = la.recurrent_bufs_for_slot(SlotId(1));
+            assert_eq!(read_slot0th(r1, 1, n), 401.0, "slot1 rec current = scratch region");
+            // Slots 0/2/3 untouched: current still the named buffers.
+            for s in [0usize, 2, 3] {
+                let (c, _) = la.conv_bufs_for_slot(SlotId(s as u32));
+                assert_eq!(read_slot0th(c, s, n), 100.0 + s as f32, "slot{s} conv current unchanged");
+                let (r, _) = la.recurrent_bufs_for_slot(SlotId(s as u32));
+                assert_eq!(read_slot0th(r, s, n), 300.0 + s as f32, "slot{s} rec current unchanged");
+            }
+        }
+
+        // (2) Snapshot canonicalization: slot 1 region comes from scratch.
+        let snap = cache.snapshot(&device).expect("snapshot");
+        {
+            let n = n_seqs as usize;
+            assert_eq!(read_slot0th(&snap.linear_conv[0], 0, n), 100.0, "snap slot0 conv = current(named)");
+            assert_eq!(read_slot0th(&snap.linear_conv[0], 1, n), 201.0, "snap slot1 conv = current(scratch)");
+            assert_eq!(read_slot0th(&snap.linear_recurrent[0], 1, n), 401.0, "snap slot1 rec = current(scratch)");
+        }
+
+        // (3) fork_seq 1 → 2 carries parity; dst-current == src-current.
+        {
+            use crate::serve::multi_seq_kv::MultiSeqKvCache;
+            cache.fork_seq(SlotId(1), SlotId(2)).expect("fork_seq 1→2");
+            let la = &cache.linear_attn[0];
+            assert!(la.pp_flipped[2], "fork carries parity");
+            let n = n_seqs as usize;
+            let (c2, _) = la.conv_bufs_for_slot(SlotId(2));
+            assert_eq!(read_slot0th(c2, 2, n), 201.0, "slot2 conv current == slot1's forked current");
+        }
+
+        // (4) reset_for_slot returns canonical parity + zeroes.
+        cache.reset_for_slot(SlotId(1)).expect("reset_for_slot 1");
+        {
+            let la = &cache.linear_attn[0];
+            assert!(!la.pp_flipped[1], "reset returns slot1 to canonical parity");
+            let n = n_seqs as usize;
+            let (c1, _) = la.conv_bufs_for_slot(SlotId(1));
+            assert_eq!(read_slot0th(c1, 1, n), 0.0, "reset zeroed slot1 current");
+        }
+
+        // (5) rollback under flipped parity lands in the slot's CURRENT.
+        cache.ensure_la_capture(&cfg, &device, 2).expect("ensure_la_capture");
+        {
+            // Fill capture position 0 for slot 3 with 777.0 (recurrent) and
+            // conv capture with 888.0.
+            let n = n_seqs as usize;
+            let la = &mut cache.linear_attn[0];
+            {
+                let cap = la.capture_states.as_mut().expect("capture_states");
+                let total = cap.element_count();
+                let s = cap.as_mut_slice::<f32>().expect("cap slice");
+                let per_seq = total / n; // [.., n_tokens_max, n_seqs] slot-major per rollback math
+                for v in &mut s[3 * per_seq..3 * per_seq + per_seq] {
+                    *v = 777.0;
+                }
+            }
+            {
+                let ccap = la.conv_capture_states.as_mut().expect("conv_capture_states");
+                let s = ccap.as_mut_slice::<f32>().expect("ccap slice");
+                let total = s.len();
+                let per_seq = total / n;
+                for v in &mut s[3 * per_seq..3 * per_seq + per_seq] {
+                    *v = 888.0;
+                }
+            }
+            la.swap_for_slot(SlotId(3)); // flip slot 3
+        }
+        cache.rollback_la_to(SlotId(3), 0).expect("rollback_la_to slot3");
+        {
+            let la = &cache.linear_attn[0];
+            let n = n_seqs as usize;
+            let (r3, _) = la.recurrent_bufs_for_slot(SlotId(3));
+            assert_eq!(
+                read_slot0th(r3, 3, n),
+                777.0,
+                "rollback landed in slot3's CURRENT recurrent (parity-aware)"
+            );
+            let (c3, _) = la.conv_bufs_for_slot(SlotId(3));
+            assert_eq!(
+                read_slot0th(c3, 3, n),
+                888.0,
+                "rollback landed in slot3's CURRENT conv (parity-aware)"
+            );
+        }
     }
 }

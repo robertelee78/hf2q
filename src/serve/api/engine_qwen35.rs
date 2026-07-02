@@ -809,15 +809,21 @@ impl Qwen35LoadedModel {
         }
         let device = mlx_native::MlxDevice::new()
             .context("ADR-040 C2d: MlxDevice::new for Qwen35 multi-seq KV provisioning")?;
-        // Size to full context window — spawn-time doesn't know
-        // per-request prompt/decode lengths. The per-request
-        // `alloc_kv_cache_for_request` path (used until iter-C2d-cont
-        // lifts the worker hot path onto the persistent cache)
-        // continues to size per-request via `prompt_len + max_tokens +
-        // 64`; the spawn-time scaffold is the structural witness that
-        // the A2a allocator works at `n_seqs = max_slots` for this
-        // model's shape.
-        let max_seq_len = self.model.cfg.max_position_embeddings;
+        // ADR-040 `iter-F-kvcap` convention (M-QWEN port, 2026-07-01):
+        // split the full-attention context budget across slots — each of
+        // `max_slots` slots gets `max_position_embeddings / max_slots`
+        // (the llama.cpp `-c`÷`-np` convention, user-authorized "each
+        // instance should get max/n"). Sizing every slot to the FULL
+        // context (the pre-kvcap behavior this replaces) eagerly
+        // allocates n_seqs × full-ctx KV — for qwen3.6-35B-A3B at
+        // n_seqs=8 with F32 KV that is ~86 GB (10 full-attn layers ×
+        // nkv=2 × ctx 262144 × hd=256 × 4 B × K+V × 8 slots), which
+        // ground provisioning into an hour-long zero-fill on a 128 GB
+        // box (measured 2026-07-01, M-QWEN gate hang). `max_slots=1` is
+        // identity (max/1 = max) so SerialFifo / single-slot sizing is
+        // unchanged — mirrors gemma4's per-slot split in
+        // `layer_type_to_alloc_params_per_slot`.
+        let max_seq_len = self.model.cfg.max_position_embeddings / max_slots;
         let cache = HybridKvCache::new_with_options(
             &self.model.cfg,
             &device,

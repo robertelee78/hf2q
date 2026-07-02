@@ -20441,6 +20441,241 @@ assistant:
         rt.block_on(engine_slot.shutdown()).expect("shutdown slot");
     }
 
+    /// ADR-040 M-QWEN — qwen35moe serial slot-aware reference (mirror of
+    /// [`gemma4_serial_slot_aware_ref_at`] for the Qwen35 architecture): a
+    /// single request through `generate_qwen35_once_slot_aware` on a freshly
+    /// loaded model with the persistent multi-seq cache provisioned at
+    /// `n_seqs`, at a SPECIFIC `slot_id`. The live SlotAware worker decodes
+    /// via `Qwen35DecodeState::prefill_seed` + `decode_tick`, which are the
+    /// hoisted mirror of this serial fn — byte-parity against these refs is
+    /// exactly the F1 mirror-invariant proof (same bar as the gemma4 tests).
+    fn qwen35_serial_slot_aware_ref_at(
+        load_opts: &LoadOptions,
+        prompt: &[u32],
+        params: &SamplingParams,
+        n_seqs: u32,
+        slot_id: SlotId,
+    ) -> GenerationResult {
+        let mut loaded = LoadedModel::load(load_opts).expect("load qwen35 ref model");
+        let LoadedModel::Qwen35(q) = &mut loaded else {
+            panic!("qwen35_serial_slot_aware_ref_at: expected a Qwen35 GGUF")
+        };
+        q.provision_multi_seq_kv_for_slot_aware(n_seqs)
+            .expect("provision qwen35 persistent multi-seq KV");
+        let mut kv = q
+            .persistent_kv_cache
+            .take()
+            .expect("persistent_kv_cache provisioned");
+        let r = crate::serve::api::engine_qwen35::generate_qwen35_once_slot_aware(
+            q, prompt, params, None, &mut kv, slot_id,
+        )
+        .expect("qwen35 serial slot-aware ref");
+        q.persistent_kv_cache = Some(kv);
+        r
+    }
+
+    /// ADR-040 M-QWEN discriminator — serial capacity-invariance pin: the
+    /// same prompt, serial, SlotId(0), at n_seqs=1 (per-slot cap = full
+    /// 262144) vs n_seqs=8 (per-slot cap = 32768 post-kvcap-split) must be
+    /// byte-equal. gemma4 holds this property (its N=8 gate compares
+    /// n_seqs=1 serial refs against the max_slots=8 engine and passes).
+    /// If THIS pin fails, qwen35's forward output depends on the KV
+    /// allocation capacity — a §0.17-class capacity-sensitivity — and the
+    /// N=8 parity failure is NOT (necessarily) a concurrency bug.
+    #[test]
+    fn qwen35_serial_capacity_invariance_pin() {
+        if byte_equiv_skip_unless_gated("qwen35_serial_capacity_invariance_pin") {
+            return;
+        }
+        let Ok(gguf) = std::env::var("HF2Q_QWEN35_E2E_GGUF") else {
+            eprintln!("[skip] qwen35_serial_capacity_invariance_pin — set HF2Q_QWEN35_E2E_GGUF");
+            return;
+        };
+        std::env::set_var("HF2Q_TQ_KV", "0");
+        let load_opts = LoadOptions {
+            model_path: PathBuf::from(gguf),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let prompt = vec![1u32, 2, 3];
+        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+        let r_full = qwen35_serial_slot_aware_ref_at(&load_opts, &prompt, &params, 1, SlotId(0));
+        let r_split = qwen35_serial_slot_aware_ref_at(&load_opts, &prompt, &params, 8, SlotId(0));
+        eprintln!("[CAPPIN] n_seqs=1 text={:?}", r_full.text);
+        eprintln!("[CAPPIN] n_seqs=8 text={:?}", r_split.text);
+        assert_genresult_byte_equal(
+            &r_split,
+            &r_full,
+            "ADR-040 M-QWEN — qwen35 serial SlotId(0): n_seqs=8 (cap 32768) vs n_seqs=1 (cap 262144)",
+        );
+    }
+
+    /// ADR-040 M-QWEN discriminator — SlotAware engine with a SINGLE request
+    /// must match the serial slot-aware ref byte-for-byte (loop-faithfulness
+    /// of the hoisted `prefill_seed`+`decode_tick` mirror, no concurrency).
+    #[test]
+    fn qwen35_slot_aware_engine_n1_parity() {
+        if byte_equiv_skip_unless_gated("qwen35_slot_aware_engine_n1_parity") {
+            return;
+        }
+        let Ok(gguf) = std::env::var("HF2Q_QWEN35_E2E_GGUF") else {
+            eprintln!("[skip] qwen35_slot_aware_engine_n1_parity — set HF2Q_QWEN35_E2E_GGUF");
+            return;
+        };
+        std::env::set_var("HF2Q_TQ_KV", "0");
+        let load_opts = LoadOptions {
+            model_path: PathBuf::from(gguf),
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+        let prompt = vec![1u32, 2, 3];
+        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+        let serial = qwen35_serial_slot_aware_ref_at(&load_opts, &prompt, &params, 1, SlotId(0));
+        let loaded = LoadedModel::load(&load_opts).expect("load qwen35 n1");
+        let engine =
+            Engine::spawn_with_mode(loaded, 8, None, EngineMode::SlotAware { max_slots: 8 })
+                .expect("spawn qwen35 SlotAware n1");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("rt");
+        let r = rt
+            .block_on(engine.clone().generate(prompt, params))
+            .expect("qwen35 n1 generate");
+        eprintln!("[N1PIN] engine text={:?}", r.text);
+        eprintln!("[N1PIN] serial text={:?}", serial.text);
+        assert_genresult_byte_equal(
+            &r,
+            &serial,
+            "ADR-040 M-QWEN — qwen35 SlotAware engine N=1 vs serial slot-aware ref",
+        );
+        rt.block_on(engine.shutdown()).expect("shutdown");
+    }
+
+    /// ADR-040 M-QWEN (closes the §0.12 tracked-open item, 2026-07-01):
+    /// qwen35moe cross-slot correctness was "correct-by-construction"
+    /// (stateless forward, per-slot cursor in `current_len[slot]`) but
+    /// empirically UNPROVEN — no qwen35 GGUF was staged when the gemma4
+    /// N=8 parity gates landed. This is the direct mirror of
+    /// [`slot_aware_n8_per_slot_parity_vs_serial`] for qwen35moe: 8 distinct
+    /// greedy prompts concurrently through one `SlotAware { max_slots: 8 }`
+    /// engine, each asserted byte-identical to its independent serial
+    /// slot-aware reference; plus a slot-equivalence pin (same prompt serial
+    /// at SlotId(0) vs SlotId(7) byte-equal — pins per-slot KV region
+    /// indexing in isolation). Gated separately from the gemma4 tests:
+    /// `HF2Q_BYTE_EQUIV_E2E=1` + `HF2Q_QWEN35_E2E_GGUF=<path>` (codex
+    /// review 2026-07-01: do NOT overload the gemma-oriented
+    /// `HF2Q_BYTE_EQUIV_E2E_GGUF`).
+    #[test]
+    fn slot_aware_qwen35_n8_per_slot_parity_vs_serial() {
+        if byte_equiv_skip_unless_gated("slot_aware_qwen35_n8_per_slot_parity_vs_serial") {
+            return;
+        }
+        let Ok(gguf) = std::env::var("HF2Q_QWEN35_E2E_GGUF") else {
+            eprintln!(
+                "[skip] slot_aware_qwen35_n8_per_slot_parity_vs_serial — set \
+                 HF2Q_QWEN35_E2E_GGUF=<qwen35moe gguf> to run (ADR-040 M-QWEN)"
+            );
+            return;
+        };
+        // Multi-slot qwen35 REQUIRES the F32 full-attn KV path: slot_id>0
+        // with TQ-active KV is the typed Phase B4a-cont deferral
+        // ("TQ encode + TQ SDPA kernels are not yet slot-aware", ADR-040
+        // §6.1.5/§6.1.6, dossier R5) and fails CLOSED — empirically
+        // confirmed by this test's first run 2026-07-01 (build_gated_attn_layer
+        // slot_id=7 typed error). HF2Q_TQ_KV defaults ON, so pin it OFF for
+        // the supported multi-slot configuration this gate proves.
+        std::env::set_var("HF2Q_TQ_KV", "0");
+        let gguf_path = PathBuf::from(gguf);
+        assert!(gguf_path.exists(), "qwen35 GGUF missing: {}", gguf_path.display());
+        let load_opts = LoadOptions {
+            model_path: gguf_path,
+            tokenizer_path: None,
+            config_path: None,
+            dwq_overlay_path: None,
+            kv_persist_dir: None,
+        };
+
+        // Eight distinct greedy prompts (same shape as the gemma4 N=8 gate).
+        let prompts: Vec<Vec<u32>> = vec![
+            vec![1, 2, 3],
+            vec![4, 5, 6, 7],
+            vec![8, 9],
+            vec![10, 11, 12, 13, 14],
+            vec![15, 16],
+            vec![17, 18, 19, 20],
+            vec![21, 22, 23],
+            vec![24, 25, 26, 27, 28],
+        ];
+        let params = SamplingParams { temperature: 0.0, max_tokens: 24, ..Default::default() };
+
+        // Slot-equivalence pin: same prompt, serial, SlotId(0) vs SlotId(7)
+        // on an n_seqs=8 provisioning — pins per-slot KV region indexing.
+        let pin0 = qwen35_serial_slot_aware_ref_at(&load_opts, &prompts[0], &params, 8, SlotId(0));
+        let pin7 = qwen35_serial_slot_aware_ref_at(&load_opts, &prompts[0], &params, 8, SlotId(7));
+        assert_genresult_byte_equal(
+            &pin7,
+            &pin0,
+            "ADR-040 M-QWEN — same prompt serial SlotId(7) vs SlotId(0)",
+        );
+
+        // Serial slot-aware references (one fresh model per prompt).
+        let serial_refs: Vec<GenerationResult> = prompts
+            .iter()
+            .map(|p| qwen35_serial_slot_aware_ref_at(&load_opts, p, &params, 1, SlotId(0)))
+            .collect();
+
+        // Vacuous-test guard at both ends of the slot range.
+        assert_ne!(
+            serial_refs[0].text, serial_refs[1].text,
+            "vacuous: qwen35 prompts 0 and 1 produced identical serial output"
+        );
+        assert_ne!(
+            serial_refs[6].text, serial_refs[7].text,
+            "vacuous: qwen35 prompts 6 and 7 produced identical serial output"
+        );
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .expect("rt");
+
+        // Concurrent SlotAware run at max_slots=8.
+        let loaded_slot = LoadedModel::load(&load_opts).expect("load qwen35 slot");
+        let engine_slot =
+            Engine::spawn_with_mode(loaded_slot, 8, None, EngineMode::SlotAware { max_slots: 8 })
+                .expect("spawn qwen35 SlotAware{max_slots:8}");
+        let slot_results: Vec<GenerationResult> = rt.block_on(async {
+            let mut handles = Vec::new();
+            for p in prompts.iter().cloned() {
+                let eng = engine_slot.clone();
+                let pr = params.clone();
+                handles.push(tokio::spawn(async move {
+                    eng.generate(p, pr).await.expect("qwen35 slot generate")
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.expect("join"));
+            }
+            out
+        });
+        for (i, (slot, serial)) in slot_results.iter().zip(serial_refs.iter()).enumerate() {
+            assert_genresult_byte_equal(
+                slot,
+                serial,
+                &format!("ADR-040 M-QWEN — qwen35 SlotAware N=8 slot {i} vs its serial ref"),
+            );
+        }
+        rt.block_on(engine_slot.shutdown()).expect("shutdown qwen35 slot");
+    }
+
     /// ADR-040 §0.19 — HIGH-RATE long-prompt determinism REPRO. Runs the
     /// concurrent N=8 SlotAware batch `repeats` times over LONG prompts (each
     /// > 512 KV ⇒ split-K `nwg=32`, max tmp+reduce contention — vs the

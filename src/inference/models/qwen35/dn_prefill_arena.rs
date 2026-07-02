@@ -245,8 +245,10 @@ impl DnPrefillArena {
         let attn_out_buf = device
             .alloc_buffer(attn_out_elems * 4, DType::F32, vec![attn_out_elems])
             .map_err(|e| anyhow!("DnPrefillArena alloc attn_out_buf: {e}"))?;
+        // 9 u32 per the mlx-native ADR-033 §Pi iter-25 params contract
+        // (index 8 = q_scale_bits; 0 = legacy contract, caller pre-scales q).
         let gdn_params_buf = device
-            .alloc_buffer(8 * 4, DType::U32, vec![8])
+            .alloc_buffer(9 * 4, DType::U32, vec![9])
             .map_err(|e| anyhow!("DnPrefillArena alloc gdn_params_buf: {e}"))?;
 
         // qkv_split slots
@@ -447,7 +449,8 @@ mod tests {
             (nv as usize) * (seq as usize) * (dv as usize) * 4,
             "attn_out_buf"
         );
-        assert_eq!(arena.gdn_params_buf.byte_len(), 32, "gdn_params_buf");
+        // 9 u32 (ADR-033 §Pi iter-25 contract: index 8 = q_scale_bits).
+        assert_eq!(arena.gdn_params_buf.byte_len(), 36, "gdn_params_buf");
 
         // qkv_split expected sizes
         let q_sp = (nk * dk) as usize;

@@ -2418,8 +2418,12 @@ pub fn build_delta_net_layer(
     let gdn_params = GatedDeltaNetParams {
         d_k, d_v, n_k_heads, n_v_heads, n_tokens: seq_len, n_seqs,
     };
+    // 9 u32 per the mlx-native ADR-033 §Pi iter-25 params contract
+    // (index 8 = q_scale_bits; 0 = legacy contract, caller pre-scales q).
+    // Pooled alloc, so hand-built instead of build_gated_delta_net_params;
+    // layout must mirror it exactly.
     let mut gdn_params_buf = super::decode_pool::pooled_alloc_buffer(
-            device, 8 * 4, DType::U32, vec![8])
+            device, 9 * 4, DType::U32, vec![9])
         .map_err(|e| anyhow!("alloc gdn params (pooled): {e}"))?;
     {
         let s = gdn_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
@@ -2431,6 +2435,7 @@ pub fn build_delta_net_layer(
         s[5] = gdn_params.n_seqs;
         s[6] = 0;
         s[7] = 0;
+        s[8] = 0; // q_scale_bits — legacy (no fold-in)
     }
 
     let output = if seq == 1 {
@@ -3199,6 +3204,7 @@ pub fn build_delta_net_layer_with_arena(
         s[5] = gdn_params.n_seqs;
         s[6] = 0;
         s[7] = 0;
+        s[8] = 0; // q_scale_bits — legacy (no fold-in), ADR-033 §Pi iter-25
     }
     let ssm_conv_params = SsmConvParams {
         channels: qkv_channels,
@@ -3923,8 +3929,10 @@ pub fn build_delta_net_layer_decode_into(
     let gdn_params = GatedDeltaNetParams {
         d_k, d_v, n_k_heads, n_v_heads, n_tokens: seq_len, n_seqs,
     };
+    // 9 u32 per the mlx-native ADR-033 §Pi iter-25 params contract
+    // (index 8 = q_scale_bits; 0 = legacy contract, caller pre-scales q).
     let mut gdn_params_buf = super::decode_pool::pooled_alloc_buffer(
-            device, 8 * 4, DType::U32, vec![8])
+            device, 9 * 4, DType::U32, vec![9])
         .map_err(|e| anyhow!("alloc gdn params (decode_into, pooled): {e}"))?;
     {
         let s = gdn_params_buf.as_mut_slice::<u32>().map_err(|e| anyhow!("{e}"))?;
@@ -3936,6 +3944,7 @@ pub fn build_delta_net_layer_decode_into(
         s[5] = gdn_params.n_seqs;
         s[6] = 0;
         s[7] = 0;
+        s[8] = 0; // q_scale_bits — legacy (no fold-in)
     }
 
     // ---- Sliced views of qkv_conv (CPU-side only) ----
@@ -6016,6 +6025,7 @@ mod tests {
             s[5] = gdn_params.n_seqs;
             s[6] = 0;
             s[7] = 0;
+            s[8] = 0; // q_scale_bits — legacy (no fold-in), ADR-033 §Pi iter-25
         }
         let ssm_conv_params = SsmConvParams {
             channels: qkv_channels,

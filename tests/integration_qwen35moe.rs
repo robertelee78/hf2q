@@ -14,8 +14,7 @@
 use std::path::Path;
 use std::process::Command;
 
-const APEX_GGUF: &str =
-    "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex.gguf";
+const APEX_GGUF: &str = "/opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf";
 
 /// Locate the release `hf2q` binary inside the active workspace (handles both
 /// the main checkout and worktrees by walking up from `CARGO_MANIFEST_DIR`).
