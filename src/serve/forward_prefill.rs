@@ -3956,26 +3956,41 @@ impl MlxModelWeights {
         let prior_leg_hb = self.leg_hb_encoded.take();
         self.leg_hb_encoded = Some(slot_view_hb);
 
-        // Delegate to the sibling fn.  Its lazy-alloc gate at line ~860
-        // (NEW iter-2A-cont alignment to `&& self.leg_hb_encoded.is_none()`,
-        // mirror of iter-2B's hybrid-branch alignment at line ~842) so
-        // the mount survives the sibling's path.  The sibling consumes
-        // `self.leg_hb_encoded` at line ~1355-1395 for the K/V kernel
-        // writes; reads land on the slot-view → kernel writes target
-        // the per-slot byte region.
+        // ADR-040 M-SPEED-LC (2026-07-02): mirror the iter-G(b) batched
+        // mount the HYBRID branch has had since 2026-06-25 (line ~3757).
+        // Without it the HB-encoded (HF2Q_HYBRID_KV=0 / full-TQ) regime
+        // silently fell to PER-TOKEN prefill — measured ~25× slower at 8k
+        // (~2 min vs ~4 s), disqualifying for the 32k-prompt target
+        // workload. `forward_prefill_batched` already carries the HB K+V
+        // write branch (forward_prefill_batched.rs:~2981, codex-verified),
+        // reading the mounted `self.leg_hb_encoded` slot views exactly as
+        // the per-token sibling does. Same gating as the hybrid mount:
+        // soft-token prefills fall back per-token; opt out via
+        // HF2Q_PREFILL_SLOT_BATCHED=0.
         //
-        // `restored_lcp = None`: LCP partial-prefix resume is iter-2D
-        // scope (dense F32 LCP-eligible regime); iter-2A-cont does NOT
-        // consume the LCP fast path for the HB-encoded opt-out branch
+        // `restored_lcp = None` on the fallback: LCP partial-prefix resume
+        // is iter-2D scope (dense F32 LCP-eligible regime); iter-2A-cont
+        // does NOT consume the LCP fast path for the HB-encoded branch
         // (orthogonal sub-deferral).
-        let result = self.forward_prefill_with_soft_tokens_resume(
-            prompt_tokens,
-            soft_tokens,
-            max_decode_tokens,
-            gpu,
-            None,
-            true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
-        );
+        let use_batched_slot_prefill = soft_tokens.is_empty()
+            && std::env::var("HF2Q_PREFILL_SLOT_BATCHED").as_deref() != Ok("0");
+        let result = if use_batched_slot_prefill {
+            let prior_dense_kvs = self.dense_kvs.take();
+            let prior_dense_sdpa_tmp = self.dense_sdpa_tmp.take();
+            let r = self.forward_prefill_batched(prompt_tokens, max_decode_tokens, 0, gpu);
+            self.dense_kvs = prior_dense_kvs;
+            self.dense_sdpa_tmp = prior_dense_sdpa_tmp;
+            r
+        } else {
+            self.forward_prefill_with_soft_tokens_resume(
+                prompt_tokens,
+                soft_tokens,
+                max_decode_tokens,
+                gpu,
+                None,
+                true, // slot_aware=true (ADR-040 STEP-1b): skip shared dense_kvs/snapshot/sdpa_tmp write-backs; caller restores
+            )
+        };
 
         // Restore prior `self.leg_hb_encoded` regardless of result.  The
         // slot-view bundle has lifetime tied to this call; the
