@@ -384,28 +384,45 @@ impl MlxModelWeights {
                 Ok("0") | Ok("false") | Ok("off")
             );
 
-        // ADR-040 §0.19 FIX: the F16 D=512 FA prefill kernel is NON-DETERMINISTIC
-        // ONLY on MULTI-CHUNK prefill — the D=512 KV chunk is C=64, so seq_len <= 64
-        // is a single chunk and F16 FA is DETERMINISTIC there; seq_len > 64 spans
-        // multiple chunks and is non-deterministic (root-caused by per-layer
-        // synced-checksum bisection to the first global/D=512 layer). The BF16 D=512
-        // FA path has a separate known enumeration-coherence bug. So for LONG prompts
-        // (> 64 tok) both D=512 FA paths are unusable; route those global layers
-        // through the deterministic + coherent tensor-mm (NO_FA) path (iter-82 H62
-        // routing, made default-on). For SHORT prompts (<= 64 tok) keep F16 FA: it is
-        // deterministic single-chunk AND the tensor-mm scores@V matmul requires
-        // K = seq_len >= 32 (it errors below that). Sliding (D=256) layers always
-        // stay on fast capped FA. Opt out (re-enable F16-D512 FA everywhere, for
-        // kernel-fix A/B) via HF2Q_GLOBAL_FA=1.
+        // ADR-040 §0.19 (2026-06-25) routed single-seq LONG prompts' global
+        // D=512 layers through tensor-mm (NO_FA) because the F16 D512 FA
+        // kernel was then non-deterministic on multi-chunk prefill (C=64
+        // chunks) and BF16 D512 FA had an enumeration-coherence bug —
+        // "conservative until §0.19 determinism is re-validated end-to-end
+        // for single long prompts".
+        // ADR-040 §7.32K (2026-07-01) RE-VALIDATED exactly that: after the
+        // §0.19-family fixes (FA blk-fix cb9806c, remask 609dfdc6, mm_id
+        // `short` f070d50, int32 dst 8b16039) the F16 D512 FA path measured
+        // deterministic + concurrency-invariant on the interleaved A/B
+        // fingerprint ladder (8k N=1 ×30 + N=8×20; 16k ×20; 32000×8 slots
+        // ×3 rounds — zero faults). The pin is therefore now SEQ-BOUNDED:
+        //   * seq <= 64            → F16 FA (single-chunk; tensor-mm needs
+        //                            K = seq_len >= 32 and errors below).
+        //   * 64 < seq <= 8192     → tensor-mm globals (unchanged §0.19
+        //                            domain: determinism-proven, ~14% faster
+        //                            than FA at 8k, pf_kq <= 4.3 GB).
+        //   * seq > 8192           → F16 D512 FA globals (§7.32K domain):
+        //                            tensor-mm's pf_kq [nh,seq,seq] F32 is
+        //                            O(seq²) — 17.2 GB @16k, 68.7 GB @32k —
+        //                            which made the 32k/slot × 8 target
+        //                            memory-unreachable; FA is O(seq) and
+        //                            speed-parity at 16k.
+        // Sliding (D=256) layers always stay on fast capped FA. Escapes:
+        // HF2Q_GLOBAL_FA=1 forces FA for globals at ANY seq > 64;
+        // HF2Q_NO_FA=1 forces tensor-mm everywhere it can run (seq >= 32,
+        // including > 8192 — O(seq²) memory by explicit operator choice).
         // ADR-040 iter-G(a): the MULTI-SEQ path always uses F16 FA for the
         // global D=512 layers — tensor-mm CANNOT be byte-identical to per-seq
         // attention (it sums over masked cross-seq columns → near-tie argmax
         // flips), whereas the (blk-fixed, §0.19/cb9806c) F16 D512 FA SKIPS
-        // masked tiles and isolates byte-exact. Single-seq keeps the §0.19
-        // tensor-mm routing for >64 (conservative until §0.19 determinism is
-        // re-validated end-to-end for single long prompts).
+        // masked tiles and isolates byte-exact.
+        /// ADR-040 §7.32K: upper bound of the single-seq global-layer
+        /// tensor-mm (NO_FA) domain; above it globals route through F16
+        /// D512 FA (O(seq) memory). See the routing comment above.
+        const GLOBAL_NOFA_MAX_SEQ: usize = 8192;
         let force_global_nofa = std::env::var("HF2Q_GLOBAL_FA").as_deref() != Ok("1")
             && seq_len > 64
+            && seq_len <= GLOBAL_NOFA_MAX_SEQ
             && self.multi_seq_prefill.is_none();
 
         // Wave P4.17 — super-flag: per-op isolation for bucket attribution.
@@ -425,8 +442,11 @@ impl MlxModelWeights {
         let profile_buckets_on = profile_gpu_ts_on
             || std::env::var("HF2Q_PROFILE_BUCKETS").is_ok();
 
-        eprintln!("Batched prefill: KV={:?}, seq_len={}, path={}{}", kv_dtype, seq_len,
+        eprintln!("Batched prefill: KV={:?}, seq_len={}, path={}, globals={}{}", kv_dtype, seq_len,
                   if use_no_fa { "tensor-mm (non-FA)" } else { "flash-attn" },
+                  // ADR-040 §7.32K: global D=512 layers can route differently
+                  // from the headline path — surface it (codex review note).
+                  if use_no_fa || force_global_nofa { "tensor-mm" } else { "flash-attn" },
                   if profile_buckets_on { " [BUCKET_PROFILE]" } else { "" });
 
         // -------------------------------------------------------------------

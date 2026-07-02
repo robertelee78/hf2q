@@ -1060,6 +1060,32 @@ All four Phase iter-1 scaffolding tracks landed in parallel under goal-mode dire
 **Instrument (committed 2026-07-01).** The determinism-ladder probe this milestone used now lives permanently in `slot_aware_n4_batched_body_throughput_probe` (`engine.rs`), all env-gated with zero default-path impact: `HF2Q_BENCH_REPEAT=R` (R single-process rounds, per-round FNV-1a-64 output fingerprint, early-return), `HF2Q_BENCH_CONC=1` (each round runs `HF2Q_BENCH_N` streams concurrently through the live admission path — the N>1 concurrency ladder), `HF2Q_BENCH_TOKENS`/`HF2Q_BENCH_PROMPT_LEN` (decode length / synthetic long-prompt padding for realistic-context ladders), `HF2Q_DUMP_FPRINT=1` (per-stream fingerprints on the timed throughput round), `HF2Q_BENCH_SETTLE_MS` (inter-round settle). The full-TQ K-quant probe wiring from the killed §7.LCP K-quant initiative (`HF2Q_BATCHED_FULL_TQ`) was NOT committed — reverted per the NO-GO; its numbers are preserved in §7.LCP.
 
 ---
+
+## 7.32K — Long-context prefill O(seq²) wall: seq-bound the global-layer NO-FA pin at 8192 (2026-07-01, SHIPPED)
+
+**Milestone.** The §7.LCP "next wall": the real workload (8 concurrent agent connections × ~32k context) could not reach 32k/slot because single-seq/per-slot prefill routes global D=512 layers through the tensor-mm NO-FA path (`force_global_nofa`, `forward_prefill_batched.rs`), whose `pf_kq [nh, seq, seq]` F32 scratch is O(seq²): 4.3 GB @8k, 17.2 GB @16k, **68.7 GB @32k** — memory-unreachable. Priority order (operator, restated 2026-07-01): **coherence > speed** — the FA route ships only on a clean determinism ladder.
+
+**Hypothesis (H1, pre-registered).** The F16-D512 FA prefill path is now deterministic for single-seq long prompts: the 2026-06-25 "multi-chunk non-determinism" verdict (which created the pin, "conservative until §0.19 determinism is re-validated end-to-end for single long prompts") predates four root-cause fixes in its causal neighborhood — the FA blk-fix (cb9806c, masked-tile skip), the mask-corruption remask fix (609dfdc6), the mm_id `short` token-index overflow (mlx-native f070d50, §7.S019 — the actual carrier of the "8k non-determinism" long mis-attributed to FA), and the NO-FA int32 dst-offset overflow (mlx-native 8b16039, §7.LCP). Codex pre-spike review (APPROVE-WITH-CHANGES): treat H1 strictly as hypothesis — the fixes are confounder-removals, not proof; N=1 ladders insufficient, an N=8 concurrent ladder required (added: `HF2Q_BENCH_CONC`, commit 3b0f87dc).
+
+**Spike (instrument = §7.S019 ladder; interleaved A/B batches per the batch-variability trap; A = default tensor-mm globals, B = `HF2Q_GLOBAL_FA=1` FA globals; gemma4-ara APEX Q5_K_M, single process, greedy, 64-tok gens, synthetic distinct-band prompts):**
+
+| rung | config | A distinct | B distinct | verdict |
+|---|---|---|---|---|
+| S1 | N=1 @8192, 3×10 reps interleaved | 1/30 | 1/30 | both deterministic; first decode token 4427 (= §7.S019 reference) |
+| S1B | N=8 CONCURRENT @8192, 2×10 reps interleaved | 8×1/20 | 8×1/20 | per-stream deterministic AND stream-0 == its N=1 fingerprint on BOTH routes (concurrency-invariant) |
+| S2 | N=1 @16384, 20 reps | — | 1/20 | FA deterministic at 16k |
+| S3A | N=8 × 32000, 1-tok smoke | — | 8/8 clean | ~33.4–34.6 s per 32k slot prefill; no fault; no OOM; 8 distinct coherent outputs |
+| S3B | N=8 × 32000 × 64 tok × 3 rounds | — | 8 × 1 distinct/3 | zero faults — **the full 32k×8 target runs deterministically** |
+
+(A ≠ B by output fingerprint — expected: different reduction order flips near-tie argmaxes; the bar is per-path determinism + coherence, not cross-path byte-equality.) **Speed (same logs, N=1 mean prefill):** 8k A=3969 ms vs B=4593 ms (tensor-mm ~14% faster at 8k); 16k A≈11591 ms vs B=11082 ms (parity). So **T=8192** is supported on three axes: determinism-proven domain (zero behavior change ≤8192), memory knee (peak transient pf_kq ≤4.3 GB — laptop-fit), and speed (tensor-mm wins ≤8k only; FA is the only option above on memory).
+
+**Fix (codex APPROVE-WITH-CHANGES, changes applied).** `GLOBAL_NOFA_MAX_SEQ = 8192`: `force_global_nofa` gains `seq_len <= 8192`. Domains after: seq ≤ 64 = F16 FA single-chunk (unchanged); 64 < seq ≤ 8192 = tensor-mm globals (unchanged — the §0.19-proven default domain); seq > 8192 = F16-D512 FA globals (O(seq); the §7.32K ladder-proven domain). `need_nofa_bufs` follows → no `pf_kq` above 8192. Escapes precisely documented: `HF2Q_GLOBAL_FA=1` = FA globals at any seq>64; `HF2Q_NO_FA=1` = tensor-mm wherever it can run (seq ≥ 32 kernel guard, including >8192 — O(seq²) by explicit operator choice). Codex-flagged log-line fix: `Batched prefill:` now prints the global-layer route separately (`globals=`). Multi-seq (iter-G(a)) and soft-token paths unaffected (`multi_seq_prefill.is_none()` stays in the gate).
+
+**Validation (default binary, no env overrides unless stated) — ALL GREEN 2026-07-01.** `slot_aware_n4`/`n8_per_slot_parity_vs_serial` byte-identity OK. **g1 @8192:** `globals=tensor-mm`, 1 distinct/10, fingerprint `32c29eb8cd754ce4` = the pre-change value byte-exactly (≤8192 domain provably untouched). **g2 @8200:** `globals=flash-attn`, 1/5 (boundary comparator proven). **g3 @12k:** FA, 1/10 (mid-domain interpolation rung). **g4 @16k:** FA, 1/10, fingerprint `5d6030f0ac8c27c8` = the spike's `HF2Q_GLOBAL_FA=1` value byte-exactly — the flip lands precisely the pre-validated behavior, not merely *a* deterministic one. **g5 N=8 concurrent @12k:** 8 streams × 1 distinct/10, stream-0 == its N=1 fingerprint (concurrency-invariant in the flipped domain). **g6 N=8 × 32000 × 64 tok ×2 rounds, DEFAULT config:** zero faults, 8 streams × 1 distinct, all 8 fingerprints byte-identical to the spike's S3B run — **the 32k×8 target is now served by the default binary, deterministically.** **g7 xlen smoke (`HF2Q_DFLASH_XLEN_SDPA=1`) @12k:** 1/2, fingerprint == the non-xlen g3 value (xlen orthogonal).
+
+**Result.** The §7.LCP "next wall" is closed: 8 concurrent ~32k-context connections (the real agent workload) prefill via O(seq) FA globals with no O(seq²) `pf_kq` (would have been 68.7 GB), no GPU faults, byte-stable outputs, with zero behavior change for all traffic ≤ 8192. Remaining speed work (0.89× llama decode at 8k×8, K-quant batched kernel) is the separate M-SPEED-LC milestone.
+
+---
 ## 8. References
 
 ### vLLM
