@@ -34,10 +34,26 @@ use crate::serve::forward_mlx_shared::{
 use mlx_native::ops::encode_helpers::{encode_with_args, KernelArg};
 
 use super::batched_head::BatchedHeadOut;
-use super::kv_cache::MultiSeqHybridKvBuffers;
+use super::kv_cache::{MultiSeqHbKvBuffers, MultiSeqHybridKvBuffers};
 use super::model::{MlxActivationBuffers, MlxModelWeights};
 use crate::serve::gpu::GpuContext;
 use crate::serve::multi_seq_kv::SlotId;
+
+/// ADR-040 M-SPEED-LC Stage 2 — typed KV-scaffold selector for the batched
+/// decode body's per-layer attention phase.
+///
+/// Exactly one production KV regime is active per `HF2Q_HYBRID_KV`: the
+/// hybrid F16-K + TQ-HB-V scaffold (`HF2Q_HYBRID_KV=1`, DEFAULT) or the
+/// full-TQ byte-packed K+V scaffold (`HF2Q_HYBRID_KV=0`, opt-in). The HB
+/// scaffold (`MultiSeqHbKvBuffers`) is ALWAYS provisioned at spawn
+/// (engine.rs, H94) regardless of which regime is selected, so `FullTq` is
+/// always constructible when `Hybrid` is unavailable — a typed enum (not
+/// two `Option`s) makes "exactly one regime, never both, never neither"
+/// a compile-time invariant instead of a runtime `unwrap()`.
+pub(crate) enum BatchedKvRegime<'a> {
+    Hybrid(&'a mut [MultiSeqHybridKvBuffers]),
+    FullTq(&'a mut [MultiSeqHbKvBuffers]),
+}
 
 /// `[N,...]` mirror of the production decode activation scratch. Each buffer is
 /// sized `N × (the scalar buffer's element count)` — read straight from the
@@ -452,7 +468,7 @@ impl MlxModelWeights {
         slot_id_buf: &MlxBuffer,
         slot_ids: &[SlotId],
         seq_positions: &[usize],
-        multi_seq_kv_hybrid: &mut [MultiSeqHybridKvBuffers],
+        regime: &mut BatchedKvRegime<'_>,
         tq_scale_factor_d512: f32,
         tq_codebook_bits: u32,
         session: &mut GraphSession<'a>,
@@ -675,6 +691,15 @@ impl MlxModelWeights {
         let q_norm_stride = nh * hd; // actual per-layer dim (see q/k/v_stride note)
         let k_norm_stride = nkv * hd;
         let sdpa_stride = nh * hd;
+        // ADR-040 M-SPEED-LC Stage 2 — regime dispatch. The Hybrid arm below
+        // is BYTE-FOR-BYTE the pre-existing body (only re-indented into the
+        // match arm) — no dispatch reordering, no arithmetic changes. The
+        // FullTq arm is NEW: same per-query addressing / same_bucket-gating
+        // skeleton, byte-packed 5/6/8-bit TQ-HB K+V (mlx-native
+        // `flash_attn_vec_tq_hb_batched`, ADR-040 M-SPEED-LC Stage 1) instead
+        // of hybrid's F16-K + TQ-HB-V.
+        match regime {
+        BatchedKvRegime::Hybrid(multi_seq_kv_hybrid) => {
         // ADR-040 M4 — OPT-IN batched multi-seq flash (HF2Q_BATCHED_FLASH=1):
         // replace the N per-slot flash dispatches with ONE batched flash over all
         // N queries (GPU occupancy). KV-encode + FWHT-undo stay per-slot. Gated
@@ -976,9 +1001,259 @@ impl MlxModelWeights {
             .map_err(|e| anyhow::anyhow!("batched FWHT-undo L{layer_idx} s{i}: {e}"))?;
         }
         }
+        } // end BatchedKvRegime::Hybrid
+        BatchedKvRegime::FullTq(multi_seq_kv_hb) => {
+        // ADR-040 M-SPEED-LC Stage 2/3 — FullTq (byte-packed 5/6/8-bit K+V)
+        // attention phase. Same same_bucket-gating skeleton as the Hybrid arm
+        // above; SDPA uses mlx-native's `flash_attn_vec_tq_hb_batched`
+        // (M-SPEED-LC Stage 1) instead of `flash_attn_vec_hybrid_batched`.
+        // Both K and V are FWHT-rotated + TQ-quantized (unlike hybrid's raw
+        // F16-K), so Q must ALSO be FWHT sign-premultiplied before SDPA — this
+        // mirrors the scalar production sequence at
+        // `gemma4/gpu_full_attn.rs:1381-1392` (standalone `fwht_sign_premult`
+        // dispatch ahead of the SDPA call, `fuse_fwht_pre: 0` in params).
+        let gbuf = &multi_seq_kv_hb[layer_idx];
+        let gcap = gbuf.capacity;
+        let gring = gbuf.is_sliding;
+        let ksl_of = |i: usize| -> u32 {
+            let sp = seq_positions[i];
+            if gring { ((sp + 1).min(gcap)) as u32 } else { (sp + 1) as u32 }
+        };
+        let nwg_bucket = |k: u32| if k > 512 { 32u32 } else { 16u32 };
+        let max_ksl = (0..n).map(ksl_of).max().unwrap_or(1);
+        let nsg_max = mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(max_ksl);
+        let same_bucket = (0..n).all(|i| {
+            let k = ksl_of(i);
+            nwg_bucket(k) == nwg_bucket(max_ksl)
+                && mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(k) == nsg_max
+        });
+        let use_batched_flash =
+            std::env::var("HF2Q_BATCHED_FLASH").as_deref() != Ok("0") && same_bucket;
+        if layer_idx == 0 && std::env::var("HF2Q_DECODE_TRACE").is_ok() {
+            let dump: Vec<String> = (0..n)
+                .map(|i| {
+                    let sp = seq_positions[i];
+                    let cp = if gring { (sp % gcap) as u32 } else { sp as u32 };
+                    format!("s{}:sp{} ksl{} cp{}", slot_ids[i].0, sp, ksl_of(i), cp)
+                })
+                .collect();
+            eprintln!(
+                "[ROWDIFF-TQ] L0 N={} max_ksl={} same_bucket={} bflash={} [{}]",
+                n, max_ksl, same_bucket, use_batched_flash, dump.join(" ")
+            );
+        }
 
-        // catsplit: hybrid KV-encode (F16-K + FWHT-V quant) + flash attention +
-        // FWHT-undo (the whole per-slot/batched attention block above).
+        // Q FWHT sign-premult — ONE dispatch (attnpre) or N per-slot dispatches,
+        // covering ALL N queries regardless of same_bucket (premult is a pure
+        // per-row transform independent of kv_seq_len/bucket selection, so it
+        // is hoisted ahead of the same_bucket branch below — both the batched
+        // SDPA path and the per-slot fallback read the SAME already-rotated
+        // `bufs.attn_q_normed`). `dispatch_fwht_sign_premult_f32` is row-count-
+        // agnostic (grid.x = num_heads param, one threadgroup per row, no
+        // cross-row state — same structure as `dispatch_fwht_sign_undo_f32`,
+        // already relied on for the Hybrid arm's ATTNPRE batched undo above) ⇒
+        // per-row bit-identical to N separate per-slot premult calls.
+        session.barrier_between(&[&bufs.attn_q_normed], &[&bufs.attn_q_normed]);
+        if attnpre {
+            mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
+                session.encoder_mut(), reg, metal_dev,
+                &bufs.attn_q_normed, (n as u32) * nh as u32, hd as u32,
+            ).map_err(|e| anyhow::anyhow!("tq batched Q premult L{layer_idx}: {e}"))?;
+        } else {
+            for i in 0..n {
+                let q_i = bufs.attn_q_normed.slice_view(row_off(q_norm_stride, i), q_norm_stride);
+                session.barrier_between(&[&bufs.attn_q_normed], &[&bufs.attn_q_normed]);
+                mlx_native::ops::fwht_standalone::dispatch_fwht_sign_premult_f32(
+                    session.encoder_mut(), reg, metal_dev, &q_i, nh as u32, hd as u32,
+                ).map_err(|e| anyhow::anyhow!("tq Q premult L{layer_idx} s{i}: {e}"))?;
+            }
+        }
+
+        if use_batched_flash {
+            let buf = gbuf;
+            let cap = gcap;
+            let is_ring = gring;
+            // PHASE 1 — KV-encode: K and V are BOTH byte-packed TQ-HB (unlike
+            // hybrid's F16-K), so this is 2 batched `dispatch_hadamard_quantize_
+            // kv_hb_batched` calls (K then V) rather than hybrid's F16-K-copy +
+            // FWHT-V-quantize pair. The scalar default production path fuses
+            // K+V into ONE `dispatch_hadamard_quantize_kv_hb_dual` dispatch
+            // (gpu_full_attn.rs:541); no batched-dual kernel exists yet, so this
+            // uses 2 separate dispatches instead. Bit-parity for the BATCHED
+            // multi-query kernel itself (not just fused-vs-2-scalar-dispatches,
+            // which is a DIFFERENT claim `test_hadamard_quantize_kv_hb_dual_
+            // byte_identity_d256` covers) is proven by mlx-native's
+            // `test_hadamard_quantize_kv_hb_batched_parity.rs`
+            // (`hadamard_quantize_kv_hb_batched_bit_parity_matrix`): N=8 queries
+            // in ONE batched dispatch (mixed ring-wrap + linear positions, full
+            // slot permutation, D=256/512, cbits 5/6/8) vs N separate scalar
+            // `dispatch_hadamard_quantize_kv_hb` calls, byte-compared zero-
+            // tolerance. Opt out: HF2Q_BATCHED_KVENC=0 (same env var as the
+            // Hybrid arm's KV-encode toggle).
+            let v_src_buf: &MlxBuffer = if v_is_k { &bufs.attn_v } else { &bufs.attn_v_normed };
+            let use_batched_kvenc = std::env::var("HF2Q_BATCHED_KVENC").as_deref() != Ok("0");
+            if use_batched_kvenc {
+                session.barrier_between(
+                    &[&bufs.attn_k_normed, v_src_buf],
+                    &[&buf.k_packed, &buf.k_norms, &buf.v_packed, &buf.v_norms],
+                );
+                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_batched(
+                    session.encoder_mut(), reg, metal_dev,
+                    &bufs.attn_k_normed, &buf.k_packed, &buf.k_norms, slot_id_buf, positions_buf,
+                    n as u32, nkv as u32, hd as u32, cap as u32, is_ring,
+                    tq_scale_factor_d512, tq_codebook_bits,
+                ).map_err(|e| anyhow::anyhow!("tq HB-K batched L{layer_idx}: {e}"))?;
+                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb_batched(
+                    session.encoder_mut(), reg, metal_dev,
+                    v_src_buf, &buf.v_packed, &buf.v_norms, slot_id_buf, positions_buf,
+                    n as u32, nkv as u32, hd as u32, cap as u32, is_ring,
+                    tq_scale_factor_d512, tq_codebook_bits,
+                ).map_err(|e| anyhow::anyhow!("tq HB-V batched L{layer_idx}: {e}"))?;
+            } else {
+            for i in 0..n {
+                let slot = slot_ids[i].0 as u64;
+                let seq_pos_i = seq_positions[i];
+                let cache_pos: u32 = if is_ring { (seq_pos_i % cap) as u32 } else { seq_pos_i as u32 };
+                let k_elems = nkv * cap * hd;
+                let norms_per_pos = buf.norms_per_pos;
+                let ne = nkv * cap * norms_per_pos;
+                let norms_shp = if norms_per_pos == 1 { vec![nkv, cap] } else { vec![nkv, cap, norms_per_pos] };
+                let k_view = buf.k_packed.slice_view(slot * (k_elems as u64), k_elems)
+                    .with_shape(vec![nkv, cap, hd]).map_err(|e| anyhow::anyhow!("tq K L{layer_idx} s{i}: {e}"))?;
+                let k_norms_view = buf.k_norms.slice_view(slot * (ne as u64) * 4, ne)
+                    .with_shape(norms_shp.clone()).map_err(|e| anyhow::anyhow!("tq Kn L{layer_idx} s{i}: {e}"))?;
+                let v_view = buf.v_packed.slice_view(slot * (k_elems as u64), k_elems)
+                    .with_shape(vec![nkv, cap, hd]).map_err(|e| anyhow::anyhow!("tq V L{layer_idx} s{i}: {e}"))?;
+                let v_norms_view = buf.v_norms.slice_view(slot * (ne as u64) * 4, ne)
+                    .with_shape(norms_shp).map_err(|e| anyhow::anyhow!("tq Vn L{layer_idx} s{i}: {e}"))?;
+                let kn_i = bufs.attn_k_normed.slice_view(row_off(k_norm_stride, i), k_norm_stride);
+                let v_i = if v_is_k {
+                    bufs.attn_v.slice_view(row_off(v_stride, i), v_stride)
+                } else {
+                    bufs.attn_v_normed.slice_view(row_off(v_normed_stride, i), v_normed_stride)
+                };
+                session.barrier_between(&[&kn_i, v_src_buf], &[&buf.k_packed, &buf.k_norms, &buf.v_packed, &buf.v_norms]);
+                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                    session.encoder_mut(), reg, metal_dev, &kn_i, &k_view, &k_norms_view,
+                    nkv as u32, hd as u32, cap as u32, cache_pos, is_ring, tq_scale_factor_d512, tq_codebook_bits,
+                ).map_err(|e| anyhow::anyhow!("tq HB-K L{layer_idx} s{i}: {e}"))?;
+                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                    session.encoder_mut(), reg, metal_dev, &v_i, &v_view, &v_norms_view,
+                    nkv as u32, hd as u32, cap as u32, cache_pos, is_ring, tq_scale_factor_d512, tq_codebook_bits,
+                ).map_err(|e| anyhow::anyhow!("tq HB-V L{layer_idx} s{i}: {e}"))?;
+            }
+            }
+            // PHASE 2 — ONE `flash_attn_vec_tq_hb_batched` dispatch over all N
+            // queries. The dispatcher OWNS undo semantics (fused reduce+undo at
+            // nwg>1 / standalone fwht_sign_undo at nwg==1 — mlx-native
+            // M-SPEED-LC Stage 1) — NO trailing FWHT-undo call here.
+            let p_tq = mlx_native::ops::flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
+                num_heads: nh as u32, num_kv_heads: nkv as u32, head_dim: hd as u32,
+                kv_seq_len: max_ksl, kv_capacity: cap as u32, scale: 1.0,
+                mask_type: if is_sliding { 2 } else { 1 },
+                sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                softcap: 0.0, ring_start: 0,
+                scale_factor_d512: tq_scale_factor_d512, codebook_bits: tq_codebook_bits,
+                fuse_fwht_pre: 0, nsg: nsg_max,
+            };
+            session.barrier_between(
+                &[&bufs.attn_q_normed, &buf.k_packed, &buf.k_norms, &buf.v_packed, &buf.v_norms, &bufs.sdpa_tmp],
+                &[&bufs.sdpa_out, &bufs.sdpa_tmp],
+            );
+            mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_batched(
+                session.encoder_mut(), reg, dev, n as u32,
+                &bufs.attn_q_normed, &buf.k_packed, &buf.k_norms, &buf.v_packed, &buf.v_norms,
+                &bufs.sdpa_out, &bufs.sdpa_tmp, slot_id_buf, positions_buf, &p_tq,
+            ).map_err(|e| anyhow::anyhow!("batched flash_tq_hb L{layer_idx}: {e}"))?;
+        } else {
+            // Per-slot fallback (mixed-bucket, e.g. staggered slots): the
+            // SCALAR production-equivalent sequence per slot — Q is already
+            // premultiplied above; `flash_attn_vec_tq_hb_with_fused_undo` owns
+            // undo internally (fused reduce+undo at nwg>1 / standalone at
+            // nwg==1), matching the batched arm's contract (no trailing undo).
+            let tmp_stride = elems(&bufs.sdpa_tmp) / n;
+            for i in 0..n {
+                let slot = slot_ids[i].0 as u64;
+                let seq_pos_i = seq_positions[i];
+                let buf = &multi_seq_kv_hb[layer_idx];
+                let cap = buf.capacity;
+                let is_ring = buf.is_sliding;
+                let cache_pos: u32 = if is_ring { (seq_pos_i % cap) as u32 } else { seq_pos_i as u32 };
+                let k_elems = nkv * cap * hd;
+                let norms_per_pos = buf.norms_per_pos;
+                let ne = nkv * cap * norms_per_pos;
+                let norms_shp = if norms_per_pos == 1 { vec![nkv, cap] } else { vec![nkv, cap, norms_per_pos] };
+                let k_view = buf.k_packed.slice_view(slot * (k_elems as u64), k_elems)
+                    .with_shape(vec![nkv, cap, hd])
+                    .map_err(|e| anyhow::anyhow!("tq fallback K slot-view L{layer_idx} s{i}: {e}"))?;
+                let k_norms_view = buf.k_norms.slice_view(slot * (ne as u64) * 4, ne)
+                    .with_shape(norms_shp.clone())
+                    .map_err(|e| anyhow::anyhow!("tq fallback Kn slot-view L{layer_idx} s{i}: {e}"))?;
+                let v_view = buf.v_packed.slice_view(slot * (k_elems as u64), k_elems)
+                    .with_shape(vec![nkv, cap, hd])
+                    .map_err(|e| anyhow::anyhow!("tq fallback V slot-view L{layer_idx} s{i}: {e}"))?;
+                let v_norms_view = buf.v_norms.slice_view(slot * (ne as u64) * 4, ne)
+                    .with_shape(norms_shp)
+                    .map_err(|e| anyhow::anyhow!("tq fallback Vn slot-view L{layer_idx} s{i}: {e}"))?;
+
+                let q_i = bufs.attn_q_normed.slice_view(row_off(q_norm_stride, i), q_norm_stride);
+                let kn_i = bufs.attn_k_normed.slice_view(row_off(k_norm_stride, i), k_norm_stride);
+                let v_src_buf: &MlxBuffer = if v_is_k { &bufs.attn_v } else { &bufs.attn_v_normed };
+                let v_i = if v_is_k {
+                    bufs.attn_v.slice_view(row_off(v_stride, i), v_stride)
+                } else {
+                    bufs.attn_v_normed.slice_view(row_off(v_normed_stride, i), v_normed_stride)
+                };
+                let sdpa_i = bufs.sdpa_out.slice_view(row_off(sdpa_stride, i), sdpa_stride);
+                let tmp_i = bufs.sdpa_tmp.slice_view(row_off(tmp_stride, i), tmp_stride);
+
+                session.barrier_between(
+                    &[&bufs.attn_k_normed, v_src_buf],
+                    &[&buf.k_packed, &buf.k_norms, &buf.v_packed, &buf.v_norms],
+                );
+                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                    session.encoder_mut(), reg, metal_dev, &kn_i, &k_view, &k_norms_view,
+                    nkv as u32, hd as u32, cap as u32, cache_pos, is_ring, tq_scale_factor_d512, tq_codebook_bits,
+                ).map_err(|e| anyhow::anyhow!("tq fallback HB-K write L{layer_idx} s{i}: {e}"))?;
+                mlx_native::ops::hadamard_quantize_kv::dispatch_hadamard_quantize_kv_hb(
+                    session.encoder_mut(), reg, metal_dev, &v_i, &v_view, &v_norms_view,
+                    nkv as u32, hd as u32, cap as u32, cache_pos, is_ring, tq_scale_factor_d512, tq_codebook_bits,
+                ).map_err(|e| anyhow::anyhow!("tq fallback HB-V quant L{layer_idx} s{i}: {e}"))?;
+
+                let kv_seq_len = if is_ring { ((seq_pos_i + 1).min(cap)) as u32 } else { (seq_pos_i + 1) as u32 };
+                let ring_start = if is_ring && kv_seq_len as usize >= cap { ((seq_pos_i + 1) % cap) as u32 } else { 0u32 };
+                session.barrier_between(
+                    &[&bufs.attn_q_normed, &buf.k_packed, &buf.k_norms, &buf.v_packed, &buf.v_norms, &tmp_i],
+                    &[&bufs.sdpa_out, &tmp_i],
+                );
+                let p_tq = mlx_native::ops::flash_attn_vec_tq_hb::FlashAttnVecTqHbParams {
+                    num_heads: nh as u32,
+                    num_kv_heads: nkv as u32,
+                    head_dim: hd as u32,
+                    kv_seq_len,
+                    kv_capacity: cap as u32,
+                    scale: 1.0,
+                    mask_type: if is_sliding { 2 } else { 1 },
+                    sliding_window: if is_sliding { self.sliding_window as u32 } else { 0 },
+                    softcap: 0.0,
+                    ring_start,
+                    scale_factor_d512: tq_scale_factor_d512,
+                    codebook_bits: tq_codebook_bits,
+                    fuse_fwht_pre: 0,
+                    nsg: mlx_native::ops::flash_attn_vec_tq_hb::compute_nsg(kv_seq_len),
+                };
+                mlx_native::ops::flash_attn_vec_tq_hb::flash_attn_vec_tq_hb_with_fused_undo(
+                    session.encoder_mut(), reg, dev,
+                    &q_i, &k_view, &k_norms_view, &v_view, &v_norms_view,
+                    &sdpa_i, &tmp_i, &p_tq,
+                ).map_err(|e| anyhow::anyhow!("tq fallback flash_attn_vec_tq_hb_with_fused_undo L{layer_idx} s{i}: {e}"))?;
+            }
+        }
+        } // end BatchedKvRegime::FullTq
+        }
+
+        // catsplit: KV-encode + flash attention + FWHT-undo (the whole
+        // per-slot/batched attention block above, either regime).
         cat_boundary(session, exec, catsplit::Cat::AttnFlash)?;
 
         let num_experts = self.num_experts;
@@ -1345,16 +1620,18 @@ impl MlxModelWeights {
     /// SlotAware worker feeds those rows to the proven batched head + finalize.
     ///
     /// `tokens[i]` / `slot_ids[i]` / `seq_positions[i]` describe slot `i`'s
-    /// current decode step. Production hybrid-TQ path only (errors otherwise via
-    /// the layer encode). Wired into `decode_batch_gemma4` under
-    /// `HF2Q_BATCHED_BODY=1`; proven byte-identical to N serial slot-aware
-    /// decodes by `slot_aware_n1` + `slot_aware_n4`.
+    /// current decode step. Both production KV regimes (see
+    /// [`BatchedKvRegime`]): hybrid F16-K + TQ-HB-V (`HF2Q_HYBRID_KV=1`,
+    /// DEFAULT) and full-TQ byte-packed K+V (`HF2Q_HYBRID_KV=0`, opt-in;
+    /// ADR-040 M-SPEED-LC Stage 2/3). Wired into `decode_batch_gemma4` under
+    /// `HF2Q_BATCHED_BODY=1`; the hybrid regime is proven byte-identical to N
+    /// serial slot-aware decodes by `slot_aware_n1` + `slot_aware_n4`.
     pub(crate) fn forward_decode_body_batched(
         &self,
         tokens: &[u32],
         slot_ids: &[SlotId],
         seq_positions: &[usize],
-        multi_seq_kv_hybrid: &mut [MultiSeqHybridKvBuffers],
+        regime: &mut BatchedKvRegime<'_>,
         // ADR-040 §25 iter-L — when HF2Q_FUSE_LMHEAD=1 (chunked path only), the
         // lm_head is encoded as the final pipeline chunk and its output is written
         // here (the body then returns an EMPTY Vec; the caller uses `head_out`).
@@ -1509,7 +1786,7 @@ impl MlxModelWeights {
                 while layer_idx < chunk_end {
                     self.encode_one_layer_batched(
                         layer_idx, &bufs, n, &positions_buf, &slot_id_buf,
-                        slot_ids, seq_positions, multi_seq_kv_hybrid,
+                        slot_ids, seq_positions, regime,
                         tq_scale_factor_d512, tq_codebook_bits,
                         &mut s, exec, reg,
                     )?;
@@ -1587,7 +1864,7 @@ impl MlxModelWeights {
             for layer_idx in 0..num_layers {
                 self.encode_one_layer_batched(
                     layer_idx, &bufs, n, &positions_buf, &slot_id_buf,
-                    slot_ids, seq_positions, multi_seq_kv_hybrid,
+                    slot_ids, seq_positions, regime,
                     tq_scale_factor_d512, tq_codebook_bits,
                     &mut s, exec, reg,
                 )?;

@@ -6791,8 +6791,13 @@ fn decode_batch_gemma4(
     // HTTP, each byte-identical to its own serial ref, no cross-slot contamination
     // — at ~1.8× the serial aggregate throughput). The per-slot loop remains
     // available via the opt-out for A/B + as the byte-equiv-harness baseline.
-    let use_batched_body = std::env::var("HF2Q_BATCHED_BODY").as_deref() != Ok("0")
-        && guard.hybrid.is_some();
+    // ADR-040 M-SPEED-LC Stage 2 — batched body is eligible under EITHER
+    // production KV regime now (see `BatchedKvRegime`): hybrid
+    // (`guard.hybrid.is_some()`, HF2Q_HYBRID_KV=1 default) or full-TQ
+    // (`guard.hybrid.is_none()`, HF2Q_HYBRID_KV=0 opt-in — the HB scaffold
+    // `guard.kv` is unconditionally provisioned at spawn per H94, so it is
+    // always available as the FullTq regime's backing buffers).
+    let use_batched_body = std::env::var("HF2Q_BATCHED_BODY").as_deref() != Ok("0");
     let mut captured = Vec::new();
     let mut hidden_rows: Vec<f32> = Vec::new();
     // ADR-040 §25 iter-L — when HF2Q_FUSE_LMHEAD=1, the batched body encodes the
@@ -6833,12 +6838,48 @@ fn decode_batch_gemma4(
             _hp_gather.elapsed().as_nanos() as u64,
         );
         let _catsplit_g0 = std::time::Instant::now();
-        let body_res = {
-            let hybrid = guard.hybrid.as_mut().unwrap();
+        // ADR-040 M-SPEED-LC Stage 2 (codex CHANGES-REQUIRED fix) — regime
+        // selection is gated on `INVESTIGATION_ENV.hybrid_kv` (the SAME
+        // HF2Q_HYBRID_KV-derived flag `provision_multi_seq_kv_for_slot_aware`
+        // reads at spawn to decide whether to allocate `multi_seq_kv_hybrid`,
+        // engine.rs:3242), NOT merely on `guard.hybrid.is_some()`. Selecting
+        // FullTq whenever `guard.hybrid` happens to be `None` would silently
+        // reroute onto the wrong scaffold if HF2Q_HYBRID_KV=1 (default) but
+        // the hybrid scaffold failed to provision (a spawn-arm invariant
+        // violation) — the older scalar slot-aware path treats that exact
+        // condition as a typed `iter-C2c-cont-invariant-violated` error (see
+        // `forward_prefill.rs:4587-4602`); this mirrors that, no silent
+        // fallback.
+        let body_res = if crate::debug::INVESTIGATION_ENV.hybrid_kv {
+            match guard.hybrid.as_mut() {
+                Some(hybrid) => {
+                    let mut regime = crate::inference::models::gemma4::batched_body::BatchedKvRegime::Hybrid(
+                        hybrid.as_mut_slice(),
+                    );
+                    let lm = &mut *guard.model;
+                    lm.weights
+                        .forward_decode_body_batched(
+                            &tokens, &sids, &positions, &mut regime, &mut fused_head_out, &mut lm.ctx,
+                        )
+                }
+                None => Err(anyhow::anyhow!(
+                    "gemma4-batched-decode-hybrid-scaffold-absent (iter-C2c-cont-invariant-violated \
+                     per ADR-040 §6.1.38 — HF2Q_HYBRID_KV=1 production-default; \
+                     INVESTIGATION_ENV.hybrid_kv == true AT CALL TIME but guard.hybrid is None \
+                     at the batched-body call site — iter-C2c-cont spawn-arm invariant violated \
+                     (provision_multi_seq_kv_for_slot_aware must allocate MultiSeqHybridKvBuffers \
+                     when HF2Q_HYBRID_KV=1; ADR-040 §6.1.33). ADR-040 M-SPEED-LC Stage 2 regime \
+                     selection — no silent FullTq fallback."
+                )),
+            }
+        } else {
+            let mut regime = crate::inference::models::gemma4::batched_body::BatchedKvRegime::FullTq(
+                guard.kv.as_mut_slice(),
+            );
             let lm = &mut *guard.model;
             lm.weights
                 .forward_decode_body_batched(
-                    &tokens, &sids, &positions, hybrid, &mut fused_head_out, &mut lm.ctx,
+                    &tokens, &sids, &positions, &mut regime, &mut fused_head_out, &mut lm.ctx,
                 )
         };
         DECODE_BODY_GPU_NS.fetch_add(
