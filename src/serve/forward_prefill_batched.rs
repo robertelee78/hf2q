@@ -411,11 +411,13 @@ impl MlxModelWeights {
         // HF2Q_GLOBAL_FA=1 forces FA for globals at ANY seq > 64;
         // HF2Q_NO_FA=1 forces tensor-mm everywhere it can run (seq >= 32,
         // including > 8192 — O(seq²) memory by explicit operator choice).
-        // ADR-040 iter-G(a): the MULTI-SEQ path always uses F16 FA for the
-        // global D=512 layers — tensor-mm CANNOT be byte-identical to per-seq
-        // attention (it sums over masked cross-seq columns → near-tie argmax
-        // flips), whereas the (blk-fixed, §0.19/cb9806c) F16 D512 FA SKIPS
-        // masked tiles and isolates byte-exact.
+        // ADR-040 iter-G(a): the MULTI-SEQ path always uses FA (BF16 —
+        // `use_fa_f16` above excludes multi-seq, so it takes the BF16 FA
+        // branch) for the global D=512 layers — tensor-mm CANNOT be
+        // byte-identical to per-seq attention (it sums over masked
+        // cross-seq columns → near-tie argmax flips), whereas the
+        // (blk-fixed, §0.19/cb9806c) FA kernels SKIP masked tiles and
+        // isolate byte-exact.
         /// ADR-040 §7.32K: upper bound of the single-seq global-layer
         /// tensor-mm (NO_FA) domain; above it globals route through F16
         /// D512 FA (O(seq) memory). See the routing comment above.
@@ -2641,9 +2643,10 @@ impl MlxModelWeights {
                 } else { None };
                 // ADR-029 iter-82 H62: O-proj reads pf_sdpa_out (NO_FA layout
                 // f32) only when this layer actually routed through NO_FA
-                // (i.e. !is_sliding AND use_no_fa).  Sliding layers under
-                // FA_SW populated pf_sdpa_out_perm (FA layout bf16) and
-                // need the FA-style O-proj branch.
+                // (i.e. !is_sliding AND (use_no_fa || force_global_nofa) —
+                // the §7.32K seq-bounded global routing). Sliding layers
+                // under FA_SW populated pf_sdpa_out_perm (FA layout bf16)
+                // and need the FA-style O-proj branch.
                 if route_through_nofa {
                     s.barrier_between(
                         &[&pf_sdpa_out, &self.layers[layer_idx].attn.o_proj.buffer],
