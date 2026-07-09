@@ -447,7 +447,29 @@ pub struct ReasoningSplitter {
 impl ReasoningSplitter {
     /// Build from a registration. If the registration has no reasoning
     /// markers, returns `None` — callers route all text to `Content`.
+    ///
+    /// Starts OUTSIDE reasoning. Engine paths must construct through
+    /// [`make_reasoning_splitter`] instead so the ADR-005 iter-230
+    /// forced-open seed is never dropped (grep-pinned by
+    /// `iter230_b2_factory_only_construction`).
     pub fn from_registration(reg: &ModelRegistration) -> Option<Self> {
+        Self::from_registration_forced(reg, false)
+    }
+
+    /// Build from a registration with an explicit initial reasoning
+    /// state (ADR-005 iter-230 B). `forced_open = true` when the
+    /// rendered prompt ends inside an open reasoning block (e.g. the
+    /// Qwen 3.6 template seeds `<think>\n` at the end of the generation
+    /// prompt with thinking on) — the completion then begins INSIDE
+    /// reasoning and the model never re-emits the open marker, so an
+    /// unseeded splitter would leak the whole reasoning span plus the
+    /// close marker into `content`. A redundant model-emitted open
+    /// marker while seeded open is reasoning TEXT (today's nested-open
+    /// behavior), not swallowed.
+    pub fn from_registration_forced(
+        reg: &ModelRegistration,
+        forced_open: bool,
+    ) -> Option<Self> {
         let (open, close) = match (reg.reasoning_open, reg.reasoning_close) {
             (Some(o), Some(c)) if !o.is_empty() && !c.is_empty() => (o, c),
             _ => return None,
@@ -456,7 +478,7 @@ impl ReasoningSplitter {
         Some(Self {
             open_marker: open,
             close_marker: close,
-            in_reasoning: false,
+            in_reasoning: forced_open,
             tail_buf: String::with_capacity(cap * 2),
             tail_cap: cap,
         })
@@ -1115,11 +1137,62 @@ fn parse_qwen35_tool_call(body: &str) -> Option<ParsedToolCall> {
 /// Helper: run a `ReasoningSplitter` over the full generated text and
 /// return the two split strings. Used by the non-streaming path to populate
 /// `message.content` + `message.reasoning_content` on the final response.
+/// THE factory for engine-path `ReasoningSplitter` construction
+/// (ADR-005 iter-230 B, gate-1 #10). Every generate/stream/embed path
+/// builds its splitter here, passing the request's
+/// `SamplingParams.reasoning_forced_open`, so a construction site can't
+/// silently drop the forced-open seed. Direct
+/// `ReasoningSplitter::from_registration*` calls outside registry.rs
+/// are grep-pinned away by `iter230_b2_factory_only_construction`.
+pub fn make_reasoning_splitter(
+    reg: &ModelRegistration,
+    forced_open: bool,
+) -> Option<ReasoningSplitter> {
+    ReasoningSplitter::from_registration_forced(reg, forced_open)
+}
+
+/// Does the rendered chat prompt end inside an OPEN reasoning block
+/// (ADR-005 iter-230 B decision 1)?
+///
+/// Rule: the trimmed prompt ends with the registration's reasoning-open
+/// marker. The chat template always appends the generation prompt AFTER
+/// user content, so the tail is template-controlled — not client-
+/// spoofable. Truth table (pinned in tests):
+///   * qwen thinking-on  → ends `<think>`      → TRUE
+///   * qwen thinking-off → ends `</think>` + ws → FALSE (suppressor)
+///   * Gemma thinking-on → ends `<|turn>model`  → FALSE (model emits its
+///     own open marker in the completion)
+///   * Gemma thinking-off → ends `<channel|>`   → FALSE (closed seed)
+pub fn prompt_seeds_reasoning_open(rendered: &str, reg: &ModelRegistration) -> bool {
+    match reg.reasoning_open {
+        // Both sides trimmed: markers may carry a trailing newline
+        // (Gemma's `<|channel>thought\n`), which `trim_end()` on the
+        // prompt side would otherwise make unmatchable.
+        Some(open) if !open.trim_end().is_empty() => {
+            rendered.trim_end().ends_with(open.trim_end())
+        }
+        _ => false,
+    }
+}
+
 pub fn split_full_output(
     reg: &ModelRegistration,
     full_text: &str,
 ) -> (String, Option<String>) {
-    let mut splitter = match ReasoningSplitter::from_registration(reg) {
+    split_full_output_forced(reg, full_text, false)
+}
+
+/// `split_full_output` with the iter-230 forced-open seed. The
+/// non-streaming assembly path passes the request's
+/// `reasoning_forced_open` so a prompt-seeded reasoning span lands in
+/// `reasoning_content` instead of leaking (with its close marker) into
+/// `content`.
+pub fn split_full_output_forced(
+    reg: &ModelRegistration,
+    full_text: &str,
+    forced_open: bool,
+) -> (String, Option<String>) {
+    let mut splitter = match make_reasoning_splitter(reg, forced_open) {
         Some(s) => s,
         None => return (full_text.to_string(), None),
     };
@@ -2062,6 +2135,126 @@ const _COMPILE_REFERENCES: fn() -> HashMap<String, ModelRegistration> = || HashM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ADR-005 iter-230 B — forced-open seeding (AC-B1/AC-B2) ----
+
+    /// Suffix-rule truth table (Decision B1) for the served templates'
+    /// generation-prompt tails.
+    #[test]
+    fn iter230_b1_prompt_seeds_reasoning_open_truth_table() {
+        // qwen thinking-on: template seeds an OPEN think block.
+        assert!(prompt_seeds_reasoning_open(
+            "<|im_start|>assistant\n<think>\n",
+            &QWEN35
+        ));
+        // qwen thinking-off: pre-closed suppressor → NOT seeded.
+        assert!(!prompt_seeds_reasoning_open(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            &QWEN35
+        ));
+        // Gemma thinking-on: bare model turn — the model emits its own
+        // open marker in the completion → NOT seeded.
+        assert!(!prompt_seeds_reasoning_open("<|turn>model\n", &GEMMA4));
+        // Gemma thinking-off: closed-channel seed ends with the CLOSE
+        // marker → NOT seeded.
+        assert!(!prompt_seeds_reasoning_open(
+            "<|turn>model\n<|channel>thought\n<channel|>",
+            &GEMMA4
+        ));
+        // No reasoning markers → never seeded.
+        let no_markers = ModelRegistration {
+            family: "none",
+            id_substrings: &["x"],
+            reasoning_open: None,
+            reasoning_close: None,
+            tool_open: None,
+            tool_close: None,
+            tool_preamble: None,
+        };
+        assert!(!prompt_seeds_reasoning_open("<think>\n", &no_markers));
+    }
+
+    /// Seeded-open: close marker split across fragment boundaries; the
+    /// pre-close span routes to Reasoning, post-close to Content.
+    #[test]
+    fn iter230_b1_seeded_open_close_marker_across_fragments() {
+        let mut sp = make_reasoning_splitter(&QWEN35, true).unwrap();
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        for frag in ["I think", " therefore</th", "ink>I am"] {
+            for (slot, s) in sp.feed(frag) {
+                match slot {
+                    SplitSlot::Reasoning => reasoning.push_str(&s),
+                    SplitSlot::Content => content.push_str(&s),
+                }
+            }
+        }
+        if let Some((slot, s)) = sp.finish() {
+            match slot {
+                SplitSlot::Reasoning => reasoning.push_str(&s),
+                SplitSlot::Content => content.push_str(&s),
+            }
+        }
+        assert_eq!(reasoning, "I think therefore");
+        assert_eq!(content, "I am");
+    }
+
+    /// Seeded-open with NO close marker: finish() drains the tail to
+    /// Reasoning — nothing leaks into content.
+    #[test]
+    fn iter230_b1_seeded_open_no_close_finish_routes_to_reasoning() {
+        let (content, reasoning) =
+            split_full_output_forced(&QWEN35, "endless pondering with no close", true);
+        assert_eq!(content, "");
+        assert_eq!(reasoning.as_deref(), Some("endless pondering with no close"));
+    }
+
+    /// Unseeded (forced_open=false) behavior is byte-identical to the
+    /// legacy constructor on marker-bearing text.
+    #[test]
+    fn iter230_b1_unseeded_byte_identical_to_legacy() {
+        let text = "Sure! <think>step by step</think>The answer is 42.";
+        let legacy = split_full_output(&QWEN35, text);
+        let forced_false = split_full_output_forced(&QWEN35, text, false);
+        assert_eq!(legacy, forced_false);
+        assert_eq!(legacy.0, "Sure! The answer is 42.");
+        assert_eq!(legacy.1.as_deref(), Some("step by step"));
+    }
+
+    /// Redundant model-emitted open marker while seeded open is
+    /// reasoning TEXT (today's nested-open behavior), not swallowed.
+    #[test]
+    fn iter230_b1_redundant_open_while_seeded_is_reasoning_text() {
+        let (content, reasoning) =
+            split_full_output_forced(&QWEN35, "<think>abc</think>done", true);
+        assert_eq!(reasoning.as_deref(), Some("<think>abc"));
+        assert_eq!(content, "done");
+    }
+
+    /// AC-B2 — factory-only construction pin: no engine-path module
+    /// constructs a ReasoningSplitter directly; everything routes
+    /// through `make_reasoning_splitter` so the forced-open seed can't
+    /// be silently dropped. (Pattern built at runtime so this pin's own
+    /// source stays out of the scan.)
+    #[test]
+    fn iter230_b2_factory_only_construction() {
+        let direct = format!("{}::{}", "ReasoningSplitter", "from_registration");
+        let modules: [(&str, &str); 4] = [
+            ("engine.rs", include_str!("engine.rs")),
+            ("engine_qwen35.rs", include_str!("engine_qwen35.rs")),
+            ("engine_qwen3vl.rs", include_str!("engine_qwen3vl.rs")),
+            ("handlers.rs", include_str!("handlers.rs")),
+        ];
+        for (name, src) in modules {
+            assert_eq!(
+                src.matches(&direct).count(),
+                0,
+                "{name}: direct ReasoningSplitter construction found — \
+                 use registry::make_reasoning_splitter(reg, forced_open) \
+                 so the iter-230 forced-open seed is threaded"
+            );
+        }
+    }
 
     #[test]
     fn gemma4_matches_real_model_ids() {

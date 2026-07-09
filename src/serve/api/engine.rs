@@ -359,6 +359,17 @@ pub struct SamplingParams {
     /// Defaults to `Auto` (content fallback) so the pre-wave-2.5
     /// behavior is preserved for all callers that don't set this field.
     pub tool_call_policy: ToolCallPolicy,
+
+    // --- ADR-005 iter-230 B — reasoning forced-open seed ---
+    /// `true` when the rendered chat prompt ends inside an OPEN
+    /// reasoning block (e.g. Qwen 3.6 template seeds `<think>\n` with
+    /// thinking on), so the completion begins inside reasoning and the
+    /// model never re-emits the open marker. Consumed by every
+    /// `registry::make_reasoning_splitter` call on the generate paths.
+    /// Computed by `handlers.rs` via
+    /// `registry::prompt_seeds_reasoning_open` on the rendered prompt;
+    /// `false` (the default) = pre-iter-230 behavior.
+    pub reasoning_forced_open: bool,
 }
 
 impl Default for SamplingParams {
@@ -385,6 +396,7 @@ impl Default for SamplingParams {
             token_bytes: None,
             grammar_kind: GrammarKind::default(),
             tool_call_policy: ToolCallPolicy::Auto,
+            reasoning_forced_open: false,
         }
     }
 }
@@ -5230,6 +5242,10 @@ struct Gemma4DecodeState {
     reasoning_splitter: Option<super::registry::ReasoningSplitter>,
     reasoning_enabled: bool,
     reasoning_token_count: usize,
+    /// ADR-005 iter-230 B: the request's forced-open seed, carried so
+    /// the finish-path full-output re-split starts in the same state
+    /// the streaming splitter did.
+    reasoning_forced_open: bool,
     want_logprobs: bool,
     logprobs_acc: Option<Vec<f32>>,
     logit_bias: std::collections::HashMap<u32, f32>,
@@ -5445,8 +5461,9 @@ impl Gemma4DecodeState {
 
         let mut reasoning_splitter = registration
             .filter(|r| r.has_reasoning())
-            .and_then(super::registry::ReasoningSplitter::from_registration);
+            .and_then(|r| super::registry::make_reasoning_splitter(r, params.reasoning_forced_open));
         let reasoning_enabled = reasoning_splitter.is_some();
+        let reasoning_forced_open = params.reasoning_forced_open;
         let mut reasoning_token_count: usize = 0;
 
         let decode_started = Instant::now();
@@ -5504,6 +5521,7 @@ impl Gemma4DecodeState {
             reasoning_splitter,
             reasoning_enabled,
             reasoning_token_count,
+            reasoning_forced_open,
             want_logprobs,
             logprobs_acc,
             logit_bias: params.logit_bias.clone(),
@@ -5741,7 +5759,11 @@ impl Gemma4DecodeState {
     fn finish(self, registration: Option<&super::registry::ModelRegistration>) -> GenerationResult {
         let (content, reasoning_text) = match registration {
             Some(reg) if reg.has_reasoning() => {
-                super::registry::split_full_output(reg, &self.decoded_text)
+                super::registry::split_full_output_forced(
+                    reg,
+                    &self.decoded_text,
+                    self.reasoning_forced_open,
+                )
             }
             _ => (self.decoded_text, None),
         };
@@ -11038,7 +11060,7 @@ fn generate_once_with_soft_tokens(
     // path's accounting exactly so stream + non-stream usage agree.
     let mut splitter = registration
         .filter(|r| r.has_reasoning())
-        .and_then(super::registry::ReasoningSplitter::from_registration);
+        .and_then(|r| super::registry::make_reasoning_splitter(r, params.reasoning_forced_open));
     let reasoning_enabled = splitter.is_some();
     let mut reasoning_token_count: usize = 0;
 
@@ -11242,7 +11264,7 @@ fn generate_once_with_soft_tokens(
     // markers registered. If not, the full decoded text goes into
     // `content` and `reasoning_text` is `None`.
     let (content, reasoning_text) = match registration {
-        Some(reg) if reg.has_reasoning() => super::registry::split_full_output(reg, &decoded_text),
+        Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(reg, &decoded_text, params.reasoning_forced_open),
         _ => (decoded_text, None),
     };
 
@@ -11821,7 +11843,7 @@ fn generate_gemma4_once_slot_aware(
         // Mirror of generate_once at engine.rs:7671-7675.
         let mut splitter = registration
             .filter(|r| r.has_reasoning())
-            .and_then(super::registry::ReasoningSplitter::from_registration);
+            .and_then(|r| super::registry::make_reasoning_splitter(r, params.reasoning_forced_open));
         let reasoning_enabled = splitter.is_some();
         let mut reasoning_token_count: usize = 0;
 
@@ -11985,7 +12007,7 @@ fn generate_gemma4_once_slot_aware(
         // at engine.rs:7876-7879.
         let (content, reasoning_text) = match registration {
             Some(reg) if reg.has_reasoning() => {
-                super::registry::split_full_output(reg, &decoded_text)
+                super::registry::split_full_output_forced(reg, &decoded_text, params.reasoning_forced_open)
             }
             _ => (decoded_text, None),
         };
@@ -12440,7 +12462,7 @@ fn generate_stream_gemma4_once_slot_aware(
                 // has no reasoning markers registered), every fragment
                 // routes to Content.
                 let mut reason_splitter = registration
-                    .and_then(super::registry::ReasoningSplitter::from_registration);
+                    .and_then(|r| super::registry::make_reasoning_splitter(r, params.reasoning_forced_open));
 
                 // ADR-040 iter-2-decode-C-stream-tool-call per §6.1.48 —
                 // tool-call splitter classifies the post-reasoning
@@ -13585,7 +13607,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
 
         let mut splitter = registration
             .filter(|r| r.has_reasoning())
-            .and_then(super::registry::ReasoningSplitter::from_registration);
+            .and_then(|r| super::registry::make_reasoning_splitter(r, params.reasoning_forced_open));
         let reasoning_enabled = splitter.is_some();
         let mut reasoning_token_count: usize = 0;
 
@@ -13741,7 +13763,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
 
         let (content, reasoning_text) = match registration {
             Some(reg) if reg.has_reasoning() => {
-                super::registry::split_full_output(reg, &decoded_text)
+                super::registry::split_full_output_forced(reg, &decoded_text, params.reasoning_forced_open)
             }
             _ => (decoded_text, None),
         };
@@ -15012,8 +15034,13 @@ fn replay_cached_streaming_response_with_fragments(
     // embedded reasoning markers (streaming-origin entries).  The
     // ToolCallSplitter handles embedded tool-call markers regardless of
     // origin (neither streaming nor non-streaming strips them).
+    //
+    // iter-230 B: forced_open = false here BY DESIGN — this replays a
+    // CACHED GenerationResult whose text was already split at capture
+    // time (the original request's seed applied then); the cached
+    // content field starts OUTSIDE any reasoning span.
     let mut reasoning_splitter = registration
-        .and_then(|r| super::registry::ReasoningSplitter::from_registration(r));
+        .and_then(|r| super::registry::make_reasoning_splitter(r, false));
     let mut tool_splitter = registration
         .and_then(|r| super::registry::ToolCallSplitter::from_registration(r));
 
@@ -15504,7 +15531,7 @@ fn generate_stream_once(
     // content / reasoning_content slot. `None` when the model has no
     // registered reasoning markers; all fragments then route to `Content`.
     let mut splitter = registration
-        .and_then(|r| super::registry::ReasoningSplitter::from_registration(r));
+        .and_then(|r| super::registry::make_reasoning_splitter(r, params.reasoning_forced_open));
 
     // Tool-call splitter (iter-133 Iter B-2) — classifies the
     // post-reasoning Content stream into in/out-of-tool-call spans. When a
@@ -16386,8 +16413,22 @@ pub fn render_chat_prompt(
     template_str: &str,
     messages: &[super::schema::ChatMessage],
 ) -> Result<String> {
-    render_chat_prompt_with_tools(template_str, messages, None, false)
+    render_chat_prompt_with_tools(template_str, messages, None, false, None)
 }
+
+/// Context keys the renderer owns; a request whose `chat_template_kwargs`
+/// names one of these is rejected before render (ADR-005 iter-229
+/// Decision 4). `enable_thinking` is deliberately absent: kwargs may
+/// override it (llama.cpp parity) — the merge order below makes kwargs
+/// win every collision that survives this validation.
+const RESERVED_TEMPLATE_KWARGS: &[&str] = &[
+    "messages",
+    "tools",
+    "add_generation_prompt",
+    "bos_token",
+    "eos_token",
+    "raise_exception",
+];
 
 /// Render the chat template with optional tool-definition exposure.
 ///
@@ -16419,24 +16460,30 @@ pub fn render_chat_prompt_with_tools(
     messages: &[super::schema::ChatMessage],
     tools: Option<&[super::schema::Tool]>,
     enable_thinking: bool,
+    chat_template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<String> {
     use super::schema::MessageContent;
 
-    let remap_assistant_to_model = template_str.contains("<|turn>model");
-
-    // Build a lookup table tool_call_id → function-name for synthesizing
-    // `tool_responses` on subsequent role:"tool" messages. This is a
-    // single-pass scan; assistant messages with tool_calls populate the
-    // map, role:"tool" messages consume it.
-    let mut id_to_name: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for msg in messages {
-        if let Some(tcs) = msg.tool_calls.as_ref() {
-            for tc in tcs {
-                id_to_name.insert(tc.id.clone(), tc.function.name.clone());
+    // ADR-005 iter-229 Decision 4 step (a): reject renderer-owned keys
+    // up front so the merge below can let kwargs win unconditionally.
+    if let Some(kwargs) = chat_template_kwargs {
+        for key in kwargs.keys() {
+            if RESERVED_TEMPLATE_KWARGS.contains(&key.as_str()) {
+                anyhow::bail!("reserved chat_template_kwargs key: {key}");
             }
         }
     }
+
+    let remap_assistant_to_model = template_str.contains("<|turn>model");
+
+    // Lookup table tool_call_id → function-name for synthesizing
+    // `tool_responses` on role:"tool" messages. Populated INCREMENTALLY
+    // while walking messages (ADR-005 iter-229 Decision 5): a tool
+    // message only resolves ids defined by PRIOR assistant turns, and a
+    // duplicate id binds to the most recent prior definition. Forward
+    // references and unknown ids fall back to "unknown".
+    let mut id_to_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     let mut out_msgs: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
     for msg in messages {
@@ -16456,21 +16503,49 @@ pub fn render_chat_prompt_with_tools(
         obj.insert("role".into(), serde_json::Value::String(role));
         obj.insert("content".into(), serde_json::Value::String(content_text));
 
+        // Reasoning echo-back (ADR-005 iter-229 Decision 3): assistant
+        // messages only. The Qwen 3.6 template's preserve branch
+        // (qwen3-chatml.jinja:100) re-emits this as `<think>…</think>`
+        // for tool-loop-tail turns; without it the model is shown a
+        // fabricated empty think block as its own prior output.
+        if msg.role == "assistant" {
+            if let Some(rc) = msg.reasoning_content.as_ref() {
+                obj.insert(
+                    "reasoning_content".into(),
+                    serde_json::Value::String(rc.clone()),
+                );
+            }
+        }
+
         // Assistant tool_calls: serialize each as
-        // `{id, type, function: {name, arguments}}`. `arguments` is kept as
-        // the raw OpenAI string (Gemma 4's template handles both string and
-        // mapping shapes; preserving the string form is closest to how the
-        // model emitted it the first time).
+        // `{id, type, function: {name, arguments}}`. `arguments` is the
+        // raw OpenAI string UNLESS it parses to a JSON object, in which
+        // case the mapping is substituted (ADR-005 iter-229 Decision 2)
+        // — the Qwen template runs `tool_call.arguments|items`, which
+        // requires a mapping. Arrays/scalars/parse failures keep the
+        // string verbatim (today's shape).
         if let Some(tcs) = msg.tool_calls.as_ref() {
             let arr: Vec<serde_json::Value> = tcs
                 .iter()
                 .map(|tc| {
+                    // Only ASSISTANT turns define ids (OpenAI semantics);
+                    // tool_calls smuggled onto other roles must not poison
+                    // the resolution map (gate-3 #1).
+                    if msg.role == "assistant" {
+                        id_to_name.insert(tc.id.clone(), tc.function.name.clone());
+                    }
+                    let arguments = match serde_json::from_str::<serde_json::Value>(
+                        &tc.function.arguments,
+                    ) {
+                        Ok(v @ serde_json::Value::Object(_)) => v,
+                        _ => serde_json::Value::String(tc.function.arguments.clone()),
+                    };
                     serde_json::json!({
                         "id": tc.id,
                         "type": tc.call_type,
                         "function": {
                             "name": tc.function.name,
-                            "arguments": tc.function.arguments,
+                            "arguments": arguments,
                         },
                     })
                 })
@@ -16517,47 +16592,49 @@ pub fn render_chat_prompt_with_tools(
         Some(t) => serde_json::to_value(t).unwrap_or(serde_json::Value::Null),
     };
 
-    let mut env = minijinja::Environment::new();
-    // ADR-005 Phase 2a iter-133 Iter A side-fix: register
-    // `minijinja-contrib`'s pycompat callback so chat templates authored
-    // against Python's Jinja2 (which transparently exposes Python-string
-    // methods like `.split()`, `.strip()`, `.lstrip()`, `.lower()`) render
-    // without `UnknownMethod` errors. The Gemma 4 chat template's
-    // `strip_thinking` macro calls `text.split('<channel|>')` on every
-    // assistant content; without pycompat, every multi-turn chat fails
-    // HTTP 400 at the second user turn (the first model message hits the
-    // macro). Discovered during the iter-133 Open WebUI multi-turn E2E
-    // test harness; pycompat is purely additive (consulted only when
-    // minijinja can't find a method natively), so existing single-turn
-    // and non-Python-style templates are unaffected.
-    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    // ADR-005 iter-229 Decision 1: shared env builder — the API path's
+    // hand-rolled environment (pycompat only) diverged from the one-shot
+    // renderer's (which had `tojson` + `raise_exception`), so every
+    // `tools`-bearing request against the Qwen 3.6 template failed at
+    // `tool | tojson` before inference. Strict raise policy: the
+    // transcript is client-supplied, so template raise sites are
+    // reachable and their message must surface in the 400 body.
+    let mut env = crate::serve::build_chat_template_env(crate::serve::RaisePolicy::Strict);
     env.add_template("chat", template_str)
         .context("Failed to parse chat template as Jinja2")?;
     let tmpl = env
         .get_template("chat")
         .context("Failed to load parsed chat template")?;
+
+    // Context assembly (ADR-005 iter-229 Decision 4): renderer values
+    // first, then `chat_template_kwargs` merged OVER them — kwargs win
+    // every collision that survived the reserved-key validation above
+    // (i.e. only `enable_thinking`, the deliberate llama.cpp-parity
+    // exception, plus free keys like `preserve_thinking`). Values pass
+    // to Jinja verbatim; templates own their type checks.
+    //
+    // `enable_thinking` semantics (ADR-005 iter-133 Iter D, W67
+    // unchanged): reasoning-capable templates branch on it to open or
+    // suppress a thinking trace; templates that don't reference it are
+    // unaffected.
+    let mut ctx = serde_json::Map::new();
+    ctx.insert("messages".into(), serde_json::Value::Array(out_msgs));
+    ctx.insert("tools".into(), tools_json);
+    ctx.insert(
+        "enable_thinking".into(),
+        serde_json::Value::Bool(enable_thinking),
+    );
+    ctx.insert("add_generation_prompt".into(), serde_json::Value::Bool(true));
+    ctx.insert("bos_token".into(), serde_json::Value::String("<bos>".into()));
+    ctx.insert("eos_token".into(), serde_json::Value::String("<eos>".into()));
+    if let Some(kwargs) = chat_template_kwargs {
+        for (k, v) in kwargs {
+            ctx.insert(k.clone(), v.clone());
+        }
+    }
+
     let rendered = tmpl
-        .render(minijinja::context! {
-            messages => out_msgs,
-            tools => tools_json,
-            // ADR-005 Phase 2a iter-133 Iter D (W67): expose
-            // `enable_thinking` to the chat template so reasoning-capable
-            // models can be told to actually emit a thinking trace. Gemma 4's
-            // template (chat_template.jinja:161-163) emits a `<|think|>`
-            // system-block hint when this is true; lines 263-265 also
-            // skip the closed-channel seed (`<|channel>thought\n<channel|>`)
-            // so the model is free to emit its own
-            // `<|channel>thought\n…<channel|>` block during decode. Qwen 3.5/3.6
-            // templates accept the same kwarg per HF convention. Templates
-            // that don't reference `enable_thinking` ignore the variable
-            // (Jinja default behavior — undefined-or-default(false) gates
-            // are unchanged), so the legacy non-reasoning path stays
-            // byte-identical.
-            enable_thinking => enable_thinking,
-            add_generation_prompt => true,
-            bos_token => "<bos>",
-            eos_token => "<eos>",
-        })
+        .render(minijinja::Value::from_serialize(&ctx))
         .context("Failed to render chat template")?;
     Ok(rendered)
 }
@@ -16929,16 +17006,16 @@ assistant:
                 },
             },
         ];
-        let out = render_chat_prompt_with_tools(tmpl, &msgs, Some(&tools), false).unwrap();
+        let out = render_chat_prompt_with_tools(tmpl, &msgs, Some(&tools), false, None).unwrap();
         assert!(out.contains("TOOLS:2"), "out={out}");
         assert!(out.contains("get_current_weather;"), "out={out}");
         assert!(out.contains("get_news;"), "out={out}");
         assert!(out.contains("user:weather?"), "out={out}");
 
         // None / empty path → tools block must NOT fire.
-        let out_none = render_chat_prompt_with_tools(tmpl, &msgs, None, false).unwrap();
+        let out_none = render_chat_prompt_with_tools(tmpl, &msgs, None, false, None).unwrap();
         assert!(!out_none.contains("TOOLS:"), "out_none={out_none}");
-        let out_empty = render_chat_prompt_with_tools(tmpl, &msgs, Some(&[]), false).unwrap();
+        let out_empty = render_chat_prompt_with_tools(tmpl, &msgs, Some(&[]), false, None).unwrap();
         assert!(!out_empty.contains("TOOLS:"), "out_empty={out_empty}");
 
         // Legacy entry-point `render_chat_prompt` (no tools param) should be
@@ -16981,7 +17058,12 @@ assistant:
                     call_type: "function".into(),
                     function: super::super::schema::ToolCallFunction {
                         name: "get_current_weather".into(),
-                        arguments: "{\"location\":\"Paris\"}".into(),
+                        // Deliberately NOT valid JSON: iter-229 Decision 2
+                        // substitutes a mapping for valid object strings, so
+                        // this test keeps a malformed string to pin the
+                        // verbatim-threading path; shape coverage lives in
+                        // the iter-229 AC2 tests below.
+                        arguments: "location=Paris".into(),
                     },
                 }]),
                 tool_call_id: None,
@@ -16998,11 +17080,12 @@ assistant:
                 name: None,
             },
         ];
-        let out = render_chat_prompt_with_tools(tmpl, &msgs, None, false).unwrap();
+        let out = render_chat_prompt_with_tools(tmpl, &msgs, None, false, None).unwrap();
         assert!(out.contains("[user]Paris weather?"), "out={out}");
-        // Assistant message: tool_calls visible verbatim (string-arguments).
+        // Assistant message: tool_calls visible verbatim (non-object
+        // arguments string is preserved raw per iter-229 Decision 2).
         assert!(
-            out.contains("[assistant]TC:get_current_weather({\"location\":\"Paris\"});"),
+            out.contains("[assistant]TC:get_current_weather(location=Paris);"),
             "out={out}"
         );
         // Tool message: tool_responses synthesized via id_to_name lookup.
@@ -17035,6 +17118,517 @@ assistant:
         let out = render_chat_prompt(tmpl, &msgs).unwrap();
         // Image part is silently dropped (iter 3 scope); text parts joined.
         assert_eq!(out.trim(), "what is this?|");
+    }
+
+    // ---- ADR-005 iter-229: env parity + tool-args mapping + reasoning ----
+    //
+    // Spike-driven ACs; the vendor qwen3-chatml fixture is byte-identical
+    // to the GGUF-embedded template of the served Qwen 3.6 model, so these
+    // tests exercise the REAL serve-path render.
+
+    fn i229_msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: Some(MessageContent::Text(content.into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn i229_tool_call(id: &str, name: &str, arguments: &str) -> super::super::schema::ToolCall {
+        super::super::schema::ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: super::super::schema::ToolCallFunction {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
+
+    fn i229_tools() -> Vec<super::super::schema::Tool> {
+        vec![super::super::schema::Tool {
+            tool_type: "function".into(),
+            function: super::super::schema::ToolFunction {
+                name: "read_file".into(),
+                description: Some("Read a file".into()),
+                parameters: Some(serde_json::json!(
+                    {"type": "object", "properties": {"path": {"type": "string"}}}
+                )),
+            },
+        }]
+    }
+
+    /// Agentic tool-loop-tail transcript: system, user, assistant tool
+    /// call (arguments as the given string), tool result.
+    fn i229_tail_transcript(arguments: &str) -> Vec<ChatMessage> {
+        let mut assistant = i229_msg("assistant", "");
+        assistant.tool_calls = Some(vec![i229_tool_call("c1", "read_file", arguments)]);
+        let mut tool = i229_msg("tool", "fn main() { panic!() }");
+        tool.tool_call_id = Some("c1".into());
+        vec![
+            i229_msg("system", "You are an agent."),
+            i229_msg("user", "Fix the bug in foo.rs"),
+            assistant,
+            tool,
+        ]
+    }
+
+    #[test]
+    fn iter229_ac1_tools_render_via_vendor_qwen_template() {
+        // Pre-fix: `unknown filter: tojson` at template line 50 — every
+        // tools-bearing request against the served qwen3.6 died here.
+        let msgs = vec![
+            i229_msg("system", "You are an agent."),
+            i229_msg("user", "Fix the bug in foo.rs"),
+        ];
+        let out = render_chat_prompt_with_tools(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &msgs,
+            Some(&i229_tools()),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("<tools>"), "out={out}");
+        assert!(out.contains("\"read_file\""), "out={out}");
+    }
+
+    #[test]
+    fn iter229_ac2a_object_arguments_render_as_mapping() {
+        // Pre-fix: string arguments hit `arguments|items` (template line
+        // 120) → `cannot convert value into pairs` on any echo-back.
+        let out = render_chat_prompt_with_tools(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &i229_tail_transcript("{\"path\": \"foo.rs\"}"),
+            Some(&i229_tools()),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("<function=read_file>"), "out={out}");
+        assert!(out.contains("<parameter=path>\nfoo.rs\n</parameter>"), "out={out}");
+    }
+
+    #[test]
+    fn iter229_ac2bcd_non_object_arguments_stay_raw_strings() {
+        // Raw-preservation semantics observed via an inspection template
+        // (the vendor template can't render non-object arguments — pinned
+        // separately below).
+        let tmpl = "{{ messages[2].tool_calls[0].function.arguments is string }}";
+        for raw in ["[1,2]", "42", "true", "null", "\"foo\"", "location=Paris"] {
+            let out = render_chat_prompt_with_tools(
+                tmpl,
+                &i229_tail_transcript(raw),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(out, "true", "arguments {raw:?} must stay a raw string");
+        }
+        // Control: a valid object DOES become a mapping.
+        let out = render_chat_prompt_with_tools(
+            tmpl,
+            &i229_tail_transcript("{\"path\": \"foo.rs\"}"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, "false", "object arguments must become a mapping");
+    }
+
+    #[test]
+    fn iter229_ac2_pin_vendor_template_fails_clean_on_non_object_arguments() {
+        // Non-spec arguments (not a JSON object) still can't render
+        // through the qwen template's `|items` — unchanged from today,
+        // now documented. The error must be a clean Err (mapped to 400
+        // by the handler), not a panic. All six preserved shapes.
+        for raw in ["[1,2]", "42", "true", "null", "\"foo\"", "location=Paris"] {
+            let err = render_chat_prompt_with_tools(
+                crate::core::chat_templates::QWEN3_CHATML,
+                &i229_tail_transcript(raw),
+                Some(&i229_tools()),
+                true,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("Failed to render chat template"),
+                "arguments {raw:?}: err={err:#}"
+            );
+        }
+    }
+
+    /// The REAL Gemma 4 chat template as served: extracted verbatim from
+    /// `/opt/hf2q/models/gemma4/gemma4-ara-2pass-APEX-Q5_K_M.gguf`
+    /// metadata `tokenizer.chat_template` (12045 bytes, 2026-07-09,
+    /// ADR-005 iter-229 gate-3 #3). Handles BOTH argument shapes natively
+    /// (`function['arguments'] is mapping` → dictsort iteration at
+    /// template line 193; `is string` → verbatim at line 200).
+    const GEMMA4_EMBEDDED_TEMPLATE: &str =
+        include_str!("test_fixtures/gemma4-apex-embedded-chat-template.jinja");
+
+    #[test]
+    fn iter229_ac2e_gemma_dual_shape_arguments_byte_pins() {
+        // Object-string arguments → mapping render (dictsort path).
+        let obj = render_chat_prompt_with_tools(
+            GEMMA4_EMBEDDED_TEMPLATE,
+            &i229_tail_transcript("{\"path\": \"foo.rs\"}"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            obj,
+            "<bos><|turn>system\nYou are an agent.<turn|>\n<|turn>user\nFix the bug in foo.rs<turn|>\n<|turn>model\n<|tool_call>call:read_file{path:<|\"|>foo.rs<|\"|>}<tool_call|><turn|>\n<|turn>tool\n<|tool_response>response:read_file{value:<|\"|>fn main() { panic!() }<|\"|>}<tool_response|>fn main() { panic!() }<turn|>\n<|channel>thought\n<channel|>"
+        );
+        // Non-object arguments → raw string verbatim (template's own
+        // `is string` branch).
+        let raw = render_chat_prompt_with_tools(
+            GEMMA4_EMBEDDED_TEMPLATE,
+            &i229_tail_transcript("location=Paris"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            raw,
+            "<bos><|turn>system\nYou are an agent.<turn|>\n<|turn>user\nFix the bug in foo.rs<turn|>\n<|turn>model\n<|tool_call>call:read_file{location=Paris}<tool_call|><turn|>\n<|turn>tool\n<|tool_response>response:read_file{value:<|\"|>fn main() { panic!() }<|\"|>}<tool_response|>fn main() { panic!() }<turn|>\n<|channel>thought\n<channel|>"
+        );
+    }
+
+    #[test]
+    fn iter229_ac4b_gemma_absent_kwargs_golden() {
+        // Gemma half of AC4b: no-tools/no-reasoning/no-kwargs transcript
+        // byte-pinned through the REAL embedded template.
+        let msgs = vec![
+            i229_msg("system", "You are an agent."),
+            i229_msg("user", "Fix the bug in foo.rs"),
+            i229_msg("assistant", "Done, fixed the panic."),
+            i229_msg("user", "Now add a test for it"),
+        ];
+        let out = render_chat_prompt_with_tools(GEMMA4_EMBEDDED_TEMPLATE, &msgs, None, true, None)
+            .unwrap();
+        assert_eq!(
+            out,
+            "<bos><|turn>system\n<|think|>You are an agent.<turn|>\n<|turn>user\nFix the bug in foo.rs<turn|>\n<|turn>model\nDone, fixed the panic.<turn|>\n<|turn>user\nNow add a test for it<turn|>\n<|turn>model\n"
+        );
+        let empty = serde_json::Map::new();
+        let out_empty =
+            render_chat_prompt_with_tools(GEMMA4_EMBEDDED_TEMPLATE, &msgs, None, true, Some(&empty))
+                .unwrap();
+        assert_eq!(out, out_empty);
+    }
+
+    #[test]
+    fn iter229_gate3_non_assistant_tool_calls_do_not_define_ids() {
+        // tool_calls smuggled onto a user message must not populate the
+        // id→name map (gate-3 #1): the later tool message stays "unknown".
+        let inspect = "{% for m in messages %}{% if m.tool_responses %}\
+                       {% for tr in m.tool_responses %}TR:{{ tr.name }};{% endfor %}\
+                       {% endif %}{% endfor %}";
+        let mut smuggler = i229_msg("user", "go");
+        smuggler.tool_calls = Some(vec![i229_tool_call("P", "poisoned_fn", "{}")]);
+        let mut t = i229_msg("tool", "r");
+        t.tool_call_id = Some("P".into());
+        let msgs = vec![smuggler, i229_msg("user", "really go"), t];
+        let out = render_chat_prompt_with_tools(inspect, &msgs, None, false, None).unwrap();
+        assert_eq!(out, "TR:unknown;");
+    }
+
+    #[test]
+    fn iter229_ac3a_reasoning_content_replayed_on_tail_turn() {
+        let mut msgs = i229_tail_transcript("{\"path\": \"foo.rs\"}");
+        msgs[2].reasoning_content = Some("I should read the file first.".into());
+        let out = render_chat_prompt_with_tools(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &msgs,
+            Some(&i229_tools()),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.contains("<think>\nI should read the file first.\n</think>"),
+            "tail-turn reasoning must be replayed verbatim; out={out}"
+        );
+    }
+
+    #[test]
+    fn iter229_ac3b_absent_reasoning_renders_empty_think_block() {
+        // Today's template behavior for a reasoning-less tail turn,
+        // byte-pinned in full: the preserve branch fires
+        // (index > last_query_index) with an empty reasoning_content —
+        // the model is shown `<think>\n\n</think>` as its prior output.
+        let out = render_chat_prompt_with_tools(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &i229_tail_transcript("{\"path\": \"foo.rs\"}"),
+            Some(&i229_tools()),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\":{\"description\":\"Read a file\",\"name\":\"read_file\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"type\":\"object\"}},\"type\":\"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are an agent.<|im_end|>\n<|im_start|>user\nFix the bug in foo.rs<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=read_file>\n<parameter=path>\nfoo.rs\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nfn main() { panic!() }\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+    }
+
+    #[test]
+    fn iter229_ac3c_reasoning_only_inserted_on_assistant_messages() {
+        let tmpl = "{% for m in messages %}{{ m.role }}:{{ m.reasoning_content is defined }};{% endfor %}";
+        let mut msgs = vec![
+            i229_msg("system", "s"),
+            i229_msg("user", "u"),
+            i229_msg("assistant", "a"),
+            i229_msg("tool", "t"),
+        ];
+        for m in msgs.iter_mut() {
+            m.reasoning_content = Some("leak?".into());
+        }
+        msgs[3].tool_call_id = Some("c1".into());
+        let out = render_chat_prompt_with_tools(tmpl, &msgs, None, false, None).unwrap();
+        assert_eq!(
+            out, "system:false;user:false;assistant:true;tool:false;",
+            "reasoning_content must reach the context on assistant messages only"
+        );
+    }
+
+    #[test]
+    fn iter229_ac4a_preserve_thinking_kwarg_replays_pre_query_reasoning() {
+        let mut a1 = i229_msg("assistant", "Done, fixed the panic.");
+        a1.reasoning_content = Some("Turn-1 reasoning: the panic was a stub.".into());
+        let msgs = vec![
+            i229_msg("system", "You are an agent."),
+            i229_msg("user", "Fix the bug in foo.rs"),
+            a1,
+            i229_msg("user", "Now add a test for it"),
+        ];
+        let mut kwargs = serde_json::Map::new();
+        kwargs.insert("preserve_thinking".into(), serde_json::Value::Bool(true));
+        let with = render_chat_prompt_with_tools(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &msgs,
+            None,
+            true,
+            Some(&kwargs),
+        )
+        .unwrap();
+        assert!(
+            with.contains("<think>\nTurn-1 reasoning: the panic was a stub.\n</think>"),
+            "with={with}"
+        );
+        // Without the kwarg: stripped per Qwen convention (spike C1).
+        let without = render_chat_prompt_with_tools(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &msgs,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(!without.contains("Turn-1 reasoning"), "without={without}");
+    }
+
+    #[test]
+    fn iter229_ac4b_absent_kwargs_render_byte_identical_golden() {
+        // Golden pin from spike scenario C1 (pre-change render for a
+        // no-tools/no-reasoning transcript is identical by construction:
+        // the context gains no new keys and the env additions are only
+        // consulted by templates that use them).
+        let msgs = vec![
+            i229_msg("system", "You are an agent."),
+            i229_msg("user", "Fix the bug in foo.rs"),
+            i229_msg("assistant", "Done, fixed the panic."),
+            i229_msg("user", "Now add a test for it"),
+        ];
+        let out = render_chat_prompt_with_tools(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &msgs,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        let golden = "<|im_start|>system\nYou are an agent.<|im_end|>\n\
+                      <|im_start|>user\nFix the bug in foo.rs<|im_end|>\n\
+                      <|im_start|>assistant\nDone, fixed the panic.<|im_end|>\n\
+                      <|im_start|>user\nNow add a test for it<|im_end|>\n\
+                      <|im_start|>assistant\n<think>\n";
+        assert_eq!(out, golden);
+        // And kwargs=Some(empty) must equal kwargs=None.
+        let empty = serde_json::Map::new();
+        let out_empty = render_chat_prompt_with_tools(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &msgs,
+            None,
+            true,
+            Some(&empty),
+        )
+        .unwrap();
+        assert_eq!(out, out_empty);
+    }
+
+    #[test]
+    fn iter229_ac4c_kwargs_enable_thinking_overrides_resolved_default() {
+        let msgs = vec![i229_msg("user", "hi")];
+        let mut kwargs = serde_json::Map::new();
+        kwargs.insert("enable_thinking".into(), serde_json::Value::Bool(false));
+        // Renderer default says thinking ON; kwargs must win → the qwen
+        // template emits the pre-closed think suppressor.
+        let out = render_chat_prompt_with_tools(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &msgs,
+            None,
+            true,
+            Some(&kwargs),
+        )
+        .unwrap();
+        assert!(out.ends_with("<think>\n\n</think>\n\n"), "out={out}");
+        // Inverse: default OFF, kwargs ON → open think block.
+        kwargs.insert("enable_thinking".into(), serde_json::Value::Bool(true));
+        let out = render_chat_prompt_with_tools(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &msgs,
+            None,
+            false,
+            Some(&kwargs),
+        )
+        .unwrap();
+        assert!(out.ends_with("<think>\n"), "out={out}");
+        assert!(!out.ends_with("</think>\n\n"), "out={out}");
+    }
+
+    #[test]
+    fn iter229_ac4d_reserved_kwargs_rejected_naming_the_key() {
+        let msgs = vec![i229_msg("user", "hi")];
+        for key in [
+            "messages",
+            "tools",
+            "add_generation_prompt",
+            "bos_token",
+            "eos_token",
+            "raise_exception",
+        ] {
+            let mut kwargs = serde_json::Map::new();
+            kwargs.insert(key.into(), serde_json::Value::Bool(true));
+            let err = render_chat_prompt_with_tools(
+                crate::core::chat_templates::QWEN3_CHATML,
+                &msgs,
+                None,
+                false,
+                Some(&kwargs),
+            )
+            .unwrap_err();
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("reserved chat_template_kwargs key") && text.contains(key),
+                "key={key} err={text}"
+            );
+        }
+    }
+
+    #[test]
+    fn iter229_ac4e_free_kwargs_pass_through_verbatim() {
+        let msgs = vec![i229_msg("user", "hi")];
+        let mut kwargs = serde_json::Map::new();
+        kwargs.insert(
+            "custom_flag".into(),
+            serde_json::Value::String("x{y\"z".into()),
+        );
+        let out =
+            render_chat_prompt_with_tools("{{ custom_flag }}", &msgs, None, false, Some(&kwargs))
+                .unwrap();
+        assert_eq!(out, "x{y\"z");
+    }
+
+    #[test]
+    fn iter229_ac6_id_to_name_chronological_scoping() {
+        let inspect = "{% for m in messages %}{% if m.tool_responses %}\
+                       {% for tr in m.tool_responses %}TR:{{ tr.name }};{% endfor %}\
+                       {% endif %}{% endfor %}";
+        // (a) duplicate id: each tool message binds to the most recent
+        // PRIOR definition.
+        let mut a1 = i229_msg("assistant", "");
+        a1.tool_calls = Some(vec![i229_tool_call("X", "first_fn", "{}")]);
+        let mut t1 = i229_msg("tool", "r1");
+        t1.tool_call_id = Some("X".into());
+        let mut a2 = i229_msg("assistant", "");
+        a2.tool_calls = Some(vec![i229_tool_call("X", "second_fn", "{}")]);
+        let mut t2 = i229_msg("tool", "r2");
+        t2.tool_call_id = Some("X".into());
+        let msgs = vec![i229_msg("user", "go"), a1, t1, a2, t2];
+        let out = render_chat_prompt_with_tools(inspect, &msgs, None, false, None).unwrap();
+        assert_eq!(out, "TR:first_fn;TR:second_fn;");
+
+        // (b) forward reference: tool message BEFORE the defining
+        // assistant turn → "unknown".
+        let mut t0 = i229_msg("tool", "early");
+        t0.tool_call_id = Some("Y".into());
+        let mut a3 = i229_msg("assistant", "");
+        a3.tool_calls = Some(vec![i229_tool_call("Y", "late_fn", "{}")]);
+        let msgs = vec![i229_msg("user", "go"), t0, a3];
+        let out = render_chat_prompt_with_tools(inspect, &msgs, None, false, None).unwrap();
+        assert_eq!(out, "TR:unknown;");
+
+        // (c) unknown id → "unknown".
+        let mut tz = i229_msg("tool", "orphan");
+        tz.tool_call_id = Some("Z".into());
+        let msgs = vec![i229_msg("user", "go"), tz];
+        let out = render_chat_prompt_with_tools(inspect, &msgs, None, false, None).unwrap();
+        assert_eq!(out, "TR:unknown;");
+
+        // (d) tool message with NO tool_call_id: bare {role, content} —
+        // no tool_responses synthesized; qwen template consumes content.
+        let bare = i229_msg("tool", "bare result");
+        let msgs = vec![i229_msg("user", "go"), bare];
+        let out = render_chat_prompt_with_tools(inspect, &msgs, None, false, None).unwrap();
+        assert_eq!(out, "", "no tool_responses must be synthesized");
+        let out = render_chat_prompt_with_tools(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &msgs,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("<tool_response>\nbare result\n</tool_response>"), "out={out}");
+    }
+
+    #[test]
+    fn iter229_ac5_raise_sites_surface_template_message() {
+        // Renderer-level: each qwen raise site produces an Err whose chain
+        // carries the template's own message (Strict policy). The
+        // handler's `{e:#}` mapping (render_and_tokenize_for_overflow)
+        // forwards this chain into the 400 body.
+        let tmpl = crate::core::chat_templates::QWEN3_CHATML;
+        let cases: Vec<(Vec<ChatMessage>, &str)> = vec![
+            // line 43: no messages at all
+            (vec![], "No messages provided"),
+            // line 79: no user query anywhere
+            (vec![i229_msg("system", "s")], "No user query found"),
+            // line 85: system not at the beginning
+            (
+                vec![i229_msg("user", "u"), i229_msg("system", "late")],
+                "System message must be at the beginning",
+            ),
+            // line 144: unexpected role
+            (
+                vec![i229_msg("user", "u"), i229_msg("narrator", "x")],
+                "Unexpected message role",
+            ),
+        ];
+        for (msgs, expect) in cases {
+            let err = render_chat_prompt_with_tools(tmpl, &msgs, None, false, None).unwrap_err();
+            let text = format!("{err:#}");
+            assert!(text.contains(expect), "expected {expect:?} in err chain: {text}");
+        }
     }
 
     // -----------------------------------------------------------------
@@ -27422,7 +28016,7 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter1_qwen35_tests {
         );
 
         // §6.1.27 closure block must exist in the ADR.
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.27"),
             "H57 FALSIFIED: ADR §6.1.27 closure block missing. \
@@ -29062,7 +29656,7 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter4_qwen35_tests {
         }
 
         // (c) ADR §6.1.30 closure block must exist + name iter-4.
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.30"),
             "H76 FALSIFIED: ADR §6.1.30 closure block missing. iter-4 \
@@ -29581,9 +30175,50 @@ mod adr040_phase_b_iter4c_gemma4_slot_aware_tests {
 // closure block's structural shape: ≥7 deferrals enumerated, AC
 // status declared, reopen trigger framed).
 // ---------------------------------------------------------------------------
+/// ADR-005 iter-230 A1 — corpus helper for ADR-040 §6.1.x closure-block
+/// doc-pins.
+///
+/// Commit `aeb6e87c` extracted the §6.1.x changelog from
+/// `ADR-040-continuous-batching-reopen.md` (6141→1091 lines) into
+/// `ADR-040-history.md`. The closure ceremonies those pins grep now live
+/// in the HISTORY doc, so historical-closure assertions call this helper;
+/// live-status/navigation assertions keep reading the MAIN doc directly
+/// (deliberately NOT a concatenation — a marker moving out of the main
+/// doc while a live section silently disappears must still fail the
+/// live pins). `iter230_a1_historical_markers_exactly_once` (in
+/// `adr040_phase_e1_closure_tests`) asserts every retargeted `### 6.1.x`
+/// marker occurs exactly once in the history doc, closing the
+/// duplicate-marker ambiguity.
+#[cfg(test)]
+pub(crate) fn adr040_history_doc() -> &'static str {
+    include_str!("../../../docs/ADR-040-history.md")
+}
+
 #[cfg(test)]
 mod adr040_phase_e1_closure_tests {
     use super::*;
+
+    /// ADR-005 iter-230 AC-A1: every `### 6.1.x` marker that the
+    /// retargeted doc-pins grep must occur EXACTLY ONCE in the history
+    /// doc — a duplicate would make block extraction (`find` + next
+    /// `### ` boundary) silently pick the wrong copy.
+    #[test]
+    fn iter230_a1_historical_markers_exactly_once() {
+        let history = adr040_history_doc();
+        for marker in [
+            "### 6.1.26", "### 6.1.27", "### 6.1.30", "### 6.1.31",
+            "### 6.1.32", "### 6.1.33", "### 6.1.34", "### 6.1.35",
+            "### 6.1.36", "### 6.1.37", "### 6.1.38", "### 6.1.39",
+            "### 6.1.40", "### 6.1.41", "### 6.1.42", "### 6.1.43",
+            "### 6.1.44", "### 6.1.45", "### 6.1.52", "### 6.1.55",
+        ] {
+            let n = history.matches(marker).count();
+            assert_eq!(
+                n, 1,
+                "ADR-040-history.md must contain {marker:?} exactly once, found {n}"
+            );
+        }
+    }
 
     /// **H46 (skip-mode)** — `EngineMode::default()` is `SerialFifo`
     /// (production default unchanged by Phase E1 closure).
@@ -29705,7 +30340,7 @@ mod adr040_phase_e1_closure_tests {
     /// runbook.
     #[test]
     fn h48_e1_closure_enumerates_at_least_7_typed_deferrals() {
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         let closure_marker = "### 6.1.26";
         let closure_start = adr
             .find(closure_marker)
@@ -29768,7 +30403,7 @@ mod adr040_phase_e1_closure_tests {
     /// reopen trigger satisfied today?" with a single grep.
     #[test]
     fn h49_e1_closure_declares_ac_status_for_each_acceptance_criterion() {
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         let closure_marker = "### 6.1.26";
         let closure_start = adr
             .find(closure_marker)
@@ -29813,7 +30448,7 @@ mod adr040_phase_e1_closure_tests {
     /// fires the next iter.
     #[test]
     fn h50_e1_closure_documents_reopen_trigger_status() {
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         let closure_marker = "### 6.1.26";
         let closure_start = adr
             .find(closure_marker)
@@ -29867,17 +30502,20 @@ mod adr040_phase_e1_closure_tests {
 
     /// **Status marker pin** — ADR-040 top-of-document Status line.
     ///
-    /// History: the Phase E1 closure ceremony (§6.1.26) marked the ADR
-    /// `CLOSED`. That closure was REOPENED on 2026-06-24 (Phase F) when
-    /// an empirical bench falsified the implicit "continuous batching
-    /// works" claim — the load-bearing throughput goal was never met
-    /// (0.85× regression; see §0). The honest top-of-document status is
-    /// now `REOPENED`, so external ADR-index tooling + downstream
-    /// cross-references see the live state, NOT a false terminal state.
-    /// This pin guards against the status silently reverting to a
-    /// premature CLOSED while the Phase F work is in flight.
+    /// Era history: E1 closure marked the ADR `CLOSED` (§6.1.26); Phase
+    /// F REOPENED it 2026-06-24 when the throughput bench falsified the
+    /// closure (0.85× regression, §0); the REOPENED era legitimately
+    /// ENDED at `dc927f39` when the target workload was served
+    /// (coherence + capacity + speed bars met — §0 milestone ledger).
+    /// ADR-005 iter-230 A1 retargeted this pin from the expired
+    /// `REOPENED` literal to the earned live status. Three invariants:
+    /// (1) the main doc's first Status line carries the earned state,
+    /// (2) the main doc still links the extracted history doc
+    /// (navigability after the aeb6e87c split), (3) the history doc
+    /// retains the REOPENED-era record (the era must stay auditable,
+    /// not vanish with the status flip).
     #[test]
-    fn adr040_status_line_marked_reopened() {
+    fn adr040_status_line_carries_earned_live_status() {
         let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
         // The Status line is the first `- **Status**:` line in the
         // file (per ADR-040 header). Restrict scan to the first
@@ -29892,12 +30530,35 @@ mod adr040_phase_e1_closure_tests {
             .unwrap_or(header.len() - status_idx);
         let status_line = &header[status_idx..status_idx + status_line_end];
         assert!(
-            status_line.contains("REOPENED") || status_line.contains("Reopened"),
+            status_line.contains("TARGET WORKLOAD SERVED"),
             "FALSIFIED: ADR-040 top-of-document Status line does not \
-             contain `REOPENED`. Phase F reopened the ADR-005 carve-out \
-             because the throughput goal was unmet (§0); the status must \
-             not silently revert to CLOSED while Phase F is active; \
-             line was: {status_line:?}"
+             carry the earned `TARGET WORKLOAD SERVED` status. If the \
+             status legitimately changed again, retarget this pin WITH \
+             a doc-comment era note (as iter-230 A1 did for REOPENED); \
+             do not delete it. Line was: {status_line:?}"
+        );
+        assert!(
+            adr.contains("ADR-040-history.md"),
+            "FALSIFIED: main ADR-040 doc no longer references \
+             ADR-040-history.md — the extracted §6.1.x changelog must \
+             stay navigable from the live doc."
+        );
+        // The era record must stay auditable across BOTH docs: the main
+        // doc keeps the literal `REOPENED` era mentions; the history doc
+        // keeps the SPECIFIC reopen-trigger record (§6.1.26's H50-pinned
+        // block), not just an incidental substring.
+        assert!(
+            adr.contains("REOPENED"),
+            "FALSIFIED: main ADR-040 doc lost its REOPENED-era \
+             mentions — the Phase F reopen must remain auditable."
+        );
+        let history = crate::serve::api::engine::adr040_history_doc();
+        assert!(
+            history.contains("Reopen-trigger status (per ADR-040 §1.5 + §3.7)")
+                && history.contains("Reopen trigger NOT MET today."),
+            "FALSIFIED: ADR-040-history.md lost the reopen-trigger \
+             record (the §6.1.26-era block H50 pins) — the Phase F \
+             reopen must remain auditable."
         );
     }
 }
@@ -30369,7 +31030,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter1_gemma4_tests {
 
         // §6.1.31 closure block exists in the ADR + names iter-B4c-
         // kernel iter-1 + the 4 sub-deferrals.
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.31"),
             "H83 FALSIFIED: ADR-040 §6.1.31 closure block not found. \
@@ -30833,7 +31494,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_gemma4_tests {
              behaviour."
         );
         // ALSO pins that the §6.1.32 ADR block exists.
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.32"),
             "H90 FALSIFIED: ADR-040 §6.1.32 closure block not found. \
@@ -31361,7 +32022,7 @@ mod adr040_phase_c_iter_c2c_cont_gemma4_hybrid_provisioning_tests {
     /// scaffold without naming the next iter.
     #[test]
     fn h91_extension_iter_c2c_cont_names_downstream_iter2b() {
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.33"),
             "H91-ext FALSIFIED: ADR-040 §6.1.33 closure block not \
@@ -32373,7 +33034,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter3_gemma4_tests {
                                   // above is the load-bearing one.
 
         // The ADR-040 §6.1.35 closure block exists in the ADR.
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.35"),
             "H109 FALSIFIED: ADR-040 §6.1.35 closure block not found. \
@@ -32934,7 +33595,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter4_gemma4_tests {
         );
 
         // The ADR-040 §6.1.36 closure block exists in the ADR.
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.36"),
             "H115 FALSIFIED: ADR-040 §6.1.36 closure block not found. \
@@ -33452,7 +34113,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter5_gemma4_tests {
         }
 
         // The ADR-040 §6.1.37 closure block exists in the ADR.
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.37"),
             "H122 FALSIFIED: ADR-040 §6.1.37 closure block not found. \
@@ -33917,7 +34578,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_a_gemma4_tests {
              L2-normalized embedding vector at norm_out."
         );
         // ADR-040 §6.1.38 closure block exists (forward-pin destination).
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.38"),
             "H129 FALSIFIED: ADR-040 §6.1.38 closure block not found. \
@@ -34227,12 +34888,17 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
         // branches now that the dense F32 + legacy 4-bit branches
         // sit before them.
         let fn_window = &src[fn_idx..(fn_idx + 80_000).min(src.len())];
+        // iter-230 B renamed the call to `split_full_output_forced(` (the
+        // forced-open-seeded variant); accept either spelling — the pin's
+        // intent is that reasoning-text routing is wired at all.
         assert!(
-            fn_window.contains("split_full_output("),
+            fn_window.contains("split_full_output(")
+                || fn_window.contains("split_full_output_forced("),
             "H134 FALSIFIED: Generate orchestrator body does NOT call \
-             `split_full_output`. Reasoning-text routing is missing \
-             — reasoning-mode requests at SlotId(N>0) would not get \
-             the reasoning_content slot populated."
+             `split_full_output`/`split_full_output_forced`. Reasoning-\
+             text routing is missing — reasoning-mode requests at \
+             SlotId(N>0) would not get the reasoning_content slot \
+             populated."
         );
         // The previous iter-2-decode-A pinned `reasoning_text: None,` —
         // iter-2-decode-C replaces with a non-trivial expression.
@@ -34355,7 +35021,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_gemma4_tests {
              operator-grep'able + future-iter-grep'able."
         );
         // ADR-040 §6.1.39 closure block exists.
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.39"),
             "H136 FALSIFIED: ADR-040 §6.1.39 closure block not found. \
@@ -34849,7 +35515,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_cont_iter2_decode_b_gemma4_tests {
         );
         // ADR-040 §6.1.45 closure block exists (forward-pin destination).
         let adr =
-            include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+            crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.45"),
             "H180 FALSIFIED: ADR-040 §6.1.45 closure block not found. \
@@ -35467,7 +36133,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2c_iter2d_iter2_decode_d_gemma4_tests {
         );
         // (h) ADR-040 §6.1.46 closure block exists.
         let adr =
-            include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+            crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.46"),
             "H188 FALSIFIED: ADR-040 §6.1.46 closure block not found. \
@@ -36113,7 +36779,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2b_xlen_iter2_decode_a_xlen_gemma4_tests 
 
         // (i) ADR-040 §6.1.47 closure block exists.
         let adr =
-            include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+            crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.47"),
             "H195 FALSIFIED: ADR-040 §6.1.47 closure block not found. \
@@ -36534,7 +37200,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_decode_c_stream_tool_call_gemma4_tests 
         // (c) ADR-040 §6.1.48 closure block exists (the new closure
         // block landing this iter).
         let adr =
-            include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+            crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.48"),
             "H201 FALSIFIED: ADR-040 §6.1.48 closure block not \
@@ -36989,7 +37655,7 @@ mod adr040_phase_b_iter_b4c_kernel_iter2_embed_batched_gemma4_tests {
 
         // (c) ADR-040 §6.1.49 closure block exists.
         let adr =
-            include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+            crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.49"),
             "H206 FALSIFIED: ADR-040 §6.1.49 closure block not found. \
@@ -37487,7 +38153,7 @@ mod adr040_phase_c_iter_c2d_cont_kernel_iter_lcp_g_qwen35_iter_2d_lcp_gemma4_tes
         // (c) ADR-040 §6.1.50 closure block exists (will be added when
         // ADR-040 is updated by this iter).
         let adr =
-            include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+            crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.50"),
             "H212 FALSIFIED: ADR-040 §6.1.50 closure block not found. \
@@ -37897,7 +38563,7 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
     /// upstream-blocker.
     #[test]
     fn h223_cont_adr_section_6_1_52_closure_block_named() {
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.52"),
             "H223-cont FALSIFIED: ADR-040 §6.1.52 closure block not \
@@ -38049,7 +38715,7 @@ mod adr040_phase_c_iter_c2e_qwen3vl_slot_aware_tests {
     /// deferrals SHIPPED structurally.
     #[test]
     fn h238_adr_section_6_1_55_full_implementation_closure_block() {
-        let adr = include_str!("../../../docs/ADR-040-continuous-batching-reopen.md");
+        let adr = crate::serve::api::engine::adr040_history_doc() /* iter-230 A1: §6.1.x moved to history (aeb6e87c) */;
         assert!(
             adr.contains("### 6.1.55"),
             "H238 FALSIFIED: ADR-040 §6.1.55 closure block not found. \

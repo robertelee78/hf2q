@@ -2306,6 +2306,7 @@ mod tests {
 
     #[test]
     fn delta_kernel_copies_top_left_pixel_per_patch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // hidden=3. weight[oc, ic, dy, dx] = 1 iff (oc == ic && dy == 0 && dx == 0), else 0.
         // No bias. Image 8×8, patch 4 → 2×2 patches. Each patch output
         // should equal the top-left pixel of that patch in the matching
@@ -2354,6 +2355,7 @@ mod tests {
 
     #[test]
     fn all_ones_kernel_produces_patch_sum() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // hidden=1. All weights = 1 → output = sum of all pixels in patch
         // window across all 3 channels.
         let img: usize = 4;
@@ -2385,6 +2387,7 @@ mod tests {
 
     #[test]
     fn bias_is_added_once_per_output_element() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // hidden=2, all weights = 0, bias = [10, 20]. Output should be
         // bias repeated for every patch.
         let img: usize = 4;
@@ -2411,6 +2414,7 @@ mod tests {
 
     #[test]
     fn single_patch_covers_whole_image() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // image_size == patch_size → 1 patch covering everything.
         let img: usize = 4;
         let patch: usize = 4;
@@ -2439,6 +2443,7 @@ mod tests {
 
     #[test]
     fn rejects_mismatched_pixel_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let weight = vec![0f32; 1 * 3 * 2 * 2];
         let pixels = vec![0f32; 10]; // wrong size
         let err = patch_embed_forward(&pixels, &weight, None, 4, 2, 1).unwrap_err();
@@ -2447,6 +2452,7 @@ mod tests {
 
     #[test]
     fn rejects_mismatched_weight_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let pixels = vec![0f32; 3 * 4 * 4];
         let weight = vec![0f32; 5]; // wrong size
         let err = patch_embed_forward(&pixels, &weight, None, 4, 2, 1).unwrap_err();
@@ -2455,6 +2461,7 @@ mod tests {
 
     #[test]
     fn rejects_bias_length_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let weight = vec![0f32; 2 * 3 * 2 * 2];
         let pixels = vec![0f32; 3 * 4 * 4];
         let bias = vec![0f32; 99];
@@ -2464,6 +2471,7 @@ mod tests {
 
     #[test]
     fn rejects_non_divisible_image_size() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let weight = vec![0f32; 1 * 3 * 3 * 3];
         let pixels = vec![0f32; 3 * 5 * 5];
         let err = patch_embed_forward(&pixels, &weight, None, 5, 3, 1).unwrap_err();
@@ -2472,6 +2480,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_patch_size() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let weight = vec![0f32; 0];
         let pixels = vec![0f32; 3 * 4 * 4];
         let err = patch_embed_forward(&pixels, &weight, None, 4, 0, 1).unwrap_err();
@@ -2484,6 +2493,7 @@ mod tests {
 
     #[test]
     fn position_embed_add_is_elementwise() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut patch = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let pos = vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6];
         position_embed_add(&mut patch, &pos).unwrap();
@@ -2495,6 +2505,7 @@ mod tests {
 
     #[test]
     fn position_embed_add_rejects_shape_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut patch = vec![0.0f32; 10];
         let pos = vec![0.0f32; 11];
         let err = position_embed_add(&mut patch, &pos).unwrap_err();
@@ -2503,6 +2514,7 @@ mod tests {
 
     #[test]
     fn position_embed_add_zero_pos_is_identity() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut patch = vec![0.5f32, -0.3, 1.7, -2.1];
         let snapshot = patch.clone();
         let pos = vec![0.0f32; 4];
@@ -2516,6 +2528,7 @@ mod tests {
 
     #[test]
     fn layer_norm_constant_row_goes_to_zero_then_beta() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Constant row has var=0 and mean=the constant; (x-mean)=0 so
         // normalized = 0; output = 0 * gamma + beta = beta.
         let mut x = vec![7.0f32; 4];
@@ -2529,6 +2542,7 @@ mod tests {
 
     #[test]
     fn layer_norm_pytorch_reference_values() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // x = [1, 2, 3, 4], mean=2.5, var = mean([1.5², 0.5², 0.5², 1.5²])
         //                             = mean([2.25, 0.25, 0.25, 2.25]) = 1.25
         // inv_std = 1/sqrt(1.25 + 1e-5) ≈ 0.8944270...
@@ -2546,6 +2560,7 @@ mod tests {
 
     #[test]
     fn layer_norm_applies_affine_scale_and_shift() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // After normalize, multiply by γ=[2,2,2,2] then add β=[10,20,30,40].
         // Normalized [1,2,3,4] = [-1.3416, -0.4472, 0.4472, 1.3416].
         // * 2      = [-2.683, -0.894, 0.894, 2.683]
@@ -2562,6 +2577,7 @@ mod tests {
 
     #[test]
     fn layer_norm_normalizes_multiple_rows_independently() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Two rows, completely different scales. Each row should
         // independently normalize to zero-mean-unit-variance.
         let mut x = vec![1.0f32, 2.0, 3.0, 4.0, 100.0, 200.0, 300.0, 400.0];
@@ -2584,6 +2600,7 @@ mod tests {
 
     #[test]
     fn layer_norm_mean_after_is_approximately_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![0.5f32, 1.7, -2.3, 4.1, -0.8, 3.2];
         let gamma = vec![1.0f32; 6];
         let beta = vec![0.0f32; 6];
@@ -2594,6 +2611,7 @@ mod tests {
 
     #[test]
     fn layer_norm_rejects_hidden_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![1.0f32; 4];
         let err = layer_norm_forward(&mut x, &[], &[], 0, 1e-5).unwrap_err();
         assert!(format!("{err}").contains("hidden must be > 0"));
@@ -2601,6 +2619,7 @@ mod tests {
 
     #[test]
     fn layer_norm_rejects_non_divisible_input_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![1.0f32; 7];
         let gamma = vec![1.0f32; 3];
         let beta = vec![0.0f32; 3];
@@ -2610,6 +2629,7 @@ mod tests {
 
     #[test]
     fn layer_norm_rejects_wrong_gamma_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![1.0f32; 4];
         let gamma = vec![1.0f32; 3];
         let beta = vec![0.0f32; 4];
@@ -2619,6 +2639,7 @@ mod tests {
 
     #[test]
     fn layer_norm_rejects_wrong_beta_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![1.0f32; 4];
         let gamma = vec![1.0f32; 4];
         let beta = vec![0.0f32; 3];
@@ -2628,6 +2649,7 @@ mod tests {
 
     #[test]
     fn layer_norm_does_not_divide_by_zero_when_variance_is_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // All-ones row → variance = 0. With eps > 0 this normalizes
         // cleanly; without eps it would divide by zero and NaN.
         let mut x = vec![5.0f32; 8];
@@ -2646,6 +2668,7 @@ mod tests {
 
     #[test]
     fn std_bias_scale_subtracts_and_scales_per_channel() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // batch=2, hidden=3. bias=[1, 2, 3], scale=[10, 20, 30].
         // Row 0: [5, 10, 15] → (row - bias) = [4, 8, 12] → * scale = [40, 160, 360].
         // Row 1: [10, 20, 30] → (row - bias) = [9, 18, 27] → * scale = [90, 360, 810].
@@ -2658,6 +2681,7 @@ mod tests {
 
     #[test]
     fn std_bias_scale_zero_bias_unit_scale_is_identity() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![0.5f32, 1.7, -2.3, 4.1];
         let snap = x.clone();
         let bias = vec![0.0f32; 2];
@@ -2668,6 +2692,7 @@ mod tests {
 
     #[test]
     fn std_bias_scale_rejects_hidden_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![0f32; 4];
         let err = std_bias_scale_in_place(&mut x, &[], &[], 0).unwrap_err();
         assert!(format!("{err}").contains("hidden must be > 0"));
@@ -2675,6 +2700,7 @@ mod tests {
 
     #[test]
     fn std_bias_scale_rejects_non_divisible_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![0f32; 7];
         let bias = vec![0f32; 3];
         let scale = vec![1f32; 3];
@@ -2684,6 +2710,7 @@ mod tests {
 
     #[test]
     fn std_bias_scale_rejects_wrong_bias_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![0f32; 6];
         let bias = vec![0f32; 2]; // should be 3
         let scale = vec![1f32; 3];
@@ -2693,6 +2720,7 @@ mod tests {
 
     #[test]
     fn std_bias_scale_rejects_wrong_scale_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![0f32; 6];
         let bias = vec![0f32; 3];
         let scale = vec![1f32; 2]; // should be 3
@@ -2779,6 +2807,7 @@ mod tests {
 
     #[test]
     fn scale_in_place_multiplies_every_element() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![1.0f32, 2.0, 3.0, 4.0];
         scale_in_place(&mut x, 2.5);
         assert_eq!(x, vec![2.5, 5.0, 7.5, 10.0]);
@@ -2786,6 +2815,7 @@ mod tests {
 
     #[test]
     fn scale_in_place_by_one_is_identity() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![0.1f32, -2.3, 7.7];
         let snap = x.clone();
         scale_in_place(&mut x, 1.0);
@@ -2794,6 +2824,7 @@ mod tests {
 
     #[test]
     fn scale_in_place_by_zero_zeros_everything() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![1.0f32, 2.0, 3.0];
         scale_in_place(&mut x, 0.0);
         assert_eq!(x, vec![0.0, 0.0, 0.0]);
@@ -2801,6 +2832,7 @@ mod tests {
 
     #[test]
     fn avg_pool_2x2_averages_each_2x2_block() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 4×4 grid × 2 hidden dims → 2×2 output.
         // Each output should be the mean of 4 input values per dim.
         // Layout: input[y*4 + x] has hidden=2 values.
@@ -2835,6 +2867,7 @@ mod tests {
 
     #[test]
     fn avg_pool_gemma4_shape_14x14_to_7x7() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Production Gemma 4 shape: 196 patches (14×14) × 1152 hidden
         // → 49 patches (7×7) × 1152 hidden.
         let n_side = 14;
@@ -2850,18 +2883,21 @@ mod tests {
 
     #[test]
     fn avg_pool_rejects_non_even_n_side() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let err = avg_pool_2x2_spatial(&[0f32; 27], 3, 3).unwrap_err();
         assert!(format!("{err}").contains("positive and even"));
     }
 
     #[test]
     fn avg_pool_rejects_mismatched_input_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let err = avg_pool_2x2_spatial(&[0f32; 15], 4, 2).unwrap_err();
         assert!(format!("{err}").contains("input len"));
     }
 
     #[test]
     fn apply_vit_block_forward_real_gemma4_block0_matches_inline_chain() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Wraps iter 40's inline block-0 chain into one function call.
         // Asserts output shape + that the new API produces the same
         // block-out distribution as the iter 40 explicit pipeline.
@@ -2916,6 +2952,7 @@ mod tests {
 
     #[test]
     fn apply_vit_block_forward_rejects_mismatched_hidden() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::mmproj::MmprojConfig;
         use super::super::mmproj_weights::LoadedMmprojWeights;
         use mlx_native::gguf::GgufFile;
@@ -2950,6 +2987,7 @@ mod tests {
 
     #[test]
     fn block_0_full_forward_on_real_gemma4() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 11-stage end-to-end block 0 on real Gemma 4 pretrained weights:
         //   1. preprocess(pixel gradient) → patch_embed
         //   2. snapshot residual_stream
@@ -3139,6 +3177,7 @@ mod tests {
 
     #[test]
     fn silu_zero_is_zero_exactly() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![0.0f32];
         silu_in_place(&mut x);
         assert_eq!(x[0], 0.0);
@@ -3146,6 +3185,7 @@ mod tests {
 
     #[test]
     fn silu_reference_values_match_pytorch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // PyTorch F.silu reference values:
         //   silu(-3) ≈ -0.14227
         //   silu(-1) ≈ -0.26894
@@ -3171,6 +3211,7 @@ mod tests {
 
     #[test]
     fn silu_large_positive_approaches_x() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // x=20 → σ(x) ≈ 1 → silu(x) ≈ x.
         let mut x = vec![20.0f32];
         silu_in_place(&mut x);
@@ -3179,6 +3220,7 @@ mod tests {
 
     #[test]
     fn silu_large_negative_approaches_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![-20.0f32];
         silu_in_place(&mut x);
         assert!(x[0].abs() < 1e-4);
@@ -3186,6 +3228,7 @@ mod tests {
 
     #[test]
     fn silu_has_local_minimum_near_negative_point_two_eight() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // SiLU has a local min at x ≈ -1.2785 where value ≈ -0.27846.
         // Probe x=-1, x=-1.28, x=-1.5; x=-1.28 should be the lowest.
         let mut x = vec![-1.0f32, -1.28, -1.5];
@@ -3195,6 +3238,7 @@ mod tests {
 
     #[test]
     fn elementwise_mul_pairs_each_index() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut a = vec![1.0f32, 2.0, 3.0, 4.0];
         let b = vec![5.0f32, 6.0, 7.0, 8.0];
         elementwise_mul_in_place(&mut a, &b).unwrap();
@@ -3203,6 +3247,7 @@ mod tests {
 
     #[test]
     fn elementwise_mul_with_zero_zeros_everything() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut a = vec![1.0f32, 2.0, 3.0];
         let b = vec![0f32; 3];
         elementwise_mul_in_place(&mut a, &b).unwrap();
@@ -3211,6 +3256,7 @@ mod tests {
 
     #[test]
     fn elementwise_mul_rejects_shape_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut a = vec![0f32; 4];
         let b = vec![0f32; 3];
         let err = elementwise_mul_in_place(&mut a, &b).unwrap_err();
@@ -3219,6 +3265,7 @@ mod tests {
 
     #[test]
     fn swiglu_gated_activation_on_real_gemma4_ffn() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Runs iter 38's full attention-half chain + iter 39's new
         // stages: gate = linear(pre_ffn, ffn_gate), up = linear(pre_ffn,
         // ffn_up), silu(gate), gate *= up. Output shape: [196, 4304].
@@ -3367,6 +3414,7 @@ mod tests {
 
     #[test]
     fn residual_add_is_elementwise() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut a = vec![1.0f32, 2.0, 3.0, 4.0];
         let b = vec![10.0f32, 20.0, 30.0, 40.0];
         residual_add(&mut a, &b).unwrap();
@@ -3375,6 +3423,7 @@ mod tests {
 
     #[test]
     fn residual_add_with_zero_is_identity() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut a = vec![0.5f32, -1.2, 3.7];
         let snap = a.clone();
         let b = vec![0.0f32; 3];
@@ -3384,6 +3433,7 @@ mod tests {
 
     #[test]
     fn residual_add_rejects_shape_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut a = vec![0f32; 4];
         let b = vec![0f32; 3];
         let err = residual_add(&mut a, &b).unwrap_err();
@@ -3392,6 +3442,7 @@ mod tests {
 
     #[test]
     fn residual_add_is_commutative_against_add_in_place_loop() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Sanity check vs a hand-rolled loop — catches any silent
         // sign-flip or off-by-one in the iterator.
         let a: Vec<f32> = (0..10).map(|i| i as f32 * 0.3).collect();
@@ -3407,6 +3458,7 @@ mod tests {
 
     #[test]
     fn attention_half_block_end_to_end_real_gemma4() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Completes the attention half of ViT block 0 on real Gemma 4
         // weights: chain from iter 37 extended with attn_output
         // projection, residual add (pre-attn → post-attn), and ln2
@@ -3548,6 +3600,7 @@ mod tests {
 
     #[test]
     fn attention_uniform_qk_averages_v_across_tokens() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Q and K all equal → every softmax is uniform 1/batch → output
         // row = mean of V rows per head.
         let batch = 3;
@@ -3606,6 +3659,7 @@ mod tests {
 
     #[test]
     fn attention_single_key_dominant_selects_its_value() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Make token 1's K overwhelmingly similar to every Q, rest
         // orthogonal. Softmax picks token 1 → output row ≈ V[1].
         let batch = 3;
@@ -3650,6 +3704,7 @@ mod tests {
 
     #[test]
     fn attention_scale_factor_applied_to_logits() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Large head_dim + moderate Q/K magnitudes → without scaling,
         // logits overflow exp. Check that the scale keeps outputs finite.
         let batch = 4;
@@ -3671,12 +3726,14 @@ mod tests {
 
     #[test]
     fn attention_rejects_zero_dims() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let err = scaled_dot_product_attention(&[], &[], &[], 0, 1, 1).unwrap_err();
         assert!(format!("{err}").contains("must all be > 0"));
     }
 
     #[test]
     fn attention_rejects_mismatched_q_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let batch = 2;
         let num_heads = 2;
         let head_dim = 2;
@@ -3691,6 +3748,7 @@ mod tests {
 
     #[test]
     fn attention_rejects_mismatched_k_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let batch = 2;
         let num_heads = 2;
         let head_dim = 2;
@@ -3705,6 +3763,7 @@ mod tests {
 
     #[test]
     fn attention_end_to_end_real_gemma4_full_self_attention() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Extends iter 36's chain test by running the full self-attention
         // through scaled-dot-product. Drives:
         //   preprocess → patch_embed → rms_norm(ln1) → qkv_projection →
@@ -3812,6 +3871,7 @@ mod tests {
 
     #[test]
     fn per_head_rms_norm_with_unit_gain_normalizes_each_head_slice_independently() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // batch=2, num_heads=3, head_dim=4. Per-(b, h) RMS-normalized,
         // each row ends at mean(x²)≈1 independent of the others.
         let batch = 2;
@@ -3847,6 +3907,7 @@ mod tests {
 
     #[test]
     fn per_head_rms_norm_broadcasts_same_gamma_across_heads() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // All heads same constant input. Per-head RMSNorm → each
         // slice independently normalized → output = γ (uniform input
         // with RMSNorm produces [1,1,...] which γ scales).
@@ -3873,6 +3934,7 @@ mod tests {
 
     #[test]
     fn per_head_rms_norm_rejects_zero_dims() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let err =
             per_head_rms_norm_forward(&mut [], &[], 0, 1, 1, 1e-5).unwrap_err();
         assert!(format!("{err}").contains("must all be > 0"));
@@ -3880,6 +3942,7 @@ mod tests {
 
     #[test]
     fn per_head_rms_norm_rejects_mismatched_input_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut input = vec![0f32; 5];
         let gamma = vec![1f32; 2];
         let err = per_head_rms_norm_forward(&mut input, &gamma, 2, 2, 2, 1e-5)
@@ -3889,6 +3952,7 @@ mod tests {
 
     #[test]
     fn per_head_rms_norm_rejects_wrong_gamma_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut input = vec![0f32; 8];
         let gamma = vec![1f32; 3]; // should be 2 (head_dim)
         let err = per_head_rms_norm_forward(&mut input, &gamma, 2, 2, 2, 1e-5)
@@ -3898,6 +3962,7 @@ mod tests {
 
     #[test]
     fn per_head_rms_norm_end_to_end_real_gemma4_chain() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // The deepest real-data chain test to date. Runs:
         //   preprocess gradient → patch_embed → rms_norm(ln1) →
         //   qkv_projection → per-head RMSNorm on Q and K.
@@ -4001,6 +4066,7 @@ mod tests {
 
     #[test]
     fn linear_identity_weight_preserves_input() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // W = I_d (identity) → y = x. batch=2, d=4.
         let d = 4;
         let batch = 2;
@@ -4015,6 +4081,7 @@ mod tests {
 
     #[test]
     fn linear_all_ones_weight_produces_row_sum_per_output() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // W[o, i] = 1 for all (o, i) → y[n, o] = sum(x[n, :]) for every o.
         let batch = 3;
         let d_in = 4;
@@ -4031,6 +4098,7 @@ mod tests {
 
     #[test]
     fn linear_applies_bias_per_output_once() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // All-zero weight, nonzero bias → output = bias repeated per row.
         let batch = 3;
         let d_in = 2;
@@ -4049,6 +4117,7 @@ mod tests {
 
     #[test]
     fn linear_reference_dot_product() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // y[n, o] = sum_i x[n, i] * W[o, i].
         // batch=1, d_in=3, d_out=2.
         // x = [1, 2, 3]
@@ -4063,6 +4132,7 @@ mod tests {
 
     #[test]
     fn linear_rejects_mismatched_input_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let weight = vec![0f32; 6];
         let input = vec![0f32; 5]; // should be 2*3 = 6 for batch=2, in=3
         let err = linear_forward(&input, &weight, None, 2, 3, 2).unwrap_err();
@@ -4071,6 +4141,7 @@ mod tests {
 
     #[test]
     fn linear_rejects_mismatched_weight_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let weight = vec![0f32; 5]; // should be 2*3 = 6 for out=2, in=3
         let input = vec![0f32; 6];
         let err = linear_forward(&input, &weight, None, 2, 3, 2).unwrap_err();
@@ -4079,6 +4150,7 @@ mod tests {
 
     #[test]
     fn linear_rejects_wrong_bias_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let weight = vec![0f32; 6];
         let input = vec![0f32; 6];
         let bias = vec![0f32; 3]; // should be 2 (out_features)
@@ -4088,12 +4160,14 @@ mod tests {
 
     #[test]
     fn linear_rejects_zero_dims() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let err = linear_forward(&[], &[], None, 0, 1, 1).unwrap_err();
         assert!(format!("{err}").contains("must all be > 0"));
     }
 
     #[test]
     fn qkv_projection_returns_three_tensors_of_expected_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Synthetic: all Q weights = 1.0, K = 2.0, V = 3.0. Uniform input
         // x = 1. For hidden=4, batch=2: each output element of Q should
         // be = 4 (sum of 4 ones), K = 8, V = 12.
@@ -4115,6 +4189,7 @@ mod tests {
 
     #[test]
     fn qkv_projection_propagates_shape_errors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Deliberately broken K-weight size to verify error reaches caller.
         let batch = 2;
         let hidden = 4;
@@ -4129,6 +4204,7 @@ mod tests {
 
     #[test]
     fn qkv_projection_against_real_gemma4_block0_weights() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // End-to-end real-data chain test — the most valuable test in
         // this module so far. Load real Gemma 4 mmproj, reads block-0's
         // q/k/v weights, feeds a synthetic [196, 1152] input (the shape
@@ -4208,6 +4284,7 @@ mod tests {
 
     #[test]
     fn rms_norm_unit_gamma_normalizes_to_unit_rms() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // After RMSNorm with γ=1, the row's mean-squared should be ~1.
         let mut x = vec![1.0f32, 2.0, 3.0, 4.0];
         let gamma = vec![1.0f32; 4];
@@ -4221,6 +4298,7 @@ mod tests {
 
     #[test]
     fn rms_norm_pytorch_reference_values() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // x = [1, 2, 3, 4]. mean(x²) = (1+4+9+16)/4 = 7.5.
         // rms = sqrt(7.5 + 1e-5) ≈ 2.7386128.
         // y = x / rms = [0.36514837, 0.73029674, 1.09544511, 1.46059349]
@@ -4235,6 +4313,7 @@ mod tests {
 
     #[test]
     fn rms_norm_applies_gain_elementwise() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // γ scales each element post-normalization. For a uniform input,
         // pre-gain output is all-1; post-gain equals γ directly.
         let mut x = vec![5.0f32; 4];
@@ -4247,6 +4326,7 @@ mod tests {
 
     #[test]
     fn rms_norm_normalizes_rows_independently() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Two rows scaled by 100× should produce identical outputs since
         // RMSNorm is scale-invariant.
         let mut x = vec![1.0f32, 2.0, 3.0, 4.0, 100.0, 200.0, 300.0, 400.0];
@@ -4265,6 +4345,7 @@ mod tests {
 
     #[test]
     fn rms_norm_does_not_divide_by_zero_when_input_is_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // All-zeros row has RMS=0, would divide by zero without eps.
         // With eps > 0 the output is finite (and zero, since x is zero).
         let mut x = vec![0.0f32; 8];
@@ -4278,6 +4359,7 @@ mod tests {
 
     #[test]
     fn rms_norm_large_inputs_do_not_overflow() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Large magnitudes: without stable normalization, sum of squares
         // could overflow. With f32 max ≈ 3.4e38, a hidden-size of 4 with
         // values of 1e18 squared = 1e36; sum is 4e36, still fits.
@@ -4293,6 +4375,7 @@ mod tests {
 
     #[test]
     fn rms_norm_rejects_hidden_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![1.0f32; 4];
         let err = rms_norm_forward(&mut x, &[], 0, 1e-5).unwrap_err();
         assert!(format!("{err}").contains("hidden must be > 0"));
@@ -4300,6 +4383,7 @@ mod tests {
 
     #[test]
     fn rms_norm_rejects_non_divisible_input_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![1.0f32; 7];
         let gamma = vec![1.0f32; 3];
         let err = rms_norm_forward(&mut x, &gamma, 3, 1e-5).unwrap_err();
@@ -4308,6 +4392,7 @@ mod tests {
 
     #[test]
     fn rms_norm_rejects_wrong_gamma_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![1.0f32; 4];
         let gamma = vec![1.0f32; 3];
         let err = rms_norm_forward(&mut x, &gamma, 4, 1e-5).unwrap_err();
@@ -4316,6 +4401,7 @@ mod tests {
 
     #[test]
     fn rms_norm_runs_against_real_gemma4_ln1_weights() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Use the real `v.blk.0.ln1.weight` gain vector (1152 f32) from
         // the loaded Gemma 4 mmproj. Apply to a synthetic [196, 1152]
         // patch-embedding-shaped input. Verifies:
@@ -4365,6 +4451,7 @@ mod tests {
 
     #[test]
     fn rms_norm_differs_from_layer_norm_on_nonzero_mean_input() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Key behavioral difference: LayerNorm subtracts mean first,
         // RMSNorm does not. A non-zero-mean input normalizes to
         // different values under the two.
@@ -4390,6 +4477,7 @@ mod tests {
 
     #[test]
     fn softmax_sums_to_one_per_row() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![1.0f32, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -3.0];
         softmax_last_dim(&mut x, 4).unwrap();
         for row in 0..2 {
@@ -4400,6 +4488,7 @@ mod tests {
 
     #[test]
     fn softmax_uniform_input_yields_uniform_output() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![5.0f32; 8];
         softmax_last_dim(&mut x, 8).unwrap();
         for v in &x {
@@ -4413,6 +4502,7 @@ mod tests {
 
     #[test]
     fn softmax_reference_values_match_pytorch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // torch.softmax(tensor([1, 2, 3]), dim=-1) =
         //   [0.09003057, 0.24472848, 0.66524094]
         let mut x = vec![1.0f32, 2.0, 3.0];
@@ -4424,6 +4514,7 @@ mod tests {
 
     #[test]
     fn softmax_is_numerically_stable_for_large_inputs() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Without max-subtraction, exp(1000) overflows to +inf and the
         // whole row becomes NaN. With the stable form, the row should
         // cleanly peak at the max element.
@@ -4439,6 +4530,7 @@ mod tests {
 
     #[test]
     fn softmax_concentrates_on_the_dominant_element() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // A single much-larger element → softmax ≈ one-hot.
         let mut x = vec![0.0f32, 20.0, 0.0, 0.0];
         softmax_last_dim(&mut x, 4).unwrap();
@@ -4450,6 +4542,7 @@ mod tests {
 
     #[test]
     fn softmax_rejects_hidden_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![1.0f32; 4];
         let err = softmax_last_dim(&mut x, 0).unwrap_err();
         assert!(format!("{err}").contains("hidden must be > 0"));
@@ -4457,6 +4550,7 @@ mod tests {
 
     #[test]
     fn softmax_rejects_non_divisible_input_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![1.0f32; 7];
         let err = softmax_last_dim(&mut x, 3).unwrap_err();
         assert!(format!("{err}").contains("not divisible"));
@@ -4468,6 +4562,7 @@ mod tests {
 
     #[test]
     fn gelu_zero_is_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut x = vec![0.0f32];
         gelu_tanh_approx(&mut x);
         assert!(x[0].abs() < 1e-7, "gelu(0) should be 0, got {}", x[0]);
@@ -4475,6 +4570,7 @@ mod tests {
 
     #[test]
     fn gelu_reference_values_match_pytorch_tanh_approximate() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // PyTorch reference (approximate="tanh"):
         //   gelu(-3) ≈ -0.00363752
         //   gelu(-1) ≈ -0.15880802
@@ -4507,6 +4603,7 @@ mod tests {
 
     #[test]
     fn gelu_is_monotonic_on_nonneg_inputs() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // GELU is NOT globally monotone — it has a local minimum near
         // x ≈ -0.7517 where derivative Φ(x) + x·φ(x) crosses zero. But
         // for x ≥ 0 the derivative is strictly positive (Φ(x) ≥ 0.5,
@@ -4528,6 +4625,7 @@ mod tests {
 
     #[test]
     fn gelu_has_local_minimum_near_negative_point_seven_five() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Sanity: confirm the non-monotone region exists where theory
         // predicts. The true local min is at x ≈ -0.7517. At x=-0.75
         // gelu ≈ -0.16998. Values at x=-0.5 and x=-1.0 should BOTH be
@@ -4546,6 +4644,7 @@ mod tests {
 
     #[test]
     fn gelu_large_positive_approaches_x() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // As x → +∞, GELU(x) → x. At x=10 the approximation is within 1e-5.
         let mut x = vec![10.0f32];
         gelu_tanh_approx(&mut x);
@@ -4554,6 +4653,7 @@ mod tests {
 
     #[test]
     fn gelu_large_negative_approaches_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // As x → -∞, GELU(x) → 0. At x=-10 the value is near zero.
         let mut x = vec![-10.0f32];
         gelu_tanh_approx(&mut x);
@@ -4566,6 +4666,7 @@ mod tests {
 
     #[test]
     fn gemma4_shape_does_not_panic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Smoke: exercise the function at the Gemma 4 shape to ensure
         // index arithmetic is sound at the production dims. 896 is too
         // slow for a unit test; scale the image + hidden to sqrt(Gemma)
@@ -4604,6 +4705,7 @@ mod tests {
 
     #[test]
     fn patch_embed_from_real_gemma4_weights_produces_sensible_embeddings() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Real-data check: load the Gemma 4 mmproj, preprocess a solid-
         // gray synthetic PNG to [3, 224, 224] f32, run patch_embed →
         // assert shape = [196, 1152] and the output has non-trivial
@@ -4679,6 +4781,7 @@ mod tests {
 
     #[test]
     fn gemma4v_patch_embed_shapes_and_math() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 4 patches × inner=12 → hidden=8. Hand-rolled GEMM check on
         // a tiny shape: y[n, o] = Σᵢ patches[n, i] * weight[o, i].
         let n_patches = 4u32;
@@ -4709,6 +4812,7 @@ mod tests {
 
     #[test]
     fn gemma4v_patch_embed_rejects_zero_dims() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let err = gemma4v_patch_embed_forward(&[1.0], &[1.0], 0, 1, 1).unwrap_err();
         assert!(format!("{err}").contains("must all be > 0"));
         let err2 = gemma4v_patch_embed_forward(&[1.0], &[1.0], 1, 0, 1).unwrap_err();
@@ -4717,6 +4821,7 @@ mod tests {
 
     #[test]
     fn gemma4v_patch_embed_rejects_shape_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Patches buf too small.
         let err = gemma4v_patch_embed_forward(&[1.0; 5], &[1.0; 24], 4, 12, 2).unwrap_err();
         assert!(format!("{err}").contains("patches.len()"));
@@ -4727,6 +4832,7 @@ mod tests {
 
     #[test]
     fn gemma4v_position_embed_lookup_basic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // pos_size=3, hidden=4 → table is 2*3*4 = 24 floats.
         // Table[0] (X-axis): rows [10,11,12,13], [20,21,22,23], [30,31,32,33]
         // Table[1] (Y-axis): rows [40,41,42,43], [50,51,52,53], [60,61,62,63]
@@ -4751,6 +4857,7 @@ mod tests {
 
     #[test]
     fn gemma4v_position_embed_lookup_clamps_out_of_range() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // pos_size=2; index 99 should clamp to 1 (max_idx = pos_size − 1).
         let pe: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
         let pos_x = vec![99u32];
@@ -4763,6 +4870,7 @@ mod tests {
 
     #[test]
     fn gemma4v_position_embed_lookup_shape_errors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let pe = vec![0f32; 12];
         // Mismatched pos arrays.
         let err =
@@ -4775,6 +4883,7 @@ mod tests {
 
     #[test]
     fn gemma4v_position_embed_add_in_place() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut patch_embeds = vec![1.0_f32; 8]; // [2, 4]
         // pos_size=2, hidden=4 → table is 16 floats.
         let pe: Vec<f32> = vec![
@@ -4800,6 +4909,7 @@ mod tests {
 
     #[test]
     fn gemma4v_clippable_linear_forward_no_bounds_matches_plain_linear() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // bounds.any() == false → byte-equivalent to linear_forward(_, None).
         let batch = 3usize;
         let in_features = 4usize;
@@ -4827,6 +4937,7 @@ mod tests {
 
     #[test]
     fn gemma4v_clippable_linear_forward_input_clamp_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Input element -100 should be clamped to -1.0 BEFORE the matmul.
         let batch = 1usize;
         let in_features = 4usize;
@@ -4849,6 +4960,7 @@ mod tests {
 
     #[test]
     fn gemma4v_clippable_linear_forward_both_clamps() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Input pre-clamps to [-2, 2]; output post-clamps to [-3, 3].
         let batch = 1usize;
         let in_features = 4usize;
@@ -4871,6 +4983,7 @@ mod tests {
 
     #[test]
     fn gemma4v_clippable_linear_bounds_resolve_default_to_neg_pos_inf() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let bounds = Gemma4ClippableLinearBounds::default();
         let (mn_in, mx_in) = bounds.resolved_input();
         let (mn_out, mx_out) = bounds.resolved_output();
@@ -4883,6 +4996,7 @@ mod tests {
 
     #[test]
     fn gemma4v_clippable_linear_forward_rejects_min_gt_max() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let input: Vec<f32> = vec![0.0; 4];
         let weight: Vec<f32> = vec![0.0; 4];
         let bounds = Gemma4ClippableLinearBounds {

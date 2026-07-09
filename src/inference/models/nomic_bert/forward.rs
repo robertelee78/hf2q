@@ -1179,6 +1179,7 @@ mod tests {
 
     #[test]
     fn full_forward_at_synthetic_min_config_produces_unit_norm_output() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = synthetic_min_cfg(2);
         let device = MlxDevice::new().expect("create device");
         let mut registry = KernelRegistry::new();
@@ -1249,6 +1250,7 @@ mod tests {
     /// post-softmax matmul, which flash-attn no longer goes through).
     #[test]
     fn full_forward_rejects_non_64_head_dim() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Build a config with head_dim=32 (hidden=64 / heads=2) — was
         // legal pre-iter-90, must now reject.
         let cfg = NomicBertConfig {
@@ -1521,6 +1523,7 @@ mod tests {
     /// production-scale forward actually run?").
     #[test]
     fn full_forward_at_production_scale_on_real_nomic_gguf_produces_unit_norm_output() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::gguf::GgufFile;
         use std::path::Path;
 
@@ -1665,6 +1668,7 @@ mod tests {
     #[test]
     #[ignore = "perf timing test; run with --ignored --nocapture"]
     fn forward_timing_10x_warm() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::gguf::GgufFile;
         use std::path::Path;
         use std::time::Instant;
@@ -1797,6 +1801,7 @@ mod tests {
     /// Upstream mlx-native fix queued for iter 80.
     #[test]
     fn full_forward_matches_llama_embedding_on_hello_world() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::gguf::GgufFile;
         use std::path::Path;
 
@@ -1942,6 +1947,7 @@ mod tests {
     /// Skips when the GGUF fixture isn't on disk.
     #[test]
     fn full_forward_padding_invariance_at_seq_lens_32_64_128_256_512() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::gguf::GgufFile;
         use std::path::Path;
 

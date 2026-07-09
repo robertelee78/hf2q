@@ -657,6 +657,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b10b3_gpu_drafter_constructor_validates_embed_shape_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -697,6 +698,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b10b3_gpu_drafter_end_to_end_with_expand_dynamic_tree_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // INTEGRATION TEST: GpuDrafter is consumed by Phase E4a's
         // expand_dynamic_tree algorithm. Verifies the full stack
         // composes — from tree expansion (E4a) through GpuDrafter
@@ -783,6 +785,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4_final_gate_constructor_rejects_fast_vocab_without_mapping_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Codex /cfa E4 final-gate Major 1 re-review fix (2026-05-22):
         // when draft_vocab_size < vocab_size, the manifest MUST
         // include draft_id_to_target_id. Constructor must reject
@@ -823,6 +826,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4_final_gate_predict_topk_rejects_depth_2_path_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Codex /cfa E4 final-gate Major 2 regression (2026-05-22):
         // calling predict_topk on a tree node at depth >= 2 must
         // fail-fast (path length > 2) since single-token decode
@@ -865,6 +869,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4_final_gate_predict_topk_rejects_depth_1_path_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Codex /cfa E4 final-gate Major 2 closure (2026-05-22):
         // even depth-1 (single-child) expansion violates conditioning
         // semantics since the path "root → child" would need both
@@ -945,6 +950,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step3_attach_kv_cache_validates_num_kv_heads_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -974,6 +980,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step3_attach_kv_cache_validates_head_dim_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -1002,6 +1009,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step3_attach_kv_cache_rejects_nonempty_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -1033,6 +1041,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step3_cache_mode_predict_topk_depth_0_works_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -1070,6 +1079,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step3_cache_mode_predict_topk_depth_1_works_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -1115,6 +1125,7 @@ mod tests {
 
     #[test]
     fn adr_037_e6_tree_mask_rejects_unexpanded_ancestor_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Phase E6 tree-mask design (replaces the buggy v1 rollback
         // design's cache.len()==path.len()-1 invariant): the new
         // invariant is "every ancestor of node_to_expand must have
@@ -1154,6 +1165,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step3_clear_kv_cache_resets_to_zero_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -1187,6 +1199,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step3_rollback_kv_cache_delegates_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -1231,6 +1244,7 @@ mod tests {
 
     #[test]
     fn adr_037_e6_gpu_drafter_with_cache_orchestrator_max_depth_2_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // END-TO-END test: GpuDrafter with attached cache + the new
         // cache-aware orchestrator expand_dynamic_tree_with_cache.
         // This proves max_depth>1 trees actually expand correctly
@@ -1295,6 +1309,7 @@ mod tests {
 
     #[test]
     fn adr_037_e6_build_tree_mask_root_no_ancestors_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Root (node 0) has no ancestors. Mask = [ATTENDED] (only
         // the new slot, which is also root's slot).
         let (device, mut registry, cfg, tensors, target_aux_buf, embed_table) =
@@ -1323,6 +1338,7 @@ mod tests {
 
     #[test]
     fn adr_037_e6_build_tree_mask_depth_1_attends_root_only_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Tree: 0 (root) → 1 (child). Suppose root is in cache slot 0.
         // Expanding child (depth=1) with pre_len=1: mask = [ATTENDED
         // (root in slot 0), ATTENDED (self in slot 1)].
@@ -1363,6 +1379,7 @@ mod tests {
 
     #[test]
     fn adr_037_e6_build_tree_mask_blocks_sibling_in_cache_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // KEY TEST. Tree: 0 (root) → 1 (A), 0 → 2 (B). Both A and B
         // are children of root. Suppose cache state is:
         //   slot 0: root, slot 1: A, slot 2: B.
@@ -1407,6 +1424,7 @@ mod tests {
 
     #[test]
     fn adr_037_e6_build_tree_mask_deep_chain_attends_all_ancestors_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 5-deep chain: 0 → 1 → 2 → 3 → 4 (each child has only one
         // parent). Cache layout: each ancestor at its own slot.
         // Expanding node 4 with pre_len=4: all of [root, 1, 2, 3]
@@ -1438,6 +1456,7 @@ mod tests {
 
     #[test]
     fn adr_037_e6_build_tree_mask_rejects_out_of_range_node_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // node_to_expand >= tree.parents.len() must error, not panic.
         let (device, mut registry, cfg, tensors, target_aux_buf, embed_table) =
             match drafter_for_mask_test() {
@@ -1464,6 +1483,7 @@ mod tests {
 
     #[test]
     fn adr_037_e6_build_tree_mask_rejects_missing_ancestor_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Calling on node 1 when root (idx 0) has no cache slot
         // recorded → error.
         let (device, mut registry, cfg, tensors, target_aux_buf, embed_table) =
@@ -1490,6 +1510,7 @@ mod tests {
 
     #[test]
     fn adr_037_e6_tree_mask_gpu_max_depth_4_no_panic_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // CRITICAL regression test: max_depth=4 + cross-branch
         // expansion would have panicked in the rollback-based design
         // (Phase E6 v1). The tree-mask design (Phase E6 v2) keeps
@@ -1541,6 +1562,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step3_rollback_kv_cache_errs_without_attached_cache_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -1565,6 +1587,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b10b3_gpu_drafter_rejects_target_aux_wrong_size_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -1604,6 +1627,7 @@ mod tests {
     /// magnitude that changes the post-attention hidden state.
     #[test]
     fn g4_cfa4_drafter_norm_before_residual_true_vs_false_diverges_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,

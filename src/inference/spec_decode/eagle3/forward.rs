@@ -2564,6 +2564,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b2_fc_cpu_parity_seq_4_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -2636,6 +2637,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b2_fc_cpu_parity_seq_1_decode_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // seq=1 exercises the GEMV path (dense_gemv_bf16_f32) instead
         // of the tiled GEMM path.
         let device = match MlxDevice::new() {
@@ -2686,6 +2688,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b2_fc_rejects_wrong_input_shape_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -2719,6 +2722,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b2_gate_fc_rejects_non_f32_input_dtype_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Codex /cfa E4b.2 Critical fix (2026-05-22): wrapper must
         // reject non-F32 input even though apply_linear_projection_f32
         // only debug-asserts this. Validates the hard check.
@@ -2825,6 +2829,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b3_input_layernorm_cpu_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -2885,6 +2890,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b3_hidden_norm_cpu_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -2942,6 +2948,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b3_concat_2x_hidden_layout_matches_vllm_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Verify the concat produces [seq, 2*H] with embeds-left,
         // hidden-right column ordering per vLLM torch.cat([embeds,
         // hidden_states], dim=-1).
@@ -3003,6 +3010,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b3_input_layernorm_rejects_non_f32_input_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3037,6 +3045,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b3_gate_input_layernorm_rejects_zero_seq_len_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Codex /cfa E4b.3 Major fix (2026-05-22): zero seq_len was
         // structurally meaningless but previously slipped through.
         let device = match MlxDevice::new() {
@@ -3066,6 +3075,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b3_gate_concat_rejects_zero_seq_len_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3165,6 +3175,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b4_q_proj_cpu_parity_no_bias_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3211,6 +3222,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b4_q_proj_cpu_parity_with_bias_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3256,6 +3268,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b4_k_proj_output_shape_matches_kv_proj_out_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3292,6 +3305,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b4_v_proj_output_shape_matches_kv_proj_out_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3327,6 +3341,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b4_gate_q_proj_rejects_non_f32_input_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3361,6 +3376,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b4_gate_q_proj_rejects_zero_seq_len_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3399,6 +3415,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b5a_q_head_norm_cpu_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3467,6 +3484,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b5a_k_head_norm_cpu_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3530,6 +3548,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b5a_q_head_norm_errors_when_use_qk_norm_false_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Calling q_head_norm when cfg.use_qk_norm=false should
         // fail-fast: q_norm tensor is None.
         let device = match MlxDevice::new() {
@@ -3568,6 +3587,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b5a_gate_q_head_norm_rejects_when_cfg_off_with_tensor_present_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Codex /cfa E4b.5a Major fix (2026-05-22): cfg gate must be
         // enforced even when the tensor happens to be present (an
         // inconsistent config/tensor bundle is a bug, not silent fallback).
@@ -3608,6 +3628,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b5a_gate_q_head_norm_rejects_non_f32_input_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3682,6 +3703,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b5b_rope_cpu_parity_linear_positions_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3745,6 +3767,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b5b_rope_cpu_parity_tree_positions_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Tree positions: simulate ExpandedTree where tree-node i has
         // depth d_i. Position[i] = base_pos + d_i. This is the path
         // EAGLE-3 uses for dynamic tree decoding.
@@ -3815,6 +3838,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b5b_rope_rejects_positions_len_mismatch_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -3845,6 +3869,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b5b_gate_rope_rejects_position_above_i32_max_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Codex /cfa E4b.5b Major fix (2026-05-22): positions above
         // i32::MAX must be rejected, not silently saturated.
         let device = match MlxDevice::new() {
@@ -3878,6 +3903,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b5b_gate_rope_rejects_non_f32_input_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4003,6 +4029,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b6_tree_attention_cpu_parity_dk128_fixed_square_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Use head_dim=128 (Qwen 3.6 27B production shape) +
         // fixed-square tree (root + 4 leaves; depth=2) over a
         // prefix of 27 tokens. Exercises both the new dk128
@@ -4100,6 +4127,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b6_gate_tree_attention_rejects_zero_q_seq_len_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4126,6 +4154,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b6_gate_tree_attention_rejects_kv_capacity_less_than_seq_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4152,6 +4181,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b7_o_proj_cpu_parity_no_bias_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4217,6 +4247,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b7_residual_add_cpu_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4252,6 +4283,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b7_gate_residual_add_rejects_non_f32_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4276,6 +4308,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b7_gate_residual_add_rejects_shape_mismatch_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4330,6 +4363,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b8_mlp_cpu_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4420,6 +4454,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b8_gate_mlp_rejects_non_f32_input_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4446,6 +4481,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b8_gate_mlp_rejects_wrong_input_shape_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Codex /cfa E4b.8 Minor fix (2026-05-22): explicit wrong-shape
         // regression for the MLP wrapper (inner helper has its own test
         // in E4b.4, but the MLP boundary check should be covered too).
@@ -4477,6 +4513,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b8_gate_mlp_rejects_zero_seq_len_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4503,6 +4540,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b9_final_norm_cpu_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4562,6 +4600,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b9_lm_head_cpu_parity_untied_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4618,6 +4657,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b9_gate_lm_head_tied_requires_full_vocab_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Codex-style pre-emptive: tying lm_head with embed_tokens
         // requires draft_vocab_size == vocab_size (since embed_tokens
         // has shape [vocab_size, hidden], not [draft_vocab_size, hidden]).
@@ -4652,6 +4692,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b9_gate_lm_head_tied_requires_embed_tokens_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // tie_lm_head=true + has_own_embed_tokens=false should
         // fail-fast since the drafter shares target's embeddings
         // (which our trait doesn't yet plumb through).
@@ -4690,6 +4731,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b10b1_permute_sentinel_layout_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Sentinel test: input [seq=3, heads=2, hd=4] with values
         // (s * 1000 + h * 100 + d). Verify output layout
         // [heads=2, seq=3, hd=4] reads (h, s, d) correctly.
@@ -4747,6 +4789,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b10b1_permute_cpu_parity_random_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Random input + CPU reference permutation.
         let device = match MlxDevice::new() {
             Ok(d) => d,
@@ -4798,6 +4841,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b10b1_gate_permute_rejects_non_f32_input_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4816,6 +4860,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b10b1_gate_permute_rejects_wrong_element_count_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Codex /cfa E4b.10b.1 Minor fix (2026-05-22): explicit
         // regression for the element_count() invariant.
         let device = match MlxDevice::new() {
@@ -4840,6 +4885,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b10b1_gate_permute_rejects_zero_dim_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4860,6 +4906,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b10b2_post_attention_layernorm_cpu_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4927,6 +4974,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b10b2_full_forward_chain_finite_and_deterministic_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -5219,6 +5267,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b3_concat_rejects_wrong_input_elements_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -5312,6 +5361,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step2_smoke_empty_cache_appends_one_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -5344,6 +5394,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step2_rejects_wrong_cache_num_kv_heads_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -5375,6 +5426,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step2_rejects_wrong_cache_head_dim_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -5405,6 +5457,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step2_rejects_seq_len_not_1_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -5435,6 +5488,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step2_rejects_cache_overflow_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -5475,6 +5529,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step2_equivalence_with_unbatched_at_len_zero_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // GOLDEN TEST. At cache.len() = 0 and cache.capacity = 1
         // (so the cache buffer layout exactly matches the
         // [num_kv_heads, seq_len, head_dim] K_perm/V_perm of the
@@ -5528,6 +5583,7 @@ mod tests {
 
     #[test]
     fn adr_037_e5b_step2_incremental_two_calls_grows_cache_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Two sequential calls with the SAME embed input (single-token
         // decode), capacity=2. Cache len goes 0→1→2; both outputs must
         // be finite. Cache.len() should equal 2 after the second call.
@@ -5577,6 +5633,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b2_fc_output_shape_correct_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,

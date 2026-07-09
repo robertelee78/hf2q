@@ -467,6 +467,7 @@ mod tests {
 
     #[test]
     fn extract_drafter_concat_picks_right_slabs() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Combined capture has 7 layers: drafter's [1,6,11,17,22,27] + final 29
         let combined = vec![1, 6, 11, 17, 22, 27, 29];
         let drafter_ids = vec![1, 6, 11, 17, 22, 27];
@@ -502,6 +503,7 @@ mod tests {
 
     #[test]
     fn extract_final_layer_slab_picks_correct_layer() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Combined: [1, 6, 11, 17, 22, 27, 29]
         // Final layer = 29 → combined_idx = 6 (last)
         let combined = vec![1, 6, 11, 17, 22, 27, 29];
@@ -525,6 +527,7 @@ mod tests {
 
     #[test]
     fn trim_capture_to_compacts_buffer_and_keeps_first_positions() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 3 layers × 5 positions × 4 dim. Trim to 2 positions.
         let mut sess = DFlashCaptureSession::new(vec![1, 6, 11], 5, 4, true);
         // Fill: hidden[(l * 5 + t) * 4 + d] = l * 100 + t * 10 + d
@@ -562,6 +565,7 @@ mod tests {
 
     #[test]
     fn trim_capture_to_no_op_when_new_geq_old() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut sess = DFlashCaptureSession::new(vec![1, 6], 3, 4, false);
         let orig_len = sess.hidden_output.len();
         for v in sess.hidden_output.iter_mut() { *v = 7.0; }
@@ -573,6 +577,7 @@ mod tests {
 
     #[test]
     fn extract_drafter_concat_errors_on_missing_layer() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Drafter wants layer 100 which isn't in combined
         let combined = vec![1, 6, 29];
         let drafter_ids = vec![1, 100];
@@ -584,6 +589,7 @@ mod tests {
 
     #[test]
     fn capture_buffer_len_matches_drafter_fc_input() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = gemma4_cfg();
         // Per drafter config: 6 target_layer_ids × hidden_size 2816.
         // For seq_len=4: 6 × 4 × 2816 = 67584 floats.
@@ -592,6 +598,7 @@ mod tests {
 
     #[test]
     fn validate_catches_wrong_buffer_size() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let target_layer_ids = vec![1, 6, 11, 17, 22, 27];
         let mut hidden = vec![0.0f32; 100]; // way too small
         let cap = PrefillCapture {
@@ -605,6 +612,7 @@ mod tests {
 
     #[test]
     fn validate_catches_non_monotonic_layer_ids() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let target_layer_ids = vec![1, 11, 6, 17, 22, 27]; // 11 > 6
         let mut hidden = vec![0.0f32; 6 * 4 * 2816];
         let cap = PrefillCapture {
@@ -618,6 +626,7 @@ mod tests {
 
     #[test]
     fn validate_catches_argmax_size_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let target_layer_ids = vec![1, 6, 11, 17, 22, 27];
         let mut hidden = vec![0.0f32; 6 * 4 * 2816];
         let mut argmaxes = vec![0u32; 99]; // wrong: should be seq_len=4
@@ -632,6 +641,7 @@ mod tests {
 
     #[test]
     fn offset_for_matches_row_major_layout() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // (layer=0, token=0): offset 0
         assert_eq!(PrefillCapture::offset_for(0, 0, 4, 2816), 0);
         // (layer=0, token=1): one row in
@@ -647,6 +657,7 @@ mod tests {
 
     #[test]
     fn write_layer_slab_places_data_correctly() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let target_layer_ids = vec![1, 6, 11, 17, 22, 27];
         let mut hidden = vec![0.0f32; 6 * 4 * 2816];
         let mut cap = PrefillCapture {
@@ -669,6 +680,7 @@ mod tests {
     /// DFlashCaptureSession: new() pre-allocates correct buffer sizes.
     #[test]
     fn session_new_allocates_correct_sizes() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let sess = DFlashCaptureSession::new(
             vec![1, 6, 11, 17, 22, 27],
             4,
@@ -688,6 +700,7 @@ mod tests {
 
     #[test]
     fn session_capture_index_for_finds_target_layers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let sess = DFlashCaptureSession::new(vec![1, 6, 11, 17, 22, 27], 4, 2816, false);
         assert_eq!(sess.capture_index_for(1), Some(0));
         assert_eq!(sess.capture_index_for(11), Some(2));
@@ -699,6 +712,7 @@ mod tests {
 
     #[test]
     fn session_write_layer_slab_places_data_at_correct_offset() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut sess = DFlashCaptureSession::new(vec![1, 6, 11, 17, 22, 27], 3, 4, false);
         // Layer-2 slab: capture_layer_idx=2; offset = 2 * 3 * 4 = 24
         let slab = vec![5.0f32; 3 * 4];
@@ -711,6 +725,7 @@ mod tests {
 
     #[test]
     fn session_as_view_borrows_buffers_consistently() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut sess = DFlashCaptureSession::new(vec![1, 6], 2, 4, true);
         // Write something via session
         let slab = vec![3.0f32; 2 * 4];
@@ -747,6 +762,7 @@ mod tests {
     /// the bug lies downstream in the GPU drafter forward.
     #[test]
     fn option_a_round2_prior_captured_delivers_correct_new_row() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let drafter_target_layer_ids: Vec<usize> = vec![1, 6, 11, 17, 22, 27];
         let final_layer_idx = 29usize;
         let mut combined_ids: Vec<usize> = drafter_target_layer_ids.clone();
@@ -851,6 +867,7 @@ mod tests {
     /// positions [0..5) at each drafter target layer.
     #[test]
     fn option_a_round2_prior_captured_multi_accept_plumbing() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let drafter_target_layer_ids: Vec<usize> = vec![1, 6, 11, 17, 22, 27];
         let final_layer_idx = 29usize;
         let mut combined_ids: Vec<usize> = drafter_target_layer_ids.clone();
@@ -947,6 +964,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device + drafter HF cache"]
     fn smoke_capture_to_drafter_forward_pipeline() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::spec_decode::dflash::{
             forward::dispatch_dflash_model_forward,
             kv_cache::DFlashKvCache,
@@ -1048,6 +1066,7 @@ mod tests {
 
     #[test]
     fn permute_to_concat_round_trips_layout() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let target_layer_ids = vec![1, 6];
         let n_layers = target_layer_ids.len();
         let seq_len = 3;

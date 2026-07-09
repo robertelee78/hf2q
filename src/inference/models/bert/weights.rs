@@ -345,6 +345,7 @@ mod tests {
 
     #[test]
     fn block_required_suffixes_cover_every_forward_pass_op() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Spot-check the suffix list matches what a transformer block
         // forward pass actually needs. Changes here must update the
         // forward pass + this test in lockstep.
@@ -370,6 +371,7 @@ mod tests {
 
     #[test]
     fn block_optional_suffixes_are_biases_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Optional list must be biases — variants drop biases, never
         // weights. If a future BERT variant turns out to drop a weight,
         // the model is genuinely incompatible and should error in the
@@ -381,6 +383,7 @@ mod tests {
 
     #[test]
     fn synthetic_required_names_count_matches_config() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = synthetic_cfg(2);
         let names = synthetic_required_names(&cfg);
         // 4 stem + 10 per-block × 2 blocks = 24 required.
@@ -392,6 +395,7 @@ mod tests {
 
     #[test]
     fn empty_loaded_weights_returns_errs_from_shortcuts() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("create device");
         let w = LoadedBertWeights::empty(device);
         assert_eq!(w.len(), 0);
@@ -413,6 +417,7 @@ mod tests {
     /// specific missing-list rather than panic.
     #[test]
     fn validate_tensor_set_on_vocab_only_gguf_reports_missing_tensors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = Path::new("/opt/llama.cpp/models/ggml-vocab-bert-bge.gguf");
         if !path.exists() {
             eprintln!(

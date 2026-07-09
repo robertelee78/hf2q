@@ -476,6 +476,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device"]
     fn allocates_drafter_kv_cache() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = gemma4_26b_a4b_dflash_config();
         let device = MlxDevice::new().expect("Metal device available on M5 Max");
         let max_full = 4096u32;
@@ -522,6 +523,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device"]
     fn append_seq_major_kv_permutes_to_head_major() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = gemma4_26b_a4b_dflash_config();
         let device = MlxDevice::new().expect("Metal device available on M5 Max");
         let max_full = 64u32;
@@ -592,6 +594,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device"]
     fn write_slack_kv_does_not_advance_seq_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = gemma4_26b_a4b_dflash_config();
         let device = MlxDevice::new().expect("Metal device available on M5 Max");
         let mut cache = DFlashKvCache::new(&device, &cfg, 32).expect("cache");
@@ -683,6 +686,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device"]
     fn adr_034_task_95_append_seq_major_kv_gpu_parity_2026_05_21() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::DType;
         let cfg = gemma4_26b_a4b_dflash_config();
         let device = MlxDevice::new().expect("Metal device available on M5 Max");
@@ -806,6 +810,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device"]
     fn adr_034_task_95_write_slack_kv_gpu_parity_2026_05_21() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::DType;
         let cfg = gemma4_26b_a4b_dflash_config();
         let device = MlxDevice::new().expect("Metal device available on M5 Max");
@@ -940,6 +945,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device"]
     fn adr_034_task_95_interleaved_cursor_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::DType;
         let cfg = gemma4_26b_a4b_dflash_config();
         let device = MlxDevice::new().expect("Metal device available on M5 Max");
@@ -1090,6 +1096,7 @@ mod tests {
 
     #[test]
     fn would_overflow_full_attn_logic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Synthetic full-attention cache; can't actually alloc without
         // a Metal device, so we test the logic via direct construction.
         // (This is a pure-CPU branch logic test — no device needed.)

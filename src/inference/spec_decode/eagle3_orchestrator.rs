@@ -1025,6 +1025,7 @@ mod tests {
 
     #[test]
     fn eagle3_orchestrator_config_validate_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let d = drafter_cfg();
         cfg().validate(&d).expect("valid config");
 
@@ -1079,6 +1080,7 @@ mod tests {
 
     #[test]
     fn eagle3_orchestrator_multi_layer_hidden_capture_order_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut collector = Eagle3HiddenCollector::new(vec![1, 3, 7], 2, 4).unwrap();
         for layer in 0..8 {
             if let Some(cap) = collector.capture_index_for(layer) {
@@ -1095,6 +1097,7 @@ mod tests {
 
     #[test]
     fn eagle3_orchestrator_drafter_integration_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::spec_decode::eagle3::drafter::{
             DraftCandidate, Drafter, TreeContextView,
         };
@@ -1134,6 +1137,7 @@ mod tests {
 
     #[test]
     fn eagle3_orchestrator_single_iteration_end_to_end_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let tree = ExpandedTree {
             tokens: vec![5, 8, 13],
             parents: vec![None, Some(0), Some(1)],
@@ -1148,6 +1152,7 @@ mod tests {
 
     #[test]
     fn eagle3_orchestrator_multi_iteration_cache_continuity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut prefix_len = 3usize;
         let accepted_counts = [1usize, 2, 1, 3, 1];
         for n in accepted_counts {
@@ -1160,12 +1165,14 @@ mod tests {
 
     #[test]
     fn eagle3_orchestrator_temp_zero_parity_vs_base_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let logits = vec![0.0, 2.0, 2.0, -1.0, 3.0, 1.0];
         assert_eq!(argmax_rows(&logits, 3).unwrap(), vec![1, 1]);
     }
 
     #[test]
     fn f1_f2_per_layer_regression_sanity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let shape = super::Eagle3OrchestratorConfig {
             dynamic_tree: DynamicTreeConfig {
                 budget: 1,
@@ -1188,6 +1195,7 @@ mod tests {
 
     #[test]
     fn qwen35_prefill_decode_regression_sanity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         assert_eq!(
             qwen_positions(3).unwrap(),
             vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]
@@ -1196,6 +1204,7 @@ mod tests {
 
     #[test]
     fn hf2q_spec_eagle3_opt_in_with_mock_drafter_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         std::env::set_var("HF2Q_SPEC_EAGLE3", "1");
         assert_eq!(std::env::var("HF2Q_SPEC_EAGLE3").as_deref(), Ok("1"));
         std::env::remove_var("HF2Q_SPEC_EAGLE3");
@@ -1203,6 +1212,7 @@ mod tests {
 
     #[test]
     fn hf2q_spec_eagle3_graceful_fallback_when_path_unset_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         std::env::remove_var("HF2Q_SPEC_EAGLE3");
         assert_ne!(std::env::var("HF2Q_SPEC_EAGLE3").as_deref(), Ok("1"));
     }
@@ -1212,6 +1222,7 @@ mod tests {
     /// AC-1 — FfnTopology enum variants are distinct and Debug-printable.
     #[test]
     fn ffn_topology_enum_variants_distinct_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         assert_ne!(FfnTopology::Dense, FfnTopology::Moe);
         assert_eq!(FfnTopology::Dense, FfnTopology::Dense);
         assert_eq!(FfnTopology::Moe, FfnTopology::Moe);
@@ -1222,6 +1233,7 @@ mod tests {
     /// AC-2 — Eagle3OrchestratorConfig carries ffn_topology; Dense path validates correctly.
     #[test]
     fn eagle3_orchestrator_config_carries_ffn_topology_dense_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut c = cfg();
         c.ffn_topology = FfnTopology::Dense;
         let d = drafter_cfg();
@@ -1232,6 +1244,7 @@ mod tests {
     /// AC-3 — Eagle3OrchestratorConfig carries ffn_topology; MoE path validates correctly.
     #[test]
     fn eagle3_orchestrator_config_carries_ffn_topology_moe_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let mut c = cfg();
         c.ffn_topology = FfnTopology::Moe;
         let d = drafter_cfg();
@@ -1243,6 +1256,7 @@ mod tests {
     /// Cannot instantiate Qwen35Model without a GGUF; test the enum branch logic directly.
     #[test]
     fn ffn_topology_from_variant_dense_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Simulate what FfnTopology::from_model does for the Dense branch.
         let topology = match crate::inference::models::qwen35::Qwen35Variant::Dense {
             crate::inference::models::qwen35::Qwen35Variant::Moe => FfnTopology::Moe,
@@ -1254,6 +1268,7 @@ mod tests {
     /// AC-5 — FfnTopology::from_model returns Moe for Moe variant.
     #[test]
     fn ffn_topology_from_variant_moe_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let topology = match crate::inference::models::qwen35::Qwen35Variant::Moe {
             crate::inference::models::qwen35::Qwen35Variant::Moe => FfnTopology::Moe,
             crate::inference::models::qwen35::Qwen35Variant::Dense => FfnTopology::Dense,
@@ -1265,6 +1280,7 @@ mod tests {
     /// Tests the config field shape only — cannot call qwen35_default without a Qwen35Model.
     #[test]
     fn eagle3_orchestrator_config_has_ffn_topology_field_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let c = cfg();
         // Field must be accessible (compile-time enforcement) and must be one of the two variants.
         assert!(
@@ -1276,6 +1292,7 @@ mod tests {
     /// AC-7 — Dense regression: existing orchestrator validate path unchanged.
     #[test]
     fn eagle3_orchestrator_f5_dense_regression_validate_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let d = drafter_cfg();
         let c = cfg(); // Dense by default in helper
         // All existing validation paths must still work unchanged.
@@ -1285,6 +1302,7 @@ mod tests {
     /// AC-8 — MoE topology does not interfere with orchestrator validate (no moe-specific fields).
     #[test]
     fn eagle3_orchestrator_f5_moe_topology_validate_ok_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let d = drafter_cfg();
         let mut c = cfg();
         c.ffn_topology = FfnTopology::Moe;
@@ -1387,6 +1405,7 @@ mod g4_cfa5_redhatai_smoke {
     /// the blocked target-GGUF load path).
     #[test]
     fn g4_cfa5_redhatai_drafter_load_smoke_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let drafter_path = match resolve_path("HF2Q_GEMMA4_31B_DRAFTER", DEFAULT_DRAFTER) {
             Some(p) => p,
             None => {
@@ -1494,6 +1513,7 @@ mod g4_cfa5_redhatai_smoke {
     /// (prefill + run_iteration ≥50 tokens + decode) executes as designed.
     #[test]
     fn g4_cfa5_redhatai_end_to_end_smoke_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let gguf_path = match resolve_path("HF2Q_GEMMA4_31B_GGUF", DEFAULT_GGUF) {
             Some(p) => p,
             None => {
@@ -1836,6 +1856,7 @@ mod g4_cfa5_redhatai_smoke {
     /// drives stays green).
     #[test]
     fn g4_cfa5b_dense_gguf_loader_smoke_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let gguf_path = match resolve_path("HF2Q_GEMMA4_31B_GGUF", DEFAULT_GGUF) {
             Some(p) => p,
             None => {
@@ -1992,6 +2013,7 @@ mod g4_cfa5_redhatai_smoke {
     /// Q4_0, that confirms the bug.
     #[test]
     fn g4_cfa5d_diagnose_layer0_weight_ggml_types_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let gguf_path = match resolve_path("HF2Q_GEMMA4_31B_GGUF", DEFAULT_GGUF) {
             Some(p) => p,
             None => {
@@ -2055,6 +2077,7 @@ mod g4_cfa5_redhatai_smoke {
     /// (decode is always m=1, prefill is per-token loop also m=1).
     #[test]
     fn g4_cfa5e_lm_head_m_dependency_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let gguf_path = match resolve_path("HF2Q_GEMMA4_31B_GGUF", DEFAULT_GGUF) {
             Some(p) => p,
             None => { eprintln!("[g4_cfa5e-m SKIP] no GGUF"); return; }
@@ -2145,6 +2168,7 @@ mod g4_cfa5_redhatai_smoke {
     /// Cost: ~30s for model load + ~1-3s for prefill on 6 tokens.
     #[test]
     fn g4_cfa5e_forward_prefill_baseline_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let gguf_path = match resolve_path("HF2Q_GEMMA4_31B_GGUF", DEFAULT_GGUF) {
             Some(p) => p,
             None => {

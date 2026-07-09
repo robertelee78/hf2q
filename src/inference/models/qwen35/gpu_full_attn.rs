@@ -6542,6 +6542,90 @@ mod tests {
     use crate::inference::spec_decode::eagle3::forward::dispatch_eagle3_tree_attention;
     use mlx_native::ops::tree_attention::{TREE_MASK_ATTENDED, TREE_MASK_MASKED};
 
+    /// ADR-005 iter-230 AC-A2 — GPU-test lock discipline source-pin.
+    ///
+    /// For every guarded GPU-family module: (i) each test fn acquires
+    /// the GPU test lock as its FIRST statement — the mutex is
+    /// non-reentrant, so a later/duplicate acquire self-deadlocks and a
+    /// missing acquire reintroduces the parallel Metal-corruption
+    /// flake; (ii) helpers never reference the lock. Enforced by
+    /// counting: per module, lock-call occurrences == test-attribute
+    /// occurrences, AND each call sits on the line immediately after a
+    /// `{` opener (first statement). Patterns are built at runtime so
+    /// this pin's own source stays out of its counts.
+    #[test]
+    fn iter230_a2_lock_discipline() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        // Patterns built dynamically so this test's own source doesn't
+        // inflate the counts it asserts.
+        let test_attr = format!("#[{}]", "test");
+        let lock_call = format!("{}();", "hf2q_gpu_test_lock");
+        let modules: [(&str, &str); 40] = [
+            ("inference/models/bert/bert_gpu.rs", include_str!("../bert/bert_gpu.rs")),
+            ("inference/models/bert/weights.rs", include_str!("../bert/weights.rs")),
+            ("inference/models/gemma4/forward_gpu.rs", include_str!("../gemma4/forward_gpu.rs")),
+            ("inference/models/gemma4/gpu_full_attn.rs", include_str!("../gemma4/gpu_full_attn.rs")),
+            ("inference/models/gemma4/kv_cache.rs", include_str!("../gemma4/kv_cache.rs")),
+            ("inference/models/gemma4/model.rs", include_str!("../gemma4/model.rs")),
+            ("inference/models/nomic_bert/forward.rs", include_str!("../nomic_bert/forward.rs")),
+            ("inference/models/nomic_bert/weights.rs", include_str!("../nomic_bert/weights.rs")),
+            ("inference/models/qwen35/chunk_allocs_arena.rs", include_str!("chunk_allocs_arena.rs")),
+            ("inference/models/qwen35/dense_ffn_arena.rs", include_str!("dense_ffn_arena.rs")),
+            ("inference/models/qwen35/dn_prefill_arena.rs", include_str!("dn_prefill_arena.rs")),
+            ("inference/models/qwen35/dump_bisect.rs", include_str!("dump_bisect.rs")),
+            ("inference/models/qwen35/fa_prefill_arena.rs", include_str!("fa_prefill_arena.rs")),
+            ("inference/models/qwen35/fa_projections_arena.rs", include_str!("fa_projections_arena.rs")),
+            ("inference/models/qwen35/forward_gpu.rs", include_str!("forward_gpu.rs")),
+            ("inference/models/qwen35/gpu_delta_net.rs", include_str!("gpu_delta_net.rs")),
+            ("inference/models/qwen35/gpu_ffn.rs", include_str!("gpu_ffn.rs")),
+            ("inference/models/qwen35/gpu_full_attn.rs", include_str!("gpu_full_attn.rs")),
+            ("inference/models/qwen35/in_memory_loader.rs", include_str!("in_memory_loader.rs")),
+            ("inference/models/qwen35/kv_cache.rs", include_str!("kv_cache.rs")),
+            ("inference/models/qwen35/model.rs", include_str!("model.rs")),
+            ("inference/models/qwen35/weight_loader.rs", include_str!("weight_loader.rs")),
+            ("inference/models/qwen35/weight_pool.rs", include_str!("weight_pool.rs")),
+            ("inference/models/qwen3vl_text/forward.rs", include_str!("../qwen3vl_text/forward.rs")),
+            ("inference/models/qwen3vl_text/mod.rs", include_str!("../qwen3vl_text/mod.rs")),
+            ("inference/spec_decode/dflash/forward.rs", include_str!("../../spec_decode/dflash/forward.rs")),
+            ("inference/spec_decode/dflash/hidden_capture.rs", include_str!("../../spec_decode/dflash/hidden_capture.rs")),
+            ("inference/spec_decode/dflash/kv_cache.rs", include_str!("../../spec_decode/dflash/kv_cache.rs")),
+            ("inference/spec_decode/dflash/orchestrator.rs", include_str!("../../spec_decode/dflash/orchestrator.rs")),
+            ("inference/spec_decode/eagle3/drafter_gpu.rs", include_str!("../../spec_decode/eagle3/drafter_gpu.rs")),
+            ("inference/spec_decode/eagle3/forward.rs", include_str!("../../spec_decode/eagle3/forward.rs")),
+            ("inference/spec_decode/eagle3/tensors.rs", include_str!("../../spec_decode/eagle3/tensors.rs")),
+            ("inference/spec_decode/eagle3_orchestrator.rs", include_str!("../../spec_decode/eagle3_orchestrator.rs")),
+            ("inference/vision/image_token_residual_add.rs", include_str!("../../vision/image_token_residual_add.rs")),
+            ("inference/vision/mmproj_weights.rs", include_str!("../../vision/mmproj_weights.rs")),
+            ("inference/vision/vit.rs", include_str!("../../vision/vit.rs")),
+            ("inference/vision/vit_dump.rs", include_str!("../../vision/vit_dump.rs")),
+            ("inference/vision/vit_gpu.rs", include_str!("../../vision/vit_gpu.rs")),
+            ("inference/vision/vit_gpu_qwen3vl.rs", include_str!("../../vision/vit_gpu_qwen3vl.rs")),
+            ("serve/forward_mlx_shared.rs", include_str!("../../../serve/forward_mlx_shared.rs")),
+        ];
+        for (name, src) in modules {
+            let n_tests = src.matches(&test_attr).count();
+            let n_locks = src.matches(&lock_call).count();
+            assert_eq!(
+                n_locks, n_tests,
+                "{name}: every test must acquire the GPU test lock \
+                 exactly once ({n_tests} tests vs {n_locks} acquisitions)"
+            );
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains(&lock_call) {
+                    let prev = if i > 0 { lines[i - 1] } else { "" };
+                    assert!(
+                        prev.trim_end().ends_with('{'),
+                        "{name}:{}: lock acquisition must be the FIRST \
+                         statement of the test fn (previous line must end \
+                         with the fn opener brace); prev was: {prev:?}",
+                        i + 1
+                    );
+                }
+            }
+        }
+    }
+
     fn mk_rand(seed: &mut u32, n: usize, scale: f32) -> Vec<f32> {
         (0..n)
             .map(|_| {
@@ -6651,6 +6735,7 @@ mod tests {
 
     #[test]
     fn dispatch_qwen35_tree_verify_head_dim_128_smoke_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -6679,6 +6764,7 @@ mod tests {
 
     #[test]
     fn dispatch_qwen35_tree_verify_rejects_head_dim_256_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -6697,6 +6783,7 @@ mod tests {
 
     #[test]
     fn dispatch_qwen35_tree_verify_chain_mask_byte_identity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -6745,6 +6832,7 @@ mod tests {
 
     #[test]
     fn dispatch_qwen35_tree_verify_overflow_q_seq_len_zero_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -6762,6 +6850,7 @@ mod tests {
 
     #[test]
     fn dispatch_qwen35_tree_verify_mask_stride_too_small_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -6781,6 +6870,7 @@ mod tests {
     /// Round-trip `upload_f32`/`download_f32` preserves contents.
     #[test]
     fn upload_download_roundtrip() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let data: Vec<f32> = (0..100).map(|i| (i as f32) * 0.137 - 5.0).collect();
         let buf = upload_f32(&data, &device).expect("upload");
@@ -6801,6 +6891,7 @@ mod tests {
     ///     (one Q4_0 block per 32 source f32 values, 18 bytes per block).
     #[test]
     fn from_cpu_uploads_all_weights() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let (shape, weights_cpu, _) = small_shape_and_weights();
         let gpu = FullAttnWeightsGpu::from_cpu(&weights_cpu, &device).expect("upload");
@@ -6900,6 +6991,7 @@ mod tests {
     /// upload + dispatch + download plumbing works end-to-end.
     #[test]
     fn pre_attn_rms_norm_matches_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
         let (shape, weights_cpu, seq_len) = small_shape_and_weights();
@@ -6961,6 +7053,7 @@ mod tests {
     /// Dtype correctness: `upload_f32` produces an F32 buffer.
     #[test]
     fn upload_f32_is_f32_dtype() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let data = vec![1.0f32, 2.0, 3.0];
         let buf = upload_f32(&data, &device).expect("upload");
@@ -6975,6 +7068,7 @@ mod tests {
     /// `x / sqrt(mean(x^2) + eps) * attn_q_norm` per row.
     #[test]
     fn q_per_head_rms_norm_matches_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
         let (shape, weights_cpu, seq_len) = small_shape_and_weights();
@@ -7038,6 +7132,7 @@ mod tests {
     /// Mirror parity test for K per-head RMSNorm (n_kv heads instead of n_head).
     #[test]
     fn k_per_head_rms_norm_matches_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
         let (shape, weights_cpu, seq_len) = small_shape_and_weights();
@@ -7102,6 +7197,7 @@ mod tests {
     /// self-contained).
     #[test]
     fn imrope_matches_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
         let (shape, _weights_cpu, seq_len) = small_shape_and_weights();
@@ -7202,6 +7298,7 @@ mod tests {
     /// Mirror of the output-gate step of the CPU reference.
     #[test]
     fn sigmoid_gate_multiply_matches_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 
@@ -7253,6 +7350,7 @@ mod tests {
     /// download_f32 rejects non-F32 buffers with a clear error.
     #[test]
     fn download_rejects_wrong_dtype() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let buf = device
             .alloc_buffer(4, DType::U32, vec![1])
@@ -7268,6 +7366,7 @@ mod tests {
     /// ADR-013 P7b acceptance criterion.
     #[test]
     fn full_layer_gpu_matches_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::full_attn::gated_full_attention_cpu_ref;
 
         let device = MlxDevice::new().expect("device");
@@ -7424,6 +7523,7 @@ mod tests {
     /// matches naive CPU matmul to 1e-3 (BF16 rounding bound).
     #[test]
     fn linear_projection_matches_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
         let (shape, weights_cpu, seq_len) = small_shape_and_weights();
@@ -7518,6 +7618,7 @@ mod tests {
     /// layer's GQA ratio (8:1).
     #[test]
     fn flash_attn_prefill_into_kernel_equivalence_with_wrapper() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::FaPrefillArena;
 
         let device = MlxDevice::new().expect("device");
@@ -7749,6 +7850,7 @@ mod tests {
     /// directly above.
     #[test]
     fn phase_b2_iso_fast_path_vs_fallback_path_kernel_divergence() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::FaPrefillArena;
 
         let device = MlxDevice::new().expect("device");
@@ -8170,6 +8272,7 @@ mod tests {
     /// `flash_attn_prefill_into_kernel_equivalence_with_wrapper` rewrite.
     #[test]
     fn fa_projections_arena_kernel_equivalence_with_legacy() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::FaProjectionsArena;
 
         let device = MlxDevice::new().expect("device");
@@ -8500,6 +8603,7 @@ mod tests {
     /// slots [64, 68) are written (no longer all-zero after the block).
     #[test]
     fn qwen35_tree_verify_attention_block_smoke_production_gqa_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -8594,6 +8698,7 @@ mod tests {
     /// T4 — Negative path tests: 7 invariants each rejected with descriptive error.
     #[test]
     fn qwen35_tree_verify_attention_block_negative_paths_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -8939,6 +9044,7 @@ mod tests {
     /// Asserts |GPU - CPU|_inf < 5e-2 (BF16-vs-F32 matmul slop budget).
     #[test]
     fn qwen35_tree_verify_attention_block_cpu_ref_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -9061,6 +9167,7 @@ mod tests {
     /// at step 6 which may reorder Metal dispatch ordering.
     #[test]
     fn qwen35_tree_verify_attention_block_prefix0_chain_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -9168,6 +9275,7 @@ mod tests {
     /// explicit memory_barriers.
     #[test]
     fn qwen35_tree_verify_attention_block_determinism_3rep_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -9272,6 +9380,7 @@ mod tests {
     /// AC-1 — Shape struct validate.
     #[test]
     fn qwen35_tree_verify_full_layer_shape_validate_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // (a) intermediate_size = 0 rejected.
         {
             let shape = Qwen35TreeVerifyFullLayerShape {
@@ -9341,6 +9450,7 @@ mod tests {
     /// AC-2 — Production GQA smoke test at Qwen 3.6 27B layer-0 shape.
     #[test]
     fn qwen35_tree_verify_full_layer_smoke_production_gqa_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -9427,6 +9537,7 @@ mod tests {
     /// All 5 invoke the FULL function entry.
     #[test]
     fn qwen35_tree_verify_full_layer_negative_paths_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -9681,6 +9792,7 @@ mod tests {
     /// Asserts |GPU - CPU|_inf < 5e-2 (BF16-cast slop budget).
     #[test]
     fn qwen35_tree_verify_full_layer_cpu_ref_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -9811,6 +9923,7 @@ mod tests {
     /// sub-operation is precise.
     #[test]
     fn qwen35_tree_verify_full_layer_composition_equivalence_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -9928,6 +10041,7 @@ mod tests {
     /// K/V caches between reps) and asserts byte-exact (0 ULP) output equality.
     #[test]
     fn qwen35_tree_verify_full_layer_determinism_3rep_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -10069,6 +10183,7 @@ mod tests {
     /// AC-1 — Qwen35TreeVerifyFullLayerShapeQ::validate() rejects all invalid shapes.
     #[test]
     fn qwen35_tree_verify_full_layer_q_shape_validate_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // (a) intermediate_size = 0 rejected.
         {
             let shape = Qwen35TreeVerifyFullLayerShapeQ {
@@ -10129,6 +10244,7 @@ mod tests {
     /// AC-2 — Production GQA smoke test at Qwen 3.6 27B layer-0 shape with real Q4_0 weights.
     #[test]
     fn qwen35_tree_verify_full_layer_q_smoke_production_gqa_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -10222,6 +10338,7 @@ mod tests {
     /// All 7 invoke the FULL function entry (not just shape.validate()).
     #[test]
     fn qwen35_tree_verify_full_layer_q_negative_paths_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -10467,6 +10584,7 @@ mod tests {
     /// Tolerance: |GPU - CPU|_inf < 0.15 (Q4_0 dequant slop budget per spec).
     #[test]
     fn qwen35_tree_verify_full_layer_q_cpu_reference_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -10603,6 +10721,7 @@ mod tests {
     /// attention_block + manual RMSNorm + CPU MLP ref.
     #[test]
     fn qwen35_tree_verify_full_layer_q_composition_equivalence_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -10725,6 +10844,7 @@ mod tests {
     /// AC-6 — 3-rep byte-identity determinism (0 ULP via to_bits()).
     #[test]
     fn qwen35_tree_verify_full_layer_q_byte_identity_3rep_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -10788,6 +10908,7 @@ mod tests {
     /// accidentally routes through the BF16 dispatcher.
     #[test]
     fn qwen35_tree_verify_full_layer_q_cross_variant_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -11112,6 +11233,7 @@ mod tests {
     /// AC-1 — Qwen35TreeVerifyFullLayerShapeQMoe::validate() accepts/rejects shapes.
     #[test]
     fn qwen35_tree_verify_full_layer_q_moe_shape_validate_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Valid production-like shape.
         {
             let shape = Qwen35TreeVerifyFullLayerShapeQMoe {
@@ -11199,6 +11321,7 @@ mod tests {
     /// AC-2 — Production GQA smoke test at downscaled 27B-A3B shape.
     #[test]
     fn qwen35_tree_verify_full_layer_q_moe_smoke_production_gqa_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -11297,6 +11420,7 @@ mod tests {
     /// AC-3 — Negative-path invariants: 8 subtests each invoke FULL function entry (RF-9).
     #[test]
     fn qwen35_tree_verify_full_layer_q_moe_negative_paths_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -11602,6 +11726,7 @@ mod tests {
     /// AC-4 — CPU reference parity at compact shape. Tolerance 0.20 (Q4_0 + MoE routing noise).
     #[test]
     fn qwen35_tree_verify_full_layer_q_moe_cpu_reference_parity_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -11715,6 +11840,7 @@ mod tests {
     /// AC-5 — Composition equivalence: F4 ≡ attention_block + RMSNorm + build_moe_ffn_layer_gpu_q.
     #[test]
     fn qwen35_tree_verify_full_layer_q_moe_composition_equivalence_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -11848,6 +11974,7 @@ mod tests {
     /// AC-6 — 3-rep byte-identity determinism with K/V cache reset (RF-6).
     #[test]
     fn qwen35_tree_verify_full_layer_q_moe_byte_identity_3rep_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -11917,6 +12044,7 @@ mod tests {
     /// AC-7 — Top-K routing correctness: sentinel-weight experts isolate routing leakage.
     #[test]
     fn qwen35_tree_verify_full_layer_q_moe_topk_routing_correctness_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -12012,6 +12140,7 @@ mod tests {
     /// AC-8 — Shared expert always contributes regardless of topK routing.
     #[test]
     fn qwen35_tree_verify_full_layer_q_moe_shared_expert_always_contributes_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,

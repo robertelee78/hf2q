@@ -1341,6 +1341,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device + drafter HF cache"]
     fn smoke_input_norm_and_q_proj() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = gemma4_26b_a4b_dflash_config();
         let device = MlxDevice::new().expect("Metal device available on M5 Max");
         let mut registry = KernelRegistry::new();
@@ -1493,6 +1494,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device + drafter HF cache"]
     fn smoke_model_forward_with_cache() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::kv_cache::DFlashKvCache;
 
         let cfg = gemma4_26b_a4b_dflash_config();
@@ -1580,6 +1582,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device + drafter HF cache"]
     fn smoke_decoder_layer_full_with_cache() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::kv_cache::DFlashKvCache;
 
         let cfg = gemma4_26b_a4b_dflash_config();
@@ -1661,6 +1664,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device + drafter HF cache"]
     fn smoke_decoder_layer_attention_with_cache() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::kv_cache::DFlashKvCache;
 
         let cfg = gemma4_26b_a4b_dflash_config();
@@ -1747,6 +1751,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device + drafter HF cache"]
     fn smoke_sdpa_cross_length() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::kv_cache::DFlashKvCache;
 
         let cfg = gemma4_26b_a4b_dflash_config();
@@ -1821,6 +1826,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device + drafter HF cache"]
     fn smoke_model_level_globals() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = gemma4_26b_a4b_dflash_config();
         let device = MlxDevice::new().expect("Metal device available on M5 Max");
         let mut registry = KernelRegistry::new();
@@ -1952,6 +1958,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device + drafter HF cache"]
     fn smoke_decoder_layer_self_attn() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = gemma4_26b_a4b_dflash_config();
         let device = MlxDevice::new().expect("Metal device available on M5 Max");
         let mut registry = KernelRegistry::new();
@@ -2072,6 +2079,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device + drafter HF cache"]
     fn smoke_o_proj() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = gemma4_26b_a4b_dflash_config();
         let device = MlxDevice::new().expect("Metal device available on M5 Max");
         let mut registry = KernelRegistry::new();
@@ -2124,6 +2132,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device + drafter HF cache"]
     fn smoke_post_norm_and_mlp() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = gemma4_26b_a4b_dflash_config();
         let device = MlxDevice::new().expect("Metal device available on M5 Max");
         let mut registry = KernelRegistry::new();

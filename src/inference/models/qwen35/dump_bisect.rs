@@ -392,6 +392,7 @@ mod tests {
     /// the parser-equivalent logic by examining filter selection.
     #[test]
     fn filter_only_matches_layer_idx() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let f = LayerFilter::Only(5);
         // Always-on ops match Only(_).
         match (f, None::<usize>) {
@@ -412,6 +413,7 @@ mod tests {
 
     #[test]
     fn filter_all_matches_everything() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let f = LayerFilter::All;
         match (f, None::<usize>) {
             (LayerFilter::All, _) => {}
@@ -425,6 +427,7 @@ mod tests {
 
     #[test]
     fn step_counter_monotone() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Cannot reset between concurrent tests; just check increment.
         let a = next_step();
         let b = next_step();
@@ -433,6 +436,7 @@ mod tests {
 
     #[test]
     fn synthetic_dump_round_trip() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Spin up a 4-element f32 buffer and dump it via dump_inner.
         // We bypass should_dump by constructing a one-shot DumpConfig.
         use mlx_native::DType;

@@ -725,6 +725,7 @@ mod tests {
 
     #[test]
     fn from_gguf_parses_underscored_arch_with_real_2b_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // The real-model GGUF arch.
         let kvs = standard_2b_kvs("qwen3_vl");
         let tensors = [TensorDesc {
@@ -771,6 +772,7 @@ mod tests {
 
     #[test]
     fn from_gguf_parses_upstream_no_underscore_arch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Forward-compat: a future converter that aligns with llama.cpp
         // upstream emits `qwen3vl` (no underscore). Both prefix + arch
         // string forms must work.
@@ -790,6 +792,7 @@ mod tests {
 
     #[test]
     fn from_gguf_rejects_non_qwen3vl_arch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let kvs = standard_2b_kvs("gemma4");
         let tensors = [TensorDesc {
             name: "token_embd.weight",
@@ -809,6 +812,7 @@ mod tests {
 
     #[test]
     fn from_gguf_rejects_moe_variant_with_specific_message() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // MoE Qwen3-VL is recognized at the dispatch level (so we route
         // to a clear error rather than a Gemma-path crash), but the
         // dense config parser must refuse it explicitly.
@@ -831,6 +835,7 @@ mod tests {
 
     #[test]
     fn from_gguf_detects_untied_embeddings_when_output_present() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // The real Qwen3-VL-2B converter emits 310 tensors (tied). A
         // future converter (or a hand-untied fork) would emit
         // `output.weight` → tied_word_embeddings = false.
@@ -858,6 +863,7 @@ mod tests {
 
     #[test]
     fn from_gguf_rejects_invalid_gqa_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // num_attention_heads not divisible by num_key_value_heads —
         // structurally impossible for valid GQA.
         let kvs = vec![
@@ -886,6 +892,7 @@ mod tests {
 
     #[test]
     fn arch_constants_match_qwen35_module_re_export() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Sanity: the re-exported constants here are byte-equal to
         // the Qwen35 module's authoritative copies.
         assert_eq!(ARCH_QWEN3_VL, "qwen3_vl");
@@ -895,6 +902,7 @@ mod tests {
 
     #[test]
     fn defaults_match_hf_text_config_for_qwen3vl_2b() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Pin the defaults to the HF text_config values — if these
         // ever drift, this test fails loudly and forces a docstring
         // update.
@@ -929,6 +937,7 @@ mod tests {
 
     #[test]
     fn from_gguf_reads_explicit_rope_dimension_sections() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // When the GGUF carries `qwen3_vl.rope.dimension_sections`
         // (the canonical 4-int IMROPE sections array hf2q's converter
         // emits at `gguf.rs::emit_qwen3vl_metadata` line 3848), the
@@ -960,6 +969,7 @@ mod tests {
 
     #[test]
     fn from_gguf_rejects_rope_sections_with_wrong_sum() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Sections that don't sum to head_dim/2 violate the IMROPE
         // rotary-axis budget; refuse the load so the operator catches
         // the misconfig before silent attention drift.
@@ -986,6 +996,7 @@ mod tests {
 
     #[test]
     fn from_gguf_rejects_rope_sections_array_too_short() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Peer canonical layout is exactly 4 entries (Qwen3-VL-2B's
         // 3-int HF mrope_section gets padded with 0); the converter
         // emits 4. A 3-entry array is malformed.
@@ -1012,6 +1023,7 @@ mod tests {
 
     #[test]
     fn from_gguf_reads_explicit_n_deepstack_layers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // When the GGUF carries `qwen3_vl.n_deepstack_layers` (hf2q's
         // converter emits it from
         // `vision_config.deepstack_visual_indexes` length), the parser
@@ -1036,6 +1048,7 @@ mod tests {
 
     #[test]
     fn from_gguf_rejects_n_deepstack_exceeding_n_layers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // n_deepstack_layers > num_hidden_layers would let the
         // per-LM-layer dispatch (`il < n_deepstack_layers`) index past
         // layers[]. Refuse at parse time.
@@ -1066,6 +1079,7 @@ mod tests {
     /// present, parse the config and pin against text_config.
     #[test]
     fn from_gguf_parses_real_qwen3vl_2b_when_operator_gated() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if std::env::var("HF2Q_QWEN3VL_LM_LOAD").ok().as_deref() != Some("1") {
             eprintln!("skip: HF2Q_QWEN3VL_LM_LOAD!=1");
             return;

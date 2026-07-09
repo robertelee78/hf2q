@@ -612,6 +612,67 @@ fn render_jinja_template(
     render_jinja_template_with_specials(template_str, user_prompt, enable_thinking, "<bos>", "<eos>")
 }
 
+/// How a chat template's `raise_exception(msg)` call behaves
+/// (ADR-005 iter-229 Decision 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RaisePolicy {
+    /// Warn and continue (render succeeds with UNDEFINED). One-shot
+    /// CLI/generate path: it always injects a user message, so raise
+    /// sites are unreachable in practice and aborting would be worse
+    /// than logging.
+    Lenient,
+    /// Hard render error carrying the template's own message. API path:
+    /// the transcript is client-supplied, so raise sites are reachable
+    /// and the message must surface in the 400 body (AC5).
+    Strict,
+}
+
+/// Shared Jinja environment for chat-template rendering (ADR-005
+/// iter-229 Decision 1). BOTH renderers — the one-shot
+/// `render_jinja_template_with_specials` below and the API path's
+/// `render_chat_prompt_with_tools` (serve/api/engine.rs) — must build
+/// their environment here; the two diverging was the root cause of the
+/// iter-229 F1/F6 failures (API path had no `tojson`/`raise_exception`,
+/// so every `tools`-bearing Qwen 3.6 request 400'd at template line 50).
+///
+/// Registers:
+/// - `tojson` filter — JSON-serializes any value, `"null"` fallback.
+/// - `raise_exception(msg)` — behavior per [`RaisePolicy`].
+/// - pycompat unknown-method callback — Python str/dict/list method
+///   shims (`.get`, `.startswith`, `.split`, …) used by the Gemma 4 and
+///   Qwen templates. Purely additive: consulted only after minijinja's
+///   native dispatch returns UnknownMethod.
+pub(crate) fn build_chat_template_env<'s>(raise_policy: RaisePolicy) -> minijinja::Environment<'s> {
+    let mut env = minijinja::Environment::new();
+
+    env.add_filter("tojson", |v: minijinja::Value| {
+        serde_json::to_string(&v).unwrap_or_else(|_| "null".to_string())
+    });
+
+    match raise_policy {
+        RaisePolicy::Lenient => {
+            env.add_function("raise_exception", |msg: String| -> minijinja::Value {
+                tracing::warn!("chat template raise_exception: {}", msg);
+                minijinja::Value::UNDEFINED
+            });
+        }
+        RaisePolicy::Strict => {
+            env.add_function(
+                "raise_exception",
+                |msg: String| -> std::result::Result<minijinja::Value, minijinja::Error> {
+                    Err(minijinja::Error::new(
+                        minijinja::ErrorKind::InvalidOperation,
+                        format!("chat template raise_exception: {msg}"),
+                    ))
+                },
+            );
+        }
+    }
+
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env
+}
+
 fn render_jinja_template_with_specials(
     template_str: &str,
     user_prompt: &str,
@@ -619,38 +680,7 @@ fn render_jinja_template_with_specials(
     bos_token: &str,
     eos_token: &str,
 ) -> Result<String> {
-    let mut env = minijinja::Environment::new();
-
-    // `tojson` filter — converts any value to its JSON representation.
-    env.add_filter("tojson", |v: minijinja::Value| {
-        serde_json::to_string(&v).unwrap_or_else(|_| "null".to_string())
-    });
-
-    // `raise_exception(msg)` — log-and-continue instead of aborting.
-    // Qwen3.6 calls this when the message list has no user turn; we always
-    // inject a user message so the guard should not fire.
-    env.add_function("raise_exception", |msg: String| -> minijinja::Value {
-        tracing::warn!("chat template raise_exception: {}", msg);
-        minijinja::Value::UNDEFINED
-    });
-
-    // Python method shims via `minijinja-contrib`'s pycompat callback.
-    // The official Google Gemma 4 chat template (and many others)
-    // authors call `.get('reasoning')` on message dicts (line 238 of
-    // the embedded Gemma 4 template) and `.startswith` / `.endswith`
-    // on strings.  The pycompat callback emulates the Python str/dict/
-    // list/tuple method set so these all work.
-    //
-    // Mirrors `src/serve/api/engine.rs:7861` (the API path).  Pre-this-
-    // patch the CLI/generate path used a hand-rolled callback that only
-    // supported `startswith`/`endswith` — calling `.get` on the bartowski
-    // GGUF's official Gemma 4 template produced
-    // `"unknown method: map has no method named get (in chat:238)"`.
-    //
-    // pycompat is purely additive: it is only consulted when minijinja's
-    // built-in method dispatch returns UnknownMethod, so it cannot break
-    // existing templates that resolved without it.
-    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    let mut env = build_chat_template_env(RaisePolicy::Lenient);
 
     env.add_template("chat", template_str)
         .context("Failed to parse chat template as Jinja2")?;
@@ -5884,11 +5914,12 @@ fn cmd_parity_capture(
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_greedy_repetition_loop, detect_greedy_repetition_loop_with_text,
+        build_chat_template_env, detect_greedy_repetition_loop,
+        detect_greedy_repetition_loop_with_text,
         find_special_token_stop, maybe_print_serve_banner,
         llama_cpp_special_token_id_for_model, parse_scheduler_config,
         render_jinja_template, resolve_enable_thinking, run_decode_loop,
-        should_enable_kv_persist, DecodeStopReason,
+        should_enable_kv_persist, DecodeStopReason, RaisePolicy,
         DEFAULT_MAX_SLOTS_UNDER_INFLIGHT, FALLBACK_GEMMA4_API_CHAT_TEMPLATE,
         FALLBACK_GEMMA4_CHAT_TEMPLATE,
     };
@@ -6941,6 +6972,53 @@ mod tests {
             no_thinking: false,
             ignore_eos: false,
         }
+    }
+
+    // ---- ADR-005 iter-229 AC-parity: shared chat-template env ---------
+    //
+    // Both renderers build their environment via `build_chat_template_env`;
+    // these pin the one-shot (Lenient) semantics the API path must not
+    // disturb, plus the Strict policy the API path relies on.
+
+    #[test]
+    fn iter229_parity_tojson_non_finite_renders_null() {
+        // Gate-3 #6 honesty note: serde_json serializes non-finite floats
+        // as `null` itself, so this pins the RENDERED OUTCOME (`null`)
+        // rather than proving the `unwrap_or_else("null")` fallback
+        // fires — that branch stays as defense-in-depth for values whose
+        // serialization genuinely errors.
+        let mut env = build_chat_template_env(RaisePolicy::Lenient);
+        env.add_template("t", "{{ x | tojson }}").unwrap();
+        let out = env
+            .get_template("t")
+            .unwrap()
+            .render(minijinja::context! { x => f64::NAN })
+            .unwrap();
+        assert_eq!(out, "null");
+    }
+
+    #[test]
+    fn iter229_parity_pycompat_strip_resolves() {
+        let mut env = build_chat_template_env(RaisePolicy::Lenient);
+        env.add_template("t", "{{ ' x '.strip() }}").unwrap();
+        let out = env.get_template("t").unwrap().render(()).unwrap();
+        assert_eq!(out, "x");
+    }
+
+    #[test]
+    fn iter229_parity_raise_exception_lenient_warns_and_continues() {
+        let mut env = build_chat_template_env(RaisePolicy::Lenient);
+        env.add_template("t", "{{ raise_exception('boom') }}x").unwrap();
+        let out = env.get_template("t").unwrap().render(()).unwrap();
+        assert_eq!(out, "x", "Lenient policy must render through the raise");
+    }
+
+    #[test]
+    fn iter229_parity_raise_exception_strict_hard_errors_with_message() {
+        let mut env = build_chat_template_env(RaisePolicy::Strict);
+        env.add_template("t", "{{ raise_exception('boom') }}x").unwrap();
+        let err = env.get_template("t").unwrap().render(()).unwrap_err();
+        assert!(err.to_string().contains("boom"), "err={err}");
     }
 
     // ---- canonical render-and-diff thinking-mode detection -----------

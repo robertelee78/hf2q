@@ -1074,6 +1074,7 @@ mod tests {
 
     #[test]
     fn k0_empty_drafts_degrades_to_single_token() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // K=0: no drafts proposed. The target argmaxes have just 1
         // entry (the next-token argmax of target at the last position).
         // Round emits exactly that 1 token.
@@ -1087,6 +1088,7 @@ mod tests {
 
     #[test]
     fn full_accept_returns_all_drafts_plus_model_token() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // K=3 drafts, all match target → accept all 3, plus 1 free.
         let drafts = vec![10, 20, 30];
         // Target argmaxes for K+1=4 positions: first 3 match drafts,
@@ -1100,6 +1102,7 @@ mod tests {
 
     #[test]
     fn partial_accept_truncates_at_first_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // K=4 drafts; first 2 match, 3rd differs. Accept 2, model
         // continues with whatever target predicted at position 2.
         let drafts = vec![10, 20, 30, 40];
@@ -1112,6 +1115,7 @@ mod tests {
 
     #[test]
     fn eos_in_accepted_prefix_stops_generation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // K=3 drafts; first 2 match target, 2nd is EOS. The 3rd draft
         // (even if it matched) doesn't matter — generation stops.
         let drafts = vec![10, 7, 30];
@@ -1124,6 +1128,7 @@ mod tests {
 
     #[test]
     fn eos_as_model_free_token_sets_hit_eos() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // K=2 drafts, partial-accept at index 1 (first matches), model's
         // continuation at position 1 IS an EOS.
         let drafts = vec![10, 20];
@@ -1136,6 +1141,7 @@ mod tests {
 
     #[test]
     fn eos_check_handles_full_accept_with_eos_continuation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // K=2 drafts both accepted, model's free token is EOS.
         let drafts = vec![10, 20];
         let target = vec![10, 20, 1];
@@ -1158,6 +1164,7 @@ mod tests {
     #[test]
     #[ignore = "requires Metal device + drafter HF cache"]
     fn smoke_orchestrator_drafter_loop_with_simulated_target() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = DFlashConfig::from_json_str(
             crate::inference::spec_decode::dflash::config::tests::GEMMA4_26B_A4B_DFLASH_CONFIG,
         )
@@ -1269,6 +1276,7 @@ mod tests {
     #[test]
     #[ignore = "requires gemma-4-26b GGUF + DFlash drafter HF cache + ~22GB RAM"]
     fn e2e_dispatch_dflash_generate_gemma4_26b() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::spec_decode::dflash::{
             kv_cache::DFlashKvCache,
             tensors::DFlashModelTensors,
@@ -1556,6 +1564,7 @@ mod tests {
     #[test]
     #[ignore = "iter-67 dual-axis diagnostic; requires gemma-4-26b GGUF + DFlash drafter"]
     fn e2e_coherence_gemma4_chat_templated_prompt() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::spec_decode::dflash::{
             kv_cache::DFlashKvCache,
             tensors::DFlashModelTensors,

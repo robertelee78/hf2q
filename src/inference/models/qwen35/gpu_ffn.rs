@@ -3485,6 +3485,7 @@ mod tests {
     /// ADR-013 Decision 14 acceptance criterion.
     #[test]
     fn dense_swiglu_gpu_parity_vs_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("Metal device unavailable — skipping GPU test");
         let mut registry = KernelRegistry::new();
 
@@ -3555,6 +3556,7 @@ mod tests {
     /// Dense SwiGLU GPU: single-token (seq_len=1) works.
     #[test]
     fn dense_swiglu_gpu_single_token() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 
@@ -3600,6 +3602,7 @@ mod tests {
     /// Dense SwiGLU GPU: zero weights → zero output.
     #[test]
     fn dense_swiglu_gpu_zero_weights_zero_output() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
         let shape = DenseFfnShape {
@@ -3642,6 +3645,7 @@ mod tests {
     /// ADR-013 Decision 13 acceptance criterion.
     #[test]
     fn moe_ffn_gpu_parity_vs_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 
@@ -3715,6 +3719,7 @@ mod tests {
     /// MoE GPU: top-1 routing (single expert selected).
     #[test]
     fn moe_ffn_gpu_top1_routing() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 
@@ -3770,6 +3775,7 @@ mod tests {
     /// mid (zero logit) ≈ average of off + on.
     #[test]
     fn moe_ffn_gpu_shared_gate_controls_contribution() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 
@@ -3835,6 +3841,7 @@ mod tests {
     /// silu_mul_cpu: SiLU * up matches known values.
     #[test]
     fn silu_mul_cpu_known_values() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // SiLU(0) = 0, SiLU(1) ≈ 0.7311, SiLU(-1) ≈ -0.2689.
         let gate = vec![0.0, 1.0, -1.0, 2.0];
         let up = vec![1.0, 2.0, 3.0, 0.5];
@@ -3854,6 +3861,7 @@ mod tests {
     /// softmax_topk_renorm_cpu: basic top-2 on 4 experts.
     #[test]
     fn softmax_topk_renorm_basic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // For logits [10, 1, 1, 1] over 4 experts, top-2 should select idx 0
         // (largest) and one of {1,2,3}.  After renorm, weight[0] >> weight[1].
         let logits = vec![10.0f32, 1.0, 1.0, 1.0];
@@ -3887,6 +3895,7 @@ mod tests {
     /// AC for Task 14 / ADR-014.
     #[test]
     fn dense_swiglu_gpu_q_parity_vs_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("Metal device unavailable");
         let mut registry = KernelRegistry::new();
 
@@ -4033,6 +4042,7 @@ mod tests {
     /// `in_use_count` growth.
     #[test]
     fn dense_q_arena_reset_chunk_prefill_no_layer_33_error() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -4249,6 +4259,7 @@ mod tests {
     /// ADR-013 P9b-scale acceptance criterion.
     #[test]
     fn moe_ffn_gpu_q_parity_vs_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("Metal device unavailable");
         let mut registry = KernelRegistry::new();
 

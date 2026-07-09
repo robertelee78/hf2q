@@ -365,6 +365,7 @@ mod tests {
 
     #[test]
     fn identity_zero_chunk_leaves_cur_unchanged() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let n_tokens = 6u32;
         let hidden = 4u32;
         let positions = [1u32, 3, 5];
@@ -390,6 +391,7 @@ mod tests {
 
     #[test]
     fn single_token_add_writes_one_row_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let n_tokens = 4u32;
         let hidden = 3u32;
         let positions = [2u32];
@@ -426,6 +428,7 @@ mod tests {
 
     #[test]
     fn multi_token_add_at_distinct_positions_handles_each_independently() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let n_tokens = 5u32;
         let hidden = 2u32;
         // Three image tokens at non-contiguous positions.
@@ -469,6 +472,7 @@ mod tests {
 
     #[test]
     fn position_gated_non_image_rows_unchanged() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Strong test: every image-token row gets a known shift; every
         // non-image row must equal cur_init exactly. Equivalent to the
         // peer's "non-image-token positions are zero in t_inp_embd" pin
@@ -523,6 +527,7 @@ mod tests {
 
     #[test]
     fn rejects_mismatched_positions_length() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
         register_image_token_residual_add_shader(&mut registry);
@@ -552,6 +557,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_n_image_tokens() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
         register_image_token_residual_add_shader(&mut registry);
@@ -585,6 +591,7 @@ mod tests {
 
     #[test]
     fn rejects_undersized_cur_buffer() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
         register_image_token_residual_add_shader(&mut registry);
@@ -615,6 +622,7 @@ mod tests {
 
     #[test]
     fn out_of_bounds_position_silently_skips() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Defense-in-depth in-kernel guard: a position >= n_tokens must
         // turn into a no-op (clamp) rather than a heap-overrun.
         // Caller should never pass such a value (handler-side

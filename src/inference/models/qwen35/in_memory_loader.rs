@@ -179,6 +179,7 @@ mod tests {
 
     #[test]
     fn q8_0_round_trip_zero_input() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let zeros = vec![0.0f32; 32];
         let buf =
@@ -198,6 +199,7 @@ mod tests {
 
     #[test]
     fn q8_0_block_round_trip_within_tolerance() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Q8_0 has ~1/127 relative error per block; verify a uniform input
         // dequantizes back within tolerance.
         let device = MlxDevice::new().expect("device");
@@ -230,6 +232,7 @@ mod tests {
 
     #[test]
     fn q8_0_rejects_unaligned_numel() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let unaligned = vec![1.0f32; 31];
         let res = quantize_f32_to_q8_0_buffer(&unaligned, vec![31], &device);
@@ -238,6 +241,7 @@ mod tests {
 
     #[test]
     fn q8_0_rejects_shape_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let v = vec![1.0f32; 32];
         let res = quantize_f32_to_q8_0_buffer(&v, vec![16, 4], &device);
@@ -247,6 +251,7 @@ mod tests {
 
     #[test]
     fn bf16_to_f32_round_trip() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // BF16 bit pattern for 1.0 = 0x3F80
         let bytes: Vec<u8> = vec![0x80, 0x3F, 0x00, 0x40]; // 1.0, 2.0
         let mut out = Vec::new();
@@ -258,6 +263,7 @@ mod tests {
 
     #[test]
     fn f32_bytes_round_trip() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let f32s = [1.5f32, -2.25, 100.0, 0.0];
         let mut bytes = Vec::new();
         for v in &f32s {

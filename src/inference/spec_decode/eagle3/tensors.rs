@@ -478,6 +478,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b_decode_bf16_round_trips_canonical_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Values with all-zero low 16 bits survive BF16 truncation.
         let canonical = [0.0f32, 1.0, -1.0, 2.0, 0.5, -0.5];
         let bytes = bf16_bytes_from_f32(&canonical);
@@ -493,6 +494,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b_decode_bf16_rejects_odd_length_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let err = decode_bf16_bytes_to_f32(&[0x80, 0x3f, 0x00]).unwrap_err();
         assert!(format!("{err}").contains("not BF16-aligned"), "got: {err}");
     }
@@ -558,6 +560,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b1_upload_default_qwen35_config_succeeds_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return, // skip when no Metal available
@@ -599,6 +602,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b1_upload_all_gates_off_minimum_tensors_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -628,6 +632,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b1_upload_all_gates_on_maximum_tensors_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -659,6 +664,7 @@ mod tests {
 
     #[test]
     fn adr_037_e4b1_gpu_resident_bytes_includes_f32_cast_expansion_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
