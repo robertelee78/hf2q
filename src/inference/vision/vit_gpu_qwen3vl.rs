@@ -3005,6 +3005,7 @@ mod tests {
 
     #[test]
     fn qwen3vl_vit_config_from_mmproj_round_trip() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Qwen3-VL-2B-style fixture: 24 layers, DeepStack at 5/11/17.
         let cfg = synth_qwen3vl_mmproj_cfg(
             24,
@@ -3033,6 +3034,7 @@ mod tests {
 
     #[test]
     fn qwen3vl_vit_config_fails_on_missing_deepstack_indexes() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // deepstack_indexes = None means the writer omitted
         // `clip.vision.is_deepstack_layers`. Refuse to fall back.
         let cfg = synth_qwen3vl_mmproj_cfg(
@@ -3056,6 +3058,7 @@ mod tests {
 
     #[test]
     fn qwen3vl_vit_config_fails_on_missing_spatial_merge_size() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = synth_qwen3vl_mmproj_cfg(
             24,
             Some(vec![5, 11, 17]),
@@ -3069,6 +3072,7 @@ mod tests {
 
     #[test]
     fn qwen3vl_vit_config_fails_on_missing_projection_dim() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = synth_qwen3vl_mmproj_cfg(
             24,
             Some(vec![5, 11, 17]),
@@ -3082,6 +3086,7 @@ mod tests {
 
     #[test]
     fn qwen3vl_vit_config_fails_on_zero_num_position_embeddings() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = synth_qwen3vl_mmproj_cfg(
             24,
             Some(vec![5, 11, 17]),
@@ -3095,6 +3100,7 @@ mod tests {
 
     #[test]
     fn qwen3vl_vit_config_fails_on_out_of_range_deepstack_index() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // deepstack_indexes contains 24 but n_layer = 24 → 24 is OOB.
         // Sanity-check that should have been caught at parse time but
         // we belt-and-suspender re-validate here so the kernel-side
@@ -3116,6 +3122,7 @@ mod tests {
 
     #[test]
     fn qwen3vl_vit_config_accepts_empty_deepstack_indexes() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Some(empty Vec) is legal — the metadata key was present but
         // no layer was flagged. The augmented embed dim collapses to
         // out_hidden_size (1 + 0 deepstack chunks).
@@ -3133,6 +3140,7 @@ mod tests {
 
     #[test]
     fn compute_vision_embeddings_gpu_qwen3vl_returns_scaffold_error() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 4c.2 contract update: empty input slice now hits the Phase-1
         // "exactly 1 input image" guard FIRST (was: returned the 4c.1
         // scaffold message before validation). The empty-input fail-loud
@@ -3197,6 +3205,7 @@ mod tests {
     /// element-wise (qwen3vl.cpp:25 `inp = ggml_add(ctx0, inp, inp_1)`).
     #[test]
     fn qwen3vl_dual_conv_patch_embedding_synthetic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::vit::patch_embed_forward;
 
         let image_size: u32 = 16;
@@ -3259,6 +3268,7 @@ mod tests {
     /// pass-through.
     #[test]
     fn qwen3vl_position_embedding_no_resize_when_trained_size_matches() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let trained_n: u32 = 4; // 16 entries
         let n_embd: u32 = 8;
         let num_pos = trained_n * trained_n; // 16
@@ -3299,6 +3309,7 @@ mod tests {
     ///   → val = 2*0.5 + 4*0.5 = 3.0.
     #[test]
     fn qwen3vl_position_embedding_bilinear_interpolation_when_resize() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let trained_n: u32 = 2;
         let n_embd: u32 = 1;
         let num_pos = trained_n * trained_n; // 4
@@ -3380,6 +3391,7 @@ mod tests {
     /// contributions and the result MUST differ from 5.5.
     #[test]
     fn qwen3vl_position_embedding_antialias_downsample_diverges_from_plain_bilinear() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let trained_n: u32 = 4;
         let n_embd: u32 = 1;
         let num_pos = trained_n * trained_n; // 16
@@ -3449,6 +3461,7 @@ mod tests {
     /// sentinel `num_position_embeddings = 1` at `vit_gpu.rs:~2499`.
     #[test]
     fn qwen3vl_dispatch_real_num_position_embeddings_extracted() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::DType;
         use std::collections::HashMap;
 
@@ -3510,6 +3523,7 @@ mod tests {
     /// previous fail-first contract.
     #[test]
     fn qwen3vl_compute_reaches_patch_embed_after_4c3() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::vision::vit_gpu::VisionInput;
         use crate::inference::vision::PreprocessedImage;
 
@@ -3586,6 +3600,7 @@ mod tests {
     /// order: 0,1,4,5.
     #[test]
     fn qwen3vl_2x2_block_merge_reshape_known_pattern() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let nx = 4;
         let ny = 4;
         let n_embd = 1;
@@ -4132,6 +4147,7 @@ mod tests {
     /// residuals intact.)
     #[test]
     fn qwen3vl_per_block_forward_synthetic_2_blocks() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::GraphExecutor;
         use std::collections::HashMap;
 
@@ -4340,6 +4356,7 @@ mod tests {
     ///      per ggml.h:1843-1846).
     #[test]
     fn qwen3vl_2d_rope_vision_mode_consumed() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::ops::rope_multi::{
             dispatch_rope_multi_cached, RopeMultiMode, RopeMultiParams,
         };
@@ -4498,6 +4515,7 @@ mod tests {
     /// see vit_gpu.rs:6303-6305 audit.)
     #[test]
     fn qwen3vl_attention_is_bidirectional_no_causal_mask() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::{DType, GraphExecutor};
 
         // Shape: batch=32 (sequence), num_heads=1, head_dim=32 (both
@@ -4601,6 +4619,7 @@ mod tests {
     ///   0.5 * (1 + 0.68252) ≈ 0.84126)
     #[test]
     fn qwen3vl_mlp_uses_gelu_not_silu() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::GraphExecutor;
 
         let n = 64usize;
@@ -4672,6 +4691,7 @@ mod tests {
     /// either case in addition to test #1's single-block check.
     #[test]
     fn qwen3vl_per_block_residual_present() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::GraphExecutor;
         use std::collections::HashMap;
 
@@ -4862,6 +4882,7 @@ mod tests {
     ///   - every element finite (no kernel NaN/Inf)
     #[test]
     fn qwen3vl_compute_returns_ok_augmented_for_2_block_synthetic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = mlx_native::MlxDevice::new().expect("MlxDevice");
         let (mut vit_cfg, mmproj_cfg) = synth_qwen3vl_block_cfg(2);
         // Use 1 deepstack flagged layer at index 0 (within n_layer=2)
@@ -4980,6 +5001,7 @@ mod tests {
     /// `qwen3vl_mlp_uses_gelu_not_silu` test uses).
     #[test]
     fn qwen3vl_deepstack_head_layernorm_then_mlp_synthetic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::{DType, GraphExecutor};
         use std::collections::HashMap;
 
@@ -5185,6 +5207,7 @@ mod tests {
     /// block-distributed or column-major).
     #[test]
     fn qwen3vl_spatial_merger_2x2_concat_along_channel() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::GraphExecutor;
 
         let n_pos: u32 = 8;
@@ -5288,6 +5311,7 @@ mod tests {
     /// Asserts every output element ≈ 4240 within tolerance.
     #[test]
     fn qwen3vl_main_projector_2layer_gelu_synthetic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::{DType, GraphExecutor};
         use std::collections::HashMap;
 
@@ -5488,6 +5512,7 @@ mod tests {
     ///     `(1 + n_layer) * lm_hidden`.
     #[test]
     fn qwen3vl_deepstack_head_taps_correct_block_index() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = mlx_native::MlxDevice::new().expect("MlxDevice");
         // 3-block model with deepstack flagged at index 2 (the last
         // block ONLY, not all blocks).
@@ -5630,6 +5655,7 @@ mod tests {
     /// embedding.
     #[test]
     fn qwen3vl_augmented_embed_shape_matches_lm_split_contract() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = mlx_native::MlxDevice::new().expect("MlxDevice");
         // 3-block fixture with all 3 blocks flagged.
         let mut mmproj_cfg = synth_qwen3vl_mmproj_cfg(
@@ -5747,6 +5773,7 @@ mod tests {
     /// `[base[t]; ds_0[t]; ds_1[t]]` consecutively.
     #[test]
     fn qwen3vl_cpu_concat_augmented_embed_byte_exact() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let n_image_tokens = 2usize;
         let lm_hidden = 4usize;
         // Build 3 chunks: chunk c has all values `(c+1)*10`.
@@ -5796,6 +5823,7 @@ mod tests {
 
     #[test]
     fn qwen3vl_merger_is_supported_after_wedge_4c5() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Plain assertion mirroring the regression-guard at
         // mmproj.rs::tests::projector_supported_for_mlp_and_gemma4v
         // (which used to assert !is_supported()) now flipped post-Wedge-4c.5.
@@ -5816,6 +5844,7 @@ mod tests {
 
     #[test]
     fn qwen3vl_dispatch_routes_to_compute_vision_embeddings_gpu_qwen3vl() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Drive `compute_vision_embeddings_gpu_dispatch` with a
         // Qwen3VlSiglip arch + a synthetic Qwen3VlSiglip-marked
         // mmproj_weights tensor map and confirm the call reaches
@@ -5904,6 +5933,7 @@ mod tests {
     /// and produces the right output shape with non-zero values.
     #[test]
     fn qwen3vl_pos_embed_resize_to_rectangular_target_iter225() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 8×8 trained = 64 entries × n_embd=2.
         let trained_n: u32 = 8;
         let n_embd: u32 = 2;
@@ -5940,6 +5970,7 @@ mod tests {
     /// the spatial merge: n_image_tokens = 32/4 = 8.
     #[test]
     fn qwen3vl_compute_accepts_rectangular_input_iter225() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = mlx_native::MlxDevice::new().expect("MlxDevice");
         let (mut vit_cfg, mut mmproj_cfg) = synth_qwen3vl_block_cfg(2);
         vit_cfg.deepstack_indexes = vec![0];
@@ -6007,6 +6038,7 @@ mod tests {
     /// stride-multiple error pointing at the offending dimension.
     #[test]
     fn qwen3vl_compute_rejects_misaligned_rectangular_input_iter225() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = mlx_native::MlxDevice::new().expect("MlxDevice");
         let (vit_cfg, mut mmproj_cfg) = synth_qwen3vl_block_cfg(1);
         let weights = build_synth_qwen3vl_weights_with_deepstack(
@@ -6053,6 +6085,7 @@ mod tests {
     /// regress under the iter-225 rectangular path.
     #[test]
     fn qwen3vl_compute_backward_compat_square_input_iter225() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = mlx_native::MlxDevice::new().expect("MlxDevice");
         let (mut vit_cfg, mmproj_cfg) = synth_qwen3vl_block_cfg(2);
         vit_cfg.deepstack_indexes = vec![0];
@@ -6100,6 +6133,7 @@ mod tests {
     /// rectangular dispatch produces square output for square input.
     #[test]
     fn qwen3vl_compute_square_byte_deterministic_iter225() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device_1 = mlx_native::MlxDevice::new().expect("MlxDevice 1");
         let device_2 = mlx_native::MlxDevice::new().expect("MlxDevice 2");
         let (mut vit_cfg, mmproj_cfg) = synth_qwen3vl_block_cfg(2);
@@ -6166,6 +6200,7 @@ mod tests {
     /// `dispatch_qwen3vl_seam_split` directly via a small CPU mirror.
     #[test]
     fn qwen3vl_phase2_image_grid_n_tokens_invariant_iter225() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Landscape 1024×576 → smart_resize+clamp → (768, 416) →
         // (n_x=24, n_y=13) → 312 tokens.
         let landscape_n_x: u32 = 24;
@@ -6205,6 +6240,7 @@ mod tests {
     /// as many patches.
     #[test]
     fn patch_embed_forward_hw_square_matches_legacy_and_rect_doubles_iter225() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::vision::vit::{patch_embed_forward, patch_embed_forward_hw};
         let patch_size: u32 = 16;
         let hidden: u32 = 32;
@@ -6319,6 +6355,7 @@ mod tests {
     /// parity test (per ADR `1 ULP for K2 bilinear`).
     #[test]
     fn adr021_iter1a_e2e_byte_pinned_baseline_2026_05_07() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = mlx_native::MlxDevice::new().expect("MlxDevice");
         let (mut vit_cfg, mmproj_cfg) = synth_qwen3vl_block_cfg(2);
         vit_cfg.deepstack_indexes = vec![0];
@@ -6510,6 +6547,7 @@ mod tests {
     /// future drift is caught.
     #[test]
     fn adr021_iter5b_ac3_substitute_three_shapes_2026_05_07() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Helper: run the synth fixture at given (pixel_h, pixel_w) and
         // return (augmented vec, fnv1a64).
         let run_at_shape = |pixel_h: u32, pixel_w: u32| -> (Vec<f32>, u64) {
@@ -6663,6 +6701,7 @@ mod tests {
     /// §3 AC-6 closure pins the literal numbers.
     #[test]
     fn adr021_iter5c_ac6_perf_stage_a_gpu_vs_cpu_2026_05_07() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use std::time::Instant;
 
         // Canonical Qwen3-VL Stage A shapes (scaled down for test

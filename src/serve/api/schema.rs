@@ -810,6 +810,19 @@ pub struct ChatCompletionRequest {
     /// rendered prompt byte-identical.
     #[serde(default)]
     pub hf2q_enable_thinking: Option<bool>,
+
+    /// Extra variables merged into the chat-template Jinja context
+    /// (ADR-005 iter-229 Decision 4; llama.cpp-compatible name/shape).
+    /// Merged AFTER the renderer's own values, so a kwarg wins every
+    /// collision that survives validation — renderer-owned keys
+    /// (`messages`, `tools`, `add_generation_prompt`, `bos_token`,
+    /// `eos_token`, `raise_exception`) are rejected 400 naming the key;
+    /// `enable_thinking` is deliberately overridable. Values reach Jinja
+    /// verbatim (no type coercion). Canonical use:
+    /// `{"preserve_thinking": true}` to make the Qwen 3.6 template
+    /// replay prior-turn reasoning on pre-last-query assistant turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 // ---------------------------------------------------------------------------

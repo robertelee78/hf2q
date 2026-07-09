@@ -9478,3 +9478,501 @@ fixing the kernel.
   `commit_and_wait` is ~50–100 µs floor. The single-CB refactor
   in this iter is the right pattern; the kernel was the wrong
   tool, not the dispatch shape.
+
+## 2026-07-09 — iter-229: API chat-renderer env parity + tool-args mapping + reasoning echo-back (Qwen 3.6 agentic serve path)
+
+Kata: hypothesis → spike → reformulate → codex gate 1 (session 019f4872) →
+THIS SECTION (revised per codex gate 2, 14 findings) → codex gate 2 →
+execute → codex gate 3 → prove.
+Spike + full hypothesis: session scratchpad `kata-hypothesis-v2.md`,
+`spike-preserve-thinking/` (minijinja 2.19.0, features identical to the
+resolved hf2q build, rendering the byte-identical vendor template ==
+GGUF-embedded template of `/opt/hf2q/models/qwen3.6/APEX-Q5_K_M.gguf`).
+
+### Problem
+
+Two Jinja environments diverged. The one-shot renderer
+(`render_jinja_template_with_specials`, serve/mod.rs:615-653) was fixed for
+Qwen 3.6 — registers `tojson`, `raise_exception` (warn+UNDEFINED), pycompat.
+The API chat renderer (`render_chat_prompt_with_tools`,
+serve/api/engine.rs:16520-16533) registers ONLY pycompat, and it is the
+renderer behind BOTH chat endpoints:
+`chat_completions` (handlers.rs:350) and `chat_completions_stream`
+(handlers.rs:1728) → `prepare_chat_generation` → `apply_overflow_policy`
+(handlers.rs:1229→2084) → `render_and_tokenize_for_overflow`
+(handlers.rs:2117) → `render_chat_prompt_with_tools`.
+
+Spike-proven consequences against the served qwen3.6 template:
+
+* **F1 (hard, turn 1):** template line 50 `tool | tojson` → `unknown
+  filter` → every `tools`-bearing chat request 400s before inference
+  ("chat template render failed", handlers.rs:2131). Unnoticed because
+  harnesses that inline tool docs into the system prompt never pass
+  `tools`.
+* **F2 (hard, turn ≥2):** engine.rs:16473 threads `tool_calls[].function.
+  arguments` as the raw OpenAI JSON *string*; template line 120
+  `tool_call.arguments|items` needs a mapping → `cannot convert value
+  into pairs` on any echo-back of an assistant tool_call.
+* **F3 (quality, default-on):** with F1+F2 patched, tool-loop-tail
+  assistant turns take the template's preserve branch (line 100,
+  `loop.index0 > ns.last_query_index` — no kwarg needed) and render a
+  fabricated EMPTY `<think>\n\n</think>` because the renderer drops the
+  request's `reasoning_content` (accepted at schema.rs:514, carried by
+  the vision rewrite handlers.rs:3018, dropped at the render-context
+  build engine.rs:16441-16507). Demonstrated render mechanism; production
+  causality not claimed until a live transcript shows it.
+* **F4:** `preserve_thinking` (consulted by the template, line 100) is
+  not exposed anywhere.
+* **F6 (latent):** template `raise_exception` is unregistered in the API
+  env → transcripts that hit a raise site die with an opaque "unknown
+  function" error. Registering it is a DIAGNOSTIC improvement only
+  (gate-2 #5): every raise site already fails today, so no currently
+  working request can newly 400.
+* Pre-existing adjacent defect (gate-1 #11): `id_to_name` is built as a
+  global map (engine.rs:16431-16439) — duplicate tool-call ids bind a
+  later `role:"tool"` message to the wrong function name.
+
+### Decision
+
+One shared env-builder + two context fixes + one request-surface addition,
+all in the render layer; no engine/kernel changes.
+
+**Byte-identity scope (gate-2 #13):** all "byte-identical" claims below are
+scoped to transcripts that carry NO `tools`, NO assistant `tool_calls`, NO
+`reasoning_content`, and NO `chat_template_kwargs`. Transcripts with valid
+object-form tool_call arguments intentionally change (that is fix F2).
+
+1. **Shared env builder (F1, F6).** Extract
+   `fn build_chat_template_env<'s>(raise_policy: RaisePolicy) -> minijinja::Environment<'s>`
+   (generic source lifetime, gate-2r3 #3 — callers `add_template` their
+   own borrowed template strings afterwards) in `serve/mod.rs` (parent
+   module; `serve/api/engine.rs` calls up — no cycle, gate-2 #4), used
+   by BOTH renderers. Registers `tojson`
+   (`serde_json::to_string`, `"null"` fallback — one-shot semantics
+   kept), `raise_exception`, pycompat. `raise_policy`: one-shot path
+   keeps warn+UNDEFINED (unchanged); API path returns a hard
+   `minijinja::Error` carrying the template's message, and the handler
+   MUST propagate that message into the 400 body (gate-2 #7 — the
+   `.context(…)` chain must not swallow it; render with `{:#}` or walk
+   the source chain).
+2. **Arguments as mapping, object-only (F2).** At context build,
+   `serde_json::from_str(&tc.function.arguments)`; substitute ONLY when
+   the parse yields a JSON **object**. Arrays, scalars, JSON strings,
+   and parse failures keep the raw string verbatim (today's shape;
+   gate-1 #5). Key-order note (gate-3 #8): hf2q's serde_json build has
+   no `preserve_order` feature, so substituted-object key order is
+   serde_json's (sorted) — object argument key order in the rendered
+   prompt is INTENTIONALLY UNSPECIFIED. Both served templates are
+   order-insensitive anyway: Gemma 4 `dictsort`s its arguments and the
+   qwen template emits one `<parameter>` block per key.
+3. **Reasoning echo-back (F3).** Insert `reasoning_content` into the
+   Jinja message object — assistant-role messages only, only when
+   present (gate-1 #6). Non-assistant messages never gain the field
+   even if a client sends it.
+4. **`chat_template_kwargs` request field (F4; rewritten per gate-2
+   #1/#2/#3/#10).** New optional
+   `chat_template_kwargs: Option<serde_json::Map<String, Value>>` on
+   `ChatCompletionRequest` (llama.cpp-compatible name/shape).
+   Context assembly (gate-2r2 #1, exact order): (a) VALIDATE — a
+   request whose kwargs contain a RESERVED key is rejected 400
+   `invalid_request` naming the key (explicit beats silent); (b) insert
+   renderer values, including the resolved `enable_thinking` default;
+   (c) merge kwargs OVER them — kwargs win every surviving collision.
+   Because reserved keys were rejected at (a), the only renderer value
+   kwargs can override is `enable_thinking` — exactly the intended
+   exception (gate-2 #2, llama.cpp parity): a kwargs `enable_thinking`
+   overrides the resolved default for TEMPLATE RENDERING ONLY
+   (marker-based reasoning splitting is unaffected). Reserved set
+   (renderer-owned, complete by construction — every name the renderer
+   itself defines in the context or env globals EXCEPT
+   `enable_thinking`): `messages`, `tools`, `add_generation_prompt`,
+   `bos_token`, `eos_token`, `raise_exception`. All kwargs values pass
+   to Jinja verbatim, no type coercion — templates own their type
+   checks. `preserve_thinking` arrives as an ordinary non-reserved
+   kwarg. Absent kwargs → byte-identical renders (scope above).
+   Summarizer exception (gate-3 #9): the overflow-policy summarizer's
+   INTERNAL 2-message conversation does NOT receive request kwargs —
+   forwarding them could override the summarizer's deliberate
+   `enable_thinking=false`; same rationale as its `tools=None`. Only
+   user-facing renders see kwargs.
+5. **Chronological `id_to_name` (gate-1 #11; scope per gate-3 #1).**
+   Build the id→name map incrementally while walking messages so a
+   `role:"tool"` message resolves ids from PRIOR **assistant** turns
+   only (tool_calls smuggled onto other roles never define ids);
+   duplicate ids bind to the most recent prior definition; forward
+   references (tool message before the assistant turn that defines the
+   id) and unknown ids fall back to `"unknown"` (today's fallback, now
+   pinned).
+6. **Documented fallback (gate-1 #12).** `role:"tool"` without
+   `tool_call_id` stays a bare `{role, content}` message (qwen template
+   consumes content directly); pinned by test.
+
+### Acceptance criteria
+
+Renderer-level (unit tests against the REAL `render_chat_prompt_with_tools`
++ vendor qwen3-chatml fixture unless stated):
+
+* AC1 (F1): spike scenario A (tools present) renders clean; `<tools>`
+  block appears in output.
+* AC2 (F2, expanded per gate-2 #8, observability per gate-2r3 #1): (a)
+  valid object string → mapping render through the VENDOR qwen fixture,
+  `<parameter=path>` appears; (b-d) raw-preservation semantics asserted
+  via an inspection template
+  `{{ messages[2].tool_calls[0].function.arguments is string }}` →
+  `true` for: JSON array string, number (`"42"`), bool (`"true"`),
+  null (`"null"`), JSON string literal (`"\"foo\""`), malformed JSON —
+  PLUS a pin that rendering the same non-object echo-backs through the
+  vendor qwen fixture fails clean (400-mapped render error at
+  `|items`, message propagated per Decision 1 — today's behavior for
+  non-spec arguments, unchanged and now documented; runs over ALL six
+  shapes, gate-3 #5); (e) (fixture per gate-3 #3) the REAL Gemma 4
+  template — extracted verbatim from the served GGUF's
+  `tokenizer.chat_template` into
+  `src/serve/api/test_fixtures/gemma4-apex-embedded-chat-template.jinja`
+  (12045 bytes; sha256 2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f5752
+  9f1d707c28b5828c, identical for fixture and GGUF-embedded bytes) —
+  rendered with BOTH a mapping-substituted and a raw-string arguments
+  transcript, outputs byte-pinned.
+* AC3 (F3, expanded per gate-2 #11): (a) echoed `reasoning_content` on a
+  tool-loop-tail assistant message appears verbatim inside
+  `<think>…</think>`; (b) absent field → full-render byte-pin
+  (gate-3 #5) whose tail turn is `<think>\n\n</think>` (today's
+  template behavior); (c) NEGATIVE (gate-2r2 #3:
+  observability requires an inspection template, not the vendor one):
+  render with a minimal template
+  `{% for m in messages %}{{ m.role }}:{{ m.reasoning_content is defined }};{% endfor %}`
+  and assert `false` for user/system/tool messages carrying the field,
+  `true` for the assistant one.
+* AC4 (F4, expanded per gate-2 #10): (a)
+  `chat_template_kwargs: {"preserve_thinking": true}` replays reasoning
+  on pre-last-query assistant turns; (b) absent kwargs → golden
+  byte-pins on a no-tools/no-reasoning qwen transcript AND the same
+  transcript through the real Gemma 4 fixture (gate-3 #4), plus
+  kwargs=None ≡ kwargs=Some(empty); (c) `{"enable_thinking": false}` via kwargs flips the
+  generation-prompt think-suppressor (overrides resolved default); (d)
+  every reserved key, sent one at a time, → 400 naming the key; (e)
+  (gate-2r2 #2) an arbitrary non-reserved kwarg with a
+  coercion-hostile value (e.g. `{"custom_flag": "x{y\"z"}`) reaches the
+  template verbatim, observed via an inspection template
+  `{{ custom_flag }}`.
+* AC5 (F6, per gate-2 #6/#7; seam per gate-3 #2): HTTP-level tests via
+  `render_chat_prompt_or_400` — the engine-free seam
+  `render_and_tokenize_for_overflow` itself uses on both chat
+  endpoints — each of the four qwen raise sites (no messages [line 43],
+  no user query [79], system not first [85], unexpected role [144])
+  driven by a minimal transcript returns a Response with status 400
+  whose serialized body contains that site's `raise_exception` message
+  text; plus a reserved-kwarg 400 asserting the key name in the body.
+* AC6 (gate-1 #11/#12, expanded per gate-2 #12): (a) duplicate tool-call
+  ids → tool message binds to most recent PRIOR definition; (b) forward
+  reference → `"unknown"`; (c) unknown id → `"unknown"`; (d) tool
+  message with NO `tool_call_id` → bare `{role, content}`, renders via
+  qwen template's content path.
+* AC-parity (gate-2 #9; (a) amended per gate-3 #6): one-shot renderer
+  through the shared builder — (a) `tojson` on a non-finite float
+  renders `null` (pins the outcome; serde_json itself emits `null` for
+  non-finite floats, so the `unwrap_or_else("null")` branch is
+  defense-in-depth, not provably exercised); (b) pycompat concrete case
+  (gate-2r3 #2): template `{{ ' x '.strip() }}` renders `x`; (c)
+  `raise_exception` warns and continues (render succeeds). Existing
+  one-shot template tests stay green untouched.
+
+Sweep + live (split per gate-2 #14 — render gates vs model-behavior
+smoke):
+
+* AC7a (amended per gate-3r2): `cargo test --bin hf2q` full sweep
+  introduces ZERO NEW failures vs the clean-HEAD baseline, proven by
+  stash-and-rerun. NOTE (2026-07-09): HEAD 9fe9539c already fails 25-28
+  tests before this iter — ADR-040 doc-pin tests
+  (`adr040_*_closure/surfaces_unchanged` families, broken by earlier
+  ADR-040 doc edits) plus flaky GPU parity tests (count varies between
+  identical runs; e.g. `qwen35_tree_verify_full_layer_q_moe_topk_
+  routing_correctness_2026_05_22` fails in one full-sweep run and
+  passes 3/3 in isolation — consistent with the known batch-variable
+  flash-attn flake class). Pre-existing; tracked OUTSIDE iter-229.
+* AC7b (render gate, deterministic): scripted sequence against live
+  qwen3.6 serve, both `stream=false` and `stream=true`: request 1 =
+  `tools` + user message; request 2 = request 1's transcript + assistant
+  `tool_calls` echo-back (string arguments) + `role:"tool"` result.
+  GATE: all four requests return 200 (no render-failure 400s), responses
+  schema-valid.
+* AC7c (model-behavior smoke, observed not gating): with temp=0 and a
+  tool-forcing prompt, note whether request 1 yields
+  `finish_reason=tool_calls` and request 2 a coherent final answer;
+  record transcript in the ADR for the F3 causality follow-up.
+
+### iter-229 CLOSURE (2026-07-09) — proof evidence
+
+Gate history: gate 1 (hypothesis) PASS with 13 findings folded in;
+gate 2 (ADR) PASS after 3 rounds (14 + 4 findings folded in); gate 3
+(implementation) 2 rounds — 6 confirmed issues fixed (assistant-only
+id map, `render_chat_prompt_or_400` HTTP seam, real Gemma fixture,
+Gemma golden, strengthened byte-pins, tojson honesty note), round-2
+blockers were proof-stage items resolved below.
+
+* **AC1-AC6, AC-parity:** 26 renderer tests + 5 HTTP-level AC5 tests,
+  all green (`cargo test --bin hf2q iter229` → 26 passed;
+  `handlers::iter229_ac5_http_tests` → 5 passed).
+* **Gemma fixture provenance:** sha256(fixture) == sha256(GGUF-embedded
+  `tokenizer.chat_template`) ==
+  `2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f57529f1d707c28b5828c`.
+* **AC7a:** zero new sweep failures vs clean-HEAD baseline
+  (stash-and-rerun comparison; the 25-28 pre-existing HEAD failures are
+  enumerated in the amended AC7a above).
+* **AC7b (live render gate): PASS 4/4 HTTP 200.** Release binary with
+  this diff, `hf2q serve` qwen3.6 APEX-Q5_K_M (id
+  `qwen36-abliterix-t63-APEX`, arch qwen35moe, 262k ctx). r1 = tools +
+  user; r2 = r1 + assistant tool_call echo-back (STRING arguments,
+  exercising F2) + `reasoning_content` echo (F3) + tool result; each ×
+  stream=false/true. Pre-fix, r1 was a hard 400 (`unknown filter:
+  tojson`) and r2 a hard 400 (`cannot convert value into pairs`).
+* **AC7c (model behavior, observed non-gating):** r1 →
+  `finish_reason=tool_calls` with well-formed
+  `read_file{"path":"foo.rs"}`; r2 → `finish_reason=stop`, correct
+  final answer describing the file.
+
+**Typed deferral (discovered by AC7c, NOT fixed here — response-side,
+outside iter-229's render scope):** with `hf2q_enable_thinking: true`,
+the qwen template seeds `<think>\n` at the END of the prompt, so the
+model's completion begins INSIDE reasoning and never re-emits the open
+marker; the ReasoningSplitter only opens on a literal `<think>` in the
+completion, so the reasoning tail + `</think>` leak into `content` and
+`reasoning_content` returns empty (observed verbatim in the AC7b r2
+response). Pre-existing splitter start-state contract, newly VISIBLE
+because tools+thinking requests now render at all. Fix belongs in the
+splitter (seed reasoning-open when the rendered prompt ends inside an
+open think block) — iter-230 candidate.
+
+## 2026-07-09 — iter-230: sweep-failure repair (ADR-040 doc-pins + GPU-test serialization) + ReasoningSplitter forced-open seeding
+
+Kata run 2 (same 9-step protocol as iter-229; gate-1 codex session folded
+9 confirmed issues into this plan). Spike data: session scratchpad
+`kata2-hypothesis.md`.
+
+### A. Pre-existing sweep failures (25-28 at HEAD 9fe9539c)
+
+**A1 — ~21 `adr040_*` doc-pin tests.** Root cause: commit `aeb6e87c`
+split the §6.1.x changelog out of
+`docs/ADR-040-continuous-batching-reopen.md` (6141→1091 lines) into
+`docs/ADR-040-history.md`; the pin tests still `include_str!` only the
+main doc. Content moved, not lost. Decision (per gate-1 #1/#2 — no
+blanket concatenation, which would let the main doc silently lose live
+sections):
+
+* Historical-closure assertions (`### 6.1.26/52/55` blocks, deferral
+  labels, closure ceremonies) retarget to
+  `include_str!(…ADR-040-history.md)`, each asserting its marker occurs
+  EXACTLY ONCE in that doc (no cross-seam ambiguity).
+* Live-status assertions stay scoped to the MAIN doc. New invariant for
+  the renamed status test: the first `- **Status**:` line contains
+  `TARGET WORKLOAD SERVED` (the REOPENED pin enforced an era that
+  legitimately ENDED at dc927f39; gate-1 #3 confirmed retarget
+  defensible). A companion assertion pins that the main doc still
+  references `ADR-040-history.md` (navigability) and that the history
+  doc retains the REOPENED-era record.
+* Neither ADR doc is edited (they are correct); only tests move.
+
+**A2 — GPU tree-verify tests corrupt under parallel execution.** Spike:
+`gpu_full_attn` family = 5/65 FAILED parallel, 65/65 ok with
+`--test-threads=1`, every failure passes 3/3 isolated; parallel failure
+modes are NaN bit-patterns (0x7FC00000), "all outputs must be finite",
+parity blowups → concurrent Metal encoding from test threads corrupts
+results. Production is not in this mode: serve routes GPU encoding
+through the encoder-worker singleton
+(`serve/encoder_worker_singleton.rs`); concurrent multi-thread encoding
+is hereby DOCUMENTED AS UNSUPPORTED crate-wide (gate-1 #8 — full
+entry-point audit out of scope, tracked as a deferral).
+
+Decision: one crate-wide test-only serialization primitive —
+`hf2q_gpu_test_lock()` returning a poison-tolerant
+`MutexGuard<'static, ()>` (`PoisonError::into_inner`; a panicked GPU
+test may leave in-flight work, accepted + documented limitation per
+gate-1 #6 — guard-drop drain needs per-context sync not available
+globally; post-panic cascade failures are attributable via the panic
+itself). Acquisition rule (gate-1 #7): exactly once, first statement of
+each guarded `#[test]`; helpers never acquire; all guarded tests use
+synchronous `commit_and_wait` so no work outlives the guard. Runner
+caveat documented: `cargo-nextest` runs tests in separate PROCESSES, so
+an in-process mutex does not serialize it — GPU families are supported
+under `cargo test` only.
+
+Guard scope (gate-1 #5, empirical loop instead of unprovable static
+inventory): initially the kernel-executing families where corruption is
+observed or adjacent — `qwen35/gpu_full_attn.rs` (45),
+`gemma4/gpu_full_attn.rs` (20), `qwen35/gpu_delta_net.rs` (14),
+`gemma4/kv_cache.rs` (observed victim) — then LOOP-UNTIL-DRY: 3
+consecutive full sweeps must show zero failures outside known
+categories; any surviving GPU-family failure extends the guard and
+restarts the loop.
+
+### B. ReasoningSplitter forced-open seeding (the iter-229 typed deferral)
+
+Root cause (iter-229 closure): with thinking enabled the qwen template
+seeds `<think>\n` at the END of the rendered prompt; decode starts
+inside reasoning; `ReasoningSplitter` (registry.rs:437) constructs
+`in_reasoning: false` and only flips on a completion-side open marker →
+reasoning + `</think>` leak into `content`, `reasoning_content` empty,
+`reasoning_tokens` undercounts. Streaming cannot reclassify emitted
+deltas → seed at construction (llama.cpp precedent:
+`thinking_forced_open`).
+
+Decisions:
+
+1. **Seed detector — template-controlled suffix, not whole-prompt rfind
+   (gate-1 #9):** `prompt_seeds_reasoning_open(rendered, reg) -> bool`
+   = `rendered.trim_end().ends_with(open_marker)`. The template always
+   appends the generation prompt AFTER user content, so the tail is
+   template-controlled — not client-spoofable. Truth table: qwen
+   thinking-on → ends `<think>` → TRUE; qwen thinking-off suppressor →
+   ends `</think>` → FALSE; Gemma thinking-on → ends `<|turn>model` →
+   FALSE (Gemma's model emits its own open marker); Gemma thinking-off
+   → ends `<channel|>` (close) → FALSE. Unit-pinned for all four.
+2. **Carrier + factory (gate-1 #10):** the flag rides
+   `engine::SamplingParams.reasoning_forced_open: bool` (pragmatic: it
+   is the single per-request struct reaching every generate path;
+   semantic mismatch acknowledged). The missed-site hazard of a
+   defaulted field is closed mechanically: all engine-path splitter
+   construction goes through one factory
+   `make_reasoning_splitter(reg, forced_open)`, and a grep-pin test
+   asserts no direct `ReasoningSplitter::from_registration(` call sites
+   remain in engine/handlers code outside the factory.
+3. **Splitter change:** `from_registration_forced(reg, bool)` setting
+   the initial `in_reasoning`; `from_registration` delegates with
+   `false` (existing callers byte-identical). Redundant model-emitted
+   `<think>` while seeded-open is reasoning TEXT, not swallowed —
+   today's nested-open behavior, pinned (gate-1 #11).
+4. **Wrong-seed blast radius (gate-1 #12, documented):** false negative
+   = today's leak; false positive = whole answer routed to reasoning
+   incl. `finish()` tail. The suffix rule is deterministic per
+   template; both directions unit-pinned.
+
+### Acceptance criteria
+
+* AC-A1: all retargeted doc-pin tests green; each historical marker
+  asserted exactly-once in the history doc; status test pins `TARGET
+  WORKLOAD SERVED` on the main doc's Status line + history link + the
+  history doc's REOPENED record.
+* AC-A2 (expanded per gate-2): with DEFAULT parallelism, each initially
+  guarded family runs green: `gpu_full_attn` (qwen35 45 + gemma4 20;
+  was 5/65 failing), `gpu_delta_net`, and the `gemma4::kv_cache` tests.
+  Guarded families enumerated in the lock's doc comment. Acquisition
+  discipline enforced mechanically: a source-pin test asserts (i)
+  within guarded modules every `#[test]` fn acquires
+  `hf2q_gpu_test_lock()` as its first statement, and (ii) no non-test
+  helper references the lock — pinning
+  exactly-once/first-statement/helpers-never from Decision A2.
+* AC-A3 (loop-until-dry): 3 consecutive full `cargo test --bin hf2q`
+  sweeps with 0 failures.
+* AC-B1: splitter unit tests — seeded-open with close marker split
+  across fragment boundaries; seeded-open with NO close (finish()
+  routes tail to reasoning); unseeded behavior byte-identical; redundant
+  open-while-seeded pinned as reasoning text; suffix-rule truth table
+  (4 cases above).
+* AC-B2 (expanded per gate-2): grep-pin test — no direct construction
+  of `ReasoningSplitter` via `from_registration` OR
+  `from_registration_forced` outside the factory (registry internals —
+  the splitter impl + its own unit tests — and the factory itself
+  exempt).
+* AC-B3 (live, deterministic render gate + behavior): re-run the
+  iter-229 AC7b r2 request with `hf2q_enable_thinking: true`, stream
+  off and on: non-empty `reasoning_content` (stream: `reasoning_content`
+  deltas precede `content` deltas), `content` contains NO `</think>`,
+  `completion_tokens_details.reasoning_tokens > 0`; thinking-OFF
+  baseline defined (per gate-2): capture the thinking-OFF response's
+  message fields (content, reasoning_content, finish_reason) with the
+  PRE-fix binary at temp=0 as a scratchpad artifact, then assert the
+  POST-fix binary reproduces those fields byte-identically on the same
+  request.
+* AC-B4: `cargo test --bin hf2q` full sweep — zero failures (composes
+  with AC-A3).
+
+### iter-230 CLOSURE (2026-07-09) — proof evidence + deviations
+
+Gate history: gate 1 PASS (12 findings folded in), gate 2 PASS (round 2,
+3 AC-wording blockers fixed), gate 3 below.
+
+**Deviations from the gate-2-approved text (all evidence-driven):**
+
+* **A2 guard scope ballooned via the loop-until-dry rule, as designed.**
+  The initial 4-family guard left sweeps failing 1-3 GPU tests
+  (interferers were UNGUARDED GPU tests in other modules — eagle3
+  forward, vit, forward_gpu, …). The guard now covers all 40
+  GPU-kernel-executing test modules (39 under `src/inference` +
+  `serve/forward_mlx_shared.rs`, ~830 tests), and
+  `iter230_a2_lock_discipline` was extended to pin
+  first-statement/exactly-once acquisition across ALL 40 (gate-3 r1
+  finding #1) -- the lock's doc comment defers to that pin as the
+  authoritative module list. serve/api engine/handlers test modules
+  were explicitly EXCLUDED after a false-positive scan (their
+  GPU-pattern mentions are production code, not test work; their async
+  tests also cannot hold a MutexGuard across await).
+* **Sweep wall-time cost was mispredicted:** 39s → ~179s (the serialized
+  GPU tests dominate). Accepted: green > fast; a finer-grained
+  per-context lock is a possible future optimization, typed here as
+  iter-231 candidate, NOT committed.
+* **h134 pin updated:** the Generate-orchestrator reasoning-wiring pin
+  now accepts `split_full_output_forced(` (the seeded variant) — same
+  intent, new spelling.
+* **Seed computed via minimal-transcript probe render** in the handler
+  (template tail is messages-independent; `iter230_b_probe_tests` pins
+  probe-tail == real-tail agreement for both thinking modes) rather
+  than threading the flag out of `apply_overflow_policy` — one render
+  of a 1-message transcript per request instead of a 5-tuple signature
+  cascade.
+* **AC-B2 enforcement:** grep-pin test `iter230_b2_factory_only_construction`
+  (0 direct constructions in engine.rs / engine_qwen35.rs /
+  engine_qwen3vl.rs / handlers.rs) — constructor privatization was
+  considered but rejected (registry-internal unit tests exercise the raw
+  constructors directly).
+* **Prompt-cache replay path** (`replay_cached_streaming_response_with_fragments`)
+  passes `forced_open=false` BY DESIGN: it re-splits CACHED
+  already-split content, which starts outside any reasoning span.
+
+**Evidence:**
+
+* AC-A1: all 22 retargeted doc-pin tests green (`cargo test --bin hf2q
+  adr040` → 196 passed / 0 failed); `iter230_a1_historical_markers_
+  exactly_once` pins 20 markers; renamed status pin
+  `adr040_status_line_carries_earned_live_status` carries the era note
+  + history-link + reopen-record invariants.
+* AC-A2: guarded families green under default parallelism
+  (`gpu_full_attn` 66/66 — was 5/65 failing); `iter230_a2_lock_discipline`
+  enforces first-statement/exactly-once/helpers-never on the 4
+  originally pinned modules.
+* AC-A3 + AC-B4: **three consecutive full sweeps: 3654 passed / 0
+  failed / 41 ignored** (was 25-28 failing at HEAD). First fully green
+  sweep on record for this tree.
+* AC-B1: 5 splitter unit tests green (truth table, cross-fragment close,
+  no-close finish → reasoning, unseeded byte-identity, redundant-open
+  pinned as reasoning text).
+* Gate-3 r1+r2 fixes: probe render now carries the request's `tools`
+  (identical template branches probe-vs-real); probe FAILURE PROPAGATES
+  as a 400 (r2 — the silent `false` fallback could coexist with a
+  successful real render and silently reintroduce the leak; no-fallback
+  rule), via the same `render_chat_prompt_or_400` seam as the real
+  render; probe pin strengthened to longest-common-suffix >= 16 bytes
+  on BOTH template fixtures + detector agreement (booleans alone
+  rejected); AC-A1 reopen-record pin strengthened from
+  any-`Reopen`-substring to the specific H50-era `Reopen-trigger
+  status` block + main-doc `REOPENED` literals.
+* AC-B3 (live, temp=0, same request as iter-229 AC7b r2):
+  - PRE-fix binary, thinking ON: `reasoning_content: ''`, content =
+    reasoning tail + `</think>` + answer, reasoning_tokens absent
+    (the leak, captured verbatim → scratchpad `acb3-pre-thinktrue.json`).
+  - POST-fix, thinking ON: `reasoning_content` populated, content has
+    NO `</think>`, `reasoning_tokens: 21`; streaming: 20
+    reasoning_content deltas (was 0) preceding 35 content deltas.
+  - Thinking OFF: message fields (content, reasoning_content,
+    finish_reason) byte-identical pre vs post (baseline artifact
+    compare, `acb3-{pre,post}-thinkfalse.json`).
+
+The iter-229 typed deferral (splitter think-leak) is CLOSED.
+
+**Final proof (post gate-3 PASS, final release binary):** AC-B3 re-run
+on the final build — thinking ON: reasoning_content populated,
+reasoning_tokens=21, streaming 20 reasoning deltas before 35 content
+deltas, no `</think>` in content; thinking OFF: message fields
+byte-identical to the PRE-fix baseline artifact. Gate-3 verdict PASS at
+round 3 (r1: 3 findings fixed — 40-module discipline pin, tools-carrying
+probe + suffix pin, specific reopen-record pin; r2: probe silent-false
+fallback replaced with 400 propagation). Full sweep green 5× consecutive.

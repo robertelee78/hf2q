@@ -3425,6 +3425,7 @@ mod g4_cfa_tests {
     /// AC-G4-CFA-1.1 — Gemma4TreeVerifyLayerShape validates dk256 (sliding).
     #[test]
     fn g4_cfa1_layer_shape_dk256_validates_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let shape = Gemma4TreeVerifyLayerShape {
             hidden_size: 5376,
             num_q_heads: 32,
@@ -3444,6 +3445,7 @@ mod g4_cfa_tests {
     /// AC-G4-CFA-1.2 — Gemma4TreeVerifyLayerShape validates dk512 (global).
     #[test]
     fn g4_cfa1_layer_shape_dk512_validates_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let shape = Gemma4TreeVerifyLayerShape {
             hidden_size: 5376,
             num_q_heads: 32,
@@ -3463,6 +3465,7 @@ mod g4_cfa_tests {
     /// AC-G4-CFA-1.3 — head_dim != 256 or 512 is rejected.
     #[test]
     fn g4_cfa1_layer_shape_rejects_dk128_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let shape = Gemma4TreeVerifyLayerShape {
             hidden_size: 128,
             num_q_heads: 1,
@@ -3482,6 +3485,7 @@ mod g4_cfa_tests {
     /// AC-G4-CFA-1.4 — cache overflow is rejected.
     #[test]
     fn g4_cfa1_layer_shape_rejects_cache_overflow_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let shape = Gemma4TreeVerifyLayerShape {
             hidden_size: 256,
             num_q_heads: 1,
@@ -3501,6 +3505,7 @@ mod g4_cfa_tests {
     /// AC-G4-CFA-2.1 — Gemma4TreeVerifyFullLayerShapeQ validates.
     #[test]
     fn g4_cfa2_full_layer_shape_validates_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let shape = Gemma4TreeVerifyFullLayerShapeQ {
             attn: Gemma4TreeVerifyLayerShape {
                 hidden_size: 5376,
@@ -3523,6 +3528,7 @@ mod g4_cfa_tests {
     /// AC-G4-CFA-2.2 — intermediate_size=0 is rejected.
     #[test]
     fn g4_cfa2_full_layer_shape_rejects_zero_intermediate_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let shape = Gemma4TreeVerifyFullLayerShapeQ {
             attn: Gemma4TreeVerifyLayerShape {
                 hidden_size: 256,
@@ -3545,12 +3551,14 @@ mod g4_cfa_tests {
     /// AC-G4-CFA-3.1 — nkv_capacity_divisor returns correct byte stride.
     #[test]
     fn g4_cfa3_nkv_capacity_divisor_dk256_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         assert_eq!(nkv_capacity_divisor(16, 256), 16 * 256 * 4);
     }
 
     /// AC-G4-CFA-3.2 — nkv_capacity_divisor dk512.
     #[test]
     fn g4_cfa3_nkv_capacity_divisor_dk512_2026_05_22() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         assert_eq!(nkv_capacity_divisor(2, 512), 2 * 512 * 4);
     }
 
@@ -3561,6 +3569,7 @@ mod g4_cfa_tests {
     /// + finite + correct dtype.
     #[test]
     fn dispatch_gemma4_tree_verify_attention_dk256_sliding_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => { eprintln!("skip: no MlxDevice"); return; }
@@ -3610,6 +3619,7 @@ mod g4_cfa_tests {
     /// synthetic 1 KV head × 512 head_dim, q_seq=2, kv_cap=4.
     #[test]
     fn dispatch_gemma4_tree_verify_attention_dk512_global_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => { eprintln!("skip: no MlxDevice"); return; }
@@ -3664,6 +3674,7 @@ mod g4_cfa_tests {
     /// and a trivial causal mask so the reference is unambiguous.
     #[test]
     fn gemma4_tree_verify_attention_block_sliding_cpu_ref_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => { eprintln!("skip: no MlxDevice"); return; }
@@ -3733,6 +3744,7 @@ mod g4_cfa_tests {
     /// same pattern as sliding but with head_dim=512. Verifies dk512 kernel path.
     #[test]
     fn gemma4_tree_verify_attention_block_global_cpu_ref_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => { eprintln!("skip: no MlxDevice"); return; }
@@ -3809,6 +3821,7 @@ mod g4_cfa_tests {
     /// so no cross-kernel rounding applies. Test name is dated 2026-05-23 per AC-G4-1.2.
     #[test]
     fn gemma4_tree_verify_attention_block_rope_freq_factors_parity_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => { eprintln!("skip: no MlxDevice"); return; }
@@ -3892,6 +3905,7 @@ mod g4_cfa_tests {
     /// Mirrors qwen35 AC-6 pattern via `to_bits()`.
     #[test]
     fn dispatch_gemma4_tree_verify_attention_dk256_byte_identity_3rep_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => { eprintln!("skip: no MlxDevice"); return; }
@@ -3955,6 +3969,7 @@ mod g4_cfa_tests {
     /// not shape.validate() shortcut. Per CFA #2 lesson.
     #[test]
     fn gemma4_tree_verify_attention_block_rejects_i32_hidden_states_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => { eprintln!("skip: no MlxDevice"); return; }
@@ -4005,6 +4020,7 @@ mod g4_cfa_tests {
     /// boundary (not just shape validation).
     #[test]
     fn gemma4_tree_verify_attention_block_rejects_i32_positions_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => { eprintln!("skip: no MlxDevice"); return; }
@@ -4056,6 +4072,7 @@ mod g4_cfa_tests {
     /// at the dispatcher boundary.
     #[test]
     fn dispatch_gemma4_tree_verify_attention_rejects_zero_kv_heads_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => { eprintln!("skip: no MlxDevice"); return; }
@@ -4220,6 +4237,7 @@ mod g4_cfa_tests {
     /// ADR-038 AC-4.1: smoke test (output shape + dtype + finiteness + cache written).
     #[test]
     fn g4_cfa2_full_layer_q_smoke_dk256_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => { eprintln!("skip: no MlxDevice"); return; }
@@ -4405,6 +4423,7 @@ mod g4_cfa_tests {
     /// Acceptance criterion: |out_F32 - out_Q4_0|_inf < 0.20 (ADR-038 AC-4.7).
     #[test]
     fn g4_cfa2_full_layer_q_cross_variant_parity_q4_0_vs_f32_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => { eprintln!("skip: no MlxDevice"); return; }
@@ -4530,6 +4549,7 @@ mod g4_cfa_tests {
     /// ADR-038 AC-4.8: determinism requirement.
     #[test]
     fn g4_cfa2_full_layer_q_determinism_three_repeats_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => { eprintln!("skip: no MlxDevice"); return; }

@@ -2623,6 +2623,7 @@ mod tests {
 
     #[test]
     fn mlx_kv_cache_trim_linear_decrements_seq_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let buf = || dev.alloc_buffer(4, DType::F32, vec![1]).unwrap();
         let mut cache = MlxKvCache {
@@ -2637,6 +2638,7 @@ mod tests {
 
     #[test]
     fn mlx_kv_cache_trim_sliding_errors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let buf = || dev.alloc_buffer(4, DType::F32, vec![1]).unwrap();
         let mut cache = MlxKvCache {
@@ -2648,6 +2650,7 @@ mod tests {
 
     #[test]
     fn mlx_kv_cache_trim_overflow_errors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let buf = || dev.alloc_buffer(4, DType::F32, vec![1]).unwrap();
         let mut cache = MlxKvCache {
@@ -2659,6 +2662,7 @@ mod tests {
 
     #[test]
     fn mlx_kv_cache_visible_len_eq_seq_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let buf = || dev.alloc_buffer(4, DType::F32, vec![1]).unwrap();
         let cache = MlxKvCache {
@@ -2670,12 +2674,14 @@ mod tests {
 
     #[test]
     fn decode_regime_default_via_default_trait() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let r: DecodeRegime = Default::default();
         assert_eq!(r, DecodeRegime::Default);
     }
 
     #[test]
     fn decode_regime_variants_distinct() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         assert_ne!(DecodeRegime::Default, DecodeRegime::ForceTq);
         assert_ne!(DecodeRegime::Default, DecodeRegime::ForceDense);
         assert_ne!(DecodeRegime::ForceTq, DecodeRegime::ForceDense);
@@ -2683,6 +2689,7 @@ mod tests {
 
     #[test]
     fn hybrid_kv_buffers_byte_len_sums_fields() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2; let cap = 4; let hd = 256;
         let k = dev.alloc_buffer(nkv * cap * hd * 2, DType::F16, vec![nkv, cap, hd]).unwrap();
@@ -2702,6 +2709,7 @@ mod tests {
 
     #[test]
     fn dense_kv_buffers_byte_len_sums_k_plus_v() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2; let cap = 8; let hd = 256;
         let k = dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap();
@@ -2714,6 +2722,7 @@ mod tests {
 
     #[test]
     fn alloc_hybrid_kv_for_layer_no_xlen_no_full_f16() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         // Ensure env gates are off for this test.
         std::env::remove_var("HF2Q_FULL_F16_KV");
@@ -2728,6 +2737,7 @@ mod tests {
 
     #[test]
     fn alloc_hybrid_kv_for_layer_full_f16_v_allocates_f16() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         std::env::set_var("HF2Q_FULL_F16_KV", "1");
         std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
@@ -2740,6 +2750,7 @@ mod tests {
 
     #[test]
     fn alloc_hybrid_kv_for_layer_xlen_allocates_bf16_buffers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::set_var("HF2Q_DFLASH_XLEN_SDPA", "1");
@@ -2751,6 +2762,7 @@ mod tests {
 
     #[test]
     fn alloc_hybrid_kv_for_layer_norms_per_pos_d256_d512() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
@@ -2844,6 +2856,7 @@ mod tests {
     /// 6. `seq_lens.len() != n_seqs`.
     #[test]
     fn h6_hb_kv_buffers_n_seqs_4_byte_scale() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         // Per dossier H6: shape choices identical to existing
         // alloc_hybrid_kv_for_layer test fixtures (nkv=2, hd=256,
@@ -2931,6 +2944,7 @@ mod tests {
     /// assumption invalid.
     #[test]
     fn h7_hb_kv_sliding_per_slot_isolation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -3059,6 +3073,7 @@ mod tests {
     /// would silently change buffer sizes.
     #[test]
     fn h8_alloc_hb_kv_for_layer_byte_equivalent_to_pre_refactor() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -3130,6 +3145,7 @@ mod tests {
     /// without changing the product).
     #[test]
     fn gemma4_hb_kv_n_seqs_outermost_axis() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let cache_1 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 1)
             .expect("alloc n_seqs=1");
@@ -3186,6 +3202,7 @@ mod tests {
     /// matches_n_seqs` (qwen35/kv_cache.rs:6669-6677).
     #[test]
     fn gemma4_hb_kv_slot_count_matches_n_seqs() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let c1 = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 1)
             .expect("alloc 1");
@@ -3200,6 +3217,7 @@ mod tests {
     /// is only observable through this getter.
     #[test]
     fn gemma4_hb_kv_layout_is_separate_slots() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
             .expect("alloc");
@@ -3213,6 +3231,7 @@ mod tests {
     /// (qwen35/kv_cache.rs:6695-6721).
     #[test]
     fn gemma4_hb_kv_slot_out_of_range_errors_named() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
             .expect("alloc");
@@ -3264,6 +3283,7 @@ mod tests {
     /// (qwen35/kv_cache.rs:6727-6745).
     #[test]
     fn gemma4_hb_kv_append_advances_target_slot_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
             .expect("alloc");
@@ -3287,6 +3307,7 @@ mod tests {
     /// re-use the slot's region on next admission).
     #[test]
     fn gemma4_hb_kv_drop_resets_seq_len_for_target_slot_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
             .expect("alloc");
@@ -3321,6 +3342,7 @@ mod tests {
     /// dispatcher territory.
     #[test]
     fn gemma4_hb_kv_drop_does_not_zero_k_packed_buffer() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -3417,6 +3439,7 @@ mod tests {
     /// kv_cache.rs:7050-7063).
     #[test]
     fn gemma4_hb_kv_fork_to_self_is_noop_ok() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
             .expect("alloc");
@@ -3448,6 +3471,7 @@ mod tests {
     /// cursor-copy pin lives at H159 + H163-H165.
     #[test]
     fn historical_gemma4_hb_kv_fork_cross_slot_closure_at_phase_a3c() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let mut c = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 8, false, 4)
             .expect("alloc");
@@ -3509,6 +3533,7 @@ mod tests {
     /// 7. `n_seqs` propagated from the call site differs across layers.
     #[test]
     fn a3a_mixed_layer_alloc_full_sliding_byte_isolation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         use crate::serve::config::LayerType;
         // Synthetic 4-layer mixed config: alternating Full / Sliding,
@@ -3610,6 +3635,7 @@ mod tests {
     /// names the exact axis (is_ring vs capacity) that drifted.
     #[test]
     fn a5c_layer_type_to_alloc_params_mapping_pinned() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::config::LayerType;
         let sliding_window: usize = 4_096;
         let max_pos: usize = 131_072;
@@ -3650,6 +3676,7 @@ mod tests {
     /// the contract that future allocator changes must continue to honour.
     #[test]
     fn a5c_production_gemma4_model_routes_through_layer_type_helper() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::config::LayerType;
         let sliding_window: usize = 1_024;
         let max_pos: usize = 131_072;
@@ -3688,6 +3715,7 @@ mod tests {
     /// max`), which is the whole point of the cap.
     #[test]
     fn iter_f_kvcap_per_slot_alloc_params_mapping_pinned() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::config::LayerType;
         let sliding_window: usize = 1_024;
         let max_pos: usize = 262_144;
@@ -3745,6 +3773,7 @@ mod tests {
     /// `match` exhaustiveness check is the load-bearing assertion.
     #[test]
     fn a3a_layer_type_variants_are_full_and_sliding_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::config::LayerType;
         // Exhaustive match on every variant — if a Null / Absent
         // variant lands without test coverage, this match will fail
@@ -3791,6 +3820,7 @@ mod tests {
     /// 5. `seq_lens.len() != n_seqs`.
     #[test]
     fn h11_multi_seq_hybrid_kv_n_seqs_4_byte_scale() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         // Mirror H6's fixture shapes for cross-test grep parity.
         std::env::remove_var("HF2Q_FULL_F16_KV");
@@ -3941,6 +3971,7 @@ mod tests {
     /// fan-outs not just the H11 tiny fixture.
     #[test]
     fn h11r_multi_seq_hybrid_kv_realistic_sliding_shape_byte_formula() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
@@ -3991,6 +4022,7 @@ mod tests {
     /// per-slot byte-offset formula does not produce disjoint regions.
     #[test]
     fn h12_multi_seq_hybrid_kv_per_slot_byte_isolation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
@@ -4124,6 +4156,7 @@ mod tests {
     /// target_slot_only).
     #[test]
     fn h13_multi_seq_hybrid_kv_cursor_independence() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         std::env::remove_var("HF2Q_FULL_F16_KV");
         std::env::remove_var("HF2Q_DFLASH_XLEN_SDPA");
@@ -4167,6 +4200,7 @@ mod tests {
     /// at n_seqs=N.
     #[test]
     fn h14_multi_seq_hybrid_kv_xlen_optional_coexists_with_u8_v() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         // (a) xlen ON.
         std::env::remove_var("HF2Q_FULL_F16_KV");
@@ -4242,6 +4276,7 @@ mod tests {
     /// the bookkeeping).
     #[test]
     fn h15_dense_kv_buffers_typed_clamp_slot_count_one() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::multi_seq_kv::MultiSeqKvCache;
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2; let cap = 8; let hd = 256;
@@ -4313,6 +4348,7 @@ mod tests {
     /// legacy single-seq cursor (`self.seq_len as u32`).
     #[test]
     fn h16_mlx_kv_cache_typed_clamp_slot_count_one() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::multi_seq_kv::MultiSeqKvCache;
         let dev = match skip_dev() { Some(d) => d, None => return };
         let buf = || dev.alloc_buffer(4, DType::F32, vec![1]).unwrap();
@@ -4379,6 +4415,7 @@ mod tests {
     /// kv_cache.rs:932-942.
     #[test]
     fn h10_post_falsification_hybrid_kv_default_is_on() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // The investigation_env module is the production source of
         // truth.  We read the raw env-default helper to avoid any
         // process-state pollution from other tests setting the
@@ -4412,6 +4449,7 @@ mod tests {
     /// (qwen35/kv_cache.rs:8113).
     #[test]
     fn iter_b4c_kernel_iter1_multi_seq_hb_kv_reset_for_slot_per_slot_isolation_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::multi_seq_kv::SlotId;
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
@@ -4489,6 +4527,7 @@ mod tests {
     /// (qwen35/kv_cache.rs:8270).
     #[test]
     fn iter_b4c_kernel_iter1_multi_seq_hb_kv_reset_for_slot_bounds_typed_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::multi_seq_kv::{MultiSeqError, SlotId};
         let dev = match skip_dev() { Some(d) => d, None => return };
         let mut cache = alloc_hb_kv_for_layer(&dev, 0, 2, 256, 4, false, 4)
@@ -4516,6 +4555,7 @@ mod tests {
     /// Sibling pin for the hybrid (F16-K + TQ-HB-V) variant.
     #[test]
     fn iter_b4c_kernel_iter1_multi_seq_hybrid_kv_reset_for_slot_per_slot_isolation_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::serve::multi_seq_kv::SlotId;
         let dev = match skip_dev() { Some(d) => d, None => return };
         // Ensure xlen + F16 are env-unset so the legacy F16-K + U8-V
@@ -4587,6 +4627,7 @@ mod tests {
     /// 5. is_sliding not propagated.
     #[test]
     fn h144_multi_seq_dense_kv_buffers_sibling_struct_exists() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -4637,6 +4678,7 @@ mod tests {
     /// `Err` (NOT panic).  Mirrors A3a / A3b iter-1 pre-flight.
     #[test]
     fn h145_alloc_multi_seq_dense_kv_for_layer_preflight_errors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         // n_seqs = 0
         assert!(
@@ -4687,6 +4729,7 @@ mod tests {
     ///   TOTAL   = 65536
     #[test]
     fn h146_multi_seq_dense_kv_n_seqs_4_byte_scale_exact_formula() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -4805,6 +4848,7 @@ mod tests {
     /// byte-offset formula does not produce disjoint regions.
     #[test]
     fn h147_multi_seq_dense_kv_per_slot_byte_isolation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -4894,6 +4938,7 @@ mod tests {
     /// will be byte-safe by construction.
     #[test]
     fn h148_multi_seq_dense_kv_n_seqs_1_byte_equivalent_to_legacy() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -4942,6 +4987,7 @@ mod tests {
     /// gemma4_hb_kv_fork_cross_slot_returns_capability_unsupported.
     #[test]
     fn h149_multi_seq_dense_kv_multi_seq_kv_cache_impl() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let n_seqs = 4u32;
         let mut cache = alloc_multi_seq_dense_kv_for_layer(
@@ -5069,6 +5115,7 @@ mod tests {
     /// tests for the dense variant.
     #[test]
     fn h150_multi_seq_dense_kv_reset_for_slot_per_slot_isolation_and_bounds() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -5208,6 +5255,7 @@ mod tests {
     ///    NOT carry n_seqs as leading axis.
     #[test]
     fn h151_multi_seq_mlx_kv_cache_sibling_struct_exists() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -5285,6 +5333,7 @@ mod tests {
     /// `gemma4/model.rs:1272` `nkv * capacity * (hd / 2)`).
     #[test]
     fn h152_alloc_multi_seq_mlx_kv_for_layer_preflight_errors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         // n_seqs = 0
         assert!(
@@ -5350,6 +5399,7 @@ mod tests {
     ///   TOTAL          = 33_792
     #[test]
     fn h153_multi_seq_mlx_kv_n_seqs_4_byte_scale_exact_formula() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -5496,6 +5546,7 @@ mod tests {
     /// formula does not produce disjoint regions.
     #[test]
     fn h154_multi_seq_mlx_kv_per_slot_byte_isolation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -5605,6 +5656,7 @@ mod tests {
     /// Phase B4c re-route will be byte-safe by construction.
     #[test]
     fn h155_multi_seq_mlx_kv_n_seqs_1_byte_equivalent_to_legacy() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let cap = 8usize;
@@ -5668,6 +5720,7 @@ mod tests {
     /// 4-bit variant.
     #[test]
     fn h156_multi_seq_mlx_kv_multi_seq_kv_cache_impl() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let n_seqs = 4u32;
         let mut cache = alloc_multi_seq_mlx_kv_for_layer(
@@ -5792,6 +5845,7 @@ mod tests {
     /// Mirrors H150 for the legacy 4-bit variant.
     #[test]
     fn h157_multi_seq_mlx_kv_reset_for_slot_per_slot_isolation_and_bounds() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -5923,6 +5977,7 @@ mod tests {
     /// at the per-sibling-struct level).
     #[test]
     fn h159_multi_seq_hb_kv_fork_seq_cross_slot_copies_all_buffers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -6001,6 +6056,7 @@ mod tests {
     /// and dst (production-default per H10).
     #[test]
     fn h160_multi_seq_hybrid_kv_fork_seq_cross_slot_copies_all_buffers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -6079,6 +6135,7 @@ mod tests {
     /// (F32 default) regions between src and dst.
     #[test]
     fn h161_multi_seq_dense_kv_fork_seq_cross_slot_copies_all_buffers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;
@@ -6135,6 +6192,7 @@ mod tests {
     /// layout per ADR-007).
     #[test]
     fn h162_multi_seq_mlx_kv_fork_seq_cross_slot_copies_all_buffers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let dev = match skip_dev() { Some(d) => d, None => return };
         let nkv = 2usize;
         let hd = 256usize;

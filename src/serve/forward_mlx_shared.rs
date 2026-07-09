@@ -1001,6 +1001,7 @@ mod cosine_tests {
 
     #[test]
     fn identity_is_one() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let a = vec![1.0_f32, 2.0, 3.0, -4.5, 0.25];
         let s = cosine_pairwise_f32(&a, &a);
         assert!((s - 1.0).abs() < 1e-6, "identity cosine = {s}");
@@ -1008,6 +1009,7 @@ mod cosine_tests {
 
     #[test]
     fn antiparallel_is_negative_one() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let a: Vec<f32> = (0..128).map(|i| (i as f32) - 64.0).collect();
         let neg: Vec<f32> = a.iter().map(|x| -x).collect();
         let s = cosine_pairwise_f32(&a, &neg);
@@ -1016,6 +1018,7 @@ mod cosine_tests {
 
     #[test]
     fn zero_norm_is_nan() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let a = vec![0.0_f32; 32];
         let b: Vec<f32> = (0..32).map(|i| i as f32).collect();
         let s = cosine_pairwise_f32(&a, &b);
@@ -1031,6 +1034,7 @@ mod cosine_tests {
 
     #[test]
     fn orthogonal_is_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // [1,0,0,...] vs [0,1,0,...] → dot=0, both norms=1 → cosine=0.
         let mut a = vec![0.0_f32; 16];
         let mut b = vec![0.0_f32; 16];
@@ -1042,6 +1046,7 @@ mod cosine_tests {
 
     #[test]
     fn matches_python_reference_within_tolerance() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Reference shape: same kernel as iter24_audit.rs:752-761 in F64.
         // We compare against the explicit numpy-style formula to make sure
         // our F64 accumulation tracks the audit-binary numbers.
@@ -1073,6 +1078,7 @@ mod dispatch_qmatmul_f32_router_test {
 
     #[test]
     fn f32_router_weight_routes_to_dense_matmul() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match mlx_native::MlxDevice::new() {
             Ok(d) => d,
             Err(_) => {
@@ -1198,6 +1204,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
 
     #[test]
     fn from_mlx_affine_linear_roundtrips_through_packed_kernel() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match mlx_native::MlxDevice::new() {
             Ok(d) => d,
             Err(_) => {
@@ -1330,6 +1337,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
     /// at the dispatch boundary.
     #[test]
     fn dispatch_qmatmul_routes_affine_weight_to_packed_kernel() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match mlx_native::MlxDevice::new() {
             Ok(d) => d,
             Err(_) => {
@@ -1430,6 +1438,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
     /// per-call drift (e.g. wrong meta values, batch-dim confusion).
     #[test]
     fn dispatch_qmatmul_affine_equals_direct_kernel() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match mlx_native::MlxDevice::new() {
             Ok(d) => d,
             Err(_) => {
@@ -1537,6 +1546,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
     /// base roles + handles invalid suffixes correctly.
     #[test]
     fn parse_dwq_moe_expert_role_covers_all_bases() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::{parse_dwq_moe_expert_role, MoeBaseRole};
         // Fused gate+up case (qwen3.5 GGUF).
         assert_eq!(
@@ -1577,6 +1587,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
     /// stems plus rejects unknowns.  Pure CPU; no MlxDevice required.
     #[test]
     fn parse_dwq_overlay_role_covers_all_dense_stems() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::{parse_dwq_overlay_role, DwqOverlayRole};
         // Dense Linears.
         assert_eq!(parse_dwq_overlay_role("attn_q"), DwqOverlayRole::AttnQ);
@@ -1615,6 +1626,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
     /// present, defaults sanely when absent, rejects mismatched format.
     #[test]
     fn parse_dwq_overlay_metadata_handles_all_cases() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::parse_dwq_overlay_metadata;
         use std::collections::HashMap;
 
@@ -1661,6 +1673,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
     /// hold without MlxModelWeights involvement.
     #[test]
     fn dwq_safetensors_metadata_roundtrip() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::core::mlx_safetensors_loader::{MlxAffineLinear, MlxAffineLinearBytes};
         use safetensors::tensor::{serialize, Dtype};
         use std::collections::HashMap;
@@ -1740,6 +1753,7 @@ mod ac5_iter_b_affine_qweight_roundtrip {
 
     #[test]
     fn from_mlx_affine_linear_rejects_unsupported_bits() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match mlx_native::MlxDevice::new() {
             Ok(d) => d,
             Err(_) => {

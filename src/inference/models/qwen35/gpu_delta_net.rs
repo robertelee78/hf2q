@@ -4136,6 +4136,7 @@ mod tests {
     /// gated_delta_net) is F32 throughout and contributes negligible extra error.
     #[test]
     fn full_delta_net_layer_gpu_matches_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 
@@ -4294,6 +4295,7 @@ mod tests {
     /// build_delta_net_layer with wrong state_in or wrong position).
     #[test]
     fn delta_net_layer_seq2_mid_stream_state() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 
@@ -4448,6 +4450,7 @@ mod tests {
     /// within the layer setup steps.
     #[test]
     fn delta_net_layer_seq1_plus_seq1_eq_seq2_at_same_initial_state() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 
@@ -4557,6 +4560,7 @@ mod tests {
     /// Verify the ssm_conv kernel_w transpose is self-inverse.
     #[test]
     fn kernel_w_transpose_roundtrip() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let k = 4usize;
         let ch = 6usize;
         let mut seed = 0xDEAD_u32;
@@ -4585,6 +4589,7 @@ mod tests {
     /// Verify the conv_state transpose pair is self-inverse.
     #[test]
     fn conv_state_transpose_roundtrip() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let km1 = 3usize;
         let ch = 8usize;
         let mut seed = 0xFACE_u32;
@@ -4604,6 +4609,7 @@ mod tests {
     /// Verify upload/download roundtrip (belt-and-suspenders for the helpers).
     #[test]
     fn upload_download_f32_roundtrip() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let data: Vec<f32> = (0..64).map(|i| i as f32 * 0.1).collect();
         let buf = upload_f32(&data, &device).expect("upload");
@@ -4631,6 +4637,7 @@ mod tests {
     /// changes to the seq_len=1 chunked path.
     #[test]
     fn gpu_state_propagation_chunked_vs_monolithic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -4782,6 +4789,7 @@ mod tests {
     /// numerical sanity check that the sign-flip bridge is correct.
     #[test]
     fn chunk_path_first_token_matches_autoregressive_at_seq128() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 
@@ -5032,6 +5040,7 @@ mod tests {
     /// in arena, mis-routed buffer slot).
     #[test]
     fn chunk_arena_byte_exact_parity_at_seq128() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 
@@ -5253,6 +5262,7 @@ mod tests {
     /// dispatch ordering unchanged, and is observed byte-stable.
     #[test]
     fn chunk_internal_arena_kernel_equivalence_at_seq128() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 
@@ -5466,6 +5476,7 @@ mod tests {
     /// with a wrapper-side error before any GPU dispatch.
     #[test]
     fn chunk_path_rejects_non_multiple_of_bt() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
         // Tiny dummy buffers — the dim check fires before any read.
@@ -5507,6 +5518,7 @@ mod tests {
     /// reserved for a future iter that defers l2-norm to the chunk dispatch.
     #[test]
     fn chunk_path_rejects_qk_l2norm_in_kernel() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
         let dummy_f32 = upload_f32(&[0.0f32; 1], &device).expect("upload dummy");
@@ -5817,6 +5829,7 @@ mod tests {
     /// Gated behind HF2Q_W5B4_DIVERGENCE=1 (slow; CPU f32 reference is O(T·D_k·D_v)).
     #[test]
     fn chunk_vs_autoreg_divergence_scaling() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if std::env::var("HF2Q_W5B4_DIVERGENCE").as_deref() != Ok("1") {
             eprintln!(
                 "chunk_vs_autoreg_divergence_scaling: skipped \
@@ -5864,6 +5877,7 @@ mod tests {
     /// 4-fixture decode parity at production weights.
     #[test]
     fn dn_stage_a_byte_exact_parity_with_pre_phase3a() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let mut registry = KernelRegistry::new();
 

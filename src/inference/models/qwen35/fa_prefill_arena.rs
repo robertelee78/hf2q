@@ -225,6 +225,7 @@ mod tests {
     /// seq_capacity is recorded correctly.
     #[test]
     fn test_arena_new_qwen35_pp101() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -256,6 +257,7 @@ mod tests {
     /// and capacity recorded.
     #[test]
     fn test_arena_new_qwen35_pp4096() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -271,6 +273,7 @@ mod tests {
     /// Passing seq=0, nh=0, nkv=0, or d=0 each individually must return Err.
     #[test]
     fn test_arena_new_zero_dim_rejected() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -303,6 +306,7 @@ mod tests {
     /// n_heads=15, n_kv_heads=2 (15 % 2 != 0) must return Err.
     #[test]
     fn test_arena_new_gqa_divisibility_rejected() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -319,6 +323,7 @@ mod tests {
     /// Arena sized for seq_capacity=128; validate_fits(seq_len=256) returns Err.
     #[test]
     fn test_validate_fits_seq_overrun() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -337,6 +342,7 @@ mod tests {
     /// Arena recorded n_heads=16; validate_fits(n_heads=8) returns Err.
     #[test]
     fn test_validate_fits_shape_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -364,6 +370,7 @@ mod tests {
     /// the exact same values returns Ok.
     #[test]
     fn test_validate_fits_exact_match() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -390,6 +397,7 @@ mod tests {
     /// guarantee documented in mlx_native/src/device.rs:120-146.
     #[test]
     fn test_arena_buffers_zero_initialized() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {

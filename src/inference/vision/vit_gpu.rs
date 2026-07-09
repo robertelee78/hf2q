@@ -4164,6 +4164,7 @@ mod tests {
 
     #[test]
     fn vit_linear_gpu_matches_cpu_reference_on_small_input() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Small shape parity. seq=4, in=64 (≥32 required), out=32.
         // Use deterministic synthetic input + deterministic synthetic
         // weight; compare GPU output to CPU linear_forward within 1e-3
@@ -4238,6 +4239,7 @@ mod tests {
 
     #[test]
     fn vit_linear_gpu_rejects_small_in_features() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
         // Allocate tiny buffers that'd satisfy shape but in_features=16 < 32.
@@ -4269,6 +4271,7 @@ mod tests {
 
     #[test]
     fn vit_linear_gpu_rejects_zero_dims() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
         let input = executor
@@ -4299,6 +4302,7 @@ mod tests {
 
     #[test]
     fn vit_linear_gpu_on_real_gemma4_mm0_matches_cpu_at_small_seq() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Real-data GPU path: use actual Gemma 4 mm.0.weight [2816,
         // 1152] F32, a synthetic [seq=4, 1152] input, run vit_linear_gpu
         // → [4, 2816] F32. Compare against CPU linear_forward; require
@@ -4396,6 +4400,7 @@ mod tests {
 
     #[test]
     fn vit_rms_norm_gpu_matches_cpu_reference_on_small_input() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 8 rows × 16 dim. F32 throughout. Compare GPU vs CPU
         // rms_norm_forward within float epsilon — RMSNorm has no
         // BF16 round-trip (input + gain stay F32), so tolerance is
@@ -4445,6 +4450,7 @@ mod tests {
 
     #[test]
     fn vit_rms_norm_gpu_rejects_zero_dims() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
         let input = executor.device().alloc_buffer(16 * 4, DType::F32, vec![4, 4]).expect("a");
@@ -4469,6 +4475,7 @@ mod tests {
 
     #[test]
     fn vit_rms_norm_gpu_on_real_gemma4_ln1_matches_cpu() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Real-data parity: load real Gemma 4 mmproj, read v.blk.0.ln1.weight
         // as the f32 gain vector (1152 elements), apply GPU RMSNorm to a
         // synthetic [8, 1152] input. Compare against CPU rms_norm_forward.
@@ -4532,6 +4539,7 @@ mod tests {
 
     #[test]
     fn vit_per_head_rms_norm_gpu_matches_cpu_reference() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // batch=4, num_heads=8, head_dim=16. GPU should match CPU
         // per_head_rms_norm_forward.
         let batch = 4usize;
@@ -4585,6 +4593,7 @@ mod tests {
 
     #[test]
     fn vit_softmax_last_dim_gpu_matches_cpu_reference() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 4 rows × 8 cols. Numerically stable softmax — GPU should match
         // CPU within float epsilon (no BF16 round-trip; everything F32).
         let rows = 4usize;
@@ -4632,6 +4641,7 @@ mod tests {
 
     #[test]
     fn vit_softmax_last_dim_gpu_numerically_stable_for_large_inputs() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // x = [1000, 999, 998] should not overflow with the
         // subtract-max trick (without it, exp(1000) → +∞).
         let rows = 1usize;
@@ -4705,6 +4715,7 @@ mod tests {
     /// might be in this stage.
     #[test]
     fn permute_021_f32_seq_to_head_major_round_trips() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Tiny [batch=2, num_heads=2, head_dim=4] test — easy to read
         // back and verify by hand.
         let batch = 2usize;
@@ -4762,6 +4773,7 @@ mod tests {
 
     #[test]
     fn vit_attention_scores_gpu_matches_cpu_reference_on_small_input() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // batch=4, num_heads=2, head_dim=64. scale=0.125 (1/sqrt(64)).
         let batch = 4usize;
         let num_heads = 2usize;
@@ -4821,6 +4833,7 @@ mod tests {
 
     #[test]
     fn vit_attention_scores_gpu_unit_scale_does_not_apply() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // scale=1.0 should skip the scalar_mul — verify by feeding
         // identical Q=K, expecting per-head diagonal = ||Q[h, q]||^2.
         let batch = 3usize;
@@ -4875,6 +4888,7 @@ mod tests {
 
     #[test]
     fn vit_attention_gpu_matches_cpu_scaled_dot_product_attention() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Full attention parity. batch=32 (≥32 for the second matmul's
         // contract dim K=batch), num_heads=2, head_dim=64. Note CPU
         // reference uses scale = 1/sqrt(head_dim) baked in (no
@@ -4949,6 +4963,7 @@ mod tests {
 
     #[test]
     fn vit_residual_add_gpu_matches_cpu_reference() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let n = 32usize;
         let a_cpu: Vec<f32> = (0..n).map(|i| 0.5 + (i as f32) * 0.1).collect();
         let b_cpu: Vec<f32> = (0..n).map(|i| -0.3 + (i as f32) * 0.05).collect();
@@ -4982,6 +4997,7 @@ mod tests {
 
     #[test]
     fn vit_residual_add_gpu_rejects_zero_n() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
         let a = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("a");
@@ -5001,6 +5017,7 @@ mod tests {
 
     #[test]
     fn vit_silu_mul_gpu_matches_cpu_swiglu_gate() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // CPU reference: silu(gate) * up. silu(x) = x * sigmoid(x).
         let n = 64usize;
         let gate_cpu: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.07).sin()).collect();
@@ -5040,6 +5057,7 @@ mod tests {
 
     #[test]
     fn vit_silu_mul_gpu_rejects_zero_n() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
         let g = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("g");
@@ -5067,6 +5085,7 @@ mod tests {
     /// First stage with > BF16 tolerance (~5e-3) is the bug.
     #[test]
     fn iter50_bisect_block_forward_gpu_vs_cpu_real_gemma4() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::vision::vit::{
             linear_forward as linear_cpu_fn,
             per_head_rms_norm_forward as per_head_rms_cpu_fn,
@@ -5314,6 +5333,7 @@ mod tests {
 
     #[test]
     fn vit_avg_pool_2x2_gpu_matches_cpu_reference() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 4×4 grid × 2 hidden → 2×2 output. Same hand-decodable test
         // as vit::tests::avg_pool_2x2_averages_each_2x2_block.
         use crate::inference::vision::vit::avg_pool_2x2_spatial as avg_pool_cpu;
@@ -5359,6 +5379,7 @@ mod tests {
 
     #[test]
     fn vit_avg_pool_2x2_gpu_gemma4_production_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // [14, 14, 1152] → [49, 1152]. Uniform input → uniform output.
         let n_side = 14usize;
         let hidden = 1152usize;
@@ -5391,6 +5412,7 @@ mod tests {
 
     #[test]
     fn vit_avg_pool_2x2_gpu_rejects_odd_n_side() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("dev");
         let executor = GraphExecutor::new(device);
         let in_buf = executor.device().alloc_buffer(27 * 4, DType::F32, vec![3, 3, 3]).expect("a");
@@ -5414,6 +5436,7 @@ mod tests {
     /// which is a real numeric regression worth investigating.
     #[test]
     fn vit_avg_pool_kxk_k2_byte_identical_to_2x2_path() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let n_side = 4usize;
         let hidden = 2usize;
         let mut input_cpu = vec![0f32; n_side * n_side * hidden];
@@ -5464,6 +5487,7 @@ mod tests {
     /// → 2×2 output of hidden=2 channels.
     #[test]
     fn vit_avg_pool_kxk_k3_correctness() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let n_x = 6usize;
         let n_y = 6usize;
         let k = 3usize;
@@ -5530,6 +5554,7 @@ mod tests {
     /// per-axis tile counts.
     #[test]
     fn vit_avg_pool_kxk_dimensions_rectangular() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let n_x = 12u32;
         let n_y = 9u32;
         let k = 3u32;
@@ -5567,6 +5592,7 @@ mod tests {
 
     #[test]
     fn vit_avg_pool_kxk_rejects_non_divisible_n() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("dev");
         let executor = GraphExecutor::new(device);
         let in_buf = executor
@@ -5591,6 +5617,7 @@ mod tests {
 
     #[test]
     fn vit_clip_gpu_clamps_to_min_max() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("dev");
         let executor = GraphExecutor::new(device);
         let input_cpu: Vec<f32> = vec![-5.0, -1.0, 0.0, 1.0, 5.0, 100.0];
@@ -5613,6 +5640,7 @@ mod tests {
 
     #[test]
     fn vit_clip_gpu_no_op_on_neg_inf_pos_inf() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Default sentinels (no clamp on either side) → identity.
         let device = MlxDevice::new().expect("dev");
         let executor = GraphExecutor::new(device);
@@ -5635,6 +5663,7 @@ mod tests {
 
     #[test]
     fn vit_clip_gpu_rejects_min_greater_than_max() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("dev");
         let executor = GraphExecutor::new(device);
         let in_buf = upload_f32(executor.device(), &[1.0, 2.0, 3.0], vec![3]);
@@ -5659,6 +5688,7 @@ mod tests {
     /// expected diff for the linear stage alone is ≤ 1e-3).
     #[test]
     fn gemma4v_clippable_linear_with_and_without_clamp() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::vision::vit::{
             gemma4v_clippable_linear_forward as cpu_clip_linear,
             Gemma4ClippableLinearBounds,
@@ -5749,6 +5779,7 @@ mod tests {
 
     #[test]
     fn vit_std_bias_scale_gpu_matches_cpu_reference() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // batch=2, hidden=3. bias=[1, 2, 3], scale=[10, 20, 30]. Same
         // hand-decodable test as vit::tests::std_bias_scale_subtracts_and_scales_per_channel.
         let batch = 2usize;
@@ -5788,6 +5819,7 @@ mod tests {
 
     #[test]
     fn vit_std_bias_scale_gpu_zero_bias_unit_scale_is_identity() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let batch = 4usize;
         let hidden = 8usize;
         let input_cpu: Vec<f32> = (0..batch * hidden).map(|i| (i as f32) * 0.1).collect();
@@ -5824,6 +5856,7 @@ mod tests {
 
     #[test]
     fn vit_std_bias_scale_gpu_rejects_zero_dims() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("dev");
         let executor = GraphExecutor::new(device);
         let buf = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("a");
@@ -5842,6 +5875,7 @@ mod tests {
 
     #[test]
     fn vit_scale_gpu_multiplies_every_element_in_place() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let n = 64usize;
         let scalar = 0.25f32;
         let cpu_in: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
@@ -5865,6 +5899,7 @@ mod tests {
 
     #[test]
     fn vit_scale_gpu_by_unit_is_identity() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let n = 16usize;
         let cpu_in: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 1.0).collect();
         let device = MlxDevice::new().expect("dev");
@@ -5885,6 +5920,7 @@ mod tests {
 
     #[test]
     fn vit_scale_gpu_rejects_zero_n() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("dev");
         let executor = GraphExecutor::new(device);
         let buf = executor.device().alloc_buffer(16, DType::F32, vec![4]).expect("a");
@@ -5899,6 +5935,7 @@ mod tests {
 
     #[test]
     fn warmup_vit_gpu_compiles_all_kernels_real_gemma4() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Iter 53: warmup function. Just verify it runs to completion
         // without panic on real Gemma 4 mmproj — its job is to JIT-
         // compile every Metal pipeline so subsequent runs are fast.
@@ -5923,6 +5960,7 @@ mod tests {
 
     #[test]
     fn compute_vision_embeddings_gpu_multi_image_real_gemma4() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Iter 52: handler-side wrapper. Two synthetic preprocessed
         // images (different gradient inputs) → two distinct
         // [49, 2816] embeddings. Validates the multi-image loop +
@@ -6000,6 +6038,7 @@ mod tests {
     /// **This is the final production forward path.**
     #[test]
     fn apply_vit_full_forward_gpu_on_real_gemma4_full_pipeline() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
             eprintln!("skipping: mmproj fixture not found");
@@ -6104,6 +6143,7 @@ mod tests {
     /// see `project_vit_attention_bf16_softmax_drift.md` for why.
     #[test]
     fn apply_vit_blocks_loop_gpu_27_blocks_real_gemma4() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
             eprintln!("skipping: mmproj fixture not found");
@@ -6209,6 +6249,7 @@ mod tests {
     #[test]
     #[ignore = "BF16-saturated-softmax drift vs F32 CPU ref is expected; see memory note"]
     fn apply_vit_block_forward_gpu_matches_cpu_on_real_gemma4_block0() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // GPU full block 0 parity vs CPU on real Gemma 4 mmproj weights.
         // Single MlxDevice for everything — weights, input upload,
         // dispatch executor — all share the same Metal device.
@@ -6303,6 +6344,7 @@ mod tests {
     /// inputs at the failing shape.
     #[test]
     fn vit_attention_gpu_isolated_head_dim_72_diagnostic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Same shape as Gemma 4: batch=32, num_heads=16, head_dim=72.
         // Synthetic Q/K/V (no real weights, no upstream stages).
         let batch = 32usize;
@@ -6365,6 +6407,7 @@ mod tests {
 
     #[test]
     fn vit_attention_gpu_rejects_small_head_dim() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
         let q = executor.device().alloc_buffer(2*2*16*4, DType::F32, vec![2,2,16]).expect("q");
@@ -6388,6 +6431,7 @@ mod tests {
 
     #[test]
     fn vit_attention_scores_gpu_rejects_small_head_dim() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
         let q = executor
@@ -6419,6 +6463,7 @@ mod tests {
 
     #[test]
     fn vit_softmax_last_dim_gpu_rejects_zero_dims() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
         let input = executor
@@ -6443,6 +6488,7 @@ mod tests {
 
     #[test]
     fn vit_per_head_rms_norm_gpu_rejects_zero_dims() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
         let input = executor.device().alloc_buffer(64 * 4, DType::F32, vec![64]).expect("a");
@@ -6485,6 +6531,7 @@ mod tests {
 
     #[test]
     fn gemma4v_patch_embed_cpu_gpu_parity() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Tiny shape: 4 patches × inner=64 → hidden=32. Keep inner ≥ 32
         // (vit_linear_gpu's tensor-core tile floor).
         let n_patches = 4usize;
@@ -6541,6 +6588,7 @@ mod tests {
 
     #[test]
     fn gemma4v_patch_embed_gpu_rejects_zero_n() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
         let p = executor.device().alloc_buffer(64 * 4, DType::F32, vec![64]).expect("a");
@@ -6565,6 +6613,7 @@ mod tests {
 
     #[test]
     fn gemma4v_position_embed_cpu_gpu_parity() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 6 patches into a [2, pos_size=4, hidden=8] table.
         let pos_size = 4usize;
         let hidden = 8usize;
@@ -6622,6 +6671,7 @@ mod tests {
 
     #[test]
     fn gemma4v_position_embed_lookup_gpu_rejects_zero_dims() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let executor = GraphExecutor::new(device);
         let pe = executor.device().alloc_buffer(64 * 4, DType::F32, vec![64]).expect("a");
@@ -6648,6 +6698,7 @@ mod tests {
 
     #[test]
     fn gemma4v_apply_position_embed_gpu_adds_pe_to_patch_embeds() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // patch_embeds = ones[N=3, hidden=4] → after add, each row is
         // 1 + (pe[0][pos_x] + pe[1][pos_y]).
         let pos_size = 2usize;
@@ -6808,6 +6859,7 @@ mod tests {
     /// were accidentally aliased the parity test below would fail.
     #[test]
     fn gemma4v_block_forward_4_rmsnorm_count_is_exactly_four() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Synthesize fixture and execute the CPU forward; assert that
         // each of the 4 gain tensors actually influences the output by
         // perturbing one and observing a delta.
@@ -6878,6 +6930,7 @@ mod tests {
     /// directly since it's the GQA bridge.
     #[test]
     fn gemma4v_block_forward_gqa_dimensions() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::vision::vit::repeat_kv_cpu;
         let batch = 3usize;
         let num_kv_heads = 2usize;
@@ -6911,6 +6964,7 @@ mod tests {
     /// synthetic weights. Validates the pipeline wiring end-to-end.
     #[test]
     fn gemma4v_block_forward_cpu_gpu_parity() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let (
             shape, batch,
             input_ln, post_attn_ln, pre_ff_ln, post_ff_ln,
@@ -7316,6 +7370,7 @@ mod tests {
     /// the correct shape.
     #[test]
     fn gemma4v_apply_full_forward_gpu_synthetic_n_36() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let n_x: u32 = 6;
         let n_y: u32 = 6;
         let (weights, cfg, patches, pos_x, pos_y) = synth_gemma4v_full_fixture(n_x, n_y);
@@ -7361,6 +7416,7 @@ mod tests {
     /// that more closely approximate gemma4v production (~270 patches).
     #[test]
     fn gemma4v_apply_full_forward_gpu_synthetic_rectangular_n_54() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let n_x: u32 = 9;
         let n_y: u32 = 6;
         let (weights, cfg, patches, pos_x, pos_y) = synth_gemma4v_full_fixture(n_x, n_y);
@@ -7408,6 +7464,7 @@ mod tests {
     /// what we exercise.
     #[test]
     fn compute_vision_embeddings_gpu_dispatch_gemma4v_routes_correctly() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::vision::mmproj::ArchProfile;
         let n_x: u32 = 6;
         let n_y: u32 = 6;
@@ -7442,6 +7499,7 @@ mod tests {
     /// must error rather than silently routing to the wrong forward.
     #[test]
     fn compute_vision_embeddings_gpu_dispatch_rejects_arch_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::vision::mmproj::ArchProfile;
         let n_x: u32 = 6;
         let n_y: u32 = 6;
@@ -7474,6 +7532,7 @@ mod tests {
     /// no-images-in-request shouldn't crash).
     #[test]
     fn compute_vision_embeddings_gpu_dispatch_empty_inputs_ok() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::vision::mmproj::ArchProfile;
         let n_x: u32 = 6;
         let n_y: u32 = 6;
@@ -7508,6 +7567,7 @@ mod tests {
     #[test]
     #[ignore]
     fn iter124_parity_probe_dump_four_dots_real_gemma4() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if super::super::vit_dump::resolve_dump_dir()
             .expect("resolve dump dir")
             .is_none()

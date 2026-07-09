@@ -1376,6 +1376,7 @@ mod tests {
 
     #[test]
     fn load_from_lazy_tensor_map_infers_four_layer_dense_config() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let map = synthetic_four_layer_dense_map();
         let Some(model) = load_lazy_or_skip_without_metal(&map) else {
             return;
@@ -1395,6 +1396,7 @@ mod tests {
 
     #[test]
     fn load_from_lazy_tensor_map_splits_fused_full_attention_q_gate() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let map = synthetic_four_layer_dense_map();
         let Some(model) = load_lazy_or_skip_without_metal(&map) else {
             return;
@@ -1413,6 +1415,7 @@ mod tests {
 
     #[test]
     fn load_from_lazy_tensor_map_quantizes_moe_experts_to_q8_0() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let map = synthetic_four_layer_moe_map();
         let Some(model) = load_lazy_or_skip_without_metal(&map) else {
             return;
@@ -1440,6 +1443,7 @@ mod tests {
     /// ~1-2 GB of dequantized f32 for one MoE linear layer.
     #[test]
     fn load_real_apex_linear_attn_layer_0() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = std::path::PathBuf::from(
             "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
              APEX-Q5_K_M.gguf",
@@ -1581,6 +1585,7 @@ mod tests {
     /// Integration test for a full-attention layer (layer 3 in apex).
     #[test]
     fn load_real_apex_full_attn_layer_3() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = std::path::PathBuf::from(
             "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
              APEX-Q5_K_M.gguf",
@@ -1640,6 +1645,7 @@ mod tests {
     /// Global tensors loadable from real apex.
     #[test]
     fn load_real_apex_global_tensors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = std::path::PathBuf::from(
             "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
              APEX-Q5_K_M.gguf",

@@ -454,6 +454,7 @@ mod tests {
 
     #[test]
     fn collector_unarmed_no_op() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Without with_dump_collector, record() must be a silent no-op.
         // We can't easily synthesize an MlxBuffer here without a Metal
         // device, so just exercise the CPU path.
@@ -468,6 +469,7 @@ mod tests {
 
     #[test]
     fn collector_armed_collects_cpu_mirror() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let result: Result<()> = with_dump_collector(|| {
             record_f32("00_test_armed", &[1.0, 2.0, 3.0, 4.0], vec![2, 2]);
             Ok(())
@@ -483,6 +485,7 @@ mod tests {
 
     #[test]
     fn write_dump_inner_round_trip() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let tmp = std::env::temp_dir().join(format!(
             "vit_dump_test_{}",
             std::process::id()

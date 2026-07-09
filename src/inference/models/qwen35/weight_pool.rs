@@ -151,6 +151,7 @@ mod tests {
 
     #[test]
     fn register_existing_via_thread_local_is_idempotent() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Skip if no Metal device available (CI / headless Linux).
         let device = match MlxDevice::new() {
             Ok(d) => d,
@@ -173,6 +174,7 @@ mod tests {
 
     #[test]
     fn register_does_not_recycle_external_buffers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Verify the register-only path: in_use + free counts must stay 0.
         let _device = match MlxDevice::new() {
             Ok(d) => d,

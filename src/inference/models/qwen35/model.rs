@@ -1193,6 +1193,7 @@ mod tests {
 
     #[test]
     fn empty_moe_40layer_has_correct_slot_counts() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40();
         let m = Qwen35Model::empty_from_cfg(cfg.clone());
         assert_eq!(m.layers.len(), 40);
@@ -1206,6 +1207,7 @@ mod tests {
 
     #[test]
     fn empty_dense_12layer_uses_swiglu_ffn() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = dense_cfg_12();
         let m = Qwen35Model::empty_from_cfg(cfg);
         for l in &m.layers {
@@ -1215,6 +1217,7 @@ mod tests {
 
     #[test]
     fn empty_moe_12layer_uses_moe_ffn() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40();
         let m = Qwen35Model::empty_from_cfg(cfg);
         for l in &m.layers {
@@ -1224,6 +1227,7 @@ mod tests {
 
     #[test]
     fn layer_kind_matches_config() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40();
         let m = Qwen35Model::empty_from_cfg(cfg.clone());
         for i in 0..40 {
@@ -1236,6 +1240,7 @@ mod tests {
 
     #[test]
     fn layer_kind_out_of_bounds_is_none() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40();
         let m = Qwen35Model::empty_from_cfg(cfg);
         assert_eq!(m.layer_kind(40), None);
@@ -1244,6 +1249,7 @@ mod tests {
 
     #[test]
     fn full_attn_layer_has_q_and_kv_weights() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40();
         let m = Qwen35Model::empty_from_cfg(cfg.clone());
         // Layer 3 is full-attention (interval=4).
@@ -1262,6 +1268,7 @@ mod tests {
 
     #[test]
     fn linear_attn_layer_has_ssm_weights() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40();
         let m = Qwen35Model::empty_from_cfg(cfg.clone());
         // Layer 0 is linear-attention.
@@ -1284,6 +1291,7 @@ mod tests {
 
     #[test]
     fn ffn_variant_reported_via_config() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg_moe = moe_cfg_40();
         let m_moe = Qwen35Model::empty_from_cfg(cfg_moe);
         assert_eq!(m_moe.ffn_variant(), Qwen35Variant::Moe);
@@ -1327,6 +1335,7 @@ mod tests {
 
     #[test]
     fn overwrite_full_attn_q_replaces_wq_vec() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = one_full_attn_cfg();
         let mut model = Qwen35Model::empty_from_cfg(cfg);
         let n_q  = model.cfg.num_attention_heads as usize * model.cfg.head_dim as usize;
@@ -1358,6 +1367,7 @@ mod tests {
 
     #[test]
     fn overwrite_full_attn_role_to_slot_mapping_is_correct() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Each AttnRole must hit its own slot; no cross-pollination.
         let cfg = one_full_attn_cfg();
         let n_q  = cfg.num_attention_heads as usize * cfg.head_dim as usize;
@@ -1406,6 +1416,7 @@ mod tests {
 
     #[test]
     fn overwrite_full_attn_rejects_linear_attention_layer() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = dense_cfg_12();
         // Find a LinearAttention layer (default arrangement has them
         // at every non-(every-Nth) position).
@@ -1426,6 +1437,7 @@ mod tests {
 
     #[test]
     fn overwrite_full_attn_rejects_shape_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = one_full_attn_cfg();
         let mut model = Qwen35Model::empty_from_cfg(cfg);
         let h = model.cfg.hidden_size as usize;
@@ -1462,6 +1474,7 @@ mod tests {
 
     #[test]
     fn dwq_to_native_q4_0_f32_gate_transposes_hidden_to_intermediate_rows() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Gate: DWQ shape (n=hidden=64, k=inter=128) → native (inter, hidden)
         // = (128 rows, 64 cols).
         let hidden = 64usize;
@@ -1489,6 +1502,7 @@ mod tests {
 
     #[test]
     fn dwq_to_native_q4_0_f32_down_transposes_intermediate_to_hidden_rows() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Down: DWQ shape (n=inter=128, k=hidden=64) → native (hidden, inter)
         // = (64 rows, 128 cols).
         let hidden = 64usize;
@@ -1511,6 +1525,7 @@ mod tests {
 
     #[test]
     fn dwq_to_native_q4_0_f32_role_validates_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Gate expects (n=hidden, k=inter); supplying (n=inter, k=hidden)
         // must error rather than silently transposing wrong data.
         let hidden = 64usize;
@@ -1526,6 +1541,7 @@ mod tests {
 
     #[test]
     fn dwq_to_native_q4_0_f32_round_trip_dimensions() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Sanity: total element count is preserved across the transpose
         // and the output shape's row length is what Q4_0 will see.
         let hidden = 64usize;
@@ -1595,6 +1611,7 @@ mod tests {
 
     #[test]
     fn apply_dwq_overlay_e2e_lm_head_plus_attn_q() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Build a tiny dense Qwen35Model with layer 0 as FullAttention.
         let mut cfg = dense_cfg_12();
         cfg.layer_types[0] = Qwen35LayerKind::FullAttention;
@@ -1644,6 +1661,7 @@ mod tests {
 
     #[test]
     fn apply_dwq_overlay_e2e_dense_ffn_stem_skipped_on_cpu_dense_variant() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // The B2.B handler errors when ffn variant is `Dense` (CPU
         // test-only; production uses `DenseQ`).  This test confirms the
         // dispatch loop catches that error path: ffn_gate stem on a
@@ -1682,6 +1700,7 @@ mod tests {
     /// Runtime-skips when artefact absent (existing path-exists check).
     #[test]
     fn load_from_real_apex_has_correct_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = std::path::PathBuf::from(
             "/opt/hf2q/models/qwen3.6-35b-a3b-abliterix-ega-abliterated-apex/\
              APEX-Q5_K_M.gguf",

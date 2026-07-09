@@ -875,6 +875,7 @@ mod tests {
     /// is recorded correctly.
     #[test]
     fn test_arena_new_qwen36_27b_pp4096() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -904,6 +905,7 @@ mod tests {
     /// Smaller shape sanity-check.
     #[test]
     fn test_arena_new_small_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -918,6 +920,7 @@ mod tests {
     /// Zero-dim rejection.
     #[test]
     fn test_arena_new_zero_dim_rejected() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -933,6 +936,7 @@ mod tests {
     /// validate_fits exact match returns Ok.
     #[test]
     fn test_validate_fits_exact_match() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -949,6 +953,7 @@ mod tests {
     /// validate_fits seq overrun returns Err.
     #[test]
     fn test_validate_fits_seq_overrun() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -963,6 +968,7 @@ mod tests {
     /// validate_fits shape mismatch returns Err.
     #[test]
     fn test_validate_fits_shape_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -980,6 +986,7 @@ mod tests {
     /// zero-init guarantee documented in mlx_native/src/device.rs.
     #[test]
     fn test_arena_buffers_zero_initialized() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1021,6 +1028,7 @@ mod tests {
     /// m_moe=512, m_sh=512.
     #[test]
     fn test_moe_arena_new_qwen36_35b_pp4096() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1061,6 +1069,7 @@ mod tests {
     /// Smaller MoE shape sanity-check.
     #[test]
     fn test_moe_arena_new_small_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1076,6 +1085,7 @@ mod tests {
     /// MoE zero-dim rejection.
     #[test]
     fn test_moe_arena_new_zero_dim_rejected() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1094,6 +1104,7 @@ mod tests {
     /// MoE validate_fits exact match returns Ok.
     #[test]
     fn test_moe_validate_fits_exact_match() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1109,6 +1120,7 @@ mod tests {
     /// MoE validate_fits seq overrun returns Err.
     #[test]
     fn test_moe_validate_fits_seq_overrun() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1123,6 +1135,7 @@ mod tests {
     /// MoE validate_fits shape mismatch returns Err.
     #[test]
     fn test_moe_validate_fits_shape_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1143,6 +1156,7 @@ mod tests {
     /// Apex shape: pp4096 × h=5120 (Qwen3.6 27B/35B prefill).
     #[test]
     fn test_layer_boundary_arena_new_apex_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1164,6 +1178,7 @@ mod tests {
     /// Zero-dim rejection.
     #[test]
     fn test_layer_boundary_arena_zero_dim_rejected() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1181,6 +1196,7 @@ mod tests {
     /// hidden_size mismatch Err.
     #[test]
     fn test_layer_boundary_arena_validate_fits() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1204,6 +1220,7 @@ mod tests {
     /// iter90b H4b depends on.
     #[test]
     fn test_layer_boundary_arena_clone_preserves_pointer() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1237,6 +1254,7 @@ mod tests {
     /// expected byte length and capacity is recorded.
     #[test]
     fn test_dense_ring_new_apex_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1256,6 +1274,7 @@ mod tests {
     /// Same for MoE ring.
     #[test]
     fn test_moe_ring_new_apex_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1275,6 +1294,7 @@ mod tests {
     /// Zero-dim rejection (both ring types).
     #[test]
     fn test_ring_new_zero_dim_rejected() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1292,6 +1312,7 @@ mod tests {
     /// mismatch Err.
     #[test]
     fn test_ring_validate_fits() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1318,6 +1339,7 @@ mod tests {
     /// depends on.
     #[test]
     fn test_dense_ring_slot_rotation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1346,6 +1368,7 @@ mod tests {
     /// MoE ring slot rotation — sister test to the Dense one above.
     #[test]
     fn test_moe_ring_slot_rotation() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -1369,6 +1392,7 @@ mod tests {
     /// hidden hand-off.
     #[test]
     fn test_dense_ring_clone_outlives_drop() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {

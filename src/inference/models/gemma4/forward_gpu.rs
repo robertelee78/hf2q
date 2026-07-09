@@ -2766,6 +2766,7 @@ mod g4_cfa3_tests {
     /// tree_seq=3, vocab=64, asserts output logits shape [3×64] + all-finite.
     #[test]
     fn g4_cfa3_single_iter_end_to_end_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match try_device() {
             Some(d) => d,
             None => { eprintln!("skip: no Metal device"); return; }
@@ -2821,6 +2822,7 @@ mod g4_cfa3_tests {
     /// correct shape. Verifies that repeated calls don't crash or corrupt.
     #[test]
     fn g4_cfa3_multi_iter_cache_continuity_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match try_device() {
             Some(d) => d,
             None => { eprintln!("skip: no Metal device"); return; }
@@ -2891,6 +2893,7 @@ mod g4_cfa3_tests {
     /// branches of the layer loop in forward_tree_verify_gpu.
     #[test]
     fn g4_cfa3_per_layer_dispatch_layer_type_branch_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match try_device() {
             Some(d) => d,
             None => { eprintln!("skip: no Metal device"); return; }
@@ -3050,6 +3053,7 @@ mod g4_cfa3_tests {
     /// Tests the layer-capture branch (capture_index_for → write_layer_slab).
     #[test]
     fn g4_cfa3_eagle3_hidden_capture_correctness_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match try_device() {
             Some(d) => d,
             None => { eprintln!("skip: no Metal device"); return; }
@@ -3109,6 +3113,7 @@ mod g4_cfa3_tests {
     /// Existing forward_decode path is unaffected (additive-only).
     #[test]
     fn g4_cfa3_regression_existing_forward_decode_passes_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match try_device() {
             Some(d) => d,
             None => { eprintln!("skip: no Metal device"); return; }
@@ -3195,6 +3200,7 @@ mod g4_cfa3_tests {
     /// path — so the counterfactual byte-diff is load-bearing here.
     #[test]
     fn g4_cfa5c_multi_iter_kv_continuity_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match try_device() {
             Some(d) => d,
             None => { eprintln!("skip: no Metal device"); return; }
@@ -3287,6 +3293,7 @@ mod g4_cfa3_tests {
     /// inputs at a single iteration. Locks in the shim's byte-identity guarantee.
     #[test]
     fn g4_cfa5c_old_signature_back_compat_2026_05_23() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match try_device() {
             Some(d) => d,
             None => { eprintln!("skip: no Metal device"); return; }

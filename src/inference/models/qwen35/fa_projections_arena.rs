@@ -395,6 +395,7 @@ mod tests {
     /// constants.
     #[test]
     fn test_fa_proj_arena_new_qwen36_pp4127() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -456,6 +457,7 @@ mod tests {
     /// Smaller shape sanity-check.
     #[test]
     fn test_fa_proj_arena_new_small_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -471,6 +473,7 @@ mod tests {
     /// Zero-dim rejection.
     #[test]
     fn test_fa_proj_arena_new_zero_dim_rejected() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -488,6 +491,7 @@ mod tests {
     /// GQA divisibility: n_head=15 with n_kv=2 must be rejected.
     #[test]
     fn test_fa_proj_arena_new_gqa_divisibility_rejected() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -503,6 +507,7 @@ mod tests {
     /// validate_fits exact match returns Ok.
     #[test]
     fn test_fa_proj_validate_fits_exact_match() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -519,6 +524,7 @@ mod tests {
     /// validate_fits seq overrun returns Err.
     #[test]
     fn test_fa_proj_validate_fits_seq_overrun() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -534,6 +540,7 @@ mod tests {
     /// validate_fits shape mismatch returns Err for each axis.
     #[test]
     fn test_fa_proj_validate_fits_shape_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -554,6 +561,7 @@ mod tests {
     /// device.alloc_buffer zero-initializes all F32 buffers (iter61a guarantee).
     #[test]
     fn test_fa_proj_arena_buffers_zero_initialized() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {

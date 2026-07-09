@@ -437,6 +437,7 @@ mod tests {
 
     #[test]
     fn block_required_suffixes_cover_every_forward_pass_op() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Spot-check the suffix list matches what a nomic-bert block
         // forward pass actually needs. Changes here must update the
         // forward pass + this test in lockstep.
@@ -461,6 +462,7 @@ mod tests {
 
     #[test]
     fn block_optional_suffixes_are_biases_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Optional list must be biases — variants drop biases, never
         // weights. If a future variant turns out to drop a weight, the
         // model is genuinely incompatible and should error in the
@@ -472,6 +474,7 @@ mod tests {
 
     #[test]
     fn no_separate_qkv_in_required_suffixes() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // The whole point of the nomic-bert lane is that QKV is fused.
         // Lock that the required set does NOT regress to the BERT
         // separate-Q/K/V manifest.
@@ -486,6 +489,7 @@ mod tests {
 
     #[test]
     fn no_position_embd_in_required_stem() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // RoPE replaces the absolute position table. position_embd.weight
         // must NOT be required (it isn't even present in nomic GGUFs).
         // This test mirrors `validate_tensor_set`'s actual stem list to
@@ -507,6 +511,7 @@ mod tests {
 
     #[test]
     fn empty_loaded_weights_returns_errs_from_shortcuts() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("create device");
         let w = LoadedNomicBertWeights::empty(device);
         assert_eq!(w.len(), 0);
@@ -525,6 +530,7 @@ mod tests {
     /// per the GGUF dump in `bert.cpp` ADR-005 iter 75 notes.
     #[test]
     fn validate_tensor_set_passes_on_real_nomic_gguf() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = Path::new("/opt/hf2q/models/bert-test/nomic-embed-text-v1.5-f16.gguf");
         if !path.exists() {
             eprintln!("skipping: nomic GGUF fixture not at {}", path.display());
@@ -542,6 +548,7 @@ mod tests {
     /// validator is naming what's actually wrong, not just throwing).
     #[test]
     fn validate_tensor_set_rejects_bert_gguf_naming_missing_fused_tensor() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = Path::new("/opt/hf2q/models/bert-test/bge-small-en-v1.5-f16.gguf");
         if !path.exists() {
             eprintln!("skipping: bge GGUF fixture not at {}", path.display());
@@ -564,6 +571,7 @@ mod tests {
 
     #[test]
     fn synthetic_required_count_matches_layer_count() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = synthetic_cfg(2);
         // 3 stem (token_embd + 2 LN) + 9 per-block × 2 layers = 21.
         let stem = 3;

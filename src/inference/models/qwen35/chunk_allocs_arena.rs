@@ -251,6 +251,7 @@ mod tests {
     /// (Shape values consistent with the apex DWQ q4_0-flat fixture.)
     #[test]
     fn test_chunk_allocs_arena_new_qwen36_35b_pp4096() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -286,6 +287,7 @@ mod tests {
     /// Smaller shape sanity-check.
     #[test]
     fn test_chunk_allocs_arena_new_small_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -306,6 +308,7 @@ mod tests {
     /// Zero-dim rejection (each parameter individually).
     #[test]
     fn test_chunk_allocs_arena_new_zero_dim_rejected() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -325,6 +328,7 @@ mod tests {
     /// validate_fits exact match returns Ok.
     #[test]
     fn test_chunk_allocs_validate_fits_exact_match() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -344,6 +348,7 @@ mod tests {
     /// validate_fits seq overrun returns Err.
     #[test]
     fn test_chunk_allocs_validate_fits_seq_overrun() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -361,6 +366,7 @@ mod tests {
     /// validate_fits shape mismatch returns Err for each axis individually.
     #[test]
     fn test_chunk_allocs_validate_fits_shape_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -382,6 +388,7 @@ mod tests {
     /// rely on for safe re-use across DN layers in a prefill.
     #[test]
     fn test_chunk_allocs_arena_buffers_zero_initialised() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {
@@ -441,6 +448,7 @@ mod tests {
     /// F32→BF16 casts.
     #[test]
     fn test_chunk_allocs_q_k_expanded_same_size() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match device_or_skip() {
             Some(d) => d,
             None => {

@@ -638,6 +638,7 @@ mod tests {
 
     #[test]
     fn load_gemma4_mmproj_populates_arch_tensors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Real Gemma 4 mmproj (SigLIP variant): 356 tensors total —
         //   5 non-block (patch_embd, pos_embd, std_bias, std_scale, mm.0.weight)
         //   13/block × 27 blocks = 351
@@ -696,6 +697,7 @@ mod tests {
 
     #[test]
     fn load_gemma4_mmproj_patch_embd_has_expected_shape_and_values() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // `v.patch_embd.weight` in Gemma 4 is a 2D tensor [hidden,
         // 3*patch*patch] = [1152, 768] = 884,736 elements. The GGUF
         // stores it as F16 (per W58 iter-127 audit + gguf_dump.py
@@ -758,6 +760,7 @@ mod tests {
 
     #[test]
     fn load_from_path_wraps_gguf_open_and_device_create() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let path = Path::new(GEMMA4_MMPROJ_PATH);
         if !path.exists() {
             eprintln!("skipping: mmproj fixture not found at {}", GEMMA4_MMPROJ_PATH);
@@ -771,6 +774,7 @@ mod tests {
 
     #[test]
     fn accessors_return_err_with_specific_name_when_missing() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Synthetic LoadedMmprojWeights with an empty tensor map — every
         // accessor should return Err naming the missing tensor.
         let weights = LoadedMmprojWeights {
@@ -792,6 +796,7 @@ mod tests {
 
     #[test]
     fn empty_weights_report_len_zero_and_is_empty_true() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let weights = LoadedMmprojWeights {
             tensors: HashMap::new(),
             _device: MlxDevice::new().expect("device"),
@@ -802,6 +807,7 @@ mod tests {
 
     #[test]
     fn get_returns_none_for_absent_tensor() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let weights = LoadedMmprojWeights {
             tensors: HashMap::new(),
             _device: MlxDevice::new().expect("device"),
@@ -811,6 +817,7 @@ mod tests {
 
     #[test]
     fn position_embd_table_3d_rejects_non_3d_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Synthesize a LoadedMmprojWeights with a 2-D position-embd
         // (the SigLIP shape). The 3-D accessor must reject it cleanly.
         let device = MlxDevice::new().expect("device");
@@ -833,6 +840,7 @@ mod tests {
 
     #[test]
     fn position_embd_table_3d_rejects_first_dim_not_two() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let buf = device
             .alloc_buffer(96 * 4, mlx_native::DType::F32, vec![3, 4, 8])
@@ -853,6 +861,7 @@ mod tests {
 
     #[test]
     fn position_embd_table_3d_returns_dims_for_valid_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let pos_size = 27usize;
         let hidden = 1152usize;
@@ -873,6 +882,7 @@ mod tests {
 
     #[test]
     fn position_embd_table_3d_propagates_missing_tensor_error() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let weights = LoadedMmprojWeights::empty(device);
         let err = weights.position_embd_table_3d().unwrap_err();
@@ -881,6 +891,7 @@ mod tests {
 
     #[test]
     fn empty_constructor_produces_zero_tensor_weights() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // `empty(device)` is the pub constructor for test/scaffolding
         // call sites that need a LoadedMmprojWeights shape without a
         // real 400MB load. Should len == 0, is_empty == true, and
@@ -903,6 +914,7 @@ mod tests {
     /// the expected scalar.
     #[test]
     fn mm_0_clamp_scalar_accessors_round_trip_single_element_tensors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::DType;
         let device = MlxDevice::new().expect("device");
         let put = |tensors: &mut HashMap<String, MlxBuffer>,
@@ -941,6 +953,7 @@ mod tests {
     /// plain Linear, byte-equivalent to the no-clamp path).
     #[test]
     fn mm_0_clamp_scalar_accessors_return_none_when_absent() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let weights = LoadedMmprojWeights::empty(device);
         assert_eq!(weights.mm_0_input_min(), None);
@@ -1000,6 +1013,7 @@ mod tests {
 
     #[test]
     fn install_fused_attn_qkv_splits_weight_into_three_slice_views() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Single block, hidden=4 → fused weight is 3*4*4 = 48 floats.
         // Q chunk = floats [0..16] @ byte_offset 0,
         // K = [16..32] @ byte_offset 64 (16 floats × 4 bytes),
@@ -1060,6 +1074,7 @@ mod tests {
 
     #[test]
     fn install_fused_attn_qkv_handles_optional_bias() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // hidden=8, single block. Fused bias is 3*8 = 24 f32 values.
         // Q bias = [0..8] @ off 0; K bias = [8..16] @ off 32;
         // V bias = [16..24] @ off 64.
@@ -1107,6 +1122,7 @@ mod tests {
 
     #[test]
     fn install_fused_attn_qkv_split_only_is_a_noop() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Pre-existing split tensors must pass through untouched —
         // the helper is a no-op on split-only inputs.
         let device = MlxDevice::new().expect("device");
@@ -1125,6 +1141,7 @@ mod tests {
 
     #[test]
     fn install_fused_attn_qkv_rejects_mixed_block() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // A block with BOTH fused and split is a producer bug — the
         // validator catches it normally; this test guards the
         // defense-in-depth check inside the loader.
@@ -1152,6 +1169,7 @@ mod tests {
 
     #[test]
     fn install_fused_attn_qkv_rejects_undersized_fused_weight() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Fused weight that's smaller than 3*hidden*hidden floats is a
         // converter bug — slicing would silently return wrong data.
         // Reject loud.
@@ -1172,6 +1190,7 @@ mod tests {
 
     #[test]
     fn install_fused_attn_qkv_multi_block_batches_correctly() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Multi-block: every block independently slices its fused
         // tensor. Block N's Q view points at block N's storage at
         // byte_offset 0 — distinct backing storage from block M (M≠N).

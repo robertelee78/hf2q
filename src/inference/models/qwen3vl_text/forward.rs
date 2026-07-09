@@ -866,6 +866,7 @@ mod tests {
 
     #[test]
     fn sentinel_is_stable_across_iters() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // The sentinel value is part of the operator-facing contract.
         // The chat handler matches on this substring; changing it in a
         // refactor would silently break HTTP 501 dispatch.
@@ -877,6 +878,7 @@ mod tests {
 
     #[test]
     fn pending_err_carries_sentinel_substring() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let err: Result<()> = qwen3vl_text_forward_pending_err();
         let msg = format!("{:#}", err.unwrap_err());
         assert!(
@@ -891,6 +893,7 @@ mod tests {
 
     #[test]
     fn pending_err_message_is_operator_actionable() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let err: Result<()> = qwen3vl_text_forward_pending_err();
         let msg = format!("{:#}", err.unwrap_err());
         // Operator-actionable: tells them what works today.
@@ -908,6 +911,7 @@ mod tests {
     /// the argmax picks) is iter-10a's AC-3 deliverable.
     #[test]
     fn forward_text_prefill_shape_finite_when_operator_gated() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if std::env::var("HF2Q_QWEN3VL_LM_LOAD").ok().as_deref() != Some("1") {
             eprintln!("skip: HF2Q_QWEN3VL_LM_LOAD!=1");
             return;

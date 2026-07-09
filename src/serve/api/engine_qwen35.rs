@@ -2121,7 +2121,7 @@ pub fn generate_qwen35_once(
     // owned by the chat handler's post-decode pipeline, NOT this
     // function — see Wedge-3 PRD Phase D step 10 + the docstring above.
     let (content, reasoning_text) = match registration {
-        Some(reg) if reg.has_reasoning() => super::registry::split_full_output(reg, &decoded_text),
+        Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(reg, &decoded_text, params.reasoning_forced_open),
         _ => (decoded_text, None),
     };
 
@@ -2131,7 +2131,7 @@ pub fn generate_qwen35_once(
     // path's `reasoning_token_count` semantics.
     let reasoning_token_count = match registration {
         Some(reg) if reg.has_reasoning() => {
-            let mut sp = ReasoningSplitter::from_registration(reg);
+            let mut sp = super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
             let mut count = 0usize;
             for &tok in &generated_tokens {
                 let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
@@ -2488,14 +2488,14 @@ pub fn generate_qwen35_once_slot_aware(
     // `(content: String, reasoning_text: Option<String>)`.
     let (content_text, reasoning_text) = match registration {
         Some(reg) if reg.has_reasoning() => {
-            super::registry::split_full_output(reg, &decoded_text)
+            super::registry::split_full_output_forced(reg, &decoded_text, params.reasoning_forced_open)
         }
         _ => (decoded_text, None),
     };
     // Reasoning token count: same shape as generate_qwen35_once.
     let reasoning_token_count = match registration {
         Some(reg) if reg.has_reasoning() => {
-            let mut sp = ReasoningSplitter::from_registration(reg);
+            let mut sp = super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
             let mut count = 0usize;
             for &tok in &generated_tokens {
                 let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
@@ -2838,13 +2838,13 @@ impl Qwen35DecodeState {
     ) -> GenerationResult {
         let (content_text, reasoning_text) = match registration {
             Some(reg) if reg.has_reasoning() => {
-                super::registry::split_full_output(reg, &self.decoded_text)
+                super::registry::split_full_output_forced(reg, &self.decoded_text, self.params.reasoning_forced_open)
             }
             _ => (self.decoded_text.clone(), None),
         };
         let reasoning_token_count = match registration {
             Some(reg) if reg.has_reasoning() => {
-                let mut sp = ReasoningSplitter::from_registration(reg);
+                let mut sp = super::registry::make_reasoning_splitter(reg, self.params.reasoning_forced_open);
                 let mut count = 0usize;
                 for &tok in &self.generated_tokens {
                     let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
@@ -3235,7 +3235,7 @@ pub fn generate_stream_qwen35_once_extended_slot_aware(
 
     // ── Splitter wiring (Reasoning + ToolCall) ────────────────────
     // Mirror of generate_stream_qwen35_once_extended's splitter chain.
-    let mut reasoning_splitter = registration.and_then(ReasoningSplitter::from_registration);
+    let mut reasoning_splitter = registration.and_then(|r| super::registry::make_reasoning_splitter(r, params.reasoning_forced_open));
     let mut tool_splitter = registration.and_then(ToolCallSplitter::from_registration);
     let mut tool_call_body: String = String::new();
     let mut tool_call_index: usize = 0;
@@ -3864,13 +3864,13 @@ pub fn generate_qwen35_once_with_soft_tokens(
 
     // Reasoning split — same registry helper as generate_qwen35_once.
     let (content, reasoning_text) = match registration {
-        Some(reg) if reg.has_reasoning() => super::registry::split_full_output(reg, &decoded_text),
+        Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(reg, &decoded_text, params.reasoning_forced_open),
         _ => (decoded_text, None),
     };
 
     let reasoning_token_count = match registration {
         Some(reg) if reg.has_reasoning() => {
-            let mut sp = ReasoningSplitter::from_registration(reg);
+            let mut sp = super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
             let mut count = 0usize;
             for &tok in &generated_tokens {
                 let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
@@ -4144,13 +4144,13 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack(
     let decode_duration = decode_start.elapsed();
 
     let (content, reasoning_text) = match registration {
-        Some(reg) if reg.has_reasoning() => super::registry::split_full_output(reg, &decoded_text),
+        Some(reg) if reg.has_reasoning() => super::registry::split_full_output_forced(reg, &decoded_text, params.reasoning_forced_open),
         _ => (decoded_text, None),
     };
 
     let reasoning_token_count = match registration {
         Some(reg) if reg.has_reasoning() => {
-            let mut sp = ReasoningSplitter::from_registration(reg);
+            let mut sp = super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
             let mut count = 0usize;
             for &tok in &generated_tokens {
                 let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
@@ -4778,7 +4778,7 @@ pub fn generate_stream_qwen35_once_extended(
     };
 
     // ── Splitter wiring (Reasoning + ToolCall) ────────────────────
-    let mut reasoning_splitter = registration.and_then(ReasoningSplitter::from_registration);
+    let mut reasoning_splitter = registration.and_then(|r| super::registry::make_reasoning_splitter(r, params.reasoning_forced_open));
     let mut tool_splitter = registration.and_then(ToolCallSplitter::from_registration);
     let mut tool_call_body: String = String::new();
     let mut tool_call_index: usize = 0;
@@ -5713,14 +5713,14 @@ pub fn generate_qwen35_once_with_soft_tokens_slot_aware(
     // Reasoning split — mirror of generate_qwen35_once_with_soft_tokens.
     let (content, reasoning_text) = match registration {
         Some(reg) if reg.has_reasoning() => {
-            super::registry::split_full_output(reg, &decoded_text)
+            super::registry::split_full_output_forced(reg, &decoded_text, params.reasoning_forced_open)
         }
         _ => (decoded_text, None),
     };
 
     let reasoning_token_count = match registration {
         Some(reg) if reg.has_reasoning() => {
-            let mut sp = ReasoningSplitter::from_registration(reg);
+            let mut sp = super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
             let mut count = 0usize;
             for &tok in &generated_tokens {
                 let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
@@ -6058,14 +6058,14 @@ pub fn generate_qwen35_once_with_soft_tokens_and_deepstack_slot_aware(
 
     let (content, reasoning_text) = match registration {
         Some(reg) if reg.has_reasoning() => {
-            super::registry::split_full_output(reg, &decoded_text)
+            super::registry::split_full_output_forced(reg, &decoded_text, params.reasoning_forced_open)
         }
         _ => (decoded_text, None),
     };
 
     let reasoning_token_count = match registration {
         Some(reg) if reg.has_reasoning() => {
-            let mut sp = ReasoningSplitter::from_registration(reg);
+            let mut sp = super::registry::make_reasoning_splitter(reg, params.reasoning_forced_open);
             let mut count = 0usize;
             for &tok in &generated_tokens {
                 let frag = qwen.tokenizer.decode(&[tok], false).unwrap_or_default();
@@ -6453,7 +6453,7 @@ mod tests {
         // splitter doesn't know whether the prefill was text-only or
         // image-augmented — its only input is the per-token decoded
         // fragment.
-        let mut sp = _ReasoningSplitter::from_registration(&QWEN35)
+        let mut sp = super::super::registry::make_reasoning_splitter(&QWEN35, false)
             .expect("Qwen35 has reasoning markers");
         let mut all_pairs: Vec<(_SplitSlot, String)> = Vec::new();
         // Open marker spans a fragment boundary to exercise the

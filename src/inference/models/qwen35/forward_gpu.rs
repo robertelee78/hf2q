@@ -6444,6 +6444,7 @@ mod tests {
 
     #[test]
     fn chain_n_for_27b_dense_q4km_returns_4() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 27B-DWQ46 (qwen3.6-27B dense Q4_K_M): peak inverted-U at cn=4 (+3.91pp).
         use mlx_native::ops::quantized_matmul_ggml::GgmlType;
         assert_eq!(
@@ -6454,6 +6455,7 @@ mod tests {
 
     #[test]
     fn chain_n_for_dwq46_moe_q4km_returns_2() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // 35B-DWQ46 (Qwen3.5/3.6 MoE Q4_K_M): cn=2 (+1.27pp), monotone-down beyond.
         use mlx_native::ops::quantized_matmul_ggml::GgmlType;
         assert_eq!(
@@ -6464,6 +6466,7 @@ mod tests {
 
     #[test]
     fn chain_n_for_apex_moe_q5_k_returns_2() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // iter51 (2026-04-29): 35B-apex (MoE Q5_K_M) — iter45-RESUMED N-curve
         // measured cn=2 optimum (+1.47pp vs cn=1 = 1.0628× vs 1.0481×).  Initially
         // deferred at iter45 because apex was a sister fixture (no primary win to
@@ -6478,6 +6481,7 @@ mod tests {
 
     #[test]
     fn chain_n_for_apex_moe_q6k_returns_1() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Apex GGUFs sometimes have Q6_K down — same MoE flat-negative regime.
         use mlx_native::ops::quantized_matmul_ggml::GgmlType;
         assert_eq!(
@@ -6488,6 +6492,7 @@ mod tests {
 
     #[test]
     fn chain_n_for_unknown_quant_returns_1() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Q8_0, F32, F16: conservative cn=1 (no measured win).
         // Q4_0 has fixture-specific arms (DenseQ Q4_0 → cn=4 per iter51,
         // MoeQ Q4_0 → cn=2 per iter45-RESUMED N-curve evidence).  See dedicated
@@ -6505,6 +6510,7 @@ mod tests {
 
     #[test]
     fn chain_n_for_27b_dense_q4_0_returns_4() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // iter51 (2026-04-29): 27b-dwq46 (dense Q4_0 per iter47) — iter45-RESUMED
         // N-curve measured cn=4 optimum, ties cn=8 at +0.70pp vs cn=1 catch-all
         // (1.0400× vs 1.0330×).  Initially deferred at iter45 because +0.70pp
@@ -6519,6 +6525,7 @@ mod tests {
 
     #[test]
     fn chain_n_for_dwq46_moe_q4_0_returns_2() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // iter45-RESUMED (2026-04-29) measured-optimum on coherent baseline:
         // dwq46 35B-MoE (Q4_0 expert blocks) at cn=2 = 1.0114× (+6.75pp vs
         // cn=1 = 0.9439×).  Sister fixtures unaffected: apex Q5_K stays cn=1,
@@ -6532,6 +6539,7 @@ mod tests {
 
     #[test]
     fn chain_n_for_other_arm_returns_1() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Dense F32 / F32-MoE / no-quant unit-test fixtures fall back to cn=1.
         assert_eq!(chain_n_for(FfnQuantArm::Other, None, false), 1);
         assert_eq!(chain_n_for(FfnQuantArm::Other, None, true), 1);
@@ -6539,6 +6547,7 @@ mod tests {
 
     #[test]
     fn chain_n_for_arm_cfg_mismatch_returns_1() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Defensive: if loaded weights say MoeQ but cfg.moe.is_none() (or vice versa),
         // fall through to cn=1 instead of trusting an inconsistent config.
         use mlx_native::ops::quantized_matmul_ggml::GgmlType;
@@ -6725,6 +6734,7 @@ mod tests {
     /// logits are all-zero.
     #[test]
     fn forward_gpu_zero_model_returns_correct_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = tiny_hybrid_cfg();
         let m = Qwen35Model::empty_from_cfg(cfg.clone());
         let tokens = vec![0u32, 1, 2];
@@ -6754,6 +6764,7 @@ mod tests {
     /// Determinism: same model + tokens + positions → same logits bit-for-bit.
     #[test]
     fn forward_gpu_deterministic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
         let tokens = vec![3u32, 7, 1];
@@ -6790,6 +6801,7 @@ mod tests {
     /// Rejects empty tokens.
     #[test]
     fn forward_gpu_rejects_empty_tokens() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = tiny_hybrid_cfg();
         let m = Qwen35Model::empty_from_cfg(cfg.clone());
         let device = MlxDevice::new().expect("device");
@@ -6801,6 +6813,7 @@ mod tests {
     /// Rejects positions length mismatch.
     #[test]
     fn forward_gpu_rejects_positions_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = tiny_hybrid_cfg();
         let m = Qwen35Model::empty_from_cfg(cfg.clone());
         let device = MlxDevice::new().expect("device");
@@ -6820,6 +6833,7 @@ mod tests {
     /// accumulated error.
     #[test]
     fn forward_gpu_matches_cpu_ref() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
 
@@ -6891,6 +6905,7 @@ mod tests {
     /// of zeros, which is a degenerate case).
     #[test]
     fn forward_embed_last_returns_l2_normalized_hidden_size_vector() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
         let tokens = vec![3u32, 7, 1];
@@ -6928,6 +6943,7 @@ mod tests {
     /// Wedge-3 / iter-216 Phase A: `forward_embed_last` rejects empty tokens.
     #[test]
     fn forward_embed_last_rejects_empty_tokens() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = tiny_hybrid_cfg();
         let m = Qwen35Model::empty_from_cfg(cfg.clone());
         let device = MlxDevice::new().expect("device");
@@ -6982,6 +6998,7 @@ mod tests {
     /// is not silently bypassed).
     #[test]
     fn qwen35_generate_with_soft_tokens_smoke() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
         let h = cfg.hidden_size as usize;
@@ -7072,6 +7089,7 @@ mod tests {
     /// positions outside `range`.
     #[test]
     fn qwen35_soft_token_range_only_overrides_embed() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::models::qwen35::io_heads::embed_tokens as cpu_embed_tokens;
 
         let m = tiny_hybrid_model_nonzero();
@@ -7161,6 +7179,7 @@ mod tests {
     /// tokens.len()) and assert it errors with a clear message.
     #[test]
     fn qwen35_no_implemented_error_on_soft_token_request() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
         let h = cfg.hidden_size as usize;
@@ -7286,6 +7305,7 @@ mod tests {
     /// zero-overhead pin: the new entry point with `None` adds no work.
     #[test]
     fn qwen35_deepstack_none_byte_identical_to_text_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
         let device = MlxDevice::new().expect("device");
@@ -7329,6 +7349,7 @@ mod tests {
     /// every per-layer image_token_residual_add dispatch.
     #[test]
     fn qwen35_deepstack_zero_chunks_byte_identical() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
         let device = MlxDevice::new().expect("device");
@@ -7381,6 +7402,7 @@ mod tests {
     /// reaches `hidden` and the injection is not silently bypassed.
     #[test]
     fn qwen35_deepstack_layer_il0_changes_logits_vs_no_injection() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
         let h = cfg.hidden_size as usize;
@@ -7448,6 +7470,7 @@ mod tests {
     /// their layer is >= n_deepstack.
     #[test]
     fn qwen35_deepstack_layers_past_n_unaffected() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
         let h = cfg.hidden_size as usize;
@@ -7520,6 +7543,7 @@ mod tests {
     /// range-validation pattern.
     #[test]
     fn qwen35_deepstack_validates_oob_position() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
         let h = cfg.hidden_size as usize;
@@ -7557,6 +7581,7 @@ mod tests {
     /// must error before any GPU dispatch.
     #[test]
     fn qwen35_deepstack_validates_chunk_size() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
         let h = cfg.hidden_size as usize;
@@ -7606,6 +7631,7 @@ mod tests {
     /// Runtime-skips when the Qwen 3.6 27B-DWQ46 GGUF is absent.
     #[test]
     fn phase_b2a_chunked_kv_cache_divergence_diagnostic() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use crate::inference::models::qwen35::tokenizer::build_tokenizer_from_gguf;
         use crate::inference::models::qwen35::model::Qwen35Model;
         use crate::serve::header::LoadProgress;
@@ -8039,6 +8065,7 @@ mod tests {
     /// contract that iter-2.5 M3 promised.
     #[test]
     fn b4a_forward_gpu_at_slot_0_n_seqs_4_byte_identical_to_n_seqs_1() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
@@ -8123,6 +8150,7 @@ mod tests {
     /// routing depends on.
     #[test]
     fn b4a_forward_gpu_slot_0_does_not_touch_slot_1_kv_region() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         let tokens = vec![3u32, 7, 1, 9];
@@ -8241,6 +8269,7 @@ mod tests {
     /// silently index past the allocated K/V region.
     #[test]
     fn b4a_forward_gpu_slot_out_of_range_errors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
@@ -8318,6 +8347,7 @@ mod tests {
     ///   1's path (per-slot isolation FALSIFIED on the cursor side).
     #[test]
     fn b4a_cont_forward_gpu_slot_1_succeeds_end_to_end() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
@@ -8439,6 +8469,7 @@ mod tests {
     ///   — a no-op kernel bind would also "preserve" slot 0).
     #[test]
     fn b4a_cont_forward_gpu_slot_isolation_raw_kv_byte_snapshot() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         // Two DIFFERENT prompts P and Q (different ids + different
@@ -8595,6 +8626,7 @@ mod tests {
     ///   N landed at a different per-token layout than slot 0's writes.
     #[test]
     fn b4a_cont_forward_gpu_same_prompt_in_slot_0_and_slot_1_produces_byte_identical_logits() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
@@ -8713,6 +8745,7 @@ mod tests {
     /// fine for pinning the gate placement.
     #[test]
     fn b4a_cont_1_tq_active_multi_slot_gated_at_build_gated_attn_layer_entry() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
@@ -8814,6 +8847,7 @@ mod tests {
     /// "byte-equivalent at slot 0" contract that ADR-040 §3.6 pledged.
     #[test]
     fn b4b_forward_gpu_last_logits_at_slot_0_n_seqs_4_byte_identical_to_n_seqs_1() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
@@ -8894,6 +8928,7 @@ mod tests {
     /// * `logits.len() != vocab_size` ⇒ OutputHeadMode::Last regressed.
     #[test]
     fn b4b_forward_gpu_last_logits_slot_1_succeeds_end_to_end() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
@@ -8981,6 +9016,7 @@ mod tests {
     ///   trivially).
     #[test]
     fn b4b_forward_gpu_last_logits_slot_isolation_raw_kv_byte_snapshot() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         // Two DIFFERENT prompts P and Q (different ids + different
@@ -9129,6 +9165,7 @@ mod tests {
     /// bounds check at `forward_gpu_impl` entry regressed.
     #[test]
     fn b4b_forward_gpu_last_logits_slot_out_of_range_errors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
@@ -9194,6 +9231,7 @@ mod tests {
     ///   propagation broke the variant's output mode.
     #[test]
     fn b4b_forward_gpu_all_decode_variants_accept_slot_n() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
@@ -9341,6 +9379,7 @@ mod tests {
     /// and SlotId(N>0) silently writes into slot 0's region.
     #[test]
     fn h137_n_seqs_hard_codes_lifted_in_gpu_delta_net_rs_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let src = std::fs::read_to_string("src/inference/models/qwen35/gpu_delta_net.rs")
             .expect("read gpu_delta_net.rs");
         // No more `let n_seqs = 1u32;` literals. All routed through
@@ -9410,6 +9449,7 @@ mod tests {
     /// regressed sibling discipline.
     #[test]
     fn h138_slot_0_byte_equivalence_with_linear_attn_layers_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
@@ -9473,6 +9513,7 @@ mod tests {
     /// `current_len[0] != 0` (slot leakage).
     #[test]
     fn h139_slot_1_succeeds_end_to_end_with_linear_attn_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_hybrid_model_nonzero();
         let cfg = m.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
@@ -9534,6 +9575,7 @@ mod tests {
     /// or `build_delta_net_layer_with_arena`.
     #[test]
     fn h140_forward_gpu_threads_slot_id_to_build_delta_net_layer_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let src = std::fs::read_to_string("src/inference/models/qwen35/forward_gpu.rs")
             .expect("read forward_gpu.rs");
         // Both the arena + non-arena prefill call sites must reference
@@ -9591,6 +9633,7 @@ mod tests {
     /// the autoreg branch.
     #[test]
     fn h141_chunk_and_autoreg_paths_both_lifted_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let src = std::fs::read_to_string("src/inference/models/qwen35/gpu_delta_net.rs")
             .expect("read gpu_delta_net.rs");
         // `narrow_la_ping_pong_to_slot` is called at the *top* of each
@@ -9650,6 +9693,7 @@ mod tests {
     /// byte-identical result is unaffected by the A2b-cont changes.
     #[test]
     fn h142_qwen35_full_attn_only_unchanged_by_a2b_cont_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         let tokens = vec![5u32, 10, 15, 20];
@@ -9742,6 +9786,7 @@ mod tests {
     /// silently regressing to `SlotId(0)`.
     #[test]
     fn h167_forward_gpu_greedy_threads_slot_id_to_all_4_internal_sites_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let body = std::fs::read_to_string("src/inference/models/qwen35/forward_gpu.rs")
             .expect("read forward_gpu.rs");
         // Locate the `pub fn forward_gpu_greedy(` declaration + walk
@@ -9814,6 +9859,7 @@ mod tests {
     /// > 1 allocation regressed the slot-0 path.
     #[test]
     fn h168_forward_gpu_greedy_slot_0_byte_equivalent_at_n_seqs_4_vs_1_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         // forward_gpu_greedy requires seq_len == 1.
@@ -9852,6 +9898,7 @@ mod tests {
     /// cursor fails to advance.
     #[test]
     fn h169_forward_gpu_greedy_slot_1_succeeds_end_to_end_at_n_seqs_4_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let m = tiny_dense_full_attn_model_nonzero_for_b4a();
         let cfg = m.cfg.clone();
         let token = 3u32;
@@ -9893,6 +9940,7 @@ mod tests {
     /// `with_slot_id`, or `new_with_eos_set_and_slot` missing.
     #[test]
     fn h170_spec_decode_carries_slot_id_field_and_builders_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let body = std::fs::read_to_string("src/inference/models/qwen35/spec_decode.rs")
             .expect("read spec_decode.rs");
         assert!(
@@ -9931,6 +9979,7 @@ mod tests {
     /// Source-grep pin.  Falsifier: either missing.
     #[test]
     fn h171_qwen35_dflash_target_carries_slot_id_field_and_ctor_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let body = std::fs::read_to_string("src/inference/spec_decode/dflash/qwen35_target.rs")
             .expect("read qwen35_target.rs");
         assert!(
@@ -9955,6 +10004,7 @@ mod tests {
     /// to a bare `SlotId(0)` hard-code.
     #[test]
     fn h172_qwen35_dflash_target_routes_slot_id_in_methods_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let body = std::fs::read_to_string("src/inference/spec_decode/dflash/qwen35_target.rs")
             .expect("read qwen35_target.rs");
         assert!(
@@ -10013,6 +10063,7 @@ mod tests {
     /// `Qwen35DFlashTarget::new_with_slot`.
     #[test]
     fn h173_gemma4_and_qwen3vl_unchanged_by_b4d_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Gemma 4 forward path body source-grep — must not reference
         // the Qwen35-scoped B4d symbols.
         let gemma4 = std::fs::read_to_string("src/serve/forward_prefill.rs")
@@ -10073,6 +10124,7 @@ mod tests {
 
     #[test]
     fn h143_gemma4_and_qwen3vl_forward_paths_unchanged_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let gemma4 = std::fs::read_to_string("src/serve/forward_prefill.rs")
             .expect("read forward_prefill.rs");
         assert!(
@@ -10153,6 +10205,7 @@ mod tests {
     /// re-fragment the centralization that §6.1.40 established.
     #[test]
     fn h213_gpu_delta_net_test_helpers_route_through_forward_dispatch_n_seqs_const_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let body = std::fs::read_to_string("src/inference/models/qwen35/gpu_delta_net.rs")
             .expect("read gpu_delta_net.rs");
 
@@ -10229,6 +10282,7 @@ mod tests {
     /// surface, but should not be the test-fixture preference).
     #[test]
     fn h214_spec_decode_tests_use_slot_aware_builders_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let body = std::fs::read_to_string("src/inference/models/qwen35/spec_decode.rs")
             .expect("read spec_decode.rs");
 
@@ -10271,6 +10325,7 @@ mod tests {
     /// Skip-mode: returns early if Metal is unavailable.
     #[test]
     fn h215_forward_gpu_greedy_multi_seq_stress_n_seqs_4_all_slots_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("[H215] skipping: no Metal device");
             return;
@@ -10357,6 +10412,7 @@ mod tests {
     /// Skip-mode: returns early if Metal is unavailable.
     #[test]
     fn h216_serial_fifo_byte_equivalence_preserved_by_cleanup_bundle_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("[H216] skipping: no Metal device");
             return;
@@ -10422,6 +10478,7 @@ mod tests {
     /// Falsifier: any of the production surfaces silently drifted.
     #[test]
     fn h217_production_code_unchanged_by_cleanup_bundle_2026_05_30() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // (a) Production reads of the const still present in
         // gpu_delta_net.rs (the 4 forward-path entry-point bodies
         // plus the centralized scope).

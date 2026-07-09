@@ -2053,6 +2053,7 @@ mod dense_placeholder_tests {
     /// "missing tensor" load-time bail.
     #[test]
     fn iter227_dense_placeholder_has_no_stacked_expert_buffers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match mlx_native::MlxDevice::new() {
             Ok(d) => d,
             Err(_) => {
@@ -2079,6 +2080,7 @@ mod dense_placeholder_tests {
     /// visibly wrong instead of producing plausible-looking garbage.
     #[test]
     fn iter227_dense_placeholder_zeros_scalar_metadata() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match mlx_native::MlxDevice::new() {
             Ok(d) => d,
             Err(_) => {
@@ -2104,6 +2106,7 @@ mod dense_placeholder_tests {
     /// don't exist on disk).
     #[test]
     fn iter227_dense_placeholder_buffers_are_one_element_each() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match mlx_native::MlxDevice::new() {
             Ok(d) => d,
             Err(_) => {

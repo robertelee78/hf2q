@@ -1225,6 +1225,10 @@ where
     // the `enable_thinking` Jinja kwarg; non-reasoning templates ignore
     // it.
     let enable_thinking = req.hf2q_enable_thinking.unwrap_or(false);
+    // ADR-005 iter-229 Decision 4: extra Jinja context vars (e.g.
+    // preserve_thinking) ride the whole render path; reserved-key
+    // validation happens inside the renderer and maps to 400.
+    let template_kwargs = req.chat_template_kwargs.as_ref();
     let (prompt_tokens, _prompt_len, summarized_messages, summary_tokens) =
         match apply_overflow_policy(
             engine,
@@ -1232,12 +1236,48 @@ where
             policy,
             req_tools,
             enable_thinking,
+            template_kwargs,
         )
         .await
         {
             Ok(r) => r,
             Err(resp) => return Err(resp),
         };
+    // ADR-005 iter-230 B: does the rendered prompt end inside an OPEN
+    // reasoning block (template-seeded `<think>\n`)? The generation-
+    // prompt tail is template-controlled and messages-independent
+    // (`add_generation_prompt` block renders after the message loop),
+    // so a minimal-transcript probe render yields the same tail as the
+    // real prompt without re-rendering the full transcript. Render
+    // failure → false (pre-iter-230 behavior).
+    let reasoning_forced_open = match super::registry::find_for(&req.model) {
+        Some(reg) => {
+            let probe_msgs = [super::schema::ChatMessage {
+                role: "user".to_string(),
+                content: Some(super::schema::MessageContent::Text("x".to_string())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }];
+            // Same tools + kwargs as the real render so the probe sees
+            // identical template branches. Probe failure PROPAGATES as a
+            // 400 (gate-3 r2: a silent `false` fallback could coexist
+            // with a successful real render and silently reintroduce the
+            // reasoning leak -- no-fallback rule). The real render
+            // already succeeded on a superset transcript, so a probe
+            // failure indicates template pathology the operator must see.
+            let rendered = render_chat_prompt_or_400(
+                engine.chat_template(),
+                &probe_msgs,
+                req_tools,
+                enable_thinking,
+                template_kwargs,
+            )?;
+            super::registry::prompt_seeds_reasoning_open(&rendered, &reg)
+        }
+        None => false,
+    };
     let max_tokens = req
         .max_completion_tokens
         .or(req.max_tokens)
@@ -1327,6 +1367,7 @@ where
         token_bytes: grammar_token_bytes,
         grammar_kind: effective_grammar_kind,
         tool_call_policy: tc_policy,
+        reasoning_forced_open,
     };
     // Vision soft-token expansion (Phase 2c Task #17 / iter-99).  When
     // the multimodal preflight produced ViT embeddings, locate the
@@ -2078,10 +2119,12 @@ async fn apply_overflow_policy(
     policy: super::schema::OverflowPolicy,
     tools: Option<&[super::schema::Tool]>,
     enable_thinking: bool,
+    template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> std::result::Result<(Vec<u32>, usize, Option<usize>, Option<usize>), Response> {
     use super::schema::OverflowPolicy;
 
-    let (tokens, n) = render_and_tokenize_for_overflow(engine, messages, tools, enable_thinking)?;
+    let (tokens, n) =
+        render_and_tokenize_for_overflow(engine, messages, tools, enable_thinking, template_kwargs)?;
     let ctx_len = match engine.context_length() {
         Some(c) => c,
         None => return Ok((tokens, n, None, None)), // no advertised ctx → trust the caller
@@ -2096,12 +2139,21 @@ async fn apply_overflow_policy(
             Err(ApiError::context_length_exceeded(ctx_len, n).into_response())
         }
         OverflowPolicy::TruncateLeft => {
-            let (t, n) =
-                apply_truncate_left(engine, messages, ctx_len, tokens, n, tools, enable_thinking)?;
+            let (t, n) = apply_truncate_left(
+                engine,
+                messages,
+                ctx_len,
+                tokens,
+                n,
+                tools,
+                enable_thinking,
+                template_kwargs,
+            )?;
             Ok((t, n, None, None))
         }
         OverflowPolicy::Summarize => {
-            apply_summarize(engine, messages, ctx_len, tools, enable_thinking).await
+            apply_summarize(engine, messages, ctx_len, tools, enable_thinking, template_kwargs)
+                .await
         }
     }
 }
@@ -2119,23 +2171,15 @@ fn render_and_tokenize_for_overflow(
     msgs: &[super::schema::ChatMessage],
     tools: Option<&[super::schema::Tool]>,
     enable_thinking: bool,
+    template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<(Vec<u32>, usize), Response> {
-    let rendered = match engine::render_chat_prompt_with_tools(
+    let rendered = render_chat_prompt_or_400(
         engine.chat_template(),
         msgs,
         tools,
         enable_thinking,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "chat template render failed");
-            return Err(ApiError::invalid_request(
-                format!("chat template render failed: {e}"),
-                Some("messages".into()),
-            )
-            .into_response());
-        }
-    };
+        template_kwargs,
+    )?;
     let encoding = match engine.tokenizer().encode(rendered.as_str(), false) {
         Ok(e) => e,
         Err(e) => {
@@ -2146,6 +2190,31 @@ fn render_and_tokenize_for_overflow(
     let tokens: Vec<u32> = encoding.get_ids().to_vec();
     let n = tokens.len();
     Ok((tokens, n))
+}
+
+/// Render the chat template or map the failure to the 400 an external
+/// client sees. Engine-free seam so AC5 (ADR-005 iter-229) can assert
+/// the full HTTP envelope — status + body — without a loaded model.
+///
+/// `{e:#}` (alternate) prints the whole anyhow chain so the template's
+/// own `raise_exception` message reaches the 400 body instead of only
+/// the outermost "Failed to render chat template" context.
+fn render_chat_prompt_or_400(
+    template: &str,
+    msgs: &[super::schema::ChatMessage],
+    tools: Option<&[super::schema::Tool]>,
+    enable_thinking: bool,
+    template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<String, Response> {
+    engine::render_chat_prompt_with_tools(template, msgs, tools, enable_thinking, template_kwargs)
+        .map_err(|e| {
+            tracing::warn!(error = %e, "chat template render failed");
+            ApiError::invalid_request(
+                format!("chat template render failed: {e:#}"),
+                Some("messages".into()),
+            )
+            .into_response()
+        })
 }
 
 /// TruncateLeft branch helper. Iteratively drop oldest non-system
@@ -2159,16 +2228,17 @@ fn apply_truncate_left(
     initial_n: usize,
     tools: Option<&[super::schema::Tool]>,
     enable_thinking: bool,
+    template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<(Vec<u32>, usize), Response> {
     let outcome = truncate_left(messages, ctx_len, |msgs| {
-        render_and_tokenize_for_overflow(engine, msgs, tools, enable_thinking)
+        render_and_tokenize_for_overflow(engine, msgs, tools, enable_thinking, template_kwargs)
             .map(|(_, n)| n)
             .map_err(|r| r)
     });
     match outcome {
         TruncateOutcome::Fits(_, _) => Ok((initial_tokens, initial_n)),
         TruncateOutcome::Truncated(shrunk, _, _) => {
-            render_and_tokenize_for_overflow(engine, &shrunk, tools, enable_thinking)
+            render_and_tokenize_for_overflow(engine, &shrunk, tools, enable_thinking, template_kwargs)
         }
         TruncateOutcome::CannotShrink { ctx_len, actual } => {
             Err(ApiError::context_length_exceeded(ctx_len, actual).into_response())
@@ -2194,13 +2264,14 @@ async fn apply_summarize(
     ctx_len: usize,
     tools: Option<&[super::schema::Tool]>,
     enable_thinking: bool,
+    template_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<(Vec<u32>, usize, Option<usize>, Option<usize>), Response> {
     let split = split_for_summarize(messages, SUMMARIZE_KEEP_RECENT_MSGS);
     if split.summary_window.is_empty() {
         // Nothing to summarize — fall through to truncate_left without
         // populating the summarize-specific transparency counters.
         let (initial_tokens, initial_n) =
-            render_and_tokenize_for_overflow(engine, messages, tools, enable_thinking)?;
+            render_and_tokenize_for_overflow(engine, messages, tools, enable_thinking, template_kwargs)?;
         let (t, n) = apply_truncate_left(
             engine,
             messages,
@@ -2209,6 +2280,7 @@ async fn apply_summarize(
             initial_n,
             tools,
             enable_thinking,
+            template_kwargs,
         )?;
         return Ok((t, n, None, None));
     }
@@ -2246,8 +2318,11 @@ async fn apply_summarize(
     // tools so the summarizer's own tiny conversation doesn't get any
     // tool-declaration overhead, and `false` for `enable_thinking` so
     // the summarizer doesn't burn budget on its own thought channel.
+    // (kwargs deliberately not forwarded: the summarizer's internal
+    // 2-message conversation is not user-facing, same rationale as the
+    // `None`/`false` tools/thinking args.)
     let (summary_prompt_tokens, summary_prompt_n) =
-        render_and_tokenize_for_overflow(engine, &summary_request_msgs, None, false)?;
+        render_and_tokenize_for_overflow(engine, &summary_request_msgs, None, false, None)?;
 
     // Sanity: the summary prompt + completion budget must itself fit.
     // If not, the summary window is too long for a one-shot summary
@@ -2255,7 +2330,7 @@ async fn apply_summarize(
     // on the original message list.
     if summary_prompt_n + SUMMARIZE_MAX_TOKENS >= ctx_len {
         let (initial_tokens, initial_n) =
-            render_and_tokenize_for_overflow(engine, messages, tools, enable_thinking)?;
+            render_and_tokenize_for_overflow(engine, messages, tools, enable_thinking, template_kwargs)?;
         let (t, n) = apply_truncate_left(
             engine,
             messages,
@@ -2264,6 +2339,7 @@ async fn apply_summarize(
             initial_n,
             tools,
             enable_thinking,
+            template_kwargs,
         )?;
         return Ok((t, n, None, None));
     }
@@ -2279,8 +2355,13 @@ async fn apply_summarize(
             let text = result.text.trim().to_string();
             if text.is_empty() {
                 tracing::warn!("summarize produced empty text; falling back to truncate_left");
-                let (initial_tokens, initial_n) =
-                    render_and_tokenize_for_overflow(engine, messages, tools, enable_thinking)?;
+                let (initial_tokens, initial_n) = render_and_tokenize_for_overflow(
+                    engine,
+                    messages,
+                    tools,
+                    enable_thinking,
+                    template_kwargs,
+                )?;
                 let (t, n) = apply_truncate_left(
                     engine,
                     messages,
@@ -2289,6 +2370,7 @@ async fn apply_summarize(
                     initial_n,
                     tools,
                     enable_thinking,
+                    template_kwargs,
                 )?;
                 return Ok((t, n, None, None));
             }
@@ -2318,7 +2400,7 @@ async fn apply_summarize(
     let summarized_count = split.summary_window.len();
 
     let (new_tokens, new_n) =
-        render_and_tokenize_for_overflow(engine, &new_messages, tools, enable_thinking)?;
+        render_and_tokenize_for_overflow(engine, &new_messages, tools, enable_thinking, template_kwargs)?;
     if new_n < ctx_len {
         return Ok((
             new_tokens,
@@ -2333,7 +2415,7 @@ async fn apply_summarize(
     // end. Keep the summarize-counters populated so the operator can
     // see in transparency headers what the policy attempted.
     let outcome = truncate_left(&new_messages, ctx_len, |msgs| {
-        render_and_tokenize_for_overflow(engine, msgs, tools, enable_thinking)
+        render_and_tokenize_for_overflow(engine, msgs, tools, enable_thinking, template_kwargs)
             .map(|(_, n)| n)
             .map_err(|r| r)
     });
@@ -2345,7 +2427,13 @@ async fn apply_summarize(
             Some(summary_completion_tokens),
         )),
         TruncateOutcome::Truncated(shrunk, _, _) => {
-            let (t, n) = render_and_tokenize_for_overflow(engine, &shrunk, tools, enable_thinking)?;
+            let (t, n) = render_and_tokenize_for_overflow(
+                engine,
+                &shrunk,
+                tools,
+                enable_thinking,
+                template_kwargs,
+            )?;
             Ok((
                 t,
                 n,
@@ -3748,6 +3836,7 @@ mod compile_tool_grammar_precondition_tests {
             parallel_tool_calls: None,
             hf2q_overflow_policy: None,
             hf2q_enable_thinking: None,
+            chat_template_kwargs: None,
         }
     }
 
@@ -8760,6 +8849,7 @@ mod readiness_guard_tests {
             parallel_tool_calls: None,
             hf2q_overflow_policy: None,
             hf2q_enable_thinking: None,
+            chat_template_kwargs: None,
         };
 
         // The resolver must never be called — the readiness guard returns
@@ -8906,6 +8996,7 @@ mod pool_error_tests {
             parallel_tool_calls: None,
             hf2q_overflow_policy: None,
             hf2q_enable_thinking: None,
+            chat_template_kwargs: None,
         };
 
         // The resolver closure mimics what `resolve_engine_for_request` does
@@ -8990,6 +9081,7 @@ mod iter215_qwen35_chat_501_tests {
             parallel_tool_calls: None,
             hf2q_overflow_policy: None,
             hf2q_enable_thinking: None,
+            chat_template_kwargs: None,
         }
     }
 
@@ -9881,6 +9973,7 @@ mod a5d_handler_429_tests {
             parallel_tool_calls: None,
             hf2q_overflow_policy: None,
             hf2q_enable_thinking: None,
+            chat_template_kwargs: None,
         }
     }
 
@@ -10113,5 +10206,205 @@ mod a5d_handler_429_tests {
             "iter-A5d Critical #2: non-streaming handler body MUST \
              embed budget_bytes={budget_bytes} verbatim; got: {body_str}"
         );
+    }
+}
+
+/// ADR-005 iter-229 AC5: HTTP-level proof that each Qwen 3.6 template
+/// `raise_exception` site surfaces as a 400 whose body carries the
+/// template's own message. Drives `render_chat_prompt_or_400` — the
+/// exact seam `render_and_tokenize_for_overflow` uses on the chat
+/// endpoints — against the vendor qwen3-chatml fixture (byte-identical
+/// to the served qwen3.6 GGUF-embedded template), asserting the full
+/// wire envelope without needing a loaded model.
+#[cfg(test)]
+mod iter229_ac5_http_tests {
+    use super::render_chat_prompt_or_400;
+    use super::super::schema::{ChatMessage, MessageContent};
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: Some(MessageContent::Text(content.into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    async fn assert_400_with(msgs: Vec<ChatMessage>, expect: &str) {
+        let resp = render_chat_prompt_or_400(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &msgs,
+            None,
+            false,
+            None,
+        )
+        .expect_err("raise-site transcript must map to a Response");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "expect={expect}");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains(expect),
+            "400 body must carry the template's raise_exception message \
+             {expect:?}; got: {body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ac5_no_messages_400() {
+        assert_400_with(vec![], "No messages provided").await;
+    }
+
+    #[tokio::test]
+    async fn ac5_no_user_query_400() {
+        assert_400_with(vec![msg("system", "s")], "No user query found").await;
+    }
+
+    #[tokio::test]
+    async fn ac5_system_not_first_400() {
+        assert_400_with(
+            vec![msg("user", "u"), msg("system", "late")],
+            "System message must be at the beginning",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ac5_unexpected_role_400() {
+        assert_400_with(
+            vec![msg("user", "u"), msg("narrator", "x")],
+            "Unexpected message role",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ac5_reserved_kwarg_400_names_key() {
+        let mut kwargs = serde_json::Map::new();
+        kwargs.insert("bos_token".into(), serde_json::Value::Bool(true));
+        let resp = render_chat_prompt_or_400(
+            crate::core::chat_templates::QWEN3_CHATML,
+            &[msg("user", "hi")],
+            None,
+            false,
+            Some(&kwargs),
+        )
+        .expect_err("reserved kwarg must map to a Response");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("reserved chat_template_kwargs key") && body_str.contains("bos_token"),
+            "got: {body_str}"
+        );
+    }
+}
+
+/// ADR-005 iter-230 B: the handler computes `reasoning_forced_open` from
+/// a minimal-transcript probe render (the generation-prompt tail is
+/// template-controlled and messages-independent), so pin that the probe
+/// render agrees with the real render's tail for the vendor qwen
+/// template in both thinking modes.
+#[cfg(test)]
+mod iter230_b_probe_tests {
+    use super::super::registry;
+    use super::super::schema::{ChatMessage, MessageContent};
+
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: Some(MessageContent::Text(content.into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn probe_render_tail_matches_real_render_tail() {
+        // Both served templates, both thinking modes, with tools in
+        // scope (gate-3: probe must see the same template branches as
+        // the real render): the last 64 BYTES of the rendered prompts
+        // must be identical -- the generation-prompt tail is template-
+        // controlled and messages-independent. Detector agreement
+        // follows from tail equality; the expected qwen seed values are
+        // additionally pinned.
+        let qwen_reg = registry::find_for("qwen3.6-anything").expect("qwen registration");
+        let tools = vec![super::super::schema::Tool {
+            tool_type: "function".into(),
+            function: super::super::schema::ToolFunction {
+                name: "read_file".into(),
+                description: Some("Read a file".into()),
+                parameters: Some(serde_json::json!(
+                    {"type": "object", "properties": {"path": {"type": "string"}}}
+                )),
+            },
+        }];
+        let probe = [msg("user", "x")];
+        let real = [
+            msg("system", "You are an agent."),
+            msg("user", "Fix the bug in foo.rs"),
+            msg("assistant", "Done."),
+            msg("user", "Now add a test"),
+        ];
+        let gemma_tmpl =
+            include_str!("test_fixtures/gemma4-apex-embedded-chat-template.jinja");
+        for (tmpl, tmpl_name) in [
+            (crate::core::chat_templates::QWEN3_CHATML, "qwen3-chatml"),
+            (gemma_tmpl, "gemma4-apex-embedded"),
+        ] {
+            for enable_thinking in [true, false] {
+                let p = super::engine::render_chat_prompt_with_tools(
+                    tmpl,
+                    &probe,
+                    Some(&tools),
+                    enable_thinking,
+                    None,
+                )
+                .unwrap();
+                let r = super::engine::render_chat_prompt_with_tools(
+                    tmpl,
+                    &real,
+                    Some(&tools),
+                    enable_thinking,
+                    None,
+                )
+                .unwrap();
+                // Longest common byte-suffix of the two renders: must
+                // cover the whole template-controlled generation-prompt
+                // tail (>= 16 bytes for both served templates; message
+                // text differs before that).
+                let (pb, rb) = (p.as_bytes(), r.as_bytes());
+                let lcs = pb
+                    .iter()
+                    .rev()
+                    .zip(rb.iter().rev())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                assert!(
+                    lcs >= 16,
+                    "{tmpl_name} enable_thinking={enable_thinking}: probe \
+                     and real renders share only a {lcs}-byte suffix -- \
+                     the generation-prompt tail is not message-independent"
+                );
+                assert_eq!(
+                    registry::prompt_seeds_reasoning_open(&p, &qwen_reg),
+                    registry::prompt_seeds_reasoning_open(&r, &qwen_reg),
+                    "{tmpl_name} enable_thinking={enable_thinking}: \
+                     detector must agree between probe and real renders"
+                );
+                if tmpl_name == "qwen3-chatml" {
+                    assert_eq!(
+                        registry::prompt_seeds_reasoning_open(&r, &qwen_reg),
+                        enable_thinking,
+                        "qwen seed must be exactly enable_thinking"
+                    );
+                }
+            }
+        }
     }
 }

@@ -3705,12 +3705,14 @@ mod tests {
 
     #[test]
     fn conv_channels_moe_8192() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         assert_eq!(conv_channels_for(&cfg), 8192);
     }
 
     #[test]
     fn conv_channels_dense_10240() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = dense_cfg_64layer();
         assert_eq!(conv_channels_for(&cfg), 10240);
     }
@@ -3719,6 +3721,7 @@ mod tests {
     /// produces 10 full-attn slots + 30 linear-attn slots.
     #[test]
     fn moe_40layer_slot_counts() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         // Use small max_seq_len for quick alloc.
         let device = MlxDevice::new().expect("device");
@@ -3730,6 +3733,7 @@ mod tests {
 
     #[test]
     fn dense_64layer_slot_counts() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = dense_cfg_64layer();
         let device = MlxDevice::new().expect("device");
         let cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("alloc cache");
@@ -3739,6 +3743,7 @@ mod tests {
 
     #[test]
     fn layer_slot_lookup_matches_layer_types() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         let device = MlxDevice::new().expect("device");
         let cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("alloc");
@@ -3760,6 +3765,7 @@ mod tests {
 
     #[test]
     fn slot_lookup_out_of_range_none() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         let device = MlxDevice::new().expect("device");
         let cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("alloc");
@@ -3769,6 +3775,7 @@ mod tests {
 
     #[test]
     fn full_attn_slot_shape_and_dtype() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         let device = MlxDevice::new().expect("device");
         let cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("alloc");
@@ -3790,6 +3797,7 @@ mod tests {
 
     #[test]
     fn linear_attn_slot_shape_matches_kernel_layout() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         let device = MlxDevice::new().expect("device");
         let cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("alloc");
@@ -3809,6 +3817,7 @@ mod tests {
     /// owned slot reads as `0.0_f32` (bit pattern `0x0000_0000`).
     #[test]
     fn new_returns_zero_initialized_buffers_iter61a() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         let device = MlxDevice::new().expect("device");
         let cache = HybridKvCache::new(&cfg, &device, 64, 2).expect("alloc");
@@ -3871,6 +3880,7 @@ mod tests {
 
     #[test]
     fn reset_zeros_state_and_resets_cursors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         let device = MlxDevice::new().expect("device");
         let mut cache = HybridKvCache::new(&cfg, &device, 16, 2).expect("alloc");
@@ -3902,6 +3912,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_seqs() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         let device = MlxDevice::new().expect("device");
         assert!(HybridKvCache::new(&cfg, &device, 16, 0).is_err());
@@ -3910,6 +3921,7 @@ mod tests {
 
     #[test]
     fn total_bytes_matches_expected_footprint() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         let device = MlxDevice::new().expect("device");
         let cache = HybridKvCache::new(&cfg, &device, 32, 1).expect("alloc");
@@ -3940,6 +3952,7 @@ mod tests {
     /// after intervening mutation.
     #[test]
     fn hybrid_kv_cache_snapshot_round_trip_preserves_bytes() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         let device = MlxDevice::new().expect("device");
         let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("alloc");
@@ -4056,6 +4069,7 @@ mod tests {
     /// (6) Assert slot.tq.k_packed bytes match original canary.
     #[test]
     fn hybrid_kv_cache_snapshot_round_trip_preserves_tq_bytes() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -4137,6 +4151,7 @@ mod tests {
     /// the TQ branch.
     #[test]
     fn hybrid_kv_cache_snapshot_restore_legacy_f32_unaffected_by_iter35() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -4175,6 +4190,7 @@ mod tests {
     /// — mutating the source post-snapshot leaves snapshot bytes intact.
     #[test]
     fn hybrid_kv_cache_snapshot_does_not_alias() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         let device = MlxDevice::new().expect("device");
         let mut cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("alloc");
@@ -4212,6 +4228,7 @@ mod tests {
     /// equals the cache it came from (snapshot owns the same shape × counts).
     #[test]
     fn hybrid_kv_cache_snapshot_total_bytes_matches_source() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let cfg = moe_cfg_40layer();
         let device = MlxDevice::new().expect("device");
         let cache = HybridKvCache::new(&cfg, &device, 16, 1).expect("alloc");
@@ -4242,6 +4259,7 @@ mod tests {
     /// mlx-native (test_gated_delta_net.rs).
     #[test]
     fn re_exported_cpu_ref_callable() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use mlx_native::ops::gated_delta_net::GatedDeltaNetParams;
 
         let p = GatedDeltaNetParams {
@@ -4271,6 +4289,7 @@ mod tests {
     ///   destination head M (different stride bases).
     #[test]
     fn partial_copy_slot_per_head_position_round_trip() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("MlxDevice");
         let n_seqs = 1usize;
         let n_kv_heads = 2usize;
@@ -4372,6 +4391,7 @@ mod tests {
     /// rank mismatch (rank-3 instead of rank-4).
     #[test]
     fn partial_copy_slot_rejects_wrong_rank() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("MlxDevice");
         let bad_src = device
             .alloc_buffer(64, DType::F32, vec![2, 4, 2]) // rank 3
@@ -4395,6 +4415,7 @@ mod tests {
     /// `n_tokens > capacity`.
     #[test]
     fn partial_copy_slot_rejects_overshoot() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("MlxDevice");
         let src = device
             .alloc_buffer(64, DType::F32, vec![1, 2, 4, 2])
@@ -4420,6 +4441,7 @@ mod tests {
 
     #[test]
     fn tq_norms_per_pos_for_qwen35_head_dim_256_is_one() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Qwen 3.5 / 3.6 production head_dim = 256 (verified by
         // Qwen35Config::head_dim default + APEX-Q5_K_M GGUF metadata).
         // Mirrors mlx-native `forward_mlx.rs:2326` formula exactly.
@@ -4439,6 +4461,7 @@ mod tests {
 
     #[test]
     fn tq_full_attn_buffers_alloc_byte_count_qwen36_apex_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -4482,6 +4505,7 @@ mod tests {
 
     #[test]
     fn tq_full_attn_buffers_byte_count_3p94x_smaller_than_f32() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -4525,6 +4549,7 @@ mod tests {
 
     #[test]
     fn tq_full_attn_buffers_alloc_rejects_zero_max_seq_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -4542,6 +4567,7 @@ mod tests {
 
     #[test]
     fn tq_full_attn_buffers_alloc_rejects_zero_n_seqs() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -4559,6 +4585,7 @@ mod tests {
 
     #[test]
     fn tq_full_attn_buffers_alloc_initializes_to_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // ADR-015 iter61a discipline: every owned GPU buffer must be
         // zero-initialized so the SDPA dispatch (iter-8) cannot read
         // recycled non-zero StorageModeShared bytes pre-write.
@@ -4594,6 +4621,7 @@ mod tests {
 
     #[test]
     fn hybrid_kv_cache_new_with_options_tq_off_keeps_tq_none_per_slot() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Default path (tq_kv_active=false): every full-attn slot has
         // tq=None. Mirrors the legacy `HybridKvCache::new(...)` behavior
         // exactly. This test pins the regression contract for all 71
@@ -4625,6 +4653,7 @@ mod tests {
 
     #[test]
     fn hybrid_kv_cache_new_with_options_tq_on_populates_tq_per_full_attn_slot() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // tq_kv_active=true: every full-attn slot gets a populated
         // TqFullAttnKvBuffers alongside its existing F32 K/V buffers
         // (shadow-cache pattern; iter-11 drops the F32 backing).
@@ -4671,6 +4700,7 @@ mod tests {
 
     #[test]
     fn hybrid_kv_cache_new_with_options_tq_on_byte_count_at_qwen36_apex_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Empirical byte-count parity at qwen36 35B-A3B-APEX shape:
         // each full-attn slot now holds ONLY TQ packed K+V (8.13 MB)
         // + TQ norms K+V (128 KB) = 8_519_680 bytes per slot.
@@ -4736,6 +4766,7 @@ mod tests {
 
     #[test]
     fn hybrid_kv_cache_new_with_options_tq_on_with_mtp_populates_mtp_tq() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Synthetic cfg with MTP enabled — the MTP full-attn slot
         // should ALSO get a populated tq when tq_kv_active=true.
         let device = match MlxDevice::new() {
@@ -4763,6 +4794,7 @@ mod tests {
 
     #[test]
     fn hybrid_kv_cache_tq_kv_active_field_matches_constructor_arg() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // The cache itself records its TQ-mode at construction. iter-29
         // (sub-iter 23c) keys the F32 K/V alloc branch off this field;
         // until then it must mirror `slot.tq.is_some()` for every
@@ -4835,6 +4867,7 @@ mod tests {
 
     #[test]
     fn encode_token_to_tq_errors_when_slot_lacks_tq_buffers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Mantra: fail loud, no silent fallback. Calling encode on a
         // legacy F32-only slot must error explicitly.
         let device = match MlxDevice::new() {
@@ -4871,6 +4904,7 @@ mod tests {
 
     #[test]
     fn encode_token_to_tq_writes_packed_at_write_pos_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Encode one token at write_pos=5 in a TQ-active slot. Verify:
         // - k_packed bytes at position 5 are non-zero (post-quant indices)
         // - k_packed bytes at OTHER positions (0..5, 6..) remain zero
@@ -4949,6 +4983,7 @@ mod tests {
 
     #[test]
     fn encode_token_to_tq_writes_positive_norms() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // After FWHT + L2-norm extraction, the stored norm scalar must
         // be > 0 for any non-zero input. This pins the norm pipeline.
         let device = match MlxDevice::new() {
@@ -5000,6 +5035,7 @@ mod tests {
 
     #[test]
     fn encode_token_to_tq_at_two_positions_writes_both_independently() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Encode token A at pos=2 then token B at pos=7 — both positions
         // must have populated bytes; positions 0,1,3,4,5,6,8+ stay zero.
         let device = match MlxDevice::new() {
@@ -5095,6 +5131,7 @@ mod tests {
 
     #[test]
     fn dispatch_tq_sdpa_errors_when_slot_lacks_tq_buffers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Mantra: fail loud, no silent fallback. Calling SDPA on a
         // legacy F32-only slot must error explicitly.
         let device = match MlxDevice::new() {
@@ -5140,6 +5177,7 @@ mod tests {
 
     #[test]
     fn dispatch_tq_sdpa_produces_finite_nonzero_output_at_qwen35_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Encode a single token's K, V via encode_token_to_tq, then
         // dispatch SDPA with kv_seq_len=1. Output must be:
         //   - finite (no NaN / no Inf)
@@ -5224,6 +5262,7 @@ mod tests {
 
     #[test]
     fn dispatch_tq_sdpa_two_position_kv_finite_output() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Encode TWO KV positions then dispatch SDPA with kv_seq_len=2.
         // Output must remain finite + non-zero at qwen35 shape.
         // Pins regression that the kernel correctly handles
@@ -5304,6 +5343,7 @@ mod tests {
 
     #[test]
     fn dispatch_tq_sdpa_rejects_kv_seq_len_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Defensive: kernel param validation propagates through the
         // wrapper.  kv_seq_len=0 must fail loud (kernel
         // validate_params rejects).
@@ -5447,6 +5487,7 @@ mod tests {
 
     #[test]
     fn dispatch_tq_sdpa_nrmse_vs_f32_baseline_under_threshold() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // **ITER-11 LITMUS TEST** — does the qwen35 TQ encode + GPU SDPA
         // pipeline produce numerically-correct outputs vs an F32 baseline?
         //
@@ -5657,6 +5698,7 @@ mod tests {
 
     #[test]
     fn encode_seq_tokens_to_tq_errors_when_slot_lacks_tq_buffers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -5693,6 +5735,7 @@ mod tests {
 
     #[test]
     fn encode_seq_tokens_to_tq_byte_equal_to_per_token_loop() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // **iter-14 equivalence test** — proves the multi-token
         // dispatch (`dispatch_hadamard_quantize_kv_hb_seq`) produces
         // byte-identical packed/norms output to a manual per-token
@@ -5851,6 +5894,7 @@ mod tests {
     /// coarse to catch a per-(h,t)-position dequant bug.
     #[test]
     fn dequant_seq_to_temp_f32_byte_equal_to_per_position_dispatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -6013,6 +6057,7 @@ mod tests {
     /// (5) Assert NRMSE < 0.15 (ADR-007 §F-0.3 threshold).
     #[test]
     fn dequant_seq_to_temp_f32_unrotated_recovers_original_within_nrmse_threshold() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -6151,6 +6196,7 @@ mod tests {
     /// (8) NRMSE(out_a, out_b) < 0.15 (ADR-007 §F-0.3 threshold).
     #[test]
     fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_nrmse_vs_f32() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::gpu_full_attn::{
             apply_flash_attn_prefill_seq_major_resume,
             apply_flash_attn_prefill_seq_major_resume_via_tq_cache,
@@ -6347,6 +6393,7 @@ mod tests {
     /// when caller passes a slot constructed without TQ buffers.
     #[test]
     fn apply_flash_attn_prefill_seq_major_resume_via_tq_cache_errors_when_slot_lacks_tq() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use super::super::gpu_full_attn::apply_flash_attn_prefill_seq_major_resume_via_tq_cache;
         let device = match MlxDevice::new() {
             Ok(d) => d,
@@ -6388,6 +6435,7 @@ mod tests {
     /// no fallback, no stub — Result::Err with clear context).
     #[test]
     fn dequant_seq_to_temp_f32_errors_when_slot_lacks_tq_buffers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -6419,6 +6467,7 @@ mod tests {
 
     #[test]
     fn encode_seq_tokens_to_tq_with_src_tok_offset_skips_leading_tokens() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Defensive: src_tok_offset > 0 must skip leading source tokens
         // (matches dispatch_hadamard_quantize_kv_seq semantics for the
         // 4-bit path). Encode tokens [2, 3] of a 5-token source into
@@ -6515,6 +6564,7 @@ mod tests {
 
     #[test]
     fn full_attn_bytes_breakdown_tq_off_only_f32_at_qwen36_8k() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Default F32 path at qwen36 8K shape: every full-attn slot has
         // F32 K + V (16 MB each at 1×2×8192×256×4 = 16,777,216 bytes per
         // buffer). TQ counts must be zero (no shadow-cache when env=0).
@@ -6544,6 +6594,7 @@ mod tests {
 
     #[test]
     fn full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_8k() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // ADR-027 Phase B iter-34 (sub-sub-iter 23c-β.5): TQ-only mode
         // (alloc-drop). F32 K+V backing absent (iter-34 alloc skip);
         // only TQ packed+norms allocated. Per slot:
@@ -6582,6 +6633,7 @@ mod tests {
 
     #[test]
     fn full_attn_bytes_breakdown_tq_on_drops_f32_at_qwen36_32k() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // ADR-027 Phase B iter-34 (sub-sub-iter 23c-β.5): TQ-only mode
         // at production-realistic 32K context. The dossier-quoted
         // 3.94× memory savings vs F32-only baseline:
@@ -6620,6 +6672,7 @@ mod tests {
 
     #[test]
     fn full_attn_bytes_breakdown_with_mtp_includes_mtp_slot() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // ADR-027 iter-34: MTP slot ALSO drops F32 in TQ mode and
         // contributes only TQ packed+norms to the breakdown.
         let device = match MlxDevice::new() {
@@ -6648,6 +6701,7 @@ mod tests {
 
     #[test]
     fn full_attn_bytes_breakdown_tq_off_returns_no_savings_ratio() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // F32-only mode: projected_iter19_savings_ratio() must return
         // None (no TQ buffers to compare against).
         let device = match MlxDevice::new() {
@@ -6667,6 +6721,7 @@ mod tests {
 
     #[test]
     fn dispatch_tq_sdpa_gpu_end_to_end_nrmse_vs_f32_baseline_under_threshold() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // **ITER-13 GPU LITMUS** — validates the FULL GPU chain:
         // (a) GPU encode (dispatch_hadamard_quantize_kv_hb)
         // (b) GPU Q pre-rotation (dispatch_fwht_sign_premult_f32_d256)
@@ -6826,6 +6881,7 @@ mod tests {
 
     #[test]
     fn hybrid_kv_cache_new_with_options_tq_off_with_mtp_keeps_mtp_tq_none() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Same MTP cfg but tq_kv_active=false: MTP slot has tq=None.
         // Ensures the MTP arm honors the flag identically to regular
         // full-attn slots.
@@ -6849,6 +6905,7 @@ mod tests {
 
     #[test]
     fn tq_full_attn_buffers_alloc_shape_at_n_seqs_2() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Defensive: prove the n_seqs outer axis is honored correctly
         // (Gemma's HbKvBuffers is 3-D; qwen35's 4-D shape is the new
         // contract).  Matters for spec-decode prefill where n_seqs > 1.
@@ -6879,6 +6936,7 @@ mod tests {
 
     #[test]
     fn ensure_la_capture_allocates_when_none_2026_05_21() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return, // Skip on systems without Metal.
@@ -6907,6 +6965,7 @@ mod tests {
 
     #[test]
     fn ensure_la_capture_idempotent_at_same_n_tokens_2026_05_21() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -6924,6 +6983,7 @@ mod tests {
 
     #[test]
     fn ensure_la_capture_reallocs_when_larger_2026_05_21() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -6942,6 +7002,7 @@ mod tests {
 
     #[test]
     fn ensure_la_capture_rejects_zero_2026_05_21() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -6954,6 +7015,7 @@ mod tests {
 
     #[test]
     fn rollback_la_to_copies_capture_slice_2026_05_21() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -7015,6 +7077,7 @@ mod tests {
 
     #[test]
     fn rollback_la_to_rejects_no_capture_2026_05_21() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -7032,6 +7095,7 @@ mod tests {
 
     #[test]
     fn rollback_la_to_rejects_out_of_range_idx_2026_05_21() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(_) => return,
@@ -7150,6 +7214,7 @@ mod tests {
     /// MTP lift ONLY.
     #[test]
     fn h1_hybrid_kv_cache_alloc_n_seqs_4_byte_scale() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("cpu device for test");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let max_seq_len = 64u32;
@@ -7381,6 +7446,7 @@ mod tests {
     /// complementary halves of the n_seqs lift coverage matrix.
     #[test]
     fn h1_tq_active_hybrid_kv_cache_alloc_n_seqs_4_byte_scale() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("cpu device for test");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let max_seq_len = 64u32;
@@ -7548,6 +7614,7 @@ mod tests {
     /// silently caps the value.
     #[test]
     fn qwen35_hybrid_kv_slot_count_matches_n_seqs() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let cache1 = HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc 1");
@@ -7562,6 +7629,7 @@ mod tests {
     /// shapes).
     #[test]
     fn qwen35_hybrid_kv_layout_is_separate_slots() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
@@ -7574,6 +7642,7 @@ mod tests {
     /// `LayoutNotSupported` masking the slot bug.
     #[test]
     fn qwen35_hybrid_kv_slot_out_of_range_errors_named() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
@@ -7606,6 +7675,7 @@ mod tests {
     /// iter-2a's trait surface only owns the cursor bookkeeping).
     #[test]
     fn qwen35_hybrid_kv_append_advances_target_slot_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
@@ -7630,6 +7700,7 @@ mod tests {
     /// Phase A2a), then exercises slots 0 and 2, then re-reads slot 1.
     #[test]
     fn qwen35_hybrid_kv_per_slot_isolation_n_seqs_4() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
@@ -7666,6 +7737,7 @@ mod tests {
     /// equivalence is broken at the trait-surface level.
     #[test]
     fn qwen35_hybrid_kv_byte_identical_at_slot_0_n_seqs_4_vs_1() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache1 = HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc 1");
@@ -7714,6 +7786,7 @@ mod tests {
     /// load-bearing for catching the regression.
     #[test]
     fn qwen35_hybrid_kv_seq_len_canonical_across_full_attn_layers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
@@ -7776,6 +7849,7 @@ mod tests {
     /// by `qwen35_hybrid_kv_drop_does_not_zero_recurrent_buffer_a2a`.
     #[test]
     fn qwen35_hybrid_kv_drop_resets_seq_len_for_target_slot_only() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
@@ -7827,6 +7901,7 @@ mod tests {
     /// surfaces here.
     #[test]
     fn qwen35_hybrid_kv_drop_does_not_zero_recurrent_buffer_a2a() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
@@ -7928,6 +8003,7 @@ mod tests {
     /// Iter-1 fixture parity contract.
     #[test]
     fn qwen35_hybrid_kv_fork_to_self_is_noop_ok() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
@@ -7964,6 +8040,7 @@ mod tests {
     /// pin lives at H158 + H163-H165.
     #[test]
     fn historical_qwen35_hybrid_kv_fork_cross_slot_closure_at_phase_a2c() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
@@ -8049,6 +8126,7 @@ mod tests {
     /// - conv capture bytes = n_seqs * n_tokens_max * per_seq_elems * 4
     #[test]
     fn h31_la_capture_buffer_byte_scale_n_seqs_4_2026_05_29() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let max_seq_len = 64u32;
@@ -8147,6 +8225,7 @@ mod tests {
     /// n_tokens_max*per_seq_elems]`.
     #[test]
     fn h32_la_capture_per_slot_write_isolation_2026_05_29() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let n_tokens_max = 4u32;
@@ -8240,6 +8319,7 @@ mod tests {
     /// conv_state region changed after rolling back ONLY slot 0.
     #[test]
     fn h33_rollback_la_to_per_slot_isolation_2026_05_29() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let n_tokens_max = 4u32;
@@ -8449,6 +8529,7 @@ mod tests {
     /// bit-exact.
     #[test]
     fn h34_rollback_la_to_n_seqs_1_byte_equivalence_2026_05_29() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let n_tokens_max = 4u32;
@@ -8577,6 +8658,7 @@ mod tests {
     /// "capture_states is None" message).
     #[test]
     fn h35_rollback_la_to_slot_out_of_range_typed_2026_05_29() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
 
@@ -8653,6 +8735,7 @@ mod tests {
     /// (b) slots 0, 2, 3 keep their seeded bytes verbatim.
     #[test]
     fn iter_c2d_cont_kernel_iter1_reset_for_slot_per_slot_isolation_2026_05_29() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let n_seqs: u32 = 4;
@@ -8810,6 +8893,7 @@ mod tests {
     /// with `SlotOutOfRange` + the iter cite in the message.
     #[test]
     fn iter_c2d_cont_kernel_iter1_reset_for_slot_bounds_typed_2026_05_29() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
@@ -8866,6 +8950,7 @@ mod tests {
     /// 3. dst's full-attn V bytes at slot region != src's V bytes.
     #[test]
     fn h158_qwen35_hybrid_kv_fork_seq_cross_slot_copies_full_attn_bytes() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let max_seq_len = 64u32;
@@ -8958,6 +9043,7 @@ mod tests {
     /// from the pre-fork snapshot.
     #[test]
     fn h163_qwen35_hybrid_kv_fork_seq_src_unchanged() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let max_seq_len = 64u32;
@@ -9023,6 +9109,7 @@ mod tests {
     /// H158 with the linear-attn surface.
     #[test]
     fn h164_qwen35_hybrid_kv_fork_seq_dst_matches_src_all_buffers() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let max_seq_len = 64u32;
@@ -9083,6 +9170,7 @@ mod tests {
     /// `current_len`) from src to dst.
     #[test]
     fn h165_qwen35_hybrid_kv_fork_seq_cursor_copied() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
@@ -9119,6 +9207,7 @@ mod tests {
     /// no-op per trait spec.
     #[test]
     fn h166_qwen35_hybrid_kv_fork_seq_typed_errors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = MlxDevice::new().expect("device");
         let cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
         let mut cache = HybridKvCache::new(&cfg, &device, 64, 4).expect("alloc");
@@ -9184,6 +9273,7 @@ mod tests {
     ///     CURRENT (scratch-named) buffer.
     #[test]
     fn la_ping_pong_per_slot_parity_semantics_2026_07_01() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let Ok(device) = MlxDevice::new() else {
             eprintln!("[skip] la_ping_pong_per_slot_parity_semantics — no Metal device");
             return;

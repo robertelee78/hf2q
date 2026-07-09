@@ -2373,6 +2373,7 @@ mod tests {
 
     #[test]
     fn prev_pow2_table() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         assert_eq!(prev_pow2(1), 1);
         assert_eq!(prev_pow2(2), 2);
         assert_eq!(prev_pow2(3), 2);
@@ -2385,6 +2386,7 @@ mod tests {
 
     #[test]
     fn cpu_ref_matches_known_value() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Hand-computed: input = [1, 2, 3, 4], gamma=[1,1,1,1], beta=[0,0,0,0],
         // eps = 0. mean = 2.5. var = ((1-2.5)² + (2-2.5)² + (3-2.5)² + (4-2.5)²)/4
         //                          = (2.25 + 0.25 + 0.25 + 2.25)/4 = 5/4 = 1.25.
@@ -2410,6 +2412,7 @@ mod tests {
 
     #[test]
     fn gpu_matches_cpu_on_synthetic_small_input() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -2437,6 +2440,7 @@ mod tests {
 
     #[test]
     fn gpu_constant_input_yields_bias_only_output() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // When input is constant per row, mean = x, var = 0 — so the
         // (x-mean) term zeroes and the output collapses to `beta`. eps is
         // irrelevant (var=0 + eps doesn't matter because the numerator
@@ -2471,6 +2475,7 @@ mod tests {
 
     #[test]
     fn gpu_matches_cpu_at_bge_small_hidden_384() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Deterministic pseudo-random input to exercise the full
         // reduction width without depending on a real model.
         if MlxDevice::new().is_err() {
@@ -2498,6 +2503,7 @@ mod tests {
 
     #[test]
     fn gpu_matches_cpu_at_mxbai_large_hidden_1024() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -2523,6 +2529,7 @@ mod tests {
 
     #[test]
     fn gpu_rejects_zero_dimensions() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         let device = match MlxDevice::new() {
             Ok(d) => d,
             Err(e) => {
@@ -2609,6 +2616,7 @@ mod tests {
 
     #[test]
     fn linear_no_bias_matches_cpu_on_small_input() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -2636,6 +2644,7 @@ mod tests {
 
     #[test]
     fn linear_with_bias_matches_cpu_on_small_input() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -2661,6 +2670,7 @@ mod tests {
 
     #[test]
     fn linear_at_bge_small_qkv_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -2692,6 +2702,7 @@ mod tests {
 
     #[test]
     fn linear_rejects_in_features_below_32() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -2722,6 +2733,7 @@ mod tests {
 
     #[test]
     fn linear_rejects_bias_size_mismatch() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -2772,6 +2784,7 @@ mod tests {
 
     #[test]
     fn gelu_cpu_ref_known_values() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // gelu(0) = 0; gelu(1) ≈ 0.8412; gelu(-1) ≈ -0.1588.
         let out = bert_gelu_cpu_ref(&[0.0, 1.0, -1.0]);
         assert!(out[0].abs() < 1e-6);
@@ -2781,6 +2794,7 @@ mod tests {
 
     #[test]
     fn gelu_gpu_matches_cpu_small_input() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -2797,6 +2811,7 @@ mod tests {
 
     #[test]
     fn gelu_gpu_matches_cpu_at_bge_small_ffn_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -2822,6 +2837,7 @@ mod tests {
 
     #[test]
     fn bias_add_gpu_matches_cpu_small() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -2911,6 +2927,7 @@ mod tests {
 
     #[test]
     fn cpu_ref_attention_simple_softmax() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         // Single-head, head_dim=4, seq=2. Q[0]=K[0], Q[1]=K[1], all
         // orthogonal → softmax should heavily prefer the matching key,
         // so out[s] ≈ V[s] for s in 0..2.
@@ -2937,6 +2954,7 @@ mod tests {
 
     #[test]
     fn attention_gpu_matches_cpu_at_synthetic_small_input() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -2968,6 +2986,7 @@ mod tests {
 
     #[test]
     fn attention_gpu_matches_cpu_at_bge_small_attention_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3003,6 +3022,7 @@ mod tests {
 
     #[test]
     fn attention_gpu_rejects_small_head_dim() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3037,6 +3057,7 @@ mod tests {
 
     #[test]
     fn encoder_block_gpu_matches_cpu_ref_at_minimal_shape() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3213,6 +3234,7 @@ mod tests {
 
     #[test]
     fn embed_gather_gpu_picks_correct_rows() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3302,6 +3324,7 @@ mod tests {
 
     #[test]
     fn embeddings_gpu_matches_cpu_with_token_types() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3392,6 +3415,7 @@ mod tests {
 
     #[test]
     fn embeddings_gpu_without_token_types_path_works() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3465,6 +3489,7 @@ mod tests {
 
     #[test]
     fn embeddings_rejects_inconsistent_token_types_args() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3507,6 +3532,7 @@ mod tests {
 
     #[test]
     fn pool_mean_gpu_matches_cpu_average() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3555,6 +3581,7 @@ mod tests {
 
     #[test]
     fn pool_cls_gpu_returns_first_row() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3595,6 +3622,7 @@ mod tests {
 
     #[test]
     fn pool_last_gpu_returns_last_row() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3653,6 +3681,7 @@ mod tests {
     /// The buggy seq_len-1 row would be row 7 = [28, 29, 30, 31].
     #[test]
     fn pool_last_padded_returns_valid_last_row_not_seq_len_minus_one() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3709,6 +3738,7 @@ mod tests {
     /// 5/8 of the correct value.
     #[test]
     fn pool_mean_padded_divides_by_valid_not_seq_len() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3765,6 +3795,7 @@ mod tests {
     /// regression guard ensuring the fix didn't break Cls.
     #[test]
     fn pool_cls_padded_still_returns_row_zero() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3812,6 +3843,7 @@ mod tests {
 
     #[test]
     fn l2_normalize_gpu_produces_unit_norm() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -3865,6 +3897,7 @@ mod tests {
 
     #[test]
     fn full_forward_gpu_produces_unit_norm_output_at_minimal_config() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -4100,6 +4133,7 @@ mod tests {
 
     #[test]
     fn full_forward_rejects_pooling_type_none() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -4151,6 +4185,7 @@ mod tests {
 
     #[test]
     fn full_forward_rejects_seq_len_below_floor() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -4196,6 +4231,7 @@ mod tests {
 
     #[test]
     fn encoder_block_rejects_hidden_not_divisible_by_num_heads() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         if MlxDevice::new().is_err() {
             eprintln!("skipping: no Metal device available");
             return;
@@ -4374,6 +4410,7 @@ mod tests {
     /// Skips when the bge GGUF isn't on disk.
     #[test]
     fn bge_full_forward_matches_llama_embedding_on_hello_world() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use std::path::Path;
         use mlx_native::gguf::GgufFile;
         use super::super::config::{BertConfig, PoolingType};
@@ -4488,6 +4525,7 @@ mod tests {
     /// positions leaks into row-0's hidden state.  Drift > 1e-5 = mask leak.
     #[test]
     fn bge_full_forward_padding_invariance_at_seq_lens_32_64_128_256_512() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use std::path::Path;
         use mlx_native::gguf::GgufFile;
         use super::super::config::BertConfig;
@@ -4851,6 +4889,7 @@ mod tests {
     /// matmul kernel at production-scale dimensions.
     #[test]
     fn mxbai_full_forward_matches_llama_embedding_on_hello_world() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use std::path::Path;
         use mlx_native::gguf::GgufFile;
         use super::super::config::{BertConfig, PoolingType};
@@ -4959,6 +4998,7 @@ mod tests {
     /// deeper attention stacks.
     #[test]
     fn mxbai_full_forward_padding_invariance_at_seq_lens_32_64_128_256_512() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
         use std::path::Path;
         use mlx_native::gguf::GgufFile;
         use super::super::config::BertConfig;
