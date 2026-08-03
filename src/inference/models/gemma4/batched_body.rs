@@ -224,6 +224,9 @@ pub(crate) mod catsplit {
         MoeOther = 11,
     }
     pub const LEN: usize = 12;
+    // Consumed only by the engine.rs bench/profiling tests (cfg(test));
+    // dead in the production bin build by design.
+    #[allow(dead_code)]
     pub const NAMES: [&str; LEN] = [
         "embed", "rms_norm", "dense_q_proj", "dense_k_proj", "dense_v_proj",
         "dense_o_proj", "attn_pre(qkv_norm_rope+vnorm+fwht)", "attention(kv_enc+flash)",
@@ -262,6 +265,8 @@ pub(crate) mod catsplit {
     }
 
     /// Snapshot `(name, total_ns, cb_count, dispatch_count)` per category.
+    // Consumed only by the engine.rs bench/profiling tests (cfg(test)).
+    #[allow(dead_code)]
     pub fn snapshot() -> Vec<(&'static str, u64, u64, u64)> {
         (0..LEN)
             .map(|i| {
@@ -276,6 +281,8 @@ pub(crate) mod catsplit {
     }
 
     /// Reset all buckets (called once before the timed decode).
+    // Consumed only by the engine.rs bench/profiling tests (cfg(test)).
+    #[allow(dead_code)]
     pub fn reset() {
         for i in 0..LEN {
             NS[i].store(0, Ordering::Relaxed);
@@ -313,6 +320,9 @@ pub(crate) mod host_phases {
         WorkerIter = 11,   // whole worker-loop iteration (admit+sched.step+decode+publish)
     }
     pub const LEN: usize = 12;
+    // Consumed only by the engine.rs bench/profiling tests (cfg(test));
+    // dead in the production bin build by design.
+    #[allow(dead_code)]
     pub const NAMES: [&str; LEN] = [
         "body_wait(sync)", "body_readback(hidden)", "lmhead_wait(sync)",
         "lmhead_readback(logits)", "sample_loop(argmax+detok+sched)", "gather+mount_clear",
@@ -337,10 +347,14 @@ pub(crate) mod host_phases {
         }
     }
 
+    // Consumed only by the engine.rs bench/profiling tests (cfg(test)).
+    #[allow(dead_code)]
     pub fn snapshot() -> Vec<(&'static str, u64)> {
         (0..LEN).map(|i| (NAMES[i], NS[i].load(Ordering::Relaxed))).collect()
     }
 
+    // Consumed only by the engine.rs bench/profiling tests (cfg(test)).
+    #[allow(dead_code)]
     pub fn reset() {
         for i in 0..LEN {
             NS[i].store(0, Ordering::Relaxed);

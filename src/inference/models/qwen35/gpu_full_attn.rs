@@ -11576,9 +11576,6 @@ mod tests {
 
         // neg_4: shape.attn.hidden_size != router element count (shape=2048 but router=128*4=512).
         {
-            let mut bad_shape = valid_shape;
-            bad_shape.attn.hidden_size = 2048;
-            bad_shape.moe.hidden_size = 2048;
             // Rebuild shape to pass validate() on its own — but cross-check will fail.
             // Note: head_dim=128 is unchanged, nq/nkv sizes may mismatch too but we'll
             // only hit cross-check first since shape validates attn.hidden_size >= 0.

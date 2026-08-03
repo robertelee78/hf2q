@@ -32,6 +32,7 @@ pub mod parser;
 pub mod sampler;
 pub mod json_schema;
 pub mod mask;
+pub mod regex_gbnf;
 pub mod serialize;
 
 #[allow(unused_imports)]

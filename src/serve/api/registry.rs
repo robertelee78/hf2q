@@ -1004,40 +1004,19 @@ fn parse_gemma4_tool_call(body: &str) -> Option<ParsedToolCall> {
     let close_idx = after_open.rfind('}')?;
     let kv_str = &after_open[..close_idx];
 
-    // Split on top-level commas — top-level meaning: not inside `<|"|>...<|"|>`.
-    let kvs = split_top_level_kvs(kv_str);
+    // iter-231b: split on top-level commas (depth-aware — commas inside
+    // nested `{...}`/`[...]` values do NOT split), then decode each value
+    // recursively so structured arguments survive as JSON objects/arrays
+    // in `arguments_json` instead of being mangled into string fields.
+    let kvs = split_gemma4_top_level(kv_str);
     let mut args = serde_json::Map::new();
     for kv in kvs {
-        let (k, v) = kv.split_once(':')?;
+        let (k, v) = split_gemma4_kv_once(kv)?;
         let key = k.trim().to_string();
         if key.is_empty() {
             return None;
         }
-        // Decode the value: if wrapped in `<|"|>...<|"|>`, treat as string;
-        // otherwise treat as JSON literal (number, bool, null).
-        let v = v.trim();
-        let json_val = if let Some(stripped) = v
-            .strip_prefix("<|\"|>")
-            .and_then(|s| s.strip_suffix("<|\"|>"))
-        {
-            serde_json::Value::String(stripped.to_string())
-        } else if let Ok(num) = v.parse::<i64>() {
-            serde_json::Value::from(num)
-        } else if let Ok(num) = v.parse::<f64>() {
-            serde_json::Value::from(num)
-        } else if v == "true" {
-            serde_json::Value::Bool(true)
-        } else if v == "false" {
-            serde_json::Value::Bool(false)
-        } else if v == "null" {
-            serde_json::Value::Null
-        } else {
-            // Fallback: treat unquoted bare-value as a string. Better to
-            // forward the model's intent than to drop the field. Logged at
-            // the call site so calibration drift is visible.
-            serde_json::Value::String(v.to_string())
-        };
-        args.insert(key, json_val);
+        args.insert(key, gemma4_value_to_json(v.trim()));
     }
     let arguments_json = serde_json::to_string(&serde_json::Value::Object(args))
         .ok()?;
@@ -1047,30 +1026,36 @@ fn parse_gemma4_tool_call(body: &str) -> Option<ParsedToolCall> {
     })
 }
 
-/// Split a Gemma 4 kv-list on top-level commas — i.e. commas NOT inside a
-/// `<|"|>...<|"|>` string-quote span. Lightweight scanner; does not handle
-/// nested objects (Gemma 4 doesn't emit them per the chat template).
-fn split_top_level_kvs(s: &str) -> Vec<&str> {
+/// Split a Gemma 4 kv-list / value-list on TOP-LEVEL commas — commas NOT
+/// inside a `<|"|>...<|"|>` string-quote span AND not nested inside
+/// `{...}`/`[...]` containers (iter-231b: the template's `format_argument`
+/// macro renders structured arguments, so the parser must be
+/// depth-aware; the pre-iter-231b string-only tracker mangled any nested
+/// value containing a comma).
+fn split_gemma4_top_level(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut in_str = false;
+    let mut depth: usize = 0;
     let bytes = s.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
-        // Detect `<|"|>` (5 bytes) at byte i.
-        if !in_str && bytes[i..].starts_with(b"<|\"|>") {
-            in_str = true;
+        // Detect `<|"|>` (5 bytes) at byte i (toggles string state).
+        if bytes[i..].starts_with(b"<|\"|>") {
+            in_str = !in_str;
             i += 5;
             continue;
         }
-        if in_str && bytes[i..].starts_with(b"<|\"|>") {
-            in_str = false;
-            i += 5;
-            continue;
-        }
-        if !in_str && bytes[i] == b',' {
-            out.push(&s[start..i]);
-            start = i + 1;
+        if !in_str {
+            match bytes[i] {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    out.push(&s[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
         }
         i += 1;
     }
@@ -1078,6 +1063,104 @@ fn split_top_level_kvs(s: &str) -> Vec<&str> {
         out.push(&s[start..]);
     }
     out
+}
+
+/// Split a Gemma 4 kv pair on its TOP-LEVEL `:` — the first colon that is
+/// neither inside a `<|"|>...<|"|>` string span nor inside nested
+/// `{...}`/`[...]` containers.  (Keys are bare identifiers, but a naive
+/// `split_once(':')` is still correct for them; this scanner exists so a
+/// STRING value containing `:` — e.g. a URL — can never confuse the
+/// boundary when the caller is reused on nested pairs whose values lead
+/// with a container.)
+fn split_gemma4_kv_once(s: &str) -> Option<(&str, &str)> {
+    let mut in_str = false;
+    let mut depth: usize = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"<|\"|>") {
+            in_str = !in_str;
+            i += 5;
+            continue;
+        }
+        if !in_str {
+            match bytes[i] {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth = depth.saturating_sub(1),
+                b':' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Recursively decode a Gemma 4 `format_argument`-rendered value into a
+/// `serde_json::Value` (iter-231b).
+///
+///   * `<|"|>...<|"|>`            → `Value::String`
+///   * `{k:v,...}`                → `Value::Object` (bare keys, recursive values)
+///   * `[v,...]`                  → `Value::Array` (recursive items)
+///   * integer / float / bool / null literals → corresponding `Value`
+///   * anything else              → `Value::String` fallback (forward the
+///     model's intent rather than dropping the field — pre-iter-231b
+///     contract for bare unknown values).
+fn gemma4_value_to_json(v: &str) -> serde_json::Value {
+    let v = v.trim();
+    if let Some(stripped) = v
+        .strip_prefix("<|\"|>")
+        .and_then(|s| s.strip_suffix("<|\"|>"))
+    {
+        return serde_json::Value::String(stripped.to_string());
+    }
+    if v.len() >= 2 && v.starts_with('{') && v.ends_with('}') {
+        let inner = &v[1..v.len() - 1];
+        let mut map = serde_json::Map::new();
+        if !inner.trim().is_empty() {
+            for kv in split_gemma4_top_level(inner) {
+                match split_gemma4_kv_once(kv) {
+                    Some((k, val)) => {
+                        let key = k.trim();
+                        if key.is_empty() {
+                            return serde_json::Value::String(v.to_string());
+                        }
+                        map.insert(key.to_string(), gemma4_value_to_json(val));
+                    }
+                    // Malformed pair (no colon): preserve the raw text
+                    // rather than dropping the field (fallback contract).
+                    None => return serde_json::Value::String(v.to_string()),
+                }
+            }
+        }
+        return serde_json::Value::Object(map);
+    }
+    if v.len() >= 2 && v.starts_with('[') && v.ends_with(']') {
+        let inner = &v[1..v.len() - 1];
+        if inner.trim().is_empty() {
+            return serde_json::Value::Array(Vec::new());
+        }
+        return serde_json::Value::Array(
+            split_gemma4_top_level(inner)
+                .into_iter()
+                .map(gemma4_value_to_json)
+                .collect(),
+        );
+    }
+    if let Ok(num) = v.parse::<i64>() {
+        return serde_json::Value::from(num);
+    }
+    if let Ok(num) = v.parse::<f64>() {
+        return serde_json::Value::from(num);
+    }
+    match v {
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        "null" => serde_json::Value::Null,
+        // Fallback: treat unquoted bare-value as a string. Better to
+        // forward the model's intent than to drop the field.
+        _ => serde_json::Value::String(v.to_string()),
+    }
 }
 
 /// Parse Qwen 3.5/3.6's `<function=NAME>\n<parameter=key>\nval\n</parameter>\n...\n</function>` body.
@@ -1231,9 +1314,10 @@ pub fn split_full_output_forced(
 /// Variants:
 /// - `TooManyRequiredKeys` — schema's `required` array exceeds the 8-key
 ///   cap; the O(2^N) permutation grammar would be unreasonably large.
-/// - `UnsupportedSchema` — parameter schema uses `array` or `object` type,
-///   which the wave-2.5 emitter does not support.  The caller should either
-///   remove the parameter or convert it to a JSON-encoded string.
+/// - `UnsupportedSchemaFeature` — a nested schema uses a feature the
+///   iter-231b recursive compiler cannot enforce (`allOf`, `$ref`/`$defs`,
+///   `pattern`, `not`, tuple-form `items`, container `enum` values,
+///   depth > 32).  The 400 names the feature and the dot-path.
 ///
 /// # ADR-005 Wave-2.7 design note
 /// The 8-key cap is the SOTA hard bound established by json_schema.rs
@@ -1242,6 +1326,14 @@ pub fn split_full_output_forced(
 /// hard-errors at >8, so a tool with 9–16 required keys would slip through
 /// registry.rs and be silently exposed to O(2^N) grammar growth before
 /// json_schema.rs caught it.  Both caps are now 8 — Q3 audit finding fixed.
+///
+/// # iter-231a/3.7 note
+/// The wave-2.5 `UnsupportedSchema` variant (B3 — hard rejection of
+/// `array`/`object` parameter types) is REMOVED: structured parameters
+/// compile to recursive value rules (iter-231a permissive free-form,
+/// iter-231b full-fidelity declared structure) instead of failing the
+/// entire request with HTTP 400.  Deleted as a unit per the no-fallback
+/// mantra — no call site may re-introduce a scalar-only gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmitterError {
     /// `required` array length exceeds `MAX_REQUIRED_KEYS` (8).
@@ -1249,12 +1341,12 @@ pub enum EmitterError {
         fn_name: String,
         count: usize,
     },
-    /// Parameter schema type is `array` or `object` — not supported by the
-    /// wave-2.5 scalar-only emitter.
-    UnsupportedSchema {
+    /// Nested schema feature the iter-231b recursive compiler cannot
+    /// enforce — see variant docs above.
+    UnsupportedSchemaFeature {
         fn_name: String,
-        param_name: String,
-        schema_type: String,
+        param_path: String,
+        feature: String,
     },
 }
 
@@ -1262,6 +1354,18 @@ pub enum EmitterError {
 /// Aligned with json_schema.rs ANY_ORDER_MAX_REQUIRED = 8 (ADR-005 W-ζ).
 /// Larger schemas return `EmitterError::TooManyRequiredKeys`.
 const MAX_REQUIRED_KEYS: usize = 8;
+
+/// iter-231b — recursion depth cap for nested parameter schemas.  JSON
+/// Schema cannot self-reference without `$ref` (rejected as an
+/// unsupported feature), so nesting is finite; this cap bounds the
+/// emitted grammar size against pathological deep schemas.
+const MAX_NESTED_DEPTH: usize = 32;
+
+/// iter-231b — property-count cap per nested object, mirroring
+/// json_schema.rs's 32-property bound (its `build_unified_inner` has the
+/// same shape).  Larger objects return
+/// `EmitterError::UnsupportedSchemaFeature`.
+const MAX_NESTED_PROPERTIES: usize = 32;
 
 impl std::fmt::Display for EmitterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1274,17 +1378,18 @@ impl std::fmt::Display for EmitterError {
                  split the tool",
                 fn_name, count, MAX_REQUIRED_KEYS
             ),
-            EmitterError::UnsupportedSchema {
+            EmitterError::UnsupportedSchemaFeature {
                 fn_name,
-                param_name,
-                schema_type,
+                param_path,
+                feature,
             } => write!(
                 f,
-                "function '{}' parameter '{}' uses unsupported schema type '{}'; \
-                 ADR-005 wave-2.5 limits tool args to scalars (string, integer, \
-                 number, boolean, null); remove the parameter or convert it to a \
-                 JSON-encoded string",
-                fn_name, param_name, schema_type
+                "function '{}' parameter '{}' uses unsupported schema feature \
+                 '{}'; the iter-231b nested compiler supports scalars, enums, \
+                 type-unions, anyOf/oneOf, object (properties/required<=8/\
+                 additionalProperties) and array (single-schema items); \
+                 rewrite the parameter schema or drop the feature",
+                fn_name, param_path, feature
             ),
         }
     }
@@ -1329,20 +1434,24 @@ fn gbnf_literal(s: &str) -> String {
 /// never emits those — it always uses `<|"|>` markers — so reusing the JSON
 /// string grammar would make valid Gemma 4 outputs fail the mask check.
 ///
-/// Returns `Err(EmitterError::UnsupportedSchema)` if the schema type is
-/// `array` or `object` (Wave 2.5 B3 — nested schemas rejected at emit time).
+/// iter-231a (B3 supersession): `array` and `object` types compile via the
+/// iter-231b recursive nested-schema converter (`gemma4_nested_value_rule`).
+/// The wave-2.5 B3 hard rejection (`EmitterError::UnsupportedSchema` →
+/// HTTP 400) made every tools-bearing request fail against tool schemas
+/// with free-form object parameters (MCP servers, nested schemas).
 fn gemma4_value_gbnf(
     fn_name: &str,
     param_name: &str,
     schema: &serde_json::Value,
-    _rules: &mut Vec<(String, String)>,
-    _rule_counter: &mut u32,
+    rules: &mut Vec<(String, String)>,
+    rule_counter: &mut u32,
 ) -> Result<String, EmitterError> {
     let obj = match schema.as_object() {
         Some(o) => o,
         None => {
-            // Untyped / unknown → accept any Gemma value (string or bare scalar).
-            return Ok("gemma4-any-val".to_string());
+            // Untyped / unknown → accept any Gemma value (string, bare
+            // scalar, or structured kv-list value).
+            return Ok(GEMMA4_TOP_ANY_VAL.to_string());
         }
     };
 
@@ -1372,27 +1481,370 @@ fn gemma4_value_gbnf(
             // (the marker opening byte).  This is conservative but correct:
             // string values in Gemma 4 tool calls never contain `<` per the
             // chat template's jinja escape of `<` in string args.
-            Ok("gemma4-str-val".to_string())
+            //
+            // iter-231c: `pattern` replaces the generic char* body with the
+            // compiled regex between the markers.
+            match compile_pattern(
+                fn_name,
+                &format!("/{}", param_name),
+                obj.get("pattern"),
+                crate::serve::api::grammar::regex_gbnf::Surface::GemmaMarkerString,
+            )? {
+                Some(body) => Ok(format!(
+                    "{} {} {}",
+                    gbnf_literal("<|\"|>"),
+                    body,
+                    gbnf_literal("<|\"|>")
+                )),
+                None => Ok("gemma4-str-val".to_string()),
+            }
         }
         "integer" => Ok("gemma4-int-val".to_string()),
         "number" => Ok("gemma4-num-val".to_string()),
         "boolean" => Ok("gemma4-bool-val".to_string()),
         "null" => Ok("gemma4-null-val".to_string()),
-        // Wave 2.5 B3: reject array and object types at emit time.
-        // The previous fallback silently treated these as strings, hiding the
-        // schema mismatch; the Chesterton reason to remove it is that it
-        // produces grammars that accept `<|"|>...<|"|>` for a parameter the
-        // schema declares as a structured list/object, masking bugs at the
-        // grammar layer while the model still emits malformed output.
-        "array" | "object" => Err(EmitterError::UnsupportedSchema {
-            fn_name: fn_name.to_string(),
-            param_name: param_name.to_string(),
-            schema_type: schema_type.to_string(),
-        }),
+        // iter-231b: structured types → full-fidelity recursive compiler.
+        "array" | "object" => gemma4_nested_value_rule(
+            fn_name,
+            &format!("/{}", param_name),
+            schema,
+            rules,
+            rule_counter,
+            1,
+        ),
         _ => {
-            // Unrecognised type string — fall through to any-val (conservative).
-            Ok("gemma4-any-val".to_string())
+            // Unrecognised type string — accept any value (conservative).
+            Ok(GEMMA4_TOP_ANY_VAL.to_string())
         }
+    }
+}
+
+/// Top-level value body for untyped / unknown-typed Gemma parameters:
+/// the template's `format_argument` renders strings (`<|"|>…<|"|>`),
+/// bare scalars, AND structured kv-list values, so all are accepted.
+const GEMMA4_TOP_ANY_VAL: &str =
+    "( gemma4-any-val | gemma4-json-obj | gemma4-json-arr )";
+
+/// iter-231b — recursive nested-schema compiler for Gemma 4 tool
+/// parameters (`format_argument` kv surface: strings `<|"|>…<|"|>`, bare
+/// keys at every nesting level via `escape_keys=False`, comma-separated,
+/// no whitespace).
+///
+/// Same contract as `qwen35_nested_value_rule` — constrain everything the
+/// schema DECLARES, stay open where the schema is open:
+///
+///   * scalars / enums / type-unions / anyOf / oneOf — exact bodies.
+///   * `object` with `properties` — declared keys with per-key value
+///     grammars; `required` (≤8) enforced any-order via permutation;
+///     optional keys follow in a Kleene suffix (top-level contract).
+///     `additionalProperties:false` closes the key set; unset/true adds
+///     a wildcard kv tail.
+///   * `object`/`array` with NO declared shape → the permissive
+///     recursive `gemma4-json-obj` / `gemma4-json-arr` rules.
+///   * `array` with `items` → typed item grammar; absent → permissive.
+///
+/// Same `EmitterError::UnsupportedSchemaFeature` rejection set and the
+/// same rejection-strength contract as the Qwen compiler (required keys
+/// + closed objects are strictly enforced; open objects carry the
+/// wildcard extra-kv caveat — see `qwen35_nested_value_rule`).
+fn gemma4_nested_value_rule(
+    fn_name: &str,
+    path: &str,
+    schema: &serde_json::Value,
+    rules: &mut Vec<(String, String)>,
+    rule_counter: &mut u32,
+    depth: usize,
+) -> Result<String, EmitterError> {
+    if depth > MAX_NESTED_DEPTH {
+        return Err(EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature: format!("nesting depth > {}", MAX_NESTED_DEPTH),
+        });
+    }
+    let obj = match schema.as_object() {
+        Some(o) => o,
+        None => return Ok("gemma4-json-val".to_string()),
+    };
+
+    for feat in [
+        "allOf",
+        "$ref",
+        "$defs",
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentSchemas",
+        "patternProperties",
+        "propertyNames",
+        "contains",
+    ] {
+        if obj.contains_key(feat) {
+            return Err(EmitterError::UnsupportedSchemaFeature {
+                fn_name: fn_name.to_string(),
+                param_path: path.to_string(),
+                feature: feat.to_string(),
+            });
+        }
+    }
+
+    for comb in ["anyOf", "oneOf"] {
+        if let Some(serde_json::Value::Array(subs)) = obj.get(comb) {
+            if subs.is_empty() {
+                return Err(EmitterError::UnsupportedSchemaFeature {
+                    fn_name: fn_name.to_string(),
+                    param_path: path.to_string(),
+                    feature: format!("empty {}", comb),
+                });
+            }
+            let mut alts: Vec<String> = Vec::with_capacity(subs.len());
+            for (i, s) in subs.iter().enumerate() {
+                alts.push(gemma4_nested_value_rule(
+                    fn_name,
+                    &format!("{}/{}/{}", path, comb, i),
+                    s,
+                    rules,
+                    rule_counter,
+                    depth + 1,
+                )?);
+            }
+            return Ok(format!("( {} )", alts.join(" | ")));
+        }
+    }
+
+    // enum → literal alternation.  Strings render as `<|"|>s<|"|>`
+    // (format_argument string branch); non-string scalars render bare
+    // (`1`, `true`, `null` — format_argument's else branch).  Container
+    // enum values are rejected (json_schema.rs parity).
+    if let Some(serde_json::Value::Array(values)) = obj.get("enum") {
+        if values.is_empty() {
+            return Err(EmitterError::UnsupportedSchemaFeature {
+                fn_name: fn_name.to_string(),
+                param_path: path.to_string(),
+                feature: "empty enum".to_string(),
+            });
+        }
+        let mut alts: Vec<String> = Vec::with_capacity(values.len());
+        for v in values {
+            match v {
+                serde_json::Value::String(s) => alts.push(format!(
+                    "{} {} {}",
+                    gbnf_literal("<|\"|>"),
+                    gbnf_literal(s),
+                    gbnf_literal("<|\"|>")
+                )),
+                serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {
+                    let text = serde_json::to_string(v).map_err(|e| {
+                        EmitterError::UnsupportedSchemaFeature {
+                            fn_name: fn_name.to_string(),
+                            param_path: path.to_string(),
+                            feature: format!("enum serialize: {}", e),
+                        }
+                    })?;
+                    alts.push(gbnf_literal(&text));
+                }
+                serde_json::Value::Null => alts.push(gbnf_literal("null")),
+                _ => {
+                    return Err(EmitterError::UnsupportedSchemaFeature {
+                        fn_name: fn_name.to_string(),
+                        param_path: path.to_string(),
+                        feature: "container enum value".to_string(),
+                    });
+                }
+            }
+        }
+        return Ok(format!("( {} )", alts.join(" | ")));
+    }
+
+    match obj.get("type") {
+        None => Ok("gemma4-json-val".to_string()),
+        Some(serde_json::Value::Array(types)) => {
+            let mut alts: Vec<String> = Vec::with_capacity(types.len());
+            for (i, t) in types.iter().enumerate() {
+                let Some(tstr) = t.as_str() else {
+                    return Err(EmitterError::UnsupportedSchemaFeature {
+                        fn_name: fn_name.to_string(),
+                        param_path: path.to_string(),
+                        feature: "non-string type union entry".to_string(),
+                    });
+                };
+                let mut stub = serde_json::Map::new();
+                stub.insert("type".into(), serde_json::Value::String(tstr.into()));
+                alts.push(gemma4_nested_value_rule(
+                    fn_name,
+                    &format!("{}/type/{}", path, i),
+                    &serde_json::Value::Object(stub),
+                    rules,
+                    rule_counter,
+                    depth + 1,
+                )?);
+            }
+            Ok(format!("( {} )", alts.join(" | ")))
+        }
+        Some(serde_json::Value::String(t)) => match t.as_str() {
+            "string" => {
+                // iter-231c: `pattern` constrains the marker-string content.
+                match compile_pattern(
+                    fn_name,
+                    path,
+                    obj.get("pattern"),
+                    crate::serve::api::grammar::regex_gbnf::Surface::GemmaMarkerString,
+                )? {
+                    Some(body) => Ok(format!(
+                        "{} {} {}",
+                        gbnf_literal("<|\"|>"),
+                        body,
+                        gbnf_literal("<|\"|>")
+                    )),
+                    None => Ok("gemma4-str-val".to_string()),
+                }
+            }
+            "integer" => Ok("gemma4-int-val".to_string()),
+            "number" => Ok("gemma4-num-val".to_string()),
+            "boolean" => Ok("gemma4-bool-val".to_string()),
+            "null" => Ok("gemma4-null-val".to_string()),
+            "object" => gemma4_nested_object(fn_name, path, obj, rules, rule_counter, depth),
+            "array" => gemma4_nested_array(fn_name, path, obj, rules, rule_counter, depth),
+            other => Err(EmitterError::UnsupportedSchemaFeature {
+                fn_name: fn_name.to_string(),
+                param_path: path.to_string(),
+                feature: format!("type '{}'", other),
+            }),
+        },
+        Some(_) => Err(EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature: "non-string type".to_string(),
+        }),
+    }
+}
+
+/// iter-231b — nested `object` compiler (Gemma kv surface).  Keys are
+/// BARE literals (the template invokes `format_argument` with
+/// `escape_keys=False` recursively at every nesting level).
+fn gemma4_nested_object(
+    fn_name: &str,
+    path: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    rules: &mut Vec<(String, String)>,
+    rule_counter: &mut u32,
+    depth: usize,
+) -> Result<String, EmitterError> {
+    let properties = obj.get("properties").and_then(|p| p.as_object());
+    let additional_closed =
+        matches!(obj.get("additionalProperties"), Some(serde_json::Value::Bool(false)));
+
+    let props = match properties {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return Ok(if additional_closed {
+                r#""{" "}""#.to_string()
+            } else {
+                "gemma4-json-obj".to_string()
+            });
+        }
+    };
+
+    let required_set: std::collections::HashSet<&str> = obj
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    if required_set.len() > MAX_REQUIRED_KEYS {
+        return Err(EmitterError::TooManyRequiredKeys {
+            fn_name: format!("{} (nested {})", fn_name, path),
+            count: required_set.len(),
+        });
+    }
+    if props.len() > MAX_NESTED_PROPERTIES {
+        return Err(EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature: format!("> {} properties", MAX_NESTED_PROPERTIES),
+        });
+    }
+
+    let mut req_kv: Vec<String> = Vec::new();
+    let mut opt_kv: Vec<String> = Vec::new();
+    let mut sorted_keys: Vec<&String> = props.keys().collect();
+    sorted_keys.sort();
+    for key in sorted_keys {
+        let val_body = gemma4_nested_value_rule(
+            fn_name,
+            &format!("{}/properties/{}", path, key),
+            &props[key],
+            rules,
+            rule_counter,
+            depth + 1,
+        )?;
+        *rule_counter += 1;
+        let kv_name = format!("g4n-{}-kv", *rule_counter);
+        rules.push((
+            kv_name.clone(),
+            format!("{} \":\" {}", gbnf_literal(key), val_body),
+        ));
+        if required_set.contains(key.as_str()) {
+            req_kv.push(kv_name);
+        } else {
+            opt_kv.push(kv_name);
+        }
+    }
+
+    // Wildcard kv for open objects: bare key + any structured value.
+    let extra_kv: Option<String> = if additional_closed {
+        None
+    } else {
+        Some(r#"gemma4-json-key ":" gemma4-json-val"#.to_string())
+    };
+
+    build_nested_obj_body(
+        "g4n",
+        req_kv,
+        opt_kv,
+        extra_kv,
+        rules,
+        rule_counter,
+    )
+    .map(|inner| format!(r#""{{" {} "}}""#, inner))
+}
+
+/// iter-231b — nested `array` compiler (Gemma kv surface).
+fn gemma4_nested_array(
+    fn_name: &str,
+    path: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    rules: &mut Vec<(String, String)>,
+    rule_counter: &mut u32,
+    depth: usize,
+) -> Result<String, EmitterError> {
+    match obj.get("items") {
+        None => Ok("gemma4-json-arr".to_string()),
+        Some(serde_json::Value::Object(_)) => {
+            let item_rule = gemma4_nested_value_rule(
+                fn_name,
+                &format!("{}/items", path),
+                obj.get("items").expect("items checked above"),
+                rules,
+                rule_counter,
+                depth + 1,
+            )?;
+            Ok(format!(
+                r#""[" ( {0} ("," {0})* )? "]""#,
+                item_rule
+            ))
+        }
+        Some(serde_json::Value::Array(_)) => Err(EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature: "tuple-form items".to_string(),
+        }),
+        Some(_) => Err(EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature: "non-object items".to_string(),
+        }),
     }
 }
 
@@ -1418,10 +1870,13 @@ fn gemma4_value_gbnf(
 /// Kleene-star suffix.  Hard cap `MAX_REQUIRED_KEYS` (8) prevents O(2^N)
 /// grammar blowup.
 ///
-/// # Nested schema rejection (Wave 2.5 B3)
+/// # Structured parameters (iter-231a, supersedes Wave 2.5 B3)
 ///
-/// If any parameter's schema type is `array` or `object`, returns
-/// `EmitterError::UnsupportedSchema` immediately.
+/// Parameters typed `array` or `object` compile to the permissive
+/// recursive `gemma4-json-arr` / `gemma4-json-obj` rules — contents
+/// unconstrained, structure constrained.  (Wave 2.5 B3 rejected these
+/// with `EmitterError::UnsupportedSchema` → HTTP 400; that gate broke
+/// every tool schema carrying free-form object params, e.g. MCP tools.)
 fn gemma4_tool_call_gbnf(
     fn_name: &str,
     params_schema: &serde_json::Value,
@@ -1470,6 +1925,45 @@ fn gemma4_tool_call_gbnf(
         r#"gemma4-str-val | gemma4-num-val | gemma4-bool-val | gemma4-null-val"#.to_string(),
     ));
 
+    // iter-231a (B3 supersession): permissive recursive kv-list rules for
+    // `object` / `array` parameters.  The chat template's
+    // `format_argument(value, escape_keys=False)` macro
+    // (test_fixtures/gemma4-apex-embedded-chat-template.jinja:111-140,
+    // invoked from :198 with `escape_keys=False` propagated recursively)
+    // renders structured args as:
+    //   * object  → `{key:val,...}`   — keys BARE at every nesting level
+    //   * array   → `[val,...]`
+    //   * string  → `<|"|>s<|"|>`     (= gemma4-str-val)
+    //   * bool/num/null → bare        (= existing scalar rules)
+    //
+    // `gemma4-json-key` matches bare keys: any run of chars that cannot
+    // collide with the kv-list structure (`,` `:` `{` `}` `[` `]`) or the
+    // `<tool_call|>` close marker (`<`) — same conservative-charset
+    // contract as `gemma4-str-char`.
+    //
+    // Same supersession rationale as the Qwen emitter: the grammar still
+    // constrains call structure (function name, declared param keys,
+    // kv-list layout, scalar types) but treats the CONTENTS of
+    // object/array parameters as "any well-formed kv-list value", ending
+    // the wave-2.5 `EmitterError::UnsupportedSchema` → HTTP 400 hard
+    // failure on real-world tool schemas (MCP free-form objects).
+    rules.push((
+        "gemma4-json-key".to_string(),
+        r#"[^,:{}\[\]<]+"#.to_string(),
+    ));
+    rules.push((
+        "gemma4-json-obj".to_string(),
+        r#""{" ("}" | gemma4-json-key ":" gemma4-json-val ("," gemma4-json-key ":" gemma4-json-val)* "}")"#.to_string(),
+    ));
+    rules.push((
+        "gemma4-json-arr".to_string(),
+        r#""[" ("]" | gemma4-json-val ("," gemma4-json-val)* "]")"#.to_string(),
+    ));
+    rules.push((
+        "gemma4-json-val".to_string(),
+        "gemma4-str-val | gemma4-num-val | gemma4-bool-val | gemma4-null-val | gemma4-json-obj | gemma4-json-arr".to_string(),
+    ));
+
     // Extract `required` set (Wave 2.5 B1).
     let required_set: std::collections::HashSet<String> = params_schema
         .as_object()
@@ -1514,7 +2008,7 @@ fn gemma4_tool_call_gbnf(
             sorted_keys.sort();
             for key in &sorted_keys {
                 let val_schema = &props[*key];
-                // B3: reject array/object at emit time.
+                // iter-231a: array/object map to permissive json rules.
                 let val_rule = gemma4_value_gbnf(fn_name, key.as_str(), val_schema, &mut rules, &mut rule_counter)?;
                 let key_lit = gbnf_literal(key.as_str());
                 let kv_body = format!("{} {} {}", key_lit, gbnf_literal(":"), val_rule);
@@ -1747,9 +2241,13 @@ fn build_gemma4_required_permutation(
 /// Same as Gemma 4: required keys enforced via permutation grammar; optional
 /// keys in Kleene-star suffix.  Hard cap `MAX_REQUIRED_KEYS` (8).
 ///
-/// # Nested schema rejection (Wave 2.5 B3)
+/// # Structured parameters (iter-231a, supersedes Wave 2.5 B3)
 ///
-/// `array` or `object` parameter types → `EmitterError::UnsupportedSchema`.
+/// Parameters typed `array` or `object` compile to the permissive
+/// recursive `qwen35-json-arr` / `qwen35-json-obj` rules — contents
+/// unconstrained, structure constrained.  (Wave 2.5 B3 rejected these
+/// with `EmitterError::UnsupportedSchema` → HTTP 400; that gate broke
+/// every tool schema carrying free-form object params, e.g. MCP tools.)
 fn qwen35_tool_call_gbnf(
     fn_name: &str,
     params_schema: &serde_json::Value,
@@ -1791,6 +2289,51 @@ fn qwen35_tool_call_gbnf(
         r#"qwen35-str-val | qwen35-num-val | qwen35-bool-val | qwen35-null-val"#.to_string(),
     ));
 
+    // iter-231a (B3 supersession): permissive recursive JSON rules for
+    // `object` / `array` parameters.  The chat template renders every
+    // non-string argument via the `tojson` filter
+    // (`serde_json::to_string` — compact, NO whitespace, `<` NOT escaped;
+    // src/serve/mod.rs `build_chat_template_env`), so the value grammar is
+    // compact-JSON-shaped:
+    //
+    //   * `qwen35-json-char` excludes `<` for the same reason
+    //     `qwen35-str-char` does: a string value must never be able to
+    //     swallow the `</parameter>` close tag.  The model can always
+    //     `\<` escape a literal `<` if it truly needs one.
+    //   * `qwen35-json-obj` / `qwen35-json-arr` are mutually recursive
+    //     with `qwen35-json-val` (GBNF supports recursion — same idiom as
+    //     json_schema.rs's `value`/`object`/`array` primitives).
+    //   * Object keys are JSON strings (serde emits them quoted).
+    //   * Numbers reuse `qwen35-num-val` (covers ints + floats).
+    //
+    // These rules are a deliberate SUPERSET of any nested schema: the
+    // grammar constrains the call structure (function name, parameter
+    // keys, tag layout, scalar types) but treats the CONTENTS of
+    // object/array parameters as "any well-formed JSON".  Real-world
+    // tool schemas (e.g. MCP servers exposing free-form `config` /
+    // `arguments` objects) previously hard-failed the entire request
+    // with `EmitterError::UnsupportedSchema` → HTTP 400.
+    rules.push((
+        "qwen35-json-char".to_string(),
+        r#"[^<"\\\x00-\x1F] | [\\] (["\\/bfnrt] | [u] [0-9a-fA-F]{4})"#.to_string(),
+    ));
+    rules.push((
+        "qwen35-json-str".to_string(),
+        r#""\"" qwen35-json-char* "\"""#.to_string(),
+    ));
+    rules.push((
+        "qwen35-json-obj".to_string(),
+        r#""{" ("}" | qwen35-json-str ":" qwen35-json-val ("," qwen35-json-str ":" qwen35-json-val)* "}")"#.to_string(),
+    ));
+    rules.push((
+        "qwen35-json-arr".to_string(),
+        r#""[" ("]" | qwen35-json-val ("," qwen35-json-val)* "]")"#.to_string(),
+    ));
+    rules.push((
+        "qwen35-json-val".to_string(),
+        "qwen35-json-str | qwen35-num-val | qwen35-bool-val | qwen35-null-val | qwen35-json-obj | qwen35-json-arr".to_string(),
+    ));
+
     // Extract `required` set (Wave 2.5 B1).
     let required_set: std::collections::HashSet<String> = params_schema
         .as_object()
@@ -1830,12 +2373,21 @@ fn qwen35_tool_call_gbnf(
         } else {
             let mut required_block_names: Vec<String> = Vec::new();
             let mut optional_block_names: Vec<String> = Vec::new();
+            let mut rule_counter: u32 = 0;
             let mut sorted_keys: Vec<&String> = props.keys().collect();
             sorted_keys.sort();
             for key in &sorted_keys {
                 let val_schema = &props[*key];
-                // B3: reject array/object at emit time.
-                let val_rule = qwen35_value_rule(fn_name, key.as_str(), val_schema)?;
+                // iter-231b: array/object compile via the recursive
+                // nested-schema converter (full declared-structure
+                // fidelity; free-form shapes stay permissive).
+                let val_rule = qwen35_value_rule(
+                    fn_name,
+                    key.as_str(),
+                    val_schema,
+                    &mut rules,
+                    &mut rule_counter,
+                )?;
                 let param_open_lit = gbnf_literal(&format!("<parameter={}>", key));
                 let param_close_lit = gbnf_literal("</parameter>");
                 // Block form confirmed against tokenizer_config.json chat_template:
@@ -2067,18 +2619,22 @@ fn build_qwen35_required_permutation(
 
 /// Map a JSON Schema value to the Qwen 3.5 value rule name.
 ///
-/// Returns `Err(EmitterError::UnsupportedSchema)` for `array` and `object`
-/// types (Wave 2.5 B3 — nested schema rejection).
+/// iter-231a (B3 supersession): `array` and `object` types compile via the
+/// iter-231b recursive nested-schema converter (`qwen35_nested_value_rule`).
 fn qwen35_value_rule(
     fn_name: &str,
     param_name: &str,
     schema: &serde_json::Value,
+    rules: &mut Vec<(String, String)>,
+    rule_counter: &mut u32,
 ) -> Result<String, EmitterError> {
     let obj = match schema.as_object() {
         Some(o) => o,
-        None => return Ok("qwen35-any-val".to_string()),
+        None => return Ok(QWEN35_TOP_ANY_VAL.to_string()),
     };
-    // enum → accept only the declared string literals.
+    // enum → accept only the declared string literals.  TOP-LEVEL string
+    // values are RAW text between the parameter tags (the template only
+    // `tojson`s NON-string values), so enum literals stay unquoted here.
     if let Some(serde_json::Value::Array(values)) = obj.get("enum") {
         let alts: Vec<String> = values
             .iter()
@@ -2091,19 +2647,510 @@ fn qwen35_value_rule(
     }
     let schema_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match schema_type {
-        "string" => Ok("qwen35-str-val".to_string()),
+        "string" => {
+            // iter-231c: `pattern` constrains the RAW string text.
+            match compile_pattern(
+                fn_name,
+                &format!("/{}", param_name),
+                obj.get("pattern"),
+                crate::serve::api::grammar::regex_gbnf::Surface::QwenRawString,
+            )? {
+                Some(body) => Ok(body),
+                None => Ok("qwen35-str-val".to_string()),
+            }
+        }
         "integer" => Ok("qwen35-int-val".to_string()),
         "number" => Ok("qwen35-num-val".to_string()),
         "boolean" => Ok("qwen35-bool-val".to_string()),
         "null" => Ok("qwen35-null-val".to_string()),
-        // Wave 2.5 B3: reject array and object types.
-        "array" | "object" => Err(EmitterError::UnsupportedSchema {
-            fn_name: fn_name.to_string(),
-            param_name: param_name.to_string(),
-            schema_type: schema_type.to_string(),
-        }),
-        _ => Ok("qwen35-any-val".to_string()),
+        // iter-231b: structured types → full-fidelity recursive compiler.
+        "array" | "object" => qwen35_nested_value_rule(
+            fn_name,
+            &format!("/{}", param_name),
+            schema,
+            rules,
+            rule_counter,
+            1,
+        ),
+        _ => Ok(QWEN35_TOP_ANY_VAL.to_string()),
     }
+}
+
+/// Top-level value body for untyped / unknown-typed parameters: the
+/// template renders string args RAW and non-string args via `tojson`, so
+/// any scalar (raw) or any structured JSON value is accepted.
+const QWEN35_TOP_ANY_VAL: &str =
+    "( qwen35-any-val | qwen35-json-obj | qwen35-json-arr )";
+
+/// iter-231c — compile a JSON Schema `pattern` keyword for the given
+/// string surface via `grammar::regex_gbnf`.  Returns `Ok(None)` when
+/// the schema carries no (string) `pattern`; `Err` for non-regular or
+/// out-of-subset regex features (honest `UnsupportedSchemaFeature` —
+/// never a silent permissive downgrade).
+///
+/// WHY the grammar-module dependency here: registry.rs previously had a
+/// "no grammar module dependency" note (to avoid a circular import for a
+/// trivial 10-line escape fn).  `regex_gbnf` has NO registry dependency,
+/// so the dependency is one-directional and the original concern does
+/// not apply.
+fn compile_pattern(
+    fn_name: &str,
+    path: &str,
+    pattern: Option<&serde_json::Value>,
+    surface: crate::serve::api::grammar::regex_gbnf::Surface,
+) -> Result<Option<String>, EmitterError> {
+    let Some(pat) = pattern.and_then(|p| p.as_str()) else {
+        return Ok(None);
+    };
+    match crate::serve::api::grammar::regex_gbnf::regex_to_gbnf_body(pat, surface) {
+        Ok(body) => Ok(Some(body)),
+        Err(e) => Err(EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature: format!("pattern {:?}: {}", pat, e.0),
+        }),
+    }
+}
+
+/// iter-231b — recursive nested-schema compiler for Qwen 3.5/3.6 tool
+/// parameters (`tojson` = compact JSON surface, `serde_json::to_string`).
+///
+/// Constrains everything the schema DECLARES and stays open only where
+/// the schema itself is open:
+///
+///   * scalars / enums / type-unions / anyOf / oneOf — exact bodies.
+///   * `object` with `properties` — declared keys with per-key value
+///     grammars; `required` (≤8) enforced any-order via permutation;
+///     optional keys follow in a Kleene suffix (SAME contract as the
+///     top-level parameter grammar: required keys in any order, then
+///     optional keys in any order; optional duplicates are accepted the
+///     same way top-level duplicates are).  `additionalProperties:false`
+///     closes the key set; unset/true adds a wildcard kv tail.
+///   * `object`/`array` with NO declared shape → the permissive
+///     recursive `qwen35-json-obj` / `qwen35-json-arr` rules (any
+///     well-formed compact JSON — the free-form MCP case).
+///   * `array` with `items` → typed item grammar; absent → permissive.
+///
+/// `pattern` (regex) is COMPILED into the value grammar via
+/// `grammar::regex_gbnf` (iter-231c); non-regular regex features
+/// (backreferences, look-around, \p{...}, bounds > 2000) are rejected.
+///
+/// Rejected with `EmitterError::UnsupportedSchemaFeature` (→ HTTP 400
+/// naming the feature + dot-path): `allOf`, `$ref`/`$defs`,
+/// `not`/`if`/`then`/`else`, `dependentSchemas`, tuple-form `items`,
+/// container `enum` values, >32 properties per object, depth > 32.
+/// Constraint keywords the grammar cannot enforce (`minLength`,
+/// `minimum`, `minItems`, `format`, …) are IGNORED, mirroring
+/// json_schema.rs's deferred-feature list.
+///
+/// # Rejection-strength contract (CFG limitation, SOTA parity)
+///
+/// A REQUIRED key's value is always constrained by its declared grammar
+/// (the permutation position cannot be filled by the wildcard extra-kv
+/// branch), and a CLOSED object (`additionalProperties: false`) rejects
+/// any key/value mismatch.  For OPEN objects (the JSON Schema default),
+/// the wildcard extra-kv tail can re-match a declared OPTIONAL key with
+/// an unconstrained value — a CFG cannot express "any key except these".
+/// llama.cpp's json-schema-to-grammar and this crate's json_schema.rs
+/// share the identical limitation; value validation for optional keys on
+/// open objects belongs to the tool server.
+fn qwen35_nested_value_rule(
+    fn_name: &str,
+    path: &str,
+    schema: &serde_json::Value,
+    rules: &mut Vec<(String, String)>,
+    rule_counter: &mut u32,
+    depth: usize,
+) -> Result<String, EmitterError> {
+    if depth > MAX_NESTED_DEPTH {
+        return Err(EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature: format!("nesting depth > {}", MAX_NESTED_DEPTH),
+        });
+    }
+    let obj = match schema.as_object() {
+        Some(o) => o,
+        // Non-object schema node (true/false/nonsense) → permissive leaf.
+        None => return Ok("qwen35-json-val".to_string()),
+    };
+
+    // Hard-reject features the grammar cannot enforce (honest 400, no
+    // silent downgrade).
+    for feat in [
+        "allOf",
+        "$ref",
+        "$defs",
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentSchemas",
+        "patternProperties",
+        "propertyNames",
+        "contains",
+    ] {
+        if obj.contains_key(feat) {
+            return Err(EmitterError::UnsupportedSchemaFeature {
+                fn_name: fn_name.to_string(),
+                param_path: path.to_string(),
+                feature: feat.to_string(),
+            });
+        }
+    }
+
+    // anyOf / oneOf → alternation of sub-schema bodies (same acceptance
+    // for grammar purposes — a value matching ANY branch is accepted).
+    for comb in ["anyOf", "oneOf"] {
+        if let Some(serde_json::Value::Array(subs)) = obj.get(comb) {
+            if subs.is_empty() {
+                return Err(EmitterError::UnsupportedSchemaFeature {
+                    fn_name: fn_name.to_string(),
+                    param_path: path.to_string(),
+                    feature: format!("empty {}", comb),
+                });
+            }
+            let mut alts: Vec<String> = Vec::with_capacity(subs.len());
+            for (i, s) in subs.iter().enumerate() {
+                alts.push(qwen35_nested_value_rule(
+                    fn_name,
+                    &format!("{}/{}/{}", path, comb, i),
+                    s,
+                    rules,
+                    rule_counter,
+                    depth + 1,
+                )?);
+            }
+            return Ok(format!("( {} )", alts.join(" | ")));
+        }
+    }
+
+    // enum → literal alternation of the JSON-serialized values (compact
+    // tojson form; strings keep their JSON quotes).  Container enum
+    // values are rejected (json_schema.rs parity).
+    if let Some(serde_json::Value::Array(values)) = obj.get("enum") {
+        if values.is_empty() {
+            return Err(EmitterError::UnsupportedSchemaFeature {
+                fn_name: fn_name.to_string(),
+                param_path: path.to_string(),
+                feature: "empty enum".to_string(),
+            });
+        }
+        let mut alts: Vec<String> = Vec::with_capacity(values.len());
+        for v in values {
+            match v {
+                serde_json::Value::String(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Null => {
+                    let text = serde_json::to_string(v).map_err(|e| {
+                        EmitterError::UnsupportedSchemaFeature {
+                            fn_name: fn_name.to_string(),
+                            param_path: path.to_string(),
+                            feature: format!("enum serialize: {}", e),
+                        }
+                    })?;
+                    alts.push(gbnf_literal(&text));
+                }
+                _ => {
+                    return Err(EmitterError::UnsupportedSchemaFeature {
+                        fn_name: fn_name.to_string(),
+                        param_path: path.to_string(),
+                        feature: "container enum value".to_string(),
+                    });
+                }
+            }
+        }
+        return Ok(format!("( {} )", alts.join(" | ")));
+    }
+
+    match obj.get("type") {
+        // Untyped nested node → any JSON value (structured included).
+        None => Ok("qwen35-json-val".to_string()),
+        Some(serde_json::Value::Array(types)) => {
+            let mut alts: Vec<String> = Vec::with_capacity(types.len());
+            for (i, t) in types.iter().enumerate() {
+                let Some(tstr) = t.as_str() else {
+                    return Err(EmitterError::UnsupportedSchemaFeature {
+                        fn_name: fn_name.to_string(),
+                        param_path: path.to_string(),
+                        feature: "non-string type union entry".to_string(),
+                    });
+                };
+                let mut stub = serde_json::Map::new();
+                stub.insert("type".into(), serde_json::Value::String(tstr.into()));
+                alts.push(qwen35_nested_value_rule(
+                    fn_name,
+                    &format!("{}/type/{}", path, i),
+                    &serde_json::Value::Object(stub),
+                    rules,
+                    rule_counter,
+                    depth + 1,
+                )?);
+            }
+            Ok(format!("( {} )", alts.join(" | ")))
+        }
+        Some(serde_json::Value::String(t)) => match t.as_str() {
+            "string" => {
+                // iter-231c: `pattern` constrains the JSON string content.
+                match compile_pattern(
+                    fn_name,
+                    path,
+                    obj.get("pattern"),
+                    crate::serve::api::grammar::regex_gbnf::Surface::QwenJsonString,
+                )? {
+                    Some(body) => Ok(format!(
+                        "{} {} {}",
+                        gbnf_literal("\""),
+                        body,
+                        gbnf_literal("\"")
+                    )),
+                    None => Ok("qwen35-json-str".to_string()),
+                }
+            }
+            "integer" => Ok("qwen35-int-val".to_string()),
+            "number" => Ok("qwen35-num-val".to_string()),
+            "boolean" => Ok("qwen35-bool-val".to_string()),
+            "null" => Ok("qwen35-null-val".to_string()),
+            "object" => qwen35_nested_object(fn_name, path, obj, rules, rule_counter, depth),
+            "array" => qwen35_nested_array(fn_name, path, obj, rules, rule_counter, depth),
+            other => Err(EmitterError::UnsupportedSchemaFeature {
+                fn_name: fn_name.to_string(),
+                param_path: path.to_string(),
+                feature: format!("type '{}'", other),
+            }),
+        },
+        Some(_) => Err(EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature: "non-string type".to_string(),
+        }),
+    }
+}
+
+/// iter-231b — nested `object` compiler (Qwen compact-JSON surface).
+/// See `qwen35_nested_value_rule` for the contract.
+fn qwen35_nested_object(
+    fn_name: &str,
+    path: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    rules: &mut Vec<(String, String)>,
+    rule_counter: &mut u32,
+    depth: usize,
+) -> Result<String, EmitterError> {
+    let properties = obj.get("properties").and_then(|p| p.as_object());
+    let additional_closed =
+        matches!(obj.get("additionalProperties"), Some(serde_json::Value::Bool(false)));
+
+    let props = match properties {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            // No declared shape: closed → only `{}`; open → permissive.
+            return Ok(if additional_closed {
+                r#""{" "}""#.to_string()
+            } else {
+                "qwen35-json-obj".to_string()
+            });
+        }
+    };
+
+    let required_set: std::collections::HashSet<&str> = obj
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    if required_set.len() > MAX_REQUIRED_KEYS {
+        return Err(EmitterError::TooManyRequiredKeys {
+            fn_name: format!("{} (nested {})", fn_name, path),
+            count: required_set.len(),
+        });
+    }
+    if props.len() > MAX_NESTED_PROPERTIES {
+        return Err(EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature: format!("> {} properties", MAX_NESTED_PROPERTIES),
+        });
+    }
+
+    let mut req_kv: Vec<String> = Vec::new();
+    let mut opt_kv: Vec<String> = Vec::new();
+    let mut sorted_keys: Vec<&String> = props.keys().collect();
+    sorted_keys.sort();
+    for key in sorted_keys {
+        let val_body = qwen35_nested_value_rule(
+            fn_name,
+            &format!("{}/properties/{}", path, key),
+            &props[key],
+            rules,
+            rule_counter,
+            depth + 1,
+        )?;
+        *rule_counter += 1;
+        let kv_name = format!("q35n-{}-kv", *rule_counter);
+        // Key literal: JSON-quoted exactly as serde emits it.
+        let key_json = serde_json::to_string(key)
+            .unwrap_or_else(|_| format!("\"{}\"", key.replace('"', "\\\"")));
+        rules.push((
+            kv_name.clone(),
+            format!("{} \":\" {}", gbnf_literal(&key_json), val_body),
+        ));
+        if required_set.contains(key.as_str()) {
+            req_kv.push(kv_name);
+        } else {
+            opt_kv.push(kv_name);
+        }
+    }
+
+    // Wildcard kv for open objects (additionalProperties unset/true):
+    // any JSON-string key with any JSON value.
+    let extra_kv: Option<String> = if additional_closed {
+        None
+    } else {
+        Some(r#"qwen35-json-str ":" qwen35-json-val"#.to_string())
+    };
+
+    build_nested_obj_body(
+        "q35n",
+        req_kv,
+        opt_kv,
+        extra_kv,
+        rules,
+        rule_counter,
+    )
+    .map(|inner| format!(r#""{{" {} "}}""#, inner))
+}
+
+/// iter-231b — nested `array` compiler (Qwen compact-JSON surface).
+fn qwen35_nested_array(
+    fn_name: &str,
+    path: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    rules: &mut Vec<(String, String)>,
+    rule_counter: &mut u32,
+    depth: usize,
+) -> Result<String, EmitterError> {
+    match obj.get("items") {
+        None => Ok("qwen35-json-arr".to_string()),
+        Some(serde_json::Value::Object(_)) => {
+            let item_rule = qwen35_nested_value_rule(
+                fn_name,
+                &format!("{}/items", path),
+                obj.get("items").expect("items checked above"),
+                rules,
+                rule_counter,
+                depth + 1,
+            )?;
+            Ok(format!(
+                r#""[" ( {0} ("," {0})* )? "]""#,
+                item_rule
+            ))
+        }
+        Some(serde_json::Value::Array(_)) => Err(EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature: "tuple-form items".to_string(),
+        }),
+        Some(_) => Err(EmitterError::UnsupportedSchemaFeature {
+            fn_name: fn_name.to_string(),
+            param_path: path.to_string(),
+            feature: "non-object items".to_string(),
+        }),
+    }
+}
+
+/// iter-231b — shared nested-object inner builder.  Emits the
+/// required-permutation + optional-Kleene-suffix body used by BOTH
+/// families' nested object compilers (same contract as the top-level
+/// parameter grammars): required keys in any order first, then optional
+/// keys (plus the wildcard tail for open objects) in any order.
+///
+/// Returns the GBNF expression for the object's inner kv sequence (no
+/// surrounding braces).
+fn build_nested_obj_body(
+    prefix: &str,
+    req_kv: Vec<String>,
+    opt_kv: Vec<String>,
+    extra_kv: Option<String>,
+    rules: &mut Vec<(String, String)>,
+    rule_counter: &mut u32,
+) -> Result<String, EmitterError> {
+    // GBNF literal for the inter-kv comma (compact surfaces — Qwen
+    // `tojson` and Gemma `format_argument` — emit NO whitespace).
+    // NOTE: the 3-byte form `","` — `r#"","#` would be just `,`.
+    let comma = r#"",""#;
+    let mut opt_items: Vec<String> = opt_kv;
+    if let Some(eb) = &extra_kv {
+        opt_items.push(format!("( {} )", eb));
+    }
+
+    if req_kv.is_empty() {
+        // All-optional object: `( item ("," item)* )?` — {} accepted.
+        if opt_items.is_empty() {
+            // Closed object, no declared keys → empty body; caller wraps
+            // braces: `{" "}` shape handled by the caller passing an empty
+            // optional set for a closed object with properties that all
+            // got filtered (defensive; today unreachable).
+            return Ok(String::new());
+        }
+        *rule_counter += 1;
+        let item_name = format!("{}-{}-item", prefix, *rule_counter);
+        rules.push((item_name.clone(), format!("( {} )", opt_items.join(" | "))));
+        Ok(format!(
+            "( {} ( {} {} )* )?",
+            item_name, comma, item_name
+        ))
+    } else {
+        let req_top =
+            build_nested_kv_permutation(&format!("{}-{}", prefix, *rule_counter), &req_kv, comma, rules);
+        if opt_items.is_empty() {
+            Ok(req_top)
+        } else {
+            *rule_counter += 1;
+            let opt_name = format!("{}-{}-opt", prefix, *rule_counter);
+            rules.push((opt_name.clone(), format!("( {} )", opt_items.join(" | "))));
+            Ok(format!("{} ( {} {} )*", req_top, comma, opt_name))
+        }
+    }
+}
+
+/// iter-231b — shared any-order permutation builder for nested kv rules.
+/// Mirrors `build_qwen35_required_permutation` but parameterized on the
+/// rule-name prefix + separator so both families' nested compilers share
+/// one implementation.  Sub-rule names are content-addressed (sorted
+/// join), so shared subsets across branches are emitted once.
+fn build_nested_kv_permutation(
+    set_name: &str,
+    item_names: &[String],
+    separator_lit: &str,
+    rules: &mut Vec<(String, String)>,
+) -> String {
+    let mut sorted = item_names.to_vec();
+    sorted.sort();
+
+    if sorted.len() == 1 {
+        return sorted[0].clone();
+    }
+
+    let rule_name = format!("{}-{}", set_name, sorted.join("-"));
+    if rules.iter().any(|(n, _)| n == &rule_name) {
+        return rule_name;
+    }
+
+    let mut alts: Vec<String> = Vec::new();
+    for (i, item) in sorted.iter().enumerate() {
+        let remaining: Vec<String> = sorted
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, s)| s.clone())
+            .collect();
+        let rest = build_nested_kv_permutation(set_name, &remaining, separator_lit, rules);
+        alts.push(format!("{} {} {}", item, separator_lit, rest));
+    }
+    rules.push((rule_name.clone(), alts.join(" | ")));
+    rule_name
 }
 
 /// Sanitize a property name for use as part of a GBNF rule name.
@@ -3576,76 +4623,132 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Wave 2.5 B3 — Nested schema rejection tests
+    // iter-231a (supersedes Wave 2.5 B3) — structured-parameter acceptance
+    //
+    // Pre-iter-231a these pinned a hard `EmitterError::UnsupportedSchema`
+    // rejection for `array`/`object` params (→ HTTP 400 for the whole
+    // request).  That gate broke real-world tool schemas (MCP servers
+    // expose free-form `object` params such as `config`, `arguments`).
+    // The grammar now compiles such params to permissive recursive value
+    // rules and ACCEPTS any well-formed structured value.
     // -----------------------------------------------------------------------
 
-    /// B3 Gemma4: `array` type parameter → structured Err.
+    /// iter-231a Gemma4: `array` param compiles AND the runtime accepts a
+    /// nested kv-list value exactly as `format_argument` renders it.
     #[test]
-    fn b3_gemma4_array_param_returns_err() {
+    fn iter231a_gemma4_array_param_compiles_and_accepts_nested_value() {
         let schema = r#"{
             "type": "object",
             "properties": {
-                "items": {"type": "array"},
+                "tags": {"type": "array"},
                 "name": {"type": "string"}
             }
         }"#;
-        let result = GEMMA4.tool_call_gbnf("process", &serde_json::from_str(schema).unwrap(), GrammarShape::SingleBody);
-        assert!(result.is_err(), "array type must return Err");
-        let msg = result.unwrap_err();
-        assert!(msg.contains("array"), "error must mention type 'array': {}", msg);
-        assert!(msg.contains("items"), "error must mention param name: {}", msg);
-        assert!(msg.contains("process"), "error must mention function name: {}", msg);
+        let mut rt = gemma4_runtime("tag_item", schema);
+        // format_argument: strings `<|"|>...<|"|>`, scalars bare, nested
+        // containers recursive, keys bare (escape_keys=False).
+        let input = b"call:tag_item{name:<|\"|>x<|\"|>,tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>,1,true,null,[2,{k:<|\"|>v<|\"|>}]]}";
+        assert!(rt.accept_bytes(input), "nested array value rejected");
+        assert!(rt.is_accepted(), "not accepted at end");
     }
 
-    /// B3 Gemma4: `object` type parameter → structured Err.
+    /// iter-231a Gemma4: `object` param compiles AND accepts a nested
+    /// object with bare keys at every level (escape_keys=False).
     #[test]
-    fn b3_gemma4_nested_object_returns_err() {
+    fn iter231a_gemma4_object_param_compiles_and_accepts_nested_value() {
         let schema = r#"{
             "type": "object",
             "properties": {
                 "config": {"type": "object"}
             }
         }"#;
-        let result = GEMMA4.tool_call_gbnf("configure", &serde_json::from_str(schema).unwrap(), GrammarShape::SingleBody);
-        assert!(result.is_err(), "object type must return Err");
-        let msg = result.unwrap_err();
-        assert!(msg.contains("object"), "error must mention type 'object': {}", msg);
+        let mut rt = gemma4_runtime("configure", schema);
+        let input = b"call:configure{config:{model:<|\"|>sonnet<|\"|>,retries:3,nested:{on:true,ids:[1,2]}}}";
+        assert!(rt.accept_bytes(input), "nested object value rejected");
+        assert!(rt.is_accepted(), "not accepted at end");
     }
 
-    /// B3 Qwen35: `array` type parameter → structured Err.
+    /// iter-231a Qwen35: `array` param compiles AND accepts nested compact
+    /// JSON (what the template's `tojson` filter emits).
     #[test]
-    fn b3_qwen35_array_param_returns_err() {
+    fn iter231a_qwen35_array_param_compiles_and_accepts_nested_value() {
         let schema = r#"{
             "type": "object",
             "properties": {
                 "tags": {"type": "array"}
             }
         }"#;
-        let result = QWEN35.tool_call_gbnf("tag_item", &serde_json::from_str(schema).unwrap(), GrammarShape::SingleBody);
-        assert!(result.is_err(), "array type must return Err");
-        let msg = result.unwrap_err();
-        assert!(msg.contains("array"), "error must mention type 'array': {}", msg);
-        assert!(msg.contains("tags"), "error must mention param name: {}", msg);
+        let mut rt = qwen35_runtime("tag_item", schema);
+        let input = b"<function=tag_item>\n<parameter=tags>\n[\"a\",\"b\",1,true,null,[2,{\"k\":\"v\"}]]\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(input), "nested JSON array rejected");
+        assert!(rt.is_accepted(), "not accepted at end");
     }
 
-    /// B3 Qwen35: `object` type parameter → structured Err.
+    /// iter-231a Qwen35: `object` param compiles AND accepts nested
+    /// compact JSON with mixed scalar/container children.
     #[test]
-    fn b3_qwen35_nested_object_returns_err() {
+    fn iter231a_qwen35_object_param_compiles_and_accepts_nested_value() {
         let schema = r#"{
             "type": "object",
             "properties": {
                 "metadata": {"type": "object"}
             }
         }"#;
-        let result = QWEN35.tool_call_gbnf("set_meta", &serde_json::from_str(schema).unwrap(), GrammarShape::SingleBody);
-        assert!(result.is_err(), "object type must return Err");
-        let msg = result.unwrap_err();
-        assert!(msg.contains("object"), "error must mention type 'object': {}", msg);
+        let mut rt = qwen35_runtime("set_meta", schema);
+        let input = b"<function=set_meta>\n<parameter=metadata>\n{\"model\":\"sonnet\",\"retries\":3,\"nested\":{\"on\":true,\"ids\":[1,2]}}\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(input), "nested JSON object rejected");
+        assert!(rt.is_accepted(), "not accepted at end");
     }
 
-    /// B3 integration: both models, scalar params unaffected.
+    /// iter-231a regression — the exact failure shape that motivated the
+    /// supersession: an MCP-style tool schema with a free-form `object`
+    /// parameter (`config`) plus scalars and an enum.  Pre-iter-231a this
+    /// 400'd the entire request at grammar-compile time; opencode and
+    /// other agentic clients could not call ANY tool once such a schema
+    /// was present in tools[].
     #[test]
-    fn b3_scalar_params_unaffected() {
+    fn iter231a_qwen35_mcp_tool_with_freeform_object_param_compiles_and_runs() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "agentType": {"type": "string"},
+                "config": {"type": "object"},
+                "memoryDimension": {"type": "integer"},
+                "model": {"type": "string", "enum": ["haiku", "sonnet", "opus"]},
+                "task": {"type": "string"}
+            }
+        }"#;
+        let mut rt = qwen35_runtime("agent_spawn", schema);
+        let input = b"<function=agent_spawn>\n<parameter=agentType>\ncoder\n</parameter>\n<parameter=config>\n{\"maxTurns\":50,\"env\":{\"KEY\":\"value\"},\"nested\":[1,{\"x\":true}]}\n</parameter>\n<parameter=memoryDimension>\n384\n</parameter>\n<parameter=model>\nsonnet\n</parameter>\n<parameter=task>\nimplement feature\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(input), "MCP-shaped call rejected");
+        assert!(rt.is_accepted(), "not accepted at end");
+    }
+
+    /// iter-231a structural guard: the JSON-string char rule excludes `<`
+    /// so a structured value can never swallow the `</parameter>` close
+    /// tag (same conservative contract as `qwen35-str-char`).
+    #[test]
+    fn iter231a_qwen35_object_param_rejects_angle_bracket_in_json_string() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "config": {"type": "object"}
+            }
+        }"#;
+        let mut rt = qwen35_runtime("configure", schema);
+        // `<` inside a JSON string would let the value eat the close tag.
+        let input = b"<function=configure>\n<parameter=config>\n{\"a\":\"<bad\"}\n</parameter>\n</function>";
+        let ok = rt.accept_bytes(input);
+        assert!(
+            !(ok && rt.is_accepted()),
+            "JSON string containing `<` accepted (must reject — close-tag safety)"
+        );
+    }
+
+    /// iter-231a integration: scalar params still compile and run under
+    /// both emitters (supersession must not regress scalars).
+    #[test]
+    fn iter231a_scalar_params_unaffected() {
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
@@ -3654,8 +4757,555 @@ mod tests {
                 "enabled": {"type": "boolean"}
             }
         });
-        assert!(GEMMA4.tool_call_gbnf("f", &schema, GrammarShape::SingleBody).is_ok(), "scalars must not be rejected by B3");
-        assert!(QWEN35.tool_call_gbnf("f", &schema, GrammarShape::SingleBody).is_ok(), "scalars must not be rejected by B3");
+        assert!(GEMMA4.tool_call_gbnf("f", &schema, GrammarShape::SingleBody).is_ok(), "scalars must compile");
+        assert!(QWEN35.tool_call_gbnf("f", &schema, GrammarShape::SingleBody).is_ok(), "scalars must compile");
+    }
+
+    // -----------------------------------------------------------------------
+    // iter-231b — full-fidelity nested-schema compilation
+    //
+    // Structured parameters now constrain everything the schema DECLARES
+    // (properties, required, typed items, enums, unions, additionalProperties)
+    // and stay open only where the schema itself is open (free-form
+    // object/array → permissive recursive value).  Same contract as the
+    // top-level parameter grammar: required keys in any order first, then
+    // optional keys in any order.
+    // -----------------------------------------------------------------------
+
+    /// Qwen35: nested object with declared properties — required keys are
+    /// accepted in ANY order (permutation grammar), compact tojson form.
+    #[test]
+    fn iter231b_qwen35_nested_object_required_keys_any_order() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": {
+                        "host": {"type": "string"},
+                        "port": {"type": "integer"},
+                        "tls": {"type": "boolean"}
+                    },
+                    "required": ["host", "port"]
+                }
+            }
+        }"#;
+        // host before port.
+        let mut rt = qwen35_runtime("connect", schema);
+        let input = b"<function=connect>\n<parameter=server>\n{\"host\":\"example.com\",\"port\":443}\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(input), "declared-order rejected");
+        assert!(rt.is_accepted());
+        // port before host (required any-order), plus optional tls.
+        let mut rt2 = qwen35_runtime("connect", schema);
+        let input2 = b"<function=connect>\n<parameter=server>\n{\"port\":443,\"host\":\"example.com\",\"tls\":true}\n</parameter>\n</function>";
+        assert!(rt2.accept_bytes(input2), "reversed required order rejected");
+        assert!(rt2.is_accepted());
+    }
+
+    /// Qwen35: omitting a nested required key must be REJECTED by the
+    /// grammar (the model physically cannot emit that token path).
+    #[test]
+    fn iter231b_qwen35_nested_object_missing_required_rejected() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": {
+                        "host": {"type": "string"},
+                        "port": {"type": "integer"}
+                    },
+                    "required": ["host", "port"]
+                }
+            }
+        }"#;
+        let mut rt = qwen35_runtime("connect", schema);
+        // port missing — the permutation grammar can never complete.
+        let input = b"<function=connect>\n<parameter=server>\n{\"host\":\"example.com\"}\n</parameter>\n</function>";
+        let ok = rt.accept_bytes(input);
+        assert!(
+            !(ok && rt.is_accepted()),
+            "nested object missing a required key accepted (must reject)"
+        );
+    }
+
+    /// Qwen35: `additionalProperties:false` closes the nested key set —
+    /// an undeclared key is rejected; the same shape WITHOUT the flag
+    /// (open, JSON Schema default) accepts it via the wildcard kv tail.
+    #[test]
+    fn iter231b_qwen35_nested_object_additional_properties_gate() {
+        let closed = r#"{
+            "type": "object",
+            "properties": {
+                "cfg": {
+                    "type": "object",
+                    "properties": {"a": {"type": "integer"}},
+                    "required": ["a"],
+                    "additionalProperties": false
+                }
+            }
+        }"#;
+        let mut rt = qwen35_runtime("f", closed);
+        let input = b"<function=f>\n<parameter=cfg>\n{\"a\":1,\"zzz\":2}\n</parameter>\n</function>";
+        let ok = rt.accept_bytes(input);
+        assert!(
+            !(ok && rt.is_accepted()),
+            "additionalProperties:false accepted an undeclared key"
+        );
+
+        let open = r#"{
+            "type": "object",
+            "properties": {
+                "cfg": {
+                    "type": "object",
+                    "properties": {"a": {"type": "integer"}},
+                    "required": ["a"]
+                }
+            }
+        }"#;
+        let mut rt2 = qwen35_runtime("f", open);
+        assert!(
+            rt2.accept_bytes(input),
+            "open object rejected an extra key (wildcard tail must accept)"
+        );
+        assert!(rt2.is_accepted());
+    }
+
+    /// Qwen35: typed array items are enforced — `items:{type:"string"}`
+    /// accepts `["a","b"]` and rejects `[1,2]`.
+    #[test]
+    fn iter231b_qwen35_nested_array_typed_items_enforced() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}}
+            }
+        }"#;
+        let mut rt = qwen35_runtime("tag", schema);
+        let good = b"<function=tag>\n<parameter=tags>\n[\"a\",\"b\"]\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(good), "string items rejected");
+        assert!(rt.is_accepted());
+
+        let mut rt2 = qwen35_runtime("tag", schema);
+        let bad = b"<function=tag>\n<parameter=tags>\n[1,2]\n</parameter>\n</function>";
+        let ok = rt2.accept_bytes(bad);
+        assert!(
+            !(ok && rt2.is_accepted()),
+            "array with items:string accepted integer items (must reject)"
+        );
+    }
+
+    /// Qwen35: nested enum + anyOf union bodies are enforced.
+    ///
+    /// NOTE on rejection strength (iter-231b documented contract): a
+    /// REQUIRED key's value is always constrained by its declared grammar
+    /// (the permutation position cannot be filled by the wildcard
+    /// extra-kv branch), and a CLOSED object (`additionalProperties:
+    /// false`) rejects any value/key mismatch.  For OPEN objects the
+    /// wildcard extra-kv tail can re-match a declared OPTIONAL key with
+    /// an unconstrained value — an inherent CFG limitation shared with
+    /// llama.cpp + json_schema.rs (a CFG cannot express "any key except
+    /// these").  The anyOf-mismatch rejection below is therefore asserted
+    /// on a CLOSED object, where the guarantee holds.
+    #[test]
+    fn iter231b_qwen35_nested_enum_and_anyof() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "cfg": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"enum": ["fast", "safe"]},
+                        "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+                    },
+                    "required": ["mode"],
+                    "additionalProperties": false
+                }
+            }
+        }"#;
+        let mut rt = qwen35_runtime("f", schema);
+        let good = b"<function=f>\n<parameter=cfg>\n{\"mode\":\"fast\",\"limit\":3}\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(good), "enum+anyOf valid value rejected");
+        assert!(rt.is_accepted());
+
+        let mut rt2 = qwen35_runtime("f", schema);
+        // "warp" is not in the enum.
+        let bad = b"<function=f>\n<parameter=cfg>\n{\"mode\":\"warp\"}\n</parameter>\n</function>";
+        let ok = rt2.accept_bytes(bad);
+        assert!(!(ok && rt2.is_accepted()), "undeclared enum value accepted");
+
+        let mut rt3 = qwen35_runtime("f", schema);
+        // "3.5" matches neither integer nor null branch of the anyOf, and
+        // the object is CLOSED — no wildcard tail to rescue it.
+        let bad2 = b"<function=f>\n<parameter=cfg>\n{\"mode\":\"safe\",\"limit\":3.5}\n</parameter>\n</function>";
+        let ok2 = rt3.accept_bytes(bad2);
+        assert!(!(ok2 && rt3.is_accepted()), "anyOf-mismatched value accepted on closed object");
+    }
+
+    /// Qwen35 (documented contract): for OPEN objects the wildcard
+    /// extra-kv tail accepts any well-formed JSON value for any key —
+    /// including a declared optional key carrying a value that violates
+    /// its declared sub-schema.  Pin the behavior so the caveat is
+    /// explicit, not silent.
+    #[test]
+    fn iter231b_qwen35_open_object_wildcard_tail_documented() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "cfg": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"enum": ["fast", "safe"]},
+                        "limit": {"type": "integer"}
+                    },
+                    "required": ["mode"]
+                }
+            }
+        }"#;
+        let mut rt = qwen35_runtime("f", schema);
+        // limit:3.5 violates items integer, but the OPEN object's
+        // wildcard tail accepts it as an extra key (CFG limitation,
+        // llama.cpp + json_schema.rs parity).  Value validation for
+        // optional keys on open objects is the tool server's job.
+        let input = b"<function=f>\n<parameter=cfg>\n{\"mode\":\"safe\",\"limit\":3.5}\n</parameter>\n</function>";
+        assert!(
+            rt.accept_bytes(input) && rt.is_accepted(),
+            "open-object wildcard tail must accept (documented CFG limitation)"
+        );
+        // But a REQUIRED key mismatch is still physically impossible:
+        let mut rt2 = qwen35_runtime("f", schema);
+        let bad = b"<function=f>\n<parameter=cfg>\n{\"mode\":\"warp\",\"limit\":3}\n</parameter>\n</function>";
+        assert!(
+            !(rt2.accept_bytes(bad) && rt2.is_accepted()),
+            "required-key enum mismatch must reject even on open objects"
+        );
+    }
+
+    /// Qwen35: features the grammar cannot enforce are an honest 400
+    /// (`UnsupportedSchemaFeature` naming feature + dot-path), not a
+    /// silent permissive downgrade.
+    #[test]
+    fn iter231b_qwen35_unsupported_nested_feature_errors() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "cfg": {"type": "object", "properties": {"x": {"$ref": "#/$defs/t"}}}
+            }
+        });
+        let err = QWEN35
+            .tool_call_gbnf("f", &schema, GrammarShape::SingleBody)
+            .expect_err("$ref must error");
+        let msg = err.to_string();
+        assert!(msg.contains("$ref"), "error must name the feature: {}", msg);
+        assert!(msg.contains("/cfg/properties/x"), "error must carry the dot-path: {}", msg);
+    }
+
+    /// Qwen35: >8 nested required keys → TooManyRequiredKeys (same SOTA
+    /// O(2^N) bound as the top level).
+    #[test]
+    fn iter231b_qwen35_nested_nine_required_keys_errors() {
+        let props: serde_json::Map<String, serde_json::Value> = (0..9)
+            .map(|i| (format!("k{}", i), serde_json::json!({"type": "integer"})))
+            .collect();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "cfg": {
+                    "type": "object",
+                    "properties": props,
+                    "required": ["k0","k1","k2","k3","k4","k5","k6","k7","k8"]
+                }
+            }
+        });
+        // Public API converts EmitterError → String; assert the payload.
+        let err = QWEN35
+            .tool_call_gbnf("f", &schema, GrammarShape::SingleBody)
+            .expect_err("9 nested required keys must error");
+        assert!(
+            err.contains("9 required parameters"),
+            "error must carry the required-key count: {}",
+            err
+        );
+        assert!(
+            err.contains("/cfg"),
+            "error must carry the nested path: {}",
+            err
+        );
+    }
+
+    /// Gemma4: nested object with declared properties — required keys in
+    /// any order (bare-key kv surface).
+    #[test]
+    fn iter231b_gemma4_nested_object_required_keys_any_order() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": {
+                        "host": {"type": "string"},
+                        "port": {"type": "integer"}
+                    },
+                    "required": ["host", "port"]
+                }
+            }
+        }"#;
+        let mut rt = gemma4_runtime("connect", schema);
+        let input = b"call:connect{server:{port:443,host:<|\"|>example.com<|\"|>}}";
+        assert!(rt.accept_bytes(input), "reversed required order rejected");
+        assert!(rt.is_accepted());
+    }
+
+    /// Gemma4: nested missing required key rejected; typed array items
+    /// enforced on the kv surface.
+    #[test]
+    fn iter231b_gemma4_nested_missing_required_and_typed_items_rejected() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": {
+                        "host": {"type": "string"},
+                        "port": {"type": "integer"}
+                    },
+                    "required": ["host", "port"]
+                },
+                "tags": {"type": "array", "items": {"type": "string"}}
+            }
+        }"#;
+        let mut rt = gemma4_runtime("connect", schema);
+        // port missing.
+        let input = b"call:connect{server:{host:<|\"|>example.com<|\"|>}}";
+        let ok = rt.accept_bytes(input);
+        assert!(!(ok && rt.is_accepted()), "missing nested required accepted");
+
+        let mut rt2 = gemma4_runtime("connect", schema);
+        // integer items against items:string.
+        let input2 = b"call:connect{server:{host:<|\"|>h<|\"|>,port:1},tags:[1,2]}";
+        let ok2 = rt2.accept_bytes(input2);
+        assert!(!(ok2 && rt2.is_accepted()), "typed array accepted wrong item type");
+    }
+
+    /// Gemma4 parser (iter-231b): nested structured arguments round-trip
+    /// into `arguments_json` as real JSON objects/arrays — the
+    /// pre-iter-231b string-only kv splitter mangled any nested value
+    /// containing a comma.
+    #[test]
+    fn iter231b_gemma4_parser_nested_arguments_round_trip() {
+        let body = "call:configure{config:{model:<|\"|>sonnet<|\"|>,retries:3,nested:{on:true,ids:[1,2]}},task:<|\"|>do it<|\"|>}";
+        let parsed = parse_gemma4_tool_call(body).expect("nested call must parse");
+        assert_eq!(parsed.name, "configure");
+        let args: serde_json::Value =
+            serde_json::from_str(&parsed.arguments_json).expect("arguments_json valid JSON");
+        assert_eq!(
+            args,
+            serde_json::json!({
+                "config": {
+                    "model": "sonnet",
+                    "retries": 3,
+                    "nested": {"on": true, "ids": [1, 2]}
+                },
+                "task": "do it"
+            })
+        );
+    }
+
+    /// Gemma4 parser (iter-231b): a comma INSIDE a nested container or a
+    /// quoted string must not split the top-level kv-list.
+    #[test]
+    fn iter231b_gemma4_parser_commas_inside_nested_values_do_not_split() {
+        let body = "call:f{tags:[<|\"|>a,b<|\"|>,2],note:<|\"|>x,y<|\"|>}";
+        let parsed = parse_gemma4_tool_call(body).expect("must parse");
+        let args: serde_json::Value =
+            serde_json::from_str(&parsed.arguments_json).expect("arguments_json valid JSON");
+        assert_eq!(
+            args,
+            serde_json::json!({
+                "tags": ["a,b", 2],
+                "note": "x,y"
+            })
+        );
+    }
+
+    /// Qwen35 parser sanity: nested JSON values already round-trip via
+    /// the JSON-first value decode (no iter-231b change needed there —
+    /// pin the contract so the two families stay symmetric).
+    #[test]
+    fn iter231b_qwen35_parser_nested_arguments_round_trip() {
+        let body = "<function=configure>\n<parameter=config>\n{\"model\":\"sonnet\",\"nested\":{\"ids\":[1,2]}}\n</parameter>\n</function>";
+        let parsed = parse_qwen35_tool_call(body).expect("nested call must parse");
+        assert_eq!(parsed.name, "configure");
+        let args: serde_json::Value =
+            serde_json::from_str(&parsed.arguments_json).expect("arguments_json valid JSON");
+        assert_eq!(
+            args,
+            serde_json::json!({"config": {"model": "sonnet", "nested": {"ids": [1, 2]}}})
+        );
+    }
+
+    /// Both families: top-level UNTYPED parameters now accept structured
+    /// values too (the template renders untyped args via tojson /
+    /// format_argument as well).
+    #[test]
+    fn iter231b_untyped_params_accept_structured_values() {
+        let schema = r#"{"type": "object", "properties": {"payload": {}}}"#;
+        let mut rt = qwen35_runtime("f", schema);
+        let q_input = b"<function=f>\n<parameter=payload>\n{\"k\":[1,2]}\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(q_input), "qwen untyped structured value rejected");
+        assert!(rt.is_accepted());
+
+        let mut rt2 = gemma4_runtime("f", schema);
+        let g_input = b"call:f{payload:{k:[1,2]}}";
+        assert!(rt2.accept_bytes(g_input), "gemma untyped structured value rejected");
+        assert!(rt2.is_accepted());
+    }
+
+    // -----------------------------------------------------------------------
+    // iter-231c — regex `pattern` keyword → GBNF compilation
+    // -----------------------------------------------------------------------
+
+    /// The exact iter-231c driver: a tool schema whose array items carry
+    /// `pattern: "^[a-z][a-z0-9-]*$"` (the ruvnet-brain `argv` shape that
+    /// 400'd opencode).  Grammar must accept conforming items and reject
+    /// non-conforming ones.
+    #[test]
+    fn iter231c_qwen35_pattern_on_array_items_enforced() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "argv": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"}
+                }
+            }
+        }"#;
+        let mut rt = qwen35_runtime("cli_help", schema);
+        let good = b"<function=cli_help>\n<parameter=argv>\n[\"ruflo\",\"claude-flow\",\"a\",\"z9-x\"]\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(good), "conforming argv rejected");
+        assert!(rt.is_accepted());
+
+        // "Bad" (uppercase start) violates the pattern — and the object
+        // is a top-level parameter block, so there is no wildcard tail
+        // to rescue it (top-level kleene alternation only).
+        let mut rt2 = qwen35_runtime("cli_help", schema);
+        let bad = b"<function=cli_help>\n<parameter=argv>\n[\"Bad\"]\n</parameter>\n</function>";
+        let ok = rt2.accept_bytes(bad);
+        assert!(!(ok && rt2.is_accepted()), "pattern-violating item accepted");
+
+        // "-x" (dash start) also violates it.
+        let mut rt3 = qwen35_runtime("cli_help", schema);
+        let bad2 = b"<function=cli_help>\n<parameter=argv>\n[\"-x\"]\n</parameter>\n</function>";
+        assert!(!(rt3.accept_bytes(bad2) && rt3.is_accepted()), "dash-start item accepted");
+    }
+
+    /// Quantified + alternation patterns on a nested string (year +
+    /// http-method shapes).
+    #[test]
+    fn iter231c_qwen35_pattern_quantifier_and_alternation() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "year": {"type": "string", "pattern": "^\\d{4}$"},
+                "method": {"type": "string", "pattern": "^(get|post|delete)$"}
+            },
+            "required": ["year"]
+        }"#;
+        // NOTE: top-level Qwen STRING params render RAW (no quotes —
+        // the template only `tojson`s non-string values), so the pattern
+        // applies to the unquoted text.
+        let mut rt = qwen35_runtime("f", schema);
+        let good = b"<function=f>\n<parameter=year>\n2026\n</parameter>\n<parameter=method>\npost\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(good), "valid quantifier/alternation strings rejected");
+        assert!(rt.is_accepted());
+
+        let mut rt2 = qwen35_runtime("f", schema);
+        // "202" is 3 digits — violates \d{4}.
+        let bad = b"<function=f>\n<parameter=year>\n202\n</parameter>\n</function>";
+        assert!(!(rt2.accept_bytes(bad) && rt2.is_accepted()), "3-digit year accepted");
+
+        let mut rt3 = qwen35_runtime("f", schema);
+        // "patch" is outside the alternation.
+        let bad2 = b"<function=f>\n<parameter=year>\n2026\n</parameter>\n<parameter=method>\npatch\n</parameter>\n</function>";
+        assert!(!(rt3.accept_bytes(bad2) && rt3.is_accepted()), "non-alternation method accepted");
+    }
+
+    /// Unanchored pattern = JSON Schema "contains" semantics: prefix and
+    /// suffix wildcards are added by the compiler.
+    #[test]
+    fn iter231c_qwen35_unanchored_pattern_is_contains() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "pattern": "needle"}
+            }
+        }"#;
+        let mut rt = qwen35_runtime("f", schema);
+        let input = b"<function=f>\n<parameter=text>\n\"a haystack with needle inside\"\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(input), "contains-match rejected");
+        assert!(rt.is_accepted());
+
+        let mut rt2 = qwen35_runtime("f", schema);
+        let bad = b"<function=f>\n<parameter=text>\n\"nothing here\"\n</parameter>\n</function>";
+        assert!(!(rt2.accept_bytes(bad) && rt2.is_accepted()), "non-containing accepted");
+    }
+
+    /// Gemma 4: pattern between the `<|"|>` markers.
+    #[test]
+    fn iter231c_gemma4_pattern_between_markers() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "argv": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"}
+                }
+            }
+        }"#;
+        let mut rt = gemma4_runtime("cli_help", schema);
+        let good = b"call:cli_help{argv:[<|\"|>ruflo<|\"|>,<|\"|>claude-flow<|\"|>]}";
+        assert!(rt.accept_bytes(good), "conforming argv rejected (gemma)");
+        assert!(rt.is_accepted());
+
+        let mut rt2 = gemma4_runtime("cli_help", schema);
+        let bad = b"call:cli_help{argv:[<|\"|>Bad<|\"|>]}";
+        assert!(!(rt2.accept_bytes(bad) && rt2.is_accepted()), "pattern-violating item accepted (gemma)");
+    }
+
+    /// Top-level string parameter with `pattern` (raw Qwen surface).
+    #[test]
+    fn iter231c_qwen35_toplevel_string_pattern() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "subcommand": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"}
+            }
+        }"#;
+        let mut rt = qwen35_runtime("cli", schema);
+        let good = b"<function=cli>\n<parameter=subcommand>\nstatus\n</parameter>\n</function>";
+        assert!(rt.accept_bytes(good), "valid top-level pattern string rejected");
+        assert!(rt.is_accepted());
+
+        let mut rt2 = qwen35_runtime("cli", schema);
+        let bad = b"<function=cli>\n<parameter=subcommand>\nStatus\n</parameter>\n</function>";
+        assert!(!(rt2.accept_bytes(bad) && rt2.is_accepted()), "invalid top-level pattern string accepted");
+    }
+
+    /// Non-regular regex features (backreference) remain an HONEST error
+    /// — never a silent permissive downgrade.
+    #[test]
+    fn iter231c_nonregular_pattern_errors_honestly() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "x": {"type": "string", "pattern": "^(a)\\1$"}
+            }
+        });
+        let err = QWEN35
+            .tool_call_gbnf("f", &schema, GrammarShape::SingleBody)
+            .expect_err("backreference must error");
+        assert!(err.contains("backreference"), "error names the feature: {}", err);
+        assert!(err.contains("/x"), "error carries the path: {}", err);
     }
 
     // -----------------------------------------------------------------------

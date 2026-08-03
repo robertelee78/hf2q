@@ -9976,3 +9976,172 @@ byte-identical to the PRE-fix baseline artifact. Gate-3 verdict PASS at
 round 3 (r1: 3 findings fixed — 40-module discipline pin, tools-carrying
 probe + suffix pin, specific reopen-record pin; r2: probe silent-false
 fallback replaced with 400 propagation). Full sweep green 5× consecutive.
+
+## 2026-08-02 — iter-231: nested-schema tool-arg grammar compilation (object/array parameters) + Gemma 4 nested-arg parser
+
+### Problem
+
+Every `/v1/chat/completions` request carrying a tool schema with an
+`object`- or `array`-typed parameter failed with HTTP 400:
+
+```
+Grammar compilation failed: tool_call_gbnf for 'X': function 'X'
+parameter 'config' uses unsupported schema type 'object'; ADR-005
+wave-2.5 limits tool args to scalars (string, integer, number,
+boolean, null); remove the parameter or convert it to a JSON-encoded string
+```
+
+Root cause chain: the wave-2.5 B3 emitters
+(`qwen35_value_rule` / `gemma4_value_gbnf`, registry.rs) hard-rejected
+structured parameter types with `EmitterError::UnsupportedSchema`, and
+`compile_tool_grammar` promoted that to a fatal 400 for the whole
+request. Real agentic clients (opencode + MCP tool servers, e.g.
+ruflo's 300+ tools with free-form `config`/`arguments` objects) declare
+such parameters routinely, so the serve path was unusable for agentic
+workloads — the exact workload class iter-229/230 opened.
+
+### Decision
+
+Full-fidelity recursive nested-schema compilation, not a bypass:
+
+1. **iter-231a — permissive leaf rules.** New eager-emitted rule sets
+   `qwen35-json-{char,str,obj,arr,val}` (compact-`tojson` surface,
+   `<` excluded from string chars so a value can never swallow
+   `</parameter>`) and `gemma4-json-{key,obj,arr,val}` (kv surface,
+   bare keys per `format_argument(escape_keys=False)`). These cover the
+   cases where the schema itself is open: free-form `{"type":"object"}`
+   with no `properties`, `{"type":"array"}` with no `items`, untyped
+   nodes, and the wildcard extra-kv tail of open objects.
+
+2. **iter-231b — recursive converters** (`qwen35_nested_value_rule`,
+   `gemma4_nested_value_rule`). Everything the schema DECLARES is
+   constrained: per-key value grammars for `properties`, `required`
+   (≤8) enforced any-order via a shared permutation builder
+   (`build_nested_kv_permutation`), typed `items`, scalar/container-
+   free `enum`s, type unions, `anyOf`/`oneOf` alternation,
+   `additionalProperties:false` closes the key set. Features the
+   grammar cannot enforce (`allOf`, `$ref`, `pattern`, `not`, tuple
+   `items`, container enums, >32 props, depth >32) return a NEW honest
+   error `EmitterError::UnsupportedSchemaFeature { fn_name,
+   param_path, feature }` → 400 naming feature + dot-path — never a
+   silent permissive downgrade. Constraint keywords (`minLength`,
+   `minimum`, `minItems`, `format`, …) are ignored (json_schema.rs
+   deferred-list parity). The wave-2.5 `UnsupportedSchema` variant is
+   DELETED as a unit (no-fallback mantra).
+
+3. **Gemma 4 parser parity.** `split_gemma4_top_level` +
+   `gemma4_value_to_json` replace the string-only kv splitter: nested
+   `{...}`/`[...]` values (commas included) now round-trip into
+   `arguments_json` as real JSON objects/arrays instead of being
+   mangled into string fields. Qwen parser already JSON-decoded values;
+   pinned by test.
+
+4. **Top-level untyped params** accept structured values too
+   (`QWEN35_TOP_ANY_VAL` / `GEMMA4_TOP_ANY_VAL`) — the templates render
+   untyped args via the same `tojson` / `format_argument` paths.
+
+### Rejection-strength contract (CFG limitation, SOTA parity)
+
+A REQUIRED key's value is always constrained by its declared grammar
+(the permutation position cannot be filled by the wildcard extra-kv
+branch), and a CLOSED object rejects any key/value mismatch. For OPEN
+objects (JSON Schema default) the wildcard extra-kv tail can re-match
+a declared OPTIONAL key with an unconstrained value — a CFG cannot
+express "any key except these". llama.cpp's json-schema-to-grammar and
+this crate's json_schema.rs share the identical limitation; optional-
+key value validation on open objects belongs to the tool server.
+Pinned by `iter231b_qwen35_open_object_wildcard_tail_documented`.
+
+### Tests (21 new, registry.rs)
+
+- iter-231a (7): free-form object/array accept under both emitters,
+  MCP-shaped tool with free-form `config` compiles + runs (the exact
+  opencode failure shape), `<`-in-JSON-string rejection guard,
+  scalars-unaffected.
+- iter-231b (14): required-any-order accept (both emitters), missing
+  required reject, `additionalProperties:false` gate, typed array
+  items enforced, nested enum + anyOf, `$ref` honest error with
+  dot-path, 9-required-keys error, Gemma parser nested round-trip,
+  comma-in-nested-value no-split, Qwen parser round-trip pin, untyped
+  structured accept, open-object wildcard contract pin.
+
+### Acceptance criteria — all met
+
+* `cargo test --bin hf2q iter231` — 21/21 pass.
+* Full sweep `cargo test` — 4120 passed, 0 failed (was 4092/2 at
+  session start: two PRE-EXISTING failures also fixed here — the H1
+  structural audit (`GOLDEN_OUTPUT` hoisted to module scope,
+  engine.rs) and the upstream citation drift canary (qwen35/qwen35moe
+  catalog line numbers re-transcribed against the current
+  /opt/llama.cpp llama-arch.cpp, incl. the stale
+  `convert_hf_to_gguf.py:4791` → `gguf-py/gguf/constants.py:1175`
+  pointer for `ssm_dt`).
+* `cargo build --bin hf2q` + test build: 0 warnings in-crate (8
+  pre-existing warnings fixed: 6 dead-code profiling items in
+  batched_body.rs marked `#[allow(dead_code)]` with the cfg(test)
+  consumer documented, 2 unused test-module imports removed, 1 unused
+  import + 1 dead binding in qwen35 GPU tests removed).
+
+### Fence respected
+
+Grammar/parser changes confined to `src/serve/api/registry.rs`.
+Warning/audit hygiene touches: `batched_body.rs`, `forward_gpu.rs`,
+`gpu_full_attn.rs`, `engine.rs`, `engine_qwen35.rs`,
+`src/arch/entries/qwen35{,moe}.rs` (citation re-transcription only).
+No touches to `src/backends/gguf.rs`, `src/ir/`, `src/convert/`,
+`src/quality/`, `src/quantize/`.
+
+### iter-231c (2026-08-02, same session) — regex `pattern` keyword → GBNF compilation
+
+**Problem.** The iter-231b honest-error gate immediately surfaced the
+next real-world feature gap: MCP tool schemas use the JSON Schema
+`pattern` regex keyword (ruvnet-brain's `argv` items:
+`^[a-z][a-z0-9-]*$`), so opencode requests still 400'd — now with
+`unsupported schema feature 'pattern'`.
+
+**Decision.** A real regex→GBNF compiler, not a bypass — frontier
+constraint engines (llguidance, xgrammar) compile regex into the
+grammar; deferring `pattern` was the llama.cpp-shaped gap, not a law.
+
+* New module `src/serve/api/grammar/regex_gbnf.rs`:
+  `regex_to_gbnf_body(pattern, Surface) -> Result<String, RegexError>`.
+  Recursive-descent regex parser (alternation / concatenation /
+  repetition / atom) emitting directly into the GBNF fragment language
+  (literals, char classes, groups, `* + ? {n} {n,m} {n,}` — all
+  natively supported by this crate's GBNF parser, repetition capped at
+  the parser's MAX_REPETITION_THRESHOLD = 2000).
+* Three string surfaces: `QwenJsonString` (content between JSON
+  quotes; `"` `\` `<` + control bytes intersected out of negated
+  classes and `.`), `QwenRawString` / `GemmaMarkerString` (`<`
+  excluded). Same close-tag-safety contract as the scalar string rules.
+* JSON Schema `pattern` is UNANCHORED ("contains"); `^`/`$` are
+  stripped and the body wrapped in surface wildcards per the anchor
+  combination.
+* Honest `Err` (→ `UnsupportedSchemaFeature` 400, never a silent
+  permissive downgrade): backreferences, look-around, `\b`/`\A`/`\z`
+  assertions, `\p{...}` property classes, complement class-escapes
+  inside classes, repetition bounds > 2000.
+* Wired into all four string arms (qwen35/gemma4 × top-level/nested).
+  `pattern` removed from the unsupported-feature lists.
+
+**Enforcement level (documented).** Patterns enforce on the RAW string
+text the model emits (between quotes / markers / tags). JSON escape
+sequences (`\u0061`) do not satisfy pattern classes; models emit plain
+text for the ASCII-identifier patterns used in practice.
+
+**Tests (10 module + 6 registry).** Compilation shape pins (anchors,
+quantifiers, alternation, negated-class surface intersection, contains
+wrappers, error set), compiled-bodies-parse-as-GBNF, the exact
+ruvnet-brain `argv` schema accept/reject under both emitters,
+quantifier + alternation on raw top-level strings, unanchored
+contains-semantics, Gemma marker-surface, backreference honest error.
+
+**Live verification (qwen3.6 APEX-Q5_K_M, debug binary).** The exact
+failing ruvnet-brain-shaped request: pre-fix HTTP 400
+(`unsupported schema feature 'pattern'`); post-fix
+`finish_reason: "tool_calls"` with `ruvnet_cli_run
+{"argv":["memory","search"],"executable":"ruflo"}`, and a forced
+`ruvnet_cli_help` call returned `argv: ["memory"]` — every argv item
+conforming to `^[a-z][a-z0-9-]*$` under the active grammar.
+
+**Full sweep.** `cargo test --bin hf2q`: 3686 passed / 0 failed.
