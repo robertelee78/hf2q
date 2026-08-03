@@ -6053,6 +6053,12 @@ fn run_slot_aware_gemma4(
         && crate::debug::INVESTIGATION_ENV.hybrid_kv
         && std::env::var("HF2Q_DFLASH_XLEN_SDPA").as_deref() != Ok("1");
 
+    // ADR-040 production profiling — zero the buckets at worker entry so the
+    // worker-exit dump reflects THIS worker's lifetime, not leftover state.
+    // Mirrors the throughput-probe test fn's reset-before-timed-run pattern.
+    crate::inference::models::gemma4::batched_body::catsplit::reset();
+    crate::inference::models::gemma4::batched_body::host_phases::reset();
+
     'worker: loop {
         let _hp_iter = std::time::Instant::now();
         // ── ADMIT ────────────────────────────────────────────────────
@@ -6309,6 +6315,70 @@ fn run_slot_aware_gemma4(
             crate::inference::models::gemma4::batched_body::host_phases::Phase::WorkerIter,
             _hp_iter.elapsed().as_nanos() as u64,
         );
+    }
+
+    // ADR-040 production profiling emit — when HF2Q_DECODE_CATSPLIT=1 or
+    // HF2Q_HOST_PHASES=1, dump the accumulated buckets at worker-thread exit.
+    // Mirrors the throughput-probe test fn's [CATSPLIT]/[HOST_PHASES] tables
+    // but reports WORKER-LIFETIME totals (not per-token/per-step) since the
+    // worker accumulates across its entire run.
+    if *crate::inference::models::gemma4::batched_body::catsplit::ENABLED {
+        let snap = crate::inference::models::gemma4::batched_body::catsplit::snapshot();
+        let mut rows: Vec<(&str, u64, u64, u64)> = snap
+            .into_iter()
+            .filter(|(_, ns, _, disp)| *ns > 0 || *disp > 0)
+            .collect();
+        let sum_ns: u64 = rows.iter().map(|(_, ns, _, _)| *ns).sum::<u64>().max(1);
+        let sum_disp: u64 = rows.iter().map(|(_, _, _, d)| *d).sum::<u64>();
+        rows.sort_by(|a, b| b.3.cmp(&a.3));
+        eprintln!(
+            "[CATSPLIT] worker-exit lifetime dump: {} categories, {} total dispatches:",
+            rows.len(),
+            sum_disp,
+        );
+        eprintln!(
+            "[CATSPLIT]   {:<40} {:>12} {:>8} {:>12} {:>10}",
+            "category", "total_ms", "% step", "total_disp", "total_cbs",
+        );
+        for (name, ns, cbs, disp) in &rows {
+            eprintln!(
+                "[CATSPLIT]   {:<40} {:>12.3} {:>7.1}% {:>12} {:>10}",
+                name,
+                *ns as f64 / 1e6,
+                100.0 * *ns as f64 / sum_ns as f64,
+                disp,
+                cbs,
+            );
+        }
+        eprintln!(
+            "[CATSPLIT]   {:<40} {:>12.3} {:>7.1}% (category-sum; CB-serialized, > real overlapped step)",
+            "TOTAL",
+            sum_ns as f64 / 1e6,
+            100.0,
+        );
+    }
+    if *crate::inference::models::gemma4::batched_body::host_phases::ENABLED {
+        let hp = crate::inference::models::gemma4::batched_body::host_phases::snapshot();
+        if hp.iter().any(|(_, ns)| *ns > 0) {
+            let leaf = hp.len().saturating_sub(2);
+            let total: u64 = hp.iter().take(leaf).map(|(_, ns)| *ns).sum();
+            eprintln!("[HOST_PHASES] worker-exit lifetime dump:");
+            for (i, (name, ns)) in hp.iter().enumerate() {
+                let tag = if i >= leaf { " [ref]" } else { "" };
+                eprintln!(
+                    "[HOST_PHASES]   {:<32} {:>10.3} ms ({:5.1}%){}",
+                    name,
+                    *ns as f64 / 1e6,
+                    100.0 * *ns as f64 / total.max(1) as f64,
+                    tag,
+                );
+            }
+            eprintln!(
+                "[HOST_PHASES]   {:<32} {:>10.3} ms (sum of leaf phases)",
+                "TOTAL",
+                total as f64 / 1e6,
+            );
+        }
     }
 
     // Guard drops here → KV restored into `model` on every exit path.

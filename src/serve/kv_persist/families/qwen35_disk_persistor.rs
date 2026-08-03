@@ -44,7 +44,7 @@ use crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot;
 
 use super::qwen35_hybrid_persistor::{
     deserialize_hybrid_with_sidecar, serialize_hybrid_with_sidecar, FullAttnCodec,
-    KvSubstrate, LcpSidecarMetadata, Qwen35HybridConfig,
+    LcpSidecarMetadata, Qwen35HybridConfig,
 };
 
 /// Disk-backed cold-resume persistor for qwen35 hybrid snapshots.
@@ -420,6 +420,7 @@ fn full_attn_codec_byte(codec: FullAttnCodec) -> u8 {
 mod tests {
     use super::*;
     use crate::inference::models::qwen35::kv_cache::MtpKvSnapshot;
+    use crate::serve::kv_persist::families::qwen35_hybrid_persistor::KvSubstrate;
     use crate::serve::kv_persist::format::ModelFingerprint;
     use mlx_native::DType;
 
