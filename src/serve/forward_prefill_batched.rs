@@ -4112,6 +4112,166 @@ impl MlxModelWeights {
             row3("RESIDUAL (sync + CPU)", residual_ms, pct(residual_ms));
         }
 
+        // ADR-017 Phase E.a "gemma-hybrid-lcp" (2026-08-03) — end-of-
+        // prefill LCP snapshots for the BATCHED prefill route (iter-344's
+        // production default for SerialFifo gemma chat). The sibling
+        // `forward_prefill_with_soft_tokens_resume` has carried these
+        // snapshots since iter-3.5b, but that fn only runs when an LCP
+        // resume is already engaged or for multimodal/soft-token
+        // requests — every FRESH SerialFifo chat request routes through
+        // THIS fn, so without snapshots here the LCP registry was never
+        // populated in production (registry-empty probe misses for both
+        // dense and hybrid regimes).
+        //
+        // Gates + copy semantics mirror forward_prefill.rs exactly:
+        //   * `kv_lcp_resume` (default-on env);
+        //   * resumable regime = use_dense || hybrid allocated this
+        //     prefill (HB-encoded opt-out regime stays byte-identical:
+        //     no snapshot);
+        //   * `snapshot_safe` = !any_sliding || seq_len <= sw (this fn's
+        //     sliding layers are always ring cap=sw — no LONG_RESUME
+        //     linear trick exists on the batched route).
+        // Dense snapshot copies the first seq_len positions per head;
+        // hybrid snapshot (F16 K + U8 V packed + F32 V norms) same.
+        let any_sliding_layer = self
+            .layers
+            .iter()
+            .any(|l| l.layer_type == LayerType::Sliding);
+        let lcp_resumable_regime = INVESTIGATION_ENV.use_dense || self.hybrid_kv.is_some();
+        let snapshot_safe = !any_sliding_layer || seq_len <= sw;
+        let lcp_snapshots_on = INVESTIGATION_ENV.kv_lcp_resume
+            && lcp_resumable_regime
+            && snapshot_safe;
+        if INVESTIGATION_ENV.kv_lcp_resume && lcp_resumable_regime && !snapshot_safe {
+            tracing::debug!(
+                "lcp_snapshot skipped (batched prefill-wrap guard): seq_len={} > sw={} \
+                 on a model with sliding layers; the live ring already wrapped during \
+                 prefill so no snapshot can faithfully reconstruct [0..K).",
+                seq_len, sw
+            );
+        }
+        let snap_cap = sw.max(seq_len + max_decode_tokens);
+        let dense_snapshot_for_lcp: Option<Vec<std::sync::Arc<DenseKvBuffers>>> =
+            if lcp_snapshots_on {
+                let mut snap: Vec<std::sync::Arc<DenseKvBuffers>> =
+                    Vec::with_capacity(num_layers);
+                for live_layer in dense_kvs_vec.iter() {
+                    let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
+                    let live_cap_dim =
+                        live_layer.k.shape().get(1).copied().unwrap_or(live_layer.capacity);
+                    let hd_dim = live_layer.k.shape().get(2).copied().unwrap_or(0);
+                    let elem = live_layer.dtype.size_of();
+                    let mut k_snap = dev
+                        .alloc_buffer(nkv_dim * snap_cap * hd_dim * elem, live_layer.dtype, vec![nkv_dim, snap_cap, hd_dim])
+                        .map_err(|e| anyhow::anyhow!("lcp snapshot K alloc: {e}"))?;
+                    let mut v_snap = dev
+                        .alloc_buffer(nkv_dim * snap_cap * hd_dim * elem, live_layer.dtype, vec![nkv_dim, snap_cap, hd_dim])
+                        .map_err(|e| anyhow::anyhow!("lcp snapshot V alloc: {e}"))?;
+                    let k_src: &[u8] = live_layer.k.as_slice()
+                        .map_err(|e| anyhow::anyhow!("lcp snapshot K src: {e}"))?;
+                    let v_src: &[u8] = live_layer.v.as_slice()
+                        .map_err(|e| anyhow::anyhow!("lcp snapshot V src: {e}"))?;
+                    let k_dst: &mut [u8] = k_snap.as_mut_slice()
+                        .map_err(|e| anyhow::anyhow!("lcp snapshot K dst: {e}"))?;
+                    let v_dst: &mut [u8] = v_snap.as_mut_slice()
+                        .map_err(|e| anyhow::anyhow!("lcp snapshot V dst: {e}"))?;
+                    let copy_len = seq_len * hd_dim * elem;
+                    let src_stride = live_cap_dim * hd_dim * elem;
+                    let dst_stride = snap_cap * hd_dim * elem;
+                    for h in 0..nkv_dim {
+                        let so = h * src_stride;
+                        let do_ = h * dst_stride;
+                        k_dst[do_..do_ + copy_len].copy_from_slice(&k_src[so..so + copy_len]);
+                        v_dst[do_..do_ + copy_len].copy_from_slice(&v_src[so..so + copy_len]);
+                    }
+                    snap.push(std::sync::Arc::new(DenseKvBuffers {
+                        k: k_snap,
+                        v: v_snap,
+                        capacity: snap_cap,
+                        is_sliding: live_layer.is_sliding,
+                        dtype: live_layer.dtype,
+                    }));
+                }
+                Some(snap)
+            } else {
+                None
+            };
+        let hybrid_snapshot_for_lcp: Option<
+            Vec<std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>>,
+        > = if lcp_snapshots_on {
+            match self.hybrid_kv.as_ref() {
+                None => None,
+                Some(live_hybrid) => {
+                    let mut hsnap: Vec<
+                        std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>,
+                    > = Vec::with_capacity(live_hybrid.len());
+                    for live_layer in live_hybrid.iter() {
+                        let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
+                        let live_cap_dim =
+                            live_layer.k.shape().get(1).copied().unwrap_or(live_layer.capacity);
+                        let hd_dim = live_layer.k.shape().get(2).copied().unwrap_or(0);
+                        let npp = live_layer.norms_per_pos.max(1);
+                        let mut k_snap = dev
+                            .alloc_buffer(nkv_dim * snap_cap * hd_dim * 2, DType::F16, vec![nkv_dim, snap_cap, hd_dim])
+                            .map_err(|e| anyhow::anyhow!("lcp hybrid snapshot K alloc: {e}"))?;
+                        let mut vp_snap = dev
+                            .alloc_buffer(nkv_dim * snap_cap * hd_dim, DType::U8, vec![nkv_dim, snap_cap, hd_dim])
+                            .map_err(|e| anyhow::anyhow!("lcp hybrid snapshot V alloc: {e}"))?;
+                        let vn_shape = if npp == 1 {
+                            vec![nkv_dim, snap_cap]
+                        } else {
+                            vec![nkv_dim, snap_cap, npp]
+                        };
+                        let mut vn_snap = dev
+                            .alloc_buffer(nkv_dim * snap_cap * npp * 4, DType::F32, vn_shape)
+                            .map_err(|e| anyhow::anyhow!("lcp hybrid snapshot V norms alloc: {e}"))?;
+                        let copy_prefix = |src: &MlxBuffer,
+                                           dst: &mut MlxBuffer,
+                                           elem: usize,
+                                           inner: usize,
+                                           what: &str|
+                         -> anyhow::Result<()> {
+                            let s: &[u8] = src
+                                .as_slice()
+                                .map_err(|e| anyhow::anyhow!("lcp hybrid snapshot {what} src: {e}"))?;
+                            let d: &mut [u8] = dst
+                                .as_mut_slice()
+                                .map_err(|e| anyhow::anyhow!("lcp hybrid snapshot {what} dst: {e}"))?;
+                            let copy_len = seq_len * inner * elem;
+                            let src_stride = live_cap_dim * inner * elem;
+                            let dst_stride = snap_cap * inner * elem;
+                            for h in 0..nkv_dim {
+                                let so = h * src_stride;
+                                let do_ = h * dst_stride;
+                                d[do_..do_ + copy_len].copy_from_slice(&s[so..so + copy_len]);
+                            }
+                            Ok(())
+                        };
+                        copy_prefix(&live_layer.k, &mut k_snap, 2, hd_dim, "K")?;
+                        copy_prefix(&live_layer.v_packed, &mut vp_snap, 1, hd_dim, "V packed")?;
+                        copy_prefix(&live_layer.v_norms, &mut vn_snap, 4, npp, "V norms")?;
+                        hsnap.push(std::sync::Arc::new(
+                            crate::inference::models::gemma4::kv_cache::HybridKvBuffers {
+                                k: k_snap,
+                                v_packed: vp_snap,
+                                v_norms: vn_snap,
+                                capacity: snap_cap,
+                                is_sliding: live_layer.is_sliding,
+                                norms_per_pos: live_layer.norms_per_pos,
+                                bf16_xlen_k: None,
+                                bf16_xlen_v: None,
+                            },
+                        ));
+                    }
+                    Some(hsnap)
+                }
+            }
+        } else {
+            None
+        };
+        self.dense_kvs_snapshot_for_lcp = dense_snapshot_for_lcp;
+        self.hybrid_kv_snapshot_for_lcp = hybrid_snapshot_for_lcp;
+
         // Store dense KV buffers so forward_decode can use them.
         //
         // ADR-017 Phase E.a iter-2.5: wrap each per-layer

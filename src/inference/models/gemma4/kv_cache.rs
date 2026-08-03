@@ -866,6 +866,100 @@ impl crate::serve::kv_persist::lcp_registry::ByteSized for HybridKvBuffers {
     }
 }
 
+/// ADR-017 Phase E.a sub-iter "gemma-hybrid-lcp" (2026-08-03) — per-layer
+/// payload for Gemma 4's LCP partial-prefill registry across KV regimes.
+///
+/// Why this exists: the registry previously stored `Vec<Arc<DenseKvBuffers>>`
+/// and the end-of-prefill snapshot was gated `kv_lcp_resume && use_dense` —
+/// under the PRODUCTION hybrid regime (`HF2Q_HYBRID_KV` default-ON,
+/// ADR-029 iter-13) no snapshot was ever taken, so Gemma 4 had NO LCP
+/// prefix resume at all in production (safe but slow; every multi-turn
+/// request re-prefilled the full conversation).
+///
+/// The dual-leg requirement comes from how prefill + decode consume the
+/// caches: prefill attention reads the DENSE SDPA path
+/// (`forward_prefill.rs` `flash_attn_vec` over `dense_kvs`), while decode
+/// under the hybrid regime reads `hybrid_kv` (F16 K + TQ-HB V). An LCP
+/// resume must therefore restore BOTH legs — dense for the resumed
+/// prefill's attention over `[0..k)`, hybrid for the subsequent decode —
+/// or the resumed request attends over zeroed bytes on the unrestored
+/// leg (the same silent-corruption class ADR-027 sub-iter 23d-γ closed
+/// for qwen35).
+///
+/// Regime matrix (process-fixed at startup):
+///   * `use_dense=1` (legacy dense regime) → `Dense` (today's path,
+///     unchanged).
+///   * hybrid production (`hybrid_kv=1`) → `DenseAndHybrid`.
+///   * HB-encoded opt-out (`hybrid_kv=0` without use_dense) → `Dense`
+///     payload, but the engine gate keeps LCP auto-disabled there
+///     (`effective_kv_lcp_resume` — packed-K restore is NOT covered by
+///     this sub-iter; restoring only the dense leg would corrupt decode
+///     on the packed leg).
+pub enum GemmaLcpLayerKv {
+    /// Dense-only payload (legacy dense regime; unchanged semantics).
+    Dense(DenseKvBuffers),
+    /// Production hybrid payload: dense leg (prefill SDPA) + hybrid leg
+    /// (decode). Tuple order is (dense, hybrid) — the same order the
+    /// install site mounts them (`weights.dense_kvs`, then
+    /// `weights.hybrid_kv`).
+    DenseAndHybrid(DenseKvBuffers, HybridKvBuffers),
+}
+
+/// Manual Debug (the leg types don't implement it — MlxBuffer fields).
+/// Compact: variant + capacities only, no buffer contents.
+impl std::fmt::Debug for GemmaLcpLayerKv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dense(d) => f
+                .debug_struct("Dense")
+                .field("capacity", &d.capacity)
+                .field("is_sliding", &d.is_sliding)
+                .field("dtype", &d.dtype)
+                .finish(),
+            Self::DenseAndHybrid(d, h) => f
+                .debug_struct("DenseAndHybrid")
+                .field("dense_capacity", &d.capacity)
+                .field("hybrid_capacity", &h.capacity)
+                .field("is_sliding", &d.is_sliding)
+                .finish(),
+        }
+    }
+}
+
+impl GemmaLcpLayerKv {
+    /// The dense leg, regardless of variant (always present).
+    pub fn dense(&self) -> &DenseKvBuffers {
+        match self {
+            Self::Dense(d) => d,
+            Self::DenseAndHybrid(d, _) => d,
+        }
+    }
+
+    /// The hybrid leg when present.
+    pub fn hybrid(&self) -> Option<&HybridKvBuffers> {
+        match self {
+            Self::Dense(_) => None,
+            Self::DenseAndHybrid(_, h) => Some(h),
+        }
+    }
+}
+
+impl crate::serve::kv_persist::lcp_registry::ByteSized for GemmaLcpLayerKv {
+    /// Exact byte count across both legs (hybrid variant) or the dense
+    /// leg alone — no estimation, same discipline as the sibling impls.
+    fn byte_len(&self) -> u64 {
+        match self {
+            Self::Dense(d) => {
+                crate::serve::kv_persist::lcp_registry::ByteSized::byte_len(d)
+            }
+            Self::DenseAndHybrid(d, h) => {
+                crate::serve::kv_persist::lcp_registry::ByteSized::byte_len(d)
+                    + crate::serve::kv_persist::lcp_registry::ByteSized::byte_len(h)
+            }
+        }
+    }
+}
+
 /// ADR-028 Phase 10c (iter-348): per-layer F16-K + TQ-HB-V buffer allocator.
 ///
 /// Single-source-of-truth for the hybrid allocation shape — called from
@@ -6262,5 +6356,68 @@ mod tests {
         assert_eq!(c.seq_len(SlotId(0)).unwrap(), 4, "H162: src cursor unchanged");
         let src_kp_after = c.k_packed.as_slice::<u8>().unwrap()[..slot_kp].to_vec();
         assert_eq!(src_kp, src_kp_after, "H162 FALSIFIED: src k_packed mutated");
+    }
+
+    // -----------------------------------------------------------------
+    // "gemma-hybrid-lcp" (2026-08-03) — GemmaLcpLayerKv payload contract
+    // -----------------------------------------------------------------
+
+    /// ByteSized must sum both legs exactly (no estimation — the LCP
+    /// registry's byte budget is enforced off this value).
+    #[test]
+    fn gemma_lcp_layer_kv_bytesized_sums_both_legs() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let dev = MlxDevice::new().expect("device");
+        let (nkv, cap, hd) = (2usize, 8usize, 4usize);
+        let dense = DenseKvBuffers {
+            k: dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap(),
+            v: dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap(),
+            capacity: cap,
+            is_sliding: false,
+            dtype: DType::F32,
+        };
+        let hybrid = HybridKvBuffers {
+            k: dev.alloc_buffer(nkv * cap * hd * 2, DType::F16, vec![nkv, cap, hd]).unwrap(),
+            v_packed: dev.alloc_buffer(nkv * cap * hd, DType::U8, vec![nkv, cap, hd]).unwrap(),
+            v_norms: dev.alloc_buffer(nkv * cap * 4, DType::F32, vec![nkv, cap]).unwrap(),
+            capacity: cap,
+            is_sliding: false,
+            norms_per_pos: 1,
+            bf16_xlen_k: None,
+            bf16_xlen_v: None,
+        };
+        use crate::serve::kv_persist::lcp_registry::ByteSized;
+        let d_bytes = ByteSized::byte_len(&dense);
+        let h_bytes = ByteSized::byte_len(&hybrid);
+        assert_eq!(d_bytes, (nkv * cap * hd * 4 * 2) as u64, "dense = 2 F32 buffers");
+        assert_eq!(h_bytes, (nkv * cap * hd * 2 + nkv * cap * hd + nkv * cap * 4) as u64);
+
+        let dense_only = GemmaLcpLayerKv::Dense(DenseKvBuffers {
+            k: dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap(),
+            v: dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap(),
+            capacity: cap,
+            is_sliding: false,
+            dtype: DType::F32,
+        });
+        assert_eq!(ByteSized::byte_len(&dense_only), d_bytes);
+        let both = GemmaLcpLayerKv::DenseAndHybrid(
+            DenseKvBuffers {
+                k: dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap(),
+                v: dev.alloc_buffer(nkv * cap * hd * 4, DType::F32, vec![nkv, cap, hd]).unwrap(),
+                capacity: cap,
+                is_sliding: false,
+                dtype: DType::F32,
+            },
+            hybrid,
+        );
+        assert_eq!(
+            ByteSized::byte_len(&both),
+            d_bytes + h_bytes,
+            "DenseAndHybrid byte_len must sum dense + hybrid legs exactly"
+        );
+        // Accessors.
+        assert!(both.hybrid().is_some());
+        assert!(dense_only.hybrid().is_none());
+        assert_eq!(both.dense().capacity, cap);
     }
 }

@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Gemma 4 LCP partial-prefill resume under the production hybrid regime ("gemma-hybrid-lcp")
+
+- **Gemma 4 has prefix caching in production for the first time.** The
+  LCP resume path previously restored only dense F32 K/V and its
+  snapshot was gated `HF2Q_USE_DENSE=1` — under the production hybrid
+  regime (F16-K + TQ-HB V, `HF2Q_HYBRID_KV` default-on) no snapshot was
+  ever taken, so every multi-turn request re-prefilled the full
+  conversation.
+- Root-cause fix for a silent production gap: the iter-344 batched
+  prefill route (`forward_prefill_batched`, the SerialFifo default for
+  gemma chat) populated **neither** LCP snapshot — so the registry
+  stayed empty and every probe missed, for dense AND hybrid regimes
+  alike. Both snapshots are now populated there.
+- New regime-aware per-layer registry payload `GemmaLcpLayerKv`
+  (`Dense` / `DenseAndHybrid`): prefill attention reads the dense leg,
+  decode under hybrid reads the hybrid leg — an LCP resume restores
+  BOTH, closing the same silent-corruption class ADR-027 sub-iter 23d-γ
+  closed for qwen35. Regime-consistency check at install rejects
+  cross-substrate entries (dense-only entry under hybrid = clean miss,
+  never a zero-restore).
+- `effective_kv_lcp_resume` widened: resumable substrates are now
+  gemma-dense, gemma-hybrid, and qwen35-TQ (23d-γ); the HB-encoded
+  opt-out regime stays auto-disabled. LCP is now default-on for
+  production gemma and qwen35 serves.
+- Gates: durable integration test
+  `gemma_hybrid_lcp_partial_prefix_byte_identity` (two-server,
+  engagement-asserted) + live ENGAGED trace `K=516 of N=537` with
+  byte-identical output vs cold control (non-streaming and streaming).
+  Known boundary: gemma LCP still skips prompts > `sliding_window`
+  (1024) — LONG_RESUME is dense-only today; hybrid long-resume is
+  follow-up work.
+
 ### Fixed — TQ-only LCP resume + disk persist made production-correct (ADR-027 sub-iter 23d-γ)
 
 - **Silent coherence corruption fixed in TQ-only LCP resume.**

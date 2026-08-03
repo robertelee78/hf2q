@@ -32,4 +32,4 @@ pub mod tokenizer;
 // Re-exports collapse import-site churn for the most-touched types.
 pub use model::MlxModelWeights;
 pub use profile::{ProfileAccumulator, TokenProfile, KernelTypeProfile};
-pub use kv_cache::{DenseKvBuffers, HbKvBuffers, HybridKvBuffers, MlxKvCache, DecodeRegime};
+pub use kv_cache::{DenseKvBuffers, GemmaLcpLayerKv, HbKvBuffers, HybridKvBuffers, MlxKvCache, DecodeRegime};

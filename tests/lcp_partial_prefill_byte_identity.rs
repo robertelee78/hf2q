@@ -130,6 +130,21 @@ fn spawn_server(
     port: u16,
     extra_envs: &[(&str, &str)],
 ) -> ServerGuard {
+    spawn_server_with_base(bin, model, port, &[("HF2Q_USE_DENSE", "1")], extra_envs)
+}
+
+/// "gemma-hybrid-lcp" (2026-08-03) — env-parameterized variant of
+/// [`spawn_server`]. The hybrid-regime test must run WITHOUT the baked
+/// `HF2Q_USE_DENSE=1` (the production default regime is hybrid F16-K +
+/// TQ-HB V; setting USE_DENSE would test the legacy dense path, not the
+/// production hybrid path this sub-iter ships).
+fn spawn_server_with_base(
+    bin: &Path,
+    model: &Path,
+    port: u16,
+    base_envs: &[(&str, &str)],
+    extra_envs: &[(&str, &str)],
+) -> ServerGuard {
     let mut cmd = Command::new(bin);
     cmd.args([
         "serve",
@@ -140,9 +155,11 @@ fn spawn_server(
         "--port",
         &port.to_string(),
     ])
-    .env("HF2Q_USE_DENSE", "1")
     .stdout(Stdio::null())
     .stderr(Stdio::piped());
+    for (k, v) in base_envs {
+        cmd.env(k, v);
+    }
     for (k, v) in extra_envs {
         cmd.env(k, v);
     }
@@ -1707,5 +1724,111 @@ fn iter3_6_long_prompt_resume_byte_identity() {
          Phase A iter-3.6 invariant verified.",
         p_decoded_a.len(),
         p_decoded_b.len()
+    );
+}
+
+/// ADR-017 Phase E.a "gemma-hybrid-lcp" (2026-08-03) — hybrid-regime
+/// K<N partial-prefix byte-identity falsifier.
+///
+/// Production-regime counterpart to [`iter3_partial_prefix_byte_identity`]:
+/// NEITHER server gets `HF2Q_USE_DENSE=1`, so both run the PRODUCTION
+/// hybrid regime (F16-K + TQ-HB V, `HF2Q_HYBRID_KV` default-on). Server
+/// A additionally gets `HF2Q_KV_LCP_RESUME=1` (explicit, though the
+/// widened `effective_kv_lcp_resume` gate also admits default-on under
+/// hybrid) and is primed with Q before P; server B receives P cold
+/// (empty registry → fresh prefill = control).
+///
+/// What this pins end-to-end:
+///   * the batched-prefill route (iter-344 default for SerialFifo)
+///     populates BOTH end-of-prefill snapshots (dense + hybrid legs) —
+///     pre-sub-iter it populated NEITHER, so the registry stayed empty
+///     and every gemma LCP probe missed in production;
+///   * the dual-leg install (`weights.dense_kvs` for the resumed
+///     prefill's SDPA + `weights.hybrid_kv` for the subsequent decode);
+///   * byte-identity of the resumed-path output vs the cold control —
+///     the falsifier for silent prefix corruption on either leg.
+///
+/// Engagement is asserted via `hf2q_kv_lcp_detected_total >= 1` on
+/// server A (vacuous-pass guard, same as the dense test).
+#[test]
+fn gemma_hybrid_lcp_partial_prefix_byte_identity() {
+    let model_path = match resolve_model_path_or_skip() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[gemma-hybrid-lcp falsifier] {ENV_PHASE_D_GATE}=1 not set — short-circuit.                  Set {ENV_PHASE_D_GATE}=1 + {ENV_MODEL_PATH}=PATH to run."
+            );
+            return;
+        }
+    };
+    let bin = hf2q_binary_path();
+    assert!(
+        bin.exists(),
+        "[gemma-hybrid-lcp falsifier] hf2q binary not found at {}",
+        bin.display()
+    );
+
+    // ── Server A: hybrid regime + LCP resume enabled ──
+    let server_a = spawn_server_with_base(
+        &bin,
+        &model_path,
+        PORT_A,
+        &[],
+        &[("HF2Q_KV_LCP_RESUME", "1")],
+    );
+    wait_for_readyz(&server_a);
+    let canonical_a = fetch_canonical_model_id(&server_a);
+    eprintln!(
+        "[gemma-hybrid-lcp falsifier] server A (hybrid + LCP_RESUME=1) ready on {}:{} model={}",
+        HOST, PORT_A, canonical_a
+    );
+
+    // Prime the registry with Q.
+    let q_decoded_a = chat_decode(&server_a, &canonical_a, PROMPT_Q, MAX_TOKENS);
+    assert!(
+        !q_decoded_a.is_empty(),
+        "[gemma-hybrid-lcp falsifier] Q decoded empty on server A"
+    );
+
+    // Probe with P — LCP resume should engage (dense leg for prefill
+    // SDPA + hybrid leg for decode, both restored).
+    let p_decoded_a = chat_decode(&server_a, &canonical_a, PROMPT_P, MAX_TOKENS);
+    assert!(
+        !p_decoded_a.is_empty(),
+        "[gemma-hybrid-lcp falsifier] P decoded empty on server A (hybrid resume path)"
+    );
+
+    // Engagement assertion (vacuous-pass guard).
+    let metrics_body_a = fetch_metrics(&server_a);
+    let lcp_detected_a = metric_lcp_detected_total(&metrics_body_a);
+    assert!(
+        lcp_detected_a >= 1,
+        "[gemma-hybrid-lcp falsifier] server A detected_total={} — the hybrid LCP \
+         probe did NOT detect (registry never populated OR probe broken). \
+         Byte-identity below would be vacuous.",
+        lcp_detected_a
+    );
+
+    // ── Server B: cold control (hybrid regime, no priming → fresh prefill) ──
+    let server_b = spawn_server_with_base(&bin, &model_path, PORT_B, &[], &[]);
+    wait_for_readyz(&server_b);
+    let canonical_b = fetch_canonical_model_id(&server_b);
+    let p_decoded_b = chat_decode(&server_b, &canonical_b, PROMPT_P, MAX_TOKENS);
+    assert!(
+        !p_decoded_b.is_empty(),
+        "[gemma-hybrid-lcp falsifier] P decoded empty on server B (control)"
+    );
+
+    // THE FALSIFIER.
+    assert_eq!(
+        p_decoded_a, p_decoded_b,
+        "[gemma-hybrid-lcp falsifier] hybrid LCP resume output diverged from cold \
+         control — silent prefix corruption on the dense or hybrid leg. \
+         A (resumed): {:?} | B (cold): {:?}",
+        p_decoded_a, p_decoded_b
+    );
+    eprintln!(
+        "[gemma-hybrid-lcp falsifier] PASS — hybrid resume byte-identical ({} bytes, K<N resume engaged)",
+        p_decoded_a.len()
     );
 }

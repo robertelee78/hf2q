@@ -439,6 +439,15 @@ pub struct MlxModelWeights {
     /// at the cost of one extra per-layer KV allocation + memcpy per
     /// resume-eligible request (~50ms on Gemma 4 26B).
     pub dense_kvs_snapshot_for_lcp: Option<Vec<std::sync::Arc<DenseKvBuffers>>>,
+    /// ADR-017 Phase E.a "gemma-hybrid-lcp" (2026-08-03) — end-of-prefill
+    /// snapshot of the hybrid leg (F16 K + TQ-HB V) for the LCP registry,
+    /// mirroring `dense_kvs_snapshot_for_lcp`. Populated only when
+    /// `kv_lcp_resume` is on AND the hybrid regime allocated
+    /// `self.hybrid_kv` this prefill (production default). Decode under
+    /// the hybrid regime reads `hybrid_kv`, so an LCP resume must restore
+    /// this leg alongside the dense one — see `GemmaLcpLayerKv`.
+    pub hybrid_kv_snapshot_for_lcp:
+        Option<Vec<std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>>>,
     /// Tmp buffer for flash_attn_vec when using dense decode.
     pub dense_sdpa_tmp: Option<MlxBuffer>,
     // iter-20 Leg F `leg_f_kvs` + `leg_f_sdpa_tmp` shadow-cache fields deleted
@@ -1415,6 +1424,7 @@ impl MlxModelWeights {
             intermediate_size: cfg.intermediate_size,
             dense_kvs: None,
             dense_kvs_snapshot_for_lcp: None,
+            hybrid_kv_snapshot_for_lcp: None,
             dense_sdpa_tmp: None,
             // iter-222 (2026-05-01): leg_f_kvs / leg_f_sdpa_tmp shadow-cache
             // fields deleted along with iter-34 dense-on-shadow Leg F branch.

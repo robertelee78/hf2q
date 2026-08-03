@@ -1956,8 +1956,14 @@ pub struct GemmaLoadedModel {
     /// registry now stores per-layer Arc clones of the actual
     /// post-prefill KV state, ready for in-place reuse on a
     /// partial-prefix hit when `HF2Q_KV_LCP_RESUME=1` (default OFF).
+    /// "gemma-hybrid-lcp" (2026-08-03): payload is now the
+    /// regime-aware `GemmaLcpLayerKv` enum — `Dense` under
+    /// `HF2Q_USE_DENSE=1`, `DenseAndHybrid` under the production
+    /// hybrid regime (dense leg for prefill SDPA + hybrid leg for
+    /// decode). Restoring both legs is what makes LCP resume coherent
+    /// in production; see the enum's doc in `gemma4/kv_cache.rs`.
     pub lcp_registry: crate::serve::kv_persist::lcp_registry::LcpRegistry<
-        crate::inference::models::gemma4::DenseKvBuffers,
+        crate::inference::models::gemma4::GemmaLcpLayerKv,
     >,
     /// ADR-017 Phase E.a iter-2 — handle to the AppState-owned
     /// `KvSpillCounters` so per-request LCP probes bump the same Arc
@@ -10523,6 +10529,10 @@ fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
     loaded.weights.leg_hb_encoded = None;
     loaded.weights.hybrid_kv = None;
     loaded.weights.dense_kvs_snapshot_for_lcp = None;
+    // "gemma-hybrid-lcp" (2026-08-03): same warmup-clearing discipline
+    // for the hybrid leg snapshot (a leftover BOS-sized warmup snapshot
+    // must never be installed against the first real request's key).
+    loaded.weights.hybrid_kv_snapshot_for_lcp = None;
     tracing::info!(
         "hf2q-engine warmup complete in {:.0}ms",
         started.elapsed().as_secs_f64() * 1000.0
@@ -10531,13 +10541,23 @@ fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
 }
 
 /// ADR-017 Phase E.a default-on + Codex Phase-2b audit (re-audit LOW issue
-/// #2) — module-level auto-disable + warn-once helper for the
-/// `kv_lcp_resume=true + HF2Q_USE_DENSE=0` configuration.
+/// #2) — module-level auto-disable + warn-once helper for configurations
+/// where LCP resume is default-ON but the active KV substrate has no
+/// proven restore path.
 ///
-/// Under default-on, this fires on every default-config engine that does
-/// NOT also have `HF2Q_USE_DENSE=1`. The auto-disable preserves backward
-/// compatibility: existing operators on `HF2Q_USE_DENSE=0` do not pay
-/// correctness or performance surprises from the default flip.
+/// **Resumable substrates (2026-08-03):**
+/// - Gemma 4 dense (`HF2Q_USE_DENSE=1`) — the original iter-3 path.
+/// - Gemma 4 hybrid (`HF2Q_HYBRID_KV` production default) — restored
+///   per-layer dual-leg (dense + hybrid) payloads landed in
+///   "gemma-hybrid-lcp" (see `GemmaLcpLayerKv`).
+/// - Qwen 3.5/3.6 TQ-only — restored all four TQ buffers per slot in
+///   ADR-027 sub-iter 23d-γ.
+/// The HB-encoded opt-out regime (`hybrid_kv=0` without use_dense) has
+/// NO restore path for its packed-K leg and stays auto-disabled.
+///
+/// The auto-disable preserves backward compatibility: operators on an
+/// unproven substrate do not pay correctness or performance surprises
+/// from the default flip.
 ///
 /// Both the non-streaming (`generate_once_with_soft_tokens`) and the
 /// streaming (`generate_stream_once`) probe sites call this helper.
@@ -10545,20 +10565,21 @@ fn warmup_once(loaded: &mut GemmaLoadedModel) -> Result<()> {
 /// process across both call sites.
 ///
 /// **Effective LCP behavior** (computed at each call site, not here):
-/// - `use_dense=true` → LCP enabled regardless.
-/// - `use_dense=false && HF2Q_KV_LCP_RESUME` was explicitly `"1"` →
-///   operator opt-in; LCP remains enabled and we log a different warning
-///   (the existing "misconfiguration" text).
-/// - `use_dense=false && default-on (env not explicitly "1")` →
+/// - `resumable_substrate=true` → LCP enabled regardless.
+/// - `resumable_substrate=false && HF2Q_KV_LCP_RESUME` was explicitly `"1"` →
+///   operator opt-in; LCP remains enabled (escape hatch; the existing
+///   "misconfiguration" warning covers the mismatch).
+/// - `resumable_substrate=false && default-on (env not explicitly "1")` →
 ///   auto-disable; this function fires once.
 fn warn_lcp_resume_without_dense() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         eprintln!(
-            "[hf2q lcp] LCP partial-prefill resume is default-ON but \
-             HF2Q_USE_DENSE=0; auto-disabling LCP for this process. \
-             Set HF2Q_USE_DENSE=1 to re-enable, or \
-             HF2Q_KV_LCP_RESUME=0 to silence."
+            "[hf2q lcp] LCP partial-prefill resume is default-ON but the \
+             active KV substrate has no proven restore path (dense \
+             HF2Q_USE_DENSE=1 / gemma hybrid / qwen35-TQ are resumable; \
+             HB-encoded opt-out is not); auto-disabling LCP for this \
+             process. Set HF2Q_KV_LCP_RESUME=0 to silence."
         );
     });
 }
@@ -10567,29 +10588,32 @@ fn warn_lcp_resume_without_dense() {
 /// applying the Q3 auto-disable rule:
 ///
 /// - If `parsed` is false → disabled (env was explicitly `=0`/`=off`/etc.).
-/// - If `use_dense` is true → enabled (dense SDPA required for LCP).
-/// - If `use_dense` is false AND `HF2Q_KV_LCP_RESUME` was explicitly `"1"`
-///   → operator override: remain enabled (warn once via a different path).
-/// - If `use_dense` is false AND default-on (env not explicitly `"1"`) →
-///   auto-disable and emit the warn-once via `warn_lcp_resume_without_dense`.
+/// - If `resumable_substrate` is true → enabled (see the substrate list
+///   above; callers compute it per-arch).
+/// - If `resumable_substrate` is false AND `HF2Q_KV_LCP_RESUME` was
+///   explicitly `"1"` → operator override: remain enabled (warn once via
+///   a different path).
+/// - If `resumable_substrate` is false AND default-on (env not explicitly
+///   `"1"`) → auto-disable and emit the warn-once.
 ///
 /// Returns the effective bool.
-pub(crate) fn effective_kv_lcp_resume(parsed: bool, use_dense: bool) -> bool {
+pub(crate) fn effective_kv_lcp_resume(parsed: bool, resumable_substrate: bool) -> bool {
     if !parsed {
         return false;
     }
-    if use_dense {
+    if resumable_substrate {
         return true;
     }
-    // use_dense is false. Check if user explicitly set the var to "1".
+    // Substrate unproven. Check if user explicitly set the var to "1".
     let explicitly_one =
         crate::debug::investigation_env::is_kv_lcp_resume_explicitly_one();
     if explicitly_one {
-        // Operator intentionally set HF2Q_KV_LCP_RESUME=1 even on dense=0.
-        // Honour their intent; the existing misconfig warning covers this.
+        // Operator intentionally set HF2Q_KV_LCP_RESUME=1 even on an
+        // unproven substrate. Honour their intent; the existing
+        // misconfig warning covers this.
         return true;
     }
-    // Default-on + dense=0 → auto-disable with a single warn-once.
+    // Default-on + unproven substrate → auto-disable with a single warn-once.
     warn_lcp_resume_without_dense();
     false
 }
@@ -10613,6 +10637,86 @@ pub(crate) fn effective_kv_lcp_resume(parsed: bool, use_dense: bool) -> bool {
 /// (temperature, top_p, etc. apply post-prefill). Iter-3+ may tighten
 /// this if grammar / soft_tokens / RoPE-affecting flags become
 /// per-request configurable.
+/// ADR-017 Phase E.a "gemma-hybrid-lcp" (2026-08-03) — zip the per-layer
+/// dense + hybrid end-of-prefill snapshots into the `GemmaLcpLayerKv`
+/// registry payload.
+///
+/// Returns `None` (skip store → clean cache miss, never fatal) when:
+///   * the two snapshots disagree on layer count (producer bug — a
+///     mismatched pairing would restore the wrong leg per layer), or
+///   * any snapshot Arc is unexpectedly shared (`MlxBuffer` has no
+///     Clone, so a contested Arc cannot be salvaged; skipping the store
+///     keeps the registry honest instead of stashing a corrupt entry).
+///     Exclusive-by-construction: both snapshots are minted during THIS
+///     prefill and never published before this store, so contention is
+///     a structural impossibility — this arm exists to fail safe, not
+///     to handle a real case.
+///
+/// When `hybrid_snapshot` is `None` (dense / HB-encoded regimes), the
+/// payload is dense-only `GemmaLcpLayerKv::Dense` — byte-identical to
+/// the pre-sub-iter store behavior.
+fn build_gemma_lcp_payload(
+    dense_snapshot: Vec<std::sync::Arc<crate::inference::models::gemma4::DenseKvBuffers>>,
+    hybrid_snapshot: Option<
+        Vec<std::sync::Arc<crate::inference::models::gemma4::HybridKvBuffers>>,
+    >,
+) -> Option<Vec<std::sync::Arc<crate::inference::models::gemma4::GemmaLcpLayerKv>>> {
+    use crate::inference::models::gemma4::GemmaLcpLayerKv;
+    match hybrid_snapshot {
+        Some(hsnap) => {
+            if hsnap.len() != dense_snapshot.len() {
+                tracing::debug!(
+                    "gemma-hybrid-lcp: dense/hybrid snapshot layer count mismatch \
+                     ({} vs {}) — skipping store",
+                    dense_snapshot.len(),
+                    hsnap.len()
+                );
+                return None;
+            }
+            let mut out = Vec::with_capacity(dense_snapshot.len());
+            for (idx, (d, h)) in dense_snapshot.into_iter().zip(hsnap.into_iter()).enumerate()
+            {
+                let d = std::sync::Arc::try_unwrap(d)
+                    .map_err(|arc| {
+                        tracing::debug!(
+                            "gemma-hybrid-lcp: dense snapshot Arc[{idx}] unexpectedly shared \
+                             (strong_count={}) — skipping store",
+                            std::sync::Arc::strong_count(&arc)
+                        );
+                    })
+                    .ok()?;
+                let h = std::sync::Arc::try_unwrap(h)
+                    .map_err(|arc| {
+                        tracing::debug!(
+                            "gemma-hybrid-lcp: hybrid snapshot Arc[{idx}] unexpectedly shared \
+                             (strong_count={}) — skipping store",
+                            std::sync::Arc::strong_count(&arc)
+                        );
+                    })
+                    .ok()?;
+                out.push(std::sync::Arc::new(GemmaLcpLayerKv::DenseAndHybrid(d, h)));
+            }
+            Some(out)
+        }
+        None => {
+            let mut out = Vec::with_capacity(dense_snapshot.len());
+            for (idx, d) in dense_snapshot.into_iter().enumerate() {
+                let d = std::sync::Arc::try_unwrap(d)
+                    .map_err(|arc| {
+                        tracing::debug!(
+                            "gemma-hybrid-lcp: dense snapshot Arc[{idx}] unexpectedly shared \
+                             (strong_count={}) — skipping store",
+                            std::sync::Arc::strong_count(&arc)
+                        );
+                    })
+                    .ok()?;
+                out.push(std::sync::Arc::new(GemmaLcpLayerKv::Dense(d)));
+            }
+            Some(out)
+        }
+    }
+}
+
 fn build_lcp_key_for_request(
     loaded: &GemmaLoadedModel,
     _params: &SamplingParams,
@@ -10750,9 +10854,13 @@ fn generate_once_with_soft_tokens(
                 // with HF2Q_USE_DENSE=0, effective_kv_lcp_resume emits a
                 // warn-once and returns false. Explicit HF2Q_KV_LCP_RESUME=1
                 // overrides the auto-disable.
+                // "gemma-hybrid-lcp" (2026-08-03): resumable substrates
+                // = dense (HF2Q_USE_DENSE=1) OR production hybrid. The
+                // HB-encoded opt-out regime stays auto-disabled.
                 let lcp_enabled = effective_kv_lcp_resume(
                     crate::debug::INVESTIGATION_ENV.kv_lcp_resume,
-                    crate::debug::INVESTIGATION_ENV.use_dense,
+                    crate::debug::INVESTIGATION_ENV.use_dense
+                        || crate::debug::INVESTIGATION_ENV.hybrid_kv,
                 );
                 if !lcp_enabled {
                     None
@@ -10831,9 +10939,34 @@ fn generate_once_with_soft_tokens(
                                     } else {
                                         new_linear
                                     };
-                                    arc.capacity >= required_cap
-                                        && arc.is_sliding == layer_is_ring
-                                        && arc.dtype == model_kv_dtype
+                                    // "gemma-hybrid-lcp" (2026-08-03):
+                                    // the per-layer check runs on the
+                                    // DENSE leg (prefill SDPA reads it);
+                                    // the dense fields live behind
+                                    // `arc.dense()` in the enum payload.
+                                    let d = arc.dense();
+                                    let dense_ok = d.capacity >= required_cap
+                                        && d.is_sliding == layer_is_ring
+                                        && d.dtype == model_kv_dtype;
+                                    // Regime-consistency: under the
+                                    // production hybrid regime the entry
+                                    // MUST carry the hybrid leg per
+                                    // layer — a dense-only entry under
+                                    // hybrid would leave the decode cache
+                                    // unrestored (silent zero-prefix; the
+                                    // class this sub-iter exists to close).
+                                    let regime_ok = if crate::debug::INVESTIGATION_ENV.hybrid_kv {
+                                        match arc.hybrid() {
+                                            Some(h) => {
+                                                h.capacity >= required_cap
+                                                    && h.is_sliding == layer_is_ring
+                                            }
+                                            None => false,
+                                        }
+                                    } else {
+                                        true
+                                    };
+                                    dense_ok && regime_ok
                                 })
                             };
                             if !per_layer_ok {
@@ -10857,18 +10990,78 @@ fn generate_once_with_soft_tokens(
                                 None
                             } else {
                                 let k = prefix.k;
+                                // "gemma-hybrid-lcp" (2026-08-03): split the
+                                // enum payload into the dense-leg Arc install
+                                // (`weights.dense_kvs`, consumed by
+                                // forward_prefill's restored_lcp branch) and
+                                // the hybrid-leg OWNED install
+                                // (`weights.hybrid_kv`, mutated in place by
+                                // the per-token hybrid encode for positions
+                                // [k..seq_len)). Arc::try_unwrap on the
+                                // hybrid leg mirrors the dense path's
+                                // exclusivity precondition (take_prefix
+                                // leaves strong_count == 1); on violation we
+                                // bail to fresh prefill GRACEFULLY (the
+                                // capacity-fail branch's exact semantics —
+                                // never a 500 from a cache hit).
+                                let mut dense_arcs: Vec<
+                                    std::sync::Arc<
+                                        crate::inference::models::gemma4::DenseKvBuffers,
+                                    >,
+                                > = Vec::with_capacity(prefix.dense_kvs.len());
+                                let mut hybrid_owned: Vec<
+                                    crate::inference::models::gemma4::HybridKvBuffers,
+                                > = Vec::new();
+                                let mut install_ok = true;
+                                for arc in prefix.dense_kvs.into_iter() {
+                                    match std::sync::Arc::try_unwrap(arc) {
+                                        Ok(layer) => match layer {
+                                            crate::inference::models::gemma4::GemmaLcpLayerKv::Dense(
+                                                d,
+                                            ) => {
+                                                dense_arcs.push(std::sync::Arc::new(d));
+                                            }
+                                            crate::inference::models::gemma4::GemmaLcpLayerKv::DenseAndHybrid(
+                                                d,
+                                                h,
+                                            ) => {
+                                                dense_arcs.push(std::sync::Arc::new(d));
+                                                hybrid_owned.push(h);
+                                            }
+                                        },
+                                        Err(arc) => {
+                                            tracing::debug!(
+                                                "gemma-hybrid-lcp: payload Arc unexpectedly \
+                                                 shared at install (strong_count={}) — fresh prefill",
+                                                std::sync::Arc::strong_count(&arc)
+                                            );
+                                            install_ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !install_ok {
+                                    drop(dense_arcs);
+                                    drop(hybrid_owned);
+                                    None
+                                } else {
+                                let has_hybrid = !hybrid_owned.is_empty();
                                 // Install the per-layer Arcs into the
                                 // model. After this assignment, the
                                 // engine holds the only Arcs (registry
                                 // dropped its set in `take_prefix`,
                                 // strong_count == 1 per layer).
-                                loaded.weights.dense_kvs = Some(prefix.dense_kvs);
+                                loaded.weights.dense_kvs = Some(dense_arcs);
+                                if has_hybrid {
+                                    loaded.weights.hybrid_kv = Some(hybrid_owned);
+                                }
                                 tracing::debug!(
                                     "lcp_resume: ENGAGED — K={} of N={} (per-layer cap ok)",
                                     k,
                                     prompt_tokens.len(),
                                 );
                                 Some(k)
+                                }
                             }
                         }
                     }
@@ -11460,7 +11653,15 @@ fn generate_once_with_soft_tokens(
     // layers are present. Multi-turn chat with prompts ≤ sw still
     // benefits.
     if soft_tokens.is_empty() {
+        // "gemma-hybrid-lcp" (2026-08-03): take the hybrid leg snapshot
+        // alongside the dense one; both are populated at end-of-prefill
+        // under the production hybrid regime (None otherwise).
+        let hybrid_snapshot = loaded.weights.hybrid_kv_snapshot_for_lcp.take();
         if let Some(snapshot) = loaded.weights.dense_kvs_snapshot_for_lcp.take() {
+            // "gemma-hybrid-lcp": build the regime-aware payload. On
+            // fail-safe (layer mismatch / shared Arc) this is None and
+            // the store below is skipped (clean future miss, never fatal).
+            let payload = build_gemma_lcp_payload(snapshot, hybrid_snapshot);
             let sliding_window = loaded.weights.sliding_window.max(1);
             let has_sliding_layer = loaded.weights.layers.iter().any(|l| {
                 matches!(l.layer_type, crate::serve::config::LayerType::Sliding)
@@ -11485,6 +11686,7 @@ fn generate_once_with_soft_tokens(
             // debug-only counter.
             let _ = physical_decode_writes;
             if prefill_safe {
+                if let Some(payload) = payload {
                 let lcp_key = build_lcp_key_for_request(loaded, params);
                 // ADR-017 Phase E.a iter-3.5d — multi-turn chat
                 // headroom. Snapshot global-layer buffers were
@@ -11496,7 +11698,7 @@ fn generate_once_with_soft_tokens(
                 match loaded.lcp_registry.store(
                     lcp_key,
                     prompt_tokens.to_vec(),
-                    snapshot,
+                    payload,
                     sliding_window,
                     linear_capacity,
                 ) {
@@ -11508,6 +11710,7 @@ fn generate_once_with_soft_tokens(
                         );
                     }
                 }
+                } // if let Some(payload)
             } else {
                 tracing::debug!(
                     "lcp_registry.store skipped: prefill-wrap guard \
@@ -15506,9 +15709,13 @@ fn generate_stream_once(
                 // Q3 auto-disable: mirrors the non-streaming gate. The shared
                 // std::sync::Once inside warn_lcp_resume_without_dense ensures
                 // exactly one log line per process across both probe sites.
+                // "gemma-hybrid-lcp" (2026-08-03): resumable substrates
+                // = dense (HF2Q_USE_DENSE=1) OR production hybrid. The
+                // HB-encoded opt-out regime stays auto-disabled.
                 let lcp_enabled = effective_kv_lcp_resume(
                     crate::debug::INVESTIGATION_ENV.kv_lcp_resume,
-                    crate::debug::INVESTIGATION_ENV.use_dense,
+                    crate::debug::INVESTIGATION_ENV.use_dense
+                        || crate::debug::INVESTIGATION_ENV.hybrid_kv,
                 );
                 if !lcp_enabled {
                     None
@@ -15569,9 +15776,34 @@ fn generate_stream_once(
                                     } else {
                                         new_linear
                                     };
-                                    arc.capacity >= required_cap
-                                        && arc.is_sliding == layer_is_ring
-                                        && arc.dtype == model_kv_dtype
+                                    // "gemma-hybrid-lcp" (2026-08-03):
+                                    // the per-layer check runs on the
+                                    // DENSE leg (prefill SDPA reads it);
+                                    // the dense fields live behind
+                                    // `arc.dense()` in the enum payload.
+                                    let d = arc.dense();
+                                    let dense_ok = d.capacity >= required_cap
+                                        && d.is_sliding == layer_is_ring
+                                        && d.dtype == model_kv_dtype;
+                                    // Regime-consistency: under the
+                                    // production hybrid regime the entry
+                                    // MUST carry the hybrid leg per
+                                    // layer — a dense-only entry under
+                                    // hybrid would leave the decode cache
+                                    // unrestored (silent zero-prefix; the
+                                    // class this sub-iter exists to close).
+                                    let regime_ok = if crate::debug::INVESTIGATION_ENV.hybrid_kv {
+                                        match arc.hybrid() {
+                                            Some(h) => {
+                                                h.capacity >= required_cap
+                                                    && h.is_sliding == layer_is_ring
+                                            }
+                                            None => false,
+                                        }
+                                    } else {
+                                        true
+                                    };
+                                    dense_ok && regime_ok
                                 })
                             };
                             if !per_layer_ok {
@@ -15582,13 +15814,65 @@ fn generate_stream_once(
                                 None
                             } else {
                                 let k = prefix.k;
-                                loaded.weights.dense_kvs = Some(prefix.dense_kvs);
+                                // "gemma-hybrid-lcp" (2026-08-03): split
+                                // enum payload into dense-leg Arc install +
+                                // hybrid-leg OWNED install (mirrors the
+                                // non-streaming site; Arc exclusivity
+                                // precondition + graceful bail on
+                                // contention).
+                                let mut dense_arcs: Vec<
+                                    std::sync::Arc<
+                                        crate::inference::models::gemma4::DenseKvBuffers,
+                                    >,
+                                > = Vec::with_capacity(prefix.dense_kvs.len());
+                                let mut hybrid_owned: Vec<
+                                    crate::inference::models::gemma4::HybridKvBuffers,
+                                > = Vec::new();
+                                let mut install_ok = true;
+                                for arc in prefix.dense_kvs.into_iter() {
+                                    match std::sync::Arc::try_unwrap(arc) {
+                                        Ok(layer) => match layer {
+                                            crate::inference::models::gemma4::GemmaLcpLayerKv::Dense(
+                                                d,
+                                            ) => {
+                                                dense_arcs.push(std::sync::Arc::new(d));
+                                            }
+                                            crate::inference::models::gemma4::GemmaLcpLayerKv::DenseAndHybrid(
+                                                d,
+                                                h,
+                                            ) => {
+                                                dense_arcs.push(std::sync::Arc::new(d));
+                                                hybrid_owned.push(h);
+                                            }
+                                        },
+                                        Err(arc) => {
+                                            tracing::debug!(
+                                                "gemma-hybrid-lcp: payload Arc unexpectedly \
+                                                 shared at install (strong_count={}) — fresh prefill",
+                                                std::sync::Arc::strong_count(&arc)
+                                            );
+                                            install_ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !install_ok {
+                                    drop(dense_arcs);
+                                    drop(hybrid_owned);
+                                    None
+                                } else {
+                                let has_hybrid = !hybrid_owned.is_empty();
+                                loaded.weights.dense_kvs = Some(dense_arcs);
+                                if has_hybrid {
+                                    loaded.weights.hybrid_kv = Some(hybrid_owned);
+                                }
                                 tracing::debug!(
                                     "lcp_resume (streaming): ENGAGED — K={} of N={}",
                                     k,
                                     prompt_tokens.len(),
                                 );
                                 Some(k)
+                                }
                             }
                         }
                     }
@@ -16389,7 +16673,15 @@ fn generate_stream_once(
     // (env-gates off / embedding-only path).
     let _ = physical_decode_writes; // retained debug counter
     if soft_tokens.is_empty() {
+        // "gemma-hybrid-lcp" (2026-08-03): take the hybrid leg snapshot
+        // alongside the dense one; both are populated at end-of-prefill
+        // under the production hybrid regime (None otherwise).
+        let hybrid_snapshot = loaded.weights.hybrid_kv_snapshot_for_lcp.take();
         if let Some(snapshot) = loaded.weights.dense_kvs_snapshot_for_lcp.take() {
+            // "gemma-hybrid-lcp": build the regime-aware payload. On
+            // fail-safe (layer mismatch / shared Arc) this is None and
+            // the store below is skipped (clean future miss, never fatal).
+            let payload = build_gemma_lcp_payload(snapshot, hybrid_snapshot);
             let sliding_window = loaded.weights.sliding_window.max(1);
             let has_sliding_layer = loaded.weights.layers.iter().any(|l| {
                 matches!(l.layer_type, crate::serve::config::LayerType::Sliding)
@@ -16411,10 +16703,13 @@ fn generate_stream_once(
                 // Codex Phase-2b 2026-05-06: surface store errors instead
                 // of `let _ = ...` so EntryExceedsBudget / EmptyPrompt /
                 // EmptyPayload aren't swallowed silently. Mantra: no fallback.
+                // "gemma-hybrid-lcp": store gated on the payload build
+                // (None = fail-safe skip).
+                if let Some(payload) = payload {
                 if let Err(e) = loaded.lcp_registry.store(
                     lcp_key,
                     prompt_tokens.to_vec(),
-                    snapshot,
+                    payload,
                     sliding_window,
                     linear_capacity,
                 ) {
@@ -16422,6 +16717,7 @@ fn generate_stream_once(
                         error = ?e,
                         "gemma streaming lcp_registry store failed"
                     );
+                }
                 }
             } else {
                 tracing::debug!(
@@ -16820,6 +17116,101 @@ mod tests {
     #[test]
     fn hit_stop_string_empty_stops_is_false() {
         assert!(!hit_stop_string("anything", &[]));
+    }
+
+    // -----------------------------------------------------------------
+    // "gemma-hybrid-lcp" (2026-08-03) — build_gemma_lcp_payload
+    // -----------------------------------------------------------------
+
+    fn lcp_test_dense_arc(
+        dev: &mlx_native::MlxDevice,
+        cap: usize,
+    ) -> std::sync::Arc<crate::inference::models::gemma4::DenseKvBuffers> {
+        std::sync::Arc::new(crate::inference::models::gemma4::DenseKvBuffers {
+            k: dev
+                .alloc_buffer(2 * cap * 4 * 4, mlx_native::DType::F32, vec![2, cap, 4])
+                .unwrap(),
+            v: dev
+                .alloc_buffer(2 * cap * 4 * 4, mlx_native::DType::F32, vec![2, cap, 4])
+                .unwrap(),
+            capacity: cap,
+            is_sliding: false,
+            dtype: mlx_native::DType::F32,
+        })
+    }
+
+    fn lcp_test_hybrid_arc(
+        dev: &mlx_native::MlxDevice,
+        cap: usize,
+    ) -> std::sync::Arc<crate::inference::models::gemma4::HybridKvBuffers> {
+        std::sync::Arc::new(crate::inference::models::gemma4::HybridKvBuffers {
+            k: dev
+                .alloc_buffer(2 * cap * 4 * 2, mlx_native::DType::F16, vec![2, cap, 4])
+                .unwrap(),
+            v_packed: dev
+                .alloc_buffer(2 * cap * 4, mlx_native::DType::U8, vec![2, cap, 4])
+                .unwrap(),
+            v_norms: dev
+                .alloc_buffer(2 * cap * 4, mlx_native::DType::F32, vec![2, cap])
+                .unwrap(),
+            capacity: cap,
+            is_sliding: false,
+            norms_per_pos: 1,
+            bf16_xlen_k: None,
+            bf16_xlen_v: None,
+        })
+    }
+
+    #[test]
+    fn build_gemma_lcp_payload_dense_only_yields_dense_variants() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let dev = mlx_native::MlxDevice::new().expect("device");
+        let dense = vec![lcp_test_dense_arc(&dev, 8), lcp_test_dense_arc(&dev, 8)];
+        let payload = build_gemma_lcp_payload(dense, None).expect("payload");
+        assert_eq!(payload.len(), 2);
+        for arc in &payload {
+            assert!(arc.hybrid().is_none(), "dense-only regime must not carry hybrid legs");
+            assert_eq!(arc.dense().capacity, 8);
+        }
+    }
+
+    #[test]
+    fn build_gemma_lcp_payload_zips_legs_and_preserves_contents() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let dev = mlx_native::MlxDevice::new().expect("device");
+        let mut d = lcp_test_dense_arc(&dev, 8);
+        // Plant a canary in the dense K buffer.
+        {
+            let mut owned = std::sync::Arc::try_unwrap(d)
+                .unwrap_or_else(|_| panic!("exclusive arc"));
+            owned.k.as_mut_slice::<u8>().unwrap()[0] = 0xAB;
+            d = std::sync::Arc::new(owned);
+        }
+        let mut h = lcp_test_hybrid_arc(&dev, 8);
+        {
+            let mut owned = std::sync::Arc::try_unwrap(h)
+                .unwrap_or_else(|_| panic!("exclusive arc"));
+            owned.v_packed.as_mut_slice::<u8>().unwrap()[0] = 0xCD;
+            h = std::sync::Arc::new(owned);
+        }
+        let payload = build_gemma_lcp_payload(vec![d], Some(vec![h])).expect("payload");
+        assert_eq!(payload.len(), 1);
+        let layer = &payload[0];
+        let h_leg = layer.hybrid().expect("hybrid leg present under hybrid regime");
+        assert_eq!(layer.dense().k.as_slice::<u8>().unwrap()[0], 0xAB, "dense leg contents must ride through");
+        assert_eq!(h_leg.v_packed.as_slice::<u8>().unwrap()[0], 0xCD, "hybrid leg contents must ride through");
+    }
+
+    #[test]
+    fn build_gemma_lcp_payload_layer_mismatch_fails_safe() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let dev = mlx_native::MlxDevice::new().expect("device");
+        let dense = vec![lcp_test_dense_arc(&dev, 8), lcp_test_dense_arc(&dev, 8)];
+        let hybrid = vec![lcp_test_hybrid_arc(&dev, 8)];
+        assert!(
+            build_gemma_lcp_payload(dense, Some(hybrid)).is_none(),
+            "layer-count mismatch must skip the store (never pair wrong legs)"
+        );
     }
 
     #[test]
@@ -19881,6 +20272,19 @@ assistant:
         r
     }
 
+    /// ADR-040 §0.12 STEP 1b golden-output table — captured pre-refactor
+    /// 2026-06-24 (gemma4 Q5_K_M, hybrid TQ-8, T=0, the four fixed prompts
+    /// in `slot_aware_serial_golden_output_pin`).  Hoisted to module scope
+    /// per the H1 structural audit (`tests/structural_audit_serve_consts.rs`):
+    /// fn-body `const` is fn-local-scope and therefore unreachable from
+    /// sibling test modules — policy data belongs at module scope.
+    const GOLDEN_OUTPUT: &[&str] = &[
+        "</i></p>\n<p>\n<style>\n/* Global Styles",
+        "텐츠텐츠텐츠텐츠텐츠를앞의의를를를를를맞는",
+        "________________________________________________________________________________________________________________________________________________________________",
+        "\\|_{**}**\n\n---\n\n## 1. Introduction\nThe purpose of",
+    ];
+
     /// ADR-040 §0.12 STEP 1b GUARDRAIL (golden-output pin) — the gemma4
     /// stateless-forward refactor moves per-request KV cursor state from
     /// shared self.kv_caches into the per-slot scaffold; it must change
@@ -19926,17 +20330,12 @@ assistant:
                 p, r.completion_tokens, r.text
             );
         }
-        // GOLDEN_OUTPUT: filled in from the eprintln on the pre-refactor
-        // capture run, then this block asserts. Until populated (capture
-        // run), the eprintln above is the capture; the assert below is the
-        // post-refactor regression guard.
-        // Captured pre-refactor 2026-06-24 (gemma4 Q5_K_M, hybrid TQ-8, T=0).
-        const GOLDEN_OUTPUT: &[&str] = &[
-            "</i></p>\n<p>\n<style>\n/* Global Styles",
-            "텐츠텐츠텐츠텐츠텐츠를앞의의를를를를를맞는",
-            "________________________________________________________________________________________________________________________________________________________________",
-            "\\|_{**}**\n\n---\n\n## 1. Introduction\nThe purpose of",
-        ];
+        // GOLDEN_OUTPUT (module scope, see above): filled in from the
+        // eprintln on the pre-refactor capture run, then this block
+        // asserts. Until populated (capture run), the eprintln above is
+        // the capture; the assert below is the post-refactor regression
+        // guard. Captured pre-refactor 2026-06-24 (gemma4 Q5_K_M, hybrid
+        // TQ-8, T=0).
         for (i, (got, want)) in golden.iter().zip(GOLDEN_OUTPUT.iter()).enumerate() {
             assert_eq!(
                 got, want,
@@ -35735,7 +36134,6 @@ mod adr040_phase_b_iter_b4c_kernel_iter2a_cont_iter2_decode_b_gemma4_tests {
 
 #[cfg(test)]
 mod adr040_phase_b_iter_b4c_kernel_iter2c_iter2d_iter2_decode_d_gemma4_tests {
-    use super::*;
 
     /// **H181 (skip-mode)** — iter-2C 4-bit prefill branch typed-error
     /// REPLACED with real slot routing.

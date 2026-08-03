@@ -2196,9 +2196,21 @@ impl MlxModelWeights {
         // full populated [0..seq_len) range, no wrap corruption. iter-7
         // guard predicate stays in place for the LONG_RESUME=0 case.
         let snapshot_safe = !any_sliding_layer || seq_len <= sw || kv_lcp_long_resume;
+        // ADR-017 Phase E.a "gemma-hybrid-lcp" (2026-08-03) — widen the
+        // dense-snapshot regime gate from `use_dense` to "a resumable
+        // regime": dense (`use_dense=1`, today's path) OR hybrid
+        // (production default; `self.hybrid_kv` allocated this prefill).
+        // The dense leg is required under BOTH regimes because prefill
+        // attention always reads the DENSE SDPA path; decode reads
+        // dense under use_dense and `hybrid_kv` under hybrid. The
+        // HB-encoded opt-out regime (neither flag) stays byte-identical
+        // to pre-sub-iter: no snapshot, no store (its packed-K leg has
+        // no restore path this sub-iter).
+        let lcp_resumable_regime = crate::debug::INVESTIGATION_ENV.use_dense
+            || self.hybrid_kv.is_some();
         let snapshot_for_lcp: Option<Vec<std::sync::Arc<DenseKvBuffers>>> =
             if crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                && crate::debug::INVESTIGATION_ENV.use_dense
+                && lcp_resumable_regime
                 && snapshot_safe
             {
                 // Allocate fresh per-layer buffers + memcpy bytes from
@@ -2336,7 +2348,7 @@ impl MlxModelWeights {
                 Some(snap)
             } else {
                 if crate::debug::INVESTIGATION_ENV.kv_lcp_resume
-                    && crate::debug::INVESTIGATION_ENV.use_dense
+                    && lcp_resumable_regime
                     && !snapshot_safe
                 {
                     tracing::debug!(
@@ -2351,6 +2363,123 @@ impl MlxModelWeights {
                 }
                 None
             };
+
+        // ADR-017 Phase E.a "gemma-hybrid-lcp" (2026-08-03) — end-of-
+        // prefill snapshot of the HYBRID leg (F16 K + TQ-HB V packed +
+        // norms), mirroring the dense snapshot above. Required for LCP
+        // resume under the production hybrid regime: decode reads
+        // `hybrid_kv`, so restoring only the dense leg would leave the
+        // decode cache zeroed over the prefix (silent corruption — the
+        // same class ADR-027 23d-γ closed for qwen35).
+        //
+        // Capacity policy + per-head copy semantics mirror the dense
+        // snapshot exactly (`snap_cap`, fast-path when live_cap ==
+        // snap_cap, strided per-head otherwise). v_norms' inner axis is
+        // `norms_per_pos` (1 at hd=256 production), with the live
+        // buffer's rank-2 `[nkv, cap]` / rank-3 `[nkv, cap, npp]` shape
+        // preserved on the snapshot side.
+        let hybrid_snapshot_for_lcp: Option<
+            Vec<std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>>,
+        > = if crate::debug::INVESTIGATION_ENV.kv_lcp_resume && snapshot_safe {
+            match self.hybrid_kv.as_ref() {
+                None => None,
+                Some(live_hybrid) => {
+                    // Same capacity policy as the dense snapshot
+                    // (mirrors line ~2229): sw headroom for short
+                    // prompts, seq_len + decode for long ones.
+                    let snap_cap = sw.max(seq_len + max_decode_tokens);
+                    let mut hsnap: Vec<
+                        std::sync::Arc<crate::inference::models::gemma4::kv_cache::HybridKvBuffers>,
+                    > = Vec::with_capacity(live_hybrid.len());
+                    for live_layer in live_hybrid.iter() {
+                        let nkv_dim = live_layer.k.shape().first().copied().unwrap_or(0);
+                        let live_cap_dim =
+                            live_layer.k.shape().get(1).copied().unwrap_or(live_layer.capacity);
+                        let hd_dim = live_layer.k.shape().get(2).copied().unwrap_or(0);
+                        let npp = live_layer.norms_per_pos.max(1);
+                        // K: F16 (2 B/elem); v_packed: U8 (1 B/elem);
+                        // v_norms: F32 (4 B/elem, inner axis npp).
+                        let k_snap = dev
+                            .alloc_buffer(
+                                nkv_dim * snap_cap * hd_dim * 2,
+                                mlx_native::DType::F16,
+                                vec![nkv_dim, snap_cap, hd_dim],
+                            )
+                            .map_err(|e| anyhow::anyhow!("hybrid snapshot K alloc: {e}"))?;
+                        let vp_snap = dev
+                            .alloc_buffer(
+                                nkv_dim * snap_cap * hd_dim,
+                                mlx_native::DType::U8,
+                                vec![nkv_dim, snap_cap, hd_dim],
+                            )
+                            .map_err(|e| anyhow::anyhow!("hybrid snapshot V packed alloc: {e}"))?;
+                        let vn_shape = if npp == 1 {
+                            vec![nkv_dim, snap_cap]
+                        } else {
+                            vec![nkv_dim, snap_cap, npp]
+                        };
+                        let vn_snap = dev
+                            .alloc_buffer(
+                                nkv_dim * snap_cap * npp * 4,
+                                mlx_native::DType::F32,
+                                vn_shape,
+                            )
+                            .map_err(|e| anyhow::anyhow!("hybrid snapshot V norms alloc: {e}"))?;
+
+                        // Per-head prefix copy for one (src, dst, elem,
+                        // inner) quadruple — same two-branch structure
+                        // as the dense snapshot (fast path when shapes
+                        // match, strided otherwise).
+                        let copy_prefix = |src: &mlx_native::MlxBuffer,
+                                           dst: &mut mlx_native::MlxBuffer,
+                                           elem: usize,
+                                           inner: usize,
+                                           what: &str|
+                         -> anyhow::Result<()> {
+                            let s: &[u8] = src
+                                .as_slice()
+                                .map_err(|e| anyhow::anyhow!("hybrid snapshot {what} src: {e}"))?;
+                            let d: &mut [u8] = dst
+                                .as_mut_slice()
+                                .map_err(|e| anyhow::anyhow!("hybrid snapshot {what} dst: {e}"))?;
+                            let copy_len = seq_len * inner * elem;
+                            let src_stride = live_cap_dim * inner * elem;
+                            let dst_stride = snap_cap * inner * elem;
+                            for h in 0..nkv_dim {
+                                let so = h * src_stride;
+                                let do_ = h * dst_stride;
+                                d[do_..do_ + copy_len].copy_from_slice(&s[so..so + copy_len]);
+                            }
+                            Ok(())
+                        };
+                        let mut k_snap = k_snap;
+                        let mut vp_snap = vp_snap;
+                        let mut vn_snap = vn_snap;
+                        copy_prefix(&live_layer.k, &mut k_snap, 2, hd_dim, "K")?;
+                        copy_prefix(&live_layer.v_packed, &mut vp_snap, 1, hd_dim, "V packed")?;
+                        copy_prefix(&live_layer.v_norms, &mut vn_snap, 4, npp, "V norms")?;
+
+                        hsnap.push(std::sync::Arc::new(
+                            crate::inference::models::gemma4::kv_cache::HybridKvBuffers {
+                                k: k_snap,
+                                v_packed: vp_snap,
+                                v_norms: vn_snap,
+                                capacity: snap_cap,
+                                is_sliding: live_layer.is_sliding,
+                                norms_per_pos: live_layer.norms_per_pos,
+                                // xlen companions are decode-time lazy
+                                // scratch, never part of prefix state.
+                                bf16_xlen_k: None,
+                                bf16_xlen_v: None,
+                            },
+                        ));
+                    }
+                    Some(hsnap)
+                }
+            }
+        } else {
+            None
+        };
         // ADR-040 STEP-1b (2026-06-24) — gate the three persistent `self.*`
         // write-backs on `!slot_aware`.  In slot-aware mode the caller
         // (`forward_*_slot_aware`) mounted a per-slot slot-view bundle on
@@ -2364,6 +2493,9 @@ impl MlxModelWeights {
         // they wrap are kept alive by the persistent multi-seq scaffold).
         if !slot_aware {
             self.dense_kvs_snapshot_for_lcp = snapshot_for_lcp;
+            // "gemma-hybrid-lcp" (2026-08-03): same write-back discipline
+            // for the hybrid leg snapshot.
+            self.hybrid_kv_snapshot_for_lcp = hybrid_snapshot_for_lcp;
 
             self.dense_kvs = Some(
                 dense_kvs_vec
@@ -2374,6 +2506,7 @@ impl MlxModelWeights {
             self.dense_sdpa_tmp = Some(sdpa_tmp);
         } else {
             drop(snapshot_for_lcp);
+            drop(hybrid_snapshot_for_lcp);
             drop(dense_kvs_vec);
             drop(sdpa_tmp);
         }

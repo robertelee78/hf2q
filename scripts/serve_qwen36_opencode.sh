@@ -9,11 +9,12 @@
 #   HF2Q_QWEN36_AUTOREG=1   REQUIRED — qwen3.6 GGUFs are gated behind the
 #                           Wave-5a autoregressive opt-in (serve refuses
 #                           to load the model without it).
-#   HF2Q_KV_LCP_RESUME=1    Explicitly enables LCP partial-prefill resume
-#                           under the production TQ-KV regime (the
-#                           dense=0 auto-disable otherwise turns it off).
-#                           Safe post-23d-γ: restore_partial restores all
-#                           four TQ buffers per slot (unit + live gates).
+#   HF2Q_KV_LCP_RESUME=1    Enables LCP partial-prefill resume. Strictly
+#                           OPTIONAL post-23d-γ (2026-08-03): qwen35's TQ
+#                           restore path is proven, so the widened
+#                           effective_kv_lcp_resume gate admits this arch
+#                           by default. Kept explicit here for
+#                           discoverability + older binaries.
 #   HF2Q_KV_PERSIST=<dir>   Binds the Qwen35DiskPersistor (LCP snapshots
 #                           write through to disk; cold restarts hydrate).
 #   HF2Q_KV_PERSIST_BUDGET_BYTES

@@ -1530,9 +1530,14 @@ pub fn generate_qwen35_once(
         // warn-once and returns false. Explicit HF2Q_KV_LCP_RESUME=1
         // overrides the auto-disable. Codex Phase-2b 2026-05-06 caught
         // this site missing the helper — added to mirror engine.rs:4099.
+        // ADR-027 sub-iter 23d-γ (2026-08-03): qwen35's TQ-only restore
+        // path is PROVEN (restore_partial restores all four TQ buffers
+        // per slot; cold-vs-resumed byte-identity live-gated) — LCP is
+        // unconditionally resumable on this arch, no explicit
+        // HF2Q_KV_LCP_RESUME=1 needed under the production TQ regime.
         let lcp_resume_enabled = crate::serve::api::engine::effective_kv_lcp_resume(
             crate::debug::INVESTIGATION_ENV.kv_lcp_resume,
-            crate::debug::INVESTIGATION_ENV.use_dense,
+            true,
         );
         if lcp_resume_enabled {
             let stride =
@@ -4424,9 +4429,14 @@ pub fn generate_stream_qwen35_once_extended(
         // Streaming gate — same Q3 auto-disable wiring as the non-streaming
         // site above. Codex Phase-2b 2026-05-06 caught this site missing
         // the helper.
+        // ADR-027 sub-iter 23d-γ (2026-08-03): qwen35's TQ-only restore
+        // path is PROVEN (restore_partial restores all four TQ buffers
+        // per slot; cold-vs-resumed byte-identity live-gated) — LCP is
+        // unconditionally resumable on this arch, no explicit
+        // HF2Q_KV_LCP_RESUME=1 needed under the production TQ regime.
         let lcp_resume_enabled = crate::serve::api::engine::effective_kv_lcp_resume(
             crate::debug::INVESTIGATION_ENV.kv_lcp_resume,
-            crate::debug::INVESTIGATION_ENV.use_dense,
+            true,
         );
         if lcp_resume_enabled {
             let stride =
