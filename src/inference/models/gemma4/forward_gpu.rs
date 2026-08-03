@@ -2513,7 +2513,6 @@ impl MlxModelWeights {
 // ── ADR-038 Step 4 G4-CFA-3 unit tests ──────────────────────────────────────
 #[cfg(test)]
 mod g4_cfa3_tests {
-    use super::*;
     use mlx_native::{DType, MlxDevice};
     use crate::inference::spec_decode::eagle3::multi_layer_hidden::Eagle3HiddenCollector;
     use crate::inference::models::gemma4::model::{
@@ -2727,6 +2726,7 @@ mod g4_cfa3_tests {
             intermediate_size: intermediate,
             dense_kvs: None,
             dense_kvs_snapshot_for_lcp: None,
+            hybrid_kv_snapshot_for_lcp: None,
             dense_sdpa_tmp: None,
             leg_hb_encoded: None,
             hybrid_kv: None,
@@ -3016,6 +3016,7 @@ mod g4_cfa3_tests {
             intermediate_size: intermediate,
             dense_kvs: None,
             dense_kvs_snapshot_for_lcp: None,
+            hybrid_kv_snapshot_for_lcp: None,
             dense_sdpa_tmp: None,
             leg_hb_encoded: None,
             hybrid_kv: None,
