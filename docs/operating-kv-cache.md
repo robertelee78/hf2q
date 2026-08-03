@@ -4,7 +4,28 @@
 **Authored against commit:** `7c6c16005250ffb3ce993a9227d01456adf403b2`
 **ADR:** `docs/ADR-017-persistent-block-prefix-cache.md` (R-O1)
 
-> **State of truth.** This runbook documents only what is implemented in the
+> **⚠ 2026-08-03 addendum (supersedes qwen35-family claims below).**
+> This runbook predates the qwen35/3.6 persist family. What it calls
+> `[NOT YET IMPLEMENTED]` items §11.9–10 ("Hybrid (Qwen 3.5) family",
+> "TQ-active codec family") **landed** (ADR-027 iters 1..54:
+> `src/serve/kv_persist/families/qwen35_{hybrid,disk}_persistor.rs`) and
+> were made production-correct end-to-end by **ADR-027 sub-iter 23d-γ
+> (2026-08-03)**: TQ-only LCP resume restores all four TQ buffers per
+> slot (was silent zero-prefix corruption), `cfg_from_cache` derives
+> shape from TQ buffers (was an engine panic → HTTP 500), QH35 codec is
+> at **v4** (per-MTP `kv_present` byte; shaped TQ deserialization), and
+> the on-disk fingerprint is **substrate-namespaced** (F32Only/TqOnly/
+> Both never cross-hydrate). Qwen-serve operator config that works
+> TODAY:
+> `HF2Q_QWEN36_AUTOREG=1 HF2Q_KV_LCP_RESUME=1 HF2Q_KV_PERSIST=<dir>
+> HF2Q_KV_PERSIST_BUDGET_BYTES=<n> hf2q serve --model <qwen3.6.gguf>
+> --kv-persist <dir> --overflow-policy reject`
+> (note: the qwen35 disk persistor is bound from the `HF2Q_KV_PERSIST`
+> ENV var, while `--kv-persist` wires the hot-swap spiller substrate —
+> set BOTH to the same path). The rest of this runbook remains accurate
+> for the Gemma-4 spiller substrate it was written against.
+
+> **State of truth (2026-05-01, preserved for provenance).** This runbook documents only what is implemented in the
 > tree at the commit above. Phase D is ship-gated but the substrate is fully
 > wired (cmd_serve flag + recovery scan + spiller + writer + factory). The
 > operator-facing behavior on the loaded path is observable but, for the

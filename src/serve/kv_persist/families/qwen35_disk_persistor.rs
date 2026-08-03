@@ -44,7 +44,7 @@ use crate::inference::models::qwen35::kv_cache::HybridKvCacheSnapshot;
 
 use super::qwen35_hybrid_persistor::{
     deserialize_hybrid_with_sidecar, serialize_hybrid_with_sidecar, FullAttnCodec,
-    LcpSidecarMetadata, Qwen35HybridConfig,
+    KvSubstrate, LcpSidecarMetadata, Qwen35HybridConfig,
 };
 
 /// Disk-backed cold-resume persistor for qwen35 hybrid snapshots.
@@ -66,6 +66,16 @@ pub struct Qwen35DiskPersistor {
     /// Root cache directory (operator-controlled). Persisted files land
     /// under `<cache_dir>/<cfg-fingerprint>/<lcp_key>.bin`.
     cache_dir: PathBuf,
+    /// ADR-027 sub-iter 23d-γ — on-disk byte budget per cfg-fingerprint
+    /// subdir, enforced LRU-by-mtime after every successful `write`.
+    /// `0` = unlimited (back-compat default for `new`). Production
+    /// serve wires `HF2Q_KV_PERSIST_BUDGET_BYTES` through
+    /// [`Self::new_with_budget`].
+    ///
+    /// Rationale: before this knob, a single ~100K-token agentic
+    /// session wrote ~105 GB of chunk snapshots unbudgeted (measured
+    /// live 2026-08-03), which is an operational disk-exhaustion hazard.
+    budget_bytes: u64,
 }
 
 impl Qwen35DiskPersistor {
@@ -73,12 +83,91 @@ impl Qwen35DiskPersistor {
     /// the directory yet — the per-cfg subdir is created lazily on
     /// the first `write` for that cfg.
     pub fn new(cache_dir: PathBuf) -> Result<Self> {
+        Self::new_with_budget(cache_dir, 0)
+    }
+
+    /// [`Self::new`] + an explicit on-disk byte budget (0 = unlimited).
+    pub fn new_with_budget(cache_dir: PathBuf, budget_bytes: u64) -> Result<Self> {
         // Validate the parent dir is creatable; do not pre-create
         // per-cfg subdirs (we don't know which cfgs will be used yet).
         fs::create_dir_all(&cache_dir).with_context(|| {
             format!("Qwen35DiskPersistor: mkdir {}", cache_dir.display())
         })?;
-        Ok(Self { cache_dir })
+        Ok(Self {
+            cache_dir,
+            budget_bytes,
+        })
+    }
+
+    /// ADR-027 sub-iter 23d-γ — enforce `budget_bytes` within one
+    /// cfg-fingerprint subdir: evict oldest-mtime `.bin` files until the
+    /// subdir totals ≤ budget. The just-written file is never evicted
+    /// (even when it alone exceeds the budget — a too-big latest
+    /// snapshot is kept so the most recent resume point always
+    /// survives; the next write re-evaluates). Eviction failures are
+    /// warn-logged and swallowed (persistence-layer failure must not
+    /// break inference).
+    fn enforce_budget(&self, cfg_dir: &Path, keep: &Path) {
+        if self.budget_bytes == 0 {
+            return;
+        }
+        let read = match fs::read_dir(cfg_dir) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    dir = %cfg_dir.display(),
+                    error = %e,
+                    "ADR-027 23d-γ: budget scan failed; skipping eviction"
+                );
+                return;
+            }
+        };
+        let mut files: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("bin") {
+                continue;
+            }
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            files.push((path, mtime, meta.len()));
+        }
+        let mut total: u64 = files.iter().map(|f| f.2).sum();
+        if total <= self.budget_bytes {
+            return;
+        }
+        // Oldest mtime first; keep the just-written file regardless.
+        files.sort_by_key(|f| f.1);
+        for (path, _, size) in files {
+            if total <= self.budget_bytes {
+                break;
+            }
+            if path == keep {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    total = total.saturating_sub(size);
+                    tracing::info!(
+                        evicted = %path.display(),
+                        freed_bytes = size,
+                        remaining_bytes = total,
+                        budget_bytes = self.budget_bytes,
+                        "ADR-027 23d-γ: LRU evicted qwen35 LCP snapshot (budget)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "ADR-027 23d-γ: budget eviction failed; continuing"
+                    );
+                }
+            }
+        }
     }
 
     /// Path to the file that would back `(cfg, lcp_key)`, regardless
@@ -150,6 +239,9 @@ impl Qwen35DiskPersistor {
                 final_path.display()
             )
         })?;
+        // ADR-027 sub-iter 23d-γ: enforce the on-disk budget after every
+        // successful write (no-op when budget = 0).
+        self.enforce_budget(cfg_dir, &final_path);
         Ok(())
     }
 
@@ -302,6 +394,14 @@ fn compute_config_fingerprint_hex(cfg: &Qwen35HybridConfig) -> String {
     for &dim in &cfg.mtp_shape {
         h.update(&dim.to_le_bytes());
     }
+    // ADR-027 sub-iter 23d-γ: mix the KV substrate into the fingerprint
+    // so a snapshot written under one substrate (F32-only / TQ-only /
+    // Both) never hydrates into a cache allocated under another — the
+    // mismatched (snapshot, cache) substrate pairs would restore nothing
+    // and leave the resumed prefix zeroed (silent coherence corruption).
+    // Same-process mode is fixed at startup, so same-mode writes and
+    // reads still collide exactly as before.
+    h.update(&[cfg.kv_substrate as u8]);
     let digest = h.finalize();
     hex::encode(&digest[..8])
 }
@@ -475,6 +575,7 @@ mod tests {
             linear_conv_shape: [4, 3, 1],
             linear_recurrent_shape: [4, 8, 2, 1],
             mtp_shape: [1, 4, 8, 4],
+            kv_substrate: KvSubstrate::F32Only,
         }
     }
 
@@ -900,6 +1001,7 @@ mod tests {
             linear_conv_shape: [0, 0, 0],
             linear_recurrent_shape: [0, 0, 0, 0],
             mtp_shape: [0, 0, 0, 0],
+            kv_substrate: KvSubstrate::TqOnly,
         };
         let tempdir = unique_tempdir("xprocess-tq");
         let _ = fs::remove_dir_all(&tempdir);
@@ -909,11 +1011,13 @@ mod tests {
         let n_full_attn = cfg.n_full_attn as usize;
         let mut full_attn_tq: Vec<Option<TqKvSnapshot>> = Vec::with_capacity(n_full_attn);
         for slot in 0..n_full_attn {
-            // TQ packed: 8 bytes; norms: 2 elements f32 = 8 bytes.
-            let mut k_packed = device.alloc_buffer(8, DType::U8, vec![8]).unwrap();
-            let mut k_norms = device.alloc_buffer(8, DType::F32, vec![2]).unwrap();
-            let mut v_packed = device.alloc_buffer(8, DType::U8, vec![8]).unwrap();
-            let mut v_norms = device.alloc_buffer(8, DType::F32, vec![2]).unwrap();
+            // TQ packed: 64 bytes ([1,2,8,4] U8); norms: 16 f32 = 64 bytes.
+            // cfg.full_attn_shape = [1,2,8,4] → packed 64 B; norms [1,2,8,1] F32 = 64 B
+            // (sub-iter 23d-γ shape-validated deserialize requires cfg-derived lengths).
+            let mut k_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
+            let mut k_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
+            let mut v_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
+            let mut v_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
             for (i, b) in k_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
                 *b = ((slot * 41 + i * 13) % 251) as u8;
             }
@@ -1086,6 +1190,74 @@ mod tests {
         let mut reg = registry;
         let lookup = reg.lookup(&key, &[1, 2, 3]);
         assert!(lookup.is_none(), "empty registry must miss every lookup");
+
+        let _ = fs::remove_dir_all(&tempdir);
+    }
+
+    /// ADR-027 sub-iter 23d-γ — on-disk budget enforcement: oldest-mtime
+    /// `.bin` files are evicted LRU-first until the cfg subdir totals ≤
+    /// budget; the just-written file is never evicted; hydrate tolerates
+    /// the gaps (walks existing files only).
+    #[test]
+    fn qh35_disk_budget_evicts_oldest_keeps_newest() {
+        let device = match MlxDevice::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: no Metal device: {e}");
+                return;
+            }
+        };
+        let cfg = synth_cfg();
+        let tempdir = unique_tempdir("budget");
+        let _ = fs::remove_dir_all(&tempdir);
+
+        // Measure one file's on-disk size, then set the budget to hold
+        // exactly two.
+        let probe = Qwen35DiskPersistor::new(tempdir.clone()).unwrap();
+        let snap = synth_snapshot(&device, &cfg);
+        let sidecar = synth_sidecar();
+        probe.write(&cfg, "probe_key", &snap, &sidecar).unwrap();
+        let one_size = fs::metadata(probe.path_for_key(&cfg, "probe_key"))
+            .unwrap()
+            .len();
+        let _ = fs::remove_dir_all(&tempdir);
+
+        let persistor =
+            Qwen35DiskPersistor::new_with_budget(tempdir.clone(), one_size * 2).unwrap();
+        for key in ["k_oldest", "k_middle", "k_newest"] {
+            persistor.write(&cfg, key, &snap, &sidecar).unwrap();
+            // Distinct mtimes for deterministic LRU order.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(
+            !persistor.path_for_key(&cfg, "k_oldest").exists(),
+            "oldest snapshot must be evicted under budget"
+        );
+        assert!(
+            persistor.path_for_key(&cfg, "k_newest").exists(),
+            "newest snapshot must always survive"
+        );
+        // Subdir total ≤ budget (the just-written keep is exempt by
+        // design, but here 2 × one_size == budget so middle survives too).
+        let dir = tempdir.join(
+            crate::serve::kv_persist::families::qwen35_disk_persistor::Qwen35DiskPersistor::fingerprint_hex_for(&cfg),
+        );
+        let total: u64 = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum();
+        assert!(
+            total <= one_size * 2,
+            "subdir total {total} exceeds budget {}",
+            one_size * 2
+        );
+
+        // Hydrate tolerates the evicted gap: it returns exactly the
+        // surviving entries, no error.
+        let triples = persistor.hydrate_for_cfg(&cfg, &device).unwrap();
+        assert_eq!(triples.len(), 2, "hydrate must return the two surviving snapshots");
 
         let _ = fs::remove_dir_all(&tempdir);
     }

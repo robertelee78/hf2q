@@ -488,11 +488,33 @@ impl Qwen35LoadedModel {
             // load on persistence-layer failure — degrades to legacy
             // behavior, doesn't break inference).
             disk_persistor: opts.kv_persist_dir.as_ref().and_then(|cache_dir| {
-                match crate::serve::kv_persist::families::qwen35_disk_persistor::Qwen35DiskPersistor::new(cache_dir.clone()) {
+                // ADR-027 sub-iter 23d-γ: wire HF2Q_KV_PERSIST_BUDGET_BYTES
+                // into the qwen35 LCP persistor (same env + parse
+                // semantics as the block-store budget at
+                // `serve/mod.rs:4208`; 0 = unlimited). Without this the
+                // write-through path grew unbudgeted — 105 GB observed
+                // for a single ~100K-token agentic session.
+                let budget_bytes: u64 = match std::env::var("HF2Q_KV_PERSIST_BUDGET_BYTES") {
+                    Ok(raw) => match raw.trim().parse::<u64>() {
+                        Ok(parsed) => parsed,
+                        Err(err) => {
+                            tracing::warn!(
+                                raw = %raw,
+                                error = %err,
+                                "ADR-027 23d-γ: HF2Q_KV_PERSIST_BUDGET_BYTES parse failed; \
+                                 defaulting to 0 (unlimited)"
+                            );
+                            0
+                        }
+                    },
+                    Err(_) => 0,
+                };
+                match crate::serve::kv_persist::families::qwen35_disk_persistor::Qwen35DiskPersistor::new_with_budget(cache_dir.clone(), budget_bytes) {
                     Ok(p) => {
                         tracing::info!(
                             cache_dir = %cache_dir.display(),
-                            "ADR-027 iter-6b.2: Qwen35DiskPersistor constructed; \
+                            budget_bytes = budget_bytes,
+                            "ADR-027 iter-6b.2 + 23d-γ: Qwen35DiskPersistor constructed; \
                              cold-process LCP resume enabled"
                         );
                         Some(std::sync::Arc::new(p))
@@ -530,34 +552,31 @@ impl Qwen35LoadedModel {
             persistent_kv_cache: None,
         };
 
-        // ADR-027 Phase B iter-22 — surface the iter-23+ design constraint:
-        // when TQ-on is combined with KV-persist, snapshot/restore today
-        // serialize the F32 K/V buffers (which are byte-identical to F32
-        // baseline under iter-15's shadow-cache pattern, so persist works
-        // correctly TODAY). When iter-23+ drops the F32 backing in TQ
-        // mode, snapshot/restore must learn to encode TQ buffers OR
-        // gracefully bail. Surfaces the future constraint NOW so operators
-        // who run TQ + persist combos know to re-run scripts/adr027-cross-
-        // axis-sweep.sh after iter-23 lands.
+        // ADR-027 sub-iter 23d-γ (2026-08-03) — the TQ × persist and
+        // LCP-on-TQ combinations are both CLOSED and production-ready:
+        //   * Persist in TQ-only mode: `cfg_from_cache` derives shape
+        //     from `slot.tq.k_packed` (F32 backing absent) and codec v4
+        //     round-trips the MTP TQ payload; `KvSubstrate` namespaces
+        //     the on-disk fingerprint so cross-substrate hydration is a
+        //     clean miss rather than a silent zero-restore.
+        //   * LCP-on-TQ: `HybridKvCache::restore_partial` copies the
+        //     first-n_tokens positions of all four TQ buffers per slot,
+        //     closing the silent zero-restore gap that the
+        //     `effective_kv_lcp_resume` auto-disable guarded against.
+        // These info lines replace the iter-22 "future constraint"
+        // warnings that described both combinations as unimplemented.
         if loaded.tq_kv_active && opts.kv_persist_dir.is_some() {
             tracing::info!(
-                "ADR-027 iter-22 + Phase B: HF2Q_TQ_KV=1 + HF2Q_KV_PERSIST both active. \
-                 Persist snapshots currently store F32 K/V (byte-identical to F32 \
-                 baseline under iter-15 shadow-cache pattern). Iter-23+ F32-drop will \
-                 require TQ-aware snapshot codec; re-run scripts/adr027-cross-axis-sweep.sh \
-                 after that change to verify the cross-axis combination still produces \
-                 byte-identical output."
+                "ADR-027 sub-iter 23d-γ: HF2Q_TQ_KV=1 + HF2Q_KV_PERSIST both active — \
+                 persist snapshots round-trip the TQ substrate (codec v4); fingerprint \
+                 is substrate-namespaced so cross-mode hydration is a clean miss."
             );
         }
         if loaded.tq_kv_active {
-            // Iter-22: also surface that the LCP probe still engages
-            // under TQ-on (slot.k/v are populated by the iter-15 shadow
-            // write so probes work). Iter-23+ that drops F32 will need
-            // an LCP-on-TQ guard (either disable LCP store/probe in TQ
-            // mode OR extend LcpRegistry payload to carry TQ buffers).
             tracing::info!(
-                "ADR-027 iter-22 + Phase B: HF2Q_TQ_KV=1; LCP probe engages off the F32 \
-                 shadow cache today. Iter-23+ F32-drop will require an LCP-on-TQ guard."
+                "ADR-027 sub-iter 23d-γ: HF2Q_TQ_KV=1; LCP resume restores TQ buffers \
+                 per-slot (restore_partial 23d-γ) — coherent under the production \
+                 TQ-only regime."
             );
         }
 
@@ -6432,8 +6451,8 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────
 
     use super::super::registry::{
-        ReasoningSplitter as _ReasoningSplitter, SplitSlot as _SplitSlot,
-        ToolCallEvent as _ToolCallEvent, ToolCallSplitter as _ToolCallSplitter, QWEN35,
+        SplitSlot as _SplitSlot, ToolCallEvent as _ToolCallEvent,
+        ToolCallSplitter as _ToolCallSplitter, QWEN35,
     };
 
     /// Wedge-4e splitter MODE-INVARIANCE: `ReasoningSplitter`'s `feed`

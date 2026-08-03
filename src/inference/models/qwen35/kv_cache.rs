@@ -2582,6 +2582,12 @@ impl HybridKvCache {
     /// to `kL`-aware tile bounds).  Sets `slot.current_len[0] =
     /// n_tokens` for each full-attn slot.
     ///
+    /// TQ-active mode (ADR-027 sub-iter 23d-γ): when a slot carries TQ
+    /// buffers on both sides (`slot.tq` Some in snapshot AND cache),
+    /// the same first-`n_tokens`-per-head partial copy is applied to
+    /// `k_packed` / `v_packed` (U8) and `k_norms` / `v_norms` (F32) so
+    /// the TQ-only decode/resume chain sees the restored prefix state.
+    ///
     /// DeltaNet recurrent + conv state buffers are NOT sized to
     /// `max_seq_len` (they're sized to model dimensions only) — those
     /// are byte-copied directly via `copy_buffer_bytes`, same as
@@ -2615,11 +2621,23 @@ impl HybridKvCache {
             self.linear_attn.len()
         );
 
+        // iter-35 (sub-iter 23d-α) guard mirrored from `restore_from`:
+        // snapshot producers always push one TQ entry per full-attn slot.
+        anyhow::ensure!(
+            snapshot.full_attn_tq.len() == snapshot.full_attn_k.len(),
+            "restore_partial: snapshot full_attn_tq.len ({}) != full_attn_k.len ({})",
+            snapshot.full_attn_tq.len(),
+            snapshot.full_attn_k.len()
+        );
+
         // Per-slot partial-position copy.  Each slot has shape
         // [n_kv_heads, max_seq_len, head_dim] with F32 elements.  Copy
         // first n_tokens positions per head.
-        for (slot, (k_snap, v_snap)) in self.full_attn.iter_mut().zip(
-            snapshot.full_attn_k.iter().zip(snapshot.full_attn_v.iter()),
+        for (slot, (k_snap, (v_snap, tq_snap))) in self.full_attn.iter_mut().zip(
+            snapshot
+                .full_attn_k
+                .iter()
+                .zip(snapshot.full_attn_v.iter().zip(snapshot.full_attn_tq.iter())),
         ) {
             // ADR-027 sub-sub-iter 23c-α: Optional full-attn K/V on
             // BOTH source AND destination. Restore is a no-op when
@@ -2629,6 +2647,44 @@ impl HybridKvCache {
             }
             if let (Some(v_buf), Some(dst_v)) = (v_snap, slot.v.as_mut()) {
                 partial_copy_slot(v_buf, dst_v, n_tokens, "full_attn.v")?;
+            }
+            // ADR-027 sub-iter 23d-γ (2026-08-03): TQ partial restore.
+            // Without this branch an LCP resume under production
+            // `tq_kv_active=true` left every TQ buffer ZERO-INITIALIZED
+            // while `current_len` advanced past the boundary — the
+            // resumed request attended over zeroed K/V for the entire
+            // cached prefix (silent coherence corruption; surfaced as
+            // the serve-side disk-persist panic investigation).
+            // `partial_copy_slot` is dtype-size generic (raw u8 slices),
+            // so the U8 packed buffers and the F32 norms buffers both
+            // route through it; the norms buffer's innermost axis is
+            // `norms_per_pos`, which the per-head stride math handles
+            // identically.
+            if let (Some(tq_src), Some(tq_dst)) = (tq_snap, slot.tq.as_mut()) {
+                partial_copy_slot(
+                    &tq_src.k_packed,
+                    &mut tq_dst.k_packed,
+                    n_tokens,
+                    "full_attn.tq.k_packed",
+                )?;
+                partial_copy_slot(
+                    &tq_src.k_norms,
+                    &mut tq_dst.k_norms,
+                    n_tokens,
+                    "full_attn.tq.k_norms",
+                )?;
+                partial_copy_slot(
+                    &tq_src.v_packed,
+                    &mut tq_dst.v_packed,
+                    n_tokens,
+                    "full_attn.tq.v_packed",
+                )?;
+                partial_copy_slot(
+                    &tq_src.v_norms,
+                    &mut tq_dst.v_norms,
+                    n_tokens,
+                    "full_attn.tq.v_norms",
+                )?;
             }
             // current_len[0] = n_tokens (the LCP boundary the snapshot
             // was taken at; subsequent prefill chunks will write at
@@ -2653,6 +2709,34 @@ impl HybridKvCache {
                 }
                 if let (Some(snap_v), Some(dst_v)) = (&snap.v, slot.v.as_mut()) {
                     partial_copy_slot(snap_v, dst_v, n_tokens, "mtp.v")?;
+                }
+                // ADR-027 sub-iter 23d-γ: MTP TQ partial restore (same
+                // gap + same fix as the full-attn slots above).
+                if let (Some(tq_src), Some(tq_dst)) = (&snap.tq, slot.tq.as_mut()) {
+                    partial_copy_slot(
+                        &tq_src.k_packed,
+                        &mut tq_dst.k_packed,
+                        n_tokens,
+                        "mtp.tq.k_packed",
+                    )?;
+                    partial_copy_slot(
+                        &tq_src.k_norms,
+                        &mut tq_dst.k_norms,
+                        n_tokens,
+                        "mtp.tq.k_norms",
+                    )?;
+                    partial_copy_slot(
+                        &tq_src.v_packed,
+                        &mut tq_dst.v_packed,
+                        n_tokens,
+                        "mtp.tq.v_packed",
+                    )?;
+                    partial_copy_slot(
+                        &tq_src.v_norms,
+                        &mut tq_dst.v_norms,
+                        n_tokens,
+                        "mtp.tq.v_norms",
+                    )?;
                 }
                 anyhow::ensure!(
                     !slot.current_len.is_empty(),
@@ -9400,6 +9484,184 @@ mod tests {
                 read_slot0th(c3, 3, n),
                 888.0,
                 "rollback landed in slot3's CURRENT conv (parity-aware)"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-027 sub-iter 23d-γ (2026-08-03) — restore_partial TQ coverage
+    // ---------------------------------------------------------------------
+
+    /// Tiny dense cfg with an MTP slot (mirrors the multi-seq fixture but
+    /// with `mtp_num_hidden_layers = 1` so the MTP branch is exercised).
+    fn tiny_dense_cfg_4layer_with_mtp() -> Qwen35Config {
+        let mut cfg = tiny_dense_cfg_4layer_for_multi_seq_tests();
+        cfg.mtp_num_hidden_layers = 1;
+        cfg
+    }
+
+    /// Fill a TQ buffer set with deterministic, per-buffer-distinct byte
+    /// patterns so a restore mismatch surfaces as an exact-byte diff.
+    fn plant_tq_pattern(tq: &mut TqFullAttnKvBuffers, seed: usize) {
+        let bufs: [&mut MlxBuffer; 4] = [
+            &mut tq.k_packed,
+            &mut tq.k_norms,
+            &mut tq.v_packed,
+            &mut tq.v_norms,
+        ];
+        for (bi, buf) in bufs.into_iter().enumerate() {
+            let s = buf.as_mut_slice::<u8>().expect("tq mut_slice");
+            for (i, b) in s.iter_mut().enumerate() {
+                *b = ((seed * 13 + bi * 5 + i) % 251) as u8;
+            }
+        }
+    }
+
+    /// Read the first `n_tokens` positions of head `head` (seq 0) from a
+    /// 4-rank `[n_seqs, n_kv, max_seq, inner]` buffer as raw bytes —
+    /// mirrors `partial_copy_slot`'s per-head stride math.
+    fn read_head_prefix(buf: &MlxBuffer, head: usize, n_tokens: usize) -> Vec<u8> {
+        let shape = buf.shape();
+        let (n_kv, max_seq, inner) = (shape[1], shape[2], shape[3]);
+        let elem = buf.dtype().size_of();
+        let head_stride = max_seq * inner * elem;
+        let all = buf.as_slice::<u8>().expect("slice");
+        all[head * head_stride..head * head_stride + n_tokens * inner * elem].to_vec()
+    }
+
+    /// ADR-027 sub-iter 23d-γ — the load-bearing regression pin for the
+    /// silent-corruption gap: under production TQ-only mode,
+    /// `restore_partial` MUST copy the first n_tokens positions of all
+    /// four TQ buffers per slot (pre-23d-γ they were left zeroed while
+    /// `current_len` advanced — the resumed request attended over zeroed
+    /// K/V for the whole cached prefix).
+    #[test]
+    fn restore_partial_tq_only_mode_restores_tq_prefix_bytes() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_with_mtp();
+        let max_seq_len = 64u32;
+        let n_tokens = 40usize;
+
+        // Source cache in TQ-only mode with planted deterministic bytes.
+        let mut src =
+            HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true).expect("alloc src");
+        assert!(src.tq_kv_active, "fixture must be TQ-active");
+        assert!(src.full_attn[0].k.is_none(), "TQ-only: F32 dropped");
+        assert!(src.full_attn[0].tq.is_some(), "TQ-only: tq populated");
+        assert!(src.mtp_slot.as_ref().expect("mtp").k.is_none(), "TQ-only MTP: F32 dropped");
+        for slot in src.full_attn.iter_mut() {
+            plant_tq_pattern(slot.tq.as_mut().expect("tq"), 1);
+        }
+        plant_tq_pattern(src.mtp_slot.as_mut().expect("mtp").tq.as_mut().expect("tq"), 2);
+        // Linear-attn state must also survive the round-trip (unchanged path).
+        src.linear_attn[0].recurrent.as_mut_slice::<f32>().unwrap()[0] = 9.5;
+
+        let snap = src.snapshot(&device).expect("snapshot");
+        assert!(snap.full_attn_k[0].is_none(), "TQ-only snapshot: k None");
+        assert!(snap.full_attn_tq[0].is_some(), "TQ-only snapshot: tq Some");
+        assert!(snap.mtp.as_ref().expect("mtp snap").k.is_none(), "TQ-only MTP snap: k None");
+        assert!(snap.mtp.as_ref().expect("mtp snap").tq.is_some(), "TQ-only MTP snap: tq Some");
+
+        // Destination: fresh zeroed TQ-only cache.
+        let mut dst =
+            HybridKvCache::new_with_options(&cfg, &device, max_seq_len, 1, true).expect("alloc dst");
+        dst.restore_partial(&snap, n_tokens).expect("restore_partial");
+
+        // Every full-attn slot: all four TQ buffers carry the prefix.
+        for (i, slot) in dst.full_attn.iter().enumerate() {
+            let tq_dst = slot.tq.as_ref().expect("dst tq");
+            let tq_src = src.full_attn[i].tq.as_ref().expect("src tq");
+            for (name, d, s) in [
+                ("k_packed", &tq_dst.k_packed, &tq_src.k_packed),
+                ("k_norms", &tq_dst.k_norms, &tq_src.k_norms),
+                ("v_packed", &tq_dst.v_packed, &tq_src.v_packed),
+                ("v_norms", &tq_dst.v_norms, &tq_src.v_norms),
+            ] {
+                let n_kv = d.shape()[1];
+                for head in 0..n_kv {
+                    assert_eq!(
+                        read_head_prefix(d, head, n_tokens),
+                        read_head_prefix(s, head, n_tokens),
+                        "full_attn[{i}].tq.{name}[head {head}] prefix diverged after restore_partial"
+                    );
+                    // Tail beyond the boundary stays zero-initialised.
+                    let tail = read_head_prefix(d, head, max_seq_len as usize);
+                    let inner = d.shape()[3] * d.dtype().size_of();
+                    assert!(
+                        tail[n_tokens * inner..].iter().all(|&b| b == 0),
+                        "full_attn[{i}].tq.{name}[head {head}] tail not zero after partial restore"
+                    );
+                }
+            }
+            assert_eq!(
+                slot.current_len[0] as usize, n_tokens,
+                "full_attn[{i}].current_len[0] must advance to the LCP boundary"
+            );
+        }
+
+        // MTP slot: same pin.
+        let dst_mtp = dst.mtp_slot.as_ref().expect("dst mtp");
+        let src_mtp = src.mtp_slot.as_ref().expect("src mtp");
+        let (dt, st) = (dst_mtp.tq.as_ref().expect("dst mtp tq"), src_mtp.tq.as_ref().expect("src mtp tq"));
+        for (name, d, s) in [
+            ("k_packed", &dt.k_packed, &st.k_packed),
+            ("k_norms", &dt.k_norms, &st.k_norms),
+            ("v_packed", &dt.v_packed, &st.v_packed),
+            ("v_norms", &dt.v_norms, &st.v_norms),
+        ] {
+            for head in 0..d.shape()[1] {
+                assert_eq!(
+                    read_head_prefix(d, head, n_tokens),
+                    read_head_prefix(s, head, n_tokens),
+                    "mtp.tq.{name}[head {head}] prefix diverged after restore_partial"
+                );
+            }
+        }
+        assert_eq!(dst_mtp.current_len[0] as usize, n_tokens);
+
+        // Linear-attn state restored (byte-copy path, unchanged by 23d-γ).
+        assert_eq!(
+            dst.linear_attn[0].recurrent.as_slice::<f32>().unwrap()[0],
+            9.5,
+            "linear recurrent must survive restore_partial"
+        );
+    }
+
+    /// Mirror pin for the legacy F32-only regime: TQ branches are
+    /// no-ops when either side lacks TQ, and the F32 partial copy is
+    /// untouched by the 23d-γ additions.
+    #[test]
+    fn restore_partial_f32_only_mode_tq_branches_are_noop() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_dense_cfg_4layer_with_mtp();
+        let max_seq_len = 64u32;
+        let n_tokens = 40usize;
+
+        let mut src = HybridKvCache::new(&cfg, &device, max_seq_len, 1).expect("alloc src");
+        assert!(!src.tq_kv_active && src.full_attn[0].tq.is_none());
+        // Plant F32 canary bytes in k[0].
+        {
+            let k = src.full_attn[0].k.as_mut().expect("f32 k");
+            let s = k.as_mut_slice::<f32>().unwrap();
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = (i % 97) as f32;
+            }
+        }
+        let snap = src.snapshot(&device).expect("snapshot");
+        let mut dst = HybridKvCache::new(&cfg, &device, max_seq_len, 1).expect("alloc dst");
+        dst.restore_partial(&snap, n_tokens).expect("restore_partial");
+
+        let d = dst.full_attn[0].k.as_ref().expect("dst k").as_slice::<f32>().unwrap();
+        let s = src.full_attn[0].k.as_ref().expect("src k").as_slice::<f32>().unwrap();
+        let inner = d.len() / (src.full_attn[0].k.as_ref().unwrap().shape()[1] * max_seq_len as usize);
+        for head in 0..2usize {
+            let stride = max_seq_len as usize * inner;
+            assert_eq!(
+                &d[head * stride..head * stride + n_tokens * inner],
+                &s[head * stride..head * stride + n_tokens * inner],
+                "F32 k prefix diverged (23d-γ must not perturb the legacy path)"
             );
         }
     }

@@ -72,14 +72,21 @@ pub const QH35_MAGIC: [u8; 4] = *b"QH35";
 ///   None entries can round-trip without K/V payload (the F32-drop
 ///   precondition for iter-23c+). v2 deserializer also accepts v1
 ///   envelopes via fallback (every slot treated as present).
-/// - v3 (iter-36 = sub-iter 23d-β, this iter): per-slot `tq_present: u8`
+/// - v3 (iter-36 = sub-iter 23d-β): per-slot `tq_present: u8`
 ///   byte after the v2 body, with optional TQ payload (`norms_per_pos`
 ///   + 4 byte_len-prefixed buffer blobs). Closes the iter-34 cross-
 ///   process replay gap: in TQ-only mode (slot.k=None) the codec
 ///   round-trips slot.tq state so cold-start hydrate restores both
 ///   the F32 absence AND the TQ presence. v3 deserializer accepts v1
 ///   AND v2 envelopes via fallback (every slot treated as tq_absent).
-pub const QH35_CODEC_VERSION: u32 = 3;
+/// - v4 (sub-iter 23d-γ, 2026-08-03): per-MTP `kv_present: u8` byte
+///   before the MTP shape block, mirroring the full-attn slots' v2
+///   byte. v3 and earlier always emitted MTP K/V (Some); in TQ-only
+///   mode the MTP slot also drops its F32 backing (`mtp_slot.k=None`)
+///   and the v3 serializer hard-panicked on the `expect` — same gap
+///   class as the full-attn slots had pre-v2. v4 deserializer accepts
+///   v1..v3 envelopes via fallback (MTP treated as kv_present).
+pub const QH35_CODEC_VERSION: u32 = 4;
 
 /// Per-slot `kv_present` byte values (v2 / v3).
 pub const QH35_KV_PRESENT: u8 = 1;
@@ -107,6 +114,49 @@ impl FullAttnCodec {
             other => Err(anyhow!(
                 "QH35 envelope: unknown full_attn_codec_tag = {other} (expected 0)"
             )),
+        }
+    }
+}
+
+/// ADR-027 sub-iter 23d-γ (2026-08-03) — which KV substrate the source
+/// cache's full-attn-family slots actually carry. Derived by
+/// `cfg_from_cache` from the LIVE cache and mixed into the disk
+/// fingerprint (`compute_config_fingerprint_hex`) so a snapshot written
+/// under one substrate NEVER hydrates into a cache allocated under a
+/// different substrate. Cross-substrate restore is incorrect by
+/// construction: the (snapshot-substrate, cache-substrate) pairs that
+/// restore nothing would leave the resumed prefix state zeroed (silent
+/// coherence corruption) — namespacing by substrate turns those pairs
+/// into clean cache misses instead.
+///
+/// NOT serialized into the QH35 envelope header (the v2/v3/v4
+/// `kv_present` / `tq_present` bytes make every payload
+/// self-describing); it exists purely to namespace the on-disk
+/// cfg-fingerprint directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum KvSubstrate {
+    /// Legacy F32-only: `slot.k`/`v` Some, `slot.tq` None
+    /// (`HF2Q_TQ_KV=0`).
+    F32Only = 0,
+    /// Production TQ-only: `slot.k`/`v` None, `slot.tq` Some
+    /// (default, `tq_kv_active=true`, iter-34 F32-drop).
+    TqOnly = 1,
+    /// Shadow mode: both F32 and TQ populated (iter-8 bridge; not a
+    /// production runtime config).
+    Both = 2,
+}
+
+impl KvSubstrate {
+    /// Classify one full-attn-family slot's substrate from its
+    /// `k` / `tq` presence. `None` when the slot has NEITHER substrate
+    /// (degenerate — surfaces as a hard error in `cfg_from_cache`).
+    fn classify(k_present: bool, tq_present: bool) -> Option<Self> {
+        match (k_present, tq_present) {
+            (true, false) => Some(Self::F32Only),
+            (false, true) => Some(Self::TqOnly),
+            (true, true) => Some(Self::Both),
+            (false, false) => None,
         }
     }
 }
@@ -142,6 +192,9 @@ pub struct Qwen35HybridConfig {
     /// Same rank as `full_attn_shape` but allowed to differ — Qwen3.6
     /// MTP block has its own head-count config.  Ignored when has_mtp = false.
     pub mtp_shape: [u64; 4],
+    /// KV substrate of the source cache's full-attn-family slots
+    /// (ADR-027 sub-iter 23d-γ). Fingerprint-only — see [`KvSubstrate`].
+    pub kv_substrate: KvSubstrate,
 }
 
 impl Qwen35HybridConfig {
@@ -330,39 +383,50 @@ pub fn cfg_from_cache(
     let has_mtp = cache.mtp_slot.is_some();
     let n_seqs = cache.n_seqs;
 
+    // ADR-027 sub-iter 23d-γ (2026-08-03): derive one full-attn-family
+    // slot's logical `[n_seqs, n_kv_heads, max_seq_len, head_dim]` shape
+    // from WHICHEVER substrate is populated — F32 `k` when present
+    // (legacy / HF2Q_TQ_KV=0), else the TQ `k_packed` (production
+    // TQ-only mode, iter-34 F32-drop). TQ packed buffers carry the SAME
+    // four logical dims as F32 (U8 dtype, one byte per element — see
+    // `alloc_tq_full_attn_buffers`), so the derived shape is identical
+    // across substrates for the same model + max_seq_len. This closes
+    // the iter-23d TODO that previously hard-panicked in TQ-only mode.
+    let shape4_from_slot = |slot: &crate::inference::models::qwen35::kv_cache::FullAttnKvSlot,
+                            what: &str|
+     -> Result<[u64; 4]> {
+        let (buf, src): (&MlxBuffer, &str) = if let Some(k) = slot.k.as_ref() {
+            (k, "k")
+        } else if let Some(tq) = slot.tq.as_ref() {
+            (&tq.k_packed, "tq.k_packed")
+        } else {
+            return Err(anyhow!(
+                "cfg_from_cache: {what} has neither F32 k nor TQ k_packed \
+                 (degenerate cache — neither substrate populated)"
+            ));
+        };
+        let s = buf.shape();
+        ensure!(
+            s.len() == 4,
+            "cfg_from_cache: {what}.{src} shape rank {} != 4",
+            s.len()
+        );
+        let shape = [s[0] as u64, s[1] as u64, s[2] as u64, s[3] as u64];
+        ensure!(
+            shape[0] == n_seqs as u64,
+            "cfg_from_cache: {what}.{src} shape[0] {} != n_seqs {}",
+            shape[0],
+            n_seqs
+        );
+        Ok(shape)
+    };
+
     // full_attn_shape: prefer a real full_attn slot; fall back to mtp
     // (same rank/role) when full_attn is empty.
-    //
-    // iter-29 (ADR-027 sub-sub-iter 23c-α): `slot.k` is `Option<MlxBuffer>`.
-    // Today (with codec=F32Dense) the producer always emits Some.
-    // iter-23d will derive shape from `slot.tq` when k is None (TQ-only
-    // codec); for now an explicit `expect` pins iter-23d's TODO and
-    // surfaces any unexpected None routing as a clear panic.
     let full_attn_shape: [u64; 4] = if let Some(slot) = cache.full_attn.first() {
-        let buf = slot.k.as_ref().expect(
-            "cfg_from_cache: full_attn[0].k is None — F32 backing dropped \
-             (TQ-only mode). iter-23d adds TQ-shape derivation; today \
-             only the F32 codec path is reachable.",
-        );
-        let s = buf.shape();
-        ensure!(
-            s.len() == 4,
-            "cfg_from_cache: full_attn[0].k shape rank {} != 4",
-            s.len()
-        );
-        [s[0] as u64, s[1] as u64, s[2] as u64, s[3] as u64]
+        shape4_from_slot(slot, "full_attn[0]")?
     } else if let Some(slot) = cache.mtp_slot.as_ref() {
-        let buf = slot.k.as_ref().expect(
-            "cfg_from_cache: mtp_slot.k is None — F32 backing dropped \
-             (TQ-only mode). iter-23d adds TQ-shape derivation.",
-        );
-        let s = buf.shape();
-        ensure!(
-            s.len() == 4,
-            "cfg_from_cache: mtp_slot.k shape rank {} != 4",
-            s.len()
-        );
-        [s[0] as u64, s[1] as u64, s[2] as u64, s[3] as u64]
+        shape4_from_slot(slot, "mtp_slot")?
     } else {
         return Err(anyhow!(
             "cfg_from_cache: cache has no full_attn slots AND no mtp_slot \
@@ -370,20 +434,41 @@ pub fn cfg_from_cache(
         ));
     };
 
-    // MTP shape: prefer mtp_slot; otherwise use full_attn_shape (same
-    // rank/role; ignored at write/read time when has_mtp = false).
+    // ADR-027 sub-iter 23d-γ: classify the cache's KV substrate and
+    // verify it is UNIFORM across every full-attn-family slot (the
+    // `new_with_options` allocator invariant — a mixed-substrate cache
+    // indicates an alloc-path bug that must not silently fingerprint).
+    let mut kv_substrate: Option<KvSubstrate> = None;
+    for (i, slot) in cache
+        .full_attn
+        .iter()
+        .chain(cache.mtp_slot.as_ref())
+        .enumerate()
+    {
+        let s = KvSubstrate::classify(slot.k.is_some(), slot.tq.is_some()).ok_or_else(|| {
+            anyhow!(
+                "cfg_from_cache: full-attn-family slot #{i} has neither F32 k nor TQ \
+                 k_packed (degenerate cache — neither substrate populated)"
+            )
+        })?;
+        match kv_substrate {
+            None => kv_substrate = Some(s),
+            Some(prev) => ensure!(
+                prev == s,
+                "cfg_from_cache: mixed KV substrates across full-attn-family slots \
+                 (slot #0 = {prev:?}, slot #{i} = {s:?}) — allocator invariant violated"
+            ),
+        }
+    }
+    let kv_substrate = kv_substrate.ok_or_else(|| {
+        anyhow!("cfg_from_cache: no full-attn-family slots to classify (unreachable)")
+    })?;
+
+    // MTP shape: prefer mtp_slot (either substrate, same derivation as
+    // full-attn); otherwise use full_attn_shape (same rank/role; ignored
+    // at write/read time when has_mtp = false).
     let mtp_shape: [u64; 4] = if let Some(slot) = cache.mtp_slot.as_ref() {
-        let buf = slot.k.as_ref().expect(
-            "cfg_from_cache: mtp_slot.k is None — F32 backing dropped \
-             (TQ-only mode). iter-23d adds TQ-shape derivation.",
-        );
-        let s = buf.shape();
-        ensure!(
-            s.len() == 4,
-            "cfg_from_cache: mtp_slot.k shape rank {} != 4",
-            s.len()
-        );
-        [s[0] as u64, s[1] as u64, s[2] as u64, s[3] as u64]
+        shape4_from_slot(slot, "mtp_slot")?
     } else {
         full_attn_shape
     };
@@ -431,6 +516,7 @@ pub fn cfg_from_cache(
         linear_conv_shape,
         linear_recurrent_shape,
         mtp_shape,
+        kv_substrate,
     })
 }
 
@@ -671,71 +757,84 @@ pub fn serialize_hybrid_snapshot(
     // declare its own head count independent of regular full-attn).
     if cfg.has_mtp {
         let mtp = snapshot.mtp.as_ref().expect("mtp present per cfg + assert above");
-        // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — codec rejects
-        // None today (iter-23d will extend with kv_present byte).
-        // serializer-side `expect` is load-bearing: production path
-        // (iter-22 LANDED) always populates Some; failing here means
-        // a bug in iter-23c+ alloc that emitted None without updating
-        // the codec.
-        let mtp_k = mtp
-            .k
-            .as_ref()
-            .expect("QH35 serialize: mtp.k is None (iter-23a-α producers always Some — see codec extension iter-23d)");
-        let mtp_v = mtp
-            .v
-            .as_ref()
-            .expect("QH35 serialize: mtp.v is None (iter-23a-α producers always Some — see codec extension iter-23d)");
-        ensure!(
-            mtp_k.shape().len() == 4,
-            "QH35 serialize: mtp.k shape rank {} != 4",
-            mtp_k.shape().len()
-        );
-        let mk_shape: [u64; 4] = [
-            mtp_k.shape()[0] as u64,
-            mtp_k.shape()[1] as u64,
-            mtp_k.shape()[2] as u64,
-            mtp_k.shape()[3] as u64,
-        ];
-        ensure!(
-            mk_shape == cfg.mtp_shape,
-            "QH35 serialize: mtp.k shape {:?} != cfg.mtp_shape {:?}",
-            mk_shape,
-            cfg.mtp_shape
-        );
-        let mv_shape: [u64; 4] = [
-            mtp_v.shape()[0] as u64,
-            mtp_v.shape()[1] as u64,
-            mtp_v.shape()[2] as u64,
-            mtp_v.shape()[3] as u64,
-        ];
-        ensure!(
-            mv_shape == cfg.mtp_shape,
-            "QH35 serialize: mtp.v shape {:?} != cfg.mtp_shape {:?}",
-            mv_shape,
-            cfg.mtp_shape
-        );
         ensure!(
             mtp.current_len.len() == cfg.n_seqs as usize,
             "QH35 serialize: mtp.current_len.len() = {} != n_seqs = {}",
             mtp.current_len.len(),
             cfg.n_seqs
         );
-        let mk_bytes: &[u8] = mtp_k
-            .as_slice::<u8>()
-            .map_err(|e| anyhow!("QH35 serialize: mtp.k as_slice: {e}"))?;
-        let mv_bytes: &[u8] = mtp_v
-            .as_slice::<u8>()
-            .map_err(|e| anyhow!("QH35 serialize: mtp.v as_slice: {e}"))?;
-        for &dim in &mk_shape {
-            write_u64_le(&mut out, dim);
+        // ADR-027 sub-iter 23d-γ (codec v4): per-MTP `kv_present: u8`
+        // byte mirroring the full-attn slots' v2 byte. In TQ-only mode
+        // the MTP slot drops its F32 backing exactly like the full-attn
+        // slots (`alloc_full_attn_slot` with tq_kv_active=true); the
+        // pre-v4 serializer's `expect("mtp.k is None")` hard-panicked —
+        // the same gap class the v2 byte closed for full-attn slots.
+        // K and V must agree on Some/None (mismatched = producer bug).
+        ensure!(
+            mtp.k.is_some() == mtp.v.is_some(),
+            "QH35 serialize: mtp.k Some={} but mtp.v Some={} (mismatch — producer bug)",
+            mtp.k.is_some(),
+            mtp.v.is_some()
+        );
+        match (mtp.k.as_ref(), mtp.v.as_ref()) {
+            (Some(mtp_k), Some(mtp_v)) => {
+                ensure!(
+                    mtp_k.shape().len() == 4,
+                    "QH35 serialize: mtp.k shape rank {} != 4",
+                    mtp_k.shape().len()
+                );
+                let mk_shape: [u64; 4] = [
+                    mtp_k.shape()[0] as u64,
+                    mtp_k.shape()[1] as u64,
+                    mtp_k.shape()[2] as u64,
+                    mtp_k.shape()[3] as u64,
+                ];
+                ensure!(
+                    mk_shape == cfg.mtp_shape,
+                    "QH35 serialize: mtp.k shape {:?} != cfg.mtp_shape {:?}",
+                    mk_shape,
+                    cfg.mtp_shape
+                );
+                let mv_shape: [u64; 4] = [
+                    mtp_v.shape()[0] as u64,
+                    mtp_v.shape()[1] as u64,
+                    mtp_v.shape()[2] as u64,
+                    mtp_v.shape()[3] as u64,
+                ];
+                ensure!(
+                    mv_shape == cfg.mtp_shape,
+                    "QH35 serialize: mtp.v shape {:?} != cfg.mtp_shape {:?}",
+                    mv_shape,
+                    cfg.mtp_shape
+                );
+                let mk_bytes: &[u8] = mtp_k
+                    .as_slice::<u8>()
+                    .map_err(|e| anyhow!("QH35 serialize: mtp.k as_slice: {e}"))?;
+                let mv_bytes: &[u8] = mtp_v
+                    .as_slice::<u8>()
+                    .map_err(|e| anyhow!("QH35 serialize: mtp.v as_slice: {e}"))?;
+                write_u8(&mut out, QH35_KV_PRESENT);
+                for &dim in &mk_shape {
+                    write_u64_le(&mut out, dim);
+                }
+                write_u64_le(&mut out, mk_bytes.len() as u64);
+                write_u64_le(&mut out, mv_bytes.len() as u64);
+                for &cl in mtp.current_len.iter() {
+                    write_u32_le(&mut out, cl);
+                }
+                out.extend_from_slice(mk_bytes);
+                out.extend_from_slice(mv_bytes);
+            }
+            (None, None) => {
+                // TQ-only mode: kv_present=0 + current_len only (the
+                // MTP TQ payload rides the tq_present block below).
+                write_u8(&mut out, QH35_KV_ABSENT);
+                for &cl in mtp.current_len.iter() {
+                    write_u32_le(&mut out, cl);
+                }
+            }
+            _ => unreachable!("mtp.k.is_some() == mtp.v.is_some() asserted above"),
         }
-        write_u64_le(&mut out, mk_bytes.len() as u64);
-        write_u64_le(&mut out, mv_bytes.len() as u64);
-        for &cl in mtp.current_len.iter() {
-            write_u32_le(&mut out, cl);
-        }
-        out.extend_from_slice(mk_bytes);
-        out.extend_from_slice(mv_bytes);
 
         // ADR-027 Phase B iter-36 (sub-iter 23d-β): MTP TQ payload — same
         // format as full-attn slot TQ (see `serialize_tq_blob`).
@@ -809,27 +908,62 @@ fn serialize_tq_blob(
 ///
 /// Caller has already consumed the `tq_present: u8` byte and confirmed
 /// it equals `QH35_TQ_PRESENT`.
+///
+/// ADR-027 sub-iter 23d-γ: buffers are allocated with their LOGICAL
+/// 4-rank shapes (derived from `packed_shape4` = the cfg's
+/// `[n_seqs, n_kv_heads, max_seq_len, head_dim]`), NOT as flat rank-1
+/// blobs. The pre-23d-γ flat allocation surfaced as a hard
+/// `partial_copy_slot` rank error the first time a disk-hydrated
+/// snapshot was LCP-resumed (`HybridKvCache::restore_partial` requires
+/// rank-4 on both sides for the per-head prefix copy). Every blob's
+/// byte_len is validated against the cfg-derived shape product, so a
+/// shape drift between writer and reader still fails fast HERE rather
+/// than at restore time.
 fn deserialize_tq_blob(
     bytes: &[u8],
     cursor: &mut usize,
     device: &MlxDevice,
     slot_idx: usize,
     family: &str,
+    packed_shape4: [u64; 4],
 ) -> Result<TqKvSnapshot> {
     let norms_per_pos = read_u32_le(bytes, cursor)?;
+    ensure!(
+        norms_per_pos > 0,
+        "QH35 deserialize: {family}[{slot_idx}].tq norms_per_pos = 0 (invalid)"
+    );
+    let packed_shape: Vec<usize> = packed_shape4.iter().map(|d| *d as usize).collect();
+    let norms_shape: Vec<usize> = vec![
+        packed_shape4[0] as usize,
+        packed_shape4[1] as usize,
+        packed_shape4[2] as usize,
+        norms_per_pos as usize,
+    ];
+    let expected_packed_bytes: usize = packed_shape.iter().product();
+    let expected_norms_bytes: usize = norms_shape.iter().product::<usize>() * 4;
 
-    // Helper closure to read one byte_len-prefixed buffer into a fresh
-    // U8 MlxBuffer (TQ payloads are dtype-tagged at the cache layer; on
-    // disk every buffer is just bytes).
+    // Helper closure to read one byte_len-prefixed buffer into a fresh,
+    // CORRECTLY-SHAPED MlxBuffer (packed = U8, norms = F32).
     let read_blob = |bytes: &[u8],
                      cursor: &mut usize,
                      device: &MlxDevice,
-                     name: &str|
+                     name: &str,
+                     dtype: DType,
+                     shape: &[usize],
+                     expected_bytes: usize|
      -> Result<MlxBuffer> {
         let n = read_u64_le(bytes, cursor)? as usize;
+        ensure!(
+            n == expected_bytes,
+            "QH35 deserialize: {family}[{slot_idx}].tq.{name} on-disk byte_len {} != \
+             cfg-derived {} (shape {:?}) — writer/reader shape drift",
+            n,
+            expected_bytes,
+            shape
+        );
         let src = read_bytes(bytes, cursor, n)?;
         let mut buf = device
-            .alloc_buffer(n, DType::U8, vec![n])
+            .alloc_buffer(n, dtype, shape.to_vec())
             .map_err(|e| anyhow!("QH35 deserialize: alloc {family}[{slot_idx}].tq.{name}: {e}"))?;
         let dst = buf
             .as_mut_slice::<u8>()
@@ -844,10 +978,18 @@ fn deserialize_tq_blob(
         Ok(buf)
     };
 
-    let k_packed = read_blob(bytes, cursor, device, "k_packed")?;
-    let k_norms = read_blob(bytes, cursor, device, "k_norms")?;
-    let v_packed = read_blob(bytes, cursor, device, "v_packed")?;
-    let v_norms = read_blob(bytes, cursor, device, "v_norms")?;
+    let k_packed = read_blob(
+        bytes, cursor, device, "k_packed", DType::U8, &packed_shape, expected_packed_bytes,
+    )?;
+    let k_norms = read_blob(
+        bytes, cursor, device, "k_norms", DType::F32, &norms_shape, expected_norms_bytes,
+    )?;
+    let v_packed = read_blob(
+        bytes, cursor, device, "v_packed", DType::U8, &packed_shape, expected_packed_bytes,
+    )?;
+    let v_norms = read_blob(
+        bytes, cursor, device, "v_norms", DType::F32, &norms_shape, expected_norms_bytes,
+    )?;
 
     Ok(TqKvSnapshot {
         k_packed,
@@ -904,13 +1046,16 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
     // envelopes are read with implicit kv_present=1 for every slot.
     // iter-36 (sub-iter 23d-β): v3 adds tq_present:u8 per slot. v1/v2
     // envelopes are read with implicit tq_present=0.
+    // sub-iter 23d-γ: v4 adds per-MTP kv_present:u8. v1..v3 envelopes
+    // are read with implicit MTP kv_present=1.
     ensure!(
-        codec_version == 1 || codec_version == 2 || codec_version == 3,
-        "QH35 deserialize: unsupported codec_version {} (expected 1, 2, or 3)",
+        codec_version >= 1 && codec_version <= 4,
+        "QH35 deserialize: unsupported codec_version {} (expected 1, 2, 3, or 4)",
         codec_version
     );
     let codec_v2 = codec_version >= 2;
     let codec_v3 = codec_version >= 3;
+    let codec_v4 = codec_version >= 4;
 
     let header_cfg = Qwen35HybridConfig {
         n_full_attn: read_u32_le(bytes, cursor)?,
@@ -921,11 +1066,13 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
         // Shapes are per-(slot, family) and not in the header — copy from
         // runtime cfg so the assert_matches comparison treats them as
         // equal (per-slot shape is validated against cfg in the body
-        // loops below).
+        // loops below). kv_substrate is likewise fingerprint-only (not
+        // serialized) — copy from runtime cfg.
         full_attn_shape: cfg.full_attn_shape,
         linear_conv_shape: cfg.linear_conv_shape,
         linear_recurrent_shape: cfg.linear_recurrent_shape,
         mtp_shape: cfg.mtp_shape,
+        kv_substrate: cfg.kv_substrate,
     };
     let _reserved = read_u16_le(bytes, cursor)?;
 
@@ -993,8 +1140,9 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
                     tq_byte
                 );
                 if tq_byte == QH35_TQ_PRESENT {
-                    full_attn_tq[slot_idx] =
-                        Some(deserialize_tq_blob(bytes, cursor, device, slot_idx, "full_attn")?);
+                    full_attn_tq[slot_idx] = Some(deserialize_tq_blob(
+                        bytes, cursor, device, slot_idx, "full_attn", cfg.full_attn_shape,
+                    )?);
                 }
             }
             continue;
@@ -1068,8 +1216,9 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
                 tq_byte
             );
             if tq_byte == QH35_TQ_PRESENT {
-                full_attn_tq[slot_idx] =
-                    Some(deserialize_tq_blob(bytes, cursor, device, slot_idx, "full_attn")?);
+                full_attn_tq[slot_idx] = Some(deserialize_tq_blob(
+                    bytes, cursor, device, slot_idx, "full_attn", cfg.full_attn_shape,
+                )?);
             }
         }
     }
@@ -1144,57 +1293,85 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
 
     // --- MTP slot (iter-4) ---
     let mtp: Option<MtpKvSnapshot> = if cfg.has_mtp {
-        let mut mk_shape_arr = [0u64; 4];
-        for dim in &mut mk_shape_arr {
-            *dim = read_u64_le(bytes, cursor)?;
-        }
-        ensure!(
-            mk_shape_arr == cfg.mtp_shape,
-            "QH35 deserialize: mtp shape on disk {:?} != cfg.mtp_shape {:?}",
-            mk_shape_arr,
-            cfg.mtp_shape
-        );
-        let mk_byte_len = read_u64_le(bytes, cursor)? as usize;
-        let mv_byte_len = read_u64_le(bytes, cursor)? as usize;
-        let mut mtp_current_len = Vec::with_capacity(cfg.n_seqs as usize);
-        for _ in 0..cfg.n_seqs {
-            mtp_current_len.push(read_u32_le(bytes, cursor)?);
-        }
-        let mk_src = read_bytes(bytes, cursor, mk_byte_len)?;
-        let mv_src = read_bytes(bytes, cursor, mv_byte_len)?;
-        let mtp_shape_usize: Vec<usize> =
-            mk_shape_arr.iter().map(|d| *d as usize).collect();
-        let dtype = full_attn_dtype_for_codec(header_cfg.full_attn_codec);
-        let mut mk_buf = device
-            .alloc_buffer(mk_byte_len, dtype, mtp_shape_usize.clone())
-            .map_err(|e| anyhow!("QH35 deserialize: alloc mtp.k: {e}"))?;
-        let mut mv_buf = device
-            .alloc_buffer(mv_byte_len, dtype, mtp_shape_usize)
-            .map_err(|e| anyhow!("QH35 deserialize: alloc mtp.v: {e}"))?;
-        {
-            let dst = mk_buf
-                .as_mut_slice::<u8>()
-                .map_err(|e| anyhow!("QH35 deserialize: mtp.k mut_slice: {e}"))?;
+        // sub-iter 23d-γ (codec v4): per-MTP kv_present byte mirroring
+        // the full-attn slots' v2 byte. v1..v3 envelopes implicitly
+        // treat MTP K/V as present (the only shape they could emit).
+        let mtp_kv_present: u8 = if codec_v4 {
+            let b = read_u8(bytes, cursor)?;
             ensure!(
-                dst.len() == mk_src.len(),
-                "QH35 deserialize: mtp.k dst.len() = {} != src.len() = {}",
-                dst.len(),
-                mk_src.len()
+                b == QH35_KV_PRESENT || b == QH35_KV_ABSENT,
+                "QH35 deserialize: invalid mtp kv_present byte {} \
+                 (expected 0 or 1)",
+                b
             );
-            dst.copy_from_slice(mk_src);
-        }
-        {
-            let dst = mv_buf
-                .as_mut_slice::<u8>()
-                .map_err(|e| anyhow!("QH35 deserialize: mtp.v mut_slice: {e}"))?;
+            b
+        } else {
+            QH35_KV_PRESENT
+        };
+
+        let (mk_buf, mv_buf, mtp_current_len) = if mtp_kv_present == QH35_KV_PRESENT {
+            let mut mk_shape_arr = [0u64; 4];
+            for dim in &mut mk_shape_arr {
+                *dim = read_u64_le(bytes, cursor)?;
+            }
             ensure!(
-                dst.len() == mv_src.len(),
-                "QH35 deserialize: mtp.v dst.len() = {} != src.len() = {}",
-                dst.len(),
-                mv_src.len()
+                mk_shape_arr == cfg.mtp_shape,
+                "QH35 deserialize: mtp shape on disk {:?} != cfg.mtp_shape {:?}",
+                mk_shape_arr,
+                cfg.mtp_shape
             );
-            dst.copy_from_slice(mv_src);
-        }
+            let mk_byte_len = read_u64_le(bytes, cursor)? as usize;
+            let mv_byte_len = read_u64_le(bytes, cursor)? as usize;
+            let mut current_len = Vec::with_capacity(cfg.n_seqs as usize);
+            for _ in 0..cfg.n_seqs {
+                current_len.push(read_u32_le(bytes, cursor)?);
+            }
+            let mk_src = read_bytes(bytes, cursor, mk_byte_len)?;
+            let mv_src = read_bytes(bytes, cursor, mv_byte_len)?;
+            let mtp_shape_usize: Vec<usize> =
+                mk_shape_arr.iter().map(|d| *d as usize).collect();
+            let dtype = full_attn_dtype_for_codec(header_cfg.full_attn_codec);
+            let mut mk_buf = device
+                .alloc_buffer(mk_byte_len, dtype, mtp_shape_usize.clone())
+                .map_err(|e| anyhow!("QH35 deserialize: alloc mtp.k: {e}"))?;
+            let mut mv_buf = device
+                .alloc_buffer(mv_byte_len, dtype, mtp_shape_usize)
+                .map_err(|e| anyhow!("QH35 deserialize: alloc mtp.v: {e}"))?;
+            {
+                let dst = mk_buf
+                    .as_mut_slice::<u8>()
+                    .map_err(|e| anyhow!("QH35 deserialize: mtp.k mut_slice: {e}"))?;
+                ensure!(
+                    dst.len() == mk_src.len(),
+                    "QH35 deserialize: mtp.k dst.len() = {} != src.len() = {}",
+                    dst.len(),
+                    mk_src.len()
+                );
+                dst.copy_from_slice(mk_src);
+            }
+            {
+                let dst = mv_buf
+                    .as_mut_slice::<u8>()
+                    .map_err(|e| anyhow!("QH35 deserialize: mtp.v mut_slice: {e}"))?;
+                ensure!(
+                    dst.len() == mv_src.len(),
+                    "QH35 deserialize: mtp.v dst.len() = {} != src.len() = {}",
+                    dst.len(),
+                    mv_src.len()
+                );
+                dst.copy_from_slice(mv_src);
+            }
+            (Some(mk_buf), Some(mv_buf), current_len)
+        } else {
+            // TQ-only mode: current_len only, K/V reconstruct as None
+            // (the MTP TQ payload is read from the tq block below).
+            let mut current_len = Vec::with_capacity(cfg.n_seqs as usize);
+            for _ in 0..cfg.n_seqs {
+                current_len.push(read_u32_le(bytes, cursor)?);
+            }
+            (None, None, current_len)
+        };
+
         // iter-36 (sub-iter 23d-β): MTP TQ payload after kv block on v3.
         let mtp_tq = if codec_v3 {
             let tq_byte = read_u8(bytes, cursor)?;
@@ -1205,7 +1382,9 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
                 tq_byte
             );
             if tq_byte == QH35_TQ_PRESENT {
-                Some(deserialize_tq_blob(bytes, cursor, device, 0, "mtp")?)
+                Some(deserialize_tq_blob(
+                    bytes, cursor, device, 0, "mtp", cfg.mtp_shape,
+                )?)
             } else {
                 None
             }
@@ -1213,11 +1392,10 @@ pub fn deserialize_hybrid_snapshot_at_cursor(
             None
         };
         Some(MtpKvSnapshot {
-            // ADR-027 sub-sub-iter 23a-α: Optional MTP K/V — codec
-            // emits Some today (iter-23d will branch on a kv_present
-            // byte to support None for TQ-only mode).
-            k: Some(mk_buf),
-            v: Some(mv_buf),
+            // sub-iter 23d-γ (codec v4): None in TQ-only mode (payload
+            // rides the TQ block); Some in every earlier-version mode.
+            k: mk_buf,
+            v: mv_buf,
             current_len: mtp_current_len,
             tq: mtp_tq,
         })
@@ -1527,6 +1705,7 @@ mod tests {
             // path is exercised — Qwen3.6 MTP block does declare its own
             // head_count in production.
             mtp_shape: [n_seqs as u64, 4, 8, 4],
+            kv_substrate: KvSubstrate::F32Only,
         }
     }
 
@@ -2010,15 +2189,15 @@ mod tests {
 
         // Build a TQ-only snapshot: K/V are None per slot, but TQ is
         // Some(_) with synthetic deterministic byte content.
-        // TQ shape: synth helper uses head_dim=4, max_seq=2, n_kv_heads=1, n_seqs=1
-        // Per slot: k_packed [1,1,2,4]u8 = 8 bytes; k_norms [1,1,2,1]f32 = 8 bytes; same for v.
-        // Total per TQ blob: 32 bytes data + 4 norms_per_pos + 4×8(byte_lens) = 68 bytes.
+        // TQ shape (synth_cfg full_attn_shape = [1,2,8,4]): packed 64 B U8;
+        // norms [1,2,8,1] F32 = 64 B. Lengths must match the 23d-γ
+        // cfg-derived shape validation in deserialize_tq_blob.
         let mut full_attn_tq: Vec<Option<TqKvSnapshot>> = Vec::new();
         for slot in 0..n_full_attn as usize {
-            let mut k_packed = device.alloc_buffer(8, DType::U8, vec![8]).unwrap();
-            let mut k_norms = device.alloc_buffer(8, DType::F32, vec![2]).unwrap();
-            let mut v_packed = device.alloc_buffer(8, DType::U8, vec![8]).unwrap();
-            let mut v_norms = device.alloc_buffer(8, DType::F32, vec![2]).unwrap();
+            let mut k_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
+            let mut k_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
+            let mut v_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
+            let mut v_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
             for (i, b) in k_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
                 *b = ((slot * 31 + i * 7) % 251) as u8;
             }
@@ -2319,5 +2498,393 @@ mod tests {
         let restored = deserialize_lcp_sidecar(&bytes, &mut cursor).expect("deserialize");
         assert_eq!(cursor, bytes.len());
         assert_eq!(restored, sidecar);
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-027 sub-iter 23d-gamma (2026-08-03) — TQ-only mode coverage:
+    // cfg_from_cache shape/substrate derivation, codec v4 MTP kv_present,
+    // substrate-namespaced fingerprint, v3 back-compat.
+    // ---------------------------------------------------------------------
+
+    /// Minimal real-cache config fixture (mirrors kv_cache.rs's
+    /// `tiny_dense_cfg_4layer_for_multi_seq_tests` — duplicated here to
+    /// keep the serve/persist layer's tests free of an inference-layer
+    /// test-helper dependency).
+    fn tiny_qwen35_cfg(mtp: bool) -> crate::inference::models::qwen35::Qwen35Config {
+        use crate::inference::models::qwen35::{
+            default_layer_types, Qwen35Config, Qwen35Variant,
+        };
+        Qwen35Config {
+            variant: Qwen35Variant::Dense,
+            hidden_size: 64,
+            num_hidden_layers: 4,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 32,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: 4,
+            linear_key_head_dim: 8,
+            linear_value_head_dim: 8,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            layer_types: default_layer_types(4, 2),
+            partial_rotary_factor: 0.25,
+            rope_theta: 1e7,
+            rotary_dim: 8,
+            mrope_section: [2, 2, 2, 2],
+            mrope_interleaved: true,
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 4096,
+            vocab_size: 256,
+            attn_output_gate: true,
+            mtp_num_hidden_layers: if mtp { 1 } else { 0 },
+            mtp_use_dedicated_embeddings: true,
+            intermediate_size: Some(128),
+            moe: None,
+        }
+    }
+
+    #[test]
+    fn cfg_from_cache_tq_only_derives_shape_substrate_and_mtp() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_qwen35_cfg(true);
+        let cache = HybridKvCache::new_with_options(&cfg, &device, 64, 1, true)
+            .expect("alloc TQ-mode cache");
+        assert!(cache.tq_kv_active && cache.full_attn[0].k.is_none());
+
+        let derived = cfg_from_cache(&cache, FullAttnCodec::F32Dense)
+            .expect("cfg_from_cache must NOT panic in TQ-only mode (23d-gamma)");
+        // Shape derived from tq.k_packed == the F32 logical layout.
+        assert_eq!(derived.full_attn_shape, [1, 2, 64, 32]);
+        assert_eq!(derived.mtp_shape, [1, 2, 64, 32]);
+        assert_eq!(derived.n_full_attn, 2);
+        assert_eq!(derived.n_linear_attn, 2);
+        assert!(derived.has_mtp);
+        assert_eq!(derived.n_seqs, 1);
+        assert_eq!(derived.kv_substrate, KvSubstrate::TqOnly);
+    }
+
+    #[test]
+    fn cfg_from_cache_f32_only_substrate() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_qwen35_cfg(true);
+        let cache = HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc legacy cache");
+        assert!(!cache.tq_kv_active && cache.full_attn[0].tq.is_none());
+
+        let derived = cfg_from_cache(&cache, FullAttnCodec::F32Dense).expect("cfg_from_cache");
+        assert_eq!(derived.full_attn_shape, [1, 2, 64, 32]);
+        assert_eq!(derived.kv_substrate, KvSubstrate::F32Only);
+    }
+
+    #[test]
+    fn cfg_from_cache_mixed_substrate_hard_errors() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = tiny_qwen35_cfg(false);
+        let mut cache = HybridKvCache::new(&cfg, &device, 64, 1).expect("alloc legacy cache");
+        // Graft TQ onto slot 1 only (slot 0 stays F32) — violates the
+        // allocator's uniform-substrate invariant.
+        cache.full_attn[1].k = None;
+        cache.full_attn[1].v = None;
+        cache.full_attn[1].tq = Some(
+            crate::inference::models::qwen35::kv_cache::alloc_tq_full_attn_buffers(
+                &cfg, &device, 64, 1,
+            )
+            .expect("alloc tq buffers"),
+        );
+        let err = cfg_from_cache(&cache, FullAttnCodec::F32Dense).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("mixed KV substrates"),
+            "expected mixed-substrate error, got: {msg}"
+        );
+    }
+
+    /// Build a fully TQ-populated snapshot (full-attn + MTP, k/v=None,
+    /// tq=Some) with deterministic byte patterns.
+    fn synth_tq_only_snapshot_with_mtp(
+        device: &MlxDevice,
+        cfg: &Qwen35HybridConfig,
+    ) -> HybridKvCacheSnapshot {
+        let mut snap = synth_full_attn_only_snapshot(device, cfg);
+        // Flip full-attn slots to TQ-only: k/v=None, tq=Some.
+        let n_full = cfg.n_full_attn as usize;
+        snap.full_attn_k = (0..n_full).map(|_| None).collect();
+        snap.full_attn_v = (0..n_full).map(|_| None).collect();
+        snap.full_attn_tq = (0..n_full)
+            .map(|slot| {
+                // cfg.full_attn_shape = [1,2,8,4] → packed 64 B; norms [1,2,8,1] F32 = 64 B.
+                let mut k_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
+                let mut k_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
+                let mut v_packed = device.alloc_buffer(64, DType::U8, vec![64]).unwrap();
+                let mut v_norms = device.alloc_buffer(64, DType::F32, vec![16]).unwrap();
+                for (i, b) in k_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+                    *b = ((slot * 41 + i * 13) % 251) as u8;
+                }
+                for (i, b) in v_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+                    *b = ((slot * 17 + i * 23) % 251) as u8;
+                }
+                for (i, f) in k_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+                    *f = (slot as f32) * 0.75 + (i as f32) * 0.25;
+                }
+                for (i, f) in v_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+                    *f = (slot as f32) * 0.5 + (i as f32) * 0.125;
+                }
+                Some(TqKvSnapshot { k_packed, k_norms, v_packed, v_norms, norms_per_pos: 1 })
+            })
+            .collect();
+        // MTP in TQ-only mode too.
+        // cfg.mtp_shape = [1,4,8,4] → packed 128 B; norms [1,4,8,1] F32 = 128 B.
+        let mut mk_packed = device.alloc_buffer(128, DType::U8, vec![128]).unwrap();
+        let mut mk_norms = device.alloc_buffer(128, DType::F32, vec![32]).unwrap();
+        let mut mv_packed = device.alloc_buffer(128, DType::U8, vec![128]).unwrap();
+        let mut mv_norms = device.alloc_buffer(128, DType::F32, vec![32]).unwrap();
+        for (i, b) in mk_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+            *b = ((97 + i * 7) % 251) as u8;
+        }
+        for (i, b) in mv_packed.as_mut_slice::<u8>().unwrap().iter_mut().enumerate() {
+            *b = ((53 + i * 11) % 251) as u8;
+        }
+        for (i, f) in mk_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+            *f = 0.5 + (i as f32) * 0.5;
+        }
+        for (i, f) in mv_norms.as_mut_slice::<f32>().unwrap().iter_mut().enumerate() {
+            *f = 0.25 + (i as f32) * 0.25;
+        }
+        snap.mtp = Some(MtpKvSnapshot {
+            k: None,
+            v: None,
+            current_len: (0..cfg.n_seqs).map(|s| 7 + s).collect(),
+            tq: Some(TqKvSnapshot {
+                k_packed: mk_packed, k_norms: mk_norms,
+                v_packed: mv_packed, v_norms: mv_norms,
+                norms_per_pos: 1,
+            }),
+        });
+        snap
+    }
+
+    #[test]
+    fn qh35_v4_tq_only_with_mtp_round_trip_byte_exact() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let mut cfg = synth_cfg_full(2, 0, true, 1);
+        cfg.kv_substrate = KvSubstrate::TqOnly;
+        let snap = synth_tq_only_snapshot_with_mtp(&device, &cfg);
+
+        let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize v4 TQ-only");
+        // Header: magic + version.
+        assert_eq!(&bytes[..4], &QH35_MAGIC);
+        let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        assert_eq!(version, 4, "serializer must emit codec v4");
+
+        let restored = deserialize_hybrid_snapshot(&bytes, &cfg, &device)
+            .expect("deserialize v4 TQ-only");
+
+        // full-attn: k/v None restored; TQ blobs byte-exact.
+        for slot in 0..cfg.n_full_attn as usize {
+            assert!(restored.full_attn_k[slot].is_none());
+            assert!(restored.full_attn_v[slot].is_none());
+            let src = snap.full_attn_tq[slot].as_ref().unwrap();
+            let dst = restored.full_attn_tq[slot].as_ref().expect("tq restored");
+            assert_eq!(dst.k_packed.as_slice::<u8>().unwrap(), src.k_packed.as_slice::<u8>().unwrap(), "slot {slot} k_packed");
+            assert_eq!(dst.v_packed.as_slice::<u8>().unwrap(), src.v_packed.as_slice::<u8>().unwrap(), "slot {slot} v_packed");
+            assert_eq!(dst.k_norms.as_slice::<u8>().unwrap(), src.k_norms.as_slice::<u8>().unwrap(), "slot {slot} k_norms");
+            assert_eq!(dst.v_norms.as_slice::<u8>().unwrap(), src.v_norms.as_slice::<u8>().unwrap(), "slot {slot} v_norms");
+            assert_eq!(dst.norms_per_pos, src.norms_per_pos);
+            assert_eq!(restored.full_attn_current_len[slot], snap.full_attn_current_len[slot]);
+        }
+        // MTP: k/v None restored (v4 kv_present=0); TQ blob byte-exact.
+        let msrc = snap.mtp.as_ref().unwrap();
+        let mdst = restored.mtp.as_ref().expect("mtp restored");
+        assert!(mdst.k.is_none() && mdst.v.is_none(), "v4 must restore MTP k/v as None in TQ-only mode");
+        let (stq, dtq) = (msrc.tq.as_ref().unwrap(), mdst.tq.as_ref().expect("mtp tq restored"));
+        assert_eq!(dtq.k_packed.as_slice::<u8>().unwrap(), stq.k_packed.as_slice::<u8>().unwrap());
+        assert_eq!(dtq.v_packed.as_slice::<u8>().unwrap(), stq.v_packed.as_slice::<u8>().unwrap());
+        assert_eq!(dtq.k_norms.as_slice::<u8>().unwrap(), stq.k_norms.as_slice::<u8>().unwrap());
+        assert_eq!(dtq.v_norms.as_slice::<u8>().unwrap(), stq.v_norms.as_slice::<u8>().unwrap());
+        assert_eq!(mdst.current_len, msrc.current_len);
+    }
+
+    #[test]
+    fn qh35_v3_envelope_deserializes_with_implicit_mtp_kv_present() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let cfg = synth_cfg_full(1, 0, true, 1);
+
+        // Hand-craft a v3 envelope: 1 full-attn F32 slot (kv_present=1,
+        // tq_present=0), no linear slots, MTP F32 present WITHOUT a
+        // kv_present byte (v3 had none), MTP tq_present=0.
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(&QH35_MAGIC);
+        write_u32_le(&mut out, 3); // codec_version = 3
+        write_u32_le(&mut out, cfg.n_full_attn);
+        write_u32_le(&mut out, cfg.n_linear_attn);
+        write_u8(&mut out, 1); // has_mtp
+        write_u8(&mut out, FullAttnCodec::F32Dense as u8);
+        write_u32_le(&mut out, cfg.n_seqs);
+        write_u16_le(&mut out, 0); // reserved
+        // full-attn slot 0: kv_present=1 + shape + lens + current_len + payload
+        let elems: usize = cfg.full_attn_shape.iter().product::<u64>() as usize;
+        let byte_len = elems * 4;
+        write_u32_le(&mut out, 0); // slot_idx
+        write_u8(&mut out, QH35_KV_PRESENT);
+        for &d in &cfg.full_attn_shape {
+            write_u64_le(&mut out, d);
+        }
+        write_u64_le(&mut out, byte_len as u64);
+        write_u64_le(&mut out, byte_len as u64);
+        write_u32_le(&mut out, 5); // current_len[0]
+        let k_bytes: Vec<u8> = (0..byte_len).map(|i| (i % 251) as u8).collect();
+        let v_bytes: Vec<u8> = (0..byte_len).map(|i| ((i * 3) % 251) as u8).collect();
+        out.extend_from_slice(&k_bytes);
+        out.extend_from_slice(&v_bytes);
+        write_u8(&mut out, QH35_TQ_ABSENT);
+        // MTP: NO kv_present byte (v3 layout) — shape + lens + current_len + payload.
+        let melems: usize = cfg.mtp_shape.iter().product::<u64>() as usize;
+        let mbyte_len = melems * 4;
+        for &d in &cfg.mtp_shape {
+            write_u64_le(&mut out, d);
+        }
+        write_u64_le(&mut out, mbyte_len as u64);
+        write_u64_le(&mut out, mbyte_len as u64);
+        write_u32_le(&mut out, 5);
+        let mk_bytes: Vec<u8> = (0..mbyte_len).map(|i| ((i * 7) % 251) as u8).collect();
+        out.extend_from_slice(&mk_bytes);
+        out.extend_from_slice(&mk_bytes); // v == k for this pin
+        write_u8(&mut out, QH35_TQ_ABSENT);
+
+        let restored = deserialize_hybrid_snapshot(&out, &cfg, &device)
+            .expect("v3 envelope must still deserialize (implicit MTP kv_present)");
+        assert!(restored.mtp.as_ref().expect("mtp").k.is_some(), "v3 MTP restores as Some");
+        assert_eq!(
+            restored.mtp.as_ref().unwrap().k.as_ref().unwrap().as_slice::<u8>().unwrap(),
+            mk_bytes.as_slice(),
+            "v3 MTP k bytes must round-trip"
+        );
+        assert_eq!(restored.full_attn_current_len[0], vec![5]);
+        let fa_k = restored.full_attn_k[0].as_ref().expect("fa k some");
+        assert_eq!(fa_k.as_slice::<u8>().unwrap(), k_bytes.as_slice());
+    }
+
+    #[test]
+    fn fingerprint_namespaces_by_kv_substrate() {
+        let mut a = synth_cfg(1, 1);
+        a.kv_substrate = KvSubstrate::F32Only;
+        let mut b = a.clone();
+        b.kv_substrate = KvSubstrate::TqOnly;
+        let ha = crate::serve::kv_persist::families::qwen35_disk_persistor::Qwen35DiskPersistor::fingerprint_hex_for(&a);
+        let hb = crate::serve::kv_persist::families::qwen35_disk_persistor::Qwen35DiskPersistor::fingerprint_hex_for(&b);
+        assert_ne!(ha, hb, "substrate must namespace the fingerprint (cross-mode hydrate would silently zero-restore)");
+        let ha2 = crate::serve::kv_persist::families::qwen35_disk_persistor::Qwen35DiskPersistor::fingerprint_hex_for(&a);
+        assert_eq!(ha, ha2, "fingerprint must be deterministic");
+    }
+
+    /// ADR-027 sub-iter 23d-γ — the exact production path that 500'd at
+    /// the live serve gate: a TQ-only snapshot written to disk
+    /// (serialize), hydrated back (deserialize), then LCP-resumed into a
+    /// freshly-allocated TQ-mode live cache via
+    /// `HybridKvCache::restore_partial`. Pre-23d-γ this chain hard-failed
+    /// with `partial_copy_slot: src shape rank 1 != 4` because the
+    /// deserializer emitted flat blobs. Pin: prefix bytes byte-exact +
+    /// tail zero + current_len advanced.
+    #[test]
+    fn qh35_v4_hydrated_tq_snapshot_restores_into_live_cache() {
+        let _gpu = crate::inference::hf2q_gpu_test_lock();
+        let device = MlxDevice::new().expect("device");
+        let live_cfg = tiny_qwen35_cfg(true);
+        let max_seq_len = 64u32;
+        let n_tokens = 40usize;
+
+        // 1) Source cache with planted patterns → snapshot (production
+        //    producer shape: live TQ-mode cache).
+        let mut src = HybridKvCache::new_with_options(&live_cfg, &device, max_seq_len, 1, true)
+            .expect("alloc src");
+        for (i, slot) in src.full_attn.iter_mut().enumerate() {
+            let tq = slot.tq.as_mut().expect("tq");
+            for (bi, buf) in [&mut tq.k_packed, &mut tq.k_norms, &mut tq.v_packed, &mut tq.v_norms]
+                .into_iter()
+                .enumerate()
+            {
+                let s = buf.as_mut_slice::<u8>().unwrap();
+                for (j, b) in s.iter_mut().enumerate() {
+                    *b = ((i * 31 + bi * 7 + j) % 251) as u8;
+                }
+            }
+        }
+        {
+            let tq = src.mtp_slot.as_mut().expect("mtp").tq.as_mut().expect("mtp tq");
+            for (bi, buf) in [&mut tq.k_packed, &mut tq.k_norms, &mut tq.v_packed, &mut tq.v_norms]
+                .into_iter()
+                .enumerate()
+            {
+                let s = buf.as_mut_slice::<u8>().unwrap();
+                for (j, b) in s.iter_mut().enumerate() {
+                    *b = ((97 + bi * 11 + j) % 251) as u8;
+                }
+            }
+        }
+        let snap = src.snapshot(&device).expect("snapshot");
+        let cfg = cfg_from_cache(&src, FullAttnCodec::F32Dense).expect("cfg_from_cache");
+        assert_eq!(cfg.kv_substrate, KvSubstrate::TqOnly);
+
+        // 2) Disk round-trip (serialize → deserialize) — the hydrate arm.
+        let bytes = serialize_hybrid_snapshot(&snap, &cfg).expect("serialize");
+        let restored_snap = deserialize_hybrid_snapshot(&bytes, &cfg, &device).expect("deserialize");
+
+        // 3) LCP resume into a fresh TQ-mode cache — THE 500 PATH.
+        let mut dst = HybridKvCache::new_with_options(&live_cfg, &device, max_seq_len, 1, true)
+            .expect("alloc dst");
+        dst.restore_partial(&restored_snap, n_tokens)
+            .expect("restore_partial on hydrated snapshot (was the live-gate 500)");
+
+        // 4) Pin: per-head prefix byte-exact on all four TQ buffers,
+        //    every full-attn slot + the MTP slot; tail zero; cursor set.
+        let check_slot = |src_tq: &crate::inference::models::qwen35::kv_cache::TqFullAttnKvBuffers,
+                          dst_tq: &crate::inference::models::qwen35::kv_cache::TqFullAttnKvBuffers,
+                          what: &str| {
+            for (name, s, d) in [
+                ("k_packed", &src_tq.k_packed, &dst_tq.k_packed),
+                ("k_norms", &src_tq.k_norms, &dst_tq.k_norms),
+                ("v_packed", &src_tq.v_packed, &dst_tq.v_packed),
+                ("v_norms", &src_tq.v_norms, &dst_tq.v_norms),
+            ] {
+                let shape = d.shape();
+                let (n_kv, max_seq, inner) = (shape[1], shape[2], shape[3]);
+                let elem = d.dtype().size_of();
+                let head_stride = max_seq * inner * elem;
+                let (sb, db) = (s.as_slice::<u8>().unwrap(), d.as_slice::<u8>().unwrap());
+                for head in 0..n_kv {
+                    let off = head * head_stride;
+                    let n = n_tokens * inner * elem;
+                    assert_eq!(
+                        &db[off..off + n],
+                        &sb[off..off + n],
+                        "{what}.tq.{name}[head {head}] prefix diverged (23d-γ)"
+                    );
+                    let tail = &db[off + n..off + head_stride];
+                    assert!(
+                        tail.iter().all(|&b| b == 0),
+                        "{what}.tq.{name}[head {head}] tail not zero (23d-γ)"
+                    );
+                }
+            }
+        };
+        for (i, slot) in dst.full_attn.iter().enumerate() {
+            check_slot(
+                src.full_attn[i].tq.as_ref().unwrap(),
+                slot.tq.as_ref().expect("dst tq"),
+                &format!("full_attn[{i}]"),
+            );
+            assert_eq!(slot.current_len[0] as usize, n_tokens);
+        }
+        check_slot(
+            src.mtp_slot.as_ref().unwrap().tq.as_ref().unwrap(),
+            dst.mtp_slot.as_ref().unwrap().tq.as_ref().expect("dst mtp tq"),
+            "mtp",
+        );
+        assert_eq!(dst.mtp_slot.as_ref().unwrap().current_len[0] as usize, n_tokens);
     }
 }

@@ -5,6 +5,75 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — TQ-only LCP resume + disk persist made production-correct (ADR-027 sub-iter 23d-γ)
+
+- **Silent coherence corruption fixed in TQ-only LCP resume.**
+  `HybridKvCache::restore_partial` now partial-copies the first-`n_tokens`
+  positions of all four TQ buffers (U8 packed + F32 norms) per slot for
+  full-attn AND MTP slots. Previously, under production `tq_kv_active=true`,
+  TQ buffers stayed zero-initialized after an LCP resume while
+  `current_len` advanced — the resumed request attended over zeroed K/V
+  for the entire cached prefix.
+- **`cfg_from_cache` no longer panics in TQ-only mode** (was an engine
+  worker panic → HTTP 500 on any request with `HF2Q_KV_PERSIST` set).
+  Shape is derived from `slot.tq.k_packed` when F32 backing is absent;
+  new `KvSubstrate` (F32Only/TqOnly/Both) classification with a
+  uniform-substrate invariant check.
+- **QH35 disk codec bumped to v4** — per-MTP `kv_present` byte (mirrors
+  the full-attn v2 byte; v1..v3 envelopes still deserialize), and
+  TQ blobs now deserialize into logical 4-rank shapes (was flat rank-1,
+  which hard-failed `restore_partial` on hydrated snapshots).
+- **On-disk fingerprint is substrate-namespaced** — snapshots written
+  under one KV substrate never hydrate into a cache allocated under
+  another (cross-mode hydration would have silently zero-restored; now a
+  clean cache miss).
+- Live gates (qwen36 APEX Q5_K_M, M5 Max): needle-recall byte-identical
+  cold vs LCP-resumed (TTFT 2920ms → 326ms = 9.0×), 182 MB checkpoints
+  written through to disk, cold-process restart hydrate byte-identical.
+  Unit: 33 persistor + 189 kv_cache + 228 kv_persist tests green.
+- **`Qwen35DiskPersistor` now enforces `HF2Q_KV_PERSIST_BUDGET_BYTES`**
+  with LRU-by-mtime eviction per cfg subdir — pre-fix, one ~100K-token
+  opencode session wrote 105 GB of chunk snapshots unbudgeted.
+- New canonical launcher `scripts/serve_qwen36_opencode.sh` (full
+  production env incl. `HF2Q_KV_LCP_DELTANET_CHECKPOINT_STRIDE=4096` for
+  long-context checkpoint economics).
+
+### Fixed — tool-call grammar for structured parameters (ADR-005 iter-231)
+
+- **Agentic clients (opencode, MCP tool servers) can now call tools whose
+  schemas declare `object` / `array` parameters.** Previously every
+  `/v1/chat/completions` request carrying such a schema failed with
+  HTTP 400 (`parameter 'X' uses unsupported schema type 'object'` — the
+  wave-2.5 scalar-only emitter gate).
+- Tool-call GBNF emitters (Qwen 3.5/3.6 + Gemma 4) now compile nested
+  schemas recursively with full declared-structure fidelity: per-key
+  value grammars, any-order `required` (≤8) permutation, typed array
+  `items`, enums, type unions, `anyOf`/`oneOf`, and
+  `additionalProperties:false` key-set closure. Free-form objects
+  (no declared `properties`/`items`) compile to permissive recursive
+  JSON value rules matching exactly what the chat templates emit
+  (`tojson` / `format_argument`).
+- The JSON Schema `pattern` regex keyword is now COMPILED into the
+  tool-call value grammars via a real regex→GBNF compiler
+  (`grammar/regex_gbnf.rs`, iter-231c) — literal/class/group/alternation/
+  quantifier support with honest errors for non-regular features
+  (backreferences, look-around, property classes). This unblocks MCP
+  tool schemas like ruvnet-brain's `argv` items (`^[a-z][a-z0-9-]*$`).
+- Schemas using features the grammar cannot enforce (`allOf`, `$ref`,
+  tuple `items`, …) now return an honest 400 naming the feature and
+  dot-path instead of failing the whole request class.
+- Gemma 4 tool-call parser now round-trips nested structured arguments
+  (objects/arrays containing commas) into `arguments_json` as real JSON
+  instead of mangling them into string fields.
+- Top-level untyped parameters accept structured values (both families).
+- Also fixed two pre-existing sweep failures: H1 structural audit
+  (`GOLDEN_OUTPUT` hoisted to module scope) and upstream citation drift
+  (qwen35/qwen35moe catalog line numbers re-transcribed against current
+  llama.cpp); cleared 8 pre-existing build warnings. Full sweep:
+  4120 passed / 0 failed / 0 warnings.
+
 ## [0.1.0] — 2026-05-16
 
 First public release.
