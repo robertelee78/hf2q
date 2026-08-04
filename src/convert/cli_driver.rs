@@ -34,8 +34,8 @@ use crate::backends::gguf::types::MetaValue;
 use crate::convert::arch::bake::BakeOp;
 use crate::convert::arch::qwen35moe_full::Qwen35MoeFullCtx;
 use crate::convert::arch::{
-    bake, bert, gemma4, gemma4_mmproj, llama3, minimax_m2, nomic_bert, qwen35moe, qwen35moe_full,
-    qwen3vl_text,
+    bake, bert, deepseek4, deepseek4_metadata, gemma4, gemma4_mmproj, llama3, minimax_m2,
+    nomic_bert, qwen35moe, qwen35moe_full, qwen3vl_text,
 };
 use crate::convert::arch::gemma4::MappedTensor as Gemma4Mapped;
 use crate::convert::arch::minimax_m2::{ExpertRole, MappedTensor as MiniMaxMapped};
@@ -380,6 +380,13 @@ pub fn run_convert(args: ConvertArgs) -> Result<(), ConvertError> {
     // mmaps each shard and records a flat tensor index. Payload bytes are
     // read one tensor at a time in the streaming stage below.
     let src = HfModelSource::open(&args.hf_dir)?;
+    if src.excluded_mtp_tensor_count() > 0 {
+        tracing::warn!(
+            target: "convert",
+            excluded = src.excluded_mtp_tensor_count(),
+            "DeepSeek-V4 MTP/DSpark tensors excluded from base GGUF; separate draft artifact remains required"
+        );
+    }
 
     // ----- 2. Detect arch ---------------------------------------------------
     let detected_arch = detect_arch(&src.config)?;
@@ -888,6 +895,7 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
             "qwen3_5_moe" | "qwen3_5_moe_text" => return Ok(ArchName::Qwen35MoeFull),
             "qwen3_vl" | "qwen3_vl_moe" | "qwen3_vl_text" => return Ok(ArchName::Qwen3VlText),
             "minimax_m2" => return Ok(ArchName::MiniMaxM2),
+            "deepseek_v4" => return Ok(ArchName::Deepseek4),
             _ => {}
         }
     }
@@ -934,6 +942,7 @@ fn detect_arch(config: &serde_json::Value) -> Result<ArchName, ConvertError> {
                 return Ok(ArchName::Qwen3VlText);
             }
             "MiniMaxM2ForCausalLM" => return Ok(ArchName::MiniMaxM2),
+            "DeepseekV4ForCausalLM" => return Ok(ArchName::Deepseek4),
             _ => {}
         }
     }
@@ -1051,6 +1060,7 @@ fn build_hparams(config: &serde_json::Value) -> Result<HParams, ConvertError> {
     let n_expert = config
         .get("num_experts")
         .or_else(|| config.get("num_local_experts"))
+        .or_else(|| config.get("n_routed_experts"))
         .and_then(|v| v.as_u64())
         .map(|x| x as u32)
         .unwrap_or(0);
@@ -1230,6 +1240,13 @@ fn build_metadata_for_arch(
             sampling,
             model_dir_basename,
             size_label,
+        ),
+        ArchName::Deepseek4 => deepseek4_metadata::build_metadata(
+            config,
+            ftype,
+            model_card,
+            sampling,
+            model_dir_basename,
         ),
         // Falcon is a placeholder in ArchName for target_for's branch
         // expression; it is NOT a convert-v2 supported arch. Reaching
@@ -1490,6 +1507,7 @@ fn map_tensor(
             None => MapOutcome::Unmapped,
         },
         ArchName::MiniMaxM2 => lift_minimax_mapped(minimax_m2::map_tensor_name(hf_name)),
+        ArchName::Deepseek4 => lift_qwen_mapped(deepseek4::map_tensor_name(hf_name)),
         ArchName::Falcon => MapOutcome::Unmapped,
     }
 }
@@ -1975,6 +1993,7 @@ fn build_convert_plan(
     let n_experts = n_experts_cfg
         .get("num_experts")
         .or_else(|| n_experts_cfg.get("num_local_experts"))
+        .or_else(|| n_experts_cfg.get("n_routed_experts"))
         .and_then(|v| v.as_u64())
         .map(|x| x as usize);
 
@@ -3081,5 +3100,146 @@ mod tests {
         .unwrap();
         assert_eq!(data.tensor_pair_count(), 1);
     }
-}
 
+    #[test]
+    fn deepseek_detection_and_incomplete_expert_group_fail_closed() {
+        assert_eq!(
+            detect_arch(&json!({"model_type":"deepseek_v4"})).unwrap(),
+            ArchName::Deepseek4
+        );
+        assert_eq!(
+            detect_arch(&json!({"architectures":["DeepseekV4ForCausalLM"]})).unwrap(),
+            ArchName::Deepseek4
+        );
+
+        use safetensors::tensor::{Dtype, TensorView};
+        let dir = tempfile::tempdir().unwrap();
+        let expert_bytes = vec![0_u8; 16];
+        let scale_bytes = vec![127_u8];
+        let expert = TensorView::new(Dtype::I8, vec![1, 16], &expert_bytes).unwrap();
+        let scale = TensorView::new(Dtype::F8_E8M0, vec![1, 1], &scale_bytes).unwrap();
+        let tensors = vec![
+            ("layers.0.ffn.experts.0.w1.weight".to_string(), &expert),
+            ("layers.0.ffn.experts.0.w1.scale".to_string(), &scale),
+        ];
+        std::fs::write(
+            dir.path().join("model.safetensors"),
+            safetensors::tensor::serialize(tensors, None).unwrap(),
+        ).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&json!({
+                "model_type":"deepseek_v4", "n_routed_experts":2,
+                "quantization_config":{"quant_method":"fp8", "weight_block":[128,128]}
+            })).unwrap(),
+        ).unwrap();
+        let source = HfModelSource::open(dir.path()).unwrap();
+        let err = match build_convert_plan(ArchName::Deepseek4, &source, &[]) {
+            Ok(_) => panic!("one of two experts must not form a complete group"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ConvertError::IncompleteExpertGroup {
+            present_count: 1, n_experts_config: 2, ..
+        }));
+    }
+
+    #[test]
+    fn deepseek_tiny_official_layout_converts_to_q2_k_s_end_to_end() {
+        use safetensors::tensor::{Dtype, TensorView};
+        let dir = tempfile::tempdir().unwrap();
+        let f16 = vec![0_u8; 32 * 256 * 2];
+        let packed = vec![0x21_u8; 256 * 128];
+        let scales = vec![127_u8; 256 * 8];
+        let mut owned: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = vec![
+            ("embed.weight".into(), Dtype::F16, vec![32, 256], f16.clone()),
+            ("head.weight".into(), Dtype::F16, vec![32, 256], f16),
+            ("norm.weight".into(), Dtype::F32, vec![256], vec![0; 256 * 4]),
+        ];
+        for expert in 0..2 {
+            for proj in ["w1", "w2", "w3"] {
+                owned.push((
+                    format!("layers.0.ffn.experts.{expert}.{proj}.weight"),
+                    Dtype::I8,
+                    vec![256, 128],
+                    packed.clone(),
+                ));
+                owned.push((
+                    format!("layers.0.ffn.experts.{expert}.{proj}.scale"),
+                    Dtype::U8,
+                    vec![256, 8],
+                    scales.clone(),
+                ));
+            }
+        }
+        let views: Vec<(String, TensorView<'_>)> = owned
+            .iter()
+            .map(|(name, dtype, shape, bytes)| {
+                (name.clone(), TensorView::new(*dtype, shape.clone(), bytes).unwrap())
+            })
+            .collect();
+        let refs: Vec<(String, &TensorView<'_>)> =
+            views.iter().map(|(name, view)| (name.clone(), view)).collect();
+        std::fs::write(
+            dir.path().join("model.safetensors"),
+            safetensors::tensor::serialize(refs, None).unwrap(),
+        ).unwrap();
+
+        let cfg = json!({
+            "_name_or_path":"deepseek-ai/DeepSeek-V4-Flash-0731", "model_type":"deepseek_v4",
+            "architectures":["DeepseekV4ForCausalLM"], "hidden_size":256,
+            "num_hidden_layers":1, "num_attention_heads":4, "num_key_value_heads":1,
+            "max_position_embeddings":1024, "rms_norm_eps":1e-6, "vocab_size":32,
+            "n_routed_experts":2, "num_experts_per_tok":1, "n_shared_experts":1,
+            "moe_intermediate_size":256, "routed_scaling_factor":1.5,
+            "norm_topk_prob":true, "scoring_func":"sqrtsoftplus", "swiglu_limit":10.0,
+            "qk_rope_head_dim":64, "q_lora_rank":64, "sliding_window":128,
+            "index_n_heads":4, "index_head_dim":32, "index_topk":16,
+            "o_groups":2, "o_lora_rank":64, "compress_ratios":[0],
+            "compress_rope_theta":160000.0, "hc_mult":4, "hc_sinkhorn_iters":20,
+            "hc_eps":1e-6, "num_hash_layers":0,
+            "quantization_config":{"quant_method":"fp8", "weight_block":[128,128]}
+        });
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
+
+        let mut vocab = serde_json::Map::new();
+        for i in 0..28 {
+            vocab.insert(format!("tok{i}"), json!(i));
+        }
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            serde_json::to_vec(&json!({
+                "model":{"type":"BPE", "byte_fallback":true, "vocab":vocab, "merges":[]},
+                "added_tokens":[
+                    {"id":28,"content":"<bos>","special":true},
+                    {"id":29,"content":"<eos>","special":true},
+                    {"id":30,"content":"<pad>","special":true},
+                    {"id":31,"content":"<unk>","special":true}
+                ]
+            })).unwrap(),
+        ).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            serde_json::to_vec(&json!({
+                "bos_token":"<bos>", "eos_token":"<eos>", "pad_token":"<pad>",
+                "unk_token":"<unk>", "add_bos_token":true, "add_eos_token":false
+            })).unwrap(),
+        ).unwrap();
+
+        let output = dir.path().join("tiny-q2-k-s.gguf");
+        run_convert(ConvertArgs {
+            hf_dir: dir.path().to_path_buf(),
+            selector: QuantSelector::Standard(LlamaFtype::MostlyQ2_K_S),
+            output: output.clone(),
+            imatrix: None,
+            imatrix_corpus: None,
+            imatrix_out: None,
+            imatrix_n_ctx: None,
+            mmproj: false,
+        }).unwrap();
+        let bytes = std::fs::read(output).unwrap();
+        assert_eq!(&bytes[..4], b"GGUF");
+        assert!(bytes.windows(b"blk.0.ffn_gate_exps.weight".len())
+            .any(|w| w == b"blk.0.ffn_gate_exps.weight"));
+        assert!(bytes.len() > 32 * 1024);
+    }
+}

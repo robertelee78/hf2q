@@ -46,6 +46,7 @@ pub enum GgmlType {
     IQ3_S = 21,
     IQ2_S = 22,
     IQ4_XS = 23,
+    I32 = 26,
     IQ1_M = 29,
     BF16 = 30,
     TQ1_0 = 34,
@@ -59,7 +60,7 @@ impl GgmlType {
     /// `QK_K=256`, etc.).
     pub const fn block_size(self) -> usize {
         match self {
-            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => 1,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::I32 => 1,
             GgmlType::Q4_0
             | GgmlType::Q4_1
             | GgmlType::Q5_0
@@ -96,6 +97,7 @@ impl GgmlType {
             GgmlType::F32 => 4,
             GgmlType::F16 => 2,
             GgmlType::BF16 => 2,
+            GgmlType::I32 => 4,
             GgmlType::Q4_0 => 18,     // f16 d + 16 nibbles
             GgmlType::Q4_1 => 20,     // f16 d + f16 m + 16 nibbles
             GgmlType::Q5_0 => 22,     // f16 d + u32 qh + 16 nibbles
@@ -168,6 +170,7 @@ impl GgmlType {
             GgmlType::IQ3_S => "iq3_s",
             GgmlType::IQ2_S => "iq2_s",
             GgmlType::IQ4_XS => "iq4_xs",
+            GgmlType::I32 => "i32",
             GgmlType::IQ1_M => "iq1_m",
             GgmlType::TQ1_0 => "tq1_0",
             GgmlType::TQ2_0 => "tq2_0",
@@ -221,6 +224,7 @@ impl GgmlType {
             "iq3_s" => GgmlType::IQ3_S,
             "iq2_s" => GgmlType::IQ2_S,
             "iq4_xs" => GgmlType::IQ4_XS,
+            "i32" => GgmlType::I32,
             "iq1_m" => GgmlType::IQ1_M,
             "tq1_0" => GgmlType::TQ1_0,
             "tq2_0" => GgmlType::TQ2_0,
@@ -256,6 +260,7 @@ impl TryFrom<u32> for GgmlType {
             21 => GgmlType::IQ3_S,
             22 => GgmlType::IQ2_S,
             23 => GgmlType::IQ4_XS,
+            26 => GgmlType::I32,
             29 => GgmlType::IQ1_M,
             30 => GgmlType::BF16,
             34 => GgmlType::TQ1_0,

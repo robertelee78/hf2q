@@ -1280,6 +1280,9 @@ fn determine_pre_tokenizer_type(arch: ArchName) -> String {
         // (verified against canonical convert_hf_to_gguf.py output:
         // `tokenizer.ggml.pre = 'minimax-m2'`).
         ArchName::MiniMaxM2 => "minimax-m2".into(),
+        // Compile-time closed-enum routing only. DeepSeek 0731 special
+        // tokens/chat encoding are owned by the dedicated encoding lane.
+        ArchName::Deepseek4 => "deepseek".into(),
         // BERT: BAAI bge tokenizer hashes to the same chkhsh as
         // jinaai/jina-embeddings-v2-base-en
         // (`0876d13b50744004aa9aeae05e7b0647eac9d801b5ba4668afc01e709c15e19f`)
@@ -1716,5 +1719,4 @@ mod tests {
         }
     }
 }
-
 

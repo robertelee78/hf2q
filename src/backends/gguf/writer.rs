@@ -636,4 +636,29 @@ mod tests {
         assert_eq!(bytes.len() % ALIGNMENT as usize, 0);
         assert_eq!(bytes.len(), 32);
     }
+
+    #[test]
+    fn i32_hash_route_tensor_preserves_wire_type_and_payload() {
+        let buf = Cursor::new(Vec::new());
+        let mut w = GgufWriter::new(buf);
+        let name = "blk.0.ffn_gate_tid2eid.weight";
+        w.write_header(1, 0).unwrap();
+        w.reserve_tensor_info(name, &[3], GgmlType::I32).unwrap();
+        w.pad_to_alignment().unwrap();
+        let payload: Vec<u8> = [0_i32, 3, 255]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        w.stream_tensor_payload(0, &payload).unwrap();
+        w.finalize().unwrap();
+        let bytes = w.into_inner().into_inner();
+
+        let type_offset = 24 + 8 + name.len() + 4 + 8;
+        assert_eq!(
+            u32::from_le_bytes(bytes[type_offset..type_offset + 4].try_into().unwrap()),
+            26
+        );
+        let data_start = align_up((type_offset + 4 + 8) as u64, ALIGNMENT) as usize;
+        assert_eq!(&bytes[data_start..data_start + payload.len()], payload);
+    }
 }

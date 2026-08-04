@@ -15,6 +15,8 @@
 
 pub mod bake;
 pub mod bert;
+pub mod deepseek4;
+pub mod deepseek4_metadata;
 pub mod gemma4;
 pub mod gemma4_mmproj;
 pub mod gemma4_vision_mmproj;
@@ -80,6 +82,14 @@ pub fn should_drop_source_tensor(model_type: &str, hf_name: &str) -> bool {
             }
             if stripped.starts_with("cls.predictions") || stripped.starts_with("cls.seq_relationship")
             {
+                return true;
+            }
+        }
+        "deepseek_v4" => {
+            // Base conversion deliberately excludes the separately
+            // exported MTP/DSpark namespace. This is an explicit
+            // artifact boundary, not an unknown-tensor fallback.
+            if hf_name.starts_with("mtp.") {
                 return true;
             }
         }

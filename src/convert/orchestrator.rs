@@ -414,7 +414,10 @@ impl ConvertOrchestrator {
                 && (e.name.contains("ffn_gate_inp.weight")
                     || e.name.contains("ffn_gate_inp_shexp.weight"));
 
-            let ggml_type = if is_vision_tensor_pattern(&e.name)
+            let ggml_type = if matches!(e.source_dtype, SourceDtype::I32 | SourceDtype::I64) {
+                // Hash routing is a lookup table, not a float weight.
+                GgmlType::I32
+            } else if is_vision_tensor_pattern(&e.name)
                 || is_audio_tensor_pattern(&e.name)
                 || mtp_ffn_gate_inp_demote
             {
@@ -712,6 +715,23 @@ impl<W: Write + Seek> StreamingWriter<W> {
                 let mut v = Vec::with_capacity(data.len() * 4);
                 for &x in data {
                     v.extend_from_slice(&x.to_le_bytes());
+                }
+                v
+            }
+            GgmlType::I32 => {
+                let mut v = Vec::with_capacity(data.len() * 4);
+                for &x in data {
+                    if !x.is_finite()
+                        || x.fract() != 0.0
+                        || x < i32::MIN as f32
+                        || x > i32::MAX as f32
+                    {
+                        return Err(OrchestratorError::StreamProtocol(format!(
+                            "tensor `{}` contains non-I32 routing value {x}",
+                            p.name
+                        )));
+                    }
+                    v.extend_from_slice(&(x as i32).to_le_bytes());
                 }
                 v
             }

@@ -16,3 +16,4 @@
 //! native F32/BF16 directly (no FP8 dequant needed).
 
 pub mod fp8;
+pub mod mxfp4;

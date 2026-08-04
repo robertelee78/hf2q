@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use safetensors::{tensor::Dtype, SafeTensors};
 
-use crate::convert::source_dtype::fp8;
+use crate::convert::source_dtype::{fp8, mxfp4};
 use crate::core::mlx_safetensors_loader::{discover_shards, read_floats_to_f32};
 use crate::quantize::ggml_quants::SourceDtype;
 
@@ -127,6 +127,10 @@ pub struct HfModelSource {
     /// `Some(_)` when `config.json::quantization_config.quant_method ==
     /// "fp8"`. Routes FP8 dispatch + governs sibling-scale lookup.
     fp8_cfg: Option<Fp8Config>,
+    /// Official DeepSeek-V4 source layout discriminator.
+    deepseek_v4: bool,
+    /// Base-artifact exclusions from the separate MTP/DSpark namespace.
+    excluded_mtp_tensors: usize,
     /// Reverse-lookup table for FP8 sibling resolution:
     /// `"<name>.weight_scale_inv"` → index into `metas` — populated even
     /// when fp8 is off so the indexer is stable, but only consumed by
@@ -153,6 +157,23 @@ struct ShardMmap {
     /// payload bytes start at `header_byte_len` and are addressed by
     /// `TensorInfo::data_offsets` relative to that origin.
     header_byte_len: usize,
+}
+
+fn is_deepseek_hash_route(name: &str) -> bool {
+    name.starts_with("layers.") && name.ends_with(".ffn.gate.tid2eid")
+}
+
+fn is_deepseek_expert_weight(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("layers.") else {
+        return false;
+    };
+    let Some((_layer, rest)) = rest.split_once(".ffn.experts.") else {
+        return false;
+    };
+    let Some((_expert, projection)) = rest.split_once('.') else {
+        return false;
+    };
+    matches!(projection, "w1.weight" | "w2.weight" | "w3.weight")
 }
 
 impl ShardMmap {
@@ -186,12 +207,19 @@ pub enum SourceError {
     },
     /// FP8 tensor's sibling `<name>.weight_scale_inv` is missing.
     /// Required when `quant_method == "fp8"`.
-    MissingFp8Scales { tensor: String },
+    MissingFp8Scales { tensor: String, scale: String },
     /// FP8 dequant failed for length / shape reasons.
     Fp8Dequant {
         tensor: String,
         error: fp8::Fp8Error,
     },
+    /// Packed E2M1/E8M0 expert dequantization failed.
+    Mxfp4Dequant {
+        tensor: String,
+        error: mxfp4::Mxfp4Error,
+    },
+    /// Hash route cannot be preserved in canonical GGML I32.
+    InvalidHashRoute { tensor: String, value: i64 },
     /// FP8 config field is malformed (e.g. `weight_block_size` not a
     /// `[i, j]` pair).
     InvalidFp8Config(String),
@@ -208,17 +236,23 @@ impl std::fmt::Display for SourceError {
                 write!(
                     f,
                     "source/unsupported dtype `{dtype}` on tensor `{tensor}` \
-                     (supported: F32, F16, BF16; FP8 only with quantization_config.quant_method=fp8)"
+                     (supported: F32, F16, BF16; architecture-specific FP8, E2M1, and integer routes require matching source metadata)"
                 )
             }
-            SourceError::MissingFp8Scales { tensor } => write!(
+            SourceError::MissingFp8Scales { tensor, scale } => write!(
                 f,
-                "source/fp8: tensor `{tensor}` is FP8 but its sibling \
-                 `{tensor}_scale_inv` is missing from the safetensors shards"
+                "source/fp8: tensor `{tensor}` requires missing sibling `{scale}`"
             ),
             SourceError::Fp8Dequant { tensor, error } => {
                 write!(f, "source/fp8: dequant `{tensor}`: {error}")
             }
+            SourceError::Mxfp4Dequant { tensor, error } => {
+                write!(f, "source/mxfp4: dequant `{tensor}`: {error}")
+            }
+            SourceError::InvalidHashRoute { tensor, value } => write!(
+                f,
+                "source/hash-route: `{tensor}` value {value} is not exactly representable as I32"
+            ),
             SourceError::InvalidFp8Config(s) => write!(f, "source/fp8 config: {s}"),
         }
     }
@@ -258,8 +292,9 @@ impl From<serde_json::Error> for SourceError {
 /// config field is present.
 #[derive(Debug, Clone)]
 pub struct Fp8Config {
-    /// `(block_rows, block_cols)` — HF `weight_block_size`. Common
-    /// values: `[128, 128]` (DeepSeek-V3 / MiniMax-M2.7), `[1, 128]`.
+    /// `(block_rows, block_cols)` — HF `weight_block_size`, or the
+    /// equivalent official DeepSeek-V4 `weight_block`. Common values:
+    /// `[128, 128]` (DeepSeek-V3/V4 / MiniMax-M2.7), `[1, 128]`.
     pub block_size: fp8::BlockSize,
     /// Tensor name suffixes listed in `modules_to_not_convert`.
     /// Tensors whose name CONTAINS any of these substrings are read in
@@ -291,10 +326,14 @@ impl Fp8Config {
             return Ok(None);
         }
 
-        // weight_block_size: [rows, cols]
-        let wbs = qc.get("weight_block_size").ok_or_else(|| {
+        // Official DSV4 names this `weight_block`; earlier FP8 models
+        // use `weight_block_size`. They are exact schema aliases.
+        let wbs = qc
+            .get("weight_block_size")
+            .or_else(|| qc.get("weight_block"))
+            .ok_or_else(|| {
             SourceError::InvalidFp8Config(
-                "quant_method=fp8 but `weight_block_size` is missing".into(),
+                "quant_method=fp8 but `weight_block_size`/`weight_block` is missing".into(),
             )
         })?;
         let arr = wbs.as_array().ok_or_else(|| {
@@ -387,6 +426,7 @@ impl HfModelSource {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let deepseek_v4 = model_type == "deepseek_v4";
 
         // ----- shard discovery ---------------------------------------------
         let shards_map: BTreeMap<String, PathBuf> =
@@ -400,6 +440,7 @@ impl HfModelSource {
         let mut shards: Vec<ShardMmap> = Vec::with_capacity(shard_paths.len());
         let mut metas: Vec<TensorMeta> = Vec::new();
         let mut by_name: HashMap<String, usize> = HashMap::new();
+        let mut excluded_mtp_tensors = 0usize;
 
         for (shard_idx, shard_path) in shard_paths.iter().enumerate() {
             let f = File::open(shard_path).map_err(|e| {
@@ -451,8 +492,12 @@ impl HfModelSource {
                 // dtype check. Mirrors canonical's per-class
                 // `filter_tensors` override.
                 if super::arch::should_drop_source_tensor(&model_type, &name) {
+                    if deepseek_v4 && name.starts_with("mtp.") {
+                        excluded_mtp_tensors += 1;
+                    }
                     continue;
                 }
+                let mut logical_shape = info.shape.clone();
                 let source_dtype = match info.dtype {
                     Dtype::F32 => SourceDtype::F32,
                     Dtype::F16 => SourceDtype::F16,
@@ -462,6 +507,39 @@ impl HfModelSource {
                         // the main weights are F8. The dtype dispatch at
                         // iter time validates the FP8 opt-in is in place.
                         SourceDtype::Fp8E4M3
+                    }
+                    Dtype::F8_E8M0 if deepseek_v4 && name.ends_with(".scale") => {
+                        SourceDtype::E8M0Scale
+                    }
+                    Dtype::U8 if deepseek_v4 && name.ends_with(".scale") => {
+                        // Some producer stacks serialize UE8M0 as raw
+                        // U8 while newer safetensors labels F8_E8M0.
+                        SourceDtype::E8M0Scale
+                    }
+                    Dtype::I8 | Dtype::U8
+                        if deepseek_v4 && is_deepseek_expert_weight(&name) =>
+                    {
+                        if logical_shape.len() != 2 {
+                            return Err(SourceError::UnsupportedSourceDtype {
+                                tensor: name.to_string(),
+                                dtype: format!(
+                                    "{:?} packed E2M1 with non-2D shape {logical_shape:?}",
+                                    info.dtype
+                                ),
+                            });
+                        }
+                        logical_shape[1] = logical_shape[1].checked_mul(2).ok_or_else(|| {
+                            SourceError::Safetensors(format!(
+                                "tensor `{name}` logical column overflow"
+                            ))
+                        })?;
+                        SourceDtype::Mxfp4E2M1
+                    }
+                    Dtype::I32 if deepseek_v4 && is_deepseek_hash_route(&name) => {
+                        SourceDtype::I32
+                    }
+                    Dtype::I64 if deepseek_v4 && is_deepseek_hash_route(&name) => {
+                        SourceDtype::I64
                     }
                     other => {
                         return Err(SourceError::UnsupportedSourceDtype {
@@ -474,7 +552,7 @@ impl HfModelSource {
                 let idx = metas.len();
                 metas.push(TensorMeta {
                     name: name.to_string(),
-                    shape: info.shape.clone(),
+                    shape: logical_shape,
                     source_dtype,
                     shard_idx,
                     data_off_start: info.data_offsets.0,
@@ -498,6 +576,8 @@ impl HfModelSource {
             shards,
             metas,
             fp8_cfg,
+            deepseek_v4,
+            excluded_mtp_tensors,
             by_name,
         })
     }
@@ -514,14 +594,25 @@ impl HfModelSource {
     /// the previous buffered-impl's skip rule.
     pub fn tensor_metas(&self) -> impl Iterator<Item = &TensorMeta> + '_ {
         let fp8_active = self.fp8_cfg.is_some();
+        let deepseek_v4 = self.deepseek_v4;
         self.metas
             .iter()
-            .filter(move |m| !(fp8_active && m.name.ends_with(".weight_scale_inv")))
+            .filter(move |m| {
+                !(fp8_active && m.name.ends_with(".weight_scale_inv"))
+                    && !(deepseek_v4 && m.name.ends_with(".scale"))
+            })
     }
 
     /// Number of streaming tensors (after the FP8 sibling-scale filter).
     pub fn tensor_count(&self) -> usize {
         self.tensor_metas().count()
+    }
+
+    /// Number of official `mtp.*` tensors excluded from this base-model
+    /// artifact. The caller must surface this count; DSpark is a separate
+    /// artifact/lane and is never guessed into the base tensor namespace.
+    pub fn excluded_mtp_tensor_count(&self) -> usize {
+        self.excluded_mtp_tensors
     }
 
     /// Materialize a single tensor by name. Slices the bytes out of the
@@ -543,7 +634,9 @@ impl HfModelSource {
         })?;
         let m = &self.metas[idx];
         // Block direct access to sibling-scale tensors when FP8 is active.
-        if self.fp8_cfg.is_some() && name.ends_with(".weight_scale_inv") {
+        if (self.fp8_cfg.is_some() && name.ends_with(".weight_scale_inv"))
+            || (self.deepseek_v4 && name.ends_with(".scale"))
+        {
             return Err(SourceError::UnsupportedSourceDtype {
                 tensor: name.into(),
                 dtype: "fp8 sibling scale (consumed inline by main weight)".into(),
@@ -580,13 +673,16 @@ impl<'a> Iterator for TensorStream<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let fp8_active = self.source.fp8_cfg.is_some();
+        let deepseek_v4 = self.source.deepseek_v4;
         // Skip FP8 sibling-scale tensors (consumed inline during dequant).
         loop {
             if self.cursor >= self.source.metas.len() {
                 return None;
             }
             let m = &self.source.metas[self.cursor];
-            if fp8_active && m.name.ends_with(".weight_scale_inv") {
+            if (fp8_active && m.name.ends_with(".weight_scale_inv"))
+                || (deepseek_v4 && m.name.ends_with(".scale"))
+            {
                 self.cursor += 1;
                 continue;
             }
@@ -646,16 +742,34 @@ fn materialize_tensor(src: &HfModelSource, m: &TensorMeta) -> Result<HfTensor, S
                     m.name
                 )));
             }
-            let scale_name = format!("{}_scale_inv", m.name);
+            let scale_name = if src.deepseek_v4 {
+                m.name
+                    .strip_suffix(".weight")
+                    .map(|base| format!("{base}.scale"))
+                    .ok_or_else(|| {
+                        SourceError::InvalidFp8Config(format!(
+                            "DeepSeek-V4 FP8 tensor `{}` does not end in .weight",
+                            m.name
+                        ))
+                    })?
+            } else {
+                format!("{}_scale_inv", m.name)
+            };
             let scale_idx =
                 src.by_name
                     .get(&scale_name)
                     .copied()
                     .ok_or_else(|| SourceError::MissingFp8Scales {
                         tensor: m.name.clone(),
+                        scale: scale_name.clone(),
                     })?;
             let scale_meta = &src.metas[scale_idx];
-            if !matches!(scale_meta.source_dtype, SourceDtype::F32) {
+            let valid_scale = if src.deepseek_v4 {
+                matches!(scale_meta.source_dtype, SourceDtype::E8M0Scale)
+            } else {
+                matches!(scale_meta.source_dtype, SourceDtype::F32)
+            };
+            if !valid_scale {
                 return Err(SourceError::InvalidFp8Config(format!(
                     "scale `{scale_name}`: expected F32, got {:?}",
                     scale_meta.source_dtype
@@ -664,9 +778,17 @@ fn materialize_tensor(src: &HfModelSource, m: &TensorMeta) -> Result<HfTensor, S
             let scale_shard = &src.shards[scale_meta.shard_idx];
             let scale_bytes =
                 scale_shard.tensor_bytes(scale_meta.data_off_start, scale_meta.data_off_end);
-            let scale_inv = read_floats_to_f32(scale_bytes, Dtype::F32).map_err(|e| {
-                SourceError::Safetensors(format!("scale dequant {scale_name}: {e:#}"))
-            })?;
+            let scale_inv = if src.deepseek_v4 {
+                scale_bytes
+                    .iter()
+                    .copied()
+                    .map(mxfp4::decode_e8m0)
+                    .collect()
+            } else {
+                read_floats_to_f32(scale_bytes, Dtype::F32).map_err(|e| {
+                    SourceError::Safetensors(format!("scale dequant {scale_name}: {e:#}"))
+                })?
+            };
             let f32_data =
                 fp8::dequantize_fp8_block(raw_bytes, &scale_inv, &m.shape, cfg.block_size)
                     .map_err(|e| SourceError::Fp8Dequant {
@@ -674,6 +796,98 @@ fn materialize_tensor(src: &HfModelSource, m: &TensorMeta) -> Result<HfTensor, S
                         error: e,
                     })?;
             (SourceDtype::Fp8E4M3, f32_data)
+        }
+        SourceDtype::Mxfp4E2M1 => {
+            let scale_name = m
+                .name
+                .strip_suffix(".weight")
+                .map(|base| format!("{base}.scale"))
+                .ok_or_else(|| {
+                    SourceError::Safetensors(format!(
+                        "packed expert `{}` does not end in .weight",
+                        m.name
+                    ))
+                })?;
+            let scale_idx = src.by_name.get(&scale_name).copied().ok_or_else(|| {
+                SourceError::MissingFp8Scales {
+                    tensor: m.name.clone(),
+                    scale: scale_name.clone(),
+                }
+            })?;
+            let scale_meta = &src.metas[scale_idx];
+            if !matches!(scale_meta.source_dtype, SourceDtype::E8M0Scale) {
+                return Err(SourceError::InvalidFp8Config(format!(
+                    "expert scale `{scale_name}`: expected F8_E8M0, got {:?}",
+                    scale_meta.source_dtype
+                )));
+            }
+            let scale_shard = &src.shards[scale_meta.shard_idx];
+            let scale_bytes =
+                scale_shard.tensor_bytes(scale_meta.data_off_start, scale_meta.data_off_end);
+            let packed_shape = [m.shape[0], m.shape[1] / 2];
+            let data = mxfp4::dequantize_e2m1(
+                raw_bytes,
+                &packed_shape,
+                scale_bytes,
+                &scale_meta.shape,
+            )
+            .map_err(|error| SourceError::Mxfp4Dequant {
+                tensor: m.name.clone(),
+                error,
+            })?;
+            (SourceDtype::Mxfp4E2M1, data)
+        }
+        SourceDtype::I32 => {
+            if raw_bytes.len() != m.numel() * 4 {
+                return Err(SourceError::Safetensors(format!(
+                    "I32 tensor `{}` byte length {} != {}",
+                    m.name,
+                    raw_bytes.len(),
+                    m.numel() * 4
+                )));
+            }
+            let mut data = Vec::with_capacity(m.numel());
+            for b in raw_bytes.chunks_exact(4) {
+                let value = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                if (value as f32) as i32 != value {
+                    return Err(SourceError::InvalidHashRoute {
+                        tensor: m.name.clone(),
+                        value: value as i64,
+                    });
+                }
+                data.push(value as f32);
+            }
+            (SourceDtype::I32, data)
+        }
+        SourceDtype::I64 => {
+            if raw_bytes.len() != m.numel() * 8 {
+                return Err(SourceError::Safetensors(format!(
+                    "I64 tensor `{}` byte length {} != {}",
+                    m.name,
+                    raw_bytes.len(),
+                    m.numel() * 8
+                )));
+            }
+            let mut data = Vec::with_capacity(m.numel());
+            for b in raw_bytes.chunks_exact(8) {
+                let value = i64::from_le_bytes([
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                ]);
+                if i32::try_from(value).is_err() || (value as f32) as i64 != value {
+                    return Err(SourceError::InvalidHashRoute {
+                        tensor: m.name.clone(),
+                        value,
+                    });
+                }
+                data.push(value as f32);
+            }
+            (SourceDtype::I64, data)
+        }
+        SourceDtype::E8M0Scale => {
+            return Err(SourceError::UnsupportedSourceDtype {
+                tensor: m.name.clone(),
+                dtype: "F8_E8M0 sidecar (consumed inline by weight)".into(),
+            });
         }
     };
 
@@ -952,7 +1166,7 @@ mod tests {
             .expect("one tensor")
             .expect_err("must error");
         match err {
-            SourceError::MissingFp8Scales { tensor } => {
+            SourceError::MissingFp8Scales { tensor, .. } => {
                 assert_eq!(tensor, "model.layers.0.mlp.gate_proj.weight");
             }
             other => panic!("expected MissingFp8Scales, got {other:?}"),
@@ -1055,5 +1269,77 @@ mod tests {
         // The TensorStream itself is two `usize`s + a borrow — sub-64
         // bytes regardless of how many tensors are in the source.
         assert!(std::mem::size_of::<TensorStream<'_>>() <= 64);
+    }
+
+    fn deepseek_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "deepseek_v4",
+            "quantization_config": {"quant_method": "fp8", "weight_block": [128, 128]}
+        })
+    }
+
+    #[test]
+    fn deepseek_official_dense_expert_and_hash_formats_decode_in_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash: Vec<u8> = [0_i64, 3, 255]
+            .into_iter()
+            .flat_map(i64::to_le_bytes)
+            .collect();
+        write_minimal_single_file(
+            dir.path(),
+            &[
+                ("layers.3.attn.wq_a.weight", Dtype::F8_E4M3, vec![1, 128], vec![0x38; 128]),
+                ("layers.3.attn.wq_a.scale", Dtype::U8, vec![1, 1], vec![128]),
+                ("layers.3.ffn.experts.0.w1.weight", Dtype::I8, vec![1, 16], vec![0x21; 16]),
+                ("layers.3.ffn.experts.0.w1.scale", Dtype::F8_E8M0, vec![1, 1], vec![127]),
+                ("layers.0.ffn.gate.tid2eid", Dtype::I64, vec![1, 3], hash),
+                ("mtp.0.enorm.weight", Dtype::F16, vec![1], vec![0, 0]),
+            ],
+            &deepseek_config(),
+        );
+        let src = HfModelSource::open(dir.path()).unwrap();
+        assert_eq!(src.tensor_count(), 3);
+        assert_eq!(src.excluded_mtp_tensor_count(), 1);
+        let expert_meta = src.tensor_metas().find(|m| m.name.ends_with("w1.weight")).unwrap();
+        assert_eq!(expert_meta.shape, vec![1, 32]);
+        assert_eq!(src.materialize_tensor("layers.3.attn.wq_a.weight").unwrap().data, vec![2.0; 128]);
+        let expert = src.materialize_tensor("layers.3.ffn.experts.0.w1.weight").unwrap();
+        assert_eq!(&expert.data[..4], &[0.5, 1.0, 0.5, 1.0]);
+        assert_eq!(src.materialize_tensor("layers.0.ffn.gate.tid2eid").unwrap().data, vec![0.0, 3.0, 255.0]);
+    }
+
+    #[test]
+    fn deepseek_rejects_malformed_scale_dtype_group_and_weight_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_single_file(
+            dir.path(),
+            &[
+                ("layers.0.ffn.experts.0.w1.weight", Dtype::U8, vec![1, 16], vec![0; 16]),
+                ("layers.0.ffn.experts.0.w1.scale", Dtype::F32, vec![1, 1], 1_f32.to_le_bytes().to_vec()),
+            ],
+            &deepseek_config(),
+        );
+        let src = HfModelSource::open(dir.path()).unwrap();
+        assert!(matches!(src.materialize_tensor("layers.0.ffn.experts.0.w1.weight"), Err(SourceError::InvalidFp8Config(_))));
+
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_single_file(
+            dir.path(),
+            &[
+                ("layers.0.ffn.experts.0.w1.weight", Dtype::I8, vec![1, 16], vec![0; 16]),
+                ("layers.0.ffn.experts.0.w1.scale", Dtype::F8_E8M0, vec![2, 1], vec![127; 2]),
+            ],
+            &deepseek_config(),
+        );
+        let src = HfModelSource::open(dir.path()).unwrap();
+        assert!(matches!(src.materialize_tensor("layers.0.ffn.experts.0.w1.weight"), Err(SourceError::Mxfp4Dequant { error: mxfp4::Mxfp4Error::ScaleShapeMismatch { .. }, .. })));
+
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_single_file(
+            dir.path(),
+            &[("layers.0.attn.wq_a.weight", Dtype::U8, vec![1, 16], vec![0; 16])],
+            &deepseek_config(),
+        );
+        assert!(matches!(HfModelSource::open(dir.path()), Err(SourceError::UnsupportedSourceDtype { .. })));
     }
 }
