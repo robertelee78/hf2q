@@ -589,12 +589,13 @@ pub struct InvestigationEnv {
     /// loop garbage then got baked into compacted history, re-priming
     /// the loop on every later turn.
     ///
-    /// Applied ONLY at the qwen35 sampler boundary
-    /// (`effective_repetition_penalty`, engine_qwen35.rs) — penalty
-    /// scope is the response's own generated tokens, never the prompt
-    /// (code-safe).  `SamplingParams` is never mutated, so
-    /// `is_greedy_eligible` / HybridPromptCache gating, the T=0 greedy
-    /// argmax path, and LCP byte-identity tests are all unaffected.
+    /// Applied ONLY at sampler-construction boundaries via the shared
+    /// `engine::effective_repetition_penalty` helper (gemma engine.rs,
+    /// engine_qwen35.rs, engine_qwen3vl.rs — uniform semantics across
+    /// arches).  Penalty scope is the response's own generated tokens,
+    /// never the prompt (code-safe).  `SamplingParams` is never
+    /// mutated, so greedy/cache predicates, the T=0 GPU argmax path,
+    /// and LCP byte-identity tests are all unaffected.
     pub default_repetition_penalty: f32,
 
     /// `HF2Q_LAYER_POLICY` — per-layer SDPA policy selector.

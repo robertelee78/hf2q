@@ -44,7 +44,7 @@ use crate::serve::load_info::{
 use crate::core::provenance::{self, Provenance};
 use crate::serve::sampler_pure::{self, SamplingParams as SamplerPureParams};
 
-use super::engine::{GenerationResult, LoadOptions, SamplingParams};
+use super::engine::{effective_repetition_penalty, GenerationResult, LoadOptions, SamplingParams};
 use super::registry::ModelRegistration;
 
 /// All artifacts the SERVE worker needs to handle requests against a
@@ -552,7 +552,7 @@ fn sample_logits_qwen3vl(
         top_p: params.top_p as f64,
         top_k: params.top_k,
         min_p: params.min_p as f64,
-        repetition_penalty: params.repetition_penalty as f64,
+        repetition_penalty: effective_repetition_penalty(params),
         max_tokens: params.max_tokens,
     };
     sampler_pure::sample_token(logits, &sp, generated)

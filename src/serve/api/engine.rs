@@ -401,6 +401,32 @@ impl Default for SamplingParams {
     }
 }
 
+/// Effective repetition penalty for sampling (2026-08-03 loop mitigation).
+///
+/// Client-supplied values (≠ 1.0) always win.  When the client omits
+/// `repetition_penalty` (handler default `1.0`), fall back to the
+/// server-wide `HF2Q_DEFAULT_REPETITION_PENALTY` (default `1.0` = off).
+///
+/// Shared by every arch's sampler-construction site (gemma engine.rs,
+/// engine_qwen35.rs, engine_qwen3vl.rs) so the semantics are uniform
+/// regardless of which model serves the request.
+///
+/// Applied ONLY at sampler-construction boundaries: `SamplingParams` is
+/// never mutated, so every `repetition_penalty != 1.0` predicate
+/// (`sample_logits` gates, cache bypasses, `is_greedy_eligible`) sees the
+/// client's literal value and behaves exactly as before.  Pure-greedy
+/// requests (T=0, all defaults) never reach a sampler on any arch — the
+/// `sample_logits` predicates stay false and the GPU argmax path is
+/// untouched.  Penalty scope downstream is the response's generated
+/// tokens only, never the prompt — safe for code.
+pub fn effective_repetition_penalty(params: &SamplingParams) -> f64 {
+    if params.repetition_penalty != 1.0 {
+        params.repetition_penalty as f64
+    } else {
+        crate::debug::INVESTIGATION_ENV.default_repetition_penalty as f64
+    }
+}
+
 /// Owned soft-token override sent through the worker channel.
 ///
 /// Identical contract to [`SoftTokenInjection`] but owns the
@@ -5396,7 +5422,7 @@ impl Gemma4DecodeState {
                 top_p: params.top_p as f64,
                 top_k: params.top_k,
                 min_p: 0.0,
-                repetition_penalty: params.repetition_penalty as f64,
+                repetition_penalty: effective_repetition_penalty(params),
                 max_tokens: params.max_tokens,
             })
         } else {
@@ -11115,7 +11141,7 @@ fn generate_once_with_soft_tokens(
             top_p: params.top_p as f64,
             top_k: params.top_k,
             min_p: 0.0,
-            repetition_penalty: params.repetition_penalty as f64,
+            repetition_penalty: effective_repetition_penalty(params),
             max_tokens: params.max_tokens,
         })
     } else {
@@ -12028,7 +12054,7 @@ fn generate_gemma4_once_slot_aware(
                 top_p: params.top_p as f64,
                 top_k: params.top_k,
                 min_p: 0.0,
-                repetition_penalty: params.repetition_penalty as f64,
+                repetition_penalty: effective_repetition_penalty(params),
                 max_tokens: params.max_tokens,
             })
         } else {
@@ -12689,7 +12715,7 @@ fn generate_stream_gemma4_once_slot_aware(
                         top_p: params.top_p as f64,
                         top_k: params.top_k,
                         min_p: 0.0,
-                        repetition_penalty: params.repetition_penalty as f64,
+                        repetition_penalty: effective_repetition_penalty(params),
                         max_tokens: params.max_tokens,
                     })
                 } else {
@@ -13808,7 +13834,7 @@ fn generate_gemma4_once_with_soft_tokens_slot_aware(
                 top_p: params.top_p as f64,
                 top_k: params.top_k,
                 min_p: 0.0,
-                repetition_penalty: params.repetition_penalty as f64,
+                repetition_penalty: effective_repetition_penalty(params),
                 max_tokens: params.max_tokens,
             })
         } else {
@@ -16163,7 +16189,7 @@ fn generate_stream_once(
             top_p: params.top_p as f64,
             top_k: params.top_k,
             min_p: 0.0,
-            repetition_penalty: params.repetition_penalty as f64,
+            repetition_penalty: effective_repetition_penalty(params),
             max_tokens: params.max_tokens,
         })
     } else {
