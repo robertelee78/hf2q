@@ -6,7 +6,7 @@ use thiserror::Error;
 use super::Deepseek4Config;
 
 const REQUIRED_WINDOW: u32 = 128;
-const CACHE_DTYPE: DType = DType::F32;
+const CACHE_DTYPE: DType = DType::BF16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CacheBufferPlan {

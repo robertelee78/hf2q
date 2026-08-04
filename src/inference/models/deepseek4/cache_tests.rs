@@ -65,7 +65,7 @@ fn official_config() -> Deepseek4Config {
 fn official_one_million_context_plan_has_exact_shapes_and_bytes() {
     let plan = Deepseek4CachePlan::for_context(&official_config(), 1_048_576).unwrap();
     assert_eq!(plan.layers.len(), 43);
-    assert_eq!(plan.resident_bytes, 14_439_677_952);
+    assert_eq!(plan.resident_bytes, 7_219_838_976);
 
     assert_eq!(plan.layers[0].window_kv.shape, vec![128, 512]);
     assert!(plan.layers[0].compressed_kv.is_none());
@@ -129,32 +129,32 @@ fn malformed_context_schedule_and_overflow_fail_closed() {
         Err(CacheError::CompressionRatio { layer: 0, ratio: 8 })
     ));
 
-    let mut overflowing = config(vec![4]);
+    let mut overflowing = config(vec![4, 4]);
     overflowing.max_position_embeddings = u32::MAX;
     overflowing.head_dim = u32::MAX;
     assert!(matches!(
         Deepseek4CachePlan::for_context(&overflowing, u32::MAX as usize),
         Err(CacheError::ByteOverflow {
-            layer: 0,
-            kind: CacheKind::CompressedKv
+            layer: 1,
+            kind: CacheKind::WindowKv
         })
     ));
 }
 
 #[test]
-fn allocator_materializes_the_plan_as_zeroed_f32_buffers() {
+fn allocator_materializes_the_plan_as_zeroed_bf16_buffers() {
     let mut cfg = config(vec![0, 4, 128]);
     cfg.max_position_embeddings = 128;
     cfg.head_dim = 32;
     cfg.index_head_dim = 16;
     let plan = Deepseek4CachePlan::for_context(&cfg, 128).unwrap();
-    assert_eq!(plan.resident_bytes, 55_424);
+    assert_eq!(plan.resident_bytes, 27_712);
 
     let _gpu = crate::inference::hf2q_gpu_test_lock();
     let cache = Deepseek4Cache::allocate(&plan, MlxDevice::new().unwrap()).unwrap();
     assert_eq!(cache.resident_bytes(), plan.resident_bytes);
     assert_eq!(cache.layers().len(), 3);
-    assert_eq!(cache.layers()[1].window_kv.dtype(), DType::F32);
+    assert_eq!(cache.layers()[1].window_kv.dtype(), DType::BF16);
     assert_eq!(cache.layers()[1].window_kv.shape(), &[128, 32]);
     assert_eq!(
         cache.layers()[1].compressed_kv.as_ref().unwrap().shape(),
@@ -168,10 +168,10 @@ fn allocator_materializes_the_plan_as_zeroed_f32_buffers() {
         .indexer_kv
         .as_ref()
         .unwrap()
-        .as_slice::<f32>()
+        .as_slice::<u16>()
         .unwrap()
         .iter()
-        .all(|value| *value == 0.0));
+        .all(|value| *value == 0));
 }
 
 #[test]
