@@ -43,6 +43,8 @@ pub enum WeightResidencyError {
     },
     #[error("resident-byte accounting overflowed while adding tensor '{name}'")]
     ByteOverflow { name: String },
+    #[error("tensor '{name}' disappeared after exact catalog validation")]
+    MissingAfterCatalog { name: String },
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -79,18 +81,22 @@ impl Deepseek4Weights {
     ) -> Result<Self, WeightResidencyError> {
         let specs = validate_tensor_catalog(gguf, cfg)?;
         for spec in &specs {
-            let info = gguf
-                .tensor_info(&spec.name)
-                .expect("exact catalog validation guarantees tensor presence");
+            let info = gguf.tensor_info(&spec.name).ok_or_else(|| {
+                WeightResidencyError::MissingAfterCatalog {
+                    name: spec.name.clone(),
+                }
+            })?;
             validate_storage_type(&spec.name, spec.role, info.ggml_type)?;
         }
 
         let mut tensors = HashMap::with_capacity(specs.len());
         let mut resident_bytes = 0_u64;
         for spec in specs {
-            let info = gguf
-                .tensor_info(&spec.name)
-                .expect("exact catalog validation guarantees tensor presence");
+            let info = gguf.tensor_info(&spec.name).ok_or_else(|| {
+                WeightResidencyError::MissingAfterCatalog {
+                    name: spec.name.clone(),
+                }
+            })?;
             let buffer = match spec.role {
                 TensorRole::RawMatrix | TensorRole::IntegerLookupI32 => gguf
                     .load_tensor(&spec.name, &device)
