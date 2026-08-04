@@ -1019,6 +1019,39 @@ impl MlxModelWeights {
             // ADR-028 Phase 10c (iter-348): hybrid F16-K + TQ-HB-V routing,
             // mirrors forward_mlx.rs decode lazy-alloc.
             if INVESTIGATION_ENV.hybrid_kv {
+                // "gemma-hybrid-lcp" SerialFifo leftover discipline
+                // (2026-08-03) — HYBRID leg.  Mirror of the dense-leg
+                // block at line ~749: a leftover hybrid mount from a
+                // PREVIOUS request is opportunistic state, not a
+                // contract.  Turn N's batched prefill leaves
+                // `hybrid_kv = Some(cap_N)`; turn N+1 (linear route)
+                // with a longer prompt previously REUSED the undersized
+                // buffers silently — the hybrid encode kernel then wrote
+                // ~22.7K positions into cap=8749 buffers and the GPU
+                // session hung in `commit_and_wait` forever (measured
+                // live on two instances, 2026-08-03; stack:
+                // forward_prefill_with_soft_tokens_resume →
+                // GraphSession::finish).  Drop on ANY len/capacity/
+                // is_sliding mismatch so the alloc below rebuilds at the
+                // right capacity.  `slot_aware == true` mounts are the
+                // multi-seq scaffold CONTRACT — never dropped here.
+                if !slot_aware {
+                    if let Some(leftover) = self.hybrid_kv.as_ref() {
+                        let rebuild = leftover.len() != num_layers
+                            || leftover.iter().zip(self.layers.iter()).any(|(b, layer)| {
+                                let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                                let required = if layer_is_ring {
+                                    sliding_layer_capacity
+                                } else {
+                                    linear_capacity
+                                };
+                                b.capacity < required || b.is_sliding != layer_is_ring
+                            });
+                        if rebuild {
+                            self.hybrid_kv = None;
+                        }
+                    }
+                }
                 // ADR-040 iter-B4c-kernel iter-2B (2026-05-30) — added the
                 // `self.hybrid_kv.is_none()` predicate around the rebuild
                 // aligning with the decode-path gate at
@@ -1068,6 +1101,23 @@ impl MlxModelWeights {
                 // preserve the mount.  The kernel-write site at
                 // line ~1290-1330 consumes `self.hybrid_kv` unchanged.
             } else {
+                // SerialFifo leftover discipline (2026-08-03) — HB leg,
+                // mirror of the hybrid_kv block above (same hang class on
+                // the HF2Q_HYBRID_KV=0 opt-out path; ring capacity here is
+                // `sw`, matching the alloc below).
+                if !slot_aware {
+                    if let Some(leftover) = self.leg_hb_encoded.as_ref() {
+                        let rebuild = leftover.len() != num_layers
+                            || leftover.iter().zip(self.layers.iter()).any(|(b, layer)| {
+                                let layer_is_ring = layer.layer_type == LayerType::Sliding;
+                                let required = if layer_is_ring { sw } else { linear_capacity };
+                                b.capacity < required || b.is_sliding != layer_is_ring
+                            });
+                        if rebuild {
+                            self.leg_hb_encoded = None;
+                        }
+                    }
+                }
                 // ADR-040 iter-B4c-kernel iter-2A-cont (2026-05-30) — added
                 // the `self.leg_hb_encoded.is_none()` predicate around the
                 // rebuild, aligning with the decode-path gate at
