@@ -246,9 +246,8 @@ fn cmd_convert(args: cli::ConvertCliArgs) -> Result<(), AppError> {
             )));
         }
         (Some(path), None) => path,
-        (None, Some(repo)) => {
-            download_repo_via_hf_cli(&repo).map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?
-        }
+        (None, Some(repo)) => download_repo_via_hf_cli(&repo, args.revision.as_deref())
+            .map_err(|e| AppError::Conversion(anyhow::anyhow!("{e}")))?,
         (None, None) => {
             return Err(AppError::Input(anyhow::anyhow!(
                 "convert: either positional `<hf_dir>` or `--repo <hf_repo>` is required"
@@ -301,6 +300,23 @@ fn sanitize_repo_for_cache_dir(repo: &str) -> String {
     repo.replace('/', "__")
 }
 
+/// Make an operator-supplied HF revision safe as one cache-path component.
+/// The original revision is still passed verbatim as a process argument; this
+/// function only prevents slashes or traversal components from affecting the
+/// local cache path.
+fn sanitize_revision_for_cache_dir(revision: &str) -> String {
+    revision
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Pick the HuggingFace download CLI binary to invoke.
 ///
 /// The legacy `huggingface-cli` is now a deprecated shim that exits 1 and
@@ -324,13 +340,17 @@ fn resolve_hf_cli() -> &'static str {
 /// B1 — shell out to `hf download <repo> --local-dir <cache>` (falling back
 /// to the legacy `huggingface-cli`) and return the cache directory on success.
 ///
-/// `<cache>` = `~/.cache/hf2q/repos/<sanitize_repo_for_cache_dir(repo)>/`.
+/// `<cache>` = `~/.cache/hf2q/repos/<sanitize_repo_for_cache_dir(repo)>/`,
+/// with `/revisions/<sanitized_revision>/` appended for pinned downloads.
 /// The directory is created if missing; existing partial downloads are
 /// resumed by `huggingface-cli`'s own logic. Stdout/stderr stream
 /// through to the operator's terminal so download progress is visible;
 /// on non-zero exit we capture the tail of stderr into the typed
 /// `ConvertError::HfDownload` variant.
-fn download_repo_via_hf_cli(repo: &str) -> Result<PathBuf, crate::convert::ConvertError> {
+fn download_repo_via_hf_cli(
+    repo: &str,
+    revision: Option<&str>,
+) -> Result<PathBuf, crate::convert::ConvertError> {
     use crate::convert::ConvertError;
 
     // Resolve cache root: ~/.cache/hf2q/repos/<sanitized>/.
@@ -340,11 +360,16 @@ fn download_repo_via_hf_cli(repo: &str) -> Result<PathBuf, crate::convert::Conve
         exit_code: None,
         stderr: "HOME env var not set — cannot resolve ~/.cache/hf2q/repos/".to_string(),
     })?;
-    let cache_dir = PathBuf::from(home)
+    let mut cache_dir = PathBuf::from(home)
         .join(".cache")
         .join("hf2q")
         .join("repos")
         .join(sanitize_repo_for_cache_dir(repo));
+    if let Some(revision) = revision {
+        cache_dir = cache_dir
+            .join("revisions")
+            .join(sanitize_revision_for_cache_dir(revision));
+    }
     std::fs::create_dir_all(&cache_dir).map_err(|e| ConvertError::HfDownload {
         repo: repo.to_string(),
         exit_code: None,
@@ -357,17 +382,20 @@ fn download_repo_via_hf_cli(repo: &str) -> Result<PathBuf, crate::convert::Conve
     // old name only if `hf` is not on PATH.
     let hf_cli = resolve_hf_cli();
 
+    let source_label = revision
+        .map(|revision| format!("{repo}@{revision}"))
+        .unwrap_or_else(|| repo.to_string());
     eprintln!(
-        "[hf2q convert --repo] downloading {repo} → {} via {hf_cli}",
+        "[hf2q convert --repo] downloading {source_label} → {} via {hf_cli}",
         cache_dir.display()
     );
 
-    let output = std::process::Command::new(hf_cli)
-        .arg("download")
-        .arg(repo)
-        .arg("--local-dir")
-        .arg(&cache_dir)
-        .output();
+    let mut command = std::process::Command::new(hf_cli);
+    command.arg("download").arg(repo);
+    if let Some(revision) = revision {
+        command.arg("--revision").arg(revision);
+    }
+    let output = command.arg("--local-dir").arg(&cache_dir).output();
 
     let output = match output {
         Ok(o) => o,
@@ -548,6 +576,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sanitize_revision_for_cache_dir_blocks_path_traversal() {
+        assert_eq!(
+            sanitize_revision_for_cache_dir("refs/pr/7/../../main"),
+            "refs_pr_7_.._.._main"
+        );
+    }
+
     /// B1 — `cmd_convert` rejects "both `<hf_dir>` and `--repo`" with
     /// the typed `RepoAndDirMutuallyExclusive` variant, mapped to
     /// `AppError::Input` (exit code 3). clap's `conflicts_with` should
@@ -558,6 +594,7 @@ mod tests {
         let args = cli::ConvertCliArgs {
             hf_dir: Some(PathBuf::from("/tmp/example")),
             repo: Some("org/repo".to_string()),
+            revision: None,
             quant: "q8_0".to_string(),
             output: PathBuf::from("/tmp/out.gguf"),
             imatrix: None,
@@ -579,4 +616,3 @@ mod tests {
         }
     }
 }
-
