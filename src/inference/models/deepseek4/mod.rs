@@ -8,6 +8,7 @@ pub mod attention;
 pub mod compressor;
 pub mod config;
 pub mod hyper_connection;
+pub mod rope;
 pub mod routing;
 pub mod weights;
 
