@@ -9,6 +9,7 @@ pub mod compressor;
 pub mod config;
 pub mod hyper_connection;
 pub mod routing;
+pub mod weights;
 
 pub use config::Deepseek4Config;
 
